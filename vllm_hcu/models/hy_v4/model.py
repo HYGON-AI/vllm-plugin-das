@@ -440,6 +440,7 @@ class HYV4DecoderLayer(nn.Module):
             positions=positions,
             hidden_states=hidden_states,
         )
+        self._maybe_prefetch_next_layer_dsa_cache()
 
         hidden_states = hidden_states + residual
         residual = hidden_states
@@ -448,6 +449,20 @@ class HYV4DecoderLayer(nn.Module):
         hidden_states = self.mlp(hidden_states)
 
         return hidden_states, residual
+
+    def _maybe_prefetch_next_layer_dsa_cache(self) -> None:
+        # SGLang maybe_prefetch_next_full_attention_kv: after attention has
+        # consumed the remote buffer, kick the next layer's MLA-latent
+        # owner-broadcast so it overlaps with FFN/MoE. MLA only: the indexer
+        # buffer is invalidated and rewritten at the start of every prefill
+        # forward, so prefetching it would be discarded. Collective on every
+        # PCP rank; no-op when layer split is off or the batch is
+        # replicated MTP.
+        from vllm_hcu.v1.dsa_cache_layer_split import (
+            maybe_prefetch_next_dsa_cache,
+        )
+
+        maybe_prefetch_next_dsa_cache(self.layer_idx, kind="mla")
 
     def _forward_ihc(
         self,
@@ -462,6 +477,7 @@ class HYV4DecoderLayer(nn.Module):
             positions=positions,
             hidden_states=hidden_states,
         )
+        self._maybe_prefetch_next_layer_dsa_cache()
         hidden_states = self.hc_attn_layer.post(hidden_states, residual, post_gates)
 
         hidden_states = self.hc_mlp_layer.prepare_input(hidden_states)

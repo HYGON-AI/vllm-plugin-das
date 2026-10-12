@@ -1,0 +1,652 @@
+# SPDX-License-Identifier: Apache-2.0
+# SPDX-FileCopyrightText: Copyright (c) 2026 Hygon Information Technology Co., Ltd.
+"""Unit tests for DSA cache layer-split (SGLang #29421 port)."""
+
+from __future__ import annotations
+
+from types import SimpleNamespace
+
+import pytest
+import torch
+
+from vllm_hcu.v1.dsa_cache_layer_split import (
+    LayerSplitState,
+    broadcast_dsa_cache_from_owner,
+    clear_broadcast_scratch_for_tests,
+    effective_num_layers,
+    get_layer_owner,
+    get_layer_shard_range,
+    get_runtime_layer_split_state,
+    invalidate_dsa_cache_broadcast,
+    is_dsa_cache_layer_split_requested,
+    local_packed_slot_for_family_layer,
+    local_packed_slot_for_layer,
+    max_owned_count_for_layers,
+    parse_layer_index,
+    phys_slots_for_layer_family,
+    remap_packed_kv_tensor_offsets,
+    should_commit_durable_dsa_cache,
+    validate_dsa_cache_layer_split,
+)
+import vllm_hcu.v1.dsa_cache_layer_split as layer_split_mod
+
+
+def _set_layer_split(monkeypatch: pytest.MonkeyPatch, enabled: bool) -> None:
+    """Force the sidecar switch for tests whose configs carry no sidecar."""
+    monkeypatch.setattr(
+        layer_split_mod,
+        "is_dsa_cache_layer_split_requested",
+        lambda vllm_config=None: enabled,
+    )
+
+
+def test_requested_only_via_hcu_sidecar(monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.setenv("VLLM_HCU_ENABLE_DSA_CACHE_LAYER_SPLIT", "1")
+    off = SimpleNamespace(additional_config={"hcu": {}})
+    on = SimpleNamespace(
+        additional_config={"hcu": {"enable_dsa_cache_layer_split": True}}
+    )
+    assert not is_dsa_cache_layer_split_requested(None)
+    assert not is_dsa_cache_layer_split_requested(off)
+    assert is_dsa_cache_layer_split_requested(on)
+
+
+@pytest.mark.parametrize(
+    ("total_layers", "shard_size"),
+    [
+        (61, 4),
+        (61, 8),
+        (48, 4),
+        (78, 4),
+        (8, 8),
+        (7, 4),
+        (1, 4),
+    ],
+)
+def test_layer_shard_ranges_cover_exactly_once(
+    total_layers: int, shard_size: int
+) -> None:
+    covered: list[int | None] = [None] * total_layers
+    owned_counts: list[int] = []
+    for rank in range(shard_size):
+        start, end = get_layer_shard_range(rank, shard_size, total_layers)
+        assert 0 <= start <= end <= total_layers
+        owned_counts.append(end - start)
+        for idx in range(start, end):
+            assert covered[idx] is None
+            covered[idx] = rank
+    assert all(owner is not None for owner in covered)
+    # Contiguous even split: sizes differ by at most 1.
+    assert max(owned_counts) - min(owned_counts) <= 1
+    for local_idx, owner in enumerate(covered):
+        assert get_layer_owner(local_idx, shard_size, total_layers) == owner
+
+
+def test_effective_num_layers_matches_sglang() -> None:
+    # ceil(61/8)+1 = 8+1 = 9
+    assert effective_num_layers(61, 8) == 9
+    # ceil(78/4)+1 = 20+1 = 21
+    assert effective_num_layers(78, 4) == 21
+    assert effective_num_layers(61, 1) == 61
+
+
+def test_validate_requires_pcp(monkeypatch: pytest.MonkeyPatch) -> None:
+    _set_layer_split(monkeypatch, True)
+    cfg = SimpleNamespace(
+        parallel_config=SimpleNamespace(
+            prefill_context_parallel_size=1,
+            pipeline_parallel_size=1,
+        )
+    )
+    with pytest.raises(ValueError, match="prefill_context_parallel_size"):
+        validate_dsa_cache_layer_split(cfg)
+
+
+def test_validate_rejects_pp(monkeypatch: pytest.MonkeyPatch) -> None:
+    _set_layer_split(monkeypatch, True)
+    cfg = SimpleNamespace(
+        parallel_config=SimpleNamespace(
+            prefill_context_parallel_size=4,
+            pipeline_parallel_size=2,
+        )
+    )
+    with pytest.raises(ValueError, match="pipeline_parallel_size"):
+        validate_dsa_cache_layer_split(cfg)
+
+
+def _pd_prefill_cfg(architectures=("HYV4ForCausalLM",), use_mla=True, kv_role="kv_producer"):
+    return SimpleNamespace(
+        parallel_config=SimpleNamespace(
+            prefill_context_parallel_size=4,
+            pipeline_parallel_size=1,
+        ),
+        model_config=SimpleNamespace(
+            architectures=list(architectures),
+            use_mla=use_mla,
+        ),
+        kv_transfer_config=(
+            None if kv_role is None else SimpleNamespace(kv_role=kv_role)
+        ),
+        additional_config={"hcu": {"enable_dsa_cache_layer_split": True}},
+    )
+
+
+def test_validate_ok_with_pcp(monkeypatch: pytest.MonkeyPatch) -> None:
+    _set_layer_split(monkeypatch, True)
+    cfg = _pd_prefill_cfg()
+    validate_dsa_cache_layer_split(cfg)
+    assert is_dsa_cache_layer_split_requested(cfg)
+
+
+@pytest.mark.parametrize("kv_role", [None, "kv_consumer", "kv_both"])
+def test_validate_requires_pd_prefill_worker(
+    monkeypatch: pytest.MonkeyPatch, kv_role: str | None
+) -> None:
+    """SGLang model_hook: layer split only on PD prefill workers."""
+    _set_layer_split(monkeypatch, True)
+    with pytest.raises(ValueError, match="kv_producer"):
+        validate_dsa_cache_layer_split(_pd_prefill_cfg(kv_role=kv_role))
+
+
+def test_validate_rejects_non_dsa(monkeypatch: pytest.MonkeyPatch) -> None:
+    _set_layer_split(monkeypatch, True)
+    cfg = _pd_prefill_cfg(architectures=("LlamaForCausalLM",), use_mla=False)
+    with pytest.raises(ValueError, match="DSA MLA"):
+        validate_dsa_cache_layer_split(cfg)
+
+
+def test_parse_layer_index_from_prefix() -> None:
+    assert parse_layer_index("model.layers.7.self_attn.attn") == 7
+    assert (
+        parse_layer_index("model.layers.41.self_attn.indexer.k_cache") == 41
+    )
+
+
+@pytest.mark.parametrize(
+    ("rank", "layer_idx", "owned"),
+    [
+        (0, 0, True),
+        (0, 15, True),
+        (0, 16, False),
+        (1, 16, True),
+        (1, 30, True),
+        (1, 31, False),
+        (1, 15, False),
+        (2, 31, True),
+        (3, 60, True),
+        (2, 60, False),
+    ],
+)
+def test_should_commit_only_on_owner(
+    monkeypatch: pytest.MonkeyPatch, rank: int, layer_idx: int, owned: bool
+) -> None:
+    _set_layer_split(monkeypatch, True)
+    # 61 layers / 4 ranks -> [0,16), [16,31), [31,46), [46,61)
+    layer_name = f"model.layers.{layer_idx}.self_attn.attn"
+    assert (
+        should_commit_durable_dsa_cache(
+            layer_name,
+            shard_rank=rank,
+            shard_size=4,
+            total_layers=61,
+        )
+        is owned
+    )
+
+
+def test_should_commit_true_when_feature_off(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    # Legacy PCP: every rank commits durable cache.
+    _set_layer_split(monkeypatch, False)
+    assert should_commit_durable_dsa_cache(
+        "model.layers.0.self_attn.attn",
+        shard_rank=1,
+        shard_size=4,
+        total_layers=61,
+    )
+
+
+def test_mtp_layers_remain_fully_replicated(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    _set_layer_split(monkeypatch, True)
+    # layer_idx >= total_layers is treated as replicated MTP.
+    assert should_commit_durable_dsa_cache(
+        "model.layers.61.self_attn.attn",
+        shard_rank=2,
+        shard_size=4,
+        total_layers=61,
+    )
+
+
+def test_layer_split_state_ownership() -> None:
+    state = LayerSplitState(shard_rank=1, shard_size=4, total_layers=61)
+    assert state.is_owned(20)
+    assert not state.is_owned(0)
+    assert state.owner_of(0) == 0
+    assert state.owner_of(20) == 1
+    assert state.covers(60)
+    assert not state.covers(61)
+
+
+def test_runtime_state_none_when_pcp_one(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    _set_layer_split(monkeypatch, True)
+    cfg = SimpleNamespace(
+        parallel_config=SimpleNamespace(prefill_context_parallel_size=1),
+        model_config=SimpleNamespace(
+            hf_config=SimpleNamespace(num_hidden_layers=61)
+        ),
+    )
+    assert get_runtime_layer_split_state(cfg, shard_rank=0) is None
+
+
+def test_broadcast_from_owner_fills_non_owner(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    _set_layer_split(monkeypatch, True)
+    clear_broadcast_scratch_for_tests()
+
+    owner_cache = torch.arange(8, dtype=torch.float32)
+    non_owner_cache = torch.zeros(8, dtype=torch.float32)
+
+    class _Group:
+        def __init__(self, rank: int) -> None:
+            self.rank_in_group = rank
+            self._payload: torch.Tensor | None = None
+
+        def broadcast(self, tensor: torch.Tensor, src: int = 0) -> torch.Tensor:
+            del src
+            if self.rank_in_group == 0:
+                self._payload = tensor.clone()
+                _Group.last_payload = self._payload
+            else:
+                assert _Group.last_payload is not None
+                tensor.copy_(_Group.last_payload)
+            return tensor
+
+    _Group.last_payload = None
+
+    # Owner (rank 0) seeds the payload.
+    broadcast_dsa_cache_from_owner(
+        owner_cache,
+        "model.layers.0.self_attn.attn",
+        shard_rank=0,
+        shard_size=4,
+        total_layers=61,
+        pcp_group=_Group(0),
+    )
+    # Ranks are separate processes; drop rank 0's remote_layer_id dedup state.
+    clear_broadcast_scratch_for_tests()
+    # Non-owner (rank 1) receives into its local buffer.
+    broadcast_dsa_cache_from_owner(
+        non_owner_cache,
+        "model.layers.0.self_attn.attn",
+        shard_rank=1,
+        shard_size=4,
+        total_layers=61,
+        pcp_group=_Group(1),
+    )
+    assert torch.equal(non_owner_cache, owner_cache)
+
+
+def test_remote_layer_id_skips_repeat_broadcast(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """SGLang remote_layer_id: second get_broadcastable is a no-op collective."""
+    _set_layer_split(monkeypatch, True)
+    clear_broadcast_scratch_for_tests()
+    cache = torch.arange(8, dtype=torch.float32)
+    calls = {"n": 0}
+
+    class _Group:
+        rank_in_group = 0
+
+        def broadcast(self, tensor: torch.Tensor, src: int = 0) -> torch.Tensor:
+            del src
+            calls["n"] += 1
+            return tensor
+
+    layer = "model.layers.0.self_attn.attn"
+    broadcast_dsa_cache_from_owner(
+        cache, layer, shard_rank=0, shard_size=2, total_layers=8, pcp_group=_Group()
+    )
+    broadcast_dsa_cache_from_owner(
+        cache, layer, shard_rank=0, shard_size=2, total_layers=8, pcp_group=_Group()
+    )
+    assert calls["n"] == 1
+    # Write-path invalidate forces the next read to rebroadcast.
+    invalidate_dsa_cache_broadcast(cache, layer)
+    broadcast_dsa_cache_from_owner(
+        cache, layer, shard_rank=0, shard_size=2, total_layers=8, pcp_group=_Group()
+    )
+    assert calls["n"] == 2
+
+
+def test_broadcast_noop_when_feature_off(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    _set_layer_split(monkeypatch, False)
+    cache = torch.ones(4)
+    out = broadcast_dsa_cache_from_owner(
+        cache,
+        "model.layers.0.self_attn.attn",
+        shard_rank=1,
+        shard_size=4,
+        total_layers=61,
+    )
+    assert out is cache
+    assert torch.equal(cache, torch.ones(4))
+
+
+def test_broadcast_noncontiguous_view(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    _set_layer_split(monkeypatch, True)
+    clear_broadcast_scratch_for_tests()
+
+    # Simulate a packed stride view: every other element.
+    backing = torch.arange(16, dtype=torch.float32)
+    owner_view = backing[::2]
+    assert not owner_view.is_contiguous()
+    non_owner_backing = torch.zeros(16, dtype=torch.float32)
+    non_owner_view = non_owner_backing[::2]
+
+    class _Group:
+        last_payload: torch.Tensor | None = None
+
+        def __init__(self, rank: int) -> None:
+            self.rank_in_group = rank
+
+        def broadcast(self, tensor: torch.Tensor, src: int = 0) -> torch.Tensor:
+            del src
+            assert tensor.is_contiguous()
+            if self.rank_in_group == 0:
+                _Group.last_payload = tensor.clone()
+            else:
+                assert _Group.last_payload is not None
+                tensor.copy_(_Group.last_payload)
+            return tensor
+
+    broadcast_dsa_cache_from_owner(
+        owner_view,
+        "model.layers.0.self_attn.attn",
+        shard_rank=0,
+        shard_size=2,
+        total_layers=8,
+        pcp_group=_Group(0),
+    )
+    # Ranks are separate processes; drop rank 0's remote_layer_id dedup state.
+    clear_broadcast_scratch_for_tests()
+    broadcast_dsa_cache_from_owner(
+        non_owner_view,
+        "model.layers.0.self_attn.attn",
+        shard_rank=1,
+        shard_size=2,
+        total_layers=8,
+        pcp_group=_Group(1),
+    )
+    assert torch.equal(non_owner_view, owner_view)
+
+
+def test_local_packed_slot_owned_vs_scratch() -> None:
+    # 8 layers / CP=4 -> owned upper=2, slots=3 (2 owned + scratch)
+    state = LayerSplitState(shard_rank=0, shard_size=4, total_layers=8)
+    assert effective_num_layers(8, 4) == 3
+    assert local_packed_slot_for_layer(state, 0) == 0
+    assert local_packed_slot_for_layer(state, 1) == 1
+    assert local_packed_slot_for_layer(state, 2) == 2  # scratch
+    assert local_packed_slot_for_layer(state, 7) == 2
+
+
+def test_phys_slots_mixed_indexer_and_mtp() -> None:
+    # Hy4-like: sparse indexer on a subset + one MTP extra.
+    total_layers = 8
+    pcp = 4
+    indexer = [0, 1, 5, 7]  # sparse backbone
+    assert max_owned_count_for_layers(set(indexer), total_layers, pcp) == 2
+    assert phys_slots_for_layer_family(indexer, total_layers, pcp) == 3  # +scratch
+    assert phys_slots_for_layer_family(indexer + [8], total_layers, pcp) == 4  # +MTP
+
+    state = LayerSplitState(shard_rank=0, shard_size=pcp, total_layers=total_layers)
+    # Rank0 owns [0,2) -> indexer layers 0,1 -> dense 0,1; others scratch.
+    assert local_packed_slot_for_family_layer(state, 0, indexer) == 0
+    assert local_packed_slot_for_family_layer(state, 1, indexer) == 1
+    assert local_packed_slot_for_family_layer(state, 5, indexer) == 2
+    family_with_mtp = indexer + [8]
+    assert local_packed_slot_for_family_layer(state, 8, family_with_mtp) == 3
+
+
+def test_remap_packed_kv_tensor_offsets_aliases_scratch(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    _set_layer_split(monkeypatch, True)
+    page = 16
+    total_layers = 8
+    pcp = 4
+    eff = effective_num_layers(total_layers, pcp)  # 3
+    block_stride = page * eff
+    num_blocks = 2
+    size = block_stride * num_blocks
+
+    class _Tensor:
+        def __init__(self, size, shared_by, offset=0, block_stride=0):
+            self.size = size
+            self.shared_by = shared_by
+            self.offset = offset
+            self.block_stride = block_stride
+
+    # Provisional clamp offsets (same as config patch).
+    tensors = [
+        _Tensor(
+            size,
+            [f"model.layers.{i}.self_attn.attn"],
+            offset=min(i, eff - 1) * page,
+            block_stride=block_stride,
+        )
+        for i in range(total_layers)
+    ]
+    cfg = SimpleNamespace(
+        parallel_config=SimpleNamespace(prefill_context_parallel_size=pcp),
+        model_config=SimpleNamespace(
+            hf_config=SimpleNamespace(num_hidden_layers=total_layers)
+        ),
+    )
+    kv_cfg = SimpleNamespace(
+        kv_cache_tensors=tensors,
+        kv_cache_groups=[
+            SimpleNamespace(
+                layer_names=[t.shared_by[0] for t in tensors],
+                kv_cache_spec=SimpleNamespace(page_size_bytes=page),
+            )
+        ],
+    )
+
+    assert remap_packed_kv_tensor_offsets(kv_cfg, cfg) is True
+    # Rank 0 owns [0,2); scratch at slot 2.
+    by_layer = {
+        (getattr(t, "shared_by", None) or t.layers)[0]: t.offset
+        for t in kv_cfg.kv_cache_tensors
+    }
+    assert by_layer["model.layers.0.self_attn.attn"] == 0
+    assert by_layer["model.layers.1.self_attn.attn"] == page
+    scratch = 2 * page
+    for i in range(2, total_layers):
+        assert by_layer[f"model.layers.{i}.self_attn.attn"] == scratch
+
+
+class _RemapTensor:
+    def __init__(self, size, shared_by, offset=0, block_stride=0):
+        self.size = size
+        self.shared_by = shared_by
+        self.offset = offset
+        self.block_stride = block_stride
+
+
+def _remap_cfg(total_layers: int, pcp: int) -> SimpleNamespace:
+    return SimpleNamespace(
+        parallel_config=SimpleNamespace(prefill_context_parallel_size=pcp),
+        model_config=SimpleNamespace(
+            hf_config=SimpleNamespace(num_hidden_layers=total_layers)
+        ),
+    )
+
+
+def test_remap_raises_on_block_stride_mismatch(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A skipped remap leaves owned layers aliased onto one slot."""
+    _set_layer_split(monkeypatch, True)
+    page, total_layers, pcp = 16, 8, 4
+    eff = effective_num_layers(total_layers, pcp)
+    wrong_stride = page * (eff + 1)
+    tensors = [
+        _RemapTensor(
+            wrong_stride * 2,
+            [f"model.layers.{i}.self_attn.attn"],
+            offset=min(i, eff - 1) * page,
+            block_stride=wrong_stride,
+        )
+        for i in range(total_layers)
+    ]
+    kv_cfg = SimpleNamespace(
+        kv_cache_tensors=tensors,
+        kv_cache_groups=[
+            SimpleNamespace(
+                layer_names=[t.shared_by[0] for t in tensors],
+                kv_cache_spec=SimpleNamespace(page_size_bytes=page),
+            )
+        ],
+    )
+    with pytest.raises(RuntimeError, match="block_stride"):
+        remap_packed_kv_tensor_offsets(kv_cfg, _remap_cfg(total_layers, pcp))
+
+
+def test_remap_raises_when_page_size_unresolved(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    _set_layer_split(monkeypatch, True)
+    tensors = [
+        _RemapTensor(
+            96, ["model.layers.0.self_attn.attn"], offset=0, block_stride=48
+        )
+    ]
+    kv_cfg = SimpleNamespace(kv_cache_tensors=tensors, kv_cache_groups=[])
+    with pytest.raises(RuntimeError, match="page sizes"):
+        remap_packed_kv_tensor_offsets(kv_cfg, _remap_cfg(8, 4))
+
+
+def test_make_packed_kv_tensor_v2_layers_api() -> None:
+    from dataclasses import dataclass
+
+    from vllm_hcu.v1.dsa_cache_layer_split import make_packed_kv_tensor
+
+    @dataclass
+    class _V2Tensor:
+        size: int
+        layers: list[str]
+        layer_stride: int
+        block_stride: int
+        offset: int = 0
+
+    t = make_packed_kv_tensor(
+        _V2Tensor,
+        size=100,
+        layer_names=["model.layers.0.self_attn.attn"],
+        page_size=16,
+        offset=32,
+        block_stride=48,
+    )
+    assert t.layers == ["model.layers.0.self_attn.attn"]
+    assert t.layer_stride == 16
+    assert t.offset == 32
+    assert t.block_stride == 48
+
+
+def test_remap_mixed_page_sizes_hy4_like(monkeypatch: pytest.MonkeyPatch) -> None:
+    """MLA (all layers+MTP) + sparse indexer families must both shrink."""
+    _set_layer_split(monkeypatch, True)
+    total_layers = 8
+    pcp = 4
+    mla_page = 100
+    idx_page = 10
+    mla_layers = list(range(total_layers)) + [8]  # +MTP
+    indexer_layers = [0, 1, 5, 7]
+    mla_phys = phys_slots_for_layer_family(mla_layers, total_layers, pcp)
+    idx_phys = phys_slots_for_layer_family(indexer_layers, total_layers, pcp)
+    assert mla_phys == effective_num_layers(total_layers, pcp) + 1  # +MTP
+    assert idx_phys == 3
+    block_stride = mla_page * mla_phys + idx_page * idx_phys
+    size = block_stride * 2
+
+    class _Tensor:
+        def __init__(self, size, shared_by, offset=0, block_stride=0):
+            self.size = size
+            self.shared_by = shared_by
+            self.offset = offset
+            self.block_stride = block_stride
+
+    tensors = []
+    # Emit in sorted page-size order (idx_page then mla_page) like the planner.
+    base = 0
+    for i in indexer_layers:
+        tensors.append(
+            _Tensor(
+                size,
+                [f"model.layers.{i}.self_attn.indexer"],
+                offset=base + min(indexer_layers.index(i), idx_phys - 1) * idx_page,
+                block_stride=block_stride,
+            )
+        )
+    base = idx_page * idx_phys
+    for i in mla_layers:
+        tensors.append(
+            _Tensor(
+                size,
+                [f"model.layers.{i}.self_attn.attn"],
+                offset=base + min(mla_layers.index(i), mla_phys - 1) * mla_page,
+                block_stride=block_stride,
+            )
+        )
+
+    def _spec_for(name: str):
+        return SimpleNamespace(
+            page_size_bytes=idx_page if "indexer" in name else mla_page
+        )
+
+    all_names = [t.shared_by[0] for t in tensors]
+    cfg = SimpleNamespace(
+        parallel_config=SimpleNamespace(prefill_context_parallel_size=pcp),
+        model_config=SimpleNamespace(
+            hf_config=SimpleNamespace(num_hidden_layers=total_layers)
+        ),
+    )
+    kv_cfg = SimpleNamespace(
+        kv_cache_tensors=tensors,
+        kv_cache_groups=[
+            SimpleNamespace(
+                layer_names=all_names,
+                kv_cache_spec=SimpleNamespace(
+                    page_size_bytes=mla_page,
+                    kv_cache_specs={n: _spec_for(n) for n in all_names},
+                ),
+            )
+        ],
+    )
+
+    assert remap_packed_kv_tensor_offsets(kv_cfg, cfg) is True
+    by_layer = {
+        (getattr(t, "shared_by", None) or t.layers)[0]: t.offset
+        for t in kv_cfg.kv_cache_tensors
+    }
+    # Indexer family at base 0; rank0 owns 0,1.
+    assert by_layer["model.layers.0.self_attn.indexer"] == 0
+    assert by_layer["model.layers.1.self_attn.indexer"] == idx_page
+    assert by_layer["model.layers.5.self_attn.indexer"] == 2 * idx_page
+    # MLA family after indexer phys region.
+    mla_base = idx_page * idx_phys
+    assert by_layer["model.layers.0.self_attn.attn"] == mla_base
+    assert by_layer["model.layers.2.self_attn.attn"] == mla_base + 2 * mla_page  # scratch
+    assert by_layer["model.layers.8.self_attn.attn"] == mla_base + 3 * mla_page  # MTP

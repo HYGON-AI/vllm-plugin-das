@@ -1067,10 +1067,16 @@ class V32SparseAttnIndexer(SparseAttnIndexer):
         cp_kv_cache_interleave_size = self.cp_kv_cache_interleave_size
         skip_k_cache_insert = self.skip_k_cache_insert
         pcp_world_size = effective_pcp_world_size(self.pcp_world_size)
+        layer_name = self.k_cache.prefix
         if pcp_world_size > 1 and not skip_k_cache_insert:
+            from vllm_hcu.v1.dsa_cache_layer_split import (
+                invalidate_dsa_cache_broadcast,
+                should_commit_durable_dsa_cache,
+            )
+
             attn_metadata = get_forward_context().attn_metadata
             if isinstance(attn_metadata, dict):
-                layer_metadata = attn_metadata[self.k_cache.prefix]
+                layer_metadata = attn_metadata[layer_name]
                 metadata_world_size = int(
                     getattr(layer_metadata, "pcp_world_size", 1)
                 )
@@ -1080,32 +1086,56 @@ class V32SparseAttnIndexer(SparseAttnIndexer):
                         f"indexer={pcp_world_size}, "
                         f"metadata={metadata_world_size}"
                     )
+                # PCP gather is a collective: every rank must participate.
+                # SGLang #29421 only restricts the durable *write* to the owner.
+                # SGLang invalidate_index_buffer_for_layer: every rank.
+                invalidate_dsa_cache_broadcast(self.k_cache.kv_cache, layer_name)
                 cache_k, cache_slots = maybe_gather_indexer_k(
                     k,
                     layer_metadata.slot_mapping,
                     layer_metadata,
                 )
-                assert self.scale_fmt is not None
-                if on_gfx938():
-                    ops.indexer_k_quant_and_cache(
-                        cache_k,
-                        self.k_cache.kv_cache,
-                        cache_slots,
-                        self.quant_block_size,
-                        self.scale_fmt,
-                    )
-                else:
-                    indexer_k_bf16_cache_triton(
-                        cache_k,
-                        self.k_cache.kv_cache,
-                        cache_slots,
-                    )
-                # The complete cache write is explicit above.  Keep the
+                if should_commit_durable_dsa_cache(layer_name):
+                    assert self.scale_fmt is not None
+                    if on_gfx938():
+                        ops.indexer_k_quant_and_cache(
+                            cache_k,
+                            self.k_cache.kv_cache,
+                            cache_slots,
+                            self.quant_block_size,
+                            self.scale_fmt,
+                        )
+                    else:
+                        indexer_k_bf16_cache_triton(
+                            cache_k,
+                            self.k_cache.kv_cache,
+                            cache_slots,
+                        )
+                # The durable write (if any) is explicit above. Keep the
                 # existing HCU custom op for local Q/top-k work only.
                 skip_k_cache_insert = True
+        # Broadcast only when effective PCP is active. During replicated MTP
+        # effective_pcp_world_size returns 1: MLA early-returns from the PCP
+        # path entirely, so entering NCCL here would deadlock the group.
+        if pcp_world_size > 1:
+            from vllm_hcu.v1.dsa_cache_layer_split import (
+                broadcast_dsa_cache_from_owner,
+                maybe_prefetch_same_layer_mla_cache,
+                parse_layer_index,
+            )
+
+            # SGLang get_broadcastable_buffer: non-owners need owner bytes
+            # before top-k. remote_layer_id skips repeat NCCL within the
+            # same layer until the next invalidate/write.
+            broadcast_dsa_cache_from_owner(self.k_cache.kv_cache, layer_name)
+            # SGLang get_k_and_scale -> pool.prefetch_kv_buffer(layer_id):
+            # after the indexer buffer is current, kick this layer's MLA
+            # latent broadcast so it overlaps with the top-k compute that
+            # runs before MLA attention reads it. Collective on every rank.
+            maybe_prefetch_same_layer_mla_cache(parse_layer_index(layer_name))
         return torch.ops.vllm.hcu_sparse_attn_indexer(
             hidden_states,
-            _encode_layer_name(self.k_cache.prefix),
+            _encode_layer_name(layer_name),
             self.k_cache.kv_cache,
             q_quant,
             k,

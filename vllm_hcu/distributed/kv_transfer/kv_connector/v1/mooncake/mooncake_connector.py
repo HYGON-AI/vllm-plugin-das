@@ -134,6 +134,111 @@ ReqId = str  # Internal scheduler request ID
 TransferId = str  # KV transfer coordination ID (shared by P/D)
 
 
+class HCURegisterWorkerPayload(RegisterWorkerPayload):
+    """Bootstrap registration extended with Prefill-CP topology.
+
+    SGLang conn.py registers ``attn_cp_size``/``attn_cp_rank`` and
+    ``enable_dsa_cache_layer_split`` with its bootstrap server so the decode
+    side knows whether to pull from every prefill CP rank. The ``tp_rank``
+    field carries the PCP-flattened virtual rank
+    (``tp_rank * pcp_size + pcp_rank``) so per-rank registrations don't
+    collide and the decode can address each CP rank's worker.
+    """
+
+    pcp_size: int = 1
+    enable_dsa_cache_layer_split: bool = False
+
+
+@dataclass
+class HCUEngineEntry:
+    engine_id: EngineId
+    # {virtual_tp_rank: {pp_rank: worker_addr}}
+    worker_addr: dict[int, dict[int, str]]
+    pcp_size: int = 1
+    enable_dsa_cache_layer_split: bool = False
+
+
+class HCUMooncakeBootstrapServer(MooncakeBootstrapServer):
+    """Bootstrap server that records PCP topology per engine."""
+
+    def _register_routes(self):
+        self.app.post("/register")(self.register_worker)
+        self.app.get("/query", response_model=dict[int, HCUEngineEntry])(
+            self.query
+        )
+
+    async def register_worker(self, payload: HCURegisterWorkerPayload):
+        from fastapi import HTTPException
+
+        if payload.dp_rank not in self.workers:
+            self.workers[payload.dp_rank] = HCUEngineEntry(
+                engine_id=payload.engine_id,
+                worker_addr={},
+                pcp_size=payload.pcp_size,
+                enable_dsa_cache_layer_split=(
+                    payload.enable_dsa_cache_layer_split
+                ),
+            )
+
+        dp_entry = self.workers[payload.dp_rank]
+        if dp_entry.engine_id != payload.engine_id:
+            raise HTTPException(
+                status_code=400,
+                detail=(
+                    f"Engine ID mismatch for dp_rank={payload.dp_rank}: "
+                    f"expected {dp_entry.engine_id}, got {payload.engine_id}"
+                ),
+            )
+        if (
+            dp_entry.pcp_size != payload.pcp_size
+            or dp_entry.enable_dsa_cache_layer_split
+            != payload.enable_dsa_cache_layer_split
+        ):
+            raise HTTPException(
+                status_code=400,
+                detail=(
+                    f"PCP topology mismatch for dp_rank={payload.dp_rank}: "
+                    f"registered pcp_size={dp_entry.pcp_size}/"
+                    f"layer_split={dp_entry.enable_dsa_cache_layer_split}, "
+                    f"got pcp_size={payload.pcp_size}/"
+                    f"layer_split={payload.enable_dsa_cache_layer_split}"
+                ),
+            )
+        if payload.tp_rank not in dp_entry.worker_addr:
+            dp_entry.worker_addr[payload.tp_rank] = {}
+
+        tp_entry = dp_entry.worker_addr[payload.tp_rank]
+        if payload.pp_rank in tp_entry:
+            raise HTTPException(
+                status_code=400,
+                detail=(
+                    f"Worker with dp_rank={payload.dp_rank}, "
+                    f"tp_rank={payload.tp_rank}, pp_rank={payload.pp_rank} "
+                    f"is already registered at "
+                    f"{tp_entry[payload.pp_rank]}, "
+                    f"but still want to register at {payload.addr}"
+                ),
+            )
+
+        tp_entry[payload.pp_rank] = payload.addr
+        logger.debug(
+            "Registered worker: engine_id=%s, dp_rank=%d, tp_rank=%d, "
+            "pp_rank=%d, pcp_size=%d, layer_split=%s at %s",
+            payload.engine_id,
+            payload.dp_rank,
+            payload.tp_rank,
+            payload.pp_rank,
+            payload.pcp_size,
+            payload.enable_dsa_cache_layer_split,
+            payload.addr,
+        )
+
+        return {"status": "ok"}
+
+    async def query(self) -> dict[int, HCUEngineEntry]:
+        return self.workers
+
+
 @dataclass(frozen=True)
 class TransferRegion:
     layer_name: str
@@ -1231,6 +1336,59 @@ class MooncakeConnectorWorker:
             else None
         )
 
+        # --- Prefill-CP topology (SGLang conn.py cp_sharded_prefill port) ---
+        # With PCP>1 every CP rank of a producer engine registers with the
+        # bootstrap server and serves transfers (SGLang: CP rank != 0 is not a
+        # dummy under all-rank transfer). Workers advertise a *virtual* TP
+        # rank (tp_rank * pcp_size + pcp_rank) so registrations don't collide
+        # and so a decode engine's handshake fan-out naturally covers every
+        # PCP rank. Transfer-plan math keeps using the real TP sizes.
+        self.pcp_size = int(
+            getattr(parallel_config, "prefill_context_parallel_size", 1) or 1
+        )
+        self.pcp_rank = 0
+        if self.pcp_size > 1:
+            self.pcp_rank = int(get_pcp_group().rank_in_group)
+        self.bootstrap_tp_rank = self.tp_rank * self.pcp_size + self.pcp_rank
+
+        # DSA cache layer split (SGLang #29421): each PCP rank owns a
+        # contiguous layer range; decode pulls each range from its owner.
+        self.dsa_layer_split_enabled = False
+        self._dsa_total_layers = 0
+        self._dsa_owned_layer_range: tuple[int, int] = (0, 0)
+        if self.pcp_size > 1 and not self.is_kv_consumer:
+            from vllm_hcu.v1.dsa_cache_layer_split import (
+                get_layer_shard_range,
+                is_dsa_cache_layer_split_requested,
+            )
+
+            if is_dsa_cache_layer_split_requested(vllm_config):
+                self.dsa_layer_split_enabled = True
+                self._dsa_total_layers = int(
+                    self.model_config.get_total_num_hidden_layers()
+                )
+                self._dsa_owned_layer_range = get_layer_shard_range(
+                    self.pcp_rank, self.pcp_size, self._dsa_total_layers
+                )
+                logger.info(
+                    "Mooncake DSA layer-split producer: pcp_rank=%d/%d "
+                    "owns layers [%d, %d) of %d",
+                    self.pcp_rank,
+                    self.pcp_size,
+                    self._dsa_owned_layer_range[0],
+                    self._dsa_owned_layer_range[1],
+                    self._dsa_total_layers,
+                )
+        # Plain PCP (no layer split) replicates the full gathered cache on
+        # every CP rank, so only CP rank 0 transfers; the others complete
+        # send bookkeeping immediately (SGLang is_dummy_cp_rank).
+        self._pcp_dummy_sender = (
+            self.pcp_size > 1
+            and not self.is_kv_consumer
+            and not self.dsa_layer_split_enabled
+            and self.pcp_rank != 0
+        )
+
         self.kv_caches_base_addr: list[int] = []
         self.device_kv_caches: dict[
             str,
@@ -1264,7 +1422,7 @@ class MooncakeConnectorWorker:
             # Start bootstrap server on global rank 0.
             if should_launch_bootstrap_server(vllm_config):
                 _, port = get_mooncake_bootstrap_addr(vllm_config)
-                self.bootstrap_server = MooncakeBootstrapServer("0.0.0.0", port)
+                self.bootstrap_server = HCUMooncakeBootstrapServer("0.0.0.0", port)
                 self.bootstrap_server.start()
 
         if not self.is_kv_producer:
@@ -1289,6 +1447,10 @@ class MooncakeConnectorWorker:
         logger.debug("Detected kv cache layout %s", self.kv_cache_layout)
 
         self._tp_size: dict[EngineId, int] = {self.engine_id: self.tp_size}
+        # Per remote engine: (pcp_size, enable_dsa_cache_layer_split) learned
+        # from the bootstrap server. Under layer split the decode pulls each
+        # prefill CP rank's owned layer range (SGLang target_cp_ranks).
+        self._remote_pcp_info: dict[EngineId, tuple[int, bool]] = {}
         self._layer_specs: dict[str, KVCacheSpec] = {}
         for group in kv_cache_config.kv_cache_groups:
             group_spec = group.kv_cache_spec
@@ -1373,12 +1535,18 @@ class MooncakeConnectorWorker:
         host, port = get_mooncake_bootstrap_addr(self.vllm_config)
         url = make_zmq_path("http", host, port) + "/register"
         worker_addr = make_zmq_path("tcp", self.hostname, self.side_channel_port)
-        payload = RegisterWorkerPayload(
+        # SGLang conn.py: every prefill CP rank registers (CP rank != 0 is
+        # not a dummy). The PCP-flattened virtual TP rank keeps per-CP-rank
+        # registrations distinct; the decode side recovers the real TP size
+        # from ``pcp_size``.
+        payload = HCURegisterWorkerPayload(
             engine_id=self.engine_id,
             dp_rank=self.dp_rank,
-            tp_rank=self.tp_rank,
+            tp_rank=self.bootstrap_tp_rank,
             pp_rank=self.pp_rank,
             addr=worker_addr,
+            pcp_size=self.pcp_size,
+            enable_dsa_cache_layer_split=self.dsa_layer_split_enabled,
         )
         while True:
             try:
@@ -1927,6 +2095,18 @@ class MooncakeConnectorWorker:
 
         return src_ptrs, dst_ptrs, lengths, err_reqs, err_msg
 
+    def _dsa_owns_layer(self, layer_index: int) -> bool:
+        """Which layers this layer-split producer rank transfers.
+
+        Backbone layers follow the contiguous shard plan. MTP / draft layers
+        (``layer_index >= total_layers``) are fully replicated; the last CP
+        rank transfers them (SGLang ``transfer_draft_cache``).
+        """
+        if layer_index >= self._dsa_total_layers:
+            return self.pcp_rank == self.pcp_size - 1
+        start, end = self._dsa_owned_layer_range
+        return start <= layer_index < end
+
     def _bind_sender_thread_device(self) -> None:
         """ThreadPoolExecutor initializer — binds each pool thread to the
         correct CUDA device.  CUDA device selection is thread-local, so
@@ -1992,6 +2172,22 @@ class MooncakeConnectorWorker:
                 logger.debug(
                     "Skipping layer %s because no KV cache spec is present.",
                     layer_name,
+                )
+                continue
+            if self.dsa_layer_split_enabled and not self._dsa_owns_layer(
+                layer_index
+            ):
+                # SGLang get_contiguous_buf_infos: a layer-split producer
+                # only reports buffers it owns. Non-owned layers alias the
+                # remote scratch slot here and must never be transferred;
+                # MTP/draft layers ride with the last CP rank
+                # (SGLang transfer_draft_cache).
+                logger.debug(
+                    "Skipping layer %s (index %d): not owned by "
+                    "pcp_rank=%d under DSA cache layer split.",
+                    layer_name,
+                    layer_index,
+                    self.pcp_rank,
                 )
                 continue
             if self._pp_layer_range is not None:
@@ -2331,14 +2527,38 @@ class MooncakeConnectorWorker:
                 data: dict = response.json()
                 for _, dp_entry in data.items():
                     remote_engine_id = dp_entry["engine_id"]
-                    self._remote_agents[remote_engine_id] = {
+                    worker_addr = {
                         int(tp_rank): {
-                            int(pp_rank): worker_addr
-                            for pp_rank, worker_addr in tp_entry.items()
+                            int(pp_rank): addr
+                            for pp_rank, addr in tp_entry.items()
                         }
                         for tp_rank, tp_entry in dp_entry["worker_addr"].items()
                     }
-                    self._tp_size[remote_engine_id] = len(dp_entry["worker_addr"])
+                    remote_pcp_size = int(dp_entry.get("pcp_size", 1) or 1)
+                    remote_layer_split = bool(
+                        dp_entry.get("enable_dsa_cache_layer_split", False)
+                    )
+                    # Registered virtual ranks flatten TP x PCP; the real
+                    # remote TP size feeds the transfer-plan math. Validate
+                    # before publishing so a partial registration set (some
+                    # prefill ranks still coming up) is not cached.
+                    num_virtual = len(worker_addr)
+                    if num_virtual % remote_pcp_size != 0:
+                        raise RuntimeError(
+                            "Mooncake bootstrap registered "
+                            f"{num_virtual} workers for engine "
+                            f"{remote_engine_id}, not divisible by "
+                            f"pcp_size={remote_pcp_size}; prefill workers "
+                            "may still be registering."
+                        )
+                    self._remote_agents[remote_engine_id] = worker_addr
+                    self._remote_pcp_info[remote_engine_id] = (
+                        remote_pcp_size,
+                        remote_layer_split,
+                    )
+                    self._tp_size[remote_engine_id] = (
+                        num_virtual // remote_pcp_size
+                    )
         except Exception as e:
             logger.error(
                 "Failed to connect to bootstrap server %s: %s",
@@ -2358,9 +2578,31 @@ class MooncakeConnectorWorker:
         remote_tp_ranks = self.transfer_topo.handshake_target_ranks(
             self._tp_size[remote_engine_id]
         )
+        remote_pcp_size, remote_layer_split = self._remote_pcp_info.get(
+            remote_engine_id, (1, False)
+        )
+        # SGLang conn.py target_cp_ranks: with a CP-sharded prefill (DSA
+        # cache layer split) each prefill CP rank holds different layers, so
+        # the decode must pull from every one of them. Expand each real TP
+        # handshake target into its PCP-flattened virtual ranks.
+        if remote_pcp_size > 1:
+            if not remote_layer_split:
+                # Prefill CP without layer split replicates every layer's
+                # cache across CP ranks after the gather; rank 0 suffices.
+                virtual_ranks = [
+                    tp_rank * remote_pcp_size for tp_rank in remote_tp_ranks
+                ]
+            else:
+                virtual_ranks = [
+                    tp_rank * remote_pcp_size + pcp_rank
+                    for tp_rank in remote_tp_ranks
+                    for pcp_rank in range(remote_pcp_size)
+                ]
+        else:
+            virtual_ranks = remote_tp_ranks
         worker_addrs: list[str] = []
         selected_remote_pp: dict[int, list[int]] = {}
-        for remote_tp_rank in remote_tp_ranks:
+        for remote_tp_rank in virtual_ranks:
             pp_to_addr = self._remote_agents[remote_engine_id][remote_tp_rank]
             if self.pp_size == len(pp_to_addr) and self.pp_rank in pp_to_addr:
                 pp_ranks = [self.pp_rank]
@@ -2371,10 +2613,12 @@ class MooncakeConnectorWorker:
 
         count = len(worker_addrs)
         logger.debug(
-            "Receiving Mooncake KV for engine %s from producer TP ranks %s "
-            "and PP ranks %s",
+            "Receiving Mooncake KV for engine %s from producer virtual TP "
+            "ranks %s (pcp_size=%d, layer_split=%s) and PP ranks %s",
             remote_engine_id,
-            remote_tp_ranks,
+            virtual_ranks,
+            remote_pcp_size,
+            remote_layer_split,
             selected_remote_pp,
         )
         for pull_meta in pull_metas.values():
@@ -2420,6 +2664,14 @@ class MooncakeConnectorWorker:
     async def record_send_reqs(self, metadata: MooncakeConnectorMetadata):
         for p_req_id, (transfer_id, block_ids) in metadata.reqs_to_send.items():
             if block_ids:
+                if self._pcp_dummy_sender:
+                    # Plain PCP replicates the gathered cache: only CP rank 0
+                    # transfers. Dummy CP ranks complete immediately so the
+                    # executor-side finished-sending aggregation does not
+                    # wait on them (SGLang is_dummy_cp_rank).
+                    self.reqs_need_send.pop(transfer_id, None)
+                    self.finished_sending_reqs.add(p_req_id)
+                    continue
                 # Already gone through request_finished()
                 send_meta = self.reqs_need_send[transfer_id]
                 send_meta.p_req_id = p_req_id

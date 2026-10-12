@@ -312,6 +312,18 @@ def _require_mrv2_pcp_contract(vllm_config: object) -> None:
 def _validate_hcu_pcp_scope(vllm_config: object) -> bool:
     """Return whether this configuration is in the HCU PCP support scope."""
 
+    # ``use_v2_model_runner`` reads ``_get_v2_model_runner_unsupported_features``,
+    # which calls this helper. Guard re-entry so contract checks that touch
+    # ``use_v2_model_runner`` cannot recurse forever.
+    if getattr(vllm_config, "_vllm_hcu_pcp_scope_checking", False):
+        parallel_config = _require_hcu_pcp_attribute(
+            vllm_config, "parallel_config", "VllmConfig"
+        )
+        pcp_size = _require_hcu_pcp_attribute(
+            parallel_config, "prefill_context_parallel_size", "ParallelConfig"
+        )
+        return pcp_size > 1
+
     parallel_config = _require_hcu_pcp_attribute(
         vllm_config, "parallel_config", "VllmConfig"
     )
@@ -321,7 +333,11 @@ def _validate_hcu_pcp_scope(vllm_config: object) -> bool:
     if pcp_size <= 1:
         return False
 
-    _require_mrv2_pcp_contract(vllm_config)
+    object.__setattr__(vllm_config, "_vllm_hcu_pcp_scope_checking", True)
+    try:
+        _require_mrv2_pcp_contract(vllm_config)
+    finally:
+        object.__setattr__(vllm_config, "_vllm_hcu_pcp_scope_checking", False)
     return True
 
 

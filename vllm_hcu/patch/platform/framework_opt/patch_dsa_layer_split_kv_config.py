@@ -1,0 +1,293 @@
+# SPDX-License-Identifier: Apache-2.0
+# SPDX-FileCopyrightText: Copyright (c) 2026 Hygon Information Technology Co., Ltd.
+"""Packed KV shrink to SGLang owned+scratch layer slots.
+
+When DSA cache layer-split is active, shrink each page-size family to
+``max_owned + 1 (+ MTP)`` physical slots (SGLang ``effective_num_layers`` /
+``remote_kv_buffer``). Emits vLLM 0.25.1 V2 ``KVCacheTensor`` fields
+(``layers`` / ``layer_stride`` / ``block_stride`` / ``offset``) when present,
+falling back to legacy ``shared_by`` + ``offset`` + ``block_stride``.
+"""
+
+from __future__ import annotations
+
+import functools
+import inspect
+from collections import defaultdict
+from types import ModuleType
+
+from ._common import (
+    PatchCompatibilityError,
+    already_applied,
+    load_exact_module,
+    require_callable,
+)
+
+TARGET_MODULE = "vllm.v1.core.kv_cache_utils"
+PATCH_ID = "platform.framework_opt.dsa_layer_split_kv_config"
+TARGETS = (f"{TARGET_MODULE}.get_kv_cache_config_from_groups",)
+_MARKER = "_vllm_hcu_dsa_layer_split_kv_config_applied"
+_WRAPPER_PACKED = "_vllm_hcu_dsa_layer_split_kv_config_packed_wrapper"
+_WRAPPER_GROUPS = "_vllm_hcu_dsa_layer_split_kv_config_groups_wrapper"
+
+
+def _layer_split_active(vllm_config) -> bool:
+    from vllm_hcu.v1.dsa_cache_layer_split import (
+        is_dsa_cache_layer_split_requested,
+    )
+
+    if not is_dsa_cache_layer_split_requested(vllm_config):
+        return False
+    parallel = getattr(vllm_config, "parallel_config", None)
+    pcp = int(getattr(parallel, "prefill_context_parallel_size", 1) or 1)
+    return pcp > 1
+
+
+def _bucket_layers_by_page_size(kv_cache_groups) -> dict[int, list[list[str]]]:
+    """page_size -> list of single-layer slots (stable within each family)."""
+    buckets: dict[int, list[list[str]]] = defaultdict(list)
+    for group in kv_cache_groups:
+        spec = group.kv_cache_spec
+        per_layer = getattr(spec, "kv_cache_specs", None)
+        if per_layer:
+            # Preserve insertion order of the UniformType map.
+            for layer_name, layer_spec in per_layer.items():
+                buckets[int(layer_spec.page_size_bytes)].append([str(layer_name)])
+            continue
+        page_size = int(spec.page_size_bytes)
+        for layer_name in getattr(group, "layer_names", []) or []:
+            buckets[page_size].append([str(layer_name)])
+    return dict(buckets)
+
+
+def apply_to_module(module: ModuleType) -> bool:
+    kv_cache_utils = load_exact_module(TARGET_MODULE, module)
+    has_packed = callable(
+        getattr(kv_cache_utils, "_get_kv_cache_config_packed", None)
+    )
+    wrapped = [
+        (
+            kv_cache_utils,
+            "get_kv_cache_config_from_groups",
+            _WRAPPER_GROUPS,
+        )
+    ]
+    if has_packed:
+        wrapped.insert(
+            0,
+            (
+                kv_cache_utils,
+                "_get_kv_cache_config_packed",
+                _WRAPPER_PACKED,
+            ),
+        )
+    if already_applied(kv_cache_utils, _MARKER, wrapped):
+        return False
+
+    original_groups = require_callable(
+        kv_cache_utils, "get_kv_cache_config_from_groups", TARGETS[0]
+    )
+    signature = inspect.signature(original_groups)
+    if tuple(signature.parameters) != (
+        "vllm_config",
+        "kv_cache_groups",
+        "available_memory",
+    ):
+        raise PatchCompatibilityError(
+            f"required HCU patch target has incompatible signature {signature}"
+        )
+
+    original_packed = None
+    if has_packed:
+        original_packed = require_callable(
+            kv_cache_utils,
+            "_get_kv_cache_config_packed",
+            f"{TARGET_MODULE}._get_kv_cache_config_packed",
+        )
+
+    may_override = require_callable(
+        kv_cache_utils,
+        "may_override_num_blocks",
+        f"{TARGET_MODULE}.may_override_num_blocks",
+    )
+    bucket_fn = getattr(kv_cache_utils, "_bucket_layers_by_page_size", None)
+    if not callable(bucket_fn):
+        bucket_fn = _bucket_layers_by_page_size
+
+    kv_cache_config_cls = getattr(kv_cache_utils, "KVCacheConfig", None)
+    if kv_cache_config_cls is None:
+        from vllm.v1.kv_cache_interface import KVCacheConfig as kv_cache_config_cls
+
+    kv_cache_tensor_cls = getattr(kv_cache_utils, "KVCacheTensor", None)
+    if kv_cache_tensor_cls is None:
+        from vllm.v1.kv_cache_interface import KVCacheTensor as kv_cache_tensor_cls
+
+    def _shrunk_packed_plan(vllm_config, kv_cache_groups, available_memory):
+        from vllm_hcu.v1.dsa_cache_layer_split import (
+            _total_layers_from_config,
+            make_packed_kv_tensor,
+            parse_layer_index,
+            phys_slots_for_layer_family,
+        )
+        from vllm.logger import init_logger
+
+        logger = init_logger("vllm_hcu.dsa_layer_split_kv")
+
+        total_layers = _total_layers_from_config(vllm_config)
+        if total_layers is None or total_layers <= 0:
+            return None
+
+        parallel = getattr(vllm_config, "parallel_config", None)
+        pcp = int(getattr(parallel, "prefill_context_parallel_size", 1) or 1)
+
+        buckets = bucket_fn(kv_cache_groups)
+        page_sizes = sorted(buckets)
+        phys_slots: dict[int, int] = {}
+        for page_size in page_sizes:
+            slots = buckets[page_size]
+            indices: list[int] = []
+            for slot in slots:
+                if not slot:
+                    continue
+                try:
+                    indices.append(parse_layer_index(slot[0]))
+                except Exception:
+                    indices.append(-1)
+            phys_slots[page_size] = phys_slots_for_layer_family(
+                indices, int(total_layers), pcp
+            )
+
+        total_num_bytes_per_block = sum(
+            page_size * phys_slots[page_size] for page_size in page_sizes
+        )
+        if total_num_bytes_per_block <= 0:
+            return None
+
+        full_bytes = sum(
+            page_size * len(buckets[page_size]) for page_size in page_sizes
+        )
+        if total_num_bytes_per_block >= full_bytes:
+            return None
+
+        num_blocks = available_memory // total_num_bytes_per_block
+        num_blocks = may_override(vllm_config, num_blocks)
+        total_size = total_num_bytes_per_block * num_blocks
+
+        kv_cache_tensors = []
+        byte_offset_base = 0
+        for page_size in page_sizes:
+            slots = buckets[page_size]
+            n_phys = phys_slots[page_size]
+            for slot_idx, slot in enumerate(slots):
+                # Provisional clamp; workers rewrite via remap_packed_*.
+                phys_idx = min(slot_idx, n_phys - 1)
+                kv_cache_tensors.append(
+                    make_packed_kv_tensor(
+                        kv_cache_tensor_cls,
+                        size=total_size,
+                        layer_names=list(slot),
+                        page_size=page_size,
+                        offset=byte_offset_base + phys_idx * page_size,
+                        block_stride=total_num_bytes_per_block,
+                    )
+                )
+            byte_offset_base += n_phys * page_size
+
+        logger.warning(
+            "DSA layer-split packed KV plan: full_bytes/block=%d "
+            "owned_scratch_bytes/block=%d ratio=%.3f num_blocks=%d "
+            "phys_slots=%s",
+            full_bytes,
+            total_num_bytes_per_block,
+            (total_num_bytes_per_block / full_bytes) if full_bytes else 0.0,
+            num_blocks,
+            dict(phys_slots),
+        )
+        return num_blocks, kv_cache_tensors
+
+    def _config_from_plan(plan, kv_cache_groups, vllm_config):
+        num_blocks, kv_cache_tensors = plan
+        kwargs = dict(
+            num_blocks=num_blocks,
+            kv_cache_tensors=kv_cache_tensors,
+            kv_cache_groups=kv_cache_groups,
+        )
+        fields = getattr(kv_cache_config_cls, "__dataclass_fields__", {})
+        if "prefix_cache_retention_interval" in fields:
+            cache_config = getattr(vllm_config, "cache_config", None)
+            kwargs["prefix_cache_retention_interval"] = getattr(
+                cache_config, "prefix_cache_retention_interval", None
+            )
+        return kv_cache_config_cls(**kwargs)
+
+    if original_packed is not None:
+
+        @functools.wraps(original_packed)
+        def hcu_get_kv_cache_config_packed(
+            vllm_config, kv_cache_groups, available_memory
+        ):
+            if not _layer_split_active(vllm_config):
+                return original_packed(
+                    vllm_config, kv_cache_groups, available_memory
+                )
+            plan = _shrunk_packed_plan(
+                vllm_config, kv_cache_groups, available_memory
+            )
+            if plan is None:
+                return original_packed(
+                    vllm_config, kv_cache_groups, available_memory
+                )
+            return plan
+
+        setattr(hcu_get_kv_cache_config_packed, _WRAPPER_PACKED, True)
+        setattr(
+            kv_cache_utils,
+            "_vllm_hcu_original_get_kv_cache_config_packed",
+            original_packed,
+        )
+        setattr(
+            kv_cache_utils,
+            "_get_kv_cache_config_packed",
+            hcu_get_kv_cache_config_packed,
+        )
+        if hasattr(kv_cache_utils, "_get_kv_cache_config_deepseek_v4"):
+            setattr(
+                kv_cache_utils,
+                "_get_kv_cache_config_deepseek_v4",
+                hcu_get_kv_cache_config_packed,
+            )
+
+    @functools.wraps(original_groups)
+    def hcu_get_kv_cache_config_from_groups(
+        vllm_config, kv_cache_groups, available_memory
+    ):
+        if not _layer_split_active(vllm_config) or not kv_cache_groups:
+            return original_groups(vllm_config, kv_cache_groups, available_memory)
+
+        plan = _shrunk_packed_plan(
+            vllm_config, kv_cache_groups, available_memory
+        )
+        if plan is None:
+            return original_groups(vllm_config, kv_cache_groups, available_memory)
+        return _config_from_plan(plan, kv_cache_groups, vllm_config)
+
+    setattr(hcu_get_kv_cache_config_from_groups, _WRAPPER_GROUPS, True)
+    setattr(
+        kv_cache_utils,
+        "_vllm_hcu_original_get_kv_cache_config_from_groups",
+        original_groups,
+    )
+    setattr(
+        kv_cache_utils,
+        "get_kv_cache_config_from_groups",
+        hcu_get_kv_cache_config_from_groups,
+    )
+    setattr(kv_cache_utils, _MARKER, True)
+    return True
+
+
+def apply(module: ModuleType | None = None) -> bool:
+    return apply_to_module(load_exact_module(TARGET_MODULE, module))
+
+
+__all__ = ["PATCH_ID", "TARGET_MODULE", "TARGETS", "apply", "apply_to_module"]
