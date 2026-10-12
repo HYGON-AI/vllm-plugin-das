@@ -17,6 +17,11 @@ layout of upstream vLLM PR #56322 to the AMD model:
   sharded back (PLE is a single early layer, so the extra gather is cheap);
 * the final mixer outputs are all-gathered once (packed with the MTP state).
 
+When ``patch_qwen4_exp_fused_ple`` is active (registered just before this
+adapter), the replacement decoder forward keeps its fused-PLE contract: the
+HCU PLE returns the materialized state including the residual, so it is not
+added again.
+
 The MTP drafter counterpart lives in ``patch_qwen4_exp_sp_mtp``.  Every
 replaced function is a fingerprint-checked copy of the audited source with
 only the SP branches added; with HC SP disabled it executes the original code
@@ -80,6 +85,9 @@ get_tensor_model_parallel_world_size = None
 tensor_model_parallel_reduce_scatter = None
 sp_all_gather = None
 _custom_collective = None
+# Whether the decoder forward being replaced is the fused-PLE forward; decided
+# once at apply time.
+_fused_ple = False
 # The patched module; names the original forwards resolve from it
 # (``get_pp_group``, ``IntermediateTensors``, classes) are looked up there.
 _target: ModuleType | None = None
@@ -214,6 +222,7 @@ def _rebuild_init_without_guard(owner: type, target: str):
     init = vars(owner).get("__init__")
     if not callable(init):
         raise PatchCompatibilityError(f"required HCU patch target {target} is missing")
+    _require_unwrapped(init, target)
     source = _checked_source(init, f"{owner.__name__}.__init__", target)
 
     function_def = ast.parse(source).body[0]
@@ -246,7 +255,7 @@ def _rebuild_init_without_guard(owner: type, target: str):
     filename = inspect.getsourcefile(init) or init.__code__.co_filename
     exec(compile(module_ast, filename, "exec"), init.__globals__, namespace)
     rebuilt = namespace["_factory"](owner)
-    functools.update_wrapper(rebuilt, init)
+    _adopt_metadata(rebuilt, init)
     return init, rebuilt
 
 
@@ -309,24 +318,20 @@ def decoder_forward(
 
         if input_ids is None or query_start_loc is None or ngram_context is None:
             raise RuntimeError("PLE inputs were not prepared")
+        # PLE's short convolution spans tokens: under HC SP run it on the
+        # full state and keep this rank's rows of the result.
+        ple_input = (
+            sp_all_gather(hidden_states)[:num_tokens] if hc_sp else hidden_states
+        )
+        ple_output = self.ple(ple_input, input_ids, query_start_loc, ngram_context)
         if hc_sp:
-            # PLE's short convolution spans tokens: run it on the full state.
-            full_hidden_states = sp_all_gather(hidden_states)[:num_tokens]
-            hidden_states = hidden_states + sp_shard(
-                self.ple(
-                    full_hidden_states,
-                    input_ids,
-                    query_start_loc,
-                    ngram_context,
-                )
-            )
+            ple_output = sp_shard(ple_output)
+        if _fused_ple:
+            # Fused PLE owns the residual addition and returns the materialized
+            # multi-stream state. Adding hidden_states again would double it.
+            hidden_states = ple_output
         else:
-            hidden_states = hidden_states + self.ple(
-                hidden_states,
-                input_ids,
-                query_start_loc,
-                ngram_context,
-            )
+            hidden_states = hidden_states + ple_output
 
     # Fuse a pending combine with this HC module's mix when possible.
     if prev_block_output is not None and prev_injection is not None:
@@ -477,18 +482,76 @@ def same_parameters(a, b) -> bool:
     ]
 
 
+def _require_unwrapped(function, target: str, module: str = TARGET_MODULE) -> None:
+    # inspect.getsource follows ``__wrapped__``, so a foreign wrapper would pass
+    # the fingerprint check of the function it wraps. Reject it explicitly.
+    if (
+        getattr(function, "__module__", None) != module
+        or hasattr(function, "__wrapped__")
+    ):
+        raise PatchCompatibilityError(
+            f"required HCU patch target {target} was already replaced by "
+            f"{getattr(function, '__module__', None)}; refusing to override it"
+        )
+
+
+def _adopt_metadata(replacement, original) -> None:
+    # Copy name/doc only: copying ``__dict__`` would also copy other patches'
+    # wrapper markers and defeat their idempotence checks.
+    functools.update_wrapper(replacement, original, updated=())
+
+
 def _replacement_forward(owner: type, key: str, target: str, replacement):
     original = vars(owner).get("forward")
     if not callable(original):
         raise PatchCompatibilityError(f"required HCU patch target {target} is missing")
+    _require_unwrapped(original, target)
     _checked_source(original, key, target)
     if not same_parameters(original, replacement):
         raise PatchCompatibilityError(
             f"required HCU patch target {target} has incompatible signature "
             f"{inspect.signature(original)}"
         )
-    functools.update_wrapper(replacement, original)
+    _adopt_metadata(replacement, original)
     return original
+
+
+def _resolve_decoder_forward(model_module: ModuleType, decoder_class: type) -> bool:
+    """Validate the decoder forward to replace; return whether it is fused PLE."""
+    from . import patch_qwen4_exp_fused_ple as fused
+
+    current = vars(decoder_class).get("forward")
+    if not callable(current):
+        raise PatchCompatibilityError(f"required HCU patch target {TARGETS[2]} is missing")
+    if not getattr(current, fused._FORWARD_WRAPPER, False):
+        ple_class = getattr(model_module, "Qwen4ExpPLELayer", None)
+        if getattr(ple_class, "__module__", "").startswith("vllm_hcu."):
+            # The HCU PLE returns the residual-included state; the unfused
+            # forward would add the residual a second time.
+            raise PatchCompatibilityError(
+                f"{TARGETS[2]} uses the HCU PLE replacement but "
+                f"{fused.PATCH_ID} is not applied"
+            )
+        _replacement_forward(
+            decoder_class, "Qwen4ExpDecoderLayer.forward", TARGETS[2], decoder_forward
+        )
+        return False
+    if not getattr(model_module, fused._MARKER, False):
+        raise PatchCompatibilityError(
+            f"{TARGETS[2]} carries a fused PLE marker without {fused.PATCH_ID}"
+        )
+    # The fused forward is the original one with only the PLE residual moved
+    # into the PLE op; audit the original it replaced.
+    original = getattr(model_module, fused._ORIGINAL_FORWARD)
+    _require_unwrapped(original, TARGETS[2])
+    _checked_source(original, "Qwen4ExpDecoderLayer.forward", TARGETS[2])
+    if not same_parameters(current, decoder_forward):
+        raise PatchCompatibilityError(
+            f"required HCU patch target {TARGETS[2]} has incompatible signature "
+            f"{inspect.signature(current)}"
+        )
+    _adopt_metadata(decoder_forward, original)
+    return True
 
 
 def apply_to_module(module: ModuleType) -> bool:
@@ -526,9 +589,7 @@ def apply_to_module(module: ModuleType) -> bool:
         defaults={"prefix": ""},
     )
     decoder_init = _make_decoder_init(guardless_decoder_init)
-    _replacement_forward(
-        decoder_class, "Qwen4ExpDecoderLayer.forward", TARGETS[2], decoder_forward
-    )
+    fused_ple = _resolve_decoder_forward(model_module, decoder_class)
     model_init = _make_model_init(
         _require_model_init_compatible(model_class, TARGETS[3])
     )
@@ -536,10 +597,18 @@ def apply_to_module(module: ModuleType) -> bool:
         model_class, "Qwen4ExpModel.forward", TARGETS[4], model_forward
     )
     _bind_runtime_names(model_module)
+    global _fused_ple
+    _fused_ple = fused_ple
 
     replacements = (moe_init, decoder_init, decoder_forward, model_init, model_forward)
     for function in replacements:
         setattr(function, _WRAPPER, True)
+    if fused_ple:
+        # This forward keeps the fused PLE contract, so it stands in for the
+        # fused wrapper in that patch's idempotence check.
+        from . import patch_qwen4_exp_fused_ple as fused
+
+        setattr(decoder_forward, fused._FORWARD_WRAPPER, True)
     try:
         for (owner, name), function in zip(slots, replacements):
             setattr(owner, name, function)

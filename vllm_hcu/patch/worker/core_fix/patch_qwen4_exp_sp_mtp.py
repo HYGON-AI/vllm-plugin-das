@@ -169,12 +169,13 @@ def apply_to_module(module: ModuleType) -> bool:
             f"required HCU patch target {TARGETS[1]} has incompatible signature "
             f"{inspect.signature(original)}"
         )
+    sp._require_unwrapped(original, TARGETS[1], TARGET_MODULE)
     init = _require_model_init_compatible(predictor, TARGETS[0])
     global _target
     _target = mtp_module
 
     hcu_init = _make_init(init)
-    functools.update_wrapper(forward, original)
+    sp._adopt_metadata(forward, original)
     setattr(hcu_init, _WRAPPER, True)
     setattr(forward, _WRAPPER, True)
     setattr(forward, mtp_pp._WRAPPER, True)
