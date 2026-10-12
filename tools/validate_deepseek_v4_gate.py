@@ -116,6 +116,7 @@ def main():
                             torch.testing.assert_close(eager_head[0], expected, rtol=0, atol=0)
                             graph_results = []
                             graph_exact = True
+                            graph_logits_exact = True
                             for name, fn, eager in [('base', base, eager_base), ('head', head, eager_head)]:
                                 stream = torch.cuda.Stream()
                                 stream.wait_stream(torch.cuda.current_stream())
@@ -128,6 +129,7 @@ def main():
                                     captured = fn()
                                 graph.replay()
                                 torch.cuda.synchronize()
+                                graph_logits_exact &= torch.equal(captured[0], eager[0])
                                 torch.testing.assert_close(captured[0], eager[0], rtol=0, atol=0)
                                 # BF16 rounding creates ties. CUDA graph topk may
                                 # choose different tied IDs while remaining valid.
@@ -154,7 +156,7 @@ def main():
                                     'topk_set_changed_tokens': (b_ids != h_ids).any(-1).sum().item(),
                                     'weights_max_abs_aligned': (h_weights-b_weights).abs().max().item(),
                                     'weights_mean_l1_per_token': (h_weights-b_weights).abs().sum(-1).mean().item(),
-                                    'eager_graph_logits_exact': True,
+                                    'eager_graph_logits_exact': graph_logits_exact,
                                     'eager_graph_routing_exact': graph_exact})
         finally:
             destroy_model_parallel()
