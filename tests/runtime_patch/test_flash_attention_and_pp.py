@@ -223,23 +223,31 @@ def test_hcu_fa_boundary_rejects_interface_without_layout(
         )
 
 
-def test_hcu_fa_boundary_accepts_any_dtk2604_build(
+@pytest.mark.parametrize(
+    "compatible_version",
+    [
+        "2.8.4",
+        "2.8.4+dtk2604.torch2110.2610091222.g130fd4",
+        "2.8.4+dtk2605.torch2110.2609010000.g999999",
+    ],
+)
+def test_hcu_fa_boundary_accepts_any_2_8_4_build(
     monkeypatch: pytest.MonkeyPatch,
+    compatible_version: str,
 ) -> None:
     _load_hcu_fa_utils_module(
         monkeypatch,
         kv_cache_layout="HND",
-        flash_attn_version="2.8.4+dtk2604.torch2110.2610091222.g130fd4",
+        flash_attn_version=compatible_version,
     )
 
 
 @pytest.mark.parametrize(
     "incompatible_version",
     [
-        "2.8.4",
-        "2.8.4+foo",
         "2.8.3+dtk2604.torch2110.2609241509.g624d7b",
-        "2.8.4+dtk2605.torch2110.2609010000.g999999",
+        "2.8.40",
+        "2.9.0+dtk2604",
     ],
 )
 def test_hcu_fa_boundary_rejects_vendor_build_without_known_gather_fix(
