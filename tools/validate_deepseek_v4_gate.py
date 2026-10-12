@@ -18,6 +18,20 @@ import torch
 import torch.nn.functional as F
 
 
+def validate_topk_routing(logits, ids, weights, topk, routed_scaling_factor):
+    """Allow tied expert IDs only when their scores form a complete top-k."""
+    scores = F.softplus(logits).sqrt()
+    selected = scores.gather(1, ids)
+    reference = scores.topk(topk, dim=-1).values
+    torch.testing.assert_close(
+        selected.sort(dim=-1).values, reference.sort(dim=-1).values,
+        rtol=0, atol=0,
+    )
+    assert (ids.sort(-1).values.diff(dim=-1) > 0).all()
+    expected_weights = selected / selected.sum(-1, keepdim=True) * routed_scaling_factor
+    torch.testing.assert_close(weights, expected_weights, rtol=0, atol=0)
+
+
 def main():
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument('--hidden-size', type=int, default=4096)
@@ -133,13 +147,10 @@ def main():
                                 torch.testing.assert_close(captured[0], eager[0], rtol=0, atol=0)
                                 # BF16 rounding creates ties. CUDA graph topk may
                                 # choose different tied IDs while remaining valid.
-                                scores = F.softplus(captured[0]).sqrt()
-                                selected = scores.gather(1, captured[1])
-                                cutoff = scores.topk(args.topk, dim=-1).values[:, -1:]
-                                assert (selected >= cutoff).all()
-                                assert (captured[1].sort(-1).values.diff(dim=-1) > 0).all()
-                                expected_weights = selected / selected.sum(-1, keepdim=True) * args.routed_scaling_factor
-                                torch.testing.assert_close(captured[2], expected_weights, rtol=0, atol=0)
+                                validate_topk_routing(
+                                    captured[0], captured[1], captured[2],
+                                    args.topk, args.routed_scaling_factor,
+                                )
                                 graph_exact &= all(torch.equal(a, b) for a, b in zip(captured, eager))
                                 graph_results.append(tuple(t.clone() for t in captured))
                             for mode, b, h in [('eager', eager_base, eager_head),
