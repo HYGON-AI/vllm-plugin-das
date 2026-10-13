@@ -38,6 +38,41 @@ _PLATFORM_PLUGIN_LOCK = threading.RLock()
 _PLATFORM_INIT_FAILURE: Exception | None = None
 
 
+def _bridge_plugin_logging() -> None:
+    """Route ``vllm_hcu.*`` records onto the same stream vLLM logs to.
+
+    vLLM attaches its handler to the ``vllm`` logger tree only; plugin
+    records otherwise propagate to the root, whose last-resort writer drops
+    everything below WARNING -- hiding exactly the one-shot lifecycle INFO
+    lines (auxiliary-comm construction, DSpark shard enablement) an operator
+    must be able to see when validating the role-separation deployment.
+    vLLM's own handlers are reused when already configured; idempotent.
+    """
+
+    import logging
+
+    root = logging.getLogger("vllm_hcu")
+    if getattr(root, "_hcu_bridge_done", False):
+        return
+    handlers = list(logging.getLogger("vllm").handlers)
+    if not handlers:
+        handler = logging.StreamHandler()
+        handler.setFormatter(
+            logging.Formatter(
+                "%(asctime)s %(levelname)s %(name)s - %(message)s"
+            )
+        )
+        handlers = [handler]
+    for handler in handlers:
+        root.addHandler(handler)
+    root.setLevel(logging.INFO)
+    root.propagate = False
+    root._hcu_bridge_done = True  # type: ignore[attr-defined]
+
+
+_bridge_plugin_logging()
+
+
 def _apply_platform_preserving_role() -> None:
     """Apply the platform phase without losing an already-known process role.
 

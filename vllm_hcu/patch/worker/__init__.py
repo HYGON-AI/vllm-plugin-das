@@ -329,6 +329,22 @@ _FRAMEWORK_CALLBACKS: tuple[_CallbackSpec, ...] = (
     _CallbackSpec(
         _adapter("framework_opt", "patch_pcp_model_state"),
     ),
+    # The wheel DSpark lm_head share probes target_model.lm_head only; a
+    # *ForConditionalGeneration K3 target keeps its head on the language
+    # model, so the share is skipped and profile_run dies on the draft's
+    # "target LM head has not been attached" guard.  Re-run the share with
+    # the fork-parity resolved head (fork 877e6996 get_target_lm_head).
+    _CallbackSpec(
+        _adapter("framework_opt", "patch_dspark_target_lm_head_share"),
+    ),
+    # Fork 877e6996 resets num_accepted_tokens_gpu unconditionally in
+    # MambaHybridModelState.add_request; the wheel gates it on _align_mode,
+    # which never runs with the default mamba_cache_mode="none".  Recycled
+    # slots then inherit stale acceptance counts and the GDN state rollback
+    # rewinds by wrong depths (bs>=2 speculative acceptance collapse).
+    _CallbackSpec(
+        _adapter("framework_opt", "patch_mamba_acceptance_reset"),
+    ),
     # v0.25.1 has no SlotMappingMode, so MultiGroupBlockTable launches the
     # slot-mapping kernel once per KV cache group even for Mamba/GDN groups.
     _CallbackSpec(

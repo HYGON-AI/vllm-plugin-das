@@ -495,6 +495,30 @@
       ],
       "jobs": ["hy4-contract", "accuracy-gfx936", "accuracy-gfx938"]
     },
+    "kimi-k3-role-separation": {
+      "patterns": [
+        "vllm_hcu/models/kimi_k3/role_separation.py",
+        "vllm_hcu/models/kimi_k3/dspark.py",
+        "vllm_hcu/models/kimi_k3/amd/linear.py",
+        "vllm_hcu/patch/worker/framework_opt/patch_dspark_role_separation.py",
+        "tests/patch/test_kimi_dspark_role_separation.py"
+      ],
+      "jobs": ["hy4-contract", "accuracy-gfx936", "accuracy-gfx938"]
+    },
+    "kimi-k3-dspark-speculative-arch": {
+      "patterns": [
+        "vllm_hcu/patch/platform/core_fix/patch_kimi_k3_dspark_speculative_arch.py",
+        "tests/patch/test_kimi_k3_dspark_speculative_arch.py"
+      ],
+      "jobs": ["hy4-contract", "accuracy-gfx936", "accuracy-gfx938"]
+    },
+    "hcu-triton-mla-non-causal": {
+      "patterns": [
+        "vllm_hcu/v1/attention/backends/mla/triton_mla.py",
+        "tests/patch/test_hcu_triton_mla_non_causal.py"
+      ],
+      "jobs": ["hy4-contract", "accuracy-gfx936", "accuracy-gfx938"]
+    },
     "hy4-contract": {
       "patterns": [
         "vllm_hcu/**hy_v4*",
