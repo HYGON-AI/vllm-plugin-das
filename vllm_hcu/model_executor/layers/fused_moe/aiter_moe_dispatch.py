@@ -122,7 +122,7 @@ def _solution_token(config: object) -> str:
 def aiter_moe_config_supports_expert_map(config: object) -> bool:
     """Return whether an AITER config routes global IDs through expert_map.
 
-    MOE_C encodes its sorting route in the ten-millions digit of MODE.  A
+    MOE_C encodes its sorting route in the millions digit of MODE.  A
     value of one selects ``moe_align``, which consumes the expert map; zero
     selects CK sorting, which leaves global expert IDs for the GEMM kernel.
     Unknown MOE_C metadata is rejected so expert-parallel callers fail safe.
