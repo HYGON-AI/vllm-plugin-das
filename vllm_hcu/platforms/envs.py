@@ -41,6 +41,10 @@ if TYPE_CHECKING:
     VLLM_HCU_USE_LIGHTOP_SPARSE_MLA_TOPK: bool = True
     VLLM_HCU_USE_LIGHTOP_FAST_TOPK_TRANSFORM: bool = True
     VLLM_HCU_USE_AITER_MHC: bool = True
+    VLLM_HCU_USE_AITER_MHC_POST: bool = True
+    VLLM_HCU_USE_AITER_MHC_PRE: bool = True
+    VLLM_HCU_USE_AITER_TILELANG_MHC: bool = False
+    VLLM_HCU_USE_AITER_MHC_FUSED: bool = False
     VLLM_HCU_USE_TILELANG_MHC_PRENORM: bool = True
     VLLM_HCU_DEEPSEEK_V4_ROCM_DECODE_FALLBACK: bool = False
     VLLM_HCU_DEEPSEEK_V4_ROCM_FAST_WOA: bool = True
@@ -352,6 +356,30 @@ hcu_vllm_environment_variables: dict[str, Callable[[], Any]] = {
     "VLLM_HCU_USE_AITER_MHC":
         lambda: (os.environ.get("VLLM_HCU_USE_AITER_MHC", "True").lower() in
                     ("true", "1")),
+
+    # Enable Post even when AITER lacks the delayed Pre interface.
+    "VLLM_HCU_USE_AITER_MHC_POST":
+        lambda: _environment_flag(
+            os.environ.get("VLLM_HCU_USE_AITER_MHC_POST", "True")
+        ),
+
+    # HCU Pre is independent of Post and of the global ROCm AITER switch.
+    "VLLM_HCU_USE_AITER_MHC_PRE":
+        lambda: _environment_flag(
+            os.environ.get("VLLM_HCU_USE_AITER_MHC_PRE", "True")
+        ),
+
+    # Match SGLang's opt-in HCU AITER TileLang mHC path.
+    "VLLM_HCU_USE_AITER_TILELANG_MHC":
+        lambda: _environment_flag(
+            os.environ.get("VLLM_HCU_USE_AITER_TILELANG_MHC", "False")
+        ),
+
+    # Generic HIP fusion is optional; HCU defaults to separate Post and Pre.
+    "VLLM_HCU_USE_AITER_MHC_FUSED":
+        lambda: _environment_flag(
+            os.environ.get("VLLM_HCU_USE_AITER_MHC_FUSED", "False")
+        ),
 
     # If use TileLang MHC prenorm impl, please set True
     "VLLM_HCU_USE_TILELANG_MHC_PRENORM":
