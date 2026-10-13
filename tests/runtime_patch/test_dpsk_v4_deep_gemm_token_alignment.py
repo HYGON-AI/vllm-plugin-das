@@ -296,3 +296,86 @@ def test_moe_problem_size_3d_expert_count_mismatch_raises() -> None:
 
     with pytest.raises(AssertionError):
         obj.moe_problem_size(a1, w13, w2, topk_ids)
+
+
+
+# ---------------------------------------------------------------------------
+# Packed-weight reload gates
+# ---------------------------------------------------------------------------
+
+def _make_reload_expert(kind: str, monkeypatch: pytest.MonkeyPatch):
+    from vllm_hcu.model_executor.layers.fused_moe.experts.dpsk_v4_deep_gemm_moe import (
+        DeepEPAutoDeepGemmExperts,
+        DeepEPDeepGemmContiguousExperts,
+        DeepEPDeepGemmMaskedExperts,
+    )
+
+    ht = object.__new__(DeepEPDeepGemmContiguousExperts)
+    ll = object.__new__(DeepEPDeepGemmMaskedExperts)
+
+    def unexpected_pack(*args, **kwargs):
+        pytest.fail("Packed reload weights must not be repacked")
+
+    for expert in (ht, ll):
+        expert._deepgemm_w13 = torch.empty(0)
+        expert._deepgemm_w2 = torch.empty(0)
+        monkeypatch.setattr(expert, "_pack_channel_weights", unexpected_pack)
+    if kind == "auto":
+        obj = object.__new__(DeepEPAutoDeepGemmExperts)
+        obj.ht_experts = ht
+        obj.ll_experts = ll
+        return obj, [ht, ll], "contiguous+masked"
+    obj = ht if kind == "contiguous" else ll
+    return obj, [obj], obj.WEIGHT_LAYOUT
+
+
+def _make_reload_layer(layout: str, w13_rank: int, w2_rank: int):
+    factories = {6: _make_6dim_weights, 7: _make_7dim_weights}
+    w13, _ = factories[w13_rank](1, 64, 64)
+    _, w2 = factories[w2_rank](1, 64, 64)
+    ll_w13, ll_w2 = _make_7dim_weights(1, 64, 64)
+    return SimpleNamespace(
+        w13_weight=w13,
+        w2_weight=w2,
+        w13_weight_scale=torch.empty(1, 128, 1),
+        w2_weight_scale=torch.empty(1, 64, 1),
+        _dsv4_channel_deepgemm_layout=layout,
+        _dsv4_channel_deepgemm_masked_w13=ll_w13,
+        _dsv4_channel_deepgemm_masked_w2=ll_w2,
+    )
+
+
+@pytest.mark.parametrize("kind", ["contiguous", "masked", "auto"])
+@pytest.mark.parametrize("w13_rank,w2_rank", [(6, 7), (7, 6)])
+def test_reload_rejects_mixed_packed_ranks(kind, w13_rank, w2_rank, monkeypatch):
+    """Reject mixed packed ranks during loading, before changing expert caches."""
+    obj, experts, layout = _make_reload_expert(kind, monkeypatch)
+    layer = _make_reload_layer(layout, w13_rank, w2_rank)
+    weights_before = (layer.w13_weight, layer.w2_weight)
+    caches_before = [(e._deepgemm_w13, e._deepgemm_w2) for e in experts]
+
+    with pytest.raises(RuntimeError, match="invalid reloaded weights"):
+        obj.process_weights_after_loading(layer)
+
+    assert layer.w13_weight is weights_before[0]
+    assert layer.w2_weight is weights_before[1]
+    assert layer._dsv4_channel_deepgemm_layout == layout
+    for expert, (w13, w2) in zip(experts, caches_before):
+        assert expert._deepgemm_w13 is w13
+        assert expert._deepgemm_w2 is w2
+
+
+@pytest.mark.parametrize("kind", ["contiguous", "masked", "auto"])
+@pytest.mark.parametrize("rank", [6, 7])
+def test_reload_reuses_matching_packed_ranks(kind, rank, monkeypatch):
+    """Both supported matching-rank layouts reuse packed storage without packing."""
+    obj, experts, layout = _make_reload_expert(kind, monkeypatch)
+    layer = _make_reload_layer(layout, rank, rank)
+
+    obj.process_weights_after_loading(layer)
+
+    assert experts[0]._deepgemm_w13 is layer.w13_weight
+    assert experts[0]._deepgemm_w2 is layer.w2_weight
+    if kind == "auto":
+        assert experts[1]._deepgemm_w13 is layer._dsv4_channel_deepgemm_masked_w13
+        assert experts[1]._deepgemm_w2 is layer._dsv4_channel_deepgemm_masked_w2

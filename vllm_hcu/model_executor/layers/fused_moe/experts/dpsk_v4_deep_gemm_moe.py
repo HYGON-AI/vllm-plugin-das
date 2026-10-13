@@ -186,7 +186,10 @@ class DeepEPDeepGemmContiguousExperts(TritonExperts):
             None,
         )
         if packed_layout == self.WEIGHT_LAYOUT:
-            if layer.w13_weight.dim() in (6, 7) and layer.w2_weight.dim() in (6, 7):
+            if (
+                layer.w13_weight.dim() in (6, 7)
+                and layer.w2_weight.dim() == layer.w13_weight.dim()
+            ):
                 self._deepgemm_w13 = layer.w13_weight
                 self._deepgemm_w2 = layer.w2_weight
                 return
@@ -822,7 +825,10 @@ class DeepEPAutoDeepGemmExperts(mk.FusedMoEExpertsModular):
                 "_dsv4_channel_deepgemm_masked_w2",
                 None,
             )
-            if layer.w13_weight.dim() in (6, 7) and layer.w2_weight.dim() in (6, 7):
+            if (
+                layer.w13_weight.dim() in (6, 7)
+                and layer.w2_weight.dim() == layer.w13_weight.dim()
+            ):
                 if ll_w13 is None or ll_w2 is None:
                     raise RuntimeError(
                         "DeepEP auto DeepGEMM layer lost its masked weight layout"
