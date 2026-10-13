@@ -100,13 +100,12 @@ def implementation(monkeypatch):
     from vllm_hcu.models.gemma4 import attention as module
 
     calls = []
-    from vllm_hcu.models.gemma4 import fa_utils
 
     def flash_forward(**kwargs):
         calls.append(("flash", kwargs))
         kwargs["out"].fill_(3)
 
-    monkeypatch.setattr(fa_utils, "gemma4_flash_attention", flash_forward)
+    monkeypatch.setattr(module, "_gemma4_flash_attention", flash_forward)
     monkeypatch.setattr(module.envs, "VLLM_BATCH_INVARIANT", False)
 
     def initialize(self, heads=16, kv_heads=2):

@@ -8,7 +8,7 @@ from types import ModuleType, SimpleNamespace
 import pytest
 import torch
 
-from vllm_hcu.models.gemma4.fa_utils import gemma4_flash_attention
+from vllm_hcu.models.gemma4.attention import _gemma4_flash_attention
 
 
 @pytest.mark.parametrize(
@@ -49,7 +49,7 @@ def test_native_gather_capacity_and_output(
     if capturing:
         seq = seq.to("meta")  # A host read of dummy lengths would fail.
     block_table = torch.zeros((batch, 2), dtype=torch.int32)
-    result = gemma4_flash_attention(
+    result = _gemma4_flash_attention(
         q=q,
         k=k,
         v=v,

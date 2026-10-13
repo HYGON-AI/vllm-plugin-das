@@ -34,7 +34,7 @@ The maintained plugin binds a model-local Attention subclass after importing
 the existing Attention constructor. It does not patch the shared Attention
 class or write upstream source files.
 
-The plugin's `models/gemma4/fa_utils.py` gathers paged KV into temporary
+A private helper in the plugin's `models/gemma4/attention.py` gathers paged KV into temporary
 contiguous K/V and calls the HCU native `pagedkv_to_contiguouskv` and
 `varlen_fwd` entry points. It does not modify or globally replace
 `flash_attn_interface.py`. It requires the HCU Flash Attention extension ABI
