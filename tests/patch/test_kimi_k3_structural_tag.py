@@ -295,15 +295,78 @@ def test_required_properties_are_individually_covered() -> None:
     assert shapes.count("SequenceFormat") >= 2, shapes
 
 
-def test_unexpressible_required_keeps_fork_shape() -> None:
-    """A required prop mapped to the permissive tag must NOT be quantified:
-    fall back to the portable single-Plus shape (fork parity)."""
+def test_union_required_pins_the_key() -> None:
+    """R11 P1: a union-valued required property keeps its declared KEY
+    pinned in the grammar (the old None-contract substituted the
+    key-agnostic permissive tag, letting closed schemas accept invented
+    argument names).  The pinned prop participates in the strict
+    per-required coverage: no Plus fallback shape remains."""
 
     tag = get_kimi_k3_structural_tag([_union_tool()], [], "required", False)
     shapes = [type(f).__name__ for f in _walk_formats(tag.format)]
-    # single Plus content=Or(tags) == the fork fallback shape; active
-    # per-property coverage would show no Plus at all (R3 #2 bare tags)
-    assert shapes.count("PlusFormat") == 1, shapes
+    assert shapes.count("PlusFormat") == 0, shapes
+    begins = [
+        getattr(f, "begin", "")
+        for f in _walk_formats(tag.format)
+        if type(f).__name__ == "TagFormat"
+    ]
+    assert any('key="mystery"' in b for b in begins), begins
+
+
+def _closed_union_tool(name: str = "py") -> FunctionToolParam:
+    return FunctionToolParam(
+        function={
+            "name": name,
+            "parameters": {
+                "type": "object",
+                "properties": {"payload": {"anyOf": [
+                    {"type": "string"}, {"type": "integer"},
+                ]}},
+                "required": ["payload"],
+                "additionalProperties": False,
+            },
+        }
+    )
+
+
+def test_closed_union_schema_rejects_invented_keys_via_xgrammar() -> None:
+    """R11 P1 end-to-end: the closed union tool must complete with the
+    required ``payload`` key (any concrete type rendering, permissive raw
+    value) and must dead-end on an invented ``key="admin"`` argument with
+    ``payload`` omitted."""
+
+    xg = pytest.importorskip("xgrammar")
+    compiler_cls = getattr(xg, "GrammarCompiler", None)
+    if compiler_cls is None or not hasattr(compiler_cls, "compile_structural_tag"):
+        pytest.skip("xgrammar lacks GrammarCompiler.compile_structural_tag")
+
+    tag = get_kimi_k3_structural_tag(
+        [_closed_union_tool()], [], "required", False
+    )
+    vocab = [
+        "a", "b", "c", "d", "e", "f", "g", "v", "3", "<", "|", ">", '"', "=",
+        "open", "close", "sep", "argument", "call", "tools", "response",
+        "message", "number", "string", "integer", "key", "py", "admin",
+        "payload", "index", "_", "s", "p", "l", "u", "t", "o", "n",
+        "r", "i", "x", " ", "1",
+    ]
+    compiled = compiler_cls(xg.TokenizerInfo(vocab)).compile_structural_tag(tag)
+
+    pre = '<|close|>response<|sep|><|open|>tools<|sep|><|open|>call tool="py" index="1"<|sep|>'
+    post = "<|close|>call<|sep|><|close|>tools<|sep|>"
+    end = "<|close|>message<|sep|>"
+    payload = '<|open|>argument key="payload" type="string"<|sep|>v<|close|>argument<|sep|>'
+    payload_num = '<|open|>argument key="payload" type="number"<|sep|>3<|close|>argument<|sep|>'
+    invented = '<|open|>argument key="admin" type="string"<|sep|>v<|close|>argument<|sep|>'
+
+    def accepts(sample: str) -> tuple[bool, bool]:
+        matcher = xg.GrammarMatcher(compiled)
+        return bool(matcher.accept_string(sample)), matcher.is_completed()
+
+    assert accepts(pre + payload + post + end) == (True, True)
+    assert accepts(pre + payload_num + post + end) == (True, True)
+    assert accepts(pre + invented + post + end)[0] is False
+    assert accepts(pre + invented + payload + post + end)[0] is False
 
 
 def test_required_branches_stagger_required_and_optional_args() -> None:

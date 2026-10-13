@@ -35,12 +35,16 @@ import inspect
 import sys
 from types import ModuleType
 
+from vllm.logger import init_logger
+
 from ._common import (
     PatchCompatibilityError,
     apply_once,
     load_exact_module,
     require_callable,
 )
+
+logger = init_logger(__name__)
 
 TARGET_MODULE = "vllm.parser.abstract_parser"
 PATCH_ID = "platform.core_fix.kimi_k3_delegating_content_pass"
@@ -78,6 +82,34 @@ def _wrap_extract(cls: type, module: ModuleType) -> None:
             # Calls were made: upstream already adopted info.content. Other
             # parsers keep the upstream contract untouched.
             return tool_calls, out
+        if getattr(request, "tool_choice", None) == "none":
+            # Review 2026-10-15 round 11 P2: the wheel's none-branch
+            # short-circuits BEFORE any tool-parser extraction, so no
+            # ``_hcu_last_extract`` record exists -- and because
+            # adjust_request deliberately KEEPS the XTML special tokens, the
+            # raw ``<|close|>response<|sep|>`` / message-close framing would
+            # reach the client.  Run the K3 content extractor for this
+            # disabled-tools path: parse the framing for the content channel
+            # and SUPPRESS any tool calls the model emitted anyway (the API
+            # contract for "none" is content only).  Checked BEFORE the
+            # exact-record branch (review R11 P3-1): a stale exact-input
+            # record left over from a previous request must not bypass the
+            # framing parse.
+            try:
+                info = self._tool_parser.extract_tool_calls(
+                    content if isinstance(content, str) else "",
+                    request=request,
+                )
+            except Exception as exc:  # noqa: BLE001 - keep upstream result
+                # Review R11 P3-2: never silent -- a framing leak here is
+                # otherwise undebuggable in production.
+                logger.warning(
+                    "kimi_k3 tool_choice=none framing extraction failed; "
+                    "returning the raw wheel output unchanged: %r",
+                    exc,
+                )
+                return tool_calls, out
+            return [], getattr(info, "content", None)
         record = self._tool_parser._hcu_last_extract
         if record is None or record[0] != content:
             # Only rewrite when the parser ran on exactly this input.
@@ -86,14 +118,14 @@ def _wrap_extract(cls: type, module: ModuleType) -> None:
         if info is not None and not getattr(info, "tools_called", False):
             # Propagate the parser's cleaned result EVEN WHEN IT IS NONE
             # (review 2026-10-15 P2): the exact-input record above proves
-            # this text WAS handled by the K3 parser, so a ``content=None``
-            # means the parser deliberately withheld everything user-facing.
-            # That covers BOTH the empty response body
-            # (``_strip_response_content`` folds "" into None) and a
-            # present-but-unparseable tools channel (e.g. max_tokens
-            # truncation mid-call), where the alternative is leaking the raw
-            # XTML delimiters; None is also the wheel's own "no content"
-            # representation in this branch.
+            # this text WAS handled by the K3 parser, so a
+            # ``content=None`` means the parser deliberately withheld
+            # everything user-facing.  That covers BOTH the empty
+            # response body (``_strip_response_content`` folds "" into
+            # None) and a present-but-unparseable tools channel (e.g.
+            # max_tokens truncation mid-call), where the alternative is
+            # leaking the raw XTML delimiters; None is also the wheel's
+            # own "no content" representation in this branch.
             out = getattr(info, "content", None)
         return tool_calls, out
 

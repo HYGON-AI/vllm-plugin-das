@@ -85,28 +85,50 @@ def _marker_holdback(text: str, head: str, word: str, tail: str) -> int:
     tolerance for suffixes: head (+spaces), head + word PREFIX, head + word
     (+spaces), head + word + TAIL PREFIX.  Canonical no-space prefixes are
     covered by :func:`_partial_tag_overlap` first.
+
+    The whitespace runs are UNBOUNDED (review 2026-10-15 round 11 P2): the
+    old fixed `+8`-slack window truncated long runs, which dropped the
+    marker head and streamed the control prefix as content.  Instead of
+    scanning a bounded window, anchor at every occurrence of ``head`` --
+    every holdable suffix STARTS with ``head``, and an occurrence at index
+    ``i`` yields a hold of ``len(text) - i`` when the remainder past the
+    head fits one of the shapes -- and keep the earliest (longest) hold.
     """
 
     esc_head, esc_word = re.escape(head), re.escape(word)
-    # "+8" slack: bounding window for whitespace runs around the word.
-    max_n = min(len(text), len(head) + len(word) + len(tail) + 8)
-    for n in range(max_n, 0, -1):
-        s = text[-n:]
-        if re.fullmatch(esc_head + r"\s*", s):
-            return n
-        m = re.fullmatch(esc_head + r"(\s*)([A-Za-z]*)", s)
-        if m is not None and len(m[2]) < len(word) and word.startswith(m[2]):
-            return n
-        if re.fullmatch(esc_head + r"\s*" + esc_word + r"\s*", s):
-            return n
-        # Tail prefix group ``<[|a-z]*``: marker tails start ``<|`` + ASCII
-        # word chars, so the group must cross the ``|`` (review follow-up
-        # R2: the earlier ``<[^|]*`` could never match past the pipe and
-        # leaked suffixes like ``<|se`` as content).
-        m = re.fullmatch(esc_head + r"\s*" + esc_word + r"\s*(<[|a-z]*)", s)
-        if m is not None and len(m[1]) < len(tail) and tail.startswith(m[1]):
-            return n
-    return 0
+    prefix_re = re.compile(esc_head + r"(\s*)([A-Za-z]*)$")
+    word_re = re.compile(esc_head + r"\s*" + esc_word + r"\s*([<|a-z]*)")
+    best = 0
+    head_len = len(head)
+    # Only the LAST head occurrence can anchor a holdable suffix: a suffix
+    # that starts at an earlier head would have to cross a later ``head``
+    # literal, and no holdable shape contains one (whitespace / letters /
+    # word / the ``<|s`` tail prefix cannot produce it).  One anchored check
+    # replaces the per-anchor scans of the first draft (review R12 P3).
+    start = text.rfind(head)
+    if start != -1 and len(text) - start > best:
+        rest_re = re.compile(r"\s*")
+        rest = text[start + head_len :]
+        if rest_re.fullmatch(rest):
+            best = len(text) - start
+        else:
+            pm = prefix_re.fullmatch(text, start)
+            if (
+                pm is not None
+                and len(pm[2]) < len(word)
+                and word.startswith(pm[2])
+            ):
+                best = len(text) - start
+            else:
+                wm = word_re.fullmatch(text, start)
+                if wm is not None:
+                    tail_prefix = wm[1]
+                    if tail_prefix == "" or (
+                        len(tail_prefix) < len(tail)
+                        and tail.startswith(tail_prefix)
+                    ):
+                        best = len(text) - start
+    return best
 
 
 class KimiK3ToolParser(ToolParser):

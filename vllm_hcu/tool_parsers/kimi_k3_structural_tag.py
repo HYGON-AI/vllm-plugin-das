@@ -132,19 +132,48 @@ def _k3_bounded_string_regex(prop: dict[str, Any]) -> str | None:
     return _K3_STRING_ATOM + f"{{{min_len},{max_len}}}"
 
 
+def _k3_pinned_key_tag(key: str) -> TagFormat:
+    """A key-pinned ``argument`` tag with permissive type and raw value.
+
+    Review 2026-10-15 round 11 P1: union (anyOf/oneOf/type-array) or
+    missing-type properties keep the declared key enforced by the grammar
+    (the key-agnostic permissive tag let closed schemas accept invented
+    argument names while omitting the declared property).  The quoted type
+    is restricted to the renderer's XTML type vocabulary (review R11 P3-3)
+    and the raw value stays AnyText so a valid call is never rejected.
+    """
+
+    return TagFormat(
+        begin=f'{_K3_OPEN}argument key="{_k3_escape_attr(key)}" ',
+        content=SequenceFormat(
+            elements=[
+                RegexFormat(
+                    pattern=r'type="(?:'
+                    + "|".join(_K3_JSON_TO_XTML_TYPE.values())
+                    + r')"'
+                    + _K3_SEP.replace("|", r"\|")
+                ),
+                AnyTextFormat(excludes=[_K3_CLOSE]),
+            ]
+        ),
+        end=_K3_ARG_CLOSE,
+    )
+
+
 def _k3_argument_tag(
     key: str,
     schema: dict[str, Any],
     root_defs: dict[str, Any] | None = None,
-) -> TagFormat | None:
+) -> TagFormat:
     """Build one ``argument`` XTML tag for property ``key``.
 
     ``string`` values are emitted raw (bounded by the close marker); every
     other JSON type is emitted as JSON and validated against the property
-    schema. A property whose type is a union / missing is left permissive so
-    a valid call is never rejected. ``root_defs`` re-attaches the tool's
-    root-level ``$defs`` / ``definitions`` to keep embedded schemas
-    self-contained.
+    schema. A property whose type is a union / missing keeps its key pinned
+    while the type attribute and value stay permissive so a valid call is
+    never rejected (review 2026-10-15 round 11 P1); this function never
+    returns None. ``root_defs`` re-attaches the tool's root-level ``$defs``
+    / ``definitions`` to keep embedded schemas self-contained.
     """
 
     prop = schema if isinstance(schema, dict) else {}
@@ -153,8 +182,10 @@ def _k3_argument_tag(
         _K3_JSON_TO_XTML_TYPE.get(json_type) if isinstance(json_type, str) else None
     )
     if xtml_type is None:
-        # Unknown / union type: constrain the key but keep the value permissive.
-        return None
+        # union / missing type: the key is PINNED with a permissive type
+        # attribute and raw value, so callers never substitute the
+        # key-agnostic permissive tag (review 2026-10-15 R11 P1).
+        return _k3_pinned_key_tag(key)
     begin = (
         f'{_K3_OPEN}argument key="{_k3_escape_attr(key)}" type="{xtml_type}"{_K3_SEP}'
     )
@@ -248,6 +279,9 @@ def _k3_arguments_block(parameters: dict[str, Any] | bool) -> Any:
             expressible[key] = tag
             tags.append(tag)
         else:
+            # Defensive: _k3_argument_tag currently returns a key-pinned tag
+            # for every property, so this fallback no longer fires; keep it
+            # as the documented None-contract handling.
             tags.append(_k3_permissive_argument_tag())
     inner = tags[0] if len(tags) == 1 else OrFormat(elements=list(tags))
     required = parameters.get("required")
@@ -292,11 +326,12 @@ def _k3_required_coverage(
     the earlier requireds-first compaction ``Seq(Plus, Plus, Star)``
     wrongly rejected legal interleavings like ``a c b``).  Returns None
     (caller keeps the fork shape) when coverage is not expressible: any
-    required key missing from ``properties``, mapped to a permissive tag
-    (union/unknown type -- a quantifier over it would be vacuous), when K
-    exceeds :data:`_K3_MAX_STRICT_REQUIRED`, or when the inner-copy count
-    would exceed :data:`_K3_MAX_COVERAGE_INNER_COPIES`.  Diverges from the
-    fork (structural_tag_registry.py:533) on purpose.
+    required key missing from ``properties``, when K exceeds
+    :data:`_K3_MAX_STRICT_REQUIRED`, or when the inner-copy count would
+    exceed :data:`_K3_MAX_COVERAGE_INNER_COPIES`.  Diverges from the fork
+    (structural_tag_registry.py:533) on purpose.  NOTE (review R11 P3-4):
+    the permissive-tag clause is gone -- union/unknown-type properties are
+    key-pinned, not mapped to the key-agnostic tag.
     """
 
     required = list(dict.fromkeys(required))  # dedupe, keep order

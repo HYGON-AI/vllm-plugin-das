@@ -379,6 +379,32 @@ def test_marker_holdback_crosses_the_pipe_prefix() -> None:
     assert _marker_holdback("Hi<|close|> response <|", head, word, tail) == len("<|close|> response <|")
     assert _marker_holdback("Hi<|close|> response <|se", head, word, tail) == len("<|close|> response <|se")
     assert _marker_holdback("plain text done", head, word, tail) == 0
+    # R11 P2: the whitespace runs are UNBOUNDED (the old +8 window dropped
+    # the head once the combined length exceeded it and leaked the prefix).
+    assert _marker_holdback("x" * 20 + head + " " * 11, head, word, tail) == len(head) + 11
+    assert (
+        _marker_holdback("Hi" + head + " " * 12 + "respo", head, word, tail)
+        == len("Hi" + head + " " * 12 + "respo") - 2
+    )
+    assert (
+        _marker_holdback(head + " " * 30 + word + " " * 9 + "<|se", head, word, tail)
+        == len(head) + 30 + len(word) + 9 + 4
+    )
+    # a head followed by junk stays untouched (no hold without a shape)
+    assert _marker_holdback("a<|close|>b c", head, word, tail) == 0
+
+
+def test_streaming_holds_a_long_space_marker_prefix() -> None:
+    """R11 P2 parser-level twin: >8 spaces between head and word must not
+    stream the control prefix as content before <|sep|> arrives."""
+
+    parser = _live_parser()
+    _stream(parser, "Hi<|close|>" + " " * 12)
+    assert parser._sent_content_idx == 2
+
+    parser = _live_parser()
+    _stream(parser, "Hi<|close|>", "Hi<|close|>" + " " * 10)
+    assert parser._sent_content_idx == 2
 
 
 def test_streaming_holds_tail_prefixes_inside_a_marker() -> None:
@@ -407,6 +433,113 @@ def test_empty_k3_response_propagates_none_over_raw_markers() -> None:
     tool_calls, out = delegator._extract_tool_calls(_RAW, object())
     assert tool_calls == []
     assert out is None
+
+
+# --- review 2026-10-15 round 11: tool_choice="none" framing parse ---
+
+
+def _none_extract_parser(
+    content: str | None, tools_called: bool = False
+) -> KimiK3ToolParser:
+    parser = object.__new__(KimiK3ToolParser)
+    parser._hcu_last_extract = None  # none short-circuits: no record
+
+    def extract_tool_calls(model_output, request=None):
+        return SimpleNamespace(
+            tools_called=tools_called, tool_calls=[], content=content
+        )
+
+    parser.extract_tool_calls = extract_tool_calls  # type: ignore[method-assign]
+    return parser
+
+
+def test_none_choice_parses_k3_framing_without_a_record() -> None:
+    """R11 P2: with tool_choice="none" the wheel never calls the tool
+    parser, so no ``_hcu_last_extract`` record exists; the wrapper must
+    still strip the XTML framing from the raw content channel."""
+
+    module, delegator = _make_delegator(
+        ([], _RAW), _none_extract_parser(_CLEAN)
+    )
+    assert patch_delegating_tool_content.apply_to_module(module) is True
+    request = SimpleNamespace(tool_choice="none")
+    tool_calls, out = delegator._extract_tool_calls(_RAW, request)
+    assert tool_calls == []
+    assert out == _CLEAN
+
+
+def test_none_choice_suppresses_emitted_tool_calls() -> None:
+    """R11 P2: a model that emitted calls despite tool_choice="none" keeps
+    its pre-tools text as content; the calls are dropped (API contract)."""
+
+    module, delegator = _make_delegator(
+        ([], _RAW), _none_extract_parser("pre", tools_called=True)
+    )
+    assert patch_delegating_tool_content.apply_to_module(module) is True
+    tool_calls, out = delegator._extract_tool_calls(
+        _RAW, SimpleNamespace(tool_choice="none")
+    )
+    assert tool_calls == []
+    assert out == "pre"
+
+
+def test_none_choice_uses_the_live_k3_parser() -> None:
+    """Live-parser variant: real XTML extraction strips the framing, and a
+    response channel BEFORE the tools channel survives as content."""
+
+    module, delegator = _make_delegator(([], _RAW), _live_parser())
+    assert patch_delegating_tool_content.apply_to_module(module) is True
+    tool_calls, out = delegator._extract_tool_calls(
+        _RAW, SimpleNamespace(tool_choice="none")
+    )
+    assert tool_calls == []
+    assert out == _CLEAN
+
+
+def test_none_choice_beats_a_stale_exact_record() -> None:
+    """R11 P3-1: the none check runs BEFORE the exact-record branch, so a
+    leftover record from a previous request (same input, tools_called) on a
+    reused parser instance cannot bypass the framing parse."""
+
+    parser = object.__new__(KimiK3ToolParser)
+    parser._hcu_last_extract = (
+        _RAW,
+        SimpleNamespace(tools_called=True, tool_calls=[], content=None),
+    )
+
+    def extract_tool_calls(model_output, request=None):
+        return SimpleNamespace(
+            tools_called=True, tool_calls=[], content="text"
+        )
+
+    parser.extract_tool_calls = extract_tool_calls  # type: ignore[method-assign]
+    module, delegator = _make_delegator(([], _RAW), parser)
+    assert patch_delegating_tool_content.apply_to_module(module) is True
+    tool_calls, out = delegator._extract_tool_calls(
+        _RAW, SimpleNamespace(tool_choice="none")
+    )
+    assert tool_calls == []
+    assert out == "text"
+
+
+def test_none_choice_with_a_tools_channel_keeps_only_pre_text() -> None:
+    """R11 P3-6: live parser, raw output carrying a full tools channel --
+    calls suppressed, the pre-tools text passes as content."""
+
+    raw = (
+        "Hi<|close|>response<|sep|><|open|>tools<|sep|>"
+        '<|open|>call tool="py" index="1"<|sep|>'
+        '<|open|>argument key="code" type="string"<|sep|>print(1)'
+        "<|close|>argument<|sep|><|close|>call<|sep|>"
+        "<|close|>tools<|sep|>"
+    )
+    module, delegator = _make_delegator(([], raw), _live_parser())
+    assert patch_delegating_tool_content.apply_to_module(module) is True
+    tool_calls, out = delegator._extract_tool_calls(
+        raw, SimpleNamespace(tool_choice="none")
+    )
+    assert tool_calls == []
+    assert out == "Hi"
 
 
 def test_required_without_structural_tag_fails_loudly() -> None:
