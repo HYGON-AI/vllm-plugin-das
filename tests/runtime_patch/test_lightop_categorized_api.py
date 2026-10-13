@@ -20,6 +20,7 @@ REQUIRED_EXPORTS = {
         "silu_and_mul_opt",
     },
     "lightop.attention": {
+        "fast_topk_transform_ragged_fused",
         "fused_deepseek_v4_qnorm_rope_kvnorm_rope_quant_insert_int32",
         "get_paged_mqa_logits_metadata",
         "mqa_logits",

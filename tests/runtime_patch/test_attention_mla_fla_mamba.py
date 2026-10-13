@@ -2162,12 +2162,21 @@ def test_sparse_indexer_padded_decode_scratch_preserves_prefill_row():
 
 
 @pytest.mark.parametrize("skip_cache_insert", [False, True])
+@pytest.mark.parametrize("lightop_store_env", ["0", "1"])
+@pytest.mark.parametrize("aiter_reader", [False, True])
 def test_sparse_indexer_gfx936_packed_cache_uses_quantized_triton_path(
-    monkeypatch, skip_cache_insert,
+    monkeypatch, skip_cache_insert, lightop_store_env, aiter_reader,
 ):
-    """Packed FP8 pages must keep their shuffled cache layout on gfx936."""
+    """The planar LightOp store is used only when this op owns the cache write
+    and decode reads it via LightOp; otherwise keep the SHUFFLE layout."""
     from vllm_hcu.v1.attention.ops import rocm_aiter_mla_sparse as sparse
 
+    monkeypatch.setenv("VLLM_HCU_USE_LIGHTOP_INDEXER_K_CACHE", lightop_store_env)
+    monkeypatch.setattr(sparse, "_uses_aiter_paged_mqa_logits", lambda: aiter_reader)
+    use_lightop_store = (
+        lightop_store_env == "1" and not skip_cache_insert and not aiter_reader
+    )
+    expected_layout = "LINEAR" if use_lightop_store else "SHUFFLE"
     events = []
     monkeypatch.setattr(sparse, "DeepseekV32IndexerMetadata", SimpleNamespace)
 
@@ -2216,9 +2225,18 @@ def test_sparse_indexer_gfx936_packed_cache_uses_quantized_triton_path(
         assert slots.tolist() == [0]
         assert block_size == 1
         assert scale_fmt == "ue8m0"
+        assert not use_lightop_store
+        events.append("insert")
+
+    def lightop_insert(k, cache, slots):
+        assert k.shape == (1, 1)
+        assert cache.dtype is torch.uint8
+        assert slots.tolist() == [0]
+        assert use_lightop_store
         events.append("insert")
 
     monkeypatch.setattr(sparse, "indexer_k_quant_and_cache_triton", insert)
+    monkeypatch.setattr(sparse, "indexer_k_quant_and_cache_lightop", lightop_insert)
     from vllm import _custom_ops as ops
 
     monkeypatch.setattr(
@@ -2227,11 +2245,15 @@ def test_sparse_indexer_gfx936_packed_cache_uses_quantized_triton_path(
         lambda *args: pytest.fail("packed gfx936 cache used the custom writer"),
     )
 
-    def gather(cache, k_fp8, k_scale, block_table, cu_seq_lens, token_to_seq):
+    def gather(
+        cache, k_fp8, k_scale, block_table, cu_seq_lens, token_to_seq,
+        layout="SHUFFLE",
+    ):
         assert cache.dtype is torch.uint8
         assert block_table is chunk.block_table
         assert cu_seq_lens is chunk.cu_seq_lens
         assert token_to_seq is chunk.token_to_seq
+        assert layout == expected_layout
         k_fp8.zero_()
         k_scale.zero_()
         events.append("gather")
@@ -2250,7 +2272,7 @@ def test_sparse_indexer_gfx936_packed_cache_uses_quantized_triton_path(
             "packed gfx936 cache dropped its per-key dequant scale"
         ),
     )
-    monkeypatch.setattr(sparse, "_use_lightop_sparse_mla_topk", lambda: False)
+    monkeypatch.setattr(sparse, "_sparse_mla_topk_backend", lambda: "torch")
     monkeypatch.setattr(
         sparse,
         "_topk_indices_torch",
@@ -2282,6 +2304,72 @@ def test_sparse_indexer_gfx936_packed_cache_uses_quantized_triton_path(
     if not skip_cache_insert:
         expected.insert(0, "insert")
     assert events == expected
+
+
+def test_lightop_ragged_topk_decode_uses_public_attention_export(monkeypatch):
+    from vllm_hcu.v1.attention.ops import rocm_aiter_mla_sparse as sparse
+
+    calls = []
+
+    def fast_topk_transform_ragged_fused(score, lengths, offsets, topk, row_starts):
+        calls.append((score, lengths, offsets, topk, row_starts))
+        return torch.arange(score.shape[0] * topk, dtype=torch.int32).view(-1, topk)
+
+    monkeypatch.setattr(
+        sparse,
+        "_get_lightop_attention",
+        lambda: SimpleNamespace(
+            fast_topk_transform_ragged_fused=fast_topk_transform_ragged_fused
+        ),
+    )
+    logits = torch.zeros((2, 8), dtype=torch.bfloat16)
+    topk_indices = torch.full((2, 3), -1, dtype=torch.int32)
+
+    sparse._lightop_ragged_topk_indices_decode(
+        logits, torch.tensor([5, 7], dtype=torch.int32), 1, topk_indices, 3
+    )
+
+    assert len(calls) == 1
+    score, lengths, offsets, topk, row_starts = calls[0]
+    assert score.dtype is torch.float32
+    assert lengths.tolist() == [5, 7]
+    assert offsets.tolist() == [0, 0]
+    assert row_starts.tolist() == [0, 0]
+    assert topk == 3
+    assert topk_indices.tolist() == [[0, 1, 2], [3, 4, 5]]
+
+
+@pytest.mark.parametrize(
+    ("backend", "custom_ops", "prefill_lightop", "decode_2048", "decode_512"),
+    [
+        ("ragged", True, True, "ragged", "per_row"),
+        ("per_row", True, True, "per_row", "per_row"),
+        ("torch", True, False, "torch", "torch"),
+        ("ragged", False, False, "torch", "torch"),
+    ],
+)
+def test_sparse_mla_topk_routes_prefill_and_decode_separately(
+    monkeypatch, backend, custom_ops, prefill_lightop, decode_2048, decode_512
+):
+    from vllm_hcu.platforms import envs as henvs
+    from vllm_hcu.v1.attention.ops import rocm_aiter_mla_sparse as sparse
+
+    monkeypatch.setattr(henvs, "VLLM_HCU_SPARSE_MLA_TOPK_BACKEND", backend)
+    monkeypatch.setattr(henvs, "VLLM_HCU_USE_CUSTOM_OPS", custom_ops)
+
+    assert sparse._use_lightop_sparse_mla_topk() is prefill_lightop
+    assert sparse._decode_sparse_mla_topk_backend(2048) == decode_2048
+    assert sparse._decode_sparse_mla_topk_backend(512) == decode_512
+
+
+def test_sparse_mla_topk_backend_defaults_to_ragged(monkeypatch):
+    from vllm_hcu.platforms import envs as henvs
+
+    monkeypatch.delenv("VLLM_HCU_SPARSE_MLA_TOPK_BACKEND", raising=False)
+    reader = henvs.hcu_vllm_environment_variables[
+        "VLLM_HCU_SPARSE_MLA_TOPK_BACKEND"
+    ]
+    assert reader() == "ragged"
 
 
 def test_sparse_indexer_gfx936_packed_cache_uses_quantized_decode_logits(
@@ -2337,7 +2425,7 @@ def test_sparse_indexer_gfx936_packed_cache_uses_quantized_decode_logits(
         return torch.zeros((1, 2), dtype=torch.float32)
 
     monkeypatch.setattr(sparse, "rocm_fp8_paged_mqa_logits", decode_logits)
-    monkeypatch.setattr(sparse, "_use_lightop_sparse_mla_topk", lambda: False)
+    monkeypatch.setattr(sparse, "_sparse_mla_topk_backend", lambda: "torch")
     monkeypatch.setattr(
         sparse,
         "_topk_indices_torch",
@@ -2489,7 +2577,9 @@ def test_sparse_indexer_mixed_padding_keeps_prefill_for_both_topk_paths(
     monkeypatch.setattr(sparse, "pack_seq_triton", fake_pack)
     monkeypatch.setattr(sparse, "unpack_seq_triton", fake_unpack)
     monkeypatch.setattr(
-        sparse, "_use_lightop_sparse_mla_topk", lambda: use_lightop
+        sparse,
+        "_sparse_mla_topk_backend",
+        lambda: "per_row" if use_lightop else "torch",
     )
 
     def fake_torch_topk(logits, topk_tokens, row_starts=None, row_ends=None):

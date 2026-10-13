@@ -962,6 +962,167 @@ def test_hcu_reshape_and_cache_flash_is_opaque_to_torch_compile() -> None:
     torch.testing.assert_close(actual_value[0, 0].float(), value[0].float())
 
 
+def _sparse_mla_runtime_with_per_row_decode() -> Any:
+    try:
+        from vllm_hcu.v1.attention.ops import rocm_aiter_mla_sparse as sparse
+
+        sparse._get_lightop_attention().top_k_per_row_decode
+    except (ImportError, AttributeError) as exc:
+        pytest.skip(f"lightop top_k_per_row_decode is unavailable: {exc}")
+    return sparse
+
+
+def _causal_decode_row_ends(request_lens: list[int], next_n: int) -> list[int]:
+    """Row j of a request with L KV tokens attends to L - next_n + j + 1."""
+    return [
+        max(length - next_n + j + 1, 0)
+        for length in request_lens
+        for j in range(next_n)
+    ]
+
+
+def _decode_seq_lens_input(
+    request_lens: list[int],
+    next_n: int,
+    layout: str,
+    device: torch.device,
+) -> torch.Tensor:
+    """Build decode seq_lens the way vLLM indexer metadata does.
+
+    ``1d``: per-request lengths, shape (B,); the wrapper expands MTP rows.
+    ``2d``: native-MTP per-token lengths, shape (B, next_n).
+    """
+    if layout == "1d":
+        return torch.tensor(request_lens, dtype=torch.int32, device=device)
+    return torch.tensor(
+        _causal_decode_row_ends(request_lens, next_n),
+        dtype=torch.int32,
+        device=device,
+    ).view(len(request_lens), next_n)
+
+
+def _assert_decode_topk_rows(
+    actual: torch.Tensor,
+    logits: torch.Tensor,
+    expected_ends: list[int],
+    topk_tokens: int,
+) -> None:
+    actual = actual.cpu()
+    logits = logits.cpu()
+    for row, end in enumerate(expected_ends):
+        indices = actual[row]
+        assert bool((indices >= -1).all()), (
+            f"row {row} has unwritten or negative non-padding indices"
+        )
+        selected = indices[indices >= 0]
+        assert bool((selected < end).all()), (
+            f"row {row} selected positions at or beyond its end {end}"
+        )
+        k = min(topk_tokens, end)
+        assert selected.numel() == k, (
+            f"row {row}: expected {k} valid indices, got {selected.numel()}"
+        )
+        if k:
+            expected = torch.topk(logits[row, :end], k).indices
+            assert set(selected.tolist()) == set(expected.tolist())
+
+
+def test_causal_decode_row_ends_reference_fixture() -> None:
+    assert _causal_decode_row_ends([256], 4) == [253, 254, 255, 256]
+    assert _causal_decode_row_ends([0, 2], 4) == [0, 0, 0, 0, 0, 0, 1, 2]
+
+
+@pytest.mark.parametrize("topk_tokens", [512, 2048])
+@pytest.mark.parametrize("max_len", [4096, 65536, 131072])
+@pytest.mark.parametrize(
+    ("next_n", "layout"),
+    [(1, "1d"), (1, "2d"), (4, "1d"), (4, "2d")],
+)
+def test_lightop_per_row_decode_topk_is_bounded_and_matches_torch(
+    topk_tokens: int,
+    max_len: int,
+    next_n: int,
+    layout: str,
+) -> None:
+    device = _hcu_device()
+    sparse = _sparse_mla_runtime_with_per_row_decode()
+
+    generator = torch.Generator().manual_seed(20261013)
+    request_lens = torch.randint(
+        next_n, max_len + 1, (12,), generator=generator
+    ).tolist()
+    # Full context, MTP rows straddling topk, exactly topk, short row and a
+    # zero-length padding request.
+    request_lens = [
+        max_len,
+        topk_tokens + next_n - 2,
+        topk_tokens,
+        256,
+        0,
+        *request_lens,
+    ]
+    expected_ends = _causal_decode_row_ends(request_lens, next_n)
+    seq_lens = _decode_seq_lens_input(request_lens, next_n, layout, device)
+    rows = len(expected_ends)
+    # Positions past each row end hold finite values that must not be picked.
+    logits = torch.randn(
+        (rows, max_len), device=device, dtype=torch.float32
+    )
+    actual = torch.full(
+        (rows, topk_tokens), -7, dtype=torch.int32, device=device
+    )
+
+    sparse._lightop_topk_indices_decode(
+        logits, seq_lens, next_n, actual, topk_tokens
+    )
+    torch.cuda.synchronize(device)
+
+    _assert_decode_topk_rows(actual, logits, expected_ends, topk_tokens)
+
+
+@pytest.mark.parametrize("topk_tokens", [512, 2048])
+def test_lightop_per_row_decode_topk_replays_with_updated_lengths(
+    topk_tokens: int,
+) -> None:
+    device = _hcu_device()
+    sparse = _sparse_mla_runtime_with_per_row_decode()
+
+    next_n = 4
+    max_len = 8192
+    first_lens = [max_len, topk_tokens, 256, 0]
+    second_lens = [topk_tokens + 1, max_len - 7, 0, 300]
+    seq_lens = _decode_seq_lens_input(first_lens, next_n, "2d", device)
+    rows = len(first_lens) * next_n
+    logits = torch.randn((rows, max_len), device=device, dtype=torch.float32)
+    actual = torch.full(
+        (rows, topk_tokens), -7, dtype=torch.int32, device=device
+    )
+
+    sparse._lightop_topk_indices_decode(
+        logits, seq_lens, next_n, actual, topk_tokens
+    )
+    graph = torch.cuda.CUDAGraph()
+    with torch.cuda.graph(graph):
+        sparse._lightop_topk_indices_decode(
+            logits, seq_lens, next_n, actual, topk_tokens
+        )
+
+    for request_lens in (first_lens, second_lens):
+        seq_lens.copy_(
+            _decode_seq_lens_input(request_lens, next_n, "2d", device)
+        )
+        logits.normal_()
+        actual.fill_(-7)
+        graph.replay()
+        torch.cuda.synchronize(device)
+        _assert_decode_topk_rows(
+            actual,
+            logits,
+            _causal_decode_row_ends(request_lens, next_n),
+            topk_tokens,
+        )
+
+
 @pytest.mark.parametrize("shape", [(1, 256), (17, 256), (4, 1024)])
 def test_lightop_silu_and_mul_matches_float32_reference(
     shape: tuple[int, int],

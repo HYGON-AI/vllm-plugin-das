@@ -37,6 +37,15 @@ ALLOWED_TOP_LEVEL = {
     (CLAMP_OWNER, "fuse_silu_mul_clamp_quant"),
     (CLAMP_OWNER, "fuse_silu_mul_clamp_quant_ep"),
 }
+INDEX_K_STORE_OWNER = "vllm_hcu/v1/attention/ops/rocm_aiter_mla_sparse.py"
+# LightOp 0.6 exports these only from non-categorized modules.
+ALLOWED_NON_PUBLIC_IMPORTS = {
+    (
+        INDEX_K_STORE_OWNER,
+        "lightop.kvcache",
+        "fuse_act_quant_and_store_index_k_cache",
+    ),
+}
 
 
 def _attribute_parts(node: ast.Attribute) -> tuple[ast.expr, list[str]]:
@@ -158,7 +167,18 @@ class _LightOpVisitor(ast.NodeVisitor):
             if suffix in {"op", "gemmopt"}:
                 self._violate(node, f"obsolete LightOp namespace {module!r}")
             elif suffix not in PUBLIC_CATEGORIES:
-                self._violate(node, f"non-public LightOp module {module!r}")
+                for alias in node.names:
+                    if (
+                        self.relative_path,
+                        module,
+                        alias.name,
+                    ) in ALLOWED_NON_PUBLIC_IMPORTS:
+                        self.used.add((module, alias.name))
+                    else:
+                        self._violate(
+                            node, f"non-public LightOp module {module!r}"
+                        )
+                        break
             else:
                 for alias in node.names:
                     if alias.name == "*":
@@ -615,6 +635,33 @@ def test_scanner_rejects_forbidden_forms_with_locations(tmp_path: Path) -> None:
         "vllm_hcu/mutation.py:6: moved top-level LightOp import 'moved'",
     }
     assert expected <= set(violations)
+
+
+def test_scanner_limits_non_public_allowlist_to_owner_and_symbol(
+    tmp_path: Path,
+) -> None:
+    root = _write_mutation_owner(tmp_path)
+    owner = tmp_path / INDEX_K_STORE_OWNER
+    owner.parent.mkdir(parents=True)
+    owner.write_text(
+        "from lightop.kvcache import fuse_act_quant_and_store_index_k_cache\n"
+        "from lightop.kvcache import fused_concat_and_store_mla_kv_cache\n",
+        encoding="utf-8",
+    )
+    other = root / "other_owner.py"
+    other.write_text(
+        "from lightop.kvcache import fuse_act_quant_and_store_index_k_cache\n",
+        encoding="utf-8",
+    )
+
+    violations = scan_lightop_imports(root)
+    used = categorized_symbols(root)
+
+    assert violations == [
+        "vllm_hcu/other_owner.py:1: non-public LightOp module 'lightop.kvcache'",
+        f"{INDEX_K_STORE_OWNER}:2: non-public LightOp module 'lightop.kvcache'",
+    ]
+    assert ("lightop.kvcache", "fuse_act_quant_and_store_index_k_cache") in used
 
 
 def test_scanner_rejects_injected_direct_lmslim_call_with_location(
