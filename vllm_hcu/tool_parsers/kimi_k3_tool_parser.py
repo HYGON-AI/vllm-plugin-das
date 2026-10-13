@@ -211,8 +211,8 @@ class KimiK3ToolParser(ToolParser):
             raise VLLMValidationError(
                 "Named tool choice for Kimi K3 requires strict tool calling "
                 "(VLLM_ENFORCE_STRICT_TOOL_CALLING) so the XTML structural "
-                "tag can force the call. Otherwise use `tool_choice` set to "
-                '"auto", "required", or "none".',
+                "tag can force the call. Otherwise use `tool_choice` \"auto\" "
+                'or "none".',
                 parameter="tool_choice",
                 value=request.tool_choice,
             )
@@ -224,6 +224,37 @@ class KimiK3ToolParser(ToolParser):
             # early to skip the generic parent path, which would otherwise attach
             # JSON guided decoding when strict calling is off -- that JSON
             # constraint conflicts with the <|open|>tools<|sep|> channel.
+            #
+            # Review 2026-10-15 P2 (+round-5 follow-up): `required` reaches
+            # here unconstrained whenever no XTML tag is attached.  The
+            # generic parent's JSON guidance is NOT an escape hatch: the
+            # wheel routes required-with-``supports_required_and_named=False``
+            # through the AUTO parse path, so JSON-constrained output would
+            # never decode as K3 XTML -- the user would get raw JSON as
+            # content with no tool calls.  And with strict calling ON the tag
+            # is normally attached BEFORE this call (wheel adjust_request
+            # order), so a missing tag means the attach was skipped (request
+            # already carries structured_outputs) -- still unconstrained.
+            # Both shapes violate the `required` contract: raise, mirroring
+            # the named guard above.
+            if (
+                request.tool_choice == "required"
+                and not named
+                and not has_structural_tag
+            ):
+                raise VLLMValidationError(
+                    '`required` tool choice for Kimi K3 arrived without the '
+                    "XTML structural tag, so the call is unconstrained: "
+                    "either strict tool calling "
+                    "(VLLM_ENFORCE_STRICT_TOOL_CALLING) is disabled, or tag "
+                    "attachment was skipped because the request already "
+                    "carries structured_outputs/response_format. Enable "
+                    "strict tool calling and drop the request-level "
+                    'structured override, or use `tool_choice` "auto" or '
+                    '"none".',
+                    parameter="tool_choice",
+                    value=request.tool_choice,
+                )
             request.skip_special_tokens = False
             if hasattr(request, "spaces_between_special_tokens"):
                 request.spaces_between_special_tokens = False

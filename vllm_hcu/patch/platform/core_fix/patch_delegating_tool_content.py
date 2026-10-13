@@ -84,9 +84,17 @@ def _wrap_extract(cls: type, module: ModuleType) -> None:
             return tool_calls, out
         info = record[1]
         if info is not None and not getattr(info, "tools_called", False):
-            cleaned = getattr(info, "content", None)
-            if cleaned is not None:
-                out = cleaned
+            # Propagate the parser's cleaned result EVEN WHEN IT IS NONE
+            # (review 2026-10-15 P2): the exact-input record above proves
+            # this text WAS handled by the K3 parser, so a ``content=None``
+            # means the parser deliberately withheld everything user-facing.
+            # That covers BOTH the empty response body
+            # (``_strip_response_content`` folds "" into None) and a
+            # present-but-unparseable tools channel (e.g. max_tokens
+            # truncation mid-call), where the alternative is leaking the raw
+            # XTML delimiters; None is also the wheel's own "no content"
+            # representation in this branch.
+            out = getattr(info, "content", None)
         return tool_calls, out
 
     setattr(hcu_extract_tool_calls, _WRAPPER, True)

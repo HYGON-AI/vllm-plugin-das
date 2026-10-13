@@ -39,7 +39,7 @@ _PLATFORM_INIT_FAILURE: Exception | None = None
 
 
 def _bridge_plugin_logging() -> None:
-    """Route ``vllm_hcu.*`` records onto the same stream vLLM logs to.
+    """Route ``vllm_hcu`` records onto the same stream vLLM logs to.
 
     vLLM attaches its handler to the ``vllm`` logger tree only; plugin
     records otherwise propagate to the root, whose last-resort writer drops
@@ -47,6 +47,23 @@ def _bridge_plugin_logging() -> None:
     lines (auxiliary-comm construction, DSpark shard enablement) an operator
     must be able to see when validating the role-separation deployment.
     vLLM's own handlers are reused when already configured; idempotent.
+
+    The plugin logger MIRRORS the level configured on the ``vllm`` logger
+    (NOTSET on ``vllm`` = unconfigured, falls back to INFO): the two trees
+    are siblings under the global root, so ``vllm_hcu`` cannot inherit the
+    operator's VLLM_LOGGING_LEVEL by leaving its own level unset (review
+    2026-10-15 P2).  The earlier hard ``INFO`` overrode that policy in both
+    directions -- plugin ``.debug()`` diagnostics were dropped in DEBUG
+    deployments while plugin INFO rode through at WARNING+.
+
+    Fallback caveat: when the ``vllm`` logger has no handlers yet (vLLM not
+    configured, or VLLM_CONFIGURE_LOGGING=0), the fallback handler logs at
+    INFO and ``propagate=False`` bypasses any operator root policy -- the
+    mirror only honors the operator's level once the ``vllm`` tree exposes
+    it (verified: this deployment line sets the ``vllm`` LOGGER level, not
+    just its handler, from VLLM_LOGGING_LEVEL in vllm/logger.py).  The
+    mirror is also a one-shot import-time snapshot; a later runtime
+    reconfiguration of the ``vllm`` level is not re-mirrored.
     """
 
     import logging
@@ -64,8 +81,10 @@ def _bridge_plugin_logging() -> None:
         )
         handlers = [handler]
     for handler in handlers:
-        root.addHandler(handler)
-    root.setLevel(logging.INFO)
+        if handler not in root.handlers:
+            root.addHandler(handler)
+    vllm_level = logging.getLogger("vllm").level
+    root.setLevel(vllm_level if vllm_level != logging.NOTSET else logging.INFO)
     root.propagate = False
     root._hcu_bridge_done = True  # type: ignore[attr-defined]
 

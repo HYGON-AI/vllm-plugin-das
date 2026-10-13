@@ -392,3 +392,56 @@ def test_streaming_holds_tail_prefixes_inside_a_marker() -> None:
     _stream(parser, "Hi<|close|> response <|", "Hi<|close|> response <|sep|>")
     assert parser._sent_content_idx == 2
     assert parser.finish_streaming() is None
+
+
+# --- review 2026-10-15: logging-policy / required-contract / empty-body ---
+
+
+def test_empty_k3_response_propagates_none_over_raw_markers() -> None:
+    """P2 #3: an EMPTY response body strips to ``content=None``; the
+    delegator must pass that through instead of leaking the raw XTML
+    delimiters (``<|close|>response<|sep|>...``) to the client."""
+
+    module, delegator = _make_delegator(([], _RAW), _stub_parser(_RAW, None))
+    assert patch_delegating_tool_content.apply_to_module(module) is True
+    tool_calls, out = delegator._extract_tool_calls(_RAW, object())
+    assert tool_calls == []
+    assert out is None
+
+
+def test_required_without_structural_tag_fails_loudly() -> None:
+    """P2 #2 (+ round-5/6): `required` without an attached XTML tag has no
+    constraint at all. Strict OFF tags nothing; strict ON normally attaches
+    the tag BEFORE adjust_request (wheel adjust_request order), so a missing
+    tag there means the attach was skipped (request already carries
+    structured_outputs with no structural_tag) -- still unconstrained.
+    Falling through to the generic JSON guidance would constrain output the
+    K3 extractor can never decode, and the wheel routes such required output
+    through the AUTO path (supports_required_and_named=False): raise, like
+    the named guard. NOTE: intentional behavior change -- strict-OFF
+    `required` used to pass through unconstrained, it now returns 400."""
+
+    from vllm.exceptions import VLLMValidationError
+
+    request = SimpleNamespace(
+        tools=[{"type": "function", "function": {"name": "py"}}],
+        tool_choice="required",
+        structured_outputs=None,
+        skip_special_tokens=True,
+    )
+
+    # no tag at all (strict calling disabled, nothing ever attaches)
+    with pytest.raises(VLLMValidationError):
+        _live_parser().adjust_request(request)
+
+    # strict ON but the attach was SKIPPED: the request already carries
+    # structured_outputs with structural_tag=None (round-6: the guard no
+    # longer reads the env flag; this namespace shape is the real hole)
+    request.structured_outputs = SimpleNamespace(structural_tag=None)
+    with pytest.raises(VLLMValidationError):
+        _live_parser().adjust_request(request)
+
+    # a tag attached by the delegating side keeps the constrained XTML path
+    request.structured_outputs = SimpleNamespace(structural_tag="x")
+    adjusted = _live_parser().adjust_request(request)
+    assert adjusted.skip_special_tokens is False
