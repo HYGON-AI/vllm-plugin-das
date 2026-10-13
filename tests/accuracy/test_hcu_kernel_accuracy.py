@@ -962,6 +962,57 @@ def test_hcu_reshape_and_cache_flash_is_opaque_to_torch_compile() -> None:
     torch.testing.assert_close(actual_value[0, 0].float(), value[0].float())
 
 
+@pytest.mark.parametrize("topk_tokens", [512, 2048])
+@pytest.mark.parametrize("max_len", [4096, 65536, 131072])
+@pytest.mark.parametrize("next_n", [1, 4])
+def test_lightop_per_row_decode_topk_is_bounded_and_matches_torch(
+    topk_tokens: int,
+    max_len: int,
+    next_n: int,
+) -> None:
+    device = _hcu_device()
+    try:
+        from vllm_hcu.v1.attention.ops import rocm_aiter_mla_sparse as sparse
+
+        sparse._get_lightop_attention().top_k_per_row_decode
+    except (ImportError, AttributeError) as exc:
+        pytest.skip(f"lightop top_k_per_row_decode is unavailable: {exc}")
+
+    batch = 16
+    generator = torch.Generator(device=device).manual_seed(20261013)
+    seq_lens = torch.randint(
+        next_n, max_len + 1, (batch,), generator=generator, device=device
+    ).to(torch.int32)
+    seq_lens[0] = max_len
+    seq_lens[1] = max(next_n, topk_tokens // 2)
+    seq_lens[2] = topk_tokens
+    rows = batch * next_n
+    # Positions past each row end hold finite values that must not be picked.
+    logits = torch.randn(
+        (rows, max_len), generator=generator, device=device, dtype=torch.float32
+    )
+    row_ends = sparse._decode_row_ends_from_seq_lens(seq_lens, next_n, rows)
+    actual = torch.full(
+        (rows, topk_tokens), -7, dtype=torch.int32, device=device
+    )
+
+    sparse._lightop_topk_indices_decode(
+        logits, seq_lens, next_n, actual, topk_tokens
+    )
+    torch.cuda.synchronize(device)
+
+    for row in range(rows):
+        end = int(row_ends[row])
+        indices = actual[row]
+        assert bool(((indices >= -1) & (indices < end)).all()), (
+            f"row {row} has indices outside [-1, {end})"
+        )
+        selected = indices[indices >= 0]
+        expected = torch.topk(logits[row, :end], min(topk_tokens, end)).indices
+        assert selected.numel() == expected.numel()
+        assert set(selected.tolist()) == set(expected.tolist())
+
+
 @pytest.mark.parametrize("shape", [(1, 256), (17, 256), (4, 1024)])
 def test_lightop_silu_and_mul_matches_float32_reference(
     shape: tuple[int, int],

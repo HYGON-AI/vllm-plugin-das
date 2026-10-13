@@ -306,7 +306,6 @@ hcu_vllm_environment_variables: dict[str, Callable[[], Any]] = {
     #             (topk == 2048 only, otherwise per_row); prefill:
     #             lightop.attention.top_k_per_row_prefill (default)
     #   per_row - lightop.attention.top_k_per_row_* for prefill and decode
-    #             (decode emits OOB indices on long contexts)
     #   torch   - torch.topk
     "VLLM_HCU_SPARSE_MLA_TOPK_BACKEND":
         lambda: os.getenv("VLLM_HCU_SPARSE_MLA_TOPK_BACKEND", "ragged").lower(),
