@@ -158,3 +158,18 @@ def test_producer_stamp_shares_the_backend_constant():
     assert patch_dspark_non_causal_stamp.TARGET_MODULE == (
         "vllm.v1.worker.gpu.spec_decode.speculator"
     )
+
+
+def test_decode_descales_v_with_the_layer_v_scale():
+    """Review 2026-10-15 round 8 P3: the ported upstream call fed k's
+    calibration to v_scale (wheel triton_mla.py:253-254 has the same
+    substitution); ``_v_scale`` is part of the wheel's attention-layer
+    contract (vllm/v1/attention/backend.py:752-753), so pass it through.
+    Source-contract style: no GPU needed."""
+
+    import inspect
+    import re
+
+    src = inspect.getsource(HcuTritonMLAImpl.forward_mqa)
+    assert re.search(r"\bv_scale=layer\._v_scale\b", src), src[-400:]
+    assert not re.search(r"\bv_scale=layer\._k_scale\b", src)

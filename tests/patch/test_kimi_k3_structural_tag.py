@@ -409,3 +409,101 @@ def test_response_body_excludes_reserved_close_prefix() -> None:
     assert all(
         "<|close|>" in (getattr(f, "excludes", None) or ()) for f in bodies
     ), [getattr(f, "excludes", None) for f in bodies]
+
+
+# --- review 2026-10-15 round 8: closed empty parameter schemas ---
+
+
+def _closed_empty_tool(name: str = "python") -> FunctionToolParam:
+    return FunctionToolParam(
+        function={
+            "name": name,
+            "description": "accepts no arguments",
+            "parameters": {
+                "type": "object",
+                "properties": {},
+                "additionalProperties": False,
+            },
+        }
+    )
+
+
+def test_closed_empty_schema_forbids_argument_tags() -> None:
+    """R8 P1: an empty CLOSED schema permits NO arguments.  The branch
+    returned the permissive star, letting the model invent argument names
+    that reach the tool executor."""
+
+    from vllm_hcu.tool_parsers.kimi_k3_structural_tag import (
+        _k3_arguments_block,
+    )
+
+    schema = {"type": "object", "properties": {}, "additionalProperties": False}
+    block = _k3_arguments_block(schema)
+    # an exact-empty match: ConstStringFormat("") (verified against the
+    # container xgrammar: SequenceFormat([]) is rejected by the compiler)
+    assert type(block).__name__ == "ConstStringFormat"
+    assert block.value == ""
+
+    tag = get_kimi_k3_structural_tag(
+        [_closed_empty_tool()], [], "required", False
+    )
+    shapes = [type(f).__name__ for f in _walk_formats(tag.format, [])]
+    assert shapes.count("StarFormat") == 0, shapes
+
+
+def test_open_empty_schema_stays_permissive() -> None:
+    """Without additionalProperties: false, generic arguments remain legal
+    per JSON Schema semantics -- unchanged behavior.  A closed-BUT-
+    patterned schema (R9 P3-a) also stays permissive: the builder has no
+    pattern channel, and forbidding would reject legal pattern-matching
+    arguments."""
+
+    from vllm_hcu.tool_parsers.kimi_k3_structural_tag import (
+        _k3_arguments_block,
+    )
+
+    block = _k3_arguments_block({"type": "object", "properties": {}})
+    assert type(block).__name__ == "StarFormat"
+    patterned = _k3_arguments_block(
+        {
+            "type": "object",
+            "properties": {},
+            "patternProperties": {"^x": {"type": "string"}},
+            "additionalProperties": False,
+        }
+    )
+    assert type(patterned).__name__ == "StarFormat"
+
+
+def test_closed_empty_call_rejects_invented_args_via_xgrammar() -> None:
+    """Compile the closed-empty tag and let the real FSM judge: the
+    zero-argument call must complete the grammar; an invented argument
+    tag must dead-end it."""
+
+    xg = pytest.importorskip("xgrammar")
+    compiler_cls = getattr(xg, "GrammarCompiler", None)
+    if compiler_cls is None or not hasattr(compiler_cls, "compile_structural_tag"):
+        pytest.skip("xgrammar lacks GrammarCompiler.compile_structural_tag")
+
+    tag = get_kimi_k3_structural_tag(
+        [_closed_empty_tool()], [], "required", False
+    )
+    vocab = [
+        "a", "b", "c", "d", "e", "f", "g", "v", "3", "<", "|", ">", '"', "=",
+        "open", "close", "sep", "argument", "call", "tools", "response",
+        "message", "number", "string", "key", "python", "index", "x",
+        "_", "s", "p", "l", "u", "t", "o", "n", "e", "r", "i", " ", "1",
+    ]
+    compiled = compiler_cls(xg.TokenizerInfo(vocab)).compile_structural_tag(tag)
+
+    pre = '<|close|>response<|sep|><|open|>tools<|sep|><|open|>call tool="python" index="1"<|sep|>'
+    post = "<|close|>call<|sep|><|close|>tools<|sep|>"
+    end = "<|close|>message<|sep|>"
+    invented = '<|open|>argument key="x" type="string"<|sep|>v<|close|>argument<|sep|>'
+
+    def accepts(sample: str) -> tuple[bool, bool]:
+        matcher = xg.GrammarMatcher(compiled)
+        return bool(matcher.accept_string(sample)), matcher.is_completed()
+
+    assert accepts(pre + post + end) == (True, True)
+    assert accepts(pre + invented + post + end)[0] is False

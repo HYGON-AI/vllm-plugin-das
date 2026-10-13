@@ -218,6 +218,22 @@ def _k3_arguments_block(parameters: dict[str, Any] | bool) -> Any:
         return StarFormat(content=_k3_permissive_argument_tag())
     props = parameters.get("properties")
     if not isinstance(props, dict) or not props:
+        # Review 2026-10-15 P1 (round 8): an empty CLOSED schema ("properties"
+        # empty/absent + additionalProperties: false) permits NO arguments --
+        # the permissive star let the model invent arbitrary argument names
+        # that reach the tool executor.  ``ConstStringFormat("")`` matches
+        # only the empty string (verified against xgrammar on this wheel:
+        # a zero-argument call compiles and completes; an invented
+        # ``argument`` tag fails the matcher), and the block is positionally
+        # optional between the call header and the call close marker.
+        if (
+            parameters.get("additionalProperties") is False
+            # R9 P3-a: patternProperties makes the schema closed-but-patterned;
+            # the builder has no pattern channel, so fall back to permissive
+            # (pre-fix behavior) instead of forbidding legal arguments.
+            and not parameters.get("patternProperties")
+        ):
+            return ConstStringFormat(value="")
         return StarFormat(content=_k3_permissive_argument_tag())
     root_defs = {
         defs_key: parameters[defs_key]

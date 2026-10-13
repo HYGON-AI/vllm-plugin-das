@@ -263,7 +263,15 @@ class HcuTritonMLAImpl(TritonMLAImpl):
             self.scale,
             PAGE_SIZE,
             k_scale=layer._k_scale,
-            v_scale=layer._k_scale,
+            # Review 2026-10-15 P3 (round 8): pass the LAYER's v calibration.
+            # The ported upstream call reused _k_scale for both sides (wheel
+            # triton_mla.py:253-254 has the same substitution); when an FP8
+            # KV cache calibrates k and v separately that descales v with
+            # k's factor.  ``_v_scale`` is part of the wheel's attention
+            # layer contract (vllm/v1/attention/backend.py:752-753); for
+            # BF16 caches and default uncalibrated layers both sides are
+            # 1.0, so this changes nothing there.
+            v_scale=layer._v_scale,
             is_mla=True,
         )
 

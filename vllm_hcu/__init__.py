@@ -56,13 +56,16 @@ def _bridge_plugin_logging() -> None:
     directions -- plugin ``.debug()`` diagnostics were dropped in DEBUG
     deployments while plugin INFO rode through at WARNING+.
 
-    Fallback caveat: when the ``vllm`` logger has no handlers yet (vLLM not
-    configured, or VLLM_CONFIGURE_LOGGING=0), the fallback handler logs at
-    INFO and ``propagate=False`` bypasses any operator root policy -- the
-    mirror only honors the operator's level once the ``vllm`` tree exposes
-    it (verified: this deployment line sets the ``vllm`` LOGGER level, not
-    just its handler, from VLLM_LOGGING_LEVEL in vllm/logger.py).  The
-    mirror is also a one-shot import-time snapshot; a later runtime
+    Handlerless deployments stay UNTOUCHED (review 2026-10-15 P2, round 8):
+    when the ``vllm`` logger has no handlers yet -- vLLM imported but not
+    configured, or VLLM_CONFIGURE_LOGGING=0 -- the plugin neither installs
+    its own fallback handler nor latches, so its records follow the
+    operator's root policy (below-WARNING records are dropped by the
+    last-resort writer exactly like vLLM's own records under that flag).
+    The previous fallback pinned INFO on stderr with ``propagate=False``
+    and, when ``vllm_hcu`` was imported before vLLM finished configuring,
+    permanently latched away the handlers and level that arrived later.
+    The mirror is a one-shot import-time snapshot; a later runtime
     reconfiguration of the ``vllm`` level is not re-mirrored.
     """
 
@@ -73,13 +76,9 @@ def _bridge_plugin_logging() -> None:
         return
     handlers = list(logging.getLogger("vllm").handlers)
     if not handlers:
-        handler = logging.StreamHandler()
-        handler.setFormatter(
-            logging.Formatter(
-                "%(asctime)s %(levelname)s %(name)s - %(message)s"
-            )
-        )
-        handlers = [handler]
+        # No vLLM logging policy exists yet: defer to the operator's root
+        # configuration instead of inventing one (see docstring).
+        return
     for handler in handlers:
         if handler not in root.handlers:
             root.addHandler(handler)
