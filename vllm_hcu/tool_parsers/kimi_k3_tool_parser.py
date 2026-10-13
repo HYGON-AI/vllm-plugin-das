@@ -382,7 +382,21 @@ class KimiK3ToolParser(ToolParser):
             else:
                 text = text[m_open.end() :]
         else:
-            text = self._response_close_re.sub("", text)
+            # Audit R18 #13: no open marker -- cut at the FIRST framing
+            # close.  Text after a close marker is post-turn junk (the
+            # streaming side already stops at the first marker); keeping
+            # it made non-streaming return "Hitail" where streaming
+            # returned "Hi".
+            cuts = [
+                m.start()
+                for m in (
+                    self._response_close_re.search(text),
+                    self._message_close_re.search(text),
+                )
+                if m is not None
+            ]
+            if cuts:
+                text = text[: min(cuts)]
         text = self._message_close_re.sub("", text)
         return text or None
 
@@ -696,7 +710,11 @@ class KimiK3ToolParser(ToolParser):
         same last-wins semantics as the closed path's dict extraction.
         Clients that patch key-by-key under a single-key assumption will
         see the same key twice (only when the model actually repeats a
-        key, which the renderer never does).  Remaining known limitation:
+        key, which the renderer never does).  PERF NOTE (audit R18 #7):
+        every delta rescans the whole open-call body -- O(text) per
+        delta, chosen for statelessness; normal argument sizes are
+        trivial, but hundreds-of-KB arguments will dominate event-loop
+        time.  Remaining known limitation:
         a truncated non-string (object/array)
         value cannot be repaired into valid JSON at end-of-stream.
         """
@@ -766,7 +784,11 @@ class KimiK3ToolParser(ToolParser):
 
         Emits whatever remains of the arguments prefix (with repaired
         closing quotes, where the value shape allows it) exactly once, and
-        clears the streaming state.
+        clears the streaming state.  DOCUMENTED DIVERGENCE (audit R18
+        #5): a call truncated by max_tokens reaches the client as a
+        valid-JSON tool_call here, while the closed path returns
+        nothing -- conservative executors should still schema-check the
+        arguments; header frames already sent cannot be retracted.
         """
 
         st = self._streaming_call

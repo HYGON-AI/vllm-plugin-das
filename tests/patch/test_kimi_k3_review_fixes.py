@@ -978,3 +978,67 @@ def test_parse_delta_none_choice_suppresses_tools_channel() -> None:
             out.append(delta.content)
     assert "".join(out) == "Hi", out
     assert "<|" not in "".join(out)
+
+
+def test_non_streaming_cuts_content_at_first_framing_close() -> None:
+    """Audit R18 #13: without an open marker, text after the first close
+    is post-turn junk -- non-streaming now matches the streaming side."""
+
+    parser = _live_parser()
+    info = parser.extract_tool_calls(
+        "Hi<|close|>response<|sep|>junk tail",
+        SimpleNamespace(tool_choice="auto"),
+    )
+    assert not info.tools_called
+    assert info.content == "Hi", info.content
+
+
+def test_parse_delta_none_flushes_tail_on_empty_final_delta() -> None:
+    """Audit R18 #6: the terminal delta can be EMPTY (wheel returns None,
+    finished=True) -- the held-back tail must still flush and the state
+    must reset, fabricating one final DeltaMessage when it has content."""
+
+    parser = _live_parser()
+
+    class Wheel:
+        def parse_delta(self, delta_text, delta_token_ids, request, *, finished=False):
+            if delta_text == "":
+                return None
+            return SimpleNamespace(content=delta_text, tool_calls=[])
+
+    class DelegatingParser:
+        def __init__(self):
+            self.result = ([], "")
+            self._tool_parser = parser
+            self._wheel = Wheel()
+
+        def _extract_tool_calls(self, content, request, *args, **kwargs):
+            return self.result
+
+        def parse_delta(self, delta_text, ids, request, *, finished=False):
+            return self._wheel.parse_delta(
+                delta_text, ids, request, finished=finished
+            )
+
+    module = ModuleType(patch_delegating_tool_content.TARGET_MODULE)
+    module.DelegatingParser = DelegatingParser
+    delegator = DelegatingParser()
+    assert patch_delegating_tool_content.apply_to_module(module) is True
+    request = SimpleNamespace(tool_choice="none", request_id="r-tail")
+
+    # visible "a", the trailing "<" is held back as a marker prefix
+    delta = delegator.parse_delta(
+        "<|open|>response<|sep|>a<", [9], request, finished=False
+    )
+    assert delta is not None and delta.content == "a", delta.content
+    assert delta.tool_calls == []
+
+    # terminal empty delta: fabricate the flush of the held "<"
+    final = delegator.parse_delta("", [9], request, finished=True)
+    assert final is not None, "held tail must flush on the empty final delta"
+    assert final.content == "<", (final.content, type(final).__name__)
+
+    # state is reset: a NEW request reuses the parser without a stale clip
+    request2 = SimpleNamespace(tool_choice="none", request_id="r-tail-2")
+    d2 = delegator.parse_delta("Z", [9], request2, finished=False)
+    assert d2 is not None and d2.content == "Z", d2.content

@@ -143,6 +143,7 @@ def _k3_simple_pattern_bounds(
         return {
             "+": (cls, 1, None),
             "*": (cls, 0, None),
+            "?": (cls, 0, 1),
         }[quant]
     inner = quant[1:-1]
     if "," not in inner:
@@ -208,6 +209,16 @@ def _k3_bounded_string_regex(prop: dict[str, Any]) -> str | None:
     if isinstance(pattern, str) and pattern:
         simple = _k3_simple_pattern_bounds(pattern)
         if simple is not None:
+            cls_src = simple[0]
+            # Framing safety (audit R18 #11): a NEGATED class or a class
+            # containing a literal ``<`` can produce marker text the
+            # parser then cuts inside -- only the ATOM regime (which
+            # excludes the ``<|`` prefix) is guaranteed safe.  Treat such
+            # classes as non-simple; they fall to the verbatim/permissive
+            # checks below.
+            if cls_src.startswith("[^") or "<" in cls_src:
+                simple = None
+        if simple is not None:
             cls, plo, phi = simple
             lo = max(min_len, plo)
             hi = phi if max_len is None else (
@@ -227,29 +238,34 @@ def _k3_bounded_string_regex(prop: dict[str, Any]) -> str | None:
                 hi = phi if phi is not None else _K3_PATTERN_CEILING
             return f"{cls}{{{lo},{hi}}}"
         if len(pattern) >= 2 and pattern[0] == "^" and pattern[-1] == "$":
-            # Whole-value enforcement.  NOTE (review R17 P2-2): a
-            # non-simple anchored pattern does NOT fold minLength /
-            # maxLength into the regex, and a general regex
-            # intersection is not expressible here -- length bounds
-            # are unenforced under this regime.  Its ATOMS also lack
-            # the ``<|`` exclusion of _K3_STRING_ATOM, so a pattern
-            # like ``^.+$`` can consume framing markers; declare such
-            # patterns carefully (review R17 P3-2).
-            return f"(?:{pattern[1:-1]})"
+            body = pattern[1:-1]
+            # Framing safety (review R18 / codex batch-6 P2): an atom that
+            # can match ``<`` -- an unescaped dot or a negated class --
+            # would let the value swallow ``<|close|>argument<|sep|>``,
+            # after which the parser cuts INSIDE a schema-valid-looking
+            # value and embedded argument tags can reach the executor.
+            # AnyText(excludes=[_K3_CLOSE]) IS the safe intersection:
+            # drop marker-swallowing patterns to the permissive atom
+            # (declared length bounds still apply via the fall-through).
+            if not (re.search(r"(?<!\\)\.", body) or "[^" in body or "<" in body):
+                return f"(?:{body})"
         if max_len is None:
-            # PROVEN engine limit (probe 2026-10-15, xgrammar 0.2.3):
-            # matching is prefix-completing, and ANY value can be
-            # completed to a containment witness by appending a match
-            # ("urrgent no" is a prefix of "urrgent nourgent").
-            # Containment ("search") semantics is unfalsifiable at the
-            # value end and CANNOT be enforced; stay permissive rather
-            # than build a toothless grammar (anchored regimes above --
-            # the realistic shapes -- are enforced exactly).
+            # Two reasons a pattern cannot ride a value regex here:
+            # (a) PROVEN engine limit (probe 2026-10-15, xgrammar 0.2.3):
+            # matching is prefix-completing -- any value can be completed
+            # to a containment witness, so search semantics is
+            # unfalsifiable at the value end;
+            # (b) framing safety per the anchored guard above.
+            # Stay permissive rather than build a toothless or
+            # structure-breaking grammar.
             return None
-        # fall through: an unanchored pattern cannot be enforced, but a
-        # declared maxLength still is (no behavior regression vs the
-        # length-only regime, review R17 P2-2).
+        # fall through: the pattern cannot be enforced, but a declared
+        # maxLength still is (declared bounds are never silently dropped).
     if max_len is None:
+        if min_len > 0:
+            # a declared minLength is not silently dropped either
+            # (audit R18 #12)
+            return _K3_STRING_ATOM + f"{{{min_len},{_K3_PATTERN_CEILING}}}"
         return None
     return _K3_STRING_ATOM + f"{{{min_len},{max_len}}}"
 
@@ -282,6 +298,26 @@ def _k3_pinned_key_tag(key: str) -> TagFormat:
     )
 
 
+# Constraint keywords that apply ONLY to object instances (JSON Schema
+# applicability): on a non-object union branch they are VACUOUS, so
+# dropping them is semantically exact -- and keeps the Optional[BigObject]
+# null branch from duplicating the whole properties table.
+_K3_OBJECT_ONLY_KEYS = frozenset(
+    {
+        "properties",
+        "required",
+        "additionalProperties",
+        "patternProperties",
+        "propertyNames",
+        "minProperties",
+        "maxProperties",
+        "dependentRequired",
+        "dependentSchemas",
+        "dependencies",
+    }
+)
+
+
 def _k3_union_branches(prop: dict[str, Any]) -> list[Any] | None:
     """The declared alternatives of a union property, in declaration order.
 
@@ -295,7 +331,22 @@ def _k3_union_branches(prop: dict[str, Any]) -> list[Any] | None:
             return branches
     json_type = prop.get("type")
     if isinstance(json_type, list) and json_type:
-        return [{"type": branch} for branch in json_type]
+        # Audit R18 #3: keep SIBLING constraints on each branch --
+        # enum/maxLength etc all apply per-type; object-only keys are
+        # vacuous elsewhere (see :data:`_K3_OBJECT_ONLY_KEYS`).  A
+        # type-only branch degraded {"type": ["object","null"],
+        # "properties": ...} to an unconstrained pinned shape via the
+        # merge path.
+        return [
+            {
+                k: v
+                for k, v in prop.items()
+                if k not in ("type", "anyOf", "oneOf")
+                and (branch == "object" or k not in _K3_OBJECT_ONLY_KEYS)
+            }
+            | {"type": branch}
+            for branch in json_type
+        ]
     return None
 
 
@@ -397,6 +448,24 @@ def _merge_same_begin(group: list[Any]) -> Any:
     )
 
 
+def _k3_deref_ref(prop: dict[str, Any], root_defs: dict[str, Any] | None) -> Any:
+    """One-hop local ``$ref`` resolution (pydantic nested-model shape).
+
+    Returns the referenced schema when it is a dict reachable through
+    ``root_defs``; None for remote/unresolvable/self-referential refs.
+    """
+
+    ref = prop.get("$ref")
+    if not (isinstance(ref, str) and ref.startswith("#/")):
+        return None
+    node: Any = root_defs or {}
+    for part in ref[2:].split("/"):
+        if not isinstance(node, dict) or part not in node:
+            return None
+        node = node[part]
+    return node if isinstance(node, dict) else None
+
+
 def _k3_argument_tag(
     key: str,
     schema: dict[str, Any],
@@ -456,6 +525,33 @@ def _k3_argument_tag(
                 return (
                     merged[0] if len(merged) == 1 else OrFormat(elements=merged)
                 )
+        # Audit R18 #4: the common pydantic shapes reach here -- a bare
+        # "$ref" (or allOf-wrapped) property and typeless enums.  Without
+        # this resolution they degrade to the pinned wildcard tag and the
+        # model can freestyle the value channel.  One hop, bounded.
+        resolved = _k3_deref_ref(prop, root_defs)
+        if resolved is None:
+            all_of = prop.get("allOf")
+            if isinstance(all_of, list) and len(all_of) == 1 and isinstance(all_of[0], dict):
+                resolved = _k3_deref_ref(all_of[0], root_defs)
+        if isinstance(resolved, dict) and resolved.get("type") is not None:
+            return _k3_argument_tag(key, resolved, root_defs)
+        enum_values = prop.get("enum")
+        if isinstance(enum_values, list) and enum_values:
+            kinds = {
+                "string"
+                if isinstance(v, str)
+                else "boolean"
+                if isinstance(v, bool)
+                else "integer"
+                if isinstance(v, int) and not isinstance(v, bool)
+                else "number"
+                if isinstance(v, float)
+                else None
+                for v in enum_values
+            }
+            if len(kinds) == 1 and None not in kinds:
+                return _k3_argument_tag(key, {**prop, "type": kinds.pop()}, root_defs)
         return _k3_pinned_key_tag(key)
     begin = (
         f'{_K3_OPEN}argument key="{_k3_escape_attr(key)}" type="{xtml_type}"{_K3_SEP}'
@@ -517,14 +613,16 @@ def _k3_arguments_block(parameters: dict[str, Any] | bool) -> Any:
     """
 
     if parameters is False:
-        # Review 2026-10-15 round 17 P3: JSON Schema ``false`` rejects any
-        # value -- a no-argument tool.  The permissive star let the model
-        # invent argument tags here while the empty-CLOSED-schema branch
-        # below correctly returns ``ConstStringFormat("")``; keep the two
-        # zero-parameter shapes consistent (same wheel-verified matching
-        # property: the zero-argument call completes, an invented
-        # ``argument`` tag fails the matcher).
-        return ConstStringFormat(value="")
+        # Review 2026-10-15 round 18 P2: JSON Schema ``false`` rejects
+        # EVERY instance -- including the empty object -- so no call can
+        # satisfy this tool.  An empty argument block would still admit
+        # the call; an unsatisfiable marker (NUL is outside any realistic
+        # vocabulary, so the matcher dies the moment the call body is
+        # attempted) rejects the tool's call outright.  Reachability note
+        # stands: this wheel's FunctionToolParam 400s bool parameters
+        # upstream; this keeps the documented dict|bool contract honest
+        # for internal callers and future wheels.
+        return ConstStringFormat(value="\x00")
     if not isinstance(parameters, dict):
         # ``True`` (or any non-dict truthy config) keeps the permissive
         # fallback -- no constraint was declared.
@@ -575,17 +673,10 @@ def _k3_arguments_block(parameters: dict[str, Any] | bool) -> Any:
     return StarFormat(content=inner)
 
 
-# Order-agnostic coverage of required properties explodes as K! branches,
-# K <= 3 (<= 6 permutations) stays compileable, larger schemas keep the
-# fork's one-of shape.  Cost driver is the number of ``inner`` (the full
-# Or-of-all-props) copies: K! branches x (K+1) stars each, capped here so
-# future raises of the K cap cannot silently blow up compile size
-# (review R3 P2 #2).
-_K3_MAX_STRICT_REQUIRED = 3
-_K3_MAX_COVERAGE_INNER_COPIES = 24
-# Grammar bloat guard for union alternation (review R13 P1): beyond this
-# many declared branches the key-pinned wildcard tag is cheaper and the
-# value axis stays (documented) permissive.
+# Coverage cost is O(K) inner copies in the fixed-order encoding below; a
+# generous ceiling only guards pathological schemas (hundreds of required
+# keys) from absurd grammar sizes.
+_K3_MAX_STRICT_REQUIRED = 64
 _K3_MAX_UNION_BRANCHES = 8
 
 
@@ -594,49 +685,42 @@ def _k3_required_coverage(
     expressible: dict[str, Any],
     inner: Any,
 ) -> Any | None:
-    """Demand at least one ``argument`` tag per schema-required property.
+    """Demand one ``argument`` tag per schema-required property, for ANY K.
 
-    Review 2026-10-13 P1 #2: the portable fork shape
-    ``PlusFormat(content=OrFormat(tags))`` only demands >=1 argument tag
-    overall, so a call omitting a required parameter compiles fine and
-    surfaces downstream as a validation error.  K3 arguments are
-    order-agnostic (the renderer never fixes arg order), so true coverage
-    must allow required tags in any order AND interleaved with optional
-    extras: each permutation branch is
-    ``SequenceFormat(StarFormat(inner), <tag> per required-prop with
-    ``StarFormat(inner)`` between and around them)`` -- every required
-    property appears exactly once with the bare tag (the trailing stars of
-    ``inner`` already carry duplicates and optional extras, so a Plus
-    quantifier would be redundant ambiguity -- review R3 P2 #2), optional
-    extras may appear before, between and after them (review follow-up R2:
-    the earlier requireds-first compaction ``Seq(Plus, Plus, Star)``
-    wrongly rejected legal interleavings like ``a c b``).  Returns None
-    (caller keeps the fork shape) when coverage is not expressible: any
-    required key missing from ``properties``, when K exceeds
-    :data:`_K3_MAX_STRICT_REQUIRED`, or when the inner-copy count would
-    exceed :data:`_K3_MAX_COVERAGE_INNER_COPIES`.  Diverges from the fork
-    (structural_tag_registry.py:533) on purpose.  NOTE (review R11 P3-4):
-    the permissive-tag clause is gone -- union/unknown-type properties are
-    key-pinned, not mapped to the key-agnostic tag.
+    Review 2026-10-15 round 18 P1: the previous encoding enumerated
+    permutations (order-agnostic coverage), so it needed a K!-explosion
+    guard at K <= 3 -- beyond the cap only PlusFormat(inner) remained,
+    which lets a call omit required parameters.  The cap is gone: under
+    strict generation the grammar CONSTRAINS the output, so a single
+    fixed order is not a rejection of legal renderings -- the model
+    simply emits that order; optional extras and duplicates ride the
+    surrounding stars exactly as before, and the closed-path parser
+    accepts any order a model could ever produce.
+
+    Each branch is
+    ``SequenceFormat(StarFormat(inner), <tag> per required prop with
+    StarFormat(inner)`` between and after)`` -- K+1 inner copies, linear.
+
+    Returns None (caller keeps the fork shape) only when a required key
+    has no expressible tag or K is absurd (> :data:`_K3_MAX_STRICT_REQUIRED`).
     """
 
     required = list(dict.fromkeys(required))  # dedupe, keep order
     if not 0 < len(required) <= _K3_MAX_STRICT_REQUIRED:
         return None
-    picked = [expressible.get(key) for key in required]
-    if any(tag is None for tag in picked):
+    # Audit R18 #2: tag order follows the PROPERTIES declaration order
+    # (expressible preserves it) -- the ``required`` array order is
+    # arbitrary, and demanding it forces the model to duplicate keys
+    # (last-wins silently picks the second value).
+    required_set = set(required)
+    if not required_set <= set(expressible):
         return None
-    perms = list(permutations(picked))
-    if len(perms) * (len(picked) + 1) > _K3_MAX_COVERAGE_INNER_COPIES:
-        return None
-    branches = []
-    for perm in perms:
-        elements: list[Any] = [StarFormat(content=inner)]
-        for tag in perm:
-            elements.append(tag)
-            elements.append(StarFormat(content=inner))
-        branches.append(SequenceFormat(elements=elements))
-    return branches[0] if len(branches) == 1 else OrFormat(elements=branches)
+    picked = [expressible[k] for k in expressible if k in required_set]
+    elements: list[Any] = [StarFormat(content=inner)]
+    for tag in picked:
+        elements.append(tag)
+        elements.append(StarFormat(content=inner))
+    return SequenceFormat(elements=elements)
 
 
 def _k3_call_tag(tool: FunctionToolParam, *, strict_gate: bool) -> TagFormat:
@@ -694,13 +778,30 @@ def _k3_response_prefix() -> list[Any]:
 
 def _k3_tools_channel(
     tools: list[FunctionToolParam], *, strict_gate: bool
-) -> TagFormat:
+) -> TagFormat | None:
+    """The tools channel, or None when NO tool can be called at all.
+
+    Audit R18 #10: a tool whose parameters cannot ever be satisfied
+    (``parameters is False``) gets NO call surface -- offering a call
+    that grammar-dies the moment its body is attempted just burns
+    generation on a doomed frame.  When every tool is dropped the whole
+    channel collapses to None and the caller emits the pure-chat shape.
+    """
+
+    tags = []
+    for tool in tools:
+        parameters = _get_function_parameters(
+            tool.function, strict_gate=strict_gate
+        )
+        if parameters is False:
+            continue
+        tags.append(_k3_call_tag(tool, strict_gate=strict_gate))
+    if not tags:
+        return None
     return TagFormat(
         begin=_K3_TOOLS_OPEN,
         content=TagsWithSeparatorFormat(
-            tags=[
-                _k3_call_tag(tool, strict_gate=strict_gate) for tool in tools
-            ],
+            tags=tags,
             separator="",
             at_least_one=True,
         ),
@@ -751,8 +852,9 @@ def get_kimi_k3_structural_tag(
         )
 
     if tool_choice == "auto":
-        tools_part: Any = OptionalFormat(
-            content=_k3_tools_channel(tools, strict_gate=True)
+        channel = _k3_tools_channel(tools, strict_gate=True)
+        tools_part: Any = (
+            OptionalFormat(content=channel) if channel is not None else None
         )
     elif tool_choice == "forced":
         # K3 rejects named tool choice upstream; treat defensively as a
@@ -761,8 +863,8 @@ def get_kimi_k3_structural_tag(
     else:  # required
         tools_part = _k3_tools_channel(tools, strict_gate=False)
 
-    return StructuralTag(
-        format=SequenceFormat(
-            elements=[*_k3_response_prefix(), tools_part, trailer]
-        )
-    )
+    elements = [*_k3_response_prefix()]
+    if tools_part is not None:
+        elements.append(tools_part)
+    elements.append(trailer)
+    return StructuralTag(format=SequenceFormat(elements=elements))

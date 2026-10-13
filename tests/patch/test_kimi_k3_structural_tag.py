@@ -525,12 +525,13 @@ def test_closed_union_schema_rejects_invented_keys_via_xgrammar() -> None:
 
 
 def test_required_branches_stagger_required_and_optional_args() -> None:
-    """R2 #2: each coverage branch is Seq(Star, tag, Star, ..., Star) so
-    optional args may appear before/between/after the required ones (the
-    earlier requireds-first compaction rejected legal interleavings);
+    """R2 #2: the coverage branch is Seq(Star, tag, Star, ..., Star) so
+    optional args may appear before/between/after the required ones;
     R3 #2: the required entries are the bare per-prop tags -- the trailing
-    stars of ``inner`` already carry duplicates and extras, so Plus would
-    be redundant ambiguity."""
+    stars of ``inner`` already carry duplicates and extras.  R18 P1: ONE
+    fixed-order branch (declaration order) instead of K! permutations --
+    under strict generation the grammar constrains the output order, so
+    coverage stays EXACT for any K at linear cost."""
 
     tag = get_kimi_k3_structural_tag(
         [_mixed_required_tool()], [], "required", False
@@ -542,7 +543,7 @@ def test_required_branches_stagger_required_and_optional_args() -> None:
         and len(getattr(f, "elements", [])) == 5
     ]
     assert branches, "no 5-element required-coverage branch found"
-    assert len(branches) == 2  # 2! permutations of {alpha, beta}
+    assert len(branches) == 1  # single fixed-order branch (R18 P1)
     for branch in branches:
         names = [type(e).__name__ for e in branch.elements]
         assert names == [
@@ -601,17 +602,30 @@ def test_required_coverage_accepts_interleaved_args_via_xgrammar() -> None:
     # samples end with it, and positives must fully consume the grammar
     end = "<|close|>message<|sep|>"
     assert accepts(pre + arg_alpha + arg_gamma + arg_beta + post + end) == (True, True)
-    assert accepts(pre + arg_beta + arg_alpha + post + end) == (True, True)
+    # R18 P1: required keys must appear in DECLARATION order -- the
+    # grammar constrains the output under strict generation (the closed
+    # parser stays order-agnostic for unguided output); a reversed
+    # emission dead-ends instead of silently dropping beta
+    assert accepts(pre + arg_beta + arg_alpha + post + end) == (False, False)
     # without beta anywhere the FSM dead-ends: not accepted
     assert accepts(pre + arg_alpha + arg_gamma + post + end)[0] is False
 
 
-def test_wide_required_schema_stays_fork_shaped() -> None:
-    """K > 3 permutations would explode: fall back to the fork shape."""
+def test_wide_required_schema_gets_linear_coverage() -> None:
+    """R18 P1: the K<=3 permutation cap is GONE -- a wide required schema
+    gets the linear fixed-order coverage branch (no PlusFormat fallback
+    that allowed omitting required keys)."""
 
     tag = get_kimi_k3_structural_tag(_k_required_tools(4), [], "required", False)
     shapes = [type(f).__name__ for f in _walk_formats(tag.format, [])]
-    assert shapes.count("PlusFormat") == 1, shapes
+    assert shapes.count("PlusFormat") == 0, shapes
+    coverage = [
+        f
+        for f in _walk_formats(tag.format, [])
+        if type(f).__name__ == "SequenceFormat"
+        and len(getattr(f, "elements", [])) == 9  # Star + 4x(tag, Star)
+    ]
+    assert coverage, shapes
 
 
 def test_response_body_excludes_reserved_close_prefix() -> None:
@@ -931,9 +945,10 @@ def test_parameters_false_rejects_invented_arguments() -> None:
     NOTE on reachability: this wheel's ``FunctionToolParam`` validates
     ``parameters`` as dict-only, so a bool ``false`` dies with a 400
     upstream -- the shape arrives only through the builder's documented
-    ``dict | bool`` contract (direct/internal callers).  There it must
-    behave consistently with the empty-CLOSED-schema branch: ONLY the
-    empty argument sequence is legal."""
+    ``dict | bool`` contract (direct/internal callers).  JSON Schema
+    ``false`` rejects EVERY instance, so the builder emits an
+    unsatisfiable marker: the tool's whole CALL dies at the matcher, not
+    merely its arguments."""
 
     from vllm_hcu.tool_parsers.kimi_k3_structural_tag import (
         _k3_arguments_block,
@@ -941,7 +956,10 @@ def test_parameters_false_rejects_invented_arguments() -> None:
 
     block = _k3_arguments_block(False)
     assert type(block).__name__ == "ConstStringFormat", type(block).__name__
-    assert block.value == "", block.value
+    # JSON Schema false rejects every instance INCLUDING the empty
+    # object: the marker is unsatisfiable (NUL), so the tool's CALL
+    # dies -- not just its arguments (review R18 P2)
+    assert block.value == "\x00", block.value
 
     # ``True``/non-dict keeps the permissive fallback
     permissive = _k3_arguments_block(True)
@@ -989,6 +1007,178 @@ def test_parameters_false_rejects_invented_arguments() -> None:
         + post
     )
     assert not matcher.accept_string(invented)
+
+
+def test_pattern_bounded_regex_r18_regimes() -> None:
+    """Audit R18: ?-quantifier table row (crash guard), minLength-only
+    regime, and framing-unsafe anchored patterns drop to the safe atom."""
+
+    from vllm_hcu.tool_parsers.kimi_k3_structural_tag import (
+        _k3_bounded_string_regex,
+        _K3_STRING_ATOM,
+    )
+
+    # audit #1: the ? quantifier must MERGE, not KeyError
+    regex = _k3_bounded_string_regex({"type": "string", "pattern": "^[a-z]?$"})
+    assert regex == "[a-z]{0,1}", regex
+
+    # audit #12: minLength-only is not silently dropped
+    only_min = _k3_bounded_string_regex({"type": "string", "minLength": 2})
+    assert only_min == _K3_STRING_ATOM + "{2,4096}", only_min
+
+    # codex batch-6 P2 / audit #11: an atom that can match '<' must never
+    # become a value regex -- permissive atom (or length regime) instead
+    assert (
+        _k3_bounded_string_regex({"type": "string", "pattern": "^.+$"}) is None
+    )
+    assert (
+        _k3_bounded_string_regex(
+            {"type": "string", "pattern": "^[^,]+$", "maxLength": 9}
+        )
+        == _K3_STRING_ATOM + "{0,9}"
+    )
+
+
+def test_required_coverage_uses_properties_order() -> None:
+    """Audit R18 #2: the required ARRAY order is arbitrary -- the coverage
+    tags follow the PROPERTIES order, so a model emitting in schema order
+    is never forced to duplicate a key."""
+
+    tool = FunctionToolParam(
+        function={
+            "name": "swap",
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "alpha": {"type": "string"},
+                    "beta": {"type": "number"},
+                },
+                "required": ["beta", "alpha"],  # reversed vs properties
+                "additionalProperties": False,
+            },
+        }
+    )
+    tag = get_kimi_k3_structural_tag([tool], [], "required", False)
+    xg = pytest.importorskip("xgrammar")
+    compiler_cls = getattr(xg, "GrammarCompiler", None)
+    if (
+        compiler_cls is None
+        or not hasattr(compiler_cls, "compile_structural_tag")
+    ):
+        pytest.skip("xgrammar lacks GrammarCompiler.compile_structural_tag")
+    vocab = [
+        "a", "b", "c", "d", "e", "f", "g", "v", "3", "<", "|", ">", '"', "=",
+        "open", "close", "sep", "argument", "call", "tools", "response",
+        "message", "alpha", "beta", "number", "string", "key", "swap",
+        "index", "1",
+    ]
+    compiled = compiler_cls(xg.TokenizerInfo(vocab)).compile_structural_tag(tag)
+    pre = '<|close|>response<|sep|><|open|>tools<|sep|><|open|>call tool="swap" index="1"<|sep|>'
+    post = "<|close|>call<|sep|><|close|>tools<|sep|><|close|>message<|sep|>"
+    arg_a = '<|open|>argument key="alpha" type="string"<|sep|>v<|close|>argument<|sep|>'
+    arg_b = '<|open|>argument key="beta" type="number"<|sep|>3<|close|>argument<|sep|>'
+    m = xg.GrammarMatcher(compiled)
+    # properties order (alpha then beta) is accepted despite the reversed
+    # required array
+    assert m.accept_string(pre + arg_a + arg_b + post)
+    assert m.is_completed()
+
+
+def test_union_type_array_keeps_sibling_constraints() -> None:
+    """Audit R18 #3: {"type": [...]} branches carry the sibling
+    properties/required/etc instead of degrading to bare types."""
+
+    from vllm_hcu.tool_parsers.kimi_k3_structural_tag import _k3_union_branches
+
+    prop = {
+        "type": ["object", "null"],
+        "properties": {"n": {"type": "integer"}},
+        "required": ["n"],
+        "additionalProperties": False,
+    }
+    branches = _k3_union_branches(prop)
+    assert branches is not None and len(branches) == 2
+    obj_branch, null_branch = branches
+    assert obj_branch["type"] == "object"
+    assert obj_branch.get("properties") == prop["properties"]
+    assert obj_branch.get("required") == ["n"]
+    assert null_branch == {"type": "null"}
+
+
+def test_ref_only_property_resolves_one_hop() -> None:
+    """Audit R18 #4: pydantic nested models arrive as a bare ``$ref``;
+    the builder must resolve through the root defs one hop instead of
+    degrading the property to the pinned wildcard tag."""
+
+    schema = {
+        "type": "object",
+        "properties": {"item": {"$ref": "#/$defs/Item"}},
+        "required": ["item"],
+        "additionalProperties": False,
+        "$defs": {
+            "Item": {
+                "type": "object",
+                "properties": {"n": {"type": "integer"}},
+                "required": ["n"],
+                "additionalProperties": False,
+            }
+        },
+    }
+    tool = FunctionToolParam(
+        function={"name": "holder", "parameters": schema}
+    )
+    tag = get_kimi_k3_structural_tag([tool], [], "required", False)
+    item_tags = [
+        f
+        for f in _walk_formats(tag.format)
+        if type(f).__name__ == "TagFormat"
+        and 'key="item" type="object"' in getattr(f, "begin", "")
+    ]
+    assert item_tags, (
+        "a $ref-only property must resolve to a typed argument tag, "
+        "not the pinned wildcard"
+    )
+    contents = [
+        c
+        for f in item_tags
+        if (c := getattr(f, "content", None)) is not None
+        and type(c).__name__ == "JSONSchemaFormat"
+    ]
+    assert contents, item_tags
+
+
+def test_unsatisfiable_parameters_tool_is_not_offered() -> None:
+    """Audit R18 #10: a tool whose parameters can never be satisfied is
+    NOT offered a call surface at all (dropped from the channel); when
+    every tool is dropped the tag is the pure-chat shape."""
+
+    from types import SimpleNamespace as NS
+
+    from vllm_hcu.tool_parsers.kimi_k3_structural_tag import _k3_tools_channel
+
+    good = FunctionToolParam(
+        function={
+            "name": "fine",
+            "parameters": {
+                "type": "object",
+                "properties": {},
+                "additionalProperties": False,
+            },
+        }
+    )
+    impossible = NS(
+        function=NS(name="impossible", strict=None, parameters=False)
+    )
+    channel = _k3_tools_channel([good, impossible], strict_gate=False)
+    assert channel is not None
+    begins = " ".join(
+        getattr(f, "begin", "") for f in _walk_formats(channel)
+    )
+    assert 'tool="fine"' in begins
+    assert 'tool="impossible"' not in begins
+
+    nothing = _k3_tools_channel([impossible], strict_gate=False)
+    assert nothing is None
 
 
 def test_strict_opt_in_is_required_for_schema_constraint() -> None:

@@ -26,6 +26,13 @@ Routing note: neither wrapper touches ``engine_based_streaming`` -- the
 composite ``_engine_based`` is computed once at delegator construction and
 drives engine-side plumbing; flipping it would reroute more than the fix
 allows.  Both behaviors ride the token-side call path unchanged.
+
+Array note (audit R18 #8, wheel-verified 2026-10-13): the wheel's
+``finalize_generation`` DOES call ``get_remaining_unstreamed_args()``
+whenever a delta carries ``tool_calls``, but our parser never populates
+``prev_tool_call_arr`` (base ``__init__`` creates it empty) and the
+base implementation returns "" on that empty guard first -- a no-op by
+construction, never an IndexError or spurious appended arguments.
 """
 
 from __future__ import annotations
@@ -167,12 +174,6 @@ def _none_stream_delta(tool_parser, request, result, finished):
     first mismatch.
     """
 
-    if result is None:
-        # Review R17 P1-1: an empty delta (or a reasoning boundary) makes
-        # the wheel return None -- keep None semantics; nothing visible
-        # means nothing to accumulate or emit.
-        return None
-
     rid = getattr(request, "request_id", None) or id(request)
     state = getattr(tool_parser, "_hcu_none_state", None)
     if state is None or state[0] != rid:
@@ -182,15 +183,21 @@ def _none_stream_delta(tool_parser, request, result, finished):
         previous = ""
     else:
         previous = state[1]
-    # Only text the wheel itself made visible belongs in the buffer.
-    visible = getattr(result, "content", None) or ""
-    current = previous + visible
-    tool_parser._hcu_none_state = (rid, current)
 
-    content = tool_parser._extract_response_content(current) or ""
+    if result is not None:
+        current = previous + (getattr(result, "content", None) or "")
+        tool_parser._hcu_none_state = (rid, current)
+        content = tool_parser._extract_response_content(current) or ""
+    else:
+        # Review R18 (audit #6 = round-18 codex P2): an empty terminal
+        # delta (the wheel returns None) is NOT a reason to skip the
+        # finish flush -- the buffer may still hold released tail
+        # content.  Treat None as "no new visible text" and run the
+        # buffered finish path below.
+        current = previous
+        content = ""
     if finished:
-        tail_start = tool_parser._sent_content_idx
-        tail = current[tail_start:]
+        tail = current[tool_parser._sent_content_idx :]
         # Review R17 P2-1: if the model emitted a tools channel despite
         # tool_choice="none", that channel must never leak as content --
         # cut it like the non-streaming none path does, THEN strip the
@@ -202,10 +209,22 @@ def _none_stream_delta(tool_parser, request, result, finished):
         tool_parser._hcu_none_state = None
         tool_parser._sent_content_idx = 0
 
+    if result is None:
+        if not content:
+            return None
+        # Fabricate ONE final message carrying the released tail.  The
+        # import path matches kimi_k3_callbacks on this wheel; it stays
+        # lazy so the patch module keeps its clean-import contract.
+        from vllm.entrypoints.openai.engine.protocol import DeltaMessage
+
+        return DeltaMessage(content=content)
     # In-place mutation keeps every other field (e.g. reasoning content)
     # untouched and works for pydantic models and test namespaces alike.
     result.content = content or None
-    result.tool_calls = None
+    # pydantic v2: an explicit None enters fields_set (a null tool_calls
+    # in payloads under exclude_unset) -- an empty list is the neutral
+    # suppressed value (audit R18 #14).
+    result.tool_calls = []
     return result
 
 
