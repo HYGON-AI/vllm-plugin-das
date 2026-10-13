@@ -20,7 +20,6 @@ ADAPTERS = (
     "vllm_hcu.patch.worker.framework_opt.patch_step5_model_state",
     "vllm_hcu.patch.worker.framework_opt.patch_step5_mtp_heads",
     "vllm_hcu.patch.worker.framework_opt.patch_step5_multi_module_mtp",
-    "vllm_hcu.patch.worker.framework_opt.patch_step5_dp_sync",
     "vllm_hcu.patch.platform.core_fix.patch_step5_ep_graph_capture",
     "vllm_hcu.patch.worker.framework_opt.patch_step5_moe_combine",
     "vllm_hcu.patch.worker.framework_opt.patch_step5_token_fp8",
