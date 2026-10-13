@@ -2990,6 +2990,20 @@ class Step4DSAState:
         slots: list[int] = []
         buf_off = 0
 
+        # Protect every resumed head before any new tail can recycle a row.
+        # Mixed prefill/verify batches can reopen retired regions after MTP
+        # rejection; a later batch row is still live even before we visit it.
+        pending_heads = [-1] * num_reqs
+        for row in range(num_reqs):
+            qlen = starts_cpu[row + 1] - starts_cpu[row]
+            if qlen <= 0:
+                continue
+            past = seq_lens_cpu[row] - qlen
+            if past % region:
+                region_id = past // region
+                slot = int(table_cpu[row][region_id // rpp]) * rpp + region_id % rpp
+                pending_heads[row] = self.pending.get(slot)
+
         for row in range(num_reqs):
             tok_start = starts_cpu[row]
             qlen = starts_cpu[row + 1] - tok_start
@@ -3018,7 +3032,7 @@ class Step4DSAState:
             last_slot = slots[-1]
             # The head tokens were buffered by a previous step; that buffer is
             # only free once the region it belongs to has actually closed.
-            pending_in = self.pending.get(first_slot) if head else -1
+            pending_in = pending_heads[row]
             if head and nbuf >= region:
                 sched.completed_slots.append(first_slot)
 
@@ -3268,12 +3282,16 @@ class Step4DSAState:
         rows_in: list[int] = [trash] * nd
         rows_out: list[int] = [trash] * nd
         widest = 0
+        # As in the verify and mixed paths, reserve all heads before acquiring.
+        for row in range(nd):
+            slot = int(slots_np[row])
+            if slot >= 0 and head_np[row]:
+                rows_in[row] = self.pending.get(slot)
         for row in range(nd):
             slot = int(slots_np[row])
             if slot < 0:  # padding, not a request
                 continue
             head_row = int(head_np[row])
-            rows_in[row] = self.pending.get(slot) if head_row else trash
             if head_row == region - 1:
                 # The region closed this step; its tokens are now in a summary
                 # and the pending row is released once every layer has read it.

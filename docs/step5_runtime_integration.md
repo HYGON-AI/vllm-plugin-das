@@ -42,6 +42,14 @@ retain their native execution and MTP paths. Existing HCU feature sidecars and
 operator switches remain the configuration boundary; upstream config and
 attention metadata dataclasses are not extended in place.
 
+## Pending-region ownership
+
+Decode, speculative verification and mixed prefill schedules resolve and touch
+all resumed region heads before allocating any new pending rows. A retired row
+may still hold tokens needed after speculative rejection; an earlier request in
+the batch must not recycle a later request's head. Missing buffered tokens fail
+instead of producing an incorrect summary.
+
 Quantization tools, server launchers, performance clients and evaluation run
 artifacts remain outside the source package. The package contains runtime
 implementations, compatibility adapters, their tests and integration guidance.
@@ -51,12 +59,15 @@ implementations, compatibility adapters, their tests and integration guidance.
 Use the supported vLLM 0.28.1 base and the plugin on `PYTHONPATH`:
 
 ```bash
-python -m pytest -q tests/runtime_patch/test_step5_runtime.py
+python -m pytest -q tests/runtime_patch/test_step5_runtime.py \
+  tests/model_executor/test_step4_dsa_schedule.py
 python tools/check_production_boundary.py
 python tools/check_patch_test_coverage.py
 ```
 
-The focused runtime tests cover adapter contracts and registration.
+The focused runtime tests cover adapter contracts and registration. Pending
+buffer ownership regressions live separately in
+`tests/model_executor/test_step4_dsa_schedule.py`.
 
 For the full `tests/patch` suite, set `VLLM_V0251_SOURCE_ROOT` to the directory
 containing the reviewed vLLM 0.28.1 package. This is the existing test harness's
