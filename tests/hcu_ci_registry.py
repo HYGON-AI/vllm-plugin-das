@@ -119,6 +119,36 @@ register_hcu_ci(
     target="tests/runtime_patch/test_lightop_categorized_api.py",
     est_time=60,
 )
+register_hcu_ci(
+    job="contract-hcu-gfx936",
+    target="tests/runtime_patch/test_deepseek_v4_dspark_patches.py",
+    est_time=60,
+)
+register_hcu_ci(
+    job="contract-hcu-gfx936",
+    target="tests/runtime_patch/test_glm53_native_mhc.py",
+    est_time=60,
+)
+register_hcu_ci(
+    job="contract-hcu-gfx936",
+    target="tests/runtime_patch/test_platform_hcu_config.py",
+    est_time=60,
+)
+register_hcu_ci(
+    job="contract-hcu-gfx936",
+    target="tests/runtime_patch/test_qwen4_exp_pp.py",
+    est_time=60,
+)
+register_hcu_ci(
+    job="contract-hcu-gfx936",
+    target="tests/runtime_patch/test_qwen4_exp_qsa_fp8.py",
+    est_time=60,
+)
+register_hcu_ci(
+    job="contract-hcu-gfx936",
+    target="tests/runtime_patch/test_sparse_indexer_loading.py",
+    est_time=60,
+)
 
 register_hcu_ci(
     job="integration-smoke-gfx938",
@@ -371,6 +401,14 @@ register_hcu_ci(
         "tests/integration/server/"
         "test_evalscope_glm53_flash_channel_fp8_humaneval.py::"
         "test_glm53_flash_channel_fp8_humaneval_evalscope_server"
+    ),
+    est_time=14400,
+)
+register_hcu_ci(
+    job="kimi-k25-humaneval",
+    target=(
+        "tests/integration/server/test_evalscope_kimi_k25_humaneval.py::"
+        "test_kimi_k25_humaneval_evalscope_server"
     ),
     est_time=14400,
 )

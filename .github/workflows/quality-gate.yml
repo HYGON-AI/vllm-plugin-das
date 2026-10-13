@@ -4,7 +4,7 @@ on:
   pull_request:
     types: [opened, synchronize, reopened, ready_for_review]
     branches:
-      - v0.25.1
+      - v0.28.1-dev
 
 permissions:
   contents: read

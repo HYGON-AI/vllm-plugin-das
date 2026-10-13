@@ -1402,6 +1402,7 @@ def test_hcu_custom_op_real_and_fake_share_dcp_schema_and_forward_constants():
     assert fake_calls == [common_args]
 
 
+@pytest.mark.hcu
 def test_hcu_sparse_indexer_custom_op_has_no_tensor_return() -> None:
     if not hasattr(torch.ops.vllm, "hcu_sparse_attn_indexer"):
         # With pytest's plugin disabled, an earlier Hy4 import can register

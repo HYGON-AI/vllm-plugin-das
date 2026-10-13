@@ -6,7 +6,7 @@ name: Patch coverage
 on:
   push:
     branches:
-      - v0.25.1
+      - v0.28.1-dev
   workflow_dispatch:
 
 permissions:
@@ -18,7 +18,7 @@ jobs:
       - self-hosted
       - hcu-ci-pr
     container:
-      image: ${{ vars.HCU_CI_IMAGE }}
+      image: ${{ vars.HCU_CI_IMAGE_V0281 }}
     defaults:
       run:
         shell: bash

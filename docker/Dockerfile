@@ -55,6 +55,8 @@ RUN TRUSTED_HOST="${PYPI_URL#*://}" && TRUSTED_HOST="${TRUSTED_HOST%%/*}" && \
     > /usr/local/bin/das-install && chmod +x /usr/local/bin/das-install
 
 COPY requirements-test.txt /tmp/requirements-test.txt
+COPY docker/requirements-vllm-runtime.txt /tmp/requirements-vllm-runtime.txt
+COPY scripts/ci/hcu/install_vllm_runtime_dependencies.sh /tmp/install_vllm_runtime_dependencies.sh
 
 # AICC 编译器 (nightly 最新版地址由 CI 通过 build-arg 传入, 在镜像内下载安装)
 # AICC_VERSION 由 CI 从同一 URL 解析传入; ENV 指令不支持 bash 参数展开, 无法在 Dockerfile 内由 URL 自动推导
@@ -82,7 +84,8 @@ RUN wget -q "${RESOURCE_SERVER_URL}/pkg/shca/others/20260706/shca-tools-ofed_3.5
 # ---layer--- vLLM 框架依赖
 ARG VLLM_VERSION
 RUN pip install --no-cache-dir ninja wheel setuptools \
-    && pip install --no-cache-dir ray[data,train,tune,serve] -i https://mirrors.aliyun.com/pypi/simple/ --trusted-host mirrors.aliyun.com \
+    && /tmp/install_vllm_runtime_dependencies.sh /tmp/requirements-vllm-runtime.txt \
+    && pip install --no-cache-dir -r /tmp/requirements-test.txt \
     && pip install --no-cache-dir amdsmi==1.0.0+630c16a6.dirty \
     && pip install --no-cache-dir cupy \
     && pip install --no-cache-dir vllm==0.28.1 \

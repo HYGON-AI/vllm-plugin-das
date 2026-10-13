@@ -77,7 +77,7 @@ jobs:
     with:
       matrix: ${{ needs.prepare.outputs.matrix }}
       tested_ref: ${{ needs.prepare.outputs.tested_sha }}
-      image: ${{ inputs.image }}
+      image: ${{ inputs.image || vars.HCU_CI_IMAGE }}
     permissions:
       contents: read
 

@@ -11,7 +11,7 @@ on:
       ref:
         description: Branch, tag, or SHA to test
         required: true
-        default: v0.25.1
+        default: v0.28.1-dev
         type: string
       image:
         description: Optional immutable HCU CI image override
@@ -32,7 +32,7 @@ jobs:
       - self-hosted
       - hcu-ci-pr
     container:
-      image: ${{ vars.HCU_CI_IMAGE }}
+      image: ${{ vars.HCU_CI_IMAGE_V0281 }}
     defaults:
       run:
         shell: bash
@@ -44,7 +44,7 @@ jobs:
       - name: Checkout nightly revision
         uses: actions/checkout@v4
         with:
-          ref: ${{ inputs.ref || 'v0.25.1' }}
+          ref: ${{ inputs.ref || 'v0.28.1-dev' }}
           clean: true
           fetch-depth: 1
 
@@ -79,7 +79,7 @@ jobs:
     with:
       matrix: ${{ needs.prepare.outputs.matrix }}
       tested_ref: ${{ needs.prepare.outputs.tested_sha }}
-      image: ${{ inputs.image || '' }}
+      image: ${{ inputs.image || vars.HCU_CI_IMAGE_V0281 }}
     permissions:
       contents: read
 
@@ -89,7 +89,7 @@ jobs:
     with:
       matrix: ${{ needs.prepare.outputs.quarantine_matrix }}
       tested_ref: ${{ needs.prepare.outputs.tested_sha }}
-      image: ${{ inputs.image || '' }}
+      image: ${{ inputs.image || vars.HCU_CI_IMAGE_V0281 }}
     permissions:
       contents: read
 

@@ -266,7 +266,12 @@ def test_prepare_is_lazy_narrow_idempotent_and_keeps_main_role():
         "'vllm_hcu.model_executor.layers.fused_moe.aiter_ops'}; "
         "initial_targets=sorted(targets & sys.modules.keys()); "
         "assert initial_targets==["
-        "'vllm.distributed.device_communicators.base_device_communicator']; "
+        "'vllm.distributed.device_communicators.base_device_communicator',"
+        "'vllm.forward_context',"
+        "'vllm.utils.deep_gemm',"
+        "'vllm.v1.attention.backend',"
+        "'vllm.v1.worker.dp_utils',"
+        "'vllm.v1.worker.ubatch_utils']; "
         "assert not (business & sys.modules.keys()); "
         "first=prepare_worker_patches(); second=prepare_worker_patches(); "
         "print(json.dumps({'first':len(first),'second':len(second),"
@@ -291,10 +296,20 @@ def test_prepare_is_lazy_narrow_idempotent_and_keeps_main_role():
         "callbacks": expected_callbacks,
         "statuses": ["applied", "armed"],
         "initial_targets_loaded": [
-            "vllm.distributed.device_communicators.base_device_communicator"
+            "vllm.distributed.device_communicators.base_device_communicator",
+            "vllm.forward_context",
+            "vllm.utils.deep_gemm",
+            "vllm.v1.attention.backend",
+            "vllm.v1.worker.dp_utils",
+            "vllm.v1.worker.ubatch_utils",
         ],
         "targets_loaded": [
-            "vllm.distributed.device_communicators.base_device_communicator"
+            "vllm.distributed.device_communicators.base_device_communicator",
+            "vllm.forward_context",
+            "vllm.utils.deep_gemm",
+            "vllm.v1.attention.backend",
+            "vllm.v1.worker.dp_utils",
+            "vllm.v1.worker.ubatch_utils",
         ],
         "business_loaded": [],
         "runner_loaded": False,

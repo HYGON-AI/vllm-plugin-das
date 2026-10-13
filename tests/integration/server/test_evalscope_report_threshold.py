@@ -4,6 +4,8 @@
 
 from __future__ import annotations
 
+import builtins
+import importlib
 import json
 import os
 import signal
@@ -219,7 +221,11 @@ def test_secure_cli_injects_key_into_python_argv_and_clears_env(
         assert sys.argv[-2:] == ["--api-key", marker]
         return 0
 
-    monkeypatch.setattr(evalscope_secure_cli, "run_cmd", assert_proc_cmdline_is_clean)
+    monkeypatch.setattr(
+        evalscope_secure_cli,
+        "_run_evalscope_command",
+        assert_proc_cmdline_is_clean,
+    )
 
     assert evalscope_secure_cli.main() == 0
     assert "VLLM_HCU_EVALSCOPE_API_KEY" not in os.environ
@@ -246,10 +252,33 @@ def test_secure_cli_rejects_command_line_api_key_aliases(
         "argv",
         ["evalscope-secure", "eval", *api_key_args],
     )
-    monkeypatch.setattr(evalscope_secure_cli, "run_cmd", fail_if_evalscope_runs)
+    monkeypatch.setattr(
+        evalscope_secure_cli,
+        "_run_evalscope_command",
+        fail_if_evalscope_runs,
+    )
 
     with pytest.raises(RuntimeError, match="protected environment"):
         evalscope_secure_cli.main()
+
+
+def test_secure_cli_import_does_not_require_evalscope(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    module_name = "tests.integration.server.evalscope_secure_cli"
+    original_import = builtins.__import__
+
+    def import_without_evalscope(name, *args, **kwargs):
+        if name == "evalscope" or name.startswith("evalscope."):
+            raise ModuleNotFoundError(name)
+        return original_import(name, *args, **kwargs)
+
+    monkeypatch.setattr(builtins, "__import__", import_without_evalscope)
+    monkeypatch.delitem(sys.modules, module_name, raising=False)
+
+    module = importlib.import_module(module_name)
+
+    assert module.__name__ == module_name
 
 
 def test_humaneval_rejects_unsandboxed_host_execution(

@@ -47,7 +47,17 @@ def _matches_version(actual: str | None, specification: dict[str, str]) -> bool:
     if actual is None:
         return False
     if specification["match"] == "prefix":
-        return actual.startswith(specification["version"])
+        expected = specification["version"]
+        if not actual.startswith(expected):
+            return False
+        # A numeric prefix denotes a complete release component: ``0.28.1``
+        # accepts RC/dev/local suffixes but must not accept ``0.28.10``.
+        return not (
+            expected
+            and expected[-1].isdigit()
+            and len(actual) > len(expected)
+            and actual[len(expected)].isdigit()
+        )
     return actual == specification["version"]
 
 

@@ -429,6 +429,8 @@ def test_engine_args_normalizes_legacy_deep_gemm_backend_on_existing_object(
 def test_real_v0251_engine_args_normalizes_legacy_deep_gemm_backend() -> None:
     result = _run_fresh_target(
         r'''
+import os
+os.environ["VLLM_USE_V2_MODEL_RUNNER"] = "0"
 from vllm.engine import arg_utils
 from vllm_hcu.patch.platform.core_fix import patch_engine_args
 
@@ -1479,6 +1481,7 @@ def test_slimquant_marlin_inherits_v0251_compressed_tensors_constructor() -> Non
         assert parameters[len(target_prefix) :] == ("i_q", "i_s")
 
 
+@pytest.mark.hcu
 def test_slimquant_fp8_moe_repack_preserves_fp8_without_widening(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:

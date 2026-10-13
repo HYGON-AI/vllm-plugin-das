@@ -765,6 +765,7 @@ def test_contiguous_deep_gemm_pairs_deepgemm_gemm_with_lightop_activation(
 def test_contiguous_deep_gemm_rejects_top_level_activation_and_grouped_gemm(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
+    monkeypatch.setitem(sys.modules, "deepgemm", ModuleType("deepgemm"))
     legacy = ModuleType("lightop")
     legacy_calls: list[str] = []
     legacy.m_grouped_w8a8_gemm_nt_contig_asm = lambda *_args, **_kwargs: legacy_calls.append(
@@ -773,7 +774,11 @@ def test_contiguous_deep_gemm_rejects_top_level_activation_and_grouped_gemm(
     legacy.fuse_silu_mul_quant = lambda *_args, **_kwargs: legacy_calls.append(
         "activation"
     )
-    _install_lightop(monkeypatch, legacy=legacy)
+    _install_lightop(
+        monkeypatch,
+        legacy=legacy,
+        activation=ModuleType("lightop.activation"),
+    )
     apply = _method(
         "vllm_hcu/model_executor/layers/fused_moe/experts/deep_gemm_moe.py",
         "DeepGemmExperts",
@@ -857,6 +862,7 @@ def test_masked_deep_gemm_pairs_deepgemm_gemm_with_lightop_activation(
 def test_masked_deep_gemm_rejects_top_level_activation_and_grouped_gemm(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
+    monkeypatch.setitem(sys.modules, "deepgemm", ModuleType("deepgemm"))
     legacy = ModuleType("lightop")
     legacy_calls: list[str] = []
     legacy.m_grouped_w8a8_gemm_nt_masked = lambda *_args, **_kwargs: legacy_calls.append(
@@ -865,7 +871,11 @@ def test_masked_deep_gemm_rejects_top_level_activation_and_grouped_gemm(
     legacy.fuse_silu_mul_quant_ep = lambda *_args, **_kwargs: legacy_calls.append(
         "activation"
     )
-    _install_lightop(monkeypatch, legacy=legacy)
+    _install_lightop(
+        monkeypatch,
+        legacy=legacy,
+        activation=ModuleType("lightop.activation"),
+    )
     namespace = {
         "torch": torch,
         "MoEActivation": SimpleNamespace(SILU="silu"),
@@ -1132,6 +1142,7 @@ def _dpsk_namespace(logger: _WarningLogger, calls: list[tuple[str, tuple, dict]]
 
     return {
         "torch": torch,
+        "henvs": SimpleNamespace(VLLM_HCU_USE_CUSTOM_OPS=False),
         "MoEActivation": SimpleNamespace(SILU="silu"),
         "compute_aligned_M": lambda **_kwargs: 1,
         "deepgemm_moe_permute": lambda **kwargs: (

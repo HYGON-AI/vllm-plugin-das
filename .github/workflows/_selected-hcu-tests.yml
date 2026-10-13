@@ -32,7 +32,7 @@ jobs:
       - self-hosted
       - hcu-ci-pr
     env:
-      SOURCE_IMAGE: ${{ inputs.image || vars.HCU_CI_IMAGE || '10.16.1.152:5000/jenkins/model_test_env/vllm:0.25.1-latest' }}
+      SOURCE_IMAGE: ${{ inputs.image }}
     outputs:
       image: ${{ steps.resolve.outputs.image }}
     steps:

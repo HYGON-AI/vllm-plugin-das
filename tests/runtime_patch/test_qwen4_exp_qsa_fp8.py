@@ -350,6 +350,7 @@ def test_qsa_backend_advertises_fp8_through_capability_contract(cache_dtype: str
     )
 
 
+@pytest.mark.hcu
 def test_real_qsa_backend_accepts_fp8_capability_contract():
     env = os.environ.copy()
     env["VLLM_PLUGINS"] = "hcu"

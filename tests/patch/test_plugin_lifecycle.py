@@ -722,6 +722,7 @@ def test_hcu_model_runner_v2_scopes_request_phase_around_upstream_execute(
 
     class UpstreamGPUModelRunner:
         def __init__(self, vllm_config, device):
+            self.vllm_config = vllm_config
             self.upstream_init = (vllm_config, device)
 
         def prepare_inputs(self, scheduler_output, batch_desc, batch_req_state):

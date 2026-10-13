@@ -7,7 +7,7 @@ on:
   pull_request:
     types: [opened, synchronize, reopened, ready_for_review, labeled, unlabeled]
     branches:
-      - v0.25.1
+      - v0.28.1-dev
 
 permissions:
   contents: read
@@ -17,8 +17,7 @@ concurrency:
   cancel-in-progress: true
 
 env:
-  # Repository variables are unavailable to workflows triggered by fork PRs.
-  HCU_CI_IMAGE: ${{ vars.HCU_CI_IMAGE || '10.16.1.152:5000/jenkins/model_test_env/vllm:0.25.1-latest' }}
+  HCU_CI_IMAGE: ${{ vars.HCU_CI_IMAGE_V0281 }}
 
 jobs:
   static-and-select:
@@ -35,6 +34,8 @@ jobs:
       groups: ${{ steps.select.outputs.groups }}
       docs_only: ${{ steps.select.outputs.docs_only }}
       fallback: ${{ steps.select.outputs.fallback }}
+      image: ${{ steps.release-environment.outputs.image }}
+      environment_lock: ${{ steps.release-environment.outputs.environment_lock }}
     steps:
       - name: Repair self-hosted workspace before checkout
         run: |
@@ -84,11 +85,47 @@ jobs:
             exit 1
           fi
 
-      - name: Checkout PR merge revision
+      - name: Checkout trusted PR CI bootstrap
         uses: actions/checkout@v4
         with:
+          ref: ${{ github.event.pull_request.base.sha }}
+          clean: true
+          fetch-depth: 1
+
+      - name: Preserve trusted PR CI bootstrap
+        run: |
+          set -euo pipefail
+          mkdir -p "$RUNNER_TEMP/hcu-ci-scripts"
+          cp scripts/ci/hcu/hcu_ci_resolve_image.sh \
+            scripts/ci/hcu/hcu_ci_run_control_container.sh \
+            "$RUNNER_TEMP/hcu-ci-scripts/"
+
+      - name: Checkout PR head revision
+        uses: actions/checkout@v4
+        with:
+          ref: ${{ github.event.pull_request.head.sha }}
           clean: true
           fetch-depth: 0
+
+      - name: Resolve v0.28.1 HCU environment
+        id: release-environment
+        env:
+          BASE_REF: ${{ github.event.pull_request.base.ref }}
+          HCU_CI_IMAGE_V0281: ${{ vars.HCU_CI_IMAGE_V0281 }}
+        run: |
+          set -euo pipefail
+          if [[ "$BASE_REF" != "v0.28.1-dev" ]]; then
+            echo "unsupported HCU CI release ref: $BASE_REF" >&2
+            exit 2
+          fi
+          if [[ -z "${HCU_CI_IMAGE_V0281//[[:space:]]/}" ]]; then
+            echo "HCU_CI_IMAGE_V0281 is required for $BASE_REF" >&2
+            exit 2
+          fi
+          {
+            echo "image=$HCU_CI_IMAGE_V0281"
+            echo "environment_lock=.github/workflows/configs/hcu-runner-environment.json"
+          } >> "$GITHUB_OUTPUT"
 
       - name: Fetch PR diff endpoints
         env:
@@ -115,13 +152,16 @@ jobs:
         env:
           BASE_SHA: ${{ github.event.pull_request.base.sha }}
           HEAD_SHA: ${{ github.event.pull_request.head.sha }}
+          HCU_CI_IMAGE: ${{ steps.release-environment.outputs.image }}
         run: |
-          bash scripts/ci/hcu/hcu_ci_run_control_container.sh -- bash -lc '
+          bash "$RUNNER_TEMP/hcu-ci-scripts/hcu_ci_run_control_container.sh" -- bash -lc '
             set -euo pipefail
             python3.10 --version
             git config --global --add safe.directory "$GITHUB_WORKSPACE"
             python3.10 .github/scripts/hcu_ci/compile_changed_python.py --base "$BASE_SHA" --head "$HEAD_SHA"
-            python3.10 .github/scripts/hcu_ci/hcu_ci_preflight.py --check-lock-only
+            python3.10 .github/scripts/hcu_ci/hcu_ci_preflight.py \
+              --environment-lock "${{ steps.release-environment.outputs.environment_lock }}" \
+              --check-lock-only
             python3.10 .github/scripts/hcu_ci/verify_hcu_registration.py
             python3.10 .github/scripts/hcu_ci/build_hcu_matrix.py --profile nightly >/dev/null
             python3.10 .github/scripts/hcu_ci/build_hcu_matrix.py --profile quarantine >/dev/null
@@ -138,8 +178,9 @@ jobs:
           HEAD_SHA: ${{ github.event.pull_request.head.sha }}
           FULL_HCU: ${{ contains(github.event.pull_request.labels.*.name, 'full-hcu') }}
           ACCURACY_HCU: ${{ contains(github.event.pull_request.labels.*.name, 'accuracy-hcu') }}
+          HCU_CI_IMAGE: ${{ steps.release-environment.outputs.image }}
         run: |
-          bash scripts/ci/hcu/hcu_ci_run_control_container.sh -- bash -lc '
+          bash "$RUNNER_TEMP/hcu-ci-scripts/hcu_ci_run_control_container.sh" -- bash -lc '
             set -euo pipefail
             git config --global --add safe.directory "$GITHUB_WORKSPACE"
             git cat-file -e "${BASE_SHA}^{commit}"
@@ -166,6 +207,8 @@ jobs:
     permissions:
       contents: read
       issues: read
+    env:
+      HCU_CI_IMAGE: ${{ needs.static-and-select.outputs.image }}
     outputs:
       ready: ${{ steps.authorization.outputs.ready }}
       authorized: ${{ steps.authorization.outputs.authorized }}
@@ -220,19 +263,7 @@ jobs:
             exit 1
           fi
 
-      - name: Checkout PR runner helpers
-        uses: actions/checkout@v4
-        with:
-          clean: true
-          fetch-depth: 1
-
-      - name: Preserve PR runner helpers
-        run: |
-          mkdir -p "$RUNNER_TEMP/hcu-ci-scripts"
-          cp scripts/ci/hcu/hcu_ci_resolve_image.sh "$RUNNER_TEMP/hcu-ci-scripts/"
-          cp scripts/ci/hcu/hcu_ci_run_control_container.sh "$RUNNER_TEMP/hcu-ci-scripts/"
-
-      - name: Checkout trusted authorization helper
+      - name: Checkout trusted authorization helpers
         uses: actions/checkout@v4
         with:
           ref: ${{ github.event.pull_request.base.sha }}
@@ -243,7 +274,7 @@ jobs:
         id: authorization
         env:
           GITHUB_TOKEN: ${{ github.token }}
-        run: bash "$RUNNER_TEMP/hcu-ci-scripts/hcu_ci_run_control_container.sh" -- python3.10 .github/scripts/hcu_ci/check_hcu_ci_authorization.py
+        run: bash scripts/ci/hcu/hcu_ci_run_control_container.sh -- python3.10 .github/scripts/hcu_ci/check_hcu_ci_authorization.py
 
   selected-hcu-tests:
     name: Selected hardware tests
@@ -256,7 +287,8 @@ jobs:
     uses: ./.github/workflows/_selected-hcu-tests.yml
     with:
       matrix: ${{ needs.static-and-select.outputs.matrix }}
-      tested_ref: ${{ github.event.pull_request.merge_commit_sha }}
+      tested_ref: ${{ github.event.pull_request.head.sha }}
+      image: ${{ needs.static-and-select.outputs.image }}
     permissions:
       contents: read
 

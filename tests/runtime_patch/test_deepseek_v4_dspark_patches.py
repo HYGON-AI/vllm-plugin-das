@@ -1096,6 +1096,7 @@ def test_dspark_target_binds_boltops_mhc_and_preserves_official_norm() -> None:
     assert len(calls[2][1]) == 14
 
 
+@pytest.mark.hcu
 def test_dspark_target_binds_every_constructed_decoder_mhc_instance() -> None:
     original_forward_method = lambda *args, **kwargs: None
 

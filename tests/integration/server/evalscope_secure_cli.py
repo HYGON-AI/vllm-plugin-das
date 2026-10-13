@@ -7,11 +7,18 @@ from __future__ import annotations
 import os
 import sys
 
-from evalscope.cli.cli import run_cmd
-
 from tests.integration.server.evalscope_server import EVALSCOPE_API_KEY_ENV
 
 _API_KEY_OPTIONS = frozenset({"--api-k", "--api-ke", "--api-key"})
+
+
+def _run_evalscope_command() -> int:
+    # EvalScope is optional for report/command contract tests. Import it only
+    # in the subprocess that actually executes an evaluation so unrelated
+    # test collection remains available in minimal HCU runtime images.
+    from evalscope.cli.cli import run_cmd
+
+    return int(run_cmd() or 0)
 
 
 def main() -> int:
@@ -25,7 +32,7 @@ def main() -> int:
     # Python-level argv is not reflected in /proc/<pid>/cmdline, so the key is
     # available to EvalScope's parser without appearing in process listings.
     sys.argv.extend(["--api-key", api_key])
-    return int(run_cmd() or 0)
+    return _run_evalscope_command()
 
 
 if __name__ == "__main__":

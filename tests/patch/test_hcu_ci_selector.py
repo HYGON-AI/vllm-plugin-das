@@ -83,6 +83,22 @@ def test_selector_configuration_is_valid() -> None:
     assert "single-node-topology" in jobs
 
 
+def test_v0281_contract_job_deselects_v0251_only_bootstrap_tests() -> None:
+    pytest_args = _config()["jobs"]["contract-hcu-gfx936"]["pytest_args"]
+    assert pytest_args == [
+        "--deselect",
+        (
+            "tests/patch/test_base_linear_parameter.py::"
+            "test_official_registry_stdin_protocol_applies_adapter_and_one_linear"
+        ),
+        "--deselect",
+        (
+            "tests/patch/test_base_linear_parameter.py::"
+            "test_qwen35_real_inspect_cache_miss_uses_official_registry_command"
+        ),
+    ]
+
+
 def test_full_matrix_contains_every_enabled_registered_job() -> None:
     config = _config()
     matrix = build_matrix(config, profile="full")
@@ -168,6 +184,55 @@ def test_nightly_matrix_explicitly_covers_extended_models_and_topology() -> None
         "qwen3-protocol",
         "single-node-topology",
     }.issubset(registry_jobs)
+
+
+def test_kimi_k25_humaneval_routes_to_eight_card_evalscope_job() -> None:
+    config = _config()
+    job = config["jobs"]["kimi-k25-humaneval"]
+    assert job == {
+        "runner": "hcu-linux-gfx938-8",
+        "arch": "gfx938",
+        "cards": 8,
+        "suite": "model",
+        "pytest_args": ["-k", "kimi_k25_humaneval_evalscope_server"],
+        "timeout_minutes": 360,
+        "requirements": [
+            {
+                "kind": "distribution",
+                "name": "evalscope",
+                "match": "exact",
+                "version": "1.9.1",
+            },
+            {
+                "kind": "model",
+                "env": "VLLM_HCU_KIMI_K25_MODEL",
+                "relative": "Kimi-K2.5",
+            },
+        ],
+    }
+
+    target = (
+        "tests/integration/server/test_evalscope_kimi_k25_humaneval.py::"
+        "test_kimi_k25_humaneval_evalscope_server"
+    )
+    assert any(
+        registration.job == "kimi-k25-humaneval"
+        and registration.target == target
+        and registration.est_time == 14400
+        and registration.disabled is None
+        for registration in parse_registry()
+    )
+    assert "kimi-k25-humaneval" in {
+        item["registry_job"] for item in build_matrix(config, profile="nightly")
+    }
+
+    jobs, groups, fallback = select_jobs(
+        config,
+        ["tests/models/kimi_k25_humaneval_evalscope.yaml"],
+    )
+    assert {item["registry_job"] for item in jobs} == {"kimi-k25-humaneval"}
+    assert groups == ["kimi-k25-evalscope"]
+    assert fallback is False
 
 
 def test_every_registered_hcu_test_file_routes_to_one_of_its_jobs() -> None:
@@ -377,6 +442,68 @@ def test_environment_lock_allows_compatible_hip_prefix(
         )
 
 
+def test_v0281_runner_lock_matches_audited_runtime(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    lock_path = (
+        REPOSITORY / ".github/workflows/configs/hcu-runner-environment.json"
+    )
+    lock = json.loads(lock_path.read_text(encoding="utf-8"))
+    assert lock["python"] == "3.10.12"
+    assert lock["torch_hip"] == {"match": "prefix", "version": "6.3."}
+    assert lock["rocm"] == {
+        "environment": "ROCM_PATH",
+        "version_file": ".info/rocm_version",
+        "match": "release_line",
+        "version": "26.04",
+    }
+    assert lock["distributions"] == {
+        "torch": {"match": "prefix", "version": "2.11.0+"},
+        "vllm": {"match": "prefix", "version": "0.28.1"},
+        "vllm-hcu": {"match": "prefix", "version": "0.28.1"},
+        "aiter": {"match": "prefix", "version": "0.1."},
+        "pytest": {"match": "exact", "version": "9.1.1"},
+    }
+
+    runtime_root = tmp_path / "dtk"
+    version_file = runtime_root / lock["rocm"]["version_file"]
+    version_file.parent.mkdir(parents=True)
+    version_file.write_text("26.04.1\n", encoding="utf-8")
+    monkeypatch.setenv("ROCM_PATH", str(runtime_root))
+    monkeypatch.setattr("hcu_ci_preflight.platform.python_version", lambda: "3.10.12")
+    versions = {
+        "torch": "2.11.0+dtk2604.2609291046.ge12687",
+        "vllm": "0.28.1+dtk2604.torch2110.2609171627.g77acaf",
+        "vllm-hcu": "0.28.1rc1.dev491+das.5d5fe2f.dtk26041",
+        "aiter": "0.1.6+dtk2604.torch2110.2609300837.gf9b9c8",
+        "pytest": "9.1.1",
+    }
+
+    report = _check_environment_lock(
+        lock_path,
+        versions=versions,
+        torch_hip="6.3.26113",
+    )
+    assert report["rocm"] == "26.04.1"
+
+    for distribution, incompatible_version in (
+        ("vllm", "0.25.1+das.legacy"),
+        ("vllm", "0.28.10+future"),
+        ("vllm-hcu", "0.28.10rc1+future"),
+    ):
+        incompatible = dict(versions, **{distribution: incompatible_version})
+        with pytest.raises(
+            PreflightError,
+            match=f"distribution drift for {distribution}",
+        ):
+            _check_environment_lock(
+                lock_path,
+                versions=incompatible,
+                torch_hip="6.3.26113",
+            )
+
+
 @pytest.fixture
 def dtk_environment_lock(
     tmp_path: Path,
@@ -386,6 +513,9 @@ def dtk_environment_lock(
         (REPOSITORY / ".github/workflows/configs/hcu-runner-environment.json")
         .read_text(encoding="utf-8")
     )
+    # Exercise the generic release-line matcher independently of the branch's
+    # exact audited DTK patch release.
+    lock["rocm"].update({"match": "release_line", "version": "26.04"})
     runtime_root = tmp_path / "dtk"
     version_file = runtime_root / lock["rocm"]["version_file"]
     version_file.parent.mkdir(parents=True)
@@ -525,6 +655,7 @@ def test_evalscope_is_required_only_by_evalscope_jobs() -> None:
         "deepseek-gsm8k",
         "glm52-pcp",
         "glm53-flash-channel-fp8-humaneval",
+        "kimi-k25-humaneval",
     }
     expected = {
         "kind": "distribution",
@@ -671,6 +802,15 @@ def test_hcu_control_container_uses_runner_identity() -> None:
     assert '--env "USER=$runner_user"' in source
 
 
+def test_hcu_control_container_does_not_expose_accelerator_devices() -> None:
+    source = (
+        REPOSITORY / "scripts/ci/hcu/hcu_ci_run_control_container.sh"
+    ).read_text(encoding="utf-8")
+    assert "--privileged" not in source
+    assert "/dev/kfd" not in source
+    assert "/dev/dri" not in source
+
+
 def test_workspace_repairs_detect_wrong_owners_and_directories() -> None:
     for relative in (
         ".github/workflows/hcu-pr-ci.yml",
@@ -753,23 +893,6 @@ def test_selected_hcu_workflow_pins_mutable_image_before_matrix() -> None:
     assert "HCU_CI_IMAGE: ${{ needs.resolve-image.outputs.image }}" in source
 
 
-def test_fork_pr_uses_non_secret_hcu_image_fallback() -> None:
-    default_image = (
-        "10.16.1.152:5000/jenkins/model_test_env/"
-        "vllm:0.25.1-latest"
-    )
-    pr_workflow = (
-        REPOSITORY / ".github/workflows/hcu-pr-ci.yml"
-    ).read_text(encoding="utf-8")
-    selected_workflow = (
-        REPOSITORY / ".github/workflows/_selected-hcu-tests.yml"
-    ).read_text(encoding="utf-8")
-
-    assert default_image in pr_workflow
-    assert default_image in selected_workflow
-    assert "Repository variables are unavailable" in pr_workflow
-
-
 def test_release_push_is_independent_from_image_validation() -> None:
     release = (
         REPOSITORY / ".github/workflows/release-docker-image.yml"
@@ -799,7 +922,8 @@ def test_release_push_is_independent_from_image_validation() -> None:
     assert "image:" in validation
     assert "required: true" in validation
     assert "actions/download-artifact@v4" not in validation
-    assert "vllm:0.25.1-latest" in validation
+    assert "vllm:0.25.1-latest" not in validation
+    assert "HCU_CI_IMAGE_V0281" in validation
     assert 'docker pull "$SOURCE_IMAGE"' in validation
     assert "tools/run_patch_tests.py --suite contract" in validation
     assert "promote_latest" not in validation

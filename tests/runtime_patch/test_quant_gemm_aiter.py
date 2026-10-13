@@ -8298,6 +8298,14 @@ def test_moe_wna16_channel_prewarm_records_aiter_availability(
     monkeypatch: pytest.MonkeyPatch,
     selected: object | None,
 ):
+    class MoeQuantType:
+        W4A16 = "w4a16"
+
+    monkeypatch.setitem(
+        sys.modules,
+        "aiter.moe",
+        _module("aiter.moe", MoeQuantType=MoeQuantType),
+    )
     problems: list[AiterMoeProblem] = []
     monkeypatch.setattr(
         compressed_tensors_moe_runtime,
@@ -8379,6 +8387,14 @@ def test_moe_wna16_explicit_aiter_channel_init_bridges_oracle(
 def test_channel_w4a16_runtime_selects_block_zero_aiter_route(
     monkeypatch: pytest.MonkeyPatch,
 ):
+    class MoeQuantType:
+        W4A16 = "w4a16"
+
+    monkeypatch.setitem(
+        sys.modules,
+        "aiter.moe",
+        _module("aiter.moe", MoeQuantType=MoeQuantType),
+    )
     selected: list[AiterMoeProblem] = []
     executed: list[dict[str, object]] = []
     config = SimpleNamespace(
@@ -8806,6 +8822,14 @@ def test_int8_backend_respects_custom_ops_master_switch(
 def test_int8_master_off_replaces_upstream_aiter_kernel_with_triton(
     monkeypatch: pytest.MonkeyPatch,
 ):
+    class TritonInt8ScaledMMLinearKernel:
+        pass
+
+    monkeypatch.setattr(
+        patch_compressed_tensors_w8a8_int8,
+        "_make_triton_int8_kernel",
+        lambda _scheme: TritonInt8ScaledMMLinearKernel(),
+    )
     module = _fake_int8_scheme_module()
     monkeypatch.setattr(
         patch_compressed_tensors_w8a8_int8,
@@ -8830,6 +8854,14 @@ def test_int8_master_off_replaces_upstream_aiter_kernel_with_triton(
 
 
 def test_int8_scheme_layout_and_feature_off_delegation(monkeypatch: pytest.MonkeyPatch):
+    class TritonInt8ScaledMMLinearKernel:
+        pass
+
+    monkeypatch.setattr(
+        patch_compressed_tensors_w8a8_int8,
+        "_make_triton_int8_kernel",
+        lambda _scheme: TritonInt8ScaledMMLinearKernel(),
+    )
     module = _fake_int8_scheme_module()
     monkeypatch.setattr(
         patch_compressed_tensors_w8a8_int8,

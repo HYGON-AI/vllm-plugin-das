@@ -18,6 +18,7 @@ class _FakeOp:
         return self.result
 
 
+@pytest.mark.hcu
 def test_mhc_post_master_off_ignores_materialized_true_attribute(
     monkeypatch: pytest.MonkeyPatch,
 ):
@@ -178,6 +179,7 @@ def test_bind_glm5next_boltops_mhc_preserves_official_norm_semantics():
     assert all("norm_eps" not in call[2] for call in calls)
 
 
+@pytest.mark.hcu
 def test_hcu_mhc_backend_symbols_are_bound_to_boltops():
     from vllm_hcu.model_executor.layers import mhc as backend
 
