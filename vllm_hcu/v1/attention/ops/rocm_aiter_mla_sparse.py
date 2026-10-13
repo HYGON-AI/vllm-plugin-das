@@ -1142,6 +1142,14 @@ def _use_lightop_sparse_mla_topk() -> bool:
     return _sparse_mla_topk_backend() in ("per_row", "ragged")
 
 
+def _decode_sparse_mla_topk_backend(topk_tokens: int) -> str:
+    """Decode top-k backend; unsupported ragged sizes use torch, not per_row."""
+    backend = _sparse_mla_topk_backend()
+    if backend == "ragged" and topk_tokens != _LIGHTOP_RAGGED_TOPK_TOKENS:
+        return "torch"
+    return backend
+
+
 def _get_lightop_zero_i32(device: torch.device, n: int) -> torch.Tensor:
     """Cached int32 zeros for LightOp top-k; must be allocated before graph capture."""
     if n <= 0:
@@ -1539,12 +1547,7 @@ def rocm_aiter_sparse_attn_indexer_native(
         next_n = padded_q_fp8_decode_tokens.shape[1]
         assert batch_size == decode_metadata.seq_lens.shape[0]
         num_padded_tokens = batch_size * next_n
-        topk_backend = _sparse_mla_topk_backend()
-        if (
-            topk_backend == "ragged"
-            and topk_tokens != _LIGHTOP_RAGGED_TOPK_TOKENS
-        ):
-            topk_backend = "per_row"
+        topk_backend = _decode_sparse_mla_topk_backend(topk_tokens)
         seq_lens = (
             decode_metadata.seq_lens[:batch_size]
             if topk_backend in ("per_row", "ragged")

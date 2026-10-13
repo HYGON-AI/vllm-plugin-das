@@ -2339,6 +2339,39 @@ def test_lightop_ragged_topk_decode_uses_public_attention_export(monkeypatch):
     assert topk_indices.tolist() == [[0, 1, 2], [3, 4, 5]]
 
 
+@pytest.mark.parametrize(
+    ("backend", "custom_ops", "prefill_lightop", "decode_2048", "decode_1024"),
+    [
+        ("ragged", True, True, "ragged", "torch"),
+        ("per_row", True, True, "per_row", "per_row"),
+        ("torch", True, False, "torch", "torch"),
+        ("ragged", False, False, "torch", "torch"),
+    ],
+)
+def test_sparse_mla_topk_routes_prefill_and_decode_separately(
+    monkeypatch, backend, custom_ops, prefill_lightop, decode_2048, decode_1024
+):
+    from vllm_hcu.platforms import envs as henvs
+    from vllm_hcu.v1.attention.ops import rocm_aiter_mla_sparse as sparse
+
+    monkeypatch.setattr(henvs, "VLLM_HCU_SPARSE_MLA_TOPK_BACKEND", backend)
+    monkeypatch.setattr(henvs, "VLLM_HCU_USE_CUSTOM_OPS", custom_ops)
+
+    assert sparse._use_lightop_sparse_mla_topk() is prefill_lightop
+    assert sparse._decode_sparse_mla_topk_backend(2048) == decode_2048
+    assert sparse._decode_sparse_mla_topk_backend(1024) == decode_1024
+
+
+def test_sparse_mla_topk_backend_defaults_to_ragged(monkeypatch):
+    from vllm_hcu.platforms import envs as henvs
+
+    monkeypatch.delenv("VLLM_HCU_SPARSE_MLA_TOPK_BACKEND", raising=False)
+    reader = henvs.hcu_vllm_environment_variables[
+        "VLLM_HCU_SPARSE_MLA_TOPK_BACKEND"
+    ]
+    assert reader() == "ragged"
+
+
 def test_sparse_indexer_gfx936_packed_cache_uses_quantized_decode_logits(
     monkeypatch,
 ):

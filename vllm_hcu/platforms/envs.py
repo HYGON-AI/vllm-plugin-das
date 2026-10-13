@@ -303,7 +303,8 @@ hcu_vllm_environment_variables: dict[str, Callable[[], Any]] = {
 
     # Sparse-MLA top-k backend:
     #   ragged  - decode: lightop.attention.fast_topk_transform_ragged_fused
-    #             (topk == 2048 only, otherwise per_row); prefill: torch (default)
+    #             (topk == 2048 only, otherwise torch); prefill:
+    #             lightop.attention.top_k_per_row_prefill (default)
     #   per_row - lightop.attention.top_k_per_row_* for prefill and decode
     #             (decode emits OOB indices on long contexts)
     #   torch   - torch.topk
