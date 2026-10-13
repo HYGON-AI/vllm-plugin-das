@@ -322,7 +322,16 @@ def _k3_union_branches(prop: dict[str, Any]) -> list[Any] | None:
     """The declared alternatives of a union property, in declaration order.
 
     Covers ``anyOf``, ``oneOf`` and the JSON type array; returns None when
-    the property declares no union shape.
+    the property declares no union shape.  NOTE (codex P2 followup
+    2026-10-13): ``oneOf`` exclusivity is NOT modeled -- both compile as
+    anyOf.  Alternatives sharing one XTML type channel merge under one
+    anyOf schema, so an OVERLAPPING oneOf (e.g. integer|number) accepts a
+    value matching several branches where true oneOf would reject it.
+    Exact exclusivity is inexpressible in the merged channel.  A value
+    matching several branches is NOT rejected at this layer -- rejection
+    depends on whatever schema validation the downstream tool executor
+    performs (vLLM itself does not validate tool arguments against the
+    schema).  Documented divergence, not a guarantee.
     """
 
     for combo_key in ("anyOf", "oneOf"):
@@ -552,6 +561,31 @@ def _k3_argument_tag(
             }
             if len(kinds) == 1 and None not in kinds:
                 return _k3_argument_tag(key, {**prop, "type": kinds.pop()}, root_defs)
+        # codex P2 followup 2026-10-13: a typeless ``const`` (the shape
+        # pydantic emits for ``Literal["auto"]`` / ``Literal[7]``) must pin
+        # the value channel EXACTLY like a typeless enum -- infer the
+        # constant's JSON type and ride the typed path (a str const then
+        # compiles to the exact ConstStringFormat channel; a numeric one
+        # to JSONSchemaFormat over ``{"const": v}``, exact per xgrammar).
+        # A FLOAT const's exactness follows xgrammar's literal form:
+        # ``{"const": 7.0}`` matches "7.0", possibly not "7".  dict/list
+        # consts stay on the pinned wildcard tag (rare; deferred).
+        if "const" in prop and not isinstance(prop["const"], (dict, list, type(None))):
+            const_kind = (
+                "string"
+                if isinstance(prop["const"], str)
+                else "boolean"
+                if isinstance(prop["const"], bool)
+                else "integer"
+                if isinstance(prop["const"], int) and not isinstance(prop["const"], bool)
+                else "number"
+                if isinstance(prop["const"], float)
+                else None
+            )
+            if const_kind is not None:
+                return _k3_argument_tag(
+                    key, {**prop, "type": const_kind}, root_defs
+                )
         return _k3_pinned_key_tag(key)
     begin = (
         f'{_K3_OPEN}argument key="{_k3_escape_attr(key)}" type="{xtml_type}"{_K3_SEP}'

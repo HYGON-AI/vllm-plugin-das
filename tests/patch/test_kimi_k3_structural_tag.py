@@ -1147,6 +1147,91 @@ def test_ref_only_property_resolves_one_hop() -> None:
     assert contents, item_tags
 
 
+def test_typeless_const_pins_value_channel() -> None:
+    """codex P2 followup: a typeless ``{"const": ...}`` (pydantic
+    ``Literal[...]`` shape) must not fall back to the wildcard tag --
+    the value channel is pinned EXACTLY to the constant."""
+
+    schema = {
+        "type": "object",
+        "properties": {"mode": {"const": "auto"}, "level": {"const": 7}},
+        "required": ["mode", "level"],
+        "additionalProperties": False,
+    }
+    tag = get_kimi_k3_structural_tag(
+        [FunctionToolParam(function={"name": "h", "parameters": schema})],
+        [],
+        "required",
+        False,
+    )
+    # string const -> exact ConstStringFormat channel; int const -> the
+    # JSON channel over the const schema
+    modes = [
+        f
+        for f in _walk_formats(tag.format)
+        if type(f).__name__ == "TagFormat"
+        and 'key="mode" type="string"' in getattr(f, "begin", "")
+    ]
+    assert modes and all(
+        type(getattr(f, "content", None)).__name__ == "ConstStringFormat"
+        and getattr(f.content, "value", None) == "auto"
+        for f in modes
+    ), [getattr(f, "content", None) for f in modes]
+    levels = [
+        f
+        for f in _walk_formats(tag.format)
+        if type(f).__name__ == "TagFormat"
+        and 'key="level" type="number"' in getattr(f, "begin", "")
+    ]
+    assert levels and all(
+        type(getattr(f, "content", None)).__name__ == "JSONSchemaFormat"
+        for f in levels
+    ), [getattr(f, "content", None) for f in levels]
+
+    # FSM proof: only the exact constants complete; wrong values and
+    # wrong types dead-end
+    xg = pytest.importorskip("xgrammar")
+    compiler_cls = getattr(xg, "GrammarCompiler", None)
+    if (
+        compiler_cls is None
+        or not hasattr(compiler_cls, "compile_structural_tag")
+    ):
+        pytest.skip("xgrammar lacks GrammarCompiler.compile_structural_tag")
+    vocab = [
+        "a", "b", "c", "d", "e", "f", "g", "h", "v", "7", "8", "<", "|",
+        ">", '"', "=", "open", "close", "sep", "argument", "call", "tools",
+        "response", "message", "auto", "manual", "mode", "level", "string",
+        "number", "key", "index", "1",
+    ]
+    compiled = compiler_cls(xg.TokenizerInfo(vocab)).compile_structural_tag(tag)
+    pre = '<|close|>response<|sep|><|open|>tools<|sep|><|open|>call tool="h" index="1"<|sep|>'
+    post = "<|close|>call<|sep|><|close|>tools<|sep|><|close|>message<|sep|>"
+
+    def acceptcall(args: str) -> tuple[bool, bool]:
+        m = xg.GrammarMatcher(compiled)
+        ok = m.accept_string(pre + args + post)
+        return bool(ok), m.is_completed()
+
+    mode_ok = '<|open|>argument key="mode" type="string"<|sep|>auto<|close|>argument<|sep|>'
+    level_ok = '<|open|>argument key="level" type="number"<|sep|>7<|close|>argument<|sep|>'
+    assert acceptcall(mode_ok + level_ok) == (True, True)
+    # wrong string value for the const
+    assert acceptcall(
+        '<|open|>argument key="mode" type="string"<|sep|>manual<|close|>argument<|sep|>'
+        + level_ok
+    )[0] is False
+    # wrong string value for the int const
+    assert acceptcall(
+        mode_ok
+        + '<|open|>argument key="level" type="number"<|sep|>8<|close|>argument<|sep|>'
+    )[0] is False
+    # wrong TYPE for the int const (a JSON string "7" where const is 7)
+    assert acceptcall(
+        mode_ok
+        + '<|open|>argument key="level" type="number"<|sep|>"7"<|close|>argument<|sep|>'
+    )[0] is False
+
+
 def test_unsatisfiable_parameters_tool_is_not_offered() -> None:
     """Audit R18 #10: a tool whose parameters can never be satisfied is
     NOT offered a call surface at all (dropped from the channel); when
