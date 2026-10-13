@@ -65,10 +65,13 @@ def router_bias_topk_kernel(
         gating_nan = gating != gating
         has_bad = tl.max(gating_nan.to(tl.int32), axis=0) > 0
 
-    weights = tl.zeros((TOPK,), dtype=tl.float32)
-    indices = tl.zeros((TOPK,), dtype=tl.int32)
+    # Triton vector lengths must be powers of two, while the model's top-k
+    # need not be. Keep selecting TOPK experts and mask the padded lanes below.
+    BLOCK_TOPK: tl.constexpr = triton.next_power_of_2(TOPK)
+    weights = tl.zeros((BLOCK_TOPK,), dtype=tl.float32)
+    indices = tl.zeros((BLOCK_TOPK,), dtype=tl.int32)
     weight_sum = 0.0
-    topk_offsets = tl.arange(0, TOPK)
+    topk_offsets = tl.arange(0, BLOCK_TOPK)
 
     for k in tl.static_range(TOPK):
         max_score, max_index = tl.max(scores, axis=0, return_indices=True)
@@ -95,7 +98,7 @@ def router_bias_topk_kernel(
         weights = tl.where(has_bad, 0.0, weights)
         indices = tl.where(has_bad, NAN_ROW_I_OUT, indices)
 
-    offsets = tl.arange(0, TOPK)
+    offsets = tl.arange(0, BLOCK_TOPK)
     tl.store(out_w_ptr + pid * stride_om + offsets, weights, mask=offsets < TOPK)
     # Triton casts the int32 expert ID to the output pointer's element type,
     # allowing the caller to request either int32 or int64 without a follow-up

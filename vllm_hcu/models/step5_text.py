@@ -907,30 +907,6 @@ class FusedMoEBlock(nn.Module):
             )
             activation = "swiglustep"
 
-        self.routed_scaling_factor = config.moe_router_scaling_factor
-        self.router_bias = nn.Parameter(
-            torch.zeros(config.moe_num_experts, dtype=torch.float32),
-            requires_grad=False,
-        )
-        self.need_fp32_gate = config.need_fp32_gate
-        assert self.need_fp32_gate, (
-            "Router logits must use FP32 precision for numerical stability."
-        )
-
-        activation = "silu"
-        swiglu_limits = config.swiglu_limits or []
-        swiglu_limit = (
-            swiglu_limits[self.layer_idx]
-            if self.layer_idx < len(swiglu_limits)
-            else None
-        )
-        if swiglu_limit not in (None, 0):
-            swiglu_limit = float(swiglu_limit)
-            assert swiglu_limit == 7.0, (
-                "Swiglu limit in fused moe block only support 7.0 now."
-            )
-            activation = "swiglustep"
-
         self.fuse_all_reduce, reduce_results = _step5_moe_reduce_policy(
             self.tp_size, get_dp_group().world_size
         )

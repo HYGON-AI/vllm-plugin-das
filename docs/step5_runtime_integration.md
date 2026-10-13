@@ -62,6 +62,32 @@ The old `VLLM_STEP5_ENABLE_QKVG_PROJ`, `VLLM_STEP5_DSA_INDEX_TP_SIZE`,
 variables had no implementation and are no longer registered. Explicit settings
 produce a warning; the actual QKVG switch is `VLLM_HCU_STEP5_FUSE_QKVG`.
 
+## MoE and communicator contracts
+
+`VLLM_HCU_EP_FUSED_MOE` is a channel-FP8 optimization with dynamic per-token
+activations and SWIGLUSTEP. Weight preparation and execution share the same
+layout checks. Block-FP8 keeps its original DeepGEMM path; unsupported channel
+layouts retain normal weight packing. AITER advertises SWIGLUSTEP only for its
+implemented FP8/INT8 channel-weight and dynamic-token activation pairs.
+
+Mixed attention backends retain a compatible upstream KV manager block and use
+kernel virtual splitting. Incompatible hybrid or heterogeneous page constraints
+fail explicitly instead of silently replacing their aligned manager block.
+
+The optional IPC all-gather supports same-node DP groups of 2 to 8 ranks.
+Inputs share logical row layouts and global sizes across ranks; local strided
+views are packed on either communication path. Initialization errors are
+coordinated during startup, without adding decode-time collectives. Communicator
+destruction synchronizes local work, closes imported mappings through the
+plugin's native `close_mem_handle` operation, confirms all importers have
+closed, then frees owned raw buffers. A failed group or import-close operation
+must terminate the worker instead of freeing buffers that peers may still use.
+Garbage collection never starts a collective or frees exported IPC memory.
+Rebuild the plugin extension when upgrading to this native operation.
+
+Router top-k uses a padded power-of-two internal vector with masked writes.
+Non-power-of-two values remain valid, while topk8 retains its original layout.
+
 ## Pending-region ownership
 
 Decode, speculative verification and mixed prefill schedules resolve and touch
