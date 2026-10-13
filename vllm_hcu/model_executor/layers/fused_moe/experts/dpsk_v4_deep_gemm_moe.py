@@ -185,7 +185,7 @@ class DeepEPDeepGemmContiguousExperts(TritonExperts):
             None,
         )
         if packed_layout == self.WEIGHT_LAYOUT:
-            if layer.w13_weight.dim() == 6 and layer.w2_weight.dim() == 6:
+            if layer.w13_weight.dim() in (6, 7) and layer.w2_weight.dim() in (6, 7):
                 self._deepgemm_w13 = layer.w13_weight
                 self._deepgemm_w2 = layer.w2_weight
                 return
@@ -474,7 +474,7 @@ class DeepEPDeepGemmContiguousExperts(TritonExperts):
         w13: torch.Tensor,
         w2: torch.Tensor,
     ) -> tuple[int, int, int]:
-        if w13.dim() != 6 or w2.dim() != 6:
+        if w13.dim() not in (6, 7) or w2.dim() not in (6, 7) or w13.dim() != w2.dim():
             raise RuntimeError(
                 "DeepEP DeepGEMM weights must be packed before apply(), "
                 f"got w13={tuple(w13.shape)} w2={tuple(w2.shape)}"
@@ -485,12 +485,20 @@ class DeepEPDeepGemmContiguousExperts(TritonExperts):
                 f"w13={tuple(w13.shape)} w2={tuple(w2.shape)}"
             )
 
-        # The gfx938 Marlin FP8/INT8 packers map [E, N, K] to
-        # [E, K / 64, N / 16, 4, 16, 16].
         local_num_experts = w13.size(0)
-        n = w13.size(2) * w13.size(4)
-        k = w13.size(1) * w13.size(3) * w13.size(5)
-        w2_n = w2.size(2) * w2.size(4)
+        if w13.dim() == 6:
+            # gfx938 Marlin FP8/INT8 packers map [E, N, K] to
+            # [E, K/64, N/16, 4, 16, 16].
+            n = w13.size(2) * w13.size(4)
+            k = w13.size(1) * w13.size(3) * w13.size(5)
+            w2_n = w2.size(2) * w2.size(4)
+        else:
+            # Updated packers map [E, N, K] to [E, K/64, N/32, 2, 4, 16, 16],
+            # doubling the N-tile width vs. the 6-dim [E, K/64, N/16, 4, 16, 16]
+            # layout: n = size(2)*size(3)*size(5), k = size(1)*size(4)*size(6).
+            n = w13.size(2) * w13.size(3) * w13.size(5)
+            k = w13.size(1) * w13.size(4) * w13.size(6)
+            w2_n = w2.size(2) * w2.size(3) * w2.size(5)
         if w2_n != k:
             raise RuntimeError(
                 "DeepEP DeepGEMM packed down weight output size does not match "
@@ -794,7 +802,7 @@ class DeepEPAutoDeepGemmExperts(mk.FusedMoEExpertsModular):
                 "_dsv4_channel_deepgemm_masked_w2",
                 None,
             )
-            if layer.w13_weight.dim() == 6 and layer.w2_weight.dim() == 6:
+            if layer.w13_weight.dim() in (6, 7) and layer.w2_weight.dim() in (6, 7):
                 if ll_w13 is None or ll_w2 is None:
                     raise RuntimeError(
                         "DeepEP auto DeepGEMM layer lost its masked weight layout"
