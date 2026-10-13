@@ -1,6 +1,6 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright (c) 2026 Hygon Information Technology Co., Ltd.
-"""Add GELU-tanh support to the ROCm AITER expert implementation."""
+"""Adapt ROCm AITER activations to HCU channel/token MoE kernels."""
 
 from __future__ import annotations
 
@@ -208,6 +208,21 @@ def apply_to_module(module: ModuleType) -> bool:
         int8_weight_key = kInt8StaticChannelSym
         int8_activation_key = kInt8DynamicTokenSym
 
+    fp8_weight_key = getattr(target, "kFp8StaticChannelSym", None)
+    fp8_activation_key = getattr(target, "kFp8DynamicTokenSym", None)
+    if fp8_weight_key is None or fp8_activation_key is None:
+        from vllm.model_executor.layers.quantization.utils.quant_utils import (
+            kFp8DynamicTokenSym,
+            kFp8StaticChannelSym,
+        )
+
+        fp8_weight_key = kFp8StaticChannelSym
+        fp8_activation_key = kFp8DynamicTokenSym
+    swiglustep_quant_pairs = (
+        (int8_weight_key, int8_activation_key),
+        (fp8_weight_key, fp8_activation_key),
+    )
+
     @functools.wraps(fused_experts)
     def hcu_fused_experts(*args, **kwargs):
         bound = fused_experts_signature.bind(*args, **kwargs)
@@ -304,12 +319,14 @@ def apply_to_module(module: ModuleType) -> bool:
                 supported
                 and swiglustep is not None
                 and getattr(moe_config, "activation", None) == swiglustep
-                and weight_key is None
+                and (weight_key, activation_key) not in swiglustep_quant_pairs
             ):
-                # Only the W8A8 route (apply_aiter_quantized_moe) implements
-                # SWIGLUSTEP; the upstream unquantized body would reject it.
+                # apply_aiter_quantized_moe implements channel weights with
+                # dynamic per-token activations only. Upstream also advertises
+                # block/tensor FP8 schemes, which this SWIGLUSTEP path rejects.
                 return False, (
-                    "HCU AITER supports SWIGLUSTEP only for W8A8 channel experts"
+                    "HCU AITER supports SWIGLUSTEP only for FP8/INT8 "
+                    "channel weights with dynamic per-token activations"
                 )
             mxfp4_key = getattr(target, "kMxfp4Static", None)
             if supported and mxfp4_key is not None and weight_key == mxfp4_key:
