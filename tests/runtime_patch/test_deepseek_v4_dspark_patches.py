@@ -10,6 +10,7 @@ from types import ModuleType, SimpleNamespace
 import pytest
 import torch
 
+from vllm_hcu.patch.platform.core_fix import patch_config_utils
 from vllm_hcu.patch.worker.core_fix import (
     patch_deepseek_v4_attention,
     patch_deepseek_v4_dspark_target,
@@ -21,7 +22,6 @@ from vllm_hcu.patch.worker.core_fix import (
     patch_dspark_query_capacity,
     patch_mhc_backend,
 )
-from vllm_hcu.patch.platform.core_fix import patch_config_utils
 from vllm_hcu.patch.worker.core_fix._common import PatchCompatibilityError
 
 
@@ -135,9 +135,7 @@ def test_attention_fp8_ds_mla_insert_uses_non_pcp_lightop(
 
     attention = DeepseekV4Attention(
         SimpleNamespace(
-            model_config=SimpleNamespace(
-                hf_config=SimpleNamespace(expert_dtype="fp8")
-            ),
+            model_config=SimpleNamespace(hf_config=SimpleNamespace(expert_dtype="fp8")),
             quant_config=None,
         ),
         "layer.attn",
@@ -149,9 +147,7 @@ def test_attention_fp8_ds_mla_insert_uses_non_pcp_lightop(
     attention.rotary_emb = SimpleNamespace(cos_sin_cache=torch.zeros(4))
     attention.eps = 1e-6
     kv_norm_weight = object()
-    attention.kv_norm = SimpleNamespace(
-        weight=SimpleNamespace(data=kv_norm_weight)
-    )
+    attention.kv_norm = SimpleNamespace(weight=SimpleNamespace(data=kv_norm_weight))
     metadata = SimpleNamespace(
         slot_mapping=torch.tensor([3, 99], dtype=torch.int64)[::2],
         block_size=16,
@@ -214,9 +210,7 @@ def test_attention_int8_wo_a_is_excluded_only_during_construction() -> None:
         get_name=lambda: "compressed-tensors",
     )
     vllm_config = SimpleNamespace(
-        model_config=SimpleNamespace(
-            hf_config=SimpleNamespace(expert_dtype="int8")
-        ),
+        model_config=SimpleNamespace(hf_config=SimpleNamespace(expert_dtype="int8")),
         quant_config=quant_config,
     )
 
@@ -251,9 +245,7 @@ def test_attention_wo_a_exclusion_rejects_other_quantization_schemes(
         ),
     )
 
-    assert not patch_deepseek_v4_attention._requires_unquantized_int8_wo_a(
-        config
-    )
+    assert not patch_deepseek_v4_attention._requires_unquantized_int8_wo_a(config)
 
 
 def test_scale_alias_matches_only_non_inv_scale_parameters() -> None:
@@ -282,10 +274,7 @@ def test_load_weights_exposes_channel_scale_alias_only_to_official_loader() -> N
             del weights
             params = dict(self.named_parameters())
             observed_names.append(set(params))
-            assert (
-                params["layers.0.attn.fused_wqa_wkv.weight_scale_inv"]
-                is parameter
-            )
+            assert params["layers.0.attn.fused_wqa_wkv.weight_scale_inv"] is parameter
             return {"layers.0.attn.fused_wqa_wkv.weight_scale"}
 
     module = _module(
@@ -514,8 +503,7 @@ def test_rocm_wo_a_cache_keeps_upstream_layout() -> None:
 def test_mhc_backend_switch_masks_aiter_only_when_hcu_option_is_off(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    module = _module(
-        patch_mhc_backend.TARGET_MODULE,
+    module = _mhc_module(
         HAS_AITER_MHC=True,
         HAS_TILELANG_MHC=True,
     )
@@ -533,8 +521,7 @@ def test_mhc_backend_switch_masks_aiter_only_when_hcu_option_is_off(
 def test_mhc_backend_keeps_importable_tilelang(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    module = _module(
-        patch_mhc_backend.TARGET_MODULE,
+    module = _mhc_module(
         HAS_AITER_MHC=False,
         HAS_TILELANG_MHC=True,
     )
@@ -558,8 +545,7 @@ def test_hcu_aiter_mhc_exposes_main_delayed_batch_heuristic() -> None:
 def test_mhc_backend_rejects_partial_aiter_delayed_surface(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    module = _module(
-        patch_mhc_backend.TARGET_MODULE,
+    module = _mhc_module(
         HAS_AITER_MHC=True,
         HAS_TILELANG_MHC=False,
     )
@@ -677,9 +663,7 @@ def test_dspark_draft_parallel_config_keeps_ep_and_uses_ag_rs() -> None:
         enable_elastic_ep: bool = False
 
     def replace(dataclass_instance, /, **kwargs):
-        init_fields = {
-            item.name for item in _fields(dataclass_instance) if item.init
-        }
+        init_fields = {item.name for item in _fields(dataclass_instance) if item.init}
         updated = {name: getattr(dataclass_instance, name) for name in init_fields}
         updated.update(kwargs)
         return type(dataclass_instance)(**updated)
@@ -728,9 +712,7 @@ def test_dspark_draft_parallel_config_keeps_dense_drafter_untouched() -> None:
         enable_expert_parallel: bool = False
 
     def replace(dataclass_instance, /, **kwargs):
-        init_fields = {
-            item.name for item in _fields(dataclass_instance) if item.init
-        }
+        init_fields = {item.name for item in _fields(dataclass_instance) if item.init}
         updated = {name: getattr(dataclass_instance, name) for name in init_fields}
         updated.update(kwargs)
         return type(dataclass_instance)(**updated)
@@ -780,12 +762,13 @@ def test_dspark_draft_load_keeps_backend_owners_consistent(backend) -> None:
     @dataclass
     class VllmConfig:
         kernel_config: KernelConfig = field(default_factory=KernelConfig)
-        speculative_config: SpeculativeConfig = field(
-            default_factory=SpeculativeConfig
+        speculative_config: SpeculativeConfig = field(default_factory=SpeculativeConfig)
+        additional_config: dict = field(
+            default_factory=lambda: {
+                "hcu": {"moe_backend": "deep_gemm"},
+                "unrelated": 7,
+            }
         )
-        additional_config: dict = field(default_factory=lambda: {
-            "hcu": {"moe_backend": "deep_gemm"}, "unrelated": 7,
-        })
 
     def original_parallel_config(parallel_config, tensor_parallel_size):
         return parallel_config
@@ -833,7 +816,8 @@ def test_dspark_ag_rs_prepare_finalize_bypasses_target_manager(monkeypatch) -> N
 
     monkeypatch.setattr(naive_dp_ep, "get_ep_group", target_group)
     monkeypatch.setattr(
-        naive_dp_ep, "_quantize_and_setup_dispatch",
+        naive_dp_ep,
+        "_quantize_and_setup_dispatch",
         lambda a1, config, defer: (a1, None, None),
     )
     monkeypatch.setattr(
@@ -929,9 +913,7 @@ def test_dspark_query_capacity_covers_markov_anchors(num_reqs, sample_from_ancho
     anchors = ids[speculator._anchor_idx].long()
     torch.testing.assert_close(seen[0], anchors.to(torch.int32))
     for step in range(steps):
-        torch.testing.assert_close(
-            speculator.draft_tokens[:, step], anchors + step + 1
-        )
+        torch.testing.assert_close(speculator.draft_tokens[:, step], anchors + step + 1)
     if (num_reqs - 1) * width >= 256:
         with pytest.raises(IndexError):
             ids[:256][speculator._anchor_idx]
@@ -977,3 +959,390 @@ def test_dspark_query_capacity_expands_shared_slots_before_capture():
     drafter.set_attn(None, None, tables, None, None)
     assert seen[1] is seen[0]
     assert config.scheduler_config.max_num_batched_tokens == 256
+
+
+@pytest.fixture(autouse=True)
+def _isolate_aiter_post_probe(monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.setattr(
+        patch_mhc_backend, "_aiter_mhc_post_runtime_available", lambda: False
+    )
+
+
+def _mhc_module(**attributes: object) -> ModuleType:
+    class MHCPostOp:
+        def forward_hip(self, x, residual, post_layer_mix, comb_res_mix):
+            return self.forward_native(x, residual, post_layer_mix, comb_res_mix)
+
+        def forward_native(self, x, residual, post_layer_mix, comb_res_mix):
+            return (
+                torch.einsum("...ij,...ih->...jh", comb_res_mix, residual.float())
+                + post_layer_mix * x.unsqueeze(-2).float()
+            ).to(residual.dtype)
+
+    return _module(patch_mhc_backend.TARGET_MODULE, MHCPostOp=MHCPostOp, **attributes)
+
+
+def _enable_aiter_post_probe(monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.setattr(
+        patch_mhc_backend, "_aiter_mhc_post_runtime_available", lambda: True
+    )
+    monkeypatch.setattr(
+        patch_mhc_backend, "_aiter_mhc_post_supported", lambda *args: True
+    )
+    monkeypatch.setattr("vllm_hcu.platforms.envs.VLLM_HCU_USE_AITER_MHC", True)
+    monkeypatch.setattr("vllm_hcu.platforms.envs.VLLM_HCU_USE_AITER_MHC_POST", True)
+    monkeypatch.setenv("VLLM_HCU_USE_CUSTOM_OPS", "1")
+
+
+def test_mhc_post_uses_aiter_when_delayed_pre_is_unavailable(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """The missing delayed Pre interface must not disable a working Post op."""
+    _enable_aiter_post_probe(monkeypatch)
+    module = _mhc_module(HAS_AITER_MHC=False, HAS_TILELANG_MHC=False)
+    expected = torch.tensor([7.0])
+    calls = []
+
+    def aiter_post(*args):
+        calls.append(args)
+        return expected
+
+    monkeypatch.setattr(patch_mhc_backend, "_call_aiter_mhc_post", aiter_post)
+    patch_mhc_backend.apply_to_module(module)
+    tensors = tuple(torch.tensor([float(i)]) for i in range(4))
+
+    actual = module.MHCPostOp().forward_hip(*tensors)
+
+    assert actual is expected
+    assert len(calls) == 1
+    assert all(actual is expected for actual, expected in zip(calls[0], tensors))
+    assert module.HAS_AITER_MHC is False
+
+
+@pytest.mark.parametrize("disabled", ("master", "aiter", "post"))
+def test_mhc_post_switch_restores_original_dispatch(
+    disabled: str,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    _enable_aiter_post_probe(monkeypatch)
+    if disabled == "master":
+        monkeypatch.setenv("VLLM_HCU_USE_CUSTOM_OPS", "0")
+    elif disabled == "aiter":
+        monkeypatch.setattr("vllm_hcu.platforms.envs.VLLM_HCU_USE_AITER_MHC", False)
+    else:
+        monkeypatch.setattr(
+            "vllm_hcu.platforms.envs.VLLM_HCU_USE_AITER_MHC_POST", False
+        )
+    monkeypatch.setattr(
+        patch_mhc_backend,
+        "_call_aiter_mhc_post",
+        lambda *args: pytest.fail("disabled Post reached AITER"),
+    )
+    module = _mhc_module(HAS_AITER_MHC=False, HAS_TILELANG_MHC=False)
+    op = module.MHCPostOp()
+    x = torch.ones(1, 8, dtype=torch.bfloat16)
+    residual = torch.ones(1, 4, 8, dtype=torch.bfloat16)
+    post = torch.ones(1, 4, 1)
+    comb = torch.eye(4).unsqueeze(0)
+    expected = op.forward_hip(x, residual, post, comb)
+    patch_mhc_backend.apply_to_module(module)
+
+    torch.testing.assert_close(op.forward_hip(x, residual, post, comb), expected)
+
+
+@pytest.mark.parametrize("explicit", (None, "legacy", "auto"))
+def test_mhc_post_selects_v3_before_warmup_and_preserves_user_override(
+    explicit: str | None,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    _enable_aiter_post_probe(monkeypatch)
+    if explicit is None:
+        monkeypatch.delenv("AITER_MHC_POST_KERNEL", raising=False)
+    else:
+        monkeypatch.setenv("AITER_MHC_POST_KERNEL", explicit)
+    module = _mhc_module(HAS_AITER_MHC=False, HAS_TILELANG_MHC=False)
+    patch_mhc_backend.apply_to_module(module)
+
+    import os
+
+    assert os.environ["AITER_MHC_POST_KERNEL"] == (explicit or "v3")
+    assert patch_mhc_backend.apply_to_module(module) is False
+
+
+@pytest.mark.parametrize("hidden_size", (256, 512, 768, 1280, 2560))
+def test_mhc_post_rejects_v3_shapes_with_invalid_b32_b64_output(
+    hidden_size: int,
+) -> None:
+    """These installed HIP variants failed direct numerical probes on gfx938."""
+    from torch._subclasses.fake_tensor import FakeTensor, FakeTensorMode
+
+    mode = FakeTensorMode()
+
+    def fake(shape, dtype):
+        return FakeTensor(
+            mode,
+            torch.empty(shape, dtype=dtype, device="meta"),
+            torch.device("cuda:0"),
+        )
+
+    tensors = (
+        fake((2, hidden_size), torch.bfloat16),
+        fake((2, 4, hidden_size), torch.bfloat16),
+        fake((2, 4, 1), torch.float32),
+        fake((2, 4, 4), torch.float32),
+    )
+    assert patch_mhc_backend._aiter_mhc_post_supported(*tensors) is False
+
+
+def test_mhc_post_unavailable_runtime_keeps_original_dispatch(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.delenv("AITER_MHC_POST_KERNEL", raising=False)
+    module = _mhc_module(HAS_AITER_MHC=False, HAS_TILELANG_MHC=False)
+    original = module.MHCPostOp.forward_hip
+    patch_mhc_backend.apply_to_module(module)
+    assert module._vllm_hcu_original_post_forward_hip is original
+    import os
+
+    assert "AITER_MHC_POST_KERNEL" not in os.environ
+
+
+def test_mhc_post_rejects_incompatible_target_before_mutating_flags() -> None:
+    module = _mhc_module(HAS_AITER_MHC=True, HAS_TILELANG_MHC=True)
+    module.MHCPostOp.forward_hip = lambda self, x: x
+    with pytest.raises(PatchCompatibilityError, match="incompatible signature"):
+        patch_mhc_backend.apply_to_module(module)
+    assert module.HAS_AITER_MHC is True
+    assert module.HAS_TILELANG_MHC is True
+
+
+def test_dspark_trailing_mhc_post_uses_same_aiter_route(monkeypatch):
+    from vllm_hcu.patch.worker.op_opt import patch_mhc_post_dspark
+
+    _enable_aiter_post_probe(monkeypatch)
+    expected = torch.tensor([5.0])
+    monkeypatch.setattr(
+        patch_mhc_backend, "_call_aiter_mhc_post", lambda *args: expected
+    )
+
+    def mhc_post_torch(x, residual, post_layer_mix, comb_res_mix):
+        return residual
+
+    module = _module(patch_mhc_post_dspark.TARGET_MODULE, mhc_post_torch=mhc_post_torch)
+    assert patch_mhc_post_dspark.apply_to_module(module) is True
+    assert module.mhc_post_torch(None, None, None, None) is expected
+    monkeypatch.setenv("VLLM_HCU_USE_CUSTOM_OPS", "0")
+    residual = torch.tensor([2.0])
+    assert module.mhc_post_torch(None, residual, None, None) is residual
+    assert patch_mhc_post_dspark.apply_to_module(module) is False
+
+
+def test_dspark_mhc_post_rejects_changed_signature():
+    from vllm_hcu.patch.worker.op_opt import patch_mhc_post_dspark
+
+    module = _module(patch_mhc_post_dspark.TARGET_MODULE, mhc_post_torch=lambda x: x)
+    with pytest.raises(PatchCompatibilityError, match="incompatible signature"):
+        patch_mhc_post_dspark.apply_to_module(module)
+
+
+@pytest.fixture
+def staged_mhc(monkeypatch):
+    """Model the staged AITER contract to check delayed mixing on CPU."""
+    from vllm_hcu.model_executor.layers import mhc_runtime as runtime
+    from vllm.model_executor.kernels.mhc.torch import mhc_pre_delayed_torch  # noqa: F401
+
+    def project(gemm, sqrsum, source, fn, tile_k, use_tf32):
+        assert not use_tf32
+        flat = source.flatten(1).float()
+        gemm[0].copy_(flat @ fn.t())
+        sqrsum[0].copy_(flat.square().sum(-1))
+
+    def coefficients(gemm, sqrsum, scale, base, hidden, eps, pre_eps,
+                     sinkhorn_eps, post_mult, repeat):
+        mixes = gemm.sum(0) * torch.rsqrt(sqrsum.sum(0) / (4 * hidden) + eps)[:, None]
+        pre = torch.sigmoid(mixes[:, :4] * scale[0] + base[:4]) + pre_eps
+        post = torch.sigmoid(mixes[:, 4:8] * scale[1] + base[4:8]) * post_mult
+        comb = torch.softmax((mixes[:, 8:] * scale[2] + base[8:]).reshape(-1, 4, 4), -1)
+        comb = comb + sinkhorn_eps
+        comb = comb / (comb.sum(-2, keepdim=True) + sinkhorn_eps)
+        for _ in range(repeat - 1):
+            comb = comb / (comb.sum(-1, keepdim=True) + sinkhorn_eps)
+            comb = comb / (comb.sum(-2, keepdim=True) + sinkhorn_eps)
+        return pre, post, comb
+
+    def big_fuse(post, comb, layer_input, gemm, sqrsum, scale, base, residual,
+                 eps, pre_eps, sinkhorn_eps, post_mult, repeat):
+        pre, post_value, comb_value = coefficients(
+            gemm, sqrsum, scale, base, residual.shape[-1], eps, pre_eps,
+            sinkhorn_eps, post_mult, repeat,
+        )
+        post.copy_(post_value.unsqueeze(-1))
+        comb.copy_(comb_value)
+        layer_input.copy_((pre.unsqueeze(-1) * residual.float()).sum(1).to(residual.dtype))
+
+    monkeypatch.setattr(runtime, "runtime", lambda: runtime.MhcRuntime(
+        project=project, big_fuse=big_fuse,
+    ))
+
+    def pre_mix(gemm, sqrsum, scale, base, hc, width, eps, pre_eps):
+        mixes = gemm.sum(0) * torch.rsqrt(sqrsum.sum(0) / width + eps)[:, None]
+        return torch.sigmoid(mixes[:, :hc] * scale[0] + base[:hc]) + pre_eps
+
+    monkeypatch.setattr(torch.ops.vllm, "mhc_pre_mix_triton", pre_mix, raising=False)
+    monkeypatch.setattr(torch.ops.vllm, "hc_collapse_triton",
+                        lambda residual, pre: (residual.float() * pre.unsqueeze(-1)).sum(1).to(residual.dtype),
+                        raising=False)
+    return runtime
+
+
+@pytest.mark.parametrize("embedding", [False, True])
+@pytest.mark.parametrize("identity_entry", [False, True])
+def test_delayed_pre_preserves_previous_mix_and_embedding_projection(
+    staged_mhc, embedding, identity_entry,
+):
+    from vllm.model_executor.kernels.mhc.torch import mhc_pre_delayed_torch
+
+    torch.manual_seed(18)
+    residual = torch.randn(3, 4, 32, dtype=torch.bfloat16)
+    x = torch.randn(3, 32, dtype=torch.bfloat16) if embedding else None
+    fn = torch.randn(24, 32 if embedding else 128) * 0.05
+    scale = torch.ones(3)
+    base = torch.randn(24) * 0.1
+    previous = None if identity_entry else torch.rand(3, 4)
+    args = (residual, fn, scale, base, 1e-6, 1e-6, 1e-6, 2.0, 20)
+    actual = staged_mhc.delayed_pre(*args, pre_mix=previous, x=x)
+    expected = mhc_pre_delayed_torch(*args, pre_mix=previous, x=x)
+    for result, reference in zip(actual, expected):
+        torch.testing.assert_close(result, reference, rtol=1e-5, atol=1e-5)
+    if identity_entry:
+        assert actual[2].untyped_storage().data_ptr() != residual.untyped_storage().data_ptr()
+
+
+def test_tilelang_pre_receives_compact_projection_and_unfused_norm(staged_mhc, monkeypatch):
+    runtime = staged_mhc
+    native = runtime.runtime()
+    seen = []
+
+    def tile_pre(gemm, sqrsum, scale, base, flat, post, comb, layer_input,
+                 hidden, eps, pre_eps, sinkhorn_eps, post_mult, repeat,
+                 n_splits, mhc_mult):
+        assert gemm.is_contiguous() and gemm.shape[-1] == 24
+        assert flat.shape == (3, 4, 32)
+        assert post.shape == (3, 4) and comb.shape == (3, 16)
+        assert n_splits == 1 and mhc_mult == 4
+        seen.append(True)
+        native.big_fuse(post.unsqueeze(-1), comb.reshape(3, 4, 4),
+                        layer_input, gemm, sqrsum, scale, base, flat, eps, pre_eps,
+                        sinkhorn_eps, post_mult, repeat)
+
+    monkeypatch.setattr(runtime, "runtime", lambda: runtime.MhcRuntime(
+        project=native.project, big_fuse=native.big_fuse, tilelang_pre=tile_pre,
+    ))
+    residual = torch.randn(3, 4, 32, dtype=torch.bfloat16)
+    args = (residual, torch.randn(24, 128), torch.ones(3), torch.zeros(24),
+            1e-6, 1e-6, 1e-6, 2.0, 20)
+    output = runtime.pre(*args)
+    assert seen == [True]
+    # The operator accepts no decoder norm weight; the layer must apply it.
+    assert output[2].shape == (3, 32)
+
+
+def test_tilelang_post_squeezes_mix_for_sglang_contract(monkeypatch):
+    from vllm_hcu.model_executor.layers import mhc_runtime as runtime
+
+    residual = torch.ones(2, 4, 32, dtype=torch.bfloat16)
+    x = torch.ones(2, 32, dtype=torch.bfloat16)
+    post = torch.ones(2, 4, 1)
+    comb = torch.eye(4).repeat(2, 1, 1)
+
+    def tile_post(x, residual, post, comb):
+        assert post.shape == (2, 4)
+        return (residual + post.unsqueeze(-1) * x.unsqueeze(1)).to(residual.dtype)
+
+    monkeypatch.setattr(runtime, "runtime", lambda: runtime.MhcRuntime(tilelang_post=tile_post))
+    torch.testing.assert_close(runtime.post(x, residual, post, comb), residual * 2)
+
+
+def test_missing_tilelang_enum_does_not_disable_native_mhc(monkeypatch):
+    from vllm_hcu.model_executor.layers import mhc_runtime as runtime
+
+    native = SimpleNamespace(mhc_pre=lambda: None, mhc_post=lambda: None,
+                             mhc_pre_gemm_sqrsum=lambda: None,
+                             mhc_pre_big_fuse=lambda: None)
+    def load(name):
+        if name == "aiter.ops.tilelang":
+            raise ImportError("cannot import name 'Enum'")
+        return native
+
+    monkeypatch.setattr(runtime.importlib, "import_module", load)
+    runtime.get_runtime.cache_clear()
+    try:
+        ops = runtime.get_runtime(True)
+        assert ops.pre is native.mhc_pre and ops.post is native.mhc_post
+        assert ops.delayed_available and ops.tilelang_pre is None
+    finally:
+        runtime.get_runtime.cache_clear()
+
+
+def test_real_fused_mhc_reorders_outputs_and_missing_interface_decomposes(monkeypatch):
+    from vllm_hcu.model_executor.layers import mhc_runtime as runtime
+
+    tensors = [torch.tensor([float(i)]) for i in range(4)]
+    monkeypatch.setattr(runtime, "runtime", lambda: runtime.MhcRuntime(
+        fused=lambda *args: tuple(tensors),
+    ))
+    monkeypatch.setattr("vllm_hcu.platforms.envs.VLLM_HCU_USE_AITER_MHC_FUSED", True)
+    args = (torch.ones(1),) * 7 + (1e-6, 1e-6, 1e-6, 2.0, 20)
+    result = runtime.fused_post_pre(*args)
+    assert result == (tensors[3], tensors[0], tensors[1], tensors[2])
+    monkeypatch.setattr(runtime, "runtime", lambda: runtime.MhcRuntime())
+    monkeypatch.setattr(runtime, "post", lambda *args: tensors[3])
+    monkeypatch.setattr(runtime, "pre", lambda *args: tuple(tensors[:3]))
+    assert runtime.fused_post_pre(*args) == result
+
+
+def test_empty_delayed_pre_does_not_launch_aiter(monkeypatch):
+    from vllm_hcu.model_executor.layers import mhc_runtime as runtime
+
+    monkeypatch.setattr(runtime, "runtime", lambda: pytest.fail("empty input launched AITER"))
+    output = runtime.delayed_pre(torch.empty(0, 4, 1024, dtype=torch.bfloat16),
+                                 torch.empty(24, 4096), torch.ones(3), torch.zeros(24),
+                                 1e-6, 1e-6, 1e-6, 2.0, 20)
+    assert [t.shape for t in output] == [(0, 4, 1), (0, 4, 4), (0, 1024), (0, 4)]
+
+
+def test_post_off_stays_native_when_delayed_pre_becomes_available(monkeypatch):
+    """Enabling Pre must not silently reactivate a disabled Post operator."""
+    _enable_aiter_post_probe(monkeypatch)
+    monkeypatch.setattr("vllm_hcu.platforms.envs.VLLM_HCU_USE_AITER_MHC_POST", False)
+    monkeypatch.setattr(patch_mhc_backend, "_aiter_mhc_runtime_complete", lambda m: True)
+    module = _mhc_module(HAS_AITER_MHC=True, HAS_TILELANG_MHC=False)
+
+    def original_aiter(self, x, residual, post_layer_mix, comb_res_mix):
+        pytest.fail("disabled Post used the original AITER route")
+
+    module.MHCPostOp.forward_hip = original_aiter
+    patch_mhc_backend.apply_to_module(module)
+    residual = torch.ones(2, 4, 16)
+    post = torch.ones(2, 4, 1)
+    comb = torch.eye(4).expand(2, -1, -1)
+    output = module.MHCPostOp().forward_hip(torch.ones(2, 16), residual, post, comb)
+    torch.testing.assert_close(output, residual * 2)
+
+
+def test_mhc_pre_changed_signature_is_rejected_before_any_patch(monkeypatch):
+    from vllm_hcu.patch.worker.core_fix import patch_mhc_pre_backend
+
+    class MHCPreOp:
+        def forward_hip(self, residual):
+            return residual
+
+        def forward_native(self, residual):
+            return residual
+
+    original = MHCPreOp.forward_hip
+    module = _module(patch_mhc_pre_backend.TARGET_MODULE, MHCPreOp=MHCPreOp)
+    with pytest.raises(PatchCompatibilityError, match="incompatible signature"):
+        patch_mhc_pre_backend.apply_to_module(module)
+    assert MHCPreOp.forward_hip is original
+    assert not hasattr(module, "_vllm_hcu_mhc_pre_backend_applied")
