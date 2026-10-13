@@ -690,32 +690,32 @@ class KimiK3ToolParser(ToolParser):
         other paths); the only persistent state is how much of the prefix
         was already emitted, so fragments can be diffed out.  The output
         shape mirrors the closed path's ``json.dumps(arguments,
-        ensure_ascii=False)``: ``{"k1": v1, "k2": v2}``.  Known limitations
-        (renderer never produces them; matched against the closed path):
-        duplicate keys stream the FIRST occurrence while the closed-path
-        decode keeps the last, and a truncated non-string (object/array)
+        ensure_ascii=False)``: ``{"k1": v1, "k2": v2}``.  Duplicate keys
+        render EVERY occurrence (review 2026-10-15 round 17 P2): clients
+        assembling with ``json.loads`` then keep the last value -- the
+        same last-wins semantics as the closed path's dict extraction.
+        Clients that patch key-by-key under a single-key assumption will
+        see the same key twice (only when the model actually repeats a
+        key, which the renderer never does).  Remaining known limitation:
+        a truncated non-string (object/array)
         value cannot be repaired into valid JSON at end-of-stream.
         """
 
         parts: list[str] = []
-        seen_keys: set[str] = set()
         pos = 0
         for m in self._arg_re.finditer(body):
             attrs = self._attrs(m["attrs"])
             key = attrs.get("key", "")
-            if key in seen_keys:
-                continue
             is_string = attrs.get("type", "string") == "string"
             rendered = (
                 f'"{self._json_escape(m["val"])}"'
                 if is_string
                 else m["val"]
             )
-            joiner = ", " if seen_keys else ""
             parts.append(
-                f'{joiner}{json.dumps(key, ensure_ascii=False)}: {rendered}'
+                f'{", " if parts else ""}'
+                f"{json.dumps(key, ensure_ascii=False)}: {rendered}"
             )
-            seen_keys.add(key)
             pos = m.end()
 
         m_open = self._arg_open_re.search(body, pos)
@@ -723,36 +723,35 @@ class KimiK3ToolParser(ToolParser):
         if m_open is not None:
             attrs = self._attrs(m_open["attrs"])
             key = attrs.get("key", "")
-            if key not in seen_keys:
-                trailing_string = attrs.get("type", "string") == "string"
-                raw = body[m_open.end() :]
-                # Hold back any suffix that may still grow into the
-                # argument close marker -- canonical prefix plus the
-                # whitespace-tolerant shapes (same pairing as the content
-                # channel and review R11's holdback fix).  At end-of-stream
-                # nothing more can arrive, so the hold MUST drop -- a
-                # literal trailing ``<`` is data, not a prefix (R12 P2 #5
-                # precedent on the content channel; review R14 P3).
-                hold = (
-                    0
-                    if final
-                    else max(
-                        _partial_tag_overlap(raw, _CO + "argument" + _SS),
-                        _marker_holdback(raw, _CO, "argument", _SS),
-                    )
+            trailing_string = attrs.get("type", "string") == "string"
+            raw = body[m_open.end() :]
+            # Hold back any suffix that may still grow into the
+            # argument close marker -- canonical prefix plus the
+            # whitespace-tolerant shapes (same pairing as the content
+            # channel and review R11's holdback fix).  At end-of-stream
+            # nothing more can arrive, so the hold MUST drop -- a
+            # literal trailing ``<`` is data, not a prefix (R12 P2 #5
+            # precedent on the content channel; review R14 P3).
+            hold = (
+                0
+                if final
+                else max(
+                    _partial_tag_overlap(raw, _CO + "argument" + _SS),
+                    _marker_holdback(raw, _CO, "argument", _SS),
                 )
-                streamable = raw[: len(raw) - hold] if hold else raw
-                joiner = ", " if seen_keys else ""
-                if trailing_string:
-                    parts.append(
-                        f'{joiner}{json.dumps(key, ensure_ascii=False)}: '
-                        f'"{self._json_escape(streamable)}'
-                    )
-                else:
-                    parts.append(
-                        f'{joiner}{json.dumps(key, ensure_ascii=False)}: '
-                        f"{streamable}"
-                    )
+            )
+            streamable = raw[: len(raw) - hold] if hold else raw
+            joiner = ", " if parts else ""
+            if trailing_string:
+                parts.append(
+                    f'{joiner}{json.dumps(key, ensure_ascii=False)}: '
+                    f'"{self._json_escape(streamable)}'
+                )
+            else:
+                parts.append(
+                    f'{joiner}{json.dumps(key, ensure_ascii=False)}: '
+                    f"{streamable}"
+                )
 
         prefix = "{" + "".join(parts)
         if final:

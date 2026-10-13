@@ -150,6 +150,65 @@ def _merge_flush(delta_message, flush):
     return delta_message
 
 
+def _none_stream_delta(tool_parser, request, result, finished):
+    """Streamed ``tool_choice="none"`` framing strip (review round 17 P2).
+
+    The wheel short-circuits ``parse_delta`` for disabled tools, so the
+    K3 XTML response/message framing streams to the client unfiltered and
+    the finish-time flush cannot retract what earlier chunks already
+    sent.  Drive the parser's cumulative content extractor over the
+    accumulated VISIBLE text -- the original call's ``result.content``
+    (review R17 P1-2: raw ``delta_text`` would also fold in reasoning
+    segments that upstream already routed elsewhere).  Markers are
+    stripped, split markers are held back across chunk boundaries, and
+    any tool calls the model emitted anyway are suppressed (the "none"
+    contract is content only).  State is keyed by request identity; a
+    parser instance reused across requests restarts its buffer on the
+    first mismatch.
+    """
+
+    if result is None:
+        # Review R17 P1-1: an empty delta (or a reasoning boundary) makes
+        # the wheel return None -- keep None semantics; nothing visible
+        # means nothing to accumulate or emit.
+        return None
+
+    rid = getattr(request, "request_id", None) or id(request)
+    state = getattr(tool_parser, "_hcu_none_state", None)
+    if state is None or state[0] != rid:
+        # A stale streaming-content index from a previous request on the
+        # same instance must not clip this request's head.
+        tool_parser._sent_content_idx = 0
+        previous = ""
+    else:
+        previous = state[1]
+    # Only text the wheel itself made visible belongs in the buffer.
+    visible = getattr(result, "content", None) or ""
+    current = previous + visible
+    tool_parser._hcu_none_state = (rid, current)
+
+    content = tool_parser._extract_response_content(current) or ""
+    if finished:
+        tail_start = tool_parser._sent_content_idx
+        tail = current[tail_start:]
+        # Review R17 P2-1: if the model emitted a tools channel despite
+        # tool_choice="none", that channel must never leak as content --
+        # cut it like the non-streaming none path does, THEN strip the
+        # remaining framing (the holdback releases as data).
+        m_tools = tool_parser._tools_open_re.search(tail)
+        if m_tools is not None:
+            tail = tail[: m_tools.start()]
+        content += tool_parser._strip_response_content(tail) or ""
+        tool_parser._hcu_none_state = None
+        tool_parser._sent_content_idx = 0
+
+    # In-place mutation keeps every other field (e.g. reasoning content)
+    # untouched and works for pydantic models and test namespaces alike.
+    result.content = content or None
+    result.tool_calls = None
+    return result
+
+
 def _wrap_parse_delta_soft(cls: type, module: ModuleType) -> bool:
     """Wrap parse_delta only when the wheel carries the finished protocol."""
 
@@ -165,16 +224,23 @@ def _wrap_parse_delta_soft(cls: type, module: ModuleType) -> bool:
 
     @functools.wraps(original)
     def hcu_parse_delta(self, delta_text, delta_token_ids, request, *args, **kwargs):
+        finished = bool(kwargs.get("finished", False)) or _bound_finished(
+            signature, self, delta_text, delta_token_ids, request, args, kwargs
+        )
         result = original(self, delta_text, delta_token_ids, request, *args, **kwargs)
-        if not kwargs.get("finished", False) and not (
-            _bound_finished(signature, self, delta_text, delta_token_ids, request, args, kwargs)
+        tool_parser = getattr(self, "_tool_parser", None)
+        if (
+            not _is_k3_parser(tool_parser)
+            or getattr(request, "tool_choice", None) != "none"
         ):
+            if not finished:
+                return result
+            if _is_k3_parser(tool_parser):
+                finish = getattr(tool_parser, "finish_streaming", None)
+                if callable(finish):
+                    result = _merge_flush(result, finish())
             return result
-        if _is_k3_parser(getattr(self, "_tool_parser", None)):
-            finish = getattr(self._tool_parser, "finish_streaming", None)
-            if callable(finish):
-                result = _merge_flush(result, finish())
-        return result
+        return _none_stream_delta(tool_parser, request, result, finished)
 
     setattr(hcu_parse_delta, _WRAPPER, True)
     cls.parse_delta = hcu_parse_delta

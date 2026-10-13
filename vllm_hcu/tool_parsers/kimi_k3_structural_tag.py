@@ -19,6 +19,7 @@ framework. All XTML byte-level constants mirror
 from __future__ import annotations
 
 import json
+import re
 from itertools import permutations
 from typing import Any
 
@@ -110,8 +111,51 @@ review 2026-10-13 P2 #3 kept this behavior with this documentation):
 """
 
 
+_K3_PATTERN_CEILING = 4096
+
+# ``^CLASS<quantifier>$`` shapes enforceable exactly by merging with the
+# min/maxLength bounds: one character class plus one bounded quantifier.
+# The braces form REQUIRES a leading digit (review R17 P3-1): ``{}`` and
+# ``{,5}`` are quantifier-free literals in ECMA Annex B and must NOT be
+# reinterpreted here (an empty ``{}`` previously crashed ``int("")`` at
+# build time instead of failing loudly at grammar compilation).
+_K3_CLASS_QUANT_RE = re.compile(
+    r"^(\[(?:\\.|[^\\\]])*\])"        # one character class (escapes ok)
+    r"(\{(\d+)(?:(,)(\d+)?)?\}|[+*?])?$"  # counted/plus/star/opt quantifier
+)
+
+
+def _k3_simple_pattern_bounds(
+    pattern: str,
+) -> tuple[str, int, int | None] | None:
+    """``(class_source, lo, hi_or_None)`` for ``^CLASS<quant>$`` patterns."""
+
+    if len(pattern) < 3 or pattern[0] != "^" or pattern[-1] != "$":
+        return None
+    body = pattern[1:-1]
+    m = _K3_CLASS_QUANT_RE.match(body)
+    if m is None:
+        return None
+    cls, quant = m.group(1), m.group(2)
+    if quant is None:
+        return cls, 1, 1
+    if quant in ("+", "*", "?"):
+        return {
+            "+": (cls, 1, None),
+            "*": (cls, 0, None),
+        }[quant]
+    inner = quant[1:-1]
+    if "," not in inner:
+        lo = hi = int(inner)
+    else:
+        lo_s, hi_s = inner.split(",", 1)
+        lo = int(lo_s)
+        hi = int(hi_s) if hi_s else None
+    return cls, lo, hi
+
+
 def _k3_bounded_string_regex(prop: dict[str, Any]) -> str | None:
-    """Length/pattern constraint for the raw string channel, if expressible.
+    """Length/pattern constraints for the raw string channel, if expressible.
 
     The XTML string channel emits values raw (not JSON-quoted), so
     JSONSchemaFormat cannot enforce string constraints there; xgrammar's
@@ -121,15 +165,92 @@ def _k3_bounded_string_regex(prop: dict[str, Any]) -> str | None:
     documented on :data:`_K3_STRING_ATOM` and intentionally ported (review
     2026-10-13 P2 #3).
 
-    Returns a regex for the value, or None to keep permissive AnyText.
+    Pattern regimes (review 2026-10-15 round 17 P1: a declared ``pattern``
+    must be enforced, never silently dropped):
+
+    - ``^CLASS<quant>$`` simple forms merge EXACTLY with minLength and
+      maxLength into one quantified class regex (e.g. ``^[0-9]+$`` +
+      ``maxLength: 5`` -> ``[0-9]{1,5}``); unbounded simple quantifiers
+      ride the standing 4096-atom ceiling, exactly like the length-only
+      regime;
+    - any other ANCHORED pattern is enforced verbatim as the whole
+      value; its atoms lack the ``<|`` exclusion and the declared
+      length bounds are NOT folded in (documented on the branch);
+    - an UNANCHORED pattern cannot be enforced on this engine (prefix
+      completion, documented on the branch): the permissive atom stands
+      unless a maxLength is declared, in which case the length-only
+      regime applies so a declared bound is never silently dropped;
+    - constructs outside the engine's regex subset fail grammar
+      compilation LOUDLY, which mirrors the ``$defs`` merge verdict: a
+      loud request error beats a silently relaxed schema.
+
+    Returns a regex for the value, or None to keep permissive AnyText
+    (only when neither an enforceable pattern nor a valid maxLength is
+    declared).
     """
 
     max_len = prop.get("maxLength")
     min_len = prop.get("minLength", 0)
-    if not isinstance(max_len, int) or max_len < 0 or max_len > 4096:
-        return None
-    if not isinstance(min_len, int) or min_len < 0 or min_len > max_len:
+    if (
+        not isinstance(max_len, int)
+        or max_len < 0
+        or max_len > _K3_PATTERN_CEILING
+    ):
+        max_len = None
+    if (
+        not isinstance(min_len, int)
+        or min_len < 0
+        or (max_len is not None and min_len > max_len)
+    ):
         min_len = 0
+
+    pattern = prop.get("pattern")
+    if isinstance(pattern, str) and pattern:
+        simple = _k3_simple_pattern_bounds(pattern)
+        if simple is not None:
+            cls, plo, phi = simple
+            lo = max(min_len, plo)
+            hi = phi if max_len is None else (
+                max_len if phi is None else min(phi, max_len)
+            )
+            if hi is None:
+                hi = _K3_PATTERN_CEILING
+            if lo > hi:
+                # The bounds cannot co-satisfy the pattern (e.g.
+                # minLength 5 vs a {0,4} quantifier).  No grammar is a
+                # correct merge here: keep the PATTERN bounds alone so
+                # the declared shape still holds -- but note this DOES
+                # relax an infeasible minLength (the schema itself was
+                # contradictory; RFC 6901-style validators would reject
+                # the whole schema before sampling).
+                lo = plo
+                hi = phi if phi is not None else _K3_PATTERN_CEILING
+            return f"{cls}{{{lo},{hi}}}"
+        if len(pattern) >= 2 and pattern[0] == "^" and pattern[-1] == "$":
+            # Whole-value enforcement.  NOTE (review R17 P2-2): a
+            # non-simple anchored pattern does NOT fold minLength /
+            # maxLength into the regex, and a general regex
+            # intersection is not expressible here -- length bounds
+            # are unenforced under this regime.  Its ATOMS also lack
+            # the ``<|`` exclusion of _K3_STRING_ATOM, so a pattern
+            # like ``^.+$`` can consume framing markers; declare such
+            # patterns carefully (review R17 P3-2).
+            return f"(?:{pattern[1:-1]})"
+        if max_len is None:
+            # PROVEN engine limit (probe 2026-10-15, xgrammar 0.2.3):
+            # matching is prefix-completing, and ANY value can be
+            # completed to a containment witness by appending a match
+            # ("urrgent no" is a prefix of "urrgent nourgent").
+            # Containment ("search") semantics is unfalsifiable at the
+            # value end and CANNOT be enforced; stay permissive rather
+            # than build a toothless grammar (anchored regimes above --
+            # the realistic shapes -- are enforced exactly).
+            return None
+        # fall through: an unanchored pattern cannot be enforced, but a
+        # declared maxLength still is (no behavior regression vs the
+        # length-only regime, review R17 P2-2).
+    if max_len is None:
+        return None
     return _K3_STRING_ATOM + f"{{{min_len},{max_len}}}"
 
 
@@ -395,7 +516,18 @@ def _k3_arguments_block(parameters: dict[str, Any] | bool) -> Any:
     and non-unique.
     """
 
+    if parameters is False:
+        # Review 2026-10-15 round 17 P3: JSON Schema ``false`` rejects any
+        # value -- a no-argument tool.  The permissive star let the model
+        # invent argument tags here while the empty-CLOSED-schema branch
+        # below correctly returns ``ConstStringFormat("")``; keep the two
+        # zero-parameter shapes consistent (same wheel-verified matching
+        # property: the zero-argument call completes, an invented
+        # ``argument`` tag fails the matcher).
+        return ConstStringFormat(value="")
     if not isinstance(parameters, dict):
+        # ``True`` (or any non-dict truthy config) keeps the permissive
+        # fallback -- no constraint was declared.
         return StarFormat(content=_k3_permissive_argument_tag())
     props = parameters.get("properties")
     if not isinstance(props, dict) or not props:

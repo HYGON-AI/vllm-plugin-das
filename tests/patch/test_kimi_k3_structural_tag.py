@@ -823,6 +823,174 @@ def test_union_merge_hoists_defs_to_the_wrapper_root() -> None:
     del vocab
 
 
+def _tool_with_string_prop(prop: dict) -> FunctionToolParam:
+    return FunctionToolParam(
+        function={
+            "name": "tagged",
+            "parameters": {
+                "type": "object",
+                "properties": {"v": prop},
+                "required": ["v"],
+                "additionalProperties": False,
+            },
+        }
+    )
+
+
+def _string_tag_content(prop: dict):
+    tag = get_kimi_k3_structural_tag([_tool_with_string_prop(prop)], [], "required", False)
+    tags = [
+        f
+        for f in _walk_formats(tag.format)
+        if type(f).__name__ == "TagFormat"
+        and 'key="v"' in getattr(f, "begin", "")
+    ]
+    assert tags, "no string argument tag built"
+    return tags[0].content
+
+
+def test_pattern_simple_class_merges_with_length_bounds() -> None:
+    """R17 P1: ^CLASS<quant>$ patterns merge EXACTLY with min/maxLength."""
+
+    content = _string_tag_content(
+        {"type": "string", "pattern": "^[0-9]+$", "maxLength": 5}
+    )
+    assert type(content).__name__ == "RegexFormat", type(content).__name__
+    assert content.pattern == "[0-9]{1,5}", content.pattern
+
+    content = _string_tag_content(
+        {"type": "string", "pattern": "^[a-z]{2,8}$", "minLength": 3}
+    )
+    assert content.pattern == "[a-z]{3,8}", content.pattern
+
+    # pattern only: unbounded quantifier rides the standing ceiling
+    content = _string_tag_content({"type": "string", "pattern": "^[0-9]+$"})
+    assert content.pattern == "[0-9]{1,4096}", content.pattern
+
+
+def test_pattern_is_enforced_in_the_grammar() -> None:
+    """The FSM must actually reject pattern-violating strict values."""
+
+    xg = pytest.importorskip("xgrammar")
+    compiler_cls = getattr(xg, "GrammarCompiler", None)
+    if (
+        compiler_cls is None
+        or not hasattr(compiler_cls, "compile_structural_tag")
+    ):
+        pytest.skip("xgrammar lacks GrammarCompiler.compile_structural_tag")
+
+    tag = get_kimi_k3_structural_tag(
+        [
+            _tool_with_string_prop(
+                {"type": "string", "pattern": "^[A-Z][a-z]+$"}
+            )
+        ],
+        [],
+        "required",
+        False,
+    )
+    vocab = [
+        "a", "b", "c", "d", "e", "f", "g", "v", "<", "|", ">", '"', "=",
+        "open", "close", "sep", "argument", "call", "tools", "response",
+        "message", "string", "key", "tagged", "index", "H", "X", "e", "l",
+        "o", "A", "B", "s", "t", "r", "n",
+    ]
+    compiled = compiler_cls(xg.TokenizerInfo(vocab)).compile_structural_tag(tag)
+    pre = '<|close|>response<|sep|><|open|>tools<|sep|><|open|>call tool="tagged" index="1"<|sep|>'
+    post = "<|close|>call<|sep|><|close|>tools<|sep|><|close|>message<|sep|>"
+
+    def arg(val: str) -> str:
+        return (
+            f'<|open|>argument key="v" type="string"<|sep|>{val}'
+            "<|close|>argument<|sep|>"
+        )
+
+    matcher = xg.GrammarMatcher(compiled)
+    assert matcher.accept_string(pre + arg("Hello") + post)
+    matcher = xg.GrammarMatcher(compiled)
+    assert not matcher.accept_string(pre + arg("hello") + post)
+    matcher = xg.GrammarMatcher(compiled)
+    assert not matcher.accept_string(pre + arg("HELLO") + post)
+
+
+def test_unanchored_pattern_falls_back_permissive() -> None:
+    """R17 P1 caveat, PROVEN engine limit: xgrammar completes VALUES by
+    prefix -- any value v plus a appended match is a containment witness
+    ("urrgent no" -> "urrgent nourgent"), so JSON-Schema search semantics
+    is unfalsifiable at the value end.  The grammar stays permissive
+    (probed across regex/star/sequence composites; all accept a typo).
+    Anchored regimes -- the realistic shapes -- are enforced exactly."""
+
+    content = _string_tag_content({"type": "string", "pattern": "urgent"})
+    assert type(content).__name__ == "AnyTextFormat", type(content).__name__
+
+
+def test_parameters_false_rejects_invented_arguments() -> None:
+    """R17 P3: JSON Schema ``parameters: false`` is a zero-parameter tool.
+
+    NOTE on reachability: this wheel's ``FunctionToolParam`` validates
+    ``parameters`` as dict-only, so a bool ``false`` dies with a 400
+    upstream -- the shape arrives only through the builder's documented
+    ``dict | bool`` contract (direct/internal callers).  There it must
+    behave consistently with the empty-CLOSED-schema branch: ONLY the
+    empty argument sequence is legal."""
+
+    from vllm_hcu.tool_parsers.kimi_k3_structural_tag import (
+        _k3_arguments_block,
+    )
+
+    block = _k3_arguments_block(False)
+    assert type(block).__name__ == "ConstStringFormat", type(block).__name__
+    assert block.value == "", block.value
+
+    # ``True``/non-dict keeps the permissive fallback
+    permissive = _k3_arguments_block(True)
+    assert type(permissive).__name__ == "StarFormat", type(permissive).__name__
+
+    # grammar-level proof via the REACHABLE dict twin (empty + closed):
+    # only the zero-argument call matches -- same ConstStringFormat("")
+    # the False branch returns.
+    xg = pytest.importorskip("xgrammar")
+    compiler_cls = getattr(
+        xg, "GrammarCompiler", None
+    )
+    if (
+        compiler_cls is None
+        or not hasattr(compiler_cls, "compile_structural_tag")
+    ):
+        pytest.skip("xgrammar lacks GrammarCompiler.compile_structural_tag")
+    tool = FunctionToolParam(
+        function={
+            "name": "noargs",
+            "parameters": {
+                "type": "object",
+                "properties": {},
+                "additionalProperties": False,
+            },
+        }
+    )
+    tag = get_kimi_k3_structural_tag([tool], [], "required", False)
+    vocab = [
+        "a", "b", "c", "d", "e", "f", "g", "v", "<", "|", ">", '"', "=",
+        "open", "close", "sep", "argument", "call", "tools", "response",
+        "message", "string", "key", "noargs", "index", "x", "y",
+    ]
+    compiled = compiler_cls(xg.TokenizerInfo(vocab)).compile_structural_tag(tag)
+    pre = '<|close|>response<|sep|><|open|>tools<|sep|><|open|>call tool="noargs" index="1"<|sep|>'
+    post = "<|close|>call<|sep|><|close|>tools<|sep|><|close|>message<|sep|>"
+    matcher = xg.GrammarMatcher(compiled)
+    assert matcher.accept_string(pre + post)
+    assert matcher.is_completed()
+    matcher = xg.GrammarMatcher(compiled)
+    invented = (
+        pre
+        + '<|open|>argument key="x" type="string"<|sep|>y'
+        + "<|close|>argument<|sep|>"
+        + post
+    )
+    assert not matcher.accept_string(invented)
+
+
 def test_strict_opt_in_is_required_for_schema_constraint() -> None:
     """R13 P2: the wheel installs ONE structural tag for the whole list
     when any tool sets strict (registry :109); a sibling that merely
@@ -852,3 +1020,42 @@ def test_strict_opt_in_is_required_for_schema_constraint() -> None:
     assert any('tool="weather"' in b for b in begins), begins
     assert any('tool="plain_lookup"' in b for b in begins), begins
     assert any('key="alpha"' in b and 'type="string"' in b for b in begins), begins
+
+
+def test_pattern_bounded_regex_regimes() -> None:
+    """R17 R2-2/P3-1 unit contracts on _k3_bounded_string_regex."""
+
+    from vllm_hcu.tool_parsers.kimi_k3_structural_tag import (
+        _k3_bounded_string_regex,
+    )
+
+    # an unanchored pattern cannot be enforced, but a declared maxLength
+    # must NOT be silently dropped (falls through to the length regime)
+    regex = _k3_bounded_string_regex(
+        {"type": "string", "pattern": "urgent", "maxLength": 10}
+    )
+    assert regex is not None and regex.endswith("{0,10}"), regex
+
+    # no usable maxLength and an unenforceable pattern -> permissive None
+    assert (
+        _k3_bounded_string_regex({"type": "string", "pattern": "urgent"})
+        is None
+    )
+
+    # ECMA-Annex-B literal quantifiers must be neither reinterpreted nor
+    # crash the builder -- they fall to the verbatim anchored regime
+    literal = _k3_bounded_string_regex(
+        {"type": "string", "pattern": "^[a]{}$"}
+    )
+    assert literal == "(?:[a]{})", literal
+    literal = _k3_bounded_string_regex(
+        {"type": "string", "pattern": "^[a]{,5}$"}
+    )
+    assert literal == "(?:[a]{,5})", literal
+
+    # non-simple anchored pattern: verbatim whole-value enforcement; the
+    # declared length bounds are documented as NOT folded in
+    verbatim = _k3_bounded_string_regex(
+        {"type": "string", "pattern": "^[A-Z][a-z]+$", "maxLength": 10}
+    )
+    assert verbatim == "(?:[A-Z][a-z]+)", verbatim

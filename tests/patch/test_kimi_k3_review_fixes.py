@@ -822,3 +822,159 @@ def test_streaming_closed_call_and_next_header_cold() -> None:
 
     assert _json.loads(_args_of(calls, 0)) == {"x": "ok"}
     assert _json.loads(_args_of(calls, 1)) == {"y": 7}
+
+
+def test_streaming_duplicate_keys_keep_last_value() -> None:
+    """R17 P2: duplicate argument keys stream EVERY occurrence so clients
+    assembling with json.loads keep the last value -- the same last-wins
+    semantics as the closed path's dict extraction (both paths agree)."""
+
+    full = (
+        "<|close|>response<|sep|><|open|>tools<|sep|>"
+        '<|open|>call tool="w" index="1"<|sep|>'
+        '<|open|>argument key="k" type="string"<|sep|>first'
+        "<|close|>argument<|sep|>"
+        '<|open|>argument key="k" type="string"<|sep|>second'
+        "<|close|>argument<|sep|><|close|>call<|sep|>"
+        "<|close|>tools<|sep|><|close|>message<|sep|>"
+    )
+    parser = _live_parser()
+    content, calls = _gather(
+        parser,
+        [
+            "<|close|>response<|sep|><|open|>tools<|sep|>",
+            '<|open|>call tool="w" index="1"<|sep|>'
+            '<|open|>argument key="k" type="string"<|sep|>first'
+            "<|close|>argument<|sep|>",
+            '<|open|>argument key="k" type="string"<|sep|>second'
+            "<|close|>argument<|sep|><|close|>call<|sep|>",
+            "<|close|>tools<|sep|><|close|>message<|sep|>",
+        ],
+    )
+    assert content == ""
+    import json as _json
+
+    assert _json.loads(_args_of(calls, 0)) == {"k": "second"}, calls
+
+    # closed-path parity on the identical text
+    parser2 = _live_parser()
+    info = parser2.extract_tool_calls(full, SimpleNamespace(tool_choice="auto"))
+    assert info.tool_calls and info.tool_calls[0].function.name == "w"
+    assert _json.loads(info.tool_calls[0].function.arguments) == {"k": "second"}
+
+
+def test_parse_delta_none_choice_strips_streamed_framing() -> None:
+    """R17 P2: with tool_choice="none" the wheel short-circuits parse_delta,
+    so the wrapper must strip the XTML framing per delta -- markers are
+    removed, split markers held, calls suppressed, and the finish turn
+    releases the held-back tail as data."""
+
+    parser = _live_parser()
+    module, delegator = _make_delegator(
+        ([], ""), parser, with_parse_delta=True
+    )
+    assert patch_delegating_tool_content.apply_to_module(module) is True
+    request = SimpleNamespace(tool_choice="none", request_id="r-none")
+    pieces = [
+        "<|open|>response<|sep|>",
+        "He",
+        "llo",
+        "<|close|>response<|sep|><|close|>message<|sep|>",
+    ]
+    out: list[str] = []
+    for i, piece in enumerate(pieces):
+        delta = delegator.parse_delta(
+            piece, [9], request, finished=i == len(pieces) - 1
+        )
+        assert delta is not None
+        assert not getattr(delta, "tool_calls", None)
+        if delta.content:
+            out.append(delta.content)
+    assert "".join(out) == "Hello", out
+
+    # a NEW request reusing the same parser instance restarts the buffer
+    request2 = SimpleNamespace(tool_choice="none", request_id="r-none-2")
+    delta = delegator.parse_delta("B", [9], request2, finished=False)
+    assert delta.content == "B", delta.content
+    delta = delegator.parse_delta("ye", [9], request2, finished=True)
+    assert delta.content == "ye", delta.content
+    out2 = []
+    for piece, fin in (("X", False), ("<|close|>message<|sep|>", True)):
+        d = delegator.parse_delta(piece, [9], request2, finished=fin)
+        if d is not None and d.content:
+            out2.append(d.content)
+        assert not getattr(d, "tool_calls", None)
+    assert "".join(out2) == "X", out2
+
+
+def test_parse_delta_none_choice_none_result_passthrough() -> None:
+    """R17 P1-1: an empty delta or reasoning boundary makes the wheel
+    return None; the wrapper must keep None semantics (no fabricated
+    message, no ImportError on a protocol import) instead of inventing
+    a DeltaMessage."""
+
+    parser = _live_parser()
+
+    class DelegatingParser:
+        def __init__(self):
+            self.result = ([], "")
+            self._tool_parser = parser
+            self.none_next = False
+
+        def _extract_tool_calls(self, content, request, *args, **kwargs):
+            return self.result
+
+        def parse_delta(
+            self, delta_text, delta_token_ids, request, *, finished=False
+        ):
+            if self.none_next:
+                self.none_next = False
+                return None
+            return SimpleNamespace(content=delta_text, tool_calls=[])
+
+    module = ModuleType(patch_delegating_tool_content.TARGET_MODULE)
+    module.DelegatingParser = DelegatingParser
+    delegator = DelegatingParser()
+    assert patch_delegating_tool_content.apply_to_module(module) is True
+    request = SimpleNamespace(tool_choice="none", request_id="r-none-x")
+
+    delegator.none_next = True
+    assert delegator.parse_delta("", [9], request, finished=False) is None
+    # the stream continues normally afterwards
+    delta = delegator.parse_delta(
+        "<|open|>response<|sep|>ok", [9], request, finished=True
+    )
+    assert delta is not None and delta.content == "ok", delta
+
+
+def test_parse_delta_none_choice_suppresses_tools_channel() -> None:
+    """R17 P2-1: a model that emits a tools channel despite
+    tool_choice="none" must not leak XTML -- the finish pass cuts the
+    channel exactly like the non-streaming none path."""
+
+    parser = _live_parser()
+    module, delegator = _make_delegator(
+        ([], ""), parser, with_parse_delta=True
+    )
+    assert patch_delegating_tool_content.apply_to_module(module) is True
+    request = SimpleNamespace(tool_choice="none", request_id="r-none-t")
+    pieces = [
+        "<|open|>response<|sep|>",
+        "Hi",
+        '<|close|>response<|sep|><|open|>tools<|sep|>'
+        '<|open|>call tool="f" index="1"<|sep|>',
+        '<|close|>call<|sep|><|close|>tools<|sep|>'
+        "<|close|>message<|sep|>",
+    ]
+    out: list[str] = []
+    for i, piece in enumerate(pieces):
+        delta = delegator.parse_delta(
+            piece, [9], request, finished=i == len(pieces) - 1
+        )
+        if delta is None:
+            continue
+        assert not getattr(delta, "tool_calls", None)
+        if delta.content:
+            out.append(delta.content)
+    assert "".join(out) == "Hi", out
+    assert "<|" not in "".join(out)
