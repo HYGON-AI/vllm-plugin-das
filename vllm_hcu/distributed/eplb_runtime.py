@@ -20,6 +20,7 @@ from vllm.distributed.eplb.eplb_state import (
 )
 
 from vllm_hcu.distributed.eplb_transfer_runtime import rearrange_expert_weights_inplace
+from vllm_hcu.runtime_compat.step5 import is_step5_config
 
 import os
 from typing import TYPE_CHECKING
@@ -29,6 +30,39 @@ if TYPE_CHECKING:
 
 _EPLB_TOUCHED_LOAD = os.environ.get("VLLM_EPLB_TOUCHED_LOAD", "0") == "1"
 _EPLB_DUMP_PATH = os.environ.get("VLLM_EPLB_DUMP_PATH", "")
+
+
+def _rank_load_imbalance(
+    mapping: torch.Tensor,
+    logical_loads: torch.Tensor,
+    ep_size: int,
+    *,
+    layerwise: bool,
+) -> float:
+    mapping = mapping.to(device=logical_loads.device, dtype=torch.long)
+    replica_counts = torch.zeros_like(logical_loads)
+    replica_counts.scatter_add_(
+        dim=1, index=mapping, src=torch.ones_like(mapping, dtype=logical_loads.dtype)
+    )
+    loads_per_replica = torch.gather(
+        logical_loads / replica_counts.clamp_min(1), dim=1, index=mapping
+    )
+    layer_rank_loads = loads_per_replica.reshape(
+        logical_loads.shape[0], ep_size, -1
+    )
+    if layerwise:
+        # Step5 accounts for each layer waiting for its slowest EP rank.
+        loads_per_rank = layer_rank_loads.sum(dim=2)
+        mean_load = loads_per_rank.mean(dim=1).sum()
+        max_load = loads_per_rank.max(dim=1).values.sum()
+    else:
+        # Preserve the upstream placement metric for other models.
+        loads_per_rank = layer_rank_loads.sum(dim=(0, 2))
+        mean_load = loads_per_rank.mean()
+        max_load = loads_per_rank.max()
+    if mean_load == 0:
+        return 1.0
+    return (max_load / mean_load).item()
 
 
 def step(
@@ -322,43 +356,21 @@ def rearrange(
                 logical_loads = global_expert_load_window.float()
                 ep_size = ep_group.size()
 
-                def rank_load_imbalance(
-                    mapping: torch.Tensor,
-                    logical_loads: torch.Tensor = logical_loads,
-                    ep_size: int = ep_size,
-                ) -> float:
-                    mapping = mapping.to(
-                        device=logical_loads.device,
-                        dtype=torch.long,
-                    )
-                    replica_counts = torch.zeros_like(logical_loads)
-                    replica_counts.scatter_add_(
-                        dim=1,
-                        index=mapping,
-                        src=torch.ones_like(mapping, dtype=logical_loads.dtype),
-                    )
-                    loads_per_replica = torch.gather(
-                        logical_loads / replica_counts.clamp_min(1),
-                        dim=1,
-                        index=mapping,
-                    )
-                    # Layers synchronize at the EP combine, so each layer
-                    # costs its slowest rank: compare per-layer maxima
-                    # (the inverse of the logged balancedness) rather than
-                    # loads summed over layers, which average out.
-                    loads_per_rank = loads_per_replica.reshape(
-                        logical_loads.shape[0], ep_size, -1
-                    ).sum(dim=2)
-                    mean_load = loads_per_rank.mean(dim=1).sum()
-                    if mean_load == 0:
-                        return 1.0
-                    max_load = loads_per_rank.max(dim=1).values.sum()
-                    return (max_load / mean_load).item()
-
-                current_imbalance = rank_load_imbalance(
-                    eplb_model_state.physical_to_logical_map
+                layerwise = is_step5_config(
+                    getattr(eplb_model_state.model, "config", None)
                 )
-                proposed_imbalance = rank_load_imbalance(new_physical_to_logical_map)
+                current_imbalance = _rank_load_imbalance(
+                    eplb_model_state.physical_to_logical_map,
+                    logical_loads,
+                    ep_size,
+                    layerwise=layerwise,
+                )
+                proposed_imbalance = _rank_load_imbalance(
+                    new_physical_to_logical_map,
+                    logical_loads,
+                    ep_size,
+                    layerwise=layerwise,
+                )
                 relative_improvement = (
                     current_imbalance - proposed_imbalance
                 ) / current_imbalance

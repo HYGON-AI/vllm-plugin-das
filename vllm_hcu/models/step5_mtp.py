@@ -222,6 +222,7 @@ class Step5MultiTokenPredictor(nn.Module):
         )
 
         self.logits_processor = LogitsProcessor(config.vocab_size)
+        self.logits_processor._step5_skinny_lm_head = True
 
     def _layer(self, spec_step_idx: int) -> Step5MultiTokenPredictorLayer:
         idx = spec_step_idx % self.num_mtp_layers

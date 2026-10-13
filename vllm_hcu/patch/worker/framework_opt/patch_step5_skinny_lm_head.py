@@ -36,7 +36,10 @@ def apply_to_module(module: ModuleType) -> bool:
 
     @functools.wraps(original)
     def apply_head(self, lm_head, hidden_states, embedding_bias=None):
-        if self.head_dtype is None or self.head_dtype == hidden_states.dtype:
+        # Only processors created by the Step5 models opt into this kernel.
+        if getattr(self, "_step5_skinny_lm_head", False) and (
+            self.head_dtype is None or self.head_dtype == hidden_states.dtype
+        ):
             from vllm_hcu.model_executor.layers import skinny_lm_head
 
             if (

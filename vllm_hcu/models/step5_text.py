@@ -704,8 +704,20 @@ class Step5Attention(nn.Module):
             from vllm_hcu.platforms import envs as henvs
         except ImportError:
             return
+        # The fused GEMM bypasses both linear methods and their bias handling.
+        # Keep those methods for biased or incompatible projections.
+        if self.qkv_proj.bias is not None or self.g_proj.bias is not None:
+            return
         wq, wg = self.qkv_proj.weight, self.g_proj.weight
-        if not henvs.VLLM_USE_NN or wq.dim() != 2 or wq.shape[0] != wg.shape[0]:
+        if (
+            not henvs.VLLM_USE_NN
+            or wq.dim() != 2
+            or wg.dim() != 2
+            or wq.shape[0] != wg.shape[0]
+            or wq.dtype != wg.dtype
+            or wq.device != wg.device
+            or wq.dtype not in (torch.bfloat16, torch.float16)
+        ):
             return
         nq = wq.shape[1]
         fused = torch.empty(
@@ -1529,6 +1541,7 @@ class Step5ForCausalLM(nn.Module, SupportsPP, MixtureOfExperts):
     ):
         super().__init__()
         config = vllm_config.model_config.hf_config
+        self.config = config
         self.model = Step5Model(
             vllm_config=vllm_config, prefix=maybe_prefix(prefix, "model")
         )
@@ -1540,6 +1553,7 @@ class Step5ForCausalLM(nn.Module, SupportsPP, MixtureOfExperts):
                 prefix=maybe_prefix(prefix, "lm_head"),
             )
             self.logits_processor = LogitsProcessor(config.vocab_size)
+            self.logits_processor._step5_skinny_lm_head = True
         else:
             self.lm_head = PPMissingLayer()
 
