@@ -237,6 +237,7 @@ _CORE_CALLBACKS: tuple[_CallbackSpec, ...] = (
 _OP_CALLBACKS: tuple[_CallbackSpec, ...] = (
     _CallbackSpec(_adapter("op_opt", "patch_attention_layer")),
     _CallbackSpec(_adapter("op_opt", "patch_attention_exports")),
+    _CallbackSpec(_adapter("op_opt", "patch_gemma4_attention")),
     _CallbackSpec(_adapter("op_opt", "patch_attention_backend")),
     _CallbackSpec(_adapter("op_opt", "patch_attention_backend_utils")),
     _CallbackSpec(_adapter("op_opt", "patch_triton_unified_attention")),
