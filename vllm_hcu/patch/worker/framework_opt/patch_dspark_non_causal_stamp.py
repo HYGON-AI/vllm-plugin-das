@@ -294,7 +294,7 @@ def _self_kv_cache_config(args) -> object:
     return getattr(args[0], "kv_cache_config", None) if args else None
 
 
-def _wrap_class(cls: type, target: str) -> bool:
+def _wrap_class(cls: type, target: str, require_causal: bool = False) -> bool:
     own = vars(cls).get(_METHOD)
     if own is None:
         return False
@@ -307,6 +307,14 @@ def _wrap_class(cls: type, target: str) -> bool:
         raise PatchCompatibilityError(f"{target} is not callable")
     original = own
     resolve_causal = _make_signature_resolver(original, "causal")
+    if require_causal and resolve_causal is None:
+        # Auto-wrapped strangers (hook path / late-arm walk) whose override
+        # has NO ``causal`` parameter: their causal semantics are unknown.
+        # Defaulting to False would silently stamp CAUSAL verify builds as
+        # non-causal drafts and mis-flatten their attention rows (review R3
+        # P2 #1).  Leave them unwrapped: an unlabeled builder falls back to
+        # the per-row causal handling -- correct, only slower.
+        return False
 
     @functools.wraps(original)
     def hcu_build_draft_attn_metadata(*args, **kwargs):
@@ -325,7 +333,7 @@ def _wrap_class(cls: type, target: str) -> bool:
 def apply_to_module(module: ModuleType) -> bool:
     spec = load_exact_module(TARGET_MODULE, module)
     # Wrap every class in the module that defines the producer, so subclass
-    # overrides (dflash/dspark style) cannot shadow the stamp.
+    # overrides in THIS module cannot shadow the stamp.
     candidates = [
         (name, obj)
         for name, obj in vars(spec).items()
@@ -344,9 +352,121 @@ def apply_to_module(module: ModuleType) -> bool:
         return False
     for name, cls in candidates:
         _wrap_class(cls, f"{TARGET_MODULE}.{name}.{_METHOD}")
+    _arm_subclass_override_guard(spec)
     _wrap_optional_capture_path()
     setattr(spec, _MARKER, True)
     return True
+
+
+# USER MODULES (review 2026-10-13 P1 #1): DFlash overrides
+# ``_build_draft_attn_metadata`` in its OWN module -- at fork 877e6996
+# dflash/speculator.py:276 is the only such override (autoregressive/
+# eagle/gemma4/mtp do not override); the base scan above only sees the
+# shared base module, so dispatch through a subclass override bypassed the
+# stamp entirely.  A factory-setattr fix is NOT viable: model_runner.py
+# imports init_speculator at module top, so by the time the patch arms,
+# the runner already holds the ORIGINAL function object and re-binding the
+# module attribute changes nothing.  This hook instead rides Python
+# itself: when the patch's post-import callback fires for the base
+# module, every descendant class is created LATER (its module imports the
+# base first), and the (implicit-classmethod) hook fires at class-body
+# creation.  It is installed under the literal dunder name so subclass
+# creation resolves it through the MRO without any conversion; chained
+# overrides call super().__init_subclass__ so the guard propagates
+# through every inheritance level.  Known limits (accepted, documented):
+# an intermediate class defining a custom __init_subclass__ WITHOUT
+# calling super() cuts descendants off the hook, and a producer setattr'ed
+# onto a class AFTER creation never fires anything.  Overrides without a
+# ``causal`` parameter are left unwrapped (unknown semantics must not be
+# stamped non-causal by default -- review R3 P2 #1).
+_HOOK_NAME = "__init_subclass__"
+
+
+def _make_override_hook(host: type, previous: object | None):
+    """Per-host __init_subclass__ guard (classmethod payload).
+
+    A naive ``super(cls, cls).__init_subclass__`` forward recurses forever
+    when the resolved entry is ANOTHER armed host on the same MRO.  The
+    forward order instead: (1) the payload UNSEALED at arm time (a
+    third-party hook already living in the host dict) keeps the chain as
+    the next link -- it must not be silently discarded; (2) with nothing
+    pre-existing, walk cls.__mro__ after ``host``, skip armed payloads, and
+    invoke the first third-party hook found; (3) fall through to object's.
+    """
+
+    def _hcu_override_hook(cls: type, **kwargs: object) -> None:
+        own = vars(cls).get(_METHOD)
+        if own is not None:
+            target = f"{cls.__module__}.{cls.__qualname__}.{_METHOD}"
+            # require_causal: auto-wrapped overrides without a ``causal``
+            # parameter keep their original (unlabeled) behavior instead of
+            # being guessed non-causal -- see _wrap_class (review R3 P2 #1).
+            _wrap_class(cls, target, require_causal=True)
+        if previous is not None:
+            fn = getattr(previous, "__func__", previous)
+            if not getattr(fn, _WRAPPER, False):
+                fn(cls, **kwargs)
+                return
+        mro = cls.__mro__
+        try:
+            start = mro.index(host) + 1
+        except ValueError:  # host no longer in the MRO: scan from the top
+            start = 0
+        for base in mro[start:]:
+            entry = vars(base).get(_HOOK_NAME)
+            if entry is None:
+                continue
+            fn = getattr(entry, "__func__", entry)
+            if getattr(fn, _WRAPPER, False):
+                continue  # another armed host: forward past it
+            fn(cls, **kwargs)
+            return
+        # mro[start:] always contains object, whose ``__init_subclass__``
+        # descriptor the loop resolves and calls above; reaching here means
+        # nothing was found -- a no-op terminal is correct (review R2).
+
+    setattr(_hcu_override_hook, _WRAPPER, True)
+    return _hcu_override_hook
+
+
+def _arm_subclass_override_guard(spec: ModuleType) -> bool:
+    armed_any = False
+    roots: list[type] = []
+    for obj in vars(spec).values():
+        if not isinstance(obj, type) or _METHOD not in vars(obj):
+            continue
+        current = vars(obj).get(_HOOK_NAME)
+        if getattr(getattr(current, "__func__", None), _WRAPPER, False):
+            continue  # already armed on this class
+        # The conversion to an implicit classmethod happens ONLY for a
+        # __init_subclass__ entry in a class NAMESPACE at creation; a
+        # setattr'ed plain function would be resolved UNBOUND by subclass
+        # creation (TypeError: missing cls).  Store the classmethod form.
+        setattr(obj, _HOOK_NAME, classmethod(_make_override_hook(obj, current)))
+        armed_any = True
+        roots.append(obj)
+    # Late arm (review follow-up R2 #1a): the post-import callback ALSO
+    # fires immediately when the base module is already imported, and the
+    # subclass modules may be imported by then too -- those live overrides
+    # predate the hook, so class creation will never re-fire for them and
+    # they would stay unguarded forever.  Wrap every descendant override in
+    # place.  ``_wrap_class`` is idempotent and ``__subclasses__`` holds
+    # only live classes, so the walk is safe to repeat.
+    seen = {id(root) for root in roots}
+    stack = [child for root in roots for child in root.__subclasses__()]
+    while stack:
+        cls = stack.pop()
+        if id(cls) in seen:
+            continue
+        seen.add(id(cls))
+        if _METHOD in vars(cls):
+            # Same require_causal rationale as the hook path above.
+            _wrap_class(
+                cls, f"{cls.__module__}.{cls.__qualname__}.{_METHOD}",
+                require_causal=True,
+            )
+        stack.extend(cls.__subclasses__())
+    return armed_any
 
 
 # The FULL cudagraph capture path builds draft metadata through the dflash

@@ -138,9 +138,12 @@ def test_forward_keys_row_semantics_on_the_producer_stamp():
     import inspect
 
     src = inspect.getsource(HcuTritonMLAImpl.forward_mqa)
-    assert NON_CAUSAL_DRAFT_STAMP in src
+    # forward_mqa references the stamp by NAME (imported constant), so assert
+    # the name in the source and pin the constant's VALUE separately.
+    assert NON_CAUSAL_DRAFT_STAMP == "_vllm_hcu_non_causal_draft"
+    assert "NON_CAUSAL_DRAFT_STAMP" in src
     assert "expand_causal_rows" in src
-    stamp_pos = src.index(NON_CAUSAL_DRAFT_STAMP)
+    stamp_pos = src.index("NON_CAUSAL_DRAFT_STAMP")
     flatten_pos = src.index("flatten_non_causal_rows")
     expand_pos = src.index("expand_causal_rows")
     assert stamp_pos < flatten_pos < expand_pos

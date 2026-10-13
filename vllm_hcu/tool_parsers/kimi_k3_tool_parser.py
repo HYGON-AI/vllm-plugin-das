@@ -38,6 +38,7 @@ from collections.abc import Sequence
 
 import regex as re
 from openai.types.responses import ToolChoiceFunction
+from vllm.entrypoints.chat_utils import make_tool_call_id
 
 from vllm.entrypoints.openai.chat_completion.protocol import (
     ChatCompletionNamedToolChoiceParam,
@@ -61,12 +62,49 @@ logger = init_logger(__name__)
 
 _O, _C, _S = r"<\|open\|>", r"<\|close\|>", r"<\|sep\|>"
 _TEXT_UNTIL_SEP = r"(?:(?!" + _S + r").)*?"
+# Literal marker fragments for the whitespace-tolerant holdback helper.
+_OO, _CO, _SS = "<|open|>", "<|close|>", "<|sep|>"
 
 
 def _partial_tag_overlap(text: str, tag: str) -> int:
     max_len = min(len(text), len(tag) - 1)
     for n in range(max_len, 0, -1):
         if text.endswith(tag[:n]):
+            return n
+    return 0
+
+
+def _marker_holdback(text: str, head: str, word: str, tail: str) -> int:
+    """Longest suffix that may still grow into a WHITESPACE-TOLERANT marker.
+
+    The compiled marker regexes accept optional whitespace around the word
+    (``<|close|> response <|sep|>``); a chunk boundary can land inside that
+    shape (e.g. current ends at ``<|close|> ``), and the canonical-string
+    overlap then sees nothing -- the partial marker would leak as content
+    (review 2026-10-13 P2).  This check mirrors the same whitespace
+    tolerance for suffixes: head (+spaces), head + word PREFIX, head + word
+    (+spaces), head + word + TAIL PREFIX.  Canonical no-space prefixes are
+    covered by :func:`_partial_tag_overlap` first.
+    """
+
+    esc_head, esc_word = re.escape(head), re.escape(word)
+    # "+8" slack: bounding window for whitespace runs around the word.
+    max_n = min(len(text), len(head) + len(word) + len(tail) + 8)
+    for n in range(max_n, 0, -1):
+        s = text[-n:]
+        if re.fullmatch(esc_head + r"\s*", s):
+            return n
+        m = re.fullmatch(esc_head + r"(\s*)([A-Za-z]*)", s)
+        if m is not None and len(m[2]) < len(word) and word.startswith(m[2]):
+            return n
+        if re.fullmatch(esc_head + r"\s*" + esc_word + r"\s*", s):
+            return n
+        # Tail prefix group ``<[|a-z]*``: marker tails start ``<|`` + ASCII
+        # word chars, so the group must cross the ``|`` (review follow-up
+        # R2: the earlier ``<[^|]*`` could never match past the pipe and
+        # leaked suffixes like ``<|se`` as content).
+        m = re.fullmatch(esc_head + r"\s*" + esc_word + r"\s*(<[|a-z]*)", s)
+        if m is not None and len(m[1]) < len(tail) and tail.startswith(m[1]):
             return n
     return 0
 
@@ -88,6 +126,7 @@ class KimiK3ToolParser(ToolParser):
         self.tools_close = "<|close|>tools<|sep|>"
         self.response_open = "<|open|>response<|sep|>"
         self.response_close = "<|close|>response<|sep|>"
+        self.message_close = "<|close|>message<|sep|>"
 
         # Regexes operate on detokenized text. The XTML markers reach us as the
         # literal strings <|open|>/<|close|>/<|sep|>. adjust_request keeps them
@@ -227,7 +266,6 @@ class KimiK3ToolParser(ToolParser):
         """
         call_attrs = self._attrs(attrs)
         tool_name = call_attrs.get("tool", "")
-        tool_index = call_attrs.get("index", "")
         arguments: dict = {}
         for arg_match in self._arg_re.finditer(body):
             arg_attrs = self._attrs(arg_match["attrs"])
@@ -243,14 +281,12 @@ class KimiK3ToolParser(ToolParser):
                     arguments[key] = raw_value
         if not tool_name:
             return None
-        tool_call_id = tool_name
-        if tool_index:
-            try:
-                tool_call_id = f"{tool_name}:{int(tool_index) - 1}"
-            except ValueError:
-                tool_call_id = f"{tool_name}:{tool_index}"
-        # id uses the API-side zero-based call ordinal; XTML's message index
-        # stays one-based when rendering tool result messages.
+        # Review 2026-10-13 P1: K3 restarts the XTML index at 1 in EVERY
+        # assistant turn, so ``tool:index`` collides across turns
+        # (get_weather:0 twice).  Consumers key results/traces by call id ->
+        # wrong-turn attachment.  Keep the readable name prefix but make the
+        # suffix unique per call with the wheel's generated-id fallback.
+        tool_call_id = f"{tool_name}:{make_tool_call_id()}"
         return ToolCall(
             id=tool_call_id,
             type="function",
@@ -302,17 +338,35 @@ class KimiK3ToolParser(ToolParser):
         body_start = m_open.end() if m_open is not None else 0
         m_tools = self._tools_open_re.search(current_text, body_start)
         m_rclose = self._response_close_re.search(current_text, body_start)
+        # Review 2026-10-13 P2: non-strict auto output may end with
+        # <|close|>message<|sep|> WITHOUT a response-close first (the message
+        # close is the model's turn terminator).  The non-streaming path
+        # strips it (_strip_response_content -> _message_close_re), so the
+        # streaming boundary set must include it too or the raw control
+        # marker streams to the client.
+        m_mclose = self._message_close_re.search(current_text, body_start)
         tools_start = m_tools.start() if m_tools else -1
         response_end = m_rclose.start() if m_rclose else -1
+        message_end = m_mclose.start() if m_mclose else -1
 
-        candidates = [i for i in (tools_start, response_end) if i != -1]
+        candidates = [
+            i for i in (tools_start, response_end, message_end) if i != -1
+        ]
         if candidates:
             sendable_idx = min(candidates)
         else:
+            # Holdback must consider BOTH the canonical markers and the
+            # whitespace-tolerant forms the regexes accept
+            # (review 2026-10-13 P2: '<|close|> ' / '<|close|> resp' chunks).
             overlap = max(
                 _partial_tag_overlap(current_text, self.response_open),
                 _partial_tag_overlap(current_text, self.response_close),
                 _partial_tag_overlap(current_text, self.tools_open),
+                _partial_tag_overlap(current_text, self.message_close),
+                _marker_holdback(current_text, _OO, "response", _SS),
+                _marker_holdback(current_text, _CO, "response", _SS),
+                _marker_holdback(current_text, _OO, "tools", _SS),
+                _marker_holdback(current_text, _CO, "message", _SS),
             )
             sendable_idx = len(current_text) - overlap
 
@@ -449,11 +503,13 @@ class KimiK3ToolParser(ToolParser):
         start = max(self._sent_content_idx, body_start)
         m_tools = self._tools_open_re.search(text, body_start)
         m_rclose = self._response_close_re.search(text, body_start)
+        m_mclose = self._message_close_re.search(text, body_start)
         candidates = [
             position
             for position in (
                 m_tools.start() if m_tools is not None else -1,
                 m_rclose.start() if m_rclose is not None else -1,
+                m_mclose.start() if m_mclose is not None else -1,
             )
             if position != -1
         ]

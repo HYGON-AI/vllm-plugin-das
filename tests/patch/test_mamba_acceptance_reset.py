@@ -10,6 +10,7 @@ wrong depths (fork 877e6996 resets unconditionally).
 
 from __future__ import annotations
 
+import re
 import sys
 import types
 
@@ -80,7 +81,12 @@ def test_real_module_contract():
 
     sig = inspect.signature(cls.add_request)
     assert list(sig.parameters) == ["self", "req_index", "new_req_data"]
-    assert hasattr(cls, "num_accepted_tokens_gpu") or True
+    # The reset target must EXIST on the deployed class: this patch rewinds
+    # num_accepted_tokens_gpu per slot, so a wheel without the buffer makes
+    # the whole patch a no-op (review 2026-10-13 P3: the ``or True`` made
+    # this check vacuous).  Match an ATTRIBUTE USE/ASSIGNMENT, not bare
+    # occurrences that could live in a comment or docstring (R3 #6).
+    assert re.search(r"\.num_accepted_tokens_gpu\s*=", inspect.getsource(cls))
     # the wheel reset must be align-gated (the bug this patch fixes)
     src = inspect.getsource(cls.add_request)
     assert "_align_mode" in src

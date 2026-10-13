@@ -11,6 +11,9 @@
     finished=True turn, matching the non-streaming output ('1 <').  The
     delegating parse_delta wrapper calls the parser's finish_streaming()
     only when the wheel carries the ``finished`` protocol.
+
+Review 2026-10-13 additions: unique tool call ids (#6), whitespace-
+tolerant holdback (#4), and the message-close streaming boundary (#7).
 """
 
 from __future__ import annotations
@@ -293,3 +296,99 @@ def test_live_parser_records_extractions_for_the_wrapper() -> None:
     assert parser._hcu_last_extract is not None
     assert parser._hcu_last_extract[0] == _RAW
     assert parser._hcu_last_extract[1].content == _CLEAN
+
+
+# --- review 2026-10-13: #6 unique call ids, #4 whitespace-tolerant
+# holdback, #7 message-close streaming boundary ---------------------------
+
+
+def test_tool_call_ids_stay_unique_across_turns() -> None:
+    """P1 #6: K3 restarts the XTML index every turn; ids must not collide."""
+
+    parser = _live_parser()
+    block = (
+        '<|open|>tools<|sep|>'
+        '<|open|>call tool="py" index="1"<|sep|>'
+        '<|open|>argument key="code" type="string"<|sep|>'
+        "print(1)<|close|>argument<|sep|>"
+        "<|close|>call<|sep|>"
+        "<|close|>tools<|sep|>"
+    )
+    first = parser._decode_call('tool="py" index="1"', "")
+    info = parser.extract_tool_calls(block, SimpleNamespace(tool_choice="auto"))
+    assert info.tools_called is True
+    repeat = parser.extract_tool_calls(block, SimpleNamespace(tool_choice="auto"))
+    a, b = info.tool_calls[0], repeat.tool_calls[0]
+    assert a.id.startswith("py:") and b.id.startswith("py:")
+    assert a.id != b.id, f"ids collide across turns: {a.id} vs {b.id}"
+    assert first.id.startswith("py:")
+
+
+def test_streaming_holds_whitespace_tolerant_marker_prefix() -> None:
+    """P2 #4: '<|close|> ' chunks must not leak the partial marker; the
+    whitespace-tolerant shapes the regexes accept are held back too."""
+
+    parser = _live_parser()
+    _stream(parser, "Hi<|close|> ")
+    # 'Hi' went out, the partial close marker is held
+    assert parser._sent_content_idx == 2
+
+    parser = _live_parser()
+    _stream(parser, "Hi<|close|> resp")
+    assert parser._sent_content_idx == 2
+
+    # completing the marker never re-emits any of it
+    parser = _live_parser()
+    _stream(parser, "Hi<|close|> response <|sep|>")
+    assert parser._sent_content_idx == 2
+
+
+def test_streaming_message_close_is_a_content_boundary() -> None:
+    """P2 #7: non-strict auto output may terminate with
+    <|close|>message<|sep|> WITHOUT a response close; neither the live
+    stream nor the end flush may leak that marker."""
+
+    parser = _live_parser()
+    _stream(parser, "Hi<|close|>message<|sep|>")
+    assert parser._sent_content_idx == 2
+    assert parser.finish_streaming() is None
+
+    # chunked arrival, marker split across deltas
+    parser = _live_parser()
+    _stream(
+        parser,
+        "Hi<|close|> ",
+        "Hi<|close|>message<|sep|>",
+        "Hi<|close|>message<|sep|><|open|>tools<|sep|>",
+    )
+    assert parser._sent_content_idx == 2
+    assert parser.finish_streaming() is None
+
+
+def test_marker_holdback_crosses_the_pipe_prefix() -> None:
+    """R2 #4: a chunk landing INSIDE the tail prefix ('<|', '<|se') must be
+    held; the old ``<[^|]*`` group could never cross the pipe and leaked
+    those suffixes into the content channel."""
+
+    from vllm_hcu.tool_parsers.kimi_k3_tool_parser import _marker_holdback
+
+    head, word, tail = "<|close|>", "response", "<|sep|>"
+    # the hold is the whole suffix ANCHORED AT head (branch shapes inherit
+    # the head), so the returned length covers head + word + tail-prefix
+    assert _marker_holdback("Hi<|close|> response <", head, word, tail) == len("<|close|> response <")
+    assert _marker_holdback("Hi<|close|> response <|", head, word, tail) == len("<|close|> response <|")
+    assert _marker_holdback("Hi<|close|> response <|se", head, word, tail) == len("<|close|> response <|se")
+    assert _marker_holdback("plain text done", head, word, tail) == 0
+
+
+def test_streaming_holds_tail_prefixes_inside_a_marker() -> None:
+    """Parser-level twin of the pipe-prefix holdback unit test."""
+
+    parser = _live_parser()
+    _stream(parser, "Hi<|close|> response <|se")
+    assert parser._sent_content_idx == 2
+
+    parser = _live_parser()
+    _stream(parser, "Hi<|close|> response <|", "Hi<|close|> response <|sep|>")
+    assert parser._sent_content_idx == 2
+    assert parser.finish_streaming() is None

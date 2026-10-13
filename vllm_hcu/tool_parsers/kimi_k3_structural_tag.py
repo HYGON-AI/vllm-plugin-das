@@ -18,6 +18,7 @@ framework. All XTML byte-level constants mirror
 
 from __future__ import annotations
 
+from itertools import permutations
 from typing import Any
 
 from xgrammar.openai_tool_call_schema import FunctionToolParam
@@ -77,7 +78,35 @@ def _k3_escape_attr(value: str) -> str:
 
 
 _K3_STRING_ATOM = r"(?:[^<]|<[^|])"
-"""One raw-string character: anything but the ambiguous "<|" marker prefix."""
+"""One raw-string ATOM: anything but the ambiguous "<|" marker prefix.
+
+Known boundary effects, inherited deliberately from the fork
+(structural_tag_registry.py:395-401 -- "xgrammar's regex engine has no
+lookahead", so a 1-char consuming alternative for '<' is not expressible;
+review 2026-10-13 P2 #3 kept this behavior with this documentation):
+
+- The ``<[^|]`` branch consumes TWO characters, so the ``{min,max}``
+  quantifier counts atoms, not characters.  A value with k embedded
+  "<x" pairs (2 chars per atom) passes maxLength when
+  ``len(value) <= max + k``; worst case, ``maxLength: 1`` accepts
+  ``"<a"``.  This over-acceptance is bounded (k <= max, because the k
+  two-char atoms must still all fit) and was judged preferable to
+  dropping the length bound -- the fork added the regex because
+  unconstrained AnyText let over-long junk through.
+- A value whose run of TRAILING ``<`` characters has ODD length is not
+  representable (one ``<`` stays unpaired and the atom cannot consume a
+  lone ``<``); an even trailing run -- ``a<<``, ``x<<<<`` -- IS
+  representable, the two-char branch consumes the pairs.  The grammar
+  steers generation away from odd-trailing values instead of truncating.
+- A ``<<|`` run smuggles a literal ``<|`` into the value: the second
+  ``<`` pairs with the char after it, so ``a<<|close|>`` matches with a
+  real ``<|`` at value positions 2-3.  Inherited fork behavior.  This
+  regex can still not TERMINATE a channel: a close needs the exact
+  ``argument<|sep|>`` sequence and its ``t<|`` junction cannot be
+  produced by the atom (its ``<`` only pairs with a non-``|`` char) --
+  RegexFormat has no ``excludes`` parameter; the ``excludes`` lists on
+  the AnyText channels are a separate, additional guard.
+"""
 
 
 def _k3_bounded_string_regex(prop: dict[str, Any]) -> str | None:
@@ -86,7 +115,10 @@ def _k3_bounded_string_regex(prop: dict[str, Any]) -> str | None:
     The XTML string channel emits values raw (not JSON-quoted), so
     JSONSchemaFormat cannot enforce string constraints there; xgrammar's
     regex engine has no lookahead, so the close marker is kept unambiguous
-    by excluding the "<|" prefix from value characters.
+    by excluding the "<|" prefix from value characters.  The quantifier
+    counts ATOMS, not characters -- the two resulting boundary effects are
+    documented on :data:`_K3_STRING_ATOM` and intentionally ported (review
+    2026-10-13 P2 #3).
 
     Returns a regex for the value, or None to keep permissive AnyText.
     """
@@ -193,14 +225,81 @@ def _k3_arguments_block(parameters: dict[str, Any] | bool) -> Any:
         if isinstance(parameters.get(defs_key), dict)
     }
     tags: list[TagFormat] = []
+    expressible: dict[str, TagFormat] = {}
     for key, prop in props.items():
         tag = _k3_argument_tag(key, prop, root_defs)
-        tags.append(tag if tag is not None else _k3_permissive_argument_tag())
+        if tag is not None:
+            expressible[key] = tag
+            tags.append(tag)
+        else:
+            tags.append(_k3_permissive_argument_tag())
     inner = tags[0] if len(tags) == 1 else OrFormat(elements=list(tags))
     required = parameters.get("required")
     if isinstance(required, list) and required:
+        strict = _k3_required_coverage(list(required), expressible, inner)
+        if strict is not None:
+            return strict
         return PlusFormat(content=inner)
     return StarFormat(content=inner)
+
+
+# Order-agnostic coverage of required properties explodes as K! branches,
+# K <= 3 (<= 6 permutations) stays compileable, larger schemas keep the
+# fork's one-of shape.  Cost driver is the number of ``inner`` (the full
+# Or-of-all-props) copies: K! branches x (K+1) stars each, capped here so
+# future raises of the K cap cannot silently blow up compile size
+# (review R3 P2 #2).
+_K3_MAX_STRICT_REQUIRED = 3
+_K3_MAX_COVERAGE_INNER_COPIES = 24
+
+
+def _k3_required_coverage(
+    required: list[str],
+    expressible: dict[str, TagFormat],
+    inner: Any,
+) -> Any | None:
+    """Demand at least one ``argument`` tag per schema-required property.
+
+    Review 2026-10-13 P1 #2: the portable fork shape
+    ``PlusFormat(content=OrFormat(tags))`` only demands >=1 argument tag
+    overall, so a call omitting a required parameter compiles fine and
+    surfaces downstream as a validation error.  K3 arguments are
+    order-agnostic (the renderer never fixes arg order), so true coverage
+    must allow required tags in any order AND interleaved with optional
+    extras: each permutation branch is
+    ``SequenceFormat(StarFormat(inner), <tag> per required-prop with
+    ``StarFormat(inner)`` between and around them)`` -- every required
+    property appears exactly once with the bare tag (the trailing stars of
+    ``inner`` already carry duplicates and optional extras, so a Plus
+    quantifier would be redundant ambiguity -- review R3 P2 #2), optional
+    extras may appear before, between and after them (review follow-up R2:
+    the earlier requireds-first compaction ``Seq(Plus, Plus, Star)``
+    wrongly rejected legal interleavings like ``a c b``).  Returns None
+    (caller keeps the fork shape) when coverage is not expressible: any
+    required key missing from ``properties``, mapped to a permissive tag
+    (union/unknown type -- a quantifier over it would be vacuous), when K
+    exceeds :data:`_K3_MAX_STRICT_REQUIRED`, or when the inner-copy count
+    would exceed :data:`_K3_MAX_COVERAGE_INNER_COPIES`.  Diverges from the
+    fork (structural_tag_registry.py:533) on purpose.
+    """
+
+    required = list(dict.fromkeys(required))  # dedupe, keep order
+    if not 0 < len(required) <= _K3_MAX_STRICT_REQUIRED:
+        return None
+    picked = [expressible.get(key) for key in required]
+    if any(tag is None for tag in picked):
+        return None
+    perms = list(permutations(picked))
+    if len(perms) * (len(picked) + 1) > _K3_MAX_COVERAGE_INNER_COPIES:
+        return None
+    branches = []
+    for perm in perms:
+        elements: list[Any] = [StarFormat(content=inner)]
+        for tag in perm:
+            elements.append(tag)
+            elements.append(StarFormat(content=inner))
+        branches.append(SequenceFormat(elements=elements))
+    return branches[0] if len(branches) == 1 else OrFormat(elements=branches)
 
 
 def _k3_call_tag(tool: FunctionToolParam) -> TagFormat:
@@ -232,7 +331,20 @@ def _k3_response_prefix() -> list[Any]:
 
     return [
         OptionalFormat(content=ConstStringFormat(value=_K3_RESPONSE_OPEN)),
-        TagFormat(begin="", content=AnyTextFormat(), end=_K3_RESPONSE_CLOSE),
+        # Review 2026-10-13 P2 #8: exclude the reserved "<|close|>" prefix
+        # from the response body -- deliberately diverging from the fork,
+        # whose body is an unbounded AnyTextFormat at
+        # structural_tag_registry.py:565 while the SAME file already uses
+        # excludes=[_K3_CLOSE] for every other raw channel (:479/:501).
+        # Unbounded AnyText let the model pre-terminate the response
+        # channel with a bare close marker (open-channel markers remain
+        # possible -- the exclusion covers "<|close|>" only; the fork
+        # leaves both open).
+        TagFormat(
+            begin="",
+            content=AnyTextFormat(excludes=[_K3_CLOSE]),
+            end=_K3_RESPONSE_CLOSE,
+        ),
     ]
 
 

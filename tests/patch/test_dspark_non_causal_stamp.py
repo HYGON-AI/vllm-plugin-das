@@ -446,3 +446,193 @@ def test_capture_path_present_but_shapeless_fails_loudly(monkeypatch) -> None:
     monkeypatch.setitem(sys.modules, CAPTURE_MODULE, capture)
     with pytest.raises(PatchCompatibilityError, match=CAPTURE_HELPER):
         patch_dspark_non_causal_stamp.apply_to_module(_fake_module())
+
+
+# --- review 2026-10-13 P1 #1: subclass overrides in OTHER modules --------
+
+
+class _HookMeta:
+    pass
+
+
+def test_override_defined_after_apply_is_wrapped_by_hook() -> None:
+    """A dflash-style override created AFTER the patch still gets stamped.
+
+    The base-module scan cannot see subclasses defined in their own modules;
+    the __init_subclass__ guard must wrap them at class creation.  The
+    override carries the fork's ``causal`` parameter shape.
+    """
+
+    base = _fake_module()
+    assert patch_dspark_non_causal_stamp.apply_to_module(base) is True
+
+    class LateDFlashStyle(SubSpeculator):
+        def _build_draft_attn_metadata(
+            self, *args, causal=False, **kwargs
+        ):  # own-module dflash shape (fork speculator.py:276)
+            return [_HookMeta()]
+
+    stamped = LateDFlashStyle()._build_draft_attn_metadata()
+    assert len(stamped) == 1
+    assert getattr(stamped[0], NON_CAUSAL_DRAFT_STAMP) is True
+
+
+def test_hook_skips_overrides_without_a_causal_parameter() -> None:
+    """R3 #1: the guard auto-wraps strangers; an override with NO ``causal``
+    parameter has unknown causal semantics and must stay UNLABELED (falls
+    back to the causal rows) rather than being guessed non-causal."""
+
+    base = _fake_module()
+    assert patch_dspark_non_causal_stamp.apply_to_module(base) is True
+
+    class NoCausalOverride(SubSpeculator):
+        def _build_draft_attn_metadata(self, *args, **kwargs):
+            return [_HookMeta()]
+
+    own = vars(NoCausalOverride)["_build_draft_attn_metadata"]
+    assert not getattr(
+        own, patch_dspark_non_causal_stamp._WRAPPER, False
+    ), "stranger override without causal was wrapped anyway"
+    stamped = NoCausalOverride()._build_draft_attn_metadata()
+    assert getattr(stamped[0], NON_CAUSAL_DRAFT_STAMP, None) is None
+
+
+def test_hook_chain_wraps_grandchild_override_too() -> None:
+    """Two-level chains (dspark extends dflash) keep working."""
+
+    base = _fake_module()
+    assert patch_dspark_non_causal_stamp.apply_to_module(base) is True
+
+    class LateDFlash(BaseSpeculator):
+        def _build_draft_attn_metadata(self, *args, causal=False, **kwargs):
+            return [_HookMeta()]
+
+    class LateDSpark(LateDFlash):
+        pass  # inherits the override
+
+    assert getattr(LateDSpark()._build_draft_attn_metadata()[0], NON_CAUSAL_DRAFT_STAMP) is True
+    # adding an override at the grandchild level is also guarded
+    class LateDSparkOverride(LateDFlash):
+        def _build_draft_attn_metadata(self, *args, causal=False, **kwargs):
+            return [_HookMeta()]
+
+    assert getattr(LateDSparkOverride()._build_draft_attn_metadata()[0], NON_CAUSAL_DRAFT_STAMP) is True
+
+
+def test_hook_default_and_explicit_causal_semantics() -> None:
+    """Fork shape: dflash override defaults to causal=False (stamped); an
+    explicit causal=True through the hook path stays unstamped."""
+
+    base = _fake_module()
+    assert patch_dspark_non_causal_stamp.apply_to_module(base) is True
+
+    class LateDefaultFalse(BaseSpeculator):
+        def _build_draft_attn_metadata(self, *args, causal=False, **kwargs):
+            return _HookMeta()
+
+    assert getattr(LateDefaultFalse()._build_draft_attn_metadata(), NON_CAUSAL_DRAFT_STAMP) is True
+    assert getattr(LateDefaultFalse()._build_draft_attn_metadata(causal=True), NON_CAUSAL_DRAFT_STAMP, None) is None
+    assert getattr(LateDefaultFalse()._build_draft_attn_metadata(causal=False), NON_CAUSAL_DRAFT_STAMP) is True
+
+
+def test_hook_stores_classmethod_form_and_is_idempotent() -> None:
+    """A setattr'ed plain function resolves UNBOUND on subclass creation
+    (TypeError: missing cls); the stored payload is a classmethod, and a
+    second apply leaves the installed guard untouched."""
+
+    base = _fake_module()
+    assert patch_dspark_non_causal_stamp.apply_to_module(base) is True
+    guard = vars(BaseSpeculator)["__init_subclass__"]
+    assert isinstance(guard, classmethod)
+    assert patch_dspark_non_causal_stamp.apply_to_module(base) is False
+    assert vars(BaseSpeculator)["__init_subclass__"] is guard
+
+
+def test_third_party_init_subclass_stays_in_the_chain() -> None:
+    """A grandparent-defined custom hook (not ours) keeps receiving the
+    chain through the forward logic."""
+
+    module = ModuleType(patch_dspark_non_causal_stamp.TARGET_MODULE)
+
+    class PartnerSpeculator:
+        seen = []
+
+        def __init_subclass__(cls, tag=None, **kwargs):
+            PartnerSpeculator.seen.append((cls, tag))
+            super().__init_subclass__(**kwargs)
+
+        def _build_draft_attn_metadata(self, *args, **kwargs):
+            return {"g": _Meta()}
+
+    module.DraftModelSpeculator = PartnerSpeculator
+    assert patch_dspark_non_causal_stamp.apply_to_module(module) is True
+
+    class PartnerChild(PartnerSpeculator, tag="x"):
+        def _build_draft_attn_metadata(self, *args, causal=False, **kwargs):
+            return [_HookMeta()]
+
+    assert PartnerSpeculator.seen == [(PartnerChild, "x")]
+    stamped = PartnerChild()._build_draft_attn_metadata()
+    assert getattr(stamped[0], NON_CAUSAL_DRAFT_STAMP) is True
+
+
+def test_late_arm_wraps_already_created_subclass_override() -> None:
+    """R2 #1a: the post-import callback also fires for an ALREADY-imported
+    base module; subclass modules may have been imported by then, so their
+    overrides predate the hook.  The arm must wrap live descendants in
+    place.  Uses a PRIVATE class hierarchy: the shared module-level fakes
+    are armed by earlier tests and would mask the late-arm path.  The
+    overrides carry the fork's ``causal`` shape so the guard accepts them
+    (R3 #1: parameterless overrides stay unwrapped)."""
+
+    module = ModuleType(patch_dspark_non_causal_stamp.TARGET_MODULE)
+
+    class PrivateBase:
+        def _build_draft_attn_metadata(self, *args, **kwargs):
+            return {"g0": _Meta()}
+
+    class PrivateEarlyOverride(PrivateBase):  # created BEFORE the arm
+        def _build_draft_attn_metadata(self, *args, causal=False, **kwargs):
+            return [_HookMeta()]
+
+    module.DraftModelSpeculator = PrivateBase
+    assert patch_dspark_non_causal_stamp.apply_to_module(module) is True
+
+    stamped = PrivateEarlyOverride()._build_draft_attn_metadata()
+    assert len(stamped) == 1
+    assert getattr(stamped[0], NON_CAUSAL_DRAFT_STAMP) is True
+    # the in-place wrap is marked, so a re-arm stays idempotent
+    own = vars(PrivateEarlyOverride)["_build_draft_attn_metadata"]
+    assert getattr(
+        own, patch_dspark_non_causal_stamp._WRAPPER, False
+    ), "in-place late-arm wrap missing its marker"
+
+    # a subclass created afterwards that DEFINES its own override rides
+    # the hook: the class-creation fires the armed guard and wraps it
+    class PrivateLate(PrivateEarlyOverride):
+        def _build_draft_attn_metadata(self, *args, causal=False, **kwargs):
+            return [_HookMeta()]
+
+    own_late = vars(PrivateLate)["_build_draft_attn_metadata"]
+    assert getattr(
+        own_late, patch_dspark_non_causal_stamp._WRAPPER, False
+    ), "post-arm override was not wrapped by the hook"
+    late = PrivateLate()._build_draft_attn_metadata()
+    assert getattr(late[0], NON_CAUSAL_DRAFT_STAMP) is True
+
+    # a STRANGER created after the arm without a causal parameter must be
+    # left alone by both the hook and the idempotent re-arm walk (R3 #1)
+    class PrivateStranger(PrivateBase):
+        def _build_draft_attn_metadata(self, *args, **kwargs):
+            return [_HookMeta()]
+
+    assert not getattr(
+        vars(PrivateStranger)["_build_draft_attn_metadata"],
+        patch_dspark_non_causal_stamp._WRAPPER,
+        False,
+    )
+    assert getattr(
+        PrivateStranger()._build_draft_attn_metadata()[0],
+        NON_CAUSAL_DRAFT_STAMP,
+        None,
+    ) is None

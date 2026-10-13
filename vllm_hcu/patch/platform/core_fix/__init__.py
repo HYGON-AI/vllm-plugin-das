@@ -57,7 +57,6 @@ _ORDERED_ADAPTERS = (
     patch_kimi_k3_model_config,
     patch_kimi_k3_mtp_config,
     patch_kimi_k3_dspark_speculative_arch,
-    patch_kimi_k3_structural_tag,
     patch_slimquant_registry,
     patch_hy_v4_model_arch_config,
     patch_hy_v4_mtp_config,
@@ -68,6 +67,7 @@ _ORDERED_ADAPTERS = (
     register_hy_v4_tool_parser,
     register_kimi_k3_tool_parser,
     patch_delegating_tool_content,
+    patch_kimi_k3_structural_tag,
     patch_hy_v3_reasoning_parser,
     patch_hy_v3_tool_parser,
 )
