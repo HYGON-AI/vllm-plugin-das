@@ -13,7 +13,7 @@ export VLLM_HCU_GEMMA4_USE_FA=0
 export VLLM_HCU_GEMMA4_USE_FA=1
 ```
 
-Read the switch at model initialization; restart the service to change it.
+Read the switch at plugin model registration; restart the service to change it.
 `HCU_FLASH_ATTN_Q5` is obsolete and does not affect routing. A conflicting
 explicit backend setting fails at initialization instead of being overridden.
 
@@ -29,12 +29,14 @@ For route diagnostics, set `HCU_DEBUG_ATTN_Q_LEN=1` before startup and look for
 `[GEMMA4_FA_ROUTE]`. Capture logs report the captured path; full graph replay
 does not re-execute the Python logger. Disable diagnostics for performance runs.
 
-The maintained plugin binds a model-local Attention subclass after importing
+The existing `register_model()` entry point registers a post-import callback
+only when enabled. That callback binds a model-local Attention subclass after importing
 `vllm.model_executor.models.gemma4`. The subclass supplies `attn_backend` through
 the existing Attention constructor. It does not patch the shared Attention
 class or write upstream source files.
 
-A private helper in the plugin's `models/gemma4/attention.py` gathers paged KV into temporary
+All Gemma4-specific implementation and registration live in `models/gemma4.py`.
+Its private helper gathers paged KV into temporary
 contiguous K/V and calls the HCU native `pagedkv_to_contiguouskv` and
 `varlen_fwd` entry points. It does not modify or globally replace
 `flash_attn_interface.py`. It requires the HCU Flash Attention extension ABI

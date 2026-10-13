@@ -8,7 +8,7 @@ from types import ModuleType, SimpleNamespace
 import pytest
 import torch
 
-from vllm_hcu.models.gemma4.attention import _gemma4_flash_attention
+from vllm_hcu.models.gemma4 import _gemma4_flash_attention
 
 
 @pytest.mark.parametrize(

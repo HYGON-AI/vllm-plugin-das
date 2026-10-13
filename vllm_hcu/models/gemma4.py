@@ -1,10 +1,12 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright (c) 2026 Hygon Information Technology Co., Ltd.
-"""Gemma4 full-attention FA path using Triton metadata and cache management."""
+"""Opt-in Gemma4 FA backend and model-local registration."""
 
 from __future__ import annotations
 
+import functools
 import os
+from types import ModuleType
 
 import torch
 from vllm import envs
@@ -255,3 +257,52 @@ class Gemma4FAAttentionImpl(TritonAttentionImpl):
             block_table=attn_metadata.block_table,
         )
         return output
+
+
+_GEMMA4_MODULE = "vllm.model_executor.models.gemma4"
+_GEMMA4_PATCH_ID = "model.gemma4.fa_attention"
+_GEMMA4_MARKER = "_vllm_hcu_gemma4_attention_injection"
+
+
+def _use_gemma4_fa(module: ModuleType) -> bool:
+    """Bind only Gemma4's local Attention; its caller passes three positional args."""
+    if module.__name__ != _GEMMA4_MODULE:
+        raise ValueError(f"Expected {_GEMMA4_MODULE}, got {module.__name__}")
+    original = module.Attention
+    if getattr(original, _GEMMA4_MARKER, False):
+        return False
+
+    class Gemma4Attention(original):
+        @functools.wraps(original.__init__)
+        def __init__(self, num_heads, head_size, scale, **kwargs):
+            if (
+                head_size == 512
+                and kwargs.get("per_layer_sliding_window") is None
+                and kwargs.get("attn_backend") is None
+            ):
+                from vllm.config import get_current_vllm_config
+
+                backend = get_current_vllm_config().attention_config.backend
+                if getattr(backend, "name", backend) not in (None, "TRITON_ATTN"):
+                    raise ValueError(
+                        "VLLM_HCU_GEMMA4_USE_FA=1 conflicts with attention "
+                        f"backend {backend!r}; requires Triton-compatible metadata."
+                    )
+                kwargs["attn_backend"] = Gemma4FAAttentionBackend
+            super().__init__(num_heads, head_size, scale, **kwargs)
+
+    setattr(Gemma4Attention, _GEMMA4_MARKER, True)
+    module.Attention = Gemma4Attention
+    return True
+
+
+def register_attention():
+    """Called by the HCU model-registration entry point only when opted in."""
+    from vllm_hcu.patch import register_post_import
+
+    return register_post_import(
+        _GEMMA4_PATCH_ID,
+        _GEMMA4_MODULE,
+        _use_gemma4_fa,
+        targets=f"{_GEMMA4_MODULE}.Attention",
+    )

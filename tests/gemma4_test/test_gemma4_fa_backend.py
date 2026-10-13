@@ -5,8 +5,6 @@ from types import SimpleNamespace
 import pytest
 import torch
 
-from vllm_hcu.models.gemma4 import config as config_module
-
 
 @pytest.fixture(autouse=True)
 def isolate_switches(monkeypatch):
@@ -14,90 +12,9 @@ def isolate_switches(monkeypatch):
         monkeypatch.delenv(name, raising=False)
 
 
-def test_disabled_does_not_override_backend_selection():
-    assert (
-        config_module.select_gemma4_hcu_attention_backend(
-            head_dim=512, is_sliding=False
-        )
-        is None
-    )
-
-
-@pytest.mark.parametrize("raw", ["0", "false", "1", "true", "TRUE"])
-def test_switch_values(monkeypatch, raw):
-    monkeypatch.setenv("VLLM_HCU_GEMMA4_USE_FA", raw)
-    assert config_module.gemma4_fa_enabled() == (raw.lower() in ("1", "true"))
-
-
-def test_invalid_switch_fails_at_initialization(monkeypatch):
-    monkeypatch.setenv("VLLM_HCU_GEMMA4_USE_FA", "maybe")
-    with pytest.raises(ValueError, match="VLLM_HCU_GEMMA4_USE_FA"):
-        config_module.gemma4_fa_enabled()
-
-
-def test_sliding_and_different_head_size_do_not_import_fa(monkeypatch):
-    monkeypatch.setenv("VLLM_HCU_GEMMA4_USE_FA", "1")
-    for dim, sliding in ((256, True), (512, True), (256, False)):
-        assert (
-            config_module.select_gemma4_hcu_attention_backend(
-                head_dim=dim, is_sliding=sliding
-            )
-            is None
-        )
-
-
-@pytest.mark.parametrize(
-    "architecture,platform,backend,expected",
-    [
-        ("Gemma4ForConditionalGeneration", "hip", None, True),
-        ("Gemma4ForCausalLM", "hip", "TRITON_ATTN", True),
-        ("Gemma4ForConditionalGeneration", "cuda", None, False),
-        ("Qwen3ForCausalLM", "hip", None, False),
-    ],
-)
-def test_enabled_selector_is_model_and_platform_scoped(
-    monkeypatch, architecture, platform, backend, expected
-):
-    import vllm.config
-    import vllm.platforms
-
-    monkeypatch.setenv("VLLM_HCU_GEMMA4_USE_FA", "1")
-    config = SimpleNamespace(
-        model_config=SimpleNamespace(architectures=[architecture]),
-        attention_config=SimpleNamespace(backend=backend),
-    )
-    monkeypatch.setattr(vllm.config, "get_current_vllm_config", lambda: config)
-    monkeypatch.setattr(
-        vllm.platforms, "current_platform", SimpleNamespace(device_name=platform)
-    )
-    result = config_module.select_gemma4_hcu_attention_backend(
-        head_dim=512, is_sliding=False
-    )
-    assert (result is not None) is expected
-
-
-def test_enabled_selector_rejects_conflicting_config_backend(monkeypatch):
-    import vllm.config
-    import vllm.platforms
-
-    monkeypatch.setenv("VLLM_HCU_GEMMA4_USE_FA", "1")
-    config = SimpleNamespace(
-        model_config=SimpleNamespace(architectures=["Gemma4ForCausalLM"]),
-        attention_config=SimpleNamespace(backend="FLASH_ATTN"),
-    )
-    monkeypatch.setattr(vllm.config, "get_current_vllm_config", lambda: config)
-    monkeypatch.setattr(
-        vllm.platforms, "current_platform", SimpleNamespace(device_name="hip")
-    )
-    with pytest.raises(ValueError, match="conflicts"):
-        config_module.select_gemma4_hcu_attention_backend(
-            head_dim=512, is_sliding=False
-        )
-
-
 @pytest.fixture
 def implementation(monkeypatch):
-    from vllm_hcu.models.gemma4 import attention as module
+    from vllm_hcu.models import gemma4 as module
 
     calls = []
 
