@@ -177,9 +177,13 @@ class _EpFusedCombineState:
 
 _EP_COMBINE = _EpFusedCombineState()
 if _EP_FUSED_COMBINE:
-    from vllm.model_executor.layers.fused_moe.prepare_finalize import naive_dp_ep
+    from vllm_hcu.model_executor.layers.fused_moe.combine_runtime import (
+        set_finalize_combine_hook,
+    )
 
-    naive_dp_ep.set_finalize_combine_hook(_EP_COMBINE.finalize_hook)
+    # Spawn may import this runner while unpickling the quantization config,
+    # before Worker callbacks attach finalize. Keep hook state plugin-owned.
+    set_finalize_combine_hook(_EP_COMBINE.finalize_hook)
     from vllm_hcu.model_executor.layers.fused_moe import ep_fused_moe
 
     ep_fused_moe.shared_add_provider = _EP_COMBINE.shared_add
@@ -744,13 +748,10 @@ class MoERunner(MoERunnerInterface):
         except (TypeError, ValueError):
             self._supports_quanted_inputs = False
             return False
-        self._supports_quanted_inputs = (
-            any(
-                parameter.kind == inspect.Parameter.VAR_KEYWORD
-                for parameter in parameters.values()
-            )
-            or ("i_q" in parameters and "i_s" in parameters)
-        )
+        self._supports_quanted_inputs = any(
+            parameter.kind == inspect.Parameter.VAR_KEYWORD
+            for parameter in parameters.values()
+        ) or ("i_q" in parameters and "i_s" in parameters)
         return self._supports_quanted_inputs
 
     def _apply_quant_method(
@@ -1137,9 +1138,9 @@ class MoERunner(MoERunnerInterface):
 
         Returns a single tensor of combined fused and shared output (if present).
         """
-        if (
-            quanted_hidden_states is not None or topk_weights is not None
-        ) and (self.do_naive_dispatch_combine or self.moe_config.pcp_size > 1):
+        if (quanted_hidden_states is not None or topk_weights is not None) and (
+            self.do_naive_dispatch_combine or self.moe_config.pcp_size > 1
+        ):
             raise RuntimeError(
                 "HCU pre-quantized/preselected MoE inputs cannot be combined "
                 "with naive DP/EP or PCP dispatch because those auxiliary "

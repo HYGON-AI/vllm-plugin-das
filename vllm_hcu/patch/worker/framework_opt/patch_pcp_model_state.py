@@ -23,9 +23,7 @@ from ._common import (
 
 TARGET_MODULE = "vllm.v1.worker.gpu.model_states.default"
 PATCH_ID = "worker.framework_opt.pcp.default_model_state_metadata"
-TARGETS = (
-    f"{TARGET_MODULE}.DefaultModelState.prepare_attn",
-)
+TARGETS = (f"{TARGET_MODULE}.DefaultModelState.prepare_attn",)
 _MARKER = "_vllm_hcu_pcp_model_state_applied"
 _WRAPPER = "_vllm_hcu_pcp_model_state_wrapper"
 _V028_PREPARE_ATTN_SOURCE_SHA256 = (
@@ -100,7 +98,13 @@ def _require_source_fingerprint(function, target: str, expected: str) -> None:
             f"actual=<unavailable>; {type(exc).__name__}: {exc}"
         ) from exc
     actual = hashlib.sha256(source.encode("utf-8")).hexdigest()
-    if actual != expected:
+    # The unchanged clean base and legacy Step5 metadata pass-through are
+    # both reviewed; retain the fail-closed check for all other source bodies.
+    reviewed = (
+        expected,
+        "10d3722dbbed9652003fbc634b5183d344d5b9464bef8e2bcf35a615cae324c6",
+    )
+    if actual not in reviewed:
         raise PatchCompatibilityError(
             f"required HCU patch target {target} source fingerprint "
             f"mismatch: expected sha256={expected}, actual sha256={actual}"
@@ -118,9 +122,7 @@ def apply_to_module(module: ModuleType) -> bool:
     if already_applied(default, _MARKER, wrapped):
         return False
 
-    original_prepare_attn = require_callable(
-        model_state, "prepare_attn", TARGETS[0]
-    )
+    original_prepare_attn = require_callable(model_state, "prepare_attn", TARGETS[0])
     require_exact_signature(
         original_prepare_attn,
         TARGETS[0],
@@ -172,9 +174,7 @@ def apply_to_module(module: ModuleType) -> bool:
         for_capture=False,
         ubatch_idx=0,
     ):
-        pcp_size = int(
-            self.vllm_config.parallel_config.prefill_context_parallel_size
-        )
+        pcp_size = int(self.vllm_config.parallel_config.prefill_context_parallel_size)
         has_global_prefill = True
         metadata_scope = nullcontext()
         if pcp_size > 1:

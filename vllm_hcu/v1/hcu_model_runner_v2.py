@@ -11,6 +11,7 @@ import numpy as np
 import torch
 
 from vllm.config.compilation import CUDAGraphMode
+from vllm_hcu.runtime_compat.step5 import is_step5_config
 from vllm.logger import init_logger
 from vllm.v1.worker.gpu.attn_utils import build_slot_mappings_by_layer
 from vllm.v1.worker.gpu.model_runner import GPUModelRunner
@@ -42,9 +43,7 @@ def record_pp_spec_draft_index_stream(
     if getattr(model_runner, "_vllm_hcu_suppress_pp_spec_draft_sync", False):
         return False
     pp_handler = getattr(model_runner, "pp_handler", None)
-    num_speculative_steps = int(
-        getattr(model_runner, "num_speculative_steps", 0)
-    )
+    num_speculative_steps = int(getattr(model_runner, "num_speculative_steps", 0))
     if (
         pp_handler is None
         or num_speculative_steps == 0
@@ -89,9 +88,7 @@ class HcuGPUModelRunnerV2(GPUModelRunner):
     @property
     def pcp_manager_cls(self):
         if self._hcu_pcp_manager_cls is None:
-            self._hcu_pcp_manager_cls = make_hcu_pcp_manager_cls(
-                self.vllm_config
-            )
+            self._hcu_pcp_manager_cls = make_hcu_pcp_manager_cls(self.vllm_config)
         return self._hcu_pcp_manager_cls
 
     def initialize_kv_cache(
@@ -145,6 +142,7 @@ class HcuGPUModelRunnerV2(GPUModelRunner):
     def _init_host_seq_lens(self) -> None:
         self._hsl_enabled = (
             _USE_HOST_SEQ_LENS
+            and is_step5_config(self.vllm_config)
             and self.pcp_manager is None
             and not getattr(self, "use_dcp", False)
             and getattr(self, "pp_handler", None) is None
@@ -206,7 +204,11 @@ class HcuGPUModelRunnerV2(GPUModelRunner):
             self._hsl_rejected[:n].copy_(num_rejected[:n], non_blocking=True)
             if self._hsl_event is not None:
                 self._hsl_event.record()
-        self._hsl_pending = (input_batch.idx_mapping_np.copy(), query_lens, has_rejected)
+        self._hsl_pending = (
+            input_batch.idx_mapping_np.copy(),
+            query_lens,
+            has_rejected,
+        )
 
     def _hsl_attach(self, input_batch) -> None:
         n = input_batch.num_reqs
@@ -282,14 +284,16 @@ class HcuGPUModelRunnerV2(GPUModelRunner):
             if kwargs.get("dummy_run", False):
                 dummy_scope = replicated_mtp_batch_scope()
         with deepep_auto_request_phase_scope(), scope, dummy_scope:
+            if is_step5_config(getattr(self, "vllm_config", None)):
+                from vllm_hcu.v1.step5_execution import execute_model
+
+                return execute_model(self, *args, **kwargs)
             return super().execute_model(*args, **kwargs)
 
     def profile_run(self) -> None:
         """Profile PCP with the per-rank token budget plus routing slack."""
 
-        pcp_size = int(
-            self.vllm_config.parallel_config.prefill_context_parallel_size
-        )
+        pcp_size = int(self.vllm_config.parallel_config.prefill_context_parallel_size)
         # Upstream profiles the target and MTP prefill from the same dummy
         # batch. Runtime MTP sampling restores the global PCP batch before
         # propose(), so shrinking this shared budget would under-profile the
@@ -308,9 +312,7 @@ class HcuGPUModelRunnerV2(GPUModelRunner):
         # DualChunkSwap segments, so reserve two tokens of per-request layout
         # headroom when that exceeds the decode width. This bounds every
         # rank-local mix while retaining the 12.5% prefill imbalance slack.
-        partitioned_tokens = (
-            (original_max + pcp_size - 1) // pcp_size
-        ) * 9 // 8
+        partitioned_tokens = ((original_max + pcp_size - 1) // pcp_size) * 9 // 8
         replicated_request_tokens = min(
             original_max,
             int(self.max_num_reqs) * max(int(self.decode_query_len), 2),
@@ -344,9 +346,7 @@ class HcuGPUModelRunnerV2(GPUModelRunner):
                 self.pcp_manager = manager
         if self.pcp_manager is None:
             return super().prepare_dummy_attn(input_batch, valid_state_slots)
-        block_tables = self.block_tables.get_dummy_block_tables(
-            input_batch.num_reqs
-        )
+        block_tables = self.block_tables.get_dummy_block_tables(input_batch.num_reqs)
         if valid_state_slots:
             state_slots = torch.arange(
                 1,
@@ -356,9 +356,7 @@ class HcuGPUModelRunnerV2(GPUModelRunner):
             )
             for block_table in block_tables:
                 block_table[:, 0].copy_(state_slots)
-        slot_mappings = self.pcp_manager.get_dummy_slot_mappings(
-            input_batch.num_tokens
-        )
+        slot_mappings = self.pcp_manager.get_dummy_slot_mappings(input_batch.num_tokens)
         return block_tables, slot_mappings
 
     def sample_tokens(self, grammar_output):
@@ -377,23 +375,17 @@ class HcuGPUModelRunnerV2(GPUModelRunner):
             (
                 restored_hidden_states,
                 restored_input_batch,
-            ) = self.pcp_manager.restore_for_sampling(
-                execute_model_state.hidden_states
-            )
+            ) = self.pcp_manager.restore_for_sampling(execute_model_state.hidden_states)
             execute_model_state = execute_model_state._replace(
                 hidden_states=restored_hidden_states,
                 input_batch=restored_input_batch,
             )
             self.execute_model_state = execute_model_state
         input_batch = (
-            None
-            if execute_model_state is None
-            else execute_model_state.input_batch
+            None if execute_model_state is None else execute_model_state.input_batch
         )
         scope = (
-            replicated_mtp_batch_scope()
-            if use_replicated_mtp_batch
-            else nullcontext()
+            replicated_mtp_batch_scope() if use_replicated_mtp_batch else nullcontext()
         )
         pcp_manager = self.pcp_manager
         record_pp_spec_draft_index_stream(self, input_batch)
