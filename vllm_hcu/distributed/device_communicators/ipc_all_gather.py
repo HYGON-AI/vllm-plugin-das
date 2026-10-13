@@ -17,10 +17,14 @@ their chunks out of its own buffer.
 * A program is a single wavefront, so the release orders all of its stores.
 
 All ranks must take the same path (custom vs. fallback) for every call; the
-decision depends only on the global ``sizes`` and the tensor layout.
+decision depends only on the global ``sizes`` and common logical row layouts.
+All ranks must supply the same tensor count, dtypes, trailing dimensions and
+sizes. Strided dense inputs are packed locally without changing that decision.
+Invalid device/shape contracts fail the call instead of falling back locally.
 """
 
 import math
+from contextlib import suppress
 
 import torch
 import torch.distributed as dist
@@ -151,48 +155,143 @@ class IpcAllGather:
         device: torch.device,
         max_bytes_per_rank: int = 4 * 1024 * 1024,
     ) -> None:
-        from vllm_hcu.distributed.device_communicators.custom_all_reduce import (
-            CustomAllreduce,
-        )
-
+        self.disabled = True
+        self._owned_buffers: list[int] = []
+        self._imported_buffers: list[int] = []
+        self._needs_coordinated_close = False
+        self._collective_failed = False
+        self._data_ptrs = self._flag_ptrs = None
+        self._bufs = self._flags = self._cnt = None
         self.group = group
         self.rank = dist.get_rank(group=group)
         self.world_size = dist.get_world_size(group=group)
-        assert 2 <= self.world_size <= _MAX_WORLD
+        if not 2 <= self.world_size <= _MAX_WORLD:
+            raise ValueError(f"IPC all-gather requires 2..{_MAX_WORLD} ranks")
+        if max_bytes_per_rank <= 0 or max_bytes_per_rank % 4:
+            raise ValueError("IPC buffer capacity must be a positive multiple of 4")
         self.device = device
+        self._free_buffer = torch.ops.hcu_ops.free_shared_buffer
+        try:
+            self._close_mapping = torch.ops.hcu_ops.close_mem_handle
+        except AttributeError as exc:
+            raise RuntimeError(
+                "Rebuild vllm-plugin-das: IPC all-gather requires close_mem_handle"
+            ) from exc
         self.region_elems = max_bytes_per_rank // 4
         self.slot_elems = self.region_elems * self.world_size
         data_bytes = 2 * self.slot_elems * 4
         flag_bytes = self.world_size * self.NPROG * 8
-        self._data_ptrs = CustomAllreduce.create_shared_buffer(data_bytes, group=group)
-        self._flag_ptrs = CustomAllreduce.create_shared_buffer(flag_bytes, group=group)
-        self._create_shared_buffer_free = CustomAllreduce.free_shared_buffer
-        self._bufs = torch.tensor(self._data_ptrs, dtype=torch.int64, device=device)
-        self._flags = torch.tensor(self._flag_ptrs, dtype=torch.int64, device=device)
-        # Flags must start at zero on every rank before any peer bumps them.
-        _zero_i64_kernel[(1,)](self._flags, self.rank, flag_bytes // 8, BLOCK=256)
-        torch.cuda.synchronize(device)
-        dist.barrier(group=group)
-        self._cnt = torch.zeros(self.NPROG, dtype=torch.int64, device=device)
+        self._needs_coordinated_close = True
+        try:
+            self._data_ptrs = self._share_buffer(data_bytes)
+            self._flag_ptrs = self._share_buffer(flag_bytes)
+            error = None
+            try:
+                self._bufs = torch.tensor(self._data_ptrs, dtype=torch.int64, device=device)
+                self._flags = torch.tensor(self._flag_ptrs, dtype=torch.int64, device=device)
+                _zero_i64_kernel[(1,)](self._flags, self.rank, flag_bytes // 8, BLOCK=256)
+                self._cnt = torch.zeros(self.NPROG, dtype=torch.int64, device=device)
+                torch.cuda.synchronize(device)
+            except Exception as exc:
+                error = exc
+            # Initialization only: peers must all have zeroed flags/counters
+            # before any rank can enter the first device-side gather.
+            self._check_initialization(error, "initializing buffers")
+        except BaseException:
+            # A failed rank must not silently choose NCCL while peers use IPC.
+            # If the group is broken, coordinated teardown cannot be proved
+            # safe. The worker must exit rather than freeing an exporter while
+            # peers may still hold its mappings.
+            if not self._collective_failed:
+                with suppress(Exception):
+                    self.close()
+            raise
         self.disabled = False
 
+    def _exchange_status(self, payload):
+        peers = [None] * self.world_size
+        try:
+            dist.all_gather_object(peers, payload, group=self.group)
+        except BaseException:
+            self._collective_failed = True
+            raise
+        return peers
+
+    def _check_initialization(self, error: Exception | None, stage: str) -> None:
+        errors = self._exchange_status(
+            None if error is None else f"{type(error).__name__}: {error}"
+        )
+        failed = [(rank, message) for rank, message in enumerate(errors) if message]
+        if failed:
+            raise RuntimeError(f"IPC all-gather failed {stage}: {failed}") from error
+
+    def _share_buffer(self, nbytes: int) -> list[int]:
+        # Own the raw allocation as soon as the native allocator returns. The
+        # generic CustomAllreduce helper cannot expose partial ownership when
+        # a later handle exchange/open fails.
+        pointer, handle, error = None, None, None
+        try:
+            pointer, handle = torch.ops.hcu_ops.allocate_shared_buffer_and_handle(nbytes)
+            self._owned_buffers.append(pointer)
+        except Exception as exc:
+            error = exc
+        payloads = self._exchange_status(
+            (None if error is None else f"{type(error).__name__}: {error}", handle)
+        )
+        failed = [(rank, payload[0]) for rank, payload in enumerate(payloads) if payload[0]]
+        if failed:
+            raise RuntimeError(f"IPC all-gather failed allocating buffers: {failed}") from error
+        pointers = []
+        error = None
+        try:
+            for rank, (_, peer_handle) in enumerate(payloads):
+                if rank == self.rank:
+                    pointers.append(pointer)
+                else:
+                    imported = torch.ops.hcu_ops.open_mem_handle(peer_handle)
+                    self._imported_buffers.append(imported)
+                    pointers.append(imported)
+        except Exception as exc:
+            error = exc
+        self._check_initialization(error, "opening IPC handles")
+        return pointers
+
     def can_gather(self, tensors: list[torch.Tensor], sizes: list[int]) -> bool:
-        if self.disabled or not tensors or len(tensors) > _MAX_TENSORS:
-            return False
+        if self.disabled:
+            raise RuntimeError("IPC all-gather communicator is closed")
+        if len(sizes) != self.world_size or any(
+            not isinstance(size, int) or size < 0 for size in sizes
+        ):
+            raise ValueError("all-gather sizes must contain one non-negative integer per rank")
         row_bytes = 0
-        for t in tensors:
+        for tensor in tensors:
             if (
-                t.dim() == 0
-                or t.shape[0] != sizes[self.rank]
-                or not t.is_contiguous()
-                or t.device != self.device
-                or _row_bytes(t) % 4
+                tensor.layout != torch.strided
+                or tensor.dim() == 0
+                or tensor.shape[0] != sizes[self.rank]
+                or tensor.device != self.device
             ):
-                return False
-            row_bytes += _row_bytes(t)
-        return max(sizes) * row_bytes <= self.region_elems * 4
+                raise ValueError("all-gather inputs must be dense tensors on this rank's device with the declared rows")
+            row_bytes += _row_bytes(tensor)
+        # Tensor count, row widths, dtypes and sizes are a collective contract.
+        # Contiguity is deliberately absent: e.g. identical column slices can
+        # be contiguous for M=1 on one rank but strided for M=2 on another.
+        return (
+            0 < len(tensors) <= _MAX_TENSORS
+            and all(_row_bytes(tensor) % 4 == 0 for tensor in tensors)
+            and max(sizes) * row_bytes <= self.region_elems * 4
+        )
 
     def gather(self, tensors: list[torch.Tensor], sizes: list[int]) -> list[torch.Tensor]:
+        if not self.can_gather(tensors, sizes):
+            raise ValueError("tensor row layout or size exceeds the IPC all-gather capacity")
+        tensors = [tensor.contiguous() for tensor in tensors]
+        # .contiguous() can preserve a one-row view with a byte offset that
+        # cannot be reinterpreted as int32. A clone gives that view aligned storage.
+        tensors = [
+            tensor.clone() if tensor.storage_offset() * tensor.element_size() % 4 else tensor
+            for tensor in tensors
+        ]
         total = sum(sizes)
         outs = [
             torch.empty((total,) + tuple(t.shape[1:]), dtype=t.dtype, device=t.device)
@@ -218,12 +317,55 @@ class IpcAllGather:
         return outs
 
     def close(self) -> None:
-        if getattr(self, "_data_ptrs", None) is None:
-            return
+        """Collectively quiesce and close imports before freeing exports.
+
+        All ranks must call explicit close/destroy. A broken group or failed
+        import close leaves exports allocated for worker-exit cleanup; freeing
+        them before every importer closes is undefined in HIP/CUDA.
+        """
         self.disabled = True
-        self._create_shared_buffer_free(self._data_ptrs, rank=self.rank)
-        self._create_shared_buffer_free(self._flag_ptrs, rank=self.rank)
-        self._data_ptrs = None
+        if self._needs_coordinated_close:
+            if self._collective_failed:
+                raise RuntimeError("Cannot safely close IPC buffers after group failure")
+            error = None
+            try:
+                torch.cuda.synchronize(self.device)
+            except Exception as exc:
+                error = exc
+            self._check_initialization(error, "quiescing IPC users")
+
+            error = None
+            remaining = []
+            for pointer in self._imported_buffers:
+                try:
+                    self._close_mapping(pointer)
+                except Exception as exc:
+                    remaining.append(pointer)
+                    error = error or exc
+            self._imported_buffers = remaining
+            # This exchange is also the barrier that ensures *all* importers
+            # have closed before any rank frees its local exported allocations.
+            self._check_initialization(error, "closing IPC mappings")
+            self._needs_coordinated_close = False
+
+        self._data_ptrs = self._flag_ptrs = None
+        self._bufs = self._flags = self._cnt = None
+        remaining = []
+        error = None
+        for pointer in self._owned_buffers:
+            try:
+                self._free_buffer(pointer)
+            except Exception as exc:
+                remaining.append(pointer)
+                error = error or exc
+        self._owned_buffers = remaining
+        if error is not None:
+            raise error
+
+    def __del__(self):
+        # GC cannot coordinate with peers. Explicit close/destroy owns teardown;
+        # abandoned allocations are left to worker exit rather than freed early.
+        self.disabled = True
 
 
 def _row_bytes(t: torch.Tensor) -> int:

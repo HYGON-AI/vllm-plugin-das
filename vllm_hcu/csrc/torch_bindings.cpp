@@ -41,6 +41,7 @@ TORCH_LIBRARY_EXPAND(TORCH_EXTENSION_NAME, ops) {
   ops.def("register_graph_buffers", &register_graph_buffers);
   ops.def("allocate_shared_buffer_and_handle", &allocate_shared_buffer_and_handle);
   ops.def("open_mem_handle(Tensor mem_handle) -> int", &open_mem_handle);
+  ops.def("close_mem_handle(int buffer) -> ()", &close_mem_handle);
   ops.def("free_shared_buffer", &free_shared_buffer);
 
   ops.def(
