@@ -51,15 +51,6 @@ STEP5_PACKED_MODULES_MAPPING = {
 }
 
 
-def _get_mtp_vllm_config(vllm_config: VllmConfig) -> VllmConfig:
-    """Get the draft model config from speculative_config if available."""
-    speculative_config = vllm_config.speculative_config
-    if speculative_config is None or speculative_config.draft_model_config is None:
-        return vllm_config
-    # For vLLM 0.28, directly return vllm_config as it handles this internally
-    return vllm_config
-
-
 def _get_mtp_config(vllm_config: VllmConfig) -> PretrainedConfig:
     """Extract the HF text config for MTP."""
     hf_config = vllm_config.model_config.hf_config

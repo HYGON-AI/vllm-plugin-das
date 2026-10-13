@@ -25,7 +25,9 @@ then register configuration exports, model types, MTP overrides, compile
 splitting operations, compile prefix hashing and EP graph capture.
 EP capture is registered before consumers copy the public distributed export.
 The Worker dispatcher registers metadata, block-table mirrors, MTP loading and
-sampling, DP synchronization, MoE combine, token FP8, logits and EPLB callbacks.
+sampling, MoE combine, token FP8, logits and EPLB callbacks.
+DP dispatch keeps the upstream synchronization contract: reuse is only valid for
+the same agreed batch; a rank must not silently start a new collective on its own.
 
 MoE combine hook state is owned by the plugin and can be registered before
 Worker dispatch. Step5 execution and EPLB helpers resolve the canonical or owned
@@ -41,6 +43,24 @@ Step5 runner and metadata paths are selected by model type. Other model families
 retain their native execution and MTP paths. Existing HCU feature sidecars and
 operator switches remain the configuration boundary; upstream config and
 attention metadata dataclasses are not extended in place.
+
+## Optimization boundaries
+
+Only Step5-created logits processors opt into the skinny LM-head kernel. The
+existing `STEP5_SKINNY_LM_HEAD` switch can still disable it. Step5 EPLB uses
+per-layer rank maxima; other models retain the upstream rank-total metric.
+Shared DeepGEMM and mixed-format transfer adapters remain compatibility helpers.
+
+QKV/gate fusion requires bias-free, matching BF16/FP16 projections in the NN
+weight layout. Unsupported layouts use the original linear methods. DSA validates
+indexer geometry at construction and RoPE tensor layout before kernel launch.
+
+`VLLM_STEP5_DISABLE_DSA` uses the same parser in platform, config and model code:
+`1` or `true` (case-insensitive, surrounding whitespace ignored) disables DSA.
+The old `VLLM_STEP5_ENABLE_QKVG_PROJ`, `VLLM_STEP5_DSA_INDEX_TP_SIZE`,
+`VLLM_STEP5_FUSE_INDEXER_NORM` and `VLLM_STEP5_O_PROJ_REDUCE_SCATTER`
+variables had no implementation and are no longer registered. Explicit settings
+produce a warning; the actual QKVG switch is `VLLM_HCU_STEP5_FUSE_QKVG`.
 
 ## Pending-region ownership
 
@@ -60,7 +80,12 @@ Use the supported vLLM 0.28.1 base and the plugin on `PYTHONPATH`:
 
 ```bash
 python -m pytest -q tests/runtime_patch/test_step5_runtime.py \
-  tests/model_executor/test_step4_dsa_schedule.py
+  tests/runtime_patch/test_step5_dp_sync_safety.py \
+  tests/runtime_patch/test_step5_optimization_scope.py \
+  tests/runtime_patch/test_step5_env_contract.py \
+  tests/model_executor/test_step4_dsa_schedule.py \
+  tests/model_executor/test_step4_dsa_geometry.py \
+  tests/model_executor/test_step5_projection_fusion.py
 python tools/check_production_boundary.py
 python tools/check_patch_test_coverage.py
 ```

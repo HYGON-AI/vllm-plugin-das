@@ -90,6 +90,7 @@ from vllm.model_executor.layers.linear import (
 from vllm.model_executor.layers.logits_processor import LogitsProcessor
 from vllm.model_executor.layers.quantization.base_config import QuantizationConfig
 from vllm.model_executor.layers.rotary_embedding import get_rope
+from vllm_hcu.platforms.step5_envs import is_dsa_disabled
 from vllm_hcu.model_executor.layers.step4_dsa import (
     Step4DSAGeometry,
     Step4DSAState,
@@ -135,7 +136,7 @@ _DSA_INDEXER_SUBSTRINGS = (
 )
 
 # Escape hatch back to the pre-DSA dense path, for A/B against this backend.
-DISABLE_DSA = os.environ.get("VLLM_STEP5_DISABLE_DSA", "0") == "1"
+DISABLE_DSA = is_dsa_disabled()
 
 # Run qkv_proj and g_proj as one GEMM. Both weights become column views of one
 # [hidden, qkv + heads] buffer, so the loaders fill it in place and no

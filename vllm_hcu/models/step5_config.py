@@ -1,9 +1,10 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
-import os
 from typing import Any
 
 from transformers.configuration_utils import PretrainedConfig
+
+from vllm_hcu.platforms.step5_envs import is_dsa_disabled, warn_ignored_step5_envs
 
 
 class PerceptionEncoderConfig(PretrainedConfig):
@@ -99,6 +100,7 @@ class Step5Config(PretrainedConfig):
         max_position_embeddings: int | None = None,
         **kwargs,
     ) -> None:
+        warn_ignored_step5_envs()
         if "max_position_embedding" in kwargs:
             raise ValueError(
                 "Found 'max_position_embedding' in config.json. "
@@ -228,7 +230,7 @@ class Step5Config(PretrainedConfig):
             enabled = getattr(sparse_config, "enabled", False)
         # Matches models/step5_text.py's DISABLE_DSA: the dense fallback has no
         # indexer op in the graph to split on.
-        if not enabled or os.environ.get("VLLM_STEP5_DISABLE_DSA", "0") == "1":
+        if not enabled or is_dsa_disabled():
             return
         # Deferred: vllm.config imports this module transitively.
         from vllm.config.compilation import CompilationConfig

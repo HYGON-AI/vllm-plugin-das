@@ -26,10 +26,8 @@ def generate_step5_drafts(
     # The output hidden state at position P (= positions) and the token id
     # at P+1 are used to draft the token at P+2. Sampling keys a draw by the
     # position before the sampled token, so the net adjustment is +1.
-    # sampling position. Each MTP layer internally knows which future token
-    # it predicts via spec_step_idx. The original 0.28 code incremented
-    # sample_src_positions in the loop, causing position/slot mismatch
-    # and 0% acceptance for later draft positions.
+    # After each draft, advance this sampling position with the draft inputs.
+    # spec_step_idx selects the MTP layer; it does not advance the sampling key.
     sample_src_positions = positions + 1
     idx_mapping = self.idx_mapping[:num_reqs]
 
