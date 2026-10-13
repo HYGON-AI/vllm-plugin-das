@@ -285,9 +285,24 @@ def apply_to_module(module: ModuleType) -> bool:
             # reads plain [E, N, K] weights; keep them unpacked.
             import os
 
+            from vllm_hcu.model_executor.layers.fused_moe.ep_fused_moe_support import (
+                supports_channel_ep_fused,
+            )
+
             ep_fused = (
                 os.environ.get("VLLM_HCU_EP_FUSED_MOE", "0") == "1"
                 and fp8_backend == hcu_enum.DEEPGEMM
+                and w13_input_scale is None
+                and w2_input_scale is None
+                and supports_channel_ep_fused(
+                    w13, w2, w13_scale, w2_scale,
+                    block_shape=getattr(layer, "weight_block_size", None),
+                    activation=getattr(layer, "activation", None),
+                    expert_map=getattr(layer, "expert_map", None),
+                    apply_router_weight_on_input=getattr(
+                        layer, "apply_router_weight_on_input", False
+                    ),
+                )
             )
             if not ep_fused:
                 with torch.no_grad():

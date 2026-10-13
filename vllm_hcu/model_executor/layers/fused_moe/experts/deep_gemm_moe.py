@@ -356,17 +356,32 @@ class DeepGemmExperts(mk.FusedMoEExpertsModular):
         global_num_experts, expert_map, a1q_scale, workspace13, workspace2,
         apply_router_weight_on_input,
     ):
+        from vllm_hcu.model_executor.layers.fused_moe.ep_fused_moe_support import (
+            supports_channel_ep_fused,
+        )
+
         if not (
             self.quant_config.use_fp8_w8a8
-            and activation == MoEActivation.SWIGLUSTEP
-            and expert_map is not None
-            and not apply_router_weight_on_input
-        ):
-            raise NotImplementedError(
-                "VLLM_HCU_EP_FUSED_MOE supports only Channel-FP8 swiglustep with "
-                f"expert parallelism (activation={activation}, "
-                f"expert_map={expert_map is not None})"
+            and self.quant_config.per_out_ch_quant
+            and self.quant_config.per_act_token_quant
+            and supports_channel_ep_fused(
+                w1, w2, self.w1_scale, self.w2_scale,
+                block_shape=self.block_shape,
+                activation=activation,
+                expert_map=expert_map,
+                apply_router_weight_on_input=apply_router_weight_on_input,
             )
+        ):
+            raise ValueError(
+                "EP fused MoE requires supported channel-FP8 weights, dynamic "
+                "per-token activations and SWIGLUSTEP with expert parallelism"
+            )
+        if (
+            a1q_scale is None
+            or a1q_scale.shape not in ((a1q.shape[0],), (a1q.shape[0], 1))
+            or a1q_scale.device != a1q.device
+        ):
+            raise ValueError("EP fused MoE requires one activation scale per token")
         from vllm_hcu.model_executor.layers.fused_moe.ep_fused_moe import (
             ep_fused_experts,
         )
@@ -429,7 +444,12 @@ class DeepGemmExperts(mk.FusedMoEExpertsModular):
         if global_num_experts == -1:
             global_num_experts = local_num_experts
 
-        if w1.dim() == 3 and _EP_FUSED_MOE:
+        if (
+            _EP_FUSED_MOE
+            and self.block_shape is None
+            and self.quant_config.use_fp8_w8a8
+            and w1.dim() == 3
+        ):
             self._apply_ep_fused(
                 output, a1q, w1, w2, topk_weights, topk_ids, activation,
                 global_num_experts, expert_map, a1q_scale, workspace13, workspace2,
