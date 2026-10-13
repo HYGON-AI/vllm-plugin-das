@@ -2309,6 +2309,26 @@ class Step4DSAGeometry:
     num_indexer_heads: int = 16
     num_provider_groups: int = 4
 
+    def __post_init__(self) -> None:
+        for name in ("proxy_dim", "topk", "num_indexer_heads", "num_provider_groups"):
+            if getattr(self, name) <= 0:
+                raise ValueError(f"{name} must be positive, got {getattr(self, name)}")
+        if self.region_size != REGION_BLOCK_SIZE:
+            raise ValueError(
+                f"sparse_config.region_block_size={self.region_size} but the "
+                f"released kernels are compiled around {REGION_BLOCK_SIZE}"
+            )
+        if not 0 < self.rope_span <= self.proxy_dim or self.rope_span % 2:
+            raise ValueError(
+                "rope span must be positive, even, and no larger than proxy_dim; "
+                f"got rope_span={self.rope_span}, proxy_dim={self.proxy_dim}"
+            )
+        if self.num_indexer_heads % self.num_provider_groups:
+            raise ValueError(
+                f"{self.num_indexer_heads} indexer heads do not divide into "
+                f"{self.num_provider_groups} provider groups"
+            )
+
     @classmethod
     def from_config(cls, sparse_config: Any) -> "Step4DSAGeometry":
         def pick(name: str, default: int) -> int:
@@ -2316,7 +2336,7 @@ class Step4DSAGeometry:
                 return int(sparse_config.get(name, default))
             return int(getattr(sparse_config, name, default))
 
-        geometry = cls(
+        return cls(
             proxy_dim=pick("proxy_dim", 256),
             topk=pick("topk", 512),
             region_size=pick("region_block_size", REGION_BLOCK_SIZE),
@@ -2324,14 +2344,6 @@ class Step4DSAGeometry:
             num_indexer_heads=pick("sparse_indexer_num_heads", 16),
             num_provider_groups=pick("num_provider_groups", 4),
         )
-        if geometry.region_size != REGION_BLOCK_SIZE:
-            raise ValueError(
-                f"sparse_config.region_block_size={geometry.region_size} but the "
-                f"released kernels are compiled around {REGION_BLOCK_SIZE}"
-            )
-        if geometry.rope_span % 2:
-            raise ValueError(f"rope span must be even, got {geometry.rope_span}")
-        return geometry
 
 
 # --------------------------------------------------------------------------
@@ -3839,10 +3851,12 @@ class Step4Indexer:
 
         groups_total = geometry.num_provider_groups
         heads_per_group = geometry.num_indexer_heads // groups_total
-        if heads_per_group * groups_total != geometry.num_indexer_heads:
+        if tp_size <= 0 or not 0 <= tp_rank < tp_size:
+            raise ValueError(f"invalid tensor-parallel rank {tp_rank}/{tp_size}")
+        if max(tp_size, groups_total) % min(tp_size, groups_total):
             raise ValueError(
-                f"{geometry.num_indexer_heads} indexer heads do not divide into "
-                f"{groups_total} provider groups"
+                f"TP size {tp_size} and {groups_total} provider groups must divide "
+                "evenly for group sharding or replication"
             )
         if tp_size <= groups_total:
             local_groups = groups_total // tp_size

@@ -363,8 +363,51 @@ def indexer_norm_rope(
             for consumers that take its row stride.
 
     index_q and index_k may be row-strided (column slices of one projection);
-    the normalised outputs are contiguous either way.
+    the normalised outputs are contiguous either way. Position values must lie
+    within the supplied tables; the caller owns that scheduler invariant.
     """
+    # These checks only inspect tensor metadata, without a device readback or
+    # synchronization. The kernel uses packed columns and shares the cos stride
+    # with sin, so incompatible layouts must fail before launching it.
+    if head_dim <= 0 or num_q_heads <= 0 or num_k_heads <= 0:
+        raise ValueError("head_dim and indexer head counts must be positive")
+    if not 0 < 2 * rotary_dim <= head_dim:
+        raise ValueError(
+            f"rotated span {2 * rotary_dim} must be positive and <= head_dim {head_dim}"
+        )
+    if index_q.ndim != 2:
+        raise ValueError("index_q must be [tokens, num_q_heads * head_dim]")
+    num_tokens = index_q.shape[0]
+    for name, tensor, heads in (
+        ("index_q", index_q, num_q_heads),
+        ("index_k", index_k, num_k_heads),
+        ("index_z", index_z, num_k_heads),
+    ):
+        if tensor.shape != (num_tokens, heads * head_dim) or tensor.stride(-1) != 1:
+            raise ValueError(f"{name} must have matching tokens and packed head columns")
+    for name, tensor in (
+        ("q_norm_weight", q_norm_weight),
+        ("k_norm_weight", k_norm_weight),
+        ("k_norm_bias", k_norm_bias),
+    ):
+        if tensor.shape != (head_dim,) or tensor.stride(0) != 1:
+            raise ValueError(f"{name} must be a contiguous vector of length head_dim")
+    if (
+        cos.ndim != 2
+        or cos.shape[1] != rotary_dim
+        or cos.shape[0] <= 0
+        or sin.shape != cos.shape
+        or cos.stride(1) != 1
+        or sin.stride() != cos.stride()
+    ):
+        raise ValueError("cos/sin must be [positions, rotary_dim] with matching row strides")
+    if (
+        positions.ndim != 1
+        or positions.shape[0] != num_tokens
+        or positions.stride(0) != 1
+        or positions.dtype not in (torch.int32, torch.int64)
+    ):
+        raise ValueError("positions must be one contiguous integer per token")
     return (
         _norm_rope(
             index_q,
