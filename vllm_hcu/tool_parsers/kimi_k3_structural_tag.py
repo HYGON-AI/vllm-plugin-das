@@ -18,6 +18,7 @@ framework. All XTML byte-level constants mirror
 
 from __future__ import annotations
 
+import json
 from itertools import permutations
 from typing import Any
 
@@ -160,19 +161,136 @@ def _k3_pinned_key_tag(key: str) -> TagFormat:
     )
 
 
+def _k3_union_branches(prop: dict[str, Any]) -> list[Any] | None:
+    """The declared alternatives of a union property, in declaration order.
+
+    Covers ``anyOf``, ``oneOf`` and the JSON type array; returns None when
+    the property declares no union shape.
+    """
+
+    for combo_key in ("anyOf", "oneOf"):
+        branches = prop.get(combo_key)
+        if isinstance(branches, list) and branches:
+            return branches
+    json_type = prop.get("type")
+    if isinstance(json_type, list) and json_type:
+        return [{"type": branch} for branch in json_type]
+    return None
+
+
+def _merge_same_begin(group: list[Any]) -> Any:
+    """Merge union branch tags that share one ``begin`` (R14 P1).
+
+    Equal begins share the XTML type channel, so the branch constraints
+    must be UNIONED, not dropped: integer|number both render
+    ``type="number"`` (and ``3.5`` Legal only via the branch union). The
+    string channel merges its content shapes (const sets / bounded regex /
+    absorbing AnyText); the JSON channel merges the embedded schemas under
+    one ``anyOf`` (nested anyOf is ordinary JSON Schema).
+    """
+
+    first = group[0]
+    contents = [getattr(tag, "content", None) for tag in group]
+    names = [type(c).__name__ for c in contents]
+
+    def str_signature(c: Any) -> str:
+        kind = type(c).__name__
+        if kind == "RegexFormat":
+            return f"re:{getattr(c, 'pattern', '')}"
+        if kind == "ConstStringFormat":
+            return f"const:{getattr(c, 'value', '')!r}"
+        if kind == "OrFormat":
+            inner = "|".join(
+                repr(getattr(e, "value", "")) for e in getattr(c, "elements", [])
+            )
+            return f"or:{inner}"
+        return "anytext"
+
+    if "JSONSchemaFormat" in names:
+        schemas: list[Any] = []
+        for c, kind in zip(contents, names):
+            if kind != "JSONSchemaFormat":
+                continue
+            schema = getattr(c, "json_schema", {})
+            key_dump = json.dumps(schema, sort_keys=True)
+            for existing in schemas:
+                if json.dumps(existing, sort_keys=True) == key_dump:
+                    break
+            else:
+                schemas.append(schema)
+        if len(schemas) == 1:
+            return TagFormat(
+                begin=first.begin, content=contents[0], end=first.end
+            )
+        # Review R15 P2: every branch carried the tool's root ``$defs`` via
+        # setdefault, but ``#/$defs/X`` resolves from the DOCUMENT root --
+        # i.e. the anyOf wrapper that loses the merge.  Strip the defs
+        # tables from the branches and hoist them onto the merged root so
+        # embedded ``$ref``s keep resolving.
+        hoisted: dict[str, Any] = {}
+        stripped: list[Any] = []
+        for schema in schemas:
+            slim = {
+                k: v
+                for k, v in schema.items()
+                if k not in ("$defs", "definitions")
+            }
+            for defs_key in ("$defs", "definitions"):
+                table = schema.get(defs_key)
+                if isinstance(table, dict) and defs_key not in hoisted:
+                    # First table wins (review R16 P3-2): two branches with
+                    # the SAME defs key but different tables lose the later
+                    # ones -- loudly (a $ref fails compation), never by
+                    # silently relaxing a constraint.  Such schemas are
+                    # already malformed downstream of R15 (a branch-local
+                    # defs table was never reachable by "#/$defs"... refs).
+                    hoisted[defs_key] = table
+            stripped.append(slim)
+        merged_root: dict[str, Any] = {"anyOf": stripped}
+        merged_root.update(hoisted)
+        return TagFormat(
+            begin=first.begin,
+            content=JSONSchemaFormat(json_schema=merged_root),
+            end=first.end,
+        )
+
+    # string channel
+    if any(kind == "AnyTextFormat" for kind in names):
+        return TagFormat(
+            begin=first.begin,
+            content=AnyTextFormat(excludes=[_K3_CLOSE]),
+            end=first.end,
+        )
+    seen: list[str] = []
+    shapes: list[Any] = []
+    for c in contents:
+        sig = str_signature(c)
+        if sig in seen:
+            continue
+        seen.append(sig)
+        shapes.append(c)
+    if len(shapes) == 1:
+        return TagFormat(begin=first.begin, content=shapes[0], end=first.end)
+    return TagFormat(
+        begin=first.begin, content=OrFormat(elements=shapes), end=first.end
+    )
+
+
 def _k3_argument_tag(
     key: str,
     schema: dict[str, Any],
     root_defs: dict[str, Any] | None = None,
-) -> TagFormat:
+) -> Any:
     """Build one ``argument`` XTML tag for property ``key``.
 
     ``string`` values are emitted raw (bounded by the close marker); every
     other JSON type is emitted as JSON and validated against the property
-    schema. A property whose type is a union / missing keeps its key pinned
-    while the type attribute and value stay permissive so a valid call is
-    never rejected (review 2026-10-15 round 11 P1); this function never
-    returns None. ``root_defs`` re-attaches the tool's root-level ``$defs``
+    schema. A union property (anyOf/oneOf/type-array) alternates one full
+    branch tag per declared alternative, each with the SAME pinned key, so
+    the rendered value is constrained to the declared branches (review
+    2026-10-13 round 13 P1, value axis; R11 pinned the key axis). Only
+    when no usable union is declared does it fall back to the key-pinned
+    wildcard tag. ``root_defs`` re-attaches the tool's root-level ``$defs``
     / ``definitions`` to keep embedded schemas self-contained.
     """
 
@@ -182,9 +300,41 @@ def _k3_argument_tag(
         _K3_JSON_TO_XTML_TYPE.get(json_type) if isinstance(json_type, str) else None
     )
     if xtml_type is None:
-        # union / missing type: the key is PINNED with a permissive type
-        # attribute and raw value, so callers never substitute the
-        # key-agnostic permissive tag (review 2026-10-15 R11 P1).
+        branches = _k3_union_branches(prop)
+        if branches and len(branches) <= _K3_MAX_UNION_BRANCHES:
+            built = [
+                _k3_argument_tag(key, branch, root_defs)
+                for branch in branches
+                if isinstance(branch, dict)
+            ]
+            # R14 P1: branches sharing a begin (integer|number both render
+            # ``type="number"``; two object schemas; enum|maxLen strings)
+            # must have their content MERGED, not dropped -- keeping only
+            # the first rejected legal values like 3.5. Merge within each
+            # begin bucket:
+            #   string channel -> OrFormat of the distinct content shapes
+            #   (any AnyText absorbs all);
+            #   JSON channel    -> one JSONSchemaFormat over the combined
+            #   ``anyOf`` (nested anyOf is legal JSON Schema).
+            buckets: list[list[Any]] = []
+            for tag in built:
+                begin = getattr(tag, "begin", "")
+                placed = False
+                for group in buckets:
+                    if begin and getattr(group[0], "begin", "") == begin:
+                        group.append(tag)
+                        placed = True
+                        break
+                if not placed:
+                    buckets.append([tag])
+            if buckets:
+                merged = [
+                    group[0] if len(group) == 1 else _merge_same_begin(group)
+                    for group in buckets
+                ]
+                return (
+                    merged[0] if len(merged) == 1 else OrFormat(elements=merged)
+                )
         return _k3_pinned_key_tag(key)
     begin = (
         f'{_K3_OPEN}argument key="{_k3_escape_attr(key)}" type="{xtml_type}"{_K3_SEP}'
@@ -271,8 +421,8 @@ def _k3_arguments_block(parameters: dict[str, Any] | bool) -> Any:
         for defs_key in ("$defs", "definitions")
         if isinstance(parameters.get(defs_key), dict)
     }
-    tags: list[TagFormat] = []
-    expressible: dict[str, TagFormat] = {}
+    tags: list[Any] = []
+    expressible: dict[str, Any] = {}
     for key, prop in props.items():
         tag = _k3_argument_tag(key, prop, root_defs)
         if tag is not None:
@@ -301,11 +451,15 @@ def _k3_arguments_block(parameters: dict[str, Any] | bool) -> Any:
 # (review R3 P2 #2).
 _K3_MAX_STRICT_REQUIRED = 3
 _K3_MAX_COVERAGE_INNER_COPIES = 24
+# Grammar bloat guard for union alternation (review R13 P1): beyond this
+# many declared branches the key-pinned wildcard tag is cheaper and the
+# value axis stays (documented) permissive.
+_K3_MAX_UNION_BRANCHES = 8
 
 
 def _k3_required_coverage(
     required: list[str],
-    expressible: dict[str, TagFormat],
+    expressible: dict[str, Any],
     inner: Any,
 ) -> Any | None:
     """Demand at least one ``argument`` tag per schema-required property.
@@ -353,11 +507,18 @@ def _k3_required_coverage(
     return branches[0] if len(branches) == 1 else OrFormat(elements=branches)
 
 
-def _k3_call_tag(tool: FunctionToolParam) -> TagFormat:
-    """One ``call`` tag: ``<|open|>call tool="N" index="<digits>"<|sep|> args``."""
+def _k3_call_tag(tool: FunctionToolParam, *, strict_gate: bool) -> TagFormat:
+    """One ``call`` tag: ``<|open|>call tool="N" index="<digits>"<|sep|> args``.
+
+    ``strict_gate`` is True ONLY for ``tool_choice="auto"`` (the wheel
+    probes strict flags for auto at structural_tag_registry.py:109 and
+    installs one shared tag for the whole list).  For required / forced /
+    named the wheel never consults strict, so the gate is off there and a
+    merely-omitted flag stays schema-constrained (review R13/R14 #2).
+    """
 
     function = tool.function
-    parameters = _get_function_parameters(function)
+    parameters = _get_function_parameters(function, strict_gate=strict_gate)
     begin = f'{_K3_OPEN}call tool="{_k3_escape_attr(function.name)}" index="'
     return TagFormat(
         begin=begin,
@@ -399,11 +560,15 @@ def _k3_response_prefix() -> list[Any]:
     ]
 
 
-def _k3_tools_channel(tools: list[FunctionToolParam]) -> TagFormat:
+def _k3_tools_channel(
+    tools: list[FunctionToolParam], *, strict_gate: bool
+) -> TagFormat:
     return TagFormat(
         begin=_K3_TOOLS_OPEN,
         content=TagsWithSeparatorFormat(
-            tags=[_k3_call_tag(tool) for tool in tools],
+            tags=[
+                _k3_call_tag(tool, strict_gate=strict_gate) for tool in tools
+            ],
             separator="",
             at_least_one=True,
         ),
@@ -411,8 +576,25 @@ def _k3_tools_channel(tools: list[FunctionToolParam]) -> TagFormat:
     )
 
 
-def _get_function_parameters(function) -> dict[str, Any] | bool:
-    if getattr(function, "strict", None) is False:
+def _get_function_parameters(
+    function, *, strict_gate: bool
+) -> dict[str, Any] | bool:
+    """Parameter channel for one tool under the current ``tool_choice``.
+
+    ``strict_gate=True`` (auto only, review R13 P2): schema constraint
+    requires an EXPLICIT ``strict=True``; a sibling that merely OMITS the
+    flag (None, the API default) stays unconstrained so valid best-effort
+    calls are not masked.  ``strict_gate=False`` (required / forced /
+    named): the wheel constrains unless the tool explicitly DECLINED
+    (``strict is False``) -- identical to structural_tag_registry.py:208,
+    which never sees these paths' tool lists.
+    """
+
+    flag = getattr(function, "strict", None)
+    if strict_gate:
+        if flag is not True:
+            return True
+    elif flag is False:
         return True
     return function.parameters if function.parameters is not None else True
 
@@ -437,13 +619,15 @@ def get_kimi_k3_structural_tag(
         )
 
     if tool_choice == "auto":
-        tools_part: Any = OptionalFormat(content=_k3_tools_channel(tools))
+        tools_part: Any = OptionalFormat(
+            content=_k3_tools_channel(tools, strict_gate=True)
+        )
     elif tool_choice == "forced":
         # K3 rejects named tool choice upstream; treat defensively as a
         # single mandatory call of the first tool.
-        tools_part = _k3_tools_channel(tools[:1])
+        tools_part = _k3_tools_channel(tools[:1], strict_gate=False)
     else:  # required
-        tools_part = _k3_tools_channel(tools)
+        tools_part = _k3_tools_channel(tools, strict_gate=False)
 
     return StructuralTag(
         format=SequenceFormat(

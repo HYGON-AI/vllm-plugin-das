@@ -35,8 +35,6 @@ import inspect
 import sys
 from types import ModuleType
 
-from vllm.logger import init_logger
-
 from ._common import (
     PatchCompatibilityError,
     apply_once,
@@ -44,7 +42,12 @@ from ._common import (
     require_callable,
 )
 
-logger = init_logger(__name__)
+# NOTE: NO module-level ``vllm`` imports here. This patch module is
+# imported during plugin registration (patch/platform/core_fix/__init__),
+# and anything pulling vllm eagerly breaks the clean-import lifecycle
+# contract (tests/patch/test_plugin_lifecycle.py: heavy == []). The logger
+# is resolved lazily inside the failure branch, where the serving process
+# has vllm (and torch) imported anyway.
 
 TARGET_MODULE = "vllm.parser.abstract_parser"
 PATCH_ID = "platform.core_fix.kimi_k3_delegating_content_pass"
@@ -103,7 +106,9 @@ def _wrap_extract(cls: type, module: ModuleType) -> None:
             except Exception as exc:  # noqa: BLE001 - keep upstream result
                 # Review R11 P3-2: never silent -- a framing leak here is
                 # otherwise undebuggable in production.
-                logger.warning(
+                from vllm.logger import init_logger
+
+                init_logger(__name__).warning(
                     "kimi_k3 tool_choice=none framing extraction failed; "
                     "returning the raw wheel output unchanged: %r",
                     exc,

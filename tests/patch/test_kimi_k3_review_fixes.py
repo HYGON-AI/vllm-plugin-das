@@ -578,3 +578,247 @@ def test_required_without_structural_tag_fails_loudly() -> None:
     request.structured_outputs = SimpleNamespace(structural_tag="x")
     adjusted = _live_parser().adjust_request(request)
     assert adjusted.skip_special_tokens is False
+
+# --- review 2026-10-15 round 13 #3: incremental tool-call streaming ---
+
+STREAM_PIECES = [
+    "<|open|>response<|sep|>",
+    "Answer it: ",
+    "<|close|>response<|sep|>",
+    "<|open|>tools<|sep|>",
+    '<|open|>call tool="write_doc" index="1"<|sep|>',
+    '<|open|>argument key="title" type="string"<|sep|>My',
+    " Report",
+    "<|close|>argument<|sep|>",
+    '<|open|>argument key="depth" type="number"<|sep|>3',
+    "<|close|>argument<|sep|>",
+    "<|close|>call<|sep|>",
+    "<|close|>tools<|sep|>",
+    "<|close|>message<|sep|>",
+]
+
+
+def _gather(parser: KimiK3ToolParser, pieces=None) -> tuple[str, list]:
+    """Stream cumulative pieces, harvesting content and tool deltas.
+
+    DeltaToolCall.function stays a DeltaFunctionCall OBJECT on this wheel;
+    all assertions therefore use attribute access.
+    """
+
+    pieces = pieces if pieces is not None else STREAM_PIECES
+    request = SimpleNamespace(tool_choice="auto")
+    out_content: list[str] = []
+    out_calls: list = []
+    previous = ""
+    for step in pieces:
+        current = previous + step
+        delta = parser.extract_tool_calls_streaming(
+            previous, current, step, [], [], [], request
+        )
+        previous = current
+        if delta is None:
+            continue
+        if delta.content:
+            out_content.append(delta.content)
+        if delta.tool_calls:
+            out_calls.extend(delta.tool_calls)
+    flush = parser.finish_streaming()
+    if flush is not None:
+        if flush.content:
+            out_content.append(flush.content)
+        if flush.tool_calls:
+            out_calls.extend(flush.tool_calls)
+    return "".join(out_content), out_calls
+
+
+def _args_of(calls: list, index: int) -> str:
+    import json as _json  # noqa: F401
+
+    return "".join(
+        (getattr(c.function, "arguments", "") or "")
+        for c in calls
+        if c.function is not None and c.index == index
+    )
+
+
+def test_streaming_emits_call_header_and_argument_fragments() -> None:
+    """R13 P2: header (id+name) streams at the header marker, argument
+    fragments stream per delta (strings quoted, JSON numbers raw), and the
+    final assembled arguments parse to the same object as the closed path."""
+
+    parser = _live_parser()
+    content, calls = _gather(parser)
+    assert content == "Answer it: "
+    headers = [c for c in calls if c.id is not None]
+    assert [h.index for h in headers] == [0]
+    assert headers[0].id.startswith("write_doc:")
+    names = [
+        c.function.name for c in calls if c.function is not None and c.function.name
+    ]
+    assert names == ["write_doc"], calls
+
+    joined = _args_of(calls, 0)
+    assert '"title": "My Report"' in joined, joined
+    assert '"depth": 3' in joined, joined
+    import json as _json
+
+    assert _json.loads(joined) == {"title": "My Report", "depth": 3}
+
+
+def test_streaming_two_calls_sequential() -> None:
+    """Two closed calls stream at their close boundaries with stable ids
+    and complete arguments each."""
+
+    parser = _live_parser()
+    content, calls = _gather(
+        parser,
+        [
+            "<|open|>response<|sep|><|close|>response<|sep|>",
+            "<|open|>tools<|sep|>",
+            '<|open|>call tool="a" index="1"<|sep|>'
+            '<|open|>argument key="x" type="string"<|sep|>hi'
+            "<|close|>argument<|sep|><|close|>call<|sep|>",
+            '<|open|>call tool="b" index="2"<|sep|>'
+            '<|open|>argument key="y" type="number"<|sep|>1'
+            "<|close|>argument<|sep|><|close|>call<|sep|>",
+            "<|close|>tools<|sep|><|close|>message<|sep|>",
+        ],
+    )
+    assert content == ""
+    names = [
+        c.function.name for c in calls if c.function is not None and c.function.name
+    ]
+    assert names == ["a", "b"], calls
+    import json as _json
+
+    assert _json.loads(_args_of(calls, 0)) == {"x": "hi"}
+    assert _json.loads(_args_of(calls, 1)) == {"y": 1}
+
+
+def test_streaming_close_and_next_header_same_delta() -> None:
+    """R14 P1: one delta delivers call-a's close AND call-b's header -- a
+    must retire with its tail remainder BEFORE b opens, with b taking the
+    NEXT index (the old elif dropped a's tail and reused a's index)."""
+
+    parser = _live_parser()
+    content, calls = _gather(
+        parser,
+        [
+            "<|close|>response<|sep|><|open|>tools<|sep|>",
+            '<|open|>call tool="a" index="1"<|sep|>'
+            '<|open|>argument key="x" type="string"<|sep|>hi',
+            "<|close|>argument<|sep|><|close|>call<|sep|>"
+            '<|open|>call tool="b" index="2"<|sep|>'
+            '<|open|>argument key="y" type="number"<|sep|>3'
+            "<|close|>argument<|sep|><|close|>call<|sep|>",
+            "<|close|>tools<|sep|><|close|>message<|sep|>",
+        ],
+    )
+    assert content == ""
+    names = [
+        c.function.name for c in calls if c.function is not None and c.function.name
+    ]
+    assert names == ["a", "b"], calls
+    indices = [
+        c.index for c in calls if c.function is not None and c.function.name
+    ]
+    assert indices == [0, 1], calls
+    import json as _json
+
+    assert _json.loads(_args_of(calls, 0)) == {"x": "hi"}
+    assert _json.loads(_args_of(calls, 1)) == {"y": 3}
+
+
+def test_streaming_truncated_string_flush_repairs_json() -> None:
+    """Stream interrupted mid-string: the held-back tail (no close marker
+    could match) is released with the closing quote repaired exactly once
+    at finish_streaming, and the assembled arguments still parse."""
+
+    parser = _live_parser()
+    content, calls = _gather(
+        parser,
+        [
+            "<|close|>response<|sep|><|open|>tools<|sep|>",
+            '<|open|>call tool="write_doc" index="1"<|sep|>',
+            '<|open|>argument key="code" type="string"<|sep|>lo'
+            "ng value",
+        ],
+    )
+    assert content == ""
+    import json as _json
+
+    assert _json.loads(_args_of(calls, 0)) == {"code": "long value"}
+    args = _args_of(calls, 0)
+    assert args.count('"code"') == 1
+
+
+def test_streaming_truncated_nonstring_value_degrades() -> None:
+    """A truncated object/array value cannot be repaired (the parser
+    cannot close arbitrary JSON braces): end-of-stream flush leaves the
+    arguments unparsable rather than inventing structure -- matched by
+    the documented limitation."""
+
+    parser = _live_parser()
+    content, calls = _gather(
+        parser,
+        [
+            "<|close|>response<|sep|><|open|>tools<|sep|>",
+            '<|open|>call tool="cfg" index="1"<|sep|>',
+            '<|open|>argument key="opts" type="object"<|sep|>{"a":',
+        ],
+    )
+    assert content == ""
+    import json as _json
+
+    with pytest.raises(_json.JSONDecodeError):
+        _json.loads(_args_of(calls, 0))
+
+
+def test_streaming_final_releases_trailing_lt() -> None:
+    """R14 P3: a string value ending exactly with a literal '<' must be
+    fully released at end-of-stream (the marker holdback drops when
+    final=True); assembled arguments keep the '<'."""
+
+    parser = _live_parser()
+    content, calls = _gather(
+        parser,
+        [
+            "<|close|>response<|sep|><|open|>tools<|sep|>",
+            '<|open|>call tool="w" index="1"<|sep|>',
+            '<|open|>argument key="html" type="string"<|sep|>body <',
+        ],
+    )
+    assert content == ""
+    import json as _json
+
+    assert _json.loads(_args_of(calls, 0)) == {"html": "body <"}
+
+
+
+def test_streaming_closed_call_and_next_header_cold() -> None:
+    """R15 P1 cold repro: the FIRST streaming delta hands over a complete
+    (never-streamed) call a AND call-b's header; b's arguments arrive one
+    delta later.  a must emit at index 0 BEFORE b opens (index 1) -- the
+    pre-R15 order opened b first (b stole index 0) and a was dropped."""
+
+    parser = _live_parser()
+    content, calls = _gather(
+        parser,
+        [
+            "<|close|>response<|sep|><|open|>tools<|sep|>",
+            '<|open|>call tool="a" index="1"<|sep|>'
+            '<|open|>argument key="x" type="string"<|sep|>ok'
+            "<|close|>argument<|sep|><|close|>call<|sep|>"
+            '<|open|>call tool="b" index="2"<|sep|>',
+            '<|open|>argument key="y" type="number"<|sep|>7'
+            "<|close|>argument<|sep|><|close|>call<|sep|>",
+            "<|close|>tools<|sep|><|close|>message<|sep|>",
+        ],
+    )
+    assert content == ""
+    named = [c for c in calls if c.function is not None and c.function.name]
+    assert [(c.function.name, c.index) for c in named] == [("a", 0), ("b", 1)], calls
+    import json as _json
+
+    assert _json.loads(_args_of(calls, 0)) == {"x": "ok"}
+    assert _json.loads(_args_of(calls, 1)) == {"y": 7}

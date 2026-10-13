@@ -190,6 +190,16 @@ class KimiK3ToolParser(ToolParser):
             + _S,
             re.DOTALL,
         )
+        # R13 P2: streaming emits call headers and argument payloads while
+        # the call is still open; the closed ``_call_re`` stays reserved
+        # for finalization of the whole call.
+        self._call_open_re = re.compile(
+            _O + r"\s*call\s+(?P<attrs>" + _TEXT_UNTIL_SEP + r")" + _S
+        )
+        self._arg_open_re = re.compile(
+            _O + r"\s*argument\s+(?P<attrs>" + _TEXT_UNTIL_SEP + r")" + _S
+        )
+        self._call_close_re = re.compile(_C + r"\s*call\s*" + _S)
         # attr segment: key="value" (value already escaped on the encode side)
         self._attr_re = re.compile(r'(?P<k>\w+)="(?P<v>[^"]*)"')
         self._response_re = re.compile(
@@ -200,6 +210,13 @@ class KimiK3ToolParser(ToolParser):
         # streaming state
         self._sent_content_idx = 0
         self._sent_tool_call_count = 0
+        # R13 P2: the ONE partially generated call being streamed
+        # incrementally (models emit calls sequentially -- the grammar
+        # allows at most one open call at any prefix):
+        # {header_start, index, id, name, emitted}; ``emitted`` is the
+        # length of the JSON arguments prefix already sent.  Recompute
+        # everything else from the accumulated text each delta.
+        self._streaming_call: dict | None = None
         # Stream-end flush + delegation bookkeeping (review 2026-10-12):
         # _hcu_last_text  -> accumulated text for finish_streaming();
         # _hcu_last_extract -> (raw model_output, info) so the delegating
@@ -499,38 +516,297 @@ class KimiK3ToolParser(ToolParser):
         # finished=True turn (review 2026-10-12 P2 #5).
         self._hcu_last_text = current_text
 
-        # Conservative streaming: stream unwrapped response-channel text, then
-        # buffer tool calls and emit each call once its block closes.
+        # Stream unwrapped response-channel text as content; tool calls are
+        # streamed incrementally: the call header (id + name) as soon as it
+        # completes, argument payloads while they generate, and the closing
+        # ``}`` when the call closes (review R13 P2 -- the old closed-only
+        # path left clients silent for minutes during long arguments).
         content = self._extract_response_content(current_text)
 
-        # tools channel is open: parse fully-closed calls we have not emitted yet
         m_tools = self._tools_open_re.search(current_text)
         if m_tools is None:
             return DeltaMessage(content=content) if content else None
 
         section = current_text[m_tools.end() :]
+        # Nothing after the tools close marker is a call.
+        m_tools_close = self._tools_close_re.search(section)
+        if m_tools_close is not None:
+            section = section[: m_tools_close.start()]
+
+        closed_matches = list(self._call_re.finditer(section))
         calls = [
             tc
-            for m in self._call_re.finditer(section)
+            for m in closed_matches
             if (tc := self._decode_call(m["attrs"], m["body"])) is not None
         ]
-        if len(calls) <= self._sent_tool_call_count:
-            return DeltaMessage(content=content) if content else None
-        new = calls[self._sent_tool_call_count :]
 
-        deltas = [
+        # R14 P1: retirement is independent of the open scan.  A delta can
+        # close call k AND open call k+1 (speculative decoding, stream
+        # interval > 1); the elif below ran the retirement only when NO
+        # header followed, which dropped k's tail and emitted k+1's header
+        # reusing k's index.
+        closed_by_start = {m.start(): m for m in closed_matches}
+        deltas: list[DeltaToolCall] = []
+        st = self._streaming_call
+        if st is not None and st["header_start"] in closed_by_start:
+            deltas.extend(
+                self._retire_streaming_call(
+                    closed_by_start[st["header_start"]], st
+                )
+            )
+            self._streaming_call = None
+            st = None
+
+        # Order follows POSITION (review R15 P1): every CLOSED call that
+        # was never streamed emits BEFORE the next header opens, so one
+        # delta delivering "short call k closes + call k+1 header" keeps
+        # indices dense (k at its index, k+1 at the next) instead of
+        # dropping k and reusing its slot for k+1.
+        pending = calls[self._sent_tool_call_count :]
+        if pending:
+            deltas.extend(
+                DeltaToolCall(
+                    index=self._sent_tool_call_count + i,
+                    id=tc.id,
+                    type="function",
+                    function=DeltaFunctionCall(
+                        name=tc.function.name, arguments=tc.function.arguments
+                    ).model_dump(exclude_none=True),
+                )
+                for i, tc in enumerate(pending)
+            )
+            self._sent_tool_call_count += len(pending)
+
+        open_match = self._call_open_re.search(
+            section, closed_matches[-1].end() if closed_matches else 0
+        )
+        if open_match is not None and not self._attrs(open_match["attrs"]).get(
+            "tool"
+        ):
+            open_match = None
+
+        if open_match is not None:
+            if st is not None and st["header_start"] != open_match.start():
+                # Defensive: a record that matches neither the closed body
+                # nor the new header cannot be trusted.  Retire its index
+                # so the restart cannot alias a client-side accumulator
+                # (review R16 P3-1); unreachable under sequential output.
+                self._sent_tool_call_count = st["index"] + 1
+                self._streaming_call = None
+                st = None
+            if st is None:
+                meta = self._attrs(open_match["attrs"])
+                name = meta.get("tool", "")
+                st = {
+                    "header_start": open_match.start(),
+                    "index": self._sent_tool_call_count,
+                    "id": f"{name}:{make_tool_call_id()}",
+                    "name": name,
+                    "emitted": 0,
+                }
+                self._streaming_call = st
+                deltas.append(
+                    DeltaToolCall(
+                        index=st["index"],
+                        id=st["id"],
+                        type="function",
+                        function=DeltaFunctionCall(
+                            name=name, arguments=""
+                        ).model_dump(exclude_none=True),
+                    )
+                )
+            body = section[open_match.end() :]
+            prefix = self._streaming_arguments_prefix(body, final=False)
+            if len(prefix) > st["emitted"]:
+                deltas.append(
+                    DeltaToolCall(
+                        index=st["index"],
+                        function=DeltaFunctionCall(
+                            arguments=prefix[st["emitted"] :]
+                        ).model_dump(exclude_none=True),
+                    )
+                )
+                st["emitted"] = len(prefix)
+
+        if deltas:
+            return DeltaMessage(content=content, tool_calls=deltas)
+        return DeltaMessage(content=content) if content else None
+
+    def _retire_streaming_call(self, match, st: dict) -> list[DeltaToolCall]:
+        """Emit the remaining arguments of a closed streamed call.
+
+        ``match`` is the closed call located by its header start (R14 P1:
+        index-based lookup can drift past unnamed blocks).  The streamed
+        non-string values are raw model text; when their concatenation is
+        not valid JSON the canonical closed-path dump takes over -- but
+        only if it extends the already-streamed bytes, otherwise the
+        incremental output stands as-is (documented limitation).
+        """
+
+        final_prefix = self._streaming_arguments_prefix(
+            match["body"], final=True
+        )
+        # The incremental algorithm is deterministic: what was streamed is
+        # exactly the final prefix truncated at ``emitted``.
+        streamed = final_prefix[: st["emitted"]]
+        tail = final_prefix[st["emitted"] :]
+        if tail:
+            try:
+                json.loads(final_prefix)
+            except ValueError:
+                # Raw non-string junk (Python literals, truncation): prefer
+                # the canonical closed-path dump -- but only when it extends
+                # the already-streamed bytes; otherwise the incremental
+                # output stands as-is (documented limitation).
+                decode = self._decode_call(match["attrs"], match["body"])
+                canonical = (
+                    decode.function.arguments if decode is not None else None
+                )
+                if canonical is not None and canonical.startswith(streamed):
+                    tail = canonical[st["emitted"] :]
+        self._sent_tool_call_count = st["index"] + 1
+        if not tail:
+            return []
+        return [
             DeltaToolCall(
-                index=self._sent_tool_call_count + i,
-                id=tc.id,
-                type="function",
+                index=st["index"],
+                function=DeltaFunctionCall(arguments=tail).model_dump(
+                    exclude_none=True
+                ),
+            )
+        ]
+
+    @staticmethod
+    def _json_escape(value: str) -> str:
+        # Per-character (context-free) JSON string escaping -- identical to
+        # the closed-path ``json.dumps(..., ensure_ascii=False)`` for values
+        # and prefix-stable across delta boundaries.
+        return json.dumps(value, ensure_ascii=False)[1:-1]
+
+    def _streaming_arguments_prefix(self, body: str, final: bool) -> str:
+        """JSON-so-far for the OPEN call's argument sequence.
+
+        Recomputed from scratch each delta (same stateless pattern as the
+        other paths); the only persistent state is how much of the prefix
+        was already emitted, so fragments can be diffed out.  The output
+        shape mirrors the closed path's ``json.dumps(arguments,
+        ensure_ascii=False)``: ``{"k1": v1, "k2": v2}``.  Known limitations
+        (renderer never produces them; matched against the closed path):
+        duplicate keys stream the FIRST occurrence while the closed-path
+        decode keeps the last, and a truncated non-string (object/array)
+        value cannot be repaired into valid JSON at end-of-stream.
+        """
+
+        parts: list[str] = []
+        seen_keys: set[str] = set()
+        pos = 0
+        for m in self._arg_re.finditer(body):
+            attrs = self._attrs(m["attrs"])
+            key = attrs.get("key", "")
+            if key in seen_keys:
+                continue
+            is_string = attrs.get("type", "string") == "string"
+            rendered = (
+                f'"{self._json_escape(m["val"])}"'
+                if is_string
+                else m["val"]
+            )
+            joiner = ", " if seen_keys else ""
+            parts.append(
+                f'{joiner}{json.dumps(key, ensure_ascii=False)}: {rendered}'
+            )
+            seen_keys.add(key)
+            pos = m.end()
+
+        m_open = self._arg_open_re.search(body, pos)
+        trailing_string = False
+        if m_open is not None:
+            attrs = self._attrs(m_open["attrs"])
+            key = attrs.get("key", "")
+            if key not in seen_keys:
+                trailing_string = attrs.get("type", "string") == "string"
+                raw = body[m_open.end() :]
+                # Hold back any suffix that may still grow into the
+                # argument close marker -- canonical prefix plus the
+                # whitespace-tolerant shapes (same pairing as the content
+                # channel and review R11's holdback fix).  At end-of-stream
+                # nothing more can arrive, so the hold MUST drop -- a
+                # literal trailing ``<`` is data, not a prefix (R12 P2 #5
+                # precedent on the content channel; review R14 P3).
+                hold = (
+                    0
+                    if final
+                    else max(
+                        _partial_tag_overlap(raw, _CO + "argument" + _SS),
+                        _marker_holdback(raw, _CO, "argument", _SS),
+                    )
+                )
+                streamable = raw[: len(raw) - hold] if hold else raw
+                joiner = ", " if seen_keys else ""
+                if trailing_string:
+                    parts.append(
+                        f'{joiner}{json.dumps(key, ensure_ascii=False)}: '
+                        f'"{self._json_escape(streamable)}'
+                    )
+                else:
+                    parts.append(
+                        f'{joiner}{json.dumps(key, ensure_ascii=False)}: '
+                        f"{streamable}"
+                    )
+
+        prefix = "{" + "".join(parts)
+        if final:
+            if m_open is not None and trailing_string:
+                # repair the truncated string value into valid JSON
+                prefix += '"'
+            prefix += "}"
+        return prefix
+
+    def _finalize_streaming_call(self) -> list[DeltaToolCall] | None:
+        """Flush an unfinished open call at end-of-stream.
+
+        Emits whatever remains of the arguments prefix (with repaired
+        closing quotes, where the value shape allows it) exactly once, and
+        clears the streaming state.
+        """
+
+        st = self._streaming_call
+        if st is None:
+            return None
+        self._streaming_call = None
+        text = self._hcu_last_text
+        if text is None:
+            return None
+        m_tools = self._tools_open_re.search(text)
+        if m_tools is None:
+            return None
+        section = text[m_tools.end() :]
+        m_tools_close = self._tools_close_re.search(section)
+        if m_tools_close is not None:
+            section = section[: m_tools_close.start()]
+        last_closed_end = 0
+        for m in self._call_re.finditer(section):
+            last_closed_end = m.end()
+        open_match = self._call_open_re.search(section, last_closed_end)
+        if open_match is None or open_match.start() != st["header_start"]:
+            # The call closed already, or the record cannot be re-derived;
+            # the regular path handled it.
+            return None
+        body = section[open_match.end() :]
+        if self._call_close_re.search(body) is not None:
+            return None
+        prefix = self._streaming_arguments_prefix(body, final=True)
+        if len(prefix) <= st["emitted"]:
+            return None
+        self._sent_tool_call_count = st["index"] + 1
+        return [
+            DeltaToolCall(
+                index=st["index"],
                 function=DeltaFunctionCall(
-                    name=tc.function.name, arguments=tc.function.arguments
+                    arguments=prefix[st["emitted"] :]
                 ).model_dump(exclude_none=True),
             )
-            for i, tc in enumerate(new)
         ]
-        self._sent_tool_call_count = len(calls)
-        return DeltaMessage(content=content, tool_calls=deltas)
 
     def finish_streaming(self) -> DeltaMessage | None:
         """Release response text held back as a partial-tag prefix.
@@ -567,8 +843,16 @@ class KimiK3ToolParser(ToolParser):
             if position != -1
         ]
         limit = min(candidates) if candidates else len(text)
-        if limit <= start:
-            return None
-        held = text[start:limit]
-        self._sent_content_idx = limit
-        return DeltaMessage(content=held) if held else None
+        flush: DeltaMessage | None = None
+        if limit > start:
+            held = text[start:limit]
+            self._sent_content_idx = limit
+            flush = DeltaMessage(content=held) if held else None
+        # R13 P2: a call truncated mid-generation releases its remaining
+        # arguments (closing quote repaired for string values) exactly once.
+        final_deltas = self._finalize_streaming_call()
+        if final_deltas:
+            if flush is None:
+                return DeltaMessage(tool_calls=final_deltas)
+            flush.tool_calls = final_deltas
+        return flush

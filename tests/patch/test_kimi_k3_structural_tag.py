@@ -230,6 +230,7 @@ def _two_required_tool(name: str = "python") -> FunctionToolParam:
                 },
                 "required": ["alpha", "beta"],
             },
+            "strict": True,
         }
     )
 
@@ -248,8 +249,7 @@ def _mixed_required_tool(name: str = "python") -> FunctionToolParam:
                     "gamma": {"type": "string"},
                 },
                 "required": ["alpha", "beta"],
-            },
-        }
+            },        }
     )
 
 
@@ -261,8 +261,7 @@ def _union_tool(name: str = "fuzzy") -> FunctionToolParam:
                 "type": "object",
                 "properties": {"mystery": {"type": ["string", "integer"]}},
                 "required": ["mystery"],
-            },
-        }
+            },        }
     )
 
 
@@ -313,6 +312,163 @@ def test_union_required_pins_the_key() -> None:
     assert any('key="mystery"' in b for b in begins), begins
 
 
+def _int_bool_union_tool(name: str = "i32") -> FunctionToolParam:
+    """anyOf(integer|boolean) -- the bot's counterexample shape."""
+
+    return FunctionToolParam(
+        function={
+            "name": name,
+            "parameters": {
+                "type": "object",
+                "properties": {"payload": {"anyOf": [
+                    {"type": "integer"}, {"type": "boolean"},
+                ]}},
+                "required": ["payload"],
+                "additionalProperties": False,
+            },        }
+    )
+
+
+def test_union_alternation_constrains_the_value_axis() -> None:
+    """R13 P1: a union property must alternate DECLARED branches only --
+    same pinned key, one branch per alternative, value per branch type.
+    The old key-pinned wildcard accepted type="object" with arbitrary
+    content for an integer|boolean schema."""
+
+    tag = get_kimi_k3_structural_tag(
+        [_int_bool_union_tool()], [], "required", False
+    )
+    begins = [
+        getattr(f, "begin", "")
+        for f in _walk_formats(tag.format)
+        if type(f).__name__ == "TagFormat" and 'key="payload"' in getattr(f, "begin", "")
+    ]
+    # two XTML type renderings for the two branches (int -> number);
+    # object/array/string/null/boolean-all must NOT appear
+    assert any('type="number"' in b for b in begins), begins
+    assert any('type="boolean"' in b for b in begins), begins
+    assert not any(
+        'type="string"' in b or 'type="object"' in b or 'type="array"' in b
+        for b in begins
+    ), begins
+
+    # End-to-end FSM: number and boolean accepted-complete, object with
+    # arbitrary content dead, payload omitted dead.
+    xg = pytest.importorskip("xgrammar")
+    compiler_cls = getattr(xg, "GrammarCompiler", None)
+    if compiler_cls is None or not hasattr(compiler_cls, "compile_structural_tag"):
+        pytest.skip("xgrammar lacks GrammarCompiler.compile_structural_tag")
+    vocab = [
+        "a", "b", "c", "d", "e", "f", "g", "v", "3", "<", "|", ">", '"', "=",
+        "open", "close", "sep", "argument", "call", "tools", "response",
+        "message", "number", "boolean", "true", "key", "i32", "admin",
+        "payload", "index", "_", "s", "p", "l", "u", "t", "o", "n",
+        "r", "i", "x", " ", "1",
+    ]
+    compiled = compiler_cls(xg.TokenizerInfo(vocab)).compile_structural_tag(tag)
+
+    pre = '<|close|>response<|sep|><|open|>tools<|sep|><|open|>call tool="i32" index="1"<|sep|>'
+    post = "<|close|>call<|sep|><|close|>tools<|sep|>"
+    end = "<|close|>message<|sep|>"
+
+    def arg(t: str, val: str) -> str:
+        return (
+            f'<|open|>argument key="payload" type="{t}"<|sep|>{val}'
+            "<|close|>argument<|sep|>"
+        )
+
+    def accepts(sample: str) -> tuple[bool, bool]:
+        matcher = xg.GrammarMatcher(compiled)
+        return bool(matcher.accept_string(sample)), matcher.is_completed()
+
+    assert accepts(pre + arg("number", "3") + post + end) == (True, True)
+    assert accepts(pre + arg("boolean", "true") + post + end) == (True, True)
+    # the declining case: object + arbitrary JSON -- dead BEFORE sampling
+    assert accepts(pre + arg("object", '{"a": 1}') + post + end)[0] is False
+    assert accepts(pre + post + end)[0] is False
+
+
+def test_union_same_begin_branches_merge_not_drop() -> None:
+    """R14 P1: integer|number both render type="number"; the merge must
+    UNION the branch constraints (one JSONSchemaFormat anyOf) so 3.5 is
+    legal -- keeping only the first branch silently rejected 3.5."""
+
+    def int_number_tool(name: str = "floaty") -> FunctionToolParam:
+        return FunctionToolParam(
+            function={
+                "name": name,
+                "parameters": {
+                    "type": "object",
+                    "properties": {"v": {"anyOf": [
+                        {"type": "integer"}, {"type": "number"},
+                    ]}},
+                    "required": ["v"],
+                    "additionalProperties": False,
+                },
+            }
+        )
+
+    tag = get_kimi_k3_structural_tag([int_number_tool()], [], "required", False)
+    walked = [
+        f
+        for f in _walk_formats(tag.format)
+        if type(f).__name__ == "TagFormat" and 'key="v"' in getattr(f, "begin", "")
+    ]
+    # required coverage repeats the SAME merged tag across permutations:
+    # one distinct begin, one merged content shape per occurrence
+    assert len({getattr(f, "begin", "") for f in walked}) == 1, walked
+    assert walked, "no argument tag for key='v'"
+    contents = {id(getattr(f, "content", None)) for f in walked}
+    if len(contents) == 1:
+        merged = walked[0].content
+    else:
+        # fall back: same serialized schema
+        import json as _json
+
+        assert (
+            len(
+                {
+                    _json.dumps(getattr(f, "content", None), default=repr)
+                    for f in walked
+                }
+            )
+            == 1
+        ), walked
+        merged = walked[0].content
+    assert type(merged).__name__ == "JSONSchemaFormat", type(merged).__name__
+    assert len(merged.json_schema.get("anyOf", [])) == 2, merged.json_schema
+
+    xg = pytest.importorskip("xgrammar")
+    compiler_cls = getattr(xg, "GrammarCompiler", None)
+    if compiler_cls is None or not hasattr(compiler_cls, "compile_structural_tag"):
+        pytest.skip("xgrammar lacks GrammarCompiler.compile_structural_tag")
+    vocab = [
+        "a", "b", "c", "d", "e", "f", "g", "v", "3", "5", ".", "<", "|", ">",
+        '"', "=", "open", "close", "sep", "argument", "call", "tools",
+        "response", "message", "number", "key", "floaty", "payload",
+        "index", "_", "s", "p", "l", "u", "t", "o", "n", "r", "i", "x", " ",
+        "1",
+    ]
+    compiled = compiler_cls(xg.TokenizerInfo(vocab)).compile_structural_tag(tag)
+
+    pre = '<|close|>response<|sep|><|open|>tools<|sep|><|open|>call tool="floaty" index="1"<|sep|>'
+    post = "<|close|>call<|sep|><|close|>tools<|sep|>"
+    end = "<|close|>message<|sep|>"
+
+    def arg(val: str) -> str:
+        return (
+            f'<|open|>argument key="v" type="number"<|sep|>{val}'
+            "<|close|>argument<|sep|>"
+        )
+
+    def accepts(sample: str) -> tuple[bool, bool]:
+        matcher = xg.GrammarMatcher(compiled)
+        return bool(matcher.accept_string(sample)), matcher.is_completed()
+
+    assert accepts(pre + arg("3") + post + end) == (True, True)
+    assert accepts(pre + arg("3.5") + post + end) == (True, True)
+
+
 def _closed_union_tool(name: str = "py") -> FunctionToolParam:
     return FunctionToolParam(
         function={
@@ -324,8 +480,7 @@ def _closed_union_tool(name: str = "py") -> FunctionToolParam:
                 ]}},
                 "required": ["payload"],
                 "additionalProperties": False,
-            },
-        }
+            },        }
     )
 
 
@@ -486,8 +641,7 @@ def _closed_empty_tool(name: str = "python") -> FunctionToolParam:
                 "type": "object",
                 "properties": {},
                 "additionalProperties": False,
-            },
-        }
+            },        }
     )
 
 
@@ -570,3 +724,131 @@ def test_closed_empty_call_rejects_invented_args_via_xgrammar() -> None:
 
     assert accepts(pre + post + end) == (True, True)
     assert accepts(pre + invented + post + end)[0] is False
+
+
+# --- review 2026-10-15 round 13 #2: explicit strict opt-in only ---
+
+
+def _plain_sibling_tool(name: str = "plain_lookup") -> FunctionToolParam:
+    """No ``strict`` key at all (the API default)."""
+
+    return FunctionToolParam(
+        function={
+            "name": name,
+            "parameters": {
+                "type": "object",
+                "properties": {"q": {"type": "string"}},
+                "required": ["q"],
+            },
+        }
+    )
+
+
+def test_union_merge_hoists_defs_to_the_wrapper_root() -> None:
+    """R15 P2: ``#/$defs/T`` resolves from the document root -- the anyOf
+    wrapper created by same-begin merging.  Branches must shed their
+    (identical) defs tables and the wrapper carries them, or references
+    inside merged object branches stop resolving."""
+
+    schema = {
+        "type": "object",
+        "properties": {
+            "pick": {
+                "anyOf": [
+                    {
+                        "type": "object",
+                        "properties": {"r": {"$ref": "#/$defs/T"}},
+                    },
+                    {
+                        "type": "object",
+                        "properties": {"s": {"$ref": "#/$defs/T"}},
+                    },
+                ]
+            }
+        },
+        "required": ["pick"],
+        "additionalProperties": False,
+        "$defs": {"T": {"type": "string"}},
+    }
+    tool = FunctionToolParam(
+        function={"name": "picker", "parameters": schema}
+    )
+    tag = get_kimi_k3_structural_tag([tool], [], "required", False)
+    merged_tags = [
+        f
+        for f in _walk_formats(tag.format)
+        if type(f).__name__ == "JSONSchemaFormat"
+        and isinstance(getattr(f, "json_schema", None), dict)
+        and "anyOf" in f.json_schema
+    ]
+    assert merged_tags, "merged anyOf wrapper not found"
+    wrapper = merged_tags[0].json_schema
+    assert isinstance(wrapper["$defs"], dict) and "T" in wrapper["$defs"], wrapper
+    for branch in wrapper["anyOf"]:
+        assert "$defs" not in branch, branch
+    # every $ref keeps resolving against the hoisted table
+    for branch in wrapper["anyOf"]:
+        props = branch.get("properties", {})
+        for prop in props.values():
+            if "$ref" in prop:
+                name = prop["$ref"].split("/")[-1]
+                assert name in wrapper["$defs"], (prop, wrapper)
+
+    # compile the tag: a broken $ref would fail the whole request here
+    xg = pytest.importorskip("xgrammar")
+    compiler_cls = getattr(xg, "GrammarCompiler", None)
+    if compiler_cls is None or not hasattr(
+        compiler_cls, "compile_structural_tag"
+    ):
+        pytest.skip("xgrammar lacks GrammarCompiler.compile_structural_tag")
+    vocab = [
+        "a", "b", "c", "d", "e", "f", "g", "v", "3", "<", "|", ">", '"', "=",
+        "open", "close", "sep", "argument", "call", "tools", "response",
+        "message", "object", "string", "key", "picker", "pick", "r", "s",
+        "index", "{", "}", ":", " ", "_",
+    ]
+    compiled = compiler_cls(xg.TokenizerInfo(vocab)).compile_structural_tag(tag)
+    pre = '<|close|>response<|sep|><|open|>tools<|sep|><|open|>call tool="picker" index="1"<|sep|>'
+    post = "<|close|>call<|sep|><|close|>tools<|sep|>"
+    end = "<|close|>message<|sep|>"
+    sample = (
+        pre
+        + '<|open|>argument key="pick" type="object"<|sep|>{"r": "v"}'
+        + "<|close|>argument<|sep|>"
+        + post
+        + end
+    )
+    matcher = xg.GrammarMatcher(compiled)
+    assert matcher.accept_string(sample)
+    del vocab
+
+
+def test_strict_opt_in_is_required_for_schema_constraint() -> None:
+    """R13 P2: the wheel installs ONE structural tag for the whole list
+    when any tool sets strict (registry :109); a sibling that merely
+    OMITS the flag must stay unconstrained.  The omitted flag used to
+    fall through ``strict is False`` into the schema channel, masking
+    otherwise valid best-effort calls."""
+
+    tag = get_kimi_k3_structural_tag(
+        [_two_required_tool(name="weather"), _plain_sibling_tool()],
+        [],
+        "auto",
+        False,
+    )
+    walked = _walk_formats(tag.format)
+    names = [type(f).__name__ for f in walked]
+    begins = [
+        getattr(f, "begin", "")
+        for f in walked
+        if type(f).__name__ == "TagFormat"
+    ]
+    # the single permissive wildcard belongs to the omitting sibling ...
+    assert names.count("PlusFormat") == 0, names  # weather coverage engaged
+    assert (
+        sum(1 for b in begins if b == "<|open|>argument ") == 1
+    ), begins
+    # ... while the strict tool keeps its schema-constrained tags
+    assert any('tool="weather"' in b for b in begins), begins
+    assert any('tool="plain_lookup"' in b for b in begins), begins
+    assert any('key="alpha"' in b and 'type="string"' in b for b in begins), begins
