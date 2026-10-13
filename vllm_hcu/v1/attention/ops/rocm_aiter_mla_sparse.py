@@ -1143,10 +1143,14 @@ def _use_lightop_sparse_mla_topk() -> bool:
 
 
 def _decode_sparse_mla_topk_backend(topk_tokens: int) -> str:
-    """Decode top-k backend; unsupported ragged sizes use torch, not per_row."""
+    """Decode top-k backend.
+
+    Ragged only supports topk == 2048; other sizes (e.g. DeepSeek V4's 512)
+    keep the pre-ragged per_row selector.
+    """
     backend = _sparse_mla_topk_backend()
     if backend == "ragged" and topk_tokens != _LIGHTOP_RAGGED_TOPK_TOKENS:
-        return "torch"
+        return "per_row"
     return backend
 
 
