@@ -147,6 +147,11 @@ register_hcu_ci(
 )
 register_hcu_ci(
     job="accuracy-gfx938",
+    target="tests/kv_connector/test_decode_bench_connector.py::test_native_packed_readback",
+    est_time=30,
+)
+register_hcu_ci(
+    job="accuracy-gfx938",
     target="tests/accuracy/test_aiter_silu_and_mul.py",
     est_time=300,
 )
