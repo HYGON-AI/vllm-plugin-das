@@ -272,26 +272,45 @@ def _rsg_config(M: int):
     raise AssertionError(f"M={M} > RSG_MAX_M={RSG_MAX_M}")
 
 
-def init_router_shared_workspace(device: torch.device, NR: int, I: int) -> None:
-    """Workspace for router_shared_swiglustep(); call before cudagraph capture."""
+def make_router_shared_workspace(
+    device: torch.device, NR: int, I: int
+) -> tuple[torch.Tensor, torch.Tensor]:
+    """Allocate one router/shared split-K workspace.
+
+    Model layers use separate workspaces because CUDA graphs for different
+    layers or target/draft models may execute concurrently.  Sharing the tile
+    counters across those graphs can make one launch reduce another launch's
+    partials.
+    """
     device = torch.device(device)
     if device.index is None:
         device = torch.device(device.type, torch.cuda.current_device())
-    if device in _rsg_workspace:
-        return
     ws_elems = tiles = 0
     for max_m, (BM, BN, _, split_k, _, _) in _RSG_CONFIGS:
         t = triton.cdiv(max_m, BM) * (triton.cdiv(NR, BN) + triton.cdiv(I, BN))
         tiles = max(tiles, t)
         ws_elems = max(ws_elems, split_k * t * 2 * BM * BN)
-    _rsg_workspace[device] = (
+    return (
         torch.empty(ws_elems, device=device, dtype=torch.float32),
         torch.zeros(tiles, device=device, dtype=torch.int32),
     )
 
 
+def init_router_shared_workspace(device: torch.device, NR: int, I: int) -> None:
+    """Initialize the compatibility workspace for direct callers."""
+    device = torch.device(device)
+    if device.index is None:
+        device = torch.device(device.type, torch.cuda.current_device())
+    if device not in _rsg_workspace:
+        _rsg_workspace[device] = make_router_shared_workspace(device, NR, I)
+
+
 def router_shared_swiglustep(
-    x: torch.Tensor, w_router: torch.Tensor, w_gate_up: torch.Tensor, limit: float
+    x: torch.Tensor,
+    w_router: torch.Tensor,
+    w_gate_up: torch.Tensor,
+    limit: float,
+    workspace: tuple[torch.Tensor, torch.Tensor] | None = None,
 ) -> tuple[torch.Tensor, torch.Tensor]:
     """(``x @ w_router`` in fp32, ``swiglustep(x @ w_gate_up)`` in bf16).
 
@@ -308,12 +327,14 @@ def router_shared_swiglustep(
         return logits, act
     BM, BN, BK, split_k, num_warps, num_stages = _rsg_config(M)
     assert K % (split_k * BK) == 0 and split_k > 1
-    if x.device not in _rsg_workspace:
-        assert not torch.cuda.is_current_stream_capturing(), (
-            "init_router_shared_workspace() must run before cudagraph capture"
-        )
-        init_router_shared_workspace(x.device, NR, I)
-    ws, cnt = _rsg_workspace[x.device]
+    if workspace is None:
+        if x.device not in _rsg_workspace:
+            assert not torch.cuda.is_current_stream_capturing(), (
+                "init_router_shared_workspace() must run before cudagraph capture"
+            )
+            init_router_shared_workspace(x.device, NR, I)
+        workspace = _rsg_workspace[x.device]
+    ws, cnt = workspace
     num_tiles = triton.cdiv(M, BM) * (triton.cdiv(NR, BN) + triton.cdiv(I, BN))
     assert cnt.numel() >= num_tiles
     assert ws.numel() >= split_k * num_tiles * 2 * BM * BN

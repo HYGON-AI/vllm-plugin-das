@@ -278,6 +278,7 @@ class BF16FP32RouterLinear(ReplicatedLinear):
         if self.weight.is_cuda:
             init_router_gemm_workspace(self.weight.device, output_size)
         self._fused_shared: list[Step5MLP] | None = None
+        self._rsg_workspace: tuple[torch.Tensor, torch.Tensor] | None = None
 
     def weight_loader(self, param: Parameter, loaded_weight: torch.Tensor):
         if loaded_weight.dtype != torch.bfloat16:
@@ -291,7 +292,7 @@ class BF16FP32RouterLinear(ReplicatedLinear):
         """Compute ``mlp``'s gate_up + SwigluStep together with the logits for
         decode-sized inputs; ``mlp.forward`` on the same input picks it up."""
         from vllm_hcu.ops.step5.router_gemm import (
-            init_router_shared_workspace,
+            make_router_shared_workspace,
             router_shared_swiglustep,
         )
 
@@ -300,17 +301,18 @@ class BF16FP32RouterLinear(ReplicatedLinear):
         self._fused_shared = [mlp]
         self._rsg = router_shared_swiglustep
         if self.weight.is_cuda:
-            init_router_shared_workspace(
+            self._rsg_workspace = make_router_shared_workspace(
                 self.weight.device,
                 self.weight.shape[1],
                 mlp.gate_up_proj.output_size_per_partition // 2,
             )
 
-    def _forward_fused_shared(self, x2: torch.Tensor) -> torch.Tensor | None:
+    def _forward_fused_shared(
+        self, x2: torch.Tensor
+    ) -> tuple[torch.Tensor, torch.Tensor] | None:
         from vllm_hcu.ops.step5.router_gemm import RSG_MAX_M
 
         mlp = self._fused_shared[0]
-        mlp.fused_act = None
         w_gu = mlp.gate_up_proj.weight
         if (
             x2.shape[0] > RSG_MAX_M
@@ -321,18 +323,30 @@ class BF16FP32RouterLinear(ReplicatedLinear):
             or self.weight.stride(1) != 1
         ):
             return None
-        logits, act = self._rsg(x2, self.weight, w_gu, mlp.limit)
-        mlp.fused_act = (torch.cuda.current_stream().cuda_stream, x2.shape, act)
-        return logits
+        logits, act = self._rsg(
+            x2,
+            self.weight,
+            w_gu,
+            mlp.limit,
+            workspace=self._rsg_workspace,
+        )
+        return logits, act
 
-    def forward(self, x: torch.Tensor) -> tuple[torch.Tensor, None]:
+    def forward(self, x: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor | None]:
         w = self.weight
+        if self._fused_shared is not None:
+            # A prior eligible call may have left a cache that must never be
+            # consumed by an ineligible dtype or weight layout.
+            self._fused_shared[0].fused_act = None
         if x.dtype == torch.bfloat16 and w.shape[0] == x.shape[-1]:
             x2 = x.reshape(-1, x.shape[-1])
             if self._fused_shared is not None:
-                out = self._forward_fused_shared(x2)
-                if out is not None:
-                    return out.view(*x.shape[:-1], w.shape[1]), None
+                # Return the activation explicitly so Dynamo records the
+                # cross-module dataflow.
+                fused = self._forward_fused_shared(x2)
+                if fused is not None:
+                    out, shared_act = fused
+                    return out.view(*x.shape[:-1], w.shape[1]), shared_act
             out = self._gemm(x2, w)
             return out.view(*x.shape[:-1], w.shape[1]), None
         # Weight in [out, in] layout (VLLM_USE_NN off) or non-bf16 activations.
@@ -989,7 +1003,13 @@ class FusedMoEBlock(nn.Module):
                 hidden_states=hidden_states, router_logits=hidden_states
             )
         else:
-            router_logits, _ = self.gate(hidden_states)
+            router_logits, fused_shared_act = self.gate(hidden_states)
+            if fused_shared_act is not None:
+                self.share_expert.fused_act = (
+                    torch.cuda.current_stream().cuda_stream,
+                    hidden_states.shape,
+                    fused_shared_act,
+                )
             routed_output = self.experts(
                 hidden_states=hidden_states, router_logits=router_logits
             )
