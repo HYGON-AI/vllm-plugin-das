@@ -6,7 +6,6 @@ from __future__ import annotations
 
 import fcntl
 import functools
-import hashlib
 import json
 import os
 import tempfile
@@ -22,6 +21,7 @@ from vllm_hcu.model_executor.layers.fused_moe.static_eplb import (
     StaticEplbPlan,
     load_static_eplb_plan,
     resolve_offline_eplb_model_key,
+    validate_static_eplb_artifact,
     verify_static_plan_across_ep_ranks,
 )
 
@@ -31,6 +31,7 @@ from ._common import (
     require_class,
     require_exact_signature,
 )
+from .patch_eplb_communicator import STATIC_MODE_MARKER
 
 
 TARGET_MODULE = "vllm.distributed.eplb.eplb_state"
@@ -118,6 +119,7 @@ def _validate_model_entry(model_key: str, entry: object) -> None:
         raise ValueError("Offline EPLB physical map layer count mismatch")
     StaticEplbPlan(
         model_key=model_key,
+        model_name=entry["model_name"],
         source_path="/offline-eplb-record-validation",
         source_sha256="0" * 64,
         record_kind=record_kind,
@@ -151,6 +153,43 @@ def _empty_record_payload() -> dict[str, Any]:
         "format": _OFFLINE_EPLB_FORMAT,
         "model_maps": {},
     }
+
+
+def _write_record_payload(output: Path, payload: dict[str, Any]) -> None:
+    descriptor, temporary_name = tempfile.mkstemp(
+        prefix=f".{output.name}.",
+        suffix=".tmp",
+        dir=output.parent,
+    )
+    temporary = Path(temporary_name)
+    try:
+        with os.fdopen(descriptor, "w", encoding="utf-8") as destination:
+            json.dump(payload, destination, sort_keys=True)
+            destination.flush()
+            os.fsync(destination.fileno())
+        os.replace(temporary, output)
+        directory_fd = os.open(output.parent, os.O_RDONLY | os.O_DIRECTORY)
+        try:
+            os.fsync(directory_fd)
+        finally:
+            os.close(directory_fd)
+    finally:
+        temporary.unlink(missing_ok=True)
+
+
+def _start_offline_record_session(path: str | Path) -> None:
+    """Atomically invalidate every proposal left by an earlier run."""
+
+    if _ep_rank() != 0:
+        return
+    output = Path(path).expanduser()
+    if not str(output):
+        raise ValueError("Offline EPLB record path must be nonempty")
+    output.parent.mkdir(parents=True, exist_ok=True)
+    lock_path = output.with_suffix(output.suffix + ".lock")
+    with lock_path.open("a", encoding="utf-8") as lock_file:
+        fcntl.flock(lock_file, fcntl.LOCK_EX)
+        _write_record_payload(output, _empty_record_payload())
 
 
 def record_offline_expert_map(
@@ -216,86 +255,26 @@ def record_offline_expert_map(
         }
         _validate_record_payload(merged)
 
-        descriptor, temporary_name = tempfile.mkstemp(
-            prefix=f".{output.name}.",
-            suffix=".tmp",
-            dir=output.parent,
-        )
-        temporary = Path(temporary_name)
-        try:
-            with os.fdopen(descriptor, "w", encoding="utf-8") as destination:
-                json.dump(merged, destination, sort_keys=True)
-                destination.flush()
-                os.fsync(destination.fileno())
-            os.replace(temporary, output)
-            directory_fd = os.open(output.parent, os.O_RDONLY | os.O_DIRECTORY)
-            try:
-                os.fsync(directory_fd)
-            finally:
-                os.close(directory_fd)
-        finally:
-            temporary.unlink(missing_ok=True)
+        _write_record_payload(output, merged)
 
 
 def validate_offline_eplb_record_complete(
     path: str | Path,
     *,
     required_models: Mapping[str, int],
+    expected_model_name: str,
     num_logical_experts: int,
     num_redundant_experts: int,
 ) -> str:
     """Validate a stable, proposal-complete multi-model calibration file."""
 
-    logical = _strict_count(
-        num_logical_experts,
-        "num_logical_experts",
-        minimum=1,
+    return validate_static_eplb_artifact(
+        path,
+        required_models=required_models,
+        expected_model_name=expected_model_name,
+        num_logical_experts=num_logical_experts,
+        num_redundant_experts=num_redundant_experts,
     )
-    redundant = _strict_count(
-        num_redundant_experts,
-        "num_redundant_experts",
-    )
-    if not isinstance(required_models, Mapping) or not required_models:
-        raise ValueError("Offline EPLB required_models must be nonempty")
-
-    source = Path(path).expanduser().resolve(strict=True)
-    raw = source.read_bytes()
-    try:
-        payload = json.loads(raw)
-    except (UnicodeDecodeError, json.JSONDecodeError) as exc:
-        raise ValueError("Offline EPLB record contains malformed JSON") from exc
-    payload = _validate_record_payload(payload)
-    physical = logical + redundant
-    for model_key, expected_layers in required_models.items():
-        layers = _strict_count(
-            expected_layers,
-            f"{model_key} num_moe_layers",
-            minimum=1,
-        )
-        entry = payload["model_maps"].get(model_key)
-        if entry is None:
-            raise ValueError(
-                f"Offline EPLB record is missing required model {model_key!r}"
-            )
-        if entry["record_kind"] != "proposal":
-            raise ValueError(
-                f"Offline EPLB model {model_key!r} has no proposal"
-            )
-        expected = {
-            "model_class": model_key,
-            "num_moe_layers": layers,
-            "num_logical_experts": logical,
-            "num_physical_experts": physical,
-            "num_redundant_experts": redundant,
-        }
-        for name, value in expected.items():
-            if type(entry.get(name)) is not type(value) or entry[name] != value:
-                raise ValueError(
-                    f"Offline EPLB model {model_key!r} {name} count mismatch"
-                )
-    if source.read_bytes() != raw:
-        raise ValueError("Offline EPLB record changed during validation")
-    return hashlib.sha256(raw).hexdigest()
 
 
 def _paths(parallel_config: object) -> tuple[str | None, str | None]:
@@ -404,6 +383,15 @@ def apply_to_module(module) -> bool:
             return original_add(self, model, model_config)
 
         _initialize_offline_counters(self)
+        if record_path and getattr(
+            self,
+            "_vllm_hcu_offline_record_session_path",
+            None,
+        ) != str(Path(record_path).expanduser().resolve()):
+            _start_offline_record_session(record_path)
+            self._vllm_hcu_offline_record_session_path = str(
+                Path(record_path).expanduser().resolve()
+            )
         plan = None
         if load_path:
             plan = getattr(model, "_vllm_hcu_static_eplb_plan", None)
@@ -417,6 +405,7 @@ def apply_to_module(module) -> bool:
                     model,
                     self.parallel_config,
                 ),
+                expected_model_name=model_config.model,
                 expected_shape=(
                     len(tuple(model.moe_layers)),
                     model.num_physical_experts,
@@ -471,6 +460,7 @@ def apply_to_module(module) -> bool:
             original_add(self, model, model_config)
 
         model_state = self.model_states[model_config.compute_hash()]
+        setattr(model_state.communicator, STATIC_MODE_MARKER, plan is not None)
         model_state._hcu_offline_record_path = record_path
         model_state._hcu_offline_owner = self
         model_state._hcu_offline_model_key = resolve_offline_eplb_model_key(

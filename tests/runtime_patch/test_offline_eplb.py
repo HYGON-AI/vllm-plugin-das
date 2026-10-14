@@ -182,6 +182,7 @@ def _complete_record(path):
     return validate_offline_eplb_record_complete(
         path,
         required_models={"HYV4ForCausalLM": 2, "HYV4MTP": 1},
+        expected_model_name="hy4-test",
         num_logical_experts=3,
         num_redundant_experts=1,
     )
@@ -333,7 +334,7 @@ def _setup_state(tmp_path, monkeypatch: pytest.MonkeyPatch, mode="static"):
 
     state = upstream.EplbState(parallel, torch.device("cpu"))
     model_config = SimpleNamespace(
-        model="hy4-test",
+        model="generic-test",
         compute_hash=lambda: f"{mode}-model",
     )
     return SimpleNamespace(
@@ -377,6 +378,27 @@ def test_record_add_publishes_initial_map_and_disables_async(
     assert fixture.state._vllm_hcu_offline_proposal_events == 0
     assert fixture.state._vllm_hcu_offline_transfer_events == 0
     assert fixture.state._vllm_hcu_offline_rearrangement_events == 0
+
+
+def test_record_add_starts_new_session_and_discards_stale_proposals(
+    tmp_path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    fixture = _setup_state(tmp_path, monkeypatch, mode="record")
+    path = tmp_path / "record.json"
+    _record(path, model_key="HYV4ForCausalLM", record_kind="proposal")
+    _record(
+        path,
+        model_key="HYV4MTP",
+        rows=[[0, 1, 2, 1]],
+        record_kind="proposal",
+    )
+
+    fixture.state.add_model(fixture.model, fixture.model_config)
+
+    payload = json.loads(path.read_text())
+    assert set(payload["model_maps"]) == {"GenericMoE"}
+    assert payload["model_maps"]["GenericMoE"]["record_kind"] == "initial"
 
 
 def test_record_proposal_uses_policy_without_transfer_or_live_commit(
@@ -769,7 +791,7 @@ def test_static_state_rejects_models_bound_to_mixed_source_sha(
     bind_static_eplb_plan(fixture.config, second)
 
     second_config = SimpleNamespace(
-        model="hy4-test-mtp",
+        model="generic-test",
         compute_hash=lambda: "static-mtp-model",
     )
     with pytest.raises(ValueError, match="mixed source SHA-256"):

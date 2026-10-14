@@ -120,6 +120,7 @@ def config_and_map(
         SimpleNamespace(
             additional_config={"hcu": feature_config.to_dict()},
             parallel_config=parallel_config,
+            model_config=SimpleNamespace(model="generic-test"),
             load_config=SimpleNamespace(load_format="safetensors"),
         ),
         path,

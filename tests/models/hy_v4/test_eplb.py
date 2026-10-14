@@ -3,6 +3,7 @@
 
 from __future__ import annotations
 
+import json
 from types import SimpleNamespace
 
 import pytest
@@ -61,6 +62,8 @@ def _vllm_config(
     enable_expert_parallel: bool = True,
     enable_elastic_ep: bool = False,
     pipeline_parallel_size: int = 1,
+    tensor_parallel_size: int = 1,
+    data_parallel_size: int = 8,
 ) -> SimpleNamespace:
     hcu = {}
     if offline_field is not None:
@@ -73,6 +76,8 @@ def _vllm_config(
             enable_elastic_ep=enable_elastic_ep,
             enable_ep_weight_filter=False,
             pipeline_parallel_size=pipeline_parallel_size,
+            tensor_parallel_size=tensor_parallel_size,
+            data_parallel_size=data_parallel_size,
             eplb_config=SimpleNamespace(
                 num_redundant_experts=redundant,
                 use_async=use_async,
@@ -81,19 +86,24 @@ def _vllm_config(
     )
 
 
-def _patch_moe_dependencies(monkeypatch: pytest.MonkeyPatch):
+def _patch_moe_dependencies(
+    monkeypatch: pytest.MonkeyPatch,
+    *,
+    tp_size: int = 1,
+    ep_size: int = 8,
+):
     captured: dict[str, object] = {}
     monkeypatch.setattr(
         hy_v4_moe,
         "get_tensor_model_parallel_world_size",
-        lambda: 8,
+        lambda: tp_size,
     )
     monkeypatch.setattr(
         hy_v4_moe,
         "get_ep_group",
         lambda: SimpleNamespace(
             rank_in_group=3,
-            device_group=SimpleNamespace(size=lambda: 8),
+            device_group=SimpleNamespace(size=lambda: ep_size),
         ),
     )
     monkeypatch.setattr(hy_v4_moe, "GateLinear", lambda *args, **kwargs: _FakeGate())
@@ -147,7 +157,10 @@ def test_hy_v4_offline_eplb_allocates_ep8_redundant_topology(
         ({"enable_expert_parallel": False}, "expert parallel"),
         ({"enable_elastic_ep": True}, "elastic"),
         ({"pipeline_parallel_size": 2}, "pipeline parallel"),
-        ({"redundant": 7}, "divisible"),
+        ({"redundant": 7}, "exactly 8"),
+        ({"redundant": 16}, "exactly 8"),
+        ({"tensor_parallel_size": 2}, "TP1"),
+        ({"data_parallel_size": 4}, "DP8"),
     ],
 )
 def test_hy_v4_offline_eplb_rejects_unsupported_modes(
@@ -162,6 +175,19 @@ def test_hy_v4_offline_eplb_rejects_unsupported_modes(
         hy_v4_moe.HYV4MoEFused(
             config=_hf_config(),
             vllm_config=config,
+            enable_eplb=True,
+        )
+
+
+def test_hy_v4_offline_eplb_rejects_non_ep8_runtime_group(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    _patch_moe_dependencies(monkeypatch, ep_size=4)
+
+    with pytest.raises(ValueError, match="EP8"):
+        hy_v4_moe.HYV4MoEFused(
+            config=_hf_config(),
+            vllm_config=_vllm_config(),
             enable_eplb=True,
         )
 
@@ -234,6 +260,23 @@ def _install_layer_states(model) -> None:
         layer.set_eplb_state = layer.eplb_state.set_layer_state
 
 
+def _complete_hyv4_map(tmp_path):
+    config, path = config_and_map(tmp_path, key="HYV4ForCausalLM")
+    payload = json.loads(path.read_text())
+    mtp = dict(payload["model_maps"]["HYV4ForCausalLM"])
+    mtp.update(
+        model_class="HYV4MTP",
+        num_moe_layers=1,
+        physical_to_logical_map=[[2, 0, 1, 2]],
+    )
+    payload["model_maps"]["HYV4MTP"] = mtp
+    path.write_text(json.dumps(payload))
+    config.model_config.hf_config = SimpleNamespace(
+        mlp_layer_types=["sparse", "sparse"]
+    )
+    return config, path
+
+
 @pytest.mark.parametrize(
     ("kind", "model_key", "rows"),
     [
@@ -257,7 +300,7 @@ def test_hy_v4_static_state_requires_and_uses_distinct_bound_plan(
     with pytest.raises((ValueError, NotImplementedError), match="plan"):
         outer.set_eplb_state(load, logical, counts)
 
-    config, _ = config_and_map(tmp_path, key=model_key, rows=rows)
+    config, _ = _complete_hyv4_map(tmp_path)
     plan = bind_static_eplb_plan(config, outer)
     assert plan is not None
     assert plan.model_key == model_key
@@ -272,6 +315,14 @@ def test_hy_v4_static_state_requires_and_uses_distinct_bound_plan(
     outer.update_physical_experts_metadata(4, 2)
     with pytest.raises(ValueError, match="cannot change"):
         outer.update_physical_experts_metadata(8, 4)
+
+
+def test_hy_v4_static_binding_rejects_target_only_artifact(tmp_path) -> None:
+    outer, _ = _offline_owner("target")
+    config, _ = config_and_map(tmp_path, key="HYV4ForCausalLM")
+
+    with pytest.raises(ValueError, match="HYV4MTP"):
+        bind_static_eplb_plan(config, outer)
 
 
 def test_hy_v4_record_state_uses_runtime_metadata_without_static_plan() -> None:
@@ -297,12 +348,7 @@ def test_hy_v4_record_state_uses_runtime_metadata_without_static_plan() -> None:
 def test_hy_v4_static_state_rejects_changed_bound_layer_row(tmp_path) -> None:
     outer, _ = _offline_owner("target")
     _install_layer_states(outer)
-    rows = [[0, 1, 2, 1], [2, 0, 1, 2]]
-    config, _ = config_and_map(
-        tmp_path,
-        key="HYV4ForCausalLM",
-        rows=rows,
-    )
+    config, _ = _complete_hyv4_map(tmp_path)
     bind_static_eplb_plan(config, outer)
     outer.moe_layers[0].routed_experts._vllm_hcu_static_eplb_row = (
         1,
@@ -488,11 +534,7 @@ def test_hy_v4_static_loader_keeps_complete_replicated_checkpoint_ledger(
         monkeypatch,
         rank,
     )
-    config, _ = config_and_map(
-        tmp_path,
-        key=type(model).__name__,
-        rows=rows,
-    )
+    config, _ = _complete_hyv4_map(tmp_path)
     bind_static_eplb_plan(config, model)
 
     loaded = model.load_weights(iter(_checkpoint_weights(model, fused=fused)))
@@ -520,7 +562,7 @@ def test_hy_v4_static_binding_preserves_router_bias_checkpoint_owner(
     monkeypatch: pytest.MonkeyPatch,
     kind: str,
 ) -> None:
-    model, rows = _checkpoint_owner(
+    model, _ = _checkpoint_owner(
         kind,
         checkpoint_model,
         monkeypatch,
@@ -538,11 +580,7 @@ def test_hy_v4_static_binding_preserves_router_bias_checkpoint_owner(
         mlp.expert_bias = nn.Parameter(torch.tensor([2.0, 3.0, 5.0]))
         mlp.experts.routed_experts.e_score_correction_bias = mlp.expert_bias
     before = dict(model.named_parameters())
-    config, _ = config_and_map(
-        tmp_path,
-        key=type(model).__name__,
-        rows=rows,
-    )
+    config, _ = _complete_hyv4_map(tmp_path)
 
     bind_static_eplb_plan(config, model)
 

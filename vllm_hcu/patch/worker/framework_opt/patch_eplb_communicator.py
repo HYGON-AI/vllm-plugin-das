@@ -1,6 +1,6 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright (c) 2026 Hygon Information Technology Co., Ltd.
-"""Avoid device profile-buffer reservation for CPU-staged EPLB."""
+"""Skip Gloo profile buffers only for static offline EPLB instances."""
 
 from __future__ import annotations
 
@@ -17,6 +17,7 @@ TARGETS = (
         "needs_profile_buffer_reservation"
     ),
 )
+STATIC_MODE_MARKER = "_vllm_hcu_static_offline_eplb"
 _MARKER = "_vllm_hcu_gloo_eplb_profile_reservation_applied"
 _PROPERTY_MARKER = "_vllm_hcu_gloo_eplb_profile_reservation_property"
 
@@ -44,16 +45,6 @@ def apply_to_module(module: ModuleType) -> bool:
         "TorchDistGlooStagedEplbCommunicator",
         f"{TARGET_MODULE}.TorchDistGlooStagedEplbCommunicator",
     )
-    require_class(
-        communicator,
-        "TorchDistNcclEplbCommunicator",
-        f"{TARGET_MODULE}.TorchDistNcclEplbCommunicator",
-    )
-    require_class(
-        communicator,
-        "PyNcclEplbCommunicator",
-        f"{TARGET_MODULE}.PyNcclEplbCommunicator",
-    )
 
     if getattr(communicator, _MARKER, False):
         if not _patched_property_is_valid(gloo):
@@ -79,8 +70,9 @@ def apply_to_module(module: ModuleType) -> bool:
         )
 
     def hcu_needs_profile_buffer_reservation(self) -> bool:
-        del self
-        return False
+        return bool(base_policy.fget(self)) and not bool(
+            getattr(self, STATIC_MODE_MARKER, False)
+        )
 
     setattr(hcu_needs_profile_buffer_reservation, _PROPERTY_MARKER, True)
     setattr(
@@ -98,9 +90,10 @@ def apply(module: ModuleType | None = None) -> bool:
 
 __all__ = [
     "PATCH_ID",
+    "PatchCompatibilityError",
+    "STATIC_MODE_MARKER",
     "TARGET_MODULE",
     "TARGETS",
-    "PatchCompatibilityError",
     "apply",
     "apply_to_module",
 ]

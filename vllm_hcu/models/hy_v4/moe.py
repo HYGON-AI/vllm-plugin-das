@@ -52,6 +52,14 @@ def validate_hyv4_offline_eplb_mode(
         raise ValueError(
             "HYV4 offline EPLB requires a positive redundant expert count"
         )
+    if redundant != 8:
+        raise ValueError(
+            "HYV4 offline EPLB supports exactly 8 redundant experts"
+        )
+    if getattr(parallel, "tensor_parallel_size", 1) != 1:
+        raise ValueError("HYV4 offline EPLB supports only TP1")
+    if getattr(parallel, "data_parallel_size", 1) != 8:
+        raise ValueError("HYV4 offline EPLB supports only DP8")
     if not parallel.enable_expert_parallel:
         raise ValueError("HYV4 offline EPLB requires expert parallel")
     if not load_path and not record_path:
@@ -141,6 +149,12 @@ class HYV4MoEFused(nn.Module):
             # only the intermediate dimension.
             self.ep_rank = 0
             self.ep_size = 1
+        if self.offline_eplb_mode is not None and (
+            self.tp_size != 1 or self.ep_size != 8
+        ):
+            raise ValueError(
+                "HYV4 offline EPLB requires runtime TP1/EP8 groups"
+            )
         self.n_routed_experts = config.num_experts
         if self.tp_size > config.num_experts:
             raise ValueError(

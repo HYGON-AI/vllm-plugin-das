@@ -7,6 +7,7 @@ from __future__ import annotations
 import functools
 import hashlib
 import json
+from collections.abc import Mapping
 from dataclasses import dataclass
 from functools import lru_cache
 from pathlib import Path
@@ -33,6 +34,7 @@ class StaticEplbPlan:
     """A validated, immutable physical-to-logical expert placement."""
 
     model_key: str
+    model_name: str
     source_path: str
     source_sha256: str
     record_kind: str
@@ -44,6 +46,8 @@ class StaticEplbPlan:
     def __post_init__(self) -> None:
         if not isinstance(self.model_key, str) or not self.model_key:
             raise ValueError("Static EPLB model_key must be nonempty")
+        if not isinstance(self.model_name, str) or not self.model_name:
+            raise ValueError("Static EPLB model_name must be nonempty")
         if (
             not isinstance(self.source_path, str)
             or not Path(self.source_path).is_absolute()
@@ -107,6 +111,7 @@ class StaticEplbPlan:
     def fingerprint(self) -> tuple[object, ...]:
         return (
             self.model_key,
+            self.model_name,
             self.source_sha256,
             (len(self._map_values), self.num_physical_experts),
             self.num_logical_experts,
@@ -126,6 +131,7 @@ def _parse_plan(
     raw: bytes,
     canonical_path: str,
     model_key: str,
+    expected_model_name: str,
     expected_shape: tuple[int, int],
     num_logical_experts: int,
     num_redundant_experts: int,
@@ -164,6 +170,8 @@ def _parse_plan(
     model_name = _required_field(selected, "model_name")
     if not isinstance(model_name, str) or not model_name:
         raise ValueError("Static EPLB model_name must be a nonempty string")
+    if model_name != expected_model_name:
+        raise ValueError("Static EPLB declared model_name mismatch")
 
     expected_metadata = {
         "model_class": model_key,
@@ -187,6 +195,7 @@ def _parse_plan(
 
     return StaticEplbPlan(
         model_key=model_key,
+        model_name=model_name,
         source_path=canonical_path,
         source_sha256=hashlib.sha256(raw).hexdigest(),
         record_kind=record_kind,
@@ -201,6 +210,7 @@ def load_static_eplb_plan(
     path: str | Path,
     *,
     model_key: str,
+    expected_model_name: str,
     expected_shape: tuple[int, int],
     num_logical_experts: int,
     num_redundant_experts: int,
@@ -215,6 +225,8 @@ def load_static_eplb_plan(
 
     if not isinstance(model_key, str) or not model_key:
         raise ValueError("Static EPLB model_key must be nonempty")
+    if not isinstance(expected_model_name, str) or not expected_model_name:
+        raise ValueError("Static EPLB expected_model_name must be nonempty")
     if type(expected_shape) is not tuple or len(expected_shape) != 2:
         raise ValueError(
             "Static EPLB expected_shape must contain two dimensions"
@@ -235,11 +247,78 @@ def load_static_eplb_plan(
         canonical.read_bytes(),
         str(canonical),
         model_key,
+        expected_model_name,
         expected_shape,
         num_logical_experts,
         num_redundant_experts,
         require_proposal,
     )
+
+
+def validate_static_eplb_artifact(
+    path: str | Path,
+    *,
+    required_models: Mapping[str, int],
+    expected_model_name: str,
+    num_logical_experts: int,
+    num_redundant_experts: int,
+) -> str:
+    """Validate a stable, proposal-complete multi-model placement file."""
+
+    if not isinstance(required_models, Mapping) or not required_models:
+        raise ValueError("Static EPLB required_models must be nonempty")
+    if not isinstance(expected_model_name, str) or not expected_model_name:
+        raise ValueError("Static EPLB expected_model_name must be nonempty")
+    logical = _integer(num_logical_experts, "num_logical_experts", 1)
+    redundant = _integer(num_redundant_experts, "num_redundant_experts")
+    physical = logical + redundant
+    canonical = Path(path).expanduser().resolve(strict=True)
+    raw = canonical.read_bytes()
+    for model_key, expected_layers in required_models.items():
+        if not isinstance(model_key, str) or not model_key:
+            raise ValueError("Static EPLB required model key must be nonempty")
+        layers = _integer(
+            expected_layers,
+            f"{model_key} num_moe_layers",
+            1,
+        )
+        _parse_plan(
+            raw,
+            str(canonical),
+            model_key,
+            expected_model_name,
+            (layers, physical),
+            logical,
+            redundant,
+            True,
+        )
+    if canonical.read_bytes() != raw:
+        raise ValueError("Static EPLB file changed during validation")
+    return hashlib.sha256(raw).hexdigest()
+
+
+def _hyv4_required_models(
+    vllm_config: object,
+    model_key: str,
+    current_layers: int,
+) -> dict[str, int] | None:
+    if model_key not in {"HYV4ForCausalLM", "HYV4MTP"}:
+        return None
+    hf_config = getattr(
+        getattr(vllm_config, "model_config", None),
+        "hf_config",
+        None,
+    )
+    layer_types = getattr(hf_config, "mlp_layer_types", None)
+    if isinstance(layer_types, (list, tuple)) and layer_types:
+        target_layers = sum(value != "dense" for value in layer_types)
+    elif model_key == "HYV4ForCausalLM":
+        target_layers = current_layers
+    else:
+        raise ValueError(
+            "Static EPLB cannot determine HYV4ForCausalLM layer count"
+        )
+    return {"HYV4ForCausalLM": target_layers, "HYV4MTP": 1}
 
 
 def resolve_offline_eplb_model_key(model: object, parallel_config: object) -> str:
@@ -465,9 +544,29 @@ def bind_static_eplb_plan(
         raise ValueError("Static EPLB found no local MoE layers")
     if len(layers) != model.num_moe_layers:
         raise ValueError("Static EPLB local MoE layer count mismatch")
+    model_key = resolve_offline_eplb_model_key(model, parallel_config)
+    expected_model_name = getattr(
+        getattr(vllm_config, "model_config", None),
+        "model",
+        None,
+    )
+    required_models = _hyv4_required_models(
+        vllm_config,
+        model_key,
+        len(layers),
+    )
+    if required_models is not None:
+        validate_static_eplb_artifact(
+            path,
+            required_models=required_models,
+            expected_model_name=expected_model_name,
+            num_logical_experts=model.num_logical_experts,
+            num_redundant_experts=model.num_redundant_experts,
+        )
     plan = load_static_eplb_plan(
         path,
-        model_key=resolve_offline_eplb_model_key(model, parallel_config),
+        model_key=model_key,
+        expected_model_name=expected_model_name,
         expected_shape=(len(layers), model.num_physical_experts),
         num_logical_experts=model.num_logical_experts,
         num_redundant_experts=model.num_redundant_experts,
@@ -576,5 +675,6 @@ __all__ = [
     "load_static_eplb_plan",
     "load_static_logical_expert",
     "resolve_offline_eplb_model_key",
+    "validate_static_eplb_artifact",
     "verify_static_plan_across_ep_ranks",
 ]

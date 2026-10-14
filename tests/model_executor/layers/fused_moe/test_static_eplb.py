@@ -53,12 +53,20 @@ def _write_plan(path, rows=None, *, model_key="HYV4ForCausalLM", **metadata):
 def _load(path, **kwargs):
     request = {
         "model_key": "HYV4ForCausalLM",
+        "expected_model_name": "hy4-test",
         "expected_shape": (2, 4),
         "num_logical_experts": 3,
         "num_redundant_experts": 1,
     }
     request.update(kwargs)
     return load_static_eplb_plan(path, **request)
+
+
+def test_loader_rejects_plan_from_a_different_checkpoint(tmp_path) -> None:
+    path = _write_plan(tmp_path / "map.json", model_name="other-checkpoint")
+
+    with pytest.raises(ValueError, match="model_name"):
+        _load(path)
 
 
 def test_plan_is_immutable_and_fingerprints_exact_file_bytes(tmp_path) -> None:
@@ -74,6 +82,7 @@ def test_plan_is_immutable_and_fingerprints_exact_file_bytes(tmp_path) -> None:
     assert plan.layer_map(0) == (0, 1, 2, 1)
     assert plan.fingerprint() == (
         "HYV4ForCausalLM",
+        "hy4-test",
         plan.source_sha256,
         (2, 4),
         3,
@@ -248,6 +257,7 @@ def test_constructor_rejects_mutable_map_rows() -> None:
     with pytest.raises(ValueError):
         StaticEplbPlan(
             model_key="HYV4ForCausalLM",
+            model_name="hy4-test",
             source_path="/tmp/map.json",
             source_sha256="a" * 64,
             record_kind="proposal",
