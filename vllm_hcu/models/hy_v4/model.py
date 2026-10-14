@@ -107,10 +107,10 @@ def enable_hyv4_gate_a2a_overlap(vllm_config: VllmConfig) -> bool:
 
 
 def enable_hyv4_gate_proj_parallel(vllm_config: VllmConfig) -> bool:
-    """Return whether HY V4 may overlap g_proj with Q/KV projections in PCP+EP.
+    """Return whether HY V4 may overlap g_proj with PCP cache all-gathers.
 
     This is distinct from DCP A2A overlap: here we parallelize g_proj with the
-    attention path's Q/KV projections when prefill_context_parallel > 1 and
+    attention path's cache gathers when prefill_context_parallel > 1 and
     expert_parallel is enabled, using an auxiliary CUDA stream.
     """
     parallel_config = vllm_config.parallel_config
@@ -540,7 +540,7 @@ class HYV4Model(nn.Module, MixtureOfExperts):
             else None
         )
         if self.gate_proj_stream is not None:
-            logger.info("HY V4 gated-MLA g_proj/projection parallel (PCP+EP) enabled")
+            logger.info("HY V4 gated-MLA g_proj/PCP cache all-gather overlap enabled")
 
         if get_pp_group().is_first_rank or (
             self.config.tie_word_embeddings and get_pp_group().is_last_rank

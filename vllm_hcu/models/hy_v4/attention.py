@@ -56,6 +56,7 @@ from vllm.v1.attention.backend import (
 )
 from vllm.v1.attention.selector import get_attn_backend
 from vllm.v1.kv_cache_interface import KVCacheSpec, get_kv_quant_mode
+from vllm_hcu.model_executor.layers.attention.pcp import cache_gather_overlap_scope
 from vllm_hcu.utils.multi_stream_utils import maybe_execute_in_parallel
 
 from .fp8_kv_dequant import LightOpKVReuseState
@@ -1048,10 +1049,16 @@ class HYV4MLAAttention(nn.Module):
                 prefix=f"{prefix}.q_proj",
             )
         self.kv_a_layernorm = RMSNorm(self.kv_lora_rank, eps=config.rms_norm_eps)
+
+        # For g_proj parallel overlap: disable kv_b_proj automatic gather,
+        # we'll do manual gather at the optimal timing (overlap with g_proj GEMM).
+        kv_b_gather_output = gate_proj_stream is None
+        self.kv_b_manual_gather = not kv_b_gather_output
         self.kv_b_proj = ColumnParallelLinear(
             self.kv_lora_rank,
             self.num_heads * (self.qk_nope_head_dim + self.v_head_dim),
             bias=False,
+            gather_output=kv_b_gather_output,  # False when gate_proj_stream is set
             quant_config=quant_config,
             prefix=f"{prefix}.kv_b_proj",
         )
@@ -1262,73 +1269,38 @@ class HYV4MLAAttention(nn.Module):
         hidden_states: torch.Tensor,
         llama_4_scaling: torch.Tensor | None = None,
     ) -> torch.Tensor:
-        # PCP+EP g_proj parallel path: overlap Q/KV projections with g_proj.
-        # When gate_proj_stream is set AND gate_a2a_stream is NOT set, we
-        # parallelize g_proj with the Q/KV projection GEMMs before attention.
-        # PCP+EP g_proj parallel path: launch g_proj on aux stream FIRST,
-        # before Q/KV projections on the main stream, to give the longer
-        # g_proj GEMM maximum lead time.  The join is deferred until after
-        # attention completes.
-        _gate_parallel_deferred: torch.Tensor | None = None
-        _gate_done_event: torch.cuda.Event | None = None
-        if (
-            self.gate_proj_stream is not None
-            and self.gated_mla
-            and self.linear_gate is not None
-            and self.gate_a2a_stream is None
-        ):
-            # PCP+EP g_proj parallel path: launch g_proj on aux stream FIRST,
-            # before Q/KV projections on the main stream, to give the longer
-            # g_proj GEMM maximum lead time.  The join is deferred until after
-            # attention completes.
-            assert self.gate_proj_start_event is not None
-            assert self.gate_proj_done_event is not None
-            current_stream = torch.cuda.current_stream()
-            self.gate_proj_start_event.record(current_stream)
-            with torch.cuda.stream(self.gate_proj_stream):
-                self.gate_proj_stream.wait_event(self.gate_proj_start_event)
-                _gate_parallel = self.linear_gate(hidden_states)[0]
-                self.gate_proj_done_event.record(self.gate_proj_stream)
+        # Parallel g_proj path: do kv_b local GEMM first, launch g_proj, then gather.
+        kv_b_local: torch.Tensor | None = None
 
-            # Q/KV projections run on the main stream while g_proj runs on aux.
-            q_c = None
-            if self.q_lora_rank is not None:
-                assert self.q_a_proj is not None
-                assert self.q_a_layernorm is not None
-                assert self.q_b_proj is not None
-                q_c = self.q_a_proj(hidden_states)[0]
-                q_c = self.q_a_layernorm(q_c)
-                q_proj_layer = self.q_b_proj
-                q = q_proj_layer(q_c)[0]
-            else:
-                assert self.q_proj is not None
-                q_proj_layer = self.q_proj
-                q = q_proj_layer(hidden_states)[0]
-            assert self.kv_a_proj_with_mqa is not None
-            kv_lora = self.kv_a_proj_with_mqa(hidden_states)[0]
-            # Defer the join: wait for g_proj only after attention finishes.
-            _gate_parallel_deferred = _gate_parallel
+        q_c = None
+        if self.q_lora_rank is not None:
+            assert self.q_a_proj is not None
+            assert self.q_a_layernorm is not None
+            assert self.q_b_proj is not None
+            q_c = self.q_a_proj(hidden_states)[0]
+            q_c = self.q_a_layernorm(q_c)
+            q_proj_layer = self.q_b_proj
+            q = q_proj_layer(q_c)[0]
         else:
-            # Serial path: Q/KV projections only (gate computed later or in A2A).
-            q_c = None
-            if self.q_lora_rank is not None:
-                assert self.q_a_proj is not None
-                assert self.q_a_layernorm is not None
-                assert self.q_b_proj is not None
-                q_c = self.q_a_proj(hidden_states)[0]
-                q_c = self.q_a_layernorm(q_c)
-                q_proj_layer = self.q_b_proj
-                q = q_proj_layer(q_c)[0]
-            else:
-                assert self.q_proj is not None
-                q_proj_layer = self.q_proj
-                q = q_proj_layer(hidden_states)[0]
+            assert self.q_proj is not None
+            q_proj_layer = self.q_proj
+            q = q_proj_layer(hidden_states)[0]
 
-            assert self.kv_a_proj_with_mqa is not None
-            kv_lora = self.kv_a_proj_with_mqa(hidden_states)[0]
-
+        assert self.kv_a_proj_with_mqa is not None
+        kv_lora = self.kv_a_proj_with_mqa(hidden_states)[0]
         kv_c, k_pe = kv_lora.split([self.kv_lora_rank, self.qk_rope_head_dim], dim=-1)
         kv_c_normed = self.kv_a_layernorm(kv_c)
+
+        # If manual gather is enabled, call kv_b_proj now (returns local shard only).
+        if self.kv_b_manual_gather:
+            # Temporarily disable gather_output to get local result only.
+            original_gather_output = self.kv_b_proj.gather_output
+            self.kv_b_proj.gather_output = False
+            try:
+                with torch.profiler.record_function("kv_b_proj_local_gemm"):
+                    kv_b_local, _ = self.kv_b_proj(kv_c_normed)  # Local GEMM, no gather
+            finally:
+                self.kv_b_proj.gather_output = original_gather_output
 
         q_proj_layer = self.q_b_proj if self.q_b_proj is not None else self.q_proj
         q_heads = self.num_local_heads
@@ -1368,26 +1340,15 @@ class HYV4MLAAttention(nn.Module):
             k_pe,
             attn_out,
             q_dcp_replicated,
+            kv_b_local=kv_b_local,  # Pass local GEMM result for manual gather
         )
 
-        # Apply gate: three paths - PCP+EP parallel, DCP A2A overlap, or serial.
+        # PCP gather and DCP A2A overlap apply their gates in the eager segment.
         if (
-            self.gate_proj_stream is not None
-            and self.gated_mla
-            and self.linear_gate is not None
-            and self.gate_a2a_stream is None
-        ):
-            # PCP+EP parallel path: join aux stream now (attention has finished,
-            # maximizing the overlap window), then apply the gate.
-            assert self.gate_proj_done_event is not None
-            torch.cuda.current_stream().wait_event(self.gate_proj_done_event)
-            gate_score = _gate_parallel_deferred
-            gate_score.record_stream(torch.cuda.current_stream())
-            self._apply_gate_in_place(attn_out, gate_score)
-        elif (
             self.gated_mla
             and self.linear_gate is not None
             and self.gate_a2a_stream is None
+            and self.gate_proj_stream is None
         ):
             # Serial path: compute gate after attention.
             gate_score = self.linear_gate(hidden_states)[0]
@@ -1413,6 +1374,7 @@ class HYV4MLAAttention(nn.Module):
         k_pe: torch.Tensor,
         out: torch.Tensor,  # [num_tokens, heads * v_head_dim], written in place
         q_dcp_replicated: torch.Tensor | None = None,
+        kv_b_local: torch.Tensor | None = None,  # Local kv_b GEMM result (no gather yet)
     ) -> None:
         """Run the lightning indexer and MLA attention in one eager segment.
 
@@ -1422,10 +1384,97 @@ class HYV4MLAAttention(nn.Module):
         capture-segment boundary. The nested ``sparse_attn_indexer`` and
         ``unified_mla_attention_with_output`` breaks short-circuit here, since
         the capture is no longer active inside an eager segment.
+
+        When `kv_b_local` is provided, we gather it HERE (while g_proj runs on aux),
+        then temporarily monkey-patch kv_b_proj to return the precomputed value.
         """
-        if self.indexer is not None and self.is_sparse and not self.skip_topk:
-            self.indexer(hidden_states, q_c, positions, self.indexer_rope_emb)
-        if self.gate_a2a_stream is None:
+        # Manual kv_b gather (overlap with g_proj GEMM on aux stream).
+        kv_b_gathered: torch.Tensor | None = None
+        if kv_b_local is not None:
+            # Gather kv_b across TP ranks NOW (while g_proj runs on aux stream).
+            tp_size = get_tensor_model_parallel_world_size()
+            if tp_size > 1:
+                with torch.profiler.record_function("kv_b_manual_all_gather"):
+                    gathered_list = [torch.empty_like(kv_b_local) for _ in range(tp_size)]
+                    dist.all_gather(gathered_list, kv_b_local)
+                    kv_b_gathered = torch.cat(gathered_list, dim=-1)
+            else:
+                kv_b_gathered = kv_b_local
+
+            # Temporarily override kv_b_proj.forward to return precomputed value.
+            original_forward = self.kv_b_proj.forward
+            def _precomputed_forward(x):
+                # Return gathered kv_b, ignoring input.
+                if self.kv_b_proj.return_bias:
+                    return kv_b_gathered, None
+                return kv_b_gathered
+            self.kv_b_proj.forward = _precomputed_forward
+
+        try:
+            if (
+                self.gate_proj_stream is not None
+                and self.gated_mla
+                and self.linear_gate is not None
+                and self.gate_a2a_stream is None
+            ):
+                assert self.gate_proj_start_event is not None
+                assert self.gate_proj_done_event is not None
+                gate_scores: list[torch.Tensor] = []
+
+                def overlap_gather(gather_fn):
+                    # Only the first live gather computes the gate. Join before
+                    # subsequent indexer/attention GEMMs to avoid CU contention.
+                    if gate_scores:
+                        return gather_fn()
+                    gathered, gate_score = maybe_execute_in_parallel(
+                        gather_fn,
+                        lambda: self.linear_gate(hidden_states)[0],
+                        self.gate_proj_start_event,
+                        self.gate_proj_done_event,
+                        self.gate_proj_stream,
+                    )
+                    gate_score.record_stream(torch.cuda.current_stream())
+                    gate_scores.append(gate_score)
+                    return gathered
+
+                with cache_gather_overlap_scope(overlap_gather):
+                    if self.indexer is not None and self.is_sparse and not self.skip_topk:
+                        self.indexer(hidden_states, q_c, positions, self.indexer_rope_emb)
+                    out.copy_(
+                        self.mla_attn(
+                            q,
+                            kv_c_normed,
+                            k_pe,
+                            output_shape=out.shape,
+                            q_dcp_replicated=q_dcp_replicated,
+                        )
+                    )
+            # Decode-only and dummy/profile forwards may not gather.
+            if not gate_scores:
+                gate_scores.append(self.linear_gate(hidden_states)[0])
+            self._apply_gate_in_place(out, gate_scores[0])
+            return
+
+            if self.indexer is not None and self.is_sparse and not self.skip_topk:
+                self.indexer(hidden_states, q_c, positions, self.indexer_rope_emb)
+            if self.gate_a2a_stream is None:
+                out.copy_(
+                    self.mla_attn(
+                        q,
+                        kv_c_normed,
+                        k_pe,
+                        output_shape=out.shape,
+                        q_dcp_replicated=q_dcp_replicated,
+                    )
+                )
+                return
+
+            assert self.linear_gate is not None
+            gate_scores: list[torch.Tensor] = []
+
+            def compute_gate() -> None:
+                gate_scores.append(self.linear_gate(hidden_states)[0])
+
             out.copy_(
                 self.mla_attn(
                     q,
@@ -1433,33 +1482,20 @@ class HYV4MLAAttention(nn.Module):
                     k_pe,
                     output_shape=out.shape,
                     q_dcp_replicated=q_dcp_replicated,
+                    dcp_a2a_overlap_fn=compute_gate,
                 )
             )
-            return
-
-        assert self.linear_gate is not None
-        gate_scores: list[torch.Tensor] = []
-
-        def compute_gate() -> None:
-            gate_scores.append(self.linear_gate(hidden_states)[0])
-
-        out.copy_(
-            self.mla_attn(
-                q,
-                kv_c_normed,
-                k_pe,
-                output_shape=out.shape,
-                q_dcp_replicated=q_dcp_replicated,
-                dcp_a2a_overlap_fn=compute_gate,
-            )
-        )
-        # Dummy/profile forwards may have no live DCP metadata and therefore
-        # never enter the A2A call site. Preserve correctness in that case.
-        if not gate_scores:
-            compute_gate()
-        gate_score = gate_scores[0]
-        gate_score.record_stream(torch.cuda.current_stream())
-        self._apply_gate_in_place(out, gate_score)
+            # Dummy/profile forwards may have no live DCP metadata and therefore
+            # never enter the A2A call site. Preserve correctness in that case.
+            if not gate_scores:
+                compute_gate()
+            gate_score = gate_scores[0]
+            gate_score.record_stream(torch.cuda.current_stream())
+            self._apply_gate_in_place(out, gate_score)
+        finally:
+            # Restore original kv_b_proj.forward if we monkey-patched it.
+            if kv_b_local is not None:
+                self.kv_b_proj.forward = original_forward
 
     def _apply_gate_in_place(
         self, attn_out: torch.Tensor, gate_score: torch.Tensor

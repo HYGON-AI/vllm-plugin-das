@@ -11,7 +11,7 @@ rank-ordered slot mappings produced by :class:`HcuPCPManager`.
 
 from __future__ import annotations
 
-from collections.abc import Iterator
+from collections.abc import Callable, Iterator
 from contextlib import contextmanager
 from contextvars import ContextVar
 from threading import local
@@ -26,6 +26,18 @@ _REPLICATED_MTP_BATCH = ContextVar(
     default=False,
 )
 _REPLICATED_MTP_GRAPH_STATE = local()
+
+_CACHE_GATHER_OVERLAP = ContextVar("vllm_hcu_cache_gather_overlap", default=None)
+
+
+@contextmanager
+def cache_gather_overlap_scope(overlap_fn: Callable) -> Iterator[None]:
+    """Wrap PCP cache gathers within the model's eager attention segment."""
+    token = _CACHE_GATHER_OVERLAP.set(overlap_fn)
+    try:
+        yield
+    finally:
+        _CACHE_GATHER_OVERLAP.reset(token)
 
 
 @contextmanager
@@ -195,17 +207,25 @@ def _gather_prefill_cache_inputs(
         rank,
     )
 
-    gathered_prefills = tuple(
-        pcp_group.all_gather(
-            tensor[num_decode_tokens:].contiguous(),
+    def gather_inputs():
+        gathered_prefills = tuple(
+            pcp_group.all_gather(
+                tensor[num_decode_tokens:].contiguous(),
+                dim=0,
+            )
+            for tensor in tensors
+        )
+        gathered_prefill_slots = pcp_group.all_gather(
+            local_slots[num_decode_tokens:].contiguous(),
             dim=0,
         )
-        for tensor in tensors
-    )
-    gathered_prefill_slots = pcp_group.all_gather(
-        local_slots[num_decode_tokens:].contiguous(),
-        dim=0,
-    )
+        return gathered_prefills, gathered_prefill_slots
+
+    overlap_fn = _CACHE_GATHER_OVERLAP.get()
+    if overlap_fn is None:
+        gathered_prefills, gathered_prefill_slots = gather_inputs()
+    else:
+        gathered_prefills, gathered_prefill_slots = overlap_fn(gather_inputs)
     if num_decode_tokens == 0:
         return gathered_prefills, gathered_prefill_slots
 
@@ -285,6 +305,7 @@ def maybe_gather_indexer_k(
 
 
 __all__ = (
+    "cache_gather_overlap_scope",
     "effective_pcp_world_size",
     "in_replicated_mtp_batch",
     "maybe_gather_indexer_k",
