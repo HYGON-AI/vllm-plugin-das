@@ -249,6 +249,27 @@ class HcuTritonMLAMetadataBuilder(TritonMLAMetadataBuilder):
             fast_build=fast_build,
         )
 
+    def build_for_cudagraph_capture(self, common_attn_metadata):
+        """Reuse the DCP guard on the FULL-capture entry point (review
+        2026-10-14 P3: the wheel ``build_for_cudagraph_capture`` asserts
+        ``max_query_len <= reorder_batch_threshold`` BEFORE delegating to
+        ``self.build``, so with DCP>1 a q=7/8 draft capture dies on that
+        bare AssertionError and never reaches the explicit RuntimeError in
+        :meth:`build` -- the check must run at the capture boundary too).
+        With DCP==1 delegation is verbatim.
+        """
+
+        if self.dcp_world_size > 1 and common_attn_metadata.max_query_len > 1:
+            raise RuntimeError(
+                "HCU triton MLA: full cudagraph capture with multi-token "
+                f"queries (max query len {common_attn_metadata.max_query_len}) "
+                "is not supported with decode_context_parallel_size > 1: the "
+                "DFlash/DSpark capture path would die on the wheel's bare "
+                "query-len assertion instead of this message. Disable DCP "
+                "for speculative decoding or use a DCP-aware backend."
+            )
+        return super().build_for_cudagraph_capture(common_attn_metadata)
+
 
 class HcuTritonMLAImpl(TritonMLAImpl):
     """Impl flattening non-causal multi-token blocks to per-token rows.

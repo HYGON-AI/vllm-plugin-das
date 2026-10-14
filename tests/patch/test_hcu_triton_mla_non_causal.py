@@ -415,3 +415,60 @@ def test_builder_build_guard_sits_before_super_delegation():
     guard_pos = src.index("dcp_world_size > 1")
     super_pos = src.index("super().build(")
     assert guard_pos < super_pos
+
+
+def test_builder_capture_entry_rejects_multi_token_under_dcp(monkeypatch):
+    """Review 2026-10-14 P3: the DFlash/DSpark FULL capture path goes
+    through ``build_for_cudagraph_capture``, which asserts
+    ``max_query_len <= reorder_batch_threshold`` BEFORE delegating to
+    ``self.build``.  Under DCP>1 the threshold is 1, so a q=7/8 capture
+    dies on that bare AssertionError and never reaches the explicit
+    RuntimeError in ``build``.  The capture entry must run the same guard
+    first; q=1 capture and DCP=1 capture delegate verbatim."""
+
+    import types
+
+    captures = []
+
+    def spy_capture(self, common_attn_metadata):
+        captures.append(common_attn_metadata.max_query_len)
+        return "captured"
+
+    monkeypatch.setattr(
+        TritonMLAMetadataBuilder,
+        "build_for_cudagraph_capture",
+        spy_capture,
+    )
+
+    builder = object.__new__(HcuTritonMLAMetadataBuilder)
+    builder.dcp_world_size = 2
+
+    def meta(q_len):
+        return types.SimpleNamespace(
+            max_query_len=q_len, seq_lens_cpu_upper_bound=None
+        )
+
+    # (a) DCP>1 + q=7/8 draft capture: explicit RuntimeError BEFORE the
+    # wheel's bare assert.
+    for q_len in (7, 8):
+        try:
+            builder.build_for_cudagraph_capture(meta(q_len))
+        except RuntimeError as exc:
+            assert "full cudagraph capture" in str(exc)
+            assert "decode_context_parallel_size > 1" in str(exc)
+        else:
+            raise AssertionError(f"expected RuntimeError at q={q_len}")
+    assert captures == []
+
+    # (b) DCP>1 + q=1 capture: delegate normally.
+    assert (
+        builder.build_for_cudagraph_capture(meta(1)) == "captured"
+    )
+    assert captures == [1]
+
+    # (c) DCP=1 + q=7 capture: delegate normally (non-DCP DSpark FULL).
+    builder.dcp_world_size = 1
+    assert (
+        builder.build_for_cudagraph_capture(meta(7)) == "captured"
+    )
+    assert captures == [1, 7]
