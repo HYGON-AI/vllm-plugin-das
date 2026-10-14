@@ -2800,8 +2800,8 @@ class Step4DSAState:
             "head": torch.zeros(nr, **i64),
             "tail": torch.zeros(nr, **i64),
             "slots": torch.zeros(nr, **i64),
-            "pending_in": torch.zeros(nr, **i64),
-            "pending_out": torch.zeros(nr, **i64),
+            "pending_in": torch.full((nr,), self.pending_trash_row, **i64),
+            "pending_out": torch.full((nr,), self.pending_trash_row, **i64),
             "nscore": torch.zeros(nr, dtype=torch.int32, device=device),
             "counts": torch.zeros(nr, dtype=torch.int32, device=device),
             "starts": torch.arange(nr, dtype=torch.int32, device=device) * region,
@@ -3257,6 +3257,10 @@ class Step4DSAState:
             dst = buf.get(name)
             if dst is None:
                 return value
+            # Larger captured views retain these rows after the live batch
+            # shrinks. Inactive rows must neither compress an old region nor
+            # reuse its pending state.
+            dst[nd:].fill_(-1 if name == "slots" else 0)
             view = dst[:nd]
             view.copy_(value)
             return view
@@ -3345,12 +3349,16 @@ class Step4DSAState:
                 ev.synchronize()
             h_in = self._host["pending_in"][stage]
             h_out = self._host["pending_out"][stage]
+            h_in.numpy().fill(trash)
+            h_out.numpy().fill(trash)
             h_in.numpy()[:nd] = rows_in
             h_out.numpy()[:nd] = rows_out
             sched.pending_in = buf["pending_in"][:nd]
             sched.pending_out = buf["pending_out"][:nd]
-            sched.pending_in.copy_(h_in[:nd], non_blocking=ev is not None)
-            sched.pending_out.copy_(h_out[:nd], non_blocking=ev is not None)
+            # Upload the entire backing buffer: replay may read a larger view
+            # captured by an earlier batch, including the inactive trash rows.
+            buf["pending_in"].copy_(h_in, non_blocking=ev is not None)
+            buf["pending_out"].copy_(h_out, non_blocking=ev is not None)
             if ev is not None:
                 ev.record()
         else:
@@ -3534,6 +3542,17 @@ class Step4DSAState:
             off, _ = layout[name]
             return h[off : off + n]
 
+        if persistent:
+            # Captured views can be wider than this step's logical batch.
+            # Never let their inactive rows address a live pending row or
+            # overwrite the first real token's staging location.
+            for name in ("pending_in", "pending_out", "keep_rows"):
+                field(name, layout[name][1])[:] = trash
+            capacity = layout["tok_buf"][1]
+            field("tok_buf", capacity)[:] = nd * nrm * region + np.arange(
+                capacity, dtype=np.int64
+            )
+
         head = field("head", nd)
         tail = field("tail", nd)
         p_in = field("pending_in", nd)
@@ -3656,7 +3675,11 @@ class Step4DSAState:
 
         def dev_i32(name: str, n: int) -> torch.Tensor:
             if persistent:
-                out = self._spec_i32[name][:n]
+                backing = self._spec_i32[name]
+                # A previously captured larger slice still sees the backing
+                # storage after a batch shrinks or this DP becomes idle.
+                backing[n:].zero_()
+                out = backing[:n]
                 out.copy_(dev(name, n))
                 return out
             return dev(name, n).to(torch.int32)
@@ -3686,6 +3709,7 @@ class Step4DSAState:
         tok_req_d = dev("tok_req", ndt)
         if persistent:
             sched.tok_table = self._spec_table[:ndt]
+            self._spec_table[ndt:].zero_()
             torch.index_select(md.block_table, 0, tok_req_d, out=sched.tok_table)
         else:
             sched.tok_table = md.block_table.index_select(0, tok_req_d)
