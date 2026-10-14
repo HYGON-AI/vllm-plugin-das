@@ -36,7 +36,9 @@ env:
 jobs:
   build:
     # 需要能访问内网 pip 源 / AICC 下载地址 / Harbor 的自托管构建节点
-    runs-on: bw1100
+    runs-on:
+      - ci
+      - bw1100
     outputs:
       docker_image: ${{ steps.gen-tag.outputs.docker_image }}
     steps:

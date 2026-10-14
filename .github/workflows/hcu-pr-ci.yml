@@ -25,7 +25,8 @@ jobs:
     name: Static gate and test selection
     runs-on:
       - self-hosted
-      - hcu-ci-pr
+      - ci
+      - bw1100
     defaults:
       run:
         shell: bash
@@ -164,7 +165,8 @@ jobs:
     needs: static-and-select
     runs-on:
       - self-hosted
-      - hcu-ci-pr
+      - ci
+      - bw1100
     defaults:
       run:
         shell: bash
@@ -274,7 +276,8 @@ jobs:
       - selected-hcu-tests
     runs-on:
       - self-hosted
-      - hcu-ci-pr
+      - ci
+      - bw1100
     env:
       STATIC_RESULT: ${{ needs.static-and-select.result }}
       AUTH_RESULT: ${{ needs.authorize-hcu.result }}

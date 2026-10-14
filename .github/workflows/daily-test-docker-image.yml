@@ -33,7 +33,9 @@ env:
 
 jobs:
   citest:
-    runs-on: bw1100
+    runs-on:
+      - ci
+      - bw1100
     timeout-minutes: 1200
     container:
       image: ${{ inputs.docker_image || format('{0}/{1}/vllm:0.25.1-latest', vars.HARBOR_SITE, vars.HARBOR_NAMESPACE) }}

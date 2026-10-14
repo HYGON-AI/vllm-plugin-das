@@ -30,7 +30,8 @@ jobs:
     if: inputs.matrix != '[]'
     runs-on:
       - self-hosted
-      - hcu-ci-pr
+      - ci
+      - bw1100
     env:
       SOURCE_IMAGE: ${{ inputs.image || vars.HCU_CI_IMAGE || '10.16.1.152:5000/jenkins/model_test_env/vllm:0.25.1-latest' }}
     outputs:
@@ -80,6 +81,7 @@ jobs:
         include: ${{ fromJSON(inputs.matrix) }}
     runs-on:
       - self-hosted
+      - ci
       - ${{ matrix.runner }}
     timeout-minutes: ${{ matrix.timeout_minutes }}
     env:
