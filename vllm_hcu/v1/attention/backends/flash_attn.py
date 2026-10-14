@@ -46,8 +46,6 @@ from vllm.v1.attention.ops.dcp import (
 from vllm.v1.attention.ops.merge_attn_states import merge_attn_states
 from vllm.v1.worker.workspace import current_workspace_manager
 
-import vllm_hcu.platforms.envs as henvs 
-from vllm.platforms import current_platform
 if is_flash_attn_varlen_func_available():
     from vllm_hcu.v1.attention.backends.fa_utils import (
         flash_attn_supports_sinks,
@@ -57,7 +55,6 @@ if is_flash_attn_varlen_func_available():
         varlen_fwd_unified,
         can_use_paged_fp8_d192_fwd,
         paged_fp8_d192_fwd,
-        hcu_ops,
         reshape_and_cache_flash,
     )
 import vllm.envs as envs
@@ -77,7 +74,6 @@ from vllm.v1.attention.backend import (
     CommonAttentionMetadata,
 )
 from vllm.v1.kv_cache_interface import AttentionSpec
-import vllm.envs as envs
 
 logger = init_logger(__name__)
 
@@ -210,10 +206,6 @@ class HcuFlashAttentionBackend(AttentionBackend):
 
     @classmethod
     def supports_batch_invariance(cls) -> bool:
-        return True
-
-    @classmethod
-    def supports_sliding_window(cls) -> bool:
         return True
 
     @classmethod

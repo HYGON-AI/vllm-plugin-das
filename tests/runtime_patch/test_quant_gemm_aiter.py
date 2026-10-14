@@ -42,7 +42,6 @@ from vllm_hcu.model_executor.layers.quantization import (
 from vllm_hcu.platforms import envs as henvs
 from vllm_hcu.patch.worker.op_opt import (
     patch_activation,
-    patch_aiter_ops,
     patch_compressed_tensors,
     patch_compressed_tensors_moe_w8a8_fp8,
     patch_compressed_tensors_moe_wna16,

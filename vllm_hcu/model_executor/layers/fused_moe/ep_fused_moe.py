@@ -20,7 +20,6 @@ GEMMs mask padding rows on store, so garbage never reaches the output.
 import functools
 import json
 import os
-from typing import Optional
 
 import torch
 import triton

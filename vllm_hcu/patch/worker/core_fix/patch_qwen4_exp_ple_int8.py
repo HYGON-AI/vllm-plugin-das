@@ -35,7 +35,6 @@ from vllm.distributed import (
     get_dp_group,
     get_etp_group,
     get_tp_group,
-    tensor_model_parallel_all_reduce,
 )
 from vllm.forward_context import get_forward_context
 from vllm.logger import init_logger

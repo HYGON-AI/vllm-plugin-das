@@ -2,18 +2,13 @@
 # SPDX-FileCopyrightText: Copyright (c) 2026 Hygon Information Technology Co., Ltd.
 import contextlib
 import importlib
-import os
-from datetime import timedelta
 from functools import cache, lru_cache
 from math import lcm
 from types import ModuleType
 from typing import TYPE_CHECKING
 
-import regex as re
 import torch
 import vllm.envs as envs
-from torch.distributed import PrefixStore, ProcessGroup
-from torch.distributed.distributed_c10d import is_nccl_available
 from vllm.logger import init_logger
 from vllm.platforms.interface import DeviceCapability, Platform, PlatformEnum
 from vllm.v1.attention.backends.registry import AttentionBackendEnum, register_backend
@@ -280,7 +275,6 @@ class HCUPlatform(Platform):
         """Import ROCm-specific kernels."""
         super().import_kernels()
 
-        import contextlib
 
         # Import ROCm-specific extension
         with contextlib.suppress(ImportError):
@@ -799,8 +793,6 @@ class HCUPlatform(Platform):
         # upstream hybrid/heterogeneous page alignment whenever a common
         # kernel block divides it, rather than replacing it with a small page.
         if cache_config is not None and not cache_config.user_specified_block_size:
-            from math import lcm
-
             from vllm.config.vllm import (
                 get_layers_from_vllm_config,
                 set_current_vllm_config,

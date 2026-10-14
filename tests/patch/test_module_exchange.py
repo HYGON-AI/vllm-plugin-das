@@ -61,8 +61,8 @@ def test_all_exchange_registration_is_exact_lazy_and_idempotent(
     first = register_all_module_exchanges(coordinator)
     second = register_all_module_exchanges(coordinator)
 
-    assert len(first) == len(second) == 15
-    assert len(coordinator.registrations()) == 15
+    assert len(first) == len(second) == 16
+    assert len(coordinator.registrations()) == 16
     assert all(item.status == PatchStatus.ARMED.value for item in first)
     assert builtins.__import__ is original_import
     assert replacements_before == set()

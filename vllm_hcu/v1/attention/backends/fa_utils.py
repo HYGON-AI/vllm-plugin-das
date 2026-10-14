@@ -14,14 +14,12 @@ from flash_attn import (
     flash_attn_varlen_func as _flash_attn_varlen_func,
     hg_flash_attn_varlen_func as _hg_flash_attn_varlen_func,
     varlen_fwd_unified as _varlen_fwd_unified,
-    vllm_flash_attn_varlen_func,
 )
 from packaging.specifiers import SpecifierSet
 from packaging.version import InvalidVersion, Version
 from torch import Tensor
 from vllm_hcu.v1.attention.kv_cache_layout import get_kv_cache_layout
 
-import vllm_hcu.hcu_ops as hcu_ops
 
 
 # This range describes the Python/native API line exercised by the plugin. It
