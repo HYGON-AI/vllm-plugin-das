@@ -31,8 +31,8 @@ except Exception:
 logger = init_logger(__name__)
 
 
-def _is_uuid_device_mask(value: str | None) -> bool:
-    return bool(value) and all(
+def _contains_uuid_device_id(value: str | None) -> bool:
+    return bool(value) and any(
         device_id.startswith("GPU-") for device_id in value.split(",")
     )
 
@@ -42,9 +42,9 @@ def _has_unresolved_uuid_visibility(
 ) -> bool:
     """Return whether physical integer IDs are unavailable for custom AR."""
 
-    return _is_uuid_device_mask(cuda_visible_devices) or (
+    return _contains_uuid_device_id(cuda_visible_devices) or (
         not cuda_visible_devices
-        and _is_uuid_device_mask(os.environ.get("HIP_VISIBLE_DEVICES"))
+        and _contains_uuid_device_id(os.environ.get("HIP_VISIBLE_DEVICES"))
     )
 
 

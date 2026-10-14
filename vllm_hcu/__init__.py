@@ -181,6 +181,17 @@ def _resolve_uuid_visible_devices() -> None:
 
     physical_uuids = _discover_physical_gpu_uuids()
     if physical_uuids is None:
+        if (
+            hip_visible_devices is not None
+            and cuda_visible_devices is not None
+            and hip_visible_devices != cuda_visible_devices
+        ):
+            raise ValueError(
+                "Inconsistent GPU visibility env vars could not be verified "
+                "because UUID discovery is unavailable: "
+                f"HIP_VISIBLE_DEVICES='{hip_visible_devices}' vs "
+                f"CUDA_VISIBLE_DEVICES='{cuda_visible_devices}'."
+            )
         return
 
     resolved_mask = _resolve_uuid_mask(uuid_mask, physical_uuids)

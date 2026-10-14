@@ -418,6 +418,45 @@ assert vllm_hcu.hcu_platform_plugin() == vllm_hcu._PLATFORM_CLASS_PATH
     assert result.returncode == 0, result.stderr
 
 
+def test_plugin_callback_rejects_unverifiable_different_uuid_aliases():
+    result = _fresh_python(
+        r'''
+import importlib
+from pathlib import Path
+
+import vllm_hcu
+
+original_import_module = importlib.import_module
+def import_without_management_package(name, package=None):
+    if name == "amdsmi":
+        error = ModuleNotFoundError("No module named 'amdsmi'")
+        error.name = "amdsmi"
+        raise error
+    return original_import_module(name, package)
+
+vllm_hcu._KFD_TOPOLOGY_NODES = Path("/definitely/missing/kfd/topology")
+vllm_hcu.importlib.import_module = import_without_management_package
+vllm_hcu.ensure_vllm_compatible = lambda: None
+vllm_hcu._apply_platform_preserving_role = lambda: None
+assert vllm_hcu.hcu_platform_plugin() == vllm_hcu._PLATFORM_CLASS_PATH
+try:
+    vllm_hcu.hcu_platform_plugin()
+except RuntimeError as error:
+    print(str(error))
+else:
+    raise AssertionError("the selected HCU platform accepted unverifiable masks")
+''',
+        assert_target_install=False,
+        env_overrides={
+            "HIP_VISIBLE_DEVICES": "GPU-bbbb,GPU-dddd",
+            "CUDA_VISIBLE_DEVICES": "1,3",
+        },
+    )
+
+    assert result.returncode == 0, result.stderr
+    assert "could not be verified" in result.stdout
+
+
 @contextmanager
 def _cpu_safe_hcu_worker_module() -> Iterator[ModuleType]:
     """Import the HCU Worker without loading the upstream GPU runtime.
