@@ -21,12 +21,14 @@ import threading
 def _sync_hip_cuda_visible_devices() -> None:
     """Keep HIP and CUDA device masks consistent for HCU integrations."""
 
-    hip_visible_devices = os.environ.get("HIP_VISIBLE_DEVICES") or None
-    cuda_visible_devices = os.environ.get("CUDA_VISIBLE_DEVICES") or None
+    hip_is_set = "HIP_VISIBLE_DEVICES" in os.environ
+    cuda_is_set = "CUDA_VISIBLE_DEVICES" in os.environ
+    hip_visible_devices = os.environ.get("HIP_VISIBLE_DEVICES")
+    cuda_visible_devices = os.environ.get("CUDA_VISIBLE_DEVICES")
 
     if (
-        hip_visible_devices is not None
-        and cuda_visible_devices is not None
+        hip_is_set
+        and cuda_is_set
         and hip_visible_devices != cuda_visible_devices
     ):
         raise ValueError(
@@ -35,9 +37,11 @@ def _sync_hip_cuda_visible_devices() -> None:
             f"CUDA_VISIBLE_DEVICES='{cuda_visible_devices}'. "
             "Please set only one, or ensure they match."
         )
-    if hip_visible_devices is not None:
+    if hip_is_set:
+        assert hip_visible_devices is not None
         os.environ["CUDA_VISIBLE_DEVICES"] = hip_visible_devices
-    elif cuda_visible_devices is not None:
+    elif cuda_is_set:
+        assert cuda_visible_devices is not None
         os.environ["HIP_VISIBLE_DEVICES"] = cuda_visible_devices
 
 

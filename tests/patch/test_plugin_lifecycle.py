@@ -120,7 +120,9 @@ def _fresh_python(
         ("4,5,6,7", None, "4,5,6,7", "4,5,6,7"),
         (None, "4,5,6,7", "4,5,6,7", "4,5,6,7"),
         ("4,5,6,7", "4,5,6,7", "4,5,6,7", "4,5,6,7"),
-        ("", "4,5,6,7", "4,5,6,7", "4,5,6,7"),
+        ("", None, "", ""),
+        (None, "", "", ""),
+        ("", "", "", ""),
     ],
 )
 def test_plugin_import_synchronizes_hip_and_cuda_visibility(
@@ -151,20 +153,31 @@ print(json.dumps({
     assert values == {"hip": expected_hip, "cuda": expected_cuda}
 
 
-def test_plugin_import_rejects_conflicting_hip_and_cuda_visibility():
+@pytest.mark.parametrize(
+    ("hip", "cuda"),
+    [
+        ("4,5,6,7", "0,1,2,3"),
+        ("", "0"),
+        ("0", ""),
+    ],
+)
+def test_plugin_import_rejects_conflicting_hip_and_cuda_visibility(
+    hip: str,
+    cuda: str,
+):
     result = _fresh_python(
         "import vllm_hcu",
         assert_target_install=False,
         env_overrides={
-            "HIP_VISIBLE_DEVICES": "4,5,6,7",
-            "CUDA_VISIBLE_DEVICES": "0,1,2,3",
+            "HIP_VISIBLE_DEVICES": hip,
+            "CUDA_VISIBLE_DEVICES": cuda,
         },
     )
 
     assert result.returncode != 0
     assert "Inconsistent GPU visibility env vars" in result.stderr
-    assert "HIP_VISIBLE_DEVICES='4,5,6,7'" in result.stderr
-    assert "CUDA_VISIBLE_DEVICES='0,1,2,3'" in result.stderr
+    assert f"HIP_VISIBLE_DEVICES='{hip}'" in result.stderr
+    assert f"CUDA_VISIBLE_DEVICES='{cuda}'" in result.stderr
 
 
 @contextmanager
