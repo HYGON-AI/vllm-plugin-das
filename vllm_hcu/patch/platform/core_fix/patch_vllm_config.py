@@ -410,6 +410,15 @@ def _validate_dspark_pd_scope(vllm_config: object) -> None:
 
     if connector == "MooncakeConnector" and is_deepseek_v4(vllm_config):
         return
+    # DecodeBenchConnector is an OFFLINE decode-bench connector: it only fills
+    # the local KV cache with synthetic values and never talks to a P/D peer,
+    # so it cannot break the validated disaggregation path. Opt-in via env to
+    # keep bench workflows reproducible outside the Mooncake setup.
+    if (
+        connector == "DecodeBenchConnector"
+        and os.environ.get("VLLM_HCU_DSPARK_ALLOW_DECODE_BENCH", "0") == "1"
+    ):
+        return
     architectures = getattr(
         getattr(vllm_config, "model_config", None), "architectures", ()
     )
