@@ -88,14 +88,36 @@ def run_prefill(kernel, q, sink, ratio, topk, swa_cache, swa_table,
     )
     output = torch.full_like(q, float("nan"))
     original = rocm.rocm_sparse_attn_prefill
+    missing = object()
+    original_chunk_size = getattr(rocm, "PREFILL_CHUNK_SIZE", missing)
+    chunk_tokens = []
+
+    def checked_kernel(*args, **kwargs):
+        chunk_tokens.append(kwargs["q"].shape[0])
+        return kernel(*args, **kwargs)
+
     try:
-        rocm.rocm_sparse_attn_prefill = kernel
+        # The pinned v0.25.1 uses a module constant; some installed revisions
+        # use self.PREFILL_CHUNK_SIZE instead. Set both and verify execution.
+        rocm.PREFILL_CHUNK_SIZE = chunk_size
+        rocm.rocm_sparse_attn_prefill = checked_kernel
         rocm.DeepseekV4ROCMAiterMLAAttention._forward_prefill(
             attention, q, torch.empty(0, device=DEVICE, dtype=torch.int64),
             compressed_cache, swa_cache, output, attn, swa,
         )
     finally:
         rocm.rocm_sparse_attn_prefill = original
+        if original_chunk_size is missing:
+            del rocm.PREFILL_CHUNK_SIZE
+        else:
+            rocm.PREFILL_CHUNK_SIZE = original_chunk_size
+    expected_chunk_tokens = [
+        sum(lengths[start:start + chunk_size])
+        for start in range(0, len(lengths), chunk_size)
+    ]
+    assert chunk_tokens == expected_chunk_tokens, (
+        ratio, requests, chunk_size, chunk_tokens, expected_chunk_tokens,
+    )
     torch.cuda.synchronize()
     assert torch.isfinite(output).all(), (ratio, requests, chunk_size)
     return output
