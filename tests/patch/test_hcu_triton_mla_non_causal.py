@@ -130,8 +130,31 @@ def test_expand_causal_rows_passthrough_single_token():
     bt, sl = expand_causal_rows(block_table, seq_lens, 2, 2)
     assert bt is block_table and sl is seq_lens
     bt, sl = expand_causal_rows(block_table, seq_lens, 3, 2)
-    # 3 tokens over 2 decodes is not a uniform verify pack: leave untouched.
+    # 3 tokens over 2 decodes is not a uniform verify pack: no expand is
+    # triggered at this size (query_len <= 1 passthrough branch).
     assert bt is block_table and sl is seq_lens
+
+
+def test_expand_causal_rows_rejects_non_divisible_multi_token_pack():
+    """Review 2026-10-14 P1 discussion (defensive guard): forward_mqa
+    launches one kernel row per query, so the expansion must produce
+    exactly ``num_decode_tokens`` rows.  A multi-token pack whose token
+    count is NOT a multiple of the request count (query_len > 1) would
+    mis-map queries to requests -- impossible on every caller path today
+    (uniform-split contract + graph-descriptor divisibility), so fail
+    loudly instead of drifting silently."""
+
+    block_table = torch.tensor([[5], [9]])
+    seq_lens = torch.tensor([10, 20])
+    try:
+        expand_causal_rows(block_table, seq_lens, 7, 2)
+    except RuntimeError as exc:
+        assert "not a multiple of" in str(exc)
+    else:
+        raise AssertionError("expected RuntimeError for 7 tokens / 2 decodes")
+    # Divisible multi-token packs still expand fine.
+    bt, sl = expand_causal_rows(block_table, seq_lens, 6, 2)
+    assert sl.shape[0] == 6
 
 
 def test_forward_keys_row_semantics_on_the_producer_stamp():

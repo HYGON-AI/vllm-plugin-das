@@ -84,6 +84,15 @@ def expand_causal_rows(
     non-causal shape -- would let early queries read future tokens and poison
     the logits (review 2026-10-12 P1 repro: prefix 2 + 2 queries -> [3, 4],
     not [4, 4]).  Single-token batches pass through untouched.
+
+    Defensive guard (review 2026-10-14 P1 discussion): ``forward_mqa``
+    launches one kernel row per query, so the expanded row count must equal
+    ``num_decode_tokens`` exactly.  ``q.shape[0] == num_decode_tokens`` is a
+    call contract today (``mqa_q = q[:num_mqa_tokens]``), but only the
+    divisibility of the logical counters keeps the product aligned -- if a
+    future wheel change (e.g. enabling PIECEWISE cudagraph for the draft)
+    pads tokens without padding requests, a silent quotient drift would
+    mis-map rows.  Fail loudly instead.
     """
 
     if num_decodes <= 0 or num_decode_tokens <= num_decodes:
@@ -91,6 +100,15 @@ def expand_causal_rows(
     query_len = num_decode_tokens // num_decodes
     if query_len <= 1:
         return block_table, seq_lens
+    if query_len * num_decodes != num_decode_tokens:
+        # Pure host-side integer comparison: no device sync, invisible to
+        # cudagraph capture/replay.
+        raise RuntimeError(
+            "HCU triton MLA: non-uniform causal verify batch "
+            f"(num_decode_tokens={num_decode_tokens} is not a multiple of "
+            f"num_decodes={num_decodes}); per-row causal expansion would "
+            "mis-map queries to requests."
+        )
     num_reqs = seq_lens.shape[0]
     inner = torch.arange(query_len, device=seq_lens.device, dtype=seq_lens.dtype)
     offsets = (query_len - 1) - inner  # 0 per-token shift, oldest row first
