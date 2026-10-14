@@ -27,6 +27,12 @@ def register_model():
         "DeepseekV32MTPModel", "vllm_hcu.models.deepseek_mtp:DeepSeekMTP"
     )
 
+    # W8A8 MTP checkpoints can use .scale for parameters named weight_scale.
+    ModelRegistry.register_model(
+        "DeepSeekV4MTPModel",
+        "vllm_hcu.models.deepseek_v4_mtp_compat:DeepSeekV4MTP",
+    )
+
     ModelRegistry.register_model(
         "GlmMoeDsaForCausalLM", "vllm_hcu.models.deepseek_v2:GlmMoeDsaForCausalLM"
     )
