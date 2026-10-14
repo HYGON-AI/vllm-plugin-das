@@ -39,7 +39,7 @@ _PLATFORM_INIT_FAILURE: Exception | None = None
 
 
 def _bridge_plugin_logging() -> None:
-    """Route ``vllm_hcu.*`` records onto the same stream vLLM logs to.
+    """Route ``vllm_hcu`` records onto the same stream vLLM logs to.
 
     vLLM attaches its handler to the ``vllm`` logger tree only; plugin
     records otherwise propagate to the root, whose last-resort writer drops
@@ -47,6 +47,26 @@ def _bridge_plugin_logging() -> None:
     lines (auxiliary-comm construction, DSpark shard enablement) an operator
     must be able to see when validating the role-separation deployment.
     vLLM's own handlers are reused when already configured; idempotent.
+
+    The plugin logger MIRRORS the level configured on the ``vllm`` logger
+    (NOTSET on ``vllm`` = unconfigured, falls back to INFO): the two trees
+    are siblings under the global root, so ``vllm_hcu`` cannot inherit the
+    operator's VLLM_LOGGING_LEVEL by leaving its own level unset (review
+    2026-10-15 P2).  The earlier hard ``INFO`` overrode that policy in both
+    directions -- plugin ``.debug()`` diagnostics were dropped in DEBUG
+    deployments while plugin INFO rode through at WARNING+.
+
+    Handlerless deployments stay UNTOUCHED (review 2026-10-15 P2, round 8):
+    when the ``vllm`` logger has no handlers yet -- vLLM imported but not
+    configured, or VLLM_CONFIGURE_LOGGING=0 -- the plugin neither installs
+    its own fallback handler nor latches, so its records follow the
+    operator's root policy (below-WARNING records are dropped by the
+    last-resort writer exactly like vLLM's own records under that flag).
+    The previous fallback pinned INFO on stderr with ``propagate=False``
+    and, when ``vllm_hcu`` was imported before vLLM finished configuring,
+    permanently latched away the handlers and level that arrived later.
+    The mirror is a one-shot import-time snapshot; a later runtime
+    reconfiguration of the ``vllm`` level is not re-mirrored.
     """
 
     import logging
@@ -56,16 +76,14 @@ def _bridge_plugin_logging() -> None:
         return
     handlers = list(logging.getLogger("vllm").handlers)
     if not handlers:
-        handler = logging.StreamHandler()
-        handler.setFormatter(
-            logging.Formatter(
-                "%(asctime)s %(levelname)s %(name)s - %(message)s"
-            )
-        )
-        handlers = [handler]
+        # No vLLM logging policy exists yet: defer to the operator's root
+        # configuration instead of inventing one (see docstring).
+        return
     for handler in handlers:
-        root.addHandler(handler)
-    root.setLevel(logging.INFO)
+        if handler not in root.handlers:
+            root.addHandler(handler)
+    vllm_level = logging.getLogger("vllm").level
+    root.setLevel(vllm_level if vllm_level != logging.NOTSET else logging.INFO)
     root.propagate = False
     root._hcu_bridge_done = True  # type: ignore[attr-defined]
 

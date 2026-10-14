@@ -345,6 +345,15 @@ _FRAMEWORK_CALLBACKS: tuple[_CallbackSpec, ...] = (
     _CallbackSpec(
         _adapter("framework_opt", "patch_mamba_acceptance_reset"),
     ),
+    # Stamp spec-side draft attn metadata as explicitly non-causal (fork
+    # 877e6996 carries a causal flag on the metadata; the wheel does not).
+    # The HCU triton MLA backend keys its row expansion on this stamp: an
+    # UNSTAMPED multi-token verify batch keeps exact per-row causal lengths
+    # instead of being flattened like a draft block (review 2026-10-12 P1:
+    # causal verify read future KV through the row-count heuristic).
+    _CallbackSpec(
+        _adapter("framework_opt", "patch_dspark_non_causal_stamp"),
+    ),
     # v0.25.1 has no SlotMappingMode, so MultiGroupBlockTable launches the
     # slot-mapping kernel once per KV cache group even for Mamba/GDN groups.
     _CallbackSpec(
