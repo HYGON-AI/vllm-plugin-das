@@ -6,6 +6,7 @@ Adapted from water18-0910 implementation for vLLM 0.28 compatibility.
 """
 
 from collections.abc import Iterable
+from copy import copy
 
 import torch
 import torch.nn as nn
@@ -116,46 +117,15 @@ class Step5MultiTokenPredictorLayer(nn.Module):
             prefix=f"{prefix}.shared_head",
         )
 
-        # Step5DecoderLayer expects hf_config to be text_config directly
-        # Temporarily patch hf_config if it has text_config nested
-        hf_config = vllm_config.model_config.hf_config
-        original_hf_config = hf_config
-        if hasattr(hf_config, "text_config"):
-            # Temporarily replace hf_config with text_config
-            vllm_config.model_config.hf_config = hf_config.text_config
-
-        # MTP layers use indices beyond the main model (92, 93, 94) but
-        # Step5DecoderLayer extracts layer_idx from prefix and accesses
-        # config.layer_types[layer_idx]. Map MTP layer indices to valid range
-        # by using the original prefix but it will be used for weight loading.
-        # For initialization, we need a unique prefix that extracts to a valid index.
-        # Extract the actual MTP layer index from the prefix
-        import re
-
-        match = re.search(r"layers\.(\d+)", prefix)
-        if match:
-            actual_idx = int(match.group(1))
-            # Map to valid range (0-91) using modulo, ensuring uniqueness
-            # Use (actual_idx - num_hidden_layers) % num_hidden_layers to cycle through
-            num_hidden_layers = getattr(config, "num_hidden_layers", 92)
-            safe_idx = (
-                (actual_idx - num_hidden_layers) % num_hidden_layers
-                if actual_idx >= num_hidden_layers
-                else actual_idx
-            )
-            safe_prefix = (
-                f"{prefix.rsplit('.layers.', 1)[0]}.layers.{safe_idx}.mtp_block"
-            )
-        else:
-            safe_prefix = f"{prefix}.mtp_block"
-
+        # Preserve the checkpoint's absolute layer index for all per-layer
+        # settings and quantization prefixes. Do not mutate the shared config.
+        decoder_config = copy(vllm_config)
+        decoder_config.model_config = copy(vllm_config.model_config)
+        decoder_config.model_config.hf_config = config
         self.mtp_block = Step5DecoderLayer(
-            vllm_config,
-            prefix=safe_prefix,
+            decoder_config,
+            prefix=f"{prefix}.mtp_block",
         )
-
-        # Restore original hf_config
-        vllm_config.model_config.hf_config = original_hf_config
 
     def forward(
         self,

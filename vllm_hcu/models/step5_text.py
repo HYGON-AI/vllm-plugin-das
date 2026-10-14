@@ -1041,13 +1041,18 @@ class Step5DecoderLayer(nn.Module):
                 f"Unsupported attention implementation: {config.att_impl_type}"
             )
 
+        # HF exposes main-model layer_types separately; MTP uses the tail.
+        layer_types = (
+            getattr(config, "layer_types_with_mtp", None)
+            or getattr(config, "layer_types", [])
+        )
         num_attention_heads = None
         num_attention_groups = None
         head_dim = None
         if (
             getattr(config, "attention_other_setting", None)
-            and getattr(config, "layer_types", [])
-            and config.layer_types[layer_idx]
+            and layer_types
+            and layer_types[layer_idx]
             == config.attention_other_setting["attention_type"]
         ):
             num_attention_heads = config.attention_other_setting["num_attention_heads"]
@@ -1073,7 +1078,7 @@ class Step5DecoderLayer(nn.Module):
             rope_scaling=getattr(config, "rope_scaling", None),
             sliding_window=getattr(config, "sliding_window", None),
             use_head_wise_attn_gate=getattr(config, "use_head_wise_attn_gate", False),
-            layer_types=getattr(config, "layer_types", []),
+            layer_types=layer_types,
             use_rope_layers=getattr(config, "use_rope_layers", []),
             yarn_only_types=getattr(config, "yarn_only_types", []),
             partial_rotary_factor=partial_rotary_factors[layer_idx]
