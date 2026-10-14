@@ -84,6 +84,10 @@ def test_platform_core_inventory_is_explicit_and_ordered():
             "vllm.config.speculative",
         ),
         (
+            "platform.core_fix.kimi_k3_dspark_speculative_arch",
+            "vllm.config.speculative",
+        ),
+        (
             "platform.core_fix.hcu_config.slimquant_registry",
             "vllm.model_executor.layers.quantization",
         ),
@@ -302,9 +306,9 @@ def test_apply_platform_patches_is_idempotent_narrow_and_reported():
     assert result.returncode == 0, result.stderr
     payload = json.loads(result.stdout.strip().splitlines()[-1])
     assert payload == {
-        "count": 59,
+        "count": 60,
         "replacements": 11,
-        "callbacks": 48,
+        "callbacks": 49,
         "failed": [],
         "builtins_same": True,
         "role": "Main",

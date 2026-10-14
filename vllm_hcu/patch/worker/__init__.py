@@ -329,6 +329,31 @@ _FRAMEWORK_CALLBACKS: tuple[_CallbackSpec, ...] = (
     _CallbackSpec(
         _adapter("framework_opt", "patch_pcp_model_state"),
     ),
+    # The wheel DSpark lm_head share probes target_model.lm_head only; a
+    # *ForConditionalGeneration K3 target keeps its head on the language
+    # model, so the share is skipped and profile_run dies on the draft's
+    # "target LM head has not been attached" guard.  Re-run the share with
+    # the fork-parity resolved head (fork 877e6996 get_target_lm_head).
+    _CallbackSpec(
+        _adapter("framework_opt", "patch_dspark_target_lm_head_share"),
+    ),
+    # Fork 877e6996 resets num_accepted_tokens_gpu unconditionally in
+    # MambaHybridModelState.add_request; the wheel gates it on _align_mode,
+    # which never runs with the default mamba_cache_mode="none".  Recycled
+    # slots then inherit stale acceptance counts and the GDN state rollback
+    # rewinds by wrong depths (bs>=2 speculative acceptance collapse).
+    _CallbackSpec(
+        _adapter("framework_opt", "patch_mamba_acceptance_reset"),
+    ),
+    # Stamp spec-side draft attn metadata as explicitly non-causal (fork
+    # 877e6996 carries a causal flag on the metadata; the wheel does not).
+    # The HCU triton MLA backend keys its row expansion on this stamp: an
+    # UNSTAMPED multi-token verify batch keeps exact per-row causal lengths
+    # instead of being flattened like a draft block (review 2026-10-12 P1:
+    # causal verify read future KV through the row-count heuristic).
+    _CallbackSpec(
+        _adapter("framework_opt", "patch_dspark_non_causal_stamp"),
+    ),
     # v0.25.1 has no SlotMappingMode, so MultiGroupBlockTable launches the
     # slot-mapping kernel once per KV cache group even for Mamba/GDN groups.
     _CallbackSpec(
