@@ -23,37 +23,52 @@ env:
   HARBOR_SITE: ${{ vars.HARBOR_SITE }}
   HARBOR_NAMESPACE: jenkins/model_test_env
   HCU_CI_IMAGE: ${{ vars.HCU_CI_IMAGE }}
-  # 从 dev 基础镜像内联安装 DTK (不再依赖预装 DTK 的基础镜像), 便于按次换 DTK 包;
-  # 归档站地址走 RESOURCE_SERVER_URL 变量, 不在文件里暴露内网 IP
-  BASE_IMAGE: ${{ vars.DEV_IMAGE_UBUNTU_PY310 || 'harbor.sourcefind.cn:5443/dcu/admin/base/dev:ubuntu22.04-mpi5.0-gcc11.4-cmake3.29-py3.10' }}
-  DTK_PKG_URL: ${{ vars.DTK_PKG_URL || format('{0}/dtk-pkg/dtk26.04.1/DTK-26.04.1-72cu-0911-ubuntu20.04-x86_64.tar.gz', vars.RESOURCE_SERVER_URL) }}
-  DTK_VERSION: "dtk26041-72cu-0911"
   PYPI_URL: ${{ vars.PYPI_URL }}
   RESOURCE_SERVER_URL: ${{ vars.RESOURCE_SERVER_URL }}
   VLLM_VERSION: "0.28.1"
-  TORCH_VERSION: "2.11.0"
 
 jobs:
   build:
     # 需要能访问内网 pip 源 / AICC 下载地址 / Harbor 的自托管构建节点
-    runs-on:
-      - ci
-      - bw1100
+    # 加镜像目标 = 改下面矩阵; image/DTK 版本号/输出 tag 全部按矩阵字段拼接,
+    # 镜像总表格式: ${HARBOR_SITE}/hcu/base/dtk:<DTK版本>-<OS>-py<Python版本>
+    runs-on: bw1100
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - dtk_tag: "26.10"
+            os_tag: "ubuntu22.04"
+            python_version: "3.12"
+            torch_version: "2.11.0"
+            # AICC 大版本, 安装脚本 --major 装该版本中日期最新的包 (26.10 段为 2.0.0)
+            aicc_major: "2.0.0"
+            # blas cut 版本, 安装脚本按版本+os 拉归档最新包覆盖到 /opt/dtk
+            blas_cut_version: "26.10"
     outputs:
       docker_image: ${{ steps.gen-tag.outputs.docker_image }}
+    env:
+      # 直接基于预装 DTK 的基础镜像构建, CI 内不再安装 DTK
+      BASE_IMAGE: ${{ vars.DTK_BASE_IMAGE || format('{0}/hcu/base/dtk:{1}-{2}-py{3}', vars.HARBOR_SITE, matrix.dtk_tag, matrix.os_tag, matrix.python_version) }}
+      TORCH_VERSION: ${{ matrix.torch_version }}
     steps:
       - name: Checkout
         uses: actions/checkout@v4
 
       - name: 生成镜像 tag
         id: gen-tag
+        env:
+          DTK_TAG_NO_DOT: ${{ matrix.dtk_tag }}
         run: |
+          DTK_TAG_NO_DOT="${DTK_TAG_NO_DOT//./}"
+          # BUILD_TIME: 传给 Dockerfile 生成 /etc/image.info 的 built 段, 与产物 tag 时间段一致
           BUILD_TIME=$(date +"%Y%m%d-%H%M")
+          echo "BUILD_TIME=${BUILD_TIME}" >> "$GITHUB_ENV"
           BASE_VERSION=$(grep -oP '__version__ = "\K[^"]+' vllm_hcu/version.py)
           BASE_VERSION="${BASE_VERSION%%.dev*}"
-          echo "IMAGE_TAG=vllm:${BASE_VERSION}-ubuntu22.04-dtk26041-py3.10-${BUILD_TIME}" >> "$GITHUB_ENV"
+          echo "IMAGE_TAG=vllm:${BASE_VERSION}-${{ matrix.os_tag }}-dtk${DTK_TAG_NO_DOT}-py${{ matrix.python_version }}-${BUILD_TIME}" >> "$GITHUB_ENV"
           echo "LATEST_TAG=vllm:${BASE_VERSION}-latest" >> "$GITHUB_ENV"
-          echo "docker_image=${HARBOR_SITE}/${HARBOR_NAMESPACE}/vllm:${BASE_VERSION}-ubuntu22.04-dtk26041-py3.10-${BUILD_TIME}" >> "$GITHUB_OUTPUT"
+          echo "docker_image=${HARBOR_SITE}/${HARBOR_NAMESPACE}/vllm:${BASE_VERSION}-${{ matrix.os_tag }}-dtk${DTK_TAG_NO_DOT}-py${{ matrix.python_version }}-${BUILD_TIME}" >> "$GITHUB_OUTPUT"
 
       - name: 登录 Harbor
         uses: docker/login-action@v3
@@ -72,13 +87,13 @@ jobs:
             -t "${FULL_TAG}" \
             -t "${FULL_LATEST_TAG}" \
             --build-arg "BASE_IMAGE=${BASE_IMAGE}" \
-            --build-arg "DTK_PKG_URL=${DTK_PKG_URL}" \
-            --build-arg "DTK_VERSION=${DTK_VERSION}" \
+            --build-arg "AICC_MAJOR=${{ matrix.aicc_major }}" \
+            --build-arg "BLAS_CUT_VERSION=${{ matrix.blas_cut_version }}" \
             --build-arg "PYPI_URL=${PYPI_URL}" \
             --build-arg "RESOURCE_SERVER_URL=${RESOURCE_SERVER_URL}" \
             --build-arg "VLLM_VERSION=${VLLM_VERSION}" \
             --build-arg "TORCH_VERSION=${TORCH_VERSION}" \
-            --build-arg "IMAGE_TAG=${FULL_TAG}" \
+            --build-arg "BUILD_TIME=${BUILD_TIME}" \
             -f docker/Dockerfile \
             .
 
