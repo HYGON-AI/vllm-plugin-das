@@ -14,7 +14,34 @@ second plugin callback cannot retry a partially registered custom op.
 from __future__ import annotations
 
 import importlib
+import os
 import threading
+
+
+def _sync_hip_cuda_visible_devices() -> None:
+    """Keep HIP and CUDA device masks consistent for HCU integrations."""
+
+    hip_visible_devices = os.environ.get("HIP_VISIBLE_DEVICES") or None
+    cuda_visible_devices = os.environ.get("CUDA_VISIBLE_DEVICES") or None
+
+    if (
+        hip_visible_devices is not None
+        and cuda_visible_devices is not None
+        and hip_visible_devices != cuda_visible_devices
+    ):
+        raise ValueError(
+            "Inconsistent GPU visibility env vars: "
+            f"HIP_VISIBLE_DEVICES='{hip_visible_devices}' vs "
+            f"CUDA_VISIBLE_DEVICES='{cuda_visible_devices}'. "
+            "Please set only one, or ensure they match."
+        )
+    if hip_visible_devices is not None:
+        os.environ["CUDA_VISIBLE_DEVICES"] = hip_visible_devices
+    elif cuda_visible_devices is not None:
+        os.environ["HIP_VISIBLE_DEVICES"] = cuda_visible_devices
+
+
+_sync_hip_cuda_visible_devices()
 
 from vllm_hcu.lightop_env import configure_lightop_environment
 

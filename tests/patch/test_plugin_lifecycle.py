@@ -77,8 +77,14 @@ def _fresh_python(
     assert_target_install: bool = True,
     assert_target_first: bool = True,
     no_site: bool = False,
+    env_overrides: dict[str, str | None] | None = None,
 ) -> subprocess.CompletedProcess[str]:
     env = dict(os.environ)
+    for name, value in (env_overrides or {}).items():
+        if value is None:
+            env.pop(name, None)
+        else:
+            env[name] = value
     env["VLLM_PLUGINS"] = plugins
     env["VLLM_TARGET_ROOT"] = str(TARGET_VLLM_ROOT)
     env["VLLM_HCU_TARGET_ROOT"] = str(TARGET_PLUGIN_ROOT)
@@ -106,6 +112,59 @@ def _fresh_python(
         env=env,
         timeout=120,
     )
+
+
+@pytest.mark.parametrize(
+    ("hip", "cuda", "expected_hip", "expected_cuda"),
+    [
+        ("4,5,6,7", None, "4,5,6,7", "4,5,6,7"),
+        (None, "4,5,6,7", "4,5,6,7", "4,5,6,7"),
+        ("4,5,6,7", "4,5,6,7", "4,5,6,7", "4,5,6,7"),
+        ("", "4,5,6,7", "4,5,6,7", "4,5,6,7"),
+    ],
+)
+def test_plugin_import_synchronizes_hip_and_cuda_visibility(
+    hip: str | None,
+    cuda: str | None,
+    expected_hip: str,
+    expected_cuda: str,
+):
+    result = _fresh_python(
+        r'''
+import json
+import os
+import vllm_hcu
+print(json.dumps({
+    "hip": os.environ.get("HIP_VISIBLE_DEVICES"),
+    "cuda": os.environ.get("CUDA_VISIBLE_DEVICES"),
+}))
+''',
+        assert_target_install=False,
+        env_overrides={
+            "HIP_VISIBLE_DEVICES": hip,
+            "CUDA_VISIBLE_DEVICES": cuda,
+        },
+    )
+
+    assert result.returncode == 0, result.stderr
+    values = json.loads(result.stdout.strip().splitlines()[-1])
+    assert values == {"hip": expected_hip, "cuda": expected_cuda}
+
+
+def test_plugin_import_rejects_conflicting_hip_and_cuda_visibility():
+    result = _fresh_python(
+        "import vllm_hcu",
+        assert_target_install=False,
+        env_overrides={
+            "HIP_VISIBLE_DEVICES": "4,5,6,7",
+            "CUDA_VISIBLE_DEVICES": "0,1,2,3",
+        },
+    )
+
+    assert result.returncode != 0
+    assert "Inconsistent GPU visibility env vars" in result.stderr
+    assert "HIP_VISIBLE_DEVICES='4,5,6,7'" in result.stderr
+    assert "CUDA_VISIBLE_DEVICES='0,1,2,3'" in result.stderr
 
 
 @contextmanager
