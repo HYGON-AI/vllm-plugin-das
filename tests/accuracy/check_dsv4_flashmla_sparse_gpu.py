@@ -6,6 +6,11 @@ from __future__ import annotations
 
 import os
 
+# Capture native AITER callables before applying the adapter manually below.
+# Installed wheels auto-load the HCU plugin during vLLM imports, which would
+# patch dsv4_rocm before we can save the reference implementation.
+os.environ["VLLM_PLUGINS"] = ""
+
 import torch
 from flash_mla import (
     flash_mla_with_kvcache,
