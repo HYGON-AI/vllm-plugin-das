@@ -65,6 +65,7 @@ def _vllm_config(
         kernel_config=SimpleNamespace(moe_backend=backend),
         parallel_config=SimpleNamespace(
             enable_expert_parallel=enable_expert_parallel,
+            use_sequence_parallel_moe=False,
             eplb_config=SimpleNamespace(num_redundant_experts=0),
         ),
     )
