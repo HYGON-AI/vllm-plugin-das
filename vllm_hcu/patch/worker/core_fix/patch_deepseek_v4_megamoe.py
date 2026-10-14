@@ -1,6 +1,11 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright (c) 2026 Hygon Information Technology Co., Ltd.
-"""Select the opt-in MegaMoE method before fallback kernel construction."""
+"""Select the opt-in MegaMoE method before fallback kernel construction.
+
+On HCU, ``--moe-backend deep_gemm_mega_moe`` selects the standalone megamoe
+package instead of vLLM's NVIDIA DeepGEMM MegaMoE path. The legacy
+``VLLM_HCU_USE_MEGAMOE=1`` switch with ``--moe-backend auto`` still works.
+"""
 
 from __future__ import annotations
 
@@ -20,6 +25,7 @@ TARGET_MODULE = "vllm.model_executor.layers.fused_moe.routed_experts"
 PATCH_ID = "worker.core_fix.deepseek_v4.hcu_megamoe"
 TARGET_SYMBOL = f"{TARGET_MODULE}.RoutedExperts._get_quant_method"
 _MARKER = "_vllm_hcu_megamoe_wrapper"
+MEGA_MOE_BACKEND = "deep_gemm_mega_moe"
 
 
 def apply_to_module(module: ModuleType) -> bool:
@@ -37,7 +43,10 @@ def apply_to_module(module: ModuleType) -> bool:
 
     @functools.wraps(original)
     def hcu_get_quant_method(self, prefix, quant_config, moe_config):
-        if os.environ.get("VLLM_HCU_USE_MEGAMOE", "0").lower() in ("1", "true"):
+        requested = getattr(moe_config, "moe_backend", None) == MEGA_MOE_BACKEND
+        if requested or os.environ.get(
+            "VLLM_HCU_USE_MEGAMOE", "0"
+        ).lower() in ("1", "true"):
             from vllm_hcu.model_executor.layers.fused_moe.megamoe_runtime import (
                 select_method,
             )
@@ -45,6 +54,12 @@ def apply_to_module(module: ModuleType) -> bool:
             method = select_method(self, quant_config, moe_config)
             if method is not None:
                 return method
+            if requested:
+                # vLLM's own deep_gemm_mega_moe path is NVIDIA-only.
+                raise ValueError(
+                    f"moe_backend={MEGA_MOE_BACKEND!r} on HCU supports "
+                    "DeepSeek-V4 target/DSpark models only"
+                )
         return original(self, prefix, quant_config, moe_config)
 
     setattr(hcu_get_quant_method, _MARKER, True)

@@ -108,9 +108,14 @@ def valid_config():
     ("is_sequence_parallel", True, "sequence"),
     ("skip_final_all_reduce", True, "defer"),
     ("in_dtype", torch.float16, "bfloat16"),
+    ("moe_backend", "triton", "deep_gemm_mega_moe"),
 ])
 def test_config_rejects_unsupported_modes(runtime, field, value, match):
     config, moe, layer = valid_config()
+    runtime.validate_config(config, moe, layer)
+    moe.moe_backend = "deep_gemm_mega_moe"
+    runtime.validate_config(config, moe, layer)
+    moe.moe_backend = "auto"
     runtime.validate_config(config, moe, layer)
     setattr(moe, field, value)
     with pytest.raises(ValueError, match=match):
@@ -184,6 +189,49 @@ def test_fp8_stages_routes_and_scales(runtime, monkeypatch):
                      torch.ones(17, 6), torch.ones(17, 6, dtype=torch.int64))
 
 
+def test_chunk_limit_keeps_k1_strides_in_uint32(runtime):
+    _, moe, _ = valid_config()
+    moe.max_num_tokens = 32768
+    limit = runtime.max_chunk_tokens(moe, "normal")
+    rows = lambda t: runtime._k1_rows("normal", t, 8, 6, 32)
+    assert rows(32768) * 4096 > 2**32 - 1  # The DSV4-Flash profile-run failure.
+    assert rows(limit) * 4096 <= 2**32 - 1 < rows(limit + 1) * 4096
+    assert 16384 < limit < 32768
+    ll = runtime.max_chunk_tokens(moe, "ll")
+    assert runtime._k1_rows("ll", ll, 8, 6, 32) * 4096 <= 2**32 - 1
+    moe.max_num_tokens = 16
+    assert runtime.max_chunk_tokens(moe, "normal") == 16
+
+
+def test_fp8_large_batch_is_chunked_on_every_dp_rank(runtime, monkeypatch):
+    _, moe, layer = valid_config()
+    method = runtime.HcuMegaMoEMethod(moe, "fp8")
+    method._max_chunk_tokens = 4
+    buf = NS(topk_idx=torch.ones(16, 6, dtype=torch.int64),
+             topk_weights=torch.ones(16, 6), x=torch.empty(16, 4096), x_sf=torch.empty(16))
+    method._buffer, method._l1, method._l2 = buf, {}, {}
+    calls = []
+    fake = ModuleType("megamoe")
+    fake.cast_to_fp8_channelwise = lambda x: (x.float(), torch.ones(x.shape[0], 1))
+    def run(y, *args, **kwargs):
+        m = y.shape[0]
+        calls.append((m, kwargs["capacity_num_tokens"], buf.topk_idx[:, 0].clone()))
+        y.copy_(buf.x[:m])
+    fake.fp8_w8a8_mega_moe = run
+    monkeypatch.setitem(sys.modules, "megamoe", fake)
+    monkeypatch.setattr(torch.cuda, "is_current_stream_capturing", lambda: False)
+    monkeypatch.setattr(runtime, "get_forward_context", lambda: NS(
+        dp_metadata=NS(num_tokens_across_dp_cpu=torch.tensor([6, 10]))))
+    x = torch.arange(6, dtype=torch.bfloat16)[:, None].expand(6, 4096).contiguous()
+    ids = torch.arange(6)[:, None].expand(6, 6).contiguous()
+    result = method.apply(layer, x, torch.ones(6, 6), ids)
+    torch.testing.assert_close(result, x)
+    # Shared capacity 10 -> 4+4+2 calls; this rank has 4, 2, then 0 tokens.
+    assert [(m, cap) for m, cap, _ in calls] == [(4, 4), (2, 4), (0, 2)]
+    assert calls[1][2][:3].tolist() == [4, 5, -1]  # Stale routes cleared.
+    assert (calls[2][2] == -1).all()
+
+
 def test_post_load_reuses_buffer_and_invalidates_weight_cache(runtime, monkeypatch):
     _, moe, _ = valid_config()
     import torch.nn as nn
@@ -246,6 +294,15 @@ def test_opt_in_patch_preserves_default_and_is_idempotent(monkeypatch):
     monkeypatch.setenv("VLLM_HCU_USE_MEGAMOE", "1")
     assert instance._get_quant_method("model.layers.0.experts", None, None) == "mega"
     assert len(calls) == 1
+    # --moe-backend deep_gemm_mega_moe opts in without the env switch.
+    monkeypatch.delenv("VLLM_HCU_USE_MEGAMOE")
+    mega = NS(moe_backend="deep_gemm_mega_moe")
+    assert instance._get_quant_method("model.layers.0.experts", None, mega) == "mega"
+    fake.select_method = lambda *args: None
+    with pytest.raises(ValueError, match="DeepSeek-V4"):
+        instance._get_quant_method("model.layers.0.experts", None, mega)
+    assert instance._get_quant_method(
+        "model.layers.0.experts", None, NS(moe_backend="auto")) == "existing"
     RoutedExperts._get_quant_method = lambda *args: None
     with pytest.raises(RuntimeError, match="stale"):
         patch.apply_to_module(module)

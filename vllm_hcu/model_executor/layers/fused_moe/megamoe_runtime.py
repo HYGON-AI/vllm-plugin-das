@@ -16,6 +16,48 @@ from vllm.model_executor.layers.fused_moe.fused_moe_method_base import (
 )
 
 
+_K1_ROUTE_TILE_M = 256
+_K1_LL_ROW_TILE = 64
+_UINT32_MAX = (1 << 32) - 1
+
+
+def _align(value: int, alignment: int) -> int:
+    return -(-value // alignment) * alignment
+
+
+def _k1_rows(backend, tokens, num_ranks, topk, local_experts) -> int:
+    """Upper bound of K1/K3 launch rows; mirrors megamoe k1_fused_ext.cu."""
+    if backend == "ll":
+        expected = -(-tokens * topk // local_experts)
+        per_expert = max(
+            _align(num_ranks * tokens, _K1_LL_ROW_TILE),
+            _align(expected + 128, _K1_LL_ROW_TILE),
+        )
+        return local_experts * per_expert
+    # skew_safe_compact_capacity_tiles
+    routes = num_ranks * tokens * topk
+    max_tiles = local_experts * -(-num_ranks * tokens // _K1_ROUTE_TILE_M)
+    active = min(local_experts, routes)
+    fragmented = active + max(0, routes - active) // _K1_ROUTE_TILE_M
+    return max(local_experts, min(max_tiles, fragmented)) * _K1_ROUTE_TILE_M
+
+
+def max_chunk_tokens(moe, backend) -> int:
+    """Largest per-rank token count whose K1/K3 asm strides fit in uint32."""
+    width = max(2 * moe.intermediate_size_per_partition, moe.hidden_dim)
+    shape = (moe.ep_size, moe.experts_per_token, moe.num_local_experts)
+    lo, hi = 1, max(1, int(moe.max_num_tokens))
+    if _k1_rows(backend, hi, *shape) * width <= _UINT32_MAX:
+        return hi
+    while lo < hi:
+        mid = (lo + hi + 1) // 2
+        if _k1_rows(backend, mid, *shape) * width <= _UINT32_MAX:
+            lo = mid
+        else:
+            hi = mid - 1
+    return lo
+
+
 def validate_config(config, moe, layer, quant_mode=None) -> None:
     parallel = config.parallel_config
     hf = config.model_config.hf_config
@@ -25,8 +67,11 @@ def validate_config(config, moe, layer, quant_mode=None) -> None:
         raise ValueError("HCU MegaMoE requires --enable-expert-parallel and EP8")
     if quant_mode == "int8" and not config.model_config.enforce_eager:
         raise ValueError("HCU MegaMoE PACK5 adapter requires --enforce-eager")
-    if moe.moe_backend != "auto":
-        raise ValueError("VLLM_HCU_USE_MEGAMOE requires moe_backend=auto")
+    if moe.moe_backend not in ("auto", "deep_gemm_mega_moe"):
+        raise ValueError(
+            "HCU MegaMoE requires --moe-backend deep_gemm_mega_moe "
+            "(or auto with VLLM_HCU_USE_MEGAMOE=1)"
+        )
     if parallel.enable_dbo:
         raise ValueError("HCU MegaMoE PACK5 does not support DBO")
     offload = getattr(config, "offload_config", None)
@@ -179,6 +224,10 @@ class HcuMegaMoEMethod(FusedMoEMethodBase):
         if self._ll_threshold < 0:
             raise ValueError("MEGAMOE_HCU_NORMAL_LL_TOKEN_THRESHOLD must be non-negative")
         self._layout = "normal" if self._mode == "normal" else "unified"
+        # Eager batches above this are split into several MegaMoE calls.
+        self._max_chunk_tokens = max_chunk_tokens(
+            moe, "ll" if self._mode == "ll" else "normal"
+        )
 
     def _backend(self, capacity):
         if self._mode == "auto":
@@ -434,39 +483,61 @@ class HcuMegaMoEMethod(FusedMoEMethodBase):
         buf = self._buffer
         if graph and getattr(buf, "cuda_graph_num_tokens", None) is None:
             raise RuntimeError("MegaMoE wheel does not provide graph token buffers")
-        # Clear stale routes, particularly when an idle DP rank follows a
-        # non-empty step. -1 is MegaMoE's unused-expert sentinel.
-        buf.topk_idx.fill_(-1)
-        buf.topk_weights.zero_()
-        if graph:
-            # Capture the padded bucket size as a GPU operation. Every replay
-            # executes this update; another target/draft bucket cannot leave a
-            # stale host-provided count in the shared symmetric buffer.
-            buf.cuda_graph_num_tokens.fill_(n)
-        if n:
-            if self.quant_mode == "int8":
-                megamoe.mega_moe_pre_dispatch_int8(
-                    x.contiguous(), topk_ids.contiguous(), topk_weights.contiguous(),
-                    buf.x, buf.x_sf, buf.topk_idx, buf.topk_weights, n,
-                )
-            else:
-                q, scale = megamoe.cast_to_fp8_channelwise(x.contiguous())
-                buf.x[:n].copy_(q)
-                buf.x_sf[:n].copy_(scale.reshape(-1))
-                buf.topk_idx[:n].copy_(topk_ids)
-                buf.topk_weights[:n].copy_(topk_weights)
         if self.quant_mode == "int8":
             from .hcu_int4_megamoe import int4_w4a8_mega_moe
 
             run = int4_w4a8_mega_moe
         else:
             run = megamoe.fp8_w8a8_mega_moe
-        descriptor = getattr(context, "batch_descriptor", None)
-        selector = getattr(descriptor, "num_tokens", capacity) if graph else capacity
-        run(
-            y, self._l1, self._l2, buf, megamoe_backend=self._backend(selector),
-            graph=graph, capacity_num_tokens=capacity,
-            activation_clamp=layer.swiglu_limit,
-            cumulative_local_expert_recv_stats=None, fast_math=True,
-        )
+        # K1/K3 asm strides are uint32, so large eager batches run as several
+        # MegaMoE calls. Chunking follows the shared capacity, so every EP/DP
+        # rank issues the same number of collective calls.
+        chunk = self._max_chunk_tokens
+        if self._mode == "ll":
+            chunk = min(chunk, int(getattr(
+                buf, "ll_scratch_capacity_tokens_per_rank", chunk)))
+        if graph:
+            if capacity > chunk:
+                raise ValueError(
+                    "MegaMoE CUDA graph bucket exceeds the K1/K3 uint32 stride limit"
+                )
+            chunk = capacity
+        for start in range(0, capacity, chunk):
+            chunk_capacity = min(chunk, capacity - start)
+            lo, hi = min(start, n), min(start + chunk_capacity, n)
+            m = hi - lo
+            # Clear stale routes, particularly when an idle DP rank follows a
+            # non-empty step. -1 is MegaMoE's unused-expert sentinel.
+            buf.topk_idx.fill_(-1)
+            buf.topk_weights.zero_()
+            if graph:
+                # Capture the padded bucket size as a GPU operation. Every replay
+                # executes this update; another target/draft bucket cannot leave a
+                # stale host-provided count in the shared symmetric buffer.
+                buf.cuda_graph_num_tokens.fill_(n)
+            if m:
+                xs, ids, ws = x[lo:hi], topk_ids[lo:hi], topk_weights[lo:hi]
+                if self.quant_mode == "int8":
+                    megamoe.mega_moe_pre_dispatch_int8(
+                        xs.contiguous(), ids.contiguous(), ws.contiguous(),
+                        buf.x, buf.x_sf, buf.topk_idx, buf.topk_weights, m,
+                    )
+                else:
+                    q, scale = megamoe.cast_to_fp8_channelwise(xs.contiguous())
+                    buf.x[:m].copy_(q)
+                    buf.x_sf[:m].copy_(scale.reshape(-1))
+                    buf.topk_idx[:m].copy_(ids)
+                    buf.topk_weights[:m].copy_(ws)
+            descriptor = getattr(context, "batch_descriptor", None)
+            selector = (
+                getattr(descriptor, "num_tokens", capacity) if graph
+                else chunk_capacity
+            )
+            run(
+                y if graph else y[lo:hi], self._l1, self._l2, buf,
+                megamoe_backend=self._backend(selector),
+                graph=graph, capacity_num_tokens=chunk_capacity,
+                activation_clamp=layer.swiglu_limit,
+                cumulative_local_expert_recv_stats=None, fast_math=True,
+            )
         return y[:n] if graph else y

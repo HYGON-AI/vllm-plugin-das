@@ -400,7 +400,8 @@ hcu_vllm_environment_variables: dict[str, Callable[[], Any]] = {
     lambda: (os.environ.get(
             "VLLM_HCU_USE_LIGHTOP_QWEN_RMSNORM_GATED", "True"
         ).lower() in ("true", "1")),
-    # Opt-in HCU MegaMoE communication/compute owner for DeepSeek-V4.
+    # Legacy opt-in HCU MegaMoE switch for DeepSeek-V4 (with moe_backend=auto);
+    # prefer --moe-backend deep_gemm_mega_moe.
     "VLLM_HCU_USE_MEGAMOE":
     lambda: (os.environ.get("VLLM_HCU_USE_MEGAMOE", "0").lower()
              in ("true", "1")),
