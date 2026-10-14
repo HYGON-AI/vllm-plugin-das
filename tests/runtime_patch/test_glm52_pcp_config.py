@@ -405,6 +405,27 @@ def test_hyv4_pcp_rejects_incomplete_pd_configuration(
         patch_vllm_config._validate_hcu_pcp_scope(config)
 
 
+@pytest.mark.parametrize(
+    "architecture",
+    [
+        "GlmMoeDsaForCausalLM",
+        "DeepseekV3ForCausalLM",
+        "DeepseekV32ForCausalLM",
+    ],
+)
+def test_dsa_mla_pcp_rejects_producer_without_connector(
+    make_pcp_config, architecture,
+) -> None:
+    config = make_pcp_config(architecture=architecture, pcp=4, tp=1)
+    config.kv_transfer_config = SimpleNamespace(
+        kv_connector=None,
+        kv_role="kv_producer",
+        kv_connector_module_path=None,
+    )
+    with pytest.raises(ValueError, match="P/D disaggregation"):
+        patch_vllm_config._validate_hcu_pcp_scope(config)
+
+
 @pytest.mark.parametrize("use_mla", [False, True])
 def test_hyv4_pcp_rejects_ambiguous_architecture_lists(
     make_hyv4_pp2_pcp4_config, use_mla,
@@ -592,7 +613,7 @@ def test_gqa_pcp_rejects_hybrid_kv_cache_groups(make_pcp_config) -> None:
     ("override", "message"),
     [
         ({"use_v2": False}, "Model Runner V2"),
-        ({"architecture": "DeepseekV2ForCausalLM"}, "GLM-5.2"),
+        ({"architecture": "DeepseekV2ForCausalLM"}, "HCU MLA PCP"),
         ({"use_mla": False}, "MLA"),
         ({"pp": 2}, "pipeline parallel"),
         ({"dcp": 2}, "decode context parallel"),

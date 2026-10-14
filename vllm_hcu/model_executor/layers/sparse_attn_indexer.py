@@ -1132,7 +1132,15 @@ class V32SparseAttnIndexer(SparseAttnIndexer):
             # after the indexer buffer is current, kick this layer's MLA
             # latent broadcast so it overlaps with the top-k compute that
             # runs before MLA attention reads it. Collective on every rank.
-            maybe_prefetch_same_layer_mla_cache(parse_layer_index(layer_name))
+            # Synthetic/test cache prefixes may omit the transformer layer
+            # number.  Broadcasting remains valid, but the optional same-layer
+            # MLA prefetch cannot be addressed; skip only that optimization.
+            try:
+                layer_idx = parse_layer_index(layer_name)
+            except (AssertionError, ValueError):
+                layer_idx = None
+            if layer_idx is not None:
+                maybe_prefetch_same_layer_mla_cache(layer_idx)
         return torch.ops.vllm.hcu_sparse_attn_indexer(
             hidden_states,
             _encode_layer_name(layer_name),

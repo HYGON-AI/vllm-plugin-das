@@ -179,13 +179,24 @@ def test_validate_rejects_ordinary_mla_even_with_index_topk(
         )
 
 
+@pytest.mark.parametrize(
+    "architecture",
+    ["DeepseekV3ForCausalLM", "DeepseekV32ForCausalLM", "GlmMoeDsaForCausalLM"],
+)
 def test_validate_rejects_when_dsa_is_disabled(
-    monkeypatch: pytest.MonkeyPatch,
+    monkeypatch: pytest.MonkeyPatch, architecture: str
 ) -> None:
     _set_layer_split(monkeypatch, True)
     monkeypatch.setenv("VLLM_HCU_DISABLE_DSA", "1")
     with pytest.raises(ValueError, match="VLLM_HCU_DISABLE_DSA"):
-        validate_dsa_cache_layer_split(_pd_prefill_cfg())
+        validate_dsa_cache_layer_split(_pd_prefill_cfg((architecture,)))
+
+
+def test_hyv4_ignores_dsa_env_opt_out(monkeypatch: pytest.MonkeyPatch) -> None:
+    """HYV4 always builds its indexer; the DeepSeek-V2 opt-out must not apply."""
+    _set_layer_split(monkeypatch, True)
+    monkeypatch.setenv("VLLM_HCU_DISABLE_DSA", "1")
+    validate_dsa_cache_layer_split(_pd_prefill_cfg(("HYV4ForCausalLM",)))
 
 
 @pytest.mark.parametrize("kv_role", [None, "kv_consumer", "kv_both"])
@@ -373,6 +384,53 @@ def test_remote_layer_id_skips_repeat_broadcast(
         cache, layer, shard_rank=0, shard_size=2, total_layers=8, pcp_group=_Group()
     )
     assert calls["n"] == 2
+
+
+def test_sparse_selection_change_forces_same_layer_rebroadcast(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A new active block set cannot reuse the old layer-only dedup state."""
+    _set_layer_split(monkeypatch, True)
+    clear_broadcast_scratch_for_tests()
+    owner = torch.arange(8 * 2, dtype=torch.float32).view(8, 2)
+    non_owner = torch.full_like(owner, -1.0)
+    active = torch.tensor([1])
+    calls = {"n": 0}
+
+    class _Group:
+        rank_in_group = 1
+
+        def broadcast(self, tensor: torch.Tensor, src: int = 0) -> torch.Tensor:
+            del src
+            calls["n"] += 1
+            tensor.copy_(owner.index_select(0, active))
+            return tensor
+
+    layer = "model.layers.0.self_attn.attn"
+    set_active_dsa_broadcast_block_ids(active)
+    broadcast_dsa_cache_from_owner(
+        non_owner,
+        layer,
+        shard_rank=1,
+        shard_size=2,
+        total_layers=8,
+        pcp_group=_Group(),
+    )
+    assert torch.equal(non_owner[1], owner[1])
+
+    active = torch.tensor([4])
+    set_active_dsa_broadcast_block_ids(active)
+    broadcast_dsa_cache_from_owner(
+        non_owner,
+        layer,
+        shard_rank=1,
+        shard_size=2,
+        total_layers=8,
+        pcp_group=_Group(),
+    )
+    assert calls["n"] == 2
+    assert torch.equal(non_owner[4], owner[4])
+    clear_broadcast_scratch_for_tests()
 
 
 def test_broadcast_noop_when_feature_off(
@@ -777,8 +835,10 @@ def test_remap_mixed_page_sizes_hy4_like(monkeypatch: pytest.MonkeyPatch) -> Non
     assert by_layer["model.layers.8.self_attn.attn"] == mla_base + 3 * mla_page  # MTP
 
 
-def test_admission_sizing_uses_shrunk_bytes(monkeypatch: pytest.MonkeyPatch) -> None:
-    """max-model-len check and block override must see owned+scratch bytes."""
+def test_admission_sizing_reserves_broadcast_bounce_bytes(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """KV admission includes both persistent broadcast scratch pools."""
     import types
 
     from vllm_hcu.patch.platform.framework_opt import (
@@ -791,6 +851,8 @@ def test_admission_sizing_uses_shrunk_bytes(monkeypatch: pytest.MonkeyPatch) -> 
     shrunk_bytes = page * phys_slots_for_layer_family(
         list(range(total_layers)), total_layers, pcp
     )
+    bounce_bytes = 2 * page
+    accounted_bytes = shrunk_bytes + bounce_bytes
 
     mod = types.ModuleType(kv_patch.TARGET_MODULE)
 
@@ -823,5 +885,146 @@ def test_admission_sizing_uses_shrunk_bytes(monkeypatch: pytest.MonkeyPatch) -> 
             kv_cache_spec=SimpleNamespace(page_size_bytes=page),
         )
     ]
-    assert mod._pool_bytes_per_block(cfg, groups) == shrunk_bytes
-    assert mod._max_memory_usage_bytes_from_groups(cfg, groups) == shrunk_bytes * 1000
+    assert mod._pool_bytes_per_block(cfg, groups) == accounted_bytes
+    assert mod._max_memory_usage_bytes_from_groups(cfg, groups) == (
+        accounted_bytes * 1000
+    )
+
+
+def _planner_module(kv_patch, *, override=None, seen=None):
+    import types
+
+    mod = types.ModuleType(kv_patch.TARGET_MODULE)
+
+    def get_kv_cache_config_from_groups(
+        vllm_config, kv_cache_groups, available_memory
+    ):
+        if seen is not None:
+            seen.append(available_memory)
+        return "original"
+
+    mod.get_kv_cache_config_from_groups = get_kv_cache_config_from_groups
+    mod.may_override_num_blocks = lambda cfg, n: n if override is None else override
+    mod.KVCacheConfig = SimpleNamespace
+    mod.KVCacheTensor = SimpleNamespace
+    assert kv_patch.apply_to_module(mod) is True
+    return mod
+
+
+def _single_family_groups(total_layers: int, page: int) -> list[SimpleNamespace]:
+    return [
+        SimpleNamespace(
+            layer_names=[
+                f"model.layers.{i}.self_attn.attn" for i in range(total_layers)
+            ],
+            kv_cache_spec=SimpleNamespace(page_size_bytes=page),
+        )
+    ]
+
+
+def test_no_shrink_fallback_still_reserves_bounce_memory(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """2 layers / PCP2 keeps every slot, but broadcasts still need scratch."""
+    from vllm_hcu.patch.platform.framework_opt import (
+        patch_dsa_layer_split_kv_config as kv_patch,
+    )
+
+    monkeypatch.setattr(kv_patch, "_layer_split_active", lambda cfg: True)
+    total_layers, pcp, page = 2, 2, 16
+    assert phys_slots_for_layer_family([0, 1], total_layers, pcp) == total_layers
+    seen: list[int] = []
+    mod = _planner_module(kv_patch, seen=seen)
+    full_bytes = page * total_layers
+    available = (full_bytes + 2 * page) * 10
+    out = mod.get_kv_cache_config_from_groups(
+        _remap_cfg(total_layers, pcp),
+        _single_family_groups(total_layers, page),
+        available,
+    )
+    assert out == "original"
+    # Original planner sees only the share that fits packed KV + bounce.
+    assert seen == [full_bytes * 10]
+
+
+def test_bounce_budget_shares_scratch_across_same_dtype_families(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Same-dtype families share one scratch per pool; distinct dtypes add up."""
+    from vllm_hcu.patch.platform.framework_opt import (
+        patch_dsa_layer_split_kv_config as kv_patch,
+    )
+
+    monkeypatch.setattr(kv_patch, "_layer_split_active", lambda cfg: True)
+    total_layers, pcp = 8, 4
+    mla_page, idx_page = 100, 10
+
+    def groups(idx_dtype):
+        return [
+            SimpleNamespace(
+                layer_names=[
+                    f"model.layers.{i}.self_attn.attn"
+                    for i in range(total_layers)
+                ],
+                kv_cache_spec=SimpleNamespace(
+                    page_size_bytes=mla_page, dtype="uint8"
+                ),
+            ),
+            SimpleNamespace(
+                layer_names=[
+                    f"model.layers.{i}.self_attn.indexer"
+                    for i in range(total_layers)
+                ],
+                kv_cache_spec=SimpleNamespace(
+                    page_size_bytes=idx_page, dtype=idx_dtype
+                ),
+            ),
+        ]
+
+    shrunk = (mla_page + idx_page) * phys_slots_for_layer_family(
+        list(range(total_layers)), total_layers, pcp
+    )
+    cfg = _remap_cfg(total_layers, pcp)
+    # HY4 fp8: both views are uint8 -> one scratch per pool, sized to max.
+    shared = shrunk + 2 * mla_page
+    config = _planner_module(kv_patch).get_kv_cache_config_from_groups(
+        cfg, groups("uint8"), shared * 7
+    )
+    assert config.num_blocks == 7
+    # GLM bf16 indexer: distinct dtypes -> separate scratches, sum.
+    separate = shrunk + 2 * (mla_page + idx_page)
+    config = _planner_module(kv_patch).get_kv_cache_config_from_groups(
+        cfg, groups("bfloat16"), separate * 7
+    )
+    assert config.num_blocks == 7
+    # Unknown dtype falls back to the conservative standalone sum.
+    config = _planner_module(kv_patch).get_kv_cache_config_from_groups(
+        cfg, groups(None), separate * 7
+    )
+    assert config.num_blocks == 7
+
+
+def test_block_override_cannot_exceed_bounce_budget(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    from vllm_hcu.patch.platform.framework_opt import (
+        patch_dsa_layer_split_kv_config as kv_patch,
+    )
+
+    monkeypatch.setattr(kv_patch, "_layer_split_active", lambda cfg: True)
+    total_layers, pcp, page = 8, 4, 16
+    shrunk_bytes = page * phys_slots_for_layer_family(
+        list(range(total_layers)), total_layers, pcp
+    )
+    accounted = shrunk_bytes + 2 * page
+    available = accounted * 10
+    cfg = _remap_cfg(total_layers, pcp)
+    groups = _single_family_groups(total_layers, page)
+
+    within = _planner_module(kv_patch, override=10)
+    config = within.get_kv_cache_config_from_groups(cfg, groups, available)
+    assert config.num_blocks == 10
+
+    over = _planner_module(kv_patch, override=11)
+    with pytest.raises(ValueError, match="num_gpu_blocks_override"):
+        over.get_kv_cache_config_from_groups(cfg, groups, available)

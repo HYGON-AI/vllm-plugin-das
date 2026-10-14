@@ -63,6 +63,8 @@ _BCAST_COMM_INIT_DONE = False
 # context length instead of the full KV pool. Must be identical on every PCP
 # rank (install from the global block table, not the rank-local partition).
 _ACTIVE_BLOCK_IDS: torch.Tensor | None = None
+# Host-side (min, max) of ``_ACTIVE_BLOCK_IDS``; avoids per-layer syncs.
+_ACTIVE_BLOCK_ID_RANGE: tuple[int, int] | None = None
 # Opt-out: VLLM_HCU_DSA_SPARSE_BROADCAST=0 forces the legacy full-pool path.
 _SPARSE_BROADCAST_ENV = "VLLM_HCU_DSA_SPARSE_BROADCAST"
 
@@ -192,8 +194,25 @@ def _dsa_hf_config(model_config: Any) -> Any | None:
     return hf_config
 
 
-def _dsa_disabled_by_environment() -> bool:
+# Architectures whose HCU runtime honors ``VLLM_HCU_DISABLE_DSA`` (the
+# DeepSeek V2 decoder / MTP set ``is_v32 = ... and not VLLM_HCU_DISABLE_DSA``).
+# HYV4 always builds its indexer, so the opt-out must not disable it here.
+_DSA_ENV_OPT_OUT_ARCHITECTURES = frozenset(
+    {
+        "DeepseekV3ForCausalLM",
+        "DeepseekV32ForCausalLM",
+        "GlmMoeDsaForCausalLM",
+    }
+)
+
+
+def _dsa_disabled_by_environment(architecture: str | None = None) -> bool:
     """Match the model runtime's environment-controlled DSA opt-out."""
+    if (
+        architecture is not None
+        and architecture not in _DSA_ENV_OPT_OUT_ARCHITECTURES
+    ):
+        return False
     return os.environ.get("VLLM_HCU_DISABLE_DSA", "False").lower() in {
         "1",
         "true",
@@ -210,11 +229,13 @@ def is_hcu_dsa_mla_model(model_config: Any | None) -> bool:
     field.  Keep the same fail-closed rule here so enabling PCP alone cannot
     route an ordinary MLA/GQA cache through DSA layer remapping.
     """
-    if model_config is None or _dsa_disabled_by_environment():
+    if model_config is None:
         return False
 
     architectures = getattr(model_config, "architectures", None) or ()
     if not architectures or architectures[0] not in _DSA_LAYER_SPLIT_ARCHITECTURES:
+        return False
+    if _dsa_disabled_by_environment(architectures[0]):
         return False
     if getattr(model_config, "use_mla", None) is not True:
         return False
@@ -227,8 +248,6 @@ def _dsa_capability_error(model_config: Any | None) -> str:
     """Describe the first missing DSA capability for validation errors."""
     if model_config is None:
         return "model_config is missing"
-    if _dsa_disabled_by_environment():
-        return "VLLM_HCU_DISABLE_DSA is enabled"
 
     architectures = getattr(model_config, "architectures", None) or ()
     architecture = architectures[0] if architectures else None
@@ -237,6 +256,8 @@ def _dsa_capability_error(model_config: Any | None) -> str:
             "architecture must be one of "
             f"{sorted(_DSA_LAYER_SPLIT_ARCHITECTURES)} (got {architecture!r})"
         )
+    if _dsa_disabled_by_environment(architecture):
+        return "VLLM_HCU_DISABLE_DSA is enabled"
     if getattr(model_config, "use_mla", None) is not True:
         return f"use_mla must be True (got {getattr(model_config, 'use_mla', None)!r})"
     hf_config = _dsa_hf_config(model_config)
@@ -512,6 +533,7 @@ def install_runtime_layer_split_state(
     """
     global _RUNTIME_STATE, _RUNTIME_STATE_INSTALLED
     _RUNTIME_STATE_INSTALLED = False
+    clear_active_dsa_broadcast_block_ids()
     _FAMILY_REMOTE.clear()
     _LAYER_CACHE_REGISTRY.clear()
     state = get_runtime_layer_split_state(vllm_config)
@@ -527,6 +549,7 @@ def reset_runtime_layer_split_state_for_tests() -> None:
     global _BCAST_COMM, _BCAST_STREAM, _BCAST_COMM_INIT_DONE
     _RUNTIME_STATE = None
     _RUNTIME_STATE_INSTALLED = False
+    clear_active_dsa_broadcast_block_ids()
     _FAMILY_REMOTE.clear()
     _LAYER_CACHE_REGISTRY.clear()
     _BCAST_COMM = None
@@ -599,6 +622,16 @@ def _family_state(cache: torch.Tensor, layer_name: str) -> _FamilyRemoteState:
     return st
 
 
+def _invalidate_remote_broadcast_state() -> None:
+    """Invalidate remote buffers when the sparse selection changes."""
+    for family in tuple(_FAMILY_REMOTE.values()):
+        if family.pending_remote_broadcast:
+            _finalize_pending_broadcast(family, set_remote_layer_id=False)
+        family.remote_layer_id = None
+        family.pending_remote_layer_id = None
+        family.pending_remote_broadcast = False
+
+
 def _scratch_for(
     cache: torch.Tensor,
     pool: str = "sync",
@@ -628,18 +661,42 @@ def set_active_dsa_broadcast_block_ids(
     """Install unique block ids for the next owner-broadcasts in this forward.
 
     ``block_ids`` must be a 1-D int tensor, identical on every PCP rank.
-    Pass ``None`` / empty to fall back to the full-pool broadcast.
+    Pass ``None`` / empty to fall back to the full-pool broadcast.  Changing
+    the selection invalidates layer-only remote dedup because a remote buffer
+    populated for the old selection is incomplete for the new one.
+
+    Dedup stays layer-granular (SGLang ``remote_layer_id``) on purpose: every
+    non-owned layer of a family aliases one scratch slot, so the next forward
+    always starts on a different layer than the scratch holds and needs a
+    broadcast regardless.  Per-block "already synced" tracking would also be
+    unsound: a request's tail block keeps receiving tokens and freed block ids
+    are reused by other requests, so an id match does not imply equal content.
     """
-    global _ACTIVE_BLOCK_IDS
-    if block_ids is None:
-        _ACTIVE_BLOCK_IDS = None
-        return
-    if not isinstance(block_ids, torch.Tensor) or block_ids.numel() == 0:
-        _ACTIVE_BLOCK_IDS = None
-        return
-    ids = block_ids.reshape(-1).to(dtype=torch.long)
-    # Deterministic order so every rank builds the same payload layout.
-    _ACTIVE_BLOCK_IDS = torch.unique(ids, sorted=True)
+    global _ACTIVE_BLOCK_IDS, _ACTIVE_BLOCK_ID_RANGE
+    if block_ids is None or not isinstance(block_ids, torch.Tensor):
+        ids = None
+    elif block_ids.numel() == 0:
+        ids = None
+    else:
+        ids = torch.unique(
+            block_ids.reshape(-1).to(dtype=torch.long), sorted=True
+        )
+
+    previous = _ACTIVE_BLOCK_IDS
+    changed = (previous is None) != (ids is None)
+    if not changed and previous is not None and ids is not None:
+        try:
+            changed = not torch.equal(previous, ids)
+        except RuntimeError:
+            changed = True
+    if changed:
+        _invalidate_remote_broadcast_state()
+    _ACTIVE_BLOCK_IDS = ids
+    # Resolve the id range once per forward. ``ids`` is sorted, so the range
+    # check in ``_active_block_ids_for`` needs no per-layer device sync.
+    _ACTIVE_BLOCK_ID_RANGE = (
+        None if ids is None else (int(ids[0].item()), int(ids[-1].item()))
+    )
 
 
 def set_active_dsa_broadcast_block_ids_from_tables(
@@ -677,9 +734,15 @@ def _active_block_ids_for(cache: torch.Tensor) -> torch.Tensor | None:
     if not _sparse_broadcast_enabled():
         return None
     ids = _ACTIVE_BLOCK_IDS
-    if ids is None or ids.numel() == 0:
+    id_range = _ACTIVE_BLOCK_ID_RANGE
+    if ids is None or id_range is None or ids.numel() == 0:
         return None
     if cache.ndim < 1 or cache.shape[0] <= 0:
+        return None
+    # An invalid/sentinel block id must never become an index_select/index_copy
+    # operand.  Falling back to the full pool is conservative and keeps every
+    # PCP rank in the same collective path.
+    if id_range[0] < 0 or id_range[1] >= int(cache.shape[0]):
         return None
     # Skip when the selection would not shrink the payload.
     if int(ids.numel()) >= int(cache.shape[0]):

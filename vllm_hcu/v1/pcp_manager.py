@@ -779,6 +779,7 @@ class HcuPCPManager:
     def _install_dsa_sparse_broadcast_block_ids(self) -> None:
         try:
             from vllm_hcu.v1.dsa_cache_layer_split import (
+                clear_active_dsa_broadcast_block_ids,
                 get_runtime_layer_split_state,
                 set_active_dsa_broadcast_block_ids_from_tables,
             )
@@ -794,6 +795,9 @@ class HcuPCPManager:
                 num_reqs_padded=self._global_batch.num_reqs_after_padding,
             )
         except Exception:
+            # Do not retain a previous forward's selection.  A stale set can
+            # make one rank skip a collective after the batch has changed.
+            clear_active_dsa_broadcast_block_ids()
             return
         set_active_dsa_broadcast_block_ids_from_tables(global_tables)
 
@@ -813,12 +817,15 @@ class HcuPCPManager:
         # MTP restore path may reshuffle metadata; refresh the sparse set.
         try:
             from vllm_hcu.v1.dsa_cache_layer_split import (
+                clear_active_dsa_broadcast_block_ids,
                 get_runtime_layer_split_state,
                 set_active_dsa_broadcast_block_ids_from_tables,
             )
 
             if get_runtime_layer_split_state() is not None:
                 set_active_dsa_broadcast_block_ids_from_tables(block_tables)
+            else:
+                clear_active_dsa_broadcast_block_ids()
         except Exception:
             pass
         global_slots = self._global_slot_mappings[

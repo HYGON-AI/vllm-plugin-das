@@ -81,6 +81,33 @@ def _bucket_layers_by_page_size(kv_cache_groups) -> dict[int, list[list[str]]]:
     return dict(buckets)
 
 
+def _bounce_bytes_per_block(kv_cache_groups, page_sizes) -> int:
+    """Per-block bytes of the sync + prefetch broadcast scratch pools.
+
+    ``_scratch_for`` keys one buffer per (pool, device, dtype) and grows it to
+    the largest cache seen, so same-dtype page families share one buffer sized
+    to their max page. Families whose spec dtype is unknown are charged
+    standalone (conservative sum).
+    """
+    page_dtypes: dict[int, set] = {}
+    for group in kv_cache_groups:
+        spec = group.kv_cache_spec
+        per_layer = getattr(spec, "kv_cache_specs", None)
+        layer_specs = per_layer.values() if per_layer else (spec,)
+        for layer_spec in layer_specs:
+            page = int(getattr(layer_spec, "page_size_bytes", 0) or 0)
+            if page:
+                page_dtypes.setdefault(page, set()).add(
+                    getattr(layer_spec, "dtype", None)
+                )
+    max_by_pool: dict[object, int] = {}
+    for page in page_sizes:
+        for dtype in page_dtypes.get(int(page)) or {None}:
+            key = ("standalone", page) if dtype is None else dtype
+            max_by_pool[key] = max(max_by_pool.get(key, 0), int(page))
+    return 2 * sum(max_by_pool.values())
+
+
 def apply_to_module(module: ModuleType) -> bool:
     kv_cache_utils = load_exact_module(TARGET_MODULE, module)
     has_packed = callable(
@@ -196,9 +223,56 @@ def apply_to_module(module: ModuleType) -> bool:
         full_bytes = sum(
             page_size * len(buckets[page_size]) for page_size in page_sizes
         )
-        if total_num_bytes_per_block >= full_bytes:
-            return None
-        return buckets, page_sizes, phys_slots, total_num_bytes_per_block, full_bytes
+        # No shrink (tiny models): the original planner keeps its layout, but
+        # the runtime still bounces through the broadcast scratch, so the
+        # reservation below applies either way.
+        shrunk = total_num_bytes_per_block < full_bytes
+        if not shrunk:
+            total_num_bytes_per_block = full_bytes
+        # ``_scratch_for`` keeps separate sync and prefetch pools; see
+        # ``_bounce_bytes_per_block`` for the per-dtype sharing model.
+        bounce_bytes_per_block = _bounce_bytes_per_block(
+            kv_cache_groups, page_sizes
+        )
+        return (
+            buckets,
+            page_sizes,
+            phys_slots,
+            total_num_bytes_per_block,
+            full_bytes,
+            bounce_bytes_per_block,
+            shrunk,
+        )
+
+    def _accounted_bytes(layout) -> int:
+        return layout[3] + layout[5]
+
+    def _budget_blocks(vllm_config, layout, available_memory) -> int:
+        """Block count that fits packed KV plus bounce; rejects larger overrides.
+
+        Bounce scratch is allocated lazily on the first broadcast, so an
+        override that only fits the packed tensor passes startup and OOMs on
+        the first prefill instead.
+        """
+        budget = available_memory // _accounted_bytes(layout)
+        num_blocks = may_override(vllm_config, budget)
+        if num_blocks > budget:
+            raise ValueError(
+                f"num_gpu_blocks_override={num_blocks} exceeds the DSA cache "
+                f"layer-split budget of {budget} blocks (packed KV "
+                f"{layout[3]} + broadcast bounce {layout[5]} bytes/block); "
+                "lower the override or the layer-split bounce buffers OOM "
+                "on the first prefill."
+            )
+        return num_blocks
+
+    def _bounce_reserved_memory(vllm_config, kv_cache_groups, available_memory):
+        """``available_memory`` minus bounce reservation for the original planner."""
+        layout = _shrunk_layout(vllm_config, kv_cache_groups)
+        if layout is None:
+            return available_memory
+        _budget_blocks(vllm_config, layout, available_memory)
+        return available_memory * layout[3] // _accounted_bytes(layout)
 
     def _shrunk_packed_plan(vllm_config, kv_cache_groups, available_memory):
         from vllm_hcu.v1.dsa_cache_layer_split import make_packed_kv_tensor
@@ -207,14 +281,22 @@ def apply_to_module(module: ModuleType) -> bool:
         logger = init_logger("vllm_hcu.dsa_layer_split_kv")
 
         layout = _shrunk_layout(vllm_config, kv_cache_groups)
-        if layout is None:
+        if layout is None or not layout[6]:
             return None
-        buckets, page_sizes, phys_slots, total_num_bytes_per_block, full_bytes = (
-            layout
-        )
+        (
+            buckets,
+            page_sizes,
+            phys_slots,
+            total_num_bytes_per_block,
+            full_bytes,
+            bounce_bytes_per_block,
+            _,
+        ) = layout
 
-        num_blocks = available_memory // total_num_bytes_per_block
-        num_blocks = may_override(vllm_config, num_blocks)
+        # Reserve the memory used by the two persistent broadcast bounce pools;
+        # it is not part of the packed KV tensor returned below.
+        accounted_bytes_per_block = _accounted_bytes(layout)
+        num_blocks = _budget_blocks(vllm_config, layout, available_memory)
         total_size = total_num_bytes_per_block * num_blocks
 
         kv_cache_tensors = []
@@ -239,10 +321,13 @@ def apply_to_module(module: ModuleType) -> bool:
 
         logger.warning(
             "DSA layer-split packed KV plan: full_bytes/block=%d "
-            "owned_scratch_bytes/block=%d ratio=%.3f num_blocks=%d "
+            "owned_scratch_bytes/block=%d bounce_bytes/block=%d "
+            "accounted_bytes/block=%d ratio=%.3f num_blocks=%d "
             "phys_slots=%s",
             full_bytes,
             total_num_bytes_per_block,
+            bounce_bytes_per_block,
+            accounted_bytes_per_block,
             (total_num_bytes_per_block / full_bytes) if full_bytes else 0.0,
             num_blocks,
             dict(phys_slots),
@@ -278,6 +363,8 @@ def apply_to_module(module: ModuleType) -> bool:
                 vllm_config, kv_cache_groups, available_memory
             )
             if plan is None:
+                # The groups wrapper already reserved bounce memory before
+                # delegating here; reserving again would double-charge it.
                 return original_packed(
                     vllm_config, kv_cache_groups, available_memory
                 )
@@ -312,7 +399,13 @@ def apply_to_module(module: ModuleType) -> bool:
             vllm_config, kv_cache_groups, available_memory
         )
         if plan is None:
-            return original_groups(vllm_config, kv_cache_groups, available_memory)
+            return original_groups(
+                vllm_config,
+                kv_cache_groups,
+                _bounce_reserved_memory(
+                    vllm_config, kv_cache_groups, available_memory
+                ),
+            )
         return _config_from_plan(plan, kv_cache_groups, vllm_config)
 
     def _shrink_bytes(vllm_config, kv_cache_groups, full_value):
@@ -321,8 +414,8 @@ def apply_to_module(module: ModuleType) -> bool:
         layout = _shrunk_layout(vllm_config, kv_cache_groups)
         if layout is None:
             return full_value
-        shrunk_bytes, full_bytes = layout[3], layout[4]
-        return -(-full_value * shrunk_bytes // full_bytes)
+        full_bytes = layout[4]
+        return -(-full_value * _accounted_bytes(layout) // full_bytes)
 
     if original_max_usage is not None:
 

@@ -287,12 +287,18 @@ def _require_mrv2_pcp_contract(vllm_config: object) -> None:
     ) is not None:
         raise ValueError("HCU PCP does not support KV offload.")
 
-    if kv_transfer_config is not None and (
-        is_hyv4
-        or _require_hcu_pcp_attribute(
+    kv_connector = None
+    if kv_transfer_config is not None:
+        kv_connector = _require_hcu_pcp_attribute(
             kv_transfer_config, "kv_connector", "KVTransferConfig"
         )
-        is not None
+    if kv_transfer_config is not None and (
+        # HYV4 has always required an explicit P/D connector.  DSA MLA
+        # families need the same guard even when the connector field is
+        # absent: layer split cannot deliver owner shards without Mooncake.
+        is_hyv4
+        or is_dsa_mla
+        or kv_connector is not None
     ):
         # kv_role is the validated KVTransferConfig role, not kv_rank or a
         # connector-name heuristic. kv_both includes a consumer and is excluded.
