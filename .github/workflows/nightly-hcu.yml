@@ -30,7 +30,8 @@ jobs:
   prepare:
     runs-on:
       - self-hosted
-      - hcu-ci-pr
+      - ci
+      - bw1100
     container:
       image: ${{ vars.HCU_CI_IMAGE_V0281 }}
     defaults:
@@ -101,7 +102,8 @@ jobs:
       - quarantine-retest
     runs-on:
       - self-hosted
-      - hcu-ci-pr
+      - ci
+      - bw1100
     permissions:
       contents: read
       issues: write

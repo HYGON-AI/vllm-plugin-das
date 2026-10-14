@@ -23,7 +23,8 @@ jobs:
   build-wheel:
     runs-on:
       - self-hosted
-      - hcu-linux-gfx938-1
+      - ci
+      - bw1100
     timeout-minutes: 120
     concurrency:
       group: hcu-runner-hcu-linux-gfx938-1
@@ -90,7 +91,8 @@ jobs:
     needs: build-wheel
     runs-on:
       - self-hosted
-      - hcu-linux-gfx938-1
+      - ci
+      - bw1100
     timeout-minutes: 60
     concurrency:
       group: hcu-runner-hcu-linux-gfx938-1
@@ -147,7 +149,8 @@ jobs:
     needs: build-wheel
     runs-on:
       - self-hosted
-      - hcu-linux-gfx938-1
+      - ci
+      - bw1100
     timeout-minutes: 120
     concurrency:
       group: hcu-runner-hcu-linux-gfx938-1
@@ -206,7 +209,8 @@ jobs:
     needs: build-wheel
     runs-on:
       - self-hosted
-      - hcu-linux-gfx938-4
+      - ci
+      - bw1100
     timeout-minutes: 180
     concurrency:
       group: hcu-runner-hcu-linux-gfx938-4
@@ -270,7 +274,8 @@ jobs:
       - wheel-multi-card-smoke
     runs-on:
       - self-hosted
-      - hcu-ci-pr
+      - ci
+      - bw1100
     env:
       BUILD_RESULT: ${{ needs.build-wheel.result }}
       KERNEL_RESULT: ${{ needs.wheel-kernel-smoke.result }}

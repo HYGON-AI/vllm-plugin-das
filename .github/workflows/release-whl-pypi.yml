@@ -31,7 +31,9 @@ jobs:
     #   ${{ vars.HARBOR_SITE }}/hcu/base/dtk:<dtk_tag>-rockylinux8.6-py<python_version>
     # (container.image 不允许 env 上下文, 变量直接用 vars.HARBOR_SITE 内联)
     # pip 源按 dtk_tag 走对应 nightly 归档: ${PYPI_URL}/nightly/dtk<dtk_tag去点>/+simple/
-    runs-on: self-hosted
+    runs-on:
+      - ci
+      - self-hosted
     strategy:
       fail-fast: false
       matrix:
