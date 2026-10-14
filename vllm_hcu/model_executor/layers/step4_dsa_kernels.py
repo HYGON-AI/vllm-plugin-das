@@ -1947,11 +1947,13 @@ def _sparse_attn_prefill_tiled_kernel(
     applied to the fp32 side rather than to the operands.
     """
     tile = tl.program_id(0)
-    group = tl.program_id(1)
-    head = tl.program_id(2)
+    head = tl.program_id(1)
 
     q_local = tl.arange(0, BLOCK_Q)
-    q_start = tl.load(q_start_ptr + tile).to(tl.int32)
+    # Tile metadata is group-major; Q/output token indices are group-local.
+    metadata_start = tl.load(q_start_ptr + tile).to(tl.int32)
+    group = metadata_start // total_q
+    q_start = metadata_start - group * total_q
     q_count = tl.load(q_count_ptr + tile).to(tl.int32)
     q_index = q_start + q_local
     q_ok = (q_local < q_count) & (q_index < total_q)
@@ -1973,7 +1975,7 @@ def _sparse_attn_prefill_tiled_kernel(
     accumulator = tl.zeros((BLOCK_Q, BLOCK_D), dtype=tl.float32)
 
     positions = tl.load(
-        q_positions_ptr + q_index,
+        q_positions_ptr + metadata_start + q_local,
         mask=q_ok,
         other=-1,
     ).to(tl.int32)
@@ -2214,11 +2216,13 @@ def _sparse_attn_prefill_tiled_hd192_kernel(
     documented contract, so the ``log2`` is converted on the way out.
     """
     tile = tl.program_id(0)
-    group = tl.program_id(1)
-    head = tl.program_id(2)
+    head = tl.program_id(1)
 
     q_local = tl.arange(0, BLOCK_Q)
-    q_start = tl.load(q_start_ptr + tile).to(tl.int32)
+    # Tile metadata is group-major; Q/output token indices are group-local.
+    metadata_start = tl.load(q_start_ptr + tile).to(tl.int32)
+    group = metadata_start // total_q
+    q_start = metadata_start - group * total_q
     q_count = tl.load(q_count_ptr + tile).to(tl.int32)
     q_index = q_start + q_local
     q_ok = (q_local < q_count) & (q_index < total_q)
@@ -2257,7 +2261,9 @@ def _sparse_attn_prefill_tiled_hd192_kernel(
     acc1 = tl.zeros((BLOCK_Q, DK), dtype=tl.float32)
     acc2 = tl.zeros((BLOCK_Q, DK), dtype=tl.float32)
 
-    positions = tl.load(q_positions_ptr + q_index, mask=q_ok, other=-1).to(tl.int32)
+    positions = tl.load(
+        q_positions_ptr + metadata_start + q_local, mask=q_ok, other=-1
+    ).to(tl.int32)
     words_of_q = q_local // 32
     bits_of_q = q_local % 32
     offsets_in_region = tl.arange(0, region_size)
@@ -2863,7 +2869,7 @@ def sparse_attention_prefill(
         # which is correct for every head_dim but pads non-powers-of-two.
         if head_dim == 192 and query.dtype in (torch.bfloat16, torch.float16):
             _sparse_attn_prefill_tiled_hd192_kernel[
-                (num_tiles, num_kv_groups, heads_per_group)
+                (num_tiles, heads_per_group)
             ](
                 query,
                 q_starts,
@@ -2918,7 +2924,7 @@ def sparse_attention_prefill(
                 num_stages=1,
             )
             return out, lse
-        _sparse_attn_prefill_tiled_kernel[(num_tiles, num_kv_groups, heads_per_group)](
+        _sparse_attn_prefill_tiled_kernel[(num_tiles, heads_per_group)](
             query,
             key_cache,
             value_cache,
