@@ -179,3 +179,59 @@ def test_weight_preparation_agrees_with_execution_capability(monkeypatch, case):
     else:
         assert len(packed)==2
         assert result[0].ndim==6 and result[1].ndim==6
+
+
+@pytest.mark.parametrize("output_offset", [0, 4096])
+def test_gathered_route_reduction_does_not_alias_output(output_offset):
+    m, topk, hidden, intermediate = 8, 8, 4096, 1536
+    rows = m * topk
+    workspace = torch.empty(rows * max(2 * intermediate, hidden))
+    out = workspace[output_offset:output_offset + m * hidden].view(m, hidden)
+    observed = {}
+
+    def gemm(a, b, result, *args, **kwargs):
+        if result.ndim == 3:
+            result.fill_(1)
+            observed["routes"] = result
+
+    def reduce(routes, output, ids, expert_map, scale, *add):
+        # A legal program schedule that exposes the former cross-token alias.
+        for token in [1, 0, *range(2, m)]:
+            output[token].copy_(routes[token].sum(0) * scale)
+
+    ns = {
+        "torch": torch,
+        "tl": SimpleNamespace(bfloat16=None, float16=None, float32=None),
+        "FP8": torch.float8_e4m3fn,
+        "ep_sorting": lambda *a: (None, None, None, None, rows),
+        "_gemm": gemm,
+        "ep_swiglustep_quant": lambda *a, q: (q, None),
+        "ep_masked_moe_sum": reduce,
+        "shared_add_provider": None,
+    }
+    path = "vllm_hcu/model_executor/layers/fused_moe/ep_fused_moe.py"
+    load_function(path, "_carve", ns)
+    run = load_function(path, "_ep_fused_experts", ns)
+    result = run(
+        torch.zeros(m, hidden),
+        SimpleNamespace(shape=(44, 2 * intermediate, hidden)),
+        SimpleNamespace(shape=(44, hidden, intermediate)),
+        torch.ones(m, topk), torch.zeros(m, topk, dtype=torch.int32),
+        torch.arange(44), None, None, a1_scale=torch.ones(1),
+        configs=({"BLOCK_SIZE_M": 1}, {"BLOCK_SIZE_M": 1}),
+        out=out, workspace13=workspace,
+    )
+    assert result is out
+    assert observed["routes"].untyped_storage().data_ptr() != out.untyped_storage().data_ptr()
+    torch.testing.assert_close(result, torch.full_like(result, 8))
+
+
+def test_route_workspace_is_reused_when_output_has_separate_storage():
+    ns = {"torch": torch}
+    carve = load_function(
+        "vllm_hcu/model_executor/layers/fused_moe/ep_fused_moe.py", "_carve", ns
+    )
+    workspace = torch.empty(128)
+    out = torch.empty(8, 4)
+    routes = carve(workspace, (8, 4, 4), torch.float32, "cpu", avoid=out)
+    assert routes.untyped_storage().data_ptr() == workspace.untyped_storage().data_ptr()

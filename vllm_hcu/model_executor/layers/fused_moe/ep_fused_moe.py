@@ -315,12 +315,19 @@ def _gemm(A, B, C, A_scale, B_scale, topk_weights, topk_ids, sorted_ids, sorted_
 CHUNK = int(os.environ.get("EP_FUSED_MOE_CHUNK", "32768"))
 
 
-def _carve(ws, shape, dtype, device):
+def _carve(ws, shape, dtype, device, *, avoid=None):
     """`shape` of `dtype` at the start of workspace `ws` (any dtype), or fresh if it won't fit."""
     nbytes = dtype.itemsize
     for d in shape:
         nbytes *= d
-    if ws is None or not ws.is_contiguous() or ws.numel() * ws.element_size() < nbytes:
+    # Reduction programs must not overwrite another token's unread routes.
+    # Storage identity also catches output slices with a nonzero offset.
+    aliases_output = (
+        ws is not None and avoid is not None
+        and ws.untyped_storage().data_ptr() == avoid.untyped_storage().data_ptr()
+    )
+    if (ws is None or not ws.is_contiguous()
+            or ws.numel() * ws.element_size() < nbytes or aliases_output):
         return torch.empty(shape, dtype=dtype, device=device)
     return ws.view(-1).view(torch.uint8)[:nbytes].view(dtype).view(shape)
 
@@ -365,7 +372,7 @@ def _ep_fused_experts(hidden_states, w1, w2, topk_weights, topk_ids, expert_map,
                                        7.0 if gemm1_limit is None else gemm1_limit,
                                        q=_carve(workspace2, (rows, N // 2), FP8, dev))
     del cache1
-    cache3 = _carve(workspace13, (M, topk, K), out_dtype, dev)
+    cache3 = _carve(workspace13, (M, topk, K), out_dtype, dev, avoid=out)
     _gemm(act_q, w2, cache3, act_s, w2_scale, topk_weights, topk_ids, sorted_ids, sorted_w,
           expert_ids, nvalid, 1, compute_type, cfg2, a_sorted=True,
           bottom_a_use_mls_load=use_mls, ck_sorting=True, ck_topk=topk,
