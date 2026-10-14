@@ -50,6 +50,7 @@ def _make_pcp_config(**overrides: object) -> object:
         model_config=SimpleNamespace(
             architectures=[architecture],
             use_mla=use_mla,
+            hf_config=SimpleNamespace(index_topk=64),
             enforce_eager=enforce_eager,
             is_multimodal_model=multimodal,
             is_hybrid=hybrid,
@@ -312,6 +313,24 @@ def test_hyv4_pd_allows_only_mooncake_producer_pcp(make_pcp_config, pcp, tp):
     config = make_pcp_config(architecture="HYV4ForCausalLM", pcp=pcp, tp=tp)
     config.kv_transfer_config = KVTransferConfig(
         kv_connector="MooncakeConnector", kv_role="kv_producer",
+        kv_buffer_device="cpu",
+    )
+    assert patch_vllm_config._validate_hcu_pcp_scope(config) is True
+
+
+@pytest.mark.parametrize(
+    "architecture",
+    [
+        "GlmMoeDsaForCausalLM",
+        "DeepseekV3ForCausalLM",
+        "DeepseekV32ForCausalLM",
+    ],
+)
+def test_dsa_mla_pd_allows_mooncake_producer_pcp(make_pcp_config, architecture):
+    config = make_pcp_config(architecture=architecture, pcp=4, tp=1)
+    config.kv_transfer_config = KVTransferConfig(
+        kv_connector="MooncakeConnector",
+        kv_role="kv_producer",
         kv_buffer_device="cpu",
     )
     assert patch_vllm_config._validate_hcu_pcp_scope(config) is True

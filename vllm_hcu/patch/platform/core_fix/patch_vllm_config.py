@@ -160,18 +160,25 @@ def _require_mrv2_pcp_contract(vllm_config: object) -> None:
     use_mla = bool(
         _require_hcu_pcp_attribute(model_config, "use_mla", "ModelConfig")
     )
+    # Reuse the SGLang-style DSA capability predicate: a registered DSA
+    # architecture must also expose index_topk and use the MLA runtime.  Keep
+    # this local import to avoid making the config patch depend on the full
+    # platform initialization path at module import time.
+    from vllm_hcu.v1.dsa_cache_layer_split import is_hcu_dsa_mla_model
+
+    is_dsa_mla = is_hcu_dsa_mla_model(model_config)
     is_glm52 = architectures == ["GlmMoeDsaForCausalLM"]
     is_hyv4 = architectures == ["HYV4ForCausalLM"]
     if "HYV4MTPModel" in architectures:
         raise ValueError("HYV4 PCP does not support HYV4MTPModel.")
     if "HYV4ForCausalLM" in architectures and not is_hyv4:
         raise ValueError("HYV4 PCP requires exactly architecture HYV4ForCausalLM.")
-    if use_mla and not (is_glm52 or is_hyv4):
+    if use_mla and not is_dsa_mla:
         raise ValueError(
-            "HCU MLA PCP only supports GLM-5.2 architecture "
-            "GlmMoeDsaForCausalLM or HYV4ForCausalLM."
+            "HCU MLA PCP requires an HCU-supported DSA MLA architecture "
+            "with index_topk and the DSA runtime."
         )
-    mla_model = "HYV4" if is_hyv4 else "GLM-5.2"
+    mla_model = "HYV4" if is_hyv4 else "DSA MLA"
     if (is_glm52 or is_hyv4) and not use_mla:
         raise ValueError(f"{mla_model} PCP requires MLA or sparse MLA.")
     if not use_mla:
@@ -290,14 +297,16 @@ def _require_mrv2_pcp_contract(vllm_config: object) -> None:
         # kv_role is the validated KVTransferConfig role, not kv_rank or a
         # connector-name heuristic. kv_both includes a consumer and is excluded.
         if not (
-            is_hyv4
-            and getattr(kv_transfer_config, "kv_connector", None) == "MooncakeConnector"
+            is_dsa_mla
+            and getattr(kv_transfer_config, "kv_connector", None)
+            == "MooncakeConnector"
             and getattr(kv_transfer_config, "kv_role", None) == "kv_producer"
             and getattr(kv_transfer_config, "kv_connector_module_path", "") is None
         ):
             raise ValueError(
-                "HCU PCP P/D disaggregation requires HYV4 PP1 with the registered "
-                "MooncakeConnector and kv_role='kv_producer'."
+                "HCU PCP P/D disaggregation requires a supported DSA MLA "
+                "producer with the registered MooncakeConnector and "
+                "kv_role='kv_producer'."
             )
 
     feature_config = get_hcu_config(vllm_config)

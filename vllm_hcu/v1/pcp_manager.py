@@ -771,7 +771,31 @@ class HcuPCPManager:
             else global_slots
         )
         setattr(input_batch, "_vllm_hcu_pcp_plan", self.build_plan())
+        # Sparse layer-split broadcast must see the *global* block table so
+        # every PCP rank selects the same rows (local partitions may differ).
+        self._install_dsa_sparse_broadcast_block_ids()
         return local_tables, slot_mappings
+
+    def _install_dsa_sparse_broadcast_block_ids(self) -> None:
+        try:
+            from vllm_hcu.v1.dsa_cache_layer_split import (
+                get_runtime_layer_split_state,
+                set_active_dsa_broadcast_block_ids_from_tables,
+            )
+        except Exception:
+            return
+        if get_runtime_layer_split_state() is None:
+            return
+        if self._global_batch is None:
+            return
+        try:
+            global_tables = self._block_tables.gather_block_tables(
+                self._global_batch.idx_mapping,
+                num_reqs_padded=self._global_batch.num_reqs_after_padding,
+            )
+        except Exception:
+            return
+        set_active_dsa_broadcast_block_ids_from_tables(global_tables)
 
     def prepare_global_attn(
         self,
@@ -786,6 +810,17 @@ class HcuPCPManager:
             self._global_batch.idx_mapping,
             num_reqs_padded=self._global_batch.num_reqs_after_padding,
         )
+        # MTP restore path may reshuffle metadata; refresh the sparse set.
+        try:
+            from vllm_hcu.v1.dsa_cache_layer_split import (
+                get_runtime_layer_split_state,
+                set_active_dsa_broadcast_block_ids_from_tables,
+            )
+
+            if get_runtime_layer_split_state() is not None:
+                set_active_dsa_broadcast_block_ids_from_tables(block_tables)
+        except Exception:
+            pass
         global_slots = self._global_slot_mappings[
             :, : self._global_batch.num_tokens
         ]

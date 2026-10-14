@@ -29,6 +29,27 @@ TARGETS = (f"{TARGET_MODULE}.get_kv_cache_config_from_groups",)
 _MARKER = "_vllm_hcu_dsa_layer_split_kv_config_applied"
 _WRAPPER_PACKED = "_vllm_hcu_dsa_layer_split_kv_config_packed_wrapper"
 _WRAPPER_GROUPS = "_vllm_hcu_dsa_layer_split_kv_config_groups_wrapper"
+_WRAPPER_MAX_USAGE = "_vllm_hcu_dsa_layer_split_kv_config_max_usage_wrapper"
+_WRAPPER_POOL_BYTES = "_vllm_hcu_dsa_layer_split_kv_config_pool_bytes_wrapper"
+
+
+def _optional_config_groups_fn(owner: ModuleType, name: str):
+    """Return ``owner.name`` if it is ``(vllm_config, kv_cache_groups)``.
+
+    These sizing helpers feed the max-model-len admission check and the
+    ``num_gpu_blocks_override`` capacity; their signatures differ across vLLM
+    builds, so unknown shapes are left untouched.
+    """
+    function = getattr(owner, name, None)
+    if not callable(function):
+        return None
+    try:
+        params = tuple(inspect.signature(function).parameters)
+    except (TypeError, ValueError):
+        return None
+    if params != ("vllm_config", "kv_cache_groups"):
+        return None
+    return function
 
 
 def _layer_split_active(vllm_config) -> bool:
@@ -81,6 +102,12 @@ def apply_to_module(module: ModuleType) -> bool:
                 _WRAPPER_PACKED,
             ),
         )
+    for name, wrapper_marker in (
+        ("_max_memory_usage_bytes_from_groups", _WRAPPER_MAX_USAGE),
+        ("_pool_bytes_per_block", _WRAPPER_POOL_BYTES),
+    ):
+        if _optional_config_groups_fn(kv_cache_utils, name) is not None:
+            wrapped.append((kv_cache_utils, name, wrapper_marker))
     if already_applied(kv_cache_utils, _MARKER, wrapped):
         return False
 
@@ -105,6 +132,13 @@ def apply_to_module(module: ModuleType) -> bool:
             f"{TARGET_MODULE}._get_kv_cache_config_packed",
         )
 
+    original_max_usage = _optional_config_groups_fn(
+        kv_cache_utils, "_max_memory_usage_bytes_from_groups"
+    )
+    original_pool_bytes = _optional_config_groups_fn(
+        kv_cache_utils, "_pool_bytes_per_block"
+    )
+
     may_override = require_callable(
         kv_cache_utils,
         "may_override_num_blocks",
@@ -122,16 +156,12 @@ def apply_to_module(module: ModuleType) -> bool:
     if kv_cache_tensor_cls is None:
         from vllm.v1.kv_cache_interface import KVCacheTensor as kv_cache_tensor_cls
 
-    def _shrunk_packed_plan(vllm_config, kv_cache_groups, available_memory):
+    def _shrunk_layout(vllm_config, kv_cache_groups):
         from vllm_hcu.v1.dsa_cache_layer_split import (
             _total_layers_from_config,
-            make_packed_kv_tensor,
             parse_layer_index,
             phys_slots_for_layer_family,
         )
-        from vllm.logger import init_logger
-
-        logger = init_logger("vllm_hcu.dsa_layer_split_kv")
 
         total_layers = _total_layers_from_config(vllm_config)
         if total_layers is None or total_layers <= 0:
@@ -168,6 +198,20 @@ def apply_to_module(module: ModuleType) -> bool:
         )
         if total_num_bytes_per_block >= full_bytes:
             return None
+        return buckets, page_sizes, phys_slots, total_num_bytes_per_block, full_bytes
+
+    def _shrunk_packed_plan(vllm_config, kv_cache_groups, available_memory):
+        from vllm_hcu.v1.dsa_cache_layer_split import make_packed_kv_tensor
+        from vllm.logger import init_logger
+
+        logger = init_logger("vllm_hcu.dsa_layer_split_kv")
+
+        layout = _shrunk_layout(vllm_config, kv_cache_groups)
+        if layout is None:
+            return None
+        buckets, page_sizes, phys_slots, total_num_bytes_per_block, full_bytes = (
+            layout
+        )
 
         num_blocks = available_memory // total_num_bytes_per_block
         num_blocks = may_override(vllm_config, num_blocks)
@@ -270,6 +314,55 @@ def apply_to_module(module: ModuleType) -> bool:
         if plan is None:
             return original_groups(vllm_config, kv_cache_groups, available_memory)
         return _config_from_plan(plan, kv_cache_groups, vllm_config)
+
+    def _shrink_bytes(vllm_config, kv_cache_groups, full_value):
+        if not _layer_split_active(vllm_config) or not kv_cache_groups:
+            return full_value
+        layout = _shrunk_layout(vllm_config, kv_cache_groups)
+        if layout is None:
+            return full_value
+        shrunk_bytes, full_bytes = layout[3], layout[4]
+        return -(-full_value * shrunk_bytes // full_bytes)
+
+    if original_max_usage is not None:
+
+        @functools.wraps(original_max_usage)
+        def hcu_max_memory_usage_bytes_from_groups(vllm_config, kv_cache_groups):
+            return _shrink_bytes(
+                vllm_config,
+                kv_cache_groups,
+                original_max_usage(vllm_config, kv_cache_groups),
+            )
+
+        setattr(hcu_max_memory_usage_bytes_from_groups, _WRAPPER_MAX_USAGE, True)
+        setattr(
+            kv_cache_utils,
+            "_vllm_hcu_original_max_memory_usage_bytes_from_groups",
+            original_max_usage,
+        )
+        setattr(
+            kv_cache_utils,
+            "_max_memory_usage_bytes_from_groups",
+            hcu_max_memory_usage_bytes_from_groups,
+        )
+
+    if original_pool_bytes is not None:
+
+        @functools.wraps(original_pool_bytes)
+        def hcu_pool_bytes_per_block(vllm_config, kv_cache_groups):
+            return _shrink_bytes(
+                vllm_config,
+                kv_cache_groups,
+                original_pool_bytes(vllm_config, kv_cache_groups),
+            )
+
+        setattr(hcu_pool_bytes_per_block, _WRAPPER_POOL_BYTES, True)
+        setattr(
+            kv_cache_utils,
+            "_vllm_hcu_original_pool_bytes_per_block",
+            original_pool_bytes,
+        )
+        setattr(kv_cache_utils, "_pool_bytes_per_block", hcu_pool_bytes_per_block)
 
     setattr(hcu_get_kv_cache_config_from_groups, _WRAPPER_GROUPS, True)
     setattr(

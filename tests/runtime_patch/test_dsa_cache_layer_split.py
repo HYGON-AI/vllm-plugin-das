@@ -25,6 +25,7 @@ from vllm_hcu.v1.dsa_cache_layer_split import (
     parse_layer_index,
     phys_slots_for_layer_family,
     remap_packed_kv_tensor_offsets,
+    set_active_dsa_broadcast_block_ids,
     should_commit_durable_dsa_cache,
     validate_dsa_cache_layer_split,
 )
@@ -114,7 +115,12 @@ def test_validate_rejects_pp(monkeypatch: pytest.MonkeyPatch) -> None:
         validate_dsa_cache_layer_split(cfg)
 
 
-def _pd_prefill_cfg(architectures=("HYV4ForCausalLM",), use_mla=True, kv_role="kv_producer"):
+def _pd_prefill_cfg(
+    architectures=("HYV4ForCausalLM",),
+    use_mla=True,
+    kv_role="kv_producer",
+    index_topk=64,
+):
     return SimpleNamespace(
         parallel_config=SimpleNamespace(
             prefill_context_parallel_size=4,
@@ -123,6 +129,7 @@ def _pd_prefill_cfg(architectures=("HYV4ForCausalLM",), use_mla=True, kv_role="k
         model_config=SimpleNamespace(
             architectures=list(architectures),
             use_mla=use_mla,
+            hf_config=SimpleNamespace(index_topk=index_topk),
         ),
         kv_transfer_config=(
             None if kv_role is None else SimpleNamespace(kv_role=kv_role)
@@ -136,6 +143,49 @@ def test_validate_ok_with_pcp(monkeypatch: pytest.MonkeyPatch) -> None:
     cfg = _pd_prefill_cfg()
     validate_dsa_cache_layer_split(cfg)
     assert is_dsa_cache_layer_split_requested(cfg)
+
+
+@pytest.mark.parametrize(
+    "architecture",
+    [
+        "DeepseekV3ForCausalLM",
+        "DeepseekV32ForCausalLM",
+        "GlmMoeDsaForCausalLM",
+        "HYV4ForCausalLM",
+    ],
+)
+def test_validate_accepts_registered_dsa_families(
+    monkeypatch: pytest.MonkeyPatch, architecture: str
+) -> None:
+    _set_layer_split(monkeypatch, True)
+    validate_dsa_cache_layer_split(_pd_prefill_cfg((architecture,)))
+
+
+def test_validate_rejects_dsa_without_index_topk(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    _set_layer_split(monkeypatch, True)
+    with pytest.raises(ValueError, match="index_topk"):
+        validate_dsa_cache_layer_split(_pd_prefill_cfg(index_topk=None))
+
+
+def test_validate_rejects_ordinary_mla_even_with_index_topk(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    _set_layer_split(monkeypatch, True)
+    with pytest.raises(ValueError, match="architecture"):
+        validate_dsa_cache_layer_split(
+            _pd_prefill_cfg(("LlamaForCausalLM",), use_mla=True)
+        )
+
+
+def test_validate_rejects_when_dsa_is_disabled(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    _set_layer_split(monkeypatch, True)
+    monkeypatch.setenv("VLLM_HCU_DISABLE_DSA", "1")
+    with pytest.raises(ValueError, match="VLLM_HCU_DISABLE_DSA"):
+        validate_dsa_cache_layer_split(_pd_prefill_cfg())
 
 
 @pytest.mark.parametrize("kv_role", [None, "kv_consumer", "kv_both"])
@@ -389,6 +439,81 @@ def test_broadcast_noncontiguous_view(
         pcp_group=_Group(1),
     )
     assert torch.equal(non_owner_view, owner_view)
+
+
+def test_sparse_broadcast_only_selected_blocks(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Active block ids shrink the NCCL payload to used rows only."""
+    _set_layer_split(monkeypatch, True)
+    clear_broadcast_scratch_for_tests()
+
+    # Pool of 8 blocks; only blocks 1 and 4 are live in the batch.
+    owner = torch.arange(8 * 4, dtype=torch.float32).view(8, 4)
+    non_owner = torch.full((8, 4), -1.0)
+    sizes: list[int] = []
+
+    class _Group:
+        last_payload: torch.Tensor | None = None
+
+        def __init__(self, rank: int) -> None:
+            self.rank_in_group = rank
+
+        def broadcast(self, tensor: torch.Tensor, src: int = 0) -> torch.Tensor:
+            del src
+            sizes.append(int(tensor.numel()))
+            assert tensor.is_contiguous()
+            assert tensor.shape[0] == 2
+            if self.rank_in_group == 0:
+                _Group.last_payload = tensor.clone()
+            else:
+                assert _Group.last_payload is not None
+                tensor.copy_(_Group.last_payload)
+            return tensor
+
+    set_active_dsa_broadcast_block_ids(torch.tensor([4, 1]))
+    broadcast_dsa_cache_from_owner(
+        owner,
+        "model.layers.0.self_attn.attn",
+        shard_rank=0,
+        shard_size=2,
+        total_layers=8,
+        pcp_group=_Group(0),
+    )
+    clear_broadcast_scratch_for_tests()
+    set_active_dsa_broadcast_block_ids(torch.tensor([4, 1]))
+    broadcast_dsa_cache_from_owner(
+        non_owner,
+        "model.layers.0.self_attn.attn",
+        shard_rank=1,
+        shard_size=2,
+        total_layers=8,
+        pcp_group=_Group(1),
+    )
+    assert sizes == [8, 8]  # 2 blocks * 4 elems, not full pool (32)
+    assert torch.equal(non_owner[1], owner[1])
+    assert torch.equal(non_owner[4], owner[4])
+    # Untouched rows stay as-is on the non-owner scratch.
+    assert torch.all(non_owner[0] == -1.0)
+    assert torch.all(non_owner[2] == -1.0)
+
+
+def test_scratch_allocated_once_for_varying_payloads() -> None:
+    """Per-step sparse payload sizes reuse one pool-sized scratch buffer."""
+    clear_broadcast_scratch_for_tests()
+    cache = torch.zeros(8, 4)
+    first = layer_split_mod._scratch_for(cache, numel=2 * 4, shape=(2, 4))
+    base_ptr = first.data_ptr()
+    for n_rows in (5, 1, 7):
+        payload = layer_split_mod._scratch_for(
+            cache, numel=n_rows * 4, shape=(n_rows, 4)
+        )
+        assert payload.shape == (n_rows, 4)
+        assert payload.data_ptr() == base_ptr
+    full = layer_split_mod._scratch_for(cache)
+    assert full.shape == cache.shape
+    assert full.data_ptr() == base_ptr
+    assert len(layer_split_mod._broadcast_scratch) == 1
 
 
 def test_local_packed_slot_owned_vs_scratch() -> None:
@@ -650,3 +775,53 @@ def test_remap_mixed_page_sizes_hy4_like(monkeypatch: pytest.MonkeyPatch) -> Non
     assert by_layer["model.layers.0.self_attn.attn"] == mla_base
     assert by_layer["model.layers.2.self_attn.attn"] == mla_base + 2 * mla_page  # scratch
     assert by_layer["model.layers.8.self_attn.attn"] == mla_base + 3 * mla_page  # MTP
+
+
+def test_admission_sizing_uses_shrunk_bytes(monkeypatch: pytest.MonkeyPatch) -> None:
+    """max-model-len check and block override must see owned+scratch bytes."""
+    import types
+
+    from vllm_hcu.patch.platform.framework_opt import (
+        patch_dsa_layer_split_kv_config as kv_patch,
+    )
+
+    monkeypatch.setattr(kv_patch, "_layer_split_active", lambda cfg: True)
+    total_layers, pcp, page = 8, 4, 16
+    full_bytes = page * total_layers
+    shrunk_bytes = page * phys_slots_for_layer_family(
+        list(range(total_layers)), total_layers, pcp
+    )
+
+    mod = types.ModuleType(kv_patch.TARGET_MODULE)
+
+    def get_kv_cache_config_from_groups(
+        vllm_config, kv_cache_groups, available_memory
+    ):
+        raise AssertionError("unused")
+
+    def _max_memory_usage_bytes_from_groups(vllm_config, kv_cache_groups):
+        return full_bytes * 1000
+
+    def _pool_bytes_per_block(vllm_config, kv_cache_groups):
+        return full_bytes
+
+    mod.get_kv_cache_config_from_groups = get_kv_cache_config_from_groups
+    mod._max_memory_usage_bytes_from_groups = _max_memory_usage_bytes_from_groups
+    mod._pool_bytes_per_block = _pool_bytes_per_block
+    mod.may_override_num_blocks = lambda cfg, n: n
+    mod.KVCacheConfig = SimpleNamespace
+    mod.KVCacheTensor = SimpleNamespace
+    assert kv_patch.apply_to_module(mod) is True
+    assert kv_patch.apply_to_module(mod) is False
+
+    cfg = _remap_cfg(total_layers, pcp)
+    groups = [
+        SimpleNamespace(
+            layer_names=[
+                f"model.layers.{i}.self_attn.attn" for i in range(total_layers)
+            ],
+            kv_cache_spec=SimpleNamespace(page_size_bytes=page),
+        )
+    ]
+    assert mod._pool_bytes_per_block(cfg, groups) == shrunk_bytes
+    assert mod._max_memory_usage_bytes_from_groups(cfg, groups) == shrunk_bytes * 1000

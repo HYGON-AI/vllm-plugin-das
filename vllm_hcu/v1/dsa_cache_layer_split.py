@@ -39,7 +39,8 @@ from vllm.logger import init_logger
 
 logger = init_logger(__name__)
 
-# Contiguous scratch used when broadcasting non-contiguous packed views.
+# Flat contiguous broadcast scratch keyed by (pool, device, dtype). Sized to
+# the largest cache seen; full-pool and sparse payloads take a prefix view.
 _broadcast_scratch: dict[tuple[int, ...], torch.Tensor] = {}
 # Worker-process cached runtime state; installed during initialize_kv_cache
 # so forward-time gating/broadcast never depend on a current vllm config.
@@ -57,6 +58,13 @@ _LAYER_CACHE_REGISTRY: dict[int, dict[str, torch.Tensor]] = {}
 _BCAST_COMM: Any | None = None
 _BCAST_STREAM: Any | None = None
 _BCAST_COMM_INIT_DONE = False
+# Unique block ids for the current forward (global batch). When set, owner
+# broadcasts only those rows via index_select / index_copy_ so traffic tracks
+# context length instead of the full KV pool. Must be identical on every PCP
+# rank (install from the global block table, not the rank-local partition).
+_ACTIVE_BLOCK_IDS: torch.Tensor | None = None
+# Opt-out: VLLM_HCU_DSA_SPARSE_BROADCAST=0 forces the legacy full-pool path.
+_SPARSE_BROADCAST_ENV = "VLLM_HCU_DSA_SPARSE_BROADCAST"
 
 
 def get_layer_shard_range(
@@ -158,8 +166,83 @@ def is_dsa_cache_layer_split_requested(vllm_config: Any | None = None) -> bool:
 
 
 _DSA_LAYER_SPLIT_ARCHITECTURES = frozenset(
-    {"HYV4ForCausalLM", "GlmMoeDsaForCausalLM"}
+    {
+        # These are the DSA model families implemented by the HCU model
+        # registry.  The architecture check is intentionally paired with
+        # the config capability check below, as in SGLang's is_deepseek_dsa.
+        "DeepseekV3ForCausalLM",
+        "DeepseekV32ForCausalLM",
+        "GlmMoeDsaForCausalLM",
+        "HYV4ForCausalLM",
+    }
 )
+
+
+def _dsa_config_attr(config: Any, name: str) -> Any:
+    if isinstance(config, dict):
+        return config.get(name)
+    return getattr(config, name, None)
+
+
+def _dsa_hf_config(model_config: Any) -> Any | None:
+    """Return the HF config that owns the DSA indexer fields."""
+    hf_config = getattr(model_config, "hf_config", None)
+    if hf_config is None:
+        hf_config = getattr(model_config, "hf_text_config", None)
+    return hf_config
+
+
+def _dsa_disabled_by_environment() -> bool:
+    """Match the model runtime's environment-controlled DSA opt-out."""
+    return os.environ.get("VLLM_HCU_DISABLE_DSA", "False").lower() in {
+        "1",
+        "true",
+        "yes",
+        "on",
+    }
+
+
+def is_hcu_dsa_mla_model(model_config: Any | None) -> bool:
+    """Whether ``model_config`` has the DSA MLA capability for HCU.
+
+    SGLang's predicate is deliberately more specific than ``use_mla``: a
+    supported DSA architecture must expose the sparse-indexer ``index_topk``
+    field.  Keep the same fail-closed rule here so enabling PCP alone cannot
+    route an ordinary MLA/GQA cache through DSA layer remapping.
+    """
+    if model_config is None or _dsa_disabled_by_environment():
+        return False
+
+    architectures = getattr(model_config, "architectures", None) or ()
+    if not architectures or architectures[0] not in _DSA_LAYER_SPLIT_ARCHITECTURES:
+        return False
+    if getattr(model_config, "use_mla", None) is not True:
+        return False
+
+    hf_config = _dsa_hf_config(model_config)
+    return hf_config is not None and _dsa_config_attr(hf_config, "index_topk") is not None
+
+
+def _dsa_capability_error(model_config: Any | None) -> str:
+    """Describe the first missing DSA capability for validation errors."""
+    if model_config is None:
+        return "model_config is missing"
+    if _dsa_disabled_by_environment():
+        return "VLLM_HCU_DISABLE_DSA is enabled"
+
+    architectures = getattr(model_config, "architectures", None) or ()
+    architecture = architectures[0] if architectures else None
+    if architecture not in _DSA_LAYER_SPLIT_ARCHITECTURES:
+        return (
+            "architecture must be one of "
+            f"{sorted(_DSA_LAYER_SPLIT_ARCHITECTURES)} (got {architecture!r})"
+        )
+    if getattr(model_config, "use_mla", None) is not True:
+        return f"use_mla must be True (got {getattr(model_config, 'use_mla', None)!r})"
+    hf_config = _dsa_hf_config(model_config)
+    if hf_config is None or _dsa_config_attr(hf_config, "index_topk") is None:
+        return "hf_config.index_topk is missing"
+    return "the HCU DSA runtime capability is unavailable"
 
 
 def _require_pd_prefill_worker(vllm_config: Any) -> None:
@@ -187,7 +270,8 @@ def validate_dsa_cache_layer_split(vllm_config: Any) -> None:
 
     Mirrors SGLang ``server_args`` / ``model_hook`` checks for
     ``--enable-dsa-cache-layer-split``: PD prefill worker, Prefill-CP > 1,
-    no pipeline parallel, and a DSA MLA architecture (HYV4 / GLM-DSA).
+    no pipeline parallel, and an HCU-supported DSA MLA capability
+    (architecture + ``index_topk`` + MLA runtime).
     """
     if not is_dsa_cache_layer_split_requested(vllm_config):
         return
@@ -212,20 +296,13 @@ def validate_dsa_cache_layer_split(vllm_config: Any) -> None:
     _require_pd_prefill_worker(vllm_config)
     model_config = getattr(vllm_config, "model_config", None)
     if model_config is None:
-        return
-    architectures = getattr(model_config, "architectures", None) or ()
-    arch_set = set(architectures)
-    if not arch_set.intersection(_DSA_LAYER_SPLIT_ARCHITECTURES):
         raise ValueError(
-            "enable_dsa_cache_layer_split is only supported for DSA MLA "
-            f"models ({sorted(_DSA_LAYER_SPLIT_ARCHITECTURES)}); "
-            f"got architectures={list(architectures)!r}."
+            "enable_dsa_cache_layer_split requires a model_config"
         )
-    use_mla = getattr(model_config, "use_mla", None)
-    if use_mla is False:
+    if not is_hcu_dsa_mla_model(model_config):
         raise ValueError(
-            "enable_dsa_cache_layer_split requires MLA "
-            f"(use_mla=True); got use_mla={use_mla!r}."
+            "enable_dsa_cache_layer_split requires an HCU-supported DSA MLA "
+            f"capability ({_dsa_capability_error(model_config)})."
         )
 
 
@@ -522,18 +599,94 @@ def _family_state(cache: torch.Tensor, layer_name: str) -> _FamilyRemoteState:
     return st
 
 
-def _scratch_for(cache: torch.Tensor, pool: str = "sync") -> torch.Tensor:
-    key = (pool, cache.device.type, cache.device.index, cache.dtype, cache.numel())
+def _scratch_for(
+    cache: torch.Tensor,
+    pool: str = "sync",
+    *,
+    numel: int | None = None,
+    shape: tuple[int, ...] | None = None,
+) -> torch.Tensor:
+    n = int(cache.numel() if numel is None else numel)
+    key = (pool, cache.device.type, cache.device.index, cache.dtype)
     scratch = _broadcast_scratch.get(key)
-    if (
-        scratch is None
-        or scratch.device != cache.device
-        or scratch.dtype != cache.dtype
-        or scratch.numel() != cache.numel()
-    ):
-        scratch = torch.empty(cache.numel(), dtype=cache.dtype, device=cache.device)
+    if scratch is None or scratch.numel() < n:
+        # Size to the full pool so per-step sparse payloads never reallocate.
+        capacity = max(n, int(cache.numel()))
+        scratch = torch.empty(capacity, dtype=cache.dtype, device=cache.device)
         _broadcast_scratch[key] = scratch
-    return scratch.view(cache.shape)
+    return scratch[:n].view(cache.shape if shape is None else shape)
+
+
+def _sparse_broadcast_enabled() -> bool:
+    raw = os.environ.get(_SPARSE_BROADCAST_ENV, "1").strip().lower()
+    return raw not in ("0", "false", "off", "no")
+
+
+def set_active_dsa_broadcast_block_ids(
+    block_ids: torch.Tensor | None,
+) -> None:
+    """Install unique block ids for the next owner-broadcasts in this forward.
+
+    ``block_ids`` must be a 1-D int tensor, identical on every PCP rank.
+    Pass ``None`` / empty to fall back to the full-pool broadcast.
+    """
+    global _ACTIVE_BLOCK_IDS
+    if block_ids is None:
+        _ACTIVE_BLOCK_IDS = None
+        return
+    if not isinstance(block_ids, torch.Tensor) or block_ids.numel() == 0:
+        _ACTIVE_BLOCK_IDS = None
+        return
+    ids = block_ids.reshape(-1).to(dtype=torch.long)
+    # Deterministic order so every rank builds the same payload layout.
+    _ACTIVE_BLOCK_IDS = torch.unique(ids, sorted=True)
+
+
+def set_active_dsa_broadcast_block_ids_from_tables(
+    block_tables: Any,
+) -> None:
+    """Derive active block ids from global ``[num_reqs, max_blocks]`` tables.
+
+    Over-including pad / stale ids only wastes bandwidth; under-including
+    would leave non-owners with missing KV. Trailing zeros are therefore
+    kept when present (block 0 is a valid id).
+    """
+    if not _sparse_broadcast_enabled():
+        set_active_dsa_broadcast_block_ids(None)
+        return
+    tables: list[torch.Tensor] = []
+    if isinstance(block_tables, torch.Tensor):
+        tables = [block_tables]
+    elif isinstance(block_tables, (tuple, list)):
+        tables = [t for t in block_tables if isinstance(t, torch.Tensor)]
+    if not tables:
+        set_active_dsa_broadcast_block_ids(None)
+        return
+    # Unified packed pool: MLA / indexer share one block-id space. Union
+    # across groups so a group with a longer prefix cannot drop ids.
+    flat = torch.cat([t.reshape(-1).to(dtype=torch.long) for t in tables], dim=0)
+    set_active_dsa_broadcast_block_ids(flat)
+
+
+def clear_active_dsa_broadcast_block_ids() -> None:
+    """Drop the per-forward block-id set (tests / end of step)."""
+    set_active_dsa_broadcast_block_ids(None)
+
+
+def _active_block_ids_for(cache: torch.Tensor) -> torch.Tensor | None:
+    if not _sparse_broadcast_enabled():
+        return None
+    ids = _ACTIVE_BLOCK_IDS
+    if ids is None or ids.numel() == 0:
+        return None
+    if cache.ndim < 1 or cache.shape[0] <= 0:
+        return None
+    # Skip when the selection would not shrink the payload.
+    if int(ids.numel()) >= int(cache.shape[0]):
+        return None
+    if ids.device != cache.device:
+        ids = ids.to(device=cache.device)
+    return ids
 
 
 def _register_layer_cache(cache: torch.Tensor, layer_name: str) -> None:
@@ -547,6 +700,33 @@ def _register_layer_cache(cache: torch.Tensor, layer_name: str) -> None:
     slot[kind] = cache
 
 
+def _broadcast_selected_blocks(
+    cache: torch.Tensor,
+    block_ids: torch.Tensor,
+    owner: int,
+    my_rank: int,
+    broadcast_fn: Any,
+    *,
+    pool: str,
+) -> None:
+    """Owner ``index_select`` → contiguous broadcast → non-owner ``index_copy_``."""
+    rest_shape = tuple(cache.shape[1:])
+    row_numel = cache[0].numel() if cache.shape[0] > 0 else int(cache.numel())
+    n_rows = int(block_ids.numel())
+    payload = _scratch_for(
+        cache,
+        pool=pool,
+        numel=n_rows * row_numel,
+        shape=(n_rows, *rest_shape),
+    )
+    if my_rank == owner:
+        # index_select gathers rows even when ``cache`` is a strided packed view.
+        payload.copy_(cache.index_select(0, block_ids))
+    broadcast_fn(payload)
+    if my_rank != owner:
+        cache.index_copy_(0, block_ids, payload)
+
+
 def _broadcast_tensor_from_owner(
     cache: torch.Tensor,
     layer_idx: int,
@@ -555,17 +735,31 @@ def _broadcast_tensor_from_owner(
 ) -> None:
     """SGLang ``LayerSplitDSATokenToKVPool._broadcast_tensor_from_owner``.
 
-    Broadcasts ``cache`` from ``owner``. Non-contiguous packed views bounce
-    through a contiguous scratch (NCCL requirement).
+    Prefers a sparse payload of the active batch's block ids when installed;
+    otherwise broadcasts the full cache (profile / warmup / opt-out).
+    Non-contiguous packed views bounce through a contiguous scratch.
     """
+    del layer_idx  # retained for SGLang signature parity / logging hooks
+    my_rank = int(pcp_group.rank_in_group)
+    block_ids = _active_block_ids_for(cache)
+    if block_ids is not None:
+        _broadcast_selected_blocks(
+            cache,
+            block_ids,
+            owner,
+            my_rank,
+            lambda payload: pcp_group.broadcast(payload, src=owner),
+            pool="sync",
+        )
+        return
     if cache.is_contiguous():
         pcp_group.broadcast(cache, src=owner)
         return
     scratch = _scratch_for(cache)
-    if int(pcp_group.rank_in_group) == owner:
+    if my_rank == owner:
         scratch.copy_(cache)
     pcp_group.broadcast(scratch, src=owner)
-    if int(pcp_group.rank_in_group) != owner:
+    if my_rank != owner:
         cache.copy_(scratch)
 
 
@@ -584,20 +778,35 @@ def _broadcast_tensor_from_owner_async(
     All copies (scratch bounce included) run on the side stream; readers
     synchronize via ``_finalize_pending_broadcast``.
     """
+    del layer_idx
     if _BCAST_COMM is None or _BCAST_STREAM is None:
         return False
     # The side stream must not overtake work already queued on the current
     # stream (the just-finished attention that still reads the scratch slot,
     # and the owner's durable write for this layer).
     _BCAST_STREAM.wait_stream(torch.cuda.current_stream())
+    block_ids = _active_block_ids_for(cache)
+
+    def _nccl_broadcast(tensor: torch.Tensor) -> None:
+        _BCAST_COMM.broadcast(tensor, src=owner, stream=_BCAST_STREAM)
+
     with torch.cuda.stream(_BCAST_STREAM):
-        if cache.is_contiguous():
-            _BCAST_COMM.broadcast(cache, src=owner, stream=_BCAST_STREAM)
+        if block_ids is not None:
+            _broadcast_selected_blocks(
+                cache,
+                block_ids,
+                owner,
+                my_rank,
+                _nccl_broadcast,
+                pool="prefetch",
+            )
+        elif cache.is_contiguous():
+            _nccl_broadcast(cache)
         else:
             scratch = _scratch_for(cache, pool="prefetch")
             if my_rank == owner:
                 scratch.copy_(cache)
-            _BCAST_COMM.broadcast(scratch, src=owner, stream=_BCAST_STREAM)
+            _nccl_broadcast(scratch)
             if my_rank != owner:
                 cache.copy_(scratch)
     fam.broadcast_stream = _BCAST_STREAM
@@ -859,6 +1068,7 @@ def clear_broadcast_scratch_for_tests() -> None:
     _broadcast_scratch.clear()
     _FAMILY_REMOTE.clear()
     _LAYER_CACHE_REGISTRY.clear()
+    clear_active_dsa_broadcast_block_ids()
 
 
 def maybe_log_runtime_layer_shard_plan(
@@ -1266,6 +1476,7 @@ __all__ = [
     "LayerSplitState",
     "begin_mla_dsa_cache_write",
     "broadcast_dsa_cache_from_owner",
+    "clear_active_dsa_broadcast_block_ids",
     "clear_broadcast_scratch_for_tests",
     "effective_num_layers",
     "get_layer_owner",
@@ -1273,6 +1484,7 @@ __all__ = [
     "get_runtime_layer_split_state",
     "invalidate_dsa_cache_broadcast",
     "is_dsa_cache_layer_split_requested",
+    "is_hcu_dsa_mla_model",
     "local_packed_slot_for_family_layer",
     "local_packed_slot_for_layer",
     "log_layer_shard_plan",
@@ -1285,6 +1497,8 @@ __all__ = [
     "phys_slots_for_layer_family",
     "prefetch_dsa_cache_from_owner",
     "remap_packed_kv_tensor_offsets",
+    "set_active_dsa_broadcast_block_ids",
+    "set_active_dsa_broadcast_block_ids_from_tables",
     "should_commit_durable_dsa_cache",
     "validate_dsa_cache_layer_split",
 ]
