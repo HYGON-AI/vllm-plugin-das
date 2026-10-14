@@ -16,6 +16,10 @@ from __future__ import annotations
 import importlib
 import os
 import threading
+from pathlib import Path
+
+
+_KFD_TOPOLOGY_NODES = Path("/sys/class/kfd/kfd/topology/nodes")
 
 
 def _is_uuid_device_mask(value: str | None) -> bool:
@@ -37,11 +41,20 @@ def _sync_hip_cuda_visible_devices() -> ValueError | None:
     hip_visible_devices = os.environ.get("HIP_VISIBLE_DEVICES")
     cuda_visible_devices = os.environ.get("CUDA_VISIBLE_DEVICES")
 
-    if (
+    masks_differ = (
         hip_is_set
         and cuda_is_set
         and hip_visible_devices != cuda_visible_devices
-    ):
+    )
+    uuid_alias_needs_resolution = (
+        bool(hip_visible_devices)
+        and bool(cuda_visible_devices)
+        and (
+            _is_uuid_device_mask(hip_visible_devices)
+            or _is_uuid_device_mask(cuda_visible_devices)
+        )
+    )
+    if masks_differ and not uuid_alias_needs_resolution:
         return ValueError(
             "Inconsistent GPU visibility env vars: "
             f"HIP_VISIBLE_DEVICES='{hip_visible_devices}' vs "
@@ -60,6 +73,97 @@ def _sync_hip_cuda_visible_devices() -> ValueError | None:
     return None
 
 
+def _physical_gpu_uuids_from_kfd() -> list[str] | None:
+    """Read GPU UUIDs in physical enumeration order from the KFD ABI."""
+
+    try:
+        node_paths = sorted(
+            _KFD_TOPOLOGY_NODES.iterdir(),
+            key=lambda path: int(path.name),
+        )
+    except (OSError, ValueError):
+        return None
+
+    physical_uuids: list[str] = []
+    try:
+        for node_path in node_paths:
+            properties = {}
+            for line in (node_path / "properties").read_text(
+                encoding="utf-8"
+            ).splitlines():
+                key, _, value = line.partition(" ")
+                properties[key] = value.strip()
+            if int(properties.get("simd_count", "0")) <= 0:
+                continue
+            unique_id = int(properties["unique_id"])
+            physical_uuids.append(f"{unique_id:016x}")
+    except (KeyError, OSError, ValueError):
+        return None
+    return physical_uuids or None
+
+
+def _physical_gpu_uuids_from_management_api() -> list[str] | None:
+    """Use the current optional management package as a compatibility fallback."""
+
+    try:
+        management_api = importlib.import_module("amdsmi")
+    except Exception:
+        return None
+
+    initialized = False
+    try:
+        management_api.amdsmi_init()
+        initialized = True
+        handles = management_api.amdsmi_get_processor_handles()
+        return [
+            str(management_api.amdsmi_get_gpu_asic_info(handle)["asic_serial"])
+            .lower()
+            .removeprefix("0x")
+            for handle in handles
+        ]
+    except Exception:
+        return None
+    finally:
+        if initialized:
+            try:
+                management_api.amdsmi_shut_down()
+            except Exception:
+                pass
+
+
+def _discover_physical_gpu_uuids() -> list[str] | None:
+    """Discover UUIDs without requiring any particular Python package name."""
+
+    return (
+        _physical_gpu_uuids_from_kfd()
+        or _physical_gpu_uuids_from_management_api()
+    )
+
+
+def _resolve_uuid_mask(uuid_mask: str, physical_uuids: list[str]) -> str:
+    physical_device_ids: list[int] = []
+    for entry in uuid_mask.split(","):
+        candidate = entry.removeprefix("GPU-").lower()
+        matches = [
+            index
+            for index, physical_uuid in enumerate(physical_uuids)
+            if physical_uuid.startswith(candidate)
+        ]
+        if len(matches) != 1:
+            raise ValueError(
+                f"HIP device UUID {entry!r} matched {len(matches)} "
+                "physical devices; expected exactly one."
+            )
+        physical_device_id = matches[0]
+        if physical_device_id in physical_device_ids:
+            raise ValueError(
+                f"HIP device UUID mask {uuid_mask!r} selects physical "
+                f"device {physical_device_id} more than once."
+            )
+        physical_device_ids.append(physical_device_id)
+    return ",".join(map(str, physical_device_ids))
+
+
 def _resolve_uuid_visible_devices() -> None:
     """Expose an integer mask to CUDA-only HCU control-plane consumers."""
 
@@ -75,52 +179,28 @@ def _resolve_uuid_visible_devices() -> None:
     if uuid_mask is None:
         return
 
-    management_api = importlib.import_module("amdsmi")
-    initialized = False
-    try:
-        management_api.amdsmi_init()
-        initialized = True
-        handles = management_api.amdsmi_get_processor_handles()
-        physical_uuids: list[str] = []
-        for handle in handles:
-            serial = str(
-                management_api.amdsmi_get_gpu_asic_info(handle)["asic_serial"]
-            ).lower()
-            physical_uuids.append(serial.removeprefix("0x"))
+    physical_uuids = _discover_physical_gpu_uuids()
+    if physical_uuids is None:
+        return
 
-        physical_device_ids: list[int] = []
-        for entry in uuid_mask.split(","):
-            candidate = entry.removeprefix("GPU-").lower()
-            matches = [
-                index
-                for index, physical_uuid in enumerate(physical_uuids)
-                if physical_uuid.startswith(candidate)
-            ]
-            if len(matches) != 1:
-                raise ValueError(
-                    f"HIP device UUID {entry!r} matched {len(matches)} "
-                    "physical devices; expected exactly one."
-                )
-            physical_device_id = matches[0]
-            if physical_device_id in physical_device_ids:
-                raise ValueError(
-                    f"HIP device UUID mask {uuid_mask!r} selects physical "
-                    f"device {physical_device_id} more than once."
-                )
-            physical_device_ids.append(physical_device_id)
-    finally:
-        if initialized:
-            management_api.amdsmi_shut_down()
+    resolved_mask = _resolve_uuid_mask(uuid_mask, physical_uuids)
+    for visible_devices in (hip_visible_devices, cuda_visible_devices):
+        if visible_devices is None:
+            continue
+        comparable_mask = (
+            _resolve_uuid_mask(visible_devices, physical_uuids)
+            if _is_uuid_device_mask(visible_devices)
+            else visible_devices
+        )
+        if comparable_mask != resolved_mask:
+            raise ValueError(
+                "Inconsistent GPU visibility env vars after resolving HIP UUIDs: "
+                f"HIP_VISIBLE_DEVICES='{hip_visible_devices}' vs "
+                f"CUDA_VISIBLE_DEVICES='{cuda_visible_devices}'."
+            )
 
-    resolved_mask = ",".join(map(str, physical_device_ids))
     if hip_visible_devices is None:
         os.environ["HIP_VISIBLE_DEVICES"] = uuid_mask
-    if cuda_visible_devices not in (None, uuid_mask, resolved_mask):
-        raise ValueError(
-            "Inconsistent GPU visibility env vars after resolving HIP UUIDs: "
-            f"HIP_VISIBLE_DEVICES='{os.environ.get('HIP_VISIBLE_DEVICES')}' vs "
-            f"CUDA_VISIBLE_DEVICES='{cuda_visible_devices}'."
-        )
     os.environ["CUDA_VISIBLE_DEVICES"] = resolved_mask
 
 

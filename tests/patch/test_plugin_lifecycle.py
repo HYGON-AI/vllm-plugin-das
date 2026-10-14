@@ -197,11 +197,13 @@ def test_plugin_callback_resolves_hip_uuid_mask_before_cuda_consumers():
         r'''
 import os
 import sys
+from pathlib import Path
 from types import ModuleType
 
 import vllm_hcu
 
 assert "CUDA_VISIBLE_DEVICES" not in os.environ
+vllm_hcu._KFD_TOPOLOGY_NODES = Path("/definitely/missing/kfd/topology")
 
 amdsmi = ModuleType("amdsmi")
 amdsmi.amdsmi_init = lambda: None
@@ -224,6 +226,186 @@ assert vllm_hcu.hcu_platform_plugin() == vllm_hcu._PLATFORM_CLASS_PATH
 assert os.environ["HIP_VISIBLE_DEVICES"] == "GPU-bbbb,GPU-dddd"
 assert os.environ["CUDA_VISIBLE_DEVICES"] == "1,3"
 assert list(map(int, os.environ["CUDA_VISIBLE_DEVICES"].split(","))) == [1, 3]
+assert vllm_hcu.hcu_platform_plugin() == vllm_hcu._PLATFORM_CLASS_PATH
+''',
+        assert_target_install=False,
+        env_overrides={
+            "HIP_VISIBLE_DEVICES": "GPU-bbbb,GPU-dddd",
+            "CUDA_VISIBLE_DEVICES": None,
+        },
+    )
+
+    assert result.returncode == 0, result.stderr
+
+
+def test_plugin_callback_accepts_equivalent_hip_uuid_and_cuda_ordinal_masks():
+    result = _fresh_python(
+        r'''
+import os
+import sys
+from pathlib import Path
+from types import ModuleType
+
+import vllm_hcu
+
+vllm_hcu._KFD_TOPOLOGY_NODES = Path("/definitely/missing/kfd/topology")
+amdsmi = ModuleType("amdsmi")
+amdsmi.amdsmi_init = lambda: None
+amdsmi.amdsmi_shut_down = lambda: None
+amdsmi.amdsmi_get_processor_handles = lambda: ["h0", "h1", "h2", "h3"]
+serials = {
+    "h0": "0xaaaa0000",
+    "h1": "0xbbbb1111",
+    "h2": "0xcccc2222",
+    "h3": "0xdddd3333",
+}
+amdsmi.amdsmi_get_gpu_asic_info = lambda handle: {
+    "asic_serial": serials[handle]
+}
+sys.modules["amdsmi"] = amdsmi
+
+vllm_hcu.ensure_vllm_compatible = lambda: None
+vllm_hcu._apply_platform_preserving_role = lambda: None
+assert vllm_hcu.hcu_platform_plugin() == vllm_hcu._PLATFORM_CLASS_PATH
+assert os.environ["HIP_VISIBLE_DEVICES"] == "GPU-bbbb,GPU-dddd"
+assert os.environ["CUDA_VISIBLE_DEVICES"] == "1,3"
+assert vllm_hcu.hcu_platform_plugin() == vllm_hcu._PLATFORM_CLASS_PATH
+''',
+        assert_target_install=False,
+        env_overrides={
+            "HIP_VISIBLE_DEVICES": "GPU-bbbb,GPU-dddd",
+            "CUDA_VISIBLE_DEVICES": "1,3",
+        },
+    )
+
+    assert result.returncode == 0, result.stderr
+
+
+def test_plugin_callback_rejects_uuid_mask_mapped_to_different_ordinals():
+    result = _fresh_python(
+        r'''
+import sys
+from pathlib import Path
+from types import ModuleType
+
+import vllm_hcu
+
+vllm_hcu._KFD_TOPOLOGY_NODES = Path("/definitely/missing/kfd/topology")
+amdsmi = ModuleType("amdsmi")
+amdsmi.amdsmi_init = lambda: None
+amdsmi.amdsmi_shut_down = lambda: None
+amdsmi.amdsmi_get_processor_handles = lambda: ["h0", "h1", "h2", "h3"]
+serials = {
+    "h0": "0xaaaa0000",
+    "h1": "0xbbbb1111",
+    "h2": "0xcccc2222",
+    "h3": "0xdddd3333",
+}
+amdsmi.amdsmi_get_gpu_asic_info = lambda handle: {
+    "asic_serial": serials[handle]
+}
+sys.modules["amdsmi"] = amdsmi
+
+vllm_hcu.ensure_vllm_compatible = lambda: None
+vllm_hcu._apply_platform_preserving_role = lambda: None
+assert vllm_hcu.hcu_platform_plugin() == vllm_hcu._PLATFORM_CLASS_PATH
+try:
+    vllm_hcu.hcu_platform_plugin()
+except RuntimeError as error:
+    print(str(error))
+else:
+    raise AssertionError("the selected HCU platform accepted different masks")
+''',
+        assert_target_install=False,
+        env_overrides={
+            "HIP_VISIBLE_DEVICES": "GPU-bbbb,GPU-dddd",
+            "CUDA_VISIBLE_DEVICES": "1,2",
+        },
+    )
+
+    assert result.returncode == 0, result.stderr
+    assert "after resolving HIP UUIDs" in result.stdout
+
+
+def test_plugin_callback_resolves_uuid_from_kfd_without_management_package():
+    result = _fresh_python(
+        r'''
+import importlib
+import os
+from pathlib import Path
+from tempfile import TemporaryDirectory
+
+import vllm_hcu
+
+original_import_module = importlib.import_module
+def import_without_management_package(name, package=None):
+    if name == "amdsmi":
+        error = ModuleNotFoundError("No module named 'amdsmi'")
+        error.name = "amdsmi"
+        raise error
+    return original_import_module(name, package)
+
+with TemporaryDirectory() as directory:
+    topology = Path(directory)
+    for node_id, simd_count, unique_id in (
+        (0, 0, 0),
+        (4, 256, int("aaaa0000", 16)),
+        (5, 256, int("bbbb1111", 16)),
+        (6, 256, int("cccc2222", 16)),
+        (7, 256, int("dddd3333", 16)),
+    ):
+        node = topology / str(node_id)
+        node.mkdir()
+        (node / "properties").write_text(
+            f"simd_count {simd_count}\nunique_id {unique_id}\n",
+            encoding="utf-8",
+        )
+
+    vllm_hcu._KFD_TOPOLOGY_NODES = topology
+    vllm_hcu.importlib.import_module = import_without_management_package
+    vllm_hcu.ensure_vllm_compatible = lambda: None
+    vllm_hcu._apply_platform_preserving_role = lambda: None
+    assert vllm_hcu.hcu_platform_plugin() == vllm_hcu._PLATFORM_CLASS_PATH
+    assert os.environ["HIP_VISIBLE_DEVICES"] == (
+        "GPU-00000000bbbb,GPU-00000000dddd"
+    )
+    assert os.environ["CUDA_VISIBLE_DEVICES"] == "1,3"
+    assert vllm_hcu.hcu_platform_plugin() == vllm_hcu._PLATFORM_CLASS_PATH
+''',
+        assert_target_install=False,
+        env_overrides={
+            "HIP_VISIBLE_DEVICES": "GPU-00000000bbbb,GPU-00000000dddd",
+            "CUDA_VISIBLE_DEVICES": None,
+        },
+    )
+
+    assert result.returncode == 0, result.stderr
+
+
+def test_plugin_callback_preserves_uuid_when_no_resolver_is_available():
+    result = _fresh_python(
+        r'''
+import importlib
+import os
+from pathlib import Path
+
+import vllm_hcu
+
+original_import_module = importlib.import_module
+def import_without_management_package(name, package=None):
+    if name == "amdsmi":
+        error = ModuleNotFoundError("No module named 'amdsmi'")
+        error.name = "amdsmi"
+        raise error
+    return original_import_module(name, package)
+
+vllm_hcu._KFD_TOPOLOGY_NODES = Path("/definitely/missing/kfd/topology")
+vllm_hcu.importlib.import_module = import_without_management_package
+vllm_hcu.ensure_vllm_compatible = lambda: None
+vllm_hcu._apply_platform_preserving_role = lambda: None
+assert vllm_hcu.hcu_platform_plugin() == vllm_hcu._PLATFORM_CLASS_PATH
+assert os.environ["HIP_VISIBLE_DEVICES"] == "GPU-bbbb,GPU-dddd"
+assert "CUDA_VISIBLE_DEVICES" not in os.environ
 assert vllm_hcu.hcu_platform_plugin() == vllm_hcu._PLATFORM_CLASS_PATH
 ''',
         assert_target_install=False,

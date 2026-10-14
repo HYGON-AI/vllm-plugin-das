@@ -252,6 +252,20 @@ def test_custom_allreduce_initializes_native_ownership_inert(
     communicator.close()
 
 
+def test_custom_allreduce_detects_unresolved_uuid_visibility(
+    monkeypatch: pytest.MonkeyPatch,
+):
+    module = _load_custom_allreduce_source(monkeypatch)
+
+    monkeypatch.setenv("HIP_VISIBLE_DEVICES", "GPU-bbbb,GPU-dddd")
+    assert module._has_unresolved_uuid_visibility(None) is True
+    assert module._has_unresolved_uuid_visibility("GPU-bbbb,GPU-dddd") is True
+    assert module._has_unresolved_uuid_visibility("1,3") is False
+
+    monkeypatch.setenv("HIP_VISIBLE_DEVICES", "1,3")
+    assert module._has_unresolved_uuid_visibility(None) is False
+
+
 def test_custom_allreduce_close_is_idempotent_and_releases_owned_resources(
     monkeypatch: pytest.MonkeyPatch,
 ):
