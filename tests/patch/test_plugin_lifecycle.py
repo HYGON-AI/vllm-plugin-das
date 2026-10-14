@@ -161,12 +161,24 @@ print(json.dumps({
         ("0", ""),
     ],
 )
-def test_plugin_import_rejects_conflicting_hip_and_cuda_visibility(
+def test_plugin_callback_latches_conflicting_hip_and_cuda_visibility(
     hip: str,
     cuda: str,
 ):
     result = _fresh_python(
-        "import vllm_hcu",
+        r'''
+import vllm_hcu
+
+vllm_hcu.ensure_vllm_compatible = lambda: None
+vllm_hcu._apply_platform_preserving_role = lambda: None
+assert vllm_hcu.hcu_platform_plugin() == vllm_hcu._PLATFORM_CLASS_PATH
+try:
+    vllm_hcu.hcu_platform_plugin()
+except RuntimeError as error:
+    print(str(error))
+else:
+    raise AssertionError("the selected HCU platform accepted conflicting masks")
+''',
         assert_target_install=False,
         env_overrides={
             "HIP_VISIBLE_DEVICES": hip,
@@ -174,10 +186,54 @@ def test_plugin_import_rejects_conflicting_hip_and_cuda_visibility(
         },
     )
 
-    assert result.returncode != 0
-    assert "Inconsistent GPU visibility env vars" in result.stderr
-    assert f"HIP_VISIBLE_DEVICES='{hip}'" in result.stderr
-    assert f"CUDA_VISIBLE_DEVICES='{cuda}'" in result.stderr
+    assert result.returncode == 0, result.stderr
+    assert "Inconsistent GPU visibility env vars" in result.stdout
+    assert f"HIP_VISIBLE_DEVICES='{hip}'" in result.stdout
+    assert f"CUDA_VISIBLE_DEVICES='{cuda}'" in result.stdout
+
+
+def test_plugin_callback_resolves_hip_uuid_mask_before_cuda_consumers():
+    result = _fresh_python(
+        r'''
+import os
+import sys
+from types import ModuleType
+
+import vllm_hcu
+
+assert "CUDA_VISIBLE_DEVICES" not in os.environ
+
+amdsmi = ModuleType("amdsmi")
+amdsmi.amdsmi_init = lambda: None
+amdsmi.amdsmi_shut_down = lambda: None
+amdsmi.amdsmi_get_processor_handles = lambda: ["h0", "h1", "h2", "h3"]
+serials = {
+    "h0": "0xaaaa0000",
+    "h1": "0xbbbb1111",
+    "h2": "0xcccc2222",
+    "h3": "0xdddd3333",
+}
+amdsmi.amdsmi_get_gpu_asic_info = lambda handle: {
+    "asic_serial": serials[handle]
+}
+sys.modules["amdsmi"] = amdsmi
+
+vllm_hcu.ensure_vllm_compatible = lambda: None
+vllm_hcu._apply_platform_preserving_role = lambda: None
+assert vllm_hcu.hcu_platform_plugin() == vllm_hcu._PLATFORM_CLASS_PATH
+assert os.environ["HIP_VISIBLE_DEVICES"] == "GPU-bbbb,GPU-dddd"
+assert os.environ["CUDA_VISIBLE_DEVICES"] == "1,3"
+assert list(map(int, os.environ["CUDA_VISIBLE_DEVICES"].split(","))) == [1, 3]
+assert vllm_hcu.hcu_platform_plugin() == vllm_hcu._PLATFORM_CLASS_PATH
+''',
+        assert_target_install=False,
+        env_overrides={
+            "HIP_VISIBLE_DEVICES": "GPU-bbbb,GPU-dddd",
+            "CUDA_VISIBLE_DEVICES": None,
+        },
+    )
+
+    assert result.returncode == 0, result.stderr
 
 
 @contextmanager

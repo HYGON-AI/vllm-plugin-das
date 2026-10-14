@@ -18,8 +18,19 @@ import os
 import threading
 
 
-def _sync_hip_cuda_visible_devices() -> None:
-    """Keep HIP and CUDA device masks consistent for HCU integrations."""
+def _is_uuid_device_mask(value: str | None) -> bool:
+    return bool(value) and all(
+        device_id.startswith("GPU-") for device_id in value.split(",")
+    )
+
+
+def _sync_hip_cuda_visible_devices() -> ValueError | None:
+    """Synchronize masks that need no device discovery.
+
+    Conflicts and UUID masks are deferred until the HCU platform callback is
+    selected. Raising while the entry point is loaded would let vLLM silently
+    omit the HCU plugin during platform discovery.
+    """
 
     hip_is_set = "HIP_VISIBLE_DEVICES" in os.environ
     cuda_is_set = "CUDA_VISIBLE_DEVICES" in os.environ
@@ -31,21 +42,89 @@ def _sync_hip_cuda_visible_devices() -> None:
         and cuda_is_set
         and hip_visible_devices != cuda_visible_devices
     ):
-        raise ValueError(
+        return ValueError(
             "Inconsistent GPU visibility env vars: "
             f"HIP_VISIBLE_DEVICES='{hip_visible_devices}' vs "
             f"CUDA_VISIBLE_DEVICES='{cuda_visible_devices}'. "
             "Please set only one, or ensure they match."
         )
+    visible_devices = hip_visible_devices if hip_is_set else cuda_visible_devices
+    if _is_uuid_device_mask(visible_devices):
+        return None
     if hip_is_set:
         assert hip_visible_devices is not None
         os.environ["CUDA_VISIBLE_DEVICES"] = hip_visible_devices
     elif cuda_is_set:
         assert cuda_visible_devices is not None
         os.environ["HIP_VISIBLE_DEVICES"] = cuda_visible_devices
+    return None
 
 
-_sync_hip_cuda_visible_devices()
+def _resolve_uuid_visible_devices() -> None:
+    """Expose an integer mask to CUDA-only HCU control-plane consumers."""
+
+    hip_visible_devices = os.environ.get("HIP_VISIBLE_DEVICES")
+    cuda_visible_devices = os.environ.get("CUDA_VISIBLE_DEVICES")
+    uuid_mask = (
+        hip_visible_devices
+        if _is_uuid_device_mask(hip_visible_devices)
+        else cuda_visible_devices
+        if _is_uuid_device_mask(cuda_visible_devices)
+        else None
+    )
+    if uuid_mask is None:
+        return
+
+    management_api = importlib.import_module("amdsmi")
+    initialized = False
+    try:
+        management_api.amdsmi_init()
+        initialized = True
+        handles = management_api.amdsmi_get_processor_handles()
+        physical_uuids: list[str] = []
+        for handle in handles:
+            serial = str(
+                management_api.amdsmi_get_gpu_asic_info(handle)["asic_serial"]
+            ).lower()
+            physical_uuids.append(serial.removeprefix("0x"))
+
+        physical_device_ids: list[int] = []
+        for entry in uuid_mask.split(","):
+            candidate = entry.removeprefix("GPU-").lower()
+            matches = [
+                index
+                for index, physical_uuid in enumerate(physical_uuids)
+                if physical_uuid.startswith(candidate)
+            ]
+            if len(matches) != 1:
+                raise ValueError(
+                    f"HIP device UUID {entry!r} matched {len(matches)} "
+                    "physical devices; expected exactly one."
+                )
+            physical_device_id = matches[0]
+            if physical_device_id in physical_device_ids:
+                raise ValueError(
+                    f"HIP device UUID mask {uuid_mask!r} selects physical "
+                    f"device {physical_device_id} more than once."
+                )
+            physical_device_ids.append(physical_device_id)
+    finally:
+        if initialized:
+            management_api.amdsmi_shut_down()
+
+    resolved_mask = ",".join(map(str, physical_device_ids))
+    if hip_visible_devices is None:
+        os.environ["HIP_VISIBLE_DEVICES"] = uuid_mask
+    if cuda_visible_devices not in (None, uuid_mask, resolved_mask):
+        raise ValueError(
+            "Inconsistent GPU visibility env vars after resolving HIP UUIDs: "
+            f"HIP_VISIBLE_DEVICES='{os.environ.get('HIP_VISIBLE_DEVICES')}' vs "
+            f"CUDA_VISIBLE_DEVICES='{cuda_visible_devices}'."
+        )
+    os.environ["CUDA_VISIBLE_DEVICES"] = resolved_mask
+
+
+_DEVICE_VISIBILITY_CONFLICT = _sync_hip_cuda_visible_devices()
 
 from vllm_hcu.lightop_env import configure_lightop_environment
 
@@ -116,6 +195,9 @@ def hcu_platform_plugin() -> str:
     with _PLATFORM_PLUGIN_LOCK:
         _ensure_platform_plugin_ready()
         try:
+            if _DEVICE_VISIBILITY_CONFLICT is not None:
+                raise _DEVICE_VISIBILITY_CONFLICT
+            _resolve_uuid_visible_devices()
             ensure_vllm_compatible()
             _apply_platform_preserving_role()
         except Exception as exc:
