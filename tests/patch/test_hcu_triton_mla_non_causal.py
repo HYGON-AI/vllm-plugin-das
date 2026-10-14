@@ -298,3 +298,97 @@ def test_forward_dcp_guard_rejects_only_unstamped_multi_token(
         tmla, "expand_causal_rows", tmla.expand_causal_rows
     )
     impl.forward_mqa(q[:2], kv, metadata2, _Layer())
+
+
+def test_builder_build_rejects_multi_token_under_dcp(monkeypatch):
+    """Review 2026-10-14 P2: under DCP>1 the wheel resets
+    ``reorder_batch_threshold`` to 1 (``supports_dcp_with_varlen=False``),
+    so a multi-token DRAFT batch is routed to the PREFILL branch of the
+    inherited build and dies on ``assert seq_lens_cpu is not None`` (draft
+    metadata is built with ``seq_lens_cpu_upper_bound=None``, attn_utils
+    ``build_attn_metadata`` default).  The builder must reject that
+    combination loudly BEFORE the wheel split.  Scope (round-4 audit B1):
+    target/plain PREFILL under DCP>1 carries a real
+    ``seq_lens_cpu_upper_bound`` and MUST stay on the wheel's supported
+    chunked-prefill path -- only draft batches with a query len > 1 AND a
+    missing bound are rejected.
+
+    Source-level control flow (codex reproduction, numpy stand-in):
+    DCP=1 (threshold=15): (decodes,prefills)=(2,0); DCP=2 (threshold=1):
+    (0,2) then AssertionError in the wheel build paths.
+    """
+
+    import types
+
+    calls = []
+
+    def spy_build(self, common_prefix_len, common_attn_metadata, fast_build=False):
+        calls.append(
+            (
+                common_attn_metadata.max_query_len,
+                getattr(
+                    common_attn_metadata, "seq_lens_cpu_upper_bound", "<absent>"
+                ),
+            )
+        )
+        return "built"
+
+    monkeypatch.setattr(TritonMLAMetadataBuilder, "build", spy_build)
+
+    builder = object.__new__(HcuTritonMLAMetadataBuilder)
+    builder.dcp_world_size = 2
+
+    def meta(q_len, bound):
+        return types.SimpleNamespace(
+            max_query_len=q_len, seq_lens_cpu_upper_bound=bound
+        )
+
+    # (a) DCP>1 + draft shape (q>1, no bound): loud reject before the
+    # wheel split.
+    try:
+        builder.build(0, meta(7, None))
+    except RuntimeError as exc:
+        assert "decode_context_parallel_size > 1" in str(exc)
+    else:
+        raise AssertionError("expected RuntimeError for DCP draft build")
+    assert calls == []
+
+    # (b) DCP>1 + plain prefill (q>1 but WITH a real bound): must stay on
+    # the wheel's supported chunked-prefill path (round-4 audit B1).
+    calls.clear()
+    assert builder.build(0, meta(37, torch.tensor([50, 60]))) == "built"
+    assert len(calls) == 1
+    assert calls[0][0] == 37
+    assert calls[0][1] is not None
+
+    # (b2) DCP>1 + q>1 WITHOUT the field at all (sentinel path, round-4
+    # audit WARN): a bare stub must fail OPEN -- the guard only matches a
+    # genuine ``None`` bound, never an absent field.
+    calls.clear()
+    assert builder.build(0, types.SimpleNamespace(max_query_len=7)) == "built"
+    assert len(calls) == 1 and calls[0][0] == 7
+
+    # (c) DCP>1 + pure single-token decode: keep the inherited wheel path.
+    calls.clear()
+    assert builder.build(0, meta(1, None)) == "built"
+    assert len(calls) == 1
+    assert calls[0][0] == 1
+
+    # (d) DCP=1 + draft shape (normal non-DCP DSpark verify on this
+    # backend): unchanged.
+    builder.dcp_world_size = 1
+    calls.clear()
+    assert builder.build(0, meta(7, None)) == "built"
+    assert len(calls) == 1 and calls[0][0] == 7
+
+
+def test_builder_build_guard_sits_before_super_delegation():
+    """Source contract: the DCP guard is the first thing the HCU build
+    override does, so no path reaches the wheel split first."""
+
+    import inspect
+
+    src = inspect.getsource(HcuTritonMLAMetadataBuilder.build)
+    guard_pos = src.index("dcp_world_size > 1")
+    super_pos = src.index("super().build(")
+    assert guard_pos < super_pos

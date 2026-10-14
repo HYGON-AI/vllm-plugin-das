@@ -168,6 +168,69 @@ class HcuTritonMLAMetadataBuilder(TritonMLAMetadataBuilder):
             ((B, q_num_heads, max_splits, lse_dim), torch.float32),
         )
 
+    def build(
+        self,
+        common_prefix_len: int,
+        common_attn_metadata,
+        fast_build: bool = False,
+    ):
+        """Reject DCP>1 multi-token DRAFT batches before the wheel split.
+
+        With ``decode_context_parallel_size > 1`` the wheel resets
+        ``reorder_batch_threshold`` to 1 (``supports_dcp_with_varlen``
+        defaults to False on this backend; see
+        ``AttentionMetadataBuilder._init_reorder_batch_threshold``), so the
+        spec-aware threshold our ``query_len_support=UNIFORM`` requested is
+        silently discarded.  A multi-token DRAFT batch -- the DSpark block,
+        ``q = 1 + num_speculative_tokens`` -- is then routed to the PREFILL
+        branch of the inherited build (``split_decodes_and_prefills`` sees
+        a first query len > 1), where it dies on
+        ``assert seq_lens_cpu is not None``: the draft metadata comes from
+        ``build_attn_metadata`` with its ``seq_lens_cpu_upper_bound``
+        parameter left at the ``None`` default (the speculator
+        ``_build_draft_attn_metadata`` chain never passes it), and the
+        ``MLACommonMetadataBuilder.build`` prefill branch asserts the
+        bound.  Under full capture the wheel
+        ``build_for_cudagraph_capture`` own query-len assert fires first
+        instead.  The forward-time DCP guard never runs for those batches
+        (review 2026-10-14 P2).
+
+        Scope against over-rejection: TARGET/plain PREFILL batches under
+        DCP>1 are NOT rejected -- they carry a real
+        ``seq_lens_cpu_upper_bound`` and stay on the wheel's supported
+        chunked-prefill path.  The guard only fires when BOTH the collapse
+        trigger (``max_query_len > 1``) AND the missing-bound signature of
+        a draft/probe batch (``seq_lens_cpu_upper_bound is None``) hold.
+        Pure q=1 decode keeps the inherited wheel behaviour; the
+        forward-time guard remains the second barrier for unstamped
+        multi-token batches that already reached forward_mqa.
+        """
+
+        if (
+            self.dcp_world_size > 1
+            and common_attn_metadata.max_query_len > 1
+            # The sentinel (not ``None``) distinguishes "field ABSENT"
+            # (bare test stubs / a wheel without the field) from a draft
+            # batch whose bound is genuinely None: only the latter matches
+            # the crash signature, an absent field fails OPEN by design.
+            and getattr(common_attn_metadata, "seq_lens_cpu_upper_bound", "missing")
+            is None
+        ):
+            raise RuntimeError(
+                "HCU triton MLA: multi-token draft batches (max query len "
+                f"{common_attn_metadata.max_query_len}) are not supported "
+                "with decode_context_parallel_size > 1: without DCP varlen "
+                "support the reorder threshold collapses to 1, the batch is "
+                "mis-routed to the prefill builder and would crash on the "
+                "missing seq_lens_cpu_upper_bound. Disable DCP for "
+                "speculative decoding or use a DCP-aware backend."
+            )
+        return super().build(
+            common_prefix_len,
+            common_attn_metadata,
+            fast_build=fast_build,
+        )
+
 
 class HcuTritonMLAImpl(TritonMLAImpl):
     """Impl flattening non-causal multi-token blocks to per-token rows.
