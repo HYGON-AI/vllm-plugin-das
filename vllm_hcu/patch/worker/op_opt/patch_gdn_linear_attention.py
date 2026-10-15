@@ -8,6 +8,8 @@ import functools
 import inspect
 from types import ModuleType
 
+import torch
+
 from ._common import (
     PatchCompatibilityError,
     already_applied,
@@ -15,7 +17,15 @@ from ._common import (
     require_callable,
     require_exact_signature,
 )
+from ._aiter_fla import make_aiter_gdn_resolver
 from ._boltops_fla import make_boltops_gdn_resolver
+from ._gdn_backend import (
+    AITER,
+    BOLTOPS,
+    aiter_input_fallback,
+    make_provider_selector,
+    record_prefill_backend,
+)
 from ._gdn_common import (
     normalize_nn_conv_weight,
     require_parameter_names,
@@ -36,6 +46,8 @@ _MARKER = "_vllm_hcu_qwen_gdn_aiter_layout_applied"
 _WRAPPER = "_vllm_hcu_qwen_gdn_aiter_layout_wrapper"
 _SIGMOID_WRAPPER = "_vllm_hcu_qwen_gdn_sigmoid_wrapper"
 _RECURRENT_WRAPPER = "_vllm_hcu_qwen_gdn_recurrent_wrapper"
+_PREFILL_WRAPPER = "_vllm_hcu_qwen_gdn_prefill_backend_wrapper"
+_PREFILL_TARGET = f"{TARGET_MODULE}._resolve_gdn_prefill_backend"
 
 # This is the audited vLLM v0.28.1 AITER launcher contract.  Binding by name is
 # intentional: the old HCU adapter rewrote args[10], which could silently
@@ -66,9 +78,73 @@ _AITER_UPDATE_PARAMETERS = (
 )
 
 
+def _aiter_state_indices(ssm_state_indices):
+    """Map vLLM NULL_BLOCK_ID (0) padding to aiter's negative null index.
+
+    vLLM and BoltOPs (null_state_index=0) skip state index <= 0; the aiter
+    HIP kernels only skip < 0 and would read/write state block 0 for
+    CUDA-graph padding rows.
+    """
+    if ssm_state_indices is None:
+        return None
+    return torch.where(
+        ssm_state_indices > 0,
+        ssm_state_indices,
+        torch.full_like(ssm_state_indices, -1),
+    )
+
+
+_AITER_SIGMOID_HEAD_DIMS = (32, 64, 128, 256, 512)
+
+
+def _aiter_sigmoid_unsupported(arguments) -> str | None:
+    """Return why aiter's HIP sigmoid update rejects these inputs, or None."""
+    q = arguments["q"]
+    state = arguments["initial_state"]
+    indices = arguments["ssm_state_indices"]
+    cu_seqlens = arguments["cu_seqlens"]
+    if state is None or state.dtype != torch.float32 or state.stride(-1) != 1:
+        return "a missing or non-fp32 recurrent state"
+    if indices is not None and indices.dtype != torch.int32:
+        return f"{indices.dtype} state indices"
+    if cu_seqlens is not None and cu_seqlens.dtype != torch.int32:
+        return f"{cu_seqlens.dtype} cu_seqlens"
+    if arguments["num_accepted_tokens"] is not None and (
+        indices is None or indices.dim() != 2
+    ):
+        return "spec decode without 2D state indices"
+    if q.shape[-1] not in _AITER_SIGMOID_HEAD_DIMS:
+        return f"head_k_dim={q.shape[-1]}"
+    activations = ("k", "v", "a", "b", "dt_bias")
+    if q.dtype not in (torch.float16, torch.bfloat16, torch.float32) or any(
+        arguments[name].dtype != q.dtype for name in activations
+    ) or arguments["A_log"].dtype != torch.float32:
+        return "mixed activation dtypes or non-fp32 A_log"
+    return None
+
+
+def _aiter_recurrent_unsupported(arguments) -> str | None:
+    """Return why aiter's HIP packed decode rejects these inputs, or None."""
+    state = arguments["initial_state"]
+    indices = arguments["ssm_state_indices"]
+    if indices.dim() != 1 or indices.dtype not in (torch.int32, torch.int64):
+        return "non-1D or non-integer state indices"
+    if state.stride(-1) != 1 or state.stride(-2) != state.shape[-1]:
+        return "a non-contiguous recurrent state"
+    if not arguments["out"].is_contiguous():
+        return "a non-contiguous output buffer"
+    return None
+
+
 def apply_to_module(module: ModuleType) -> bool:
     qwen = load_exact_module(TARGET_MODULE, module)
-    aiter_available = bool(getattr(qwen, "GDN_AITER_TRITON_AVAILABLE", False))
+    aiter_available = bool(
+        getattr(
+            qwen,
+            "_vllm_hcu_original_gdn_aiter_triton_available",
+            getattr(qwen, "GDN_AITER_TRITON_AVAILABLE", False),
+        )
+    )
     wrapped = [
         (qwen, TARGETS[1].rsplit(".", 1)[-1], TARGETS[1], _SIGMOID_WRAPPER),
         (qwen, TARGETS[2].rsplit(".", 1)[-1], TARGETS[2], _RECURRENT_WRAPPER),
@@ -77,6 +153,12 @@ def apply_to_module(module: ModuleType) -> bool:
         wrapped.insert(
             0,
             (qwen, TARGETS[0].rsplit(".", 1)[-1], TARGETS[0], _WRAPPER),
+        )
+    official_resolver = getattr(qwen, "_resolve_gdn_prefill_backend", None)
+    if callable(official_resolver):
+        wrapped.append(
+            (qwen, "_resolve_gdn_prefill_backend", _PREFILL_TARGET,
+             _PREFILL_WRAPPER)
         )
     if already_applied(qwen, _MARKER, wrapped):
         return False
@@ -145,39 +227,65 @@ def apply_to_module(module: ModuleType) -> bool:
         defaults={"use_qk_l2norm_in_kernel": False},
     )
     recurrent_signature = inspect.signature(official_recurrent)
-    resolve_boltops_sigmoid = make_boltops_gdn_resolver(
-        "fused_sigmoid_gating_delta_rule_update"
+    sigmoid_op = "fused_sigmoid_gating_delta_rule_update"
+    recurrent_op = "fused_recurrent_gated_delta_rule_packed_decode"
+    resolve_boltops_sigmoid = make_boltops_gdn_resolver(sigmoid_op)
+    resolve_boltops_recurrent = make_boltops_gdn_resolver(recurrent_op)
+    select_sigmoid = make_provider_selector(
+        "decode",
+        sigmoid_op,
+        {
+            BOLTOPS: resolve_boltops_sigmoid,
+            AITER: make_aiter_gdn_resolver(sigmoid_op),
+        },
     )
-    resolve_boltops_recurrent = make_boltops_gdn_resolver(
-        "fused_recurrent_gated_delta_rule_packed_decode"
+    select_recurrent = make_provider_selector(
+        "decode",
+        recurrent_op,
+        {
+            BOLTOPS: resolve_boltops_recurrent,
+            AITER: make_aiter_gdn_resolver(recurrent_op),
+        },
     )
 
     @functools.wraps(official_sigmoid)
     def hcu_sigmoid_update(*args, **kwargs):
         bound = sigmoid_signature.bind(*args, **kwargs)
         bound.apply_defaults()
-        if _boltops_enabled():
-            boltops_kernel = resolve_boltops_sigmoid()
-            if boltops_kernel is not None:
-                return boltops_kernel(
-                    *bound.args,
-                    **bound.kwargs,
-                    null_state_index=0,
+        provider, kernel = select_sigmoid()
+        if provider == AITER:
+            reason = _aiter_sigmoid_unsupported(bound.arguments)
+            if reason is not None:
+                provider, kernel = aiter_input_fallback(
+                    "decode", sigmoid_op, reason, resolve_boltops_sigmoid
                 )
+        if provider == BOLTOPS:
+            return kernel(*bound.args, **bound.kwargs, null_state_index=0)
+        if provider == AITER:
+            bound.arguments["ssm_state_indices"] = _aiter_state_indices(
+                bound.arguments["ssm_state_indices"]
+            )
+            return kernel(*bound.args, **bound.kwargs)
         return official_sigmoid(*bound.args, **bound.kwargs)
 
     @functools.wraps(official_recurrent)
     def hcu_recurrent_update(*args, **kwargs):
         bound = recurrent_signature.bind(*args, **kwargs)
         bound.apply_defaults()
-        if _boltops_enabled():
-            boltops_kernel = resolve_boltops_recurrent()
-            if boltops_kernel is not None:
-                return boltops_kernel(
-                    *bound.args,
-                    **bound.kwargs,
-                    null_state_index=0,
+        provider, kernel = select_recurrent()
+        if provider == AITER:
+            reason = _aiter_recurrent_unsupported(bound.arguments)
+            if reason is not None:
+                provider, kernel = aiter_input_fallback(
+                    "decode", recurrent_op, reason, resolve_boltops_recurrent
                 )
+        if provider == BOLTOPS:
+            return kernel(*bound.args, **bound.kwargs, null_state_index=0)
+        if provider == AITER:
+            bound.arguments["ssm_state_indices"] = _aiter_state_indices(
+                bound.arguments["ssm_state_indices"]
+            )
+            return kernel(*bound.args, **bound.kwargs)
         return official_recurrent(*bound.args, **bound.kwargs)
 
     if aiter_available:
@@ -233,17 +341,34 @@ def apply_to_module(module: ModuleType) -> bool:
             "gdn_aiter_fused_reshape_causal_conv1d_update_single_token",
             hcu_aiter_update,
         )
+        # VLLM_HCU_GDN_DECODE_BACKEND owns GDN decode.  vLLM's ROCm AITER
+        # fast path (taken only with VLLM_ROCM_USE_AITER=1) would bypass the
+        # selected sigmoid/recurrent provider, so HCU never takes it.
+        setattr(qwen, "_vllm_hcu_original_gdn_aiter_triton_available", True)
+        setattr(qwen, "GDN_AITER_TRITON_AVAILABLE", False)
+
+    if callable(official_resolver):
+
+        @functools.wraps(official_resolver)
+        def hcu_resolve_gdn_prefill_backend(vllm_config):
+            # Capture --gdn-prefill-backend while layers are constructed so
+            # the FLA kernel patches can select their provider later.
+            record_prefill_backend(vllm_config)
+            return official_resolver(vllm_config)
+
+        setattr(hcu_resolve_gdn_prefill_backend, _PREFILL_WRAPPER, True)
+        setattr(
+            qwen,
+            "_vllm_hcu_original_resolve_gdn_prefill_backend",
+            official_resolver,
+        )
+        setattr(
+            qwen,
+            "_resolve_gdn_prefill_backend",
+            hcu_resolve_gdn_prefill_backend,
+        )
     setattr(qwen, _MARKER, True)
     return True
-
-
-def _boltops_enabled() -> bool:
-    from vllm_hcu.platforms import envs as henvs
-
-    return bool(
-        henvs.VLLM_HCU_USE_CUSTOM_OPS
-        and henvs.VLLM_HCU_USE_CUSTOM_AITER_FLA
-    )
 
 
 def apply(module: ModuleType | None = None) -> bool:

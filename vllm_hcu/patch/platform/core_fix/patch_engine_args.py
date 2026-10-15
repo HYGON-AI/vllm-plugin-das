@@ -18,6 +18,7 @@ from types import ModuleType
 from typing import Any
 
 from vllm_hcu.patch.config import (
+    HCU_GDN_PREFILL_BACKENDS,
     HcuFeatureConfig,
     get_hcu_config,
     normalize_hcu_moe_backend,
@@ -51,6 +52,7 @@ _UPSTREAM_BACKEND = "auto"
 _DEEPEP_AUTO_BACKEND = "deepep_auto"
 _DEEPEP_AUTO_UPSTREAM_BACKEND = "deepep_low_latency"
 _FLASH_ATTN_BACKEND = "FLASH_ATTN"
+_GDN_PREFILL_UPSTREAM_BACKEND = "triton"
 _HCU_FLASH_ATTN_ALIASES = {
     "FLASH_ATTN_CLASSIC": "classic",
     "FLASH_ATTN_CUTLASS": "cutlass",
@@ -90,6 +92,7 @@ def _require_engine_args_class(module: ModuleType, name: str) -> type:
         "all2all_backend",
         "attention_backend",
         "attention_config",
+        "gdn_prefill_backend",
         "moe_backend",
         "kernel_config",
         "speculative_config",
@@ -211,6 +214,33 @@ def _normalise_constructor_kwargs(
             f"selects {top_level_all2all!r}"
         )
 
+    requested_gdn_prefill = feature_config.hcu_gdn_prefill_backend
+    top_level_gdn_prefill = bound.arguments.get("gdn_prefill_backend")
+    if top_level_gdn_prefill in HCU_GDN_PREFILL_BACKENDS:
+        if "gdn_prefill_backend" not in kwargs:
+            raise TypeError(
+                "positional HCU gdn_prefill_backend values are not supported; "
+                "pass gdn_prefill_backend by keyword"
+            )
+        if (
+            requested_gdn_prefill is not None
+            and requested_gdn_prefill != top_level_gdn_prefill
+        ):
+            raise ValueError(
+                "conflicting hcu_gdn_prefill_backend in HCU sidecar and "
+                "EngineArgs.gdn_prefill_backend"
+            )
+        requested_gdn_prefill = top_level_gdn_prefill
+        kwargs["gdn_prefill_backend"] = _GDN_PREFILL_UPSTREAM_BACKEND
+    elif requested_gdn_prefill is not None and top_level_gdn_prefill not in (
+        None,
+        _GDN_PREFILL_UPSTREAM_BACKEND,
+    ):
+        raise ValueError(
+            f"HCU sidecar selects {requested_gdn_prefill} but "
+            f"EngineArgs.gdn_prefill_backend selects {top_level_gdn_prefill!r}"
+        )
+
     requested_deep_gemm = feature_config.moe_backend == _DEEP_GEMM_BACKEND
     raw_top_level_backend = bound.arguments.get("moe_backend")
     top_level_backend = normalize_hcu_moe_backend(raw_top_level_backend)
@@ -309,6 +339,8 @@ def _normalise_constructor_kwargs(
         updates["moe_backend"] = _DEEP_GEMM_BACKEND
     if requested_deepep_auto:
         updates["deepep_auto"] = True
+    if requested_gdn_prefill is not None:
+        updates["hcu_gdn_prefill_backend"] = requested_gdn_prefill
     return feature_config.with_updates(**updates) if updates else feature_config
 
 
@@ -363,6 +395,29 @@ def _normalise_existing_engine_args(engine_args: object) -> HcuFeatureConfig:
         raise ValueError(
             "HCU sidecar selects deepep_auto but EngineArgs.all2all_backend "
             f"selects {all2all_backend!r}"
+        )
+
+    gdn_prefill_backend = getattr(engine_args, "gdn_prefill_backend", None)
+    if gdn_prefill_backend in HCU_GDN_PREFILL_BACKENDS:
+        if (
+            feature_config.hcu_gdn_prefill_backend is not None
+            and feature_config.hcu_gdn_prefill_backend != gdn_prefill_backend
+        ):
+            raise ValueError(
+                "conflicting hcu_gdn_prefill_backend in HCU sidecar and "
+                "EngineArgs.gdn_prefill_backend"
+            )
+        setattr(engine_args, "gdn_prefill_backend", _GDN_PREFILL_UPSTREAM_BACKEND)
+        feature_config = feature_config.with_updates(
+            hcu_gdn_prefill_backend=gdn_prefill_backend
+        )
+    elif (
+        feature_config.hcu_gdn_prefill_backend is not None
+        and gdn_prefill_backend not in (None, _GDN_PREFILL_UPSTREAM_BACKEND)
+    ):
+        raise ValueError(
+            f"HCU sidecar selects {feature_config.hcu_gdn_prefill_backend} but "
+            f"EngineArgs.gdn_prefill_backend selects {gdn_prefill_backend!r}"
         )
 
     backend = normalize_hcu_moe_backend(
@@ -535,6 +590,24 @@ def apply_to_module(module: ModuleType) -> bool:
         else:
             raise PatchCompatibilityError(
                 "EngineArgs.add_cli_args did not install --all2all-backend"
+            )
+        for action in getattr(result, "_actions", ()):
+            if getattr(action, "dest", None) != "gdn_prefill_backend":
+                continue
+            choices = getattr(action, "choices", None)
+            if choices is None:
+                raise PatchCompatibilityError(
+                    "--gdn-prefill-backend CLI action has no audited choices"
+                )
+            missing = tuple(
+                name for name in HCU_GDN_PREFILL_BACKENDS if name not in choices
+            )
+            if missing:
+                action.choices = tuple(choices) + missing
+            break
+        else:
+            raise PatchCompatibilityError(
+                "EngineArgs.add_cli_args did not install --gdn-prefill-backend"
             )
         return result
 

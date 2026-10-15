@@ -1,6 +1,9 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright (c) 2026 Hygon Information Technology Co., Ltd.
-"""Route the vLLM FLA recompute_w_u helper through BoltOPs on HCU."""
+"""Route the vLLM FLA recompute_w_u helper through the selected HCU provider.
+
+aiter has no recompute_w_u kernel, so ``hcu-aiter`` falls back to BoltOPs.
+"""
 
 from __future__ import annotations
 
@@ -14,21 +17,14 @@ from ._common import (
     require_exact_signature,
 )
 from ._boltops_fla import make_boltops_gdn_resolver
+from ._gdn_backend import BOLTOPS, make_provider_selector
 
 TARGET_MODULE = "vllm.third_party.flash_linear_attention.ops.chunk"
 PATCH_ID = "worker.op_opt.fla.recompute_w_u.boltops"
 TARGETS = (f"{TARGET_MODULE}.recompute_w_u_fwd",)
 _MARKER = "_vllm_hcu_fla_recompute_w_u_applied"
 _WRAPPER = "_vllm_hcu_fla_recompute_w_u_wrapper"
-
-
-def _enabled() -> bool:
-    from vllm_hcu.platforms import envs as henvs
-
-    return bool(
-        henvs.VLLM_HCU_USE_CUSTOM_OPS
-        and henvs.VLLM_HCU_USE_CUSTOM_AITER_FLA
-    )
+_OP = "recompute_w_u_fwd"
 
 
 def apply_to_module(module: ModuleType) -> bool:
@@ -46,7 +42,9 @@ def apply_to_module(module: ModuleType) -> bool:
         ),
         defaults={"chunk_indices": None},
     )
-    resolve_boltops = make_boltops_gdn_resolver("recompute_w_u_fwd")
+    select_provider = make_provider_selector(
+        "prefill", _OP, {BOLTOPS: make_boltops_gdn_resolver(_OP)}
+    )
 
     @functools.wraps(original)
     def hcu_recompute_w_u(
@@ -58,12 +56,8 @@ def apply_to_module(module: ModuleType) -> bool:
         cu_seqlens,
         chunk_indices=None,
     ):
-        if not _enabled():
-            return original(
-                k, v, beta, g_cumsum, A, cu_seqlens, chunk_indices,
-            )
-        boltops_kernel = resolve_boltops()
-        if boltops_kernel is None:
+        provider, boltops_kernel = select_provider()
+        if provider != BOLTOPS:
             return original(
                 k, v, beta, g_cumsum, A, cu_seqlens, chunk_indices,
             )

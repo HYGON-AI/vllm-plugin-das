@@ -25,6 +25,7 @@ _FEATURE_FIELDS = (
     "qwen4_exp_hc_sp",
     "moe_backend",
     "hcu_flash_attn_mode",
+    "hcu_gdn_prefill_backend",
 )
 _BOOLEAN_FIELDS = _FEATURE_FIELDS[:7]
 _SUPPORTED_MOE_BACKENDS = frozenset({"auto", "deep_gemm"})
@@ -35,6 +36,8 @@ _legacy_backend_warning_lock = threading.Lock()
 _SUPPORTED_FLASH_ATTN_MODES = frozenset(
     {"classic", "cutlass", "varlen"}
 )
+# HCU-only --gdn-prefill-backend values. vLLM itself only sees "triton".
+HCU_GDN_PREFILL_BACKENDS = ("hcu-boltops", "hcu-aiter")
 
 
 def normalize_hcu_moe_backend(value: Any) -> Any:
@@ -78,6 +81,10 @@ class HcuFeatureConfig:
     qwen4_exp_hc_sp: bool = True
     moe_backend: str = "auto"
     hcu_flash_attn_mode: str | None = None
+    # HCU provider requested through --gdn-prefill-backend (hcu-boltops or
+    # hcu-aiter). None means the official value decides; see
+    # vllm_hcu.patch.worker.op_opt._gdn_backend.
+    hcu_gdn_prefill_backend: str | None = None
 
     def __post_init__(self) -> None:
         for name in _BOOLEAN_FIELDS:
@@ -112,6 +119,15 @@ class HcuFeatureConfig:
                     "unsupported HCU hcu_flash_attn_mode "
                     f"{self.hcu_flash_attn_mode!r}; expected one of {supported}"
                 )
+        if (
+            self.hcu_gdn_prefill_backend is not None
+            and self.hcu_gdn_prefill_backend not in HCU_GDN_PREFILL_BACKENDS
+        ):
+            supported = ", ".join(HCU_GDN_PREFILL_BACKENDS)
+            raise ValueError(
+                "unsupported HCU hcu_gdn_prefill_backend "
+                f"{self.hcu_gdn_prefill_backend!r}; expected one of {supported}"
+            )
         if self.enable_lightly_cplb and not self.enable_lightly_cp:
             raise ValueError("enable_lightly_cplb requires enable_lightly_cp")
 
