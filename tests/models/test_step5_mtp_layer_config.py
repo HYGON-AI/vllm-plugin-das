@@ -1,5 +1,8 @@
 # SPDX-License-Identifier: Apache-2.0
-"""Exercise production constructors with CPU projection/distributed stubs."""
+"""Verify dense MTP tail configuration with CPU constructor stubs.
+
+These tests do not cover expert checkpoint loading or full MTP execution.
+"""
 
 import ast
 from copy import copy
@@ -41,10 +44,8 @@ class RecordedAttention(nn.Module):
         self.args = kwargs
 
 
-class RecordedMoE(nn.Module):
-    def __init__(self, config, prefix):
-        super().__init__()
-        self.config, self.prefix = config, prefix
+def reject_moe_mtp(*args, **kwargs):
+    raise AssertionError("Dense MTP must not construct an MoE block")
 
 
 class Projection(nn.Module):
@@ -60,7 +61,7 @@ def constructors():
         copy=copy,
         extract_layer_index=lambda p: int(re.search(r"layers\.(\d+)", p).group(1)),
         Step5Attention=RecordedAttention,
-        FusedMoEBlock=RecordedMoE,
+        FusedMoEBlock=reject_moe_mtp,
         get_tp_group=lambda: None,
         get_dp_group=lambda: SimpleNamespace(world_size=2),
         get_tensor_model_parallel_world_size=lambda: 4,
@@ -97,7 +98,8 @@ def constructors():
 
 
 def config(nested):
-    # Main layer zero is sliding; MTP layer 92 is full with different RoPE.
+    # Synthetic tail settings differ from the main stack to catch index reuse.
+    # The main stack includes MoE, but all three MTP layers are dense.
     main_types = ["sliding_attention"] * 92
     text = SimpleNamespace(
         hidden_size=8,
@@ -118,7 +120,7 @@ def config(nested):
         use_rope_layers=[True] * 92 + [False, True, True],
         swiglu_limits_shared=[7.0] * 92 + [5.0, 6.0, 8.0],
         swiglu_limits=[7.0] * 95,
-        moe_layers_enum="93",
+        moe_layers_enum=",".join(str(idx) for idx in range(3, 91)),
         attention_other_setting=dict(
             attention_type="full_attention",
             num_attention_heads=8,
@@ -137,7 +139,7 @@ def config(nested):
 
 @pytest.mark.parametrize("nested", [False, True])
 @pytest.mark.parametrize("idx", [92, 93, 94])
-def test_mtp_uses_absolute_tail_layer_configuration(nested, idx):
+def test_dense_mtp_uses_absolute_tail_layer_configuration(nested, idx):
     cls, _ = constructors()
     cfg, original, text = config(nested)
     layer = cls(cfg, prefix=f"model.layers.{idx}")
@@ -151,16 +153,12 @@ def test_mtp_uses_absolute_tail_layer_configuration(nested, idx):
     assert attn["partial_rotary_factor"] == text.partial_rotary_factors[idx]
     assert attn["use_rope_layers"][idx] == text.use_rope_layers[idx]
     assert attn["num_heads"] == (4 if idx == 93 else 8)
-    assert decoder.use_moe == (idx == 93)
-    if idx == 93:
-        assert decoder.moe.prefix == f"model.layers.{idx}.mtp_block.moe"
-        assert decoder.moe.config.model_config.hf_config is text
-    else:
-        assert decoder.mlp.limit == text.swiglu_limits_shared[idx]
-        assert (
-            decoder.mlp.gate_up_proj.prefix
-            == f"model.layers.{idx}.mtp_block.mlp.gate_up_proj"
-        )
+    assert not decoder.use_moe
+    assert decoder.mlp.limit == text.swiglu_limits_shared[idx]
+    assert (
+        decoder.mlp.gate_up_proj.prefix
+        == f"model.layers.{idx}.mtp_block.mlp.gate_up_proj"
+    )
     assert cfg.model_config.hf_config is original
     assert len(text.layer_types) == 92
 
