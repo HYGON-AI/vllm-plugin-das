@@ -26,6 +26,8 @@ if TYPE_CHECKING:
     VLLM_HCU_USE_CUSTOM_GEMMA_RMS_NORM : bool = False
     VLLM_HCU_USE_SKIP_WEIGHT_DEBUG : bool = False
     VLLM_HCU_USE_CUSTOM_TOPK_TOPP_SAMPLER : bool = False
+    VLLM_HCU_USE_DEEPGEMM_W8A16_GEMM: bool = True
+    VLLM_HCU_DEEPGEMM_W8A16_PRESHUFFLE: bool = True
     VLLM_HCU_USE_CUSTOM_RMS_NORM : bool = False
     VLLM_HCU_USE_CUSTOM_AITER_FLA : bool = False
     VLLM_HCU_PP_LAYER_PARTITION_D : Optional[str] = None
@@ -262,6 +264,20 @@ def resolve_hcu_flash_attn_mode(explicit_mode: Optional[str]) -> str:
     return "varlen"
 
 hcu_vllm_environment_variables: dict[str, Callable[[], Any]] = {
+    # If set (default True), vLLM uses the DeepGEMM W8A16 GEMM kernel for
+    # int8 weight-only linear layers; otherwise the PyTorch fallback.
+    "VLLM_HCU_USE_DEEPGEMM_W8A16_GEMM":
+        lambda: (os.environ.get("VLLM_HCU_USE_DEEPGEMM_W8A16_GEMM", "True").lower() in
+                 ("true", "1")),
+
+    # If set (default True) and DeepGEMM is used, pre-shuffle W8A16 linear
+    # weights into the marlin layout (WEIGHT_LAYOUT=1) at load time for
+    # shapes whose tuned DeepGEMM configs pick that layout. Requires
+    # DeepGEMM with the bm32 kernel fix (a325158 "fix:bm32 kernel Bload").
+    "VLLM_HCU_DEEPGEMM_W8A16_PRESHUFFLE":
+        lambda: (os.environ.get("VLLM_HCU_DEEPGEMM_W8A16_PRESHUFFLE", "True").lower() in
+                 ("true", "1")),
+
     # path to the logs of redirect-output, abstrac of related are ok
 
     # If set, vLLM will transpose weight to use nn layout
