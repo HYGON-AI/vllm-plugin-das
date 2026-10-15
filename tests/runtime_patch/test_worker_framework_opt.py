@@ -7,6 +7,7 @@ import ast
 import contextlib
 import dataclasses
 import enum
+import inspect
 import os
 import subprocess
 import sys
@@ -28,6 +29,7 @@ from vllm_hcu.patch.worker.framework_opt import (
     patch_dp_utils,
     patch_draft_speculator_inputs,
     patch_eagle_utils,
+    patch_eplb_communicator,
     patch_forward_context,
     patch_gpu_ubatch_wrapper,
     patch_llm_base_proposer,
@@ -35,6 +37,62 @@ from vllm_hcu.patch.worker.framework_opt import (
     patch_pynccl_wrapper,
     patch_ubatch_utils,
 )
+
+
+def test_gloo_eplb_communicator_preserves_profile_buffer_reservation() -> None:
+    class EplbCommunicator:
+        @property
+        def needs_profile_buffer_reservation(self) -> bool:
+            return True
+
+    class TorchDistGlooStagedEplbCommunicator(EplbCommunicator):
+        pass
+
+    module = _module(
+        patch_eplb_communicator.TARGET_MODULE,
+        EplbCommunicator=EplbCommunicator,
+        TorchDistGlooStagedEplbCommunicator=(
+            TorchDistGlooStagedEplbCommunicator
+        ),
+    )
+    assert patch_eplb_communicator.apply_to_module(module)
+
+    communicator = object.__new__(TorchDistGlooStagedEplbCommunicator)
+    assert communicator.needs_profile_buffer_reservation
+    setattr(
+        communicator,
+        patch_eplb_communicator.STATIC_MODE_MARKER,
+        True,
+    )
+    assert not communicator.needs_profile_buffer_reservation
+
+
+def test_gloo_eplb_communicator_rejects_stale_property_marker() -> None:
+    class EplbCommunicator:
+        @property
+        def needs_profile_buffer_reservation(self) -> bool:
+            return True
+
+    class TorchDistGlooStagedEplbCommunicator(EplbCommunicator):
+        pass
+
+    module = _module(
+        patch_eplb_communicator.TARGET_MODULE,
+        EplbCommunicator=EplbCommunicator,
+        TorchDistGlooStagedEplbCommunicator=(
+            TorchDistGlooStagedEplbCommunicator
+        ),
+    )
+    patch_eplb_communicator.apply_to_module(module)
+    TorchDistGlooStagedEplbCommunicator.needs_profile_buffer_reservation = (
+        EplbCommunicator.needs_profile_buffer_reservation
+    )
+
+    with pytest.raises(
+        patch_eplb_communicator.PatchCompatibilityError,
+        match="stale",
+    ):
+        patch_eplb_communicator.apply_to_module(module)
 
 
 def _module(name: str, **attributes: object) -> ModuleType:
@@ -1191,6 +1249,64 @@ def test_dp_coordination_deepep_low_latency_and_feature_off_delegation():
     assert calls == [(4, normal)]
 
 
+def test_gpu_dp_upstream_selects_dbo_for_fixed_deepep_low_latency(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    from vllm.config.compilation import CUDAGraphMode
+    from vllm.v1.worker.gpu import dp_utils as upstream
+    from vllm.v1.worker.gpu.cudagraph_utils import BatchExecutionDescriptor
+
+    def all_reduce(tensor, group):
+        assert group == "cpu-group"
+        tensor[0].fill_(4)
+        tensor[1].fill_(CUDAGraphMode.NONE.value)
+        tensor[2].zero_()
+        tensor[3].fill_(-1)
+        tensor[4].fill_(1)
+        tensor[5].fill_(2)
+
+    monkeypatch.setattr(
+        upstream,
+        "get_dp_group",
+        lambda: SimpleNamespace(cpu_group="cpu-group"),
+    )
+    monkeypatch.setattr(upstream.dist, "all_reduce", all_reduce)
+    parallel_config = SimpleNamespace(
+        all2all_backend="deepep_low_latency",
+        enable_dbo=True,
+        use_ubatching=True,
+        num_ubatches=2,
+        dbo_decode_token_threshold=2,
+        dbo_prefill_token_threshold=2,
+    )
+    desired = BatchExecutionDescriptor(
+        cg_mode=CUDAGraphMode.NONE,
+        num_tokens=4,
+        num_reqs=2,
+    )
+
+    synced, state = inspect.unwrap(
+        upstream.sync_cudagraph_and_dp_padding
+    )(
+        None,
+        desired,
+        4,
+        2,
+        None,
+        8,
+        0,
+        parallel_config=parallel_config,
+        allow_ubatching=True,
+    )
+
+    assert synced.cg_mode == CUDAGraphMode.NONE
+    assert synced.num_tokens == 4
+    assert synced.num_ubatches == 2
+    assert state is not None
+    assert state.eager is True
+    assert state.num_tokens_across_dp.tolist() == [4] * 8
+
+
 def test_draft_speculator_sampling_inputs_copy_async_and_preserve_padding():
     class _Buffer:
         def copy_(self, other, *, non_blocking=False):
@@ -1990,7 +2106,8 @@ from vllm_hcu.patch.worker.framework_opt import (
 )
 adapters = (
     patch_all2all, patch_base_device_communicator, patch_forward_context,
-    patch_llm_base_proposer, patch_dp_utils, patch_draft_speculator_inputs,
+    patch_llm_base_proposer, patch_dp_utils,
+    patch_draft_speculator_inputs,
     patch_eagle_utils,
     patch_gpu_ubatch_wrapper, patch_ubatch_utils,
 )
