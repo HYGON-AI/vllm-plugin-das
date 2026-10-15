@@ -2,6 +2,7 @@
 """Step5 runtime ownership, adapter lifecycle and CPU behavior contracts."""
 
 import importlib
+from pathlib import Path
 from types import ModuleType, SimpleNamespace
 from typing import Literal
 import numpy as np
@@ -241,12 +242,15 @@ def test_eplb_uses_each_layers_weight_format(monkeypatch):
 def test_step5_projection_and_attention_modules_have_plugin_ownership():
     import subprocess, sys, json, os
 
+    # Initialize vLLM before HCU registration to avoid cold import cycles.
     code = (
-        "import json;from vllm_hcu import hcu_platform_register_model;"
+        "import json;import vllm;import vllm_hcu;"
+        "from vllm_hcu import hcu_platform_register_model;"
         "hcu_platform_register_model();"
         "from vllm.model_executor.models.step5_text import Step5ForCausalLM;"
         "from vllm.model_executor.layers import step4_dsa;"
-        "print(json.dumps([Step5ForCausalLM.__module__,step4_dsa.__file__]))"
+        "print(json.dumps([Step5ForCausalLM.__module__,"
+        "step4_dsa.__file__,vllm_hcu.__file__]))"
     )
     result = subprocess.run(
         [sys.executable, "-c", code],
@@ -256,9 +260,10 @@ def test_step5_projection_and_attention_modules_have_plugin_ownership():
         timeout=90,
     )
     assert result.returncode == 0, result.stdout + result.stderr
-    model, backend = json.loads(result.stdout.splitlines()[-1])
+    model, backend, plugin = json.loads(result.stdout.splitlines()[-1])
     assert model == "vllm_hcu.models.step5_text"
-    assert backend.startswith("/workspace/vllm-plugin-das/vllm_hcu/")
+    plugin_root = Path(plugin).resolve().parent
+    assert Path(backend).resolve().is_relative_to(plugin_root), backend
 
 
 def test_ep_capture_scopes_ep_buffers_and_keeps_export_identity():
