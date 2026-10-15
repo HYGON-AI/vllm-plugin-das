@@ -27,6 +27,25 @@ concurrency:
   cancel-in-progress: false
 
 jobs:
+  dispatch-v0281-nightly:
+    if: ${{ github.event_name == 'schedule' }}
+    runs-on: bw1100
+    permissions:
+      contents: read
+      actions: write
+    env:
+      REPO: ${{ github.repository }}
+      TARGET_REF: v0.28.1-dev
+    steps:
+      - name: Dispatch v0.28.1 nightly
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: >-
+          gh workflow run nightly-hcu.yml
+          --repo "$REPO"
+          --ref "$TARGET_REF"
+          -f ref="$TARGET_REF"
+
   prepare:
     runs-on:
       - self-hosted
