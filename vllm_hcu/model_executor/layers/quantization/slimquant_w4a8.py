@@ -294,8 +294,10 @@ class SlimQuantW4A8Int8AiterMoEMethod(FusedMoEMethodBase):
         """
         from vllm_hcu.platforms import envs as henvs
 
+        # Follows the HCU custom-op master switch: VLLM_HCU_USE_CUSTOM_OPS=1
+        # (default) quantizes before the all-gather; 0 gathers BF16 instead.
         if (
-            not henvs.VLLM_HCU_MOE_PREQUANT_DISPATCH
+            not henvs.custom_ops_enabled()
             or self.moe_kernel is not None
             or getattr(layer, "_hcu_slimquant_post_load_aiter_config", None) is None
         ):

@@ -87,7 +87,7 @@ def _method(slimquant_w4a8: ModuleType, moe_kernel: object | None = None):
 def test_moe_c_layer_quantizes_dispatch_input_by_default(
     monkeypatch: pytest.MonkeyPatch, slimquant_w4a8: ModuleType
 ) -> None:
-    monkeypatch.delenv("VLLM_HCU_MOE_PREQUANT_DISPATCH", raising=False)
+    monkeypatch.delenv("VLLM_HCU_USE_CUSTOM_OPS", raising=False)
     calls = _install_quant(monkeypatch)
     layer = SimpleNamespace(_hcu_slimquant_post_load_aiter_config=object())
     x = torch.ones(3, 4, dtype=torch.bfloat16)
@@ -102,7 +102,7 @@ def test_moe_c_layer_quantizes_dispatch_input_by_default(
 @pytest.mark.parametrize(
     ("env", "config", "moe_kernel"),
     [
-        ("0", object(), None),  # switch off
+        ("0", object(), None),  # custom-op master switch off
         ("1", None, None),  # native layout: vLLM/Triton route needs BF16
         ("1", object(), object()),  # deepep_auto modular kernel
     ],
@@ -114,7 +114,7 @@ def test_non_moe_c_layers_keep_bf16_dispatch(
     config: object | None,
     moe_kernel: object | None,
 ) -> None:
-    monkeypatch.setenv("VLLM_HCU_MOE_PREQUANT_DISPATCH", env)
+    monkeypatch.setenv("VLLM_HCU_USE_CUSTOM_OPS", env)
     calls = _install_quant(monkeypatch)
     layer = SimpleNamespace(_hcu_slimquant_post_load_aiter_config=config)
 
@@ -380,7 +380,7 @@ def test_runner_gathers_int8_and_scale(
                 quantize_dispatch_input=lambda layer, x: None,
             ),
             True,
-        ),  # hook declines (native layout, switch off)
+        ),  # hook declines (native layout / master off)
         (2, 1, _PrequantMethod(), False),  # preselected routing guard owns it
     ],
 )
