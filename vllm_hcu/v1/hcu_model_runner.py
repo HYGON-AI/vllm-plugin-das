@@ -7390,8 +7390,20 @@ class GPUModelRunner(
             cache size of each layer
         """
         kv_cache_config = deepcopy(kv_cache_config)
+        # Rank-local owned+scratch offsets before allocate (SGLang remote
+        # scratch).
+        from vllm_hcu.v1.dsa_cache_layer_split import (
+            install_runtime_layer_split_state,
+            maybe_log_runtime_layer_shard_plan,
+            remap_packed_kv_tensor_offsets,
+        )
+
+        install_runtime_layer_split_state(self.vllm_config)
+        remap_packed_kv_tensor_offsets(kv_cache_config, self.vllm_config)
         self.kv_cache_config = kv_cache_config
         self._mamba_copy_bufs = None
+        # Log SGLang-style PCP layer ownership once KV init runs.
+        maybe_log_runtime_layer_shard_plan(self.vllm_config)
         self.may_add_encoder_only_layers_to_kv_cache_config()
         self.maybe_add_kv_sharing_layers_to_kv_cache_groups(kv_cache_config)
         self.initialize_attn_backend(kv_cache_config, is_profiling=is_profiling)
