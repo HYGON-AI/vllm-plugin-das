@@ -16,10 +16,14 @@ TARGETS = (
     "vllm.distributed.eplb.eplb_state.EplbState.step",
     "vllm.distributed.eplb.eplb_state.EplbState._propagate_shared_tensors",
     "vllm.distributed.eplb.eplb_state.EplbState.rearrange",
+    "vllm.distributed.eplb.eplb_state._move_to_workspace",
+    "vllm.distributed.eplb.eplb_state.create_eplb_communicator",
 )
 _MARKER = "_vllm_hcu_step5_eplb_state_applied"
 
 SIGNATURES = (
+    (TARGETS[3], ("model_state", "ep_rank")),
+    (TARGETS[4], ("group_coordinator", "backend", "expert_weights", "expert_buffer")),
     (
         "vllm.distributed.eplb.eplb_state.EplbState.step",
         ("self", "is_dummy", "is_profile", "log_stats"),
@@ -34,6 +38,14 @@ SIGNATURES = (
     ),
 )
 REVIEWED_SOURCES = (
+    (
+        TARGETS[4],
+        ("40072a27544d91da0fde0eedec61ba3686fd2726457397110b387581bcd051c3",),
+    ),
+    (
+        TARGETS[3],
+        ("4d024a8b1332524acc9e6af21e71c39aea92915a92811c8d512b6db04d0f8d23",),
+    ),
     (
         "vllm.distributed.eplb.eplb_state.EplbState.step",
         (
@@ -65,14 +77,19 @@ def apply_to_module(module: ModuleType) -> bool:
     require_signatures(target, SIGNATURES, REVIEWED_SOURCES)
     cls = getattr(target, "EplbState", None)
     for name, symbol in zip(
-        ("step", "_propagate_shared_tensors", "rearrange"), TARGETS
+        ("step", "_propagate_shared_tensors", "rearrange"), TARGETS[:3]
     ):
         require_callable(cls, name, symbol)
+    require_callable(target, "_move_to_workspace", TARGETS[3])
+    require_callable(target, "create_eplb_communicator", TARGETS[4])
+    from vllm.distributed.eplb.eplb_communicator import create_eplb_communicator
     from vllm_hcu.distributed import eplb_runtime
 
     cls.step = eplb_runtime.step
     cls._propagate_shared_tensors = eplb_runtime._propagate_shared_tensors
     cls.rearrange = eplb_runtime.rearrange
+    target._move_to_workspace = eplb_runtime._move_to_workspace
+    target.create_eplb_communicator = create_eplb_communicator
     remember_targets(target, _MARKER, TARGETS)
     return True
 

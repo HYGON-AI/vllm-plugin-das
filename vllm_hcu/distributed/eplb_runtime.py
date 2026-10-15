@@ -8,8 +8,8 @@ from vllm.distributed.eplb.eplb_state import (
     EplbStats,
     StatelessGroupCoordinator,
     _commit_eplb_maps,
+    _commit_eplb_maps_for_layer,
     _compute_eplb_load_stats,
-    _move_to_workspace,
     _node_count_with_rank_mapping,
     current_platform,
     get_ep_group,
@@ -19,7 +19,12 @@ from vllm.distributed.eplb.eplb_state import (
     torch,
 )
 
-from vllm_hcu.distributed.eplb_transfer_runtime import rearrange_expert_weights_inplace
+from vllm_hcu.distributed.eplb_buffer_runtime import buffer_signature
+from vllm_hcu.distributed.eplb_transfer_runtime import (
+    BufferedTransferMetadata,
+    move_from_buffer,
+    rearrange_expert_weights_inplace,
+)
 from vllm_hcu.runtime_compat.step5 import is_step5_config
 
 import os
@@ -30,6 +35,38 @@ if TYPE_CHECKING:
 
 _EPLB_TOUCHED_LOAD = os.environ.get("VLLM_EPLB_TOUCHED_LOAD", "0") == "1"
 _EPLB_DUMP_PATH = os.environ.get("VLLM_EPLB_DUMP_PATH", "")
+
+
+def _move_to_workspace(model_state, ep_rank):
+    result = model_state.pending_result
+    assert result is not None
+    weights = model_state.model.expert_weights[result.layer_idx]
+    metadata = result.transfer_metadata
+    if isinstance(metadata, BufferedTransferMetadata):
+        if metadata.layer_idx != result.layer_idx:
+            raise RuntimeError("Async EPLB result belongs to a different layer")
+        layer_buffer = metadata.expert_buffer
+    else:
+        layer_buffer = model_state.expert_buffer
+    if buffer_signature(weights) != buffer_signature(layer_buffer):
+        raise RuntimeError("Async EPLB result has incompatible staging buffers")
+    move_from_buffer(
+        expert_weights=weights,
+        expert_weights_buffers=layer_buffer,
+        transfer_metadata=metadata,
+        new_indices=result.new_physical_to_logical_map.numpy(),
+        ep_rank=ep_rank,
+    )
+    _commit_eplb_maps_for_layer(
+        model_state,
+        new_physical_to_logical_map=result.new_physical_to_logical_map,
+        layer=result.layer_idx,
+    )
+    if result.layer_idx == model_state.model.num_moe_layers - 1:
+        model_state.rebalanced = False
+    # Keep the upstream consume ordering: clear ownership before waking worker.
+    model_state.pending_result = None
+    result.consumed_event.record()
 
 
 def _rank_load_imbalance(

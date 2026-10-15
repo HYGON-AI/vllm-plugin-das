@@ -2,6 +2,7 @@
 """Step5 runtime ownership, adapter lifecycle and CPU behavior contracts."""
 
 import importlib
+import inspect
 from pathlib import Path
 from types import ModuleType, SimpleNamespace
 from typing import Literal
@@ -25,18 +26,42 @@ ADAPTERS = (
     "vllm_hcu.patch.worker.framework_opt.patch_step5_moe_combine",
     "vllm_hcu.patch.worker.framework_opt.patch_step5_token_fp8",
     "vllm_hcu.patch.worker.framework_opt.patch_step5_skinny_lm_head",
+    "vllm_hcu.patch.worker.framework_opt.patch_step5_eplb_communicator",
     "vllm_hcu.patch.worker.framework_opt.patch_step5_eplb_transfer",
+    "vllm_hcu.patch.worker.framework_opt.patch_step5_eplb_async_worker",
     "vllm_hcu.patch.worker.framework_opt.patch_step5_eplb_state",
     "vllm_hcu.patch.worker.framework_opt.patch_step5_deep_gemm_api",
 )
 
 
 @pytest.mark.parametrize("name", ADAPTERS)
-def test_exact_target_and_repeat_application(name):
+def test_exact_target_and_repeat_application(name, request):
     adapter = importlib.import_module(name)
     with pytest.raises(RuntimeError, match="expected module"):
         adapter.apply_to_module(ModuleType("unrelated.module"))
     module = importlib.import_module(adapter.TARGET_MODULE)
+    if adapter.PATCH_ID.startswith("worker.framework_opt.step5_eplb"):
+        # Offline EPLB tests patch the upstream module globals. Restore the
+        # EPLB methods/aliases so those tests do not inherit these replacements.
+        missing = object()
+        originals = []
+        for symbol in (*adapter.TARGETS, f"{module.__name__}.{adapter._MARKER}"):
+            parts = symbol.removeprefix(module.__name__ + ".").split(".")
+            owner = module
+            for part in parts[:-1]:
+                owner = getattr(owner, part)
+            original = inspect.getattr_static(owner, parts[-1], missing)
+            originals.append((owner, parts[-1], original))
+
+        def restore():
+            for owner, attribute, original in reversed(originals):
+                if original is missing:
+                    if hasattr(owner, attribute):
+                        delattr(owner, attribute)
+                else:
+                    setattr(owner, attribute, original)
+
+        request.addfinalizer(restore)
     adapter.apply_to_module(module)
     from vllm_hcu.runtime_compat.step5_patch_contract import resolve
 
