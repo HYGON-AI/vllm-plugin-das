@@ -5,6 +5,7 @@ import pytest
 import torch
 
 from vllm_hcu.v1.attention.ops import deepseek_v41_flashmla_decode as runtime
+from vllm_hcu.v1.attention.ops.deepseek_v41_flashmla_metadata import DecodeScheduler
 
 pytestmark = pytest.mark.hcu
 
@@ -59,7 +60,8 @@ def live(monkeypatch):
 @pytest.mark.parametrize("page", [None, 32, 64])
 @pytest.mark.parametrize("batch", [1, 3])
 @pytest.mark.parametrize("swa_page", [32, 64])
-def test_actual_writer_three_cache_types(live, heads, page, batch, swa_page):
+@pytest.mark.parametrize("managed", [False, True])
+def test_actual_writer_three_cache_types(live, heads, page, batch, swa_page, managed):
     torch.manual_seed(1234)
     q = torch.randn(batch, heads, 512, device="cuda", dtype=torch.bfloat16) * 0.2
     main_cache, main_values = make_cache(swa_page)
@@ -79,6 +81,8 @@ def test_actual_writer_three_cache_types(live, heads, page, batch, swa_page):
         head_dim=512, nope_head_dim=448, rope_head_dim=64,
         scheduler=runtime._decode_bindings()[2]()[0],
     )
+    if managed:
+        args["scheduler"] = DecodeScheduler(runtime._decode_bindings()[2])
     columns = torch.arange(128, device="cuda")
     ref_indices = torch.where(columns[None, :] < swa_lens[:, None], swa_indices, -1)
     values = main_values

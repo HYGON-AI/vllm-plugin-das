@@ -20,6 +20,10 @@ from ._common import (
 )
 from vllm_hcu.platforms import envs as henvs
 from vllm_hcu.v1.attention.ops import deepseek_v41_flashmla_decode as runtime
+from vllm_hcu.v1.attention.ops.deepseek_v41_flashmla_metadata import (
+    SCHEDULERS_ATTR,
+    decode_context_supported,
+)
 
 TARGET_MODULE = "vllm.models.deepseek_v41.amd.rocm"
 PATCH_ID = "worker.op_opt.deepseek_v41.flashmla_sparse_decode"
@@ -31,21 +35,20 @@ _MARKER = "_vllm_hcu_dsv41_flashmla_decode_applied"
 _WRAPPER = "_vllm_hcu_dsv41_flashmla_decode_wrapper"
 _INIT_WRAPPER = "_vllm_hcu_dsv41_flashmla_decode_init_wrapper"
 _CONTEXT_FLAG = "_vllm_hcu_flashmla_decode_context_supported"
+_SPECULATIVE_FLAG = "_vllm_hcu_flashmla_decode_speculative_context"
 
 
 def _config_supported(config) -> bool:
-    parallel = config.parallel_config
-    return (
-        parallel.decode_context_parallel_size == 1
-        and parallel.prefill_context_parallel_size == 1
-        and config.speculative_config is None
-    )
+    return decode_context_supported(config)
 
 
 def _context_supported(attention) -> bool:
     # MRV2 executes warmup and regular forwards without a process-global
     # set_current_vllm_config context. Topology/speculation are init invariants.
-    return getattr(attention, _CONTEXT_FLAG, False)
+    return getattr(attention, _CONTEXT_FLAG, False) and (
+        not getattr(attention, _SPECULATIVE_FLAG, False)
+        or henvs.dsv41_flashmla_dspark_enabled()
+    )
 
 
 def apply_to_module(module: ModuleType) -> bool:
@@ -73,12 +76,19 @@ def apply_to_module(module: ModuleType) -> bool:
         config = args[0] if args else kwargs["vllm_config"]
         original_init(self, *args, **kwargs)
         setattr(self, _CONTEXT_FLAG, _config_supported(config))
+        setattr(self, _SPECULATIVE_FLAG, config.speculative_config is not None)
 
     @functools.wraps(original)
     def decode(self, q, kv_cache, swa_metadata, attn_metadata, swa_only, output):
         if henvs.dsv41_flashmla_decode_enabled():
             if _context_supported(self) and self.compress_ratio in (0, 1, 2):
                 scheduler_name = "tile_sched_swaonly" if swa_only else {1: "tile_sched_c1a", 2: "tile_sched_c2a"}.get(self.compress_ratio)
+                schedulers = getattr(swa_metadata, SCHEDULERS_ATTR, None)
+                scheduler = (
+                    getattr(swa_metadata, scheduler_name, None)
+                    if schedulers is None
+                    else schedulers.get(getattr(self.swa_cache_layer, "prefix", None))
+                )
                 num_tokens = swa_metadata.num_decode_tokens
                 source = None if swa_only else self.topk_indices_buffer
                 if swa_only or (
@@ -95,7 +105,7 @@ def apply_to_module(module: ModuleType) -> bool:
                             kv_cache=None if swa_only else kv_cache,
                             swa_indices=swa_metadata.decode_swa_indices,
                             swa_lens=swa_metadata.decode_swa_lens,
-                            scheduler=getattr(swa_metadata, scheduler_name, None),
+                            scheduler=scheduler,
                             scale=self.scale,
                             attn_sink=self.attn_sink,
                             output=output_buffer,

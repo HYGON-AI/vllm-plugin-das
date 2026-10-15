@@ -1,6 +1,6 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright (c) 2026 Hygon Information Technology Co., Ltd.
-"""Default-on eager V4.1 decode over the existing packed FP8 caches.
+"""Default-on V4.1 decode over the existing packed FP8 caches.
 
 Keep KV writers and source-layer selection in the model. Map local top-k to
 dense physical indices with the model's audited utility, without KV gathering.
@@ -16,6 +16,7 @@ import logging
 import torch
 
 from vllm_hcu.platforms import envs as henvs
+from vllm_hcu.v1.attention.ops.deepseek_v41_flashmla_metadata import DecodeScheduler
 
 logger = logging.getLogger(__name__)
 _SUPPORTED_ARCHES = frozenset({"gfx938"})
@@ -114,13 +115,19 @@ def try_flashmla_decode(
     """Write caller-owned output on selection; leave it untouched on fallback."""
     if not henvs.dsv41_flashmla_decode_enabled():
         return False
+    managed_spec = isinstance(scheduler, DecodeScheduler) and scheduler.speculative
+    supported_query = max_decode_query_len == 1 or (
+        managed_spec and henvs.dsv41_flashmla_dspark_enabled()
+        and 1 <= max_decode_query_len <= scheduler.query_limit
+    )
     if (
-        max_decode_query_len != 1
+        not supported_query
+        or (managed_spec and not henvs.dsv41_flashmla_dspark_enabled())
         or kv_cache_dtype != "fp8_ds_mla"
         or (head_dim, nope_head_dim, rope_head_dim) != (512, 448, 64)
         or scheduler is None
     ):
-        _log_fallback("only single-token D512 packed-FP8 decode with scheduler is validated")
+        _log_fallback("decode needs supported query rows, D512 packed FP8 and scheduler")
         return False
     if (
         q.ndim != 3 or q.shape[0] == 0 or q.shape[1] not in (64, 128)
@@ -170,14 +177,21 @@ def try_flashmla_decode(
     if not _supported_device(q):
         _log_fallback("only gfx938 decode is validated")
         return False
-    if torch.cuda.is_current_stream_capturing():
-        _log_fallback("decode graph capture is not yet validated")
+    if torch.cuda.is_current_stream_capturing() and not (
+        henvs.dsv41_flashmla_decode_graph_enabled()
+        and isinstance(scheduler, DecodeScheduler) and scheduler.allow_graph
+    ):
+        _log_fallback("decode capture needs opt-in and a framework-owned fresh plan")
         return False
     bindings = _decode_bindings()
     if bindings is None:
         _log_fallback("native FlashMLA decode unavailable")
         return False
     kernel, map_indices, get_metadata = bindings
+    # Framework metadata owns per-layer leases. Raw holders remain supported
+    # for standalone callers and pre-patch metadata; never initialize a shared
+    # per-type holder in place. Consume only after every fallback check passes.
+    plan = scheduler.take() if isinstance(scheduler, DecodeScheduler) else get_metadata()[0]
     extra_indices, extra_lens = None, None
     if kv_cache is not None:
         extra_indices, extra_lens = map_indices(
@@ -199,12 +213,13 @@ def try_flashmla_decode(
         columns[None, None, :] < swa_lens[:, None, None], main_indices, -1,
     )
     result, _ = kernel(
+        # One native batch row per query token, including DSpark verify/draft.
+        # Non-causal future visibility is already encoded in the SWA indices;
+        # never impose a triangular mask or regroup rows by request here.
         q=q.unsqueeze(1), k_cache=swa_cache.unsqueeze(-2),
         block_table=None, cache_seqlens=None, head_dim_v=512,
-        # Lengths may differ across source layers even with equal shapes. The
-        # native contract forbids plan reuse in that case. Keep per-call plans
-        # until source-aware reuse has independent correctness evidence.
-        tile_scheduler_metadata=get_metadata()[0], softmax_scale=scale,
+        # A fresh per-invocation plan is required even for equal-shaped layers.
+        tile_scheduler_metadata=plan, softmax_scale=scale,
         is_fp8_kvcache=True, indices=main_indices,
         topk_length=swa_lens.contiguous(),
         attn_sink=None if attn_sink is None else attn_sink[:q.shape[1]].contiguous(),
