@@ -16,8 +16,18 @@ copies.
 This patch swaps in an alternate ``fused_recurrent_kda`` that forwards
 per-token strides into a (locally defined) copy of the Triton kernel and
 skips the copy for any input whose (head, dim) layout is already dense.
-Gated by VLLM_HCU_GLM5NEXT_KDA_STRIDED_INPUTS (default off); when disabled
-this is a no-op passthrough to the target implementation.
+Gated by VLLM_HCU_GLM5NEXT_KDA_STRIDED_INPUTS, consulted once at patch-apply
+time (default off); when the switch is off the target module is left
+untouched, so the default path keeps the original function object with no
+wrapper indirection.
+
+The Triton kernel below is copied from
+``vllm.models.glm5next.nvidia.ops.third_party.kda.fused_recurrent`` /
+``kernels`` as of vLLM 0.28.1+das (upstream flash-linear-attention, Songlin
+Yang, Yu Zhang), with per-token stride parameters added. If the upstream
+``fused_recurrent_gated_delta_rule_fwd_kernel`` or ``fused_recurrent_kda_fwd``
+changes, this copy must be re-synced manually; ``require_exact_signature``
+below only guards the Python wrapper signature, not the kernel body.
 """
 
 from __future__ import annotations
@@ -34,6 +44,7 @@ from ._common import (
     already_applied,
     load_exact_module,
     require_callable,
+    require_exact_signature,
 )
 
 TARGET_MODULE = "vllm.models.glm5next.nvidia.kda"
@@ -41,12 +52,6 @@ PATCH_ID = "worker.op_opt.glm5next_kda_strided_recurrent"
 TARGETS = (f"{TARGET_MODULE}.fused_recurrent_kda",)
 _MARKER = "_vllm_hcu_glm5next_kda_strided_recurrent_applied"
 _WRAPPER = "_vllm_hcu_glm5next_kda_strided_recurrent_wrapper"
-
-
-def _enabled() -> bool:
-    from vllm_hcu.platforms import envs as henvs
-
-    return bool(henvs.VLLM_HCU_GLM5NEXT_KDA_STRIDED_INPUTS)
 
 
 def _inner_dense(x: torch.Tensor) -> bool:
@@ -106,7 +111,12 @@ def _strided_fused_recurrent_gated_delta_rule_fwd_kernel(
     stride_indices_seq: tl.constexpr,
     stride_indices_tok: tl.constexpr,
     # Per-token strides (in elements) of the inputs. Runtime args, not
-    # constexpr, so different strides don't trigger recompiles.
+    # constexpr. Triton still specializes integer args on ==1 / %16
+    # alignment, so distinct stride classes compile separate variants; for a
+    # given model the stride set is small and fixed (the conv-split and
+    # contiguous layouts), so this is bounded at a handful of compiles.
+    # Deliberately NOT in do_not_specialize: that changes codegen enough to
+    # lose bit-exactness with the upstream kernel (~1 fp32 ulp).
     stride_q,
     stride_k,
     stride_v,
@@ -357,6 +367,54 @@ def apply_to_module(module: ModuleType) -> bool:
     if already_applied(kda, _MARKER, wrapped):
         return False
     original = require_callable(kda, "fused_recurrent_kda", TARGETS[0])
+    require_exact_signature(
+        original,
+        TARGETS[0],
+        positional=(
+            "q",
+            "k",
+            "v",
+            "g",
+            "beta",
+            "scale",
+            "initial_state",
+            "inplace_final_state",
+            "use_qk_l2norm_in_kernel",
+            "cu_seqlens",
+            "ssm_state_indices",
+            "num_accepted_tokens",
+            "out",
+            "sigmoid_beta",
+            "a_log",
+            "g_bias",
+            "compute_gate",
+            "lower_bound",
+        ),
+        defaults={
+            "beta": None,
+            "scale": None,
+            "initial_state": None,
+            "inplace_final_state": True,
+            "use_qk_l2norm_in_kernel": True,
+            "cu_seqlens": None,
+            "ssm_state_indices": None,
+            "num_accepted_tokens": None,
+            "out": None,
+            "sigmoid_beta": False,
+            "a_log": None,
+            "g_bias": None,
+            "compute_gate": False,
+            "lower_bound": -5.0,
+        },
+        var_keyword="kwargs",
+    )
+
+    import vllm_hcu.platforms.envs as henvs
+
+    if not henvs.VLLM_HCU_GLM5NEXT_KDA_STRIDED_INPUTS:
+        # Opt-in only: leave the target untouched so the default path has
+        # no wrapper indirection or per-call environment lookups.
+        return False
 
     @functools.wraps(original)
     def hcu_fused_recurrent_kda(
@@ -380,7 +438,10 @@ def apply_to_module(module: ModuleType) -> bool:
         lower_bound=-5.0,
         **kwargs,
     ):
-        if not _enabled():
+        if kwargs:
+            # Unknown extra arguments (e.g. added by a future vLLM); the
+            # strided copy does not know how to honor them, so defer to the
+            # original implementation instead of silently dropping them.
             return original(
                 q, k, v, g,
                 beta=beta, scale=scale, initial_state=initial_state,

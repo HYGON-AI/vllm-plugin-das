@@ -606,9 +606,11 @@ hcu_vllm_environment_variables: dict[str, Callable[[], Any]] = {
 
     # Route the RMSNorm applied after the mHC pre/fused-post-pre kernels
     # through aten's single fused rms_norm kernel instead of
-    # vllm.ir.ops.rms_norm's native implementation, which decomposes into
-    # 8 elementwise/reduce kernels when no fused IR provider is registered
-    # (the case on HCU). See patch_mhc_backend.py.
+    # vllm.ir.ops.rms_norm's native implementation (8 elementwise/reduce
+    # kernels when no fused IR provider is registered, the case on HCU).
+    # Affects every model on the native mHC fallback path (GLM5Next,
+    # DeepSeek V4, ...); consulted once at patch-apply time. See
+    # patch_mhc_fused_rmsnorm.py.
     "VLLM_HCU_MHC_FUSED_RMSNORM":
         lambda: (os.environ.get("VLLM_HCU_MHC_FUSED_RMSNORM", "False").lower() in
                     ("true", "1")),
@@ -618,7 +620,8 @@ hcu_vllm_environment_variables: dict[str, Callable[[], Any]] = {
     # by passing per-token strides into the kernel instead. On the decode and
     # spec-verify paths q/k/v are non-contiguous views split out of the merged
     # qkv causal-conv1d output, so this removes 4-5 elementwise copy kernels
-    # per step. See patch_glm5next_kda_strided_recurrent.py.
+    # per step. Consulted once at patch-apply time. See
+    # patch_glm5next_kda_strided_recurrent.py.
     "VLLM_HCU_GLM5NEXT_KDA_STRIDED_INPUTS":
         lambda: (os.environ.get("VLLM_HCU_GLM5NEXT_KDA_STRIDED_INPUTS", "False").lower() in
                     ("true", "1")),
