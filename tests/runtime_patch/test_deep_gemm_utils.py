@@ -134,9 +134,10 @@ def _load_deep_gemm_apply():
     namespace: dict[str, object] = {
         "torch": torch,
         "mk": SimpleNamespace(ExpertTokensMetadata=object),
-        "MoEActivation": SimpleNamespace(SILU="silu"),
+        "MoEActivation": SimpleNamespace(SILU="silu", SWIGLUSTEP="swiglustep"),
         "nullcontext": nullcontext,
         "_HCU_HT_EP_TOKEN_ALIGNMENT": 256,
+        "_EP_FUSED_MOE": False,
         "compute_aligned_M_and_alignment": lambda **_kwargs: (2, 256),
         "get_mk_alignment_for_contiguous_layout": lambda: (128, 128),
         "_resize_cache": lambda tensor, shape: torch.zeros(

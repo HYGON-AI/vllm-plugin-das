@@ -183,6 +183,9 @@ def pcp_runner_module(monkeypatch: pytest.MonkeyPatch):
     monkeypatch.setitem(sys.modules, pcp_module.__name__, pcp_module)
     monkeypatch.delitem(sys.modules, adapter_name, raising=False)
     adapter_module = importlib.import_module(adapter_name)
+    # The host seq-lens mirror needs real MRV2 runner state (max_num_reqs,
+    # model_state, block-table host mirror); these tests cover the PCP path.
+    monkeypatch.setattr(adapter_module, "_USE_HOST_SEQ_LENS", False)
     yield adapter_module, events
 
 

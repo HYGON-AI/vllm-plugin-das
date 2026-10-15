@@ -5,6 +5,7 @@
 """Attention layer with FlashAttention."""
 
 import copy
+import os
 from dataclasses import dataclass
 from typing import TYPE_CHECKING, ClassVar
 
@@ -31,6 +32,11 @@ from vllm_hcu.v1.attention.backends.fa_utils import (
     is_flash_attn_varlen_func_available,
 )
 from vllm_hcu.v1.attention.kv_cache_layout import get_kv_cache_layout
+from vllm_hcu.v1.attention.backends.swa_decode import (
+    can_use_swa_decode_fp8_d192,
+    swa_decode_fp8_d192,
+    swa_decode_fp8_d192_gate_quant,
+)
 from vllm.v1.attention.backends.utils import get_dcp_local_seq_lens
 from vllm.v1.attention.ops.dcp import (
     cp_lse_ag_out_ar,
@@ -40,8 +46,6 @@ from vllm.v1.attention.ops.dcp import (
 from vllm.v1.attention.ops.merge_attn_states import merge_attn_states
 from vllm.v1.worker.workspace import current_workspace_manager
 
-import vllm_hcu.platforms.envs as henvs 
-from vllm.platforms import current_platform
 if is_flash_attn_varlen_func_available():
     from vllm_hcu.v1.attention.backends.fa_utils import (
         flash_attn_supports_sinks,
@@ -49,7 +53,8 @@ if is_flash_attn_varlen_func_available():
         get_scheduler_metadata,
         hg_flash_attn_varlen_func,
         varlen_fwd_unified,
-        hcu_ops,
+        can_use_paged_fp8_d192_fwd,
+        paged_fp8_d192_fwd,
         reshape_and_cache_flash,
     )
 import vllm.envs as envs
@@ -69,7 +74,6 @@ from vllm.v1.attention.backend import (
     CommonAttentionMetadata,
 )
 from vllm.v1.kv_cache_interface import AttentionSpec
-import vllm.envs as envs
 
 logger = init_logger(__name__)
 
@@ -99,6 +103,12 @@ def _split_kv_cache(
 
 if TYPE_CHECKING:
     from vllm_hcu.v1.pcp_manager import PCPPlan
+
+
+# Sliding-window decode (q_len <= 4) on the FP8 D192 cache through the Triton
+# split-KV kernel instead of the cutlass HG prefix kernel (~4x faster, more
+# accurate). VLLM_HCU_SWA_DECODE=0 restores the cutlass path.
+_SWA_DECODE_ENABLED = os.environ.get("VLLM_HCU_SWA_DECODE", "1") == "1"
 
 
 def _get_flash_attn_mode() -> str:
@@ -148,9 +158,17 @@ class HcuFlashAttentionBackend(AttentionBackend):
 
     @staticmethod
     def get_supported_kernel_block_sizes() -> list[int | MultipleOf]:
+        mode = _get_flash_attn_mode()
+        # HCU's paged varlen and CUTLASS kernels require a 64-token page.
+        # This must also constrain sliding-window specs: those specs choose
+        # their own page size from this method instead of cache_config.block_size.
+        if mode in ("varlen", "cutlass"):
+            return [64]
+        # Sliding-window specs query this from get_kv_cache_spec, which runs
+        # outside a set_current_vllm_config() context.
         vllm_config = get_current_vllm_config_or_none()
-        model_config = getattr(vllm_config, "model_config", None)
-        cache_config = getattr(vllm_config, "cache_config", None)
+        model_config = vllm_config.model_config if vllm_config else None
+        cache_config = vllm_config.cache_config if vllm_config else None
         if (
             model_config
             and cache_config
@@ -160,9 +178,6 @@ class HcuFlashAttentionBackend(AttentionBackend):
                 or cache_config.mamba_cache_dtype == "float32"
             )
         ):
-            mode = _get_flash_attn_mode()
-            if mode in ("varlen", "cutlass"):
-                return [64]
             if mode == "classic":
                 return [128]
             # NOTE(tdoublep): while in principle, FA supports
@@ -194,11 +209,14 @@ class HcuFlashAttentionBackend(AttentionBackend):
         return True
 
     @classmethod
-    def supports_sliding_window(cls) -> bool:
+    def supports_non_causal(cls) -> bool:
         return True
 
     @classmethod
-    def supports_non_causal(cls) -> bool:
+    def supports_sliding_window(cls) -> bool:
+        # Every HCU flash_attn entry point takes window_size natively (the
+        # paged decode kernel included), as vllm_hcu_21 relied on. Without
+        # this, sliding-window layers silently fall back to TRITON_ATTN.
         return True
 
     @classmethod
@@ -1004,6 +1022,66 @@ class FlashAttentionImpl(AttentionImpl):
                     attn_metadata.causal,
                 )
                 if _get_flash_attn_mode() == "cutlass":
+                    if (
+                        layer._k_scale_float == 1.0
+                        and layer._v_scale_float == 1.0
+                        and can_use_paged_fp8_d192_fwd(
+                            key_cache,
+                            value_cache,
+                            output,
+                            self.alibi_slopes,
+                            self.logits_soft_cap,
+                            self.sinks,
+                        )
+                    ):
+                        if (
+                            _SWA_DECODE_ENABLED
+                            and layer._q_scale_float == 1.0
+                            and can_use_swa_decode_fp8_d192(
+                                query,
+                                key_cache,
+                                max_seqlen_q,
+                                attn_metadata.causal,
+                                sliding_window_size,
+                                self.sinks,
+                            )
+                        ):
+                            logger.info_once(
+                                "[HCU FLASH_ATTN PATH] swa_decode_fp8_d192 (triton split-KV)",
+                                scope="local",
+                            )
+                            swa_decode_fp8_d192(
+                                query[:num_actual_tokens],
+                                key_cache,
+                                value_cache,
+                                output[:num_actual_tokens],
+                                cu_seqlens_q,
+                                seqused_k,
+                                block_table,
+                                self.scale,
+                                sliding_window_size[0],
+                            )
+                            return output
+                        logger.info_once(
+                            "[HCU FLASH_ATTN PATH] paged_fp8_d192 (HG prefix)",
+                            scope="local",
+                        )
+                        paged_fp8_d192_fwd(
+                            query[:num_actual_tokens],
+                            key_cache,
+                            value_cache,
+                            output[:num_actual_tokens],
+                            cu_seqlens_q,
+                            seqused_k,
+                            block_table,
+                            max_seqlen_q,
+                            max_seqlen_k,
+                            self.scale,
+                            attn_metadata.causal,
+                            sliding_window_size,
+                            self.sinks,
+                        )
+                        return output
                     logger.info_once(
                         "[HCU FLASH_ATTN PATH] unified_flash_attn",
                         scope="local",
@@ -1089,6 +1167,83 @@ class FlashAttentionImpl(AttentionImpl):
             s_aux=self.sinks,
         )
         return output
+
+    def forward_swa_gate_quant(
+        self,
+        layer: torch.nn.Module,
+        query: torch.Tensor,
+        kv_cache: torch.Tensor,
+        attn_metadata: FlashAttentionMetadata,
+        gate: torch.Tensor,
+        xq: torch.Tensor,
+        xs: torch.Tensor,
+    ) -> bool:
+        """Sliding decode with the Step5 epilogue fused into the split combine:
+        writes sigmoid(gate)-scaled, per-token fp8 output (xq, xs) instead of
+        the bf16 attention output. Only where forward() would take the
+        swa_decode_fp8_d192 path; returns False otherwise (nothing written)."""
+        if (
+            attn_metadata.use_cascade
+            or self.dcp_world_size > 1
+            or self.attn_type != AttentionType.DECODER
+            or not _SWA_DECODE_ENABLED
+            or _get_flash_attn_mode() != "cutlass"
+            or layer._q_scale_float != 1.0
+            or layer._k_scale_float != 1.0
+            or layer._v_scale_float != 1.0
+            or not is_quantized_kv_cache(self.kv_cache_dtype)
+        ):
+            return False
+        key_cache, value_cache = _split_kv_cache(kv_cache, query.shape[-1])
+        key_cache = canonicalize_singleton_dim_strides(key_cache)
+        value_cache = canonicalize_singleton_dim_strides(value_cache)
+        dtype = HcuFlashAttentionBackend.get_fp8_dtype_for_flashattn(
+            self.kv_cache_dtype
+        )
+        key_cache = key_cache.view(dtype)
+        value_cache = value_cache.view(dtype)
+        sliding_window_size = _get_native_sliding_window(
+            attn_metadata.sliding_window,
+            self.sliding_window,
+            attn_metadata.causal,
+        )
+        if not (
+            can_use_paged_fp8_d192_fwd(
+                key_cache,
+                value_cache,
+                gate,  # only its dtype is checked: the bf16 output it replaces
+                self.alibi_slopes,
+                self.logits_soft_cap,
+                self.sinks,
+            )
+            and can_use_swa_decode_fp8_d192(
+                query,
+                key_cache,
+                attn_metadata.max_query_len,
+                attn_metadata.causal,
+                sliding_window_size,
+                self.sinks,
+            )
+        ):
+            return False
+        logger.info_once(
+            "[HCU FLASH_ATTN PATH] swa_decode_fp8_d192 + gate/fp8 quant epilogue",
+            scope="local",
+        )
+        swa_decode_fp8_d192_gate_quant(
+            query,
+            key_cache,
+            value_cache,
+            attn_metadata.query_start_loc,
+            attn_metadata.seq_lens,
+            attn_metadata.block_table,
+            self.scale,
+            sliding_window_size[0],
+            gate,
+            xq,
+            xs,
+        )
+        return True
 
     def do_kv_cache_update(
         self,
