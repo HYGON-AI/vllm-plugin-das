@@ -774,8 +774,8 @@ import vllm
 from vllm_hcu.version import __vllm_target_version__
 target_root = Path(os.environ['VLLM_SOURCE_ROOT']).resolve()
 assert Path(vllm.__file__).resolve().is_relative_to(target_root)
-assert Version(vllm.__version__).release[:3] == (0, 28, 1)
-assert Version(__vllm_target_version__).release[:3] == (0, 28, 1)
+assert Version(vllm.__version__).release[:3] == (0, 29, 1)
+assert Version(__vllm_target_version__).release[:3] == (0, 29, 1)
 assert 'VLLM_V0251_SOURCE_ROOT' not in os.environ
 from vllm_hcu.patch.platform.framework_opt import (
     patch_kv_connector_factory, patch_outputs,

@@ -14,6 +14,8 @@ if TYPE_CHECKING:
     VLLM_HCU_USE_FLASH_ATTN_UNIFIED: bool = False
     VLLM_HCU_USE_FLASH_ATTN_VARLEN: bool = True
     VLLM_HCU_USE_FLASHMLA: bool = False
+    VLLM_HCU_DSV41_FLASHMLA_PREFILL: bool = True
+    VLLM_HCU_DSV41_FLASHMLA_DECODE: bool = True
     VLLM_USE_OPT_CAT: bool = False
     VLLM_HCU_USE_CAT_MLA: bool = False
     VLLM_HCU_DISABLE_DSA: bool = False
@@ -111,6 +113,20 @@ def optional_custom_op_enabled(feature_enabled: bool = True) -> bool:
     """
 
     return custom_ops_enabled() and bool(feature_enabled)
+
+
+def dsv41_flashmla_prefill_enabled() -> bool:
+    """Default-on V4.1 native FlashMLA prefill under the custom-op master."""
+    return optional_custom_op_enabled(
+        _environment_flag(os.environ.get("VLLM_HCU_DSV41_FLASHMLA_PREFILL", "True"))
+    )
+
+
+def dsv41_flashmla_decode_enabled() -> bool:
+    """Default-on V4.1 native FlashMLA decode under the custom-op master."""
+    return optional_custom_op_enabled(
+        _environment_flag(os.environ.get("VLLM_HCU_DSV41_FLASHMLA_DECODE", "True"))
+    )
 
 
 def custom_quantization_gemm_enabled() -> bool:
@@ -237,6 +253,9 @@ hcu_vllm_environment_variables: dict[str, Callable[[], Any]] = {
     "VLLM_HCU_USE_FLASHMLA":
     lambda: (os.environ.get("VLLM_HCU_USE_FLASHMLA", "False").lower() in
              ("true", "1")),
+    # Experimental V4.1 prefill only; does not select a global MLA backend.
+    "VLLM_HCU_DSV41_FLASHMLA_PREFILL": dsv41_flashmla_prefill_enabled,
+    "VLLM_HCU_DSV41_FLASHMLA_DECODE": dsv41_flashmla_decode_enabled,
     # vLLM will use use opt cat 
     "VLLM_USE_OPT_CAT":
     lambda: (os.environ.get("VLLM_USE_OPT_CAT", "True").lower() in

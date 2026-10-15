@@ -25,9 +25,9 @@ from vllm_hcu.version import __vllm_target_version__
 REPO = Path(__file__).resolve().parents[2]
 TARGET_RELEASE = Version(__vllm_target_version__).release[:3]
 TARGET_VLLM_ROOT = resolve_target_vllm_root()
-if TARGET_RELEASE != (0, 28, 1):
+if TARGET_RELEASE != (0, 29, 1):
     raise RuntimeError(
-        "worker dispatcher tests require the v0.28.1 target release, got "
+        "worker dispatcher tests require the v0.29.1 target release, got "
         f"{__vllm_target_version__}"
     )
 
