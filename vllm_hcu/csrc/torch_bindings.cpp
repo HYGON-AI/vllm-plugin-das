@@ -62,6 +62,9 @@ TORCH_LIBRARY_EXPAND(TORCH_EXTENSION_NAME, ops) {
       "deepseek_v4_inv_rope(Tensor! rope, Tensor position_ids, "
       "Tensor cos_sin_cache) -> ()");
   ops.impl("deepseek_v4_inv_rope", torch::kCUDA, &deepseek_v4_inv_rope);
+  ops.def(
+      "sigmoid_mul(Tensor gate, Tensor value) -> Tensor");
+  ops.impl("sigmoid_mul", torch::kCUDA, &sigmoid_mul_hcu);
 }
 
 REGISTER_EXTENSION(TORCH_EXTENSION_NAME)

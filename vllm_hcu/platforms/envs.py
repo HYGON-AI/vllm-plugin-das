@@ -28,6 +28,8 @@ if TYPE_CHECKING:
     VLLM_HCU_USE_CUSTOM_TOPK_TOPP_SAMPLER : bool = False
     VLLM_HCU_USE_DEEPGEMM_W8A16_GEMM: bool = True
     VLLM_HCU_DEEPGEMM_W8A16_PRESHUFFLE: bool = True
+    VLLM_HCU_USE_CUSTOM_REARRANGE_MIXED_QKV: bool = True
+    VLLM_HCU_USE_CUSTOM_STRIDED_Z: bool = True
     VLLM_HCU_USE_CUSTOM_RMS_NORM : bool = False
     VLLM_HCU_USE_CUSTOM_AITER_FLA : bool = False
     VLLM_HCU_PP_LAYER_PARTITION_D : Optional[str] = None
@@ -274,6 +276,14 @@ hcu_vllm_environment_variables: dict[str, Callable[[], Any]] = {
     # weights into the marlin layout (WEIGHT_LAYOUT=1) at load time for
     # shapes whose tuned DeepGEMM configs pick that layout. Requires
     # DeepGEMM with the bm32 kernel fix (a325158 "fix:bm32 kernel Bload").
+    "VLLM_HCU_USE_CUSTOM_REARRANGE_MIXED_QKV":
+        lambda: (os.environ.get("VLLM_HCU_USE_CUSTOM_REARRANGE_MIXED_QKV", "True").lower() in
+                 ("true", "1")),
+
+    "VLLM_HCU_USE_CUSTOM_STRIDED_Z":
+        lambda: (os.environ.get("VLLM_HCU_USE_CUSTOM_STRIDED_Z", "True").lower() in
+                 ("true", "1")),
+
     "VLLM_HCU_DEEPGEMM_W8A16_PRESHUFFLE":
         lambda: (os.environ.get("VLLM_HCU_DEEPGEMM_W8A16_PRESHUFFLE", "True").lower() in
                  ("true", "1")),

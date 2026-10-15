@@ -56,3 +56,5 @@ void concat_and_cache_mla_hcu(torch::Tensor& kv_c, torch::Tensor& k_pe,
 void deepseek_v4_inv_rope(torch::Tensor& rope,
                           torch::Tensor const& position_ids,
                           torch::Tensor const& cos_sin_cache);
+
+torch::Tensor sigmoid_mul_hcu(torch::Tensor gate, torch::Tensor value);
