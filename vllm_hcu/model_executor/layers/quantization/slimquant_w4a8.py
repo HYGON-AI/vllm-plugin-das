@@ -280,6 +280,30 @@ class SlimQuantW4A8Int8AiterMoEMethod(FusedMoEMethodBase):
     def is_monolithic(self) -> bool:
         return False
 
+    def quantize_dispatch_input(
+        self,
+        layer: torch.nn.Module,
+        x: torch.Tensor,
+    ) -> tuple[torch.Tensor, torch.Tensor] | None:
+        """Quantize activations to per-token INT8 before naive DP/EP dispatch.
+
+        Per-token quantization is row-local, so quantizing before the
+        all-gather equals AITER quantizing after it.  Only layers installed for
+        AITER MOE_C at load time accept INT8 input; the vLLM/Triton route and
+        deepep_auto return None and keep BF16 dispatch.
+        """
+        from vllm_hcu.platforms import envs as henvs
+
+        if (
+            not henvs.VLLM_HCU_MOE_PREQUANT_DISPATCH
+            or self.moe_kernel is not None
+            or getattr(layer, "_hcu_slimquant_post_load_aiter_config", None) is None
+        ):
+            return None
+        from aiter.fused_moe_c import per_token_quant_int8
+
+        return per_token_quant_int8(x.contiguous())
+
     def create_weights(
         self,
         layer: torch.nn.Module,
@@ -491,9 +515,13 @@ class SlimQuantW4A8Int8AiterMoEMethod(FusedMoEMethodBase):
         topk_ids: torch.Tensor,
         shared_experts: object | None,
         shared_experts_input: torch.Tensor | None,
+        i_q: torch.Tensor | None = None,
+        i_s: torch.Tensor | None = None,
         **_,
     ) -> torch.Tensor | tuple[torch.Tensor, torch.Tensor]:
 
+        if (i_q is None) != (i_s is None):
+            raise ValueError("SlimQuant W4A8 pre-quantized input requires i_q and i_s")
         if x.dim() != 2:
             raise ValueError(
                 "SlimQuant W4A8 AITER Triton MoE expects rank-2 hidden states, "
@@ -522,6 +550,10 @@ class SlimQuantW4A8Int8AiterMoEMethod(FusedMoEMethodBase):
                 getattr(self, "moe", None)
             )
         if uses_deepep_auto:
+            if i_q is not None:
+                raise RuntimeError(
+                    "SlimQuant W4A8 deepep_auto does not accept pre-quantized input"
+                )
             if moe_kernel is None:
                 raise RuntimeError(
                     "SlimQuant W4A8 deepep_auto kernel was not initialized; "
@@ -574,6 +606,19 @@ class SlimQuantW4A8Int8AiterMoEMethod(FusedMoEMethodBase):
             == "triton"
             else moe_runtime.apply_aiter_w4a8_moe
         )
+        if i_q is not None:
+            if operation is not moe_runtime.apply_aiter_w4a8_moe:
+                raise RuntimeError(
+                    "SlimQuant W4A8 pre-quantized input requires the AITER backend"
+                )
+            return operation(
+                self,
+                layer,
+                i_q,
+                topk_weights,
+                topk_ids,
+                a1q_scale=i_s,
+            )
         return operation(
             self,
             layer,

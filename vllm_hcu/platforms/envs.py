@@ -55,6 +55,7 @@ if TYPE_CHECKING:
     VLLM_HCU_ENABLE_DEEPSEEK_V4_C128_COMPRESSOR: bool = True
     VLLM_HCU_ENABLE_DEEPSEEK_V4_CACHE_WINDOW: bool = False
     VLLM_HCU_USE_AITER_W8A8_FP8_MOE: bool = False
+    VLLM_HCU_MOE_PREQUANT_DISPATCH: bool = True
     VLLM_HCU_USE_LIGHTOP_MOE_ALIGN: bool = False
     VLLM_HCU_USE_LIGHTOP_EP_SCATTER: bool = True
     VLLM_HCU_USE_LIGHTOP_PER_TOKEN_QUANT_FP8: bool = False
@@ -470,6 +471,11 @@ hcu_vllm_environment_variables: dict[str, Callable[[], Any]] = {
     "VLLM_HCU_USE_AITER_W8A8_FP8_MOE":
         lambda: (os.environ.get("VLLM_HCU_USE_AITER_W8A8_FP8_MOE", "False").lower() in
                     ("true", "1")),
+    # Quantize SlimQuant W4A8 MoE activations to per-token INT8 before the
+    # naive DP/EP all-gather, instead of gathering BF16 and quantizing after.
+    "VLLM_HCU_MOE_PREQUANT_DISPATCH":
+        lambda: (os.environ.get("VLLM_HCU_MOE_PREQUANT_DISPATCH", "True").lower() in
+                 ("true", "1")),
     "VLLM_HCU_USE_LIGHTOP_MOE_ALIGN":
         lambda: (os.environ.get("VLLM_HCU_USE_LIGHTOP_MOE_ALIGN", "False").lower() in
                     ("true", "1")),

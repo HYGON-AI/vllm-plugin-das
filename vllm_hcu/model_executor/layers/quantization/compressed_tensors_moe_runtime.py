@@ -852,8 +852,29 @@ def apply_aiter_w4a8_moe(
     topk_ids: torch.Tensor,
     *,
     allow_aiter: bool = True,
+    a1q_scale: torch.Tensor | None = None,
 ) -> torch.Tensor:
-    """Route SlimQuant W4A8 through AITER, or vLLM Triton if unsupported."""
+    """Route SlimQuant W4A8 through AITER, or vLLM Triton if unsupported.
+
+    A non-None ``a1q_scale`` marks ``hidden_states`` as per-token INT8
+    activations quantized before naive DP/EP dispatch.  Only the AITER MOE_C
+    route consumes them; the output keeps the MoE input dtype.
+    """
+
+    prequantized = a1q_scale is not None
+    compute_dtype = (
+        getattr(getattr(method, "moe", None), "in_dtype", None)
+        if prequantized
+        else hidden_states.dtype
+    )
+    if prequantized and (
+        hidden_states.dtype != torch.int8
+        or not isinstance(compute_dtype, torch.dtype)
+    ):
+        raise HcuCompressedTensorsMoeError(
+            "Pre-quantized SlimQuant W4A8 input requires INT8 activations and "
+            "a known MoE input dtype"
+        )
 
     if (
         hidden_states.ndim != 2
@@ -931,7 +952,7 @@ def apply_aiter_w4a8_moe(
             K=logical_k,
             top_k=int(topk_ids.shape[1]),
             block_size=0,
-            dtype=hidden_states.dtype,
+            dtype=compute_dtype,
             device=hidden_states.device,
             quant_type=quant_type,
             activation=activation,
@@ -961,6 +982,11 @@ def apply_aiter_w4a8_moe(
     expert_mask = getattr(layer, "expert_mask", None)
     swiglu_limit = getattr(layer, "swiglu_limit", None) or None
     if aiter_config is None:
+        if prequantized:
+            raise HcuCompressedTensorsMoeError(
+                "Pre-quantized SlimQuant W4A8 input requires an AITER MOE_C "
+                "solution"
+            )
         if installed_solution not in (None, "native"):
             raise HcuCompressedTensorsMoeError(
                 "AITER has no MOE_C solution for installed W4A8 weights"
@@ -1034,14 +1060,16 @@ def apply_aiter_w4a8_moe(
         activation=activation,
         w1_scale=prepared_w1_scale,
         w2_scale=prepared_w2_scale,
-        a1_scale=getattr(quant_config, "a1_scale", None),
+        a1_scale=(
+            a1q_scale if prequantized else getattr(quant_config, "a1_scale", None)
+        ),
         a2_scale=getattr(quant_config, "a2_scale", None),
         block_shape=None,
         global_num_experts=int(global_num_experts),
         expert_map=aiter_expert_map,
         routed_scaling_factor=1.0,
         use_weight_shuffle=bool(getattr(aiter_config, "need_shuffle", False)),
-        output_dtype=hidden_states.dtype,
+        output_dtype=compute_dtype,
         gemm1_limit=swiglu_limit,
     )
 

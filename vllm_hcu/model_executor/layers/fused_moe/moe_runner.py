@@ -623,6 +623,7 @@ class MoERunner(MoERunnerInterface):
         scale: torch.Tensor | None = None,
         topk_weights: torch.Tensor | None = None,
         topk_ids: torch.Tensor | None = None,
+        shared_experts_use_quanted: bool = True,
     ) -> tuple[torch.Tensor | None, torch.Tensor]:
         """Run expert routing and the fused MoE kernel via the quant method.
 
@@ -647,9 +648,13 @@ class MoERunner(MoERunnerInterface):
                 f"monolithic quant method {type(self._quant_method).__name__}"
             )
 
+        # Dispatch-quantized inputs cover gathered tokens; shared experts run
+        # on the local shared_experts_input and must not receive them.
         shared_experts_x_and_scale_quanted = (
             (quanted_hidden_states, scale)
-            if quanted_hidden_states is not None and scale is not None
+            if shared_experts_use_quanted
+            and quanted_hidden_states is not None
+            and scale is not None
             else None
         )
         self._maybe_apply_shared_experts(
@@ -915,6 +920,37 @@ class MoERunner(MoERunnerInterface):
 
         return hidden_states, router_logits
 
+    def _maybe_dispatch_prequantized(
+        self,
+        hidden_states: torch.Tensor,
+        router_logits: torch.Tensor | None,
+    ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor] | None:
+        # Quantize before the naive DP/EP all-gather when the quant method
+        # accepts INT8 activations, so the gather moves INT8 plus per-token
+        # scales instead of BF16.  Returns None to keep the BF16 dispatch.
+        if (
+            not self.do_naive_dispatch_combine
+            or self.moe_config.pcp_size > 1
+            or router_logits is None
+        ):
+            return None
+        quantize = getattr(self._quant_method, "quantize_dispatch_input", None)
+        if quantize is None:
+            return None
+        quantized = quantize(self.routed_experts, hidden_states)
+        if quantized is None:
+            return None
+        quanted_hidden_states, scale = quantized
+        quanted_hidden_states, router_logits, extras = (
+            get_ep_group().dispatch_router_logits(
+                quanted_hidden_states,
+                router_logits,
+                self.moe_config.is_sequence_parallel,
+                extra_tensors=[scale],
+            )
+        )
+        return quanted_hidden_states, router_logits, extras[0]
+
     def _maybe_combine(
         self,
         shared_output: torch.Tensor | None,
@@ -1001,10 +1037,18 @@ class MoERunner(MoERunnerInterface):
             # TODO(bnell): parts of the dispatch/combine steps will go away once
             # #32567 lands and the remaining kernels are made MKs.  The PCP
             # code will probably remain
-            hidden_states, router_logits = self._maybe_dispatch(
+            prequantized = self._maybe_dispatch_prequantized(
                 hidden_states,
                 router_logits,
             )
+            if prequantized is not None:
+                hidden_states, router_logits, scale = prequantized
+                quanted_hidden_states = hidden_states
+            else:
+                hidden_states, router_logits = self._maybe_dispatch(
+                    hidden_states,
+                    router_logits,
+                )
 
             shared_output, hidden_states = self._apply_quant_method(
                 hidden_states=hidden_states,
@@ -1015,6 +1059,7 @@ class MoERunner(MoERunnerInterface):
                 scale=scale,
                 topk_weights=topk_weights,
                 topk_ids=topk_ids,
+                shared_experts_use_quanted=prequantized is None,
             )
 
             return self._maybe_combine(
