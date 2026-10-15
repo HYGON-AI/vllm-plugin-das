@@ -31,6 +31,7 @@ def apply_to_module(module: ModuleType) -> bool:
     require_signatures(target, SIGNATURES, REVIEWED_SOURCES)
     import functools
     import os
+    from vllm_hcu.platforms import envs as henvs
 
     cls = getattr(target, "CompilationConfig", None)
     original = require_callable(cls, "set_splitting_ops_for_v1", TARGETS[0])
@@ -44,7 +45,12 @@ def apply_to_module(module: ModuleType) -> bool:
                 ("VLLM_HCU_STEP5_FUSED_GATE", "vllm::step5_swa_attention_gate_quant"),
                 ("VLLM_HCU_STEP5_SWA_FUSED_QK", "vllm::step5_swa_qk_norm_rope_cache"),
             ):
-                if os.environ.get(flag, "0") == "1" and op not in self.splitting_ops:
+                if (
+                    henvs.optional_custom_op_enabled(
+                        os.environ.get(flag, "0") == "1"
+                    )
+                    and op not in self.splitting_ops
+                ):
                     self.splitting_ops.append(op)
         return result
 

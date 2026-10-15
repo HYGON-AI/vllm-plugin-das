@@ -7,6 +7,46 @@ import sys
 import textwrap
 
 import pytest
+import torch
+
+
+class _FakeCudaTensor(torch.Tensor):
+    @property
+    def is_cuda(self):
+        return True
+
+
+def test_router_master_off_uses_eager_fallback_before_triton_import(monkeypatch):
+    """Master-off must use the real eager router even for CUDA-like inputs."""
+    from vllm_hcu.models.step5 import kernels
+
+    monkeypatch.setenv("VLLM_HCU_USE_CUSTOM_OPS", "0")
+
+    def forbidden_import(name):
+        raise AssertionError(f"master-off imported optimized provider {name}")
+
+    monkeypatch.setattr(kernels.importlib, "import_module", forbidden_import)
+    logits_base = torch.tensor([[0.0, 1.0, -1.0]], dtype=torch.float32)
+    logits = logits_base.as_subclass(_FakeCudaTensor)
+    bias = torch.tensor([0.0, 0.2, 0.1], dtype=torch.float32)
+
+    weights, ids = kernels.router_bias_func(
+        torch.empty(1, 1),
+        logits,
+        2,
+        True,
+        router_bias=bias,
+        indices_dtype=torch.int64,
+    )
+
+    scores = logits_base.sigmoid()
+    expected_ids = torch.tensor([[1, 0]], dtype=torch.int64)
+    expected_weights = scores.gather(1, expected_ids)
+    expected_weights /= expected_weights.sum(dim=-1, keepdim=True) + 1e-20
+    assert torch.equal(ids.as_subclass(torch.Tensor), expected_ids)
+    torch.testing.assert_close(
+        weights.as_subclass(torch.Tensor), expected_weights
+    )
 
 
 def test_router_topk_interpreter_matches_reference_and_preserves_padding():

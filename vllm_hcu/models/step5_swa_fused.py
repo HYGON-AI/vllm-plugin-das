@@ -34,9 +34,14 @@ from vllm.utils.torch_utils import (
     _resolve_layer_name,
     direct_register_custom_op,
 )
+from vllm_hcu.platforms import envs as henvs
 
-SWA_FUSED_QK = os.environ.get("VLLM_HCU_STEP5_SWA_FUSED_QK", "0") == "1"
-FUSED_GATE = os.environ.get("VLLM_HCU_STEP5_FUSED_GATE", "0") == "1"
+SWA_FUSED_QK = henvs.optional_custom_op_enabled(
+    os.environ.get("VLLM_HCU_STEP5_SWA_FUSED_QK", "0") == "1"
+)
+FUSED_GATE = henvs.optional_custom_op_enabled(
+    os.environ.get("VLLM_HCU_STEP5_FUSED_GATE", "0") == "1"
+)
 OP_NAME = "step5_swa_qk_norm_rope_cache"
 GATED_OP_NAME = "step5_swa_attention_gate_quant"
 
