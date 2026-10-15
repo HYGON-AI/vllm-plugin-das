@@ -1,6 +1,6 @@
 # HY4 PCP8 and custom-op master validation
 
-Validation date: 2026-10-15 (UTC).
+Validation dates: 2026-10-15 through 2026-10-16 (UTC).
 
 ## Provenance and scope
 
@@ -115,6 +115,46 @@ Retained ignored artifacts:
   `99f74737bc375504ee290777d4dbe852f426dccb3a325f521a02489c8fb33956`
 - `hy4-humaneval16-score.json`, SHA-256
   `1cb99f8fe68225e7382336798d3fe48e9919a714fe09860bb279c884d5b4f8ff`
+
+## Full HumanEval with a 16,384-token client limit
+
+The full 164-problem HumanEval dataset was rerun after the final review fixes
+at plugin commit `3f918f4aa0996e1d91e100aa183ed828b22f451f`. The isolated wheel was
+`vllm_hcu-0.28.1rc1.dev491+das.3f918f4.dtk2604-cp310-cp310-linux_x86_64.whl`
+with SHA-256
+`f888534324322c662e07fdd7cf0e00b1c2f4cadfcc2af1c9855075ee9d9f9c40`.
+
+The server used the same TP1/PCP8/EP8, DeepGEMM, DeepEP high-throughput,
+FP8-KV and MTP3 configuration as above, with `--max-model-len 32768`. Every
+client request set `max_tokens=16384`; the larger server window is required
+because vLLM validates prompt plus requested output tokens. Sixteen requests
+were kept concurrently in flight. The 62,592-token KV cache advertised 1.91x
+maximum concurrency for a full 32,768-token request, so excess long requests
+would queue rather than all occupy their maximum reservation at once.
+
+Generation results:
+
+- 164/164 requests returned HTTP 200 and `finish_reason=stop`; length, abort
+  and error counts were all zero.
+- Generation completed in 201.811 seconds and produced 27,766 tokens. Actual
+  completion lengths were 31–652 tokens (169.3 mean), so no response approached
+  the 16,384-token client cap.
+- EvalScope 1.11.0 `check_correctness` scored **125/164 (76.22%)**. The 39
+  failures were generated-code correctness/syntax failures plus one timeout,
+  not service or length failures.
+- MTP3 remained active for the whole run: 8,629 draft steps accepted 19,171 of
+  25,887 proposed tokens (74.05%), equivalent to a 3.22 mean acceptance length
+  including the target token. Per-position accepted counts were
+  8,629 / 8,629 / 1,913.
+- After shutdown all eight devices returned to 2 MiB used, 0% utilization, and
+  no KFD process.
+
+Retained ignored artifacts:
+
+- `hy4-humaneval164-max16384-c16.json`, SHA-256
+  `28c9b6e2fb0348de6f5f5882b961dc156546f2bf88c912a9ec07ce9a0b1f7eba`
+- `hy4-humaneval164-max16384-c16-score.json`, SHA-256
+  `e0fb6ca75dcd58c73b42ad3b02d51a87aa22a64bb556be3bdb2026507e4a5884`
 
 ## CPU and source-level verification
 
