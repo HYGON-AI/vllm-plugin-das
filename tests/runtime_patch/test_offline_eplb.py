@@ -401,7 +401,109 @@ def test_record_add_starts_new_session_and_discards_stale_proposals(
     assert payload["model_maps"]["GenericMoE"]["record_kind"] == "initial"
 
 
+@pytest.mark.parametrize("contents", [b"malformed", b'{"version": 2}'])
+def test_record_add_rejects_malformed_previous_session_without_overwriting(
+    tmp_path,
+    monkeypatch: pytest.MonkeyPatch,
+    contents: bytes,
+) -> None:
+    fixture = _setup_state(tmp_path, monkeypatch, mode="record")
+    path = tmp_path / "record.json"
+    path.write_bytes(contents)
+
+    with pytest.raises(ValueError, match="malformed|model_maps"):
+        fixture.state.add_model(fixture.model, fixture.model_config)
+
+    assert path.read_bytes() == contents
+
+
 def test_record_proposal_uses_policy_without_transfer_or_live_commit(
+    tmp_path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    fixture = _setup_state(tmp_path, monkeypatch, mode="record")
+    fixture.state.add_model(fixture.model, fixture.model_config)
+    candidate = torch.tensor([[2, 0, 1, 2], [0, 1, 2, 1]])
+    policy_calls = []
+    fixture.state.policy = SimpleNamespace(
+        rebalance_experts=lambda *args: policy_calls.append(args) or candidate
+    )
+    fixture.state.model_states["record-model"].expert_load_window.fill_(1)
+    fixture.state._allreduce_list = lambda values: values
+    _install_cpu_events(monkeypatch)
+
+    fixture.state.rearrange()
+
+    entry = json.loads((tmp_path / "record.json").read_text())["model_maps"][
+        "GenericMoE"
+    ]
+    assert entry["record_kind"] == "proposal"
+    assert entry["physical_to_logical_map"] == candidate.tolist()
+    assert policy_calls
+    assert fixture.transfer_calls == []
+    live = fixture.state.model_states["record-model"]
+    assert live.physical_to_logical_map.tolist() == [[0, 1, 2, 0]] * 2
+    assert fixture.state._vllm_hcu_offline_proposal_events == 1
+    assert fixture.state._vllm_hcu_offline_transfer_events == 0
+    assert fixture.state._vllm_hcu_offline_rearrangement_events == 0
+
+
+def test_record_rocm_low_gain_policy_result_is_still_published(
+    tmp_path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    fixture = _setup_state(tmp_path, monkeypatch, mode="record")
+    fixture.state.add_model(fixture.model, fixture.model_config)
+    live = fixture.state.model_states["record-model"]
+    live.expert_load_window.fill_(1)
+    candidate = live.physical_to_logical_map.cpu().clone()
+    policy_calls = []
+    fixture.state.policy = SimpleNamespace(
+        rebalance_experts=lambda *args: policy_calls.append(args) or candidate
+    )
+    fixture.state._allreduce_list = lambda values: values
+    monkeypatch.setattr(fixture.upstream.current_platform, "is_rocm", lambda: True)
+    _install_cpu_events(monkeypatch)
+
+    fixture.state.rearrange()
+
+    entry = json.loads((tmp_path / "record.json").read_text())["model_maps"][
+        "GenericMoE"
+    ]
+    assert policy_calls
+    assert entry["record_kind"] == "proposal"
+    assert entry["physical_to_logical_map"] == candidate.tolist()
+    assert fixture.state._vllm_hcu_offline_proposal_events == 1
+    assert fixture.transfer_calls == []
+
+
+def test_record_ep_zero_dummy_publishes_globally_nonzero_policy_result(
+    tmp_path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    fixture = _setup_state(tmp_path, monkeypatch, mode="record")
+    fixture.state.add_model(fixture.model, fixture.model_config)
+    candidate = torch.tensor([[2, 0, 1, 2], [0, 1, 2, 1]])
+    fixture.state.policy = SimpleNamespace(rebalance_experts=lambda *args: candidate)
+    fixture.state._allreduce_list = lambda values: [
+        torch.ones_like(value) for value in values
+    ]
+    fixture.state.expert_rearrangement_step = (
+        fixture.state.expert_rearrangement_step_interval - 1
+    )
+    _install_cpu_events(monkeypatch)
+
+    fixture.state.step(is_dummy=True)
+
+    entry = json.loads((tmp_path / "record.json").read_text())["model_maps"][
+        "GenericMoE"
+    ]
+    assert entry["record_kind"] == "proposal"
+    assert entry["physical_to_logical_map"] == candidate.tolist()
+    assert fixture.state._vllm_hcu_offline_proposal_events == 1
+
+
+def test_record_all_zero_global_load_cannot_publish_policy_result(
     tmp_path,
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
@@ -420,15 +522,54 @@ def test_record_proposal_uses_policy_without_transfer_or_live_commit(
     entry = json.loads((tmp_path / "record.json").read_text())["model_maps"][
         "GenericMoE"
     ]
-    assert entry["record_kind"] == "proposal"
-    assert entry["physical_to_logical_map"] == candidate.tolist()
     assert policy_calls
-    assert fixture.transfer_calls == []
-    live = fixture.state.model_states["record-model"]
-    assert live.physical_to_logical_map.tolist() == [[0, 1, 2, 0]] * 2
-    assert fixture.state._vllm_hcu_offline_proposal_events == 1
-    assert fixture.state._vllm_hcu_offline_transfer_events == 0
-    assert fixture.state._vllm_hcu_offline_rearrangement_events == 0
+    assert entry["record_kind"] == "initial"
+    assert fixture.state._vllm_hcu_offline_proposal_events == 0
+
+
+def test_record_multiple_models_keep_policy_results_with_their_owner(
+    tmp_path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    fixture = _setup_state(tmp_path, monkeypatch, mode="record")
+    fixture.state.add_model(fixture.model, fixture.model_config)
+
+    class DraftMoE(GenericMoE):
+        pass
+
+    draft = DraftMoE()
+    for layer in draft.moe_layers:
+        layer.eplb_state = fixture.upstream.EplbLayerState()
+        layer.get_expert_weights = (
+            lambda layer=layer: list(layer.routed_experts.parameters())
+        )
+        layer.set_eplb_state = layer.eplb_state.set_layer_state
+    draft_config = SimpleNamespace(
+        model="generic-test",
+        compute_hash=lambda: "record-draft",
+    )
+    fixture.state.add_model(draft, draft_config)
+    target_candidate = torch.tensor([[2, 0, 1, 2], [0, 1, 2, 1]])
+    draft_candidate = torch.tensor([[1, 2, 0, 1], [2, 1, 0, 2]])
+    candidates = iter((target_candidate, draft_candidate))
+    fixture.state.policy = SimpleNamespace(
+        rebalance_experts=lambda *args: next(candidates)
+    )
+    for live in fixture.state.model_states.values():
+        live.expert_load_window.fill_(1)
+    fixture.state._allreduce_list = lambda values: values
+    _install_cpu_events(monkeypatch)
+
+    fixture.state.rearrange()
+
+    entries = json.loads((tmp_path / "record.json").read_text())["model_maps"]
+    assert entries["GenericMoE"]["physical_to_logical_map"] == (
+        target_candidate.tolist()
+    )
+    assert entries["DraftMoE"]["physical_to_logical_map"] == (
+        draft_candidate.tolist()
+    )
+    assert fixture.state._vllm_hcu_offline_proposal_events == 2
 
 
 def test_record_dummy_and_profile_work_cannot_publish_proposal(

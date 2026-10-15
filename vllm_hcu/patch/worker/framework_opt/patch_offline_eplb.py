@@ -47,11 +47,36 @@ TARGETS += (
 _MARKER = "_vllm_hcu_offline_eplb"
 _OFFLINE_EPLB_FORMAT = "vllm_offline_eplb_physical_to_logical_by_model"
 _RECORD_ONLY = ContextVar("hcu_eplb_record_only", default=False)
-_RECORD_PROPOSAL_ALLOWED = ContextVar(
-    "hcu_eplb_record_proposal_allowed",
-    default=True,
-)
 logger = init_logger("vllm.hcu.offline_eplb")
+
+
+class _RecordOnlyPolicyProxy:
+    """Capture policy outputs without changing the upstream policy contract."""
+
+    def __init__(
+        self,
+        policy: object,
+        captured: list[tuple[torch.Tensor, bool]],
+    ) -> None:
+        self._policy = policy
+        self._captured = captured
+
+    def rebalance_experts(self, *args, **kwargs):
+        candidate = self._policy.rebalance_experts(*args, **kwargs)
+        global_load = args[0] if args else kwargs.get("expert_load")
+        if not isinstance(global_load, torch.Tensor):
+            raise TypeError(
+                "Offline EPLB policy must receive a global load tensor"
+            )
+        if not isinstance(candidate, torch.Tensor):
+            raise TypeError("Offline EPLB policy must return a map tensor")
+        self._captured.append(
+            (candidate, bool(torch.count_nonzero(global_load).item()))
+        )
+        return candidate
+
+    def __getattr__(self, name: str):
+        return getattr(self._policy, name)
 
 
 def _ep_rank() -> int:
@@ -189,6 +214,14 @@ def _start_offline_record_session(path: str | Path) -> None:
     lock_path = output.with_suffix(output.suffix + ".lock")
     with lock_path.open("a", encoding="utf-8") as lock_file:
         fcntl.flock(lock_file, fcntl.LOCK_EX)
+        if output.exists():
+            try:
+                payload = json.loads(output.read_bytes())
+            except (UnicodeDecodeError, json.JSONDecodeError) as exc:
+                raise ValueError(
+                    "Existing offline EPLB record contains malformed JSON"
+                ) from exc
+            _validate_record_payload(payload)
         _write_record_payload(output, _empty_record_payload())
 
 
@@ -538,16 +571,12 @@ def apply_to_module(module) -> bool:
                 is_profile=is_profile,
                 log_stats=log_stats,
             )
-        token = _RECORD_PROPOSAL_ALLOWED.set(not is_dummy and not is_profile)
-        try:
-            return original_step(
-                self,
-                is_dummy=is_dummy,
-                is_profile=is_profile,
-                log_stats=log_stats,
-            )
-        finally:
-            _RECORD_PROPOSAL_ALLOWED.reset(token)
+        return original_step(
+            self,
+            is_dummy=is_dummy,
+            is_profile=is_profile,
+            log_stats=log_stats,
+        )
 
     @functools.wraps(original_rearrange)
     def rearrange(self, is_profile=False, rank_mapping=None):
@@ -571,15 +600,45 @@ def apply_to_module(module) -> bool:
             raise ValueError(
                 "Offline EPLB recording does not support elastic rank mappings"
             )
+        captured: list[tuple[torch.Tensor, bool]] = []
+        original_policy = self.policy
+        self.policy = _RecordOnlyPolicyProxy(original_policy, captured)
         token = _RECORD_ONLY.set(True)
         try:
-            return original_rearrange(
+            result = original_rearrange(
                 self,
                 is_profile=False,
                 rank_mapping=None,
             )
         finally:
             _RECORD_ONLY.reset(token)
+            self.policy = original_policy
+
+        model_states = tuple(self.model_states.values())
+        if len(captured) != len(model_states):
+            raise RuntimeError(
+                "Offline EPLB policy result count does not match model states"
+            )
+        if _ep_rank() == 0:
+            for model_state, (candidate, has_global_load) in zip(
+                model_states,
+                captured,
+            ):
+                if not has_global_load:
+                    continue
+                model = model_state.model
+                record_offline_expert_map(
+                    model_state._hcu_offline_record_path,
+                    model_key=model_state._hcu_offline_model_key,
+                    model_name=model_state.model_name,
+                    model_class=type(model).__name__,
+                    physical_to_logical_map=candidate,
+                    num_logical_experts=model.num_logical_experts,
+                    num_redundant_experts=model.num_redundant_experts,
+                    record_kind="proposal",
+                )
+                self._vllm_hcu_offline_proposal_events += 1
+        return result
 
     @functools.wraps(original_transfer)
     def rearrange_expert_weights_inplace(*args, **kwargs):
@@ -594,20 +653,6 @@ def apply_to_module(module) -> bool:
                 model_state,
                 new_physical_to_logical_map,
             )
-        if not _RECORD_PROPOSAL_ALLOWED.get():
-            return None
-        model = model_state.model
-        record_offline_expert_map(
-            model_state._hcu_offline_record_path,
-            model_key=model_state._hcu_offline_model_key,
-            model_name=model_state.model_name,
-            model_class=type(model).__name__,
-            physical_to_logical_map=new_physical_to_logical_map,
-            num_logical_experts=model.num_logical_experts,
-            num_redundant_experts=model.num_redundant_experts,
-            record_kind="proposal",
-        )
-        model_state._hcu_offline_owner._vllm_hcu_offline_proposal_events += 1
         return None
 
     wrappers = (
