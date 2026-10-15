@@ -1588,7 +1588,6 @@ def rocm_aiter_sparse_attn_indexer_native(
         )
 
         v4_pcp_batch = current_pcp_batch()
-        # Local queries: Q and weights already hold only this rank's rows.
         local_queries = local_queries_enabled(v4_pcp_batch)
         for chunk in prefill_metadata.chunks:
             pcp_rows = None
@@ -1641,18 +1640,16 @@ def rocm_aiter_sparse_attn_indexer_native(
             topk_indices = topk_indices_buffer[
                 chunk.token_start : chunk.token_end, :topk_tokens
             ]
-            if local_queries:
-                q_slice = q_fp8.index_select(0, local_rows).contiguous()
-                weights_slice = weights.index_select(0, local_rows).contiguous()
-            else:
-                q_slice = q_fp8[chunk.token_start : chunk.token_end]
-                weights_slice = weights[chunk.token_start : chunk.token_end]
+            q_slice = q_fp8[chunk.token_start : chunk.token_end]
+            weights_slice = weights[chunk.token_start : chunk.token_end]
             row_starts = chunk.cu_seqlen_ks
             row_ends = chunk.cu_seqlen_ke
             if pcp_rows is not None:
-                if not local_queries:
-                    q_slice = q_slice.index_select(0, pcp_rows).contiguous()
-                    weights_slice = weights_slice.index_select(0, pcp_rows).contiguous()
+                # Local queries: Q and weights already hold only this rank's rows.
+                q_rows, q_src, w_src = ((local_rows, q_fp8, weights) if local_queries
+                                        else (pcp_rows, q_slice, weights_slice))
+                q_slice = q_src.index_select(0, q_rows).contiguous()
+                weights_slice = w_src.index_select(0, q_rows).contiguous()
                 row_starts = row_starts.reshape(-1).index_select(0, pcp_rows)
                 row_ends = row_ends.reshape(-1).index_select(0, pcp_rows)
                 topk_indices = torch.empty(

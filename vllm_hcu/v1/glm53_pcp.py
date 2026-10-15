@@ -31,7 +31,7 @@ class Glm53PCPBatch:
     manager: object
     local_batch: object
     local_indices: torch.Tensor
-    _owned_rows: dict = field(default_factory=dict, repr=False)
+    _query_rows: dict = field(default_factory=dict, repr=False)
 
     @property
     def global_batch(self):
@@ -43,39 +43,23 @@ class Glm53PCPBatch:
     def localize(self, value: torch.Tensor) -> torch.Tensor:
         return value.index_select(0, self.local_indices)
 
-    def owned_rows(self, start: int, end: int) -> torch.Tensor:
-        """Real local token rows within global ``[start, end)``, minus start."""
-        return self.local_query_rows(start, end)[0]
-
-    def local_query_rows(
-        self, start: int, end: int,
-    ) -> tuple[torch.Tensor, torch.Tensor]:
-        """Owned rows within global ``[start, end)`` and their local positions.
-
-        Returns chunk-relative global rows and the matching positions in the
-        padded rank-local layout, in the same order.
-        """
+    def local_query_rows(self, start: int, end: int):
+        """Owned rows in global ``[start, end)`` (minus start) and their
+        positions in the rank-local layout. Built from the CPU layout once per
+        step, so every layer reuses the device indices without a sync."""
         key = (int(start), int(end))
-        rows = self._owned_rows.get(key)
-        if rows is None:
-            # CPU layout only; every layer reuses the cached device indices.
+        if key not in self._query_rows:
             segments = self.manager._local_segments
-            empty = [np.empty(0, dtype=np.int64)]
-            owned = np.concatenate(empty + [
-                np.arange(seg.global_slice.start, seg.global_slice.stop)
-                for seg in segments
-            ])
-            local = np.concatenate(empty + [
-                np.arange(seg.local_slice.start,
-                          seg.local_slice.start + seg.num_actual_tokens)
-                for seg in segments
-            ])
+            owned = np.concatenate([np.arange(seg.global_slice.start, seg.global_slice.stop)
+                                    for seg in segments])
+            local = np.concatenate([np.arange(seg.local_slice.start,
+                                              seg.local_slice.start + seg.num_actual_tokens)
+                                    for seg in segments])
             mask = (owned >= key[0]) & (owned < key[1])
             device = self.local_indices.device
-            rows = (torch.from_numpy(owned[mask] - key[0]).to(device),
-                    torch.from_numpy(local[mask]).to(device))
-            self._owned_rows[key] = rows
-        return rows
+            self._query_rows[key] = (torch.from_numpy(owned[mask] - key[0]).to(device),
+                                     torch.from_numpy(local[mask]).to(device))
+        return self._query_rows[key]
 
 
 _BATCH: ContextVar[Glm53PCPBatch | None] = ContextVar(

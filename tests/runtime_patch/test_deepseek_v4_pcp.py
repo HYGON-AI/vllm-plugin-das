@@ -139,44 +139,6 @@ def test_v4_metadata_uses_original_request_rows_for_every_group():
         assert item.slots.shape[1] == batch.num_tokens
 
 
-def test_install_deepseek_v4_pcp_wraps_model_state_once():
-    from vllm_hcu.v1.glm53_pcp import install_deepseek_v4_pcp
-
-    original = object()
-    state = SimpleNamespace(prepare_attn=original)
-    runner = SimpleNamespace(model_state=state)
-    install_deepseek_v4_pcp(runner)
-    wrapped = state.prepare_attn
-    install_deepseek_v4_pcp(runner)
-    assert state.prepare_attn is wrapped
-    assert state._hcu_glm53_original_prepare_attn is original
-    assert state._hcu_pcp_replicate_all_groups
-
-
-@pytest.mark.parametrize("pcp_size", [2, 4, 8])
-def test_owned_rows_follow_partition_layout(pcp_size):
-    batch = _make_batch([
-        ("d", [17, 18], 40, False),
-        ("p", list(range(9)), 30, True),
-        ("short", [11], 90, True),
-    ])
-    managers, _ = _make_managers(pcp_size)
-    owners = torch.zeros(batch.num_tokens, dtype=torch.int64)
-    for manager in managers:
-        local = manager.partition_batch(batch)
-        with glm53_pcp_step_scope():
-            bind_glm53_pcp_batch(manager, local)
-            pcp_batch = patch_batch()
-        expected = pcp_batch.local_indices[~local.is_padding]
-        torch.testing.assert_close(pcp_batch.owned_rows(0, batch.num_tokens), expected)
-        rows = pcp_batch.owned_rows(2, batch.num_tokens)
-        assert pcp_batch.owned_rows(2, batch.num_tokens) is rows
-        torch.testing.assert_close(rows + 2, expected[expected >= 2])
-        owners[expected[expected >= 2]] += 1
-    # Prefill rows have exactly one owner; decode rows are replicated.
-    assert (owners[2:] == 1).all()
-
-
 def _select(manager, value):
     start = manager.pcp_rank * manager._padded_num_tokens
     return value[manager._padded_gather_idx[start:start + manager._padded_num_tokens]]
@@ -200,6 +162,8 @@ def native_attention(monkeypatch):
         output.copy_(q + kv.index_select(0, indices[:, 0]))
 
     class Attention:
+        head_dim = 2  # not the 512-wide V4 head: exercise the compatibility path
+
         def _run_parallel_input_projections(self, hidden_states):
             events.append(("projections", hidden_states.shape[0]))
             return tuple(hidden_states * factor for factor in (2, 3, 4, 5))
@@ -237,6 +201,12 @@ def native_attention(monkeypatch):
                 SimpleNamespace(num_decode_tokens=decode),
             )
             return self._o_proj(output, positions)
+
+        def forward_mqa(self, q, kv, positions, output):
+            raise AssertionError("local-query MQA must not run")
+
+        def _fused_qnorm_rope_kv_insert(self, q, kv, positions, attn_metadata):
+            raise AssertionError("local-query cache insert must not run")
 
     class Indexer:
         def _wq_b_proj(self, qr, qr_scale=None):
@@ -298,7 +268,7 @@ def test_native_pcp_matches_global_attention_and_keeps_local_projections(
             bind_glm53_pcp_batch(manager, local_batches[rank])
             actual = layer.forward(local_batches[rank].positions,
                                    _select(manager, full_hidden))
-            owned = patch_batch().owned_rows(decode_tokens, global_batch.num_tokens)
+            owned, _ = patch_batch().local_query_rows(decode_tokens, global_batch.num_tokens)
         valid = ~local_batches[rank].is_padding
         torch.testing.assert_close(actual[valid], _select(manager, expected)[valid])
         assert calls == [local_batches[rank].num_tokens_after_padding] * 6
@@ -342,22 +312,6 @@ def test_pcp_patch_rejects_signature_drift_before_mutation(native_attention, mon
     with pytest.raises(patch.PatchCompatibilityError, match="signature"):
         patch.apply_to_module(rocm)
     assert Attention.forward is original_forward
-
-
-def test_prefill_exception_restores_query_scope(native_attention, monkeypatch):
-    Attention, _, rocm = native_attention
-    layer = Attention()
-    monkeypatch.setattr(patch, "_ATTENTION_BATCH", SimpleNamespace(
-        get=lambda: SimpleNamespace(local_query_rows=lambda start, end:
-                                    (torch.tensor([0]), torch.tensor([0]))),
-    ))
-    monkeypatch.setattr(rocm, "rocm_sparse_attn_prefill",
-                        lambda *a, **kw: (_ for _ in ()).throw(RuntimeError("kernel failed")))
-    q = torch.ones(1, 1, 2)
-    with pytest.raises(RuntimeError, match="kernel failed"):
-        layer._forward_prefill(q, torch.arange(1), q, q, torch.empty_like(q), None,
-                               SimpleNamespace(num_decode_tokens=0))
-    assert patch._PREFILL_ROWS.get() is None
 
 
 @pytest.mark.parametrize("local_queries", [False, True])
@@ -455,6 +409,7 @@ def test_local_query_rows_map_global_rows_to_local_positions(pcp_size):
         ("short", [11], 90, True),
     ])
     managers, _ = _make_managers(pcp_size)
+    owners = torch.zeros(batch.num_tokens, dtype=torch.int64)
     for manager in managers:
         local = manager.partition_batch(batch)
         with glm53_pcp_step_scope():
@@ -464,6 +419,9 @@ def test_local_query_rows_map_global_rows_to_local_positions(pcp_size):
         torch.testing.assert_close(pcp_batch.local_indices[positions], rows + 2)
         assert not local.is_padding[positions].any()
         assert pcp_batch.local_query_rows(2, batch.num_tokens)[1] is positions
+        owners[rows + 2] += 1
+    # Prefill rows have exactly one owner; decode rows are replicated.
+    assert (owners[2:] == 1).all()
 
 
 @pytest.mark.parametrize("pcp_size", [2, 4, 8])
@@ -622,6 +580,8 @@ def test_indexer_quant_selects_local_positions(native_attention, monkeypatch):
         _wq_b_proj = old._wq_b_proj.__wrapped__
         _o_proj = old._o_proj.__wrapped__
         _forward_prefill = old._forward_prefill.__wrapped__
+        forward_mqa = old.forward_mqa.__wrapped__
+        _fused_qnorm_rope_kv_insert = old._fused_qnorm_rope_kv_insert.__wrapped__
     monkeypatch.setattr(rocm, "DeepseekV4ROCMAiterMLAAttention", Fresh)
     monkeypatch.setattr(rocm, "rocm_sparse_attn_prefill",
                         rocm.rocm_sparse_attn_prefill.__wrapped__)

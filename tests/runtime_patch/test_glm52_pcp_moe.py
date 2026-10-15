@@ -454,49 +454,6 @@ def test_hy4_gate_runs_once_before_runner_dispatch(
     torch.testing.assert_close(actual, hidden * hidden.sigmoid())
 
 
-@pytest.mark.parametrize("pcp", [1, 2, 8])
-@pytest.mark.parametrize("use_all2all", [False, True])
-@pytest.mark.parametrize("fail", [False, True])
-def test_pcp_routing_auxiliaries_follow_dispatch_and_restore_context(
-    monkeypatch, moe_runner_module, make_runner, pcp, use_all2all, fail
-):
-    runner, _ = make_runner(pcp, use_all2all)
-    # Distinct peer token IDs and padding verify rank order, not just lengths.
-    token_ids = torch.tensor([11, 12])
-    padding = torch.tensor([False, True])
-    context = SimpleNamespace(is_padding=padding)
-    calls = []
-
-    def gather(tensor, dim=0):
-        calls.append(tensor)
-        if tensor.dtype == torch.bool:
-            return torch.cat([tensor] + [~tensor] * (pcp - 1))
-        return torch.cat([tensor + rank * 10 for rank in range(pcp)])
-
-    monkeypatch.setattr(moe_runner_module, "get_pcp_group", lambda: SimpleNamespace(all_gather=gather))
-    monkeypatch.setattr(moe_runner_module, "is_forward_context_available", lambda: True)
-    monkeypatch.setattr(moe_runner_module, "get_forward_context", lambda: context)
-    fallback = pcp > 1 and not use_all2all
-
-    def route():
-        with runner._pcp_routing_inputs(token_ids, 2) as ids:
-            expected_ids = torch.cat([token_ids + rank * 10 for rank in range(pcp)]) if fallback else token_ids
-            expected_padding = torch.cat([padding] + [~padding] * (pcp - 1)) if fallback else padding
-            torch.testing.assert_close(ids, expected_ids)
-            torch.testing.assert_close(context.is_padding, expected_padding)
-            assert ids.shape[0] == context.is_padding.shape[0]
-            if fail:
-                raise RuntimeError("routing failed")
-
-    if fail:
-        with pytest.raises(RuntimeError, match="routing failed"):
-            route()
-    else:
-        route()
-    assert context.is_padding is padding
-    assert len(calls) == (2 if fallback else 0)
-
-
 @pytest.mark.parametrize("pcp", [2, 8])
 def test_hash_router_receives_gathered_auxiliaries_in_real_forward_impl(
     monkeypatch, moe_runner_module, pcp

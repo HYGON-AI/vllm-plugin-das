@@ -35,9 +35,8 @@ PATCH_ID = "worker.core_fix.deepseek_v4.full_kv_pcp"
 _MARKER = "_vllm_hcu_deepseek_v4_pcp_applied"
 _WRAPPED = (
     "forward", "_run_parallel_input_projections", "_wq_b_proj", "_o_proj",
-    "_forward_prefill",
+    "_forward_prefill", "forward_mqa", "_fused_qnorm_rope_kv_insert",
 )
-_OPTIONAL_WRAPPED = ("forward_mqa", "_fused_qnorm_rope_kv_insert")
 _ATTENTION_BATCH = ContextVar("deepseek_v4_pcp_attention_batch", default=None)
 _PREFILL_ROWS = ContextVar("deepseek_v4_pcp_prefill_rows", default=None)
 _LOCAL_QUERIES = ContextVar("deepseek_v4_pcp_local_queries", default=None)
@@ -78,9 +77,6 @@ def _can_use_local_queries(layer, batch) -> bool:
         henvs.optional_custom_op_enabled(
             henvs.VLLM_HCU_DEEPSEEK_V4_PCP_LOCAL_QUERIES
         )
-        and hasattr(layer, "_prepare_and_attn_fn")
-        and hasattr(layer, "_fused_qnorm_rope_kv_insert")
-        and hasattr(layer, "forward_mqa")
         and layer.head_dim == 512
         and layer.n_local_heads == layer.padded_heads
         and layer.swa_cache_layer.kv_cache.dtype == torch.uint8
@@ -140,8 +136,6 @@ def apply_to_module(module: ModuleType) -> bool:
     cls = require_class(rocm, "DeepseekV4ROCMAiterMLAAttention", TARGET_MODULE)
     if getattr(cls, _MARKER, False):
         if not all(getattr(getattr(cls, name), _MARKER, False) for name in _WRAPPED) \
-                or not all(getattr(getattr(cls, name), _MARKER, False)
-                           for name in _OPTIONAL_WRAPPED if hasattr(cls, name)) \
                 or not getattr(rocm.rocm_sparse_attn_prefill, _MARKER, False):
             raise PatchCompatibilityError("stale DeepSeek V4 PCP patch")
         return False
@@ -149,9 +143,6 @@ def apply_to_module(module: ModuleType) -> bool:
         name: require_callable(cls, name, f"{TARGET_MODULE}.{name}")
         for name in _WRAPPED
     }
-    for name in _OPTIONAL_WRAPPED:
-        if hasattr(cls, name):
-            originals[name] = require_callable(cls, name, TARGET_MODULE)
     kernel = require_callable(rocm, "rocm_sparse_attn_prefill", TARGET_MODULE)
     signatures = {
         "forward": (("self", "positions", "hidden_states", "llama_4_scaling"),
@@ -166,9 +157,8 @@ def apply_to_module(module: ModuleType) -> bool:
             ("self", "q", "kv", "positions", "attn_metadata"), {}),
     }
     for name, (positional, defaults) in signatures.items():
-        if name in originals:
-            require_exact_signature(originals[name], f"{TARGET_MODULE}.{name}",
-                                    positional=positional, defaults=defaults)
+        require_exact_signature(originals[name], f"{TARGET_MODULE}.{name}",
+                                positional=positional, defaults=defaults)
     require_exact_signature(
         kernel, f"{TARGET_MODULE}.rocm_sparse_attn_prefill",
         positional=("q", "kv", "indices", "topk_length", "scale", "head_dim",
@@ -318,63 +308,60 @@ def apply_to_module(module: ModuleType) -> bool:
             attn_sink=attn_sink, output=output,
         )
 
+    @functools.wraps(originals["_fused_qnorm_rope_kv_insert"])
+    def local_insert(self, q, kv, positions, attn_metadata):
+        batch = _ATTENTION_BATCH.get()
+        if not local_queries_enabled(batch):
+            return originals["_fused_qnorm_rope_kv_insert"](
+                self, q, kv, positions, attn_metadata,
+            )
+        from vllm.forward_context import get_forward_context
+        metadata = get_forward_context().attn_metadata[self.swa_cache_layer.prefix]
+        q = q.contiguous()
+        # The PCP kernel has no KVNorm. local_query_forward() already
+        # applied the learned norm on local KV before gathering.
+        _pcp_insert_op()(
+            q, kv.contiguous(),
+            self.swa_cache_layer.kv_cache.view(
+                self.swa_cache_layer.kv_cache.shape[0], -1,
+            ),
+            metadata.slot_mapping[:kv.shape[0]].to(dtype=torch.int64).contiguous(),
+            batch.localize(positions).to(dtype=torch.int64),
+            positions.to(dtype=torch.int64), self.rotary_emb.cos_sin_cache,
+            self.eps, metadata.block_size,
+        )
+        return q
+
+    @functools.wraps(originals["forward_mqa"])
+    def local_mqa(self, q, kv, positions, output):
+        batch = _ATTENTION_BATCH.get()
+        if not local_queries_enabled(batch):
+            return originals["forward_mqa"](self, q, kv, positions, output)
+        # The native prefill loop owns global chunk/KV metadata. Give it
+        # tiny shape-only views with a nonzero token stride so chunk
+        # offsets remain recoverable, rather than a 2-GiB global Q buffer.
+        full_tokens = batch.global_batch.num_tokens
+        q_proxy = q.new_empty(full_tokens).as_strided(
+            (full_tokens, q.shape[1], q.shape[2]), (1, 0, 0),
+        )
+        out_proxy = output.new_empty(full_tokens).as_strided(
+            q_proxy.shape, (1, 0, 0),
+        )
+        token = _LOCAL_MQA.set((q, output))
+        try:
+            return originals["forward_mqa"](
+                self, q_proxy, kv, positions, out_proxy,
+            )
+        finally:
+            _LOCAL_MQA.reset(token)
+
     wrappers = [
         ("forward", forward), ("_run_parallel_input_projections", projections),
         ("_wq_b_proj", partition_query_projection(originals["_wq_b_proj"])),
         ("_o_proj", output_projection),
         ("_forward_prefill", prefill),
+        ("_fused_qnorm_rope_kv_insert", local_insert), ("forward_mqa", local_mqa),
     ]
-
-    if "_fused_qnorm_rope_kv_insert" in originals:
-        @functools.wraps(originals["_fused_qnorm_rope_kv_insert"])
-        def local_insert(self, q, kv, positions, attn_metadata):
-            batch = _ATTENTION_BATCH.get()
-            if not local_queries_enabled(batch):
-                return originals["_fused_qnorm_rope_kv_insert"](
-                    self, q, kv, positions, attn_metadata,
-                )
-            from vllm.forward_context import get_forward_context
-            metadata = get_forward_context().attn_metadata[self.swa_cache_layer.prefix]
-            q = q.contiguous()
-            # The PCP kernel has no KVNorm. local_query_forward() already
-            # applied the learned norm on local KV before gathering.
-            _pcp_insert_op()(
-                q, kv.contiguous(),
-                self.swa_cache_layer.kv_cache.view(
-                    self.swa_cache_layer.kv_cache.shape[0], -1,
-                ),
-                metadata.slot_mapping[:kv.shape[0]].to(dtype=torch.int64).contiguous(),
-                batch.localize(positions).to(dtype=torch.int64),
-                positions.to(dtype=torch.int64), self.rotary_emb.cos_sin_cache,
-                self.eps, metadata.block_size,
-            )
-            return q
-        wrappers.append(("_fused_qnorm_rope_kv_insert", local_insert))
-
-    if "forward_mqa" in originals:
-        @functools.wraps(originals["forward_mqa"])
-        def local_mqa(self, q, kv, positions, output):
-            batch = _ATTENTION_BATCH.get()
-            if not local_queries_enabled(batch):
-                return originals["forward_mqa"](self, q, kv, positions, output)
-            # The native prefill loop owns global chunk/KV metadata. Give it
-            # tiny shape-only views with a nonzero token stride so chunk
-            # offsets remain recoverable, rather than a 2-GiB global Q buffer.
-            full_tokens = batch.global_batch.num_tokens
-            q_proxy = q.new_empty(full_tokens).as_strided(
-                (full_tokens, q.shape[1], q.shape[2]), (1, 0, 0),
-            )
-            out_proxy = output.new_empty(full_tokens).as_strided(
-                q_proxy.shape, (1, 0, 0),
-            )
-            token = _LOCAL_MQA.set((q, output))
-            try:
-                return originals["forward_mqa"](
-                    self, q_proxy, kv, positions, out_proxy,
-                )
-            finally:
-                _LOCAL_MQA.reset(token)
-        wrappers.append(("forward_mqa", local_mqa))
 
     attention_module = importlib.import_module("vllm.models.deepseek_v4.attention")
     quant = getattr(attention_module, "fused_indexer_q_rope_quant", None)
