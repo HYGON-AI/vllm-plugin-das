@@ -6,12 +6,21 @@ from __future__ import annotations
 
 import ast
 import json
+import os
+import subprocess
 import sys
 from pathlib import Path
 
 import pytest
 import yaml
 
+
+V0281_FALLBACK_IMAGE = (
+    '10.16.1.152:5000/jenkins/model_test_env/vllm:0.28.1rc1-latest'
+)
+V0281_IMAGE_EXPRESSION = (
+    "${{ vars.HCU_CI_IMAGE_V0281 || '" + V0281_FALLBACK_IMAGE + "' }}"
+)
 
 REPOSITORY = Path(__file__).resolve().parents[2]
 CI_SCRIPTS = REPOSITORY / ".github" / "scripts" / "hcu_ci"
@@ -116,10 +125,11 @@ def test_pr_static_gate_exports_release_environment_to_consumers() -> None:
     static = workflow["jobs"]["static-and-select"]
     resolver = _named_step(static, "Resolve v0.28.1 HCU environment")
 
+    assert workflow["env"]["HCU_CI_IMAGE"] == V0281_IMAGE_EXPRESSION
     assert resolver["id"] == "release-environment"
     assert resolver["env"] == {
         "BASE_REF": "${{ github.event.pull_request.base.ref }}",
-        "HCU_CI_IMAGE_V0281": "${{ vars.HCU_CI_IMAGE_V0281 }}",
+        "HCU_CI_IMAGE_V0281": V0281_IMAGE_EXPRESSION,
     }
     assert '[[ "$BASE_REF" != "v0.28.1-dev" ]]' in resolver["run"]
     assert "HCU_CI_IMAGE_V0281 is required" in resolver["run"]
@@ -148,6 +158,52 @@ def test_pr_static_gate_exports_release_environment_to_consumers() -> None:
     assert selected["with"]["image"] == (
         "${{ needs.static-and-select.outputs.image }}"
     )
+
+
+@pytest.mark.parametrize(
+    ("configured_image", "base_ref", "expected_status"),
+    [
+        ("", "v0.28.1-dev", 0),
+        ("harbor.example/vllm@sha256:" + "a" * 64, "v0.28.1-dev", 0),
+        ("", "v0.25.1", 2),
+    ],
+)
+def test_pr_environment_step_with_fork_fallback_or_variable_override(
+    tmp_path: Path,
+    configured_image: str,
+    base_ref: str,
+    expected_status: int,
+) -> None:
+    workflow = _workflow("hcu-pr-ci.yml")
+    resolver = _named_step(
+        workflow["jobs"]["static-and-select"], "Resolve v0.28.1 HCU environment"
+    )
+    assert workflow["env"]["HCU_CI_IMAGE"] == V0281_IMAGE_EXPRESSION
+    assert resolver["env"]["HCU_CI_IMAGE_V0281"] == V0281_IMAGE_EXPRESSION
+    # GitHub evaluates the expression before passing the value to Bash.
+    image = configured_image or V0281_FALLBACK_IMAGE
+    output = tmp_path / "github-output"
+    result = subprocess.run(
+        ["bash", "-c", resolver["run"]],
+        env={
+            **os.environ,
+            "BASE_REF": base_ref,
+            "HCU_CI_IMAGE_V0281": image,
+            "GITHUB_OUTPUT": str(output),
+        },
+        capture_output=True,
+        text=True,
+        check=False,
+    )
+    assert result.returncode == expected_status, result.stderr
+    if expected_status:
+        assert not output.exists()
+        assert "unsupported HCU CI release ref" in result.stderr
+    else:
+        assert output.read_text().splitlines() == [
+            f"image={image}",
+            "environment_lock=.github/workflows/configs/hcu-runner-environment.json",
+        ]
 
 
 def test_pr_ci_uses_immutable_event_shas_and_trusted_host_helpers() -> None:
