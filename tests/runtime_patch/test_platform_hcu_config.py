@@ -606,9 +606,26 @@ def test_engine_args_normalizes_legacy_deep_gemm_backend_on_existing_object(
     assert config.kernel_config.moe_backend == "deep_gemm"
 
 
-def test_real_v0251_engine_args_normalizes_legacy_deep_gemm_backend() -> None:
+def test_real_v0251_engine_args_normalizes_legacy_deep_gemm_backend(
+    tmp_path: Path,
+) -> None:
+    from transformers import Qwen3Config
+
+    # This CPU configuration contract needs metadata, not a Hub connection.
+    model_path = tmp_path / "qwen3-config"
+    Qwen3Config(
+        architectures=["Qwen3ForCausalLM"],
+        vocab_size=128,
+        hidden_size=64,
+        intermediate_size=128,
+        num_hidden_layers=1,
+        num_attention_heads=2,
+        num_key_value_heads=1,
+        head_dim=32,
+        max_position_embeddings=64,
+    ).save_pretrained(model_path)
     result = _run_fresh_target(
-        r'''
+        f"MODEL_PATH = {str(model_path)!r}\n" + r'''
 import os
 os.environ["VLLM_USE_V2_MODEL_RUNNER"] = "0"
 from vllm.engine import arg_utils
@@ -621,11 +638,11 @@ for kwargs in (
     {"moe_backend": "dpsk_deep_gemm"},
     {"kernel_config": {"moe_backend": "dpsk_deep_gemm"}},
 ):
-    args = arg_utils.EngineArgs(**kwargs)
+    args = arg_utils.EngineArgs(model=MODEL_PATH, skip_tokenizer_init=True, **kwargs)
     assert args.moe_backend == "deep_gemm" or args.kernel_config.moe_backend == "deep_gemm"
     assert args.create_engine_config().kernel_config.moe_backend == "deep_gemm"
 
-args = arg_utils.EngineArgs()
+args = arg_utils.EngineArgs(model=MODEL_PATH, skip_tokenizer_init=True)
 args.moe_backend = "dpsk_deep_gemm"
 assert args.create_engine_config().kernel_config.moe_backend == "deep_gemm"
 

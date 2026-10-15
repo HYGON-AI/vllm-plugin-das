@@ -262,6 +262,10 @@ def _setup_state(tmp_path, monkeypatch: pytest.MonkeyPatch, mode="static"):
             monkeypatch.setattr(owner, name, inspect.unwrap(getattr(owner, name)))
     monkeypatch.delattr(upstream, api._MARKER, raising=False)
 
+    # CPU contracts exercise real map commits without device-backed pinned
+    # allocations. Hardware allocator behavior belongs to HCU-marked tests.
+    monkeypatch.setattr(upstream, "PIN_MEMORY", False)
+
     model = GenericMoE()
     config, path = config_and_map(tmp_path)
     _set_mode(config, tmp_path, mode)
