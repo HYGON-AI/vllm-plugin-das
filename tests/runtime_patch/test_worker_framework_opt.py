@@ -7,6 +7,7 @@ import ast
 import contextlib
 import dataclasses
 import enum
+import inspect
 import os
 import subprocess
 import sys
@@ -30,7 +31,6 @@ from vllm_hcu.patch.worker.framework_opt import (
     patch_eagle_utils,
     patch_eplb_communicator,
     patch_forward_context,
-    patch_gpu_dp_utils,
     patch_gpu_ubatch_wrapper,
     patch_llm_base_proposer,
     patch_pynccl,
@@ -1249,60 +1249,62 @@ def test_dp_coordination_deepep_low_latency_and_feature_off_delegation():
     assert calls == [(4, normal)]
 
 
-def test_gpu_dp_cudagraph_sync_skips_only_fixed_deepep_low_latency():
-    from vllm_hcu.patch.worker.framework_opt import patch_gpu_dp_utils
+def test_gpu_dp_upstream_selects_dbo_for_fixed_deepep_low_latency(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    from vllm.config.compilation import CUDAGraphMode
+    from vllm.v1.worker.gpu import dp_utils as upstream
+    from vllm.v1.worker.gpu.cudagraph_utils import BatchExecutionDescriptor
 
-    calls: list[tuple[object, ...]] = []
+    def all_reduce(tensor, group):
+        assert group == "cpu-group"
+        tensor[0].fill_(4)
+        tensor[1].fill_(CUDAGraphMode.NONE.value)
+        tensor[2].zero_()
+        tensor[3].fill_(-1)
+        tensor[4].fill_(1)
+        tensor[5].fill_(2)
 
-    def sync_cudagraph_and_dp_padding(
-        cudagraph_manager,
-        desired_batch_desc,
-        num_tokens,
-        num_reqs,
-        uniform_token_count,
-        dp_size,
-        dp_rank,
-        max_query_len=None,
-        num_active_loras=0,
-        parallel_config=None,
-        allow_ubatching=False,
-        uniform_decode=False,
-    ):
-        calls.append((desired_batch_desc, parallel_config))
-        return "synced", "state"
-
-    module = _module(
-        patch_gpu_dp_utils.TARGET_MODULE,
-        sync_cudagraph_and_dp_padding=sync_cudagraph_and_dp_padding,
+    monkeypatch.setattr(
+        upstream,
+        "get_dp_group",
+        lambda: SimpleNamespace(cpu_group="cpu-group"),
     )
-    assert patch_gpu_dp_utils.apply_to_module(module) is True
-    assert patch_gpu_dp_utils.apply_to_module(module) is False
-    fixed = SimpleNamespace(
+    monkeypatch.setattr(upstream.dist, "all_reduce", all_reduce)
+    parallel_config = SimpleNamespace(
         all2all_backend="deepep_low_latency",
-        _vllm_hcu_deepep_auto=False,
+        enable_dbo=True,
+        use_ubatching=True,
+        num_ubatches=2,
+        dbo_decode_token_threshold=2,
+        dbo_prefill_token_threshold=2,
     )
-    auto = SimpleNamespace(
-        all2all_backend="deepep_low_latency",
-        _vllm_hcu_deepep_auto=True,
+    desired = BatchExecutionDescriptor(
+        cg_mode=CUDAGraphMode.NONE,
+        num_tokens=4,
+        num_reqs=2,
     )
-    normal = SimpleNamespace(all2all_backend="naive")
-    args = (None, "local_desc", 4, 2, None, 8, 3)
 
-    assert module.sync_cudagraph_and_dp_padding(
-        *args,
-        max_query_len=4,
-        num_active_loras=1,
-        parallel_config=fixed,
+    synced, state = inspect.unwrap(
+        upstream.sync_cudagraph_and_dp_padding
+    )(
+        None,
+        desired,
+        4,
+        2,
+        None,
+        8,
+        0,
+        parallel_config=parallel_config,
         allow_ubatching=True,
-        uniform_decode=True,
-    ) == ("local_desc", None)
-    assert module.sync_cudagraph_and_dp_padding(
-        *args, parallel_config=auto
-    ) == ("synced", "state")
-    assert module.sync_cudagraph_and_dp_padding(
-        *args, parallel_config=normal
-    ) == ("synced", "state")
-    assert calls == [("local_desc", auto), ("local_desc", normal)]
+    )
+
+    assert synced.cg_mode == CUDAGraphMode.NONE
+    assert synced.num_tokens == 4
+    assert synced.num_ubatches == 2
+    assert state is not None
+    assert state.eager is True
+    assert state.num_tokens_across_dp.tolist() == [4] * 8
 
 
 def test_draft_speculator_sampling_inputs_copy_async_and_preserve_padding():
@@ -2098,13 +2100,13 @@ print('VLLM_SOURCE', vllm.__file__)
 from vllm_hcu.patch.worker.framework_opt import (
     patch_all2all, patch_base_device_communicator, patch_cuda_communicator,
     patch_dp_utils, patch_draft_speculator_inputs, patch_eagle_utils,
-    patch_forward_context, patch_gpu_dp_utils,
+    patch_forward_context,
     patch_gpu_ubatch_wrapper, patch_llm_base_proposer, patch_pynccl,
     patch_pynccl_wrapper, patch_ubatch_utils,
 )
 adapters = (
     patch_all2all, patch_base_device_communicator, patch_forward_context,
-    patch_llm_base_proposer, patch_dp_utils, patch_gpu_dp_utils,
+    patch_llm_base_proposer, patch_dp_utils,
     patch_draft_speculator_inputs,
     patch_eagle_utils,
     patch_gpu_ubatch_wrapper, patch_ubatch_utils,

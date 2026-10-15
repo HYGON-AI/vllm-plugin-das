@@ -56,6 +56,7 @@ FeatureKey = Literal[
     "lightly_cp",
     "multi_layers_mtp",
     "offline_eplb",
+    "eplb_control",
     "proposer",
     "pynccl_all_to_all",
 ]
@@ -348,7 +349,7 @@ _FRAMEWORK_CALLBACKS: tuple[_CallbackSpec, ...] = (
     ),
     _CallbackSpec(
         _adapter("framework_opt", "patch_offline_eplb"),
-        feature="offline_eplb",
+        feature="eplb_control",
     ),
     _CallbackSpec(
         _adapter("framework_opt", "patch_eplb_communicator"),
@@ -368,10 +369,6 @@ _FRAMEWORK_CALLBACKS: tuple[_CallbackSpec, ...] = (
     ),
     _CallbackSpec(
         _adapter("framework_opt", "patch_dp_utils"),
-        feature="deepep_low_latency",
-    ),
-    _CallbackSpec(
-        _adapter("framework_opt", "patch_gpu_dp_utils"),
         feature="deepep_low_latency",
     ),
     _CallbackSpec(
@@ -441,7 +438,6 @@ _REQUIRED_TERMINAL_IDS = frozenset(
         "worker.op_opt.moe.all2all_utils",
         "worker.op_opt.mla.lightly_cp_wrapper",
         "worker.framework_opt.dp.deepep_low_latency",
-        "worker.framework_opt.dp.gpu_deepep_low_latency",
         "worker.framework_opt.forward_context.hcu_runtime_fields",
         "worker.framework_opt.communicator.base_custom_sp",
         "worker.framework_opt.communicator.pynccl_wrapper_all_to_all",
@@ -773,6 +769,11 @@ def _feature_states(
         "multi_layers_mtp": config.enable_multi_layers_mtp,
         "offline_eplb": bool(
             config.expert_map_path or config.expert_map_record_path
+        ),
+        "eplb_control": bool(
+            config.expert_map_path
+            or config.expert_map_record_path
+            or config.eplb_disable_rearrange
         ),
         "proposer": bool(
             config.enable_lightly_cp or config.enable_multi_layers_mtp
