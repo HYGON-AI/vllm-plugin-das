@@ -622,6 +622,10 @@ def test_static_add_commits_plan_with_gloo_and_zero_mutation_counters(
         [2, 0, 1, 2],
     ]
     assert live.logical_to_physical_map[0, 1, :2].tolist() == [3, 1]
+    assert live.logical_replica_count[0, 1].item() == 2
+    assert fixture.model.moe_layers[
+        0
+    ].eplb_state._vllm_hcu_static_primary_replica_count.tolist() == [1, 1, 1]
     assert fixture.communicator_backends == ["torch_gloo"]
     assert fixture.state.parallel_config.eplb_config.communicator == "nixl"
     assert fixture.state.is_async is False
@@ -853,7 +857,8 @@ def test_static_committed_map_reaches_installed_deepep_and_masked_deepgemm(
     )
 
     assert layer_state.logical_to_physical_map[1, :2].tolist() == [3, 1]
-    assert physical_ids.tolist() == [[3], [1]]
+    assert layer_state.logical_replica_count[1].item() == 2
+    assert physical_ids.tolist() == [[3], [3]]
     assert torch.equal(dispatch["topk_idx"], physical_ids)
     assert dispatch["num_experts"] == 4
     assert dispatch["quant_type"] == 2

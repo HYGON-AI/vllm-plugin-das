@@ -1622,9 +1622,15 @@ def test_eplb_torch_map_and_record_numeric_contract(monkeypatch: pytest.MonkeyPa
         calls.append(True)
         return topk_ids + 100
 
+    class BaseRouter:
+        def _apply_eplb_mapping(self, topk_ids):
+            return topk_ids
+
     module = _module(
         patch_base_router.TARGET_MODULE,
         torch=torch,
+        BaseRouter=BaseRouter,
+        dbo_current_ubatch_id=lambda: 0,
         eplb_map_to_physical_and_record=official,
     )
     patch_base_router.apply_to_module(module)
@@ -1671,6 +1677,91 @@ def test_eplb_torch_map_and_record_numeric_contract(monkeypatch: pytest.MonkeyPa
     )
     assert torch.equal(result, torch.tensor([[0, 2], [1, 2]], dtype=torch.int32))
     assert torch.equal(loads, torch.tensor([1, 0, 1]))
+
+
+@pytest.mark.parametrize("use_torch_fallback", [False, True])
+def test_static_primary_replica_is_selected_for_every_token(
+    monkeypatch: pytest.MonkeyPatch,
+    use_torch_fallback: bool,
+) -> None:
+    official_replica_counts = []
+
+    def official(
+        topk_ids,
+        expert_load_view,
+        logical_to_physical_map,
+        logical_replica_count,
+        record_enabled,
+        num_unpadded_tokens=None,
+    ):
+        del expert_load_view, record_enabled, num_unpadded_tokens
+        official_replica_counts.append(logical_replica_count.clone())
+        token_idx = torch.arange(topk_ids.numel(), dtype=torch.int64)
+        replica_idx = (
+            ((token_idx * 2654435769) % (1 << 32))
+            % logical_replica_count[topk_ids.reshape(-1)].long()
+        )
+        return logical_to_physical_map[
+            topk_ids.reshape(-1).long(), replica_idx
+        ].reshape_as(topk_ids)
+
+    class BaseRouter:
+        def __init__(self, eplb_state):
+            self.eplb_state = eplb_state
+
+        def _apply_eplb_mapping(self, topk_ids):
+            state = self.eplb_state
+            return module.eplb_map_to_physical_and_record(
+                topk_ids,
+                state.expert_load_view,
+                state.logical_to_physical_map,
+                state.logical_replica_count,
+                state.should_record_tensor,
+                state.num_unpadded_tokens_tensors[0],
+            )
+
+    module = _module(
+        patch_base_router.TARGET_MODULE,
+        torch=torch,
+        BaseRouter=BaseRouter,
+        dbo_current_ubatch_id=lambda: 0,
+        eplb_map_to_physical_and_record=official,
+    )
+    patch_base_router.apply_to_module(module)
+    from vllm_hcu.platforms import envs as henvs
+
+    monkeypatch.setattr(
+        henvs,
+        "VLLM_HCU_USE_TORCH_EPLB_MAP_RECORD",
+        use_torch_fallback,
+    )
+    state = SimpleNamespace(
+        expert_load_view=torch.zeros(264, dtype=torch.int64),
+        logical_to_physical_map=torch.tensor([[0, 132]], dtype=torch.int64),
+        logical_replica_count=torch.tensor([2], dtype=torch.int64),
+        should_record_tensor=torch.tensor(False),
+        num_unpadded_tokens_tensors=[torch.tensor(64)],
+    )
+    setattr(
+        state,
+        "_vllm_hcu_static_primary_replica_count",
+        torch.ones_like(state.logical_replica_count),
+    )
+    router = BaseRouter(state)
+    logical_ids = torch.zeros((64, 1), dtype=torch.int64)
+
+    static_ids = router._apply_eplb_mapping(logical_ids)
+    delattr(state, "_vllm_hcu_static_primary_replica_count")
+    online_ids = router._apply_eplb_mapping(logical_ids)
+
+    assert torch.equal(static_ids, torch.zeros_like(static_ids))
+    assert set(online_ids.reshape(-1).tolist()) == {0, 132}
+    assert state.logical_replica_count.tolist() == [2]
+    if not use_torch_fallback:
+        assert [counts.tolist() for counts in official_replica_counts] == [
+            [1],
+            [2],
+        ]
 
 
 def test_hash_router_normalizes_index_dtypes(

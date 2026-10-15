@@ -510,6 +510,9 @@ def apply_to_module(module) -> bool:
                 build_locality_fair_replica_order,
                 build_nearest_replica_order,
             )
+            from vllm_hcu.model_executor.layers.fused_moe.router_runtime import (
+                STATIC_PRIMARY_REPLICA_COUNT,
+            )
 
             policy = getattr(
                 self.parallel_config,
@@ -529,6 +532,18 @@ def apply_to_module(module) -> bool:
                 num_physical_experts=plan.num_physical_experts,
             )
             model_state.logical_to_physical_map.copy_(ordered)
+            for layer in model.moe_layers:
+                layer_state = layer.eplb_state
+                replica_count = layer_state.logical_replica_count
+                if not isinstance(replica_count, torch.Tensor):
+                    raise ValueError(
+                        "Static EPLB layer has no logical replica counts"
+                    )
+                setattr(
+                    layer_state,
+                    STATIC_PRIMARY_REPLICA_COUNT,
+                    torch.ones_like(replica_count),
+                )
             self._vllm_hcu_static_source_sha256 = plan.source_sha256
             logger.info(
                 "Committed static EPLB runtime map: model=%s "
