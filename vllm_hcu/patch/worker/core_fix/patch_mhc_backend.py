@@ -36,6 +36,22 @@ def apply_to_module(module: ModuleType) -> bool:
     # existing forward_hip methods then select TileLang, followed by native.
     mhc._vllm_hcu_original_has_aiter_mhc = has_aiter_mhc
     mhc.HAS_AITER_MHC = bool(has_aiter_mhc and henvs.VLLM_HCU_USE_AITER_MHC)
+
+    if henvs.VLLM_HCU_MHC_FUSED_RMSNORM:
+        import torch
+
+        original_apply_mhc_norm = mhc._apply_mhc_norm
+
+        def _fused_apply_mhc_norm(layer_input, norm_weight, norm_eps):
+            if norm_weight is None:
+                return layer_input
+            return torch.nn.functional.rms_norm(
+                layer_input, (layer_input.shape[-1],), norm_weight, norm_eps
+            )
+
+        mhc._vllm_hcu_original_apply_mhc_norm = original_apply_mhc_norm
+        mhc._apply_mhc_norm = _fused_apply_mhc_norm
+
     setattr(mhc, _MARKER, True)
     return True
 

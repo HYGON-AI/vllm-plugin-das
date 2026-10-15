@@ -80,6 +80,7 @@ if TYPE_CHECKING:
     VLLM_HCU_PLE_CPU_OFFLOAD: bool = False
     VLLM_HCU_PLE_PREFETCH_STREAM: bool = False
     VLLM_HCU_QWEN4_EXP_HC_SP: bool = True
+    VLLM_HCU_MHC_FUSED_RMSNORM: bool = False
 
 def maybe_convert_int(value: Optional[str]) -> Optional[int]:
     """
@@ -601,6 +602,15 @@ hcu_vllm_environment_variables: dict[str, Callable[[], Any]] = {
     # (token-major pages, LightOp decode reader).
     "VLLM_HCU_INDEXER_KCACHE_LAYOUT":
         indexer_kcache_layout,
+
+    # Route the RMSNorm applied after the mHC pre/fused-post-pre kernels
+    # through aten's single fused rms_norm kernel instead of
+    # vllm.ir.ops.rms_norm's native implementation, which decomposes into
+    # 8 elementwise/reduce kernels when no fused IR provider is registered
+    # (the case on HCU). See patch_mhc_backend.py.
+    "VLLM_HCU_MHC_FUSED_RMSNORM":
+        lambda: (os.environ.get("VLLM_HCU_MHC_FUSED_RMSNORM", "False").lower() in
+                    ("true", "1")),
 }
 
 # end-env-vars-definition
