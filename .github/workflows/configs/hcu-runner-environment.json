@@ -1,15 +1,15 @@
 {
   "schema_version": 1,
-  "python": "3.10.12",
+  "python": "3.12.12",
   "torch_hip": {
     "match": "prefix",
-    "version": "6.3."
+    "version": "7.2."
   },
   "rocm": {
     "environment": "ROCM_PATH",
     "version_file": ".info/rocm_version",
     "match": "release_line",
-    "version": "26.04"
+    "version": "26.10"
   },
   "distributions": {
     "torch": {

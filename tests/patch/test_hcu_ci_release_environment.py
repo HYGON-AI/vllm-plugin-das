@@ -120,6 +120,23 @@ def test_pull_request_gates_target_v0281_dev() -> None:
         assert workflow["on"]["pull_request"]["branches"] == ["v0.28.1-dev"]
 
 
+def test_default_image_build_runtime_matches_the_ci_environment_lock() -> None:
+    workflow = _workflow("release-docker-image.yml")
+    lock = json.loads(
+        (REPOSITORY / ".github/workflows/configs/hcu-runner-environment.json")
+        .read_text(encoding="utf-8")
+    )
+    # Every matrix entry publishes the generic latest tag used by fork PRs.
+    # It must not select a Python/DTK line incompatible with the CI lock.
+    build_runtimes = {
+        (entry["dtk_tag"], entry["python_version"])
+        for entry in workflow["jobs"]["build"]["strategy"]["matrix"]["include"]
+    }
+    assert build_runtimes == {
+        (lock["rocm"]["version"], ".".join(lock["python"].split(".")[:2]))
+    }
+
+
 def test_pr_static_gate_exports_release_environment_to_consumers() -> None:
     workflow = _workflow("hcu-pr-ci.yml")
     static = workflow["jobs"]["static-and-select"]
@@ -204,6 +221,53 @@ def test_pr_environment_step_with_fork_fallback_or_variable_override(
             f"image={image}",
             "environment_lock=.github/workflows/configs/hcu-runner-environment.json",
         ]
+
+
+@pytest.mark.parametrize("has_python", [True, False])
+def test_image_resolver_checks_the_default_python_in_the_image(
+    tmp_path: Path,
+    has_python: bool,
+) -> None:
+    image_bin = tmp_path / "image-bin"
+    image_bin.mkdir()
+    if has_python:
+        (image_bin / "python3").symlink_to(sys.executable)
+    fake_bin = tmp_path / "bin"
+    fake_bin.mkdir()
+    docker = fake_bin / "docker"
+    docker.write_text(
+        "#!/bin/bash\n"
+        'case "$1" in\n'
+        "  pull) exit 0 ;;\n"
+        "  run)\n"
+        '    while [[ "$1" != "-lc" ]]; do shift; done\n'
+        '    PATH="$HCU_TEST_IMAGE_BIN" /bin/bash --noprofile --norc -c "$2" ;;\n'
+        '  image) printf "%s\\n" "$HCU_TEST_RESOLVED_IMAGE" ;;\n'
+        "  *) exit 1 ;;\n"
+        "esac\n"
+    )
+    docker.chmod(0o755)
+    expected = "registry.example/vllm@sha256:" + "a" * 64
+    result = subprocess.run(
+        ["bash", str(REPOSITORY / "scripts/ci/hcu/hcu_ci_resolve_image.sh")],
+        env={
+            **os.environ,
+            "PATH": str(fake_bin) + os.pathsep + os.environ["PATH"],
+            "HCU_CI_IMAGE": "registry.example/vllm:0.28.1rc1-latest",
+            "HCU_TEST_IMAGE_BIN": str(image_bin),
+            "HCU_TEST_RESOLVED_IMAGE": expected,
+        },
+        capture_output=True,
+        text=True,
+        check=False,
+    )
+    if has_python:
+        assert result.returncode == 0, result.stderr
+        assert result.stdout.strip() == expected
+    else:
+        assert result.returncode == 2
+        assert "without python3" in result.stderr
+        assert not result.stdout
 
 
 def test_pr_ci_uses_immutable_event_shas_and_trusted_host_helpers() -> None:

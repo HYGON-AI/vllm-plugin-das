@@ -179,14 +179,14 @@ docker exec "$container_name" bash -lc '
   set -euo pipefail
   ci_home=/tmp/hcu-ci-home
   mkdir -p "$ci_home" "$TORCHINDUCTOR_CACHE_DIR" "$XDG_CACHE_HOME"
-  if [[ ! -x /usr/local/bin/python3.10 ]]; then
-    python_bin="$(command -v python3.10 || true)"
+  if [[ ! -x /usr/local/bin/python3 ]]; then
+    python_bin="$(command -v python3 || true)"
     if [[ -z "$python_bin" ]]; then
-      echo "python3.10 is unavailable in HCU CI image" >&2
+      echo "python3 is unavailable in HCU CI image" >&2
       exit 2
     fi
     mkdir -p /usr/local/bin
-    ln -sf "$python_bin" /usr/local/bin/python3.10
+    ln -sf "$python_bin" /usr/local/bin/python3
   fi
   HOME="$ci_home" git config --global --add safe.directory /vllm-plugin-das
 '

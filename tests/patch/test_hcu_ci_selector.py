@@ -450,13 +450,13 @@ def test_v0281_runner_lock_matches_audited_runtime(
         REPOSITORY / ".github/workflows/configs/hcu-runner-environment.json"
     )
     lock = json.loads(lock_path.read_text(encoding="utf-8"))
-    assert lock["python"] == "3.10.12"
-    assert lock["torch_hip"] == {"match": "prefix", "version": "6.3."}
+    assert lock["python"] == "3.12.12"
+    assert lock["torch_hip"] == {"match": "prefix", "version": "7.2."}
     assert lock["rocm"] == {
         "environment": "ROCM_PATH",
         "version_file": ".info/rocm_version",
         "match": "release_line",
-        "version": "26.04",
+        "version": "26.10",
     }
     assert lock["distributions"] == {
         "torch": {"match": "prefix", "version": "2.11.0+"},
@@ -469,30 +469,30 @@ def test_v0281_runner_lock_matches_audited_runtime(
     runtime_root = tmp_path / "dtk"
     version_file = runtime_root / lock["rocm"]["version_file"]
     version_file.parent.mkdir(parents=True)
-    version_file.write_text("26.04.1\n", encoding="utf-8")
+    version_file.write_text("26.10\n", encoding="utf-8")
     monkeypatch.setenv("ROCM_PATH", str(runtime_root))
-    monkeypatch.setattr("hcu_ci_preflight.platform.python_version", lambda: "3.10.12")
+    monkeypatch.setattr("hcu_ci_preflight.platform.python_version", lambda: "3.12.12")
     versions = {
-        "torch": "2.11.0+dtk2604.2609291046.ge12687",
-        "vllm": "0.28.1+dtk2604.torch2110.2609171627.g77acaf",
-        "vllm-hcu": "0.28.1rc1.dev491+das.5d5fe2f.dtk26041",
-        "aiter": "0.1.6+dtk2604.torch2110.2609300837.gf9b9c8",
+        "torch": "2.11.0+das.opt1.dtk2610.2609201632.gf74cd7",
+        "vllm": "0.28.1+dtk2610.torch2110.2610151506.g77acaf",
+        "vllm-hcu": "0.28.1rc1.dev491+dtk2610.torch2110.2610141353.g109dc7",
+        "aiter": "0.1.7+dtk2610.torch2110.2610151315.g3459a5",
         "pytest": "9.1.1",
     }
 
     report = _check_environment_lock(
         lock_path,
         versions=versions,
-        torch_hip="6.3.26113",
+        torch_hip="7.2.26365",
     )
-    assert report["rocm"] == "26.04.1"
+    assert report["rocm"] == "26.10"
 
     for distribution, compatible_version in (
         ("vllm", "0.28.1"),
         ("vllm", "0.28.1rc2"),
         ("vllm", "0.28.1.dev2"),
         ("vllm", "0.28.1.post1"),
-        ("vllm", "0.28.1+dtk2604"),
+        ("vllm", "0.28.1+dtk2610"),
         ("vllm-hcu", "0.28.1rc2+das.test"),
         ("vllm-hcu", "0.28.1.dev2+das.test"),
         ("vllm-hcu", "0.28.1.post1+das.test"),
@@ -501,7 +501,7 @@ def test_v0281_runner_lock_matches_audited_runtime(
         _check_environment_lock(
             lock_path,
             versions=compatible,
-            torch_hip="6.3.26113",
+            torch_hip="7.2.26365",
         )
 
     for distribution, incompatible_version in (
@@ -509,10 +509,10 @@ def test_v0281_runner_lock_matches_audited_runtime(
         ("vllm", "0.28.10+future"),
         ("vllm", "0.28.1.0"),
         ("vllm", "0.28.1.1"),
-        ("vllm", "0.28.1.1rc1+dtk2604"),
+        ("vllm", "0.28.1.1rc1+dtk2610"),
         ("vllm-hcu", "0.28.10rc1+future"),
         ("vllm-hcu", "0.28.1.1"),
-        ("vllm-hcu", "0.28.1.1rc1+dtk2604"),
+        ("vllm-hcu", "0.28.1.1rc1+dtk2610"),
     ):
         incompatible = dict(versions, **{distribution: incompatible_version})
         with pytest.raises(
@@ -522,8 +522,26 @@ def test_v0281_runner_lock_matches_audited_runtime(
             _check_environment_lock(
                 lock_path,
                 versions=incompatible,
-                torch_hip="6.3.26113",
+                torch_hip="7.2.26365",
             )
+
+    with monkeypatch.context() as old_python:
+        old_python.setattr(
+            "hcu_ci_preflight.platform.python_version", lambda: "3.10.12"
+        )
+        with pytest.raises(PreflightError, match="runner Python drift"):
+            _check_environment_lock(
+                lock_path, versions=versions, torch_hip="7.2.26365"
+            )
+    with pytest.raises(PreflightError, match="runner torch HIP drift"):
+        _check_environment_lock(
+            lock_path, versions=versions, torch_hip="6.3.26113"
+        )
+    version_file.write_text("26.04.1\n", encoding="utf-8")
+    with pytest.raises(PreflightError, match="DTK/ROCm drift"):
+        _check_environment_lock(
+            lock_path, versions=versions, torch_hip="7.2.26365"
+        )
 
 
 @pytest.fixture
@@ -538,6 +556,7 @@ def dtk_environment_lock(
     # Exercise the generic release-line matcher independently of the branch's
     # exact audited DTK patch release.
     lock["rocm"].update({"match": "release_line", "version": "26.04"})
+    lock["torch_hip"] = {"match": "prefix", "version": "6.3."}
     runtime_root = tmp_path / "dtk"
     version_file = runtime_root / lock["rocm"]["version_file"]
     version_file.parent.mkdir(parents=True)
