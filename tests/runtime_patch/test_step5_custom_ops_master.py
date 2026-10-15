@@ -137,6 +137,91 @@ assert actual == {expected!r}, actual
     assert result.returncode == 0, result.stdout + result.stderr
 
 
+@pytest.mark.parametrize(
+    ("master", "expected"),
+    [
+        (
+            "0",
+            (
+                False,
+                False,
+                frozenset(),
+                frozenset(),
+                "off",
+                False,
+                False,
+            ),
+        ),
+        (
+            "1",
+            (
+                True,
+                True,
+                frozenset({"decode"}),
+                frozenset({"prefill"}),
+                "full",
+                True,
+                True,
+            ),
+        ),
+    ],
+)
+def test_step4_dsa_optional_paths_obey_custom_ops_master(master, expected):
+    """DSA remains present, but every alternate provider/fast path is baseline."""
+
+    env = os.environ.copy()
+    env.update(
+        {
+            "VLLM_HCU_USE_CUSTOM_OPS": master,
+            "VLLM_STEP4_DSA_SPEC_INDEXER_PER_REQUEST": "1",
+            "VLLM_STEP4_DSA_SPEC_INDEXER_FP8_DOT": "1",
+            "VLLM_STEP4_DSA_BOLTOPS": "decode",
+            "VLLM_STEP4_DSA_FLASH_ATTN": "prefill",
+            "VLLM_STEP4_DSA_FP8_MATH": "full",
+            "VLLM_STEP4_DSA_SPEC_FUSED_SUMMARIES": "1",
+            "STEP5_DSA_MERGED_PROJ": "1",
+        }
+    )
+    script = f"""
+import builtins
+import vllm
+
+native_import = builtins.__import__
+def guarded_import(name, *args, **kwargs):
+    if name in {"boltops.step4_dsa", "flash_attn.flash_attn_interface"}:
+        raise AssertionError("custom-op test imported optional provider " + name)
+    return native_import(name, *args, **kwargs)
+builtins.__import__ = guarded_import
+
+from vllm_hcu.model_executor.layers import step4_dsa as dsa
+
+actual = (
+    dsa._SPEC_INDEXER_PER_REQUEST,
+    dsa._SPEC_INDEXER_FP8_DOT,
+    dsa.BOLTOPS_STAGES,
+    dsa.FLASH_ATTN_DSA_STAGES,
+    dsa._fp8_math,
+    dsa._SPEC_FUSED_SUMMARIES,
+    dsa._MERGED_PROJ,
+)
+assert actual == {expected!r}, actual
+if dsa._fp8_math == "off":
+    assert (dsa.DECODE_QK_FP8, dsa.DECODE_PV_FP8) == (False, False)
+    assert (dsa.PREFILL_QK_FP8, dsa.PREFILL_PV_FP8) == (False, False)
+else:
+    assert (dsa.DECODE_QK_FP8, dsa.DECODE_PV_FP8) == (True, True)
+    assert (dsa.PREFILL_QK_FP8, dsa.PREFILL_PV_FP8) == (True, True)
+"""
+    result = subprocess.run(
+        [sys.executable, "-c", script],
+        env=env,
+        capture_output=True,
+        text=True,
+        timeout=120,
+    )
+    assert result.returncode == 0, result.stdout + result.stderr
+
+
 def test_step5_splitting_ops_ignore_enabled_children_when_master_is_off(
     monkeypatch,
 ):

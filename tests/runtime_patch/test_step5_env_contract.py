@@ -45,6 +45,19 @@ def test_dsa_switch_controls_compilation_registration(monkeypatch, value, disabl
     assert registered is not disabled
 
 
+def test_custom_ops_master_does_not_disable_dsa_semantics(monkeypatch):
+    from vllm.config.compilation import CompilationConfig
+    from vllm_hcu.models.step5_config import Step5Config
+
+    monkeypatch.setenv("VLLM_HCU_USE_CUSTOM_OPS", "0")
+    monkeypatch.delenv("VLLM_STEP5_DISABLE_DSA", raising=False)
+    monkeypatch.setattr(CompilationConfig, "_attention_ops", [])
+
+    assert step5_envs.is_dsa_disabled() is False
+    Step5Config(sparse_config={"enabled": True})
+    assert "vllm::step4_dsa_index" in CompilationConfig._attention_ops
+
+
 @pytest.mark.parametrize("name", step5_envs.IGNORED_ENVIRONMENT_VARIABLES)
 def test_obsolete_settings_warn_only_when_explicitly_set(monkeypatch, name):
     from vllm_hcu.models.step5_config import Step5Config

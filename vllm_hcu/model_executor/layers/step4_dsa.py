@@ -91,6 +91,7 @@ from vllm.v1.kv_cache_interface import AttentionSpec
 from vllm.platforms import current_platform
 from vllm.triton_utils import tl, triton
 from vllm.utils.torch_utils import direct_register_custom_op
+from vllm_hcu.platforms import envs as henvs
 
 logger = init_logger("vllm.step5.step4_dsa")
 
@@ -163,7 +164,9 @@ CHECK_SLOTS = os.environ.get("VLLM_STEP4_DSA_CHECK_SLOTS", "0") == "1"
 # Verify-batch indexer scores with one program per request (spec_indexer_logits)
 # instead of one per query token. Bit-identical; "0" restores the per-token kernel.
 _SPEC_INDEXER_PER_REQUEST = (
-    os.environ.get("VLLM_STEP4_DSA_SPEC_INDEXER_PER_REQUEST", "1") == "1"
+    henvs.optional_custom_op_enabled(
+        os.environ.get("VLLM_STEP4_DSA_SPEC_INDEXER_PER_REQUEST", "1") == "1"
+    )
 )
 
 # ...and with the request's (token, head) pairs stacked into one fp8 x fp8 dot
@@ -171,7 +174,9 @@ _SPEC_INDEXER_PER_REQUEST = (
 # order, but the dot's internal fp32 accumulation order differs: not
 # bit-identical. "0" restores the per-head bf16 dots.
 _SPEC_INDEXER_FP8_DOT = (
-    os.environ.get("VLLM_STEP4_DSA_SPEC_INDEXER_FP8_DOT", "1") == "1"
+    henvs.optional_custom_op_enabled(
+        os.environ.get("VLLM_STEP4_DSA_SPEC_INDEXER_FP8_DOT", "1") == "1"
+    )
 )
 
 # Depth of the pinned staging ring used to upload the per-step pending rows.
@@ -211,10 +216,15 @@ _STAGING_DEPTH = 4
 #   fill the CUs and merge for me", so the ``_decode_num_splits`` policy and the
 #   explicit ``merge_split_states`` pass are skipped on that path.
 _BOLTOPS_STAGE_NAMES = frozenset({"decode", "prefill"})
-BOLTOPS_STAGES = frozenset(
+_requested_boltops_stages = frozenset(
     name.strip()
     for name in os.environ.get("VLLM_STEP4_DSA_BOLTOPS", "").split(",")
     if name.strip()
+)
+BOLTOPS_STAGES = (
+    _requested_boltops_stages
+    if henvs.optional_custom_op_enabled(bool(_requested_boltops_stages))
+    else frozenset()
 )
 if BOLTOPS_STAGES - _BOLTOPS_STAGE_NAMES:
     raise ValueError(
@@ -248,12 +258,15 @@ if BOLTOPS_STAGES - _BOLTOPS_STAGE_NAMES:
 _FLASH_ATTN_STAGE_NAMES = frozenset({"decode", "prefill"})
 _flash_attn_stages_raw = os.environ.get("VLLM_STEP4_DSA_FLASH_ATTN")
 if _flash_attn_stages_raw is not None:
-    FLASH_ATTN_DSA_STAGES = frozenset(
+    _requested_flash_attn_stages = frozenset(
         name.strip() for name in _flash_attn_stages_raw.split(",") if name.strip()
     )
+    FLASH_ATTN_DSA_STAGES = (
+        _requested_flash_attn_stages
+        if henvs.optional_custom_op_enabled(bool(_requested_flash_attn_stages))
+        else frozenset()
+    )
 else:
-    import vllm_hcu.platforms.envs as _henvs
-
     def _flash_attn_dsa_ops_available() -> bool:
         """Whether flash_attn here exposes the sparse ops at all.
 
@@ -280,9 +293,12 @@ else:
         return True
 
     _flash_attn_requested = (
-        _henvs.VLLM_HCU_USE_FLASH_ATTN or _henvs.VLLM_HCU_USE_FLASH_ATTN_UNIFIED
+        henvs.VLLM_HCU_USE_FLASH_ATTN or henvs.VLLM_HCU_USE_FLASH_ATTN_UNIFIED
     )
-    if _flash_attn_requested and _flash_attn_dsa_ops_available():
+    if (
+        henvs.optional_custom_op_enabled(_flash_attn_requested)
+        and _flash_attn_dsa_ops_available()
+    ):
         FLASH_ATTN_DSA_STAGES = frozenset(_FLASH_ATTN_STAGE_NAMES)
     else:
         if _flash_attn_requested:
@@ -346,10 +362,11 @@ _FP8_MATH_MODES = {"off": (False, False), "qk": (True, False), "full": (True, Tr
 # tuning knob here -- 'qk' and 'full' simply do not build. 'off' is also the
 # only mode inside the acceptance envelopes, so this costs only speed.
 _fp8_math_default = "off" if current_platform.is_rocm() else "full"
-_fp8_math = (
+_requested_fp8_math = (
     os.environ.get("VLLM_STEP4_DSA_FP8_MATH", _fp8_math_default).strip().lower()
     or _fp8_math_default
 )
+_fp8_math = _requested_fp8_math if henvs.custom_ops_enabled() else "off"
 if _fp8_math not in _FP8_MATH_MODES:
     raise ValueError(
         f"VLLM_STEP4_DSA_FP8_MATH={_fp8_math!r}: expected one of "
@@ -792,11 +809,15 @@ def _spec_summaries_kernel(
 # Fold _update_summaries_spec into _spec_summaries_kernel. Bit-identical; "0"
 # restores the unfused torch path.
 _SPEC_FUSED_SUMMARIES = (
-    os.environ.get("VLLM_STEP4_DSA_SPEC_FUSED_SUMMARIES", "1") == "1"
+    henvs.optional_custom_op_enabled(
+        os.environ.get("VLLM_STEP4_DSA_SPEC_FUSED_SUMMARIES", "1") == "1"
+    )
 )
 
 # One GEMM for the four indexer projections (Step4Indexer._merged_projection).
-_MERGED_PROJ = os.environ.get("STEP5_DSA_MERGED_PROJ", "1") == "1"
+_MERGED_PROJ = henvs.optional_custom_op_enabled(
+    os.environ.get("STEP5_DSA_MERGED_PROJ", "1") == "1"
+)
 
 
 @triton.jit

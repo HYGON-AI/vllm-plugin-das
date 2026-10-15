@@ -7,6 +7,51 @@ import pytest
 import torch
 
 
+def test_disabled_spec_indexer_uses_full_batch_baseline(monkeypatch):
+    from vllm_hcu.model_executor.layers import step4_dsa as dsa
+
+    monkeypatch.setattr(dsa, "_SPEC_INDEXER_PER_REQUEST", False)
+    monkeypatch.setattr(
+        dsa,
+        "spec_indexer_logits",
+        lambda *args, **kwargs: pytest.fail("per-request indexer was selected"),
+    )
+    calls = []
+    monkeypatch.setattr(
+        dsa,
+        "decode_indexer_logits",
+        lambda *args, **kwargs: calls.append((args, kwargs)),
+    )
+    indexer = object.__new__(dsa.Step4Indexer)
+    indexer.num_kv_groups = 1
+    indexer.slot = 0
+    indexer.weight_prescale = 0.5
+    indexer.state = SimpleNamespace(
+        spec_query_len=4,
+        regions_per_page=8,
+        summary=[torch.empty(1, 1, 2)],
+    )
+    sched = SimpleNamespace(
+        num_tokens=2,
+        graph_regions=0,
+        max_nscore=1,
+        req_table=torch.ones(1, 1, dtype=torch.int32),
+        tok_table=torch.ones(2, 1, dtype=torch.int32),
+        tok_nscore=torch.ones(2, dtype=torch.int32),
+        num_decodes=1,
+        query_start_loc=torch.tensor([0, 2], dtype=torch.int32),
+    )
+
+    _, logits, width = indexer._score_spec(
+        sched,
+        torch.ones(2, 1, 1, 2),
+        torch.ones(2, 1, 1),
+    )
+
+    assert width == 1 and logits.shape == (2, 1)
+    assert len(calls) == 1
+
+
 @pytest.mark.parametrize("route", ["general", "decode"])
 def test_pending_heads_survive_earlier_row_allocation(route):
     from vllm_hcu.model_executor.layers.step4_dsa import (
