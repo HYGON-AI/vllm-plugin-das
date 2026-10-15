@@ -28,6 +28,7 @@ if TYPE_CHECKING:
     VLLM_HCU_USE_CUSTOM_TOPK_TOPP_SAMPLER : bool = False
     VLLM_HCU_USE_CUSTOM_RMS_NORM : bool = False
     VLLM_HCU_USE_CUSTOM_AITER_FLA : bool = False
+    VLLM_HCU_GDN_DECODE_BACKEND: str = "hcu-aiter"
     VLLM_HCU_PP_LAYER_PARTITION_D : Optional[str] = None
     VLLM_HCU_USE_FUSE_MOE_GATE : bool = True
     VLLM_HCU_USE_LIGHTOP_SQRTSOFTPLUS_GATE: bool = True
@@ -338,9 +339,18 @@ hcu_vllm_environment_variables: dict[str, Callable[[], Any]] = {
     "VLLM_HCU_USE_CUSTOM_RMS_NORM":
     lambda: (os.environ.get("VLLM_HCU_USE_CUSTOM_RMS_NORM", "True").lower() in
              ("true", "1")),
+    # Deprecated and ignored: GDN prefill is selected by
+    # --gdn-prefill-backend and GDN decode by VLLM_HCU_GDN_DECODE_BACKEND.
     "VLLM_HCU_USE_CUSTOM_AITER_FLA":
     lambda: (os.environ.get("VLLM_HCU_USE_CUSTOM_AITER_FLA", "True").lower() in
              ("true", "1")),
+    # Select the GDN decode kernel provider: triton (vLLM FLA), hcu-boltops
+    # or hcu-aiter (default). VLLM_HCU_USE_CUSTOM_OPS=0 forces hcu-boltops. On HCU the GDN
+    # prefill provider is selected by --gdn-prefill-backend instead.
+    "VLLM_HCU_GDN_DECODE_BACKEND":
+    lambda: os.environ.get(
+        "VLLM_HCU_GDN_DECODE_BACKEND", "hcu-aiter"
+    ).strip().lower(),
             
     # Pipeline stage partition strategy
     "VLLM_HCU_PP_LAYER_PARTITION_D":

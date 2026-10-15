@@ -25,6 +25,7 @@ _FEATURE_FIELDS = (
     "qwen4_exp_hc_sp",
     "moe_backend",
     "hcu_flash_attn_mode",
+    "hcu_gdn_prefill_backend",
     "expert_map_path",
     "expert_map_record_path",
     "eplb_disable_rearrange",
@@ -39,6 +40,8 @@ _legacy_backend_warning_lock = threading.Lock()
 _SUPPORTED_FLASH_ATTN_MODES = frozenset(
     {"classic", "cutlass", "varlen"}
 )
+# HCU-only --gdn-prefill-backend values. vLLM itself only sees "triton".
+HCU_GDN_PREFILL_BACKENDS = ("hcu-boltops", "hcu-aiter")
 _SUPPORTED_EPLB_STATIC_DISPATCH_POLICIES = frozenset(
     {"nearest", "locality_fair"}
 )
@@ -91,6 +94,10 @@ class HcuFeatureConfig:
     qwen4_exp_hc_sp: bool = True
     moe_backend: str = "auto"
     hcu_flash_attn_mode: str | None = None
+    # HCU provider requested through --gdn-prefill-backend (hcu-boltops or
+    # hcu-aiter). None means the official value decides; see
+    # vllm_hcu.patch.worker.op_opt._gdn_backend.
+    hcu_gdn_prefill_backend: str | None = None
     expert_map_path: str | None = None
     expert_map_record_path: str | None = None
     eplb_disable_rearrange: bool = False
@@ -129,6 +136,15 @@ class HcuFeatureConfig:
                     "unsupported HCU hcu_flash_attn_mode "
                     f"{self.hcu_flash_attn_mode!r}; expected one of {supported}"
                 )
+        if (
+            self.hcu_gdn_prefill_backend is not None
+            and self.hcu_gdn_prefill_backend not in HCU_GDN_PREFILL_BACKENDS
+        ):
+            supported = ", ".join(HCU_GDN_PREFILL_BACKENDS)
+            raise ValueError(
+                "unsupported HCU hcu_gdn_prefill_backend "
+                f"{self.hcu_gdn_prefill_backend!r}; expected one of {supported}"
+            )
         if self.enable_lightly_cplb and not self.enable_lightly_cp:
             raise ValueError("enable_lightly_cplb requires enable_lightly_cp")
         for name in ("expert_map_path", "expert_map_record_path"):
