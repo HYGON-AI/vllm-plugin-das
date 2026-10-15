@@ -9,18 +9,17 @@ from collections.abc import Callable
 from typing import Any
 
 import torch
+import flash_attn_2_cuda
 from flash_attn import (
     flash_attn_varlen_func as _flash_attn_varlen_func,
     hg_flash_attn_varlen_func as _hg_flash_attn_varlen_func,
     varlen_fwd_unified as _varlen_fwd_unified,
-    vllm_flash_attn_varlen_func,
 )
 from packaging.specifiers import SpecifierSet
 from packaging.version import InvalidVersion, Version
 from torch import Tensor
 from vllm_hcu.v1.attention.kv_cache_layout import get_kv_cache_layout
 
-import vllm_hcu.hcu_ops as hcu_ops
 
 
 # This range describes the Python/native API line exercised by the plugin. It
@@ -168,6 +167,89 @@ varlen_fwd_unified = _with_kv_cache_layout(
     _varlen_fwd_unified,
     "varlen_fwd_unified",
 )
+
+
+def can_use_paged_fp8_d192_fwd(
+    key_cache: Tensor,
+    value_cache: Tensor,
+    out: Tensor,
+    alibi_slopes: Tensor | None,
+    softcap: float,
+    s_aux: Tensor | None,
+) -> bool:
+    """Whether the paged FP8 head_dim-192 HG prefix kernel can serve a call."""
+    return (
+        key_cache.dtype == torch.float8_e4m3fn
+        and value_cache.dtype == torch.float8_e4m3fn
+        and key_cache.ndim == 4
+        and key_cache.shape[-1] == 192
+        and value_cache.shape[-1] == 192
+        and key_cache.shape[1] in (64, 128)
+        and out.dtype == torch.bfloat16
+        and alibi_slopes is None
+        and not softcap
+        and (s_aux is None or s_aux.dtype == out.dtype)
+        and get_kv_cache_layout() == "NHD"
+    )
+
+
+def paged_fp8_d192_fwd(
+    q: Tensor,
+    k: Tensor,
+    v: Tensor,
+    out: Tensor,
+    cu_seqlens_q: Tensor,
+    seqused_k: Tensor,
+    block_table: Tensor,
+    max_seqlen_q: int,
+    max_seqlen_k: int,
+    softmax_scale: float,
+    causal: bool,
+    window_size: list[int] | None,
+    s_aux: Tensor | None = None,
+) -> Tensor:
+    """FP8 paged attention for head_dim 192 through the HG prefix kernel.
+
+    varlen_fwd_unified sends this shape to two unsuitable kernels: decode
+    (q_len <= 4) goes to paged_attention, which quantizes the per-partition
+    *normalized* probabilities to e4m3 (most fall into the subnormal range,
+    15-30% output error), and prefill goes to a contiguous FP8 path that only
+    supports head_dim 128. The C++ varlen_fwd on the paged cache serves both
+    with the HG prefix kernel (~2% error vs an exact reference on the same
+    FP8 bytes), and only reads device-side lengths, so it is graph-safe.
+    """
+    window_left, window_right = (
+        (window_size[0], window_size[1]) if window_size is not None else (-1, -1)
+    )
+    flash_attn_2_cuda.varlen_fwd(
+        q.to(k.dtype),
+        k,
+        v,
+        out,
+        cu_seqlens_q,
+        # cu_seqlens_k is unused with seqused_k but must be a tensor.
+        cu_seqlens_q,
+        seqused_k,
+        None,  # leftpad_k
+        block_table,
+        None,  # alibi_slopes
+        max_seqlen_q,
+        max_seqlen_k,
+        0.0,  # dropout
+        softmax_scale,
+        False,  # zero_tensors
+        causal,
+        window_left,
+        window_right,
+        0.0,  # softcap
+        False,  # return_softmax
+        None,  # q_descale
+        None,  # k_descale
+        None,  # v_descale
+        None,  # generator
+        s_aux,
+    )
+    return out
 
 
 # Hcu doesn't use scheduler metadata (FA3 feature), provide stub

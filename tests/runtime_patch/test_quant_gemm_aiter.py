@@ -42,7 +42,6 @@ from vllm_hcu.model_executor.layers.quantization import (
 from vllm_hcu.platforms import envs as henvs
 from vllm_hcu.patch.worker.op_opt import (
     patch_activation,
-    patch_aiter_ops,
     patch_compressed_tensors,
     patch_compressed_tensors_moe_w8a8_fp8,
     patch_compressed_tensors_moe_wna16,
@@ -50,6 +49,7 @@ from vllm_hcu.patch.worker.op_opt import (
     patch_compressed_tensors_w8a8_fp8,
     patch_compressed_tensors_w8a8_int8,
     patch_deep_gemm,
+    patch_deep_gemm_transform,
     patch_input_quant_fp8,
     patch_layers_utils,
     patch_scaled_mm_linear_kernel,
@@ -9263,3 +9263,34 @@ def test_tf32_hc_prenorm_cpu_fallback_and_backend_delegation():
     module._tf32_hc_prenorm_gemm_impl = object()
     assert module.tf32_hc_prenorm_gemm(x, fn, out, sqrsum, 2) == "backend"
     assert calls[-1] == "backend"
+
+
+def test_transform_sf_identity_fallback_and_backend_delegation():
+    calls: list[object] = []
+
+    def lazy_init():
+        calls.append("lazy")
+
+    def original(*args, **kwargs):
+        calls.append(("backend", args, kwargs))
+        return "backend"
+
+    module = _module(
+        patch_deep_gemm_transform.TARGET_MODULE,
+        _lazy_init=lazy_init,
+        _transform_sf_into_required_layout_impl=None,
+        transform_sf_into_required_layout=original,
+    )
+    assert patch_deep_gemm_transform.apply_to_module(module) is True
+    assert patch_deep_gemm_transform.apply_to_module(module) is False
+
+    sf = torch.ones(4, 2)
+    assert module.transform_sf_into_required_layout(sf, 128, 128) is sf
+    assert module.transform_sf_into_required_layout(sf=sf, mn=128, k=128) is sf
+    with pytest.raises(ValueError, match="requires 'sf'"):
+        module.transform_sf_into_required_layout()
+    assert calls == ["lazy", "lazy", "lazy"]
+
+    module._transform_sf_into_required_layout_impl = object()
+    assert module.transform_sf_into_required_layout(sf, 128, 128) == "backend"
+    assert calls[-2:] == ["lazy", ("backend", (sf, 128, 128), {})]

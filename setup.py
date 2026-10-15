@@ -192,7 +192,14 @@ setup(
     license="Apache-2.0",
     python_requires=">=3.10",
     packages=find_namespace_packages(include=["vllm_hcu", "vllm_hcu.*"]),
-    package_data={"vllm_hcu": ["*.so", "so/*.so", "include/*.h"]},
+    package_data={
+        "vllm_hcu": [
+            "*.so",
+            "so/*.so",
+            "include/*.h",
+            "model_executor/layers/fused_moe/ep_table.json",
+        ]
+    },
     ext_modules=ext_modules,
     cmdclass={
         'build_ext': CustomBuildExt,

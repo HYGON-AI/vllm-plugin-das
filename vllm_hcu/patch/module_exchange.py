@@ -86,6 +86,49 @@ _QWEN4_EXP_PLE: tuple[_Entry, ...] = (
     ),
 )
 
+_STEP5: tuple[_Entry, ...] = (
+    (
+        "module_exchange.step5.text_model",
+        "vllm.model_executor.models.step5_text",
+        "vllm_hcu.models.step5_text",
+    ),
+    (
+        "module_exchange.step5.multimodal_model",
+        "vllm.model_executor.models.step5_vl",
+        "vllm_hcu.models.step5_vl",
+    ),
+    (
+        "module_exchange.step5.mtp_model",
+        "vllm.model_executor.models.step5_mtp",
+        "vllm_hcu.models.step5_mtp",
+    ),
+    (
+        "module_exchange.step5.swa_fused",
+        "vllm.model_executor.models.step5_swa_fused",
+        "vllm_hcu.models.step5_swa_fused",
+    ),
+    (
+        "module_exchange.step5.config",
+        "vllm.transformers_utils.configs.step5",
+        "vllm_hcu.models.step5_config",
+    ),
+    (
+        "module_exchange.step5.dsa_backend",
+        "vllm.model_executor.layers.step4_dsa",
+        "vllm_hcu.model_executor.layers.step4_dsa",
+    ),
+    (
+        "module_exchange.step5.dsa_kernels",
+        "vllm.model_executor.layers.step4_dsa_kernels",
+        "vllm_hcu.model_executor.layers.step4_dsa_kernels",
+    ),
+    (
+        "module_exchange.step5.skinny_lm_head",
+        "vllm.model_executor.layers.skinny_lm_head",
+        "vllm_hcu.model_executor.layers.skinny_lm_head",
+    ),
+)
+
 _ALL_GROUPS: tuple[tuple[_Entry, ...], ...] = (
     _MODULAR_KERNEL,
     _BASE_LINEAR,
@@ -94,6 +137,7 @@ _ALL_GROUPS: tuple[tuple[_Entry, ...], ...] = (
     _ATTENTION,
     _DEEPSEEK_V4,
     _DEEP_GEMM,
+    _STEP5,
 )
 
 _HCU_PACKAGE_ROOT = Path(__file__).resolve().parents[1]
@@ -124,8 +168,10 @@ def _validate_hcu_replacement_path(module_name: str) -> None:
     """Validate an HCU module path without importing any package/module."""
 
     parts = module_name.split(".")
-    if len(parts) < 2 or parts[0] != "vllm_hcu" or any(
-        not part.isidentifier() for part in parts
+    if (
+        len(parts) < 2
+        or parts[0] != "vllm_hcu"
+        or any(not part.isidentifier() for part in parts)
     ):
         raise ValueError(
             f"replacement must be an absolute vllm_hcu module name: {module_name!r}"
