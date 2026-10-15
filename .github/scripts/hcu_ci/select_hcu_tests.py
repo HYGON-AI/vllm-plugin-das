@@ -42,7 +42,7 @@ VALID_SUITES = {
     "full",
 }
 RUNNER_RE = re.compile(
-    r"^(?:bw18|nmz36|hcu-ci-pr|hcu-linux-(?:cpu|gfx9[0-9]{2}-[1-9][0-9]*))$"
+    r"^(?:bw1000|bw1100)$"
 )
 JOB_ID_RE = re.compile(r"^[a-z0-9][a-z0-9-]*$")
 
