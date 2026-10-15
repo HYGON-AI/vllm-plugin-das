@@ -349,6 +349,10 @@ class ModelOptW8A16MoEMethod(FusedMoEMethodBase):
         shared_experts: SharedExperts | None,
         shared_experts_input: torch.Tensor | None,
     ) -> torch.Tensor | tuple[torch.Tensor, torch.Tensor]:
+        # 0.28 stores layer.activation as a plain string; older stacks
+        # used an enum with .value.
+        act = getattr(layer, "activation", None)
+        act = act.value if hasattr(act, "value") else act
 
         if _HAS_AITER and envs.VLLM_ROCM_USE_AITER_MOE:
             from vllm.platforms import current_platform
@@ -403,7 +407,7 @@ class ModelOptW8A16MoEMethod(FusedMoEMethodBase):
                 topk_ids=topk_ids,
                 moe_config=moe_cfg,
                 inplace=inplace,
-                activation=layer.activation.value,
+                activation=act,
                 w1_scale=self.moe_quant_config.w1_scale.unsqueeze(dim=-1),
                 w2_scale=self.moe_quant_config.w2_scale.unsqueeze(dim=-1),
                 w1_zp=self.moe_quant_config.w1_zp,
@@ -418,6 +422,9 @@ class ModelOptW8A16MoEMethod(FusedMoEMethodBase):
         else:
             # 0.28 fused_experts dropped the inplace kwarg (activation is a
             # positional arg there); output is always a fresh tensor.
+            # fused_experts (and the vllm.fused_experts op it wraps) wants
+            # the MoEActivation enum; normalize the str-or-enum layer attr.
+            from vllm.model_executor.layers.fused_moe.activation import MoEActivation
             from vllm.model_executor.layers.fused_moe.fused_moe import fused_experts
             return fused_experts(
                 x,
@@ -425,7 +432,7 @@ class ModelOptW8A16MoEMethod(FusedMoEMethodBase):
                 layer.w2_weight,
                 topk_weights=topk_weights,
                 topk_ids=topk_ids,
-                activation=layer.activation.value,
+                activation=MoEActivation(act) if isinstance(act, str) else act,
                 quant_config=self.moe_quant_config,
             )
 
