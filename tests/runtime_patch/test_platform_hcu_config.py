@@ -105,6 +105,7 @@ def _make_arg_utils_module() -> ModuleType:
         kernel_config: _KernelConfig | dict[str, Any] = field(
             default_factory=_KernelConfig
         )
+        eplb_config: dict[str, Any] = field(default_factory=dict)
         speculative_config: dict[str, Any] | None = None
 
         def __post_init__(self) -> None:
@@ -130,10 +131,22 @@ def _make_arg_utils_module() -> ModuleType:
 
         @staticmethod
         def add_cli_args(parser: argparse.ArgumentParser):
+            def parse_official_eplb(value: str) -> dict[str, Any]:
+                payload = json.loads(value)
+                unexpected = set(payload) & patch_engine_args._HCU_EPLB_FIELDS.keys()
+                if unexpected:
+                    raise ValueError(f"unexpected EPLB fields: {sorted(unexpected)}")
+                return payload
+
             parser.add_argument(
                 "--all2all-backend",
                 choices=("allgather_reducescatter", "deepep_low_latency"),
                 default="allgather_reducescatter",
+            )
+            parser.add_argument(
+                "--eplb-config",
+                type=parse_official_eplb,
+                default={},
             )
             return parser
 
@@ -196,6 +209,7 @@ def test_engine_args_legacy_keywords_are_removed_before_official_init() -> None:
         "all2all_backend",
         "moe_backend",
         "kernel_config",
+        "eplb_config",
         "speculative_config",
     }
 
@@ -218,6 +232,95 @@ def test_engine_args_normalizes_deepep_auto_and_extends_cli_choice() -> None:
     parser = module.EngineArgs.add_cli_args(argparse.ArgumentParser())
     parsed = parser.parse_args(["--all2all-backend", "deepep_auto"])
     assert parsed.all2all_backend == "deepep_auto"
+
+
+def test_engine_args_extracts_nested_offline_eplb_fields() -> None:
+    module = _make_arg_utils_module()
+    patch_engine_args.apply_to_module(module)
+    eplb_config = {
+        "window_size": 512,
+        "step_interval": 100,
+        "expert_map_path": "/maps/hy4.json",
+        "disable_rearrange": True,
+        "static_dispatch_policy": "locality_fair",
+    }
+
+    args = module.EngineArgs(eplb_config=eplb_config)
+
+    assert eplb_config["expert_map_path"] == "/maps/hy4.json"
+    assert args.eplb_config == {"window_size": 512, "step_interval": 100}
+    assert get_hcu_config(args) == HcuFeatureConfig(
+        expert_map_path="/maps/hy4.json",
+        eplb_disable_rearrange=True,
+        eplb_static_dispatch_policy="locality_fair",
+    )
+
+    config = args.create_engine_config()
+    assert get_hcu_config(config) == get_hcu_config(args)
+    assert config.parallel_config._vllm_hcu_expert_map_path == "/maps/hy4.json"
+    assert config.parallel_config._vllm_hcu_expert_map_record_path is None
+    assert config.parallel_config._vllm_hcu_eplb_disable_rearrange is True
+    assert (
+        config.parallel_config._vllm_hcu_eplb_static_dispatch_policy
+        == "locality_fair"
+    )
+
+
+def test_engine_args_extracts_nested_offline_eplb_record_path() -> None:
+    module = _make_arg_utils_module()
+    patch_engine_args.apply_to_module(module)
+
+    args = module.EngineArgs(
+        eplb_config={"expert_map_record_path": "/maps/record.json"}
+    )
+
+    assert args.eplb_config == {}
+    assert get_hcu_config(args).expert_map_record_path == "/maps/record.json"
+
+
+def test_engine_args_cli_delays_offline_eplb_validation_until_hcu_init() -> None:
+    module = _make_arg_utils_module()
+    patch_engine_args.apply_to_module(module)
+    parser = module.EngineArgs.add_cli_args(argparse.ArgumentParser())
+
+    namespace = parser.parse_args(
+        [
+            "--eplb-config",
+            json.dumps(
+                {
+                    "window_size": 16,
+                    "step_interval": 16,
+                    "num_redundant_experts": 8,
+                    "use_async": False,
+                    "expert_map_record_path": "/maps/hy4.json",
+                }
+            ),
+        ]
+    )
+    args = module.EngineArgs.from_cli_args(namespace)
+
+    assert args.eplb_config == {
+        "window_size": 16,
+        "step_interval": 16,
+        "num_redundant_experts": 8,
+        "use_async": False,
+    }
+    assert get_hcu_config(args).expert_map_record_path == "/maps/hy4.json"
+
+
+def test_engine_args_rejects_conflicting_nested_offline_eplb_sidecar() -> None:
+    module = _make_arg_utils_module()
+    patch_engine_args.apply_to_module(module)
+
+    with pytest.raises(ValueError, match="conflicting expert_map_path"):
+        module.EngineArgs(
+            additional_config={
+                "hcu": HcuFeatureConfig(
+                    expert_map_path="/maps/sidecar.json"
+                ).to_dict()
+            },
+            eplb_config={"expert_map_path": "/maps/nested.json"},
+        )
 
 
 def test_dspark_deepep_auto_uses_standard_engine_args_path() -> None:
