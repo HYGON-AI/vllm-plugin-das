@@ -81,6 +81,7 @@ if TYPE_CHECKING:
     VLLM_HCU_PLE_PREFETCH_STREAM: bool = False
     VLLM_HCU_QWEN4_EXP_HC_SP: bool = True
     VLLM_HCU_MHC_FUSED_RMSNORM: bool = False
+    VLLM_HCU_GLM5NEXT_KDA_STRIDED_INPUTS: bool = False
 
 def maybe_convert_int(value: Optional[str]) -> Optional[int]:
     """
@@ -610,6 +611,16 @@ hcu_vllm_environment_variables: dict[str, Callable[[], Any]] = {
     # (the case on HCU). See patch_mhc_backend.py.
     "VLLM_HCU_MHC_FUSED_RMSNORM":
         lambda: (os.environ.get("VLLM_HCU_MHC_FUSED_RMSNORM", "False").lower() in
+                    ("true", "1")),
+
+    # Skip the .contiguous() copies GLM5Next's fused_recurrent_kda otherwise
+    # applies to q/k/v/g/beta before the recurrent decode/spec-verify kernel,
+    # by passing per-token strides into the kernel instead. On the decode and
+    # spec-verify paths q/k/v are non-contiguous views split out of the merged
+    # qkv causal-conv1d output, so this removes 4-5 elementwise copy kernels
+    # per step. See patch_glm5next_kda_strided_recurrent.py.
+    "VLLM_HCU_GLM5NEXT_KDA_STRIDED_INPUTS":
+        lambda: (os.environ.get("VLLM_HCU_GLM5NEXT_KDA_STRIDED_INPUTS", "False").lower() in
                     ("true", "1")),
 }
 
