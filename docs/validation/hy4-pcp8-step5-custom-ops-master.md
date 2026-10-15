@@ -156,6 +156,32 @@ Retained ignored artifacts:
 - `hy4-humaneval164-max16384-c16-score.json`, SHA-256
   `e0fb6ca75dcd58c73b42ad3b02d51a87aa22a64bb556be3bdb2026507e4a5884`
 
+### Standard rejection control
+
+The full run above used synthetic acceptance. A control run removed
+`rejection_sample_method=synthetic` and `synthetic_acceptance_length=3.28`,
+leaving standard MTP3 rejection enabled. The client explicitly used
+`reasoning_effort=no_think`, temperature 0, `top_p=1`, `max_tokens=16384`, and
+16 concurrent requests.
+
+- 164/164 requests returned HTTP 200 with `finish_reason=stop`; all 164
+  responses had zero reasoning tokens.
+- Generation completed in 179.391 seconds and produced 28,210 completion
+  tokens. Completion lengths were 31–494 tokens (172.01 mean).
+- EvalScope 1.11.0 `check_correctness` scored **153/164 (93.29%)**. The failed
+  task indices were 32, 59, 97, 103, 108, 115, 127, 130, 132, 145, and 160.
+- This is 28 more passing problems than the synthetic run. Synthetic
+  acceptance is therefore not used as accuracy evidence: accepting draft
+  tokens independently of the target model is not lossless speculative
+  decoding.
+
+Retained ignored artifacts:
+
+- `hy4-humaneval164-nothink-mtp3-standard-c16.json`, SHA-256
+  `83ece0a91407d7f141bd5e698e38641d13ca0ad38433af2f1a7cd420f1742f0c`
+- `hy4-humaneval164-nothink-mtp3-standard-c16-score.json`, SHA-256
+  `339a418f32afe8659ede59a3908e90ca00ee101b1d94f62b965f2be15f201cd4`
+
 ## CPU and source-level verification
 
 The post-review focused suite produced **314 passed, 1 deselected, 14 warnings**.
