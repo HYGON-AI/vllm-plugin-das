@@ -416,6 +416,8 @@ class ModelOptW8A16MoEMethod(FusedMoEMethodBase):
                 routed_scaling_factor=1.0,
             )
         else:
+            # 0.28 fused_experts dropped the inplace kwarg (activation is a
+            # positional arg there); output is always a fresh tensor.
             from vllm.model_executor.layers.fused_moe.fused_moe import fused_experts
             return fused_experts(
                 x,
@@ -423,7 +425,6 @@ class ModelOptW8A16MoEMethod(FusedMoEMethodBase):
                 layer.w2_weight,
                 topk_weights=topk_weights,
                 topk_ids=topk_ids,
-                inplace=True,
                 activation=layer.activation.value,
                 quant_config=self.moe_quant_config,
             )
