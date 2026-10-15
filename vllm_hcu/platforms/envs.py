@@ -16,8 +16,8 @@ if TYPE_CHECKING:
     VLLM_HCU_USE_FLASHMLA: bool = False
     VLLM_HCU_DSV41_FLASHMLA_PREFILL: bool = True
     VLLM_HCU_DSV41_FLASHMLA_DECODE: bool = True
-    VLLM_HCU_DSV41_FLASHMLA_DECODE_GRAPH: bool = False
-    VLLM_HCU_DSV41_FLASHMLA_DSPARK: bool = False
+    VLLM_HCU_DSV41_FLASHMLA_DECODE_GRAPH: bool = True
+    VLLM_HCU_DSV41_FLASHMLA_DSPARK: bool = True
     VLLM_USE_OPT_CAT: bool = False
     VLLM_HCU_USE_CAT_MLA: bool = False
     VLLM_HCU_DISABLE_DSA: bool = False
@@ -134,18 +134,18 @@ def dsv41_flashmla_decode_enabled() -> bool:
 def dsv41_flashmla_decode_graph_enabled() -> bool:
     """Opt-in graph rollout; ordinary eager decode remains default-on.
 
-    Keep capture gated until the operator and DP/EP serving graph regressions
-    have passed. Changing this switch requires re-capturing existing graphs.
+    Decode graph is enabled by default after the validated rollout. Changing
+    this switch requires re-capturing existing graphs.
     """
     return dsv41_flashmla_decode_enabled() and _environment_flag(
-        os.environ.get("VLLM_HCU_DSV41_FLASHMLA_DECODE_GRAPH", "False")
+        os.environ.get("VLLM_HCU_DSV41_FLASHMLA_DECODE_GRAPH", "True")
     )
 
 
 def dsv41_flashmla_dspark_enabled() -> bool:
     """Opt-in DSpark rollout, independent of ordinary eager/graph decode."""
     return dsv41_flashmla_decode_enabled() and _environment_flag(
-        os.environ.get("VLLM_HCU_DSV41_FLASHMLA_DSPARK", "False")
+        os.environ.get("VLLM_HCU_DSV41_FLASHMLA_DSPARK", "True")
     )
 
 

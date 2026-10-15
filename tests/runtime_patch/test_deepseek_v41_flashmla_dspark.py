@@ -50,7 +50,7 @@ def test_only_explicit_dspark_config_is_accepted(enabled, monkeypatch, method, c
 
 
 @pytest.mark.parametrize("child,decode,master,expected", [
-    (None, "1", "1", False), ("1", "1", "1", True),
+    (None, "1", "1", True), ("1", "1", "1", True),
     ("0", "1", "1", False), ("1", "0", "1", False),
     ("1", "1", "0", False),
 ])
