@@ -1220,7 +1220,9 @@ def test_real_v0251_set_cudagraph_binds_custom_sp_before_first_adjustment() -> N
 
 
 class _ValidationCompilation:
-    pass
+    def __init__(self) -> None:
+        # Mirrors CompilationConfig: no attention layers are registered yet.
+        self.static_forward_context: dict[str, object] = {}
 
 
 def _validation_config(feature_config: HcuFeatureConfig) -> object:

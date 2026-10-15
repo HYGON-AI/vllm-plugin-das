@@ -25,6 +25,7 @@ void register_graph_buffers(fptr_t _fa,
 std::tuple<int64_t, torch::Tensor> allocate_shared_buffer_and_handle(
     int64_t size);
 int64_t open_mem_handle(torch::Tensor& mem_handle);
+void close_mem_handle(int64_t buffer);
 void free_shared_buffer(int64_t buffer);
 
 void reshape_and_cache_hcu(

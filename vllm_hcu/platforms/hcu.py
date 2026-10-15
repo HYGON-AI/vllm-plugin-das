@@ -1,18 +1,14 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright (c) 2026 Hygon Information Technology Co., Ltd.
+import contextlib
 import importlib
-import os
-from datetime import timedelta
 from functools import cache, lru_cache
 from math import lcm
 from types import ModuleType
 from typing import TYPE_CHECKING
 
-import regex as re
 import torch
 import vllm.envs as envs
-from torch.distributed import PrefixStore, ProcessGroup
-from torch.distributed.distributed_c10d import is_nccl_available
 from vllm.logger import init_logger
 from vllm.platforms.interface import DeviceCapability, Platform, PlatformEnum
 from vllm.v1.attention.backends.registry import AttentionBackendEnum, register_backend
@@ -279,7 +275,6 @@ class HCUPlatform(Platform):
         """Import ROCm-specific kernels."""
         super().import_kernels()
 
-        import contextlib
 
         # Import ROCm-specific extension
         with contextlib.suppress(ImportError):
@@ -793,6 +788,109 @@ class HCUPlatform(Platform):
                 backend.name,
             )
 
+        # Different attention layers may use different kernel block sizes.
+        # A manager block can contain multiple kernel blocks: preserve an
+        # upstream hybrid/heterogeneous page alignment whenever a common
+        # kernel block divides it, rather than replacing it with a small page.
+        if cache_config is not None and not cache_config.user_specified_block_size:
+            from vllm.config.vllm import (
+                get_layers_from_vllm_config,
+                set_current_vllm_config,
+            )
+            from vllm.model_executor.layers.attention_layer_base import (
+                AttentionLayerBase,
+            )
+            from vllm.v1.attention.backend import MultipleOf
+
+            attn_layers = get_layers_from_vllm_config(
+                vllm_config,
+                AttentionLayerBase,  # type: ignore[type-abstract]
+            )
+            backends = []
+            seen = set()
+            for layer in attn_layers.values():
+                backend_cls = layer.get_attn_backend()
+                if backend_cls.is_ssm() or backend_cls in seen:
+                    continue
+                seen.add(backend_cls)
+                backends.append(backend_cls)
+
+            if len(backends) > 1:
+                with set_current_vllm_config(vllm_config):
+                    supported = [
+                        b.get_supported_kernel_block_sizes() for b in backends
+                    ]
+                for sizes in supported:
+                    for size in sizes:
+                        base = size.base if isinstance(size, MultipleOf) else size
+                        if (
+                            not isinstance(base, int)
+                            or isinstance(base, bool)
+                            or base <= 0
+                        ):
+                            raise ValueError(
+                                f"Invalid attention kernel block size: {size}"
+                            )
+
+                def supports_kernel(block: int) -> bool:
+                    return all(
+                        any(
+                            block % size.base == 0
+                            if isinstance(size, MultipleOf)
+                            else block == size
+                            for size in sizes
+                        )
+                        for sizes in supported
+                    )
+
+                # A common size is either one of the explicit integer choices,
+                # or a common multiple of one MultipleOf rule from each backend.
+                explicit = {
+                    size
+                    for sizes in supported
+                    for size in sizes
+                    if isinstance(size, int) and supports_kernel(size)
+                }
+                common_multiples = {1}
+                for sizes in supported:
+                    common_multiples = {
+                        lcm(previous, size.base)
+                        for previous in common_multiples
+                        for size in sizes
+                        if isinstance(size, MultipleOf)
+                    }
+                common_kernels = explicit | common_multiples
+                current = cache_config.block_size
+                if supports_kernel(current) or any(
+                    current % kernel == 0 for kernel in common_kernels
+                ):
+                    return
+                names = [b.get_name() for b in backends]
+                if not common_kernels:
+                    raise ValueError(
+                        f"No common attention kernel block size for backends {names}"
+                    )
+                if vllm_config.model_config.is_hybrid or getattr(
+                    cache_config, "kv_cache_dtype_skip_layers", None
+                ):
+                    # These configurations carry page-padding hints calculated
+                    # by upstream. Changing only block_size would invalidate
+                    # those hints and potentially the SSM chunk alignment.
+                    raise ValueError(
+                        f"Upstream-aligned KV manager block size {current} cannot "
+                        f"be split into a common kernel block for {names}; "
+                        "hybrid/heterogeneous KV page alignment must be resolved "
+                        "before changing the manager block size"
+                    )
+                required = min(lcm(current, kernel) for kernel in common_kernels)
+                logger.info(
+                    "Aligning KV manager block size from %d to %d for "
+                    "attention backends %s.",
+                    current,
+                    required,
+                    names,
+                )
+                cache_config.block_size = required
 
     @classmethod
     def get_current_memory_usage(

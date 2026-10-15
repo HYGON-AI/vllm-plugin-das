@@ -5,6 +5,7 @@
 from __future__ import annotations
 
 import functools
+import sys
 from types import ModuleType
 
 from vllm_hcu.patch.worker.op_opt.moe._common import (
@@ -28,6 +29,10 @@ TARGETS = (
 )
 _MARKER = "_vllm_hcu_lightop_w16a16_oracle_applied"
 _BINDING_MARKER = "_vllm_hcu_lightop_w16a16_oracle_binding"
+_CONSUMER_MODULES = (
+    "vllm.model_executor.layers.fused_moe.unquantized_fused_moe_method",
+    "vllm_hcu.model_executor.layers.fused_moe.unquantized_fused_moe_method",
+)
 
 
 def _normalize_backend(backend, old_enum, new_enum):
@@ -144,7 +149,25 @@ def apply_to_module(module: ModuleType) -> bool:
                 if configs_available:
                     return hcu_enum.HCU_LIGHTOP_W16A16, experts_cls
 
-        backend, experts = select_backend(moe_config)
+        try:
+            backend, experts = select_backend(moe_config)
+        except ValueError as exc:
+            # moe_backend is global, but mixed checkpoints keep some MoE layers
+            # unquantized (e.g. Step5 bf16 layers with SWIGLUSTEP).  When the
+            # requested AITER backend cannot serve such a layer, use Triton
+            # for it instead of failing the whole model.
+            if getattr(moe_config, "moe_backend", "auto") != "aiter":
+                raise
+            batched = moe_config.moe_parallel_config.use_batched_activation_format
+            backend = hcu_enum.BATCHED_TRITON if batched else hcu_enum.TRITON
+            # hcu_backend_to_kernel_cls, not the captured original: the original
+            # compares against the module-global enum, which is hcu_enum now.
+            experts = hcu_backend_to_kernel_cls(backend)[0]
+            target.logger.warning_once(
+                "%s Falling back to %s for this unquantized MoE layer.",
+                exc,
+                backend.value,
+            )
         return _normalize_backend(backend, old_enum, hcu_enum), experts
 
     @functools.wraps(convert)
@@ -204,6 +227,27 @@ def apply_to_module(module: ModuleType) -> bool:
         hcu_convert_to_unquantized_kernel_format
     )
     target.make_unquantized_moe_kernel = hcu_make_unquantized_moe_kernel
+
+    # Method modules import these helpers by name; any that were imported
+    # before this patch still hold the originals, so rebind them.
+    rebinds = {
+        "select_unquantized_moe_backend": (
+            select_backend,
+            hcu_select_unquantized_moe_backend,
+        ),
+        "convert_to_unquantized_kernel_format": (
+            convert,
+            hcu_convert_to_unquantized_kernel_format,
+        ),
+        "make_unquantized_moe_kernel": (make_kernel, hcu_make_unquantized_moe_kernel),
+    }
+    for consumer_name in _CONSUMER_MODULES:
+        consumer = sys.modules.get(consumer_name)
+        if consumer is None:
+            continue
+        for name, (original, replacement) in rebinds.items():
+            if getattr(consumer, name, None) is original:
+                setattr(consumer, name, replacement)
     setattr(target, _MARKER, True)
     return True
 
