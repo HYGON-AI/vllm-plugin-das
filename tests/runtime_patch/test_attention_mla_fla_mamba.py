@@ -2380,8 +2380,7 @@ def test_sparse_mla_cache_update_uses_hcu_operator(
     )
     _install_fake_module(
         monkeypatch,
-        "vllm_hcu.v1.attention.backends.fa_utils",
-        hcu_ops=object(),
+        "vllm_hcu.hcu_ops",
     )
 
     assert adapter.apply_to_module(module)
@@ -2435,8 +2434,7 @@ def test_sparse_mla_fp8_nope_cache_update_zero_pads_rope(monkeypatch, preallocat
     )
     _install_fake_module(
         monkeypatch,
-        "vllm_hcu.v1.attention.backends.fa_utils",
-        hcu_ops=object(),
+        "vllm_hcu.hcu_ops",
     )
     assert adapter.apply_to_module(module)
 
