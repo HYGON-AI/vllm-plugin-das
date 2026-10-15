@@ -149,12 +149,16 @@ class HYV4MoEFused(nn.Module):
             # only the intermediate dimension.
             self.ep_rank = 0
             self.ep_size = 1
-        if self.offline_eplb_mode is not None and (
-            self.tp_size != 1 or self.ep_size != 8
-        ):
-            raise ValueError(
-                "HYV4 offline EPLB requires runtime TP1/EP8 groups"
-            )
+        if self.offline_eplb_mode is not None:
+            if self.tp_size != 1 or self.ep_size != 8:
+                raise ValueError(
+                    "HYV4 offline EPLB requires runtime TP1/EP8 groups"
+                )
+            speculative = getattr(vllm_config, "speculative_config", None)
+            if getattr(speculative, "method", None) != "mtp":
+                raise ValueError(
+                    "HYV4 offline EPLB requires MTP speculative decoding"
+                )
         self.n_routed_experts = config.num_experts
         if self.tp_size > config.num_experts:
             raise ValueError(

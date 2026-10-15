@@ -56,6 +56,7 @@ def _hf_config() -> SimpleNamespace:
 def _vllm_config(
     *,
     offline_field: str | None = "expert_map_path",
+    speculative_method: str | None = "mtp",
     redundant: int = 8,
     use_async: bool = False,
     enable_eplb: bool = True,
@@ -70,6 +71,11 @@ def _vllm_config(
         hcu[offline_field] = "/tmp/hy4-eplb.json"
     return SimpleNamespace(
         additional_config={"hcu": HcuFeatureConfig(**hcu).to_dict()},
+        speculative_config=(
+            SimpleNamespace(method=speculative_method)
+            if speculative_method is not None
+            else None
+        ),
         parallel_config=SimpleNamespace(
             enable_eplb=enable_eplb,
             enable_expert_parallel=enable_expert_parallel,
@@ -161,6 +167,14 @@ def test_hy_v4_offline_eplb_allocates_ep8_redundant_topology(
         ({"redundant": 16}, "exactly 8"),
         ({"tensor_parallel_size": 2}, "TP1"),
         ({"data_parallel_size": 4}, "DP8"),
+        (
+            {
+                "offline_field": "expert_map_record_path",
+                "speculative_method": None,
+            },
+            "MTP speculative decoding",
+        ),
+        ({"speculative_method": "dspark"}, "MTP speculative decoding"),
     ],
 )
 def test_hy_v4_offline_eplb_rejects_unsupported_modes(
@@ -179,15 +193,19 @@ def test_hy_v4_offline_eplb_rejects_unsupported_modes(
         )
 
 
-def test_hy_v4_offline_eplb_rejects_non_ep8_runtime_group(
+@pytest.mark.parametrize("speculative_method", ["mtp", None, "dspark"])
+def test_hy_v4_offline_eplb_rejects_non_ep8_runtime_group_before_mtp(
     monkeypatch: pytest.MonkeyPatch,
+    speculative_method: str | None,
 ) -> None:
     _patch_moe_dependencies(monkeypatch, ep_size=4)
 
     with pytest.raises(ValueError, match="EP8"):
         hy_v4_moe.HYV4MoEFused(
             config=_hf_config(),
-            vllm_config=_vllm_config(),
+            vllm_config=_vllm_config(
+                speculative_method=speculative_method
+            ),
             enable_eplb=True,
         )
 
