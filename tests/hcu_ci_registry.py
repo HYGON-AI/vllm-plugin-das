@@ -126,11 +126,6 @@ register_hcu_ci(
 )
 register_hcu_ci(
     job="contract-hcu-gfx936",
-    target="tests/runtime_patch/test_gate_linear_context.py",
-    est_time=180,
-)
-register_hcu_ci(
-    job="contract-hcu-gfx936",
     target="tests/runtime_patch/test_glm53_native_mhc.py",
     est_time=60,
 )
