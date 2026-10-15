@@ -12,6 +12,7 @@ from types import ModuleType
 import torch
 
 from vllm_hcu.patch.config import get_hcu_config
+from vllm_hcu.platforms import envs as henvs
 
 from vllm_hcu.patch.import_coordinator import (
     IMPORT_COORDINATOR,
@@ -59,7 +60,9 @@ def _maybe_init_ep_custom_allreduce(communicator, unique_name: str) -> None:
     Upstream restricts custom all-reduce to the TP group; the fused MoE
     combine (moe_runner._ep_fused_all_reduce) all-reduces over EP instead.
     """
-    if os.environ.get("VLLM_HCU_EP_FUSED_COMBINE", "0") != "1":
+    if not henvs.optional_custom_op_enabled(
+        os.environ.get("VLLM_HCU_EP_FUSED_COMBINE", "0") == "1"
+    ):
         return
     if unique_name.split(":")[0] != "ep" or communicator.world_size <= 1:
         return
@@ -92,7 +95,9 @@ def _maybe_init_dp_ipc_all_gather(communicator, unique_name: str) -> None:
     takes ~15 us.  Used by ``hcu_all_gatherv`` when the gather fits.
     """
     communicator._hcu_ipc_ag = None
-    if os.environ.get("VLLM_HCU_DP_CUSTOM_AG", "0") != "1":
+    if not henvs.optional_custom_op_enabled(
+        os.environ.get("VLLM_HCU_DP_CUSTOM_AG", "0") == "1"
+    ):
         return
     if unique_name.split(":")[0] != "dp" or not 2 <= communicator.world_size <= 8:
         return

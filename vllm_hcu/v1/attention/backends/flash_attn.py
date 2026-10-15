@@ -45,6 +45,7 @@ from vllm.v1.attention.ops.dcp import (
 )
 from vllm.v1.attention.ops.merge_attn_states import merge_attn_states
 from vllm.v1.worker.workspace import current_workspace_manager
+from vllm_hcu.platforms import envs as henvs
 
 if is_flash_attn_varlen_func_available():
     from vllm_hcu.v1.attention.backends.fa_utils import (
@@ -108,7 +109,9 @@ if TYPE_CHECKING:
 # Sliding-window decode (q_len <= 4) on the FP8 D192 cache through the Triton
 # split-KV kernel instead of the cutlass HG prefix kernel (~4x faster, more
 # accurate). VLLM_HCU_SWA_DECODE=0 restores the cutlass path.
-_SWA_DECODE_ENABLED = os.environ.get("VLLM_HCU_SWA_DECODE", "1") == "1"
+_SWA_DECODE_ENABLED = henvs.optional_custom_op_enabled(
+    os.environ.get("VLLM_HCU_SWA_DECODE", "1") == "1"
+)
 
 
 def _get_flash_attn_mode() -> str:

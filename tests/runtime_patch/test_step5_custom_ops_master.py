@@ -21,6 +21,13 @@ _MODEL_CHILDREN = (
     "VLLM_HCU_TRITON_TOKEN_FP8_QUANT",
 )
 
+_RUNTIME_CHILDREN = (
+    "VLLM_HCU_EP_FUSED_MOE",
+    "VLLM_HCU_EP_FUSED_COMBINE",
+    "VLLM_HCU_HOST_SEQ_LENS",
+    "VLLM_HCU_SWA_DECODE",
+)
+
 
 @pytest.mark.parametrize(
     ("master", "child", "expected"),
@@ -65,6 +72,58 @@ actual = (
     step5_swa_fused.FUSED_GATE,
     skinny_lm_head._ENABLED,
     token_fp8_quant.ENABLED,
+)
+assert actual == {expected!r}, actual
+"""
+    result = subprocess.run(
+        [sys.executable, "-c", script],
+        env=env,
+        capture_output=True,
+        text=True,
+        timeout=120,
+    )
+    assert result.returncode == 0, result.stdout + result.stderr
+
+
+@pytest.mark.parametrize(
+    ("master", "child", "expected"),
+    [
+        ("0", "1", (False,) * 4),
+        ("1", "1", (True,) * 4),
+        ("1", "0", (False,) * 4),
+        ("1", None, (False, False, True, True)),
+    ],
+)
+def test_step5_runtime_features_obey_custom_ops_master(master, child, expected):
+    """Runtime fast paths must use the same effective master/child state."""
+
+    env = os.environ.copy()
+    env["VLLM_HCU_USE_CUSTOM_OPS"] = master
+    for name in _RUNTIME_CHILDREN:
+        if child is None:
+            env.pop(name, None)
+        else:
+            env[name] = child
+    script = f"""
+import importlib
+import vllm
+from vllm_hcu import hcu_platform_register_model
+hcu_platform_register_model()
+
+deep_gemm_moe = importlib.import_module(
+    "vllm.model_executor.layers.fused_moe.experts.deep_gemm_moe"
+)
+moe_runner = importlib.import_module(
+    "vllm.model_executor.layers.fused_moe.runner.moe_runner"
+)
+hcu_model_runner_v2 = importlib.import_module("vllm_hcu.v1.hcu_model_runner_v2")
+flash_attn = importlib.import_module("vllm_hcu.v1.attention.backends.flash_attn")
+
+actual = (
+    deep_gemm_moe._EP_FUSED_MOE,
+    moe_runner._EP_FUSED_COMBINE,
+    hcu_model_runner_v2._USE_HOST_SEQ_LENS,
+    flash_attn._SWA_DECODE_ENABLED,
 )
 assert actual == {expected!r}, actual
 """

@@ -55,6 +55,7 @@ from vllm.utils.deep_gemm import (
     mk_alignment_scope,
 )
 from vllm.utils.import_utils import has_deep_gemm
+from vllm_hcu.platforms import envs as henvs
 
 logger = init_logger(__name__)
 
@@ -65,7 +66,9 @@ _HCU_HT_EP_TOKEN_ALIGNMENT = 256
 # Opt-in: run Channel-FP8 EP MoE through ep_fused_moe (expert-sorted Triton GEMMs,
 # work bounded by local routes) instead of DeepGEMM. patch_fp8_oracle then keeps
 # the weights as plain [E, N, K].
-_EP_FUSED_MOE = os.environ.get("VLLM_HCU_EP_FUSED_MOE", "0") == "1"
+_EP_FUSED_MOE = henvs.optional_custom_op_enabled(
+    os.environ.get("VLLM_HCU_EP_FUSED_MOE", "0") == "1"
+)
 
 
 def _valid_deep_gemm_shape(M: int, N: int, K: int) -> bool:
