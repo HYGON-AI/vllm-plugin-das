@@ -101,6 +101,7 @@ def _make_arg_utils_module() -> ModuleType:
         attention_backend: str | None = None
         attention_config: dict[str, Any] = field(default_factory=dict)
         all2all_backend: str = "allgather_reducescatter"
+        gdn_prefill_backend: str | None = None
         moe_backend: str = "auto"
         kernel_config: _KernelConfig | dict[str, Any] = field(
             default_factory=_KernelConfig
@@ -121,8 +122,13 @@ def _make_arg_utils_module() -> ModuleType:
             kernel_config = copy.deepcopy(self.kernel_config)
             if self.moe_backend != "auto":
                 kernel_config.moe_backend = self.moe_backend
+            additional_config = copy.deepcopy(self.additional_config)
+            if self.gdn_prefill_backend is not None:
+                additional_config["gdn_prefill_backend"] = (
+                    self.gdn_prefill_backend
+                )
             return SimpleNamespace(
-                additional_config=copy.deepcopy(self.additional_config),
+                additional_config=additional_config,
                 kernel_config=kernel_config,
                 parallel_config=SimpleNamespace(
                     all2all_backend=self.all2all_backend
@@ -142,6 +148,12 @@ def _make_arg_utils_module() -> ModuleType:
                 "--all2all-backend",
                 choices=("allgather_reducescatter", "deepep_low_latency"),
                 default="allgather_reducescatter",
+            )
+            parser.add_argument(
+                "--gdn-prefill-backend",
+                dest="gdn_prefill_backend",
+                choices=["flashinfer", "triton", "cutedsl"],
+                default=None,
             )
             parser.add_argument(
                 "--eplb-config",
@@ -207,6 +219,7 @@ def test_engine_args_legacy_keywords_are_removed_before_official_init() -> None:
         "attention_backend",
         "attention_config",
         "all2all_backend",
+        "gdn_prefill_backend",
         "moe_backend",
         "kernel_config",
         "eplb_config",
@@ -232,6 +245,70 @@ def test_engine_args_normalizes_deepep_auto_and_extends_cli_choice() -> None:
     parser = module.EngineArgs.add_cli_args(argparse.ArgumentParser())
     parsed = parser.parse_args(["--all2all-backend", "deepep_auto"])
     assert parsed.all2all_backend == "deepep_auto"
+
+
+@pytest.mark.parametrize("backend", ["hcu-boltops", "hcu-aiter"])
+def test_engine_args_moves_hcu_gdn_prefill_backend_to_sidecar(
+    backend: str,
+) -> None:
+    module = _make_arg_utils_module()
+    patch_engine_args.apply_to_module(module)
+
+    args = module.EngineArgs(gdn_prefill_backend=backend)
+    assert args.gdn_prefill_backend == "triton"
+    assert get_hcu_config(args).hcu_gdn_prefill_backend == backend
+    config = args.create_engine_config()
+    assert config.additional_config["gdn_prefill_backend"] == "triton"
+    assert get_hcu_config(config).hcu_gdn_prefill_backend == backend
+
+    parser = module.EngineArgs.add_cli_args(argparse.ArgumentParser())
+    parsed = parser.parse_args(["--gdn-prefill-backend", backend])
+    cli_args = module.EngineArgs.from_cli_args(parsed)
+    assert cli_args.gdn_prefill_backend == "triton"
+    assert get_hcu_config(cli_args).hcu_gdn_prefill_backend == backend
+
+
+@pytest.mark.parametrize("backend", [None, "triton", "flashinfer"])
+def test_engine_args_keeps_official_gdn_prefill_backend(
+    backend: str | None,
+) -> None:
+    module = _make_arg_utils_module()
+    patch_engine_args.apply_to_module(module)
+
+    args = module.EngineArgs(gdn_prefill_backend=backend)
+    assert args.gdn_prefill_backend == backend
+    assert get_hcu_config(args).hcu_gdn_prefill_backend is None
+
+
+@pytest.mark.parametrize("backend", ["hcu-boltops", "hcu-aiter"])
+def test_engine_args_sidecar_only_gdn_prefill_backend_pins_triton(
+    backend: str,
+) -> None:
+    module = _make_arg_utils_module()
+    patch_engine_args.apply_to_module(module)
+    sidecar = {"hcu": {"hcu_gdn_prefill_backend": backend}}
+
+    args = module.EngineArgs(additional_config=sidecar)
+    assert args.gdn_prefill_backend == "triton"
+    assert get_hcu_config(args).hcu_gdn_prefill_backend == backend
+
+    # A reconstructed instance that bypassed the constructor normalisation.
+    args.gdn_prefill_backend = None
+    config = args.create_engine_config()
+    assert args.gdn_prefill_backend == "triton"
+    assert config.additional_config["gdn_prefill_backend"] == "triton"
+    assert get_hcu_config(config).hcu_gdn_prefill_backend == backend
+
+
+def test_engine_args_rejects_conflicting_gdn_prefill_backend() -> None:
+    module = _make_arg_utils_module()
+    patch_engine_args.apply_to_module(module)
+
+    with pytest.raises(ValueError, match="conflicting hcu_gdn_prefill_backend"):
+        module.EngineArgs(
+            gdn_prefill_backend="hcu-aiter",
+            additional_config={"hcu": {"hcu_gdn_prefill_backend": "hcu-boltops"}},
+        )
 
 
 def test_engine_args_extracts_nested_offline_eplb_fields() -> None:
