@@ -443,8 +443,8 @@ def test_prefill_pads_local_head_counts(
         torch.testing.assert_close(output, expected.expand_as(output))
 
 
-def test_prefill_head_padding_defaults_to_disabled():
-    assert not henvs.VLLM_HCU_DEEPSEEK_V4_ROCM_FLASHMLA_PREFILL_HEAD_PADDING
+def test_prefill_head_padding_defaults_to_enabled():
+    assert henvs.VLLM_HCU_DEEPSEEK_V4_ROCM_FLASHMLA_PREFILL_HEAD_PADDING
 
 
 def test_guard_rejects_unavailable_flashmla(monkeypatch):
