@@ -240,6 +240,13 @@ def _normalise_constructor_kwargs(
             f"HCU sidecar selects {requested_gdn_prefill} but "
             f"EngineArgs.gdn_prefill_backend selects {top_level_gdn_prefill!r}"
         )
+    elif (
+        requested_gdn_prefill is not None
+        and top_level_gdn_prefill is None
+        and "gdn_prefill_backend" not in bound.arguments
+    ):
+        # Sidecar-only selection: pin vLLM to the FLA path the HCU wrappers own.
+        kwargs["gdn_prefill_backend"] = _GDN_PREFILL_UPSTREAM_BACKEND
 
     requested_deep_gemm = feature_config.moe_backend == _DEEP_GEMM_BACKEND
     raw_top_level_backend = bound.arguments.get("moe_backend")
@@ -419,6 +426,12 @@ def _normalise_existing_engine_args(engine_args: object) -> HcuFeatureConfig:
             f"HCU sidecar selects {feature_config.hcu_gdn_prefill_backend} but "
             f"EngineArgs.gdn_prefill_backend selects {gdn_prefill_backend!r}"
         )
+    elif (
+        feature_config.hcu_gdn_prefill_backend is not None
+        and gdn_prefill_backend is None
+    ):
+        # Sidecar-only selection: pin vLLM to the FLA path the HCU wrappers own.
+        setattr(engine_args, "gdn_prefill_backend", _GDN_PREFILL_UPSTREAM_BACKEND)
 
     backend = normalize_hcu_moe_backend(
         getattr(engine_args, "moe_backend", _UPSTREAM_BACKEND)

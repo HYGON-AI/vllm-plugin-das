@@ -266,6 +266,26 @@ def test_engine_args_keeps_official_gdn_prefill_backend(
     assert get_hcu_config(args).hcu_gdn_prefill_backend is None
 
 
+@pytest.mark.parametrize("backend", ["hcu-boltops", "hcu-aiter"])
+def test_engine_args_sidecar_only_gdn_prefill_backend_pins_triton(
+    backend: str,
+) -> None:
+    module = _make_arg_utils_module()
+    patch_engine_args.apply_to_module(module)
+    sidecar = {"hcu": {"hcu_gdn_prefill_backend": backend}}
+
+    args = module.EngineArgs(additional_config=sidecar)
+    assert args.gdn_prefill_backend == "triton"
+    assert get_hcu_config(args).hcu_gdn_prefill_backend == backend
+
+    # A reconstructed instance that bypassed the constructor normalisation.
+    args.gdn_prefill_backend = None
+    config = args.create_engine_config()
+    assert args.gdn_prefill_backend == "triton"
+    assert config.additional_config["gdn_prefill_backend"] == "triton"
+    assert get_hcu_config(config).hcu_gdn_prefill_backend == backend
+
+
 def test_engine_args_rejects_conflicting_gdn_prefill_backend() -> None:
     module = _make_arg_utils_module()
     patch_engine_args.apply_to_module(module)
