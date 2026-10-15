@@ -10,7 +10,6 @@ import pytest
 import torch
 
 
-@pytest.mark.hcu
 @pytest.mark.parametrize(
     ("provider", "package"),
     [("hcu-boltops", "boltops.fla.gdn"), ("hcu-aiter", "aiter.ops.fla")],
@@ -150,7 +149,6 @@ def test_chunk_h_uses_official_for_three_to_one_value_head_ratio(monkeypatch):
     assert calls == ["official", "boltops"]
 
 
-@pytest.mark.hcu
 @pytest.mark.parametrize("lengths", [(64,), (33, 64)])
 def test_three_to_one_official_chunk_h_and_boltops_chunk_o(
     monkeypatch: pytest.MonkeyPatch,
@@ -234,7 +232,6 @@ def test_three_to_one_official_chunk_h_and_boltops_chunk_o(
     torch.testing.assert_close(actual, expected, rtol=5e-2, atol=5e-4)
 
 
-@pytest.mark.hcu
 def test_aiter_hip_decode_matches_official_with_null_block_padding():
     """aiter HIP decode kernels + HCU index remap match vLLM FLA.
 
