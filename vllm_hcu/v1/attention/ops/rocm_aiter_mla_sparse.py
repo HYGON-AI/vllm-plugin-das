@@ -1584,15 +1584,19 @@ def rocm_aiter_sparse_attn_indexer_native(
             dtype=torch.uint8,
         )
         from vllm_hcu.patch.worker.core_fix.patch_deepseek_v4_pcp import (
-            current_pcp_batch,
+            current_pcp_batch, local_queries_enabled,
         )
 
         v4_pcp_batch = current_pcp_batch()
+        # Local queries: Q and weights already hold only this rank's rows.
+        local_queries = local_queries_enabled(v4_pcp_batch)
         for chunk in prefill_metadata.chunks:
             pcp_rows = None
             if v4_pcp_batch is not None:
                 # DeepSeek V4 PCP: full KV, but only this rank's query rows.
-                pcp_rows = v4_pcp_batch.owned_rows(chunk.token_start, chunk.token_end)
+                pcp_rows, local_rows = v4_pcp_batch.local_query_rows(
+                    chunk.token_start, chunk.token_end,
+                )
                 if pcp_rows.numel() == 0:
                     continue
             local_cu_seq_lens = getattr(chunk, "local_cu_seq_lens", None)
@@ -1637,13 +1641,18 @@ def rocm_aiter_sparse_attn_indexer_native(
             topk_indices = topk_indices_buffer[
                 chunk.token_start : chunk.token_end, :topk_tokens
             ]
-            q_slice = q_fp8[chunk.token_start : chunk.token_end]
-            weights_slice = weights[chunk.token_start : chunk.token_end]
+            if local_queries:
+                q_slice = q_fp8.index_select(0, local_rows).contiguous()
+                weights_slice = weights.index_select(0, local_rows).contiguous()
+            else:
+                q_slice = q_fp8[chunk.token_start : chunk.token_end]
+                weights_slice = weights[chunk.token_start : chunk.token_end]
             row_starts = chunk.cu_seqlen_ks
             row_ends = chunk.cu_seqlen_ke
             if pcp_rows is not None:
-                q_slice = q_slice.index_select(0, pcp_rows).contiguous()
-                weights_slice = weights_slice.index_select(0, pcp_rows).contiguous()
+                if not local_queries:
+                    q_slice = q_slice.index_select(0, pcp_rows).contiguous()
+                    weights_slice = weights_slice.index_select(0, pcp_rows).contiguous()
                 row_starts = row_starts.reshape(-1).index_select(0, pcp_rows)
                 row_ends = row_ends.reshape(-1).index_select(0, pcp_rows)
                 topk_indices = torch.empty(

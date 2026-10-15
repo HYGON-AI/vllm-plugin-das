@@ -45,16 +45,35 @@ class Glm53PCPBatch:
 
     def owned_rows(self, start: int, end: int) -> torch.Tensor:
         """Real local token rows within global ``[start, end)``, minus start."""
+        return self.local_query_rows(start, end)[0]
+
+    def local_query_rows(
+        self, start: int, end: int,
+    ) -> tuple[torch.Tensor, torch.Tensor]:
+        """Owned rows within global ``[start, end)`` and their local positions.
+
+        Returns chunk-relative global rows and the matching positions in the
+        padded rank-local layout, in the same order.
+        """
         key = (int(start), int(end))
         rows = self._owned_rows.get(key)
         if rows is None:
             # CPU layout only; every layer reuses the cached device indices.
-            owned = np.concatenate([np.empty(0, dtype=np.int64)] + [
+            segments = self.manager._local_segments
+            empty = [np.empty(0, dtype=np.int64)]
+            owned = np.concatenate(empty + [
                 np.arange(seg.global_slice.start, seg.global_slice.stop)
-                for seg in self.manager._local_segments
+                for seg in segments
             ])
-            owned = owned[(owned >= key[0]) & (owned < key[1])] - key[0]
-            rows = torch.from_numpy(owned).to(self.local_indices.device)
+            local = np.concatenate(empty + [
+                np.arange(seg.local_slice.start,
+                          seg.local_slice.start + seg.num_actual_tokens)
+                for seg in segments
+            ])
+            mask = (owned >= key[0]) & (owned < key[1])
+            device = self.local_indices.device
+            rows = (torch.from_numpy(owned[mask] - key[0]).to(device),
+                    torch.from_numpy(local[mask]).to(device))
             self._owned_rows[key] = rows
         return rows
 

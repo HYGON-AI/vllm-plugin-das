@@ -177,6 +177,11 @@ def test_owned_rows_follow_partition_layout(pcp_size):
     assert (owners[2:] == 1).all()
 
 
+def _select(manager, value):
+    start = manager.pcp_rank * manager._padded_num_tokens
+    return value[manager._padded_gather_idx[start:start + manager._padded_num_tokens]]
+
+
 def patch_batch():
     from vllm_hcu.v1.glm53_pcp import _current_pcp_batch
     return _current_pcp_batch()
@@ -272,10 +277,6 @@ def test_native_pcp_matches_global_attention_and_keeps_local_projections(
     expected = (5 * full_hidden + 7) * 11
     decode_tokens = sum(len(ids) for _, ids, _, prefill in requests if not prefill)
 
-    def select(manager, value):
-        start = manager.pcp_rank * manager._padded_num_tokens
-        return value[manager._padded_gather_idx[start:start + manager._padded_num_tokens]]
-
     for rank, manager in enumerate(managers):
         events.clear()
         layer = Attention()
@@ -288,18 +289,18 @@ def test_native_pcp_matches_global_attention_and_keeps_local_projections(
 
         def gather(local, dim=0):
             full = stages[len(calls)]
-            torch.testing.assert_close(local, select(manager, full))
+            torch.testing.assert_close(local, _select(manager, full))
             calls.append(local.shape[0])
-            return torch.cat([select(peer, full) for peer in managers])
+            return torch.cat([_select(peer, full) for peer in managers])
 
         groups[rank].all_gather = gather
         with glm53_pcp_step_scope():
             bind_glm53_pcp_batch(manager, local_batches[rank])
             actual = layer.forward(local_batches[rank].positions,
-                                   select(manager, full_hidden))
+                                   _select(manager, full_hidden))
             owned = patch_batch().owned_rows(decode_tokens, global_batch.num_tokens)
         valid = ~local_batches[rank].is_padding
-        torch.testing.assert_close(actual[valid], select(manager, expected)[valid])
+        torch.testing.assert_close(actual[valid], _select(manager, expected)[valid])
         assert calls == [local_batches[rank].num_tokens_after_padding] * 6
         assert ("projections", actual.shape[0]) in events
         assert ("output", actual.shape[0]) in events
@@ -347,7 +348,8 @@ def test_prefill_exception_restores_query_scope(native_attention, monkeypatch):
     Attention, _, rocm = native_attention
     layer = Attention()
     monkeypatch.setattr(patch, "_ATTENTION_BATCH", SimpleNamespace(
-        get=lambda: SimpleNamespace(owned_rows=lambda start, end: torch.tensor([0])),
+        get=lambda: SimpleNamespace(local_query_rows=lambda start, end:
+                                    (torch.tensor([0]), torch.tensor([0]))),
     ))
     monkeypatch.setattr(rocm, "rocm_sparse_attn_prefill",
                         lambda *a, **kw: (_ for _ in ()).throw(RuntimeError("kernel failed")))
@@ -358,11 +360,12 @@ def test_prefill_exception_restores_query_scope(native_attention, monkeypatch):
     assert patch._PREFILL_ROWS.get() is None
 
 
+@pytest.mark.parametrize("local_queries", [False, True])
 @pytest.mark.parametrize("owned_rows", [[0, 2, 7], [], [4, 5, 6, 7]])
 @pytest.mark.parametrize("use_lightop", [False, True])
 @pytest.mark.parametrize("gfx938", [False, True])
 def test_indexer_owned_queries_keep_full_kv_coordinates(
-    monkeypatch, owned_rows, use_lightop, gfx938,
+    monkeypatch, owned_rows, use_lightop, gfx938, local_queries,
 ):
     from vllm_hcu.v1.attention.ops import rocm_aiter_mla_sparse as sparse
     from vllm import _custom_ops as ops
@@ -406,10 +409,12 @@ def test_indexer_owned_queries_keep_full_kv_coordinates(
         attn_metadata={"indexer": metadata},
     ))
 
-    def run():
+    def run(owned=None):
         q = torch.tensor([1, -1, 2, -2, 3, -3, 4, -4],
                          dtype=torch.float32).view(8, 1, 1)
         weights = torch.arange(8).view(8, 1).float()
+        if owned is not None:
+            q, weights = q[owned], weights[owned]
         return sparse.rocm_aiter_sparse_attn_indexer_native(
             hidden_states=torch.zeros(8, 1), k_cache_prefix="indexer",
             kv_cache=torch.zeros(1, 8, 1), q_fp8=q, k=None, weights=weights,
@@ -424,15 +429,246 @@ def test_indexer_owned_queries_keep_full_kv_coordinates(
     owned = torch.tensor(owned_rows, dtype=torch.int64)
 
     def rows(start, end):
-        return owned[(owned >= start) & (owned < end)] - start
+        mask = (owned >= start) & (owned < end)
+        return owned[mask] - start, torch.arange(owned.numel())[mask]
 
-    token = patch._ATTENTION_BATCH.set(SimpleNamespace(owned_rows=rows))
+    batch = SimpleNamespace(local_query_rows=rows)
+    token = patch._ATTENTION_BATCH.set(batch)
+    local = patch._LOCAL_QUERIES.set(batch if local_queries else None)
     try:
-        actual = run()
+        actual = run(owned if local_queries else None)
     finally:
+        patch._LOCAL_QUERIES.reset(local)
         patch._ATTENTION_BATCH.reset(token)
     torch.testing.assert_close(actual[owned], expected[owned])
     mask = torch.ones(8, dtype=torch.bool)
     mask[owned] = False
     assert (actual[mask] == -1).all()
     assert sum(calls) == len(owned_rows)
+
+
+@pytest.mark.parametrize("pcp_size", [2, 4, 8])
+def test_local_query_rows_map_global_rows_to_local_positions(pcp_size):
+    batch = _make_batch([
+        ("d", [17, 18], 40, False),
+        ("p", list(range(9)), 30, True),
+        ("short", [11], 90, True),
+    ])
+    managers, _ = _make_managers(pcp_size)
+    for manager in managers:
+        local = manager.partition_batch(batch)
+        with glm53_pcp_step_scope():
+            bind_glm53_pcp_batch(manager, local)
+            pcp_batch = patch_batch()
+        rows, positions = pcp_batch.local_query_rows(2, batch.num_tokens)
+        torch.testing.assert_close(pcp_batch.local_indices[positions], rows + 2)
+        assert not local.is_padding[positions].any()
+        assert pcp_batch.local_query_rows(2, batch.num_tokens)[1] is positions
+
+
+@pytest.mark.parametrize("pcp_size", [2, 4, 8])
+@pytest.mark.parametrize("length", [1, 9, 32])
+@pytest.mark.parametrize("fail_sparse", [False, True])
+def test_local_query_path_only_gathers_kv(native_attention, monkeypatch,
+                                          pcp_size, length, fail_sparse):
+    Attention, events, _ = native_attention
+    batch = _make_batch([("p", list(range(1, length + 1)), length, True)])
+    managers, groups = _make_managers(pcp_size)
+    local_batches = [manager.partition_batch(batch) for manager in managers]
+    full = batch.input_ids[:, None].float().repeat(1, 512)
+
+    # CPU numerical native-interface double: distinct Q and KV lengths,
+    # chunk boundaries, padding and local output all use real tensors.
+    def project(self, hidden_states):
+        return torch.cat((hidden_states * 2, hidden_states * 3), -1), None, None, None
+
+    def query(self, qr, qr_scale=None):
+        return qr.repeat(1, 2)
+
+    def insert(self, q, kv, positions, attn_metadata):
+        raise AssertionError("full-query cache insert must not run")
+
+    cache_store = {}
+
+    def mqa(self, q, kv, positions, output):
+        assert q.shape == output.shape
+        kv = cache_store["kv"]
+        self._forward_prefill(q, positions, kv.unsqueeze(1), kv.unsqueeze(1),
+                              output, None, SimpleNamespace(num_decode_tokens=0))
+
+    def prepare(self, hidden, qr, kv, qr_scale, kv_score, indexer_kv_score,
+                weights, positions, output):
+        assert hidden.shape[0] == batch.num_tokens
+        q = self._wq_b_proj(qr, qr_scale).view(-1, 2, 512)
+        q = self._fused_qnorm_rope_kv_insert(q, kv, positions, None)
+        self.forward_mqa(q, kv, positions, output)
+
+    def pcp_insert(q, kv, cache, slots, q_positions, kv_positions, rope, eps, block):
+        assert q.shape[0] == q_positions.numel()
+        assert kv.shape[0] == kv_positions.numel() == batch.num_tokens
+        torch.testing.assert_close(kv, full * 6)  # learned KVNorm exactly once
+        cache_store["kv"] = kv
+        q.add_(7)
+
+    # A fresh class/module isolates optional native methods from wrappers
+    # already installed by the fixture.
+    original_attention = Attention
+    rocm = ModuleType(patch.TARGET_MODULE)
+
+    class LocalAttention(original_attention):
+        _vllm_hcu_deepseek_v4_pcp_applied = False
+        forward = original_attention.forward.__wrapped__
+        _run_parallel_input_projections = project
+        _wq_b_proj = query
+        _o_proj = original_attention._o_proj.__wrapped__
+        _fused_qnorm_rope_kv_insert = insert
+        forward_mqa = mqa
+        _prepare_and_attn_fn = prepare
+
+    rocm.DeepseekV4ROCMAiterMLAAttention = LocalAttention
+    rocm.DeepseekV4ROCMAiterMLASparseBackend = type("LocalBackend", (), {})
+    # Original numerical sparse provider from the fixture's wrapper closure.
+    provider = native_attention[2].rocm_sparse_attn_prefill.__wrapped__
+
+    def sparse_provider(q, kv, indices, topk_length, scale, head_dim,
+                        nope_head_dim, rope_head_dim, attn_sink, output,
+                        ragged_indices=None, ragged_indptr=None):
+        if fail_sparse:
+            raise RuntimeError("sparse kernel failed")
+        return provider(q, kv, indices, topk_length, scale, head_dim,
+                        nope_head_dim, rope_head_dim, attn_sink, output,
+                        ragged_indices, ragged_indptr)
+    rocm.rocm_sparse_attn_prefill = sparse_provider
+
+    # The numerical prefill double resolves its provider through this module.
+    def prefill(self, q, positions, compressed_k_cache, swa_k_cache, output,
+                attn_metadata, swa_metadata):
+        for start in range(0, q.shape[0], 3):
+            end = min(start + 3, q.shape[0])
+            rocm.rocm_sparse_attn_prefill(
+                q[start:end], compressed_k_cache,
+                torch.arange(start, end)[:, None],
+                torch.ones(end - start, dtype=torch.int32), 1., 512, 512, 0,
+                None, output[start:end],
+            )
+    LocalAttention._forward_prefill = prefill
+    monkeypatch.setattr(patch, "_pcp_insert_op", lambda: pcp_insert)
+    monkeypatch.setenv("VLLM_HCU_USE_CUSTOM_OPS", "1")
+    from vllm_hcu.platforms import envs as henvs
+    monkeypatch.setattr(henvs, "VLLM_HCU_DEEPSEEK_V4_PCP_LOCAL_QUERIES", True)
+    assert patch.apply_to_module(rocm)
+    import vllm.forward_context as fc
+    monkeypatch.setattr(fc, "get_forward_context", lambda: SimpleNamespace(
+        attn_metadata={"swa": SimpleNamespace(
+            slot_mapping=torch.arange(length), block_size=256,
+            num_decodes=0, num_decode_tokens=0)},
+    ))
+
+    for rank, manager in enumerate(managers):
+        layer = LocalAttention()
+        layer.q_lora_rank = layer.head_dim = 512
+        layer.n_local_heads = layer.padded_heads = 2
+        layer.q_norm = lambda x: x
+        layer.kv_norm = lambda x: x * 2
+        layer.rotary_emb = SimpleNamespace(cos_sin_cache=torch.zeros(1))
+        layer.eps = 1e-6
+        layer.swa_cache_layer = SimpleNamespace(
+            prefix="swa", kv_cache=torch.zeros(1, 1, dtype=torch.uint8))
+        gathered = []
+
+        def gather(local, dim=0):
+            torch.testing.assert_close(local, _select(manager, full * 6))
+            gathered.append(local.shape)
+            return torch.cat([_select(peer, full * 6) for peer in managers])
+        groups[rank].all_gather = gather
+        valid = ~local_batches[rank].is_padding
+        with glm53_pcp_step_scope():
+            bind_glm53_pcp_batch(manager, local_batches[rank])
+            if fail_sparse and valid.any():
+                with pytest.raises(RuntimeError, match="sparse kernel failed"):
+                    layer.forward(local_batches[rank].positions,
+                                  _select(manager, full))
+            else:
+                actual = layer.forward(local_batches[rank].positions,
+                                       _select(manager, full))
+                expected = ((full * 8 + 7).repeat(1, 2)) * 11
+                torch.testing.assert_close(actual[valid],
+                                           _select(manager, expected)[valid])
+        assert len(gathered) == 1  # KV only; never hidden, QR or Q
+        assert patch._LOCAL_QUERIES.get() is None
+        assert patch._LOCAL_MQA.get() is None
+        assert patch.current_pcp_batch() is None
+        assert patch._PREFILL_ROWS.get() is None
+
+
+def test_indexer_quant_selects_local_positions(native_attention, monkeypatch):
+    _, _, rocm = native_attention
+    attention_module = sys.modules["vllm.models.deepseek_v4.attention"]
+    recorded = []
+
+    def quant(positions, q, weights):
+        recorded.append(positions)
+        return q, weights
+    monkeypatch.setattr(attention_module, "fused_indexer_q_rope_quant", quant,
+                        raising=False)
+    # Reapply to a fresh native-interface class so the quant provider is
+    # wrapped at the same lifecycle point as in the real import callback.
+    old = rocm.DeepseekV4ROCMAiterMLAAttention
+
+    class Fresh(old):
+        _vllm_hcu_deepseek_v4_pcp_applied = False
+        forward = old.forward.__wrapped__
+        _run_parallel_input_projections = old._run_parallel_input_projections.__wrapped__
+        _wq_b_proj = old._wq_b_proj.__wrapped__
+        _o_proj = old._o_proj.__wrapped__
+        _forward_prefill = old._forward_prefill.__wrapped__
+    monkeypatch.setattr(rocm, "DeepseekV4ROCMAiterMLAAttention", Fresh)
+    monkeypatch.setattr(rocm, "rocm_sparse_attn_prefill",
+                        rocm.rocm_sparse_attn_prefill.__wrapped__)
+    patch.apply_to_module(rocm)
+    batch = SimpleNamespace(localize=lambda x: x[torch.tensor([1, 3])])
+    token = patch._ATTENTION_BATCH.set(batch)
+    local = patch._LOCAL_QUERIES.set(batch)
+    try:
+        q, weights = torch.ones(2, 1), torch.ones(2, 1)
+        result = attention_module.fused_indexer_q_rope_quant(torch.arange(4), q, weights)
+        torch.testing.assert_close(recorded[-1], torch.tensor([1, 3]))
+        assert result[0] is q and result[1] is weights
+    finally:
+        patch._LOCAL_QUERIES.reset(local)
+        patch._ATTENTION_BATCH.reset(token)
+    attention_module.fused_indexer_q_rope_quant(torch.arange(4), q, weights)
+    torch.testing.assert_close(recorded[-1], torch.arange(4))
+
+
+@pytest.mark.parametrize("pure_prefill", [False, True])
+@pytest.mark.parametrize("available", [False, True])
+@pytest.mark.parametrize("enabled", [False, True])
+@pytest.mark.parametrize("metadata_decode", [False, True])
+def test_local_query_capability_gate(monkeypatch, pure_prefill, available, enabled,
+                                     metadata_decode):
+    import numpy as np
+    from vllm_hcu.platforms import envs as henvs
+    monkeypatch.setenv("VLLM_HCU_USE_CUSTOM_OPS", "1")
+    monkeypatch.setattr(henvs, "VLLM_HCU_DEEPSEEK_V4_PCP_LOCAL_QUERIES", enabled)
+    monkeypatch.setattr(patch, "_pcp_insert_op", lambda:
+                        (lambda *args: None) if available else None)
+    layer = SimpleNamespace(
+        _prepare_and_attn_fn=object(), _fused_qnorm_rope_kv_insert=object(),
+        forward_mqa=object(), head_dim=512, n_local_heads=64, padded_heads=64,
+        swa_cache_layer=SimpleNamespace(prefix="swa",
+                                        kv_cache=torch.empty(1, dtype=torch.uint8)),
+    )
+    batch = SimpleNamespace(global_batch=SimpleNamespace(
+        is_prefilling_np=np.array([pure_prefill]),
+    ))
+    import vllm.forward_context as fc
+    monkeypatch.setattr(fc, "get_forward_context", lambda: SimpleNamespace(
+        attn_metadata={"swa": SimpleNamespace(num_decodes=int(metadata_decode),
+                                              num_decode_tokens=int(metadata_decode))},
+    ))
+    assert patch._can_use_local_queries(layer, batch) == (
+        pure_prefill and available and enabled and not metadata_decode
+    )
+    monkeypatch.setenv("VLLM_HCU_USE_CUSTOM_OPS", "0")
+    assert not patch._can_use_local_queries(layer, batch)
