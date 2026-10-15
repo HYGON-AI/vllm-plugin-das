@@ -57,9 +57,21 @@ def test_dict_vllm_config_uses_canonical_storage_path() -> None:
                 "qwen4_exp_hc_sp": True,
                 "moe_backend": "auto",
                 "hcu_flash_attn_mode": None,
+                "hcu_gdn_prefill_backend": None,
             }
         }
     }
+    assert get_hcu_config(vllm_config) == normalized
+
+
+def test_gdn_prefill_backend_round_trips_through_sidecar() -> None:
+    vllm_config: dict[str, object] = {}
+    normalized = set_hcu_config(
+        vllm_config, {"hcu_gdn_prefill_backend": "hcu-aiter"}
+    )
+
+    stored = vllm_config["additional_config"]["hcu"]  # type: ignore[index]
+    assert stored["hcu_gdn_prefill_backend"] == "hcu-aiter"
     assert get_hcu_config(vllm_config) == normalized
 
 

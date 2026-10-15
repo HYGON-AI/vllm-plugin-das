@@ -24,6 +24,11 @@ register_hcu_ci(
     est_time=900,
 )
 register_hcu_ci(
+    job="accuracy-gfx936",
+    target="tests/kernels/test_boltops_fla_numeric.py",
+    est_time=120,
+)
+register_hcu_ci(
     job="accuracy-gfx938",
     target="tests/accuracy/test_aiter_silu_and_mul.py",
     est_time=300,
