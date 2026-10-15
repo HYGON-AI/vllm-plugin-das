@@ -320,17 +320,23 @@ def _require_mrv2_pcp_contract(vllm_config: object) -> None:
     )
     is_glm52 = architectures == ["GlmMoeDsaForCausalLM"]
     is_hy4 = architectures == ["HYV4ForCausalLM"]
+    is_dsv4 = architectures == ["DeepseekV4ForCausalLM"]
     is_glm53 = is_glm53_pcp(vllm_config)
     is_glm53_mtp = _is_glm53_mtp_pcp(vllm_config)
     if is_glm53:
         _require_glm53_pcp_contract(vllm_config)
     if is_glm53_mtp:
         _require_glm53_mtp_pcp_contract(vllm_config)
-    if use_mla and not (is_glm52 or is_hy4 or is_glm53 or is_glm53_mtp):
+    if use_mla and not (is_glm52 or is_hy4 or is_glm53 or is_glm53_mtp or is_dsv4):
         raise ValueError(
             "GLM-5.2 and HY V4 MLA PCP only support "
-            "GlmMoeDsaForCausalLM or HYV4ForCausalLM."
+            "GlmMoeDsaForCausalLM, HYV4ForCausalLM or DeepseekV4ForCausalLM."
         )
+    if is_dsv4:
+        if not use_mla:
+            raise ValueError("DeepSeek V4 PCP requires sparse MLA.")
+        if getattr(parallel_config, "cp_kv_cache_interleave_size", 1) != 1:
+            raise ValueError("DeepSeek V4 PCP requires Full KV without interleaving.")
     if is_glm52 and not use_mla:
         raise ValueError("GLM-5.2 PCP requires MLA or sparse MLA.")
     if is_hy4 and not use_mla:
@@ -586,8 +592,14 @@ def validate_and_update_hcu_config(vllm_config: object) -> HcuFeatureConfig:
                 "deepep_auto with EPLB is not supported because the HT and "
                 "LL expert weight layouts cannot be rebalanced atomically"
             )
-        if int(getattr(parallel_config, "data_parallel_size", 1)) <= 1:
-            raise ValueError("HCU deepep_auto requires data_parallel_size > 1.")
+        if (
+            int(getattr(parallel_config, "data_parallel_size", 1)) <= 1
+            and int(getattr(parallel_config, "prefill_context_parallel_size", 1)) <= 1
+        ):
+            raise ValueError(
+                "HCU deepep_auto requires data_parallel_size > 1 or "
+                "prefill_context_parallel_size > 1."
+            )
         if not getattr(parallel_config, "enable_expert_parallel", False):
             raise ValueError(
                 "HCU deepep_auto requires enable_expert_parallel=True."

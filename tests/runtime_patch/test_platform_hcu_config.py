@@ -2532,3 +2532,22 @@ def test_qwen4_exp_hc_sp_falls_back_with_lora_or_compiler_sp(
 
     feature_config = patch_vllm_config.validate_and_update_hcu_config(config)
     assert feature_config.qwen4_exp_hc_sp is expected
+
+
+@pytest.mark.parametrize("pcp", [2, 8])
+def test_deepep_auto_accepts_deepseek_v4_pcp_without_dp(pcp):
+    from tests.runtime_patch.test_glm52_pcp_config import _make_pcp_config
+
+    config = _make_pcp_config(
+        architecture="DeepseekV4ForCausalLM", pcp=pcp,
+        all2all_backend="deepep_low_latency", enable_eplb=False,
+    )
+    config.additional_config = {
+        "hcu": HcuFeatureConfig(deepep_auto=True, moe_backend="deep_gemm").to_dict()
+    }
+    config.compilation_config = _ValidationCompilation()
+    config.scheduler_config = SimpleNamespace(max_num_batched_tokens=32768)
+    result = patch_vllm_config.validate_and_update_hcu_config(config)
+    assert result.deepep_auto
+    assert config.parallel_config._vllm_hcu_deepep_auto
+    assert config.parallel_config.data_parallel_size == 1

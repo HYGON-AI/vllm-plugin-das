@@ -1583,7 +1583,18 @@ def rocm_aiter_sparse_attn_indexer_native(
             device=device,
             dtype=torch.uint8,
         )
+        from vllm_hcu.patch.worker.core_fix.patch_deepseek_v4_pcp import (
+            current_pcp_batch,
+        )
+
+        v4_pcp_batch = current_pcp_batch()
         for chunk in prefill_metadata.chunks:
+            pcp_rows = None
+            if v4_pcp_batch is not None:
+                # DeepSeek V4 PCP: full KV, but only this rank's query rows.
+                pcp_rows = v4_pcp_batch.owned_rows(chunk.token_start, chunk.token_end)
+                if pcp_rows.numel() == 0:
+                    continue
             local_cu_seq_lens = getattr(chunk, "local_cu_seq_lens", None)
             if local_cu_seq_lens is None:
                 local_cu_seq_lens = chunk.cu_seq_lens
@@ -1627,6 +1638,18 @@ def rocm_aiter_sparse_attn_indexer_native(
                 chunk.token_start : chunk.token_end, :topk_tokens
             ]
             q_slice = q_fp8[chunk.token_start : chunk.token_end]
+            weights_slice = weights[chunk.token_start : chunk.token_end]
+            row_starts = chunk.cu_seqlen_ks
+            row_ends = chunk.cu_seqlen_ke
+            if pcp_rows is not None:
+                q_slice = q_slice.index_select(0, pcp_rows).contiguous()
+                weights_slice = weights_slice.index_select(0, pcp_rows).contiguous()
+                row_starts = row_starts.reshape(-1).index_select(0, pcp_rows)
+                row_ends = row_ends.reshape(-1).index_select(0, pcp_rows)
+                topk_indices = torch.empty(
+                    (pcp_rows.numel(), topk_tokens), dtype=topk_indices.dtype,
+                    device=topk_indices.device,
+                )
             if local_total_seq_lens == 0:
                 logits = q_slice.new_empty(
                     (q_slice.shape[0], 0), dtype=torch.float32
@@ -1636,15 +1659,15 @@ def rocm_aiter_sparse_attn_indexer_native(
                 logits = rocm_fp8_mqa_logits(
                     q_slice,
                     (k_fp8, k_scale.view(torch.float32)),
-                    weights[chunk.token_start : chunk.token_end],
-                    chunk.cu_seqlen_ks,
-                    chunk.cu_seqlen_ke,
+                    weights_slice,
+                    row_starts,
+                    row_ends,
                 )
                 if _use_lightop_sparse_mla_topk():
                     _lightop_topk_indices_prefill(
                         logits,
-                        chunk.cu_seqlen_ks,
-                        chunk.cu_seqlen_ke,
+                        row_starts,
+                        row_ends,
                         topk_indices,
                         topk_tokens,
                     )
@@ -1653,10 +1676,15 @@ def rocm_aiter_sparse_attn_indexer_native(
                         _topk_indices_torch(
                             logits,
                             topk_tokens,
-                            chunk.cu_seqlen_ks,
-                            chunk.cu_seqlen_ke,
+                            row_starts,
+                            row_ends,
                         )
                     )
+
+            if pcp_rows is not None:
+                topk_indices_buffer[
+                    chunk.token_start : chunk.token_end, :topk_tokens
+                ].index_copy_(0, pcp_rows, topk_indices)
 
             if dcp_world_size > 1:
                 from vllm_hcu.model_executor.layers.sparse_attn_indexer import (
