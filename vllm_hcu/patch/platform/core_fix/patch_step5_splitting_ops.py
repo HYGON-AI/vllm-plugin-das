@@ -41,16 +41,19 @@ def apply_to_module(module: ModuleType) -> bool:
         automatic = self.splitting_ops is None
         result = original(self, *args, **kwargs)
         if automatic and self.splitting_ops:
-            for flag, op in (
-                ("VLLM_HCU_STEP5_FUSED_GATE", "vllm::step5_swa_attention_gate_quant"),
-                ("VLLM_HCU_STEP5_SWA_FUSED_QK", "vllm::step5_swa_qk_norm_rope_cache"),
-            ):
-                if (
-                    henvs.optional_custom_op_enabled(
-                        os.environ.get(flag, "0") == "1"
-                    )
-                    and op not in self.splitting_ops
-                ):
+            fused_gate = henvs.optional_custom_op_enabled(
+                os.environ.get("VLLM_HCU_STEP5_FUSED_GATE", "0") == "1"
+            )
+            swa_fused_qk = henvs.optional_custom_op_enabled(
+                os.environ.get("VLLM_HCU_STEP5_SWA_FUSED_QK", "0") == "1"
+            )
+            requested_ops = []
+            if fused_gate and swa_fused_qk:
+                requested_ops.append("vllm::step5_swa_attention_gate_quant")
+            if swa_fused_qk:
+                requested_ops.append("vllm::step5_swa_qk_norm_rope_cache")
+            for op in requested_ops:
+                if op not in self.splitting_ops:
                     self.splitting_ops.append(op)
         return result
 

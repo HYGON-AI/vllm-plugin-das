@@ -221,17 +221,17 @@ _requested_boltops_stages = frozenset(
     for name in os.environ.get("VLLM_STEP4_DSA_BOLTOPS", "").split(",")
     if name.strip()
 )
+if _requested_boltops_stages - _BOLTOPS_STAGE_NAMES:
+    raise ValueError(
+        f"VLLM_STEP4_DSA_BOLTOPS: unknown stage(s) "
+        f"{sorted(_requested_boltops_stages - _BOLTOPS_STAGE_NAMES)}; "
+        f"expected a comma-separated subset of {sorted(_BOLTOPS_STAGE_NAMES)}"
+    )
 BOLTOPS_STAGES = (
     _requested_boltops_stages
     if henvs.optional_custom_op_enabled(bool(_requested_boltops_stages))
     else frozenset()
 )
-if BOLTOPS_STAGES - _BOLTOPS_STAGE_NAMES:
-    raise ValueError(
-        f"VLLM_STEP4_DSA_BOLTOPS: unknown stage(s) "
-        f"{sorted(BOLTOPS_STAGES - _BOLTOPS_STAGE_NAMES)}; "
-        f"expected a comma-separated subset of {sorted(_BOLTOPS_STAGE_NAMES)}"
-    )
 
 # Which sparse-attention stages to run through
 # flash-attention-cutlass's own sparse kernels (``fa_sparse_attention_prefill``/
@@ -261,6 +261,21 @@ if _flash_attn_stages_raw is not None:
     _requested_flash_attn_stages = frozenset(
         name.strip() for name in _flash_attn_stages_raw.split(",") if name.strip()
     )
+    if _requested_flash_attn_stages - _FLASH_ATTN_STAGE_NAMES:
+        raise ValueError(
+            f"VLLM_STEP4_DSA_FLASH_ATTN: unknown stage(s) "
+            f"{sorted(_requested_flash_attn_stages - _FLASH_ATTN_STAGE_NAMES)}; "
+            f"expected a comma-separated subset of "
+            f"{sorted(_FLASH_ATTN_STAGE_NAMES)}"
+        )
+    if _requested_flash_attn_stages & _requested_boltops_stages:
+        raise ValueError(
+            f"VLLM_STEP4_DSA_FLASH_ATTN and VLLM_STEP4_DSA_BOLTOPS both claim "
+            f"stage(s) "
+            f"{sorted(_requested_flash_attn_stages & _requested_boltops_stages)}; "
+            f"a stage can only run through one alternate sparse-attention "
+            f"implementation"
+        )
     FLASH_ATTN_DSA_STAGES = (
         _requested_flash_attn_stages
         if henvs.optional_custom_op_enabled(bool(_requested_flash_attn_stages))
@@ -310,12 +325,6 @@ else:
                 "Triton DSA kernels."
             )
         FLASH_ATTN_DSA_STAGES = frozenset()
-if FLASH_ATTN_DSA_STAGES - _FLASH_ATTN_STAGE_NAMES:
-    raise ValueError(
-        f"VLLM_STEP4_DSA_FLASH_ATTN: unknown stage(s) "
-        f"{sorted(FLASH_ATTN_DSA_STAGES - _FLASH_ATTN_STAGE_NAMES)}; "
-        f"expected a comma-separated subset of {sorted(_FLASH_ATTN_STAGE_NAMES)}"
-    )
 if FLASH_ATTN_DSA_STAGES & BOLTOPS_STAGES:
     raise ValueError(
         f"VLLM_STEP4_DSA_FLASH_ATTN and VLLM_STEP4_DSA_BOLTOPS both claim "
@@ -366,12 +375,12 @@ _requested_fp8_math = (
     os.environ.get("VLLM_STEP4_DSA_FP8_MATH", _fp8_math_default).strip().lower()
     or _fp8_math_default
 )
-_fp8_math = _requested_fp8_math if henvs.custom_ops_enabled() else "off"
-if _fp8_math not in _FP8_MATH_MODES:
+if _requested_fp8_math not in _FP8_MATH_MODES:
     raise ValueError(
-        f"VLLM_STEP4_DSA_FP8_MATH={_fp8_math!r}: expected one of "
+        f"VLLM_STEP4_DSA_FP8_MATH={_requested_fp8_math!r}: expected one of "
         f"{sorted(_FP8_MATH_MODES)}"
     )
+_fp8_math = _requested_fp8_math if henvs.custom_ops_enabled() else "off"
 DECODE_QK_FP8, DECODE_PV_FP8 = _FP8_MATH_MODES[_fp8_math]
 PREFILL_QK_FP8, PREFILL_PV_FP8 = _FP8_MATH_MODES[_fp8_math]
 if _fp8_math != "off":

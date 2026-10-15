@@ -99,7 +99,6 @@ from vllm_hcu.model_executor.layers.step4_dsa import (
     Step4SparseAttentionBackend,
 )
 from vllm_hcu.models.step5.kernels import router_bias_func
-from vllm_hcu.models import step5_swa_fused
 from vllm.model_executor.layers.vocab_parallel_embedding import (
     ParallelLMHead,
     VocabParallelEmbedding,
@@ -177,6 +176,26 @@ FP8_DENSE = henvs.optional_custom_op_enabled(
 FP8_BF16_MOE = henvs.optional_custom_op_enabled(
     os.environ.get("VLLM_HCU_STEP5_FP8_BF16_MOE", "0") == "1"
 )
+
+SWA_FUSED_QK = henvs.optional_custom_op_enabled(
+    os.environ.get("VLLM_HCU_STEP5_SWA_FUSED_QK", "0") == "1"
+)
+FUSED_GATE = henvs.optional_custom_op_enabled(
+    os.environ.get("VLLM_HCU_STEP5_FUSED_GATE", "0") == "1"
+)
+
+step5_swa_fused = None
+if SWA_FUSED_QK or FUSED_GATE:
+    # Enabled custom ops must register during model-module initialization,
+    # before torch.compile tracing or CUDA/HCU graph capture begins.
+    from vllm_hcu.models import step5_swa_fused
+
+
+def _get_step5_swa_fused():
+    """Return the provider selected during startup feature resolution."""
+
+    assert step5_swa_fused is not None
+    return step5_swa_fused
 
 _PACKED_EXPERT_WEIGHT = re.compile(r"\.moe\.(gate|up|down)_proj\.weight$")
 
@@ -704,11 +723,11 @@ class Step5Attention(nn.Module):
 
         self.max_position_embeddings = max_position
         # Sliding layers: q/k norm + RoPE + q quant + KV cache write in one op.
-        self.swa_fused_qk = step5_swa_fused.can_use(self)
+        self.swa_fused_qk = SWA_FUSED_QK and _get_step5_swa_fused().can_use(self)
         # Gate + fp8 quant of the o_proj input as one op (folded into the SWA
         # decode combine when swa_fused_qk); needs the fused qkvg fp8 GEMM.
         self.fused_gate = (
-            step5_swa_fused.FUSED_GATE
+            FUSED_GATE
             and FP8_DENSE
             and use_head_wise_attn_gate
             and self.qkvg_weight is not None
@@ -784,7 +803,7 @@ class Step5Attention(nn.Module):
             extra_dims = None
         q, k, v = qkv.split([self.q_size, self.kv_size, self.kv_size], dim=-1)
         if self.swa_fused_qk:
-            attn_output = step5_swa_fused.forward(
+            attn_output = _get_step5_swa_fused().forward(
                 self,
                 positions,
                 qkv,
@@ -821,7 +840,7 @@ class Step5Attention(nn.Module):
             return output
         if self.fused_gate and extra_dims is not None:
             output, _ = self.o_proj(
-                step5_swa_fused.gate_quant(
+                _get_step5_swa_fused().gate_quant(
                     attn_output.view(-1, attn_output.shape[-1]), extra_dims
                 )
             )

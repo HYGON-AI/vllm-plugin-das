@@ -25,7 +25,7 @@ or globally installed plugin.
 No Step5 checkpoint was present on this host: searching model `config.json`
 files found neither `model_type=step5` nor a `Step5For*` architecture. The
 Step5 master-on/master-off service gate therefore remains unexecuted here; its
-evidence is the 302-case CPU suite and source-level provider/fallback tests,
+evidence is the 314-case CPU suite and source-level provider/fallback tests,
 not a hardware claim.
 
 ## HY4 master-off fail-fast gate
@@ -118,7 +118,7 @@ Retained ignored artifacts:
 
 ## CPU and source-level verification
 
-The complete focused suite produced **302 passed, 1 deselected, 14 warnings**.
+The post-review focused suite produced **314 passed, 1 deselected, 14 warnings**.
 The deselected test is the pre-existing installed-vLLM alias mismatch where
 `HYV4Config` preserves `deepseek_sparse_attention` but the repository test
 expects `indexed_attention`; the unfiltered run was 302 passed and that single

@@ -281,20 +281,29 @@ def apply_to_module(module: ModuleType) -> bool:
                 if fp8_backend == hcu_enum.BATCHED_DEEPGEMM
                 else marlin_fp8_contiguous_weight
             )
-            # VLLM_HCU_EP_FUSED_MOE=1: DeepGemmExperts runs ep_fused_moe, which
-            # reads plain [E, N, K] weights; keep them unpacked.
+            # Effective VLLM_HCU_EP_FUSED_MOE=1: DeepGemmExperts runs
+            # ep_fused_moe, which reads plain [E, N, K] weights; keep them
+            # unpacked.  The custom-op master must participate in this choice:
+            # otherwise runtime falls back to DeepGEMM while conversion leaves
+            # weights in the incompatible EP-fused layout.
             import os
 
-            from vllm_hcu.model_executor.layers.fused_moe.ep_fused_moe_support import (
-                supports_channel_ep_fused,
-            )
+            from vllm_hcu.platforms import envs as henvs
 
-            ep_fused = (
-                os.environ.get("VLLM_HCU_EP_FUSED_MOE", "0") == "1"
+            ep_fused = False
+            if (
+                henvs.optional_custom_op_enabled(
+                    os.environ.get("VLLM_HCU_EP_FUSED_MOE", "0") == "1"
+                )
                 and fp8_backend == hcu_enum.DEEPGEMM
                 and w13_input_scale is None
                 and w2_input_scale is None
-                and supports_channel_ep_fused(
+            ):
+                from vllm_hcu.model_executor.layers.fused_moe.ep_fused_moe_support import (
+                    supports_channel_ep_fused,
+                )
+
+                ep_fused = supports_channel_ep_fused(
                     w13, w2, w13_scale, w2_scale,
                     block_shape=getattr(layer, "weight_block_size", None),
                     activation=getattr(layer, "activation", None),
@@ -303,7 +312,6 @@ def apply_to_module(module: ModuleType) -> bool:
                         layer, "apply_router_weight_on_input", False
                     ),
                 )
-            )
             if not ep_fused:
                 with torch.no_grad():
                     w13 = pack_weight(w13).detach()
