@@ -1,6 +1,6 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright (c) 2026 Hygon Information Technology Co., Ltd.
-"""Runtime migration of the two HCU environment handling fragments."""
+"""HCU environment validation and platform-specific runtime defaults."""
 
 from __future__ import annotations
 
@@ -21,6 +21,7 @@ PATCH_ID = "platform.core_fix.envs"
 TARGETS = (
     "vllm.envs.validate_environ",
     "vllm.envs.environment_variables.VLLM_ROCM_USE_AITER_MOE",
+    "vllm.envs.environment_variables.VLLM_USE_V2_MODEL_RUNNER",
 )
 _MARKER = "_vllm_hcu_envs_patch_applied"
 
@@ -42,6 +43,13 @@ def apply_to_module(module: ModuleType) -> bool:
         raise PatchCompatibilityError(
             "required HCU patch target "
             "vllm.envs.environment_variables['VLLM_ROCM_USE_AITER_MOE'] is missing"
+        )
+
+    original_runner_getter = environment_variables.get("VLLM_USE_V2_MODEL_RUNNER")
+    if not callable(original_runner_getter):
+        raise PatchCompatibilityError(
+            "required HCU patch target "
+            "vllm.envs.environment_variables['VLLM_USE_V2_MODEL_RUNNER'] is missing"
         )
 
     original_validate = require_callable(
@@ -71,11 +79,25 @@ def apply_to_module(module: ModuleType) -> bool:
                 )
             env_logger.warning("Unknown vLLM environment variable detected: %s", name)
 
+    @functools.wraps(original_runner_getter)
+    def hcu_model_runner_v2() -> bool:
+        # Preserve vLLM's parsing of explicit values. Only the unset default
+        # changes; VllmConfig's V2 feature checks remain authoritative.
+        use_v2 = original_runner_getter()
+        if use_v2 is False:
+            raise ValueError(
+                "HCU supports only Model Runner V2; "
+                "VLLM_USE_V2_MODEL_RUNNER disables V2. "
+                "Unset VLLM_USE_V2_MODEL_RUNNER or set it to 1."
+            )
+        return True if use_v2 is None else use_v2
+
+    environment_variables["VLLM_USE_V2_MODEL_RUNNER"] = hcu_model_runner_v2
     environment_variables["VLLM_ROCM_USE_AITER_MOE"] = lambda: os.getenv(
         "VLLM_ROCM_USE_AITER_MOE", "False"
     ).lower() in ("true", "1")
     # vLLM can cache module-level environment reads.  Clear stale values so a
-    # pre-plugin lookup cannot preserve the upstream True default.
+    # pre-plugin lookup cannot preserve either upstream default.
     env_getattr = getattr(envs, "__getattr__", None)
     cache_clear = getattr(env_getattr, "cache_clear", None)
     if callable(cache_clear):
@@ -83,13 +105,14 @@ def apply_to_module(module: ModuleType) -> bool:
 
     setattr(envs, "_vllm_hcu_original_validate_environ", original_validate)
     setattr(envs, "_vllm_hcu_original_aiter_moe_getter", old_aiter_getter)
+    envs._vllm_hcu_original_model_runner_v2_getter = original_runner_getter
     setattr(envs, "validate_environ", hcu_validate_environ)
     setattr(envs, _MARKER, True)
     return True
 
 
 def apply(module: ModuleType | None = None) -> bool:
-    """Allow ``VLLM_HCU_*`` variables and disable AITER MoE by default."""
+    """Allow HCU variables, default AITER MoE off, and require Model Runner V2."""
 
     envs = load_exact_module(TARGET_MODULE, module)
 

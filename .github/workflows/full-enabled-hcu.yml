@@ -28,7 +28,8 @@ jobs:
   prepare:
     runs-on:
       - self-hosted
-      - hcu-ci-pr
+      - ci
+      - bw1100
     container:
       image: ${{ vars.HCU_CI_IMAGE }}
     defaults:
@@ -88,7 +89,8 @@ jobs:
       - hardware
     runs-on:
       - self-hosted
-      - hcu-ci-pr
+      - ci
+      - bw1100
     env:
       PREPARE_RESULT: ${{ needs.prepare.result }}
       HARDWARE_RESULT: ${{ needs.hardware.result }}

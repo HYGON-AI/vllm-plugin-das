@@ -35,7 +35,9 @@ concurrency:
 jobs:
   dispatch:
     # 与 docker-image 构建任务同类的自托管节点, 需要能访问内网 Harbor 与 gh CLI
-    runs-on: bw1100
+    runs-on:
+      - ci
+      - bw1100
     env:
       REPO: ${{ github.repository }}
       BRANCHES: ${{ inputs.branches || 'v0.25.1,v0.28.1-dev' }}

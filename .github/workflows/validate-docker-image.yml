@@ -29,7 +29,9 @@ env:
 jobs:
   validate:
     name: Validate published image
-    runs-on: bw18
+    runs-on:
+      - ci
+      - bw1000
     steps:
       - name: Authorize release ref
         run: |

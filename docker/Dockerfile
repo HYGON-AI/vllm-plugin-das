@@ -1,32 +1,19 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright (c) 2026 Hygon Information Technology Co., Ltd.
 
-# DTK 包由 CI 通过 build-arg 传入, 从 dev 基础镜像内联安装 (分层方式同 ciimage 的框架镜像):
-#   第一段下载解压 DTK 并把 lib 移出 (约 20G 的层只存在于本地构建缓存, 不会推到 Harbor),
-#   第二段 lib 一层 + 其余一层 COPY 回 /opt/dtk, 避免单个超大层
-# 不再依赖预装 DTK 的基础镜像, 便于按次更换 DTK 包
+# 直接基于预装 DTK 的基础镜像构建 (DTK 已内置于 BASE_IMAGE, CI 内不再安装 DTK):
+#   基础镜像来自镜像总表 ${HARBOR_SITE}/hcu/base/dtk:<DTK版本>-<OS>-py<版本>,
+#   由 CI 通过 build-arg 按固定格式拼接传入; 换 DTK 包 = 换基础镜像 tag
+# pip nightly 归档路径不再由参数拼接: 基础镜像自带 ENV DTK_VERSION
+# (token 格式 dtk2604/dtk2610), FROM 之后直接读它拼出 nightly/dtk2604/+simple/
 ARG BASE_IMAGE
-ARG DTK_PKG_URL
 
-# 第一段: 下载并解压 DTK, 按 ciimage 的方式把 lib 移出单独存放
-FROM ${BASE_IMAGE} AS dtk_src
-ARG DTK_PKG_URL
-RUN wget -q -O - "${DTK_PKG_URL}" | tar -xzf - -C /opt && \
-    mv /opt/dtk-* /opt/dtk && \
-    mv /opt/dtk/lib /dtk_lib
-
-# 第二段: 正式镜像, 先装入 DTK(lib 一层 + 其余一层), 再装框架
 FROM ${BASE_IMAGE}
-ARG DTK_VERSION
 
 ENV ROCM_PATH=/opt/dtk
-COPY --from=dtk_src /dtk_lib ${ROCM_PATH}/lib
-COPY --from=dtk_src /opt/dtk ${ROCM_PATH}
 
 RUN echo "source /opt/dtk/env.sh" >> ~/.bashrc && \
     echo 'export LD_LIBRARY_PATH=/usr/local/lib/python3.10/dist-packages/amdsmi:$LD_LIBRARY_PATH' >> ~/.bashrc
-
-ENV DTK_VERSION=${DTK_VERSION}
 
 SHELL ["/bin/bash", "-c"]
 
@@ -34,12 +21,12 @@ SHELL ["/bin/bash", "-c"]
 ARG PYPI_URL
 ARG RESOURCE_SERVER_URL
 
-# pip 配置 + das-install
+# pip 配置 (nightly 归档按基础镜像的 DTK_VERSION token 拼接) + das-install
 RUN TRUSTED_HOST="${PYPI_URL#*://}" && TRUSTED_HOST="${TRUSTED_HOST%%/*}" && \
     mkdir -p ~/.pip && \
     printf '%s\n' \
     '[global]' \
-    "index-url = ${PYPI_URL}/nightly/dtk2604/+simple/" \
+    "index-url = ${PYPI_URL}/nightly/${DTK_VERSION}/+simple/" \
     "trusted-host = ${TRUSTED_HOST}" \
     > ~/.pip/pip.conf && \
     pip install --ignore-installed --no-cache-dir blinker && \
@@ -51,41 +38,30 @@ RUN TRUSTED_HOST="${PYPI_URL#*://}" && TRUSTED_HOST="${TRUSTED_HOST%%/*}" && \
     'ver=$(pip index versions "$pkg" 2>/dev/null | grep -oP "${prefix}[^ ()]*${tag}[^ ()]*" | head -1)' \
     '[ -z "$ver" ] && echo "Error: No version for $pkg matching $tag" && exit 1' \
     'echo "Installing $pkg==$ver"' \
-    'pip install --no-cache-dir --extra-index-url https://mirrors.aliyun.com/pypi/simple/ --trusted-host mirrors.aliyun.com "$pkg==$ver"' \
+    'pip install --no-cache-dir --extra-index-url https://mirrors.cloud.tencent.com/pypi/simple/ --trusted-host mirrors.cloud.tencent.com "$pkg==$ver"' \
     > /usr/local/bin/das-install && chmod +x /usr/local/bin/das-install
 
-COPY requirements-test.txt /tmp/requirements-test.txt
-COPY docker/requirements-vllm-runtime.txt /tmp/requirements-vllm-runtime.txt
-COPY scripts/ci/hcu/install_vllm_runtime_dependencies.sh /tmp/install_vllm_runtime_dependencies.sh
-
-# AICC 编译器 (nightly 最新版地址由 CI 通过 build-arg 传入, 在镜像内下载安装)
-# AICC_VERSION 由 CI 从同一 URL 解析传入; ENV 指令不支持 bash 参数展开, 无法在 Dockerfile 内由 URL 自动推导
-ARG AICC_URL
-ARG AICC_VERSION
-ENV AICC_VERSION=${AICC_VERSION}
-
-# 安装脚本安装成功后会在 $DTK_DIR/hcu_llvm.info 写入本次完整版本/commit 等记录
+# AICC 编译器安装 (安装脚本安装成功后会在 $DTK_DIR/hcu_llvm.info 写入本次完整版本/commit 等记录);
+# AICC 大版本由 CI 按矩阵的 aicc_major 字段 --build-arg 传入, 脚本 --major 装该版本中日期最新的包
+# (大版本与 dtk 段对应: dtk2604/dtk26042 -> 1.0.0/2.0.0 按归档实际为准, dtk2610 -> 2.0.0)
+ARG AICC_MAJOR
 RUN wget -q "${RESOURCE_SERVER_URL}/ai_cc/Nightly/hcu_llvm_installer.sh" -O /tmp/hcu_llvm_installer.sh && \
     chmod +x /tmp/hcu_llvm_installer.sh && \
-    bash /tmp/hcu_llvm_installer.sh --major 1.0.0 && \
+    bash /tmp/hcu_llvm_installer.sh --major "${AICC_MAJOR}" && \
     rm -f /tmp/hcu_llvm_installer.sh
 
-# 从 nightly 归档拉取 26.04 最新 blas cut 包, 解压后覆盖到 DTK 安装目录(默认 /opt/dtk)
+# 从 nightly 归档拉取blas cut 最新包, 解压后覆盖到 DTK 安装目录(默认 /opt/dtk);
+# blas cut 版本由 CI 按矩阵的 blas_cut_version 字段传入, 与基础镜像 DTK 大版本保持一致
+ARG BLAS_CUT_VERSION
 RUN wget -q "${RESOURCE_SERVER_URL}/Jenkins/CI_scripts/dtk_blas_cut_installer.sh" -O /tmp/dtk_blas_cut_installer.sh && \
     chmod +x /tmp/dtk_blas_cut_installer.sh && \
-    bash /tmp/dtk_blas_cut_installer.sh --version 26.04 --os ubuntu20.04 && \
+    bash /tmp/dtk_blas_cut_installer.sh --version "${BLAS_CUT_VERSION}" --os ubuntu20.04 && \
     rm -f /tmp/dtk_blas_cut_installer.sh
-
-# ---layer--- shca 驱动
-RUN wget -q "${RESOURCE_SERVER_URL}/pkg/shca/others/20260706/shca-tools-ofed_3.500.4.B020-Ubuntu22.04_amd64.deb" \
-    && dpkg -i --force-all shca-tools-ofed_3.500.4.B020-Ubuntu22.04_amd64.deb \
-    && rm -rf shca-tools*.deb
 
 # ---layer--- vLLM 框架依赖
 ARG VLLM_VERSION
 RUN pip install --no-cache-dir ninja wheel setuptools \
-    && /tmp/install_vllm_runtime_dependencies.sh /tmp/requirements-vllm-runtime.txt \
-    && pip install --no-cache-dir -r /tmp/requirements-test.txt \
+    && pip install --no-cache-dir ray[data,train,tune,serve] -i https://mirrors.cloud.tencent.com/pypi/simple/ --trusted-host mirrors.cloud.tencent.com \
     && pip install --no-cache-dir amdsmi==1.0.0+630c16a6.dirty \
     && pip install --no-cache-dir cupy \
     && pip install --no-cache-dir vllm==0.28.1 \
@@ -94,6 +70,8 @@ RUN pip install --no-cache-dir ninja wheel setuptools \
 
 # ---layer--- torch + das 加速库
 ARG TORCH_VERSION
+# flash_attn 包名按 DTK 版本编译, 归档里的版本串是 dtk<DTK_VERSION>.torch<TORCH_TAG>.<时间戳>.<commit>;
+# 用 das-install 按 torch_tag 前缀匹配, 避免硬编码完整包名 (换 dtk/torch 版本不用改这里)
 RUN TORCH_TAG="torch${TORCH_VERSION//./}" \
     && pip install --no-cache-dir torch==${TORCH_VERSION} torchvision \
     && das-install triton==3.6.0 ${TORCH_TAG} \
@@ -114,40 +92,22 @@ RUN TORCH_TAG="torch${TORCH_VERSION//./}" \
     # tilelang 放最后: 安装真实包会替换上面 vLLM 层写的 0.1.10 stub, 之后不应再有触发 vllm 依赖解析的安装
     && das-install tilelang ${TORCH_TAG} \
     && pip install --no-cache-dir apache-tvm-ffi==0.1.11 \
-    && pip install --no-cache-dir numpy==1.25.0 \
+    && pip install --no-cache-dir numpy==2.0.2 \
     && pip cache purge
     
 
-# ---layer--- UCX (scale-out / mooncake 多机传输依赖)
-RUN wget -q ${RESOURCE_SERVER_URL}/pkg/openmpi/ucx-1.21.0.tar.gz \
-    && tar -xzf ucx-1.21.0.tar.gz \
-    && cd ucx-1.21.0 \
-    && ./configure --prefix=/opt/ucx --enable-mt --enable-optimizations --enable-tuning --enable-cma --with-rocm=/opt/dtk --without-cuda \
-    && make && make install \
-    && cd .. \
-    && rm -rf ucx-1.21.0 ucx-1.21.0.tar.gz
+# UCX 已在基础镜像内 (/opt/ucx, 路径已在其 ENV 中), 不再重复编译
 
 # 构建完成后移除内网 pip 源, 避免运行时意外拉取内网依赖
 RUN rm -rf ~/.pip/pip.conf
 
-# DTK 环境变量: 固化 env.sh 的导出(外加 bashrc 追加的 amdsmi 路径), 使 docker run 直接给命令 / sh /
-# k8s 等非交互 bash 场景也能加载; bashrc 保留作兜底(驱动缺失时 env.sh 的 .hyhal 分支只有 source 才命中)。
-# 放在文件末尾: 不改动其上方各构建步骤所见的环境。换 DTK 包后对照新 env.sh 同步这里(参考 ciimage「DTK 环境变量」)
-ENV HYHAL_PATH=/opt/hyhal
-ENV DTKROOT=${ROCM_PATH}
-ENV AMDGPU_TARGETS="gfx906;gfx926;gfx928;gfx936;gfx938"
-ENV HIP_PATH=${ROCM_PATH}/hip
-ENV MIOPEN_FIND_MODE=3
-ENV CMAKE_PREFIX_PATH=/opt/hyhal:$CMAKE_PREFIX_PATH
-ENV PATH=${ROCM_PATH}/bin:${ROCM_PATH}/llvm/bin:${ROCM_PATH}/hip/bin:${ROCM_PATH}/hip/bin/hipify:${HYHAL_PATH}/bin:${ROCM_PATH}/opencl/bin:$PATH
-ENV LD_LIBRARY_PATH=${ROCM_PATH}/lib:${ROCM_PATH}/lib64:${HYHAL_PATH}/lib:${HYHAL_PATH}/lib64:${ROCM_PATH}/dushmem/lib:${ROCM_PATH}/opencl/lib:$LD_LIBRARY_PATH
-ENV LD_LIBRARY_PATH=${ROCM_PATH}/dcc/gcvm/lib:${ROCM_PATH}/hip/lib:${ROCM_PATH}/llvm/lib:$LD_LIBRARY_PATH
-ENV LIBRARY_PATH=${HYHAL_PATH}/lib:${ROCM_PATH}/opencl/lib:${ROCM_PATH}/dushmem/lib${LIBRARY_PATH:+:${LIBRARY_PATH}}
-ENV C_INCLUDE_PATH=${ROCM_PATH}/include:${HYHAL_PATH}/include:${ROCM_PATH}/llvm/include:${ROCM_PATH}/opencl/include${C_INCLUDE_PATH:+:${C_INCLUDE_PATH}}
-ENV C_INCLUDE_PATH=${ROCM_PATH}/dcc/gcvm/include:${C_INCLUDE_PATH}
-ENV CPLUS_INCLUDE_PATH=${ROCM_PATH}/dcc/gcvm/include:${C_INCLUDE_PATH}:${ROCM_PATH}/include:${HYHAL_PATH}/include:${ROCM_PATH}/llvm/include:${ROCM_PATH}/dushmem/include:${ROCM_PATH}/opencl/include${CPLUS_INCLUDE_PATH:+:${CPLUS_INCLUDE_PATH}}
-ENV LD_LIBRARY_PATH=/usr/local/lib/python3.10/dist-packages/amdsmi:$LD_LIBRARY_PATH
-
-# 镜像完整引用由 CI 构建时通过 --build-arg 传入, 注入 ENV 便于容器运行时读取
-ARG IMAGE_TAG
-ENV IMAGE_TAG=${IMAGE_TAG}
+# /etc/image.info (口径同基础镜像 dtk 段: ASCII 大字 + 名称/构建时间, 容器启动时由
+# ENTRYPOINT /usr/local/bin/hcu_image_info 打印); 大字换成 vllm, 覆盖基础镜像的 DTK 记录;
+# figlet 字体与基础镜像同源 (资源服务器 pkg/slant.flf); BUILD_TIME 由 CI 传入, 与产物 tag 的时间段一致
+ARG BUILD_TIME
+RUN cd /tmp && \
+    wget -q "${RESOURCE_SERVER_URL}/pkg/slant.flf" -O /tmp/slant.flf && \
+    { figlet -f slant -d /tmp -w 80 vllm; \
+      echo "dtk    : ${DTK_VERSION}"; \
+      echo "built  : ${BUILD_TIME:-$(date +%Y%m%d-%H%M)}"; } > /etc/image.info && \
+    rm -f /tmp/slant.flf

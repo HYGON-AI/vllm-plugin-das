@@ -33,7 +33,9 @@ env:
 
 jobs:
   citest:
-    runs-on: bw1100
+    runs-on:
+      - ci
+      - bw1100
     container:
       image: ${{ inputs.docker_image || format('{0}/{1}/vllm:0.28.1rc1.dev490-latest', vars.HARBOR_SITE, vars.HARBOR_NAMESPACE) }}
       options: --privileged --cap-add=SYS_PTRACE --device /dev/kfd:/dev/kfd --device /dev/dri:/dev/dri
