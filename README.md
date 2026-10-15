@@ -119,18 +119,17 @@ platform patch activation; neither mode proves model accuracy or GPU execution.
 ## Runtime Settings
 
 This branch's [HCU worker](vllm_hcu/v1/worker.py) constructs
-`HcuGPUModelRunnerV2` and rejects the legacy runner. Use Model Runner V2 when
-launching a server, as the model validation profiles do:
-
-```bash
-export VLLM_USE_V2_MODEL_RUNNER=1
-```
+`HcuGPUModelRunnerV2` and rejects the legacy runner. The HCU platform defaults
+`VLLM_USE_V2_MODEL_RUNNER` to `True` (equivalent to `1`) when it is unset,
+through its environment adapter. Explicit `1` remains supported;
+explicit `0` raises a configuration error without being overwritten. vLLM's
+Model Runner V2 feature-compatibility checks still apply.
 
 The following settings are not interchangeable:
 
 | Setting | Current behavior |
 | --- | --- |
-| `VLLM_USE_V2_MODEL_RUNNER` | Must resolve to V2; the HCU worker has no legacy-runner fallback. |
+| `VLLM_USE_V2_MODEL_RUNNER` | Defaults to `1` on HCU; explicit `0` is rejected. The HCU worker has no legacy-runner fallback. |
 | `VLLM_HCU_USE_CUSTOM_OPS` | Enabled by default; `0` disables optional HCU optimized paths governed by the master switch, not the entire plugin or all native dependencies. |
 
 See [environment settings](vllm_hcu/platforms/envs.py) for HCU-specific
