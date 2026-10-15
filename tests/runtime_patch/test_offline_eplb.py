@@ -448,6 +448,36 @@ def test_record_proposal_uses_policy_without_transfer_or_live_commit(
     assert fixture.state._vllm_hcu_offline_rearrangement_events == 0
 
 
+def test_record_disable_rearrange_still_publishes_proposal_without_transfer(
+    tmp_path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    fixture = _setup_state(tmp_path, monkeypatch, mode="record")
+    fixture.state.parallel_config._vllm_hcu_eplb_disable_rearrange = True
+    fixture.state.add_model(fixture.model, fixture.model_config)
+    candidate = torch.tensor([[2, 0, 1, 2], [0, 1, 2, 1]])
+    policy_calls = []
+    fixture.state.policy = SimpleNamespace(
+        rebalance_experts=lambda *args: policy_calls.append(args) or candidate
+    )
+    fixture.state.model_states["record-model"].expert_load_window.fill_(1)
+    fixture.state._allreduce_list = lambda values: values
+    _install_cpu_events(monkeypatch)
+
+    fixture.state.rearrange()
+
+    entry = json.loads((tmp_path / "record.json").read_text())["model_maps"][
+        "GenericMoE"
+    ]
+    assert policy_calls
+    assert entry["record_kind"] == "proposal"
+    assert entry["physical_to_logical_map"] == candidate.tolist()
+    assert fixture.transfer_calls == []
+    assert fixture.state._vllm_hcu_offline_proposal_events == 1
+    assert fixture.state._vllm_hcu_offline_transfer_events == 0
+    assert fixture.state._vllm_hcu_offline_rearrangement_events == 0
+
+
 def test_record_rocm_low_gain_policy_result_is_still_published(
     tmp_path,
     monkeypatch: pytest.MonkeyPatch,

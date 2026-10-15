@@ -555,8 +555,9 @@ def bind_static_eplb_plan(
         model_key,
         len(layers),
     )
+    completeness_sha256 = None
     if required_models is not None:
-        validate_static_eplb_artifact(
+        completeness_sha256 = validate_static_eplb_artifact(
             path,
             required_models=required_models,
             expected_model_name=expected_model_name,
@@ -571,6 +572,13 @@ def bind_static_eplb_plan(
         num_logical_experts=model.num_logical_experts,
         num_redundant_experts=model.num_redundant_experts,
     )
+    if (
+        completeness_sha256 is not None
+        and plan.source_sha256 != completeness_sha256
+    ):
+        raise ValueError(
+            "Static EPLB file changed after completeness validation"
+        )
 
     bound = getattr(model, "_vllm_hcu_static_eplb_plan", None)
     if bound is not None:

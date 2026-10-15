@@ -384,6 +384,53 @@ def test_binding_loads_each_logical_checkpoint_into_static_local_replicas(
         )
 
 
+def test_binding_rejects_artifact_replaced_after_completeness_validation(
+    tmp_path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    import vllm_hcu.model_executor.layers.fused_moe.static_eplb as api
+
+    hyv4_type = type("HYV4ForCausalLM", (GenericMoE,), {})
+    model = hyv4_type()
+    config, path = config_and_map(tmp_path, key="HYV4ForCausalLM")
+    config.model_config.hf_config = SimpleNamespace(
+        mlp_layer_types=["moe", "moe"]
+    )
+    complete = json.loads(path.read_text())
+    mtp_entry = dict(complete["model_maps"]["HYV4ForCausalLM"])
+    mtp_entry.update(
+        model_class="HYV4MTP",
+        num_moe_layers=1,
+        physical_to_logical_map=[[0, 1, 2, 1]],
+    )
+    complete["model_maps"]["HYV4MTP"] = mtp_entry
+    path.write_text(json.dumps(complete))
+
+    replacement = tmp_path / "target-only.json"
+    target_only = dict(complete)
+    target_only["model_maps"] = {
+        "HYV4ForCausalLM": complete["model_maps"]["HYV4ForCausalLM"]
+    }
+    replacement.write_text(json.dumps(target_only))
+    original_validate = api.validate_static_eplb_artifact
+
+    def validate_then_replace(*args, **kwargs):
+        source_sha256 = original_validate(*args, **kwargs)
+        replacement.replace(path)
+        return source_sha256
+
+    monkeypatch.setattr(
+        api,
+        "validate_static_eplb_artifact",
+        validate_then_replace,
+    )
+
+    with pytest.raises(ValueError, match="changed after completeness validation"):
+        bind_static_eplb_plan(config, model)
+
+    assert not hasattr(model, "_vllm_hcu_static_eplb_plan")
+
+
 def test_binding_preserves_shared_router_and_global_state(tmp_path) -> None:
     model = GenericMoE()
     config, _ = config_and_map(tmp_path)

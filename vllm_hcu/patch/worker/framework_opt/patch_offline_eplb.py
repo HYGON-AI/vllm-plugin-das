@@ -596,7 +596,9 @@ def apply_to_module(module) -> bool:
     @functools.wraps(original_rearrange)
     def rearrange(self, is_profile=False, rank_mapping=None):
         load_path, record_path = _paths(self.parallel_config)
-        if load_path or (
+        if load_path:
+            return None
+        if not record_path and (
             not is_profile
             and getattr(
                 self.parallel_config,
