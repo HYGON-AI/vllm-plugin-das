@@ -254,6 +254,7 @@ _CORE_CALLBACKS: tuple[_CallbackSpec, ...] = (
 # ``attention.attention`` callback, hence the non-alphabetical first entries.
 _OP_CALLBACKS: tuple[_CallbackSpec, ...] = (
     _CallbackSpec(_adapter("op_opt", "patch_custom_ops")),
+    _CallbackSpec(_adapter("op_opt", "patch_deepseek_v41_topk_output_size")),
     _CallbackSpec(_adapter("op_opt", "patch_attention_layer")),
     _CallbackSpec(_adapter("op_opt", "patch_attention_exports")),
     _CallbackSpec(_adapter("op_opt", "patch_attention_backend")),
