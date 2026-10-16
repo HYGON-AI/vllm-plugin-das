@@ -19,8 +19,8 @@ dtype. When ``norm_weight.dtype != layer_input.dtype`` the wrapper falls back
 to the original implementation, because aten's rms_norm would promote the
 output dtype in that case.
 
-The switch is consulted once, at patch-apply time; when it is off the module
-is left untouched so the default path has no wrapper indirection.
+The switch is enabled by default and can be disabled by setting it to 0. It is
+consulted once, at patch-apply time; when off the module is left untouched.
 """
 
 from __future__ import annotations
@@ -53,8 +53,7 @@ def apply_to_module(module: ModuleType) -> bool:
     import vllm_hcu.platforms.envs as henvs
 
     if not henvs.VLLM_HCU_MHC_FUSED_RMSNORM or not henvs.VLLM_HCU_USE_CUSTOM_OPS:
-        # Opt-in only: leave the module untouched so the default path has
-        # no wrapper indirection at all.
+        # Leave the module untouched when the feature or its master switch is off.
         return False
 
     import torch

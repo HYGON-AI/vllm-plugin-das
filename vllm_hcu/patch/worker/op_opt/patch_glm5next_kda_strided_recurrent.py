@@ -16,18 +16,20 @@ copies.
 This patch swaps in an alternate ``fused_recurrent_kda`` that forwards
 per-token strides into a (locally defined) copy of the Triton kernel and
 skips the copy for any input whose (head, dim) layout is already dense.
-Gated by VLLM_HCU_GLM5NEXT_KDA_STRIDED_INPUTS, consulted once at patch-apply
-time (default off); when the switch is off the target module is left
-untouched, so the default path keeps the original function object with no
-wrapper indirection.
+Gated by VLLM_HCU_GLM5NEXT_KDA_STRIDED_INPUTS, enabled by default and
+consulted once at patch-apply time. Set it to 0 to disable; when off the
+target module is left untouched.
 
 The Triton kernel below is copied from
 ``vllm.models.glm5next.nvidia.ops.third_party.kda.fused_recurrent`` /
 ``kernels`` as of vLLM 0.28.1+das (upstream flash-linear-attention, Songlin
-Yang, Yu Zhang), with per-token stride parameters added. If the upstream
-``fused_recurrent_gated_delta_rule_fwd_kernel`` or ``fused_recurrent_kda_fwd``
-changes, this copy must be re-synced manually; ``require_exact_signature``
-below only guards the Python wrapper signature, not the kernel body.
+Yang, Yu Zhang), with per-token stride parameters added and two upstream bugs
+fixed (gate reading missing mask when K is not a power of 2, and final_state
+allocation sized T instead of B*T when inplace_final_state=False). When K is
+non-power-of-2 or inplace_final_state=False, outputs will not match the
+(buggy) upstream kernel bit-for-bit. If the upstream kernel changes, this copy
+must be re-synced manually; ``require_exact_signature`` below only guards the
+Python wrapper signature, not the kernel body.
 """
 
 from __future__ import annotations
@@ -208,7 +210,7 @@ def _strided_fused_recurrent_gated_delta_rule_fwd_kernel(
             b_g = tl.load(p_g).to(tl.float32)
             b_h *= exp(b_g)
         else:
-            b_gk = tl.load(p_gk).to(tl.float32)
+            b_gk = tl.load(p_gk, mask=mask_k, other=0.0).to(tl.float32)
             if COMPUTE_GATE:
                 # Replicates kda_gate_fwd_kernel's SAFE_GATE branch
                 # bit-for-bit: y = lb / (1 + exp(-exp(A)*(g+bias))).
@@ -301,7 +303,7 @@ def _strided_fused_recurrent_kda_fwd(
     if inplace_final_state:
         final_state = initial_state
     else:
-        final_state = q.new_empty(T, HV, V, K, dtype=initial_state.dtype)
+        final_state = q.new_empty(B * T, HV, V, K, dtype=initial_state.dtype)
 
     stride_init_state_token = initial_state.stride(0)
     stride_final_state_token = final_state.stride(0)
@@ -412,8 +414,7 @@ def apply_to_module(module: ModuleType) -> bool:
     import vllm_hcu.platforms.envs as henvs
 
     if not henvs.VLLM_HCU_GLM5NEXT_KDA_STRIDED_INPUTS or not henvs.VLLM_HCU_USE_CUSTOM_OPS:
-        # Opt-in only: leave the target untouched so the default path has
-        # no wrapper indirection or per-call environment lookups.
+        # Leave the target untouched when the feature or its master switch is off.
         return False
 
     @functools.wraps(original)

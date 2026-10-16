@@ -80,8 +80,8 @@ if TYPE_CHECKING:
     VLLM_HCU_PLE_CPU_OFFLOAD: bool = False
     VLLM_HCU_PLE_PREFETCH_STREAM: bool = False
     VLLM_HCU_QWEN4_EXP_HC_SP: bool = True
-    VLLM_HCU_MHC_FUSED_RMSNORM: bool = False
-    VLLM_HCU_GLM5NEXT_KDA_STRIDED_INPUTS: bool = False
+    VLLM_HCU_MHC_FUSED_RMSNORM: bool = True
+    VLLM_HCU_GLM5NEXT_KDA_STRIDED_INPUTS: bool = True
 
 def maybe_convert_int(value: Optional[str]) -> Optional[int]:
     """
@@ -610,9 +610,9 @@ hcu_vllm_environment_variables: dict[str, Callable[[], Any]] = {
     # kernels when no fused IR provider is registered, the case on HCU).
     # Affects every model on the native mHC fallback path (GLM5Next,
     # DeepSeek V4, ...); consulted once at patch-apply time. See
-    # patch_mhc_fused_rmsnorm.py.
+    # patch_mhc_fused_rmsnorm.py. Enabled by default; set to 0 to disable.
     "VLLM_HCU_MHC_FUSED_RMSNORM":
-        lambda: (os.environ.get("VLLM_HCU_MHC_FUSED_RMSNORM", "False").lower() in
+        lambda: (os.environ.get("VLLM_HCU_MHC_FUSED_RMSNORM", "True").lower() in
                     ("true", "1")),
 
     # Skip the .contiguous() copies GLM5Next's fused_recurrent_kda otherwise
@@ -621,9 +621,10 @@ hcu_vllm_environment_variables: dict[str, Callable[[], Any]] = {
     # spec-verify paths q/k/v are non-contiguous views split out of the merged
     # qkv causal-conv1d output, so this removes 4-5 elementwise copy kernels
     # per step. Consulted once at patch-apply time. See
-    # patch_glm5next_kda_strided_recurrent.py.
+    # patch_glm5next_kda_strided_recurrent.py. Enabled by default; set to 0
+    # to disable.
     "VLLM_HCU_GLM5NEXT_KDA_STRIDED_INPUTS":
-        lambda: (os.environ.get("VLLM_HCU_GLM5NEXT_KDA_STRIDED_INPUTS", "False").lower() in
+        lambda: (os.environ.get("VLLM_HCU_GLM5NEXT_KDA_STRIDED_INPUTS", "True").lower() in
                     ("true", "1")),
 }
 
