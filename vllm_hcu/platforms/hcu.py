@@ -467,6 +467,11 @@ class HCUPlatform(Platform):
     ) -> "IrOpPriorityConfig":
         from vllm.config.kernel import IrOpPriorityConfig
 
+        model_config = getattr(vllm_config, "model_config", None)
+        hf_config = getattr(model_config, "hf_config", None)
+        if getattr(hf_config, "model_type", None) not in ("kimi_k3", "kimi_linear"):
+            return super().get_default_ir_op_priority(vllm_config)
+
         # HCU Kimi runs may request torch.compile but fall back at runtime.
         # Prefer the same ROCm C kernels used by the source path rather than
         # selecting native decomposition solely from the requested mode.
