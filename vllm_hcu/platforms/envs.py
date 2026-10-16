@@ -29,11 +29,13 @@ if TYPE_CHECKING:
     VLLM_HCU_USE_DEEPGEMM_W8A16_GEMM: bool = True
     VLLM_HCU_DEEPGEMM_W8A16_PRESHUFFLE: bool = True
     VLLM_HCU_USE_CUSTOM_REARRANGE_MIXED_QKV: bool = True
-    VLLM_HCU_USE_FUSED_RMSNORM_MROPE: bool = False
-    # Default off on 0.28: the strided-z op runs inside FULL decode
-    # graphs where launch shapes freeze at capture time; some replay
-    # shapes deadlock the stream (2026-10-15 eval hang at parallel=2).
-    VLLM_HCU_USE_CUSTOM_STRIDED_Z: bool = False
+    VLLM_HCU_USE_FUSED_RMSNORM_MROPE: bool = True
+    # KNOWN ISSUE (rare): the strided-z op runs inside FULL decode graphs
+    # where launch shapes freeze at capture time; a rare replay shape has
+    # deadlocked the stream once in ~5h of evals. Default on for the p1
+    # +11% it buys; set 0 to fall back if the serving loop lacks a
+    # restart-on-stall watchdog.
+    VLLM_HCU_USE_CUSTOM_STRIDED_Z: bool = True
     VLLM_HCU_USE_CUSTOM_RMS_NORM : bool = False
     VLLM_HCU_USE_CUSTOM_AITER_FLA : bool = False
     VLLM_HCU_PP_LAYER_PARTITION_D : Optional[str] = None
@@ -280,10 +282,10 @@ hcu_vllm_environment_variables: dict[str, Callable[[], Any]] = {
     # weights into the marlin layout (WEIGHT_LAYOUT=1) at load time for
     # shapes whose tuned DeepGEMM configs pick that layout. Requires
     # DeepGEMM with the bm32 kernel fix (a325158 "fix:bm32 kernel Bload").
-        # If set (default False), the Qwen3.5 full-attention layers use the
+        # If set (default True), the Qwen3.5 full-attention layers use the
     # fused RMSNorm+MRoPE Triton kernel (stride-safe, vllm-hcu 4e01bc8).
     "VLLM_HCU_USE_FUSED_RMSNORM_MROPE":
-        lambda: (os.environ.get("VLLM_HCU_USE_FUSED_RMSNORM_MROPE", "False").lower() in
+        lambda: (os.environ.get("VLLM_HCU_USE_FUSED_RMSNORM_MROPE", "True").lower() in
                  ("true", "1")),
 
     "VLLM_HCU_USE_CUSTOM_REARRANGE_MIXED_QKV":
@@ -291,7 +293,7 @@ hcu_vllm_environment_variables: dict[str, Callable[[], Any]] = {
                  ("true", "1")),
 
     "VLLM_HCU_USE_CUSTOM_STRIDED_Z":
-        lambda: (os.environ.get("VLLM_HCU_USE_CUSTOM_STRIDED_Z", "False").lower() in
+        lambda: (os.environ.get("VLLM_HCU_USE_CUSTOM_STRIDED_Z", "True").lower() in
                  ("true", "1")),
 
     "VLLM_HCU_DEEPGEMM_W8A16_PRESHUFFLE":
