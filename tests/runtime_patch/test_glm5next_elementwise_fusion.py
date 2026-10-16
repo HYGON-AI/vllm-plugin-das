@@ -44,6 +44,7 @@ def _fake_mhc_module() -> ModuleType:
 
 
 def test_mhc_fused_rmsnorm_disabled_leaves_module_untouched(monkeypatch):
+    monkeypatch.setenv("VLLM_HCU_USE_CUSTOM_OPS", "1")
     monkeypatch.delenv("VLLM_HCU_MHC_FUSED_RMSNORM", raising=False)
     module = _fake_mhc_module()
     original = module._apply_mhc_norm
@@ -51,7 +52,17 @@ def test_mhc_fused_rmsnorm_disabled_leaves_module_untouched(monkeypatch):
     assert module._apply_mhc_norm is original
 
 
+def test_mhc_fused_rmsnorm_respects_custom_ops_master_switch(monkeypatch):
+    monkeypatch.setenv("VLLM_HCU_USE_CUSTOM_OPS", "0")
+    monkeypatch.setenv("VLLM_HCU_MHC_FUSED_RMSNORM", "1")
+    module = _fake_mhc_module()
+    original = module._apply_mhc_norm
+    assert patch_mhc_fused_rmsnorm.apply_to_module(module) is False
+    assert module._apply_mhc_norm is original
+
+
 def test_mhc_fused_rmsnorm_matches_reference(monkeypatch):
+    monkeypatch.setenv("VLLM_HCU_USE_CUSTOM_OPS", "1")
     monkeypatch.setenv("VLLM_HCU_MHC_FUSED_RMSNORM", "1")
     module = _fake_mhc_module()
     assert patch_mhc_fused_rmsnorm.apply_to_module(module) is True
@@ -74,6 +85,7 @@ def test_mhc_fused_rmsnorm_matches_reference(monkeypatch):
 
 
 def test_mhc_fused_rmsnorm_dtype_mismatch_falls_back(monkeypatch):
+    monkeypatch.setenv("VLLM_HCU_USE_CUSTOM_OPS", "1")
     monkeypatch.setenv("VLLM_HCU_MHC_FUSED_RMSNORM", "1")
     module = _fake_mhc_module()
     patch_mhc_fused_rmsnorm.apply_to_module(module)
@@ -90,7 +102,20 @@ def test_mhc_fused_rmsnorm_dtype_mismatch_falls_back(monkeypatch):
 
 
 def test_kda_strided_disabled_leaves_module_untouched(monkeypatch):
+    monkeypatch.setenv("VLLM_HCU_USE_CUSTOM_OPS", "1")
     monkeypatch.delenv("VLLM_HCU_GLM5NEXT_KDA_STRIDED_INPUTS", raising=False)
+    kda = pytest.importorskip("vllm.models.glm5next.nvidia.kda")
+    original = kda.fused_recurrent_kda
+    try:
+        assert kda_patch.apply_to_module(sys.modules[kda.__name__]) is False
+        assert kda.fused_recurrent_kda is original
+    finally:
+        kda.fused_recurrent_kda = original
+
+
+def test_kda_strided_respects_custom_ops_master_switch(monkeypatch):
+    monkeypatch.setenv("VLLM_HCU_USE_CUSTOM_OPS", "0")
+    monkeypatch.setenv("VLLM_HCU_GLM5NEXT_KDA_STRIDED_INPUTS", "1")
     kda = pytest.importorskip("vllm.models.glm5next.nvidia.kda")
     original = kda.fused_recurrent_kda
     try:
@@ -103,6 +128,7 @@ def test_kda_strided_disabled_leaves_module_untouched(monkeypatch):
 @requires_gpu
 @pytest.mark.parametrize("spec", [False, True])
 def test_kda_strided_matches_contiguous_reference(monkeypatch, spec):
+    monkeypatch.setenv("VLLM_HCU_USE_CUSTOM_OPS", "1")
     monkeypatch.setenv("VLLM_HCU_GLM5NEXT_KDA_STRIDED_INPUTS", "1")
     kda = pytest.importorskip("vllm.models.glm5next.nvidia.kda")
     original = getattr(

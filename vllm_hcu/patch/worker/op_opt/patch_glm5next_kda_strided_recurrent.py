@@ -411,7 +411,7 @@ def apply_to_module(module: ModuleType) -> bool:
 
     import vllm_hcu.platforms.envs as henvs
 
-    if not henvs.VLLM_HCU_GLM5NEXT_KDA_STRIDED_INPUTS:
+    if not henvs.VLLM_HCU_GLM5NEXT_KDA_STRIDED_INPUTS or not henvs.VLLM_HCU_USE_CUSTOM_OPS:
         # Opt-in only: leave the target untouched so the default path has
         # no wrapper indirection or per-call environment lookups.
         return False

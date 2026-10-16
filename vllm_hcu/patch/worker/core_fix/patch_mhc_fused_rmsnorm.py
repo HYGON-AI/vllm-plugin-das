@@ -52,7 +52,7 @@ def apply_to_module(module: ModuleType) -> bool:
 
     import vllm_hcu.platforms.envs as henvs
 
-    if not henvs.VLLM_HCU_MHC_FUSED_RMSNORM:
+    if not henvs.VLLM_HCU_MHC_FUSED_RMSNORM or not henvs.VLLM_HCU_USE_CUSTOM_OPS:
         # Opt-in only: leave the module untouched so the default path has
         # no wrapper indirection at all.
         return False
