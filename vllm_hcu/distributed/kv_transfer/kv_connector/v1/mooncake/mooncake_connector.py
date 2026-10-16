@@ -174,32 +174,15 @@ def _get_pp_stage_layer_range(
     ):
         raise ValueError("Mooncake PP requires positive stage sizes and a valid rank.")
     partition = envs.VLLM_PP_LAYER_PARTITION
-    if partition is None:
-        # Keep upstream's default layer distribution authoritative.
-        return get_pp_indices(num_layers, pp_rank, pp_size)
-    _normalize_pp_layer_partition(partition, num_layers, pp_size)
+    if partition is not None:
+        _normalize_pp_layer_partition(partition, num_layers, pp_size)
     return get_pp_indices(num_layers, pp_rank, pp_size)
 
 
-def _get_tp_ratio(local_tp_size: int, remote_tp_size: int) -> int:
-    """Return the TP ratio used by heterogeneous TP transfer planning.
-
-    Positive values mean one local rank maps into a larger remote KV region.
-    Negative values mean one local rank must gather from multiple remote KV
-    regions.
-    """
-    if local_tp_size >= remote_tp_size:
-        assert local_tp_size % remote_tp_size == 0, (
-            f"Local tensor parallel size {local_tp_size} is not divisible "
-            f"by remote tensor parallel size {remote_tp_size}."
-        )
-        return local_tp_size // remote_tp_size
-
-    assert remote_tp_size % local_tp_size == 0, (
-        f"Remote tensor parallel size {remote_tp_size} is not divisible "
-        f"by local tensor parallel size {local_tp_size}."
+def _valid_block_capacities(counts: list[int], region_count: int) -> bool:
+    return len(counts) == region_count and all(
+        type(count) is int and count > 0 for count in counts
     )
-    return -(remote_tp_size // local_tp_size)
 
 
 def _expand_transfer_regions(
@@ -240,9 +223,8 @@ def _expand_transfer_regions(
         f"got split_kv_regions={len(split_kv_regions)}, "
         f"layer_names={len(layer_names)}."
     )
-    if num_blocks_per_layer is not None and (
-        len(num_blocks_per_layer) != len(layer_names)
-        or any(type(count) is not int or count <= 0 for count in num_blocks_per_layer)
+    if num_blocks_per_layer is not None and not _valid_block_capacities(
+        num_blocks_per_layer, len(layer_names)
     ):
         raise ValueError("Mooncake requires one positive block capacity per region.")
     capacities = num_blocks_per_layer or [None] * len(layer_names)
@@ -311,8 +293,7 @@ def _expand_transfer_regions(
 
 
 def _compute_sender_transfer_plan(
-    local_tp_rank: int,
-    local_tp_size: int,
+    transfer_topo: TransferTopology,
     remote_tp_rank: int,
     remote_tp_size: int,
     local_kv_block_len: int,
@@ -320,18 +301,18 @@ def _compute_sender_transfer_plan(
     producer_cache_replicated: bool,
 ) -> tuple[bool, int, int, int]:
     """Plan one producer-rank to one consumer-rank copy for heterogeneous TP."""
-    tp_ratio = _get_tp_ratio(local_tp_size, remote_tp_size)
+    tp_ratio = transfer_topo.tp_ratio(remote_tp_size)
 
     if tp_ratio == 1:
         return True, 0, 0, local_kv_block_len
 
     if tp_ratio > 0:
         if producer_cache_replicated:
-            return local_tp_rank % tp_ratio == 0, 0, 0, local_kv_block_len
+            return transfer_topo.tp_rank % tp_ratio == 0, 0, 0, local_kv_block_len
         return (
             True,
             0,
-            (local_tp_rank % tp_ratio) * local_kv_block_len,
+            (transfer_topo.tp_rank % tp_ratio) * local_kv_block_len,
             local_kv_block_len,
         )
 
@@ -366,7 +347,7 @@ def _can_coalesce_block_transfers(
 def _validate_asymmetric_region_lengths(
     local_regions: list[TransferRegion],
     remote_regions: list[TransferRegion],
-    local_tp_size: int,
+    transfer_topo: TransferTopology,
     remote_tp_size: int,
     producer_cache_replicated: bool,
 ) -> str | None:
@@ -394,7 +375,7 @@ def _validate_asymmetric_region_lengths(
                 )
         return None
 
-    tp_ratio = _get_tp_ratio(local_tp_size, remote_tp_size)
+    tp_ratio = transfer_topo.tp_ratio(remote_tp_size)
     for idx, (local_region, remote_region) in enumerate(
         zip(local_regions, remote_regions)
     ):
@@ -529,12 +510,8 @@ def _validate_phase1_metadata(
 
     Layer occurrences are aligned separately by ``_align_transfer_regions``.
     """
-    if remote_num_blocks_per_layer is not None and (
-        len(remote_num_blocks_per_layer) != len(remote_layer_names)
-        or any(
-            type(count) is not int or count <= 0
-            for count in remote_num_blocks_per_layer
-        )
+    if remote_num_blocks_per_layer is not None and not _valid_block_capacities(
+        remote_num_blocks_per_layer, len(remote_layer_names)
     ):
         return "Mooncake remote metadata requires one positive block capacity per region."
     local_lengths = {
@@ -1556,7 +1533,7 @@ class MooncakeConnectorWorker:
         validation_err = _validate_asymmetric_region_lengths(
             local_regions=local_regions,
             remote_regions=remote_regions,
-            local_tp_size=self.tp_size,
+            transfer_topo=self.transfer_topo,
             remote_tp_size=meta.remote_tp_size,
             producer_cache_replicated=self._producer_cache_is_replicated(),
         )
@@ -2532,8 +2509,7 @@ class MooncakeConnectorWorker:
         remote_tp_size: int,
     ) -> tuple[bool, int, int, int]:
         return _compute_sender_transfer_plan(
-            local_tp_rank=self.tp_rank,
-            local_tp_size=self.tp_size,
+            transfer_topo=self.transfer_topo,
             remote_tp_rank=remote_tp_rank,
             remote_tp_size=remote_tp_size,
             local_kv_block_len=local_kv_block_len,

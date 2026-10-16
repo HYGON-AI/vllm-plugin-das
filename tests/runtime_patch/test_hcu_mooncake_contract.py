@@ -36,13 +36,15 @@ def _worker(
     blocks_first: bool,
     split_k_and_v: bool = False,
     use_mla: bool = False,
+    tp_size: int = 2,
+    tp_rank: int = 0,
 ):
     worker = object.__new__(mooncake.MooncakeConnectorWorker)
     worker.shutdown = lambda: None
     worker.use_mla = use_mla
     # Use the real v0.28 topology: it has no v0.25 cache-layout helpers.
     worker.transfer_topo = mooncake.TransferTopology(
-        tp_rank=0, tp_size=2, block_size=16, engine_id="test",
+        tp_rank=tp_rank, tp_size=tp_size, block_size=16, engine_id="test",
         is_mla=use_mla, is_mamba=False, total_num_kv_heads=16,
         attn_backends=[],
     )
@@ -52,8 +54,8 @@ def _worker(
     worker._layer_specs = {}
     worker._layer_group_indices = {}
     worker._physical_blocks_per_logical_kv_block = 1
-    worker.tp_rank = 0
-    worker.tp_size = 2
+    worker.tp_rank = tp_rank
+    worker.tp_size = tp_size
     worker.finished_recving_reqs = set()
     worker._kv_load_error = None
     return worker
@@ -679,9 +681,9 @@ def test_cutlass_asymmetric_tp_uses_hnd_head_slice_transfer_plan(
     expected_dst,
 ):
     """Cover asymmetric TP planning only for the CUTLASS/HND contract."""
-    worker = _worker(mooncake, blocks_first=True)
-    worker.tp_rank = local_tp_rank
-    worker.tp_size = local_tp_size
+    worker = _worker(
+        mooncake, blocks_first=True, tp_rank=local_tp_rank, tp_size=local_tp_size,
+    )
     worker.kv_cache_config = SimpleNamespace(
         kv_cache_groups=[SimpleNamespace(kv_cache_spec=object())]
     )
@@ -924,7 +926,9 @@ def test_mooncake_replicated_regions_reject_mismatched_lengths(
         mooncake, local_payload=local_payload, remote_payload=remote_payload,
     )
     error = mooncake._validate_asymmetric_region_lengths(
-        local, remote, local_tp, remote_tp, True,
+        local, remote,
+        _worker(mooncake, blocks_first=False, tp_size=local_tp).transfer_topo,
+        remote_tp, True,
     )
     assert error is not None and "replicated" in error
 
@@ -940,7 +944,9 @@ def test_mooncake_valid_asymmetric_region_lengths(
         mooncake, local_payload=local_payload, remote_payload=remote_payload,
     )
     assert mooncake._validate_asymmetric_region_lengths(
-        local, remote, local_tp, remote_tp, replicated,
+        local, remote,
+        _worker(mooncake, blocks_first=False, tp_size=local_tp).transfer_topo,
+        remote_tp, replicated,
     ) is None
 
 
@@ -1034,7 +1040,7 @@ def test_v028_allocated_pages_transfer_exact_bytes(
         for remote_rank in producer.transfer_topo.handshake_target_ranks(consumer_tp):
             consumer, _, remote_regions = consumers[remote_rank]
             assert mooncake._validate_asymmetric_region_lengths(
-                local_regions, remote_regions, producer_tp, consumer_tp, use_mla,
+                local_regions, remote_regions, producer.transfer_topo, consumer_tp, use_mla,
             ) is None
             metadata = _metadata(
                 mooncake, remote_tp_rank=remote_rank, remote_tp_size=consumer_tp,
