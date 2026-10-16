@@ -270,10 +270,16 @@ def test_kimi_without_redundancy_preserves_native_loader():
         torch.testing.assert_close(value, expected[name])
 
 
-def test_kimi_redundant_loader_preserves_other_weights_and_partial_layer_skip():
+def test_kimi_redundant_loader_preserves_other_weights_and_pp_missing_layer_skip():
     from torch import nn
+    from vllm.model_executor.models.utils import PPMissingLayer
 
     model, _, weights, _, _, _ = _cpu_expert_model(2, 1)
+    # A PP stage retains the full layer index space and marks nonlocal layers.
+    # Merely omitting a module is not a supported native loader skip contract.
+    model.config.num_hidden_layers = 4
+    model.start_layer, model.end_layer = 0, 1
+    model.layers.extend(PPMissingLayer() for _ in range(3))
     model.extra_weight = nn.Parameter(torch.full((2, 2), -77.0))
     patch._wrap_model_load_weights(type(model))
     weights += [
