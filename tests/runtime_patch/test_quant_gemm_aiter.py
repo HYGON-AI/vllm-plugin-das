@@ -4383,15 +4383,29 @@ def test_slimquant_w4a8_moe_method_is_a_direct_fused_moe_method():
 
 
 @pytest.mark.hcu
+@pytest.mark.parametrize("architecture", [
+    "DeepseekV4ForCausalLM", "DeepSeekV4MTPModel",
+])
+@pytest.mark.parametrize("dp_size,pcp_size", [(2, 1), (1, 2), (1, 4), (1, 8)])
 def test_slimquant_w4a8_deepep_auto_uses_w4a8_deepgemm_factory_not_aiter(
-    monkeypatch: pytest.MonkeyPatch,
+    monkeypatch: pytest.MonkeyPatch, architecture: str,
+    dp_size: int, pcp_size: int,
 ):
-    """DP+EP W4A8 must own an auto DeepGEMM kernel, not an AITER fallback."""
+    """DP/PCP+EP targets and MTP drafts must load and execute W4A8 experts."""
 
     from vllm_hcu.model_executor.layers.fused_moe.experts import (
         dpsk_v4_deep_gemm_moe as deepgemm_module,
     )
     from vllm_hcu.model_executor.layers.quantization import slimquant_w4a8
+
+    from vllm_hcu.model_executor.layers.fused_moe import deepep_runtime
+
+    monkeypatch.setattr(
+        deepep_runtime, "current_platform", SimpleNamespace(is_rocm=lambda: True)
+    )
+    monkeypatch.setattr(
+        deepep_runtime, "_require_slimquant_w4a8_hipc_runtime", lambda: None
+    )
 
     factory_calls: list[tuple[object, object, object]] = []
     processed_layers: list[object] = []
@@ -4441,14 +4455,15 @@ def test_slimquant_w4a8_deepep_auto_uses_w4a8_deepgemm_factory_not_aiter(
         activation=SimpleNamespace(value="silu"),
         moe_backend="auto",
         moe_parallel_config=SimpleNamespace(
-            dp_size=2,
+            dp_size=dp_size,
+            pcp_size=pcp_size,
             use_ep=True,
             all2all_backend="deepep_auto",
             use_deepep_auto_kernels=True,
         ),
         _hcu_vllm_config=SimpleNamespace(
             model_config=SimpleNamespace(
-                architectures=["DeepseekV4ForCausalLM"]
+                architectures=[architecture]
             )
         ),
     )
@@ -4867,7 +4882,7 @@ def test_slimquant_w4a8_agrs_dp_ep_uses_standard_aiter_route(
             "deepep_auto",
             True,
             "auto",
-            "requires dp_size > 1 and expert parallelism",
+            "requires dp_size > 1 or pcp_size > 1, with expert parallelism",
         ),
         (
             2,
@@ -4875,7 +4890,7 @@ def test_slimquant_w4a8_agrs_dp_ep_uses_standard_aiter_route(
             "deepep_auto",
             True,
             "auto",
-            "requires dp_size > 1 and expert parallelism",
+            "requires dp_size > 1 or pcp_size > 1, with expert parallelism",
         ),
         (
             2,
@@ -4895,9 +4910,11 @@ def test_slimquant_w4a8_agrs_dp_ep_uses_standard_aiter_route(
         ),
     ],
 )
+@pytest.mark.parametrize("pcp_size", [1, 8])
 def test_slimquant_w4a8_deepep_routing_fails_closed_before_tp_fallback(
     monkeypatch: pytest.MonkeyPatch,
     dp_size: int,
+    pcp_size: int,
     use_ep: bool,
     all2all_backend: str,
     auto_kernels: bool,
@@ -4919,6 +4936,7 @@ def test_slimquant_w4a8_deepep_routing_fails_closed_before_tp_fallback(
             moe_backend=moe_backend,
             moe_parallel_config=SimpleNamespace(
                 dp_size=dp_size,
+                pcp_size=pcp_size,
                 use_ep=use_ep,
                 all2all_backend=all2all_backend,
                 use_deepep_auto_kernels=auto_kernels,
