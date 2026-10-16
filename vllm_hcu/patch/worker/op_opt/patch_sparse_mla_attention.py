@@ -73,7 +73,7 @@ def apply_to_module(module: ModuleType) -> bool:
                 k_scale,
             )
         try:
-            from vllm_hcu.v1.attention.backends.fa_utils import hcu_ops  # noqa: F401
+            import vllm_hcu.hcu_ops  # noqa: F401
 
             op = sparse_module.torch.ops.hcu_ops.concat_and_cache_mla
         except (ImportError, AttributeError) as exc:

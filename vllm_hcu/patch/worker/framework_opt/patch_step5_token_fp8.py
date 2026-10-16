@@ -30,12 +30,21 @@ def apply_to_module(module: ModuleType) -> bool:
         return False
     require_signatures(target, SIGNATURES, REVIEWED_SOURCES)
     import functools
+    import os
+    from vllm_hcu.platforms import envs as henvs
 
     original = require_callable(target, "_fp8_quantize", TARGETS[0])
 
     @functools.wraps(original)
     def quantize(A, A_scale, per_act_token, block_shape=None):
-        if block_shape is None and per_act_token and A_scale is None:
+        if (
+            henvs.optional_custom_op_enabled(
+                os.environ.get("VLLM_HCU_TRITON_TOKEN_FP8_QUANT", "0") == "1"
+            )
+            and block_shape is None
+            and per_act_token
+            and A_scale is None
+        ):
             from vllm_hcu.ops import token_fp8_quant as tq
 
             if tq.can_use(A):

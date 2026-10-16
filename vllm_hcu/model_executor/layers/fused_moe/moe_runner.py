@@ -61,6 +61,7 @@ from vllm.utils.torch_utils import (
     LayerName,
     direct_register_custom_op,
 )
+from vllm_hcu.platforms import envs as henvs
 
 logger = init_logger(__name__)
 
@@ -68,7 +69,9 @@ logger = init_logger(__name__)
 # the TP all-reduce into one custom all-reduce over the EP group (see
 # _ep_fused_all_reduce).  Requires the EP group's custom all-reduce, which
 # CudaCommunicator creates under the same flag.
-_EP_FUSED_COMBINE = os.environ.get("VLLM_HCU_EP_FUSED_COMBINE", "0") == "1"
+_EP_FUSED_COMBINE = henvs.optional_custom_op_enabled(
+    os.environ.get("VLLM_HCU_EP_FUSED_COMBINE", "0") == "1"
+)
 
 
 def _ep_fused_rows(hidden_states: torch.Tensor) -> tuple[int, int] | None:

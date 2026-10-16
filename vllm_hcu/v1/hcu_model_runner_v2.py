@@ -32,6 +32,7 @@ def _uses_global_pcp_batch(vllm_config) -> bool:
     parallel_config = getattr(vllm_config, "parallel_config", None)
     pcp_size = int(getattr(parallel_config, "prefill_context_parallel_size", 1))
     return is_glm53_pcp(vllm_config) or (pcp_size > 1 and is_deepseek_v4(vllm_config))
+from vllm_hcu.platforms import envs as henvs
 
 logger = init_logger(__name__)
 
@@ -39,7 +40,9 @@ logger = init_logger(__name__)
 # runner keeps). Without it a host-scheduling attention builder (step4 DSA)
 # reads seq_lens back from the device, which waits for the whole previous step
 # -- the MTP drafter included -- and leaves the GPU idle at every step start.
-_USE_HOST_SEQ_LENS = os.environ.get("VLLM_HCU_HOST_SEQ_LENS", "1") == "1"
+_USE_HOST_SEQ_LENS = henvs.optional_custom_op_enabled(
+    os.environ.get("VLLM_HCU_HOST_SEQ_LENS", "1") == "1"
+)
 # Debug: compare the mirror against the device seq_lens every step.
 _CHECK_HOST_SEQ_LENS = os.environ.get("VLLM_HCU_CHECK_HOST_SEQ_LENS", "0") == "1"
 

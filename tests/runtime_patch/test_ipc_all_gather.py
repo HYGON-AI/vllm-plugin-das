@@ -1,6 +1,7 @@
 # SPDX-License-Identifier: Apache-2.0
 """CPU contracts for IPC ownership and rank-consistent all-gather selection."""
 
+import sys
 from types import ModuleType, SimpleNamespace
 
 import pytest
@@ -166,6 +167,63 @@ def _patched_communicator(monkeypatch, ag):
     assert adapter.apply_to_module(module)
     assert not adapter.apply_to_module(module)
     return module.CudaCommunicator(object())
+
+
+@pytest.mark.parametrize(
+    ("master", "child", "expected"),
+    [("0", "1", 0), ("1", "0", 0), ("1", "1", 2)],
+)
+def test_optional_communicators_obey_custom_ops_master(
+    monkeypatch, master, child, expected
+):
+    """Master-off must avoid both allocations and their provider imports."""
+
+    monkeypatch.setenv("VLLM_HCU_USE_CUSTOM_OPS", master)
+    monkeypatch.setenv("VLLM_HCU_EP_FUSED_COMBINE", child)
+    monkeypatch.setenv("VLLM_HCU_DP_CUSTOM_AG", child)
+    created = []
+
+    parallel_state = ModuleType("vllm.distributed.parallel_state")
+    parallel_state._ENABLE_CUSTOM_ALL_REDUCE = True
+    parallel_state.in_the_same_node_as = lambda group, source_rank: [True, True]
+    parallel_state.is_local_first_rank = lambda: True
+    monkeypatch.setitem(sys.modules, parallel_state.__name__, parallel_state)
+
+    custom_all_reduce = ModuleType(
+        "vllm.distributed.device_communicators.custom_all_reduce"
+    )
+
+    def make_custom_allreduce(*, group, device):
+        created.append(("ep", group, device))
+        return SimpleNamespace(disabled=False)
+
+    custom_all_reduce.CustomAllreduce = make_custom_allreduce
+    monkeypatch.setitem(sys.modules, custom_all_reduce.__name__, custom_all_reduce)
+
+    ipc_all_gather = ModuleType(
+        "vllm_hcu.distributed.device_communicators.ipc_all_gather"
+    )
+
+    def make_ipc_all_gather(group, device):
+        created.append(("dp", group, device))
+        return SimpleNamespace(close=lambda: None)
+
+    ipc_all_gather.IpcAllGather = make_ipc_all_gather
+    monkeypatch.setitem(sys.modules, ipc_all_gather.__name__, ipc_all_gather)
+
+    ep = SimpleNamespace(
+        world_size=2,
+        ca_comm=None,
+        cpu_group="ep-group",
+        device="hcu:0",
+    )
+    dp = SimpleNamespace(world_size=2, cpu_group="dp-group", device="hcu:0")
+    adapter._maybe_init_ep_custom_allreduce(ep, "ep:0")
+    adapter._maybe_init_dp_ipc_all_gather(dp, "dp:0")
+
+    assert len(created) == expected
+    assert (ep.ca_comm is not None) == bool(expected)
+    assert (dp._hcu_ipc_ag is not None) == bool(expected)
 
 
 def test_communicator_destroy_closes_ipc_once(monkeypatch):

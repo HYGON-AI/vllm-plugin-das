@@ -15,8 +15,11 @@ import os
 import torch
 
 from vllm.triton_utils import tl, triton
+from vllm_hcu.platforms import envs as henvs
 
-_ENABLED = os.environ.get("STEP5_SKINNY_LM_HEAD", "1") != "0"
+_ENABLED = henvs.optional_custom_op_enabled(
+    os.environ.get("STEP5_SKINNY_LM_HEAD", "1") != "0"
+)
 MAX_M = 64
 _BK = 128
 

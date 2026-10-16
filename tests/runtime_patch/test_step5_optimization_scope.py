@@ -56,6 +56,41 @@ def test_skinny_head_requires_step5_opt_in(
     assert calls == [expected]
 
 
+def test_skinny_head_master_off_uses_native_without_probing_provider(monkeypatch):
+    """Master-off must branch before the optional skinny kernel is probed."""
+    from vllm_hcu.patch.worker.framework_opt import patch_step5_skinny_lm_head as a
+    from vllm_hcu.model_executor.layers import skinny_lm_head
+
+    monkeypatch.setenv("VLLM_HCU_USE_CUSTOM_OPS", "0")
+    monkeypatch.setenv("STEP5_SKINNY_LM_HEAD", "1")
+
+    class Processor:
+        head_dtype = None
+        _step5_skinny_lm_head = True
+
+        def _apply_head(self, lm_head, hidden_states, embedding_bias=None):
+            return "native"
+
+    class Unquantized:
+        pass
+
+    target = ModuleType(a.TARGET_MODULE)
+    target.LogitsProcessor = Processor
+    target.UnquantizedEmbeddingMethod = Unquantized
+    target.UnquantizedLinearMethod = Unquantized
+    target.logger = SimpleNamespace(info_once=lambda *args: None)
+    monkeypatch.setattr(
+        skinny_lm_head,
+        "usable",
+        lambda *args: pytest.fail("master-off probed the skinny provider"),
+    )
+    a.apply_to_module(target)
+
+    head = SimpleNamespace(quant_method=Unquantized(), weight=torch.zeros(4, 4))
+    hidden = torch.ones(1, 4, dtype=torch.bfloat16)
+    assert Processor()._apply_head(head, hidden) == "native"
+
+
 def test_eplb_native_metric_preserves_cross_layer_cancellation():
     from vllm_hcu.distributed.eplb_runtime import _rank_load_imbalance
 

@@ -228,11 +228,21 @@ def _require_hy4_pcp8_contract(vllm_config: object) -> None:
         raise ValueError(
             "HY V4 PCP8 requires the FLASHMLA_SPARSE attention backend."
         )
-    if os.environ.get(
-        "VLLM_HCU_ENABLE_LINEAR_GATE_PCP_SHARD", "0"
-    ).strip().lower() not in ("1", "true", "yes", "on"):
+    from vllm_hcu.platforms import envs as hcu_envs
+
+    gate_shard_enabled = hcu_envs.linear_gate_pcp_shard_enabled(
+        tp_size=int(parallel_config.tensor_parallel_size),
+        pcp_size=int(parallel_config.prefill_context_parallel_size),
+        pp_size=int(parallel_config.pipeline_parallel_size),
+    )
+    if not gate_shard_enabled:
+        if not hcu_envs.custom_ops_enabled():
+            raise ValueError(
+                "HY V4 PCP8 requires effective linear_gate PCP sharding, "
+                "but VLLM_HCU_USE_CUSTOM_OPS=0 disables it."
+            )
         raise ValueError(
-            "HY V4 PCP8 requires "
+            "HY V4 PCP8 requires effective linear_gate PCP sharding; set "
             "VLLM_HCU_ENABLE_LINEAR_GATE_PCP_SHARD=1 to avoid replicated "
             "linear_gate weights exhausting KV-cache memory."
         )

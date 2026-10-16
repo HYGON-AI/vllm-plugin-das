@@ -265,11 +265,12 @@ def test_hy4_tp1_pcp8_ep8_mtp3_fp8_is_allowed(
     assert patch_vllm_config._validate_hcu_pcp_scope(config) is True
 
 
-def test_hy4_tp1_pcp8_requires_linear_gate_pcp_sharding(
+def test_hy4_tp1_pcp8_defaults_to_linear_gate_pcp_sharding(
     make_pcp_config, monkeypatch
 ) -> None:
-    """PCP8 must fail before loading replicated Hy4 gate weights."""
+    """PCP8 must auto-select sharding before loading Hy4 gate weights."""
 
+    monkeypatch.delenv("VLLM_HCU_USE_CUSTOM_OPS", raising=False)
     monkeypatch.delenv("VLLM_HCU_ENABLE_LINEAR_GATE_PCP_SHARD", raising=False)
     config = make_pcp_config(
         architecture="HYV4ForCausalLM",
@@ -289,7 +290,64 @@ def test_hy4_tp1_pcp8_requires_linear_gate_pcp_sharding(
         attention_backend=AttentionBackendEnum.FLASHMLA_SPARSE,
     )
 
+    assert patch_vllm_config._validate_hcu_pcp_scope(config) is True
+
+
+def test_hy4_tp1_pcp8_rejects_explicitly_disabled_linear_gate_sharding(
+    make_pcp_config, monkeypatch
+) -> None:
+    """An explicit opt-out must fail before replicated weights are loaded."""
+
+    monkeypatch.delenv("VLLM_HCU_USE_CUSTOM_OPS", raising=False)
+    monkeypatch.setenv("VLLM_HCU_ENABLE_LINEAR_GATE_PCP_SHARD", "0")
+    config = make_pcp_config(
+        architecture="HYV4ForCausalLM",
+        tp=1,
+        pcp=8,
+        pp=1,
+        dp=1,
+        dcp=1,
+        enable_expert_parallel=True,
+        enforce_eager=True,
+        speculative=True,
+        speculative_method="mtp",
+        num_speculative_tokens=3,
+        cache_dtype="fp8_e4m3",
+        all2all_backend="deepep_high_throughput",
+        moe_backend="deep_gemm",
+        attention_backend=AttentionBackendEnum.FLASHMLA_SPARSE,
+    )
+
     with pytest.raises(ValueError, match="LINEAR_GATE_PCP_SHARD=1"):
+        patch_vllm_config._validate_hcu_pcp_scope(config)
+
+
+def test_hy4_tp1_pcp8_rejects_custom_ops_master_off(
+    make_pcp_config, monkeypatch
+) -> None:
+    """The PCP8 child must not override the global custom-op opt-out."""
+
+    monkeypatch.setenv("VLLM_HCU_USE_CUSTOM_OPS", "0")
+    monkeypatch.setenv("VLLM_HCU_ENABLE_LINEAR_GATE_PCP_SHARD", "1")
+    config = make_pcp_config(
+        architecture="HYV4ForCausalLM",
+        tp=1,
+        pcp=8,
+        pp=1,
+        dp=1,
+        dcp=1,
+        enable_expert_parallel=True,
+        enforce_eager=True,
+        speculative=True,
+        speculative_method="mtp",
+        num_speculative_tokens=3,
+        cache_dtype="fp8_e4m3",
+        all2all_backend="deepep_high_throughput",
+        moe_backend="deep_gemm",
+        attention_backend=AttentionBackendEnum.FLASHMLA_SPARSE,
+    )
+
+    with pytest.raises(ValueError, match="VLLM_HCU_USE_CUSTOM_OPS=0"):
         patch_vllm_config._validate_hcu_pcp_scope(config)
 
 

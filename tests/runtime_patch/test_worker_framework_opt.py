@@ -1836,6 +1836,70 @@ def test_eagle_loader_installs_draft_model_config_before_construction():
     assert calls[0].model_config is draft_model_config
 
 
+@pytest.mark.parametrize("load_fails", [False, True])
+def test_eagle_loader_does_not_reinitialize_target_config(load_fails: bool):
+    """Draft loading must preserve the already-initialized engine config."""
+    calls: list[object] = []
+
+    @dataclasses.dataclass
+    class FakeVllmConfig:
+        model_config: object
+        speculative_config: object
+        additional_config: dict[str, object]
+        compilation_config: object
+        parallel_config: object
+        quant_config: object
+        runtime_state: object = dataclasses.field(init=False, default=None)
+
+        def __post_init__(self):
+            self.compilation_config.custom_ops.append("+sparse_attn_indexer")
+
+    def load_eagle_model(target_model, vllm_config):
+        calls.append(vllm_config)
+        if load_fails:
+            raise RuntimeError("checkpoint load failed")
+        return object()
+
+    module = _module(
+        patch_eagle_utils.TARGET_MODULE,
+        load_eagle_model=load_eagle_model,
+        _should_share=_should_share,
+    )
+    patch_eagle_utils.apply_to_module(module)
+    config = FakeVllmConfig(
+        model_config=object(),
+        speculative_config=SimpleNamespace(draft_model_config=object()),
+        additional_config={"hcu": HcuFeatureConfig().to_dict()},
+        compilation_config=SimpleNamespace(custom_ops=["all"]),
+        parallel_config=object(),
+        quant_config=object(),
+    )
+    target_model_config = config.model_config
+    expected_ops = list(config.compilation_config.custom_ops)
+    config.runtime_state = object()
+
+    if load_fails:
+        with pytest.raises(RuntimeError, match="checkpoint load failed"):
+            module.load_eagle_model(object(), config)
+    else:
+        module.load_eagle_model(object(), config)
+
+    assert config.model_config is target_model_config
+    assert config.compilation_config.custom_ops == expected_ops
+    draft_config = calls[-1]
+    assert draft_config is not config
+    assert draft_config.model_config is config.speculative_config.draft_model_config
+    assert draft_config.runtime_state is config.runtime_state
+    for field in (
+        "compilation_config",
+        "parallel_config",
+        "quant_config",
+        "speculative_config",
+        "additional_config",
+    ):
+        assert getattr(draft_config, field) is getattr(config, field)
+
+
 def test_eagle_loader_preserves_step3p5_per_layer_lm_heads():
     trained_head = object()
     target_head = object()

@@ -46,6 +46,31 @@ attention metadata dataclasses are not extended in place.
 
 ## Optimization boundaries
 
+`VLLM_HCU_USE_CUSTOM_OPS` is the master for optional HCU acceleration. Its
+effective-policy rule is strict: master `0` wins over a child explicitly set to
+`1`; master `1` preserves each child's existing default and explicit disable.
+The implementation resolves this policy before importing an optional provider,
+changing a weight layout, registering an optional split, or allocating an
+optional communicator buffer.
+
+The managed Step5 children are:
+
+| Area | Child settings / selected providers | Master-off baseline |
+| --- | --- | --- |
+| Model load and projections | `VLLM_HCU_STEP5_FUSE_QKVG`, `VLLM_HCU_STEP5_BF16_ROUTER`, `VLLM_HCU_STEP5_FUSED_ROUTER_SHARED`, `VLLM_HCU_STEP5_FP8_DENSE`, `VLLM_HCU_STEP5_FP8_BF16_MOE`, `VLLM_HCU_STEP5_SWA_FUSED_QK`, `VLLM_HCU_STEP5_FUSED_GATE` | Original modules and native weight layouts |
+| Logits and quantization | `STEP5_SKINNY_LM_HEAD`, `VLLM_HCU_TRITON_TOKEN_FP8_QUANT` | Upstream logits/quantization implementations |
+| MoE and communication | `VLLM_HCU_EP_FUSED_MOE`, `VLLM_HCU_EP_FUSED_COMBINE`, `VLLM_HCU_DP_CUSTOM_AG` | DeepGEMM/normal combine and process-group collectives; no optional communicator allocation |
+| Runner and attention | `VLLM_HCU_HOST_SEQ_LENS`, `VLLM_HCU_SWA_DECODE` | Device-derived sequence lengths and baseline paged attention |
+| DSA acceleration | per-request and FP8-dot speculative indexers, BoltOps/FlashAttention stages, optional FP8 attention math, fused speculative summaries, and merged projection | Full-batch BF16 indexer, vendored Triton stages, unfused summaries, and separate projections |
+
+DSA itself is a required Step5 model semantic, not an optional custom-op
+provider. Therefore master-off does **not** set `VLLM_STEP5_DISABLE_DSA`, remove
+`vllm::step4_dsa_index` from compilation, or disable the DSA metadata, cache,
+planner, selector, CSA compression, and vendored Triton baseline. Disable DSA
+only with its explicit `VLLM_STEP5_DISABLE_DSA` setting. Diagnostic and tuning
+values such as slot validation, plan dumps, query chunking, and graph-region
+sizing are also not provider selections and retain their meanings.
+
 Only Step5-created logits processors opt into the skinny LM-head kernel. The
 existing `STEP5_SKINNY_LM_HEAD` switch can still disable it. Step5 EPLB uses
 per-layer rank maxima; other models retain the upstream rank-total metric.
@@ -61,6 +86,27 @@ The old `VLLM_STEP5_ENABLE_QKVG_PROJ`, `VLLM_STEP5_DSA_INDEX_TP_SIZE`,
 `VLLM_STEP5_FUSE_INDEXER_NORM` and `VLLM_STEP5_O_PROJ_REDUCE_SCATTER`
 variables had no implementation and are no longer registered. Explicit settings
 produce a warning; the actual QKVG switch is `VLLM_HCU_STEP5_FUSE_QKVG`.
+
+### Audit of the `75aa13701` runtime surface
+
+The complete Python runtime surface introduced by `75aa13701` was classified
+as follows. This grouping covers every path returned by `git diff-tree` for the
+commit; a helper inherits the classification of its only caller.
+
+| Files / subsystem | Classification | Reason |
+| --- | --- | --- |
+| `models/step5_text.py`, `models/step5_swa_fused.py`, `models/step5/kernels.py`, `layers/skinny_lm_head.py`, `ops/token_fp8_quant.py` and the corresponding provider modules under `ops/step5/` | Managed optional acceleration | These replace projections, routers, logits, quantization, or fused kernels and have native fallbacks. |
+| `layers/fused_moe/{experts/deep_gemm_moe.py,moe_runner.py,ep_fused_moe*.py,combine_runtime.py}`, `patch_cuda_communicator.py`, `distributed/device_communicators/ipc_all_gather.py` | Managed optional acceleration plus required support helpers | Provider selection/allocation is master-gated; capability checks and cleanup are required once a selected provider owns resources. |
+| `model_executor/layers/step4_dsa.py` alternate providers and fusion selectors | Managed optional acceleration | Master-off selects the full-batch/BF16/unfused/separate-projection vendored baseline. |
+| `step4_dsa.py` planner/cache/metadata plus `step4_dsa_kernels.py` | Required model semantics | They implement Step5 sparse attention and remain active unless DSA is explicitly disabled. |
+| `models/step5_config.py`, `models/{step5_mtp.py,step5_vl.py}`, `v1/step5_*.py`, `v1/hcu_model_runner_v2.py` non-host-mirror paths | Correctness and compatibility | Config identity, metadata ownership, MTP loading/sampling, and runner selection are needed for a valid Step5 execution path. |
+| `distributed/eplb*_runtime.py` and Step5 EPLB adapters | Correctness for explicitly configured EPLB | They preserve mixed-format expert state and lifecycle; they are not an unconditional kernel substitution. |
+| `patch/module_exchange.py`, patch registration/contract adapters, `models/__init__.py`, `models/step5/__init__.py`, `runtime_compat/step5*.py`, `platforms/step5_envs.py`, `platforms/hcu.py` | Compatibility and registration | These establish exact imports, fail-closed signatures, config exports, and shared environment parsing. |
+| DSA slot checks, plan dump, query-chunk and graph-region controls | Diagnostic/tuning | They change diagnostics or bounded scheduling geometry, not operator-provider ownership. |
+
+The audit intentionally does not claim that master-off removes all plugin code;
+it guarantees optional accelerator fallback while keeping the model-correctness
+and compatibility layers required to run Step5.
 
 ## MoE and communicator contracts
 

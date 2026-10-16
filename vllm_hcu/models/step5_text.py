@@ -91,6 +91,7 @@ from vllm.model_executor.layers.logits_processor import LogitsProcessor
 from vllm.model_executor.layers.quantization.base_config import QuantizationConfig
 from vllm.model_executor.layers.rotary_embedding import get_rope
 from vllm_hcu.platforms.step5_envs import is_dsa_disabled
+from vllm_hcu.platforms import envs as henvs
 from vllm_hcu.model_executor.layers.step4_dsa import (
     Step4DSAGeometry,
     Step4DSAState,
@@ -98,7 +99,6 @@ from vllm_hcu.model_executor.layers.step4_dsa import (
     Step4SparseAttentionBackend,
 )
 from vllm_hcu.models.step5.kernels import router_bias_func
-from vllm_hcu.models import step5_swa_fused
 from vllm.model_executor.layers.vocab_parallel_embedding import (
     ParallelLMHead,
     VocabParallelEmbedding,
@@ -142,30 +142,60 @@ DISABLE_DSA = is_dsa_disabled()
 # [hidden, qkv + heads] buffer, so the loaders fill it in place and no
 # post-load step is needed (AutoWeightsLoader may call load_weights twice).
 # Only valid for the HCU [in, out] weight layout (VLLM_USE_NN).
-FUSE_QKVG = os.environ.get("VLLM_HCU_STEP5_FUSE_QKVG", "1") == "1"
+FUSE_QKVG = henvs.optional_custom_op_enabled(
+    os.environ.get("VLLM_HCU_STEP5_FUSE_QKVG", "1") == "1"
+)
 
 # Keep the router weight in its checkpoint dtype (bf16) and compute fp32 logits
 # with a bf16 MFMA GEMM instead of upcasting both operands to fp32. Exact up to
 # accumulation order, since bf16 x bf16 products are exact in fp32.
-BF16_ROUTER = os.environ.get("VLLM_HCU_STEP5_BF16_ROUTER", "1") == "1"
+BF16_ROUTER = henvs.optional_custom_op_enabled(
+    os.environ.get("VLLM_HCU_STEP5_BF16_ROUTER", "1") == "1"
+)
 
 # With BF16_ROUTER and the shared expert folded into FusedMoE: at decode sizes run
 # the router GEMM, the shared-expert gate_up GEMM and its SwigluStep as one Triton
 # kernel (the router input is also the shared-expert input).
-FUSED_ROUTER_SHARED = os.environ.get("VLLM_HCU_STEP5_FUSED_ROUTER_SHARED", "1") == "1"
+FUSED_ROUTER_SHARED = henvs.optional_custom_op_enabled(
+    os.environ.get("VLLM_HCU_STEP5_FUSED_ROUTER_SHARED", "1") == "1"
+)
 
 # After loading, store the bf16 attention (qkv/g/o) and dense-MLP weights as fp8
 # with one scale per output channel and run them as fp8 GEMMs with per-token
 # activation scales (ops/fp8_dense.py), the scheme of the fp8 MoE experts. The
 # shared expert (fused into the router kernel), router, indexer, eh_proj and
 # lm_head stay bf16.
-FP8_DENSE = os.environ.get("VLLM_HCU_STEP5_FP8_DENSE", "0") == "1"
+FP8_DENSE = henvs.optional_custom_op_enabled(
+    os.environ.get("VLLM_HCU_STEP5_FP8_DENSE", "0") == "1"
+)
 
 # Quantize the bf16 routed experts (layers 88-90) to fp8 per output channel at
 # load time, the scheme of the other layers' checkpoint experts, so they run the
 # same fp8 MoE path instead of the bf16 Triton experts. Channel (compressed-
 # tensors) checkpoint only.
-FP8_BF16_MOE = os.environ.get("VLLM_HCU_STEP5_FP8_BF16_MOE", "0") == "1"
+FP8_BF16_MOE = henvs.optional_custom_op_enabled(
+    os.environ.get("VLLM_HCU_STEP5_FP8_BF16_MOE", "0") == "1"
+)
+
+SWA_FUSED_QK = henvs.optional_custom_op_enabled(
+    os.environ.get("VLLM_HCU_STEP5_SWA_FUSED_QK", "0") == "1"
+)
+FUSED_GATE = henvs.optional_custom_op_enabled(
+    os.environ.get("VLLM_HCU_STEP5_FUSED_GATE", "0") == "1"
+)
+
+step5_swa_fused = None
+if SWA_FUSED_QK or FUSED_GATE:
+    # Enabled custom ops must register during model-module initialization,
+    # before torch.compile tracing or CUDA/HCU graph capture begins.
+    from vllm_hcu.models import step5_swa_fused
+
+
+def _get_step5_swa_fused():
+    """Return the provider selected during startup feature resolution."""
+
+    assert step5_swa_fused is not None
+    return step5_swa_fused
 
 _PACKED_EXPERT_WEIGHT = re.compile(r"\.moe\.(gate|up|down)_proj\.weight$")
 
@@ -693,11 +723,11 @@ class Step5Attention(nn.Module):
 
         self.max_position_embeddings = max_position
         # Sliding layers: q/k norm + RoPE + q quant + KV cache write in one op.
-        self.swa_fused_qk = step5_swa_fused.can_use(self)
+        self.swa_fused_qk = SWA_FUSED_QK and _get_step5_swa_fused().can_use(self)
         # Gate + fp8 quant of the o_proj input as one op (folded into the SWA
         # decode combine when swa_fused_qk); needs the fused qkvg fp8 GEMM.
         self.fused_gate = (
-            step5_swa_fused.FUSED_GATE
+            FUSED_GATE
             and FP8_DENSE
             and use_head_wise_attn_gate
             and self.qkvg_weight is not None
@@ -773,7 +803,7 @@ class Step5Attention(nn.Module):
             extra_dims = None
         q, k, v = qkv.split([self.q_size, self.kv_size, self.kv_size], dim=-1)
         if self.swa_fused_qk:
-            attn_output = step5_swa_fused.forward(
+            attn_output = _get_step5_swa_fused().forward(
                 self,
                 positions,
                 qkv,
@@ -810,7 +840,7 @@ class Step5Attention(nn.Module):
             return output
         if self.fused_gate and extra_dims is not None:
             output, _ = self.o_proj(
-                step5_swa_fused.gate_quant(
+                _get_step5_swa_fused().gate_quant(
                     attn_output.view(-1, attn_output.shape[-1]), extra_dims
                 )
             )

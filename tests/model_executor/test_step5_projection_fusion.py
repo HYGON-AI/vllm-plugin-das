@@ -7,6 +7,43 @@ import subprocess
 import sys
 
 
+def test_qkvg_child_cannot_fuse_when_custom_ops_master_is_off():
+    script = r"""
+import torch
+from vllm_hcu import hcu_platform_register_model
+hcu_platform_register_model()
+from vllm_hcu.models import step5_text as m
+from vllm_hcu.platforms import envs
+envs.VLLM_USE_NN = True
+assert m.FUSE_QKVG is False
+
+def projection(shape):
+    p = torch.nn.Module()
+    p.weight = torch.nn.Parameter(torch.ones(shape, dtype=torch.bfloat16))
+    p.bias = None
+    return p
+
+a = m.Step5Attention.__new__(m.Step5Attention)
+torch.nn.Module.__init__(a)
+a.qkv_proj = projection((4, 6))
+a.g_proj = projection((4, 2))
+a.register_buffer("qkvg_weight", None, persistent=False)
+a._maybe_fuse_qkvg()
+assert a.qkvg_weight is None
+"""
+    env = os.environ.copy()
+    env["VLLM_HCU_USE_CUSTOM_OPS"] = "0"
+    env["VLLM_HCU_STEP5_FUSE_QKVG"] = "1"
+    result = subprocess.run(
+        [sys.executable, "-c", script],
+        capture_output=True,
+        text=True,
+        env=env,
+        timeout=90,
+    )
+    assert result.returncode == 0, result.stdout + result.stderr
+
+
 def test_qkvg_fusion_bias_layout_and_loaded_weights():
     # Keep model registration and lazy import callbacks out of other unit tests.
     script = r"""

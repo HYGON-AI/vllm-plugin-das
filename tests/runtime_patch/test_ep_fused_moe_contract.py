@@ -143,9 +143,18 @@ def test_ep_execution_validates_channel_scale_semantics(monkeypatch, case):
 @pytest.mark.parametrize("case", [
     "channel", "block", "silu", "no_ep", "router_on_input",
     "bad_dimensions", "block_scales", "static_activation", "batched", "disabled",
+    "master_disabled",
 ])
 def test_weight_preparation_agrees_with_execution_capability(monkeypatch, case):
+    monkeypatch.setenv("VLLM_HCU_USE_CUSTOM_OPS", "0" if case=="master_disabled" else "1")
     monkeypatch.setenv("VLLM_HCU_EP_FUSED_MOE", "0" if case=="disabled" else "1")
+    if case == "master_disabled":
+        # The effective master-off path must decide to pack before importing
+        # the optional EP-fused capability provider.
+        support = ModuleType(
+            "vllm_hcu.model_executor.layers.fused_moe.ep_fused_moe_support"
+        )
+        monkeypatch.setitem(sys.modules, support.__name__, support)
     packed=[]
     module=ModuleType("deepgemm")
     def pack(weight):

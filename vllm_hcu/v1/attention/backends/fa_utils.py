@@ -3,6 +3,7 @@
 # SPDX-FileCopyrightText: Copyright (c) 2026 Hygon Information Technology Co., Ltd.
 # Modified by Hygon Information Technology Co., Ltd., 2026.
 import functools
+import importlib
 import importlib.metadata as importlib_metadata
 import inspect
 from collections.abc import Callable
@@ -18,6 +19,7 @@ from flash_attn import (
 from packaging.specifiers import SpecifierSet
 from packaging.version import InvalidVersion, Version
 from torch import Tensor
+from vllm_hcu.platforms import envs as hcu_envs
 from vllm_hcu.v1.attention.kv_cache_layout import get_kv_cache_layout
 
 
@@ -278,7 +280,35 @@ def reshape_and_cache_flash(
         if kv_cache_dtype in {"bfloat16", "float16"}
         else kv_cache_dtype
     )
-    torch.ops.hcu_ops.reshape_and_cache_flash(
+    if hcu_envs.custom_ops_enabled():
+        try:
+            importlib.import_module("vllm_hcu.hcu_ops")
+        except (ImportError, OSError) as exc:
+            raise RuntimeError(
+                "HCU FlashAttention cache writer requires the vllm_hcu.hcu_ops "
+                "native extension; rebuild or reinstall vllm_hcu so the "
+                "extension matches this source checkout"
+            ) from exc
+        cache_writer = getattr(
+            getattr(torch.ops, "hcu_ops", None),
+            "reshape_and_cache_flash",
+            None,
+        )
+        if not callable(cache_writer):
+            raise RuntimeError(
+                "HCU FlashAttention cache writer requires "
+                "torch.ops.hcu_ops.reshape_and_cache_flash; rebuild or "
+                "reinstall vllm_hcu so the native extension matches this "
+                "source checkout"
+            )
+    else:
+        from vllm.v1.attention.ops.triton_reshape_and_cache_flash import (
+            triton_reshape_and_cache_flash,
+        )
+
+        cache_writer = triton_reshape_and_cache_flash
+
+    cache_writer(
         key,
         value,
         key_cache,
