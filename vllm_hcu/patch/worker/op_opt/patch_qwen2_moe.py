@@ -45,6 +45,10 @@ def apply_to_module(module: ModuleType) -> bool:
 
     @functools.wraps(original)
     def hcu_forward(self, x):
+        import vllm_hcu.platforms.envs as henvs
+
+        if not henvs.VLLM_HCU_USE_CUSTOM_OPS:
+            return original(self, x)
         gate_up, _ = self.gate_up_proj(x)
         out = self.act_fn(gate_up)
         out, _ = self.down_proj(out)
