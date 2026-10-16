@@ -373,6 +373,213 @@ def test_kda_strided_final_state_non_inplace_alloc(monkeypatch):
                 delattr(kda, attr)
 
 
+
+@requires_gpu
+def test_kda_strided_noncontiguous_gate_beta(monkeypatch):
+    """Verify strided kernel handles non-contiguous g/beta correctly."""
+    monkeypatch.setenv("VLLM_HCU_USE_CUSTOM_OPS", "1")
+    monkeypatch.setenv("VLLM_HCU_GLM5NEXT_KDA_STRIDED_INPUTS", "1")
+    kda = pytest.importorskip("vllm.models.glm5next.nvidia.kda")
+    original = getattr(
+        kda, "_vllm_hcu_original_fused_recurrent_kda", kda.fused_recurrent_kda
+    )
+    try:
+        kda_patch.apply_to_module(sys.modules[kda.__name__])
+
+        torch.manual_seed(42)
+        B, T, H, K = 2, 8, 4, 128
+
+        # Create non-contiguous g and beta by slicing from a larger buffer
+        g_buf = torch.randn(B, T, 2 * H * K, device="cuda", dtype=torch.bfloat16)
+        g = g_buf[..., :H * K].reshape(B, T, H, K)  # Take first half
+        assert not g.is_contiguous()
+
+        beta_buf = torch.randn(B, T, 3 * H, device="cuda", dtype=torch.bfloat16)
+        beta = beta_buf[..., H:2*H]  # Take middle slice
+        assert not beta.is_contiguous()
+
+        # qkv also non-contiguous as before
+        qkv = torch.randn(B, T, 3 * H * K, device="cuda", dtype=torch.bfloat16)
+        q, k, v = (x.reshape(B, T, H, K) for x in qkv.split(H * K, dim=-1))
+
+        state0 = torch.randn(B * T + 1, H, K, K, device="cuda") * 0.1
+
+        def run(fn, qq, kk, vv, gg, bb):
+            st = state0.clone()
+            o, fs = fn(
+                q=qq, k=kk, v=vv, g=gg, beta=bb,
+                initial_state=st,
+                inplace_final_state=False,
+                use_qk_l2norm_in_kernel=True,
+                sigmoid_beta=True,
+            )
+            torch.cuda.synchronize()
+            return o, fs
+
+        # Reference: make everything contiguous
+        ref_o, ref_fs = run(
+            original,
+            q.contiguous(), k.contiguous(), v.contiguous(),
+            g.contiguous(), beta.contiguous()
+        )
+
+        # Strided: pass non-contiguous directly
+        out_o, out_fs = run(kda.fused_recurrent_kda, q, k, v, g, beta)
+
+        torch.testing.assert_close(out_o, ref_o, rtol=1e-2, atol=1e-3)
+        torch.testing.assert_close(out_fs, ref_fs, rtol=1e-2, atol=1e-3)
+    finally:
+        kda.fused_recurrent_kda = original
+        for attr in (kda_patch._MARKER, "_vllm_hcu_original_fused_recurrent_kda"):
+            if hasattr(kda, attr):
+                delattr(kda, attr)
+
+
+@requires_gpu
+def test_kda_strided_preallocated_output(monkeypatch):
+    """Verify strided kernel writes to caller-provided output buffer."""
+    monkeypatch.setenv("VLLM_HCU_USE_CUSTOM_OPS", "1")
+    monkeypatch.setenv("VLLM_HCU_GLM5NEXT_KDA_STRIDED_INPUTS", "1")
+    kda = pytest.importorskip("vllm.models.glm5next.nvidia.kda")
+    original = getattr(
+        kda, "_vllm_hcu_original_fused_recurrent_kda", kda.fused_recurrent_kda
+    )
+    try:
+        kda_patch.apply_to_module(sys.modules[kda.__name__])
+
+        torch.manual_seed(42)
+        B, T, H, K = 2, 8, 4, 128
+        qkv = torch.randn(B, T, 3 * H * K, device="cuda", dtype=torch.bfloat16)
+        q, k, v = (x.reshape(B, T, H, K) for x in qkv.split(H * K, dim=-1))
+        g = torch.randn(B, T, H, K, device="cuda", dtype=torch.bfloat16)
+        beta = torch.randn(B, T, H, device="cuda", dtype=torch.bfloat16)
+        state0 = torch.randn(B * T + 1, H, K, K, device="cuda") * 0.1
+
+        # Pre-allocate output buffer (fill with sentinel to detect no-write)
+        out_buf = torch.full((B, T, H, K), -999.0, device="cuda", dtype=torch.bfloat16)
+
+        st = state0.clone()
+        returned_o, fs = kda.fused_recurrent_kda(
+            q=q, k=k, v=v, g=g, beta=beta,
+            initial_state=st,
+            out=out_buf,  # Pass pre-allocated buffer
+            inplace_final_state=False,
+            use_qk_l2norm_in_kernel=True,
+            sigmoid_beta=True,
+        )
+        torch.cuda.synchronize()
+
+        # Verify kernel wrote to the buffer (no sentinel left)
+        assert not torch.any(out_buf == -999.0), "output buffer not fully written"
+
+        # Verify returned pointer is the same buffer
+        assert returned_o.data_ptr() == out_buf.data_ptr(), \
+            "returned output is not the provided buffer"
+
+        # Compare against reference (no pre-allocated output)
+        st_ref = state0.clone()
+        ref_o, ref_fs = original(
+            q=q.contiguous(), k=k.contiguous(), v=v.contiguous(),
+            g=g, beta=beta,
+            initial_state=st_ref,
+            inplace_final_state=False,
+            use_qk_l2norm_in_kernel=True,
+            sigmoid_beta=True,
+        )
+
+        torch.testing.assert_close(returned_o, ref_o, rtol=1e-2, atol=1e-3)
+        torch.testing.assert_close(fs, ref_fs, rtol=1e-2, atol=1e-3)
+    finally:
+        kda.fused_recurrent_kda = original
+        for attr in (kda_patch._MARKER, "_vllm_hcu_original_fused_recurrent_kda"):
+            if hasattr(kda, attr):
+                delattr(kda, attr)
+
+
+@requires_gpu
+@pytest.mark.parametrize("scenario", [
+    "decode",           # B > 1, T=1 per seq
+    "mixed_spec_accept", # Some seqs prefill, some decode, all accepted
+    "mixed_spec_reject", # Some seqs have num_accepted < Tp (reject)
+])
+def test_kda_strided_decode_and_spec(monkeypatch, scenario):
+    """Verify strided kernel in decode and speculative decoding scenarios."""
+    monkeypatch.setenv("VLLM_HCU_USE_CUSTOM_OPS", "1")
+    monkeypatch.setenv("VLLM_HCU_GLM5NEXT_KDA_STRIDED_INPUTS", "1")
+    kda = pytest.importorskip("vllm.models.glm5next.nvidia.kda")
+    original = getattr(
+        kda, "_vllm_hcu_original_fused_recurrent_kda", kda.fused_recurrent_kda
+    )
+    try:
+        kda_patch.apply_to_module(sys.modules[kda.__name__])
+
+        torch.manual_seed(42)
+
+        if scenario == "decode":
+            # Pure decode: 4 seqs, each generating 1 token
+            N, Tp = 4, 1
+            cu = torch.arange(0, N * Tp + 1, Tp, device="cuda", dtype=torch.int32)
+            idx = torch.arange(1, N * Tp + 1, device="cuda", dtype=torch.int32).view(N, Tp)
+            nacc = None  # No speculation
+
+        elif scenario == "mixed_spec_accept":
+            # 3 seqs: [prefill=4, decode=1, decode=1]
+            cu = torch.tensor([0, 4, 5, 6], device="cuda", dtype=torch.int32)
+            idx = torch.tensor([
+                [1, 2, 3, 4],  # seq 0: prefill 4 tokens
+                [5, 0, 0, 0],  # seq 1: decode 1 token (pad with 0)
+                [6, 0, 0, 0],  # seq 2: decode 1 token
+            ], device="cuda", dtype=torch.int32)
+            nacc = torch.tensor([4, 1, 1], device="cuda", dtype=torch.int32)
+            N = 3
+            Tp = 4  # Max tokens per seq in this batch
+
+        elif scenario == "mixed_spec_reject":
+            # 2 seqs with spec decode, one rejected 2 tokens
+            cu = torch.tensor([0, 3, 6], device="cuda", dtype=torch.int32)
+            idx = torch.tensor([
+                [1, 2, 3, 0],  # seq 0: generated 4, accepted 3
+                [4, 5, 6, 0],  # seq 1: generated 4, accepted 3
+            ], device="cuda", dtype=torch.int32)
+            nacc = torch.tensor([3, 3], device="cuda", dtype=torch.int32)  # Both reject 1
+            N = 2
+            Tp = 4
+
+        T = cu[-1].item()
+        H, K = 8, 128
+
+        qkv = torch.randn(T, 3 * H * K, device="cuda", dtype=torch.bfloat16)
+        q, k, v = (x.reshape(1, T, H, K) for x in qkv.split(H * K, dim=-1))
+        g = torch.randn(1, T, H, K, device="cuda", dtype=torch.bfloat16)
+        beta = torch.randn(1, T, H, device="cuda", dtype=torch.bfloat16)
+        state0 = torch.randn(T + 1, H, K, K, device="cuda") * 0.1
+
+        def run(fn, qq, kk, vv):
+            st = state0.clone()
+            o, fs = fn(
+                q=qq, k=kk, v=vv, g=g, beta=beta,
+                initial_state=st,
+                use_qk_l2norm_in_kernel=True,
+                cu_seqlens=cu,
+                ssm_state_indices=idx,
+                num_accepted_tokens=nacc,
+                sigmoid_beta=True,
+            )
+            torch.cuda.synchronize()
+            return o, fs
+
+        ref_o, ref_fs = run(original, q.contiguous(), k.contiguous(), v.contiguous())
+        out_o, out_fs = run(kda.fused_recurrent_kda, q, k, v)
+
+        torch.testing.assert_close(out_o, ref_o, rtol=1e-2, atol=1e-3)
+        torch.testing.assert_close(out_fs, ref_fs, rtol=1e-2, atol=1e-3)
+    finally:
+        kda.fused_recurrent_kda = original
+        for attr in (kda_patch._MARKER, "_vllm_hcu_original_fused_recurrent_kda"):
+            if hasattr(kda, attr):
+                delattr(kda, attr)
+
+
 def test_inner_dense_rules():
     x = torch.randn(16, 3 * 8 * 32)
     q = x.split(8 * 32, dim=-1)[0].reshape(1, 16, 8, 32)
