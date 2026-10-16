@@ -55,6 +55,8 @@ FeatureKey = Literal[
     "forward_context",
     "lightly_cp",
     "multi_layers_mtp",
+    "offline_eplb",
+    "eplb_control",
     "proposer",
     "pynccl_all_to_all",
 ]
@@ -90,18 +92,14 @@ def _adapter(group: str, name: str) -> str:
 # is duplicated here intentionally: platform registration must not import an
 # adapter before the coordinator's atomic registration fence is active.  A
 # test below compares this frozen inventory with the adapters to prevent drift.
-_SHARED_EXPERTS_MODULE = (
-    "vllm.model_executor.layers.fused_moe.runner.shared_experts"
-)
+_SHARED_EXPERTS_MODULE = "vllm.model_executor.layers.fused_moe.runner.shared_experts"
 _MOE_RUNNER_MODULE = "vllm.model_executor.layers.fused_moe.runner.moe_runner"
 _MOE_REPLACEMENTS: tuple[_ReplacementSpec, ...] = (
     _ReplacementSpec(
         adapter=_adapter("op_opt.moe", "patch_shared_experts"),
         patch_id="worker.op_opt.moe.runner.shared_experts",
         target_module=_SHARED_EXPERTS_MODULE,
-        replacement_module=(
-            "vllm_hcu.model_executor.layers.fused_moe.shared_experts"
-        ),
+        replacement_module=("vllm_hcu.model_executor.layers.fused_moe.shared_experts"),
         targets=(
             _SHARED_EXPERTS_MODULE,
             f"{_SHARED_EXPERTS_MODULE}.SharedExperts._layer_supports_x_and_scale_quanted",
@@ -122,9 +120,7 @@ _MOE_REPLACEMENTS: tuple[_ReplacementSpec, ...] = (
         adapter=_adapter("op_opt.moe", "patch_moe_runner"),
         patch_id="worker.op_opt.moe.runner",
         target_module=_MOE_RUNNER_MODULE,
-        replacement_module=(
-            "vllm_hcu.model_executor.layers.fused_moe.moe_runner"
-        ),
+        replacement_module=("vllm_hcu.model_executor.layers.fused_moe.moe_runner"),
         targets=(
             _MOE_RUNNER_MODULE,
             f"{_MOE_RUNNER_MODULE}._moe_forward",
@@ -149,37 +145,29 @@ _OP_REPLACEMENTS: tuple[_ReplacementSpec, ...] = (
         adapter=_adapter("op_opt", "patch_aiter_ops"),
         patch_id="worker.op_opt.aiter_ops.hcu_runtime",
         target_module="vllm._aiter_ops",
-        replacement_module=(
-            "vllm_hcu.model_executor.layers.fused_moe.aiter_ops"
-        ),
+        replacement_module=("vllm_hcu.model_executor.layers.fused_moe.aiter_ops"),
         targets=(
             "vllm._aiter_ops",
             "vllm._aiter_ops.is_aiter_found_and_supported",
             "vllm._aiter_ops._rocm_aiter_fused_moe_impl",
             "vllm._aiter_ops._rocm_aiter_topk_softmax_impl",
             "vllm._aiter_ops.rocm_aiter_ops.get_aiter_activation_type",
-            "vllm._aiter_ops.rocm_aiter_ops."
-            "is_shuffled_per_token_w8a8_gemm_tuned",
+            "vllm._aiter_ops.rocm_aiter_ops.is_shuffled_per_token_w8a8_gemm_tuned",
             "vllm._aiter_ops.rocm_aiter_ops.is_per_token_w8a8_gemm_tuned",
             "vllm._aiter_ops.rocm_aiter_ops.is_fp8bmm_enabled",
             "vllm._aiter_ops._rocm_aiter_rmsnorm_fused_dynamic_quant_impl",
-            "vllm._aiter_ops."
-            "_rocm_aiter_rmsnorm_fused_add_dynamic_quant_impl",
+            "vllm._aiter_ops._rocm_aiter_rmsnorm_fused_add_dynamic_quant_impl",
         ),
     ),
 )
 
 
-_CUSTOM_ALLREDUCE_MODULE = (
-    "vllm.distributed.device_communicators.custom_all_reduce"
-)
+_CUSTOM_ALLREDUCE_MODULE = "vllm.distributed.device_communicators.custom_all_reduce"
 _CUSTOM_ALLREDUCE_REPLACEMENT = _ReplacementSpec(
     adapter=_adapter("framework_opt", "patch_cuda_communicator"),
     patch_id="worker.framework_opt.communicator.hcu_custom_allreduce_exchange",
     target_module=_CUSTOM_ALLREDUCE_MODULE,
-    replacement_module=(
-        "vllm_hcu.distributed.device_communicators.custom_all_reduce"
-    ),
+    replacement_module=("vllm_hcu.distributed.device_communicators.custom_all_reduce"),
     targets=(
         _CUSTOM_ALLREDUCE_MODULE,
         "vllm_hcu.distributed.device_communicators.custom_all_reduce",
@@ -213,6 +201,7 @@ _MOE_FOUNDATION_CALLBACKS: tuple[_CallbackSpec, ...] = (
 
 _CORE_CALLBACKS: tuple[_CallbackSpec, ...] = (
     _CallbackSpec(_adapter("core_fix", "patch_mhc_backend")),
+    _CallbackSpec(_adapter("core_fix", "patch_mhc_fused_rmsnorm")),
     _CallbackSpec(_adapter("core_fix", "patch_minimax_m3_aiter_cache")),
     _CallbackSpec(_adapter("core_fix", "patch_minimax_m3_sparse_decode")),
     _CallbackSpec(_adapter("core_fix", "patch_deepseek_v32_config")),
@@ -227,6 +216,7 @@ _CORE_CALLBACKS: tuple[_CallbackSpec, ...] = (
     _CallbackSpec(_adapter("core_fix", "patch_deepseek_v4_rocm_dspark_metadata")),
     _CallbackSpec(_adapter("core_fix", "patch_deepseek_v4_rocm_flashmla_sparse")),
     _CallbackSpec(_adapter("core_fix", "patch_deepseek_v4_rocm_wo_a_layout")),
+    _CallbackSpec(_adapter("core_fix", "patch_deepseek_v4_pcp")),
     _CallbackSpec(_adapter("core_fix", "patch_gpt_oss_mlp_block")),
     _CallbackSpec(_adapter("core_fix", "patch_glm5next_channel_fp8")),
     _CallbackSpec(_adapter("core_fix", "patch_qwen3_5_mamba_state_dtype")),
@@ -269,6 +259,12 @@ _OP_CALLBACKS: tuple[_CallbackSpec, ...] = (
     _CallbackSpec(_adapter("op_opt", "patch_fla_chunk_o")),
     _CallbackSpec(_adapter("op_opt", "patch_mamba_mixer")),
     _CallbackSpec(_adapter("op_opt", "patch_mamba_mixer2")),
+    _CallbackSpec(_adapter("op_opt", "patch_kimi_k3_kda_gemm_warmup")),
+    _CallbackSpec(_adapter("op_opt", "patch_kimi_k3_kda_reference_paths")),
+    _CallbackSpec(_adapter("op_opt", "patch_kimi_k3_cpu_metadata")),
+    _CallbackSpec(_adapter("op_opt", "patch_kimi_k3_eplb_model")),
+    _CallbackSpec(_adapter("op_opt", "patch_kimi_k3_reference_paths")),
+    _CallbackSpec(_adapter("op_opt", "patch_kimi_k3_mla_gate")),
     # All GDN deltas bind Qwen's module-local symbols/class only.  The
     # canonical causal-conv module and the shared GDN base remain vLLM-owned
     # so Kimi, Olmo, MambaMixer, MambaMixer2, and ShortConv are not patched by
@@ -278,10 +274,12 @@ _OP_CALLBACKS: tuple[_CallbackSpec, ...] = (
     _CallbackSpec(_adapter("op_opt", "patch_gdn_base")),
     _CallbackSpec(_adapter("op_opt", "patch_gdn_linear_attention")),
     _CallbackSpec(_adapter("op_opt", "patch_glm5next_kda_conv_weight")),
+    _CallbackSpec(_adapter("op_opt", "patch_glm5next_kda_strided_recurrent")),
     _CallbackSpec(_adapter("op_opt", "patch_gate_linear")),
     _CallbackSpec(_adapter("op_opt", "patch_activation")),
     _CallbackSpec(_adapter("op_opt", "patch_layers_utils")),
     _CallbackSpec(_adapter("op_opt", "patch_deep_gemm")),
+    _CallbackSpec(_adapter("op_opt", "patch_deep_gemm_transform")),
     _CallbackSpec(_adapter("op_opt", "patch_scaled_mm_linear_kernel")),
     _CallbackSpec(_adapter("op_opt", "patch_input_quant_fp8")),
     _CallbackSpec(_adapter("op_opt", "patch_w8a8_utils")),
@@ -343,6 +341,22 @@ _CUDA_VALIDATION_ID = (
 # an explicit ``all2all_backend='pynccl'`` config requests it.
 _FRAMEWORK_CALLBACKS: tuple[_CallbackSpec, ...] = (
     _CallbackSpec(
+        _adapter("framework_opt", "patch_model_loader_static_eplb"),
+        feature="offline_eplb",
+    ),
+    _CallbackSpec(
+        _adapter("framework_opt", "patch_static_expert_mapping"),
+        feature="offline_eplb",
+    ),
+    _CallbackSpec(
+        _adapter("framework_opt", "patch_offline_eplb"),
+        feature="eplb_control",
+    ),
+    _CallbackSpec(
+        _adapter("framework_opt", "patch_eplb_communicator"),
+        feature="offline_eplb",
+    ),
+    _CallbackSpec(
         _adapter("framework_opt", "patch_gpu_worker_shutdown"),
     ),
     _CallbackSpec(
@@ -392,14 +406,24 @@ _FRAMEWORK_CALLBACKS: tuple[_CallbackSpec, ...] = (
     ),
     _CallbackSpec(_adapter("framework_opt", "patch_gpu_ubatch_wrapper")),
     _CallbackSpec(_adapter("framework_opt", "patch_ubatch_utils")),
-    _CallbackSpec(
-        _adapter("framework_opt", "patch_all2all"), feature="deepep"
-    ),
+    _CallbackSpec(_adapter("framework_opt", "patch_all2all"), feature="deepep"),
     _CallbackSpec(
         _adapter("framework_opt", "patch_cuda_communicator"),
         patch_id=_CUDA_VALIDATION_ID,
         targets_from=1,
     ),
+    _CallbackSpec(_adapter("framework_opt", "patch_step5_block_tables")),
+    _CallbackSpec(_adapter("framework_opt", "patch_step5_model_state")),
+    _CallbackSpec(_adapter("framework_opt", "patch_step5_mtp_heads")),
+    _CallbackSpec(_adapter("framework_opt", "patch_step5_multi_module_mtp")),
+    _CallbackSpec(_adapter("framework_opt", "patch_step5_moe_combine")),
+    _CallbackSpec(_adapter("framework_opt", "patch_step5_token_fp8")),
+    _CallbackSpec(_adapter("framework_opt", "patch_step5_skinny_lm_head")),
+    _CallbackSpec(_adapter("framework_opt", "patch_step5_eplb_communicator")),
+    _CallbackSpec(_adapter("framework_opt", "patch_step5_eplb_transfer")),
+    _CallbackSpec(_adapter("framework_opt", "patch_step5_eplb_async_worker")),
+    _CallbackSpec(_adapter("framework_opt", "patch_step5_eplb_state")),
+    _CallbackSpec(_adapter("framework_opt", "patch_step5_deep_gemm_api")),
 )
 
 
@@ -417,6 +441,11 @@ _ALL_CALLBACK_GROUPS: tuple[tuple[_CallbackSpec, ...], ...] = (
 # must not fail merely because a Qwen-VL/GPT-OSS/Mamba module was never
 # imported.  These entries, in contrast, are required whenever their recorded
 # feature state is true.
+#
+# ``worker.framework_opt.spec_decode.hcu_proposer`` is deliberately absent: it
+# targets the Model Runner V1 ``vllm.v1.spec_decode.llm_base_proposer``, which
+# the MRV2-only worker never imports, so it legitimately stays armed.  The MRV2
+# multi-layer MTP terminal is ``eagle_topk_buffer`` (``load_eagle_model``).
 _REQUIRED_TERMINAL_IDS = frozenset(
     {
         "worker.op_opt.moe.oracle.fp8_dpsk",
@@ -429,7 +458,6 @@ _REQUIRED_TERMINAL_IDS = frozenset(
         "worker.framework_opt.communicator.base_custom_sp",
         "worker.framework_opt.communicator.pynccl_wrapper_all_to_all",
         "worker.framework_opt.communicator.pynccl_all_to_all",
-        "worker.framework_opt.spec_decode.hcu_proposer",
         "worker.framework_opt.spec_decode.eagle_topk_buffer",
         "worker.framework_opt.communicator.deep_ep_runtime",
     }
@@ -553,8 +581,7 @@ def _replacement_factory(adapter_name: str) -> Callable[[], ModuleType]:
         replacement_name = getattr(adapter, "REPLACEMENT_MODULE", None)
         if not isinstance(replacement_name, str) or not replacement_name:
             raise TypeError(
-                f"worker replacement adapter {adapter_name!r} has no "
-                "REPLACEMENT_MODULE"
+                f"worker replacement adapter {adapter_name!r} has no REPLACEMENT_MODULE"
             )
         replacement = importlib.import_module(replacement_name)
         _apply_and_verify(adapter, replacement)
@@ -638,9 +665,7 @@ def _known_patch_ids() -> set[str]:
     return values
 
 
-def _failure_reason(
-    coordinator: ExactImportCoordinator, patch_id: str
-) -> str | None:
+def _failure_reason(coordinator: ExactImportCoordinator, patch_id: str) -> str | None:
     registry = getattr(coordinator, "_registry", None)
     record = registry.get(patch_id) if registry is not None else None
     return getattr(record, "failure_reason", None)
@@ -737,23 +762,23 @@ def _feature_states(
         "always": True,
         "custom_sp": config.enable_custom_sp,
         "deepep": deepep or deepep_auto,
-        "deepep_high_throughput": (
-            backend == "deepep_high_throughput" or deepep_auto
-        ),
-        "deepep_low_latency": (
-            backend == "deepep_low_latency" or deepep_auto
-        ),
+        "deepep_high_throughput": (backend == "deepep_high_throughput" or deepep_auto),
+        "deepep_low_latency": (backend == "deepep_low_latency" or deepep_auto),
         "deepep_auto": deepep_auto,
-        "deep_gemm": (
-            config.moe_backend == "deep_gemm" or deepep_auto
-        ),
+        "deep_gemm": (config.moe_backend == "deep_gemm" or deepep_auto),
         "forward_context": bool(
-            config.enable_lightly_cp
-            or backend == "deepep_low_latency"
-            or deepep_auto
+            config.enable_lightly_cp or backend == "deepep_low_latency" or deepep_auto
         ),
         "lightly_cp": config.enable_lightly_cp,
         "multi_layers_mtp": config.enable_multi_layers_mtp,
+        "offline_eplb": bool(
+            config.expert_map_path or config.expert_map_record_path
+        ),
+        "eplb_control": bool(
+            config.expert_map_path
+            or config.expert_map_record_path
+            or config.eplb_disable_rearrange
+        ),
         "proposer": bool(
             config.enable_lightly_cp or config.enable_multi_layers_mtp
         ),
@@ -781,8 +806,11 @@ def _bind_deserialized_hcu_config(vllm_config: object) -> HcuFeatureConfig:
     from vllm_hcu.patch.platform.core_fix.patch_compilation_config import (
         bind_hcu_config,
     )
+    from vllm_hcu.patch.config import bind_hcu_eplb_config
 
-    return bind_hcu_config(vllm_config)
+    normalized = bind_hcu_config(vllm_config)
+    bind_hcu_eplb_config(vllm_config)
+    return normalized
 
 
 def apply_worker_patches(vllm_config: object | None = None) -> None:
@@ -869,9 +897,7 @@ def validate_worker_patches(
             and registration.feature_enabled
             and registration.status != PatchStatus.APPLIED.value
         ):
-            pending.append(
-                f"{registration.patch_id} ({registration.status})"
-            )
+            pending.append(f"{registration.patch_id} ({registration.status})")
     if pending:
         raise RuntimeError(
             "enabled HCU worker feature chain did not reach its required "

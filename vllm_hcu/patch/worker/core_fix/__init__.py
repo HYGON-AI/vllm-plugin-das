@@ -10,6 +10,7 @@ explicit ``apply(module=None)`` convenience entry point.
 from . import (
     patch_deepseek_v32_config,
     patch_deepseek_v4_attention,
+    patch_deepseek_v4_pcp,
     patch_deepseek_v4_bf16_compressor,
     patch_deepseek_v4_dspark_target,
     patch_deepseek_v4_load_weights,
@@ -21,6 +22,7 @@ from . import (
     patch_gpt_oss_mlp_block,
     patch_glm5next_channel_fp8,
     patch_mhc_backend,
+    patch_mhc_fused_rmsnorm,
     patch_minimax_m3_aiter_cache,
     patch_minimax_m3_sparse_decode,
     patch_qwen3_5_mamba_state_dtype,
@@ -41,6 +43,7 @@ from . import (
 __all__ = [
     "patch_deepseek_v32_config",
     "patch_deepseek_v4_attention",
+    "patch_deepseek_v4_pcp",
     "patch_deepseek_v4_bf16_compressor",
     "patch_deepseek_v4_dspark_target",
     "patch_deepseek_v4_load_weights",
@@ -52,6 +55,7 @@ __all__ = [
     "patch_gpt_oss_mlp_block",
     "patch_glm5next_channel_fp8",
     "patch_mhc_backend",
+    "patch_mhc_fused_rmsnorm",
     "patch_minimax_m3_aiter_cache",
     "patch_minimax_m3_sparse_decode",
     "patch_qwen3_5_mamba_state_dtype",

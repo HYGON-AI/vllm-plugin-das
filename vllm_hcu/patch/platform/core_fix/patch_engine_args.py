@@ -11,6 +11,7 @@ from __future__ import annotations
 
 import functools
 import inspect
+import json
 import sys
 from collections.abc import Mapping, MutableMapping
 from dataclasses import dataclass as official_dataclass
@@ -18,7 +19,9 @@ from types import ModuleType
 from typing import Any
 
 from vllm_hcu.patch.config import (
+    HCU_GDN_PREFILL_BACKENDS,
     HcuFeatureConfig,
+    bind_hcu_eplb_config,
     get_hcu_config,
     normalize_hcu_moe_backend,
     set_hcu_config,
@@ -45,12 +48,19 @@ _HCU_BOOLEAN_KWARGS = (
     "enable_custom_sp",
     "enable_multi_layers_mtp",
 )
+_HCU_EPLB_FIELDS = {
+    "expert_map_path": "expert_map_path",
+    "expert_map_record_path": "expert_map_record_path",
+    "disable_rearrange": "eplb_disable_rearrange",
+    "static_dispatch_policy": "eplb_static_dispatch_policy",
+}
 _DEEP_GEMM_BACKEND = "deep_gemm"
 _LEGACY_DEEP_GEMM_BACKEND = "dpsk_deep_gemm"
 _UPSTREAM_BACKEND = "auto"
 _DEEPEP_AUTO_BACKEND = "deepep_auto"
 _DEEPEP_AUTO_UPSTREAM_BACKEND = "deepep_low_latency"
 _FLASH_ATTN_BACKEND = "FLASH_ATTN"
+_GDN_PREFILL_UPSTREAM_BACKEND = "triton"
 _HCU_FLASH_ATTN_ALIASES = {
     "FLASH_ATTN_CLASSIC": "classic",
     "FLASH_ATTN_CUTLASS": "cutlass",
@@ -90,8 +100,10 @@ def _require_engine_args_class(module: ModuleType, name: str) -> type:
         "all2all_backend",
         "attention_backend",
         "attention_config",
+        "gdn_prefill_backend",
         "moe_backend",
         "kernel_config",
+        "eplb_config",
         "speculative_config",
     }
     if not required.issubset(parameters):
@@ -115,6 +127,13 @@ def _normalise_constructor_kwargs(
         for name in _HCU_BOOLEAN_KWARGS
         if name in kwargs
     }
+    eplb_payload = kwargs.get("eplb_config")
+    if isinstance(eplb_payload, Mapping):
+        official_eplb = dict(eplb_payload)
+        for public_name, sidecar_name in _HCU_EPLB_FIELDS.items():
+            if public_name in official_eplb:
+                updates[sidecar_name] = official_eplb.pop(public_name)
+        kwargs["eplb_config"] = official_eplb
     # Bind after removing HCU-only keywords so positional official arguments
     # (especially additional_config) participate in normalization instead of
     # being overwritten by a default sidecar after construction.
@@ -210,6 +229,40 @@ def _normalise_constructor_kwargs(
             "HCU sidecar selects deepep_auto but EngineArgs.all2all_backend "
             f"selects {top_level_all2all!r}"
         )
+
+    requested_gdn_prefill = feature_config.hcu_gdn_prefill_backend
+    top_level_gdn_prefill = bound.arguments.get("gdn_prefill_backend")
+    if top_level_gdn_prefill in HCU_GDN_PREFILL_BACKENDS:
+        if "gdn_prefill_backend" not in kwargs:
+            raise TypeError(
+                "positional HCU gdn_prefill_backend values are not supported; "
+                "pass gdn_prefill_backend by keyword"
+            )
+        if (
+            requested_gdn_prefill is not None
+            and requested_gdn_prefill != top_level_gdn_prefill
+        ):
+            raise ValueError(
+                "conflicting hcu_gdn_prefill_backend in HCU sidecar and "
+                "EngineArgs.gdn_prefill_backend"
+            )
+        requested_gdn_prefill = top_level_gdn_prefill
+        kwargs["gdn_prefill_backend"] = _GDN_PREFILL_UPSTREAM_BACKEND
+    elif requested_gdn_prefill is not None and top_level_gdn_prefill not in (
+        None,
+        _GDN_PREFILL_UPSTREAM_BACKEND,
+    ):
+        raise ValueError(
+            f"HCU sidecar selects {requested_gdn_prefill} but "
+            f"EngineArgs.gdn_prefill_backend selects {top_level_gdn_prefill!r}"
+        )
+    elif (
+        requested_gdn_prefill is not None
+        and top_level_gdn_prefill is None
+        and "gdn_prefill_backend" not in bound.arguments
+    ):
+        # Sidecar-only selection: pin vLLM to the FLA path the HCU wrappers own.
+        kwargs["gdn_prefill_backend"] = _GDN_PREFILL_UPSTREAM_BACKEND
 
     requested_deep_gemm = feature_config.moe_backend == _DEEP_GEMM_BACKEND
     raw_top_level_backend = bound.arguments.get("moe_backend")
@@ -309,6 +362,8 @@ def _normalise_constructor_kwargs(
         updates["moe_backend"] = _DEEP_GEMM_BACKEND
     if requested_deepep_auto:
         updates["deepep_auto"] = True
+    if requested_gdn_prefill is not None:
+        updates["hcu_gdn_prefill_backend"] = requested_gdn_prefill
     return feature_config.with_updates(**updates) if updates else feature_config
 
 
@@ -364,6 +419,35 @@ def _normalise_existing_engine_args(engine_args: object) -> HcuFeatureConfig:
             "HCU sidecar selects deepep_auto but EngineArgs.all2all_backend "
             f"selects {all2all_backend!r}"
         )
+
+    gdn_prefill_backend = getattr(engine_args, "gdn_prefill_backend", None)
+    if gdn_prefill_backend in HCU_GDN_PREFILL_BACKENDS:
+        if (
+            feature_config.hcu_gdn_prefill_backend is not None
+            and feature_config.hcu_gdn_prefill_backend != gdn_prefill_backend
+        ):
+            raise ValueError(
+                "conflicting hcu_gdn_prefill_backend in HCU sidecar and "
+                "EngineArgs.gdn_prefill_backend"
+            )
+        setattr(engine_args, "gdn_prefill_backend", _GDN_PREFILL_UPSTREAM_BACKEND)
+        feature_config = feature_config.with_updates(
+            hcu_gdn_prefill_backend=gdn_prefill_backend
+        )
+    elif (
+        feature_config.hcu_gdn_prefill_backend is not None
+        and gdn_prefill_backend not in (None, _GDN_PREFILL_UPSTREAM_BACKEND)
+    ):
+        raise ValueError(
+            f"HCU sidecar selects {feature_config.hcu_gdn_prefill_backend} but "
+            f"EngineArgs.gdn_prefill_backend selects {gdn_prefill_backend!r}"
+        )
+    elif (
+        feature_config.hcu_gdn_prefill_backend is not None
+        and gdn_prefill_backend is None
+    ):
+        # Sidecar-only selection: pin vLLM to the FLA path the HCU wrappers own.
+        setattr(engine_args, "gdn_prefill_backend", _GDN_PREFILL_UPSTREAM_BACKEND)
 
     backend = normalize_hcu_moe_backend(
         getattr(engine_args, "moe_backend", _UPSTREAM_BACKEND)
@@ -521,21 +605,50 @@ def apply_to_module(module: ModuleType) -> bool:
     @functools.wraps(add_cli_args)
     def hcu_add_cli_args(parser):
         result = add_cli_args(parser)
-        for action in getattr(result, "_actions", ()):
-            if getattr(action, "dest", None) != "all2all_backend":
-                continue
-            choices = getattr(action, "choices", None)
-            if choices is None:
-                raise PatchCompatibilityError(
-                    "--all2all-backend CLI action has no audited choices"
-                )
-            if _DEEPEP_AUTO_BACKEND not in choices:
-                action.choices = tuple(choices) + (_DEEPEP_AUTO_BACKEND,)
-            break
-        else:
+        actions = {
+            getattr(action, "dest", None): action
+            for action in getattr(result, "_actions", ())
+        }
+        all2all_action = actions.get("all2all_backend")
+        if all2all_action is None:
             raise PatchCompatibilityError(
                 "EngineArgs.add_cli_args did not install --all2all-backend"
             )
+        choices = getattr(all2all_action, "choices", None)
+        if choices is None:
+            raise PatchCompatibilityError(
+                "--all2all-backend CLI action has no audited choices"
+            )
+        if _DEEPEP_AUTO_BACKEND not in choices:
+            all2all_action.choices = tuple(choices) + (_DEEPEP_AUTO_BACKEND,)
+
+        eplb_action = actions.get("eplb_config")
+        if eplb_action is None or not callable(getattr(eplb_action, "type", None)):
+            raise PatchCompatibilityError(
+                "EngineArgs.add_cli_args did not install an audited "
+                "--eplb-config converter"
+            )
+        # Upstream eagerly constructs EPLBConfig inside argparse.  Delay that
+        # validation so the wrapped EngineArgs constructor can first extract
+        # the HCU-owned offline fields and then pass only official fields to
+        # EPLBConfig.
+        eplb_action.type = json.loads
+
+        gdn_action = actions.get("gdn_prefill_backend")
+        if gdn_action is None:
+            raise PatchCompatibilityError(
+                "EngineArgs.add_cli_args did not install --gdn-prefill-backend"
+            )
+        gdn_choices = getattr(gdn_action, "choices", None)
+        if gdn_choices is None:
+            raise PatchCompatibilityError(
+                "--gdn-prefill-backend CLI action has no audited choices"
+            )
+        missing = tuple(
+            name for name in HCU_GDN_PREFILL_BACKENDS if name not in gdn_choices
+        )
+        if missing:
+            gdn_action.choices = tuple(gdn_choices) + missing
         return result
 
     setattr(engine_args, "_vllm_hcu_original_add_cli_args", add_cli_descriptor)
@@ -563,6 +676,7 @@ def apply_to_module(module: ModuleType) -> bool:
                     "VllmConfig did not retain normalized HCU field "
                     f"{name!r}: expected {expected!r}, got {resolved[name]!r}"
                 )
+        bind_hcu_eplb_config(config)
         return config
 
     setattr(engine_args, "_vllm_hcu_original_create_engine_config", create_engine_config)

@@ -3,6 +3,7 @@
 # SPDX-FileCopyrightText: Copyright (c) 2026 Hygon Information Technology Co., Ltd.
 # Modified by Hygon Information Technology Co., Ltd., 2026.
 
+import os
 from contextlib import nullcontext
 
 import torch
@@ -54,6 +55,7 @@ from vllm.utils.deep_gemm import (
     mk_alignment_scope,
 )
 from vllm.utils.import_utils import has_deep_gemm
+from vllm_hcu.platforms import envs as henvs
 
 logger = init_logger(__name__)
 
@@ -61,8 +63,20 @@ logger = init_logger(__name__)
 # DeepEP high-throughput kernels on HCU require 256-row expert slices.
 _HCU_HT_EP_TOKEN_ALIGNMENT = 256
 
+# Opt-in: run Channel-FP8 EP MoE through ep_fused_moe (expert-sorted Triton GEMMs,
+# work bounded by local routes) instead of DeepGEMM. patch_fp8_oracle then keeps
+# the weights as plain [E, N, K].
+_EP_FUSED_MOE = henvs.optional_custom_op_enabled(
+    os.environ.get("VLLM_HCU_EP_FUSED_MOE", "0") == "1"
+)
+
 
 def _valid_deep_gemm_shape(M: int, N: int, K: int) -> bool:
+    if current_platform.is_rocm():
+        # HCU pads every expert to _HCU_HT_EP_TOKEN_ALIGNMENT rows, so the
+        # DeepGemm workspace must be used even for small M; the Triton one
+        # would be undersized when DeepGemm is selected at apply() time.
+        return True
     align = get_mk_alignment_for_contiguous_layout()[0]
     return align <= M and N % align == 0 and K % align == 0
 
@@ -78,6 +92,11 @@ def _valid_deep_gemm(
     if not has_deep_gemm():
         logger.debug_once("DeepGemm disabled: deep_gemm not available.")
         return False
+
+    # HCU Marlin-packed weights [E, K/64, N/16, 4, 16, 16] are consumable
+    # only by the HCU DeepGEMM kernels; Triton cannot read this layout.
+    if w1.dim() == 6 and w2.dim() == 6:
+        return True
 
     M = hidden_states.size(0)
     _, K, N = w2.size()
@@ -142,11 +161,14 @@ class DeepGemmExperts(mk.FusedMoEExpertsModular):
         # MXFP8: FP8 e4m3 values + UE8M0 1x32 block scales (Blackwell). Reuses
         # the same grouped GEMM (aliased to fp8_fp4) with recipe (1, 32).
         self.mxfp8 = quant_config.block_shape == [1, 32]
+        # NOTE: Relaxed assertions for HCU w8a8 to support channel-level FP8
+        # quantization (as in vLLM 0.21). HCU DeepGemm can handle per-channel
+        # quantized weights with per-token activation scales.
         if current_platform.is_rocm() and (
             quant_config.use_int8_w8a8 or quant_config.use_fp8_w8a8
         ):
-            # HCU LightOP consumes per-token Channel scales (block_shape=None).
-            assert not quant_config.per_out_ch_quant
+            # HCU w8a8: skip block_shape and per_out_ch_quant assertions
+            pass
         else:
             if self.mxfp8:
                 assert quant_config.quant_dtype == "mxfp8"
@@ -332,6 +354,64 @@ class DeepGemmExperts(mk.FusedMoEExpertsModular):
             act_out, block_k, column_major_scales=True, out_q=output
         )
 
+    def _apply_ep_fused(
+        self, output, a1q, w1, w2, topk_weights, topk_ids, activation,
+        global_num_experts, expert_map, a1q_scale, workspace13, workspace2,
+        apply_router_weight_on_input,
+    ):
+        from vllm_hcu.model_executor.layers.fused_moe.ep_fused_moe_support import (
+            supports_channel_ep_fused,
+        )
+
+        if not (
+            self.quant_config.use_fp8_w8a8
+            and self.quant_config.per_out_ch_quant
+            and self.quant_config.per_act_token_quant
+            and supports_channel_ep_fused(
+                w1, w2, self.w1_scale, self.w2_scale,
+                block_shape=self.block_shape,
+                activation=activation,
+                expert_map=expert_map,
+                apply_router_weight_on_input=apply_router_weight_on_input,
+            )
+        ):
+            raise ValueError(
+                "EP fused MoE requires supported channel-FP8 weights, dynamic "
+                "per-token activations and SWIGLUSTEP with expert parallelism"
+            )
+        if (
+            a1q_scale is None
+            or a1q_scale.shape not in ((a1q.shape[0],), (a1q.shape[0], 1))
+            or a1q_scale.device != a1q.device
+        ):
+            raise ValueError("EP fused MoE requires one activation scale per token")
+        from vllm_hcu.model_executor.layers.fused_moe.ep_fused_moe import (
+            ep_fused_experts,
+        )
+
+        mask = getattr(self, "_ep_fused_mask", None)
+        if mask is None or self._ep_fused_mask_src is not expert_map:
+            mask = (expert_map >= 0).to(torch.int32)
+            self._ep_fused_mask, self._ep_fused_mask_src = mask, expert_map
+        ep_fused_experts(
+            a1q,
+            w1,
+            w2,
+            topk_weights.to(torch.float32),
+            topk_ids.to(torch.int32).contiguous(),
+            expert_map,
+            self.w1_scale,
+            self.w2_scale,
+            a1_scale=a1q_scale,
+            global_num_experts=int(global_num_experts),
+            output_dtype=output.dtype,
+            gemm1_limit=float(self.gemm1_clamp_limit or 7.0),
+            expert_mask=mask,
+            out=output,
+            workspace13=workspace13,
+            workspace2=workspace2,
+        )
+
     def apply(
         self,
         output: torch.Tensor,
@@ -366,6 +446,19 @@ class DeepGemmExperts(mk.FusedMoEExpertsModular):
         local_num_experts = w1.size(0)
         if global_num_experts == -1:
             global_num_experts = local_num_experts
+
+        if (
+            _EP_FUSED_MOE
+            and self.block_shape is None
+            and self.quant_config.use_fp8_w8a8
+            and w1.dim() == 3
+        ):
+            self._apply_ep_fused(
+                output, a1q, w1, w2, topk_weights, topk_ids, activation,
+                global_num_experts, expert_map, a1q_scale, workspace13, workspace2,
+                apply_router_weight_on_input,
+            )
+            return
 
         if current_platform.is_rocm():
             N = self._hcu_logical_n
@@ -470,14 +563,23 @@ class DeepGemmExperts(mk.FusedMoEExpertsModular):
                     workspace13.view(dtype=torch.float8_e4m3fn),
                     (M_sum, activation_out_dim),
                 )
-                if current_platform.is_rocm() and activation == MoEActivation.SILU:
+                if current_platform.is_rocm() and activation in (
+                    MoEActivation.SILU,
+                    MoEActivation.SWIGLUSTEP,
+                ):
                     from lightop.activation import fuse_silu_mul_fp8_quant
 
+                    # lightop's `limit` computes min(silu(g), L) * clamp(u, -L, L),
+                    # i.e. swiglustep; -1 disables the clamp (plain SiLU).
+                    limit = -1.0
+                    if activation == MoEActivation.SWIGLUSTEP:
+                        limit = float(self.gemm1_clamp_limit or 7.0)
                     a2q, a2q_scale = fuse_silu_mul_fp8_quant(
                         mm1_out,
                         fp8type=0,
                         output=quant_out,
                         expert_ids=expert_ids,
+                        limit=limit,
                     )
                 else:
                     a2q, a2q_scale = self._act_mul_quant(

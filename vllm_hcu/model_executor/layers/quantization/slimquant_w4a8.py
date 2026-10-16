@@ -237,15 +237,14 @@ class SlimQuantW4A8Int8AiterMoEMethod(FusedMoEMethodBase):
     def get_fused_moe_quant_config(
         self, layer: torch.nn.Module
     ) -> FusedMoEQuantConfig:
-        # Keep the checkpoint scale as the canonical value.  The AITER MOE_C
-        # shuffled representation already accounts for the packed INT4
-        # high-nibble convention.  The explicit Triton fallback applies its
-        # separate x16 conversion at the call site instead of changing this
-        # shared configuration.
+        # Both contiguous HT and masked LL HIPC apply the packed INT4 x16
+        # compensation internally. Pass checkpoint scales unchanged.
+        w13_scale = layer.w13_weight_scale
+        w2_scale = layer.w2_weight_scale
         self.moe_quant_config = FusedMoEQuantConfig.make(
             torch.int8,
-            w1_scale=layer.w13_weight_scale,
-            w2_scale=layer.w2_weight_scale,
+            w1_scale=w13_scale,
+            w2_scale=w2_scale,
             a1_scale=layer.w13_input_scale,
             a2_scale=layer.w2_input_scale,
             per_act_token_quant=True,
@@ -255,6 +254,44 @@ class SlimQuantW4A8Int8AiterMoEMethod(FusedMoEMethodBase):
             gemm1_clamp_limit=getattr(layer, "swiglu_limit", None),
         )
         return self.moe_quant_config
+
+    def _is_kimi_ht(self) -> bool:
+        moe_parallel_config = getattr(self.moe, "moe_parallel_config", None)
+        return bool(
+            getattr(self.moe, "_hcu_kimi_k3", False)
+            and getattr(moe_parallel_config, "all2all_backend", None)
+            == "deepep_high_throughput"
+        )
+
+    def _is_kimi_ll(self) -> bool:
+        moe_parallel_config = getattr(self.moe, "moe_parallel_config", None)
+        return bool(
+            getattr(self.moe, "_hcu_kimi_k3", False)
+            and getattr(moe_parallel_config, "all2all_backend", None)
+            == "deepep_low_latency"
+        )
+
+    def _prepare_kimi_ht_scales(self, layer: torch.nn.Module) -> None:
+        if not self._is_kimi_ht():
+            return
+        names = ("w13_weight_scale", "w2_weight_scale")
+        sources = tuple(getattr(layer, name, None) for name in names)
+        if not all(isinstance(value, Parameter) for value in sources):
+            raise TypeError("Kimi DeepEP HT requires both checkpoint scale Parameters")
+        if any(value.dtype != torch.float32 for value in sources):
+            raise TypeError("Kimi DeepEP HT checkpoint scales must be FP32")
+
+        marker = getattr(layer, "_hcu_kimi_ht_scale_ids", None)
+        current = tuple(id(source) for source in sources)
+        if marker is not None:
+            if marker != current:
+                raise RuntimeError(
+                    "Kimi DeepEP HT scale Parameters changed after binding; "
+                    "reload or expert replacement is unsupported"
+                )
+            return
+
+        layer._hcu_kimi_ht_scale_ids = current
 
     @staticmethod
     def _get_deepgemm_moe_quant_config(
@@ -279,6 +316,20 @@ class SlimQuantW4A8Int8AiterMoEMethod(FusedMoEMethodBase):
     @property
     def is_monolithic(self) -> bool:
         return False
+
+    @property
+    def supports_eplb(self) -> bool:
+        # Kimi fixed LL is safe for synchronous EPLB only because its masked
+        # N32 views alias the same in-place packed Parameter storage. Keep the
+        # capability limited to the exact model/backend/config combination.
+        parallel = getattr(self.moe, "moe_parallel_config", None)
+        activation = getattr(self.moe, "activation", None)
+        activation = getattr(activation, "value", activation)
+        return bool(
+            activation == "situ"
+            and getattr(parallel, "all2all_backend", None) == "deepep_low_latency"
+            and getattr(parallel, "enable_eplb", False)
+        )
 
     def create_weights(
         self,
@@ -349,6 +400,10 @@ class SlimQuantW4A8Int8AiterMoEMethod(FusedMoEMethodBase):
             if not isinstance(parameter, Parameter):
                 raise TypeError(f"SlimQuant W4A8 requires Parameter {name}")
             parameter.requires_grad_(False)
+        # DeepEP HT consumes the INT8-domain scale. The checkpoint's canonical
+        # SlimQuant scale remains untouched; the derived x16 Parameters have
+        # stable identities for MoE ownership and any future transfer adapter.
+        self._prepare_kimi_ht_scales(layer)
         generation = _slimquant_moe_tensor_generation(
             layer,
             _SLIMQUANT_MOE_LAYOUT_TENSORS,
@@ -358,13 +413,18 @@ class SlimQuantW4A8Int8AiterMoEMethod(FusedMoEMethodBase):
             == generation
         ):
             return
-        from vllm_hcu.model_executor.layers.fused_moe.deepep_runtime import (
-            slimquant_w4a8_uses_deepep_auto,
-        )
+        is_kimi_ht = self._is_kimi_ht()
+        is_kimi_ll = self._is_kimi_ll()
+        if is_kimi_ht or is_kimi_ll:
+            uses_deepep_auto = False
+        else:
+            from vllm_hcu.model_executor.layers.fused_moe.deepep_runtime import (
+                slimquant_w4a8_uses_deepep_auto,
+            )
 
-        uses_deepep_auto = slimquant_w4a8_uses_deepep_auto(
-            getattr(self, "moe", None)
-        )
+            uses_deepep_auto = slimquant_w4a8_uses_deepep_auto(
+                getattr(self, "moe", None)
+            )
         weight_generation = _slimquant_moe_tensor_generation(
             layer,
             _SLIMQUANT_MOE_WEIGHT_TENSORS,
@@ -397,6 +457,74 @@ class SlimQuantW4A8Int8AiterMoEMethod(FusedMoEMethodBase):
                 "SlimQuant W4A8 requires its MoE quantization config before "
                 "weight postprocessing"
             )
+
+        if is_kimi_ht:
+            from vllm_hcu.model_executor.layers.quantization.slimquant_w4a8_deepgemm_runtime import (
+                make_kimi_k3_deepep_ht_w4a8_moe_kernel,
+            )
+
+            routing_tables = getattr(layer, "_expert_routing_tables", None)
+            self.moe_kernel = make_kimi_k3_deepep_ht_w4a8_moe_kernel(
+                moe_quant_config=self.moe_quant_config,
+                moe_config=self.moe,
+                routing_tables=routing_tables() if callable(routing_tables) else None,
+            )
+            fused_experts = getattr(self.moe_kernel, "fused_experts", None)
+            experts = getattr(fused_experts, "experts", fused_experts)
+            process = getattr(experts, "process_weights_after_loading", None)
+            if not callable(process):
+                raise RuntimeError(
+                    "Kimi-K3 DeepEP HT did not construct modular experts "
+                    "before weight postprocessing"
+                )
+            process(layer)
+            layer._hcu_slimquant_post_load_weight_generation = (
+                _slimquant_moe_tensor_generation(
+                    layer,
+                    _SLIMQUANT_MOE_WEIGHT_TENSORS,
+                )
+            )
+            layer._hcu_slimquant_post_load_generation = (
+                _slimquant_moe_tensor_generation(
+                    layer,
+                    _SLIMQUANT_MOE_LAYOUT_TENSORS,
+                )
+            )
+            return
+
+        if is_kimi_ll:
+            from vllm_hcu.model_executor.layers.quantization.slimquant_w4a8_deepgemm_runtime import (
+                make_kimi_k3_deepep_ll_w4a8_moe_kernel,
+            )
+
+            routing_tables = getattr(layer, "_expert_routing_tables", None)
+            self.moe_kernel = make_kimi_k3_deepep_ll_w4a8_moe_kernel(
+                moe_quant_config=self.moe_quant_config,
+                moe_config=self.moe,
+                routing_tables=routing_tables() if callable(routing_tables) else None,
+            )
+            fused_experts = getattr(self.moe_kernel, "fused_experts", None)
+            experts = getattr(fused_experts, "experts", fused_experts)
+            process = getattr(experts, "process_weights_after_loading", None)
+            if not callable(process):
+                raise RuntimeError(
+                    "Kimi-K3 DeepEP LL did not construct modular experts "
+                    "before weight postprocessing"
+                )
+            process(layer)
+            layer._hcu_slimquant_post_load_weight_generation = (
+                _slimquant_moe_tensor_generation(
+                    layer,
+                    _SLIMQUANT_MOE_WEIGHT_TENSORS,
+                )
+            )
+            layer._hcu_slimquant_post_load_generation = (
+                _slimquant_moe_tensor_generation(
+                    layer,
+                    _SLIMQUANT_MOE_LAYOUT_TENSORS,
+                )
+            )
+            return
 
         if uses_deepep_auto:
             from vllm_hcu.model_executor.layers.fused_moe.experts.dpsk_v4_deep_gemm_moe import (

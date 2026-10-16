@@ -4,34 +4,16 @@
 
 from __future__ import annotations
 
-import os
 from types import ModuleType, SimpleNamespace
 
 import pytest
 
 from vllm.config.vllm import VllmConfig
 from vllm.v1.attention.backends.registry import AttentionBackendEnum
+
 from vllm_hcu.patch.config import HcuFeatureConfig
 from vllm_hcu.patch.platform.core_fix import patch_vllm_config
 from vllm_hcu.patch.platform.core_fix._common import PatchCompatibilityError
-
-
-def test_glm_dsa_defaults_to_mrv2_for_hcu(monkeypatch):
-    monkeypatch.delenv("VLLM_USE_V2_MODEL_RUNNER", raising=False)
-    model_config = SimpleNamespace(architectures=["GlmMoeDsaForCausalLM"])
-
-    patch_vllm_config._normalize_hcu_model_runner(model_config)
-
-    assert os.environ["VLLM_USE_V2_MODEL_RUNNER"] == "1"
-
-
-def test_glm_dsa_preserves_explicit_model_runner_choice(monkeypatch):
-    monkeypatch.setenv("VLLM_USE_V2_MODEL_RUNNER", "0")
-    model_config = SimpleNamespace(architectures=["GlmMoeDsaForCausalLM"])
-
-    patch_vllm_config._normalize_hcu_model_runner(model_config)
-
-    assert os.environ["VLLM_USE_V2_MODEL_RUNNER"] == "0"
 
 
 def _make_pcp_config(**overrides: object) -> object:
@@ -283,11 +265,12 @@ def test_hy4_tp1_pcp8_ep8_mtp3_fp8_is_allowed(
     assert patch_vllm_config._validate_hcu_pcp_scope(config) is True
 
 
-def test_hy4_tp1_pcp8_requires_linear_gate_pcp_sharding(
+def test_hy4_tp1_pcp8_defaults_to_linear_gate_pcp_sharding(
     make_pcp_config, monkeypatch
 ) -> None:
-    """PCP8 must fail before loading replicated Hy4 gate weights."""
+    """PCP8 must auto-select sharding before loading Hy4 gate weights."""
 
+    monkeypatch.delenv("VLLM_HCU_USE_CUSTOM_OPS", raising=False)
     monkeypatch.delenv("VLLM_HCU_ENABLE_LINEAR_GATE_PCP_SHARD", raising=False)
     config = make_pcp_config(
         architecture="HYV4ForCausalLM",
@@ -307,7 +290,64 @@ def test_hy4_tp1_pcp8_requires_linear_gate_pcp_sharding(
         attention_backend=AttentionBackendEnum.FLASHMLA_SPARSE,
     )
 
+    assert patch_vllm_config._validate_hcu_pcp_scope(config) is True
+
+
+def test_hy4_tp1_pcp8_rejects_explicitly_disabled_linear_gate_sharding(
+    make_pcp_config, monkeypatch
+) -> None:
+    """An explicit opt-out must fail before replicated weights are loaded."""
+
+    monkeypatch.delenv("VLLM_HCU_USE_CUSTOM_OPS", raising=False)
+    monkeypatch.setenv("VLLM_HCU_ENABLE_LINEAR_GATE_PCP_SHARD", "0")
+    config = make_pcp_config(
+        architecture="HYV4ForCausalLM",
+        tp=1,
+        pcp=8,
+        pp=1,
+        dp=1,
+        dcp=1,
+        enable_expert_parallel=True,
+        enforce_eager=True,
+        speculative=True,
+        speculative_method="mtp",
+        num_speculative_tokens=3,
+        cache_dtype="fp8_e4m3",
+        all2all_backend="deepep_high_throughput",
+        moe_backend="deep_gemm",
+        attention_backend=AttentionBackendEnum.FLASHMLA_SPARSE,
+    )
+
     with pytest.raises(ValueError, match="LINEAR_GATE_PCP_SHARD=1"):
+        patch_vllm_config._validate_hcu_pcp_scope(config)
+
+
+def test_hy4_tp1_pcp8_rejects_custom_ops_master_off(
+    make_pcp_config, monkeypatch
+) -> None:
+    """The PCP8 child must not override the global custom-op opt-out."""
+
+    monkeypatch.setenv("VLLM_HCU_USE_CUSTOM_OPS", "0")
+    monkeypatch.setenv("VLLM_HCU_ENABLE_LINEAR_GATE_PCP_SHARD", "1")
+    config = make_pcp_config(
+        architecture="HYV4ForCausalLM",
+        tp=1,
+        pcp=8,
+        pp=1,
+        dp=1,
+        dcp=1,
+        enable_expert_parallel=True,
+        enforce_eager=True,
+        speculative=True,
+        speculative_method="mtp",
+        num_speculative_tokens=3,
+        cache_dtype="fp8_e4m3",
+        all2all_backend="deepep_high_throughput",
+        moe_backend="deep_gemm",
+        attention_backend=AttentionBackendEnum.FLASHMLA_SPARSE,
+    )
+
+    with pytest.raises(ValueError, match="VLLM_HCU_USE_CUSTOM_OPS=0"):
         patch_vllm_config._validate_hcu_pcp_scope(config)
 
 
