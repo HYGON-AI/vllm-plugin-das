@@ -21,31 +21,46 @@ from tests.runtime_patch.test_glm52_pcp_manager import _make_batch, _make_manage
 from tests.runtime_patch.test_glm52_pcp_runner import _config, pcp_runner_module
 
 
+@pytest.mark.parametrize("architecture", [
+    "DeepseekV4ForCausalLM", "DeepSeekV4MTPModel",
+])
 @pytest.mark.parametrize("pcp", [2, 4, 8])
 @pytest.mark.parametrize("draft_tokens", [0, 1, 2, 3])
-def test_v4_pcp_config_accepts_full_kv_and_native_mtp(pcp, draft_tokens):
+def test_v4_pcp_config_accepts_full_kv_and_native_mtp(
+    architecture, pcp, draft_tokens,
+):
     config = _make_pcp_config(
-        architecture="DeepseekV4ForCausalLM", pcp=pcp,
+        architecture=architecture, pcp=pcp,
         speculative=bool(draft_tokens), num_speculative_tokens=draft_tokens,
     )
     assert _validate_hcu_pcp_scope(config)
 
 
+@pytest.mark.parametrize("architecture", [
+    "DeepseekV4ForCausalLM", "DeepSeekV4MTPModel",
+])
 @pytest.mark.parametrize("overrides", [
     {"dcp": 2}, {"dp": 2}, {"pp": 2}, {"enforce_eager": False},
     {"enable_expert_parallel": False}, {"use_mla": False},
     {"speculative": True, "speculative_method": "dspark"},
+    {"speculative": True, "num_speculative_tokens": 0},
+    {"speculative": True, "num_speculative_tokens": 4},
 ])
-def test_v4_rejects_unsupported_pcp_without_affecting_pcp_one(overrides):
-    config = _make_pcp_config(architecture="DeepseekV4ForCausalLM", **overrides)
+def test_v4_rejects_unsupported_pcp_without_affecting_pcp_one(
+    architecture, overrides,
+):
+    config = _make_pcp_config(architecture=architecture, **overrides)
     with pytest.raises(ValueError):
         _validate_hcu_pcp_scope(config)
     config.parallel_config.prefill_context_parallel_size = 1
     assert _validate_hcu_pcp_scope(config) is False
 
 
-def test_v4_interleaved_cache_is_rejected():
-    config = _make_pcp_config(architecture="DeepseekV4ForCausalLM")
+@pytest.mark.parametrize("architecture", [
+    "DeepseekV4ForCausalLM", "DeepSeekV4MTPModel",
+])
+def test_v4_interleaved_cache_is_rejected(architecture):
+    config = _make_pcp_config(architecture=architecture)
     config.parallel_config.cp_kv_cache_interleave_size = 2
     with pytest.raises(ValueError, match="Full KV"):
         _validate_hcu_pcp_scope(config)

@@ -320,7 +320,9 @@ def _require_mrv2_pcp_contract(vllm_config: object) -> None:
     )
     is_glm52 = architectures == ["GlmMoeDsaForCausalLM"]
     is_hy4 = architectures == ["HYV4ForCausalLM"]
-    is_dsv4 = architectures == ["DeepseekV4ForCausalLM"]
+    is_dsv4 = architectures in (
+        ["DeepseekV4ForCausalLM"], ["DeepSeekV4MTPModel"]
+    )
     is_glm53 = is_glm53_pcp(vllm_config)
     is_glm53_mtp = _is_glm53_mtp_pcp(vllm_config)
     if is_glm53:
@@ -330,7 +332,8 @@ def _require_mrv2_pcp_contract(vllm_config: object) -> None:
     if use_mla and not (is_glm52 or is_hy4 or is_glm53 or is_glm53_mtp or is_dsv4):
         raise ValueError(
             "GLM-5.2 and HY V4 MLA PCP only support "
-            "GlmMoeDsaForCausalLM, HYV4ForCausalLM or DeepseekV4ForCausalLM."
+            "GlmMoeDsaForCausalLM, HYV4ForCausalLM, DeepseekV4ForCausalLM "
+            "or DeepSeekV4MTPModel."
         )
     if is_dsv4:
         if not use_mla:
