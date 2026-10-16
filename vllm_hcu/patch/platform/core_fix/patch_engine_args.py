@@ -47,6 +47,7 @@ _HCU_BOOLEAN_KWARGS = (
     "enable_lightly_cplb",
     "enable_custom_sp",
     "enable_multi_layers_mtp",
+    "enable_dsa_cache_layer_split",
 )
 _HCU_EPLB_FIELDS = {
     "expert_map_path": "expert_map_path",
@@ -589,9 +590,11 @@ def apply_to_module(module: ModuleType) -> bool:
     def hcu_from_cli_args(cls, args):
         engine_args_instance = from_cli_args(cls, args)
         feature_config = get_hcu_config(engine_args_instance)
+        # Include every registered HCU boolean (not just the lightly-CP trio)
+        # so flags like --enable-dsa-cache-layer-split reach the sidecar.
         updates = {
             name: getattr(args, name)
-            for name in _HCU_BOOLEAN_KWARGS[:3]
+            for name in _HCU_BOOLEAN_KWARGS
             if hasattr(args, name)
         }
         if updates:
