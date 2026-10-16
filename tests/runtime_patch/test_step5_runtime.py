@@ -182,6 +182,47 @@ def test_metadata_extension_is_owned_without_changing_upstream_dataclass():
     assert m.block_table_np.tolist() == [[1], [2]]
 
 
+def test_disabled_host_seq_lens_does_not_allocate_mirror(monkeypatch):
+    from vllm_hcu.v1 import hcu_model_runner_v2 as runner_module
+
+    monkeypatch.setattr(runner_module, "_USE_HOST_SEQ_LENS", False)
+    block_tables = SimpleNamespace(
+        enable_host_mirror=lambda: pytest.fail("host mirror was allocated")
+    )
+    runner = SimpleNamespace(
+        vllm_config=object(),
+        pcp_manager=None,
+        block_tables=block_tables,
+    )
+    runner_module.HcuGPUModelRunnerV2._init_host_seq_lens(runner)
+
+    assert runner._hsl_enabled is False
+    assert runner._hsl_pending is None
+    assert runner._hsl_batch is None
+
+
+def test_disabled_swa_decode_uses_baseline_branch(monkeypatch):
+    from vllm_hcu.v1.attention.backends import flash_attn
+
+    monkeypatch.setattr(flash_attn, "_SWA_DECODE_ENABLED", False)
+    impl = SimpleNamespace(
+        dcp_world_size=0,
+        attn_type=flash_attn.AttentionType.DECODER,
+    )
+    metadata = SimpleNamespace(use_cascade=False)
+
+    assert not flash_attn.FlashAttentionImpl.forward_swa_gate_quant(
+        impl,
+        SimpleNamespace(),
+        object(),
+        object(),
+        metadata,
+        object(),
+        object(),
+        object(),
+    )
+
+
 def test_combine_can_return_result_without_copying_output(monkeypatch):
     from vllm_hcu.model_executor.layers.fused_moe import combine_runtime as c
 

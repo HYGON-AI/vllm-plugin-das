@@ -5,6 +5,7 @@
 
 import importlib
 import torch
+from vllm_hcu.platforms import envs as henvs
 
 
 def router_bias_func(
@@ -28,7 +29,7 @@ def router_bias_func(
     # The Triton kernel also runs on ROCm/HCU (is_cuda is True there) and is
     # 7-10x faster than the eager fallback below, which runs inside the opaque
     # moe_forward op and so never gets fused by Inductor.
-    if not gating_output.is_cuda:
+    if not henvs.optional_custom_op_enabled() or not gating_output.is_cuda:
         if router_bias is None:
             raise ValueError("Step5 router_bias must be provided.")
         scores = gating_output.float().sigmoid()

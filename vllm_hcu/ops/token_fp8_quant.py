@@ -11,8 +11,11 @@ import os
 import torch
 
 from vllm.triton_utils import tl, triton
+from vllm_hcu.platforms import envs as henvs
 
-ENABLED = os.environ.get("VLLM_HCU_TRITON_TOKEN_FP8_QUANT", "0") == "1"
+ENABLED = henvs.optional_custom_op_enabled(
+    os.environ.get("VLLM_HCU_TRITON_TOKEN_FP8_QUANT", "0") == "1"
+)
 _MAX_K = 8192
 
 

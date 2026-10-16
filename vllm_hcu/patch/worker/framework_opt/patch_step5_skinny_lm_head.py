@@ -30,6 +30,8 @@ def apply_to_module(module: ModuleType) -> bool:
         return False
     require_signatures(target, SIGNATURES, REVIEWED_SOURCES)
     import functools
+    import os
+    from vllm_hcu.platforms import envs as henvs
 
     cls = getattr(target, "LogitsProcessor", None)
     original = require_callable(cls, "_apply_head", TARGETS[0])
@@ -37,8 +39,12 @@ def apply_to_module(module: ModuleType) -> bool:
     @functools.wraps(original)
     def apply_head(self, lm_head, hidden_states, embedding_bias=None):
         # Only processors created by the Step5 models opt into this kernel.
-        if getattr(self, "_step5_skinny_lm_head", False) and (
-            self.head_dtype is None or self.head_dtype == hidden_states.dtype
+        if (
+            henvs.optional_custom_op_enabled(
+                os.environ.get("STEP5_SKINNY_LM_HEAD", "1") != "0"
+            )
+            and getattr(self, "_step5_skinny_lm_head", False)
+            and (self.head_dtype is None or self.head_dtype == hidden_states.dtype)
         ):
             from vllm_hcu.model_executor.layers import skinny_lm_head
 

@@ -73,6 +73,26 @@ def _indexer(tp_size, tp_rank):
     return owner, indexer
 
 
+def test_disabled_merged_projection_preserves_separate_weights(monkeypatch):
+    from vllm_hcu.model_executor.layers import step4_dsa
+
+    monkeypatch.setattr(step4_dsa, "_MERGED_PROJ", False)
+    monkeypatch.setattr(step4_dsa, "_INDEXERS", {})
+    owner, indexer = _indexer(1, 0)
+    original = tuple(
+        getattr(owner, name).weight
+        for name in ("sparse_indexer_q", "sparse_indexer_k", "sparse_indexer_z")
+    )
+
+    assert indexer._merged_projection(torch.bfloat16) is None
+    current = tuple(
+        getattr(owner, name).weight
+        for name in ("sparse_indexer_q", "sparse_indexer_k", "sparse_indexer_z")
+    )
+    assert all(after is before for after, before in zip(current, original))
+    assert not hasattr(indexer, "_merged_w")
+
+
 @pytest.mark.parametrize("tp_size", [1, 2, 4, 8])
 def test_provider_groups_shard_or_replicate_without_lost_heads(monkeypatch, tp_size):
     from vllm_hcu.model_executor.layers import step4_dsa

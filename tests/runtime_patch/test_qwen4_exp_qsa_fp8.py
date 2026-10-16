@@ -252,9 +252,65 @@ def test_qsa_fp8_cache_writer_accepts_exact_native_schema(
         ),
     )
     monkeypatch.setattr(qsa_fp8_patch, "torch", fake_torch)
-    fa_utils = importlib.import_module("vllm_hcu.v1.attention.backends.fa_utils")
 
-    assert qsa_fp8_patch._load_hcu_cache_writer() is fa_utils.reshape_and_cache_flash
+    assert qsa_fp8_patch._load_hcu_cache_writer() is writer
+
+
+def test_qsa_fp8_cache_writer_stays_native_when_custom_ops_are_disabled(
+    monkeypatch: pytest.MonkeyPatch,
+):
+    qsa_fp8_patch = _load_patch()
+    _library, schema_writer = _define_native_cache_writer(
+        "qsa_fp8_master_off_native_writer",
+        "reshape_and_cache_flash(Tensor key, Tensor value, Tensor! key_cache, "
+        "Tensor! value_cache, Tensor slot_mapping, str kv_cache_dtype, "
+        "Tensor k_scale, Tensor v_scale) -> ()",
+    )
+    native_calls = []
+
+    class NativeWriter:
+        default = schema_writer.default
+
+        def __call__(self, *args):
+            native_calls.append(args)
+
+    native_writer = NativeWriter()
+    fake_torch = SimpleNamespace(
+        ops=SimpleNamespace(
+            hcu_ops=SimpleNamespace(reshape_and_cache_flash=native_writer),
+        ),
+    )
+    monkeypatch.setattr(qsa_fp8_patch, "torch", fake_torch)
+    monkeypatch.setenv("VLLM_HCU_USE_CUSTOM_OPS", "0")
+    monkeypatch.setitem(
+        sys.modules,
+        "vllm_hcu.hcu_ops",
+        ModuleType("vllm_hcu.hcu_ops"),
+    )
+
+    triton_calls = []
+    triton_module = ModuleType(
+        "vllm.v1.attention.ops.triton_reshape_and_cache_flash"
+    )
+    triton_module.triton_reshape_and_cache_flash = lambda *args: triton_calls.append(
+        args
+    )
+    monkeypatch.setitem(sys.modules, triton_module.__name__, triton_module)
+
+    writer_args = (
+        object(),
+        object(),
+        object(),
+        object(),
+        object(),
+        "fp8_e4m3",
+        object(),
+        object(),
+    )
+    qsa_fp8_patch._load_hcu_cache_writer()(*writer_args)
+
+    assert native_calls == [writer_args]
+    assert triton_calls == []
 
 
 def test_qsa_owner_accepts_fp8_cache_and_restores_shared_config(

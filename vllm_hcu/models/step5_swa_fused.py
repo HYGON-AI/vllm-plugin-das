@@ -34,9 +34,14 @@ from vllm.utils.torch_utils import (
     _resolve_layer_name,
     direct_register_custom_op,
 )
+from vllm_hcu.platforms import envs as henvs
 
-SWA_FUSED_QK = os.environ.get("VLLM_HCU_STEP5_SWA_FUSED_QK", "0") == "1"
-FUSED_GATE = os.environ.get("VLLM_HCU_STEP5_FUSED_GATE", "0") == "1"
+SWA_FUSED_QK = henvs.optional_custom_op_enabled(
+    os.environ.get("VLLM_HCU_STEP5_SWA_FUSED_QK", "0") == "1"
+)
+FUSED_GATE = henvs.optional_custom_op_enabled(
+    os.environ.get("VLLM_HCU_STEP5_FUSED_GATE", "0") == "1"
+)
 OP_NAME = "step5_swa_qk_norm_rope_cache"
 GATED_OP_NAME = "step5_swa_attention_gate_quant"
 
@@ -296,12 +301,13 @@ def _op_fake(
 # q_out is allocated by the caller: this is a splitting op, and a tensor it
 # allocated itself would reach the next piecewise CUDA graph at an address
 # that graph did not capture.
-direct_register_custom_op(
-    op_name=OP_NAME,
-    op_func=_op_impl,
-    mutates_args=["q_out"],
-    fake_impl=_op_fake,
-)
+if SWA_FUSED_QK:
+    direct_register_custom_op(
+        op_name=OP_NAME,
+        op_func=_op_impl,
+        mutates_args=["q_out"],
+        fake_impl=_op_fake,
+    )
 
 
 def _gate_quant_impl(
@@ -323,12 +329,13 @@ def _gate_quant_fake(
     return xq, xs
 
 
-direct_register_custom_op(
-    op_name="step5_gate_quant_fp8",
-    op_func=_gate_quant_impl,
-    mutates_args=[],
-    fake_impl=_gate_quant_fake,
-)
+if FUSED_GATE:
+    direct_register_custom_op(
+        op_name="step5_gate_quant_fp8",
+        op_func=_gate_quant_impl,
+        mutates_args=[],
+        fake_impl=_gate_quant_fake,
+    )
 
 
 def gate_quant(
@@ -375,11 +382,12 @@ def _gated_op_impl(
     )
 
 
-direct_register_custom_op(
-    op_name=GATED_OP_NAME,
-    op_func=_gated_op_impl,
-    mutates_args=["xq", "xs"],
-)
+if SWA_FUSED_QK and FUSED_GATE:
+    direct_register_custom_op(
+        op_name=GATED_OP_NAME,
+        op_func=_gated_op_impl,
+        mutates_args=["xq", "xs"],
+    )
 
 
 def can_use(attn_module) -> bool:
