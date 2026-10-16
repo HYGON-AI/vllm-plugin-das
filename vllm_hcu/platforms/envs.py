@@ -28,6 +28,7 @@ if TYPE_CHECKING:
     VLLM_HCU_USE_CUSTOM_TOPK_TOPP_SAMPLER : bool = False
     VLLM_HCU_USE_CUSTOM_RMS_NORM : bool = False
     VLLM_HCU_USE_CUSTOM_AITER_FLA : bool = False
+    VLLM_HCU_GDN_DECODE_BACKEND: str = "hcu-aiter"
     VLLM_HCU_PP_LAYER_PARTITION_D : Optional[str] = None
     VLLM_HCU_USE_FUSE_MOE_GATE : bool = True
     VLLM_HCU_USE_LIGHTOP_SQRTSOFTPLUS_GATE: bool = True
@@ -47,6 +48,7 @@ if TYPE_CHECKING:
     VLLM_HCU_DEEPSEEK_V4_ROCM_DECODE_FALLBACK: bool = False
     VLLM_HCU_DEEPSEEK_V4_ROCM_FLASHMLA_DECODE: bool = True
     VLLM_HCU_DEEPSEEK_V4_ROCM_FLASHMLA_PREFILL: bool = True
+    VLLM_HCU_DEEPSEEK_V4_ROCM_FLASHMLA_PREFILL_HEAD_PADDING: bool = True
     VLLM_HCU_DEEPSEEK_V4_ROCM_SPARSE_PREFILL_BACKEND: str = "flashmla"
     VLLM_HCU_DEEPSEEK_V4_ROCM_FAST_WOA: bool = True
     VLLM_HCU_ENABLE_DEEPSEEK_V4_MULTI_STREAM: bool = True
@@ -115,6 +117,19 @@ def optional_custom_op_enabled(feature_enabled: bool = True) -> bool:
     """
 
     return custom_ops_enabled() and bool(feature_enabled)
+
+
+def linear_gate_pcp_shard_enabled(
+    *, tp_size: int, pcp_size: int, pp_size: int = 1
+) -> bool:
+    """Resolve HY4 linear-gate PCP sharding under the custom-op master."""
+
+    raw = os.environ.get("VLLM_HCU_ENABLE_LINEAR_GATE_PCP_SHARD")
+    if raw is None:
+        requested = (tp_size, pcp_size, pp_size) == (1, 8, 1)
+    else:
+        requested = raw.strip().lower() in ("1", "true", "yes", "on")
+    return optional_custom_op_enabled(requested)
 
 
 def qwen4_exp_hc_sp_enabled() -> bool:
@@ -340,9 +355,18 @@ hcu_vllm_environment_variables: dict[str, Callable[[], Any]] = {
     "VLLM_HCU_USE_CUSTOM_RMS_NORM":
     lambda: (os.environ.get("VLLM_HCU_USE_CUSTOM_RMS_NORM", "True").lower() in
              ("true", "1")),
+    # Deprecated and ignored: GDN prefill is selected by
+    # --gdn-prefill-backend and GDN decode by VLLM_HCU_GDN_DECODE_BACKEND.
     "VLLM_HCU_USE_CUSTOM_AITER_FLA":
     lambda: (os.environ.get("VLLM_HCU_USE_CUSTOM_AITER_FLA", "True").lower() in
              ("true", "1")),
+    # Select the GDN decode kernel provider: triton (vLLM FLA), hcu-boltops
+    # or hcu-aiter (default). VLLM_HCU_USE_CUSTOM_OPS=0 forces hcu-boltops. On HCU the GDN
+    # prefill provider is selected by --gdn-prefill-backend instead.
+    "VLLM_HCU_GDN_DECODE_BACKEND":
+    lambda: os.environ.get(
+        "VLLM_HCU_GDN_DECODE_BACKEND", "hcu-aiter"
+    ).strip().lower(),
             
     # Pipeline stage partition strategy
     "VLLM_HCU_PP_LAYER_PARTITION_D":
@@ -427,6 +451,11 @@ hcu_vllm_environment_variables: dict[str, Callable[[], Any]] = {
     "VLLM_HCU_DEEPSEEK_V4_ROCM_FLASHMLA_PREFILL":
         lambda: os.environ.get("VLLM_HCU_DEEPSEEK_V4_ROCM_FLASHMLA_PREFILL", "True").lower()
         in ("true", "1"),
+    # Disabling padding retains FlashMLA for native 64/128-head queries.
+    "VLLM_HCU_DEEPSEEK_V4_ROCM_FLASHMLA_PREFILL_HEAD_PADDING":
+        lambda: os.environ.get(
+            "VLLM_HCU_DEEPSEEK_V4_ROCM_FLASHMLA_PREFILL_HEAD_PADDING", "True"
+        ).lower() in ("true", "1"),
     # Provider selection applies only to this adapter's prefill path.
     "VLLM_HCU_DEEPSEEK_V4_ROCM_SPARSE_PREFILL_BACKEND":
         lambda: os.environ.get(

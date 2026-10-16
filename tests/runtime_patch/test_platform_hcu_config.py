@@ -101,10 +101,12 @@ def _make_arg_utils_module() -> ModuleType:
         attention_backend: str | None = None
         attention_config: dict[str, Any] = field(default_factory=dict)
         all2all_backend: str = "allgather_reducescatter"
+        gdn_prefill_backend: str | None = None
         moe_backend: str = "auto"
         kernel_config: _KernelConfig | dict[str, Any] = field(
             default_factory=_KernelConfig
         )
+        eplb_config: dict[str, Any] = field(default_factory=dict)
         speculative_config: dict[str, Any] | None = None
 
         def __post_init__(self) -> None:
@@ -120,8 +122,13 @@ def _make_arg_utils_module() -> ModuleType:
             kernel_config = copy.deepcopy(self.kernel_config)
             if self.moe_backend != "auto":
                 kernel_config.moe_backend = self.moe_backend
+            additional_config = copy.deepcopy(self.additional_config)
+            if self.gdn_prefill_backend is not None:
+                additional_config["gdn_prefill_backend"] = (
+                    self.gdn_prefill_backend
+                )
             return SimpleNamespace(
-                additional_config=copy.deepcopy(self.additional_config),
+                additional_config=additional_config,
                 kernel_config=kernel_config,
                 parallel_config=SimpleNamespace(
                     all2all_backend=self.all2all_backend
@@ -130,10 +137,28 @@ def _make_arg_utils_module() -> ModuleType:
 
         @staticmethod
         def add_cli_args(parser: argparse.ArgumentParser):
+            def parse_official_eplb(value: str) -> dict[str, Any]:
+                payload = json.loads(value)
+                unexpected = set(payload) & patch_engine_args._HCU_EPLB_FIELDS.keys()
+                if unexpected:
+                    raise ValueError(f"unexpected EPLB fields: {sorted(unexpected)}")
+                return payload
+
             parser.add_argument(
                 "--all2all-backend",
                 choices=("allgather_reducescatter", "deepep_low_latency"),
                 default="allgather_reducescatter",
+            )
+            parser.add_argument(
+                "--gdn-prefill-backend",
+                dest="gdn_prefill_backend",
+                choices=["flashinfer", "triton", "cutedsl"],
+                default=None,
+            )
+            parser.add_argument(
+                "--eplb-config",
+                type=parse_official_eplb,
+                default={},
             )
             return parser
 
@@ -194,8 +219,10 @@ def test_engine_args_legacy_keywords_are_removed_before_official_init() -> None:
         "attention_backend",
         "attention_config",
         "all2all_backend",
+        "gdn_prefill_backend",
         "moe_backend",
         "kernel_config",
+        "eplb_config",
         "speculative_config",
     }
 
@@ -218,6 +245,159 @@ def test_engine_args_normalizes_deepep_auto_and_extends_cli_choice() -> None:
     parser = module.EngineArgs.add_cli_args(argparse.ArgumentParser())
     parsed = parser.parse_args(["--all2all-backend", "deepep_auto"])
     assert parsed.all2all_backend == "deepep_auto"
+
+
+@pytest.mark.parametrize("backend", ["hcu-boltops", "hcu-aiter"])
+def test_engine_args_moves_hcu_gdn_prefill_backend_to_sidecar(
+    backend: str,
+) -> None:
+    module = _make_arg_utils_module()
+    patch_engine_args.apply_to_module(module)
+
+    args = module.EngineArgs(gdn_prefill_backend=backend)
+    assert args.gdn_prefill_backend == "triton"
+    assert get_hcu_config(args).hcu_gdn_prefill_backend == backend
+    config = args.create_engine_config()
+    assert config.additional_config["gdn_prefill_backend"] == "triton"
+    assert get_hcu_config(config).hcu_gdn_prefill_backend == backend
+
+    parser = module.EngineArgs.add_cli_args(argparse.ArgumentParser())
+    parsed = parser.parse_args(["--gdn-prefill-backend", backend])
+    cli_args = module.EngineArgs.from_cli_args(parsed)
+    assert cli_args.gdn_prefill_backend == "triton"
+    assert get_hcu_config(cli_args).hcu_gdn_prefill_backend == backend
+
+
+@pytest.mark.parametrize("backend", [None, "triton", "flashinfer"])
+def test_engine_args_keeps_official_gdn_prefill_backend(
+    backend: str | None,
+) -> None:
+    module = _make_arg_utils_module()
+    patch_engine_args.apply_to_module(module)
+
+    args = module.EngineArgs(gdn_prefill_backend=backend)
+    assert args.gdn_prefill_backend == backend
+    assert get_hcu_config(args).hcu_gdn_prefill_backend is None
+
+
+@pytest.mark.parametrize("backend", ["hcu-boltops", "hcu-aiter"])
+def test_engine_args_sidecar_only_gdn_prefill_backend_pins_triton(
+    backend: str,
+) -> None:
+    module = _make_arg_utils_module()
+    patch_engine_args.apply_to_module(module)
+    sidecar = {"hcu": {"hcu_gdn_prefill_backend": backend}}
+
+    args = module.EngineArgs(additional_config=sidecar)
+    assert args.gdn_prefill_backend == "triton"
+    assert get_hcu_config(args).hcu_gdn_prefill_backend == backend
+
+    # A reconstructed instance that bypassed the constructor normalisation.
+    args.gdn_prefill_backend = None
+    config = args.create_engine_config()
+    assert args.gdn_prefill_backend == "triton"
+    assert config.additional_config["gdn_prefill_backend"] == "triton"
+    assert get_hcu_config(config).hcu_gdn_prefill_backend == backend
+
+
+def test_engine_args_rejects_conflicting_gdn_prefill_backend() -> None:
+    module = _make_arg_utils_module()
+    patch_engine_args.apply_to_module(module)
+
+    with pytest.raises(ValueError, match="conflicting hcu_gdn_prefill_backend"):
+        module.EngineArgs(
+            gdn_prefill_backend="hcu-aiter",
+            additional_config={"hcu": {"hcu_gdn_prefill_backend": "hcu-boltops"}},
+        )
+
+
+def test_engine_args_extracts_nested_offline_eplb_fields() -> None:
+    module = _make_arg_utils_module()
+    patch_engine_args.apply_to_module(module)
+    eplb_config = {
+        "window_size": 512,
+        "step_interval": 100,
+        "expert_map_path": "/maps/hy4.json",
+        "disable_rearrange": True,
+        "static_dispatch_policy": "locality_fair",
+    }
+
+    args = module.EngineArgs(eplb_config=eplb_config)
+
+    assert eplb_config["expert_map_path"] == "/maps/hy4.json"
+    assert args.eplb_config == {"window_size": 512, "step_interval": 100}
+    assert get_hcu_config(args) == HcuFeatureConfig(
+        expert_map_path="/maps/hy4.json",
+        eplb_disable_rearrange=True,
+        eplb_static_dispatch_policy="locality_fair",
+    )
+
+    config = args.create_engine_config()
+    assert get_hcu_config(config) == get_hcu_config(args)
+    assert config.parallel_config._vllm_hcu_expert_map_path == "/maps/hy4.json"
+    assert config.parallel_config._vllm_hcu_expert_map_record_path is None
+    assert config.parallel_config._vllm_hcu_eplb_disable_rearrange is True
+    assert (
+        config.parallel_config._vllm_hcu_eplb_static_dispatch_policy
+        == "locality_fair"
+    )
+
+
+def test_engine_args_extracts_nested_offline_eplb_record_path() -> None:
+    module = _make_arg_utils_module()
+    patch_engine_args.apply_to_module(module)
+
+    args = module.EngineArgs(
+        eplb_config={"expert_map_record_path": "/maps/record.json"}
+    )
+
+    assert args.eplb_config == {}
+    assert get_hcu_config(args).expert_map_record_path == "/maps/record.json"
+
+
+def test_engine_args_cli_delays_offline_eplb_validation_until_hcu_init() -> None:
+    module = _make_arg_utils_module()
+    patch_engine_args.apply_to_module(module)
+    parser = module.EngineArgs.add_cli_args(argparse.ArgumentParser())
+
+    namespace = parser.parse_args(
+        [
+            "--eplb-config",
+            json.dumps(
+                {
+                    "window_size": 16,
+                    "step_interval": 16,
+                    "num_redundant_experts": 8,
+                    "use_async": False,
+                    "expert_map_record_path": "/maps/hy4.json",
+                }
+            ),
+        ]
+    )
+    args = module.EngineArgs.from_cli_args(namespace)
+
+    assert args.eplb_config == {
+        "window_size": 16,
+        "step_interval": 16,
+        "num_redundant_experts": 8,
+        "use_async": False,
+    }
+    assert get_hcu_config(args).expert_map_record_path == "/maps/hy4.json"
+
+
+def test_engine_args_rejects_conflicting_nested_offline_eplb_sidecar() -> None:
+    module = _make_arg_utils_module()
+    patch_engine_args.apply_to_module(module)
+
+    with pytest.raises(ValueError, match="conflicting expert_map_path"):
+        module.EngineArgs(
+            additional_config={
+                "hcu": HcuFeatureConfig(
+                    expert_map_path="/maps/sidecar.json"
+                ).to_dict()
+            },
+            eplb_config={"expert_map_path": "/maps/nested.json"},
+        )
 
 
 def test_dspark_deepep_auto_uses_standard_engine_args_path() -> None:
@@ -1040,7 +1220,9 @@ def test_real_v0251_set_cudagraph_binds_custom_sp_before_first_adjustment() -> N
 
 
 class _ValidationCompilation:
-    pass
+    def __init__(self) -> None:
+        # Mirrors CompilationConfig: no attention layers are registered yet.
+        self.static_forward_context: dict[str, object] = {}
 
 
 def _validation_config(feature_config: HcuFeatureConfig) -> object:

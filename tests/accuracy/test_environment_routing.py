@@ -14,9 +14,8 @@ import torch
 
 from vllm_hcu.patch.worker.core_fix import patch_qwen3_5_mamba_state_dtype
 from vllm_hcu.patch.worker.op_opt import (
+    _gdn_backend,
     patch_compressed_tensors_w8a8_int8,
-    patch_fla_chunk_delta_h,
-    patch_fla_chunk_o,
     patch_input_quant_fp8,
     patch_mamba_mixer2,
 )
@@ -252,16 +251,6 @@ def test_optional_integer_environment_values_preserve_none(
 
 SELECTORS = (
     (
-        "fla_chunk_o",
-        patch_fla_chunk_o._enabled,
-        "VLLM_HCU_USE_CUSTOM_AITER_FLA",
-    ),
-    (
-        "fla_chunk_delta_h",
-        patch_fla_chunk_delta_h._enabled,
-        "VLLM_HCU_USE_CUSTOM_AITER_FLA",
-    ),
-    (
         "lightop_input_fp8",
         patch_input_quant_fp8._lightop_requested,
         "VLLM_HCU_USE_LIGHTOP_PER_TOKEN_QUANT_FP8",
@@ -304,6 +293,62 @@ def test_master_custom_ops_gate_routes_feature_selectors(
     monkeypatch.setenv(feature_name, "true" if feature_enabled else "false")
 
     assert selector() is (master_enabled and feature_enabled)
+
+
+@pytest.mark.parametrize(
+    ("value", "expected"),
+    [
+        (None, "hcu-aiter"),
+        ("triton", "triton"),
+        ("hcu-boltops", "hcu-boltops"),
+        (" HCU-AITER ", "hcu-aiter"),
+    ],
+)
+def test_gdn_decode_backend_environment_selects_provider(
+    monkeypatch: pytest.MonkeyPatch,
+    value: str | None,
+    expected: str,
+) -> None:
+    monkeypatch.delenv("VLLM_HCU_USE_CUSTOM_OPS", raising=False)
+    if value is None:
+        monkeypatch.delenv("VLLM_HCU_GDN_DECODE_BACKEND", raising=False)
+    else:
+        monkeypatch.setenv("VLLM_HCU_GDN_DECODE_BACKEND", value)
+
+    assert _gdn_backend.requested_backend("decode") == expected
+
+
+@pytest.mark.parametrize("stage", ["prefill", "decode"])
+def test_gdn_backend_master_gate_forces_boltops(
+    monkeypatch: pytest.MonkeyPatch,
+    stage: str,
+) -> None:
+    monkeypatch.setenv("VLLM_HCU_USE_CUSTOM_OPS", "0")
+    monkeypatch.setenv("VLLM_HCU_GDN_DECODE_BACKEND", "hcu-aiter")
+    monkeypatch.setattr(_gdn_backend, "_prefill_requested", "hcu-aiter")
+
+    assert _gdn_backend.requested_backend(stage) == "hcu-boltops"
+
+
+def test_gdn_decode_backend_invalid_value_uses_default(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.delenv("VLLM_HCU_USE_CUSTOM_OPS", raising=False)
+    monkeypatch.setenv("VLLM_HCU_GDN_DECODE_BACKEND", "cuda")
+
+    assert _gdn_backend.requested_backend("decode") == "hcu-aiter"
+
+
+@pytest.mark.parametrize("legacy", ["0", "1"])
+def test_legacy_aiter_fla_flag_is_ignored(
+    monkeypatch: pytest.MonkeyPatch,
+    legacy: str,
+) -> None:
+    monkeypatch.delenv("VLLM_HCU_USE_CUSTOM_OPS", raising=False)
+    monkeypatch.delenv("VLLM_HCU_GDN_DECODE_BACKEND", raising=False)
+    monkeypatch.setenv("VLLM_HCU_USE_CUSTOM_AITER_FLA", legacy)
+
+    assert _gdn_backend.requested_backend("decode") == "hcu-aiter"
 
 
 @pytest.mark.parametrize(

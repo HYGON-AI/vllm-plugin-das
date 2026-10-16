@@ -4,11 +4,15 @@
 """HCU integration boundary for vLLM's Model Runner V2."""
 
 import functools
+import os
 from contextlib import nullcontext
 
+import numpy as np
 import torch
 
 from vllm.config.compilation import CUDAGraphMode
+from vllm_hcu.runtime_compat.step5 import is_step5_config
+from vllm.logger import init_logger
 from vllm.v1.worker.gpu.attn_utils import build_slot_mappings_by_layer
 from vllm.v1.worker.gpu.model_runner import GPUModelRunner
 from vllm_hcu.model_executor.layers.attention.pcp import (
@@ -20,6 +24,19 @@ from vllm_hcu.forward_context_runtime import (
 )
 from vllm_hcu.v1.pcp_manager import make_hcu_pcp_manager_cls
 from vllm_hcu.patch.platform.core_fix.patch_vllm_config import is_glm53_pcp
+from vllm_hcu.platforms import envs as henvs
+
+logger = init_logger(__name__)
+
+# Exact host mirror of num_computed_tokens / block tables (as vllm_hcu_21's V1
+# runner keeps). Without it a host-scheduling attention builder (step4 DSA)
+# reads seq_lens back from the device, which waits for the whole previous step
+# -- the MTP drafter included -- and leaves the GPU idle at every step start.
+_USE_HOST_SEQ_LENS = henvs.optional_custom_op_enabled(
+    os.environ.get("VLLM_HCU_HOST_SEQ_LENS", "1") == "1"
+)
+# Debug: compare the mirror against the device seq_lens every step.
+_CHECK_HOST_SEQ_LENS = os.environ.get("VLLM_HCU_CHECK_HOST_SEQ_LENS", "0") == "1"
 
 
 def record_pp_spec_draft_index_stream(
@@ -29,9 +46,7 @@ def record_pp_spec_draft_index_stream(
     if getattr(model_runner, "_vllm_hcu_suppress_pp_spec_draft_sync", False):
         return False
     pp_handler = getattr(model_runner, "pp_handler", None)
-    num_speculative_steps = int(
-        getattr(model_runner, "num_speculative_steps", 0)
-    )
+    num_speculative_steps = int(getattr(model_runner, "num_speculative_steps", 0))
     if (
         pp_handler is None
         or num_speculative_steps == 0
@@ -57,6 +72,9 @@ class HcuGPUModelRunnerV2(GPUModelRunner):
         # lifecycle point without allocating a second manager.
         if not hasattr(self, "pcp_manager"):
             self.pcp_manager = None
+        self._hsl_enabled = False
+        self._hsl_pending = None
+        self._hsl_batch = None
 
     def load_model(self, load_dummy_weights: bool = False) -> None:
         """Load and pack GLM router weights in the worker weights pool."""
@@ -73,9 +91,7 @@ class HcuGPUModelRunnerV2(GPUModelRunner):
     @property
     def pcp_manager_cls(self):
         if self._hcu_pcp_manager_cls is None:
-            self._hcu_pcp_manager_cls = make_hcu_pcp_manager_cls(
-                self.vllm_config
-            )
+            self._hcu_pcp_manager_cls = make_hcu_pcp_manager_cls(self.vllm_config)
         return self._hcu_pcp_manager_cls
 
     def initialize_kv_cache(
@@ -112,6 +128,133 @@ class HcuGPUModelRunnerV2(GPUModelRunner):
             raise RuntimeError(
                 "official MRV2 did not initialize the selected HCU PCP manager"
             )
+        self._init_host_seq_lens()
+
+    # ------------------------------------------------------------------
+    # Host mirror of num_computed_tokens.
+    #
+    # The device value changes in exactly two places on this path:
+    # add_request (exact) and post_update (+= query_len - num_rejected). The
+    # mirror replays both. num_rejected is copied to pinned memory right after
+    # rejection sampling and applied lazily at the next attention metadata
+    # build, so the host waits for the rejection sampler of the previous step
+    # only, while the drafter keeps running. Configurations where the device
+    # value moves in other ways (PP, pooling, adaptive verification
+    # reallocating drafts on the device, PCP/DCP) keep the device read-back.
+    # ------------------------------------------------------------------
+    def _init_host_seq_lens(self) -> None:
+        self._hsl_enabled = (
+            _USE_HOST_SEQ_LENS
+            and is_step5_config(self.vllm_config)
+            and self.pcp_manager is None
+            and not getattr(self, "use_dcp", False)
+            and getattr(self, "pp_handler", None) is None
+            and getattr(self, "pooling_runner", None) is None
+            and getattr(self, "adaptive_verification", None) is None
+        )
+        self._hsl_pending = None
+        self._hsl_batch = None
+        if not self._hsl_enabled:
+            return
+        n = self.max_num_reqs
+        self._hsl_exact = np.zeros(n, dtype=np.int64)
+        # Slots (re)added since the pending correction was recorded: the
+        # device post_update ran before their add_request, so skip them.
+        self._hsl_fresh = np.zeros(n, dtype=bool)
+        pin = torch.cuda.is_available()
+        self._hsl_rejected = torch.zeros(n, dtype=torch.int32, pin_memory=pin)
+        self._hsl_event = torch.cuda.Event() if pin else None
+        self.block_tables.enable_host_mirror()
+        self._hsl_wrap_model_state()
+
+    def _hsl_wrap_model_state(self) -> None:
+        model_state = self.model_state
+        if getattr(model_state, "_vllm_hcu_hsl_wrapped", False):
+            return
+        original_prepare_attn = model_state.prepare_attn
+
+        @functools.wraps(original_prepare_attn)
+        def prepare_attn(input_batch, *args, **kwargs):
+            if input_batch is self._hsl_batch and input_batch.seq_lens_cpu is None:
+                self._hsl_resolve()
+                self._hsl_attach(input_batch)
+            return original_prepare_attn(input_batch, *args, **kwargs)
+
+        model_state.prepare_attn = prepare_attn
+        model_state._vllm_hcu_hsl_wrapped = True
+
+    def _hsl_resolve(self) -> None:
+        pending = self._hsl_pending
+        if pending is not None:
+            self._hsl_pending = None
+            idx, delta, has_rejected = pending
+            if has_rejected:
+                if self._hsl_event is not None:
+                    self._hsl_event.synchronize()
+                delta = delta - self._hsl_rejected.numpy()[: idx.shape[0]]
+            keep = ~self._hsl_fresh[idx]
+            self._hsl_exact[idx[keep]] += delta[keep]
+        self._hsl_fresh[:] = False
+
+    def _hsl_record(self, input_batch, num_rejected) -> None:
+        # One correction per sampled batch; a leftover one is applied first so
+        # the pinned buffer is free to reuse.
+        self._hsl_resolve()
+        n = input_batch.num_reqs
+        query_lens = np.diff(input_batch.query_start_loc_np[: n + 1]).astype(np.int64)
+        has_rejected = input_batch.num_draft_tokens > 0 and num_rejected is not None
+        if has_rejected:
+            self._hsl_rejected[:n].copy_(num_rejected[:n], non_blocking=True)
+            if self._hsl_event is not None:
+                self._hsl_event.record()
+        self._hsl_pending = (
+            input_batch.idx_mapping_np.copy(),
+            query_lens,
+            has_rejected,
+        )
+
+    def _hsl_attach(self, input_batch) -> None:
+        n = input_batch.num_reqs
+        n_pad = input_batch.num_reqs_after_padding
+        idx = input_batch.idx_mapping_np
+        query_lens = np.diff(input_batch.query_start_loc_np[: n + 1])
+        computed = np.zeros(n_pad, dtype=np.int32)
+        seq_lens = np.zeros(n_pad, dtype=np.int32)
+        computed[:n] = self._hsl_exact[idx]
+        seq_lens[:n] = computed[:n] + query_lens
+        if _CHECK_HOST_SEQ_LENS:
+            ref = input_batch.seq_lens[:n_pad].cpu().numpy()
+            if not np.array_equal(ref, seq_lens):
+                bad = np.flatnonzero(ref != seq_lens)
+                logger.error(
+                    "host seq_lens mirror mismatch at rows %s: host %s device %s",
+                    bad.tolist(),
+                    seq_lens[bad].tolist(),
+                    ref[bad].tolist(),
+                )
+                # Resync so a single slip does not persist.
+                self._hsl_exact[idx] = ref[:n] - query_lens
+                seq_lens[:] = ref
+                computed[:n] = ref[:n] - query_lens
+        input_batch.seq_lens_cpu = torch.from_numpy(seq_lens)
+        input_batch.num_computed_tokens_cpu = torch.from_numpy(computed)
+
+    def add_requests(self, scheduler_output) -> None:
+        super().add_requests(scheduler_output)
+        if not self._hsl_enabled:
+            return
+        req_id_to_index = self.req_states.req_id_to_index
+        for new_req_data in scheduler_output.scheduled_new_reqs:
+            req_index = req_id_to_index[new_req_data.req_id]
+            self._hsl_exact[req_index] = new_req_data.num_computed_tokens
+            self._hsl_fresh[req_index] = True
+
+    def sample(self, hidden_states, input_batch, grammar_output):
+        out = super().sample(hidden_states, input_batch, grammar_output)
+        if self._hsl_enabled and input_batch is self._hsl_batch:
+            self._hsl_batch = None
+            self._hsl_record(input_batch, out[2])
+        return out
 
     def prepare_inputs(self, scheduler_output, batch_req_state, batch_desc):
         input_batch = super().prepare_inputs(
@@ -119,6 +262,13 @@ class HcuGPUModelRunnerV2(GPUModelRunner):
             batch_req_state,
             batch_desc,
         )
+        if self._hsl_enabled:
+            # The mirror is resolved lazily in model_state.prepare_attn (see
+            # _hsl_wrap_model_state), so all host work before the metadata
+            # build overlaps the previous step's rejection sampler.
+            input_batch.seq_lens_cpu = None
+            input_batch.num_computed_tokens_cpu = None
+            self._hsl_batch = input_batch
         set_deepep_auto_request_phase(input_batch.is_prefilling_np)
         if is_glm53_pcp(self.vllm_config):
             from vllm_hcu.v1.glm53_pcp import bind_glm53_pcp_batch
@@ -137,24 +287,24 @@ class HcuGPUModelRunnerV2(GPUModelRunner):
             if kwargs.get("dummy_run", False):
                 dummy_scope = replicated_mtp_batch_scope()
         with deepep_auto_request_phase_scope(), scope, dummy_scope:
+            if is_step5_config(getattr(self, "vllm_config", None)):
+                from vllm_hcu.v1.step5_execution import execute_model
+
+                return execute_model(self, *args, **kwargs)
             return super().execute_model(*args, **kwargs)
 
     def profile_run(self) -> None:
-        """Profile PCP with the per-rank token budget plus routing slack."""
+        """Profile PCP target locally; profile MTP at the full global batch.
 
-        pcp_size = int(
-            self.vllm_config.parallel_config.prefill_context_parallel_size
-        )
-        # Upstream profiles the target and MTP prefill from the same dummy
-        # batch. Runtime MTP sampling restores the global PCP batch before
-        # propose(), so shrinking this shared budget would under-profile the
-        # replicated draft prefill even though it is safe for the target.
-        if (
-            pcp_size <= 1
-            or getattr(self, "speculator", None) is not None
-            # GLM5Next KDA and K-pool see the full, replicated token batch.
-            or is_glm53_pcp(self.vllm_config)
-        ):
+        Target prefill is PCP-partitioned, so its MoE/attention workspaces must
+        use the rank-local budget. Runtime MTP restores the global PCP batch
+        before ``propose()``, so draft prefill must still be profiled at the
+        full ``max_num_batched_tokens`` — not divided by PCP.
+        """
+
+        pcp_size = int(self.vllm_config.parallel_config.prefill_context_parallel_size)
+        # GLM5Next KDA and K-pool see the full, replicated token batch.
+        if pcp_size <= 1 or is_glm53_pcp(self.vllm_config):
             return super().profile_run()
 
         original_max = self.max_num_tokens
@@ -163,25 +313,96 @@ class HcuGPUModelRunnerV2(GPUModelRunner):
         # DualChunkSwap segments, so reserve two tokens of per-request layout
         # headroom when that exceeds the decode width. This bounds every
         # rank-local mix while retaining the 12.5% prefill imbalance slack.
-        partitioned_tokens = (
-            (original_max + pcp_size - 1) // pcp_size
-        ) * 9 // 8
+        partitioned_tokens = ((original_max + pcp_size - 1) // pcp_size) * 9 // 8
         replicated_request_tokens = min(
             original_max,
             int(self.max_num_reqs) * max(int(self.decode_query_len), 2),
         )
-        self.max_num_tokens = min(
+        target_budget = min(
             original_max,
             max(1, partitioned_tokens + replicated_request_tokens),
         )
+        speculator = getattr(self, "speculator", None)
+
+        # Pass 1: PCP-aware target profile (exclude MTP propose so it is not
+        # under-profiled at the shrunk batch).
+        self.max_num_tokens = target_budget
+        if speculator is not None:
+            self.speculator = None
         try:
-            return super().profile_run()
+            super().profile_run()
         finally:
+            if speculator is not None:
+                self.speculator = speculator
             self.max_num_tokens = original_max
+
+        if speculator is None:
+            return
+
+        # Pass 2: MTP draft at the full global batch (not /pcp). Stub the
+        # target forward so DeepGEMM workspaces are not inflated by a second
+        # full-batch target MoE profile.
+        self.max_num_tokens = original_max
+        self._hcu_profile_mtp_full_batch = True
+        try:
+            super().profile_run()
+        finally:
+            self._hcu_profile_mtp_full_batch = False
+            self.max_num_tokens = original_max
+
+    def _dummy_run(self, num_tokens, *args, **kwargs):
+        """Optionally stub target forward while sizing full-batch MTP."""
+
+        if not getattr(self, "_hcu_profile_mtp_full_batch", False):
+            return super()._dummy_run(num_tokens, *args, **kwargs)
+
+        real_model = self.model
+        hidden_size = int(self.model_config.get_hidden_size())
+        use_aux = bool(getattr(self, "use_aux_hidden_state_outputs", False))
+        dtype = getattr(self, "dtype", None)
+        if dtype is None:
+            dtype = torch.bfloat16
+        device = self.device
+
+        class _TargetForwardStub:
+            """Keep target attributes, skip heavy MoE/attention compute."""
+
+            def __init__(self, real):
+                object.__setattr__(self, "_real_model", real)
+
+            def __call__(self, *args, **call_kwargs):
+                positions = call_kwargs.get("positions")
+                input_ids = call_kwargs.get("input_ids")
+                if positions is not None:
+                    n = int(positions.shape[0])
+                elif input_ids is not None:
+                    n = int(input_ids.shape[0])
+                else:
+                    n = int(num_tokens)
+                hidden = torch.zeros(
+                    n, hidden_size, dtype=dtype, device=device
+                )
+                if use_aux:
+                    return hidden, []
+                return hidden
+
+            def __getattr__(self, name):
+                return getattr(self._real_model, name)
+
+        self.model = _TargetForwardStub(real_model)
+        try:
+            return super()._dummy_run(num_tokens, *args, **kwargs)
+        finally:
+            self.model = real_model
 
     def prepare_attn(self, input_batch):
         if self.pcp_manager is None:
-            return super().prepare_attn(input_batch)
+            out = super().prepare_attn(input_batch)
+            if self._hsl_enabled and input_batch is self._hsl_batch:
+                input_batch.block_tables_np = self.block_tables.gather_block_tables_np(
+                    input_batch.idx_mapping_np, input_batch.num_reqs_after_padding
+                )
+            return out
         return self.pcp_manager.prepare_attn(input_batch)
 
     def prepare_dummy_attn(self, input_batch, valid_state_slots=False):
@@ -194,9 +415,7 @@ class HcuGPUModelRunnerV2(GPUModelRunner):
                 self.pcp_manager = manager
         if self.pcp_manager is None:
             return super().prepare_dummy_attn(input_batch, valid_state_slots)
-        block_tables = self.block_tables.get_dummy_block_tables(
-            input_batch.num_reqs
-        )
+        block_tables = self.block_tables.get_dummy_block_tables(input_batch.num_reqs)
         if valid_state_slots:
             state_slots = torch.arange(
                 1,
@@ -206,9 +425,7 @@ class HcuGPUModelRunnerV2(GPUModelRunner):
             )
             for block_table in block_tables:
                 block_table[:, 0].copy_(state_slots)
-        slot_mappings = self.pcp_manager.get_dummy_slot_mappings(
-            input_batch.num_tokens
-        )
+        slot_mappings = self.pcp_manager.get_dummy_slot_mappings(input_batch.num_tokens)
         return block_tables, slot_mappings
 
     def sample_tokens(self, grammar_output):
@@ -227,23 +444,17 @@ class HcuGPUModelRunnerV2(GPUModelRunner):
             (
                 restored_hidden_states,
                 restored_input_batch,
-            ) = self.pcp_manager.restore_for_sampling(
-                execute_model_state.hidden_states
-            )
+            ) = self.pcp_manager.restore_for_sampling(execute_model_state.hidden_states)
             execute_model_state = execute_model_state._replace(
                 hidden_states=restored_hidden_states,
                 input_batch=restored_input_batch,
             )
             self.execute_model_state = execute_model_state
         input_batch = (
-            None
-            if execute_model_state is None
-            else execute_model_state.input_batch
+            None if execute_model_state is None else execute_model_state.input_batch
         )
         scope = (
-            replicated_mtp_batch_scope()
-            if use_replicated_mtp_batch
-            else nullcontext()
+            replicated_mtp_batch_scope() if use_replicated_mtp_batch else nullcontext()
         )
         pcp_manager = self.pcp_manager
         record_pp_spec_draft_index_stream(self, input_batch)

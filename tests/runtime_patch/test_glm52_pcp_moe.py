@@ -56,6 +56,8 @@ def test_fallback_moe_forward_shared_satisfies_aot_mutation_contract(
     """The tuple fallback must clone the mutated routed output."""
 
     class Layer:
+        _ep_fused_combine = False
+
         def _forward_impl(self, hidden_states, *_args, **_kwargs):
             hidden_states.add_(1)
             return torch.full_like(hidden_states, 7), hidden_states
@@ -192,6 +194,7 @@ def test_forward_entry_stays_on_official_shared_op_after_reconfiguration(
     monkeypatch.setattr(moe_runner_module.current_platform, "is_tpu", lambda: False)
 
     runner = object.__new__(moe_runner_module.MoERunner)
+    runner._ep_fused_combine = False
     runner.routed_experts = RoutedExperts()
     runner._shared_experts = SharedExperts()
     runner.moe_config = SimpleNamespace(
@@ -259,6 +262,7 @@ def make_runner(
 ):
     def make(pcp: int, use_all2all_kernels: bool):
         runner = object.__new__(moe_runner_module.MoERunner)
+        runner._ep_fused_combine = False
         runner.moe_config = SimpleNamespace(
             pcp_size=pcp,
             dp_size=1,
@@ -327,6 +331,7 @@ def test_shared_and_routed_outputs_keep_local_token_order_before_addition(
     """Reordering either local output before the shared+routed add is a bug."""
 
     runner = object.__new__(moe_runner_module.MoERunner)
+    runner._ep_fused_combine = False
     runner.moe_config = SimpleNamespace(hidden_dim_unpadded=2)
     runner.routed_experts = SimpleNamespace(
         quant_method=SimpleNamespace(has_unpadded_output=False),
@@ -409,6 +414,7 @@ def test_hy4_gate_runs_once_before_runner_dispatch(
 
     runner = object.__new__(moe_runner_module.MoERunner)
     torch.nn.Module.__init__(runner)
+    runner._ep_fused_combine = False
     runner.gate = Gate()
     runner._fse_fuse_gate = False
     runner._shared_experts = None

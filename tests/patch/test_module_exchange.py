@@ -61,8 +61,8 @@ def test_all_exchange_registration_is_exact_lazy_and_idempotent(
     first = register_all_module_exchanges(coordinator)
     second = register_all_module_exchanges(coordinator)
 
-    assert len(first) == len(second) == 8
-    assert len(coordinator.registrations()) == 8
+    assert len(first) == len(second) == 16
+    assert len(coordinator.registrations()) == 16
     assert all(item.status == PatchStatus.ARMED.value for item in first)
     assert builtins.__import__ is original_import
     assert replacements_before == set()
@@ -73,16 +73,16 @@ def test_all_exchange_registration_is_exact_lazy_and_idempotent(
     # Exact lookup only: neither ancestors, descendants, nor unrelated names
     # produce a coordinator spec or resolve any replacement.
     assert coordinator.find_spec("vllm.model_executor.layers", None) is None
-    assert coordinator.find_spec(
-        "vllm.model_executor.layers.linear.unrelated_child", None
-    ) is None
+    assert (
+        coordinator.find_spec("vllm.model_executor.layers.linear.unrelated_child", None)
+        is None
+    )
     assert coordinator.find_spec("unrelated_hcu_module", None) is None
 
 
 def test_exchange_inventory_arms_dependencies_before_canonical_consumers():
     order = {
-        canonical: index
-        for index, (canonical, _) in enumerate(module_exchange_names())
+        canonical: index for index, (canonical, _) in enumerate(module_exchange_names())
     }
     dependencies = {
         "vllm.model_executor.layers.fused_moe.deep_gemm_utils": {
@@ -161,13 +161,9 @@ def test_fused_ple_logs_selected_mode_once(
 
 def test_deep_gemm_replacement_preserves_v0251_warmup_helper():
     repo = Path(__file__).resolve().parents[2]
-    replacement = repo / (
-        "vllm_hcu/model_executor/layers/fused_moe/deep_gemm_utils.py"
-    )
+    replacement = repo / ("vllm_hcu/model_executor/layers/fused_moe/deep_gemm_utils.py")
     tree = ast.parse(replacement.read_text(encoding="utf-8"))
-    functions = {
-        node.name for node in tree.body if isinstance(node, ast.FunctionDef)
-    }
+    functions = {node.name for node in tree.body if isinstance(node, ast.FunctionDef)}
 
     assert "compute_aligned_M_and_alignment" in functions
 
@@ -184,10 +180,8 @@ def test_deep_gemm_replacement_preserves_v0251_warmup_helper():
             "vllm_hcu/model_executor/layers/fused_moe/experts/deep_gemm_moe.py",
         ),
         (
-            "vllm/model_executor/layers/fused_moe/experts/"
-            "batched_deep_gemm_moe.py",
-            "vllm_hcu/model_executor/layers/fused_moe/experts/"
-            "batched_deep_gemm_moe.py",
+            "vllm/model_executor/layers/fused_moe/experts/batched_deep_gemm_moe.py",
+            "vllm_hcu/model_executor/layers/fused_moe/experts/batched_deep_gemm_moe.py",
         ),
     ),
 )
@@ -222,9 +216,7 @@ def test_deep_gemm_replacements_preserve_v0251_surface_and_signatures(
     ):
         assert type(replacement_node) is type(target_node), target_node.name
         if isinstance(target_node, (ast.FunctionDef, ast.AsyncFunctionDef)):
-            assert isinstance(
-                replacement_node, (ast.FunctionDef, ast.AsyncFunctionDef)
-            )
+            assert isinstance(replacement_node, (ast.FunctionDef, ast.AsyncFunctionDef))
             assert ast.dump(
                 replacement_node.args, include_attributes=False
             ) == ast.dump(target_node.args, include_attributes=False), target_node.name
@@ -237,10 +229,23 @@ def test_deep_gemm_replacements_preserve_v0251_surface_and_signatures(
             for node in target_node.body
             if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef))
         ]
+        target_method_names = {node.name for node in target_methods}
         replacement_methods = [
             node
             for node in replacement_node.body
             if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef))
+        ]
+        # HCU may add private helpers; the target's methods must stay intact.
+        helper_names = [
+            node.name
+            for node in replacement_methods
+            if node.name not in target_method_names
+        ]
+        assert all(
+            name.startswith("_") and not name.endswith("__") for name in helper_names
+        ), f"{target_node.name}: non-private additions {helper_names}"
+        replacement_methods = [
+            node for node in replacement_methods if node.name in target_method_names
         ]
         assert [node.name for node in replacement_methods] == [
             node.name for node in target_methods
@@ -250,9 +255,9 @@ def test_deep_gemm_replacements_preserve_v0251_surface_and_signatures(
         ):
             assert ast.dump(
                 replacement_method.args, include_attributes=False
-            ) == ast.dump(
-                target_method.args, include_attributes=False
-            ), f"{target_node.name}.{target_method.name}"
+            ) == ast.dump(target_method.args, include_attributes=False), (
+                f"{target_node.name}.{target_method.name}"
+            )
 
 
 def test_deep_gemm_replacements_keep_target_features_and_scoped_hcu_deltas():
@@ -260,8 +265,7 @@ def test_deep_gemm_replacements_keep_target_features_and_scoped_hcu_deltas():
         "vllm_hcu/model_executor/layers/fused_moe/experts/deep_gemm_moe.py"
     )
     batched_path = REPO_ROOT / (
-        "vllm_hcu/model_executor/layers/fused_moe/experts/"
-        "batched_deep_gemm_moe.py"
+        "vllm_hcu/model_executor/layers/fused_moe/experts/batched_deep_gemm_moe.py"
     )
     utils_path = REPO_ROOT / (
         "vllm_hcu/model_executor/layers/fused_moe/deep_gemm_utils.py"
@@ -326,9 +330,7 @@ def test_linear_replacement_preserves_v0251_stacked_weight_loaders():
     repo = Path(__file__).resolve().parents[2]
     replacement = repo / "vllm_hcu/model_executor/layers/linear.py"
     tree = ast.parse(replacement.read_text(encoding="utf-8"))
-    classes = {
-        node.name: node for node in tree.body if isinstance(node, ast.ClassDef)
-    }
+    classes = {node.name: node for node in tree.body if isinstance(node, ast.ClassDef)}
 
     for class_name in ("MergedColumnParallelLinear", "QKVParallelLinear"):
         method = next(
@@ -372,12 +374,8 @@ def test_linear_replacement_preserves_v0251_minimax_indexer_contract():
         and node.name == "MinimaxM3QKVParallelLinearWithIndexer"
     )
 
-    bases = {
-        node.id for node in cls.bases if isinstance(node, ast.Name)
-    }
-    methods = {
-        node.name for node in cls.body if isinstance(node, ast.FunctionDef)
-    }
+    bases = {node.id for node in cls.bases if isinstance(node, ast.Name)}
+    methods = {node.name for node in cls.body if isinstance(node, ast.FunctionDef)}
     assert "QKVParallelLinear" in bases
     assert {
         "validate_shard_id",
@@ -394,8 +392,7 @@ def test_replacement_consumers_use_canonical_aliases():
         "vllm_hcu/model_executor/layers/fused_moe/experts/deep_gemm_moe.py": {
             "vllm.model_executor.layers.fused_moe.deep_gemm_utils",
         },
-        "vllm_hcu/model_executor/layers/fused_moe/experts/"
-        "dpsk_v4_deep_gemm_moe.py": {
+        "vllm_hcu/model_executor/layers/fused_moe/experts/dpsk_v4_deep_gemm_moe.py": {
             "vllm.model_executor.layers.fused_moe.deep_gemm_utils",
         },
         "vllm_hcu/models/deepseek_v2.py": {
@@ -417,28 +414,27 @@ def test_replacement_consumers_use_canonical_aliases():
             for alias in node.names
         )
         assert expected <= imported
-        assert not {
-            replacement_by_canonical[canonical]
-            for canonical in expected
-            if canonical in replacement_by_canonical
-        } & imported
+        assert (
+            not {
+                replacement_by_canonical[canonical]
+                for canonical in expected
+                if canonical in replacement_by_canonical
+            }
+            & imported
+        )
 
 
 def test_deepep_auto_does_not_restore_removed_expected_m_interface():
     path = REPO_ROOT / (
-        "vllm_hcu/model_executor/layers/fused_moe/experts/"
-        "dpsk_v4_deep_gemm_moe.py"
+        "vllm_hcu/model_executor/layers/fused_moe/experts/dpsk_v4_deep_gemm_moe.py"
     )
     tree = ast.parse(path.read_text(encoding="utf-8"))
     cls = next(
         node
         for node in tree.body
-        if isinstance(node, ast.ClassDef)
-        and node.name == "DeepEPAutoDeepGemmExperts"
+        if isinstance(node, ast.ClassDef) and node.name == "DeepEPAutoDeepGemmExperts"
     )
-    methods = {
-        node.name for node in cls.body if isinstance(node, ast.FunctionDef)
-    }
+    methods = {node.name for node in cls.body if isinstance(node, ast.FunctionDef)}
     attributes = {
         node.attr for node in ast.walk(cls) if isinstance(node, ast.Attribute)
     }
@@ -486,20 +482,17 @@ def test_v0251_native_hcu_deepseek_v4_uses_narrow_mtp_loader_adapter():
         "vllm.v1.attention.ops.deepseek_v4_ops.fused_compress_quant_cache",
     }.isdisjoint(exchanges)
 
-    hcu_registry = (
-        REPO_ROOT / "vllm_hcu/models/__init__.py"
-    ).read_text(encoding="utf-8")
+    hcu_registry = (REPO_ROOT / "vllm_hcu/models/__init__.py").read_text(
+        encoding="utf-8"
+    )
     assert '"DeepseekV4ForCausalLM"' not in hcu_registry
     assert '"DeepSeekV4MTPModel"' in hcu_registry
-    assert (
-        '"vllm_hcu.models.deepseek_v4_mtp_compat:DeepSeekV4MTP"'
-        in hcu_registry
-    )
+    assert "deepseek_v4_mtp_compat:DeepSeekV4MTP" in hcu_registry
 
     target_registry_tree = ast.parse(
-        (
-            TARGET_VLLM_ROOT / "vllm/model_executor/models/registry.py"
-        ).read_text(encoding="utf-8")
+        (TARGET_VLLM_ROOT / "vllm/model_executor/models/registry.py").read_text(
+            encoding="utf-8"
+        )
     )
 
     def registry_value(table_name: str, architecture: str) -> tuple[str, str]:
@@ -532,9 +525,9 @@ def test_v0251_native_hcu_deepseek_v4_uses_narrow_mtp_loader_adapter():
     )
 
     native_entry_tree = ast.parse(
-        (
-            TARGET_VLLM_ROOT / "vllm/models/deepseek_v4/__init__.py"
-        ).read_text(encoding="utf-8")
+        (TARGET_VLLM_ROOT / "vllm/models/deepseek_v4/__init__.py").read_text(
+            encoding="utf-8"
+        )
     )
     platform_branch = next(
         node
@@ -565,16 +558,14 @@ def test_aiter_replacement_preserves_v0251_public_method_surface_and_ar_lifecycl
         return next(
             node
             for node in tree.body
-            if isinstance(node, ast.ClassDef)
-            and node.name == "rocm_aiter_ops"
+            if isinstance(node, ast.ClassDef) and node.name == "rocm_aiter_ops"
         )
 
     def public_methods(cls: ast.ClassDef) -> dict[str, ast.FunctionDef]:
         return {
             node.name: node
             for node in cls.body
-            if isinstance(node, ast.FunctionDef)
-            and not node.name.startswith("_")
+            if isinstance(node, ast.FunctionDef) and not node.name.startswith("_")
         }
 
     target_class = aiter_class(target_path)
@@ -690,9 +681,7 @@ def test_sparse_replacements_preserve_v0251_definition_surface_and_signatures(
     target_definitions = definitions(target_tree)
     replacement_definitions = definitions(replacement_tree)
     assert target_definitions.keys() <= replacement_definitions.keys()
-    hcu_owned_definitions = set(replacement_definitions).difference(
-        target_definitions
-    )
+    hcu_owned_definitions = set(replacement_definitions).difference(target_definitions)
     if replacement_relative.endswith("sparse_attn_indexer.py"):
         assert hcu_owned_definitions == {"V32SparseAttnIndexer"}
     else:
@@ -702,9 +691,7 @@ def test_sparse_replacements_preserve_v0251_definition_surface_and_signatures(
         replacement_node = replacement_definitions[name]
         assert type(replacement_node) is type(target_node), name
         if isinstance(target_node, (ast.FunctionDef, ast.AsyncFunctionDef)):
-            assert isinstance(
-                replacement_node, (ast.FunctionDef, ast.AsyncFunctionDef)
-            )
+            assert isinstance(replacement_node, (ast.FunctionDef, ast.AsyncFunctionDef))
             assert ast.dump(
                 replacement_node.args, include_attributes=False
             ) == ast.dump(target_node.args, include_attributes=False), name
@@ -752,17 +739,16 @@ def test_sparse_replacements_keep_reviewed_hcu_deltas():
         "from vllm_hcu.v1.attention.ops.flashmla import "
         "FlashMLASchedMeta, get_mla_metadata" in sparse_swa_source
     )
-    build_tile_scheduler = sparse_swa_source.split(
-        "    def build_tile_scheduler(", 1
-    )[1].split("    def _build_deepseek_v4_metadata(", 1)[0]
+    build_tile_scheduler = sparse_swa_source.split("    def build_tile_scheduler(", 1)[
+        1
+    ].split("    def _build_deepseek_v4_metadata(", 1)[0]
     assert "current_platform.is_rocm()" not in build_tile_scheduler
     assert "current_platform.is_xpu()" in build_tile_scheduler
     sparse_swa_tree = ast.parse(sparse_swa_source)
     backend_class = next(
         node
         for node in sparse_swa_tree.body
-        if isinstance(node, ast.ClassDef)
-        and node.name == "DeepseekSparseSWABackend"
+        if isinstance(node, ast.ClassDef) and node.name == "DeepseekSparseSWABackend"
     )
     get_builder_cls = next(
         node

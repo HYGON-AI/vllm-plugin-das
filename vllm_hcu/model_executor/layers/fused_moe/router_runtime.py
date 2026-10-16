@@ -10,6 +10,9 @@ from .lightop_routing import (
 )
 
 
+STATIC_PRIMARY_REPLICA_COUNT = "_vllm_hcu_static_primary_replica_count"
+
+
 def eplb_map_to_physical_and_record(
     module,
     original,
@@ -210,4 +213,8 @@ def make_hcu_grouped_topk_router(base_class):
     return HcuGroupedTopKRouter
 
 
-__all__ = ["eplb_map_to_physical_and_record", "make_hcu_grouped_topk_router"]
+__all__ = [
+    "STATIC_PRIMARY_REPLICA_COUNT",
+    "eplb_map_to_physical_and_record",
+    "make_hcu_grouped_topk_router",
+]

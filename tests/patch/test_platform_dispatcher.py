@@ -31,11 +31,9 @@ else:
         )
     TARGET_VLLM_ROOT = Path(_vllm_spec.origin).resolve().parents[1]
 if not (TARGET_VLLM_ROOT / "vllm" / "__init__.py").is_file():
-    raise RuntimeError(
-        f"VLLM_TARGET_ROOT does not contain vllm: {TARGET_VLLM_ROOT}"
-    )
+    raise RuntimeError(f"VLLM_TARGET_ROOT does not contain vllm: {TARGET_VLLM_ROOT}")
 
-_TARGET_SOURCE_ASSERTION = r'''
+_TARGET_SOURCE_ASSERTION = r"""
 import os as _vllm_hcu_os
 from pathlib import Path as _VllmHcuPath
 import vllm as _vllm_hcu_target
@@ -44,12 +42,10 @@ _vllm_hcu_file = _VllmHcuPath(_vllm_hcu_target.__file__).resolve()
 assert _vllm_hcu_file.is_relative_to(_vllm_hcu_root), (
     f"vllm resolved outside target root: {_vllm_hcu_file} not under {_vllm_hcu_root}"
 )
-'''
+"""
 
 
-def _run_fresh(
-    code: str, *, timeout: int = 120
-) -> subprocess.CompletedProcess[str]:
+def _run_fresh(code: str, *, timeout: int = 120) -> subprocess.CompletedProcess[str]:
     env = dict(os.environ)
     env["VLLM_PLUGINS"] = "__disabled__"
     env["VLLM_TARGET_ROOT"] = str(TARGET_VLLM_ROOT)
@@ -74,6 +70,7 @@ def test_target_root_is_installed_vllm():
 
 def test_platform_core_inventory_is_explicit_and_ordered():
     assert platform_core_callback_names() == (
+        ("platform.core_fix.deep_gemm_foundation", "vllm.utils.deep_gemm"),
         ("platform.core_fix.envs", "vllm.envs"),
         ("platform.core_fix.engram_config.hcu", "vllm.config.engram"),
         ("platform.core_fix.import_utils.deep_gemm", "vllm.utils.import_utils"),
@@ -107,6 +104,13 @@ def test_platform_core_inventory_is_explicit_and_ordered():
             "platform.core_fix.hy_v3_tool_parser",
             "vllm.tool_parsers.hy_v3_tool_parser",
         ),
+        ("platform.core_fix.step5_envs", "vllm.envs"),
+        ("platform.core_fix.step5_config_exports", "vllm.transformers_utils.configs"),
+        ("platform.core_fix.step5_config_registry", "vllm.transformers_utils.config"),
+        ("platform.core_fix.step5_speculative_config", "vllm.config.speculative"),
+        ("platform.core_fix.step5_splitting_ops", "vllm.config.compilation"),
+        ("platform.core_fix.step5_compile_prefix", "vllm.compilation.decorators"),
+        ("platform.core_fix.step5_ep_graph_capture", "vllm.distributed.parallel_state"),
     )
 
 
@@ -394,9 +398,9 @@ def test_apply_platform_patches_is_idempotent_narrow_and_reported():
     assert result.returncode == 0, result.stderr
     payload = json.loads(result.stdout.strip().splitlines()[-1])
     assert payload == {
-        "count": 49,
-        "replacements": 12,
-        "callbacks": 37,
+        "count": 65,
+        "replacements": 20,
+        "callbacks": 45,
         "failed": [],
         "builtins_same": True,
         "role": "Main",

@@ -31,7 +31,6 @@ TARGETS = (
     f"{TARGET_MODULE}.VllmConfig._maybe_enable_breakable_cudagraph",
 )
 _MARKER = "_vllm_hcu_feature_config_patch_applied"
-_GLM_DSA_ARCHITECTURE = "GlmMoeDsaForCausalLM"
 _HCU_BREAKABLE_CUDAGRAPH_ARCHITECTURES = frozenset(
     {
         "HYV4ForCausalLM",
@@ -54,16 +53,6 @@ _REQUEST_CAPTURE_SIZES = (
     *range(40, 65, 4),
     *range(72, 257, 8),
 )
-
-
-def _normalize_hcu_model_runner(model_config: object) -> None:
-    """Keep HCU-supported GLM DSA on the plugin's MRV2-only worker."""
-    architectures = getattr(model_config, "architectures", ()) or ()
-    if (
-        _GLM_DSA_ARCHITECTURE in architectures
-        and "VLLM_USE_V2_MODEL_RUNNER" not in os.environ
-    ):
-        os.environ["VLLM_USE_V2_MODEL_RUNNER"] = "1"
 
 
 def _normalize_dspark_draft_deepep_topology(
@@ -239,11 +228,21 @@ def _require_hy4_pcp8_contract(vllm_config: object) -> None:
         raise ValueError(
             "HY V4 PCP8 requires the FLASHMLA_SPARSE attention backend."
         )
-    if os.environ.get(
-        "VLLM_HCU_ENABLE_LINEAR_GATE_PCP_SHARD", "0"
-    ).strip().lower() not in ("1", "true", "yes", "on"):
+    from vllm_hcu.platforms import envs as hcu_envs
+
+    gate_shard_enabled = hcu_envs.linear_gate_pcp_shard_enabled(
+        tp_size=int(parallel_config.tensor_parallel_size),
+        pcp_size=int(parallel_config.prefill_context_parallel_size),
+        pp_size=int(parallel_config.pipeline_parallel_size),
+    )
+    if not gate_shard_enabled:
+        if not hcu_envs.custom_ops_enabled():
+            raise ValueError(
+                "HY V4 PCP8 requires effective linear_gate PCP sharding, "
+                "but VLLM_HCU_USE_CUSTOM_OPS=0 disables it."
+            )
         raise ValueError(
-            "HY V4 PCP8 requires "
+            "HY V4 PCP8 requires effective linear_gate PCP sharding; set "
             "VLLM_HCU_ENABLE_LINEAR_GATE_PCP_SHARD=1 to avoid replicated "
             "linear_gate weights exhausting KV-cache memory."
         )
@@ -516,8 +515,6 @@ def _validate_dspark_pd_scope(vllm_config: object) -> None:
 
 def validate_and_update_hcu_config(vllm_config: object) -> HcuFeatureConfig:
     """Validate cross-config invariants and bind the compilation adapter."""
-
-    _normalize_hcu_model_runner(vllm_config.model_config)
 
     _validate_hcu_pcp_scope(vllm_config)
     from vllm_hcu.models.hy_v4.dcp_config import validate_hy4_dcp_config
