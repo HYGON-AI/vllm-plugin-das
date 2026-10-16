@@ -79,7 +79,13 @@ def apply_to_module(module: ModuleType) -> bool:
     orig_gqm = config_cls.get_quant_method
 
     def _hcu_w8a16_get_quant_method(self, layer, prefix=""):
-        if type(layer).__name__ == "RoutedExperts":
+        # Mirror upstream's exclusion check FIRST: a checkpoint that
+        # excludes an MoE layer from quantization must keep its experts on
+        # the unquantized path even when the config's global algo is W8A16.
+        if (
+            type(layer).__name__ == "RoutedExperts"
+            and not self.is_layer_excluded(prefix)
+        ):
             algo = getattr(self, "quant_method", None)
             if algo is None and hasattr(self, "_resolve_quant_algo"):
                 algo = self._resolve_quant_algo(prefix)

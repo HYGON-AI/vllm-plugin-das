@@ -36,6 +36,70 @@ _GET_WEIGHTS_MARKER = "_vllm_hcu_moe_layer_get_weights"
 _LOAD_WEIGHTS_MARKER = "_vllm_hcu_moe_layer_load_weights"
 
 
+def _load_per_expert_channel_scale(self, expert_name, loaded_weight):
+    """Load per-expert 1-D channel scales for ModelOpt int8wo checkpoints.
+
+    The stock RoutedExperts ModelOpt branch treats every ``weight_scale``
+    as a per-tensor scalar (``reshape(())``), but ModelOpt W8A16 expert
+    scales are per-channel vectors. The HCU W8A16 MoE method creates
+    per-channel slots (``w13_weight_scale`` [E, 2, inter_local],
+    ``w2_weight_scale`` [E, hidden_local]); write the TP slices directly
+    and leave the stock path for everything else.
+    """
+    if loaded_weight.ndim != 1 or "scale" not in expert_name:
+        return None
+    qual_name = f"{self.layer_name}.{expert_name}"
+    tp_rank = self.moe_config.tp_rank
+    tp_size = self.moe_config.tp_size
+    # get_expert_mapping() yields GLOBAL checkpoint expert ids; map to
+    # this rank's local slot (EP-aware) and skip non-local experts so
+    # the stock loader stays authoritative for them.
+    _mapper = getattr(
+        self, "_map_global_expert_id_to_local_expert_id", None)
+    for param_name, checkpoint_name, expert_id, shard_id in (
+        self.get_expert_mapping()
+    ):
+        if checkpoint_name not in qual_name:
+            continue
+        if _mapper is not None:
+            expert_id = _mapper(expert_id)
+            if expert_id == -1:
+                return None
+        local_name = (
+            qual_name.replace(checkpoint_name, param_name)
+            .removeprefix(f"{self.layer_name}.")
+        )
+        if shard_id in ("w1", "w3"):
+            if local_name != "w13_weight_scale":
+                return None
+            param = self.w13_weight_scale
+            if param.ndim != 3:
+                return None
+            local = param.shape[-1]
+            if loaded_weight.numel() != local * tp_size:
+                return None
+            start = tp_rank * local
+            param.data[expert_id, 0 if shard_id == "w1" else 1] = (
+                loaded_weight[start:start + local].to(param.dtype)
+            )
+        elif shard_id == "w2":
+            if local_name != "w2_weight_scale":
+                return None
+            param = self.w2_weight_scale
+            if param.ndim != 2:
+                return None
+            # w2's TP shard is on the INPUT (intermediate) dim; its
+            # per-output-channel scale stays full-length hidden_size on
+            # every rank — copy it whole, never slice by tp_rank.
+            if loaded_weight.numel() != param.shape[-1]:
+                return None
+            param.data[expert_id] = loaded_weight.to(param.dtype)
+        else:
+            return None
+        return [local_name]
+    return None
+
+
 def apply_to_module(module: ModuleType) -> bool:
     target = load_exact_module(TARGET_MODULE, module)
     layer_module = load_exact_module(
@@ -266,61 +330,6 @@ def apply_to_module(module: ModuleType) -> bool:
                     loaded_names.append(local_name)
         return loaded_names
 
-    def _load_per_expert_channel_scale(self, expert_name, loaded_weight):
-        """Load per-expert 1-D channel scales for ModelOpt int8wo checkpoints.
-
-        The stock RoutedExperts ModelOpt branch treats every ``weight_scale``
-        as a per-tensor scalar (``reshape(())``), but ModelOpt W8A16 expert
-        scales are per-channel vectors. The HCU W8A16 MoE method creates
-        per-channel slots (``w13_weight_scale`` [E, 2, inter_local],
-        ``w2_weight_scale`` [E, hidden_local]); write the TP slices directly
-        and leave the stock path for everything else.
-        """
-        if loaded_weight.ndim != 1 or "scale" not in expert_name:
-            return None
-        qual_name = f"{self.layer_name}.{expert_name}"
-        tp_rank = self.moe_config.tp_rank
-        tp_size = self.moe_config.tp_size
-        for param_name, checkpoint_name, expert_id, shard_id in (
-            self.get_expert_mapping()
-        ):
-            if checkpoint_name not in qual_name:
-                continue
-            local_name = (
-                qual_name.replace(checkpoint_name, param_name)
-                .removeprefix(f"{self.layer_name}.")
-            )
-            if shard_id in ("w1", "w3"):
-                if local_name != "w13_weight_scale":
-                    return None
-                param = self.w13_weight_scale
-                if param.ndim != 3:
-                    return None
-                local = param.shape[-1]
-                if loaded_weight.numel() != local * tp_size:
-                    return None
-                start = tp_rank * local
-                param.data[expert_id, 0 if shard_id == "w1" else 1] = (
-                    loaded_weight[start:start + local].to(param.dtype)
-                )
-            elif shard_id == "w2":
-                if local_name != "w2_weight_scale":
-                    return None
-                param = self.w2_weight_scale
-                if param.ndim != 2:
-                    return None
-                local = param.shape[-1]
-                if loaded_weight.numel() != local * tp_size:
-                    return None
-                start = tp_rank * local
-                param.data[expert_id] = (
-                    loaded_weight[start:start + local].to(param.dtype)
-                )
-            else:
-                return None
-            return [local_name]
-        return None
-
     @functools.wraps(load_weights)
     def hcu_load_weights(self, weights):
         for expert_name, loaded_weight in weights:
@@ -368,3 +377,7 @@ def apply(module: ModuleType | None = None) -> bool:
 
 
 __all__ = ["PATCH_ID", "TARGET_MODULE", "TARGETS", "apply", "apply_to_module"]
+
+
+# Test hook for CPU loader tests.
+_TEST_load_per_expert_channel_scale = _load_per_expert_channel_scale
