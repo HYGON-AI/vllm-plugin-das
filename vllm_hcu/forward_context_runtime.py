@@ -72,6 +72,16 @@ def choose_deepep_auto_low_latency(
 
     if not get_hcu_config(vllm_config).deepep_auto:
         return False
+    # KVConnector creates rank-local contexts for control work without a model
+    # forward. Joining DP here would collide with other ranks' next batch sync.
+    # A zero-token rank in a real DP forward must still participate below.
+    if (
+        num_tokens is None
+        and num_tokens_across_dp is None
+        and batch_descriptor is None
+        and attn_metadata is None
+    ):
+        return False
     from vllm_hcu.model_executor.layers.fused_moe.prepare_finalize.deepep_auto import (
         dspark_mooncake_pd_use_low_latency,
     )
