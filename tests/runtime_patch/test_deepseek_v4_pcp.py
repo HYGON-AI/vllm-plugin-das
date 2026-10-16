@@ -322,7 +322,9 @@ def test_native_pcp_matches_global_attention_and_keeps_local_projections(
             owned, _ = patch_batch().local_query_rows(decode_tokens, global_batch.num_tokens)
         valid = ~local_batches[rank].is_padding
         torch.testing.assert_close(actual[valid], _select(manager, expected)[valid])
-        assert calls == [local_batches[rank].num_tokens_after_padding] * 6
+        expected_calls = ([local_batches[rank].num_tokens_after_padding] * 6
+                          if manager._global_has_prefill else [])
+        assert calls == expected_calls
         assert ("projections", actual.shape[0]) in events
         assert ("output", actual.shape[0]) in events
         assert sum(count for name, count in events if name == "sparse") == owned.numel()
@@ -683,3 +685,110 @@ def test_local_query_capability_gate(monkeypatch, pure_prefill, available, enabl
     )
     monkeypatch.setenv("VLLM_HCU_USE_CUSTOM_OPS", "0")
     assert not patch._can_use_local_queries(layer, batch)
+
+
+@pytest.mark.parametrize("pcp_size", [2, 4, 8])
+@pytest.mark.parametrize("num_requests", [1, 3, 9])
+@pytest.mark.parametrize("with_indexer", [False, True])
+@pytest.mark.parametrize("local_queries", [False, True])
+def test_replicated_decode_raw_kv_forward_never_gathers(
+    native_attention, monkeypatch, pcp_size, num_requests, with_indexer,
+    local_queries,
+):
+    import ast
+    from pathlib import Path
+
+    from vllm_hcu.patch.worker.core_fix import patch_deepseek_v4_attention
+    from vllm_hcu.platforms import envs as henvs
+    from vllm_hcu.model_executor.layers.attention.pcp import in_replicated_mtp_batch
+    from vllm_hcu.v1.glm53_pcp import _current_pcp_batch
+
+    # Retain the actual HCU raw-KV forward; only projection/norm/attention
+    # arithmetic and collective device boundaries are replaced below.
+    source = ast.parse(Path(patch_deepseek_v4_attention.__file__).read_text())
+    forward = next(node for node in ast.walk(source)
+                   if isinstance(node, ast.FunctionDef)
+                   and node.name == "hcu_attention_forward")
+    forward.decorator_list = []
+    namespace = {"torch": torch}
+    exec(compile(ast.Module(body=[forward], type_ignores=[]),
+                 patch_deepseek_v4_attention.__file__, "exec"), namespace)
+
+    Attention, _, rocm = native_attention
+    attention_module = sys.modules["vllm.models.deepseek_v4.attention"]
+    Indexer = attention_module.DeepseekV4Indexer
+    monkeypatch.setattr(Indexer, "_wq_b_proj", Indexer._wq_b_proj.__wrapped__)
+
+    class DecodeAttention(Attention):
+        _vllm_hcu_deepseek_v4_pcp_applied = False
+        forward = namespace["hcu_attention_forward"]
+        _wq_b_proj = Attention._wq_b_proj.__wrapped__
+        _o_proj = Attention._o_proj.__wrapped__
+        _forward_prefill = Attention._forward_prefill.__wrapped__
+        _fused_qnorm_rope_kv_insert = Attention._fused_qnorm_rope_kv_insert.__wrapped__
+        forward_mqa = Attention.forward_mqa.__wrapped__
+        head_dim = q_lora_rank = 2
+        n_local_heads = padded_heads = 1
+        q_norm = staticmethod(lambda qr: qr)
+
+        def _run_parallel_input_projections(self, hidden_states):
+            projected = torch.cat((hidden_states * 2, hidden_states * 3), -1)
+            if with_indexer:
+                return projected, hidden_states * 4, hidden_states * 5, hidden_states * 6
+            return projected, None, None, None
+
+        def _prepare_and_attn_fn(self, hidden, qr, kv, qr_scale, kv_score,
+                                 indexer_kv_score, weights, positions, output):
+            assert effective_pcp_world_size(pcp_size) == 1
+            assert in_replicated_mtp_batch()
+            assert _current_pcp_batch() is None
+            assert hidden.shape[0] == positions.numel() == num_requests
+            q = self._wq_b_proj(qr, qr_scale)
+            value = q + kv
+            if with_indexer:
+                torch.testing.assert_close(kv_score, hidden * 4)
+                torch.testing.assert_close(indexer_kv_score, hidden * 5)
+                torch.testing.assert_close(weights, hidden * 6)
+                value = value + Indexer()._wq_b_proj(qr, qr_scale)
+            output.copy_(value[:, None, :])
+
+    monkeypatch.setattr(rocm, "DeepseekV4ROCMAiterMLAAttention", DecodeAttention)
+    monkeypatch.setattr(rocm, "rocm_sparse_attn_prefill",
+                        rocm.rocm_sparse_attn_prefill.__wrapped__)
+    monkeypatch.setattr(henvs, "VLLM_HCU_DEEPSEEK_V4_PCP_LOCAL_QUERIES", local_queries)
+    assert patch.apply_to_module(rocm)
+
+    def unexpected_gather(*args, **kwargs):
+        pytest.fail("replicated decode must not issue attention PCP all-gathers")
+
+    managers, groups = _make_managers(pcp_size)
+    for group in groups:
+        monkeypatch.setattr(group, "all_gather", unexpected_gather)
+    # Reuse the managers across decode steps with new values to detect stale
+    # inputs, and add model-input padding beyond the valid global token count.
+    for step in range(2):
+        batch = _make_batch([
+            (f"d{idx}", [step * 100 + idx + 1], 30 + step, False)
+            for idx in range(num_requests)
+        ], pad_to=num_requests + 3)
+        full_hidden = batch.input_ids[:num_requests, None].float().repeat(1, 2)
+        expected = ((full_hidden * 7 + 14) if with_indexer
+                    else (full_hidden * 5 + 7)) * 11
+        layer = DecodeAttention()
+        with replicated_mtp_batch_scope():
+            reference = layer.forward(batch.positions[:num_requests], full_hidden)
+        torch.testing.assert_close(reference, expected)
+        for manager in managers:
+            local = manager.partition_batch(batch, padded_num_tokens=num_requests + 3)
+            assert not manager._global_has_prefill
+            with glm53_pcp_step_scope():
+                bind_glm53_pcp_batch(manager, local)
+                actual = layer.forward(local.positions, _select(manager, full_hidden))
+            assert actual.shape[0] == local.num_tokens_after_padding
+            assert int(local.is_padding.sum()) == 3
+            torch.testing.assert_close(actual, _select(manager, expected))
+            torch.testing.assert_close(actual[~local.is_padding], reference)
+            assert patch.current_pcp_batch() is None
+            assert patch._LOCAL_QUERIES.get() is None
+            assert not in_replicated_mtp_batch()
+            assert effective_pcp_world_size(pcp_size) == pcp_size

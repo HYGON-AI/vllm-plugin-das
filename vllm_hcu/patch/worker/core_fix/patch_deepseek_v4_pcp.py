@@ -221,11 +221,26 @@ def apply_to_module(module: ModuleType) -> bool:
         batch = _current_pcp_batch()
         if batch is None:
             return originals["forward"](self, positions, hidden_states, llama_4_scaling)
-        token = _ATTENTION_BATCH.set(batch)
+        replicated_decode = not batch.manager._global_has_prefill
+        # Pure decode already has identical, globally ordered rows on every
+        # PCP peer. Hide the partition from projection/indexer wrappers so
+        # they do not gather those replicated inputs again.
+        token = _ATTENTION_BATCH.set(None if replicated_decode else batch)
         local_token = _LOCAL_QUERIES.set(
-            batch if _can_use_local_queries(self, batch) else None
+            batch if not replicated_decode and _can_use_local_queries(self, batch)
+            else None
         )
         try:
+            if replicated_decode:
+                num_tokens = batch.global_batch.num_tokens
+                with replicated_mtp_batch_scope():
+                    output = originals["forward"](
+                        self, batch.global_batch.positions[:num_tokens],
+                        hidden_states[:num_tokens], llama_4_scaling,
+                    )
+                # Native attention sees only valid rows. Restore the caller's
+                # padded layout once, after all native output projections.
+                return batch.localize(output)
             if local_queries_enabled(batch):
                 return local_query_forward(self, batch, positions, hidden_states)
             full_hidden = batch.gather(hidden_states)
