@@ -33,10 +33,14 @@ class SituAndMul(nn.Module):
             return output
 
         gate, up = x.chunk(2, dim=-1)
+        # Match the native reference: preserve small sigmoid values until the
+        # final multiply, before rounding the result back to the input dtype.
+        gate = gate.float()
+        up = up.float()
         gate = self.beta * torch.tanh(gate / self.beta) * torch.sigmoid(gate)
         if self.linear_beta is not None:
             up = self.linear_beta * torch.tanh(up / self.linear_beta)
-        return gate * up
+        return (gate * up).to(x.dtype)
 
 
 __all__ = ["SituAndMul"]

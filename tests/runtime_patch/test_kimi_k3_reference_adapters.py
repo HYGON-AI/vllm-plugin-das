@@ -267,3 +267,48 @@ def test_situ_master_switch_avoids_device_kernel_for_cuda_dispatch(monkeypatch):
     gate, up = x.chunk(2, dim=-1)
     expected = 1.25 * torch.tanh(gate / 1.25) * torch.sigmoid(gate) * 2 * torch.tanh(up / 2)
     torch.testing.assert_close(actual, expected)
+
+
+def test_situ_fallback_preserves_fp16_output_after_small_sigmoid(monkeypatch):
+    from vllm.model_executor.layers.activation import SituAndMul as NativeSitu
+
+    monkeypatch.setenv("VLLM_HCU_USE_CUSTOM_OPS", "0")
+    activation = SituAndMul()
+    x = torch.tensor([[-18.0, 8192.0]], dtype=torch.float16)
+    expected = NativeSitu.forward_native(activation, x)
+    assert expected.item() != 0.0
+    torch.testing.assert_close(activation(x), expected, rtol=0, atol=0)
+
+
+@pytest.mark.parametrize("dtype", [torch.float16, torch.bfloat16, torch.float32])
+@pytest.mark.parametrize("beta,linear_beta", [(1.0, None), (1.25, 2.0), (0.5, 8192.0)])
+@pytest.mark.parametrize("strided", [False, True])
+def test_situ_fallback_matches_native_dynamic_range(
+    monkeypatch, dtype, beta, linear_beta, strided
+):
+    from vllm.model_executor.layers.activation import SituAndMul as NativeSitu
+
+    monkeypatch.setenv("VLLM_HCU_USE_CUSTOM_OPS", "0")
+    values = torch.tensor(
+        [
+            [-18.0, 8192.0],
+            [-20.0, 65504.0],
+            [-8.0, 6.0],
+            [8.0, 2048.0],
+            [0.0, 1.0],
+            [1e-4, 1e-4],
+            [-1e-4, -1e-4],
+        ],
+        dtype=dtype,
+    )
+    if strided:
+        storage = torch.empty((values.shape[0], 4), dtype=dtype)
+        storage[:, ::2] = values
+        values = storage[:, ::2]
+        assert not values.is_contiguous()
+    activation = SituAndMul(beta, linear_beta)
+    expected = NativeSitu.forward_native(activation, values)
+    actual = activation(values)
+    assert actual.dtype == dtype
+    assert actual.shape == expected.shape
+    torch.testing.assert_close(actual, expected, rtol=0, atol=0)
