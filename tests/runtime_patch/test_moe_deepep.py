@@ -2865,8 +2865,11 @@ def test_moe_align_ep_remap_rejects_uninitialized_buffer_ids(
     assert count.item() == 2
 
 
+@pytest.mark.parametrize("architecture", [
+    "DeepseekV4ForCausalLM", "DeepSeekV4MTPModel",
+])
 def test_fp8_oracle_sidecar_selection_and_format_contract(
-    monkeypatch: pytest.MonkeyPatch,
+    monkeypatch: pytest.MonkeyPatch, architecture: str,
 ):
     auto_kernel_calls: list[tuple[object, object, object]] = []
 
@@ -3009,7 +3012,7 @@ def test_fp8_oracle_sidecar_selection_and_format_contract(
         moe_parallel_config=SimpleNamespace(use_batched_activation_format=False),
         _hcu_vllm_config=SimpleNamespace(
             model_config=SimpleNamespace(
-                architectures=["DeepseekV4ForCausalLM"],
+                architectures=[architecture],
             ),
         ),
     )
@@ -6024,3 +6027,24 @@ def test_importing_adapters_does_not_eager_import_optional_moe_stacks():
         importlib.reload(adapter)
     for name in optional:
         assert sys.modules.get(name) is before[name]
+
+
+@pytest.mark.parametrize("pcp", [2, 8])
+def test_deepep_auto_uses_internal_dispatch_for_pcp_without_dp(monkeypatch, pcp):
+    import vllm.config
+
+    monkeypatch.setattr(vllm.config, "get_current_vllm_config_or_none", lambda: None)
+    module = _fake_config_module()
+    patch_config.apply_to_module(module)
+    upstream = SimpleNamespace(
+        all2all_backend="deepep_low_latency", enable_expert_parallel=True,
+        _vllm_hcu_deepep_auto=True,
+    )
+    parallel = module.FusedMoEParallelConfig.make(1, pcp, 1, 1, upstream)
+    parallel.is_sequence_parallel = False
+    assert parallel.use_all2all_kernels
+    assert parallel.use_deepep_auto_kernels
+    assert parallel.use_batched_activation_format
+    parallel.use_ep = False
+    assert not parallel.use_all2all_kernels
+    assert not parallel.use_deepep_auto_kernels

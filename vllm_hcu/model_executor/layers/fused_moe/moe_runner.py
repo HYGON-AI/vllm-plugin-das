@@ -7,7 +7,7 @@
 import inspect
 import os
 from collections.abc import Callable, Iterable
-from contextlib import nullcontext
+from contextlib import contextmanager, nullcontext
 from typing import TYPE_CHECKING
 
 import torch
@@ -1067,6 +1067,32 @@ class MoERunner(MoERunnerInterface):
 
         return hidden_states, router_logits
 
+    @contextmanager
+    def _pcp_routing_inputs(self, input_ids, num_local_tokens):
+        """Match routing auxiliaries to the fallback PCP dispatch ordering."""
+        if not (
+            self.moe_config.pcp_size > 1
+            and not self.moe_config.moe_parallel_config.use_all2all_kernels
+        ):
+            yield input_ids
+            return
+
+        context = get_forward_context() if is_forward_context_available() else None
+        local_padding = context.is_padding if context is not None else None
+        if input_ids is not None:
+            input_ids = get_pcp_group().all_gather(
+                input_ids[:num_local_tokens], dim=0
+            )
+        if local_padding is not None:
+            context.is_padding = get_pcp_group().all_gather(
+                local_padding[:num_local_tokens], dim=0
+            )
+        try:
+            yield input_ids
+        finally:
+            if context is not None:
+                context.is_padding = local_padding
+
     def _ep_fused_combine_output(
         self,
         shared_output: torch.Tensor,
@@ -1178,22 +1204,25 @@ class MoERunner(MoERunnerInterface):
             # TODO(bnell): parts of the dispatch/combine steps will go away once
             # #32567 lands and the remaining kernels are made MKs.  The PCP
             # code will probably remain
+            num_local_tokens = hidden_states.shape[0]
             hidden_states, router_logits = self._maybe_dispatch(
                 hidden_states,
                 router_logits,
             )
 
-            shared_output, hidden_states = self._apply_quant_method(
-                hidden_states=hidden_states,
-                router_logits=router_logits,
-                shared_experts_input=shared_experts_input,
-                input_ids=input_ids,
-                quanted_hidden_states=quanted_hidden_states,
-                scale=scale,
-                topk_weights=topk_weights,
-                topk_ids=topk_ids,
-            )
-
+            with self._pcp_routing_inputs(
+                input_ids, num_local_tokens
+            ) as routing_input_ids:
+                shared_output, hidden_states = self._apply_quant_method(
+                    hidden_states=hidden_states,
+                    router_logits=router_logits,
+                    shared_experts_input=shared_experts_input,
+                    input_ids=routing_input_ids,
+                    quanted_hidden_states=quanted_hidden_states,
+                    scale=scale,
+                    topk_weights=topk_weights,
+                    topk_ids=topk_ids,
+                )
             return self._maybe_combine(
                 shared_output,
                 hidden_states,

@@ -2534,3 +2534,57 @@ def test_qwen4_exp_hc_sp_falls_back_with_lora_or_compiler_sp(
 
     feature_config = patch_vllm_config.validate_and_update_hcu_config(config)
     assert feature_config.qwen4_exp_hc_sp is expected
+
+
+@pytest.mark.parametrize("architecture", [
+    "DeepseekV4ForCausalLM", "DeepSeekV4MTPModel",
+])
+@pytest.mark.parametrize("pcp", [2, 4, 8])
+def test_deepep_auto_accepts_deepseek_v4_pcp_without_dp(pcp, architecture):
+    from tests.runtime_patch.test_glm52_pcp_config import _make_pcp_config
+
+    config = _make_pcp_config(
+        architecture=architecture, pcp=pcp,
+        all2all_backend="deepep_low_latency", enable_eplb=False,
+    )
+    config.additional_config = {
+        "hcu": HcuFeatureConfig(deepep_auto=True, moe_backend="deep_gemm").to_dict()
+    }
+    config.compilation_config = _ValidationCompilation()
+    config.scheduler_config = SimpleNamespace(max_num_batched_tokens=32768)
+    result = patch_vllm_config.validate_and_update_hcu_config(config)
+    assert result.deepep_auto
+    assert config.parallel_config._vllm_hcu_deepep_auto
+    assert config.parallel_config.data_parallel_size == 1
+
+
+@pytest.mark.parametrize("architecture,pcp", [
+    ("GlmMoeDsaForCausalLM", 2),
+    ("GlmMoeDsaForCausalLM", 4),
+    ("GlmMoeDsaForCausalLM", 8),
+    ("Glm5NextForCausalLM", 8),
+])
+def test_deepep_auto_rejects_non_v4_pcp_only_topology(architecture, pcp):
+    from tests.runtime_patch.test_glm52_pcp_config import _make_pcp_config
+
+    config = _make_pcp_config(
+        architecture=architecture, pcp=pcp, tp=1,
+        hybrid=architecture == "Glm5NextForCausalLM",
+        all2all_backend="deepep_low_latency",
+    )
+    config.additional_config = {
+        "hcu": HcuFeatureConfig(deepep_auto=True, moe_backend="deep_gemm").to_dict()
+    }
+    config.compilation_config = _ValidationCompilation()
+    config.scheduler_config = SimpleNamespace(max_num_batched_tokens=32768)
+    with pytest.raises(ValueError, match="PCP-only.*DeepSeek V4"):
+        patch_vllm_config.validate_and_update_hcu_config(config)
+
+
+def test_deepep_auto_keeps_glm_dp_ep_without_pcp():
+    config = _validation_config(HcuFeatureConfig(deepep_auto=True))
+    config.model_config.architectures = ["GlmMoeDsaForCausalLM"]
+    config.parallel_config.data_parallel_size = 2
+    config.parallel_config.enable_expert_parallel = True
+    config.parallel_config.all2all_backend = "deepep_low_latency"
+    assert patch_vllm_config.validate_and_update_hcu_config(config).deepep_auto

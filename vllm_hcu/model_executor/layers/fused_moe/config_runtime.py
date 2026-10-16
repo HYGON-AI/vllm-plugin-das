@@ -137,7 +137,14 @@ def int8_w8a8_moe_quant_config(
 
 def use_all2all_kernels(parallel_config: object) -> bool:
     return bool(
-        (parallel_config.dp_size > 1 or parallel_config.is_sequence_parallel)
+        (
+            parallel_config.dp_size > 1
+            or parallel_config.is_sequence_parallel
+            or (
+                getattr(parallel_config, "pcp_size", 1) > 1
+                and getattr(parallel_config, "all2all_backend", None) == "deepep_auto"
+            )
+        )
         and parallel_config.use_ep
     )
 

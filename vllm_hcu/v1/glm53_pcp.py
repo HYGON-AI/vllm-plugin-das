@@ -5,10 +5,11 @@ from __future__ import annotations
 
 from contextlib import contextmanager
 from contextvars import ContextVar
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from functools import lru_cache
 from types import MethodType
 
+import numpy as np
 import torch
 
 from vllm.logger import init_logger
@@ -30,6 +31,7 @@ class Glm53PCPBatch:
     manager: object
     local_batch: object
     local_indices: torch.Tensor
+    _query_rows: dict = field(default_factory=dict, repr=False)
 
     @property
     def global_batch(self):
@@ -40,6 +42,24 @@ class Glm53PCPBatch:
 
     def localize(self, value: torch.Tensor) -> torch.Tensor:
         return value.index_select(0, self.local_indices)
+
+    def local_query_rows(self, start: int, end: int):
+        """Owned rows in global ``[start, end)`` (minus start) and their
+        positions in the rank-local layout. Built from the CPU layout once per
+        step, so every layer reuses the device indices without a sync."""
+        key = (int(start), int(end))
+        if key not in self._query_rows:
+            segments = self.manager._local_segments
+            owned = np.concatenate([np.arange(seg.global_slice.start, seg.global_slice.stop)
+                                    for seg in segments])
+            local = np.concatenate([np.arange(seg.local_slice.start,
+                                              seg.local_slice.start + seg.num_actual_tokens)
+                                    for seg in segments])
+            mask = (owned >= key[0]) & (owned < key[1])
+            device = self.local_indices.device
+            self._query_rows[key] = (torch.from_numpy(owned[mask] - key[0]).to(device),
+                                     torch.from_numpy(local[mask]).to(device))
+        return self._query_rows[key]
 
 
 _BATCH: ContextVar[Glm53PCPBatch | None] = ContextVar(
@@ -96,12 +116,13 @@ def _prepare_attn(
         return result
 
     manager = batch.manager
+    replicate_all = getattr(self, "_hcu_pcp_replicate_all_groups", False)
     local_groups = [
-        [group for group in groups if not _replicated_group(group)]
+        [group for group in groups if not (replicate_all or _replicated_group(group))]
         for groups in attn_groups
     ]
     global_groups = [
-        [group for group in groups if _replicated_group(group)]
+        [group for group in groups if replicate_all or _replicated_group(group)]
         for groups in attn_groups
     ]
     logical_width = manager.pcp_size if manager._global_has_prefill else 1
@@ -236,3 +257,16 @@ def install_glm53_pcp(runner) -> None:
         "%d replicated K-pool indexers; MLA queries and MoE remain sharded",
         *counts,
     )
+
+
+def install_deepseek_v4_pcp(runner) -> None:
+    """Reuse the GLM5Next adapter with every DeepSeek V4 cache group global.
+
+    V4 SWA, compressor and indexer caches all consume full KV on each rank,
+    so their metadata is built from the original request rows.
+    """
+    state = runner.model_state
+    if not hasattr(state, "_hcu_glm53_original_prepare_attn"):
+        state._hcu_glm53_original_prepare_attn = state.prepare_attn
+        state._hcu_pcp_replicate_all_groups = True
+        state.prepare_attn = MethodType(_prepare_attn, state)
