@@ -202,6 +202,121 @@ def test_kda_constructor_warmup_does_not_launch_for_cpu_weights(monkeypatch):
     assert not patch._warmup_done
 
 
+@pytest.mark.parametrize("nn_setting", ["0", "1", None])
+@pytest.mark.parametrize("failure", [None, "projection", "synchronize"])
+def test_kda_device_warmup_uses_logical_input_width_and_retries(
+    monkeypatch, nn_setting, failure
+):
+    import importlib.util
+    from pathlib import Path
+
+    from vllm.model_executor import custom_op, parameter
+    from vllm_hcu.platforms import envs as henvs
+
+    # Load the actual HCU methods with an isolated registration table: native
+    # linear classes have already registered the same layer names in pytest.
+    path = (
+        Path(__file__).resolve().parents[2]
+        / "vllm_hcu/model_executor/layers/linear.py"
+    )
+    spec = importlib.util.spec_from_file_location("kda_warmup_hcu_linear", path)
+    hcu_linear = importlib.util.module_from_spec(spec)
+    with monkeypatch.context() as registration:
+        registration.setattr(custom_op, "op_registry", {})
+        spec.loader.exec_module(hcu_linear)
+
+    if nn_setting is None:
+        monkeypatch.delenv("VLLM_USE_NN", raising=False)
+    else:
+        monkeypatch.setenv("VLLM_USE_NN", nn_setting)
+    nn_layout = nn_setting != "0"
+    assert henvs.VLLM_USE_NN is nn_layout
+    monkeypatch.setenv("VLLM_BATCH_INVARIANT", "0")
+    monkeypatch.setattr(parameter, "get_tensor_model_parallel_rank", lambda: 0)
+    monkeypatch.setattr(parameter, "get_tensor_model_parallel_world_size", lambda: 2)
+    # Real HCU allocation/apply methods and real CPU GEMMs; TP metadata, device
+    # identity, scratch allocation and synchronization are explicit doubles.
+    monkeypatch.setattr(
+        hcu_linear, "dispatch_unquantized_gemm",
+        lambda: lambda layer, x, weight, bias: torch.nn.functional.linear(
+            x, weight, bias
+        ),
+    )
+    calls, messages = [], []
+    pending_failure = [failure]
+    real_zeros = torch.zeros
+
+    def scratch_zeros(shape, *, device, dtype):
+        assert device == torch.device("cuda:0")
+        return real_zeros(shape, device="cpu", dtype=dtype)
+
+    def synchronize(device):
+        assert device == torch.device("cuda:0")
+        if pending_failure[0] == "synchronize":
+            pending_failure[0] = None
+            raise RuntimeError("injected synchronize failure")
+
+    class Projection:
+        input_size = 4
+        output_partition_sizes = [5, 7]
+
+        def __init__(self):
+            self.layer = nn.Module()
+            self.method = hcu_linear.UnquantizedLinearMethod()
+            self.method.create_weights(
+                self.layer, input_size_per_partition=self.input_size,
+                output_partition_sizes=self.output_partition_sizes,
+                input_size=self.input_size, output_size=24,
+                params_dtype=torch.bfloat16, weight_loader=lambda *a: None,
+            )
+            with torch.no_grad():
+                self.layer.weight.fill_(1)
+            expected_shape = (4, 12) if nn_layout else (12, 4)
+            assert self.layer.weight.shape == expected_shape
+            self.weight = SimpleNamespace(
+                device=torch.device("cuda:0"), dtype=self.layer.weight.dtype,
+                shape=self.layer.weight.shape,
+            )
+
+        def __call__(self, x):
+            calls.append(tuple(x.shape))
+            if pending_failure[0] == "projection":
+                pending_failure[0] = None
+                raise RuntimeError("injected projection failure")
+            result = self.method.apply(self.layer, x)
+            assert result.shape == (patch._PROFILE_M, 12)
+            assert result.dtype == torch.bfloat16
+            assert torch.count_nonzero(result) == 0
+            return result, None
+
+    class Attention:
+        def __init__(self):
+            self.in_proj_qkvgfab = Projection()
+
+    patch = patch_kimi_k3_kda_gemm_warmup
+    target = ModuleType(patch.TARGET_MODULE)
+    target.KimiK3DeltaAttention = Attention
+    target.logger = SimpleNamespace(
+        info=lambda message, *args: messages.append(message % args)
+    )
+    monkeypatch.setattr(patch, "_warmup_done", False)
+    monkeypatch.setattr(torch, "zeros", scratch_zeros)
+    monkeypatch.setattr(torch.cuda, "synchronize", synchronize)
+    assert patch.apply_to_module(target)
+    assert not patch.apply_to_module(target)
+    if failure is not None:
+        with pytest.raises(RuntimeError, match=f"injected {failure} failure"):
+            Attention()
+        assert not patch._warmup_done
+    Attention()
+    assert patch._warmup_done
+    assert calls and all(shape == (patch._PROFILE_M, 4) for shape in calls)
+    assert "packed_output=12, K=4" in messages[-2]
+    count = len(calls)
+    Attention()
+    assert len(calls) == count
+
+
 def test_residual_master_switch_restores_original_forward(monkeypatch):
     patch = patch_kimi_k3_reference_paths
     target = ModuleType(patch.TARGET_MODULE)

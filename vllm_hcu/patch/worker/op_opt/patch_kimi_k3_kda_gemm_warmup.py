@@ -55,14 +55,16 @@ def apply_to_module(module: ModuleType) -> bool:
         if weight.dtype != torch.bfloat16:
             return
 
-        hidden_size = int(weight.shape[-1])
+        # Column-parallel KDA consumes the logical input width in either NN
+        # [input, local_output] or non-NN [local_output, input] weight storage.
+        hidden_size = int(linear.input_size)
         logger = getattr(kda, "logger", None)
         if logger is not None:
             logger.info(
                 "Running Kimi K3 KDA BF16 projection warmup before weight load: "
                 "M=%d, packed_output=%d, K=%d, device=%s",
                 _PROFILE_M,
-                int(weight.shape[0]),
+                sum(linear.output_partition_sizes),
                 hidden_size,
                 weight.device,
             )
