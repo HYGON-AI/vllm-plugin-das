@@ -1279,8 +1279,11 @@ def test_aiter_asm_boltops_fp8_quant_context_rejects_subtle_abi_drift(
     assert asm_module.per_token_quant_hip is incompatible_quant
 
 
+@pytest.mark.parametrize("architecture", [
+    "DeepseekV4ForCausalLM", "DeepSeekV4MTPModel",
+])
 def test_int8_oracle_keeps_aiter_weights_and_packs_hcu_deep_gemm_weights(
-    monkeypatch: pytest.MonkeyPatch,
+    monkeypatch: pytest.MonkeyPatch, architecture: str,
 ):
     from vllm_hcu.patch.worker.op_opt.moe import patch_int8_oracle
     from vllm.model_executor.layers.quantization.utils.quant_utils import (
@@ -1560,7 +1563,7 @@ def test_int8_oracle_keeps_aiter_weights_and_packs_hcu_deep_gemm_weights(
                 }
             },
             model_config=SimpleNamespace(
-                architectures=["DeepseekV4ForCausalLM"],
+                architectures=[architecture],
             ),
         ),
     )

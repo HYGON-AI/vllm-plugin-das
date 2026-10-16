@@ -2865,8 +2865,11 @@ def test_moe_align_ep_remap_rejects_uninitialized_buffer_ids(
     assert count.item() == 2
 
 
+@pytest.mark.parametrize("architecture", [
+    "DeepseekV4ForCausalLM", "DeepSeekV4MTPModel",
+])
 def test_fp8_oracle_sidecar_selection_and_format_contract(
-    monkeypatch: pytest.MonkeyPatch,
+    monkeypatch: pytest.MonkeyPatch, architecture: str,
 ):
     auto_kernel_calls: list[tuple[object, object, object]] = []
 
@@ -3009,7 +3012,7 @@ def test_fp8_oracle_sidecar_selection_and_format_contract(
         moe_parallel_config=SimpleNamespace(use_batched_activation_format=False),
         _hcu_vllm_config=SimpleNamespace(
             model_config=SimpleNamespace(
-                architectures=["DeepseekV4ForCausalLM"],
+                architectures=[architecture],
             ),
         ),
     )
