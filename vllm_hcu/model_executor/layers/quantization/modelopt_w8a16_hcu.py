@@ -365,6 +365,14 @@ class ModelOptW8A16MoEMethod(FusedMoEMethodBase):
                 "W8A16 AITER MoE inplace fast-path assumes single-card "
                 "(dp_size=1). With DP the chunked runner reverses shared/apply "
                 "order and would read x after inplace overwrite.")
+            if getattr(layer, "apply_router_weight_on_input", False):
+                # aiter_moe applies routing weights to the expert OUTPUT;
+                # input-weighting (F(p*x) != p*F(x) under nonlinear
+                # activations, e.g. Llama4 MoE) has no aiter equivalent.
+                raise NotImplementedError(
+                    "W8A16 AITER MoE does not implement "
+                    "apply_router_weight_on_input; disable "
+                    "VLLM_ROCM_USE_AITER_MOE to use the vLLM fallback.")
             m = x.shape[0]
             K = x.shape[1]
             n = layer.w2_weight.shape[2]
@@ -380,11 +388,23 @@ class ModelOptW8A16MoEMethod(FusedMoEMethodBase):
             )
 
             if not status:
-                aiter.logger.info(
-                    f"[aiter_moe_w8a16] SKIP {m=}, {N1=}, {N2=}, {K=}, {e=}, {topk=}: "
-                    f"no backend available"
-                )
-                return None
+                raise RuntimeError(
+                    f"[aiter_moe_w8a16] no AITER backend for {m=}, {N1=}, "
+                    f"{N2=}, {K=}, {e=}, {topk=}: the expert weights are "
+                    "already marlin-shuffled at load time and no correct "
+                    "fallback exists (returning wrong-layout weights to a "
+                    "raw-int8 kernel would silently corrupt outputs).")
+            if getattr(moe_cfg, "need_shuffle", None) is False:
+                # MOE_C unavailable but a triton solution exists: that path
+                # hands the weights straight to the raw-int8 triton kernel,
+                # which misreads the marlin layout. There is no triton
+                # solution for shuffled weights — refuse loudly.
+                raise RuntimeError(
+                    f"[aiter_moe_w8a16] AITER selected a triton solution "
+                    f"(need_shuffle=False) for {m=}, {N1=}, {N2=}, {K=}, "
+                    f"{e=}, {topk=}, but the expert weights are "
+                    "marlin-shuffled at load time; no triton kernel "
+                    "consumes that layout.")
 
             inplace = True # not getattr(layer.moe_config, "disable_inplace", True)
             # mortal_input = x if not inplace else x.clone()
@@ -406,7 +426,7 @@ class ModelOptW8A16MoEMethod(FusedMoEMethodBase):
                 a2_scale=self.moe_quant_config.a2_scale,
                 block_shape=self.moe_quant_config.block_shape,
                 global_num_experts=layer.global_num_experts,
-                expert_map=None,
+                expert_map=getattr(layer, "expert_map", None),
                 routed_scaling_factor=1.0,
             )
         else:
@@ -423,6 +443,10 @@ class ModelOptW8A16MoEMethod(FusedMoEMethodBase):
                 topk_weights=topk_weights,
                 topk_ids=topk_ids,
                 activation=MoEActivation(act) if isinstance(act, str) else act,
+                apply_router_weight_on_input=getattr(
+                    layer, "apply_router_weight_on_input", False),
+                global_num_experts=layer.global_num_experts,
+                expert_map=getattr(layer, "expert_map", None),
                 quant_config=self.moe_quant_config,
             )
 
