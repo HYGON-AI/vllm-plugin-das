@@ -201,6 +201,7 @@ _MOE_FOUNDATION_CALLBACKS: tuple[_CallbackSpec, ...] = (
 
 _CORE_CALLBACKS: tuple[_CallbackSpec, ...] = (
     _CallbackSpec(_adapter("core_fix", "patch_mhc_backend")),
+    _CallbackSpec(_adapter("core_fix", "patch_mhc_fused_rmsnorm")),
     _CallbackSpec(_adapter("core_fix", "patch_minimax_m3_aiter_cache")),
     _CallbackSpec(_adapter("core_fix", "patch_minimax_m3_sparse_decode")),
     _CallbackSpec(_adapter("core_fix", "patch_deepseek_v32_config")),
@@ -266,6 +267,7 @@ _OP_CALLBACKS: tuple[_CallbackSpec, ...] = (
     _CallbackSpec(_adapter("op_opt", "patch_gdn_base")),
     _CallbackSpec(_adapter("op_opt", "patch_gdn_linear_attention")),
     _CallbackSpec(_adapter("op_opt", "patch_glm5next_kda_conv_weight")),
+    _CallbackSpec(_adapter("op_opt", "patch_glm5next_kda_strided_recurrent")),
     _CallbackSpec(_adapter("op_opt", "patch_gate_linear")),
     _CallbackSpec(_adapter("op_opt", "patch_activation")),
     _CallbackSpec(_adapter("op_opt", "patch_layers_utils")),
