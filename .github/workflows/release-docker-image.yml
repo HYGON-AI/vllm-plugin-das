@@ -102,13 +102,43 @@ jobs:
           docker push "${HARBOR_SITE}/${HARBOR_NAMESPACE}/${IMAGE_TAG}"
           docker push "${HARBOR_SITE}/${HARBOR_NAMESPACE}/${LATEST_TAG}"
 
-      # 自托管构建机磁盘有限, 推送成功后删除本地镜像释放空间;
-      # 下游 validate-image 会自行从 Harbor 重新拉取, 不依赖本机镜像
-      - name: 删除本地镜像
+      # 登记镜像记录(DashHub, 同 ciimage 的 record 口径): docker run 用产物镜像本身起
+      # 临时容器(与 build 同一 runner, 天然主机亲和, 不用镜像不存在/多 runner 拉副本的
+      # 问题), 容器里补装 cinotificate 后执行 --record_image; 上报哪个镜像以 -e
+      # IMAGE_TAG 现配传入(镜像内没有烙该 ENV); 失败仅告警不阻断, 可稍后手动重试
+      - name: 登记镜像记录(record)
+        continue-on-error: true
+        timeout-minutes: 10
         run: |
-          docker rmi "${HARBOR_SITE}/${HARBOR_NAMESPACE}/${IMAGE_TAG}" \
-                    "${HARBOR_SITE}/${HARBOR_NAMESPACE}/${LATEST_TAG}" \
-          || echo "删除本地镜像失败(可能被其他容器 job 占用), 可稍后手动清理"
+          FULL_TAG="${HARBOR_SITE}/${HARBOR_NAMESPACE}/${IMAGE_TAG}"
+          TOKEN="${{ matrix.dtk_tag }}"
+          TOKEN="dtk${TOKEN//./}"
+          PYPI_HOST="${PYPI_URL#*://}"; PYPI_HOST="${PYPI_HOST%%/*}"; PYPI_HOST="${PYPI_HOST%%:*}"
+          docker run --rm --network=host \
+            -e "IMAGE_TAG=${FULL_TAG}" \
+            --entrypoint /bin/bash "${FULL_TAG}" -c "
+              set -e
+              pip install cinotificate \
+                -i '${PYPI_URL}/nightly/${TOKEN}/+simple/' \
+                --trusted-host '${PYPI_HOST}'
+              CInotificate --record_image
+            "
+
+      # 自托管构建机磁盘有限, record 完删除本地镜像释放空间;
+      # 下游 validate-image 会自行从 Harbor 重新拉取, 不依赖本机镜像。
+      # if: always(): 同 ref 的下一次 dispatch 会因 concurrency.cancel-in-progress
+      # 取消本 job(continue-on-error 不覆盖取消语义), 默认 success() 会跳过本步骤,
+      # 构建机将残留全部镜像层; 取消时先杀掉可能存活的 record 容器再删镜像
+      - name: 删除本地镜像
+        if: always()
+        run: |
+          docker ps --filter "ancestor=${HARBOR_SITE}/${HARBOR_NAMESPACE}/${IMAGE_TAG}" -q \
+            | xargs -r docker rm -f \
+            || true
+          if ! docker rmi "${HARBOR_SITE}/${HARBOR_NAMESPACE}/${IMAGE_TAG}" \
+                         "${HARBOR_SITE}/${HARBOR_NAMESPACE}/${LATEST_TAG}"; then
+            echo "::warning::删除本地镜像失败(可能被其他容器 job 占用), 磁盘有限请稍后手动清理: ${HARBOR_SITE}/${HARBOR_NAMESPACE}/${IMAGE_TAG}"
+          fi
 
       # 其他容器 job 会以 root 在共享 workspace 留下文件, 导致下次 checkout 清理失败
       - name: 清理 workspace
