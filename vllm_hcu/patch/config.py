@@ -20,6 +20,7 @@ _FEATURE_FIELDS = (
     "enable_lightly_cplb",
     "enable_custom_sp",
     "enable_multi_layers_mtp",
+    "enable_dsa_cache_layer_split",
     "deepep_auto",
     "fused_qwen3_rms_rope",
     "qwen4_exp_hc_sp",
@@ -84,6 +85,7 @@ class HcuFeatureConfig:
     enable_lightly_cplb: bool = False
     enable_custom_sp: bool = False
     enable_multi_layers_mtp: bool = False
+    enable_dsa_cache_layer_split: bool = False
     deepep_auto: bool = False
     # Effective (master AND child) runtime policy persisted for compilation
     # cache partitioning. Platform validation refreshes it from the process
