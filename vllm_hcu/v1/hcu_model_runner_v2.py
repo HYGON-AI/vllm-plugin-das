@@ -463,6 +463,22 @@ class HcuGPUModelRunnerV2(GPUModelRunner):
             and execute_model_state is not None
             and not getattr(self, "is_last_pp_rank", True)
         )
+        if (
+            use_replicated_mtp_batch
+            and is_deepseek_v4(self.vllm_config)
+            and execute_model_state.hidden_states is not None
+        ):
+            # Native V4 MTP reads the pre-hc residual through the model getter,
+            # independently of the post-hc hidden states restored below. Only
+            # this step's local prefix is valid; gather/reorder it before the
+            # upstream sampler slices the persistent buffer at global width.
+            residual = self.model.get_mtp_target_hidden_states()
+            if residual is not None:
+                num_local_tokens = execute_model_state.hidden_states.shape[0]
+                restored_residual = self.pcp_manager.restore_hidden_states(
+                    residual[:num_local_tokens]
+                )
+                residual[:restored_residual.shape[0]].copy_(restored_residual)
         if use_replicated_mtp_batch or restore_nonfinal_pp_batch:
             (
                 restored_hidden_states,
