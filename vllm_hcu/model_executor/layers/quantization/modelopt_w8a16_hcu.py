@@ -365,6 +365,13 @@ class ModelOptW8A16MoEMethod(FusedMoEMethodBase):
                 "W8A16 AITER MoE inplace fast-path assumes single-card "
                 "(dp_size=1). With DP the chunked runner reverses shared/apply "
                 "order and would read x after inplace overwrite.")
+            if getattr(layer.moe_config, "swiglu_limit", None):
+                # Neither aiter_moe nor the legacy fused_experts fallback
+                # applies the SwiGLU clamp; running without it changes the
+                # math for models that rely on it (e.g. ExaoneMoE).
+                raise NotImplementedError(
+                    "W8A16 MoE does not support moe_config.swiglu_limit; "
+                    "no available execution path applies the clamp.")
             if getattr(layer, "apply_router_weight_on_input", False):
                 # aiter_moe applies routing weights to the expert OUTPUT;
                 # input-weighting (F(p*x) != p*F(x) under nonlinear
@@ -436,6 +443,11 @@ class ModelOptW8A16MoEMethod(FusedMoEMethodBase):
             # the MoEActivation enum; normalize the str-or-enum layer attr.
             from vllm.model_executor.layers.fused_moe.activation import MoEActivation
             from vllm.model_executor.layers.fused_moe.fused_moe import fused_experts
+            if getattr(layer.moe_config, "swiglu_limit", None):
+                raise NotImplementedError(
+                    "W8A16 MoE fallback does not support "
+                    "moe_config.swiglu_limit (legacy fused_experts applies "
+                    "plain SILU, not the clamped variant).")
             return fused_experts(
                 x,
                 layer.w13_weight,
