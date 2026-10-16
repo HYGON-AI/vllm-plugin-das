@@ -70,6 +70,7 @@ def test_mhc_fused_rmsnorm_respects_custom_ops_master_switch(monkeypatch):
 
 
 def test_mhc_fused_rmsnorm_matches_reference(monkeypatch):
+    """Smoke test: patch applies, is idempotent, and callable on CPU."""
     monkeypatch.setenv("VLLM_HCU_USE_CUSTOM_OPS", "1")
     monkeypatch.setenv("VLLM_HCU_MHC_FUSED_RMSNORM", "1")
     module = _fake_mhc_module()
@@ -90,6 +91,40 @@ def test_mhc_fused_rmsnorm_matches_reference(monkeypatch):
 
     # None weight passes through.
     assert module._apply_mhc_norm(x, None, eps) is x
+
+
+@requires_gpu
+@pytest.mark.parametrize("shape,dtype", [
+    ((32, 2048), torch.bfloat16),
+    ((128, 4096), torch.bfloat16),
+    ((1, 2048), torch.float16),
+    ((256, 2048), torch.float16),
+    ((64, 8192), torch.bfloat16),
+])
+def test_mhc_fused_rmsnorm_cuda_numerical(monkeypatch, shape, dtype):
+    """Numerical correctness of HCU fused RMSNorm vs reference on GPU."""
+    monkeypatch.setenv("VLLM_HCU_USE_CUSTOM_OPS", "1")
+    monkeypatch.setenv("VLLM_HCU_MHC_FUSED_RMSNORM", "1")
+
+    module = _fake_mhc_module()
+    patch_mhc_fused_rmsnorm.apply_to_module(module)
+
+    torch.manual_seed(42)
+    torch.cuda.manual_seed(42)
+    x = torch.randn(*shape, dtype=dtype, device="cuda")
+    w = torch.randn(shape[-1], dtype=dtype, device="cuda")
+    eps = 1e-6
+
+    y_fused = module._apply_mhc_norm(x, w, eps)
+    y_ref = _reference_rms_norm(x, w, eps)
+
+    # bfloat16 has ~7 mantissa bits, expect rtol ~1e-2
+    # float16 has 10 mantissa bits, expect rtol ~1e-3
+    rtol = 1e-2 if dtype == torch.bfloat16 else 1e-3
+    atol = 1e-3 if dtype == torch.bfloat16 else 1e-4
+    torch.testing.assert_close(y_fused, y_ref, rtol=rtol, atol=atol)
+    assert not torch.isnan(y_fused).any()
+    assert not torch.isinf(y_fused).any()
 
 
 def test_mhc_fused_rmsnorm_dtype_mismatch_falls_back(monkeypatch):
@@ -136,6 +171,7 @@ def test_kda_strided_respects_custom_ops_master_switch(monkeypatch):
 @requires_gpu
 @pytest.mark.parametrize("spec", [False, True])
 def test_kda_strided_matches_contiguous_reference(monkeypatch, spec):
+    """Bit-exact match between strided-input and contiguous-ref paths."""
     monkeypatch.setenv("VLLM_HCU_USE_CUSTOM_OPS", "1")
     monkeypatch.setenv("VLLM_HCU_GLM5NEXT_KDA_STRIDED_INPUTS", "1")
     kda = pytest.importorskip("vllm.models.glm5next.nvidia.kda")
@@ -191,6 +227,75 @@ def test_kda_strided_matches_contiguous_reference(monkeypatch, spec):
         out_o, out_s = run(kda.fused_recurrent_kda, q, k, v)
         assert torch.equal(ref_o, out_o)
         assert torch.equal(ref_s, out_s)
+    finally:
+        kda.fused_recurrent_kda = original
+        for attr in (kda_patch._MARKER, "_vllm_hcu_original_fused_recurrent_kda"):
+            if hasattr(kda, attr):
+                delattr(kda, attr)
+
+
+@requires_gpu
+@pytest.mark.parametrize("B,T,H,K,dtype", [
+    (2, 8, 4, 128, torch.bfloat16),
+    (4, 16, 8, 64, torch.bfloat16),
+    (1, 32, 4, 128, torch.float16),
+    (8, 4, 8, 256, torch.bfloat16),
+])
+def test_kda_strided_numerical_correctness(monkeypatch, B, T, H, K, dtype):
+    """Numerical correctness of strided KDA vs contiguous reference across
+    shapes and dtypes."""
+    monkeypatch.setenv("VLLM_HCU_USE_CUSTOM_OPS", "1")
+    monkeypatch.setenv("VLLM_HCU_GLM5NEXT_KDA_STRIDED_INPUTS", "1")
+    kda = pytest.importorskip("vllm.models.glm5next.nvidia.kda")
+    original = getattr(
+        kda, "_vllm_hcu_original_fused_recurrent_kda", kda.fused_recurrent_kda
+    )
+    try:
+        kda_patch.apply_to_module(sys.modules[kda.__name__])
+
+        torch.manual_seed(42)
+        torch.cuda.manual_seed(42)
+        V = K  # Keep V=K for simplicity
+        # Create non-contiguous split views as in real usage
+        qkv = torch.randn(B, T, 3 * H * K, device="cuda", dtype=dtype)
+        q, k, v = (x.reshape(B, T, H, K) for x in qkv.split(H * K, dim=-1))
+        assert not q.is_contiguous()
+
+        g = torch.randn(B, T, H, K, device="cuda", dtype=dtype)
+        beta = torch.randn(B, T, H, device="cuda", dtype=dtype)
+        state0 = torch.randn(B * T + 1, H, V, K, device="cuda") * 0.1
+
+        def run(fn, qq, kk, vv):
+            st = state0.clone()
+            o, fs = fn(
+                q=qq, k=kk, v=vv, g=g, beta=beta,
+                initial_state=st,
+                inplace_final_state=False,
+                use_qk_l2norm_in_kernel=True,
+                sigmoid_beta=True,
+            )
+            torch.cuda.synchronize()
+            return o, fs
+
+        ref_o, ref_fs = run(original, q.contiguous(), k.contiguous(), v.contiguous())
+        out_o, out_fs = run(kda.fused_recurrent_kda, q, k, v)
+
+        # Numerical tolerance based on dtype
+        rtol = 1e-2 if dtype == torch.bfloat16 else 1e-3
+        atol = 1e-3 if dtype == torch.bfloat16 else 1e-4
+        torch.testing.assert_close(out_o, ref_o, rtol=rtol, atol=atol)
+        torch.testing.assert_close(out_fs, ref_fs, rtol=rtol, atol=atol)
+
+        # Check for NaN (always unexpected)
+        assert not torch.isnan(out_o).any()
+        # Inf can occur legitimately in float16 with long sequences;
+        # verify it matches the reference pattern if present.
+        if torch.isinf(ref_o).any():
+            assert torch.equal(torch.isinf(out_o), torch.isinf(ref_o)), \
+                "Inf pattern differs from reference"
+        else:
+            assert not torch.isinf(out_o).any(), "output has Inf when ref does not"
+        assert not torch.isnan(out_fs).any()
     finally:
         kda.fused_recurrent_kda = original
         for attr in (kda_patch._MARKER, "_vllm_hcu_original_fused_recurrent_kda"):
