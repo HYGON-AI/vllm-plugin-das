@@ -469,6 +469,7 @@ def test_hash_router_receives_gathered_auxiliaries_in_real_forward_impl(
     runner = object.__new__(moe_runner_module.MoERunner)
     torch.nn.Module.__init__(runner)
     runner.gate = None
+    runner._ep_fused_combine = False
     runner._shared_experts = None
     runner.moe_config = SimpleNamespace(
         pcp_size=pcp, dp_size=1, is_sequence_parallel=False,
