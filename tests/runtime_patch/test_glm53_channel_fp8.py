@@ -47,7 +47,7 @@ def _fake_glm_model_module() -> ModuleType:
     return module
 
 
-def test_glm5next_shared_gate_uses_deepgemm_only_when_opted_in(monkeypatch) -> None:
+def test_glm5next_shared_gate_deepgemm_defaults_under_master(monkeypatch) -> None:
     calls = []
 
     class Kernel:
@@ -94,7 +94,7 @@ def test_glm5next_shared_gate_uses_deepgemm_only_when_opted_in(monkeypatch) -> N
 
     monkeypatch.setattr(hcu, "on_gfx938", lambda: True)
     monkeypatch.setenv("VLLM_HCU_USE_CUSTOM_OPS", "1")
-    monkeypatch.setenv("VLLM_HCU_GLM53_GATE_UP_DEEPGEMM", "1")
+    monkeypatch.delenv("VLLM_HCU_GLM53_GATE_UP_DEEPGEMM", raising=False)
 
     module = fake_module()
     assert patch_glm5next_channel_fp8._patch_glm5next_shared_gate_deepgemm(module)
@@ -163,7 +163,7 @@ def test_glm5next_shared_gate_uses_deepgemm_only_when_opted_in(monkeypatch) -> N
     assert torch.all(mtp_kernel.apply_scaled_mm(**kwargs) == -1)
     assert len(calls) == 1
 
-    monkeypatch.delenv("VLLM_HCU_GLM53_GATE_UP_DEEPGEMM")
+    monkeypatch.setenv("VLLM_HCU_GLM53_GATE_UP_DEEPGEMM", "0")
     disabled_module = fake_module()
     patch_glm5next_channel_fp8._patch_glm5next_shared_gate_deepgemm(
         disabled_module
@@ -188,6 +188,12 @@ def test_glm5next_shared_gate_uses_deepgemm_only_when_opted_in(monkeypatch) -> N
     )
 
     monkeypatch.setenv("VLLM_HCU_USE_CUSTOM_OPS", "1")
+    monkeypatch.delenv("VLLM_HCU_GLM53_GATE_UP_DEEPGEMM", raising=False)
+    monkeypatch.setitem(sys.modules, "deepgemm", None)
+    assert not patch_glm5next_channel_fp8._patch_glm5next_shared_gate_deepgemm(
+        fake_module()
+    )
+    monkeypatch.setitem(sys.modules, "deepgemm", deepgemm)
     monkeypatch.setattr(hcu, "on_gfx938", lambda: False)
     assert not patch_glm5next_channel_fp8._patch_glm5next_shared_gate_deepgemm(
         fake_module()
