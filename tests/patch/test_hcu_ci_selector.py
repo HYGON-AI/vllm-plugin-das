@@ -190,7 +190,7 @@ def test_kimi_k25_humaneval_routes_to_eight_card_evalscope_job() -> None:
     config = _config()
     job = config["jobs"]["kimi-k25-humaneval"]
     assert job == {
-        "runner": "hcu-linux-gfx938-8",
+        "runner": "bw1100",
         "arch": "gfx938",
         "cards": 8,
         "suite": "model",

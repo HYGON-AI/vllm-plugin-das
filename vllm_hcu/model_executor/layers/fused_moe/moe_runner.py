@@ -322,7 +322,11 @@ def _moe_forward_shared(
     if layer._ep_fused_combine:
         # Already a fresh all-reduce output that aliases no input.
         return shared_output, fused_output
-    return shared_output, fused_output.clone()
+    # Custom-op outputs must not alias their inputs. Out-of-place W4A8 and
+    # other kernels already own their output; clone only the aliasing paths.
+    if torch._C._is_alias_of(fused_output, hidden_states):
+        fused_output = fused_output.clone()
+    return shared_output, fused_output
 
 
 def _moe_forward_shared_fake(
@@ -605,6 +609,7 @@ class MoERunner(MoERunnerInterface):
     def _maybe_reduce_shared_expert_output(
         self,
         shared_output: torch.Tensor | None,
+        fused_output_is_reduced: bool | None = None,
     ) -> torch.Tensor | None:
         """All-reduce shared expert output when the combine kernel already
         reduced fused output.
@@ -614,18 +619,79 @@ class MoERunner(MoERunnerInterface):
         * If we have SP (TP=N, DP=M, EP), there is a separate AG step handled
           in the model.
         """
+        if fused_output_is_reduced is None:
+            fused_output_is_reduced = self._fused_output_is_reduced
+
         if (
             shared_output is not None
             and not self.moe_config.is_sequence_parallel
-            and self._fused_output_is_reduced
+            and fused_output_is_reduced
         ):
             shared_output = tensor_model_parallel_all_reduce(shared_output)
         return shared_output
+
+    def _maybe_reduce_routed_output_before_transform(
+        self,
+        fused_output: torch.Tensor,
+        fused_output_is_reduced: bool,
+    ) -> tuple[torch.Tensor, bool]:
+        """Reduce latent routed output before its nonlinear output transform."""
+        if (
+            self.routed_output_transform is not None
+            and not self.moe_config.is_sequence_parallel
+            and (self.moe_config.tp_size > 1 or self.moe_config.ep_size > 1)
+            and not fused_output_is_reduced
+        ):
+            fused_output = tensor_model_parallel_all_reduce(fused_output)
+            fused_output_is_reduced = True
+        return fused_output, fused_output_is_reduced
+
+    def _can_fuse_kimi_k3_latent_all_reduce(
+        self,
+        shared_output: torch.Tensor | None,
+        fused_output: torch.Tensor,
+        fused_output_is_reduced: bool,
+    ) -> bool:
+        """Fuse eligible Kimi-K3 partials by default; the env flag can opt out."""
+        fusion_enabled = os.environ.get(
+            "VLLM_HCU_KIMI_LATENT_MOE_FUSE_ALLREDUCE",
+            "1",
+        ).lower() in ("true", "1")
+        return (
+            fusion_enabled
+            and getattr(
+                self.routed_output_transform,
+                "_hcu_fuse_shared_and_routed_tp_all_reduce",
+                False,
+            )
+            and shared_output is not None
+            and self._shared_experts is not None
+            and self.moe_config.tp_size > 1
+            and not self.moe_config.is_sequence_parallel
+            and not fused_output_is_reduced
+            and fused_output.dtype == shared_output.dtype
+            and fused_output.shape[:-1] == shared_output.shape[:-1]
+        )
+
+    def _fuse_kimi_k3_latent_all_reduce(
+        self,
+        shared_output: torch.Tensor,
+        fused_output: torch.Tensor,
+    ) -> tuple[torch.Tensor, torch.Tensor]:
+        """Reduce Kimi-K3 latent and shared partials in one TP collective."""
+        latent_width = fused_output.shape[-1]
+        combined_output = torch.cat((fused_output, shared_output), dim=-1)
+        combined_output = tensor_model_parallel_all_reduce(combined_output)
+        return (
+            combined_output[..., :latent_width],
+            combined_output[..., latent_width:],
+        )
 
     def _maybe_reduce_final_output(
         self,
         states: torch.Tensor,
         trunc_size: int | None,
+        output_is_reduced: bool | None = None,
     ) -> torch.Tensor:
         """All-reduce the combined output if needed.
 
@@ -636,8 +702,13 @@ class MoERunner(MoERunnerInterface):
         """
         # skip_final_all_reduce must not coexist with a pre-reduced fused
         # output. This should be enforced by MoE config initialization.
+        is_reduced = (
+            self._fused_output_is_reduced
+            if output_is_reduced is None
+            else output_is_reduced
+        )
         if self.moe_config.skip_final_all_reduce:
-            assert not self._fused_output_is_reduced, (
+            assert not is_reduced, (
                 "skip_final_all_reduce requires an un-reduced fused output"
             )
 
@@ -648,7 +719,7 @@ class MoERunner(MoERunnerInterface):
             not self.moe_config.is_sequence_parallel
             and not self.moe_config.skip_final_all_reduce
             and (self.moe_config.tp_size > 1 or self.moe_config.ep_size > 1)
-            and not self._fused_output_is_reduced
+            and not is_reduced
         ):
             states = tensor_model_parallel_all_reduce(states)
 
@@ -997,9 +1068,38 @@ class MoERunner(MoERunnerInterface):
         if og_hidden_dim_pre_xform is not None:
             fused_output = fused_output[..., :og_hidden_dim_pre_xform]
 
-        # If combine kernel already reduced fused, reduce shared to match.
-        # See note above re: the two all-reduce points.
-        shared_output = self._maybe_reduce_shared_expert_output(shared_output)
+        fused_output_is_reduced = self._fused_output_is_reduced
+        if self._can_fuse_kimi_k3_latent_all_reduce(
+            shared_output,
+            fused_output,
+            fused_output_is_reduced,
+        ):
+            assert shared_output is not None
+            fused_output, shared_output = self._fuse_kimi_k3_latent_all_reduce(
+                shared_output,
+                fused_output,
+            )
+            fused_output_is_reduced = True
+        elif getattr(
+            self.routed_output_transform,
+            "_hcu_fuse_shared_and_routed_tp_all_reduce",
+            False,
+        ):
+            fused_output, fused_output_is_reduced = (
+                self._maybe_reduce_routed_output_before_transform(
+                    fused_output,
+                    fused_output_is_reduced,
+                )
+            )
+
+            # If routed output is reduced before its nonlinear transform,
+            # reduce shared output separately so both branches share a TP domain.
+            shared_output = self._maybe_reduce_shared_expert_output(
+                shared_output,
+                fused_output_is_reduced,
+            )
+        else:
+            shared_output = self._maybe_reduce_shared_expert_output(shared_output)
 
         shared_output, fused_output = self._maybe_apply_routed_scale_to_output(
             shared_output, fused_output
@@ -1013,7 +1113,9 @@ class MoERunner(MoERunnerInterface):
         else:
             result = fused_output
 
-        result = self._maybe_reduce_final_output(result, og_hidden_dim_post_xform)
+        result = self._maybe_reduce_final_output(
+            result, og_hidden_dim_post_xform, fused_output_is_reduced
+        )
 
         return self._maybe_add_zero_expert_output(result)
 

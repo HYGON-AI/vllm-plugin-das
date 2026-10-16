@@ -181,6 +181,11 @@ def apply_to_module(module: ModuleType) -> bool:
         from vllm.config import get_current_vllm_config_or_none
 
         vllm_config = get_current_vllm_config_or_none()
+        self._hcu_kimi_k3 = (
+            vllm_config is not None
+            and getattr(vllm_config.model_config.hf_config, "model_type", None)
+            == "kimi_k3"
+        )
         self._hcu_feature_config = get_hcu_config(vllm_config)
         self._hcu_pcp_world_size = configured_pcp_world_size(vllm_config)
         self._hcu_use_pcp = self._hcu_pcp_world_size > 1
@@ -288,7 +293,6 @@ def apply_to_module(module: ModuleType) -> bool:
         # Warmup/capture placeholders do not carry request phase metadata.
         # Preserve the target vLLM decode classification in that case, while
         # retaining HCU's prefix-hit short-extend policy for real requests.
-        del treat_short_extends_as_decodes
         is_prefilling = getattr(common_attn_metadata, "is_prefilling", None)
         # Official MRV2 builds this mask from a NumPy array on CPU.  FULL
         # graphs can pad query rows, but are dispatched only for uniform
@@ -301,6 +305,12 @@ def apply_to_module(module: ModuleType) -> bool:
             else bool(is_prefilling.numpy().any())
         )
         hcu_treat_short_extends_as_decodes = not has_prefill
+        from vllm import envs
+
+        if envs.VLLM_USE_V2_MODEL_RUNNER is False:
+            # The Kimi MRV1 reference path uses the HCU backend's 128-token
+            # MQA threshold, including short initial prefills like v0.25.1.
+            hcu_treat_short_extends_as_decodes = treat_short_extends_as_decodes
         return split_batch(
             common_attn_metadata,
             decode_threshold,
@@ -360,7 +370,7 @@ def apply_to_module(module: ModuleType) -> bool:
         # The current upstream short-prefill MHA path is rank-local and does
         # not combine PCP attention states. Keep the v0.25.1 sparse-MQA path
         # for PCP until upstream MHA prefill owns that collective.
-        if getattr(self, "_hcu_use_pcp", False):
+        if getattr(self, "_hcu_use_pcp", False) or getattr(self, "_hcu_kimi_k3", False):
             return False
         return original_use_sparse_mha(self, attn_metadata)
 
