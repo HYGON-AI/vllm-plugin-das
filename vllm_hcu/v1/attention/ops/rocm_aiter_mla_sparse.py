@@ -1596,8 +1596,6 @@ def rocm_aiter_sparse_attn_indexer_native(
                 pcp_rows, local_rows = v4_pcp_batch.local_query_rows(
                     chunk.token_start, chunk.token_end,
                 )
-                if pcp_rows.numel() == 0:
-                    continue
             local_cu_seq_lens = getattr(chunk, "local_cu_seq_lens", None)
             if local_cu_seq_lens is None:
                 local_cu_seq_lens = chunk.cu_seq_lens
@@ -1636,6 +1634,12 @@ def rocm_aiter_sparse_attn_indexer_native(
                     #     local_cu_seq_lens,
                     #     token_to_seq=chunk.token_to_seq,
                     # )
+
+            # The first query subchunk initializes K/scale for all later
+            # subchunks with skip_kv_gather=True, even if this PCP rank owns
+            # no queries in that first subchunk.
+            if pcp_rows is not None and pcp_rows.numel() == 0:
+                continue
 
             topk_indices = topk_indices_buffer[
                 chunk.token_start : chunk.token_end, :topk_tokens
