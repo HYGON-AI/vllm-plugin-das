@@ -35,6 +35,7 @@ from vllm_hcu.model_executor.layers.quantization.w8a16_gemm import (
     W8A16_LAYOUT_MARLIN,  # noqa: F401
     W8A16_LAYOUT_RAW,  # noqa: F401
     _deepgemm_version,  # noqa: F401
+    preshuffle_linear_weight,
     w8a16_should_preshuffle,  # noqa: F401
 )
 
@@ -103,26 +104,11 @@ class ModelOptW8A16LinearMethod(LinearMethodBase):
         weight_scale[:] = torch.finfo(params_dtype).min
         layer.register_parameter("weight_scale", weight_scale)
 
-    _LOGGED_PRESHUFFLE_SHAPES: set = set()
-
     def process_weights_after_loading(self, layer: torch.nn.Module) -> None:
         weight = layer.weight.detach()
-        layer.weight_layout = W8A16_LAYOUT_RAW
-        if w8a16_should_preshuffle(*weight.shape):
-            import deepgemm
-
-            shape = tuple(weight.shape)
-            if shape not in self._LOGGED_PRESHUFFLE_SHAPES:
-                self._LOGGED_PRESHUFFLE_SHAPES.add(shape)
-                # warning, not info: vllm_hcu.* loggers run at WARNING in
-                # EngineCore, an info line here would be silently dropped.
-                logger.warning(
-                    "W8A16: pre-shuffling linear weights into DeepGEMM "
-                    "marlin layout (deepgemm %s), (N, K)=%s",
-                    _deepgemm_version(), shape)
-            weight = deepgemm.w8a16_marlin_weight(weight)
-            layer.weight_layout = W8A16_LAYOUT_MARLIN
-        else:
+        weight, layout = preshuffle_linear_weight(weight, "modelopt")
+        layer.weight_layout = layout
+        if layout == W8A16_LAYOUT_RAW:
             weight = weight.clone()
         layer.weight = Parameter(weight, requires_grad=False)
         layer.weight_scale = Parameter(
@@ -270,6 +256,10 @@ class ModelOptW8A16MoEMethod(FusedMoEMethodBase):
             local_expert_id = layer._map_global_expert_id_to_local_expert_id(
                 expert_id)
             if local_expert_id == -1:
+                return False if return_success else None
+            if not 0 <= local_expert_id < param.data.shape[0]:
+                # Defensive: the upstream mapper contract says -1-or-valid,
+                # but a bounds violation would IndexError mid-load.
                 return False if return_success else None
             idx = 0 if shard_id == "w1" else 1
             target = param.data[local_expert_id][idx]

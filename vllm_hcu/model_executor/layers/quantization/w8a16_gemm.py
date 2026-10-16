@@ -70,9 +70,40 @@ def w8a16_should_preshuffle(n: int, k: int) -> bool:
     return _w8a16_tuned_marlin(n, k)
 
 
+# Distinct (N, K) pairs already reported as pre-shuffled this process.
+_LOGGED_PRESHUFFLE_SHAPES: set = set()
+
+
+def preshuffle_linear_weight(weight: torch.Tensor, scheme: str) -> tuple:
+    """Pre-shuffle an int8 [N, K] weight to marlin layout if tuned configs
+    want it; returns (weight, W8A16_LAYOUT_*). Shared by the ModelOpt and
+    compressed-tensors W8A16 linear methods so the decision logic lives in
+    exactly one place."""
+    import vllm_hcu.platforms.envs as _henvs
+
+    if not _henvs.VLLM_HCU_USE_CUSTOM_OPS:
+        return weight, W8A16_LAYOUT_RAW
+    if not w8a16_should_preshuffle(*weight.shape):
+        return weight, W8A16_LAYOUT_RAW
+    import deepgemm
+
+    shape = tuple(weight.shape)
+    if shape not in _LOGGED_PRESHUFFLE_SHAPES:
+        _LOGGED_PRESHUFFLE_SHAPES.add(shape)
+        # warning, not info: vllm_hcu.* loggers run at WARNING inside
+        # EngineCore, an info line here would be silently dropped.
+        logger.warning(
+            "W8A16(%s): pre-shuffling linear weights into DeepGEMM marlin "
+            "layout (deepgemm %s), (N, K)=%s",
+            scheme, _deepgemm_version(), shape)
+    return deepgemm.w8a16_marlin_weight(weight), W8A16_LAYOUT_MARLIN
+
+
 def w8a16_unmarlin_weight(w: torch.Tensor) -> torch.Tensor:
     """Inverse of deepgemm.w8a16_marlin_weight: marlin -> row-major [N, K]."""
     n, k = w.shape
+    assert n % 16 == 0 and k % 128 == 0, (
+        f"unmarlin tile geometry requires N%16==0 and K%128==0, got {(n, k)}")
     w_u32 = w.contiguous().view(torch.int32).view(k // 128, n // 16, 4, 16, 8)
     w_u32 = w_u32.transpose(0, 1).contiguous().view(n // 16, k // 32, 16, 8)
     return w_u32.transpose(1, 2).contiguous().view(torch.int8).view(n, k)
