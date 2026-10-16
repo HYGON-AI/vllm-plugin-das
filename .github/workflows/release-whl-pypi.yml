@@ -29,7 +29,9 @@ jobs:
   compile:
     name: compile (py${{ matrix.python_version }})
     # 需要 docker 与内网 pip 源访问能力的自托管 runner
-    runs-on: self-hosted
+    runs-on:
+      - ci
+      - self-hosted
     strategy:
       fail-fast: false
       matrix:

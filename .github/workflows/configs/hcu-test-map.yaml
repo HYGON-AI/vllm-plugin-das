@@ -30,7 +30,7 @@
   ],
   "jobs": {
     "hy4-contract": {
-      "runner": "bw18",
+      "runner": "bw1000",
       "arch": "gfx936",
       "cards": 1,
       "suite": "full",
@@ -39,7 +39,7 @@
       "requirements": []
     },
     "accuracy-gfx936": {
-      "runner": "bw18",
+      "runner": "bw1000",
       "arch": "gfx936",
       "cards": 1,
       "suite": "accuracy-hcu",
@@ -51,7 +51,7 @@
       "requirements": []
     },
     "accuracy-gfx938": {
-      "runner": "nmz36",
+      "runner": "bw1100",
       "arch": "gfx938",
       "cards": 1,
       "suite": "accuracy-hcu",
@@ -60,7 +60,7 @@
       "requirements": []
     },
     "contract-hcu-gfx936": {
-      "runner": "bw18",
+      "runner": "bw1000",
       "arch": "gfx936",
       "cards": 1,
       "suite": "contract-hcu",
@@ -70,7 +70,7 @@
       "partitions": 2
     },
     "integration-smoke-gfx938": {
-      "runner": "nmz36",
+      "runner": "bw1100",
       "arch": "gfx938",
       "cards": 1,
       "suite": "integration-smoke",
@@ -91,7 +91,7 @@
       "partitions": 2
     },
     "qwen35-smoke": {
-      "runner": "nmz36",
+      "runner": "bw1100",
       "arch": "gfx938",
       "cards": 1,
       "suite": "model",
@@ -109,7 +109,7 @@
       ]
     },
     "qwen35-graph": {
-      "runner": "nmz36",
+      "runner": "bw1100",
       "arch": "gfx938",
       "cards": 1,
       "suite": "model",
@@ -127,7 +127,7 @@
       ]
     },
     "engine-features": {
-      "runner": "nmz36",
+      "runner": "bw1100",
       "arch": "gfx938",
       "cards": 1,
       "suite": "model",
@@ -145,7 +145,7 @@
       ]
     },
     "lora": {
-      "runner": "nmz36",
+      "runner": "bw1100",
       "arch": "gfx938",
       "cards": 1,
       "suite": "model",
@@ -173,7 +173,7 @@
       ]
     },
     "spec-decode": {
-      "runner": "nmz36",
+      "runner": "bw1100",
       "arch": "gfx938",
       "cards": 1,
       "suite": "model",
@@ -191,7 +191,7 @@
       ]
     },
     "mamba-smoke": {
-      "runner": "nmz36",
+      "runner": "bw1100",
       "arch": "gfx938",
       "cards": 1,
       "suite": "model",
@@ -209,7 +209,7 @@
       ]
     },
     "kv-transfer": {
-      "runner": "nmz36",
+      "runner": "bw1100",
       "arch": "gfx938",
       "cards": 1,
       "suite": "model",
@@ -227,7 +227,7 @@
       ]
     },
     "qwen35-tp-ep": {
-      "runner": "hcu-linux-gfx938-4",
+      "runner": "bw1100",
       "arch": "gfx938",
       "cards": 4,
       "suite": "model",
@@ -245,7 +245,7 @@
       ]
     },
     "deepseek-tp-ep": {
-      "runner": "hcu-linux-gfx938-8",
+      "runner": "bw1100",
       "arch": "gfx938",
       "cards": 8,
       "suite": "model",
@@ -263,7 +263,7 @@
       ]
     },
     "qwen25-models": {
-      "runner": "nmz36",
+      "runner": "bw1100",
       "arch": "gfx938",
       "cards": 1,
       "suite": "model",
@@ -287,7 +287,7 @@
       ]
     },
     "qwen3-pooling": {
-      "runner": "nmz36",
+      "runner": "bw1100",
       "arch": "gfx938",
       "cards": 1,
       "suite": "model",
@@ -311,7 +311,7 @@
       ]
     },
     "qwen3-protocol": {
-      "runner": "nmz36",
+      "runner": "bw1100",
       "arch": "gfx938",
       "cards": 1,
       "suite": "model",
@@ -329,7 +329,7 @@
       ]
     },
     "qwen35-gsm8k": {
-      "runner": "nmz36",
+      "runner": "bw1100",
       "arch": "gfx938",
       "cards": 1,
       "suite": "model",
@@ -353,7 +353,7 @@
       ]
     },
     "qwen3-vl-mmmu": {
-      "runner": "nmz36",
+      "runner": "bw1100",
       "arch": "gfx938",
       "cards": 1,
       "suite": "model",
@@ -377,7 +377,7 @@
       ]
     },
     "qwen3-8b-gsm8k": {
-      "runner": "nmz36",
+      "runner": "bw1100",
       "arch": "gfx938",
       "cards": 1,
       "suite": "model",
@@ -401,7 +401,7 @@
       ]
     },
     "deepseek-gsm8k": {
-      "runner": "nmz36",
+      "runner": "bw1100",
       "arch": "gfx938",
       "cards": 8,
       "suite": "model",
@@ -425,7 +425,7 @@
       ]
     },
     "glm52-pcp": {
-      "runner": "hcu-linux-gfx938-8",
+      "runner": "bw1100",
       "arch": "gfx938",
       "cards": 8,
       "suite": "model",
@@ -449,7 +449,7 @@
       ]
     },
     "single-node-topology": {
-      "runner": "nmz36",
+      "runner": "bw1100",
       "arch": "gfx938",
       "cards": 1,
       "suite": "distributed-single-node",
