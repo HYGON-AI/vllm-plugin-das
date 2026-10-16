@@ -294,19 +294,17 @@ class HcuGPUModelRunnerV2(GPUModelRunner):
             return super().execute_model(*args, **kwargs)
 
     def profile_run(self) -> None:
-        """Profile PCP with the per-rank token budget plus routing slack."""
+        """Profile PCP target locally; profile MTP at the full global batch.
+
+        Target prefill is PCP-partitioned, so its MoE/attention workspaces must
+        use the rank-local budget. Runtime MTP restores the global PCP batch
+        before ``propose()``, so draft prefill must still be profiled at the
+        full ``max_num_batched_tokens`` — not divided by PCP.
+        """
 
         pcp_size = int(self.vllm_config.parallel_config.prefill_context_parallel_size)
-        # Upstream profiles the target and MTP prefill from the same dummy
-        # batch. Runtime MTP sampling restores the global PCP batch before
-        # propose(), so shrinking this shared budget would under-profile the
-        # replicated draft prefill even though it is safe for the target.
-        if (
-            pcp_size <= 1
-            or getattr(self, "speculator", None) is not None
-            # GLM5Next KDA and K-pool see the full, replicated token batch.
-            or is_glm53_pcp(self.vllm_config)
-        ):
+        # GLM5Next KDA and K-pool see the full, replicated token batch.
+        if pcp_size <= 1 or is_glm53_pcp(self.vllm_config):
             return super().profile_run()
 
         original_max = self.max_num_tokens
@@ -320,14 +318,82 @@ class HcuGPUModelRunnerV2(GPUModelRunner):
             original_max,
             int(self.max_num_reqs) * max(int(self.decode_query_len), 2),
         )
-        self.max_num_tokens = min(
+        target_budget = min(
             original_max,
             max(1, partitioned_tokens + replicated_request_tokens),
         )
+        speculator = getattr(self, "speculator", None)
+
+        # Pass 1: PCP-aware target profile (exclude MTP propose so it is not
+        # under-profiled at the shrunk batch).
+        self.max_num_tokens = target_budget
+        if speculator is not None:
+            self.speculator = None
         try:
-            return super().profile_run()
+            super().profile_run()
         finally:
+            if speculator is not None:
+                self.speculator = speculator
             self.max_num_tokens = original_max
+
+        if speculator is None:
+            return
+
+        # Pass 2: MTP draft at the full global batch (not /pcp). Stub the
+        # target forward so DeepGEMM workspaces are not inflated by a second
+        # full-batch target MoE profile.
+        self.max_num_tokens = original_max
+        self._hcu_profile_mtp_full_batch = True
+        try:
+            super().profile_run()
+        finally:
+            self._hcu_profile_mtp_full_batch = False
+            self.max_num_tokens = original_max
+
+    def _dummy_run(self, num_tokens, *args, **kwargs):
+        """Optionally stub target forward while sizing full-batch MTP."""
+
+        if not getattr(self, "_hcu_profile_mtp_full_batch", False):
+            return super()._dummy_run(num_tokens, *args, **kwargs)
+
+        real_model = self.model
+        hidden_size = int(self.model_config.get_hidden_size())
+        use_aux = bool(getattr(self, "use_aux_hidden_state_outputs", False))
+        dtype = getattr(self, "dtype", None)
+        if dtype is None:
+            dtype = torch.bfloat16
+        device = self.device
+
+        class _TargetForwardStub:
+            """Keep target attributes, skip heavy MoE/attention compute."""
+
+            def __init__(self, real):
+                object.__setattr__(self, "_real_model", real)
+
+            def __call__(self, *args, **call_kwargs):
+                positions = call_kwargs.get("positions")
+                input_ids = call_kwargs.get("input_ids")
+                if positions is not None:
+                    n = int(positions.shape[0])
+                elif input_ids is not None:
+                    n = int(input_ids.shape[0])
+                else:
+                    n = int(num_tokens)
+                hidden = torch.zeros(
+                    n, hidden_size, dtype=dtype, device=device
+                )
+                if use_aux:
+                    return hidden, []
+                return hidden
+
+            def __getattr__(self, name):
+                return getattr(self._real_model, name)
+
+        self.model = _TargetForwardStub(real_model)
+        try:
+            return super()._dummy_run(num_tokens, *args, **kwargs)
+        finally:
+            self.model = real_model
 
     def prepare_attn(self, input_batch):
         if self.pcp_manager is None:

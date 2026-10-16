@@ -1280,13 +1280,14 @@ def test_profile_run_keeps_global_budget_for_real_mtp_prefill(
     pcp_runner_module,
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    """PCP profiling must not shrink the real MTP propose/prefill shape."""
+    """PCP target shrinks; MTP propose/prefill keeps the full global batch."""
 
     runner_module, _ = pcp_runner_module
     speculator_module = importlib.import_module(
         "vllm.v1.worker.gpu.spec_decode.autoregressive.speculator"
     )
     prefill_tokens: list[int] = []
+    target_profile_tokens: list[int] = []
 
     class ConcreteSpeculator(speculator_module.AutoRegressiveSpeculator):
         def load_draft_model(self, target_model):
@@ -1348,6 +1349,10 @@ def test_profile_run_keeps_global_budget_for_real_mtp_prefill(
 
     def profile_run(self):
         num_tokens = int(self.max_num_tokens)
+        # Pass 1: target-only profile under the PCP-local budget.
+        if getattr(self, "speculator", None) is None:
+            target_profile_tokens.append(num_tokens)
+            return
         num_reqs = min(num_tokens, int(self.max_num_reqs))
         input_batch = SimpleNamespace(
             num_tokens=num_tokens,
@@ -1395,6 +1400,7 @@ def test_profile_run_keeps_global_budget_for_real_mtp_prefill(
 
     runner.profile_run()
 
+    assert target_profile_tokens == [1200]
     assert prefill_tokens == [4096]
     assert runner.max_num_tokens == 4096
 
