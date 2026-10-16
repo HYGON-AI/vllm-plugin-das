@@ -38,17 +38,25 @@ def apply_to_module(module: ModuleType) -> bool:
     def hcu_project_qkv_gate(self, qkv, positions):
         import vllm_hcu.platforms.envs as henvs
 
-        rot_emb = self.rotary_emb
+        # The rotary-embedding layout facts never change after init; cache
+        # them on the layer instead of re-checking per forward call.
+        rot_ok = self.__dict__.get("_vllm_hcu_mrope_layout_ok")
+        if rot_ok is None:
+            rot_emb = self.rotary_emb
+            rot_ok = (
+                self.head_dim == 256
+                and type(rot_emb).__name__ == "MRotaryEmbedding"
+                and getattr(rot_emb, "is_neox_style", False)
+                and rot_emb.rotary_dim == 64
+                and getattr(rot_emb, "mrope_interleaved", False)
+                and tuple(getattr(rot_emb, "mrope_section", ())) == (11, 11, 10)
+            )
+            self.__dict__["_vllm_hcu_mrope_layout_ok"] = rot_ok
         if (
             henvs.VLLM_HCU_USE_CUSTOM_OPS
             and henvs.VLLM_HCU_USE_FUSED_RMSNORM_MROPE
+            and rot_ok
             and positions.ndim == 2
-            and self.head_dim == 256
-            and type(rot_emb).__name__ == "MRotaryEmbedding"
-            and getattr(rot_emb, "is_neox_style", False)
-            and rot_emb.rotary_dim == 64
-            and getattr(rot_emb, "mrope_interleaved", False)
-            and tuple(getattr(rot_emb, "mrope_section", ())) == (11, 11, 10)
         ):
             from vllm_hcu.model_executor.layers.rotary_embedding import (
                 fused_rmsnorm_mrope as _fused,

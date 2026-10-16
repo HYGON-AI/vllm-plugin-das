@@ -45,10 +45,6 @@ def is_hcu_w8a16_int8_channel(weight_quant, input_quant, format: str | None) -> 
     )
 
 
-# Distinct (N, K) pairs already reported as pre-shuffled this process.
-_LOGGED_PRESHUFFLE_SHAPES: set = set()
-
-
 class CompressedTensorsW8A16Hcu(CompressedTensorsScheme):
     """int8 weight-only scheme backed by torch.ops.vllm.w8a16_gemm.
 
@@ -126,27 +122,13 @@ class CompressedTensorsW8A16Hcu(CompressedTensorsScheme):
         scale = layer.weight_scale.data.reshape(-1).contiguous()
 
         from vllm_hcu.model_executor.layers.quantization.w8a16_gemm import (
-            W8A16_LAYOUT_MARLIN,
             W8A16_LAYOUT_RAW,
-            w8a16_should_preshuffle,
+            preshuffle_linear_weight,
         )
 
-        layer.weight_layout = W8A16_LAYOUT_RAW
-        weight = unpacked
-        if w8a16_should_preshuffle(*unpacked.shape):
-            import deepgemm
-
-            shape = tuple(unpacked.shape)
-            if shape not in _LOGGED_PRESHUFFLE_SHAPES:
-                _LOGGED_PRESHUFFLE_SHAPES.add(shape)
-                # warning, not info: vllm_hcu.* loggers run at WARNING in
-                # EngineCore, an info line here would be silently dropped.
-                logger.warning(
-                    "W8A16(compressed-tensors): pre-shuffling linear "
-                    "weights into DeepGEMM marlin layout, (N, K)=%s",
-                    shape)
-            weight = deepgemm.w8a16_marlin_weight(unpacked)
-            layer.weight_layout = W8A16_LAYOUT_MARLIN
+        weight, layout = preshuffle_linear_weight(unpacked,
+                                                  "compressed-tensors")
+        layer.weight_layout = layout
 
         layer.weight = Parameter(weight, requires_grad=False)
         layer.weight_scale = Parameter(scale, requires_grad=False)
