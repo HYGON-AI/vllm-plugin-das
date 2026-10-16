@@ -8,6 +8,7 @@ from types import ModuleType
 
 import pytest
 import torch
+from torch.utils._python_dispatch import TorchDispatchMode
 
 from vllm_hcu.patch.worker.op_opt import patch_deepseek_v41_topk_output_size as patch
 from vllm_hcu.patch.worker.core_fix._common import PatchCompatibilityError
@@ -50,7 +51,10 @@ def _oracle(indices, starts, seq_lens, gather_lens, window, ratio, topk, M, N):
     ],
 )
 @pytest.mark.parametrize("ratio", [4, 128])
-@pytest.mark.parametrize(("window", "topk"), [(0, 3), (8, 6)])
+@pytest.mark.parametrize(
+    ("window", "topk"),
+    [(0, 3), (8, 6), (8, 0), (1, 129), (129, 3), (256, 512)],
+)
 def test_combiner_preserves_request_offsets_and_padded_indices(
     query_lens, base, past, ratio, window, topk
 ):
@@ -74,6 +78,30 @@ def test_combiner_preserves_request_offsets_and_padded_indices(
     for result, reference in zip(actual, expected):
         assert result.dtype == torch.int32
         assert torch.equal(result, reference)
+
+
+def test_combiner_avoids_dynamic_index_sizes_and_scalar_readback():
+    calls = []
+
+    class RecordOps(TorchDispatchMode):
+        def __torch_dispatch__(self, func, types, args=(), kwargs=None):
+            calls.append(str(func))
+            return func(*args, **(kwargs or {}))
+
+    args = (
+        torch.tensor([[0, 1, -1], [2, 99, 1], [3, 0, 1]], dtype=torch.int32),
+        torch.tensor([17, 19, 20], dtype=torch.int32),
+        torch.tensor([2, 129], dtype=torch.int32),
+        torch.tensor([2, 4], dtype=torch.int32),
+        8, 4, 3, 64, 16,
+    )
+    with RecordOps():
+        actual = patch._combine_topk_swa_indices(*args)
+    expected = _oracle(args[0], [17, 19, 20], [2, 129], [2, 4], 8, 4, 3, 64, 16)
+    for result, reference in zip(actual, expected):
+        assert torch.equal(result, reference)
+    assert "aten.scatter_.src" in calls
+    assert not any("nonzero" in op or "_local_scalar_dense" in op for op in calls)
 
 
 def _target(original):
@@ -134,3 +162,23 @@ def test_adapter_rejects_incompatible_target():
     module = _target(lambda x: x)
     with pytest.raises(PatchCompatibilityError, match="signature"):
         patch.apply_to_module(module)
+
+
+def test_combiner_rejects_unknown_backend(monkeypatch):
+    monkeypatch.setenv(patch._BACKEND_FLAG, "unknown")
+    with pytest.raises(ValueError, match="must be auto, torch or triton"):
+        patch._combine_topk_swa_indices(*([None] * 9))
+
+
+def test_swa_only_accepts_model_zero_compress_ratio():
+    args = (
+        torch.zeros(2, 8, dtype=torch.int32),
+        torch.tensor([17, 19], dtype=torch.int32),
+        torch.tensor([2], dtype=torch.int32),
+        torch.tensor([2], dtype=torch.int32),
+        128, 0, 0, 1024, 0,
+    )
+    actual = patch._combine_topk_swa_indices(*args)
+    expected = _oracle(args[0], [17, 19], [2], [2], 128, 1, 0, 1024, 0)
+    for result, reference in zip(actual, expected):
+        assert torch.equal(result, reference)

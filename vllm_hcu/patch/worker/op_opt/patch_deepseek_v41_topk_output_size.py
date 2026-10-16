@@ -1,7 +1,7 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 # SPDX-FileCopyrightText: Copyright (c) 2026 Hygon Information Technology Co., Ltd.
-"""Avoid scalar shape readback in the DSV4.1 AMD prefill index combiner."""
+"""Fused DSV4.1 AMD prefill indices, with a sync-free Torch fallback."""
 
 from __future__ import annotations
 
@@ -24,10 +24,11 @@ PATCH_ID = "worker.op_opt.deepseek_v41.topk_output_size"
 _MARKER = "_vllm_hcu_topk_output_size_applied"
 _ORIGINAL = "_vllm_hcu_original_combine_topk_swa_indices"
 _FLAG = "VLLM_HCU_DSV41_TOPK_OUTPUT_SIZE"
+_BACKEND_FLAG = "VLLM_HCU_DSV41_PREFILL_INDICES_BACKEND"
 _SPARSE_PREFILL_TOPK_ALIGNMENT = 128
 
 
-def _combine_topk_swa_indices(
+def _combine_topk_swa_indices_torch(
     topk_indices: torch.Tensor,
     query_start_loc: torch.Tensor,
     seq_lens: torch.Tensor,
@@ -38,7 +39,11 @@ def _combine_topk_swa_indices(
     M: int,
     N: int,
 ) -> tuple[torch.Tensor, torch.Tensor]:
-    """Preserve the AMD Torch fallback without repeat-size scalar readback."""
+    """Preserve the AMD fallback without dynamic-size scalar readback."""
+    # The model represents SWA-only layers with compress_ratio=0 and topk=0.
+    # There is no compressed span to divide in that case.
+    if topk == 0 and compress_ratio == 0:
+        compress_ratio = 1
     topk_indices = topk_indices.reshape(topk_indices.shape[0], -1).contiguous()
     num_tokens = topk_indices.shape[0]
     combined_topk = (
@@ -99,13 +104,35 @@ def _combine_topk_swa_indices(
         + 1
         - gather_starts[req_ids, None]
     ).to(torch.int32)
-    rows = torch.arange(num_tokens, device=seq_lens.device)[:, None].expand_as(
-        swa_columns
-    )
-    flat_dst = rows[swa_mask] * combined_topk + swa_columns[swa_mask]
-    combined_indices.view(-1).index_copy_(0, flat_dst, swa_values[swa_mask])
+    # Boolean indexing would run nonzero and read its dynamic size back to host.
+    # Each row has unique columns in [topk_lens, topk_lens + window_size),
+    # within combined_topk. Invalid SWA slots only overwrite existing -1 padding.
+    swa_src = torch.where(swa_mask, swa_values, -1)
+    combined_indices.scatter_(1, swa_columns, swa_src)
     combined_lens.copy_((topk_lens + swa_lens).to(torch.int32))
     return combined_indices, combined_lens
+
+
+def _combine_topk_swa_indices(
+    topk_indices, query_start_loc, seq_lens, gather_lens,
+    window_size, compress_ratio, topk, M, N,
+):
+    # Lazy import keeps CPU contract tests and plugin discovery GPU-independent.
+    # Setting the old optimization flag to 0 still restores the upstream path.
+    backend = os.environ.get(_BACKEND_FLAG, "auto").lower()
+    if backend not in ("auto", "torch", "triton"):
+        raise ValueError(f"{_BACKEND_FLAG} must be auto, torch or triton; got {backend!r}")
+    function = _combine_topk_swa_indices_torch
+    if backend == "triton" or (backend == "auto" and topk_indices.is_cuda):
+        from vllm_hcu.v1.attention.ops.deepseek_v41_prefill_indices import (
+            combine_topk_swa_indices,
+        )
+
+        function = combine_topk_swa_indices
+    return function(
+        topk_indices, query_start_loc, seq_lens, gather_lens,
+        window_size, compress_ratio, topk, M, N,
+    )
 
 
 def apply_to_module(module: ModuleType) -> bool:
