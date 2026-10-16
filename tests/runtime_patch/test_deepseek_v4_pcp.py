@@ -86,6 +86,27 @@ def test_v4_runner_accepts_multiple_cache_groups_and_installs_global_metadata(
     assert runner.prepare_attn(SimpleNamespace()) == ("global-tables", "global-slots")
 
 
+@pytest.mark.parametrize("with_mtp", [False, True])
+def test_v4_profile_keeps_global_budget(pcp_runner_module, monkeypatch, with_mtp):
+    module, _ = pcp_runner_module
+    seen = []
+    monkeypatch.setattr(
+        module.GPUModelRunner, "profile_run",
+        lambda self: seen.append((self.max_num_tokens, self.speculator)),
+        raising=False,
+    )
+    config = _config(8)
+    config.model_config = SimpleNamespace(architectures=["DeepseekV4ForCausalLM"])
+    runner = module.HcuGPUModelRunnerV2(config, "cpu")
+    runner.max_num_tokens = 16384
+    runner.speculator = object() if with_mtp else None
+
+    runner.profile_run()
+
+    assert seen == [(16384, runner.speculator)]
+    assert runner.max_num_tokens == 16384
+
+
 def test_empty_v4_shards_use_global_deepep_phase(pcp_runner_module, monkeypatch):
     from vllm_hcu.forward_context_runtime import (
         deepep_auto_request_phase_scope, get_deepep_auto_request_phase,
