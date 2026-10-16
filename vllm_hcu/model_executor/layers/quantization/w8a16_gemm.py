@@ -55,7 +55,8 @@ def _w8a16_tuned_marlin(n: int, k: int) -> bool:
 
 def w8a16_should_preshuffle(n: int, k: int) -> bool:
     """Whether an [N, K] int8 weight should be stored in the marlin layout."""
-    if not (henvs.VLLM_HCU_USE_DEEPGEMM_W8A16_GEMM
+    if not (henvs.VLLM_HCU_USE_CUSTOM_OPS
+            and henvs.VLLM_HCU_USE_DEEPGEMM_W8A16_GEMM
             and henvs.VLLM_HCU_DEEPGEMM_W8A16_PRESHUFFLE):
         return False
     if n % 16 != 0 or k % 128 != 0:
@@ -140,7 +141,10 @@ def _w8a16_gemm(
     weight_layout: int = W8A16_LAYOUT_RAW,
 ) -> torch.Tensor:
     """W8A16 GEMM with runtime backend selection."""
-    use_deepgemm = henvs.VLLM_HCU_USE_DEEPGEMM_W8A16_GEMM
+    use_deepgemm = (
+        henvs.VLLM_HCU_USE_CUSTOM_OPS
+        and henvs.VLLM_HCU_USE_DEEPGEMM_W8A16_GEMM
+    )
     if use_deepgemm:
         try:
             return _w8a16_gemm_deepgemm(x, w, scale, bias, weight_layout)
