@@ -104,6 +104,7 @@ def test_target_metadata_schema_and_round_trip(mooncake):
         "registered_layer_names",
         "registered_layer_indices",
         "registered_group_indices",
+        "num_blocks_per_layer",
     )
     metadata = _metadata(
         mooncake,
@@ -111,6 +112,7 @@ def test_target_metadata_schema_and_round_trip(mooncake):
         kv_caches_base_addr=[100],
         block_lens=[64],
         kv_block_lens=[24],
+        num_blocks_per_layer=[8],
         registered_layer_names=["model.layers.0.self_attn"],
         registered_layer_indices=[0],
         registered_group_indices=[0],
@@ -147,6 +149,11 @@ def test_mooncake_uses_v028_page_layout(mooncake):
         ({"remote_layer_names": [""]}, "non-empty layer name"),
         ({"remote_layer_indices": [-1]}, "non-negative layer indices"),
         ({"remote_group_indices": [-1]}, "non-negative group indices"),
+        ({"remote_num_blocks_per_layer": []}, "positive block capacity"),
+        ({"remote_num_blocks_per_layer": [0]}, "positive block capacity"),
+        ({"remote_num_blocks_per_layer": [-1]}, "positive block capacity"),
+        ({"remote_num_blocks_per_layer": [True]}, "positive block capacity"),
+        ({"remote_num_blocks_per_layer": [2, 3]}, "positive block capacity"),
     ],
 )
 def test_phase1_metadata_is_structural_and_fail_closed(
@@ -470,7 +477,7 @@ def test_registration_rejects_non_page_or_scattered_layouts(mooncake, cache):
     name = "model.layers.0.self_attn"
     worker._layer_specs[name] = _attention_spec(mooncake)
     worker._layer_group_indices[name] = 0
-    with pytest.raises(ValueError, match="compact KV pages|page tensor"):
+    with pytest.raises(ValueError, match="canonical contiguous|page tensor"):
         worker.register_kv_caches({name: cache})
     assert worker.engine.calls == []
 
@@ -956,8 +963,9 @@ def test_mooncake_pp1_bootstrap_preserves_sending_roles(mooncake, monkeypatch, r
 @pytest.mark.parametrize("producer_tp,consumer_tp,use_mla", [
     (1, 2, False), (2, 1, False), (8, 1, True), (1, 8, True),
 ])
+@pytest.mark.parametrize("padded", [False, True])
 def test_v028_allocated_pages_transfer_exact_bytes(
-    mooncake, producer_tp, consumer_tp, use_mla,
+    mooncake, producer_tp, consumer_tp, use_mla, padded,
 ):
     """Exercise allocator views, real topology, and transfer address planning.
 
@@ -988,10 +996,13 @@ def test_v028_allocated_pages_transfer_exact_bytes(
         if use_mla:
             spec = mooncake.MLAAttentionSpec(
                 block_size=2, num_kv_heads=heads, head_size=content,
-                dtype=torch.float16, alignment=32,
+                dtype=torch.float16, alignment=32 if padded else None,
             )
         else:
-            spec = _attention_spec(mooncake, heads=heads, head_size=2, head_size_v=3)
+            spec = _attention_spec(
+                mooncake, heads=heads, head_size=2, head_size_v=3,
+                page_size_padded=(24 * heads if padded else None),
+            )
         # Use v0.28's allocator view builder, including padded MLA pages.
         raw = torch.zeros(3 * spec.page_size_bytes, dtype=torch.int8)
         placement = KVCacheTensor(
@@ -1011,7 +1022,9 @@ def test_v028_allocated_pages_transfer_exact_bytes(
             worker.kv_caches_base_addr, worker.block_len_per_layer,
             worker.kv_block_len_per_layer, worker.registered_layer_names,
             worker.registered_layer_indices, worker.registered_group_indices,
+            num_blocks_per_layer=worker.num_blocks_per_layer,
         )
+        assert regions[0].num_blocks == 3
         assert len(regions) == 1
         return worker, cache, regions
 
@@ -1026,6 +1039,7 @@ def test_v028_allocated_pages_transfer_exact_bytes(
             metadata = _metadata(
                 mooncake, remote_tp_rank=remote_rank, remote_tp_size=consumer_tp,
                 req_blocks={"d": ("x", [[1, 2]])},
+                num_blocks_per_layer=consumer.num_blocks_per_layer,
             )
             send = mooncake.SendBlockMeta(
                 p_req_id="p", transfer_id="x", local_block_ids=[[2, 0]],
@@ -1053,7 +1067,7 @@ def test_registration_rejects_token_major_multi_head_pages(mooncake):
     worker._layer_group_indices[name] = 0
     # Logical [B,H,N,C], physical [B,N,H,C]. Page is dense, heads aren't.
     cache = torch.zeros((2, 2, 2, 4), dtype=torch.float16).transpose(1, 2)
-    with pytest.raises(ValueError, match="contiguous head slices"):
+    with pytest.raises(ValueError, match="canonical contiguous"):
         worker.register_kv_caches({name: cache})
     assert worker.engine.calls == []
 
@@ -1094,3 +1108,63 @@ def test_successful_pull_still_completes_and_error_remains_fatal(mooncake):
     for _ in range(2):
         with pytest.raises(RuntimeError, match="connection lost"):
             asyncio.run(worker.fetch_finished_recving_reqs())
+
+
+@pytest.mark.parametrize("side", ["producer", "consumer"])
+@pytest.mark.parametrize("kernel_ratio,block_id", [(1, 2), (1, 99), (2, 1)])
+def test_transfer_rejects_block_ids_at_or_above_capacity(
+    mooncake, side, kernel_ratio, block_id,
+):
+    from dataclasses import replace
+    worker = _worker(mooncake, blocks_first=False)
+    worker._physical_blocks_per_logical_kv_block = kernel_ratio
+    worker.kv_cache_config = SimpleNamespace(
+        kv_cache_groups=[SimpleNamespace(kv_cache_spec=object())]
+    )
+    local, remote = _single_group_regions(mooncake)
+    local = [replace(local[0], num_blocks=2)]
+    remote = [replace(remote[0], num_blocks=2)]
+    send = mooncake.SendBlockMeta(
+        p_req_id="p", transfer_id="x",
+        local_block_ids=[[block_id if side == "producer" else 0]],
+        ready=asyncio.Event(),
+    )
+    metadata = _metadata(mooncake, req_blocks={
+        "d": ("x", [[block_id if side == "consumer" else 0]]),
+    })
+    src, dst, lengths, errors, message = asyncio.run(worker._build_transfer_params(
+        [("d", send)], metadata, local, remote,
+    ))
+    assert (src, dst, lengths) == ([], [], [])
+    assert errors == ["d"] and side in message and "capacity" in message
+
+
+@pytest.mark.parametrize("counts", [[], [0], [-1], [True], [2, 3]])
+def test_region_capacities_reject_missing_or_invalid_counts(mooncake, counts):
+    with pytest.raises(ValueError, match="positive block capacity"):
+        mooncake._expand_transfer_regions(
+            base_addrs=[100], block_lens=[16], kv_block_lens=[8],
+            layer_names=["model.layers.0.self_attn"], layer_indices=[0],
+            is_kv_layout_blocks_first=False, num_blocks_per_layer=counts,
+        )
+
+
+def test_capacity_error_does_not_emit_partial_request_descriptors(mooncake):
+    from dataclasses import replace
+    worker = _worker(mooncake, blocks_first=False)
+    worker.kv_cache_config = SimpleNamespace(
+        kv_cache_groups=[SimpleNamespace(kv_cache_spec=object())]
+    )
+    local, remote = _single_group_regions(mooncake)
+    local = [replace(local[0], num_blocks=2), replace(local[0], num_blocks=1)]
+    remote = [replace(remote[0], num_blocks=2)] * 2
+    send = mooncake.SendBlockMeta(
+        p_req_id="p", transfer_id="x", local_block_ids=[[1]],
+        ready=asyncio.Event(),
+    )
+    metadata = _metadata(mooncake, req_blocks={"d": ("x", [[1]])})
+    src, dst, lengths, errors, message = asyncio.run(worker._build_transfer_params(
+        [("d", send)], metadata, local, remote,
+    ))
+    assert (src, dst, lengths) == ([], [], [])
+    assert errors == ["d"] and "capacity" in message

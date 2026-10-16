@@ -54,7 +54,6 @@ from vllm.model_executor.models.utils import extract_layer_index
 from vllm.platforms import current_platform
 from vllm.utils.math_utils import cdiv
 from vllm.utils.network_utils import get_ip, make_zmq_path, make_zmq_socket
-from vllm.utils.torch_utils import is_non_overlapping_and_dense
 from vllm.v1.attention.backend import AttentionMetadata
 from vllm.v1.attention.backends.utils import NULL_BLOCK_ID
 from vllm_hcu.v1.attention.kv_cache_layout import get_kv_cache_layout
@@ -145,6 +144,7 @@ class TransferRegion:
     block_len: int
     kv_block_len: int
     group_index: int = 0
+    num_blocks: int | None = None
 
 
 def _normalize_pp_layer_partition(
@@ -177,9 +177,8 @@ def _get_pp_stage_layer_range(
     if partition is None:
         # Keep upstream's default layer distribution authoritative.
         return get_pp_indices(num_layers, pp_rank, pp_size)
-    counts = _normalize_pp_layer_partition(partition, num_layers, pp_size)
-    start = sum(counts[:pp_rank])
-    return start, start + counts[pp_rank]
+    _normalize_pp_layer_partition(partition, num_layers, pp_size)
+    return get_pp_indices(num_layers, pp_rank, pp_size)
 
 
 def _get_tp_ratio(local_tp_size: int, remote_tp_size: int) -> int:
@@ -212,6 +211,7 @@ def _expand_transfer_regions(
     is_kv_layout_blocks_first: bool,
     group_indices: list[int] | None = None,
     split_kv_regions: list[bool] | None = None,
+    num_blocks_per_layer: list[int] | None = None,
 ) -> list[TransferRegion]:
     """Expand registered KV tensors into the regions transferred by Mooncake."""
     assert (
@@ -240,6 +240,12 @@ def _expand_transfer_regions(
         f"got split_kv_regions={len(split_kv_regions)}, "
         f"layer_names={len(layer_names)}."
     )
+    if num_blocks_per_layer is not None and (
+        len(num_blocks_per_layer) != len(layer_names)
+        or any(type(count) is not int or count <= 0 for count in num_blocks_per_layer)
+    ):
+        raise ValueError("Mooncake requires one positive block capacity per region.")
+    capacities = num_blocks_per_layer or [None] * len(layer_names)
     regions: list[TransferRegion] = []
     for (
         base_addr,
@@ -249,6 +255,7 @@ def _expand_transfer_regions(
         layer_index,
         group_index,
         split_kv_region,
+        num_blocks,
     ) in zip(
         base_addrs,
         block_lens,
@@ -257,6 +264,7 @@ def _expand_transfer_regions(
         layer_indices,
         group_indices,
         split_kv_regions,
+        capacities,
     ):
         if base_addr <= 0:
             raise ValueError(
@@ -284,6 +292,7 @@ def _expand_transfer_regions(
                 block_len=block_len,
                 kv_block_len=kv_block_len,
                 group_index=group_index,
+                num_blocks=num_blocks,
             )
         )
         if split_kv_region:
@@ -295,6 +304,7 @@ def _expand_transfer_regions(
                     block_len=block_len,
                     kv_block_len=kv_block_len,
                     group_index=group_index,
+                    num_blocks=num_blocks,
                 )
             )
     return regions
@@ -513,11 +523,20 @@ def _validate_phase1_metadata(
     remote_layer_names: list[str],
     remote_layer_indices: list[int],
     remote_group_indices: list[int],
+    remote_num_blocks_per_layer: list[int] | None = None,
 ) -> str | None:
     """Validate the structural Mooncake wire contract.
 
     Layer occurrences are aligned separately by ``_align_transfer_regions``.
     """
+    if remote_num_blocks_per_layer is not None and (
+        len(remote_num_blocks_per_layer) != len(remote_layer_names)
+        or any(
+            type(count) is not int or count <= 0
+            for count in remote_num_blocks_per_layer
+        )
+    ):
+        return "Mooncake remote metadata requires one positive block capacity per region."
     local_lengths = {
         len(local_layer_names),
         len(local_layer_indices),
@@ -633,6 +652,7 @@ class MooncakeXferMetadata(
     registered_layer_names: list[str] = msgspec.field(default_factory=list)
     registered_layer_indices: list[int] = msgspec.field(default_factory=list)
     registered_group_indices: list[int] = msgspec.field(default_factory=list)
+    num_blocks_per_layer: list[int] = msgspec.field(default_factory=list)
 
 
 class MooncakeXferResponseStatus(IntEnum):
@@ -1215,6 +1235,7 @@ class MooncakeConnectorWorker:
         self.registered_layer_names: list[str] = []
         self.registered_layer_indices: list[int] = []
         self.registered_group_indices: list[int] = []
+        self.num_blocks_per_layer: list[int] = []
         self.seen_base_addresses: list[int] = []
 
         assert (parallel_config := vllm_config.parallel_config)
@@ -1503,6 +1524,7 @@ class MooncakeConnectorWorker:
                 remote_layer_names=meta.registered_layer_names,
                 remote_layer_indices=meta.registered_layer_indices,
                 remote_group_indices=meta.registered_group_indices,
+                remote_num_blocks_per_layer=meta.num_blocks_per_layer,
             )
             if metadata_err is not None:
                 await reject_metadata(metadata_err)
@@ -1514,6 +1536,7 @@ class MooncakeConnectorWorker:
             self.registered_layer_names,
             self.registered_layer_indices,
             self.registered_group_indices,
+            num_blocks_per_layer=self.num_blocks_per_layer,
         )
         remote_regions = self._get_transfer_regions(
             meta.kv_caches_base_addr,
@@ -1522,6 +1545,7 @@ class MooncakeConnectorWorker:
             meta.registered_layer_names,
             meta.registered_layer_indices,
             meta.registered_group_indices,
+            num_blocks_per_layer=meta.num_blocks_per_layer,
         )
         local_regions, remote_regions, align_err = _align_transfer_regions(
             local_regions, remote_regions
@@ -1834,6 +1858,35 @@ class MooncakeConnectorWorker:
                     err_msg = block_id_error
                 continue
 
+            bounds_error = None
+            for regions, groups, side in (
+                (local_regions, local_block_ids_by_group, "producer"),
+                (remote_regions, remote_block_ids_by_group, "consumer"),
+            ):
+                max_block_ids = [max(group, default=-1) for group in groups]
+                for region in regions:
+                    if not 0 <= region.group_index < len(groups):
+                        bounds_error = (
+                            f"Mooncake {side} region references a missing KV group."
+                        )
+                        break
+                    if (
+                        region.num_blocks is not None
+                        and max_block_ids[region.group_index] >= region.num_blocks
+                    ):
+                        bounds_error = (
+                            f"Mooncake {side} block ID exceeds region capacity "
+                            f"{region.num_blocks} for {region.layer_name}."
+                        )
+                        break
+                if bounds_error is not None:
+                    break
+            if bounds_error is not None:
+                err_reqs.append(d_req_id)
+                if err_msg is None:
+                    err_msg = bounds_error
+                continue
+
             for local_region, remote_region in zip(local_regions, remote_regions):
                 assert local_region.group_index == remote_region.group_index, (
                     "Aligned Mooncake transfer regions must belong to the same "
@@ -1981,6 +2034,7 @@ class MooncakeConnectorWorker:
         self.registered_layer_names = []
         self.registered_layer_indices = []
         self.registered_group_indices = []
+        self.num_blocks_per_layer = []
 
         for layer_name, cache in kv_caches.items():
             layer_index = extract_layer_index(layer_name)
@@ -2010,18 +2064,6 @@ class MooncakeConnectorWorker:
                 raise ValueError(
                     f"KV cache {layer_name} must contain at least one block."
                 )
-            if not is_non_overlapping_and_dense(cache[0]):
-                raise ValueError(
-                    "HCU Mooncake requires compact KV pages; "
-                    f"layer={layer_name}, shape={tuple(cache.shape)}, "
-                    f"stride={cache.stride()}. Use KV cache layout LBHNC."
-                )
-            if cache.shape[1] > 1 and cache.stride(1) != cache[0, 0].numel():
-                raise ValueError(
-                    "HCU Mooncake requires contiguous head slices for "
-                    f"heterogeneous TP; layer={layer_name}. "
-                    "Use KV cache layout LBHNC."
-                )
             if not cache[0].is_contiguous():
                 raise ValueError(
                     "HCU Mooncake requires canonical contiguous [H, N, C] "
@@ -2039,15 +2081,30 @@ class MooncakeConnectorWorker:
                         "Mooncake KV page size must divide evenly into "
                         f"physical kernel blocks for {layer_name}."
                     )
-                kv_block_len = layer_spec.page_size_bytes // ratio
+                if layer_spec.page_size_bytes // ratio > block_len:
+                    raise ValueError(
+                        f"Mooncake KV page exceeds its physical block stride: {layer_name}."
+                    )
+                if isinstance(layer_spec, (MLAAttentionSpec, SlidingWindowMLASpec)):
+                    kv_block_len = layer_spec.page_size_bytes // ratio
+                else:
+                    if layer_spec.unpadded_page_size_bytes % ratio:
+                        raise ValueError(
+                            "Mooncake KV content must divide into kernel blocks."
+                        )
+                    kv_block_len = layer_spec.unpadded_page_size_bytes // ratio
+                    if kv_block_len != cache[0].numel() * cache.element_size():
+                        raise ValueError(
+                            "Mooncake KV page shape does not match its spec."
+                        )
             else:
                 raise NotImplementedError(
                     "HCU Mooncake supports attention KV pages only; "
                     f"layer={layer_name}, spec={type(layer_spec).__name__}."
                 )
-            # page_size_bytes includes allocator alignment padding, which
-            # need not be visible in the logical tensor shape. Validate the
-            # full transfer against its byte stride and registered storage.
+            # Keep padded page strides separate from head payload lengths.
+            # MLA copies its complete aligned page; sharded attention copies
+            # only content, so TP offsets never include trailing page padding.
             if kv_block_len <= 0 or kv_block_len > block_len:
                 raise ValueError(
                     "Mooncake KV payload exceeds its physical block stride: "
@@ -2060,6 +2117,7 @@ class MooncakeConnectorWorker:
             self.registered_layer_names.append(layer_name)
             self.registered_layer_indices.append(layer_index)
             self.registered_group_indices.append(self._layer_group_indices[layer_name])
+            self.num_blocks_per_layer.append(cache.shape[0])
             storage = cache.untyped_storage()
             storage_addr = storage.data_ptr()
             storage_len = storage.nbytes()
@@ -2202,6 +2260,7 @@ class MooncakeConnectorWorker:
             registered_layer_names=self.registered_layer_names,
             registered_layer_indices=self.registered_layer_indices,
             registered_group_indices=self.registered_group_indices,
+            num_blocks_per_layer=self.num_blocks_per_layer,
         )
 
         encoded_data = self._encoder.encode(metadata)
@@ -2446,6 +2505,7 @@ class MooncakeConnectorWorker:
         layer_names: list[str],
         layer_indices: list[int],
         group_indices: list[int] | None = None,
+        num_blocks_per_layer: list[int] | None = None,
     ) -> list[TransferRegion]:
         if not group_indices:
             group_indices = [
@@ -2461,6 +2521,7 @@ class MooncakeConnectorWorker:
             # One transfer region per v0.28 page, including both K and V.
             is_kv_layout_blocks_first=False,
             group_indices=group_indices,
+            num_blocks_per_layer=num_blocks_per_layer,
         )
 
     def _get_sender_transfer_plan(
