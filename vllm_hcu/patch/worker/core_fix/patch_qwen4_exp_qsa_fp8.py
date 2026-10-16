@@ -11,9 +11,12 @@ from __future__ import annotations
 import functools
 import importlib
 import inspect
+import os
 from types import ModuleType
 
 import torch
+
+from vllm.logger import init_logger
 
 from vllm_hcu.v1.attention.backends.qsa import get_qsa_fp8_reader
 
@@ -24,6 +27,48 @@ from ._common import (
     require_class,
     require_exact_signature,
 )
+
+logger = init_logger(__name__)
+
+# Short-context dense fast-path threshold (tokens of computed KV), applied
+# only to pure fresh-prefill steps in eager mode; decode, mixed and
+# continued-chunk steps and cudagraph capture always take the QSA path.
+# Below it QSA's fixed indexer-scoring/top-k overhead dominates, so plain
+# causal varlen attention on the step's BF16 K/V is faster; the indexer and
+# cache updates still run, so later QSA steps stay correct.  0 disables it.
+_QSA_DENSE_MAX_CTX = int(os.environ.get("VLLM_HCU_QSA_DENSE_MAX_CTX", "16384"))
+_PURE_PREFILL_ATTR = "_vllm_hcu_qsa_pure_prefill"
+
+
+def _use_dense_prefill(attn_metadata) -> bool:
+    """Whether this step is a short pure fresh prefill (eager only).
+
+    Host-side checks run first so decode, capture and long contexts never
+    synchronize.  max_query_len >= 16 also keeps short uniform batches off the
+    vendor varlen MTP/direct-paged dispatch.  The per-request "no cached
+    context" check needs one device sync, cached on the step's metadata.
+    """
+    if (
+        _QSA_DENSE_MAX_CTX <= 0
+        or torch.cuda.is_current_stream_capturing()
+        or attn_metadata.use_cascade
+        or attn_metadata.num_actual_tokens == 0
+        or attn_metadata.max_query_len < 16
+        or attn_metadata.max_seq_len >= _QSA_DENSE_MAX_CTX
+    ):
+        return False
+    cached = getattr(attn_metadata, _PURE_PREFILL_ATTR, None)
+    if cached is None:
+        query_start_loc = attn_metadata.query_start_loc
+        num_reqs = query_start_loc.shape[0] - 1
+        cached = bool(
+            torch.equal(
+                attn_metadata.seq_lens[:num_reqs],
+                query_start_loc.diff().to(attn_metadata.seq_lens.dtype),
+            )
+        )
+        setattr(attn_metadata, _PURE_PREFILL_ATTR, cached)
+    return cached
 
 TARGET_MODULE = "vllm.models.qwen4_exp.amd.qsa"
 PATCH_ID = "worker.core_fix.qwen4_exp.qsa.fp8_kv_cache"
@@ -458,7 +503,6 @@ def apply_to_module(module: ModuleType) -> bool:
                 output_scale,
                 output_block_scale,
             )
-        del key, value
         if output_scale is not None or output_block_scale is not None:
             raise NotImplementedError(
                 "QSA does not support fused output quantization"
@@ -471,6 +515,44 @@ def apply_to_module(module: ModuleType) -> bool:
             raise NotImplementedError(
                 "QSA does not support sliding-window attention"
             )
+
+        if _use_dense_prefill(attn_metadata):
+            # Pure fresh prefill (every request has zero cached context): the
+            # whole K/V of each sequence is this step's BF16 key/value, so run
+            # plain causal varlen attention on them instead of the paged FP8
+            # cache (whose 3200-token pages the vendor varlen kernel cannot
+            # read).  The indexer and KV-cache updates already ran in
+            # _run_qsa, so later decode/QSA steps stay correct.
+            from flash_attn import flash_attn_varlen_func
+
+            num_tokens = attn_metadata.num_actual_tokens
+            cu_seqlens = attn_metadata.query_start_loc
+            logger.info_once(
+                "[HCU QSA PATH] dense_varlen "
+                f"(pure prefill, max_seq_len < {_QSA_DENSE_MAX_CTX})",
+                scope="local",
+            )
+            # The vendor non-paged varlen path ignores ``out=`` and returns a
+            # fresh tensor, so copy the result into the caller's buffer.
+            dense_out = flash_attn_varlen_func(
+                q=query[:num_tokens],
+                k=key[:num_tokens],
+                v=value[:num_tokens],
+                cu_seqlens_q=cu_seqlens,
+                cu_seqlens_k=cu_seqlens,
+                max_seqlen_q=attn_metadata.max_query_len,
+                max_seqlen_k=attn_metadata.max_query_len,
+                softmax_scale=self.scale,
+                causal=True,
+                window_size=(-1, -1),
+                layout="bshd",
+            )
+            if isinstance(dense_out, (tuple, list)):
+                dense_out = dense_out[0]
+            output[:num_tokens].copy_(dense_out)
+            output[num_tokens:].zero_()
+            return output
+        del key, value
 
         num_tokens = attn_metadata.num_actual_tokens
         output.zero_()
