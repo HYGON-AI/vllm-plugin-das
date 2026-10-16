@@ -95,5 +95,28 @@ def apply_to_module(module: ModuleType) -> bool:
         return orig_gqm(self, layer, prefix)
 
     config_cls.get_quant_method = _hcu_w8a16_get_quant_method
+
+    # ModelOptMixedPrecisionConfig overrides get_quant_method and never
+    # calls the base class, so the base-class wrapper above does not reach
+    # its RoutedExperts branch. Wrap it with the same W8A16 interception
+    # (using its own _resolve_quant_algo + exclusion check); upstream
+    # formats (FP8/NVFP4/W4A16_NVFP4/MXFP8) keep their dispatch.
+    mixed_cls = getattr(mo, "ModelOptMixedPrecisionConfig", None)
+    if mixed_cls is not None and hasattr(mixed_cls, "get_quant_method"):
+        mixed_orig = mixed_cls.get_quant_method
+
+        def _hcu_w8a16_mixed_gqm(self, layer, prefix=""):
+            if (
+                type(layer).__name__ == "RoutedExperts"
+                and not self.is_layer_excluded(prefix)
+            ):
+                algo = self._resolve_quant_algo(prefix)
+                if str(algo).upper() == "W8A16":
+                    return ModelOptW8A16MoEMethod(
+                        quant_config=self, moe_config=layer.moe_config)
+            return mixed_orig(self, layer, prefix)
+
+        mixed_cls.get_quant_method = _hcu_w8a16_mixed_gqm
+
     setattr(mo, _MARKER, True)
     return True
