@@ -57,7 +57,7 @@ def _run_fresh_v028(code: str) -> subprocess.CompletedProcess[str]:
             "VLLM_HCU_SOURCE_ROOT": str(REPO_ROOT),
             "VLLM_USE_NN": "1",
             "VLLM_HCU_USE_CUSTOM_OPS": "0",
-            "VLLM_HCU_USE_CUSTOM_AITER_FLA": "0",
+            "VLLM_HCU_GDN_DECODE_BACKEND": "triton",
             "VLLM_HCU_USE_CUSTOM_CAUSAL_CONV1D": "0",
             "VLLM_HCU_MAMBA_SSM_CACHE_DTYPE": "0",
             "HIP_VISIBLE_DEVICES": "",
@@ -354,10 +354,8 @@ def test_qwen_sigmoid_uses_boltops(monkeypatch):
         "boltops.fla.gdn",
         fused_sigmoid_gating_delta_rule_update=boltops,
     )
-    from vllm_hcu.platforms import envs as henvs
-
-    monkeypatch.setattr(henvs, "VLLM_HCU_USE_CUSTOM_OPS", True)
-    monkeypatch.setattr(henvs, "VLLM_HCU_USE_CUSTOM_AITER_FLA", True)
+    monkeypatch.setenv("VLLM_HCU_USE_CUSTOM_OPS", "1")
+    monkeypatch.setenv("VLLM_HCU_GDN_DECODE_BACKEND", "hcu-boltops")
     adapter.apply_to_module(module)
 
     assert (
@@ -381,10 +379,8 @@ def test_qwen_sigmoid_uses_boltops_for_mixed_dtype(monkeypatch):
         "boltops.fla.gdn",
         fused_sigmoid_gating_delta_rule_update=boltops,
     )
-    from vllm_hcu.platforms import envs as henvs
-
-    monkeypatch.setattr(henvs, "VLLM_HCU_USE_CUSTOM_OPS", True)
-    monkeypatch.setattr(henvs, "VLLM_HCU_USE_CUSTOM_AITER_FLA", True)
+    monkeypatch.setenv("VLLM_HCU_USE_CUSTOM_OPS", "1")
+    monkeypatch.setenv("VLLM_HCU_GDN_DECODE_BACKEND", "hcu-boltops")
     adapter.apply_to_module(module)
 
     result = module.fused_sigmoid_gating_delta_rule_update(
@@ -413,10 +409,8 @@ def test_qwen_packed_recurrent_uses_boltops(monkeypatch):
         "boltops.fla.gdn",
         fused_recurrent_gated_delta_rule_packed_decode=boltops,
     )
-    from vllm_hcu.platforms import envs as henvs
-
-    monkeypatch.setattr(henvs, "VLLM_HCU_USE_CUSTOM_OPS", True)
-    monkeypatch.setattr(henvs, "VLLM_HCU_USE_CUSTOM_AITER_FLA", True)
+    monkeypatch.setenv("VLLM_HCU_USE_CUSTOM_OPS", "1")
+    monkeypatch.setenv("VLLM_HCU_GDN_DECODE_BACKEND", "hcu-boltops")
     adapter.apply_to_module(module)
     args = tuple(torch.empty(1) for _ in range(5))
     result = module.fused_recurrent_gated_delta_rule_packed_decode(
@@ -438,10 +432,8 @@ def test_qwen_sigmoid_missing_boltops_symbol_falls_back(monkeypatch):
     adapter = _adapter("patch_gdn_linear_attention")
     module, _, _, _, _ = _fake_qwen(aiter_available=False)
     _install_module(monkeypatch, "boltops.fla.gdn")
-    from vllm_hcu.platforms import envs as henvs
-
-    monkeypatch.setattr(henvs, "VLLM_HCU_USE_CUSTOM_OPS", True)
-    monkeypatch.setattr(henvs, "VLLM_HCU_USE_CUSTOM_AITER_FLA", True)
+    monkeypatch.setenv("VLLM_HCU_USE_CUSTOM_OPS", "1")
+    monkeypatch.setenv("VLLM_HCU_GDN_DECODE_BACKEND", "hcu-boltops")
     adapter.apply_to_module(module)
     assert (
         module.fused_sigmoid_gating_delta_rule_update(*_sigmoid_args())
@@ -453,10 +445,8 @@ def test_qwen_packed_recurrent_missing_boltops_symbol_falls_back(monkeypatch):
     adapter = _adapter("patch_gdn_linear_attention")
     module, _, _, _, _ = _fake_qwen(aiter_available=False)
     _install_module(monkeypatch, "boltops.fla.gdn")
-    from vllm_hcu.platforms import envs as henvs
-
-    monkeypatch.setattr(henvs, "VLLM_HCU_USE_CUSTOM_OPS", True)
-    monkeypatch.setattr(henvs, "VLLM_HCU_USE_CUSTOM_AITER_FLA", True)
+    monkeypatch.setenv("VLLM_HCU_USE_CUSTOM_OPS", "1")
+    monkeypatch.setenv("VLLM_HCU_GDN_DECODE_BACKEND", "hcu-boltops")
     adapter.apply_to_module(module)
     args = tuple(torch.empty(1) for _ in range(5))
     result = module.fused_recurrent_gated_delta_rule_packed_decode(
@@ -467,6 +457,217 @@ def test_qwen_packed_recurrent_missing_boltops_symbol_falls_back(monkeypatch):
         torch.empty(1, dtype=torch.long),
     )
     assert result == "target-packed_recurrent"
+
+
+def _aiter_sigmoid_contract(
+    A_log, a, b, dt_bias, q, k, v, beta=1.0, threshold=20.0,
+    scale=None, initial_state=None, inplace_final_state=True,
+    cu_seqlens=None, ssm_state_indices=None, num_accepted_tokens=None,
+    use_qk_l2norm_in_kernel=False, is_kda=False,
+):
+    pass
+
+
+def _aiter_packed_recurrent_contract(
+    mixed_qkv, a, b, A_log, dt_bias, scale, initial_state, out,
+    ssm_state_indices, use_qk_l2norm_in_kernel=False, kernel_cfg=None,
+):
+    pass
+
+
+def _aiter_hip_sigmoid_kwargs(state_dtype=torch.float32):
+    """Small decode inputs that satisfy the aiter HIP kernel's checks."""
+    q = torch.empty(1, 4, 2, 128, dtype=torch.bfloat16)
+    return dict(
+        A_log=torch.empty(4, dtype=torch.float32),
+        a=torch.empty(4, 4, dtype=torch.bfloat16),
+        b=torch.empty(4, 4, dtype=torch.bfloat16),
+        dt_bias=torch.empty(4, dtype=torch.bfloat16),
+        q=q,
+        k=torch.empty_like(q),
+        v=torch.empty(1, 4, 4, 128, dtype=torch.bfloat16),
+        initial_state=torch.empty(8, 4, 128, 128, dtype=state_dtype),
+        ssm_state_indices=torch.tensor([3, 0, 5, 0], dtype=torch.int32),
+    )
+
+
+def test_qwen_sigmoid_uses_aiter_hip_with_vllm_null_index(monkeypatch):
+    adapter = _adapter("patch_gdn_linear_attention")
+    module, _, _, _, _ = _fake_qwen(aiter_available=False)
+    module.fused_sigmoid_gating_delta_rule_update = _sigmoid_contract
+    calls = []
+
+    def aiter(*args, **kwargs):
+        calls.append((args, kwargs))
+        return "aiter"
+
+    aiter.__signature__ = inspect.signature(_aiter_sigmoid_contract)
+    _install_module(
+        monkeypatch,
+        "aiter.ops.fla",
+        vllm_fused_sigmoid_gating_delta_rule_update=aiter,
+    )
+    monkeypatch.setenv("VLLM_HCU_USE_CUSTOM_OPS", "1")
+    monkeypatch.setenv("VLLM_HCU_GDN_DECODE_BACKEND", "hcu-aiter")
+    adapter.apply_to_module(module)
+
+    inputs = _aiter_hip_sigmoid_kwargs()
+    result = module.fused_sigmoid_gating_delta_rule_update(**inputs)
+
+    assert result == "aiter"
+    assert len(calls) == 1
+    assert "null_state_index" not in calls[0][1]
+    remapped = calls[0][0][13]
+    assert remapped.dtype == torch.int32
+    assert remapped.tolist() == [3, -1, 5, -1]
+    assert inputs["ssm_state_indices"].tolist() == [3, 0, 5, 0]
+
+
+def test_qwen_packed_recurrent_uses_aiter_hip_with_vllm_null_index(monkeypatch):
+    adapter = _adapter("patch_gdn_linear_attention")
+    module, _, _, _, _ = _fake_qwen(aiter_available=False)
+    calls = []
+
+    def aiter(*args, **kwargs):
+        calls.append((args, kwargs))
+        return "aiter-out", "aiter-state"
+
+    aiter.__signature__ = inspect.signature(_aiter_packed_recurrent_contract)
+    _install_module(
+        monkeypatch,
+        "aiter.ops.fla",
+        aiter_fused_recurrent_gated_delta_rule_packed_decode=aiter,
+    )
+    monkeypatch.setenv("VLLM_HCU_USE_CUSTOM_OPS", "1")
+    monkeypatch.setenv("VLLM_HCU_GDN_DECODE_BACKEND", "hcu-aiter")
+    adapter.apply_to_module(module)
+
+    args = tuple(torch.empty(1) for _ in range(5))
+    result = module.fused_recurrent_gated_delta_rule_packed_decode(
+        *args,
+        0.5,
+        torch.empty(8, 4, 128, 128),
+        torch.empty(2, 1, 4, 128),
+        torch.tensor([0, 7], dtype=torch.int32),
+    )
+
+    assert result == ("aiter-out", "aiter-state")
+    assert calls[0][0][8].tolist() == [-1, 7]
+
+
+def _install_boltops_sigmoid(monkeypatch, calls):
+    def boltops(*args, **kwargs):
+        calls.append(kwargs)
+        return "boltops"
+
+    boltops.__signature__ = inspect.signature(_boltops_sigmoid_contract)
+    _install_module(
+        monkeypatch,
+        "boltops.fla.gdn",
+        fused_sigmoid_gating_delta_rule_update=boltops,
+    )
+
+
+def test_qwen_sigmoid_missing_aiter_falls_back_to_boltops(monkeypatch):
+    adapter = _adapter("patch_gdn_linear_attention")
+    module, _, _, _, _ = _fake_qwen(aiter_available=False)
+    module.fused_sigmoid_gating_delta_rule_update = _sigmoid_contract
+    calls = []
+    _install_boltops_sigmoid(monkeypatch, calls)
+    _install_module(monkeypatch, "aiter.ops.fla")
+    monkeypatch.setenv("VLLM_HCU_USE_CUSTOM_OPS", "1")
+    monkeypatch.setenv("VLLM_HCU_GDN_DECODE_BACKEND", "hcu-aiter")
+    adapter.apply_to_module(module)
+
+    assert (
+        module.fused_sigmoid_gating_delta_rule_update(*_sigmoid_args())
+        == "boltops"
+    )
+    assert calls[0]["null_state_index"] == 0
+
+
+def test_qwen_sigmoid_unsupported_aiter_inputs_fall_back_to_boltops(
+    monkeypatch,
+):
+    adapter = _adapter("patch_gdn_linear_attention")
+    module, _, _, _, _ = _fake_qwen(aiter_available=False)
+    module.fused_sigmoid_gating_delta_rule_update = _sigmoid_contract
+    calls = []
+    _install_boltops_sigmoid(monkeypatch, calls)
+    aiter = lambda *a, **k: pytest.fail("aiter HIP requires an fp32 state")
+    aiter.__signature__ = inspect.signature(_aiter_sigmoid_contract)
+    _install_module(
+        monkeypatch,
+        "aiter.ops.fla",
+        vllm_fused_sigmoid_gating_delta_rule_update=aiter,
+    )
+    monkeypatch.setenv("VLLM_HCU_USE_CUSTOM_OPS", "1")
+    monkeypatch.setenv("VLLM_HCU_GDN_DECODE_BACKEND", "hcu-aiter")
+    adapter.apply_to_module(module)
+
+    result = module.fused_sigmoid_gating_delta_rule_update(
+        **_aiter_hip_sigmoid_kwargs(state_dtype=torch.bfloat16)
+    )
+
+    assert result == "boltops"
+    assert calls[0]["null_state_index"] == 0
+
+
+def test_qwen_decode_triton_skips_hcu_providers(monkeypatch):
+    adapter = _adapter("patch_gdn_linear_attention")
+    module, _, _, _, _ = _fake_qwen(aiter_available=False)
+    _install_module(
+        monkeypatch,
+        "boltops.fla.gdn",
+        fused_sigmoid_gating_delta_rule_update=lambda *a, **k: pytest.fail(
+            "triton must not call BoltOPs"
+        ),
+    )
+    monkeypatch.setenv("VLLM_HCU_USE_CUSTOM_OPS", "1")
+    monkeypatch.setenv("VLLM_HCU_GDN_DECODE_BACKEND", "triton")
+    adapter.apply_to_module(module)
+
+    assert (
+        module.fused_sigmoid_gating_delta_rule_update(*_sigmoid_args())
+        == "target-sigmoid"
+    )
+
+
+def test_qwen_decode_owns_vllm_aiter_fast_path():
+    adapter = _adapter("patch_gdn_linear_attention")
+    module, _, _, _, _ = _fake_qwen(aiter_available=True)
+
+    adapter.apply_to_module(module)
+
+    assert module.GDN_AITER_TRITON_AVAILABLE is False
+    assert module._vllm_hcu_original_gdn_aiter_triton_available is True
+    assert adapter.apply_to_module(module) is False
+
+
+def test_qwen_prefill_backend_is_captured_from_resolver(monkeypatch):
+    adapter = _adapter("patch_gdn_linear_attention")
+    backend = _adapter("_gdn_backend")
+    module, _, _, _, _ = _fake_qwen(aiter_available=False)
+    module._resolve_gdn_prefill_backend = lambda config: ("auto", "triton")
+    monkeypatch.setattr(backend, "_prefill_requested", None)
+    monkeypatch.setenv("VLLM_HCU_USE_CUSTOM_OPS", "1")
+    adapter.apply_to_module(module)
+
+    config = SimpleNamespace(
+        additional_config={
+            "gdn_prefill_backend": "triton",
+            "hcu": {"hcu_gdn_prefill_backend": "hcu-aiter"},
+        }
+    )
+    assert module._resolve_gdn_prefill_backend(config) == ("auto", "triton")
+    assert backend.requested_backend("prefill") == "hcu-aiter"
+
+    explicit = SimpleNamespace(additional_config={"gdn_prefill_backend": "triton"})
+    module._resolve_gdn_prefill_backend(explicit)
+    assert backend.requested_backend("prefill") == "triton"
+
+    module._resolve_gdn_prefill_backend(SimpleNamespace(additional_config={}))
+    assert backend.requested_backend("prefill") == "hcu-aiter"
 
 
 def _install_module(monkeypatch: pytest.MonkeyPatch, name: str, **values):

@@ -7,6 +7,7 @@ import ast
 import contextlib
 import dataclasses
 import enum
+import inspect
 import os
 import subprocess
 import sys
@@ -28,6 +29,7 @@ from vllm_hcu.patch.worker.framework_opt import (
     patch_dp_utils,
     patch_draft_speculator_inputs,
     patch_eagle_utils,
+    patch_eplb_communicator,
     patch_forward_context,
     patch_gpu_ubatch_wrapper,
     patch_llm_base_proposer,
@@ -35,6 +37,62 @@ from vllm_hcu.patch.worker.framework_opt import (
     patch_pynccl_wrapper,
     patch_ubatch_utils,
 )
+
+
+def test_gloo_eplb_communicator_preserves_profile_buffer_reservation() -> None:
+    class EplbCommunicator:
+        @property
+        def needs_profile_buffer_reservation(self) -> bool:
+            return True
+
+    class TorchDistGlooStagedEplbCommunicator(EplbCommunicator):
+        pass
+
+    module = _module(
+        patch_eplb_communicator.TARGET_MODULE,
+        EplbCommunicator=EplbCommunicator,
+        TorchDistGlooStagedEplbCommunicator=(
+            TorchDistGlooStagedEplbCommunicator
+        ),
+    )
+    assert patch_eplb_communicator.apply_to_module(module)
+
+    communicator = object.__new__(TorchDistGlooStagedEplbCommunicator)
+    assert communicator.needs_profile_buffer_reservation
+    setattr(
+        communicator,
+        patch_eplb_communicator.STATIC_MODE_MARKER,
+        True,
+    )
+    assert not communicator.needs_profile_buffer_reservation
+
+
+def test_gloo_eplb_communicator_rejects_stale_property_marker() -> None:
+    class EplbCommunicator:
+        @property
+        def needs_profile_buffer_reservation(self) -> bool:
+            return True
+
+    class TorchDistGlooStagedEplbCommunicator(EplbCommunicator):
+        pass
+
+    module = _module(
+        patch_eplb_communicator.TARGET_MODULE,
+        EplbCommunicator=EplbCommunicator,
+        TorchDistGlooStagedEplbCommunicator=(
+            TorchDistGlooStagedEplbCommunicator
+        ),
+    )
+    patch_eplb_communicator.apply_to_module(module)
+    TorchDistGlooStagedEplbCommunicator.needs_profile_buffer_reservation = (
+        EplbCommunicator.needs_profile_buffer_reservation
+    )
+
+    with pytest.raises(
+        patch_eplb_communicator.PatchCompatibilityError,
+        match="stale",
+    ):
+        patch_eplb_communicator.apply_to_module(module)
 
 
 def _module(name: str, **attributes: object) -> ModuleType:
@@ -553,6 +611,12 @@ def test_base_communicator_reads_custom_sp_sidecar_and_uses_torch_collective(
 
 def test_cuda_communicator_registers_exact_exchange_and_marks_stale_removal_obsolete():
     class CudaCommunicator:
+        def destroy(self):
+            pass
+
+        def all_gatherv(self, input_, dim=0, sizes=None):
+            return input_
+
         def __init__(
             self,
             cpu_group,
@@ -601,6 +665,12 @@ def test_cuda_communicator_replaces_normalized_ll_manager_for_auto(
     )
 
     class CudaCommunicator:
+        def destroy(self):
+            pass
+
+        def all_gatherv(self, input_, dim=0, sizes=None):
+            return input_
+
         def __init__(
             self,
             cpu_group,
@@ -640,6 +710,12 @@ def test_cuda_communicator_auto_ignores_non_ep_collective_groups(
     )
 
     class CudaCommunicator:
+        def destroy(self):
+            pass
+
+        def all_gatherv(self, input_, dim=0, sizes=None):
+            return input_
+
         def __init__(
             self,
             cpu_group,
@@ -1191,6 +1267,64 @@ def test_dp_coordination_deepep_low_latency_and_feature_off_delegation():
     assert calls == [(4, normal)]
 
 
+def test_gpu_dp_upstream_selects_dbo_for_fixed_deepep_low_latency(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    from vllm.config.compilation import CUDAGraphMode
+    from vllm.v1.worker.gpu import dp_utils as upstream
+    from vllm.v1.worker.gpu.cudagraph_utils import BatchExecutionDescriptor
+
+    def all_reduce(tensor, group):
+        assert group == "cpu-group"
+        tensor[0].fill_(4)
+        tensor[1].fill_(CUDAGraphMode.NONE.value)
+        tensor[2].zero_()
+        tensor[3].fill_(-1)
+        tensor[4].fill_(1)
+        tensor[5].fill_(2)
+
+    monkeypatch.setattr(
+        upstream,
+        "get_dp_group",
+        lambda: SimpleNamespace(cpu_group="cpu-group"),
+    )
+    monkeypatch.setattr(upstream.dist, "all_reduce", all_reduce)
+    parallel_config = SimpleNamespace(
+        all2all_backend="deepep_low_latency",
+        enable_dbo=True,
+        use_ubatching=True,
+        num_ubatches=2,
+        dbo_decode_token_threshold=2,
+        dbo_prefill_token_threshold=2,
+    )
+    desired = BatchExecutionDescriptor(
+        cg_mode=CUDAGraphMode.NONE,
+        num_tokens=4,
+        num_reqs=2,
+    )
+
+    synced, state = inspect.unwrap(
+        upstream.sync_cudagraph_and_dp_padding
+    )(
+        None,
+        desired,
+        4,
+        2,
+        None,
+        8,
+        0,
+        parallel_config=parallel_config,
+        allow_ubatching=True,
+    )
+
+    assert synced.cg_mode == CUDAGraphMode.NONE
+    assert synced.num_tokens == 4
+    assert synced.num_ubatches == 2
+    assert state is not None
+    assert state.eager is True
+    assert state.num_tokens_across_dp.tolist() == [4] * 8
+
+
 def test_draft_speculator_sampling_inputs_copy_async_and_preserve_padding():
     class _Buffer:
         def copy_(self, other, *, non_blocking=False):
@@ -1702,6 +1836,70 @@ def test_eagle_loader_installs_draft_model_config_before_construction():
     assert calls[0].model_config is draft_model_config
 
 
+@pytest.mark.parametrize("load_fails", [False, True])
+def test_eagle_loader_does_not_reinitialize_target_config(load_fails: bool):
+    """Draft loading must preserve the already-initialized engine config."""
+    calls: list[object] = []
+
+    @dataclasses.dataclass
+    class FakeVllmConfig:
+        model_config: object
+        speculative_config: object
+        additional_config: dict[str, object]
+        compilation_config: object
+        parallel_config: object
+        quant_config: object
+        runtime_state: object = dataclasses.field(init=False, default=None)
+
+        def __post_init__(self):
+            self.compilation_config.custom_ops.append("+sparse_attn_indexer")
+
+    def load_eagle_model(target_model, vllm_config):
+        calls.append(vllm_config)
+        if load_fails:
+            raise RuntimeError("checkpoint load failed")
+        return object()
+
+    module = _module(
+        patch_eagle_utils.TARGET_MODULE,
+        load_eagle_model=load_eagle_model,
+        _should_share=_should_share,
+    )
+    patch_eagle_utils.apply_to_module(module)
+    config = FakeVllmConfig(
+        model_config=object(),
+        speculative_config=SimpleNamespace(draft_model_config=object()),
+        additional_config={"hcu": HcuFeatureConfig().to_dict()},
+        compilation_config=SimpleNamespace(custom_ops=["all"]),
+        parallel_config=object(),
+        quant_config=object(),
+    )
+    target_model_config = config.model_config
+    expected_ops = list(config.compilation_config.custom_ops)
+    config.runtime_state = object()
+
+    if load_fails:
+        with pytest.raises(RuntimeError, match="checkpoint load failed"):
+            module.load_eagle_model(object(), config)
+    else:
+        module.load_eagle_model(object(), config)
+
+    assert config.model_config is target_model_config
+    assert config.compilation_config.custom_ops == expected_ops
+    draft_config = calls[-1]
+    assert draft_config is not config
+    assert draft_config.model_config is config.speculative_config.draft_model_config
+    assert draft_config.runtime_state is config.runtime_state
+    for field in (
+        "compilation_config",
+        "parallel_config",
+        "quant_config",
+        "speculative_config",
+        "additional_config",
+    ):
+        assert getattr(draft_config, field) is getattr(config, field)
+
+
 def test_eagle_loader_preserves_step3p5_per_layer_lm_heads():
     trained_head = object()
     target_head = object()
@@ -1990,7 +2188,8 @@ from vllm_hcu.patch.worker.framework_opt import (
 )
 adapters = (
     patch_all2all, patch_base_device_communicator, patch_forward_context,
-    patch_llm_base_proposer, patch_dp_utils, patch_draft_speculator_inputs,
+    patch_llm_base_proposer, patch_dp_utils,
+    patch_draft_speculator_inputs,
     patch_eagle_utils,
     patch_gpu_ubatch_wrapper, patch_ubatch_utils,
 )

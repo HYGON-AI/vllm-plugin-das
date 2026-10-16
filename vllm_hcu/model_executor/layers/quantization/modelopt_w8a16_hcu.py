@@ -229,7 +229,8 @@ class ModelOptW8A16MoEMethod(FusedMoEMethodBase):
         )
         w2_weight_scale = PerTensorScaleParameter(
             data=torch.full((num_experts, hidden_size), 1.0, dtype=torch.float16),
-            weight_loader=weight_loader,
+            weight_loader=self._make_w8a16_w2_scale_loader(
+                layer, weight_loader),
         )
         layer.register_parameter("w13_weight_scale", w13_weight_scale)
         layer.register_parameter("w2_weight_scale", w2_weight_scale)
@@ -297,6 +298,47 @@ class ModelOptW8A16MoEMethod(FusedMoEMethodBase):
         # method, which populates moe_quant_config itself during setup, so
         # apply() never sees an unset config regardless of the caller.
         self.moe_quant_config = self.get_fused_moe_quant_config(layer)
+
+    @staticmethod
+    def _make_w8a16_w2_scale_loader(layer, default_loader):
+        """Per-channel W8A16 MoE scale loader for the w2 (down) weights.
+
+        The w2 scale is per-output-channel along hidden_size, which is NOT
+        TP-sharded (w2 shards the input/intermediate dim), so every rank
+        holds the full-length vector. The default RoutedExperts loader
+        calls _load_per_tensor_weight_scale which reshape(())s the 1-D
+        vector into a scalar — this module-level loader would also be
+        bypassed by models that call param.weight_loader directly (e.g.
+        Llama4's load_moe_expert_weights). Install a parameter-level
+        loader that handles the 1-D case; everything else falls through
+        to the default.
+        """
+
+        def loader(param, loaded_weight, weight_name, shard_id, expert_id,
+                   return_success=False):
+            if "weight_scale" not in weight_name:
+                return default_loader(param, loaded_weight, weight_name,
+                                      shard_id, expert_id,
+                                      return_success=return_success)
+            local_expert_id = layer._map_global_expert_id_to_local_expert_id(
+                expert_id)
+            if local_expert_id == -1:
+                return False if return_success else None
+            if not 0 <= local_expert_id < param.data.shape[0]:
+                return False if return_success else None
+            if loaded_weight.ndim != 1:
+                return default_loader(param, loaded_weight, weight_name,
+                                      shard_id, expert_id,
+                                      return_success=return_success)
+            # w2 scale is full-length hidden_size on every rank; copy whole.
+            if loaded_weight.numel() != param.data.shape[-1]:
+                return default_loader(param, loaded_weight, weight_name,
+                                      shard_id, expert_id,
+                                      return_success=return_success)
+            param.data[local_expert_id] = loaded_weight.to(param.dtype)
+            return True if return_success else None
+
+        return loader
 
     def process_weights_after_loading(self, layer: RoutedExperts) -> None:
         w13_scale = layer.w13_weight_scale

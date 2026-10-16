@@ -5,8 +5,9 @@
 """HCU-owned v0.25.1 MoE runner with pre-quantized input support."""
 
 import inspect
+import os
 from collections.abc import Callable, Iterable
-from contextlib import nullcontext
+from contextlib import contextmanager, nullcontext
 from typing import TYPE_CHECKING
 
 import torch
@@ -15,8 +16,10 @@ import torch.nn.functional as F
 from vllm.config import VllmConfig, get_current_vllm_config
 from vllm.config.parallel import ExpertPlacementStrategy
 from vllm.distributed import (
+    get_dp_group,
     get_ep_group,
     get_pcp_group,
+    get_tensor_model_parallel_world_size,
     tensor_model_parallel_all_reduce,
 )
 from vllm.distributed.eplb.eplb_state import EplbLayerState
@@ -58,8 +61,135 @@ from vllm.utils.torch_utils import (
     LayerName,
     direct_register_custom_op,
 )
+from vllm_hcu.platforms import envs as henvs
 
 logger = init_logger(__name__)
+
+# Fold the naive DP combine (reduce-scatter over DP), the shared-expert add and
+# the TP all-reduce into one custom all-reduce over the EP group (see
+# _ep_fused_all_reduce).  Requires the EP group's custom all-reduce, which
+# CudaCommunicator creates under the same flag.
+_EP_FUSED_COMBINE = henvs.optional_custom_op_enabled(
+    os.environ.get("VLLM_HCU_EP_FUSED_COMBINE", "0") == "1"
+)
+
+
+def _ep_fused_rows(hidden_states: torch.Tensor) -> tuple[int, int] | None:
+    """This DP rank's rows of ``hidden_states`` if the EP custom all-reduce
+    can combine it (see _ep_fused_all_reduce), else None."""
+    ep = get_ep_group()
+    dp = get_dp_group()
+    ca = getattr(ep.device_communicator, "ca_comm", None)
+    if (
+        ca is None
+        or ca.disabled
+        or ep.world_size != dp.world_size * get_tensor_model_parallel_world_size()
+    ):
+        return None
+    sizes = get_forward_context().dp_metadata.get_chunk_sizes_across_dp_rank()
+    if hidden_states.shape[0] != sum(sizes) or not ca.should_custom_ar(hidden_states):
+        return None
+    start = sum(sizes[: dp.rank_in_group])
+    return start, start + sizes[dp.rank_in_group]
+
+
+def _ep_fused_all_reduce(
+    hidden_states: torch.Tensor,
+    shared_output: torch.Tensor | None,
+) -> torch.Tensor | None:
+    """Combine + shared add + TP all-reduce as one EP custom all-reduce.
+
+    With naive DP dispatch every EP rank holds routed partial sums for the
+    tokens of all DP ranks, laid out by DP rank.  Reduce-scatter over DP
+    followed by an all-reduce over TP equals an all-reduce over the whole EP
+    group (DP x TP) sliced to this DP rank's rows.  Adding the TP-partial
+    shared output into the own rows first folds the shared add into the same
+    collective: one custom all-reduce instead of NCCL reduce-scatter + add +
+    custom all-reduce.  Returns None when the custom all-reduce cannot take
+    the tensor (e.g. large prefill chunks); ``hidden_states`` is then intact.
+    ``shared_output=None`` means it was already added into the own rows.
+    """
+    rows = _ep_fused_rows(hidden_states)
+    if rows is None:
+        return None
+    start, end = rows
+    if shared_output is not None:
+        hidden_states[start:end] += shared_output
+    ca = get_ep_group().device_communicator.ca_comm
+    return ca.custom_all_reduce(hidden_states)[start:end]
+
+
+class _EpFusedCombineState:
+    """Hands the shared-expert output of the running MoE layer to the naive
+    DP/EP modular-kernel finalize, which does the combine there."""
+
+    def __init__(self) -> None:
+        self.shared: torch.Tensor | None = None
+        self.done = False
+        # (data_ptr, shape) of the expert output the shared output was
+        # already added into by the EP fused experts (shared_add below).
+        self.added_to: tuple[int, torch.Size] | None = None
+
+    def arm(self, shared_experts: SharedExperts | None, shared_input) -> None:
+        self.done = False
+        self.shared = None
+        self.added_to = None
+        # Only when the shared expert already ran inline on this stream; an
+        # aux-stream output is not ready yet at finalize time.
+        if (
+            shared_experts is not None
+            and shared_experts._determine_shared_experts_order(shared_input)
+            == SharedExpertsOrder.NO_OVERLAP
+        ):
+            # Peek without consuming; the runner still pops it as usual.
+            self.shared = shared_experts._output[shared_experts._output_idx]
+
+    def shared_add(self, out: torch.Tensor) -> tuple[torch.Tensor, int] | None:
+        """For the EP fused experts: (shared_output, row_start) to add into
+        the rows of ``out`` the finalize hook would add it to, else None.
+        Only when the hook is then guaranteed to take the fused path."""
+        if self.shared is None or self.added_to is not None:
+            return None
+        rows = _ep_fused_rows(out)
+        if rows is None:
+            return None
+        self.added_to = (out.data_ptr(), out.shape)
+        return self.shared, rows[0]
+
+    def finalize_hook(self, out: torch.Tensor) -> torch.Tensor | None:
+        shared, self.shared = self.shared, None
+        if shared is None:
+            return None
+        if self.added_to is not None:
+            assert self.added_to == (out.data_ptr(), out.shape)
+            shared = None
+        reduced = _ep_fused_all_reduce(out, shared)
+        if reduced is None:
+            assert shared is not None
+            return None
+        self.done = True
+        # The finalize returns it as the MoE output: no copy into its buffer.
+        return reduced
+
+    def finish(self) -> bool:
+        done, self.done, self.shared = self.done, False, None
+        assert done or self.added_to is None
+        self.added_to = None
+        return done
+
+
+_EP_COMBINE = _EpFusedCombineState()
+if _EP_FUSED_COMBINE:
+    from vllm_hcu.model_executor.layers.fused_moe.combine_runtime import (
+        set_finalize_combine_hook,
+    )
+
+    # Spawn may import this runner while unpickling the quantization config,
+    # before Worker callbacks attach finalize. Keep hook state plugin-owned.
+    set_finalize_combine_hook(_EP_COMBINE.finalize_hook)
+    from vllm_hcu.model_executor.layers.fused_moe import ep_fused_moe
+
+    ep_fused_moe.shared_add_provider = _EP_COMBINE.shared_add
 
 
 def register_layer_for_moe_forward_op(
@@ -189,7 +319,14 @@ def _moe_forward_shared(
         topk_weights=topk_weights,
         topk_ids=topk_ids,
     )
-    return shared_output, fused_output.clone()
+    if layer._ep_fused_combine:
+        # Already a fresh all-reduce output that aliases no input.
+        return shared_output, fused_output
+    # Custom-op outputs must not alias their inputs. Out-of-place W4A8 and
+    # other kernels already own their output; clone only the aliasing paths.
+    if torch._C._is_alias_of(fused_output, hidden_states):
+        fused_output = fused_output.clone()
+    return shared_output, fused_output
 
 
 def _moe_forward_shared_fake(
@@ -325,6 +462,20 @@ class MoERunner(MoERunnerInterface):
                 is_multistream_safe=routed_input_is_quantized,
             )
 
+        # Static so the traced forward() branches on a plain bool; runtime
+        # conditions (custom AR availability, size) are checked in the op.
+        self._ep_fused_combine = (
+            _EP_FUSED_COMBINE
+            and shared_experts is not None
+            and moe_config.dp_size > 1
+            and moe_config.pcp_size == 1
+            and not moe_config.is_sequence_parallel
+            and not moe_config.skip_final_all_reduce
+            and routed_scaling_factor == 1.0
+            and routed_input_transform is None
+            and routed_output_transform is None
+        )
+
         # Needed for string -> MoERunner layer lookup in custom ops.
         self.layer_name = layer_name
 
@@ -458,6 +609,7 @@ class MoERunner(MoERunnerInterface):
     def _maybe_reduce_shared_expert_output(
         self,
         shared_output: torch.Tensor | None,
+        fused_output_is_reduced: bool | None = None,
     ) -> torch.Tensor | None:
         """All-reduce shared expert output when the combine kernel already
         reduced fused output.
@@ -467,18 +619,79 @@ class MoERunner(MoERunnerInterface):
         * If we have SP (TP=N, DP=M, EP), there is a separate AG step handled
           in the model.
         """
+        if fused_output_is_reduced is None:
+            fused_output_is_reduced = self._fused_output_is_reduced
+
         if (
             shared_output is not None
             and not self.moe_config.is_sequence_parallel
-            and self._fused_output_is_reduced
+            and fused_output_is_reduced
         ):
             shared_output = tensor_model_parallel_all_reduce(shared_output)
         return shared_output
+
+    def _maybe_reduce_routed_output_before_transform(
+        self,
+        fused_output: torch.Tensor,
+        fused_output_is_reduced: bool,
+    ) -> tuple[torch.Tensor, bool]:
+        """Reduce latent routed output before its nonlinear output transform."""
+        if (
+            self.routed_output_transform is not None
+            and not self.moe_config.is_sequence_parallel
+            and (self.moe_config.tp_size > 1 or self.moe_config.ep_size > 1)
+            and not fused_output_is_reduced
+        ):
+            fused_output = tensor_model_parallel_all_reduce(fused_output)
+            fused_output_is_reduced = True
+        return fused_output, fused_output_is_reduced
+
+    def _can_fuse_kimi_k3_latent_all_reduce(
+        self,
+        shared_output: torch.Tensor | None,
+        fused_output: torch.Tensor,
+        fused_output_is_reduced: bool,
+    ) -> bool:
+        """Fuse eligible Kimi-K3 partials by default; the env flag can opt out."""
+        fusion_enabled = os.environ.get(
+            "VLLM_HCU_KIMI_LATENT_MOE_FUSE_ALLREDUCE",
+            "1",
+        ).lower() in ("true", "1")
+        return (
+            fusion_enabled
+            and getattr(
+                self.routed_output_transform,
+                "_hcu_fuse_shared_and_routed_tp_all_reduce",
+                False,
+            )
+            and shared_output is not None
+            and self._shared_experts is not None
+            and self.moe_config.tp_size > 1
+            and not self.moe_config.is_sequence_parallel
+            and not fused_output_is_reduced
+            and fused_output.dtype == shared_output.dtype
+            and fused_output.shape[:-1] == shared_output.shape[:-1]
+        )
+
+    def _fuse_kimi_k3_latent_all_reduce(
+        self,
+        shared_output: torch.Tensor,
+        fused_output: torch.Tensor,
+    ) -> tuple[torch.Tensor, torch.Tensor]:
+        """Reduce Kimi-K3 latent and shared partials in one TP collective."""
+        latent_width = fused_output.shape[-1]
+        combined_output = torch.cat((fused_output, shared_output), dim=-1)
+        combined_output = tensor_model_parallel_all_reduce(combined_output)
+        return (
+            combined_output[..., :latent_width],
+            combined_output[..., latent_width:],
+        )
 
     def _maybe_reduce_final_output(
         self,
         states: torch.Tensor,
         trunc_size: int | None,
+        output_is_reduced: bool | None = None,
     ) -> torch.Tensor:
         """All-reduce the combined output if needed.
 
@@ -489,8 +702,13 @@ class MoERunner(MoERunnerInterface):
         """
         # skip_final_all_reduce must not coexist with a pre-reduced fused
         # output. This should be enforced by MoE config initialization.
+        is_reduced = (
+            self._fused_output_is_reduced
+            if output_is_reduced is None
+            else output_is_reduced
+        )
         if self.moe_config.skip_final_all_reduce:
-            assert not self._fused_output_is_reduced, (
+            assert not is_reduced, (
                 "skip_final_all_reduce requires an un-reduced fused output"
             )
 
@@ -501,7 +719,7 @@ class MoERunner(MoERunnerInterface):
             not self.moe_config.is_sequence_parallel
             and not self.moe_config.skip_final_all_reduce
             and (self.moe_config.tp_size > 1 or self.moe_config.ep_size > 1)
-            and not self._fused_output_is_reduced
+            and not is_reduced
         ):
             states = tensor_model_parallel_all_reduce(states)
 
@@ -604,13 +822,10 @@ class MoERunner(MoERunnerInterface):
         except (TypeError, ValueError):
             self._supports_quanted_inputs = False
             return False
-        self._supports_quanted_inputs = (
-            any(
-                parameter.kind == inspect.Parameter.VAR_KEYWORD
-                for parameter in parameters.values()
-            )
-            or ("i_q" in parameters and "i_s" in parameters)
-        )
+        self._supports_quanted_inputs = any(
+            parameter.kind == inspect.Parameter.VAR_KEYWORD
+            for parameter in parameters.values()
+        ) or ("i_q" in parameters and "i_s" in parameters)
         return self._supports_quanted_inputs
 
     def _apply_quant_method(
@@ -657,6 +872,8 @@ class MoERunner(MoERunnerInterface):
             SharedExpertsOrder.NO_OVERLAP,
             x_and_scale_quanted=shared_experts_x_and_scale_quanted,
         )
+        if self._ep_fused_combine:
+            _EP_COMBINE.arm(self._shared_experts, shared_experts_input)
 
         if self.routed_experts.quant_method.is_monolithic:
             # Monolithic kernels: pass router_logits to routed_experts
@@ -842,12 +1059,47 @@ class MoERunner(MoERunnerInterface):
 
         shared_output, fused_output = _unpack(result)
 
+        if self._ep_fused_combine:
+            # The op already combined, added shared output and all-reduced.
+            assert og_hidden_dim_pre_xform is None
+            assert og_hidden_dim_post_xform is None
+            return self._maybe_add_zero_expert_output(fused_output)
+
         if og_hidden_dim_pre_xform is not None:
             fused_output = fused_output[..., :og_hidden_dim_pre_xform]
 
-        # If combine kernel already reduced fused, reduce shared to match.
-        # See note above re: the two all-reduce points.
-        shared_output = self._maybe_reduce_shared_expert_output(shared_output)
+        fused_output_is_reduced = self._fused_output_is_reduced
+        if self._can_fuse_kimi_k3_latent_all_reduce(
+            shared_output,
+            fused_output,
+            fused_output_is_reduced,
+        ):
+            assert shared_output is not None
+            fused_output, shared_output = self._fuse_kimi_k3_latent_all_reduce(
+                shared_output,
+                fused_output,
+            )
+            fused_output_is_reduced = True
+        elif getattr(
+            self.routed_output_transform,
+            "_hcu_fuse_shared_and_routed_tp_all_reduce",
+            False,
+        ):
+            fused_output, fused_output_is_reduced = (
+                self._maybe_reduce_routed_output_before_transform(
+                    fused_output,
+                    fused_output_is_reduced,
+                )
+            )
+
+            # If routed output is reduced before its nonlinear transform,
+            # reduce shared output separately so both branches share a TP domain.
+            shared_output = self._maybe_reduce_shared_expert_output(
+                shared_output,
+                fused_output_is_reduced,
+            )
+        else:
+            shared_output = self._maybe_reduce_shared_expert_output(shared_output)
 
         shared_output, fused_output = self._maybe_apply_routed_scale_to_output(
             shared_output, fused_output
@@ -861,7 +1113,9 @@ class MoERunner(MoERunnerInterface):
         else:
             result = fused_output
 
-        result = self._maybe_reduce_final_output(result, og_hidden_dim_post_xform)
+        result = self._maybe_reduce_final_output(
+            result, og_hidden_dim_post_xform, fused_output_is_reduced
+        )
 
         return self._maybe_add_zero_expert_output(result)
 
@@ -915,11 +1169,62 @@ class MoERunner(MoERunnerInterface):
 
         return hidden_states, router_logits
 
+    @contextmanager
+    def _pcp_routing_inputs(self, input_ids, num_local_tokens):
+        """Match routing auxiliaries to the fallback PCP dispatch ordering."""
+        if not (
+            self.moe_config.pcp_size > 1
+            and not self.moe_config.moe_parallel_config.use_all2all_kernels
+        ):
+            yield input_ids
+            return
+
+        context = get_forward_context() if is_forward_context_available() else None
+        local_padding = context.is_padding if context is not None else None
+        if input_ids is not None:
+            input_ids = get_pcp_group().all_gather(
+                input_ids[:num_local_tokens], dim=0
+            )
+        if local_padding is not None:
+            context.is_padding = get_pcp_group().all_gather(
+                local_padding[:num_local_tokens], dim=0
+            )
+        try:
+            yield input_ids
+        finally:
+            if context is not None:
+                context.is_padding = local_padding
+
+    def _ep_fused_combine_output(
+        self,
+        shared_output: torch.Tensor,
+        hidden_states: torch.Tensor,
+    ) -> torch.Tensor:
+        """Final MoE output when the finalize hook did not already fuse it."""
+        if self.do_naive_dispatch_combine:
+            if not self._fused_output_is_reduced:
+                reduced = _ep_fused_all_reduce(hidden_states, shared_output)
+                if reduced is not None:
+                    return reduced
+            hidden_states = get_ep_group().combine(hidden_states, False)
+        # Unfused tail, identical to forward() for this configuration.
+        shared_output = self._maybe_reduce_shared_expert_output(shared_output)
+        return self._maybe_reduce_final_output(shared_output + hidden_states, None)
+
     def _maybe_combine(
         self,
         shared_output: torch.Tensor | None,
         hidden_states: torch.Tensor,
     ) -> torch.Tensor | tuple[torch.Tensor | None, torch.Tensor]:
+        if self._ep_fused_combine:
+            assert shared_output is not None
+            if _EP_COMBINE.finish():
+                # MK finalize already produced the final output.
+                return shared_output, hidden_states
+            return shared_output, self._ep_fused_combine_output(
+                shared_output, hidden_states
+            )
+
         if self.do_naive_dispatch_combine:
             hidden_states = get_ep_group().combine(
                 hidden_states, self.moe_config.is_sequence_parallel
@@ -964,9 +1269,9 @@ class MoERunner(MoERunnerInterface):
 
         Returns a single tensor of combined fused and shared output (if present).
         """
-        if (
-            quanted_hidden_states is not None or topk_weights is not None
-        ) and (self.do_naive_dispatch_combine or self.moe_config.pcp_size > 1):
+        if (quanted_hidden_states is not None or topk_weights is not None) and (
+            self.do_naive_dispatch_combine or self.moe_config.pcp_size > 1
+        ):
             raise RuntimeError(
                 "HCU pre-quantized/preselected MoE inputs cannot be combined "
                 "with naive DP/EP or PCP dispatch because those auxiliary "
@@ -1001,22 +1306,25 @@ class MoERunner(MoERunnerInterface):
             # TODO(bnell): parts of the dispatch/combine steps will go away once
             # #32567 lands and the remaining kernels are made MKs.  The PCP
             # code will probably remain
+            num_local_tokens = hidden_states.shape[0]
             hidden_states, router_logits = self._maybe_dispatch(
                 hidden_states,
                 router_logits,
             )
 
-            shared_output, hidden_states = self._apply_quant_method(
-                hidden_states=hidden_states,
-                router_logits=router_logits,
-                shared_experts_input=shared_experts_input,
-                input_ids=input_ids,
-                quanted_hidden_states=quanted_hidden_states,
-                scale=scale,
-                topk_weights=topk_weights,
-                topk_ids=topk_ids,
-            )
-
+            with self._pcp_routing_inputs(
+                input_ids, num_local_tokens
+            ) as routing_input_ids:
+                shared_output, hidden_states = self._apply_quant_method(
+                    hidden_states=hidden_states,
+                    router_logits=router_logits,
+                    shared_experts_input=shared_experts_input,
+                    input_ids=routing_input_ids,
+                    quanted_hidden_states=quanted_hidden_states,
+                    scale=scale,
+                    topk_weights=topk_weights,
+                    topk_ids=topk_ids,
+                )
             return self._maybe_combine(
                 shared_output,
                 hidden_states,

@@ -87,6 +87,48 @@ def _run_fresh_target(code: str) -> subprocess.CompletedProcess[str]:
     )
 
 
+@pytest.mark.parametrize(
+    "model_type", ["kimi_k3", "kimi_linear", "deepseek_v4", "qwen3", None]
+)
+@pytest.mark.parametrize("compiled", [False, True])
+def test_ir_priority_scopes_kimi_fallback_to_its_model_config(model_type, compiled):
+    from vllm.config.compilation import CompilationMode
+    from vllm.platforms.interface import Platform
+    from vllm_hcu.platforms.hcu import HCUPlatform
+
+    config = SimpleNamespace(
+        model_config=SimpleNamespace(
+            hf_config=SimpleNamespace(model_type=model_type)
+        ),
+        compilation_config=SimpleNamespace(
+            backend="inductor",
+            mode=CompilationMode.VLLM_COMPILE if compiled else CompilationMode.NONE,
+        ),
+    )
+    priority = dataclasses.asdict(HCUPlatform.get_default_ir_op_priority(config))
+    if model_type in ("kimi_k3", "kimi_linear"):
+        assert priority == {
+            "rms_norm": ["vllm_c", "native"],
+            "fused_add_rms_norm": ["vllm_c", "native"],
+        }
+    else:
+        assert priority == dataclasses.asdict(
+            Platform.get_default_ir_op_priority(config)
+        )
+        assert all(providers == ["native"] for providers in priority.values())
+
+
+@pytest.mark.parametrize("model_config", [None, SimpleNamespace(hf_config=None)])
+def test_ir_priority_without_model_metadata_preserves_platform_default(model_config):
+    from vllm.platforms.interface import Platform
+    from vllm_hcu.platforms.hcu import HCUPlatform
+
+    config = SimpleNamespace(model_config=model_config)
+    assert HCUPlatform.get_default_ir_op_priority(config) == (
+        Platform.get_default_ir_op_priority(config)
+    )
+
+
 @dataclass
 class _KernelConfig:
     moe_backend: str = "auto"
@@ -101,10 +143,12 @@ def _make_arg_utils_module() -> ModuleType:
         attention_backend: str | None = None
         attention_config: dict[str, Any] = field(default_factory=dict)
         all2all_backend: str = "allgather_reducescatter"
+        gdn_prefill_backend: str | None = None
         moe_backend: str = "auto"
         kernel_config: _KernelConfig | dict[str, Any] = field(
             default_factory=_KernelConfig
         )
+        eplb_config: dict[str, Any] = field(default_factory=dict)
         speculative_config: dict[str, Any] | None = None
 
         def __post_init__(self) -> None:
@@ -120,8 +164,13 @@ def _make_arg_utils_module() -> ModuleType:
             kernel_config = copy.deepcopy(self.kernel_config)
             if self.moe_backend != "auto":
                 kernel_config.moe_backend = self.moe_backend
+            additional_config = copy.deepcopy(self.additional_config)
+            if self.gdn_prefill_backend is not None:
+                additional_config["gdn_prefill_backend"] = (
+                    self.gdn_prefill_backend
+                )
             return SimpleNamespace(
-                additional_config=copy.deepcopy(self.additional_config),
+                additional_config=additional_config,
                 kernel_config=kernel_config,
                 parallel_config=SimpleNamespace(
                     all2all_backend=self.all2all_backend
@@ -130,10 +179,28 @@ def _make_arg_utils_module() -> ModuleType:
 
         @staticmethod
         def add_cli_args(parser: argparse.ArgumentParser):
+            def parse_official_eplb(value: str) -> dict[str, Any]:
+                payload = json.loads(value)
+                unexpected = set(payload) & patch_engine_args._HCU_EPLB_FIELDS.keys()
+                if unexpected:
+                    raise ValueError(f"unexpected EPLB fields: {sorted(unexpected)}")
+                return payload
+
             parser.add_argument(
                 "--all2all-backend",
                 choices=("allgather_reducescatter", "deepep_low_latency"),
                 default="allgather_reducescatter",
+            )
+            parser.add_argument(
+                "--gdn-prefill-backend",
+                dest="gdn_prefill_backend",
+                choices=["flashinfer", "triton", "cutedsl"],
+                default=None,
+            )
+            parser.add_argument(
+                "--eplb-config",
+                type=parse_official_eplb,
+                default={},
             )
             return parser
 
@@ -194,8 +261,10 @@ def test_engine_args_legacy_keywords_are_removed_before_official_init() -> None:
         "attention_backend",
         "attention_config",
         "all2all_backend",
+        "gdn_prefill_backend",
         "moe_backend",
         "kernel_config",
+        "eplb_config",
         "speculative_config",
     }
 
@@ -218,6 +287,159 @@ def test_engine_args_normalizes_deepep_auto_and_extends_cli_choice() -> None:
     parser = module.EngineArgs.add_cli_args(argparse.ArgumentParser())
     parsed = parser.parse_args(["--all2all-backend", "deepep_auto"])
     assert parsed.all2all_backend == "deepep_auto"
+
+
+@pytest.mark.parametrize("backend", ["hcu-boltops", "hcu-aiter"])
+def test_engine_args_moves_hcu_gdn_prefill_backend_to_sidecar(
+    backend: str,
+) -> None:
+    module = _make_arg_utils_module()
+    patch_engine_args.apply_to_module(module)
+
+    args = module.EngineArgs(gdn_prefill_backend=backend)
+    assert args.gdn_prefill_backend == "triton"
+    assert get_hcu_config(args).hcu_gdn_prefill_backend == backend
+    config = args.create_engine_config()
+    assert config.additional_config["gdn_prefill_backend"] == "triton"
+    assert get_hcu_config(config).hcu_gdn_prefill_backend == backend
+
+    parser = module.EngineArgs.add_cli_args(argparse.ArgumentParser())
+    parsed = parser.parse_args(["--gdn-prefill-backend", backend])
+    cli_args = module.EngineArgs.from_cli_args(parsed)
+    assert cli_args.gdn_prefill_backend == "triton"
+    assert get_hcu_config(cli_args).hcu_gdn_prefill_backend == backend
+
+
+@pytest.mark.parametrize("backend", [None, "triton", "flashinfer"])
+def test_engine_args_keeps_official_gdn_prefill_backend(
+    backend: str | None,
+) -> None:
+    module = _make_arg_utils_module()
+    patch_engine_args.apply_to_module(module)
+
+    args = module.EngineArgs(gdn_prefill_backend=backend)
+    assert args.gdn_prefill_backend == backend
+    assert get_hcu_config(args).hcu_gdn_prefill_backend is None
+
+
+@pytest.mark.parametrize("backend", ["hcu-boltops", "hcu-aiter"])
+def test_engine_args_sidecar_only_gdn_prefill_backend_pins_triton(
+    backend: str,
+) -> None:
+    module = _make_arg_utils_module()
+    patch_engine_args.apply_to_module(module)
+    sidecar = {"hcu": {"hcu_gdn_prefill_backend": backend}}
+
+    args = module.EngineArgs(additional_config=sidecar)
+    assert args.gdn_prefill_backend == "triton"
+    assert get_hcu_config(args).hcu_gdn_prefill_backend == backend
+
+    # A reconstructed instance that bypassed the constructor normalisation.
+    args.gdn_prefill_backend = None
+    config = args.create_engine_config()
+    assert args.gdn_prefill_backend == "triton"
+    assert config.additional_config["gdn_prefill_backend"] == "triton"
+    assert get_hcu_config(config).hcu_gdn_prefill_backend == backend
+
+
+def test_engine_args_rejects_conflicting_gdn_prefill_backend() -> None:
+    module = _make_arg_utils_module()
+    patch_engine_args.apply_to_module(module)
+
+    with pytest.raises(ValueError, match="conflicting hcu_gdn_prefill_backend"):
+        module.EngineArgs(
+            gdn_prefill_backend="hcu-aiter",
+            additional_config={"hcu": {"hcu_gdn_prefill_backend": "hcu-boltops"}},
+        )
+
+
+def test_engine_args_extracts_nested_offline_eplb_fields() -> None:
+    module = _make_arg_utils_module()
+    patch_engine_args.apply_to_module(module)
+    eplb_config = {
+        "window_size": 512,
+        "step_interval": 100,
+        "expert_map_path": "/maps/hy4.json",
+        "disable_rearrange": True,
+        "static_dispatch_policy": "locality_fair",
+    }
+
+    args = module.EngineArgs(eplb_config=eplb_config)
+
+    assert eplb_config["expert_map_path"] == "/maps/hy4.json"
+    assert args.eplb_config == {"window_size": 512, "step_interval": 100}
+    assert get_hcu_config(args) == HcuFeatureConfig(
+        expert_map_path="/maps/hy4.json",
+        eplb_disable_rearrange=True,
+        eplb_static_dispatch_policy="locality_fair",
+    )
+
+    config = args.create_engine_config()
+    assert get_hcu_config(config) == get_hcu_config(args)
+    assert config.parallel_config._vllm_hcu_expert_map_path == "/maps/hy4.json"
+    assert config.parallel_config._vllm_hcu_expert_map_record_path is None
+    assert config.parallel_config._vllm_hcu_eplb_disable_rearrange is True
+    assert (
+        config.parallel_config._vllm_hcu_eplb_static_dispatch_policy
+        == "locality_fair"
+    )
+
+
+def test_engine_args_extracts_nested_offline_eplb_record_path() -> None:
+    module = _make_arg_utils_module()
+    patch_engine_args.apply_to_module(module)
+
+    args = module.EngineArgs(
+        eplb_config={"expert_map_record_path": "/maps/record.json"}
+    )
+
+    assert args.eplb_config == {}
+    assert get_hcu_config(args).expert_map_record_path == "/maps/record.json"
+
+
+def test_engine_args_cli_delays_offline_eplb_validation_until_hcu_init() -> None:
+    module = _make_arg_utils_module()
+    patch_engine_args.apply_to_module(module)
+    parser = module.EngineArgs.add_cli_args(argparse.ArgumentParser())
+
+    namespace = parser.parse_args(
+        [
+            "--eplb-config",
+            json.dumps(
+                {
+                    "window_size": 16,
+                    "step_interval": 16,
+                    "num_redundant_experts": 8,
+                    "use_async": False,
+                    "expert_map_record_path": "/maps/hy4.json",
+                }
+            ),
+        ]
+    )
+    args = module.EngineArgs.from_cli_args(namespace)
+
+    assert args.eplb_config == {
+        "window_size": 16,
+        "step_interval": 16,
+        "num_redundant_experts": 8,
+        "use_async": False,
+    }
+    assert get_hcu_config(args).expert_map_record_path == "/maps/hy4.json"
+
+
+def test_engine_args_rejects_conflicting_nested_offline_eplb_sidecar() -> None:
+    module = _make_arg_utils_module()
+    patch_engine_args.apply_to_module(module)
+
+    with pytest.raises(ValueError, match="conflicting expert_map_path"):
+        module.EngineArgs(
+            additional_config={
+                "hcu": HcuFeatureConfig(
+                    expert_map_path="/maps/sidecar.json"
+                ).to_dict()
+            },
+            eplb_config={"expert_map_path": "/maps/nested.json"},
+        )
 
 
 def test_dspark_deepep_auto_uses_standard_engine_args_path() -> None:
@@ -1040,7 +1262,9 @@ def test_real_v0251_set_cudagraph_binds_custom_sp_before_first_adjustment() -> N
 
 
 class _ValidationCompilation:
-    pass
+    def __init__(self) -> None:
+        # Mirrors CompilationConfig: no attention layers are registered yet.
+        self.static_forward_context: dict[str, object] = {}
 
 
 def _validation_config(feature_config: HcuFeatureConfig) -> object:
@@ -2352,3 +2576,57 @@ def test_qwen4_exp_hc_sp_falls_back_with_lora_or_compiler_sp(
 
     feature_config = patch_vllm_config.validate_and_update_hcu_config(config)
     assert feature_config.qwen4_exp_hc_sp is expected
+
+
+@pytest.mark.parametrize("architecture", [
+    "DeepseekV4ForCausalLM", "DeepSeekV4MTPModel",
+])
+@pytest.mark.parametrize("pcp", [2, 4, 8])
+def test_deepep_auto_accepts_deepseek_v4_pcp_without_dp(pcp, architecture):
+    from tests.runtime_patch.test_glm52_pcp_config import _make_pcp_config
+
+    config = _make_pcp_config(
+        architecture=architecture, pcp=pcp,
+        all2all_backend="deepep_low_latency", enable_eplb=False,
+    )
+    config.additional_config = {
+        "hcu": HcuFeatureConfig(deepep_auto=True, moe_backend="deep_gemm").to_dict()
+    }
+    config.compilation_config = _ValidationCompilation()
+    config.scheduler_config = SimpleNamespace(max_num_batched_tokens=32768)
+    result = patch_vllm_config.validate_and_update_hcu_config(config)
+    assert result.deepep_auto
+    assert config.parallel_config._vllm_hcu_deepep_auto
+    assert config.parallel_config.data_parallel_size == 1
+
+
+@pytest.mark.parametrize("architecture,pcp", [
+    ("GlmMoeDsaForCausalLM", 2),
+    ("GlmMoeDsaForCausalLM", 4),
+    ("GlmMoeDsaForCausalLM", 8),
+    ("Glm5NextForCausalLM", 8),
+])
+def test_deepep_auto_rejects_non_v4_pcp_only_topology(architecture, pcp):
+    from tests.runtime_patch.test_glm52_pcp_config import _make_pcp_config
+
+    config = _make_pcp_config(
+        architecture=architecture, pcp=pcp, tp=1,
+        hybrid=architecture == "Glm5NextForCausalLM",
+        all2all_backend="deepep_low_latency",
+    )
+    config.additional_config = {
+        "hcu": HcuFeatureConfig(deepep_auto=True, moe_backend="deep_gemm").to_dict()
+    }
+    config.compilation_config = _ValidationCompilation()
+    config.scheduler_config = SimpleNamespace(max_num_batched_tokens=32768)
+    with pytest.raises(ValueError, match="PCP-only.*DeepSeek V4"):
+        patch_vllm_config.validate_and_update_hcu_config(config)
+
+
+def test_deepep_auto_keeps_glm_dp_ep_without_pcp():
+    config = _validation_config(HcuFeatureConfig(deepep_auto=True))
+    config.model_config.architectures = ["GlmMoeDsaForCausalLM"]
+    config.parallel_config.data_parallel_size = 2
+    config.parallel_config.enable_expert_parallel = True
+    config.parallel_config.all2all_backend = "deepep_low_latency"
+    assert patch_vllm_config.validate_and_update_hcu_config(config).deepep_auto

@@ -15,7 +15,7 @@ if TYPE_CHECKING:
     VLLM_HCU_USE_FLASH_ATTN_VARLEN: bool = True
     VLLM_HCU_USE_FLASHMLA: bool = False
     VLLM_USE_OPT_CAT: bool = False
-    VLLM_HCU_USE_CAT_MLA: bool = False
+    VLLM_HCU_USE_CAT_MLA: bool = True
     VLLM_HCU_DISABLE_DSA: bool = False
     VLLM_HCU_USE_FP8_MIXED_BATCH: bool = False
     VLLM_HCU_USE_CUSTOM_QUANTIZATION_GEMM : bool = False
@@ -38,6 +38,7 @@ if TYPE_CHECKING:
     VLLM_HCU_USE_CUSTOM_STRIDED_Z: bool = True
     VLLM_HCU_USE_CUSTOM_RMS_NORM : bool = False
     VLLM_HCU_USE_CUSTOM_AITER_FLA : bool = False
+    VLLM_HCU_GDN_DECODE_BACKEND: str = "hcu-aiter"
     VLLM_HCU_PP_LAYER_PARTITION_D : Optional[str] = None
     VLLM_HCU_USE_FUSE_MOE_GATE : bool = True
     VLLM_HCU_USE_LIGHTOP_SQRTSOFTPLUS_GATE: bool = True
@@ -57,6 +58,7 @@ if TYPE_CHECKING:
     VLLM_HCU_DEEPSEEK_V4_ROCM_DECODE_FALLBACK: bool = False
     VLLM_HCU_DEEPSEEK_V4_ROCM_FLASHMLA_DECODE: bool = True
     VLLM_HCU_DEEPSEEK_V4_ROCM_FLASHMLA_PREFILL: bool = True
+    VLLM_HCU_DEEPSEEK_V4_ROCM_FLASHMLA_PREFILL_HEAD_PADDING: bool = True
     VLLM_HCU_DEEPSEEK_V4_ROCM_SPARSE_PREFILL_BACKEND: str = "flashmla"
     VLLM_HCU_DEEPSEEK_V4_ROCM_FAST_WOA: bool = True
     VLLM_HCU_ENABLE_DEEPSEEK_V4_MULTI_STREAM: bool = True
@@ -85,11 +87,14 @@ if TYPE_CHECKING:
     VLLM_HCU_DEEPEP_NUM_SMS: Optional[int] = None
     VLLM_HCU_DPSK_V4_DEEPEP_LL_USE_HCU_DISPATCH_API: bool = False
     VLLM_HCU_SHARED_EXPERTS_STREAM_FORCE: bool = False
+    VLLM_HCU_DEEPSEEK_V4_PCP_LOCAL_QUERIES: bool = True
     VLLM_HCU_SHARED_EXPERTS_EARLY_LAUNCH: bool = False
     VLLM_HCU_ENABLE_REQUEST_CUDAGRAPH_BUCKETS: bool = False
     VLLM_HCU_PLE_CPU_OFFLOAD: bool = False
     VLLM_HCU_PLE_PREFETCH_STREAM: bool = False
     VLLM_HCU_QWEN4_EXP_HC_SP: bool = True
+    VLLM_HCU_MHC_FUSED_RMSNORM: bool = True
+    VLLM_HCU_GLM5NEXT_KDA_STRIDED_INPUTS: bool = True
 
 def maybe_convert_int(value: Optional[str]) -> Optional[int]:
     """
@@ -123,6 +128,19 @@ def optional_custom_op_enabled(feature_enabled: bool = True) -> bool:
     """
 
     return custom_ops_enabled() and bool(feature_enabled)
+
+
+def linear_gate_pcp_shard_enabled(
+    *, tp_size: int, pcp_size: int, pp_size: int = 1
+) -> bool:
+    """Resolve HY4 linear-gate PCP sharding under the custom-op master."""
+
+    raw = os.environ.get("VLLM_HCU_ENABLE_LINEAR_GATE_PCP_SHARD")
+    if raw is None:
+        requested = (tp_size, pcp_size, pp_size) == (1, 8, 1)
+    else:
+        requested = raw.strip().lower() in ("1", "true", "yes", "on")
+    return optional_custom_op_enabled(requested)
 
 
 def qwen4_exp_hc_sp_enabled() -> bool:
@@ -376,9 +394,18 @@ hcu_vllm_environment_variables: dict[str, Callable[[], Any]] = {
     "VLLM_HCU_USE_CUSTOM_RMS_NORM":
     lambda: (os.environ.get("VLLM_HCU_USE_CUSTOM_RMS_NORM", "True").lower() in
              ("true", "1")),
+    # Deprecated and ignored: GDN prefill is selected by
+    # --gdn-prefill-backend and GDN decode by VLLM_HCU_GDN_DECODE_BACKEND.
     "VLLM_HCU_USE_CUSTOM_AITER_FLA":
     lambda: (os.environ.get("VLLM_HCU_USE_CUSTOM_AITER_FLA", "True").lower() in
              ("true", "1")),
+    # Select the GDN decode kernel provider: triton (vLLM FLA), hcu-boltops
+    # or hcu-aiter (default). VLLM_HCU_USE_CUSTOM_OPS=0 forces hcu-boltops. On HCU the GDN
+    # prefill provider is selected by --gdn-prefill-backend instead.
+    "VLLM_HCU_GDN_DECODE_BACKEND":
+    lambda: os.environ.get(
+        "VLLM_HCU_GDN_DECODE_BACKEND", "hcu-aiter"
+    ).strip().lower(),
             
     # Pipeline stage partition strategy
     "VLLM_HCU_PP_LAYER_PARTITION_D":
@@ -463,6 +490,11 @@ hcu_vllm_environment_variables: dict[str, Callable[[], Any]] = {
     "VLLM_HCU_DEEPSEEK_V4_ROCM_FLASHMLA_PREFILL":
         lambda: os.environ.get("VLLM_HCU_DEEPSEEK_V4_ROCM_FLASHMLA_PREFILL", "True").lower()
         in ("true", "1"),
+    # Disabling padding retains FlashMLA for native 64/128-head queries.
+    "VLLM_HCU_DEEPSEEK_V4_ROCM_FLASHMLA_PREFILL_HEAD_PADDING":
+        lambda: os.environ.get(
+            "VLLM_HCU_DEEPSEEK_V4_ROCM_FLASHMLA_PREFILL_HEAD_PADDING", "True"
+        ).lower() in ("true", "1"),
     # Provider selection applies only to this adapter's prefill path.
     "VLLM_HCU_DEEPSEEK_V4_ROCM_SPARSE_PREFILL_BACKEND":
         lambda: os.environ.get(
@@ -603,6 +635,11 @@ hcu_vllm_environment_variables: dict[str, Callable[[], Any]] = {
         lambda: (os.environ.get("VLLM_HCU_SHARED_EXPERTS_STREAM_FORCE", "False").lower() in
                     ("true", "1")),
 
+    # DeepSeek V4 PCP: keep attention queries rank-local and gather only KV.
+    "VLLM_HCU_DEEPSEEK_V4_PCP_LOCAL_QUERIES":
+        lambda: os.getenv("VLLM_HCU_DEEPSEEK_V4_PCP_LOCAL_QUERIES", "True").lower()
+        in ("1", "true"),
+
     # Launch shared_experts on the auxiliary stream before routed MoE/DeepEP,
     # and wait only when the shared output is consumed.
     "VLLM_HCU_SHARED_EXPERTS_EARLY_LAUNCH":
@@ -639,6 +676,29 @@ hcu_vllm_environment_variables: dict[str, Callable[[], Any]] = {
     # (token-major pages, LightOp decode reader).
     "VLLM_HCU_INDEXER_KCACHE_LAYOUT":
         indexer_kcache_layout,
+
+    # Route the RMSNorm applied after the mHC pre/fused-post-pre kernels
+    # through aten's single fused rms_norm kernel instead of
+    # vllm.ir.ops.rms_norm's native implementation (8 elementwise/reduce
+    # kernels when no fused IR provider is registered, the case on HCU).
+    # Affects every model on the native mHC fallback path (GLM5Next,
+    # DeepSeek V4, ...); consulted once at patch-apply time. See
+    # patch_mhc_fused_rmsnorm.py. Enabled by default; set to 0 to disable.
+    "VLLM_HCU_MHC_FUSED_RMSNORM":
+        lambda: (os.environ.get("VLLM_HCU_MHC_FUSED_RMSNORM", "True").lower() in
+                    ("true", "1")),
+
+    # Skip the .contiguous() copies GLM5Next's fused_recurrent_kda otherwise
+    # applies to q/k/v/g/beta before the recurrent decode/spec-verify kernel,
+    # by passing per-token strides into the kernel instead. On the decode and
+    # spec-verify paths q/k/v are non-contiguous views split out of the merged
+    # qkv causal-conv1d output, so this removes 4-5 elementwise copy kernels
+    # per step. Consulted once at patch-apply time. See
+    # patch_glm5next_kda_strided_recurrent.py. Enabled by default; set to 0
+    # to disable.
+    "VLLM_HCU_GLM5NEXT_KDA_STRIDED_INPUTS":
+        lambda: (os.environ.get("VLLM_HCU_GLM5NEXT_KDA_STRIDED_INPUTS", "True").lower() in
+                    ("true", "1")),
 }
 
 # end-env-vars-definition

@@ -6,6 +6,7 @@ import os
 import gc
 import torch
 import math
+from contextlib import nullcontext
 from typing import TYPE_CHECKING, Dict, List, Optional, Set, Tuple, Type, Union
 from vllm.v1.worker.gpu_worker import Worker, init_worker_distributed_environment
 from vllm.utils.torch_utils import set_random_seed
@@ -47,6 +48,21 @@ def _create_model_runner(
     use_v2_model_runner: bool,
 ):
     if not use_v2_model_runner:
+        # Kimi reference-trace validation needs the same metadata ordering and
+        # breakable graph execution as v0.25.1. The retained HCU MRV1 copy has
+        # stale imports on v0.28; use upstream's maintained MRV1 with the HCU
+        # worker/model/operator callbacks already installed above.
+        if (
+            getattr(vllm_config.model_config.hf_config, "model_type", None)
+            == "kimi_k3"
+            and vllm_config.parallel_config.data_parallel_size == 1
+            and vllm_config.parallel_config.prefill_context_parallel_size == 1
+        ):
+            from vllm.v1.worker.gpu_model_runner import GPUModelRunner
+
+            runner = GPUModelRunner(vllm_config, device)
+            runner_logger.info("Kimi reference model runner constructed: %s", type(runner).__name__)
+            return runner
         raise RuntimeError(
             "vllm-plugin-das for vLLM main supports only Model Runner V2"
         )
@@ -133,6 +149,16 @@ class HcuGPUWorker(Worker):
             refresh_glm53_router_gates(self.model_runner.model)
 
     def compile_or_warm_up_model(self):
+        if self.use_v2_model_runner:
+            from vllm_hcu.v1.hcu_model_runner_v2 import sampler_warmup_scope
+
+            scope = sampler_warmup_scope()
+        else:
+            scope = nullcontext()
+        with scope:
+            return self._compile_or_warm_up_model()
+
+    def _compile_or_warm_up_model(self):
         if (
             self.use_v2_model_runner
             and self.parallel_config.pipeline_parallel_size > 1

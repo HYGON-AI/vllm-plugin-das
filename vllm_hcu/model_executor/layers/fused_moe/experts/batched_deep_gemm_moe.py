@@ -469,9 +469,14 @@ class BatchedDeepGemmExperts(mk.FusedMoEExpertsModular):
         )
 
         if use_w4a8:
-            if activation != MoEActivation.SILU:
+            is_situ = (
+                activation == getattr(MoEActivation, "SITU", None)
+                and bool(getattr(self, "_hcu_situ_activation", False))
+            )
+            if activation != MoEActivation.SILU and not is_situ:
                 raise ValueError(
-                    "HCU Channel W4A8 batched DeepGEMM supports only SiLU activation"
+                    "HCU Channel W4A8 batched DeepGEMM supports only SiLU "
+                    "activation, except for an explicitly enabled SiTU specialization"
                 )
             if (
                 getattr(self, "_deepgemm_w13", None) is None
@@ -494,7 +499,17 @@ class BatchedDeepGemmExperts(mk.FusedMoEExpertsModular):
                 expected_m,
             )
             clamp_limit = self.quant_config.gemm1_clamp_limit
-            if clamp_limit is not None and clamp_limit > 0:
+            if is_situ:
+                from lightop.activation import fuse_situ_mul_quant_ep
+
+                a2q, a2q_scale = fuse_situ_mul_quant_ep(
+                    workspace1,
+                    masked_m=expert_num_tokens,
+                    situ_beta=self._hcu_situ_beta,
+                    situ_linear_beta=self._hcu_situ_linear_beta,
+                    expect_m=expected_m,
+                )
+            elif clamp_limit is not None and clamp_limit > 0:
                 clamp_quant = (
                     dpsk_v4_deep_gemm_moe.fuse_silu_mul_clamp_quant_ep
                 )

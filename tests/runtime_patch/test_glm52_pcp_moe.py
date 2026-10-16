@@ -56,6 +56,8 @@ def test_fallback_moe_forward_shared_satisfies_aot_mutation_contract(
     """The tuple fallback must clone the mutated routed output."""
 
     class Layer:
+        _ep_fused_combine = False
+
         def _forward_impl(self, hidden_states, *_args, **_kwargs):
             hidden_states.add_(1)
             return torch.full_like(hidden_states, 7), hidden_states
@@ -192,6 +194,7 @@ def test_forward_entry_stays_on_official_shared_op_after_reconfiguration(
     monkeypatch.setattr(moe_runner_module.current_platform, "is_tpu", lambda: False)
 
     runner = object.__new__(moe_runner_module.MoERunner)
+    runner._ep_fused_combine = False
     runner.routed_experts = RoutedExperts()
     runner._shared_experts = SharedExperts()
     runner.moe_config = SimpleNamespace(
@@ -259,6 +262,7 @@ def make_runner(
 ):
     def make(pcp: int, use_all2all_kernels: bool):
         runner = object.__new__(moe_runner_module.MoERunner)
+        runner._ep_fused_combine = False
         runner.moe_config = SimpleNamespace(
             pcp_size=pcp,
             dp_size=1,
@@ -327,6 +331,7 @@ def test_shared_and_routed_outputs_keep_local_token_order_before_addition(
     """Reordering either local output before the shared+routed add is a bug."""
 
     runner = object.__new__(moe_runner_module.MoERunner)
+    runner._ep_fused_combine = False
     runner.moe_config = SimpleNamespace(hidden_dim_unpadded=2)
     runner.routed_experts = SimpleNamespace(
         quant_method=SimpleNamespace(has_unpadded_output=False),
@@ -409,6 +414,7 @@ def test_hy4_gate_runs_once_before_runner_dispatch(
 
     runner = object.__new__(moe_runner_module.MoERunner)
     torch.nn.Module.__init__(runner)
+    runner._ep_fused_combine = False
     runner.gate = Gate()
     runner._fse_fuse_gate = False
     runner._shared_experts = None
@@ -452,3 +458,47 @@ def test_hy4_gate_runs_once_before_runner_dispatch(
     assert runner.gate.calls == 1
     assert actual.shape == hidden.shape
     torch.testing.assert_close(actual, hidden * hidden.sigmoid())
+
+
+@pytest.mark.parametrize("pcp", [2, 8])
+def test_hash_router_receives_gathered_auxiliaries_in_real_forward_impl(
+    monkeypatch, moe_runner_module, pcp
+):
+    from contextlib import nullcontext
+
+    runner = object.__new__(moe_runner_module.MoERunner)
+    torch.nn.Module.__init__(runner)
+    runner.gate = None
+    runner._ep_fused_combine = False
+    runner._shared_experts = None
+    runner.moe_config = SimpleNamespace(
+        pcp_size=pcp, dp_size=1, is_sequence_parallel=False,
+        moe_parallel_config=SimpleNamespace(use_all2all_kernels=False),
+    )
+    runner.routed_experts = SimpleNamespace(
+        _ensure_moe_quant_config_init=lambda: None,
+        quant_method=SimpleNamespace(supports_internal_mk=False),
+    )
+    padding = torch.tensor([False, True])
+    context = SimpleNamespace(is_padding=padding)
+    group = SimpleNamespace(
+        all_gather=lambda tensor, dim=0: torch.cat([tensor] * pcp, dim=dim),
+        reduce_scatter=lambda tensor, dim=0: tensor.chunk(pcp, dim=dim)[0],
+    )
+    monkeypatch.setattr(moe_runner_module, "get_pcp_group", lambda: group)
+    monkeypatch.setattr(moe_runner_module, "is_forward_context_available", lambda: True)
+    monkeypatch.setattr(moe_runner_module, "get_forward_context", lambda: context)
+    monkeypatch.setattr(runner, "_sequence_parallel_context", nullcontext)
+    monkeypatch.setattr(runner, "_maybe_sync_shared_experts_stream", lambda *a, **k: None)
+    ids = torch.tensor([23, 24])
+
+    def route_and_apply(*, hidden_states, router_logits, input_ids, **kwargs):
+        assert hidden_states.shape[0] == router_logits.shape[0] == 2 * pcp
+        torch.testing.assert_close(input_ids, ids.repeat(pcp))
+        torch.testing.assert_close(context.is_padding, padding.repeat(pcp))
+        return None, hidden_states
+
+    monkeypatch.setattr(runner, "_apply_quant_method", route_and_apply)
+    result = runner._forward_impl(make_hidden(), make_logits(), None, ids)
+    torch.testing.assert_close(result, make_hidden())
+    assert context.is_padding is padding

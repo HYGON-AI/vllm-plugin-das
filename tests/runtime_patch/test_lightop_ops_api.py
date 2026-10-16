@@ -658,7 +658,7 @@ def test_silu_and_mul_rejects_same_named_legacy_operator_when_category_missing(
 def _deep_apply_namespace(logger: _WarningLogger) -> dict[str, object]:
     return {
         "torch": torch,
-        "MoEActivation": SimpleNamespace(SILU="silu"),
+        "MoEActivation": SimpleNamespace(SILU="silu", SWIGLUSTEP="swiglustep"),
         "current_platform": SimpleNamespace(is_rocm=lambda: True),
         "compute_aligned_M_and_alignment": lambda **_kwargs: (1, 256),
         "deepgemm_moe_permute": lambda **kwargs: (
@@ -675,6 +675,7 @@ def _deep_apply_namespace(logger: _WarningLogger) -> dict[str, object]:
             kwargs["a"]
         ),
         "_HCU_HT_EP_TOKEN_ALIGNMENT": 256,
+        "_EP_FUSED_MOE": False,
         "logger": logger,
     }
 

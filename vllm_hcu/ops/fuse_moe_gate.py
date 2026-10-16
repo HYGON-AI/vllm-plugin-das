@@ -120,6 +120,8 @@ class HcuGroupedTopKRouter(GroupedTopKRouter):
                     indices_type,
                     input_ids=input_ids,
                 )
+            if indices_type is not None and topk_ids.dtype != indices_type:
+                topk_ids = topk_ids.to(indices_type)
             return topk_weights, topk_ids
         else:
             return super()._compute_routing(

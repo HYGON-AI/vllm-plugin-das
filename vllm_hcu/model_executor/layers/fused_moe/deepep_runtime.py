@@ -67,6 +67,7 @@ def slimquant_w4a8_uses_deepep_auto(moe_config: object) -> bool:
         return False
 
     dp_size = getattr(parallel_config, "dp_size", 1)
+    pcp_size = getattr(parallel_config, "pcp_size", 1)
     use_ep = bool(getattr(parallel_config, "use_ep", False))
     all2all_backend = getattr(parallel_config, "all2all_backend", None)
     auto_kernels = getattr(
@@ -102,10 +103,10 @@ def slimquant_w4a8_uses_deepep_auto(moe_config: object) -> bool:
             )
         return False
 
-    if not is_dp_ep:
+    if not (use_ep and (dp_size > 1 or pcp_size > 1)):
         raise ValueError(
-            "SlimQuant W4A8 deepep_auto requires dp_size > 1 and expert "
-            "parallelism enabled"
+            "SlimQuant W4A8 deepep_auto requires dp_size > 1 or "
+            "pcp_size > 1, with expert parallelism enabled"
         )
     if auto_kernels is False:
         raise ValueError(
@@ -127,6 +128,7 @@ def slimquant_w4a8_uses_deepep_auto(moe_config: object) -> bool:
     architectures = model_architectures(vllm_config)
     supported_architectures = {
         "DeepseekV4ForCausalLM",
+        "DeepSeekV4MTPModel",
         # GLM's DSA model is implemented by vLLM as a direct
         # DeepseekV2ForCausalLM subclass and uses the same SiLU routed-expert
         # contract.  Channel SlimQuant checkpoints therefore share the
@@ -136,7 +138,7 @@ def slimquant_w4a8_uses_deepep_auto(moe_config: object) -> bool:
     if supported_architectures.isdisjoint(architectures):
         raise ValueError(
             "SlimQuant W4A8 deepep_auto is validated only for DeepSeek-V4 "
-            "or GLM MoE DSA; "
+            "and its native MTP draft, or GLM MoE DSA; "
             f"got architectures={architectures!r}"
         )
     activation = getattr(moe_config, "activation", None)
