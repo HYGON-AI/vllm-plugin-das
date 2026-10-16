@@ -107,7 +107,16 @@ def test_v4_profile_keeps_global_budget(pcp_runner_module, monkeypatch, with_mtp
     assert runner.max_num_tokens == 16384
 
 
-def test_empty_v4_shards_use_global_deepep_phase(pcp_runner_module, monkeypatch):
+@pytest.mark.parametrize("architecture,pcp", [
+    ("DeepseekV4ForCausalLM", 8),
+    ("Glm5NextForCausalLM", 8),
+    ("GlmMoeDsaForCausalLM", 8),
+    ("DeepseekV4ForCausalLM", 1),
+    ("Glm5NextForCausalLM", 1),
+])
+def test_prepare_inputs_selects_deepep_phase_batch(
+    pcp_runner_module, monkeypatch, architecture, pcp,
+):
     from vllm_hcu.forward_context_runtime import (
         deepep_auto_request_phase_scope, get_deepep_auto_request_phase,
     )
@@ -118,22 +127,28 @@ def test_empty_v4_shards_use_global_deepep_phase(pcp_runner_module, monkeypatch)
     bound = []
     monkeypatch.setattr(glm53_pcp, "bind_glm53_pcp_batch",
                         lambda manager, batch: bound.append(batch))
-    config = _config(8)
-    config.model_config = SimpleNamespace(architectures=["DeepseekV4ForCausalLM"])
+    config = _config(pcp)
+    config.model_config = SimpleNamespace(architectures=[architecture])
     runner = module.HcuGPUModelRunnerV2(config, "cpu")
     global_batch = SimpleNamespace(is_prefilling_np=np.array([True]))
     local_batch = SimpleNamespace(is_prefilling_np=np.array([False]))
     runner.global_batch = global_batch
-    runner.pcp_manager = SimpleNamespace(
+    runner.pcp_manager = None if pcp == 1 else SimpleNamespace(
         _global_batch=global_batch,
         partition_batch=lambda *args, **kwargs: local_batch,
     )
     with deepep_auto_request_phase_scope():
         result = runner.prepare_inputs("scheduler-output", "batch-req-state",
                                        SimpleNamespace(num_tokens=1))
-        assert result is local_batch
-        assert get_deepep_auto_request_phase() is global_batch.is_prefilling_np
-    assert bound == [local_batch]
+        expected_batch = global_batch if pcp == 1 else local_batch
+        phase_batch = (global_batch if architecture == "DeepseekV4ForCausalLM"
+                       else expected_batch)
+        assert result is expected_batch
+        assert get_deepep_auto_request_phase() is phase_batch.is_prefilling_np
+    uses_global_batch = pcp > 1 and architecture in (
+        "DeepseekV4ForCausalLM", "Glm5NextForCausalLM",
+    )
+    assert bound == ([local_batch] if uses_global_batch else [])
 
 
 def test_v4_metadata_uses_original_request_rows_for_every_group():
