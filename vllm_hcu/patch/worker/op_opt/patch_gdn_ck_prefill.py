@@ -95,7 +95,10 @@ def apply_to_module(module: ModuleType) -> bool:
             "transpose_state": True, "qk_l2norm": False,
             "gate_in_kernel": False, "has_dt_bias": False,
             "beta_sigmoid_in_kernel": False,
-            "output_final_state": output_final_state,
+            # AITER 0.1.7's Python/C++ binding cannot marshal the empty
+            # final-state result produced when this is false.  Compute it and
+            # discard it below to preserve the vLLM contract.
+            "output_final_state": True,
             "cp_context": False, "cp_world_size": 2,
         }
         workspace = aiter_ck_workspace(ops, packed[0], packed[2], ck_cu, flags)

@@ -323,7 +323,11 @@ def test_ck_gdn_complete_prefill_copies_core_output(monkeypatch):
     ck = _adapter("_aiter_ck_gdn")
     module = _ck_qwen_module()
     expected = torch.arange(65 * 8 * 128, dtype=torch.float32).to(torch.bfloat16).reshape(65, 8, 128)
-    ops = SimpleNamespace(prefill=lambda *args, **kwargs: (expected, None))
+    calls = []
+    ops = SimpleNamespace(
+        prefill=lambda *args, **kwargs: calls.append((args, kwargs))
+        or (expected, None)
+    )
     monkeypatch.setattr(patch, "resolve_aiter_ck_gdn", lambda: ops)
     monkeypatch.setattr(ck, "requested_backend", lambda stage: "hcu-aiter")
     monkeypatch.setattr(patch, "aiter_ck_workspace", lambda *args: torch.empty(1, dtype=torch.uint8))
@@ -339,6 +343,7 @@ def test_ck_gdn_complete_prefill_copies_core_output(monkeypatch):
     assert torch.equal(backing, expected)
     assert torch.equal(out[0], expected)
     assert final is None
+    assert calls[0][1]["output_final_state"] is True
 
 
 def test_ck_gdn_complete_prefill_varlen_graph_falls_back(monkeypatch):
