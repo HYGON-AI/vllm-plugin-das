@@ -26,6 +26,9 @@ from vllm_hcu.forward_context_runtime import (
 from vllm_hcu.v1.pcp_manager import make_hcu_pcp_manager_cls
 from vllm_hcu.patch.platform.core_fix.patch_vllm_config import is_glm53_pcp
 from vllm_hcu.deepseek_v4_runtime import is_deepseek_v4
+from vllm_hcu.patch.worker.op_opt._aiter_ck_gdn import (
+    reserve_aiter_ck_gdn_workspace,
+)
 
 
 def _uses_global_pcp_batch(vllm_config) -> bool:
@@ -369,7 +372,13 @@ class HcuGPUModelRunnerV2(GPUModelRunner):
         # GLM5Next KDA/K-pool and DeepSeek V4 attention see the full,
         # replicated token batch, including during profiling.
         if pcp_size <= 1 or _uses_global_pcp_batch(self.vllm_config):
-            return super().profile_run()
+            result = super().profile_run()
+            reserve_aiter_ck_gdn_workspace(
+                self.vllm_config,
+                self.max_num_tokens,
+                tuple(dict.fromkeys((0, getattr(self, "_draft_workspace_lane", 0)))),
+            )
+            return result
 
         original_max = self.max_num_tokens
         # Prefill tokens are partitioned, but decode tokens are replicated on
@@ -401,6 +410,9 @@ class HcuGPUModelRunnerV2(GPUModelRunner):
             self.max_num_tokens = original_max
 
         if speculator is None:
+            reserve_aiter_ck_gdn_workspace(
+                self.vllm_config, original_max, (0,)
+            )
             return
 
         # Pass 2: MTP draft at the full global batch (not /pcp). Stub the
@@ -413,6 +425,11 @@ class HcuGPUModelRunnerV2(GPUModelRunner):
         finally:
             self._hcu_profile_mtp_full_batch = False
             self.max_num_tokens = original_max
+        reserve_aiter_ck_gdn_workspace(
+            self.vllm_config,
+            original_max,
+            tuple(dict.fromkeys((0, getattr(self, "_draft_workspace_lane", 0)))),
+        )
 
     def _dummy_run(self, num_tokens, *args, **kwargs):
         """Optionally stub target forward while sizing full-batch MTP."""

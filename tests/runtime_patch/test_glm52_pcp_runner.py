@@ -1463,7 +1463,7 @@ def test_profile_run_covers_replicated_decode_and_sampler_requests(
 
 
 def test_profile_run_keeps_non_pcp_token_budget(
-    pcp_runner_module,
+    pcp_runner_module, monkeypatch,
 ) -> None:
     """PCP=1 must retain the upstream profile token budget."""
 
@@ -1472,11 +1472,18 @@ def test_profile_run_keeps_non_pcp_token_budget(
     _install_recording_profile_run(runner_module, seen)
     runner = runner_module.HcuGPUModelRunnerV2(_config(1), "hcu:0")
     runner.max_num_tokens = 16384
+    reserved = []
+    monkeypatch.setattr(
+        runner_module,
+        "reserve_aiter_ck_gdn_workspace",
+        lambda config, tokens, lanes: reserved.append((config, tokens, lanes)),
+    )
 
     runner.profile_run()
 
     assert seen == [16384]
     assert runner.max_num_tokens == 16384
+    assert reserved == [(runner.vllm_config, 16384, (0,))]
 
 
 def test_profile_run_restores_token_budget_after_failure(

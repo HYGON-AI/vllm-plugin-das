@@ -7,6 +7,7 @@ from __future__ import annotations
 import importlib
 import inspect
 import sys
+from contextlib import contextmanager
 from dataclasses import dataclass
 from types import ModuleType, SimpleNamespace
 
@@ -264,6 +265,63 @@ def test_ck_gdn_workspace_reuses_lane_and_respects_lock(monkeypatch):
     size[0] = 513
     with use_workspace_lane(0), pytest.raises(AssertionError, match="locked"):
         adapter.aiter_ck_workspace(ops, q, v, cu, {})
+
+
+def test_ck_gdn_reserves_max_prefill_workspace_per_lane(monkeypatch):
+    adapter = _adapter("_aiter_ck_gdn")
+    layer = SimpleNamespace(
+        num_k_heads=8,
+        num_v_heads=32,
+        tp_size=4,
+        head_k_dim=128,
+        head_v_dim=128,
+        A_log=torch.empty(1),
+    )
+    config = SimpleNamespace(
+        compilation_config=SimpleNamespace(
+            static_forward_context={"layer": layer}
+        ),
+        model_config=SimpleNamespace(dtype=torch.bfloat16),
+    )
+    shapes = []
+    ops = SimpleNamespace(
+        workspace_bytes=lambda q, v, cu, **flags: (
+            shapes.append((q.shape, v.shape, cu, flags)) or 777
+        )
+    )
+    reservations = []
+
+    class Manager:
+        def get_simultaneous(self, *specs):
+            reservations.append(specs)
+            return [torch.empty(specs[0][0], dtype=specs[0][1])]
+
+    lanes = []
+
+    @contextmanager
+    def lane_scope(lane):
+        lanes.append(lane)
+        yield
+
+    monkeypatch.setattr(adapter, "requested_backend", lambda stage: adapter.AITER)
+    monkeypatch.setattr(adapter, "resolve_aiter_ck_gdn", lambda: ops)
+    monkeypatch.setattr(adapter, "current_workspace_manager", lambda: Manager())
+    monkeypatch.setattr(adapter, "use_workspace_lane", lane_scope)
+
+    required = adapter.reserve_aiter_ck_gdn_workspace(config, 8192, (0, 1))
+
+    assert required == 777
+    assert lanes == [0, 1]
+    assert reservations == [
+        (((777,), torch.uint8),),
+        (((777,), torch.uint8),),
+    ]
+    q_shape, v_shape, cu, flags = shapes[0]
+    assert q_shape == (8192, 2, 128)
+    assert v_shape == (8192, 8, 128)
+    assert cu is None
+    assert flags["transpose_state"] is True
+    assert flags["use_exp2"] is False
 
 
 def _ck_forward_native(

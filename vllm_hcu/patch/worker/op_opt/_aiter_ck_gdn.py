@@ -9,7 +9,10 @@ from dataclasses import dataclass
 from collections.abc import Callable, Mapping
 
 import torch
-from vllm.v1.worker.workspace import current_workspace_manager
+from vllm.v1.worker.workspace import (
+    current_workspace_manager,
+    use_workspace_lane,
+)
 
 from ._common import PatchCompatibilityError, require_exact_signature
 from ._gdn_backend import AITER, requested_backend
@@ -160,7 +163,75 @@ def aiter_ck_workspace(
     )[0]
 
 
+def reserve_aiter_ck_gdn_workspace(
+    vllm_config: object,
+    max_tokens: int,
+    lanes: tuple[int, ...],
+) -> int:
+    """Reserve the largest fused-prefill workspace before it is locked."""
+
+    compilation_config = getattr(vllm_config, "compilation_config", None)
+    contexts = getattr(compilation_config, "static_forward_context", {})
+    layer = next(
+        (
+            candidate
+            for candidate in contexts.values()
+            if all(
+                hasattr(candidate, name)
+                for name in (
+                    "num_k_heads", "num_v_heads", "tp_size",
+                    "head_k_dim", "head_v_dim", "A_log",
+                )
+            )
+        ),
+        None,
+    )
+    if layer is None or requested_backend("prefill") != AITER:
+        return 0
+
+    tp_size = int(layer.tp_size)
+    hq = int(layer.num_k_heads) // tp_size
+    hv = int(layer.num_v_heads) // tp_size
+    if (
+        int(layer.head_k_dim) != 128
+        or int(layer.head_v_dim) != 128
+        or hq <= 0
+        or hv % hq
+        or hv // hq not in (1, 2, 4)
+    ):
+        return 0
+
+    ops = resolve_aiter_ck_gdn()
+    if ops is None:
+        return 0
+    dtype = vllm_config.model_config.dtype
+    device = layer.A_log.device
+    q = torch.empty((int(max_tokens), hq, 128), dtype=dtype, device=device)
+    v = torch.empty((int(max_tokens), hv, 128), dtype=dtype, device=device)
+    required = int(ops.workspace_bytes(
+        q, v, None,
+        use_g=True,
+        use_gk=False,
+        use_exp2=False,
+        transpose_state=True,
+        qk_l2norm=False,
+        gate_in_kernel=False,
+        has_dt_bias=False,
+        beta_sigmoid_in_kernel=False,
+        output_final_state=True,
+        cp_context=False,
+        cp_world_size=2,
+    ))
+    del q, v
+    manager = current_workspace_manager()
+    for lane in dict.fromkeys(lanes):
+        with use_workspace_lane(lane):
+            manager.get_simultaneous(((required,), torch.uint8))
+    return required
+
+
 __all__ = [
     "AiterCkGdnOps", "PatchCompatibilityError", "aiter_ck_cu_seqlens",
-    "aiter_ck_unsupported", "aiter_ck_workspace", "resolve_aiter_ck_gdn",
+    "aiter_ck_unsupported", "aiter_ck_workspace",
+    "reserve_aiter_ck_gdn_workspace", "resolve_aiter_ck_gdn",
 ]
