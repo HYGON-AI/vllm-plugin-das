@@ -5,7 +5,10 @@
 from __future__ import annotations
 
 import functools
+from contextlib import contextmanager
+from contextvars import ContextVar
 from types import ModuleType
+from typing import Iterator
 
 from ._common import (
     already_applied,
@@ -24,6 +27,10 @@ TARGETS = (
 _MARKER = "_vllm_hcu_agrs_int8_dispatch_applied"
 _WRAPPER = "_vllm_hcu_agrs_int8_dispatch_wrapper"
 _RUNTIME_ENABLED = False
+_DIRECT_TRANSPORT = ContextVar(
+    "vllm_hcu_int8_allgatherv_direct_transport",
+    default=False,
+)
 
 
 def configure(enabled: bool) -> None:
@@ -37,6 +44,21 @@ def configure(enabled: bool) -> None:
 
 def _enabled() -> bool:
     return _RUNTIME_ENABLED
+
+
+@contextmanager
+def int8_transport() -> Iterator[None]:
+    """Scope the altered communicator payload to a compatible MoE consumer."""
+
+    token = _DIRECT_TRANSPORT.set(True)
+    try:
+        yield
+    finally:
+        _DIRECT_TRANSPORT.reset(token)
+
+
+def _direct_transport_enabled() -> bool:
+    return _DIRECT_TRANSPORT.get()
 
 
 def _supports_transport_quantization(hidden_states: torch.Tensor) -> bool:
@@ -78,16 +100,6 @@ def _quantize_hidden_states(
     return quantized, scales
 
 
-def _dequantize_hidden_states(
-    quantized: torch.Tensor,
-    scales: torch.Tensor,
-    dtype: torch.dtype,
-) -> torch.Tensor:
-    import torch
-
-    return (quantized.to(torch.float32) * scales).to(dtype)
-
-
 def _gather_quantized(
     manager,
     hidden_states: torch.Tensor,
@@ -107,9 +119,7 @@ def _gather_quantized(
     tensors = [quantized, scales, *metadata]
     if extra_tensors is not None:
         tensors.extend(extra_tensors)
-    gathered = group.all_gatherv(tensors, dim=0, sizes=sizes)
-    restored = _dequantize_hidden_states(gathered[0], gathered[1], hidden_states.dtype)
-    return [restored, *gathered[2:]]
+    return group.all_gatherv(tensors, dim=0, sizes=sizes)
 
 
 def apply_to_module(module: ModuleType) -> bool:
@@ -160,7 +170,11 @@ def apply_to_module(module: ModuleType) -> bool:
         is_sequence_parallel=False,
         extra_tensors=None,
     ):
-        if not _enabled() or not _supports_transport_quantization(hidden_states):
+        if (
+            not _enabled()
+            or not _direct_transport_enabled()
+            or not _supports_transport_quantization(hidden_states)
+        ):
             return original_router(
                 self,
                 hidden_states,
@@ -176,8 +190,8 @@ def apply_to_module(module: ModuleType) -> bool:
             extra_tensors,
         )
         if extra_tensors is None:
-            return gathered[0], gathered[1]
-        return gathered[0], gathered[1], gathered[2:]
+            return gathered[0], gathered[2], gathered[1]
+        return gathered[0], gathered[2], gathered[3:], gathered[1]
 
     @functools.wraps(original_dispatch)
     def hcu_dispatch(
@@ -188,7 +202,11 @@ def apply_to_module(module: ModuleType) -> bool:
         is_sequence_parallel=False,
         extra_tensors=None,
     ):
-        if not _enabled() or not _supports_transport_quantization(hidden_states):
+        if (
+            not _enabled()
+            or not _direct_transport_enabled()
+            or not _supports_transport_quantization(hidden_states)
+        ):
             return original_dispatch(
                 self,
                 hidden_states,
@@ -205,8 +223,8 @@ def apply_to_module(module: ModuleType) -> bool:
             extra_tensors,
         )
         if extra_tensors is None:
-            return gathered[0], gathered[1], gathered[2]
-        return gathered[0], gathered[1], gathered[2], gathered[3:]
+            return gathered[0], gathered[2], gathered[3], gathered[1]
+        return gathered[0], gathered[2], gathered[3], gathered[4:], gathered[1]
 
     setattr(hcu_dispatch_router_logits, _WRAPPER, True)
     setattr(hcu_dispatch, _WRAPPER, True)
@@ -229,4 +247,5 @@ __all__ = [
     "apply",
     "apply_to_module",
     "configure",
+    "int8_transport",
 ]

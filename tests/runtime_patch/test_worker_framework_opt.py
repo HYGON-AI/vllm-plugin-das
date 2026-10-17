@@ -108,15 +108,19 @@ def test_agrs_int8_dispatch_gathers_quantized_hidden_and_scale(
     manager = module.AgRsAll2AllManager()
     manager.group = Group()
 
-    all_hidden, all_router = manager.dispatch_router_logits(hidden, router)
+    with patch_agrs_int8.int8_transport():
+        all_hidden, all_router, all_scales = manager.dispatch_router_logits(
+            hidden, router
+        )
 
     assert len(gathered) == 1
     sent, sizes = gathered[0]
     assert sent == [quantized, scales, router]
     assert sizes == [2]
-    torch.testing.assert_close(all_hidden, hidden, rtol=0, atol=0)
-    assert all_hidden.dtype is torch.bfloat16
+    assert all_hidden is quantized
+    assert all_hidden.dtype is torch.int8
     assert all_router is router
+    assert all_scales is scales
 
 
 def test_agrs_int8_dispatch_is_opt_in(monkeypatch: pytest.MonkeyPatch) -> None:
@@ -126,6 +130,28 @@ def test_agrs_int8_dispatch_is_opt_in(monkeypatch: pytest.MonkeyPatch) -> None:
     manager = module.AgRsAll2AllManager()
     hidden = torch.ones((2, 4), dtype=torch.bfloat16)
     router = torch.ones((2, 3), dtype=torch.bfloat16)
+
+    result = manager.dispatch_router_logits(hidden, router)
+
+    assert result == (hidden, router)
+
+
+def test_agrs_int8_dispatch_requires_explicit_transport_scope(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    patch_agrs_int8.configure(True)
+    module = _fake_agrs_module()
+    assert patch_agrs_int8.apply_to_module(module)
+    manager = module.AgRsAll2AllManager()
+    hidden = torch.ones((2, 4), dtype=torch.bfloat16)
+    router = torch.ones((2, 3), dtype=torch.bfloat16)
+    monkeypatch.setattr(
+        patch_agrs_int8,
+        "_quantize_hidden_states",
+        lambda _value: pytest.fail(
+            "generic communicator calls must preserve BF16 transport"
+        ),
+    )
 
     result = manager.dispatch_router_logits(hidden, router)
 
@@ -237,22 +263,20 @@ def test_agrs_int8_topk_dispatch_preserves_uneven_sizes_and_extras(
     manager.group = Group()
     manager.sizes = [2, 0, 3]
 
-    all_hidden, all_weights, all_ids, all_extras = manager.dispatch(
-        hidden,
-        topk_weights,
-        topk_ids,
-        extra_tensors=[extra],
-    )
+    with patch_agrs_int8.int8_transport():
+        all_hidden, all_weights, all_ids, all_extras, all_scales = manager.dispatch(
+            hidden,
+            topk_weights,
+            topk_ids,
+            extra_tensors=[extra],
+        )
 
-    torch.testing.assert_close(
-        all_hidden,
-        torch.full_like(hidden, 0.25),
-        rtol=0,
-        atol=0,
-    )
+    assert all_hidden is quantized
+    assert all_hidden.dtype is torch.int8
     assert all_weights is topk_weights
     assert all_ids is topk_ids
     assert all_extras == [extra]
+    assert all_scales is scales
 
 
 def test_agrs_int8_quantizes_zero_token_rank_without_lightop() -> None:
