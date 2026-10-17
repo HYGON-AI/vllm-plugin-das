@@ -335,6 +335,7 @@ _CUDA_VALIDATION_ID = (
 # proposer/eagle/ubatch -> DeepEP all2all.  The PyNccl pair is optional unless
 # an explicit ``all2all_backend='pynccl'`` config requests it.
 _FRAMEWORK_CALLBACKS: tuple[_CallbackSpec, ...] = (
+    _CallbackSpec(_adapter("framework_opt", "patch_agrs_int8")),
     _CallbackSpec(
         _adapter("framework_opt", "patch_model_loader_static_eplb"),
         feature="offline_eplb",
