@@ -217,6 +217,8 @@ _CORE_CALLBACKS: tuple[_CallbackSpec, ...] = (
     _CallbackSpec(_adapter("core_fix", "patch_deepseek_v4_rocm_dspark_metadata")),
     _CallbackSpec(_adapter("core_fix", "patch_deepseek_v4_rocm_flashmla_sparse")),
     _CallbackSpec(_adapter("core_fix", "patch_deepseek_v4_rocm_wo_a_layout")),
+    # Before the PCP adapter: its local-query path captures this _o_proj.
+    _CallbackSpec(_adapter("core_fix", "patch_deepseek_v4_inverse_rope")),
     _CallbackSpec(_adapter("core_fix", "patch_deepseek_v4_pcp")),
     _CallbackSpec(_adapter("core_fix", "patch_gpt_oss_mlp_block")),
     _CallbackSpec(_adapter("core_fix", "patch_glm5next_channel_fp8")),

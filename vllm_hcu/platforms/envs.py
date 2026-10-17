@@ -82,6 +82,7 @@ if TYPE_CHECKING:
     VLLM_HCU_DEEPSEEK_V4_PCP_LOCAL_SLICES: bool = True
     VLLM_HCU_COMPRESSOR_GEMM_BACKEND: str = "blaslt"
     VLLM_HCU_C128_HEAD_SPLITS: int = 4
+    VLLM_HCU_INVERSE_ROPE_SUFFIX: bool = True
     VLLM_HCU_SHARED_EXPERTS_EARLY_LAUNCH: bool = False
     VLLM_HCU_ENABLE_REQUEST_CUDAGRAPH_BUCKETS: bool = False
     VLLM_HCU_PLE_CPU_OFFLOAD: bool = False
@@ -624,6 +625,11 @@ hcu_vllm_environment_variables: dict[str, Callable[[], Any]] = {
     # C128 prefill head tiles on HCU; 0 restores the upstream CU heuristic.
     "VLLM_HCU_C128_HEAD_SPLITS":
         lambda: int(os.getenv("VLLM_HCU_C128_HEAD_SPLITS", "4")),
+
+    # DeepSeek V4 o_proj: rotate only the 64-dim RoPE suffix of the private
+    # attention output in place, instead of an out-of-place 512-dim copy.
+    "VLLM_HCU_INVERSE_ROPE_SUFFIX":
+        lambda: _environment_flag(os.getenv("VLLM_HCU_INVERSE_ROPE_SUFFIX", "1")),
 
     # Launch shared_experts on the auxiliary stream before routed MoE/DeepEP,
     # and wait only when the shared output is consumed.
