@@ -6639,3 +6639,73 @@ def test_deepep_auto_uses_internal_dispatch_for_pcp_without_dp(monkeypatch, pcp)
     parallel.use_ep = False
     assert not parallel.use_all2all_kernels
     assert not parallel.use_deepep_auto_kernels
+
+
+@pytest.mark.parametrize("mode", ["shared", "disabled", "layouts_differ"])
+def test_channel_fp8_auto_experts_share_identical_marlin_layouts(
+    monkeypatch: pytest.MonkeyPatch, mode: str,
+):
+    from vllm_hcu.model_executor.layers.fused_moe.experts import (
+        dpsk_v4_deep_gemm_moe as module,
+    )
+
+    monkeypatch.setenv("VLLM_HCU_DEEPEP_AUTO_SHARED_WEIGHTS",
+                       "0" if mode == "disabled" else "1")
+
+    def make_experts():
+        experts = object.__new__(module.DeepEPAutoDeepGemmExperts)
+        experts._fixed_use_low_latency = None
+        experts.ht_experts = object.__new__(module.DeepEPDeepGemmContiguousExperts)
+        experts.ll_experts = object.__new__(module.DeepEPDeepGemmMaskedExperts)
+        return experts
+
+    def raw_layer(layer):
+        layer.w13_weight = torch.nn.Parameter(w13.clone(), requires_grad=False)
+        layer.w2_weight = torch.nn.Parameter(w2.clone(), requires_grad=False)
+        return layer
+
+    w13 = torch.randint(-128, 128, (2, 32, 64), dtype=torch.int8)
+    w2 = torch.randint(-128, 128, (2, 64, 16), dtype=torch.int8)
+    layer = raw_layer(torch.nn.Module())
+    layer.w13_weight_scale = torch.nn.Parameter(torch.ones((2, 32)))
+    layer.w2_weight_scale = torch.nn.Parameter(torch.ones((2, 64)))
+    layer.weight_block_size = None
+
+    # gfx938 deepgemm applies the same permutation in both packers.
+    def pack(weight: torch.Tensor) -> torch.Tensor:
+        return weight.flip(-1).reshape(weight.shape[0], 1, 1, 1, *weight.shape[1:])
+
+    monkeypatch.setattr(module, "marlin_fp8_contiguous_weight", pack)
+    monkeypatch.setattr(
+        module, "marlin_fp8_masked_weight",
+        (lambda w: w.reshape(w.shape[0], 1, 1, 1, *w.shape[1:]))
+        if mode == "layouts_differ" else pack,
+    )
+
+    experts = make_experts()
+    experts.process_weights_after_loading(layer)
+    assert torch.equal(layer.w13_weight, pack(w13))
+    assert torch.equal(layer.w2_weight, pack(w2))
+    if mode != "shared":
+        assert layer._dsv4_channel_deepgemm_layout == "contiguous+masked"
+        assert experts.ll_experts._deepgemm_w13 is layer._dsv4_channel_deepgemm_masked_w13
+        assert experts.ll_experts._deepgemm_w13 is not layer.w13_weight
+        return
+
+    assert layer._dsv4_channel_deepgemm_layout == "contiguous=masked"
+    assert not hasattr(layer, "_dsv4_channel_deepgemm_masked_w13")
+    for child in (experts.ht_experts, experts.ll_experts):
+        assert child._deepgemm_w13 is layer.w13_weight
+        assert child._deepgemm_w2 is layer.w2_weight
+
+    # A rebuilt expert (e.g. after layerwise reload) rebinds without repacking.
+    replacement = make_experts()
+    replacement.process_weights_after_loading(layer)
+    assert replacement.ll_experts._deepgemm_w13 is layer.w13_weight
+    assert replacement.ht_experts._deepgemm_w2 is layer.w2_weight
+
+    # Raw reload of the shared layout repacks into one copy again.
+    reloaded = make_experts()
+    reloaded.process_weights_after_loading(raw_layer(layer))
+    assert reloaded.ll_experts._deepgemm_w13 is layer.w13_weight
+    assert torch.equal(layer.w13_weight, pack(w13))

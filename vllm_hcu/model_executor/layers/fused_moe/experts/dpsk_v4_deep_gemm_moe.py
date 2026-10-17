@@ -63,6 +63,12 @@ def _deepgemm_op(name: str):
     return getattr(deepgemm, name)
 
 
+def _shared_ht_ll_weights_enabled() -> bool:
+    return henvs.optional_custom_op_enabled(
+        henvs.VLLM_HCU_DEEPEP_AUTO_SHARED_WEIGHTS
+    )
+
+
 def marlin_fp8_contiguous_weight(weight: torch.Tensor) -> torch.Tensor:
     return _deepgemm_op("marlin_fp8_contiguous_weight")(weight)
 
@@ -759,6 +765,8 @@ class DeepEPDeepGemmMaskedExperts(DeepEPDeepGemmContiguousExperts):
 class DeepEPAutoDeepGemmExperts(mk.FusedMoEExpertsModular):
     """Select a per-forward or role-fixed DeepGEMM expert layout."""
 
+    SHARED_LAYOUT = "contiguous=masked"
+
     def __init__(
         self,
         moe_config: FusedMoEConfig,
@@ -817,6 +825,19 @@ class DeepEPAutoDeepGemmExperts(mk.FusedMoEExpertsModular):
             "_dsv4_channel_deepgemm_layout",
             None,
         )
+        if packed_layout == self.SHARED_LAYOUT:
+            if (
+                layer.w13_weight.dim() in (6, 7)
+                and layer.w2_weight.dim() == layer.w13_weight.dim()
+            ):
+                self._bind_shared(layer)
+                return
+            if not self.ht_experts._can_pack_channel_weights(layer):
+                raise RuntimeError(
+                    "DeepEP auto DeepGEMM layer has invalid reloaded weights: "
+                    f"w13={tuple(layer.w13_weight.shape)} "
+                    f"w2={tuple(layer.w2_weight.shape)}"
+                )
         if packed_layout == "contiguous+masked":
             ll_w13 = getattr(
                 layer,
@@ -848,7 +869,7 @@ class DeepEPAutoDeepGemmExperts(mk.FusedMoEExpertsModular):
                     f"w2={tuple(layer.w2_weight.shape)}"
                 )
         if packed_layout is not None:
-            if packed_layout != "contiguous+masked":
+            if packed_layout not in ("contiguous+masked", self.SHARED_LAYOUT):
                 raise RuntimeError(
                     "DeepEP auto DeepGEMM requires unpacked channel-wise "
                     "FP8 or INT8 weights, "
@@ -862,6 +883,27 @@ class DeepEPAutoDeepGemmExperts(mk.FusedMoEExpertsModular):
 
         w13 = layer.w13_weight
         w2 = layer.w2_weight
+        if _shared_ht_ll_weights_enabled() and self._packers_share_layout(w13, w2):
+            # On gfx938/gfx92a the contiguous and masked packers emit the same
+            # bytes, so one resident copy serves both delegates (and EPLB only
+            # has to move the registered parameters).
+            with torch.no_grad():
+                w13_packed, w2_packed = self.ht_experts._pack_channel_weights(
+                    w13, w2
+                )
+            replace_parameter(layer, "w13_weight", w13_packed)
+            replace_parameter(layer, "w2_weight", w2_packed)
+            for name in (
+                "_dsv4_channel_deepgemm_masked_w13",
+                "_dsv4_channel_deepgemm_masked_w2",
+            ):
+                if hasattr(layer, name):
+                    delattr(layer, name)
+            self._bind_shared(layer)
+            layer._dsv4_channel_deepgemm_layout = self.SHARED_LAYOUT
+            layer._dsv4_channel_deepgemm_repacked = True
+            del w13, w2
+            return
         with torch.no_grad():
             # Both HCU Marlin packers rearrange their input storage in place
             # and return a view of that same storage.  Preserve independent
@@ -884,6 +926,40 @@ class DeepEPAutoDeepGemmExperts(mk.FusedMoEExpertsModular):
         layer._dsv4_channel_deepgemm_layout = "contiguous+masked"
         layer._dsv4_channel_deepgemm_repacked = True
         del w13, w2
+
+    def _bind_shared(self, layer: torch.nn.Module) -> None:
+        for child in (self.ht_experts, self.ll_experts):
+            child._deepgemm_w13 = layer.w13_weight
+            child._deepgemm_w2 = layer.w2_weight
+
+    def _packers_share_layout(self, w13: torch.Tensor, w2: torch.Tensor) -> bool:
+        # Probe one random expert: the packers are pure per-expert byte
+        # permutations, so equal output on random bytes means equal layouts.
+        def probe(weight: torch.Tensor) -> torch.Tensor:
+            raw = torch.randint(
+                -128, 128, (1, *weight.shape[1:]),
+                dtype=torch.int8, device=weight.device,
+            )
+            return raw.view(weight.dtype)
+
+        with torch.no_grad():
+            p13, p2 = probe(w13), probe(w2)
+            ht = self.ht_experts._pack_channel_weights(p13.clone(), p2.clone())
+            ll = self.ll_experts._pack_channel_weights(p13.clone(), p2.clone())
+            shared = all(
+                a.shape == b.shape
+                and a.stride() == b.stride()
+                and torch.equal(
+                    a.contiguous().view(torch.int8), b.contiguous().view(torch.int8)
+                )
+                for a, b in zip(ht, ll)
+            )
+        logger.info_once(
+            "DeepEP auto DeepGEMM: HT/LL packed layouts %s; keeping %s.",
+            "match" if shared else "differ",
+            "one shared copy" if shared else "two copies",
+        )
+        return shared
 
     @staticmethod
     def _supports_current_device() -> bool:
