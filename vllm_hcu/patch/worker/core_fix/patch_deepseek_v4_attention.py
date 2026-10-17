@@ -5,6 +5,7 @@
 from __future__ import annotations
 
 import functools
+import os
 from collections.abc import Callable
 from types import ModuleType
 from typing import Any
@@ -12,6 +13,7 @@ from typing import Any
 import torch
 
 from vllm_hcu.platforms.hcu import on_gfx938
+from vllm_hcu.utils.bf16_fp32_gemm import linear_bf16_fp32
 
 from ._common import (
     PatchCompatibilityError,
@@ -40,9 +42,38 @@ _INDEXER_INIT_WRAPPER_MARKER = "_vllm_hcu_indexer_cache_dtype_wrapper"
 _INDEXER_Q_WRAPPER_MARKER = "_vllm_hcu_bf16_indexer_query_wrapper"
 
 
+def _compressor_nt_weight(weight: torch.Tensor) -> torch.Tensor | None:
+    """Cached ``[out, in]`` copy of an HCU NN ``[in, out]`` compressor weight.
+
+    The first call may run on an auxiliary projection stream; later callers
+    wait for that copy. The cache is keyed on storage and version, so an
+    in-place weight reload rebuilds it.
+    """
+    if weight.is_inference() or weight.shape[0] == weight.shape[1]:
+        return None
+    key = (weight.data_ptr(), weight._version)
+    cached = getattr(weight, "_vllm_hcu_compressor_nt", None)
+    if cached is None or cached[0] != key:
+        ready = torch.cuda.Event()
+        cached = (key, weight.T.contiguous(), ready)
+        ready.record()
+        weight._vllm_hcu_compressor_nt = cached
+    _, nt, ready = cached
+    torch.cuda.current_stream().wait_event(ready)
+    return nt
+
+
 def _compressor_mm(hidden_states: torch.Tensor, weight: torch.Tensor) -> torch.Tensor:
     """Multiply either HCU NN ``[in, out]`` or upstream ``[out, in]`` weights."""
-    rhs = weight if weight.shape[0] == hidden_states.shape[-1] else weight.T
+    nn_layout = weight.shape[0] == hidden_states.shape[-1]
+    if (os.environ.get("VLLM_HCU_COMPRESSOR_GEMM_BACKEND", "blaslt") == "blaslt"
+            and weight.is_cuda and weight.dtype == torch.bfloat16):
+        # Reuse the shared BF16 -> FP32 BLASLt NT GEMM (with its own
+        # switch and torch fallback); the NN layout's torch.mm is slow.
+        nt = _compressor_nt_weight(weight) if nn_layout else weight
+        if nt is not None:
+            return linear_bf16_fp32(hidden_states, nt)
+    rhs = weight if nn_layout else weight.T
     return torch.mm(hidden_states, rhs, out_dtype=torch.float32)
 
 
