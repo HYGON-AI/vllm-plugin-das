@@ -11,6 +11,7 @@ import torch
 
 from ._aiter_ck_gdn import (
     aiter_ck_cu_seqlens,
+    aiter_ck_runtime_safety_reason,
     aiter_ck_unsupported,
     aiter_ck_workspace,
     resolve_aiter_ck_gdn,
@@ -75,6 +76,13 @@ def apply_to_module(module: ModuleType) -> bool:
             )
 
         if ops is None or use_qk_l2norm_in_kernel:
+            return fallback()
+        safety_reason = aiter_ck_runtime_safety_reason()
+        if safety_reason:
+            qwen.logger.warning_once(
+                "GDN fused CK prefill is disabled because %s; using the "
+                "existing prefill path.", safety_reason,
+            )
             return fallback()
         if any(x.ndim < 1 or x.shape[0] != 1 for x in (q, k, v, g, beta)):
             return fallback()

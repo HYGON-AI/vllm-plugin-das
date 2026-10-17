@@ -19,12 +19,22 @@ from ._gdn_backend import AITER, requested_backend
 
 _MODULE = "aiter"
 _AUDITED_VERSION = "0.1.7"
+_RUNTIME_SAFETY_REASON = (
+    "AITER 0.1.7 CK prefill produces non-finite output for legal "
+    "strong-decay inputs"
+)
 
 
 @dataclass(frozen=True)
 class AiterCkGdnOps:
     prefill: Callable
     workspace_bytes: Callable
+
+
+def aiter_ck_runtime_safety_reason() -> str:
+    """Explain why the audited CK prefill must not serve model traffic."""
+
+    return _RUNTIME_SAFETY_REASON
 
 
 _WORKSPACE_POSITIONAL = (
@@ -232,6 +242,6 @@ def reserve_aiter_ck_gdn_workspace(
 
 __all__ = [
     "AiterCkGdnOps", "PatchCompatibilityError", "aiter_ck_cu_seqlens",
-    "aiter_ck_unsupported", "aiter_ck_workspace",
+    "aiter_ck_runtime_safety_reason", "aiter_ck_unsupported", "aiter_ck_workspace",
     "reserve_aiter_ck_gdn_workspace", "resolve_aiter_ck_gdn",
 ]

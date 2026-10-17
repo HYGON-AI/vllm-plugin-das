@@ -2,11 +2,10 @@
 
 ## Scope and environment
 
-This validation covers the fused `aiter.ck_gdn_prefill` route added at
-`ChunkGatedDeltaRule.forward_native`. It is controlled by the existing
-`VLLM_HCU_USE_CUSTOM_OPS` master switch and the existing `hcu-aiter` prefill
-provider selection. Explicit `triton`, explicit `hcu-boltops`, and a disabled
-master switch retain the original path.
+This validation covers the fused `aiter.ck_gdn_prefill` route evaluated at
+`ChunkGatedDeltaRule.forward_native`. Production routing is fail-closed because
+the audited AITER 0.1.7 kernel produces non-finite results for legal Qwen GDN
+inputs. The existing mixed AITER/BoltOps path remains active.
 
 Operator measurements were taken on a BW HCU with PyTorch 2.11.0,
 vLLM `0.28.1+dtk2604.torch2110.2609171627.g77acaf`, AITER
@@ -27,6 +26,9 @@ vLLM `0.28.1+dtk2604.torch2110.2609171627.g77acaf`, AITER
   so the public vLLM result remains `(output, None)`.
 - Workspace comes from vLLM's active `WorkspaceManager` lane. A locked manager
   that is too small raises before launch rather than allocating during capture.
+- Production model traffic does not enter CK prefill while the AITER 0.1.7
+  strong-decay failure remains. Native CK tests explicitly bypass this safety
+  gate to characterize the optional dependency.
 
 ## Native correctness and graph validation
 
@@ -74,12 +76,43 @@ HIP_VISIBLE_DEVICES=0 VLLM_HCU_USE_CUSTOM_OPS=1 \
 | 2048 | 0.903 | 0.687 | 0.363 | 1.89x | 24,232,704 |
 | 4096 | 1.006 | 0.793 | 0.487 | 1.63x | 47,367,424 |
 
-All providers produced finite output. Across the matrix, CK output NRMSE versus
-official FLA was at most 0.00467. These are isolated eager operator numbers;
-the TP4 `FULL_AND_PIECEWISE` model comparison is recorded below after the
-isolated-wheel validation is complete.
+All providers produced finite output for this original synthetic matrix, whose
+log-decay values were limited to approximately -0.01 through -0.03. Across the
+matrix, CK output NRMSE versus official FLA was at most 0.00467. The later
+model failure showed that this input distribution was not sufficient for a
+production-safety decision.
 
-## Qwen3.5-35B TP4 model validation
+## Strong-decay and Qwen3.5-35B TP4 validation
 
-Pending isolated baseline/candidate wheel runs against
-`/model/Qwen3.5-35B-A3B`.
+Direct AITER probes with legal FP32 log-decay inputs found:
+
+| Constant `g` | CK output finite | CK final state finite |
+|---:|:---:|:---:|
+| -1 | yes | yes |
+| -2 | no | no |
+| -5 | no | no |
+| -10 | no | no |
+
+Both `use_exp2=False` and the equivalent base-2 representation with
+`use_exp2=True` fail. The result was reproduced with builds
+`0.1.7+dtk2604.torch2110.2610161749.g722998` and
+`0.1.7+dtk2604.torch2110.2610171925.ga76f3d`.
+
+The isolated TP4 candidate at commit `8f9f4f25` completed target and speculator
+`FULL_AND_PIECEWISE` capture. Its pre-reserved 8192-token workspace also
+eliminated the earlier 71.37 MiB locked-workspace failure: correctness,
+performance, 8192-token, and four-way concurrent requests all returned HTTP
+200. However, model semantics failed. Unrelated prompts repeatedly generated
+`duct Register Register ...`; the baseline produced prompt-dependent output.
+The candidate also had zero initial MTP draft acceptance and substantially
+worse TPOT. The same collapsed output reproduced with `--enforce-eager`, which
+rules out graph capture and workspace sharing as the semantic root cause.
+
+Artifacts are under:
+
+- Baseline: `/data/models/validation/gdn-aiter-ck-prefill/68f20511`
+- Candidate: `/data/models/validation/gdn-aiter-ck-prefill/8f9f4f25`
+
+Consequently, operator speedups are informational only and CK fused prefill is
+not enabled for production model traffic until AITER fixes the non-finite
+strong-decay behavior and the complete TP4 validation passes again.

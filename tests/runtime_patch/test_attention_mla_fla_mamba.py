@@ -168,6 +168,15 @@ def test_ck_gdn_resolver_handles_missing_and_audits_signatures(monkeypatch):
         adapter.resolve_aiter_ck_gdn()
 
 
+def test_ck_gdn_runtime_is_fail_closed_for_strong_decay_nan():
+    adapter = _adapter("_aiter_ck_gdn")
+
+    assert adapter.aiter_ck_runtime_safety_reason() == (
+        "AITER 0.1.7 CK prefill produces non-finite output for legal "
+        "strong-decay inputs"
+    )
+
+
 @pytest.mark.parametrize(("hq", "hv"), ((4, 4), (4, 8), (2, 8)))
 def test_ck_gdn_supported_contract_returns_no_reason(monkeypatch, hq, hv):
     adapter = _adapter("_aiter_ck_gdn")
@@ -344,6 +353,25 @@ def _ck_qwen_module():
     )
 
 
+def test_ck_gdn_complete_prefill_fails_closed_for_runtime_safety(monkeypatch):
+    patch = _adapter("patch_gdn_ck_prefill")
+    module = _ck_qwen_module()
+    logs = []
+    module.logger.warning_once = lambda *args: logs.append(args)
+    ops = SimpleNamespace(
+        prefill=lambda *args, **kwargs: pytest.fail("unsafe CK must not run")
+    )
+    monkeypatch.setattr(patch, "resolve_aiter_ck_gdn", lambda: ops)
+    patch.apply_to_module(module)
+    q, k, v, g, beta, state, cu = _ck_inputs()
+
+    assert module.ChunkGatedDeltaRule().forward_native(
+        q[None], k[None], v[None], g[None], beta[None], state, True,
+        cu_seqlens=cu, use_qk_l2norm_in_kernel=False,
+    ) == ("official", "state")
+    assert any("non-finite output" in args[1] for args in logs)
+
+
 def test_ck_gdn_complete_prefill_routes_supported_call(monkeypatch):
     patch = _adapter("patch_gdn_ck_prefill")
     ck = _adapter("_aiter_ck_gdn")
@@ -356,6 +384,7 @@ def test_ck_gdn_complete_prefill_routes_supported_call(monkeypatch):
         torch.ones(1, 8, 128, 128, dtype=torch.float32),
     ))
     monkeypatch.setattr(patch, "resolve_aiter_ck_gdn", lambda: ops)
+    monkeypatch.setattr(patch, "aiter_ck_runtime_safety_reason", lambda: "")
     monkeypatch.setattr(ck, "requested_backend", lambda stage: "hcu-aiter")
     monkeypatch.setattr(patch, "aiter_ck_workspace", lambda *args: torch.empty(257, dtype=torch.uint8))
     monkeypatch.setattr(torch.cuda, "is_current_stream_capturing", lambda: False)
@@ -379,6 +408,7 @@ def test_ck_gdn_complete_prefill_falls_back_for_ratio_three(monkeypatch):
     module = _ck_qwen_module()
     ops = SimpleNamespace(prefill=lambda *args, **kwargs: pytest.fail("CK must not run"))
     monkeypatch.setattr(patch, "resolve_aiter_ck_gdn", lambda: ops)
+    monkeypatch.setattr(patch, "aiter_ck_runtime_safety_reason", lambda: "")
     monkeypatch.setattr(ck, "requested_backend", lambda stage: "hcu-aiter")
     monkeypatch.setattr(torch.cuda, "is_current_stream_capturing", lambda: False)
     patch.apply_to_module(module)
@@ -400,6 +430,7 @@ def test_ck_gdn_complete_prefill_copies_core_output(monkeypatch):
         or (expected, None)
     )
     monkeypatch.setattr(patch, "resolve_aiter_ck_gdn", lambda: ops)
+    monkeypatch.setattr(patch, "aiter_ck_runtime_safety_reason", lambda: "")
     monkeypatch.setattr(ck, "requested_backend", lambda stage: "hcu-aiter")
     monkeypatch.setattr(patch, "aiter_ck_workspace", lambda *args: torch.empty(1, dtype=torch.uint8))
     monkeypatch.setattr(torch.cuda, "is_current_stream_capturing", lambda: False)
@@ -423,6 +454,7 @@ def test_ck_gdn_complete_prefill_varlen_graph_falls_back(monkeypatch):
     module = _ck_qwen_module()
     ops = SimpleNamespace(prefill=lambda *args, **kwargs: pytest.fail("CK must not run"))
     monkeypatch.setattr(patch, "resolve_aiter_ck_gdn", lambda: ops)
+    monkeypatch.setattr(patch, "aiter_ck_runtime_safety_reason", lambda: "")
     monkeypatch.setattr(ck, "requested_backend", lambda stage: "hcu-aiter")
     monkeypatch.setattr(torch.cuda, "is_current_stream_capturing", lambda: True)
     patch.apply_to_module(module)
@@ -444,6 +476,7 @@ def test_ck_gdn_complete_prefill_propagates_provider_failure(monkeypatch):
         raise RuntimeError("native CK launch failed")
 
     monkeypatch.setattr(patch, "resolve_aiter_ck_gdn", lambda: SimpleNamespace(prefill=failed))
+    monkeypatch.setattr(patch, "aiter_ck_runtime_safety_reason", lambda: "")
     monkeypatch.setattr(ck, "requested_backend", lambda stage: "hcu-aiter")
     monkeypatch.setattr(patch, "aiter_ck_workspace", lambda *args: torch.empty(1, dtype=torch.uint8))
     monkeypatch.setattr(torch.cuda, "is_current_stream_capturing", lambda: False)

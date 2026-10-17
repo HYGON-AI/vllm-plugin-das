@@ -32,6 +32,9 @@ def methods():
 
     reset_workspace_manager()
     init_workspace_manager(torch.device("cuda"))
+    # These are explicit native characterization tests. Production routing is
+    # fail-closed until AITER fixes its legal strong-decay NaN behavior.
+    patch_gdn_ck_prefill.aiter_ck_runtime_safety_reason = lambda: ""
     patch_gdn_ck_prefill.apply_to_module(qwen)
     wrapped = qwen.ChunkGatedDeltaRule.forward_native
     original = qwen.ChunkGatedDeltaRule._vllm_hcu_original_forward_native
