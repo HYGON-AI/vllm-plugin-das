@@ -1552,6 +1552,18 @@ def test_deepep_auto_rejects_eplb_before_model_loading() -> None:
         patch_vllm_config.validate_and_update_hcu_config(config)
 
 
+def test_deepep_auto_accepts_static_eplb_without_rearrangement() -> None:
+    config = _validation_config(
+        HcuFeatureConfig(deepep_auto=True, expert_map_path="/tmp/map.json")
+    )
+    config.parallel_config.all2all_backend = "deepep_low_latency"
+    config.parallel_config.enable_eplb = True
+    config.parallel_config.data_parallel_size = 8
+    config.parallel_config.enable_expert_parallel = True
+
+    patch_vllm_config.validate_and_update_hcu_config(config)
+
+
 @pytest.mark.parametrize(
     ("data_parallel_size", "enable_expert_parallel", "message"),
     [
