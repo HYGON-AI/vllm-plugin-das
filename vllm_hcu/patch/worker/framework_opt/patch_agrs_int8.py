@@ -23,18 +23,29 @@ TARGETS = (
 )
 _MARKER = "_vllm_hcu_agrs_int8_dispatch_applied"
 _WRAPPER = "_vllm_hcu_agrs_int8_dispatch_wrapper"
+_RUNTIME_ENABLED = False
+
+
+def configure(enabled: bool) -> None:
+    """Latch the effective worker policy resolved before model construction."""
+
+    if not isinstance(enabled, bool):
+        raise TypeError("INT8 AllGatherv worker policy must be bool")
+    global _RUNTIME_ENABLED
+    _RUNTIME_ENABLED = enabled
 
 
 def _enabled() -> bool:
-    from vllm.config import get_current_vllm_config_or_none
+    return _RUNTIME_ENABLED
 
-    from vllm_hcu.patch.config import get_hcu_config
-    from vllm_hcu.platforms import envs as henvs
 
-    config = get_current_vllm_config_or_none()
-    if config is not None:
-        return get_hcu_config(config).dp_int8_allgather
-    return henvs.dp_int8_allgather_enabled()
+def _supports_transport_quantization(hidden_states: torch.Tensor) -> bool:
+    import torch
+
+    # Quantized MoE prepare paths already attach their activation scale through
+    # extra_tensors. Re-quantizing those codes would corrupt that contract and
+    # cannot reduce their one-byte communication payload.
+    return hidden_states.dtype is torch.bfloat16
 
 
 def _quantize_hidden_states(
@@ -149,7 +160,7 @@ def apply_to_module(module: ModuleType) -> bool:
         is_sequence_parallel=False,
         extra_tensors=None,
     ):
-        if not _enabled():
+        if not _enabled() or not _supports_transport_quantization(hidden_states):
             return original_router(
                 self,
                 hidden_states,
@@ -177,7 +188,7 @@ def apply_to_module(module: ModuleType) -> bool:
         is_sequence_parallel=False,
         extra_tensors=None,
     ):
-        if not _enabled():
+        if not _enabled() or not _supports_transport_quantization(hidden_states):
             return original_dispatch(
                 self,
                 hidden_states,
@@ -211,4 +222,11 @@ def apply(module: ModuleType | None = None) -> bool:
     return apply_to_module(load_exact_module(TARGET_MODULE, module))
 
 
-__all__ = ["PATCH_ID", "TARGET_MODULE", "TARGETS", "apply", "apply_to_module"]
+__all__ = [
+    "PATCH_ID",
+    "TARGET_MODULE",
+    "TARGETS",
+    "apply",
+    "apply_to_module",
+    "configure",
+]

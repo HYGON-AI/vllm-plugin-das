@@ -836,6 +836,13 @@ def apply_worker_patches(vllm_config: object | None = None) -> None:
         config = get_hcu_config(vllm_config)
         if HcuFeatureConfig.from_mapping(config.to_dict()) != config:
             raise RuntimeError("HCU feature sidecar failed its worker round-trip check")
+        # The current-vLLM-config context is transient and arbitrary HCU
+        # environment variables are filtered from spawned workers. Latch the
+        # already master-gated serialized policy before any model/communicator
+        # import can install the dispatch wrapper.
+        from .framework_opt import patch_agrs_int8
+
+        patch_agrs_int8.configure(config.dp_int8_allgather)
         if vllm_config is not None:
             if isinstance(vllm_config, dict):
                 parallel_config = vllm_config.get("parallel_config")
