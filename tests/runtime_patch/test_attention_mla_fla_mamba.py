@@ -65,6 +65,40 @@ def test_fla_selector_master_off_ignores_materialized_true_attribute(
     assert backend.requested_backend(stage) == "hcu-boltops"
 
 
+def test_fla_selector_logs_provider_specific_unavailable_reason(monkeypatch):
+    backend = _adapter("_gdn_backend")
+    warnings = []
+    fake_logger = SimpleNamespace(
+        warning_once=lambda message, *args: warnings.append(message % args),
+        info_once=lambda *args: None,
+    )
+    monkeypatch.setattr(backend, "logger", fake_logger)
+    monkeypatch.setattr(backend, "requested_backend", lambda stage: "hcu-aiter")
+
+    select = backend.make_provider_selector(
+        "prefill",
+        "recompute_w_u_fwd",
+        {"hcu-boltops": lambda: lambda: None},
+        unavailable_reasons={
+            "hcu-aiter": (
+                "it has no standalone vLLM-compatible entry point; "
+                "its recompute kernel is internal to ck_gdn_prefill"
+            )
+        },
+    )
+
+    provider, kernel = select()
+
+    assert provider == "hcu-boltops"
+    assert kernel is not None
+    assert warnings == [
+        "GDN prefill recompute_w_u_fwd: hcu-aiter cannot be used "
+        "(requested hcu-aiter) because it has no standalone vLLM-compatible "
+        "entry point; its recompute kernel is internal to ck_gdn_prefill; "
+        "falling back."
+    ]
+
+
 def _import_hcu_sparse_indexer_without_custom_op_registration(
     monkeypatch, request
 ):
