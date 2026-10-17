@@ -83,6 +83,7 @@ if TYPE_CHECKING:
     VLLM_HCU_PLE_CPU_OFFLOAD: bool = False
     VLLM_HCU_PLE_PREFETCH_STREAM: bool = False
     VLLM_HCU_QWEN4_EXP_HC_SP: bool = True
+    VLLM_HCU_DP_INT8_ALLGATHER: bool = False
     VLLM_HCU_MHC_FUSED_RMSNORM: bool = True
     VLLM_HCU_GLM5NEXT_KDA_STRIDED_INPUTS: bool = True
 
@@ -138,6 +139,16 @@ def qwen4_exp_hc_sp_enabled() -> bool:
 
     return optional_custom_op_enabled(
         _environment_flag(os.environ.get("VLLM_HCU_QWEN4_EXP_HC_SP", "True"))
+    )
+
+
+def dp_int8_allgather_enabled() -> bool:
+    """Resolve INT8 MoE AllGatherv transport under the custom-op master."""
+
+    return optional_custom_op_enabled(
+        _environment_flag(
+            os.environ.get("VLLM_HCU_DP_INT8_ALLGATHER", "False")
+        )
     )
 
 
@@ -625,6 +636,11 @@ hcu_vllm_environment_variables: dict[str, Callable[[], Any]] = {
     # not enable FP8 prefetch.
     "VLLM_HCU_PLE_PREFETCH_STREAM":
         ple_prefetch_enabled,
+
+    # Quantize naive DP/EP MoE hidden-state dispatch to INT8 before
+    # AllGatherv. ReduceScatterv remains in the model activation dtype.
+    "VLLM_HCU_DP_INT8_ALLGATHER":
+        dp_int8_allgather_enabled,
 
     # Run Qwen4Exp hyper-connection layers sequence-parallel (attention
     # all-gather/reduce-scatter instead of all-reduce) when sequence-parallel

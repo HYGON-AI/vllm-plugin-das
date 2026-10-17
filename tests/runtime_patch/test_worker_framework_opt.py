@@ -128,6 +128,24 @@ def test_agrs_int8_dispatch_is_opt_in(monkeypatch: pytest.MonkeyPatch) -> None:
     assert result == (hidden, router)
 
 
+def test_agrs_int8_enablement_uses_serialized_worker_config(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    import vllm.config
+
+    monkeypatch.delenv("VLLM_HCU_DP_INT8_ALLGATHER", raising=False)
+    config = SimpleNamespace(
+        additional_config={"hcu": {"dp_int8_allgather": True}}
+    )
+    monkeypatch.setattr(
+        vllm.config,
+        "get_current_vllm_config_or_none",
+        lambda: config,
+    )
+
+    assert patch_agrs_int8._enabled() is True
+
+
 def test_gloo_eplb_communicator_preserves_profile_buffer_reservation() -> None:
     class EplbCommunicator:
         @property

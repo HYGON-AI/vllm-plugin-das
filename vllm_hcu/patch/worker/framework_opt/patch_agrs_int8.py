@@ -5,7 +5,6 @@
 from __future__ import annotations
 
 import functools
-import os
 from types import ModuleType
 
 from ._common import (
@@ -24,19 +23,16 @@ TARGETS = (
 )
 _MARKER = "_vllm_hcu_agrs_int8_dispatch_applied"
 _WRAPPER = "_vllm_hcu_agrs_int8_dispatch_wrapper"
-_ENV = "VLLM_HCU_DP_INT8_ALLGATHER"
-
-
 def _enabled() -> bool:
+    from vllm.config import get_current_vllm_config_or_none
+
+    from vllm_hcu.patch.config import get_hcu_config
     from vllm_hcu.platforms import envs as henvs
 
-    requested = os.environ.get(_ENV, "0").strip().lower() in (
-        "1",
-        "true",
-        "yes",
-        "on",
-    )
-    return henvs.optional_custom_op_enabled(requested)
+    config = get_current_vllm_config_or_none()
+    if config is not None:
+        return get_hcu_config(config).dp_int8_allgather
+    return henvs.dp_int8_allgather_enabled()
 
 
 def _quantize_hidden_states(
