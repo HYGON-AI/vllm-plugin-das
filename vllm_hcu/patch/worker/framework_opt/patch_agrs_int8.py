@@ -82,6 +82,11 @@ def _gather_quantized(
     is_sequence_parallel: bool,
     extra_tensors: list[torch.Tensor] | None,
 ) -> list[torch.Tensor]:
+    from vllm.logger import init_logger
+
+    init_logger(__name__).info_once(
+        "Using INT8 hidden-state AllGatherv for naive DP/EP MoE dispatch"
+    )
     group = manager._get_comm_group(is_sequence_parallel)
     sizes = manager._get_sizes(hidden_states.shape[0], group)
     assert sizes[group.rank_in_group] == hidden_states.shape[0]
