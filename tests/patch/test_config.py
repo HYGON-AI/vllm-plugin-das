@@ -57,6 +57,7 @@ def test_dict_vllm_config_uses_canonical_storage_path() -> None:
                 "fused_qwen3_rms_rope": True,
                 "qwen4_exp_hc_sp": True,
                 "dp_int8_allgather": False,
+                "qsa_dense_prefill": False,
                 "moe_backend": "auto",
                 "hcu_flash_attn_mode": None,
                 "hcu_gdn_prefill_backend": None,

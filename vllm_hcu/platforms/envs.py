@@ -362,10 +362,12 @@ hcu_vllm_environment_variables: dict[str, Callable[[], Any]] = {
     # cache dtype and uses its dedicated reader/writer independently.
     "VLLM_HCU_QSA_BACKEND":
     lambda: os.environ.get("VLLM_HCU_QSA_BACKEND", "cutlass").strip().lower(),
-    # Run context-free Qwen4Exp prefill batches through dense varlen
-    # FlashAttention while preserving QSA for prefix/chunked prefill,
-    # decode/spec-decode, and mixed batches. This is opt-in and additionally
-    # gated by VLLM_HCU_USE_CUSTOM_OPS.
+    # Run Qwen4Exp prefill-only batches through dense varlen FlashAttention.
+    # Context-free prefill consumes current BF16 K/V directly; prefix/chunked
+    # prefill gathers the paged cache when the bounded workspace is safe and
+    # otherwise falls back to QSA. Decode/spec-decode and mixed batches
+    # preserve QSA. This is opt-in and additionally gated by
+    # VLLM_HCU_USE_CUSTOM_OPS.
     "VLLM_HCU_QSA_DENSE_PREFILL":
     qsa_dense_prefill_enabled,
     # If set, control hcu custom silu and mul op

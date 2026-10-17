@@ -843,9 +843,11 @@ def apply_worker_patches(vllm_config: object | None = None) -> None:
         # environment variables are filtered from spawned workers. Latch the
         # already master-gated serialized policy before any model/communicator
         # import can install the dispatch wrapper.
+        from .core_fix import patch_qwen4_exp_qsa_dense_prefill
         from .framework_opt import patch_agrs_int8
 
         patch_agrs_int8.configure(config.dp_int8_allgather)
+        patch_qwen4_exp_qsa_dense_prefill.configure(config.qsa_dense_prefill)
         if vllm_config is not None:
             if isinstance(vllm_config, dict):
                 parallel_config = vllm_config.get("parallel_config")

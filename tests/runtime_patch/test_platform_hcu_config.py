@@ -1913,12 +1913,51 @@ def test_dp_int8_allgather_policy_is_serialized_for_workers(
     assert get_hcu_config(config) == feature_config
 
 
+@pytest.mark.parametrize(
+    ("master", "feature", "expected"),
+    [
+        ("0", "0", False),
+        ("0", "1", False),
+        ("1", "0", False),
+        ("1", "1", True),
+    ],
+)
+def test_qsa_dense_prefill_policy_is_serialized_for_workers(
+    monkeypatch: pytest.MonkeyPatch,
+    master: str,
+    feature: str,
+    expected: bool,
+) -> None:
+    monkeypatch.setenv("VLLM_HCU_USE_CUSTOM_OPS", master)
+    monkeypatch.setenv("VLLM_HCU_QSA_DENSE_PREFILL", feature)
+
+    config = _validation_config(HcuFeatureConfig())
+    feature_config = patch_vllm_config.validate_and_update_hcu_config(config)
+
+    assert getattr(feature_config, "qsa_dense_prefill", None) is expected
+    assert get_hcu_config(config) == feature_config
+
+
 def test_dp_int8_allgather_effective_policy_partitions_persistent_cache(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     def cache_key(master: str, feature: str) -> str:
         monkeypatch.setenv("VLLM_HCU_USE_CUSTOM_OPS", master)
         monkeypatch.setenv("VLLM_HCU_DP_INT8_ALLGATHER", feature)
+        config = _validation_config(HcuFeatureConfig())
+        patch_vllm_config.validate_and_update_hcu_config(config)
+        return _vllm_hash(config.additional_config)
+
+    assert cache_key("0", "0") == cache_key("0", "1")
+    assert cache_key("1", "0") != cache_key("1", "1")
+
+
+def test_qsa_dense_prefill_effective_policy_partitions_persistent_cache(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    def cache_key(master: str, feature: str) -> str:
+        monkeypatch.setenv("VLLM_HCU_USE_CUSTOM_OPS", master)
+        monkeypatch.setenv("VLLM_HCU_QSA_DENSE_PREFILL", feature)
         config = _validation_config(HcuFeatureConfig())
         patch_vllm_config.validate_and_update_hcu_config(config)
         return _vllm_hash(config.additional_config)
