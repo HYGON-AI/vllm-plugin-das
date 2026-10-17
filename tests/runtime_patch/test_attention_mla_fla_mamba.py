@@ -207,8 +207,18 @@ def test_ck_gdn_normalizes_only_fixed_single_sequence_metadata():
     adapter = _adapter("_aiter_ck_gdn")
     q, *_, cu = _ck_inputs()
     assert adapter.aiter_ck_cu_seqlens(q, cu) is None
+    fixed_i32 = cu.to(torch.int32)
+    supported = (*_ck_inputs()[:-1], fixed_i32)
+    assert adapter.aiter_ck_unsupported(
+        *supported, capturing=True
+    ) is None
+    assert adapter.aiter_ck_cu_seqlens(q, fixed_i32) is None
     varlen = torch.tensor([0, 17, 65], dtype=torch.int64)
     assert adapter.aiter_ck_cu_seqlens(q, varlen) is varlen
+    packed_i32 = (*_ck_inputs(sequences=2)[:-1], varlen.to(torch.int32))
+    assert adapter.aiter_ck_unsupported(
+        *packed_i32, capturing=False
+    ) == "cu_seqlens must be contiguous int64"
 
 
 def test_ck_gdn_workspace_uses_workspace_manager(monkeypatch):
@@ -280,6 +290,8 @@ def test_ck_gdn_complete_prefill_routes_supported_call(monkeypatch):
     patch = _adapter("patch_gdn_ck_prefill")
     ck = _adapter("_aiter_ck_gdn")
     module = _ck_qwen_module()
+    logs = []
+    module.logger.info_once = lambda *args: logs.append(args)
     calls = []
     ops = SimpleNamespace(prefill=lambda *args, **kwargs: calls.append((args, kwargs)) or (
         torch.ones(65, 8, 128, dtype=torch.bfloat16),
@@ -300,6 +312,7 @@ def test_ck_gdn_complete_prefill_routes_supported_call(monkeypatch):
     assert calls[0][1]["cu_seqlens"] is None
     assert calls[0][1]["use_exp2"] is False
     assert calls[0][1]["transpose_state"] is True
+    assert any("fused CK prefill" in args[0] for args in logs)
 
 
 def test_ck_gdn_complete_prefill_falls_back_for_ratio_three(monkeypatch):

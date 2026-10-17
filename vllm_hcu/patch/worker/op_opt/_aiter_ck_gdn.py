@@ -124,9 +124,14 @@ def aiter_ck_unsupported(
         if not initial_state.is_contiguous():
             return "initial state must be contiguous fp32 [sequences, hv, 128, 128]"
     if cu_seqlens is not None:
-        if cu_seqlens.ndim != 1 or cu_seqlens.dtype != torch.int64:
+        if cu_seqlens.ndim != 1:
             return "cu_seqlens must be contiguous int64"
-        if not cu_seqlens.is_contiguous():
+        # A framework-owned fixed [2] tensor is omitted from the CK call, so
+        # its integer width and layout are irrelevant. Packed metadata is
+        # passed through and must satisfy AITER's public contract.
+        if cu_seqlens.numel() > 2 and (
+            cu_seqlens.dtype != torch.int64 or not cu_seqlens.is_contiguous()
+        ):
             return "cu_seqlens must be contiguous int64"
         if capturing and cu_seqlens.numel() > 2:
             return "packed variable-length metadata is not graph-safe"

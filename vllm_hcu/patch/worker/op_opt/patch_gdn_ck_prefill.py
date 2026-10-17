@@ -107,6 +107,10 @@ def apply_to_module(module: ModuleType) -> bool:
             cu_seqlens=ck_cu, scale=packed[1].shape[-1] ** -0.5,
             **flags, cp_rank=1,
         )
+        if not capturing:
+            qwen.logger.info_once(
+                "GDN fused CK prefill is active for supported inputs."
+            )
         output = output.unsqueeze(0)
         if core_attn_out is not None:
             _store_core_output(output, core_attn_out)

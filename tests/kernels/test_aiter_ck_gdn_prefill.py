@@ -112,6 +112,13 @@ def test_ck_prefill_ratio_three_uses_original(methods):
     _assert_close(_run(wrapped, data), _run(original, data))
 
 
+def test_ck_prefill_fixed_int32_metadata_matches_model_contract(methods):
+    wrapped, original = methods
+    data = _inputs([65])
+    data = (*data[:-1], data[-1].to(torch.int32))
+    _assert_close(_run(wrapped, data), _run(original, data))
+
+
 @pytest.mark.parametrize("nonzero_state", [False, True])
 @pytest.mark.parametrize("output_final_state", [False, True])
 def test_ck_prefill_state_and_final_state_semantics(
