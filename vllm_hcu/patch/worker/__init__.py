@@ -227,6 +227,9 @@ _CORE_CALLBACKS: tuple[_CallbackSpec, ...] = (
     _CallbackSpec(_adapter("core_fix", "patch_qwen4_exp_fused_ple")),
     _CallbackSpec(_adapter("core_fix", "patch_qwen4_exp_sp")),
     _CallbackSpec(_adapter("core_fix", "patch_qwen4_exp_qsa_fp8")),
+    _CallbackSpec(
+        _adapter("core_fix", "patch_qwen4_exp_qsa_dense_prefill")
+    ),
     _CallbackSpec(_adapter("core_fix", "patch_qwen4_exp_model_state")),
     _CallbackSpec(_adapter("core_fix", "patch_qwen4_exp_mtp_pp")),
     _CallbackSpec(_adapter("core_fix", "patch_qwen4_exp_sp_mtp")),

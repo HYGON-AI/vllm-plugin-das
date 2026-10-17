@@ -118,6 +118,38 @@ def test_optional_custom_op_policy_reads_master_without_materialized_leak(
 
 
 @pytest.mark.parametrize(
+    ("master", "feature", "expected"),
+    [
+        ("0", "0", False),
+        ("0", "1", False),
+        ("1", "0", False),
+        ("1", "1", True),
+    ],
+)
+def test_qsa_dense_prefill_is_opt_in_under_custom_ops_master(
+    monkeypatch: pytest.MonkeyPatch,
+    master: str,
+    feature: str,
+    expected: bool,
+) -> None:
+    monkeypatch.setenv("VLLM_HCU_USE_CUSTOM_OPS", master)
+    monkeypatch.setenv("VLLM_HCU_QSA_DENSE_PREFILL", feature)
+
+    assert hcu_envs.qsa_dense_prefill_enabled() is expected
+    assert hcu_envs.VLLM_HCU_QSA_DENSE_PREFILL is expected
+
+
+def test_qsa_dense_prefill_defaults_off(monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.delenv("VLLM_HCU_QSA_DENSE_PREFILL", raising=False)
+    monkeypatch.setenv("VLLM_HCU_USE_CUSTOM_OPS", "1")
+
+    assert hcu_envs.qsa_dense_prefill_enabled() is False
+    assert "VLLM_HCU_QSA_DENSE_PREFILL" in (
+        hcu_envs.hcu_vllm_environment_variables
+    )
+
+
+@pytest.mark.parametrize(
     ("value", "expected"),
     ((None, True), ("1", True), ("true", True), ("0", False), ("false", False)),
 )

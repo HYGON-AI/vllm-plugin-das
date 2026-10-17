@@ -22,6 +22,7 @@ if TYPE_CHECKING:
     VLLM_HCU_USE_CUSTOM_OPS : bool = False
     VLLM_HCU_GLM53_ROUTER_GEMV: bool = True
     VLLM_HCU_QSA_BACKEND: str = "cutlass"
+    VLLM_HCU_QSA_DENSE_PREFILL: bool = False
     VLLM_HCU_USE_CUSTOM_SILU_AND_MUL : bool = False
     VLLM_HCU_USE_CUSTOM_GEMMA_RMS_NORM : bool = False
     VLLM_HCU_USE_SKIP_WEIGHT_DEBUG : bool = False
@@ -148,6 +149,16 @@ def dp_int8_allgather_enabled() -> bool:
     return optional_custom_op_enabled(
         _environment_flag(
             os.environ.get("VLLM_HCU_DP_INT8_ALLGATHER", "False")
+        )
+    )
+
+
+def qsa_dense_prefill_enabled() -> bool:
+    """Resolve dense Qwen4Exp prefill under the custom-op master switch."""
+
+    return optional_custom_op_enabled(
+        _environment_flag(
+            os.environ.get("VLLM_HCU_QSA_DENSE_PREFILL", "False")
         )
     )
 
@@ -351,6 +362,12 @@ hcu_vllm_environment_variables: dict[str, Callable[[], Any]] = {
     # cache dtype and uses its dedicated reader/writer independently.
     "VLLM_HCU_QSA_BACKEND":
     lambda: os.environ.get("VLLM_HCU_QSA_BACKEND", "cutlass").strip().lower(),
+    # Run context-free Qwen4Exp prefill batches through dense varlen
+    # FlashAttention while preserving QSA for prefix/chunked prefill,
+    # decode/spec-decode, and mixed batches. This is opt-in and additionally
+    # gated by VLLM_HCU_USE_CUSTOM_OPS.
+    "VLLM_HCU_QSA_DENSE_PREFILL":
+    qsa_dense_prefill_enabled,
     # If set, control hcu custom silu and mul op
     "VLLM_HCU_USE_CUSTOM_SILU_AND_MUL":
     lambda: (os.environ.get("VLLM_HCU_USE_CUSTOM_SILU_AND_MUL", "True").lower() in
