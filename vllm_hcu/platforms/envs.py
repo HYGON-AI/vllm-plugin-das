@@ -22,6 +22,7 @@ if TYPE_CHECKING:
     VLLM_HCU_USE_CUSTOM_OPS : bool = False
     VLLM_HCU_GLM53_ROUTER_GEMV: bool = True
     VLLM_HCU_QSA_BACKEND: str = "cutlass"
+    VLLM_HCU_QSA_DENSE_PREFILL: bool = False
     VLLM_HCU_USE_CUSTOM_SILU_AND_MUL : bool = False
     VLLM_HCU_USE_CUSTOM_GEMMA_RMS_NORM : bool = False
     VLLM_HCU_USE_SKIP_WEIGHT_DEBUG : bool = False
@@ -83,6 +84,7 @@ if TYPE_CHECKING:
     VLLM_HCU_PLE_CPU_OFFLOAD: bool = False
     VLLM_HCU_PLE_PREFETCH_STREAM: bool = False
     VLLM_HCU_QWEN4_EXP_HC_SP: bool = True
+    VLLM_HCU_DP_INT8_ALLGATHER: bool = False
     VLLM_HCU_MHC_FUSED_RMSNORM: bool = True
     VLLM_HCU_GLM5NEXT_KDA_STRIDED_INPUTS: bool = True
 
@@ -138,6 +140,26 @@ def qwen4_exp_hc_sp_enabled() -> bool:
 
     return optional_custom_op_enabled(
         _environment_flag(os.environ.get("VLLM_HCU_QWEN4_EXP_HC_SP", "True"))
+    )
+
+
+def dp_int8_allgather_enabled() -> bool:
+    """Resolve INT8 MoE AllGatherv transport under the custom-op master."""
+
+    return optional_custom_op_enabled(
+        _environment_flag(
+            os.environ.get("VLLM_HCU_DP_INT8_ALLGATHER", "False")
+        )
+    )
+
+
+def qsa_dense_prefill_enabled() -> bool:
+    """Resolve dense Qwen4Exp prefill under the custom-op master switch."""
+
+    return optional_custom_op_enabled(
+        _environment_flag(
+            os.environ.get("VLLM_HCU_QSA_DENSE_PREFILL", "False")
+        )
     )
 
 
@@ -340,6 +362,14 @@ hcu_vllm_environment_variables: dict[str, Callable[[], Any]] = {
     # cache dtype and uses its dedicated reader/writer independently.
     "VLLM_HCU_QSA_BACKEND":
     lambda: os.environ.get("VLLM_HCU_QSA_BACKEND", "cutlass").strip().lower(),
+    # Run Qwen4Exp prefill-only batches through dense varlen FlashAttention.
+    # Context-free prefill consumes current BF16 K/V directly; prefix/chunked
+    # prefill gathers the paged cache when the bounded workspace is safe and
+    # otherwise falls back to QSA. Decode/spec-decode and mixed batches
+    # preserve QSA. This is opt-in and additionally gated by
+    # VLLM_HCU_USE_CUSTOM_OPS.
+    "VLLM_HCU_QSA_DENSE_PREFILL":
+    qsa_dense_prefill_enabled,
     # If set, control hcu custom silu and mul op
     "VLLM_HCU_USE_CUSTOM_SILU_AND_MUL":
     lambda: (os.environ.get("VLLM_HCU_USE_CUSTOM_SILU_AND_MUL", "True").lower() in
@@ -625,6 +655,11 @@ hcu_vllm_environment_variables: dict[str, Callable[[], Any]] = {
     # not enable FP8 prefetch.
     "VLLM_HCU_PLE_PREFETCH_STREAM":
         ple_prefetch_enabled,
+
+    # Quantize naive DP/EP MoE hidden-state dispatch to INT8 before
+    # AllGatherv. ReduceScatterv remains in the model activation dtype.
+    "VLLM_HCU_DP_INT8_ALLGATHER":
+        dp_int8_allgather_enabled,
 
     # Run Qwen4Exp hyper-connection layers sequence-parallel (attention
     # all-gather/reduce-scatter instead of all-reduce) when sequence-parallel

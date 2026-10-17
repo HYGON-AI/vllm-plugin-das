@@ -227,6 +227,9 @@ _CORE_CALLBACKS: tuple[_CallbackSpec, ...] = (
     _CallbackSpec(_adapter("core_fix", "patch_qwen4_exp_fused_ple")),
     _CallbackSpec(_adapter("core_fix", "patch_qwen4_exp_sp")),
     _CallbackSpec(_adapter("core_fix", "patch_qwen4_exp_qsa_fp8")),
+    _CallbackSpec(
+        _adapter("core_fix", "patch_qwen4_exp_qsa_dense_prefill")
+    ),
     _CallbackSpec(_adapter("core_fix", "patch_qwen4_exp_model_state")),
     _CallbackSpec(_adapter("core_fix", "patch_qwen4_exp_mtp_pp")),
     _CallbackSpec(_adapter("core_fix", "patch_qwen4_exp_sp_mtp")),
@@ -335,6 +338,7 @@ _CUDA_VALIDATION_ID = (
 # proposer/eagle/ubatch -> DeepEP all2all.  The PyNccl pair is optional unless
 # an explicit ``all2all_backend='pynccl'`` config requests it.
 _FRAMEWORK_CALLBACKS: tuple[_CallbackSpec, ...] = (
+    _CallbackSpec(_adapter("framework_opt", "patch_agrs_int8")),
     _CallbackSpec(
         _adapter("framework_opt", "patch_model_loader_static_eplb"),
         feature="offline_eplb",
@@ -835,6 +839,15 @@ def apply_worker_patches(vllm_config: object | None = None) -> None:
         config = get_hcu_config(vllm_config)
         if HcuFeatureConfig.from_mapping(config.to_dict()) != config:
             raise RuntimeError("HCU feature sidecar failed its worker round-trip check")
+        # The current-vLLM-config context is transient and arbitrary HCU
+        # environment variables are filtered from spawned workers. Latch the
+        # already master-gated serialized policy before any model/communicator
+        # import can install the dispatch wrapper.
+        from .core_fix import patch_qwen4_exp_qsa_dense_prefill
+        from .framework_opt import patch_agrs_int8
+
+        patch_agrs_int8.configure(config.dp_int8_allgather)
+        patch_qwen4_exp_qsa_dense_prefill.configure(config.qsa_dense_prefill)
         if vllm_config is not None:
             if isinstance(vllm_config, dict):
                 parallel_config = vllm_config.get("parallel_config")

@@ -555,6 +555,8 @@ def validate_and_update_hcu_config(vllm_config: object) -> HcuFeatureConfig:
         "qwen4_exp_hc_sp": _resolve_qwen4_exp_hc_sp(
             vllm_config, hcu_envs.qwen4_exp_hc_sp_enabled()
         ),
+        "dp_int8_allgather": hcu_envs.dp_int8_allgather_enabled(),
+        "qsa_dense_prefill": hcu_envs.qsa_dense_prefill_enabled(),
     }
     if feature_config.hcu_flash_attn_mode is None:
         # Persist the resolved sub-mode before vLLM computes compilation cache
