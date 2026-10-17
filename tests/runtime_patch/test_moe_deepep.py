@@ -5905,6 +5905,193 @@ def test_moe_runner_and_shared_experts_cold_replacement_contract():
         else:
             raise AssertionError("unsupported prequantized input did not fail")
 
+        direct_calls = {}
+        direct_hidden = torch.tensor([[1.0, -2.0]], dtype=torch.bfloat16)
+        direct_logits = torch.tensor([[0.25, 0.75]], dtype=torch.bfloat16)
+        direct_quanted = torch.tensor([[10, -20]], dtype=torch.int8)
+        direct_scale = torch.tensor([[0.1]], dtype=torch.float32)
+        direct_weights = torch.tensor([[0.75]], dtype=torch.float32)
+        direct_ids = torch.tensor([[1]], dtype=torch.int32)
+
+        class DirectQuantMethod:
+            supports_internal_mk = False
+            supports_int8_allgatherv_input = True
+            is_monolithic = False
+            topk_indices_dtype = torch.int32
+
+            def apply(
+                self,
+                layer,
+                x,
+                topk_weights,
+                topk_ids,
+                shared_experts,
+                shared_experts_input,
+                i_q=None,
+                i_s=None,
+                output_dtype=None,
+            ):
+                del layer, shared_experts, shared_experts_input
+                direct_calls["expert"] = (
+                    x, topk_weights, topk_ids, i_q, i_s, output_dtype
+                )
+                return torch.zeros_like(x, dtype=output_dtype)
+
+        class WrappedDirectQuantMethod:
+            supports_internal_mk = False
+            is_monolithic = False
+            topk_indices_dtype = torch.int32
+
+            def __init__(self):
+                self.old_quant_method = DirectQuantMethod()
+
+            def apply(
+                self,
+                layer,
+                x,
+                topk_weights,
+                topk_ids,
+                shared_experts,
+                shared_experts_input,
+                i_q=None,
+                i_s=None,
+            ):
+                return self.old_quant_method.apply(
+                    layer,
+                    x,
+                    topk_weights,
+                    topk_ids,
+                    shared_experts,
+                    shared_experts_input,
+                    i_q=i_q,
+                    i_s=i_s,
+                    output_dtype=x.dtype,
+                )
+
+        class DirectRouter:
+            def select_experts(self, **kwargs):
+                direct_calls["router_hidden"] = kwargs["hidden_states"]
+                direct_calls["router_logits"] = kwargs["router_logits"]
+                return direct_weights, direct_ids
+
+        class DirectGroup:
+            def dispatch_router_logits(self, *_args, **_kwargs):
+                raise AssertionError(
+                    "direct INT8 path must select top-k before AllGatherv"
+                )
+
+            def dispatch(
+                self,
+                dispatched_hidden,
+                dispatched_weights,
+                dispatched_ids,
+                is_sequence_parallel=False,
+            ):
+                assert dispatched_hidden is direct_hidden
+                assert dispatched_weights is direct_weights
+                assert dispatched_ids is direct_ids
+                assert is_sequence_parallel is False
+                return direct_quanted, direct_weights, direct_ids, direct_scale
+
+            def combine(self, output, is_sequence_parallel=False):
+                assert is_sequence_parallel is False
+                return output
+
+        class DirectSharedExperts:
+            def __init__(self):
+                self.output = direct_hidden
+
+            def __call__(
+                self,
+                shared_input,
+                order,
+                x_and_scale_quanted=None,
+            ):
+                del order
+                assert shared_input is direct_hidden
+                direct_calls.setdefault("shared_quanted_inputs", []).append(
+                    x_and_scale_quanted
+                )
+
+            def maybe_sync_shared_experts_stream(
+                self,
+                shared_input,
+                x_and_scale_quanted=None,
+            ):
+                assert shared_input is direct_hidden
+                assert x_and_scale_quanted is None
+
+        direct_runner = object.__new__(runner_module.MoERunner)
+        direct_runner._ep_fused_combine = False
+        direct_runner.moe_config = SimpleNamespace(
+            pcp_size=1,
+            dp_size=4,
+            tp_size=1,
+            is_sequence_parallel=False,
+            moe_parallel_config=SimpleNamespace(use_all2all_kernels=False),
+        )
+        direct_runner.routed_experts = SimpleNamespace(
+            quant_method=WrappedDirectQuantMethod(),
+            _ensure_moe_quant_config_init=lambda: None,
+        )
+        direct_runner._shared_experts = DirectSharedExperts()
+        direct_runner.router = DirectRouter()
+        direct_runner.gate = None
+        direct_runner._sequence_parallel_context = lambda: runner_module.nullcontext()
+        runner_module._int8_allgatherv_enabled = lambda: True
+        runner_module.get_ep_group = lambda: DirectGroup()
+        assert direct_runner._use_int8_allgatherv_dispatch(direct_hidden)
+        assert not direct_runner._use_int8_allgatherv_dispatch(
+            direct_hidden.to(torch.float16)
+        )
+        direct_runner.moe_config.dp_size = 2
+        assert not direct_runner._use_int8_allgatherv_dispatch(direct_hidden)
+        direct_runner.moe_config.dp_size = 4
+        direct_runner.moe_config.tp_size = 2
+        assert not direct_runner._use_int8_allgatherv_dispatch(direct_hidden)
+        direct_runner.moe_config.tp_size = 1
+        direct_output = direct_runner._forward_impl(
+            direct_hidden, direct_logits, direct_hidden
+        )
+        assert direct_output[1].dtype is torch.bfloat16
+        assert direct_calls["shared_quanted_inputs"] == [None, None]
+        assert direct_calls["router_hidden"] is direct_hidden
+        assert direct_calls["router_logits"] is direct_logits
+        expert_input, *expert_payload = direct_calls["expert"]
+        assert expert_input.dtype is torch.bfloat16
+        assert expert_input.shape == direct_quanted.shape
+        assert expert_payload == [
+            direct_weights,
+            direct_ids,
+            direct_quanted,
+            direct_scale,
+            torch.bfloat16,
+        ]
+
+        class FallbackGroup:
+            def dispatch_router_logits(
+                self, fallback_hidden, fallback_logits, is_sequence_parallel=False
+            ):
+                assert fallback_hidden is direct_hidden
+                assert fallback_logits is direct_logits
+                assert is_sequence_parallel is False
+                return fallback_hidden, fallback_logits
+
+        fallback_runner = object.__new__(runner_module.MoERunner)
+        fallback_runner.moe_config = direct_runner.moe_config
+        fallback_runner.routed_experts = SimpleNamespace(
+            quant_method=SimpleNamespace(
+                supports_internal_mk=False,
+                supports_int8_allgatherv_input=False,
+            )
+        )
+        runner_module.get_ep_group = lambda: FallbackGroup()
+        fallback_hidden, fallback_logits = fallback_runner._maybe_dispatch(
+            direct_hidden, direct_logits
+        )
+        assert fallback_hidden is direct_hidden
+        assert fallback_logits is direct_logits
+
         class SharedLayer:
             def forward(self, value, x_and_scale_quanted=None):
                 assert x_and_scale_quanted == (quanted, scale)
