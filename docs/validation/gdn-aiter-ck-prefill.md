@@ -116,3 +116,20 @@ Artifacts are under:
 Consequently, operator speedups are informational only and CK fused prefill is
 not enabled for production model traffic until AITER fixes the non-finite
 strong-decay behavior and the complete TP4 validation passes again.
+
+## Fail-closed candidate verification
+
+Commit `b5d64fbe` was built as an isolated wheel with SHA256
+`7e2efb80a565ced9fd9dd75171be5b442930b3581131a0a50cad0ab649704f92`.
+The same TP4/EP4, MTP3, FP8 KV, 8192-token, `FULL_AND_PIECEWISE` configuration
+logged the strong-decay safety reason and retained the existing mixed prefill
+path. It completed all correctness, prefix-cache, sequential performance,
+8192-token, and four-way concurrent requests with HTTP 200. Natural-language
+sanity prompts produced prompt-dependent baseline output (`Paris`, `2`, and
+`Green`) rather than the fused-CK collapse.
+
+Median TTFT was 89.54 ms at 64 tokens, 199.87 ms at 1024, 398.50 ms at 4096,
+and 426.50 ms at 8192. These are within normal run-to-run variation of the
+baseline medians (91.42, 204.91, 400.38, and 426.85 ms respectively). Raw
+artifacts are under
+`/data/models/validation/gdn-aiter-ck-prefill/b5d64fbe`.
