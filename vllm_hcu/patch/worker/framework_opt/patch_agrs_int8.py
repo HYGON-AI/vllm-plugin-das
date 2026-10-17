@@ -23,6 +23,8 @@ TARGETS = (
 )
 _MARKER = "_vllm_hcu_agrs_int8_dispatch_applied"
 _WRAPPER = "_vllm_hcu_agrs_int8_dispatch_wrapper"
+
+
 def _enabled() -> bool:
     from vllm.config import get_current_vllm_config_or_none
 
