@@ -12,6 +12,7 @@ from vllm.v1.attention.backends.mla.flashmla_sparse import (
     FlashMLASparseMetadataBuilder,
 )
 from vllm.v1.worker.workspace import current_workspace_manager
+from vllm_hcu.v1.attention.kv_cache_layout import prefer_hnd_layouts
 
 
 class HcuFlashMLASparseMetadataBuilder(FlashMLASparseMetadataBuilder):
@@ -142,6 +143,10 @@ class HcuFlashMLASparseImpl(FlashMLASparseImpl):
 
 
 class HcuFlashMLASparseBackend(FlashMLASparseBackend):
+    @classmethod
+    def supported_kv_cache_layouts(cls):
+        return prefer_hnd_layouts(super().supported_kv_cache_layouts())
+
     @staticmethod
     def get_builder_cls() -> type[HcuFlashMLASparseMetadataBuilder]:
         return HcuFlashMLASparseMetadataBuilder
