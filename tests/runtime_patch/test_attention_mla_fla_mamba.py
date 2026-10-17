@@ -99,6 +99,163 @@ def test_fla_selector_logs_provider_specific_unavailable_reason(monkeypatch):
     ]
 
 
+def _fake_ck_gdn_module():
+    def workspace_bytes(
+        q, v, cu_seqlens=None, use_g=True, use_gk=False, use_exp2=True,
+        transpose_state=False, qk_l2norm=False, gate_in_kernel=False,
+        has_dt_bias=False, beta_sigmoid_in_kernel=False,
+        output_final_state=True, cp_context=False, cp_world_size=2,
+    ):
+        del q, v, cu_seqlens, use_g, use_gk, use_exp2, transpose_state
+        del qk_l2norm, gate_in_kernel, has_dt_bias, beta_sigmoid_in_kernel
+        del output_final_state, cp_context, cp_world_size
+        return 257
+
+    def prefill(
+        q, k, v, g, beta, workspace=None, gk=None, a_log=None,
+        dt_bias=None, initial_state=None, cu_seqlens=None, scale=None,
+        use_g=True, use_gk=False, use_exp2=True, transpose_state=False,
+        qk_l2norm=False, gate_in_kernel=False, has_dt_bias=False,
+        beta_sigmoid_in_kernel=False, output_final_state=True,
+        cp_context=False, cp_world_size=2, cp_rank=1,
+    ):
+        del k, g, beta, workspace, gk, a_log, dt_bias, initial_state
+        del cu_seqlens, scale, use_g, use_gk, use_exp2, transpose_state
+        del qk_l2norm, gate_in_kernel, has_dt_bias, beta_sigmoid_in_kernel
+        del output_final_state, cp_context, cp_world_size, cp_rank
+        return q, v
+
+    return _module(
+        "aiter", ck_gdn_prefill=prefill,
+        ck_gdn_prefill_workspace_bytes=workspace_bytes,
+    )
+
+
+def _ck_inputs(hq=2, hv=8, dim=128, dtype=torch.bfloat16, sequences=1):
+    tokens = 65
+    q = torch.empty(tokens, hq, dim, dtype=dtype)
+    k = torch.empty_like(q)
+    v = torch.empty(tokens, hv, dim, dtype=dtype)
+    g = torch.empty(tokens, hv, dtype=torch.float32)
+    beta = torch.empty(tokens, hv, dtype=torch.float32)
+    state = torch.empty(sequences, hv, dim, dim, dtype=torch.float32)
+    cu = torch.tensor([0, tokens], dtype=torch.int64)
+    return q, k, v, g, beta, state, cu
+
+
+def test_ck_gdn_resolver_handles_missing_and_audits_signatures(monkeypatch):
+    adapter = _adapter("_aiter_ck_gdn")
+    real_import = adapter.importlib.import_module
+
+    def missing(name):
+        if name == "aiter":
+            raise ModuleNotFoundError("missing", name="aiter")
+        return real_import(name)
+
+    monkeypatch.setattr(adapter.importlib, "import_module", missing)
+    assert adapter.resolve_aiter_ck_gdn() is None
+
+    monkeypatch.setattr(adapter.importlib, "import_module", lambda name: _fake_ck_gdn_module())
+    ops = adapter.resolve_aiter_ck_gdn()
+    assert ops.prefill is not None
+    assert ops.workspace_bytes is not None
+
+    bad = _fake_ck_gdn_module()
+    bad.ck_gdn_prefill = lambda q: q
+    monkeypatch.setattr(adapter.importlib, "import_module", lambda name: bad)
+    with pytest.raises(adapter.PatchCompatibilityError, match="incompatible signature"):
+        adapter.resolve_aiter_ck_gdn()
+
+
+@pytest.mark.parametrize(("hq", "hv"), ((4, 4), (4, 8), (2, 8)))
+def test_ck_gdn_supported_contract_returns_no_reason(monkeypatch, hq, hv):
+    adapter = _adapter("_aiter_ck_gdn")
+    monkeypatch.setattr(adapter, "requested_backend", lambda stage: "hcu-aiter")
+    assert adapter.aiter_ck_unsupported(*_ck_inputs(hq=hq, hv=hv), capturing=False) is None
+
+
+@pytest.mark.parametrize(
+    ("inputs", "reason"),
+    (
+        (_ck_inputs(hq=2, hv=6), "value/key head ratio 3 is unsupported"),
+        (_ck_inputs(dim=64), "key/value dimensions must both be 128"),
+        (_ck_inputs(dtype=torch.float32), "activations must be fp16 or bf16"),
+    ),
+)
+def test_ck_gdn_rejects_incompatible_inputs(monkeypatch, inputs, reason):
+    adapter = _adapter("_aiter_ck_gdn")
+    monkeypatch.setattr(adapter, "requested_backend", lambda stage: "hcu-aiter")
+    assert adapter.aiter_ck_unsupported(*inputs, capturing=False) == reason
+
+
+def test_ck_gdn_respects_master_provider_and_varlen_graph(monkeypatch):
+    adapter = _adapter("_aiter_ck_gdn")
+    inputs = _ck_inputs(sequences=2)
+    inputs = (*inputs[:-1], torch.tensor([0, 17, 65], dtype=torch.int64))
+    monkeypatch.setattr(adapter, "requested_backend", lambda stage: "hcu-boltops")
+    assert adapter.aiter_ck_unsupported(*inputs, capturing=False) == (
+        "requested provider is hcu-boltops"
+    )
+    monkeypatch.setattr(adapter, "requested_backend", lambda stage: "hcu-aiter")
+    assert adapter.aiter_ck_unsupported(*inputs, capturing=False) is None
+    assert adapter.aiter_ck_unsupported(*inputs, capturing=True) == (
+        "packed variable-length metadata is not graph-safe"
+    )
+
+
+def test_ck_gdn_normalizes_only_fixed_single_sequence_metadata():
+    adapter = _adapter("_aiter_ck_gdn")
+    q, *_, cu = _ck_inputs()
+    assert adapter.aiter_ck_cu_seqlens(q, cu) is None
+    varlen = torch.tensor([0, 17, 65], dtype=torch.int64)
+    assert adapter.aiter_ck_cu_seqlens(q, varlen) is varlen
+
+
+def test_ck_gdn_workspace_uses_workspace_manager(monkeypatch):
+    adapter = _adapter("_aiter_ck_gdn")
+    ops = SimpleNamespace(workspace_bytes=lambda *args, **kwargs: 257)
+    backing = torch.empty(512, dtype=torch.uint8)
+    calls = []
+
+    class Manager:
+        def get_simultaneous(self, *specs):
+            calls.append(specs)
+            return [backing[: specs[0][0][0]]]
+
+    monkeypatch.setattr(adapter, "current_workspace_manager", lambda: Manager())
+    q, _, v, *_, cu = _ck_inputs()
+    workspace = adapter.aiter_ck_workspace(ops, q, v, cu, {})
+    assert workspace.dtype == torch.uint8
+    assert workspace.numel() == 257
+    assert workspace.untyped_storage().data_ptr() == backing.untyped_storage().data_ptr()
+    assert calls == [(((257,), torch.uint8),)]
+
+
+def test_ck_gdn_workspace_reuses_lane_and_respects_lock(monkeypatch):
+    from vllm.v1.worker.workspace import WorkspaceManager, use_workspace_lane
+
+    adapter = _adapter("_aiter_ck_gdn")
+    manager = WorkspaceManager(torch.device("cpu"), num_ubatches=1, num_lanes=2)
+    monkeypatch.setattr(adapter, "current_workspace_manager", lambda: manager)
+    q, _, v, *_, cu = _ck_inputs()
+    size = [257]
+    ops = SimpleNamespace(workspace_bytes=lambda *args, **kwargs: size[0])
+
+    with use_workspace_lane(0):
+        first = adapter.aiter_ck_workspace(ops, q, v, cu, {})
+        again = adapter.aiter_ck_workspace(ops, q, v, cu, {})
+    with use_workspace_lane(1):
+        other_lane = adapter.aiter_ck_workspace(ops, q, v, cu, {})
+
+    assert first.untyped_storage().data_ptr() == again.untyped_storage().data_ptr()
+    assert first.untyped_storage().data_ptr() != other_lane.untyped_storage().data_ptr()
+
+    manager.lock()
+    size[0] = 513
+    with use_workspace_lane(0), pytest.raises(AssertionError, match="locked"):
+        adapter.aiter_ck_workspace(ops, q, v, cu, {})
+
+
 def _import_hcu_sparse_indexer_without_custom_op_registration(
     monkeypatch, request
 ):
