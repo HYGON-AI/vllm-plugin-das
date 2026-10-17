@@ -256,6 +256,130 @@ def test_ck_gdn_workspace_reuses_lane_and_respects_lock(monkeypatch):
         adapter.aiter_ck_workspace(ops, q, v, cu, {})
 
 
+def _ck_forward_native(
+    self, q, k, v, g, beta, initial_state, output_final_state,
+    cu_seqlens=None, chunk_indices=None, chunk_offsets=None,
+    use_qk_l2norm_in_kernel=True, core_attn_out=None,
+):
+    del self, q, k, v, g, beta, initial_state, output_final_state
+    del cu_seqlens, chunk_indices, chunk_offsets, use_qk_l2norm_in_kernel
+    del core_attn_out
+    return "official", "state"
+
+
+def _ck_qwen_module():
+    cls = type("ChunkGatedDeltaRule", (), {"forward_native": _ck_forward_native})
+    return _module(
+        "vllm.model_executor.layers.mamba.gdn.qwen_gdn_linear_attn",
+        ChunkGatedDeltaRule=cls,
+        logger=SimpleNamespace(info_once=lambda *args: None, warning_once=lambda *args: None),
+    )
+
+
+def test_ck_gdn_complete_prefill_routes_supported_call(monkeypatch):
+    patch = _adapter("patch_gdn_ck_prefill")
+    ck = _adapter("_aiter_ck_gdn")
+    module = _ck_qwen_module()
+    calls = []
+    ops = SimpleNamespace(prefill=lambda *args, **kwargs: calls.append((args, kwargs)) or (
+        torch.ones(65, 8, 128, dtype=torch.bfloat16),
+        torch.ones(1, 8, 128, 128, dtype=torch.float32),
+    ))
+    monkeypatch.setattr(patch, "resolve_aiter_ck_gdn", lambda: ops)
+    monkeypatch.setattr(ck, "requested_backend", lambda stage: "hcu-aiter")
+    monkeypatch.setattr(patch, "aiter_ck_workspace", lambda *args: torch.empty(257, dtype=torch.uint8))
+    monkeypatch.setattr(torch.cuda, "is_current_stream_capturing", lambda: False)
+    patch.apply_to_module(module)
+    q, k, v, g, beta, state, cu = _ck_inputs()
+    out, final = module.ChunkGatedDeltaRule().forward_native(
+        q[None], k[None], v[None], g[None], beta[None], state, True,
+        cu_seqlens=cu, use_qk_l2norm_in_kernel=False,
+    )
+    assert out.shape == (1, 65, 8, 128)
+    assert final.shape == (1, 8, 128, 128)
+    assert calls[0][1]["cu_seqlens"] is None
+    assert calls[0][1]["use_exp2"] is False
+    assert calls[0][1]["transpose_state"] is True
+
+
+def test_ck_gdn_complete_prefill_falls_back_for_ratio_three(monkeypatch):
+    patch = _adapter("patch_gdn_ck_prefill")
+    ck = _adapter("_aiter_ck_gdn")
+    module = _ck_qwen_module()
+    ops = SimpleNamespace(prefill=lambda *args, **kwargs: pytest.fail("CK must not run"))
+    monkeypatch.setattr(patch, "resolve_aiter_ck_gdn", lambda: ops)
+    monkeypatch.setattr(ck, "requested_backend", lambda stage: "hcu-aiter")
+    monkeypatch.setattr(torch.cuda, "is_current_stream_capturing", lambda: False)
+    patch.apply_to_module(module)
+    q, k, v, g, beta, state, cu = _ck_inputs(hq=2, hv=6)
+    assert module.ChunkGatedDeltaRule().forward_native(
+        q[None], k[None], v[None], g[None], beta[None], state, True,
+        cu_seqlens=cu, use_qk_l2norm_in_kernel=False,
+    ) == ("official", "state")
+
+
+def test_ck_gdn_complete_prefill_copies_core_output(monkeypatch):
+    patch = _adapter("patch_gdn_ck_prefill")
+    ck = _adapter("_aiter_ck_gdn")
+    module = _ck_qwen_module()
+    expected = torch.arange(65 * 8 * 128, dtype=torch.float32).to(torch.bfloat16).reshape(65, 8, 128)
+    ops = SimpleNamespace(prefill=lambda *args, **kwargs: (expected, None))
+    monkeypatch.setattr(patch, "resolve_aiter_ck_gdn", lambda: ops)
+    monkeypatch.setattr(ck, "requested_backend", lambda stage: "hcu-aiter")
+    monkeypatch.setattr(patch, "aiter_ck_workspace", lambda *args: torch.empty(1, dtype=torch.uint8))
+    monkeypatch.setattr(torch.cuda, "is_current_stream_capturing", lambda: False)
+    patch.apply_to_module(module)
+    q, k, v, g, beta, state, cu = _ck_inputs()
+    backing = torch.empty_like(expected)
+    out, final = module.ChunkGatedDeltaRule().forward_native(
+        q[None], k[None], v[None], g[None], beta[None], state, False,
+        cu_seqlens=cu, use_qk_l2norm_in_kernel=False,
+        core_attn_out=backing,
+    )
+    assert torch.equal(backing, expected)
+    assert torch.equal(out[0], expected)
+    assert final is None
+
+
+def test_ck_gdn_complete_prefill_varlen_graph_falls_back(monkeypatch):
+    patch = _adapter("patch_gdn_ck_prefill")
+    ck = _adapter("_aiter_ck_gdn")
+    module = _ck_qwen_module()
+    ops = SimpleNamespace(prefill=lambda *args, **kwargs: pytest.fail("CK must not run"))
+    monkeypatch.setattr(patch, "resolve_aiter_ck_gdn", lambda: ops)
+    monkeypatch.setattr(ck, "requested_backend", lambda stage: "hcu-aiter")
+    monkeypatch.setattr(torch.cuda, "is_current_stream_capturing", lambda: True)
+    patch.apply_to_module(module)
+    q, k, v, g, beta, _, _ = _ck_inputs()
+    state = torch.empty(2, 8, 128, 128, dtype=torch.float32)
+    cu = torch.tensor([0, 17, 65], dtype=torch.int64)
+    assert module.ChunkGatedDeltaRule().forward_native(
+        q[None], k[None], v[None], g[None], beta[None], state, True,
+        cu_seqlens=cu, use_qk_l2norm_in_kernel=False,
+    ) == ("official", "state")
+
+
+def test_ck_gdn_complete_prefill_propagates_provider_failure(monkeypatch):
+    patch = _adapter("patch_gdn_ck_prefill")
+    ck = _adapter("_aiter_ck_gdn")
+    module = _ck_qwen_module()
+
+    def failed(*args, **kwargs):
+        raise RuntimeError("native CK launch failed")
+
+    monkeypatch.setattr(patch, "resolve_aiter_ck_gdn", lambda: SimpleNamespace(prefill=failed))
+    monkeypatch.setattr(ck, "requested_backend", lambda stage: "hcu-aiter")
+    monkeypatch.setattr(patch, "aiter_ck_workspace", lambda *args: torch.empty(1, dtype=torch.uint8))
+    monkeypatch.setattr(torch.cuda, "is_current_stream_capturing", lambda: False)
+    patch.apply_to_module(module)
+    q, k, v, g, beta, state, cu = _ck_inputs()
+    with pytest.raises(RuntimeError, match="native CK launch failed"):
+        module.ChunkGatedDeltaRule().forward_native(
+            q[None], k[None], v[None], g[None], beta[None], state, True,
+            cu_seqlens=cu, use_qk_l2norm_in_kernel=False,
+        )
+
+
 def _import_hcu_sparse_indexer_without_custom_op_registration(
     monkeypatch, request
 ):

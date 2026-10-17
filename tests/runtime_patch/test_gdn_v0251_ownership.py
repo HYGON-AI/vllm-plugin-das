@@ -699,8 +699,8 @@ def test_qwen_prefill_log_distinguishes_frontend_from_hcu_provider(monkeypatch):
 
     assert messages == [
         (
-            "Using Triton/FLA GDN prefill frontend; HCU provider requested=%s "
-            "and is resolved per operator at execution.",
+            "Using the GDN prefill frontend; HCU provider requested=%s and is "
+            "resolved as fused CK or per operator at execution.",
             "hcu-aiter",
         )
     ]
