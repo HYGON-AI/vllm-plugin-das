@@ -23,6 +23,7 @@ from vllm_hcu.patch.import_coordinator import ExactImportCoordinator
 from vllm_hcu.patch.runtime_state import PatchRegistry
 from vllm_hcu.v1 import worker_framework_runtime
 from vllm_hcu.patch.worker.framework_opt import (
+    patch_agrs_int8,
     patch_all2all,
     patch_base_device_communicator,
     patch_cuda_communicator,
@@ -37,6 +38,291 @@ from vllm_hcu.patch.worker.framework_opt import (
     patch_pynccl_wrapper,
     patch_ubatch_utils,
 )
+
+
+def _fake_agrs_module() -> ModuleType:
+    class AgRsAll2AllManager:
+        def _get_comm_group(self, is_sequence_parallel: bool):
+            del is_sequence_parallel
+            return self.group
+
+        def _get_sizes(self, num_local_tokens: int, comm_group):
+            del comm_group
+            return getattr(self, "sizes", [num_local_tokens])
+
+        def dispatch_router_logits(
+            self,
+            hidden_states,
+            router_logits,
+            is_sequence_parallel=False,
+            extra_tensors=None,
+        ):
+            if extra_tensors is None:
+                return hidden_states, router_logits
+            return hidden_states, router_logits, extra_tensors
+
+        def dispatch(
+            self,
+            hidden_states,
+            topk_weights,
+            topk_ids,
+            is_sequence_parallel=False,
+            extra_tensors=None,
+        ):
+            if extra_tensors is None:
+                return hidden_states, topk_weights, topk_ids
+            return hidden_states, topk_weights, topk_ids, extra_tensors
+
+    return _module(
+        patch_agrs_int8.TARGET_MODULE,
+        AgRsAll2AllManager=AgRsAll2AllManager,
+    )
+
+
+def test_agrs_int8_dispatch_gathers_quantized_hidden_and_scale(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    patch_agrs_int8.configure(True)
+    hidden = torch.tensor([[1.0, -2.0], [3.0, -4.0]], dtype=torch.bfloat16)
+    router = torch.ones((2, 3), dtype=torch.bfloat16)
+    quantized = torch.tensor([[10, -20], [30, -40]], dtype=torch.int8)
+    scales = torch.full((2, 1), 0.1, dtype=torch.float32)
+    monkeypatch.setattr(
+        patch_agrs_int8,
+        "_quantize_hidden_states",
+        lambda value: (quantized, scales),
+    )
+
+    gathered: list[tuple[list[torch.Tensor], list[int]]] = []
+
+    class Group:
+        rank_in_group = 0
+
+        def all_gatherv(self, tensors, dim=0, sizes=None):
+            assert dim == 0
+            gathered.append((tensors, sizes))
+            return tensors
+
+    module = _fake_agrs_module()
+    assert patch_agrs_int8.apply_to_module(module)
+    manager = module.AgRsAll2AllManager()
+    manager.group = Group()
+
+    with patch_agrs_int8.int8_transport():
+        all_hidden, all_router, all_scales = manager.dispatch_router_logits(
+            hidden, router
+        )
+
+    assert len(gathered) == 1
+    sent, sizes = gathered[0]
+    assert sent == [quantized, scales, router]
+    assert sizes == [2]
+    assert all_hidden is quantized
+    assert all_hidden.dtype is torch.int8
+    assert all_router is router
+    assert all_scales is scales
+
+
+def test_agrs_int8_dispatch_reuses_prequantized_transport_payload(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    patch_agrs_int8.configure(True)
+    hidden = torch.tensor([[1.0, -2.0], [3.0, -4.0]], dtype=torch.bfloat16)
+    topk_weights = torch.ones((2, 1), dtype=torch.float32)
+    topk_ids = torch.zeros((2, 1), dtype=torch.int32)
+    quantized = torch.tensor([[10, -20], [30, -40]], dtype=torch.int8)
+    scales = torch.full((2, 1), 0.1, dtype=torch.float32)
+    monkeypatch.setattr(
+        patch_agrs_int8,
+        "_quantize_hidden_states",
+        lambda _value: pytest.fail("prequantized transport must not requantize"),
+    )
+
+    class Group:
+        rank_in_group = 0
+
+        def all_gatherv(self, tensors, dim=0, sizes=None):
+            assert dim == 0
+            assert sizes == [2]
+            assert tensors == [quantized, scales, topk_weights, topk_ids]
+            return tensors
+
+    module = _fake_agrs_module()
+    assert patch_agrs_int8.apply_to_module(module)
+    manager = module.AgRsAll2AllManager()
+    manager.group = Group()
+
+    with patch_agrs_int8.int8_transport((quantized, scales)):
+        result = manager.dispatch(hidden, topk_weights, topk_ids)
+
+    assert result == (quantized, topk_weights, topk_ids, scales)
+
+
+def test_agrs_int8_dispatch_is_opt_in(monkeypatch: pytest.MonkeyPatch) -> None:
+    patch_agrs_int8.configure(False)
+    module = _fake_agrs_module()
+    assert patch_agrs_int8.apply_to_module(module)
+    manager = module.AgRsAll2AllManager()
+    hidden = torch.ones((2, 4), dtype=torch.bfloat16)
+    router = torch.ones((2, 3), dtype=torch.bfloat16)
+
+    result = manager.dispatch_router_logits(hidden, router)
+
+    assert result == (hidden, router)
+
+
+def test_agrs_int8_dispatch_requires_explicit_transport_scope(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    patch_agrs_int8.configure(True)
+    module = _fake_agrs_module()
+    assert patch_agrs_int8.apply_to_module(module)
+    manager = module.AgRsAll2AllManager()
+    hidden = torch.ones((2, 4), dtype=torch.bfloat16)
+    router = torch.ones((2, 3), dtype=torch.bfloat16)
+    monkeypatch.setattr(
+        patch_agrs_int8,
+        "_quantize_hidden_states",
+        lambda _value: pytest.fail(
+            "generic communicator calls must preserve BF16 transport"
+        ),
+    )
+
+    result = manager.dispatch_router_logits(hidden, router)
+
+    assert result == (hidden, router)
+
+
+def test_agrs_int8_enablement_uses_serialized_worker_config(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    import vllm.config
+
+    monkeypatch.setenv("VLLM_HCU_USE_CUSTOM_OPS", "0")
+    monkeypatch.setenv("VLLM_HCU_DP_INT8_ALLGATHER", "0")
+    monkeypatch.setattr(
+        vllm.config,
+        "get_current_vllm_config_or_none",
+        lambda: None,
+    )
+    patch_agrs_int8.configure(True)
+
+    assert patch_agrs_int8._enabled() is True
+
+
+def test_worker_initialization_latches_agrs_int8_policy(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    import vllm_hcu.patch.platform as platform_patch
+    import vllm_hcu.patch.worker as worker_patch
+
+    config = _config(dp_int8_allgather=True)
+    config.parallel_config = None
+    monkeypatch.setattr(worker_patch, "ensure_vllm_compatible", lambda: None)
+    monkeypatch.setattr(platform_patch, "apply_platform_patches", lambda: None)
+    monkeypatch.setattr(worker_patch, "set_process_role", lambda role: None)
+    monkeypatch.setattr(
+        worker_patch,
+        "_bind_deserialized_hcu_config",
+        lambda value: HcuFeatureConfig(dp_int8_allgather=True),
+    )
+    monkeypatch.setattr(worker_patch, "prepare_worker_patches", lambda: None)
+    monkeypatch.setattr(worker_patch, "_feature_states", lambda *args: {})
+    monkeypatch.setattr(worker_patch, "_patch_features", lambda: {})
+    monkeypatch.setattr(
+        worker_patch,
+        "_raise_latched_or_required_failures",
+        lambda coordinator: None,
+    )
+    patch_agrs_int8.configure(False)
+
+    worker_patch.apply_worker_patches(config)
+
+    assert patch_agrs_int8._enabled() is True
+
+
+def test_agrs_int8_dispatch_preserves_prequantized_payload() -> None:
+    patch_agrs_int8.configure(True)
+    hidden = torch.tensor([[1, -2], [3, -4]], dtype=torch.int8)
+    router = torch.ones((2, 3), dtype=torch.bfloat16)
+    activation_scale = torch.full((2, 1), 0.1, dtype=torch.float32)
+
+    class Group:
+        rank_in_group = 0
+
+        def all_gatherv(self, tensors, dim=0, sizes=None):
+            raise AssertionError("prequantized hidden states must use the original path")
+
+    module = _fake_agrs_module()
+    assert patch_agrs_int8.apply_to_module(module)
+    manager = module.AgRsAll2AllManager()
+    manager.group = Group()
+
+    result = manager.dispatch_router_logits(
+        hidden,
+        router,
+        extra_tensors=[activation_scale],
+    )
+
+    assert result == (hidden, router, [activation_scale])
+
+
+def test_agrs_int8_topk_dispatch_preserves_uneven_sizes_and_extras(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    patch_agrs_int8.configure(True)
+    hidden = torch.ones((3, 4), dtype=torch.bfloat16)
+    topk_weights = torch.ones((3, 2), dtype=torch.float32)
+    topk_ids = torch.zeros((3, 2), dtype=torch.int32)
+    extra = torch.arange(3, dtype=torch.int32)
+    quantized = torch.ones_like(hidden, dtype=torch.int8)
+    scales = torch.full((3, 1), 0.25, dtype=torch.float32)
+    monkeypatch.setattr(
+        patch_agrs_int8,
+        "_quantize_hidden_states",
+        lambda value: (quantized, scales),
+    )
+
+    class Group:
+        rank_in_group = 2
+
+        def all_gatherv(self, tensors, dim=0, sizes=None):
+            assert dim == 0
+            assert sizes == [2, 0, 3]
+            assert tensors == [quantized, scales, topk_weights, topk_ids, extra]
+            return tensors
+
+    module = _fake_agrs_module()
+    assert patch_agrs_int8.apply_to_module(module)
+    manager = module.AgRsAll2AllManager()
+    manager.group = Group()
+    manager.sizes = [2, 0, 3]
+
+    with patch_agrs_int8.int8_transport():
+        all_hidden, all_weights, all_ids, all_extras, all_scales = manager.dispatch(
+            hidden,
+            topk_weights,
+            topk_ids,
+            extra_tensors=[extra],
+        )
+
+    assert all_hidden is quantized
+    assert all_hidden.dtype is torch.int8
+    assert all_weights is topk_weights
+    assert all_ids is topk_ids
+    assert all_extras == [extra]
+    assert all_scales is scales
+
+
+def test_agrs_int8_quantizes_zero_token_rank_without_lightop() -> None:
+    hidden = torch.empty((0, 2560), dtype=torch.bfloat16)
+
+    quantized, scales = patch_agrs_int8._quantize_hidden_states(hidden)
+
+    assert quantized.shape == (0, 2560)
+    assert quantized.dtype is torch.int8
+    assert scales.shape == (0, 1)
+    assert scales.dtype is torch.float32
 
 
 def test_gloo_eplb_communicator_preserves_profile_buffer_reservation() -> None:
