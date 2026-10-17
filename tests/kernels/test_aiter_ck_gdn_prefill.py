@@ -165,3 +165,35 @@ def test_ck_prefill_packed_varlen_graph_uses_original(methods, caplog):
     eager_original = run(original)
     _assert_close(graph_out, eager_original)
     assert "packed variable-length metadata is not graph-safe" in caplog.text
+
+
+@pytest.mark.parametrize(
+    ("decay", "expected_finite"),
+    [(-1.0, True), (-2.0, False), (-5.0, False), (-10.0, False)],
+)
+def test_native_ck_prefill_documents_strong_decay_boundary(
+    decay, expected_finite
+):
+    """Preserve the AITER 0.1.7 failure that keeps production fail-closed."""
+    import aiter
+
+    q, k, v, _, beta, state, _ = _inputs([128])
+    g = torch.full_like(beta[0], decay)
+    flags = {
+        "use_g": True, "use_gk": False, "use_exp2": False,
+        "transpose_state": True, "qk_l2norm": False,
+        "gate_in_kernel": False, "has_dt_bias": False,
+        "beta_sigmoid_in_kernel": False, "output_final_state": True,
+        "cp_context": False, "cp_world_size": 2,
+    }
+    workspace = aiter.ck_gdn_prefill_alloc_workspace(
+        q[0], v[0], None, **flags
+    )
+    output, final_state = aiter.ck_gdn_prefill(
+        q[0], k[0], v[0], g, beta[0], workspace,
+        initial_state=state, scale=128**-0.5, **flags, cp_rank=1,
+    )
+    torch.cuda.synchronize()
+
+    assert bool(torch.isfinite(output).all()) is expected_finite
+    assert bool(torch.isfinite(final_state).all()) is expected_finite

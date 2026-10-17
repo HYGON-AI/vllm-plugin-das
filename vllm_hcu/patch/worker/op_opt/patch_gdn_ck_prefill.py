@@ -60,7 +60,8 @@ def apply_to_module(module: ModuleType) -> bool:
             "use_qk_l2norm_in_kernel": True, "core_attn_out": None,
         },
     )
-    ops = resolve_aiter_ck_gdn()
+    safety_reason = aiter_ck_runtime_safety_reason()
+    ops = None if safety_reason else resolve_aiter_ck_gdn()
 
     @functools.wraps(original)
     def hcu_forward_native(
@@ -75,14 +76,13 @@ def apply_to_module(module: ModuleType) -> bool:
                 use_qk_l2norm_in_kernel, core_attn_out,
             )
 
-        if ops is None or use_qk_l2norm_in_kernel:
-            return fallback()
-        safety_reason = aiter_ck_runtime_safety_reason()
         if safety_reason:
             qwen.logger.warning_once(
                 "GDN fused CK prefill is disabled because %s; using the "
                 "existing prefill path.", safety_reason,
             )
+            return fallback()
+        if ops is None or use_qk_l2norm_in_kernel:
             return fallback()
         if any(x.ndim < 1 or x.shape[0] != 1 for x in (q, k, v, g, beta)):
             return fallback()

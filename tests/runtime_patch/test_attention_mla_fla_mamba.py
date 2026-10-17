@@ -278,6 +278,7 @@ def test_ck_gdn_workspace_reuses_lane_and_respects_lock(monkeypatch):
 
 def test_ck_gdn_reserves_max_prefill_workspace_per_lane(monkeypatch):
     adapter = _adapter("_aiter_ck_gdn")
+    monkeypatch.setattr(adapter, "aiter_ck_runtime_safety_reason", lambda: "")
     layer = SimpleNamespace(
         num_k_heads=8,
         num_v_heads=32,
@@ -333,6 +334,19 @@ def test_ck_gdn_reserves_max_prefill_workspace_per_lane(monkeypatch):
     assert flags["use_exp2"] is False
 
 
+def test_ck_gdn_fail_closed_does_not_reserve_workspace(monkeypatch):
+    adapter = _adapter("_aiter_ck_gdn")
+    monkeypatch.setattr(
+        adapter,
+        "resolve_aiter_ck_gdn",
+        lambda: pytest.fail("disabled CK ABI must not be resolved"),
+    )
+
+    assert adapter.reserve_aiter_ck_gdn_workspace(
+        SimpleNamespace(), 8192, (0, 1)
+    ) == 0
+
+
 def _ck_forward_native(
     self, q, k, v, g, beta, initial_state, output_final_state,
     cu_seqlens=None, chunk_indices=None, chunk_offsets=None,
@@ -370,6 +384,24 @@ def test_ck_gdn_complete_prefill_fails_closed_for_runtime_safety(monkeypatch):
         cu_seqlens=cu, use_qk_l2norm_in_kernel=False,
     ) == ("official", "state")
     assert any("non-finite output" in args[1] for args in logs)
+
+
+def test_ck_gdn_fail_closed_skips_optional_abi_resolution(monkeypatch):
+    patch = _adapter("patch_gdn_ck_prefill")
+    module = _ck_qwen_module()
+    monkeypatch.setattr(
+        patch,
+        "resolve_aiter_ck_gdn",
+        lambda: pytest.fail("disabled CK ABI must not be resolved"),
+    )
+
+    patch.apply_to_module(module)
+
+    q, k, v, g, beta, state, cu = _ck_inputs()
+    assert module.ChunkGatedDeltaRule().forward_native(
+        q[None], k[None], v[None], g[None], beta[None], state, True,
+        cu_seqlens=cu, use_qk_l2norm_in_kernel=False,
+    ) == ("official", "state")
 
 
 def test_ck_gdn_complete_prefill_routes_supported_call(monkeypatch):

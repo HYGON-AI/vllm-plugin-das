@@ -180,6 +180,8 @@ def reserve_aiter_ck_gdn_workspace(
 ) -> int:
     """Reserve the largest fused-prefill workspace before it is locked."""
 
+    if aiter_ck_runtime_safety_reason():
+        return 0
     compilation_config = getattr(vllm_config, "compilation_config", None)
     contexts = getattr(compilation_config, "static_forward_context", {})
     layer = next(
