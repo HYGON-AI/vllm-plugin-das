@@ -31,6 +31,10 @@ _DIRECT_TRANSPORT = ContextVar(
     "vllm_hcu_int8_allgatherv_direct_transport",
     default=False,
 )
+_PREQUANTIZED_TRANSPORT = ContextVar(
+    "vllm_hcu_int8_allgatherv_prequantized_transport",
+    default=None,
+)
 
 
 def configure(enabled: bool) -> None:
@@ -47,14 +51,18 @@ def _enabled() -> bool:
 
 
 @contextmanager
-def int8_transport() -> Iterator[None]:
-    """Scope the altered communicator payload to a compatible MoE consumer."""
+def int8_transport(
+    prequantized: tuple[object, object] | None = None,
+) -> Iterator[None]:
+    """Scope INT8 transport and optionally reuse an existing quantized pair."""
 
-    token = _DIRECT_TRANSPORT.set(True)
+    direct_token = _DIRECT_TRANSPORT.set(True)
+    prequantized_token = _PREQUANTIZED_TRANSPORT.set(prequantized)
     try:
         yield
     finally:
-        _DIRECT_TRANSPORT.reset(token)
+        _PREQUANTIZED_TRANSPORT.reset(prequantized_token)
+        _DIRECT_TRANSPORT.reset(direct_token)
 
 
 def _direct_transport_enabled() -> bool:
@@ -115,7 +123,11 @@ def _gather_quantized(
     group = manager._get_comm_group(is_sequence_parallel)
     sizes = manager._get_sizes(hidden_states.shape[0], group)
     assert sizes[group.rank_in_group] == hidden_states.shape[0]
-    quantized, scales = _quantize_hidden_states(hidden_states)
+    prequantized = _PREQUANTIZED_TRANSPORT.get()
+    if prequantized is None:
+        quantized, scales = _quantize_hidden_states(hidden_states)
+    else:
+        quantized, scales = prequantized
     tensors = [quantized, scales, *metadata]
     if extra_tensors is not None:
         tensors.extend(extra_tensors)

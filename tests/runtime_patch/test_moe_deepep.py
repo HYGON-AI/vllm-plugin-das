@@ -6000,6 +6000,10 @@ def test_moe_runner_and_shared_experts_cold_replacement_contract():
         class DirectSharedExperts:
             def __init__(self):
                 self.output = direct_hidden
+                self.supports_quanted_input = True
+
+            def _layer_supports_x_and_scale_quanted(self):
+                return self.supports_quanted_input
 
             def __call__(
                 self,
@@ -6019,7 +6023,12 @@ def test_moe_runner_and_shared_experts_cold_replacement_contract():
                 x_and_scale_quanted=None,
             ):
                 assert shared_input is direct_hidden
-                assert x_and_scale_quanted is None
+                expected = (
+                    (direct_quanted, direct_scale)
+                    if self.supports_quanted_input
+                    else None
+                )
+                assert x_and_scale_quanted == expected
 
         direct_runner = object.__new__(runner_module.MoERunner)
         direct_runner._ep_fused_combine = False
@@ -6039,6 +6048,12 @@ def test_moe_runner_and_shared_experts_cold_replacement_contract():
         direct_runner.gate = None
         direct_runner._sequence_parallel_context = lambda: runner_module.nullcontext()
         runner_module._int8_allgatherv_enabled = lambda: True
+        from vllm_hcu.patch.worker.framework_opt import patch_agrs_int8
+
+        patch_agrs_int8._quantize_hidden_states = lambda value: (
+            direct_quanted,
+            direct_scale,
+        )
         runner_module.get_ep_group = lambda: DirectGroup()
         assert direct_runner._use_int8_allgatherv_dispatch(direct_hidden)
         assert not direct_runner._use_int8_allgatherv_dispatch(
@@ -6054,7 +6069,10 @@ def test_moe_runner_and_shared_experts_cold_replacement_contract():
             direct_hidden, direct_logits, direct_hidden
         )
         assert direct_output[1].dtype is torch.bfloat16
-        assert direct_calls["shared_quanted_inputs"] == [None, None]
+        assert direct_calls["shared_quanted_inputs"] == [
+            (direct_quanted, direct_scale),
+            (direct_quanted, direct_scale),
+        ]
         assert direct_calls["router_hidden"] is direct_hidden
         assert direct_calls["router_logits"] is direct_logits
         expert_input, *expert_payload = direct_calls["expert"]
@@ -6067,6 +6085,15 @@ def test_moe_runner_and_shared_experts_cold_replacement_contract():
             direct_scale,
             torch.bfloat16,
         ]
+
+        direct_runner._shared_experts.supports_quanted_input = False
+        direct_calls["shared_quanted_inputs"] = []
+        direct_output = direct_runner._forward_impl(
+            direct_hidden, direct_logits, direct_hidden
+        )
+        assert direct_output[1].dtype is torch.bfloat16
+        assert direct_calls["shared_quanted_inputs"] == [None, None]
+        assert direct_calls["expert"][3:5] == (direct_quanted, direct_scale)
 
         class FallbackGroup:
             def dispatch_router_logits(

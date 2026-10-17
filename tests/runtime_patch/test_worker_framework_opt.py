@@ -123,6 +123,41 @@ def test_agrs_int8_dispatch_gathers_quantized_hidden_and_scale(
     assert all_scales is scales
 
 
+def test_agrs_int8_dispatch_reuses_prequantized_transport_payload(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    patch_agrs_int8.configure(True)
+    hidden = torch.tensor([[1.0, -2.0], [3.0, -4.0]], dtype=torch.bfloat16)
+    topk_weights = torch.ones((2, 1), dtype=torch.float32)
+    topk_ids = torch.zeros((2, 1), dtype=torch.int32)
+    quantized = torch.tensor([[10, -20], [30, -40]], dtype=torch.int8)
+    scales = torch.full((2, 1), 0.1, dtype=torch.float32)
+    monkeypatch.setattr(
+        patch_agrs_int8,
+        "_quantize_hidden_states",
+        lambda _value: pytest.fail("prequantized transport must not requantize"),
+    )
+
+    class Group:
+        rank_in_group = 0
+
+        def all_gatherv(self, tensors, dim=0, sizes=None):
+            assert dim == 0
+            assert sizes == [2]
+            assert tensors == [quantized, scales, topk_weights, topk_ids]
+            return tensors
+
+    module = _fake_agrs_module()
+    assert patch_agrs_int8.apply_to_module(module)
+    manager = module.AgRsAll2AllManager()
+    manager.group = Group()
+
+    with patch_agrs_int8.int8_transport((quantized, scales)):
+        result = manager.dispatch(hidden, topk_weights, topk_ids)
+
+    assert result == (quantized, topk_weights, topk_ids, scales)
+
+
 def test_agrs_int8_dispatch_is_opt_in(monkeypatch: pytest.MonkeyPatch) -> None:
     patch_agrs_int8.configure(False)
     module = _fake_agrs_module()

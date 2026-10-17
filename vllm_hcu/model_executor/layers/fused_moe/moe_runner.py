@@ -1341,12 +1341,33 @@ class MoERunner(MoERunnerInterface):
         # TODO(bnell): this can be removed after MK migration is complete.
         self.routed_experts._ensure_moe_quant_config_init()
 
-        # Sync aux and main stream for shared expert multi-stream overlap.
+        use_int8_allgatherv = self._use_int8_allgatherv_dispatch(hidden_states)
+
+        # Quantize the local input once so both the shared expert's first
+        # projection and the DP AllGatherv transport can consume it.
         shared_experts_x_and_scale_quanted = (
             (quanted_hidden_states, scale)
             if quanted_hidden_states is not None and scale is not None
             else None
         )
+        transport_x_and_scale_quanted = None
+        if use_int8_allgatherv:
+            from vllm_hcu.patch.worker.framework_opt.patch_agrs_int8 import (
+                _quantize_hidden_states,
+            )
+
+            transport_x_and_scale_quanted = _quantize_hidden_states(
+                hidden_states
+            )
+            if (
+                self._shared_experts is not None
+                and self._shared_experts._layer_supports_x_and_scale_quanted()
+            ):
+                shared_experts_x_and_scale_quanted = (
+                    transport_x_and_scale_quanted
+                )
+
+        # Sync aux and main stream for shared expert multi-stream overlap.
         self._maybe_sync_shared_experts_stream(
             shared_experts_input,
             x_and_scale_quanted=shared_experts_x_and_scale_quanted,
@@ -1368,7 +1389,7 @@ class MoERunner(MoERunnerInterface):
             # code will probably remain
             num_local_tokens = hidden_states.shape[0]
             dispatch_output_dtype = None
-            if self._use_int8_allgatherv_dispatch(hidden_states):
+            if use_int8_allgatherv:
                 if router_logits is None:
                     raise RuntimeError(
                         "INT8 AllGatherv dispatch requires router logits"
@@ -1384,7 +1405,7 @@ class MoERunner(MoERunnerInterface):
                     int8_transport,
                 )
 
-                with int8_transport():
+                with int8_transport(transport_x_and_scale_quanted):
                     result = get_ep_group().dispatch(
                         hidden_states,
                         topk_weights,
