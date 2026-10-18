@@ -1,10 +1,11 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright (c) 2026 Hygon Information Technology Co., Ltd.
-"""Use dense varlen FlashAttention for Qwen4Exp prefill-only steps.
+"""Use dense varlen FlashAttention for context-free Qwen4Exp prefill.
 
 QSA side-cache updates remain owned by the upstream indexer.  Only its top-k
-selection and the sparse main-attention reader are bypassed during prefill.
-Decode, speculative decode, and mixed batches retain the existing QSA path.
+selection and the sparse main-attention reader are bypassed when every request
+has no cached history. Decode, speculative decode, mixed batches, and
+prefix/chunked prefill retain the existing QSA path.
 """
 
 from __future__ import annotations
@@ -57,9 +58,6 @@ _METADATA_BUILD_WRAPPER = "_vllm_hcu_qsa_dense_prefill_metadata_build"
 _STEP_ATTR = "_vllm_hcu_qsa_dense_prefill_step"
 _SELECTION_SKIPPED_ATTR = "_vllm_hcu_qsa_selection_skipped"
 _CONTEXT_FREE_PREFILL_ATTR = "_vllm_hcu_qsa_context_free_prefill"
-_HISTORY_DENSE_SAFE_ATTR = "_vllm_hcu_qsa_history_dense_safe"
-_MAX_HISTORY_WORKSPACE_AMPLIFICATION = 4
-_MAX_HISTORY_WORKSPACE_BYTES = 1 << 30
 _RUNTIME_ENABLED = henvs.qsa_dense_prefill_enabled()
 
 
@@ -109,97 +107,14 @@ def _can_skip_qsa_selection(metadata) -> bool:
     )
 
 
-def _history_workspace_fits(impl, attn_metadata) -> bool:
-    if not bool(getattr(attn_metadata, _HISTORY_DENSE_SAFE_ATTR, False)):
-        return False
-    num_reqs = int(attn_metadata.seq_lens.shape[0])
-    num_slots = num_reqs * int(attn_metadata.max_seq_len)
-    bytes_per_element = 1 if impl.kv_cache_dtype.startswith("fp8") else 2
-    # K and V gathers coexist. FP8 history additionally materializes BF16
-    # dequantized K and V before the native attention call.
-    bytes_per_channel = 2 * bytes_per_element
-    if impl.kv_cache_dtype.startswith("fp8"):
-        bytes_per_channel += 2 * torch.bfloat16.itemsize
-    workspace_bytes = (
-        num_slots
-        * int(impl.num_kv_heads)
-        * int(impl.head_size)
-        * bytes_per_channel
-    )
-    return workspace_bytes <= _MAX_HISTORY_WORKSPACE_BYTES
-
-
 @lru_cache(maxsize=1)
 def _load_dense_flash_attention_symbols():
     from vllm_hcu.v1.attention.backends.fa_utils import (
         flash_attn_varlen_func,
-        flash_attn_varlen_fixed_stride_func,
         get_flash_attn_version,
     )
 
-    return (
-        flash_attn_varlen_func,
-        flash_attn_varlen_fixed_stride_func,
-        get_flash_attn_version,
-    )
-
-
-def _gather_paged_kv_fixed_stride(
-    kv_cache: torch.Tensor,
-    block_table: torch.Tensor,
-    seq_lens: torch.Tensor,
-    max_seq_len: int,
-) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
-    """Gather manager pages without dynamic output shapes.
-
-    Each request owns ``max_seq_len`` rows in the returned tensor. Padding
-    rows repeat the request's last valid token and are excluded by
-    ``seqused_k`` in FlashAttention. This keeps allocations and addresses
-    stable for piecewise/full graph capture while avoiding reads through
-    unused block-table entries.
-    """
-
-    if kv_cache.ndim != 4:
-        raise ValueError(
-            "QSA main KV cache must be [blocks, heads, tokens, channels], "
-            f"got {tuple(kv_cache.shape)}"
-        )
-    if max_seq_len <= 0:
-        raise ValueError(f"max_seq_len must be positive, got {max_seq_len}")
-
-    num_reqs = seq_lens.shape[0]
-    block_size = kv_cache.shape[2]
-    token_positions = torch.arange(
-        max_seq_len,
-        dtype=torch.int64,
-        device=seq_lens.device,
-    ).unsqueeze(0)
-    # Prefill requests have at least one live token. Clamp defensively so a
-    # zero-length padded row still performs an in-bounds, subsequently masked
-    # read rather than indexing an unused page.
-    last_positions = seq_lens[:num_reqs].to(torch.int64).clamp_min(1).unsqueeze(1) - 1
-    safe_positions = torch.minimum(token_positions, last_positions)
-    block_columns = torch.div(safe_positions, block_size, rounding_mode="floor")
-    block_ids = torch.gather(
-        block_table[:num_reqs].to(torch.int64),
-        1,
-        block_columns,
-    )
-    offsets = torch.remainder(safe_positions, block_size)
-
-    # QSA's bound cache is [block, head, token, 2 * head_size]. Split before
-    # advanced indexing so the gather produces contiguous K and V tensors
-    # directly instead of a combined temporary followed by two copies.
-    token_major_cache = kv_cache.transpose(1, 2)
-    key_cache, value_cache = token_major_cache.chunk(2, dim=-1)
-    dense_key = key_cache[block_ids, offsets].flatten(0, 1)
-    dense_value = value_cache[block_ids, offsets].flatten(0, 1)
-    cu_seqlens_k = torch.arange(
-        num_reqs + 1,
-        dtype=torch.int32,
-        device=seq_lens.device,
-    ) * max_seq_len
-    return dense_key, dense_value, cu_seqlens_k
+    return flash_attn_varlen_func, get_flash_attn_version
 
 
 def run_qsa_dense_varlen_prefill(
@@ -214,7 +129,7 @@ def run_qsa_dense_varlen_prefill(
     output_scale: torch.Tensor | None = None,
     output_block_scale: torch.Tensor | None = None,
 ) -> torch.Tensor:
-    """Run dense varlen attention from current or paged Qwen4Exp K/V."""
+    """Run dense varlen attention from current context-free Qwen4Exp K/V."""
 
     if output_scale is not None or output_block_scale is not None:
         raise NotImplementedError(
@@ -234,94 +149,45 @@ def run_qsa_dense_varlen_prefill(
     if num_tokens == 0:
         return output
 
-    (
-        flash_attn_varlen_func,
-        flash_attn_varlen_fixed_stride_func,
-        get_flash_attn_version,
-    ) = _load_dense_flash_attention_symbols()
     context_free = bool(
         getattr(attn_metadata, _CONTEXT_FREE_PREFILL_ATTR, False)
     )
-    if context_free:
-        dense_key = key[:num_tokens]
-        dense_value = value[:num_tokens]
-        cu_seqlens_k = attn_metadata.query_start_loc
-        seqused_k = None
-        max_seqlen_k = attn_metadata.max_query_len
-        block_table = None
-        k_descale = None
-        v_descale = None
-        attention_func = flash_attn_varlen_func
-        logger.info_once(
-            "Qwen4Exp QSA routing: context-free prefill uses current BF16 "
-            "K/V with dense varlen FlashAttention",
-            scope="local",
+    if not context_free:
+        raise RuntimeError(
+            "QSA dense varlen prefill requires a context-free batch"
         )
-    else:
-        dense_key, dense_value, cu_seqlens_k = _gather_paged_kv_fixed_stride(
-            kv_cache,
-            attn_metadata.block_table,
-            attn_metadata.seq_lens,
-            attn_metadata.max_seq_len,
-        )
-        if impl.kv_cache_dtype in ("fp8", "fp8_e4m3"):
-            dense_key = (
-                dense_key.view(torch.float8_e4m3fn).to(query.dtype)
-                * layer._k_scale
-            ).to(query.dtype)
-            dense_value = (
-                dense_value.view(torch.float8_e4m3fn).to(query.dtype)
-                * layer._v_scale
-            ).to(query.dtype)
-        elif impl.kv_cache_dtype == "fp8_e5m2":
-            dense_key = (
-                dense_key.view(torch.float8_e5m2).to(query.dtype)
-                * layer._k_scale
-            ).to(query.dtype)
-            dense_value = (
-                dense_value.view(torch.float8_e5m2).to(query.dtype)
-                * layer._v_scale
-            ).to(query.dtype)
-        elif impl.kv_cache_dtype not in ("auto", "bfloat16"):
-            raise NotImplementedError(
-                "QSA dense history prefill does not support KV cache dtype "
-                f"{impl.kv_cache_dtype}"
-            )
-        seqused_k = attn_metadata.seq_lens
-        max_seqlen_k = attn_metadata.max_seq_len
-        block_table = None
-        k_descale = None
-        v_descale = None
-        attention_func = flash_attn_varlen_fixed_stride_func
-        logger.info_once(
-            "Qwen4Exp QSA routing: prefix/chunked prefill gathers manager "
-            "pages into contiguous K/V for dense varlen FlashAttention; "
-            "decode remains QSA",
-            scope="local",
-        )
-    attention_func(
+    flash_attn_varlen_func, get_flash_attn_version = (
+        _load_dense_flash_attention_symbols()
+    )
+    del layer, kv_cache
+    logger.info_once(
+        "Qwen4Exp QSA routing: context-free prefill uses current BF16 "
+        "K/V with dense varlen FlashAttention",
+        scope="local",
+    )
+    flash_attn_varlen_func(
         q=query[:num_tokens],
-        k=dense_key,
-        v=dense_value,
+        k=key[:num_tokens],
+        v=value[:num_tokens],
         out=output[:num_tokens],
         cu_seqlens_q=attn_metadata.query_start_loc,
-        cu_seqlens_k=cu_seqlens_k,
+        cu_seqlens_k=attn_metadata.query_start_loc,
         max_seqlen_q=attn_metadata.max_query_len,
-        seqused_k=seqused_k,
-        max_seqlen_k=max_seqlen_k,
+        seqused_k=None,
+        max_seqlen_k=attn_metadata.max_query_len,
         softmax_scale=impl.scale,
         causal=attn_metadata.causal,
         alibi_slopes=impl.alibi_slopes,
         window_size=[-1, -1],
-        block_table=block_table,
+        block_table=None,
         softcap=impl.logits_soft_cap,
         scheduler_metadata=None,
         # QSA constructs the official vLLM implementation, whose ROCm
         # version probe is unset. Resolve against the HCU vendor wheel here.
         fa_version=get_flash_attn_version(),
         q_descale=None,
-        k_descale=k_descale,
-        v_descale=v_descale,
+        k_descale=None,
+        v_descale=None,
         s_aux=impl.sinks,
     )
     return output
@@ -440,7 +306,6 @@ def apply_to_module(module: ModuleType) -> bool:
         if seq_lens_cpu is None:
             seq_lens_cpu = getattr(common_attn_metadata, "_seq_lens_cpu", None)
         context_free = False
-        history_dense_safe = False
         if seq_lens_cpu is not None:
             num_reqs = int(common_attn_metadata.num_reqs)
             query_lens_cpu = torch.diff(
@@ -450,18 +315,7 @@ def apply_to_module(module: ModuleType) -> bool:
                 seq_lens_cpu[:num_reqs],
                 query_lens_cpu,
             )
-            if not context_free:
-                live_kv_tokens = int(
-                    seq_lens_cpu[:num_reqs].to(torch.int64).sum().item()
-                )
-                fixed_stride_tokens = num_reqs * int(metadata.max_seq_len)
-                history_dense_safe = (
-                    live_kv_tokens > 0
-                    and fixed_stride_tokens
-                    <= _MAX_HISTORY_WORKSPACE_AMPLIFICATION * live_kv_tokens
-                )
         setattr(metadata, _CONTEXT_FREE_PREFILL_ATTR, context_free)
-        setattr(metadata, _HISTORY_DENSE_SAFE_ATTR, history_dense_safe)
         return metadata
 
     @functools.wraps(original_indexer_forward)
@@ -507,13 +361,15 @@ def apply_to_module(module: ModuleType) -> bool:
             getattr(attn_metadata, _CONTEXT_FREE_PREFILL_ATTR, False)
             or getattr(layer.indexer, _SELECTION_SKIPPED_ATTR, False)
         )
-        history_workspace_fits = _history_workspace_fits(self, attn_metadata)
-        if not dense_prefill or not (context_free or history_workspace_fits):
+        # The vendor non-paged varlen ABI faults when batched history uses
+        # fixed-stride K/V segments together with per-request seqused_k. Keep
+        # prefix/chunked prefill on QSA until that native contract is supported.
+        if not dense_prefill or not context_free:
             if dense_prefill and not context_free:
                 logger.info_once(
                     "Qwen4Exp QSA routing: prefix/chunked prefill remains QSA "
-                    "because fixed-stride dense K/V would exceed the history "
-                    "workspace safety limit",
+                    "because vendor fixed-stride varlen attention is unsafe "
+                    "for batched history",
                     scope="local",
                 )
             return original_attention_forward(

@@ -159,10 +159,10 @@ def test_pure_prefill_skips_qsa_selection_and_uses_dense_varlen(
     assert torch.all(output == 9)
 
 
-def test_prefill_with_safe_history_keeps_selection_and_uses_dense_varlen(
+def test_prefill_with_history_keeps_qsa_to_avoid_multisequence_vmfault(
     monkeypatch: pytest.MonkeyPatch,
 ):
-    """Catch regressions that route prefix/chunked prefill back to QSA."""
+    """The vendor fixed-stride varlen ABI faults for batched history."""
 
     module = _module()
     dense_calls = []
@@ -176,39 +176,38 @@ def test_prefill_with_safe_history_keeps_selection_and_uses_dense_varlen(
     indexer = module.QSAIndexer()
     indexer.metadata = _side_metadata(
         decode_tokens=0,
-        prefill_tokens=4,
+        prefill_tokens=8,
         max_query_len=4,
         max_seq_len=8,
     )
-    topk = torch.empty(4, indexer.output_width, dtype=torch.int32)
-    selected = indexer.forward(torch.empty(4, 2), torch.empty(4), topk)
+    topk = torch.empty(8, indexer.output_width, dtype=torch.int32)
+    selected = indexer.forward(torch.empty(8, 2), torch.empty(8), topk)
 
     impl = module.Qwen4ExpQSAFlashAttentionImpl()
     layer = SimpleNamespace(indexer=indexer)
-    output = torch.empty(4, 2)
+    output = torch.empty(8, 2)
     result = impl.forward_qsa(
         layer,
-        torch.empty(4, 2),
-        torch.empty(4, 2),
-        torch.empty(4, 2),
+        torch.empty(8, 2),
+        torch.empty(8, 2),
+        torch.empty(8, 2),
         torch.empty(1),
         SimpleNamespace(
-            num_actual_tokens=4,
-            seq_lens=torch.tensor([8], dtype=torch.int32),
+            num_actual_tokens=8,
+            seq_lens=torch.tensor([8, 8], dtype=torch.int32),
             max_seq_len=8,
             _vllm_hcu_qsa_context_free_prefill=False,
-            _vllm_hcu_qsa_history_dense_safe=True,
         ),
         output,
-        torch.empty(4, dtype=torch.int32),
+        torch.empty(8, dtype=torch.int32),
     )
 
     assert selected is topk
     assert indexer.select_calls == 1
-    assert len(dense_calls) == 1
-    assert not hasattr(impl, "qsa_calls")
+    assert dense_calls == []
+    assert impl.qsa_calls == 1
     assert result is output
-    assert torch.all(output == 9)
+    assert torch.all(output == 5)
 
 
 def test_prefill_with_unsafe_history_falls_back_to_qsa(
@@ -246,7 +245,6 @@ def test_prefill_with_unsafe_history_falls_back_to_qsa(
             seq_lens=torch.tensor([32768] + [1] * 31, dtype=torch.int32),
             max_seq_len=32768,
             _vllm_hcu_qsa_context_free_prefill=False,
-            _vllm_hcu_qsa_history_dense_safe=False,
         ),
         output,
         torch.empty(4, dtype=torch.int32),
@@ -385,7 +383,6 @@ def test_metadata_builder_checks_context_for_every_prefill_request():
     assert (
         getattr(metadata, "_vllm_hcu_qsa_context_free_prefill", None) is False
     )
-    assert getattr(metadata, "_vllm_hcu_qsa_history_dense_safe", None) is True
 
     no_context = SimpleNamespace(
         num_reqs=2,
@@ -397,7 +394,6 @@ def test_metadata_builder_checks_context_for_every_prefill_request():
     assert (
         getattr(metadata, "_vllm_hcu_qsa_context_free_prefill", None) is True
     )
-    assert getattr(metadata, "_vllm_hcu_qsa_history_dense_safe", None) is False
 
     ragged_lens = torch.tensor([100] + [1] * 7, dtype=torch.int32)
     highly_ragged = SimpleNamespace(
@@ -410,22 +406,6 @@ def test_metadata_builder_checks_context_for_every_prefill_request():
     assert (
         getattr(metadata, "_vllm_hcu_qsa_context_free_prefill", None) is False
     )
-    assert getattr(metadata, "_vllm_hcu_qsa_history_dense_safe", None) is False
-
-
-def test_history_workspace_has_absolute_byte_cap():
-    impl = SimpleNamespace(
-        kv_cache_dtype="fp8_e5m2",
-        num_kv_heads=8,
-        head_size=128,
-    )
-    metadata = SimpleNamespace(
-        seq_lens=torch.empty(256, dtype=torch.int32),
-        max_seq_len=32768,
-        _vllm_hcu_qsa_history_dense_safe=True,
-    )
-
-    assert not dense_prefill_patch._history_workspace_fits(impl, metadata)
 
 
 @pytest.mark.parametrize("cache_dtype", ["auto", "fp8_e5m2"])
@@ -442,11 +422,7 @@ def test_dense_varlen_uses_current_bf16_kv_for_context_free_prefill(
     monkeypatch.setattr(
         dense_prefill_patch,
         "_load_dense_flash_attention_symbols",
-        lambda: (
-            fake_flash_attn_varlen_func,
-            fake_flash_attn_varlen_func,
-            lambda: 2,
-        ),
+        lambda: (fake_flash_attn_varlen_func, lambda: 2),
     )
     impl = SimpleNamespace(
         alibi_slopes=None,
@@ -515,25 +491,7 @@ def test_dense_varlen_uses_current_bf16_kv_for_context_free_prefill(
     assert torch.all(output[3:] == 0)
 
 
-def test_dense_varlen_gathers_history_when_global_maxima_match(
-    monkeypatch: pytest.MonkeyPatch,
-):
-    """A shorter request's prefix must not be dropped by global max equality."""
-
-    calls = []
-
-    def fake_flash_attn_varlen_func(**kwargs):
-        calls.append(kwargs)
-
-    monkeypatch.setattr(
-        dense_prefill_patch,
-        "_load_dense_flash_attention_symbols",
-        lambda: (
-            fake_flash_attn_varlen_func,
-            fake_flash_attn_varlen_func,
-            lambda: 2,
-        ),
-    )
+def test_dense_varlen_rejects_prefill_with_history():
     impl = SimpleNamespace(
         alibi_slopes=None,
         sinks=None,
@@ -542,10 +500,6 @@ def test_dense_varlen_gathers_history_when_global_maxima_match(
         kv_cache_dtype="auto",
         scale=0.5,
         logits_soft_cap=0.0,
-    )
-    layer = SimpleNamespace(
-        _k_scale=torch.tensor(1.0),
-        _v_scale=torch.tensor(1.0),
     )
     metadata = SimpleNamespace(
         num_actual_tokens=4,
@@ -561,133 +515,17 @@ def test_dense_varlen_gathers_history_when_global_maxima_match(
     current_key = torch.full((4, 1, 4), 9, dtype=torch.bfloat16)
     current_value = torch.full((4, 1, 4), 10, dtype=torch.bfloat16)
     kv_cache = torch.empty(2, 1, 4, 8, dtype=torch.bfloat16)
-    kv_cache[0, :, :, :4].fill_(1)
-    kv_cache[0, :, :, 4:].fill_(2)
-    kv_cache[1, :, :, :4].fill_(3)
-    kv_cache[1, :, :, 4:].fill_(4)
-
-    dense_prefill_patch.run_qsa_dense_varlen_prefill(
-        impl,
-        layer,
-        query,
-        current_key,
-        current_value,
-        kv_cache,
-        metadata,
-        torch.empty_like(query),
-    )
-
-    assert len(calls) == 1
-    call = calls[0]
-    assert call["k"].shape == (6, 1, 4)
-    assert call["k"].data_ptr() != current_key.data_ptr()
-    assert call["v"].data_ptr() != current_value.data_ptr()
-    assert torch.all(call["k"][:3] == 1)
-    assert torch.all(call["k"][3:] == 3)
-    assert torch.all(call["v"][:3] == 2)
-    assert torch.all(call["v"][3:] == 4)
-    assert call["seqused_k"] is metadata.seq_lens
-    assert torch.equal(
-        call["seqused_k"], torch.tensor([3, 2], dtype=torch.int32)
-    )
-
-
-def test_dense_varlen_gathers_e5m2_cache_for_prefill_with_history(
-    monkeypatch: pytest.MonkeyPatch,
-):
-    """Catch dropping cached prefix tokens or applying the wrong FP8 scale."""
-
-    calls = []
-
-    def fake_flash_attn_varlen_func(**kwargs):
-        calls.append(kwargs)
-        kwargs["out"].fill_(13)
-
-    monkeypatch.setattr(
-        dense_prefill_patch,
-        "_load_dense_flash_attention_symbols",
-        lambda: (
-            fake_flash_attn_varlen_func,
-            fake_flash_attn_varlen_func,
-            lambda: 2,
-        ),
-    )
-    impl = SimpleNamespace(
-        alibi_slopes=None,
-        sinks=None,
-        sliding_window=(-1, -1),
-        head_size=4,
-        kv_cache_dtype="fp8_e5m2",
-        num_kv_heads=1,
-        supports_quant_query_input=False,
-        scale=0.5,
-        logits_soft_cap=0.0,
-        vllm_flash_attn_version=2,
-    )
-    layer = SimpleNamespace(
-        _q_scale=torch.tensor(1.0),
-        _k_scale=torch.tensor(2.0),
-        _v_scale=torch.tensor(3.0),
-    )
-    metadata = SimpleNamespace(
-        num_actual_tokens=3,
-        query_start_loc=torch.tensor([0, 3], dtype=torch.int32),
-        max_query_len=3,
-        seq_lens=torch.tensor([8], dtype=torch.int32),
-        max_seq_len=8,
-        causal=True,
-        block_table=torch.tensor([[0]], dtype=torch.int32),
-        use_cascade=False,
-        scheduler_metadata=None,
-    )
-    query = torch.zeros(4, 2, 4, dtype=torch.bfloat16)
-    current_key = torch.full((4, 1, 4), 2, dtype=torch.bfloat16)
-    current_value = torch.full((4, 1, 4), 3, dtype=torch.bfloat16)
-    kv_cache = torch.zeros(2, 1, 4, 8, dtype=torch.uint8)
-    one = torch.tensor(1.0, dtype=torch.float8_e5m2).view(torch.uint8).item()
-    two = torch.tensor(2.0, dtype=torch.float8_e5m2).view(torch.uint8).item()
-    kv_cache[0].fill_(one)
-    kv_cache[1].fill_(two)
-    metadata.block_table = torch.tensor([[1, 0]], dtype=torch.int32)
-    output = torch.full((4, 2, 4), -1, dtype=torch.bfloat16)
-
-    result = dense_prefill_patch.run_qsa_dense_varlen_prefill(
-        impl,
-        layer,
-        query,
-        current_key,
-        current_value,
-        kv_cache,
-        metadata,
-        output,
-    )
-
-    assert result is output
-    assert len(calls) == 1
-    call = calls[0]
-    assert call["q"].shape == (3, 2, 4)
-    assert call["k"].dtype == torch.bfloat16
-    assert call["v"].dtype == torch.bfloat16
-    assert call["k"].shape == (8, 1, 4)
-    assert call["v"].shape == (8, 1, 4)
-    assert call["k"].data_ptr() != kv_cache.data_ptr()
-    assert call["k"].data_ptr() != current_key.data_ptr()
-    assert call["v"].data_ptr() != current_value.data_ptr()
-    assert call["block_table"] is None
-    assert call["seqused_k"] is metadata.seq_lens
-    assert torch.equal(
-        call["cu_seqlens_k"], torch.tensor([0, 8], dtype=torch.int32)
-    )
-    assert call["max_seqlen_k"] == 8
-    assert call["q_descale"] is None
-    assert call["k_descale"] is None
-    assert call["v_descale"] is None
-    assert torch.all(call["k"][:4] == 4.0)
-    assert torch.all(call["k"][4:] == 2.0)
-    assert torch.all(call["v"][:4] == 6.0)
-    assert torch.all(call["v"][4:] == 3.0)
-    assert torch.all(output[:3] == 13)
-    assert torch.all(output[3:] == 0)
+    with pytest.raises(RuntimeError, match="requires a context-free batch"):
+        dense_prefill_patch.run_qsa_dense_varlen_prefill(
+            impl,
+            SimpleNamespace(),
+            query,
+            current_key,
+            current_value,
+            kv_cache,
+            metadata,
+            torch.empty_like(query),
+        )
 
 
 @pytest.mark.hcu

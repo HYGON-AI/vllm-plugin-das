@@ -1837,52 +1837,6 @@ def test_flash_attention_long_chunked_prefill_uses_vendor_paged_gather(
             assert native is original
 
 
-def test_fixed_stride_varlen_forwards_actual_k_lengths_to_native_abi(
-    monkeypatch: pytest.MonkeyPatch,
-) -> None:
-    fa_utils, _ = _load_hcu_fa_utils_module(
-        monkeypatch,
-        kv_cache_layout="NHD",
-    )
-    calls = []
-
-    def native_varlen(*args):
-        calls.append(args)
-        return (args[3],)
-
-    monkeypatch.setattr(fa_utils.flash_attn_2_cuda, "varlen_fwd", native_varlen)
-    query = torch.zeros((3, 4, 64), dtype=torch.bfloat16)
-    key = torch.zeros((10, 2, 64), dtype=torch.bfloat16)
-    value = torch.zeros_like(key)
-    output = torch.empty_like(query)
-    cu_seqlens_q = torch.tensor([0, 2, 3], dtype=torch.int32)
-    fixed_stride_offsets = torch.tensor([0, 5, 10], dtype=torch.int32)
-    actual_k_lengths = torch.tensor([5, 3], dtype=torch.int32)
-
-    result = fa_utils.flash_attn_varlen_fixed_stride_func(
-        q=query,
-        k=key,
-        v=value,
-        out=output,
-        cu_seqlens_q=cu_seqlens_q,
-        cu_seqlens_k=fixed_stride_offsets,
-        max_seqlen_q=2,
-        seqused_k=actual_k_lengths,
-        max_seqlen_k=5,
-        softmax_scale=0.125,
-        causal=True,
-    )
-
-    assert result is output
-    assert len(calls) == 1
-    native = calls[0]
-    assert native[4] is cu_seqlens_q
-    assert native[5] is fixed_stride_offsets
-    assert native[6] is actual_k_lengths
-    assert native[8] is None
-    assert native[10:12] == (2, 5)
-
-
 @pytest.mark.parametrize(
     ("cache_dtype", "expected_query_dtype"),
     [("fp8_e5m2", torch.bfloat16), ("fp8_e4m3", torch.float8_e4m3fn)],
