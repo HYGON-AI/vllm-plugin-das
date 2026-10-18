@@ -22,6 +22,7 @@ if TYPE_CHECKING:
     VLLM_HCU_USE_CUSTOM_OPS : bool = False
     VLLM_HCU_GLM53_ROUTER_GEMV: bool = True
     VLLM_HCU_QSA_BACKEND: str = "cutlass"
+    VLLM_HCU_QSA_PREFILL_INDEXER: bool = False
     VLLM_HCU_USE_CUSTOM_SILU_AND_MUL : bool = False
     VLLM_HCU_USE_CUSTOM_GEMMA_RMS_NORM : bool = False
     VLLM_HCU_USE_SKIP_WEIGHT_DEBUG : bool = False
@@ -138,6 +139,16 @@ def qwen4_exp_hc_sp_enabled() -> bool:
 
     return optional_custom_op_enabled(
         _environment_flag(os.environ.get("VLLM_HCU_QWEN4_EXP_HC_SP", "True"))
+    )
+
+
+def qsa_prefill_indexer_enabled() -> bool:
+    """Resolve the QSA prefill indexer under the custom-op master switch."""
+
+    return optional_custom_op_enabled(
+        _environment_flag(
+            os.environ.get("VLLM_HCU_QSA_PREFILL_INDEXER", "False")
+        )
     )
 
 
@@ -340,6 +351,10 @@ hcu_vllm_environment_variables: dict[str, Callable[[], Any]] = {
     # cache dtype and uses its dedicated reader/writer independently.
     "VLLM_HCU_QSA_BACKEND":
     lambda: os.environ.get("VLLM_HCU_QSA_BACKEND", "cutlass").strip().lower(),
+    # Use the request-major score kernel for prefill-only QSA selection.
+    # Decode/spec-decode and mixed batches preserve their existing backend.
+    "VLLM_HCU_QSA_PREFILL_INDEXER":
+    qsa_prefill_indexer_enabled,
     # If set, control hcu custom silu and mul op
     "VLLM_HCU_USE_CUSTOM_SILU_AND_MUL":
     lambda: (os.environ.get("VLLM_HCU_USE_CUSTOM_SILU_AND_MUL", "True").lower() in

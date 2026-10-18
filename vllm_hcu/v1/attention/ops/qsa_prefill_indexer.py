@@ -13,6 +13,7 @@ from vllm.triton_utils import HAS_TRITON, tl, triton
 _TILE_R = 64
 _BLOCK_N = 64
 _K_TILES = 16
+_LOGITS_WORKSPACE_BYTES = 128 * 1024 * 1024
 
 
 @triton.jit(do_not_specialize=["num_rows", "query_offset"])
@@ -265,5 +266,86 @@ def qsa_mqa_paged_prefill(
     return logits
 
 
-__all__ = ["qsa_mqa_paged_prefill"]
+def qsa_select_paged_prefill(
+    q: torch.Tensor,
+    k_cache: torch.Tensor,
+    page_table: torch.Tensor,
+    query_start_loc: torch.Tensor,
+    visible_blocks: torch.Tensor,
+    logical_positions: torch.Tensor,
+    token_to_req: torch.Tensor,
+    sequence_lengths: torch.Tensor,
+    token_topk: int,
+    compress_ratio: int,
+    max_query_len: int,
+    out: torch.Tensor | None = None,
+) -> torch.Tensor:
+    """Select and expand indices while bounding the temporary score matrix."""
 
+    from vllm import _custom_ops as ops
+    from vllm.models.qwen4_exp.amd.ops.qsa import (
+        expand_qsa_block_indices_cuda,
+    )
+
+    rows = q.shape[0]
+    if compress_ratio <= 0 or token_topk <= 0 or token_topk % compress_ratio:
+        raise ValueError("QSA token top-k must be positive and divisible by ratio")
+    output_width = token_topk + compress_ratio - 1
+    if out is None:
+        out = torch.empty(
+            (rows, output_width),
+            dtype=torch.int32,
+            device=q.device,
+        )
+    elif out.shape != (rows, output_width):
+        raise ValueError("QSA selection output has an invalid shape")
+    if not rows:
+        return out
+
+    columns = page_table.shape[1] * k_cache.shape[1]
+    chunks = _prefill_chunks(rows, columns, _LOGITS_WORKSPACE_BYTES)
+    max_chunk_rows = max(end - start for start, end in chunks)
+    block_topk = token_topk // compress_ratio
+    blocks_buffer = torch.empty(
+        (max_chunk_rows, block_topk),
+        dtype=torch.int32,
+        device=q.device,
+    )
+    for row_start, row_end in chunks:
+        row_slice = slice(row_start, row_end)
+        logits = qsa_mqa_paged_prefill(
+            q,
+            k_cache,
+            page_table,
+            query_start_loc,
+            visible_blocks,
+            max_query_len,
+            query_offset=row_start,
+            num_queries=row_end - row_start,
+        )
+        visible = visible_blocks[row_slice]
+        blocks = blocks_buffer[: row_end - row_start]
+        ops.top_k_per_row_decode(
+            logits,
+            1,
+            visible,
+            blocks,
+            blocks.shape[0],
+            logits.stride(0),
+            logits.stride(1),
+            block_topk,
+        )
+        expand_qsa_block_indices_cuda(
+            blocks,
+            logical_positions[row_slice],
+            sequence_lengths,
+            token_to_req[row_slice],
+            compress_ratio,
+            token_topk,
+            out[row_slice],
+        )
+        del logits
+    return out
+
+
+__all__ = ["qsa_mqa_paged_prefill", "qsa_select_paged_prefill"]

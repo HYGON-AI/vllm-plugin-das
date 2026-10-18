@@ -21,6 +21,7 @@ import torch
 from vllm_hcu.patch.config import HcuFeatureConfig
 from vllm_hcu.patch.import_coordinator import ExactImportCoordinator
 from vllm_hcu.patch.runtime_state import PatchRegistry
+from vllm_hcu.patch.worker.op_opt import patch_qwen4_exp_qsa_prefill_indexer
 from vllm_hcu.v1 import worker_framework_runtime
 from vllm_hcu.patch.worker.framework_opt import (
     patch_all2all,
@@ -105,6 +106,40 @@ def _module(name: str, **attributes: object) -> ModuleType:
 def _config(**updates: object) -> SimpleNamespace:
     values = HcuFeatureConfig(**updates).to_dict()
     return SimpleNamespace(additional_config={"hcu": values})
+
+
+def test_worker_initialization_latches_qsa_prefill_indexer_policy(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    import vllm_hcu.patch.platform as platform_patch
+    import vllm_hcu.patch.worker as worker_patch
+
+    config = _config(qsa_prefill_indexer=True)
+    config.parallel_config = None
+    monkeypatch.setattr(worker_patch, "ensure_vllm_compatible", lambda: None)
+    monkeypatch.setattr(platform_patch, "apply_platform_patches", lambda: None)
+    monkeypatch.setattr(worker_patch, "set_process_role", lambda role: None)
+    monkeypatch.setattr(
+        worker_patch,
+        "_bind_deserialized_hcu_config",
+        lambda value: HcuFeatureConfig(qsa_prefill_indexer=True),
+    )
+    monkeypatch.setattr(worker_patch, "prepare_worker_patches", lambda: None)
+    monkeypatch.setattr(worker_patch, "_feature_states", lambda *args: {})
+    monkeypatch.setattr(worker_patch, "_patch_features", lambda: {})
+    monkeypatch.setattr(
+        worker_patch,
+        "_raise_latched_or_required_failures",
+        lambda coordinator: None,
+    )
+
+    worker_patch.apply_worker_patches(config)
+
+    assert getattr(
+        patch_qwen4_exp_qsa_prefill_indexer,
+        "_enabled",
+        lambda: False,
+    )()
 
 
 def _should_share(eagle, flag, draft, target):

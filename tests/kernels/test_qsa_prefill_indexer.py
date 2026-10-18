@@ -12,6 +12,7 @@ import torch
 from vllm_hcu.v1.attention.ops.qsa_prefill_indexer import (
     _prefill_chunks,
     qsa_mqa_paged_prefill,
+    qsa_select_paged_prefill,
 )
 
 
@@ -54,9 +55,9 @@ def _case(*, batch: int, query_len: int, prefix_len: int):
         dtype=torch.int32,
         device=device,
     )
-    token_to_req = torch.arange(batch, device=device, dtype=torch.int32).repeat_interleave(
-        query_len
-    )
+    token_to_req = torch.arange(
+        batch, device=device, dtype=torch.int32
+    ).repeat_interleave(query_len)
     local_positions = torch.arange(
         prefix_len,
         sequence_len,
@@ -170,6 +171,63 @@ def test_prefill_chunk_offset_keeps_absolute_request_rows():
         visible,
         row_offset=row_offset,
     )
+
+
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="requires HCU GPU")
+def test_prefill_selection_matches_existing_topk_and_expansion():
+    from vllm.models.qwen4_exp.amd.ops.qsa import qsa_select_paged_tokens
+
+    batch, query_len, prefix_len = 2, 128, 128
+    q, cache, table, starts, visible, _ = _case(
+        batch=batch,
+        query_len=query_len,
+        prefix_len=prefix_len,
+    )
+    token_to_req = torch.arange(
+        batch, dtype=torch.int32, device=q.device
+    ).repeat_interleave(query_len)
+    logical_positions = torch.arange(
+        prefix_len,
+        prefix_len + query_len,
+        dtype=torch.int64,
+        device=q.device,
+    ).repeat(batch)
+    sequence_lengths = torch.full(
+        (batch,),
+        prefix_len + query_len,
+        dtype=torch.int32,
+        device=q.device,
+    )
+    token_topk, compress_ratio = 64, 4
+    expected = qsa_select_paged_tokens(
+        q,
+        cache,
+        table,
+        token_to_req,
+        logical_positions,
+        sequence_lengths,
+        token_topk,
+        compress_ratio,
+    )
+    output = torch.empty_like(expected)
+
+    actual = qsa_select_paged_prefill(
+        q,
+        cache,
+        table,
+        starts,
+        visible,
+        logical_positions,
+        token_to_req,
+        sequence_lengths,
+        token_topk,
+        compress_ratio,
+        query_len,
+        output,
+    )
+
+    assert actual is output
+    assert torch.equal(actual, expected)
 
 
 def test_benchmark_contract_covers_required_shapes():

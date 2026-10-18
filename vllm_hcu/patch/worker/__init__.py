@@ -253,6 +253,7 @@ _OP_CALLBACKS: tuple[_CallbackSpec, ...] = (
     _CallbackSpec(_adapter("op_opt", "patch_mla_indexer")),
     _CallbackSpec(_adapter("op_opt", "patch_flashmla_sparse")),
     _CallbackSpec(_adapter("op_opt", "patch_qwen4_exp_qsa_flash_attn")),
+    _CallbackSpec(_adapter("op_opt", "patch_qwen4_exp_qsa_prefill_indexer")),
     _CallbackSpec(_adapter("op_opt", "patch_qwen3_attention")),
     _CallbackSpec(_adapter("op_opt", "patch_fla_chunk_delta_h")),
     _CallbackSpec(_adapter("op_opt", "patch_fla_recompute_w_u")),
@@ -835,6 +836,12 @@ def apply_worker_patches(vllm_config: object | None = None) -> None:
         config = get_hcu_config(vllm_config)
         if HcuFeatureConfig.from_mapping(config.to_dict()) != config:
             raise RuntimeError("HCU feature sidecar failed its worker round-trip check")
+        # Spawned workers consume the already master-gated serialized policy.
+        from .op_opt import patch_qwen4_exp_qsa_prefill_indexer
+
+        patch_qwen4_exp_qsa_prefill_indexer.configure(
+            config.qsa_prefill_indexer
+        )
         if vllm_config is not None:
             if isinstance(vllm_config, dict):
                 parallel_config = vllm_config.get("parallel_config")
