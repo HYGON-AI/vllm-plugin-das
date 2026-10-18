@@ -86,6 +86,7 @@ if TYPE_CHECKING:
     VLLM_HCU_DEEPEP_AUTO_SHARED_WEIGHTS: bool = True
     VLLM_HCU_MOE_WORKSPACE_GROWTH_MB: int = 512
     VLLM_HCU_DEEPEP_HT_EXACT_LAYOUT: bool = True
+    VLLM_HCU_SHARED_EXPERTS_DEEPEP_EPLB_OVERLAP: bool = True
     VLLM_HCU_SHARED_EXPERTS_EARLY_LAUNCH: bool = False
     VLLM_HCU_ENABLE_REQUEST_CUDAGRAPH_BUCKETS: bool = False
     VLLM_HCU_PLE_CPU_OFFLOAD: bool = False
@@ -659,6 +660,12 @@ hcu_vllm_environment_variables: dict[str, Callable[[], Any]] = {
     # DeepEP returns for the received batch, instead of the M*topk upper bound.
     "VLLM_HCU_DEEPEP_HT_EXACT_LAYOUT":
         lambda: _environment_flag(os.getenv("VLLM_HCU_DEEPEP_HT_EXACT_LAYOUT", "1")),
+
+    # Quantized DeepEP + EPLB: launch shared experts on the auxiliary stream
+    # before routing and join only when the shared output is consumed.
+    "VLLM_HCU_SHARED_EXPERTS_DEEPEP_EPLB_OVERLAP":
+        lambda: _environment_flag(
+            os.getenv("VLLM_HCU_SHARED_EXPERTS_DEEPEP_EPLB_OVERLAP", "1")),
 
     # Launch shared_experts on the auxiliary stream before routed MoE/DeepEP,
     # and wait only when the shared output is consumed.
