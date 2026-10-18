@@ -940,10 +940,12 @@ class MoERunner(MoERunnerInterface):
                         "i_q/i_s"
                     )
                 quantized_kwargs = {"i_q": quanted_hidden_states, "i_s": scale}
-                if output_dtype is not None and self._quant_method_accepts_argument(
-                    "output_dtype"
-                ):
-                    quantized_kwargs["output_dtype"] = output_dtype
+                if self._quant_method_accepts_argument("output_dtype"):
+                    quantized_kwargs["output_dtype"] = (
+                        output_dtype
+                        if output_dtype is not None
+                        else hidden_states.dtype
+                    )
                 fused_out = self._quant_method.apply(
                     layer=self.routed_experts,
                     x=hidden_states,
@@ -1361,6 +1363,7 @@ class MoERunner(MoERunnerInterface):
             )
             if (
                 self._shared_experts is not None
+                and shared_experts_input is hidden_states
                 and self._shared_experts._layer_supports_x_and_scale_quanted()
             ):
                 shared_experts_x_and_scale_quanted = (

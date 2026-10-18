@@ -5881,6 +5881,51 @@ def test_moe_runner_and_shared_experts_cold_replacement_contract():
         assert shared is None
         assert torch.equal(output, hidden + 1)
 
+        # Pure-TP callers can supply prequantized activations without taking
+        # the DP AllGatherv branch. The quant method still needs the original
+        # floating output dtype for the expert GEMM result.
+        output_dtype_calls = []
+
+        class PrequantizedOutputDtypeMethod:
+            is_monolithic = False
+
+            def apply(
+                self,
+                layer,
+                x,
+                topk_weights,
+                topk_ids,
+                shared_experts,
+                shared_experts_input,
+                i_q=None,
+                i_s=None,
+                output_dtype=None,
+            ):
+                del (
+                    layer,
+                    topk_weights,
+                    topk_ids,
+                    shared_experts,
+                    shared_experts_input,
+                )
+                assert i_q is quanted and i_s is scale
+                output_dtype_calls.append(output_dtype)
+                return x
+
+        prequantized_hidden = hidden.to(torch.bfloat16)
+        runner.routed_experts.quant_method = PrequantizedOutputDtypeMethod()
+        runner.__dict__.pop("_supports_quanted_inputs", None)
+        runner._apply_quant_method(
+            prequantized_hidden,
+            None,
+            None,
+            quanted_hidden_states=quanted,
+            scale=scale,
+            topk_weights=topk_weights,
+            topk_ids=topk_ids,
+        )
+        assert output_dtype_calls == [torch.bfloat16]
+
         class UnsupportedQuantMethod:
             is_monolithic = False
 
@@ -6001,6 +6046,7 @@ def test_moe_runner_and_shared_experts_cold_replacement_contract():
             def __init__(self):
                 self.output = direct_hidden
                 self.supports_quanted_input = True
+                self.expected_input = direct_hidden
 
             def _layer_supports_x_and_scale_quanted(self):
                 return self.supports_quanted_input
@@ -6012,7 +6058,7 @@ def test_moe_runner_and_shared_experts_cold_replacement_contract():
                 x_and_scale_quanted=None,
             ):
                 del order
-                assert shared_input is direct_hidden
+                assert shared_input is self.expected_input
                 direct_calls.setdefault("shared_quanted_inputs", []).append(
                     x_and_scale_quanted
                 )
@@ -6022,13 +6068,10 @@ def test_moe_runner_and_shared_experts_cold_replacement_contract():
                 shared_input,
                 x_and_scale_quanted=None,
             ):
-                assert shared_input is direct_hidden
-                expected = (
-                    (direct_quanted, direct_scale)
-                    if self.supports_quanted_input
-                    else None
+                assert shared_input is self.expected_input
+                direct_calls.setdefault("shared_sync_quanted_inputs", []).append(
+                    x_and_scale_quanted
                 )
-                assert x_and_scale_quanted == expected
 
         direct_runner = object.__new__(runner_module.MoERunner)
         direct_runner._ep_fused_combine = False
@@ -6073,6 +6116,9 @@ def test_moe_runner_and_shared_experts_cold_replacement_contract():
             (direct_quanted, direct_scale),
             (direct_quanted, direct_scale),
         ]
+        assert direct_calls["shared_sync_quanted_inputs"] == [
+            (direct_quanted, direct_scale)
+        ]
         assert direct_calls["router_hidden"] is direct_hidden
         assert direct_calls["router_logits"] is direct_logits
         expert_input, *expert_payload = direct_calls["expert"]
@@ -6088,11 +6134,29 @@ def test_moe_runner_and_shared_experts_cold_replacement_contract():
 
         direct_runner._shared_experts.supports_quanted_input = False
         direct_calls["shared_quanted_inputs"] = []
+        direct_calls["shared_sync_quanted_inputs"] = []
         direct_output = direct_runner._forward_impl(
             direct_hidden, direct_logits, direct_hidden
         )
         assert direct_output[1].dtype is torch.bfloat16
         assert direct_calls["shared_quanted_inputs"] == [None, None]
+        assert direct_calls["shared_sync_quanted_inputs"] == [None]
+        assert direct_calls["expert"][3:5] == (direct_quanted, direct_scale)
+
+        # A routed-input transform may leave the shared branch on the original
+        # activation. Transport quantization belongs to the routed tensor and
+        # must not be reused for a distinct shared-expert input.
+        distinct_shared_input = direct_hidden.clone()
+        direct_runner._shared_experts.supports_quanted_input = True
+        direct_runner._shared_experts.expected_input = distinct_shared_input
+        direct_calls["shared_quanted_inputs"] = []
+        direct_calls["shared_sync_quanted_inputs"] = []
+        direct_output = direct_runner._forward_impl(
+            direct_hidden, direct_logits, distinct_shared_input
+        )
+        assert direct_output[1].dtype is torch.bfloat16
+        assert direct_calls["shared_quanted_inputs"] == [None, None]
+        assert direct_calls["shared_sync_quanted_inputs"] == [None]
         assert direct_calls["expert"][3:5] == (direct_quanted, direct_scale)
 
         class FallbackGroup:
