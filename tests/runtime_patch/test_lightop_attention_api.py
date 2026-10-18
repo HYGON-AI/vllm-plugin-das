@@ -616,6 +616,75 @@ def test_sparse_mla_boltops_decode_rejects_public_abi_drift(
         resolver.cache_clear()
 
 
+def test_sparse_mla_boltops_decode_resolver_allows_missing_optional_package(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """An absent BoltOps install is a backend miss, not a startup failure."""
+    runtime = _runtime()
+    resolver = runtime._load_boltops_paged_mqa_logits
+    resolver.cache_clear()
+
+    def missing_module(name: str):
+        raise ModuleNotFoundError(
+            f"No module named {name!r}",
+            name=name,
+        )
+
+    monkeypatch.setattr(runtime.importlib, "import_module", missing_module)
+    try:
+        assert resolver() is None
+    finally:
+        resolver.cache_clear()
+
+
+def test_sparse_mla_master_off_missing_boltops_decode_uses_existing_backend(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Master-off decode falls back without re-entering the AITER route."""
+    runtime = _runtime()
+    monkeypatch.setenv("VLLM_HCU_USE_CUSTOM_OPS", "0")
+    monkeypatch.setattr(runtime, "on_gfx938", lambda: False)
+    monkeypatch.setattr(runtime.current_platform, "is_rocm", lambda: True)
+    monkeypatch.setattr(runtime, "_load_boltops_paged_mqa_logits", lambda: None)
+    from vllm._aiter_ops import rocm_aiter_ops
+
+    monkeypatch.setattr(rocm_aiter_ops, "is_enabled", lambda: True)
+    monkeypatch.setattr(
+        runtime,
+        "paged_mqa_logits_module",
+        lambda: pytest.fail("master-off BoltOps fallback queried AITER"),
+    )
+    calls: list[tuple[object, ...]] = []
+    output = object()
+
+    def paged_mqa_logits(*args):
+        calls.append(args)
+        return output
+
+    monkeypatch.setattr(
+        runtime,
+        "_get_lightop_attention",
+        lambda: SimpleNamespace(paged_mqa_logits=paged_mqa_logits),
+    )
+    q = torch.empty((1, 1, 8, 128), dtype=torch.float8_e4m3fn)
+    cache = torch.empty((2, 64, 1, 132), dtype=torch.uint8)
+
+    result = runtime.rocm_fp8_paged_mqa_logits(
+        q,
+        cache,
+        torch.ones((1, 8), dtype=torch.float32),
+        torch.tensor([64], dtype=torch.int32),
+        torch.tensor([[0]], dtype=torch.int32),
+        torch.empty(0),
+        64,
+    )
+
+    assert result is output
+    assert len(calls) == 1
+    assert calls[0][0] is q
+    assert calls[0][1] is cache
+
+
 @pytest.mark.parametrize("abi_change", ("kind", "default", "uninspectable"))
 def test_sparse_mla_boltops_decode_rejects_subtle_public_abi_drift(
     monkeypatch: pytest.MonkeyPatch,

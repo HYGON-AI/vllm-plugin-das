@@ -879,16 +879,6 @@ def prepare_boltops_w4a8_moe(
             "Kimi-K3 SiTU requires the AITER W4A8 MoE implementation"
         )
     _boltops_w4a8_fused_experts()
-    quant_config = getattr(method, "moe_quant_config", None)
-    # SlimQuant stores INT4 values in the high-nibble INT8 scale convention.
-    # BoltOps unpacks each nibble to [-8, 7], so compensate once at post-load
-    # time instead of allocating scaled tensors in every forward.
-    method._hcu_boltops_w4a8_w1_scale = (
-        _required_tensor(quant_config, "w1_scale") * 16.0
-    )
-    method._hcu_boltops_w4a8_w2_scale = (
-        _required_tensor(quant_config, "w2_scale") * 16.0
-    )
     return w1, w2
 
 
@@ -1213,8 +1203,12 @@ def apply_vllm_w4a8_moe(
         )
 
     quant_config = getattr(method, "moe_quant_config", None)
-    w1_scale = _required_tensor(method, "_hcu_boltops_w4a8_w1_scale")
-    w2_scale = _required_tensor(method, "_hcu_boltops_w4a8_w2_scale")
+    # SlimQuant stores INT4 values in the high-nibble INT8 scale convention.
+    # Read the layer-owned Parameters restored by layerwise reload and keep the
+    # compensation in the forward graph.  This lets eager kernel-format reload
+    # and CUDA/HIP Graph replay consume the current canonical scale storage.
+    w1_scale = _required_tensor(layer, "w13_weight_scale") * 16.0
+    w2_scale = _required_tensor(layer, "w2_weight_scale") * 16.0
     global_num_experts = getattr(
         layer,
         "global_num_experts",

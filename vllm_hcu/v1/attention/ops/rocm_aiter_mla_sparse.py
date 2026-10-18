@@ -792,10 +792,13 @@ def _load_boltops_paged_mqa_logits():
     """Resolve the audited public BoltOps sparse-indexer decode entry point."""
     try:
         module = importlib.import_module("boltops.mqa_logits")
+    except ModuleNotFoundError as exc:
+        if exc.name in {"boltops", "boltops.mqa_logits"}:
+            return None
+        raise
     except (ImportError, OSError) as exc:
         raise RuntimeError(
-            "VLLM_HCU_USE_CUSTOM_OPS=0 sparse decode requires "
-            "boltops.mqa_logits.triton_fp8_paged_mqa_logits"
+            "Failed to import the installed BoltOps sparse decode backend"
         ) from exc
 
     kernel = getattr(module, "triton_fp8_paged_mqa_logits", None)
@@ -922,42 +925,50 @@ def rocm_fp8_paged_mqa_logits(
         and boltops_packed_layout
         and block_size in (1, 64)
     ):
-        (
-            kernel_q_fp8,
-            kernel_context_lens,
-            kernel_block_tables,
-        ) = _boltops_paged_mqa_inputs(
-            q_fp8, context_lens, block_tables, batch_size, next_n
+        boltops_paged_mqa_logits = _load_boltops_paged_mqa_logits()
+        if boltops_paged_mqa_logits is not None:
+            (
+                kernel_q_fp8,
+                kernel_context_lens,
+                kernel_block_tables,
+            ) = _boltops_paged_mqa_inputs(
+                q_fp8, context_lens, block_tables, batch_size, next_n
+            )
+            fuse_output_init = block_size == 64
+            output_factory = torch.empty if fuse_output_init else torch.full
+            output_args = (
+                ((batch_size * next_n, max_model_len),)
+                if fuse_output_init
+                else ((batch_size * next_n, max_model_len), float("-inf"))
+            )
+            out_logits = output_factory(
+                *output_args,
+                device=q_fp8.device,
+                dtype=torch.float32,
+            )
+            logger.info_once(
+                "VLLM_HCU_USE_CUSTOM_OPS=0: using BoltOps Triton "
+                "sparse-indexer decode paged-MQA"
+            )
+            return boltops_paged_mqa_logits(
+                kernel_q_fp8,
+                kv_cache_fp8,
+                weights.float().contiguous(),
+                out_logits,
+                kernel_context_lens,
+                kernel_block_tables,
+                max_model_len,
+                kv_block_size=block_size,
+                preshuffle=False,
+                fuse_output_init=fuse_output_init,
+            )
+        logger.warning_once(
+            "VLLM_HCU_USE_CUSTOM_OPS=0: BoltOps paged MQA is unavailable; "
+            "using the existing sparse-indexer decode backend"
         )
-        fuse_output_init = block_size == 64
-        output_factory = torch.empty if fuse_output_init else torch.full
-        output_args = (
-            ((batch_size * next_n, max_model_len),)
-            if fuse_output_init
-            else ((batch_size * next_n, max_model_len), float("-inf"))
-        )
-        out_logits = output_factory(
-            *output_args,
-            device=q_fp8.device,
-            dtype=torch.float32,
-        )
-        logger.info_once(
-            "VLLM_HCU_USE_CUSTOM_OPS=0: using BoltOps Triton "
-            "sparse-indexer decode paged-MQA"
-        )
-        return _load_boltops_paged_mqa_logits()(
-            kernel_q_fp8,
-            kv_cache_fp8,
-            weights.float().contiguous(),
-            out_logits,
-            kernel_context_lens,
-            kernel_block_tables,
-            max_model_len,
-            kv_block_size=block_size,
-            preshuffle=False,
-            fuse_output_init=fuse_output_init,
-        )
-    use_aiter = force_aiter_triton or rocm_aiter_ops.is_enabled()
+    use_aiter = henvs.custom_ops_enabled() and (
+        force_aiter_triton or rocm_aiter_ops.is_enabled()
+    )
     if is_gfx938 and block_size != 1:
         if force_aiter_triton:
             raise RuntimeError(

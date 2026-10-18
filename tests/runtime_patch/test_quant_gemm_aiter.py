@@ -5960,6 +5960,40 @@ def test_slimquant_w4a8_explicit_triton_keeps_packed_weights(
     assert layer.w2_weight is installed_w2
     assert method.moe_quant_config is installed_quant_config
 
+    # Layerwise checkpoint reload restores the original layer Parameter storage
+    # after post-load, while the rebuilt quant config can still reference its
+    # temporary tensors.  A following kernel-format reload updates only the
+    # restored layer Parameters.  BoltOps must read that canonical storage in
+    # the forward graph rather than either stale object.
+    method.moe_quant_config = SimpleNamespace(
+        w1_scale=torch.full((1, 4, 1), 99.0),
+        w2_scale=torch.full((1, 4, 1), 99.0),
+        a1_scale=None,
+        a2_scale=None,
+    )
+    with torch.no_grad():
+        layer.w13_weight_scale.fill_(2.0)
+        layer.w2_weight_scale.fill_(3.0)
+    method.apply(
+        layer,
+        hidden_states,
+        torch.ones((2, 1), dtype=torch.float32),
+        torch.zeros((2, 1), dtype=torch.int64),
+        None,
+        None,
+    )
+    torch.testing.assert_close(
+        kernel_calls[1]["w1_scale"],
+        torch.full((1, 4, 1), 32.0),
+    )
+    torch.testing.assert_close(
+        kernel_calls[1]["w2_scale"],
+        torch.full((1, 4, 1), 48.0),
+    )
+    with torch.no_grad():
+        layer.w13_weight_scale.fill_(1.0)
+        layer.w2_weight_scale.fill_(1.0)
+
     with torch.no_grad():
         layer.w13_weight_scale.add_(1.0)
         layer.w2_weight_scale.add_(2.0)
@@ -5976,14 +6010,8 @@ def test_slimquant_w4a8_explicit_triton_keeps_packed_weights(
         scale_updated_quant_config.w2_scale,
         torch.full((1, 4, 1), 3.0),
     )
-    torch.testing.assert_close(
-        method._hcu_boltops_w4a8_w1_scale,
-        torch.full((1, 4, 1), 32.0),
-    )
-    torch.testing.assert_close(
-        method._hcu_boltops_w4a8_w2_scale,
-        torch.full((1, 4, 1), 48.0),
-    )
+    assert not hasattr(method, "_hcu_boltops_w4a8_w1_scale")
+    assert not hasattr(method, "_hcu_boltops_w4a8_w2_scale")
 
     layer.w13_weight = torch.nn.Parameter(expected_w13, requires_grad=False)
     layer.w2_weight = torch.nn.Parameter(expected_w2, requires_grad=False)
@@ -6004,6 +6032,76 @@ def test_slimquant_w4a8_explicit_triton_keeps_packed_weights(
         method.moe_quant_config.w2_scale,
         torch.full((1, 4, 1), 3.0),
     )
+
+
+@pytest.mark.hcu
+def test_slimquant_w4a8_scale_reload_reaches_existing_graph(
+    monkeypatch: pytest.MonkeyPatch,
+):
+    """A captured forward must reread layer-owned scales after in-place reload."""
+    if not torch.cuda.is_available():
+        pytest.skip("requires a visible HCU for graph replay")
+
+    def fused_experts_impl(hidden_states, _w1, _w2, *_args, **kwargs):
+        return (
+            hidden_states
+            + kwargs["w1_scale"][0, 0, 0]
+            + kwargs["w2_scale"][0, 0, 0]
+        )
+
+    monkeypatch.setattr(
+        compressed_tensors_moe_runtime,
+        "_boltops_w4a8_fused_experts",
+        lambda: fused_experts_impl,
+    )
+    method = SimpleNamespace(
+        moe=SimpleNamespace(
+            hidden_dim=4,
+            activation=SimpleNamespace(value="silu"),
+            num_experts=1,
+        ),
+        moe_quant_config=SimpleNamespace(a1_scale=None, a2_scale=None),
+    )
+    layer = SimpleNamespace(
+        w13_weight=torch.zeros((1, 4, 2), dtype=torch.int8, device="cuda"),
+        w2_weight=torch.zeros((1, 4, 1), dtype=torch.int8, device="cuda"),
+        w13_weight_scale=torch.ones((1, 4, 1), device="cuda"),
+        w2_weight_scale=torch.ones((1, 4, 1), device="cuda"),
+        global_num_experts=1,
+        _expert_map=None,
+        expert_mask=None,
+        swiglu_limit=0.0,
+    )
+    hidden_states = torch.zeros((1, 4), dtype=torch.float16, device="cuda")
+    topk_weights = torch.ones((1, 1), dtype=torch.float32, device="cuda")
+    topk_ids = torch.zeros((1, 1), dtype=torch.int32, device="cuda")
+
+    stream = torch.cuda.Stream()
+    stream.wait_stream(torch.cuda.current_stream())
+    with torch.cuda.stream(stream):
+        for _ in range(3):
+            compressed_tensors_moe_runtime.apply_vllm_w4a8_moe(
+                method, layer, hidden_states, topk_weights, topk_ids
+            )
+    torch.cuda.current_stream().wait_stream(stream)
+    graph = torch.cuda.CUDAGraph()
+    with torch.cuda.graph(graph):
+        output = compressed_tensors_moe_runtime.apply_vllm_w4a8_moe(
+            method, layer, hidden_states, topk_weights, topk_ids
+        )
+    graph.replay()
+    torch.cuda.synchronize()
+    torch.testing.assert_close(output, torch.full_like(output, 32.0))
+
+    layer.w13_weight_scale.fill_(2.0)
+    layer.w2_weight_scale.fill_(3.0)
+    graph.replay()
+    torch.cuda.synchronize()
+    torch.testing.assert_close(output, torch.full_like(output, 80.0))
+    eager = compressed_tensors_moe_runtime.apply_vllm_w4a8_moe(
+        method, layer, hidden_states, topk_weights, topk_ids
+    )
+    torch.testing.assert_close(output, eager)
 
 
 @pytest.mark.hcu
@@ -6375,11 +6473,11 @@ def test_slimquant_w4a8_explicit_triton_runtime_never_selects_aiter(
         a1_scale=None,
         a2_scale=None,
     )
-    method._hcu_boltops_w4a8_w1_scale = method.moe_quant_config.w1_scale * 16.0
-    method._hcu_boltops_w4a8_w2_scale = method.moe_quant_config.w2_scale * 16.0
     layer = SimpleNamespace(
         w13_weight=torch.zeros((1, 4, 2), dtype=torch.int8),
         w2_weight=torch.zeros((1, 4, 1), dtype=torch.int8),
+        w13_weight_scale=torch.ones((1, 4, 1)),
+        w2_weight_scale=torch.ones((1, 4, 1)),
         global_num_experts=1,
         _expert_map=None,
         expert_mask=None,
