@@ -387,6 +387,10 @@ def test_deep_ep_auto_manager_sizes_one_buffer_for_ht_and_ll(
 
     class Buffer:
         @staticmethod
+        def set_num_sms(_value: int) -> None:
+            pass
+
+        @staticmethod
         def get_low_latency_rdma_size_hint(**kwargs):
             calls.append(kwargs)
             return kwargs["num_max_dispatch_tokens_per_rank"] * 23_437_500
@@ -438,6 +442,37 @@ def test_deep_ep_auto_manager_sizes_one_buffer_for_ht_and_ll(
         num_local_experts=32,
     ) == kwargs
     assert len(calls) == 32
+
+
+def test_deep_ep_auto_manager_initializes_ht_sms_and_honors_override(
+    monkeypatch: pytest.MonkeyPatch,
+):
+    """Auto mode must configure HT kernels even when DBO SM control is idle."""
+
+    from vllm_hcu.platforms import envs as hcu_envs
+
+    calls: list[int] = []
+
+    class Buffer:
+        @staticmethod
+        def set_num_sms(value: int) -> None:
+            calls.append(value)
+
+    monkeypatch.setitem(sys.modules, "deep_ep", SimpleNamespace(Buffer=Buffer))
+    monkeypatch.setattr(hcu_envs, "VLLM_HCU_DEEPEP_NUM_SMS", None)
+    module = _fake_all2all_module()
+    assert patch_all2all.apply_to_module(module)
+
+    manager = module.DeepEPAutoAll2AllManager("group")
+    assert calls == [48]
+
+    monkeypatch.setattr(hcu_envs, "VLLM_HCU_DEEPEP_NUM_SMS", 40)
+    manager.set_num_sms(48)
+    assert calls == [48, 40]
+
+    monkeypatch.setattr(hcu_envs, "VLLM_HCU_DEEPEP_NUM_SMS", 60)
+    manager.set_num_sms(48)
+    assert calls == [48, 40, 48]
 
 
 def test_deep_ep_low_latency_rejects_first_invalid_model_specific_hint(
