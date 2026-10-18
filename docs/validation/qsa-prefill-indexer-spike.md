@@ -200,6 +200,73 @@ invalid-address, page-fault, or failed serving request occurred.
 **Default-enable gate: NO-GO.** Keep this implementation behind the default-off
 experimental switch. The scorer itself is correct on the focused tests and
 48-56% faster, but its absolute saving is only about 4 ms and the five-run
-serving A/B does not show a reproducible TTFT gain. Full evaluation accuracy is
-also not established for the opt-in route. The standalone Draft MR exists to
-continue isolated validation without coupling its lifecycle to PR 248.
+serving A/B does not show a reproducible TTFT gain. The standalone Draft MR
+exists to continue isolated validation without coupling its lifecycle to PR
+248.
+
+## Standalone-head revalidation
+
+The final revalidation below used standalone MR commit
+`f4b02f078188ff108a78f6f2b1a87d071bbf43f9`, whose merge base with
+`origin/v0.28.1-dev` is `49beac0a6a993ab441717abee66faa8176c02720`.
+The installed plugin version was
+`vllm_hcu-0.28.1rc1.dev491+das.f4b02f0.dtk26041`; vLLM remained
+`0.28.1+dtk2604.torch2110.2609171627.g77acaf`.
+
+The focused environment, kernel, config, routing, and worker suite completed
+with `328 passed, 14 warnings` in 73.89 seconds. Re-running the synchronized
+kernel benchmark on this exact commit produced:
+
+| Case | Baseline | Candidate | Reduction | Maximum absolute error |
+|---|---:|---:|---:|---:|
+| BS4, query 4096, no prefix | 1.850319 ms | 1.152079 ms | 37.736% | 2.861023e-06 |
+| BS16, query 4096, no prefix | 7.326634 ms | 3.778717 ms | 48.425% | 3.814697e-06 |
+| BS4, prefix 8192 + query 4096 | 8.383914 ms | 6.626795 ms | 20.958% | 2.384186e-06 |
+
+The exact-head serving A/B used the same configuration described above. There
+were three warmups and five measured seeds on each side, with 16 concurrent
+requests per measured seed and exactly 4096 input plus 1024 output tokens per
+request. Both sides completed 80/80 measured requests without an error.
+
+| Metric (median of five runs) | OFF | ON | ON vs OFF |
+|---|---:|---:|---:|
+| Mean TTFT | 2825.112 ms | 2897.326 ms | +2.556% |
+| Median TTFT | 2976.844 ms | 3036.533 ms | +2.005% |
+| Mean TPOT | 34.420 ms | 38.308 ms | +11.297% |
+| Median TPOT | 30.036 ms | 36.883 ms | +22.797% |
+| Output throughput | 278.136 token/s | 240.176 token/s | -13.648% |
+| Weighted MTP acceptance | 57.786% | 57.687% | -0.099 percentage points |
+
+Paired mean-TTFT changes by seed were `-1.566%, +0.341%, -24.555%,
++15.391%, -0.148%`; their median was `-0.148%`. This confirms that the
+approximately 3.5 ms score-kernel saving is lost in run-to-run serving noise
+and does not produce a repeatable end-to-end improvement. The run-level median
+comparison is a regression, so the default-enable gate remains NO-GO.
+
+Accuracy was then checked with the candidate route enabled, prefix caching and
+dense prefill disabled, temperature 0, and thinking disabled:
+
+- Full HumanEval: `158/164 = 96.34%`. The six failed tasks were
+  `HumanEval/32`, `/93`, `/116`, `/140`, `/145`, and `/163`. A previous valid
+  baseline run scored `159/164 = 96.95%`; the candidate run fixed `/129` but
+  differed on `/116` and `/163`, a net one-sample change.
+- MathVision sample: `14/20 = 70%` using four seeded samples from each of the
+  five levels, batch size 16, `max_tokens=32768`, and server context length
+  65536. Per-level scores were 25%, 100%, 75%, 100%, and 50%. This is a sampled
+  check, not the full 3040-item benchmark. Failed sample IDs were level 1
+  `4, 7, 9`; level 3 `58`; and level 5 `63, 126`. Level-1 sample 9 reached the
+  32768-token output limit, and level-3 sample 58 generated 17038 tokens.
+- Weighted MTP acceptance during MathVision was `66852 / 82077 = 81.45%`.
+  All 20 requests completed; one finished by length and 19 by stop, with zero
+  aborts and zero errors.
+
+No `VMFault`, invalid-address, page-fault, segfault, fatal error, traceback, or
+failed request appeared in the exact-head OFF/ON serving logs or the MathVision
+service log. This validates the requested BS16, dense-prefill-off path; it does
+not by itself prove that the earlier BS32 fault is fixed for every shape.
+
+Exact-head artifacts are stored under:
+
+- `/models/qsa_prefill_indexer_mr251_benchmark_20261018.log`
+- `/models/qsa_prefill_indexer_mr251_ab_20261018/off`
+- `/models/qsa_prefill_indexer_mr251_ab_20261018/on`
