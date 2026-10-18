@@ -432,6 +432,72 @@ def test_sparse_mla_master_off_decode_uses_boltops_paged_mqa(
     }
 
 
+@pytest.mark.parametrize("block_size", (1, 64))
+def test_sparse_mla_boltops_decode_preserves_exact_mtp_pool_ends(
+    monkeypatch: pytest.MonkeyPatch,
+    block_size: int,
+) -> None:
+    """Exact KPool ends must remain distinct for every MTP query row."""
+    runtime = _runtime()
+    monkeypatch.setenv("VLLM_HCU_USE_CUSTOM_OPS", "0")
+    monkeypatch.setattr(runtime, "on_gfx938", lambda: False)
+    calls: list[tuple[tuple[object, ...], dict[str, object]]] = []
+
+    def boltops_paged(*args, **kwargs):
+        calls.append((args, kwargs))
+        return args[3]
+
+    monkeypatch.setattr(
+        runtime,
+        "_load_boltops_paged_mqa_logits",
+        lambda: boltops_paged,
+    )
+    q = (
+        torch.arange(6, dtype=torch.float32)
+        .reshape(2, 3, 1, 1)
+        .expand(2, 3, 8, 128)
+        .contiguous()
+        .to(torch.float8_e4m3fn)
+    )
+    cache = torch.empty((10, block_size, 1, 132), dtype=torch.uint8)
+    weights = torch.ones((6, 8), dtype=torch.float32)
+    context_lens = torch.tensor(
+        [[300, 300, 301], [1, 1, 2]],
+        dtype=torch.int32,
+    )
+    block_tables = torch.tensor(
+        [[0, 1, 2, 3, 4], [5, 6, 7, 8, 9]],
+        dtype=torch.int32,
+    )
+
+    result = runtime.rocm_fp8_paged_mqa_logits(
+        q,
+        cache,
+        weights,
+        context_lens,
+        block_tables,
+        torch.empty(0),
+        320,
+    )
+
+    assert len(calls) == 1
+    args, kwargs = calls[0]
+    assert args[0].shape == (6, 1, 8, 128)
+    assert torch.equal(args[0].float().reshape_as(q), q.float())
+    assert args[1] is cache
+    assert args[2] is weights
+    assert args[3] is result
+    assert result.shape == (6, 320)
+    assert torch.equal(args[4], context_lens.reshape(-1))
+    assert torch.equal(args[5], block_tables.repeat_interleave(3, dim=0))
+    assert args[6] == 320
+    assert kwargs == {
+        "kv_block_size": block_size,
+        "preshuffle": False,
+        "fuse_output_init": block_size == 64,
+    }
+
+
 def test_sparse_mla_master_off_bf16_decode_skips_boltops_paged_mqa(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:

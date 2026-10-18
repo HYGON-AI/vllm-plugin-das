@@ -823,16 +823,22 @@ def _load_boltops_paged_mqa_logits():
     return kernel
 
 
-def _boltops_paged_mqa_context_lens(
+def _boltops_paged_mqa_inputs(
+    q_fp8: torch.Tensor,
     context_lens: torch.Tensor,
+    block_tables: torch.Tensor,
     batch_size: int,
     next_n: int,
-) -> torch.Tensor:
-    """Normalize exact per-query ends to BoltOps' final length per request."""
+) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+    """Adapt exact per-query KPool ends without losing MTP row semantics."""
     if context_lens.shape == (batch_size,):
-        return context_lens
+        return q_fp8, context_lens, block_tables
     if context_lens.shape == (batch_size, next_n):
-        return context_lens[:, -1].contiguous()
+        return (
+            q_fp8.reshape(batch_size * next_n, 1, *q_fp8.shape[2:]),
+            context_lens.reshape(batch_size * next_n).contiguous(),
+            block_tables.repeat_interleave(next_n, dim=0),
+        )
     raise ValueError(
         "BoltOps paged-MQA requires context_lens shaped [batch] or "
         f"[batch, next_n], got {tuple(context_lens.shape)}"
@@ -916,10 +922,12 @@ def rocm_fp8_paged_mqa_logits(
         and boltops_packed_layout
         and block_size in (1, 64)
     ):
-        kernel_context_lens = _boltops_paged_mqa_context_lens(
-            context_lens,
-            batch_size,
-            next_n,
+        (
+            kernel_q_fp8,
+            kernel_context_lens,
+            kernel_block_tables,
+        ) = _boltops_paged_mqa_inputs(
+            q_fp8, context_lens, block_tables, batch_size, next_n
         )
         fuse_output_init = block_size == 64
         output_factory = torch.empty if fuse_output_init else torch.full
@@ -938,12 +946,12 @@ def rocm_fp8_paged_mqa_logits(
             "sparse-indexer decode paged-MQA"
         )
         return _load_boltops_paged_mqa_logits()(
-            q_fp8,
+            kernel_q_fp8,
             kv_cache_fp8,
             weights.float().contiguous(),
             out_logits,
             kernel_context_lens,
-            block_tables,
+            kernel_block_tables,
             max_model_len,
             kv_block_size=block_size,
             preshuffle=False,
