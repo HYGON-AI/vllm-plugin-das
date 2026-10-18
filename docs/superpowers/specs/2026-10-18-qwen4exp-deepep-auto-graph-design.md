@@ -98,6 +98,17 @@ for HT piecewise graphs, the implementation must fail closed to phase-aware
 `prefill/mixed=NONE` and `decode=FULL`. It must not fall back to disabling
 decode graphs globally, and it must not claim PIECEWISE prefill support.
 
+### Hardware-gated effective policy
+
+The 2026-10-18 DP4/EP4 gate reached the first PIECEWISE capture warmup and
+remained at 0/51. All four GPUs were idle while every worker stack was inside
+`deep_ep.buffer.Buffer.dispatch` through the HT delegate. The effective policy
+for DP `deepep_auto` is therefore `FULL_DECODE_ONLY`: prefill and mixed batches
+run eager `NONE` with DP-synchronized HT/contiguous experts, while uniform
+decode retains FULL graphs with LL/masked experts. Explicit user `NONE`,
+single-rank execution, fixed DeepEP modes, and unrelated all-to-all backends
+are unchanged.
+
 ## Model Runner V2 Phase Propagation
 
 The HCU V2 runner will preserve the `_dummy_run()` `uniform_decode` decision
