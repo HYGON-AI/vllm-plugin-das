@@ -1163,7 +1163,8 @@ class V32SparseAttnIndexer(SparseAttnIndexer):
                 layer_idx = None
             if layer_idx is not None:
                 maybe_prefetch_same_layer_mla_cache(layer_idx)
-        return torch.ops.vllm.hcu_sparse_attn_indexer(
+        # Mutation-only custom op: return the top-k buffer, not the op result.
+        torch.ops.vllm.hcu_sparse_attn_indexer(
             hidden_states,
             _encode_layer_name(self.k_cache.prefix),
             self.k_cache.kv_cache,

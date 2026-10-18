@@ -308,3 +308,40 @@ def test_out_of_range_page_id_is_masked_before_cache_read():
     args[4][0, 0] = args[1].shape[0] + 123
     expected[:, :32] = -torch.inf
     _check(gfx938_fp8_paged_mqa_logits(*args), expected)
+
+
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="requires HCU GPU")
+def test_layer_split_sized_stride_with_high_page_ids_matches_oracle():
+    """DSA packed stride (~554496) + high page ids must not int32-wrap.
+
+    page*554496 overflows signed int32 once page >= 3871. Reproduce that
+    regime with as_strided physical pages past the overflow cliff.
+    """
+    args, expected = _case(32, 64, 1, 1, False)
+    q, cache, weights, lengths, table, max_len = args
+    page_size = int(cache.shape[1])
+    dim_p4 = int(cache.shape[-1])
+    block_stride = 554496
+    high_page = 4000
+    assert high_page * block_stride > (1 << 31)
+    backing = torch.zeros(
+        (high_page + 2) * block_stride,
+        dtype=cache.dtype,
+        device=cache.device,
+    )
+    src = int(table[0, 0].item())
+    live = cache[src].reshape(-1)
+    start = high_page * block_stride
+    backing[start : start + live.numel()].copy_(live)
+    strided = torch.as_strided(
+        backing,
+        size=(high_page + 2, page_size, 1, dim_p4),
+        stride=(block_stride, dim_p4, dim_p4, 1),
+    )
+    assert strided.stride(0) == block_stride
+    table = table.clone()
+    table[0, 0] = high_page
+    actual = gfx938_fp8_paged_mqa_logits(
+        q, strided, weights, lengths, table, max_len
+    )
+    _check(actual, expected)

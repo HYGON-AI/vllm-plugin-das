@@ -301,10 +301,15 @@ def _reshape_modern_packed_cache(
     offset = int(getattr(descriptor, "offset", 0) or 0)
     if block_stride % dtype_size or offset % dtype_size:
         raise ValueError("Packed KV offsets and strides must align to cache dtype")
-    page_bytes = 1
-    for dimension in shape:
+    # Measure one cache page only. Logical dim 0 is the block count; folding
+    # it into page_bytes overstates the view and rejects valid packed
+    # layer-split descriptors. The as_strided layout below is unchanged.
+    block_dim = stride_order.index(0)
+    page_bytes = dtype_size
+    for index, dimension in enumerate(physical_shape):
+        if index == block_dim:
+            continue
         page_bytes *= int(dimension)
-    page_bytes *= dtype_size
     if page_bytes > block_stride:
         raise ValueError(
             "Packed KV backend view exceeds its per-block descriptor stride: "
@@ -319,7 +324,6 @@ def _reshape_modern_packed_cache(
             "Packed KV descriptor offset/view exceeds its backing allocation"
         )
     physical_stride = list(torch.empty(physical_shape, dtype=dtype).stride())
-    block_dim = stride_order.index(0)
     physical_stride[block_dim] = block_stride // dtype_size
     return torch.as_strided(
         raw.view(dtype),

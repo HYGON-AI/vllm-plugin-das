@@ -1580,6 +1580,16 @@ class MooncakeConnectorWorker:
             self._mooncake_receiver_t.join()
 
     async def register_worker_with_bootstrap(self):
+        if self._pcp_dummy_sender:
+            # Replicated PCP keeps only rank 0 in the bootstrap topology.
+            # Nonzero ranks still run the sender loop so finished-sending
+            # aggregation can complete locally.
+            logger.debug(
+                "Skipping Mooncake bootstrap registration for replicated "
+                "PCP dummy rank %d",
+                self.pcp_rank,
+            )
+            return
         host, port = get_mooncake_bootstrap_addr(self.vllm_config)
         url = make_zmq_path("http", host, port) + "/register"
         worker_addr = make_zmq_path("tcp", self.hostname, self.side_channel_port)

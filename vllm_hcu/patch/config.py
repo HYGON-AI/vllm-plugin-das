@@ -33,9 +33,19 @@ _FEATURE_FIELDS = (
     "eplb_disable_rearrange",
     "eplb_static_dispatch_policy",
 )
-# enable_dsa_cache_layer_split sits ahead of dp_int8_allgather, so the
-# upstream 8-field slice would drop that boolean.
-_BOOLEAN_FIELDS = _FEATURE_FIELDS[:9]
+# Enumerate booleans explicitly so inserting a feature field cannot silently
+# drop qwen4_exp_hc_sp, enable_dsa_cache_layer_split, or dp_int8_allgather.
+_BOOLEAN_FIELDS = (
+    "enable_lightly_cp",
+    "enable_lightly_cplb",
+    "enable_custom_sp",
+    "enable_multi_layers_mtp",
+    "enable_dsa_cache_layer_split",
+    "deepep_auto",
+    "fused_qwen3_rms_rope",
+    "qwen4_exp_hc_sp",
+    "dp_int8_allgather",
+)
 _SUPPORTED_MOE_BACKENDS = frozenset({"auto", "deep_gemm"})
 _LEGACY_DEEP_GEMM_BACKEND = "dpsk_deep_gemm"
 _DEEP_GEMM_BACKEND = "deep_gemm"
