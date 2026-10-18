@@ -950,7 +950,8 @@ class DeepEPAutoDeepGemmExperts(mk.FusedMoEExpertsModular):
         expert_tokens_meta: mk.ExpertTokensMetadata | None,
         activation: MoEActivation,
     ) -> tuple[tuple[int, ...], tuple[int, ...], tuple[int, ...]]:
-        return self._current().workspace_shapes(
+        current = self._current()
+        workspace13, workspace2, output = current.workspace_shapes(
             M,
             N,
             K,
@@ -960,6 +961,36 @@ class DeepEPAutoDeepGemmExperts(mk.FusedMoEExpertsModular):
             expert_tokens_meta,
             activation,
         )
+        use_low_latency = (
+            self._fixed_use_low_latency
+            if self._fixed_use_low_latency is not None
+            else self._use_low_latency_snapshot
+        )
+        if use_low_latency:
+            return workspace13, workspace2, output
+
+        # DP engine profiling exercises one rank's synthetic prefill at a
+        # time. DeepEP HT runtime can instead receive the routed rows from all
+        # simultaneously active ranks. Reserve one local scheduler batch of
+        # routes (tokens * top-k) so the shared workspace is large enough
+        # before vLLM locks it after profiling. Keep the output at the real M:
+        # only the two temporary workspaces need the conservative bound.
+        max_local_routes = int(self.moe_config.max_num_tokens) * int(
+            self.moe_config.experts_per_token
+        )
+        if max_local_routes <= M:
+            return workspace13, workspace2, output
+        reserve13, reserve2, _ = current.workspace_shapes(
+            max_local_routes,
+            N,
+            K,
+            topk,
+            global_num_experts,
+            local_num_experts,
+            expert_tokens_meta,
+            activation,
+        )
+        return reserve13, reserve2, output
 
     def finalize_weight_and_reduce_impl(self) -> mk.TopKWeightAndReduce:
         return self._current().finalize_weight_and_reduce_impl()

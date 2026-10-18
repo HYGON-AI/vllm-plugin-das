@@ -4000,6 +4000,59 @@ def test_channel_auto_experts_construct_only_mooncake_pd_role_layout(
     assert experts.ht_experts is experts.ll_experts
 
 
+def test_deepep_auto_ht_workspace_reserves_all_local_routed_tokens() -> None:
+    from vllm_hcu.model_executor.layers.fused_moe.experts import (
+        dpsk_v4_deep_gemm_moe as module,
+    )
+
+    class Experts:
+        def __init__(self) -> None:
+            self.calls: list[int] = []
+
+        def workspace_shapes(self, m, *_args):
+            self.calls.append(m)
+            return (m, 2), (m, 3), (m, 5)
+
+    experts = object.__new__(module.DeepEPAutoDeepGemmExperts)
+    experts.moe_config = SimpleNamespace(
+        max_num_tokens=16_384,
+        experts_per_token=10,
+    )
+    experts._fixed_use_low_latency = None
+    experts._use_low_latency_snapshot = False
+    experts.ht_experts = Experts()
+    experts.ll_experts = Experts()
+
+    shapes = experts.workspace_shapes(
+        49_152,
+        1_280,
+        2_560,
+        1,
+        512,
+        128,
+        None,
+        SimpleNamespace(),
+    )
+
+    assert experts.ht_experts.calls == [49_152, 163_840]
+    assert shapes == ((163_840, 2), (163_840, 3), (49_152, 5))
+
+    experts._use_low_latency_snapshot = True
+    shapes = experts.workspace_shapes(
+        256,
+        1_280,
+        2_560,
+        10,
+        512,
+        128,
+        None,
+        SimpleNamespace(),
+    )
+
+    assert experts.ll_experts.calls == [256]
+    assert shapes == ((256, 2), (256, 3), (256, 5))
+
+
 def _slimquant_w4a8_auto_experts(fixed_use_low_latency: bool | None):
     from vllm_hcu.model_executor.layers.fused_moe.experts import (
         dpsk_v4_deep_gemm_moe as module,
