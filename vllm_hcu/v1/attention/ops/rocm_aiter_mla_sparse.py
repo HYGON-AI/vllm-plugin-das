@@ -763,6 +763,95 @@ def _paged_mqa_cache_kernel_view(kv_cache_fp8: torch.Tensor) -> torch.Tensor:
     return kv_cache_fp8
 
 
+_BOLTOPS_PAGED_MQA_CONTRACT = (
+    ("q_fp8", Parameter.POSITIONAL_OR_KEYWORD, Parameter.empty),
+    ("kv_cache", Parameter.POSITIONAL_OR_KEYWORD, Parameter.empty),
+    ("weights", Parameter.POSITIONAL_OR_KEYWORD, Parameter.empty),
+    ("out_logits", Parameter.POSITIONAL_OR_KEYWORD, Parameter.empty),
+    ("context_lens", Parameter.POSITIONAL_OR_KEYWORD, Parameter.empty),
+    ("kv_indices", Parameter.POSITIONAL_OR_KEYWORD, Parameter.empty),
+    ("max_model_len", Parameter.POSITIONAL_OR_KEYWORD, Parameter.empty),
+    ("kv_block_size", Parameter.KEYWORD_ONLY, 1),
+    ("preshuffle", Parameter.KEYWORD_ONLY, False),
+    ("chunk_k", Parameter.KEYWORD_ONLY, None),
+    ("total_cu_count", Parameter.KEYWORD_ONLY, None),
+    ("split_kv", Parameter.KEYWORD_ONLY, None),
+    ("waves_per_eu", Parameter.KEYWORD_ONLY, None),
+    ("num_warps", Parameter.KEYWORD_ONLY, None),
+    ("num_stages", Parameter.KEYWORD_ONLY, None),
+    ("use_bucket", Parameter.KEYWORD_ONLY, False),
+    ("bucket_tokens", Parameter.KEYWORD_ONLY, 2048),
+    ("bucket_schedule", Parameter.KEYWORD_ONLY, None),
+    ("batch_info", Parameter.KEYWORD_ONLY, None),
+    ("fuse_output_init", Parameter.KEYWORD_ONLY, False),
+)
+
+
+@functools.lru_cache
+def _load_boltops_paged_mqa_logits():
+    """Resolve the audited public BoltOps sparse-indexer decode entry point."""
+    try:
+        module = importlib.import_module("boltops.mqa_logits")
+    except (ImportError, OSError) as exc:
+        raise RuntimeError(
+            "VLLM_HCU_USE_CUSTOM_OPS=0 sparse decode requires "
+            "boltops.mqa_logits.triton_fp8_paged_mqa_logits"
+        ) from exc
+
+    kernel = getattr(module, "triton_fp8_paged_mqa_logits", None)
+    if not callable(kernel):
+        raise RuntimeError(
+            "boltops.mqa_logits.triton_fp8_paged_mqa_logits is unavailable "
+            "in the installed BoltOps package"
+        )
+    try:
+        parameters = signature(kernel).parameters
+    except (TypeError, ValueError) as exc:
+        raise RuntimeError(
+            "boltops.mqa_logits.triton_fp8_paged_mqa_logits signature "
+            "drifted from the audited BoltOps 0.1.0 contract"
+        ) from exc
+    actual_contract = tuple(
+        (name, parameter.kind, parameter.default)
+        for name, parameter in parameters.items()
+    )
+    if actual_contract != _BOLTOPS_PAGED_MQA_CONTRACT:
+        raise RuntimeError(
+            "boltops.mqa_logits.triton_fp8_paged_mqa_logits signature "
+            "drifted from the audited BoltOps 0.1.0 contract"
+        )
+    return kernel
+
+
+def _boltops_paged_mqa_context_lens(
+    context_lens: torch.Tensor,
+    batch_size: int,
+    next_n: int,
+) -> torch.Tensor:
+    """Normalize exact per-query ends to BoltOps' final length per request."""
+    if context_lens.shape == (batch_size,):
+        return context_lens
+    if context_lens.shape == (batch_size, next_n):
+        return context_lens[:, -1].contiguous()
+    raise ValueError(
+        "BoltOps paged-MQA requires context_lens shaped [batch] or "
+        f"[batch, next_n], got {tuple(context_lens.shape)}"
+    )
+
+
+def _is_boltops_packed_paged_mqa_layout(
+    q: torch.Tensor,
+    kv_cache: torch.Tensor,
+) -> bool:
+    """Return whether BoltOps can interpret the query and packed K-cache."""
+    return (
+        q.dtype.is_floating_point
+        and q.element_size() == 1
+        and kv_cache.element_size() == 1
+        and kv_cache.shape[-1] == q.shape[-1] + 4
+    )
+
+
 def rocm_fp8_paged_mqa_logits(
     q_fp8: torch.Tensor,
     kv_cache_fp8: torch.Tensor,
@@ -815,6 +904,51 @@ def rocm_fp8_paged_mqa_logits(
 
     if is_gfx938 and block_size not in (1, 16, 32, 64):
         raise ValueError(f"Unsupported preshuffled KPool page size: {block_size}")
+    boltops_row_major = not (
+        is_gfx938 and block_size != 1 and kcache_layout == "preshuffle"
+    )
+    boltops_packed_layout = _is_boltops_packed_paged_mqa_layout(
+        q_fp8, kv_cache_fp8
+    )
+    if (
+        not henvs.custom_ops_enabled()
+        and boltops_row_major
+        and boltops_packed_layout
+        and block_size in (1, 64)
+    ):
+        kernel_context_lens = _boltops_paged_mqa_context_lens(
+            context_lens,
+            batch_size,
+            next_n,
+        )
+        fuse_output_init = block_size == 64
+        output_factory = torch.empty if fuse_output_init else torch.full
+        output_args = (
+            ((batch_size * next_n, max_model_len),)
+            if fuse_output_init
+            else ((batch_size * next_n, max_model_len), float("-inf"))
+        )
+        out_logits = output_factory(
+            *output_args,
+            device=q_fp8.device,
+            dtype=torch.float32,
+        )
+        logger.info_once(
+            "VLLM_HCU_USE_CUSTOM_OPS=0: using BoltOps Triton "
+            "sparse-indexer decode paged-MQA"
+        )
+        return _load_boltops_paged_mqa_logits()(
+            q_fp8,
+            kv_cache_fp8,
+            weights.float().contiguous(),
+            out_logits,
+            kernel_context_lens,
+            block_tables,
+            max_model_len,
+            kv_block_size=block_size,
+            preshuffle=False,
+            fuse_output_init=fuse_output_init,
+        )
     use_aiter = force_aiter_triton or rocm_aiter_ops.is_enabled()
     if is_gfx938 and block_size != 1:
         if force_aiter_triton:
