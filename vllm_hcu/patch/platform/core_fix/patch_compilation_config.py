@@ -123,9 +123,20 @@ def apply_to_module(module: ModuleType) -> bool:
         )
     cudagraph_mode_type = getattr(compilation_module, "CUDAGraphMode", None)
     cudagraph_none = getattr(cudagraph_mode_type, "NONE", None)
-    if cudagraph_none is None:
+    cudagraph_full_and_piecewise = getattr(
+        cudagraph_mode_type, "FULL_AND_PIECEWISE", None
+    )
+    cudagraph_full_decode_only = getattr(
+        cudagraph_mode_type, "FULL_DECODE_ONLY", None
+    )
+    if (
+        cudagraph_none is None
+        or cudagraph_full_and_piecewise is None
+        or cudagraph_full_decode_only is None
+    ):
         raise PatchCompatibilityError(
-            f"required HCU patch target {TARGET_MODULE}.CUDAGraphMode.NONE is missing"
+            f"required HCU patch target {TARGET_MODULE}.CUDAGraphMode is missing "
+            "NONE, FULL_AND_PIECEWISE, or FULL_DECODE_ONLY"
         )
 
     @functools.wraps(original)
@@ -167,6 +178,24 @@ def apply_to_module(module: ModuleType) -> bool:
         all2all_backend: str,
         data_parallel_size: int = 1,
     ):
+        feature_config = _bound_hcu_config(self) or HcuFeatureConfig()
+        if (
+            feature_config.deepep_auto
+            and data_parallel_size > 1
+            and getattr(self, "cudagraph_mode", None)
+            is cudagraph_full_and_piecewise
+        ):
+            # DeepEP HT spins in Buffer.dispatch while vLLM warms the first
+            # PIECEWISE graph on the supported ROCm stack. Preserve FULL
+            # decode graphs while keeping prefill/mixed execution eager.
+            self.cudagraph_mode = cudagraph_full_decode_only
+            from vllm.logger import init_logger
+
+            init_logger(__name__).info_once(
+                "DeepEP auto uses FULL_DECODE_ONLY because DeepEP HT "
+                "PIECEWISE capture is unsupported on HCU."
+            )
+
         result = original_set_splitting_ops(
             self,
             all2all_backend,

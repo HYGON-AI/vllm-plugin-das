@@ -880,6 +880,10 @@ def _make_compilation_module() -> ModuleType:
         def has_piecewise_cudagraphs(self) -> bool:
             return self.piecewise
 
+    full_and_piecewise = _CUDAGraphMode()
+    full_decode_only = _CUDAGraphMode(piecewise=False)
+    none = _CUDAGraphMode(piecewise=False)
+
     class CompilationConfig:
         def __init__(self) -> None:
             self.pass_config = SimpleNamespace(enable_sp=False)
@@ -888,7 +892,7 @@ def _make_compilation_module() -> ModuleType:
             self.splitting_calls = 0
             self.splitting_ops = ["vllm::unified_mla_attention_with_output"]
             self.use_inductor_graph_partition = False
-            self.cudagraph_mode = _CUDAGraphMode()
+            self.cudagraph_mode = full_and_piecewise
 
         def adjust_cudagraph_sizes_for_spec_decode(
             self,
@@ -907,7 +911,11 @@ def _make_compilation_module() -> ModuleType:
             self.splitting_calls += 1
             return all2all_backend, data_parallel_size
 
-    module.CUDAGraphMode = SimpleNamespace(NONE=_CUDAGraphMode(piecewise=False))
+    module.CUDAGraphMode = SimpleNamespace(
+        NONE=none,
+        FULL_AND_PIECEWISE=full_and_piecewise,
+        FULL_DECODE_ONLY=full_decode_only,
+    )
     module.CompilationConfig = CompilationConfig
     return module
 
@@ -951,11 +959,10 @@ def test_compilation_adapter_splits_hcu_sparse_indexer_from_piecewise_graph() ->
     assert config.splitting_ops.count("vllm::hcu_sparse_attn_indexer") == 1
 
 
-def test_compilation_adapter_preserves_cudagraph_for_dp_deepep_auto() -> None:
+def test_compilation_adapter_falls_back_to_decode_graph_for_dp_deepep_auto() -> None:
     module = _make_compilation_module()
     patch_compilation_config.apply_to_module(module)
     config = module.CompilationConfig()
-    configured_mode = config.cudagraph_mode
     vllm_config = SimpleNamespace(
         additional_config={"hcu": HcuFeatureConfig(deepep_auto=True).to_dict()},
         compilation_config=config,
@@ -964,8 +971,23 @@ def test_compilation_adapter_preserves_cudagraph_for_dp_deepep_auto() -> None:
 
     config.set_splitting_ops_for_v1("deepep_low_latency", 8)
 
-    assert config.cudagraph_mode is configured_mode
-    assert config.cudagraph_mode.has_piecewise_cudagraphs()
+    assert config.cudagraph_mode is module.CUDAGraphMode.FULL_DECODE_ONLY
+    assert not config.cudagraph_mode.has_piecewise_cudagraphs()
+
+
+def test_compilation_adapter_keeps_piecewise_for_single_rank_deepep_auto() -> None:
+    module = _make_compilation_module()
+    patch_compilation_config.apply_to_module(module)
+    config = module.CompilationConfig()
+    vllm_config = SimpleNamespace(
+        additional_config={"hcu": HcuFeatureConfig(deepep_auto=True).to_dict()},
+        compilation_config=config,
+    )
+    patch_compilation_config.bind_hcu_config(vllm_config)
+
+    config.set_splitting_ops_for_v1("deepep_low_latency", 1)
+
+    assert config.cudagraph_mode is module.CUDAGraphMode.FULL_AND_PIECEWISE
 
 
 def test_compilation_adapter_keeps_explicit_none_for_dp_deepep_auto() -> None:
