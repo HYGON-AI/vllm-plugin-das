@@ -666,23 +666,98 @@ def test_sparse_mla_master_off_missing_boltops_decode_uses_existing_backend(
         "_get_lightop_attention",
         lambda: SimpleNamespace(paged_mqa_logits=paged_mqa_logits),
     )
-    q = torch.empty((1, 1, 8, 128), dtype=torch.float8_e4m3fn)
-    cache = torch.empty((2, 64, 1, 132), dtype=torch.uint8)
+    q = (
+        torch.arange(6, dtype=torch.float32)
+        .reshape(2, 3, 1, 1)
+        .expand(2, 3, 8, 128)
+        .contiguous()
+        .to(torch.float8_e4m3fn)
+    )
+    cache = torch.empty((10, 64, 1, 132), dtype=torch.uint8)
+    context_lens = torch.tensor(
+        [[300, 300, 301], [1, 1, 2]],
+        dtype=torch.int32,
+    )
+    block_tables = torch.tensor(
+        [[0, 1, 2, 3, 4], [5, 6, 7, 8, 9]],
+        dtype=torch.int32,
+    )
+
+    result = runtime.rocm_fp8_paged_mqa_logits(
+        q,
+        cache,
+        torch.ones((6, 8), dtype=torch.float32),
+        context_lens,
+        block_tables,
+        torch.empty(0),
+        320,
+        force_aiter_triton=True,
+    )
+
+    assert result is output
+    assert len(calls) == 1
+    assert calls[0][0].shape == (6, 1, 8, 128)
+    assert torch.equal(calls[0][0].float().reshape_as(q), q.float())
+    assert calls[0][1] is cache
+    assert torch.equal(calls[0][3], context_lens.reshape(-1))
+    assert torch.equal(calls[0][4], block_tables.repeat_interleave(3, dim=0))
+
+
+@pytest.mark.parametrize(
+    ("block_size", "kcache_layout", "expected_backend"),
+    ((1, "preshuffle", "torch"), (64, "normal", "lightop")),
+)
+def test_sparse_mla_master_off_ignores_forced_aiter_on_gfx938_fallback(
+    monkeypatch: pytest.MonkeyPatch,
+    block_size: int,
+    kcache_layout: str,
+    expected_backend: str,
+) -> None:
+    """The GLM5Next force flag cannot bypass the disabled master switch."""
+    runtime = _runtime()
+    monkeypatch.setenv("VLLM_HCU_USE_CUSTOM_OPS", "0")
+    monkeypatch.setattr(runtime, "on_gfx938", lambda: True)
+    monkeypatch.setattr(runtime.current_platform, "is_rocm", lambda: True)
+    monkeypatch.setattr(runtime, "_load_boltops_paged_mqa_logits", lambda: None)
+    monkeypatch.setattr(
+        runtime,
+        "paged_mqa_logits_module",
+        lambda: pytest.fail("master-off gfx938 fallback queried AITER"),
+    )
+    outputs = {"torch": object(), "lightop": object()}
+    calls: list[str] = []
+
+    def torch_reference(*_args):
+        calls.append("torch")
+        return outputs["torch"]
+
+    def lightop_reference(*_args, **_kwargs):
+        calls.append("lightop")
+        return outputs["lightop"]
+
+    monkeypatch.setattr(runtime, "fp8_paged_mqa_logits_torch", torch_reference)
+    monkeypatch.setattr(
+        runtime,
+        "_get_lightop_attention",
+        lambda: SimpleNamespace(paged_mqa_logits=lightop_reference),
+    )
+    q = torch.zeros((1, 1, 8, 128), dtype=torch.float8_e4m3fn)
+    cache = torch.empty((2, block_size, 1, 132), dtype=torch.uint8)
 
     result = runtime.rocm_fp8_paged_mqa_logits(
         q,
         cache,
         torch.ones((1, 8), dtype=torch.float32),
-        torch.tensor([64], dtype=torch.int32),
+        torch.tensor([block_size], dtype=torch.int32),
         torch.tensor([[0]], dtype=torch.int32),
         torch.empty(0),
-        64,
+        block_size,
+        force_aiter_triton=True,
+        kcache_layout=kcache_layout,
     )
 
-    assert result is output
-    assert len(calls) == 1
-    assert calls[0][0] is q
-    assert calls[0][1] is cache
+    assert result is outputs[expected_backend]
+    assert calls == [expected_backend]
 
 
 @pytest.mark.parametrize("abi_change", ("kind", "default", "uninspectable"))

@@ -848,6 +848,42 @@ def _boltops_paged_mqa_inputs(
     )
 
 
+def _lightop_paged_mqa_inputs(
+    q_fp8: torch.Tensor,
+    context_lens: torch.Tensor,
+    block_tables: torch.Tensor,
+    batch_size: int,
+    next_n: int,
+) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+    """Give each LightOp MTP query its exact causal KPool end."""
+    if next_n == 1:
+        if context_lens.shape not in {(batch_size,), (batch_size, 1)}:
+            raise ValueError(
+                "LightOp paged-MQA requires context_lens shaped [batch] or "
+                f"[batch, next_n], got {tuple(context_lens.shape)}"
+            )
+        return q_fp8, context_lens.reshape(batch_size).contiguous(), block_tables
+    if context_lens.shape == (batch_size,):
+        offsets = torch.arange(
+            next_n,
+            dtype=context_lens.dtype,
+            device=context_lens.device,
+        )
+        context_lens = (
+            context_lens[:, None] - next_n + 1 + offsets
+        ).clamp_min(0)
+    elif context_lens.shape != (batch_size, next_n):
+        raise ValueError(
+            "LightOp paged-MQA requires context_lens shaped [batch] or "
+            f"[batch, next_n], got {tuple(context_lens.shape)}"
+        )
+    return (
+        q_fp8.reshape(batch_size * next_n, 1, *q_fp8.shape[2:]),
+        context_lens.reshape(batch_size * next_n).contiguous(),
+        block_tables.repeat_interleave(next_n, dim=0),
+    )
+
+
 def _is_boltops_packed_paged_mqa_layout(
     q: torch.Tensor,
     kv_cache: torch.Tensor,
@@ -966,11 +1002,13 @@ def rocm_fp8_paged_mqa_logits(
             "VLLM_HCU_USE_CUSTOM_OPS=0: BoltOps paged MQA is unavailable; "
             "using the existing sparse-indexer decode backend"
         )
-    use_aiter = henvs.custom_ops_enabled() and (
-        force_aiter_triton or rocm_aiter_ops.is_enabled()
+    custom_ops_enabled = henvs.custom_ops_enabled()
+    effective_force_aiter = custom_ops_enabled and force_aiter_triton
+    use_aiter = effective_force_aiter or (
+        custom_ops_enabled and rocm_aiter_ops.is_enabled()
     )
     if is_gfx938 and block_size != 1:
-        if force_aiter_triton:
+        if effective_force_aiter:
             raise RuntimeError(
                 "AITER paged-MQA does not support gfx938 preshuffled KPool pages"
             )
@@ -978,17 +1016,13 @@ def rocm_fp8_paged_mqa_logits(
             # LightOp paged_mqa_logits reads token-major pages only. It
             # rejects next_n > 2 and ignores per-query [B, next_n] lengths,
             # so each MTP verify token becomes its own batch row.
-            if next_n > 1:
-                if context_lens.ndim == 1:
-                    offsets = torch.arange(
-                        next_n, dtype=context_lens.dtype, device=context_lens.device
-                    )
-                    context_lens = (
-                        context_lens[:, None] - next_n + 1 + offsets
-                    ).clamp_min(0)
-                q_fp8 = q_fp8.reshape(batch_size * next_n, 1, *q_fp8.shape[2:])
-                block_tables = block_tables.repeat_interleave(next_n, dim=0)
-            context_lens = context_lens.reshape(batch_size * next_n).contiguous()
+            q_fp8, context_lens, block_tables = _lightop_paged_mqa_inputs(
+                q_fp8,
+                context_lens,
+                block_tables,
+                batch_size,
+                next_n,
+            )
             return _get_lightop_attention().paged_mqa_logits(
                 q_fp8,
                 kv_cache_fp8,
@@ -1011,7 +1045,7 @@ def rocm_fp8_paged_mqa_logits(
     aiter_paged_mqa_logits_module = None
     if use_aiter:
         aiter_paged_mqa_logits_module = paged_mqa_logits_module()
-    if force_aiter_triton and aiter_paged_mqa_logits_module is None:
+    if effective_force_aiter and aiter_paged_mqa_logits_module is None:
         raise RuntimeError(
             "HCU GLM5Next sparse decode requires the packaged AITER "
             "pa_mqa_logits Triton module"
@@ -1070,6 +1104,13 @@ def rocm_fp8_paged_mqa_logits(
             q_fp8, kv_cache_fp8, weights, context_lens, block_tables, max_model_len
         )
     elif current_platform.is_rocm():
+        q_fp8, context_lens, block_tables = _lightop_paged_mqa_inputs(
+            q_fp8,
+            context_lens,
+            block_tables,
+            batch_size,
+            next_n,
+        )
         return _get_lightop_attention().paged_mqa_logits(
             q_fp8, 
             kv_cache_fp8, 
