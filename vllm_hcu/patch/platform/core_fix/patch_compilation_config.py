@@ -172,20 +172,6 @@ def apply_to_module(module: ModuleType) -> bool:
             all2all_backend,
             data_parallel_size,
         )
-        feature_config = _bound_hcu_config(self) or HcuFeatureConfig()
-        if feature_config.deepep_auto and data_parallel_size > 1:
-            # deepep_auto includes the same HT dispatch that upstream marks
-            # CUDA-Graph incompatible for DP. Keep the standard CLI contract
-            # and apply upstream's automatic graph fallback internally.
-            if getattr(self, "cudagraph_mode", None) != cudagraph_none:
-                logger = getattr(compilation_module, "logger", None)
-                if logger is not None:
-                    logger.info(
-                        "DeepEP auto: disabling CUDA Graphs because the "
-                        "high-throughput dispatch phase is not graph compatible."
-                    )
-                self.cudagraph_mode = cudagraph_none
-            return result
 
         # With Inductor graph partitioning enabled, the operator's
         # ``cudagraph_unsafe`` tag is authoritative. HCU currently uses the
