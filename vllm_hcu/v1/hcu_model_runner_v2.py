@@ -23,6 +23,7 @@ from vllm_hcu.forward_context_runtime import (
     deepep_auto_request_phase_scope,
     set_deepep_auto_request_phase,
 )
+from vllm_hcu.patch.config import get_hcu_config
 from vllm_hcu.v1.pcp_manager import make_hcu_pcp_manager_cls
 from vllm_hcu.patch.platform.core_fix.patch_vllm_config import is_glm53_pcp
 from vllm_hcu.deepseek_v4_runtime import is_deepseek_v4
@@ -47,6 +48,20 @@ _USE_HOST_SEQ_LENS = henvs.optional_custom_op_enabled(
 # Debug: compare the mirror against the device seq_lens every step.
 _CHECK_HOST_SEQ_LENS = os.environ.get("VLLM_HCU_CHECK_HOST_SEQ_LENS", "0") == "1"
 _SAMPLER_WARMUP = ContextVar("hcu_sampler_warmup", default=False)
+_DEEPEP_AUTO_DUMMY_PHASE: ContextVar[bool | None] = ContextVar(
+    "vllm_hcu_deepep_auto_dummy_phase", default=None
+)
+
+
+@contextmanager
+def _deepep_auto_dummy_phase_scope(is_prefilling: bool | None):
+    """Keep a worker dummy phase available to its nested execute call."""
+
+    token = _DEEPEP_AUTO_DUMMY_PHASE.set(is_prefilling)
+    try:
+        yield
+    finally:
+        _DEEPEP_AUTO_DUMMY_PHASE.reset(token)
 
 
 @contextmanager
@@ -350,6 +365,12 @@ class HcuGPUModelRunnerV2(GPUModelRunner):
             if kwargs.get("dummy_run", False) and is_glm53_pcp(self.vllm_config):
                 dummy_scope = replicated_mtp_batch_scope()
         with deepep_auto_request_phase_scope(), scope, dummy_scope:
+            dummy_phase = _DEEPEP_AUTO_DUMMY_PHASE.get()
+            if (
+                dummy_phase is not None
+                and get_hcu_config(self.vllm_config).deepep_auto
+            ):
+                set_deepep_auto_request_phase(dummy_phase)
             if is_step5_config(getattr(self, "vllm_config", None)):
                 from vllm_hcu.v1.step5_execution import execute_model
 
@@ -416,6 +437,17 @@ class HcuGPUModelRunnerV2(GPUModelRunner):
 
     def _dummy_run(self, num_tokens, *args, **kwargs):
         """Optionally stub target forward while sizing full-batch MTP."""
+
+        phase_scope = nullcontext()
+        if get_hcu_config(self.vllm_config).deepep_auto:
+            phase_scope = _deepep_auto_dummy_phase_scope(
+                not bool(kwargs.get("uniform_decode", False))
+            )
+        with phase_scope:
+            return self._dummy_run_with_phase(num_tokens, *args, **kwargs)
+
+    def _dummy_run_with_phase(self, num_tokens, *args, **kwargs):
+        """Run the upstream/profile dummy while its phase scope is active."""
 
         if not getattr(self, "_hcu_profile_mtp_full_batch", False):
             return super()._dummy_run(num_tokens, *args, **kwargs)
