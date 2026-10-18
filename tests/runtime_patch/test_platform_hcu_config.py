@@ -744,6 +744,7 @@ def test_engine_args_preserves_platform_resolved_compile_factors() -> None:
             get_hcu_config(config).with_updates(
                 fused_qwen3_rms_rope=False,
                 hcu_flash_attn_mode="varlen",
+                qsa_prefill_indexer=True,
             ),
         )
         return config
@@ -755,6 +756,7 @@ def test_engine_args_preserves_platform_resolved_compile_factors() -> None:
 
     assert get_hcu_config(config).fused_qwen3_rms_rope is False
     assert get_hcu_config(config).hcu_flash_attn_mode == "varlen"
+    assert get_hcu_config(config).qsa_prefill_indexer is True
 
 
 def test_engine_args_rejects_incompatible_target_signature() -> None:
