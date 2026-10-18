@@ -78,6 +78,125 @@ unrelated DeepGEMM numerical test. The QSA-focused suites passed.
 
 **Kernel gate: PASS.** The required BS16 4096 target improves by `48.229%`,
 well above the 10% advancement threshold, with numerical/top-k parity and no
-new HCU fault. Proceed to an opt-in prefill-only serving route. This result is
-not yet evidence of end-to-end TTFT improvement; serving A/B remains required.
+new HCU fault. This justified testing an opt-in prefill-only serving route.
 
+## Serving integration
+
+The candidate was integrated behind both `VLLM_HCU_USE_CUSTOM_OPS=1` and the
+new `VLLM_HCU_QSA_PREFILL_INDEXER=1` switch. Pure prefill QSA selection uses
+the request-major scorer; decode, speculative decode, and mixed batches retain
+the original selector. Dense prefill remained disabled.
+
+The first ON startup exposed a configuration propagation defect: the resolved
+`qsa_prefill_indexer=True` value was overwritten while `EngineArgs` rebuilt the
+compile factors. Commit `7aebcc7` adds the field to the same preservation list
+as the other platform-resolved policies and adds a regression assertion. The
+relevant post-fix suite passed `345` tests.
+
+The tested worktree was installed without changing vLLM or its dependencies:
+
+```bash
+pip install --force-reinstall --no-deps --no-build-isolation .
+```
+
+Serving configuration was identical on both sides except for the candidate
+switch:
+
+- Model: `/models/Qwen3.8-Flash-Next-w4a8-slimquant-ngram-int8-mtp`
+- TP1, DP4, EP4 on HCU 0-3; AITER MoE and allgather/reducescatter
+- MTP with 3 speculative tokens; FP8 e5m2 KV cache
+- Maximum model length 32768; maximum batched tokens 16384; maximum sequences 64
+- Prefix caching off, thinking off, dense prefill off
+- `FULL_AND_PIECEWISE` compile mode
+- Three warmup rounds followed by five measured seeds, each with 16 concurrent
+  requests of exactly 4096 input and 1024 output tokens
+- Temperature 0 and ignore-EOS enabled
+
+ON logs explicitly reported `Qwen4Exp QSA routing: prefill-only selection uses
+the HCU request-major indexer`. OFF and ON used distinct compile-cache hashes,
+`90b5c642f5` and `d29b64389e`, respectively.
+
+## Serving A/B
+
+Each aggregate below is the median of the five run-level values:
+
+| Metric | OFF | ON | ON vs OFF |
+|---|---:|---:|---:|
+| Mean TTFT | 2901.787 ms | 2884.335 ms | -0.601% |
+| Median TTFT | 3042.263 ms | 2931.172 ms | -3.652% |
+| Mean TPOT | 33.015 ms | 32.995 ms | -0.060% |
+| Median TPOT | 29.136 ms | 30.941 ms | +6.196% |
+| Output throughput | 288.428 token/s | 306.664 token/s | +6.323% |
+| MTP acceptance | 60.840% | 59.550% | -1.290 percentage points |
+| Completed requests | 80/80 | 80/80 | unchanged |
+
+Mean-TTFT values by measured seed were:
+
+- OFF: `3283.966, 2802.187, 2904.500, 2901.787, 2826.134` ms
+- ON: `3713.418, 3814.879, 2854.862, 2773.788, 2884.335` ms
+- Paired ON changes: `+13.077%, +36.139%, -1.709%, -4.411%, +2.059%`
+
+The paired median is a `2.059%` regression and the paired mean is a `9.031%`
+regression. The first two measured ON rounds still logged inference-time Triton
+JIT compilation for selection expansion and MTP rejection/resampling kernels,
+despite the three warmups. This explains some variance, but it also means the
+current procedure does not demonstrate a reproducible end-to-end improvement.
+
+Weighted over all draft tokens, MTP acceptance changed from `52,892 / 87,168 =
+60.678%` OFF to `52,321 / 88,881 = 58.866%` ON. Because the generated token
+trajectories differed, this is not a controlled measurement of an MTP change
+caused by the scorer alone.
+
+Raw results are under:
+
+- `/models/pr248_qsa_prefill_indexer_ab_20261018/off`
+- `/models/pr248_qsa_prefill_indexer_ab_20261018/on`
+
+## Trace attribution
+
+PyTorch/ROCTracer Chrome traces were captured after three kernel warmups for
+the BS16, input-4096 score operation. Both paths launch two chunks under the
+same 128 MiB logits budget:
+
+| Trace | Kernel | Calls | GPU total |
+|---|---|---:|---:|
+| CUTLASS | `mqa_paged_score_mmac_kernel` | 2 | 7.296 ms |
+| Candidate | `_qsa_mqa_paged_prefill_kernel` | 2 | 3.179 ms |
+
+The trace therefore attributes a `56.43%` score-kernel reduction to the
+request-major layout. This is consistent with the synchronized-event
+microbenchmark. However, the saved scorer work is only about 4 ms against an
+approximately 2.9-second serving TTFT, so the trace also explains why it does
+not reproduce PR 247's seconds-scale TTFT change.
+
+Trace files:
+
+- `/models/pr248_qsa_prefill_indexer_trace_20261018/cutlass_bs16_in4096.json`
+- `/models/pr248_qsa_prefill_indexer_trace_20261018/request_major_bs16_in4096.json`
+
+## Accuracy and safety
+
+Kernel-level numerical and top-k checks passed, and an ON serving smoke prompt
+requesting exactly `OK` returned exactly `OK` with thinking disabled and
+temperature 0. The response is saved as
+`/models/pr248_qsa_prefill_indexer_ab_20261018/on/accuracy_smoke.json`.
+
+The long random benchmark outputs were not byte-identical across separate OFF
+and ON server runs (`0/80` exact matches; median common text prefix was zero).
+This benchmark is not an accuracy evaluation, and separate DP/MoE runs can
+also diverge, so it cannot isolate an accuracy regression. Conversely, the
+smoke test alone cannot prove full HumanEval or MathVision parity. A real
+accuracy claim would require rerunning the same evaluation set with the
+candidate enabled.
+
+After the serving runs and trace capture, the latest matching HCU fault in
+`dmesg` was still the pre-existing `2026-10-18 10:42:24` event. No new VMFault,
+invalid-address, page-fault, or failed serving request occurred.
+
+## Final decision
+
+**Serving gate: NO-GO for PR 248 in its current form.** Keep the implementation
+on the experimental branch, but do not add it to PR 248 yet. The scorer itself
+is correct on the focused tests and 48-56% faster, but its absolute saving is
+only about 4 ms and the five-run serving A/B does not show a reproducible TTFT
+gain. Full evaluation accuracy is also not established for the opt-in route.
