@@ -171,3 +171,27 @@ def test_prefill_chunk_offset_keeps_absolute_request_rows():
         row_offset=row_offset,
     )
 
+
+def test_benchmark_contract_covers_required_shapes():
+    from benchmarks.kernels.benchmark_qsa_prefill_indexer import required_cases
+
+    assert [
+        (case.batch, case.query_len, case.prefix_len)
+        for case in required_cases()
+    ] == [
+        (4, 4096, 0),
+        (16, 4096, 0),
+        (4, 4096, 8192),
+    ]
+
+
+def test_benchmark_contract_rejects_fewer_than_three_rounds():
+    from benchmarks.kernels.benchmark_qsa_prefill_indexer import (
+        build_parser,
+        validate_args,
+    )
+
+    parser = build_parser()
+    args = parser.parse_args(["--rounds", "2"])
+    with pytest.raises(SystemExit):
+        validate_args(args, parser)
