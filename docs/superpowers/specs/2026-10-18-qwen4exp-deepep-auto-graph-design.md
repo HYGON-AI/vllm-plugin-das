@@ -187,4 +187,3 @@ workspace:
 The MR will be stacked on MR #247 and include the exact server command,
 benchmark command, accuracy result, relevant log paths, performance comparison,
 and any PIECEWISE-to-NONE fallback disclosed explicitly.
-
