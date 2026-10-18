@@ -13,6 +13,20 @@ from typing import Any
 _DEEPEP_AUTO_REQUEST_PHASE: ContextVar[list[object | None] | None] = ContextVar(
     "vllm_hcu_deepep_auto_request_phase", default=None
 )
+_DEEPEP_AUTO_CAPTURE_MODE: ContextVar[object | None] = ContextVar(
+    "vllm_hcu_deepep_auto_capture_mode", default=None
+)
+
+
+@contextmanager
+def deepep_auto_capture_mode_scope(cudagraph_mode: object | None):
+    """Expose the descriptor mode while upstream calls FULL capture as NONE."""
+
+    token = _DEEPEP_AUTO_CAPTURE_MODE.set(cudagraph_mode)
+    try:
+        yield
+    finally:
+        _DEEPEP_AUTO_CAPTURE_MODE.reset(token)
 
 
 @contextmanager
@@ -84,6 +98,12 @@ def choose_deepep_auto_low_latency(
     if cudagraph_runtime_mode is not None:
         from vllm.config.compilation import CUDAGraphMode
 
+        capture_mode = _DEEPEP_AUTO_CAPTURE_MODE.get()
+        if (
+            cudagraph_runtime_mode == CUDAGraphMode.NONE
+            and capture_mode in (CUDAGraphMode.FULL, CUDAGraphMode.PIECEWISE)
+        ):
+            cudagraph_runtime_mode = capture_mode
         if cudagraph_runtime_mode == CUDAGraphMode.FULL:
             return True
         if cudagraph_runtime_mode == CUDAGraphMode.PIECEWISE:
