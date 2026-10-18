@@ -65,8 +65,9 @@ def choose_deepep_auto_low_latency(
     batch_descriptor: object | None,
     attn_metadata: object | None = None,
     is_prefilling: object | None = None,
+    cudagraph_runtime_mode: object | None = None,
 ) -> bool:
-    """Choose LL for uniform decode and HT for prefill/mixed batches."""
+    """Choose LL for FULL decode graphs or synchronized eager decode."""
 
     from vllm_hcu.patch.config import get_hcu_config
 
@@ -79,6 +80,20 @@ def choose_deepep_auto_low_latency(
     fixed_use_low_latency = dspark_mooncake_pd_use_low_latency(vllm_config)
     if fixed_use_low_latency is not None:
         return fixed_use_low_latency
+
+    if cudagraph_runtime_mode is not None:
+        from vllm.config.compilation import CUDAGraphMode
+
+        if cudagraph_runtime_mode == CUDAGraphMode.FULL:
+            return True
+        if cudagraph_runtime_mode == CUDAGraphMode.PIECEWISE:
+            return False
+        if cudagraph_runtime_mode != CUDAGraphMode.NONE:
+            raise ValueError(
+                "DeepEP auto requires a concrete CUDA Graph runtime mode "
+                f"(NONE, PIECEWISE, or FULL), got {cudagraph_runtime_mode!r}"
+            )
+
     # Backend-specific attention metadata does not consistently retain
     # CommonAttentionMetadata.is_prefilling.  Require the runner's explicit
     # per-request phase vector instead of inferring phase from query lengths.
