@@ -67,7 +67,7 @@
 
 **Files:**
 - Create: `benchmarks/kernels/benchmark_qsa_prefill_indexer.py`
-- Create: `docs/validation/pr248-qsa-prefill-indexer-spike.md`
+- Create: `docs/validation/qsa-prefill-indexer-spike.md`
 
 **Interfaces:**
 - Consumes: Task 1's `qsa_mqa_paged_prefill` and the installed `flash_attn.mqa_paged_score_func` baseline.
@@ -95,7 +95,7 @@
 
 - [ ] **Step 5: Commit**
 
-  Run: `git add benchmarks/kernels/benchmark_qsa_prefill_indexer.py docs/validation/pr248-qsa-prefill-indexer-spike.md tests/kernels/test_qsa_prefill_indexer.py && git commit -m "bench(qsa): compare prefill scorer with CUTLASS"`
+  Run: `git add benchmarks/kernels/benchmark_qsa_prefill_indexer.py docs/validation/qsa-prefill-indexer-spike.md tests/kernels/test_qsa_prefill_indexer.py && git commit -m "bench(qsa): compare prefill scorer with CUTLASS"`
 
 ### Task 3: Conditional opt-in serving route
 
@@ -133,7 +133,7 @@
 
 - [ ] **Step 5: Run focused and full neighboring suites**
 
-  Run: `pytest -q tests/kernels/test_qsa_prefill_indexer.py tests/runtime_patch/test_qwen4_exp_qsa_backend.py tests/runtime_patch/test_qwen4_exp_qsa_prefill_indexer.py tests/runtime_patch/test_qwen4_exp_qsa_dense_prefill.py tests/accuracy/test_environment_routing.py tests/patch/test_config.py tests/runtime_patch/test_worker_framework_opt.py`
+  Run: `pytest -q tests/kernels/test_qsa_prefill_indexer.py tests/runtime_patch/test_qwen4_exp_qsa_backend.py tests/runtime_patch/test_qwen4_exp_qsa_prefill_indexer.py tests/accuracy/test_environment_routing.py tests/patch/test_config.py tests/runtime_patch/test_platform_hcu_config.py tests/runtime_patch/test_worker_framework_opt.py`
 
   Expected: all tests pass.
 
@@ -144,7 +144,7 @@
 ### Task 4: Conditional serving A/B
 
 **Files:**
-- Modify: `docs/validation/pr248-qsa-prefill-indexer-spike.md`
+- Modify: `docs/validation/qsa-prefill-indexer-spike.md`
 
 **Interfaces:**
 - Consumes: Task 3's opt-in route and the existing BS16 input-4096/output-1024 harness.
@@ -168,7 +168,6 @@
 
   Add TTFT, TPOT, throughput, request success, accuracy smoke, trace totals, and the go/no-go decision to the validation note.
 
-  Run: `git add docs/validation/pr248-qsa-prefill-indexer-spike.md && git commit -m "docs(qsa): record prefill indexer validation"`
+  Run: `git add docs/validation/qsa-prefill-indexer-spike.md && git commit -m "docs(qsa): record prefill indexer validation"`
 
-  Expected: the note distinguishes kernel gain from end-to-end gain and does not recommend PR 248 unless both correctness and reproducible serving performance pass.
-
+  Expected: the note distinguishes kernel gain from end-to-end gain and keeps the route default-off unless both correctness and reproducible serving performance pass.

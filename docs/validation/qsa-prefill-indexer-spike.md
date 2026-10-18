@@ -1,9 +1,10 @@
-# PR 248 QSA prefill-indexer spike validation
+# QSA prefill-indexer spike validation
 
 ## Scope
 
-This experiment tests the request-major prefill score-kernel design from
-upstream vLLM PR 54513 against the HCU baseline actually used by PR 248:
+This experiment originated while analyzing PR 248. It tests the request-major
+prefill score-kernel design from upstream vLLM PR 54513 against the HCU
+baseline used by the standalone `v0.28.1-dev` feature:
 `flash_attn.mqa_paged_score_func`. It does not compare against upstream's
 generic NVIDIA Triton baseline and it does not enable dense prefill.
 
@@ -17,7 +18,8 @@ the FP8 sparse-attention reader are unchanged.
 - PyTorch: `2.11.0`
 - HIP: `6.3.26113`
 - vLLM: `0.28.1+dtk2604.torch2110.2609171627.g77acaf`
-- Plugin branch: `codex/qsa-prefill-indexer-spike`
+- Source experiment branch: `codex/qsa-prefill-indexer-spike`
+- Standalone integration branch: `feature/qsa-prefill-indexer`
 - Kernel commit: `525d241` (`feat(qsa): prototype request-major prefill scorer`)
 - Timer: synchronized HIP events
 - Temporary-logits budget: 128 MiB per chunk
@@ -195,8 +197,9 @@ invalid-address, page-fault, or failed serving request occurred.
 
 ## Final decision
 
-**Serving gate: NO-GO for PR 248 in its current form.** Keep the implementation
-on the experimental branch, but do not add it to PR 248 yet. The scorer itself
-is correct on the focused tests and 48-56% faster, but its absolute saving is
-only about 4 ms and the five-run serving A/B does not show a reproducible TTFT
-gain. Full evaluation accuracy is also not established for the opt-in route.
+**Default-enable gate: NO-GO.** Keep this implementation behind the default-off
+experimental switch. The scorer itself is correct on the focused tests and
+48-56% faster, but its absolute saving is only about 4 ms and the five-run
+serving A/B does not show a reproducible TTFT gain. Full evaluation accuracy is
+also not established for the opt-in route. The standalone Draft MR exists to
+continue isolated validation without coupling its lifecycle to PR 248.

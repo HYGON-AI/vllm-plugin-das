@@ -55,8 +55,8 @@ Decode, speculative decode, mixed batches, and any unsupported shape fall back
 before launching the new kernel. Then run three warmups and five measured
 serving A/B rounds at batch 16, input 4096, output 1024 with dense prefill
 disabled on both sides. Report TTFT, TPOT, throughput, failures, and any HCU
-VMFault. Do not claim an optimization or update PR 248 unless the end-to-end
-result is reproducible and accuracy remains unchanged.
+VMFault. Do not enable the route by default unless the end-to-end result is
+reproducible and accuracy remains unchanged.
 
 ## Failure and safety rules
 
@@ -67,4 +67,3 @@ result is reproducible and accuracy remains unchanged.
 - Keep the prototype opt-in until kernel and serving gates pass.
 - On a VMFault, stop that shape, collect the kernel arguments and system log,
   and return to root-cause analysis before another launch.
-
