@@ -11,7 +11,10 @@ import weakref
 from collections.abc import Mapping
 from types import ModuleType
 
-from vllm_hcu.deepseek_v4_runtime import dspark_mooncake_pd_use_low_latency
+from vllm_hcu.deepseek_v4_runtime import (
+    config_field,
+    dspark_mooncake_pd_use_low_latency,
+)
 from vllm_hcu.patch.config import HcuFeatureConfig, get_hcu_config
 
 from ._common import PatchCompatibilityError, apply_once, load_exact_module
@@ -58,12 +61,9 @@ def _bound_hcu_config(compilation_config: object) -> HcuFeatureConfig | None:
 
 
 def _parallel_size(vllm_config: object) -> int:
-    if isinstance(vllm_config, Mapping):
-        parallel_config = vllm_config.get("parallel_config")
-    else:
-        parallel_config = getattr(vllm_config, "parallel_config", None)
+    parallel_config = config_field(vllm_config, "parallel_config")
     return max(
-        int(getattr(parallel_config, name, 1) or 1)
+        int(config_field(parallel_config, name, 1) or 1)
         for name in (
             "data_parallel_size",
             "prefill_context_parallel_size",

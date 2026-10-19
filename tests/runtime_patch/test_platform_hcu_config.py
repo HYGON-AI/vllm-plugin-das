@@ -1062,6 +1062,37 @@ def test_compilation_adapter_limits_fixed_ll_deepep_auto_consumer_to_decode_full
     assert config.cudagraph_mode is module.CUDAGraphMode.FULL_DECODE_ONLY
 
 
+def test_compilation_adapter_restores_fixed_ht_policy_from_mapping_config() -> None:
+    module = _make_compilation_module()
+    patch_compilation_config.apply_to_module(module)
+    config = module.CompilationConfig()
+    config.cudagraph_mode = module.CUDAGraphMode.FULL_DECODE_ONLY
+    serialized_vllm_config = {
+        "additional_config": {
+            "hcu": HcuFeatureConfig(deepep_auto=True).to_dict()
+        },
+        "compilation_config": config,
+        "model_config": {"architectures": ["DeepseekV4ForCausalLM"]},
+        "speculative_config": {"method": "dspark"},
+        "kv_transfer_config": {
+            "kv_connector": "MooncakeConnector",
+            "kv_role": "kv_producer",
+        },
+        "parallel_config": {
+            "data_parallel_size": 4,
+            "prefill_context_parallel_size": 1,
+            "decode_context_parallel_size": 1,
+        },
+    }
+    patch_compilation_config.bind_hcu_config(serialized_vllm_config)
+
+    # Worker rebind accepts the pickled dictionary form. Use the callback's
+    # default DP argument to prove the bound nested topology was restored too.
+    config.set_splitting_ops_for_v1("deepep_low_latency")
+
+    assert config.cudagraph_mode is module.CUDAGraphMode.NONE
+
+
 def test_compilation_adapter_keeps_piecewise_for_single_rank_deepep_auto() -> None:
     module = _make_compilation_module()
     patch_compilation_config.apply_to_module(module)
