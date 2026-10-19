@@ -815,7 +815,11 @@ def test_local_query_runs_cover_owned_rows_in_order(pcp_size):
 
 @pytest.mark.parametrize("contiguous", [True, False])
 @pytest.mark.parametrize("enabled", [True, False])
-def test_local_prefill_runs_write_local_output_in_place(monkeypatch, enabled, contiguous):
+@pytest.mark.parametrize("custom_ops", [True, False])
+def test_local_prefill_runs_write_local_output_in_place(
+    monkeypatch, custom_ops, enabled, contiguous
+):
+    monkeypatch.setenv("VLLM_HCU_USE_CUSTOM_OPS", "1" if custom_ops else "0")
     monkeypatch.setenv("VLLM_HCU_DEEPSEEK_V4_PCP_LOCAL_SLICES", "1" if enabled else "0")
     calls = []
 
@@ -843,4 +847,4 @@ def test_local_prefill_runs_write_local_output_in_place(monkeypatch, enabled, co
     expected[local_rows] = (local_q[local_rows] * 2 + indices[selected, :1, None]
                             + topk[selected, None, None])
     torch.testing.assert_close(local_out, expected)
-    assert calls == ([2, 1] if enabled and contiguous else [3])
+    assert calls == ([2, 1] if custom_ops and enabled and contiguous else [3])

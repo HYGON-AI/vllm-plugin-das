@@ -36,6 +36,7 @@ def blas(monkeypatch):
 @pytest.mark.parametrize("layout", ["nn", "nt"])
 @pytest.mark.parametrize("backend", ["torch", "blaslt"])
 def test_outputs_and_dispatch(monkeypatch, blas, layout, backend):
+    monkeypatch.setenv("VLLM_HCU_USE_CUSTOM_OPS", "1")
     monkeypatch.setenv("VLLM_HCU_COMPRESSOR_GEMM_BACKEND", backend)
     x = torch.randn(7, 5, dtype=torch.bfloat16, device="cuda")
     nn = torch.randn(5, 3, dtype=torch.bfloat16, device="cuda")
@@ -48,8 +49,21 @@ def test_outputs_and_dispatch(monkeypatch, blas, layout, backend):
         assert blas[0].shape == (3, 5)
 
 
+def test_master_switch_disables_blaslt(monkeypatch, blas):
+    monkeypatch.setenv("VLLM_HCU_USE_CUSTOM_OPS", "0")
+    monkeypatch.setenv("VLLM_HCU_COMPRESSOR_GEMM_BACKEND", "blaslt")
+    x = torch.randn(7, 5, dtype=torch.bfloat16, device="cuda")
+    w = torch.randn(5, 3, dtype=torch.bfloat16, device="cuda")
+
+    result = patch._compressor_mm(x, w)
+
+    torch.testing.assert_close(result, torch.mm(x, w, out_dtype=torch.float32))
+    assert not blas
+
+
 @pytest.mark.parametrize("case", ["fp32", "square"])
 def test_ineligible_weights_keep_torch(monkeypatch, blas, case):
+    monkeypatch.setenv("VLLM_HCU_USE_CUSTOM_OPS", "1")
     monkeypatch.setenv("VLLM_HCU_COMPRESSOR_GEMM_BACKEND", "blaslt")
     dtype = torch.float32 if case == "fp32" else torch.bfloat16
     k = 5

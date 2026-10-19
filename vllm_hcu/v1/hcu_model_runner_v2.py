@@ -50,6 +50,10 @@ _CHECK_HOST_SEQ_LENS = os.environ.get("VLLM_HCU_CHECK_HOST_SEQ_LENS", "0") == "1
 _SAMPLER_WARMUP = ContextVar("hcu_sampler_warmup", default=False)
 
 
+def _kv_zero_by_group_enabled() -> bool:
+    return henvs.optional_custom_op_enabled(henvs.VLLM_HCU_KV_ZERO_BY_GROUP)
+
+
 @contextmanager
 def sampler_warmup_scope():
     """Mark worker-controlled startup, independently of user request IDs."""
@@ -117,12 +121,12 @@ class _GroupKVBlockZeroer:
     def warmup(self, num_kv_blocks: int) -> None:
         """Preserve the upstream zeroer lifecycle and compile group kernels."""
         self.fallback.warmup(num_kv_blocks)
-        if henvs.VLLM_HCU_KV_ZERO_BY_GROUP:
+        if _kv_zero_by_group_enabled():
             for zeroer in self.zeroers.values():
                 zeroer.warmup(num_kv_blocks)
 
     def zero_block_ids(self, block_ids) -> None:
-        if not henvs.VLLM_HCU_KV_ZERO_BY_GROUP or self.owners is None:
+        if not _kv_zero_by_group_enabled() or self.owners is None:
             self.fallback.zero_block_ids(block_ids)
             return
 
@@ -194,7 +198,7 @@ class HcuGPUModelRunnerV2(GPUModelRunner):
         super()._init_kv_zero_meta()
         fallback = self.kv_block_zeroer
         if (
-            not henvs.VLLM_HCU_KV_ZERO_BY_GROUP
+            not _kv_zero_by_group_enabled()
             or fallback is None
             or fallback._meta is None
         ):

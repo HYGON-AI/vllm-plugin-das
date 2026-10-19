@@ -73,7 +73,8 @@ def _compressor_mm(hidden_states: torch.Tensor, weight: torch.Tensor) -> torch.T
             f"got {backend!r}"
         )
     if (
-        backend == "blaslt"
+        henvs.custom_ops_enabled()
+        and backend == "blaslt"
         and weight.is_cuda
         and weight.dtype == torch.bfloat16
     ):

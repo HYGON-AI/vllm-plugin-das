@@ -46,6 +46,7 @@ def test_conflicting_owner_uses_fallback():
 
 
 def test_dispatches_to_owner_and_falls_back(monkeypatch):
+    monkeypatch.setenv("VLLM_HCU_USE_CUSTOM_OPS", "1")
     monkeypatch.delenv("VLLM_HCU_KV_ZERO_BY_GROUP", raising=False)
     calls = []
     dispatcher = _GroupKVBlockZeroer(
@@ -58,6 +59,7 @@ def test_dispatches_to_owner_and_falls_back(monkeypatch):
 
 
 def test_disabled_dispatcher_uses_upstream_zeroer(monkeypatch):
+    monkeypatch.setenv("VLLM_HCU_USE_CUSTOM_OPS", "1")
     monkeypatch.setenv("VLLM_HCU_KV_ZERO_BY_GROUP", "0")
     calls = []
     dispatcher = _GroupKVBlockZeroer(
@@ -68,7 +70,20 @@ def test_disabled_dispatcher_uses_upstream_zeroer(monkeypatch):
     assert calls == [("all", [1])]
 
 
+def test_master_switch_disables_dispatcher(monkeypatch):
+    monkeypatch.setenv("VLLM_HCU_USE_CUSTOM_OPS", "0")
+    monkeypatch.setenv("VLLM_HCU_KV_ZERO_BY_GROUP", "1")
+    calls = []
+    dispatcher = _GroupKVBlockZeroer(
+        RecordingZeroer(calls, "all"), {0: RecordingZeroer(calls, "g0")}
+    )
+    dispatcher.owners = {1: 0}
+    dispatcher.zero_block_ids([1])
+    assert calls == [("all", [1])]
+
+
 def test_group_zeroer_preserves_native_warmup_contract(monkeypatch):
+    monkeypatch.setenv("VLLM_HCU_USE_CUSTOM_OPS", "1")
     monkeypatch.delenv("VLLM_HCU_KV_ZERO_BY_GROUP", raising=False)
     calls = []
 
@@ -112,6 +127,7 @@ def test_update_uses_upstream_order_without_mutating_output(monkeypatch):
 
 
 def test_init_builds_one_upstream_zeroer_per_group(monkeypatch):
+    monkeypatch.setenv("VLLM_HCU_USE_CUSTOM_OPS", "1")
     monkeypatch.delenv("VLLM_HCU_KV_ZERO_BY_GROUP", raising=False)
     built = []
 
@@ -146,11 +162,13 @@ def test_init_builds_one_upstream_zeroer_per_group(monkeypatch):
     assert sorted(runner.kv_block_zeroer.zeroers) == [0, 2]
 
 
+@pytest.mark.parametrize("custom_ops", [False, True])
 @pytest.mark.parametrize("enabled", [False, True])
 @pytest.mark.parametrize("num_groups", [1, 3])
 def test_init_and_startup_warmup_for_single_and_multi_group(
-    monkeypatch, enabled, num_groups
+    monkeypatch, custom_ops, enabled, num_groups
 ):
+    monkeypatch.setenv("VLLM_HCU_USE_CUSTOM_OPS", "1" if custom_ops else "0")
     monkeypatch.setenv("VLLM_HCU_KV_ZERO_BY_GROUP", "1" if enabled else "0")
     calls = []
 
@@ -180,7 +198,7 @@ def test_init_and_startup_warmup_for_single_and_multi_group(
     # This is the exact interface called by vllm.v1.worker.gpu.warmup.
     runner.kv_block_zeroer.warmup(runner.kv_cache_config.num_blocks)
 
-    wrapped = enabled and num_groups > 1
+    wrapped = custom_ops and enabled and num_groups > 1
     assert isinstance(runner.kv_block_zeroer, _GroupKVBlockZeroer) is wrapped
     expected = [("g0.warmup", 32)]
     if wrapped:

@@ -106,7 +106,9 @@ def _can_use_local_queries(layer, batch) -> bool:
 def _local_slices_enabled() -> bool:
     from vllm_hcu.platforms import envs as henvs
 
-    return henvs.VLLM_HCU_DEEPSEEK_V4_PCP_LOCAL_SLICES
+    return henvs.optional_custom_op_enabled(
+        henvs.VLLM_HCU_DEEPSEEK_V4_PCP_LOCAL_SLICES
+    )
 
 
 def _run_local_prefill(kernel, batch, root_q, decode_tokens, **kwargs):
