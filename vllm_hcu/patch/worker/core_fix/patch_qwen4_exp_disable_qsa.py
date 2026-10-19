@@ -6,7 +6,10 @@
 native non-QSA branch (``Qwen3NextAttention``), so full-attention layers run
 the platform's standard FlashAttention path over a regular KV cache with no
 indexer or top-k selection.  Backbone and MTP drafter layers share
-``Qwen4ExpDecoderLayer``, so both are covered.
+``Qwen4ExpDecoderLayer``, so both are covered.  The same switch also enables
+the FlashAttention backend's mixed decode/prefill batch split (see
+``_SPLIT_PD`` in ``vllm_hcu/v1/attention/backends/flash_attn.py``), so dense
+replacement and the split ship as one option.
 
 The QSA owner registers itself and its indexer side caches in the global
 ``static_forward_context`` while it is constructed, so it must never be built:

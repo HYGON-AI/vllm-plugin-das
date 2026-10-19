@@ -139,7 +139,10 @@ if TYPE_CHECKING:
 # mixed prefill/decode batches into two varlen calls, each with its own
 # max_query_len (decode rows lead the reordered batch).  0 (default) keeps
 # the existing mode dispatch untouched.
-_SPLIT_PD = os.environ.get("VLLM_HCU_SPLIT_PD", "0") == "1"
+# The dense-QSA replacement and the mixed-batch split ship as one switch:
+# VLLM_HCU_DISABLE_QSA=1 makes full-attention layers dense (see
+# patch_qwen4_exp_disable_qsa) and splits mixed decode/prefill batches here.
+_SPLIT_PD = os.environ.get("VLLM_HCU_DISABLE_QSA", "0") == "1"
 
 
 def _get_flash_attn_mode() -> str:
@@ -428,7 +431,7 @@ class FlashAttentionMetadata:
 
     sliding_window: tuple[int, int] | None = None
 
-    # Decode/prefill batch split (populated only when VLLM_HCU_SPLIT_PD=1).
+    # Decode/prefill batch split (populated only when VLLM_HCU_DISABLE_QSA=1).
     num_decodes: int = 0
     num_decode_tokens: int = 0
     decode_query_len: int = 0
@@ -1133,9 +1136,9 @@ class FlashAttentionImpl(AttentionImpl):
                     # dispatch: routing them through the varlen interface
                     # would bypass their FP8 d192 paged paths entirely.
                     logger.warning_once(
-                        "[HCU FLASH_ATTN PATH] VLLM_HCU_SPLIT_PD=1 is only "
-                        "supported in varlen mode; %s mode keeps its native "
-                        "kernel dispatch",
+                        "[HCU FLASH_ATTN PATH] the decode/prefill split from "
+                        "VLLM_HCU_DISABLE_QSA=1 is only supported in varlen "
+                        "mode; %s mode keeps its native kernel dispatch",
                         _get_flash_attn_mode(),
                     )
                 sliding_window_size = _get_native_sliding_window(
