@@ -173,7 +173,16 @@ def _dequantize_hyv4_fp8_weight(
         scale = scale.view(torch.float8_e8m0fnu).float()
     if not torch.isfinite(scale).all() or not (scale > 0).all():
         raise ValueError("HY V4 FP8 scales must be finite and positive")
-    if (
+    if weight.dtype == torch.int8:
+        expanded_scale = scale
+        for dimension, (weight_size, scale_size) in enumerate(
+            zip(weight.shape, scale.shape)
+        ):
+            expanded_scale = expanded_scale.repeat_interleave(
+                weight_size // scale_size, dim=dimension
+            )
+        result = weight.to(out_dtype) * expanded_scale.to(out_dtype)
+    elif (
         out_dtype == torch.bfloat16
         and encoded_scale.dtype == torch.uint8
         and weight.shape[1] % MXFP8_BLOCK_SIZE == 0
@@ -212,7 +221,7 @@ def _try_load_hyv4_fp8_projection(
         return False
     part = "weight" if match["part"] == "weight" else "scale"
     if part == "weight" and tensor.dtype not in (
-        torch.float8_e4m3fn, torch.float8_e4m3fnuz,
+        torch.int8, torch.float8_e4m3fn, torch.float8_e4m3fnuz,
     ):
         return False
     projection = match["projection"]

@@ -116,4 +116,71 @@ def adapt_checkpoint_weights(quant_config, weights):
 
         if isinstance(quant_config, HYV4W4A8Config):
             return quant_config.adapt_weights(weights)
+    get_name = getattr(quant_config, "get_name", None)
+    if callable(get_name) and get_name() == "compressed-tensors":
+        return _adapt_compressed_tensors_experts(quant_config, weights)
     return weights
+
+
+def _matches_compressed_target(target: str, name: str) -> bool:
+    if target in ("Linear", "RoutedExperts"):
+        return True
+    if target.startswith("re:"):
+        return re.fullmatch(target[3:], name) is not None
+    return name == target or name.endswith("." + target)
+
+
+def _is_supported_compressed_expert(quant_config, name: str) -> bool:
+    config = getattr(quant_config, "config", None)
+    if not isinstance(config, dict):
+        return False
+    for group in config.get("config_groups", {}).values():
+        targets = group.get("targets", ())
+        if not any(_matches_compressed_target(target, name) for target in targets):
+            continue
+        weight = group.get("weights") or {}
+        activation = group.get("input_activations") or {}
+        return bool(
+            group.get("format", config.get("format")) == "pack-quantized"
+            and weight.get("num_bits") == 4
+            and weight.get("type") == "int"
+            and weight.get("strategy") == "channel"
+            and weight.get("symmetric") is True
+            and weight.get("dynamic") is False
+            and weight.get("group_size") in (None, -1)
+            and activation.get("num_bits") == 8
+            and activation.get("type") == "int"
+            and activation.get("strategy") == "token"
+            and activation.get("symmetric") is True
+            and activation.get("dynamic") is True
+        )
+    return False
+
+
+def _adapt_compressed_tensors_experts(
+    quant_config,
+    weights: Iterable[tuple[str, torch.Tensor]],
+) -> Iterator[tuple[str, torch.Tensor]]:
+    """Rename split expert tensors before PP-local parameter loading."""
+    expert = re.compile(r"\.mlp\.experts\.\d+\.")
+    for name, weight in weights:
+        match = expert.search(name)
+        projection_name = re.sub(
+            r"\.(?:weight_packed|weight_scale|weight_shape)$", "", name
+        )
+        if match is None or not _is_supported_compressed_expert(
+            quant_config, projection_name
+        ):
+            yield name, weight
+            continue
+        if name.endswith(".weight_shape"):
+            continue
+        if name.endswith(".weight_packed"):
+            if weight.dtype != torch.int32 or weight.ndim != 2:
+                raise ValueError(
+                    "HYV4 compressed-tensors expert weight_packed must be "
+                    "rank-2 INT32"
+                )
+            yield name.removesuffix(".weight_packed") + ".weight", weight
+            continue
+        yield name, weight

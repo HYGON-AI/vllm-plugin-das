@@ -620,6 +620,20 @@ def test_hyv4_fp8_loads_local_indexer_router_scales_without_touching_target(
     assert not hasattr(model.model, "_checkpoint_accounting")
 
 
+def test_hyv4_channel_int8_indexer_pairs_weight_with_scale(
+    hyv4_fp8_checkpoint,
+):
+    model = hyv4_fp8_checkpoint
+    weights = _hyv4_fp8_weights(model, torch.full((4, 1), 0.5))
+    quantized = torch.arange(-8, 8, dtype=torch.int8).repeat(4, 4)
+    weights[0] = (weights[0][0], quantized)
+
+    model.load_weights(iter(weights))
+
+    actual = model.model.layers[0].self_attn.indexer.wk_weights_proj.weight
+    torch.testing.assert_close(actual[:4], quantized.to(torch.bfloat16) * 0.5)
+
+
 @pytest.mark.parametrize("missing", ["weight", "weight_scale"])
 def test_hyv4_fp8_incomplete_pair_fails_and_does_not_survive_reload(hyv4_fp8_checkpoint, missing):
     model = hyv4_fp8_checkpoint
