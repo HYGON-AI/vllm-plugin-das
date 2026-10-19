@@ -8,6 +8,8 @@
 
 `v0.25.1` 分支固定测试 0.25.1，`v0.28.1-dev` 分支固定测试 0.28.1。两个分支都只使用 `bw1100` Runner，暂不接入 BW1000。
 
-仓库需授权 `MODEL_SMOKE_REPO_TOKEN`（只读拉取测试仓库）与 `DASHHUB_CI_TOKEN`（结果上报）。构建步骤、框架版本、DTK / Python 配置、定时调度和 `validate-image` 镜像校验保持原样。
+仓库需授权 `MODEL_SMOKE_REPO_TOKEN`（只读拉取测试仓库）。模型结果由 ci-model-test 导出，再由已发布适配版 CInotificate 的独立部署模式上传；接口、鉴权和统计在 CInotificate 维护。`DASHHUB_CI_TOKEN` 仅保留为可选覆盖值，默认复用工具现有鉴权。先合入并发布 CInotificate 适配版本，再切换控制器和调用入口。
+
+构建步骤、框架版本、DTK / Python 配置、定时调度和 `validate-image` 镜像校验保持原样。
 
 验收时核对本次镜像地址、报告中的组件版本、模型状态，以及 DashHub 上报步骤的 HTTP 成功返回。已有运行不会自动切换到新流程，历史结果也不会自动重传。
