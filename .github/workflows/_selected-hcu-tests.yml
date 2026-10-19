@@ -163,6 +163,22 @@ jobs:
             exit 1
           fi
 
+      - name: Checkout caller HCU CI bootstrap
+        uses: actions/checkout@v4
+        with:
+          ref: ${{ github.workflow_sha }}
+          clean: true
+          fetch-depth: 1
+
+      - name: Preserve caller HCU CI bootstrap
+        run: |
+          set -euo pipefail
+          mkdir -p "$RUNNER_TEMP/hcu-ci-bootstrap"
+          cp \
+            scripts/ci/hcu/hcu_ci_bootstrap_python.sh \
+            scripts/ci/hcu/hcu_ci_create_python_wrapper.sh \
+            "$RUNNER_TEMP/hcu-ci-bootstrap/"
+
       - name: Checkout tested revision
         uses: actions/checkout@v4
         with:
@@ -185,6 +201,19 @@ jobs:
           --container-name "$HCU_CI_CONTAINER_NAME"
           --workspace "$GITHUB_WORKSPACE"
           --artifact-root "$HCU_CI_HOST_JOB_ROOT"
+
+      - name: Bootstrap stable Python entry
+        run: |
+          set -euo pipefail
+          helper=/tmp/hcu_ci_create_python_wrapper.sh
+          docker cp \
+            "$RUNNER_TEMP/hcu-ci-bootstrap/hcu_ci_create_python_wrapper.sh" \
+            "$HCU_CI_CONTAINER_NAME:$helper"
+          docker cp \
+            "$RUNNER_TEMP/hcu-ci-bootstrap/hcu_ci_bootstrap_python.sh" \
+            "$HCU_CI_CONTAINER_NAME:/tmp/hcu_ci_bootstrap_python.sh"
+          docker exec "$HCU_CI_CONTAINER_NAME" \
+            bash /tmp/hcu_ci_bootstrap_python.sh
 
       - name: Diagnose HCU container runtime
         run: |

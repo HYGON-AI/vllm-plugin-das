@@ -881,9 +881,18 @@ def test_selected_hcu_path_uses_resolved_supported_python() -> None:
     assert "command -v python3" in sources[paths[2]]
     assert "for name in python3.10 python3.12" not in sources[paths[2]]
     assert "without the default python3" in sources[paths[2]]
+    assert "github.workflow_sha" in sources[paths[3]]
+    assert "Preserve caller HCU CI bootstrap" in sources[paths[3]]
+    assert "docker cp" in sources[paths[3]]
+    assert "hcu_ci_create_python_wrapper.sh" in sources[paths[3]]
+    assert "hcu_ci_bootstrap_python.sh" in sources[paths[3]]
+    bootstrap = (
+        REPOSITORY / "scripts/ci/hcu/hcu_ci_bootstrap_python.sh"
+    ).read_text(encoding="utf-8")
+    assert "/usr/local/bin/python3.10" in bootstrap
 
-    for source in sources.values():
-        assert "/usr/local/bin/python3.10" not in source
+    for path in paths[:3]:
+        assert "/usr/local/bin/python3.10" not in sources[path]
 
 
 def test_hcu_control_workflows_use_image_python_without_fixed_minor() -> None:
@@ -892,7 +901,6 @@ def test_hcu_control_workflows_use_image_python_without_fixed_minor() -> None:
         ".github/workflows/nightly-hcu.yml",
         ".github/workflows/patch-coverage.yml",
         ".github/workflows/full-enabled-hcu.yml",
-        ".github/workflows/weekly-multi-node.yml",
     )
     for path in paths:
         source = (REPOSITORY / path).read_text(encoding="utf-8")
@@ -904,11 +912,15 @@ def test_hcu_control_workflows_use_image_python_without_fixed_minor() -> None:
         ".github/workflows/nightly-hcu.yml",
         ".github/workflows/patch-coverage.yml",
         ".github/workflows/full-enabled-hcu.yml",
-        ".github/workflows/weekly-multi-node.yml",
     ):
         source = (REPOSITORY / path).read_text(encoding="utf-8")
         assert "hcu_ci_preflight.py" in source, path
         assert "--check-lock-only" in source, path
+
+    weekly = (
+        REPOSITORY / ".github/workflows/weekly-multi-node.yml"
+    ).read_text(encoding="utf-8")
+    assert "run: python3.10 .github/scripts/hcu_ci/run_hcu_ci_job.py" in weekly
 
 
 def test_control_preflight_runs_with_python312_only(tmp_path: Path) -> None:
@@ -1013,6 +1025,35 @@ def test_hcu_python_wrapper_preserves_venv_context(tmp_path: Path) -> None:
     )
     assert completed.returncode == 0, completed.stderr
     assert completed.stdout.splitlines() == [str(venv_root), "venv-only"]
+
+
+@pytest.mark.skipif(os.name == "nt", reason="HCU CI bootstrap is a Bash entrypoint")
+def test_caller_bootstrap_supports_legacy_tested_revision(tmp_path: Path) -> None:
+    legacy_python = tmp_path / "usr/local/bin/python3.10"
+    legacy_python.parent.mkdir(parents=True)
+    shutil.copy2(sys.executable, legacy_python)
+    wrapper = tmp_path / "usr/local/bin/hcu-ci-python"
+    bootstrap = REPOSITORY / "scripts/ci/hcu/hcu_ci_bootstrap_python.sh"
+    creator = REPOSITORY / "scripts/ci/hcu/hcu_ci_create_python_wrapper.sh"
+
+    subprocess.run(
+        [
+            "bash",
+            str(bootstrap),
+            str(wrapper),
+            str(legacy_python),
+            str(creator),
+        ],
+        check=True,
+    )
+    completed = subprocess.run(
+        [str(wrapper), "-c", "import sys; print(sys.version_info[:2])"],
+        check=False,
+        capture_output=True,
+        text=True,
+    )
+    assert completed.returncode == 0, completed.stderr
+    assert completed.stdout.strip() == str(sys.version_info[:2])
 
 
 def test_hcu_control_container_uses_runner_identity() -> None:
