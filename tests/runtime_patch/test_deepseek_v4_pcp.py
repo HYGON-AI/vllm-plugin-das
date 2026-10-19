@@ -792,3 +792,59 @@ def test_replicated_decode_raw_kv_forward_never_gathers(
             assert patch._LOCAL_QUERIES.get() is None
             assert not in_replicated_mtp_batch()
             assert effective_pcp_world_size(pcp_size) == pcp_size
+
+
+@pytest.mark.parametrize("pcp_size", [2, 4, 8])
+def test_local_query_runs_cover_owned_rows_in_order(pcp_size):
+    batch = _make_batch([(f"r{i}", list(range(i * 16, i * 16 + 16)), 16, True)
+                         for i in range(3)])
+    managers, _ = _make_managers(pcp_size)
+    for manager in managers:
+        local = manager.partition_batch(batch)
+        with glm53_pcp_step_scope():
+            bind_glm53_pcp_batch(manager, local)
+            pcp_batch = patch_batch()
+        for start, end in ((0, batch.num_tokens), (16, 48)):
+            _, positions = pcp_batch.local_query_rows(start, end)
+            runs = pcp_batch.local_query_runs(start, end)
+            assert [r for r, _, _ in runs] == [sum(n for *_, n in runs[:i])
+                                               for i in range(len(runs))]
+            assert [p for _, s, n in runs for p in range(s, s + n)] == positions.tolist()
+            assert pcp_batch.local_query_runs(start, end) is runs
+
+
+@pytest.mark.parametrize("contiguous", [True, False])
+@pytest.mark.parametrize("enabled", [True, False])
+@pytest.mark.parametrize("custom_ops", [True, False])
+def test_local_prefill_runs_write_local_output_in_place(
+    monkeypatch, custom_ops, enabled, contiguous
+):
+    monkeypatch.setenv("VLLM_HCU_USE_CUSTOM_OPS", "1" if custom_ops else "0")
+    monkeypatch.setenv("VLLM_HCU_DEEPSEEK_V4_PCP_LOCAL_SLICES", "1" if enabled else "0")
+    calls = []
+
+    def kernel(q, indices, topk_length, output, **_):
+        calls.append(q.shape[0])
+        output.copy_(q * 2 + indices[:, :1, None] + topk_length[:, None, None])
+
+    selected, local_rows = torch.tensor([1, 3, 6]), torch.tensor([1, 2, 5])
+    batch = SimpleNamespace(local_query_rows=lambda start, end: (selected, local_rows),
+                            local_query_runs=lambda start, end: ((0, 1, 2), (2, 5, 1)))
+    root_q = torch.zeros(8, 2, 4)
+    local_q = torch.randn(6, 2, 4)
+    local_out = torch.full((6, 2, 4), -1.0)
+    if not contiguous:
+        local_out = torch.full((6, 2, 8), -1.0)[..., ::2]
+    indices = torch.arange(8, dtype=torch.float32)[:, None].repeat(1, 3)
+    topk = torch.arange(8, dtype=torch.float32) * 10
+    token = patch._LOCAL_MQA.set((local_q, local_out))
+    try:
+        patch._run_local_prefill(kernel, batch, root_q, 0, q=root_q, indices=indices,
+                                 topk_length=topk, output=root_q)
+    finally:
+        patch._LOCAL_MQA.reset(token)
+    expected = torch.full_like(local_out, -1.0)
+    expected[local_rows] = (local_q[local_rows] * 2 + indices[selected, :1, None]
+                            + topk[selected, None, None])
+    torch.testing.assert_close(local_out, expected)
+    assert calls == ([2, 1] if custom_ops and enabled and contiguous else [3])

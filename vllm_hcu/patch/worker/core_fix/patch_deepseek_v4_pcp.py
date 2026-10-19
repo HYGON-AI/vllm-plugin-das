@@ -103,6 +103,14 @@ def _can_use_local_queries(layer, batch) -> bool:
     return True
 
 
+def _local_slices_enabled() -> bool:
+    from vllm_hcu.platforms import envs as henvs
+
+    return henvs.optional_custom_op_enabled(
+        henvs.VLLM_HCU_DEEPSEEK_V4_PCP_LOCAL_SLICES
+    )
+
+
 def _run_local_prefill(kernel, batch, root_q, decode_tokens, **kwargs):
     """Run only this rank's query rows while preserving global KV coordinates."""
     q = kwargs["q"]
@@ -116,12 +124,28 @@ def _run_local_prefill(kernel, batch, root_q, decode_tokens, **kwargs):
         full_output.zero_()
     if selected.numel() == 0:
         return
+    for name in ("indices", "topk_length"):
+        kwargs[name] = kwargs[name].index_select(0, selected).contiguous()
+    if local_mqa is not None and _local_slices_enabled() and all(
+        t.is_contiguous() for t in local_mqa
+    ):
+        # A chunk's owned rows form a few contiguous runs in the local layout
+        # (at most head + tail per request): let the kernel read and write
+        # local Q/output slices instead of gathering Q and scattering output.
+        indices, topk_length = kwargs["indices"], kwargs["topk_length"]
+        for row, local, length in batch.local_query_runs(
+            start + decode_tokens, start + decode_tokens + q.shape[0],
+        ):
+            kwargs["q"] = local_mqa[0][local:local + length]
+            kwargs["output"] = local_mqa[1][local:local + length]
+            kwargs["indices"] = indices[row:row + length]
+            kwargs["topk_length"] = topk_length[row:row + length]
+            kernel(**kwargs)
+        return
     if local_mqa is None:
         local_q = q.index_select(0, selected).contiguous()
     else:
         local_q = local_mqa[0].index_select(0, local_rows).contiguous()
-    for name in ("indices", "topk_length"):
-        kwargs[name] = kwargs[name].index_select(0, selected).contiguous()
     kwargs["q"] = local_q
     kwargs["output"] = torch.empty_like(local_q)
     kernel(**kwargs)

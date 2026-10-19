@@ -950,7 +950,8 @@ class DeepEPAutoDeepGemmExperts(mk.FusedMoEExpertsModular):
         expert_tokens_meta: mk.ExpertTokensMetadata | None,
         activation: MoEActivation,
     ) -> tuple[tuple[int, ...], tuple[int, ...], tuple[int, ...]]:
-        return self._current().workspace_shapes(
+        current = self._current()
+        workspace13, workspace2, output = current.workspace_shapes(
             M,
             N,
             K,
@@ -960,6 +961,36 @@ class DeepEPAutoDeepGemmExperts(mk.FusedMoEExpertsModular):
             expert_tokens_meta,
             activation,
         )
+        use_low_latency = (
+            self._fixed_use_low_latency
+            if self._fixed_use_low_latency is not None
+            else self._use_low_latency_snapshot
+        )
+        if use_low_latency:
+            return workspace13, workspace2, output
+
+        # DP engine profiling exercises one sender's synthetic prefill at a
+        # time. DeepEP HT can instead receive token rows from every dispatcher
+        # on one rank. Pass that receive bound to the contiguous expert; its
+        # workspace calculation expands rows by top-k and expert alignment.
+        # Keep output at the real M because only temporary workspaces need the
+        # conservative bound before vLLM locks the shared workspace.
+        max_received_tokens = int(self.moe_config.max_num_tokens) * int(
+            self.num_dispatchers
+        )
+        if max_received_tokens <= M:
+            return workspace13, workspace2, output
+        reserve13, reserve2, _ = current.workspace_shapes(
+            max_received_tokens,
+            N,
+            K,
+            topk,
+            global_num_experts,
+            local_num_experts,
+            expert_tokens_meta,
+            activation,
+        )
+        return reserve13, reserve2, output
 
     def finalize_weight_and_reduce_impl(self) -> mk.TopKWeightAndReduce:
         return self._current().finalize_weight_and_reduce_impl()
@@ -1007,6 +1038,7 @@ class DeepEPAutoW4A8Experts(DeepEPAutoDeepGemmExperts):
     _LAYOUT_MARKER = "_slimquant_w4a8_deepep_auto_layout"
     _PACKED_W13 = "_slimquant_w4a8_deepep_auto_packed_w13"
     _PACKED_W2 = "_slimquant_w4a8_deepep_auto_packed_w2"
+    _PACKED_W13_SCALE = "_slimquant_w4a8_deepep_auto_packed_w13_scale"
     _PACKING_LAYOUT = "packing"
     _REPACKING_LAYOUT = "repacking"
 
@@ -1055,48 +1087,67 @@ class DeepEPAutoW4A8Experts(DeepEPAutoDeepGemmExperts):
         owners = (
             getattr(layer, self._PACKED_W13, None),
             getattr(layer, self._PACKED_W2, None),
+            getattr(layer, self._PACKED_W13_SCALE, None),
         )
         if marker is None and any(owner is not None for owner in owners):
             self._invalid_marker()
         if marker is not None and marker != expected_layout:
             self._invalid_marker()
         runtime._validate_w4a8_channel_weights(layer)
-        weights = (layer.w13_weight, layer.w2_weight)
+        current = (
+            layer.w13_weight,
+            layer.w2_weight,
+            layer.w13_weight_scale,
+        )
         if marker is not None:
+            setattr(layer, self._LAYOUT_MARKER, self._REPACKING_LAYOUT)
+            padded = runtime._pad_w4a8_channel_weights_for_hipc(layer)
             if any(
                 not isinstance(owner, torch.Tensor)
-                or owner.dtype != torch.int8
-                or owner.ndim != 3
-                or tuple(owner.shape) != tuple(weight.shape)
-                for owner, weight in zip(owners, weights)
+                or tuple(owner.shape) != tuple(value.shape)
+                or owner.dtype != value.dtype
+                for owner, value in zip(owners, padded)
             ):
                 self._invalid_marker()
-            if all(self._same_storage(a, b) for a, b in zip(owners, weights)):
-                self._bind_packed_owners(runtime, *owners)
+            if all(self._same_storage(a, b) for a, b in zip(owners, current)):
+                self._restore_scale_and_bind(layer, runtime, *owners)
+                setattr(layer, self._LAYOUT_MARKER, expected_layout)
                 return
 
             # v0.25.1 layerwise reload processes temporary raw Parameters and
             # then restores the original kernel storage. Reuse that storage so
             # the temporary allocation cannot become a second resident owner.
-            setattr(layer, self._LAYOUT_MARKER, self._REPACKING_LAYOUT)
-            reloaded = self._pack_in_place(runtime, weights)
+            reloaded = self._pack_in_place(runtime, padded[:2])
             with torch.no_grad():
-                for owner, weight in zip(owners, reloaded):
-                    owner.copy_(weight)
+                owners[0].copy_(reloaded[0])
+                owners[1].copy_(reloaded[1])
+                owners[2].copy_(padded[2])
             replace_parameter(layer, "w13_weight", owners[0])
             replace_parameter(layer, "w2_weight", owners[1])
-            self._bind_packed_owners(runtime, *owners)
+            replace_parameter(layer, "w13_weight_scale", owners[2])
+            self._restore_scale_and_bind(layer, runtime, *owners)
             setattr(layer, self._LAYOUT_MARKER, expected_layout)
             return
 
         # The packer mutates each registered Parameter in sequence. Mark the
         # transition first so a partial failure can never be retried as raw.
         setattr(layer, self._LAYOUT_MARKER, self._PACKING_LAYOUT)
+        padded = runtime._pad_w4a8_channel_weights_for_hipc(layer)
+        if any(not self._same_storage(a, b) for a, b in zip(padded, current)):
+            replace_parameter(layer, "w13_weight", padded[0])
+            replace_parameter(layer, "w2_weight", padded[1])
+            replace_parameter(layer, "w13_weight_scale", padded[2])
+        weights = (layer.w13_weight, layer.w2_weight)
         self._pack_in_place(runtime, weights)
-        owners = tuple(weight.detach() for weight in weights)
+        owners = (
+            layer.w13_weight.detach(),
+            layer.w2_weight.detach(),
+            layer.w13_weight_scale.detach(),
+        )
         setattr(layer, self._PACKED_W13, owners[0])
         setattr(layer, self._PACKED_W2, owners[1])
-        self._bind_packed_owners(runtime, *owners)
+        setattr(layer, self._PACKED_W13_SCALE, owners[2])
+        self._restore_scale_and_bind(layer, runtime, *owners)
         setattr(layer, self._LAYOUT_MARKER, expected_layout)
 
     @staticmethod
@@ -1127,6 +1178,28 @@ class DeepEPAutoW4A8Experts(DeepEPAutoDeepGemmExperts):
         raise RuntimeError(
             "invalid SlimQuant W4A8 deepep_auto marker or owner shape state"
         )
+
+    def _restore_scale_and_bind(self, layer, runtime, w13, w2, _w13_scale) -> None:
+        scale = layer.w13_weight_scale
+        configs = {
+            id(config): config
+            for config in (
+                self.quant_config,
+                self.ht_experts.quant_config,
+                self.ll_experts.quant_config,
+            )
+        }.values()
+        for config in configs:
+            config._w1.scale = scale
+        if self._fixed_use_low_latency is not False:
+            # BatchedDeepGemmExperts normally seeds these from the logical
+            # model config. HIPC must instead size its masked output and
+            # activation buffers from the padded physical matrices.
+            self.ll_experts._hcu_logical_n = int(scale.size(1))
+            self.ll_experts._hcu_logical_k = int(
+                layer.w2_weight_scale.size(1)
+            )
+        self._bind_packed_owners(runtime, w13, w2)
 
     def _bind_packed_owners(self, runtime, w13, w2) -> None:
         if self._fixed_use_low_latency is not True:

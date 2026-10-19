@@ -4000,6 +4000,74 @@ def test_channel_auto_experts_construct_only_mooncake_pd_role_layout(
     assert experts.ht_experts is experts.ll_experts
 
 
+@pytest.mark.parametrize(
+    ("num_dispatchers", "expected_aligned_rows"),
+    [
+        pytest.param(16, 18_432, id="dp16-receive-bound"),
+        pytest.param(4, 10_752, id="dp4-topk-applied-once"),
+    ],
+)
+def test_deepep_auto_ht_workspace_reserves_dispatcher_receive_bound(
+    num_dispatchers: int,
+    expected_aligned_rows: int,
+) -> None:
+    from vllm.model_executor.layers.fused_moe.activation import MoEActivation
+    from vllm_hcu.model_executor.layers.fused_moe.experts import (
+        dpsk_v4_deep_gemm_moe as module,
+    )
+
+    experts = object.__new__(module.DeepEPAutoDeepGemmExperts)
+    experts.moe_config = SimpleNamespace(
+        max_num_tokens=64,
+        experts_per_token=10,
+    )
+    experts.num_dispatchers = num_dispatchers
+    experts._fixed_use_low_latency = None
+    experts._use_low_latency_snapshot = False
+    experts.ht_experts = object.__new__(module.DeepEPDeepGemmContiguousExperts)
+    experts.ll_experts = object.__new__(module.DeepEPDeepGemmMaskedExperts)
+    experts.ll_experts.max_num_tokens = 64
+    experts.ll_experts.num_dispatchers = num_dispatchers
+
+    shapes = experts.workspace_shapes(
+        64,
+        1_536,
+        2_048,
+        10,
+        512,
+        32,
+        None,
+        MoEActivation.SILU,
+    )
+
+    assert shapes[0][0] == expected_aligned_rows
+    assert shapes[1][0] == expected_aligned_rows
+    assert shapes[2] == (64, 2_048)
+
+    experts._use_low_latency_snapshot = True
+    ll_shapes = experts.workspace_shapes(
+        64,
+        1_536,
+        2_048,
+        10,
+        512,
+        32,
+        None,
+        MoEActivation.SILU,
+    )
+
+    assert ll_shapes == experts.ll_experts.workspace_shapes(
+        64,
+        1_536,
+        2_048,
+        10,
+        512,
+        32,
+        None,
+        MoEActivation.SILU,
+    )
+
+
 def _slimquant_w4a8_auto_experts(fixed_use_low_latency: bool | None):
     from vllm_hcu.model_executor.layers.fused_moe.experts import (
         dpsk_v4_deep_gemm_moe as module,
@@ -4009,6 +4077,8 @@ def _slimquant_w4a8_auto_experts(fixed_use_low_latency: bool | None):
     )
 
     experts = object.__new__(module.DeepEPAutoW4A8Experts)
+    quant_config = SimpleNamespace(_w1=SimpleNamespace(scale=None))
+    experts.quant_config = quant_config
     experts._fixed_use_low_latency = fixed_use_low_latency
     experts._use_low_latency_snapshot = False
     if fixed_use_low_latency is True:
@@ -4027,6 +4097,7 @@ def _slimquant_w4a8_auto_experts(fixed_use_low_latency: bool | None):
             runtime.DeepEPDeepGemmW4A8MaskedExperts
         )
     for child in {experts.ht_experts, experts.ll_experts}:
+        child.quant_config = quant_config
         child._deepgemm_w13 = None
         child._deepgemm_w2 = None
     return experts
@@ -4035,15 +4106,15 @@ def _slimquant_w4a8_auto_experts(fixed_use_low_latency: bool | None):
 def _slimquant_w4a8_auto_layer() -> torch.nn.Module:
     layer = torch.nn.Module()
     layer.w13_weight = torch.nn.Parameter(
-        torch.zeros((1, 128, 32), dtype=torch.int8),
+        torch.zeros((1, 512, 32), dtype=torch.int8),
         requires_grad=False,
     )
     layer.w2_weight = torch.nn.Parameter(
-        torch.zeros((1, 64, 32), dtype=torch.int8),
+        torch.zeros((1, 64, 128), dtype=torch.int8),
         requires_grad=False,
     )
     layer.w13_weight_scale = torch.nn.Parameter(
-        torch.ones((1, 128, 1), dtype=torch.float32),
+        torch.ones((1, 512, 1), dtype=torch.float32),
         requires_grad=False,
     )
     layer.w2_weight_scale = torch.nn.Parameter(
@@ -4051,6 +4122,190 @@ def _slimquant_w4a8_auto_layer() -> torch.nn.Module:
         requires_grad=False,
     )
     return layer
+
+
+def _slimquant_qwen_w4a8_auto_layer() -> torch.nn.Module:
+    """Small-hidden replica of Qwen's logical intermediate size of 640."""
+
+    layer = torch.nn.Module()
+    layer.w13_weight = torch.nn.Parameter(
+        torch.arange(1280 * 32, dtype=torch.int64)
+        .remainder(251)
+        .to(torch.int8)
+        .reshape(1, 1280, 32),
+        requires_grad=False,
+    )
+    layer.w2_weight = torch.nn.Parameter(
+        torch.arange(64 * 320, dtype=torch.int64)
+        .remainder(241)
+        .to(torch.int8)
+        .reshape(1, 64, 320),
+        requires_grad=False,
+    )
+    layer.w13_weight_scale = torch.nn.Parameter(
+        torch.arange(1280, dtype=torch.float32).reshape(1, 1280, 1) + 1,
+        requires_grad=False,
+    )
+    layer.w2_weight_scale = torch.nn.Parameter(
+        torch.ones((1, 64, 1), dtype=torch.float32),
+        requires_grad=False,
+    )
+    return layer
+
+
+def test_slimquant_w4a8_auto_pads_qwen_intermediate_for_hipc(
+    monkeypatch: pytest.MonkeyPatch,
+):
+    """Qwen I=640 must use a zero-preserving physical I=768 layout."""
+
+    from vllm_hcu.model_executor.layers.quantization import (
+        slimquant_w4a8_deepgemm_runtime as runtime,
+    )
+
+    layer = _slimquant_qwen_w4a8_auto_layer()
+    raw_w13 = layer.w13_weight.detach().clone()
+    raw_w2 = layer.w2_weight.detach().clone()
+    raw_w13_scale = layer.w13_weight_scale.detach().clone()
+    experts = _slimquant_w4a8_auto_experts(None)
+    pack_calls: list[torch.Tensor] = []
+
+    def identity_pack(weight: torch.Tensor) -> torch.Tensor:
+        pack_calls.append(weight)
+        return weight
+
+    def n32_view(weight: torch.Tensor) -> torch.Tensor:
+        num_experts, output_size, packed_k = weight.shape
+        return weight.view(
+            num_experts,
+            packed_k // 32,
+            output_size // 32,
+            4,
+            32,
+            8,
+        )
+
+    monkeypatch.setattr(runtime, "pack_w4a8_moe_hipc_weight", identity_pack)
+    monkeypatch.setattr(
+        runtime,
+        "view_w4a8_moe_hipc_weight_n32_layout",
+        n32_view,
+    )
+
+    experts.process_weights_after_loading(layer)
+
+    assert [tuple(weight.shape) for weight in pack_calls] == [
+        (1, 1536, 32),
+        (1, 64, 384),
+    ]
+    assert tuple(layer.w13_weight.shape) == (1, 1536, 32)
+    assert tuple(layer.w2_weight.shape) == (1, 64, 384)
+    assert tuple(layer.w13_weight_scale.shape) == (1, 1536, 1)
+    torch.testing.assert_close(layer.w13_weight[:, :640], raw_w13[:, :640])
+    torch.testing.assert_close(
+        layer.w13_weight[:, 768:1408], raw_w13[:, 640:1280]
+    )
+    assert torch.count_nonzero(layer.w13_weight[:, 640:768]) == 0
+    assert torch.count_nonzero(layer.w13_weight[:, 1408:1536]) == 0
+    torch.testing.assert_close(layer.w2_weight[:, :, :320], raw_w2)
+    assert torch.count_nonzero(layer.w2_weight[:, :, 320:]) == 0
+    torch.testing.assert_close(
+        layer.w13_weight_scale[:, :640], raw_w13_scale[:, :640]
+    )
+    torch.testing.assert_close(
+        layer.w13_weight_scale[:, 768:1408], raw_w13_scale[:, 640:1280]
+    )
+    torch.testing.assert_close(
+        layer.w13_weight_scale[:, 640:768],
+        torch.ones_like(layer.w13_weight_scale[:, 640:768]),
+    )
+    torch.testing.assert_close(
+        layer.w13_weight_scale[:, 1408:1536],
+        torch.ones_like(layer.w13_weight_scale[:, 1408:1536]),
+    )
+    assert experts.quant_config._w1.scale is layer.w13_weight_scale
+    assert experts.ll_experts._hcu_logical_n == 1536
+    assert experts.ll_experts._hcu_logical_k == 64
+    assert experts.ht_experts._deepgemm_w13.untyped_storage().data_ptr() == (
+        experts.ll_experts._deepgemm_w13.untyped_storage().data_ptr()
+    )
+    assert experts.ht_experts._deepgemm_w2.untyped_storage().data_ptr() == (
+        experts.ll_experts._deepgemm_w2.untyped_storage().data_ptr()
+    )
+
+
+def test_slimquant_w4a8_auto_reloads_raw_qwen_weights_into_padded_owner(
+    monkeypatch: pytest.MonkeyPatch,
+):
+    """A raw checkpoint reload must retain the graph-stable padded storage."""
+
+    from vllm_hcu.model_executor.layers.quantization import (
+        slimquant_w4a8_deepgemm_runtime as runtime,
+    )
+
+    monkeypatch.setattr(
+        runtime,
+        "pack_w4a8_moe_hipc_weight",
+        lambda weight: weight,
+    )
+
+    def n32_view(weight: torch.Tensor) -> torch.Tensor:
+        num_experts, output_size, packed_k = weight.shape
+        return weight.view(
+            num_experts,
+            packed_k // 32,
+            output_size // 32,
+            4,
+            32,
+            8,
+        )
+
+    monkeypatch.setattr(
+        runtime,
+        "view_w4a8_moe_hipc_weight_n32_layout",
+        n32_view,
+    )
+    layer = _slimquant_qwen_w4a8_auto_layer()
+    _slimquant_w4a8_auto_experts(None).process_weights_after_loading(layer)
+    owner_ptrs = tuple(
+        value.untyped_storage().data_ptr()
+        for value in (
+            layer.w13_weight,
+            layer.w2_weight,
+            layer.w13_weight_scale,
+        )
+    )
+
+    raw_reload = _slimquant_qwen_w4a8_auto_layer()
+    raw_reload.w13_weight.data.fill_(7)
+    raw_reload.w2_weight.data.fill_(9)
+    raw_reload.w13_weight_scale.data.fill_(0.25)
+    layer.w13_weight = raw_reload.w13_weight
+    layer.w2_weight = raw_reload.w2_weight
+    layer.w13_weight_scale = raw_reload.w13_weight_scale
+    replacement = _slimquant_w4a8_auto_experts(None)
+    replacement.process_weights_after_loading(layer)
+
+    assert owner_ptrs == tuple(
+        value.untyped_storage().data_ptr()
+        for value in (
+            layer.w13_weight,
+            layer.w2_weight,
+            layer.w13_weight_scale,
+        )
+    )
+    assert torch.count_nonzero(layer.w13_weight[:, :640] != 7) == 0
+    assert torch.count_nonzero(layer.w13_weight[:, 768:1408] != 7) == 0
+    assert torch.count_nonzero(layer.w13_weight[:, 640:768]) == 0
+    assert torch.count_nonzero(layer.w13_weight[:, 1408:]) == 0
+    assert torch.count_nonzero(layer.w2_weight[:, :, :320] != 9) == 0
+    assert torch.count_nonzero(layer.w2_weight[:, :, 320:]) == 0
+    assert torch.count_nonzero(layer.w13_weight_scale[:, :640] != 0.25) == 0
+    assert (
+        torch.count_nonzero(layer.w13_weight_scale[:, 768:1408] != 0.25)
+        == 0
+    )
+    assert replacement.quant_config._w1.scale is layer.w13_weight_scale
+    assert layer._slimquant_w4a8_deepep_auto_layout == "shared_hipc_auto"
 
 
 def _install_in_place_w4a8_packers(

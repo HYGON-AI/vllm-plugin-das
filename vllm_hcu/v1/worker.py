@@ -120,8 +120,16 @@ class HcuGPUWorker(Worker):
 
         super().load_model(load_dummy_weights=load_dummy_weights)
         from vllm_hcu.patch.worker import validate_worker_patches
-
         model_runner = getattr(self, "model_runner", None)
+        num_compressor_weights = getattr(
+            model_runner, "_vllm_hcu_num_compressor_weights", 0
+        )
+        if num_compressor_weights:
+            runner_logger.info(
+                "DeepSeek V4 compressor NT weights bound: %d layers",
+                num_compressor_weights,
+            )
+
         num_router_gates = getattr(
             model_runner, "_vllm_hcu_num_router_gates", 0
         )
@@ -133,14 +141,28 @@ class HcuGPUWorker(Worker):
 
     def reload_weights(self, *args, **kwargs) -> None:
         super().reload_weights(*args, **kwargs)
+        from vllm_hcu.patch.worker.core_fix.patch_deepseek_v4_attention import (
+            refresh_compressor_nt_weights,
+        )
         from vllm_hcu.model_executor.layers.fused_moe.glm53_router_gemv import (
             refresh_glm53_router_gates,
         )
 
         refresh_glm53_router_gates(self.model_runner.model)
+        refresh_compressor_nt_weights(self.model_runner.model)
 
     def finish_weight_update(self) -> None:
         super().finish_weight_update()
+        if self._weight_update_is_draft:
+            get_draft_model = getattr(self.model_runner, "get_draft_model", None)
+            model = get_draft_model() if callable(get_draft_model) else None
+        else:
+            model = self.model_runner.model
+        from vllm_hcu.patch.worker.core_fix.patch_deepseek_v4_attention import (
+            refresh_compressor_nt_weights,
+        )
+
+        refresh_compressor_nt_weights(model)
         if not self._weight_update_is_draft:
             from vllm_hcu.model_executor.layers.fused_moe.glm53_router_gemv import (
                 refresh_glm53_router_gates,

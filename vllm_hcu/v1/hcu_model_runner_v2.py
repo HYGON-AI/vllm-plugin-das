@@ -5,6 +5,7 @@
 
 import functools
 import os
+from collections import defaultdict
 from contextlib import contextmanager, nullcontext
 from contextvars import ContextVar
 
@@ -23,6 +24,7 @@ from vllm_hcu.forward_context_runtime import (
     deepep_auto_request_phase_scope,
     set_deepep_auto_request_phase,
 )
+from vllm_hcu.patch.config import get_hcu_config
 from vllm_hcu.v1.pcp_manager import make_hcu_pcp_manager_cls
 from vllm_hcu.patch.platform.core_fix.patch_vllm_config import is_glm53_pcp
 from vllm_hcu.deepseek_v4_runtime import is_deepseek_v4
@@ -47,6 +49,24 @@ _USE_HOST_SEQ_LENS = henvs.optional_custom_op_enabled(
 # Debug: compare the mirror against the device seq_lens every step.
 _CHECK_HOST_SEQ_LENS = os.environ.get("VLLM_HCU_CHECK_HOST_SEQ_LENS", "0") == "1"
 _SAMPLER_WARMUP = ContextVar("hcu_sampler_warmup", default=False)
+_DEEPEP_AUTO_DUMMY_PHASE: ContextVar[bool | None] = ContextVar(
+    "vllm_hcu_deepep_auto_dummy_phase", default=None
+)
+
+
+@contextmanager
+def _deepep_auto_dummy_phase_scope(is_prefilling: bool | None):
+    """Keep a worker dummy phase available to its nested execute call."""
+
+    token = _DEEPEP_AUTO_DUMMY_PHASE.set(is_prefilling)
+    try:
+        yield
+    finally:
+        _DEEPEP_AUTO_DUMMY_PHASE.reset(token)
+
+
+def _kv_zero_by_group_enabled() -> bool:
+    return henvs.optional_custom_op_enabled(henvs.VLLM_HCU_KV_ZERO_BY_GROUP)
 
 
 @contextmanager
@@ -79,6 +99,64 @@ def record_pp_spec_draft_index_stream(
         getattr(pp_handler, "broadcast_stream")
     )
     return True
+
+
+def _kv_block_owners(scheduler_output) -> dict[int, int]:
+    """Map unambiguous newly scheduled block ids to their cache group."""
+    owners: dict[int, int] = {}
+    ambiguous: set[int] = set()
+
+    def record(groups) -> None:
+        if groups is None:
+            return
+        for group_id, block_ids in enumerate(groups):
+            for block_id in block_ids:
+                previous = owners.get(block_id)
+                if previous is not None and previous != group_id:
+                    owners.pop(block_id)
+                    ambiguous.add(block_id)
+                elif block_id not in ambiguous:
+                    owners[block_id] = group_id
+
+    for request in scheduler_output.scheduled_new_reqs:
+        record(request.block_ids)
+    for groups in scheduler_output.scheduled_cached_reqs.new_block_ids:
+        record(groups)
+    return owners
+
+
+class _GroupKVBlockZeroer:
+    """Dispatch upstream KV zeroing to the block's owning cache group."""
+
+    def __init__(self, fallback, zeroers: dict[int, object]):
+        self.fallback = fallback
+        self.zeroers = zeroers
+        self.owners: dict[int, int] | None = None
+
+    def warmup(self, num_kv_blocks: int) -> None:
+        """Preserve the upstream zeroer lifecycle and compile group kernels."""
+        self.fallback.warmup(num_kv_blocks)
+        if _kv_zero_by_group_enabled():
+            for zeroer in self.zeroers.values():
+                zeroer.warmup(num_kv_blocks)
+
+    def zero_block_ids(self, block_ids) -> None:
+        if not _kv_zero_by_group_enabled() or self.owners is None:
+            self.fallback.zero_block_ids(block_ids)
+            return
+
+        buckets: dict[int, list[int]] = defaultdict(list)
+        unowned = []
+        for block_id in block_ids:
+            group_id = self.owners.get(block_id)
+            if group_id in self.zeroers:
+                buckets[group_id].append(block_id)
+            else:
+                unowned.append(block_id)
+        for group_id, ids in buckets.items():
+            self.zeroers[group_id].zero_block_ids(ids)
+        if unowned:
+            self.fallback.zero_block_ids(unowned)
 
 
 @contextmanager
@@ -130,8 +208,51 @@ class HcuGPUModelRunnerV2(GPUModelRunner):
         self._hsl_pending = None
         self._hsl_batch = None
 
+    def _init_kv_zero_meta(self) -> None:
+        """Build one upstream zeroer per cache group for mixed KV caches."""
+        super()._init_kv_zero_meta()
+        fallback = self.kv_block_zeroer
+        if (
+            not _kv_zero_by_group_enabled()
+            or fallback is None
+            or fallback._meta is None
+        ):
+            return
+
+        zeroer_cls = type(fallback)
+        zeroers = {}
+        by_group = defaultdict(list)
+        for groups in self.attn_groups:
+            for group in groups:
+                by_group[group.kv_cache_group_id].append(group)
+        if len(by_group) <= 1:
+            return
+        for group_id, groups in by_group.items():
+            zeroer = zeroer_cls(
+                self.device,
+                groups,
+                self.kernel_block_sizes,
+                self.compilation_config.static_forward_context,
+                self.kv_cache_config.num_blocks,
+            )
+            if zeroer._meta is not None:
+                zeroers[group_id] = zeroer
+        # One zeroable group is already the upstream all-group behavior.
+        if len(zeroers) > 1:
+            self.kv_block_zeroer = _GroupKVBlockZeroer(fallback, zeroers)
+
+    def update_requests(self, scheduler_output) -> None:
+        zeroer = self.kv_block_zeroer
+        if not isinstance(zeroer, _GroupKVBlockZeroer):
+            return super().update_requests(scheduler_output)
+        zeroer.owners = _kv_block_owners(scheduler_output)
+        try:
+            return super().update_requests(scheduler_output)
+        finally:
+            zeroer.owners = None
+
     def load_model(self, load_dummy_weights: bool = False) -> None:
-        """Load and pack GLM router weights in the worker weights pool."""
+        """Load and materialize derived weights in the worker weights pool."""
 
         super().load_model(load_dummy_weights=load_dummy_weights)
         from vllm_hcu.model_executor.layers.fused_moe.glm53_router_gemv import (
@@ -140,6 +261,18 @@ class HcuGPUModelRunnerV2(GPUModelRunner):
 
         self._vllm_hcu_num_router_gates = bind_glm53_router_gates(
             getattr(self, "model", None)
+        )
+
+        from vllm_hcu.patch.worker.core_fix.patch_deepseek_v4_attention import (
+            bind_compressor_nt_weights,
+        )
+
+        # Worker.load_model still owns its initial weights pool here. Creating
+        # these buffers after it returns leaves them outside sleep management.
+        self._vllm_hcu_num_compressor_weights = sum(
+            bind_compressor_nt_weights(model)
+            for model in (self.model, self.get_draft_model())
+            if model is not None
         )
 
     @property
@@ -371,6 +504,12 @@ class HcuGPUModelRunnerV2(GPUModelRunner):
             if kwargs.get("dummy_run", False) and is_glm53_pcp(self.vllm_config):
                 dummy_scope = replicated_mtp_batch_scope()
         with deepep_auto_request_phase_scope(), scope, dummy_scope:
+            dummy_phase = _DEEPEP_AUTO_DUMMY_PHASE.get()
+            if (
+                dummy_phase is not None
+                and get_hcu_config(self.vllm_config).deepep_auto
+            ):
+                set_deepep_auto_request_phase(dummy_phase)
             if is_step5_config(getattr(self, "vllm_config", None)):
                 from vllm_hcu.v1.step5_execution import execute_model
 
@@ -437,6 +576,17 @@ class HcuGPUModelRunnerV2(GPUModelRunner):
 
     def _dummy_run(self, num_tokens, *args, **kwargs):
         """Optionally stub target forward while sizing full-batch MTP."""
+
+        phase_scope = nullcontext()
+        if get_hcu_config(self.vllm_config).deepep_auto:
+            phase_scope = _deepep_auto_dummy_phase_scope(
+                not bool(kwargs.get("uniform_decode", False))
+            )
+        with phase_scope:
+            return self._dummy_run_with_phase(num_tokens, *args, **kwargs)
+
+    def _dummy_run_with_phase(self, num_tokens, *args, **kwargs):
+        """Run the upstream/profile dummy while its phase scope is active."""
 
         if not getattr(self, "_hcu_profile_mtp_full_batch", False):
             return super()._dummy_run(num_tokens, *args, **kwargs)

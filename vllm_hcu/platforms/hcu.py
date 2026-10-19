@@ -667,6 +667,16 @@ class HCUPlatform(Platform):
                 )
                 compilation_config.cudagraph_mode = CUDAGraphMode.PIECEWISE
 
+        # PCP/DCP normalization above runs after CompilationConfig's splitting
+        # callback. Reapply the same bound DeepEP-auto policy so PIECEWISE
+        # cannot reintroduce HT capture or route mixed/prefill FULL graphs to
+        # the capacity-limited LL delegate.
+        from vllm_hcu.patch.platform.core_fix.patch_compilation_config import (
+            normalize_bound_deepep_auto_cudagraph_mode,
+        )
+
+        normalize_bound_deepep_auto_cudagraph_mode(vllm_config)
+
         if cache_config and not cache_config.user_specified_block_size:
             backend = vllm_config.attention_config.backend
             if (
