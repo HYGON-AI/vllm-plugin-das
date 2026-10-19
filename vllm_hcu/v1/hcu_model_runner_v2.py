@@ -5,7 +5,8 @@
 
 import functools
 import os
-from contextlib import nullcontext
+from contextlib import contextmanager, nullcontext
+from contextvars import ContextVar
 
 import numpy as np
 import torch
@@ -24,6 +25,14 @@ from vllm_hcu.forward_context_runtime import (
 )
 from vllm_hcu.v1.pcp_manager import make_hcu_pcp_manager_cls
 from vllm_hcu.patch.platform.core_fix.patch_vllm_config import is_glm53_pcp
+from vllm_hcu.deepseek_v4_runtime import is_deepseek_v4
+
+
+def _uses_global_pcp_batch(vllm_config) -> bool:
+    """GLM5Next and DeepSeek V4 PCP bind the global batch per step."""
+    parallel_config = getattr(vllm_config, "parallel_config", None)
+    pcp_size = int(getattr(parallel_config, "prefill_context_parallel_size", 1))
+    return is_glm53_pcp(vllm_config) or (pcp_size > 1 and is_deepseek_v4(vllm_config))
 from vllm_hcu.platforms import envs as henvs
 
 logger = init_logger(__name__)
@@ -37,6 +46,17 @@ _USE_HOST_SEQ_LENS = henvs.optional_custom_op_enabled(
 )
 # Debug: compare the mirror against the device seq_lens every step.
 _CHECK_HOST_SEQ_LENS = os.environ.get("VLLM_HCU_CHECK_HOST_SEQ_LENS", "0") == "1"
+_SAMPLER_WARMUP = ContextVar("hcu_sampler_warmup", default=False)
+
+
+@contextmanager
+def sampler_warmup_scope():
+    """Mark worker-controlled startup, independently of user request IDs."""
+    token = _SAMPLER_WARMUP.set(True)
+    try:
+        yield
+    finally:
+        _SAMPLER_WARMUP.reset(token)
 
 
 def record_pp_spec_draft_index_stream(
@@ -59,6 +79,40 @@ def record_pp_spec_draft_index_stream(
         getattr(pp_handler, "broadcast_stream")
     )
     return True
+
+
+@contextmanager
+def suppress_sampler_warmup_logprobs(model_runner, input_batch):
+    """Skip synthetic logprob top-k work in the MRv2 sampler warmup.
+
+    The upstream V2 warmup requests five logprobs for each synthetic request.
+    On HCU, the resulting batched ``torch.topk`` may have no kernel image for
+    the warmup batch shape. Warmup only needs to exercise token sampling and
+    structured-output handling, so temporarily disable logprobs for those
+    synthetic slots. Real requests retain their requested logprob behavior.
+    """
+    if not _SAMPLER_WARMUP.get() or input_batch is None:
+        yield
+        return
+
+    sampler = getattr(model_runner, "sampler", None)
+    sampling_states = getattr(sampler, "sampling_states", None)
+    if sampling_states is None:
+        yield
+        return
+
+    indices = [
+        int(index)
+        for index in input_batch.idx_mapping_np[: input_batch.num_reqs]
+        if int(index) >= 0
+    ]
+    num_logprobs = sampling_states.num_logprobs
+    saved = num_logprobs[indices].copy()
+    num_logprobs[indices] = -1
+    try:
+        yield
+    finally:
+        num_logprobs[indices] = saved
 
 
 class HcuGPUModelRunnerV2(GPUModelRunner):
@@ -106,7 +160,7 @@ class HcuGPUModelRunnerV2(GPUModelRunner):
         if (
             pcp_size > 1
             and len(kv_cache_config.kv_cache_groups) != 1
-            and not is_glm53_pcp(self.vllm_config)
+            and not _uses_global_pcp_batch(self.vllm_config)
         ):
             raise ValueError(
                 "HCU PCP requires exactly one KV cache group."
@@ -118,6 +172,10 @@ class HcuGPUModelRunnerV2(GPUModelRunner):
 
             # Install before upstream discovers backends and checks PCP support.
             install_glm53_pcp(self)
+        elif _uses_global_pcp_batch(self.vllm_config):
+            from vllm_hcu.v1.glm53_pcp import install_deepseek_v4_pcp
+
+            install_deepseek_v4_pcp(self)
         with use_hcu_flash_kv_cache_allocator(self):
             super().initialize_kv_cache(
                 kv_cache_config,
@@ -269,8 +327,13 @@ class HcuGPUModelRunnerV2(GPUModelRunner):
             input_batch.seq_lens_cpu = None
             input_batch.num_computed_tokens_cpu = None
             self._hsl_batch = input_batch
-        set_deepep_auto_request_phase(input_batch.is_prefilling_np)
-        if is_glm53_pcp(self.vllm_config):
+        phase_batch = input_batch
+        if self.pcp_manager is not None and is_deepseek_v4(self.vllm_config):
+            # Empty PCP shards must choose the same DeepEP collective as
+            # ranks owning a real prefill, including one-token prompts.
+            phase_batch = self.pcp_manager._global_batch
+        set_deepep_auto_request_phase(phase_batch.is_prefilling_np)
+        if _uses_global_pcp_batch(self.vllm_config):
             from vllm_hcu.v1.glm53_pcp import bind_glm53_pcp_batch
 
             bind_glm53_pcp_batch(self.pcp_manager, input_batch)
@@ -280,11 +343,11 @@ class HcuGPUModelRunnerV2(GPUModelRunner):
     def execute_model(self, *args, **kwargs):
         scope = nullcontext()
         dummy_scope = nullcontext()
-        if is_glm53_pcp(self.vllm_config):
+        if _uses_global_pcp_batch(self.vllm_config):
             from vllm_hcu.v1.glm53_pcp import glm53_pcp_step_scope
 
             scope = glm53_pcp_step_scope()
-            if kwargs.get("dummy_run", False):
+            if kwargs.get("dummy_run", False) and is_glm53_pcp(self.vllm_config):
                 dummy_scope = replicated_mtp_batch_scope()
         with deepep_auto_request_phase_scope(), scope, dummy_scope:
             if is_step5_config(getattr(self, "vllm_config", None)):
@@ -303,8 +366,9 @@ class HcuGPUModelRunnerV2(GPUModelRunner):
         """
 
         pcp_size = int(self.vllm_config.parallel_config.prefill_context_parallel_size)
-        # GLM5Next KDA and K-pool see the full, replicated token batch.
-        if pcp_size <= 1 or is_glm53_pcp(self.vllm_config):
+        # GLM5Next KDA/K-pool and DeepSeek V4 attention see the full,
+        # replicated token batch, including during profiling.
+        if pcp_size <= 1 or _uses_global_pcp_batch(self.vllm_config):
             return super().profile_run()
 
         original_max = self.max_num_tokens
@@ -403,10 +467,15 @@ class HcuGPUModelRunnerV2(GPUModelRunner):
                     input_batch.idx_mapping_np, input_batch.num_reqs_after_padding
                 )
             return out
-        return self.pcp_manager.prepare_attn(input_batch)
+        result = self.pcp_manager.prepare_attn(input_batch)
+        if is_deepseek_v4(self.vllm_config):
+            # Every V4 cache (SWA, compressor, indexer) holds full KV and is
+            # written from the original request rows on each rank.
+            return self.pcp_manager.prepare_global_attn()
+        return result
 
     def prepare_dummy_attn(self, input_batch, valid_state_slots=False):
-        if is_glm53_pcp(self.vllm_config):
+        if _uses_global_pcp_batch(self.vllm_config):
             manager = self.pcp_manager
             self.pcp_manager = None
             try:
@@ -440,6 +509,22 @@ class HcuGPUModelRunnerV2(GPUModelRunner):
             and execute_model_state is not None
             and not getattr(self, "is_last_pp_rank", True)
         )
+        if (
+            use_replicated_mtp_batch
+            and is_deepseek_v4(self.vllm_config)
+            and execute_model_state.hidden_states is not None
+        ):
+            # Native V4 MTP reads the pre-hc residual through the model getter,
+            # independently of the post-hc hidden states restored below. Only
+            # this step's local prefix is valid; gather/reorder it before the
+            # upstream sampler slices the persistent buffer at global width.
+            residual = self.model.get_mtp_target_hidden_states()
+            if residual is not None:
+                num_local_tokens = execute_model_state.hidden_states.shape[0]
+                restored_residual = self.pcp_manager.restore_hidden_states(
+                    residual[:num_local_tokens]
+                )
+                residual[:restored_residual.shape[0]].copy_(restored_residual)
         if use_replicated_mtp_batch or restore_nonfinal_pp_batch:
             (
                 restored_hidden_states,
@@ -458,41 +543,42 @@ class HcuGPUModelRunnerV2(GPUModelRunner):
         )
         pcp_manager = self.pcp_manager
         record_pp_spec_draft_index_stream(self, input_batch)
-        with scope:
-            if use_replicated_mtp_batch:
-                assert execute_model_state is not None
-                assert input_batch is not None
-                block_tables, slot_mappings = pcp_manager.prepare_global_attn()
-                slot_mappings_by_layer = build_slot_mappings_by_layer(
-                    slot_mappings, self.kv_cache_config
-                )
-                attn_metadata = self.model_state.prepare_attn(
-                    input_batch,
-                    CUDAGraphMode.NONE,
-                    block_tables,
-                    slot_mappings,
-                    self.attn_groups,
-                    self.kv_cache_config,
-                )
-                execute_model_state = execute_model_state._replace(
-                    attn_metadata=attn_metadata,
-                    slot_mappings_by_layer=slot_mappings_by_layer,
-                )
-                self.execute_model_state = execute_model_state
-            if use_replicated_mtp_batch:
-                # The HCU path restored PCP state above so it could rebuild
-                # global draft metadata. Upstream sample_tokens() now performs
-                # the same restore itself, so hide the manager to avoid a
-                # second gather/reorder of the global batch.
-                self.pcp_manager = None
-                try:
+        with suppress_sampler_warmup_logprobs(self, input_batch):
+            with scope:
+                if use_replicated_mtp_batch:
+                    assert execute_model_state is not None
+                    assert input_batch is not None
+                    block_tables, slot_mappings = pcp_manager.prepare_global_attn()
+                    slot_mappings_by_layer = build_slot_mappings_by_layer(
+                        slot_mappings, self.kv_cache_config
+                    )
+                    attn_metadata = self.model_state.prepare_attn(
+                        input_batch,
+                        CUDAGraphMode.NONE,
+                        block_tables,
+                        slot_mappings,
+                        self.attn_groups,
+                        self.kv_cache_config,
+                    )
+                    execute_model_state = execute_model_state._replace(
+                        attn_metadata=attn_metadata,
+                        slot_mappings_by_layer=slot_mappings_by_layer,
+                    )
+                    self.execute_model_state = execute_model_state
+                if use_replicated_mtp_batch:
+                    # The HCU path restored PCP state above so it could rebuild
+                    # global draft metadata. Upstream sample_tokens() now performs
+                    # the same restore itself, so hide the manager to avoid a
+                    # second gather/reorder of the global batch.
+                    self.pcp_manager = None
+                    try:
+                        output = super().sample_tokens(grammar_output)
+                    finally:
+                        self.pcp_manager = pcp_manager
+                else:
+                    # Upstream restores PCP only on the final PP stage. Non-final
+                    # ranks need the global batch restored before PP receive.
                     output = super().sample_tokens(grammar_output)
-                finally:
-                    self.pcp_manager = pcp_manager
-            else:
-                # Upstream restores PCP only on the final PP stage. Non-final
-                # ranks need the global batch restored before PP receive.
-                output = super().sample_tokens(grammar_output)
         return output
 
 

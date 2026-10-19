@@ -11,7 +11,9 @@ import os
 from types import ModuleType
 from typing import Any
 
-from vllm_hcu.deepseek_v4_runtime import is_deepseek_v4, is_dspark_enabled
+from vllm_hcu.deepseek_v4_runtime import (
+    is_deepseek_v4, is_dspark_enabled, model_architectures,
+)
 from vllm_hcu.patch.config import HcuFeatureConfig, get_hcu_config, set_hcu_config
 
 from ._common import PatchCompatibilityError, apply_once, load_exact_module
@@ -330,17 +332,26 @@ def _require_mrv2_pcp_contract(vllm_config: object) -> None:
     )
     is_glm52 = architectures == ["GlmMoeDsaForCausalLM"]
     is_hy4 = architectures == ["HYV4ForCausalLM"]
+    is_dsv4 = architectures in (
+        ["DeepseekV4ForCausalLM"], ["DeepSeekV4MTPModel"]
+    )
     is_glm53 = is_glm53_pcp(vllm_config)
     is_glm53_mtp = _is_glm53_mtp_pcp(vllm_config)
     if is_glm53:
         _require_glm53_pcp_contract(vllm_config)
     if is_glm53_mtp:
         _require_glm53_mtp_pcp_contract(vllm_config)
-    if use_mla and not (is_glm52 or is_hy4 or is_glm53 or is_glm53_mtp):
+    if use_mla and not (is_glm52 or is_hy4 or is_glm53 or is_glm53_mtp or is_dsv4):
         raise ValueError(
             "GLM-5.2 and HY V4 MLA PCP only support "
-            "GlmMoeDsaForCausalLM or HYV4ForCausalLM."
+            "GlmMoeDsaForCausalLM, HYV4ForCausalLM, DeepseekV4ForCausalLM "
+            "or DeepSeekV4MTPModel."
         )
+    if is_dsv4:
+        if not use_mla:
+            raise ValueError("DeepSeek V4 PCP requires sparse MLA.")
+        if getattr(parallel_config, "cp_kv_cache_interleave_size", 1) != 1:
+            raise ValueError("DeepSeek V4 PCP requires Full KV without interleaving.")
     if is_glm52 and not use_mla:
         raise ValueError("GLM-5.2 PCP requires MLA or sparse MLA.")
     if is_hy4 and not use_mla:
@@ -503,6 +514,15 @@ def _validate_dspark_pd_scope(vllm_config: object) -> None:
 
     if connector == "MooncakeConnector" and is_deepseek_v4(vllm_config):
         return
+    # DecodeBenchConnector is an OFFLINE decode-bench connector: it only fills
+    # the local KV cache with synthetic values and never talks to a P/D peer,
+    # so it cannot break the validated disaggregation path. Opt-in via env to
+    # keep bench workflows reproducible outside the Mooncake setup.
+    if (
+        connector == "DecodeBenchConnector"
+        and os.environ.get("VLLM_HCU_DSPARK_ALLOW_DECODE_BENCH", "0") == "1"
+    ):
+        return
     architectures = getattr(
         getattr(vllm_config, "model_config", None), "architectures", ()
     )
@@ -596,8 +616,24 @@ def validate_and_update_hcu_config(vllm_config: object) -> HcuFeatureConfig:
                 "deepep_auto with EPLB is not supported because the HT and "
                 "LL expert weight layouts cannot be rebalanced atomically"
             )
-        if int(getattr(parallel_config, "data_parallel_size", 1)) <= 1:
-            raise ValueError("HCU deepep_auto requires data_parallel_size > 1.")
+        # Only V4 restores global prefill phase evidence for PCP-only auto.
+        # Its native MTP draft runs against the restored global target batch.
+        # Other PCP models can disagree on HT/LL when a shard has no queries.
+        supports_pcp_only_auto = (
+            int(getattr(parallel_config, "prefill_context_parallel_size", 1)) > 1
+            and not {"DeepseekV4ForCausalLM", "DeepSeekV4MTPModel"}.isdisjoint(
+                model_architectures(vllm_config)
+            )
+        )
+        if (
+            int(getattr(parallel_config, "data_parallel_size", 1)) <= 1
+            and not supports_pcp_only_auto
+        ):
+            raise ValueError(
+                "HCU deepep_auto requires data_parallel_size > 1; "
+                "the PCP-only exception requires DeepSeek V4 or its native "
+                "MTP draft with prefill_context_parallel_size > 1."
+            )
         if not getattr(parallel_config, "enable_expert_parallel", False):
             raise ValueError(
                 "HCU deepep_auto requires enable_expert_parallel=True."
