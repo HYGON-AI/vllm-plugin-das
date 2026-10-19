@@ -33,7 +33,10 @@ from vllm_hcu.v1.attention.backends.fa_utils import (
 )
 from vllm_hcu.v1.attention.kv_cache_layout import get_kv_cache_layout
 from vllm_hcu.platforms import envs as henvs
-from vllm.v1.attention.backends.utils import get_dcp_local_seq_lens
+from vllm.v1.attention.backends.utils import (
+    get_dcp_local_seq_lens,
+    split_decodes_and_prefills,
+)
 from vllm.v1.attention.ops.dcp import (
     cp_lse_ag_out_ar,
     cp_lse_ag_out_rs,
@@ -131,6 +134,13 @@ if TYPE_CHECKING:
 # split-KV kernel instead of the cutlass HG prefix kernel (~4x faster, more
 # accurate). VLLM_HCU_SWA_DECODE=0 restores the cutlass path. The effective
 # switch is resolved above so the provider is imported only when enabled.
+
+# The dense-QSA replacement and the mixed-batch split ship as one switch:
+# VLLM_HCU_DISABLE_QSA=1 makes full-attention layers dense (see
+# patch_qwen4_exp_disable_qsa) and splits mixed decode/prefill batches into
+# two varlen calls, each with its own max_query_len (decode rows lead the
+# reordered batch).  Varlen mode only; other modes keep their native dispatch.
+_SPLIT_PD = os.environ.get("VLLM_HCU_DISABLE_QSA", "0") == "1"
 
 
 def _get_flash_attn_mode() -> str:
@@ -419,6 +429,12 @@ class FlashAttentionMetadata:
 
     sliding_window: tuple[int, int] | None = None
 
+    # Decode/prefill batch split (populated only when VLLM_HCU_DISABLE_QSA=1).
+    num_decodes: int = 0
+    num_decode_tokens: int = 0
+    decode_query_len: int = 0
+    prefill_max_query_len: int = 0
+
 
 def _get_sliding_window_configs(
     vllm_config: VllmConfig,
@@ -494,6 +510,20 @@ class FlashAttentionMetadataBuilder(AttentionMetadataBuilder[FlashAttentionMetad
     ) -> AttentionCGSupport:
         if vllm_config.parallel_config.prefill_context_parallel_size > 1:
             return AttentionCGSupport.NEVER
+        if _SPLIT_PD:
+            from vllm_hcu.platforms.hcu import get_hcu_flash_attn_mode
+
+            if get_hcu_flash_attn_mode(vllm_config) != "varlen":
+                # Only varlen mode splits the batch; other modes keep their
+                # native unsplit dispatch and their original graph support.
+                return cls._cudagraph_support
+            # The split boundary (num_decodes/num_decode_tokens) is host-side
+            # Python state frozen at capture time, so a mixed prefill/decode
+            # FULL graph would replay the captured slices for a different
+            # boundary. Uniform batches (all decode) take the single-call tail
+            # and stay replay-safe; mixed batches must run through PIECEWISE
+            # graphs, where this forward executes eagerly per step.
+            return AttentionCGSupport.UNIFORM_BATCH
         return cls._cudagraph_support
 
     def __init__(
@@ -509,6 +539,14 @@ class FlashAttentionMetadataBuilder(AttentionMetadataBuilder[FlashAttentionMetad
                 "HCU FlashAttention native wrapper"
             )
         super().__init__(kv_cache_spec, layer_names, vllm_config, device)
+        if _SPLIT_PD:
+            # Decode-first batch reordering gives the split a contiguous
+            # decode prefix; the threshold is bumped for spec decode
+            # (MTP=3 -> decode_query_len 4) by _init_reorder_batch_threshold.
+            self._init_reorder_batch_threshold(
+                reorder_batch_threshold=1,
+                supports_spec_as_decode=True,
+            )
         self.model_config = vllm_config.model_config
         self.parallel_config = vllm_config.parallel_config
         self.cache_config = vllm_config.cache_config
@@ -595,6 +633,14 @@ class FlashAttentionMetadataBuilder(AttentionMetadataBuilder[FlashAttentionMetad
         """
         num_reqs = common_attn_metadata.num_reqs
         num_actual_tokens = common_attn_metadata.num_actual_tokens
+        if pcp_plan is None:
+            # MTP draft decode passes the DP-padded token count while
+            # query_start_loc only covers real tokens. The vendor direct-paged
+            # path reshapes q to [bs, max_seqlen_q, ...], so drop the padding.
+            num_actual_tokens = min(
+                num_actual_tokens,
+                int(common_attn_metadata.query_start_loc_cpu[num_reqs]),
+            )
         max_query_len = common_attn_metadata.max_query_len
         max_seq_len = common_attn_metadata.max_seq_len
         query_start_loc = common_attn_metadata.query_start_loc
@@ -760,6 +806,31 @@ class FlashAttentionMetadataBuilder(AttentionMetadataBuilder[FlashAttentionMetad
             self.scheduler_metadata[n:] = 0
             scheduler_metadata = self.scheduler_metadata[:n]
 
+        num_decodes = 0
+        num_decode_tokens = 0
+        decode_query_len = 0
+        prefill_max_query_len = 0
+        if _SPLIT_PD and not use_cascade:
+            num_decodes, _, num_decode_tokens, _ = split_decodes_and_prefills(
+                common_attn_metadata,
+                decode_threshold=self.reorder_batch_threshold,
+                require_uniform=(self.reorder_batch_threshold > 1),
+            )
+            if num_decodes > 0:
+                query_lens_cpu = torch.diff(
+                    common_attn_metadata.query_start_loc_cpu[: num_decodes + 1]
+                )
+                nonzero_query_lens = query_lens_cpu[query_lens_cpu > 0]
+                if nonzero_query_lens.numel() > 0:
+                    decode_query_len = int(nonzero_query_lens[0].item())
+                    assert torch.all(nonzero_query_lens == decode_query_len)
+            if num_decodes < num_reqs:
+                prefill_max_query_len = int(
+                    torch.diff(
+                        common_attn_metadata.query_start_loc_cpu[num_decodes:]
+                    ).max().item()
+                )
+
         group_sliding_window = getattr(self.kv_cache_spec, "sliding_window", None)
         base_window = (
             (-1, -1)
@@ -776,6 +847,10 @@ class FlashAttentionMetadataBuilder(AttentionMetadataBuilder[FlashAttentionMetad
             seq_lens=seq_lens,
             block_table=block_table_tensor,
             slot_mapping=slot_mapping,
+            num_decodes=num_decodes,
+            num_decode_tokens=num_decode_tokens,
+            decode_query_len=decode_query_len,
+            prefill_max_query_len=prefill_max_query_len,
             max_dcp_context_kv_len=max_dcp_context_kv_len,
             dcp_context_kv_lens=dcp_context_kv_lens,
             pcp_plan=pcp_plan,
@@ -1037,7 +1112,33 @@ class FlashAttentionImpl(AttentionImpl):
                     layer=layer,
                 )
                 return output
+
+            if _SPLIT_PD and _get_flash_attn_mode() == "varlen":
+                return self._forward_split_pd(
+                    query,
+                    key_cache,
+                    value_cache,
+                    output,
+                    attn_metadata,
+                    cu_seqlens_q,
+                    seqused_k,
+                    block_table,
+                    q_descale,
+                    k_descale,
+                    v_descale,
+                )
             else:
+                if _SPLIT_PD:
+                    # The split's raw-varlen fast path only exists in varlen
+                    # mode. classic/cutlass fall back to their native kernel
+                    # dispatch: routing them through the varlen interface
+                    # would bypass their FP8 d192 paged paths entirely.
+                    logger.warning_once(
+                        "[HCU FLASH_ATTN PATH] the decode/prefill split from "
+                        "VLLM_HCU_DISABLE_QSA=1 is only supported in varlen "
+                        "mode; %s mode keeps its native kernel dispatch",
+                        _get_flash_attn_mode(),
+                    )
                 sliding_window_size = _get_native_sliding_window(
                     attn_metadata.sliding_window,
                     self.sliding_window,
@@ -1187,6 +1288,102 @@ class FlashAttentionImpl(AttentionImpl):
             k_descale=layer._k_scale,
             v_descale=layer._v_scale,
             s_aux=self.sinks,
+        )
+        return output
+
+    def _forward_split_pd(
+        self,
+        query: torch.Tensor,
+        key_cache: torch.Tensor,
+        value_cache: torch.Tensor,
+        output: torch.Tensor,
+        attn_metadata: FlashAttentionMetadata,
+        cu_seqlens_q: torch.Tensor,
+        seqused_k: torch.Tensor,
+        block_table: torch.Tensor,
+        q_descale: torch.Tensor | None,
+        k_descale: torch.Tensor,
+        v_descale: torch.Tensor,
+    ) -> torch.Tensor:
+        """Forced flash_attn_varlen with the decode/prefill batch split.
+
+        A mixed batch's decode rows lead the reordered batch and share one
+        query length, so each segment gets its own max_seqlen_q (decode rows
+        are no longer inflated by the prefill's max_query_len).
+        """
+        num_actual_tokens = attn_metadata.num_actual_tokens
+        num_decode_tokens = attn_metadata.num_decode_tokens
+        sliding_window_size = _get_native_sliding_window(
+            attn_metadata.sliding_window,
+            self.sliding_window,
+            attn_metadata.causal,
+        )
+        fa_func = _select_flash_attn_varlen_func()
+        common = dict(
+            k=key_cache,
+            v=value_cache,
+            softmax_scale=self.scale,
+            causal=attn_metadata.causal,
+            alibi_slopes=self.alibi_slopes,
+            window_size=sliding_window_size,
+            softcap=self.logits_soft_cap,
+            fa_version=self.vllm_flash_attn_version,
+            s_aux=self.sinks,
+        )
+        if 0 < num_decode_tokens < num_actual_tokens:
+            num_decodes = attn_metadata.num_decodes
+            decode_query_len = attn_metadata.decode_query_len
+            # Decode rows lead the reordered batch and share one query length.
+            fa_func(
+                q=query[:num_decode_tokens],
+                out=output[:num_decode_tokens],
+                cu_seqlens_q=cu_seqlens_q[: num_decodes + 1],
+                max_seqlen_q=decode_query_len,
+                seqused_k=seqused_k[:num_decodes],
+                max_seqlen_k=attn_metadata.max_seq_len,
+                block_table=block_table[:num_decodes],
+                q_descale=None if q_descale is None else q_descale[:num_decodes],
+                k_descale=k_descale[:num_decodes],
+                v_descale=v_descale[:num_decodes],
+                **common,
+            )
+            # Prefill/extends follow with their own varlen layout.
+            fa_func(
+                q=query[num_decode_tokens:num_actual_tokens],
+                out=output[num_decode_tokens:num_actual_tokens],
+                cu_seqlens_q=cu_seqlens_q[num_decodes:] - num_decode_tokens,
+                max_seqlen_q=attn_metadata.prefill_max_query_len,
+                seqused_k=seqused_k[num_decodes:],
+                max_seqlen_k=attn_metadata.max_seq_len,
+                block_table=block_table[num_decodes:],
+                q_descale=None if q_descale is None else q_descale[num_decodes:],
+                k_descale=k_descale[num_decodes:],
+                v_descale=v_descale[num_decodes:],
+                **common,
+            )
+            logger.info_once(
+                "[HCU FLASH_ATTN PATH] split_pd flash_attn_varlen "
+                f"(decode {num_decodes} reqs / prefill "
+                f"{num_actual_tokens - num_decode_tokens} tokens)",
+                scope="local",
+            )
+            return output
+        logger.info_once(
+            "[HCU FLASH_ATTN PATH] flash_attn_varlen (split_pd)",
+            scope="local",
+        )
+        fa_func(
+            q=query[:num_actual_tokens],
+            out=output[:num_actual_tokens],
+            cu_seqlens_q=cu_seqlens_q,
+            max_seqlen_q=attn_metadata.max_query_len,
+            seqused_k=seqused_k,
+            max_seqlen_k=attn_metadata.max_seq_len,
+            block_table=block_table,
+            q_descale=q_descale,
+            k_descale=k_descale,
+            v_descale=v_descale,
+            **common,
         )
         return output
 
