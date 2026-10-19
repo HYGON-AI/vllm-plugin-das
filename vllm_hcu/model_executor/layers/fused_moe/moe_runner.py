@@ -472,6 +472,7 @@ class MoERunner(MoERunnerInterface):
         # conditions (custom AR availability, size) are checked in the op.
         self._ep_fused_combine = (
             _EP_FUSED_COMBINE
+            and not getattr(self._quant_method, "hcu_owns_dispatch", False)
             and shared_experts is not None
             and moe_config.dp_size > 1
             and moe_config.pcp_size == 1

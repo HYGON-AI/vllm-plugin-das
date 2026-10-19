@@ -69,7 +69,7 @@ def validate_config(config, moe, layer, quant_mode=None) -> None:
         raise ValueError("HCU MegaMoE PACK5 adapter requires --enforce-eager")
     if moe.moe_backend != "deep_gemm_mega_moe":
         raise ValueError(
-            "HCU MegaMoE requires --moe-backend deep_gemm_mega_moe "
+            "HCU MegaMoE requires --moe-backend deep_gemm_mega_moe"
         )
     if parallel.enable_dbo:
         raise ValueError("HCU MegaMoE PACK5 does not support DBO")
@@ -228,9 +228,22 @@ class HcuMegaMoEMethod(FusedMoEMethodBase):
             moe, "ll" if self._mode == "ll" else "normal"
         )
 
-    def _backend(self, capacity):
+    def _ll_capacity(self):
+        # The wheel sizes LL scratch with its own threshold, which may differ
+        # from the HCU selector. The actual allocation and asm stride bound
+        # take precedence over either tuning threshold.
+        return min(
+            max_chunk_tokens(self.moe, "ll"),
+            int(getattr(self._buffer, "ll_scratch_capacity_tokens_per_rank",
+                        self.moe.max_num_tokens)),
+        )
+
+    def _backend(self, capacity, *, launch_capacity=None):
         if self._mode == "auto":
-            return "ll" if capacity <= self._ll_threshold else "normal"
+            required = capacity if launch_capacity is None else launch_capacity
+            return "ll" if (
+                capacity <= self._ll_threshold and required <= self._ll_capacity()
+            ) else "normal"
         return self._mode
 
     @property
@@ -403,6 +416,10 @@ class HcuMegaMoEMethod(FusedMoEMethodBase):
         import megamoe
 
         buf = self._buffer
+        if self._graph_tokens > self._max_chunk_tokens:
+            raise ValueError("MegaMoE CUDA graph bucket exceeds K1/K3 stride capacity")
+        if self._mode == "ll" and self._graph_tokens > self._ll_capacity():
+            raise ValueError("MegaMoE CUDA graph bucket exceeds LL scratch/stride capacity")
         key = (self._layout, self._mode, self._graph_tokens, layer.swiglu_limit)
         warmed = getattr(buf, "_hcu_megamoe_graph_warmups", None)
         if warmed is None:
@@ -418,7 +435,13 @@ class HcuMegaMoEMethod(FusedMoEMethodBase):
             (self._graph_tokens, self.moe.hidden_dim),
             dtype=torch.bfloat16, device=buf.x.device,
         )
-        backends = ("ll", "normal") if self._mode == "auto" else (self._mode,)
+        if self._mode == "auto":
+            backends = (
+                ("ll", "normal")
+                if self._graph_tokens <= self._ll_capacity() else ("normal",)
+            )
+        else:
+            backends = (self._mode,)
         for backend in backends:
             megamoe.fp8_w8a8_mega_moe(
                 y, self._l1, self._l2, buf,
@@ -493,8 +516,7 @@ class HcuMegaMoEMethod(FusedMoEMethodBase):
         # rank issues the same number of collective calls.
         chunk = self._max_chunk_tokens
         if self._mode == "ll":
-            chunk = min(chunk, int(getattr(
-                buf, "ll_scratch_capacity_tokens_per_rank", chunk)))
+            chunk = min(chunk, self._ll_capacity())
         if graph:
             if capacity > chunk:
                 raise ValueError(
@@ -534,7 +556,7 @@ class HcuMegaMoEMethod(FusedMoEMethodBase):
             )
             run(
                 y if graph else y[lo:hi], self._l1, self._l2, buf,
-                megamoe_backend=self._backend(selector),
+                megamoe_backend=self._backend(selector, launch_capacity=chunk_capacity),
                 graph=graph, capacity_num_tokens=chunk_capacity,
                 activation_clamp=layer.swiglu_limit,
                 cumulative_local_expert_recv_stats=None, fast_math=True,

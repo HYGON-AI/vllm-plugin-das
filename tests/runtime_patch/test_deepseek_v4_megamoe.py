@@ -582,13 +582,15 @@ def test_raw_int4_pack5_triton_on_hcu(int4):
     torch.testing.assert_close(out.cpu(), reference)
 
 
-def test_graph_warmup_is_per_buffer_and_before_capture(runtime, monkeypatch):
+@pytest.mark.parametrize("ll_capacity,backends", [(16, ["ll", "normal"]), (4, ["normal"])])
+def test_graph_warmup_is_per_buffer_and_before_capture(runtime, monkeypatch, ll_capacity, backends):
     _, moe, layer = valid_config()
     method = runtime.HcuMegaMoEMethod(moe, "fp8", graph_tokens=8)
     method._l1, method._l2 = {}, {}
     buf = NS(x=torch.ones(16, 4096), x_sf=torch.ones(16),
              topk_idx=torch.ones(16, 6, dtype=torch.int64),
              topk_weights=torch.ones(16, 6), cuda_graph_num_tokens=torch.tensor([99]))
+    buf.ll_scratch_capacity_tokens_per_rank = ll_capacity
     method._buffer = buf
     fake = ModuleType("megamoe")
     calls = []
@@ -596,7 +598,7 @@ def test_graph_warmup_is_per_buffer_and_before_capture(runtime, monkeypatch):
     monkeypatch.setitem(sys.modules, "megamoe", fake)
     method._warmup_graph(layer)
     method._warmup_graph(layer)
-    assert [c["megamoe_backend"] for c in calls] == ["ll", "normal"]
+    assert [c["megamoe_backend"] for c in calls] == backends
     assert all(c["graph"] and c["capacity_num_tokens"] == 8 for c in calls)
     assert buf.cuda_graph_num_tokens.item() == 0
     assert (buf.topk_idx == -1).all()
@@ -664,3 +666,58 @@ def test_raw_pack5_kernel_interpreter_matches_independent_layout(int4, e, n, k, 
     reference = values.reshape(e, n//256, 16, 16, k//64, 4, 16)
     reference = reference.permute(0, 4, 1, 2, 5, 3, 6).contiguous().reshape(e, n*k)
     torch.testing.assert_close(out, reference)
+
+
+@pytest.mark.parametrize("backend", ["auto", "ll"])
+def test_ll_selection_respects_native_scratch_and_stride(runtime, monkeypatch, backend):
+    _, moe, _ = valid_config()
+    monkeypatch.setenv("MEGAMOE_HCU_BACKEND", backend)
+    method = runtime.HcuMegaMoEMethod(moe, "fp8")
+    method._buffer = NS(ll_scratch_capacity_tokens_per_rank=4)
+    assert method._ll_capacity() == 4
+    if backend == "auto":
+        assert method._backend(4) == "ll"
+        assert method._backend(5) == "normal"
+        # A small graph bucket still launches with the buffer's graph maximum.
+        assert method._backend(2, launch_capacity=8) == "normal"
+    monkeypatch.setattr(runtime, "max_chunk_tokens", lambda *args: 2)
+    assert method._ll_capacity() == 2
+    if backend == "auto":
+        assert method._backend(3) == "normal"
+
+
+@pytest.mark.parametrize("owns_dispatch,expected", [(True, False), (False, True)])
+def test_ep_fused_combine_excludes_backend_owned_dispatch(owns_dispatch, expected):
+    import ast
+    path = REPO / "vllm_hcu/model_executor/layers/fused_moe/moe_runner.py"
+    tree = ast.parse(path.read_text())
+    assignment = next(
+        node for node in ast.walk(tree)
+        if isinstance(node, ast.Assign) and any(
+            isinstance(target, ast.Attribute) and target.attr == "_ep_fused_combine"
+            for target in node.targets)
+    )
+    runner = NS(_quant_method=NS(hcu_owns_dispatch=owns_dispatch))
+    namespace = dict(
+        self=runner, _EP_FUSED_COMBINE=True, shared_experts=object(),
+        moe_config=NS(dp_size=8, pcp_size=1, is_sequence_parallel=False,
+                      skip_final_all_reduce=False),
+        routed_scaling_factor=1., routed_input_transform=None,
+        routed_output_transform=None,
+    )
+    exec(compile(ast.fix_missing_locations(ast.Module(body=[assignment], type_ignores=[])),
+                 str(path), "exec"), namespace)
+    assert runner._ep_fused_combine is expected
+
+
+@pytest.mark.parametrize("mode,match", [("normal", "stride"), ("ll", "LL scratch")])
+def test_graph_warmup_rejects_unsafe_capacity_before_launch(runtime, monkeypatch, mode, match):
+    _, moe, layer = valid_config()
+    monkeypatch.setenv("MEGAMOE_HCU_BACKEND", mode)
+    method = runtime.HcuMegaMoEMethod(moe, "fp8", graph_tokens=8)
+    method._buffer = NS(ll_scratch_capacity_tokens_per_rank=4)
+    if mode == "normal":
+        method._max_chunk_tokens = 4
+    monkeypatch.setitem(sys.modules, "megamoe", ModuleType("megamoe"))
+    with pytest.raises(ValueError, match=match):
+        method._warmup_graph(layer)
