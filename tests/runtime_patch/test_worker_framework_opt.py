@@ -2521,3 +2521,55 @@ print('REAL_WORKER_FRAMEWORK_OK', wrapper_applied, pynccl_applied)
     assert result.returncode == 0, result.stdout + result.stderr
     assert "REAL_WORKER_FRAMEWORK_OK" in result.stdout
     assert f"VLLM_SOURCE {target_vllm / 'vllm' / '__init__.py'}" in result.stdout
+
+
+@pytest.mark.parametrize("entry", ["_start_load_kv", "post_forward", "no_forward"])
+def test_kv_connector_control_context_does_not_join_dp_phase_collective(
+    monkeypatch: pytest.MonkeyPatch, entry: str,
+):
+    from unittest.mock import Mock
+    from vllm.v1.worker.gpu import kv_connector
+    import vllm_hcu.forward_context_runtime as runtime
+
+    config = _config(deepep_auto=True)
+    config.parallel_config = SimpleNamespace(
+        data_parallel_size=8, all2all_backend="deepep_auto",
+    )
+    module = _fake_forward_context_module()
+    patch_forward_context.apply_to_module(module)
+    context = object()
+    monkeypatch.setattr(
+        runtime, "set_forward_context",
+        lambda *args, **kwargs: contextlib.nullcontext(context),
+    )
+    monkeypatch.setattr(
+        runtime, "_synchronize_deepep_auto_phase",
+        lambda *args, **kwargs: pytest.fail(
+            "KV-only contexts must not join model-forward DP collectives"
+        ),
+    )
+    monkeypatch.setattr(kv_connector, "set_forward_context", module.set_forward_context)
+    monkeypatch.setattr(kv_connector, "is_forward_context_available", lambda: False)
+    monkeypatch.setattr(kv_connector, "get_forward_context", lambda: context)
+    connector = Mock()
+    connector.get_finished.return_value = (None, None)
+    connector.get_block_ids_with_load_errors.return_value = set()
+    connector.get_kv_connector_stats.return_value = None
+    connector.get_kv_connector_kv_cache_events.return_value = None
+    connector.build_connector_worker_meta.return_value = None
+    active = object.__new__(kv_connector.ActiveKVConnector)
+    active.vllm_config = config
+    active.kv_connector = connector
+    active._disabled = False
+    active._pending_load_start = True
+    if entry == "post_forward":
+        active.post_forward(set())
+    elif entry == "no_forward":
+        active.no_forward(SimpleNamespace(
+            kv_connector_metadata=object(), has_sync_kv_loads=False,
+            finished_req_ids=set(),
+        ))
+    else:
+        active._start_load_kv()
+    connector.start_load_kv.assert_called_once_with(context)
+    assert active._pending_load_start is False
