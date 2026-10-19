@@ -2052,7 +2052,7 @@ def test_pp_v2_spec_broadcast_pads_initial_sample_to_receiver_width() -> None:
     assert captured[0][0, 1:].tolist() == [0, 0, 0, 0, 0]
 
 
-def test_pp_v2_spec_drafts_are_broadcast_to_non_last_rank(
+def test_pp_v2_spec_drafts_wait_only_when_same_request_becomes_eligible(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     from vllm_hcu.v1 import hcu_model_runner_v2
@@ -2064,17 +2064,27 @@ def test_pp_v2_spec_drafts_are_broadcast_to_non_last_rank(
         def wait_stream(self, stream: object) -> None:
             calls.append(("wait", stream))
 
-        def synchronize(self) -> None:
-            calls.append(("sync", self))
+        def record_event(self) -> object:
+            event = object()
+            calls.append(("record", event))
+            return event
 
-    main_stream = object()
+        def wait_event(self, event: object) -> None:
+            calls.append(("wait_event", event))
+
+        def synchronize(self) -> None:
+            pytest.fail("draft broadcast must not synchronize the host")
+
+    main_stream = Stream()
     broadcast_stream = Stream()
     handler = SimpleNamespace(
         is_last_rank=False,
         last_rank=7,
+        world_size=2,
         broadcast_group="draft-group",
         broadcast_stream=broadcast_stream,
         main_stream=main_stream,
+        req_idx_gen_np=np.zeros(4, dtype=np.int32),
     )
     runner = SimpleNamespace(
         pp_handler=handler,
@@ -2106,12 +2116,31 @@ def test_pp_v2_spec_drafts_are_broadcast_to_non_last_rank(
     assert hcu_model_runner_v2.synchronize_pp_spec_draft_tokens(
         runner, input_batch
     )
+    assert runner.req_states.draft_tokens[2].tolist() == [0, 0, 0]
+    assert hcu_model_runner_v2.consume_pending_pp_spec_draft_tokens(runner) is False
+    assert runner.req_states.draft_tokens[2].tolist() == [0, 0, 0]
+    assert hcu_model_runner_v2.consume_pending_pp_spec_draft_tokens(runner) is True
     assert runner.req_states.draft_tokens[2].tolist() == [101, 102, 103]
+
+    event = calls[2][1]
     assert calls == [
         ("wait", main_stream),
         ("broadcast", (7, "draft-group")),
-        ("sync", broadcast_stream),
+        ("record", event),
+        ("wait_event", event),
     ]
+
+    # Reusing a request-state slot before its deferred receive becomes eligible
+    # must not publish the old request's drafts into the new request.
+    payload.fill_(999)
+    assert hcu_model_runner_v2.synchronize_pp_spec_draft_tokens(
+        runner, input_batch
+    )
+    assert hcu_model_runner_v2.consume_pending_pp_spec_draft_tokens(runner) is False
+    handler.req_idx_gen_np[2] += 1
+    assert hcu_model_runner_v2.consume_pending_pp_spec_draft_tokens(runner) is False
+    assert runner.req_states.draft_tokens[2].tolist() == [101, 102, 103]
+    assert [name for name, _ in calls].count("wait_event") == 1
 
 
 @pytest.mark.parametrize("is_last", [False, True])

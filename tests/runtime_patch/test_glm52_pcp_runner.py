@@ -481,6 +481,7 @@ def test_hyv4_pp2_mtp3_current_sample_body_restores_and_synchronizes(
     events = []
     batch = SimpleNamespace(req_ids=["b", "a"], num_reqs=2,
                             idx_mapping=torch.tensor([3, 1]),
+                            idx_mapping_np=np.array([3, 1]),
                             query_start_loc=torch.tensor([0, 1, 2]))
     hidden = torch.ones(2, 4)
     drafts = torch.tensor([[101, 102, 103], [201, 202, 203]])
@@ -509,7 +510,14 @@ def test_hyv4_pp2_mtp3_current_sample_body_restores_and_synchronizes(
                         lambda slots, cache: {"draft": slots})
     class Stream:
         def wait_stream(self, other): pass
-        def synchronize(self): events.append("draft_complete")
+        def record_event(self):
+            events.append("draft_queued")
+            return "draft_event"
+        def wait_event(self, event):
+            assert event == "draft_event"
+            events.append("draft_complete")
+        def synchronize(self):
+            pytest.fail("draft broadcast must not synchronize the host")
     def sample_broadcast(ids, *args):
         assert ids.shape == (2, 4)
         assert ids[:, 0].tolist() == [11, 21]
@@ -518,7 +526,8 @@ def test_hyv4_pp2_mtp3_current_sample_body_restores_and_synchronizes(
         is_last_rank=is_last, last_rank=4, max_sample_len=4,
         broadcast=sample_broadcast,
         receive=lambda b: events.append("target_width4") or True,
-        broadcast_stream=Stream(), main_stream=object(), broadcast_group="pp")
+        broadcast_stream=Stream(), main_stream=Stream(), broadcast_group="pp",
+        world_size=2, req_idx_gen_np=np.zeros(5, dtype=np.int32))
     adapter.install_fixed_width_pp_sample_broadcast(runner)
     monkeypatch.setattr(adapter.torch.cuda, "stream", lambda _: contextlib.nullcontext())
     def broadcast(ids, *, src, group):
@@ -558,9 +567,13 @@ def test_hyv4_pp2_mtp3_current_sample_body_restores_and_synchronizes(
         assert "draft_width3" not in events
     else:
         runner.sample_tokens(None)
+        if not is_last:
+            assert runner.req_states.draft_tokens[batch.idx_mapping].eq(0).all()
+            assert adapter.consume_pending_pp_spec_draft_tokens(runner) is False
+            assert adapter.consume_pending_pp_spec_draft_tokens(runner) is True
         torch.testing.assert_close(runner.req_states.draft_tokens[batch.idx_mapping], drafts)
         assert events.index("target_width4") < events.index("draft_width3")
-        assert events[-1] == "draft_complete"
+        assert ("draft_complete" in events) is (not is_last)
     assert runner.execute_model_state is None
     assert pcp.effective_pcp_world_size(4) == 4
     assert ("propose" in events) is is_last
