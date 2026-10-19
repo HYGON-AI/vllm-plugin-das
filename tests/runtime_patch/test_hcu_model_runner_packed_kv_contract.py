@@ -12,6 +12,7 @@ import pytest
 import torch
 
 import vllm.v1.attention.backend as target_attention_backend
+import vllm.v1.kv_cache_interface as kv_cache_interface
 from vllm.v1.kv_cache_interface import (
     AttentionSpec,
     KVCacheConfig,
@@ -19,7 +20,6 @@ from vllm.v1.kv_cache_interface import (
     KVCacheTensor,
     KVQuantMode,
     MLAAttentionSpec,
-    TQFullAttentionSpec,
 )
 from vllm.v1.simple_kv_offload.manager import SimpleCPUOffloadScheduler
 
@@ -39,7 +39,19 @@ def runner_module():
         object,
         raising=False,
     )
+    # 462fdb0 has no TurboQuant spec. The runner still imports the name,
+    # so expose a stand-in only when the target interface lacks it. Tests
+    # that need the real spec read the class captured before this patch.
+    real_tq_spec = getattr(kv_cache_interface, "TQFullAttentionSpec", None)
+    if real_tq_spec is None:
+        patch.setattr(
+            kv_cache_interface,
+            "TQFullAttentionSpec",
+            type("TQFullAttentionSpec", (), {}),
+            raising=False,
+        )
     module = importlib.import_module("vllm_hcu.v1.hcu_model_runner")
+    module._target_tq_full_attention_spec = real_tq_spec
     yield module
     patch.undo()
 
@@ -310,46 +322,52 @@ def test_runner_uses_per_layer_dtype_and_target_nonpacked_reshape(
     monkeypatch.setattr(runner_module, "get_hcu_flash_attn_mode", lambda: "classic")
     plain_spec = _plain_spec()
     quant_spec = _plain_spec(quant_mode=KVQuantMode.FP8_PER_TENSOR)
-    tq_spec = TQFullAttentionSpec(
-        block_size=2,
-        num_kv_heads=1,
-        head_size=2,
-        dtype=torch.float16,
-        tq_slot_size=8,
-    )
     plain_backend = _Backend()
     quant_backend = _Backend()
-    tq_backend = _Backend()
+    layer_specs = [
+        ("plain", plain_spec, plain_backend),
+        ("quant", quant_spec, quant_backend),
+    ]
+    tq_cls = runner_module._target_tq_full_attention_spec
+    tq_backend = None
+    if tq_cls is not None:
+        tq_spec = tq_cls(
+            block_size=2,
+            num_kv_heads=1,
+            head_size=2,
+            dtype=torch.float16,
+            tq_slot_size=8,
+        )
+        tq_backend = _Backend()
+        layer_specs.append(("tq", tq_spec, tq_backend))
     config = KVCacheConfig(
         num_blocks=2,
         kv_cache_tensors=[
-            KVCacheTensor(2 * plain_spec.page_size_bytes, ["plain"]),
-            KVCacheTensor(2 * quant_spec.page_size_bytes, ["quant"]),
-            KVCacheTensor(2 * tq_spec.page_size_bytes, ["tq"]),
+            KVCacheTensor(2 * spec.page_size_bytes, [name])
+            for name, spec, _backend in layer_specs
         ],
         kv_cache_groups=[
-            KVCacheGroupSpec(["plain"], plain_spec),
-            KVCacheGroupSpec(["quant"], quant_spec),
-            KVCacheGroupSpec(["tq"], tq_spec),
+            KVCacheGroupSpec([name], spec) for name, spec, _backend in layer_specs
         ],
     )
     groups = [
-        _group(0, ["plain"], plain_spec, plain_backend),
-        _group(1, ["quant"], quant_spec, quant_backend),
-        _group(2, ["tq"], tq_spec, tq_backend),
+        _group(group_id, [name], spec, backend)
+        for group_id, (name, spec, backend) in enumerate(layer_specs)
     ]
     runner = _runner(runner_module, config, groups, cache_dtype="fp8")
     raw = runner._allocate_kv_cache_tensors(config)
 
-    caches = runner._reshape_kv_cache_tensors(raw, [2, 2, 2])
+    caches = runner._reshape_kv_cache_tensors(raw, [2] * len(layer_specs))
 
     assert plain_backend.shape_calls[-1][-1] == "auto"
     assert quant_backend.shape_calls[-1][-1] == "fp8"
-    assert tq_backend.shape_calls[-1][-1] == "fp8"
+    if tq_backend is not None:
+        assert tq_backend.shape_calls[-1][-1] == "fp8"
     assert {cache.shape for cache in caches.values()} == {(2, 2, 2, 1, 2)}
     assert caches["plain"].is_contiguous()
     assert caches["quant"].is_contiguous()
-    assert caches["tq"].is_contiguous()
+    if tq_backend is not None:
+        assert caches["tq"].is_contiguous()
 
 
 def test_runner_uses_storage_block_size_for_compressed_mla(

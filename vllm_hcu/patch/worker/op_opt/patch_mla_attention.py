@@ -104,7 +104,7 @@ def apply_to_module(module: ModuleType) -> bool:
     )
     require_exact_signature(
         original_bind_kv_cache,
-        TARGETS[9],
+        TARGETS[10],
         positional=("self", "kv_cache"),
     )
     require_exact_signature(
