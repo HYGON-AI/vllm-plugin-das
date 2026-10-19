@@ -881,6 +881,8 @@ def apply_aiter_w4a8_moe(
     topk_ids: torch.Tensor,
     *,
     allow_aiter: bool = True,
+    activation_scale: torch.Tensor | None = None,
+    output_dtype: torch.dtype | None = None,
 ) -> torch.Tensor:
     """Route SlimQuant W4A8 through AITER, or vLLM Triton if unsupported."""
 
@@ -894,6 +896,27 @@ def apply_aiter_w4a8_moe(
         raise HcuCompressedTensorsMoeError(
             "SlimQuant W4A8 requires matching rank-2 hidden and top-k tensors"
         )
+    prequantized = activation_scale is not None
+    if prequantized:
+        if hidden_states.dtype is not torch.int8:
+            raise HcuCompressedTensorsMoeError(
+                "SlimQuant W4A8 prequantized activations must be INT8"
+            )
+        if activation_scale.dtype is not torch.float32 or activation_scale.shape != (
+            hidden_states.shape[0],
+            1,
+        ):
+            raise HcuCompressedTensorsMoeError(
+                "SlimQuant W4A8 prequantized activations require FP32 "
+                "per-token scales"
+            )
+        if output_dtype not in (torch.float16, torch.bfloat16, torch.float32):
+            raise HcuCompressedTensorsMoeError(
+                "SlimQuant W4A8 prequantized activations require a floating "
+                "output dtype"
+            )
+    elif output_dtype is None:
+        output_dtype = hidden_states.dtype
     explicit_vllm_layout = bool(
         getattr(
             getattr(layer, "w13_weight", None),
@@ -954,7 +977,7 @@ def apply_aiter_w4a8_moe(
             K=logical_k,
             top_k=int(topk_ids.shape[1]),
             block_size=0,
-            dtype=hidden_states.dtype,
+            dtype=output_dtype,
             device=hidden_states.device,
             quant_type=quant_type,
             activation=activation,
@@ -984,6 +1007,11 @@ def apply_aiter_w4a8_moe(
     expert_mask = getattr(layer, "expert_mask", None)
     swiglu_limit = getattr(layer, "swiglu_limit", None) or None
     if aiter_config is None:
+        if prequantized:
+            raise HcuCompressedTensorsMoeError(
+                "SlimQuant W4A8 prequantized activations require an AITER "
+                "solution that accepts activation scales"
+            )
         if activation != "silu":
             raise HcuCompressedTensorsMoeError(
                 "AITER selected no W4A8 solution for Kimi-K3 SiTU"
@@ -1062,14 +1090,18 @@ def apply_aiter_w4a8_moe(
         activation=activation,
         w1_scale=prepared_w1_scale,
         w2_scale=prepared_w2_scale,
-        a1_scale=getattr(quant_config, "a1_scale", None),
+        a1_scale=(
+            activation_scale
+            if activation_scale is not None
+            else getattr(quant_config, "a1_scale", None)
+        ),
         a2_scale=getattr(quant_config, "a2_scale", None),
         block_shape=None,
         global_num_experts=int(global_num_experts),
         expert_map=aiter_expert_map,
         routed_scaling_factor=1.0,
         use_weight_shuffle=bool(getattr(aiter_config, "need_shuffle", False)),
-        output_dtype=hidden_states.dtype,
+        output_dtype=output_dtype,
         gemm1_alpha=situ_beta,
         gemm1_limit=(
             situ_linear_beta if activation == "situ" else swiglu_limit

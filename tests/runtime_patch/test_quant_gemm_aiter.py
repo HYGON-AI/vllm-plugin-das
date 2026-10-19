@@ -5747,6 +5747,7 @@ def test_slimquant_w4a8_tp_aiter_keeps_selected_canonical_owner(
     method.process_weights_after_loading(layer)
 
     assert method.moe_quant_config is not None
+    assert method.supports_int8_allgatherv_input is True
     assert prewarm_calls == [layer]
     assert layer.w13_weight is w13
     assert layer.w2_weight is w2
@@ -5970,6 +5971,7 @@ def test_slimquant_w4a8_m1_miss_installs_single_native_triton_layout(
     method.process_weights_after_loading(layer)
 
     assert method.moe_quant_config is not None
+    assert method.supports_int8_allgatherv_input is False
     assert layer.w13_weight.shape == (1, 4, 4)
     assert layer.w2_weight.shape == (1, 4, 2)
     assert layer.w13_weight._hcu_vllm_w4a8_unpacked is True
@@ -6063,6 +6065,82 @@ def test_slimquant_w4a8_legacy_raw_weights_pin_actual_m_to_moe_c(
     assert execute["w1_scale"] is w1_scale
     assert execute["w2_scale"] is w2_scale
     assert execute["gemm1_limit"] == 10.0
+
+
+@pytest.mark.hcu
+def test_slimquant_w4a8_prequantized_input_reaches_aiter_without_requantizing(
+    monkeypatch: pytest.MonkeyPatch,
+):
+    calls: dict[str, object] = {}
+    selected = SimpleNamespace(
+        quant_type="w4a8",
+        solution_type="moe_c",
+        need_shuffle=False,
+        need_shuffle_scale=False,
+    )
+
+    class MoeQuantType:
+        W4A8 = "w4a8"
+
+    def get_config(**kwargs: object):
+        calls["selector"] = kwargs
+        return True, selected
+
+    def aiter_moe(**kwargs: object):
+        calls["execute"] = kwargs
+        return torch.zeros((3, 4), dtype=kwargs["output_dtype"])
+
+    monkeypatch.setitem(
+        sys.modules,
+        "aiter.moe",
+        _module(
+            "aiter.moe",
+            MoeQuantType=MoeQuantType,
+            get_aiter_moe_config=get_config,
+            aiter_moe=aiter_moe,
+        ),
+    )
+    quantized = torch.ones((3, 4), dtype=torch.int8)
+    activation_scale = torch.full((3, 1), 0.125, dtype=torch.float32)
+    topk_weights = torch.ones((3, 2), dtype=torch.float32)
+    topk_ids = torch.zeros((3, 2), dtype=torch.int32)
+    w1 = torch.zeros((2, 8, 2), dtype=torch.int8)
+    w2 = torch.zeros((2, 4, 2), dtype=torch.int8)
+    w1._hcu_aiter_moe_m1_supported = False
+    method = SimpleNamespace(
+        moe=SimpleNamespace(num_experts=2),
+        moe_quant_config=SimpleNamespace(
+            w1_scale=torch.ones((2, 8, 1)),
+            w2_scale=torch.ones((2, 4, 1)),
+            a1_scale=None,
+            a2_scale=None,
+        ),
+    )
+    layer = SimpleNamespace(
+        w13_weight=w1,
+        w2_weight=w2,
+        swiglu_limit=10.0,
+        global_num_experts=2,
+        _expert_map=None,
+        expert_mask=None,
+    )
+
+    result = compressed_tensors_moe_runtime.apply_aiter_w4a8_moe(
+        method,
+        layer,
+        quantized,
+        topk_weights,
+        topk_ids,
+        activation_scale=activation_scale,
+        output_dtype=torch.bfloat16,
+    )
+
+    assert result.dtype is torch.bfloat16
+    assert calls["selector"]["dtype"] is torch.bfloat16
+    execute = calls["execute"]
+    assert execute["hidden_states"] is quantized
+    assert execute["a1_scale"] is activation_scale
+    assert execute["output_dtype"] is torch.bfloat16
 
 
 @pytest.mark.hcu
@@ -6352,6 +6430,55 @@ def test_slimquant_w4a8_apply_accepts_runner_owned_shared_experts(
     )
 
     assert result is x
+
+
+@pytest.mark.hcu
+def test_slimquant_w4a8_apply_forwards_prequantized_allgather_payload(
+    monkeypatch: pytest.MonkeyPatch,
+):
+    from vllm_hcu.model_executor.layers.quantization import slimquant_w4a8
+
+    calls: list[tuple[tuple[object, ...], dict[str, object]]] = []
+    expected = torch.zeros((3, 2), dtype=torch.bfloat16)
+
+    def apply_aiter(*args: object, **kwargs: object) -> torch.Tensor:
+        calls.append((args, kwargs))
+        return expected
+
+    monkeypatch.setattr(
+        compressed_tensors_moe_runtime,
+        "apply_aiter_w4a8_moe",
+        apply_aiter,
+    )
+    method = object.__new__(slimquant_w4a8.SlimQuantW4A8Int8AiterMoEMethod)
+    method.moe = SimpleNamespace(moe_backend="aiter")
+    method.moe_kernel = None
+    method._supports_int8_allgatherv_input = True
+    layer = SimpleNamespace()
+    quantized = torch.ones((3, 2), dtype=torch.int8)
+    scale = torch.full((3, 1), 0.125, dtype=torch.float32)
+    topk_weights = torch.ones((3, 1), dtype=torch.float32)
+    topk_ids = torch.zeros((3, 1), dtype=torch.int32)
+
+    result = method.apply(
+        layer,
+        quantized,
+        topk_weights,
+        topk_ids,
+        shared_experts=None,
+        shared_experts_input=None,
+        i_q=quantized,
+        i_s=scale,
+        output_dtype=torch.bfloat16,
+    )
+
+    assert method.supports_int8_allgatherv_input is True
+    assert result is expected
+    assert len(calls) == 1
+    args, kwargs = calls[0]
+    assert args[2] is quantized
+    assert kwargs["activation_scale"] is scale
+    assert kwargs["output_dtype"] is torch.bfloat16
 
 
 @pytest.mark.hcu
