@@ -131,7 +131,6 @@ def apply_to_module(module: ModuleType) -> bool:
         torch.ops.hcu_ops.deepseek_v4_inv_rope(
             o[..., -rope_head_dim:], positions, rotary_emb.cos_sin_cache
         )
-        logger.info_once("DeepSeek V4 uses the HCU suffix inverse-RoPE op")
         return torch.einsum(
             "tgd,grd->tgr",
             o.view(o.shape[0], n_local_groups, hidden_dim),
@@ -141,6 +140,7 @@ def apply_to_module(module: ModuleType) -> bool:
     setattr(inverse_rope_einsum, _MARKER, True)
     rocm.rocm_inv_rope_einsum = inverse_rope_einsum
     setattr(rocm, _MARKER, True)
+    logger.info_once("DeepSeek V4 uses the HCU suffix inverse-RoPE op")
     return True
 
 
