@@ -450,13 +450,19 @@ def test_v0281_runner_lock_matches_audited_runtime(
         REPOSITORY / ".github/workflows/configs/hcu-runner-environment.json"
     )
     lock = json.loads(lock_path.read_text(encoding="utf-8"))
-    assert lock["python"] == "3.10.12"
-    assert lock["torch_hip"] == {"match": "prefix", "version": "6.3."}
+    assert lock["python"] == {
+        "match": "exact",
+        "versions": ["3.10.12", "3.12.12"],
+    }
+    assert lock["torch_hip"] == {
+        "match": "prefix",
+        "versions": ["6.3.", "7.2."],
+    }
     assert lock["rocm"] == {
         "environment": "ROCM_PATH",
         "version_file": ".info/rocm_version",
         "match": "release_line",
-        "version": "26.04",
+        "versions": ["26.04", "26.10"],
     }
     assert lock["distributions"] == {
         "torch": {"match": "prefix", "version": "2.11.0+"},
@@ -486,6 +492,22 @@ def test_v0281_runner_lock_matches_audited_runtime(
         torch_hip="6.3.26113",
     )
     assert report["rocm"] == "26.04.1"
+
+    version_file.write_text("26.10\n", encoding="utf-8")
+    report = _check_environment_lock(
+        lock_path,
+        versions=versions,
+        torch_hip="7.2.26365",
+    )
+    assert report["rocm"] == "26.10"
+    monkeypatch.setattr("hcu_ci_preflight.platform.python_version", lambda: "3.12.12")
+    _check_environment_lock(
+        lock_path,
+        versions=versions,
+        torch_hip="7.2.26365",
+    )
+    monkeypatch.setattr("hcu_ci_preflight.platform.python_version", lambda: "3.10.12")
+    version_file.write_text("26.04.1\n", encoding="utf-8")
 
     for distribution, compatible_version in (
         ("vllm", "0.28.1"),
@@ -537,7 +559,9 @@ def dtk_environment_lock(
     )
     # Exercise the generic release-line matcher independently of the branch's
     # exact audited DTK patch release.
+    lock["rocm"].pop("versions", None)
     lock["rocm"].update({"match": "release_line", "version": "26.04"})
+    lock["python"] = "3.10.12"
     runtime_root = tmp_path / "dtk"
     version_file = runtime_root / lock["rocm"]["version_file"]
     version_file.parent.mkdir(parents=True)
@@ -633,6 +657,10 @@ def test_environment_lock_preserves_exact_dtk_matching(
     (
         {"match": "prefix"},
         {"match": []},
+        {"version": "26.04", "versions": ["26.04", "26.10"]},
+        {"version": None, "versions": []},
+        {"version": None, "versions": ["26.04", 26.10]},
+        {"version": None, "versions": ["26.04", "26.04"]},
         {"match": "release_line", "version": "26"},
         {"match": "release_line", "version": "26.04.1"},
         {"match": "release_line", "version": "26.04|27.01"},
