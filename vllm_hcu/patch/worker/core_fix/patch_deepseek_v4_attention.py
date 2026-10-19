@@ -53,6 +53,22 @@ def _validate_compressor_backend() -> str:
     return backend
 
 
+def _offloaded_param_ids() -> set[int]:
+    """Return parameters whose storage is managed by the prefetch offloader."""
+    from vllm.model_executor.offloader.base import get_offloader
+    from vllm.model_executor.offloader.prefetch import PrefetchOffloader
+
+    offloader = get_offloader()
+    if not isinstance(offloader, PrefetchOffloader):
+        return set()
+
+    return {
+        id(param_offloader._param)
+        for module_offloader in offloader.module_offloaders
+        for param_offloader in module_offloader._param_offloaders.values()
+    }
+
+
 def bind_compressor_nt_weights(model: torch.nn.Module | None) -> int:
     """Materialize NN-layout compressor weights before graph compilation."""
     if model is None or not henvs.custom_ops_enabled():
@@ -60,6 +76,7 @@ def bind_compressor_nt_weights(model: torch.nn.Module | None) -> int:
     if _validate_compressor_backend() != "blaslt":
         return 0
 
+    offloaded_param_ids = _offloaded_param_ids()
     bound = 0
     for module in model.modules():
         linear = getattr(module, "fused_wkv_wgate", None)
@@ -67,6 +84,10 @@ def bind_compressor_nt_weights(model: torch.nn.Module | None) -> int:
             continue
         weight = getattr(linear, "weight", None)
         if not isinstance(weight, torch.Tensor):
+            continue
+        if id(weight) in offloaded_param_ids or getattr(
+            weight, "_vllm_is_uva_offloaded", False
+        ):
             continue
         if (
             weight.ndim != 2

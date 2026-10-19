@@ -101,6 +101,7 @@ def test_optimized_helper_uses_native_op_and_cached_weight(monkeypatch):
     assert len(calls) == 1
 
 
+@pytest.mark.hcu
 @pytest.mark.skipif(
     not torch.cuda.is_available(), reason="inverse RoPE tests need a working GPU"
 )
