@@ -74,6 +74,12 @@ _EP_FUSED_COMBINE = henvs.optional_custom_op_enabled(
 )
 
 
+def _int8_allgatherv_enabled() -> bool:
+    from vllm_hcu.patch.worker.framework_opt import patch_agrs_int8
+
+    return patch_agrs_int8._enabled()
+
+
 def _ep_fused_rows(hidden_states: torch.Tensor) -> tuple[int, int] | None:
     """This DP rank's rows of ``hidden_states`` if the EP custom all-reduce
     can combine it (see _ep_fused_all_reduce), else None."""
@@ -828,6 +834,32 @@ class MoERunner(MoERunnerInterface):
         ) or ("i_q" in parameters and "i_s" in parameters)
         return self._supports_quanted_inputs
 
+    def _quant_method_accepts_argument(self, name: str) -> bool:
+        apply = getattr(self._quant_method, "apply", None)
+        if apply is None:
+            return False
+        try:
+            parameters = inspect.signature(apply).parameters
+        except (TypeError, ValueError):
+            return False
+        return name in parameters or any(
+            parameter.kind == inspect.Parameter.VAR_KEYWORD
+            for parameter in parameters.values()
+        )
+
+    def _int8_allgatherv_quant_method(self):
+        """Return the legacy method wrapped by a modular MoE method, if any."""
+
+        quant_method = self._quant_method
+        seen = set()
+        while id(quant_method) not in seen:
+            seen.add(id(quant_method))
+            wrapped = getattr(quant_method, "old_quant_method", None)
+            if wrapped is None:
+                break
+            quant_method = wrapped
+        return quant_method
+
     def _apply_quant_method(
         self,
         hidden_states: torch.Tensor,
@@ -838,6 +870,10 @@ class MoERunner(MoERunnerInterface):
         scale: torch.Tensor | None = None,
         topk_weights: torch.Tensor | None = None,
         topk_ids: torch.Tensor | None = None,
+        output_dtype: torch.dtype | None = None,
+        shared_experts_quanted_input: tuple[
+            torch.Tensor, torch.Tensor
+        ] | None = None,
     ) -> tuple[torch.Tensor | None, torch.Tensor]:
         """Run expert routing and the fused MoE kernel via the quant method.
 
@@ -862,15 +898,10 @@ class MoERunner(MoERunnerInterface):
                 f"monolithic quant method {type(self._quant_method).__name__}"
             )
 
-        shared_experts_x_and_scale_quanted = (
-            (quanted_hidden_states, scale)
-            if quanted_hidden_states is not None and scale is not None
-            else None
-        )
         self._maybe_apply_shared_experts(
             shared_experts_input,
             SharedExpertsOrder.NO_OVERLAP,
-            x_and_scale_quanted=shared_experts_x_and_scale_quanted,
+            x_and_scale_quanted=shared_experts_quanted_input,
         )
         if self._ep_fused_combine:
             _EP_COMBINE.arm(self._shared_experts, shared_experts_input)
@@ -908,6 +939,13 @@ class MoERunner(MoERunnerInterface):
                         f"{type(self._quant_method).__name__}.apply does not accept "
                         "i_q/i_s"
                     )
+                quantized_kwargs = {"i_q": quanted_hidden_states, "i_s": scale}
+                if self._quant_method_accepts_argument("output_dtype"):
+                    quantized_kwargs["output_dtype"] = (
+                        output_dtype
+                        if output_dtype is not None
+                        else hidden_states.dtype
+                    )
                 fused_out = self._quant_method.apply(
                     layer=self.routed_experts,
                     x=hidden_states,
@@ -915,14 +953,13 @@ class MoERunner(MoERunnerInterface):
                     topk_ids=topk_ids,
                     shared_experts=self._shared_experts,
                     shared_experts_input=shared_experts_input,
-                    i_q=quanted_hidden_states,
-                    i_s=scale,
+                    **quantized_kwargs,
                 )
 
         self._maybe_apply_shared_experts(
             shared_experts_input,
             SharedExpertsOrder.MULTI_STREAM_OVERLAPPED,
-            x_and_scale_quanted=shared_experts_x_and_scale_quanted,
+            x_and_scale_quanted=shared_experts_quanted_input,
         )
 
         return (
@@ -1125,6 +1162,31 @@ class MoERunner(MoERunnerInterface):
             self.moe_config.dp_size > 1 or self.moe_config.is_sequence_parallel
         ) and not self._quant_method.supports_internal_mk
 
+    @property
+    def do_int8_allgatherv_dispatch(self) -> bool:
+        return bool(
+            self.do_naive_dispatch_combine
+            and self.moe_config.tp_size == 1
+            and self.moe_config.dp_size == 4
+            and self.moe_config.pcp_size == 1
+            and not self.moe_config.is_sequence_parallel
+            and _int8_allgatherv_enabled()
+            and getattr(
+                self._int8_allgatherv_quant_method(),
+                "supports_int8_allgatherv_input",
+                False,
+            )
+        )
+
+    def _use_int8_allgatherv_dispatch(
+        self,
+        hidden_states: torch.Tensor,
+    ) -> bool:
+        return bool(
+            hidden_states.dtype is torch.bfloat16
+            and self.do_int8_allgatherv_dispatch
+        )
+
     def _maybe_dispatch(
         self,
         hidden_states: torch.Tensor,
@@ -1281,12 +1343,34 @@ class MoERunner(MoERunnerInterface):
         # TODO(bnell): this can be removed after MK migration is complete.
         self.routed_experts._ensure_moe_quant_config_init()
 
-        # Sync aux and main stream for shared expert multi-stream overlap.
+        use_int8_allgatherv = self._use_int8_allgatherv_dispatch(hidden_states)
+
+        # Quantize the local input once so both the shared expert's first
+        # projection and the DP AllGatherv transport can consume it.
         shared_experts_x_and_scale_quanted = (
             (quanted_hidden_states, scale)
             if quanted_hidden_states is not None and scale is not None
             else None
         )
+        transport_x_and_scale_quanted = None
+        if use_int8_allgatherv:
+            from vllm_hcu.patch.worker.framework_opt.patch_agrs_int8 import (
+                _quantize_hidden_states,
+            )
+
+            transport_x_and_scale_quanted = _quantize_hidden_states(
+                hidden_states
+            )
+            if (
+                self._shared_experts is not None
+                and shared_experts_input is hidden_states
+                and self._shared_experts._layer_supports_x_and_scale_quanted()
+            ):
+                shared_experts_x_and_scale_quanted = (
+                    transport_x_and_scale_quanted
+                )
+
+        # Sync aux and main stream for shared expert multi-stream overlap.
         self._maybe_sync_shared_experts_stream(
             shared_experts_input,
             x_and_scale_quanted=shared_experts_x_and_scale_quanted,
@@ -1307,10 +1391,47 @@ class MoERunner(MoERunnerInterface):
             # #32567 lands and the remaining kernels are made MKs.  The PCP
             # code will probably remain
             num_local_tokens = hidden_states.shape[0]
-            hidden_states, router_logits = self._maybe_dispatch(
-                hidden_states,
-                router_logits,
-            )
+            dispatch_output_dtype = None
+            if use_int8_allgatherv:
+                if router_logits is None:
+                    raise RuntimeError(
+                        "INT8 AllGatherv dispatch requires router logits"
+                    )
+                topk_weights, topk_ids = self.router.select_experts(
+                    hidden_states=hidden_states,
+                    router_logits=router_logits,
+                    topk_indices_dtype=self._quant_method.topk_indices_dtype,
+                    input_ids=input_ids,
+                )
+                dispatch_output_dtype = hidden_states.dtype
+                from vllm_hcu.patch.worker.framework_opt.patch_agrs_int8 import (
+                    int8_transport,
+                )
+
+                with int8_transport(transport_x_and_scale_quanted):
+                    result = get_ep_group().dispatch(
+                        hidden_states,
+                        topk_weights,
+                        topk_ids,
+                        self.moe_config.is_sequence_parallel,
+                    )
+                if len(result) != 4:
+                    raise RuntimeError(
+                        "INT8 AllGatherv dispatch must return hidden states, "
+                        "top-k weights, top-k ids, and activation scales"
+                    )
+                hidden_states, topk_weights, topk_ids, scale = result
+                quanted_hidden_states = hidden_states
+                hidden_states = torch.empty_like(
+                    quanted_hidden_states,
+                    dtype=dispatch_output_dtype,
+                )
+                router_logits = None
+            else:
+                hidden_states, router_logits = self._maybe_dispatch(
+                    hidden_states,
+                    router_logits,
+                )
 
             with self._pcp_routing_inputs(
                 input_ids, num_local_tokens
@@ -1324,6 +1445,10 @@ class MoERunner(MoERunnerInterface):
                     scale=scale,
                     topk_weights=topk_weights,
                     topk_ids=topk_ids,
+                    output_dtype=dispatch_output_dtype,
+                    shared_experts_quanted_input=(
+                        shared_experts_x_and_scale_quanted
+                    ),
                 )
             return self._maybe_combine(
                 shared_output,

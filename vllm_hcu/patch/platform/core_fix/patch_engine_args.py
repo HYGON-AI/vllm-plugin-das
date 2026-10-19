@@ -671,6 +671,7 @@ def apply_to_module(module: ModuleType) -> bool:
                 "fused_qwen3_rms_rope",
                 "qwen4_exp_hc_sp",
                 "qsa_prefill_indexer",
+                "dp_int8_allgather",
             ) or (
                 name == "hcu_flash_attn_mode" and expected is None
             ):

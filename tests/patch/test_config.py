@@ -57,6 +57,7 @@ def test_dict_vllm_config_uses_canonical_storage_path() -> None:
                 "fused_qwen3_rms_rope": True,
                 "qwen4_exp_hc_sp": True,
                 "qsa_prefill_indexer": False,
+                "dp_int8_allgather": False,
                 "moe_backend": "auto",
                 "hcu_flash_attn_mode": None,
                 "hcu_gdn_prefill_backend": None,
@@ -179,6 +180,8 @@ def test_legacy_deep_gemm_sidecar_is_normalized_with_one_warning(
     ("payload", "error"),
     [
         ({"enable_lightly_cp": 1}, TypeError),
+        ({"qsa_prefill_indexer": 1}, TypeError),
+        ({"dp_int8_allgather": 1}, TypeError),
         ({"moe_backend": "triton"}, ValueError),
         ({"hcu_flash_attn_mode": "future"}, ValueError),
         ({"expert_map_path": ""}, ValueError),

@@ -24,6 +24,7 @@ _FEATURE_FIELDS = (
     "fused_qwen3_rms_rope",
     "qwen4_exp_hc_sp",
     "qsa_prefill_indexer",
+    "dp_int8_allgather",
     "moe_backend",
     "hcu_flash_attn_mode",
     "hcu_gdn_prefill_backend",
@@ -32,7 +33,7 @@ _FEATURE_FIELDS = (
     "eplb_disable_rearrange",
     "eplb_static_dispatch_policy",
 )
-_BOOLEAN_FIELDS = _FEATURE_FIELDS[:8]
+_BOOLEAN_FIELDS = _FEATURE_FIELDS[:9]
 _SUPPORTED_MOE_BACKENDS = frozenset({"auto", "deep_gemm"})
 _LEGACY_DEEP_GEMM_BACKEND = "dpsk_deep_gemm"
 _DEEP_GEMM_BACKEND = "deep_gemm"
@@ -96,6 +97,10 @@ class HcuFeatureConfig:
     # Effective request-major QSA prefill-indexer policy. This must survive
     # the spawn boundary and partition compilation caches.
     qsa_prefill_indexer: bool = False
+    # Effective opt-in policy for INT8 hidden-state transport in the naive
+    # DP/EP AllGatherv dispatch path. Persisted because spawned workers do not
+    # inherit arbitrary VLLM_HCU_* variables from the API process.
+    dp_int8_allgather: bool = False
     moe_backend: str = "auto"
     hcu_flash_attn_mode: str | None = None
     # HCU provider requested through --gdn-prefill-backend (hcu-boltops or
