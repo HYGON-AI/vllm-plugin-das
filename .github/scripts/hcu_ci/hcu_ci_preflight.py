@@ -39,6 +39,8 @@ def _version_specification(value: object, *, name: str) -> dict[str, Any]:
     match = value.get("match")
     version = value.get("version")
     versions = value.get("versions")
+    has_version = "version" in value
+    has_versions = "versions" in value
     valid_versions = (
         isinstance(versions, list)
         and bool(versions)
@@ -47,8 +49,9 @@ def _version_specification(value: object, *, name: str) -> dict[str, Any]:
     )
     if (
         match not in {"exact", "prefix", "release"}
-        or (isinstance(version, str) == valid_versions)
-        or (isinstance(version, str) and not version)
+        or has_version == has_versions
+        or (has_version and (not isinstance(version, str) or not version))
+        or (has_versions and not valid_versions)
     ):
         raise PreflightError(
             f"{name} must declare match=exact|prefix|release and exactly one "

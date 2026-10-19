@@ -179,15 +179,17 @@ docker exec "$container_name" bash -lc '
   set -euo pipefail
   ci_home=/tmp/hcu-ci-home
   mkdir -p "$ci_home" "$TORCHINDUCTOR_CACHE_DIR" "$XDG_CACHE_HOME"
-  if [[ ! -x /usr/local/bin/python3.10 ]]; then
-    python_bin="$(command -v python3.10 || true)"
-    if [[ -z "$python_bin" ]]; then
-      echo "python3.10 is unavailable in HCU CI image" >&2
-      exit 2
-    fi
-    mkdir -p /usr/local/bin
-    ln -sf "$python_bin" /usr/local/bin/python3.10
+  python_bin=
+  for python_name in python3.10 python3.12; do
+    python_bin="$(command -v "$python_name" || true)"
+    [[ -n "$python_bin" ]] && break
+  done
+  if [[ -z "$python_bin" ]]; then
+    echo "no accepted Python (3.12 or 3.10) is available in HCU CI image" >&2
+    exit 2
   fi
+  mkdir -p /usr/local/bin
+  ln -sf "$python_bin" /usr/local/bin/hcu-ci-python
   HOME="$ci_home" git config --global --add safe.directory /vllm-plugin-das
 '
 echo "started HCU CI container $container_name from $image"

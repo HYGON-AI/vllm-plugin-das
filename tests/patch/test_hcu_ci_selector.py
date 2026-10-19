@@ -32,6 +32,7 @@ from hcu_ci_preflight import PreflightError, run_preflight  # noqa: E402
 from hcu_ci_preflight import (  # noqa: E402
     _check_environment_lock,
     _check_requirements,
+    _version_specification,
 )
 from run_hcu_ci_job import _export_resolved_resource_environment  # noqa: E402
 from build_hcu_matrix import MatrixError, build_matrix  # noqa: E402
@@ -442,6 +443,21 @@ def test_environment_lock_allows_compatible_hip_prefix(
         )
 
 
+@pytest.mark.parametrize(
+    "specification",
+    (
+        {"match": "exact", "version": "3.10.12", "versions": []},
+        {"match": "exact", "version": "3.10.12", "versions": [3, 10]},
+        {"match": "exact", "version": 31012, "versions": ["3.12.12"]},
+    ),
+)
+def test_version_specification_rejects_conflicting_or_malformed_secondary_field(
+    specification: dict,
+) -> None:
+    with pytest.raises(PreflightError, match="exactly one"):
+        _version_specification(specification, name="test version")
+
+
 def test_v0281_runner_lock_matches_audited_runtime(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
@@ -839,6 +855,28 @@ def test_hcu_container_uses_checked_out_environment_lock() -> None:
     assert "/models/public" in source
     assert "/models/parastor" in source
     assert ":/models/llm-models:ro" not in source
+
+
+def test_selected_hcu_path_uses_resolved_supported_python() -> None:
+    paths = (
+        "scripts/ci/hcu/hcu_ci_start_container.sh",
+        "scripts/ci/hcu/hcu_ci_install_dependency.sh",
+        "scripts/ci/hcu/hcu_ci_resolve_image.sh",
+        ".github/workflows/_selected-hcu-tests.yml",
+    )
+    sources = {
+        path: (REPOSITORY / path).read_text(encoding="utf-8") for path in paths
+    }
+
+    assert "python3.10 python3.12" in sources[paths[0]]
+    assert "/usr/local/bin/hcu-ci-python" in sources[paths[0]]
+    assert "/usr/local/bin/hcu-ci-python" in sources[paths[1]]
+    assert "/usr/local/bin/hcu-ci-python" in sources[paths[3]]
+    assert "python3.10 python3.12" in sources[paths[2]]
+    assert "without an accepted Python" in sources[paths[2]]
+
+    for source in sources.values():
+        assert "/usr/local/bin/python3.10" not in source
 
 
 def test_hcu_control_container_uses_runner_identity() -> None:
