@@ -509,6 +509,14 @@ class FlashAttentionMetadataBuilder(AttentionMetadataBuilder[FlashAttentionMetad
     ) -> AttentionCGSupport:
         if vllm_config.parallel_config.prefill_context_parallel_size > 1:
             return AttentionCGSupport.NEVER
+        if _SPLIT_PD:
+            # The split boundary (num_decodes/num_decode_tokens) is host-side
+            # Python state frozen at capture time, so a mixed prefill/decode
+            # FULL graph would replay the captured slices for a different
+            # boundary. Uniform batches (all decode) take the single-call tail
+            # and stay replay-safe; mixed batches must run through PIECEWISE
+            # graphs, where this forward executes eagerly per step.
+            return AttentionCGSupport.UNIFORM_BATCH
         return cls._cudagraph_support
 
     def __init__(
