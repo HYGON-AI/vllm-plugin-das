@@ -510,6 +510,12 @@ class FlashAttentionMetadataBuilder(AttentionMetadataBuilder[FlashAttentionMetad
         if vllm_config.parallel_config.prefill_context_parallel_size > 1:
             return AttentionCGSupport.NEVER
         if _SPLIT_PD:
+            from vllm_hcu.platforms.hcu import get_hcu_flash_attn_mode
+
+            if get_hcu_flash_attn_mode(vllm_config) != "varlen":
+                # Only varlen mode splits the batch; other modes keep their
+                # native unsplit dispatch and their original graph support.
+                return cls._cudagraph_support
             # The split boundary (num_decodes/num_decode_tokens) is host-side
             # Python state frozen at capture time, so a mixed prefill/decode
             # FULL graph would replay the captured slices for a different
