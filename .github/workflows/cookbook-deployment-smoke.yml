@@ -1,0 +1,70 @@
+# SPDX-License-Identifier: Apache-2.0
+# SPDX-FileCopyrightText: Copyright (c) 2026 Hygon Information Technology Co., Ltd.
+
+name: Cookbook deployment smoke (vLLM)
+
+on:
+  workflow_call:
+    inputs:
+      image:
+        description: Exact dated vLLM image built and pushed by the caller
+        type: string
+        required: true
+      mode:
+        description: preflight or execute
+        type: string
+        default: execute
+      cases:
+        description: Exact Cookbook sections; empty tests all vLLM 0.25.1 BW1100 single-host deployments
+        type: string
+        default: ''
+    secrets:
+      MODEL_SMOKE_REPO_TOKEN:
+        required: true
+      DASHHUB_CI_TOKEN:
+        required: false
+  workflow_dispatch:
+    inputs:
+      mode:
+        description: First run preflight; then execute
+        type: choice
+        options: [preflight, execute]
+        default: preflight
+      image:
+        description: Dated vLLM 0.25.1 image; empty selects the newest dated image
+        type: string
+        default: ''
+      cases:
+        description: Exact Cookbook sections; empty tests all vLLM 0.25.1 BW1100 single-host deployments
+        type: string
+        default: ''
+
+permissions:
+  contents: read
+
+concurrency:
+  group: cookbook-deployment-smoke-vllm
+  cancel-in-progress: false
+
+jobs:
+  smoke:
+    runs-on: bw1100
+    timeout-minutes: 840
+    steps:
+      - name: Checkout private test controller
+        uses: actions/checkout@v4
+        with:
+          repository: guochenyang99/ci-model-test
+          ref: main
+          token: ${{ secrets.MODEL_SMOKE_REPO_TOKEN }}
+          persist-credentials: false
+          path: model-ci-tools
+      - name: Invoke maintained test controller
+        uses: ./model-ci-tools/.github/actions/deployment-smoke
+        with:
+          framework: vllm
+          framework-version: '0.25.1'
+          image: ${{ inputs.image || '' }}
+          dashhub-token: ${{ secrets.DASHHUB_CI_TOKEN }}
+          cases: ${{ inputs.cases || '' }}
+          mode: ${{ inputs.mode || 'execute' }}

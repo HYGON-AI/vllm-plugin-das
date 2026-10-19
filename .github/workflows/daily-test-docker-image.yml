@@ -3,89 +3,35 @@
 
 name: test-docker-image-daily
 
-# 由 docker-image (release-docker-image.yml) 构建并推送成功后作为 reusable workflow 被调用,
-# 传入本次构建的镜像名; 也可手动触发, 留空 docker_image 时回落 0.25.1-latest
+# Compatibility entry point: retain the old docker_image input and workflow name.
+# Model tests, reports and DashHub submission run in ci-model-test; no Feishu notification.
 on:
   workflow_call:
     inputs:
       docker_image:
-        description: 待测试镜像完整路径, 例如 <site>/<ns>/vllm:0.25.1-ubuntu22.04-dtk2604-py3.10-<时间戳>
+        description: Exact dated vLLM 0.25.1 image to test
         required: true
         type: string
+    secrets:
+      MODEL_SMOKE_REPO_TOKEN:
+        required: true
+      DASHHUB_CI_TOKEN:
+        required: false
   workflow_dispatch:
     inputs:
       docker_image:
-        description: 待测试镜像完整路径; 留空使用 vllm:0.25.1-latest
+        description: Dated vLLM 0.25.1 image; empty selects the newest dated image
         required: false
-        default: ""
+        default: ''
         type: string
 
 permissions:
   contents: read
 
-concurrency:
-  group: test-docker-image-${{ github.ref }}
-  cancel-in-progress: true
-
-env:
-  PYPI_URL: ${{ vars.PYPI_URL }}
-  TEST_IMAGE: ${{ inputs.docker_image || format('{0}/{1}/vllm:0.25.1-latest', vars.HARBOR_SITE, vars.HARBOR_NAMESPACE) }}
-
 jobs:
-  citest:
-    runs-on:
-      - ci
-      - bw1100
-    timeout-minutes: 1200
-    container:
-      image: ${{ inputs.docker_image || format('{0}/{1}/vllm:0.25.1-latest', vars.HARBOR_SITE, vars.HARBOR_NAMESPACE) }}
-      options: --privileged --cap-add=SYS_PTRACE --device /dev/kfd:/dev/kfd --device /dev/dri:/dev/dri
-      volumes:
-        - /public/opendas/DL_DATA/llm-models:/models/public:ro
-        - /parastor/opendas/DL_DATA/llm-models:/models/parastor:ro
-        - /usr/bin/docker:/usr/local/bin/docker:ro
-        - /etc/docker/docker_env.conf:/etc/docker/docker_env.conf:ro
-        - /opt/hyhal:/opt/hyhal:ro
-    steps:
-      - uses: actions/checkout@v4
-
-      - name: 确认测试镜像
-        run: echo "TEST_IMAGE=${{ env.TEST_IMAGE }}"
-
-      - name: 安装 CItest
-        run: |
-          PYPI_HOST=$(echo "${PYPI_URL}" | sed -E 's#^https?://##; s#:.*##')
-          pip install citest[evalscope] cinotificate \
-            -i "${PYPI_URL}/nightly/dtk2604/+simple/" \
-            --trusted-host "${PYPI_HOST}"
-
-      - name: 运行 CItest
-        run: |
-          CItest --test_tool evalscope \
-                 --case_conf docker/image-citest-conf-hcu.yaml \
-                 --models_path /models \
-                 --output_dir "${GITHUB_WORKSPACE}/citest-output"
-
-      - name: 飞书通知
-        run: |
-          CInotificate --modify_json "${GITHUB_WORKSPACE}/citest-output/notificate.json" \
-                       --json_key docker_image_name \
-                       --json_value "${{ env.TEST_IMAGE }}"
-          CInotificate --modify_json "${GITHUB_WORKSPACE}/citest-output/notificate.json" \
-                       --json_key jenkins_url \
-                       --json_value "${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}"
-          CInotificate --notificate_conf "${GITHUB_WORKSPACE}/citest-output/notificate.json" \
-                       --notificate_type PrecisionTest \
-                       --group_name 框架发版对接 高性能推理加速部 --record
-
-      - name: 归档测试结果
-        if: always()
-        uses: actions/upload-artifact@v4
-        with:
-          name: citest-output-${{ github.run_id }}
-          path: citest-output/**
-
-      # 其他容器 job 会以 root 在共享 workspace 留下文件, 导致下次 checkout 清理失败
-      - name: 清理 workspace
-        if: always()
-        run: rm -rf "${GITHUB_WORKSPACE}"/* "${GITHUB_WORKSPACE}"/.[!.]* || true
+  smoke:
+    uses: ./.github/workflows/cookbook-deployment-smoke.yml
+    with:
+      image: ${{ inputs.docker_image || '' }}
+      mode: execute
+    secrets: inherit
