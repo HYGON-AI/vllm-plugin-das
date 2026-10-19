@@ -20,6 +20,7 @@ _FEATURE_FIELDS = (
     "enable_lightly_cplb",
     "enable_custom_sp",
     "enable_multi_layers_mtp",
+    "enable_dsa_cache_layer_split",
     "deepep_auto",
     "moe_backend",
     "hcu_flash_attn_mode",
@@ -28,7 +29,7 @@ _FEATURE_FIELDS = (
     "eplb_disable_rearrange",
     "eplb_static_dispatch_policy",
 )
-_BOOLEAN_FIELDS = _FEATURE_FIELDS[:5]
+_BOOLEAN_FIELDS = _FEATURE_FIELDS[:6]
 _SUPPORTED_MOE_BACKENDS = frozenset({"auto", "deep_gemm"})
 _LEGACY_DEEP_GEMM_BACKEND = "dpsk_deep_gemm"
 _DEEP_GEMM_BACKEND = "deep_gemm"
@@ -70,6 +71,7 @@ class HcuFeatureConfig:
     enable_lightly_cplb: bool = False
     enable_custom_sp: bool = False
     enable_multi_layers_mtp: bool = False
+    enable_dsa_cache_layer_split: bool = False
     deepep_auto: bool = False
     moe_backend: str = "auto"
     hcu_flash_attn_mode: str | None = None

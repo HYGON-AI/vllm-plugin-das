@@ -132,6 +132,21 @@ class HcuGPUModelRunnerV2(GPUModelRunner):
             raise ValueError(
                 "HCU PCP requires exactly one KV cache group."
             )
+        # V2 path does not go through hcu_model_runner.initialize_kv_cache;
+        # remap packed owned+scratch offsets (SGLang remote scratch) then
+        # bind via upstream create_kv_cache_views (layers/layer_stride).
+        from copy import deepcopy
+
+        from vllm_hcu.v1.dsa_cache_layer_split import (
+            install_runtime_layer_split_state,
+            maybe_log_runtime_layer_shard_plan,
+            remap_packed_kv_tensor_offsets,
+        )
+
+        install_runtime_layer_split_state(self.vllm_config)
+        kv_cache_config = deepcopy(kv_cache_config)
+        remap_packed_kv_tensor_offsets(kv_cache_config, self.vllm_config)
+        maybe_log_runtime_layer_shard_plan(self.vllm_config)
         super().initialize_kv_cache(kv_cache_config)
         if pcp_size > 1:
             self.pcp_manager = maybe_build_pcp_manager(
