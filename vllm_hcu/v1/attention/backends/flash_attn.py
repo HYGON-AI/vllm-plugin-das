@@ -1098,7 +1098,7 @@ class FlashAttentionImpl(AttentionImpl):
                 )
                 return output
 
-            if _SPLIT_PD:
+            if _SPLIT_PD and _get_flash_attn_mode() == "varlen":
                 return self._forward_split_pd(
                     query,
                     key_cache,
@@ -1113,6 +1113,17 @@ class FlashAttentionImpl(AttentionImpl):
                     v_descale,
                 )
             else:
+                if _SPLIT_PD:
+                    # The split's raw-varlen fast path only exists in varlen
+                    # mode. classic/cutlass fall back to their native kernel
+                    # dispatch: routing them through the varlen interface
+                    # would bypass their FP8 d192 paged paths entirely.
+                    logger.warning_once(
+                        "[HCU FLASH_ATTN PATH] VLLM_HCU_SPLIT_PD=1 is only "
+                        "supported in varlen mode; %s mode keeps its native "
+                        "kernel dispatch",
+                        _get_flash_attn_mode(),
+                    )
                 sliding_window_size = _get_native_sliding_window(
                     attn_metadata.sliding_window,
                     self.sliding_window,

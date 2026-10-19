@@ -11,8 +11,12 @@ indexer or top-k selection.  Backbone and MTP drafter layers share
 The QSA owner registers itself and its indexer side caches in the global
 ``static_forward_context`` while it is constructed, so it must never be built:
 ``config.indexer_n_heads`` is hidden only for the duration of the layer's
-``__init__`` and restored afterwards (other readers, e.g. the model's QSA
-cache-scale remap, see the real value).  The checkpoint's
+``__init__`` and restored afterwards.  ``Qwen4ExpModel`` computes
+``_qsa_layer_ids`` from the unmodified config before any layer exists, so
+``load_weights`` is wrapped to recompute that set from the modules that were
+actually built: a dense replacement keeps its checkpoint cache scales on the
+native ``self_attn.attn`` path instead of having them remapped onto buffers
+the QSA owner would have owned (and then silently dropped).  The checkpoint's
 ``self_attn.indexer.*`` weights then have no module and are ignored through
 the shared Qwen4Exp ignored-suffix list used by the backbone and MTP loaders.
 Any other value (or unset) keeps the unmodified QSA behavior.
@@ -41,10 +45,12 @@ _DISABLE_QSA = os.environ.get("VLLM_HCU_DISABLE_QSA", "0") == "1"
 TARGET_MODULE = "vllm.models.qwen4_exp.amd.model"
 PATCH_ID = "worker.core_fix.qwen4_exp.disable_qsa"
 _LAYER_INIT_TARGET = f"{TARGET_MODULE}.Qwen4ExpDecoderLayer.__init__"
+_LOAD_WEIGHTS_TARGET = f"{TARGET_MODULE}.Qwen4ExpModel.load_weights"
 _IGNORED_SUFFIXES_TARGET = f"{TARGET_MODULE}._QWEN4_EXP_IGNORED_MISSING_SUFFIXES"
-TARGETS = (_LAYER_INIT_TARGET, _IGNORED_SUFFIXES_TARGET)
+TARGETS = (_LAYER_INIT_TARGET, _LOAD_WEIGHTS_TARGET, _IGNORED_SUFFIXES_TARGET)
 _MARKER = "_vllm_hcu_qwen4_exp_disable_qsa_applied"
 _LAYER_INIT_WRAPPER = "_vllm_hcu_disable_qsa_layer_init"
+_LOAD_WEIGHTS_WRAPPER = "_vllm_hcu_disable_qsa_load_weights"
 _QSA_CONFIG_ATTR = "indexer_n_heads"
 _INDEXER_WEIGHT_SUFFIX = ".self_attn.indexer."
 
@@ -65,6 +71,7 @@ def _already_applied(owner: object, wrapped: tuple[tuple, ...]) -> bool:
 def apply_to_module(module: ModuleType) -> bool:
     owner = load_exact_module(TARGET_MODULE, module)
     layer_cls = require_class(owner, "Qwen4ExpDecoderLayer", _LAYER_INIT_TARGET)
+    model_cls = require_class(owner, "Qwen4ExpModel", _LOAD_WEIGHTS_TARGET)
     ignored_suffixes = getattr(owner, "_QWEN4_EXP_IGNORED_MISSING_SUFFIXES", None)
     if not isinstance(ignored_suffixes, list):
         raise PatchCompatibilityError(
@@ -72,6 +79,7 @@ def apply_to_module(module: ModuleType) -> bool:
         )
     wrapped = (
         (layer_cls, "__init__", _LAYER_INIT_TARGET, _LAYER_INIT_WRAPPER),
+        (model_cls, "load_weights", _LOAD_WEIGHTS_TARGET, _LOAD_WEIGHTS_WRAPPER),
     )
     if _already_applied(owner, wrapped):
         return False
@@ -84,6 +92,14 @@ def apply_to_module(module: ModuleType) -> bool:
         _LAYER_INIT_TARGET,
         positional=("self", "vllm_config", "layer_type", "prefix"),
         defaults={"prefix": ""},
+    )
+    original_load_weights = require_callable(
+        model_cls, "load_weights", _LOAD_WEIGHTS_TARGET
+    )
+    require_exact_signature(
+        original_load_weights,
+        _LOAD_WEIGHTS_TARGET,
+        positional=("self", "weights"),
     )
 
     @functools.wraps(original_layer_init)
@@ -111,6 +127,25 @@ def apply_to_module(module: ModuleType) -> bool:
 
     setattr(hcu_disable_qsa_layer_init, _LAYER_INIT_WRAPPER, True)
 
+    @functools.wraps(original_load_weights)
+    def hcu_disable_qsa_load_weights(self, weights):
+        if _DISABLE_QSA:
+            # The native __init__ derived _qsa_layer_ids from the unmodified
+            # config before any layer existed, so dense replacements were
+            # still treated as QSA scale owners by the remap below. Recompute
+            # the set from the modules that were actually built: a QSA owner
+            # is exactly an attention that still has its indexer. The remap
+            # generator reads the attribute lazily and picks this set up.
+            self._qsa_layer_ids = frozenset(
+                layer_idx
+                for layer_idx, layer in enumerate(self.layers)
+                if getattr(getattr(layer, "self_attn", None), "indexer", None)
+                is not None
+            )
+        return original_load_weights(self, weights)
+
+    setattr(hcu_disable_qsa_load_weights, _LOAD_WEIGHTS_WRAPPER, True)
+
     added_suffix = _DISABLE_QSA and _INDEXER_WEIGHT_SUFFIX not in ignored_suffixes
     try:
         if added_suffix:
@@ -118,11 +153,13 @@ def apply_to_module(module: ModuleType) -> bool:
             # the unused checkpoint indexer weights are skipped on both paths.
             ignored_suffixes.append(_INDEXER_WEIGHT_SUFFIX)
         setattr(layer_cls, "__init__", hcu_disable_qsa_layer_init)
+        setattr(model_cls, "load_weights", hcu_disable_qsa_load_weights)
         setattr(owner, _MARKER, True)
     except BaseException:
         if added_suffix and _INDEXER_WEIGHT_SUFFIX in ignored_suffixes:
             ignored_suffixes.remove(_INDEXER_WEIGHT_SUFFIX)
         setattr(layer_cls, "__init__", original_layer_init)
+        setattr(model_cls, "load_weights", original_load_weights)
         if hasattr(owner, _MARKER):
             delattr(owner, _MARKER)
         raise
