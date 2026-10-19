@@ -874,11 +874,21 @@ def _make_compilation_module() -> ModuleType:
     module = ModuleType(patch_compilation_config.TARGET_MODULE)
 
     class _CUDAGraphMode:
-        def __init__(self, piecewise: bool = True) -> None:
+        def __init__(self, *, full: bool = False, piecewise: bool = False) -> None:
+            self.full = full
             self.piecewise = piecewise
+
+        def has_full_cudagraphs(self) -> bool:
+            return self.full
 
         def has_piecewise_cudagraphs(self) -> bool:
             return self.piecewise
+
+    full = _CUDAGraphMode(full=True)
+    piecewise = _CUDAGraphMode(piecewise=True)
+    full_and_piecewise = _CUDAGraphMode(full=True, piecewise=True)
+    full_decode_only = _CUDAGraphMode(full=True)
+    none = _CUDAGraphMode()
 
     class CompilationConfig:
         def __init__(self) -> None:
@@ -888,7 +898,7 @@ def _make_compilation_module() -> ModuleType:
             self.splitting_calls = 0
             self.splitting_ops = ["vllm::unified_mla_attention_with_output"]
             self.use_inductor_graph_partition = False
-            self.cudagraph_mode = _CUDAGraphMode()
+            self.cudagraph_mode = full_and_piecewise
 
         def adjust_cudagraph_sizes_for_spec_decode(
             self,
@@ -907,7 +917,13 @@ def _make_compilation_module() -> ModuleType:
             self.splitting_calls += 1
             return all2all_backend, data_parallel_size
 
-    module.CUDAGraphMode = SimpleNamespace(NONE=_CUDAGraphMode(piecewise=False))
+    module.CUDAGraphMode = SimpleNamespace(
+        NONE=none,
+        FULL=full,
+        PIECEWISE=piecewise,
+        FULL_AND_PIECEWISE=full_and_piecewise,
+        FULL_DECODE_ONLY=full_decode_only,
+    )
     module.CompilationConfig = CompilationConfig
     return module
 
@@ -951,7 +967,7 @@ def test_compilation_adapter_splits_hcu_sparse_indexer_from_piecewise_graph() ->
     assert config.splitting_ops.count("vllm::hcu_sparse_attn_indexer") == 1
 
 
-def test_compilation_adapter_disables_cudagraph_for_dp_deepep_auto() -> None:
+def test_compilation_adapter_falls_back_to_decode_graph_for_dp_deepep_auto() -> None:
     module = _make_compilation_module()
     patch_compilation_config.apply_to_module(module)
     config = module.CompilationConfig()
@@ -963,7 +979,160 @@ def test_compilation_adapter_disables_cudagraph_for_dp_deepep_auto() -> None:
 
     config.set_splitting_ops_for_v1("deepep_low_latency", 8)
 
+    assert config.cudagraph_mode is module.CUDAGraphMode.FULL_DECODE_ONLY
+    assert not config.cudagraph_mode.has_piecewise_cudagraphs()
+
+
+@pytest.mark.parametrize(
+    ("configured_mode", "expected_mode"),
+    [
+        ("FULL", "FULL_DECODE_ONLY"),
+        ("PIECEWISE", "NONE"),
+    ],
+)
+def test_compilation_adapter_normalizes_explicit_dp_deepep_auto_graph_mode(
+    configured_mode: str,
+    expected_mode: str,
+) -> None:
+    module = _make_compilation_module()
+    patch_compilation_config.apply_to_module(module)
+    config = module.CompilationConfig()
+    config.cudagraph_mode = getattr(module.CUDAGraphMode, configured_mode)
+    vllm_config = SimpleNamespace(
+        additional_config={"hcu": HcuFeatureConfig(deepep_auto=True).to_dict()},
+        compilation_config=config,
+    )
+    patch_compilation_config.bind_hcu_config(vllm_config)
+
+    config.set_splitting_ops_for_v1("deepep_low_latency", 8)
+
+    assert config.cudagraph_mode is getattr(
+        module.CUDAGraphMode, expected_mode
+    )
+
+
+@pytest.mark.parametrize(
+    "configured_mode",
+    ["FULL", "PIECEWISE", "FULL_AND_PIECEWISE", "FULL_DECODE_ONLY"],
+)
+def test_compilation_adapter_forces_fixed_ht_deepep_auto_producer_to_eager(
+    configured_mode: str,
+) -> None:
+    module = _make_compilation_module()
+    patch_compilation_config.apply_to_module(module)
+    config = module.CompilationConfig()
+    config.cudagraph_mode = getattr(module.CUDAGraphMode, configured_mode)
+    vllm_config = SimpleNamespace(
+        additional_config={"hcu": HcuFeatureConfig(deepep_auto=True).to_dict()},
+        compilation_config=config,
+        model_config=SimpleNamespace(architectures=["DeepseekV4ForCausalLM"]),
+        speculative_config=SimpleNamespace(method="dspark"),
+        kv_transfer_config=SimpleNamespace(
+            kv_connector="MooncakeConnector",
+            kv_role="kv_producer",
+        ),
+    )
+    patch_compilation_config.bind_hcu_config(vllm_config)
+
+    config.set_splitting_ops_for_v1("deepep_low_latency", 8)
+
     assert config.cudagraph_mode is module.CUDAGraphMode.NONE
+
+
+def test_compilation_adapter_limits_fixed_ll_deepep_auto_consumer_to_decode_full(
+) -> None:
+    module = _make_compilation_module()
+    patch_compilation_config.apply_to_module(module)
+    config = module.CompilationConfig()
+    config.cudagraph_mode = module.CUDAGraphMode.FULL
+    vllm_config = SimpleNamespace(
+        additional_config={"hcu": HcuFeatureConfig(deepep_auto=True).to_dict()},
+        compilation_config=config,
+        model_config=SimpleNamespace(architectures=["DeepseekV4ForCausalLM"]),
+        speculative_config=SimpleNamespace(method="dspark"),
+        kv_transfer_config=SimpleNamespace(
+            kv_connector="MooncakeConnector",
+            kv_role="kv_consumer",
+        ),
+    )
+    patch_compilation_config.bind_hcu_config(vllm_config)
+
+    config.set_splitting_ops_for_v1("deepep_low_latency", 8)
+
+    assert config.cudagraph_mode is module.CUDAGraphMode.FULL_DECODE_ONLY
+
+
+def test_compilation_adapter_restores_fixed_ht_policy_from_mapping_config() -> None:
+    module = _make_compilation_module()
+    patch_compilation_config.apply_to_module(module)
+    config = module.CompilationConfig()
+    config.cudagraph_mode = module.CUDAGraphMode.FULL_DECODE_ONLY
+    serialized_vllm_config = {
+        "additional_config": {
+            "hcu": HcuFeatureConfig(deepep_auto=True).to_dict()
+        },
+        "compilation_config": config,
+        "model_config": {"architectures": ["DeepseekV4ForCausalLM"]},
+        "speculative_config": {"method": "dspark"},
+        "kv_transfer_config": {
+            "kv_connector": "MooncakeConnector",
+            "kv_role": "kv_producer",
+        },
+        "parallel_config": {
+            "data_parallel_size": 4,
+            "prefill_context_parallel_size": 1,
+            "decode_context_parallel_size": 1,
+        },
+    }
+    patch_compilation_config.bind_hcu_config(serialized_vllm_config)
+
+    # Worker rebind accepts the pickled dictionary form. Use the callback's
+    # default DP argument to prove the bound nested topology was restored too.
+    config.set_splitting_ops_for_v1("deepep_low_latency")
+
+    assert config.cudagraph_mode is module.CUDAGraphMode.NONE
+
+
+def test_compilation_adapter_keeps_piecewise_for_single_rank_deepep_auto() -> None:
+    module = _make_compilation_module()
+    patch_compilation_config.apply_to_module(module)
+    config = module.CompilationConfig()
+    vllm_config = SimpleNamespace(
+        additional_config={"hcu": HcuFeatureConfig(deepep_auto=True).to_dict()},
+        compilation_config=config,
+    )
+    patch_compilation_config.bind_hcu_config(vllm_config)
+
+    config.set_splitting_ops_for_v1("deepep_low_latency", 1)
+
+    assert config.cudagraph_mode is module.CUDAGraphMode.FULL_AND_PIECEWISE
+
+
+def test_compilation_adapter_keeps_explicit_none_for_dp_deepep_auto() -> None:
+    module = _make_compilation_module()
+    patch_compilation_config.apply_to_module(module)
+    config = module.CompilationConfig()
+    config.cudagraph_mode = module.CUDAGraphMode.NONE
+    vllm_config = SimpleNamespace(
+        additional_config={"hcu": HcuFeatureConfig(deepep_auto=True).to_dict()},
+        compilation_config=config,
+    )
+    patch_compilation_config.bind_hcu_config(vllm_config)
+
+    config.set_splitting_ops_for_v1("deepep_low_latency", 8)
+
+    assert config.cudagraph_mode is module.CUDAGraphMode.NONE
+
+
+def test_compilation_adapter_keeps_unrelated_backend_graph_mode() -> None:
+    module = _make_compilation_module()
+    patch_compilation_config.apply_to_module(module)
+    config = module.CompilationConfig()
+    configured_mode = config.cudagraph_mode
+
+    config.set_splitting_ops_for_v1("allgather_reducescatter", 8)
+
+    assert config.cudagraph_mode is configured_mode
 
 
 def test_compilation_adapter_defers_to_inductor_unsafe_tags() -> None:
@@ -2051,6 +2220,70 @@ def test_sparse_cache_normalization_tolerates_missing_attention_config(
     HCUPlatform.check_and_update_config(config)
 
     assert config.cache_config.cache_dtype == "fp8_e4m3"
+
+
+@pytest.mark.parametrize(
+    "parallel_dimension",
+    ["prefill_context_parallel_size", "decode_context_parallel_size"],
+)
+def test_deepep_auto_platform_final_graph_policy_disables_piecewise(
+    monkeypatch: pytest.MonkeyPatch,
+    parallel_dimension: str,
+) -> None:
+    from vllm.config.compilation import CUDAGraphMode
+    from vllm_hcu.patch.import_coordinator import IMPORT_COORDINATOR
+    from vllm_hcu.patch.platform.framework_opt import patch_multiproc_executor
+    from vllm_hcu.platforms.hcu import HCUPlatform
+
+    if parallel_dimension == "prefill_context_parallel_size":
+        from tests.runtime_patch.test_glm52_pcp_config import _make_pcp_config
+
+        config = _make_pcp_config(
+            architecture="DeepseekV4ForCausalLM",
+            use_mla=True,
+            pcp=2,
+            dp=1,
+            enable_expert_parallel=True,
+            enforce_eager=True,
+            all2all_backend="deepep_low_latency",
+            moe_backend="auto",
+        )
+        config.additional_config = {
+            "hcu": HcuFeatureConfig(deepep_auto=True).to_dict()
+        }
+        config.compilation_config = _ValidationCompilation()
+        config.scheduler_config = SimpleNamespace(max_num_batched_tokens=256)
+        config.model_config.max_model_len = 4096
+        config.parallel_config.use_ubatching = False
+        config.cache_config.user_specified_block_size = True
+        config.cache_config.block_size = 64
+        config.cache_config.kv_cache_dtype_skip_layers = []
+    else:
+        config = _validation_config(HcuFeatureConfig(deepep_auto=True))
+        config.model_config.architectures = ["DeepseekV4ForCausalLM"]
+        config.model_config.enforce_eager = False
+        config.parallel_config.all2all_backend = "deepep_low_latency"
+        config.parallel_config.data_parallel_size = 4
+        config.parallel_config.enable_expert_parallel = True
+        config.parallel_config.enable_eplb = False
+        config.parallel_config.use_ubatching = False
+        config.cache_config = None
+        config.attention_config = None
+    config.parallel_config.worker_cls = "custom"
+    config.parallel_config.distributed_executor_backend = "uni"
+    setattr(config.parallel_config, parallel_dimension, 2)
+    config.compilation_config.cudagraph_mode = CUDAGraphMode.FULL_DECODE_ONLY
+
+    monkeypatch.setattr(IMPORT_COORDINATOR, "drain_ready_callbacks", lambda: None)
+    monkeypatch.setattr(
+        patch_multiproc_executor,
+        "select_hcu_multiproc_executor",
+        lambda _vllm_config: None,
+    )
+
+    HCUPlatform.check_and_update_config(config)
+
+    assert config.compilation_config.cudagraph_mode is CUDAGraphMode.NONE
 
 
 def test_sparse_flashmla_sets_engine_cache_block_size_before_worker_start(
