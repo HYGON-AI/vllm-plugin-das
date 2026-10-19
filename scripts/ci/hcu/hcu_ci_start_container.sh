@@ -179,13 +179,9 @@ docker exec "$container_name" bash -lc '
   set -euo pipefail
   ci_home=/tmp/hcu-ci-home
   mkdir -p "$ci_home" "$TORCHINDUCTOR_CACHE_DIR" "$XDG_CACHE_HOME"
-  python_bin=
-  for python_name in python3.10 python3.12; do
-    python_bin="$(command -v "$python_name" || true)"
-    [[ -n "$python_bin" ]] && break
-  done
+  python_bin="$(command -v python3 || true)"
   if [[ -z "$python_bin" ]]; then
-    echo "no accepted Python (3.12 or 3.10) is available in HCU CI image" >&2
+    echo "the default python3 is unavailable in HCU CI image" >&2
     exit 2
   fi
   mkdir -p /usr/local/bin

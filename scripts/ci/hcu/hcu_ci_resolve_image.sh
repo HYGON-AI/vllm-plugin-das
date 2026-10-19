@@ -31,7 +31,7 @@ has_control_python() {
   local ref="$1"
 
   docker run --rm --entrypoint /bin/bash "$ref" \
-    -lc 'for name in python3.10 python3.12; do command -v "$name" >/dev/null 2>&1 && exit 0; done; exit 1' >/dev/null 2>&1
+    -lc 'command -v python3 >/dev/null 2>&1' >/dev/null 2>&1
 }
 
 refresh_ref() {
@@ -56,7 +56,7 @@ emit_usable_ref() {
     refresh_ref "$ref" || true
   fi
   if ! has_control_python "$ref"; then
-    echo "skipping HCU CI image candidate without an accepted Python: $ref" >&2
+    echo "skipping HCU CI image candidate without the default python3: $ref" >&2
     return 1
   fi
   inspect_ref "$ref"
