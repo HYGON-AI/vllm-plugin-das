@@ -114,6 +114,13 @@ class _GroupKVBlockZeroer:
         self.zeroers = zeroers
         self.owners: dict[int, int] | None = None
 
+    def warmup(self, num_kv_blocks: int) -> None:
+        """Preserve the upstream zeroer lifecycle and compile group kernels."""
+        self.fallback.warmup(num_kv_blocks)
+        if henvs.VLLM_HCU_KV_ZERO_BY_GROUP:
+            for zeroer in self.zeroers.values():
+                zeroer.warmup(num_kv_blocks)
+
     def zero_block_ids(self, block_ids) -> None:
         if not henvs.VLLM_HCU_KV_ZERO_BY_GROUP or self.owners is None:
             self.fallback.zero_block_ids(block_ids)
@@ -186,7 +193,11 @@ class HcuGPUModelRunnerV2(GPUModelRunner):
         """Build one upstream zeroer per cache group for mixed KV caches."""
         super()._init_kv_zero_meta()
         fallback = self.kv_block_zeroer
-        if fallback is None or fallback._meta is None:
+        if (
+            not henvs.VLLM_HCU_KV_ZERO_BY_GROUP
+            or fallback is None
+            or fallback._meta is None
+        ):
             return
 
         zeroer_cls = type(fallback)
@@ -195,6 +206,8 @@ class HcuGPUModelRunnerV2(GPUModelRunner):
         for groups in self.attn_groups:
             for group in groups:
                 by_group[group.kv_cache_group_id].append(group)
+        if len(by_group) <= 1:
+            return
         for group_id, groups in by_group.items():
             zeroer = zeroer_cls(
                 self.device,
@@ -205,7 +218,8 @@ class HcuGPUModelRunnerV2(GPUModelRunner):
             )
             if zeroer._meta is not None:
                 zeroers[group_id] = zeroer
-        if zeroers:
+        # One zeroable group is already the upstream all-group behavior.
+        if len(zeroers) > 1:
             self.kv_block_zeroer = _GroupKVBlockZeroer(fallback, zeroers)
 
     def update_requests(self, scheduler_output) -> None:
