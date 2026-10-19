@@ -10,6 +10,8 @@ from collections import defaultdict
 import datetime as dt
 import json
 import os
+import shutil
+import subprocess
 import sys
 from pathlib import Path
 from types import SimpleNamespace
@@ -877,6 +879,60 @@ def test_selected_hcu_path_uses_resolved_supported_python() -> None:
 
     for source in sources.values():
         assert "/usr/local/bin/python3.10" not in source
+
+
+def test_hcu_control_workflows_use_image_python_without_fixed_minor() -> None:
+    paths = (
+        ".github/workflows/hcu-pr-ci.yml",
+        ".github/workflows/nightly-hcu.yml",
+        ".github/workflows/patch-coverage.yml",
+        ".github/workflows/full-enabled-hcu.yml",
+        ".github/workflows/weekly-multi-node.yml",
+    )
+    for path in paths:
+        source = (REPOSITORY / path).read_text(encoding="utf-8")
+        assert "python3.10" not in source, path
+        assert "python3 " in source or "python3\n" in source, path
+
+    for path in (
+        ".github/workflows/hcu-pr-ci.yml",
+        ".github/workflows/nightly-hcu.yml",
+        ".github/workflows/patch-coverage.yml",
+        ".github/workflows/full-enabled-hcu.yml",
+        ".github/workflows/weekly-multi-node.yml",
+    ):
+        source = (REPOSITORY / path).read_text(encoding="utf-8")
+        assert "hcu_ci_preflight.py" in source, path
+        assert "--check-lock-only" in source, path
+
+
+def test_control_preflight_runs_with_python312_only(tmp_path: Path) -> None:
+    bin_dir = tmp_path / "bin"
+    bin_dir.mkdir()
+    (bin_dir / "python3").symlink_to(sys.executable)
+    isolated_path = str(bin_dir)
+
+    assert shutil.which("python3", path=isolated_path) == str(bin_dir / "python3")
+    assert shutil.which("python3.10", path=isolated_path) is None
+    completed = subprocess.run(
+        [
+            str(bin_dir / "python3"),
+            str(CI_SCRIPTS / "hcu_ci_preflight.py"),
+            "--environment-lock",
+            str(
+                REPOSITORY
+                / ".github/workflows/configs/hcu-runner-environment.json"
+            ),
+            "--check-lock-only",
+        ],
+        check=False,
+        capture_output=True,
+        env={"PATH": isolated_path},
+        text=True,
+    )
+    assert completed.returncode == 0, completed.stderr
+    assert '"versions": [' in completed.stdout
+    assert '"3.12.12"' in completed.stdout
 
 
 def test_hcu_control_container_uses_runner_identity() -> None:
