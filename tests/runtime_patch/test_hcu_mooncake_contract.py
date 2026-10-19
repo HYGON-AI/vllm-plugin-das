@@ -49,6 +49,9 @@ def _worker(
         attn_backends=[],
     )
     worker._pp_layer_range = None
+    worker.pp_rank = 0
+    worker.pp_size = 2
+    worker.vllm_config = SimpleNamespace(speculative_config=None)
     worker.engine = _RegistrationEngine()
     worker.is_kv_consumer = True
     worker._layer_specs = {}
@@ -1174,3 +1177,54 @@ def test_capacity_error_does_not_emit_partial_request_descriptors(mooncake):
     ))
     assert (src, dst, lengths) == ([], [], [])
     assert errors == ["d"] and "capacity" in message
+
+
+@pytest.mark.parametrize("method", ["mtp", "dspark", None])
+@pytest.mark.parametrize("pp_rank,layer_index,with_spec,without_spec", [
+    (0, 40, True, True), (0, 41, False, False),
+    (0, 78, False, False), (0, 79, False, False),
+    (1, 40, False, False), (1, 41, True, True), (1, 77, True, True),
+    (1, 78, True, False), (1, 79, True, False),
+])
+def test_pp_registration_checks_backbone_and_local_draft_ownership(
+    mooncake, method, pp_rank, layer_index, with_spec, without_spec,
+):
+    worker = _worker(mooncake, blocks_first=False)
+    worker.pp_rank = pp_rank
+    worker._pp_layer_range = [(0, 41), (41, 78)][pp_rank]
+    worker.vllm_config.speculative_config = (
+        SimpleNamespace(method=method) if method is not None else None
+    )
+    name = f"model.layers.{layer_index}.self_attn"
+    # Only caches declared in this worker's KVCacheConfig can be registered.
+    worker._layer_specs[name] = _attention_spec(mooncake)
+    worker._layer_group_indices[name] = 0
+    cache = torch.zeros((2, 1, 2, 4), dtype=torch.float16)
+    owned = with_spec if method is not None else without_spec
+    if not owned:
+        with pytest.raises(ValueError, match="outside PP stage"):
+            worker.register_kv_caches({name: cache})
+        assert worker.engine.calls == []
+    else:
+        worker.register_kv_caches({name: cache})
+        assert worker.registered_layer_names == [name]
+        assert worker.registered_layer_indices == [layer_index]
+        assert len(worker.engine.calls) == 1
+
+
+def test_final_pp_stage_registers_backbone_and_only_declared_draft_cache(mooncake):
+    worker = _worker(mooncake, blocks_first=False)
+    worker.pp_rank = 1
+    worker._pp_layer_range = (41, 78)
+    worker.vllm_config.speculative_config = SimpleNamespace(method="mtp")
+    names = [f"model.layers.{i}.self_attn" for i in (77, 78)]
+    for name in names:
+        worker._layer_specs[name] = _attention_spec(mooncake)
+        worker._layer_group_indices[name] = 0
+    cache = torch.zeros((2, 1, 2, 4), dtype=torch.float16)
+    caches = dict.fromkeys(names, cache)
+    caches["model.layers.79.self_attn"] = cache  # No local spec: skip this cache.
+    worker.register_kv_caches(caches)
+    assert worker.registered_layer_names == names
+    assert worker.registered_layer_indices == [77, 78]
+    assert len(worker.engine.calls) == 1

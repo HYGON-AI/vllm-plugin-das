@@ -2024,7 +2024,15 @@ class MooncakeConnectorWorker:
                 continue
             if self._pp_layer_range is not None:
                 start, end = self._pp_layer_range
-                if not start <= layer_index < end:
+                # KVCacheConfig above declares this worker's actual cache ownership.
+                # Predictors may number draft layers after the backbone; those
+                # layers are local to the final PP stage, outside [start, end).
+                is_local_draft = (
+                    self.pp_rank == self.pp_size - 1
+                    and self.vllm_config.speculative_config is not None
+                    and layer_index >= end
+                )
+                if not start <= layer_index < end and not is_local_draft:
                     raise ValueError(
                         f"Mooncake layer {layer_name} is outside PP stage [{start}, {end})."
                     )
