@@ -28,7 +28,7 @@ def test_megamoe_acceptance_configuration(profile):
     command, _, _ = server_command(config, model_env=MODEL_ENV)
     assert "--enable-expert-parallel" in command
     assert ("--enforce-eager" in command) == (profile != "fp8_dspark_graph")
-    assert command[command.index("--moe-backend")+1] == "auto"
+    assert command[command.index("--moe-backend")+1] == "deep_gemm_mega_moe"
     assert command[command.index("--tensor-parallel-size")+1] == "8"
     assert "--all2all-backend" not in command
     spec = json.loads(command[command.index("--speculative-config")+1])
@@ -37,7 +37,6 @@ def test_megamoe_acceptance_configuration(profile):
         assert spec["quantization"] == "slimquant_w4a8"
         assert "model" in spec
     env = _server_environment(config)
-    assert env["VLLM_HCU_USE_MEGAMOE"] == "1"
     assert env["VLLM_ROCM_USE_AITER_FUSION_SHARED_EXPERTS"] == "0"
 
 

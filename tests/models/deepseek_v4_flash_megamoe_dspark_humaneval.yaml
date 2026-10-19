@@ -7,7 +7,6 @@ server:
   shutdown_timeout_s: 120
   served_model_name: DeepSeek-V4-Flash-0731-Channel-FP8-w8a8
   environment:
-    VLLM_HCU_USE_MEGAMOE: '1'
     VLLM_ROCM_USE_AITER_FUSION_SHARED_EXPERTS: '0'
 evalscope:
   api_key: EMPTY
@@ -64,7 +63,7 @@ profiles:
       - --enable-expert-parallel
       - --enforce-eager
       - --moe-backend
-      - auto
+      - deep_gemm_mega_moe
       - --speculative-config
       - '{"method":"dspark","num_speculative_tokens":7,"draft_sample_method":"probabilistic"}'
     evalscope:
@@ -97,7 +96,7 @@ profiles:
       - --enable-expert-parallel
       - --enforce-eager
       - --moe-backend
-      - auto
+      - deep_gemm_mega_moe
       - --speculative-config
       - '{"method":"dspark","num_speculative_tokens":7,"draft_sample_method":"probabilistic","model":"/models/DeepSeek-V4-Flash-DSpark-SlimQuant-W4A8","quantization":"slimquant_w4a8"}'
     evalscope:
@@ -129,7 +128,7 @@ profiles:
       - '8'
       - --enable-expert-parallel
       - --moe-backend
-      - auto
+      - deep_gemm_mega_moe
       - --speculative-config
       - '{"method":"dspark","num_speculative_tokens":7,"draft_sample_method":"probabilistic"}'
     evalscope:

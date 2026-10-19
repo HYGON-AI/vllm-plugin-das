@@ -3,14 +3,13 @@
 """Select the opt-in MegaMoE method before fallback kernel construction.
 
 On HCU, ``--moe-backend deep_gemm_mega_moe`` selects the standalone megamoe
-package instead of vLLM's NVIDIA DeepGEMM MegaMoE path. The legacy
-``VLLM_HCU_USE_MEGAMOE=1`` switch with ``--moe-backend auto`` still works.
+package instead of vLLM's NVIDIA DeepGEMM MegaMoE path. Other backends
+retain their existing selection logic.
 """
 
 from __future__ import annotations
 
 import functools
-import os
 from types import ModuleType
 
 from ._common import (
@@ -44,9 +43,7 @@ def apply_to_module(module: ModuleType) -> bool:
     @functools.wraps(original)
     def hcu_get_quant_method(self, prefix, quant_config, moe_config):
         requested = getattr(moe_config, "moe_backend", None) == MEGA_MOE_BACKEND
-        if requested or os.environ.get(
-            "VLLM_HCU_USE_MEGAMOE", "0"
-        ).lower() in ("1", "true"):
+        if requested:
             from vllm_hcu.model_executor.layers.fused_moe.megamoe_runtime import (
                 select_method,
             )

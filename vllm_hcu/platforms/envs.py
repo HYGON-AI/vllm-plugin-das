@@ -33,7 +33,6 @@ if TYPE_CHECKING:
     VLLM_HCU_USE_FUSE_MOE_GATE : bool = True
     VLLM_HCU_USE_LIGHTOP_SQRTSOFTPLUS_GATE: bool = True
     VLLM_HCU_USE_LIGHTOP_QWEN_RMSNORM_GATED: bool = True
-    VLLM_HCU_USE_MEGAMOE: bool = False
     VLLM_HCU_USE_LIGHTOP_W16A16_MOE: bool = False
     VLLM_HCU_USE_LIGHTOP_AWQ: bool = False
     VLLM_HCU_INDEXER_KCACHE_LAYOUT: str = "preshuffle"
@@ -400,11 +399,6 @@ hcu_vllm_environment_variables: dict[str, Callable[[], Any]] = {
     lambda: (os.environ.get(
             "VLLM_HCU_USE_LIGHTOP_QWEN_RMSNORM_GATED", "True"
         ).lower() in ("true", "1")),
-    # Legacy opt-in HCU MegaMoE switch for DeepSeek-V4 (with moe_backend=auto);
-    # prefer --moe-backend deep_gemm_mega_moe.
-    "VLLM_HCU_USE_MEGAMOE":
-    lambda: (os.environ.get("VLLM_HCU_USE_MEGAMOE", "0").lower()
-             in ("true", "1")),
     # Opt-in because this backend installs a LightOp-specific packed weight
     # layout during process_weights_after_loading().
     "VLLM_HCU_USE_LIGHTOP_W16A16_MOE":

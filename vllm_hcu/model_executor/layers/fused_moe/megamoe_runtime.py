@@ -67,10 +67,9 @@ def validate_config(config, moe, layer, quant_mode=None) -> None:
         raise ValueError("HCU MegaMoE requires --enable-expert-parallel and EP8")
     if quant_mode == "int8" and not config.model_config.enforce_eager:
         raise ValueError("HCU MegaMoE PACK5 adapter requires --enforce-eager")
-    if moe.moe_backend not in ("auto", "deep_gemm_mega_moe"):
+    if moe.moe_backend != "deep_gemm_mega_moe":
         raise ValueError(
             "HCU MegaMoE requires --moe-backend deep_gemm_mega_moe "
-            "(or auto with VLLM_HCU_USE_MEGAMOE=1)"
         )
     if parallel.enable_dbo:
         raise ValueError("HCU MegaMoE PACK5 does not support DBO")

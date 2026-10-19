@@ -92,7 +92,7 @@ def valid_config():
     config = NS(parallel_config=NS(enable_expert_parallel=True, enable_eplb=False,
                                    enable_dbo=False),
                 model_config=NS(enforce_eager=True, hf_config=NS(model_type="deepseek_v4")))
-    moe = NS(ep_size=8, moe_backend="auto", pcp_size=1, is_sequence_parallel=False,
+    moe = NS(ep_size=8, moe_backend="deep_gemm_mega_moe", pcp_size=1, is_sequence_parallel=False,
              num_experts=256, num_local_experts=32, hidden_dim=4096,
              intermediate_size_per_partition=2048, num_fused_shared_experts=0,
              has_bias=False, is_lora_enabled=False, activation=NS(value="silu"),
@@ -109,13 +109,12 @@ def valid_config():
     ("skip_final_all_reduce", True, "defer"),
     ("in_dtype", torch.float16, "bfloat16"),
     ("moe_backend", "triton", "deep_gemm_mega_moe"),
+    ("moe_backend", "auto", "deep_gemm_mega_moe"),
 ])
 def test_config_rejects_unsupported_modes(runtime, field, value, match):
     config, moe, layer = valid_config()
     runtime.validate_config(config, moe, layer)
     moe.moe_backend = "deep_gemm_mega_moe"
-    runtime.validate_config(config, moe, layer)
-    moe.moe_backend = "auto"
     runtime.validate_config(config, moe, layer)
     setattr(moe, field, value)
     with pytest.raises(ValueError, match=match):
@@ -292,10 +291,13 @@ def test_opt_in_patch_preserves_default_and_is_idempotent(monkeypatch):
     fake.select_method = lambda *args: "mega"
     monkeypatch.setitem(sys.modules, fake.__name__, fake)
     monkeypatch.setenv("VLLM_HCU_USE_MEGAMOE", "1")
-    assert instance._get_quant_method("model.layers.0.experts", None, None) == "mega"
-    assert len(calls) == 1
-    # --moe-backend deep_gemm_mega_moe opts in without the env switch.
-    monkeypatch.delenv("VLLM_HCU_USE_MEGAMOE")
+    # A stale legacy variable must not override explicit backend selection.
+    for backend in ("auto", "triton", "aiter", "deep_gemm"):
+        assert instance._get_quant_method(
+            "model.layers.0.experts", None, NS(moe_backend=backend)) == "existing"
+    assert len(calls) == 5
+    # Only the CLI backend opts in, even if the old variable says disabled.
+    monkeypatch.setenv("VLLM_HCU_USE_MEGAMOE", "0")
     mega = NS(moe_backend="deep_gemm_mega_moe")
     assert instance._get_quant_method("model.layers.0.experts", None, mega) == "mega"
     fake.select_method = lambda *args: None
@@ -616,6 +618,7 @@ def test_pcp_runner_keeps_rank_local_tokens_for_megamoe():
     exec(compile(code, str(path), "exec"), namespace)
     runner = namespace["Runner"]()
     runner.shared_experts = None
+    runner._ep_fused_combine = False
     runner.moe_config = NS(pcp_size=2, dp_size=1, is_sequence_parallel=False,
                            moe_parallel_config=NS(use_all2all_kernels=False))
     runner._quant_method = NS(hcu_owns_dispatch=True)
