@@ -216,6 +216,7 @@ def apply_to_module(module: ModuleType) -> bool:
                     batch_descriptor,
                     attn_metadata,
                     deepep_auto_is_prefilling,
+                    cudagraph_runtime_mode=cudagraph_runtime_mode,
                 )
             ),
         )

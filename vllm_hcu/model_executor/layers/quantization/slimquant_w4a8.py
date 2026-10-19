@@ -569,6 +569,10 @@ class SlimQuantW4A8Int8AiterMoEMethod(FusedMoEMethodBase):
                     "experts before weight postprocessing"
                 )
             process(layer)
+            # The HIPC backend may replace Qwen's unaligned gate/up scale with
+            # a zero-preserving padded owner. Keep the method-level config on
+            # that registered Parameter as well as the kernel-local config.
+            self.moe_quant_config = self.get_fused_moe_quant_config(layer)
             layer._hcu_slimquant_post_load_weight_generation = (
                 _slimquant_moe_tensor_generation(
                     layer,

@@ -4384,7 +4384,10 @@ def test_slimquant_w4a8_moe_method_is_a_direct_fused_moe_method():
 
 @pytest.mark.hcu
 @pytest.mark.parametrize("architecture", [
-    "DeepseekV4ForCausalLM", "DeepSeekV4MTPModel",
+    "DeepseekV4ForCausalLM",
+    "DeepSeekV4MTPModel",
+    "Qwen4ExpForCausalLM",
+    "Qwen4ExpForConditionalGeneration",
 ])
 @pytest.mark.parametrize("dp_size,pcp_size", [(2, 1), (1, 2), (1, 4), (1, 8)])
 def test_slimquant_w4a8_deepep_auto_uses_w4a8_deepgemm_factory_not_aiter(
