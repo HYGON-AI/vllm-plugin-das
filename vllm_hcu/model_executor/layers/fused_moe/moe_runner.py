@@ -1246,6 +1246,7 @@ class MoERunner(MoERunnerInterface):
         if not (
             self.moe_config.pcp_size > 1
             and not self.moe_config.moe_parallel_config.use_all2all_kernels
+            and not getattr(self._quant_method, "hcu_owns_dispatch", False)
         ):
             yield input_ids
             return

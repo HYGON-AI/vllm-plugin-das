@@ -410,7 +410,10 @@ def test_selects_channel_fp8_and_rejects_mismatched_projections(runtime, monkeyp
     def get_scheme(layer, name):
         names.append(name)
         return scheme
-    quant = NS(get_name=lambda: "compressed-tensors",
+    utils = ModuleType("vllm.model_executor.layers.quantization.compressed_tensors.utils")
+    utils.should_ignore_layer = lambda *args, **kwargs: False
+    monkeypatch.setitem(sys.modules, utils.__name__, utils)
+    quant = NS(get_name=lambda: "compressed-tensors", ignore=[], packed_modules_mapping={},
                _add_fused_moe_to_target_scheme_map=lambda: None,
                get_scheme_dict=get_scheme, _is_fp8_w8a8=lambda *args: True)
     method = runtime.select_method(layer, quant, moe)
@@ -588,12 +591,19 @@ def test_pcp_runner_keeps_rank_local_tokens_for_megamoe():
     path = REPO / "vllm_hcu/model_executor/layers/fused_moe/moe_runner.py"
     tree = ast.parse(path.read_text())
     cls = next(n for n in tree.body if isinstance(n, ast.ClassDef) and n.name == "MoERunner")
-    names = {"_maybe_dispatch", "_maybe_combine", "do_naive_dispatch_combine"}
+    names = {"_maybe_dispatch", "_maybe_combine", "do_naive_dispatch_combine",
+             "_pcp_routing_inputs"}
     methods = [n for n in cls.body if isinstance(n, ast.FunctionDef) and n.name in names]
     calls = []
     group = NS(all_gather=lambda x, **kw: calls.append("gather") or x,
                reduce_scatter=lambda x, **kw: calls.append("scatter") or x)
-    namespace = {"torch": torch, "get_pcp_group": lambda: group}
+    from contextlib import contextmanager
+    padding = torch.tensor([False, True])
+    context = NS(is_padding=padding)
+    namespace = {"torch": torch, "get_pcp_group": lambda: group,
+                 "contextmanager": contextmanager,
+                 "get_forward_context": lambda: context,
+                 "is_forward_context_available": lambda: True}
     test_cls = ast.ClassDef(name="Runner", bases=[], keywords=[], body=methods, decorator_list=[])
     code = ast.fix_missing_locations(ast.Module(body=[test_cls], type_ignores=[]))
     exec(compile(code, str(path), "exec"), namespace)
@@ -606,11 +616,21 @@ def test_pcp_runner_keeps_rank_local_tokens_for_megamoe():
     x, logits = torch.ones(2, 4), torch.ones(2, 256)
     assert runner._maybe_dispatch(x, logits) == (x, logits)
     assert runner._maybe_combine(None, x) is x
+    ids = torch.tensor([17, 23])
+    for _ in range(2):
+        with runner._pcp_routing_inputs(ids, 2) as routing_ids:
+            assert routing_ids is ids
+            assert context.is_padding is padding
+        assert context.is_padding is padding
     assert calls == []
     runner._quant_method = NS(supports_internal_mk=False)
     runner._maybe_dispatch(x, logits)
     runner._maybe_combine(None, x)
-    assert calls == ["gather", "gather", "scatter"]
+    with runner._pcp_routing_inputs(ids, 1) as routing_ids:
+        torch.testing.assert_close(routing_ids, ids[:1])
+        torch.testing.assert_close(context.is_padding, padding[:1])
+    assert context.is_padding is padding
+    assert calls == ["gather", "gather", "scatter", "gather", "gather"]
 
 
 def test_offload_sleep_and_nonstandard_activation_rejected(runtime):
@@ -741,3 +761,26 @@ def test_signed_int4_triton_unpack_on_hcu(int4):
     raw = torch.arange(256, dtype=torch.int16)
     reference = ((torch.stack((raw >> 4, raw & 15), -1) ^ 8)-8).to(torch.int8)
     torch.testing.assert_close(out.cpu(), reference.flatten())
+
+
+@pytest.mark.parametrize("name", ["compressed-tensors", "slimquant_compressed_tensors_marlin"])
+def test_fp8_ignored_experts_rejected_before_scheme_lookup(runtime, monkeypatch, name):
+    config, moe, layer = valid_config()
+    layer.layer_name = "model.layers.0.ffn.experts"
+    monkeypatch.setattr(runtime, "get_current_vllm_config", lambda: config)
+    ignore = ["model.layers.*.ffn.experts"]
+    mapping = {"gate_up_proj": ["gate_proj", "up_proj"]}
+    utils = ModuleType("vllm.model_executor.layers.quantization.compressed_tensors.utils")
+    def should_ignore(layer_name, **kwargs):
+        assert layer_name == layer.layer_name
+        assert kwargs == dict(ignore=ignore, fused_mapping=mapping, use_fnmatch=True)
+        return True
+    utils.should_ignore_layer = should_ignore
+    monkeypatch.setitem(sys.modules, utils.__name__, utils)
+    def unexpected(*args):
+        pytest.fail("Ignored experts must be rejected before FP8 scheme lookup/construction")
+    quant = NS(get_name=lambda: name, ignore=ignore, packed_modules_mapping=mapping,
+               _add_fused_moe_to_target_scheme_map=unexpected, get_scheme_dict=unexpected)
+    monkeypatch.setattr(runtime, "HcuMegaMoEMethod", unexpected)
+    with pytest.raises(ValueError, match="ignored/unquantized"):
+        runtime.select_method(layer, quant, moe)

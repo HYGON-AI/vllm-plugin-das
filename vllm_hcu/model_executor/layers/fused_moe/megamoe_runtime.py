@@ -131,22 +131,26 @@ def select_method(layer, quant_config, moe):
         return None
     validate_config(config, moe, layer)
     name = quant_config.get_name() if quant_config is not None else None
-    if name == "slimquant_w4a8":
-        from vllm.model_executor.layers.quantization.compressed_tensors.utils import (
-            should_ignore_layer,
-        )
+    if name not in (
+        "slimquant_w4a8", "compressed-tensors", "slimquant_compressed_tensors_marlin",
+    ):
+        raise ValueError("HCU MegaMoE requires SlimQuant W4A8 or Channel-FP8 experts")
+    from vllm.model_executor.layers.quantization.compressed_tensors.utils import (
+        should_ignore_layer,
+    )
 
-        if should_ignore_layer(
-            layer.layer_name,
-            ignore=quant_config.ignore,
-            fused_mapping=quant_config.packed_modules_mapping,
-            use_fnmatch=True,
-        ):
-            raise ValueError("HCU MegaMoE cannot run ignored/unquantized experts")
+    # Selection bypasses get_quant_method, so honor its unquantized-layer guard
+    # before looking up projection schemes or constructing quantized weights.
+    if should_ignore_layer(
+        layer.layer_name,
+        ignore=quant_config.ignore,
+        fused_mapping=quant_config.packed_modules_mapping,
+        use_fnmatch=True,
+    ):
+        raise ValueError("HCU MegaMoE cannot run ignored/unquantized experts")
+    if name == "slimquant_w4a8":
         validate_config(config, moe, layer, "int8")
         return HcuMegaMoEMethod(moe, "int8")
-    if name not in ("compressed-tensors", "slimquant_compressed_tensors_marlin"):
-        raise ValueError("HCU MegaMoE requires SlimQuant W4A8 or Channel-FP8 experts")
     quant_config._add_fused_moe_to_target_scheme_map()
     schemes = [
         quant_config.get_scheme_dict(layer, layer.layer_name + f".0.{proj}_proj")
