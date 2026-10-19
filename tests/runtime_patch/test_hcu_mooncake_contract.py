@@ -61,6 +61,9 @@ def _worker(
     worker.tp_size = tp_size
     worker.finished_recving_reqs = set()
     worker._kv_load_error = None
+    # object.__new__ skips MooncakeConnectorWorker.__init__.
+    worker.dsa_layer_split_enabled = False
+    worker._remote_pcp_info = {}
     return worker
 
 

@@ -30,6 +30,7 @@ SGLang pool methods; the scratch alias is the remote buffer.
 
 from __future__ import annotations
 
+import math
 import os
 from dataclasses import dataclass
 from typing import Any
@@ -325,6 +326,29 @@ def validate_dsa_cache_layer_split(vllm_config: Any) -> None:
             "enable_dsa_cache_layer_split requires an HCU-supported DSA MLA "
             f"capability ({_dsa_capability_error(model_config)})."
         )
+    _require_unsplittable_manager_block(vllm_config)
+
+
+def _require_unsplittable_manager_block(vllm_config: Any) -> None:
+    """Packed layer-split stores one cross-layer stride per manager block.
+
+    Upstream ``create_kv_cache_views`` subdivides a manager block into kernel
+    pages only when ``block_stride`` equals one dense page. The packed stride
+    is larger than a page, so a manager block of 128 tokens cannot become two
+    FLASHMLA sparse kernel blocks of 64. Fail here instead of at allocation.
+    """
+    cache_config = getattr(vllm_config, "cache_config", None)
+    block_size = getattr(cache_config, "block_size", None)
+    if block_size is None:
+        return
+    block_size = int(block_size)
+    kernel_page = 64
+    if block_size > kernel_page and block_size % kernel_page == 0:
+        raise ValueError(
+            "enable_dsa_cache_layer_split packs every layer into one block "
+            "stride, so a manager block cannot be split into kernel blocks. "
+            f"Use --block-size {kernel_page} (got {block_size})."
+        )
 
 
 def parse_layer_index(layer_name: str) -> int:
@@ -607,13 +631,25 @@ def _family_kind(layer_name: str) -> str:
     return "mla"
 
 
+def _family_shape(cache: torch.Tensor) -> tuple[int, ...]:
+    """Drop size-1 dims so ``[B, 1, N, C]`` and ``squeeze(1)`` match.
+
+    The allocator registers the 4D tensor. MLA binds the squeezed 3D view
+    of that same cache. A key that keeps the singleton dimension splits
+    prefetch and the forward onto two broadcast states.
+    """
+    dims = tuple(int(dim) for dim in cache.shape if int(dim) != 1)
+    return dims or tuple(int(dim) for dim in cache.shape)
+
+
 def _family_key(cache: torch.Tensor, layer_name: str) -> str:
-    # Shape/dtype identify the packed family; kind separates MLA vs indexer
-    # when shapes happen to collide.
+    # Kind separates MLA vs indexer. Normalized shape keeps every layer of
+    # one packed family on the same broadcast state, including the 4D
+    # registration view and the 3D view used by the forward.
     return (
         f"{_family_kind(layer_name)}|"
         f"{cache.device.type}:{cache.device.index}|"
-        f"{cache.dtype}|{tuple(cache.shape)}"
+        f"{cache.dtype}|{_family_shape(cache)}"
     )
 
 
@@ -1580,6 +1616,36 @@ def make_packed_kv_tensor(
         )
 
 
+def align_packed_block_stride(payload_bytes: int, kv_cache_groups: Any) -> int:
+    """Pad a packed block pitch up to a whole number of every layer's rows.
+
+    BF16 MLA reads the packed buffer as ``[blocks, tokens, width]`` and
+    requires ``stride(0)`` to be a multiple of the row. Summing page sizes
+    can leave a remainder. The pad is a trailing gap inside ``block_stride``;
+    layer offsets stay on the unpadded payload. Planner and worker remap
+    must apply the same pad or startup rejects the layout.
+    """
+    align = 1
+    for group in kv_cache_groups or []:
+        spec = getattr(group, "kv_cache_spec", None)
+        per_layer = getattr(spec, "kv_cache_specs", None)
+        specs = (
+            list(per_layer.values())
+            if isinstance(per_layer, dict) and per_layer
+            else [spec]
+        )
+        for layer_spec in specs:
+            if layer_spec is None:
+                continue
+            page = int(getattr(layer_spec, "page_size_bytes", 0) or 0)
+            block = int(getattr(layer_spec, "block_size", 0) or 0)
+            if page > 0 and block > 0 and page % block == 0:
+                align = math.lcm(align, page // block)
+    if align > 1 and payload_bytes % align:
+        payload_bytes = (payload_bytes + align - 1) // align * align
+    return int(payload_bytes)
+
+
 def remap_packed_kv_tensor_offsets(
     kv_cache_config: Any,
     vllm_config: Any | None = None,
@@ -1650,7 +1716,10 @@ def remap_packed_kv_tensor_offsets(
         )
         return False
 
-    new_stride = sum(ps * phys_slots[ps] for ps in page_sizes)
+    new_stride = align_packed_block_stride(
+        sum(ps * phys_slots[ps] for ps in page_sizes),
+        getattr(kv_cache_config, "kv_cache_groups", None),
+    )
     old_stride = int(packed[0].block_stride)
     if old_stride != new_stride:
         raise RuntimeError(

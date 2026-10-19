@@ -205,11 +205,13 @@ def apply_to_module(module: ModuleType) -> bool:
         from vllm.config import get_current_vllm_config_or_none
 
         vllm_config = get_current_vllm_config_or_none()
-        self._hcu_kimi_k3 = (
-            vllm_config is not None
-            and getattr(vllm_config.model_config.hf_config, "model_type", None)
-            == "kimi_k3"
+        model_config = (
+            getattr(vllm_config, "model_config", None)
+            if vllm_config is not None
+            else None
         )
+        hf_config = getattr(model_config, "hf_config", None)
+        self._hcu_kimi_k3 = getattr(hf_config, "model_type", None) == "kimi_k3"
         self._hcu_feature_config = get_hcu_config(vllm_config)
         self._hcu_pcp_world_size = configured_pcp_world_size(vllm_config)
         self._hcu_use_pcp = self._hcu_pcp_world_size > 1

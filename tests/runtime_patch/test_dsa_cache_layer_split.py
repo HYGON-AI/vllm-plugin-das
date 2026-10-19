@@ -879,6 +879,88 @@ def test_remap_mixed_page_sizes_hy4_like(monkeypatch: pytest.MonkeyPatch) -> Non
     assert by_layer["model.layers.8.self_attn.attn"] == mla_base + 3 * mla_page  # MTP
 
 
+def test_remap_accepts_row_aligned_block_stride(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Worker remap must pad the same way the planner does.
+
+    Hy4 PCP8 startup failed when the planner wrote 562848 and remap still
+    expected the unpadded 554496.
+    """
+    from vllm_hcu.v1.dsa_cache_layer_split import align_packed_block_stride
+
+    _set_layer_split(monkeypatch, True)
+    block = 64
+    idx_page, mla_page = 8448, 41984
+    indexer_layers = list(range(22))
+    mla_layers = list(range(78)) + [78]
+    total_layers, pcp = 78, 8
+    idx_phys = phys_slots_for_layer_family(indexer_layers, total_layers, pcp)
+    mla_phys = phys_slots_for_layer_family(mla_layers, total_layers, pcp)
+    payload = idx_page * idx_phys + mla_page * mla_phys
+
+    def _spec(page: int):
+        return SimpleNamespace(page_size_bytes=page, block_size=block)
+
+    names = [
+        f"model.layers.{i}.self_attn.indexer" for i in indexer_layers
+    ] + [f"model.layers.{i}.self_attn.attn" for i in mla_layers]
+    groups = [
+        SimpleNamespace(
+            layer_names=names,
+            kv_cache_spec=SimpleNamespace(
+                page_size_bytes=mla_page,
+                block_size=block,
+                kv_cache_specs={
+                    name: _spec(idx_page if "indexer" in name else mla_page)
+                    for name in names
+                },
+            ),
+        )
+    ]
+    stride = align_packed_block_stride(payload, groups)
+    assert stride > payload
+    assert align_packed_block_stride(
+        554496,
+        [
+            SimpleNamespace(
+                kv_cache_spec=SimpleNamespace(
+                    kv_cache_specs={
+                        "indexer": SimpleNamespace(
+                            page_size_bytes=8448, block_size=64
+                        ),
+                        "mla": SimpleNamespace(
+                            page_size_bytes=41984, block_size=64
+                        ),
+                    }
+                )
+            )
+        ],
+    ) == 562848
+
+    class _Tensor:
+        def __init__(self, size, shared_by, offset=0, block_stride=0):
+            self.size = size
+            self.shared_by = shared_by
+            self.offset = offset
+            self.block_stride = block_stride
+
+    tensors = []
+    for name in names:
+        page = idx_page if "indexer" in name else mla_page
+        tensors.append(_Tensor(stride, [name], offset=0, block_stride=stride))
+        del page
+    cfg = SimpleNamespace(
+        parallel_config=SimpleNamespace(prefill_context_parallel_size=pcp),
+        model_config=SimpleNamespace(
+            hf_config=SimpleNamespace(num_hidden_layers=total_layers)
+        ),
+    )
+    kv_cfg = SimpleNamespace(kv_cache_tensors=tensors, kv_cache_groups=groups)
+    assert remap_packed_kv_tensor_offsets(kv_cfg, cfg) is True
+    assert kv_cfg.kv_cache_tensors[0].block_stride == stride
+
+
 def test_admission_sizing_reserves_broadcast_bounce_bytes(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
@@ -1155,3 +1237,158 @@ def test_make_packed_kv_tensor_modern_shared_by_fallback() -> None:
     assert t.offset == 64
     assert t.block_stride == 96
     assert t.layer_stride == 32
+
+
+def test_family_key_unifies_allocator_view_and_mla_squeeze() -> None:
+    from vllm_hcu.v1.dsa_cache_layer_split import _family_key
+
+    registered = torch.zeros(4, 1, 8, 16)
+    bound = registered.squeeze(1)
+    name = "model.layers.0.self_attn.attn"
+    assert tuple(bound.shape) == (4, 8, 16)
+    assert _family_key(registered, name) == _family_key(bound, name)
+    other_layer = torch.zeros(4, 1, 8, 16)
+    assert _family_key(other_layer, name) == _family_key(registered, name)
+    indexer = "model.layers.0.self_attn.indexer"
+    assert _family_key(registered, indexer) != _family_key(registered, name)
+
+
+def test_validate_rejects_splittable_manager_block(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    _set_layer_split(monkeypatch, True)
+    cfg = _pd_prefill_cfg()
+    cfg.cache_config = SimpleNamespace(block_size=64)
+    validate_dsa_cache_layer_split(cfg)
+    cfg.cache_config = SimpleNamespace(block_size=128)
+    with pytest.raises(ValueError, match="kernel blocks"):
+        validate_dsa_cache_layer_split(cfg)
+
+
+def test_packed_stride_is_a_whole_number_of_bf16_rows(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """61-layer PCP4 BF16 MLA + uint8 indexer, the review's remainder case."""
+    from vllm_hcu.patch.platform.framework_opt import (
+        patch_dsa_layer_split_kv_config as kv_patch,
+    )
+
+    monkeypatch.setattr(kv_patch, "_layer_split_active", lambda cfg: True)
+    monkeypatch.setattr(kv_patch, "_layer_split_runtime_reserve_bytes", lambda: 0)
+    total_layers, pcp, block = 61, 4, 64
+    mla_row, idx_row = 576 * 2, 132
+    mla_page, idx_page = mla_row * block, idx_row * block
+    groups = [
+        SimpleNamespace(
+            layer_names=[
+                f"model.layers.{i}.self_attn.attn" for i in range(total_layers)
+            ],
+            kv_cache_spec=SimpleNamespace(
+                kv_cache_specs={
+                    **{
+                        f"model.layers.{i}.self_attn.attn": SimpleNamespace(
+                            page_size_bytes=mla_page,
+                            block_size=block,
+                            dtype=torch.bfloat16,
+                        )
+                        for i in range(total_layers)
+                    },
+                    **{
+                        f"model.layers.{i}.self_attn.indexer": SimpleNamespace(
+                            page_size_bytes=idx_page,
+                            block_size=block,
+                            dtype=torch.uint8,
+                        )
+                        for i in range(total_layers)
+                    },
+                }
+            ),
+        )
+    ]
+    mod = _planner_module(kv_patch)
+    available = (mla_page + idx_page) * total_layers * 4
+    plan = mod.get_kv_cache_config_from_groups(
+        _remap_cfg(total_layers, pcp),
+        groups,
+        available,
+    )
+    stride = plan.kv_cache_tensors[0].block_stride
+    assert stride % mla_row == 0
+    assert stride % idx_row == 0
+    assert (stride // 2) % 576 == 0
+
+
+def test_max_usage_applies_layer_split_ratio_once(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Native max-usage multiplies the wrapped pool; do not shrink again."""
+    import types
+
+    from vllm_hcu.patch.platform.framework_opt import (
+        patch_dsa_layer_split_kv_config as kv_patch,
+    )
+
+    monkeypatch.setattr(kv_patch, "_layer_split_active", lambda cfg: True)
+    total_layers, pcp, page, blocks = 8, 4, 512, 1000
+    full_bytes = page * total_layers
+    accounted = page * phys_slots_for_layer_family(
+        list(range(total_layers)), total_layers, pcp
+    ) + 2 * page
+
+    mod = types.ModuleType(kv_patch.TARGET_MODULE)
+
+    def get_kv_cache_config_from_groups(
+        vllm_config, kv_cache_groups, available_memory
+    ):
+        del vllm_config, kv_cache_groups, available_memory
+        raise AssertionError("unused")
+
+    def _pool_bytes_per_block(vllm_config, kv_cache_groups):
+        del vllm_config, kv_cache_groups
+        return full_bytes
+
+    def _max_memory_usage_bytes_from_groups(vllm_config, kv_cache_groups):
+        return mod._pool_bytes_per_block(vllm_config, kv_cache_groups) * blocks
+
+    mod.get_kv_cache_config_from_groups = get_kv_cache_config_from_groups
+    mod._max_memory_usage_bytes_from_groups = _max_memory_usage_bytes_from_groups
+    mod._pool_bytes_per_block = _pool_bytes_per_block
+    mod.may_override_num_blocks = lambda cfg, n: n
+    mod.KVCacheConfig = SimpleNamespace
+    mod.KVCacheTensor = SimpleNamespace
+    assert kv_patch.apply_to_module(mod) is True
+
+    groups = _single_family_groups(total_layers, page)
+    cfg = _remap_cfg(total_layers, pcp)
+    assert mod._pool_bytes_per_block(cfg, groups) == accounted
+    assert mod._max_memory_usage_bytes_from_groups(cfg, groups) == accounted * blocks
+
+
+def test_native_positive_block_stride_uses_original_offload() -> None:
+    import types
+
+    from vllm_hcu.patch.platform.framework_opt import patch_packed_kv_offload
+
+    calls: list[int] = []
+    mod = types.ModuleType(patch_packed_kv_offload.TARGET_MODULE)
+
+    class Scheduler:
+        @staticmethod
+        def _derive_cpu_config(gpu_config, cpu_capacity_bytes):
+            del gpu_config
+            calls.append(cpu_capacity_bytes)
+            return "native"
+
+    mod.SimpleCPUOffloadScheduler = Scheduler
+    assert patch_packed_kv_offload.apply_to_module(mod) is True
+    gpu = SimpleNamespace(
+        num_blocks=4,
+        kv_cache_tensors=[
+            SimpleNamespace(size=64, block_stride=32, layers=["layer.0"]),
+            SimpleNamespace(size=64, block_stride=32, layers=["layer.1"]),
+        ],
+    )
+    assert (
+        mod.SimpleCPUOffloadScheduler._derive_cpu_config(gpu, 128) == "native"
+    )
+    assert calls == [128]

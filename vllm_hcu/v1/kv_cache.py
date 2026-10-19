@@ -267,8 +267,8 @@ def _reshape_modern_packed_cache(
 ) -> torch.Tensor:
     """Create a backend cache view from a packed byte descriptor."""
     storage_block_size = int(getattr(spec, "storage_block_size", spec.block_size))
-    kernel_block_size = storage_block_size
-    if storage_block_size % kernel_block_size:
+    kernel_block_size = int(getattr(spec, "block_size", storage_block_size))
+    if kernel_block_size <= 0 or storage_block_size % kernel_block_size:
         raise ValueError(
             "KV storage block size must be divisible by the kernel block size"
         )
@@ -287,7 +287,7 @@ def _reshape_modern_packed_cache(
         )
     shape = backend.get_kv_cache_shape(
         kernel_num_blocks,
-        kernel_block_size,
+        storage_block_size,
         spec.num_kv_heads,
         spec.head_size,
         cache_dtype_str=cache_dtype,

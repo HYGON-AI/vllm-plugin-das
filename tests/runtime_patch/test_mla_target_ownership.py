@@ -325,6 +325,9 @@ def _fake_mla_module(adapter, target_calls, event_log=None):
             sparse_mha_calls.append((self, attn_metadata))
             return True
 
+        def bind_kv_cache(self, kv_cache):
+            self.kv_cache = kv_cache
+
     class MLACommonMetadata:
         def __init__(self, num_actual_tokens):
             self.num_actual_tokens = num_actual_tokens

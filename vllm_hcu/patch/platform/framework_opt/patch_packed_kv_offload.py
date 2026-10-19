@@ -35,7 +35,14 @@ def _layer_names(tensor: Any) -> list[str]:
 
 
 def _is_packed(tensor: Any) -> bool:
-    return int(getattr(tensor, "block_stride", 0) or 0) > 0
+    """HCU packed descriptors always carry ``packed_kv_backing_id``.
+
+    Native ``KVCacheTensor`` also has a positive ``block_stride`` (bytes
+    between manager blocks). Treating that as packed makes PCP=1 / layer-split
+    off raise when several native descriptors lack a backing id. Only the
+    explicit HCU identity enters the packed export path.
+    """
+    return _packed_backing_id(tensor) is not None
 
 
 def _packed_backing_id(tensor: Any) -> Any | None:
@@ -162,6 +169,8 @@ def apply_to_module(module: ModuleType) -> bool:
         # identity from numeric size alone: equal-sized pools are independent
         # unless the planner marked them as aliases.
         packed_keys = _packed_pool_keys(tensors)
+        if not packed_keys:
+            return original(gpu_config, cpu_capacity_bytes)
         packed_sizes: dict[Any, int] = {}
         packed_index = 0
         gpu_total_bytes = 0

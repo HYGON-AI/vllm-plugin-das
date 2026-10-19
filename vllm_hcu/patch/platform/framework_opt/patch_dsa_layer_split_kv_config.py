@@ -269,6 +269,17 @@ def apply_to_module(module: ModuleType) -> bool:
         shrunk = total_num_bytes_per_block < full_bytes
         if not shrunk:
             total_num_bytes_per_block = full_bytes
+        else:
+            # Interleaving page-size families does not guarantee that the
+            # byte pitch is a whole number of BF16 MLA rows. Pad with the
+            # same helper the worker remap uses.
+            from vllm_hcu.v1.dsa_cache_layer_split import (
+                align_packed_block_stride,
+            )
+
+            total_num_bytes_per_block = align_packed_block_stride(
+                total_num_bytes_per_block, kv_cache_groups
+            )
         # ``_scratch_for`` keeps separate sync and prefetch pools; see
         # ``_bounce_bytes_per_block`` for the per-dtype sharing model.
         bounce_bytes_per_block = _bounce_bytes_per_block(
@@ -469,11 +480,20 @@ def apply_to_module(module: ModuleType) -> bool:
 
         @functools.wraps(original_max_usage)
         def hcu_max_memory_usage_bytes_from_groups(vllm_config, kv_cache_groups):
-            return _shrink_bytes(
-                vllm_config,
-                kv_cache_groups,
-                original_max_usage(vllm_config, kv_cache_groups),
-            )
+            # 0.28 max-usage multiplies ``_pool_bytes_per_block``. That helper is
+            # already the shrunk wrapper, so shrinking the product again
+            # under-counts max-model-len. A stub that returns full bytes and
+            # never calls the pool still gets one shrink.
+            try:
+                uses_pool = "_pool_bytes_per_block" in inspect.getsource(
+                    original_max_usage
+                )
+            except (OSError, TypeError):
+                uses_pool = False
+            full_value = original_max_usage(vllm_config, kv_cache_groups)
+            if uses_pool:
+                return full_value
+            return _shrink_bytes(vllm_config, kv_cache_groups, full_value)
 
         setattr(hcu_max_memory_usage_bytes_from_groups, _WRAPPER_MAX_USAGE, True)
         setattr(
