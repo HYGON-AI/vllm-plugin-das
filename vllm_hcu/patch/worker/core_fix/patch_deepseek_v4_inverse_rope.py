@@ -26,6 +26,29 @@ _MARKER = "_vllm_hcu_inverse_rope_suffix_applied"
 logger = init_logger(__name__)
 
 
+@functools.cache
+def _register_inverse_rope_fake() -> bool:
+    """Register the FakeTensor implementation for the mutating HCU op."""
+    try:
+        import vllm_hcu.hcu_ops  # noqa: F401
+
+        getattr(torch.ops.hcu_ops, "deepseek_v4_inv_rope")
+    except (ImportError, AttributeError):
+        return False
+
+    def deepseek_v4_inv_rope_fake(rope, position_ids, cos_sin_cache):
+        return None
+
+    try:
+        torch.library.register_fake("hcu_ops::deepseek_v4_inv_rope")(
+            deepseek_v4_inv_rope_fake
+        )
+    except RuntimeError as exc:
+        if "already has" not in str(exc) and "already registered" not in str(exc):
+            raise
+    return True
+
+
 def _eligible(rotary_emb, o, positions, rope_head_dim, n_local_groups):
     cache = rotary_emb.cos_sin_cache
     return (
@@ -56,6 +79,7 @@ def _eligible(rotary_emb, o, positions, rope_head_dim, n_local_groups):
 
 def apply_to_module(module: ModuleType) -> bool:
     rocm = load_exact_module(TARGET_MODULE, module)
+    _register_inverse_rope_fake()
     original = require_callable(rocm, "rocm_inv_rope_einsum", TARGET_SYMBOL)
     if getattr(rocm, _MARKER, False):
         if not getattr(original, _MARKER, False):

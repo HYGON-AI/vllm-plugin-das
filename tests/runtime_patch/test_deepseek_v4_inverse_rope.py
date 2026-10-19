@@ -99,3 +99,25 @@ def test_optimized_helper_uses_native_op_and_cached_weight(monkeypatch):
     torch.testing.assert_close(result, expected)
     torch.testing.assert_close(o, expected_o)
     assert len(calls) == 1
+
+
+@pytest.mark.skipif(
+    not torch.cuda.is_available(), reason="inverse RoPE tests need a working GPU"
+)
+def test_inverse_rope_fake_supports_fullgraph():
+    assert patch._register_inverse_rope_fake()
+    assert patch._register_inverse_rope_fake()
+
+    def invoke(rope, positions, cache):
+        torch.ops.hcu_ops.deepseek_v4_inv_rope(rope, positions, cache)
+        return rope
+
+    compiled = torch.compile(invoke, fullgraph=True, backend="eager")
+    rope = torch.randn(512, 2, 64, dtype=torch.bfloat16, device="cuda")
+    positions = torch.arange(512, device="cuda", dtype=torch.int64)
+    cache = torch.randn(512, 64, dtype=torch.float32, device="cuda")
+    expected = rope.clone()
+    torch.ops.hcu_ops.deepseek_v4_inv_rope(expected, positions, cache)
+
+    result = compiled(rope, positions, cache)
+    torch.testing.assert_close(result, expected)

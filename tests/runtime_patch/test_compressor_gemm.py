@@ -16,6 +16,7 @@ pytestmark = pytest.mark.skipif(
 )
 
 from vllm_hcu.patch.worker.core_fix import patch_deepseek_v4_attention as patch
+from vllm_hcu.utils import bf16_fp32_gemm
 
 
 class CompressorLinear(torch.nn.Module):
@@ -40,7 +41,7 @@ def blas(monkeypatch):
         calls.append(w)
         return x.float() @ w.float().T
 
-    monkeypatch.setattr(patch, "linear_bf16_fp32", linear)
+    monkeypatch.setattr(bf16_fp32_gemm, "linear_bf16_fp32", linear)
     return calls
 
 
@@ -110,14 +111,20 @@ def test_invalid_backend_is_rejected(monkeypatch):
         patch.bind_compressor_nt_weights(model)
 
 
+def test_registered_gemm_has_fake_impl(monkeypatch, blas):
+    x = torch.randn(2, 5, dtype=torch.bfloat16, device="cuda")
+    nt = torch.randn(3, 5, dtype=torch.bfloat16, device="cuda").contiguous()
+
+    torch.library.opcheck(
+        torch.ops.vllm.hcu_linear_bf16_fp32.default,
+        (x, nt),
+        test_utils=("test_schema", "test_faketensor"),
+    )
+
+
 def test_compile_uses_materialized_buffer(monkeypatch):
     monkeypatch.setenv("VLLM_HCU_USE_CUSTOM_OPS", "1")
     monkeypatch.setenv("VLLM_HCU_COMPRESSOR_GEMM_BACKEND", "blaslt")
-    monkeypatch.setattr(
-        patch,
-        "linear_bf16_fp32",
-        lambda x, w: x.float() @ w.float().T,
-    )
     model = _model(torch.randn(5, 3, dtype=torch.bfloat16, device="cuda"))
     assert patch.bind_compressor_nt_weights(model) == 1
 
@@ -127,7 +134,9 @@ def test_compile_uses_materialized_buffer(monkeypatch):
         backend="eager",
     )
     x = torch.randn(2, 5, dtype=torch.bfloat16, device="cuda")
-    torch.testing.assert_close(compiled(x), x.float() @ model.fused_wkv_wgate.weight.float())
+    torch.testing.assert_close(
+        compiled(x), x.float() @ model.fused_wkv_wgate.weight.float()
+    )
 
 
 def test_refresh_reuses_buffer_after_hot_reload(monkeypatch):

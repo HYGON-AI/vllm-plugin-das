@@ -13,6 +13,7 @@ from typing import Any
 import torch
 
 from vllm.logger import init_logger
+from vllm.utils.torch_utils import direct_register_custom_op
 
 logger = init_logger(__name__)
 
@@ -151,3 +152,34 @@ def linear_bf16_fp32(x: torch.Tensor, weight: torch.Tensor) -> torch.Tensor:
             e,
         )
         return torch.mm(x, weight.T, out_dtype=torch.float32)
+
+
+def _linear_bf16_fp32_op(
+    x: torch.Tensor, weight: torch.Tensor
+) -> torch.Tensor:
+    """Run the eager BF16-to-FP32 GEMM implementation."""
+    return linear_bf16_fp32(x, weight)
+
+
+def _linear_bf16_fp32_fake(
+    x: torch.Tensor, weight: torch.Tensor
+) -> torch.Tensor:
+    """Describe the output shape without tracing into the backend."""
+    output_features = (
+        weight.shape[1]
+        if weight.ndim == 2 and x.ndim == 2 and weight.shape[0] == x.shape[-1]
+        else weight.shape[0]
+    )
+    return torch.empty(
+        (x.shape[0], output_features),
+        dtype=torch.float32,
+        device=x.device,
+    )
+
+
+direct_register_custom_op(
+    op_name="hcu_linear_bf16_fp32",
+    op_func=_linear_bf16_fp32_op,
+    mutates_args=[],
+    fake_impl=_linear_bf16_fp32_fake,
+)

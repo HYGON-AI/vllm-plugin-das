@@ -13,7 +13,7 @@ import torch
 
 from vllm_hcu.platforms import envs as henvs
 from vllm_hcu.platforms.hcu import on_gfx938
-from vllm_hcu.utils.bf16_fp32_gemm import linear_bf16_fp32
+import vllm_hcu.utils.bf16_fp32_gemm  # noqa: F401  # registers the dispatcher op
 
 from ._common import (
     PatchCompatibilityError,
@@ -111,7 +111,7 @@ def _compressor_mm(hidden_states: torch.Tensor, linear) -> torch.Tensor:
     weight = linear.weight
     nt = getattr(linear, _COMPRESSOR_NT_BUFFER, None)
     if nt is not None:
-        return linear_bf16_fp32(hidden_states, nt)
+        return torch.ops.vllm.hcu_linear_bf16_fp32(hidden_states, nt)
     nn_layout = weight.shape[0] == hidden_states.shape[-1]
     rhs = weight if nn_layout else weight.T
     return torch.mm(hidden_states, rhs, out_dtype=torch.float32)
