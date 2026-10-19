@@ -111,7 +111,7 @@ def test_invalid_backend_is_rejected(monkeypatch):
         patch.bind_compressor_nt_weights(model)
 
 
-def test_registered_gemm_has_fake_impl(monkeypatch, blas):
+def test_registered_gemm_has_fake_impl():
     x = torch.randn(2, 5, dtype=torch.bfloat16, device="cuda")
     nt = torch.randn(3, 5, dtype=torch.bfloat16, device="cuda").contiguous()
 

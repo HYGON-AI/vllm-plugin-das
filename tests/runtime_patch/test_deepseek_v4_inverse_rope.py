@@ -105,7 +105,8 @@ def test_optimized_helper_uses_native_op_and_cached_weight(monkeypatch):
     not torch.cuda.is_available(), reason="inverse RoPE tests need a working GPU"
 )
 def test_inverse_rope_fake_supports_fullgraph():
-    assert patch._register_inverse_rope_fake()
+    if not patch._register_inverse_rope_fake():
+        pytest.skip("HCU inverse RoPE operator is unavailable")
     assert patch._register_inverse_rope_fake()
 
     def invoke(rope, positions, cache):
