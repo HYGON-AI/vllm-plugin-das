@@ -7,7 +7,7 @@ on:
   workflow_dispatch:
     inputs:
       run_test:
-        description: 构建完成并推送后, 自动触发 test-docker-image-daily 对该镜像跑 CItest
+        description: Run Cookbook model deployment tests on this published image
         required: false
         default: true
         type: boolean
@@ -145,14 +145,15 @@ jobs:
         if: always()
         run: rm -rf "${GITHUB_WORKSPACE}"/* "${GITHUB_WORKSPACE}"/.[!.]* || true
 
-  # 镜像推送成功后, 对本次构建的具体镜像并行跑 CItest 与冒烟校验,
+  # Run Cookbook model tests and image validation independently after publishing.
   # 两个测试 job 只依赖 build, 互不等待互不阻断
   test-image:
     if: github.event.inputs.run_test != 'false'
     needs: build
-    uses: ./.github/workflows/daily-test-docker-image.yml
+    uses: ./.github/workflows/cookbook-deployment-smoke.yml
     with:
-      docker_image: ${{ needs.build.outputs.docker_image }}
+      image: ${{ needs.build.outputs.docker_image }}
+      mode: execute
     secrets: inherit
 
   validate-image:

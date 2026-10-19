@@ -47,6 +47,7 @@ from vllm.distributed.parallel_state import (
     get_tensor_model_parallel_rank,
     get_tensor_model_parallel_world_size,
 )
+from vllm.distributed.utils import get_pp_indices
 from vllm.forward_context import ForwardContext
 from vllm.logger import init_logger
 from vllm.model_executor.models.utils import extract_layer_index
@@ -58,7 +59,9 @@ from vllm.v1.attention.backends.utils import NULL_BLOCK_ID
 from vllm_hcu.v1.attention.kv_cache_layout import get_kv_cache_layout
 from vllm.v1.core.sched.output import SchedulerOutput
 from vllm.v1.kv_cache_interface import (
+    AttentionSpec,
     FullAttentionSpec,
+    KpoolTailSpec,
     KVCacheSpec,
     MambaSpec,
     MLAAttentionSpec,
@@ -141,27 +144,45 @@ class TransferRegion:
     block_len: int
     kv_block_len: int
     group_index: int = 0
+    num_blocks: int | None = None
 
 
-def _get_tp_ratio(local_tp_size: int, remote_tp_size: int) -> int:
-    """Return the TP ratio used by heterogeneous TP transfer planning.
+def _normalize_pp_layer_partition(
+    partition: str, num_layers: int, pp_size: int
+) -> tuple[int, ...]:
+    """Validate an explicit partition without mutating the process environment."""
+    parts = partition.split(",")
+    if any(re.fullmatch(r"[0-9]+", part.strip()) is None for part in parts):
+        raise ValueError("Mooncake PP partition requires comma-separated layer counts.")
+    counts = tuple(int(part.strip()) for part in parts)
+    if len(counts) != pp_size or any(count <= 0 for count in counts):
+        raise ValueError("Mooncake PP partition requires one positive count per stage.")
+    if sum(counts) != num_layers:
+        raise ValueError("Mooncake PP partition must sum to the model layer count.")
+    return counts
 
-    Positive values mean one local rank maps into a larger remote KV region.
-    Negative values mean one local rank must gather from multiple remote KV
-    regions.
-    """
-    if local_tp_size >= remote_tp_size:
-        assert local_tp_size % remote_tp_size == 0, (
-            f"Local tensor parallel size {local_tp_size} is not divisible "
-            f"by remote tensor parallel size {remote_tp_size}."
-        )
-        return local_tp_size // remote_tp_size
 
-    assert remote_tp_size % local_tp_size == 0, (
-        f"Remote tensor parallel size {remote_tp_size} is not divisible "
-        f"by local tensor parallel size {local_tp_size}."
+def _get_pp_stage_layer_range(
+    num_layers: int, pp_rank: int, pp_size: int
+) -> tuple[int, int]:
+    """Resolve a checked stage range using the current PP group rank."""
+    if (
+        any(type(value) is not int for value in (num_layers, pp_rank, pp_size))
+        or pp_size <= 0
+        or num_layers < pp_size
+        or not 0 <= pp_rank < pp_size
+    ):
+        raise ValueError("Mooncake PP requires positive stage sizes and a valid rank.")
+    partition = envs.VLLM_PP_LAYER_PARTITION
+    if partition is not None:
+        _normalize_pp_layer_partition(partition, num_layers, pp_size)
+    return get_pp_indices(num_layers, pp_rank, pp_size)
+
+
+def _valid_block_capacities(counts: list[int], region_count: int) -> bool:
+    return len(counts) == region_count and all(
+        type(count) is int and count > 0 for count in counts
     )
-    return -(remote_tp_size // local_tp_size)
 
 
 def _expand_transfer_regions(
@@ -173,6 +194,7 @@ def _expand_transfer_regions(
     is_kv_layout_blocks_first: bool,
     group_indices: list[int] | None = None,
     split_kv_regions: list[bool] | None = None,
+    num_blocks_per_layer: list[int] | None = None,
 ) -> list[TransferRegion]:
     """Expand registered KV tensors into the regions transferred by Mooncake."""
     assert (
@@ -201,6 +223,11 @@ def _expand_transfer_regions(
         f"got split_kv_regions={len(split_kv_regions)}, "
         f"layer_names={len(layer_names)}."
     )
+    if num_blocks_per_layer is not None and not _valid_block_capacities(
+        num_blocks_per_layer, len(layer_names)
+    ):
+        raise ValueError("Mooncake requires one positive block capacity per region.")
+    capacities = num_blocks_per_layer or [None] * len(layer_names)
     regions: list[TransferRegion] = []
     for (
         base_addr,
@@ -210,6 +237,7 @@ def _expand_transfer_regions(
         layer_index,
         group_index,
         split_kv_region,
+        num_blocks,
     ) in zip(
         base_addrs,
         block_lens,
@@ -218,6 +246,7 @@ def _expand_transfer_regions(
         layer_indices,
         group_indices,
         split_kv_regions,
+        capacities,
     ):
         if base_addr <= 0:
             raise ValueError(
@@ -245,6 +274,7 @@ def _expand_transfer_regions(
                 block_len=block_len,
                 kv_block_len=kv_block_len,
                 group_index=group_index,
+                num_blocks=num_blocks,
             )
         )
         if split_kv_region:
@@ -256,14 +286,14 @@ def _expand_transfer_regions(
                     block_len=block_len,
                     kv_block_len=kv_block_len,
                     group_index=group_index,
+                    num_blocks=num_blocks,
                 )
             )
     return regions
 
 
 def _compute_sender_transfer_plan(
-    local_tp_rank: int,
-    local_tp_size: int,
+    transfer_topo: TransferTopology,
     remote_tp_rank: int,
     remote_tp_size: int,
     local_kv_block_len: int,
@@ -271,18 +301,18 @@ def _compute_sender_transfer_plan(
     producer_cache_replicated: bool,
 ) -> tuple[bool, int, int, int]:
     """Plan one producer-rank to one consumer-rank copy for heterogeneous TP."""
-    tp_ratio = _get_tp_ratio(local_tp_size, remote_tp_size)
+    tp_ratio = transfer_topo.tp_ratio(remote_tp_size)
 
     if tp_ratio == 1:
         return True, 0, 0, local_kv_block_len
 
     if tp_ratio > 0:
         if producer_cache_replicated:
-            return local_tp_rank % tp_ratio == 0, 0, 0, local_kv_block_len
+            return transfer_topo.tp_rank % tp_ratio == 0, 0, 0, local_kv_block_len
         return (
             True,
             0,
-            (local_tp_rank % tp_ratio) * local_kv_block_len,
+            (transfer_topo.tp_rank % tp_ratio) * local_kv_block_len,
             local_kv_block_len,
         )
 
@@ -317,7 +347,7 @@ def _can_coalesce_block_transfers(
 def _validate_asymmetric_region_lengths(
     local_regions: list[TransferRegion],
     remote_regions: list[TransferRegion],
-    local_tp_size: int,
+    transfer_topo: TransferTopology,
     remote_tp_size: int,
     producer_cache_replicated: bool,
 ) -> str | None:
@@ -334,9 +364,18 @@ def _validate_asymmetric_region_lengths(
         )
 
     if producer_cache_replicated:
+        for idx, (local_region, remote_region) in enumerate(
+            zip(local_regions, remote_regions)
+        ):
+            if local_region.kv_block_len != remote_region.kv_block_len:
+                return (
+                    "Mooncake replicated KV region length mismatch at "
+                    f"region {idx}: local={local_region.kv_block_len}, "
+                    f"remote={remote_region.kv_block_len}."
+                )
         return None
 
-    tp_ratio = _get_tp_ratio(local_tp_size, remote_tp_size)
+    tp_ratio = transfer_topo.tp_ratio(remote_tp_size)
     for idx, (local_region, remote_region) in enumerate(
         zip(local_regions, remote_regions)
     ):
@@ -465,11 +504,16 @@ def _validate_phase1_metadata(
     remote_layer_names: list[str],
     remote_layer_indices: list[int],
     remote_group_indices: list[int],
+    remote_num_blocks_per_layer: list[int] | None = None,
 ) -> str | None:
     """Validate the structural Mooncake wire contract.
 
     Layer occurrences are aligned separately by ``_align_transfer_regions``.
     """
+    if remote_num_blocks_per_layer is not None and not _valid_block_capacities(
+        remote_num_blocks_per_layer, len(remote_layer_names)
+    ):
+        return "Mooncake remote metadata requires one positive block capacity per region."
     local_lengths = {
         len(local_layer_names),
         len(local_layer_indices),
@@ -585,6 +629,7 @@ class MooncakeXferMetadata(
     registered_layer_names: list[str] = msgspec.field(default_factory=list)
     registered_layer_indices: list[int] = msgspec.field(default_factory=list)
     registered_group_indices: list[int] = msgspec.field(default_factory=list)
+    num_blocks_per_layer: list[int] = msgspec.field(default_factory=list)
 
 
 class MooncakeXferResponseStatus(IntEnum):
@@ -696,10 +741,10 @@ class MooncakeConnector(KVConnectorBase_V1, SupportsHMA):
         ):
             return None
         logger.info_once(
-            "HCU MooncakeConnector setting KV cache layout to HND for "
+            "HCU MooncakeConnector setting KV cache layout to LBHNC for "
             "heterogeneous TP-safe KV transfer."
         )
-        return "HND"
+        return "LBHNC"
 
     ############################################################
     # Scheduler Side Methods
@@ -749,10 +794,7 @@ class MooncakeConnector(KVConnectorBase_V1, SupportsHMA):
     ############################################################
     def register_kv_caches(
         self,
-        kv_caches: dict[
-            str,
-            torch.Tensor | tuple[torch.Tensor, torch.Tensor],
-        ],
+        kv_caches: dict[str, torch.Tensor],
     ):
         assert self.connector_worker is not None
         self.connector_worker.register_kv_caches(kv_caches)
@@ -1097,6 +1139,10 @@ class MooncakeConnectorWorker:
         engine_id: str,
         kv_cache_config: "KVCacheConfig",
     ):
+        if vllm_config.parallel_config.decode_context_parallel_size != 1:
+            raise NotImplementedError(
+                "HCU Mooncake P/D requires decode_context_parallel_size=1."
+            )
         if TransferEngine is None:
             logger.error("Mooncake is not available")
             raise RuntimeError("Mooncake is not available")
@@ -1166,6 +1212,7 @@ class MooncakeConnectorWorker:
         self.registered_layer_names: list[str] = []
         self.registered_layer_indices: list[int] = []
         self.registered_group_indices: list[int] = []
+        self.num_blocks_per_layer: list[int] = []
         self.seen_base_addresses: list[int] = []
 
         assert (parallel_config := vllm_config.parallel_config)
@@ -1174,12 +1221,18 @@ class MooncakeConnectorWorker:
         self.dp_rank = dp_local_rank if parallel_config.local_engines_only else dp_rank
         self.pp_size = vllm_config.parallel_config.pipeline_parallel_size
         self.pp_rank = get_pp_group().rank_in_group
+        self._pp_layer_range = (
+            _get_pp_stage_layer_range(
+                self.model_config.get_total_num_hidden_layers(),
+                self.pp_rank,
+                self.pp_size,
+            )
+            if self.pp_size > 1
+            else None
+        )
 
         self.kv_caches_base_addr: list[int] = []
-        self.device_kv_caches: dict[
-            str,
-            torch.Tensor | tuple[torch.Tensor, torch.Tensor],
-        ] = {}
+        self.device_kv_caches: dict[str, torch.Tensor] = {}
         self.reqs_need_send: dict[TransferId, SendBlockMeta] = {}
 
         # For kv_both, we will act both prefiller and decoder.
@@ -1221,6 +1274,7 @@ class MooncakeConnectorWorker:
 
         self.finished_sending_reqs: set[ReqId] = set()
         self.finished_recving_reqs: set[ReqId] = set()
+        self._kv_load_error: str | None = None
 
         self.xfer_stats = MooncakeKVConnectorStats()
 
@@ -1447,6 +1501,7 @@ class MooncakeConnectorWorker:
                 remote_layer_names=meta.registered_layer_names,
                 remote_layer_indices=meta.registered_layer_indices,
                 remote_group_indices=meta.registered_group_indices,
+                remote_num_blocks_per_layer=meta.num_blocks_per_layer,
             )
             if metadata_err is not None:
                 await reject_metadata(metadata_err)
@@ -1458,6 +1513,7 @@ class MooncakeConnectorWorker:
             self.registered_layer_names,
             self.registered_layer_indices,
             self.registered_group_indices,
+            num_blocks_per_layer=self.num_blocks_per_layer,
         )
         remote_regions = self._get_transfer_regions(
             meta.kv_caches_base_addr,
@@ -1466,6 +1522,7 @@ class MooncakeConnectorWorker:
             meta.registered_layer_names,
             meta.registered_layer_indices,
             meta.registered_group_indices,
+            num_blocks_per_layer=meta.num_blocks_per_layer,
         )
         local_regions, remote_regions, align_err = _align_transfer_regions(
             local_regions, remote_regions
@@ -1476,7 +1533,7 @@ class MooncakeConnectorWorker:
         validation_err = _validate_asymmetric_region_lengths(
             local_regions=local_regions,
             remote_regions=remote_regions,
-            local_tp_size=self.tp_size,
+            transfer_topo=self.transfer_topo,
             remote_tp_size=meta.remote_tp_size,
             producer_cache_replicated=self._producer_cache_is_replicated(),
         )
@@ -1778,6 +1835,35 @@ class MooncakeConnectorWorker:
                     err_msg = block_id_error
                 continue
 
+            bounds_error = None
+            for regions, groups, side in (
+                (local_regions, local_block_ids_by_group, "producer"),
+                (remote_regions, remote_block_ids_by_group, "consumer"),
+            ):
+                max_block_ids = [max(group, default=-1) for group in groups]
+                for region in regions:
+                    if not 0 <= region.group_index < len(groups):
+                        bounds_error = (
+                            f"Mooncake {side} region references a missing KV group."
+                        )
+                        break
+                    if (
+                        region.num_blocks is not None
+                        and max_block_ids[region.group_index] >= region.num_blocks
+                    ):
+                        bounds_error = (
+                            f"Mooncake {side} block ID exceeds region capacity "
+                            f"{region.num_blocks} for {region.layer_name}."
+                        )
+                        break
+                if bounds_error is not None:
+                    break
+            if bounds_error is not None:
+                err_reqs.append(d_req_id)
+                if err_msg is None:
+                    err_msg = bounds_error
+                continue
+
             for local_region, remote_region in zip(local_regions, remote_regions):
                 assert local_region.group_index == remote_region.group_index, (
                     "Aligned Mooncake transfer regions must belong to the same "
@@ -1910,10 +1996,7 @@ class MooncakeConnectorWorker:
 
     def register_kv_caches(
         self,
-        kv_caches: dict[
-            str,
-            torch.Tensor | tuple[torch.Tensor, torch.Tensor],
-        ],
+        kv_caches: dict[str, torch.Tensor],
     ):
         """Register the KV Cache data in mooncake."""
 
@@ -1928,8 +2011,9 @@ class MooncakeConnectorWorker:
         self.registered_layer_names = []
         self.registered_layer_indices = []
         self.registered_group_indices = []
+        self.num_blocks_per_layer = []
 
-        for layer_name, cache_or_caches in kv_caches.items():
+        for layer_name, cache in kv_caches.items():
             layer_index = extract_layer_index(layer_name)
             layer_spec = self._layer_specs.get(layer_name)
             if layer_spec is None:
@@ -1938,111 +2022,102 @@ class MooncakeConnectorWorker:
                     layer_name,
                 )
                 continue
-            if isinstance(cache_or_caches, tuple):
-                if len(cache_or_caches) != 2 or not all(
-                    isinstance(cache, torch.Tensor) for cache in cache_or_caches
-                ):
-                    raise ValueError(
-                        "Split Mooncake KV caches require a (key, value) "
-                        f"tensor tuple for {layer_name}."
-                    )
-                cache_list = list(cache_or_caches)
-            elif isinstance(layer_spec, MambaSpec):
-                conv, _ = cache_or_caches
-                cache_list = [conv]
-            else:
-                cache_list = list(
-                    self.transfer_topo.get_transfer_cache_regions(
-                        cache_or_caches,
-                        layer_spec,
-                    )
+            if self._pp_layer_range is not None:
+                start, end = self._pp_layer_range
+                # KVCacheConfig above declares this worker's actual cache ownership.
+                # Predictors may number draft layers after the backbone; those
+                # layers are local to the final PP stage, outside [start, end).
+                is_local_draft = (
+                    self.pp_rank == self.pp_size - 1
+                    and self.vllm_config.speculative_config is not None
+                    and layer_index >= end
                 )
-
-            logger.debug(
-                "registering layer %s with %d cache tensor(s)",
-                layer_name,
-                len(cache_list),
-            )
-
-            for cache in cache_list:
-                self._log_debug_cache_registration(layer_name, cache)
-                if cache.ndim == 0 or cache.shape[0] <= 0:
+                if not start <= layer_index < end and not is_local_draft:
                     raise ValueError(
-                        f"KV cache {layer_name} must contain at least one block."
+                        f"Mooncake layer {layer_name} is outside PP stage [{start}, {end})."
                     )
-                base_addr = cache.data_ptr()
-                block_len = cache.stride(0) * cache.element_size()
-                region_base_addresses.append(base_addr)
-
+            # v0.28 allocates logical [B, H, N, C] page views. K and V
+            # are part of C, not an extra axis that can be split in half.
+            # LBHNC keeps whole heads contiguous for heterogeneous TP copies.
+            if not isinstance(cache, torch.Tensor) or cache.ndim != 4:
+                raise ValueError(
+                    "HCU Mooncake on vLLM 0.28 requires a [B, H, N, C] "
+                    f"KV page tensor for {layer_name}."
+                )
+            self._log_debug_cache_registration(layer_name, cache)
+            if cache.shape[0] <= 0:
+                raise ValueError(
+                    f"KV cache {layer_name} must contain at least one block."
+                )
+            if not cache[0].is_contiguous():
+                raise ValueError(
+                    "HCU Mooncake requires canonical contiguous [H, N, C] "
+                    f"page contents; layer={layer_name}. Use KV cache layout LBHNC."
+                )
+            base_addr = cache.data_ptr()
+            block_len = cache.stride(0) * cache.element_size()
+            if isinstance(layer_spec, KpoolTailSpec):
+                # Match v0.28 Mooncake's raw-tail transfer payload.
+                kv_block_len = layer_spec.unpadded_page_size_bytes // 2
+            elif isinstance(layer_spec, AttentionSpec):
+                ratio = self._physical_blocks_per_logical_kv_block
+                if layer_spec.page_size_bytes % ratio:
+                    raise ValueError(
+                        "Mooncake KV page size must divide evenly into "
+                        f"physical kernel blocks for {layer_name}."
+                    )
+                if layer_spec.page_size_bytes // ratio > block_len:
+                    raise ValueError(
+                        f"Mooncake KV page exceeds its physical block stride: {layer_name}."
+                    )
                 if isinstance(layer_spec, (MLAAttentionSpec, SlidingWindowMLASpec)):
-                    kv_block_len = layer_spec.page_size_bytes
-                elif self.transfer_topo.virtually_split_kv_in_blocks and not isinstance(
-                    layer_spec, MambaSpec
-                ):
-                    dense_block_len = (
-                        cache.numel() * cache.element_size() // cache.shape[0]
-                    )
-                    if cache.ndim < 2 or cache.shape[1] != 2:
-                        raise ValueError(
-                            "Block-first combined KV cache must have a K/V "
-                            f"axis of size 2, got shape={tuple(cache.shape)}."
-                        )
-                    if dense_block_len % 2 != 0:
-                        raise ValueError(
-                            "Block-first combined KV payload must split evenly "
-                            "between K and V."
-                        )
-                    kv_block_len = dense_block_len // 2
-                    kv_plane_offset = cache.stride(1) * cache.element_size()
-                    if kv_plane_offset != kv_block_len:
-                        raise ValueError(
-                            "Mooncake requires dense K/V planes within each "
-                            f"block; offset={kv_plane_offset}, "
-                            f"payload={kv_block_len}."
-                        )
+                    kv_block_len = layer_spec.page_size_bytes // ratio
                 else:
-                    dense_bytes = cache.numel() * cache.element_size()
-                    if dense_bytes % cache.shape[0] != 0:
+                    if layer_spec.unpadded_page_size_bytes % ratio:
                         raise ValueError(
-                            f"KV cache payload for {layer_name} cannot be "
-                            f"divided across {cache.shape[0]} blocks."
+                            "Mooncake KV content must divide into kernel blocks."
                         )
-                    kv_block_len = dense_bytes // cache.shape[0]
-                payload_span = kv_block_len * (
-                    2 if self.transfer_topo.virtually_split_kv_in_blocks else 1
+                    kv_block_len = layer_spec.unpadded_page_size_bytes // ratio
+                    if kv_block_len != cache[0].numel() * cache.element_size():
+                        raise ValueError(
+                            "Mooncake KV page shape does not match its spec."
+                        )
+            else:
+                raise NotImplementedError(
+                    "HCU Mooncake supports attention KV pages only; "
+                    f"layer={layer_name}, spec={type(layer_spec).__name__}."
                 )
-                if payload_span > block_len:
-                    raise ValueError(
-                        "Mooncake KV payload exceeds its physical block stride: "
-                        f"layer={layer_name}, stride={block_len}, "
-                        f"payload_span={payload_span}."
-                    )
-                self.block_len_per_layer.append(block_len)
-                self.kv_block_len_per_layer.append(kv_block_len)
-                self.registered_layer_names.append(layer_name)
-                self.registered_layer_indices.append(layer_index)
-                self.registered_group_indices.append(
-                    self._layer_group_indices[layer_name]
+            # Keep padded page strides separate from head payload lengths.
+            # MLA copies its complete aligned page; sharded attention copies
+            # only content, so TP offsets never include trailing page padding.
+            if kv_block_len <= 0 or kv_block_len > block_len:
+                raise ValueError(
+                    "Mooncake KV payload exceeds its physical block stride: "
+                    f"layer={layer_name}, stride={block_len}, "
+                    f"payload_span={kv_block_len}."
                 )
-                storage = cache.untyped_storage()
-                storage_addr = storage.data_ptr()
-                storage_len = storage.nbytes()
-                view_offset = base_addr - storage_addr
-                view_end = (
-                    view_offset
-                    + (cache.shape[0] - 1) * block_len
-                    + payload_span
+            region_base_addresses.append(base_addr)
+            self.block_len_per_layer.append(block_len)
+            self.kv_block_len_per_layer.append(kv_block_len)
+            self.registered_layer_names.append(layer_name)
+            self.registered_layer_indices.append(layer_index)
+            self.registered_group_indices.append(self._layer_group_indices[layer_name])
+            self.num_blocks_per_layer.append(cache.shape[0])
+            storage = cache.untyped_storage()
+            storage_addr = storage.data_ptr()
+            storage_len = storage.nbytes()
+            view_offset = base_addr - storage_addr
+            view_end = view_offset + (cache.shape[0] - 1) * block_len + kv_block_len
+            if view_offset < 0 or view_end > storage_len:
+                raise ValueError(
+                    "KV cache view exceeds its registered storage: "
+                    f"layer={layer_name}, view_offset={view_offset}, "
+                    f"view_end={view_end}, storage_length={storage_len}."
                 )
-                if view_offset < 0 or view_end > storage_len:
-                    raise ValueError(
-                        "KV cache view exceeds its registered storage: "
-                        f"layer={layer_name}, view_offset={view_offset}, "
-                        f"view_end={view_end}, storage_length={storage_len}."
-                    )
-                if storage_addr not in seen_storage_ptrs:
-                    seen_storage_ptrs.add(storage_addr)
-                    kv_data_ptrs.append(storage_addr)
-                    kv_data_lens.append(storage_len)
+            if storage_addr not in seen_storage_ptrs:
+                seen_storage_ptrs.add(storage_addr)
+                kv_data_ptrs.append(storage_addr)
+                kv_data_lens.append(storage_len)
 
         self.kv_caches_base_addr = region_base_addresses
         self.seen_base_addresses = kv_data_ptrs
@@ -2072,6 +2147,11 @@ class MooncakeConnectorWorker:
         ready_event.wait()  # Wait for listener ZMQ socket to be ready.
 
     async def fetch_finished_recving_reqs(self) -> set[ReqId]:
+        if self._kv_load_error is not None:
+            # Propagate on the worker thread via get_finished(), rather than
+            # raising in an unobserved background asyncio task. HMA recompute
+            # is unsupported by v0.28, so never mark invalid KV as ready.
+            raise RuntimeError(self._kv_load_error)
         finished_recving_reqs = self.finished_recving_reqs
         self.finished_recving_reqs = set()
         return finished_recving_reqs
@@ -2165,6 +2245,7 @@ class MooncakeConnectorWorker:
             registered_layer_names=self.registered_layer_names,
             registered_layer_indices=self.registered_layer_indices,
             registered_group_indices=self.registered_group_indices,
+            num_blocks_per_layer=self.num_blocks_per_layer,
         )
 
         encoded_data = self._encoder.encode(metadata)
@@ -2222,6 +2303,13 @@ class MooncakeConnectorWorker:
         ok_reqs: list[ReqId] = response.ok_reqs or []
         err_reqs: list[ReqId] = response.err_reqs or []
 
+        if err_reqs:
+            self._kv_load_error = (
+                f"Mooncake KV receive failed for {err_reqs}: {response.err_msg}"
+            )
+            logger.error("%s", self._kv_load_error)
+            return
+
         for req_id in dict.fromkeys((*ok_reqs, *err_reqs)):
             pull_meta = pull_metas[req_id]
             # No race because we are in async loop.
@@ -2237,20 +2325,10 @@ class MooncakeConnectorWorker:
         if ok_reqs:
             logger.debug("pulling kv_caches for %s finished", ok_reqs)
 
-        if err_reqs:
-            logger.error(
-                "pulling kv_caches for %s failed: %s",
-                err_reqs,
-                response.err_msg,
-            )
-
     def _fail_pull_metas(
         self, pull_metas: dict[ReqId, PullReqMeta], err_msg: str
     ) -> None:
-        """Finish one failed receive task so scheduler-owned blocks can progress."""
-        for pull_meta in pull_metas.values():
-            if pull_meta.pull_tasks_count <= 0:
-                pull_meta.pull_tasks_count = 1
+        """Report a fatal receive error without releasing invalid KV for decoding."""
         self.process_pulling_result(
             MooncakeXferResponse(
                 status=MooncakeXferResponseStatus.ERROR,
@@ -2412,19 +2490,11 @@ class MooncakeConnectorWorker:
         layer_names: list[str],
         layer_indices: list[int],
         group_indices: list[int] | None = None,
+        num_blocks_per_layer: list[int] | None = None,
     ) -> list[TransferRegion]:
         if not group_indices:
             group_indices = [
                 self._layer_group_indices.get(layer_name, 0)
-                for layer_name in layer_names
-            ]
-        split_kv_regions = None
-        if self.transfer_topo.virtually_split_kv_in_blocks:
-            split_kv_regions = [
-                not isinstance(
-                    self._layer_specs[layer_name],
-                    (MambaSpec, MLAAttentionSpec, SlidingWindowMLASpec),
-                )
                 for layer_name in layer_names
             ]
         return _expand_transfer_regions(
@@ -2433,9 +2503,10 @@ class MooncakeConnectorWorker:
             kv_block_lens=kv_block_lens,
             layer_names=layer_names,
             layer_indices=layer_indices,
-            is_kv_layout_blocks_first=self.transfer_topo.virtually_split_kv_in_blocks,
+            # One transfer region per v0.28 page, including both K and V.
+            is_kv_layout_blocks_first=False,
             group_indices=group_indices,
-            split_kv_regions=split_kv_regions,
+            num_blocks_per_layer=num_blocks_per_layer,
         )
 
     def _get_sender_transfer_plan(
@@ -2446,8 +2517,7 @@ class MooncakeConnectorWorker:
         remote_tp_size: int,
     ) -> tuple[bool, int, int, int]:
         return _compute_sender_transfer_plan(
-            local_tp_rank=self.tp_rank,
-            local_tp_size=self.tp_size,
+            transfer_topo=self.transfer_topo,
             remote_tp_rank=remote_tp_rank,
             remote_tp_size=remote_tp_size,
             local_kv_block_len=local_kv_block_len,
@@ -2506,6 +2576,8 @@ def _async_loop(loop: asyncio.AbstractEventLoop):
 
 def should_launch_bootstrap_server(vllm_config: VllmConfig) -> bool:
     assert (parallel_config := vllm_config.parallel_config)
+    if vllm_config.kv_transfer_config.kv_role not in ("kv_producer", "kv_both"):
+        return False
     # Only the TP=0, PP=0 worker of the designated engine should launch it.
     if get_tensor_model_parallel_rank() != 0:
         return False
