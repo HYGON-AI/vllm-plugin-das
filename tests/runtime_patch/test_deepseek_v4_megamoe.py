@@ -52,31 +52,20 @@ def int4(monkeypatch):
                      "vllm_hcu/model_executor/layers/fused_moe/hcu_int4_megamoe.py")
 
 
-def test_int4_pack5_matches_expanded_int8_permutation_and_scales(int4):
-    # Independent signed-nibble reference: use every possible byte, including
-    # negative int8 bytes. Verify unpacking commutes with PACK5 permutation.
+@pytest.mark.parametrize("dtype", [torch.uint8, torch.int8])
+def test_int4_preparation_retains_weights_and_scales(int4, dtype):
     e, h, i = 2, 256, 256
-    w1 = torch.arange(e * 2 * i * h // 2).to(torch.uint8).reshape(e, 2*i, h//2)
-    w2 = torch.arange(e * h * i // 2).to(torch.uint8).reshape(e, h, i//2)
+    w1 = torch.arange(e * 2 * i * h // 2).to(dtype).reshape(e, 2*i, h//2)
+    w2 = torch.arange(e * h * i // 2).to(dtype).reshape(e, h, i//2)
     s1, s2 = torch.rand(e, 2*i, 1), torch.rand(e, h, 1)
     l1, l2 = int4.transform_int4_weights_for_mega_moe_normal(
-        w1, w2, l1_scale=s1, l2_scale=s2)
-
-    def expand(w):
-        nibbles = torch.stack((w.to(torch.int16) >> 4, w.to(torch.int16) & 15), -1)
-        return ((nibbles ^ 8) - 8).to(torch.int8).reshape(*w.shape[:-1], w.shape[-1]*2)
-
-    for w, scale, packed in ((w1, s1, l1), (w2, s2, l2)):
-        values, scales = packed["normal_int4"]
-        raw = expand(w)
-        _, n, k = raw.shape
-        reference = raw.reshape(e, n//256, 16, 16, k//64, 4, 16)
-        reference = reference.permute(0, 4, 1, 2, 5, 3, 6).contiguous().reshape(e, n*k)
-        torch.testing.assert_close(expand(values), reference)
+        w1, w2, l1_scale=s1, l2_scale=s2, prepack=False)
+    for weight, scale, prepared in ((w1, s1, l1), (w2, s2, l2)):
+        values, scales = prepared["raw_int4"]
+        assert values is weight  # No duplicate resident weights or shuffle.
         torch.testing.assert_close(scales, scale.squeeze(-1)*16)
-        assert values.numel() == w.numel()
         assert scales.dtype == torch.float32
-    _, true_scales = int4._pack(w1, s1, 1.0)["normal_int4"]
+    _, true_scales = int4._pack(w1, s1, 1.0, prepack=False)["raw_int4"]
     torch.testing.assert_close(true_scales, s1.squeeze(-1))
 
 
@@ -351,7 +340,8 @@ def test_config_rejects_fused_shared_experts(runtime):
         runtime.validate_config(config, moe, layer)
 
 
-def test_int4_adapter_reuses_scratch_across_layers_and_separates_streams(int4, monkeypatch):
+@pytest.mark.parametrize("layout", ["raw_int4", "normal_int4"])
+def test_int4_adapter_reuses_scratch_across_layers_and_separates_streams(int4, monkeypatch, layout):
     fake = ModuleType("megamoe")
     calls = []
     def run(y, l1, l2, buf, **kwargs):
@@ -366,10 +356,11 @@ def test_int4_adapter_reuses_scratch_across_layers_and_separates_streams(int4, m
         raw = p.to(torch.int16)
         values = torch.stack((raw >> 4, raw & 15), -1)
         out.copy_(((values ^ 8)-8).to(torch.int8).reshape(out.shape))
+    monkeypatch.setattr(int4, "unpack_raw_int4_pack5_out", unpack)
     monkeypatch.setattr(int4, "unpack_signed_int4_out", unpack)
     scale = torch.ones(1, 8)
-    l1 = {"normal_int4": (torch.full((1, 8), 0x8F, dtype=torch.uint8), scale)}
-    l2 = {"normal_int4": (torch.full((1, 4), 0x17, dtype=torch.uint8), scale)}
+    l1 = {layout: (torch.full((1, 1, 8), 0x8F, dtype=torch.uint8), scale)}
+    l2 = {layout: (torch.full((1, 1, 4), 0x17, dtype=torch.uint8), scale)}
     buf = NS(quant_mode="int8")
     y = torch.empty(2, 4)
     int4.int4_w4a8_mega_moe(y, l1, l2, buf, capacity_num_tokens=2)
@@ -384,19 +375,6 @@ def test_int4_adapter_reuses_scratch_across_layers_and_separates_streams(int4, m
         int4.int4_w4a8_mega_moe(y, l1, l2, buf, graph=True)
     with pytest.raises(NotImplementedError, match="normal"):
         int4.int4_w4a8_mega_moe(y, l1, l2, buf, megamoe_backend="ll")
-
-
-def test_signed_int4_triton_unpack_on_hcu(int4):
-    try:
-        torch.cuda.init()
-    except RuntimeError as exc:
-        pytest.skip(f"requires an HCU to execute the unpack kernel: {exc}")
-    packed = torch.arange(256).to(torch.uint8).to("cuda")
-    out = torch.empty(512, dtype=torch.int8, device="cuda")
-    int4.unpack_signed_int4_out(packed, out)
-    raw = torch.arange(256, dtype=torch.int16)
-    reference = ((torch.stack((raw >> 4, raw & 15), -1) ^ 8)-8).to(torch.int8)
-    torch.testing.assert_close(out.cpu(), reference.flatten())
 
 
 def test_selects_slimquant_before_fallback_construction(runtime, monkeypatch):
@@ -562,19 +540,20 @@ def test_old_int8_factory_is_rejected_before_allocation(int4, monkeypatch):
     fake.SymmBuffer = SymmBuffer
     fake.get_symm_buffer_for_mega_moe = lambda group: None
     monkeypatch.setitem(sys.modules, "megamoe", fake)
-    with pytest.raises(RuntimeError, match="factory"):
+    with pytest.raises(RuntimeError, match="get_symm_buffer_for_mega_moe"):
         int4.validate_megamoe_int8_runtime()
 
 
-def test_raw_int4_pack5_triton_on_hcu(int4):
+@pytest.mark.parametrize("dtype", [torch.uint8, torch.int8])
+def test_raw_int4_pack5_triton_on_hcu(int4, dtype):
     try:
         torch.cuda.init()
     except RuntimeError as exc:
         pytest.skip(f"requires HCU to execute the unpack kernel: {exc}")
     e, n, k = 2, 256, 256
-    raw = torch.arange(e*n*k//2).to(torch.uint8).reshape(e, n, k//2)
+    raw = torch.arange(e*n*k//2).to(dtype).reshape(e, n, k//2)
     cpu = raw.to(torch.int16)
-    values = ((torch.stack((cpu >> 4, cpu & 15), -1) ^ 8)-8).to(torch.int8)
+    values = ((torch.stack(((cpu >> 4) & 15, cpu & 15), -1) ^ 8)-8).to(torch.int8)
     reference = values.reshape(e, n//256, 16, 16, k//64, 4, 16)
     reference = reference.permute(0, 4, 1, 2, 5, 3, 6).contiguous().reshape(e, n*k)
     out = torch.empty((e, n*k), dtype=torch.int8, device="cuda")
@@ -721,3 +700,44 @@ def test_graph_warmup_rejects_unsafe_capacity_before_launch(runtime, monkeypatch
     monkeypatch.setitem(sys.modules, "megamoe", ModuleType("megamoe"))
     with pytest.raises(ValueError, match=match):
         method._warmup_graph(layer)
+
+
+def test_int4_pack5_matches_expanded_int8_permutation_and_scales(int4):
+    # Independent signed-nibble reference: use every possible byte, including
+    # negative int8 bytes. Verify unpacking commutes with PACK5 permutation.
+    e, h, i = 2, 256, 256
+    w1 = torch.arange(e * 2 * i * h // 2).to(torch.uint8).reshape(e, 2*i, h//2)
+    w2 = torch.arange(e * h * i // 2).to(torch.uint8).reshape(e, h, i//2)
+    s1, s2 = torch.rand(e, 2*i, 1), torch.rand(e, h, 1)
+    l1, l2 = int4.transform_int4_weights_for_mega_moe_normal(
+        w1, w2, l1_scale=s1, l2_scale=s2)
+
+    def expand(w):
+        nibbles = torch.stack((w.to(torch.int16) >> 4, w.to(torch.int16) & 15), -1)
+        return ((nibbles ^ 8) - 8).to(torch.int8).reshape(*w.shape[:-1], w.shape[-1]*2)
+
+    for w, scale, packed in ((w1, s1, l1), (w2, s2, l2)):
+        values, scales = packed["normal_int4"]
+        raw = expand(w)
+        _, n, k = raw.shape
+        reference = raw.reshape(e, n//256, 16, 16, k//64, 4, 16)
+        reference = reference.permute(0, 4, 1, 2, 5, 3, 6).contiguous().reshape(e, n*k)
+        torch.testing.assert_close(expand(values), reference)
+        torch.testing.assert_close(scales, scale.squeeze(-1)*16)
+        assert values.numel() == w.numel()
+        assert scales.dtype == torch.float32
+    _, true_scales = int4._pack(w1, s1, 1.0)["normal_int4"]
+    torch.testing.assert_close(true_scales, s1.squeeze(-1))
+
+
+def test_signed_int4_triton_unpack_on_hcu(int4):
+    try:
+        torch.cuda.init()
+    except RuntimeError as exc:
+        pytest.skip(f"requires an HCU to execute the unpack kernel: {exc}")
+    packed = torch.arange(256).to(torch.uint8).to("cuda")
+    out = torch.empty(512, dtype=torch.int8, device="cuda")
+    int4.unpack_signed_int4_out(packed, out)
+    raw = torch.arange(256, dtype=torch.int16)
+    reference = ((torch.stack((raw >> 4, raw & 15), -1) ^ 8)-8).to(torch.int8)
+    torch.testing.assert_close(out.cpu(), reference.flatten())

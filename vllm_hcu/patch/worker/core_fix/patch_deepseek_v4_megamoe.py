@@ -42,8 +42,7 @@ def apply_to_module(module: ModuleType) -> bool:
 
     @functools.wraps(original)
     def hcu_get_quant_method(self, prefix, quant_config, moe_config):
-        requested = getattr(moe_config, "moe_backend", None) == MEGA_MOE_BACKEND
-        if requested:
+        if getattr(moe_config, "moe_backend", None) == MEGA_MOE_BACKEND:
             from vllm_hcu.model_executor.layers.fused_moe.megamoe_runtime import (
                 select_method,
             )
@@ -51,12 +50,11 @@ def apply_to_module(module: ModuleType) -> bool:
             method = select_method(self, quant_config, moe_config)
             if method is not None:
                 return method
-            if requested:
-                # vLLM's own deep_gemm_mega_moe path is NVIDIA-only.
-                raise ValueError(
-                    f"moe_backend={MEGA_MOE_BACKEND!r} on HCU supports "
-                    "DeepSeek-V4 target/DSpark models only"
-                )
+            # vLLM's own deep_gemm_mega_moe path is NVIDIA-only.
+            raise ValueError(
+                f"moe_backend={MEGA_MOE_BACKEND!r} on HCU supports "
+                "DeepSeek-V4 target/DSpark models only"
+            )
         return original(self, prefix, quant_config, moe_config)
 
     setattr(hcu_get_quant_method, _MARKER, True)

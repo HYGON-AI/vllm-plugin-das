@@ -30,24 +30,15 @@ def validate_megamoe_int8_runtime() -> None:
             "The installed MegaMoE wheel lacks the W8A8-I8 runtime required "
             "by vLLM HCU's W4A8 compatibility adapter: " + ", ".join(missing)
         )
-    try:
-        parameters = inspect.signature(megamoe.SymmBuffer).parameters
-    except (TypeError, ValueError):
-        parameters = {}
-    if parameters and "quant_mode" not in parameters and not any(
-        p.kind == inspect.Parameter.VAR_KEYWORD for p in parameters.values()
-    ):
-        raise RuntimeError(
-            "The installed MegaMoE SymmBuffer does not support quant_mode='int8'"
-        )
-    try:
-        factory_parameters = inspect.signature(megamoe.get_symm_buffer_for_mega_moe).parameters
-    except (TypeError, ValueError):
-        factory_parameters = {}
-    if factory_parameters and "quant_mode" not in factory_parameters and not any(
-        p.kind == inspect.Parameter.VAR_KEYWORD for p in factory_parameters.values()
-    ):
-        raise RuntimeError("MegaMoE buffer factory does not support quant_mode='int8'")
+    for name in ("SymmBuffer", "get_symm_buffer_for_mega_moe"):
+        try:
+            parameters = inspect.signature(getattr(megamoe, name)).parameters
+        except (TypeError, ValueError):
+            continue  # Some extension APIs do not expose a Python signature.
+        if parameters and "quant_mode" not in parameters and not any(
+            p.kind == inspect.Parameter.VAR_KEYWORD for p in parameters.values()
+        ):
+            raise RuntimeError(f"MegaMoE {name} does not support quant_mode='int8'")
 
 
 @triton.jit

@@ -247,10 +247,6 @@ class HcuMegaMoEMethod(FusedMoEMethodBase):
         return self._mode
 
     @property
-    def is_monolithic(self):
-        return False
-
-    @property
     def topk_indices_dtype(self):
         return torch.int64
 

@@ -38,9 +38,7 @@ class DSparkDeepseekV4Model(_dspark.DSparkDeepseekV4Model):
                     topk_indices_buffer=topk_indices_buffer,
                     aux_stream_list=None,
                 )
-                # Keep the upstream DSpark NVIDIA MegaMoE branch disabled.
-                # HCU MegaMoE is selected inside the regular vLLM RoutedExperts
-                # quantization method, including for these draft layers.
+                # AMD/HCU uses regular FusedMoE rather than NVIDIA MegaMoE.
                 self.ffn.use_mega_moe = False
 
         # Reproduce the small upstream constructor with the HCU decoder class
