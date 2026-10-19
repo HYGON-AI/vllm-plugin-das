@@ -11,6 +11,7 @@ import weakref
 from collections.abc import Mapping
 from types import ModuleType
 
+from vllm_hcu.deepseek_v4_runtime import dspark_mooncake_pd_use_low_latency
 from vllm_hcu.patch.config import HcuFeatureConfig, get_hcu_config
 
 from ._common import PatchCompatibilityError, apply_once, load_exact_module
@@ -28,20 +29,47 @@ _HCU_CUDAGRAPH_UNSAFE_SPLITTING_OPS = (
 _BOUND_CONFIGS_LOCK = threading.RLock()
 _BOUND_CONFIGS: dict[
     int,
-    tuple[weakref.ReferenceType[object], HcuFeatureConfig],
+    tuple[
+        weakref.ReferenceType[object],
+        HcuFeatureConfig,
+        bool | None,
+        int,
+    ],
 ] = {}
 
 
-def _bound_hcu_config(compilation_config: object) -> HcuFeatureConfig | None:
+def _bound_policy(
+    compilation_config: object,
+) -> tuple[HcuFeatureConfig, bool | None, int] | None:
     with _BOUND_CONFIGS_LOCK:
         entry = _BOUND_CONFIGS.get(id(compilation_config))
         if entry is None:
             return None
-        reference, feature_config = entry
+        reference, feature_config, fixed_use_low_latency, parallel_size = entry
         if reference() is compilation_config:
-            return feature_config
+            return feature_config, fixed_use_low_latency, parallel_size
         _BOUND_CONFIGS.pop(id(compilation_config), None)
         return None
+
+
+def _bound_hcu_config(compilation_config: object) -> HcuFeatureConfig | None:
+    policy = _bound_policy(compilation_config)
+    return None if policy is None else policy[0]
+
+
+def _parallel_size(vllm_config: object) -> int:
+    if isinstance(vllm_config, Mapping):
+        parallel_config = vllm_config.get("parallel_config")
+    else:
+        parallel_config = getattr(vllm_config, "parallel_config", None)
+    return max(
+        int(getattr(parallel_config, name, 1) or 1)
+        for name in (
+            "data_parallel_size",
+            "prefill_context_parallel_size",
+            "decode_context_parallel_size",
+        )
+    )
 
 
 def bind_hcu_config(vllm_config: object) -> HcuFeatureConfig:
@@ -76,8 +104,104 @@ def bind_hcu_config(vllm_config: object) -> HcuFeatureConfig:
             "CompilationConfig must support weak references for HCU binding"
         ) from exc
     with _BOUND_CONFIGS_LOCK:
-        _BOUND_CONFIGS[key] = (reference, feature_config)
+        _BOUND_CONFIGS[key] = (
+            reference,
+            feature_config,
+            dspark_mooncake_pd_use_low_latency(vllm_config),
+            _parallel_size(vllm_config),
+        )
     return feature_config
+
+
+def _required_cudagraph_modes(cudagraph_mode_type: object) -> tuple[object, ...]:
+    names = (
+        "NONE",
+        "FULL",
+        "PIECEWISE",
+        "FULL_AND_PIECEWISE",
+        "FULL_DECODE_ONLY",
+    )
+    modes = tuple(getattr(cudagraph_mode_type, name, None) for name in names)
+    if any(mode is None for mode in modes):
+        raise PatchCompatibilityError(
+            f"required HCU patch target {TARGET_MODULE}.CUDAGraphMode is missing "
+            + ", ".join(names)
+        )
+    return modes
+
+
+def _normalize_deepep_auto_cudagraph_mode(
+    current_mode: object,
+    *,
+    feature_config: HcuFeatureConfig,
+    fixed_use_low_latency: bool | None,
+    parallel_size: int,
+    modes: tuple[object, ...],
+) -> tuple[object, str | None]:
+    if not feature_config.deepep_auto or parallel_size <= 1:
+        return current_mode, None
+
+    none, full, piecewise, full_and_piecewise, full_decode_only = modes
+    if fixed_use_low_latency is False and current_mode is not none:
+        return none, "fixed_ht"
+    if current_mode is full or current_mode is full_and_piecewise:
+        return full_decode_only, "decode_only"
+    if current_mode is piecewise:
+        return none, "piecewise"
+    return current_mode, None
+
+
+def _log_deepep_auto_graph_policy(reason: str | None) -> None:
+    if reason is None:
+        return
+    from vllm.logger import init_logger
+
+    messages = {
+        "fixed_ht": (
+            "DeepEP auto Mooncake producer uses NONE because fixed HT "
+            "dispatch does not support CUDA Graph capture on HCU."
+        ),
+        "piecewise": (
+            "DeepEP auto uses NONE for mixed/prefill execution because HT "
+            "PIECEWISE capture is unsupported on HCU."
+        ),
+        "decode_only": (
+            "DeepEP auto uses FULL_DECODE_ONLY so only LL decode execution "
+            "is captured on HCU."
+        ),
+    }
+    init_logger(__name__).info_once(messages[reason])
+
+
+def normalize_bound_deepep_auto_cudagraph_mode(vllm_config: object) -> object:
+    """Reapply the bound DeepEP-auto graph policy after platform rewrites."""
+
+    if isinstance(vllm_config, Mapping):
+        compilation_config = vllm_config.get("compilation_config")
+    else:
+        compilation_config = getattr(vllm_config, "compilation_config", None)
+    if compilation_config is None:
+        raise PatchCompatibilityError("VllmConfig.compilation_config is missing")
+    policy = _bound_policy(compilation_config)
+    if policy is None:
+        bind_hcu_config(vllm_config)
+        policy = _bound_policy(compilation_config)
+    if policy is None:
+        raise PatchCompatibilityError("HCU CompilationConfig binding is missing")
+
+    from vllm.config.compilation import CUDAGraphMode
+
+    feature_config, fixed_use_low_latency, parallel_size = policy
+    effective_mode, reason = _normalize_deepep_auto_cudagraph_mode(
+        getattr(compilation_config, "cudagraph_mode", None),
+        feature_config=feature_config,
+        fixed_use_low_latency=fixed_use_low_latency,
+        parallel_size=parallel_size,
+        modes=_required_cudagraph_modes(CUDAGraphMode),
+    )
+    compilation_config.cudagraph_mode = effective_mode
+    _log_deepep_auto_graph_policy(reason)
+    return effective_mode
 
 
 def apply_to_module(module: ModuleType) -> bool:
@@ -122,22 +246,7 @@ def apply_to_module(module: ModuleType) -> bool:
             f"signature {splitting_signature}"
         )
     cudagraph_mode_type = getattr(compilation_module, "CUDAGraphMode", None)
-    cudagraph_none = getattr(cudagraph_mode_type, "NONE", None)
-    cudagraph_full_and_piecewise = getattr(
-        cudagraph_mode_type, "FULL_AND_PIECEWISE", None
-    )
-    cudagraph_full_decode_only = getattr(
-        cudagraph_mode_type, "FULL_DECODE_ONLY", None
-    )
-    if (
-        cudagraph_none is None
-        or cudagraph_full_and_piecewise is None
-        or cudagraph_full_decode_only is None
-    ):
-        raise PatchCompatibilityError(
-            f"required HCU patch target {TARGET_MODULE}.CUDAGraphMode is missing "
-            "NONE, FULL_AND_PIECEWISE, or FULL_DECODE_ONLY"
-        )
+    cudagraph_modes = _required_cudagraph_modes(cudagraph_mode_type)
 
     @functools.wraps(original)
     def hcu_adjust_cudagraph_sizes(
@@ -178,23 +287,18 @@ def apply_to_module(module: ModuleType) -> bool:
         all2all_backend: str,
         data_parallel_size: int = 1,
     ):
-        feature_config = _bound_hcu_config(self) or HcuFeatureConfig()
-        if (
-            feature_config.deepep_auto
-            and data_parallel_size > 1
-            and getattr(self, "cudagraph_mode", None)
-            is cudagraph_full_and_piecewise
-        ):
-            # DeepEP HT spins in Buffer.dispatch while vLLM warms the first
-            # PIECEWISE graph on the supported ROCm stack. Preserve FULL
-            # decode graphs while keeping prefill/mixed execution eager.
-            self.cudagraph_mode = cudagraph_full_decode_only
-            from vllm.logger import init_logger
-
-            init_logger(__name__).info_once(
-                "DeepEP auto uses FULL_DECODE_ONLY because DeepEP HT "
-                "PIECEWISE capture is unsupported on HCU."
-            )
+        policy = _bound_policy(self)
+        if policy is None:
+            policy = HcuFeatureConfig(), None, 1
+        feature_config, fixed_use_low_latency, bound_parallel_size = policy
+        self.cudagraph_mode, reason = _normalize_deepep_auto_cudagraph_mode(
+            getattr(self, "cudagraph_mode", None),
+            feature_config=feature_config,
+            fixed_use_low_latency=fixed_use_low_latency,
+            parallel_size=max(data_parallel_size, bound_parallel_size),
+            modes=cudagraph_modes,
+        )
+        _log_deepep_auto_graph_policy(reason)
 
         result = original_set_splitting_ops(
             self,
@@ -274,4 +378,5 @@ __all__ = [
     "apply",
     "apply_to_module",
     "bind_hcu_config",
+    "normalize_bound_deepep_auto_cudagraph_mode",
 ]

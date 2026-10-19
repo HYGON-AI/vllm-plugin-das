@@ -56,24 +56,31 @@ violation to fix.
 
 At `--gpu-memory-utilization 0.90`, a separate 6.08 GiB contiguous DeepGEMM HT
 workspace allocation also failed because only 4.82 GiB was free. Hardware
-validation will use a memory limit that reserves this dynamic workspace. That
-capacity issue is not part of the phase fix.
+validation will use a memory limit that reserves this dynamic workspace. A
+later review also found that the profiling reserve did not scale with DeepEP
+dispatcher fan-in: it pre-expanded scheduler tokens by top-k even though the
+contiguous expert already applies top-k, while omitting the number of senders.
+The capacity fix therefore reserves received token rows as
+`max_num_tokens * num_dispatchers` and leaves top-k/alignment expansion to the
+contiguous expert. This prevents lock-time under-allocation; it does not solve
+general device-memory fragmentation.
 
 ## Execution Contract
 
 `deepep_auto` will bind its DeepEP/DeepGEMM delegate to the runtime graph mode.
 This makes the selected Python delegate part of the graph cache contract rather
-than mutable state hidden from capture.
+than mutable state hidden from capture. Configured `PIECEWISE` execution is not
+an allowed effective mode for multi-rank auto operation on HCU.
 
 | Runtime mode | Workload contract | DeepEP mode | DeepGEMM layout |
 |---|---|---|---|
-| `FULL` | Uniform pure decode | LL | masked |
-| `PIECEWISE` | Prefill or mixed batch | HT | contiguous |
-| `NONE` | Uncaptured shape or eager fallback | DP-synchronized phase | LL for all-active decode, otherwise HT |
+| `FULL` | Uniform pure decode only | LL | masked |
+| `NONE` | Uncaptured shape or eager fallback | fixed P/D role or DP-synchronized phase | fixed P uses HT, fixed D uses LL, dynamic uses LL for all-active decode and HT otherwise |
 
-For `FULL` and `PIECEWISE`, the DP graph-mode synchronization performed by the
-vLLM runner is authoritative. No additional phase collective is needed: all
-ranks already agreed on the same runtime mode before model execution.
+For `FULL`, the DP graph-mode synchronization performed by the vLLM runner is
+authoritative. No additional phase collective is needed: all ranks already
+agreed on pure decode before model execution. A fixed Mooncake producer never
+enters this mode because its delegate is always HT.
 
 For `NONE`, the current conservative DP phase collective remains. Empty ranks
 are neutral, every active rank must report pure decode before LL is selected,
@@ -81,33 +88,32 @@ and any prefill, mixed, or missing phase evidence selects HT.
 
 ## CUDA Graph Policy
 
-The configured `FULL_AND_PIECEWISE` mode will no longer be globally disabled
-for `deepep_auto`.
+The configured graph mode is normalized to a fail-closed pair for multi-rank
+`deepep_auto`: `FULL_DECODE_ONLY` or `NONE`.
 
-- FULL capture is decode-only and must capture the LL delegate.
-- PIECEWISE capture must capture the HT delegate. DeepEP HT communication
-  remains outside captured graph segments; surrounding compilable computation
-  may use the piecewise graph.
-- Replay must select the same delegate captured for that graph mode.
+- `FULL` and `FULL_AND_PIECEWISE` narrow to `FULL_DECODE_ONLY`.
+- Explicit `PIECEWISE` narrows to `NONE`.
+- A fixed Mooncake P/HT role always narrows every graph-enabled mode, including
+  `FULL_DECODE_ONLY`, to `NONE`.
+- A fixed Mooncake D/LL role may retain `FULL_DECODE_ONLY`; mixed/prefill FULL
+  and PIECEWISE modes are not retained.
+- PCP/DCP may rewrite a full mode to `PIECEWISE` after the compilation callback,
+  so the same normalization policy runs again on the platform's final mode.
 - An uncaptured decode shape uses eager `NONE` plus synchronized LL rather than
-  replaying a PIECEWISE HT graph under LL mutable state.
-
-The first hardware gate will test PIECEWISE HT capture explicitly. If the
-installed vLLM/ROCm stack still exhibits the upstream compile-cache limitation
-for HT piecewise graphs, the implementation must fail closed to phase-aware
-`prefill/mixed=NONE` and `decode=FULL`. It must not fall back to disabling
-decode graphs globally, and it must not claim PIECEWISE prefill support.
+  replaying a mixed/prefill graph under LL mutable state.
 
 ### Hardware-gated effective policy
 
 The 2026-10-18 DP4/EP4 gate reached the first PIECEWISE capture warmup and
 remained at 0/51. All four GPUs were idle while every worker stack was inside
 `deep_ep.buffer.Buffer.dispatch` through the HT delegate. The effective policy
-for DP `deepep_auto` is therefore `FULL_DECODE_ONLY`: prefill and mixed batches
-run eager `NONE` with DP-synchronized HT/contiguous experts, while uniform
-decode retains FULL graphs with LL/masked experts. Explicit user `NONE`,
-single-rank execution, fixed DeepEP modes, and unrelated all-to-all backends
-are unchanged.
+for dynamic DP `deepep_auto` is therefore `FULL_DECODE_ONLY`: prefill and mixed
+batches run eager `NONE` with DP-synchronized HT/contiguous experts, while
+uniform decode retains FULL graphs with LL/masked experts. This statement does
+not cover the fixed Mooncake producer: its role predicate selects HT before
+graph-mode selection, so its effective mode is always `NONE`. Explicit user
+`NONE`, invalid single-rank/non-PCP configurations, fixed DeepEP backends, and
+unrelated all-to-all backends are unchanged.
 
 ## Model Runner V2 Phase Propagation
 
@@ -128,9 +134,9 @@ shape.
 ## Target and MTP Behavior
 
 The target model and native MTP draft share the same graph-mode contract.
-During capture, FULL binds both target and draft MoE layers to LL, while
-PIECEWISE binds both to HT. During eager execution, both observe the same
-invocation phase and DP synchronization order.
+During capture, decode-only FULL binds both target and draft MoE layers to LL.
+Prefill/mixed execution is eager `NONE`; both layers observe the same invocation
+phase and DP synchronization order.
 
 No change is made to the number of speculative tokens, rejection sampling,
 KV-cache dtype, or Qwen attention selection.
@@ -142,7 +148,8 @@ In scope:
 - Qwen4Exp causal and conditional-generation architecture wrappers;
 - SlimQuant W4A8 DeepEP-auto factory selection;
 - Model Runner V2 real, dummy, target, and MTP phase propagation;
-- phase-aware FULL/PIECEWISE/NONE graph selection;
+- phase-aware decode-only FULL/NONE graph selection;
+- dispatcher-aware HT workspace capacity reservation;
 - DP4/EP4 functional, accuracy, and performance validation.
 
 Out of scope:
@@ -151,8 +158,8 @@ Out of scope:
 - enabling fixed `deepep_high_throughput` or `deepep_low_latency` for this
   checkpoint;
 - changing AITER/AGRS behavior from MR #247;
-- solving DeepGEMM workspace fragmentation or changing KV-cache allocation
-  policy;
+- solving general DeepGEMM workspace fragmentation or changing KV-cache
+  allocation policy;
 - enabling DBO/ubatching for `deepep_auto`;
 - claiming that DeepEP outperforms AITER/AGRS for this model.
 
@@ -180,10 +187,16 @@ Software tests will use red-green TDD and cover:
 1. Qwen4Exp factory admission for both wrapper architecture names.
 2. V2 runtime dummy decode propagation inside the invocation scope.
 3. Restoration of dummy phase state after success and exceptions.
-4. `FULL -> LL`, `PIECEWISE -> HT`, and `NONE -> synchronized dynamic mode`.
+4. `FULL -> LL`, configured `PIECEWISE -> NONE`, fixed P/HT graph disablement,
+   and `NONE -> synchronized dynamic mode`.
 5. Empty DP ranks being neutral in eager phase synchronization.
 6. Target and MTP capture using the same phase contract.
 7. Feature-off and existing DeepSeek/GLM behavior remaining unchanged.
+8. DP16 receive-bound workspace sizing (18,432 aligned rows for the reduced
+   `T=64`, top-k 10 case) plus a DP4 control proving top-k is applied once.
+
+The DP16 case is an exact capacity-contract/unit test, not a distributed
+multi-HCU execution or performance result.
 
 Hardware validation will run on DP4/EP4 with sufficient free memory for the HT
 workspace:
@@ -197,4 +210,4 @@ workspace:
 
 The MR will be stacked on MR #247 and include the exact server command,
 benchmark command, accuracy result, relevant log paths, performance comparison,
-and any PIECEWISE-to-NONE fallback disclosed explicitly.
+and the effective PIECEWISE-to-NONE policy disclosed explicitly.

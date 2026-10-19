@@ -969,19 +969,19 @@ class DeepEPAutoDeepGemmExperts(mk.FusedMoEExpertsModular):
         if use_low_latency:
             return workspace13, workspace2, output
 
-        # DP engine profiling exercises one rank's synthetic prefill at a
-        # time. DeepEP HT runtime can instead receive the routed rows from all
-        # simultaneously active ranks. Reserve one local scheduler batch of
-        # routes (tokens * top-k) so the shared workspace is large enough
-        # before vLLM locks it after profiling. Keep the output at the real M:
-        # only the two temporary workspaces need the conservative bound.
-        max_local_routes = int(self.moe_config.max_num_tokens) * int(
-            self.moe_config.experts_per_token
+        # DP engine profiling exercises one sender's synthetic prefill at a
+        # time. DeepEP HT can instead receive token rows from every dispatcher
+        # on one rank. Pass that receive bound to the contiguous expert; its
+        # workspace calculation expands rows by top-k and expert alignment.
+        # Keep output at the real M because only temporary workspaces need the
+        # conservative bound before vLLM locks the shared workspace.
+        max_received_tokens = int(self.moe_config.max_num_tokens) * int(
+            self.num_dispatchers
         )
-        if max_local_routes <= M:
+        if max_received_tokens <= M:
             return workspace13, workspace2, output
         reserve13, reserve2, _ = current.workspace_shapes(
-            max_local_routes,
+            max_received_tokens,
             N,
             K,
             topk,

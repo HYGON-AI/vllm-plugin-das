@@ -26,4 +26,30 @@ def is_dspark_enabled(vllm_config: object | None) -> bool:
     return getattr(speculative_config, "method", None) == "dspark"
 
 
-__all__ = ["is_deepseek_v4", "is_dspark_enabled", "model_architectures"]
+def dspark_mooncake_pd_use_low_latency(
+    vllm_config: object | None,
+) -> bool | None:
+    """Return the fixed DeepEP layout for a supported Mooncake P/D role."""
+
+    if not is_dspark_enabled(vllm_config):
+        return None
+    kv_transfer_config = getattr(vllm_config, "kv_transfer_config", None)
+    if getattr(kv_transfer_config, "kv_connector", None) != "MooncakeConnector":
+        return None
+    if not is_deepseek_v4(vllm_config):
+        return None
+
+    role = getattr(kv_transfer_config, "kv_role", None)
+    if role == "kv_producer":
+        return False
+    if role == "kv_consumer":
+        return True
+    return None
+
+
+__all__ = [
+    "dspark_mooncake_pd_use_low_latency",
+    "is_deepseek_v4",
+    "is_dspark_enabled",
+    "model_architectures",
+]
