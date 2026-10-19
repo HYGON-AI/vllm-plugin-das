@@ -452,6 +452,12 @@ class SlimQuantW4A8Int8AiterMoEMethod(FusedMoEMethodBase):
         )
         if not uses_deepep_auto and installed_weight_generation == weight_generation:
             self.moe_quant_config = self.get_fused_moe_quant_config(layer)
+            if getattr(self.moe, "moe_backend", "auto") == "triton":
+                from vllm_hcu.model_executor.layers.quantization.compressed_tensors_moe_runtime import (
+                    prepare_boltops_w4a8_moe,
+                )
+
+                prepare_boltops_w4a8_moe(self, layer)
             config = getattr(layer, "_hcu_slimquant_post_load_aiter_config", None)
             self._supports_int8_allgatherv_input = config is not None
             if config is not None:
@@ -578,10 +584,10 @@ class SlimQuantW4A8Int8AiterMoEMethod(FusedMoEMethodBase):
             return
         if getattr(self.moe, "moe_backend", "auto") == "triton":
             from vllm_hcu.model_executor.layers.quantization.compressed_tensors_moe_runtime import (
-                prepare_vllm_w4a8_moe,
+                prepare_boltops_w4a8_moe,
             )
 
-            prepare_vllm_w4a8_moe(self, layer)
+            prepare_boltops_w4a8_moe(self, layer)
             layer._hcu_slimquant_post_load_aiter_config = None
         else:
             from vllm_hcu.model_executor.layers.quantization.compressed_tensors_moe_runtime import (

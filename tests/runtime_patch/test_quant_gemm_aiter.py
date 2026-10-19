@@ -5776,8 +5776,78 @@ def test_slimquant_w4a8_tp_aiter_keeps_selected_canonical_owner(
     )
 
 
+def test_slimquant_w4a8_resolves_public_boltops_fused_moe_api():
+    """Packed W4A8 must not bind BoltOps' private Triton implementation."""
+    from boltops import fused_moe
+
+    resolver = compressed_tensors_moe_runtime._boltops_w4a8_fused_experts
+    cache_clear = getattr(resolver, "cache_clear", None)
+    if cache_clear is not None:
+        cache_clear()
+    try:
+        assert resolver() is fused_moe.fused_experts
+    finally:
+        if cache_clear is not None:
+            cache_clear()
+
+
+@pytest.mark.parametrize("abi_change", ("kind", "default", "uninspectable"))
+def test_slimquant_w4a8_rejects_subtle_public_boltops_abi_drift(
+    monkeypatch: pytest.MonkeyPatch,
+    abi_change: str,
+):
+    """Packed W4A8 must fail closed on every audited call-contract change."""
+    from boltops.fused_moe import fused_experts
+
+    resolver = compressed_tensors_moe_runtime._boltops_w4a8_fused_experts
+    resolver.cache_clear()
+    if abi_change == "uninspectable":
+
+        class Kernel:
+            @property
+            def __signature__(self):
+                raise TypeError("opaque callable")
+
+            def __call__(self, *args, **kwargs):
+                return args, kwargs
+
+        kernel = Kernel()
+    else:
+        expected = inspect.signature(fused_experts)
+        parameters = list(expected.parameters.values())
+        index = next(
+            index
+            for index, parameter in enumerate(parameters)
+            if parameter.name == ("hidden_states" if abi_change == "kind" else "activation")
+        )
+        parameters[index] = parameters[index].replace(
+            kind=(
+                inspect.Parameter.POSITIONAL_ONLY
+                if abi_change == "kind"
+                else parameters[index].kind
+            ),
+            default=("silu" if abi_change == "default" else parameters[index].default),
+        )
+
+        def kernel(*args, **kwargs):
+            return args, kwargs
+
+        kernel.__signature__ = expected.replace(parameters=parameters)
+
+    module = _module("boltops.fused_moe", fused_experts=kernel)
+    monkeypatch.setitem(sys.modules, "boltops.fused_moe", module)
+    try:
+        with pytest.raises(
+            compressed_tensors_moe_runtime.HcuCompressedTensorsMoeError,
+            match="fused_experts signature",
+        ):
+            resolver()
+    finally:
+        resolver.cache_clear()
+
+
 @pytest.mark.hcu
-def test_slimquant_w4a8_explicit_triton_prepares_only_vllm_weights(
+def test_slimquant_w4a8_explicit_triton_keeps_packed_weights(
     monkeypatch: pytest.MonkeyPatch,
 ):
     from vllm_hcu.model_executor.layers.quantization import slimquant_w4a8
@@ -5820,19 +5890,24 @@ def test_slimquant_w4a8_explicit_triton_prepares_only_vllm_weights(
         ),
         w13_input_scale=None,
         w2_input_scale=None,
+        swiglu_limit=0.0,
     )
     assert method.moe_quant_config is None
-    packed_w13 = layer.w13_weight.detach().clone()
-    packed_w2 = layer.w2_weight.detach().clone()
+    packed_w13 = layer.w13_weight
+    packed_w2 = layer.w2_weight
+    expected_w13 = packed_w13.detach().clone()
+    expected_w2 = packed_w2.detach().clone()
 
     method.process_weights_after_loading(layer)
 
-    assert layer.w13_weight.shape == (1, 4, 4)
-    assert layer.w2_weight.shape == (1, 4, 2)
-    assert layer.w13_weight._hcu_vllm_w4a8_unpacked is True
-    assert layer.w2_weight._hcu_vllm_w4a8_unpacked is True
-    assert not hasattr(layer.w13_weight, "_hcu_vllm_w4a8_fallback_weights")
-    assert not hasattr(layer.w13_weight, "_hcu_aiter_moe_m1_supported")
+    assert layer.w13_weight is packed_w13
+    assert layer.w2_weight is packed_w2
+    assert layer.w13_weight.shape == (1, 4, 2)
+    assert layer.w2_weight.shape == (1, 4, 1)
+    assert not hasattr(layer.w13_weight, "_hcu_vllm_w4a8_unpacked")
+    assert not hasattr(layer.w2_weight, "_hcu_vllm_w4a8_unpacked")
+    torch.testing.assert_close(layer.w13_weight, expected_w13)
+    torch.testing.assert_close(layer.w2_weight, expected_w2)
     assert method.moe_quant_config is not None
     torch.testing.assert_close(
         method.moe_quant_config.w1_scale,
@@ -5843,15 +5918,18 @@ def test_slimquant_w4a8_explicit_triton_prepares_only_vllm_weights(
         layer.w2_weight_scale,
     )
 
-    from vllm.model_executor.layers.fused_moe import fused_moe
-
     kernel_calls: list[dict[str, object]] = []
 
-    def fused_experts_impl(hidden_states, *_args, **kwargs):
-        kernel_calls.append(kwargs)
+    def fused_experts_impl(hidden_states, w1, w2, *_args, **kwargs):
+        kernel_calls.append({"w1": w1, "w2": w2, **kwargs})
         return hidden_states + 1
 
-    monkeypatch.setattr(fused_moe, "fused_experts_impl", fused_experts_impl)
+    monkeypatch.setattr(
+        compressed_tensors_moe_runtime,
+        "_boltops_w4a8_fused_experts",
+        lambda: fused_experts_impl,
+        raising=False,
+    )
     hidden_states = torch.zeros((2, 4), dtype=torch.float16)
     result = method.apply(
         layer,
@@ -5863,12 +5941,17 @@ def test_slimquant_w4a8_explicit_triton_prepares_only_vllm_weights(
     )
 
     torch.testing.assert_close(result, hidden_states + 1)
+    assert kernel_calls[0]["w1"] is packed_w13
+    assert kernel_calls[0]["w2"] is packed_w2
     torch.testing.assert_close(
         kernel_calls[0]["w1_scale"], method.moe_quant_config.w1_scale * 16.0
     )
     torch.testing.assert_close(
         kernel_calls[0]["w2_scale"], method.moe_quant_config.w2_scale * 16.0
     )
+    assert kernel_calls[0]["use_int4_w4a8"] is True
+    assert kernel_calls[0]["use_int8_w8a8"] is False
+    assert kernel_calls[0]["per_channel_quant"] is True
 
     installed_w13 = layer.w13_weight
     installed_w2 = layer.w2_weight
@@ -5877,6 +5960,40 @@ def test_slimquant_w4a8_explicit_triton_prepares_only_vllm_weights(
     assert layer.w13_weight is installed_w13
     assert layer.w2_weight is installed_w2
     assert method.moe_quant_config is installed_quant_config
+
+    # Layerwise checkpoint reload restores the original layer Parameter storage
+    # after post-load, while the rebuilt quant config can still reference its
+    # temporary tensors.  A following kernel-format reload updates only the
+    # restored layer Parameters.  BoltOps must read that canonical storage in
+    # the forward graph rather than either stale object.
+    method.moe_quant_config = SimpleNamespace(
+        w1_scale=torch.full((1, 4, 1), 99.0),
+        w2_scale=torch.full((1, 4, 1), 99.0),
+        a1_scale=None,
+        a2_scale=None,
+    )
+    with torch.no_grad():
+        layer.w13_weight_scale.fill_(2.0)
+        layer.w2_weight_scale.fill_(3.0)
+    method.apply(
+        layer,
+        hidden_states,
+        torch.ones((2, 1), dtype=torch.float32),
+        torch.zeros((2, 1), dtype=torch.int64),
+        None,
+        None,
+    )
+    torch.testing.assert_close(
+        kernel_calls[1]["w1_scale"],
+        torch.full((1, 4, 1), 32.0),
+    )
+    torch.testing.assert_close(
+        kernel_calls[1]["w2_scale"],
+        torch.full((1, 4, 1), 48.0),
+    )
+    with torch.no_grad():
+        layer.w13_weight_scale.fill_(1.0)
+        layer.w2_weight_scale.fill_(1.0)
 
     with torch.no_grad():
         layer.w13_weight_scale.add_(1.0)
@@ -5894,9 +6011,11 @@ def test_slimquant_w4a8_explicit_triton_prepares_only_vllm_weights(
         scale_updated_quant_config.w2_scale,
         torch.full((1, 4, 1), 3.0),
     )
+    assert not hasattr(method, "_hcu_boltops_w4a8_w1_scale")
+    assert not hasattr(method, "_hcu_boltops_w4a8_w2_scale")
 
-    layer.w13_weight = torch.nn.Parameter(packed_w13, requires_grad=False)
-    layer.w2_weight = torch.nn.Parameter(packed_w2, requires_grad=False)
+    layer.w13_weight = torch.nn.Parameter(expected_w13, requires_grad=False)
+    layer.w2_weight = torch.nn.Parameter(expected_w2, requires_grad=False)
     layer.w13_weight_scale = torch.nn.Parameter(
         torch.full((1, 4, 1), 2.0), requires_grad=False
     )
@@ -5914,6 +6033,76 @@ def test_slimquant_w4a8_explicit_triton_prepares_only_vllm_weights(
         method.moe_quant_config.w2_scale,
         torch.full((1, 4, 1), 3.0),
     )
+
+
+@pytest.mark.hcu
+def test_slimquant_w4a8_scale_reload_reaches_existing_graph(
+    monkeypatch: pytest.MonkeyPatch,
+):
+    """A captured forward must reread layer-owned scales after in-place reload."""
+    if not torch.cuda.is_available():
+        pytest.skip("requires a visible HCU for graph replay")
+
+    def fused_experts_impl(hidden_states, _w1, _w2, *_args, **kwargs):
+        return (
+            hidden_states
+            + kwargs["w1_scale"][0, 0, 0]
+            + kwargs["w2_scale"][0, 0, 0]
+        )
+
+    monkeypatch.setattr(
+        compressed_tensors_moe_runtime,
+        "_boltops_w4a8_fused_experts",
+        lambda: fused_experts_impl,
+    )
+    method = SimpleNamespace(
+        moe=SimpleNamespace(
+            hidden_dim=4,
+            activation=SimpleNamespace(value="silu"),
+            num_experts=1,
+        ),
+        moe_quant_config=SimpleNamespace(a1_scale=None, a2_scale=None),
+    )
+    layer = SimpleNamespace(
+        w13_weight=torch.zeros((1, 4, 2), dtype=torch.int8, device="cuda"),
+        w2_weight=torch.zeros((1, 4, 1), dtype=torch.int8, device="cuda"),
+        w13_weight_scale=torch.ones((1, 4, 1), device="cuda"),
+        w2_weight_scale=torch.ones((1, 4, 1), device="cuda"),
+        global_num_experts=1,
+        _expert_map=None,
+        expert_mask=None,
+        swiglu_limit=0.0,
+    )
+    hidden_states = torch.zeros((1, 4), dtype=torch.float16, device="cuda")
+    topk_weights = torch.ones((1, 1), dtype=torch.float32, device="cuda")
+    topk_ids = torch.zeros((1, 1), dtype=torch.int32, device="cuda")
+
+    stream = torch.cuda.Stream()
+    stream.wait_stream(torch.cuda.current_stream())
+    with torch.cuda.stream(stream):
+        for _ in range(3):
+            compressed_tensors_moe_runtime.apply_vllm_w4a8_moe(
+                method, layer, hidden_states, topk_weights, topk_ids
+            )
+    torch.cuda.current_stream().wait_stream(stream)
+    graph = torch.cuda.CUDAGraph()
+    with torch.cuda.graph(graph):
+        output = compressed_tensors_moe_runtime.apply_vllm_w4a8_moe(
+            method, layer, hidden_states, topk_weights, topk_ids
+        )
+    graph.replay()
+    torch.cuda.synchronize()
+    torch.testing.assert_close(output, torch.full_like(output, 32.0))
+
+    layer.w13_weight_scale.fill_(2.0)
+    layer.w2_weight_scale.fill_(3.0)
+    graph.replay()
+    torch.cuda.synchronize()
+    torch.testing.assert_close(output, torch.full_like(output, 80.0))
+    eager = compressed_tensors_moe_runtime.apply_vllm_w4a8_moe(
+        method, layer, hidden_states, topk_weights, topk_ids
+    )
+    torch.testing.assert_close(output, eager)
 
 
 @pytest.mark.hcu
@@ -6332,7 +6521,6 @@ def test_slimquant_w4a8_actual_m_no_config_uses_cached_selection_and_triton(
 def test_slimquant_w4a8_explicit_triton_runtime_never_selects_aiter(
     monkeypatch: pytest.MonkeyPatch,
 ):
-    from vllm.model_executor.layers.fused_moe import fused_moe
     from vllm_hcu.model_executor.layers.quantization import slimquant_w4a8
 
     monkeypatch.setattr(
@@ -6344,9 +6532,9 @@ def test_slimquant_w4a8_explicit_triton_runtime_never_selects_aiter(
     )
     expected = torch.full((2, 4), 3.0, dtype=torch.float16)
     monkeypatch.setattr(
-        fused_moe,
-        "fused_experts_impl",
-        lambda *args, **kwargs: expected,
+        compressed_tensors_moe_runtime,
+        "_boltops_w4a8_fused_experts",
+        lambda: lambda *args, **kwargs: expected,
     )
     method = slimquant_w4a8.SlimQuantW4A8Int8AiterMoEMethod(
         quant_config=object(),
@@ -6366,6 +6554,8 @@ def test_slimquant_w4a8_explicit_triton_runtime_never_selects_aiter(
     layer = SimpleNamespace(
         w13_weight=torch.zeros((1, 4, 2), dtype=torch.int8),
         w2_weight=torch.zeros((1, 4, 1), dtype=torch.int8),
+        w13_weight_scale=torch.ones((1, 4, 1)),
+        w2_weight_scale=torch.ones((1, 4, 1)),
         global_num_experts=1,
         _expert_map=None,
         expert_mask=None,

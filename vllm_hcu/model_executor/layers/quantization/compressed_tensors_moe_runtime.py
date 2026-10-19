@@ -10,7 +10,9 @@ that no vLLM source file needs to be rewritten.
 from __future__ import annotations
 
 from collections.abc import Callable
+import functools
 import math
+from inspect import Parameter, signature
 from typing import Any
 
 import torch
@@ -791,6 +793,95 @@ def _slimquant_w4a8_metadata(
     return w1, w2, logical_k, activation
 
 
+_BOLTOPS_W4A8_FUSED_EXPERTS_CONTRACT = (
+    ("hidden_states", Parameter.empty),
+    ("w1", Parameter.empty),
+    ("w2", Parameter.empty),
+    ("topk_weights", Parameter.empty),
+    ("topk_ids", Parameter.empty),
+    ("inplace", False),
+    ("activation", None),
+    ("b1", None),
+    ("b2", None),
+    ("is_gated", None),
+    ("apply_router_weight_on_input", False),
+    ("use_fp8_w8a8", False),
+    ("use_int8_w8a8", False),
+    ("use_int8_w8a16", False),
+    ("use_int4_w4a16", False),
+    ("use_int4_w4a8", False),
+    ("per_channel_quant", False),
+    ("global_num_experts", -1),
+    ("expert_map", None),
+    ("w1_scale", None),
+    ("w2_scale", None),
+    ("w1_zp", None),
+    ("w2_zp", None),
+    ("a1_scale", None),
+    ("a2_scale", None),
+    ("block_shape", None),
+    ("output_dtype", None),
+    ("no_combine", False),
+    ("routed_scaling_factor", 1.0),
+    ("gemm1_alpha", None),
+    ("gemm1_limit", None),
+    ("activation_situ_beta", None),
+    ("activation_situ_linear_beta", None),
+)
+
+
+@functools.lru_cache
+def _boltops_w4a8_fused_experts() -> Callable[..., torch.Tensor]:
+    """Resolve the packed W4A8 Triton entry point exposed by BoltOps."""
+
+    try:
+        from boltops.fused_moe import fused_experts
+    except (ImportError, OSError) as exc:
+        raise HcuCompressedTensorsMoeError(
+            "SlimQuant packed W4A8 Triton requires BoltOps fused MoE"
+        ) from exc
+    if not callable(fused_experts):
+        raise HcuCompressedTensorsMoeError(
+            "BoltOps exposes no callable packed W4A8 fused MoE"
+        )
+    try:
+        parameters = signature(fused_experts).parameters
+    except (TypeError, ValueError) as exc:
+        raise HcuCompressedTensorsMoeError(
+            "boltops.fused_moe.fused_experts signature drifted from the "
+            "audited BoltOps 0.1.0 packed W4A8 contract"
+        ) from exc
+    actual_contract = tuple(
+        (name, parameter.kind, parameter.default)
+        for name, parameter in parameters.items()
+    )
+    expected_contract = tuple(
+        (name, Parameter.POSITIONAL_OR_KEYWORD, default)
+        for name, default in _BOLTOPS_W4A8_FUSED_EXPERTS_CONTRACT
+    )
+    if actual_contract != expected_contract:
+        raise HcuCompressedTensorsMoeError(
+            "boltops.fused_moe.fused_experts signature drifted from the "
+            "audited BoltOps 0.1.0 packed W4A8 contract"
+        )
+    return fused_experts
+
+
+def prepare_boltops_w4a8_moe(
+    method: object,
+    layer: object,
+) -> tuple[torch.Tensor, torch.Tensor]:
+    """Validate explicit Triton without replacing canonical packed weights."""
+
+    w1, w2, _, activation = _slimquant_w4a8_metadata(method, layer)
+    if activation != "silu":
+        raise HcuCompressedTensorsMoeError(
+            "Kimi-K3 SiTU requires the AITER W4A8 MoE implementation"
+        )
+    _boltops_w4a8_fused_experts()
+    return w1, w2
+
+
 def prewarm_aiter_w4a8_moe(
     method: object,
     layer: object,
@@ -1116,15 +1207,75 @@ def apply_vllm_w4a8_moe(
     topk_weights: torch.Tensor,
     topk_ids: torch.Tensor,
 ) -> torch.Tensor:
-    """Run SlimQuant W4A8 directly with vLLM Triton, without AITER probes."""
+    """Run packed SlimQuant W4A8 through BoltOps Triton without AITER."""
 
-    return apply_aiter_w4a8_moe(
-        method,
+    if (
+        hidden_states.ndim != 2
+        or topk_weights.ndim != 2
+        or topk_ids.ndim != 2
+        or topk_weights.shape != topk_ids.shape
+        or topk_ids.shape[0] != hidden_states.shape[0]
+    ):
+        raise HcuCompressedTensorsMoeError(
+            "SlimQuant W4A8 requires matching rank-2 hidden and top-k tensors"
+        )
+    w1, w2, logical_k, activation = _slimquant_w4a8_metadata(method, layer)
+    if int(hidden_states.shape[1]) != logical_k:
+        raise HcuCompressedTensorsMoeError(
+            "SlimQuant W4A8 hidden states do not match the weight logical K"
+        )
+    if activation != "silu":
+        raise HcuCompressedTensorsMoeError(
+            "Kimi-K3 SiTU requires the AITER W4A8 MoE implementation"
+        )
+    swiglu_limit = getattr(layer, "swiglu_limit", None) or None
+    if swiglu_limit is not None:
+        raise HcuCompressedTensorsMoeError(
+            "SlimQuant packed W4A8 Triton does not support swiglu_limit"
+        )
+
+    quant_config = getattr(method, "moe_quant_config", None)
+    # SlimQuant stores INT4 values in the high-nibble INT8 scale convention.
+    # Read the layer-owned Parameters restored by layerwise reload and keep the
+    # compensation in the forward graph.  This lets eager kernel-format reload
+    # and CUDA/HIP Graph replay consume the current canonical scale storage.
+    w1_scale = _required_tensor(layer, "w13_weight_scale") * 16.0
+    w2_scale = _required_tensor(layer, "w2_weight_scale") * 16.0
+    global_num_experts = getattr(
         layer,
+        "global_num_experts",
+        getattr(getattr(method, "moe", None), "num_experts", int(w1.shape[0])),
+    )
+    native_expert_map = getattr(
+        layer,
+        "_expert_map",
+        getattr(layer, "expert_map", None),
+    )
+    fused_experts_impl = _boltops_w4a8_fused_experts()
+    return fused_experts_impl(
         hidden_states,
-        topk_weights,
-        topk_ids,
-        allow_aiter=False,
+        w1,
+        w2,
+        topk_weights.to(torch.float32),
+        topk_ids.to(torch.int32),
+        output_dtype=hidden_states.dtype,
+        inplace=False,
+        activation=activation,
+        apply_router_weight_on_input=False,
+        use_fp8_w8a8=False,
+        use_int8_w8a8=False,
+        use_int8_w8a16=False,
+        use_int4_w4a16=False,
+        use_int4_w4a8=True,
+        per_channel_quant=True,
+        global_num_experts=int(global_num_experts),
+        expert_map=native_expert_map,
+        w1_scale=w1_scale,
+        w2_scale=w2_scale,
+        a1_scale=getattr(quant_config, "a1_scale", None),
+        a2_scale=getattr(quant_config, "a2_scale", None),
+        block_shape=None,
+        routed_scaling_factor=1.0,
     )
 
 
@@ -1699,6 +1850,7 @@ __all__ = [
     "install_aiter_moe_scale_layout",
     "mark_aiter_moe_native_layout",
     "prewarm_aiter_w4a8_moe",
+    "prepare_boltops_w4a8_moe",
     "prepare_vllm_w4a8_moe",
     "process_dpsk_deepgemm_weights",
 ]
