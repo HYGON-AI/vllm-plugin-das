@@ -2,8 +2,18 @@
 import pytest
 import torch
 
-pytestmark = pytest.mark.skipif(not torch.cuda.is_available(),
-                                reason="torch.mm(out_dtype=) needs a GPU")
+
+def _cuda_usable():
+    try:
+        torch.empty(1, device="cuda")
+        return True
+    except RuntimeError:
+        return False
+
+
+pytestmark = pytest.mark.skipif(
+    not _cuda_usable(), reason="torch.mm(out_dtype=) needs a working GPU"
+)
 
 from vllm_hcu.patch.worker.core_fix import patch_deepseek_v4_attention as patch
 

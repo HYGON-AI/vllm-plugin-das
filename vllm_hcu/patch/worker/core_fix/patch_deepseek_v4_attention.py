@@ -5,13 +5,13 @@
 from __future__ import annotations
 
 import functools
-import os
 from collections.abc import Callable
 from types import ModuleType
 from typing import Any
 
 import torch
 
+from vllm_hcu.platforms import envs as henvs
 from vllm_hcu.platforms.hcu import on_gfx938
 from vllm_hcu.utils.bf16_fp32_gemm import linear_bf16_fp32
 
@@ -66,8 +66,17 @@ def _compressor_nt_weight(weight: torch.Tensor) -> torch.Tensor | None:
 def _compressor_mm(hidden_states: torch.Tensor, weight: torch.Tensor) -> torch.Tensor:
     """Multiply either HCU NN ``[in, out]`` or upstream ``[out, in]`` weights."""
     nn_layout = weight.shape[0] == hidden_states.shape[-1]
-    if (os.environ.get("VLLM_HCU_COMPRESSOR_GEMM_BACKEND", "blaslt") == "blaslt"
-            and weight.is_cuda and weight.dtype == torch.bfloat16):
+    backend = henvs.VLLM_HCU_COMPRESSOR_GEMM_BACKEND.lower()
+    if backend not in ("blaslt", "torch"):
+        raise ValueError(
+            "VLLM_HCU_COMPRESSOR_GEMM_BACKEND must be 'blaslt' or 'torch', "
+            f"got {backend!r}"
+        )
+    if (
+        backend == "blaslt"
+        and weight.is_cuda
+        and weight.dtype == torch.bfloat16
+    ):
         # Reuse the shared BF16 -> FP32 BLASLt NT GEMM (with its own
         # switch and torch fallback); the NN layout's torch.mm is slow.
         nt = _compressor_nt_weight(weight) if nn_layout else weight

@@ -5,6 +5,7 @@
 
 import functools
 import os
+from collections import defaultdict
 from contextlib import nullcontext
 
 import numpy as np
@@ -69,6 +70,57 @@ def record_pp_spec_draft_index_stream(
     return True
 
 
+def _kv_block_owners(scheduler_output) -> dict[int, int]:
+    """Map unambiguous newly scheduled block ids to their cache group."""
+    owners: dict[int, int] = {}
+    ambiguous: set[int] = set()
+
+    def record(groups) -> None:
+        if groups is None:
+            return
+        for group_id, block_ids in enumerate(groups):
+            for block_id in block_ids:
+                previous = owners.get(block_id)
+                if previous is not None and previous != group_id:
+                    owners.pop(block_id)
+                    ambiguous.add(block_id)
+                elif block_id not in ambiguous:
+                    owners[block_id] = group_id
+
+    for request in scheduler_output.scheduled_new_reqs:
+        record(request.block_ids)
+    for groups in scheduler_output.scheduled_cached_reqs.new_block_ids:
+        record(groups)
+    return owners
+
+
+class _GroupKVBlockZeroer:
+    """Dispatch upstream KV zeroing to the block's owning cache group."""
+
+    def __init__(self, fallback, zeroers: dict[int, object]):
+        self.fallback = fallback
+        self.zeroers = zeroers
+        self.owners: dict[int, int] | None = None
+
+    def zero_block_ids(self, block_ids) -> None:
+        if not henvs.VLLM_HCU_KV_ZERO_BY_GROUP or self.owners is None:
+            self.fallback.zero_block_ids(block_ids)
+            return
+
+        buckets: dict[int, list[int]] = defaultdict(list)
+        unowned = []
+        for block_id in block_ids:
+            group_id = self.owners.get(block_id)
+            if group_id in self.zeroers:
+                buckets[group_id].append(block_id)
+            else:
+                unowned.append(block_id)
+        for group_id, ids in buckets.items():
+            self.zeroers[group_id].zero_block_ids(ids)
+        if unowned:
+            self.fallback.zero_block_ids(unowned)
+
+
 class HcuGPUModelRunnerV2(GPUModelRunner):
     """HCU compatibility adapter around upstream v0.25.1 Model Runner V2."""
 
@@ -83,6 +135,42 @@ class HcuGPUModelRunnerV2(GPUModelRunner):
         self._hsl_enabled = False
         self._hsl_pending = None
         self._hsl_batch = None
+
+    def _init_kv_zero_meta(self) -> None:
+        """Build one upstream zeroer per cache group for mixed KV caches."""
+        super()._init_kv_zero_meta()
+        fallback = self.kv_block_zeroer
+        if fallback is None or fallback._meta is None:
+            return
+
+        zeroer_cls = type(fallback)
+        zeroers = {}
+        by_group = defaultdict(list)
+        for groups in self.attn_groups:
+            for group in groups:
+                by_group[group.kv_cache_group_id].append(group)
+        for group_id, groups in by_group.items():
+            zeroer = zeroer_cls(
+                self.device,
+                groups,
+                self.kernel_block_sizes,
+                self.compilation_config.static_forward_context,
+                self.kv_cache_config.num_blocks,
+            )
+            if zeroer._meta is not None:
+                zeroers[group_id] = zeroer
+        if zeroers:
+            self.kv_block_zeroer = _GroupKVBlockZeroer(fallback, zeroers)
+
+    def update_requests(self, scheduler_output) -> None:
+        zeroer = self.kv_block_zeroer
+        if not isinstance(zeroer, _GroupKVBlockZeroer):
+            return super().update_requests(scheduler_output)
+        zeroer.owners = _kv_block_owners(scheduler_output)
+        try:
+            return super().update_requests(scheduler_output)
+        finally:
+            zeroer.owners = None
 
     def load_model(self, load_dummy_weights: bool = False) -> None:
         """Load and pack GLM router weights in the worker weights pool."""
