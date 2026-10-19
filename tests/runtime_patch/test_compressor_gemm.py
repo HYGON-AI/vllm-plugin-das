@@ -258,3 +258,52 @@ def test_blaslt_invalid_k_raises_from_extension():
 
     with pytest.raises(RuntimeError, match="incompatible K dimensions"):
         extension.linear_bf16_fp32(x, weight)
+
+
+@pytest.mark.skipif(torch.version.hip is None, reason="requires hipBLASLt")
+@pytest.mark.parametrize(
+    "api", ["hipblasLtMatmul", "hipblasLtMatmulDescCreate", "hipblasLtMatrixLayoutCreate"]
+)
+@pytest.mark.parametrize("status", ["HIPBLAS_STATUS_NOT_SUPPORTED", "HIPBLAS_STATUS_INVALID_VALUE"])
+def test_blaslt_status_failure_raises_and_falls_back(monkeypatch, api, status):
+    import torch.utils.cpp_extension as cpp_extension
+
+    load_inline = cpp_extension.load_inline
+
+    def injected_extension(**kwargs):
+        # Compile the production C++ error handling, replacing only the vendor
+        # call with a non-throwing failure. No Python exception is injected.
+        source = kwargs["cuda_sources"]
+        call = api + "("
+        assert source.count(call) == 1
+        kwargs["cuda_sources"] = source.replace(
+            call, f"([](auto... args) {{ return {status}; }})(", 1
+        )
+        kwargs["name"] += "_" + api + "_" + status
+        return load_inline(**kwargs)
+
+    monkeypatch.setattr(cpp_extension, "load_inline", injected_extension)
+    monkeypatch.setenv("VLLM_USE_LINEAR_BF16_FP32_USE_BLASLT", "1")
+    monkeypatch.setattr(bf16_fp32_gemm, "_HIPBLASLT_DISABLED", False)
+    jit = bf16_fp32_gemm._jit_hipblaslt_bf16_fp32
+    jit.cache_clear()
+    try:
+        extension = bf16_fp32_gemm._jit_hipblaslt_bf16_fp32()
+        x = torch.randn(2, 5, dtype=torch.bfloat16, device="cuda")
+        weight = torch.randn(3, 5, dtype=torch.bfloat16, device="cuda")
+        with pytest.raises(RuntimeError, match="failed with hipBLASLt status"):
+            extension.linear_bf16_fp32(x, weight)
+        result = bf16_fp32_gemm.linear_bf16_fp32(x, weight)
+        torch.testing.assert_close(result, torch.mm(x, weight.T, out_dtype=torch.float32))
+        assert bf16_fp32_gemm._HIPBLASLT_DISABLED
+        # A failed backend must remain bypassed on subsequent calls.
+        monkeypatch.setattr(
+            bf16_fp32_gemm, "_jit_hipblaslt_bf16_fp32",
+            lambda: pytest.fail("disabled backend was retried"),
+        )
+        torch.testing.assert_close(
+            bf16_fp32_gemm.linear_bf16_fp32(x, weight), result
+        )
+    finally:
+        # Keep injected extensions out of later tests, even after failures.
+        jit.cache_clear()
