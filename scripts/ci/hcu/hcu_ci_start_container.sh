@@ -184,8 +184,8 @@ docker exec "$container_name" bash -lc '
     echo "the default python3 is unavailable in HCU CI image" >&2
     exit 2
   fi
-  mkdir -p /usr/local/bin
-  ln -sf "$python_bin" /usr/local/bin/hcu-ci-python
+  bash /vllm-plugin-das/scripts/ci/hcu/hcu_ci_create_python_wrapper.sh \
+    "$python_bin" /usr/local/bin/hcu-ci-python
   HOME="$ci_home" git config --global --add safe.directory /vllm-plugin-das
 '
 echo "started HCU CI container $container_name from $image"

@@ -13,6 +13,7 @@ import os
 import shutil
 import subprocess
 import sys
+import venv
 from pathlib import Path
 from types import SimpleNamespace
 
@@ -872,6 +873,8 @@ def test_selected_hcu_path_uses_resolved_supported_python() -> None:
 
     assert 'command -v python3' in sources[paths[0]]
     assert "for python_name in" not in sources[paths[0]]
+    assert "hcu_ci_create_python_wrapper.sh" in sources[paths[0]]
+    assert "ln -sf" not in sources[paths[0]]
     assert "/usr/local/bin/hcu-ci-python" in sources[paths[0]]
     assert "/usr/local/bin/hcu-ci-python" in sources[paths[1]]
     assert "/usr/local/bin/hcu-ci-python" in sources[paths[3]]
@@ -967,6 +970,49 @@ def test_default_python312_wins_over_invalid_python310(tmp_path: Path) -> None:
         text=True,
     )
     assert completed.returncode == 0, completed.stderr
+
+
+@pytest.mark.skipif(os.name == "nt", reason="HCU CI wrapper is a Bash entrypoint")
+def test_hcu_python_wrapper_preserves_venv_context(tmp_path: Path) -> None:
+    venv_root = tmp_path / "runtime-venv"
+    venv.EnvBuilder(with_pip=False, symlinks=False).create(venv_root)
+    venv_python = venv_root / "bin" / "python3"
+    purelib = Path(
+        subprocess.check_output(
+            [
+                str(venv_python),
+                "-c",
+                "import sysconfig; print(sysconfig.get_paths()['purelib'])",
+            ],
+            text=True,
+        ).strip()
+    )
+    (purelib / "hcu_ci_venv_marker.py").write_text(
+        "VALUE = 'venv-only'\n",
+        encoding="utf-8",
+    )
+    wrapper = tmp_path / "external-bin" / "hcu-ci-python"
+    helper = REPOSITORY / "scripts/ci/hcu/hcu_ci_create_python_wrapper.sh"
+
+    subprocess.run(
+        ["bash", str(helper), str(venv_python), str(wrapper)],
+        check=True,
+    )
+    completed = subprocess.run(
+        [
+            str(wrapper),
+            "-c",
+            (
+                "import hcu_ci_venv_marker, sys; "
+                "print(sys.prefix); print(hcu_ci_venv_marker.VALUE)"
+            ),
+        ],
+        check=False,
+        capture_output=True,
+        text=True,
+    )
+    assert completed.returncode == 0, completed.stderr
+    assert completed.stdout.splitlines() == [str(venv_root), "venv-only"]
 
 
 def test_hcu_control_container_uses_runner_identity() -> None:
