@@ -87,6 +87,48 @@ def _run_fresh_target(code: str) -> subprocess.CompletedProcess[str]:
     )
 
 
+@pytest.mark.parametrize(
+    "model_type", ["kimi_k3", "kimi_linear", "deepseek_v4", "qwen3", None]
+)
+@pytest.mark.parametrize("compiled", [False, True])
+def test_ir_priority_scopes_kimi_fallback_to_its_model_config(model_type, compiled):
+    from vllm.config.compilation import CompilationMode
+    from vllm.platforms.interface import Platform
+    from vllm_hcu.platforms.hcu import HCUPlatform
+
+    config = SimpleNamespace(
+        model_config=SimpleNamespace(
+            hf_config=SimpleNamespace(model_type=model_type)
+        ),
+        compilation_config=SimpleNamespace(
+            backend="inductor",
+            mode=CompilationMode.VLLM_COMPILE if compiled else CompilationMode.NONE,
+        ),
+    )
+    priority = dataclasses.asdict(HCUPlatform.get_default_ir_op_priority(config))
+    if model_type in ("kimi_k3", "kimi_linear"):
+        assert priority == {
+            "rms_norm": ["vllm_c", "native"],
+            "fused_add_rms_norm": ["vllm_c", "native"],
+        }
+    else:
+        assert priority == dataclasses.asdict(
+            Platform.get_default_ir_op_priority(config)
+        )
+        assert all(providers == ["native"] for providers in priority.values())
+
+
+@pytest.mark.parametrize("model_config", [None, SimpleNamespace(hf_config=None)])
+def test_ir_priority_without_model_metadata_preserves_platform_default(model_config):
+    from vllm.platforms.interface import Platform
+    from vllm_hcu.platforms.hcu import HCUPlatform
+
+    config = SimpleNamespace(model_config=model_config)
+    assert HCUPlatform.get_default_ir_op_priority(config) == (
+        Platform.get_default_ir_op_priority(config)
+    )
+
+
 @dataclass
 class _KernelConfig:
     moe_backend: str = "auto"

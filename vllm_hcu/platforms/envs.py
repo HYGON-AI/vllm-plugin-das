@@ -15,7 +15,7 @@ if TYPE_CHECKING:
     VLLM_HCU_USE_FLASH_ATTN_VARLEN: bool = True
     VLLM_HCU_USE_FLASHMLA: bool = False
     VLLM_USE_OPT_CAT: bool = False
-    VLLM_HCU_USE_CAT_MLA: bool = False
+    VLLM_HCU_USE_CAT_MLA: bool = True
     VLLM_HCU_DISABLE_DSA: bool = False
     VLLM_HCU_USE_FP8_MIXED_BATCH: bool = False
     VLLM_HCU_USE_CUSTOM_QUANTIZATION_GEMM : bool = False
