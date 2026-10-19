@@ -40,49 +40,79 @@ _WRAPPER_MARKER = "_vllm_hcu_compressor_weight_layout_wrapper"
 _INSERT_WRAPPER_MARKER = "_vllm_hcu_fp8_ds_mla_lightop_insert_wrapper"
 _INDEXER_INIT_WRAPPER_MARKER = "_vllm_hcu_indexer_cache_dtype_wrapper"
 _INDEXER_Q_WRAPPER_MARKER = "_vllm_hcu_bf16_indexer_query_wrapper"
+_COMPRESSOR_NT_BUFFER = "_vllm_hcu_compressor_nt_weight"
 
 
-def _compressor_nt_weight(weight: torch.Tensor) -> torch.Tensor | None:
-    """Cached ``[out, in]`` copy of an HCU NN ``[in, out]`` compressor weight.
-
-    The first call may run on an auxiliary projection stream; later callers
-    wait for that copy. The cache is keyed on storage and version, so an
-    in-place weight reload rebuilds it.
-    """
-    if weight.is_inference() or weight.shape[0] == weight.shape[1]:
-        return None
-    key = (weight.data_ptr(), weight._version)
-    cached = getattr(weight, "_vllm_hcu_compressor_nt", None)
-    if cached is None or cached[0] != key:
-        ready = torch.cuda.Event()
-        cached = (key, weight.T.contiguous(), ready)
-        ready.record()
-        weight._vllm_hcu_compressor_nt = cached
-    _, nt, ready = cached
-    torch.cuda.current_stream().wait_event(ready)
-    return nt
-
-
-def _compressor_mm(hidden_states: torch.Tensor, weight: torch.Tensor) -> torch.Tensor:
-    """Multiply either HCU NN ``[in, out]`` or upstream ``[out, in]`` weights."""
-    nn_layout = weight.shape[0] == hidden_states.shape[-1]
+def _validate_compressor_backend() -> str:
     backend = henvs.VLLM_HCU_COMPRESSOR_GEMM_BACKEND.lower()
     if backend not in ("blaslt", "torch"):
         raise ValueError(
             "VLLM_HCU_COMPRESSOR_GEMM_BACKEND must be 'blaslt' or 'torch', "
             f"got {backend!r}"
         )
-    if (
-        henvs.custom_ops_enabled()
-        and backend == "blaslt"
-        and weight.is_cuda
-        and weight.dtype == torch.bfloat16
-    ):
-        # Reuse the shared BF16 -> FP32 BLASLt NT GEMM (with its own
-        # switch and torch fallback); the NN layout's torch.mm is slow.
-        nt = _compressor_nt_weight(weight) if nn_layout else weight
-        if nt is not None:
-            return linear_bf16_fp32(hidden_states, nt)
+    return backend
+
+
+def bind_compressor_nt_weights(model: torch.nn.Module | None) -> int:
+    """Materialize NN-layout compressor weights before graph compilation."""
+    if model is None or not henvs.custom_ops_enabled():
+        return 0
+    if _validate_compressor_backend() != "blaslt":
+        return 0
+
+    bound = 0
+    for module in model.modules():
+        linear = getattr(module, "fused_wkv_wgate", None)
+        if linear is None or getattr(linear, _COMPRESSOR_NT_BUFFER, None) is not None:
+            continue
+        weight = getattr(linear, "weight", None)
+        if not isinstance(weight, torch.Tensor):
+            continue
+        if (
+            weight.ndim != 2
+            or weight.dtype != torch.bfloat16
+            or weight.device.type != "cuda"
+            or weight.shape[0] == weight.shape[1]
+            or weight.shape[0] != getattr(linear, "input_size_per_partition", -1)
+        ):
+            continue
+        linear.register_buffer(
+            _COMPRESSOR_NT_BUFFER, weight.T.contiguous(), persistent=False
+        )
+        bound += 1
+    return bound
+
+
+@torch.no_grad()
+def refresh_compressor_nt_weights(model: torch.nn.Module | None) -> None:
+    """Refresh materialized compressor weights after an in-place reload."""
+    if model is None:
+        return
+    for module in model.modules():
+        linear = getattr(module, "fused_wkv_wgate", None)
+        nt = getattr(linear, _COMPRESSOR_NT_BUFFER, None)
+        if nt is None:
+            continue
+        weight = linear.weight
+        if (
+            weight.ndim != 2
+            or nt.shape != weight.T.shape
+            or nt.dtype != weight.dtype
+            or nt.device != weight.device
+        ):
+            raise RuntimeError(
+                "reloaded DeepSeek V4 compressor weight has incompatible layout"
+            )
+        nt.copy_(weight.T)
+
+
+def _compressor_mm(hidden_states: torch.Tensor, linear) -> torch.Tensor:
+    """Multiply an HCU NN or upstream NT-layout compressor weight."""
+    weight = linear.weight
+    nt = getattr(linear, _COMPRESSOR_NT_BUFFER, None)
+    if nt is not None:
+        return linear_bf16_fp32(hidden_states, nt)
+    nn_layout = weight.shape[0] == hidden_states.shape[-1]
     rhs = weight if nn_layout else weight.T
     return torch.mm(hidden_states, rhs, out_dtype=torch.float32)
 
@@ -456,7 +486,7 @@ def apply_to_module(module: ModuleType) -> bool:
 
             def compressor_kv_score() -> torch.Tensor:
                 return _compressor_mm(
-                    hidden_states, compressor.fused_wkv_wgate.weight
+                    hidden_states, compressor.fused_wkv_wgate
                 )
 
             aux_fns[0] = compressor_kv_score
@@ -470,7 +500,7 @@ def apply_to_module(module: ModuleType) -> bool:
 
             def indexer_compressor_kv_score() -> torch.Tensor:
                 return _compressor_mm(
-                    hidden_states, indexer.compressor.fused_wkv_wgate.weight
+                    hidden_states, indexer.compressor.fused_wkv_wgate
                 )
 
             aux_fns[1] = indexer_weights_proj
