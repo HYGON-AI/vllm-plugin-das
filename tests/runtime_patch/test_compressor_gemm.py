@@ -4,6 +4,13 @@ from types import SimpleNamespace
 import pytest
 import torch
 
+from tests.fixtures.blaslt_faults import (
+    BLASLT_FAILURE_IDS,
+    BLASLT_FAILURE_SITES,
+    BLASLT_FAILURE_STATUSES,
+    failing_blaslt_loader,
+)
+
 
 if not torch.cuda.is_available():
     pytest.skip("compressor GEMM tests need a working GPU", allow_module_level=True)
@@ -262,27 +269,22 @@ def test_blaslt_invalid_k_raises_from_extension():
 
 @pytest.mark.skipif(torch.version.hip is None, reason="requires hipBLASLt")
 @pytest.mark.parametrize(
-    "api", ["hipblasLtMatmul", "hipblasLtMatmulDescCreate", "hipblasLtMatrixLayoutCreate"]
+    "api,occurrence,expected_calls", BLASLT_FAILURE_SITES, ids=BLASLT_FAILURE_IDS,
 )
-@pytest.mark.parametrize("status", ["HIPBLAS_STATUS_NOT_SUPPORTED", "HIPBLAS_STATUS_INVALID_VALUE"])
-def test_blaslt_status_failure_raises_and_falls_back(monkeypatch, api, status):
+@pytest.mark.parametrize("status", BLASLT_FAILURE_STATUSES)
+def test_blaslt_status_failure_raises_and_falls_back(
+    monkeypatch, api, occurrence, expected_calls, status,
+):
     import torch.utils.cpp_extension as cpp_extension
 
-    load_inline = cpp_extension.load_inline
-
-    def injected_extension(**kwargs):
-        # Compile the production C++ error handling, replacing only the vendor
-        # call with a non-throwing failure. No Python exception is injected.
-        source = kwargs["cuda_sources"]
-        call = api + "("
-        assert source.count(call) == 1
-        kwargs["cuda_sources"] = source.replace(
-            call, f"([](auto... args) {{ return {status}; }})(", 1
-        )
-        kwargs["name"] += "_" + api + "_" + status
-        return load_inline(**kwargs)
-
-    monkeypatch.setattr(cpp_extension, "load_inline", injected_extension)
+    # Compile production error handling with only the selected vendor call
+    # replaced by a non-throwing failure, including partially created layouts.
+    monkeypatch.setattr(
+        cpp_extension, "load_inline",
+        failing_blaslt_loader(
+            cpp_extension.load_inline, api, status, occurrence, expected_calls
+        ),
+    )
     monkeypatch.setenv("VLLM_USE_LINEAR_BF16_FP32_USE_BLASLT", "1")
     monkeypatch.setattr(bf16_fp32_gemm, "_HIPBLASLT_DISABLED", False)
     jit = bf16_fp32_gemm._jit_hipblaslt_bf16_fp32
