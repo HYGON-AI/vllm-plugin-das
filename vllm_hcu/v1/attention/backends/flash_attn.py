@@ -135,13 +135,11 @@ if TYPE_CHECKING:
 # accurate). VLLM_HCU_SWA_DECODE=0 restores the cutlass path. The effective
 # switch is resolved above so the provider is imported only when enabled.
 
-# Force flash_attn_varlen (skipping the cutlass/classic dispatch) and split
-# mixed prefill/decode batches into two varlen calls, each with its own
-# max_query_len (decode rows lead the reordered batch).  0 (default) keeps
-# the existing mode dispatch untouched.
 # The dense-QSA replacement and the mixed-batch split ship as one switch:
 # VLLM_HCU_DISABLE_QSA=1 makes full-attention layers dense (see
-# patch_qwen4_exp_disable_qsa) and splits mixed decode/prefill batches here.
+# patch_qwen4_exp_disable_qsa) and splits mixed decode/prefill batches into
+# two varlen calls, each with its own max_query_len (decode rows lead the
+# reordered batch).  Varlen mode only; other modes keep their native dispatch.
 _SPLIT_PD = os.environ.get("VLLM_HCU_DISABLE_QSA", "0") == "1"
 
 
