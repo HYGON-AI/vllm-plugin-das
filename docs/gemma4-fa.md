@@ -22,6 +22,12 @@ size 32 or 64. Gemma4's hybrid page-size unification may grow the full-attention
 block size from a requested 32 to 64. Query and KV head counts come from the model's local TP configuration;
 there is no batch=1 or fixed TP2 head-count check. Unsupported attention masks,
 output quantization, and other semantics fall back to the original forward.
+Text-only prefix-LM batches may carry an empty CPU range dictionary and a
+generated mask tensor. They remain eligible when every request's range list
+is empty; real bidirectional ranges and tensor-only masks still fall back.
+The eligibility check does not read GPU mask contents during graph capture.
+KV writes retain Triton's separate-update contract: the outer attention layer
+updates the cache before forward, and KV-sharing layers reuse the target cache.
 The vLLM 0.25.1 integration still requires numerical and CUDA Graph validation
 on HCU; CPU dispatch tests do not establish model accuracy or a speedup.
 

@@ -142,14 +142,21 @@ class Gemma4FAAttentionImpl(TritonAttentionImpl):
     ) -> bool:
         if not self._fa_supported or metadata is None:
             return False
+        mm_ranges = metadata.mm_prefix_range
+        # The runner supplies a CPU dictionary even for text-only prefix-LM
+        # batches. It is authoritative for its generated mask tensor; inspect
+        # empty lists here rather than reading device data during capture.
         q_len = metadata.max_query_len
         return (
             (q_len > 16 or q_len == 5)
             and metadata.num_actual_tokens > 0
             and not metadata.use_cascade
             and getattr(metadata, "causal", True) is True
-            and metadata.mm_prefix_range is None
-            and metadata.mm_prefix_range_tensor is None
+            and (
+                not any(mm_ranges.values())
+                if isinstance(mm_ranges, dict)
+                else mm_ranges is None and metadata.mm_prefix_range_tensor is None
+            )
             and getattr(metadata, "rswa_prefix_lens", None) is None
             and getattr(metadata, "rswa_window", None) is None
             and output_scale is None
