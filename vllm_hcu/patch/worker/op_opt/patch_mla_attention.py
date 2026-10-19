@@ -390,18 +390,12 @@ def apply_to_module(module: ModuleType) -> bool:
     def hcu_get_kv_b_proj_input_dtype(kv_b_proj, use_fp8_prefill):
         weight = getattr(kv_b_proj, "weight", None)
         if weight is not None and weight.dtype == torch_module.int8:
-            scheme = getattr(kv_b_proj, "scheme", None)
-            supports_quanted_inputs = getattr(
-                scheme,
-                "supports_quanted_inputs",
-                None,
-            )
-            if callable(supports_quanted_inputs) and not supports_quanted_inputs():
-                # Packed INT8 weights do not imply an INT8 activation. The
-                # master-off Triton scaled-MM kernel dynamically quantizes its
-                # floating input, while custom kernels that accept a shared
-                # prequantized activation advertise that capability explicitly.
-                return kv_b_proj.params_dtype
+            # The MLA context-prefill call site passes only an activation
+            # tensor, never the (quantized_tensor, scale) tuple accepted by
+            # fused linear paths.
+            # Preserve the floating activation so either the upstream Triton
+            # kernel or the HCU custom kernel can quantize it with its scale.
+            return kv_b_proj.params_dtype
         return original_get_kv_b_proj_input_dtype(
             kv_b_proj,
             use_fp8_prefill,

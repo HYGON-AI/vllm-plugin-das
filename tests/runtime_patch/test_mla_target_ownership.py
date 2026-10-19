@@ -401,7 +401,7 @@ def test_mla_int8_kv_b_proj_keeps_floating_prefill_input_dtype():
         params_dtype=torch.bfloat16,
         scheme=SimpleNamespace(supports_quanted_inputs=lambda: False),
     )
-    prequantized_projection = SimpleNamespace(
+    custom_projection = SimpleNamespace(
         weight=torch.empty(1, dtype=torch.int8),
         params_dtype=torch.bfloat16,
         scheme=SimpleNamespace(supports_quanted_inputs=lambda: True),
@@ -423,8 +423,8 @@ def test_mla_int8_kv_b_proj_keeps_floating_prefill_input_dtype():
         is torch.float16
     )
     assert (
-        module._get_kv_b_proj_input_dtype(prequantized_projection, False)
-        is torch.int8
+        module._get_kv_b_proj_input_dtype(custom_projection, False)
+        is torch.bfloat16
     )
 
 
