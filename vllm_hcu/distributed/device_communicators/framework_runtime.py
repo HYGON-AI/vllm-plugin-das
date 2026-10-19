@@ -181,6 +181,13 @@ def install_deep_ep_auto_manager(module: object) -> type:
         def __init__(self, cpu_group, tcp_store_group=None):
             super().__init__(cpu_group, tcp_store_group)
             self.num_sms = 48
+            self.set_num_sms(self.num_sms)
+
+        def set_num_sms(self, num_sms: int) -> None:
+            import deep_ep
+
+            selected_sms = requested_deep_ep_sms(int(num_sms))
+            deep_ep.Buffer.set_num_sms(min(selected_sms, self.num_sms))
 
         def _make_all2all_kwargs(
             self,

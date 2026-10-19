@@ -673,6 +673,10 @@ def test_deep_ep_auto_manager_sizes_one_buffer_for_ht_and_ll(
 
     class Buffer:
         @staticmethod
+        def set_num_sms(_value: int) -> None:
+            pass
+
+        @staticmethod
         def get_low_latency_rdma_size_hint(**kwargs):
             calls.append(kwargs)
             return kwargs["num_max_dispatch_tokens_per_rank"] * 23_437_500
@@ -724,6 +728,37 @@ def test_deep_ep_auto_manager_sizes_one_buffer_for_ht_and_ll(
         num_local_experts=32,
     ) == kwargs
     assert len(calls) == 32
+
+
+def test_deep_ep_auto_manager_initializes_ht_sms_and_honors_override(
+    monkeypatch: pytest.MonkeyPatch,
+):
+    """Auto mode must configure HT kernels even when DBO SM control is idle."""
+
+    from vllm_hcu.platforms import envs as hcu_envs
+
+    calls: list[int] = []
+
+    class Buffer:
+        @staticmethod
+        def set_num_sms(value: int) -> None:
+            calls.append(value)
+
+    monkeypatch.setitem(sys.modules, "deep_ep", SimpleNamespace(Buffer=Buffer))
+    monkeypatch.setattr(hcu_envs, "VLLM_HCU_DEEPEP_NUM_SMS", None)
+    module = _fake_all2all_module()
+    assert patch_all2all.apply_to_module(module)
+
+    manager = module.DeepEPAutoAll2AllManager("group")
+    assert calls == [48]
+
+    monkeypatch.setattr(hcu_envs, "VLLM_HCU_DEEPEP_NUM_SMS", 40)
+    manager.set_num_sms(48)
+    assert calls == [48, 40]
+
+    monkeypatch.setattr(hcu_envs, "VLLM_HCU_DEEPEP_NUM_SMS", 60)
+    manager.set_num_sms(48)
+    assert calls == [48, 40, 48]
 
 
 def test_deep_ep_low_latency_rejects_first_invalid_model_specific_hint(
@@ -1166,9 +1201,11 @@ def test_pynccl_communicator_method_is_capability_gated(
 
 class _Mode(enum.Enum):
     NONE = 0
+    PIECEWISE = 1
+    FULL = 2
 
 
-def _fake_forward_context_module() -> ModuleType:
+def _fake_forward_context_module(mode_enum: type[enum.Enum] = _Mode) -> ModuleType:
     @dataclasses.dataclass
     class ForwardContext:
         value: object
@@ -1177,7 +1214,7 @@ def _fake_forward_context_module() -> ModuleType:
         attn_metadata,
         vllm_config,
         dp_metadata=None,
-        cudagraph_runtime_mode=_Mode.NONE,
+        cudagraph_runtime_mode=mode_enum.NONE,
         batch_descriptor=None,
         ubatch_slices=None,
         slot_mapping=None,
@@ -1193,7 +1230,7 @@ def _fake_forward_context_module() -> ModuleType:
         vllm_config,
         num_tokens=None,
         num_tokens_across_dp=None,
-        cudagraph_runtime_mode=_Mode.NONE,
+        cudagraph_runtime_mode=mode_enum.NONE,
         batch_descriptor=None,
         ubatch_slices=None,
         slot_mapping=None,
@@ -1205,7 +1242,7 @@ def _fake_forward_context_module() -> ModuleType:
     return _module(
         patch_forward_context.TARGET_MODULE,
         ForwardContext=ForwardContext,
-        CUDAGraphMode=_Mode,
+        CUDAGraphMode=mode_enum,
         create_forward_context=create_forward_context,
         set_forward_context=set_forward_context,
     )
@@ -1291,6 +1328,210 @@ def test_deepep_auto_forward_mode_requires_decode_phase_evidence():
     assert not choose_deepep_auto_low_latency(
         config, None, torch.tensor([4, 33, 16]), None
     )
+
+
+def test_deepep_auto_graph_mode_selects_delegate_without_phase_collective(
+    monkeypatch: pytest.MonkeyPatch,
+):
+    import vllm_hcu.forward_context_runtime as runtime
+    from vllm.config.compilation import CUDAGraphMode
+
+    config = _config(deepep_auto=True)
+    config.parallel_config = SimpleNamespace(data_parallel_size=4)
+    monkeypatch.setattr(
+        runtime,
+        "_synchronize_deepep_auto_phase",
+        lambda *args, **kwargs: pytest.fail(
+            "concrete graph modes must not add a phase collective"
+        ),
+    )
+
+    assert runtime.choose_deepep_auto_low_latency(
+        config,
+        32,
+        None,
+        None,
+        cudagraph_runtime_mode=CUDAGraphMode.FULL,
+    )
+    assert not runtime.choose_deepep_auto_low_latency(
+        config,
+        32,
+        None,
+        SimpleNamespace(uniform=True),
+        is_prefilling=torch.tensor([False]),
+        cudagraph_runtime_mode=CUDAGraphMode.PIECEWISE,
+    )
+
+
+def test_deepep_auto_none_graph_mode_uses_synchronized_phase(
+    monkeypatch: pytest.MonkeyPatch,
+):
+    import vllm_hcu.forward_context_runtime as runtime
+    from vllm.config.compilation import CUDAGraphMode
+
+    config = _config(deepep_auto=True)
+    config.parallel_config = SimpleNamespace(data_parallel_size=4)
+    local_evidence: list[tuple[bool, bool]] = []
+
+    def synchronize_phase(
+        _config: object,
+        *,
+        local_active: bool,
+        local_decode: bool,
+    ) -> bool:
+        local_evidence.append((local_active, local_decode))
+        return True
+
+    monkeypatch.setattr(
+        runtime,
+        "_synchronize_deepep_auto_phase",
+        synchronize_phase,
+    )
+
+    assert runtime.choose_deepep_auto_low_latency(
+        config,
+        0,
+        None,
+        None,
+        cudagraph_runtime_mode=CUDAGraphMode.NONE,
+    )
+    assert local_evidence == [(False, False)]
+
+
+def test_deepep_auto_none_graph_mode_missing_phase_fails_closed():
+    from vllm_hcu.forward_context_runtime import choose_deepep_auto_low_latency
+    from vllm.config.compilation import CUDAGraphMode
+
+    config = _config(deepep_auto=True)
+    config.parallel_config = SimpleNamespace(data_parallel_size=1)
+
+    assert not choose_deepep_auto_low_latency(
+        config,
+        32,
+        None,
+        SimpleNamespace(uniform=True),
+        cudagraph_runtime_mode=CUDAGraphMode.NONE,
+    )
+
+
+def test_deepep_auto_rejects_composite_runtime_graph_mode():
+    from vllm_hcu.forward_context_runtime import choose_deepep_auto_low_latency
+    from vllm.config.compilation import CUDAGraphMode
+
+    config = _config(deepep_auto=True)
+
+    with pytest.raises(ValueError, match="concrete CUDA Graph runtime mode"):
+        choose_deepep_auto_low_latency(
+            config,
+            32,
+            None,
+            None,
+            cudagraph_runtime_mode=CUDAGraphMode.FULL_AND_PIECEWISE,
+        )
+
+
+@pytest.mark.parametrize(
+    "runtime_mode",
+    [
+        pytest.param("NONE", id="none"),
+        pytest.param("PIECEWISE", id="piecewise"),
+        pytest.param("FULL", id="full"),
+    ],
+)
+def test_deepep_auto_graph_mode_does_not_affect_feature_off(runtime_mode: str):
+    from vllm_hcu.forward_context_runtime import choose_deepep_auto_low_latency
+    from vllm.config.compilation import CUDAGraphMode
+
+    config = _config(deepep_auto=False)
+
+    assert not choose_deepep_auto_low_latency(
+        config,
+        32,
+        None,
+        SimpleNamespace(uniform=True),
+        is_prefilling=torch.tensor([False]),
+        cudagraph_runtime_mode=getattr(CUDAGraphMode, runtime_mode),
+    )
+
+
+def test_deepep_auto_forward_context_passes_runtime_graph_mode(
+    monkeypatch: pytest.MonkeyPatch,
+):
+    module = _fake_forward_context_module()
+    assert patch_forward_context.apply_to_module(module)
+    config = _config(deepep_auto=True)
+    config.parallel_config = SimpleNamespace(
+        all2all_backend="deepep_low_latency",
+        data_parallel_size=4,
+    )
+    observed_modes: list[object] = []
+
+    def choose_delegate(*args, cudagraph_runtime_mode, **kwargs):
+        observed_modes.append(cudagraph_runtime_mode)
+        return True
+
+    monkeypatch.setattr(
+        "vllm_hcu.forward_context_runtime.choose_deepep_auto_low_latency",
+        choose_delegate,
+    )
+    monkeypatch.setattr(
+        "vllm_hcu.forward_context_runtime.set_forward_context",
+        lambda *args, **kwargs: contextlib.nullcontext(),
+    )
+
+    with module.set_forward_context(
+        None,
+        config,
+        cudagraph_runtime_mode=_Mode.FULL,
+    ):
+        pass
+
+    assert observed_modes == [_Mode.FULL]
+
+
+def test_deepep_auto_target_mtp_graph_mode_uses_shared_forward_context(
+    monkeypatch: pytest.MonkeyPatch,
+):
+    import vllm_hcu.forward_context_runtime as runtime
+    from vllm.config.compilation import CUDAGraphMode
+
+    module = _fake_forward_context_module(CUDAGraphMode)
+    assert patch_forward_context.apply_to_module(module)
+    config = _config(deepep_auto=True)
+    config.parallel_config = SimpleNamespace(
+        all2all_backend="deepep_low_latency",
+        data_parallel_size=4,
+    )
+    selected_delegates: list[bool] = []
+
+    def capture_context(*args, deepep_auto_use_low_latency, **kwargs):
+        selected_delegates.append(deepep_auto_use_low_latency)
+        return contextlib.nullcontext()
+
+    monkeypatch.setattr(runtime, "set_forward_context", capture_context)
+    monkeypatch.setattr(
+        runtime,
+        "_synchronize_deepep_auto_phase",
+        lambda *args, **kwargs: pytest.fail(
+            "target/MTP graph capture must not synchronize request phase"
+        ),
+    )
+
+    # Target and MTP each enter the same patched forward-context boundary.
+    for runtime_mode in (
+        CUDAGraphMode.FULL,
+        CUDAGraphMode.FULL,
+        CUDAGraphMode.PIECEWISE,
+        CUDAGraphMode.PIECEWISE,
+    ):
+        with module.set_forward_context(
+            None,
+            config,
+            cudagraph_runtime_mode=runtime_mode,
+        ):
+            pass
+
+    assert selected_delegates == [True, True, False, False]
 
 
 def test_dspark_deepep_auto_uses_ht_for_prefill_and_ll_for_uniform_decode():

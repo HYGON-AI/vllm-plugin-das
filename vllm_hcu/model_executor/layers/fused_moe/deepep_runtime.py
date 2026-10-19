@@ -134,11 +134,16 @@ def slimquant_w4a8_uses_deepep_auto(moe_config: object) -> bool:
         # contract.  Channel SlimQuant checkpoints therefore share the
         # DeepEP W4A8 packing and DeepGEMM execution path.
         "GlmMoeDsaForCausalLM",
+        # Qwen4Exp uses the same SiLU routed-expert contract. Both entry
+        # points are needed because --language-model-only selects the causal
+        # LM wrapper while the checkpoint advertises the conditional wrapper.
+        "Qwen4ExpForCausalLM",
+        "Qwen4ExpForConditionalGeneration",
     }
     if supported_architectures.isdisjoint(architectures):
         raise ValueError(
             "SlimQuant W4A8 deepep_auto is validated only for DeepSeek-V4 "
-            "and its native MTP draft, or GLM MoE DSA; "
+            "and its native MTP draft, GLM MoE DSA, or Qwen4Exp; "
             f"got architectures={architectures!r}"
         )
     activation = getattr(moe_config, "activation", None)

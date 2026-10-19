@@ -144,6 +144,61 @@ def _validate_w4a8_channel_weights(layer: torch.nn.Module) -> None:
             )
 
 
+def _pad_w4a8_channel_weights_for_hipc(
+    layer: torch.nn.Module,
+) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+    """Pad unsupported HIPC intermediate sizes without changing MoE math.
+
+    The installed HIPC W4A8 mode requires the combined gate/up output
+    dimension to be a multiple of 512. Padding each SwiGLU half to a multiple
+    of 256 satisfies that physical contract. The matching down-projection K
+    dimension is padded with packed zero nibbles, so the added activation
+    channels cannot affect the result.
+    """
+
+    _validate_w4a8_channel_weights(layer)
+    w13 = layer.w13_weight
+    w2 = layer.w2_weight
+    w13_scale = layer.w13_weight_scale
+    logical_intermediate = w2.size(2) * 2
+    physical_intermediate = (
+        (logical_intermediate + 255) // 256
+    ) * 256
+    if physical_intermediate == logical_intermediate:
+        return w13, w2, w13_scale
+
+    num_experts, _, packed_hidden = w13.shape
+    hidden = w2.size(1)
+    padded_w13 = w13.new_zeros(
+        (num_experts, 2 * physical_intermediate, packed_hidden)
+    )
+    padded_w2 = w2.new_zeros(
+        (num_experts, hidden, physical_intermediate // 2)
+    )
+    padded_w13_scale = w13_scale.new_ones(
+        (num_experts, 2 * physical_intermediate, *w13_scale.shape[2:])
+    )
+    with torch.no_grad():
+        padded_w13[:, :logical_intermediate].copy_(
+            w13[:, :logical_intermediate]
+        )
+        padded_w13[
+            :,
+            physical_intermediate : physical_intermediate
+            + logical_intermediate,
+        ].copy_(w13[:, logical_intermediate:])
+        padded_w2[:, :, : w2.size(2)].copy_(w2)
+        padded_w13_scale[:, :logical_intermediate].copy_(
+            w13_scale[:, :logical_intermediate]
+        )
+        padded_w13_scale[
+            :,
+            physical_intermediate : physical_intermediate
+            + logical_intermediate,
+        ].copy_(w13_scale[:, logical_intermediate:])
+    return padded_w13, padded_w2, padded_w13_scale
+
+
 class DeepEPDeepGemmW4A8ContiguousExperts(TritonExperts):
     """Contiguous HIPC W4A8 experts for DeepEP high-throughput dispatch."""
 
