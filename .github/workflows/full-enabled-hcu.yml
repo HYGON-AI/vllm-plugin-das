@@ -52,19 +52,19 @@ jobs:
 
       - name: Validate patch contracts and Python sources
         run: |
-          /usr/local/bin/python3.10 --version
-          /usr/local/bin/python3.10 tools/check_patch_test_coverage.py
-          /usr/local/bin/python3.10 .github/scripts/hcu_ci/hcu_ci_preflight.py --check-lock-only
-          /usr/local/bin/python3.10 .github/scripts/hcu_ci/verify_hcu_registration.py
-          /usr/local/bin/python3.10 -m compileall -q .github/scripts/hcu_ci tools tests vllm_hcu
+          python3 --version
+          python3 .github/scripts/hcu_ci/hcu_ci_preflight.py --check-lock-only
+          python3 tools/check_patch_test_coverage.py
+          python3 .github/scripts/hcu_ci/verify_hcu_registration.py
+          python3 -m compileall -q .github/scripts/hcu_ci tools tests vllm_hcu
 
       - name: Validate quarantine governance
-        run: /usr/local/bin/python3.10 .github/scripts/hcu_ci/build_hcu_matrix.py --profile quarantine
+        run: python3 .github/scripts/hcu_ci/build_hcu_matrix.py --profile quarantine
 
       - name: Build full HCU matrix
         id: matrix
         run: >-
-          /usr/local/bin/python3.10 .github/scripts/hcu_ci/build_hcu_matrix.py
+          python3 .github/scripts/hcu_ci/build_hcu_matrix.py
           --profile full
           --github-output "$GITHUB_OUTPUT"
 
