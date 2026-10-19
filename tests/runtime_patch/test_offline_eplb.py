@@ -1046,3 +1046,34 @@ def test_offline_adapter_rejects_stale_wrapper_identity(index) -> None:
     setattr(owner, name, inspect.unwrap(getattr(owner, name)))
     with pytest.raises(api.PatchCompatibilityError, match="stale"):
         api.apply_to_module(target)
+
+
+def test_offline_outer_wrappers_preserve_step5_idempotence_and_stale_checks():
+    from vllm_hcu.patch.worker.framework_opt import patch_step5_eplb_state as step5
+    from vllm_hcu.runtime_compat.step5_patch_contract import remember_targets
+
+    api, target = _isolated_offline_target()
+    target.EplbState._propagate_shared_tensors = lambda *a: None
+    target._move_to_workspace = lambda *a: None
+    target.create_eplb_communicator = lambda *a: None
+    original_step = target.EplbState.step
+    remember_targets(target, step5._MARKER, step5.TARGETS)
+    assert api.apply_to_module(target)
+    assert inspect.unwrap(target.EplbState.step) is original_step
+    assert step5.apply_to_module(target) is False
+    assert api.apply_to_module(target) is False
+    target.EplbState.step = original_step
+    with pytest.raises(RuntimeError, match="[Ss]tale"):
+        step5.apply_to_module(target)
+    with pytest.raises(RuntimeError, match="stale"):
+        api.apply_to_module(target)
+
+
+def test_step5_rejects_installation_over_existing_offline_policy():
+    from vllm_hcu.patch.worker.framework_opt import patch_step5_eplb_state as step5
+    api, target = _isolated_offline_target()
+    api.apply_to_module(target)
+    wrappers = tuple(getattr(owner, name) for owner, name in _offline_hooks(target))
+    with pytest.raises(RuntimeError, match="before offline EPLB policy"):
+        step5.apply_to_module(target)
+    assert wrappers == tuple(getattr(owner, name) for owner, name in _offline_hooks(target))

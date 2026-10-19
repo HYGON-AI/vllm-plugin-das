@@ -20,6 +20,7 @@ from vllm.distributed.eplb.eplb_state import (
 )
 
 from vllm_hcu.distributed.eplb_buffer_runtime import buffer_signature
+from vllm_hcu.distributed.eplb_control import RECORD_ONLY
 from vllm_hcu.distributed.eplb_transfer_runtime import (
     BufferedTransferMetadata,
     move_from_buffer,
@@ -438,7 +439,7 @@ def rearrange(
                 )
                 logger.info("[EPLB] Placement saved to %s", _EPLB_DUMP_PATH)
 
-            if not skip_rearrange:
+            if not skip_rearrange and not RECORD_ONLY.get():
                 # Update expert weights
                 rearrange_expert_weights_inplace(
                     eplb_model_state.physical_to_logical_map,

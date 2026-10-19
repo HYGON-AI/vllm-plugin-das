@@ -52,11 +52,13 @@ def _create_model_runner(
         # breakable graph execution as v0.25.1. The retained HCU MRV1 copy has
         # stale imports on v0.28; use upstream's maintained MRV1 with the HCU
         # worker/model/operator callbacks already installed above.
+        model_config = getattr(vllm_config, "model_config", None)
+        parallel_config = getattr(vllm_config, "parallel_config", None)
         if (
-            getattr(vllm_config.model_config.hf_config, "model_type", None)
+            getattr(getattr(model_config, "hf_config", None), "model_type", None)
             == "kimi_k3"
-            and vllm_config.parallel_config.data_parallel_size == 1
-            and vllm_config.parallel_config.prefill_context_parallel_size == 1
+            and getattr(parallel_config, "data_parallel_size", None) == 1
+            and getattr(parallel_config, "prefill_context_parallel_size", None) == 1
         ):
             from vllm.v1.worker.gpu_model_runner import GPUModelRunner
 

@@ -265,6 +265,8 @@ _OP_CALLBACKS: tuple[_CallbackSpec, ...] = (
     _CallbackSpec(_adapter("op_opt", "patch_kimi_k3_eplb_model")),
     _CallbackSpec(_adapter("op_opt", "patch_kimi_k3_reference_paths")),
     _CallbackSpec(_adapter("op_opt", "patch_kimi_k3_mla_gate")),
+    _CallbackSpec(_adapter("op_opt", "patch_kimi_k3_mixed_kda")),
+    _CallbackSpec(_adapter("op_opt", "patch_kimi_k3_mixed_linear")),
     # All GDN deltas bind Qwen's module-local symbols/class only.  The
     # canonical causal-conv module and the shared GDN base remain vLLM-owned
     # so Kimi, Olmo, MambaMixer, MambaMixer2, and ShortConv are not patched by
@@ -344,10 +346,6 @@ _FRAMEWORK_CALLBACKS: tuple[_CallbackSpec, ...] = (
         feature="offline_eplb",
     ),
     _CallbackSpec(
-        _adapter("framework_opt", "patch_offline_eplb"),
-        feature="eplb_control",
-    ),
-    _CallbackSpec(
         _adapter("framework_opt", "patch_eplb_communicator"),
         feature="offline_eplb",
     ),
@@ -418,6 +416,11 @@ _FRAMEWORK_CALLBACKS: tuple[_CallbackSpec, ...] = (
     _CallbackSpec(_adapter("framework_opt", "patch_step5_eplb_transfer")),
     _CallbackSpec(_adapter("framework_opt", "patch_step5_eplb_async_worker")),
     _CallbackSpec(_adapter("framework_opt", "patch_step5_eplb_state")),
+    # Offline recording/static-map policy wraps the final EPLB runtime.
+    _CallbackSpec(
+        _adapter("framework_opt", "patch_offline_eplb"),
+        feature="eplb_control",
+    ),
     _CallbackSpec(_adapter("framework_opt", "patch_step5_deep_gemm_api")),
 )
 

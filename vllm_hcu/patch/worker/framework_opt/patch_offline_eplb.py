@@ -10,12 +10,12 @@ import json
 import os
 import tempfile
 from collections.abc import Mapping
-from contextvars import ContextVar
 from pathlib import Path
 from typing import Any, Literal
 
 import torch
 from vllm.logger import init_logger
+from vllm_hcu.distributed.eplb_control import RECORD_ONLY as _RECORD_ONLY
 
 from vllm_hcu.model_executor.layers.fused_moe.static_eplb import (
     StaticEplbPlan,
@@ -46,7 +46,6 @@ TARGETS += (
 )
 _MARKER = "_vllm_hcu_offline_eplb"
 _OFFLINE_EPLB_FORMAT = "vllm_offline_eplb_physical_to_logical_by_model"
-_RECORD_ONLY = ContextVar("hcu_eplb_record_only", default=False)
 logger = init_logger("vllm.hcu.offline_eplb")
 
 
@@ -363,6 +362,16 @@ def apply_to_module(module) -> bool:
                 "Static EPLB state marker is stale; restart the process"
             )
         return False
+
+    # The runtime replacement must be installed before this outer policy.
+    # Verify its exact identities before updating its ownership snapshot below;
+    # an unknown replacement must continue to fail closed.
+    from . import patch_step5_eplb_state as step5
+    from vllm_hcu.runtime_compat.step5_patch_contract import (
+        already_applied as step5_applied,
+        remember_targets,
+    )
+    owns_step5 = step5_applied(target, step5._MARKER, step5.TARGETS)
 
     (
         original_add,
@@ -689,6 +698,10 @@ def apply_to_module(module) -> bool:
     target._commit_eplb_maps = commit_eplb_maps
     target.rearrange_expert_weights_inplace = rearrange_expert_weights_inplace
     setattr(target, _MARKER, wrappers)
+    if owns_step5:
+        # Approved outer wrappers retain __wrapped__ and call the verified
+        # Step5 functions. Re-entry of either adapter must see the composition.
+        remember_targets(target, step5._MARKER, step5.TARGETS)
     return True
 
 

@@ -94,6 +94,20 @@ def _fresh_python(
         child_code = _TARGET_INSTALL_ASSERTION + code
     else:
         child_code = code + _TARGET_INSTALL_ASSERTION
+    if env.get("VLLM_HCU_CPU_AUDIT") == "1" and not no_site and assert_target_install:
+        # Propagate the CPU audit boundary into lifecycle child interpreters.
+        child_code = """
+import torch
+
+def _cpu_audit_forbidden(*args, **kwargs):
+    raise RuntimeError("GPU/distributed initialization forbidden in CPU audit")
+
+torch.cuda._lazy_init = _cpu_audit_forbidden
+torch.cuda.init = _cpu_audit_forbidden
+# Import-time kernel selection uses a synthetic capability in this CPU fixture.
+torch.cuda.get_device_capability = lambda *args, **kwargs: (9, 0)
+torch.distributed.init_process_group = _cpu_audit_forbidden
+""" + child_code
     command = [sys.executable]
     if no_site:
         command.append("-S")
@@ -1306,3 +1320,36 @@ def test_plugin_source_has_no_builtins_import_override():
     source = inspect.getsource(plugin)
     assert "patch_utils" not in source
     assert "builtins.__import__" not in source
+
+
+@pytest.mark.parametrize("model_type,dp,pcp,allowed", [
+    ("kimi_k3", 1, 1, True),
+    ("kimi_k3", 2, 1, False),
+    ("kimi_k3", 1, 2, False),
+    ("other", 1, 1, False),
+])
+def test_kimi_reference_runner_exception_is_limited_to_supported_topology(
+    monkeypatch, cpu_safe_hcu_worker_module, model_type, dp, pcp, allowed,
+):
+    module = ModuleType("vllm.v1.worker.gpu_model_runner")
+    constructed = []
+
+    class Runner:
+        def __init__(self, config, device):
+            constructed.append((config, device))
+
+    module.GPUModelRunner = Runner
+    monkeypatch.setitem(sys.modules, module.__name__, module)
+    config = SimpleNamespace(
+        model_config=SimpleNamespace(hf_config=SimpleNamespace(model_type=model_type)),
+        parallel_config=SimpleNamespace(data_parallel_size=dp, prefill_context_parallel_size=pcp),
+    )
+    if allowed:
+        assert isinstance(cpu_safe_hcu_worker_module._create_model_runner(
+            config, "cpu", use_v2_model_runner=False), Runner)
+        assert constructed == [(config, "cpu")]
+    else:
+        with pytest.raises(RuntimeError, match="only Model Runner V2"):
+            cpu_safe_hcu_worker_module._create_model_runner(
+                config, "cpu", use_v2_model_runner=False)
+        assert not constructed
