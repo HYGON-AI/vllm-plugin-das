@@ -252,7 +252,7 @@ class HcuGPUModelRunnerV2(GPUModelRunner):
             zeroer.owners = None
 
     def load_model(self, load_dummy_weights: bool = False) -> None:
-        """Load and pack GLM router weights in the worker weights pool."""
+        """Load and materialize derived weights in the worker weights pool."""
 
         super().load_model(load_dummy_weights=load_dummy_weights)
         from vllm_hcu.model_executor.layers.fused_moe.glm53_router_gemv import (
@@ -261,6 +261,18 @@ class HcuGPUModelRunnerV2(GPUModelRunner):
 
         self._vllm_hcu_num_router_gates = bind_glm53_router_gates(
             getattr(self, "model", None)
+        )
+
+        from vllm_hcu.patch.worker.core_fix.patch_deepseek_v4_attention import (
+            bind_compressor_nt_weights,
+        )
+
+        # Worker.load_model still owns its initial weights pool here. Creating
+        # these buffers after it returns leaves them outside sleep management.
+        self._vllm_hcu_num_compressor_weights = sum(
+            bind_compressor_nt_weights(model)
+            for model in (self.model, self.get_draft_model())
+            if model is not None
         )
 
     @property
