@@ -342,9 +342,16 @@ def _fake_mla_module(adapter, target_calls, event_log=None):
             )
 
     module = ModuleType(adapter.TARGET_MODULE)
+
+    def _get_kv_b_proj_input_dtype(kv_b_proj, use_fp8_prefill):
+        del use_fp8_prefill
+        weight = getattr(kv_b_proj, "weight", None)
+        return weight.dtype if weight is not None else kv_b_proj.params_dtype
+
     module.MLAAttention = MLAAttention
     module.MLACommonMetadata = MLACommonMetadata
     module.MLACommonMetadataBuilder = MLACommonMetadataBuilder
+    module._get_kv_b_proj_input_dtype = _get_kv_b_proj_input_dtype
     module.split_decodes_and_prefills = split_decodes_and_prefills
     def maybe_gather_mla_latent_cache_inputs(
         kv_c_normed,
@@ -384,6 +391,41 @@ def _fake_mla_module(adapter, target_calls, event_log=None):
 
 def _forward_args():
     return tuple(object() for _ in range(13))
+
+
+def test_mla_int8_kv_b_proj_keeps_floating_prefill_input_dtype():
+    adapter = _adapter()
+    module = _fake_mla_module(adapter, [])
+    int8_projection = SimpleNamespace(
+        weight=torch.empty(1, dtype=torch.int8),
+        params_dtype=torch.bfloat16,
+        scheme=SimpleNamespace(supports_quanted_inputs=lambda: False),
+    )
+    custom_projection = SimpleNamespace(
+        weight=torch.empty(1, dtype=torch.int8),
+        params_dtype=torch.bfloat16,
+        scheme=SimpleNamespace(supports_quanted_inputs=lambda: True),
+    )
+    fp16_projection = SimpleNamespace(
+        weight=torch.empty(1, dtype=torch.float16),
+        params_dtype=torch.bfloat16,
+    )
+    assert module._get_kv_b_proj_input_dtype(int8_projection, False) is torch.int8
+
+    assert adapter.apply_to_module(module) is True
+
+    assert (
+        module._get_kv_b_proj_input_dtype(int8_projection, False)
+        is torch.bfloat16
+    )
+    assert (
+        module._get_kv_b_proj_input_dtype(fp16_projection, False)
+        is torch.float16
+    )
+    assert (
+        module._get_kv_b_proj_input_dtype(custom_projection, False)
+        is torch.bfloat16
+    )
 
 
 @pytest.mark.parametrize("transposed_input", [False, True])

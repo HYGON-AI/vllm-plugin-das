@@ -24,6 +24,7 @@ TARGETS = (
     f"{TARGET_MODULE}.split_decodes_and_prefills",
     f"{TARGET_MODULE}.maybe_gather_mla_latent_cache_inputs",
     f"{TARGET_MODULE}.MLAAttention._use_sparse_mha",
+    f"{TARGET_MODULE}._get_kv_b_proj_input_dtype",
 )
 _MARKER = "_vllm_hcu_mla_attention_applied"
 _WRAPPER = "_vllm_hcu_mla_attention_wrapper"
@@ -44,6 +45,7 @@ def apply_to_module(module: ModuleType) -> bool:
         (mla, "split_decodes_and_prefills", TARGETS[6], _WRAPPER),
         (mla, "maybe_gather_mla_latent_cache_inputs", TARGETS[7], _WRAPPER),
         (cls, "_use_sparse_mha", TARGETS[8], _WRAPPER),
+        (mla, "_get_kv_b_proj_input_dtype", TARGETS[9], _WRAPPER),
     )
     if already_applied(mla, _MARKER, wrapped):
         return False
@@ -83,10 +85,20 @@ def apply_to_module(module: ModuleType) -> bool:
         "_use_sparse_mha",
         TARGETS[8],
     )
+    original_get_kv_b_proj_input_dtype = require_callable(
+        mla,
+        "_get_kv_b_proj_input_dtype",
+        TARGETS[9],
+    )
     require_exact_signature(
         original_use_sparse_mha,
         TARGETS[8],
         positional=("self", "attn_metadata"),
+    )
+    require_exact_signature(
+        original_get_kv_b_proj_input_dtype,
+        TARGETS[9],
+        positional=("kv_b_proj", "use_fp8_prefill"),
     )
     require_exact_signature(
         original_cache_gather,
@@ -374,6 +386,21 @@ def apply_to_module(module: ModuleType) -> bool:
             return False
         return original_use_sparse_mha(self, attn_metadata)
 
+    @functools.wraps(original_get_kv_b_proj_input_dtype)
+    def hcu_get_kv_b_proj_input_dtype(kv_b_proj, use_fp8_prefill):
+        weight = getattr(kv_b_proj, "weight", None)
+        if weight is not None and weight.dtype == torch_module.int8:
+            # The MLA context-prefill call site passes only an activation
+            # tensor, never the (quantized_tensor, scale) tuple accepted by
+            # fused linear paths.
+            # Preserve the floating activation so either the upstream Triton
+            # kernel or the HCU custom kernel can quantize it with its scale.
+            return kv_b_proj.params_dtype
+        return original_get_kv_b_proj_input_dtype(
+            kv_b_proj,
+            use_fp8_prefill,
+        )
+
     for function in (
         hcu_init,
         hcu_full_forward,
@@ -384,6 +411,7 @@ def apply_to_module(module: ModuleType) -> bool:
         hcu_split_batch,
         hcu_cache_gather,
         hcu_use_sparse_mha,
+        hcu_get_kv_b_proj_input_dtype,
     ):
         setattr(function, _WRAPPER, True)
     setattr(cls, "_vllm_hcu_original_init", original_init)
@@ -394,6 +422,11 @@ def apply_to_module(module: ModuleType) -> bool:
     setattr(metadata_cls, "_vllm_hcu_original_init", metadata_init)
     setattr(builder_cls, "_vllm_hcu_original_build", builder)
     setattr(mla, "_vllm_hcu_original_split_decodes_and_prefills", split_batch)
+    setattr(
+        mla,
+        "_vllm_hcu_original_get_kv_b_proj_input_dtype",
+        original_get_kv_b_proj_input_dtype,
+    )
     setattr(cls, "__init__", hcu_init)
     setattr(cls, "forward", hcu_full_forward)
     setattr(cls, "forward_impl", hcu_forward)
@@ -403,6 +436,11 @@ def apply_to_module(module: ModuleType) -> bool:
     setattr(builder_cls, "build", hcu_build)
     setattr(mla, "split_decodes_and_prefills", hcu_split_batch)
     setattr(mla, "maybe_gather_mla_latent_cache_inputs", hcu_cache_gather)
+    setattr(
+        mla,
+        "_get_kv_b_proj_input_dtype",
+        hcu_get_kv_b_proj_input_dtype,
+    )
     setattr(mla, _MARKER, True)
     return True
 
