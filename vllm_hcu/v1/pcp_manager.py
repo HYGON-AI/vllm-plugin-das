@@ -123,6 +123,7 @@ class HcuPCPManager:
         self._block_tables = block_tables
         self._global_batch: InputBatch | None = None
         self._global_attn_ready = False
+        self._cached_global_block_tables: tuple[torch.Tensor, ...] | None = None
         self._hidden_restore_idx: torch.Tensor | None = None
         self._padded_gather_idx: torch.Tensor | None = None
         self._gathered_kv_write_mask: torch.Tensor | None = None
@@ -518,6 +519,7 @@ class HcuPCPManager:
         self._global_batch = input_batch
         self._global_has_prefill = bool(input_batch.is_prefilling_np.any())
         self._global_attn_ready = False
+        self._cached_global_block_tables = None
         segments_by_rank, per_rank_num_tokens = self._build_batch_layout(
             input_batch,
             padded_num_tokens=padded_num_tokens,
@@ -935,6 +937,7 @@ class HcuPCPManager:
         except Exception:
             clear_active_dsa_broadcast_block_ids()
             return
+        self._cached_global_block_tables = global_tables
         set_active_dsa_broadcast_block_ids_from_tables(global_tables)
 
     def prepare_global_attn(
@@ -946,20 +949,22 @@ class HcuPCPManager:
             raise RuntimeError("PCP global attention slots are not prepared")
         assert self._global_batch is not None
         assert self._global_slot_mappings is not None
-        try:
-            block_tables = self._block_tables.gather_block_tables(
-                self._global_batch.idx_mapping,
-                num_reqs_padded=self._global_batch.num_reqs_after_padding,
-            )
-        except Exception:
+        block_tables = self._cached_global_block_tables
+        if block_tables is None:
             try:
-                from vllm_hcu.v1.dsa_cache_layer_split import (
-                    clear_active_dsa_broadcast_block_ids,
+                block_tables = self._block_tables.gather_block_tables(
+                    self._global_batch.idx_mapping,
+                    num_reqs_padded=self._global_batch.num_reqs_after_padding,
                 )
+            except Exception:
+                try:
+                    from vllm_hcu.v1.dsa_cache_layer_split import (
+                        clear_active_dsa_broadcast_block_ids,
+                    )
 
-                clear_active_dsa_broadcast_block_ids()
-            finally:
-                raise
+                    clear_active_dsa_broadcast_block_ids()
+                finally:
+                    raise
         try:
             from vllm_hcu.v1.dsa_cache_layer_split import (
                 set_active_dsa_broadcast_block_ids_from_tables,
