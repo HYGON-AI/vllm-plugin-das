@@ -62,11 +62,18 @@ def _offloaded_param_ids() -> set[int]:
     if not isinstance(offloader, PrefetchOffloader):
         return set()
 
-    return {
-        id(param_offloader._param)
-        for module_offloader in offloader.module_offloaders
-        for param_offloader in module_offloader._param_offloaders.values()
-    }
+    param_ids = set()
+    for module_offloader in offloader.module_offloaders:
+        param_offloaders = getattr(module_offloader, "_param_offloaders", {})
+        for param_offloader in param_offloaders.values():
+            if getattr(param_offloader, "_param_deleted", False):
+                continue
+            try:
+                param_ids.add(id(param_offloader._param))
+            except AttributeError:
+                # Post-load processing may delete transient parameters.
+                continue
+    return param_ids
 
 
 def bind_compressor_nt_weights(model: torch.nn.Module | None) -> int:
