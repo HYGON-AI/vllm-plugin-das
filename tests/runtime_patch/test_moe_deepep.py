@@ -4068,6 +4068,28 @@ def test_deepep_auto_ht_workspace_reserves_dispatcher_receive_bound(
     )
 
 
+def test_deepep_auto_ht_workspace_uses_global_bound_for_dsv4_pcp() -> None:
+    from vllm.model_executor.layers.fused_moe.activation import MoEActivation
+    from vllm_hcu.model_executor.layers.fused_moe.experts import (
+        dpsk_v4_deep_gemm_moe as module,
+    )
+
+    experts = object.__new__(module.DeepEPAutoDeepGemmExperts)
+    experts.moe_config = SimpleNamespace(max_num_tokens=64, experts_per_token=10)
+    experts.num_dispatchers = 8
+    experts._fixed_use_low_latency = None
+    experts._use_low_latency_snapshot = False
+    experts._global_ht_token_bound = True
+    experts.ht_experts = object.__new__(module.DeepEPDeepGemmContiguousExperts)
+    experts.ll_experts = object.__new__(module.DeepEPDeepGemmMaskedExperts)
+
+    args = (64, 1_536, 2_048, 10, 512, 32, None, MoEActivation.SILU)
+    shapes = experts.workspace_shapes(*args)
+    expected = experts.ht_experts.workspace_shapes(*args)
+
+    assert shapes == expected
+
+
 def _slimquant_w4a8_auto_experts(fixed_use_low_latency: bool | None):
     from vllm_hcu.model_executor.layers.fused_moe.experts import (
         dpsk_v4_deep_gemm_moe as module,
@@ -4882,6 +4904,7 @@ def test_channel_int8_auto_factory_builds_unified_ht_ll_kernel(
         "max_num_tokens": 64,
         "num_dispatchers": 8,
         "fixed_use_low_latency": None,
+        "global_ht_token_bound": False,
     }
 
 
