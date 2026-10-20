@@ -8,8 +8,31 @@ import pytest
 import torch
 
 from vllm_hcu.v1.attention.ops.fp8_paged_mqa_gfx938 import (
+    _gather_dense_pages_for_tables,
     gfx938_fp8_paged_mqa_logits,
 )
+
+
+def test_layer_split_page_gather_has_fixed_capture_shape(monkeypatch):
+    cache = torch.arange(5 * 2 * 3).reshape(5, 2, 1, 3)
+    table = torch.tensor([[3, -1, 3, 1]], dtype=torch.int32)
+    monkeypatch.setattr(torch.cuda, "is_current_stream_capturing", lambda: True)
+    monkeypatch.setattr(
+        torch,
+        "unique",
+        lambda *_args, **_kwargs: pytest.fail(
+            "capture path must not use data-dependent unique"
+        ),
+    )
+
+    dense, remapped = _gather_dense_pages_for_tables(cache, table)
+
+    assert dense.shape == (table.numel(), 2, 1, 3)
+    assert torch.equal(dense[0], cache[3])
+    assert torch.equal(dense[1], cache[0])
+    assert torch.equal(dense[2], cache[3])
+    assert torch.equal(dense[3], cache[1])
+    assert torch.equal(remapped, torch.tensor([[0, -1, 2, 3]], dtype=torch.int32))
 
 
 def _case(
@@ -277,6 +300,33 @@ def test_layer_interleaved_physical_pages_match_oracle():
         table,
         max_len,
     )
+
+    _check(actual, expected)
+
+
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="requires HCU GPU")
+def test_layer_interleaved_pages_support_graph_capture():
+    args, expected = _case(32, 513, 1, 3, True)
+    q, cache, weights, lengths, table, max_len = args
+    page_size = cache.shape[1]
+    backing = torch.empty(
+        (cache.shape[0], page_size + 1, *cache.shape[2:]),
+        dtype=cache.dtype,
+        device=cache.device,
+    )
+    interleaved_pages = backing[:, :page_size]
+    interleaved_pages.copy_(cache)
+    graph_args = (q, interleaved_pages, weights, lengths, table, max_len)
+
+    stream = torch.cuda.Stream()
+    stream.wait_stream(torch.cuda.current_stream())
+    with torch.cuda.stream(stream):
+        gfx938_fp8_paged_mqa_logits(*graph_args)
+    torch.cuda.current_stream().wait_stream(stream)
+    graph = torch.cuda.CUDAGraph()
+    with torch.cuda.graph(graph):
+        actual = gfx938_fp8_paged_mqa_logits(*graph_args)
+    graph.replay()
 
     _check(actual, expected)
 
