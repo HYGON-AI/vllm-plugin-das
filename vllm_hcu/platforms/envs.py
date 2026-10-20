@@ -71,6 +71,7 @@ if TYPE_CHECKING:
     VLLM_HCU_MAMBA_SSM_CACHE_DTYPE: bool = False
     VLLM_HCU_USE_AITER_W4A16_MOE: bool = False
     VLLM_HCU_USE_TORCH_EPLB_MAP_RECORD: bool = False
+    VLLM_HCU_MOE_PAD_MASK_INPLACE: bool = False
     VLLM_HCU_USE_AITER_MOE_SHUFFLE: bool = True
     VLLM_HCU_USE_AITER_MOE_CONFIG: bool = True
     VLLM_HCU_MOONCAKE_TTFT_TRACE: bool = False
@@ -568,6 +569,16 @@ hcu_vllm_environment_variables: dict[str, Callable[[], Any]] = {
     # recording instead of the fused Triton kernel.
     "VLLM_HCU_USE_TORCH_EPLB_MAP_RECORD":
         lambda: (os.environ.get("VLLM_HCU_USE_TORCH_EPLB_MAP_RECORD", "False").lower() in
+                    ("true", "1")),
+
+    # If set, HcuGroupedTopKRouter fills the padded-row region of the
+    # LightOp moe_fused_gate output (topk_weights/topk_ids) in place instead
+    # of via out-of-place masked_fill. The LightOp output is freshly
+    # allocated and never aliased, so the out-of-place clone this skips is
+    # pure overhead: it shows up as a Memcpy DtoD per tensor right after
+    # moe_fused_gate in the profiler trace.
+    "VLLM_HCU_MOE_PAD_MASK_INPLACE":
+        lambda: (os.environ.get("VLLM_HCU_MOE_PAD_MASK_INPLACE", "False").lower() in
                     ("true", "1")),
 
     # Shuffle AITER MoE weights for any quantization mode (default True).
