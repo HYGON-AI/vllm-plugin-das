@@ -6878,7 +6878,9 @@ def test_deepep_auto_uses_internal_dispatch_for_pcp_without_dp(monkeypatch, pcp)
     assert not parallel.use_deepep_auto_kernels
 
 
-@pytest.mark.parametrize("mode", ["shared", "disabled", "layouts_differ"])
+@pytest.mark.parametrize(
+    "mode", ["shared", "disabled", "master_disabled", "layouts_differ"]
+)
 def test_channel_fp8_auto_experts_share_identical_marlin_layouts(
     monkeypatch: pytest.MonkeyPatch, mode: str,
 ):
@@ -6888,6 +6890,10 @@ def test_channel_fp8_auto_experts_share_identical_marlin_layouts(
 
     monkeypatch.setenv("VLLM_HCU_DEEPEP_AUTO_SHARED_WEIGHTS",
                        "0" if mode == "disabled" else "1")
+    monkeypatch.setenv(
+        "VLLM_HCU_USE_CUSTOM_OPS",
+        "0" if mode == "master_disabled" else "1",
+    )
 
     def make_experts():
         experts = object.__new__(module.DeepEPAutoDeepGemmExperts)
