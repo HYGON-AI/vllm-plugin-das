@@ -208,6 +208,60 @@ def test_kda_callback_keeps_legacy_constructor():
     assert len(calls) == 1
 
 
+@pytest.mark.parametrize("selection", ["empty", "mlp", "other_layer", "ignored"])
+def test_kda_callback_preserves_unquantized_qkv(selection):
+    cfg = config()
+    parent = "language_model.model.layers.1.self_attn"
+    if selection == "empty":
+        cfg.w8a8_include = []
+    elif selection == "mlp":
+        cfg.w8a8_include = ["language_model.model.layers.*.mlp.*"]
+    elif selection == "other_layer":
+        cfg.w8a8_include = ["language_model.model.layers.0.self_attn.*"]
+    else:
+        cfg.ignore.append(parent + ".*")
+    # Verify these configurations really select floating Q/K/V in production.
+    for branch in ("q_proj", "k_proj", "v_proj"):
+        layer = ColumnParallelLinear.__new__(ColumnParallelLinear)
+        nn.Module.__init__(layer)
+        assert isinstance(cfg.get_quant_method(layer, f"{parent}.{branch}"),
+                          UnquantizedLinearMethod)
+
+    target = ModuleType(kda_patch.TARGET_MODULE)
+    calls = []
+    sentinel = object()
+
+    def native(*args, **kwargs):
+        calls.append((args, kwargs))
+        return sentinel
+
+    def forbidden_column(*args, **kwargs):
+        pytest.fail("Floating Q/K/V must retain the native merged constructor")
+
+    target._KimiGDNMergedColumnParallelLinear = native
+    target.ColumnParallelLinear = forbidden_column
+    kda_patch.apply_to_module(target)
+    args = (4, [32] * 4 + [8, 16], 4, 1)
+    kwargs = dict(quant_config=cfg, prefix=f"{parent}.in_proj_qkvgfab", bias=False)
+    assert target._KimiGDNMergedColumnParallelLinear(*args, **kwargs) is sentinel
+    assert calls == [(args, kwargs)]
+
+
+def test_kda_callback_keeps_selected_qkv_quantized():
+    target = ModuleType(kda_patch.TARGET_MODULE)
+    column, merged = _cpu_factories(1, 0)
+    target.ColumnParallelLinear = column
+    target._KimiGDNMergedColumnParallelLinear = merged
+    kda_patch.apply_to_module(target)
+    projection = target._KimiGDNMergedColumnParallelLinear(
+        4, [32] * 4 + [8, 16], 4, 1, quant_config=config(),
+        prefix="language_model.model.layers.1.self_attn.in_proj_qkvgfab", bias=False)
+    assert isinstance(projection, KimiK3MixedKDAProjection)
+    assert all(getattr(projection, branch).weight.dtype == torch.int8
+               for branch in ("q_proj", "k_proj", "v_proj"))
+    assert projection.fp_gate.weight.is_floating_point()
+
+
 def test_callbacks_registered():
     from vllm_hcu.patch.worker import worker_callback_names
     callbacks = dict(worker_callback_names())

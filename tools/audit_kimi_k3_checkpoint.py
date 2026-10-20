@@ -13,6 +13,7 @@ import array
 from collections import Counter
 import json
 import math
+import os
 from pathlib import Path
 import re
 import struct
@@ -144,9 +145,17 @@ def audit(root, tp=16):
             if size > 100_000_000:
                 raise ValueError('Unreasonable safetensors header size')
             header = json.loads(stream.read(size))
+            data_size = os.fstat(stream.fileno()).st_size - 8 - size
             if set(header) - {'__metadata__'} != indexed:
                 errors.append(f'Index/header mismatch: {shard}')
             for name in indexed:
+                if name not in header:
+                    continue
+                info = header[name]
+                start, end = info['data_offsets']
+                if not 0 <= start <= end <= data_size:
+                    errors.append(f'Data offsets outside shard: {name}')
+                    continue
                 if name.startswith(('vision_tower.', 'mm_projector.')):
                     vision += 1  # Inventory only; not proof of visual-model loading.
                     continue
@@ -160,15 +169,11 @@ def audit(root, tp=16):
                 if spec is None:
                     errors.append(f'Unknown language tensor: {name}')
                     continue
-                if name not in header:
-                    continue
-                info = header[name]
                 counts[pattern] += 1
                 routes[spec['route']] += 1
                 if info['dtype'] != spec['dtype'] or info['shape'] != spec['shape']:
                     errors.append(f'Shape/dtype mismatch: {name}')
                     continue
-                start, end = info['data_offsets']
                 width = {'BF16': 2, 'F32': 4, 'I8': 1}[spec['dtype']]
                 if end - start != math.prod(spec['shape']) * width:
                     errors.append(f'Byte extent mismatch: {name}')

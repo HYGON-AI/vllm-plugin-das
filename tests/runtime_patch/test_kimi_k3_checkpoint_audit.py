@@ -73,3 +73,33 @@ def test_audit_rejects_missing_unknown_or_invalid_parameters(tmp_path, case):
     _write(tmp_path, mutate)
     result = audit_module.audit(tmp_path)
     assert not result['passed'] and result['errors']
+
+
+@pytest.mark.parametrize('case', ['past_eof', 'negative', 'reversed', 'truncated', 'vision'])
+def test_audit_rejects_invalid_data_ranges(tmp_path, case):
+    def add_vision(entries):
+        if case == 'vision':
+            entries['vision_tower.test.weight'] = dict(shape=[1], dtype='BF16', count=1)
+
+    _write(tmp_path, add_vision)
+    path = tmp_path / 'model.safetensors'
+    raw = path.read_bytes()
+    size = struct.unpack('<Q', raw[:8])[0]
+    header = json.loads(raw[8:8 + size])
+    payload = raw[8 + size:]
+    name = ('vision_tower.test.weight' if case == 'vision'
+            else 'language_model.model.embed_tokens.weight')
+    start, end = header[name]['data_offsets']
+    length = end - start
+    if case == 'truncated':
+        payload = payload[:-1]
+    else:
+        header[name]['data_offsets'] = (
+            [-length, 0] if case == 'negative' else
+            [end, start] if case == 'reversed' else
+            [10**12, 10**12 + length])
+    encoded = json.dumps(header).encode()
+    path.write_bytes(struct.pack('<Q', len(encoded)) + encoded + payload)
+    result = audit_module.audit(tmp_path)
+    assert not result['passed']
+    assert any('Data offsets outside shard' in error for error in result['errors'])

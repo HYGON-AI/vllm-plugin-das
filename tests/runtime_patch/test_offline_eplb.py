@@ -260,7 +260,9 @@ def _setup_state(tmp_path, monkeypatch: pytest.MonkeyPatch, mode="static"):
     ):
         for name in names:
             monkeypatch.setattr(owner, name, inspect.unwrap(getattr(owner, name)))
-    monkeypatch.delattr(upstream, api._MARKER, raising=False)
+    # Register restoration even when the marker did not exist before apply().
+    # delattr(..., raising=False) records no undo action for an absent marker.
+    monkeypatch.setattr(upstream, api._MARKER, None, raising=False)
 
     model = GenericMoE()
     config, path = config_and_map(tmp_path)
@@ -989,6 +991,21 @@ def test_dynamic_eplb_delegates_to_current_initialization(
         "dynamic-model"
     ].physical_to_logical_map.tolist() == [[0, 1, 2, 0]] * 2
     assert not hasattr(fixture.state, "_vllm_hcu_offline_proposal_events")
+
+
+def test_setup_state_restores_offline_patch_state(tmp_path):
+    import vllm.distributed.eplb.eplb_state as upstream
+    import vllm_hcu.patch.worker.framework_opt.patch_offline_eplb as api
+
+    missing = object()
+    marker = getattr(upstream, api._MARKER, missing)
+    originals = tuple(getattr(owner, name) for owner, name in _offline_hooks(upstream))
+    with pytest.MonkeyPatch.context() as scoped:
+        _setup_state(tmp_path, scoped, mode="record")
+        assert getattr(upstream, api._MARKER, None) is not None
+    assert getattr(upstream, api._MARKER, missing) is marker
+    assert all(getattr(owner, name) is original
+               for (owner, name), original in zip(_offline_hooks(upstream), originals))
 
 
 def _isolated_offline_target():
