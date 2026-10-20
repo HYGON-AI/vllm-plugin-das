@@ -13,6 +13,16 @@ audit_module = importlib.util.module_from_spec(_spec)
 _spec.loader.exec_module(audit_module)
 
 
+def _rewrite_header(root, mutate):
+    path = root / 'model.safetensors'
+    raw = path.read_bytes()
+    size = struct.unpack('<Q', raw[:8])[0]
+    header = json.loads(raw[8:8 + size])
+    mutate(header)
+    encoded = json.dumps(header).encode()
+    path.write_bytes(struct.pack('<Q', len(encoded)) + encoded + raw[8 + size:])
+
+
 def _write(root, mutate=None):
     config = dict(hidden_size=4, vocab_size=32, num_hidden_layers=2,
                   num_attention_heads=16, q_lora_rank=4, kv_lora_rank=4,
@@ -163,3 +173,77 @@ def test_audit_accepts_unordered_header_with_empty_tensor(tmp_path):
     path.write_bytes(struct.pack('<Q', len(encoded)) + encoded + raw[8 + size:])
     result = audit_module.audit(tmp_path)
     assert result['passed'] and not result['errors']
+
+
+@pytest.mark.parametrize('prefix', ['vision_tower', 'mm_projector'])
+@pytest.mark.parametrize('case,message', [
+    ('extent', 'Byte extent mismatch'), ('dtype', 'Invalid tensor dtype'),
+    ('negative_shape', 'Invalid tensor shape'), ('fractional_shape', 'Invalid tensor shape'),
+])
+def test_vision_inventory_requires_valid_tensor_metadata(tmp_path, prefix, case, message):
+    from safetensors import SafetensorError, safe_open
+
+    name = prefix + '.test.weight'
+    _write(tmp_path, lambda entries: entries.update({name: dict(shape=[1], dtype='BF16')}))
+
+    def mutate(header):
+        info = header[name]
+        if case == 'extent':
+            info['shape'] = [2]
+        elif case == 'dtype':
+            info['dtype'] = 'INVALID'
+        else:
+            info['shape'] = [-1] if case == 'negative_shape' else [1.0]
+
+    _rewrite_header(tmp_path, mutate)
+    # Offsets remain a valid partition: only the tensor metadata is invalid.
+    with pytest.raises(SafetensorError):
+        with safe_open(tmp_path / 'model.safetensors', framework='numpy'):
+            pass
+    result = audit_module.audit(tmp_path)
+    assert not result['passed']
+    assert any(message in error and name in error for error in result['errors'])
+
+
+@pytest.mark.parametrize('dtype,shape,byte_count', [
+    ('F16', [1], 2), ('F32', [], 4), ('F64', [], 8),
+    ('U8', [2], 2), ('BOOL', [2], 2), ('I16', [0], 0),
+])
+def test_vision_inventory_accepts_generic_valid_metadata(tmp_path, dtype, shape, byte_count):
+    from safetensors import safe_open
+
+    name = 'vision_tower.test.weight'
+    _write(tmp_path, lambda entries: entries.update({name: dict(shape=[byte_count], dtype='I8')}))
+
+    def mutate(header):
+        header[name].update(dtype=dtype, shape=shape)
+
+    _rewrite_header(tmp_path, mutate)
+    with safe_open(tmp_path / 'model.safetensors', framework='numpy'):
+        pass
+    result = audit_module.audit(tmp_path)
+    assert result['passed'] and result['vision_inventory_only'] == 1
+
+
+@pytest.mark.parametrize('projection', ['w1', 'w2', 'w3'])
+@pytest.mark.parametrize('alias', ['00', '01'])
+def test_audit_rejects_noncanonical_expert_ids(tmp_path, projection, alias):
+    from safetensors import safe_open
+
+    owner = 'language_model.model.layers.1.block_sparse_moe.experts.'
+
+    def mutate(entries):
+        for suffix in ('weight', 'weight_scale'):
+            source = f'{owner}1.{projection}.{suffix}'
+            entries[f'{owner}{alias}.{projection}.{suffix}'] = entries.pop(source)
+
+    _write(tmp_path, mutate)
+    # This is a valid safetensors container, but not valid expert coverage.
+    with safe_open(tmp_path / 'model.safetensors', framework='numpy'):
+        pass
+    result = audit_module.audit(tmp_path)
+    assert not result['passed']
+    assert any('Invalid expert ID' in error and f'.{alias}.' in error
+               for error in result['errors'])
+    assert any('Expert ID coverage mismatch' in error and f'.{projection}.' in error
+               for error in result['errors'])

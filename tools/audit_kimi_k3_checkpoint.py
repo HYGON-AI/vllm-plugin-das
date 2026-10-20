@@ -2,8 +2,9 @@
 """Read-only K3 mixed-checkpoint name/shape/scale audit. No torch/vLLM imports.
 
 This is an independent checkpoint contract check, not model construction or a
-claim that GPU loaders/kernels have run. Vision is inventoried separately for
---language-model-only. Supported contract: full-rank KDA, SlimQuant per-channel
+claim that GPU loaders/kernels have run. Vision tensors receive container
+metadata validation and inventory, without architecture semantics. Supported
+contract: full-rank KDA, SlimQuant per-channel
 INT4 experts and W8A8 linears, as used by the Channel checkpoint.
 """
 from __future__ import annotations
@@ -18,6 +19,36 @@ from pathlib import Path
 import re
 import struct
 import sys
+
+
+# Safetensors storage widths, independent of torch/vLLM and model semantics.
+# Packed expert INT4 values in this checkpoint are serialized as I8 tensors.
+_DTYPE_BITS = {
+    'BOOL': 8, 'U8': 8, 'I8': 8,
+    'I16': 16, 'U16': 16, 'F16': 16, 'BF16': 16,
+    'I32': 32, 'U32': 32, 'F32': 32,
+    'I64': 64, 'U64': 64, 'F64': 64, 'C64': 64,
+    'F8_E4M3': 8, 'F8_E5M2': 8, 'F8_E8M0': 8,
+    'F8_E4M3FNUZ': 8, 'F8_E5M2FNUZ': 8,
+    'F4': 4, 'F6_E2M3': 6, 'F6_E3M2': 6,
+}
+
+
+def validate_tensor_extent(name, info, errors):
+    """Check container metadata even for inventory-only vision tensors."""
+    dtype, shape = info.get('dtype'), info.get('shape')
+    if not isinstance(dtype, str) or dtype not in _DTYPE_BITS:
+        errors.append(f'Invalid tensor dtype: {name}: {dtype!r}')
+        return False
+    if not isinstance(shape, list) or any(type(dim) is not int or dim < 0 for dim in shape):
+        errors.append(f'Invalid tensor shape: {name}: {shape!r}')
+        return False
+    bits = math.prod(shape) * _DTYPE_BITS[dtype]
+    start, end = info['data_offsets']
+    if bits % 8 or end - start != bits // 8:
+        errors.append(f'Byte extent mismatch: {name}')
+        return False
+    return True
 
 
 def language_schema(c):
@@ -135,6 +166,8 @@ def validate_shard_ranges(header, data_size, shard, errors):
             errors.append(f'Data offsets outside shard: {name}')
             invalid.add(name)
             continue
+        if not validate_tensor_extent(name, info, errors):
+            invalid.add(name)
         ranges.append((start, end, name))
     cursor = 0
     for start, end, name in sorted(ranges):
@@ -161,6 +194,8 @@ def audit(root, tp=16):
     for name, shard in index.items():
         shards.setdefault(shard, set()).add(name)
     counts = Counter()
+    expert_ids = {name: set() for name in schema if '.experts.*.' in name}
+    expected_expert_ids = set(range(c['num_experts'])) if expert_ids else set()
     routes = Counter()
     w8_scales = 0
     w8_values = 0
@@ -190,21 +225,21 @@ def audit(root, tp=16):
                 pattern = name
                 expert = re.search(r'\.experts\.(\d+)\.', name)
                 if expert:
-                    if not 0 <= int(expert[1]) < c['num_experts']:
+                    expert_id = int(expert[1])
+                    if expert[1] != str(expert_id) or expert_id not in expected_expert_ids:
                         errors.append(f'Invalid expert ID: {name}')
+                        continue
                     pattern = name[:expert.start(1)] + '*' + name[expert.end(1):]
                 spec = schema.get(pattern)
                 if spec is None:
                     errors.append(f'Unknown language tensor: {name}')
                     continue
                 counts[pattern] += 1
+                if expert:
+                    expert_ids[pattern].add(expert_id)
                 routes[spec['route']] += 1
                 if info['dtype'] != spec['dtype'] or info['shape'] != spec['shape']:
                     errors.append(f'Shape/dtype mismatch: {name}')
-                    continue
-                width = {'BF16': 2, 'F32': 4, 'I8': 1}[spec['dtype']]
-                if end - start != math.prod(spec['shape']) * width:
-                    errors.append(f'Byte extent mismatch: {name}')
                     continue
                 if name.endswith('.weight_scale') and spec['route'] != 'packed_expert':
                     stream.seek(8 + size + start)
@@ -220,6 +255,10 @@ def audit(root, tp=16):
     for name, spec in schema.items():
         if counts[name] != spec['count']:
             errors.append(f'Missing/excess tensor: {name}: {counts[name]} != {spec["count"]}')
+        if name in expert_ids and expert_ids[name] != expected_expert_ids:
+            missing = sorted(expected_expert_ids - expert_ids[name])
+            extra = sorted(expert_ids[name] - expected_expert_ids)
+            errors.append(f'Expert ID coverage mismatch: {name}: missing={missing}, extra={extra}')
     for value in (c['linear_attn_config']['num_heads'], c['num_attention_heads'],
                   c['moe_intermediate_size'], c['intermediate_size']):
         if value % tp:
