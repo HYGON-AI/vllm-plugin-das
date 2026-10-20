@@ -3,6 +3,7 @@
 
 from __future__ import annotations
 
+from contextlib import nullcontext
 import importlib
 import linecache
 import os
@@ -2027,6 +2028,66 @@ def test_moe_layer_forward_and_repacked_weight_contract(
         (2, 3),
         (2, 2),
     ]
+
+    experts._dsv4_channel_deepgemm_layout = "contiguous+masked"
+    experts._dsv4_channel_deepgemm_masked_w13 = torch.tensor(
+        [[[101, 102]], [[201, 202]]]
+    )
+    experts._dsv4_channel_deepgemm_masked_w2 = torch.tensor(
+        [[[103, 104]], [[203, 204]]]
+    )
+    ll_delegate = SimpleNamespace(
+        _deepgemm_w13=experts._dsv4_channel_deepgemm_masked_w13,
+        _deepgemm_w2=experts._dsv4_channel_deepgemm_masked_w2,
+    )
+    weights = experts.get_expert_weights()
+    assert [tuple(weight.shape) for weight in weights] == [
+        (2, 12),
+        (2, 8),
+        (2, 3),
+        (2, 2),
+        (2, 2),
+        (2, 2),
+    ]
+
+    class LocalCommunicator:
+        needs_profile_buffer_reservation = False
+
+        def set_transfer_context(self, old_indices, layer_idx):
+            pass
+
+        def add_send(self, tensors, dst_rank, expert_id):
+            raise AssertionError("single-rank rearrange must not send")
+
+        def add_recv(self, tensors, src_rank, expert_id):
+            raise AssertionError("single-rank rearrange must not receive")
+
+        def execute(self):
+            pass
+
+    from vllm_hcu.distributed.eplb_transfer_runtime import (
+        rearrange_expert_weights_inplace,
+    )
+
+    old_map = torch.tensor([[0, 1]])
+    new_map = torch.tensor([[1, 0]])
+    monkeypatch.setattr(torch.cuda, "stream", lambda _stream: nullcontext())
+    rearrange_expert_weights_inplace(
+        old_map,
+        new_map,
+        [weights],
+        [torch.empty_like(weight) for weight in weights],
+        SimpleNamespace(size=lambda: 1, rank=lambda: 0),
+        LocalCommunicator(),
+    )
+    assert torch.equal(
+        ll_delegate._deepgemm_w13,
+        torch.tensor([[[201, 202]], [[101, 102]]]),
+    )
+    assert torch.equal(
+        ll_delegate._deepgemm_w2,
+        torch.tensor([[[203, 204]], [[103, 104]]]),
+    )
 
     loaded = []
 
