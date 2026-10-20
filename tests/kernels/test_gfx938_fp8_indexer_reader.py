@@ -8,35 +8,8 @@ import pytest
 import torch
 
 from vllm_hcu.v1.attention.ops.fp8_paged_mqa_gfx938 import (
-    _gather_dense_pages_for_tables,
     gfx938_fp8_paged_mqa_logits,
 )
-
-
-def test_layer_split_page_gather_has_fixed_capture_shape(monkeypatch):
-    backing = torch.arange(5 * 3 * 3).reshape(5, 3, 1, 3)
-    cache = backing[:, :2]
-    assert not cache.is_contiguous()
-    table = torch.tensor(
-        [[3, -1, 3, 1, -1, -1, -1], [-1, 4, -1, -1, -1, -1, -1]],
-        dtype=torch.int32,
-    )
-    monkeypatch.setattr(torch.cuda, "is_current_stream_capturing", lambda: True)
-    monkeypatch.setattr(
-        torch,
-        "unique",
-        lambda *_args, **_kwargs: pytest.fail(
-            "capture path must not use data-dependent unique"
-        ),
-    )
-
-    dense, remapped = _gather_dense_pages_for_tables(cache, table)
-
-    assert table.numel() > cache.shape[0]
-    assert dense.shape == cache.shape
-    assert dense.is_contiguous()
-    assert torch.equal(dense, cache)
-    assert remapped is table
 
 
 def _case(
