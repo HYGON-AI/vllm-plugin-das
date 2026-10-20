@@ -125,6 +125,10 @@ def test_platform_framework_inventory_is_explicit_and_dependency_ordered():
             "vllm.distributed.utils",
         ),
         (
+            "platform.framework_opt.transfer_topology_kv_layout",
+            "vllm.distributed.kv_transfer.kv_connector.utils",
+        ),
+        (
             "platform.framework_opt.hcu_mooncake_connector",
             "vllm_hcu.distributed.kv_transfer.kv_connector.v1.mooncake."
             "mooncake_connector",
@@ -140,6 +144,14 @@ def test_platform_framework_inventory_is_explicit_and_dependency_ordered():
         (
             "platform.framework_opt.pcp_kv_cache_utils",
             "vllm.v1.core.kv_cache_utils",
+        ),
+        (
+            "platform.framework_opt.dsa_layer_split_kv_config",
+            "vllm.v1.core.kv_cache_utils",
+        ),
+        (
+            "platform.framework_opt.packed_kv_offload",
+            "vllm.v1.simple_kv_offload.manager",
         ),
         (
             "platform.framework_opt.qwen4_exp_mtp_kv_cache_groups",

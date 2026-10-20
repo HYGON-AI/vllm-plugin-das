@@ -12,6 +12,10 @@ _HCU_BOOLEAN_OPTIONS = {
     "enable_lightly_cp": "Enable HCU lightly context parallelism.",
     "enable_lightly_cplb": "Enable HCU lightly-CP load balancing.",
     "enable_custom_sp": "Enable HCU custom runtime sequence parallelism.",
+    "enable_dsa_cache_layer_split": (
+        "Enable SGLang-compatible DSA cache layer split across PCP ranks "
+        "for Mooncake PD-prefill producers."
+    ),
 }
 _DEEP_GEMM_BACKEND = "deep_gemm"
 _LEGACY_DEEP_GEMM_BACKEND = "dpsk_deep_gemm"

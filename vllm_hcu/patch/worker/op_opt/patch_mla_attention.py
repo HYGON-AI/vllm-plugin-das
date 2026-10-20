@@ -25,6 +25,7 @@ TARGETS = (
     f"{TARGET_MODULE}.maybe_gather_mla_latent_cache_inputs",
     f"{TARGET_MODULE}.MLAAttention._use_sparse_mha",
     f"{TARGET_MODULE}._get_kv_b_proj_input_dtype",
+    f"{TARGET_MODULE}.MLAAttention.bind_kv_cache",
 )
 _MARKER = "_vllm_hcu_mla_attention_applied"
 _WRAPPER = "_vllm_hcu_mla_attention_wrapper"
@@ -46,6 +47,7 @@ def apply_to_module(module: ModuleType) -> bool:
         (mla, "maybe_gather_mla_latent_cache_inputs", TARGETS[7], _WRAPPER),
         (cls, "_use_sparse_mha", TARGETS[8], _WRAPPER),
         (mla, "_get_kv_b_proj_input_dtype", TARGETS[9], _WRAPPER),
+        (cls, "bind_kv_cache", TARGETS[10], _WRAPPER),
     )
     if already_applied(mla, _MARKER, wrapped):
         return False
@@ -94,6 +96,16 @@ def apply_to_module(module: ModuleType) -> bool:
         original_use_sparse_mha,
         TARGETS[8],
         positional=("self", "attn_metadata"),
+    )
+    original_bind_kv_cache = require_callable(
+        cls,
+        "bind_kv_cache",
+        TARGETS[10],
+    )
+    require_exact_signature(
+        original_bind_kv_cache,
+        TARGETS[10],
+        positional=("self", "kv_cache"),
     )
     require_exact_signature(
         original_get_kv_b_proj_input_dtype,
@@ -193,11 +205,13 @@ def apply_to_module(module: ModuleType) -> bool:
         from vllm.config import get_current_vllm_config_or_none
 
         vllm_config = get_current_vllm_config_or_none()
-        self._hcu_kimi_k3 = (
-            vllm_config is not None
-            and getattr(vllm_config.model_config.hf_config, "model_type", None)
-            == "kimi_k3"
+        model_config = (
+            getattr(vllm_config, "model_config", None)
+            if vllm_config is not None
+            else None
         )
+        hf_config = getattr(model_config, "hf_config", None)
+        self._hcu_kimi_k3 = getattr(hf_config, "model_type", None) == "kimi_k3"
         self._hcu_feature_config = get_hcu_config(vllm_config)
         self._hcu_pcp_world_size = configured_pcp_world_size(vllm_config)
         self._hcu_use_pcp = self._hcu_pcp_world_size > 1
@@ -217,12 +231,46 @@ def apply_to_module(module: ModuleType) -> bool:
         output_shape=None,
         q_dcp_replicated=None,
     ):
-        # Current upstream owns the direct MLA forward and HIPC cache writer.
-        # Keep its kernel split separate from HCU's per-token PCP ownership.
+        # Keep the official path unchanged when PCP/layer split is inactive.
         if not getattr(self, "_hcu_use_pcp", False):
             return original_full_forward(
                 self, q, kv_c_normed, k_pe, output_shape, q_dcp_replicated
             )
+        from vllm_hcu.model_executor.layers.attention.pcp import (
+            in_replicated_mtp_batch,
+        )
+
+        # MTP/draft batches are replicated and must use the official writer;
+        # entering the layer-split collective here would deadlock PCP ranks.
+        if in_replicated_mtp_batch():
+            return original_full_forward(
+                self, q, kv_c_normed, k_pe, output_shape, q_dcp_replicated
+            )
+
+        from vllm_hcu.v1.dsa_cache_layer_split import (
+            get_runtime_layer_split_state,
+        )
+
+        # Ordinary PCP (without DSA layer split) retains the target's evolved
+        # HIPC writer and ownership scope.
+        if get_runtime_layer_split_state() is None:
+            forward_context = get_forward_context()
+            attn_metadata_raw = forward_context.attn_metadata
+            if isinstance(attn_metadata_raw, dict):
+                attn_metadata = attn_metadata_raw.get(self.layer_name)
+            elif isinstance(attn_metadata_raw, list):
+                attn_metadata = attn_metadata_raw[0].get(self.layer_name)
+            else:
+                attn_metadata = attn_metadata_raw
+            from vllm_hcu.model_executor.layers.attention.pcp import (
+                pcp_cache_ownership_scope,
+            )
+
+            with pcp_cache_ownership_scope(attn_metadata):
+                return original_full_forward(
+                    self, q, kv_c_normed, k_pe, output_shape, q_dcp_replicated
+                )
+
         forward_context = get_forward_context()
         attn_metadata_raw = forward_context.attn_metadata
         if isinstance(attn_metadata_raw, dict):
@@ -231,14 +279,88 @@ def apply_to_module(module: ModuleType) -> bool:
             attn_metadata = attn_metadata_raw[0].get(self.layer_name)
         else:
             attn_metadata = attn_metadata_raw
-        from vllm_hcu.model_executor.layers.attention.pcp import (
-            pcp_cache_ownership_scope,
+
+        if attn_metadata is not None:
+            slot_mapping = forward_context.slot_mapping
+            if not isinstance(slot_mapping, dict):
+                raise RuntimeError(
+                    "PCP MLA direct forward requires per-layer slot mappings"
+                )
+            layer_slot_mapping = slot_mapping.get(self.layer_name)
+            if layer_slot_mapping is None:
+                raise RuntimeError(
+                    "PCP MLA slot mapping is missing for layer "
+                    f"{self.layer_name!r}"
+                )
+            # Decode-only / replicated steps force metadata.pcp_world_size=1
+            # (see patch_pcp_model_state._attach_pcp_cache_ownership). Match
+            # sparse_attn_indexer: compare against the logical width for this
+            # batch, not the configured PCP group size.
+            metadata_world_size = int(
+                getattr(attn_metadata, "pcp_world_size", 1)
+            )
+            expected_world_size = int(self._hcu_pcp_world_size)
+            if not bool(
+                getattr(attn_metadata, "pcp_has_global_prefill", True)
+            ):
+                expected_world_size = 1
+            if metadata_world_size != expected_world_size:
+                raise RuntimeError(
+                    "PCP MLA metadata world size mismatch: "
+                    f"layer={expected_world_size}, "
+                    f"metadata={metadata_world_size}"
+                )
+
+            from vllm_hcu.model_executor.layers.attention.pcp import (
+                maybe_gather_mla_latent_cache_inputs,
+            )
+            from vllm_hcu.v1.dsa_cache_layer_split import (
+                begin_mla_dsa_cache_write,
+                should_commit_durable_dsa_cache,
+            )
+
+            # The gather remains collective on every PCP rank. Only the owner
+            # commits durable cache rows; a remote-updatable scratch may still
+            # be patched on non-owners so remote_layer_id can skip a broadcast.
+            remote_updatable = begin_mla_dsa_cache_write(
+                self.kv_cache, self.layer_name
+            )
+            kv_for_cache, kpe_for_cache, layer_slot_mapping = (
+                maybe_gather_mla_latent_cache_inputs(
+                    kv_c_normed,
+                    k_pe,
+                    layer_slot_mapping,
+                    attn_metadata,
+                )
+            )
+            if should_commit_durable_dsa_cache(self.layer_name) or remote_updatable:
+                self.impl.do_kv_cache_update(
+                    kv_for_cache,
+                    kpe_for_cache,
+                    self.kv_cache,
+                    layer_slot_mapping,
+                    self.kv_cache_dtype,
+                    self._k_scale,
+                )
+
+        # Every PCP rank enters the owner broadcast, including profile/warmup
+        # forwards where metadata is absent. MTP returned above.
+        from vllm_hcu.v1.dsa_cache_layer_split import (
+            broadcast_dsa_cache_from_owner,
         )
 
-        with pcp_cache_ownership_scope(attn_metadata):
-            return original_full_forward(
-                self, q, kv_c_normed, k_pe, output_shape, q_dcp_replicated
-            )
+        broadcast_dsa_cache_from_owner(self.kv_cache, self.layer_name)
+        output = torch_module.empty(output_shape, dtype=q.dtype, device=q.device)
+        self.forward_impl(
+            q,
+            kv_c_normed,
+            k_pe,
+            self.kv_cache,
+            attn_metadata,
+            output=output,
+            q_dcp_replicated=q_dcp_replicated,
+        )
+        return output
 
     @functools.wraps(original_forward)
     def hcu_forward(self, q, k_c_normed, k_pe, kv_cache, attn_metadata, output,
@@ -401,6 +523,38 @@ def apply_to_module(module: ModuleType) -> bool:
             use_fp8_prefill,
         )
 
+    @functools.wraps(original_bind_kv_cache)
+    def hcu_bind_kv_cache(self, kv_cache):
+        # v0.28 bind_kv_cache asserts stride(0) % row_width == 0 before JIT
+        # warmup. DSA layer-split packed views intentionally keep a cross-
+        # family block_stride (same as 025 packing); that stride need not be
+        # divisible by the MLA last-dim width. 025 had no warmup assert here,
+        # so bind the cache and skip warmup when the layout is not row-aligned.
+        self.kv_cache = kv_cache.squeeze(1)
+        kernel_config = getattr(self._vllm_config, "kernel_config", None)
+        if not getattr(kernel_config, "enable_jit_warmup", False):
+            return
+        backend = getattr(self, "attn_backend", None)
+        backend_name = backend.get_name() if backend is not None else ""
+        if backend_name not in (
+            "FLASHMLA_SPARSE",
+            "FLASHINFER_MLA_SPARSE",
+            "FLASHINFER_MLA_SPARSE_SM120",
+            "DEEPSEEK_V32_INDEXER",
+        ):
+            return
+        row_width = int(self.kv_cache.shape[-1])
+        if row_width <= 0 or self.kv_cache.stride(0) % row_width != 0:
+            return
+        from vllm.v1.attention.backends.mla.sparse_utils import (
+            _CONVERT_REQ_INDEX_TO_GLOBAL_INDEX_KERNEL,
+        )
+
+        _CONVERT_REQ_INDEX_TO_GLOBAL_INDEX_KERNEL.register_warmup(
+            self._vllm_config,
+            block_stride_rows=self.kv_cache.stride(0) // row_width,
+        )
+
     for function in (
         hcu_init,
         hcu_full_forward,
@@ -412,6 +566,7 @@ def apply_to_module(module: ModuleType) -> bool:
         hcu_cache_gather,
         hcu_use_sparse_mha,
         hcu_get_kv_b_proj_input_dtype,
+        hcu_bind_kv_cache,
     ):
         setattr(function, _WRAPPER, True)
     setattr(cls, "_vllm_hcu_original_init", original_init)
@@ -419,6 +574,7 @@ def apply_to_module(module: ModuleType) -> bool:
     setattr(cls, "_vllm_hcu_original_forward_impl", original_forward)
     setattr(cls, "_vllm_hcu_original_process_weights", process)
     setattr(cls, "_vllm_hcu_original_use_sparse_mha", original_use_sparse_mha)
+    setattr(cls, "_vllm_hcu_original_bind_kv_cache", original_bind_kv_cache)
     setattr(metadata_cls, "_vllm_hcu_original_init", metadata_init)
     setattr(builder_cls, "_vllm_hcu_original_build", builder)
     setattr(mla, "_vllm_hcu_original_split_decodes_and_prefills", split_batch)
@@ -432,6 +588,7 @@ def apply_to_module(module: ModuleType) -> bool:
     setattr(cls, "forward_impl", hcu_forward)
     setattr(cls, "process_weights_after_loading", hcu_process)
     setattr(cls, "_use_sparse_mha", hcu_use_sparse_mha)
+    setattr(cls, "bind_kv_cache", hcu_bind_kv_cache)
     setattr(metadata_cls, "__init__", hcu_metadata_init)
     setattr(builder_cls, "build", hcu_build)
     setattr(mla, "split_decodes_and_prefills", hcu_split_batch)
