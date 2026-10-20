@@ -6,13 +6,14 @@ from __future__ import annotations
 
 from types import ModuleType
 
+from vllm.logger import init_logger
+
 from vllm_hcu.model_executor.layers.fused_moe.reference_moe import (
     apply_reference_moe,
 )
 from vllm_hcu.platforms import envs as henvs
 
 from ._common import (
-    PatchCompatibilityError,
     check_module_marker,
     load_exact_module,
     marked_wrapper,
@@ -21,11 +22,10 @@ from ._common import (
     require_parameter_names,
 )
 
-TARGET_MODULE = (
-    "vllm.model_executor.layers.fused_moe.experts.triton_moe"
-)
+TARGET_MODULE = "vllm.model_executor.layers.fused_moe.experts.triton_moe"
 PATCH_ID = "worker.op_opt.moe.experts.reference_unquantized"
 TARGETS = (f"{TARGET_MODULE}.TritonExperts.apply",)
+logger = init_logger(__name__)
 _MARKER = "_vllm_hcu_reference_moe_applied"
 _WRAPPER_MARKER = "_vllm_hcu_reference_moe_wrapper"
 _PARAMETERS = (
@@ -50,8 +50,8 @@ _PARAMETERS = (
 
 def _reject(reason: str) -> None:
     raise RuntimeError(
-        f"VLLM_HCU_USE_REFERENCE_MOE is enabled but {reason}; "
-        "disable it or use a supported unquantized Triton MoE configuration"
+        f"VLLM_HCU_USE_REFERENCE_MOE is enabled but {reason}; disable it or "
+        "use a supported unquantized Triton MoE configuration"
     )
 
 
@@ -72,7 +72,6 @@ def apply_to_module(module: ModuleType) -> bool:
     original = require_callable(experts_cls, "apply", TARGETS[0])
     require_parameter_names(original, TARGETS[0], _PARAMETERS)
 
-    @marked_wrapper(original, _WRAPPER_MARKER)
     def hcu_reference_apply(
         self,
         output,
@@ -118,7 +117,7 @@ def apply_to_module(module: ModuleType) -> bool:
         if not hidden_states.is_floating_point() or not w1.is_floating_point():
             _reject("the layer is not unquantized fp16/bf16/fp32")
         if expert_tokens_meta is not None:
-            _reject("the layer uses batched expert tokens metadata")
+            _reject("the layer uses batched expert token metadata")
 
         apply_reference_moe(
             output=output,
@@ -135,8 +134,16 @@ def apply_to_module(module: ModuleType) -> bool:
         return None
 
     setattr(experts_cls, "_vllm_hcu_original_apply", original)
-    setattr(experts_cls, "apply", hcu_reference_apply)
+    setattr(
+        experts_cls,
+        "apply",
+        marked_wrapper(original, _WRAPPER_MARKER, hcu_reference_apply),
+    )
     setattr(target, _MARKER, True)
+    logger.warning_once(
+        "VLLM_HCU_USE_REFERENCE_MOE is enabled: routed experts use the "
+        "plain-matmul reference kernel instead of the fused MoE kernel"
+    )
     return True
 
 

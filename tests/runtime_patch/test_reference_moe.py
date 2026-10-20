@@ -2,15 +2,14 @@
 # SPDX-FileCopyrightText: Copyright (c) 2026 Hygon Information Technology Co., Ltd.
 """CPU contracts for the reference (plain-matmul) expert kernel.
 
-The expected values are recomputed here token-by-token and slot-by-slot from
-the weight tensors, independent of the implementation under test. This keeps
-the test meaningful when the production code changes its chunking or
-accumulation strategy.
+Expected values are recomputed here token-by-token and slot-by-slot from the
+weight tensors, independently of the implementation under test.  That keeps the
+test meaningful if processing code changes its chunking or accumulation order.
 """
 
 from __future__ import annotations
 
-from types import SimpleNamespace
+from types import ModuleType, SimpleNamespace
 
 import pytest
 import torch
@@ -20,6 +19,7 @@ from vllm_hcu.model_executor.layers.fused_moe import reference_moe
 from vllm_hcu.model_executor.layers.fused_moe.reference_moe import (
     apply_reference_moe,
 )
+from vllm_hcu.patch.worker.op_opt.moe import patch_reference_moe
 
 NUM_EXPERTS = 4
 HIDDEN = 8
@@ -27,7 +27,7 @@ INTERMEDIATE = 6
 TOP_K = 2
 NUM_TOKENS = 5
 
-_TOP_K_IDS = (
+_TOPK_IDS = (
     (0, 1),
     (1, 2),
     (2, 3),
@@ -61,7 +61,7 @@ def _make_problem(
     topk_weights = torch.rand(
         NUM_TOKENS, TOP_K, generator=generator, dtype=torch.float32
     )
-    topk_ids = torch.tensor(_TOP_K_IDS, dtype=torch.int32)
+    topk_ids = torch.tensor(_TOPK_IDS, dtype=torch.int32)
     return hidden_states, w1, w2, topk_weights, topk_ids
 
 
@@ -91,13 +91,11 @@ def _expected_output(
     expert_map: torch.Tensor | None = None,
     apply_router_weight_on_input: bool = False,
 ) -> torch.Tensor:
-    """Token-by-token reference in FP32."""
+    """Token-by-token reference computed in FP32."""
 
     name = _activation_name(activation)
     gated = w1.shape[1] == 2 * w2.shape[2]
-    expected = torch.zeros(
-        hidden_states.shape[0], w2.shape[1], dtype=torch.float32
-    )
+    expected = torch.zeros(hidden_states.shape[0], w2.shape[1], dtype=torch.float32)
     for token in range(hidden_states.shape[0]):
         x = hidden_states[token].to(torch.float32)
         for slot in range(topk_ids.shape[1]):
@@ -106,9 +104,11 @@ def _expected_output(
                 continue
             if expert_map is None:
                 local = expert
+            elif expert >= expert_map.numel():
+                continue
             else:
                 local = int(expert_map[expert])
-            if local < 0:
+            if local < 0 or local >= w1.shape[0]:
                 continue
 
             weight = float(topk_weights[token, slot])
@@ -116,11 +116,15 @@ def _expected_output(
             gate_up = w1[local].to(torch.float32) @ activated_input
             if gated:
                 gate, up = gate_up.chunk(2)
-                act = _reference_activation(gate, name) * up
+                contribution = (
+                    w2[local].to(torch.float32)
+                    @ (_reference_activation(gate, name) * up)
+                )
             else:
-                act = _reference_activation(gate_up, name)
-
-            contribution = w2[local].to(torch.float32) @ act
+                contribution = (
+                    w2[local].to(torch.float32)
+                    @ _reference_activation(gate_up, name)
+                )
             if not apply_router_weight_on_input:
                 contribution = contribution * weight
             expected[token] += contribution
@@ -140,12 +144,18 @@ def _run_reference(
     output: torch.Tensor | None = None,
 ) -> torch.Tensor:
     if output is None:
-        # NaN pre-fill proves the kernel writes every output element.
-        output = torch.full(
-            (hidden_states.shape[0], w2.shape[1]),
-            float("nan"),
-            dtype=hidden_states.dtype,
-        )
+        if hidden_states.is_floating_point():
+            # NaN pre-fill proves every output element is written.
+            output = torch.full(
+                (hidden_states.shape[0], w2.shape[1]),
+                float("nan"),
+                dtype=hidden_states.dtype,
+            )
+        else:
+            output = torch.zeros(
+                (hidden_states.shape[0], w2.shape[1]),
+                dtype=hidden_states.dtype,
+            )
     result = apply_reference_moe(
         output=output,
         hidden_states=hidden_states,
@@ -163,10 +173,7 @@ def _run_reference(
 
 
 def _assert_matches(
-    actual: torch.Tensor,
-    expected: torch.Tensor,
-    rtol: float,
-    atol: float,
+    actual: torch.Tensor, expected: torch.Tensor, rtol: float, atol: float
 ) -> None:
     torch.testing.assert_close(
         actual.to(torch.float32), expected, rtol=rtol, atol=atol
@@ -177,24 +184,15 @@ def _assert_matches(
 def test_relu2_non_gated(activation: str) -> None:
     hidden, w1, w2, weights, ids = _make_problem(gated=False)
     actual = _run_reference(hidden, w1, w2, weights, ids, activation=activation)
-    expected = _expected_output(
-        hidden, w1, w2, weights, ids, activation=activation
-    )
+    expected = _expected_output(hidden, w1, w2, weights, ids, activation=activation)
     _assert_matches(actual, expected, 1e-5, 1e-5)
-    # relu2 is non-negative before the down projection; a corrupted kernel
-    # manifests as NaN or huge magnitudes, so bound the routed output too.
     assert torch.isfinite(actual).all()
+    # A corrupted kernel shows up as NaN or ~1e36 magnitudes.
+    assert actual.abs().max() < 1e3
 
 
-def test_silu_gated() -> None:
-    hidden, w1, w2, weights, ids = _make_problem(gated=True)
-    actual = _run_reference(hidden, w1, w2, weights, ids, activation="silu")
-    expected = _expected_output(hidden, w1, w2, weights, ids, activation="silu")
-    _assert_matches(actual, expected, 1e-5, 1e-5)
-
-
-@pytest.mark.parametrize("activation", ("gelu", "gelu_tanh"))
-def test_gelu_gated(activation: str) -> None:
+@pytest.mark.parametrize("activation", ("silu",))
+def test_silu_gated(activation: str) -> None:
     hidden, w1, w2, weights, ids = _make_problem(gated=True)
     actual = _run_reference(hidden, w1, w2, weights, ids, activation=activation)
     expected = _expected_output(
@@ -203,10 +201,31 @@ def test_gelu_gated(activation: str) -> None:
     _assert_matches(actual, expected, 1e-5, 1e-5)
 
 
+@pytest.mark.parametrize("activation", ("relu2", "relu_squared"))
+def test_relu2_gated(activation: str) -> None:
+    """The gated relu^2 layout (``relu2(gate) * up``) is used by NemotronH."""
+
+    hidden, w1, w2, weights, ids = _make_problem(gated=True)
+    actual = _run_reference(hidden, w1, w2, weights, ids, activation=activation)
+    expected = _expected_output(
+        hidden, w1, w2, weights, ids, activation=activation
+    )
+    _assert_matches(actual, expected, 1e-5, 1e-5)
+
+
+@pytest.mark.parametrize("activation", ("gelu", "gelu_tanh"))
+def test_gelu_gated(activation: str) -> None:
+    hidden, w1, w2, weights, ids = _make_problem(gated=True)
+    actual = _run_reference(hidden, w1, w2, weights, ids, activation=activation)
+    expected = _expected_output(hidden, w1, w2, weights, ids, activation=activation)
+    _assert_matches(actual, expected, 1e-5, 1e-5)
+
+
 def test_activation_enum_like_value_is_used() -> None:
     hidden, w1, w2, weights, ids = _make_problem(gated=False)
-    enum_like = SimpleNamespace(value="relu2")
-    actual = _run_reference(hidden, w1, w2, weights, ids, activation=enum_like)
+    actual = _run_reference(
+        hidden, w1, w2, weights, ids, activation=SimpleNamespace(value="relu2")
+    )
     expected = _expected_output(hidden, w1, w2, weights, ids, activation="relu2")
     _assert_matches(actual, expected, 1e-5, 1e-5)
 
@@ -215,44 +234,97 @@ def test_activation_enum_like_value_is_used() -> None:
 def test_dtype_is_preserved_and_every_row_written(
     dtype: torch.dtype, rtol: float, atol: float
 ) -> None:
-    hidden, w1, w2, weights, ids = _make_problem(dtype=dtype)
+    hidden, w1, w2, weights, ids = _make_problem(dtype=dtype, gated=False)
     actual = _run_reference(hidden, w1, w2, weights, ids)
     assert actual.dtype is dtype
+    assert torch.isfinite(actual).all()
     expected = _expected_output(hidden, w1, w2, weights, ids, activation="relu2")
     _assert_matches(actual, expected, rtol, atol)
 
 
 def test_expert_map_global_to_local() -> None:
-    # Global 0 -> local 0, global 1 absent, global 2 -> local 1, global 3 absent.
+    # Global 0 -> local 0, global 2 -> local 1; global 1 and 3 are remote.
     expert_map = torch.tensor([0, -1, 1, -1], dtype=torch.int32)
-    hidden, w1, w2, weights, ids = _make_problem(gated=False)
-    w1 = w1[:2]
-    w2 = w2[:2]
+
+    # All-positive weights keep every relu2 activation non-zero, so the
+    # assertions below test the mapping rather than the activation.
+    hidden = torch.ones(NUM_TOKENS, HIDDEN)
+    w1 = torch.ones(2, INTERMEDIATE, HIDDEN)
+    w2 = torch.ones(2, HIDDEN, INTERMEDIATE)
+    topk_weights = torch.full((NUM_TOKENS, TOP_K), 0.5)
+    ids = torch.tensor(_TOPK_IDS, dtype=torch.int32)
 
     actual = _run_reference(
-        hidden, w1, w2, weights, ids, expert_map=expert_map
+        hidden, w1, w2, topk_weights, ids, expert_map=expert_map
     )
     expected = _expected_output(
-        hidden, w1, w2, weights, ids, activation="relu2", expert_map=expert_map
+        hidden,
+        w1,
+        w2,
+        topk_weights,
+        ids,
+        activation="relu2",
+        expert_map=expert_map,
     )
     _assert_matches(actual, expected, 1e-5, 1e-5)
 
-    # Token 0 selects global experts 0 and 1; only expert 0 exists locally.
+    # Token 0 routes to global 0 (local) and 1 (remote).
     assert actual[0].abs().sum() > 0
-    # Token 2 selects global experts 2 and 3; only expert 2 exists locally.
+    # Token 2 routes to global 2 (local) and 3 (remote).
     assert actual[2].abs().sum() > 0
+    # Token 4 routes to global 1 and 3, both remote on this rank.
+    assert torch.equal(actual[4], torch.zeros(HIDDEN))
 
 
 def test_absent_local_experts_write_zeros() -> None:
     expert_map = torch.full((NUM_EXPERTS,), -1, dtype=torch.int32)
     hidden, w1, w2, weights, ids = _make_problem(gated=False)
-    w1 = w1[:2]
-    w2 = w2[:2]
-
     actual = _run_reference(
-        hidden, w1, w2, weights, ids, expert_map=expert_map
+        hidden, w1[:2], w2[:2], weights, ids, expert_map=expert_map
     )
     assert torch.equal(actual, torch.zeros_like(actual))
+
+
+def test_expert_map_shorter_than_global_ids_is_skipped() -> None:
+    """Ids beyond the map length cannot be local and must be ignored."""
+
+    expert_map = torch.tensor([0, 1], dtype=torch.int32)
+    hidden, w1, w2, weights, ids = _make_problem(gated=False)
+
+    actual = _run_reference(hidden, w1, w2, weights, ids, expert_map=expert_map)
+    expected = _expected_output(
+        hidden, w1, w2, weights, ids, activation="relu2", expert_map=expert_map
+    )
+    _assert_matches(actual, expected, 1e-5, 1e-5)
+
+
+def test_local_expert_map_reads_device_tensor_once() -> None:
+    """The mapping is resolved with a single host read, not one per expert."""
+
+    reads = 0
+    real = reference_moe._local_expert_map
+
+    def counting(expert_map, num_local_experts):
+        nonlocal reads
+        reads += 1
+        return real(expert_map, num_local_experts)
+
+    hidden, w1, w2, weights, ids = _make_problem(gated=False)
+    original = reference_moe._local_expert_map
+    reference_moe._local_expert_map = counting
+    try:
+        _run_reference(
+            hidden,
+            w1,
+            w2,
+            weights,
+            ids,
+            expert_map=torch.tensor([0, 1, 2, 3], dtype=torch.int32),
+        )
+    finally:
+        reference_moe._local_expert_map = original
+    # The value used by production code is bound at call time.
+    assert reads == 1
 
 
 def test_negative_topk_ids_are_skipped() -> None:
@@ -269,42 +341,39 @@ def test_apply_router_weight_on_input() -> None:
     hidden, w1, w2, weights, ids = _make_problem(gated=False)
 
     on_input = _run_reference(
-        hidden,
-        w1,
-        w2,
-        weights,
-        ids,
-        apply_router_weight_on_input=True,
+        hidden, w1, w2, weights, ids, apply_router_weight_on_input=True
     )
     on_output = _run_reference(
-        hidden,
-        w1,
-        w2,
-        weights,
-        ids,
-        apply_router_weight_on_input=False,
+        hidden, w1, w2, weights, ids, apply_router_weight_on_input=False
     )
-    expected_on_input = _expected_output(
-        hidden,
-        w1,
-        w2,
-        weights,
-        ids,
-        activation="relu2",
-        apply_router_weight_on_input=True,
+    _assert_matches(
+        on_input,
+        _expected_output(
+            hidden,
+            w1,
+            w2,
+            weights,
+            ids,
+            activation="relu2",
+            apply_router_weight_on_input=True,
+        ),
+        1e-5,
+        1e-5,
     )
-    expected_on_output = _expected_output(
-        hidden,
-        w1,
-        w2,
-        weights,
-        ids,
-        activation="relu2",
-        apply_router_weight_on_input=False,
+    _assert_matches(
+        on_output,
+        _expected_output(
+            hidden,
+            w1,
+            w2,
+            weights,
+            ids,
+            activation="relu2",
+            apply_router_weight_on_input=False,
+        ),
+        1e-5,
+        1e-5,
     )
-
-    _assert_matches(on_input, expected_on_input, 1e-5, 1e-5)
-    _assert_matches(on_output, expected_on_output, 1e-5, 1e-5)
     # relu2 is non-linear, so the two weighting points must differ.
     assert not torch.allclose(on_input, on_output, rtol=1e-4, atol=1e-4)
 
@@ -317,6 +386,27 @@ def test_chunking_matches_single_pass(monkeypatch: pytest.MonkeyPatch) -> None:
     chunked = _run_reference(hidden, w1, w2, weights, ids, activation="silu")
 
     _assert_matches(chunked, baseline.to(torch.float32), 1e-6, 1e-6)
+
+
+def test_accepts_caller_supplied_output_buffer() -> None:
+    hidden, w1, w2, weights, ids = _make_problem(gated=False)
+    output = torch.empty(NUM_TOKENS, HIDDEN, dtype=hidden.dtype)
+    assert _run_reference(hidden, w1, w2, weights, ids, output=output) is output
+
+
+def test_empty_token_batch_writes_empty_output() -> None:
+    hidden, w1, w2, weights, ids = _make_problem(gated=False)
+    empty_hidden = hidden[:0]
+    output = torch.full((0, HIDDEN), float("nan"), dtype=hidden.dtype)
+    _run_reference(
+        empty_hidden,
+        w1,
+        w2,
+        weights[:0],
+        ids[:0],
+        output=output,
+    )
+    assert output.shape == (0, HIDDEN)
 
 
 def test_requires_precomputed_routing() -> None:
@@ -359,11 +449,7 @@ def test_unsupported_hidden_dtype_raises(dtype: torch.dtype) -> None:
     hidden, w1, w2, weights, ids = _make_problem(gated=False)
     with pytest.raises(TypeError, match="fp16/bf16/fp32"):
         _run_reference(
-            hidden.to(dtype),
-            w1.to(dtype),
-            w2.to(dtype),
-            weights,
-            ids,
+            hidden.to(dtype), w1.to(dtype), w2.to(dtype), weights, ids
         )
 
 
@@ -381,8 +467,176 @@ def test_unsupported_plain_activation_raises(activation: str) -> None:
         _run_reference(hidden, w1, w2, weights, ids, activation=activation)
 
 
-def test_accepts_caller_supplied_output_buffer() -> None:
+# --------------------------------------------------------------------------
+# Adapter contract: a fake module keeps this CPU-only and hermetic.
+# --------------------------------------------------------------------------
+
+
+def _adapter_module(calls: list[str]) -> ModuleType:
+    module = ModuleType(patch_reference_moe.TARGET_MODULE)
+
+    class TritonExperts:
+        def apply(
+            self,
+            output,
+            hidden_states,
+            w1,
+            w2,
+            topk_weights,
+            topk_ids,
+            activation,
+            global_num_experts,
+            expert_map,
+            a1q_scale,
+            a2_scale,
+            workspace13,
+            workspace2,
+            expert_tokens_meta,
+            apply_router_weight_on_input,
+        ):
+            calls.append("original")
+            output.zero_()
+            return None
+
+    module.TritonExperts = TritonExperts
+    return module
+
+
+def _call_apply(experts, hidden_states, w1, w2, weights, ids, **overrides):
+    kwargs = {
+        "hidden_states": hidden_states,
+        "w1": w1,
+        "w2": w2,
+        "topk_weights": weights,
+        "topk_ids": ids,
+        "activation": "relu2",
+        "global_num_experts": NUM_EXPERTS,
+        "expert_map": None,
+        "a1q_scale": None,
+        "a2_scale": None,
+        "workspace13": None,
+        "workspace2": None,
+        "expert_tokens_meta": None,
+        "apply_router_weight_on_input": False,
+    }
+    kwargs.update(overrides)
+    output = torch.full(
+        (hidden_states.shape[0], HIDDEN), float("nan"), dtype=hidden_states.dtype
+    )
+    experts.apply(output=output, **kwargs)
+    return output
+
+
+def _install(monkeypatch: pytest.MonkeyPatch, enabled: bool, calls):
+    monkeypatch.setenv(
+        "VLLM_HCU_USE_REFERENCE_MOE", "1" if enabled else "0"
+    )
+    module = _adapter_module(calls)
+    assert patch_reference_moe.apply_to_module(module) is True
+    return module.TritonExperts()
+
+
+def test_env_off_calls_original(monkeypatch: pytest.MonkeyPatch) -> None:
+    calls: list[str] = []
+    experts = _install(monkeypatch, False, calls)
     hidden, w1, w2, weights, ids = _make_problem(gated=False)
-    output = torch.empty(NUM_TOKENS, HIDDEN, dtype=hidden.dtype)
-    returned = _run_reference(hidden, w1, w2, weights, ids, output=output)
-    assert returned is output
+
+    output = _call_apply(experts, hidden, w1, w2, weights, ids)
+
+    assert calls == ["original"]
+    assert torch.equal(output, torch.zeros_like(output))
+
+
+def test_env_on_writes_reference_output(monkeypatch: pytest.MonkeyPatch) -> None:
+    calls: list[str] = []
+    experts = _install(monkeypatch, True, calls)
+    hidden, w1, w2, weights, ids = _make_problem(gated=False)
+
+    output = _call_apply(experts, hidden, w1, w2, weights, ids)
+
+    assert calls == []
+    _assert_matches(
+        output,
+        _expected_output(hidden, w1, w2, weights, ids, activation="relu2"),
+        1e-5,
+        1e-5,
+    )
+
+
+def test_apply_is_idempotent(monkeypatch: pytest.MonkeyPatch) -> None:
+    calls: list[str] = []
+    monkeypatch.setenv("VLLM_HCU_USE_REFERENCE_MOE", "1")
+    module = _adapter_module(calls)
+
+    assert patch_reference_moe.apply_to_module(module) is True
+    assert patch_reference_moe.apply_to_module(module) is False
+
+
+def test_quantized_input_is_rejected(monkeypatch: pytest.MonkeyPatch) -> None:
+    calls: list[str] = []
+    experts = _install(monkeypatch, True, calls)
+    hidden, w1, w2, weights, ids = _make_problem(gated=False)
+
+    with pytest.raises(RuntimeError, match="quantized"):
+        _call_apply(
+            experts,
+            hidden,
+            w1,
+            w2,
+            weights,
+            ids,
+            a1q_scale=torch.ones(1),
+        )
+
+
+def test_batched_expert_metadata_is_rejected(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    calls: list[str] = []
+    experts = _install(monkeypatch, True, calls)
+    hidden, w1, w2, weights, ids = _make_problem(gated=False)
+
+    with pytest.raises(RuntimeError, match="batched expert token metadata"):
+        _call_apply(
+            experts,
+            hidden,
+            w1,
+            w2,
+            weights,
+            ids,
+            expert_tokens_meta=object(),
+        )
+
+
+def test_signature_mismatch_raises(monkeypatch: pytest.MonkeyPatch) -> None:
+    from vllm_hcu.patch.worker.op_opt._common import PatchCompatibilityError
+
+    monkeypatch.setenv("VLLM_HCU_USE_REFERENCE_MOE", "1")
+    module = ModuleType(patch_reference_moe.TARGET_MODULE)
+
+    class TritonExperts:
+        def apply(self, output, hidden_states):
+            return None
+
+    module.TritonExperts = TritonExperts
+
+    with pytest.raises(PatchCompatibilityError):
+        patch_reference_moe.apply_to_module(module)
+
+
+def test_eager_moe_alias_enables_reference(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    from vllm_hcu.platforms import envs as henvs
+
+    monkeypatch.delenv("VLLM_HCU_USE_REFERENCE_MOE", raising=False)
+    monkeypatch.setenv("VLLM_HCU_EAGER_MOE", "1")
+    assert henvs.VLLM_HCU_USE_REFERENCE_MOE is True
+
+    monkeypatch.setenv("VLLM_HCU_EAGER_MOE", "0")
+    assert henvs.VLLM_HCU_USE_REFERENCE_MOE is False
+
+    # The canonical name wins over the deprecated alias.
+    monkeypatch.setenv("VLLM_HCU_EAGER_MOE", "1")
+    monkeypatch.setenv("VLLM_HCU_USE_REFERENCE_MOE", "0")
+    assert henvs.VLLM_HCU_USE_REFERENCE_MOE is False
