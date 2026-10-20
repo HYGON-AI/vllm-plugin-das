@@ -6,6 +6,10 @@ name: Cookbook deployment smoke (vLLM)
 on:
   workflow_call:
     inputs:
+      model-tests-enabled:
+        description: Explicitly resume paused vLLM 0.25.1 model testing
+        type: boolean
+        default: false
       image:
         description: Exact dated image built and pushed by the caller
         type: string
@@ -33,6 +37,10 @@ on:
         required: false
   workflow_dispatch:
     inputs:
+      model-tests-enabled:
+        description: Explicitly resume paused vLLM 0.25.1 model testing
+        type: boolean
+        default: false
       hardware:
         description: all runs both hardware suites in parallel
         type: choice
@@ -61,6 +69,8 @@ concurrency:
 
 jobs:
   prepare:
+    # vLLM 0.25.1 Cookbook model testing is paused; other workflows remain enabled.
+    if: ${{ inputs.model-tests-enabled }}
     runs-on: bw1100
     timeout-minutes: 45
     outputs:
