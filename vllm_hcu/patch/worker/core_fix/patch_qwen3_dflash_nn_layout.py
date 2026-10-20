@@ -29,6 +29,10 @@ def _use_nn_layout() -> bool:
     try:
         from vllm_hcu.platforms import envs as henvs
 
+        # Weight storage is produced under VLLM_USE_NN independently of the
+        # custom-op master switch.  Gating this layout repair on
+        # VLLM_HCU_USE_CUSTOM_OPS would make an already-transposed projection
+        # incompatible with the output-major upstream slicing below.
         return bool(henvs.VLLM_USE_NN)
     except (AttributeError, ImportError) as exc:
         raise PatchCompatibilityError(

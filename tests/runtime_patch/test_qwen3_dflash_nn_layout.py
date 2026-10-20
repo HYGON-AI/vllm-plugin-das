@@ -67,12 +67,13 @@ def _patch_module():
         pytest.fail("Qwen3 DSpark NN-layout compatibility patch is missing")
 
 
-def test_nn_layout_builds_output_major_context_kv_projection(
+def test_nn_layout_ignores_disabled_custom_ops_master_switch(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     patch = _patch_module()
     module = _upstream_module()
-    monkeypatch.setattr(patch, "_use_nn_layout", lambda: True)
+    monkeypatch.setenv("VLLM_USE_NN", "1")
+    monkeypatch.setenv("VLLM_HCU_USE_CUSTOM_OPS", "0")
     assert patch.apply_to_module(module) is True
 
     model = module.DFlashQwen3Model()
