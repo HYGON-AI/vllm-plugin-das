@@ -4,6 +4,7 @@
 from __future__ import annotations
 
 import enum
+import math
 import sys
 from types import ModuleType, SimpleNamespace
 
@@ -213,8 +214,8 @@ def _run_mocked_w16a16_pipeline(
             w2=w2,
             topk_weights=torch.ones((1, 1), dtype=torch.float32),
             topk_ids=torch.zeros((1, 1), dtype=torch.int32),
-            workspace13=torch.empty((1, 32), dtype=torch.bfloat16),
-            workspace2=torch.empty((1, 16), dtype=torch.bfloat16),
+            workspace13=torch.empty((1, 16), dtype=torch.bfloat16),
+            workspace2=torch.empty((1, 32), dtype=torch.bfloat16),
             global_num_experts=2,
         )
     if fail_stage is None:
@@ -231,6 +232,106 @@ def test_w16a16_success_marker_requires_complete_pipeline(
     assert _run_mocked_w16a16_pipeline(monkeypatch) == [
         "Using LightOp W16A16 Marlin MoE backend."
     ]
+
+
+def test_w16a16_vllm_common_output_has_no_live_scratch_overlap(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    from vllm_hcu.model_executor.layers.fused_moe import lightop_w16a16_runtime
+    from vllm_hcu.model_executor.layers.fused_moe.experts.lightop_w16a16_moe import (
+        LightopW16A16Experts,
+    )
+
+    layout = lightop_w16a16_runtime.LightopW16A16Layout(
+        logical_w13_shape=(2, 32, 32),
+        logical_w2_shape=(2, 32, 16),
+        packed_w13_shape=(2, 2, 16),
+        packed_w2_shape=(2, 1, 16),
+    )
+    w13 = torch.empty(layout.packed_w13_shape, dtype=torch.bfloat16)
+    w2 = torch.empty(layout.packed_w2_shape, dtype=torch.bfloat16)
+    lightop_w16a16_runtime.mark_lightop_w16a16_weights(w13, w2, layout)
+    captured: dict[str, tuple[torch.Tensor, torch.Tensor]] = {}
+    gemm_outputs: list[torch.Tensor] = []
+
+    def gemm(*args, **_kwargs) -> None:
+        gemm_outputs.append(args[2])
+
+    def activate(cache1: torch.Tensor, cache2: torch.Tensor) -> None:
+        captured["activate"] = (cache1, cache2)
+
+    def reduce(*, input: torch.Tensor, output: torch.Tensor, **_kwargs) -> None:
+        captured["reduce"] = (input, output)
+
+    monkeypatch.setattr(
+        lightop_w16a16_runtime,
+        "_load_lightop_w16a16",
+        lambda: SimpleNamespace(
+            get_config=object(),
+            align=lambda *_args, **_kwargs: None,
+            gemm=gemm,
+            activate=activate,
+            reduce=reduce,
+        ),
+    )
+    monkeypatch.setattr(
+        lightop_w16a16_runtime,
+        "select_lightop_w16a16_config",
+        lambda *_args, **_kwargs: (
+            {"BLOCK_SIZE_M": 1},
+            {"BLOCK_SIZE_M": 1},
+        ),
+    )
+
+    workspace13_shape, workspace2_shape, output_shape = (
+        LightopW16A16Experts.workspace_shapes(
+            LightopW16A16Experts,
+            M=2,
+            N=32,
+            K=32,
+            topk=1,
+            global_num_experts=2,
+            local_num_experts=2,
+            expert_tokens_meta=None,
+            activation=MoEActivation.SILU,
+        )
+    )
+    common = torch.empty(
+        max(math.prod(workspace13_shape), math.prod(output_shape)),
+        dtype=torch.bfloat16,
+    )
+    workspace13 = common[: math.prod(workspace13_shape)].view(workspace13_shape)
+    output = common[: math.prod(output_shape)].view(output_shape)
+    workspace2 = torch.empty(workspace2_shape, dtype=torch.bfloat16)
+
+    lightop_w16a16_runtime.run_lightop_w16a16(
+        output=output,
+        hidden_states=torch.empty((2, 32), dtype=torch.bfloat16),
+        w13=w13,
+        w2=w2,
+        topk_weights=torch.ones((2, 1), dtype=torch.float32),
+        topk_ids=torch.zeros((2, 1), dtype=torch.int32),
+        workspace13=workspace13,
+        workspace2=workspace2,
+        global_num_experts=2,
+    )
+
+    def storage_range(tensor: torch.Tensor) -> tuple[int, int]:
+        start = (
+            tensor.untyped_storage().data_ptr()
+            + tensor.storage_offset() * tensor.element_size()
+        )
+        return start, start + tensor.numel() * tensor.element_size()
+
+    def disjoint(left: torch.Tensor, right: torch.Tensor) -> bool:
+        left_start, left_end = storage_range(left)
+        right_start, right_end = storage_range(right)
+        return left_end <= right_start or right_end <= left_start
+
+    assert len(gemm_outputs) == 2
+    assert disjoint(*captured["activate"])
+    assert disjoint(captured["activate"][1], gemm_outputs[1])
+    assert disjoint(*captured["reduce"])
 
 
 @pytest.mark.parametrize("fail_stage", ("align", "gemm", "activate", "reduce"))

@@ -160,8 +160,8 @@ class LightopW16A16Experts(mk.FusedMoEExpertsModular):
             raise RuntimeError("LightOp W16A16 supports standard TP SiLU MoE only")
         intermediate = N // 2
         return (
-            (M * topk, max(N, K)),
             (M * topk, intermediate),
+            (M * topk, max(N, K)),
             (M, K),
         )
 

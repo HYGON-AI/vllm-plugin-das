@@ -341,15 +341,21 @@ def run_lightop_w16a16(
 
     cache1_elements = tokens * topk * two_n
     cache3_elements = tokens * topk * hidden
-    if workspace13.numel() < max(cache1_elements, cache3_elements):
-        raise RuntimeError("vLLM W16A16 workspace13 is smaller than required")
-    if workspace2.numel() < tokens * topk * intermediate:
+    cache2_elements = tokens * topk * intermediate
+    if workspace2.numel() < max(cache1_elements, cache3_elements):
         raise RuntimeError("vLLM W16A16 workspace2 is smaller than required")
-    cache1 = workspace13.reshape(-1)[:cache1_elements].view(-1, two_n)
-    cache2 = workspace2.reshape(-1)[: tokens * topk * intermediate].view(
+    if workspace13.numel() < cache2_elements:
+        raise RuntimeError("vLLM W16A16 workspace13 is smaller than required")
+    # vLLM aliases the final output with workspace13.  Keep cache3 in the
+    # other allocation so reduction never reads and writes overlapping views.
+    # cache1 and cache3 may share workspace2 because activation finishes
+    # consuming cache1 before GEMM2 produces cache3.  Likewise cache2 is dead
+    # before reduction writes the aliased output into workspace13.
+    cache1 = workspace2.reshape(-1)[:cache1_elements].view(-1, two_n)
+    cache2 = workspace13.reshape(-1)[:cache2_elements].view(
         -1, intermediate
     )
-    cache3 = workspace13.reshape(-1)[:cache3_elements].view(-1, hidden)
+    cache3 = workspace2.reshape(-1)[:cache3_elements].view(-1, hidden)
     exports.gemm(
         hidden_states,
         w13,
