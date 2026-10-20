@@ -14,8 +14,9 @@ from ._common import (
     require_class,
 )
 from .patch_deepseek_v4_eplb import (
+    _capture_eplb_config,
     _collect_moe,
-    _eplb_config,
+    _instance_eplb_config,
     _update_physical_experts_metadata,
 )
 
@@ -53,14 +54,18 @@ def apply_to_module(module: ModuleType) -> bool:
     @functools.wraps(mtp_init)
     def hcu_mtp_init(self, *args, **kwargs):
         mtp_init(self, *args, **kwargs)
-        if _eplb_config()[0]:
+        enable_eplb, _ = _capture_eplb_config(
+            self,
+            getattr(self, "model", None),
+        )
+        if enable_eplb:
             _collect_moe(self)
 
     @functools.wraps(mtp_make_mapping)
     def hcu_mtp_make_mapping(*args, **kwargs):
-        enable_eplb, num_redundant = _eplb_config()
+        model = args[0] if args else kwargs.get("model")
+        enable_eplb, num_redundant = _instance_eplb_config(model)
         if enable_eplb:
-            model = args[0] if args else kwargs.get("model")
             if getattr(model, "_vllm_hcu_static_eplb_plan", None) is None:
                 kwargs.setdefault("num_redundant_experts", num_redundant)
             else:

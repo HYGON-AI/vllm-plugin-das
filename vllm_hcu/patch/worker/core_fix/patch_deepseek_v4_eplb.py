@@ -39,6 +39,7 @@ TARGETS = (
 )
 _MARKER = "_vllm_hcu_deepseek_v4_eplb_applied"
 _WRAPPER = "_vllm_hcu_deepseek_v4_eplb_wrapper"
+_CONFIG_ATTR = "_vllm_hcu_deepseek_v4_eplb_config"
 
 
 def _eplb_config() -> tuple[bool, int]:
@@ -48,6 +49,22 @@ def _eplb_config() -> tuple[bool, int]:
     if not parallel_config.enable_eplb:
         return False, 0
     return True, int(parallel_config.eplb_config.num_redundant_experts)
+
+
+def _capture_eplb_config(*owners) -> tuple[bool, int]:
+    config = _eplb_config()
+    for owner in owners:
+        if owner is not None:
+            setattr(owner, _CONFIG_ATTR, config)
+    return config
+
+
+def _instance_eplb_config(owner) -> tuple[bool, int]:
+    config = getattr(owner, _CONFIG_ATTR, None)
+    if config is not None:
+        return config
+    # Initialization-time callers still have the temporary vLLM config scope.
+    return _eplb_config()
 
 
 def _collect_moe(model) -> None:
@@ -165,7 +182,7 @@ def apply_to_module(module: ModuleType) -> bool:
 
     @functools.wraps(get_expert_mapping)
     def hcu_get_expert_mapping(self):
-        enable_eplb, num_redundant = _eplb_config()
+        enable_eplb, num_redundant = _instance_eplb_config(self)
         if not enable_eplb or num_redundant == 0:
             return get_expert_mapping(self)
         # EPLB disables shared-expert fusion, so only routed experts remain.
@@ -181,7 +198,11 @@ def apply_to_module(module: ModuleType) -> bool:
     @functools.wraps(lm_init)
     def hcu_lm_init(self, *args, **kwargs):
         lm_init(self, *args, **kwargs)
-        if _eplb_config()[0]:
+        enable_eplb, _ = _capture_eplb_config(
+            self,
+            getattr(self, "model", None),
+        )
+        if enable_eplb:
             _collect_moe(self)
 
     for function in (

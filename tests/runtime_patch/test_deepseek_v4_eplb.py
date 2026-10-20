@@ -87,6 +87,15 @@ def vllm_config(monkeypatch):
 HF = SimpleNamespace(n_routed_experts=256, n_group=None)
 
 
+def leave_current_config_scope(monkeypatch):
+    import vllm.config as config_module
+
+    def unavailable():
+        raise RuntimeError("current vLLM config scope has ended")
+
+    monkeypatch.setattr(config_module, "get_current_vllm_config", unavailable)
+
+
 def test_target_patch_does_not_import_initializing_mtp(vllm_config, monkeypatch):
     module, _ = target(monkeypatch)
     monkeypatch.delitem(sys.modules, mtp_patch.TARGET_MODULE)
@@ -111,6 +120,7 @@ def test_eplb_builds_redundant_experts_and_moe_interface(
             model.num_local_physical_experts, model.num_redundant_experts,
             model.num_shared_experts, model.num_expert_groups) == (2, 256, 272, 34, 16, 1, 1)
     assert model.moe_layers == [layer.ffn.experts for layer in model.model.layers[1:]]
+    leave_current_config_scope(monkeypatch)
     assert model.model.get_expert_mapping() == ("eplb", {
         "ckpt_gate_proj_name": "w1", "ckpt_down_proj_name": "w2",
         "ckpt_up_proj_name": "w3", "num_experts": 256, "num_redundant_experts": 16})
@@ -124,6 +134,7 @@ def test_eplb_disabled_keeps_upstream_paths(vllm_config, monkeypatch):
     module._test_ep_size = 3
     patch.apply_to_module(module)
     model = module.DeepseekV4ForCausalLM(HF)
+    leave_current_config_scope(monkeypatch)
     assert calls[0] == {"num_experts": 256}
     assert not is_mixture_of_experts(model)
     assert model.model.get_expert_mapping() == "original"
@@ -153,6 +164,7 @@ def test_eplb_registers_native_mtp_and_maps_redundant_weights(
     assert draft.moe_layers == [
         layer.mtp_block.ffn.experts for layer in draft.model.layers.values()
     ]
+    leave_current_config_scope(monkeypatch)
     assert mtp_module.fused_moe_make_expert_params_mapping(
         draft,
         num_experts=256,
@@ -177,6 +189,7 @@ def test_static_eplb_mtp_checkpoint_mapping_uses_logical_experts(
     draft._vllm_hcu_static_eplb_plan = SimpleNamespace(
         placement=tuple(range(1, 256)) + tuple(range(240, 256))
     )
+    leave_current_config_scope(monkeypatch)
     assert mtp_module.fused_moe_make_expert_params_mapping(
         draft,
         num_experts=256,
