@@ -61,6 +61,9 @@ def _worker(
     worker.tp_size = tp_size
     worker.finished_recving_reqs = set()
     worker._kv_load_error = None
+    # object.__new__ skips MooncakeConnectorWorker.__init__.
+    worker.dsa_layer_split_enabled = False
+    worker._remote_pcp_info = {}
     return worker
 
 
@@ -782,12 +785,57 @@ def test_bootstrap_launch_is_owned_by_designated_tp_pp_dp_rank(
     config = SimpleNamespace(
         kv_transfer_config=SimpleNamespace(kv_role="kv_producer"),
         parallel_config=SimpleNamespace(
+            prefill_context_parallel_size=1,
             local_engines_only=local_only,
             data_parallel_rank_local=dp_local,
             data_parallel_index=dp_index,
         )
     )
 
+    assert mooncake.should_launch_bootstrap_server(config) is expected
+
+
+@pytest.mark.parametrize("role", ["kv_producer", "kv_consumer", "kv_both", None])
+def test_hyv4_producer_only_pcp_launches_one_bootstrap_per_global_first_rank(
+    mooncake, monkeypatch, role,
+):
+    from vllm.distributed import parallel_state
+
+    # GroupCoordinator.rank is global; each PCP group is strided across TP.
+    group = object.__new__(parallel_state.GroupCoordinator)
+    monkeypatch.setattr(parallel_state, "_PCP", group)
+    monkeypatch.setattr(mooncake, "get_tensor_model_parallel_rank", lambda: group.rank % 2)
+    monkeypatch.setattr(mooncake, "get_pp_group", lambda: SimpleNamespace(rank_in_group=0))
+    config = SimpleNamespace(
+        kv_transfer_config=SimpleNamespace(kv_role=role),
+        parallel_config=SimpleNamespace(
+            prefill_context_parallel_size=4, local_engines_only=False,
+            data_parallel_index=0,
+        ),
+    )
+    owners = []
+    for global_rank in range(8):
+        group.rank = global_rank
+        group.ranks = [0, 2, 4, 6] if global_rank % 2 == 0 else [1, 3, 5, 7]
+        group.rank_in_group = global_rank // 2
+        if mooncake.should_launch_bootstrap_server(config):
+            owners.append(global_rank)
+    assert owners == ([0] if role == "kv_producer" else [])
+
+
+@pytest.mark.parametrize("role,expected", [
+    ("kv_producer", True), ("kv_both", True), ("kv_consumer", False), (None, False),
+])
+def test_mooncake_pp1_bootstrap_preserves_sending_roles(mooncake, monkeypatch, role, expected):
+    monkeypatch.setattr(mooncake, "get_tensor_model_parallel_rank", lambda: 0)
+    monkeypatch.setattr(mooncake, "get_pp_group", lambda: SimpleNamespace(rank_in_group=0))
+    config = SimpleNamespace(
+        kv_transfer_config=SimpleNamespace(kv_role=role),
+        parallel_config=SimpleNamespace(
+            prefill_context_parallel_size=1, local_engines_only=False,
+            data_parallel_index=0,
+        ),
+    )
     assert mooncake.should_launch_bootstrap_server(config) is expected
 
 
