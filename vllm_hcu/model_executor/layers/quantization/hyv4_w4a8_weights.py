@@ -13,6 +13,7 @@ from .slimquant_facade import SlimQuantW4A8Facade
 CHECKPOINT_FORMAT = "hy4-w4a8-custom-v1"
 NATIVE_FORMAT = "hy4_w4a8_v1"
 PACKING = "signed nibble, even input in low bits"
+PACKED_EXPERT_ADAPTER_MARKER = "_vllm_hcu_hyv4_packed_expert_adapter"
 
 
 class HYV4W4A8Facade(SlimQuantW4A8Facade):
@@ -118,6 +119,7 @@ def adapt_checkpoint_weights(quant_config, weights):
             return quant_config.adapt_weights(weights)
     get_name = getattr(quant_config, "get_name", None)
     if callable(get_name) and get_name() == "compressed-tensors":
+        setattr(quant_config, PACKED_EXPERT_ADAPTER_MARKER, True)
         return _adapt_compressed_tensors_experts(quant_config, weights)
     return weights
 

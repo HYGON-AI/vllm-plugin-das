@@ -38,6 +38,20 @@ _GET_WEIGHTS_MARKER = "_vllm_hcu_moe_layer_get_weights"
 _LOAD_WEIGHTS_MARKER = "_vllm_hcu_moe_layer_load_weights"
 
 
+def _should_adapt_packed_expert_names(owner) -> bool:
+    from vllm_hcu.model_executor.layers.quantization.hyv4_w4a8_weights import (
+        PACKED_EXPERT_ADAPTER_MARKER,
+    )
+
+    return not bool(
+        getattr(
+            getattr(owner, "quant_config", None),
+            PACKED_EXPERT_ADAPTER_MARKER,
+            False,
+        )
+    )
+
+
 def apply_to_module(module: ModuleType) -> bool:
     target = load_exact_module(TARGET_MODULE, module)
     layer_module = load_exact_module(
@@ -297,7 +311,7 @@ def apply_to_module(module: ModuleType) -> bool:
             HcuCompressedTensorsW4A8Int8MoEMethod,
         )
         for expert_name, loaded_weight in weights:
-            if uses_hcu_compressed_w4a8:
+            if uses_hcu_compressed_w4a8 and _should_adapt_packed_expert_names(self):
                 if expert_name.endswith(".weight_shape"):
                     continue
                 if expert_name.endswith(".weight_packed"):

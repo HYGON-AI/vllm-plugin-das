@@ -1,5 +1,6 @@
 # SPDX-License-Identifier: Apache-2.0
 """Explicit HYV4 formats must not change the ordinary quantization owner."""
+import copy
 import importlib
 import json
 import os
@@ -189,8 +190,9 @@ def test_hyv4_compressed_tensors_packed_experts_adapt_to_hcu_layout():
     packed = pack_to_int32(values, 4)
     scale = torch.ones(1, 1, dtype=torch.bfloat16)
     prefix = "model.layers.1.mlp.experts.0.gate_proj"
+    quant_config = CompressedTensorsConfig()
     adapted = dict(module("hyv4_w4a8_weights").adapt_checkpoint_weights(
-        CompressedTensorsConfig(),
+        quant_config,
         [
             (prefix + ".weight_packed", packed),
             (prefix + ".weight_scale", scale),
@@ -198,6 +200,9 @@ def test_hyv4_compressed_tensors_packed_experts_adapt_to_hcu_layout():
         ],
     ))
 
+    assert getattr(
+        quant_config, "_vllm_hcu_hyv4_packed_expert_adapter", False
+    ) is True
     assert set(adapted) == {prefix + ".weight", prefix + ".weight_scale"}
     assert adapted[prefix + ".weight"].data_ptr() == packed.data_ptr()
     assert adapted[prefix + ".weight_scale"].data_ptr() == scale.data_ptr()
@@ -265,6 +270,81 @@ def test_standard_packed_experts_load_without_hyv4_weight_adapter():
     loaded_weight, shard_id, expert_id = loaded[0]
     torch.testing.assert_close(loaded_weight, packed)
     assert (shard_id, expert_id) == ("w1", 0)
+
+
+def test_global_packed_expert_loader_defers_to_hyv4_adapter():
+    """HYV4's model-level adapter must remain the sole packed-name owner."""
+    from vllm_hcu.patch.worker.op_opt.moe import patch_layer
+
+    marker = "_vllm_hcu_hyv4_packed_expert_adapter"
+    hyv4_owner = SimpleNamespace(
+        quant_config=SimpleNamespace(**{marker: True})
+    )
+    standard_owner = SimpleNamespace(quant_config=SimpleNamespace())
+    should_adapt = getattr(
+        patch_layer,
+        "_should_adapt_packed_expert_names",
+        lambda owner: True,
+    )
+
+    assert not should_adapt(hyv4_owner)
+    assert should_adapt(standard_owner)
+
+
+def test_hyv4_packed_expert_marker_survives_mtp_copy_and_skips_global_adapter():
+    """MTP's shallow config copy must keep HYV4 as the packed-name owner."""
+    from vllm.model_executor.layers.fused_moe.routed_experts import (
+        RoutedExperts,
+    )
+    from vllm_hcu.model_executor.layers.quantization.compressed_tensors_w4a8_moe import (
+        HcuCompressedTensorsW4A8Int8MoEMethod,
+    )
+    from vllm_hcu.model_executor.layers.quantization.hyv4_w4a8_weights import (
+        PACKED_EXPERT_ADAPTER_MARKER,
+    )
+    from vllm_hcu.patch.worker.op_opt.moe import patch_layer
+
+    patch_layer.apply()
+    backbone_quant_config = SimpleNamespace()
+    setattr(backbone_quant_config, PACKED_EXPERT_ADAPTER_MARKER, True)
+    mtp_quant_config = copy.copy(backbone_quant_config)
+    assert getattr(mtp_quant_config, PACKED_EXPERT_ADAPTER_MARKER)
+
+    loaded_by: list[str] = []
+
+    def parameter(label: str) -> torch.nn.Parameter:
+        result = torch.nn.Parameter(
+            torch.empty((1, 1), dtype=torch.int8), requires_grad=False
+        )
+
+        def weight_loader(**kwargs) -> bool:
+            loaded_by.append(label)
+            return True
+
+        result.weight_loader = weight_loader
+        return result
+
+    owner = SimpleNamespace(
+        layer_name="experts",
+        moe_config=SimpleNamespace(hidden_dim_unpadded=8),
+        quant_config=mtp_quant_config,
+        quant_method=object.__new__(HcuCompressedTensorsW4A8Int8MoEMethod),
+        w13_weight=parameter("adapted"),
+        w13_weight_packed=parameter("native"),
+        get_expert_mapping=lambda include_fused: [
+            ("w13_", "experts.0.gate_proj.", 0, "w1")
+        ],
+    )
+
+    loaded_names = list(
+        RoutedExperts.load_weights(
+            owner,
+            [("0.gate_proj.weight_packed", torch.ones((2, 1), dtype=torch.int32))],
+        )
+    )
+
+    assert loaded_names == ["w13_weight_packed"]
+    assert loaded_by == ["native"]
 
 
 def test_hyv4_compressed_tensors_preserves_unrelated_expert_scheme():
