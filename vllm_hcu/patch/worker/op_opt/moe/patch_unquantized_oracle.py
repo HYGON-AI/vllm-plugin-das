@@ -148,6 +148,7 @@ def apply_to_module(module: ModuleType) -> bool:
                     for tokens in probe_tokens
                 )
                 if configs_available:
+                    lightop_w16a16_runtime.mark_lightop_w16a16_backend_selected()
                     return hcu_enum.HCU_LIGHTOP_W16A16, experts_cls
 
         try:

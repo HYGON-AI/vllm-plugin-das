@@ -20,6 +20,18 @@ _PACKED_MARKER = "_hcu_lightop_w16a16_packed"
 _GENERATION_MARKER = "_hcu_lightop_w16a16_generation"
 _LAYOUT_MARKER = "_hcu_lightop_w16a16_layout"
 logger = init_logger(__name__)
+_BACKEND_SELECTED = False
+
+
+def mark_lightop_w16a16_backend_selected() -> None:
+    """Record that this worker owns at least one LightOp W16A16 layer."""
+
+    global _BACKEND_SELECTED
+    _BACKEND_SELECTED = True
+
+
+def lightop_w16a16_backend_selected() -> bool:
+    return _BACKEND_SELECTED
 
 
 @dataclass(frozen=True, slots=True)
@@ -413,7 +425,9 @@ class SimpleMoeProblem:
 __all__ = [
     "LightopW16A16Layout",
     "is_lightop_w16a16_available",
+    "lightop_w16a16_backend_selected",
     "lightop_w16a16_layout",
+    "mark_lightop_w16a16_backend_selected",
     "mark_lightop_w16a16_weights",
     "pack_lightop_w16a16_weights",
     "run_lightop_w16a16",

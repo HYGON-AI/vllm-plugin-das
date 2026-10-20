@@ -237,6 +237,55 @@ def test_w16a16_success_marker_requires_complete_pipeline(
     ]
 
 
+def test_w16a16_router_keeps_graph_padding_ids_valid(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    from vllm_hcu.model_executor.layers.fused_moe import lightop_w16a16_runtime
+    from vllm_hcu.patch.worker.op_opt.moe import patch_fused_topk_router
+
+    calls: list[int] = []
+
+    def get_padding_mask(num_tokens: int):
+        calls.append(num_tokens)
+        return "native-padding-mask"
+
+    module = _module(
+        patch_fused_topk_router.TARGET_MODULE,
+        _get_padding_mask=get_padding_mask,
+    )
+    patch_fused_topk_router.apply_to_module(module)
+    monkeypatch.setattr(
+        lightop_w16a16_runtime,
+        "lightop_w16a16_backend_selected",
+        lambda: False,
+    )
+    assert module._get_padding_mask(8) == "native-padding-mask"
+
+    monkeypatch.setattr(
+        lightop_w16a16_runtime,
+        "lightop_w16a16_backend_selected",
+        lambda: True,
+    )
+    assert module._get_padding_mask(16) is None
+    assert calls == [8]
+
+
+def test_w16a16_router_patch_is_idempotent_and_rejects_stale_binding() -> None:
+    from vllm_hcu.patch.worker.op_opt.moe import patch_fused_topk_router
+    from vllm_hcu.patch.worker.op_opt.moe._common import PatchCompatibilityError
+
+    module = _module(
+        patch_fused_topk_router.TARGET_MODULE,
+        _get_padding_mask=lambda num_tokens: num_tokens,
+    )
+    assert patch_fused_topk_router.apply_to_module(module) is True
+    assert patch_fused_topk_router.apply_to_module(module) is False
+
+    module._get_padding_mask = lambda num_tokens: num_tokens
+    with pytest.raises(PatchCompatibilityError, match="stale"):
+        patch_fused_topk_router.apply_to_module(module)
+
+
 def test_w16a16_vllm_common_output_has_no_live_scratch_overlap(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
@@ -411,12 +460,14 @@ def test_w16a16_auto_selects_lightop_only_when_master_and_leaf_enabled(
         "select_lightop_w16a16_config",
         lambda *args, **kwargs: ({"BLOCK_SIZE_M": 16}, {"BLOCK_SIZE_M": 16}),
     )
+    monkeypatch.setattr(lightop_w16a16_runtime, "_BACKEND_SELECTED", False)
 
     assert patch_unquantized_oracle.apply_to_module(module) is True
     backend, experts = module.select_unquantized_moe_backend(_config())
 
     assert backend.name == "HCU_LIGHTOP_W16A16"
     assert experts is LightopW16A16Experts
+    assert lightop_w16a16_runtime.lightop_w16a16_backend_selected()
     assert not [call for call in calls if call[0] == "select"]
 
 
