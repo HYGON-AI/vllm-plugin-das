@@ -298,6 +298,18 @@ class HcuGPUModelRunnerV2(GPUModelRunner):
             raise ValueError(
                 "HCU PCP requires exactly one KV cache group."
             )
+        from copy import deepcopy
+
+        from vllm_hcu.v1.dsa_cache_layer_split import (
+            install_runtime_layer_split_state,
+            maybe_log_runtime_layer_shard_plan,
+            remap_packed_kv_tensor_offsets,
+        )
+
+        install_runtime_layer_split_state(self.vllm_config)
+        kv_cache_config = deepcopy(kv_cache_config)
+        remap_packed_kv_tensor_offsets(kv_cache_config, self.vllm_config)
+        maybe_log_runtime_layer_shard_plan(self.vllm_config)
         from vllm_hcu.v1.kv_cache import use_hcu_flash_kv_cache_allocator
 
         if is_glm53_pcp(self.vllm_config):
@@ -310,11 +322,20 @@ class HcuGPUModelRunnerV2(GPUModelRunner):
 
             install_deepseek_v4_pcp(self)
         with use_hcu_flash_kv_cache_allocator(self):
-            super().initialize_kv_cache(
-                kv_cache_config,
-                is_profiling=is_profiling,
-                kv_cache_allocation_context=kv_cache_allocation_context,
-            )
+            super_initialize_kv_cache = super().initialize_kv_cache
+            import inspect
+
+            initialize_params = inspect.signature(
+                super_initialize_kv_cache
+            ).parameters
+            initialize_kwargs = {}
+            if "is_profiling" in initialize_params:
+                initialize_kwargs["is_profiling"] = is_profiling
+            if "kv_cache_allocation_context" in initialize_params:
+                initialize_kwargs[
+                    "kv_cache_allocation_context"
+                ] = kv_cache_allocation_context
+            super_initialize_kv_cache(kv_cache_config, **initialize_kwargs)
         if pcp_size > 1 and self.pcp_manager is None:
             raise RuntimeError(
                 "official MRV2 did not initialize the selected HCU PCP manager"

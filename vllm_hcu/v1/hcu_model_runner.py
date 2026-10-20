@@ -6889,23 +6889,68 @@ class GPUModelRunner(
             corresponding memory buffer for KV cache.
         """
         kv_cache_raw_tensors: dict[str, torch.Tensor] = {}
-        packed_backing: torch.Tensor | None = None
+        packed_backings: dict[tuple[object, ...], torch.Tensor] = {}
+        packed_layouts: dict[object, tuple[int, int]] = {}
+        from vllm_hcu.v1.dsa_cache_layer_split import packed_kv_backing_id
+
+        packed_descriptors = [
+            tensor
+            for tensor in kv_cache_config.kv_cache_tensors
+            if int(getattr(tensor, "block_stride", 0) or 0) > 0
+        ]
+        packed_ids = [packed_kv_backing_id(tensor) for tensor in packed_descriptors]
+        if any(value is None for value in packed_ids) and (
+            len(packed_descriptors) > 1
+            or any(value is not None for value in packed_ids)
+        ):
+            raise ValueError(
+                "Packed KV descriptors must carry explicit backing_id metadata "
+                "when more than one descriptor is present"
+            )
         for kv_cache_tensor in kv_cache_config.kv_cache_tensors:
-            if kv_cache_tensor.block_stride > 0:
-                if packed_backing is None:
-                    packed_backing = torch.zeros(
+            block_stride = int(getattr(kv_cache_tensor, "block_stride", 0) or 0)
+            if block_stride > 0:
+                backing_id = packed_kv_backing_id(kv_cache_tensor)
+                if backing_id is None:
+                    key: tuple[object, ...] = (
+                        "single-packed",
+                        int(kv_cache_tensor.size),
+                        block_stride,
+                    )
+                else:
+                    try:
+                        hash(backing_id)
+                    except TypeError as exc:
+                        raise ValueError(
+                            "Packed KV backing_id must be hashable"
+                        ) from exc
+                    layout = (int(kv_cache_tensor.size), block_stride)
+                    previous_layout = packed_layouts.get(backing_id)
+                    if previous_layout is not None and previous_layout != layout:
+                        raise ValueError(
+                            "Packed KV descriptors sharing backing_id disagree "
+                            "on size or block_stride"
+                        )
+                    packed_layouts[backing_id] = layout
+                    key = ("packed", backing_id, *layout)
+                tensor = packed_backings.get(key)
+                if tensor is None:
+                    tensor = torch.zeros(
                         kv_cache_tensor.size,
                         dtype=torch.int8,
                         device=self.device,
                     )
-                tensor = packed_backing
+                    packed_backings[key] = tensor
             else:
                 tensor = torch.zeros(
                     kv_cache_tensor.size,
                     dtype=torch.int8,
                     device=self.device,
                 )
-            for layer_name in kv_cache_tensor.shared_by:
+            layer_names = getattr(kv_cache_tensor, "shared_by", None)
+            if layer_names is None:
+                layer_names = getattr(kv_cache_tensor, "layers", ())
+            for layer_name in layer_names:
                 kv_cache_raw_tensors[layer_name] = tensor
 
         layer_names = set()
@@ -6949,11 +6994,15 @@ class GPUModelRunner(
 
         layer_packing: dict[str, tuple[int, int]] = {}
         for kv_tensor in self.kv_cache_config.kv_cache_tensors:
-            if kv_tensor.block_stride > 0:
-                for layer_name in kv_tensor.shared_by:
+            block_stride = int(getattr(kv_tensor, "block_stride", 0) or 0)
+            if block_stride > 0:
+                layer_names = getattr(kv_tensor, "shared_by", None)
+                if layer_names is None:
+                    layer_names = getattr(kv_tensor, "layers", ())
+                for layer_name in layer_names:
                     layer_packing[layer_name] = (
-                        kv_tensor.offset,
-                        kv_tensor.block_stride,
+                        int(getattr(kv_tensor, "offset", 0) or 0),
+                        block_stride,
                     )
 
         for group in self._kv_cache_spec_attn_group_iterator():
@@ -6967,6 +7016,10 @@ class GPUModelRunner(
                 if layer_name in self.runner_only_attn_layers:
                     continue
                 raw_tensor = kv_cache_raw_tensors[layer_name]
+                kv_cache_spec = group.kv_cache_spec
+                per_layer_specs = getattr(kv_cache_spec, "kv_cache_specs", None)
+                if isinstance(per_layer_specs, dict):
+                    kv_cache_spec = per_layer_specs[layer_name]
                 packing = layer_packing.get(layer_name)
                 if packing is not None:
                     _, block_stride = packing
@@ -7133,7 +7186,26 @@ class GPUModelRunner(
 
         # Try creating KV caches optimized for kv-connector transfers
         cache_dtype = self.cache_config.cache_dtype
-        if self.use_uniform_kv_cache(self.attn_groups):
+        from vllm_hcu.v1.dsa_cache_layer_split import (
+            is_dsa_cache_layer_split_requested,
+        )
+
+        # The upstream uniform connector layout allocates one independent
+        # layer dimension and ignores HCU's packed ``offset``/
+        # ``block_stride`` descriptors.  Running it for DSA layer split would
+        # multiply the packed allocation by the number of layers and discard
+        # the owned/scratch aliases, so use the packed generic path instead.
+        dsa_layer_split_active = is_dsa_cache_layer_split_requested(
+            self.vllm_config
+        )
+        has_packed_layer_split = any(
+            int(getattr(tensor, "block_stride", 0) or 0) > 0
+            for tensor in kv_cache_config.kv_cache_tensors
+        )
+        if (
+            self.use_uniform_kv_cache(self.attn_groups)
+            and not (dsa_layer_split_active and has_packed_layer_split)
+        ):
             kv_caches, cross_layers_kv_cache, attn_backend = (
                 self.allocate_uniform_kv_caches(
                     kv_cache_config,
@@ -7169,6 +7241,9 @@ class GPUModelRunner(
             self.kv_caches,
             num_attn_module,
         )
+        from vllm_hcu.v1.dsa_cache_layer_split import register_dsa_cache_tensors
+
+        register_dsa_cache_tensors(kv_caches)
         return kv_caches
 
     def maybe_add_kv_sharing_layers_to_kv_cache_groups(
@@ -7211,6 +7286,15 @@ class GPUModelRunner(
             cache size of each layer
         """
         kv_cache_config = deepcopy(kv_cache_config)
+        from vllm_hcu.v1.dsa_cache_layer_split import (
+            install_runtime_layer_split_state,
+            maybe_log_runtime_layer_shard_plan,
+            remap_packed_kv_tensor_offsets,
+        )
+
+        install_runtime_layer_split_state(self.vllm_config)
+        remap_packed_kv_tensor_offsets(kv_cache_config, self.vllm_config)
+        maybe_log_runtime_layer_shard_plan(self.vllm_config)
         self.kv_cache_config = kv_cache_config
         self._mamba_bufs = None
         self._mamba_state_copy_funcs = None
