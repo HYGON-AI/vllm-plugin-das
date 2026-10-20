@@ -14,8 +14,13 @@ from vllm_hcu.v1.attention.ops.fp8_paged_mqa_gfx938 import (
 
 
 def test_layer_split_page_gather_has_fixed_capture_shape(monkeypatch):
-    cache = torch.arange(5 * 2 * 3).reshape(5, 2, 1, 3)
-    table = torch.tensor([[3, -1, 3, 1]], dtype=torch.int32)
+    backing = torch.arange(5 * 3 * 3).reshape(5, 3, 1, 3)
+    cache = backing[:, :2]
+    assert not cache.is_contiguous()
+    table = torch.tensor(
+        [[3, -1, 3, 1, -1, -1, -1], [-1, 4, -1, -1, -1, -1, -1]],
+        dtype=torch.int32,
+    )
     monkeypatch.setattr(torch.cuda, "is_current_stream_capturing", lambda: True)
     monkeypatch.setattr(
         torch,
@@ -27,12 +32,11 @@ def test_layer_split_page_gather_has_fixed_capture_shape(monkeypatch):
 
     dense, remapped = _gather_dense_pages_for_tables(cache, table)
 
-    assert dense.shape == (table.numel(), 2, 1, 3)
-    assert torch.equal(dense[0], cache[3])
-    assert torch.equal(dense[1], cache[0])
-    assert torch.equal(dense[2], cache[3])
-    assert torch.equal(dense[3], cache[1])
-    assert torch.equal(remapped, torch.tensor([[0, -1, 2, 3]], dtype=torch.int32))
+    assert table.numel() > cache.shape[0]
+    assert dense.shape == cache.shape
+    assert dense.is_contiguous()
+    assert torch.equal(dense, cache)
+    assert remapped is table
 
 
 def _case(

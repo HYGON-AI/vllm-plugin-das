@@ -105,22 +105,10 @@ def _gather_dense_pages_for_tables(
     used_mask = (flat >= 0) & (flat < num_pages)
     if torch.cuda.is_current_stream_capturing():
         # CUDA graph capture cannot synchronize on used_mask.any() or allocate
-        # the data-dependent output of torch.unique(). Gather one fixed slot
-        # per table entry instead; repeated pages are harmless, and invalid
-        # entries stay masked by their remapped -1 IDs.
-        safe_pages = torch.where(used_mask, flat, torch.zeros_like(flat))
-        dense = kv_cache_fp8.index_select(0, safe_pages).contiguous()
-        dense_ids = torch.arange(
-            flat.numel(),
-            dtype=block_tables.dtype,
-            device=block_tables.device,
-        ).reshape_as(block_tables)
-        remapped = torch.where(
-            used_mask.reshape_as(block_tables),
-            dense_ids,
-            torch.full_like(block_tables, -1),
-        )
-        return dense, remapped
+        # the data-dependent output of torch.unique(). Materialize each
+        # physical page once and retain the original IDs, bounding temporary
+        # storage by the physical cache instead of padded table capacity.
+        return kv_cache_fp8.contiguous(), block_tables
     if not bool(used_mask.any()):
         dense = kv_cache_fp8[:0].contiguous()
         return dense, block_tables
