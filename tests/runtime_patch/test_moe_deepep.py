@@ -1839,8 +1839,16 @@ def test_moe_layer_forward_and_repacked_weight_contract(
             self.moe_quant_config = "official-config"
 
     class RoutedExperts:
-        def __init__(self, apply_router_weight_on_input=False, activation=None):
-            self.moe_config = SimpleNamespace(activation=activation)
+        def __init__(
+            self,
+            apply_router_weight_on_input=False,
+            activation=None,
+            pcp_size=1,
+        ):
+            self.moe_config = SimpleNamespace(
+                activation=activation,
+                pcp_size=pcp_size,
+            )
             self.quant_method = UnquantizedFusedMoEMethod()
             self.local_num_experts = 2
             self._dsv4_channel_deepgemm_repacked = False
@@ -1870,9 +1878,14 @@ def test_moe_layer_forward_and_repacked_weight_contract(
             yield "official-load"
 
     class Runner:
-        def __init__(self, apply_router_weight_on_input=False, activation=None):
+        def __init__(
+            self,
+            apply_router_weight_on_input=False,
+            activation=None,
+            pcp_size=1,
+        ):
             self.routed_experts = RoutedExperts(
-                apply_router_weight_on_input, activation
+                apply_router_weight_on_input, activation, pcp_size
             )
             self.replaced = None
 
@@ -1889,7 +1902,7 @@ def test_moe_layer_forward_and_repacked_weight_contract(
         "def FusedMoEFactory("
         + ", ".join(f"{name}=None" for name in factory_names)
         + "):\n    factory_calls.append((enable_eplb, num_redundant_experts))\n"
-        + "    return Runner(apply_router_weight_on_input, activation)\n"
+        + "    return Runner(apply_router_weight_on_input, activation, pcp_size)\n"
     )
     layer_module.factory_calls = []
     exec(source, layer_module.__dict__)
@@ -1960,6 +1973,26 @@ def test_moe_layer_forward_and_repacked_weight_contract(
     )
     non_kimi_runner = fused_moe_package.FusedMoE()
     assert not hasattr(non_kimi_runner.routed_experts.moe_config, "_hcu_kimi_k3")
+    assert (
+        non_kimi_runner.routed_experts.moe_config._hcu_global_ht_token_bound
+        is False
+    )
+    for architecture in ("DeepseekV4ForCausalLM", "DeepSeekV4MTPModel"):
+        monkeypatch.setattr(
+            "vllm.config.get_current_vllm_config_or_none",
+            lambda architecture=architecture: SimpleNamespace(
+                model_config=SimpleNamespace(
+                    architectures=[architecture],
+                    hf_config=SimpleNamespace(model_type="deepseek_v4"),
+                )
+            ),
+        )
+        deepseek_v4_pcp_runner = fused_moe_package.FusedMoE(pcp_size=8)
+        assert (
+            deepseek_v4_pcp_runner.routed_experts.moe_config
+            ._hcu_global_ht_token_bound
+            is True
+        )
     situ_runner = fused_moe_package.FusedMoE(activation="situ")
     assert situ_runner.routed_experts.moe_config._hcu_kimi_k3 is True
     kimi_runner_type = type(
@@ -5117,11 +5150,7 @@ def test_slimquant_w4a8_auto_factory_reuses_unified_prepare_finalize(
     monkeypatch.setattr(
         vllm_config_module,
         "get_current_vllm_config_or_none",
-        lambda: SimpleNamespace(
-            model_config=SimpleNamespace(
-                architectures=["DeepSeekV4MTPModel"],
-            )
-        ),
+        lambda: None,
     )
     constructed: dict[str, object] = {}
 
@@ -5145,7 +5174,10 @@ def test_slimquant_w4a8_auto_factory_reuses_unified_prepare_finalize(
         weight_dtype="int4",
         gemm1_clamp_limit=10.0,
     )
-    moe_config = SimpleNamespace(pcp_size=8)
+    moe_config = SimpleNamespace(
+        pcp_size=8,
+        _hcu_global_ht_token_bound=True,
+    )
 
     kernel = module.make_deepep_auto_deepgemm_w4a8_moe_kernel(
         moe_quant_config=quant_config,
