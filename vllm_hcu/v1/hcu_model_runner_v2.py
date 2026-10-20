@@ -125,6 +125,8 @@ def synchronize_pp_spec_draft_tokens(
         broadcast_stream.wait_stream(main_stream)
         if getattr(pp_handler, "is_last_rank"):
             draft_tokens = req_states.draft_tokens[idx_mapping].contiguous()
+            if idx_mapping.is_cuda:
+                idx_mapping.record_stream(broadcast_stream)
         else:
             draft_tokens = torch.empty(
                 (num_reqs, num_speculative_steps),

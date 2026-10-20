@@ -2143,6 +2143,76 @@ def test_pp_v2_spec_drafts_wait_only_when_same_request_becomes_eligible(
     assert [name for name, _ in calls].count("wait_event") == 1
 
 
+def test_pp_v2_last_rank_records_gather_index_on_broadcast_stream(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """The side-stream gather must keep its CUDA index storage alive."""
+    from vllm_hcu.v1 import hcu_model_runner_v2
+
+    calls: list[tuple[str, object]] = []
+
+    class Stream:
+        def wait_stream(self, stream: object) -> None:
+            calls.append(("wait", stream))
+
+    class Tensor:
+        is_cuda = True
+
+        def __init__(self, label: str) -> None:
+            self.label = label
+
+        def contiguous(self):
+            return self
+
+        def record_stream(self, stream: object) -> None:
+            calls.append((f"record_{self.label}", stream))
+
+    class DraftTable:
+        def __getitem__(self, index: Tensor) -> Tensor:
+            calls.append(("gather", index))
+            return Tensor("payload")
+
+    main_stream = Stream()
+    broadcast_stream = Stream()
+    idx_mapping = Tensor("index")
+    runner = SimpleNamespace(
+        pp_handler=SimpleNamespace(
+            is_last_rank=True,
+            last_rank=7,
+            broadcast_group="draft-group",
+            broadcast_stream=broadcast_stream,
+            main_stream=main_stream,
+        ),
+        num_speculative_steps=3,
+        req_states=SimpleNamespace(draft_tokens=DraftTable()),
+    )
+    input_batch = SimpleNamespace(num_reqs=1, idx_mapping=idx_mapping)
+
+    monkeypatch.setattr(
+        hcu_model_runner_v2.torch.cuda,
+        "stream",
+        lambda stream: contextlib.nullcontext(),
+    )
+
+    def broadcast(tensor, *, src, group):
+        calls.append(("broadcast", (src, group)))
+
+    monkeypatch.setattr(
+        hcu_model_runner_v2.torch.distributed, "broadcast", broadcast
+    )
+
+    assert hcu_model_runner_v2.synchronize_pp_spec_draft_tokens(
+        runner, input_batch
+    )
+    assert calls == [
+        ("wait", main_stream),
+        ("gather", idx_mapping),
+        ("record_index", broadcast_stream),
+        ("broadcast", (7, "draft-group")),
+        ("record_payload", broadcast_stream),
+    ]
+
+
 @pytest.mark.parametrize("is_last", [False, True])
 def test_pp_mtp_rejects_oversized_sample_before_broadcast(is_last):
     from vllm_hcu.v1.hcu_model_runner_v2 import install_fixed_width_pp_sample_broadcast

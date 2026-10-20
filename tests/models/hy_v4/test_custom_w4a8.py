@@ -215,6 +215,58 @@ def test_hyv4_compressed_tensors_packed_experts_adapt_to_hcu_layout():
     )
 
 
+def test_standard_packed_experts_load_without_hyv4_weight_adapter():
+    """The global W4A8 route must accept native packed checkpoint names."""
+    from vllm.model_executor.layers.fused_moe.routed_experts import (
+        RoutedExperts,
+    )
+    from vllm_hcu.model_executor.layers.quantization.compressed_tensors_w4a8_moe import (
+        HcuCompressedTensorsW4A8Int8MoEMethod,
+    )
+    from vllm_hcu.patch.worker.op_opt.moe import patch_layer
+
+    patch_layer.apply()
+    loaded: list[tuple[torch.Tensor, str, int]] = []
+    parameter = torch.nn.Parameter(
+        torch.empty((1, 1), dtype=torch.int8), requires_grad=False
+    )
+
+    def weight_loader(
+        *, param, loaded_weight, shard_id, expert_id, **kwargs
+    ) -> bool:
+        loaded.append((loaded_weight, shard_id, expert_id))
+        return True
+
+    parameter.weight_loader = weight_loader
+    owner = SimpleNamespace(
+        layer_name="experts",
+        moe_config=SimpleNamespace(hidden_dim_unpadded=8),
+        quant_method=object.__new__(HcuCompressedTensorsW4A8Int8MoEMethod),
+        w13_weight=parameter,
+        get_expert_mapping=lambda include_fused: [
+            ("w13_", "experts.0.gate_proj.", 0, "w1")
+        ],
+    )
+    packed = torch.ones((2, 1), dtype=torch.int32)
+    metadata = torch.tensor([2, 8], dtype=torch.int64)
+
+    loaded_names = list(
+        RoutedExperts.load_weights(
+            owner,
+            [
+                ("0.gate_proj.weight_shape", metadata),
+                ("0.gate_proj.weight_packed", packed),
+            ],
+        )
+    )
+
+    assert loaded_names == ["w13_weight"]
+    assert len(loaded) == 1
+    loaded_weight, shard_id, expert_id = loaded[0]
+    torch.testing.assert_close(loaded_weight, packed)
+    assert (shard_id, expert_id) == ("w1", 0)
+
+
 def test_hyv4_compressed_tensors_preserves_unrelated_expert_scheme():
     class CompressedTensorsConfig:
         config = compressed_w4a8_config()

@@ -288,7 +288,23 @@ def apply_to_module(module: ModuleType) -> bool:
 
     @functools.wraps(load_weights)
     def hcu_load_weights(self, weights):
+        from vllm_hcu.model_executor.layers.quantization.compressed_tensors_w4a8_moe import (
+            HcuCompressedTensorsW4A8Int8MoEMethod,
+        )
+
+        uses_hcu_compressed_w4a8 = isinstance(
+            getattr(self, "quant_method", None),
+            HcuCompressedTensorsW4A8Int8MoEMethod,
+        )
         for expert_name, loaded_weight in weights:
+            if uses_hcu_compressed_w4a8:
+                if expert_name.endswith(".weight_shape"):
+                    continue
+                if expert_name.endswith(".weight_packed"):
+                    suffix = "" if loaded_weight.ndim == 3 else ".weight"
+                    expert_name = (
+                        expert_name.removesuffix(".weight_packed") + suffix
+                    )
             loaded_names = _load_fused_channel_scale(
                 self, expert_name, loaded_weight
             )
