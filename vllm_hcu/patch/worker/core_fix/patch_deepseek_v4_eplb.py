@@ -19,7 +19,6 @@ With EPLB disabled every wrapped path is the original one.
 from __future__ import annotations
 
 import functools
-import importlib
 from types import ModuleType
 
 from ._common import (
@@ -31,15 +30,12 @@ from ._common import (
 )
 
 TARGET_MODULE = "vllm.models.deepseek_v4.amd.model"
-MTP_MODULE = "vllm.models.deepseek_v4.amd.mtp"
 PATCH_ID = "worker.core_fix.deepseek_v4_amd.eplb"
 TARGETS = (
     f"{TARGET_MODULE}.FusedMoEFactory",
     f"{TARGET_MODULE}.DeepseekV4MoE.__init__",
     f"{TARGET_MODULE}.DeepseekV4Model.get_expert_mapping",
     f"{TARGET_MODULE}.DeepseekV4ForCausalLM.__init__",
-    f"{MTP_MODULE}.DeepSeekV4MTP.__init__",
-    f"{MTP_MODULE}.fused_moe_make_expert_params_mapping",
 )
 _MARKER = "_vllm_hcu_deepseek_v4_eplb_applied"
 _WRAPPER = "_vllm_hcu_deepseek_v4_eplb_wrapper"
@@ -102,7 +98,6 @@ def _update_physical_experts_metadata(
 
 def apply_to_module(module: ModuleType) -> bool:
     amd_model = load_exact_module(TARGET_MODULE, module)
-    amd_mtp = importlib.import_module(MTP_MODULE)
     moe_cls = require_class(amd_model, "DeepseekV4MoE", f"{TARGET_MODULE}.DeepseekV4MoE")
     model_cls = require_class(
         amd_model, "DeepseekV4Model", f"{TARGET_MODULE}.DeepseekV4Model"
@@ -110,15 +105,12 @@ def apply_to_module(module: ModuleType) -> bool:
     lm_cls = require_class(
         amd_model, "DeepseekV4ForCausalLM", f"{TARGET_MODULE}.DeepseekV4ForCausalLM"
     )
-    mtp_cls = require_class(amd_mtp, "DeepSeekV4MTP", f"{MTP_MODULE}.DeepSeekV4MTP")
     if getattr(amd_model, _MARKER, False):
         for owner, name, target in (
             (amd_model, "FusedMoEFactory", TARGETS[0]),
             (moe_cls, "__init__", TARGETS[1]),
             (model_cls, "get_expert_mapping", TARGETS[2]),
             (lm_cls, "__init__", TARGETS[3]),
-            (mtp_cls, "__init__", TARGETS[4]),
-            (amd_mtp, "fused_moe_make_expert_params_mapping", TARGETS[5]),
         ):
             if not getattr(require_callable(owner, name, target), _WRAPPER, False):
                 raise PatchCompatibilityError(
@@ -131,10 +123,6 @@ def apply_to_module(module: ModuleType) -> bool:
     get_expert_mapping = require_callable(model_cls, "get_expert_mapping", TARGETS[2])
     require_exact_signature(get_expert_mapping, TARGETS[2], positional=("self",))
     lm_init = require_callable(lm_cls, "__init__", TARGETS[3])
-    mtp_init = require_callable(mtp_cls, "__init__", TARGETS[4])
-    mtp_make_mapping = require_callable(
-        amd_mtp, "fused_moe_make_expert_params_mapping", TARGETS[5]
-    )
     make_mapping = require_callable(
         amd_model,
         "fused_moe_make_expert_params_mapping",
@@ -196,42 +184,22 @@ def apply_to_module(module: ModuleType) -> bool:
         if _eplb_config()[0]:
             _collect_moe(self)
 
-    @functools.wraps(mtp_init)
-    def hcu_mtp_init(self, *args, **kwargs):
-        mtp_init(self, *args, **kwargs)
-        if _eplb_config()[0]:
-            _collect_moe(self)
-
-    @functools.wraps(mtp_make_mapping)
-    def hcu_mtp_make_mapping(*args, **kwargs):
-        enable_eplb, num_redundant = _eplb_config()
-        if enable_eplb:
-            kwargs.setdefault("num_redundant_experts", num_redundant)
-        return mtp_make_mapping(*args, **kwargs)
-
     for function in (
         hcu_factory,
         hcu_moe_init,
         hcu_get_expert_mapping,
         hcu_lm_init,
-        hcu_mtp_init,
-        hcu_mtp_make_mapping,
     ):
         setattr(function, _WRAPPER, True)
     amd_model.FusedMoEFactory = hcu_factory
     moe_cls.__init__ = hcu_moe_init
     model_cls.get_expert_mapping = hcu_get_expert_mapping
     lm_cls.__init__ = hcu_lm_init
-    mtp_cls.__init__ = hcu_mtp_init
-    amd_mtp.fused_moe_make_expert_params_mapping = hcu_mtp_make_mapping
     # Methods are class-level; the data attributes exist only when EPLB is on,
     # so ``is_mixture_of_experts`` stays False with EPLB disabled.
     lm_cls._vllm_hcu_moe_cls = moe_cls
     lm_cls.set_eplb_state = MixtureOfExperts.set_eplb_state
     lm_cls.update_physical_experts_metadata = _update_physical_experts_metadata
-    mtp_cls._vllm_hcu_moe_cls = moe_cls
-    mtp_cls.set_eplb_state = MixtureOfExperts.set_eplb_state
-    mtp_cls.update_physical_experts_metadata = _update_physical_experts_metadata
     setattr(amd_model, _MARKER, True)
     return True
 
@@ -241,7 +209,6 @@ def apply(module: ModuleType | None = None) -> bool:
 
 
 __all__ = [
-    "MTP_MODULE",
     "PATCH_ID",
     "TARGET_MODULE",
     "TARGETS",

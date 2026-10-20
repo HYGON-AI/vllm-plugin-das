@@ -6,12 +6,13 @@ import pytest
 import torch
 
 from vllm_hcu.patch.worker.core_fix import patch_deepseek_v4_eplb as patch
+from vllm_hcu.patch.worker.core_fix import patch_deepseek_v4_mtp_eplb as mtp_patch
 from vllm_hcu.patch.worker.core_fix._common import PatchCompatibilityError
 
 
 def target(monkeypatch):
     module = ModuleType(patch.TARGET_MODULE)
-    mtp_module = ModuleType(patch.MTP_MODULE)
+    mtp_module = ModuleType(mtp_patch.TARGET_MODULE)
     factory_calls = []
 
     def factory(**kwargs):
@@ -64,7 +65,8 @@ def target(monkeypatch):
     mtp_module.fused_moe_make_expert_params_mapping = (
         lambda model, **kwargs: ("mtp-eplb", kwargs)
     )
-    monkeypatch.setitem(sys.modules, patch.MTP_MODULE, mtp_module)
+    monkeypatch.setitem(sys.modules, patch.TARGET_MODULE, module)
+    monkeypatch.setitem(sys.modules, mtp_patch.TARGET_MODULE, mtp_module)
     module._test_mtp_module = mtp_module
     return module, factory_calls
 
@@ -83,6 +85,14 @@ def vllm_config(monkeypatch):
 
 
 HF = SimpleNamespace(n_routed_experts=256, n_group=None)
+
+
+def test_target_patch_does_not_import_initializing_mtp(vllm_config, monkeypatch):
+    module, _ = target(monkeypatch)
+    monkeypatch.delitem(sys.modules, mtp_patch.TARGET_MODULE)
+
+    assert patch.apply_to_module(module)
+    assert mtp_patch.TARGET_MODULE not in sys.modules
 
 
 def test_eplb_builds_redundant_experts_and_moe_interface(
@@ -128,6 +138,8 @@ def test_eplb_registers_native_mtp_and_maps_redundant_weights(
     module, _ = target(monkeypatch)
     patch.apply_to_module(module)
     mtp_module = module._test_mtp_module
+    assert mtp_patch.apply_to_module(mtp_module)
+    assert not mtp_patch.apply_to_module(mtp_module)
 
     class RegisteredCompatMTP(mtp_module.DeepSeekV4MTP):
         pass
