@@ -4214,7 +4214,11 @@ def test_deepep_auto_ht_workspace_uses_global_bound_for_dsv4_pcp() -> None:
     )
 
     experts = object.__new__(module.DeepEPAutoDeepGemmExperts)
-    experts.moe_config = SimpleNamespace(max_num_tokens=64, experts_per_token=10)
+    experts.moe_config = SimpleNamespace(
+        max_num_tokens=64,
+        experts_per_token=10,
+        dp_size=1,
+    )
     experts.num_dispatchers = 8
     experts._fixed_use_low_latency = None
     experts._use_low_latency_snapshot = False
@@ -4227,6 +4231,34 @@ def test_deepep_auto_ht_workspace_uses_global_bound_for_dsv4_pcp() -> None:
     expected = experts.ht_experts.workspace_shapes(*args)
 
     assert shapes == expected
+
+
+def test_deepep_auto_ht_workspace_keeps_dp_factor_for_dsv4_pcp() -> None:
+    from vllm.model_executor.layers.fused_moe.activation import MoEActivation
+    from vllm_hcu.model_executor.layers.fused_moe.experts import (
+        dpsk_v4_deep_gemm_moe as module,
+    )
+
+    experts = object.__new__(module.DeepEPAutoDeepGemmExperts)
+    experts.moe_config = SimpleNamespace(
+        max_num_tokens=64,
+        experts_per_token=10,
+        dp_size=2,
+    )
+    experts.num_dispatchers = 16
+    experts._fixed_use_low_latency = None
+    experts._use_low_latency_snapshot = False
+    experts._global_ht_token_bound = True
+    experts.ht_experts = object.__new__(module.DeepEPDeepGemmContiguousExperts)
+    experts.ll_experts = object.__new__(module.DeepEPDeepGemmMaskedExperts)
+
+    args = (64, 1_536, 2_048, 10, 512, 32, None, MoEActivation.SILU)
+    shapes = experts.workspace_shapes(*args)
+    reserve_args = (128, *args[1:])
+    reserve13, reserve2, _ = experts.ht_experts.workspace_shapes(*reserve_args)
+    _, _, output = experts.ht_experts.workspace_shapes(*args)
+
+    assert shapes == (reserve13, reserve2, output)
 
 
 def _slimquant_w4a8_auto_experts(fixed_use_low_latency: bool | None):
