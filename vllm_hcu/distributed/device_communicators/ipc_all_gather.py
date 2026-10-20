@@ -30,11 +30,13 @@ import torch
 import torch.distributed as dist
 from torch.distributed import ProcessGroup
 
-from vllm.triton_utils import tl, triton
+from vllm.triton_utils import HAS_TRITON, tl, triton
 
 _MAX_TENSORS = 4
 _MAX_WORLD = 8
-_NT = tl.constexpr(_MAX_TENSORS)
+# Without an active driver vLLM supplies a placeholder with constexpr=None.
+# Keep CPU contract tests importable; real Triton kernels retain the constexpr.
+_NT = tl.constexpr(_MAX_TENSORS) if HAS_TRITON else _MAX_TENSORS
 
 
 @triton.jit
