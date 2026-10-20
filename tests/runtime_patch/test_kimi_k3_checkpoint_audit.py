@@ -198,6 +198,48 @@ def test_audit_rejects_duplicate_header_keys_without_losing_first_value(tmp_path
     assert any('Duplicate JSON header key' in error for error in result['errors'])
 
 
+@pytest.mark.parametrize('encoding', [
+    'utf-16-le', 'utf-16', 'utf-32-le', 'utf-32', 'utf-8-sig',
+])
+def test_audit_rejects_non_utf8_safetensors_headers(tmp_path, encoding):
+    from safetensors import SafetensorError, safe_open
+
+    _write(tmp_path)
+    path = tmp_path / 'model.safetensors'
+    raw = path.read_bytes()
+    size = struct.unpack('<Q', raw[:8])[0]
+    header_text = raw[8:8 + size].decode('utf-8')
+    encoded_header = header_text.encode(encoding)
+    _rewrite_raw_header(tmp_path, encoded_header)
+
+    with pytest.raises(SafetensorError):
+        with safe_open(path, framework='numpy'):
+            pass
+    result = audit_module.audit(tmp_path)
+    assert not result['passed']
+    assert any('Invalid safetensors header' in error for error in result['errors'])
+
+
+@pytest.mark.parametrize('prefix,suffix', [('', ''), (' \n', '\t\n')])
+def test_audit_accepts_utf8_safetensors_headers_with_json_whitespace(
+    tmp_path, prefix, suffix
+):
+    from safetensors import safe_open
+
+    _write(tmp_path)
+    path = tmp_path / 'model.safetensors'
+    raw = path.read_bytes()
+    size = struct.unpack('<Q', raw[:8])[0]
+    header_text = raw[8:8 + size].decode('utf-8')
+    encoded_header = (prefix + header_text + suffix).encode('utf-8')
+    _rewrite_raw_header(tmp_path, encoded_header)
+
+    with safe_open(path, framework='numpy'):
+        pass
+    result = audit_module.audit(tmp_path)
+    assert result['passed'] and not result['errors']
+
+
 @pytest.mark.parametrize('case,message', [
     ('identical', 'Overlapping'), ('partial', 'Overlapping'),
     ('vision', 'Overlapping'), ('leading_gap', 'Gap'),

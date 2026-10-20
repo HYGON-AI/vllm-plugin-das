@@ -239,8 +239,9 @@ def audit(root, tp=16):
             if size > 100_000_000:
                 raise ValueError('Unreasonable safetensors header size')
             try:
-                header = json.loads(stream.read(size), object_pairs_hook=_unique_object)
-            except (json.JSONDecodeError, ValueError) as exc:
+                header_text = stream.read(size).decode('utf-8')
+                header = json.loads(header_text, object_pairs_hook=_unique_object)
+            except (UnicodeDecodeError, json.JSONDecodeError, ValueError) as exc:
                 errors.append(f'Invalid safetensors header: {shard}: {exc}')
                 continue
             if type(header) is not dict:
