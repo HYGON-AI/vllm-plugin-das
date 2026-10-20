@@ -918,6 +918,9 @@ def test_hcu_model_runner_v2_binds_router_while_worker_weight_pool_is_active(
             events.append(("upstream-load", load_dummy_weights))
             self.model = model
 
+        def get_draft_model(self):
+            return None
+
         def execute_model(self):
             return None
 
@@ -936,6 +939,15 @@ def test_hcu_model_runner_v2_binds_router_while_worker_weight_pool_is_active(
         return 42
 
     monkeypatch.setattr(router_runtime, "bind_glm53_router_gates", bind_router)
+    from vllm_hcu.patch.worker.core_fix import patch_deepseek_v4_attention
+
+    def bind_compressor(loaded_model):
+        assert pool_active
+        assert loaded_model is model
+        events.append("bind-compressor")
+        return 7
+
+    monkeypatch.setattr(patch_deepseek_v4_attention, "bind_compressor_nt_weights", bind_compressor)
     adapter_module = importlib.import_module(adapter_name)
     runner = adapter_module.HcuGPUModelRunnerV2(object(), object())
 
@@ -945,8 +957,9 @@ def test_hcu_model_runner_v2_binds_router_while_worker_weight_pool_is_active(
     finally:
         pool_active = False
 
-    assert events == [("upstream-load", True), "bind-router"]
+    assert events == [("upstream-load", True), "bind-router", "bind-compressor"]
     assert runner._vllm_hcu_num_router_gates == 42
+    assert runner._vllm_hcu_num_compressor_weights == 7
 
 
 def test_worker_allocates_separate_dspark_workspace_lane(
@@ -1129,6 +1142,13 @@ def test_platform_defaults_prearm_worker_before_aiter_import(monkeypatch):
     assert events == ["prepare", "fused_moe", "linear", "shared"]
 
 
+class _CompilationConfigStub:
+    """Support the weak-reference binding used by the platform graph policy."""
+
+    def __init__(self):
+        self.cudagraph_mode = SimpleNamespace(has_full_cudagraphs=lambda: False)
+
+
 def test_platform_check_uses_lazy_executor_selector(monkeypatch):
     import torch
 
@@ -1153,12 +1173,11 @@ def test_platform_check_uses_lazy_executor_selector(monkeypatch):
         lambda config: events.append("executor") or False,
     )
     config = SimpleNamespace(
+        additional_config={},
         model_config=SimpleNamespace(use_mla=False),
         cache_config=None,
         attention_config=SimpleNamespace(backend=None),
-        compilation_config=SimpleNamespace(
-            cudagraph_mode=SimpleNamespace(has_full_cudagraphs=lambda: False)
-        ),
+        compilation_config=_CompilationConfigStub(),
         parallel_config=SimpleNamespace(worker_cls="auto"),
     )
     HCUPlatform.check_and_update_config(config)
@@ -1195,15 +1214,14 @@ def test_hcu_config_preserves_mla_prefix_caching(monkeypatch):
         or False,
     )
     config = SimpleNamespace(
+        additional_config={},
         model_config=SimpleNamespace(use_mla=True),
         cache_config=SimpleNamespace(
             enable_prefix_caching=True,
             user_specified_block_size=True,
         ),
         attention_config=SimpleNamespace(backend=None),
-        compilation_config=SimpleNamespace(
-            cudagraph_mode=SimpleNamespace(has_full_cudagraphs=lambda: False)
-        ),
+        compilation_config=_CompilationConfigStub(),
         parallel_config=SimpleNamespace(worker_cls="auto"),
     )
 
