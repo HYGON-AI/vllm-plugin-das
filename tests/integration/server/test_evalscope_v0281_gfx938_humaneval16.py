@@ -110,21 +110,21 @@ PROFILE_CONTRACTS = (
     ),
     (
         "hy4_preview_channel_fp8_tp8",
-        "/models/Hy4-preview-Channel-FP8-w8a8",
+        "/models/Hy4-preview-Channel-FP8-w8a8-v2",
         8,
         "FLASHMLA_SPARSE",
         None,
     ),
     (
         "hy4_preview_channel_fp8_dp8_ep8_mtp3_kvfp8_eplb_calibration",
-        "/models/Hy4-preview-Channel-FP8-w8a8",
+        "/models/Hy4-preview-Channel-FP8-w8a8-v2",
         1,
         "FLASHMLA_SPARSE",
         "HND",
     ),
     (
         "hy4_preview_channel_fp8_dp8_ep8_mtp3_kvfp8_eplb_static",
-        "/models/Hy4-preview-Channel-FP8-w8a8",
+        "/models/Hy4-preview-Channel-FP8-w8a8-v2",
         1,
         "FLASHMLA_SPARSE",
         "HND",
@@ -318,6 +318,22 @@ def test_gfx938_profiles_have_unique_ports_and_owned_work_directories(
         ports.append(config["server"]["port"])
     assert len(work_dirs) == len(set(work_dirs)) == 26
     assert len(ports) == len(set(ports)) == 26
+
+
+def test_qwen35_w8a8_profile_avoids_aiter_marlin_vm_fault(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.delenv(CONFIG_ENV, raising=False)
+    monkeypatch.delenv(MODEL_ENV, raising=False)
+    config = load_profiled_config(
+        DEFAULT_CONFIG,
+        CONFIG_ENV,
+        profile="qwen35_35b_w8a8_tp2",
+    )
+
+    command, _, _ = server_command(config, model_env=MODEL_ENV)
+
+    assert _option_value(command, "--moe-backend") == "triton"
 
 
 def test_hy4_offline_eplb_calibration_and_static_commands() -> None:
