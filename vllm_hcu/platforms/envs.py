@@ -84,6 +84,7 @@ if TYPE_CHECKING:
     VLLM_HCU_QWEN4_EXP_HC_SP: bool = True
     VLLM_HCU_MHC_FUSED_RMSNORM: bool = True
     VLLM_HCU_GLM5NEXT_KDA_STRIDED_INPUTS: bool = True
+    VLLM_HCU_GLM5NEXT_KPOOL_FUSE_EXPAND: bool = False
 
 def maybe_convert_int(value: Optional[str]) -> Optional[int]:
     """
@@ -654,6 +655,19 @@ hcu_vllm_environment_variables: dict[str, Callable[[], Any]] = {
     # to disable.
     "VLLM_HCU_GLM5NEXT_KDA_STRIDED_INPUTS":
         lambda: (os.environ.get("VLLM_HCU_GLM5NEXT_KDA_STRIDED_INPUTS", "True").lower() in
+                    ("true", "1")),
+
+    # Fuse the GLM5Next kpool sparse-indexer's pool-expand step: derive the
+    # token-granular seq_len (positions + 1) inside
+    # expand_pools_and_append_tail's Triton kernel and let it write straight
+    # into topk_indices_buffer, instead of precomputing an int64 pool-id
+    # cast, a separate int32 positions cast + add, and a final whole-buffer
+    # copy on the host. Removes 4 elementwise kernels per decode step on the
+    # non-padded kpool>1 (index_kpool > 1) path. Consulted once at
+    # patch-apply time. See patch_glm5next_kpool_fuse_expand.py. Disabled
+    # by default (opt-in); set to 1 to enable.
+    "VLLM_HCU_GLM5NEXT_KPOOL_FUSE_EXPAND":
+        lambda: (os.environ.get("VLLM_HCU_GLM5NEXT_KPOOL_FUSE_EXPAND", "False").lower() in
                     ("true", "1")),
 }
 
