@@ -3881,6 +3881,47 @@ def test_channel_fp8_auto_experts_isolate_in_place_marlin_layouts(
     assert ht_w13.untyped_storage().data_ptr() != ll_w13.untyped_storage().data_ptr()
 
 
+def test_channel_auto_experts_cache_equivalent_layout_probe_by_shape() -> None:
+    from vllm_hcu.model_executor.layers.fused_moe.experts import (
+        dpsk_v4_deep_gemm_moe as module,
+    )
+
+    calls: list[str] = []
+
+    class ContiguousExperts:
+        def _pack_channel_weights(self, w13, w2):
+            calls.append("ht")
+            return w13, w2
+
+    class MaskedExperts:
+        def _pack_channel_weights(self, w13, w2):
+            calls.append("ll")
+            return w13, w2
+
+    def make_experts():
+        experts = object.__new__(module.DeepEPAutoDeepGemmExperts)
+        experts.quant_config = SimpleNamespace(use_int8_w8a8=False)
+        experts.ht_experts = ContiguousExperts()
+        experts.ll_experts = MaskedExperts()
+        return experts
+
+    module._PACKED_LAYOUT_PROBE_CACHE.clear()
+    first = make_experts()
+    second = make_experts()
+    w13 = torch.empty((4, 32, 64), dtype=torch.int8)
+    w2 = torch.empty((4, 64, 16), dtype=torch.int8)
+
+    assert first._packers_share_layout(w13, w2)
+    assert second._packers_share_layout(w13, w2)
+    assert calls == ["ht", "ll"]
+
+    different_shape = torch.empty((4, 64, 64), dtype=torch.int8)
+    assert second._packers_share_layout(different_shape, w2)
+    assert calls == ["ht", "ll", "ht", "ll"]
+
+    module._PACKED_LAYOUT_PROBE_CACHE.clear()
+
+
 @pytest.mark.parametrize(
     ("fixed_use_low_latency", "layout", "selected_packer", "rejected_packer"),
     [

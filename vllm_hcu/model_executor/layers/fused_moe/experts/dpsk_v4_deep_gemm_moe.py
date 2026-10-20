@@ -10,6 +10,7 @@ activation scales.
 """
 
 import functools
+import threading
 
 import torch
 
@@ -52,6 +53,9 @@ from vllm_hcu.platforms import envs as henvs
 # Use vLLM's configured logger hierarchy so worker-side backend evidence is
 # present in the normal engine log (``vllm_hcu.*`` has no configured handler).
 logger = init_logger("vllm.hcu.deepseek_v4_deepep_experts")
+
+_PACKED_LAYOUT_PROBE_CACHE: dict[tuple[object, ...], bool] = {}
+_PACKED_LAYOUT_PROBE_LOCK = threading.Lock()
 
 
 @functools.lru_cache(maxsize=None)
@@ -935,6 +939,34 @@ class DeepEPAutoDeepGemmExperts(mk.FusedMoEExpertsModular):
             child._deepgemm_w2 = layer.w2_weight
 
     def _packers_share_layout(self, w13: torch.Tensor, w2: torch.Tensor) -> bool:
+        use_int8 = bool(
+            getattr(getattr(self, "quant_config", None), "use_int8_w8a8", False)
+        )
+        cache_key = (
+            type(self.ht_experts)._pack_channel_weights,
+            type(self.ll_experts)._pack_channel_weights,
+            marlin_i8_contiguous_weight if use_int8 else marlin_fp8_contiguous_weight,
+            marlin_i8_masked_weight if use_int8 else marlin_fp8_masked_weight,
+            w13.device.type,
+            w13.device.index,
+            w13.dtype,
+            tuple(w13.shape[1:]),
+            w2.device.type,
+            w2.device.index,
+            w2.dtype,
+            tuple(w2.shape[1:]),
+        )
+        with _PACKED_LAYOUT_PROBE_LOCK:
+            cached = _PACKED_LAYOUT_PROBE_CACHE.get(cache_key)
+            if cached is not None:
+                return cached
+            shared = self._probe_packers_share_layout(w13, w2)
+            _PACKED_LAYOUT_PROBE_CACHE[cache_key] = shared
+            return shared
+
+    def _probe_packers_share_layout(
+        self, w13: torch.Tensor, w2: torch.Tensor
+    ) -> bool:
         # Probe one random expert: the packers are pure per-expert byte
         # permutations, so equal output on random bytes means equal layouts.
         def probe(weight: torch.Tensor) -> torch.Tensor:
