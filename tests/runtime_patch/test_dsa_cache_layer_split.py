@@ -115,6 +115,18 @@ def test_validate_rejects_pp(monkeypatch: pytest.MonkeyPatch) -> None:
         validate_dsa_cache_layer_split(cfg)
 
 
+def test_validate_rejects_pcp_greater_than_layers(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Empty owned ranges cannot register Mooncake KV tensors."""
+    _set_layer_split(monkeypatch, True)
+    cfg = _pd_prefill_cfg()
+    cfg.parallel_config.prefill_context_parallel_size = 8
+    cfg.model_config.hf_config.num_hidden_layers = 3
+    with pytest.raises(ValueError, match="num_hidden_layers"):
+        validate_dsa_cache_layer_split(cfg)
+
+
 def _pd_prefill_cfg(
     architectures=("HYV4ForCausalLM",),
     use_mla=True,
@@ -719,6 +731,37 @@ def _remap_cfg(total_layers: int, pcp: int) -> SimpleNamespace:
             hf_config=SimpleNamespace(num_hidden_layers=total_layers)
         ),
     )
+
+
+def test_remap_skips_no_shrink_when_phys_slots_exceed_layers(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Planner keeps the native stride; worker must not invent owned+scratch."""
+    _set_layer_split(monkeypatch, True)
+    page, total_layers, pcp = 16, 1, 2
+    # Native full layout: one slot. Owned+scratch would want two.
+    assert phys_slots_for_layer_family([0], total_layers, pcp) == 2
+    block_stride = page * total_layers
+    tensors = [
+        _RemapTensor(
+            size=block_stride * 2,
+            shared_by=["model.layers.0.self_attn.attn"],
+            offset=0,
+            block_stride=block_stride,
+        )
+    ]
+    kv_cfg = SimpleNamespace(
+        kv_cache_tensors=tensors,
+        kv_cache_groups=[
+            SimpleNamespace(
+                layer_names=["model.layers.0.self_attn.attn"],
+                kv_cache_spec=SimpleNamespace(page_size_bytes=page),
+            )
+        ],
+    )
+    assert remap_packed_kv_tensor_offsets(kv_cfg, _remap_cfg(total_layers, pcp)) is False
+    assert tensors[0].offset == 0
+    assert tensors[0].block_stride == block_stride
 
 
 def test_remap_raises_on_block_stride_mismatch(

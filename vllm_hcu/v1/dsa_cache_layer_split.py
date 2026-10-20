@@ -326,6 +326,15 @@ def validate_dsa_cache_layer_split(vllm_config: Any) -> None:
             "enable_dsa_cache_layer_split requires an HCU-supported DSA MLA "
             f"capability ({_dsa_capability_error(model_config)})."
         )
+    total_layers = _total_layers_from_config(vllm_config)
+    if total_layers is not None and pcp > total_layers:
+        raise ValueError(
+            "enable_dsa_cache_layer_split requires "
+            "prefill_context_parallel_size <= num_hidden_layers "
+            f"(got pcp={pcp}, num_hidden_layers={total_layers}); "
+            "PCP ranks with an empty owned range cannot register Mooncake "
+            "KV tensors."
+        )
     _require_unsplittable_manager_block(vllm_config)
 
 
@@ -1708,16 +1717,25 @@ def remap_packed_kv_tensor_offsets(
             indices, state.total_layers, state.shard_size
         )
 
-    if all(phys_slots[ps] == len(buckets[ps]) for ps in page_sizes):
+    # Match the planner no-shrink fallback: when owned+scratch is not smaller
+    # than the native family layout (phys_slots >= original layer count), the
+    # shared KV config kept the full stride. Remapping would invent a larger
+    # stride and fail the block_stride check (e.g. 1 layer / PCP2).
+    owned_scratch_bytes = sum(ps * phys_slots[ps] for ps in page_sizes)
+    full_bytes = sum(ps * len(buckets[ps]) for ps in page_sizes)
+    if owned_scratch_bytes >= full_bytes:
         logger.warning(
-            "DSA layer-split packed remap skipped: families already full-size "
-            "phys_slots=%s",
+            "DSA layer-split packed remap skipped: no-shrink layout "
+            "(owned+scratch=%s >= full=%s) phys_slots=%s bucket_lens=%s",
+            owned_scratch_bytes,
+            full_bytes,
             phys_slots,
+            {ps: len(buckets[ps]) for ps in page_sizes},
         )
         return False
 
     new_stride = align_packed_block_stride(
-        sum(ps * phys_slots[ps] for ps in page_sizes),
+        owned_scratch_bytes,
         getattr(kv_cache_config, "kv_cache_groups", None),
     )
     old_stride = int(packed[0].block_stride)
