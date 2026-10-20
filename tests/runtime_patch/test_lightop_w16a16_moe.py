@@ -27,14 +27,17 @@ def _module(name: str, **attributes: object) -> ModuleType:
 
 
 def _config(
-    *, backend: str = "auto", max_num_tokens: int = 16
+    *,
+    backend: str = "auto",
+    max_num_tokens: int = 16,
+    intermediate_size_per_partition: int = 512,
 ) -> SimpleNamespace:
     return SimpleNamespace(
         moe_backend=backend,
         in_dtype=torch.bfloat16,
         activation=MoEActivation.SILU,
         hidden_dim=2048,
-        intermediate_size_per_partition=512,
+        intermediate_size_per_partition=intermediate_size_per_partition,
         num_experts=256,
         experts_per_token=8,
         max_num_tokens=max_num_tokens,
@@ -534,7 +537,7 @@ def test_w16a16_no_config_preserves_original_selector_and_weights(
     assert [call for call in calls if call[0] == "convert"]
 
 
-def test_w16a16_selection_requires_configs_for_every_reachable_token_count(
+def test_w16a16_selection_checks_decode_and_budget_boundary_configs(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     from vllm_hcu.model_executor.layers.fused_moe import lightop_w16a16_runtime
@@ -558,7 +561,7 @@ def test_w16a16_selection_requires_configs_for_every_reachable_token_count(
     def select_config(_config, expected_m, device):
         del device
         probed.append(expected_m)
-        if expected_m == 3:
+        if expected_m == 4:
             return None
         return {"BLOCK_SIZE_M": 16}, {"BLOCK_SIZE_M": 16}
 
@@ -575,8 +578,132 @@ def test_w16a16_selection_requires_configs_for_every_reachable_token_count(
 
     assert backend.name == "AITER"
     assert experts == "official-experts"
-    assert probed == [1, 2, 3]
+    assert probed == [1, 4]
     assert [call for call in calls if call[0] == "select"]
+
+
+def test_w16a16_qwen35_tp2_shape_and_8192_budget_are_eligible(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    from vllm_hcu.model_executor.layers.fused_moe.experts import (
+        lightop_w16a16_moe,
+    )
+
+    monkeypatch.setattr(
+        lightop_w16a16_moe.current_platform,
+        "is_cuda_alike",
+        lambda: True,
+    )
+    monkeypatch.setattr(
+        lightop_w16a16_moe,
+        "is_lightop_w16a16_available",
+        lambda: True,
+    )
+
+    supported, reason = lightop_w16a16_moe.LightopW16A16Experts.is_supported_config(
+        lightop_w16a16_moe.LightopW16A16Experts,
+        _config(
+            max_num_tokens=8192,
+            intermediate_size_per_partition=256,
+        ),
+        None,
+        None,
+        FusedMoEActivationFormat.Standard,
+    )
+
+    assert supported is True, reason
+
+
+def test_w16a16_qwen35_budget_above_8192_is_rejected(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    from vllm_hcu.model_executor.layers.fused_moe.experts import (
+        lightop_w16a16_moe,
+    )
+
+    monkeypatch.setattr(
+        lightop_w16a16_moe.current_platform,
+        "is_cuda_alike",
+        lambda: True,
+    )
+    monkeypatch.setattr(
+        lightop_w16a16_moe,
+        "is_lightop_w16a16_available",
+        lambda: pytest.fail("oversized budget must not probe LightOp"),
+    )
+
+    supported, reason = lightop_w16a16_moe.LightopW16A16Experts.is_supported_config(
+        lightop_w16a16_moe.LightopW16A16Experts,
+        _config(
+            max_num_tokens=8193,
+            intermediate_size_per_partition=256,
+        ),
+        None,
+        None,
+        FusedMoEActivationFormat.Standard,
+    )
+
+    assert supported is False
+    assert "8192" in str(reason)
+
+
+@pytest.mark.parametrize(
+    ("arch", "cus", "expected_lookup_m"),
+    (
+        ("gfx936:sramecc+:xnack-", 80, 2),
+        ("gfx938:sramecc+:xnack-", 80, 1),
+        ("gfx936:sramecc+:xnack-", 72, 1),
+    ),
+)
+def test_w16a16_qwen35_m1_config_substitution_is_gfx936_80cu_only(
+    monkeypatch: pytest.MonkeyPatch,
+    arch: str,
+    cus: int,
+    expected_lookup_m: int,
+) -> None:
+    from vllm_hcu.model_executor.layers.fused_moe import lightop_w16a16_runtime
+
+    looked_up: list[int] = []
+
+    def get_config(
+        _experts,
+        tokens,
+        *_args,
+    ):
+        looked_up.append(tokens)
+        return (
+            {"BLOCK_SIZE_M": 16},
+            {"BLOCK_SIZE_M": 16},
+            True,
+        )
+
+    monkeypatch.setattr(
+        lightop_w16a16_runtime,
+        "_load_lightop_w16a16",
+        lambda: SimpleNamespace(get_config=get_config),
+    )
+    monkeypatch.setattr(
+        lightop_w16a16_runtime.torch.cuda,
+        "get_device_properties",
+        lambda _index: SimpleNamespace(
+            gcnArchName=arch,
+            multi_processor_count=cus,
+        ),
+    )
+    monkeypatch.setattr(
+        lightop_w16a16_runtime.torch.cuda,
+        "get_device_name",
+        lambda _index: "BW",
+    )
+
+    selected = lightop_w16a16_runtime.select_lightop_w16a16_config(
+        _config(intermediate_size_per_partition=256),
+        expected_m=1,
+        device="cuda:0",
+    )
+
+    assert selected is not None
+    assert looked_up == [expected_lookup_m]
 
 
 def test_w16a16_unverified_token_range_preserves_official_backend(

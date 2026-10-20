@@ -224,9 +224,20 @@ def select_lightop_w16a16_config(
     index = torch.cuda.current_device() if device.index is None else device.index
     properties = torch.cuda.get_device_properties(index)
     dtype = getattr(moe_config, "in_dtype", None)
+    arch = str(getattr(properties, "gcnArchName", "")).split(":", 1)[0]
+    config_m = int(expected_m)
+    if (
+        config_m == 1
+        and (experts, hidden, intermediate, topk) == (256, 2048, 256, 8)
+        and arch == "gfx936"
+        and int(properties.multi_processor_count) == 80
+    ):
+        # LightOp 0.6's gfx936 one-token records fail this exact TP2 problem,
+        # while the M=2 records are correct for the same one-token workload.
+        config_m = 2
     result = exports.get_config(
         experts,
-        int(expected_m),
+        config_m,
         2 * intermediate,
         hidden,
         hidden,

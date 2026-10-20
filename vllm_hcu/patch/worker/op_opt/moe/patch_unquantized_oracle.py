@@ -139,12 +139,13 @@ def apply_to_module(module: ModuleType) -> bool:
                 # decode config therefore delegates while weights are still
                 # canonical and safe for official Triton/AITER paths.
                 max_tokens = int(getattr(moe_config, "max_num_tokens", 0))
+                probe_tokens = (1, max_tokens) if max_tokens > 1 else (1,)
                 configs_available = all(
                     lightop_w16a16_runtime.select_lightop_w16a16_config(
                         moe_config, expected_m=tokens, device="cuda"
                     )
                     is not None
-                    for tokens in range(1, max_tokens + 1)
+                    for tokens in probe_tokens
                 )
                 if configs_available:
                     return hcu_enum.HCU_LIGHTOP_W16A16, experts_cls

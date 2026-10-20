@@ -32,10 +32,11 @@ Keep the two vLLM-managed allocations and change only their lifetimes:
   unchanged for the Qwen3.5 TP2 dimensions.
 
 Admit only the existing validated shapes: the prior N=512 shape and Qwen3.5
-TP2 N=256.  Keep BF16, SiLU, no-bias, pure-TP and no-EP constraints.  Allow a
-maximum scheduler budget of 8192.  Backend selection probes M=1 and the maximum
-budget rather than every integer because LightOp's config status is file/shape
-based and its API maps intermediate M values to the next configured bucket.
+TP2 N=256.  Keep BF16, SiLU, no-bias, pure-TP and no-EP constraints.  Allow the
+Qwen3.5 shape a maximum scheduler budget of 8192 while preserving the prior
+N=512 limit of 16.  Backend selection probes M=1 and the maximum budget rather
+than every integer because LightOp's config status is file/shape based and its
+API maps intermediate M values to the next configured bucket.
 
 For gfx936/80 CU and the exact Qwen3.5 TP2 problem, map only `expected_m=1` to
 the package's M=2 config.  Other architectures and shapes retain their native

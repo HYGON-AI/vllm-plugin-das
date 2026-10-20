@@ -16,7 +16,7 @@
 - Preserve BF16, unmodified SiLU, no bias/shared-expert fusion, pure TP, and no EP/DP/PCP/SP restrictions.
 - Admit only `(256,2048,512,8)` and `(256,2048,256,8)` problem shapes.
 - Apply the M=1-to-M=2 lookup only to gfx936/80 CU Qwen3.5 TP2.
-- Maximum supported scheduler token budget is 8192.
+- Maximum supported scheduler token budget is 8192 for Qwen3.5 TP2; the existing N=512 shape remains capped at 16.
 - Missing or invalid LightOp configs must select the official backend before weight packing.
 
 ## Review Focus
@@ -58,11 +58,11 @@
 - Consumes: LightOp config lookup and existing opt-in oracle.
 - Produces: Qwen3.5 TP2 eligibility through 8192 tokens, constant-count config preflight, and gfx936/80-CU one-token config substitution.
 
-- [ ] Add failing tests for N=256 eligibility, 8192/8193 boundary, constant-count preflight, and gfx936-only M=1 substitution.
-- [ ] Verify every test fails for the intended current gate/lookup behavior.
-- [ ] Implement the minimal shape, budget, preflight, and lookup changes.
-- [ ] Verify all focused tests and the complete LightOp contract file pass.
-- [ ] Commit with `fix(moe): enable qwen35 lightop tp2 configs`.
+- [x] Add failing tests for N=256 eligibility, 8192/8193 boundary, constant-count preflight, and gfx936-only M=1 substitution.
+- [x] Verify every test fails for the intended current gate/lookup behavior.
+- [x] Implement the minimal shape, budget, preflight, and lookup changes.
+- [x] Verify all focused tests and the complete LightOp contract file pass.
+- [x] Commit with `fix(moe): enable qwen35 lightop tp2 configs`.
 
 ### Task 3: HCU and model validation
 
