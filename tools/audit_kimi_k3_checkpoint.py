@@ -118,6 +118,36 @@ def language_schema(c):
     return schema
 
 
+def validate_shard_ranges(header, data_size, shard, errors):
+    """Require every payload byte to belong to exactly one tensor.
+
+    Safetensors headers need not be ordered. Sorting by both endpoints also
+    places empty tensors before nonempty tensors starting at the same offset.
+    Include vision and unindexed entries: they share the same payload space.
+    """
+    ranges = []
+    invalid = set()
+    for name, info in header.items():
+        if name == '__metadata__':
+            continue
+        start, end = info['data_offsets']
+        if not 0 <= start <= end <= data_size:
+            errors.append(f'Data offsets outside shard: {name}')
+            invalid.add(name)
+            continue
+        ranges.append((start, end, name))
+    cursor = 0
+    for start, end, name in sorted(ranges):
+        if start < cursor:
+            errors.append(f'Overlapping tensor data: {shard}: {name}')
+        elif start > cursor:
+            errors.append(f'Gap in tensor data: {shard}: {cursor}..{start}')
+        cursor = max(cursor, end)
+    if cursor < data_size:
+        errors.append(f'Trailing shard data: {shard}: {cursor}..{data_size}')
+    return invalid
+
+
 def audit(root, tp=16):
     root = Path(root)
     raw = json.loads((root / 'config.json').read_text())
@@ -146,16 +176,14 @@ def audit(root, tp=16):
                 raise ValueError('Unreasonable safetensors header size')
             header = json.loads(stream.read(size))
             data_size = os.fstat(stream.fileno()).st_size - 8 - size
+            invalid_ranges = validate_shard_ranges(header, data_size, shard, errors)
             if set(header) - {'__metadata__'} != indexed:
                 errors.append(f'Index/header mismatch: {shard}')
             for name in indexed:
-                if name not in header:
+                if name not in header or name in invalid_ranges:
                     continue
                 info = header[name]
                 start, end = info['data_offsets']
-                if not 0 <= start <= end <= data_size:
-                    errors.append(f'Data offsets outside shard: {name}')
-                    continue
                 if name.startswith(('vision_tower.', 'mm_projector.')):
                     vision += 1  # Inventory only; not proof of visual-model loading.
                     continue

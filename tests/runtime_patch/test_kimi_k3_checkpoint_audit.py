@@ -103,3 +103,63 @@ def test_audit_rejects_invalid_data_ranges(tmp_path, case):
     result = audit_module.audit(tmp_path)
     assert not result['passed']
     assert any('Data offsets outside shard' in error for error in result['errors'])
+
+
+@pytest.mark.parametrize('case,message', [
+    ('identical', 'Overlapping'), ('partial', 'Overlapping'),
+    ('vision', 'Overlapping'), ('leading_gap', 'Gap'),
+    ('internal_gap', 'Gap'), ('trailing', 'Trailing'),
+])
+def test_audit_rejects_non_partitioning_shard_ranges(tmp_path, case, message):
+    from safetensors import SafetensorError, safe_open
+
+    def add_vision(entries):
+        if case == 'vision':
+            entries['vision_tower.test.weight'] = dict(shape=[1], dtype='BF16')
+
+    _write(tmp_path, add_vision)
+    path = tmp_path / 'model.safetensors'
+    raw = path.read_bytes()
+    size = struct.unpack('<Q', raw[:8])[0]
+    header = json.loads(raw[8:8 + size])
+    payload = raw[8 + size:]
+    parent = 'language_model.model.layers.0.self_attn.'
+    if case in ('identical', 'partial'):
+        start, end = header[parent + 'q_proj.weight']['data_offsets']
+        shift = int(case == 'partial')
+        header[parent + 'k_proj.weight']['data_offsets'] = [start + shift, end + shift]
+    elif case == 'vision':
+        header['vision_tower.test.weight']['data_offsets'] = [0, 2]
+    elif case in ('leading_gap', 'internal_gap'):
+        split = 0 if case == 'leading_gap' else header[parent + 'k_proj.weight']['data_offsets'][0]
+        payload = payload[:split] + b'\0' + payload[split:]
+        for info in header.values():
+            start, end = info['data_offsets']
+            if start >= split:
+                info['data_offsets'] = [start + 1, end + 1]
+    else:
+        payload += b'\0'
+    encoded = json.dumps(header).encode()
+    path.write_bytes(struct.pack('<Q', len(encoded)) + encoded + payload)
+    # An independent loader confirms these files are structurally invalid.
+    with pytest.raises(SafetensorError):
+        with safe_open(path, framework='numpy'):
+            pass
+    result = audit_module.audit(tmp_path)
+    assert not result['passed']
+    assert any(message in error for error in result['errors'])
+
+
+def test_audit_accepts_unordered_header_with_empty_tensor(tmp_path):
+    def add_empty(entries):
+        entries['vision_tower.empty.weight'] = dict(shape=[0], dtype='BF16')
+
+    _write(tmp_path, add_empty)
+    path = tmp_path / 'model.safetensors'
+    raw = path.read_bytes()
+    size = struct.unpack('<Q', raw[:8])[0]
+    header = json.loads(raw[8:8 + size])
+    encoded = json.dumps(dict(reversed(list(header.items())))).encode()
+    path.write_bytes(struct.pack('<Q', len(encoded)) + encoded + raw[8 + size:])
+    result = audit_module.audit(tmp_path)
+    assert result['passed'] and not result['errors']

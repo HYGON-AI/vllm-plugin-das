@@ -82,7 +82,7 @@ def _cpu_factories(tp_size, rank):
     return CPUColumn, NativeCPUMerged
 
 
-def _target(native_load=None):
+def _target(native_load=None, column_linear=None):
     target = ModuleType(patch.TARGET_MODULE)
 
     class Linear(nn.Module):
@@ -91,12 +91,14 @@ def _target(native_load=None):
             self.config = kwargs.get("quant_config")
 
     class MoE(nn.Module):
-        def __init__(self, config, quant_config=None, prefix="", fail=False):
+        def __init__(self, config, quant_config=None, prefix="", fail=False, sharded=False):
             super().__init__()
             self.down = target.ReplicatedLinear(
                 quant_config=None, prefix=prefix + ".routed_expert_down_proj")
-            self.up = target.ReplicatedLinear(
-                quant_config=None, prefix=prefix + ".routed_expert_up_proj")
+            up_linear = target.ColumnParallelLinear if sharded else target.ReplicatedLinear
+            self.up = up_linear(
+                quant_config=None, prefix=prefix + ".routed_expert_up_proj",
+                **({"gather_output": True} if sharded else {}))
             self.other = target.ReplicatedLinear(quant_config=None, prefix=prefix + ".other")
             # The runner must retain the same quantized module objects.
             self.runner_refs = (self.down, self.up)
@@ -119,13 +121,15 @@ def _target(native_load=None):
     if native_load is not None:
         Model.load_weights = native_load
     target.ReplicatedLinear = Linear
+    target.ColumnParallelLinear = column_linear or Linear
     target.KimiMoE, target.KimiLinearModel = MoE, Model
     target.KimiLinearForCausalLM = CausalLM
     patch.apply_to_module(target)
     return target
 
 
-def test_fused_w8a8_selection_and_latent_constructor_scope():
+@pytest.mark.parametrize("sharded", [False, True])
+def test_fused_w8a8_selection_and_latent_constructor_scope(sharded):
     target = _target()
     cfg = config()
     assert not patch.apply_to_module(target)
@@ -135,7 +139,7 @@ def test_fused_w8a8_selection_and_latent_constructor_scope():
         layer = ReplicatedLinear.__new__(ReplicatedLinear)
         nn.Module.__init__(layer)
         assert isinstance(cfg.get_quant_method(layer, prefix), SlimQuantW4A8Int8LinearMethod)
-    moe = target.KimiMoE(None, cfg, "language_model.model.layers.1.block_sparse_moe")
+    moe = target.KimiMoE(None, cfg, "language_model.model.layers.1.block_sparse_moe", sharded=sharded)
     assert moe.down.config is cfg and moe.up.config is cfg
     assert moe.runner_refs == (moe.down, moe.up)
     assert moe.other.config is None
@@ -143,6 +147,42 @@ def test_fused_w8a8_selection_and_latent_constructor_scope():
     with pytest.raises(RuntimeError, match="construction failed"):
         target.KimiMoE(None, cfg, "x", fail=True)
     assert target.ReplicatedLinear(prefix="x.routed_expert_up_proj").config is None
+    assert target.ColumnParallelLinear(prefix="x.routed_expert_up_proj").config is None
+
+
+@pytest.mark.parametrize("tp_size", [1, 16])
+def test_sharded_latent_up_loads_int8_weights_and_scales(tp_size):
+    cfg = config()
+    weights = torch.arange(32 * 4).remainder(17).to(torch.int8).view(32, 4)
+    scales = torch.linspace(.02, .12, 32).view(-1, 1)
+    x = torch.tensor([[1., 2., 3., 4.]])
+    sx = x.abs().amax(-1, keepdim=True) / 127
+    xq = (x / sx).round().clamp(-127, 127) * sx
+    for rank in range(tp_size):
+        column, _ = _cpu_factories(tp_size, rank)
+
+        class CheckedColumn(column):
+            def __init__(self, **kwargs):
+                assert kwargs['quant_config'] is cfg
+                assert kwargs.pop('gather_output') is True
+                probe = ColumnParallelLinear.__new__(ColumnParallelLinear)
+                nn.Module.__init__(probe)
+                assert isinstance(cfg.get_quant_method(probe, kwargs['prefix']),
+                                  SlimQuantW4A8Int8LinearMethod)
+                super().__init__(4, 32, **kwargs)
+
+        target = _target(column_linear=CheckedColumn)
+        moe = target.KimiMoE(None, cfg, 'language_model.model.layers.1.block_sparse_moe',
+                            sharded=True)
+        up = moe.up
+        up.weight.weight_loader(up.weight, weights)
+        up.weight_scale.weight_loader(up.weight_scale, scales)
+        expected_w = weights.chunk(tp_size)[rank]
+        expected_s = scales.chunk(tp_size)[rank]
+        torch.testing.assert_close(up.weight, expected_w)
+        torch.testing.assert_close(up.weight_scale, expected_s)
+        torch.testing.assert_close(up(x)[0], xq @ (expected_w.float() * expected_s).T)
+        assert moe.runner_refs[1] is up
 
 
 @pytest.mark.parametrize("tp_size", [1, 16])

@@ -54,9 +54,7 @@ def apply_to_module(module: ModuleType) -> bool:
         finally:
             _LATENT_SCOPE.reset(token)
 
-    original_linear = target.ReplicatedLinear
-
-    class MixedLatentLinear(original_linear):
+    class MixedLatentConfig:
         def __init__(self, *args, **kwargs):
             scope = _LATENT_SCOPE.get()
             if scope is not None:
@@ -67,6 +65,12 @@ def apply_to_module(module: ModuleType) -> bool:
                 ):
                     kwargs["quant_config"] = config
             super().__init__(*args, **kwargs)
+
+    class MixedLatentLinear(MixedLatentConfig, target.ReplicatedLinear):
+        pass
+
+    class MixedLatentColumnLinear(MixedLatentConfig, target.ColumnParallelLinear):
+        pass
 
     model_cls = target.KimiLinearModel
     original_load = require_callable(model_cls, "load_weights", TARGETS[2])
@@ -102,6 +106,7 @@ def apply_to_module(module: ModuleType) -> bool:
     cls.__init__ = init
     moe_cls.__init__ = moe_init
     target.ReplicatedLinear = MixedLatentLinear
+    target.ColumnParallelLinear = MixedLatentColumnLinear
     model_cls.load_weights = load
     setattr(target, _MARKER, True)
     return True
