@@ -41,11 +41,13 @@ TARGETS = (
     f"{TARGET_MODULE}.gdn_aiter_fused_reshape_causal_conv1d_update_single_token",
     f"{TARGET_MODULE}.fused_sigmoid_gating_delta_rule_update",
     f"{TARGET_MODULE}.fused_recurrent_gated_delta_rule_packed_decode",
+    f"{TARGET_MODULE}.mamba_v2_sharded_weight_loader",
 )
 _MARKER = "_vllm_hcu_qwen_gdn_aiter_layout_applied"
 _WRAPPER = "_vllm_hcu_qwen_gdn_aiter_layout_wrapper"
 _SIGMOID_WRAPPER = "_vllm_hcu_qwen_gdn_sigmoid_wrapper"
 _RECURRENT_WRAPPER = "_vllm_hcu_qwen_gdn_recurrent_wrapper"
+_LOADER_WRAPPER = "_vllm_hcu_qwen_gdn_loader_wrapper"
 _PREFILL_WRAPPER = "_vllm_hcu_qwen_gdn_prefill_backend_wrapper"
 _PREFILL_TARGET = f"{TARGET_MODULE}._resolve_gdn_prefill_backend"
 
@@ -148,6 +150,7 @@ def apply_to_module(module: ModuleType) -> bool:
     wrapped = [
         (qwen, TARGETS[1].rsplit(".", 1)[-1], TARGETS[1], _SIGMOID_WRAPPER),
         (qwen, TARGETS[2].rsplit(".", 1)[-1], TARGETS[2], _RECURRENT_WRAPPER),
+        (qwen, TARGETS[3].rsplit(".", 1)[-1], TARGETS[3], _LOADER_WRAPPER),
     ]
     if aiter_available:
         wrapped.insert(
@@ -162,6 +165,27 @@ def apply_to_module(module: ModuleType) -> bool:
         )
     if already_applied(qwen, _MARKER, wrapped):
         return False
+
+    official_loader_factory = require_callable(
+        qwen,
+        "mamba_v2_sharded_weight_loader",
+        TARGETS[3],
+    )
+    require_exact_signature(
+        official_loader_factory,
+        TARGETS[3],
+        positional=("shard_spec", "tp_size", "tp_rank"),
+    )
+
+    @functools.wraps(official_loader_factory)
+    def hcu_loader_factory(shard_spec, tp_size, tp_rank):
+        if not use_nn_layout():
+            return official_loader_factory(shard_spec, tp_size, tp_rank)
+        from vllm_hcu.model_executor.layers.mamba_runtime import (
+            mamba_v2_nn_sharded_weight_loader,
+        )
+
+        return mamba_v2_nn_sharded_weight_loader(shard_spec, tp_size, tp_rank)
 
     official_sigmoid = require_callable(
         qwen,
@@ -325,9 +349,12 @@ def apply_to_module(module: ModuleType) -> bool:
 
     setattr(hcu_sigmoid_update, _SIGMOID_WRAPPER, True)
     setattr(hcu_recurrent_update, _RECURRENT_WRAPPER, True)
+    setattr(hcu_loader_factory, _LOADER_WRAPPER, True)
     setattr(qwen, "_vllm_hcu_original_fused_sigmoid", official_sigmoid)
     setattr(qwen, "_vllm_hcu_original_fused_recurrent", official_recurrent)
     setattr(qwen, "fused_sigmoid_gating_delta_rule_update", hcu_sigmoid_update)
+    setattr(qwen, "_vllm_hcu_original_mamba_v2_loader", official_loader_factory)
+    setattr(qwen, "mamba_v2_sharded_weight_loader", hcu_loader_factory)
     setattr(
         qwen,
         "fused_recurrent_gated_delta_rule_packed_decode",
