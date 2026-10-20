@@ -26,7 +26,16 @@ def _stub_flash_attn_distribution(
     flash_attn_extension: ModuleType,
     version: str = _TEST_FLASH_ATTN_VERSION,
 ) -> None:
-    """Keep CPU kernel doubles independent of the installed vendor wheel."""
+    """Keep CPU doubles independent of vendor metadata and native binaries."""
+
+    native_extension = ModuleType("flash_attn_2_cuda")
+    native_extension.__spec__ = ModuleSpec(native_extension.__name__, loader=None)
+
+    def unexpected_native_call(*args, **kwargs):
+        raise AssertionError("CPU attention contracts must not execute native FlashAttention")
+
+    native_extension.varlen_fwd = unexpected_native_call
+    monkeypatch.setitem(sys.modules, native_extension.__name__, native_extension)
 
     flash_attn_extension.__version__ = version
     distribution_version = importlib.metadata.version
@@ -182,6 +191,32 @@ def test_hcu_flash_attention_loader_stubs_vendor_distribution_metadata(
     module = _load_hcu_flash_attention_module(monkeypatch)
 
     assert module.__name__ == "vllm_hcu.v1.attention.backends.flash_attn"
+
+
+@pytest.mark.parametrize("load_backend", [False, True])
+def test_cpu_attention_loaders_never_import_native_extension(monkeypatch, load_backend):
+    class RejectNativeImport:
+        def find_spec(self, fullname, path=None, target=None):
+            if fullname == "flash_attn_2_cuda":
+                raise AssertionError("Attempted to import the real FlashAttention binary")
+            return None
+
+    # Force a fresh boundary import even if another test already loaded it.
+    for name in ("flash_attn_2_cuda", "vllm_hcu.v1.attention.backends.fa_utils",
+                 "vllm_hcu.v1.attention.backends.flash_attn"):
+        monkeypatch.setitem(sys.modules, name, sys.modules.get(name))
+        monkeypatch.delitem(sys.modules, name)
+    monkeypatch.setattr(sys, "meta_path", [RejectNativeImport(), *sys.meta_path])
+    if load_backend:
+        _load_hcu_flash_attention_module(monkeypatch)
+        fa_utils = sys.modules["vllm_hcu.v1.attention.backends.fa_utils"]
+    else:
+        fa_utils, _ = _load_hcu_fa_utils_module(monkeypatch, kv_cache_layout="NHD")
+    native = sys.modules["flash_attn_2_cuda"]
+    assert fa_utils.flash_attn_2_cuda is native
+    assert native.__spec__.loader is None
+    with pytest.raises(AssertionError, match="must not execute native FlashAttention"):
+        native.varlen_fwd()
 
 
 @pytest.mark.parametrize(
@@ -579,8 +614,10 @@ def test_flash_attention_prefers_vendor_kernel_page_size(
     assert backend.get_preferred_block_size(16) == expected_block_size
 
 
+@pytest.mark.parametrize("mode", ["varlen", "cutlass", "classic"])
 def test_flash_attention_kernel_block_sizes_do_not_require_current_config(
     monkeypatch: pytest.MonkeyPatch,
+    mode: str,
 ) -> None:
     """KV-cache planning queries this outside model-construction context."""
 
@@ -588,12 +625,16 @@ def test_flash_attention_kernel_block_sizes_do_not_require_current_config(
     backend = flash_attn.HcuFlashAttentionBackend
 
     monkeypatch.setattr(flash_attn, "get_current_vllm_config_or_none", lambda: None)
+    monkeypatch.setattr(flash_attn, "_get_flash_attn_mode", lambda: mode)
 
     sizes = backend.get_supported_kernel_block_sizes()
 
     assert len(sizes) == 1
-    assert isinstance(sizes[0], flash_attn.MultipleOf)
-    assert sizes[0].base == 16
+    if mode in ("varlen", "cutlass"):
+        assert sizes == [64]
+    else:
+        assert isinstance(sizes[0], flash_attn.MultipleOf)
+        assert sizes[0].base == 16
 
 
 @pytest.mark.parametrize(
@@ -687,9 +728,7 @@ def test_flash_cache_writer_dispatches_by_physical_layout(
     monkeypatch: pytest.MonkeyPatch,
     layout: str,
 ) -> None:
-    fa_utils = importlib.import_module(
-        "vllm_hcu.v1.attention.backends.fa_utils"
-    )
+    fa_utils, _ = _load_hcu_fa_utils_module(monkeypatch, kv_cache_layout=layout)
     calls: list[tuple[str, tuple[object, ...]]] = []
     aiter_cache_module = ModuleType("aiter.ops.cache")
     aiter_cache_module.reshape_and_cache_flash = (
