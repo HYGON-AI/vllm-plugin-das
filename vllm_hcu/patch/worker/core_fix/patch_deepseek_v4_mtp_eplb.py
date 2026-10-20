@@ -60,7 +60,14 @@ def apply_to_module(module: ModuleType) -> bool:
     def hcu_mtp_make_mapping(*args, **kwargs):
         enable_eplb, num_redundant = _eplb_config()
         if enable_eplb:
-            kwargs.setdefault("num_redundant_experts", num_redundant)
+            model = args[0] if args else kwargs.get("model")
+            if getattr(model, "_vllm_hcu_static_eplb_plan", None) is None:
+                kwargs.setdefault("num_redundant_experts", num_redundant)
+            else:
+                # Static checkpoint mappings contain logical expert IDs only.
+                # The bound static loaders fan each logical weight out to every
+                # physical replica selected by the placement plan.
+                kwargs.pop("num_redundant_experts", None)
         return mtp_make_mapping(*args, **kwargs)
 
     for function in (hcu_mtp_init, hcu_mtp_make_mapping):

@@ -162,6 +162,31 @@ def test_eplb_registers_native_mtp_and_maps_redundant_weights(
     )
 
 
+def test_static_eplb_mtp_checkpoint_mapping_uses_logical_experts(
+    vllm_config, monkeypatch
+):
+    module, _ = target(monkeypatch)
+    patch.apply_to_module(module)
+    mtp_module = module._test_mtp_module
+    mtp_patch.apply_to_module(mtp_module)
+    draft = mtp_module.DeepSeekV4MTP(HF)
+
+    # Binding happens before checkpoint loading. This rank's placement does
+    # not contain logical expert 0, so a physical ID such as 256 must never be
+    # emitted as a fallback checkpoint ID.
+    draft._vllm_hcu_static_eplb_plan = SimpleNamespace(
+        placement=tuple(range(1, 256)) + tuple(range(240, 256))
+    )
+    assert mtp_module.fused_moe_make_expert_params_mapping(
+        draft,
+        num_experts=256,
+        num_redundant_experts=16,
+    ) == (
+        "mtp-eplb",
+        {"num_experts": 256},
+    )
+
+
 def test_rejects_indivisible_physical_experts_and_stale_marker(
     vllm_config, monkeypatch
 ):
