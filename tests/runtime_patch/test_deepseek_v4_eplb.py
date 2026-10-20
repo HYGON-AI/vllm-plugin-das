@@ -1,4 +1,5 @@
 # SPDX-License-Identifier: Apache-2.0
+import sys
 from types import ModuleType, SimpleNamespace
 
 import pytest
@@ -8,13 +9,14 @@ from vllm_hcu.patch.worker.core_fix import patch_deepseek_v4_eplb as patch
 from vllm_hcu.patch.worker.core_fix._common import PatchCompatibilityError
 
 
-def target():
+def target(monkeypatch):
     module = ModuleType(patch.TARGET_MODULE)
+    mtp_module = ModuleType(patch.MTP_MODULE)
     factory_calls = []
 
     def factory(**kwargs):
         factory_calls.append(kwargs)
-        return SimpleNamespace(moe_config=SimpleNamespace(ep_size=8),
+        return SimpleNamespace(moe_config=SimpleNamespace(ep_size=module._test_ep_size),
                                update_expert_map=lambda: None)
 
     class DeepseekV4MoE(torch.nn.Module):
@@ -38,12 +40,32 @@ def target():
             self.model.layers = [SimpleNamespace(ffn=None)] + [
                 SimpleNamespace(ffn=DeepseekV4MoE(config)) for _ in range(moe_layers)]
 
+    class DeepSeekV4MTP(torch.nn.Module):
+        def __init__(self, config, moe_layers=2):
+            super().__init__()
+            self.config = config
+            self.model = SimpleNamespace(
+                layers={
+                    str(index): SimpleNamespace(
+                        mtp_block=SimpleNamespace(ffn=DeepseekV4MoE(config))
+                    )
+                    for index in range(moe_layers)
+                }
+            )
+
     module.FusedMoEFactory = factory
     module.DeepseekV4MoE = DeepseekV4MoE
     module.DeepseekV4Model = DeepseekV4Model
     module.DeepseekV4ForCausalLM = DeepseekV4ForCausalLM
+    module._test_ep_size = 8
     module.fused_moe_make_expert_params_mapping = (
         lambda model, **kwargs: ("eplb", kwargs))
+    mtp_module.DeepSeekV4MTP = DeepSeekV4MTP
+    mtp_module.fused_moe_make_expert_params_mapping = (
+        lambda model, **kwargs: ("mtp-eplb", kwargs)
+    )
+    monkeypatch.setitem(sys.modules, patch.MTP_MODULE, mtp_module)
+    module._test_mtp_module = mtp_module
     return module, factory_calls
 
 
@@ -63,10 +85,12 @@ def vllm_config(monkeypatch):
 HF = SimpleNamespace(n_routed_experts=256, n_group=None)
 
 
-def test_eplb_builds_redundant_experts_and_moe_interface(vllm_config):
+def test_eplb_builds_redundant_experts_and_moe_interface(
+    vllm_config, monkeypatch
+):
     from vllm.model_executor.models.interfaces import is_mixture_of_experts
 
-    module, calls = target()
+    module, calls = target(monkeypatch)
     assert patch.apply_to_module(module)
     assert not patch.apply_to_module(module)
     model = module.DeepseekV4ForCausalLM(HF)
@@ -82,21 +106,55 @@ def test_eplb_builds_redundant_experts_and_moe_interface(vllm_config):
         "ckpt_up_proj_name": "w3", "num_experts": 256, "num_redundant_experts": 16})
 
 
-def test_eplb_disabled_keeps_upstream_paths(vllm_config):
+def test_eplb_disabled_keeps_upstream_paths(vllm_config, monkeypatch):
     from vllm.model_executor.models.interfaces import is_mixture_of_experts
 
     vllm_config.parallel_config.enable_eplb = False
-    module, calls = target()
+    module, calls = target(monkeypatch)
+    module._test_ep_size = 3
     patch.apply_to_module(module)
     model = module.DeepseekV4ForCausalLM(HF)
     assert calls[0] == {"num_experts": 256}
     assert not is_mixture_of_experts(model)
     assert model.model.get_expert_mapping() == "original"
+    assert not hasattr(model.model.layers[1].ffn, "n_physical_experts")
 
 
-def test_rejects_indivisible_physical_experts_and_stale_marker(vllm_config):
+def test_eplb_registers_native_mtp_and_maps_redundant_weights(
+    vllm_config, monkeypatch
+):
+    from vllm.model_executor.models.interfaces import is_mixture_of_experts
+
+    module, _ = target(monkeypatch)
+    patch.apply_to_module(module)
+    mtp_module = module._test_mtp_module
+
+    class RegisteredCompatMTP(mtp_module.DeepSeekV4MTP):
+        pass
+
+    draft = RegisteredCompatMTP(HF)
+
+    assert is_mixture_of_experts(draft)
+    assert draft.num_moe_layers == 2
+    assert draft.num_physical_experts == 272
+    assert draft.num_local_physical_experts == 34
+    assert draft.moe_layers == [
+        layer.mtp_block.ffn.experts for layer in draft.model.layers.values()
+    ]
+    assert mtp_module.fused_moe_make_expert_params_mapping(
+        draft,
+        num_experts=256,
+    ) == (
+        "mtp-eplb",
+        {"num_experts": 256, "num_redundant_experts": 16},
+    )
+
+
+def test_rejects_indivisible_physical_experts_and_stale_marker(
+    vllm_config, monkeypatch
+):
     vllm_config.parallel_config.eplb_config.num_redundant_experts = 3
-    module, _ = target()
+    module, _ = target(monkeypatch)
     patch.apply_to_module(module)
     with pytest.raises(ValueError, match="divisible"):
         module.DeepseekV4ForCausalLM(HF)
