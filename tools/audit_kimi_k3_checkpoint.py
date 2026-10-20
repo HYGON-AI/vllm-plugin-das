@@ -161,7 +161,13 @@ def validate_shard_ranges(header, data_size, shard, errors):
     for name, info in header.items():
         if name == '__metadata__':
             continue
-        start, end = info['data_offsets']
+        offsets = info.get('data_offsets') if isinstance(info, dict) else None
+        if (type(offsets) is not list or len(offsets) != 2
+                or any(type(offset) is not int for offset in offsets)):
+            errors.append(f'Invalid data_offsets: {name}: {offsets!r}')
+            invalid.add(name)
+            continue
+        start, end = offsets
         if not 0 <= start <= end <= data_size:
             errors.append(f'Data offsets outside shard: {name}')
             invalid.add(name)
@@ -179,6 +185,29 @@ def validate_shard_ranges(header, data_size, shard, errors):
     if cursor < data_size:
         errors.append(f'Trailing shard data: {shard}: {cursor}..{data_size}')
     return invalid
+
+
+def _unique_object(pairs):
+    """Build a JSON object without discarding duplicate keys."""
+    result = {}
+    for key, value in pairs:
+        if key in result:
+            raise ValueError(f'Duplicate JSON header key: {key}')
+        result[key] = value
+    return result
+
+
+def _valid_metadata(header, shard, errors):
+    """Match safetensors metadata: absent/null or a string-to-string object."""
+    if '__metadata__' not in header:
+        return
+    metadata = header['__metadata__']
+    if metadata is None:
+        return
+    if (type(metadata) is not dict
+            or any(type(key) is not str or type(value) is not str
+                   for key, value in metadata.items())):
+        errors.append(f'Invalid safetensors metadata: {shard}')
 
 
 def audit(root, tp=16):
@@ -209,7 +238,15 @@ def audit(root, tp=16):
             size = struct.unpack('<Q', stream.read(8))[0]
             if size > 100_000_000:
                 raise ValueError('Unreasonable safetensors header size')
-            header = json.loads(stream.read(size))
+            try:
+                header = json.loads(stream.read(size), object_pairs_hook=_unique_object)
+            except (json.JSONDecodeError, ValueError) as exc:
+                errors.append(f'Invalid safetensors header: {shard}: {exc}')
+                continue
+            if type(header) is not dict:
+                errors.append(f'Invalid safetensors header object: {shard}')
+                continue
+            _valid_metadata(header, shard, errors)
             data_size = os.fstat(stream.fileno()).st_size - 8 - size
             invalid_ranges = validate_shard_ranges(header, data_size, shard, errors)
             if set(header) - {'__metadata__'} != indexed:

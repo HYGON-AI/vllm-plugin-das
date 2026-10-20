@@ -23,6 +23,13 @@ def _rewrite_header(root, mutate):
     path.write_bytes(struct.pack('<Q', len(encoded)) + encoded + raw[8 + size:])
 
 
+def _rewrite_raw_header(root, encoded_header):
+    path = root / 'model.safetensors'
+    raw = path.read_bytes()
+    size = struct.unpack('<Q', raw[:8])[0]
+    path.write_bytes(struct.pack('<Q', len(encoded_header)) + encoded_header + raw[8 + size:])
+
+
 def _write(root, mutate=None):
     config = dict(hidden_size=4, vocab_size=32, num_hidden_layers=2,
                   num_attention_heads=16, q_lora_rank=4, kv_lora_rank=4,
@@ -113,6 +120,82 @@ def test_audit_rejects_invalid_data_ranges(tmp_path, case):
     result = audit_module.audit(tmp_path)
     assert not result['passed']
     assert any('Data offsets outside shard' in error for error in result['errors'])
+
+
+@pytest.mark.parametrize('tensor_kind', ['language', 'vision'])
+@pytest.mark.parametrize('offsets', [[0.0, 2.0], [False, 2]])
+def test_audit_rejects_non_integer_data_offsets(tmp_path, tensor_kind, offsets):
+    from safetensors import SafetensorError, safe_open
+
+    name = 'language_model.model.embed_tokens.weight'
+    if tensor_kind == 'vision':
+        name = 'vision_tower.test.weight'
+        _write(tmp_path, lambda entries: entries.update(
+            {name: dict(shape=[1], dtype='BF16')}))
+    else:
+        _write(tmp_path)
+    _rewrite_header(tmp_path, lambda header: header[name].update(data_offsets=offsets))
+
+    with pytest.raises(SafetensorError):
+        with safe_open(tmp_path / 'model.safetensors', framework='numpy'):
+            pass
+    result = audit_module.audit(tmp_path)
+    assert not result['passed']
+    assert any(f'Invalid data_offsets: {name}' in error for error in result['errors'])
+
+
+@pytest.mark.parametrize('metadata', [
+    {'format': 123}, [], 'metadata', False,
+])
+def test_audit_rejects_invalid_safetensors_metadata(tmp_path, metadata):
+    from safetensors import SafetensorError, safe_open
+
+    _write(tmp_path)
+    _rewrite_header(tmp_path, lambda header: header.update(__metadata__=metadata))
+    with pytest.raises(SafetensorError):
+        with safe_open(tmp_path / 'model.safetensors', framework='numpy'):
+            pass
+    result = audit_module.audit(tmp_path)
+    assert not result['passed']
+    assert any('Invalid safetensors metadata' in error for error in result['errors'])
+
+
+@pytest.mark.parametrize('metadata', [None, {'format': 'pt'}])
+def test_audit_accepts_supported_safetensors_metadata(tmp_path, metadata):
+    from safetensors import safe_open
+
+    _write(tmp_path)
+    _rewrite_header(tmp_path, lambda header: header.update(__metadata__=metadata))
+    with safe_open(tmp_path / 'model.safetensors', framework='numpy'):
+        pass
+    result = audit_module.audit(tmp_path)
+    assert result['passed'] and not result['errors']
+
+
+def test_audit_rejects_duplicate_header_keys_without_losing_first_value(tmp_path):
+    from safetensors import SafetensorError, safe_open
+
+    _write(tmp_path)
+    path = tmp_path / 'model.safetensors'
+    raw = path.read_bytes()
+    size = struct.unpack('<Q', raw[:8])[0]
+    header = json.loads(raw[8:8 + size])
+    name = 'language_model.model.embed_tokens.weight'
+    valid = header[name]
+    invalid = dict(valid, shape=[-1])
+    entries = [(name, invalid)] + [
+        (key, value) for key, value in header.items() if key != name
+    ] + [(name, valid)]
+    encoded = ('{' + ','.join(json.dumps(key) + ':' + json.dumps(value)
+                              for key, value in entries) + '}').encode()
+    _rewrite_raw_header(tmp_path, encoded)
+
+    with pytest.raises(SafetensorError):
+        with safe_open(path, framework='numpy'):
+            pass
+    result = audit_module.audit(tmp_path)
+    assert not result['passed']
+    assert any('Duplicate JSON header key' in error for error in result['errors'])
 
 
 @pytest.mark.parametrize('case,message', [
