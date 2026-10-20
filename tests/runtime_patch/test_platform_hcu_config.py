@@ -1809,6 +1809,14 @@ def test_slimquant_uses_public_registry_without_loading_concrete_kernels(
         facade.get_supported_act_dtypes()
 
 
+def test_slimquant_marlin_facade_resolves_supported_activation_dtypes() -> None:
+    assert slimquant_facade.SlimQuantMarlinFacade.get_supported_act_dtypes() == [
+        torch.float32,
+        torch.float16,
+        torch.bfloat16,
+    ]
+
+
 def test_slimquant_registry_rejects_provider_conflict() -> None:
     module = _make_quantization_module()
     module.QUANTIZATION_METHODS.append("slimquant_w4a8")
