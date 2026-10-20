@@ -4,9 +4,16 @@
 
 from __future__ import annotations
 
+from math import prod
+
 import pytest
 import torch
 import torch.nn.functional as F
+from vllm.model_executor.layers.fused_moe.activation import MoEActivation
+
+from vllm_hcu.model_executor.layers.fused_moe.experts.lightop_w16a16_moe import (
+    LightopW16A16Experts,
+)
 
 from vllm_hcu.model_executor.layers.fused_moe.lightop_w16a16_runtime import (
     pack_lightop_w16a16_weights,
@@ -112,15 +119,29 @@ def _run_case(
     expected = _reference(hidden_states, w13, w2, topk_weights, topk_ids)
 
     packed13, packed2, _ = pack_lightop_w16a16_weights(w13, w2)
-    workspace13 = torch.empty(
-        (tokens * topk, max(2 * intermediate, hidden)),
+    experts_impl = object.__new__(LightopW16A16Experts)
+    workspace13_shape, workspace2_shape, output_shape = (
+        experts_impl.workspace_shapes(
+            M=tokens,
+            N=2 * intermediate,
+            K=hidden,
+            topk=topk,
+            global_num_experts=experts,
+            local_num_experts=experts,
+            expert_tokens_meta=None,
+            activation=MoEActivation.SILU,
+        )
+    )
+    common = torch.empty(
+        max(prod(workspace13_shape), prod(output_shape)),
         dtype=torch.bfloat16,
         device="cuda",
     )
+    workspace13 = common[: prod(workspace13_shape)].view(workspace13_shape)
     workspace2 = torch.empty(
-        (tokens * topk, intermediate), dtype=torch.bfloat16, device="cuda"
+        workspace2_shape, dtype=torch.bfloat16, device="cuda"
     )
-    output = torch.empty_like(hidden_states)
+    output = common[: prod(output_shape)].view(output_shape)
     run_lightop_w16a16(
         output=output,
         hidden_states=hidden_states,
