@@ -308,7 +308,18 @@ class HcuMegaMoEMethod(FusedMoEMethodBase):
         # Every post-load call is a refresh boundary, including in-place reloads.
         # No MegaMoE dependency is imported unless the feature was selected.
         os.environ.setdefault("K3_USE_ASM_TAIL_REDUCE", "0")
-        import megamoe
+        try:
+            import megamoe
+        except ModuleNotFoundError as exc:
+            if exc.name != "megamoe":
+                raise
+            raise RuntimeError(
+                "--moe-backend deep_gemm_mega_moe on HCU requires the optional "
+                "standalone megamoe package. Build and install a compatible wheel "
+                "in the serving environment using the DCU/HIP instructions at "
+                "https://github.com/Sherlolo/DeepGEMM-megamoe-w8a8. "
+                "The standard image does not install this package automatically."
+            ) from exc
 
         required = ["get_symm_buffer_for_mega_moe"]
         if self.quant_mode == "fp8":

@@ -932,3 +932,31 @@ def test_config_rejects_dp_backend_without_token_metadata(runtime, dp_size, back
             runtime.validate_config(config, moe, layer)
     else:
         runtime.validate_config(config, moe, layer)
+
+
+@pytest.mark.parametrize("missing", ["megamoe", "megamoe_native_dependency"])
+def test_optional_megamoe_import_error(runtime, monkeypatch, missing):
+    import builtins
+    original_import = builtins.__import__
+    imports = []
+    def import_without_megamoe(name, *args, **kwargs):
+        if name == "megamoe":
+            imports.append(name)
+            raise ModuleNotFoundError(f"No module named {missing!r}", name=missing)
+        return original_import(name, *args, **kwargs)
+    monkeypatch.setattr(builtins, "__import__", import_without_megamoe)
+    _, moe, _ = valid_config()
+    method = runtime.HcuMegaMoEMethod(moe, "fp8")
+    assert imports == []  # No import before explicit MegaMoE weight finalization.
+    if missing == "megamoe":
+        with pytest.raises(RuntimeError, match="optional standalone megamoe") as exc:
+            method.process_weights_after_loading(None)
+        assert "--moe-backend deep_gemm_mega_moe" in str(exc.value)
+        assert "Build and install" in str(exc.value)
+        assert "https://github.com/Sherlolo/DeepGEMM-megamoe-w8a8" in str(exc.value)
+        assert isinstance(exc.value.__cause__, ModuleNotFoundError)
+    else:
+        # Preserve errors inside an installed package instead of claiming it is absent.
+        with pytest.raises(ModuleNotFoundError) as exc:
+            method.process_weights_after_loading(None)
+        assert exc.value.name == missing
