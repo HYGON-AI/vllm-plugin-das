@@ -2290,6 +2290,9 @@ def test_eagle_topk_buffer_sharing_is_multi_mtp_gated():
         model_config: object
         speculative_config: object
         additional_config: dict[str, object]
+        compilation_config: object = dataclasses.field(
+            default_factory=lambda: SimpleNamespace(static_forward_context={})
+        )
 
     def config(**updates: object) -> FakeVllmConfig:
         return FakeVllmConfig(
@@ -2337,6 +2340,9 @@ def test_eagle_loader_installs_draft_model_config_before_construction():
         model_config: object
         speculative_config: object
         additional_config: dict[str, object]
+        compilation_config: object = dataclasses.field(
+            default_factory=lambda: SimpleNamespace(static_forward_context={})
+        )
 
     def load_eagle_model(target_model, vllm_config):
         calls.append(vllm_config)
@@ -2361,6 +2367,144 @@ def test_eagle_loader_installs_draft_model_config_before_construction():
     assert config.model_config is target_model_config
     assert calls[0] is not config
     assert calls[0].model_config is draft_model_config
+
+
+def test_eagle_loader_preserves_target_config_for_zero_layer_mtp_draft():
+    """Zero-layer draft configs select an architecture, not model geometry."""
+    target_model_config = SimpleNamespace(
+        hf_config=SimpleNamespace(num_hidden_layers=47)
+    )
+    draft_model_config = SimpleNamespace(
+        hf_config=SimpleNamespace(num_hidden_layers=0)
+    )
+    calls: list[object] = []
+
+    @dataclasses.dataclass
+    class FakeVllmConfig:
+        model_config: object
+        speculative_config: object
+        additional_config: dict[str, object]
+        compilation_config: object = dataclasses.field(
+            default_factory=lambda: SimpleNamespace(static_forward_context={})
+        )
+
+    def load_eagle_model(target_model, vllm_config):
+        del target_model
+        calls.append(vllm_config)
+        return object()
+
+    module = _module(
+        patch_eagle_utils.TARGET_MODULE,
+        load_eagle_model=load_eagle_model,
+        _should_share=_should_share,
+    )
+    patch_eagle_utils.apply_to_module(module)
+    config = FakeVllmConfig(
+        model_config=target_model_config,
+        speculative_config=SimpleNamespace(
+            draft_model_config=draft_model_config,
+        ),
+        additional_config={"hcu": HcuFeatureConfig().to_dict()},
+    )
+
+    module.load_eagle_model(object(), config)
+
+    assert calls[0].model_config is target_model_config
+
+
+def test_eagle_loader_namespaces_colliding_draft_attention_layers():
+    """Draft attention registration must not overwrite the target layer."""
+    layer_name = "model.layers.0.self_attn.attn"
+    target_layer = SimpleNamespace(layer_name=layer_name)
+    draft_layer = SimpleNamespace(layer_name=layer_name)
+
+    @dataclasses.dataclass
+    class FakeVllmConfig:
+        model_config: object
+        speculative_config: object
+        additional_config: dict[str, object]
+        compilation_config: object
+
+    def load_eagle_model(target_model, vllm_config):
+        del target_model
+        context = vllm_config.compilation_config.static_forward_context
+        if layer_name in context:
+            raise ValueError(f"Duplicate layer name: {layer_name}")
+        context[layer_name] = draft_layer
+        return SimpleNamespace(model=object())
+
+    module = _module(
+        patch_eagle_utils.TARGET_MODULE,
+        load_eagle_model=load_eagle_model,
+        _should_share=_should_share,
+    )
+    patch_eagle_utils.apply_to_module(module)
+    target_context = {layer_name: target_layer}
+    config = FakeVllmConfig(
+        model_config=object(),
+        speculative_config=SimpleNamespace(draft_model_config=object()),
+        additional_config={"hcu": HcuFeatureConfig().to_dict()},
+        compilation_config=SimpleNamespace(
+            static_forward_context=target_context,
+            custom_ops=["all"],
+        ),
+    )
+
+    module.load_eagle_model(object(), config)
+
+    draft_name = f"eagle_head.{layer_name}"
+    assert target_context[layer_name] is target_layer
+    assert target_context[draft_name] is draft_layer
+    assert draft_layer.layer_name == draft_name
+
+
+def test_eagle_loader_namespaces_colliding_draft_moe_layer_order():
+    """The fallback MoE registry must resolve the renamed draft runner."""
+    layer_name = "model.layers.0.mlp.experts"
+    target_layer = SimpleNamespace(layer_name=layer_name)
+    draft_layer = SimpleNamespace(layer_name=layer_name)
+
+    @dataclasses.dataclass
+    class FakeVllmConfig:
+        model_config: object
+        speculative_config: object
+        additional_config: dict[str, object]
+        compilation_config: object
+
+    def load_eagle_model(target_model, vllm_config):
+        del target_model
+        compilation_config = vllm_config.compilation_config
+        context = compilation_config.static_forward_context
+        context[layer_name] = draft_layer
+        compilation_config.static_all_moe_layers.append(layer_name)
+        return SimpleNamespace(model=object())
+
+    module = _module(
+        patch_eagle_utils.TARGET_MODULE,
+        load_eagle_model=load_eagle_model,
+        _should_share=_should_share,
+    )
+    patch_eagle_utils.apply_to_module(module)
+    target_context = {layer_name: target_layer}
+    target_moe_layers = [layer_name]
+    config = FakeVllmConfig(
+        model_config=object(),
+        speculative_config=SimpleNamespace(draft_model_config=object()),
+        additional_config={"hcu": HcuFeatureConfig().to_dict()},
+        compilation_config=SimpleNamespace(
+            static_forward_context=target_context,
+            static_all_moe_layers=target_moe_layers,
+            custom_ops=["all"],
+        ),
+    )
+
+    module.load_eagle_model(object(), config)
+
+    draft_name = f"eagle_head.{layer_name}"
+    assert target_moe_layers == [layer_name, draft_name]
+    assert target_context[layer_name] is target_layer
+    assert target_context[draft_name] is draft_layer
+    assert draft_layer.layer_name == draft_name
 
 
 @pytest.mark.parametrize("load_fails", [False, True])
@@ -2397,7 +2541,9 @@ def test_eagle_loader_does_not_reinitialize_target_config(load_fails: bool):
         model_config=object(),
         speculative_config=SimpleNamespace(draft_model_config=object()),
         additional_config={"hcu": HcuFeatureConfig().to_dict()},
-        compilation_config=SimpleNamespace(custom_ops=["all"]),
+        compilation_config=SimpleNamespace(
+            custom_ops=["all"], static_forward_context={}
+        ),
         parallel_config=object(),
         quant_config=object(),
     )
@@ -2417,8 +2563,15 @@ def test_eagle_loader_does_not_reinitialize_target_config(load_fails: bool):
     assert draft_config is not config
     assert draft_config.model_config is config.speculative_config.draft_model_config
     assert draft_config.runtime_state is config.runtime_state
+    assert draft_config.compilation_config is not config.compilation_config
+    assert (
+        draft_config.compilation_config.custom_ops
+        is config.compilation_config.custom_ops
+    )
+    assert draft_config.compilation_config.static_forward_context is not (
+        config.compilation_config.static_forward_context
+    )
     for field in (
-        "compilation_config",
         "parallel_config",
         "quant_config",
         "speculative_config",
@@ -2436,6 +2589,9 @@ def test_eagle_loader_preserves_step3p5_per_layer_lm_heads():
         model_config: object
         speculative_config: object
         additional_config: dict[str, object]
+        compilation_config: object = dataclasses.field(
+            default_factory=lambda: SimpleNamespace(static_forward_context={})
+        )
 
     def should_share(eagle, flag, draft, target):
         return True
