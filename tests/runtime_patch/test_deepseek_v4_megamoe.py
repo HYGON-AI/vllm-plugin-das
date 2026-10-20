@@ -220,7 +220,8 @@ def test_fp8_large_batch_is_chunked_on_every_dp_rank(runtime, monkeypatch):
     assert (calls[2][2] == -1).all()
 
 
-def test_post_load_reuses_buffer_and_invalidates_weight_cache(runtime, monkeypatch):
+@pytest.mark.parametrize("inference", [False, True])
+def test_post_load_reuses_buffer_and_invalidates_weight_cache(runtime, monkeypatch, inference):
     _, moe, _ = valid_config()
     import torch.nn as nn
     # Tiny CPU shapes exercise lifecycle without allocating a real model.
@@ -245,15 +246,30 @@ def test_post_load_reuses_buffer_and_invalidates_weight_cache(runtime, monkeypat
     monkeypatch.setattr(runtime, "get_ep_group", lambda: ep)
     monkeypatch.setattr(runtime.HcuMegaMoEMethod, "get_fused_moe_quant_config", lambda *args: object())
     a, b = runtime.HcuMegaMoEMethod(moe, "fp8"), runtime.HcuMegaMoEMethod(moe, "fp8")
-    weights = layer()
+    with torch.inference_mode(inference):
+        weights = layer()
     a.process_weights_after_loading(weights)
     original = a._l1
+    addresses = [t.data_ptr() for packed in (a._l1, a._l2)
+                 for t in packed["unified"]]
+    # Real loaders write via .data, leaving Parameter version counters unchanged.
+    version = None if inference else weights.w13_weight._version
+    weights.w13_weight.data.copy_(torch.ones_like(weights.w13_weight))
+    weights.w2_weight.data.copy_(torch.ones_like(weights.w2_weight))
+    weights.w13_weight_scale.data.copy_(torch.full_like(weights.w13_weight_scale, 3))
+    if not inference:
+        assert weights.w13_weight._version == version
+    a.process_weights_after_loading(weights)
+    for packed in (a._l1, a._l2):
+        assert (packed["unified"][0].float() == 1).all()
+    assert (a._l1["unified"][1] == 3).all()
+    assert addresses == [t.data_ptr() for packed in (a._l1, a._l2)
+                         for t in packed["unified"]]
     a.process_weights_after_loading(weights)
     assert a._l1 is original
-    weights.w13_weight_scale.data = weights.w13_weight_scale.data.clone()
-    # Updating a parameter in-place advances the loader generation.
-    with torch.no_grad():
-        weights.w13_weight_scale.mul_(2)
+    # Explicit post-load refresh also covers ordinary in-place scale updates.
+    with torch.inference_mode(inference), torch.no_grad():
+        weights.w13_weight_scale.fill_(2)
     a.process_weights_after_loading(weights)
     assert a._l1 is original  # Graph-safe reload preserves captured addresses.
     assert (a._l1["unified"][1] == 2).all()
@@ -520,13 +536,6 @@ def test_release_buffers_destroys_once_and_drops_scratch(runtime, monkeypatch):
     assert not ep._hcu_megamoe_buffers and not buf._int4_unpack_workspaces
 
 
-def test_runtime_generation_handles_inference_tensors(runtime):
-    with torch.inference_mode():
-        p = torch.nn.Parameter(torch.ones(2), requires_grad=False)
-    layer = NS(w13_weight=p, w2_weight=p, w13_weight_scale=p, w2_weight_scale=p)
-    assert runtime.HcuMegaMoEMethod._weight_generation(layer) is None
-
-
 def test_other_models_bypass_feature_even_when_global_switch_is_on(runtime, monkeypatch):
     config, moe, layer = valid_config()
     config.model_config.hf_config.model_type = "qwen3_moe"
@@ -784,3 +793,95 @@ def test_fp8_ignored_experts_rejected_before_scheme_lookup(runtime, monkeypatch,
     monkeypatch.setattr(runtime, "HcuMegaMoEMethod", unexpected)
     with pytest.raises(ValueError, match="ignored/unquantized"):
         runtime.select_method(layer, quant, moe)
+
+
+def test_int4_native_layerwise_reload_releases_temporary_weights(runtime, int4, monkeypatch):
+    import gc
+    import logging
+    import weakref
+    import importlib
+
+    # Execute the installed native reload helpers, stubbing only platform imports.
+    reload_dir = next((Path(p) / "vllm/model_executor/model_loader/reload"
+                       for p in sys.path
+                       if (Path(p) / "vllm/model_executor/model_loader/reload/layerwise.py").is_file()), None)
+    if reload_dir is None:
+        pytest.skip("requires native vLLM reload helpers")
+    package = ModuleType("test_native_megamoe_reload")
+    package.__path__ = [str(reload_dir)]
+    monkeypatch.setitem(sys.modules, package.__name__, package)
+    monkeypatch.setattr(sys.modules["vllm.config"], "ModelConfig", object, raising=False)
+    def weight_loader(param, loaded_weight):
+        param.data.copy_(loaded_weight)
+    deps = {
+        "vllm.logger": {"init_logger": logging.getLogger},
+        "vllm.model_executor.layers.attention": {"is_deferred_attention_layer": lambda layer: False},
+        "vllm.model_executor.layers.quantization.base_config": {"QuantizeMethodBase": runtime.FusedMoEMethodBase},
+        "vllm.model_executor.model_loader.weight_utils": {"default_weight_loader": weight_loader},
+    }
+    for name, symbols in deps.items():
+        mod = ModuleType(name)
+        mod.__dict__.update(symbols)
+        monkeypatch.setitem(sys.modules, name, mod)
+    native = importlib.import_module(package.__name__ + ".layerwise")
+    monkeypatch.setattr(runtime, "__package__", package.__name__)
+    monkeypatch.setitem(sys.modules, package.__name__ + ".hcu_int4_megamoe", int4)
+    fake = ModuleType("megamoe")
+    fake.get_symm_buffer_for_mega_moe = lambda *args, **kwargs: NS(quant_mode="int8")
+    monkeypatch.setitem(sys.modules, "megamoe", fake)
+    monkeypatch.setattr(int4, "validate_megamoe_int8_runtime", lambda: None)
+    monkeypatch.setattr(runtime, "get_ep_group", lambda: NS(device_group=object()))
+    monkeypatch.setattr(runtime.HcuMegaMoEMethod, "get_fused_moe_quant_config", lambda *args: None)
+    _, moe, _ = valid_config()
+    method = runtime.HcuMegaMoEMethod(moe, "int8")
+    layer = torch.nn.Module()
+    for name, shape in (("w13_weight", (2, 512, 128)), ("w2_weight", (2, 256, 128)),
+                        ("w13_weight_scale", (2, 512, 1)), ("w2_weight_scale", (2, 256, 1))):
+        param = torch.nn.Parameter(torch.ones(shape, dtype=torch.int8 if "scale" not in name else torch.float32),
+                                   requires_grad=False)
+        param.weight_loader = weight_loader
+        layer.register_parameter(name, param)
+    del param
+    layer.quant_method = method
+    native.record_metadata_for_reloading(layer)
+    method.process_weights_after_loading(layer)
+    canonical = dict(layer.named_parameters())
+    temporary = []
+    transform = int4.transform_int4_weights_for_mega_moe_normal
+    def track(w1, w2, **kwargs):
+        temporary.extend((weakref.ref(w1), weakref.ref(w2)))
+        return transform(w1, w2, **kwargs)
+    monkeypatch.setattr(int4, "transform_int4_weights_for_mega_moe_normal", track)
+    for value in (2, 3):
+        native.initialize_layerwise_reload(layer)
+        for name in canonical:
+            target = getattr(layer, name)
+            target.weight_loader(target, torch.full_like(canonical[name], value))
+        del target
+        native.finalize_layerwise_reload(layer, None)
+        gc.collect()
+        assert all(ref() is None for ref in temporary)
+        for name, param in canonical.items():
+            assert getattr(layer, name) is param
+            assert (param == value).all()
+        assert method._l1 is None and method._l2 is None
+        assert all((scale == value * 16).all() for scale in method._int4_scales)
+
+    # Forward must resolve the restored canonical weights, not the temporaries.
+    layer.swiglu_limit = None
+    method._buffer.topk_idx = torch.zeros(16, 6, dtype=torch.int64)
+    method._buffer.topk_weights = torch.zeros(16, 6)
+    method._buffer.x = torch.empty(16, 4096)
+    method._buffer.x_sf = torch.empty(16)
+    fake.mega_moe_pre_dispatch_int8 = lambda *args: None
+    seen = []
+    def run(y, l1, l2, *args, **kwargs):
+        assert l1["raw_int4"][0] is canonical["w13_weight"]
+        assert l2["raw_int4"][0] is canonical["w2_weight"]
+        seen.append(True)
+    monkeypatch.setattr(int4, "int4_w4a8_mega_moe", run)
+    monkeypatch.setattr(torch.cuda, "is_current_stream_capturing", lambda: False)
+    monkeypatch.setattr(runtime, "get_forward_context", lambda: NS(dp_metadata=None))
+    method.apply(layer, torch.ones(1, 4096, dtype=torch.bfloat16),
+                 torch.ones(1, 6), torch.zeros(1, 6, dtype=torch.int64))
+    assert seen == [True]

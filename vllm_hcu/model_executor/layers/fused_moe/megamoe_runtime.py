@@ -216,7 +216,7 @@ class HcuMegaMoEMethod(FusedMoEMethodBase):
         self.static_input_scales = False
         self.weight_block_size = None
         self._buffer = None
-        self._generation = None
+        self._int4_scales = None
         self._l1 = self._l2 = None
         self._graph_tokens = graph_tokens
         mode = os.environ.get("MEGAMOE_HCU_BACKEND", "auto").strip().lower()
@@ -293,25 +293,10 @@ class HcuMegaMoEMethod(FusedMoEMethodBase):
             gemm1_clamp_limit=layer.swiglu_limit,
         )
 
-    @staticmethod
-    def _weight_generation(layer):
-        try:
-            return tuple(
-                (id(p), p.data_ptr(), p._version, tuple(p.shape), p.device, p.dtype)
-                for p in (
-                    layer.w13_weight, layer.w2_weight,
-                    layer.w13_weight_scale, layer.w2_weight_scale,
-                )
-            )
-        except RuntimeError:
-            # Inference tensors have no version counter. They cannot prove
-            # that an in-place reload left the weights unchanged.
-            return None
-
+    @torch.inference_mode()
     def process_weights_after_loading(self, layer):
-        generation = self._weight_generation(layer)
-        if generation is not None and generation == self._generation:
-            return
+        # Loaders write through param.data without advancing Parameter._version.
+        # Every post-load call is a refresh boundary, including in-place reloads.
         # No MegaMoE dependency is imported unless the feature was selected.
         os.environ.setdefault("K3_USE_ASM_TAIL_REDUCE", "0")
         import megamoe
@@ -405,8 +390,12 @@ class HcuMegaMoEMethod(FusedMoEMethodBase):
                     for dst, src in zip(old[self._layout], new[self._layout]):
                         dst.copy_(src)
             l1, l2 = self._l1, self._l2
-        self._l1, self._l2 = l1, l2
-        self._generation = self._weight_generation(layer)
+        if self.quant_mode == "int8":
+            # Native layerwise reload restores canonical Parameters AFTER this
+            # callback. Retaining raw weights here would pin temporary storage.
+            self._int4_scales = (l1["raw_int4"][1], l2["raw_int4"][1])
+        else:
+            self._l1, self._l2 = l1, l2
         self.moe_quant_config = self.get_fused_moe_quant_config(layer)
         if self._graph_tokens:
             self._warmup_graph(layer)
@@ -505,9 +494,14 @@ class HcuMegaMoEMethod(FusedMoEMethodBase):
         buf = self._buffer
         if graph and getattr(buf, "cuda_graph_num_tokens", None) is None:
             raise RuntimeError("MegaMoE wheel does not provide graph token buffers")
+        l1, l2 = self._l1, self._l2
         if self.quant_mode == "int8":
             from .hcu_int4_megamoe import int4_w4a8_mega_moe
 
+            # Resolve after reload finalization has restored the layer's weights.
+            s1, s2 = self._int4_scales
+            l1 = {"raw_int4": (layer.w13_weight, s1)}
+            l2 = {"raw_int4": (layer.w2_weight, s2)}
             run = int4_w4a8_mega_moe
         else:
             run = megamoe.fp8_w8a8_mega_moe
@@ -555,7 +549,7 @@ class HcuMegaMoEMethod(FusedMoEMethodBase):
                 else chunk_capacity
             )
             run(
-                y if graph else y[lo:hi], self._l1, self._l2, buf,
+                y if graph else y[lo:hi], l1, l2, buf,
                 megamoe_backend=self._backend(selector, launch_capacity=chunk_capacity),
                 graph=graph, capacity_num_tokens=chunk_capacity,
                 activation_clamp=layer.swiglu_limit,
