@@ -885,3 +885,50 @@ def test_int4_native_layerwise_reload_releases_temporary_weights(runtime, int4, 
     method.apply(layer, torch.ones(1, 4096, dtype=torch.bfloat16),
                  torch.ones(1, 6), torch.zeros(1, 6, dtype=torch.int64))
     assert seen == [True]
+
+
+@pytest.mark.parametrize("capturing", [True, False])
+@pytest.mark.parametrize("threshold,expected", [(4, "normal"), (8, "ll")])
+def test_dp_graph_uses_same_backend_for_uneven_local_buckets(runtime, monkeypatch, capturing, threshold, expected):
+    monkeypatch.setenv("MEGAMOE_HCU_BACKEND", "auto")
+    monkeypatch.setenv("MEGAMOE_HCU_NORMAL_LL_TOKEN_THRESHOLD", str(threshold))
+    fake = ModuleType("megamoe")
+    fake.cast_to_fp8_channelwise = lambda x: (x.float(), torch.ones(x.shape[0]))
+    backends = []
+    fake.fp8_w8a8_mega_moe = lambda *args, **kwargs: backends.append(kwargs["megamoe_backend"])
+    monkeypatch.setitem(sys.modules, "megamoe", fake)
+    monkeypatch.setattr(torch.cuda, "is_current_stream_capturing", lambda: capturing)
+    for rank, tokens in enumerate((2, 6)):
+        _, moe, layer = valid_config()
+        moe.dp_size, moe.dp_rank = 2, rank
+        method = runtime.HcuMegaMoEMethod(moe, "fp8", graph_tokens=8)
+        method._buffer = NS(topk_idx=torch.ones(16, 6, dtype=torch.int64),
+                            topk_weights=torch.ones(16, 6), x=torch.empty(16, 4096),
+                            x_sf=torch.empty(16), cuda_graph_num_tokens=torch.tensor([0]),
+                            ll_scratch_capacity_tokens_per_rank=16)
+        method._l1, method._l2 = {}, {}
+        context = NS(dp_metadata=NS(num_tokens_across_dp_cpu=torch.tensor([2, 6])),
+                     batch_descriptor=NS(num_tokens=tokens),
+                     cudagraph_runtime_mode=NS(name="FULL"))
+        monkeypatch.setattr(runtime, "get_forward_context", lambda: context)
+        method.apply(layer, torch.ones(tokens, 4096, dtype=torch.bfloat16),
+                     torch.ones(tokens, 6), torch.zeros(tokens, 6, dtype=torch.int64))
+    assert backends == [expected, expected]
+
+
+@pytest.mark.parametrize("dp_size,backend,auto,rejected", [
+    (2, "deepep_low_latency", False, True),
+    (1, "deepep_low_latency", False, False),
+    (2, "deepep_low_latency", True, False),
+    (2, "deepep_high_throughput", False, False),
+])
+def test_config_rejects_dp_backend_without_token_metadata(runtime, dp_size, backend, auto, rejected):
+    config, moe, layer = valid_config()
+    moe.dp_size = dp_size
+    config.parallel_config.all2all_backend = backend
+    config.parallel_config._vllm_hcu_deepep_auto = auto
+    if rejected:
+        with pytest.raises(ValueError, match="deepep_low_latency"):
+            runtime.validate_config(config, moe, layer)
+    else:
+        runtime.validate_config(config, moe, layer)

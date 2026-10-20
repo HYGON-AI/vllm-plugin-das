@@ -73,6 +73,15 @@ def validate_config(config, moe, layer, quant_mode=None) -> None:
         )
     if parallel.enable_dbo:
         raise ValueError("HCU MegaMoE PACK5 does not support DBO")
+    if (
+        moe.dp_size > 1
+        and getattr(parallel, "all2all_backend", None) == "deepep_low_latency"
+        and not getattr(parallel, "_vllm_hcu_deepep_auto", False)
+    ):
+        raise ValueError(
+            "HCU MegaMoE DP execution requires coordinated token metadata; "
+            "fixed deepep_low_latency suppresses it"
+        )
     offload = getattr(config, "offload_config", None)
     if offload is not None and (
         offload.uva.cpu_offload_gb or offload.prefetch.offload_group_size
@@ -548,6 +557,11 @@ class HcuMegaMoEMethod(FusedMoEMethodBase):
                 getattr(descriptor, "num_tokens", capacity) if graph
                 else chunk_capacity
             )
+            if graph and self.moe.dp_size > 1:
+                # Local graph buckets can differ across DP ranks. Pin selection
+                # to the shared maximum graph capacity so captured collectives
+                # agree regardless of which local buckets are replayed together.
+                selector = capacity
             run(
                 y if graph else y[lo:hi], l1, l2, buf,
                 megamoe_backend=self._backend(selector, launch_capacity=chunk_capacity),
