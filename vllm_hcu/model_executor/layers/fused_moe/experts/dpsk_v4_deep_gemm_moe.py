@@ -1127,12 +1127,14 @@ class DeepEPAutoW4A8Experts(DeepEPAutoDeepGemmExperts):
         max_num_tokens: int,
         num_dispatchers: int,
         fixed_use_low_latency: bool | None = None,
+        global_ht_token_bound: bool = False,
     ):
         self.moe_config = moe_config
         self.quant_config = quant_config
         self.max_num_tokens = max_num_tokens
         self.num_dispatchers = num_dispatchers
         self._fixed_use_low_latency = fixed_use_low_latency
+        self._global_ht_token_bound = global_ht_token_bound
         self._use_low_latency_snapshot = False
         if fixed_use_low_latency is not True:
             self.ht_experts = DeepEPDeepGemmW4A8ContiguousExperts(
@@ -1330,7 +1332,7 @@ def _make_deepep_auto_deepgemm_moe_kernel(
 
     vllm_config = get_current_vllm_config_or_none()
     fixed_use_low_latency = dspark_mooncake_pd_use_low_latency(vllm_config)
-    from vllm_hcu.deepseek_v4_runtime import is_deepseek_v4
+    from vllm_hcu.deepseek_v4_runtime import model_architectures
 
     # DeepSeek V4 PCP gathers the local PCP slices before routing, so
     # moe_config.max_num_tokens is already the global token bound. Multiplying
@@ -1338,8 +1340,12 @@ def _make_deepep_auto_deepgemm_moe_kernel(
     # dispatcher (32768 * 8 in PCP8) and can create a 24.5 GiB warmup buffer.
     # Keep the conservative per-dispatcher bound from 2434b9b6 for every other
     # model and for non-PCP DeepSeek V4 deployments.
+    is_native_deepseek_v4 = not {
+        "DeepseekV4ForCausalLM",
+        "DeepSeekV4MTPModel",
+    }.isdisjoint(model_architectures(vllm_config))
     global_ht_token_bound = bool(
-        is_deepseek_v4(vllm_config)
+        is_native_deepseek_v4
         and int(getattr(moe_config, "pcp_size", 1)) > 1
     )
     if experts_cls is None:

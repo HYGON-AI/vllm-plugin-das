@@ -4000,6 +4000,43 @@ def test_channel_auto_experts_construct_only_mooncake_pd_role_layout(
     assert experts.ht_experts is experts.ll_experts
 
 
+def test_w4a8_auto_accepts_global_ht_token_bound(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    from vllm_hcu.model_executor.layers.fused_moe.experts import (
+        dpsk_v4_deep_gemm_moe as module,
+    )
+
+    class ContiguousExperts:
+        def __init__(self, **_kwargs):
+            pass
+
+    class MaskedExperts:
+        def __init__(self, **_kwargs):
+            pass
+
+    monkeypatch.setattr(
+        module,
+        "DeepEPDeepGemmW4A8ContiguousExperts",
+        ContiguousExperts,
+    )
+    monkeypatch.setattr(
+        module,
+        "DeepEPDeepGemmW4A8MaskedExperts",
+        MaskedExperts,
+    )
+
+    experts = module.DeepEPAutoW4A8Experts(
+        moe_config=SimpleNamespace(),
+        quant_config=SimpleNamespace(),
+        max_num_tokens=64,
+        num_dispatchers=8,
+        global_ht_token_bound=True,
+    )
+
+    assert experts._global_ht_token_bound is True
+
+
 @pytest.mark.parametrize(
     ("num_dispatchers", "expected_aligned_rows"),
     [
@@ -4911,6 +4948,7 @@ def test_channel_int8_auto_factory_builds_unified_ht_ll_kernel(
 def test_slimquant_w4a8_auto_factory_reuses_unified_prepare_finalize(
     monkeypatch: pytest.MonkeyPatch,
 ):
+    import vllm.config as vllm_config_module
     import vllm.model_executor.layers.fused_moe.all2all_utils as all2all_utils
     from vllm.model_executor.layers.fused_moe.config import FusedMoEQuantConfig
     from vllm_hcu.model_executor.layers.fused_moe.experts import (
@@ -4942,6 +4980,15 @@ def test_slimquant_w4a8_auto_factory_reuses_unified_prepare_finalize(
         "maybe_make_prepare_finalize",
         maybe_make_prepare_finalize,
     )
+    monkeypatch.setattr(
+        vllm_config_module,
+        "get_current_vllm_config_or_none",
+        lambda: SimpleNamespace(
+            model_config=SimpleNamespace(
+                architectures=["DeepSeekV4MTPModel"],
+            )
+        ),
+    )
     constructed: dict[str, object] = {}
 
     class AutoW4A8Experts:
@@ -4964,7 +5011,7 @@ def test_slimquant_w4a8_auto_factory_reuses_unified_prepare_finalize(
         weight_dtype="int4",
         gemm1_clamp_limit=10.0,
     )
-    moe_config = SimpleNamespace()
+    moe_config = SimpleNamespace(pcp_size=8)
 
     kernel = module.make_deepep_auto_deepgemm_w4a8_moe_kernel(
         moe_quant_config=quant_config,
@@ -4981,6 +5028,7 @@ def test_slimquant_w4a8_auto_factory_reuses_unified_prepare_finalize(
         "max_num_tokens": 64,
         "num_dispatchers": 8,
         "fixed_use_low_latency": None,
+        "global_ht_token_bound": True,
     }
 
 
