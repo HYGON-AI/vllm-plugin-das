@@ -1767,6 +1767,15 @@ def _gdn_packed_recurrent_contract(
     return "official-recurrent"
 
 
+def _gdn_mamba_loader_contract(shard_spec, tp_size, tp_rank):
+    def load(param, loaded_weight):
+        shard_size = shard_spec[0][0] // tp_size
+        loaded = loaded_weight.narrow(0, tp_rank * shard_size, shard_size)
+        param.data.copy_(loaded)
+
+    return load
+
+
 def test_gdn_nn_layout_normalizes_all_conv_weight_consumers(monkeypatch):
     causal_adapter = _adapter("patch_gdn_causal_conv1d")
     qwen_adapter = _adapter("patch_gdn_linear_attention")
@@ -1851,6 +1860,7 @@ def test_gdn_nn_layout_normalizes_all_conv_weight_consumers(monkeypatch):
             _gdn_packed_recurrent_contract
         ),
         fused_sigmoid_gating_delta_rule_update=_gdn_sigmoid_contract,
+        mamba_v2_sharded_weight_loader=_gdn_mamba_loader_contract,
         GatedDeltaNetAttention=GatedDeltaNetAttention,
         MambaStateDtypeCalculator=SimpleNamespace(
             gated_delta_net_state_dtype=lambda *a: "calculator"
@@ -1934,6 +1944,7 @@ def test_gdn_recurrent_and_sigmoid_are_qwen_local(monkeypatch):
         GDN_AITER_TRITON_AVAILABLE=False,
         fused_recurrent_gated_delta_rule_packed_decode=recurrent,
         fused_sigmoid_gating_delta_rule_update=sigmoid,
+        mamba_v2_sharded_weight_loader=_gdn_mamba_loader_contract,
     )
     adapter.apply_to_module(module)
 
@@ -1958,6 +1969,35 @@ def test_gdn_recurrent_and_sigmoid_are_qwen_local(monkeypatch):
     assert (
         module.fused_sigmoid_gating_delta_rule_update(*sigmoid_args)
         == "official-sigmoid"
+    )
+
+
+def test_gdn_qwen_local_mamba_loader_supports_nn_layout_tp2(monkeypatch):
+    adapter = _adapter("patch_gdn_linear_attention")
+
+    module = _module(
+        adapter.TARGET_MODULE,
+        GDN_AITER_TRITON_AVAILABLE=False,
+        fused_recurrent_gated_delta_rule_packed_decode=(
+            _gdn_packed_recurrent_contract
+        ),
+        fused_sigmoid_gating_delta_rule_update=_gdn_sigmoid_contract,
+        mamba_v2_sharded_weight_loader=_gdn_mamba_loader_contract,
+    )
+    adapter.apply_to_module(module)
+    from vllm_hcu.platforms import envs as henvs
+
+    monkeypatch.setattr(henvs, "VLLM_USE_NN", True)
+    loaded = torch.arange(48, dtype=torch.float32).reshape(12, 1, 4)
+    param = torch.zeros(4, 1, 6)
+
+    module.mamba_v2_sharded_weight_loader([(12, 0, False)], 2, 1)(
+        param, loaded
+    )
+
+    torch.testing.assert_close(
+        param,
+        loaded[6:12].permute(2, 1, 0).contiguous(),
     )
 
 

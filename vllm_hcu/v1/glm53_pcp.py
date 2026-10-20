@@ -32,6 +32,7 @@ class Glm53PCPBatch:
     local_batch: object
     local_indices: torch.Tensor
     _query_rows: dict = field(default_factory=dict, repr=False)
+    _query_runs: dict = field(default_factory=dict, repr=False)
 
     @property
     def global_batch(self):
@@ -59,7 +60,20 @@ class Glm53PCPBatch:
             device = self.local_indices.device
             self._query_rows[key] = (torch.from_numpy(owned[mask] - key[0]).to(device),
                                      torch.from_numpy(local[mask]).to(device))
+            # The same rows as contiguous (row, local, length) runs.
+            local = local[mask]
+            bounds = [0, *(np.flatnonzero(np.diff(local) != 1) + 1).tolist(), local.size]
+            self._query_runs[key] = tuple(
+                (begin, int(local[begin]), stop - begin)
+                for begin, stop in zip(bounds[:-1], bounds[1:]) if stop > begin
+            )
         return self._query_rows[key]
+
+    def local_query_runs(self, start: int, end: int):
+        """``local_query_rows`` as contiguous ``(row, local, length)`` runs:
+        ``row`` indexes the owned-row order, ``local`` the rank-local layout."""
+        self.local_query_rows(start, end)
+        return self._query_runs[(int(start), int(end))]
 
 
 _BATCH: ContextVar[Glm53PCPBatch | None] = ContextVar(

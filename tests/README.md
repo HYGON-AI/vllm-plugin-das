@@ -82,12 +82,13 @@ checks this lock before running tests. Update the lock in the same reviewed
 change as an intentional Runner image or package upgrade; an unreviewed Runner
 drift fails before pytest starts.
 
-The DTK/ROCm entry uses `"match": "release_line"` with `"version": "26.04"`.
-It accepts `26.04`, numeric patch releases, and `-`/`+` build suffixes (for
+The lock accepts Python 3.10.12 or 3.12.12. Its DTK/ROCm entry uses
+`"match": "release_line"` with `"versions": ["26.04", "26.10"]`. It accepts
+numeric patch releases and `-`/`+` build suffixes within either line (for
 example, `26.04.1-72cu-0911`), while rejecting other release lines and malformed
 versions such as `26.040` or `26.04foo`. Reports retain the full observed DTK
 version. Omitting `rocm.match`, or setting it to `exact`, preserves exact
-matching for custom locks; Python, HIP, and distribution checks are unchanged.
+matching for custom locks; HIP and distribution checks are unchanged.
 
 Available manual workflows:
 

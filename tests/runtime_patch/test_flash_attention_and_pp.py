@@ -1030,6 +1030,7 @@ def _common_attention_metadata(*, causal: bool | torch.Tensor):
         max_query_len=2,
         max_seq_len=4,
         query_start_loc=torch.tensor([0, 2], dtype=torch.int32),
+        query_start_loc_cpu=torch.tensor([0, 2], dtype=torch.int32),
         seq_lens=torch.tensor([4], dtype=torch.int32),
         block_table_tensor=torch.tensor([[0]], dtype=torch.int32),
         slot_mapping=torch.tensor([0, 1], dtype=torch.int64),
@@ -1877,3 +1878,272 @@ def test_hcu_flash_attention_e5m2_keeps_compute_dtype_queries(
     query = torch.full((2, 64), 1.25, dtype=torch.bfloat16)
     output = attention_forward(upstream, layer, query, query, query)
     torch.testing.assert_close(output, query)
+
+
+def _split_pd_impl(monkeypatch: pytest.MonkeyPatch, flash_attn):
+    monkeypatch.setattr(flash_attn, "get_flash_attn_version", lambda **kwargs: 3)
+    monkeypatch.setattr(flash_attn, "get_current_vllm_config_or_none", lambda: None)
+    monkeypatch.setattr(flash_attn, "flash_attn_supports_fp8", lambda: True)
+    monkeypatch.setattr(flash_attn, "flash_attn_supports_quant_query_input", lambda: True)
+    return flash_attn.FlashAttentionImpl(
+        num_heads=1, head_size=64, scale=0.125, num_kv_heads=1,
+        alibi_slopes=None, sliding_window=None, kv_cache_dtype="auto",
+    )
+
+
+def _split_pd_inputs(num_actual_tokens: int, num_decode_tokens: int):
+    metadata = SimpleNamespace(
+        num_actual_tokens=num_actual_tokens,
+        num_decode_tokens=num_decode_tokens,
+        num_decodes=2,
+        decode_query_len=2,
+        prefill_max_query_len=3,
+        max_query_len=3,
+        max_seq_len=100,
+        sliding_window=None,
+        causal=True,
+    )
+    query = torch.arange(8, dtype=torch.float32).reshape(8, 1).expand(8, 4).clone()
+    return (
+        metadata,
+        query,
+        torch.zeros_like(query),
+        torch.tensor([0, 2, 4, 7], dtype=torch.int32),
+        torch.tensor([10, 11, 12], dtype=torch.int32),
+        torch.arange(12, dtype=torch.int32).reshape(3, 4),
+        torch.ones(3, 1),
+        torch.ones(3, 1),
+    )
+
+
+def _run_split_pd(monkeypatch: pytest.MonkeyPatch, num_actual_tokens, num_decode_tokens):
+    flash_attn = _load_hcu_flash_attention_module(monkeypatch)
+    impl = _split_pd_impl(monkeypatch, flash_attn)
+    calls: list[dict[str, object]] = []
+    monkeypatch.setattr(
+        flash_attn,
+        "_select_flash_attn_varlen_func",
+        lambda: lambda **kwargs: calls.append(kwargs),
+    )
+    metadata, query, output, cu, seqused, table, k_descale, v_descale = (
+        _split_pd_inputs(num_actual_tokens, num_decode_tokens)
+    )
+    impl._forward_split_pd(
+        query, object(), object(), output, metadata, cu, seqused, table,
+        None, k_descale, v_descale,
+    )
+    return calls, query, cu, seqused, table
+
+
+def test_split_pd_mixed_batch_runs_decode_then_prefill_with_own_query_len(
+    monkeypatch: pytest.MonkeyPatch,
+):
+    calls, query, cu, seqused, table = _run_split_pd(monkeypatch, 7, 4)
+
+    decode, prefill = calls
+    assert decode["max_seqlen_q"] == 2
+    assert decode["q"].shape[0] == 4
+    torch.testing.assert_close(decode["cu_seqlens_q"], cu[:3])
+    torch.testing.assert_close(decode["seqused_k"], seqused[:2])
+    torch.testing.assert_close(decode["block_table"], table[:2])
+    assert decode["k_descale"].shape[0] == 2
+
+    assert prefill["max_seqlen_q"] == 3
+    assert prefill["q"].shape[0] == 3
+    torch.testing.assert_close(prefill["q"], query[4:7])
+    torch.testing.assert_close(
+        prefill["cu_seqlens_q"], torch.tensor([0, 3], dtype=torch.int32)
+    )
+    torch.testing.assert_close(prefill["seqused_k"], seqused[2:])
+    torch.testing.assert_close(prefill["block_table"], table[2:])
+    assert prefill["k_descale"].shape[0] == 1
+
+
+@pytest.mark.parametrize(
+    ("num_actual_tokens", "num_decode_tokens"),
+    [
+        (4, 4),  # uniform decode batch: nothing to split off
+        (4, 5),  # DP-padded metadata: decode count exceeds the clamped total
+        (7, 0),  # pure prefill
+    ],
+)
+def test_split_pd_without_a_mixed_boundary_issues_one_call(
+    monkeypatch: pytest.MonkeyPatch,
+    num_actual_tokens: int,
+    num_decode_tokens: int,
+):
+    calls, query, cu, seqused, table = _run_split_pd(
+        monkeypatch, num_actual_tokens, num_decode_tokens
+    )
+
+    (call,) = calls
+    assert call["q"].shape[0] == num_actual_tokens
+    assert call["max_seqlen_q"] == 3
+    torch.testing.assert_close(call["cu_seqlens_q"], cu)
+    torch.testing.assert_close(call["seqused_k"], seqused)
+    torch.testing.assert_close(call["block_table"], table)
+
+
+@pytest.mark.parametrize(
+    ("switch", "mode", "pcp", "uniform_only"),
+    [
+        (False, "varlen", 1, False),
+        (True, "varlen", 1, True),
+        (True, "cutlass", 1, False),
+        (True, "classic", 1, False),
+        (True, "varlen", 2, None),
+    ],
+)
+def test_split_pd_only_restricts_graphs_when_it_actually_splits(
+    monkeypatch: pytest.MonkeyPatch,
+    switch: bool,
+    mode: str,
+    pcp: int,
+    uniform_only: bool | None,
+):
+    from vllm.v1.attention.backend import AttentionCGSupport
+    from vllm_hcu.platforms import hcu as hcu_platform
+
+    flash_attn = _load_hcu_flash_attention_module(monkeypatch)
+    builder = flash_attn.FlashAttentionMetadataBuilder
+    monkeypatch.setattr(flash_attn, "_SPLIT_PD", switch)
+    monkeypatch.setattr(hcu_platform, "get_hcu_flash_attn_mode", lambda config=None: mode)
+    vllm_config = SimpleNamespace(
+        parallel_config=SimpleNamespace(prefill_context_parallel_size=pcp)
+    )
+
+    support = builder.get_cudagraph_support(vllm_config, None)
+
+    if uniform_only is None:
+        assert support is AttentionCGSupport.NEVER
+    elif uniform_only:
+        assert support is AttentionCGSupport.UNIFORM_BATCH
+    else:
+        assert support is builder._cudagraph_support
+
+
+def _padded_draft_metadata(*, num_actual_tokens: int, query_start_loc: list[int]):
+    """Draft-decode metadata whose token count was DP-padded past the batch."""
+
+    num_reqs = len(query_start_loc) - 1
+    qsl = torch.tensor(query_start_loc, dtype=torch.int32)
+    return SimpleNamespace(
+        num_reqs=num_reqs,
+        num_actual_tokens=num_actual_tokens,
+        max_query_len=max(
+            (b - a for a, b in zip(query_start_loc, query_start_loc[1:])), default=1
+        ),
+        max_seq_len=64,
+        query_start_loc=qsl,
+        query_start_loc_cpu=qsl,
+        seq_lens=torch.full((num_reqs,), 8, dtype=torch.int32),
+        block_table_tensor=torch.zeros((num_reqs, 1), dtype=torch.int32),
+        slot_mapping=torch.arange(num_actual_tokens, dtype=torch.int64),
+        causal=True,
+    )
+
+
+@pytest.mark.parametrize(
+    ("num_actual_tokens", "query_start_loc", "expected"),
+    [
+        (4, [0, 1, 2, 3], 3),  # DP padding row: 4 tokens for 3 real ones
+        (3, [0, 1, 2, 3], 3),  # already consistent: untouched
+        (6, [0, 2, 4, 6], 6),  # uniform MTP verify batch: untouched
+    ],
+)
+def test_build_drops_dp_padding_tokens_beyond_query_start_loc(
+    monkeypatch: pytest.MonkeyPatch,
+    num_actual_tokens: int,
+    query_start_loc: list[int],
+    expected: int,
+) -> None:
+    flash_attn = _load_hcu_flash_attention_module(monkeypatch)
+    builder = _bare_flash_attention_builder(flash_attn)
+    monkeypatch.setattr(flash_attn, "_SPLIT_PD", False)
+    monkeypatch.setattr(flash_attn, "get_scheduler_metadata", lambda **kwargs: None)
+
+    metadata = builder.build(
+        0,
+        _padded_draft_metadata(
+            num_actual_tokens=num_actual_tokens, query_start_loc=query_start_loc
+        ),
+    )
+
+    assert metadata.num_actual_tokens == expected
+
+
+def test_build_keeps_padded_token_count_when_pcp_plan_is_present(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    flash_attn = _load_hcu_flash_attention_module(monkeypatch)
+    builder = _bare_flash_attention_builder(flash_attn)
+    monkeypatch.setattr(flash_attn, "_SPLIT_PD", False)
+    monkeypatch.setattr(flash_attn, "get_scheduler_metadata", lambda **kwargs: None)
+
+    metadata = builder.build(
+        0,
+        _padded_draft_metadata(num_actual_tokens=4, query_start_loc=[0, 1, 2, 3]),
+        pcp_plan=object(),
+    )
+
+    assert metadata.num_actual_tokens == 4
+
+
+@pytest.mark.parametrize(
+    ("threshold", "query_start_loc", "expected"),
+    [
+        # MTP=3: two verify rows of 4 tokens, then one 3-token extend.
+        (4, [0, 4, 8, 11], (2, 8, 4, 3)),
+        # No spec decode: a single-token decode row ahead of a prefill.
+        (1, [0, 1, 6], (1, 1, 1, 5)),
+        # Uniform decode batch: nothing is left for the prefill segment.
+        (4, [0, 4, 8], (2, 8, 4, 0)),
+        # Pure prefill: no decode prefix.
+        (1, [0, 5, 9], (0, 0, 0, 5)),
+    ],
+)
+def test_build_populates_decode_prefill_split_metadata(
+    monkeypatch: pytest.MonkeyPatch,
+    threshold: int,
+    query_start_loc: list[int],
+    expected: tuple[int, int, int, int],
+) -> None:
+    flash_attn = _load_hcu_flash_attention_module(monkeypatch)
+    builder = _bare_flash_attention_builder(flash_attn)
+    builder.reorder_batch_threshold = threshold
+    monkeypatch.setattr(flash_attn, "_SPLIT_PD", True)
+    monkeypatch.setattr(flash_attn, "get_scheduler_metadata", lambda **kwargs: None)
+
+    metadata = builder.build(
+        0,
+        _padded_draft_metadata(
+            num_actual_tokens=query_start_loc[-1], query_start_loc=query_start_loc
+        ),
+    )
+
+    assert (
+        metadata.num_decodes,
+        metadata.num_decode_tokens,
+        metadata.decode_query_len,
+        metadata.prefill_max_query_len,
+    ) == expected
+
+
+def test_build_leaves_split_metadata_empty_when_the_switch_is_off(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    flash_attn = _load_hcu_flash_attention_module(monkeypatch)
+    builder = _bare_flash_attention_builder(flash_attn)
+    monkeypatch.setattr(flash_attn, "_SPLIT_PD", False)
+    monkeypatch.setattr(flash_attn, "get_scheduler_metadata", lambda **kwargs: None)
+
+    metadata = builder.build(
+        0, _padded_draft_metadata(num_actual_tokens=11, query_start_loc=[0, 4, 8, 11])
+    )
+
+    assert (
+        metadata.num_decodes,
+        metadata.num_decode_tokens,
+        metadata.decode_query_len,
+        metadata.prefill_max_query_len,
+    ) == (0, 0, 0, 0)
