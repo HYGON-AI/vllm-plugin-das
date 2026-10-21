@@ -247,6 +247,7 @@ class HCUPlatform(Platform):
         "awq_marlin",  # will be overwritten with awq
         "gptq",
         "gptq_marlin",  # will be overwritten with gptq
+        "auto_gptq",  # current vLLM resolves compatible GPTQ checkpoints here
         "fp8",
         "deepseek_v4_fp8",
         "compressed-tensors",
