@@ -133,6 +133,40 @@ def test_cli_writes_structured_report_for_missing_shard(tmp_path, monkeypatch):
                for error in report['errors'])
 
 
+@pytest.mark.parametrize('bad_shard', [None, 0, False, [], {}, '', '\0'])
+def test_cli_reports_invalid_shard_names(tmp_path, monkeypatch, bad_shard):
+    _write(tmp_path)
+    index_path = tmp_path / 'model.safetensors.index.json'
+    index = json.loads(index_path.read_text())
+    # Keep valid entries too: invalid values must not reach grouping or sorting.
+    name = next(iter(index['weight_map']))
+    index['weight_map'][name] = bad_shard
+    index_path.write_text(json.dumps(index))
+    output = tmp_path / 'audit.json'
+    monkeypatch.setattr(sys, 'argv', [
+        'audit_kimi_k3_checkpoint.py', str(tmp_path), '--output', str(output)
+    ])
+
+    assert audit_module.main() == 1
+    report = json.loads(output.read_text())
+    assert not report['passed']
+    assert any('Invalid weight_map shard name' in error
+               for error in report['errors'])
+
+
+@pytest.mark.parametrize('weight_map', [None, [], 0, {'': 'model.safetensors'}])
+def test_audit_reports_invalid_weight_map(tmp_path, weight_map):
+    _write(tmp_path)
+    (tmp_path / 'model.safetensors.index.json').write_text(
+        json.dumps({'weight_map': weight_map})
+    )
+
+    result = audit_module.audit(tmp_path)
+
+    assert not result['passed']
+    assert any('Invalid weight_map' in error for error in result['errors'])
+
+
 @pytest.mark.parametrize('source', ['root', 'text_config'])
 @pytest.mark.parametrize('effective_config_valid', [False, True])
 def test_audit_uses_runtime_quantization_config_priority(

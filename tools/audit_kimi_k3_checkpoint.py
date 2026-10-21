@@ -363,9 +363,20 @@ def audit(root, tp=16):
     if quant.get('quant_method') != 'slimquant_w4a8':
         raise ValueError('Expected slimquant_w4a8 checkpoint')
     schema = language_schema(c)
-    index = json.loads((root / 'model.safetensors.index.json').read_text())['weight_map']
+    errors = []
+    index_document = json.loads((root / 'model.safetensors.index.json').read_text())
+    index = index_document.get('weight_map') if isinstance(index_document, dict) else None
+    if not isinstance(index, dict):
+        errors.append('Invalid weight_map: expected an object')
+        index = {}
     shards = {}
     for name, shard in index.items():
+        if not isinstance(name, str) or not name:
+            errors.append(f'Invalid weight_map tensor name: {name!r}')
+            continue
+        if not isinstance(shard, str) or not shard or '\0' in shard:
+            errors.append(f'Invalid weight_map shard name for {name!r}: {shard!r}')
+            continue
         shards.setdefault(shard, set()).add(name)
     counts = Counter()
     expert_ids = {name: set() for name in schema if '.experts.*.' in name}
@@ -374,7 +385,6 @@ def audit(root, tp=16):
     w8_scales = 0
     w8_values = 0
     vision = 0
-    errors = []
     selected_routes = validate_quantization_routes(schema, quant, errors)
     for shard, indexed in sorted(shards.items()):
         path = (root / shard).resolve()
