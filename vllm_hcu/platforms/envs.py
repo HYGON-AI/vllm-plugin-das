@@ -58,6 +58,8 @@ if TYPE_CHECKING:
     VLLM_HCU_ENABLE_DEEPSEEK_V4_CACHE_WINDOW: bool = False
     VLLM_HCU_USE_AITER_W8A8_FP8_MOE: bool = False
     VLLM_HCU_USE_LIGHTOP_MOE_ALIGN: bool = False
+    VLLM_HCU_USE_REFERENCE_MOE: bool = False
+    VLLM_HCU_USE_NATIVE_RELU_SQUARED: bool = True
     VLLM_HCU_USE_LIGHTOP_EP_SCATTER: bool = True
     VLLM_HCU_USE_LIGHTOP_PER_TOKEN_QUANT_FP8: bool = False
     VLLM_HCU_FUSED_MOE_CHUNK_SIZE: Optional[int] = None
@@ -524,6 +526,24 @@ hcu_vllm_environment_variables: dict[str, Callable[[], Any]] = {
                     ("true", "1")),
     "VLLM_HCU_USE_LIGHTOP_MOE_ALIGN":
         lambda: (os.environ.get("VLLM_HCU_USE_LIGHTOP_MOE_ALIGN", "False").lower() in
+                    ("true", "1")),
+
+    # Use a plain-matmul reference expert kernel instead of the Triton fused
+    # MoE kernel. DTK2610 miscomputes a small fraction of elements; opt-in
+    # only. VLLM_HCU_EAGER_MOE is the deprecated alias used by the Nemotron
+    # start script.
+    "VLLM_HCU_USE_REFERENCE_MOE":
+        lambda: (
+            os.environ.get(
+                "VLLM_HCU_USE_REFERENCE_MOE",
+                os.environ.get("VLLM_HCU_EAGER_MOE", "False"),
+            ).lower() in ("true", "1")
+        ),
+                    
+    # DTK2610 returns NaN/~1e36 from torch.ops._C.relu_squared. Use the native
+    # relu^2 implementation for ReLUSquaredActivation on HCU by default.
+    "VLLM_HCU_USE_NATIVE_RELU_SQUARED":
+        lambda: (os.environ.get("VLLM_HCU_USE_NATIVE_RELU_SQUARED", "True").lower() in
                     ("true", "1")),
 
     # DeepEP HT permute: use lightop op.ep_scatter when True (also requires
