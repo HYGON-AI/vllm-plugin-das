@@ -12,6 +12,7 @@ from __future__ import annotations
 import argparse
 import array
 from collections import Counter
+import fnmatch
 import json
 import math
 import os
@@ -187,6 +188,106 @@ def validate_shard_ranges(header, data_size, shard, errors):
     return invalid
 
 
+def _selector_matches(module, selectors):
+    """Match module selectors with SlimQuant's exact/glob/``re:`` forms."""
+    for selector in selectors:
+        if selector.startswith('re:'):
+            try:
+                if re.match(selector[3:], module):
+                    return True
+            except re.error:
+                # Invalid patterns are reported by selector validation below.
+                continue
+        elif fnmatch.fnmatchcase(module, selector):
+            return True
+    return False
+
+
+def _validate_selector_patterns(label, selectors, errors):
+    for selector in selectors:
+        if selector.startswith('re:'):
+            try:
+                re.compile(selector[3:])
+            except re.error as exc:
+                errors.append(f'Invalid {label} selector {selector!r}: {exc}')
+
+
+def validate_quantization_routes(schema, quant, errors):
+    """Check that SlimQuant config selects every checkpoint W8A8 route.
+
+    The ordinary linear config quantizes all linears when ``w8a8_include`` is
+    absent, except modules matched by ``ignore``. The mixed KDA constructor is
+    narrower: it only creates INT8 Q/K/V branches when an include list is
+    present and selects each branch, with ``ignore`` taking precedence.
+    """
+    mixed_precision = quant.get('mixed_precision')
+    if mixed_precision is None:
+        mixed_precision = {}
+    if type(mixed_precision) is not dict:
+        errors.append('Invalid mixed_precision config: expected an object')
+        mixed_precision = {}
+
+    include = None
+    if 'w8a8_include' in mixed_precision:
+        include_config = mixed_precision.get('w8a8_include') or {}
+        if type(include_config) is not dict:
+            errors.append(
+                'Invalid mixed_precision.w8a8_include config: expected an object'
+            )
+            include_config = {}
+        include = include_config.get('modules') or []
+        if type(include) is not list or any(type(item) is not str for item in include):
+            errors.append(
+                'Invalid mixed_precision.w8a8_include.modules: '
+                'expected a list of strings'
+            )
+            include = []
+
+    ignore = quant.get('ignore') or []
+    if type(ignore) is not list or any(type(item) is not str for item in ignore):
+        errors.append('Invalid compression_config.ignore: expected a list of strings')
+        ignore = []
+    _validate_selector_patterns(
+        'mixed_precision.w8a8_include.modules', include or [], errors
+    )
+    _validate_selector_patterns('compression_config.ignore', ignore, errors)
+
+    modules = {}
+    for name, spec in schema.items():
+        route = spec['route']
+        if route not in ('w8a8', 'latent_w8a8', 'mla_fusion', 'mlp_fusion',
+                         'mixed_kda_w8a8'):
+            continue
+        source = name.removesuffix('.weight_scale').removesuffix('.weight')
+        destination = spec.get('destination', name)
+        runtime = destination.removesuffix('.weight_scale').removesuffix('.weight')
+        # Mixed KDA checks each split branch's original module prefix. Other
+        # routes may be constructed as a fused module (for example gate_up_proj).
+        if route == 'mixed_kda_w8a8':
+            runtime = source
+        modules[source, route] = runtime
+    selected_routes = set()
+    for (module, route), runtime in sorted(modules.items()):
+        ignored = (_selector_matches(module, ignore)
+                   or runtime != module and _selector_matches(runtime, ignore))
+        include_match = (
+            _selector_matches(module, include or [])
+            or runtime != module and _selector_matches(runtime, include or [])
+        )
+        included = include is None or include_match
+        selected = not ignored and included
+        if route == 'mixed_kda_w8a8':
+            selected = not ignored and include is not None and include_match
+        if selected:
+            selected_routes.add((module, route))
+        else:
+            errors.append(
+                f'W8A8 route not selected by effective quantization config: '
+                f'{module} ({route})'
+            )
+    return selected_routes
+
+
 def _unique_object(pairs):
     """Build a JSON object without discarding duplicate keys."""
     result = {}
@@ -230,6 +331,7 @@ def audit(root, tp=16):
     w8_values = 0
     vision = 0
     errors = []
+    selected_routes = validate_quantization_routes(schema, quant, errors)
     for shard, indexed in sorted(shards.items()):
         path = (root / shard).resolve()
         if not path.is_relative_to(root.resolve()):
@@ -275,7 +377,9 @@ def audit(root, tp=16):
                 counts[pattern] += 1
                 if expert:
                     expert_ids[pattern].add(expert_id)
-                routes[spec['route']] += 1
+                module = name.removesuffix('.weight_scale').removesuffix('.weight')
+                if (module, spec['route']) in selected_routes:
+                    routes[spec['route']] += 1
                 if info['dtype'] != spec['dtype'] or info['shape'] != spec['shape']:
                     errors.append(f'Shape/dtype mismatch: {name}')
                     continue

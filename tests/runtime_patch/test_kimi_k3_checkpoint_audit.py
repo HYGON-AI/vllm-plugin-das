@@ -39,8 +39,9 @@ def _write(root, mutate=None):
                   num_shared_experts=2, routed_expert_hidden_size=4, num_experts=2,
                   linear_attn_config=dict(num_heads=16, head_dim=2, full_attn_layers=[2],
                                           short_conv_kernel_size=4, use_full_rank_gate=True))
+    schema = audit_module.language_schema(config)
     entries = {}
-    for name, value in audit_module.language_schema(config).items():
+    for name, value in schema.items():
         for expert in range(value['count']):
             entries[name.replace('.experts.*.', f'.experts.{expert}.')] = dict(value)
     if mutate:
@@ -61,8 +62,17 @@ def _write(root, mutate=None):
         chunks.append(payload)
     raw = json.dumps(header).encode()
     (root / 'model.safetensors').write_bytes(struct.pack('<Q', len(raw)) + raw + b''.join(chunks))
+    w8a8_modules = sorted({
+        name.removesuffix('.weight_scale').removesuffix('.weight')
+        for name, spec in schema.items()
+        if spec['route'] in ('w8a8', 'latent_w8a8', 'mla_fusion', 'mlp_fusion',
+                             'mixed_kda_w8a8')
+    })
     (root / 'config.json').write_text(json.dumps(dict(text_config=config,
-        compression_config={'quant_method':'slimquant_w4a8'})))
+        compression_config={
+            'quant_method': 'slimquant_w4a8',
+            'mixed_precision': {'w8a8_include': {'modules': w8a8_modules}},
+        })))
     (root / 'model.safetensors.index.json').write_text(json.dumps({
         'weight_map': {name:'model.safetensors' for name in header}}))
 
@@ -73,6 +83,50 @@ def test_small_full_contract_passes(tmp_path):
     assert result['passed'] and not result['errors']
     assert result['w8a8_scale_tensors_fully_read'] > 0
     assert result['model_constructed'] is False
+
+
+@pytest.mark.parametrize(
+    'case', ['empty_include', 'missing_kda_branches', 'ignored_kda_branch']
+)
+def test_audit_rejects_w8a8_routes_not_selected_by_effective_config(tmp_path, case):
+    _write(tmp_path)
+    config_path = tmp_path / 'config.json'
+    raw = json.loads(config_path.read_text())
+    quant = raw['compression_config']
+    modules = quant['mixed_precision']['w8a8_include']['modules']
+    if case == 'empty_include':
+        modules.clear()
+    elif case == 'missing_kda_branches':
+        modules.remove('language_model.model.layers.0.self_attn.k_proj')
+        modules.remove('language_model.model.layers.0.self_attn.v_proj')
+    else:
+        quant['ignore'] = [r're:.*layers\.0\.self_attn\.k_proj(?:\.|$)']
+    config_path.write_text(json.dumps(raw))
+
+    result = audit_module.audit(tmp_path)
+
+    assert not result['passed']
+    assert any('W8A8 route not selected by effective quantization config' in error
+               for error in result['errors'])
+    if case == 'empty_include':
+        assert result['route_counts'].get('mixed_kda_w8a8', 0) == 0
+
+
+def test_audit_accepts_runtime_fused_module_selector(tmp_path):
+    _write(tmp_path)
+    config_path = tmp_path / 'config.json'
+    raw = json.loads(config_path.read_text())
+    modules = raw['compression_config']['mixed_precision']['w8a8_include']['modules']
+    gate = 'language_model.model.layers.0.mlp.gate_proj'
+    up = 'language_model.model.layers.0.mlp.up_proj'
+    modules.remove(gate)
+    modules.remove(up)
+    modules.append('language_model.model.layers.0.mlp.gate_up_proj')
+    config_path.write_text(json.dumps(raw))
+
+    result = audit_module.audit(tmp_path)
+
+    assert result['passed'] and not result['errors']
 
 
 @pytest.mark.parametrize('case', ['missing_scale', 'unknown_name', 'wrong_dtype', 'bad_scale'])
