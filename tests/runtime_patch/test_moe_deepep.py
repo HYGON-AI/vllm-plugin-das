@@ -1993,6 +1993,11 @@ def test_moe_layer_forward_and_repacked_weight_contract(
             ._hcu_global_ht_token_bound
             is True
         )
+        assert (
+            deepseek_v4_pcp_runner.routed_experts.moe_config
+            ._hcu_model_architectures
+            == (architecture,)
+        )
     situ_runner = fused_moe_package.FusedMoE(activation="situ")
     assert situ_runner.routed_experts.moe_config._hcu_kimi_k3 is True
     kimi_runner_type = type(
@@ -5196,6 +5201,86 @@ def test_slimquant_w4a8_auto_factory_reuses_unified_prepare_finalize(
         "fixed_use_low_latency": None,
         "global_ht_token_bound": True,
     }
+
+
+@pytest.mark.parametrize(
+    "architecture", ["DeepseekV4ForCausalLM", "DeepSeekV4MTPModel"]
+)
+def test_slimquant_w4a8_post_load_uses_persisted_architecture_without_context(
+    monkeypatch: pytest.MonkeyPatch,
+    architecture: str,
+):
+    import vllm.config as vllm_config_module
+    from vllm_hcu.model_executor.layers.fused_moe.experts import (
+        dpsk_v4_deep_gemm_moe as experts_module,
+    )
+    from vllm_hcu.model_executor.layers.fused_moe import deepep_runtime
+    from vllm_hcu.model_executor.layers.quantization.slimquant_w4a8 import (
+        SlimQuantW4A8Int8AiterMoEMethod,
+    )
+
+    monkeypatch.setattr(
+        vllm_config_module,
+        "get_current_vllm_config_or_none",
+        lambda: None,
+    )
+    monkeypatch.setattr(deepep_runtime.current_platform, "is_rocm", lambda: True)
+    monkeypatch.setattr(
+        deepep_runtime,
+        "_require_slimquant_w4a8_hipc_runtime",
+        lambda: None,
+    )
+    moe_config = SimpleNamespace(
+        activation="silu",
+        moe_backend="deep_gemm",
+        pcp_size=8,
+        moe_parallel_config=SimpleNamespace(
+            all2all_backend="deepep_auto",
+            dp_size=1,
+            pcp_size=8,
+            use_ep=True,
+            use_deepep_auto_kernels=True,
+        ),
+        _hcu_global_ht_token_bound=True,
+        _hcu_model_architectures=(architecture,),
+    )
+    method = SlimQuantW4A8Int8AiterMoEMethod(None, moe_config)
+    layer = _slimquant_w4a8_auto_layer()
+    layer.w13_input_scale = None
+    layer.w2_input_scale = None
+    routing_tables = (object(), object(), object())
+    layer._expert_routing_tables = lambda: routing_tables
+
+    processed: list[torch.nn.Module] = []
+    captured: dict[str, object] = {}
+
+    class Experts:
+        def process_weights_after_loading(self, loaded_layer):
+            processed.append(loaded_layer)
+
+    def make_kernel(*, moe_quant_config, moe_config, routing_tables):
+        captured.update(
+            moe_quant_config=moe_quant_config,
+            moe_config=moe_config,
+            routing_tables=routing_tables,
+        )
+        return SimpleNamespace(
+            fused_experts=SimpleNamespace(experts=Experts()),
+        )
+
+    monkeypatch.setattr(
+        experts_module,
+        "make_deepep_auto_deepgemm_w4a8_moe_kernel",
+        make_kernel,
+    )
+
+    method.process_weights_after_loading(layer)
+
+    assert captured["moe_config"] is moe_config
+    assert captured["routing_tables"] is routing_tables
+    assert captured["moe_quant_config"] is method.moe_quant_config
+    assert processed == [layer]
+    assert method.moe_kernel is not None
 
 
 def test_slimquant_w4a8_auto_factory_rejects_non_dynamic_token_scheme(

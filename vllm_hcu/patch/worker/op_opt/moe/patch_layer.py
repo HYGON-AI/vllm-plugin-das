@@ -223,10 +223,11 @@ def apply_to_module(module: ModuleType) -> bool:
         vllm_config = get_current_vllm_config_or_none()
         model_config = getattr(vllm_config, "model_config", None)
         hf_config = getattr(model_config, "hf_config", None)
+        architectures = model_architectures(vllm_config)
         is_native_deepseek_v4 = not {
             "DeepseekV4ForCausalLM",
             "DeepSeekV4MTPModel",
-        }.isdisjoint(model_architectures(vllm_config))
+        }.isdisjoint(architectures)
         # init_vllm_registered_model installs the inner text config while
         # constructing Kimi-K3's language model (model_type="kimi_linear").
         is_kimi_k3 = getattr(hf_config, "model_type", None) in (
@@ -281,6 +282,7 @@ def apply_to_module(module: ModuleType) -> bool:
                 "_hcu_global_ht_token_bound",
                 global_ht_token_bound,
             )
+            setattr(moe_config, "_hcu_model_architectures", architectures)
         activation_value = getattr(moe_config, "activation", None)
         activation = getattr(activation_value, "value", activation_value)
         # FusedMoEFactory may run after the current VllmConfig context has
@@ -304,6 +306,7 @@ def apply_to_module(module: ModuleType) -> bool:
                 "_hcu_global_ht_token_bound",
                 global_ht_token_bound,
             )
+            setattr(method_moe, "_hcu_model_architectures", architectures)
         if type(experts.quant_method) is not official_unquantized_cls:
             return runner
         if bool(getattr(experts, "apply_router_weight_on_input", False)):
