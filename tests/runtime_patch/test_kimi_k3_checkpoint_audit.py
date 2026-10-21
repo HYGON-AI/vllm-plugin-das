@@ -68,10 +68,16 @@ def _write(root, mutate=None):
         if spec['route'] in ('w8a8', 'latent_w8a8', 'mla_fusion', 'mlp_fusion',
                              'mixed_kda_w8a8')
     })
+    floating_linear_modules = sorted({
+        name.removesuffix('.weight_scale').removesuffix('.weight')
+        for name, spec in schema.items()
+        if spec['route'] == 'float_w8a8_selectable'
+    })
     (root / 'config.json').write_text(json.dumps(dict(text_config=config,
         compression_config={
             'quant_method': 'slimquant_w4a8',
             'mixed_precision': {'w8a8_include': {'modules': w8a8_modules}},
+            'ignore': floating_linear_modules,
         })))
     (root / 'model.safetensors.index.json').write_text(json.dumps({
         'weight_map': {name:'model.safetensors' for name in header}}))
@@ -83,6 +89,7 @@ def test_small_full_contract_passes(tmp_path):
     assert result['passed'] and not result['errors']
     assert result['w8a8_scale_tensors_fully_read'] > 0
     assert result['model_constructed'] is False
+    assert sum(result['route_counts'].values()) == result['language_tensor_count']
 
 
 @pytest.mark.parametrize(
@@ -122,6 +129,55 @@ def test_audit_accepts_runtime_fused_module_selector(tmp_path):
     modules.remove(gate)
     modules.remove(up)
     modules.append('language_model.model.layers.0.mlp.gate_up_proj')
+    config_path.write_text(json.dumps(raw))
+
+    result = audit_module.audit(tmp_path)
+
+    assert result['passed'] and not result['errors']
+
+
+@pytest.mark.parametrize('projection', ['f_b_proj', 'o_proj'])
+def test_audit_rejects_float_projection_selected_by_w8a8(tmp_path, projection):
+    _write(tmp_path)
+    config_path = tmp_path / 'config.json'
+    raw = json.loads(config_path.read_text())
+    quant = raw['compression_config']
+    module = f'language_model.model.layers.0.self_attn.{projection}'
+    quant['mixed_precision']['w8a8_include']['modules'].append(module)
+    quant['ignore'].remove(module)
+    config_path.write_text(json.dumps(raw))
+
+    result = audit_module.audit(tmp_path)
+
+    assert not result['passed']
+    assert any('Floating projection selected by effective W8A8 config' in error
+               and module in error for error in result['errors'])
+
+
+@pytest.mark.parametrize('projection', ['f_b_proj', 'o_proj'])
+def test_ignore_keeps_float_projection_out_of_w8a8(tmp_path, projection):
+    _write(tmp_path)
+    config_path = tmp_path / 'config.json'
+    raw = json.loads(config_path.read_text())
+    quant = raw['compression_config']
+    module = f'language_model.model.layers.0.self_attn.{projection}'
+    quant['mixed_precision']['w8a8_include']['modules'].append(module)
+    config_path.write_text(json.dumps(raw))
+
+    result = audit_module.audit(tmp_path)
+
+    assert result['passed'] and not result['errors']
+
+
+def test_audit_accepts_runtime_regex_unicode_property_selector(tmp_path):
+    _write(tmp_path)
+    config_path = tmp_path / 'config.json'
+    raw = json.loads(config_path.read_text())
+    modules = raw['compression_config']['mixed_precision']['w8a8_include']['modules']
+    modules.remove('language_model.model.layers.0.self_attn.q_proj')
+    modules.append(
+        r're:language_model\.model\.layers\.\p{Nd}+\.self_attn\.q_proj$'
+    )
     config_path.write_text(json.dumps(raw))
 
     result = audit_module.audit(tmp_path)

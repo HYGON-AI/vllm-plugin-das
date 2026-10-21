@@ -17,9 +17,10 @@ import json
 import math
 import os
 from pathlib import Path
-import re
 import struct
 import sys
+
+import regex as re
 
 
 # Safetensors storage widths, independent of torch/vLLM and model semantics.
@@ -32,6 +33,10 @@ _DTYPE_BITS = {
     'F8_E4M3': 8, 'F8_E5M2': 8, 'F8_E8M0': 8,
     'F8_E4M3FNUZ': 8, 'F8_E5M2FNUZ': 8,
     'F4': 4, 'F6_E2M3': 6, 'F6_E3M2': 6,
+}
+
+_CONFIG_SELECTED_ROUTES = {
+    'w8a8', 'latent_w8a8', 'mla_fusion', 'mlp_fusion', 'mixed_kda_w8a8',
 }
 
 
@@ -92,7 +97,8 @@ def language_schema(c):
         for name in ('mlp_res_proj', 'self_attention_res_proj'):
             add(f'{base}.{name}.weight', (1, h))
         attn = base + '.self_attn'
-        add(attn + '.o_proj.weight', (h, heads * c['v_head_dim']))
+        add(attn + '.o_proj.weight', (h, heads * c['v_head_dim']),
+            route='float_w8a8_selectable')
         if i + 1 not in full:
             for name in ('q_proj', 'k_proj', 'v_proj'):
                 linear(attn + '.' + name, p, h,
@@ -104,7 +110,8 @@ def language_schema(c):
             for shard, name in enumerate(('q_conv1d', 'k_conv1d', 'v_conv1d')):
                 add(attn + '.' + name + '.weight', (p, 1, kda['short_conv_kernel_size']),
                     destination=attn + '.conv1d.weight', shard=shard, route='conv_fusion')
-            add(attn + '.f_b_proj.weight', (p, hd))
+            add(attn + '.f_b_proj.weight', (p, hd),
+                route='float_w8a8_selectable')
             add(attn + '.o_norm.weight', (hd,))
             # Serialized K3 A_log uses head_dim entries; the installed loader
             # narrows to local head rows. The audit does not reinterpret values.
@@ -117,8 +124,11 @@ def language_schema(c):
             linear(attn + '.q_b_proj', heads * (c['qk_nope_head_dim'] + c['qk_rope_head_dim']), qr)
             add(attn + '.q_a_layernorm.weight', (qr,))
             add(attn + '.kv_a_layernorm.weight', (kv,))
-            add(attn + '.kv_b_proj.weight', (heads * (c['qk_nope_head_dim'] + c['v_head_dim']), kv))
-            add(attn + '.g_proj.weight', (heads * c['v_head_dim'], h))
+            add(attn + '.kv_b_proj.weight',
+                (heads * (c['qk_nope_head_dim'] + c['v_head_dim']), kv),
+                route='float_w8a8_selectable')
+            add(attn + '.g_proj.weight', (heads * c['v_head_dim'], h),
+                route='float_w8a8_selectable')
         moe = (i >= c['first_k_dense_replace'] and i % c['moe_layer_freq'] == 0)
         if not moe:
             mlp, mid = base + '.mlp', c['intermediate_size']
@@ -255,8 +265,7 @@ def validate_quantization_routes(schema, quant, errors):
     modules = {}
     for name, spec in schema.items():
         route = spec['route']
-        if route not in ('w8a8', 'latent_w8a8', 'mla_fusion', 'mlp_fusion',
-                         'mixed_kda_w8a8'):
+        if route not in _CONFIG_SELECTED_ROUTES | {'float_w8a8_selectable'}:
             continue
         source = name.removesuffix('.weight_scale').removesuffix('.weight')
         destination = spec.get('destination', name)
@@ -278,6 +287,13 @@ def validate_quantization_routes(schema, quant, errors):
         selected = not ignored and included
         if route == 'mixed_kda_w8a8':
             selected = not ignored and include is not None and include_match
+        if route == 'float_w8a8_selectable':
+            if selected:
+                errors.append(
+                    f'Floating projection selected by effective W8A8 config: '
+                    f'{module}'
+                )
+            continue
         if selected:
             selected_routes.add((module, route))
         else:
@@ -378,7 +394,8 @@ def audit(root, tp=16):
                 if expert:
                     expert_ids[pattern].add(expert_id)
                 module = name.removesuffix('.weight_scale').removesuffix('.weight')
-                if (module, spec['route']) in selected_routes:
+                if (spec['route'] not in _CONFIG_SELECTED_ROUTES
+                        or (module, spec['route']) in selected_routes):
                     routes[spec['route']] += 1
                 if info['dtype'] != spec['dtype'] or info['shape'] != spec['shape']:
                     errors.append(f'Shape/dtype mismatch: {name}')
