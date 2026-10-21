@@ -260,7 +260,11 @@ def _setup_state(tmp_path, monkeypatch: pytest.MonkeyPatch, mode="static"):
     ):
         for name in names:
             monkeypatch.setattr(owner, name, inspect.unwrap(getattr(owner, name)))
-    monkeypatch.delattr(upstream, api._MARKER, raising=False)
+    # Record absence too: apply_to_module adds these attributes directly.
+    for marker in (api._MARKER, api._DELEGATES):
+        if not hasattr(upstream, marker):
+            monkeypatch.setattr(upstream, marker, None, raising=False)
+        monkeypatch.delattr(upstream, marker, raising=False)
 
     # CPU contracts exercise real map commits without device-backed pinned
     # allocations. Hardware allocator behavior belongs to HCU-marked tests.
@@ -1050,3 +1054,84 @@ def test_offline_adapter_rejects_stale_wrapper_identity(index) -> None:
     setattr(owner, name, inspect.unwrap(getattr(owner, name)))
     with pytest.raises(api.PatchCompatibilityError, match="stale"):
         api.apply_to_module(target)
+
+
+def _composable_runtime(calls):
+    def step(self, **kwargs):
+        calls.append(("step", kwargs))
+        return "stepped"
+
+    def rearrange(self, **kwargs):
+        calls.append(("rearrange", kwargs))
+        return "rearranged"
+
+    def transfer(*args, **kwargs):
+        calls.append(("transfer", args))
+        return "transferred"
+
+    return SimpleNamespace(
+        step=step, rearrange=rearrange,
+        rearrange_expert_weights_inplace=transfer,
+        _propagate_shared_tensors=lambda *args: None,
+        _move_to_workspace=lambda *args: None,
+    )
+
+
+def test_step5_composes_with_offline_guards_without_replacing_them(monkeypatch):
+    from vllm_hcu.patch.worker.framework_opt import patch_step5_eplb_state
+    import vllm_hcu.distributed as distributed
+
+    api, target = _isolated_offline_target()
+    target.EplbState._propagate_shared_tensors = lambda *args: None
+    target._move_to_workspace = lambda *args: None
+    target.create_eplb_communicator = lambda *args: None
+    api.apply_to_module(target)
+    wrappers = [getattr(owner, name) for owner, name in _offline_hooks(target)]
+    calls = []
+    runtime = _composable_runtime(calls)
+    monkeypatch.setattr(distributed, "eplb_runtime", runtime, raising=False)
+    monkeypatch.setattr(patch_step5_eplb_state, "require_signatures", lambda *args: None)
+
+    assert patch_step5_eplb_state.apply_to_module(target) is True
+    assert api.apply_to_module(target) is False
+    assert patch_step5_eplb_state.apply_to_module(target) is False
+    assert all(
+        getattr(owner, name) is original
+        for (owner, name), original in zip(_offline_hooks(target), wrappers)
+    )
+    state = target.EplbState()
+    state.parallel_config = SimpleNamespace()
+    assert state.step(is_dummy=True) == "stepped"
+    assert state.rearrange(is_profile=True) == "rearranged"
+    assert [call[0] for call in calls] == ["step", "rearrange"]
+
+
+def test_composed_runtime_preserves_static_noop_guards():
+    api, target = _isolated_offline_target()
+    api.apply_to_module(target)
+    calls = []
+    runtime = _composable_runtime(calls)
+    assert api.compose_runtime(target, runtime)
+    state = target.EplbState()
+    state.parallel_config = SimpleNamespace(_vllm_hcu_expert_map_path="/maps/static.json")
+
+    assert state.step() is None
+    assert state.rearrange() is None
+    assert calls == []
+
+
+def test_composed_runtime_preserves_record_only_mutation_guards():
+    api, target = _isolated_offline_target()
+    api.apply_to_module(target)
+    calls = []
+    runtime = _composable_runtime(calls)
+    assert api.compose_runtime(target, runtime)
+    token = api._RECORD_ONLY.set(True)
+    try:
+        assert runtime.rearrange_expert_weights_inplace("weights") is None
+        assert runtime._commit_eplb_maps(object(), object()) is None
+    finally:
+        api._RECORD_ONLY.reset(token)
+    assert calls == []
+    assert runtime.rearrange_expert_weights_inplace("weights") == "transferred"
+    assert calls == [("transfer", ("weights",))]

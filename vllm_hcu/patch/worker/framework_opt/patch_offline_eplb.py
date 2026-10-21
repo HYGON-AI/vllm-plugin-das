@@ -45,6 +45,7 @@ TARGETS += (
     f"{TARGET_MODULE}.rearrange_expert_weights_inplace",
 )
 _MARKER = "_vllm_hcu_offline_eplb"
+_DELEGATES = "_vllm_hcu_offline_eplb_delegates"
 _OFFLINE_EPLB_FORMAT = "vllm_offline_eplb_physical_to_logical_by_model"
 _RECORD_ONLY = ContextVar("hcu_eplb_record_only", default=False)
 logger = init_logger("vllm.hcu.offline_eplb")
@@ -409,6 +410,13 @@ def apply_to_module(module) -> bool:
         defaults={"is_profile": False, "rank_mapping": None},
     )
 
+    delegates = {
+        "step": original_step,
+        "rearrange": original_rearrange,
+        "transfer": original_transfer,
+        "runtime": None,
+    }
+
     @functools.wraps(original_add)
     def add_model(self, model, model_config):
         load_path, record_path = _paths(self.parallel_config)
@@ -580,13 +588,13 @@ def apply_to_module(module) -> bool:
         if load_path:
             return None
         if not record_path:
-            return original_step(
+            return delegates["step"](
                 self,
                 is_dummy=is_dummy,
                 is_profile=is_profile,
                 log_stats=log_stats,
             )
-        return original_step(
+        return delegates["step"](
             self,
             is_dummy=is_dummy,
             is_profile=is_profile,
@@ -608,7 +616,7 @@ def apply_to_module(module) -> bool:
         ):
             return None
         if not record_path or is_profile:
-            return original_rearrange(
+            return delegates["rearrange"](
                 self,
                 is_profile=is_profile,
                 rank_mapping=rank_mapping,
@@ -622,7 +630,7 @@ def apply_to_module(module) -> bool:
         self.policy = _RecordOnlyPolicyProxy(original_policy, captured)
         token = _RECORD_ONLY.set(True)
         try:
-            result = original_rearrange(
+            result = delegates["rearrange"](
                 self,
                 is_profile=False,
                 rank_mapping=None,
@@ -661,7 +669,7 @@ def apply_to_module(module) -> bool:
     def rearrange_expert_weights_inplace(*args, **kwargs):
         if _RECORD_ONLY.get():
             return None
-        return original_transfer(*args, **kwargs)
+        return delegates["transfer"](*args, **kwargs)
 
     @functools.wraps(original_commit)
     def commit_eplb_maps(model_state, new_physical_to_logical_map):
@@ -689,6 +697,31 @@ def apply_to_module(module) -> bool:
     target._commit_eplb_maps = commit_eplb_maps
     target.rearrange_expert_weights_inplace = rearrange_expert_weights_inplace
     setattr(target, _MARKER, wrappers)
+    setattr(target, _DELEGATES, delegates)
+    return True
+
+
+def compose_runtime(module, runtime) -> bool:
+    """Install runtime delegates without replacing the offline guard wrappers."""
+    target = load_exact_module(TARGET_MODULE, module)
+    if getattr(target, _MARKER, None) is None:
+        return False
+    apply_to_module(target)  # Keep the strict stale-wrapper identity check.
+    delegates = getattr(target, _DELEGATES, None)
+    if not isinstance(delegates, dict):
+        raise PatchCompatibilityError("Offline EPLB runtime delegates are missing")
+    if delegates["runtime"] is runtime:
+        return True
+    for name in ("step", "rearrange", "rearrange_expert_weights_inplace"):
+        if not callable(getattr(runtime, name, None)):
+            raise PatchCompatibilityError(f"EPLB runtime delegate is missing: {name}")
+    delegates["step"] = runtime.step
+    delegates["rearrange"] = runtime.rearrange
+    delegates["transfer"] = runtime.rearrange_expert_weights_inplace
+    delegates["runtime"] = runtime
+    # Runtime functions must observe the same record-only guards as upstream.
+    runtime._commit_eplb_maps = target._commit_eplb_maps
+    runtime.rearrange_expert_weights_inplace = target.rearrange_expert_weights_inplace
     return True
 
 

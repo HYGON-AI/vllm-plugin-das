@@ -202,7 +202,9 @@ def test_disabled_host_seq_lens_does_not_allocate_mirror(monkeypatch):
 
 
 def test_disabled_swa_decode_uses_baseline_branch(monkeypatch):
-    from vllm_hcu.v1.attention.backends import flash_attn
+    from tests.fixtures.flash_attention import load_hcu_flash_attention_module
+
+    flash_attn = load_hcu_flash_attention_module(monkeypatch)
 
     monkeypatch.setattr(flash_attn, "_SWA_DECODE_ENABLED", False)
     impl = SimpleNamespace(

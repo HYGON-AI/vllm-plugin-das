@@ -85,9 +85,14 @@ def apply_to_module(module: ModuleType) -> bool:
     from vllm.distributed.eplb.eplb_communicator import create_eplb_communicator
     from vllm_hcu.distributed import eplb_runtime
 
-    cls.step = eplb_runtime.step
+    from . import patch_offline_eplb
+
+    composed = patch_offline_eplb.compose_runtime(target, eplb_runtime)
+    if not composed:
+        cls.step = eplb_runtime.step
     cls._propagate_shared_tensors = eplb_runtime._propagate_shared_tensors
-    cls.rearrange = eplb_runtime.rearrange
+    if not composed:
+        cls.rearrange = eplb_runtime.rearrange
     target._move_to_workspace = eplb_runtime._move_to_workspace
     target.create_eplb_communicator = create_eplb_communicator
     remember_targets(target, _MARKER, TARGETS)

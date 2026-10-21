@@ -568,6 +568,12 @@ def test_installed_cli_defers_hcu_offline_eplb_fields_until_engine_args():
     result = _fresh_python(
         r'''
 import json
+import tempfile
+from transformers import Qwen3Config
+
+# Argument parsing requires a real local config, not an unmounted model path.
+model_directory = tempfile.TemporaryDirectory()
+Qwen3Config().save_pretrained(model_directory.name)
 
 from vllm.engine.arg_utils import EngineArgs
 from vllm.utils.argparse_utils import FlexibleArgumentParser
@@ -576,7 +582,7 @@ from vllm_hcu.patch.config import get_hcu_config
 parser = FlexibleArgumentParser()
 EngineArgs.add_cli_args(parser)
 namespace = parser.parse_args([
-    "--model", "/models/Hy4-preview-Channel-FP8-w8a8",
+    "--model", model_directory.name,
     "--eplb-config", json.dumps({
         "window_size": 16,
         "step_interval": 16,

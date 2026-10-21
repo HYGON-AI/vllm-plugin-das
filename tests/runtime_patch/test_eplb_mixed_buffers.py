@@ -438,7 +438,16 @@ from vllm_hcu.distributed import eplb_runtime, eplb_transfer_runtime
 assert async_worker.transfer_layer is eplb_transfer_runtime.transfer_layer
 assert rebalance_execute.transfer_layer is eplb_transfer_runtime.transfer_layer
 assert eplb_state._move_to_workspace is eplb_runtime._move_to_workspace
-assert eplb_state.EplbState.step is eplb_runtime.step
+from vllm_hcu.patch.worker.framework_opt import patch_offline_eplb, patch_step5_eplb_state
+offline_wrappers = getattr(eplb_state, patch_offline_eplb._MARKER)
+delegates = getattr(eplb_state, patch_offline_eplb._DELEGATES)
+assert eplb_state.EplbState.step is offline_wrappers[1]
+assert delegates["step"] is eplb_runtime.step
+assert delegates["rearrange"] is eplb_runtime.rearrange
+assert eplb_runtime._commit_eplb_maps is eplb_state._commit_eplb_maps
+assert eplb_runtime.rearrange_expert_weights_inplace is eplb_state.rearrange_expert_weights_inplace
+assert patch_offline_eplb.apply_to_module(eplb_state) is False
+assert patch_step5_eplb_state.apply_to_module(eplb_state) is False
 assert eplb_state.create_eplb_communicator is eplb_communicator.create_eplb_communicator
 assert hasattr(eplb_communicator, '_vllm_hcu_step5_eplb_communicator_applied')
 from vllm_hcu.patch.worker.framework_opt import patch_step5_eplb_communicator
