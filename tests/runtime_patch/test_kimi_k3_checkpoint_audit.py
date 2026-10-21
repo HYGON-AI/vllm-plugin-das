@@ -92,6 +92,36 @@ def test_small_full_contract_passes(tmp_path):
     assert sum(result['route_counts'].values()) == result['language_tensor_count']
 
 
+def test_audit_accepts_packed_experts_without_ignore(tmp_path):
+    _write(tmp_path)
+
+    result = audit_module.audit(tmp_path)
+
+    assert result['passed'] and not result['errors']
+    assert result['route_counts']['packed_expert'] > 0
+
+
+@pytest.mark.parametrize('selector', [
+    'language_model.model.layers.1.block_sparse_moe.experts',
+    r're:language_model\.model\.layers\.1\.block_sparse_moe\.experts$',
+])
+def test_audit_rejects_ignored_packed_experts(tmp_path, selector):
+    _write(tmp_path)
+    config_path = tmp_path / 'config.json'
+    raw = json.loads(config_path.read_text())
+    raw['compression_config']['ignore'].append(selector)
+    config_path.write_text(json.dumps(raw))
+
+    result = audit_module.audit(tmp_path)
+
+    assert not result['passed']
+    assert any(
+        'Packed expert route ignored by effective quantization config' in error
+        and 'language_model.model.layers.1.block_sparse_moe.experts' in error
+        for error in result['errors']
+    )
+
+
 @pytest.mark.parametrize(
     'case', ['empty_include', 'missing_kda_branches', 'ignored_kda_branch']
 )
@@ -200,6 +230,30 @@ def test_audit_rejects_missing_unknown_or_invalid_parameters(tmp_path, case):
     _write(tmp_path, mutate)
     result = audit_module.audit(tmp_path)
     assert not result['passed'] and result['errors']
+
+
+@pytest.mark.parametrize('projection', ['w1', 'w2', 'w3'])
+@pytest.mark.parametrize('bad_value', [float('nan'), float('inf'), float('-inf')])
+def test_audit_rejects_nonfinite_packed_expert_scales(
+    tmp_path, projection, bad_value
+):
+    def mutate(entries):
+        key = (
+            'language_model.model.layers.1.block_sparse_moe.experts.0.'
+            f'{projection}.weight_scale'
+        )
+        entries[key]['value'] = bad_value
+
+    _write(tmp_path, mutate)
+
+    result = audit_module.audit(tmp_path)
+
+    assert not result['passed']
+    assert any(
+        'Invalid packed-expert scale values' in error
+        and f'.{projection}.weight_scale' in error
+        for error in result['errors']
+    )
 
 
 @pytest.mark.parametrize('case', ['past_eof', 'negative', 'reversed', 'truncated', 'vision'])

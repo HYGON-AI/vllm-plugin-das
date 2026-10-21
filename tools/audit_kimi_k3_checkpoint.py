@@ -262,6 +262,22 @@ def validate_quantization_routes(schema, quant, errors):
     )
     _validate_selector_patterns('compression_config.ignore', ignore, errors)
 
+    # RoutedExperts uses its ``.experts`` module prefix for quant-method
+    # selection. Its packed INT4 checkpoint tensors are not governed by the
+    # W8A8 include list, but an ignore match switches the runtime to an
+    # unquantized method that cannot consume these packed weights and scales.
+    packed_expert_modules = {
+        name.split('.experts.*.', 1)[0] + '.experts'
+        for name, spec in schema.items()
+        if spec['route'] == 'packed_expert' and '.experts.*.' in name
+    }
+    for module in sorted(packed_expert_modules):
+        if _selector_matches(module, ignore):
+            errors.append(
+                f'Packed expert route ignored by effective quantization config: '
+                f'{module}'
+            )
+
     modules = {}
     for name, spec in schema.items():
         route = spec['route']
@@ -400,17 +416,23 @@ def audit(root, tp=16):
                 if info['dtype'] != spec['dtype'] or info['shape'] != spec['shape']:
                     errors.append(f'Shape/dtype mismatch: {name}')
                     continue
-                if name.endswith('.weight_scale') and spec['route'] != 'packed_expert':
+                if name.endswith('.weight_scale'):
                     stream.seek(8 + size + start)
                     data = stream.read(end - start)
                     values = array.array('f')
                     values.frombytes(data)
                     if sys.byteorder != 'little':
                         values.byteswap()
-                    if len(data) != end-start or not all(math.isfinite(v) and v > 0 for v in values):
-                        errors.append(f'Invalid W8A8 scale values: {name}')
-                    w8_scales += 1
-                    w8_values += len(values)
+                    valid_values = all(math.isfinite(v) for v in values)
+                    if spec['route'] == 'packed_expert':
+                        if len(data) != end-start or not valid_values:
+                            errors.append(f'Invalid packed-expert scale values: {name}')
+                    else:
+                        if (len(data) != end-start or not valid_values
+                                or not all(v > 0 for v in values)):
+                            errors.append(f'Invalid W8A8 scale values: {name}')
+                        w8_scales += 1
+                        w8_values += len(values)
     for name, spec in schema.items():
         if counts[name] != spec['count']:
             errors.append(f'Missing/excess tensor: {name}: {counts[name]} != {spec["count"]}')
