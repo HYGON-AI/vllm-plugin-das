@@ -92,7 +92,7 @@ RUN TORCH_TAG="torch${TORCH_VERSION//./}" \
     # tilelang 放最后: 安装真实包会替换上面 vLLM 层写的 0.1.10 stub, 之后不应再有触发 vllm 依赖解析的安装
     && das-install tilelang ${TORCH_TAG} \
     && pip install --no-cache-dir apache-tvm-ffi==0.1.11 \
-    && pip install --no-cache-dir numpy==2.0.2 \
+    && pip install --no-cache-dir numpy==2.1.0 \
     && pip cache purge
     
 
