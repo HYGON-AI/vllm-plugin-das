@@ -228,8 +228,8 @@ INCREMENTAL_REVALIDATION_PERFORMED=NONE
 
 ## Evidence
 
-Host path (not shipped in the repo):
-`/public/home/liumengjie/vllm028-work/experiments/AIOPT-1269/C1_CURRENT_MAINLINE_56d23cd/`
+Host evidence root (not shipped in the repo):
+`<host-evidence-root>/experiments/AIOPT-1269/C1_CURRENT_MAINLINE_56d23cd/`
 
 - `evidence/impact_ledger.md`
 - `evidence/runtime_preflight.txt`
