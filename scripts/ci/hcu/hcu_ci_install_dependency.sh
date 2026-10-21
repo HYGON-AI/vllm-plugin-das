@@ -34,3 +34,8 @@ if missing:
     raise SystemExit(f"HCU CI image is missing required distributions: {missing}")
 print(f"python={sys.version}")
 PY
+
+# Evaluation jobs may bootstrap their declared evaluator in the ephemeral container.
+docker exec --workdir /vllm-plugin-das "$container_name" \
+  bash -lc \
+  'source /opt/dtk/env.sh && exec /usr/local/bin/hcu-ci-python .github/scripts/hcu_ci/ensure_evalscope.py'

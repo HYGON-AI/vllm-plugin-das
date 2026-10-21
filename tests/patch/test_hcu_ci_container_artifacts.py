@@ -55,14 +55,14 @@ def artifact_runtime(tmp_path: Path):
     (reports / "nested logs" / "server.log").write_text("complete\n")
     workspace = tmp_path / "workspace"
     workspace.mkdir()
-    destination = tmp_path / "host reports"
+    destination = tmp_path / "upload staging"
     calls = tmp_path / "docker.jsonl"
     removed = tmp_path / "removed"
     env = dict(
         os.environ,
         PATH=str(binaries) + os.pathsep + os.environ["PATH"],
         HCU_CI_CONTAINER_NAME="hcu_ci_artifact_test",
-        HCU_CI_HOST_JOB_ROOT=str(destination),
+        HCU_CI_UPLOAD_ROOT=str(destination),
         GITHUB_WORKSPACE=str(workspace),
         FAKE_DOCKER_LOG=str(calls),
         FAKE_ARTIFACTS=str(reports),
@@ -116,7 +116,7 @@ def test_cleanup_preserves_stopped_container_when_export_fails(artifact_runtime)
 
 def test_cleanup_without_artifact_destination_still_removes_container(artifact_runtime):
     env, _, destination, calls, removed = artifact_runtime
-    env.pop("HCU_CI_HOST_JOB_ROOT")
+    env.pop("HCU_CI_UPLOAD_ROOT")
 
     result = _run_cleanup(env)
 
@@ -135,3 +135,48 @@ def test_cleanup_does_not_export_when_start_never_created_container(artifact_run
     assert result.returncode == 0, result.stdout + result.stderr
     assert "cp" not in [args[0] for args in _commands(calls)]
     assert not destination.exists()
+
+def _artifact_step(name: str):
+    import yaml
+
+    workflow = yaml.safe_load(
+        (REPOSITORY / ".github/workflows/_selected-hcu-tests.yml").read_text()
+    )
+    return next(step for step in workflow["jobs"]["hcu"]["steps"] if step["name"] == name)
+
+
+def test_upload_staging_is_temporary_and_removed_after_upload(tmp_path: Path):
+    temporary = tmp_path / "runner temporary"
+    temporary.mkdir()
+    env_file, outputs = tmp_path / "env", tmp_path / "outputs"
+    env = dict(os.environ, RUNNER_TEMP=str(temporary), GITHUB_ENV=str(env_file), GITHUB_OUTPUT=str(outputs))
+    prepare = _artifact_step("Prepare HCU artifact upload")
+    subprocess.run(["bash", "-c", prepare["run"]], env=env, check=True)
+    values = dict(line.split("=", 1) for line in env_file.read_text().splitlines())
+    staging = Path(values["HCU_CI_UPLOAD_ROOT"])
+    assert staging.parent == temporary
+    assert dict(line.split("=", 1) for line in outputs.read_text().splitlines())["path"] == str(staging)
+    (staging / "pytest.xml").write_text("report")
+    neighbor = temporary / "other-job"
+    neighbor.mkdir()
+    (neighbor / "keep").write_text("keep")
+
+    remove = _artifact_step("Remove uploaded HCU temporary reports")
+    subprocess.run(["bash", "-c", remove["run"]], env=dict(env, **values), check=True)
+
+    assert not staging.exists()
+    assert (neighbor / "keep").read_text() == "keep"
+
+
+def test_upload_cleanup_rejects_an_unrelated_directory(tmp_path: Path):
+    unrelated = tmp_path / "other-job"
+    unrelated.mkdir()
+    (unrelated / "keep").write_text("keep")
+    env = dict(os.environ, RUNNER_TEMP=str(tmp_path), HCU_CI_UPLOAD_ROOT=str(unrelated))
+
+    remove = _artifact_step("Remove uploaded HCU temporary reports")
+    result = subprocess.run(["bash", "-c", remove["run"]], env=env, capture_output=True, text=True)
+
+    assert result.returncode != 0
+    assert "Refusing to remove" in result.stderr
+    assert (unrelated / "keep").read_text() == "keep"

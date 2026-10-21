@@ -25,12 +25,12 @@ if docker inspect "$container_name" >/dev/null 2>&1; then
   # Release devices and freeze the reports before copying. docker cp also works
   # for a container that exited before cleanup (when docker exec/stop cannot).
   docker stop --time 5 "$container_name" >/dev/null 2>&1 || true
-  if [[ -n "${HCU_CI_HOST_JOB_ROOT:-}" ]]; then
+  if [[ -n "${HCU_CI_UPLOAD_ROOT:-}" ]]; then
     # Some runner Docker policies reject /tmp bind mounts. Keep the reports
-    # container-local during execution and export them as the invoking user.
+    # container-local during execution and stage them for upload as the invoking user.
     # Retain the stopped container if export fails so reports remain recoverable.
-    if ! mkdir -p "$HCU_CI_HOST_JOB_ROOT" \
-        || ! docker cp "$container_name:/hcu-ci-artifacts/." "$HCU_CI_HOST_JOB_ROOT/"; then
+    if ! mkdir -p "$HCU_CI_UPLOAD_ROOT" \
+        || ! docker cp "$container_name:/hcu-ci-artifacts/." "$HCU_CI_UPLOAD_ROOT/"; then
       echo "HCU artifact export failed; retaining stopped container $container_name for recovery" >&2
       artifact_export_status=1
     fi
@@ -89,5 +89,5 @@ repair_path() {
 }
 
 repair_path "${GITHUB_WORKSPACE:-}"
-repair_path "${HCU_CI_HOST_JOB_ROOT:-}"
+repair_path "${HCU_CI_UPLOAD_ROOT:-}"
 exit "$artifact_export_status"

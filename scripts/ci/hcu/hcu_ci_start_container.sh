@@ -7,7 +7,6 @@ set -euo pipefail
 image="${HCU_CI_IMAGE:-}"
 container_name="${HCU_CI_CONTAINER_NAME:-}"
 workspace="${GITHUB_WORKSPACE:-$(pwd)}"
-artifact_root="${HCU_CI_HOST_JOB_ROOT:-}"
 model_root="${HCU_CI_MODEL_ROOT:-${VLLM_HCU_TEST_MODEL_ROOT:-}}"
 dataset_root="${HCU_CI_DATASET_ROOT:-${VLLM_HCU_TEST_DATASET_ROOT:-}}"
 
@@ -16,7 +15,6 @@ while [[ $# -gt 0 ]]; do
     --image) image="$2"; shift 2 ;;
     --container-name) container_name="$2"; shift 2 ;;
     --workspace) workspace="$2"; shift 2 ;;
-    --artifact-root) artifact_root="$2"; shift 2 ;;
     *) echo "unknown argument: $1" >&2; exit 2 ;;
   esac
 done
@@ -26,8 +24,8 @@ if [[ -z "$image" ]]; then
   image="$("$script_dir/hcu_ci_resolve_image.sh")"
 fi
 
-if [[ -z "$image" || -z "$container_name" || -z "$artifact_root" ]]; then
-  echo "HCU CI image, container name, and host artifact root are required" >&2
+if [[ -z "$image" || -z "$container_name" ]]; then
+  echo "HCU CI image and container name are required" >&2
   exit 2
 fi
 if [[ ! "$container_name" =~ ^[a-zA-Z0-9][a-zA-Z0-9_.-]*$ ]]; then
@@ -42,8 +40,6 @@ if [[ "${HCU_CI_ALLOW_MUTABLE_IMAGE:-0}" != "1" \
 fi
 
 workspace="$(realpath "$workspace")"
-mkdir -p "$artifact_root"
-artifact_root="$(realpath "$artifact_root")"
 
 if [[ "${HCU_CI_SKIP_PULL:-0}" != "1" && ! "$image" =~ ^sha256:[0-9a-fA-F]{64}$ ]]; then
   docker pull "$image"

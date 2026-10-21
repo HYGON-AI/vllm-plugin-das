@@ -254,7 +254,7 @@
         {
           "kind": "model",
           "env": "VLLM_HCU_DEEPSEEK_R1_CHANNEL_INT8_MODEL",
-          "relative": "vllm-w8a8-models/DeepSeek-R1-0528-Channel-INT8"
+          "relative": "vllm-w8a8-models/DeepSeek-R1-0528-Channel-INT8-w8a8"
         }
       ]
     },
