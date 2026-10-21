@@ -27,8 +27,10 @@ from vllm_hcu.moe_config_env import (
 
 REPOSITORY = Path(__file__).resolve().parents[2]
 
-# The MTP draft-layer MoE of Step5: 352 routed experts over EP8, so E=44 is the
-# local expert count, N is `moe_intermediate_size` and K is `hidden_size`.
+# The target-model bf16 MoE layers 88-90 of Step5: 352 routed experts over
+# EP8, so E=44 is the local expert count, N is `moe_intermediate_size` and
+# K is `hidden_size`. The MTP draft layers 92-94 are dense and contain no
+# MoE; this table is not an MTP MoE tuning.
 DRAFT_MOE_E = 44
 DRAFT_MOE_N = 1536
 DRAFT_MOE_K = 4096

@@ -1,11 +1,27 @@
 # AIOPT-1269 C1 — Frozen-base current-mainline reintegration
 
-Status: C1 (Step5 MTP draft-layer MoE fixed-shape specialization) reintegrated
-onto the frozen `v0.28.1-dev` head `56d23cd` and revalidated on nmz106.
+Status: C1 (target-model bf16 MoE layers 88-90 fixed-shape specialization)
+reintegrated onto the frozen `v0.28.1-dev` head `56d23cd` and revalidated on
+nmz106.
 
 This document reports the **frozen-base revalidation**. The historical
 `+1.007%` / `-0.989%` / `+0.085%` result on the earlier lineage remains a
 historical reference only; it is not an acceptance threshold for this round.
+
+## Target correction (supersedes the original C1 commit narrative)
+
+The original C1 commit `67b757d` and earlier drafts described the target as
+"Step5 MTP draft-layer MoE". That wording is incorrect and is superseded by
+this document:
+
+- C1 targets the **target-model bf16 MoE layers 88-90** (E=44 local after
+  EP8, N=1536, K=4096, topk 8; decode config-lookup M≈128).
+- Those layers run the unquantized **TRITON `TritonExperts`** path
+  (`fused_moe_kernel`), 2 GEMM launches per layer = 6 launches per decode
+  step.
+- **MTP draft layers 92-94 are dense** (`mlp.*`, no `moe.*`); they contain no
+  MoE.
+- C1 is a target-model bf16 MoE tile specialization, **not MTP MoE tuning**.
 
 ## Frozen base
 
@@ -130,14 +146,20 @@ pin fix); C1 arm = `67b757d` (+ C1 diff only).
 | 3 | 1388.873 | 1399.747 | +0.783% |
 
 ```
+CURRENT_MAINLINE_E2E_DIRECTION=POSITIVE_WEAK
+CURRENT_MAINLINE_E2E_MEDIAN=+0.56%
+CURRENT_MAINLINE_PAIRED_WINS=2/3
+CURRENT_MAINLINE_ITL_DELTA=-0.28%
+CURRENT_MAINLINE_PREFILL_DELTA=+0.22%
+
 E2E_VALID_PAIRS=3
 PAIRED_WINS=2/3
 A0_MEDIAN_DECODE=1392.022
 C1_MEDIAN_DECODE=1399.747
-MEDIAN_DECODE_DELTA_PERCENT=+0.555
-MEAN_DECODE_DELTA_PERCENT=+0.273
-ITL_DELTA_PERCENT=-0.575
-PREFILL_DELTA_PERCENT=+0.200
+MEDIAN_DECODE_DELTA_PERCENT=+0.56
+MEAN_DECODE_DELTA_PERCENT=+0.27
+ITL_DELTA_PERCENT=-0.28        (mean of life means: 64.11 -> 63.93 ms, -0.18 ms)
+PREFILL_DELTA_PERCENT=+0.22    (mean of life means)
 MTP_ACCEPTANCE_DELTA=0.000000
 REQUEST_FAILURES=0        (384 complete / 0 incomplete; 0 preemptions)
 SERVER_5XX=0
@@ -149,11 +171,19 @@ STABILITY=PASS            (6/6 lives READY, 12/12 formal cases rc=0,
                            health 200, GPU_RELEASED=YES after every life)
 ```
 
+Aggregation: the decode median is the ratio of the three life medians; the
+mean and the ITL/prefill deltas are means of the three life means (the frozen
+convention). `evidence/e2e_frozen_base_summary.json` also records a
+ratio-of-medians `itl_delta_percent` (-0.575%); that field is a different
+aggregation and is **not** the current-mainline ITL delta reported here.
+
 The frozen extension rule (3/3 positive and stable) was **not** met:
 PAIR2 is −0.001%, a statistical tie. The run therefore stopped at the
-required 3 pairs and was **not** extended to 5. The 3-pair median, mean and
-ITL are positive; the result is reported on its own merits. The historical
-`+1.007%` was not used as an acceptance threshold.
+required 3 pairs and was **not** extended to 5. The current-mainline result
+is classified **POSITIVE_WEAK** (median decode +0.56%, 2/3 paired wins,
+ITL -0.28%); it is reported on its own merits. The historical `+1.007%` is
+**not** current-mainline performance and was not used as an acceptance
+threshold.
 
 ## Historical C1 result — reference only
 
@@ -175,12 +205,13 @@ acceptance evidence.
 
 ```
 merge-base(56d23cd, HEAD)=56d23cd
-commits=3 (pin fix + C1 + this delivery doc)
-files=8 (7 code files +571 lines, plus this doc)
+commits=4 (pin fix + C1 + delivery doc + target/metrics correction)
+files=8 (7 code files +573 lines, plus this doc)
 OLD_PATCH_CHAIN_INCLUDED=NO
 UNRELATED_COMMITS=NO
 UNRELATED_DIFF=NO
 SCOPE_CONTAMINATION=NO
+CORRECTION_COMMIT=DOC_AND_TEST_COMMENT_ONLY
 ```
 
 ## Delivery drift
@@ -207,4 +238,3 @@ Host path (not shipped in the repo):
 - `evidence/local_bench_current_mainline.json` / `.log`
 - `evidence/e2e_frozen_base_summary.{json,txt}`
 - `harness/runs/<RUN_ID>/` — 3 paired clean-restart lives
-
