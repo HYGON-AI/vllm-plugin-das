@@ -57,6 +57,17 @@ def compute_aligned_M_and_alignment(
         # lag a post-dispatch expert remap, so it may raise the bound but must
         # never shrink the worst-case workspace derived from the routed batch.
         alignment = max(alignment, _HCU_TOKEN_ALIGNMENT)
+        # A provenance-tagged DeepEP HT layout is already post-EPLB physical
+        # routing, unlike generic metadata that may precede an expert remap.
+        # Preserve the conservative fallback for mismatched chunks/alignment.
+        layout = getattr(expert_tokens_meta, "_hcu_deepep_ht_layout", None)
+        if (
+            henvs.optional_custom_op_enabled(henvs.VLLM_HCU_DEEPEP_HT_EXACT_LAYOUT)
+            and alignment == _HCU_TOKEN_ALIGNMENT
+            and layout is not None
+            and layout[:3] == (M, num_topk, local_num_experts)
+        ):
+            return layout[3], alignment
         M_sum_upper = round_up(
             (M * num_topk) + local_num_experts * (alignment - 1), alignment
         )

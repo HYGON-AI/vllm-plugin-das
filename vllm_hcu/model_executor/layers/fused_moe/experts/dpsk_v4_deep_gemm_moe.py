@@ -10,6 +10,7 @@ activation scales.
 """
 
 import functools
+import threading
 
 import torch
 
@@ -53,6 +54,9 @@ from vllm_hcu.platforms import envs as henvs
 # present in the normal engine log (``vllm_hcu.*`` has no configured handler).
 logger = init_logger("vllm.hcu.deepseek_v4_deepep_experts")
 
+_PACKED_LAYOUT_PROBE_CACHE: dict[tuple[object, ...], bool] = {}
+_PACKED_LAYOUT_PROBE_LOCK = threading.Lock()
+
 
 @functools.lru_cache(maxsize=None)
 def _deepgemm_op(name: str):
@@ -61,6 +65,12 @@ def _deepgemm_op(name: str):
     import deepgemm
 
     return getattr(deepgemm, name)
+
+
+def _shared_ht_ll_weights_enabled() -> bool:
+    return henvs.optional_custom_op_enabled(
+        henvs.VLLM_HCU_DEEPEP_AUTO_SHARED_WEIGHTS
+    )
 
 
 def marlin_fp8_contiguous_weight(weight: torch.Tensor) -> torch.Tensor:
@@ -759,6 +769,8 @@ class DeepEPDeepGemmMaskedExperts(DeepEPDeepGemmContiguousExperts):
 class DeepEPAutoDeepGemmExperts(mk.FusedMoEExpertsModular):
     """Select a per-forward or role-fixed DeepGEMM expert layout."""
 
+    SHARED_LAYOUT = "contiguous=masked"
+
     def __init__(
         self,
         moe_config: FusedMoEConfig,
@@ -766,6 +778,7 @@ class DeepEPAutoDeepGemmExperts(mk.FusedMoEExpertsModular):
         max_num_tokens: int,
         num_dispatchers: int,
         fixed_use_low_latency: bool | None = None,
+        global_ht_token_bound: bool = False,
     ):
         # The expert base validates one fixed activation format, while this
         # adapter can own both. Initialize its public state using the same
@@ -775,6 +788,7 @@ class DeepEPAutoDeepGemmExperts(mk.FusedMoEExpertsModular):
         self.max_num_tokens = max_num_tokens
         self.num_dispatchers = num_dispatchers
         self._fixed_use_low_latency = fixed_use_low_latency
+        self._global_ht_token_bound = global_ht_token_bound
         self._use_low_latency_snapshot = False
         if fixed_use_low_latency is not True:
             self.ht_experts = DeepEPDeepGemmContiguousExperts(
@@ -817,6 +831,19 @@ class DeepEPAutoDeepGemmExperts(mk.FusedMoEExpertsModular):
             "_dsv4_channel_deepgemm_layout",
             None,
         )
+        if packed_layout == self.SHARED_LAYOUT:
+            if (
+                layer.w13_weight.dim() in (6, 7)
+                and layer.w2_weight.dim() == layer.w13_weight.dim()
+            ):
+                self._bind_shared(layer)
+                return
+            if not self.ht_experts._can_pack_channel_weights(layer):
+                raise RuntimeError(
+                    "DeepEP auto DeepGEMM layer has invalid reloaded weights: "
+                    f"w13={tuple(layer.w13_weight.shape)} "
+                    f"w2={tuple(layer.w2_weight.shape)}"
+                )
         if packed_layout == "contiguous+masked":
             ll_w13 = getattr(
                 layer,
@@ -848,7 +875,7 @@ class DeepEPAutoDeepGemmExperts(mk.FusedMoEExpertsModular):
                     f"w2={tuple(layer.w2_weight.shape)}"
                 )
         if packed_layout is not None:
-            if packed_layout != "contiguous+masked":
+            if packed_layout not in ("contiguous+masked", self.SHARED_LAYOUT):
                 raise RuntimeError(
                     "DeepEP auto DeepGEMM requires unpacked channel-wise "
                     "FP8 or INT8 weights, "
@@ -862,6 +889,27 @@ class DeepEPAutoDeepGemmExperts(mk.FusedMoEExpertsModular):
 
         w13 = layer.w13_weight
         w2 = layer.w2_weight
+        if _shared_ht_ll_weights_enabled() and self._packers_share_layout(w13, w2):
+            # On gfx938/gfx92a the contiguous and masked packers emit the same
+            # bytes, so one resident copy serves both delegates (and EPLB only
+            # has to move the registered parameters).
+            with torch.no_grad():
+                w13_packed, w2_packed = self.ht_experts._pack_channel_weights(
+                    w13, w2
+                )
+            replace_parameter(layer, "w13_weight", w13_packed)
+            replace_parameter(layer, "w2_weight", w2_packed)
+            for name in (
+                "_dsv4_channel_deepgemm_masked_w13",
+                "_dsv4_channel_deepgemm_masked_w2",
+            ):
+                if hasattr(layer, name):
+                    delattr(layer, name)
+            self._bind_shared(layer)
+            layer._dsv4_channel_deepgemm_layout = self.SHARED_LAYOUT
+            layer._dsv4_channel_deepgemm_repacked = True
+            del w13, w2
+            return
         with torch.no_grad():
             # Both HCU Marlin packers rearrange their input storage in place
             # and return a view of that same storage.  Preserve independent
@@ -884,6 +932,68 @@ class DeepEPAutoDeepGemmExperts(mk.FusedMoEExpertsModular):
         layer._dsv4_channel_deepgemm_layout = "contiguous+masked"
         layer._dsv4_channel_deepgemm_repacked = True
         del w13, w2
+
+    def _bind_shared(self, layer: torch.nn.Module) -> None:
+        for child in (self.ht_experts, self.ll_experts):
+            child._deepgemm_w13 = layer.w13_weight
+            child._deepgemm_w2 = layer.w2_weight
+
+    def _packers_share_layout(self, w13: torch.Tensor, w2: torch.Tensor) -> bool:
+        use_int8 = bool(
+            getattr(getattr(self, "quant_config", None), "use_int8_w8a8", False)
+        )
+        cache_key = (
+            type(self.ht_experts)._pack_channel_weights,
+            type(self.ll_experts)._pack_channel_weights,
+            marlin_i8_contiguous_weight if use_int8 else marlin_fp8_contiguous_weight,
+            marlin_i8_masked_weight if use_int8 else marlin_fp8_masked_weight,
+            w13.device.type,
+            w13.device.index,
+            w13.dtype,
+            tuple(w13.shape[1:]),
+            w2.device.type,
+            w2.device.index,
+            w2.dtype,
+            tuple(w2.shape[1:]),
+        )
+        with _PACKED_LAYOUT_PROBE_LOCK:
+            cached = _PACKED_LAYOUT_PROBE_CACHE.get(cache_key)
+            if cached is not None:
+                return cached
+            shared = self._probe_packers_share_layout(w13, w2)
+            _PACKED_LAYOUT_PROBE_CACHE[cache_key] = shared
+            return shared
+
+    def _probe_packers_share_layout(
+        self, w13: torch.Tensor, w2: torch.Tensor
+    ) -> bool:
+        # Probe one random expert: the packers are pure per-expert byte
+        # permutations, so equal output on random bytes means equal layouts.
+        def probe(weight: torch.Tensor) -> torch.Tensor:
+            raw = torch.randint(
+                -128, 128, (1, *weight.shape[1:]),
+                dtype=torch.int8, device=weight.device,
+            )
+            return raw.view(weight.dtype)
+
+        with torch.no_grad():
+            p13, p2 = probe(w13), probe(w2)
+            ht = self.ht_experts._pack_channel_weights(p13.clone(), p2.clone())
+            ll = self.ll_experts._pack_channel_weights(p13.clone(), p2.clone())
+            shared = all(
+                a.shape == b.shape
+                and a.stride() == b.stride()
+                and torch.equal(
+                    a.contiguous().view(torch.int8), b.contiguous().view(torch.int8)
+                )
+                for a, b in zip(ht, ll)
+            )
+        logger.info_once(
+            "DeepEP auto DeepGEMM: HT/LL packed layouts %s; keeping %s.",
+            "match" if shared else "differ",
+            "one shared copy" if shared else "two copies",
+        )
+        return shared
 
     @staticmethod
     def _supports_current_device() -> bool:
@@ -975,9 +1085,13 @@ class DeepEPAutoDeepGemmExperts(mk.FusedMoEExpertsModular):
         # workspace calculation expands rows by top-k and expert alignment.
         # Keep output at the real M because only temporary workspaces need the
         # conservative bound before vLLM locks the shared workspace.
-        max_received_tokens = int(self.moe_config.max_num_tokens) * int(
-            self.num_dispatchers
-        )
+        max_received_tokens = int(self.moe_config.max_num_tokens)
+        if getattr(self, "_global_ht_token_bound", False):
+            # PCP has already gathered one global batch per DP replica. HT can
+            # still receive that bound independently from every DP replica.
+            max_received_tokens *= int(getattr(self.moe_config, "dp_size", 1))
+        else:
+            max_received_tokens *= int(self.num_dispatchers)
         if max_received_tokens <= M:
             return workspace13, workspace2, output
         reserve13, reserve2, _ = current.workspace_shapes(
@@ -1049,12 +1163,14 @@ class DeepEPAutoW4A8Experts(DeepEPAutoDeepGemmExperts):
         max_num_tokens: int,
         num_dispatchers: int,
         fixed_use_low_latency: bool | None = None,
+        global_ht_token_bound: bool = False,
     ):
         self.moe_config = moe_config
         self.quant_config = quant_config
         self.max_num_tokens = max_num_tokens
         self.num_dispatchers = num_dispatchers
         self._fixed_use_low_latency = fixed_use_low_latency
+        self._global_ht_token_bound = global_ht_token_bound
         self._use_low_latency_snapshot = False
         if fixed_use_low_latency is not True:
             self.ht_experts = DeepEPDeepGemmW4A8ContiguousExperts(
@@ -1250,8 +1366,24 @@ def _make_deepep_auto_deepgemm_moe_kernel(
         dspark_mooncake_pd_use_low_latency,
     )
 
-    fixed_use_low_latency = dspark_mooncake_pd_use_low_latency(
-        get_current_vllm_config_or_none()
+    vllm_config = get_current_vllm_config_or_none()
+    fixed_use_low_latency = dspark_mooncake_pd_use_low_latency(vllm_config)
+    from vllm_hcu.deepseek_v4_runtime import model_architectures
+
+    # DeepSeek V4 PCP gathers the local PCP slices before routing, so
+    # moe_config.max_num_tokens is already the global token bound for one DP
+    # replica. Multiplying it by the PCP/EP dispatcher count reserves that
+    # global batch once per dispatcher (32768 * 8 in PCP8 DP1) and can create
+    # a 24.5 GiB warmup buffer. workspace_shapes retains only the DP factor.
+    # Keep the conservative per-dispatcher bound from 2434b9b6 for every other
+    # model and for non-PCP DeepSeek V4 deployments.
+    is_native_deepseek_v4 = not {
+        "DeepseekV4ForCausalLM",
+        "DeepSeekV4MTPModel",
+    }.isdisjoint(model_architectures(vllm_config))
+    global_ht_token_bound = bool(
+        is_native_deepseek_v4
+        and int(getattr(moe_config, "pcp_size", 1)) > 1
     )
     if experts_cls is None:
         experts_cls = DeepEPAutoDeepGemmExperts
@@ -1261,6 +1393,7 @@ def _make_deepep_auto_deepgemm_moe_kernel(
         max_num_tokens=max_num_tokens,
         num_dispatchers=prepare_finalize.num_dispatchers(),
         fixed_use_low_latency=fixed_use_low_latency,
+        global_ht_token_bound=global_ht_token_bound,
     )
     if fixed_use_low_latency is None:
         logger.info_once("Using DeepEP auto MoE kernel with HT/LL experts.")

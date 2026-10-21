@@ -293,10 +293,31 @@ def apply_to_module(module: ModuleType) -> bool:
     @functools.wraps(get_weights)
     def hcu_get_expert_weights(self):
         if getattr(self, "_dsv4_channel_deepgemm_repacked", False):
-            names = ("w13_weight", "w2_weight", "w13_weight_scale", "w2_weight_scale")
+            names = [
+                "w13_weight",
+                "w2_weight",
+                "w13_weight_scale",
+                "w2_weight_scale",
+            ]
+            if (
+                getattr(self, "_dsv4_channel_deepgemm_layout", None)
+                == "contiguous+masked"
+            ):
+                # The auto kernel keeps independent HT and LL packed copies
+                # when their layouts cannot be shared. Both copies must move
+                # in the same online EPLB transaction before routing maps are
+                # committed.
+                names.extend(
+                    (
+                        "_dsv4_channel_deepgemm_masked_w13",
+                        "_dsv4_channel_deepgemm_masked_w2",
+                    )
+                )
             weights = [getattr(self, name, None) for name in names]
             if all(weight is not None for weight in weights):
-                return [weight.view(self.local_num_experts, -1) for weight in weights]
+                return [
+                    weight.view(self.local_num_experts, -1) for weight in weights
+                ]
             missing = [name for name, value in zip(names, weights) if value is None]
             raise RuntimeError(
                 "HCU DeepGEMM repacked layer is missing expert weights: "

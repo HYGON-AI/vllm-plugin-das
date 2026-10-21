@@ -209,6 +209,8 @@ _CORE_CALLBACKS: tuple[_CallbackSpec, ...] = (
     _CallbackSpec(_adapter("core_fix", "patch_deepseek_v4_bf16_compressor")),
     _CallbackSpec(_adapter("core_fix", "patch_deepseek_v4_c128_splits")),
     _CallbackSpec(_adapter("core_fix", "patch_deepseek_v4_load_weights")),
+    _CallbackSpec(_adapter("core_fix", "patch_deepseek_v4_eplb")),
+    _CallbackSpec(_adapter("core_fix", "patch_deepseek_v4_mtp_eplb")),
     _CallbackSpec(_adapter("core_fix", "patch_deepseek_v4_dspark_target")),
     _CallbackSpec(
         _adapter("core_fix", "patch_deepseek_v4_rocm_compressor_fusion")
