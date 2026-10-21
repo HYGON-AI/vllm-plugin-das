@@ -371,7 +371,7 @@ def audit(root, tp=16):
         index = {}
     shards = {}
     for name, shard in index.items():
-        if not isinstance(name, str) or not name:
+        if not isinstance(name, str) or not name or name == '__metadata__':
             errors.append(f'Invalid weight_map tensor name: {name!r}')
             continue
         if not isinstance(shard, str) or not shard or '\0' in shard:
@@ -387,9 +387,14 @@ def audit(root, tp=16):
     vision = 0
     selected_routes = validate_quantization_routes(schema, quant, errors)
     for shard, indexed in sorted(shards.items()):
-        path = (root / shard).resolve()
+        try:
+            path = (root / shard).resolve()
+        except (OSError, RuntimeError, ValueError) as exc:
+            errors.append(f'Invalid shard path: {shard!r}: {exc}')
+            continue
         if not path.is_relative_to(root.resolve()):
-            raise ValueError('Shard path escapes checkpoint')
+            errors.append(f'Shard path escapes checkpoint: {shard}')
+            continue
         try:
             stream = path.open('rb')
         except OSError as exc:
@@ -409,7 +414,8 @@ def audit(root, tp=16):
                 continue
             size = struct.unpack('<Q', preamble)[0]
             if size > 100_000_000:
-                raise ValueError('Unreasonable safetensors header size')
+                errors.append(f'Unreasonable safetensors header size: {shard}: {size}')
+                continue
             try:
                 header_text = stream.read(size).decode('utf-8')
                 header = json.loads(header_text, object_pairs_hook=_unique_object)
@@ -469,17 +475,22 @@ def audit(root, tp=16):
                             f'Unable to read scale tensor: {name}: {exc}'
                         )
                         continue
+                    if len(data) != end - start:
+                        errors.append(
+                            f'Short scale tensor read: {name}: '
+                            f'expected {end - start} bytes, got {len(data)}'
+                        )
+                        continue
                     values = array.array('f')
                     values.frombytes(data)
                     if sys.byteorder != 'little':
                         values.byteswap()
                     valid_values = all(math.isfinite(v) for v in values)
                     if spec['route'] == 'packed_expert':
-                        if len(data) != end-start or not valid_values:
+                        if not valid_values:
                             errors.append(f'Invalid packed-expert scale values: {name}')
                     else:
-                        if (len(data) != end-start or not valid_values
-                                or not all(v > 0 for v in values)):
+                        if not valid_values or not all(v > 0 for v in values):
                             errors.append(f'Invalid W8A8 scale values: {name}')
                         w8_scales += 1
                         w8_values += len(values)

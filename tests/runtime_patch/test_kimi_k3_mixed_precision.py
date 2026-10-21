@@ -397,27 +397,62 @@ def test_mixed_and_fused_branches_compose_with_installed_kimi_model_loader():
         model.direct = nn.Module()
         model.direct.weight = _parameter((1, 4), torch.float32, lambda p, t: p.data.copy_(t))
         entries = []
-        for branch, rows in [('q_proj',32),('k_proj',32),('v_proj',32),
-                             ('g_proj',32),('f_a_proj',8),('b_proj',16)]:
+        def branch_tensors(rows, seed, quant=True):
+            values = torch.arange(rows * 4).view(rows, 4) + seed * 19
+            weight = (values.remainder(127).to(torch.int8) if quant
+                      else values.float() / 128)
+            scale = (torch.arange(rows).float() + 1 + seed * 64).view(rows, 1) / 1024
+            return weight, scale
+
+        for seed, (branch, rows) in enumerate([
+            ('q_proj',32),('k_proj',32),('v_proj',32),
+            ('g_proj',32),('f_a_proj',8),('b_proj',16),
+        ]):
             quant = branch in ('q_proj','k_proj','v_proj')
-            entries.append((f'layers.0.self_attn.{branch}.weight',
-                            torch.full((rows,4), 3, dtype=torch.int8 if quant else torch.float32)))
+            weight, scale = branch_tensors(rows, seed, quant)
+            entries.append((f'layers.0.self_attn.{branch}.weight', weight))
             if quant:
-                entries.append((f'layers.0.self_attn.{branch}.weight_scale',torch.full((rows,1),.25)))
-        for parent, names, sizes in [
+                entries.append((f'layers.0.self_attn.{branch}.weight_scale', scale))
+        for group, (parent, names, sizes) in enumerate([
             ('layers.0.mlp', ['gate_proj','up_proj'], [32,32]),
             ('layers.1.self_attn', ['q_a_proj','kv_a_proj_with_mqa'], [32,16]),
             ('layers.1.block_sparse_moe.shared_experts', ['gate_proj','up_proj'], [32,32]),
-        ]:
-            for n, rows in zip(names,sizes):
-                entries.append((parent+'.'+n+'.weight',torch.full((rows,4),5,dtype=torch.int8)))
-                entries.append((parent+'.'+n+'.weight_scale',torch.full((rows,1),.125)))
+        ]):
+            for branch, (n, rows) in enumerate(zip(names, sizes)):
+                weight, scale = branch_tensors(rows, 6 + group * 2 + branch)
+                entries.append((parent+'.'+n+'.weight', weight))
+                entries.append((parent+'.'+n+'.weight_scale', scale))
         entries.append(('direct.weight',torch.ones(1,4)))
+        expected = {name: tensor.clone() for name, tensor in entries}
         loaded = model.load_weights(iter(reversed(entries)))
         assert loaded == {name for name, _ in model.named_parameters()}
-        for layer in (dense, mla, shared):
-            assert torch.all(layer.weight == 5)
-            assert torch.all(layer.weight_scale == .125)
-        assert torch.all(proj.q_proj.weight == 3)
-        assert torch.all(proj.q_proj.weight_scale == .25)
+
+        def local_rows(tensor, replicated=False):
+            if replicated:
+                return tensor
+            width = tensor.shape[0] // 16
+            return tensor.narrow(0, rank * width, width)
+
+        for layer, parent, names, replicated in [
+            (dense, 'layers.0.mlp', ['gate_proj', 'up_proj'], False),
+            (mla, 'layers.1.self_attn', ['q_a_proj', 'kv_a_proj_with_mqa'], True),
+            (shared, 'layers.1.block_sparse_moe.shared_experts',
+             ['gate_proj', 'up_proj'], False),
+        ]:
+            for suffix in ('weight', 'weight_scale'):
+                rows = [local_rows(expected[f'{parent}.{name}.{suffix}'], replicated)
+                        for name in names]
+                torch.testing.assert_close(getattr(layer, suffix), torch.cat(rows),
+                                           rtol=0, atol=0)
+        for branch in ('q_proj', 'k_proj', 'v_proj'):
+            for suffix in ('weight', 'weight_scale'):
+                tensor = expected[f'layers.0.self_attn.{branch}.{suffix}']
+                torch.testing.assert_close(getattr(getattr(proj, branch), suffix),
+                                           local_rows(tensor), rtol=0, atol=0)
+        gate_rows = [local_rows(expected[f'layers.0.self_attn.{name}.weight'],
+                                replicated=name == 'f_a_proj')
+                     for name in ('g_proj', 'f_a_proj', 'b_proj')]
+        gate_rows.append(torch.zeros(1, 4))  # One local output-padding row.
+        torch.testing.assert_close(proj.fp_gate.weight, torch.cat(gate_rows),
+                                   rtol=0, atol=0)
         assert torch.all(model.direct.weight == 1)

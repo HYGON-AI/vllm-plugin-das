@@ -167,6 +167,67 @@ def test_audit_reports_invalid_weight_map(tmp_path, weight_map):
     assert any('Invalid weight_map' in error for error in result['errors'])
 
 
+@pytest.mark.parametrize('case,message', [
+    ('escaping_path', 'Shard path escapes checkpoint'),
+    ('oversized_header', 'Unreasonable safetensors header size'),
+])
+def test_cli_reports_rejected_shard_paths_and_headers(tmp_path, monkeypatch, case, message):
+    _write(tmp_path)
+    if case == 'escaping_path':
+        index_path = tmp_path / 'model.safetensors.index.json'
+        index = json.loads(index_path.read_text())
+        index['weight_map']['vision_tower.invalid.weight'] = '../outside.safetensors'
+        index_path.write_text(json.dumps(index))
+    else:
+        (tmp_path / 'model.safetensors').write_bytes(struct.pack('<Q', 100_000_001))
+    output = tmp_path / 'audit.json'
+    monkeypatch.setattr(sys, 'argv', [
+        'audit_kimi_k3_checkpoint.py', str(tmp_path), '--output', str(output)
+    ])
+
+    assert audit_module.main() == 1
+    report = json.loads(output.read_text())
+    assert not report['passed']
+    assert any(message in error for error in report['errors'])
+
+
+def test_audit_reports_short_scale_read(tmp_path, monkeypatch):
+    _write(tmp_path)
+    original_open = Path.open
+
+    class ShortScaleReader:
+        def __init__(self, stream):
+            self.stream = stream
+
+        def __enter__(self):
+            self.stream.__enter__()
+            return self
+
+        def __exit__(self, *args):
+            return self.stream.__exit__(*args)
+
+        def __getattr__(self, name):
+            return getattr(self.stream, name)
+
+        def read(self, size=-1):
+            # Header reads start at 0/8. Scale reads follow the header and
+            # simulate a file truncated after its ranges were validated.
+            position = self.stream.tell()
+            data = self.stream.read(size)
+            return data[:-1] if position > 8 and data else data
+
+    def short_read(path, *args, **kwargs):
+        stream = original_open(path, *args, **kwargs)
+        return ShortScaleReader(stream) if path.suffix == '.safetensors' else stream
+
+    monkeypatch.setattr(Path, 'open', short_read)
+
+    result = audit_module.audit(tmp_path)
+
+    assert not result['passed']
+    assert any('Short scale tensor read' in error for error in result['errors'])
+
+
 @pytest.mark.parametrize('source', ['root', 'text_config'])
 @pytest.mark.parametrize('effective_config_valid', [False, True])
 def test_audit_uses_runtime_quantization_config_priority(
@@ -439,6 +500,33 @@ def test_audit_accepts_supported_safetensors_metadata(tmp_path, metadata):
         pass
     result = audit_module.audit(tmp_path)
     assert result['passed'] and not result['errors']
+
+
+@pytest.mark.parametrize('metadata', [None, {'format': 'pt'}])
+def test_cli_rejects_reserved_metadata_in_weight_map(tmp_path, monkeypatch, metadata):
+    from safetensors import safe_open
+
+    _write(tmp_path)
+    valid = audit_module.audit(tmp_path)
+    _rewrite_header(tmp_path, lambda header: header.update(__metadata__=metadata))
+    with safe_open(tmp_path / 'model.safetensors', framework='numpy') as reader:
+        assert len(reader.keys()) == valid['language_tensor_count']
+    index_path = tmp_path / 'model.safetensors.index.json'
+    index = json.loads(index_path.read_text())
+    index['weight_map']['__metadata__'] = 'model.safetensors'
+    index_path.write_text(json.dumps(index))
+    output = tmp_path / 'audit.json'
+    monkeypatch.setattr(sys, 'argv', [
+        'audit_kimi_k3_checkpoint.py', str(tmp_path), '--output', str(output)
+    ])
+
+    assert audit_module.main() == 1
+    report = json.loads(output.read_text())
+    assert not report['passed']
+    assert any('Invalid weight_map tensor name' in error and '__metadata__' in error
+               for error in report['errors'])
+    assert report['language_tensor_count'] == valid['language_tensor_count']
+    assert report['w8a8_scale_tensors_fully_read'] == valid['w8a8_scale_tensors_fully_read']
 
 
 def test_audit_rejects_duplicate_header_keys_without_losing_first_value(tmp_path):
