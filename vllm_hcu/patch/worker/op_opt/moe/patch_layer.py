@@ -218,10 +218,16 @@ def apply_to_module(module: ModuleType) -> bool:
     @functools.wraps(factory)
     def hcu_factory(*args, **kwargs):
         from vllm.config import get_current_vllm_config_or_none
+        from vllm_hcu.deepseek_v4_runtime import model_architectures
 
         vllm_config = get_current_vllm_config_or_none()
         model_config = getattr(vllm_config, "model_config", None)
         hf_config = getattr(model_config, "hf_config", None)
+        architectures = model_architectures(vllm_config)
+        is_native_deepseek_v4 = not {
+            "DeepseekV4ForCausalLM",
+            "DeepSeekV4MTPModel",
+        }.isdisjoint(architectures)
         # init_vllm_registered_model installs the inner text config while
         # constructing Kimi-K3's language model (model_type="kimi_linear").
         is_kimi_k3 = getattr(hf_config, "model_type", None) in (
@@ -262,6 +268,21 @@ def apply_to_module(module: ModuleType) -> bool:
         _adapt_kimi_runner_forward_entry(runner)
         experts = runner.routed_experts
         moe_config = getattr(experts, "moe_config", None)
+        # Kernel construction can be deferred until checkpoint post-load,
+        # after vLLM's temporary current-config scope has ended. Persist this
+        # model-specific workspace contract on the long-lived MoE config while
+        # model construction still has an authoritative VllmConfig.
+        global_ht_token_bound = bool(
+            is_native_deepseek_v4
+            and int(getattr(moe_config, "pcp_size", 1) or 1) > 1
+        )
+        if moe_config is not None:
+            setattr(
+                moe_config,
+                "_hcu_global_ht_token_bound",
+                global_ht_token_bound,
+            )
+            setattr(moe_config, "_hcu_model_architectures", architectures)
         activation_value = getattr(moe_config, "activation", None)
         activation = getattr(activation_value, "value", activation_value)
         # FusedMoEFactory may run after the current VllmConfig context has
@@ -278,6 +299,14 @@ def apply_to_module(module: ModuleType) -> bool:
             method_moe = getattr(experts.quant_method, "moe", None)
             if method_moe is not None:
                 setattr(method_moe, "_hcu_kimi_k3", True)
+        method_moe = getattr(experts.quant_method, "moe", None)
+        if method_moe is not None and method_moe is not moe_config:
+            setattr(
+                method_moe,
+                "_hcu_global_ht_token_bound",
+                global_ht_token_bound,
+            )
+            setattr(method_moe, "_hcu_model_architectures", architectures)
         if type(experts.quant_method) is not official_unquantized_cls:
             return runner
         if bool(getattr(experts, "apply_router_weight_on_input", False)):
