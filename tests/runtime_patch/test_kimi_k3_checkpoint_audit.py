@@ -4,6 +4,7 @@ import importlib.util
 import json
 from pathlib import Path
 import struct
+import sys
 
 import pytest
 
@@ -90,6 +91,46 @@ def test_small_full_contract_passes(tmp_path):
     assert result['w8a8_scale_tensors_fully_read'] > 0
     assert result['model_constructed'] is False
     assert sum(result['route_counts'].values()) == result['language_tensor_count']
+
+
+def test_audit_reports_missing_shard_instead_of_raising(tmp_path):
+    _write(tmp_path)
+    (tmp_path / 'model.safetensors').unlink()
+
+    result = audit_module.audit(tmp_path)
+
+    assert not result['passed']
+    assert any('Unable to read shard: model.safetensors' in error
+               for error in result['errors'])
+
+
+def test_audit_reports_short_safetensors_preamble_instead_of_raising(tmp_path):
+    _write(tmp_path)
+    (tmp_path / 'model.safetensors').write_bytes(b'\0' * 7)
+
+    result = audit_module.audit(tmp_path)
+
+    assert not result['passed']
+    assert any(
+        'Invalid safetensors preamble: model.safetensors: '
+        'expected 8 bytes, got 7' in error
+        for error in result['errors']
+    )
+
+
+def test_cli_writes_structured_report_for_missing_shard(tmp_path, monkeypatch):
+    _write(tmp_path)
+    (tmp_path / 'model.safetensors').unlink()
+    output = tmp_path / 'audit.json'
+    monkeypatch.setattr(sys, 'argv', [
+        'audit_kimi_k3_checkpoint.py', str(tmp_path), '--output', str(output)
+    ])
+
+    assert audit_module.main() == 1
+    report = json.loads(output.read_text())
+    assert not report['passed']
+    assert any('Unable to read shard: model.safetensors' in error
+               for error in report['errors'])
 
 
 @pytest.mark.parametrize('source', ['root', 'text_config'])

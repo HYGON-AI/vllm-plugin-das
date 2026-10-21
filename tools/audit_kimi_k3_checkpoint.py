@@ -380,21 +380,43 @@ def audit(root, tp=16):
         path = (root / shard).resolve()
         if not path.is_relative_to(root.resolve()):
             raise ValueError('Shard path escapes checkpoint')
-        with path.open('rb') as stream:
-            size = struct.unpack('<Q', stream.read(8))[0]
+        try:
+            stream = path.open('rb')
+        except OSError as exc:
+            errors.append(f'Unable to read shard: {shard}: {exc}')
+            continue
+        with stream:
+            try:
+                preamble = stream.read(8)
+            except OSError as exc:
+                errors.append(f'Unable to read shard preamble: {shard}: {exc}')
+                continue
+            if len(preamble) != 8:
+                errors.append(
+                    f'Invalid safetensors preamble: {shard}: '
+                    f'expected 8 bytes, got {len(preamble)}'
+                )
+                continue
+            size = struct.unpack('<Q', preamble)[0]
             if size > 100_000_000:
                 raise ValueError('Unreasonable safetensors header size')
             try:
                 header_text = stream.read(size).decode('utf-8')
                 header = json.loads(header_text, object_pairs_hook=_unique_object)
-            except (UnicodeDecodeError, json.JSONDecodeError, ValueError) as exc:
+            except (
+                UnicodeDecodeError, json.JSONDecodeError, ValueError, OSError
+            ) as exc:
                 errors.append(f'Invalid safetensors header: {shard}: {exc}')
                 continue
             if type(header) is not dict:
                 errors.append(f'Invalid safetensors header object: {shard}')
                 continue
             _valid_metadata(header, shard, errors)
-            data_size = os.fstat(stream.fileno()).st_size - 8 - size
+            try:
+                data_size = os.fstat(stream.fileno()).st_size - 8 - size
+            except OSError as exc:
+                errors.append(f'Unable to stat shard: {shard}: {exc}')
+                continue
             invalid_ranges = validate_shard_ranges(header, data_size, shard, errors)
             if set(header) - {'__metadata__'} != indexed:
                 errors.append(f'Index/header mismatch: {shard}')
@@ -429,8 +451,14 @@ def audit(root, tp=16):
                     errors.append(f'Shape/dtype mismatch: {name}')
                     continue
                 if name.endswith('.weight_scale'):
-                    stream.seek(8 + size + start)
-                    data = stream.read(end - start)
+                    try:
+                        stream.seek(8 + size + start)
+                        data = stream.read(end - start)
+                    except OSError as exc:
+                        errors.append(
+                            f'Unable to read scale tensor: {name}: {exc}'
+                        )
+                        continue
                     values = array.array('f')
                     values.frombytes(data)
                     if sys.byteorder != 'little':
