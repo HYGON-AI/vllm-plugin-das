@@ -1,0 +1,80 @@
+# SPDX-License-Identifier: Apache-2.0
+import pytest
+import torch
+
+if not torch.cuda.is_available():
+    pytest.skip("MMAC GEMM tests need a working GPU", allow_module_level=True)
+
+pytestmark = pytest.mark.hcu
+
+from vllm_hcu.utils import bf16_fp32_gemm, bf16_fp32_mmac  # noqa: E402
+
+
+@pytest.mark.parametrize("m", [1, 7, 8, 16, 33, 48, 64])
+@pytest.mark.parametrize("n", sorted(bf16_fp32_mmac.SUPPORTED_N))
+@pytest.mark.parametrize("k", [512, 4096])
+def test_matches_fp32_reference(m, n, k):
+    torch.manual_seed(0)
+    x = torch.randn(m, k, dtype=torch.bfloat16, device="cuda")
+    w = torch.randn(n, k, dtype=torch.bfloat16, device="cuda")
+    out = bf16_fp32_mmac.linear_bf16_fp32_mmac(x, w)
+    ref = x.float() @ w.float().T
+    assert out.dtype == torch.float32 and out.shape == (m, n)
+    torch.testing.assert_close(out, ref, rtol=1e-4, atol=1e-3)
+
+
+@pytest.mark.parametrize(
+    ("m", "n", "k", "expected"),
+    [
+        (48, 1024, 4096, True),
+        (64, 2048, 4096, True),
+        (65, 1024, 4096, False),
+        (48, 1536, 4096, False),
+        (48, 1024, 4000, False),
+    ],
+)
+def test_supported_contract(m, n, k, expected):
+    x = torch.empty(m, k, dtype=torch.bfloat16, device="cuda")
+    w = torch.empty(n, k, dtype=torch.bfloat16, device="cuda")
+    assert bf16_fp32_mmac.supported(x, w) is expected
+
+
+def test_dispatcher_routes_small_m(monkeypatch):
+    calls = []
+    real = bf16_fp32_mmac.linear_bf16_fp32_mmac
+
+    def spy(x, w):
+        calls.append(x.shape[0])
+        return real(x, w)
+
+    monkeypatch.setattr(bf16_fp32_mmac, "linear_bf16_fp32_mmac", spy)
+    w = torch.randn(512, 4096, dtype=torch.bfloat16, device="cuda")
+    for m in (48, 128):
+        x = torch.randn(m, 4096, dtype=torch.bfloat16, device="cuda")
+        torch.testing.assert_close(
+            bf16_fp32_gemm.linear_bf16_fp32(x, w),
+            x.float() @ w.float().T,
+            rtol=1e-4,
+            atol=1e-3,
+        )
+    assert calls == [48]
+
+    monkeypatch.setenv("VLLM_HCU_BF16_FP32_MMAC", "0")
+    bf16_fp32_gemm.linear_bf16_fp32(
+        torch.randn(48, 4096, dtype=torch.bfloat16, device="cuda"), w
+    )
+    assert calls == [48]
+
+
+def test_cuda_graph_replay():
+    x = torch.randn(48, 4096, dtype=torch.bfloat16, device="cuda")
+    w = torch.randn(1024, 4096, dtype=torch.bfloat16, device="cuda")
+    bf16_fp32_mmac.linear_bf16_fp32_mmac(x, w)
+    torch.cuda.synchronize()
+    graph = torch.cuda.CUDAGraph()
+    with torch.cuda.graph(graph):
+        out = bf16_fp32_mmac.linear_bf16_fp32_mmac(x, w)
+    x.copy_(torch.randn_like(x))
+    graph.replay()
+    torch.cuda.synchronize()
+    torch.testing.assert_close(out, x.float() @ w.float().T, rtol=1e-4, atol=1e-3)
