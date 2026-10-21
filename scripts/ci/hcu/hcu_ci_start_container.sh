@@ -60,7 +60,6 @@ docker_args=(
   --security-opt seccomp=unconfined
   --workdir /vllm-plugin-das
   --volume "$workspace:/vllm-plugin-das"
-  --volume "$artifact_root:/hcu-ci-artifacts"
   --env HOME=/tmp/hcu-ci-home
   --env PYTHONDONTWRITEBYTECODE=1
   --env VLLM_HCU_IS_IN_CI=1
@@ -178,7 +177,8 @@ docker "${docker_args[@]}" "$image" bash -lc 'while true; do sleep 3600; done'
 docker exec "$container_name" bash -lc '
   set -euo pipefail
   ci_home=/tmp/hcu-ci-home
-  mkdir -p "$ci_home" "$TORCHINDUCTOR_CACHE_DIR" "$XDG_CACHE_HOME"
+  # Reports stay container-local; cleanup exports them without another host bind.
+  mkdir -p /hcu-ci-artifacts "$ci_home" "$TORCHINDUCTOR_CACHE_DIR" "$XDG_CACHE_HOME"
   python_bin="$(command -v python3 || true)"
   if [[ -z "$python_bin" ]]; then
     echo "the default python3 is unavailable in HCU CI image" >&2
