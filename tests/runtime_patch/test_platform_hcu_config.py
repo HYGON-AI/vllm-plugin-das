@@ -2197,19 +2197,14 @@ def test_fused_qwen3_rms_rope_effective_policy_partitions_persistent_cache(
 def test_varlen_flash_attention_uses_64_token_cache_blocks(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    # Source-only test worktrees do not contain the compiled extension. This
-    # contract only exercises backend block-size metadata, not HCU kernels.
-    monkeypatch.setitem(
-        sys.modules,
-        "vllm_hcu.hcu_ops",
-        ModuleType("vllm_hcu.hcu_ops"),
-    )
+    from tests.fixtures.flash_attention import load_hcu_flash_attention_module
     from vllm.v1.attention.backends.registry import AttentionBackendEnum
-    from vllm_hcu.v1.attention.backends.flash_attn import (
-        HcuFlashAttentionBackend,
-    )
     from vllm_hcu.platforms import envs as hcu_envs
     from vllm_hcu.platforms.hcu import HCUPlatform
+
+    HcuFlashAttentionBackend = load_hcu_flash_attention_module(
+        monkeypatch
+    ).HcuFlashAttentionBackend
 
     class _NoFullGraphs:
         @staticmethod

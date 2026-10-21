@@ -106,6 +106,14 @@ def test_step5_runtime_features_obey_custom_ops_master(master, child, expected):
             env[name] = child
     script = f"""
 import importlib
+import sys
+from types import ModuleType
+import pytest
+from tests.fixtures.flash_attention import stub_flash_attn_extensions
+stub_flash_attn_extensions(pytest.MonkeyPatch())
+# This matrix checks policy flags, not the optional GPU provider's kernels.
+provider = "vllm_hcu.model_executor.layers.fused_moe.ep_fused_moe"
+sys.modules[provider] = ModuleType(provider)
 import vllm
 from vllm_hcu import hcu_platform_register_model
 hcu_platform_register_model()
@@ -438,6 +446,9 @@ def test_flash_attention_does_not_import_swa_provider_when_master_is_off():
     )
     script = """
 import builtins
+import pytest
+from tests.fixtures.flash_attention import stub_flash_attn_extensions
+stub_flash_attn_extensions(pytest.MonkeyPatch())
 
 native_import = builtins.__import__
 def guarded_import(name, *args, **kwargs):

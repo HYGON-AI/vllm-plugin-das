@@ -471,7 +471,7 @@ def test_gqa_pcp_rejects_hybrid_kv_cache_groups(make_pcp_config) -> None:
     ("override", "message"),
     [
         ({"use_v2": False}, "Model Runner V2"),
-        ({"architecture": "DeepseekV2ForCausalLM"}, "GLM-5.2"),
+        ({"architecture": "DeepseekV2ForCausalLM"}, "registered DSA MLA family"),
         ({"use_mla": False}, "MLA"),
         ({"pp": 2}, "pipeline parallel"),
         ({"dcp": 2}, "decode context parallel"),

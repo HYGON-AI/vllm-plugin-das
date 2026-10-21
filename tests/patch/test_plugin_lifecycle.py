@@ -32,6 +32,10 @@ from vllm_hcu.patch.runtime_state import (
 )
 
 
+class _WeakNamespace(SimpleNamespace):
+    """Match CompilationConfig weak-reference support in lifecycle doubles."""
+
+
 REPO = Path(__file__).resolve().parents[2]
 TARGET_PLUGIN_ROOT = Path(plugin.__file__).resolve().parents[1]
 _target_root_override = os.environ.get("VLLM_TARGET_ROOT")
@@ -779,7 +783,9 @@ def test_worker_selects_plugin_owned_model_runner(
 def test_hcu_worker_rejects_model_runner_v1(cpu_safe_hcu_worker_module):
     with pytest.raises(RuntimeError, match="only Model Runner V2"):
         cpu_safe_hcu_worker_module._create_model_runner(
-            object(), object(), use_v2_model_runner=False
+            SimpleNamespace(model_config=SimpleNamespace(hf_config=SimpleNamespace(
+                model_type="qwen3"
+            ))), object(), use_v2_model_runner=False
         )
 
 
@@ -892,7 +898,7 @@ def test_hcu_model_runner_v2_binds_router_while_worker_weight_pool_is_active(
     upstream_module = ModuleType(upstream_name)
     events: list[object] = []
     pool_active = False
-    model = object()
+    model = SimpleNamespace(modules=lambda: ())
 
     class UpstreamGPUModelRunner:
         def __init__(self, vllm_config, device):
@@ -903,6 +909,9 @@ def test_hcu_model_runner_v2_binds_router_while_worker_weight_pool_is_active(
             assert pool_active
             events.append(("upstream-load", load_dummy_weights))
             self.model = model
+
+        def get_draft_model(self):
+            return None
 
         def execute_model(self):
             return None
@@ -1139,10 +1148,11 @@ def test_platform_check_uses_lazy_executor_selector(monkeypatch):
         lambda config: events.append("executor") or False,
     )
     config = SimpleNamespace(
+        additional_config={},
         model_config=SimpleNamespace(use_mla=False),
         cache_config=None,
         attention_config=SimpleNamespace(backend=None),
-        compilation_config=SimpleNamespace(
+        compilation_config=_WeakNamespace(
             cudagraph_mode=SimpleNamespace(has_full_cudagraphs=lambda: False)
         ),
         parallel_config=SimpleNamespace(worker_cls="auto"),
@@ -1181,13 +1191,14 @@ def test_hcu_config_preserves_mla_prefix_caching(monkeypatch):
         or False,
     )
     config = SimpleNamespace(
+        additional_config={},
         model_config=SimpleNamespace(use_mla=True),
         cache_config=SimpleNamespace(
             enable_prefix_caching=True,
             user_specified_block_size=True,
         ),
         attention_config=SimpleNamespace(backend=None),
-        compilation_config=SimpleNamespace(
+        compilation_config=_WeakNamespace(
             cudagraph_mode=SimpleNamespace(has_full_cudagraphs=lambda: False)
         ),
         parallel_config=SimpleNamespace(worker_cls="auto"),

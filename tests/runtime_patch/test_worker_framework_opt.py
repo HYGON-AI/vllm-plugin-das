@@ -1527,6 +1527,7 @@ def test_deepep_auto_target_mtp_graph_mode_uses_shared_forward_context(
         with module.set_forward_context(
             None,
             config,
+            num_tokens=8,
             cudagraph_runtime_mode=runtime_mode,
         ):
             pass
