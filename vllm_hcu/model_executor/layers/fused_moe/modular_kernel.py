@@ -12,6 +12,8 @@ from typing import final
 import torch
 
 import vllm.envs as envs
+import vllm_hcu.platforms.envs as henvs
+from vllm_hcu.model_executor.layers.fused_moe.workspace_growth import get_moe_workspaces
 from vllm.logger import init_logger
 from vllm.model_executor.layers.fused_moe.activation import (
     ApplyMoEActivationConfig,
@@ -365,11 +367,13 @@ class FusedMoEPrepareAndFinalizeModular(FusedMoEPrepareAndFinalize):
         topk_ids: torch.Tensor,
         apply_router_weight_on_input: bool,
         weight_and_reduce_impl: TopKWeightAndReduce,
-    ) -> None:
+    ) -> torch.Tensor | None:
         """
         Perform any combine plus apply weights and perform a reduction on the
         fused experts output.
         - output: The output tensor, written in place.  Must be (M, K) shape.
+          An implementation may instead return an (M, K) result tensor, which
+          the caller then uses in place of ``output``.
         - fused_expert_output: The unweighted, unreduced output of the fused
           experts, it will have (M, topk, K) shape.
         - topk_weights: The weights to be applied to the fused_experts_output.
@@ -1130,9 +1134,22 @@ class FusedMoEKernelModularImpl:
         # time we need cache3, we're done with cache1.
         # Reuse workspace13 for the output since there is only one chunk.
         max_shape_size = max(prod(workspace13_shape), prod(fused_out_shape))
-        common_workspace, workspace2 = current_workspace_manager().get_simultaneous(
-            ((max_shape_size,), workspace_dtype),
-            (workspace2_shape, workspace_dtype),
+        growth_mb = 0
+        if (
+            henvs.VLLM_HCU_USE_CUSTOM_OPS
+            and not dbo_enabled()
+            and self.moe_parallel_config is not None
+            and self.moe_parallel_config.all2all_backend
+            in ("deepep_auto", "deepep_high_throughput")
+            and self.fused_experts.activation_format()
+            == FusedMoEActivationFormat.Standard
+        ):
+            growth_mb = henvs.VLLM_HCU_MOE_WORKSPACE_GROWTH_MB
+        common_workspace, workspace2 = get_moe_workspaces(
+            current_workspace_manager(),
+            (((max_shape_size,), workspace_dtype),
+             (workspace2_shape, workspace_dtype)),
+            growth_mb * 1024 * 1024,
         )
         workspace13 = _resize_cache(common_workspace, workspace13_shape)
         fused_out = _resize_cache(common_workspace, fused_out_shape)
@@ -1386,7 +1403,9 @@ class FusedMoEKernelModularImpl:
         if not self.prepare_finalize.supports_async():
             assert not dbo_enabled()
 
-            self.prepare_finalize.finalize(
+            # A prepare/finalize may hand back the combined result instead of
+            # writing it into ``output`` (naive DP/EP with a combine hook).
+            combined = self.prepare_finalize.finalize(
                 output,
                 fused_out,
                 topk_weights,
@@ -1394,6 +1413,8 @@ class FusedMoEKernelModularImpl:
                 apply_router_weight_on_input,
                 self.fused_experts.finalize_weight_and_reduce_impl(),
             )
+            if combined is not None:
+                return combined
         else:
             finalize_ret = self.prepare_finalize.finalize_async(
                 output,

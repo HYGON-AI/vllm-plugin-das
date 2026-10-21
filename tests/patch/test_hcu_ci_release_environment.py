@@ -132,9 +132,14 @@ def test_default_image_build_runtime_matches_the_ci_environment_lock() -> None:
         (entry["dtk_tag"], entry["python_version"])
         for entry in workflow["jobs"]["build"]["strategy"]["matrix"]["include"]
     }
-    assert build_runtimes == {
-        (lock["rocm"]["version"], ".".join(lock["python"].split(".")[:2]))
+    allowed_python_lines = {
+        ".".join(version.split(".")[:2])
+        for version in lock["python"]["versions"]
     }
+    assert build_runtimes
+    for dtk_line, python_line in build_runtimes:
+        assert dtk_line in lock["rocm"]["versions"]
+        assert python_line in allowed_python_lines
 
 
 def test_pr_static_gate_exports_release_environment_to_consumers() -> None:
@@ -266,7 +271,7 @@ def test_image_resolver_checks_the_default_python_in_the_image(
         assert result.stdout.strip() == expected
     else:
         assert result.returncode == 2
-        assert "without python3" in result.stderr
+        assert "without the default python3" in result.stderr
         assert not result.stdout
 
 

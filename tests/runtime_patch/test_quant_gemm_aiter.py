@@ -42,7 +42,6 @@ from vllm_hcu.model_executor.layers.quantization import (
 from vllm_hcu.platforms import envs as henvs
 from vllm_hcu.patch.worker.op_opt import (
     patch_activation,
-    patch_aiter_ops,
     patch_compressed_tensors,
     patch_compressed_tensors_moe_w8a8_fp8,
     patch_compressed_tensors_moe_wna16,
@@ -50,6 +49,7 @@ from vllm_hcu.patch.worker.op_opt import (
     patch_compressed_tensors_w8a8_fp8,
     patch_compressed_tensors_w8a8_int8,
     patch_deep_gemm,
+    patch_deep_gemm_transform,
     patch_input_quant_fp8,
     patch_layers_utils,
     patch_scaled_mm_linear_kernel,
@@ -1279,8 +1279,11 @@ def test_aiter_asm_boltops_fp8_quant_context_rejects_subtle_abi_drift(
     assert asm_module.per_token_quant_hip is incompatible_quant
 
 
+@pytest.mark.parametrize("architecture", [
+    "DeepseekV4ForCausalLM", "DeepSeekV4MTPModel",
+])
 def test_int8_oracle_keeps_aiter_weights_and_packs_hcu_deep_gemm_weights(
-    monkeypatch: pytest.MonkeyPatch,
+    monkeypatch: pytest.MonkeyPatch, architecture: str,
 ):
     from vllm_hcu.patch.worker.op_opt.moe import patch_int8_oracle
     from vllm.model_executor.layers.quantization.utils.quant_utils import (
@@ -1560,7 +1563,7 @@ def test_int8_oracle_keeps_aiter_weights_and_packs_hcu_deep_gemm_weights(
                 }
             },
             model_config=SimpleNamespace(
-                architectures=["DeepseekV4ForCausalLM"],
+                architectures=[architecture],
             ),
         ),
     )
@@ -4380,15 +4383,32 @@ def test_slimquant_w4a8_moe_method_is_a_direct_fused_moe_method():
 
 
 @pytest.mark.hcu
+@pytest.mark.parametrize("architecture", [
+    "DeepseekV4ForCausalLM",
+    "DeepSeekV4MTPModel",
+    "Qwen4ExpForCausalLM",
+    "Qwen4ExpForConditionalGeneration",
+])
+@pytest.mark.parametrize("dp_size,pcp_size", [(2, 1), (1, 2), (1, 4), (1, 8)])
 def test_slimquant_w4a8_deepep_auto_uses_w4a8_deepgemm_factory_not_aiter(
-    monkeypatch: pytest.MonkeyPatch,
+    monkeypatch: pytest.MonkeyPatch, architecture: str,
+    dp_size: int, pcp_size: int,
 ):
-    """DP+EP W4A8 must own an auto DeepGEMM kernel, not an AITER fallback."""
+    """DP/PCP+EP targets and MTP drafts must load and execute W4A8 experts."""
 
     from vllm_hcu.model_executor.layers.fused_moe.experts import (
         dpsk_v4_deep_gemm_moe as deepgemm_module,
     )
     from vllm_hcu.model_executor.layers.quantization import slimquant_w4a8
+
+    from vllm_hcu.model_executor.layers.fused_moe import deepep_runtime
+
+    monkeypatch.setattr(
+        deepep_runtime, "current_platform", SimpleNamespace(is_rocm=lambda: True)
+    )
+    monkeypatch.setattr(
+        deepep_runtime, "_require_slimquant_w4a8_hipc_runtime", lambda: None
+    )
 
     factory_calls: list[tuple[object, object, object]] = []
     processed_layers: list[object] = []
@@ -4438,14 +4458,15 @@ def test_slimquant_w4a8_deepep_auto_uses_w4a8_deepgemm_factory_not_aiter(
         activation=SimpleNamespace(value="silu"),
         moe_backend="auto",
         moe_parallel_config=SimpleNamespace(
-            dp_size=2,
+            dp_size=dp_size,
+            pcp_size=pcp_size,
             use_ep=True,
             all2all_backend="deepep_auto",
             use_deepep_auto_kernels=True,
         ),
         _hcu_vllm_config=SimpleNamespace(
             model_config=SimpleNamespace(
-                architectures=["DeepseekV4ForCausalLM"]
+                architectures=[architecture]
             )
         ),
     )
@@ -4864,7 +4885,7 @@ def test_slimquant_w4a8_agrs_dp_ep_uses_standard_aiter_route(
             "deepep_auto",
             True,
             "auto",
-            "requires dp_size > 1 and expert parallelism",
+            "requires dp_size > 1 or pcp_size > 1, with expert parallelism",
         ),
         (
             2,
@@ -4872,7 +4893,7 @@ def test_slimquant_w4a8_agrs_dp_ep_uses_standard_aiter_route(
             "deepep_auto",
             True,
             "auto",
-            "requires dp_size > 1 and expert parallelism",
+            "requires dp_size > 1 or pcp_size > 1, with expert parallelism",
         ),
         (
             2,
@@ -4892,9 +4913,11 @@ def test_slimquant_w4a8_agrs_dp_ep_uses_standard_aiter_route(
         ),
     ],
 )
+@pytest.mark.parametrize("pcp_size", [1, 8])
 def test_slimquant_w4a8_deepep_routing_fails_closed_before_tp_fallback(
     monkeypatch: pytest.MonkeyPatch,
     dp_size: int,
+    pcp_size: int,
     use_ep: bool,
     all2all_backend: str,
     auto_kernels: bool,
@@ -4916,6 +4939,7 @@ def test_slimquant_w4a8_deepep_routing_fails_closed_before_tp_fallback(
             moe_backend=moe_backend,
             moe_parallel_config=SimpleNamespace(
                 dp_size=dp_size,
+                pcp_size=pcp_size,
                 use_ep=use_ep,
                 all2all_backend=all2all_backend,
                 use_deepep_auto_kernels=auto_kernels,
@@ -5726,6 +5750,7 @@ def test_slimquant_w4a8_tp_aiter_keeps_selected_canonical_owner(
     method.process_weights_after_loading(layer)
 
     assert method.moe_quant_config is not None
+    assert method.supports_int8_allgatherv_input is True
     assert prewarm_calls == [layer]
     assert layer.w13_weight is w13
     assert layer.w2_weight is w2
@@ -5754,8 +5779,78 @@ def test_slimquant_w4a8_tp_aiter_keeps_selected_canonical_owner(
     )
 
 
+def test_slimquant_w4a8_resolves_public_boltops_fused_moe_api():
+    """Packed W4A8 must not bind BoltOps' private Triton implementation."""
+    from boltops import fused_moe
+
+    resolver = compressed_tensors_moe_runtime._boltops_w4a8_fused_experts
+    cache_clear = getattr(resolver, "cache_clear", None)
+    if cache_clear is not None:
+        cache_clear()
+    try:
+        assert resolver() is fused_moe.fused_experts
+    finally:
+        if cache_clear is not None:
+            cache_clear()
+
+
+@pytest.mark.parametrize("abi_change", ("kind", "default", "uninspectable"))
+def test_slimquant_w4a8_rejects_subtle_public_boltops_abi_drift(
+    monkeypatch: pytest.MonkeyPatch,
+    abi_change: str,
+):
+    """Packed W4A8 must fail closed on every audited call-contract change."""
+    from boltops.fused_moe import fused_experts
+
+    resolver = compressed_tensors_moe_runtime._boltops_w4a8_fused_experts
+    resolver.cache_clear()
+    if abi_change == "uninspectable":
+
+        class Kernel:
+            @property
+            def __signature__(self):
+                raise TypeError("opaque callable")
+
+            def __call__(self, *args, **kwargs):
+                return args, kwargs
+
+        kernel = Kernel()
+    else:
+        expected = inspect.signature(fused_experts)
+        parameters = list(expected.parameters.values())
+        index = next(
+            index
+            for index, parameter in enumerate(parameters)
+            if parameter.name == ("hidden_states" if abi_change == "kind" else "activation")
+        )
+        parameters[index] = parameters[index].replace(
+            kind=(
+                inspect.Parameter.POSITIONAL_ONLY
+                if abi_change == "kind"
+                else parameters[index].kind
+            ),
+            default=("silu" if abi_change == "default" else parameters[index].default),
+        )
+
+        def kernel(*args, **kwargs):
+            return args, kwargs
+
+        kernel.__signature__ = expected.replace(parameters=parameters)
+
+    module = _module("boltops.fused_moe", fused_experts=kernel)
+    monkeypatch.setitem(sys.modules, "boltops.fused_moe", module)
+    try:
+        with pytest.raises(
+            compressed_tensors_moe_runtime.HcuCompressedTensorsMoeError,
+            match="fused_experts signature",
+        ):
+            resolver()
+    finally:
+        resolver.cache_clear()
+
+
 @pytest.mark.hcu
-def test_slimquant_w4a8_explicit_triton_prepares_only_vllm_weights(
+def test_slimquant_w4a8_explicit_triton_keeps_packed_weights(
     monkeypatch: pytest.MonkeyPatch,
 ):
     from vllm_hcu.model_executor.layers.quantization import slimquant_w4a8
@@ -5798,19 +5893,24 @@ def test_slimquant_w4a8_explicit_triton_prepares_only_vllm_weights(
         ),
         w13_input_scale=None,
         w2_input_scale=None,
+        swiglu_limit=0.0,
     )
     assert method.moe_quant_config is None
-    packed_w13 = layer.w13_weight.detach().clone()
-    packed_w2 = layer.w2_weight.detach().clone()
+    packed_w13 = layer.w13_weight
+    packed_w2 = layer.w2_weight
+    expected_w13 = packed_w13.detach().clone()
+    expected_w2 = packed_w2.detach().clone()
 
     method.process_weights_after_loading(layer)
 
-    assert layer.w13_weight.shape == (1, 4, 4)
-    assert layer.w2_weight.shape == (1, 4, 2)
-    assert layer.w13_weight._hcu_vllm_w4a8_unpacked is True
-    assert layer.w2_weight._hcu_vllm_w4a8_unpacked is True
-    assert not hasattr(layer.w13_weight, "_hcu_vllm_w4a8_fallback_weights")
-    assert not hasattr(layer.w13_weight, "_hcu_aiter_moe_m1_supported")
+    assert layer.w13_weight is packed_w13
+    assert layer.w2_weight is packed_w2
+    assert layer.w13_weight.shape == (1, 4, 2)
+    assert layer.w2_weight.shape == (1, 4, 1)
+    assert not hasattr(layer.w13_weight, "_hcu_vllm_w4a8_unpacked")
+    assert not hasattr(layer.w2_weight, "_hcu_vllm_w4a8_unpacked")
+    torch.testing.assert_close(layer.w13_weight, expected_w13)
+    torch.testing.assert_close(layer.w2_weight, expected_w2)
     assert method.moe_quant_config is not None
     torch.testing.assert_close(
         method.moe_quant_config.w1_scale,
@@ -5821,15 +5921,18 @@ def test_slimquant_w4a8_explicit_triton_prepares_only_vllm_weights(
         layer.w2_weight_scale,
     )
 
-    from vllm.model_executor.layers.fused_moe import fused_moe
-
     kernel_calls: list[dict[str, object]] = []
 
-    def fused_experts_impl(hidden_states, *_args, **kwargs):
-        kernel_calls.append(kwargs)
+    def fused_experts_impl(hidden_states, w1, w2, *_args, **kwargs):
+        kernel_calls.append({"w1": w1, "w2": w2, **kwargs})
         return hidden_states + 1
 
-    monkeypatch.setattr(fused_moe, "fused_experts_impl", fused_experts_impl)
+    monkeypatch.setattr(
+        compressed_tensors_moe_runtime,
+        "_boltops_w4a8_fused_experts",
+        lambda: fused_experts_impl,
+        raising=False,
+    )
     hidden_states = torch.zeros((2, 4), dtype=torch.float16)
     result = method.apply(
         layer,
@@ -5841,12 +5944,17 @@ def test_slimquant_w4a8_explicit_triton_prepares_only_vllm_weights(
     )
 
     torch.testing.assert_close(result, hidden_states + 1)
+    assert kernel_calls[0]["w1"] is packed_w13
+    assert kernel_calls[0]["w2"] is packed_w2
     torch.testing.assert_close(
         kernel_calls[0]["w1_scale"], method.moe_quant_config.w1_scale * 16.0
     )
     torch.testing.assert_close(
         kernel_calls[0]["w2_scale"], method.moe_quant_config.w2_scale * 16.0
     )
+    assert kernel_calls[0]["use_int4_w4a8"] is True
+    assert kernel_calls[0]["use_int8_w8a8"] is False
+    assert kernel_calls[0]["per_channel_quant"] is True
 
     installed_w13 = layer.w13_weight
     installed_w2 = layer.w2_weight
@@ -5855,6 +5963,40 @@ def test_slimquant_w4a8_explicit_triton_prepares_only_vllm_weights(
     assert layer.w13_weight is installed_w13
     assert layer.w2_weight is installed_w2
     assert method.moe_quant_config is installed_quant_config
+
+    # Layerwise checkpoint reload restores the original layer Parameter storage
+    # after post-load, while the rebuilt quant config can still reference its
+    # temporary tensors.  A following kernel-format reload updates only the
+    # restored layer Parameters.  BoltOps must read that canonical storage in
+    # the forward graph rather than either stale object.
+    method.moe_quant_config = SimpleNamespace(
+        w1_scale=torch.full((1, 4, 1), 99.0),
+        w2_scale=torch.full((1, 4, 1), 99.0),
+        a1_scale=None,
+        a2_scale=None,
+    )
+    with torch.no_grad():
+        layer.w13_weight_scale.fill_(2.0)
+        layer.w2_weight_scale.fill_(3.0)
+    method.apply(
+        layer,
+        hidden_states,
+        torch.ones((2, 1), dtype=torch.float32),
+        torch.zeros((2, 1), dtype=torch.int64),
+        None,
+        None,
+    )
+    torch.testing.assert_close(
+        kernel_calls[1]["w1_scale"],
+        torch.full((1, 4, 1), 32.0),
+    )
+    torch.testing.assert_close(
+        kernel_calls[1]["w2_scale"],
+        torch.full((1, 4, 1), 48.0),
+    )
+    with torch.no_grad():
+        layer.w13_weight_scale.fill_(1.0)
+        layer.w2_weight_scale.fill_(1.0)
 
     with torch.no_grad():
         layer.w13_weight_scale.add_(1.0)
@@ -5872,9 +6014,11 @@ def test_slimquant_w4a8_explicit_triton_prepares_only_vllm_weights(
         scale_updated_quant_config.w2_scale,
         torch.full((1, 4, 1), 3.0),
     )
+    assert not hasattr(method, "_hcu_boltops_w4a8_w1_scale")
+    assert not hasattr(method, "_hcu_boltops_w4a8_w2_scale")
 
-    layer.w13_weight = torch.nn.Parameter(packed_w13, requires_grad=False)
-    layer.w2_weight = torch.nn.Parameter(packed_w2, requires_grad=False)
+    layer.w13_weight = torch.nn.Parameter(expected_w13, requires_grad=False)
+    layer.w2_weight = torch.nn.Parameter(expected_w2, requires_grad=False)
     layer.w13_weight_scale = torch.nn.Parameter(
         torch.full((1, 4, 1), 2.0), requires_grad=False
     )
@@ -5892,6 +6036,76 @@ def test_slimquant_w4a8_explicit_triton_prepares_only_vllm_weights(
         method.moe_quant_config.w2_scale,
         torch.full((1, 4, 1), 3.0),
     )
+
+
+@pytest.mark.hcu
+def test_slimquant_w4a8_scale_reload_reaches_existing_graph(
+    monkeypatch: pytest.MonkeyPatch,
+):
+    """A captured forward must reread layer-owned scales after in-place reload."""
+    if not torch.cuda.is_available():
+        pytest.skip("requires a visible HCU for graph replay")
+
+    def fused_experts_impl(hidden_states, _w1, _w2, *_args, **kwargs):
+        return (
+            hidden_states
+            + kwargs["w1_scale"][0, 0, 0]
+            + kwargs["w2_scale"][0, 0, 0]
+        )
+
+    monkeypatch.setattr(
+        compressed_tensors_moe_runtime,
+        "_boltops_w4a8_fused_experts",
+        lambda: fused_experts_impl,
+    )
+    method = SimpleNamespace(
+        moe=SimpleNamespace(
+            hidden_dim=4,
+            activation=SimpleNamespace(value="silu"),
+            num_experts=1,
+        ),
+        moe_quant_config=SimpleNamespace(a1_scale=None, a2_scale=None),
+    )
+    layer = SimpleNamespace(
+        w13_weight=torch.zeros((1, 4, 2), dtype=torch.int8, device="cuda"),
+        w2_weight=torch.zeros((1, 4, 1), dtype=torch.int8, device="cuda"),
+        w13_weight_scale=torch.ones((1, 4, 1), device="cuda"),
+        w2_weight_scale=torch.ones((1, 4, 1), device="cuda"),
+        global_num_experts=1,
+        _expert_map=None,
+        expert_mask=None,
+        swiglu_limit=0.0,
+    )
+    hidden_states = torch.zeros((1, 4), dtype=torch.float16, device="cuda")
+    topk_weights = torch.ones((1, 1), dtype=torch.float32, device="cuda")
+    topk_ids = torch.zeros((1, 1), dtype=torch.int32, device="cuda")
+
+    stream = torch.cuda.Stream()
+    stream.wait_stream(torch.cuda.current_stream())
+    with torch.cuda.stream(stream):
+        for _ in range(3):
+            compressed_tensors_moe_runtime.apply_vllm_w4a8_moe(
+                method, layer, hidden_states, topk_weights, topk_ids
+            )
+    torch.cuda.current_stream().wait_stream(stream)
+    graph = torch.cuda.CUDAGraph()
+    with torch.cuda.graph(graph):
+        output = compressed_tensors_moe_runtime.apply_vllm_w4a8_moe(
+            method, layer, hidden_states, topk_weights, topk_ids
+        )
+    graph.replay()
+    torch.cuda.synchronize()
+    torch.testing.assert_close(output, torch.full_like(output, 32.0))
+
+    layer.w13_weight_scale.fill_(2.0)
+    layer.w2_weight_scale.fill_(3.0)
+    graph.replay()
+    torch.cuda.synchronize()
+    torch.testing.assert_close(output, torch.full_like(output, 80.0))
+    eager = compressed_tensors_moe_runtime.apply_vllm_w4a8_moe(
+        method, layer, hidden_states, topk_weights, topk_ids
+    )
+    torch.testing.assert_close(output, eager)
 
 
 @pytest.mark.hcu
@@ -5949,6 +6163,7 @@ def test_slimquant_w4a8_m1_miss_installs_single_native_triton_layout(
     method.process_weights_after_loading(layer)
 
     assert method.moe_quant_config is not None
+    assert method.supports_int8_allgatherv_input is False
     assert layer.w13_weight.shape == (1, 4, 4)
     assert layer.w2_weight.shape == (1, 4, 2)
     assert layer.w13_weight._hcu_vllm_w4a8_unpacked is True
@@ -6042,6 +6257,82 @@ def test_slimquant_w4a8_legacy_raw_weights_pin_actual_m_to_moe_c(
     assert execute["w1_scale"] is w1_scale
     assert execute["w2_scale"] is w2_scale
     assert execute["gemm1_limit"] == 10.0
+
+
+@pytest.mark.hcu
+def test_slimquant_w4a8_prequantized_input_reaches_aiter_without_requantizing(
+    monkeypatch: pytest.MonkeyPatch,
+):
+    calls: dict[str, object] = {}
+    selected = SimpleNamespace(
+        quant_type="w4a8",
+        solution_type="moe_c",
+        need_shuffle=False,
+        need_shuffle_scale=False,
+    )
+
+    class MoeQuantType:
+        W4A8 = "w4a8"
+
+    def get_config(**kwargs: object):
+        calls["selector"] = kwargs
+        return True, selected
+
+    def aiter_moe(**kwargs: object):
+        calls["execute"] = kwargs
+        return torch.zeros((3, 4), dtype=kwargs["output_dtype"])
+
+    monkeypatch.setitem(
+        sys.modules,
+        "aiter.moe",
+        _module(
+            "aiter.moe",
+            MoeQuantType=MoeQuantType,
+            get_aiter_moe_config=get_config,
+            aiter_moe=aiter_moe,
+        ),
+    )
+    quantized = torch.ones((3, 4), dtype=torch.int8)
+    activation_scale = torch.full((3, 1), 0.125, dtype=torch.float32)
+    topk_weights = torch.ones((3, 2), dtype=torch.float32)
+    topk_ids = torch.zeros((3, 2), dtype=torch.int32)
+    w1 = torch.zeros((2, 8, 2), dtype=torch.int8)
+    w2 = torch.zeros((2, 4, 2), dtype=torch.int8)
+    w1._hcu_aiter_moe_m1_supported = False
+    method = SimpleNamespace(
+        moe=SimpleNamespace(num_experts=2),
+        moe_quant_config=SimpleNamespace(
+            w1_scale=torch.ones((2, 8, 1)),
+            w2_scale=torch.ones((2, 4, 1)),
+            a1_scale=None,
+            a2_scale=None,
+        ),
+    )
+    layer = SimpleNamespace(
+        w13_weight=w1,
+        w2_weight=w2,
+        swiglu_limit=10.0,
+        global_num_experts=2,
+        _expert_map=None,
+        expert_mask=None,
+    )
+
+    result = compressed_tensors_moe_runtime.apply_aiter_w4a8_moe(
+        method,
+        layer,
+        quantized,
+        topk_weights,
+        topk_ids,
+        activation_scale=activation_scale,
+        output_dtype=torch.bfloat16,
+    )
+
+    assert result.dtype is torch.bfloat16
+    assert calls["selector"]["dtype"] is torch.bfloat16
+    execute = calls["execute"]
+    assert execute["hidden_states"] is quantized
+    assert execute["a1_scale"] is activation_scale
+    assert execute["output_dtype"] is torch.bfloat16
 
 
 @pytest.mark.hcu
@@ -6233,7 +6524,6 @@ def test_slimquant_w4a8_actual_m_no_config_uses_cached_selection_and_triton(
 def test_slimquant_w4a8_explicit_triton_runtime_never_selects_aiter(
     monkeypatch: pytest.MonkeyPatch,
 ):
-    from vllm.model_executor.layers.fused_moe import fused_moe
     from vllm_hcu.model_executor.layers.quantization import slimquant_w4a8
 
     monkeypatch.setattr(
@@ -6245,9 +6535,9 @@ def test_slimquant_w4a8_explicit_triton_runtime_never_selects_aiter(
     )
     expected = torch.full((2, 4), 3.0, dtype=torch.float16)
     monkeypatch.setattr(
-        fused_moe,
-        "fused_experts_impl",
-        lambda *args, **kwargs: expected,
+        compressed_tensors_moe_runtime,
+        "_boltops_w4a8_fused_experts",
+        lambda: lambda *args, **kwargs: expected,
     )
     method = slimquant_w4a8.SlimQuantW4A8Int8AiterMoEMethod(
         quant_config=object(),
@@ -6267,6 +6557,8 @@ def test_slimquant_w4a8_explicit_triton_runtime_never_selects_aiter(
     layer = SimpleNamespace(
         w13_weight=torch.zeros((1, 4, 2), dtype=torch.int8),
         w2_weight=torch.zeros((1, 4, 1), dtype=torch.int8),
+        w13_weight_scale=torch.ones((1, 4, 1)),
+        w2_weight_scale=torch.ones((1, 4, 1)),
         global_num_experts=1,
         _expert_map=None,
         expert_mask=None,
@@ -6331,6 +6623,55 @@ def test_slimquant_w4a8_apply_accepts_runner_owned_shared_experts(
     )
 
     assert result is x
+
+
+@pytest.mark.hcu
+def test_slimquant_w4a8_apply_forwards_prequantized_allgather_payload(
+    monkeypatch: pytest.MonkeyPatch,
+):
+    from vllm_hcu.model_executor.layers.quantization import slimquant_w4a8
+
+    calls: list[tuple[tuple[object, ...], dict[str, object]]] = []
+    expected = torch.zeros((3, 2), dtype=torch.bfloat16)
+
+    def apply_aiter(*args: object, **kwargs: object) -> torch.Tensor:
+        calls.append((args, kwargs))
+        return expected
+
+    monkeypatch.setattr(
+        compressed_tensors_moe_runtime,
+        "apply_aiter_w4a8_moe",
+        apply_aiter,
+    )
+    method = object.__new__(slimquant_w4a8.SlimQuantW4A8Int8AiterMoEMethod)
+    method.moe = SimpleNamespace(moe_backend="aiter")
+    method.moe_kernel = None
+    method._supports_int8_allgatherv_input = True
+    layer = SimpleNamespace()
+    quantized = torch.ones((3, 2), dtype=torch.int8)
+    scale = torch.full((3, 1), 0.125, dtype=torch.float32)
+    topk_weights = torch.ones((3, 1), dtype=torch.float32)
+    topk_ids = torch.zeros((3, 1), dtype=torch.int32)
+
+    result = method.apply(
+        layer,
+        quantized,
+        topk_weights,
+        topk_ids,
+        shared_experts=None,
+        shared_experts_input=None,
+        i_q=quantized,
+        i_s=scale,
+        output_dtype=torch.bfloat16,
+    )
+
+    assert method.supports_int8_allgatherv_input is True
+    assert result is expected
+    assert len(calls) == 1
+    args, kwargs = calls[0]
+    assert args[2] is quantized
+    assert kwargs["activation_scale"] is scale
+    assert kwargs["output_dtype"] is torch.bfloat16
 
 
 @pytest.mark.hcu
@@ -9263,3 +9604,34 @@ def test_tf32_hc_prenorm_cpu_fallback_and_backend_delegation():
     module._tf32_hc_prenorm_gemm_impl = object()
     assert module.tf32_hc_prenorm_gemm(x, fn, out, sqrsum, 2) == "backend"
     assert calls[-1] == "backend"
+
+
+def test_transform_sf_identity_fallback_and_backend_delegation():
+    calls: list[object] = []
+
+    def lazy_init():
+        calls.append("lazy")
+
+    def original(*args, **kwargs):
+        calls.append(("backend", args, kwargs))
+        return "backend"
+
+    module = _module(
+        patch_deep_gemm_transform.TARGET_MODULE,
+        _lazy_init=lazy_init,
+        _transform_sf_into_required_layout_impl=None,
+        transform_sf_into_required_layout=original,
+    )
+    assert patch_deep_gemm_transform.apply_to_module(module) is True
+    assert patch_deep_gemm_transform.apply_to_module(module) is False
+
+    sf = torch.ones(4, 2)
+    assert module.transform_sf_into_required_layout(sf, 128, 128) is sf
+    assert module.transform_sf_into_required_layout(sf=sf, mn=128, k=128) is sf
+    with pytest.raises(ValueError, match="requires 'sf'"):
+        module.transform_sf_into_required_layout()
+    assert calls == ["lazy", "lazy", "lazy"]
+
+    module._transform_sf_into_required_layout_impl = object()
+    assert module.transform_sf_into_required_layout(sf, 128, 128) == "backend"
+    assert calls[-2:] == ["lazy", ("backend", (sf, 128, 128), {})]

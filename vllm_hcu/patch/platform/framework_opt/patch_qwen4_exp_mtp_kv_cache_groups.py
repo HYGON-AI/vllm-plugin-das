@@ -271,7 +271,10 @@ def apply_to_module(module: ModuleType) -> bool:
 
         local_tensors = []
         for tensor in config.kv_cache_tensors:
-            tensor_layers = set(tensor.layers)
+            tensor_layers = getattr(tensor, "shared_by", None)
+            if tensor_layers is None:
+                tensor_layers = getattr(tensor, "layers", ())
+            tensor_layers = set(tensor_layers)
             if not tensor_layers:
                 raise RuntimeError(
                     "Qwen hybrid MTP PP found a KV tensor without layers"
@@ -287,7 +290,7 @@ def apply_to_module(module: ModuleType) -> bool:
             if local and remote:
                 raise RuntimeError(
                     "Qwen hybrid MTP PP KV tensor mixes local and remote "
-                    f"layers: {tensor.layers}"
+                    f"layers: {sorted(tensor_layers)}"
                 )
             if local:
                 local_tensors.append(tensor)

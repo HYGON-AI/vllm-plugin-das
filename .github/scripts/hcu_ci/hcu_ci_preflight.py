@@ -31,43 +31,67 @@ class PreflightError(RuntimeError):
     """Raised when the selected runner cannot execute its assigned job."""
 
 
-def _version_specification(value: object, *, name: str) -> dict[str, str]:
+def _version_specification(value: object, *, name: str) -> dict[str, Any]:
     if isinstance(value, str):
         return {"match": "exact", "version": value}
     if not isinstance(value, dict):
         raise PreflightError(f"{name} must be a version string or mapping")
     match = value.get("match")
     version = value.get("version")
-    if match not in {"exact", "prefix", "release"} or not isinstance(version, str):
+    versions = value.get("versions")
+    has_version = "version" in value
+    has_versions = "versions" in value
+    valid_versions = (
+        isinstance(versions, list)
+        and bool(versions)
+        and all(isinstance(item, str) and item for item in versions)
+        and len(versions) == len(set(versions))
+    )
+    if (
+        match not in {"exact", "prefix", "release"}
+        or has_version == has_versions
+        or (has_version and (not isinstance(version, str) or not version))
+        or (has_versions and not valid_versions)
+    ):
         raise PreflightError(
-            f"{name} must declare match=exact|prefix|release and a version string"
+            f"{name} must declare match=exact|prefix|release and exactly one "
+            "non-empty version string or versions list"
         )
-    return {"match": match, "version": version}
+    if isinstance(version, str):
+        return {"match": match, "version": version}
+    return {"match": match, "versions": versions}
 
 
-def _matches_version(actual: str | None, specification: dict[str, str]) -> bool:
+def _expected_versions(specification: dict[str, Any]) -> list[str]:
+    version = specification.get("version")
+    return [version] if isinstance(version, str) else specification["versions"]
+
+
+def _expected_version_text(specification: dict[str, Any]) -> str:
+    return "|".join(_expected_versions(specification))
+
+
+def _matches_version(actual: str | None, specification: dict[str, Any]) -> bool:
     if actual is None:
         return False
-    if specification["match"] == "release":
-        try:
-            return Version(actual).release == Version(
-                specification["version"]
-            ).release
-        except InvalidVersion:
-            return False
-    if specification["match"] == "prefix":
-        expected = specification["version"]
-        if not actual.startswith(expected):
-            return False
-        # A numeric prefix denotes a complete release component: ``0.28.1``
-        # accepts RC/dev/local suffixes but must not accept ``0.28.10``.
-        return not (
-            expected
-            and expected[-1].isdigit()
-            and len(actual) > len(expected)
-            and actual[len(expected)].isdigit()
-        )
-    return actual == specification["version"]
+    for expected in _expected_versions(specification):
+        if specification["match"] == "release":
+            try:
+                if Version(actual).release == Version(expected).release:
+                    return True
+            except InvalidVersion:
+                return False
+        elif specification["match"] == "prefix":
+            if actual.startswith(expected) and not (
+                expected
+                and expected[-1].isdigit()
+                and len(actual) > len(expected)
+                and actual[len(expected)].isdigit()
+            ):
+                return True
+        elif actual == expected:
+            return True
+    return False
 
 
 def _distribution_version(name: str) -> str | None:
@@ -135,7 +159,8 @@ def _check_requirements(
             if not _matches_version(actual, specification):
                 raise PreflightError(
                     f"required distribution drift for {name}: expected "
-                    f"{specification['match']} {specification['version']}, "
+                    f"{specification['match']} "
+                    f"{_expected_version_text(specification)}, "
                     f"got {actual}"
                 )
             resolved.append(
@@ -178,8 +203,10 @@ def _load_environment_lock(path: Path) -> dict[str, Any]:
         raise PreflightError(f"cannot load environment lock {path}: {exc}") from exc
     if not isinstance(lock, dict) or lock.get("schema_version") != 1:
         raise PreflightError("environment lock must be a schema_version=1 mapping")
-    if not isinstance(lock.get("python"), str):
-        raise PreflightError("environment lock must declare an exact Python version")
+    lock["python"] = _version_specification(
+        lock.get("python"),
+        name="environment lock python",
+    )
     lock["torch_hip"] = _version_specification(
         lock.get("torch_hip"),
         name="environment lock torch_hip",
@@ -199,14 +226,23 @@ def _load_environment_lock(path: Path) -> dict[str, Any]:
     rocm = lock.get("rocm")
     if not isinstance(rocm, dict) or not all(
         isinstance(rocm.get(name), str) and rocm[name]
-        for name in ("environment", "version_file", "version")
+        for name in ("environment", "version_file")
     ):
         raise PreflightError("environment lock must declare the DTK/ROCm version file")
+    rocm_specification = _version_specification(
+        {
+            "match": "exact" if rocm.get("match", "exact") == "exact" else "prefix",
+            **({"version": rocm["version"]} if "version" in rocm else {}),
+            **({"versions": rocm["versions"]} if "versions" in rocm else {}),
+        },
+        name="environment lock DTK/ROCm",
+    )
     rocm_match = rocm.get("match", "exact")
     if rocm_match not in ("exact", "release_line"):
         raise PreflightError("DTK/ROCm must declare match=exact|release_line")
-    if rocm_match == "release_line" and not re.fullmatch(
-        r"[0-9]+\.[0-9]+", rocm["version"]
+    if rocm_match == "release_line" and not all(
+        re.fullmatch(r"[0-9]+\.[0-9]+", version)
+        for version in _expected_versions(rocm_specification)
     ):
         raise PreflightError("DTK/ROCm release line must have major.minor form")
     return lock
@@ -221,26 +257,29 @@ def _check_environment_lock(
     lock = _load_environment_lock(path)
     actual_python = platform.python_version()
     expected_python = lock["python"]
-    if actual_python != expected_python:
+    if not _matches_version(actual_python, expected_python):
         raise PreflightError(
-            f"runner Python drift: expected {expected_python}, got {actual_python}"
+            "runner Python drift: expected "
+            f"{expected_python['match']} {_expected_version_text(expected_python)}, "
+            f"got {actual_python}"
         )
     expected_hip = lock["torch_hip"]
     if not _matches_version(torch_hip, expected_hip):
         raise PreflightError(
             "runner torch HIP drift: expected "
-            f"{expected_hip['match']} {expected_hip['version']}, got {torch_hip}"
+            f"{expected_hip['match']} {_expected_version_text(expected_hip)}, "
+            f"got {torch_hip}"
         )
 
     for name, specification in lock["distributions"].items():
         actual = versions.get(name)
-        expected = specification["version"]
         if actual is None:
             raise PreflightError(f"locked distribution is missing: {name}")
         if not _matches_version(actual, specification):
             raise PreflightError(
                 f"runner distribution drift for {name}: expected "
-                f"{specification['match']} {expected}, got {actual}"
+                f"{specification['match']} "
+                f"{_expected_version_text(specification)}, got {actual}"
             )
 
     rocm = lock["rocm"]
@@ -257,23 +296,28 @@ def _check_environment_lock(
             f"cannot read DTK/ROCm version from {version_path}: {exc}"
         ) from exc
     rocm_match = rocm.get("match", "exact")
-    matches_rocm = actual_rocm == rocm["version"]
+    expected_rocm_versions = _expected_versions(rocm)
+    matches_rocm = actual_rocm in expected_rocm_versions
     if rocm_match == "release_line":
         # Keep a component boundary: 26.040 is not in the 26.04 release line.
-        pattern = (
-            re.escape(rocm["version"])
-            + r"(?:\.[0-9]+)*(?:[-+][A-Za-z0-9]+(?:[._+-][A-Za-z0-9]+)*)?"
+        matches_rocm = any(
+            re.fullmatch(
+                re.escape(version)
+                + r"(?:\.[0-9]+)*(?:[-+][A-Za-z0-9]+(?:[._+-][A-Za-z0-9]+)*)?",
+                actual_rocm,
+            )
+            is not None
+            for version in expected_rocm_versions
         )
-        matches_rocm = re.fullmatch(pattern, actual_rocm) is not None
     if not matches_rocm:
         raise PreflightError(
             "runner DTK/ROCm drift: expected "
-            f"{rocm_match} {rocm['version']}, got {actual_rocm}"
+            f"{rocm_match} {'|'.join(expected_rocm_versions)}, got {actual_rocm}"
         )
     return {
         "path": str(path.resolve()),
-        "python": expected_python,
-        "torch_hip": expected_hip["version"],
+        "python": actual_python,
+        "torch_hip": torch_hip,
         "rocm": actual_rocm,
         "distributions": lock["distributions"],
     }

@@ -64,6 +64,26 @@ assert _vllm_hcu_file.is_relative_to(_vllm_hcu_root), (
 '''
 
 
+def test_hcu_accepts_gptq_alias_selected_by_current_vllm() -> None:
+    from vllm.model_executor.layers.quantization import get_quantization_config
+    from vllm_hcu.platforms.hcu import HCUPlatform
+
+    gptq_config = {
+        "quant_method": "gptq",
+        "bits": 4,
+        "group_size": 128,
+        "desc_act": False,
+        "sym": True,
+    }
+    resolved = get_quantization_config("gptq").override_quantization_method(
+        gptq_config,
+        user_quant=None,
+    )
+
+    assert resolved == "auto_gptq"
+    HCUPlatform.verify_quantization(resolved)
+
+
 def _run_fresh_target(code: str) -> subprocess.CompletedProcess[str]:
     env = dict(os.environ)
     for name in (
@@ -84,6 +104,48 @@ def _run_fresh_target(code: str) -> subprocess.CompletedProcess[str]:
         text=True,
         env=env,
         timeout=120,
+    )
+
+
+@pytest.mark.parametrize(
+    "model_type", ["kimi_k3", "kimi_linear", "deepseek_v4", "qwen3", None]
+)
+@pytest.mark.parametrize("compiled", [False, True])
+def test_ir_priority_scopes_kimi_fallback_to_its_model_config(model_type, compiled):
+    from vllm.config.compilation import CompilationMode
+    from vllm.platforms.interface import Platform
+    from vllm_hcu.platforms.hcu import HCUPlatform
+
+    config = SimpleNamespace(
+        model_config=SimpleNamespace(
+            hf_config=SimpleNamespace(model_type=model_type)
+        ),
+        compilation_config=SimpleNamespace(
+            backend="inductor",
+            mode=CompilationMode.VLLM_COMPILE if compiled else CompilationMode.NONE,
+        ),
+    )
+    priority = dataclasses.asdict(HCUPlatform.get_default_ir_op_priority(config))
+    if model_type in ("kimi_k3", "kimi_linear"):
+        assert priority == {
+            "rms_norm": ["vllm_c", "native"],
+            "fused_add_rms_norm": ["vllm_c", "native"],
+        }
+    else:
+        assert priority == dataclasses.asdict(
+            Platform.get_default_ir_op_priority(config)
+        )
+        assert all(providers == ["native"] for providers in priority.values())
+
+
+@pytest.mark.parametrize("model_config", [None, SimpleNamespace(hf_config=None)])
+def test_ir_priority_without_model_metadata_preserves_platform_default(model_config):
+    from vllm.platforms.interface import Platform
+    from vllm_hcu.platforms.hcu import HCUPlatform
+
+    config = SimpleNamespace(model_config=model_config)
+    assert HCUPlatform.get_default_ir_op_priority(config) == (
+        Platform.get_default_ir_op_priority(config)
     )
 
 
@@ -849,11 +911,21 @@ def _make_compilation_module() -> ModuleType:
     module = ModuleType(patch_compilation_config.TARGET_MODULE)
 
     class _CUDAGraphMode:
-        def __init__(self, piecewise: bool = True) -> None:
+        def __init__(self, *, full: bool = False, piecewise: bool = False) -> None:
+            self.full = full
             self.piecewise = piecewise
+
+        def has_full_cudagraphs(self) -> bool:
+            return self.full
 
         def has_piecewise_cudagraphs(self) -> bool:
             return self.piecewise
+
+    full = _CUDAGraphMode(full=True)
+    piecewise = _CUDAGraphMode(piecewise=True)
+    full_and_piecewise = _CUDAGraphMode(full=True, piecewise=True)
+    full_decode_only = _CUDAGraphMode(full=True)
+    none = _CUDAGraphMode()
 
     class CompilationConfig:
         def __init__(self) -> None:
@@ -863,7 +935,7 @@ def _make_compilation_module() -> ModuleType:
             self.splitting_calls = 0
             self.splitting_ops = ["vllm::unified_mla_attention_with_output"]
             self.use_inductor_graph_partition = False
-            self.cudagraph_mode = _CUDAGraphMode()
+            self.cudagraph_mode = full_and_piecewise
 
         def adjust_cudagraph_sizes_for_spec_decode(
             self,
@@ -882,7 +954,13 @@ def _make_compilation_module() -> ModuleType:
             self.splitting_calls += 1
             return all2all_backend, data_parallel_size
 
-    module.CUDAGraphMode = SimpleNamespace(NONE=_CUDAGraphMode(piecewise=False))
+    module.CUDAGraphMode = SimpleNamespace(
+        NONE=none,
+        FULL=full,
+        PIECEWISE=piecewise,
+        FULL_AND_PIECEWISE=full_and_piecewise,
+        FULL_DECODE_ONLY=full_decode_only,
+    )
     module.CompilationConfig = CompilationConfig
     return module
 
@@ -926,7 +1004,7 @@ def test_compilation_adapter_splits_hcu_sparse_indexer_from_piecewise_graph() ->
     assert config.splitting_ops.count("vllm::hcu_sparse_attn_indexer") == 1
 
 
-def test_compilation_adapter_disables_cudagraph_for_dp_deepep_auto() -> None:
+def test_compilation_adapter_falls_back_to_decode_graph_for_dp_deepep_auto() -> None:
     module = _make_compilation_module()
     patch_compilation_config.apply_to_module(module)
     config = module.CompilationConfig()
@@ -938,7 +1016,160 @@ def test_compilation_adapter_disables_cudagraph_for_dp_deepep_auto() -> None:
 
     config.set_splitting_ops_for_v1("deepep_low_latency", 8)
 
+    assert config.cudagraph_mode is module.CUDAGraphMode.FULL_DECODE_ONLY
+    assert not config.cudagraph_mode.has_piecewise_cudagraphs()
+
+
+@pytest.mark.parametrize(
+    ("configured_mode", "expected_mode"),
+    [
+        ("FULL", "FULL_DECODE_ONLY"),
+        ("PIECEWISE", "NONE"),
+    ],
+)
+def test_compilation_adapter_normalizes_explicit_dp_deepep_auto_graph_mode(
+    configured_mode: str,
+    expected_mode: str,
+) -> None:
+    module = _make_compilation_module()
+    patch_compilation_config.apply_to_module(module)
+    config = module.CompilationConfig()
+    config.cudagraph_mode = getattr(module.CUDAGraphMode, configured_mode)
+    vllm_config = SimpleNamespace(
+        additional_config={"hcu": HcuFeatureConfig(deepep_auto=True).to_dict()},
+        compilation_config=config,
+    )
+    patch_compilation_config.bind_hcu_config(vllm_config)
+
+    config.set_splitting_ops_for_v1("deepep_low_latency", 8)
+
+    assert config.cudagraph_mode is getattr(
+        module.CUDAGraphMode, expected_mode
+    )
+
+
+@pytest.mark.parametrize(
+    "configured_mode",
+    ["FULL", "PIECEWISE", "FULL_AND_PIECEWISE", "FULL_DECODE_ONLY"],
+)
+def test_compilation_adapter_forces_fixed_ht_deepep_auto_producer_to_eager(
+    configured_mode: str,
+) -> None:
+    module = _make_compilation_module()
+    patch_compilation_config.apply_to_module(module)
+    config = module.CompilationConfig()
+    config.cudagraph_mode = getattr(module.CUDAGraphMode, configured_mode)
+    vllm_config = SimpleNamespace(
+        additional_config={"hcu": HcuFeatureConfig(deepep_auto=True).to_dict()},
+        compilation_config=config,
+        model_config=SimpleNamespace(architectures=["DeepseekV4ForCausalLM"]),
+        speculative_config=SimpleNamespace(method="dspark"),
+        kv_transfer_config=SimpleNamespace(
+            kv_connector="MooncakeConnector",
+            kv_role="kv_producer",
+        ),
+    )
+    patch_compilation_config.bind_hcu_config(vllm_config)
+
+    config.set_splitting_ops_for_v1("deepep_low_latency", 8)
+
     assert config.cudagraph_mode is module.CUDAGraphMode.NONE
+
+
+def test_compilation_adapter_limits_fixed_ll_deepep_auto_consumer_to_decode_full(
+) -> None:
+    module = _make_compilation_module()
+    patch_compilation_config.apply_to_module(module)
+    config = module.CompilationConfig()
+    config.cudagraph_mode = module.CUDAGraphMode.FULL
+    vllm_config = SimpleNamespace(
+        additional_config={"hcu": HcuFeatureConfig(deepep_auto=True).to_dict()},
+        compilation_config=config,
+        model_config=SimpleNamespace(architectures=["DeepseekV4ForCausalLM"]),
+        speculative_config=SimpleNamespace(method="dspark"),
+        kv_transfer_config=SimpleNamespace(
+            kv_connector="MooncakeConnector",
+            kv_role="kv_consumer",
+        ),
+    )
+    patch_compilation_config.bind_hcu_config(vllm_config)
+
+    config.set_splitting_ops_for_v1("deepep_low_latency", 8)
+
+    assert config.cudagraph_mode is module.CUDAGraphMode.FULL_DECODE_ONLY
+
+
+def test_compilation_adapter_restores_fixed_ht_policy_from_mapping_config() -> None:
+    module = _make_compilation_module()
+    patch_compilation_config.apply_to_module(module)
+    config = module.CompilationConfig()
+    config.cudagraph_mode = module.CUDAGraphMode.FULL_DECODE_ONLY
+    serialized_vllm_config = {
+        "additional_config": {
+            "hcu": HcuFeatureConfig(deepep_auto=True).to_dict()
+        },
+        "compilation_config": config,
+        "model_config": {"architectures": ["DeepseekV4ForCausalLM"]},
+        "speculative_config": {"method": "dspark"},
+        "kv_transfer_config": {
+            "kv_connector": "MooncakeConnector",
+            "kv_role": "kv_producer",
+        },
+        "parallel_config": {
+            "data_parallel_size": 4,
+            "prefill_context_parallel_size": 1,
+            "decode_context_parallel_size": 1,
+        },
+    }
+    patch_compilation_config.bind_hcu_config(serialized_vllm_config)
+
+    # Worker rebind accepts the pickled dictionary form. Use the callback's
+    # default DP argument to prove the bound nested topology was restored too.
+    config.set_splitting_ops_for_v1("deepep_low_latency")
+
+    assert config.cudagraph_mode is module.CUDAGraphMode.NONE
+
+
+def test_compilation_adapter_keeps_piecewise_for_single_rank_deepep_auto() -> None:
+    module = _make_compilation_module()
+    patch_compilation_config.apply_to_module(module)
+    config = module.CompilationConfig()
+    vllm_config = SimpleNamespace(
+        additional_config={"hcu": HcuFeatureConfig(deepep_auto=True).to_dict()},
+        compilation_config=config,
+    )
+    patch_compilation_config.bind_hcu_config(vllm_config)
+
+    config.set_splitting_ops_for_v1("deepep_low_latency", 1)
+
+    assert config.cudagraph_mode is module.CUDAGraphMode.FULL_AND_PIECEWISE
+
+
+def test_compilation_adapter_keeps_explicit_none_for_dp_deepep_auto() -> None:
+    module = _make_compilation_module()
+    patch_compilation_config.apply_to_module(module)
+    config = module.CompilationConfig()
+    config.cudagraph_mode = module.CUDAGraphMode.NONE
+    vllm_config = SimpleNamespace(
+        additional_config={"hcu": HcuFeatureConfig(deepep_auto=True).to_dict()},
+        compilation_config=config,
+    )
+    patch_compilation_config.bind_hcu_config(vllm_config)
+
+    config.set_splitting_ops_for_v1("deepep_low_latency", 8)
+
+    assert config.cudagraph_mode is module.CUDAGraphMode.NONE
+
+
+def test_compilation_adapter_keeps_unrelated_backend_graph_mode() -> None:
+    module = _make_compilation_module()
+    patch_compilation_config.apply_to_module(module)
+    config = module.CompilationConfig()
+    configured_mode = config.cudagraph_mode
+
+    config.set_splitting_ops_for_v1("allgather_reducescatter", 8)
+
+    assert config.cudagraph_mode is configured_mode
 
 
 def test_compilation_adapter_defers_to_inductor_unsafe_tags() -> None:
@@ -1237,7 +1468,9 @@ def test_real_v0251_set_cudagraph_binds_custom_sp_before_first_adjustment() -> N
 
 
 class _ValidationCompilation:
-    pass
+    def __init__(self) -> None:
+        # Mirrors CompilationConfig: no attention layers are registered yet.
+        self.static_forward_context: dict[str, object] = {}
 
 
 def _validation_config(feature_config: HcuFeatureConfig) -> object:
@@ -1354,6 +1587,18 @@ def test_deepep_auto_rejects_eplb_before_model_loading() -> None:
         match="deepep_auto.*EPLB.*not supported",
     ):
         patch_vllm_config.validate_and_update_hcu_config(config)
+
+
+def test_deepep_auto_accepts_static_eplb_without_rearrangement() -> None:
+    config = _validation_config(
+        HcuFeatureConfig(deepep_auto=True, expert_map_path="/tmp/map.json")
+    )
+    config.parallel_config.all2all_backend = "deepep_low_latency"
+    config.parallel_config.enable_eplb = True
+    config.parallel_config.data_parallel_size = 8
+    config.parallel_config.enable_expert_parallel = True
+
+    patch_vllm_config.validate_and_update_hcu_config(config)
 
 
 @pytest.mark.parametrize(
@@ -1613,6 +1858,14 @@ def test_slimquant_uses_public_registry_without_loading_concrete_kernels(
         facade.get_supported_act_dtypes()
 
 
+def test_slimquant_marlin_facade_resolves_supported_activation_dtypes() -> None:
+    assert slimquant_facade.SlimQuantMarlinFacade.get_supported_act_dtypes() == [
+        torch.float32,
+        torch.float16,
+        torch.bfloat16,
+    ]
+
+
 def test_slimquant_registry_rejects_provider_conflict() -> None:
     module = _make_quantization_module()
     module.QUANTIZATION_METHODS.append("slimquant_w4a8")
@@ -1861,6 +2114,45 @@ def test_fused_qwen3_rms_rope_policy_is_finalized_before_config_hash(
     assert get_hcu_config(config) == feature_config
 
 
+@pytest.mark.parametrize(
+    ("master", "feature", "expected"),
+    [
+        ("0", "0", False),
+        ("0", "1", False),
+        ("1", "0", False),
+        ("1", "1", True),
+    ],
+)
+def test_dp_int8_allgather_policy_is_serialized_for_workers(
+    monkeypatch: pytest.MonkeyPatch,
+    master: str,
+    feature: str,
+    expected: bool,
+) -> None:
+    monkeypatch.setenv("VLLM_HCU_USE_CUSTOM_OPS", master)
+    monkeypatch.setenv("VLLM_HCU_DP_INT8_ALLGATHER", feature)
+
+    config = _validation_config(HcuFeatureConfig())
+    feature_config = patch_vllm_config.validate_and_update_hcu_config(config)
+
+    assert feature_config.dp_int8_allgather is expected
+    assert get_hcu_config(config) == feature_config
+
+
+def test_dp_int8_allgather_effective_policy_partitions_persistent_cache(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    def cache_key(master: str, feature: str) -> str:
+        monkeypatch.setenv("VLLM_HCU_USE_CUSTOM_OPS", master)
+        monkeypatch.setenv("VLLM_HCU_DP_INT8_ALLGATHER", feature)
+        config = _validation_config(HcuFeatureConfig())
+        patch_vllm_config.validate_and_update_hcu_config(config)
+        return _vllm_hash(config.additional_config)
+
+    assert cache_key("0", "0") == cache_key("0", "1")
+    assert cache_key("1", "0") != cache_key("1", "1")
+
+
 def test_fused_qwen3_rms_rope_effective_policy_partitions_persistent_cache(
     monkeypatch: pytest.MonkeyPatch,
     tmp_path: Path,
@@ -1985,6 +2277,70 @@ def test_sparse_cache_normalization_tolerates_missing_attention_config(
     HCUPlatform.check_and_update_config(config)
 
     assert config.cache_config.cache_dtype == "fp8_e4m3"
+
+
+@pytest.mark.parametrize(
+    "parallel_dimension",
+    ["prefill_context_parallel_size", "decode_context_parallel_size"],
+)
+def test_deepep_auto_platform_final_graph_policy_disables_piecewise(
+    monkeypatch: pytest.MonkeyPatch,
+    parallel_dimension: str,
+) -> None:
+    from vllm.config.compilation import CUDAGraphMode
+    from vllm_hcu.patch.import_coordinator import IMPORT_COORDINATOR
+    from vllm_hcu.patch.platform.framework_opt import patch_multiproc_executor
+    from vllm_hcu.platforms.hcu import HCUPlatform
+
+    if parallel_dimension == "prefill_context_parallel_size":
+        from tests.runtime_patch.test_glm52_pcp_config import _make_pcp_config
+
+        config = _make_pcp_config(
+            architecture="DeepseekV4ForCausalLM",
+            use_mla=True,
+            pcp=2,
+            dp=1,
+            enable_expert_parallel=True,
+            enforce_eager=True,
+            all2all_backend="deepep_low_latency",
+            moe_backend="auto",
+        )
+        config.additional_config = {
+            "hcu": HcuFeatureConfig(deepep_auto=True).to_dict()
+        }
+        config.compilation_config = _ValidationCompilation()
+        config.scheduler_config = SimpleNamespace(max_num_batched_tokens=256)
+        config.model_config.max_model_len = 4096
+        config.parallel_config.use_ubatching = False
+        config.cache_config.user_specified_block_size = True
+        config.cache_config.block_size = 64
+        config.cache_config.kv_cache_dtype_skip_layers = []
+    else:
+        config = _validation_config(HcuFeatureConfig(deepep_auto=True))
+        config.model_config.architectures = ["DeepseekV4ForCausalLM"]
+        config.model_config.enforce_eager = False
+        config.parallel_config.all2all_backend = "deepep_low_latency"
+        config.parallel_config.data_parallel_size = 4
+        config.parallel_config.enable_expert_parallel = True
+        config.parallel_config.enable_eplb = False
+        config.parallel_config.use_ubatching = False
+        config.cache_config = None
+        config.attention_config = None
+    config.parallel_config.worker_cls = "custom"
+    config.parallel_config.distributed_executor_backend = "uni"
+    setattr(config.parallel_config, parallel_dimension, 2)
+    config.compilation_config.cudagraph_mode = CUDAGraphMode.FULL_DECODE_ONLY
+
+    monkeypatch.setattr(IMPORT_COORDINATOR, "drain_ready_callbacks", lambda: None)
+    monkeypatch.setattr(
+        patch_multiproc_executor,
+        "select_hcu_multiproc_executor",
+        lambda _vllm_config: None,
+    )
+
+    HCUPlatform.check_and_update_config(config)
+
+    assert config.compilation_config.cudagraph_mode is CUDAGraphMode.NONE
 
 
 def test_sparse_flashmla_sets_engine_cache_block_size_before_worker_start(
@@ -2549,3 +2905,57 @@ def test_qwen4_exp_hc_sp_falls_back_with_lora_or_compiler_sp(
 
     feature_config = patch_vllm_config.validate_and_update_hcu_config(config)
     assert feature_config.qwen4_exp_hc_sp is expected
+
+
+@pytest.mark.parametrize("architecture", [
+    "DeepseekV4ForCausalLM", "DeepSeekV4MTPModel",
+])
+@pytest.mark.parametrize("pcp", [2, 4, 8])
+def test_deepep_auto_accepts_deepseek_v4_pcp_without_dp(pcp, architecture):
+    from tests.runtime_patch.test_glm52_pcp_config import _make_pcp_config
+
+    config = _make_pcp_config(
+        architecture=architecture, pcp=pcp,
+        all2all_backend="deepep_low_latency", enable_eplb=False,
+    )
+    config.additional_config = {
+        "hcu": HcuFeatureConfig(deepep_auto=True, moe_backend="deep_gemm").to_dict()
+    }
+    config.compilation_config = _ValidationCompilation()
+    config.scheduler_config = SimpleNamespace(max_num_batched_tokens=32768)
+    result = patch_vllm_config.validate_and_update_hcu_config(config)
+    assert result.deepep_auto
+    assert config.parallel_config._vllm_hcu_deepep_auto
+    assert config.parallel_config.data_parallel_size == 1
+
+
+@pytest.mark.parametrize("architecture,pcp", [
+    ("GlmMoeDsaForCausalLM", 2),
+    ("GlmMoeDsaForCausalLM", 4),
+    ("GlmMoeDsaForCausalLM", 8),
+    ("Glm5NextForCausalLM", 8),
+])
+def test_deepep_auto_rejects_non_v4_pcp_only_topology(architecture, pcp):
+    from tests.runtime_patch.test_glm52_pcp_config import _make_pcp_config
+
+    config = _make_pcp_config(
+        architecture=architecture, pcp=pcp, tp=1,
+        hybrid=architecture == "Glm5NextForCausalLM",
+        all2all_backend="deepep_low_latency",
+    )
+    config.additional_config = {
+        "hcu": HcuFeatureConfig(deepep_auto=True, moe_backend="deep_gemm").to_dict()
+    }
+    config.compilation_config = _ValidationCompilation()
+    config.scheduler_config = SimpleNamespace(max_num_batched_tokens=32768)
+    with pytest.raises(ValueError, match="PCP-only.*DeepSeek V4"):
+        patch_vllm_config.validate_and_update_hcu_config(config)
+
+
+def test_deepep_auto_keeps_glm_dp_ep_without_pcp():
+    config = _validation_config(HcuFeatureConfig(deepep_auto=True))
+    config.model_config.architectures = ["GlmMoeDsaForCausalLM"]
+    config.parallel_config.data_parallel_size = 2
+    config.parallel_config.enable_expert_parallel = True
+    config.parallel_config.all2all_backend = "deepep_low_latency"
+    assert patch_vllm_config.validate_and_update_hcu_config(config).deepep_auto

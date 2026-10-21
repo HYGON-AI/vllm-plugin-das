@@ -840,17 +840,21 @@ def test_hcu_model_runner_v2_scopes_request_phase_around_upstream_execute(
     upstream_name = "vllm.v1.worker.gpu.model_runner"
     adapter_name = "vllm_hcu.v1.hcu_model_runner_v2"
     upstream_module = ModuleType(upstream_name)
+    prepared_inputs = []
 
     class UpstreamGPUModelRunner:
         def __init__(self, vllm_config, device):
             self.vllm_config = vllm_config
             self.upstream_init = (vllm_config, device)
 
-        def prepare_inputs(self, scheduler_output, batch_desc, batch_req_state):
+        def prepare_inputs(self, scheduler_output, batch_req_state, batch_desc):
+            prepared_inputs.append(
+                (scheduler_output, batch_req_state, batch_desc)
+            )
             return SimpleNamespace(is_prefilling_np=[False, False])
 
         def execute_model(self):
-            self.prepare_inputs(None, None, None)
+            self.prepare_inputs("scheduler", "batch_state", "batch_desc")
             from vllm_hcu.forward_context_runtime import (
                 get_deepep_auto_request_phase,
             )
@@ -871,6 +875,7 @@ def test_hcu_model_runner_v2_scopes_request_phase_around_upstream_execute(
     assert runner.upstream_init == (config, device)
     assert runner.pcp_manager is None
     assert runner.execute_model() == [False, False]
+    assert prepared_inputs == [("scheduler", "batch_state", "batch_desc")]
     from vllm_hcu.forward_context_runtime import get_deepep_auto_request_phase
 
     assert get_deepep_auto_request_phase() is None

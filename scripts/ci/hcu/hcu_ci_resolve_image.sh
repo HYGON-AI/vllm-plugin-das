@@ -56,7 +56,7 @@ emit_usable_ref() {
     refresh_ref "$ref" || true
   fi
   if ! has_control_python "$ref"; then
-    echo "skipping HCU CI image candidate without python3: $ref" >&2
+    echo "skipping HCU CI image candidate without the default python3: $ref" >&2
     return 1
   fi
   inspect_ref "$ref"

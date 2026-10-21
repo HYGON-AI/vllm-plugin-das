@@ -67,6 +67,7 @@ def slimquant_w4a8_uses_deepep_auto(moe_config: object) -> bool:
         return False
 
     dp_size = getattr(parallel_config, "dp_size", 1)
+    pcp_size = getattr(parallel_config, "pcp_size", 1)
     use_ep = bool(getattr(parallel_config, "use_ep", False))
     all2all_backend = getattr(parallel_config, "all2all_backend", None)
     auto_kernels = getattr(
@@ -102,10 +103,10 @@ def slimquant_w4a8_uses_deepep_auto(moe_config: object) -> bool:
             )
         return False
 
-    if not is_dp_ep:
+    if not (use_ep and (dp_size > 1 or pcp_size > 1)):
         raise ValueError(
-            "SlimQuant W4A8 deepep_auto requires dp_size > 1 and expert "
-            "parallelism enabled"
+            "SlimQuant W4A8 deepep_auto requires dp_size > 1 or "
+            "pcp_size > 1, with expert parallelism enabled"
         )
     if auto_kernels is False:
         raise ValueError(
@@ -127,16 +128,22 @@ def slimquant_w4a8_uses_deepep_auto(moe_config: object) -> bool:
     architectures = model_architectures(vllm_config)
     supported_architectures = {
         "DeepseekV4ForCausalLM",
+        "DeepSeekV4MTPModel",
         # GLM's DSA model is implemented by vLLM as a direct
         # DeepseekV2ForCausalLM subclass and uses the same SiLU routed-expert
         # contract.  Channel SlimQuant checkpoints therefore share the
         # DeepEP W4A8 packing and DeepGEMM execution path.
         "GlmMoeDsaForCausalLM",
+        # Qwen4Exp uses the same SiLU routed-expert contract. Both entry
+        # points are needed because --language-model-only selects the causal
+        # LM wrapper while the checkpoint advertises the conditional wrapper.
+        "Qwen4ExpForCausalLM",
+        "Qwen4ExpForConditionalGeneration",
     }
     if supported_architectures.isdisjoint(architectures):
         raise ValueError(
             "SlimQuant W4A8 deepep_auto is validated only for DeepSeek-V4 "
-            "or GLM MoE DSA; "
+            "and its native MTP draft, GLM MoE DSA, or Qwen4Exp; "
             f"got architectures={architectures!r}"
         )
     activation = getattr(moe_config, "activation", None)
@@ -284,6 +291,21 @@ def ht_do_dispatch(
     )
 
 
+def _bind_ht_exact_layout(meta, rows, top_k, counts):
+    """Bind actual physical counts to a full unpadded received HT batch."""
+    counts = tuple(int(c) for c in counts)
+    total = sum(counts)
+    if not counts or not all(0 <= c <= rows for c in counts):
+        return False
+    # With expert_alignment=1, every received row has at least one local
+    # expert and at most top_k. Reject padded/stale/corrupt count metadata.
+    if not rows <= total <= rows * top_k:
+        return False
+    exact_m = sum(((c + 255) // 256) * 256 for c in counts)
+    meta._hcu_deepep_ht_layout = (rows, top_k, len(counts), exact_m)
+    return True
+
+
 def ht_receiver(
     module,
     self,
@@ -318,6 +340,29 @@ def ht_receiver(
     post_dispatch_channel_fp8 = _uses_post_dispatch_channel_fp8_quant(
         quant_config
     )
+    # DeepEP reports physical per-rank expert counts for exactly these rows.
+    # Offset conversion above preserves local expert ownership; EPLB routing
+    # to physical slots has already occurred before dispatch. Bind the cache
+    # to the full received shape so chunks/remaps cannot reuse it accidentally.
+    if post_dispatch_channel_fp8:
+        from vllm_hcu.platforms import envs as henvs
+        if henvs.optional_custom_op_enabled(henvs.VLLM_HCU_DEEPEP_HT_EXACT_LAYOUT):
+            rows, top_k = expert_topk_ids.shape
+            local_experts = len(expert_num_tokens_per_expert_list)
+            if (
+                0 < local_experts < num_experts
+                and self.rank_expert_offset >= 0
+                and self.rank_expert_offset % local_experts == 0
+                and self.rank_expert_offset + local_experts <= num_experts
+            ):
+                if _bind_ht_exact_layout(
+                    expert_tokens_meta, rows, top_k,
+                    expert_num_tokens_per_expert_list,
+                ):
+                    from vllm.logger import init_logger
+                    init_logger("vllm.hcu.deepep").info_once(
+                        "DeepEP HT exact layout enabled from physical dispatch counts."
+                    )
     if (
         not defer_input_quant
         and not quant_config.is_block_quantized

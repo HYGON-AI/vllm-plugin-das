@@ -161,10 +161,10 @@ jobs:
             set -euo pipefail
             python3 --version
             git config --global --add safe.directory "$GITHUB_WORKSPACE"
-            python3 .github/scripts/hcu_ci/compile_changed_python.py --base "$BASE_SHA" --head "$HEAD_SHA"
             python3 .github/scripts/hcu_ci/hcu_ci_preflight.py \
               --environment-lock "${{ steps.release-environment.outputs.environment_lock }}" \
               --check-lock-only
+            python3 .github/scripts/hcu_ci/compile_changed_python.py --base "$BASE_SHA" --head "$HEAD_SHA"
             python3 .github/scripts/hcu_ci/verify_hcu_registration.py
             python3 .github/scripts/hcu_ci/build_hcu_matrix.py --profile nightly >/dev/null
             python3 .github/scripts/hcu_ci/build_hcu_matrix.py --profile quarantine >/dev/null
