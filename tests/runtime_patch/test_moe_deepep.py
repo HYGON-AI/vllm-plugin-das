@@ -5278,9 +5278,26 @@ def test_slimquant_w4a8_post_load_uses_persisted_architecture_without_context(
 
     assert captured["moe_config"] is moe_config
     assert captured["routing_tables"] is routing_tables
-    assert captured["moe_quant_config"] is method.moe_quant_config
+    kernel_quant_config = captured["moe_quant_config"]
+    assert method.moe_quant_config is not None
+    for quant_config in (kernel_quant_config, method.moe_quant_config):
+        assert quant_config.quant_dtype == torch.int8
+        assert quant_config.weight_quant_dtype == "int4"
+        assert quant_config.per_act_token_quant is True
+        assert quant_config.per_out_ch_quant is False
+        assert quant_config.block_shape is None
+        assert quant_config.w1_scale is layer.w13_weight_scale
+        assert quant_config.w2_scale is layer.w2_weight_scale
+        assert quant_config.a1_scale is None
+        assert quant_config.a2_scale is None
     assert processed == [layer]
     assert method.moe_kernel is not None
+    assert len(layer._hcu_slimquant_post_load_weight_generation) == 2
+    assert len(layer._hcu_slimquant_post_load_generation) == 4
+    assert (
+        layer._hcu_slimquant_post_load_generation[:2]
+        == layer._hcu_slimquant_post_load_weight_generation
+    )
 
 
 def test_slimquant_w4a8_auto_factory_rejects_non_dynamic_token_scheme(
