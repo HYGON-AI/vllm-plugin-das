@@ -39,6 +39,9 @@ _CONFIG_SELECTED_ROUTES = {
     'w8a8', 'latent_w8a8', 'mla_fusion', 'mlp_fusion', 'mixed_kda_w8a8',
 }
 
+# Safetensors deserializes dimensions as native usize and checks each product.
+_MAX_USIZE = (1 << (struct.calcsize('P') * 8)) - 1
+
 
 def validate_tensor_extent(name, info, errors):
     """Check container metadata even for inventory-only vision tensors."""
@@ -46,10 +49,17 @@ def validate_tensor_extent(name, info, errors):
     if not isinstance(dtype, str) or dtype not in _DTYPE_BITS:
         errors.append(f'Invalid tensor dtype: {name}: {dtype!r}')
         return False
-    if not isinstance(shape, list) or any(type(dim) is not int or dim < 0 for dim in shape):
+    if (not isinstance(shape, list)
+            or any(type(dim) is not int or not 0 <= dim <= _MAX_USIZE for dim in shape)):
         errors.append(f'Invalid tensor shape: {name}: {shape!r}')
         return False
-    bits = math.prod(shape) * _DTYPE_BITS[dtype]
+    elements = 1
+    for dim in shape:
+        elements *= dim
+        if elements > _MAX_USIZE:
+            errors.append(f'Tensor element count overflow: {name}: {shape!r}')
+            return False
+    bits = elements * _DTYPE_BITS[dtype]
     start, end = info['data_offsets']
     if bits % 8 or end - start != bits // 8:
         errors.append(f'Byte extent mismatch: {name}')
@@ -330,6 +340,48 @@ def _unique_object(pairs):
     return result
 
 
+def _reject_json_constant(value):
+    """Python accepts these tokens, but safetensors requires standard JSON."""
+    raise ValueError(f'Invalid JSON constant: {value}')
+
+
+def _finite_json_float(value):
+    result = float(value)
+    if not math.isfinite(result):
+        raise ValueError(f'JSON number out of range: {value}')
+    return result
+
+
+def _json_integer(value):
+    # serde_json stores integral values as i64/u64, then falls back to a
+    # finite f64. Match that behavior so oversized unknown fields cannot make
+    # this parser more permissive than the safetensors reader.
+    if value == '-0':
+        # serde_json preserves -0 as a float, so usize fields must reject it.
+        return -0.0
+    result = int(value)
+    if -(1 << 63) <= result <= _MAX_USIZE:
+        return result
+    result = float(value)
+    if not math.isfinite(result):
+        raise ValueError(f'JSON number out of range: {value}')
+    return result
+
+
+def _validate_json_strings(value):
+    """Reject lone surrogate escapes even in fields not used by the audit."""
+    pending = [value]
+    while pending:
+        item = pending.pop()
+        if isinstance(item, str):
+            item.encode('utf-8')
+        elif isinstance(item, dict):
+            pending.extend(item.keys())
+            pending.extend(item.values())
+        elif isinstance(item, list):
+            pending.extend(item)
+
+
 def _valid_metadata(header, shard, errors):
     """Match safetensors metadata: absent/null or a string-to-string object."""
     if '__metadata__' not in header:
@@ -418,7 +470,13 @@ def audit(root, tp=16):
                 continue
             try:
                 header_text = stream.read(size).decode('utf-8')
-                header = json.loads(header_text, object_pairs_hook=_unique_object)
+                header = json.loads(
+                    header_text, object_pairs_hook=_unique_object,
+                    parse_constant=_reject_json_constant,
+                    parse_float=_finite_json_float,
+                    parse_int=_json_integer,
+                )
+                _validate_json_strings(header)
             except (
                 UnicodeDecodeError, json.JSONDecodeError, ValueError, OSError
             ) as exc:

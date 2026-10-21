@@ -555,6 +555,87 @@ def test_audit_rejects_duplicate_header_keys_without_losing_first_value(tmp_path
     assert any('Duplicate JSON header key' in error for error in result['errors'])
 
 
+@pytest.mark.parametrize('value', [float('nan'), float('inf'), float('-inf')])
+def test_cli_rejects_nonstandard_json_constants_in_unused_header_fields(
+    tmp_path, monkeypatch, value
+):
+    from safetensors import SafetensorError, safe_open
+
+    _write(tmp_path)
+    name = 'language_model.model.embed_tokens.weight'
+    _rewrite_header(tmp_path, lambda header: header[name].update(extra=value))
+    with pytest.raises(SafetensorError):
+        with safe_open(tmp_path / 'model.safetensors', framework='numpy'):
+            pass
+    output = tmp_path / 'audit.json'
+    monkeypatch.setattr(sys, 'argv', [
+        'audit_kimi_k3_checkpoint.py', str(tmp_path), '--output', str(output)
+    ])
+
+    assert audit_module.main() == 1
+    report = json.loads(output.read_text())
+    assert not report['passed']
+    assert any('Invalid safetensors header' in error and 'JSON constant' in error
+               for error in report['errors'])
+
+
+@pytest.mark.parametrize('value', [0.125, None])
+def test_audit_accepts_standard_json_values_in_unused_header_fields(tmp_path, value):
+    from safetensors import safe_open
+
+    _write(tmp_path)
+    name = 'language_model.model.embed_tokens.weight'
+    _rewrite_header(tmp_path, lambda header: header[name].update(extra=value))
+    with safe_open(tmp_path / 'model.safetensors', framework='numpy'):
+        pass
+
+    result = audit_module.audit(tmp_path)
+
+    assert result['passed'] and not result['errors']
+
+
+@pytest.mark.parametrize('token,valid', [
+    ('1e309', False), ('-1e309', False),
+    (r'"\ud800"', False), (r'"\udc00"', False),
+    ('1e-999', True), ('-0', True), ('"NaN"', True),
+    (r'"\ud800\udc00"', True),
+    ('123456789012345678901234567890', True),
+    pytest.param('1' + '0' * 400, False, id='huge_integer'),
+    pytest.param('-1' + '0' * 400, False, id='huge_negative_integer'),
+    pytest.param('1' + '0' * 308, True, id='large_finite_integer'),
+    ('{"nested":[NaN]}', False),
+])
+def test_cli_matches_reader_for_json_number_and_unicode_boundaries(
+    tmp_path, monkeypatch, token, valid
+):
+    from safetensors import SafetensorError, safe_open
+
+    _write(tmp_path)
+    name = 'language_model.model.embed_tokens.weight'
+    _rewrite_header(tmp_path, lambda header: header[name].update(extra='TOKEN_PLACEHOLDER'))
+    raw = (tmp_path / 'model.safetensors').read_bytes()
+    size = struct.unpack('<Q', raw[:8])[0]
+    encoded = raw[8:8 + size].replace(b'"TOKEN_PLACEHOLDER"', token.encode('ascii'))
+    _rewrite_raw_header(tmp_path, encoded)
+    if valid:
+        with safe_open(tmp_path / 'model.safetensors', framework='numpy'):
+            pass
+    else:
+        with pytest.raises(SafetensorError):
+            with safe_open(tmp_path / 'model.safetensors', framework='numpy'):
+                pass
+    output = tmp_path / 'audit.json'
+    monkeypatch.setattr(sys, 'argv', [
+        'audit_kimi_k3_checkpoint.py', str(tmp_path), '--output', str(output)
+    ])
+
+    assert audit_module.main() == (0 if valid else 1)
+    report = json.loads(output.read_text())
+    assert report['passed'] is valid
+    if not valid:
+        assert any('Invalid safetensors header' in error for error in report['errors'])
+
+
 @pytest.mark.parametrize('encoding', [
     'utf-16-le', 'utf-16', 'utf-32-le', 'utf-32', 'utf-8-sig',
 ])
@@ -685,6 +766,85 @@ def test_vision_inventory_requires_valid_tensor_metadata(tmp_path, prefix, case,
     result = audit_module.audit(tmp_path)
     assert not result['passed']
     assert any(message in error and name in error for error in result['errors'])
+
+
+@pytest.mark.parametrize('field,message', [
+    ('shape', 'Invalid tensor shape'), ('data_offsets', 'Invalid data_offsets'),
+])
+@pytest.mark.parametrize('token,valid', [('0', True), ('-0', False)])
+def test_cli_matches_reader_for_negative_zero_in_usize_fields(
+    tmp_path, monkeypatch, field, message, token, valid
+):
+    from safetensors import SafetensorError, safe_open
+
+    name = 'vision_tower.empty.weight'
+    _write(tmp_path, lambda entries: entries.update({name: dict(shape=[0], dtype='BF16')}))
+    values = [0, 'TOKEN_PLACEHOLDER'] if field == 'shape' else ['TOKEN_PLACEHOLDER', 0]
+    _rewrite_header(tmp_path, lambda header: header[name].update({field: values}))
+    raw = (tmp_path / 'model.safetensors').read_bytes()
+    size = struct.unpack('<Q', raw[:8])[0]
+    encoded = raw[8:8 + size].replace(b'"TOKEN_PLACEHOLDER"', token.encode('ascii'))
+    _rewrite_raw_header(tmp_path, encoded)
+    if valid:
+        with safe_open(tmp_path / 'model.safetensors', framework='numpy'):
+            pass
+    else:
+        with pytest.raises(SafetensorError):
+            with safe_open(tmp_path / 'model.safetensors', framework='numpy'):
+                pass
+    output = tmp_path / 'audit.json'
+    monkeypatch.setattr(sys, 'argv', [
+        'audit_kimi_k3_checkpoint.py', str(tmp_path), '--output', str(output)
+    ])
+
+    assert audit_module.main() == (0 if valid else 1)
+    report = json.loads(output.read_text())
+    assert report['passed'] is valid
+    if not valid:
+        assert any(message in error for error in report['errors'])
+
+
+@pytest.mark.parametrize('shape,message', [
+    ([0, 2**64], 'Invalid tensor shape'),
+    ([0, 2**100], 'Invalid tensor shape'),
+    ([2**100, 0], 'Invalid tensor shape'),
+    ([2**63, 2, 0], 'Tensor element count overflow'),
+])
+def test_cli_rejects_empty_tensor_shape_overflow(tmp_path, monkeypatch, shape, message):
+    from safetensors import SafetensorError, safe_open
+
+    name = 'vision_tower.empty.weight'
+    _write(tmp_path, lambda entries: entries.update({name: dict(shape=[0], dtype='BF16')}))
+    _rewrite_header(tmp_path, lambda header: header[name].update(shape=shape))
+    with pytest.raises(SafetensorError):
+        with safe_open(tmp_path / 'model.safetensors', framework='numpy'):
+            pass
+    output = tmp_path / 'audit.json'
+    monkeypatch.setattr(sys, 'argv', [
+        'audit_kimi_k3_checkpoint.py', str(tmp_path), '--output', str(output)
+    ])
+
+    assert audit_module.main() == 1
+    report = json.loads(output.read_text())
+    assert not report['passed']
+    assert any(message in error and name in error for error in report['errors'])
+
+
+@pytest.mark.parametrize('shape', [
+    [0, 2], [2, 0], [0, 2**64 - 1], [2**64 - 1, 0], [0, 2**63, 2],
+])
+def test_audit_accepts_reader_supported_empty_tensor_shapes(tmp_path, shape):
+    from safetensors import safe_open
+
+    name = 'vision_tower.empty.weight'
+    _write(tmp_path, lambda entries: entries.update({name: dict(shape=[0], dtype='BF16')}))
+    _rewrite_header(tmp_path, lambda header: header[name].update(shape=shape))
+    with safe_open(tmp_path / 'model.safetensors', framework='numpy'):
+        pass
+
+    result = audit_module.audit(tmp_path)
+
+    assert result['passed'] and not result['errors']
 
 
 @pytest.mark.parametrize('dtype,shape,byte_count', [
