@@ -187,3 +187,77 @@ def apply(module: ModuleType | None = None) -> bool:
 
 
 __all__ = ["PATCH_ID", "TARGET_MODULE", "TARGETS", "apply", "apply_to_module"]
+
+
+# === K3 LL size logger (v29, replaces earlier probes) ===
+import functools as _ft
+import json as _json
+
+
+def _k3_ll_layout_estimate(num_tokens, hidden, num_ranks, num_experts,
+                           layered=False, quant_group_size=0):
+    NUM_MAX_NVL_PEERS = 8
+    num_scales = hidden // 128
+    num_nodes = max(1, num_ranks // NUM_MAX_NVL_PEERS)
+    msg_d = 16 + max(hidden * 2, hidden + (num_scales if quant_group_size else 4) * 4)
+    msg_c = hidden * 2 + (0 if layered else num_scales * 4)
+    send = max(num_tokens * msg_d, num_experts * num_tokens * msg_c)
+    recv = max(num_experts * num_tokens * msg_d, num_experts * num_tokens * msg_c)
+    sig = num_experts * 8
+    if layered:
+        sig += NUM_MAX_NVL_PEERS * num_nodes * num_tokens * 4 + NUM_MAX_NVL_PEERS * 4
+    return (send + recv + sig) * 2
+
+
+def _install_k3_ll_logger():
+    import deep_ep as _dep
+
+    if getattr(_dep.Buffer, "_k3_ll_size_logger", False):
+        return
+    _orig_init = _dep.Buffer.__init__
+
+    @_ft.wraps(_orig_init)
+    def _init(self, *a, **kw):
+        _orig_init(self, *a, **kw)
+        try:
+            with open("/tmp/k3_ll_sizes.log", "a") as f:
+                f.write(_json.dumps({
+                    "event": "ctor",
+                    "num_rdma_bytes": getattr(self, "num_rdma_bytes", None),
+                    "num_nvl_bytes": getattr(self, "num_nvl_bytes", None),
+                    "kwargs": {k: str(v)[:48] for k, v in kw.items()},
+                }) + "\n")
+        except Exception:
+            pass
+
+    _orig_disp = _dep.Buffer.low_latency_dispatch
+
+    @_ft.wraps(_orig_disp)
+    def _disp(self, x, topk_idx, topk_weight=None, num_max=0, num_experts=0, **kw):
+        try:
+            hidden = int(x.shape[-1]) if hasattr(x, "shape") and x.dim() >= 2 else 0
+            est = _k3_ll_layout_estimate(
+                int(num_max), hidden, int(self.group_size), int(num_experts),
+                layered=False, quant_group_size=int(kw.get("quant_group_size") or 0))
+        except Exception:
+            est = None
+        rb = getattr(self, "num_rdma_bytes", None)
+        with open("/tmp/k3_ll_sizes.log", "a") as f:
+            f.write(_json.dumps({
+                "event": "dispatch",
+                "x_shape": list(x.shape) if hasattr(x, "shape") else None,
+                "num_max_tokens": int(num_max),
+                "num_experts": int(num_experts),
+                "buffer_num_rdma_bytes": rb,
+                "layout_formula_total_bytes": est,
+                "ratio_formula_over_buffer": (round(est / rb, 4) if est and rb else None),
+                "quant_group_size": kw.get("quant_group_size"),
+            }) + "\n")
+        return _orig_disp(self, x, topk_idx, topk_weight, num_max, num_experts, **kw)
+
+    _dep.Buffer.__init__ = _init
+    _dep.Buffer.low_latency_dispatch = _disp
+    _dep.Buffer._k3_ll_size_logger = True
+
+
+_install_k3_ll_logger()

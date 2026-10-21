@@ -411,6 +411,13 @@ _FRAMEWORK_CALLBACKS: tuple[_CallbackSpec, ...] = (
     _CallbackSpec(
         _adapter("framework_opt", "patch_draft_speculator_inputs"),
     ),
+    # Wraps whatever DSpark draft loader adapter installed at callback time
+    # by object identity, not by rebinding module globals (role-separation
+    # adapters do not exist on this line; ordering after
+    # patch_draft_speculator_inputs is still required).
+    _CallbackSpec(
+        _adapter("framework_opt", "patch_smoke_draft_guard"),
+    ),
     _CallbackSpec(_adapter("framework_opt", "patch_gpu_ubatch_wrapper")),
     _CallbackSpec(_adapter("framework_opt", "patch_ubatch_utils")),
     _CallbackSpec(_adapter("framework_opt", "patch_all2all"), feature="deepep"),
