@@ -176,6 +176,25 @@ register_hcu_ci(
 )
 
 register_hcu_ci(
+    job="contract-hcu-gfx936",
+    target="tests/runtime_patch/test_hcu_model_runner_packed_kv_contract.py",
+    est_time=60,
+)
+register_hcu_ci(
+    job="contract-hcu-gfx936",
+    target=(
+        "tests/runtime_patch/test_deepseek_v4_inverse_rope.py::"
+        "test_inverse_rope_fake_supports_fullgraph"
+    ),
+    est_time=60,
+)
+register_hcu_ci(
+    job="contract-hcu-gfx936",
+    target="tests/runtime_patch/test_compressor_gemm.py",
+    est_time=180,
+)
+
+register_hcu_ci(
     job="integration-smoke-gfx938",
     target="tests/integration/graph/test_qwen35_9b_graph_parity.py",
     est_time=900,
