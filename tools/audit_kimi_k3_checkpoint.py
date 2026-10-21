@@ -343,11 +343,23 @@ def _valid_metadata(header, shard, errors):
         errors.append(f'Invalid safetensors metadata: {shard}')
 
 
+def _effective_quantization_config(raw, text_config):
+    """Resolve the checkpoint config with vLLM's native loader priority."""
+    for config in (
+        raw.get('quantization_config'),
+        text_config.get('quantization_config'),
+        raw.get('compression_config'),
+    ):
+        if config is not None:
+            return config
+    return {}
+
+
 def audit(root, tp=16):
     root = Path(root)
     raw = json.loads((root / 'config.json').read_text())
     c = raw['text_config']
-    quant = raw.get('compression_config', c.get('compression_config', {}))
+    quant = _effective_quantization_config(raw, c)
     if quant.get('quant_method') != 'slimquant_w4a8':
         raise ValueError('Expected slimquant_w4a8 checkpoint')
     schema = language_schema(c)

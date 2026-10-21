@@ -92,6 +92,36 @@ def test_small_full_contract_passes(tmp_path):
     assert sum(result['route_counts'].values()) == result['language_tensor_count']
 
 
+@pytest.mark.parametrize('source', ['root', 'text_config'])
+@pytest.mark.parametrize('effective_config_valid', [False, True])
+def test_audit_uses_runtime_quantization_config_priority(
+    tmp_path, source, effective_config_valid
+):
+    _write(tmp_path)
+    config_path = tmp_path / 'config.json'
+    raw = json.loads(config_path.read_text())
+    compression = raw['compression_config']
+    effective = json.loads(json.dumps(compression))
+    if not effective_config_valid:
+        effective['mixed_precision']['w8a8_include']['modules'] = []
+    else:
+        compression['mixed_precision']['w8a8_include']['modules'] = []
+    if source == 'root':
+        raw['quantization_config'] = effective
+    else:
+        raw['text_config']['quantization_config'] = effective
+    config_path.write_text(json.dumps(raw))
+
+    result = audit_module.audit(tmp_path)
+
+    assert result['passed'] is effective_config_valid
+    if not effective_config_valid:
+        assert any(
+            'W8A8 route not selected by effective quantization config' in error
+            for error in result['errors']
+        )
+
+
 def test_audit_accepts_packed_experts_without_ignore(tmp_path):
     _write(tmp_path)
 
