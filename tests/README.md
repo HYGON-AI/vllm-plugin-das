@@ -168,9 +168,9 @@ Accuracy gates are asserted from EvalScope JSON reports:
 
 - GSM8K uses `mean_acc`; each model configuration declares its required score.
 - Qwen3-VL MMMU smoke uses the `Art` subset and requires `mean_acc >= 0.55`.
-- Qwen3.5 GSM8K uses the first 10 samples without shuffling and disables
+- Qwen3.5 GSM8K uses the first 100 samples without shuffling and disables
   thinking through chat-template kwargs. Predictions, reviews, and report sample
-  counts must each be exactly 10, with mean accuracy exactly 1.0.
+  counts must each be exactly 100, with mean accuracy at least 0.95.
 
 ## Model configuration files
 

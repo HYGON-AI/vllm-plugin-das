@@ -751,6 +751,24 @@ def _assert_pass_criteria(
         dataset=dataset,
         metric=metric,
     )
+    for artifact, key in (
+        ("predictions", "num_predictions"), ("reviews", "num_reviews"),
+    ):
+        if key not in criteria:
+            continue
+        expected = int(criteria[key])
+        count, path = _artifact_record_count(
+            work_dir, artifact=artifact, model=model, dataset=dataset,
+        )
+        assert count == expected, (
+            f"expected {expected} {artifact}, got {count}; path={path}"
+        )
+    if "num_predictions" in criteria:
+        expected = int(criteria["num_predictions"])
+        assert num == expected, (
+            f"{dataset} {metric} expected {expected} samples, "
+            f"got {num}; report={report_path}"
+        )
     verdict = (
         f"pass criterion: {dataset} {display_name}={score:.4f}, "
         f"required>={minimum_score:.4f}, samples={num}, report={report_path}"

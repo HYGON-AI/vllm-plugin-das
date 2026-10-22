@@ -949,14 +949,16 @@ def test_pass_at_one_requires_report_metric(tmp_path: Path) -> None:
 @pytest.mark.parametrize(
     ("predictions", "reviews", "reported_samples", "score", "passes"),
     [
-        (10, 10, 10, 1.0, True),
-        (9, 9, 9, 1.0, False),
-        (10, 9, 10, 1.0, False),
-        (10, 10, 9, 1.0, False),
-        (10, 10, 10, 0.9, False),
+        (100, 100, 100, 1.0, True),
+        (100, 100, 100, 0.95, True),
+        (100, 100, 100, 0.96, True),
+        (100, 100, 100, 0.94, False),
+        (99, 100, 100, 1.0, False),
+        (100, 99, 100, 1.0, False),
+        (100, 100, 99, 1.0, False),
     ],
 )
-def test_qwen35_gsm8k_requires_all_ten_answers(
+def test_qwen35_gsm8k_requires_100_samples_and_95_percent(
     tmp_path, monkeypatch, predictions, reviews, reported_samples, score, passes,
 ):
     root = Path(__file__).resolve().parents[3]

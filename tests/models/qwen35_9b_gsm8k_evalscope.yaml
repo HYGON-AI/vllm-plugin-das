@@ -37,7 +37,7 @@ evalscope:
   stream: true
   eval_batch_size: 8
   timeout: 60000
-  limit: 10
+  limit: 100
   datasets:
     - gsm8k
   dataset_args:
@@ -48,7 +48,9 @@ evalscope:
         - Pass@1
   pass_criteria:
     dataset: gsm8k
-    num_predictions: 10
-    num_reviews: 10
-    mean_acc: 1.0
+    metric: mean_acc
+    display_name: Pass@1
+    minimum_score: 0.95
+    num_predictions: 100
+    num_reviews: 100
   no_timestamp: true
