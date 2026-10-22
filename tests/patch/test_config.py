@@ -53,6 +53,7 @@ def test_dict_vllm_config_uses_canonical_storage_path() -> None:
                 "enable_lightly_cplb": False,
                 "enable_custom_sp": False,
                 "enable_multi_layers_mtp": False,
+                "enable_dsa_cache_layer_split": False,
                 "deepep_auto": False,
                 "fused_qwen3_rms_rope": True,
                 "qwen4_exp_hc_sp": True,

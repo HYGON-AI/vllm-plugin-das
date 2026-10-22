@@ -64,6 +64,26 @@ assert _vllm_hcu_file.is_relative_to(_vllm_hcu_root), (
 '''
 
 
+def test_hcu_accepts_gptq_alias_selected_by_current_vllm() -> None:
+    from vllm.model_executor.layers.quantization import get_quantization_config
+    from vllm_hcu.platforms.hcu import HCUPlatform
+
+    gptq_config = {
+        "quant_method": "gptq",
+        "bits": 4,
+        "group_size": 128,
+        "desc_act": False,
+        "sym": True,
+    }
+    resolved = get_quantization_config("gptq").override_quantization_method(
+        gptq_config,
+        user_quant=None,
+    )
+
+    assert resolved == "auto_gptq"
+    HCUPlatform.verify_quantization(resolved)
+
+
 def _run_fresh_target(code: str) -> subprocess.CompletedProcess[str]:
     env = dict(os.environ)
     for name in (
@@ -1550,6 +1570,18 @@ def test_deepep_auto_rejects_eplb_before_model_loading() -> None:
         match="deepep_auto.*EPLB.*not supported",
     ):
         patch_vllm_config.validate_and_update_hcu_config(config)
+
+
+def test_deepep_auto_accepts_static_eplb_without_rearrangement() -> None:
+    config = _validation_config(
+        HcuFeatureConfig(deepep_auto=True, expert_map_path="/tmp/map.json")
+    )
+    config.parallel_config.all2all_backend = "deepep_low_latency"
+    config.parallel_config.enable_eplb = True
+    config.parallel_config.data_parallel_size = 8
+    config.parallel_config.enable_expert_parallel = True
+
+    patch_vllm_config.validate_and_update_hcu_config(config)
 
 
 @pytest.mark.parametrize(

@@ -55,14 +55,17 @@ def _paged_logits(
     # HCU still faults on masked OOB pointers; clamp before forming addresses.
     page = tl.where(valid, page, 0)
     slot = tokens % PAGE_SIZE
-    page_base = page * CACHE_PAGE_STRIDE
-    offset = (
-        page_base[None, :]
-        + (slot[None, :] // 16) * (16 * DIM)
+    # Keep the full physical-page address in int64. Layer-split caches can
+    # exceed the signed-int32 offset range because pages retain their packed
+    # cross-layer stride.
+    page_base = page.to(tl.int64) * CACHE_PAGE_STRIDE
+    in_page_offset = (
+        (slot[None, :] // 16) * (16 * DIM)
         + (dims[:, None] // 16) * 256
         + (slot[None, :] % 16) * 16
         + dims[:, None] % 16
     )
+    offset = page_base[None, :] + in_page_offset.to(tl.int64)
     keys = tl.load(Cache + offset, (dims[:, None] < DIM) & valid[None, :], 0.0)
     query_values = tl.load(
         Q + batch * Q_BATCH + query * Q_NEXT + heads[:, None] * Q_HEAD + dims[None, :],
@@ -81,47 +84,6 @@ def _paged_logits(
         tl.where(valid, scores, -float("inf")),
         tokens < MAX_LEN,
     )
-
-
-def _dense_page_elems(kv_cache_fp8: torch.Tensor) -> int:
-    return int(kv_cache_fp8.shape[1]) * int(kv_cache_fp8.shape[-1])
-
-
-def _gather_dense_pages_for_tables(
-    kv_cache_fp8: torch.Tensor,
-    block_tables: torch.Tensor,
-) -> tuple[torch.Tensor, torch.Tensor]:
-    """Compact packed/strided pages referenced by ``block_tables``.
-
-    DSA layer-split exposes indexer caches with ``stride(0)`` equal to the
-    packed block stride (~554496). Addressing those pages inside the Triton
-    kernel via ``page * stride`` overflows signed int32 once physical ids
-    exceed ~3870 and VMFaults on HCU. Gathering used pages into a dense
-    contiguous cache keeps the kernel on the small-stride path it was written
-    for, and remaps block table ids accordingly.
-    """
-    num_pages = int(kv_cache_fp8.shape[0])
-    flat = block_tables.reshape(-1)
-    used_mask = (flat >= 0) & (flat < num_pages)
-    if not bool(used_mask.any()):
-        dense = kv_cache_fp8[:0].contiguous()
-        return dense, block_tables
-    unique = torch.unique(flat[used_mask])
-    dense = kv_cache_fp8.index_select(0, unique).contiguous()
-    remap = torch.full(
-        (num_pages,),
-        -1,
-        dtype=block_tables.dtype,
-        device=block_tables.device,
-    )
-    remap[unique] = torch.arange(
-        unique.numel(), dtype=block_tables.dtype, device=block_tables.device
-    )
-    used = (block_tables >= 0) & (block_tables < num_pages)
-    remapped = torch.full_like(block_tables, -1)
-    remapped[used] = remap[block_tables[used]]
-    return dense, remapped
-
 
 def gfx938_fp8_paged_mqa_logits(
     q_fp8: torch.Tensor,
@@ -187,16 +149,6 @@ def gfx938_fp8_paged_mqa_logits(
     )
     if max_model_len == 0:
         return output
-
-    # Packed DSA layer-split views use a large block stride. Compact referenced
-    # pages so the Triton kernel only sees dense page strides.
-    if int(kv_cache_fp8.stride(0)) != _dense_page_elems(kv_cache_fp8):
-        kv_cache_fp8, block_tables = _gather_dense_pages_for_tables(
-            kv_cache_fp8, block_tables
-        )
-        if kv_cache_fp8.shape[0] == 0:
-            output.fill_(float("-inf"))
-            return output
 
     cache = kv_cache_fp8.view(q_fp8.dtype)
     _paged_logits[(batch * next_n, triton.cdiv(max_model_len, 64))](

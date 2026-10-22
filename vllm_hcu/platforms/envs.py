@@ -84,6 +84,10 @@ if TYPE_CHECKING:
     VLLM_HCU_C128_HEAD_SPLITS: int = 4
     VLLM_HCU_INVERSE_ROPE_SUFFIX: bool = True
     VLLM_HCU_SHARED_EXPERTS_EARLY_LAUNCH: bool = False
+    VLLM_HCU_DEEPEP_AUTO_SHARED_WEIGHTS: bool = True
+    VLLM_HCU_MOE_WORKSPACE_GROWTH_MB: int = 512
+    VLLM_HCU_DEEPEP_HT_EXACT_LAYOUT: bool = True
+    VLLM_HCU_SHARED_EXPERTS_DEEPEP_EPLB_OVERLAP: bool = True
     VLLM_HCU_ENABLE_REQUEST_CUDAGRAPH_BUCKETS: bool = False
     VLLM_HCU_PLE_CPU_OFFLOAD: bool = False
     VLLM_HCU_PLE_PREFETCH_STREAM: bool = False
@@ -647,6 +651,27 @@ hcu_vllm_environment_variables: dict[str, Callable[[], Any]] = {
     "VLLM_HCU_SHARED_EXPERTS_EARLY_LAUNCH":
         lambda: (os.environ.get("VLLM_HCU_SHARED_EXPERTS_EARLY_LAUNCH", "False").lower() in
                     ("true", "1")),
+
+    # DeepEP auto DeepGEMM: keep one routed-expert weight copy for both the
+    # HT (contiguous) and LL (masked) experts when their packers agree.
+    "VLLM_HCU_DEEPEP_AUTO_SHARED_WEIGHTS":
+        lambda: _environment_flag(
+            os.getenv("VLLM_HCU_DEEPEP_AUTO_SHARED_WEIGHTS", "1")),
+
+    # Round HT MoE scratch capacity to bounded buckets; 0 restores exact sizing.
+    "VLLM_HCU_MOE_WORKSPACE_GROWTH_MB":
+        lambda: int(os.getenv("VLLM_HCU_MOE_WORKSPACE_GROWTH_MB", "512")),
+
+    # Size DeepEP HT expert workspaces from the physical per-expert counts
+    # DeepEP returns for the received batch, instead of the M*topk upper bound.
+    "VLLM_HCU_DEEPEP_HT_EXACT_LAYOUT":
+        lambda: _environment_flag(os.getenv("VLLM_HCU_DEEPEP_HT_EXACT_LAYOUT", "1")),
+
+    # Quantized DeepEP + EPLB: launch shared experts on the auxiliary stream
+    # before routing and join only when the shared output is consumed.
+    "VLLM_HCU_SHARED_EXPERTS_DEEPEP_EPLB_OVERLAP":
+        lambda: _environment_flag(
+            os.getenv("VLLM_HCU_SHARED_EXPERTS_DEEPEP_EPLB_OVERLAP", "1")),
 
     # Enable request-count-oriented cudagraph capture buckets up to request size 256.
     "VLLM_HCU_ENABLE_REQUEST_CUDAGRAPH_BUCKETS":

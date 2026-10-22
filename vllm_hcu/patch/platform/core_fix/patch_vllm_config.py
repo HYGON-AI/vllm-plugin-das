@@ -636,10 +636,16 @@ def validate_and_update_hcu_config(vllm_config: object) -> HcuFeatureConfig:
                 "HCU deepep_auto must be normalized to the vLLM 0.25 "
                 "deepep_low_latency configuration contract"
             )
-        if getattr(parallel_config, "enable_eplb", False):
+        # Static EPLB loads every physical expert directly from the
+        # checkpoint before either layout is packed and never rearranges.
+        if (
+            getattr(parallel_config, "enable_eplb", False)
+            and feature_config.expert_map_path is None
+        ):
             raise ValueError(
                 "deepep_auto with EPLB is not supported because the HT and "
-                "LL expert weight layouts cannot be rebalanced atomically"
+                "LL expert weight layouts cannot be rebalanced atomically; "
+                "use a static expert_map_path instead"
             )
         # Only V4 restores global prefill phase evidence for PCP-only auto.
         # Its native MTP draft runs against the restored global target batch.
