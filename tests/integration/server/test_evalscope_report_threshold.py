@@ -945,6 +945,52 @@ def test_pass_at_one_requires_report_metric(tmp_path: Path) -> None:
         )
 
 
+
+@pytest.mark.parametrize(
+    ("predictions", "reviews", "reported_samples", "score", "passes"),
+    [
+        (10, 10, 10, 1.0, True),
+        (9, 9, 9, 1.0, False),
+        (10, 9, 10, 1.0, False),
+        (10, 10, 9, 1.0, False),
+        (10, 10, 10, 0.9, False),
+    ],
+)
+def test_qwen35_gsm8k_requires_all_ten_answers(
+    tmp_path, monkeypatch, predictions, reviews, reported_samples, score, passes,
+):
+    root = Path(__file__).resolve().parents[3]
+    config = evalscope_server.load_config(
+        root / "tests/models/qwen35_9b_gsm8k_evalscope.yaml",
+        "VLLM_HCU_TEST_UNUSED_GSM8K_CONFIG",
+    )
+    model_env = "VLLM_HCU_TEST_UNUSED_GSM8K_MODEL"
+    monkeypatch.delenv(model_env, raising=False)
+    model = Path(config["model"]).name
+    report_path = tmp_path / "reports" / model / "gsm8k.json"
+    report_path.parent.mkdir(parents=True)
+    report_path.write_text(json.dumps({
+        "dataset_name": "gsm8k", "model_name": model,
+        "metrics": [{"name": "mean_acc", "score": score, "num": reported_samples}],
+    }))
+    for artifact, count in (("predictions", predictions), ("reviews", reviews)):
+        path = tmp_path / artifact / model / "gsm8k_main.jsonl"
+        path.parent.mkdir(parents=True)
+        path.write_text("".join(json.dumps({"sample_id": i}) + "\n" for i in range(count)))
+
+    def check():
+        _assert_pass_criteria(
+            config, model_env=model_env, work_dir=tmp_path,
+            eval_log_path=tmp_path / "logs/evalscope.log",
+        )
+
+    if passes:
+        check()
+    else:
+        with pytest.raises(AssertionError):
+            check()
+
+
 def _exact_humaneval_config() -> dict:
     return {
         "model": "/models/DeepSeek-V4-Flash-0731-Channel-FP8-w8a8",

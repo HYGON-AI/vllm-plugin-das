@@ -5,7 +5,6 @@
 from __future__ import annotations
 
 import importlib
-import importlib.metadata
 import sys
 from importlib.machinery import ModuleSpec
 from types import ModuleType
@@ -26,28 +25,28 @@ def stub_flash_attn_native_extension(monkeypatch: pytest.MonkeyPatch) -> ModuleT
     return module
 
 
-FLASH_ATTN_TEST_VERSION = "2.8.4+dtk2604.torch2110.2609241509.g624d7b"
+def isolate_flash_attn_backend_imports(monkeypatch: pytest.MonkeyPatch) -> None:
+    """Restore both module and parent-package caches after CPU doubles are used."""
+    package = importlib.import_module("vllm_hcu.v1.attention.backends")
+    for child in ("flash_attn", "fa_utils"):
+        name = f"{package.__name__}.{child}"
+        # Record absent entries too, so newly imported modules are removed on undo.
+        monkeypatch.setitem(sys.modules, name, sys.modules.get(name))
+        monkeypatch.delitem(sys.modules, name)
+        monkeypatch.setattr(package, child, getattr(package, child, None), raising=False)
+        monkeypatch.delattr(package, child)
 
 
-def stub_flash_attn_distribution(
-    monkeypatch: pytest.MonkeyPatch,
-    flash_attn_extension: ModuleType,
-    version: str = FLASH_ATTN_TEST_VERSION,
-) -> None:
-    """Keep CPU kernel doubles independent of the installed vendor wheel."""
+def stub_flash_attn_version_check(monkeypatch: pytest.MonkeyPatch) -> None:
+    """Kernel orchestration tests do not exercise distribution compatibility."""
+    from vllm_hcu.v1.attention import _flash_attn_compat
 
-    flash_attn_extension.__version__ = version
-    distribution_version = importlib.metadata.version
-
-    def version_for_test(distribution_name: str) -> str:
-        if distribution_name == "flash_attn":
-            return version
-        return distribution_version(distribution_name)
-
-    monkeypatch.setattr(importlib.metadata, "version", version_for_test)
+    monkeypatch.setattr(_flash_attn_compat, "require_compatible_flash_attn", lambda: None)
 
 
 def stub_flash_attn_extensions(monkeypatch: pytest.MonkeyPatch) -> None:
+    isolate_flash_attn_backend_imports(monkeypatch)
+    stub_flash_attn_version_check(monkeypatch)
     stub_flash_attn_native_extension(monkeypatch)
     hcu_ops = ModuleType("vllm_hcu.hcu_ops")
     hcu_ops.__spec__ = ModuleSpec(hcu_ops.__name__, loader=None)
@@ -58,7 +57,6 @@ def stub_flash_attn_extensions(monkeypatch: pytest.MonkeyPatch) -> None:
         flash_attn_extension.__name__,
         loader=None,
     )
-    stub_flash_attn_distribution(monkeypatch, flash_attn_extension)
 
     def layout_entrypoint(
         q=None,

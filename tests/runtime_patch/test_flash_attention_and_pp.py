@@ -19,9 +19,10 @@ from vllm_hcu.platforms import envs as hcu_envs
 
 
 from tests.fixtures.flash_attention import (
-    FLASH_ATTN_TEST_VERSION as _TEST_FLASH_ATTN_VERSION,
     load_hcu_flash_attention_module as _load_hcu_flash_attention_module,
-    stub_flash_attn_distribution as _stub_flash_attn_distribution,
+    isolate_flash_attn_backend_imports,
+    stub_flash_attn_extensions,
+    stub_flash_attn_version_check,
     stub_flash_attn_native_extension,
 )
 
@@ -32,10 +33,11 @@ def _load_hcu_fa_utils_module(
     kv_cache_layout: str,
     missing_layout_on: str | None = None,
     flash_attn_varlen_override=None,
-    flash_attn_version: str = _TEST_FLASH_ATTN_VERSION,
 ):
     """Load the real HCU FA boundary against observable kernel doubles."""
 
+    isolate_flash_attn_backend_imports(monkeypatch)
+    stub_flash_attn_version_check(monkeypatch)
     stub_flash_attn_native_extension(monkeypatch)
 
     from vllm_hcu.v1.attention import kv_cache_layout as hcu_kv_cache_layout
@@ -55,11 +57,6 @@ def _load_hcu_fa_utils_module(
     flash_attn_extension.__spec__ = ModuleSpec(
         flash_attn_extension.__name__,
         loader=None,
-    )
-    _stub_flash_attn_distribution(
-        monkeypatch,
-        flash_attn_extension,
-        flash_attn_version,
     )
 
     def make_entrypoint(name: str):
@@ -98,37 +95,33 @@ def _load_hcu_fa_utils_module(
         else:
             setattr(flash_attn_extension, symbol, make_entrypoint(symbol))
     monkeypatch.setitem(sys.modules, flash_attn_extension.__name__, flash_attn_extension)
-    monkeypatch.delitem(
-        sys.modules,
-        "vllm_hcu.v1.attention.backends.fa_utils",
-        raising=False,
-    )
-
     module = importlib.import_module("vllm_hcu.v1.attention.backends.fa_utils")
     return module, calls
 
-
 @pytest.mark.parametrize("loader", ["backend", "fa_utils"])
-def test_cpu_flash_attention_loaders_never_import_native_binary(monkeypatch, loader):
-    class RejectNativeImport:
-        def find_spec(self, fullname, path=None, target=None):
-            if fullname == "flash_attn_2_cuda":
-                raise AssertionError("CPU contract attempted a native FlashAttention import")
-            return None
+def test_cpu_attention_loaders_restore_module_cache(monkeypatch, loader):
+    names = (
+        "vllm_hcu.v1.attention.backends.flash_attn",
+        "vllm_hcu.v1.attention.backends.fa_utils",
+    )
+    package = importlib.import_module("vllm_hcu.v1.attention.backends")
+    for name in names:
+        monkeypatch.setitem(sys.modules, name, None)
+        monkeypatch.delitem(sys.modules, name)
+        monkeypatch.delattr(package, name.rsplit(".", 1)[1], raising=False)
 
-    monkeypatch.setattr(sys, "meta_path", [RejectNativeImport(), *sys.meta_path])
-    for name in ("flash_attn_2_cuda", "vllm_hcu.v1.attention.backends.fa_utils",
-                 "vllm_hcu.v1.attention.backends.flash_attn"):
-        monkeypatch.delitem(sys.modules, name, raising=False)
-    if loader == "backend":
-        module = _load_hcu_flash_attention_module(monkeypatch)
-    else:
-        module, _ = _load_hcu_fa_utils_module(monkeypatch, kv_cache_layout="NHD")
-    assert callable(module.flash_attn_varlen_func)
-    assert sys.modules["flash_attn_2_cuda"].__spec__.loader is None
+    with pytest.MonkeyPatch.context() as patch:
+        if loader == "backend":
+            _load_hcu_flash_attention_module(patch)
+        else:
+            _load_hcu_fa_utils_module(patch, kv_cache_layout="NHD")
+
+    for name in names:
+        assert name not in sys.modules
+        assert not hasattr(package, name.rsplit(".", 1)[1])
 
 
-def test_hcu_flash_attention_loader_stubs_vendor_distribution_metadata(
+def test_cpu_flash_attention_loader_does_not_query_distribution_metadata(
     monkeypatch: pytest.MonkeyPatch,
 ):
     """The CPU contract loader must not require an installed vendor wheel."""
@@ -137,7 +130,7 @@ def test_hcu_flash_attention_loader_stubs_vendor_distribution_metadata(
 
     def missing_distribution(distribution_name: str):
         if distribution_name == "flash_attn":
-            raise importlib.metadata.PackageNotFoundError(distribution_name)
+            raise AssertionError("CPU kernel doubles must not read vendor distribution metadata")
         return real_version(distribution_name)
 
     monkeypatch.setattr(importlib.metadata, "version", missing_distribution)
@@ -222,13 +215,42 @@ def test_hcu_fa_boundary_rejects_interface_without_layout(
         )
 
 
+def _require_flash_attn_version(monkeypatch, version):
+    from vllm_hcu.v1.attention import _flash_attn_compat
+
+    real_version = importlib.metadata.version
+    monkeypatch.setattr(
+        importlib.metadata, "version",
+        lambda name: version if name == "flash_attn" else real_version(name),
+    )
+    _flash_attn_compat.require_compatible_flash_attn()
+
+
+def test_fa_utils_keeps_the_distribution_guard(monkeypatch):
+    from vllm_hcu.v1.attention import _flash_attn_compat
+
+    real_check = _flash_attn_compat.require_compatible_flash_attn
+    stub_flash_attn_extensions(monkeypatch)
+    monkeypatch.setattr(_flash_attn_compat, "require_compatible_flash_attn", real_check)
+    real_version = importlib.metadata.version
+
+    def missing_distribution(name):
+        if name == "flash_attn":
+            raise importlib.metadata.PackageNotFoundError(name)
+        return real_version(name)
+
+    monkeypatch.setattr(importlib.metadata, "version", missing_distribution)
+    with pytest.raises(RuntimeError, match="compatible flash_attn release"):
+        importlib.import_module("vllm_hcu.v1.attention.backends.fa_utils")
+
+
 @pytest.mark.parametrize(
     "compatible_version",
     [
         "2.8.4",
-        "2.8.4+dtk2604.torch2110.2610091222.g130fd4",
-        "2.8.4.post1+dtk2605.torch2110.2609010000.g999999",
-        "2.8.5+dtk2605.torch2110.2609010000.g999999",
+        "2.8.4+dtk2604",
+        "2.8.4.post1+dtk2610",
+        "2.8.5+dtk2610",
         "2.8.40",
     ],
 )
@@ -236,17 +258,13 @@ def test_hcu_fa_boundary_accepts_compatible_2_8_release(
     monkeypatch: pytest.MonkeyPatch,
     compatible_version: str,
 ) -> None:
-    _load_hcu_fa_utils_module(
-        monkeypatch,
-        kv_cache_layout="HND",
-        flash_attn_version=compatible_version,
-    )
+    _require_flash_attn_version(monkeypatch, compatible_version)
 
 
 @pytest.mark.parametrize(
     "incompatible_version",
     [
-        "2.8.3+dtk2604.torch2110.2609241509.g624d7b",
+        "2.8.3+dtk2604",
         "2.8.4rc1",
         "2.8.4.dev1+dtk2604",
         "2.8.4.post1.dev1",
@@ -260,21 +278,15 @@ def test_hcu_fa_boundary_rejects_incompatible_release(
     incompatible_version: str,
 ) -> None:
     with pytest.raises(RuntimeError, match="compatible flash_attn release"):
-        _load_hcu_fa_utils_module(
-            monkeypatch,
-            kv_cache_layout="HND",
-            flash_attn_version=incompatible_version,
-        )
+        _require_flash_attn_version(monkeypatch, incompatible_version)
 
 
 def test_hcu_fa_boundary_rejects_invalid_distribution_version(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     with pytest.raises(RuntimeError, match="Invalid flash_attn distribution version"):
-        _load_hcu_fa_utils_module(
-            monkeypatch,
-            kv_cache_layout="HND",
-            flash_attn_version="vendor-build-without-pep440-version",
+        _require_flash_attn_version(
+            monkeypatch, "vendor-build-without-pep440-version"
         )
 
 
@@ -590,7 +602,6 @@ def test_flash_attention_kernel_block_sizes_do_not_require_current_config(
 
     monkeypatch.setattr(flash_attn, "_get_flash_attn_mode", lambda: mode)
     monkeypatch.setattr(flash_attn, "get_current_vllm_config_or_none", lambda: None)
-    monkeypatch.setattr(flash_attn, "_get_flash_attn_mode", lambda: mode)
 
     sizes = backend.get_supported_kernel_block_sizes()
 

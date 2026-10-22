@@ -126,21 +126,6 @@ def test_test_requirements_pin_ci_runner_and_official_evalscope() -> None:
     assert str(requirements["evalscope"].specifier) == "==1.9.1"
 
 
-def _dockerfile_instructions() -> list[str]:
-    instructions: list[str] = []
-    current: list[str] = []
-    for raw_line in DOCKERFILE.read_text(encoding="utf-8").splitlines():
-        line = raw_line.strip()
-        if not current and (not line or line.startswith("#")):
-            continue
-        current.append(line.removesuffix("\\").strip())
-        if not line.endswith("\\"):
-            instructions.append(" ".join(current))
-            current = []
-    assert not current, "Dockerfile ends inside a continued instruction"
-    return instructions
-
-
 def test_dockerfile_does_not_install_ci_requirements() -> None:
     source = DOCKERFILE.read_text(encoding="utf-8")
     assert "requirements-test.txt" not in source
