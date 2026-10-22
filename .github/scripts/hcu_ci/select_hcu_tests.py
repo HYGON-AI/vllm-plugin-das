@@ -2,7 +2,7 @@
 # SPDX-FileCopyrightText: Copyright (c) 2026 Hygon Information Technology Co., Ltd.
 """Select HCU CI jobs from changed repository paths.
 
-The configuration file uses JSON syntax, which is also valid YAML. Keeping the
+The configuration file is JSON data stored outside the workflow directory. Keeping the
 parser in the Python standard library makes selection runnable on a minimal
 control-plane runner before the HCU test environment is initialized.
 """
@@ -28,7 +28,7 @@ from hcu_ci_register import (
 
 
 REPOSITORY = Path(__file__).resolve().parents[3]
-DEFAULT_CONFIG = REPOSITORY / ".github/workflows/configs/hcu-test-map.yaml"
+DEFAULT_CONFIG = REPOSITORY / ".github/configs/hcu-test-map.json"
 VALID_SUITES = {
     "accuracy-hcu",
     "contract-hcu",

@@ -13,6 +13,12 @@ from __future__ import annotations
 # calls as literals, so adding imports or runtime-generated values is forbidden.
 
 
+def register_hcu_ci(
+    *, job: str, target: str, est_time: float, disabled: str | None = None
+) -> None:
+    """Declare the literal-only API for tooling; CI parses calls through AST."""
+
+
 register_hcu_ci(
     job="accuracy-gfx936",
     target="tests/accuracy/test_hcu_kernel_accuracy.py",

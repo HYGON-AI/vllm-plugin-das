@@ -1321,10 +1321,17 @@ def test_kernel_accuracy_change_runs_both_supported_architectures() -> None:
     assert fallback is False
 
 
-def test_hcu_container_script_change_selects_ci_smoke() -> None:
+@pytest.mark.parametrize(
+    "changed_path",
+    [
+        "scripts/ci/hcu/hcu_ci_start_container.sh",
+        ".github/configs/hcu-test-map.json",
+    ],
+)
+def test_ci_preparation_change_selects_ci_smoke(changed_path: str) -> None:
     jobs, groups, fallback = select_jobs(
         _config(),
-        ["scripts/ci/hcu/hcu_ci_start_container.sh"],
+        [changed_path],
     )
     assert {job["registry_job"] for job in jobs} == {
         "accuracy-gfx936",

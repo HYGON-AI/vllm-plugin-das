@@ -633,6 +633,7 @@
       "patterns": [
         ".github/workflows/**",
         ".github/workflows/configs/**",
+        ".github/configs/**",
         ".github/scripts/hcu_ci/**",
         "scripts/ci/hcu/**",
         "tools/run_patch_tests.py",

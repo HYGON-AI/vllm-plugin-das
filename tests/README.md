@@ -93,14 +93,14 @@ matching for custom locks; HIP and distribution checks are unchanged.
 Available manual workflows:
 
 - `HCU full-enabled` accepts a branch, tag, or SHA and runs every job declared
-  in `hcu-test-map.yaml`.
+  in [hcu-test-map.json](../.github/configs/hcu-test-map.json).
 - `HCU release wheel` builds the requested checkout, installs the wheel in an
   isolated virtual environment, verifies the imported package and compiled
   extension originate from that wheel, then runs an OpenAI server smoke and a
   TP4/EP4 smoke.
 - `HCU nightly` accepts an optional ref for manual runs and uses `v0.25.1` for
   scheduled runs. Its matrix is generated from the `nightly_jobs` list in
-  `hcu-test-map.yaml`.
+  [hcu-test-map.json](../.github/configs/hcu-test-map.json).
 
 Nightly failures create or update one GitHub tracking issue and close it after
 recovery. Set the repository variable `HCU_CI_NIGHTLY_OWNER` to a GitHub login
