@@ -176,6 +176,38 @@ def test_evaluation_environment_preserves_proxy_and_removes_host_secrets(
     assert "127.0.0.1" in environment["NO_PROXY"]
 
 
+
+@pytest.mark.skipif(sys.platform != "linux", reason="requires POSIX signals")
+def test_evaluator_native_crash_writes_stack_to_log(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setenv("PYTHONFAULTHANDLER", "0")
+    monkeypatch.setenv("PYTHONUNBUFFERED", "0")
+    log_path = tmp_path / "evalscope.log"
+    with log_path.open("w") as log:
+        result = subprocess.run(
+            [
+                sys.executable,
+                "-c",
+                "import os, resource, signal; "
+                "resource.setrlimit(resource.RLIMIT_CORE, (0, 0)); "
+                "print('dataset loading started'); "
+                "os.kill(os.getpid(), signal.SIGSEGV)",
+            ],
+            env=_evaluation_environment({}),
+            stdout=log,
+            stderr=subprocess.STDOUT,
+            check=False,
+        )
+
+    assert result.returncode == -signal.SIGSEGV
+    output = log_path.read_text()
+    assert "dataset loading started" in output
+    assert "Fatal Python error: Segmentation fault" in output
+    assert 'File "<string>", line 1' in output
+
+
 def test_evalscope_command_keeps_api_key_out_of_argv(tmp_path: Path) -> None:
     secret = "must-not-appear-in-process-list"
     config = {

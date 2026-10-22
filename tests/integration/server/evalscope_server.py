@@ -512,6 +512,10 @@ def _evaluation_environment(config: dict[str, Any]) -> dict[str, str]:
     env["XDG_CONFIG_HOME"] = str(isolated_home / ".config")
     env["HF_HOME"] = str(isolated_home / ".cache/huggingface")
     env["HF_HUB_DISABLE_IMPLICIT_TOKEN"] = "1"
+    # Capture native crashes (for example SIGSEGV while loading a dataset)
+    # in evalscope.log, including crashes during dependency imports.
+    env["PYTHONFAULTHANDLER"] = "1"
+    env["PYTHONUNBUFFERED"] = "1"
     env[EVALSCOPE_API_KEY_ENV] = str(
         config.get("evalscope", {}).get("api_key", "EMPTY")
     )
