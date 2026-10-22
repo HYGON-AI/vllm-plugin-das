@@ -261,6 +261,12 @@ class UnquantizedLinearMethod(LinearMethodBase):
             from vllm.model_executor.layers.utils import dispatch_cpu_unquantized_gemm
 
             dispatch_cpu_unquantized_gemm(layer, remove_weight=True)
+        else:
+            from vllm_hcu.utils.gate_linear_layout import (
+                prepare_gate_linear_nt_weight,
+            )
+
+            prepare_gate_linear_nt_weight(layer, use_nn=henvs.VLLM_USE_NN)
 
     def apply(
         self,
