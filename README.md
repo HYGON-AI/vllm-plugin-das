@@ -137,6 +137,31 @@ switches. Select attention/MoE backends, KV-cache format, speculative decoding,
 and parallel topology from a matching model profile; these options are not
 validated in every combination.
 
+### MLA KV Cache Layout Preference
+
+On gfx938, the HCU `FLASHMLA` and `FLASHMLA_SPARSE` backends prefer HND (`LBHNC`)
+when vLLM resolves the KV cache layout. The preference does not set
+`VLLM_KV_CACHE_LAYOUT` in the process environment. Explicit settings, an already
+resolved configuration, compatible KV connector preferences, and all backends'
+supported layout sets retain their upstream precedence. gfx936, other
+architectures, and other backends retain their inherited preferences.
+
+For these two MLA backends on gfx938, an unset layout can select HND
+automatically when compatible with the other selected backends and KV connector:
+
+```bash
+vllm serve /path/to/model \
+  --attention-backend FLASHMLA
+```
+
+HND is a preference, not a requirement: hybrid models can select additional
+backends that require another layout. Leave the variable unset to let vLLM
+resolve their common supported layout. An explicit `VLLM_KV_CACHE_LAYOUT=NHD`
+remains available when supported. Follow the matching [model profile](tests/models/)
+for cache dtype, hardware, and topology requirements. A layout preference does
+not change the backend's dtype or device support. See the
+[validation records](docs/validation/) for model-specific constraints.
+
 ### MHA/GQA With FlashAttention
 
 For MHA/GQA models using `--attention-backend FLASH_ATTN`, set

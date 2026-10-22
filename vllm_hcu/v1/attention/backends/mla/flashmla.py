@@ -46,6 +46,7 @@ from vllm_hcu.v1.attention.ops.flashmla import (
     get_mla_metadata_dense_fp8,
     is_flashmla_dense_supported,
 )
+from vllm_hcu.v1.attention.kv_cache_layout import prefer_hnd_layouts
 import vllm_hcu.platforms.envs as henvs
 from vllm_hcu.platforms.hcu import on_gfx938
 
@@ -53,6 +54,10 @@ logger = init_logger(__name__)
 
 
 class HcuFlashMLABackend(MLACommonBackend):
+    @classmethod
+    def supported_kv_cache_layouts(cls):
+        return prefer_hnd_layouts(super().supported_kv_cache_layouts())
+
     supported_dtypes: ClassVar[list[torch.dtype]] = [torch.float16, torch.bfloat16]
     supported_kv_cache_dtypes: ClassVar[list[CacheDType]] = [
         "auto",

@@ -4,6 +4,37 @@
 
 from __future__ import annotations
 
+from typing import TYPE_CHECKING
+
+if TYPE_CHECKING:
+    from vllm.v1.kv_cache_layout import KVCacheLayout
+
+
+def prefer_hnd_layouts(
+    supported: tuple[KVCacheLayout, ...] | None,
+) -> tuple[KVCacheLayout, ...] | None:
+    """Express a gfx938 MLA preference without changing supported layouts.
+
+    Only the HCU FLASHMLA and FLASHMLA_SPARSE backends call this helper. The
+    upstream resolver still owns explicit settings, connector preferences,
+    and cross-backend checks. Other architectures retain the inherited
+    declaration, including None.
+    """
+    from vllm_hcu.platforms.hcu import on_gfx938
+
+    if not on_gfx938():
+        return supported
+
+    from vllm.v1.kv_cache_layout import KVCacheLayout
+
+    # None means unrestricted, so retain every layout rather than narrowing
+    # the set to HND/NHD and potentially rejecting a KV transfer connector.
+    layouts = tuple(KVCacheLayout) if supported is None else supported
+    hnd = KVCacheLayout.LBHNC
+    if hnd not in layouts:
+        return supported
+    return (hnd, *(layout for layout in layouts if layout != hnd))
+
 
 # Each worker serves one engine. Cache allocation runs under the engine config
 # context, but model forwards and Graph replay need not retain that context.
@@ -28,4 +59,4 @@ def get_kv_cache_layout() -> str:
     return _worker_kv_cache_layout
 
 
-__all__ = ["get_kv_cache_layout"]
+__all__ = ["get_kv_cache_layout", "prefer_hnd_layouts"]
