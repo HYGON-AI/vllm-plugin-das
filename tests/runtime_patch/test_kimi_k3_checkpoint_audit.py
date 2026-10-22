@@ -224,6 +224,28 @@ def test_cli_writes_structured_report_for_invalid_index(tmp_path, monkeypatch, c
     assert any('model.safetensors.index.json' in error for error in report['errors'])
 
 
+@pytest.mark.parametrize('file_name', [
+    'config.json', 'model.safetensors.index.json',
+])
+@pytest.mark.parametrize('digits,valid', [(101, True), (5001, False)])
+def test_cli_reports_json_integer_digit_limit(tmp_path, monkeypatch, file_name,
+                                              digits, valid):
+    _write(tmp_path)
+    path = tmp_path / file_name
+    text = path.read_text()
+    path.write_text(text[:-1] + ',"unused":' + '7' * digits + '}')
+    output = tmp_path / 'audit.json'
+    monkeypatch.setattr(sys, 'argv', [
+        'audit_kimi_k3_checkpoint.py', str(tmp_path), '--output', str(output)
+    ])
+
+    assert audit_module.main() == (0 if valid else 1)
+    report = json.loads(output.read_text())
+    assert report['passed'] is valid
+    if not valid:
+        assert any(file_name in error for error in report['errors'])
+
+
 @pytest.mark.parametrize('bad_shard', [None, 0, False, [], {}, '', '\0'])
 def test_cli_reports_invalid_shard_names(tmp_path, monkeypatch, bad_shard):
     _write(tmp_path)
@@ -683,6 +705,51 @@ def test_audit_accepts_standard_json_values_in_unused_header_fields(tmp_path, va
     result = audit_module.audit(tmp_path)
 
     assert result['passed'] and not result['errors']
+
+
+@pytest.mark.parametrize('depth,reader_accepts', [
+    (32, True), (125, True), (126, False), (200, False),
+    (2000, False), (10000, False),
+])
+def test_cli_matches_reader_header_nesting_limit(tmp_path, monkeypatch,
+                                                 depth, reader_accepts):
+    from safetensors import SafetensorError, safe_open
+
+    _write(tmp_path)
+    path = tmp_path / 'model.safetensors'
+    raw = path.read_bytes()
+    size = struct.unpack('<Q', raw[:8])[0]
+    header = raw[8:8 + size].decode('utf-8')
+    offsets = header.index('"data_offsets": [')
+    offsets_end = header.index(']', offsets) + 1
+    encoded = (
+        header[:offsets_end] + ',"extra":' + '[' * depth + '0' + ']' * depth
+        + header[offsets_end:]
+    ).encode('utf-8')
+    _rewrite_raw_header(tmp_path, encoded)
+
+    if reader_accepts:
+        with safe_open(path, framework='numpy'):
+            pass
+    else:
+        with pytest.raises(SafetensorError):
+            with safe_open(path, framework='numpy'):
+                pass
+    if depth == 200:
+        # This is the important gap: Python accepts it, serde_json rejects it.
+        json.loads(encoded)
+
+    output = tmp_path / 'audit.json'
+    monkeypatch.setattr(sys, 'argv', [
+        'audit_kimi_k3_checkpoint.py', str(tmp_path), '--output', str(output)
+    ])
+
+    assert audit_module.main() == (0 if reader_accepts else 1)
+    report = json.loads(output.read_text())
+    assert report['passed'] is reader_accepts
+    if not reader_accepts:
+        assert any('JSON nesting exceeds safetensors limit' in error
+                   for error in report['errors'])
 
 
 @pytest.mark.parametrize('token,valid', [

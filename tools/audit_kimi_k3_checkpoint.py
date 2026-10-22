@@ -41,6 +41,9 @@ _CONFIG_SELECTED_ROUTES = {
 
 # Safetensors deserializes dimensions as native usize and checks each product.
 _MAX_USIZE = (1 << (struct.calcsize('P') * 8)) - 1
+# safetensors 0.8.0's serde_json reader permits at most 127 nested JSON
+# containers in the complete header (including the root object).
+_MAX_HEADER_JSON_NESTING = 127
 
 
 def validate_tensor_extent(name, info, errors):
@@ -382,6 +385,37 @@ def _validate_json_strings(value):
             pending.extend(item)
 
 
+def _validate_json_nesting(text, max_depth=_MAX_HEADER_JSON_NESTING):
+    """Reject headers deeper than the serde_json reader accepts.
+
+    This lightweight scan runs before json.loads so very deep input cannot
+    exploit a more permissive parser or trigger Python's recursion limit.
+    Brackets inside JSON strings are ignored; syntax pairing remains the
+    decoder's responsibility.
+    """
+    depth = 0
+    in_string = False
+    escaped = False
+    for char in text:
+        if in_string:
+            if escaped:
+                escaped = False
+            elif char == '\\':
+                escaped = True
+            elif char == '"':
+                in_string = False
+        elif char == '"':
+            in_string = True
+        elif char in '[{':
+            depth += 1
+            if depth > max_depth:
+                raise ValueError(
+                    f'JSON nesting exceeds safetensors limit ({max_depth})'
+                )
+        elif char in ']}':
+            depth -= 1
+
+
 def _valid_metadata(header, shard, errors):
     """Match safetensors metadata: absent/null or a string-to-string object."""
     if '__metadata__' not in header:
@@ -423,7 +457,7 @@ def audit(root, tp=16):
     config_path = root / 'config.json'
     try:
         raw = json.loads(config_path.read_text())
-    except (OSError, UnicodeError, json.JSONDecodeError, RecursionError) as exc:
+    except (OSError, UnicodeError, ValueError, RecursionError) as exc:
         return _failed_audit_result(
             root, [f'Unable to read/parse config.json: {exc}']
         )
@@ -452,7 +486,7 @@ def audit(root, tp=16):
     index_path = root / 'model.safetensors.index.json'
     try:
         index_document = json.loads(index_path.read_text())
-    except (OSError, UnicodeError, json.JSONDecodeError, RecursionError) as exc:
+    except (OSError, UnicodeError, ValueError, RecursionError) as exc:
         return _failed_audit_result(
             root, [f'Unable to read/parse model.safetensors.index.json: {exc}']
         )
@@ -510,6 +544,7 @@ def audit(root, tp=16):
                 continue
             try:
                 header_text = stream.read(size).decode('utf-8')
+                _validate_json_nesting(header_text)
                 header = json.loads(
                     header_text, object_pairs_hook=_unique_object,
                     parse_constant=_reject_json_constant,
