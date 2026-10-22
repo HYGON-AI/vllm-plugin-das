@@ -212,7 +212,13 @@ def test_kimi_k25_humaneval_routes_to_eight_card_evalscope_job() -> None:
                 "env": "VLLM_HCU_KIMI_K25_MODEL",
                 "relative": "Kimi-K2.5",
             },
+            {
+                "kind": "dataset",
+                "env": "VLLM_HCU_HUMANEVAL_DATASET",
+                "relative": "humaneval",
+            },
         ],
+        "isolate_generated_code": True,
     }
 
     target = (
@@ -1496,3 +1502,62 @@ def test_preflight_hides_device_inspection_details(
 
     assert error.value.__suppress_context__ is True
     assert private_link_name not in str(error.value)
+
+
+def test_dataset_preflight_searches_dataset_roots(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    roots = [tmp_path / "public", tmp_path / "parastor"]
+    source = roots[1] / "gsm8k/main"
+    source.mkdir(parents=True)
+    (source / "test-00000-of-00001.parquet").write_bytes(b"parquet")
+    monkeypatch.setenv("VLLM_HCU_TEST_DATASET_ROOTS", os.pathsep.join(map(str, roots)))
+    monkeypatch.delenv("VLLM_HCU_GSM8K_DATASET", raising=False)
+    requirement = {"kind": "dataset", "env": "VLLM_HCU_GSM8K_DATASET", "relative": "gsm8k"}
+    assert _check_requirements([requirement], tmp_path / "models") == [
+        {"env": requirement["env"], "kind": "dataset", "path": str(source.parent)}
+    ]
+
+
+def test_dataset_preflight_rejects_empty_directory(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    source = tmp_path / "gsm8k"
+    source.mkdir()
+    monkeypatch.setenv("VLLM_HCU_TEST_DATASET_ROOT", str(tmp_path))
+    monkeypatch.delenv("VLLM_HCU_TEST_DATASET_ROOTS", raising=False)
+    monkeypatch.delenv("VLLM_HCU_GSM8K_DATASET", raising=False)
+    with pytest.raises(PreflightError, match="local dataset is unavailable"):
+        _check_requirements(
+            [{"kind": "dataset", "env": "VLLM_HCU_GSM8K_DATASET", "relative": "gsm8k"}], None
+        )
+
+
+def test_humaneval_jobs_request_isolated_containers() -> None:
+    matrix = build_matrix(_config(), profile="nightly")
+    human_jobs = [job for job in matrix if "humaneval" in job["id"]]
+    assert human_jobs
+    assert all(job["isolate_generated_code"] is True for job in human_jobs)
+    assert all(
+        any(item.get("env") == "VLLM_HCU_HUMANEVAL_DATASET" for item in job["requirements"])
+        for job in human_jobs
+    )
+
+
+def test_missing_quantized_model_jobs_are_temporarily_disabled() -> None:
+    disabled_jobs = {
+        "qwen38-flash-next-humaneval",
+        "qwen38-flash-next-int8-pp2-tp4-humaneval",
+        "glm53-flash-channel-fp8-humaneval",
+    }
+    config = _config()
+    registrations = parse_registry()
+    for job in disabled_jobs:
+        entries = [entry for entry in registrations if entry.job == job]
+        assert entries
+        assert all(entry.disabled and "temporarily disabled" in entry.disabled for entry in entries)
+    nightly = build_matrix(config, profile="nightly")
+    assert disabled_jobs.isdisjoint({job["registry_job"] for job in nightly})
+    selected, _, _ = select_jobs(config, ["tests/integration/server/evalscope_server.py"])
+    assert disabled_jobs.isdisjoint({job["registry_job"] for job in selected})
+    assert "kimi-k25-humaneval" in {job["registry_job"] for job in selected}

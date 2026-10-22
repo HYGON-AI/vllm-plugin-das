@@ -345,6 +345,11 @@
           "kind": "model",
           "env": "VLLM_HCU_QWEN35_9B_MODEL",
           "relative": "qwen3.5/Qwen3.5-9B"
+        },
+        {
+          "kind": "dataset",
+          "env": "VLLM_HCU_GSM8K_DATASET",
+          "relative": "gsm8k"
         }
       ]
     },
@@ -369,6 +374,11 @@
           "kind": "model",
           "env": "VLLM_HCU_QWEN3_VL_8B_MODEL",
           "relative": "qwen3/Qwen3-VL-8B-Instruct"
+        },
+        {
+          "kind": "dataset",
+          "env": "VLLM_HCU_MMMU_DATASET",
+          "relative": "MMMU"
         }
       ]
     },
@@ -393,6 +403,11 @@
           "kind": "model",
           "env": "VLLM_HCU_QWEN3_8B_MODEL",
           "relative": "qwen3/Qwen3-8B"
+        },
+        {
+          "kind": "dataset",
+          "env": "VLLM_HCU_GSM8K_DATASET",
+          "relative": "gsm8k"
         }
       ]
     },
@@ -417,8 +432,14 @@
           "kind": "model",
           "env": "VLLM_HCU_QWEN38_FLASH_NEXT_MODEL",
           "relative": "Qwen3.8-Flash-Next-FP8-Channelwise"
+        },
+        {
+          "kind": "dataset",
+          "env": "VLLM_HCU_HUMANEVAL_DATASET",
+          "relative": "humaneval"
         }
-      ]
+      ],
+      "isolate_generated_code": true
     },
     "qwen38-flash-next-int8-pp2-tp4-humaneval": {
       "runner": "bw1100",
@@ -441,8 +462,14 @@
           "kind": "model",
           "env": "VLLM_HCU_QWEN38_FLASH_NEXT_INT8_MODEL",
           "relative": "Qwen3.8-Flash-Next-Channel-INT8-w8a8-ngram"
+        },
+        {
+          "kind": "dataset",
+          "env": "VLLM_HCU_HUMANEVAL_DATASET",
+          "relative": "humaneval"
         }
-      ]
+      ],
+      "isolate_generated_code": true
     },
     "deepseek-gsm8k": {
       "runner": "bw1100",
@@ -465,6 +492,11 @@
           "kind": "model",
           "env": "VLLM_HCU_DEEPSEEK_R1_MODEL",
           "relative": "DeepSeek-R1-Channel-FP8-w8a8"
+        },
+        {
+          "kind": "dataset",
+          "env": "VLLM_HCU_GSM8K_DATASET",
+          "relative": "gsm8k"
         }
       ]
     },
@@ -489,8 +521,14 @@
           "kind": "model",
           "env": "VLLM_HCU_GLM52_MODEL",
           "relative": "GLM-5___1-Channel-FP8-w8a8"
+        },
+        {
+          "kind": "dataset",
+          "env": "VLLM_HCU_HUMANEVAL_DATASET",
+          "relative": "humaneval"
         }
-      ]
+      ],
+      "isolate_generated_code": true
     },
     "glm53-flash-channel-fp8-humaneval": {
       "runner": "bw1100",
@@ -513,8 +551,14 @@
           "kind": "model",
           "env": "VLLM_HCU_GLM53_FLASH_CHANNEL_FP8_MODEL",
           "relative": "GLM-5.3-Flash-Channel-FP8-w8a8"
+        },
+        {
+          "kind": "dataset",
+          "env": "VLLM_HCU_HUMANEVAL_DATASET",
+          "relative": "humaneval"
         }
-      ]
+      ],
+      "isolate_generated_code": true
     },
     "kimi-k25-humaneval": {
       "runner": "bw1100",
@@ -537,8 +581,14 @@
           "kind": "model",
           "env": "VLLM_HCU_KIMI_K25_MODEL",
           "relative": "Kimi-K2.5"
+        },
+        {
+          "kind": "dataset",
+          "env": "VLLM_HCU_HUMANEVAL_DATASET",
+          "relative": "humaneval"
         }
-      ]
+      ],
+      "isolate_generated_code": true
     },
     "single-node-topology": {
       "runner": "bw1100",

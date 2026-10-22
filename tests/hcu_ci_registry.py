@@ -416,6 +416,11 @@ register_hcu_ci(
         "test_qwen38_flash_next_humaneval_evalscope_server"
     ),
     est_time=10800,
+    disabled=(
+        'temporarily disabled: required Qwen3.8-Flash-Next-FP8-Channelwise weights are '
+        'unavailable in public/parastor; re-enable after provisioning the exact '
+        'channel-FP8 checkpoint'
+    ),
 )
 register_hcu_ci(
     job="qwen38-flash-next-int8-pp2-tp4-humaneval",
@@ -425,6 +430,11 @@ register_hcu_ci(
         "test_qwen38_flash_next_int8_pp2_tp4_humaneval_evalscope_server"
     ),
     est_time=10800,
+    disabled=(
+        'temporarily disabled: required Qwen3.8-Flash-Next-Channel-INT8-w8a8-ngram '
+        'weights are unavailable in public/parastor; re-enable after provisioning the '
+        'exact INT8-ngram checkpoint'
+    ),
 )
 register_hcu_ci(
     job="deepseek-gsm8k",
@@ -460,6 +470,11 @@ register_hcu_ci(
         "test_glm53_flash_channel_fp8_humaneval_evalscope_server"
     ),
     est_time=14400,
+    disabled=(
+        'temporarily disabled: required GLM-5.3-Flash-Channel-FP8-w8a8 weights are '
+        'unavailable in public/parastor; re-enable after provisioning the exact Flash '
+        'channel-FP8 checkpoint'
+    ),
 )
 register_hcu_ci(
     job="kimi-k25-humaneval",

@@ -1318,3 +1318,38 @@ def test_evalscope_sandbox_does_not_reexecute_completion_on_host(
         work_dir=tmp_path,
         eval_log_path=tmp_path / "logs/evalscope.log",
     )
+
+
+def test_local_dataset_staging_preserves_read_only_mirror(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    source = tmp_path / "shared/gsm8k"
+    (source / "main").mkdir(parents=True)
+    for split in ("train", "test"):
+        (source / "main" / f"{split}-00000-of-00001.parquet").write_bytes(b"parquet")
+    metadata = source / "dataset_infos.json"
+    metadata.write_text("keep")
+    monkeypatch.setenv("VLLM_HCU_GSM8K_DATASET", str(source))
+    config = {"evalscope": {"datasets": ["gsm8k"], "dataset_args": {"gsm8k": {"few_shot_num": 4}}}}
+    prepared = evalscope_server.prepare_evalscope_datasets(config, tmp_path / "work")
+    target = Path(prepared["evalscope"]["dataset_args"]["gsm8k"]["dataset_id"])
+    assert target != source
+    assert metadata.read_text() == "keep"
+    assert not (target / "dataset_infos.json").exists()
+    assert (target / "main/test-00000-of-00001.parquet").is_symlink()
+    assert prepared["evalscope"]["dataset_args"]["gsm8k"]["few_shot_num"] == 4
+    assert "dataset_id" not in config["evalscope"]["dataset_args"]["gsm8k"]
+    assert "config_name: main" in (target / "README.md").read_text()
+    assert (target / "README.md").read_text().startswith("---\n")
+
+
+def test_local_dataset_staging_rejects_empty_mirror(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    source = tmp_path / "empty"
+    source.mkdir()
+    monkeypatch.setenv("VLLM_HCU_MMMU_DATASET", str(source))
+    with pytest.raises(FileNotFoundError, match="no parquet"):
+        evalscope_server.prepare_evalscope_datasets(
+            {"evalscope": {"datasets": ["mmmu"]}}, tmp_path / "work"
+        )

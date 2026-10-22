@@ -49,13 +49,8 @@ docker rm -f "$container_name" >/dev/null 2>&1 || true
 docker_args=(
   run --detach
   --name "$container_name"
-  --privileged
-  --ipc host
   --shm-size "${HCU_CI_SHM_SIZE:-32g}"
-  --cap-add SYS_PTRACE
-  --security-opt seccomp=unconfined
   --workdir /vllm-plugin-das
-  --volume "$workspace:/vllm-plugin-das"
   --env HOME=/tmp/hcu-ci-home
   --env PYTHONDONTWRITEBYTECODE=1
   --env VLLM_HCU_IS_IN_CI=1
@@ -64,6 +59,20 @@ docker_args=(
   --env TORCHINDUCTOR_CACHE_DIR=/tmp/hcu-ci-torchinductor
   --env XDG_CACHE_HOME=/tmp/hcu-ci-cache
 )
+
+if [[ "${HCU_CI_ISOLATE_GENERATED_CODE:-0}" == "1" ]]; then
+  docker_args+=(
+    --ipc private --cap-drop ALL --security-opt no-new-privileges --pids-limit 2048
+    --volume "$workspace:/hcu-ci-source:ro"
+    --env VLLM_HCU_HUMANEVAL_ISOLATED=1
+  )
+else
+  docker_args+=(
+    --privileged --ipc host --cap-add SYS_PTRACE
+    --security-opt seccomp=unconfined
+    --volume "$workspace:/vllm-plugin-das"
+  )
+fi
 
 missing_devices=()
 for device in /dev/kfd /dev/dri; do
@@ -135,15 +144,33 @@ if [[ "${#model_root_hosts[@]}" -gt 0 ]]; then
   )
 fi
 
+dataset_root_hosts=()
+dataset_root_containers=()
+add_dataset_root() {
+  local host_root="$1" container_root="$2" existing
+  [[ -d "$host_root" ]] || return 0
+  host_root="$(realpath "$host_root")"
+  for existing in "${dataset_root_hosts[@]:-}"; do
+    [[ "$existing" == "$host_root" ]] && return 0
+  done
+  dataset_root_hosts+=("$host_root")
+  dataset_root_containers+=("$container_root")
+}
 if [[ -n "$dataset_root" ]]; then
-  dataset_root="$(realpath "$dataset_root")"
-  if [[ ! -d "$dataset_root" ]]; then
-    echo "HCU dataset root does not exist: $dataset_root" >&2
-    exit 2
-  fi
+  [[ -d "$dataset_root" ]] || { echo "HCU dataset root does not exist: $dataset_root" >&2; exit 2; }
+  add_dataset_root "$dataset_root" /datasets
+fi
+add_dataset_root /public/opendas/DL_DATA/ci_datasets /datasets/public
+add_dataset_root /parastor/opendas/DL_DATA/ci_datasets /datasets/parastor
+if [[ "${#dataset_root_hosts[@]}" -gt 0 ]]; then
+  for index in "${!dataset_root_hosts[@]}"; do
+    echo "using HCU dataset root: ${dataset_root_hosts[$index]} -> ${dataset_root_containers[$index]}"
+    docker_args+=(--volume "${dataset_root_hosts[$index]}:${dataset_root_containers[$index]}:ro")
+  done
+  dataset_root_search_path="$(IFS=:; echo "${dataset_root_containers[*]}")"
   docker_args+=(
-    --volume "$dataset_root:/datasets:ro"
-    --env VLLM_HCU_TEST_DATASET_ROOT=/datasets
+    --env "VLLM_HCU_TEST_DATASET_ROOT=${dataset_root_containers[0]}"
+    --env "VLLM_HCU_TEST_DATASET_ROOTS=$dataset_root_search_path"
   )
 fi
 
@@ -172,6 +199,16 @@ done
 docker "${docker_args[@]}" "$image" bash -lc 'while true; do sleep 3600; done'
 docker exec "$container_name" bash -lc '
   set -euo pipefail
+  if [[ "${VLLM_HCU_HUMANEVAL_ISOLATED:-0}" == "1" ]]; then
+    if git -c safe.directory=/hcu-ci-source -C /hcu-ci-source config --local --name-only \
+      --get-regexp "(^http\\..*\\.extraheader$|^credential\\.)" >/dev/null; then
+      echo "isolated evaluation requires checkout with persist-credentials: false" >&2
+      exit 2
+    fi
+    mkdir -p /vllm-plugin-das
+    cp -a --no-preserve=ownership /hcu-ci-source/. /vllm-plugin-das/
+    git -C /vllm-plugin-das config --local --unset-all http.https://github.com/.extraheader || true
+  fi
   ci_home=/tmp/hcu-ci-home
   # Reports stay container-local; cleanup exports them without another host bind.
   mkdir -p /hcu-ci-artifacts "$ci_home" "$TORCHINDUCTOR_CACHE_DIR" "$XDG_CACHE_HOME"

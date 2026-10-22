@@ -86,6 +86,7 @@ jobs:
     timeout-minutes: ${{ matrix.timeout_minutes }}
     env:
       HCU_CI_JOB_ID: ${{ matrix.id }}
+      HCU_CI_ISOLATE_GENERATED_CODE: ${{ matrix.isolate_generated_code && '1' || '0' }}
       HCU_CI_REGISTRY_JOB: ${{ matrix.registry_job }}
       HCU_CI_ARCH: ${{ matrix.arch }}
       HCU_CI_CARDS: ${{ matrix.cards }}
@@ -182,6 +183,7 @@ jobs:
         uses: actions/checkout@v4
         with:
           ref: ${{ inputs.tested_ref || github.sha }}
+          persist-credentials: false
           clean: true
           fetch-depth: 1
 

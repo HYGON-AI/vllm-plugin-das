@@ -122,6 +122,8 @@ def _validated_job(job_id: str, raw: Any) -> dict[str, Any]:
         or not 1 <= partitions <= 32
     ):
         raise SelectionError(f"job {job_id!r} has invalid partitions {partitions!r}")
+    if not isinstance(raw.get("isolate_generated_code", False), bool):
+        raise SelectionError(f"job {job_id!r} isolate_generated_code must be boolean")
     return {
         "id": job_id,
         "runner": runner,
@@ -132,6 +134,7 @@ def _validated_job(job_id: str, raw: Any) -> dict[str, Any]:
         "timeout_minutes": timeout,
         "requirements": requirements,
         "partitions": partitions,
+        "isolate_generated_code": bool(raw.get("isolate_generated_code", False)),
     }
 
 

@@ -204,6 +204,48 @@ def server_command(
     return ["vllm", "serve", model, *args], host, port
 
 
+def prepare_evalscope_datasets(
+    config: dict[str, Any], work_dir: Path
+) -> dict[str, Any]:
+    """Use private manifests backed by the mounted read-only parquet data."""
+
+    prepared = copy.deepcopy(config)
+    evaluation = prepared["evalscope"]
+    arguments = evaluation.setdefault("dataset_args", {})
+    for name in evaluation["datasets"]:
+        env_name = f"VLLM_HCU_{str(name).upper()}_DATASET"
+        source_text = os.environ.get(env_name)
+        if not source_text:
+            continue
+        source = Path(source_text).resolve()
+        if not source.is_dir():
+            raise FileNotFoundError(f"{env_name} is unavailable: {source}")
+        target = work_dir / "datasets" / str(name)
+        target.mkdir(parents=True, exist_ok=False)
+        subsets: dict[str, dict[str, list[str]]] = {}
+        for parquet in sorted(source.rglob("*.parquet")):
+            relative = parquet.relative_to(source)
+            link = target / relative
+            link.parent.mkdir(parents=True, exist_ok=True)
+            link.symlink_to(parquet)
+            subset = relative.parts[0] if len(relative.parts) > 1 else "default"
+            split = parquet.name.split("-", 1)[0].removesuffix(".parquet")
+            subsets.setdefault(subset, {}).setdefault(split, []).append(relative.as_posix())
+        if not subsets:
+            raise FileNotFoundError(f"no parquet data under {source}")
+        metadata = {"configs": [
+            {"config_name": subset, "data_files": [
+                {"split": split, "path": paths} for split, paths in splits.items()
+            ]} for subset, splits in subsets.items()
+        ]}
+        (target / "README.md").write_text(
+            "---\n" + yaml.safe_dump(metadata, sort_keys=False) + "---\n",
+            encoding="utf-8",
+        )
+        arguments.setdefault(name, {})["dataset_id"] = str(target)
+    return prepared
+
+
 def evalscope_command(
     config: dict[str, Any],
     *,
@@ -303,7 +345,7 @@ def _reset_evalscope_artifacts(work_dir: Path) -> None:
         encoding="utf-8"
     ) != EVALSCOPE_OWNER_SIGNATURE:
         raise ValueError(f"invalid EvalScope ownership marker under {root}")
-    for name in ("configs", "predictions", "reviews", "reports"):
+    for name in ("configs", "predictions", "reviews", "reports", "datasets"):
         path = root / name
         if path.is_symlink() or path.is_file():
             path.unlink()
@@ -1113,6 +1155,7 @@ def run_evalscope_server_test(
         os.environ.get("VLLM_HCU_EVAL_WORK_DIR", config["evalscope"]["work_dir"])
     )
     _reset_evalscope_artifacts(work_dir)
+    config = prepare_evalscope_datasets(config, work_dir)
     log_dir = work_dir / "logs"
     server_log_path = log_dir / "vllm_server.log"
     eval_log_path = log_dir / "evalscope.log"
