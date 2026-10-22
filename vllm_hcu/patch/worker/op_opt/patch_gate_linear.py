@@ -1,6 +1,6 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright (c) 2026 Hygon Information Technology Co., Ltd.
-"""Adapt official GateLinear to the HCU unquantized NN weight layout."""
+"""Use logical HCU [K,N] router weights with post-load NT storage."""
 
 from __future__ import annotations
 
@@ -10,6 +10,7 @@ from types import ModuleType
 import torch
 
 from vllm_hcu.platforms import envs as henvs
+from vllm_hcu.utils.gate_linear_layout import HCU_GATE_LINEAR_MARKER
 
 from ._common import (
     already_applied,
@@ -22,7 +23,7 @@ from ._common import (
 TARGET_MODULE = "vllm.model_executor.layers.fused_moe.router.gate_linear"
 PATCH_ID = "worker.op_opt.moe.router.gate_linear_nn_layout"
 TARGETS = (f"{TARGET_MODULE}.GateLinear.forward",)
-_CLASS_MARKER = "_vllm_hcu_nn_layout_applied"
+_CLASS_MARKER = HCU_GATE_LINEAR_MARKER
 _WRAPPER_MARKER = "_vllm_hcu_nn_layout_wrapper"
 
 
@@ -57,6 +58,8 @@ def apply_to_module(module: ModuleType) -> bool:
             and self.weight.shape[0] == x.shape[-1]
         )
         if uses_hcu_nn_layout:
+            # Post-load preparation preserves [K,N] but makes weight.T
+            # contiguous. No layout conversion or cache lookup in forward.
             output = torch.mm(x, self.weight, out_dtype=torch.float32)
             return output, None
         return original(self, x)
