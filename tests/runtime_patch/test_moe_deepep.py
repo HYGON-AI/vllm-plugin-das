@@ -3730,8 +3730,10 @@ def test_channel_int8_auto_factory_builds_unified_ht_ll_kernel(
     }
 
 
+@pytest.mark.parametrize("pcp_ht", [False, True])
 def test_slimquant_w4a8_auto_factory_reuses_unified_prepare_finalize(
     monkeypatch: pytest.MonkeyPatch,
+    pcp_ht: bool,
 ):
     import vllm.model_executor.layers.fused_moe.all2all_utils as all2all_utils
     from vllm.model_executor.layers.fused_moe.config import FusedMoEQuantConfig
@@ -3751,12 +3753,17 @@ def test_slimquant_w4a8_auto_factory_reuses_unified_prepare_finalize(
         def num_dispatchers():
             return 8
 
-    prepare_finalize = PrepareFinalize()
+    prepare_finalize = (
+        SimpleNamespace(num_dispatchers=lambda: 8) if pcp_ht else PrepareFinalize()
+    )
+    prepare_calls = []
 
     def maybe_make_prepare_finalize(**kwargs):
-        prepare_finalize.ll_prepare_finalize.routing_tables = kwargs[
-            "routing_tables"
-        ]
+        prepare_calls.append(kwargs)
+        if not pcp_ht:
+            prepare_finalize.ll_prepare_finalize.routing_tables = kwargs[
+                "routing_tables"
+            ]
         return prepare_finalize
 
     monkeypatch.setattr(
@@ -3784,25 +3791,112 @@ def test_slimquant_w4a8_auto_factory_reuses_unified_prepare_finalize(
         per_out_ch_quant=False,
         block_shape=None,
         weight_dtype="int4",
+        gemm1_clamp_limit=7.0 if pcp_ht else None,
     )
     moe_config = SimpleNamespace()
 
-    kernel = module.make_deepep_auto_deepgemm_w4a8_moe_kernel(
+    factory = (
+        module.make_deepep_ht_deepgemm_w4a8_moe_kernel
+        if pcp_ht else module.make_deepep_auto_deepgemm_w4a8_moe_kernel
+    )
+    kernel = factory(
         moe_quant_config=quant_config,
         moe_config=moe_config,
         routing_tables=routing_tables,
     )
 
     assert kernel[0] is prepare_finalize
-    assert kernel[0].ll_prepare_finalize.routing_tables is routing_tables
+    assert prepare_calls == [dict(
+        moe=moe_config,
+        quant_config=quant_config,
+        routing_tables=routing_tables,
+        allow_new_interface=True,
+        use_monolithic=False,
+    )]
     assert isinstance(kernel[1], AutoW4A8Experts)
     assert constructed == {
         "moe_config": moe_config,
         "quant_config": quant_config,
-        "max_num_tokens": 64,
+        "max_num_tokens": 0 if pcp_ht else 64,
         "num_dispatchers": 8,
-        "fixed_use_low_latency": None,
+        "fixed_use_low_latency": False if pcp_ht else None,
     }
+
+
+@pytest.mark.parametrize(
+    ("field", "value", "error"),
+    [
+        (None, None, None),
+        ("pcp_size", 1, None),
+        ("dp_size", 2, None),
+        ("use_ep", False, None),
+        ("all2all_backend", "deepep_low_latency", None),
+        ("use_deepep_auto_kernels", True, "cannot use deepep_auto"),
+        ("architecture", "DeepseekV4ForCausalLM", "requires HYV4ForCausalLM"),
+        ("moe_backend", "triton", "requires moe_backend"),
+        ("activation", "gelu", "supports only SiLU"),
+    ],
+)
+def test_hyv4_w4a8_pcp_ht_route(monkeypatch, field, value, error):
+    from vllm_hcu.model_executor.layers.fused_moe import deepep_runtime as module
+
+    parallel = SimpleNamespace(
+        pcp_size=8, dp_size=1, use_ep=True,
+        all2all_backend="deepep_high_throughput",
+        use_deepep_auto_kernels=False,
+    )
+    model = SimpleNamespace(architectures=["HYV4ForCausalLM"])
+    moe = SimpleNamespace(
+        moe_parallel_config=parallel, moe_backend="deep_gemm", activation="silu",
+        swiglu_limit=7.0, _hcu_vllm_config=SimpleNamespace(model_config=model),
+    )
+    if field == "architecture":
+        model.architectures = [value]
+    elif field in ("moe_backend", "activation"):
+        setattr(moe, field, value)
+    elif field is not None:
+        setattr(parallel, field, value)
+    monkeypatch.setattr(module, "current_platform", SimpleNamespace(is_rocm=lambda: True))
+    calls = []
+    monkeypatch.setattr(
+        module, "_require_slimquant_w4a8_hipc_runtime",
+        lambda **kwargs: calls.append(kwargs),
+    )
+    if error is not None:
+        with pytest.raises(ValueError, match=error):
+            module.slimquant_w4a8_uses_deepep_ht(moe)
+        assert calls == []
+    else:
+        assert module.slimquant_w4a8_uses_deepep_ht(moe) is (field is None)
+        assert calls == ([dict(ht_only=True, clamp=True)] if field is None else [])
+
+
+def test_hyv4_w4a8_ht_runtime_needs_no_ll_operators(monkeypatch):
+    from vllm_hcu.model_executor.layers.fused_moe import deepep_runtime as module
+
+    noop = lambda *_args, **_kwargs: None
+    modules = {
+        "deepgemm": SimpleNamespace(
+            pack_w4a8_moe_hipc_weight=noop,
+            m_grouped_w4a8_gemm_nt_contiguous_hipc=noop,
+        ),
+        "lightop.activation": SimpleNamespace(fuse_silu_mul_quant=noop),
+        "lightop": SimpleNamespace(),
+    }
+    with monkeypatch.context() as patch:
+        for name, runtime in modules.items():
+            patch.setitem(sys.modules, name, runtime)
+        module._require_slimquant_w4a8_hipc_runtime.cache_clear()
+        try:
+            module._require_slimquant_w4a8_hipc_runtime(ht_only=True)
+            with pytest.raises(RuntimeError, match="fuse_silu_mul_clamp_quant"):
+                module._require_slimquant_w4a8_hipc_runtime(ht_only=True, clamp=True)
+            modules["lightop"].fuse_silu_mul_clamp_quant = noop
+            module._require_slimquant_w4a8_hipc_runtime(ht_only=True, clamp=True)
+            with pytest.raises(RuntimeError, match="m_grouped_w4a8_gemm_nt_masked_hipc"):
+                module._require_slimquant_w4a8_hipc_runtime()
+        finally:
+            module._require_slimquant_w4a8_hipc_runtime.cache_clear()
 
 
 def test_slimquant_w4a8_auto_factory_rejects_non_dynamic_token_scheme(
