@@ -65,6 +65,15 @@ def validate_config(config, moe, layer, quant_mode=None) -> None:
         raise ValueError("HCU MegaMoE supports DeepSeek-V4 target/DSpark models only")
     if not parallel.enable_expert_parallel or moe.ep_size != 8:
         raise ValueError("HCU MegaMoE requires --enable-expert-parallel and EP8")
+    # EP rewrites the MoE-local TP size to one, but the model's original TP
+    # ranks still receive replicated (non-sequence-parallel) tokens.  MegaMoE
+    # registers routes per source rank and cannot coalesce those replicas, so
+    # accepting model TP here would execute every routed expert TP times.
+    if parallel.tensor_parallel_size > 1:
+        raise ValueError(
+            "HCU MegaMoE does not support tensor parallelism; use "
+            "--tensor-parallel-size 1 with data parallel expert parallelism"
+        )
     if quant_mode == "int8" and not config.model_config.enforce_eager:
         raise ValueError("HCU MegaMoE PACK5 adapter requires --enforce-eager")
     if moe.moe_backend != "deep_gemm_mega_moe":

@@ -29,7 +29,8 @@ def test_megamoe_acceptance_configuration(profile):
     assert "--enable-expert-parallel" in command
     assert ("--enforce-eager" in command) == (profile != "fp8_dspark_graph")
     assert command[command.index("--moe-backend")+1] == "deep_gemm_mega_moe"
-    assert command[command.index("--tensor-parallel-size")+1] == "8"
+    assert command[command.index("--tensor-parallel-size")+1] == "1"
+    assert command[command.index("--data-parallel-size")+1] == "8"
     assert "--all2all-backend" not in command
     spec = json.loads(command[command.index("--speculative-config")+1])
     assert spec["method"] == "dspark" and spec["num_speculative_tokens"] == 7

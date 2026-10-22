@@ -79,7 +79,7 @@ def test_int4_rejects_invalid_scale(int4, factor):
 
 def valid_config():
     config = NS(parallel_config=NS(enable_expert_parallel=True, enable_eplb=False,
-                                   enable_dbo=False),
+                                   enable_dbo=False, tensor_parallel_size=1),
                 model_config=NS(enforce_eager=True, hf_config=NS(model_type="deepseek_v4")))
     moe = NS(ep_size=8, moe_backend="deep_gemm_mega_moe", pcp_size=1, is_sequence_parallel=False,
              num_experts=256, num_local_experts=32, hidden_dim=4096,
@@ -118,6 +118,16 @@ def test_config_rejects_graphs_and_round_robin(runtime):
     config.model_config.enforce_eager = True
     layer.expert_placement_strategy = "round_robin"
     with pytest.raises(ValueError, match="linear expert"):
+        runtime.validate_config(config, moe, layer)
+
+
+def test_config_rejects_original_tp_before_replicated_routes_are_staged(runtime):
+    config, moe, layer = valid_config()
+    config.parallel_config.tensor_parallel_size = 8
+    # EP has already rewritten the MoE-local TP topology; validation must use
+    # the original ParallelConfig or 16 * top-6 routes would be staged 8 times.
+    moe.tp_size = 1
+    with pytest.raises(ValueError, match="tensor parallelism"):
         runtime.validate_config(config, moe, layer)
 
 
