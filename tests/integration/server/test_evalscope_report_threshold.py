@@ -587,6 +587,30 @@ def test_reset_evalscope_artifacts_removes_stale_outputs_only(
     assert log.read_text(encoding="utf-8") == "keep"
 
 
+def test_ci_evalscope_directory_is_owned_and_isolated(tmp_path: Path) -> None:
+    parent = tmp_path / "hcu-ci-artifacts/evalscope"
+    unrelated = parent / "reports/keep.json"
+    unrelated.parent.mkdir(parents=True)
+    unrelated.write_text("keep", encoding="utf-8")
+
+    first = evalscope_server.create_evalscope_work_dir(parent)
+    second = evalscope_server.create_evalscope_work_dir(parent)
+    assert first != second
+    assert first.parent == second.parent == parent
+    stale = first / "reports/stale.json"
+    stale.parent.mkdir()
+    stale.write_text("stale", encoding="utf-8")
+
+    evalscope_server._reset_evalscope_artifacts(first)
+    evalscope_server._reset_evalscope_artifacts(second)
+
+    assert not stale.exists()
+    assert unrelated.read_text(encoding="utf-8") == "keep"
+    assert (first / evalscope_server.EVALSCOPE_OWNER_MARKER).read_text(
+        encoding="utf-8"
+    ) == evalscope_server.EVALSCOPE_OWNER_SIGNATURE
+
+
 def test_reset_evalscope_artifacts_rejects_unowned_broad_path(
     tmp_path: Path,
 ) -> None:

@@ -13,6 +13,7 @@ import shutil
 import signal
 import subprocess
 import sys
+import tempfile
 import time
 import uuid
 from pathlib import Path
@@ -265,6 +266,17 @@ def evalscope_command(
 def _open_log(path: Path):
     path.parent.mkdir(parents=True, exist_ok=True)
     return path.open("ab")
+
+
+def create_evalscope_work_dir(parent: Path) -> Path:
+    """Claim a fresh report directory without adopting existing user outputs."""
+
+    parent.mkdir(parents=True, exist_ok=True)
+    work_dir = Path(tempfile.mkdtemp(prefix="run-", dir=parent))
+    (work_dir / EVALSCOPE_OWNER_MARKER).write_text(
+        EVALSCOPE_OWNER_SIGNATURE, encoding="utf-8"
+    )
+    return work_dir
 
 
 def _reset_evalscope_artifacts(work_dir: Path) -> None:

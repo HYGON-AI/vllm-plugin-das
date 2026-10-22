@@ -130,9 +130,13 @@ def main() -> int:
         integration_dir = job_root / "integration"
         evalscope_dir = job_root / "evalscope"
         integration_dir.mkdir(parents=True, exist_ok=True)
-        evalscope_dir.mkdir(parents=True, exist_ok=True)
+        from tests.integration.server.evalscope_server import (
+            create_evalscope_work_dir,
+        )
+
+        evalscope_work_dir = create_evalscope_work_dir(evalscope_dir)
         os.environ["VLLM_HCU_INTEGRATION_LOG_DIR"] = str(integration_dir)
-        os.environ["VLLM_HCU_EVAL_WORK_DIR"] = str(evalscope_dir)
+        os.environ["VLLM_HCU_EVAL_WORK_DIR"] = str(evalscope_work_dir)
 
         request = {
             "job_id": job_id,
