@@ -86,6 +86,7 @@ if TYPE_CHECKING:
     VLLM_HCU_MHC_FUSED_RMSNORM: bool = True
     VLLM_HCU_GLM5NEXT_KDA_STRIDED_INPUTS: bool = True
     VLLM_HCU_GLM5NEXT_KPOOL_FUSE_EXPAND: bool = False
+    VLLM_HCU_GLM5NEXT_KPOOL_ELEMENT_FUSION: bool = False
 
 def maybe_convert_int(value: Optional[str]) -> Optional[int]:
     """
@@ -679,6 +680,16 @@ hcu_vllm_environment_variables: dict[str, Callable[[], Any]] = {
     # by default (opt-in); set to 1 to enable.
     "VLLM_HCU_GLM5NEXT_KPOOL_FUSE_EXPAND":
         lambda: (os.environ.get("VLLM_HCU_GLM5NEXT_KPOOL_FUSE_EXPAND", "False").lower() in
+                    ("true", "1")),
+
+    # Trim elementwise kernels on the GLM5Next kpool sparse-indexer decode
+    # path: pass int64 positions straight to the kpool decode-update kernel
+    # (drops a positions.to(int32) copy), and on pure short-context decode
+    # replace the whole-buffer -1 fill + _fill_causal_indices chain with one
+    # Triton kernel. Consulted once at patch-apply time. See
+    # patch_glm5next_kpool_element_fusion.py. Disabled by default (opt-in).
+    "VLLM_HCU_GLM5NEXT_KPOOL_ELEMENT_FUSION":
+        lambda: (os.environ.get("VLLM_HCU_GLM5NEXT_KPOOL_ELEMENT_FUSION", "False").lower() in
                     ("true", "1")),
 }
 

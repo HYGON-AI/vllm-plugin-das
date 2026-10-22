@@ -13,6 +13,7 @@ upstream function body underneath the textual patch below.
 from __future__ import annotations
 
 import inspect
+import linecache
 from types import ModuleType
 
 import torch
@@ -379,8 +380,17 @@ def _patch_indexer_decode(indexer_mod: ModuleType) -> None:
         setattr(indexer_mod, _PATCH_MARKER, True)
         return
 
+    # Register the rewritten source so later textual patches on the same
+    # function (e.g. kpool_element_fusion) can still inspect.getsource it.
+    filename = f"<{PATCH_ID}>"
+    linecache.cache[filename] = (
+        len(source),
+        None,
+        source.splitlines(keepends=True),
+        filename,
+    )
     namespace: dict[str, object] = {}
-    code = compile(source, f"<{PATCH_ID}>", "exec")
+    code = compile(source, filename, "exec")
     exec(code, indexer_mod.__dict__, namespace)
     patched = namespace["sparse_attn_indexer_kpool"]
     # functools.wraps(fn) inside eager_break_during_capture copies fn.__dict__
