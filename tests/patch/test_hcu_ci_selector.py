@@ -37,7 +37,10 @@ from hcu_ci_preflight import (  # noqa: E402
     _check_requirements,
     _version_specification,
 )
-from run_hcu_ci_job import _export_resolved_resource_environment  # noqa: E402
+from run_hcu_ci_job import (  # noqa: E402
+    _export_resolved_resource_environment,
+    _pid_cgroup_snapshot,
+)
 from build_hcu_matrix import MatrixError, build_matrix  # noqa: E402
 from compile_changed_python import _compile as compile_python_file  # noqa: E402
 from compile_changed_python import main as compile_changed_python_main  # noqa: E402
@@ -1568,3 +1571,44 @@ def test_missing_quantized_model_jobs_are_temporarily_disabled() -> None:
     selected, _, _ = select_jobs(config, ["tests/integration/server/evalscope_server.py"])
     assert disabled_jobs.isdisjoint({job["registry_job"] for job in selected})
     assert "kimi-k25-humaneval" in {job["registry_job"] for job in selected}
+
+
+@pytest.mark.parametrize("version", ["v1", "v2"])
+def test_pid_controller_snapshot_records_thread_limits_and_events(tmp_path: Path, version: str) -> None:
+    missing = tmp_path / "unavailable"
+    root = tmp_path / version
+    root.mkdir()
+    for name, value in {
+        "pids.max": "8192", "pids.current": "2305", "pids.events": "max 0"
+    }.items():
+        (root / name).write_text(value + "\n")
+    if version == "v2":
+        (root / "pids.peak").write_text("2306\n")
+    actual = _pid_cgroup_snapshot((missing, root))
+    assert actual == {
+        "path": str(root), "pids.max": "8192", "pids.current": "2305",
+        "pids.events": "max 0", "pids.peak": "2306" if version == "v2" else None,
+    }
+
+
+def test_pid_controller_snapshot_handles_missing_controller(tmp_path: Path) -> None:
+    assert _pid_cgroup_snapshot((tmp_path,)) == {"path": None}
+
+
+@pytest.mark.parametrize("value", ["0", "-1", "not-a-number", "8192; echo invalid"])
+def test_ci_container_rejects_invalid_pid_limit_before_docker(
+    tmp_path: Path, value: str
+) -> None:
+    env = os.environ.copy()
+    env.update(
+        HCU_CI_IMAGE="example.invalid/vllm@sha256:" + "0" * 64,
+        HCU_CI_CONTAINER_NAME="ci-pids-validation",
+        GITHUB_WORKSPACE=str(tmp_path),
+        HCU_CI_PIDS_LIMIT=value,
+    )
+    result = subprocess.run(
+        ["bash", str(REPOSITORY / "scripts/ci/hcu/hcu_ci_start_container.sh")],
+        env=env, text=True, capture_output=True,
+    )
+    assert result.returncode == 2
+    assert "HCU_CI_PIDS_LIMIT must be a positive integer" in result.stderr

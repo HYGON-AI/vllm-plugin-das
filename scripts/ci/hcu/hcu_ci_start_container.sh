@@ -9,6 +9,7 @@ container_name="${HCU_CI_CONTAINER_NAME:-}"
 workspace="${GITHUB_WORKSPACE:-$(pwd)}"
 model_root="${HCU_CI_MODEL_ROOT:-${VLLM_HCU_TEST_MODEL_ROOT:-}}"
 dataset_root="${HCU_CI_DATASET_ROOT:-${VLLM_HCU_TEST_DATASET_ROOT:-}}"
+pids_limit="${HCU_CI_PIDS_LIMIT:-8192}"
 
 while [[ $# -gt 0 ]]; do
   case "$1" in
@@ -39,6 +40,11 @@ if [[ "${HCU_CI_ALLOW_MUTABLE_IMAGE:-0}" != "1" \
   exit 2
 fi
 
+if [[ ! "$pids_limit" =~ ^[1-9][0-9]*$ ]]; then
+  echo "HCU_CI_PIDS_LIMIT must be a positive integer" >&2
+  exit 2
+fi
+
 workspace="$(realpath "$workspace")"
 
 if [[ "${HCU_CI_SKIP_PULL:-0}" != "1" && ! "$image" =~ ^sha256:[0-9a-fA-F]{64}$ ]]; then
@@ -62,7 +68,10 @@ docker_args=(
 
 if [[ "${HCU_CI_ISOLATE_GENERATED_CODE:-0}" == "1" ]]; then
   docker_args+=(
-    --ipc private --cap-drop ALL --security-opt no-new-privileges --pids-limit 2048
+    # The PID controller counts threads too; eight GPU workers need room for
+    # their driver pools and distributed process-group watchdog threads.
+    --ipc private --cap-drop ALL --security-opt no-new-privileges
+    --pids-limit "$pids_limit"
     --volume "$workspace:/hcu-ci-source:ro"
     --env VLLM_HCU_HUMANEVAL_ISOLATED=1
   )
