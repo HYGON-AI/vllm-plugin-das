@@ -160,6 +160,8 @@ jobs:
           bash "$RUNNER_TEMP/hcu-ci-scripts/hcu_ci_run_control_container.sh" -- bash -lc '
             set -euo pipefail
             python3 --version
+            export PATH="$HOME/.local/bin:$PATH"
+            python3 .github/scripts/hcu_ci/ensure_ci_dependencies.py --user
             git config --global --add safe.directory "$GITHUB_WORKSPACE"
             python3 .github/scripts/hcu_ci/hcu_ci_preflight.py \
               --environment-lock "${{ steps.release-environment.outputs.environment_lock }}" \

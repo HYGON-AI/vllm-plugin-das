@@ -30,6 +30,12 @@ Install the lightweight test dependency:
 python -m pip install -r requirements-test.txt
 ```
 
+CI installs the pinned runtime and test requirements after creating each
+disposable container. The static gate uses the container user's temporary
+home; hardware jobs install inside their temporary job container. EvalScope
+is installed only when the selected job declares it. CI dependency setup
+does not require rebuilding or updating the image.
+
 Run the standard suites from the repository root:
 
 ```bash

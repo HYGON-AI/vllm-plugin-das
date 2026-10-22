@@ -59,20 +59,13 @@ RUN wget -q "${RESOURCE_SERVER_URL}/Jenkins/CI_scripts/dtk_blas_cut_installer.sh
     rm -f /tmp/dtk_blas_cut_installer.sh
 
 # ---layer--- vLLM 框架依赖
-COPY docker/requirements-vllm-runtime.txt /tmp/requirements-vllm-runtime.txt
-COPY scripts/ci/hcu/install_vllm_runtime_dependencies.sh /tmp/install_vllm_runtime_dependencies.sh
-COPY requirements-test.txt /tmp/requirements-test.txt
-# EvalScope is installed only in the ephemeral evaluation containers.
-
 ARG VLLM_VERSION
 RUN pip install --no-cache-dir ninja wheel setuptools \
-    && bash /tmp/install_vllm_runtime_dependencies.sh /tmp/requirements-vllm-runtime.txt \
+    && pip install --no-cache-dir ray[data,train,tune,serve] -i https://mirrors.cloud.tencent.com/pypi/simple/ --trusted-host mirrors.cloud.tencent.com \
     && pip install --no-cache-dir amdsmi==1.0.0+630c16a6.dirty \
     && pip install --no-cache-dir cupy \
     && pip install --no-cache-dir vllm==0.28.1 \
     && pip install --no-cache-dir --pre "vllm-hcu>0.28.0,<=0.28.1" \
-    && grep -vi '^[[:space:]]*evalscope' /tmp/requirements-test.txt > /tmp/requirements-ci-base.txt \
-    && pip install --no-cache-dir -r /tmp/requirements-ci-base.txt \
     && pip cache purge
 
 # ---layer--- torch + das 加速库
