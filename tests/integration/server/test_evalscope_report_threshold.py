@@ -1323,6 +1323,7 @@ def test_evalscope_sandbox_does_not_reexecute_completion_on_host(
 def test_local_dataset_staging_preserves_read_only_mirror(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
+    monkeypatch.setattr(evalscope_server, "EVALSCOPE_OWNED_ROOT", tmp_path / "cache")
     source = tmp_path / "shared/gsm8k"
     (source / "main").mkdir(parents=True)
     for split in ("train", "test"):
@@ -1334,6 +1335,8 @@ def test_local_dataset_staging_preserves_read_only_mirror(
     prepared = evalscope_server.prepare_evalscope_datasets(config, tmp_path / "work")
     target = Path(prepared["evalscope"]["dataset_args"]["gsm8k"]["dataset_id"])
     assert target != source
+    assert not target.is_relative_to(tmp_path / "work")
+    assert target.is_relative_to(tmp_path / "cache")
     assert metadata.read_text() == "keep"
     assert not (target / "dataset_infos.json").exists()
     assert (target / "main/test-00000-of-00001.parquet").is_symlink()
@@ -1346,6 +1349,7 @@ def test_local_dataset_staging_preserves_read_only_mirror(
 def test_local_dataset_staging_rejects_empty_mirror(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
+    monkeypatch.setattr(evalscope_server, "EVALSCOPE_OWNED_ROOT", tmp_path / "cache")
     source = tmp_path / "empty"
     source.mkdir()
     monkeypatch.setenv("VLLM_HCU_MMMU_DATASET", str(source))

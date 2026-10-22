@@ -220,8 +220,13 @@ def prepare_evalscope_datasets(
         source = Path(source_text).resolve()
         if not source.is_dir():
             raise FileNotFoundError(f"{env_name} is unavailable: {source}")
-        target = work_dir / "datasets" / str(name)
-        target.mkdir(parents=True, exist_ok=False)
+        # Dataset links must stay outside the report tree: artifact uploaders
+        # may follow symlinks and otherwise upload the shared parquet data.
+        staging_root = EVALSCOPE_OWNED_ROOT / "dataset-manifests"
+        staging_root.mkdir(parents=True, exist_ok=True)
+        target = Path(tempfile.mkdtemp(
+            prefix=f"{work_dir.name}-{name}-", dir=staging_root
+        ))
         subsets: dict[str, dict[str, list[str]]] = {}
         for parquet in sorted(source.rglob("*.parquet")):
             relative = parquet.relative_to(source)
@@ -345,7 +350,7 @@ def _reset_evalscope_artifacts(work_dir: Path) -> None:
         encoding="utf-8"
     ) != EVALSCOPE_OWNER_SIGNATURE:
         raise ValueError(f"invalid EvalScope ownership marker under {root}")
-    for name in ("configs", "predictions", "reviews", "reports", "datasets"):
+    for name in ("configs", "predictions", "reviews", "reports"):
         path = root / name
         if path.is_symlink() or path.is_file():
             path.unlink()
