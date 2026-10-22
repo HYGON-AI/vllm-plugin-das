@@ -111,6 +111,8 @@ def test_platform_core_inventory_is_explicit_and_ordered():
         ("platform.core_fix.step5_splitting_ops", "vllm.config.compilation"),
         ("platform.core_fix.step5_compile_prefix", "vllm.compilation.decorators"),
         ("platform.core_fix.step5_ep_graph_capture", "vllm.distributed.parallel_state"),
+        ("platform.core_fix.step5_reasoning_parser", "vllm.reasoning"),
+        ("platform.core_fix.step5_tool_parser", "vllm.tool_parsers"),
     )
 
 
@@ -410,9 +412,9 @@ def test_apply_platform_patches_is_idempotent_narrow_and_reported():
     assert result.returncode == 0, result.stderr
     payload = json.loads(result.stdout.strip().splitlines()[-1])
     assert payload == {
-        "count": 65,
+        "count": 70,
         "replacements": 20,
-        "callbacks": 45,
+        "callbacks": 50,
         "failed": [],
         "builtins_same": True,
         "role": "Main",
