@@ -96,6 +96,7 @@ RUN TORCH_TAG="torch${TORCH_VERSION//./}" \
     && das-install flash_kda ${TORCH_TAG} \
     && das-install vllm-router ${TORCH_TAG} \
     && das-install nixl ${TORCH_TAG} \
+    && das-install lmcache ${TORCH_TAG} \
     # tilelang 放最后: 安装真实包会替换上面 vLLM 层写的 0.1.10 stub, 之后不应再有触发 vllm 依赖解析的安装
     && das-install tilelang ${TORCH_TAG} \
     && pip install --no-cache-dir apache-tvm-ffi==0.1.11 \
