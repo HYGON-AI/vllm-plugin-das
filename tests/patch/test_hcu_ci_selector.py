@@ -193,7 +193,7 @@ def test_nightly_matrix_explicitly_covers_extended_models_and_topology() -> None
     }.issubset(registry_jobs)
 
 
-def test_kimi_k25_humaneval_routes_to_eight_card_evalscope_job() -> None:
+def test_kimi_k25_keeps_configuration_but_is_not_scheduled() -> None:
     config = _config()
     job = config["jobs"]["kimi-k25-humaneval"]
     assert job == {
@@ -232,10 +232,11 @@ def test_kimi_k25_humaneval_routes_to_eight_card_evalscope_job() -> None:
         registration.job == "kimi-k25-humaneval"
         and registration.target == target
         and registration.est_time == 14400
-        and registration.disabled is None
+        and registration.disabled is not None
+        and "startup" in registration.disabled
         for registration in parse_registry()
     )
-    assert "kimi-k25-humaneval" in {
+    assert "kimi-k25-humaneval" not in {
         item["registry_job"] for item in build_matrix(config, profile="nightly")
     }
 
@@ -243,7 +244,7 @@ def test_kimi_k25_humaneval_routes_to_eight_card_evalscope_job() -> None:
         config,
         ["tests/models/kimi_k25_humaneval_evalscope.yaml"],
     )
-    assert {item["registry_job"] for item in jobs} == {"kimi-k25-humaneval"}
+    assert jobs == []
     assert groups == ["kimi-k25-evalscope"]
     assert fallback is False
 
@@ -1544,8 +1545,9 @@ def test_dataset_preflight_rejects_empty_directory(
 
 
 def test_humaneval_jobs_request_isolated_containers() -> None:
-    matrix = build_matrix(_config(), profile="nightly")
-    human_jobs = [job for job in matrix if "humaneval" in job["id"]]
+    human_jobs = [
+        job for name, job in _config()["jobs"].items() if "humaneval" in name
+    ]
     assert human_jobs
     assert all(job["isolate_generated_code"] is True for job in human_jobs)
     assert all(
@@ -1554,8 +1556,9 @@ def test_humaneval_jobs_request_isolated_containers() -> None:
     )
 
 
-def test_missing_quantized_model_jobs_are_temporarily_disabled() -> None:
+def test_temporarily_disabled_model_jobs_are_not_scheduled() -> None:
     disabled_jobs = {
+        "kimi-k25-humaneval",
         "qwen38-flash-next-humaneval",
         "qwen38-flash-next-int8-pp2-tp4-humaneval",
         "glm53-flash-channel-fp8-humaneval",
@@ -1570,7 +1573,7 @@ def test_missing_quantized_model_jobs_are_temporarily_disabled() -> None:
     assert disabled_jobs.isdisjoint({job["registry_job"] for job in nightly})
     selected, _, _ = select_jobs(config, ["tests/integration/server/evalscope_server.py"])
     assert disabled_jobs.isdisjoint({job["registry_job"] for job in selected})
-    assert "kimi-k25-humaneval" in {job["registry_job"] for job in selected}
+    assert "kimi-k25-humaneval" not in {job["registry_job"] for job in selected}
 
 
 @pytest.mark.parametrize("version", ["v1", "v2"])

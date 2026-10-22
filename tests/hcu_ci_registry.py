@@ -489,6 +489,10 @@ register_hcu_ci(
         "test_kimi_k25_humaneval_evalscope_server"
     ),
     est_time=14400,
+    disabled=(
+        "temporarily disabled: repeated Kimi-K2.5 CI startup failures; "
+        "re-enable after end-to-end startup validation"
+    ),
 )
 register_hcu_ci(
     job="single-node-topology",
