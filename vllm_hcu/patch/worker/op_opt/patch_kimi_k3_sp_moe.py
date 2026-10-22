@@ -308,6 +308,8 @@ the same as before this patch.
 from __future__ import annotations
 
 import functools
+import importlib
+import os
 import sys
 from types import ModuleType
 
@@ -329,10 +331,273 @@ TARGETS = (
 )
 ENV_SWITCH = "VLLM_HCU_K3_SP_MOE"
 
+# User-visible SP messages are routed through the ``vllm`` root logger.
+# ``init_logger(__name__)`` hands back a child logger with NO handler of
+# its own: the vLLM dictConfig attaches the StreamHandler to the ``vllm``
+# logger only (its own ``propagate`` is False), so INFO-level records from
+# the ``vllm_hcu.*`` child never reach any handler and are silently
+# dropped -- the enablement banner, the whitelist admission line and the
+# clamp line all vanished from server logs even while the patch was fully
+# live. ``vllm.logger.logger`` is that configured root instance (and
+# carries the same monkey-patched ``info_once``). Lazy import keeps the
+# module import free of body-vllm side effects, matching this file's
+# style; module-level names stay monkeypatch-able for the test suite.
+_INFO_ONCE = None
+_WARN = None
+
+
+def _vllm_info_once(msg: str, *args) -> None:
+    if _INFO_ONCE is not None:
+        _INFO_ONCE(msg, *args)
+        return
+    from vllm.logger import logger as _vllogger
+
+    _vllogger.info_once(msg, *args)
+
+
+def _vllm_warn(msg: str, *args) -> None:
+    if _WARN is not None:
+        _WARN(msg, *args)
+        return
+    from vllm.logger import logger as _vllogger
+
+    _vllogger.warning(msg, *args)
+
+_ROLE_SEP_MODULE = "vllm.models.kimi_k3.role_separation"
 _MARKER = "_vllm_hcu_kimi_k3_sp_moe_applied"
 _INIT_WRAPPER = "_vllm_hcu_kimi_k3_sp_moe_init_wrapper"
 _FORWARD_WRAPPER = "_vllm_hcu_kimi_k3_sp_moe_forward_wrapper"
 _LAYER_STATE = "_vllm_hcu_kimi_k3_sp_moe_state"
+
+# Resolved once at apply time when the switch is on.
+_role_sep_enabled = None
+_role_sep_aux_comm = None
+
+# Latent-width admission for the DeepEP-LL path (Kimi-K3 latent MoE).
+#
+# Kimi-K3 routes experts in a 3584-wide latent (routed_expert_hidden_size;
+# FusedMoEFactory is built with hidden_size=3584 and the checkpoint's
+# routed weights are natively 3584-wide -- verified by safetensors shape
+# census, no 4096 dimension exists in any routed-expert tensor). The body
+# resolves the routed width through a hardcoded SUPPORTED_HIDDEN_SIZES
+# whitelist at RoutedExperts construction (maybe_roundup_sizes ->
+# maybe_roundup_layer_hidden_size): the stock list stops at 4096, so the
+# expert weights AND the forward activation pad are both sized to 4096
+# and every routed byte pays a 3584->4096 growth.
+#
+# With SP enabled we admit 3584 at patch-apply time (before any layer
+# constructs its RoutedExperts, so weights width and pad width both
+# follow), gated by a byte probe of the deep_ep extension: every
+# function family that instantiates a legacy width must also
+# instantiate 3584, else the deployment keeps its stock 4096-rounded
+# path (verified 3584 kernels exist in this wheel; guards against forks
+# whose C++ SWITCH_HIDDEN would host-assert on the width). A per-layer
+# verifier re-reads moe_config.hidden_dim after enablement and warns
+# when admission landed after expert construction -- that layer keeps
+# the padded path and loses the width gain, which must not silently
+# contaminate a TPOT A/B run.
+_LL_ADMIT_HIDDEN_SIZE = 3584
+_LL_ADMIT_MODULES = (
+    ("vllm.model_executor.layers.fused_moe.prepare_finalize.deepep_ll",
+     "DeepEPLLPrepareAndFinalize"),
+    ("vllm.model_executor.layers.fused_moe.prepare_finalize.nixl_ep",
+     "NixlEPPrepareAndFinalize"),
+)
+
+
+# (family probes at a legacy width, 3584 instantiations any-of) --
+# a requirement is ACTIVE only when its function family exists in the
+# wheel at a legacy width, so a wheel that predates a function entirely
+# is not failed for lacking its 3584 case, while a fork that adds 3584
+# to some switch sites but not others is caught. Census on the deployed
+# das wheel: dispatch 265 hits, combine 26+26 (LogFMT on/off), sbo 26,
+# dispatch_ll_layered family absent (auto-skipped).
+_LL_NEEDLE_REQUIREMENTS: tuple[tuple[tuple[bytes, ...], tuple[bytes, ...]], ...] = (
+    (
+        (b"internode_ll8dispatchILi2048E",),
+        (b"internode_ll8dispatchILi3584E",),
+    ),
+    (
+        (b"internode_ll7combineILb0ELi2048E",
+         b"internode_ll7combineILb1ELi2048E"),
+        (b"internode_ll7combineILb0ELi3584E",
+         b"internode_ll7combineILb1ELi3584E"),
+    ),
+    (
+        (b"internode_ll11combine_sboILi2048E",),
+        (b"internode_ll11combine_sboILi3584E",),
+    ),
+    (
+        (b"internode_ll19dispatch_ll_layeredILi2048E",),
+        (b"internode_ll19dispatch_ll_layeredILi3584E",),
+    ),
+)
+
+
+def _scan_ll_needles(data: bytes) -> list[bytes] | None:
+    """Analyze extension bytes: which required 3584 needles are missing.
+
+    Returns the missing needles for every ACTIVE requirement family
+    ([] = fully provisioned), or ``None`` when the bytes match no legacy
+    probe at all -- meaning the binary is unverifiable (stripped symbols,
+    compressed device code, different mangling) and no claim about 3584
+    support can be made from it either way.
+    """
+    missing: list[bytes] = []
+    active = False
+    for family_probes, targets in _LL_NEEDLE_REQUIREMENTS:
+        if not any(probe in data for probe in family_probes):
+            continue
+        active = True
+        if not any(target in data for target in targets):
+            missing.extend(targets[:1])
+    if not active:
+        return None
+    return missing
+
+
+def _deep_ep_kernel_needles() -> list[bytes] | None:
+    """Missing 3584 LL template instantiations in the deep_ep extension.
+
+    Reads each extension binary once and checks the mangled-name needles
+    for every active requirement (see ``_scan_ll_needles``). Returns the
+    missing needles, or ``None`` when the extension could not be located,
+    read, or recognized at all (the caller then abstains from admission).
+    """
+    try:
+        import deep_ep
+
+        pkg_dir = os.path.dirname(deep_ep.__file__)
+        so_paths = [
+            os.path.join(pkg_dir, name)
+            for name in os.listdir(pkg_dir)
+            if name.endswith(".so")
+        ]
+    except Exception:
+        return None
+    data = b""
+    for so_path in so_paths:
+        try:
+            with open(so_path, "rb") as handle:
+                data += handle.read()
+        except OSError:
+            continue
+    if not data:
+        return None
+    return _scan_ll_needles(data)
+
+
+def _admit_latent_hidden_size(logger) -> tuple[int, int]:
+    """Add 3584 to the body's DeepEP-LL hidden-size whitelists, in place.
+
+    The lists are mutated (append), never rebound: modules capture the
+    same list object in module-level aliases (``_supported_hs``), and an
+    in-place append updates every alias at once. Returns
+    ``(admitted, modules_searched)``.
+
+    Guard: the body whitelist is not the only width gate. The deep_ep
+    C++ dispatches through a hardcoded ``SWITCH_HIDDEN`` case table whose
+    ``default`` is a host assert ("Unsupported hidden") -- a wheel built
+    from sources without the 3584 case would accept the python admission
+    and then abort at the first token. The installed extension is
+    therefore probed for the 3584 template instantiations first and the
+    admission is refused when any active requirement is missing: the
+    deployment keeps its stock gated path (which rounds 3584 up to 4096)
+    instead of trading a ValueError for a C++ assert.
+    """
+    admitted = 0
+    missing = _deep_ep_kernel_needles()
+    if missing is None:
+        logger.warning_once(
+            "SP-MoE: the deep_ep extension could not be probed for native "
+            "%d-width LL kernels; keeping the stock hidden-size gate.",
+            _LL_ADMIT_HIDDEN_SIZE,
+        )
+        return 0, 0
+    if missing:
+        logger.warning_once(
+            "SP-MoE: deep_ep lacks native 3584 LL kernels (missing %s); "
+            "keeping the stock hidden-size gate so the C++ switch cannot "
+            "hit its unsupported-hidden assert.",
+            ", ".join(item.decode("ascii", "replace") for item in missing),
+        )
+        return 0, len(_LL_ADMIT_MODULES)
+    searched = 0
+    for module_name, class_name in _LL_ADMIT_MODULES:
+        try:
+            module = importlib.import_module(module_name)
+        except Exception:
+            logger.debug(
+                "SP-MoE: %s unavailable; skipping 3584 admission",
+                module_name,
+                exc_info=True,
+            )
+            continue
+        searched += 1
+        cls = getattr(module, class_name, None)
+        sizes = getattr(cls, "SUPPORTED_HIDDEN_SIZES", None)
+        if not isinstance(sizes, list):
+            logger.debug(
+                "SP-MoE: %s.%sSUPPORTED_HIDDEN_SIZES missing or not a "
+                "list; skipping 3584 admission",
+                module_name,
+                class_name,
+            )
+            continue
+        if _LL_ADMIT_HIDDEN_SIZE in sizes:
+            admitted += 1
+            continue
+        sizes.append(_LL_ADMIT_HIDDEN_SIZE)
+        sizes.sort()
+        admitted += 1
+        _vllm_info_once(
+            "SP-MoE: %s now admits hidden size %d (Kimi-K3 latent width).",
+            class_name,
+            _LL_ADMIT_HIDDEN_SIZE,
+        )
+    return admitted, searched
+
+
+# Whether the whitelist admission took effect at patch-apply time. The
+# per-layer verifier only rates the width when this is true; when false
+# the deployment is intentionally on its stock rounded path.
+_admitted_wide = False
+
+
+def _verify_latent_width(runner, logger) -> None:
+    """Confirm the runner was sized for the native latent width.
+
+    The body resolves the routed width through the LL whitelist at
+    RoutedExperts construction time (``maybe_roundup_sizes`` ->
+    ``moe_config.hidden_dim``), which sizes expert weights and the
+    forward activation pad together. Admission runs at patch-apply time,
+    so a still-rounded ``hidden_dim`` means the whitelist change landed
+    after (or was shadowed at) expert construction: the layer silently
+    keeps the stock padded path. Numerically safe, so rate it once
+    instead of raising.
+    """
+    if not _admitted_wide:
+        return
+    hidden_dim = getattr(getattr(runner, "moe_config", None), "hidden_dim",
+                         None)
+    if hidden_dim == _LL_ADMIT_HIDDEN_SIZE:
+        logger.debug(
+            "SP-MoE: %s sized at native latent width %d.",
+            type(runner).__name__,
+            _LL_ADMIT_HIDDEN_SIZE,
+        )
+        return
+    logger.warning_once(
+        "SP-MoE: %s.moe_config.hidden_dim=%r still rounds past the native "
+        "%d latent width; the whitelist change landed after expert "
+        "construction, so this layer keeps the stock padded path and "
+        "loses the width gain -- exclude it from TPOT comparisons.",
+        type(runner).__name__,
+        hidden_dim,
+        _LL_ADMIT_HIDDEN_SIZE,
+    )
+
+_warned_fallback = False
 
 
 def _switch_enabled() -> bool:
@@ -926,7 +1191,7 @@ def _maybe_enable_layer(layer, decoder_cls, logger) -> _SpState | None:
     _ensure_custom_ops_registered()
     _attach_padding_window(moe, get_tensor_model_parallel_rank(), tp_size)
 
-    logger.info_once(
+    _vllm_info_once(
         "Kimi-K3 SP-MoE enabled (%s=1, shared experts: %s): o_proj "
         "reduce-scatter, MoE dispatch of ceil(N/%d) rows per TP rank, "
         "all-gather after MoE.",
@@ -934,6 +1199,7 @@ def _maybe_enable_layer(layer, decoder_cls, logger) -> _SpState | None:
         shared_mode,
         tp_size,
     )
+    _verify_latent_width(runner, logger)
     return _SpState(tp_size, get_tensor_model_parallel_rank(), runner)
 
 
@@ -973,6 +1239,22 @@ def apply_to_module(module: ModuleType) -> bool:
     from vllm.logger import init_logger
 
     logger = init_logger(__name__)
+    # Admit the Kimi latent width (3584) into the DeepEP-LL whitelists so
+    # the LL path can run the native width under SP. Done once per
+    # process, at patch-apply time -- this MUST land before any layer
+    # constructs its RoutedExperts, because the body resolves the routed
+    # width through the whitelist then (maybe_roundup_sizes ->
+    # moe_config.hidden_dim weights + forward pad).
+    global _admitted_wide
+    admitted, searched = _admit_latent_hidden_size(logger)
+    _admitted_wide = admitted > 0
+    if not _admitted_wide and searched == 0:
+        _vllm_warn(
+            "SP-MoE: no DeepEP-LL prepare/finalize whitelist module was "
+            "found; the %d-wide latent path keeps whatever gate this "
+            "deployment ships.",
+            _LL_ADMIT_HIDDEN_SIZE,
+        )
 
     @functools.wraps(original_init)
     def hcu_init(self, *args, **kwargs):
