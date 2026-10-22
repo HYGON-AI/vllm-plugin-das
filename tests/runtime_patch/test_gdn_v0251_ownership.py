@@ -733,6 +733,48 @@ def test_qwen_prefill_log_preserves_explicit_triton_path(monkeypatch):
     assert messages == [("official", "triton", "triton")]
 
 
+@pytest.mark.parametrize(
+    ("requested_backend_name", "active_backend"),
+    [
+        ("auto", "flashinfer"),
+        ("flashinfer", "flashinfer"),
+        ("cutedsl", "cutedsl"),
+    ],
+)
+def test_qwen_prefill_log_preserves_non_triton_backend(
+    monkeypatch, requested_backend_name, active_backend
+):
+    adapter = _adapter("patch_gdn_linear_attention")
+    backend = _adapter("_gdn_backend")
+    module, _, _, _, _ = _fake_qwen(aiter_available=False)
+    messages = []
+
+    module._resolve_gdn_prefill_backend = (
+        lambda config: (requested_backend_name, active_backend)
+    )
+    module._log_gdn_backend_decision = (
+        lambda config, requested, active: messages.append(
+            ("official", requested, active)
+        )
+    )
+    module.logger = SimpleNamespace(
+        info_once=lambda message, *args: messages.append((message, *args))
+    )
+    monkeypatch.setattr(backend, "_prefill_requested", None)
+    monkeypatch.setenv("VLLM_HCU_USE_CUSTOM_OPS", "1")
+    adapter.apply_to_module(module)
+
+    config = SimpleNamespace(
+        additional_config={"gdn_prefill_backend": requested_backend_name}
+    )
+    requested, active = module._resolve_gdn_prefill_backend(config)
+    module._log_gdn_backend_decision(config, requested, active)
+
+    assert messages == [
+        ("official", requested_backend_name, active_backend)
+    ]
+
+
 def _install_module(monkeypatch: pytest.MonkeyPatch, name: str, **values):
     parts = name.split(".")
     for index in range(1, len(parts) + 1):

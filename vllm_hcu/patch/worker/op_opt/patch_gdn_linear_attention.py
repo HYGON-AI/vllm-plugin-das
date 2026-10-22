@@ -411,7 +411,7 @@ def apply_to_module(module: ModuleType) -> bool:
             vllm_config, requested_backend_name, active_backend
         ):
             provider = requested_backend("prefill")
-            if provider != TRITON:
+            if active_backend == TRITON and provider != TRITON:
                 qwen.logger.info_once(
                     "Using Triton/FLA GDN prefill frontend; HCU provider "
                     "requested=%s and is resolved per operator at execution.",
