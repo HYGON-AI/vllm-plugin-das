@@ -14,6 +14,13 @@ from vllm_hcu.patch.worker.core_fix import patch_deepseek_v4_rocm_flashmla_spars
 from vllm_hcu.platforms import envs as henvs
 
 
+@pytest.fixture(autouse=True)
+def clear_prefill_head_padding_env(monkeypatch):
+    monkeypatch.delenv(
+        "VLLM_HCU_DEEPSEEK_V4_ROCM_FLASHMLA_PREFILL_HEAD_PADDING", raising=False
+    )
+
+
 def _build_module(ratio, batch, calls, local_heads=4):
     vllm_config = SimpleNamespace(
         model_config=SimpleNamespace(
@@ -342,20 +349,40 @@ def test_decode_falls_back_for_unsupported_local_head_counts(
     assert ("ragged_swa" in calls) is not uses_flashmla
 
 
+@pytest.mark.parametrize("padding_enabled", [True, False])
 @pytest.mark.parametrize(
-    ("heads", "uses_flashmla"),
-    [(16, False), (32, False), (64, True), (128, True)],
+    ("heads", "kernel_heads", "uses_flashmla"),
+    [
+        (0, None, False),
+        (16, 64, True),
+        (32, 64, True),
+        (64, 64, True),
+        (65, 128, True),
+        (96, 128, True),
+        (128, 128, True),
+        (129, None, False),
+    ],
 )
-def test_prefill_falls_back_for_unsupported_local_head_counts(
-    monkeypatch, heads, uses_flashmla
+def test_prefill_pads_local_head_counts(
+    monkeypatch, heads, kernel_heads, uses_flashmla, padding_enabled
 ):
+    monkeypatch.setenv(
+        "VLLM_HCU_DEEPSEEK_V4_ROCM_FLASHMLA_PREFILL_HEAD_PADDING",
+        "1" if padding_enabled else "0",
+    )
+    uses_flashmla = uses_flashmla and (padding_enabled or heads in (64, 128))
     calls = []
+    kernel_args = {}
     flash = ModuleType("vllm_hcu.v1.attention.ops.flashmla")
     flash.is_flashmla_sparse_supported = lambda: (True, None)
 
     def prefill_kernel(**kwargs):
         calls.append("flashmla_prefill")
-        return torch.ones_like(kwargs["q"]), None, None
+        kernel_args.update(kwargs)
+        values = torch.arange(
+            kwargs["q"].shape[1], dtype=kwargs["q"].dtype
+        ).view(1, -1, 1)
+        return values.expand_as(kwargs["q"]), None, None
 
     flash.flash_mla_sparse_fwd = prefill_kernel
     monkeypatch.setitem(sys.modules, flash.__name__, flash)
@@ -368,8 +395,10 @@ def test_prefill_falls_back_for_unsupported_local_head_counts(
     module, _, _, _ = _build_module(1, 1, calls)
     assert patch.apply_to_module(module)
     tokens = 2
-    q = torch.zeros(tokens, heads, 512, dtype=torch.bfloat16)
+    q = torch.arange(heads, dtype=torch.bfloat16).view(1, heads, 1)
+    q = q.expand(tokens, heads, 512).clone()
     output = torch.zeros_like(q)
+    attn_sink = torch.arange(heads, dtype=torch.float32)
     module.rocm_sparse_attn_prefill(
         q,
         torch.zeros(16, 1, 512, dtype=torch.bfloat16),
@@ -379,7 +408,7 @@ def test_prefill_falls_back_for_unsupported_local_head_counts(
         512,
         448,
         64,
-        torch.zeros(heads, dtype=torch.float32),
+        attn_sink,
         output,
     )
 
@@ -387,7 +416,19 @@ def test_prefill_falls_back_for_unsupported_local_head_counts(
     assert ("prefill_guard" in calls) is uses_flashmla
     assert ("aiter_prefill_kernel" in calls) is not uses_flashmla
     if uses_flashmla:
-        assert torch.all(output == 1)
+        assert kernel_args["q"].shape == (tokens, kernel_heads, 512)
+        assert kernel_args["attn_sink"].shape == (kernel_heads,)
+        torch.testing.assert_close(kernel_args["q"][:, :heads], q)
+        torch.testing.assert_close(kernel_args["attn_sink"][:heads], attn_sink)
+        if kernel_heads > heads:
+            assert torch.count_nonzero(kernel_args["q"][:, heads:]) == 0
+            assert torch.count_nonzero(kernel_args["attn_sink"][heads:]) == 0
+        expected = torch.arange(heads, dtype=output.dtype).view(1, heads, 1)
+        torch.testing.assert_close(output, expected.expand_as(output))
+
+
+def test_prefill_head_padding_defaults_to_disabled():
+    assert not henvs.VLLM_HCU_DEEPSEEK_V4_ROCM_FLASHMLA_PREFILL_HEAD_PADDING
 
 
 def test_guard_rejects_unavailable_flashmla(monkeypatch):
@@ -404,3 +445,96 @@ def test_guard_rejects_unavailable_flashmla(monkeypatch):
     with pytest.raises(RuntimeError, match="FlashMLA decode unavailable"):
         Builder().build_tile_scheduler(1)
     patch._require_flashmla_ready.cache_clear()
+
+
+@pytest.mark.parametrize("heads", [16, 32, 96])
+@pytest.mark.parametrize("compressed_len", [0, 64, 32], ids=["swa", "c4a", "c128a"])
+def test_prefill_padding_matches_reference(monkeypatch, heads, compressed_len):
+    """Exercise the installed adapter with head-sensitive attention and masks."""
+    monkeypatch.setenv(
+        "VLLM_HCU_DEEPSEEK_V4_ROCM_FLASHMLA_PREFILL_HEAD_PADDING", "1"
+    )
+    monkeypatch.setattr(henvs, "VLLM_HCU_DEEPSEEK_V4_ROCM_FLASHMLA_DECODE", False)
+    monkeypatch.setattr(henvs, "VLLM_HCU_DEEPSEEK_V4_ROCM_FLASHMLA_PREFILL", True)
+    monkeypatch.setattr(patch, "_require_flashmla_prefill_ready", lambda: None)
+    torch.manual_seed(42)
+    q = torch.randn(3, heads, 512, dtype=torch.bfloat16)
+    kv = torch.randn(compressed_len + 128, 1, 512, dtype=torch.bfloat16)
+    sink = torch.randn(heads)
+    indices = torch.arange(kv.shape[0], dtype=torch.int32).repeat(3, 1)
+    indices[:, 5] = -1  # Invalid entries inside the active prefix.
+    lengths = torch.tensor([17, 93, kv.shape[0]], dtype=torch.int32)
+    originals = [x.clone() for x in (q, kv, sink, indices, lengths)]
+    scale = 512 ** -0.5
+
+    def reference(query, attention_sink):
+        rows = []
+        for row in range(query.shape[0]):
+            ids = indices[row, :int(lengths[row])]
+            keys = kv[ids[ids >= 0].long(), 0].float()
+            # Keep each head's computation identical before and after padding.
+            # Batched GEMM can change rounding when its head dimension changes,
+            # which would obscure this contract test's exact equality check.
+            head_outputs = []
+            for head in range(query.shape[1]):
+                logits = keys @ query[row, head].float() * scale
+                # The sink participates in the denominator with zero value.
+                weights = torch.softmax(
+                    torch.cat((logits, attention_sink[head:head + 1])), dim=0
+                )[:-1]
+                head_outputs.append(weights @ keys)
+            rows.append(torch.stack(head_outputs))
+        return torch.stack(rows).to(query.dtype)
+
+    flash = ModuleType("vllm_hcu.v1.attention.ops.flashmla")
+    calls = []
+
+    def kernel(**kwargs):
+        calls.append(kwargs)
+        assert kwargs["kv"] is kv
+        assert kwargs["topk_length"] is lengths
+        torch.testing.assert_close(kwargs["indices"], indices.unsqueeze(1))
+        assert kwargs["sm_scale"] == scale
+        assert kwargs["d_v"] == 512
+        return reference(kwargs["q"], kwargs["attn_sink"]), None, None
+
+    flash.flash_mla_sparse_fwd = kernel
+    monkeypatch.setitem(sys.modules, flash.__name__, flash)
+    module, _, _, _ = _build_module(1, 1, [])
+    assert patch.apply_to_module(module)
+    # Exercise output conversion as well as clipping back to local heads.
+    output = torch.full(q.shape, float("nan"), dtype=torch.float32)
+    module.rocm_sparse_attn_prefill(
+        q, kv, indices, lengths, scale, 512, 448, 64, sink, output
+    )
+    assert len(calls) == 1
+    torch.testing.assert_close(output, reference(q, sink).float(), rtol=0, atol=0)
+    for actual, original in zip((q, kv, sink, indices, lengths), originals):
+        torch.testing.assert_close(actual, original, rtol=0, atol=0)
+
+
+@pytest.mark.parametrize("sink_shape", [(15,), (16, 1)])
+def test_prefill_padding_rejects_invalid_sink(monkeypatch, sink_shape):
+    monkeypatch.setenv(
+        "VLLM_HCU_DEEPSEEK_V4_ROCM_FLASHMLA_PREFILL_HEAD_PADDING", "1"
+    )
+    monkeypatch.setattr(henvs, "VLLM_HCU_DEEPSEEK_V4_ROCM_FLASHMLA_DECODE", False)
+    monkeypatch.setattr(henvs, "VLLM_HCU_DEEPSEEK_V4_ROCM_FLASHMLA_PREFILL", True)
+    monkeypatch.setattr(patch, "_require_flashmla_prefill_ready", lambda: None)
+    flash = ModuleType("vllm_hcu.v1.attention.ops.flashmla")
+
+    def kernel(**kwargs):
+        pytest.fail("invalid sink must be rejected before invoking FlashMLA")
+
+    flash.flash_mla_sparse_fwd = kernel
+    monkeypatch.setitem(sys.modules, flash.__name__, flash)
+    module, _, _, _ = _build_module(1, 1, [])
+    assert patch.apply_to_module(module)
+    q = torch.zeros(2, 16, 512, dtype=torch.bfloat16)
+    with pytest.raises(ValueError, match="one attention sink per query head"):
+        module.rocm_sparse_attn_prefill(
+            q, torch.zeros(128, 1, 512, dtype=q.dtype),
+            torch.zeros(2, 128, dtype=torch.int32),
+            torch.full((2,), 128, dtype=torch.int32),
+            512 ** -0.5, 512, 448, 64, torch.zeros(sink_shape), torch.empty_like(q),
+        )
