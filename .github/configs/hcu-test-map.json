@@ -828,6 +828,35 @@
         "kimi-k25-humaneval"
       ]
     },
+    "gpu-memory-helper": {
+      "patterns": [
+        "tests/integration/gpu_memory.py"
+      ],
+      "jobs": [
+        "integration-smoke-gfx938",
+        "qwen35-smoke",
+        "qwen35-graph",
+        "engine-features",
+        "lora",
+        "spec-decode",
+        "mamba-smoke",
+        "kv-transfer",
+        "qwen35-tp-ep",
+        "deepseek-tp-ep",
+        "qwen25-models",
+        "qwen3-pooling",
+        "qwen3-protocol",
+        "qwen35-gsm8k",
+        "qwen3-vl-mmmu",
+        "qwen3-8b-gsm8k",
+        "qwen38-flash-next-humaneval",
+        "qwen38-flash-next-int8-pp2-tp4-humaneval",
+        "deepseek-gsm8k",
+        "glm52-pcp",
+        "glm53-flash-channel-fp8-humaneval",
+        "kimi-k25-humaneval"
+      ]
+    },
     "model-runtime-helper": {
       "patterns": [
         "tests/integration/model_runtime.py"

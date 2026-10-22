@@ -993,6 +993,68 @@ def test_qwen35_gsm8k_requires_100_samples_and_95_percent(
             check()
 
 
+
+@pytest.mark.parametrize("resources_ready", [False, True])
+def test_server_waits_for_configured_memory_before_launch(
+    tmp_path, monkeypatch, resources_ready,
+):
+    from tests.integration.gpu_memory import GpuMemoryUnavailableError
+
+    work_dir = evalscope_server.create_evalscope_work_dir(tmp_path / "reports")
+    config = {
+        "model": "/models/example",
+        "server": {
+            "args": ["--gpu-memory-utilization", "0.4"],
+            "startup_timeout_s": 10,
+            "environment": {"CUDA_VISIBLE_DEVICES": "3"},
+        },
+        "evalscope": {"datasets": [], "work_dir": str(work_dir)},
+    }
+    events = []
+    monkeypatch.setattr(evalscope_server, "_require_runtime", lambda *a, **k: None)
+
+    def wait(**kwargs):
+        assert kwargs["required_cards"] == 1
+        assert kwargs["gpu_memory_utilization"] == 0.4
+        assert kwargs["env"]["CUDA_VISIBLE_DEVICES"] == "3"
+        events.append("wait")
+        kwargs["report"]("GPU memory resource check")
+        if not resources_ready:
+            raise GpuMemoryUnavailableError("GPU still busy")
+
+    def launch(*args, **kwargs):
+        events.append("launch")
+        return SimpleNamespace()
+
+    def healthy(proc, url, timeout):
+        events.append("health")
+        assert timeout == 10
+
+    monkeypatch.setattr(evalscope_server, "wait_for_gpu_memory", wait)
+    monkeypatch.setattr(evalscope_server.subprocess, "Popen", launch)
+    monkeypatch.setattr(evalscope_server, "_wait_for_server", healthy)
+    monkeypatch.setattr(evalscope_server, "_run_prefix_probe", lambda *a, **k: None)
+    monkeypatch.setattr(evalscope_server, "evalscope_command", lambda *a, **k: ["evaluate"])
+    monkeypatch.setattr(evalscope_server.subprocess, "run", lambda *a, **k: SimpleNamespace(returncode=0))
+    monkeypatch.setattr(evalscope_server, "_assert_pass_criteria", lambda *a, **k: None)
+    monkeypatch.setattr(evalscope_server, "_terminate_process_group", lambda *a, **k: None)
+
+    def execute():
+        evalscope_server.run_evalscope_server_test(
+            config, model_env="VLLM_HCU_TEST_UNUSED_MEMORY_MODEL",
+            model_label="example", required_hcu_count=1,
+        )
+
+    if resources_ready:
+        execute()
+        assert events == ["wait", "launch", "health"]
+    else:
+        with pytest.raises(GpuMemoryUnavailableError, match="still busy"):
+            execute()
+        assert events == ["wait"]
+    assert "GPU memory resource check" in (work_dir / "logs/vllm_server.log").read_text()
+
+
 def _exact_humaneval_config() -> dict:
     return {
         "model": "/models/DeepSeek-V4-Flash-0731-Channel-FP8-w8a8",

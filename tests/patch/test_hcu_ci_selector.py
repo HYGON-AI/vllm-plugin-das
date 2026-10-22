@@ -1261,6 +1261,28 @@ def test_deepseek_runtime_change_selects_deepseek_jobs() -> None:
     assert fallback is False
 
 
+def test_gpu_memory_helper_selects_all_enabled_model_jobs() -> None:
+    config = _config()
+    selected, groups, fallback = select_jobs(
+        config, ["tests/integration/gpu_memory.py"],
+    )
+    selected_jobs = {job["registry_job"] for job in selected}
+    expected = {
+        job_id for job_id, job in config["jobs"].items()
+        if (job["suite"] == "model" or job_id == "integration-smoke-gfx938")
+        and job_id in _enabled_registry_jobs()
+    }
+    assert selected_jobs == expected
+    assert groups == ["gpu-memory-helper"]
+    assert fallback is False
+    assert selected_jobs.isdisjoint({
+        "qwen38-flash-next-humaneval",
+        "qwen38-flash-next-int8-pp2-tp4-humaneval",
+        "glm53-flash-channel-fp8-humaneval",
+        "kimi-k25-humaneval",
+    })
+
+
 def test_model_runtime_change_selects_text_vl_and_pooling_models() -> None:
     jobs, groups, fallback = select_jobs(
         _config(),

@@ -172,6 +172,16 @@ Accuracy gates are asserted from EvalScope JSON reports:
   thinking through chat-template kwargs. Predictions, reviews, and report sample
   counts must each be exactly 100, with mean accuracy at least 0.95.
 
+CI model cases wait for their configured free GPU memory before the first model
+is created; evaluation servers wait before launch. The default is up to 600
+seconds per case, checking every 15 seconds. Configure
+HCU_CI_GPU_MEMORY_WAIT_TIMEOUT_S (0 disables waiting) and
+HCU_CI_GPU_MEMORY_POLL_INTERVAL_S to override these values. Missing explicit
+server utilization uses the installed vLLM default. Waiting does not reserve
+devices; a timeout remains a visible resource failure, and runtime OOM still
+fails the test. Each case keeps its original model-startup timeout in addition
+to the waiting allowance.
+
 ## Model configuration files
 
 The current server/EvalScope configs live under `tests/models/`:

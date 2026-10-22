@@ -25,6 +25,11 @@ import pytest
 import psutil
 import yaml
 
+from tests.integration.gpu_memory import (
+    gpu_memory_utilization_from_args,
+    wait_for_gpu_memory,
+)
+
 
 ROOT = Path(__file__).resolve().parents[3]
 EVALSCOPE_OWNED_ROOT = Path("/tmp/vllm-hcu-evalscope")
@@ -1205,6 +1210,18 @@ def run_evalscope_server_test(
             f"{attention_environment or 'default'}\n".encode()
         )
         server_log.flush()
+        memory_fraction = gpu_memory_utilization_from_args(command)
+
+        def report_memory(message: str) -> None:
+            server_log.write((message + "\n").encode())
+            server_log.flush()
+
+        wait_for_gpu_memory(
+            required_cards=required_hcu_count,
+            gpu_memory_utilization=memory_fraction,
+            env=env,
+            report=report_memory,
+        )
         proc = subprocess.Popen(
             command,
             cwd=ROOT,
