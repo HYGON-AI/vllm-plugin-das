@@ -136,7 +136,6 @@ def test_worker_inventory_is_complete_explicit_and_dependency_ordered():
     framework_order = (
         "worker.framework_opt.model_loader.static_eplb_preload",
         "worker.framework_opt.model_loader.static_expert_mapping",
-        "worker.framework_opt.eplb.offline_expert_map",
         "worker.framework_opt.eplb.gloo_profile_reservation",
         "worker.framework_opt.dp.deepep_low_latency",
         "worker.framework_opt.forward_context.hcu_runtime_fields",
@@ -152,6 +151,9 @@ def test_worker_inventory_is_complete_explicit_and_dependency_ordered():
     assert tuple(positions[name] for name in framework_order) == tuple(
         sorted(positions[name] for name in framework_order)
     )
+    assert positions["worker.framework_opt.step5_eplb_state"] < positions[
+        "worker.framework_opt.eplb.offline_expert_map"
+    ]
 
     callback_specs = {
         spec.adapter
@@ -320,6 +322,7 @@ def test_prepare_is_lazy_narrow_idempotent_and_keeps_main_role():
         "assert initial_targets==["
         "'vllm.distributed.device_communicators.base_device_communicator',"
         "'vllm.forward_context',"
+        "'vllm.third_party.flash_linear_attention.ops.chunk',"
         "'vllm.utils.deep_gemm',"
         "'vllm.v1.attention.backend',"
         "'vllm.v1.worker.dp_utils',"
@@ -350,6 +353,7 @@ def test_prepare_is_lazy_narrow_idempotent_and_keeps_main_role():
         "initial_targets_loaded": [
             "vllm.distributed.device_communicators.base_device_communicator",
             "vllm.forward_context",
+            "vllm.third_party.flash_linear_attention.ops.chunk",
             "vllm.utils.deep_gemm",
             "vllm.v1.attention.backend",
             "vllm.v1.worker.dp_utils",
@@ -358,6 +362,7 @@ def test_prepare_is_lazy_narrow_idempotent_and_keeps_main_role():
         "targets_loaded": [
             "vllm.distributed.device_communicators.base_device_communicator",
             "vllm.forward_context",
+            "vllm.third_party.flash_linear_attention.ops.chunk",
             "vllm.utils.deep_gemm",
             "vllm.v1.attention.backend",
             "vllm.v1.worker.dp_utils",

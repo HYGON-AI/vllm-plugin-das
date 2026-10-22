@@ -453,8 +453,9 @@ def test_compressor_mm_accepts_hcu_nn_and_upstream_nt_layouts(
         lambda lhs, rhs, *, out_dtype: lhs @ rhs.to(out_dtype),
     )
     hidden = torch.tensor([[2.0, 3.0]])
+    linear = SimpleNamespace(weight=weight)
 
-    result = patch_deepseek_v4_attention._compressor_mm(hidden, weight)
+    result = patch_deepseek_v4_attention._compressor_mm(hidden, linear)
 
     torch.testing.assert_close(result, torch.tensor([[8.0, 18.0, 28.0]]))
 

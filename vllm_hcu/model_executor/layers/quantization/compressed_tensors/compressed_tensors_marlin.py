@@ -60,6 +60,10 @@ class SlimQuantCompressedTensorsMarlinConfig(CompressedTensorsConfig):
     def get_name(cls) -> QuantizationMethods:
         return "slimquant_compressed_tensors_marlin"
 
+    @classmethod
+    def get_supported_act_dtypes(cls) -> list[torch.dtype]:
+        return CompressedTensorsConfig.get_supported_act_dtypes(cls)
+
     def get_quant_method(
             self,
             layer: torch.nn.Module,

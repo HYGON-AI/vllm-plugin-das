@@ -122,10 +122,10 @@ jobs:
               )"
             fi
             if [[ -n "$candidate" ]]; then
-              if ! docker run --rm --entrypoint /bin/bash "$candidate" -lc 'command -v python3.10 >/dev/null 2>&1'; then
+              if ! docker run --rm --entrypoint /bin/bash "$candidate" -lc 'command -v python3 >/dev/null 2>&1'; then
                 docker pull "$candidate" >/dev/null 2>&1 || true
               fi
-              if docker run --rm --entrypoint /bin/bash "$candidate" -lc 'command -v python3.10 >/dev/null 2>&1'; then
+              if docker run --rm --entrypoint /bin/bash "$candidate" -lc 'command -v python3 >/dev/null 2>&1'; then
                 HCU_CI_IMAGE="$(
                   docker image inspect "$candidate" \
                     --format '{{range .RepoDigests}}{{println .}}{{end}}' \
@@ -137,7 +137,7 @@ jobs:
                 fi
                 echo "HCU_CI_IMAGE=$HCU_CI_IMAGE" >> "$GITHUB_ENV"
               else
-                echo "Skipping HCU CI image candidate without python3.10: $candidate" >&2
+                echo "Skipping HCU CI image candidate without the default python3: $candidate" >&2
               fi
             fi
           fi
@@ -163,6 +163,22 @@ jobs:
             exit 1
           fi
 
+      - name: Checkout caller HCU CI bootstrap
+        uses: actions/checkout@v4
+        with:
+          ref: ${{ github.workflow_sha }}
+          clean: true
+          fetch-depth: 1
+
+      - name: Preserve caller HCU CI bootstrap
+        run: |
+          set -euo pipefail
+          mkdir -p "$RUNNER_TEMP/hcu-ci-bootstrap"
+          cp \
+            scripts/ci/hcu/hcu_ci_bootstrap_python.sh \
+            scripts/ci/hcu/hcu_ci_create_python_wrapper.sh \
+            "$RUNNER_TEMP/hcu-ci-bootstrap/"
+
       - name: Checkout tested revision
         uses: actions/checkout@v4
         with:
@@ -186,6 +202,19 @@ jobs:
           --workspace "$GITHUB_WORKSPACE"
           --artifact-root "$HCU_CI_HOST_JOB_ROOT"
 
+      - name: Bootstrap stable Python entry
+        run: |
+          set -euo pipefail
+          helper=/tmp/hcu_ci_create_python_wrapper.sh
+          docker cp \
+            "$RUNNER_TEMP/hcu-ci-bootstrap/hcu_ci_create_python_wrapper.sh" \
+            "$HCU_CI_CONTAINER_NAME:$helper"
+          docker cp \
+            "$RUNNER_TEMP/hcu-ci-bootstrap/hcu_ci_bootstrap_python.sh" \
+            "$HCU_CI_CONTAINER_NAME:/tmp/hcu_ci_bootstrap_python.sh"
+          docker exec "$HCU_CI_CONTAINER_NAME" \
+            bash /tmp/hcu_ci_bootstrap_python.sh
+
       - name: Diagnose HCU container runtime
         run: |
           docker exec "$HCU_CI_CONTAINER_NAME" bash -lc '
@@ -199,7 +228,7 @@ jobs:
             echo "VLLM_HCU_TEST_MODEL_ROOTS=${VLLM_HCU_TEST_MODEL_ROOTS:-<unset>}"
             ls -ld /models/public /models/parastor /models/public/qwen3.5 /models/parastor/qwen3.5 2>&1
             ldconfig -p 2>/dev/null | grep -E "hydmi|hyhal|rocm_smi" || true
-            /usr/local/bin/python3.10 - <<'"'"'PY'"'"'
+            /usr/local/bin/hcu-ci-python - <<'"'"'PY'"'"'
           import torch
           print("torch", torch.__version__)
           print("hip", getattr(torch.version, "hip", None))
@@ -219,7 +248,7 @@ jobs:
           bash scripts/ci/hcu/hcu_ci_exec.sh
           --container-name "$HCU_CI_CONTAINER_NAME"
           -w /vllm-plugin-das
-          -- /usr/local/bin/python3.10 .github/scripts/hcu_ci/run_hcu_ci_job.py
+          -- /usr/local/bin/hcu-ci-python .github/scripts/hcu_ci/run_hcu_ci_job.py
 
       - name: Cleanup HCU CI container
         if: always()

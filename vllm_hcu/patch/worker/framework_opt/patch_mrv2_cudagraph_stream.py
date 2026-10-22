@@ -122,13 +122,27 @@ def apply_to_module(module: ModuleType) -> bool:
     @functools.wraps(capture)
     def capture_with_separate_eager_comm(self, create_forward_fn, *args, **kwargs):
         def create_forward(desc, warmup):
+            from vllm_hcu.forward_context_runtime import (
+                deepep_auto_capture_mode_scope,
+            )
+
             forward = create_forward_fn(desc, warmup)
+            capture_mode = getattr(desc, "cg_mode", None)
+
+            @functools.wraps(forward)
+            def forward_with_capture_mode(*forward_args, **forward_kwargs):
+                with deepep_auto_capture_mode_scope(capture_mode):
+                    return forward(*forward_args, **forward_kwargs)
+
             if not warmup:
-                return forward
+                return forward_with_capture_mode
 
             @functools.wraps(forward)
             def eager_forward(*forward_args, **forward_kwargs):
-                with use_torch_collectives_for_warmup():
+                with (
+                    deepep_auto_capture_mode_scope(capture_mode),
+                    use_torch_collectives_for_warmup(),
+                ):
                     return forward(*forward_args, **forward_kwargs)
 
             return eager_forward

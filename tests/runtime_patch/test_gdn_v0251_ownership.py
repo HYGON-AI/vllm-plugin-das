@@ -226,6 +226,9 @@ def _fake_qwen(*, aiter_available: bool = True):
     update = _recording_callable(_causal_update_contract, "update", calls)
     aiter_update = _recording_callable(_aiter_update_contract, "aiter", calls)
 
+    def loader(shard_spec, tp_size, tp_rank):
+        return lambda param, weight: None
+
     class GatedDeltaNetAttention:
         model_config = SimpleNamespace(dtype=torch.float16)
         cache_config = SimpleNamespace(
@@ -254,6 +257,7 @@ def _fake_qwen(*, aiter_available: bool = True):
         "causal_conv1d_update": update,
         "fused_recurrent_gated_delta_rule_packed_decode": recurrent,
         "fused_sigmoid_gating_delta_rule_update": sigmoid,
+        "mamba_v2_sharded_weight_loader": loader,
         "QwenGatedDeltaNetAttention": QwenGatedDeltaNetAttention,
     }
     if aiter_available:

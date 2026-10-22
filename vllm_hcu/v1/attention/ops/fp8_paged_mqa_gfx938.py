@@ -52,15 +52,20 @@ def _paged_logits(
         Tables + batch * T_BATCH + logical_page * T_PAGE, valid, other=-1
     ).to(tl.int64)
     valid = valid & (page >= 0) & (page < NUM_PAGES)
+    # HCU still faults on masked OOB pointers; clamp before forming addresses.
+    page = tl.where(valid, page, 0)
     slot = tokens % PAGE_SIZE
-    page_base = page * CACHE_PAGE_STRIDE
-    offset = (
-        page_base[None, :]
-        + (slot[None, :] // 16) * (16 * DIM)
+    # Keep the full physical-page address in int64. Layer-split caches can
+    # exceed the signed-int32 offset range because pages retain their packed
+    # cross-layer stride.
+    page_base = page.to(tl.int64) * CACHE_PAGE_STRIDE
+    in_page_offset = (
+        (slot[None, :] // 16) * (16 * DIM)
         + (dims[:, None] // 16) * 256
         + (slot[None, :] % 16) * 16
         + dims[:, None] % 16
     )
+    offset = page_base[None, :] + in_page_offset.to(tl.int64)
     keys = tl.load(Cache + offset, (dims[:, None] < DIM) & valid[None, :], 0.0)
     query_values = tl.load(
         Q + batch * Q_BATCH + query * Q_NEXT + heads[:, None] * Q_HEAD + dims[None, :],
@@ -79,7 +84,6 @@ def _paged_logits(
         tl.where(valid, scores, -float("inf")),
         tokens < MAX_LEN,
     )
-
 
 def gfx938_fp8_paged_mqa_logits(
     q_fp8: torch.Tensor,
@@ -145,6 +149,7 @@ def gfx938_fp8_paged_mqa_logits(
     )
     if max_model_len == 0:
         return output
+
     cache = kv_cache_fp8.view(q_fp8.dtype)
     _paged_logits[(batch * next_n, triton.cdiv(max_model_len, 64))](
         q_fp8,

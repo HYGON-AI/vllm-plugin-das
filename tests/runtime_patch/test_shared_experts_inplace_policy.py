@@ -30,6 +30,10 @@ class _StreamPolicySharedExperts(SharedExperts):
         self._is_multistream_safe = lambda: multistream_safe
         self._stream = object()
 
+    def _can_overlap_deepep_eplb(self) -> bool:
+        # This fixture isolates generic stream safety from backend policy.
+        return False
+
     @property
     def _disable_shared_experts_overlap(self) -> bool:
         return False

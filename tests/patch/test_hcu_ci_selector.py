@@ -10,7 +10,10 @@ from collections import defaultdict
 import datetime as dt
 import json
 import os
+import shutil
+import subprocess
 import sys
+import venv
 from pathlib import Path
 from types import SimpleNamespace
 
@@ -32,6 +35,7 @@ from hcu_ci_preflight import PreflightError, run_preflight  # noqa: E402
 from hcu_ci_preflight import (  # noqa: E402
     _check_environment_lock,
     _check_requirements,
+    _version_specification,
 )
 from run_hcu_ci_job import _export_resolved_resource_environment  # noqa: E402
 from build_hcu_matrix import MatrixError, build_matrix  # noqa: E402
@@ -442,6 +446,21 @@ def test_environment_lock_allows_compatible_hip_prefix(
         )
 
 
+@pytest.mark.parametrize(
+    "specification",
+    (
+        {"match": "exact", "version": "3.10.12", "versions": []},
+        {"match": "exact", "version": "3.10.12", "versions": [3, 10]},
+        {"match": "exact", "version": 31012, "versions": ["3.12.12"]},
+    ),
+)
+def test_version_specification_rejects_conflicting_or_malformed_secondary_field(
+    specification: dict,
+) -> None:
+    with pytest.raises(PreflightError, match="exactly one"):
+        _version_specification(specification, name="test version")
+
+
 def test_v0281_runner_lock_matches_audited_runtime(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
@@ -450,13 +469,19 @@ def test_v0281_runner_lock_matches_audited_runtime(
         REPOSITORY / ".github/workflows/configs/hcu-runner-environment.json"
     )
     lock = json.loads(lock_path.read_text(encoding="utf-8"))
-    assert lock["python"] == "3.10.12"
-    assert lock["torch_hip"] == {"match": "prefix", "version": "6.3."}
+    assert lock["python"] == {
+        "match": "exact",
+        "versions": ["3.10.12", "3.12.12"],
+    }
+    assert lock["torch_hip"] == {
+        "match": "prefix",
+        "versions": ["6.3.", "7.2."],
+    }
     assert lock["rocm"] == {
         "environment": "ROCM_PATH",
         "version_file": ".info/rocm_version",
         "match": "release_line",
-        "version": "26.04",
+        "versions": ["26.04", "26.10"],
     }
     assert lock["distributions"] == {
         "torch": {"match": "prefix", "version": "2.11.0+"},
@@ -486,6 +511,22 @@ def test_v0281_runner_lock_matches_audited_runtime(
         torch_hip="6.3.26113",
     )
     assert report["rocm"] == "26.04.1"
+
+    version_file.write_text("26.10\n", encoding="utf-8")
+    report = _check_environment_lock(
+        lock_path,
+        versions=versions,
+        torch_hip="7.2.26365",
+    )
+    assert report["rocm"] == "26.10"
+    monkeypatch.setattr("hcu_ci_preflight.platform.python_version", lambda: "3.12.12")
+    _check_environment_lock(
+        lock_path,
+        versions=versions,
+        torch_hip="7.2.26365",
+    )
+    monkeypatch.setattr("hcu_ci_preflight.platform.python_version", lambda: "3.10.12")
+    version_file.write_text("26.04.1\n", encoding="utf-8")
 
     for distribution, compatible_version in (
         ("vllm", "0.28.1"),
@@ -537,7 +578,9 @@ def dtk_environment_lock(
     )
     # Exercise the generic release-line matcher independently of the branch's
     # exact audited DTK patch release.
+    lock["rocm"].pop("versions", None)
     lock["rocm"].update({"match": "release_line", "version": "26.04"})
+    lock["python"] = "3.10.12"
     runtime_root = tmp_path / "dtk"
     version_file = runtime_root / lock["rocm"]["version_file"]
     version_file.parent.mkdir(parents=True)
@@ -633,6 +676,10 @@ def test_environment_lock_preserves_exact_dtk_matching(
     (
         {"match": "prefix"},
         {"match": []},
+        {"version": "26.04", "versions": ["26.04", "26.10"]},
+        {"version": None, "versions": []},
+        {"version": None, "versions": ["26.04", 26.10]},
+        {"version": None, "versions": ["26.04", "26.04"]},
         {"match": "release_line", "version": "26"},
         {"match": "release_line", "version": "26.04.1"},
         {"match": "release_line", "version": "26.04|27.01"},
@@ -811,6 +858,202 @@ def test_hcu_container_uses_checked_out_environment_lock() -> None:
     assert "/models/public" in source
     assert "/models/parastor" in source
     assert ":/models/llm-models:ro" not in source
+
+
+def test_selected_hcu_path_uses_resolved_supported_python() -> None:
+    paths = (
+        "scripts/ci/hcu/hcu_ci_start_container.sh",
+        "scripts/ci/hcu/hcu_ci_install_dependency.sh",
+        "scripts/ci/hcu/hcu_ci_resolve_image.sh",
+        ".github/workflows/_selected-hcu-tests.yml",
+    )
+    sources = {
+        path: (REPOSITORY / path).read_text(encoding="utf-8") for path in paths
+    }
+
+    assert 'command -v python3' in sources[paths[0]]
+    assert "for python_name in" not in sources[paths[0]]
+    assert "hcu_ci_create_python_wrapper.sh" in sources[paths[0]]
+    assert "ln -sf" not in sources[paths[0]]
+    assert "/usr/local/bin/hcu-ci-python" in sources[paths[0]]
+    assert "/usr/local/bin/hcu-ci-python" in sources[paths[1]]
+    assert "/usr/local/bin/hcu-ci-python" in sources[paths[3]]
+    assert "command -v python3" in sources[paths[2]]
+    assert "for name in python3.10 python3.12" not in sources[paths[2]]
+    assert "without the default python3" in sources[paths[2]]
+    assert "github.workflow_sha" in sources[paths[3]]
+    assert "Preserve caller HCU CI bootstrap" in sources[paths[3]]
+    assert "docker cp" in sources[paths[3]]
+    assert "hcu_ci_create_python_wrapper.sh" in sources[paths[3]]
+    assert "hcu_ci_bootstrap_python.sh" in sources[paths[3]]
+    bootstrap = (
+        REPOSITORY / "scripts/ci/hcu/hcu_ci_bootstrap_python.sh"
+    ).read_text(encoding="utf-8")
+    assert "/usr/local/bin/python3.10" in bootstrap
+
+    for path in paths[:3]:
+        assert "/usr/local/bin/python3.10" not in sources[path]
+
+
+def test_hcu_control_workflows_use_image_python_without_fixed_minor() -> None:
+    paths = (
+        ".github/workflows/hcu-pr-ci.yml",
+        ".github/workflows/nightly-hcu.yml",
+        ".github/workflows/patch-coverage.yml",
+        ".github/workflows/full-enabled-hcu.yml",
+    )
+    for path in paths:
+        source = (REPOSITORY / path).read_text(encoding="utf-8")
+        assert "python3.10" not in source, path
+        assert "python3 " in source or "python3\n" in source, path
+
+    for path in (
+        ".github/workflows/hcu-pr-ci.yml",
+        ".github/workflows/nightly-hcu.yml",
+        ".github/workflows/patch-coverage.yml",
+        ".github/workflows/full-enabled-hcu.yml",
+    ):
+        source = (REPOSITORY / path).read_text(encoding="utf-8")
+        assert "hcu_ci_preflight.py" in source, path
+        assert "--check-lock-only" in source, path
+
+    weekly = (
+        REPOSITORY / ".github/workflows/weekly-multi-node.yml"
+    ).read_text(encoding="utf-8")
+    assert "run: python3.10 .github/scripts/hcu_ci/run_hcu_ci_job.py" in weekly
+
+
+def test_control_preflight_runs_with_python312_only(tmp_path: Path) -> None:
+    bin_dir = tmp_path / "bin"
+    bin_dir.mkdir()
+    shutil.copy2(sys.executable, bin_dir / "python3")
+    isolated_path = str(bin_dir)
+
+    assert shutil.which("python3", path=isolated_path) == str(bin_dir / "python3")
+    assert shutil.which("python3.10", path=isolated_path) is None
+    completed = subprocess.run(
+        [
+            str(bin_dir / "python3"),
+            str(CI_SCRIPTS / "hcu_ci_preflight.py"),
+            "--environment-lock",
+            str(
+                REPOSITORY
+                / ".github/workflows/configs/hcu-runner-environment.json"
+            ),
+            "--check-lock-only",
+        ],
+        check=False,
+        capture_output=True,
+        env={"PATH": isolated_path},
+        text=True,
+    )
+    assert completed.returncode == 0, completed.stderr
+    assert '"versions": [' in completed.stdout
+    assert '"3.12.12"' in completed.stdout
+
+
+def test_default_python312_wins_over_invalid_python310(tmp_path: Path) -> None:
+    bin_dir = tmp_path / "bin"
+    bin_dir.mkdir()
+    default_python = bin_dir / "python3"
+    invalid_python = bin_dir / "python3.10"
+    shutil.copy2(sys.executable, default_python)
+    invalid_python.write_text("#!/bin/sh\nexit 97\n", encoding="utf-8")
+    invalid_python.chmod(0o755)
+    isolated_path = str(bin_dir)
+
+    selected = shutil.which("python3", path=isolated_path)
+    assert selected == str(default_python)
+    assert shutil.which("python3.10", path=isolated_path) == str(invalid_python)
+    completed = subprocess.run(
+        [
+            selected,
+            str(CI_SCRIPTS / "hcu_ci_preflight.py"),
+            "--environment-lock",
+            str(
+                REPOSITORY
+                / ".github/workflows/configs/hcu-runner-environment.json"
+            ),
+            "--check-lock-only",
+        ],
+        check=False,
+        capture_output=True,
+        env={"PATH": isolated_path},
+        text=True,
+    )
+    assert completed.returncode == 0, completed.stderr
+
+
+@pytest.mark.skipif(os.name == "nt", reason="HCU CI wrapper is a Bash entrypoint")
+def test_hcu_python_wrapper_preserves_venv_context(tmp_path: Path) -> None:
+    venv_root = tmp_path / "runtime-venv"
+    venv.EnvBuilder(with_pip=False, symlinks=False).create(venv_root)
+    venv_python = venv_root / "bin" / "python3"
+    purelib = Path(
+        subprocess.check_output(
+            [
+                str(venv_python),
+                "-c",
+                "import sysconfig; print(sysconfig.get_paths()['purelib'])",
+            ],
+            text=True,
+        ).strip()
+    )
+    (purelib / "hcu_ci_venv_marker.py").write_text(
+        "VALUE = 'venv-only'\n",
+        encoding="utf-8",
+    )
+    wrapper = tmp_path / "external-bin" / "hcu-ci-python"
+    helper = REPOSITORY / "scripts/ci/hcu/hcu_ci_create_python_wrapper.sh"
+
+    subprocess.run(
+        ["bash", str(helper), str(venv_python), str(wrapper)],
+        check=True,
+    )
+    completed = subprocess.run(
+        [
+            str(wrapper),
+            "-c",
+            (
+                "import hcu_ci_venv_marker, sys; "
+                "print(sys.prefix); print(hcu_ci_venv_marker.VALUE)"
+            ),
+        ],
+        check=False,
+        capture_output=True,
+        text=True,
+    )
+    assert completed.returncode == 0, completed.stderr
+    assert completed.stdout.splitlines() == [str(venv_root), "venv-only"]
+
+
+@pytest.mark.skipif(os.name == "nt", reason="HCU CI bootstrap is a Bash entrypoint")
+def test_caller_bootstrap_supports_legacy_tested_revision(tmp_path: Path) -> None:
+    legacy_python = tmp_path / "usr/local/bin/python3.10"
+    legacy_python.parent.mkdir(parents=True)
+    shutil.copy2(sys.executable, legacy_python)
+    wrapper = tmp_path / "usr/local/bin/hcu-ci-python"
+    bootstrap = REPOSITORY / "scripts/ci/hcu/hcu_ci_bootstrap_python.sh"
+    creator = REPOSITORY / "scripts/ci/hcu/hcu_ci_create_python_wrapper.sh"
+
+    subprocess.run(
+        [
+            "bash",
+            str(bootstrap),
+            str(wrapper),
+            str(legacy_python),
+            str(creator),
+        ],
+        check=True,
+    )
+    completed = subprocess.run(
+        [str(wrapper), "-c", "import sys; print(sys.version_info[:2])"],
+        check=False,
+        capture_output=True,
+        text=True,
+    )
+    assert completed.returncode == 0, completed.stderr
+    assert completed.stdout.strip() == str(sys.version_info[:2])
 
 
 def test_hcu_control_container_uses_runner_identity() -> None:

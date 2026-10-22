@@ -146,6 +146,8 @@ def test_auto_w4a8_shared_storage_feeds_ht_and_ll_with_empty_expert() -> None:
         requires_grad=False,
     )
     auto = object.__new__(experts_module.DeepEPAutoW4A8Experts)
+    quant_config = SimpleNamespace(_w1=SimpleNamespace(scale=checkpoint_scale))
+    auto.quant_config = quant_config
     auto._fixed_use_low_latency = None
     auto._use_low_latency_snapshot = False
     auto.ht_experts = object.__new__(
@@ -153,6 +155,7 @@ def test_auto_w4a8_shared_storage_feeds_ht_and_ll_with_empty_expert() -> None:
     )
     auto.ll_experts = object.__new__(runtime.DeepEPDeepGemmW4A8MaskedExperts)
     for child in (auto.ht_experts, auto.ll_experts):
+        child.quant_config = quant_config
         child._deepgemm_w13 = None
         child._deepgemm_w2 = None
 
@@ -207,6 +210,174 @@ def test_auto_w4a8_shared_storage_feeds_ht_and_ll_with_empty_expert() -> None:
         ll_output[0].float(), reference, rtol=3e-2, atol=0.1
     )
     assert torch.isnan(ll_output[1]).all()
+
+
+def test_auto_w4a8_qwen_padding_matches_ht_and_ll_reference() -> None:
+    """Qwen I=640 padding must fix HIPC HT/LL gate-up numerics."""
+
+    from deepgemm import (
+        m_grouped_w4a8_gemm_nt_contiguous_hipc,
+        m_grouped_w4a8_gemm_nt_masked_hipc,
+    )
+    from vllm_hcu.model_executor.layers.fused_moe.experts import (
+        dpsk_v4_deep_gemm_moe as experts_module,
+    )
+    from vllm_hcu.model_executor.layers.quantization import (
+        slimquant_w4a8_deepgemm_runtime as runtime,
+    )
+
+    device = _hcu_device()
+    num_experts, tokens, hidden, intermediate = 128, 32, 2560, 640
+    generator = torch.Generator(device=device).manual_seed(751)
+    activation = torch.randint(
+        -8,
+        8,
+        (tokens, hidden),
+        generator=generator,
+        device=device,
+        dtype=torch.int8,
+    )
+    activation_scale = torch.rand(
+        (tokens, 1),
+        generator=generator,
+        device=device,
+        dtype=torch.float32,
+    ).mul_(0.01)
+    canonical_w13 = torch.randint(
+        -128,
+        128,
+        (num_experts, 2 * intermediate, hidden // 2),
+        generator=generator,
+        device=device,
+        dtype=torch.int8,
+    )
+    raw_expert0 = canonical_w13[0].clone()
+    checkpoint_scale = torch.rand(
+        (num_experts, 2 * intermediate, 1),
+        generator=generator,
+        device=device,
+        dtype=torch.float32,
+    ).mul_(0.01)
+    layer = torch.nn.Module()
+    layer.w13_weight = torch.nn.Parameter(canonical_w13, requires_grad=False)
+    layer.w2_weight = torch.nn.Parameter(
+        torch.zeros(
+            (num_experts, hidden, intermediate // 2),
+            device=device,
+            dtype=torch.int8,
+        ),
+        requires_grad=False,
+    )
+    layer.w13_weight_scale = torch.nn.Parameter(
+        checkpoint_scale,
+        requires_grad=False,
+    )
+    layer.w2_weight_scale = torch.nn.Parameter(
+        torch.ones(
+            (num_experts, hidden, 1),
+            device=device,
+            dtype=torch.float32,
+        ),
+        requires_grad=False,
+    )
+    quant_config = SimpleNamespace(_w1=SimpleNamespace(scale=checkpoint_scale))
+    auto = object.__new__(experts_module.DeepEPAutoW4A8Experts)
+    auto.quant_config = quant_config
+    auto._fixed_use_low_latency = None
+    auto._use_low_latency_snapshot = False
+    auto.ht_experts = object.__new__(
+        runtime.DeepEPDeepGemmW4A8ContiguousExperts
+    )
+    auto.ll_experts = object.__new__(runtime.DeepEPDeepGemmW4A8MaskedExperts)
+    for child in (auto.ht_experts, auto.ll_experts):
+        child.quant_config = quant_config
+        child._deepgemm_w13 = None
+        child._deepgemm_w2 = None
+
+    auto.process_weights_after_loading(layer)
+
+    physical_intermediate = 768
+    assert tuple(layer.w13_weight.shape) == (
+        num_experts,
+        2 * physical_intermediate,
+        hidden // 2,
+    )
+    assert tuple(layer.w2_weight.shape) == (
+        num_experts,
+        hidden,
+        physical_intermediate // 2,
+    )
+    m_indices = torch.zeros(tokens, device=device, dtype=torch.int32)
+    ht_output = torch.empty(
+        (tokens, 2 * physical_intermediate),
+        device=device,
+        dtype=torch.bfloat16,
+    )
+    m_grouped_w4a8_gemm_nt_contiguous_hipc(
+        (activation, activation_scale),
+        (auto.ht_experts._deepgemm_w13, layer.w13_weight_scale),
+        ht_output,
+        m_indices,
+    )
+    ll_output = torch.full(
+        (num_experts, tokens, 2 * physical_intermediate),
+        torch.nan,
+        device=device,
+        dtype=torch.bfloat16,
+    )
+    m_grouped_w4a8_gemm_nt_masked_hipc(
+        (
+            activation.unsqueeze(0)
+            .expand(num_experts, -1, -1)
+            .contiguous(),
+            activation_scale.unsqueeze(0)
+            .expand(num_experts, -1, -1)
+            .contiguous(),
+        ),
+        (auto.ll_experts._deepgemm_w13, layer.w13_weight_scale),
+        ll_output,
+        torch.tensor(
+            [tokens] + [0] * (num_experts - 1),
+            device=device,
+            dtype=torch.int32,
+        ),
+        tokens,
+    )
+
+    logical_weight = _unpack_signed_int4_high_low(raw_expert0)
+    reference = (activation.float() * activation_scale) @ (
+        logical_weight.float() * (checkpoint_scale[0] * 16.0)
+    ).T
+    ht_logical = torch.cat(
+        (
+            ht_output[:, :intermediate],
+            ht_output[
+                :,
+                physical_intermediate : physical_intermediate + intermediate,
+            ],
+        ),
+        dim=1,
+    )
+    ll_logical = torch.cat(
+        (
+            ll_output[0, :, :intermediate],
+            ll_output[
+                0,
+                :,
+                physical_intermediate : physical_intermediate + intermediate,
+            ],
+        ),
+        dim=1,
+    )
+    torch.testing.assert_close(ht_logical.float(), reference, rtol=3e-2, atol=0.1)
+    torch.testing.assert_close(ll_logical.float(), reference, rtol=3e-2, atol=0.1)
+    assert torch.count_nonzero(ht_output[:, intermediate:physical_intermediate]) == 0
+    assert (
+        torch.count_nonzero(
+            ht_output[:, physical_intermediate + intermediate :]
+        )
+        == 0
+    )
 
 
 def test_contiguous_channel_fp8_deepgemm_matches_dequantized_reference() -> None:

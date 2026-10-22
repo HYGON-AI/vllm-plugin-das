@@ -81,6 +81,99 @@ def _hcu_device() -> torch.device:
     return torch.device("cuda", 0)
 
 
+@pytest.mark.parametrize(
+    ("query_len", "causal"),
+    [(8, True), (7, False)],
+    ids=["target-verification", "dspark-drafter"],
+)
+def test_hcu_qwen3_dspark_vendor_kernel_replays_in_cuda_graph(
+    query_len: int,
+    causal: bool,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Keep the Qwen3 DSpark vendor paged-KV kernel graph-safe."""
+    from flash_attn import flash_attn_varlen_func as vendor_varlen
+    from vllm_hcu.v1.attention.backends import fa_utils
+
+    monkeypatch.setattr(fa_utils, "get_kv_cache_layout", lambda: "NHD")
+    hcu_varlen = fa_utils.flash_attn_varlen_func
+
+    device = _hcu_device()
+    torch.manual_seed(42)
+    batch_size, q_heads, kv_heads, head_dim = 2, 16, 4, 128
+    q = torch.randn(
+        (batch_size * query_len, q_heads, head_dim),
+        device=device,
+        dtype=torch.bfloat16,
+    )
+    kv = torch.randn(
+        (4, 2, 64, kv_heads, head_dim),
+        device=device,
+        dtype=torch.bfloat16,
+    )
+    k, v = kv.unbind(1)
+    cu_seqlens_q = torch.arange(
+        0,
+        (batch_size + 1) * query_len,
+        query_len,
+        device=device,
+        dtype=torch.int32,
+    )
+    seqused_k = torch.tensor(
+        [query_len, 128], device=device, dtype=torch.int32
+    )
+    block_table = torch.tensor(
+        [[0, 1], [2, 3]], device=device, dtype=torch.int32
+    )
+    descales = tuple(
+        torch.tensor(1.0, device=device).expand(batch_size, kv_heads)
+        for _ in range(3)
+    )
+    common = {
+        "q": q,
+        "k": k,
+        "v": v,
+        "cu_seqlens_q": cu_seqlens_q,
+        "max_seqlen_q": query_len,
+        "seqused_k": seqused_k,
+        "max_seqlen_k": 128,
+        "softmax_scale": head_dim**-0.5,
+        "causal": causal,
+        "window_size": (-1, -1),
+        "block_table": block_table,
+        "q_descale": descales[0],
+        "k_descale": descales[1],
+        "v_descale": descales[2],
+    }
+    reference_out = torch.empty_like(q)
+    actual_out = torch.empty_like(q)
+
+    reference = vendor_varlen(
+        out=reference_out, layout="bshd", **common
+    ).clone()
+    actual = hcu_varlen(out=actual_out, **common).clone()
+    torch.cuda.synchronize(device)
+    torch.testing.assert_close(actual, reference, rtol=1e-2, atol=1e-2)
+
+    hcu_varlen(out=actual_out, **common)
+    graph = torch.cuda.CUDAGraph()
+    with torch.cuda.graph(graph):
+        hcu_varlen(out=actual_out, **common)
+
+    q.neg_()
+    actual_out.fill_(float("nan"))
+    graph.replay()
+    replay_reference = vendor_varlen(
+        out=reference_out, layout="bshd", **common
+    ).clone()
+    torch.cuda.synchronize(device)
+
+    assert not torch.isnan(actual_out).any().item()
+    torch.testing.assert_close(
+        actual_out, replay_reference, rtol=1e-2, atol=1e-2
+    )
+
+
 def test_concat_and_cache_mla_e5m2_matches_reference_and_graph() -> None:
     device = _hcu_device()
     import vllm_hcu.hcu_ops  # noqa: F401
