@@ -9,6 +9,25 @@ recomputes only the per-expert GEMM plus activation with plain matmuls.
 Everything else stays with its existing owner in the surrounding MoE pipeline:
 router selection, prepare/finalize, shared experts, latent projections, TP
 all-reduce, sequence parallelism and routed scaling.
+
+The plain-matmul path reproduces the parts of the fused kernel that change the
+numerics, so that enabling the fallback does not change the model function:
+
+* ``apply_router_weight_on_input`` inputs are already weighted by the prepare
+  step; the routed weight must not be applied a second time.
+* ``w1_bias``/``w2_bias`` are added to the FP32 accumulator of their GEMM, i.e.
+  before the activation and before the routed scaling, respectively.
+* the SwiGLU clamp (``gemm1_clamp_limit``/``swiglu_limit``) is applied to the
+  gate and up halves before ``silu``.
+* GEMM2 keeps FP32 precision until after the routed scaling, like the fused
+  kernel's FP32 accumulator, so FP16 cannot overflow before the scaling.
+* ``gelu`` stays exact; only ``gelu_tanh`` uses the tanh approximation.
+
+The per-expert loop is data dependent: it enumerates ``topk_ids`` on the host
+and sizes its row slices from the device.  It therefore synchronizes the device
+during the forward pass and cannot run inside a CUDA graph.  Enabling
+``VLLM_HCU_USE_REFERENCE_MOE`` requires eager execution; the HCU config
+validation rejects every capture mode instead of replaying a stale graph.
 """
 
 from __future__ import annotations
@@ -28,18 +47,31 @@ _PLAIN_RELU2_ACTIVATIONS = frozenset(
 )
 _PLAIN_ACTIVATIONS = frozenset({"relu"})
 
+# The fused kernel only applies the clamp for SILU (and the OAI variants,
+# which this fallback rejects); see ``TritonExperts.activation``.
+_CLAMPED_ACTIVATIONS = frozenset({"silu"})
+
 
 def _activation_name(activation: object) -> str:
     return str(getattr(activation, "value", activation)).lower()
 
 
 def _apply_gated_activation(
-    gate_up: torch.Tensor, name: str
+    gate_up: torch.Tensor,
+    name: str,
+    clamp_limit: float | None,
 ) -> torch.Tensor:
     gate, up = gate_up.chunk(2, dim=-1)
     if name == "silu":
+        if clamp_limit is not None and clamp_limit > 0:
+            # Mirrors ``swiglu_limit_func``: gate is only clamped above, up is
+            # clamped to [-limit, limit].
+            gate = torch.clamp(gate, max=clamp_limit)
+            up = torch.clamp(up, min=-clamp_limit, max=clamp_limit)
         return F.silu(gate) * up
-    if name in ("gelu", "gelu_tanh"):
+    if name == "gelu":
+        return F.gelu(gate) * up
+    if name == "gelu_tanh":
         return F.gelu(gate, approximate="tanh") * up
     if name in _PLAIN_RELU2_ACTIVATIONS:
         return torch.square(F.relu(gate)) * up
@@ -49,7 +81,12 @@ def _apply_gated_activation(
     )
 
 
-def _apply_plain_activation(x: torch.Tensor, name: str) -> torch.Tensor:
+def _apply_plain_activation(
+    x: torch.Tensor,
+    name: str,
+    clamp_limit: float | None,
+) -> torch.Tensor:
+    del clamp_limit  # The fused kernel ignores it for non-gated activations.
     if name in _PLAIN_RELU2_ACTIVATIONS:
         return torch.square(F.relu(x))
     if name in _PLAIN_ACTIVATIONS:
@@ -91,15 +128,25 @@ def apply_reference_moe(
     global_num_experts: int,
     expert_map: torch.Tensor | None,
     apply_router_weight_on_input: bool,
+    *,
+    w1_bias: torch.Tensor | None = None,
+    w2_bias: torch.Tensor | None = None,
+    clamp_limit: float | None = None,
 ) -> None:
     """Write the routed expert output into ``output`` in place.
 
     ``w1`` is ``[num_local_experts, 2 * I, H]`` for gated activations and
     ``[num_local_experts, I, H]`` for non-gated activations.
     ``w2`` is ``[num_local_experts, H, I]``.
+    ``w1_bias``/``w2_bias`` are optional ``[num_local_experts, N]`` biases.
 
     ``topk_ids`` holds global expert ids.  ``expert_map`` maps them to the
     local expert index, where ``-1`` means the expert is not on this rank.
+
+    ``hidden_states`` arrives after the prepare step.  When
+    ``apply_router_weight_on_input`` is set, prepare has already multiplied it
+    by the routed weights, so they are not applied again here; the flag only
+    suppresses the output-side scaling, exactly like the fused kernel.
     """
 
     del global_num_experts  # Routing already happened upstream.
@@ -144,6 +191,11 @@ def apply_reference_moe(
         raise ValueError(
             f"VLLM_HCU_USE_REFERENCE_MOE does not support activation {name!r}"
         )
+    if clamp_limit is not None and name not in _CLAMPED_ACTIVATIONS:
+        # The fused kernel ignores the clamp for every activation it would
+        # route through the reference path here; keep that behaviour instead
+        # of silently changing the function.
+        clamp_limit = None
 
     num_local_experts = w1.shape[0]
     num_tokens = hidden_states.shape[0]
@@ -170,6 +222,14 @@ def apply_reference_moe(
             if local is None:
                 continue
 
+        w1_e = w1[local]
+        # GEMM2 runs in FP32 so that the routed scaling happens before the
+        # cast to the output dtype; converting the weight once per expert
+        # keeps that out of the row-chunk loop.
+        w2_e_fp32 = w2[local].to(torch.float32)
+        bias1 = None if w1_bias is None else w1_bias[local]
+        bias2 = None if w2_bias is None else w2_bias[local].to(torch.float32)
+
         rows, slots = torch.where(topk_ids == expert)
         for start in range(0, rows.numel(), _MAX_ROWS_PER_CHUNK):
             chunk_rows = rows[start : start + _MAX_ROWS_PER_CHUNK]
@@ -177,18 +237,25 @@ def apply_reference_moe(
             x = hidden_states[chunk_rows]
             weights = topk_weights[chunk_rows, chunk_slots].to(torch.float32)
 
-            if apply_router_weight_on_input:
-                x = (x.float() * weights.unsqueeze(-1)).to(
-                    hidden_states.dtype
-                )
-
-            gate_up = torch.matmul(x, w1[local].T)
-            if gated:
-                act = _apply_gated_activation(gate_up, name)
+            # ``x`` is the prepared input: already router-weighted when
+            # ``apply_router_weight_on_input`` is set.
+            if bias1 is None:
+                gate_up = torch.matmul(x, w1_e.T)
             else:
-                act = _apply_plain_activation(gate_up, name)
+                # addmm adds the bias to the FP32 accumulator before the cast,
+                # which is what the fused GEMM1 does with ``B_bias``.
+                gate_up = torch.addmm(bias1.to(x.dtype), x, w1_e.T)
 
-            expert_out = torch.matmul(act, w2[local].T).float()
+            if gated:
+                act = _apply_gated_activation(gate_up, name, clamp_limit)
+            else:
+                act = _apply_plain_activation(gate_up, name, clamp_limit)
+
+            act_fp32 = act.to(torch.float32)
+            if bias2 is None:
+                expert_out = torch.matmul(act_fp32, w2_e_fp32.T)
+            else:
+                expert_out = torch.addmm(bias2, act_fp32, w2_e_fp32.T)
             if not apply_router_weight_on_input:
                 expert_out = expert_out * weights.unsqueeze(-1)
 

@@ -533,10 +533,59 @@ def _validate_dspark_pd_scope(vllm_config: object) -> None:
     )
 
 
+def _require_reference_moe_eager(vllm_config: object) -> None:
+    """Reject graph capture for the data-dependent reference MoE fallback.
+
+    ``apply_reference_moe`` picks the routed experts with
+    ``torch.unique(topk_ids).tolist()``, sizes its row slices from
+    ``torch.where(...).numel()`` and reads ``expert_map`` back to the CPU.  All
+    three synchronize the device, so the forward pass cannot be captured in a
+    CUDA graph: a captured graph replays with stale routing and would produce
+    silently wrong numbers instead of failing.  Capture modes therefore have to
+    be rejected while the configuration is validated, not left to the launch
+    recipe in the documentation.
+    """
+
+    from vllm_hcu.platforms import envs as hcu_envs
+
+    if not hcu_envs.VLLM_HCU_USE_REFERENCE_MOE:
+        return
+    compilation_config = getattr(vllm_config, "compilation_config", None)
+    if compilation_config is None:
+        raise PatchCompatibilityError(
+            "VLLM_HCU_USE_REFERENCE_MOE requires VllmConfig.compilation_config"
+        )
+    # ``None`` means the mode has not been resolved yet; upstream's
+    # ``--enforce-eager`` path stores NONE before this validation runs, so a
+    # resolved capture mode is always visible here.  If a future vLLM version
+    # defers the resolution, fall back to the documented eager switch instead
+    # of silently allowing capture.
+    cudagraph_mode = getattr(compilation_config, "cudagraph_mode", None)
+    if cudagraph_mode is None:
+        model_config = getattr(vllm_config, "model_config", None)
+        if getattr(model_config, "enforce_eager", False):
+            return
+        mode_name = "unresolved"
+    else:
+        from vllm.config.compilation import CUDAGraphMode
+
+        if cudagraph_mode == CUDAGraphMode.NONE:
+            return
+        mode_name = getattr(cudagraph_mode, "name", str(cudagraph_mode))
+    raise ValueError(
+        "VLLM_HCU_USE_REFERENCE_MOE requires eager execution: the reference "
+        "expert kernel synchronizes the device while routing, so it cannot be "
+        "captured in a CUDA graph. Start the server with --enforce-eager (or "
+        "set --compilation-config.cudagraph_mode=none); got cudagraph_mode="
+        f"{mode_name}."
+    )
+
+
 def validate_and_update_hcu_config(vllm_config: object) -> HcuFeatureConfig:
     """Validate cross-config invariants and bind the compilation adapter."""
 
     _validate_hcu_pcp_scope(vllm_config)
+    _require_reference_moe_eager(vllm_config)
     from vllm_hcu.models.hy_v4.dcp_config import validate_hy4_dcp_config
 
     validate_hy4_dcp_config(vllm_config)
@@ -555,6 +604,7 @@ def validate_and_update_hcu_config(vllm_config: object) -> HcuFeatureConfig:
         "qwen4_exp_hc_sp": _resolve_qwen4_exp_hc_sp(
             vllm_config, hcu_envs.qwen4_exp_hc_sp_enabled()
         ),
+        "dp_int8_allgather": hcu_envs.dp_int8_allgather_enabled(),
     }
     if feature_config.hcu_flash_attn_mode is None:
         # Persist the resolved sub-mode before vLLM computes compilation cache
