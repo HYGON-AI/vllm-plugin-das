@@ -407,16 +407,55 @@ def _effective_quantization_config(raw, text_config):
     return {}
 
 
+def _failed_audit_result(root, errors):
+    """Return the normal report shape when config prevents schema auditing."""
+    return dict(checkpoint=str(root), tensor_count=0, language_tensor_count=0,
+                vision_inventory_only=0, route_counts={},
+                w8a8_scale_tensors_fully_read=0, w8a8_scale_values_checked=0,
+                errors=errors, passed=False, model_constructed=False,
+                GPU_initialized=False, mapping_contracts={},
+                limits='Schema and source routing audit; not complete live-model parameter coverage or GPU loading')
+
+
 def audit(root, tp=16):
     root = Path(root)
-    raw = json.loads((root / 'config.json').read_text())
-    c = raw['text_config']
-    quant = _effective_quantization_config(raw, c)
-    if quant.get('quant_method') != 'slimquant_w4a8':
-        raise ValueError('Expected slimquant_w4a8 checkpoint')
-    schema = language_schema(c)
     errors = []
-    index_document = json.loads((root / 'model.safetensors.index.json').read_text())
+    config_path = root / 'config.json'
+    try:
+        raw = json.loads(config_path.read_text())
+    except (OSError, UnicodeError, json.JSONDecodeError, RecursionError) as exc:
+        return _failed_audit_result(
+            root, [f'Unable to read/parse config.json: {exc}']
+        )
+    if type(raw) is not dict:
+        return _failed_audit_result(
+            root, ['Invalid config.json: expected a JSON object']
+        )
+    c = raw.get('text_config')
+    if type(c) is not dict:
+        return _failed_audit_result(
+            root, ['Invalid config.json text_config: expected an object']
+        )
+    try:
+        quant = _effective_quantization_config(raw, c)
+        if type(quant) is not dict:
+            raise ValueError('quantization config must be an object')
+        if quant.get('quant_method') != 'slimquant_w4a8':
+            raise ValueError('Expected slimquant_w4a8 checkpoint')
+        schema = language_schema(c)
+        expected_expert_ids = set(range(c['num_experts']))
+    except (AttributeError, IndexError, KeyError, TypeError, ValueError,
+            OverflowError, ZeroDivisionError) as exc:
+        return _failed_audit_result(
+            root, [f'Invalid checkpoint config: {exc}']
+        )
+    index_path = root / 'model.safetensors.index.json'
+    try:
+        index_document = json.loads(index_path.read_text())
+    except (OSError, UnicodeError, json.JSONDecodeError, RecursionError) as exc:
+        return _failed_audit_result(
+            root, [f'Unable to read/parse model.safetensors.index.json: {exc}']
+        )
     index = index_document.get('weight_map') if isinstance(index_document, dict) else None
     if not isinstance(index, dict):
         errors.append('Invalid weight_map: expected an object')
@@ -432,7 +471,8 @@ def audit(root, tp=16):
         shards.setdefault(shard, set()).add(name)
     counts = Counter()
     expert_ids = {name: set() for name in schema if '.experts.*.' in name}
-    expected_expert_ids = set(range(c['num_experts'])) if expert_ids else set()
+    if not expert_ids:
+        expected_expert_ids = set()
     routes = Counter()
     w8_scales = 0
     w8_values = 0

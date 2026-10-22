@@ -133,6 +133,97 @@ def test_cli_writes_structured_report_for_missing_shard(tmp_path, monkeypatch):
                for error in report['errors'])
 
 
+@pytest.mark.parametrize('case', [
+    'missing', 'unreadable', 'truncated', 'invalid_json', 'non_object',
+    'missing_text_config', 'null_text_config', 'non_object_text_config',
+    'incomplete_text_config', 'malformed_nested_config',
+    'invalid_expert_count', 'invalid_quantization_config',
+])
+def test_cli_writes_structured_report_for_invalid_config(tmp_path, monkeypatch, case):
+    _write(tmp_path)
+    config_path = tmp_path / 'config.json'
+    if case == 'missing':
+        config_path.unlink()
+    elif case == 'truncated':
+        config_path.write_text('{"text_config":')
+    elif case == 'invalid_json':
+        config_path.write_text('not json')
+    elif case == 'non_object':
+        config_path.write_text('[]')
+    elif case == 'missing_text_config':
+        config_path.write_text(json.dumps({'compression_config': {}}))
+    elif case == 'null_text_config':
+        config_path.write_text(json.dumps({'text_config': None}))
+    elif case == 'non_object_text_config':
+        config_path.write_text(json.dumps({'text_config': []}))
+    elif case == 'incomplete_text_config':
+        config_path.write_text(json.dumps({
+            'text_config': {},
+            'compression_config': {'quant_method': 'slimquant_w4a8'},
+        }))
+    elif case == 'malformed_nested_config':
+        raw = json.loads(config_path.read_text())
+        raw['text_config']['linear_attn_config'] = []
+        config_path.write_text(json.dumps(raw))
+    elif case == 'invalid_expert_count':
+        raw = json.loads(config_path.read_text())
+        raw['text_config']['num_experts'] = 'two'
+        config_path.write_text(json.dumps(raw))
+    elif case == 'invalid_quantization_config':
+        raw = json.loads(config_path.read_text())
+        raw['quantization_config'] = []
+        config_path.write_text(json.dumps(raw))
+    elif case == 'unreadable':
+        original_read_text = Path.read_text
+
+        def deny_config_read(path, *args, **kwargs):
+            if path == config_path:
+                raise PermissionError('fixture unreadable config')
+            return original_read_text(path, *args, **kwargs)
+
+        monkeypatch.setattr(Path, 'read_text', deny_config_read)
+
+    output = tmp_path / 'audit.json'
+    monkeypatch.setattr(sys, 'argv', [
+        'audit_kimi_k3_checkpoint.py', str(tmp_path), '--output', str(output)
+    ])
+
+    assert audit_module.main() == 1
+    report = json.loads(output.read_text())
+    assert report['passed'] is False
+    assert report['errors']
+    assert report['mapping_contracts'] == {}
+
+
+@pytest.mark.parametrize('case', ['missing', 'unreadable', 'invalid_json'])
+def test_cli_writes_structured_report_for_invalid_index(tmp_path, monkeypatch, case):
+    _write(tmp_path)
+    index_path = tmp_path / 'model.safetensors.index.json'
+    if case == 'missing':
+        index_path.unlink()
+    elif case == 'invalid_json':
+        index_path.write_text('{"weight_map":')
+    elif case == 'unreadable':
+        original_read_text = Path.read_text
+
+        def deny_index_read(path, *args, **kwargs):
+            if path == index_path:
+                raise PermissionError('fixture unreadable index')
+            return original_read_text(path, *args, **kwargs)
+
+        monkeypatch.setattr(Path, 'read_text', deny_index_read)
+
+    output = tmp_path / 'audit.json'
+    monkeypatch.setattr(sys, 'argv', [
+        'audit_kimi_k3_checkpoint.py', str(tmp_path), '--output', str(output)
+    ])
+
+    assert audit_module.main() == 1
+    report = json.loads(output.read_text())
+    assert report['passed'] is False
+    assert any('model.safetensors.index.json' in error for error in report['errors'])
+
+
 @pytest.mark.parametrize('bad_shard', [None, 0, False, [], {}, '', '\0'])
 def test_cli_reports_invalid_shard_names(tmp_path, monkeypatch, bad_shard):
     _write(tmp_path)
