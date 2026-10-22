@@ -681,6 +681,127 @@ def prepare_vllm_w4a8_moe(
     return layer.w13_weight, layer.w2_weight
 
 
+_CLAMPED_W4A8_TRITON_EXPERTS_CLS: type | None = None
+
+
+def _clamped_w4a8_triton_experts_cls() -> type:
+    """Return Triton experts that quantize after TP/EP preparation.
+
+    The stock modular Triton experts normally receive an already quantized
+    activation from prepare/finalize.  W4A8 is routed here only after the
+    packed checkpoint weights have been expanded, so keeping the activation
+    unquantized through preparation lets the experts own the dynamic INT8
+    quantization while retaining the upstream clamp-aware activation.
+    """
+
+    global _CLAMPED_W4A8_TRITON_EXPERTS_CLS
+    if _CLAMPED_W4A8_TRITON_EXPERTS_CLS is None:
+        from vllm.model_executor.layers.fused_moe.experts.triton_moe import (
+            TritonExperts,
+        )
+
+        class ClampedW4A8TritonExperts(TritonExperts):
+            @property
+            def expects_unquantized_inputs(self) -> bool:
+                return True
+
+        _CLAMPED_W4A8_TRITON_EXPERTS_CLS = ClampedW4A8TritonExperts
+    return _CLAMPED_W4A8_TRITON_EXPERTS_CLS
+
+
+def _apply_vllm_w4a8_moe_with_clamp(
+    *,
+    method: object,
+    layer: object,
+    hidden_states: torch.Tensor,
+    w1: torch.Tensor,
+    w2: torch.Tensor,
+    topk_weights: torch.Tensor,
+    topk_ids: torch.Tensor,
+    swiglu_limit: float,
+) -> torch.Tensor:
+    """Run unpacked W4A8 through clamp-aware modular Triton experts."""
+
+    import vllm.model_executor.layers.fused_moe.modular_kernel as mk
+    from vllm.model_executor.layers.fused_moe.activation import MoEActivation
+    from vllm.model_executor.layers.fused_moe.all2all_utils import (
+        maybe_make_prepare_finalize,
+    )
+    from vllm.model_executor.layers.fused_moe.config import FusedMoEQuantConfig
+
+    moe = getattr(method, "moe", None)
+    quant_config = getattr(method, "moe_quant_config", None)
+    if moe is None or quant_config is None:
+        raise HcuCompressedTensorsMoeError(
+            "clamped SlimQuant W4A8 Triton requires MoE configuration"
+        )
+    w1_scale = _required_tensor(quant_config, "w1_scale")
+    w2_scale = _required_tensor(quant_config, "w2_scale")
+    kernel_key = (
+        id(quant_config),
+        tuple(w1.shape),
+        tuple(w2.shape),
+        float(swiglu_limit),
+    )
+    cached = getattr(method, "_hcu_clamped_w4a8_triton_kernel", None)
+    cached_key = getattr(method, "_hcu_clamped_w4a8_triton_kernel_key", None)
+    if cached is None or cached_key != kernel_key:
+        triton_quant_config = FusedMoEQuantConfig.make(
+            torch.int8,
+            w1_scale=w1_scale * 16.0,
+            w2_scale=w2_scale * 16.0,
+            a1_scale=getattr(quant_config, "a1_scale", None),
+            a2_scale=getattr(quant_config, "a2_scale", None),
+            per_act_token_quant=True,
+            per_out_ch_quant=False,
+            block_shape=None,
+            weight_dtype="int4",
+            gemm1_clamp_limit=float(swiglu_limit),
+        )
+        prepare_finalize = maybe_make_prepare_finalize(
+            moe=moe,
+            quant_config=triton_quant_config,
+            allow_new_interface=True,
+            use_monolithic=False,
+        )
+        if prepare_finalize is None:
+            raise HcuCompressedTensorsMoeError(
+                "clamped SlimQuant W4A8 Triton prepare/finalize is unavailable"
+            )
+        experts = _clamped_w4a8_triton_experts_cls()(
+            moe_config=moe,
+            quant_config=triton_quant_config,
+        )
+        cached = mk.FusedMoEKernel(prepare_finalize, experts)
+        method._hcu_clamped_w4a8_triton_kernel = cached
+        method._hcu_clamped_w4a8_triton_kernel_key = kernel_key
+
+    activation = getattr(moe, "activation", MoEActivation.SILU)
+    if not isinstance(activation, MoEActivation):
+        activation = MoEActivation.from_str(
+            str(getattr(activation, "value", activation))
+        )
+    global_num_experts = int(
+        getattr(layer, "global_num_experts", getattr(moe, "num_experts", -1))
+    )
+    expert_map = getattr(layer, "_expert_map", getattr(layer, "expert_map", None))
+    return cached.apply(
+        hidden_states=hidden_states,
+        w1=w1,
+        w2=w2,
+        topk_weights=topk_weights,
+        topk_ids=topk_ids,
+        activation=activation,
+        global_num_experts=global_num_experts,
+        expert_map=expert_map,
+        apply_router_weight_on_input=bool(
+            getattr(layer, "apply_router_weight_on_input", False)
+        ),
+        shared_experts=None,
+        shared_experts_input=None,
+    )
+
+
 def apply_aiter_w4a8_moe(
     method: object,
     layer: object,
@@ -806,6 +927,18 @@ def apply_aiter_w4a8_moe(
         else:
             fallback_weights = _vllm_w4a8_fallback_weights(w1, w2)
         fallback_w1, fallback_w2 = fallback_weights
+        swiglu_limit = getattr(getattr(method, "moe", None), "swiglu_limit", None)
+        if swiglu_limit is not None and float(swiglu_limit) > 0:
+            return _apply_vllm_w4a8_moe_with_clamp(
+                method=method,
+                layer=layer,
+                hidden_states=hidden_states,
+                w1=fallback_w1,
+                w2=fallback_w2,
+                topk_weights=topk_weights,
+                topk_ids=topk_ids,
+                swiglu_limit=float(swiglu_limit),
+            )
         from vllm.model_executor.layers.fused_moe.fused_moe import (
             fused_experts_impl,
         )
@@ -873,6 +1006,7 @@ def apply_aiter_w4a8_moe(
         routed_scaling_factor=1.0,
         use_weight_shuffle=bool(getattr(aiter_config, "need_shuffle", False)),
         output_dtype=hidden_states.dtype,
+        gemm1_limit=getattr(getattr(method, "moe", None), "swiglu_limit", None),
     )
 
 

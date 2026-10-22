@@ -187,6 +187,7 @@ class SlimQuantW4A8Int8AiterMoEMethod(FusedMoEMethodBase):
             per_out_ch_quant=False,
             block_shape=None,
             weight_dtype="int4",
+            gemm1_clamp_limit=getattr(self.moe, "swiglu_limit", None),
         )
         return self.moe_quant_config
 

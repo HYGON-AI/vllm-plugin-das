@@ -4121,6 +4121,7 @@ def test_slimquant_w4a8_moe_quant_config_uses_int4_weight_contract(
         slimquant_w4a8, "FusedMoEQuantConfig", FusedMoEQuantConfig
     )
     method = object.__new__(slimquant_w4a8.SlimQuantW4A8Int8AiterMoEMethod)
+    method.moe = SimpleNamespace(swiglu_limit=10.0)
     layer = SimpleNamespace(
         w13_weight_scale=torch.ones(2, 4, 1),
         w2_weight_scale=torch.ones(2, 2, 1),
@@ -4145,6 +4146,7 @@ def test_slimquant_w4a8_moe_quant_config_uses_int4_weight_contract(
     assert call["per_out_ch_quant"] is False
     assert call["block_shape"] is None
     assert call["weight_dtype"] == "int4"
+    assert call["gemm1_clamp_limit"] == 10.0
 
 
 @pytest.mark.hcu
@@ -5474,7 +5476,7 @@ def test_slimquant_w4a8_legacy_raw_weights_pin_actual_m_to_moe_c(
     w1_scale = torch.ones((2, 8, 1))
     w2_scale = torch.ones((2, 4, 1))
     method = SimpleNamespace(
-        moe=SimpleNamespace(num_experts=2),
+        moe=SimpleNamespace(num_experts=2, swiglu_limit=10.0),
         moe_quant_config=SimpleNamespace(
             w1_scale=w1_scale,
             w2_scale=w2_scale,
@@ -5515,6 +5517,39 @@ def test_slimquant_w4a8_legacy_raw_weights_pin_actual_m_to_moe_c(
     assert execute["w2"] is w2
     assert execute["w1_scale"] is w1_scale
     assert execute["w2_scale"] is w2_scale
+    assert execute["gemm1_limit"] == 10.0
+
+
+@pytest.mark.hcu
+def test_slimquant_w4a8_triton_activation_preserves_hyv4_clamp():
+    from vllm.model_executor.layers.fused_moe.activation import MoEActivation
+    from vllm.model_executor.layers.fused_moe.experts.triton_moe import (
+        TritonExperts,
+    )
+    from vllm_hcu.model_executor.layers.quantization import slimquant_w4a8
+
+    method = object.__new__(slimquant_w4a8.SlimQuantW4A8Int8AiterMoEMethod)
+    method.moe = SimpleNamespace(swiglu_limit=10.0)
+    layer = SimpleNamespace(
+        w13_weight_scale=torch.ones(1, 4, 1),
+        w2_weight_scale=torch.ones(1, 2, 1),
+        w13_input_scale=None,
+        w2_input_scale=None,
+    )
+    quant_config = method.get_fused_moe_quant_config(layer)
+    experts = object.__new__(TritonExperts)
+    experts.quant_config = quant_config
+    experts.gemm1_alpha = 1.0
+    experts.gemm1_beta = 0.0
+    intermediate = torch.tensor([[20.0, -20.0, 20.0, -20.0]])
+    output = torch.empty(1, 2)
+
+    experts.activation(MoEActivation.SILU, output, intermediate)
+
+    expected = torch.nn.functional.silu(
+        torch.tensor([[10.0, -20.0]])
+    ) * torch.tensor([[10.0, -10.0]])
+    torch.testing.assert_close(output, expected)
 
 
 @pytest.mark.hcu
@@ -5656,6 +5691,151 @@ def test_slimquant_w4a8_actual_m_no_config_uses_cached_selection_and_triton(
     torch.testing.assert_close(
         kwargs["w2_scale"], torch.full((1, 4, 1), 16.0)
     )
+
+
+@pytest.mark.hcu
+def test_slimquant_w4a8_triton_fallback_routes_clamp_to_modular_experts(
+    monkeypatch: pytest.MonkeyPatch,
+):
+    from vllm.model_executor.layers.fused_moe import fused_moe
+
+    class MoeQuantType:
+        W4A8 = "w4a8"
+
+    monkeypatch.setitem(
+        sys.modules,
+        "aiter.moe",
+        _module(
+            "aiter.moe",
+            MoeQuantType=MoeQuantType,
+            get_aiter_moe_config=lambda **_: (False, None),
+        ),
+    )
+    monkeypatch.setattr(
+        fused_moe,
+        "fused_experts_impl",
+        lambda *args, **kwargs: pytest.fail(
+            "clamped W4A8 must not use the clamp-unaware functional Triton path"
+        ),
+    )
+    calls: list[dict[str, object]] = []
+    expected = torch.full((2, 4), 7.0, dtype=torch.float16)
+
+    def apply_clamped(**kwargs: object) -> torch.Tensor:
+        calls.append(kwargs)
+        return expected
+
+    monkeypatch.setattr(
+        compressed_tensors_moe_runtime,
+        "_apply_vllm_w4a8_moe_with_clamp",
+        apply_clamped,
+        raising=False,
+    )
+    method = SimpleNamespace(
+        moe=SimpleNamespace(num_experts=1, swiglu_limit=10.0),
+        moe_quant_config=SimpleNamespace(
+            w1_scale=torch.ones((1, 4, 1)),
+            w2_scale=torch.ones((1, 4, 1)),
+            a1_scale=None,
+            a2_scale=None,
+        ),
+    )
+    packed_w1 = torch.zeros((1, 4, 2), dtype=torch.int8)
+    packed_w2 = torch.zeros((1, 4, 1), dtype=torch.int8)
+    layer = SimpleNamespace(
+        w13_weight=packed_w1,
+        w2_weight=packed_w2,
+        global_num_experts=1,
+        _expert_map=None,
+        expert_mask=None,
+    )
+    x = torch.zeros((2, 4), dtype=torch.float16)
+    topk_weights = torch.ones((2, 1), dtype=torch.float32)
+    topk_ids = torch.zeros((2, 1), dtype=torch.int32)
+
+    actual = compressed_tensors_moe_runtime.apply_aiter_w4a8_moe(
+        method, layer, x, topk_weights, topk_ids
+    )
+
+    assert actual is expected
+    assert len(calls) == 1
+    assert calls[0]["method"] is method
+    assert calls[0]["layer"] is layer
+    assert calls[0]["hidden_states"] is x
+    assert calls[0]["topk_weights"] is topk_weights
+    assert calls[0]["topk_ids"] is topk_ids
+    assert calls[0]["swiglu_limit"] == 10.0
+    assert calls[0]["w1"].shape == (1, 4, 4)
+    assert calls[0]["w2"].shape == (1, 4, 2)
+
+
+@pytest.mark.hcu
+def test_slimquant_w4a8_builds_real_clamp_aware_triton_kernel(
+    monkeypatch: pytest.MonkeyPatch,
+):
+    import vllm.model_executor.layers.fused_moe.modular_kernel as mk
+    from vllm.model_executor.layers.fused_moe.activation import MoEActivation
+
+    parallel = SimpleNamespace(
+        use_all2all_kernels=False,
+        dp_size=1,
+        use_ep=False,
+    )
+    moe = SimpleNamespace(
+        moe_parallel_config=parallel,
+        activation=MoEActivation.SILU,
+        num_experts=1,
+        swiglu_limit=10.0,
+    )
+    method = SimpleNamespace(
+        moe=moe,
+        moe_quant_config=SimpleNamespace(
+            w1_scale=torch.ones((1, 4, 1)),
+            w2_scale=torch.full((1, 4, 1), 2.0),
+            a1_scale=None,
+            a2_scale=None,
+        ),
+    )
+    layer = SimpleNamespace(
+        global_num_experts=1,
+        _expert_map=None,
+        apply_router_weight_on_input=False,
+    )
+    x = torch.zeros((2, 4), dtype=torch.float16)
+    expected = x + 5
+    captured: dict[str, object] = {}
+
+    def fake_apply(kernel, **kwargs: object) -> torch.Tensor:
+        captured["experts"] = kernel.fused_experts
+        captured["kwargs"] = kwargs
+        return expected
+
+    monkeypatch.setattr(mk.FusedMoEKernel, "apply", fake_apply)
+
+    actual = compressed_tensors_moe_runtime._apply_vllm_w4a8_moe_with_clamp(
+        method=method,
+        layer=layer,
+        hidden_states=x,
+        w1=torch.zeros((1, 4, 4), dtype=torch.int8),
+        w2=torch.zeros((1, 4, 2), dtype=torch.int8),
+        topk_weights=torch.ones((2, 1), dtype=torch.float32),
+        topk_ids=torch.zeros((2, 1), dtype=torch.int32),
+        swiglu_limit=10.0,
+    )
+
+    assert actual is expected
+    experts = captured["experts"]
+    assert experts.expects_unquantized_inputs is True
+    assert experts.quant_config.gemm1_clamp_limit == 10.0
+    torch.testing.assert_close(
+        experts.quant_config.w1_scale,
+        torch.full((1, 4, 1), 16.0),
+    )
+    torch.testing.assert_close(
+        experts.quant_config.w2_scale,
+        torch.full((1, 4, 1), 32.0),
+    )
+    assert captured["kwargs"]["activation"] is MoEActivation.SILU
 
 
 @pytest.mark.hcu
