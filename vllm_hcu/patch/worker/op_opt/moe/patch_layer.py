@@ -5,6 +5,7 @@
 from __future__ import annotations
 
 import functools
+import inspect
 import sys
 from types import ModuleType
 
@@ -34,6 +35,44 @@ _FACTORY_MARKER = "_vllm_hcu_moe_layer_factory"
 _EXPERT_MAP_MARKER = "_vllm_hcu_moe_layer_expert_map"
 _GET_WEIGHTS_MARKER = "_vllm_hcu_moe_layer_get_weights"
 _LOAD_WEIGHTS_MARKER = "_vllm_hcu_moe_layer_load_weights"
+
+
+def _adapt_kimi_runner_forward_entry(runner) -> None:
+    """Bridge Kimi's six-argument runner call to v0.28's ten-argument op."""
+
+    runner_type = type(runner)
+    if (
+        runner_type.__name__ != "ROCmLatentMoERunner"
+        or not runner_type.__module__.startswith("vllm.models.kimi_k3.amd.")
+        or getattr(runner, "_vllm_hcu_kimi_moe_entry_adapted", False)
+    ):
+        return
+    forward_entry = getattr(runner, "_forward_entry", None)
+    if forward_entry is None:
+        raise PatchCompatibilityError(
+            "Kimi ROCmLatentMoERunner has no _forward_entry callable"
+        )
+
+    @functools.wraps(forward_entry)
+    def hcu_kimi_forward_entry(*args, **kwargs):
+        if kwargs or len(args) != 6:
+            return forward_entry(*args, **kwargs)
+        hidden_states, router_logits, shared_input, input_ids, layer_name, hidden_dim = args
+        return forward_entry(
+            hidden_states,
+            router_logits,
+            shared_input,
+            input_ids,
+            None,  # quanted_hidden_states
+            None,  # scale
+            None,  # topk_weights
+            None,  # topk_ids
+            layer_name,
+            hidden_dim,
+        )
+
+    runner._forward_entry = hcu_kimi_forward_entry
+    runner._vllm_hcu_kimi_moe_entry_adapted = True
 
 
 def apply_to_module(module: ModuleType) -> bool:
@@ -178,8 +217,96 @@ def apply_to_module(module: ModuleType) -> bool:
 
     @functools.wraps(factory)
     def hcu_factory(*args, **kwargs):
-        runner = factory(*args, **kwargs)
+        from vllm.config import get_current_vllm_config_or_none
+        from vllm_hcu.deepseek_v4_runtime import model_architectures
+
+        vllm_config = get_current_vllm_config_or_none()
+        model_config = getattr(vllm_config, "model_config", None)
+        hf_config = getattr(model_config, "hf_config", None)
+        architectures = model_architectures(vllm_config)
+        is_native_deepseek_v4 = not {
+            "DeepseekV4ForCausalLM",
+            "DeepSeekV4MTPModel",
+        }.isdisjoint(architectures)
+        # init_vllm_registered_model installs the inner text config while
+        # constructing Kimi-K3's language model (model_type="kimi_linear").
+        is_kimi_k3 = getattr(hf_config, "model_type", None) in (
+            "kimi_k3", "kimi_linear"
+        )
+        parallel_config = getattr(vllm_config, "parallel_config", None)
+        if is_kimi_k3 and bool(getattr(parallel_config, "enable_eplb", False)):
+            eplb_config = getattr(parallel_config, "eplb_config", None)
+            if eplb_config is None:
+                raise PatchCompatibilityError(
+                    "Kimi-K3 EPLB is enabled without a vLLM EPLBConfig"
+                )
+            try:
+                bound = inspect.signature(factory).bind_partial(*args, **kwargs)
+            except TypeError as exc:
+                raise PatchCompatibilityError(
+                    "Cannot bind Kimi-K3 FusedMoEFactory EPLB arguments"
+                ) from exc
+            if "enable_eplb" not in bound.arguments:
+                bound.arguments["enable_eplb"] = True
+            elif not bound.arguments["enable_eplb"]:
+                raise PatchCompatibilityError(
+                    "Kimi-K3 FusedMoEFactory explicitly disabled EPLB while "
+                    "the vLLM parallel config enables it"
+                )
+            redundant = int(eplb_config.num_redundant_experts)
+            if "num_redundant_experts" in bound.arguments and int(
+                bound.arguments["num_redundant_experts"]
+            ) != redundant:
+                raise PatchCompatibilityError(
+                    "Kimi-K3 FusedMoEFactory redundant expert count disagrees "
+                    "with the vLLM EPLBConfig"
+                )
+            bound.arguments["num_redundant_experts"] = redundant
+            runner = factory(*bound.args, **bound.kwargs)
+        else:
+            runner = factory(*args, **kwargs)
+        _adapt_kimi_runner_forward_entry(runner)
         experts = runner.routed_experts
+        moe_config = getattr(experts, "moe_config", None)
+        # Kernel construction can be deferred until checkpoint post-load,
+        # after vLLM's temporary current-config scope has ended. Persist this
+        # model-specific workspace contract on the long-lived MoE config while
+        # model construction still has an authoritative VllmConfig.
+        global_ht_token_bound = bool(
+            is_native_deepseek_v4
+            and int(getattr(moe_config, "pcp_size", 1) or 1) > 1
+        )
+        if moe_config is not None:
+            setattr(
+                moe_config,
+                "_hcu_global_ht_token_bound",
+                global_ht_token_bound,
+            )
+            setattr(moe_config, "_hcu_model_architectures", architectures)
+        activation_value = getattr(moe_config, "activation", None)
+        activation = getattr(activation_value, "value", activation_value)
+        # FusedMoEFactory may run after the current VllmConfig context has
+        # ended. v0.28.1 carries SiTU's explicit beta fields on FusedMoEConfig;
+        # preserve the exact SiTU route identity there as a fail-closed signal
+        # for the SlimQuant adapter and DeepEP HT scale owner.
+        if is_kimi_k3 or activation == "situ":
+            # The quant method is constructed from this same config object and
+            # weights are processed after the current-config context ends.
+            # Also tag the method's owner directly in case vLLM supplies a
+            # distinct config reference to the quantization wrapper.
+            if moe_config is not None:
+                setattr(moe_config, "_hcu_kimi_k3", True)
+            method_moe = getattr(experts.quant_method, "moe", None)
+            if method_moe is not None:
+                setattr(method_moe, "_hcu_kimi_k3", True)
+        method_moe = getattr(experts.quant_method, "moe", None)
+        if method_moe is not None and method_moe is not moe_config:
+            setattr(
+                method_moe,
+                "_hcu_global_ht_token_bound",
+                global_ht_token_bound,
+            )
+            setattr(method_moe, "_hcu_model_architectures", architectures)
         if type(experts.quant_method) is not official_unquantized_cls:
             return runner
         if bool(getattr(experts, "apply_router_weight_on_input", False)):
@@ -195,10 +322,31 @@ def apply_to_module(module: ModuleType) -> bool:
     @functools.wraps(get_weights)
     def hcu_get_expert_weights(self):
         if getattr(self, "_dsv4_channel_deepgemm_repacked", False):
-            names = ("w13_weight", "w2_weight", "w13_weight_scale", "w2_weight_scale")
+            names = [
+                "w13_weight",
+                "w2_weight",
+                "w13_weight_scale",
+                "w2_weight_scale",
+            ]
+            if (
+                getattr(self, "_dsv4_channel_deepgemm_layout", None)
+                == "contiguous+masked"
+            ):
+                # The auto kernel keeps independent HT and LL packed copies
+                # when their layouts cannot be shared. Both copies must move
+                # in the same online EPLB transaction before routing maps are
+                # committed.
+                names.extend(
+                    (
+                        "_dsv4_channel_deepgemm_masked_w13",
+                        "_dsv4_channel_deepgemm_masked_w2",
+                    )
+                )
             weights = [getattr(self, name, None) for name in names]
             if all(weight is not None for weight in weights):
-                return [weight.view(self.local_num_experts, -1) for weight in weights]
+                return [
+                    weight.view(self.local_num_experts, -1) for weight in weights
+                ]
             missing = [name for name, value in zip(names, weights) if value is None]
             raise RuntimeError(
                 "HCU DeepGEMM repacked layer is missing expert weights: "

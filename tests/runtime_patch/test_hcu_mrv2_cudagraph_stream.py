@@ -5,8 +5,12 @@ from __future__ import annotations
 
 from types import ModuleType, SimpleNamespace
 
+import pytest
+
+from vllm_hcu.patch.config import HcuFeatureConfig
 from vllm_hcu.patch.worker.framework_opt.patch_mrv2_cudagraph_stream import (
     apply_to_module,
+    use_torch_collectives_for_warmup,
 )
 
 
@@ -65,3 +69,102 @@ def test_non_mrv2_graph_calls_keep_their_default_stream_behavior() -> None:
 
     assert len(calls) == 2
     assert [kwargs for _, kwargs in calls] == [{}, {}]
+
+
+@pytest.mark.parametrize("disabled", [False, True])
+def test_warmup_collective_scope_restores_communicator_on_error(monkeypatch, disabled):
+    import vllm.distributed
+
+    comm = SimpleNamespace(disabled=disabled)
+    monkeypatch.setattr(
+        vllm.distributed,
+        "get_tp_group",
+        lambda: SimpleNamespace(device_communicator=SimpleNamespace(pynccl_comm=comm)),
+    )
+    with pytest.raises(RuntimeError, match="warmup failed"):
+        with use_torch_collectives_for_warmup():
+            assert comm.disabled is True
+            raise RuntimeError("warmup failed")
+    assert comm.disabled is disabled
+
+
+def test_capture_uses_separate_collectives_only_in_eager_warmup(monkeypatch):
+    import vllm.distributed
+
+    comm = SimpleNamespace(disabled=False)
+    monkeypatch.setattr(
+        vllm.distributed,
+        "get_tp_group",
+        lambda: SimpleNamespace(device_communicator=SimpleNamespace(pynccl_comm=comm)),
+    )
+    module, _, _ = _make_target_module()
+    exec(
+        "def capture(self, create_forward_fn, progress_bar_desc='Capturing CUDA graphs'):\n"
+        "    create_forward_fn(4, True)('eager')\n"
+        "    graph = torch.cuda.CUDAGraph()\n"
+        "    torch.cuda.graph(graph, self.pool)\n"
+        "    create_forward_fn(4, False)('capture')\n",
+        module.__dict__,
+    )
+    module.CudaGraphManager.capture = module.capture
+    observed = []
+
+    def factory(desc, warmup):
+        # Preparation and captured forward retain the original communicator.
+        assert comm.disabled is False
+        return lambda mode: observed.append((mode, comm.disabled))
+
+    assert apply_to_module(module) is True
+    module.CudaGraphManager().capture(factory)
+    assert observed == [("eager", True), ("capture", False)]
+    assert comm.disabled is False
+
+
+def test_full_capture_none_calls_bind_deepep_auto_low_latency(monkeypatch):
+    import vllm.distributed
+    from vllm.config.compilation import CUDAGraphMode
+    from vllm_hcu.forward_context_runtime import choose_deepep_auto_low_latency
+
+    comm = SimpleNamespace(disabled=False)
+    monkeypatch.setattr(
+        vllm.distributed,
+        "get_tp_group",
+        lambda: SimpleNamespace(device_communicator=SimpleNamespace(pynccl_comm=comm)),
+    )
+    module, _, _ = _make_target_module()
+    exec(
+        "def capture(self, create_forward_fn, progress_bar_desc='Capturing CUDA graphs'):\n"
+        "    create_forward_fn(self.capture_desc, True)(self.none_mode)\n"
+        "    graph = torch.cuda.CUDAGraph()\n"
+        "    torch.cuda.graph(graph, self.pool)\n"
+        "    create_forward_fn(self.capture_desc, False)(self.none_mode)\n",
+        module.__dict__,
+    )
+    module.CudaGraphManager.capture = module.capture
+    config = SimpleNamespace(
+        additional_config={
+            "hcu": HcuFeatureConfig(deepep_auto=True).to_dict()
+        },
+        model_config=SimpleNamespace(architectures=[]),
+        parallel_config=SimpleNamespace(data_parallel_size=1),
+    )
+    observed = []
+
+    def factory(desc, warmup):
+        return lambda mode: observed.append(
+            choose_deepep_auto_low_latency(
+                config,
+                32,
+                None,
+                None,
+                cudagraph_runtime_mode=mode,
+            )
+        )
+
+    assert apply_to_module(module) is True
+    manager = module.CudaGraphManager()
+    manager.capture_desc = SimpleNamespace(cg_mode=CUDAGraphMode.FULL)
+    manager.none_mode = CUDAGraphMode.NONE
+    manager.capture(factory)
+
+    assert observed == [True, True]

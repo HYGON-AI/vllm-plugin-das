@@ -247,6 +247,7 @@ class HCUPlatform(Platform):
         "awq_marlin",  # will be overwritten with awq
         "gptq",
         "gptq_marlin",  # will be overwritten with gptq
+        "auto_gptq",  # current vLLM resolves compatible GPTQ checkpoints here
         "fp8",
         "deepseek_v4_fp8",
         "compressed-tensors",
@@ -462,6 +463,25 @@ class HCUPlatform(Platform):
         return AttentionBackendEnum.TORCH_SDPA
     
     @classmethod
+    def get_default_ir_op_priority(
+        cls, vllm_config: "VllmConfig"
+    ) -> "IrOpPriorityConfig":
+        from vllm.config.kernel import IrOpPriorityConfig
+
+        model_config = getattr(vllm_config, "model_config", None)
+        hf_config = getattr(model_config, "hf_config", None)
+        if getattr(hf_config, "model_type", None) not in ("kimi_k3", "kimi_linear"):
+            return super().get_default_ir_op_priority(vllm_config)
+
+        # HCU Kimi runs may request torch.compile but fall back at runtime.
+        # Prefer the same ROCm C kernels used by the source path rather than
+        # selecting native decomposition solely from the requested mode.
+        default = ["vllm_c", "native"]
+        return IrOpPriorityConfig.with_default(
+            default, rms_norm=default, fused_add_rms_norm=default
+        )
+
+    @classmethod
     def use_custom_allreduce(cls) -> bool:
         # We only enable custom allreduce for MI300 series
         # return any(gfx in _GCN_ARCH for gfx in ["gfx94", "gfx95"])
@@ -647,6 +667,16 @@ class HCUPlatform(Platform):
                     "Overriding cudagraph_mode to PIECEWISE."
                 )
                 compilation_config.cudagraph_mode = CUDAGraphMode.PIECEWISE
+
+        # PCP/DCP normalization above runs after CompilationConfig's splitting
+        # callback. Reapply the same bound DeepEP-auto policy so PIECEWISE
+        # cannot reintroduce HT capture or route mixed/prefill FULL graphs to
+        # the capacity-limited LL delegate.
+        from vllm_hcu.patch.platform.core_fix.patch_compilation_config import (
+            normalize_bound_deepep_auto_cudagraph_mode,
+        )
+
+        normalize_bound_deepep_auto_cudagraph_mode(vllm_config)
 
         if cache_config and not cache_config.user_specified_block_size:
             backend = vllm_config.attention_config.backend

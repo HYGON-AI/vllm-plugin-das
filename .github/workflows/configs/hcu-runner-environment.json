@@ -1,15 +1,18 @@
 {
   "schema_version": 1,
-  "python": "3.10.12",
+  "python": {
+    "match": "exact",
+    "versions": ["3.10.12", "3.12.12"]
+  },
   "torch_hip": {
     "match": "prefix",
-    "version": "6.3."
+    "versions": ["6.3.", "7.2."]
   },
   "rocm": {
     "environment": "ROCM_PATH",
     "version_file": ".info/rocm_version",
     "match": "release_line",
-    "version": "26.04"
+    "versions": ["26.04", "26.10"]
   },
   "distributions": {
     "torch": {

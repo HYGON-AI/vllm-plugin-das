@@ -134,7 +134,9 @@ def _load_deep_gemm_apply():
     namespace: dict[str, object] = {
         "torch": torch,
         "mk": SimpleNamespace(ExpertTokensMetadata=object),
-        "MoEActivation": SimpleNamespace(SILU="silu", SWIGLUSTEP="swiglustep"),
+        "MoEActivation": SimpleNamespace(
+            SILU="silu", SITU="situ", SWIGLUSTEP="swiglustep"
+        ),
         "nullcontext": nullcontext,
         "_HCU_HT_EP_TOKEN_ALIGNMENT": 256,
         "_EP_FUSED_MOE": False,
@@ -310,7 +312,7 @@ def _load_batched_deep_gemm_apply():
     namespace: dict[str, object] = {
         "torch": torch,
         "mk": SimpleNamespace(ExpertTokensMetadata=object),
-        "MoEActivation": SimpleNamespace(SILU="silu"),
+        "MoEActivation": SimpleNamespace(SILU="silu", SITU="situ"),
         "_resize_cache": lambda tensor, shape: torch.zeros(
             shape, dtype=tensor.dtype
         ),
@@ -715,6 +717,56 @@ def test_w4a8_masked_packs_once_into_n32_view_without_replacing_parameters(
     assert replacement._deepgemm_w2 is experts._deepgemm_w2
 
 
+def test_kimi_ll_n32_view_tracks_in_place_eplb_weight_owner(
+    monkeypatch: pytest.MonkeyPatch,
+):
+    from vllm_hcu.model_executor.layers.quantization import (
+        slimquant_w4a8_deepgemm_runtime as module,
+    )
+
+    layer = torch.nn.Module()
+    layer.w13_weight = torch.nn.Parameter(
+        torch.zeros((1, 128, 32), dtype=torch.int8), requires_grad=False
+    )
+    layer.w2_weight = torch.nn.Parameter(
+        torch.zeros((1, 64, 32), dtype=torch.int8), requires_grad=False
+    )
+    layer.w13_weight_scale = torch.nn.Parameter(
+        torch.ones((1, 128, 1), dtype=torch.float32), requires_grad=False
+    )
+    layer.w2_weight_scale = torch.nn.Parameter(
+        torch.ones((1, 64, 1), dtype=torch.float32), requires_grad=False
+    )
+    owners = (layer.w13_weight, layer.w2_weight)
+
+    def pack(weight: torch.Tensor) -> torch.Tensor:
+        weight.add_(11)
+        return weight
+
+    def n32_view(weight: torch.Tensor) -> torch.Tensor:
+        experts, n, k_half = weight.shape
+        return weight.view(experts, k_half // 32, n // 32, 4, 32, 8)
+
+    monkeypatch.setattr(module, "pack_w4a8_moe_hipc_weight", pack)
+    monkeypatch.setattr(module, "view_w4a8_moe_hipc_weight_n32_layout", n32_view)
+    experts = object.__new__(module.KimiK3LLExperts)
+    experts._deepgemm_w13 = None
+    experts._deepgemm_w2 = None
+    experts.process_weights_after_loading(layer)
+
+    assert layer.w13_weight is owners[0]
+    assert layer.w2_weight is owners[1]
+    assert all(
+        view.untyped_storage().data_ptr() == owner.untyped_storage().data_ptr()
+        for view, owner in zip(
+            (experts._deepgemm_w13, experts._deepgemm_w2), owners
+        )
+    )
+    # Simulate EPLB copying new physical expert contents in place.
+    owners[0].fill_(29)
+    assert torch.all(experts._deepgemm_w13 == 29)
+
+
 def test_w4a8_masked_batched_apply_propagates_scales_and_token_counts(
     monkeypatch: pytest.MonkeyPatch,
 ):
@@ -871,3 +923,81 @@ def test_w4a8_masked_empty_dispatch_skips_all_kernels(
     )
 
     assert output.shape == (1, 0, 64)
+
+
+def test_kimi_ll_masked_apply_uses_situ_activation_and_eplb_token_mask(
+    monkeypatch: pytest.MonkeyPatch,
+):
+    activation_call: dict[str, object] = {}
+    gemm_calls: list[tuple[object, ...]] = []
+
+    def quantize(tensor, **kwargs):
+        activation_call.update(kwargs)
+        return (
+            torch.zeros((1, 2, 64), dtype=torch.int8),
+            torch.ones((1, 2, 1), dtype=torch.float32),
+        )
+
+    _install_categorized_lightop(
+        monkeypatch,
+        activation_name="fuse_silu_mul_quant_ep",
+        activation_kernel=lambda *_args: pytest.fail("SiLU path used for Kimi"),
+        gemm_name="unused_w4a8_gemm",
+        gemm_kernel=lambda *_args: None,
+    )
+    sys.modules["lightop.activation"].fuse_situ_mul_quant_ep = quantize
+    deepgemm = ModuleType("deepgemm")
+    deepgemm.__path__ = []
+    deepgemm.m_grouped_w4a8_gemm_nt_masked_hipc = (
+        lambda *args: gemm_calls.append(args)
+    )
+    monkeypatch.setitem(sys.modules, "deepgemm", deepgemm)
+
+    hcu = _load_batched_deep_gemm_apply()
+    hcu["current_platform"] = SimpleNamespace(is_rocm=lambda: True)
+    mask = torch.tensor([2], dtype=torch.int32)
+    experts = SimpleNamespace(
+        block_shape=None,
+        quant_config=SimpleNamespace(
+            use_int8_w8a8=True,
+            use_fp8_w8a8=False,
+            weight_quant_dtype="int4",
+            gemm1_clamp_limit=None,
+        ),
+        w1_scale=torch.ones((1, 128, 1), dtype=torch.float32),
+        w2_scale=torch.ones((1, 64, 1), dtype=torch.float32),
+        _deepgemm_w13=torch.empty((1, 1, 4, 4, 32, 8), dtype=torch.int8),
+        _deepgemm_w2=torch.empty((1, 1, 2, 4, 32, 8), dtype=torch.int8),
+        _hcu_logical_n=128,
+        _hcu_logical_k=64,
+        _hcu_situ_activation=True,
+        _hcu_situ_beta=1.25,
+        _hcu_situ_linear_beta=2.0,
+        moe_problem_size=lambda *_args: (1, 2, 128, 64, 1),
+        estimate_expected_m=lambda **_kwargs: 16,
+    )
+    output = torch.empty((1, 2, 64), dtype=torch.bfloat16)
+    hcu["apply"](
+        experts,
+        output=output,
+        hidden_states=torch.zeros((1, 2, 64), dtype=torch.int8),
+        w1=torch.empty((1, 128, 32), dtype=torch.int8),
+        w2=torch.empty((1, 64, 32), dtype=torch.int8),
+        topk_weights=torch.ones((2, 1)),
+        topk_ids=torch.zeros((2, 1), dtype=torch.int32),
+        activation="situ",
+        global_num_experts=1,
+        expert_map=None,
+        a1q_scale=torch.ones((1, 2, 1), dtype=torch.float32),
+        a2_scale=None,
+        workspace13=torch.empty(256, dtype=torch.bfloat16),
+        workspace2=torch.empty(256, dtype=torch.bfloat16),
+        expert_tokens_meta=SimpleNamespace(expert_num_tokens=mask),
+        apply_router_weight_on_input=False,
+    )
+    assert len(gemm_calls) == 2
+    assert gemm_calls[0][3] is mask and gemm_calls[1][3] is mask
+    assert activation_call["masked_m"] is mask
+    assert activation_call["situ_beta"] == 1.25
+    assert activation_call["situ_linear_beta"] == 2.0
+    assert activation_call["expect_m"] == 16

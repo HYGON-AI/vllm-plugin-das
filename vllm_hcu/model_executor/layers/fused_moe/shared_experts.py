@@ -25,7 +25,7 @@ from vllm.v1.worker.ubatching import (
     dbo_current_ubatch_id,
 )
 
-logger = init_logger(__name__)
+logger = init_logger("vllm.hcu.shared_experts")
 
 
 class SharedExpertsOrder(IntEnum):
@@ -127,12 +127,34 @@ class SharedExperts(torch.nn.Module):
             )
         return self._layer(shared_experts_input)
 
+    def _can_overlap_deepep_eplb(self) -> bool:
+        """Shared weights are independent of routed-expert EPLB moves.
+
+        Limit automatic overlap to quantized DeepEP inputs, an auxiliary
+        stream and the non-DBO schedule. The routed computation must not
+        overwrite the raw shared input; keep the existing safety callback.
+        """
+        parallel = self._moe_config.moe_parallel_config
+        return bool(
+            henvs.optional_custom_op_enabled(
+                henvs.VLLM_HCU_SHARED_EXPERTS_DEEPEP_EPLB_OVERLAP
+            )
+            and parallel.enable_eplb
+            and parallel.all2all_backend in ("deepep_auto", "deepep_high_throughput")
+            and not parallel.use_fi_nvl_two_sided_kernels
+            and not self.enable_dbo
+            and self._stream is not None
+            and self._is_multistream_safe()
+        )
+
     @property
     def _disable_shared_experts_overlap(self) -> bool:
         if (
             henvs.VLLM_HCU_USE_CUSTOM_OPS
             and henvs.VLLM_HCU_SHARED_EXPERTS_STREAM_FORCE
         ):
+            return False
+        if self._can_overlap_deepep_eplb():
             return False
         # Disable shared expert overlap if:
         #   - we are using eplb with non-default backend, because of correctness issues
@@ -166,9 +188,9 @@ class SharedExperts(torch.nn.Module):
             hidden_states
         )
         if (
-            force_stream
-            and should_run_shared_in_aux_stream
+            should_run_shared_in_aux_stream
             and self._is_multistream_safe()
+            and (force_stream or self._can_overlap_deepep_eplb())
         ):
             return SharedExpertsOrder.MULTI_STREAM_OVERLAPPED
 
@@ -238,8 +260,16 @@ class SharedExperts(torch.nn.Module):
 
             if (
                 henvs.VLLM_HCU_USE_CUSTOM_OPS
-                and henvs.VLLM_HCU_SHARED_EXPERTS_EARLY_LAUNCH
+                and (henvs.VLLM_HCU_SHARED_EXPERTS_EARLY_LAUNCH
+                     or self._can_overlap_deepep_eplb())
             ):
+                if self._can_overlap_deepep_eplb():
+                    logger.info_once(
+                        "Shared experts: early auxiliary-stream overlap enabled "
+                        "for quantized DeepEP with EPLB."
+                    )
+                # Launch before the gate/router, not after routed experts.
+                # output() performs the join only when consuming the result.
                 self._launch_in_aux_stream(
                     shared_experts_input,
                     x_and_scale_quanted=x_and_scale_quanted,
@@ -304,7 +334,8 @@ class SharedExperts(torch.nn.Module):
         if (
             order == SharedExpertsOrder.MULTI_STREAM_OVERLAPPED
             and henvs.VLLM_HCU_USE_CUSTOM_OPS
-            and henvs.VLLM_HCU_SHARED_EXPERTS_EARLY_LAUNCH
+            and (henvs.VLLM_HCU_SHARED_EXPERTS_EARLY_LAUNCH
+                 or self._can_overlap_deepep_eplb())
             and self._output[self._output_idx] is not None
         ):
             return None
