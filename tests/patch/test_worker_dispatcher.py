@@ -136,7 +136,6 @@ def test_worker_inventory_is_complete_explicit_and_dependency_ordered():
     framework_order = (
         "worker.framework_opt.model_loader.static_eplb_preload",
         "worker.framework_opt.model_loader.static_expert_mapping",
-        "worker.framework_opt.eplb.offline_expert_map",
         "worker.framework_opt.eplb.gloo_profile_reservation",
         "worker.framework_opt.dp.deepep_low_latency",
         "worker.framework_opt.forward_context.hcu_runtime_fields",
@@ -152,6 +151,9 @@ def test_worker_inventory_is_complete_explicit_and_dependency_ordered():
     assert tuple(positions[name] for name in framework_order) == tuple(
         sorted(positions[name] for name in framework_order)
     )
+    assert positions["worker.framework_opt.step5_eplb_state"] < positions[
+        "worker.framework_opt.eplb.offline_expert_map"
+    ]
 
     callback_specs = {
         spec.adapter
@@ -323,7 +325,7 @@ def test_prepare_is_lazy_narrow_idempotent_and_keeps_main_role():
         "'vllm.utils.deep_gemm',"
         "'vllm.v1.attention.backend',"
         "'vllm.v1.worker.dp_utils',"
-        "'vllm.v1.worker.ubatch_utils']; "
+        "'vllm.v1.worker.ubatch_utils'], initial_targets; "
         "assert not (business & sys.modules.keys()); "
         "first=prepare_worker_patches(); second=prepare_worker_patches(); "
         "print(json.dumps({'first':len(first),'second':len(second),"

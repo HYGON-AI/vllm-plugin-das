@@ -157,6 +157,32 @@ def test_hcu_flash_attention_loader_stubs_vendor_distribution_metadata(
     assert module.__name__ == "vllm_hcu.v1.attention.backends.flash_attn"
 
 
+@pytest.mark.parametrize("load_backend", [False, True])
+def test_cpu_attention_loaders_never_import_native_extension(monkeypatch, load_backend):
+    class RejectNativeImport:
+        def find_spec(self, fullname, path=None, target=None):
+            if fullname == "flash_attn_2_cuda":
+                raise AssertionError("Attempted to import the real FlashAttention binary")
+            return None
+
+    # Force a fresh boundary import even if another test already loaded it.
+    for name in ("flash_attn_2_cuda", "vllm_hcu.v1.attention.backends.fa_utils",
+                 "vllm_hcu.v1.attention.backends.flash_attn"):
+        monkeypatch.setitem(sys.modules, name, sys.modules.get(name))
+        monkeypatch.delitem(sys.modules, name)
+    monkeypatch.setattr(sys, "meta_path", [RejectNativeImport(), *sys.meta_path])
+    if load_backend:
+        _load_hcu_flash_attention_module(monkeypatch)
+        fa_utils = sys.modules["vllm_hcu.v1.attention.backends.fa_utils"]
+    else:
+        fa_utils, _ = _load_hcu_fa_utils_module(monkeypatch, kv_cache_layout="NHD")
+    native = sys.modules["flash_attn_2_cuda"]
+    assert fa_utils.flash_attn_2_cuda is native
+    assert native.__spec__.loader is None
+    with pytest.raises(AssertionError, match="must not execute native FlashAttention"):
+        native.varlen_fwd()
+
+
 @pytest.mark.parametrize(
     ("kv_cache_layout", "expected_fa_layout"),
     [("HND", "bhsd"), ("NHD", "bshd")],
@@ -564,13 +590,14 @@ def test_flash_attention_kernel_block_sizes_do_not_require_current_config(
 
     monkeypatch.setattr(flash_attn, "_get_flash_attn_mode", lambda: mode)
     monkeypatch.setattr(flash_attn, "get_current_vllm_config_or_none", lambda: None)
+    monkeypatch.setattr(flash_attn, "_get_flash_attn_mode", lambda: mode)
 
     sizes = backend.get_supported_kernel_block_sizes()
 
+    assert len(sizes) == 1
     if mode in ("varlen", "cutlass"):
         assert sizes == [64]
     else:
-        assert len(sizes) == 1
         assert isinstance(sizes[0], flash_attn.MultipleOf)
         assert sizes[0].base == 16
 

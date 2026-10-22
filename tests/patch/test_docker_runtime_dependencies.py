@@ -168,7 +168,7 @@ def test_dockerfile_copies_runtime_installer_before_framework_layer() -> None:
     assert "/tmp/requirements-vllm-runtime.txt" in instructions[framework_run]
 
 
-def test_dockerfile_installs_registered_test_dependencies() -> None:
+def test_dockerfile_installs_base_test_dependencies_without_evalscope() -> None:
     instructions = _dockerfile_instructions()
     requirements_copy = next(
         index
@@ -183,9 +183,13 @@ def test_dockerfile_installs_registered_test_dependencies() -> None:
     )
 
     assert requirements_copy < framework_run
-    assert "pip install --no-cache-dir -r /tmp/requirements-test.txt" in instructions[
-        framework_run
-    ]
+    run = instructions[framework_run]
+    exclusion = "grep -vi '^[[:space:]]*evalscope' /tmp/requirements-test.txt"
+    install = "pip install --no-cache-dir -r /tmp/requirements-ci-base.txt"
+    assert exclusion in run
+    assert install in run
+    assert run.index(exclusion) < run.index(install)
+    assert "pip install --no-cache-dir -r /tmp/requirements-test.txt" not in run
 
 
 def test_dockerfile_does_not_override_the_index_for_ray() -> None:

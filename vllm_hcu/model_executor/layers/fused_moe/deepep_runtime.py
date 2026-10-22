@@ -126,6 +126,10 @@ def slimquant_w4a8_uses_deepep_auto(moe_config: object) -> bool:
     if vllm_config is None:
         vllm_config = getattr(moe_config, "_hcu_vllm_config", None)
     architectures = model_architectures(vllm_config)
+    if not architectures:
+        architectures = tuple(
+            getattr(moe_config, "_hcu_model_architectures", ())
+        )
     supported_architectures = {
         "DeepseekV4ForCausalLM",
         "DeepSeekV4MTPModel",

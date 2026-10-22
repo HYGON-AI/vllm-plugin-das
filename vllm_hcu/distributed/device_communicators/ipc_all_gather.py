@@ -30,14 +30,13 @@ import torch
 import torch.distributed as dist
 from torch.distributed import ProcessGroup
 
-from vllm.triton_utils import tl, triton
+from vllm.triton_utils import HAS_TRITON, tl, triton
 
 _MAX_TENSORS = 4
 _MAX_WORLD = 8
-# vLLM exposes a placeholder language module when no Triton driver is active.
-# Keep CPU ownership/selection contracts importable; real kernels retain the
-# constexpr global required by Triton's JIT.
-_NT = tl.constexpr(_MAX_TENSORS) if callable(tl.constexpr) else _MAX_TENSORS
+# Without an active driver vLLM supplies a placeholder with constexpr=None.
+# Keep CPU contract tests importable; real Triton kernels retain the constexpr.
+_NT = tl.constexpr(_MAX_TENSORS) if HAS_TRITON else _MAX_TENSORS
 
 
 @triton.jit

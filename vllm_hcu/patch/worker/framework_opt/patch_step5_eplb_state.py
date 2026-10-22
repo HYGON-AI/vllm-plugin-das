@@ -7,6 +7,7 @@ from vllm_hcu.runtime_compat.step5_patch_contract import (
     already_applied,
     remember_targets,
     require_signatures,
+    Step5PatchCompatibilityError,
 )
 from ._common import load_exact_module, require_callable
 
@@ -74,6 +75,10 @@ def apply_to_module(module: ModuleType) -> bool:
     target = load_exact_module(TARGET_MODULE, module)
     if already_applied(target, _MARKER, TARGETS):
         return False
+    if getattr(target, "_vllm_hcu_offline_eplb", None) is not None:
+        raise Step5PatchCompatibilityError(
+            "Install Step5 EPLB runtime before offline EPLB policy; restart the process"
+        )
     require_signatures(target, SIGNATURES, REVIEWED_SOURCES)
     cls = getattr(target, "EplbState", None)
     for name, symbol in zip(
@@ -85,14 +90,9 @@ def apply_to_module(module: ModuleType) -> bool:
     from vllm.distributed.eplb.eplb_communicator import create_eplb_communicator
     from vllm_hcu.distributed import eplb_runtime
 
-    from . import patch_offline_eplb
-
-    composed = patch_offline_eplb.compose_runtime(target, eplb_runtime)
-    if not composed:
-        cls.step = eplb_runtime.step
+    cls.step = eplb_runtime.step
     cls._propagate_shared_tensors = eplb_runtime._propagate_shared_tensors
-    if not composed:
-        cls.rearrange = eplb_runtime.rearrange
+    cls.rearrange = eplb_runtime.rearrange
     target._move_to_workspace = eplb_runtime._move_to_workspace
     target.create_eplb_communicator = create_eplb_communicator
     remember_targets(target, _MARKER, TARGETS)

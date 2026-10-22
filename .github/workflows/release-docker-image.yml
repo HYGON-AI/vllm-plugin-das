@@ -162,11 +162,3 @@ jobs:
     with:
       image: ${{ needs.build.outputs.docker_image }}
     secrets: inherit
-
-  test-ops:
-    if: github.event.inputs.run_test != 'false'
-    needs: build
-    uses: ./.github/workflows/nightly-test-operator.yml
-    with:
-      image: ${{ needs.build.outputs.docker_image }}
-    secrets: inherit

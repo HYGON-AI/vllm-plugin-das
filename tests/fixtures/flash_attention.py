@@ -17,6 +17,11 @@ def stub_flash_attn_native_extension(monkeypatch: pytest.MonkeyPatch) -> ModuleT
     """Keep CPU contracts from loading vendor native binaries."""
     module = ModuleType("flash_attn_2_cuda")
     module.__spec__ = ModuleSpec(module.__name__, loader=None)
+
+    def unexpected_native_call(*args, **kwargs):
+        raise AssertionError("CPU attention contracts must not execute native FlashAttention")
+
+    module.varlen_fwd = unexpected_native_call
     monkeypatch.setitem(sys.modules, module.__name__, module)
     return module
 

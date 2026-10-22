@@ -28,6 +28,7 @@ def test_ipc_import_supports_placeholder_and_real_language_modules(
         return function
 
     shim = ModuleType("vllm.triton_utils")
+    shim.HAS_TRITON = has_constexpr
     shim.tl = SimpleNamespace(constexpr=Constexpr if has_constexpr else None)
     shim.triton = SimpleNamespace(jit=jit)
     monkeypatch.setitem(sys.modules, shim.__name__, shim)

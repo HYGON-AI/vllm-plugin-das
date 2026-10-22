@@ -261,7 +261,7 @@ def _setup_state(tmp_path, monkeypatch: pytest.MonkeyPatch, mode="static"):
         for name in names:
             monkeypatch.setattr(owner, name, inspect.unwrap(getattr(owner, name)))
     # Record absence too: apply_to_module adds these attributes directly.
-    for marker in (api._MARKER, api._DELEGATES):
+    for marker in (api._MARKER,):
         if not hasattr(upstream, marker):
             monkeypatch.setattr(upstream, marker, None, raising=False)
         monkeypatch.delattr(upstream, marker, raising=False)
@@ -999,6 +999,21 @@ def test_dynamic_eplb_delegates_to_current_initialization(
     assert not hasattr(fixture.state, "_vllm_hcu_offline_proposal_events")
 
 
+def test_setup_state_restores_offline_patch_state(tmp_path):
+    import vllm.distributed.eplb.eplb_state as upstream
+    import vllm_hcu.patch.worker.framework_opt.patch_offline_eplb as api
+
+    missing = object()
+    marker = getattr(upstream, api._MARKER, missing)
+    originals = tuple(getattr(owner, name) for owner, name in _offline_hooks(upstream))
+    with pytest.MonkeyPatch.context() as scoped:
+        _setup_state(tmp_path, scoped, mode="record")
+        assert getattr(upstream, api._MARKER, None) is not None
+    assert getattr(upstream, api._MARKER, missing) is marker
+    assert all(getattr(owner, name) is original
+               for (owner, name), original in zip(_offline_hooks(upstream), originals))
+
+
 def _isolated_offline_target():
     import vllm.distributed.eplb.eplb_state as upstream
     import vllm_hcu.patch.worker.framework_opt.patch_offline_eplb as api
@@ -1056,82 +1071,32 @@ def test_offline_adapter_rejects_stale_wrapper_identity(index) -> None:
         api.apply_to_module(target)
 
 
-def _composable_runtime(calls):
-    def step(self, **kwargs):
-        calls.append(("step", kwargs))
-        return "stepped"
-
-    def rearrange(self, **kwargs):
-        calls.append(("rearrange", kwargs))
-        return "rearranged"
-
-    def transfer(*args, **kwargs):
-        calls.append(("transfer", args))
-        return "transferred"
-
-    return SimpleNamespace(
-        step=step, rearrange=rearrange,
-        rearrange_expert_weights_inplace=transfer,
-        _propagate_shared_tensors=lambda *args: None,
-        _move_to_workspace=lambda *args: None,
-    )
-
-
-def test_step5_composes_with_offline_guards_without_replacing_them(monkeypatch):
-    from vllm_hcu.patch.worker.framework_opt import patch_step5_eplb_state
-    import vllm_hcu.distributed as distributed
+def test_offline_outer_wrappers_preserve_step5_idempotence_and_stale_checks():
+    from vllm_hcu.patch.worker.framework_opt import patch_step5_eplb_state as step5
+    from vllm_hcu.runtime_compat.step5_patch_contract import remember_targets
 
     api, target = _isolated_offline_target()
-    target.EplbState._propagate_shared_tensors = lambda *args: None
-    target._move_to_workspace = lambda *args: None
-    target.create_eplb_communicator = lambda *args: None
-    api.apply_to_module(target)
-    wrappers = [getattr(owner, name) for owner, name in _offline_hooks(target)]
-    calls = []
-    runtime = _composable_runtime(calls)
-    monkeypatch.setattr(distributed, "eplb_runtime", runtime, raising=False)
-    monkeypatch.setattr(patch_step5_eplb_state, "require_signatures", lambda *args: None)
-
-    assert patch_step5_eplb_state.apply_to_module(target) is True
+    target.EplbState._propagate_shared_tensors = lambda *a: None
+    target._move_to_workspace = lambda *a: None
+    target.create_eplb_communicator = lambda *a: None
+    original_step = target.EplbState.step
+    remember_targets(target, step5._MARKER, step5.TARGETS)
+    assert api.apply_to_module(target)
+    assert inspect.unwrap(target.EplbState.step) is original_step
+    assert step5.apply_to_module(target) is False
     assert api.apply_to_module(target) is False
-    assert patch_step5_eplb_state.apply_to_module(target) is False
-    assert all(
-        getattr(owner, name) is original
-        for (owner, name), original in zip(_offline_hooks(target), wrappers)
-    )
-    state = target.EplbState()
-    state.parallel_config = SimpleNamespace()
-    assert state.step(is_dummy=True) == "stepped"
-    assert state.rearrange(is_profile=True) == "rearranged"
-    assert [call[0] for call in calls] == ["step", "rearrange"]
+    target.EplbState.step = original_step
+    with pytest.raises(RuntimeError, match="[Ss]tale"):
+        step5.apply_to_module(target)
+    with pytest.raises(RuntimeError, match="stale"):
+        api.apply_to_module(target)
 
 
-def test_composed_runtime_preserves_static_noop_guards():
+def test_step5_rejects_installation_over_existing_offline_policy():
+    from vllm_hcu.patch.worker.framework_opt import patch_step5_eplb_state as step5
     api, target = _isolated_offline_target()
     api.apply_to_module(target)
-    calls = []
-    runtime = _composable_runtime(calls)
-    assert api.compose_runtime(target, runtime)
-    state = target.EplbState()
-    state.parallel_config = SimpleNamespace(_vllm_hcu_expert_map_path="/maps/static.json")
-
-    assert state.step() is None
-    assert state.rearrange() is None
-    assert calls == []
-
-
-def test_composed_runtime_preserves_record_only_mutation_guards():
-    api, target = _isolated_offline_target()
-    api.apply_to_module(target)
-    calls = []
-    runtime = _composable_runtime(calls)
-    assert api.compose_runtime(target, runtime)
-    token = api._RECORD_ONLY.set(True)
-    try:
-        assert runtime.rearrange_expert_weights_inplace("weights") is None
-        assert runtime._commit_eplb_maps(object(), object()) is None
-    finally:
-        api._RECORD_ONLY.reset(token)
-    assert calls == []
-    assert runtime.rearrange_expert_weights_inplace("weights") == "transferred"
-    assert calls == [("transfer", ("weights",))]
+    wrappers = tuple(getattr(owner, name) for owner, name in _offline_hooks(target))
+    with pytest.raises(RuntimeError, match="before offline EPLB policy"):
+        step5.apply_to_module(target)
+    assert wrappers == tuple(getattr(owner, name) for owner, name in _offline_hooks(target))
