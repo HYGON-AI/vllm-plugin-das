@@ -46,6 +46,16 @@ def _paged_logits(
         end = tl.load(Lengths + batch * L_BATCH + query * L_NEXT)
     else:
         end = tl.load(Lengths + batch * L_BATCH) - NEXT_N + 1 + query
+    if tl.program_id(1) * BLOCK_T >= end:
+        # Tiles past this query's context only need the -inf fill; skipping
+        # the page loads and dot keeps cost proportional to the context
+        # instead of max_model_len.
+        tl.store(
+            Out + row * MAX_LEN + tokens,
+            tl.full((BLOCK_T,), -float("inf"), tl.float32),
+            tokens < MAX_LEN,
+        )
+        return
     logical_page = tokens // PAGE_SIZE
     valid = (tokens < MAX_LEN) & (tokens < end) & (logical_page < TABLE_WIDTH)
     page = tl.load(
