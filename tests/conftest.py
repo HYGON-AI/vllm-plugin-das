@@ -86,3 +86,13 @@ def hcu_environment_fingerprint() -> EnvironmentFingerprint:
     fixtures later, after a test explicitly requests a live HCU.
     """
     return EnvironmentFingerprint.collect_base()
+
+
+def pytest_report_header(config):
+    # Kernel-level tests depend on the exact DeepGEMM build; record it.
+    try:
+        from vllm_hcu.model_executor.layers.quantization.w8a16_gemm import (
+            _deepgemm_version)
+        return f"deepgemm: {_deepgemm_version()}"
+    except Exception:
+        return None
