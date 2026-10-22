@@ -1001,6 +1001,8 @@ def test_server_waits_for_configured_memory_before_launch(
     from tests.integration.gpu_memory import GpuMemoryUnavailableError
 
     work_dir = evalscope_server.create_evalscope_work_dir(tmp_path / "reports")
+    # CI supplies a shared report override; keep this mocked server test local.
+    monkeypatch.setenv("VLLM_HCU_EVAL_WORK_DIR", str(work_dir))
     config = {
         "model": "/models/example",
         "server": {
