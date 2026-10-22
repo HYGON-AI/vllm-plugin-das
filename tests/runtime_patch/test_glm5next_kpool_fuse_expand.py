@@ -1,12 +1,17 @@
 # SPDX-License-Identifier: Apache-2.0
 """Tests for the VLLM_HCU_GLM5NEXT_KPOOL_FUSE_EXPAND runtime patch."""
 
+import functools
 import inspect
-from types import ModuleType
+import textwrap
+from types import ModuleType, SimpleNamespace
 
 import pytest
 import torch
 
+from vllm_hcu.patch.worker.core_fix import (
+    patch_glm5next_kpool_element_fusion as fusion_patch,
+)
 from vllm_hcu.patch.worker.core_fix import (
     patch_glm5next_kpool_fuse_expand as fuse_patch,
 )
@@ -170,6 +175,72 @@ def test_already_fused_indexer_source_is_audited_not_rebound(
 
     assert indexer_module.sparse_attn_indexer_kpool is patched
     assert getattr(indexer_module, fuse_patch._PATCH_MARKER) is True
+
+
+def _force_wrapping_decorator(monkeypatch, indexer_module):
+    """Make eager_break_during_capture always wrap (as when breakable
+    cudagraph capture is enabled) and record each application."""
+    calls = []
+
+    def eager_break_during_capture(fn):
+        calls.append(fn)
+
+        @functools.wraps(fn)
+        def wrapper(*args, **kwargs):
+            return fn(*args, **kwargs)
+
+        return wrapper
+
+    monkeypatch.setattr(
+        indexer_module, "eager_break_during_capture", eager_break_during_capture
+    )
+    return calls
+
+
+def _wrap_depth(fn):
+    depth = 0
+    while hasattr(fn, "__wrapped__"):
+        fn = fn.__wrapped__
+        depth += 1
+    return depth
+
+
+def test_rewritten_indexer_is_decorated_once(
+    monkeypatch, indexer_module, kpool_ops
+):
+    monkeypatch.setenv(fuse_patch.ENV_VAR, "1")
+    monkeypatch.setenv("VLLM_HCU_USE_CUSTOM_OPS", "1")
+    calls = _force_wrapping_decorator(monkeypatch, indexer_module)
+
+    assert fuse_patch.apply_to_module(indexer_module) is True
+
+    patched = indexer_module.sparse_attn_indexer_kpool
+    assert len(calls) == 1
+    assert _wrap_depth(patched) == 1
+    assert getattr(patched, fuse_patch._WRAPPER_MARKER, False)
+    assert not inspect.getsource(patched).startswith(fuse_patch._DECORATOR_LINE)
+
+
+def test_stacked_with_element_fusion_is_decorated_once(
+    monkeypatch, indexer_module, kpool_ops
+):
+    monkeypatch.setenv(fuse_patch.ENV_VAR, "1")
+    monkeypatch.setenv(fusion_patch.ENV_VAR, "1")
+    monkeypatch.setenv("VLLM_HCU_USE_CUSTOM_OPS", "1")
+    monkeypatch.delattr(indexer_module, fusion_patch._PATCH_MARKER, raising=False)
+    calls = _force_wrapping_decorator(monkeypatch, indexer_module)
+
+    assert fuse_patch.apply_to_module(indexer_module) is True
+    assert len(calls) == 1
+    assert fusion_patch.apply_to_module(indexer_module) is True
+    assert len(calls) == 2
+
+    patched = indexer_module.sparse_attn_indexer_kpool
+    assert _wrap_depth(patched) == 1
+    assert getattr(patched, fusion_patch._WRAPPER_MARKER, False)
+    source = inspect.getsource(patched)
+    assert fuse_patch._DECODE_NEW in source
+    assert "_vllm_hcu_fused_short_decode_fill(" in source
 
 
 def test_stale_indexer_marker_is_rejected(monkeypatch, indexer_module):
@@ -381,3 +452,95 @@ def test_decode_positions_match_upstream_seq_lens(indexer_module, requires_paddi
         ).reshape(batch_size * next_n)
 
     assert torch.equal(dec_pos + 1, expected_seq)
+
+
+# (topk_tokens, index_kpool): the indexer selects topk_tokens // index_kpool
+# pools, so non-divisible configs expand to fewer than topk_tokens columns.
+_DECODE_TOPK_CONFIGS = [(2048, 4), (2049, 4), (2050, 4), (2051, 4), (4097, 8)]
+
+
+def _run_decode_block(expand, pool_topk, positions, topk_tokens, index_kpool,
+                      buffer):
+    """Execute the rewritten non-padded decode block against ``buffer``."""
+    namespace = dict(
+        torch=torch,
+        kpool_ops=SimpleNamespace(expand_pools_and_append_tail=expand),
+        decode_metadata=SimpleNamespace(requires_padding=False),
+        index_kpool=index_kpool,
+        topk_tokens=topk_tokens,
+        pool_topk=pool_topk,
+        topk_dst=pool_topk,
+        positions=positions,
+        batch_size=pool_topk.shape[0],
+        next_n=1,
+        topk_indices_buffer=buffer,
+    )
+    exec(textwrap.dedent(fuse_patch._DECODE_NEW), namespace)
+    return namespace["out"]
+
+
+def _contract_expand(pool_ids, positions, pool_size, out=None):
+    # Same shape contract as the fused helper, without the Triton launch.
+    rows, n_groups = pool_ids.shape
+    out_cols = n_groups * pool_size + pool_size - 1
+    if out is None:
+        out = torch.empty((rows, out_cols), dtype=torch.int32)
+    else:
+        assert out.shape == (rows, out_cols) and out.dtype == torch.int32
+    out.fill_(7)
+    return out
+
+
+@pytest.mark.parametrize(("topk_tokens", "index_kpool"), _DECODE_TOPK_CONFIGS)
+def test_decode_out_width_follows_selected_pools(topk_tokens, index_kpool):
+    rows = 3
+    n_groups = topk_tokens // index_kpool
+    out_cols = n_groups * index_kpool + index_kpool - 1
+    pool_topk = torch.zeros(rows, n_groups, dtype=torch.int32)
+    positions = torch.full((rows,), topk_tokens * 2, dtype=torch.int64)
+    buffer = torch.full(
+        (rows + 2, topk_tokens + index_kpool - 1 + 32), -1, dtype=torch.int32
+    )
+
+    out = _run_decode_block(
+        _contract_expand, pool_topk, positions, topk_tokens, index_kpool, buffer
+    )
+
+    # Written in place; columns past the expanded width keep the -1 fill.
+    assert out.data_ptr() == buffer.data_ptr()
+    assert out.shape == (rows, out_cols)
+    assert torch.all(buffer[:rows, :out_cols] == 7)
+    assert torch.all(buffer[:rows, out_cols:] == -1)
+    assert torch.all(buffer[rows:] == -1)
+
+
+@requires_gpu
+@pytest.mark.parametrize(("topk_tokens", "index_kpool"), _DECODE_TOPK_CONFIGS)
+def test_decode_block_matches_upstream_expand(
+    original_expand, fused_expand, topk_tokens, index_kpool
+):
+    torch.manual_seed(3)
+    rows = 6
+    n_groups = topk_tokens // index_kpool
+    # Long context: seq_len > topk_tokens so decode takes the pool-expand path.
+    positions = torch.randint(
+        topk_tokens, 16384, (rows,), device="cuda", dtype=torch.int64
+    )
+    pool_topk = _random_pool_ids(rows, n_groups, positions, index_kpool,
+                                 torch.int32)
+    width = topk_tokens + index_kpool - 1 + 32
+    buffer = torch.full((rows + 2, width), -1, dtype=torch.int32, device="cuda")
+
+    # Upstream: -1 fill, expand into a fresh tensor, copy its width back.
+    upstream_out = original_expand(
+        pool_topk.to(torch.int64), positions.to(torch.int32) + 1, index_kpool
+    )
+    expected = buffer.clone()
+    expected[:rows, : upstream_out.shape[-1]] = upstream_out
+
+    out = _run_decode_block(
+        fused_expand, pool_topk, positions, topk_tokens, index_kpool, buffer
+    )
+
+    assert out.data_ptr() == buffer.data_ptr()
+    assert torch.equal(buffer, expected)

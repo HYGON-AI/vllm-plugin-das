@@ -31,6 +31,7 @@ PATCH_ID = "worker.core_fix.glm5next.kpool_fuse_expand"
 ENV_VAR = "VLLM_HCU_GLM5NEXT_KPOOL_FUSE_EXPAND"
 _PATCH_MARKER = "_vllm_hcu_glm5next_kpool_fuse_expand_applied"
 _WRAPPER_MARKER = "_vllm_hcu_glm5next_kpool_fuse_expand_wrapper"
+_DECORATOR_LINE = "@eager_break_during_capture\n"
 
 logger = init_logger(__name__)
 
@@ -162,7 +163,7 @@ _DECODE_NEW = """\
                 if dec_pos.ndim == 2:
                     dec_pos = dec_pos[:, -1]
                 dec_pos = dec_pos.to(torch.int32) - 1
-            out_cols = topk_tokens + index_kpool - 1
+            out_cols = pool_ids.shape[1] * index_kpool + index_kpool - 1
             dst = (
                 None
                 if decode_metadata.requires_padding
@@ -342,6 +343,10 @@ def _patch_indexer_decode(indexer_mod: ModuleType) -> None:
     )
 
     source = inspect.getsource(original)
+    # Drop the decorator line: the rewritten function is re-wrapped exactly
+    # once below, so keeping it here would apply the decorator twice.
+    if source.startswith(_DECORATOR_LINE):
+        source = source[len(_DECORATOR_LINE) :]
     changed = False
     for label, old, new in (
         ("prefill", _PREFILL_OLD, _PREFILL_NEW),
@@ -398,11 +403,8 @@ def _patch_indexer_decode(indexer_mod: ModuleType) -> None:
     # survive onto whatever gets installed below (plain fn, if breakable
     # cudagraph capture is disabled, or the wrapper, if enabled).
     setattr(patched, _WRAPPER_MARKER, True)
-    # Preserve the original decoration: `original` may already be the raw fn
-    # (decorator is a no-op when breakable cudagraph capture is disabled), or
-    # the wrapper. Re-applying unconditionally matches upstream's own
-    # decoration exactly, since eager_break_during_capture itself re-checks
-    # the same enablement flag and returns fn unchanged when it's off.
+    # The decorator line was stripped from the source above, so this is the
+    # only application; it matches upstream's single @eager_break_during_capture.
     patched = indexer_mod.eager_break_during_capture(patched)
 
     setattr(indexer_mod, "_vllm_hcu_original_sparse_attn_indexer_kpool", original)

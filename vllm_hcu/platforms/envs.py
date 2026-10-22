@@ -71,7 +71,7 @@ if TYPE_CHECKING:
     VLLM_HCU_MAMBA_SSM_CACHE_DTYPE: bool = False
     VLLM_HCU_USE_AITER_W4A16_MOE: bool = False
     VLLM_HCU_USE_TORCH_EPLB_MAP_RECORD: bool = False
-    VLLM_HCU_MOE_PAD_MASK_INPLACE: bool = False
+    VLLM_HCU_MOE_PAD_MASK_INPLACE: bool = True
     VLLM_HCU_USE_AITER_MOE_SHUFFLE: bool = True
     VLLM_HCU_USE_AITER_MOE_CONFIG: bool = True
     VLLM_HCU_MOONCAKE_TTFT_TRACE: bool = False
@@ -95,11 +95,9 @@ if TYPE_CHECKING:
     VLLM_HCU_QWEN4_EXP_HC_SP: bool = True
     VLLM_HCU_MHC_FUSED_RMSNORM: bool = True
     VLLM_HCU_GLM5NEXT_KDA_STRIDED_INPUTS: bool = True
-    VLLM_HCU_GLM5NEXT_KPOOL_FUSE_EXPAND: bool = False
-    VLLM_HCU_GLM5NEXT_KPOOL_ELEMENT_FUSION: bool = False
     VLLM_HCU_DP_INT8_ALLGATHER: bool = False
-    VLLM_HCU_MHC_FUSED_RMSNORM: bool = True
-    VLLM_HCU_GLM5NEXT_KDA_STRIDED_INPUTS: bool = True
+    VLLM_HCU_GLM5NEXT_KPOOL_FUSE_EXPAND: bool = True
+    VLLM_HCU_GLM5NEXT_KPOOL_ELEMENT_FUSION: bool = True
 
 def maybe_convert_int(value: Optional[str]) -> Optional[int]:
     """
@@ -602,7 +600,7 @@ hcu_vllm_environment_variables: dict[str, Callable[[], Any]] = {
     # pure overhead: it shows up as a Memcpy DtoD per tensor right after
     # moe_fused_gate in the profiler trace.
     "VLLM_HCU_MOE_PAD_MASK_INPLACE":
-        lambda: (os.environ.get("VLLM_HCU_MOE_PAD_MASK_INPLACE", "False").lower() in
+        lambda: (os.environ.get("VLLM_HCU_MOE_PAD_MASK_INPLACE", "True").lower() in
                     ("true", "1")),
 
     # Shuffle AITER MoE weights for any quantization mode (default True).
@@ -757,8 +755,8 @@ hcu_vllm_environment_variables: dict[str, Callable[[], Any]] = {
     # patch-apply time. See patch_glm5next_kpool_fuse_expand.py. Disabled
     # by default (opt-in); set to 1 to enable.
     "VLLM_HCU_GLM5NEXT_KPOOL_FUSE_EXPAND":
-        lambda: (os.environ.get("VLLM_HCU_GLM5NEXT_KPOOL_FUSE_EXPAND", "False").lower() in
-                    ("true", "1")),
+        lambda: os.environ.get("VLLM_HCU_GLM5NEXT_KPOOL_FUSE_EXPAND", "True").lower()
+                    in ("true", "1"),
 
     # Trim elementwise kernels on the GLM5Next kpool sparse-indexer decode
     # path: pass int64 positions straight to the kpool decode-update kernel
@@ -767,7 +765,7 @@ hcu_vllm_environment_variables: dict[str, Callable[[], Any]] = {
     # Triton kernel. Consulted once at patch-apply time. See
     # patch_glm5next_kpool_element_fusion.py. Disabled by default (opt-in).
     "VLLM_HCU_GLM5NEXT_KPOOL_ELEMENT_FUSION":
-        lambda: (os.environ.get("VLLM_HCU_GLM5NEXT_KPOOL_ELEMENT_FUSION", "False").lower() in
+        lambda: (os.environ.get("VLLM_HCU_GLM5NEXT_KPOOL_ELEMENT_FUSION", "True").lower() in
                     ("true", "1")),
 }
 

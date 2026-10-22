@@ -37,14 +37,13 @@ from ._common import (
     require_callable,
     require_exact_signature,
 )
-from .patch_glm5next_kpool_fuse_expand import _INDEXER_SIGNATURE
+from .patch_glm5next_kpool_fuse_expand import _DECORATOR_LINE, _INDEXER_SIGNATURE
 
 TARGET_MODULE = "vllm.model_executor.layers.sparse_attn_indexer_kpool"
 PATCH_ID = "worker.core_fix.glm5next.kpool_element_fusion"
 ENV_VAR = "VLLM_HCU_GLM5NEXT_KPOOL_ELEMENT_FUSION"
 _PATCH_MARKER = "_vllm_hcu_glm5next_kpool_element_fusion_applied"
 _WRAPPER_MARKER = "_vllm_hcu_glm5next_kpool_element_fusion_wrapper"
-_DECORATOR_LINE = "@eager_break_during_capture\n"
 _SOURCE_FILENAME = f"<{PATCH_ID}>"
 
 logger = init_logger(__name__)
