@@ -7,6 +7,10 @@ import re
 from collections.abc import Iterable, Iterator
 
 import torch
+from compressed_tensors.quantization import (
+    QuantizationStrategy,
+    QuantizationType,
+)
 
 from .slimquant_facade import SlimQuantW4A8Facade
 
@@ -14,6 +18,7 @@ CHECKPOINT_FORMAT = "hy4-w4a8-custom-v1"
 NATIVE_FORMAT = "hy4_w4a8_v1"
 PACKING = "signed nibble, even input in low bits"
 PACKED_EXPERT_ADAPTER_MARKER = "_vllm_hcu_hyv4_packed_expert_adapter"
+_ROUTED_EXPERTS_TARGET = type("RoutedExperts", (), {})()
 
 
 class HYV4W4A8Facade(SlimQuantW4A8Facade):
@@ -124,39 +129,49 @@ def adapt_checkpoint_weights(quant_config, weights):
     return weights
 
 
-def _matches_compressed_target(target: str, name: str) -> bool:
-    if target in ("Linear", "RoutedExperts"):
-        return True
-    if target.startswith("re:"):
-        return re.match(target[3:], name) is not None
-    return name == target or name.endswith("." + target)
-
-
 def _is_supported_compressed_expert(quant_config, name: str) -> bool:
-    config = getattr(quant_config, "config", None)
-    if not isinstance(config, dict):
+    add_fused_moe = getattr(
+        quant_config, "_add_fused_moe_to_target_scheme_map", None
+    )
+    get_scheme_dict = getattr(quant_config, "get_scheme_dict", None)
+    if not callable(add_fused_moe) or not callable(get_scheme_dict):
         return False
-    for group in config.get("config_groups", {}).values():
-        targets = group.get("targets", ())
-        if not any(_matches_compressed_target(target, name) for target in targets):
-            continue
-        weight = group.get("weights") or {}
-        activation = group.get("input_activations") or {}
-        return bool(
-            group.get("format", config.get("format")) == "pack-quantized"
-            and weight.get("num_bits") == 4
-            and weight.get("type") == "int"
-            and weight.get("strategy") == "channel"
-            and weight.get("symmetric") is True
-            and weight.get("dynamic") is False
-            and weight.get("group_size") in (None, -1)
-            and activation.get("num_bits") == 8
-            and activation.get("type") == "int"
-            and activation.get("strategy") == "token"
-            and activation.get("symmetric") is True
-            and activation.get("dynamic") is True
+    add_fused_moe()
+    layer_name = re.sub(
+        r"\.\d+\.(?:gate_proj|up_proj|down_proj)$", "", name
+    )
+    if layer_name == name:
+        return False
+    schemes = [
+        get_scheme_dict(
+            _ROUTED_EXPERTS_TARGET,
+            layer_name=layer_name + projection,
         )
-    return False
+        for projection in (".0.gate_proj", ".0.up_proj", ".0.down_proj")
+    ]
+    scheme = schemes[-1]
+    if not all(candidate == scheme for candidate in schemes[:-1]):
+        return False
+    if not isinstance(scheme, dict):
+        return False
+    weight = scheme.get("weights")
+    activation = scheme.get("input_activations")
+    return bool(
+        scheme.get("format") == "pack-quantized"
+        and weight is not None
+        and weight.num_bits == 4
+        and weight.type == QuantizationType.INT
+        and weight.strategy == QuantizationStrategy.CHANNEL
+        and weight.symmetric
+        and not weight.dynamic
+        and weight.group_size in (None, -1)
+        and activation is not None
+        and activation.num_bits == 8
+        and activation.type == QuantizationType.INT
+        and activation.strategy == QuantizationStrategy.TOKEN
+        and activation.symmetric
+        and activation.dynamic
+    )
 
 
 def _adapt_compressed_tensors_experts(

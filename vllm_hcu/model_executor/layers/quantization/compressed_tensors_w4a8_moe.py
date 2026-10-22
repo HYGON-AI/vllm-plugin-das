@@ -188,14 +188,15 @@ class HcuCompressedTensorsW4A8Int8MoEMethod(
                         "compressed-tensors expert scale requires shape "
                         f"{expected}, got {tuple(loaded_weight.shape)}"
                     )
-                if not loaded_weight.numel() or not torch.all(
-                    torch.isfinite(loaded_weight) & (loaded_weight > 0)
+                converted_scale = loaded_weight.float() / 16.0
+                if not converted_scale.numel() or not torch.all(
+                    torch.isfinite(converted_scale) & (converted_scale > 0)
                 ).item():
                     raise ValueError(
                         "compressed-tensors expert scale must be finite and "
                         "positive"
                     )
-                return load(param, loaded_weight / 16.0, *args, **kwargs)
+                return load(param, converted_scale, *args, **kwargs)
 
             load_scale.__self__ = getattr(load, "__self__", None)
             parameter.weight_loader = load_scale

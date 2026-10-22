@@ -45,6 +45,14 @@ def compressed_w4a8_config(target="re:.*\\.mlp\\.experts\\.\\d+\\.(?:gate_proj|u
     }
 
 
+def real_compressed_config(config):
+    from vllm.model_executor.layers.quantization.compressed_tensors.compressed_tensors import (
+        CompressedTensorsConfig,
+    )
+
+    return CompressedTensorsConfig.from_config(copy.deepcopy(config))
+
+
 def module(leaf):
     name = "vllm_hcu.model_executor.layers.quantization." + leaf
     assert importlib.util.find_spec(name) is not None, f"Missing HYV4 adapter: {leaf}"
@@ -181,18 +189,11 @@ def test_hyv4_compressed_tensors_packed_experts_adapt_to_hcu_layout():
         repack_compressed_tensors_int4,
     )
 
-    class CompressedTensorsConfig:
-        config = compressed_w4a8_config()
-
-        @staticmethod
-        def get_name():
-            return "compressed-tensors"
-
     values = torch.tensor([[-8, -7, -1, 0, 1, 2, 6, 7]], dtype=torch.int8)
     packed = pack_to_int32(values, 4)
     scale = torch.ones(1, 1, dtype=torch.bfloat16)
     prefix = "model.layers.1.mlp.experts.0.gate_proj"
-    quant_config = CompressedTensorsConfig()
+    quant_config = real_compressed_config(compressed_w4a8_config())
     adapted = dict(module("hyv4_w4a8_weights").adapt_checkpoint_weights(
         quant_config,
         [
@@ -224,17 +225,12 @@ def test_hyv4_compressed_tensors_packed_experts_adapt_to_hcu_layout():
 
 def test_hyv4_compressed_tensors_prefix_regex_uses_native_match_semantics():
     """A native selector prefix regex must adapt the same checkpoint names."""
-    class CompressedTensorsConfig:
-        config = compressed_w4a8_config(target=r"re:.*\.mlp\.experts")
-
-        @staticmethod
-        def get_name():
-            return "compressed-tensors"
-
     prefix = "model.layers.1.mlp.experts.0.gate_proj"
     packed = torch.ones((1, 1), dtype=torch.int32)
     adapted = dict(module("hyv4_w4a8_weights").adapt_checkpoint_weights(
-        CompressedTensorsConfig(),
+        real_compressed_config(
+            compressed_w4a8_config(target=r"re:.*\.mlp\.experts")
+        ),
         [
             (prefix + ".weight_packed", packed),
             (prefix + ".weight_shape", torch.tensor([1, 8])),
@@ -243,6 +239,114 @@ def test_hyv4_compressed_tensors_prefix_regex_uses_native_match_semantics():
 
     assert set(adapted) == {prefix + ".weight"}
     assert adapted[prefix + ".weight"] is packed
+
+
+@pytest.mark.parametrize(
+    "omitted",
+    ["dynamic", "symmetric", "type", "strategy"],
+)
+def test_hyv4_compressed_tensors_adapter_uses_normalized_weight_defaults(
+    omitted,
+):
+    config = compressed_w4a8_config()
+    del config["config_groups"]["experts"]["weights"][omitted]
+    quant_config = real_compressed_config(config)
+    prefix = "model.layers.1.mlp.experts.0.gate_proj"
+
+    adapted = dict(module("hyv4_w4a8_weights").adapt_checkpoint_weights(
+        quant_config,
+        [
+            (prefix + ".weight_packed", torch.ones((1, 1), dtype=torch.int32)),
+            (prefix + ".weight_shape", torch.tensor([1, 8])),
+        ],
+    ))
+
+    assert set(adapted) == {prefix + ".weight"}
+
+
+def test_hyv4_compressed_tensors_adapter_inherits_top_level_format():
+    config = compressed_w4a8_config()
+    config["config_groups"]["experts"]["format"] = None
+    quant_config = real_compressed_config(config)
+    prefix = "model.layers.1.mlp.experts.0.down_proj"
+
+    adapted = dict(module("hyv4_w4a8_weights").adapt_checkpoint_weights(
+        quant_config,
+        [
+            (prefix + ".weight_packed", torch.ones((1, 1), dtype=torch.int32)),
+            (prefix + ".weight_shape", torch.tensor([1, 8])),
+        ],
+    ))
+
+    assert set(adapted) == {prefix + ".weight"}
+
+
+def test_hyv4_compressed_tensors_adapter_prefers_expert_regex_over_linear():
+    config = compressed_w4a8_config()
+    expert_group = config["config_groups"]["experts"]
+    config["config_groups"] = {
+        "linear": {
+            "format": "pack-quantized",
+            "targets": ["Linear"],
+            "weights": {
+                "num_bits": 4,
+                "type": "int",
+                "strategy": "group",
+                "symmetric": True,
+                "dynamic": False,
+                "group_size": 128,
+            },
+            "input_activations": None,
+        },
+        "experts": expert_group,
+    }
+    quant_config = real_compressed_config(config)
+    prefix = "model.layers.1.mlp.experts.0.up_proj"
+
+    adapted = dict(module("hyv4_w4a8_weights").adapt_checkpoint_weights(
+        quant_config,
+        [
+            (prefix + ".weight_packed", torch.ones((1, 1), dtype=torch.int32)),
+            (prefix + ".weight_shape", torch.tensor([1, 8])),
+        ],
+    ))
+
+    assert set(adapted) == {prefix + ".weight"}
+
+
+def test_hyv4_compressed_tensors_adapter_requires_one_expert_scheme():
+    config = compressed_w4a8_config(
+        target=r"re:.*\.mlp\.experts\.\d+\.(?:gate_proj|up_proj)$"
+    )
+    expert_group = config["config_groups"]["experts"]
+    config["config_groups"] = {
+        "linear": {
+            "format": "pack-quantized",
+            "targets": ["Linear"],
+            "weights": {
+                "num_bits": 4,
+                "type": "int",
+                "strategy": "group",
+                "symmetric": True,
+                "dynamic": False,
+                "group_size": 128,
+            },
+            "input_activations": None,
+        },
+        "partial_experts": expert_group,
+    }
+    quant_config = real_compressed_config(config)
+    prefix = "model.layers.1.mlp.experts.0.gate_proj"
+    original = [
+        (prefix + ".weight_packed", torch.ones((1, 1), dtype=torch.int32)),
+        (prefix + ".weight_shape", torch.tensor([1, 8])),
+    ]
+
+    adapted = list(module("hyv4_w4a8_weights").adapt_checkpoint_weights(
+        quant_config, iter(original)
+    ))
+
+    assert [name for name, _ in adapted] == [name for name, _ in original]
 
 
 def test_standard_packed_experts_load_without_hyv4_weight_adapter():
@@ -372,17 +476,11 @@ def test_hyv4_packed_expert_marker_survives_mtp_copy_and_skips_global_adapter():
 
 
 def test_hyv4_compressed_tensors_preserves_unrelated_expert_scheme():
-    class CompressedTensorsConfig:
-        config = compressed_w4a8_config()
-        config["config_groups"]["experts"]["weights"].update(
-            strategy="group", group_size=128
-        )
-        config["config_groups"]["experts"]["input_activations"] = None
-
-        @staticmethod
-        def get_name():
-            return "compressed-tensors"
-
+    config = compressed_w4a8_config()
+    config["config_groups"]["experts"]["weights"].update(
+        strategy="group", group_size=128
+    )
+    config["config_groups"]["experts"]["input_activations"] = None
     prefix = "model.layers.1.mlp.experts.0.gate_proj"
     original = [
         (prefix + ".weight_packed", torch.ones(1, 1, dtype=torch.int32)),
@@ -390,7 +488,7 @@ def test_hyv4_compressed_tensors_preserves_unrelated_expert_scheme():
         (prefix + ".weight_shape", torch.tensor([1, 8])),
     ]
     adapted = list(module("hyv4_w4a8_weights").adapt_checkpoint_weights(
-        CompressedTensorsConfig(), iter(original)
+        real_compressed_config(config), iter(original)
     ))
 
     assert [name for name, _ in adapted] == [name for name, _ in original]
@@ -534,7 +632,7 @@ def test_compressed_tensors_w4a8_conversion_runs_in_parameter_loader():
         torch.tensor([[0x89, 0xF0, 0x12, 0x67]] * 4, dtype=torch.uint8),
     )
     torch.testing.assert_close(
-        loaded[1], torch.full((4, 1), 1.0 / 16.0, dtype=torch.bfloat16),
+        loaded[1], torch.full((4, 1), 1.0 / 16.0, dtype=torch.float32),
     )
 
 
@@ -602,6 +700,62 @@ def test_compressed_tensors_w4a8_loader_accepts_native_keyword_contract():
     )
 
     assert len(loaded) == 2
+
+
+def test_compressed_tensors_w4a8_scale_conversion_avoids_fp16_underflow():
+    from compressed_tensors.quantization import QuantizationArgs
+    from vllm_hcu.model_executor.layers.quantization.compressed_tensors_w4a8_moe import (
+        HcuCompressedTensorsW4A8Int8MoEMethod,
+    )
+
+    moe = SimpleNamespace(
+        moe_backend="aiter",
+        has_bias=False,
+        moe_parallel_config=SimpleNamespace(
+            all2all_backend=None, use_ep=False, tp_size=1,
+        ),
+    )
+    method = HcuCompressedTensorsW4A8Int8MoEMethod(
+        QuantizationArgs(
+            num_bits=4, type="int", strategy="channel", symmetric=True,
+            dynamic=False, group_size=-1, scale_dtype="torch.float16",
+        ),
+        QuantizationArgs(
+            num_bits=8, type="int", strategy="token", symmetric=True,
+            dynamic=True,
+        ),
+        moe,
+    )
+    layer = torch.nn.Module()
+    layer.moe_config = moe
+    loaded = []
+
+    def loader(param, loaded_weight, *args, **kwargs):
+        del param, args, kwargs
+        loaded.append(loaded_weight)
+
+    method.create_weights(
+        layer,
+        num_experts=1,
+        hidden_size=8,
+        intermediate_size_per_partition=4,
+        params_dtype=torch.bfloat16,
+        weight_loader=loader,
+    )
+    scale = torch.full((4, 1), 1e-7, dtype=torch.float16)
+    layer.w13_weight_scale.weight_loader(
+        param=layer.w13_weight_scale,
+        loaded_weight=scale,
+        weight_name="model.layers.0.mlp.experts.w13_weight_scale",
+        shard_id="w1",
+        expert_id=0,
+        return_success=True,
+    )
+
+    expected = scale.float() / 16.0
+    assert loaded[0].dtype == torch.float32
+    assert torch.all(loaded[0] > 0)
+    torch.testing.assert_close(loaded[0], expected, rtol=0, atol=0)
 
 
 def test_custom_manifest_selects_fused_modules_and_mtp_names(tmp_path):
