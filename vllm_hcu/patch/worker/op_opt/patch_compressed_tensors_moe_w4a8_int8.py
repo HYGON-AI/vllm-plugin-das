@@ -12,6 +12,9 @@ from compressed_tensors.quantization import (
     QuantizationStrategy,
     QuantizationType,
 )
+from vllm_hcu.model_executor.layers.quantization.hyv4_ownership import (
+    HYV4_MODEL_MARKER,
+)
 
 from ._common import (
     already_applied,
@@ -85,6 +88,8 @@ def apply_to_module(module: ModuleType) -> bool:
 
     @functools.wraps(original)
     def hcu_get_moe_method(quant_config, layer, layer_name):
+        if not getattr(quant_config, HYV4_MODEL_MARKER, False):
+            return original(quant_config, layer, layer_name)
         scheme = _scheme_dict(quant_config, layer, layer_name)
         if scheme is not None:
             weight_quant = scheme.get("weights")

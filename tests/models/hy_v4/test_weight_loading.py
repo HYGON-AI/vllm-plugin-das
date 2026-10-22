@@ -127,6 +127,7 @@ def test_non_modelopt_quant_config_is_forwarded_to_lm_head(
     HYV4ForCausalLM(vllm_config=vllm_config)
 
     assert captured["quant_config"] is quant_config
+    assert quant_config._vllm_hcu_hyv4_model is True
 
 
 def test_compute_logits_keeps_hidden_state_in_model_dtype() -> None:
@@ -660,6 +661,18 @@ def test_hyv4_fp8_scales_before_weights_preserves_fp32_router(hyv4_fp8_checkpoin
     # The router must not round via BF16 when decoding its FP32 parameter.
     torch.testing.assert_close(model.model.layers[0].mlp.gate.weight,
                                torch.full((4, 64), 2.0002), rtol=0, atol=0)
+
+
+def test_hyv4_int8_dequantizes_in_fp32_before_bfloat16_cast():
+    weight = torch.tensor([[-127]], dtype=torch.int8)
+    scale = torch.tensor([[0.0007]], dtype=torch.float32)
+
+    actual = hy_v4_model._dequantize_hyv4_fp8_weight(
+        weight, scale, torch.bfloat16
+    )
+    expected = (weight.float() * scale).to(torch.bfloat16)
+
+    torch.testing.assert_close(actual, expected, rtol=0, atol=0)
 
 
 @pytest.mark.parametrize("bad_weight", [torch.full((4, 64), float("nan")),

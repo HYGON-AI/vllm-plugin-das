@@ -139,6 +139,8 @@ def test_hyv4_compressed_tensors_w4a8_experts_select_hcu_method():
     )
 
     class FakeCompressedTensorsConfig:
+        _vllm_hcu_hyv4_model = True
+
         def _add_fused_moe_to_target_scheme_map(self):
             pass
 
@@ -220,13 +222,33 @@ def test_hyv4_compressed_tensors_packed_experts_adapt_to_hcu_layout():
     )
 
 
+def test_hyv4_compressed_tensors_prefix_regex_uses_native_match_semantics():
+    """A native selector prefix regex must adapt the same checkpoint names."""
+    class CompressedTensorsConfig:
+        config = compressed_w4a8_config(target=r"re:.*\.mlp\.experts")
+
+        @staticmethod
+        def get_name():
+            return "compressed-tensors"
+
+    prefix = "model.layers.1.mlp.experts.0.gate_proj"
+    packed = torch.ones((1, 1), dtype=torch.int32)
+    adapted = dict(module("hyv4_w4a8_weights").adapt_checkpoint_weights(
+        CompressedTensorsConfig(),
+        [
+            (prefix + ".weight_packed", packed),
+            (prefix + ".weight_shape", torch.tensor([1, 8])),
+        ],
+    ))
+
+    assert set(adapted) == {prefix + ".weight"}
+    assert adapted[prefix + ".weight"] is packed
+
+
 def test_standard_packed_experts_load_without_hyv4_weight_adapter():
     """The global W4A8 route must accept native packed checkpoint names."""
     from vllm.model_executor.layers.fused_moe.routed_experts import (
         RoutedExperts,
-    )
-    from vllm_hcu.model_executor.layers.quantization.compressed_tensors_w4a8_moe import (
-        HcuCompressedTensorsW4A8Int8MoEMethod,
     )
     from vllm_hcu.patch.worker.op_opt.moe import patch_layer
 
@@ -246,7 +268,9 @@ def test_standard_packed_experts_load_without_hyv4_weight_adapter():
     owner = SimpleNamespace(
         layer_name="experts",
         moe_config=SimpleNamespace(hidden_dim_unpadded=8),
-        quant_method=object.__new__(HcuCompressedTensorsW4A8Int8MoEMethod),
+        quant_method=SimpleNamespace(
+            _vllm_hcu_compressed_tensors_w4a8_int8_moe=True,
+        ),
         w13_weight=parameter,
         get_expert_mapping=lambda include_fused: [
             ("w13_", "experts.0.gate_proj.", 0, "w1")
@@ -396,6 +420,53 @@ def test_hcu_compressed_tensors_w4a8_selector_is_strict():
     assert not _is_hcu_w4a8_scheme(*schemes(has_bias=True))
 
 
+def test_hcu_compressed_tensors_w4a8_selector_requires_hyv4_owner():
+    from compressed_tensors.quantization import QuantizationArgs
+    from vllm_hcu.patch.worker.op_opt import (
+        patch_compressed_tensors_moe_w4a8_int8 as patch,
+    )
+
+    selected_by_original = object()
+
+    class CompressedTensorsMoEMethod:
+        @staticmethod
+        def get_moe_method(quant_config, layer, layer_name):
+            del quant_config, layer, layer_name
+            return selected_by_original
+
+    target = ModuleType(patch.TARGET_MODULE)
+    target.CompressedTensorsMoEMethod = CompressedTensorsMoEMethod
+    assert patch.apply_to_module(target)
+
+    weight = QuantizationArgs(
+        num_bits=4, type="int", strategy="channel", symmetric=True,
+        dynamic=False, group_size=-1,
+    )
+    activation = QuantizationArgs(
+        num_bits=8, type="int", strategy="token", symmetric=True,
+        dynamic=True,
+    )
+
+    class QuantConfig:
+        def _add_fused_moe_to_target_scheme_map(self):
+            pass
+
+        def get_scheme_dict(self, layer, name):
+            del layer, name
+            return {
+                "weights": weight,
+                "input_activations": activation,
+                "format": "pack-quantized",
+            }
+
+    layer = SimpleNamespace(moe_config=SimpleNamespace(has_bias=False))
+    selected = CompressedTensorsMoEMethod.get_moe_method(
+        QuantConfig(), layer, "model.layers.0.mlp.experts"
+    )
+
+    assert selected is selected_by_original
+
+
 def test_compressed_tensors_w4a8_conversion_runs_in_parameter_loader():
     from compressed_tensors.compressors.pack_quantized.helpers import pack_to_int32
     from compressed_tensors.quantization import QuantizationArgs
@@ -465,6 +536,72 @@ def test_compressed_tensors_w4a8_conversion_runs_in_parameter_loader():
     torch.testing.assert_close(
         loaded[1], torch.full((4, 1), 1.0 / 16.0, dtype=torch.bfloat16),
     )
+
+
+def test_compressed_tensors_w4a8_loader_accepts_native_keyword_contract():
+    from compressed_tensors.compressors.pack_quantized.helpers import pack_to_int32
+    from compressed_tensors.quantization import QuantizationArgs
+    from vllm_hcu.model_executor.layers.quantization.compressed_tensors_w4a8_moe import (
+        HcuCompressedTensorsW4A8Int8MoEMethod,
+    )
+
+    moe = SimpleNamespace(
+        moe_backend="aiter",
+        has_bias=False,
+        moe_parallel_config=SimpleNamespace(
+            all2all_backend=None, use_ep=False, tp_size=1,
+        ),
+    )
+    method = HcuCompressedTensorsW4A8Int8MoEMethod(
+        QuantizationArgs(
+            num_bits=4, type="int", strategy="channel", symmetric=True,
+            dynamic=False, group_size=-1,
+        ),
+        QuantizationArgs(
+            num_bits=8, type="int", strategy="token", symmetric=True,
+            dynamic=True,
+        ),
+        moe,
+    )
+    layer = torch.nn.Module()
+    layer.moe_config = moe
+    loaded = []
+
+    def loader(param, loaded_weight, *args, **kwargs):
+        del param, args, kwargs
+        loaded.append(loaded_weight)
+
+    method.create_weights(
+        layer,
+        num_experts=1,
+        hidden_size=8,
+        intermediate_size_per_partition=4,
+        params_dtype=torch.bfloat16,
+        weight_loader=loader,
+    )
+    packed = pack_to_int32(
+        torch.tensor([[-8, -7, -1, 0, 1, 2, 6, 7]] * 4, dtype=torch.int8),
+        4,
+    )
+
+    layer.w13_weight.weight_loader(
+        param=layer.w13_weight,
+        loaded_weight=packed,
+        weight_name="model.layers.0.mlp.experts.w13_weight",
+        shard_id="w1",
+        expert_id=0,
+        return_success=True,
+    )
+    layer.w13_weight_scale.weight_loader(
+        param=layer.w13_weight_scale,
+        loaded_weight=torch.ones((4, 1), dtype=torch.bfloat16),
+        weight_name="model.layers.0.mlp.experts.w13_weight_scale",
+        shard_id="w1",
+        expert_id=0,
+        return_success=True,
+    )
+
+    assert len(loaded) == 2
 
 
 def test_custom_manifest_selects_fused_modules_and_mtp_names(tmp_path):

@@ -78,6 +78,9 @@ from vllm.platforms import current_platform
 from vllm.sequence import IntermediateTensors
 
 import vllm_hcu.platforms.envs as henvs
+from vllm_hcu.model_executor.layers.quantization.hyv4_ownership import (
+    mark_hyv4_quant_config,
+)
 
 from .attention import (
     HYV4MLAAttention,
@@ -181,7 +184,7 @@ def _dequantize_hyv4_fp8_weight(
             expanded_scale = expanded_scale.repeat_interleave(
                 weight_size // scale_size, dim=dimension
             )
-        result = weight.to(out_dtype) * expanded_scale.to(out_dtype)
+        result = (weight.float() * expanded_scale.float()).to(out_dtype)
     elif (
         out_dtype == torch.bfloat16
         and encoded_scale.dtype == torch.uint8
@@ -1008,7 +1011,7 @@ class HYV4ForCausalLM(nn.Module, SupportsPP, SupportsLoRA, MixtureOfExperts):
     def __init__(self, *, vllm_config: VllmConfig, prefix: str = ""):
         super().__init__()
         config = vllm_config.model_config.hf_config
-        quant_config = vllm_config.quant_config
+        quant_config = mark_hyv4_quant_config(vllm_config.quant_config)
         self.config = config
         self.quant_config = quant_config
         if quant_config is not None:

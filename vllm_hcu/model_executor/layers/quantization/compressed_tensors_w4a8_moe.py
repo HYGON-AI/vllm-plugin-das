@@ -14,6 +14,10 @@ from vllm.model_executor.layers.fused_moe.config import FusedMoEConfig
 
 from .slimquant_w4a8 import SlimQuantW4A8Int8AiterMoEMethod
 
+HCU_COMPRESSED_W4A8_METHOD_MARKER = (
+    "_vllm_hcu_compressed_tensors_w4a8_int8_moe"
+)
+
 
 def repack_compressed_tensors_int4(weight: torch.Tensor) -> torch.Tensor:
     """Convert offset-packed INT32 storage to signed high-first nibbles."""
@@ -37,6 +41,8 @@ class HcuCompressedTensorsW4A8Int8MoEMethod(
     SlimQuantW4A8Int8AiterMoEMethod
 ):
     """Run packed compressed-tensors W4A8 experts with the HCU MoE path."""
+
+    _vllm_hcu_compressed_tensors_w4a8_int8_moe = True
 
     def __init__(
         self,
@@ -117,7 +123,7 @@ class HcuCompressedTensorsW4A8Int8MoEMethod(
         def wrap_weight(parameter, name):
             load = parameter.weight_loader
 
-            def load_packed(param, value, *args, **kwargs):
+            def load_packed(param, loaded_weight, *args, **kwargs):
                 shard = shard_id(args, kwargs)
                 down = name == "w2_weight"
                 if shard not in (("w2",) if down else ("w1", "w3")):
@@ -142,14 +148,17 @@ class HcuCompressedTensorsW4A8Int8MoEMethod(
                     if down
                     else (intermediate * tp, input_size // 8)
                 )
-                if value.dtype != torch.int32 or tuple(value.shape) != expected:
+                if (
+                    loaded_weight.dtype != torch.int32
+                    or tuple(loaded_weight.shape) != expected
+                ):
                     raise ValueError(
                         f"compressed-tensors expert {shard} requires INT32 "
-                        f"shape {expected}, got {value.dtype} "
-                        f"{tuple(value.shape)}"
+                        f"shape {expected}, got {loaded_weight.dtype} "
+                        f"{tuple(loaded_weight.shape)}"
                     )
-                value = repack_compressed_tensors_int4(value)
-                return load(param, value, *args, **kwargs)
+                loaded_weight = repack_compressed_tensors_int4(loaded_weight)
+                return load(param, loaded_weight, *args, **kwargs)
 
             load_packed.__self__ = getattr(load, "__self__", None)
             parameter.weight_loader = load_packed
@@ -157,7 +166,7 @@ class HcuCompressedTensorsW4A8Int8MoEMethod(
         def wrap_scale(parameter, name):
             load = parameter.weight_loader
 
-            def load_scale(param, value, *args, **kwargs):
+            def load_scale(param, loaded_weight, *args, **kwargs):
                 shard = shard_id(args, kwargs)
                 down = name == "w2_weight_scale"
                 if shard not in (("w2",) if down else ("w1", "w3")):
@@ -174,19 +183,19 @@ class HcuCompressedTensorsW4A8Int8MoEMethod(
                     )
                 channels = hidden if down else intermediate * tp
                 expected = (channels, 1)
-                if tuple(value.shape) != expected:
+                if tuple(loaded_weight.shape) != expected:
                     raise ValueError(
                         "compressed-tensors expert scale requires shape "
-                        f"{expected}, got {tuple(value.shape)}"
+                        f"{expected}, got {tuple(loaded_weight.shape)}"
                     )
-                if not value.numel() or not torch.all(
-                    torch.isfinite(value) & (value > 0)
+                if not loaded_weight.numel() or not torch.all(
+                    torch.isfinite(loaded_weight) & (loaded_weight > 0)
                 ).item():
                     raise ValueError(
                         "compressed-tensors expert scale must be finite and "
                         "positive"
                     )
-                return load(param, value / 16.0, *args, **kwargs)
+                return load(param, loaded_weight / 16.0, *args, **kwargs)
 
             load_scale.__self__ = getattr(load, "__self__", None)
             parameter.weight_loader = load_scale
@@ -198,6 +207,7 @@ class HcuCompressedTensorsW4A8Int8MoEMethod(
 
 
 __all__ = [
+    "HCU_COMPRESSED_W4A8_METHOD_MARKER",
     "HcuCompressedTensorsW4A8Int8MoEMethod",
     "repack_compressed_tensors_int4",
 ]

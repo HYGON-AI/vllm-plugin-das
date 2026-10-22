@@ -36,17 +36,17 @@ _FACTORY_MARKER = "_vllm_hcu_moe_layer_factory"
 _EXPERT_MAP_MARKER = "_vllm_hcu_moe_layer_expert_map"
 _GET_WEIGHTS_MARKER = "_vllm_hcu_moe_layer_get_weights"
 _LOAD_WEIGHTS_MARKER = "_vllm_hcu_moe_layer_load_weights"
+_HCU_COMPRESSED_W4A8_METHOD_MARKER = (
+    "_vllm_hcu_compressed_tensors_w4a8_int8_moe"
+)
+_PACKED_EXPERT_ADAPTER_MARKER = "_vllm_hcu_hyv4_packed_expert_adapter"
 
 
 def _should_adapt_packed_expert_names(owner) -> bool:
-    from vllm_hcu.model_executor.layers.quantization.hyv4_w4a8_weights import (
-        PACKED_EXPERT_ADAPTER_MARKER,
-    )
-
     return not bool(
         getattr(
             getattr(owner, "quant_config", None),
-            PACKED_EXPERT_ADAPTER_MARKER,
+            _PACKED_EXPERT_ADAPTER_MARKER,
             False,
         )
     )
@@ -302,13 +302,12 @@ def apply_to_module(module: ModuleType) -> bool:
 
     @functools.wraps(load_weights)
     def hcu_load_weights(self, weights):
-        from vllm_hcu.model_executor.layers.quantization.compressed_tensors_w4a8_moe import (
-            HcuCompressedTensorsW4A8Int8MoEMethod,
-        )
-
-        uses_hcu_compressed_w4a8 = isinstance(
-            getattr(self, "quant_method", None),
-            HcuCompressedTensorsW4A8Int8MoEMethod,
+        uses_hcu_compressed_w4a8 = bool(
+            getattr(
+                getattr(self, "quant_method", None),
+                _HCU_COMPRESSED_W4A8_METHOD_MARKER,
+                False,
+            )
         )
         for expert_name, loaded_weight in weights:
             if uses_hcu_compressed_w4a8 and _should_adapt_packed_expert_names(self):

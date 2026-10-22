@@ -128,7 +128,7 @@ def _matches_compressed_target(target: str, name: str) -> bool:
     if target in ("Linear", "RoutedExperts"):
         return True
     if target.startswith("re:"):
-        return re.fullmatch(target[3:], name) is not None
+        return re.match(target[3:], name) is not None
     return name == target or name.endswith("." + target)
 
 

@@ -26,6 +26,9 @@ from vllm.sequence import IntermediateTensors
 from vllm.v1.outputs import SamplerOutput
 from vllm.v1.sample.metadata import SamplingMetadata
 from vllm.v1.sample.sampler import Sampler
+from vllm_hcu.model_executor.layers.quantization.hyv4_ownership import (
+    mark_hyv4_quant_config,
+)
 
 from .model import (
     HYV4DecoderLayer,
@@ -282,7 +285,9 @@ class HYV4MultiTokenPredictor(nn.Module, MixtureOfExperts):
         self.num_mtp_layers = 1
         # Serialized names still follow the target's explicit format when the
         # draft executes unquantized. Never use this owner for draft allocation.
-        self.checkpoint_quant_config = vllm_config.quant_config
+        self.checkpoint_quant_config = mark_hyv4_quant_config(
+            vllm_config.quant_config
+        )
         self.quant_config = _remap_mtp_quant_exclusions(
             _create_mtp_quant_config(config, vllm_config.quant_config),
             self.mtp_start_layer_idx, 1,
