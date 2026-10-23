@@ -17,8 +17,10 @@ import importlib
 import threading
 
 from vllm_hcu.lightop_env import configure_lightop_environment
+from vllm_hcu.moe_config_env import configure_tuned_moe_config_folder
 
 configure_lightop_environment()
+configure_tuned_moe_config_folder()
 
 from vllm_hcu.compatibility import (
     VllmCompatibilityError,

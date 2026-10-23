@@ -198,6 +198,7 @@ setup(
             "so/*.so",
             "include/*.h",
             "model_executor/layers/fused_moe/ep_table.json",
+            "model_executor/layers/fused_moe/moe_configs/*.json",
         ]
     },
     ext_modules=ext_modules,
