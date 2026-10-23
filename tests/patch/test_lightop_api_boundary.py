@@ -29,6 +29,11 @@ PUBLIC_CATEGORIES = {
     "sampling",
     "tensor",
 }
+# This versioned fast path has a maintained fallback when older wheels omit it.
+# If installed, it must still be exported by the public category.
+OPTIONAL_CATEGORIZED_EXPORTS = {
+    ("lightop.attention", "fused_deepseek_v4_qnorm_rope_kv_rope_quant_insert_pcp"),
+}
 CLAMP_OWNER = (
     "vllm_hcu/model_executor/layers/fused_moe/experts/"
     "dpsk_v4_deep_gemm_moe.py"
@@ -788,6 +793,7 @@ def test_installed_lightop_exports_cover_production_symbols() -> None:
     used = categorized_symbols(REPOSITORY / "vllm_hcu")
     env = dict(os.environ)
     env["LIGHTOP_REQUIRED_EXPORTS"] = json.dumps(sorted(used))
+    env["LIGHTOP_OPTIONAL_EXPORTS"] = json.dumps(sorted(OPTIONAL_CATEGORIZED_EXPORTS))
     env["LIGHTOP_REQUIRED_LEGACY_ROOT_EXPORTS"] = json.dumps(
         sorted({symbol for _, symbol, _ in LEGACY_TOP_LEVEL_IMPORTS})
     )
@@ -812,6 +818,9 @@ def test_installed_lightop_exports_cover_production_symbols() -> None:
             "os.environ['LIGHTOP_REQUIRED_LEGACY_ROOT_EXPORTS']); "
             "modules={name: importlib.import_module(name) "
             "for name, _symbol in required}; "
+            "optional=json.loads(os.environ['LIGHTOP_OPTIONAL_EXPORTS']); "
+            "required=[(name, symbol) for name, symbol in required "
+            "if [name, symbol] not in optional or hasattr(modules[name], symbol)]; "
             "lightop=importlib.import_module('lightop'); "
             "missing_public=[(name, symbol) for name, symbol in required "
             "if symbol not in modules[name].__all__]; "

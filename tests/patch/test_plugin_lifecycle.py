@@ -578,6 +578,12 @@ def test_installed_cli_defers_hcu_offline_eplb_fields_until_engine_args():
     result = _fresh_python(
         r'''
 import json
+import tempfile
+from transformers import Qwen3Config
+
+# Argument parsing requires a real local config, not an unmounted model path.
+model_directory = tempfile.TemporaryDirectory()
+Qwen3Config().save_pretrained(model_directory.name)
 
 from vllm.engine.arg_utils import EngineArgs
 from vllm.utils.argparse_utils import FlexibleArgumentParser
@@ -586,7 +592,7 @@ from vllm_hcu.patch.config import get_hcu_config
 parser = FlexibleArgumentParser()
 EngineArgs.add_cli_args(parser)
 namespace = parser.parse_args([
-    "--model", "/models/Hy4-preview-Channel-FP8-w8a8",
+    "--model", model_directory.name,
     "--eplb-config", json.dumps({
         "window_size": 16,
         "step_interval": 16,
@@ -793,7 +799,9 @@ def test_worker_selects_plugin_owned_model_runner(
 def test_hcu_worker_rejects_model_runner_v1(cpu_safe_hcu_worker_module):
     with pytest.raises(RuntimeError, match="only Model Runner V2"):
         cpu_safe_hcu_worker_module._create_model_runner(
-            object(), object(), use_v2_model_runner=False
+            SimpleNamespace(model_config=SimpleNamespace(hf_config=SimpleNamespace(
+                model_type="qwen3"
+            ))), object(), use_v2_model_runner=False
         )
 
 
@@ -906,7 +914,7 @@ def test_hcu_model_runner_v2_binds_router_while_worker_weight_pool_is_active(
     upstream_module = ModuleType(upstream_name)
     events: list[object] = []
     pool_active = False
-    model = object()
+    model = SimpleNamespace(modules=lambda: ())
 
     class UpstreamGPUModelRunner:
         def __init__(self, vllm_config, device):

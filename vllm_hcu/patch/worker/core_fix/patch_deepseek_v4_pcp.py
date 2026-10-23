@@ -57,14 +57,13 @@ def _pcp_insert_op():
     # LightOp's PCP entry has separate Q/KV lengths and position vectors.
     # KVNorm remains the caller's responsibility, unlike the combined op.
     try:
-        import lightop
+        from lightop import attention as native
     except ImportError:
         return None
-    native = getattr(lightop, "op", None)
-    if native is None:
+    try:
+        op = getattr(native, "fused_deepseek_v4_qnorm_rope_kv_rope_quant_insert_pcp")
+    except AttributeError:
         return None
-    op = getattr(native, "fused_deepseek_v4_qnorm_rope_kv_rope_quant_insert_pcp",
-                 None)
     return op if callable(op) else None
 
 

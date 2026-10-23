@@ -6,12 +6,21 @@ from __future__ import annotations
 
 import ast
 import json
+import os
+import subprocess
 import sys
 from pathlib import Path
 
 import pytest
 import yaml
 
+
+V0281_FALLBACK_IMAGE = (
+    '10.16.1.152:5000/jenkins/model_test_env/vllm:0.28.1rc1-latest'
+)
+V0281_IMAGE_EXPRESSION = (
+    "${{ vars.HCU_CI_IMAGE_V0281 || '" + V0281_FALLBACK_IMAGE + "' }}"
+)
 
 REPOSITORY = Path(__file__).resolve().parents[2]
 CI_SCRIPTS = REPOSITORY / ".github" / "scripts" / "hcu_ci"
@@ -111,15 +120,38 @@ def test_pull_request_gates_target_v0281_dev() -> None:
         assert workflow["on"]["pull_request"]["branches"] == ["v0.28.1-dev"]
 
 
+def test_default_image_build_runtime_matches_the_ci_environment_lock() -> None:
+    workflow = _workflow("release-docker-image.yml")
+    lock = json.loads(
+        (REPOSITORY / ".github/workflows/configs/hcu-runner-environment.json")
+        .read_text(encoding="utf-8")
+    )
+    # Every matrix entry publishes the generic latest tag used by fork PRs.
+    # It must not select a Python/DTK line incompatible with the CI lock.
+    build_runtimes = {
+        (entry["dtk_tag"], entry["python_version"])
+        for entry in workflow["jobs"]["build"]["strategy"]["matrix"]["include"]
+    }
+    allowed_python_lines = {
+        ".".join(version.split(".")[:2])
+        for version in lock["python"]["versions"]
+    }
+    assert build_runtimes
+    for dtk_line, python_line in build_runtimes:
+        assert dtk_line in lock["rocm"]["versions"]
+        assert python_line in allowed_python_lines
+
+
 def test_pr_static_gate_exports_release_environment_to_consumers() -> None:
     workflow = _workflow("hcu-pr-ci.yml")
     static = workflow["jobs"]["static-and-select"]
     resolver = _named_step(static, "Resolve v0.28.1 HCU environment")
 
+    assert workflow["env"]["HCU_CI_IMAGE"] == V0281_IMAGE_EXPRESSION
     assert resolver["id"] == "release-environment"
     assert resolver["env"] == {
         "BASE_REF": "${{ github.event.pull_request.base.ref }}",
-        "HCU_CI_IMAGE_V0281": "${{ vars.HCU_CI_IMAGE_V0281 }}",
+        "HCU_CI_IMAGE_V0281": V0281_IMAGE_EXPRESSION,
     }
     assert '[[ "$BASE_REF" != "v0.28.1-dev" ]]' in resolver["run"]
     assert "HCU_CI_IMAGE_V0281 is required" in resolver["run"]
@@ -148,6 +180,99 @@ def test_pr_static_gate_exports_release_environment_to_consumers() -> None:
     assert selected["with"]["image"] == (
         "${{ needs.static-and-select.outputs.image }}"
     )
+
+
+@pytest.mark.parametrize(
+    ("configured_image", "base_ref", "expected_status"),
+    [
+        ("", "v0.28.1-dev", 0),
+        ("harbor.example/vllm@sha256:" + "a" * 64, "v0.28.1-dev", 0),
+        ("", "v0.25.1", 2),
+    ],
+)
+def test_pr_environment_step_with_fork_fallback_or_variable_override(
+    tmp_path: Path,
+    configured_image: str,
+    base_ref: str,
+    expected_status: int,
+) -> None:
+    workflow = _workflow("hcu-pr-ci.yml")
+    resolver = _named_step(
+        workflow["jobs"]["static-and-select"], "Resolve v0.28.1 HCU environment"
+    )
+    assert workflow["env"]["HCU_CI_IMAGE"] == V0281_IMAGE_EXPRESSION
+    assert resolver["env"]["HCU_CI_IMAGE_V0281"] == V0281_IMAGE_EXPRESSION
+    # GitHub evaluates the expression before passing the value to Bash.
+    image = configured_image or V0281_FALLBACK_IMAGE
+    output = tmp_path / "github-output"
+    result = subprocess.run(
+        ["bash", "-c", resolver["run"]],
+        env={
+            **os.environ,
+            "BASE_REF": base_ref,
+            "HCU_CI_IMAGE_V0281": image,
+            "GITHUB_OUTPUT": str(output),
+        },
+        capture_output=True,
+        text=True,
+        check=False,
+    )
+    assert result.returncode == expected_status, result.stderr
+    if expected_status:
+        assert not output.exists()
+        assert "unsupported HCU CI release ref" in result.stderr
+    else:
+        assert output.read_text().splitlines() == [
+            f"image={image}",
+            "environment_lock=.github/workflows/configs/hcu-runner-environment.json",
+        ]
+
+
+@pytest.mark.parametrize("has_python", [True, False])
+def test_image_resolver_checks_the_default_python_in_the_image(
+    tmp_path: Path,
+    has_python: bool,
+) -> None:
+    image_bin = tmp_path / "image-bin"
+    image_bin.mkdir()
+    if has_python:
+        (image_bin / "python3").symlink_to(sys.executable)
+    fake_bin = tmp_path / "bin"
+    fake_bin.mkdir()
+    docker = fake_bin / "docker"
+    docker.write_text(
+        "#!/bin/bash\n"
+        'case "$1" in\n'
+        "  pull) exit 0 ;;\n"
+        "  run)\n"
+        '    while [[ "$1" != "-lc" ]]; do shift; done\n'
+        '    PATH="$HCU_TEST_IMAGE_BIN" /bin/bash --noprofile --norc -c "$2" ;;\n'
+        '  image) printf "%s\\n" "$HCU_TEST_RESOLVED_IMAGE" ;;\n'
+        "  *) exit 1 ;;\n"
+        "esac\n"
+    )
+    docker.chmod(0o755)
+    expected = "registry.example/vllm@sha256:" + "a" * 64
+    result = subprocess.run(
+        ["bash", str(REPOSITORY / "scripts/ci/hcu/hcu_ci_resolve_image.sh")],
+        env={
+            **os.environ,
+            "PATH": str(fake_bin) + os.pathsep + os.environ["PATH"],
+            "HCU_CI_IMAGE": "registry.example/vllm:0.28.1rc1-latest",
+            "HCU_TEST_IMAGE_BIN": str(image_bin),
+            "HCU_TEST_RESOLVED_IMAGE": expected,
+        },
+        capture_output=True,
+        text=True,
+        check=False,
+    )
+    if has_python:
+        assert result.returncode == 0, result.stderr
+        assert result.stdout.strip() == expected
+    else:
+        assert result.returncode == 2
+        assert "without the default python3" in result.stderr
+        assert not result.stdout
 
 
 def test_pr_ci_uses_immutable_event_shas_and_trusted_host_helpers() -> None:

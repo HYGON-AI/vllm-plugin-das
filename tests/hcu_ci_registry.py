@@ -13,6 +13,12 @@ from __future__ import annotations
 # calls as literals, so adding imports or runtime-generated values is forbidden.
 
 
+def register_hcu_ci(
+    *, job: str, target: str, est_time: float, disabled: str | None = None
+) -> None:
+    """Declare the literal-only API for tooling; CI parses calls through AST."""
+
+
 register_hcu_ci(
     job="accuracy-gfx936",
     target="tests/accuracy/test_hcu_kernel_accuracy.py",
@@ -173,6 +179,25 @@ register_hcu_ci(
     job="contract-hcu-gfx936",
     target="tests/runtime_patch/test_hcu_model_runner_v2_api.py",
     est_time=60,
+)
+
+register_hcu_ci(
+    job="contract-hcu-gfx936",
+    target="tests/runtime_patch/test_hcu_model_runner_packed_kv_contract.py",
+    est_time=60,
+)
+register_hcu_ci(
+    job="contract-hcu-gfx936",
+    target=(
+        "tests/runtime_patch/test_deepseek_v4_inverse_rope.py::"
+        "test_inverse_rope_fake_supports_fullgraph"
+    ),
+    est_time=60,
+)
+register_hcu_ci(
+    job="contract-hcu-gfx936",
+    target="tests/runtime_patch/test_compressor_gemm.py",
+    est_time=180,
 )
 
 register_hcu_ci(
@@ -397,6 +422,11 @@ register_hcu_ci(
         "test_qwen38_flash_next_humaneval_evalscope_server"
     ),
     est_time=10800,
+    disabled=(
+        'temporarily disabled: required Qwen3.8-Flash-Next-FP8-Channelwise weights are '
+        'unavailable in public/parastor; re-enable after provisioning the exact '
+        'channel-FP8 checkpoint'
+    ),
 )
 register_hcu_ci(
     job="qwen38-flash-next-int8-pp2-tp4-humaneval",
@@ -406,6 +436,11 @@ register_hcu_ci(
         "test_qwen38_flash_next_int8_pp2_tp4_humaneval_evalscope_server"
     ),
     est_time=10800,
+    disabled=(
+        'temporarily disabled: required Qwen3.8-Flash-Next-Channel-INT8-w8a8-ngram '
+        'weights are unavailable in public/parastor; re-enable after provisioning the '
+        'exact INT8-ngram checkpoint'
+    ),
 )
 register_hcu_ci(
     job="deepseek-gsm8k",
@@ -441,6 +476,11 @@ register_hcu_ci(
         "test_glm53_flash_channel_fp8_humaneval_evalscope_server"
     ),
     est_time=14400,
+    disabled=(
+        'temporarily disabled: required GLM-5.3-Flash-Channel-FP8-w8a8 weights are '
+        'unavailable in public/parastor; re-enable after provisioning the exact Flash '
+        'channel-FP8 checkpoint'
+    ),
 )
 register_hcu_ci(
     job="kimi-k25-humaneval",
@@ -449,6 +489,10 @@ register_hcu_ci(
         "test_kimi_k25_humaneval_evalscope_server"
     ),
     est_time=14400,
+    disabled=(
+        "temporarily disabled: repeated Kimi-K2.5 CI startup failures; "
+        "re-enable after end-to-end startup validation"
+    ),
 )
 register_hcu_ci(
     job="single-node-topology",

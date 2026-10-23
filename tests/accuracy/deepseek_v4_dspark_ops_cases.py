@@ -380,14 +380,20 @@ def test_auto_w4a8_qwen_padding_matches_ht_and_ll_reference() -> None:
     )
 
 
-def test_contiguous_channel_fp8_deepgemm_matches_dequantized_reference() -> None:
+@pytest.mark.parametrize("tokens_per_expert", [256, 512])
+def test_contiguous_channel_fp8_deepgemm_matches_dequantized_reference(
+    tokens_per_expert: int,
+) -> None:
     from deepgemm import (
         marlin_fp8_contiguous_weight,
         m_grouped_fp8_gemm_nt_contiguous,
     )
 
     device = _hcu_device()
-    experts, tokens, hidden, output_size = 2, 256, 128, 256
+    # HCU contiguous grouped GEMM selects an expert per 256-row tile.
+    # An expert boundary inside a tile would exercise an invalid input layout.
+    experts, hidden, output_size = 2, 128, 256
+    tokens = experts * tokens_per_expert
     generator = torch.Generator(device=device).manual_seed(731)
     activation, activation_scale = _channel_fp8_quantize(
         torch.randn(
@@ -553,14 +559,20 @@ def test_lightop_fp8_silu_quant_matches_float_reference_for_ht_and_ll() -> None:
         assert error.max() < 0.35
 
 
-def test_contiguous_channel_int8_deepgemm_matches_dequantized_reference() -> None:
+@pytest.mark.parametrize("tokens_per_expert", [256, 512])
+def test_contiguous_channel_int8_deepgemm_matches_dequantized_reference(
+    tokens_per_expert: int,
+) -> None:
     from deepgemm import (
         marlin_i8_contiguous_weight,
         m_grouped_i8_gemm_nt_contiguous,
     )
 
     device = _hcu_device()
-    experts, tokens, hidden, output_size = 2, 256, 128, 256
+    # HCU contiguous grouped GEMM selects an expert per 256-row tile.
+    # An expert boundary inside a tile would exercise an invalid input layout.
+    experts, hidden, output_size = 2, 128, 256
+    tokens = experts * tokens_per_expert
     generator = torch.Generator(device=device).manual_seed(738)
     activation, activation_scale = _channel_int8_quantize(
         torch.randn(

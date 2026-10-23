@@ -322,11 +322,10 @@ def test_prepare_is_lazy_narrow_idempotent_and_keeps_main_role():
         "assert initial_targets==["
         "'vllm.distributed.device_communicators.base_device_communicator',"
         "'vllm.forward_context',"
-        "'vllm.third_party.flash_linear_attention.ops.chunk',"
         "'vllm.utils.deep_gemm',"
         "'vllm.v1.attention.backend',"
         "'vllm.v1.worker.dp_utils',"
-        "'vllm.v1.worker.ubatch_utils']; "
+        "'vllm.v1.worker.ubatch_utils'], initial_targets; "
         "assert not (business & sys.modules.keys()); "
         "first=prepare_worker_patches(); second=prepare_worker_patches(); "
         "print(json.dumps({'first':len(first),'second':len(second),"
@@ -353,7 +352,6 @@ def test_prepare_is_lazy_narrow_idempotent_and_keeps_main_role():
         "initial_targets_loaded": [
             "vllm.distributed.device_communicators.base_device_communicator",
             "vllm.forward_context",
-            "vllm.third_party.flash_linear_attention.ops.chunk",
             "vllm.utils.deep_gemm",
             "vllm.v1.attention.backend",
             "vllm.v1.worker.dp_utils",
@@ -362,7 +360,6 @@ def test_prepare_is_lazy_narrow_idempotent_and_keeps_main_role():
         "targets_loaded": [
             "vllm.distributed.device_communicators.base_device_communicator",
             "vllm.forward_context",
-            "vllm.third_party.flash_linear_attention.ops.chunk",
             "vllm.utils.deep_gemm",
             "vllm.v1.attention.backend",
             "vllm.v1.worker.dp_utils",

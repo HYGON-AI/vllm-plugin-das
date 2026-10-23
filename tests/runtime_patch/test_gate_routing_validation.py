@@ -9,12 +9,17 @@ import torch.nn.functional as F
 
 
 @pytest.fixture
-def validator():
+def validator_module():
     source = Path(__file__).resolve().parents[2] / "tools/validate_deepseek_v4_gate.py"
     spec = importlib.util.spec_from_file_location("gate_routing_validator", source)
     module = importlib.util.module_from_spec(spec)
     spec.loader.exec_module(module)
-    return module.validate_topk_routing
+    return module
+
+
+@pytest.fixture
+def validator(validator_module):
+    return validator_module.validate_topk_routing
 
 
 def routing_case(ids):
@@ -48,3 +53,22 @@ def test_rejects_wrong_weights_for_valid_topk(validator):
     logits, ids, weights = routing_case([0, 1, 2, 3, 4, 5])
     with pytest.raises(AssertionError):
         validator(logits, ids, torch.zeros_like(weights), 6, 1.5)
+
+
+def test_fp32_graph_reference_accepts_small_reduction_roundoff(validator_module):
+    eager = torch.tensor([[0.25, -0.5, 0.0]], dtype=torch.float32)
+    captured = eager + torch.tensor([[4e-7, -4e-7, 2e-7]])
+    validator_module.validate_graph_logits(captured, eager, baseline=True)
+
+
+def test_fp32_graph_reference_rejects_material_error(validator_module):
+    eager = torch.tensor([[0.25, -0.5]], dtype=torch.float32)
+    with pytest.raises(AssertionError):
+        validator_module.validate_graph_logits(eager + 1e-3, eager, baseline=True)
+
+
+def test_bf16_gate_graph_still_requires_exact_logits(validator_module):
+    eager = torch.tensor([[0.25, -0.5]], dtype=torch.float32)
+    with pytest.raises(AssertionError):
+        validator_module.validate_graph_logits(eager + 4e-7, eager, baseline=False)
+    validator_module.validate_graph_logits(eager.clone(), eager, baseline=False)

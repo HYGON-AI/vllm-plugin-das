@@ -1,523 +1,190 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright (c) 2026 Hygon Information Technology Co., Ltd.
-"""Packed KV-cache contracts for the HCU V1 runner."""
+"""CPU contracts for the packed KV helpers used by the HCU MRV2 adapter."""
 
 from __future__ import annotations
 
 import importlib
 from types import SimpleNamespace
-from typing import Any
 
 import pytest
 import torch
 
-import vllm.v1.attention.backend as target_attention_backend
-import vllm.v1.kv_cache_interface as kv_cache_interface
 from vllm.v1.kv_cache_interface import (
-    AttentionSpec,
-    KVCacheConfig,
-    KVCacheGroupSpec,
-    KVCacheTensor,
+    AttentionSpec, KVCacheConfig, KVCacheGroupSpec, KVCacheTensor,
     KVQuantMode,
-    MLAAttentionSpec,
 )
 from vllm.v1.simple_kv_offload.manager import SimpleCPUOffloadScheduler
 
 from vllm_hcu.v1.dsa_cache_layer_split import make_packed_kv_tensor
-from vllm_hcu.v1.kv_cache import _allocate_modern_raw_kv_cache
+from vllm_hcu.v1.kv_cache import (
+    _allocate_modern_raw_kv_cache, _reshape_modern_packed_cache,
+)
 
+# These methods operate on real CPU tensors. Retain the registered hardware
+# tier while testing the maintained adapter, without importing the old MRV1.
 pytestmark = pytest.mark.hcu
 
 
-@pytest.fixture(scope="module")
-def runner_module():
-    patch = pytest.MonkeyPatch()
-    # The installed target wheel predates this HCU-only metadata alias.
-    patch.setattr(
-        target_attention_backend,
-        "CpCommonAttentionMetadata",
-        object,
-        raising=False,
-    )
-    # 462fdb0 has no TurboQuant spec. The runner still imports the name,
-    # so expose a stand-in only when the target interface lacks it. Tests
-    # that need the real spec read the class captured before this patch.
-    real_tq_spec = getattr(kv_cache_interface, "TQFullAttentionSpec", None)
-    if real_tq_spec is None:
-        patch.setattr(
-            kv_cache_interface,
-            "TQFullAttentionSpec",
-            type("TQFullAttentionSpec", (), {}),
-            raising=False,
-        )
-    module = importlib.import_module("vllm_hcu.v1.hcu_model_runner")
-    module._target_tq_full_attention_spec = real_tq_spec
-    yield module
-    patch.undo()
-
-
 class _Backend:
-    def __init__(self, *, mla: bool = False) -> None:
+    def __init__(self, *, mla=False, stride_order=None):
         self.mla = mla
-        self.shape_calls: list[tuple[int, int, int, int, str]] = []
+        self.stride_order = stride_order
+        self.shape_calls = []
 
-    def get_kv_cache_shape(
-        self,
-        num_blocks: int,
-        block_size: int,
-        num_kv_heads: int,
-        head_size: int,
-        cache_dtype_str: str,
-    ) -> tuple[int, ...]:
-        self.shape_calls.append(
-            (
-                num_blocks,
-                block_size,
-                num_kv_heads,
-                head_size,
-                cache_dtype_str,
-            )
-        )
+    def get_kv_cache_shape(self, num_blocks, block_size, num_kv_heads, head_size, cache_dtype_str):
+        self.shape_calls.append((num_blocks, block_size, num_kv_heads, head_size, cache_dtype_str))
         if self.mla:
             return (num_blocks, block_size, head_size)
         return (num_blocks, 2, block_size, num_kv_heads, head_size)
 
-    def get_kv_cache_stride_order(self) -> tuple[int, ...]:
-        return (0, 1, 2) if self.mla else (0, 1, 2, 3, 4)
-
-    def get_kv_cache_block_dim(self, *args: object, **kwargs: object) -> int:
-        return 0
+    def get_kv_cache_stride_order(self):
+        return self.stride_order or ((0, 1, 2) if self.mla else (0, 1, 2, 3, 4))
 
 
-def _group(
-    group_id: int,
-    layer_names: list[str],
-    spec: AttentionSpec,
-    backend: _Backend,
-) -> SimpleNamespace:
-    return SimpleNamespace(
-        kv_cache_group_id=group_id,
-        layer_names=layer_names,
-        kv_cache_spec=spec,
-        backend=backend,
-    )
-
-
-def _runner(
-    runner_module: Any,
-    config: KVCacheConfig,
-    groups: list[SimpleNamespace],
-    *,
-    cache_dtype: str = "fp8",
-    use_mla: bool = False,
-):
-    runner = object.__new__(runner_module.GPUModelRunner)
-    runner.device = torch.device("cpu")
-    runner.runner_only_attn_layers = set()
-    runner.kv_cache_config = config
-    runner.attn_groups = [groups]
-    runner.cache_config = SimpleNamespace(cache_dtype=cache_dtype)
-    runner.vllm_config = SimpleNamespace(
-        attention_config=SimpleNamespace(backend=None),
-        model_config=SimpleNamespace(use_mla=use_mla),
-    )
-    return runner
-
-
-def _plain_spec(*, quant_mode: KVQuantMode = KVQuantMode.NONE) -> AttentionSpec:
+def _plain_spec(*, quant_mode=KVQuantMode.NONE):
     return AttentionSpec(
-        block_size=2,
-        num_kv_heads=1,
-        head_size=2,
-        dtype=torch.float16,
-        kv_quant_mode=quant_mode,
+        block_size=2, num_kv_heads=1, head_size=2,
+        dtype=torch.float16, kv_quant_mode=quant_mode,
     )
 
 
-def _packed_tensor(
-    size: int,
-    layer_name: str,
-    *,
-    page_size: int,
-    offset: int,
-    block_stride: int,
-    backing_id: object = ("test-packed",),
-):
+def _packed_tensor(size, name, *, page_size, offset, block_stride, backing_id=("test-packed",)):
     return make_packed_kv_tensor(
-        KVCacheTensor,
-        size=size,
-        layer_names=[layer_name],
-        page_size=page_size,
-        offset=offset,
-        block_stride=block_stride,
-        backing_id=backing_id,
+        KVCacheTensor, size=size, layer_names=[name], page_size=page_size,
+        offset=offset, block_stride=block_stride, backing_id=backing_id,
     )
 
 
-def test_runner_propagates_backend_stride_capability_to_attention_spec(
-    runner_module,
-    monkeypatch: pytest.MonkeyPatch,
-) -> None:
+def test_packed_cache_observes_backend_physical_stride_order():
+    spec = AttentionSpec(block_size=2, num_kv_heads=3, head_size=4, dtype=torch.float16)
+    descriptor = _packed_tensor(256, "layer", page_size=spec.page_size_bytes, offset=0, block_stride=128)
+    raw, _ = _allocate_modern_raw_kv_cache(SimpleNamespace(kv_cache_tensors=[descriptor]), torch.device("cpu"))
+    backend = _Backend(stride_order=(0, 1, 3, 2, 4))
+
+    view = _reshape_modern_packed_cache(raw["layer"], descriptor, spec, backend, 2, "auto")
+
+    assert view.shape == (2, 2, 2, 3, 4)
+    assert view.stride() == (64, 24, 4, 8, 1)
+    view[1, 0, 1, 2, 3] = 7
+    flat = raw["layer"].view(torch.float16)
+    assert flat[64 + 4 + 16 + 3] == 7
+    assert torch.count_nonzero(flat[:64]) == 0
+
+
+def test_runner_allocates_one_packed_backing_and_independent_plain_tensors():
     spec = _plain_spec()
-    config = SimpleNamespace(name="config")
-    entered_configs: list[object] = []
-    backend_calls: list[None] = []
+    config = SimpleNamespace(kv_cache_tensors=[
+        _packed_tensor(64, "packed.0", page_size=spec.page_size_bytes, offset=0, block_stride=32),
+        _packed_tensor(64, "packed.1", page_size=spec.page_size_bytes, offset=16, block_stride=32),
+        _packed_tensor(16, "plain.0", page_size=16, offset=0, block_stride=0, backing_id=None),
+        _packed_tensor(16, "plain.1", page_size=16, offset=0, block_stride=0, backing_id=None),
+    ])
 
-    class _CurrentConfig:
-        def __init__(self, current: object) -> None:
-            self.current = current
+    tensors, _ = _allocate_modern_raw_kv_cache(config, torch.device("cpu"))
 
-        def __enter__(self) -> None:
-            entered_configs.append(self.current)
-
-        def __exit__(self, *args: object) -> None:
-            return None
-
-    class _StrideBackend:
-        @staticmethod
-        def indexes_kv_by_block_stride() -> bool:
-            backend_calls.append(None)
-            return True
-
-    layer = SimpleNamespace(
-        get_kv_cache_spec=lambda vllm_config: spec,
-        get_attn_backend=lambda: _StrideBackend,
-    )
-    monkeypatch.setattr(runner_module, "has_ec_transfer", lambda: False)
-    monkeypatch.setattr(
-        runner_module,
-        "get_layers_from_vllm_config",
-        lambda vllm_config, layer_type: {"layer": layer},
-    )
-    monkeypatch.setattr(
-        runner_module,
-        "set_current_vllm_config",
-        _CurrentConfig,
-    )
-    runner = object.__new__(runner_module.GPUModelRunner)
-    runner.vllm_config = config
-    runner.shared_kv_cache_layers = {}
-
-    result = runner.get_kv_cache_spec()
-
-    assert result["layer"].indexes_kv_by_block_stride is True
-    assert entered_configs == [config]
-    assert backend_calls == [None]
+    pointer = lambda name: tensors[name].untyped_storage().data_ptr()
+    assert pointer("packed.0") == pointer("packed.1")
+    assert pointer("plain.0") != pointer("plain.1")
+    assert pointer("packed.0") != pointer("plain.0")
 
 
-def test_runner_allocates_one_packed_backing_and_independent_plain_tensors(
-    runner_module,
-) -> None:
+def test_modern_allocator_uses_explicit_pool_identity():
     spec = _plain_spec()
-    layers = ["packed.0", "packed.1", "plain.0", "plain.1"]
-    config = KVCacheConfig(
-        num_blocks=2,
-        kv_cache_tensors=[
-            _packed_tensor(
-                64,
-                "packed.0",
-                page_size=spec.page_size_bytes,
-                offset=0,
-                block_stride=32,
-            ),
-            _packed_tensor(
-                64,
-                "packed.1",
-                page_size=spec.page_size_bytes,
-                offset=16,
-                block_stride=32,
-            ),
-            KVCacheTensor(16, ["plain.0"]),
-            KVCacheTensor(16, ["plain.1"]),
-        ],
-        kv_cache_groups=[KVCacheGroupSpec(layers, spec)],
-    )
-    runner = _runner(runner_module, config, [])
-
-    tensors = runner._allocate_kv_cache_tensors(config)
-
-    assert tensors["packed.0"].untyped_storage().data_ptr() == tensors[
-        "packed.1"
-    ].untyped_storage().data_ptr()
-    assert tensors["plain.0"].untyped_storage().data_ptr() != tensors[
-        "plain.1"
-    ].untyped_storage().data_ptr()
-    assert tensors["packed.0"].untyped_storage().data_ptr() != tensors[
-        "plain.0"
-    ].untyped_storage().data_ptr()
-
-
-def test_modern_allocator_uses_explicit_pool_identity() -> None:
-    spec = _plain_spec()
-    tensors = [
-        _packed_tensor(
-            64,
-            "shared.0",
-            page_size=spec.page_size_bytes,
-            offset=0,
-            block_stride=32,
-            backing_id=("pool-a",),
-        ),
-        _packed_tensor(
-            64,
-            "shared.1",
-            page_size=spec.page_size_bytes,
-            offset=16,
-            block_stride=32,
-            backing_id=("pool-a",),
-        ),
-        _packed_tensor(
-            64,
-            "independent.0",
-            page_size=spec.page_size_bytes,
-            offset=0,
-            block_stride=32,
-            backing_id=("pool-b",),
-        ),
+    descriptors = [
+        _packed_tensor(64, "shared.0", page_size=spec.page_size_bytes, offset=0, block_stride=32, backing_id=("a",)),
+        _packed_tensor(64, "shared.1", page_size=spec.page_size_bytes, offset=16, block_stride=32, backing_id=("a",)),
+        _packed_tensor(64, "independent", page_size=spec.page_size_bytes, offset=0, block_stride=32, backing_id=("b",)),
     ]
-    raw, _ = _allocate_modern_raw_kv_cache(
-        SimpleNamespace(kv_cache_tensors=tensors),
-        torch.device("cpu"),
-    )
-
-    assert raw["shared.0"].untyped_storage().data_ptr() == raw[
-        "shared.1"
-    ].untyped_storage().data_ptr()
-    assert raw["shared.0"].untyped_storage().data_ptr() != raw[
-        "independent.0"
-    ].untyped_storage().data_ptr()
+    raw, _ = _allocate_modern_raw_kv_cache(SimpleNamespace(kv_cache_tensors=descriptors), torch.device("cpu"))
+    assert raw["shared.0"].untyped_storage().data_ptr() == raw["shared.1"].untyped_storage().data_ptr()
+    assert raw["shared.0"].untyped_storage().data_ptr() != raw["independent"].untyped_storage().data_ptr()
 
 
-def test_modern_allocator_rejects_ambiguous_legacy_packed_pools() -> None:
+def test_modern_allocator_rejects_ambiguous_legacy_packed_pools():
     spec = _plain_spec()
-    tensors = [
-        _packed_tensor(
-            64,
-            "pool.0",
-            page_size=spec.page_size_bytes,
-            offset=0,
-            block_stride=32,
-            backing_id=None,
-        ),
-        _packed_tensor(
-            64,
-            "pool.1",
-            page_size=spec.page_size_bytes,
-            offset=0,
-            block_stride=32,
-            backing_id=None,
-        ),
+    descriptors = [
+        _packed_tensor(64, name, page_size=spec.page_size_bytes, offset=0, block_stride=32, backing_id=None)
+        for name in ("a", "b")
     ]
     with pytest.raises(ValueError, match="explicit backing_id"):
-        _allocate_modern_raw_kv_cache(
-            SimpleNamespace(kv_cache_tensors=tensors),
-            torch.device("cpu"),
-        )
+        _allocate_modern_raw_kv_cache(SimpleNamespace(kv_cache_tensors=descriptors), torch.device("cpu"))
 
 
-def test_runner_uses_per_layer_dtype_and_target_nonpacked_reshape(
-    runner_module,
-    monkeypatch: pytest.MonkeyPatch,
-) -> None:
-    monkeypatch.setattr(runner_module, "get_hcu_flash_attn_mode", lambda: "classic")
-    plain_spec = _plain_spec()
-    quant_spec = _plain_spec(quant_mode=KVQuantMode.FP8_PER_TENSOR)
-    plain_backend = _Backend()
-    quant_backend = _Backend()
-    layer_specs = [
-        ("plain", plain_spec, plain_backend),
-        ("quant", quant_spec, quant_backend),
-    ]
-    tq_cls = runner_module._target_tq_full_attention_spec
-    tq_backend = None
-    if tq_cls is not None:
-        tq_spec = tq_cls(
-            block_size=2,
-            num_kv_heads=1,
-            head_size=2,
-            dtype=torch.float16,
-            tq_slot_size=8,
-        )
-        tq_backend = _Backend()
-        layer_specs.append(("tq", tq_spec, tq_backend))
-    config = KVCacheConfig(
-        num_blocks=2,
-        kv_cache_tensors=[
-            KVCacheTensor(2 * spec.page_size_bytes, [name])
-            for name, spec, _backend in layer_specs
-        ],
-        kv_cache_groups=[
-            KVCacheGroupSpec([name], spec) for name, spec, _backend in layer_specs
-        ],
+@pytest.mark.parametrize("quant_mode,expected", [(KVQuantMode.NONE, "auto"), (KVQuantMode.FP8_PER_TENSOR, "fp8")])
+def test_packed_cache_uses_per_layer_cache_dtype(quant_mode, expected):
+    spec = _plain_spec(quant_mode=quant_mode)
+    descriptor = _packed_tensor(64, "layer", page_size=spec.page_size_bytes, offset=0, block_stride=32)
+    backend = _Backend()
+    raw, _ = _allocate_modern_raw_kv_cache(SimpleNamespace(kv_cache_tensors=[descriptor]), torch.device("cpu"))
+
+    view = _reshape_modern_packed_cache(raw["layer"], descriptor, spec, backend, 2, "fp8")
+
+    assert backend.shape_calls == [(2, 2, 1, 2, expected)]
+    assert view.dtype == torch.float16
+    assert view.shape == (2, 2, 2, 1, 2)
+
+
+def test_packed_cache_uses_storage_block_size_for_compressed_mla():
+    # The adapter consumes this spec protocol across target versions; older
+    # target dataclasses do not expose compress_ratio/storage_block_size.
+    spec = SimpleNamespace(
+        block_size=128, storage_block_size=1, num_kv_heads=1, head_size=2,
+        dtype=torch.float16, kv_quant_mode=KVQuantMode.NONE, page_size_bytes=4,
     )
-    groups = [
-        _group(group_id, [name], spec, backend)
-        for group_id, (name, spec, backend) in enumerate(layer_specs)
-    ]
-    runner = _runner(runner_module, config, groups, cache_dtype="fp8")
-    raw = runner._allocate_kv_cache_tensors(config)
-
-    caches = runner._reshape_kv_cache_tensors(raw, [2] * len(layer_specs))
-
-    assert plain_backend.shape_calls[-1][-1] == "auto"
-    assert quant_backend.shape_calls[-1][-1] == "fp8"
-    if tq_backend is not None:
-        assert tq_backend.shape_calls[-1][-1] == "fp8"
-    assert {cache.shape for cache in caches.values()} == {(2, 2, 2, 1, 2)}
-    assert caches["plain"].is_contiguous()
-    assert caches["quant"].is_contiguous()
-    if tq_backend is not None:
-        assert caches["tq"].is_contiguous()
-
-
-def test_runner_uses_storage_block_size_for_compressed_mla(
-    runner_module,
-    monkeypatch: pytest.MonkeyPatch,
-) -> None:
-    monkeypatch.setattr(runner_module, "get_hcu_flash_attn_mode", lambda: "classic")
-    spec = MLAAttentionSpec(
-        block_size=128,
-        num_kv_heads=1,
-        head_size=2,
-        dtype=torch.float16,
-        compress_ratio=128,
-    )
+    descriptor = _packed_tensor(2 * spec.page_size_bytes, "mla", page_size=spec.page_size_bytes, offset=0, block_stride=spec.page_size_bytes)
     backend = _Backend(mla=True)
-    config = KVCacheConfig(
-        num_blocks=2,
-        kv_cache_tensors=[KVCacheTensor(2 * spec.page_size_bytes, ["mla"])],
-        kv_cache_groups=[KVCacheGroupSpec(["mla"], spec)],
-    )
-    runner = _runner(
-        runner_module,
-        config,
-        [_group(0, ["mla"], spec, backend)],
-        use_mla=True,
-    )
-    raw = runner._allocate_kv_cache_tensors(config)
+    raw, _ = _allocate_modern_raw_kv_cache(SimpleNamespace(kv_cache_tensors=[descriptor]), torch.device("cpu"))
 
-    caches = runner._reshape_kv_cache_tensors(raw, [64])
+    view = _reshape_modern_packed_cache(raw["mla"], descriptor, spec, backend, 2, "fp8")
 
     assert spec.storage_block_size == 1
     assert backend.shape_calls == [(2, 1, 1, 2, "auto")]
-    assert caches["mla"].shape == (2, 1, 2)
-
-    invalid = MLAAttentionSpec(
-        block_size=64,
-        num_kv_heads=1,
-        head_size=2,
-        dtype=torch.float16,
-        compress_ratio=128,
-    )
-    invalid_config = KVCacheConfig(
-        num_blocks=0,
-        kv_cache_tensors=[KVCacheTensor(0, ["invalid"])],
-        kv_cache_groups=[KVCacheGroupSpec(["invalid"], invalid)],
-    )
-    invalid_runner = _runner(
-        runner_module,
-        invalid_config,
-        [_group(0, ["invalid"], invalid, _Backend(mla=True))],
-        use_mla=True,
-    )
-    with pytest.raises(ValueError, match="page size must be positive"):
-        invalid_runner._reshape_kv_cache_tensors(
-            invalid_runner._allocate_kv_cache_tensors(invalid_config),
-            [64],
-        )
+    assert view.shape == (2, 1, 2)
+    invalid = SimpleNamespace(**{**vars(spec), "storage_block_size": 0})
+    with pytest.raises(ValueError, match="positive"):
+        _reshape_modern_packed_cache(raw["mla"], descriptor, invalid, backend, 2, "fp8")
 
 
-def test_runner_packed_views_preserve_block_stride_and_layer_offset(
-    runner_module,
-    monkeypatch: pytest.MonkeyPatch,
-) -> None:
-    monkeypatch.setattr(runner_module, "get_hcu_flash_attn_mode", lambda: "classic")
+def test_runner_packed_views_preserve_block_stride_and_layer_offset():
     spec = _plain_spec()
-    num_blocks = 2
-    block_stride = 2 * spec.page_size_bytes
-    total_size = num_blocks * block_stride
-    config = KVCacheConfig(
-        num_blocks=num_blocks,
-        kv_cache_tensors=[
-            _packed_tensor(
-                total_size,
-                "layer.0",
-                page_size=spec.page_size_bytes,
-                offset=0,
-                block_stride=block_stride,
-            ),
-            _packed_tensor(
-                total_size,
-                "layer.1",
-                page_size=spec.page_size_bytes,
-                offset=spec.page_size_bytes,
-                block_stride=block_stride,
-            ),
-        ],
-        kv_cache_groups=[KVCacheGroupSpec(["layer.0", "layer.1"], spec)],
-    )
-    backend = _Backend()
-    runner = _runner(
-        runner_module,
-        config,
-        [_group(0, ["layer.0", "layer.1"], spec, backend)],
-    )
-    raw = runner._allocate_kv_cache_tensors(config)
-
-    caches = runner._reshape_kv_cache_tensors(raw, [2])
-    first = caches["layer.0"]
-    second = caches["layer.1"]
-
+    stride = 2 * spec.page_size_bytes
+    descriptors = [
+        _packed_tensor(2 * stride, name, page_size=spec.page_size_bytes, offset=offset, block_stride=stride)
+        for name, offset in (("layer.0", 0), ("layer.1", spec.page_size_bytes))
+    ]
+    raw, by_layer = _allocate_modern_raw_kv_cache(SimpleNamespace(kv_cache_tensors=descriptors), torch.device("cpu"))
+    caches = {
+        name: _reshape_modern_packed_cache(raw[name], by_layer[name], spec, _Backend(), 2, "auto")
+        for name in raw
+    }
+    first, second = caches["layer.0"], caches["layer.1"]
     assert first.shape == second.shape == (2, 2, 2, 1, 2)
-    assert first.stride(0) == second.stride(0) == block_stride // 2
+    assert first.stride(0) == second.stride(0) == stride // 2
     assert second.data_ptr() - first.data_ptr() == spec.page_size_bytes
     first[1].fill_(3)
     second[1].fill_(5)
-    packed = raw["layer.0"].view(num_blocks, block_stride)
-    assert torch.all(packed[1, : spec.page_size_bytes].view(torch.float16) == 3)
-    assert torch.all(packed[1, spec.page_size_bytes :].view(torch.float16) == 5)
+    packed = raw["layer.0"].view(2, stride)
+    assert torch.all(packed[1, :spec.page_size_bytes].view(torch.float16) == 3)
+    assert torch.all(packed[1, spec.page_size_bytes:].view(torch.float16) == 5)
     assert torch.count_nonzero(packed[0]) == 0
 
 
-def test_target_simple_offload_preserves_packed_descriptors() -> None:
+def test_target_simple_offload_preserves_packed_descriptors():
     from vllm_hcu.patch.platform.framework_opt import patch_packed_kv_offload
 
-    patch_packed_kv_offload.apply_to_module(
-        importlib.import_module("vllm.v1.simple_kv_offload.manager")
-    )
+    patch_packed_kv_offload.apply_to_module(importlib.import_module("vllm.v1.simple_kv_offload.manager"))
     spec = _plain_spec()
-    gpu_config = KVCacheConfig(
+    config = KVCacheConfig(
         num_blocks=4,
         kv_cache_tensors=[
-            _packed_tensor(
-                128,
-                "layer.0",
-                page_size=spec.page_size_bytes,
-                offset=0,
-                block_stride=32,
-                backing_id=("offload",),
-            ),
-            _packed_tensor(
-                128,
-                "layer.1",
-                page_size=spec.page_size_bytes,
-                offset=16,
-                block_stride=32,
-                backing_id=("offload",),
-            ),
+            _packed_tensor(128, "a", page_size=spec.page_size_bytes, offset=0, block_stride=32, backing_id=("offload",)),
+            _packed_tensor(128, "b", page_size=spec.page_size_bytes, offset=16, block_stride=32, backing_id=("offload",)),
         ],
-        kv_cache_groups=[
-            KVCacheGroupSpec(["layer.0"], spec),
-            KVCacheGroupSpec(["layer.1"], spec),
-        ],
+        kv_cache_groups=[KVCacheGroupSpec(["a"], spec), KVCacheGroupSpec(["b"], spec)],
     )
-
-    cpu_config = SimpleCPUOffloadScheduler._derive_cpu_config(
-        gpu_config,
-        cpu_capacity_bytes=256,
-    )
-
-    assert cpu_config.num_blocks == 8
-    assert [tensor.size for tensor in cpu_config.kv_cache_tensors] == [256, 256]
-    assert [tensor.offset for tensor in cpu_config.kv_cache_tensors] == [0, 16]
-    assert [tensor.block_stride for tensor in cpu_config.kv_cache_tensors] == [32, 32]
+    cpu = SimpleCPUOffloadScheduler._derive_cpu_config(config, cpu_capacity_bytes=256)
+    assert cpu.num_blocks == 8
+    assert [tensor.size for tensor in cpu.kv_cache_tensors] == [256, 256]
+    assert [tensor.offset for tensor in cpu.kv_cache_tensors] == [0, 16]
+    assert [tensor.block_stride for tensor in cpu.kv_cache_tensors] == [32, 32]
