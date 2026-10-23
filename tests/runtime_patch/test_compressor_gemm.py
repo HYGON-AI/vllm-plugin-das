@@ -314,6 +314,26 @@ def test_blaslt_status_failure_raises_and_falls_back(
 @pytest.mark.parametrize("level", [1, 2])
 @pytest.mark.parametrize("with_draft", [False, True])
 def test_compressor_nt_pool_sleep_wake(monkeypatch, level, with_draft):
+    import vllm.platforms as platforms
+    from vllm.distributed.device_communicators import cuda_wrapper
+    from vllm_hcu.platforms.hcu import HCUPlatform
+
+    # Collection disables plugin activation. This native allocator test must
+    # select the real HCU platform before its CUDA/HIP runtime lookup.
+    platform = HCUPlatform()
+    monkeypatch.setattr(platforms, "_current_platform", platform)
+    monkeypatch.setattr(cuda_wrapper, "current_platform", platform)
+    import ctypes.util
+
+    # DTK 26.10 loads libgalaxyhip; upstream's loaded-library probe only
+    # searches for libamdhip64. Resolve its HIP-compatible library alias.
+    runtime_library = (
+        cuda_wrapper.envs.VLLM_CUDART_SO_PATH
+        or ctypes.util.find_library("amdhip64")
+        or ctypes.util.find_library("galaxyhip")
+    )
+    assert runtime_library, "HCU sleep tests require the HIP runtime library"
+    monkeypatch.setattr(cuda_wrapper.envs, "VLLM_CUDART_SO_PATH", runtime_library)
     from vllm.device_allocator.cumem import CuMemAllocator, cumem_available
     from vllm.v1.worker.gpu_worker import Worker
     from tests.runtime_patch.test_compressor_weights_pool_contract import load_method
@@ -330,70 +350,80 @@ def test_compressor_nt_pool_sleep_wake(monkeypatch, level, with_draft):
         lambda x, w: torch.mm(x, w.T, out_dtype=torch.float32),
     )
 
-    class RunnerBase:
-        def load_model(self, load_dummy_weights=False):
-            self.model = _model(
-                torch.full((2048, 1024), 1, dtype=torch.bfloat16, device="cuda"),
-                input_size=2048,
-            )
-            self.draft = (
-                _model(
-                    torch.full((2048, 1024), 2, dtype=torch.bfloat16, device="cuda"),
+    def run_case():
+        class RunnerBase:
+            def load_model(self, load_dummy_weights=False):
+                self.model = _model(
+                    torch.full((2048, 1024), 1, dtype=torch.bfloat16, device="cuda"),
                     input_size=2048,
-                ) if with_draft else None
-            )
+                )
+                self.draft = (
+                    _model(
+                        torch.full((2048, 1024), 2, dtype=torch.bfloat16, device="cuda"),
+                        input_size=2048,
+                    ) if with_draft else None
+                )
 
-        def get_draft_model(self):
-            return self.draft
+            def get_draft_model(self):
+                return self.draft
 
-    runner_cls = load_method(
-        "vllm_hcu/v1/hcu_model_runner_v2.py", "HcuGPUModelRunnerV2", RunnerBase, {},
-    )
-    runner = runner_cls()
-    config = SimpleNamespace(model_config=SimpleNamespace(
-        enable_nccl_comm_suspend=False,
-    ))
-    worker = SimpleNamespace(
-        model_runner=runner, vllm_config=config,
-        get_draft_model=runner.get_draft_model,
-        _sleep_saved_buffers={}, _sleep_saved_draft_buffers={},
-        synchronize_device=torch.cuda.synchronize,
-        sleep_mode_backend=SimpleNamespace(
-            suspend=lambda level: allocator.sleep(
-                offload_tags=("weights",) if level == 1 else ()
+        runner_cls = load_method(
+            "vllm_hcu/v1/hcu_model_runner_v2.py", "HcuGPUModelRunnerV2", RunnerBase, {},
+        )
+        runner = runner_cls()
+        config = SimpleNamespace(model_config=SimpleNamespace(
+            enable_nccl_comm_suspend=False,
+        ))
+        worker = SimpleNamespace(
+            model_runner=runner, vllm_config=config,
+            get_draft_model=runner.get_draft_model,
+            _sleep_saved_buffers={}, _sleep_saved_draft_buffers={},
+            synchronize_device=torch.cuda.synchronize,
+            sleep_mode_backend=SimpleNamespace(
+                suspend=lambda level: allocator.sleep(
+                    offload_tags=("weights",) if level == 1 else ()
+                ),
+                resume=allocator.wake_up,
             ),
-            resume=allocator.wake_up,
-        ),
-    )
-    try:
-        # The same initial context used by upstream Worker.load_model.
-        with allocator.use_memory_pool(tag="weights"):
-            runner.load_model()
-        models = [model for model in (runner.model, runner.draft) if model is not None]
-        caches = [model.fused_wkv_wgate._vllm_hcu_compressor_nt_weight for model in models]
-        saved = [cache.cpu().clone() for cache in caches]
-        pointers = [cache.data_ptr() for cache in caches]
-        for pointer in pointers:
-            assert any(
-                data.tag == "weights" and ptr <= pointer < ptr + data.handle[1]
-                for ptr, data in allocator.pointer_to_data.items()
-            )
-        torch.cuda.synchronize()
-        before = torch.cuda.mem_get_info()[0]
-        Worker.sleep(worker, level=level)
-        after = torch.cuda.mem_get_info()[0]
-        assert after - before >= sum(cache.numel() * cache.element_size() for cache in caches)
-        Worker.wake_up(worker, tags=["weights"])
-        for model, cache, expected, pointer in zip(models, caches, saved, pointers):
-            assert cache.data_ptr() == pointer
-            torch.testing.assert_close(cache.cpu(), expected)
-            # Level 2 deliberately discards parameters; reload them before use.
-            model.fused_wkv_wgate.weight.data.copy_(expected.T)
-            x = torch.ones(1, 2048, dtype=torch.bfloat16, device="cuda")
-            torch.testing.assert_close(
-                patch._compressor_mm(x, model.fused_wkv_wgate),
-                torch.mm(x, expected.T.to("cuda"), out_dtype=torch.float32),
-            )
-    finally:
-        # Never leave global allocator mappings asleep if an assertion fails.
-        allocator.wake_up()
+        )
+        try:
+            # The same initial context used by upstream Worker.load_model.
+            with allocator.use_memory_pool(tag="weights"):
+                runner.load_model()
+            models = [model for model in (runner.model, runner.draft) if model is not None]
+            caches = [model.fused_wkv_wgate._vllm_hcu_compressor_nt_weight for model in models]
+            saved = [cache.cpu().clone() for cache in caches]
+            pointers = [cache.data_ptr() for cache in caches]
+            for pointer in pointers:
+                assert any(
+                    data.tag == "weights" and ptr <= pointer < ptr + data.handle[1]
+                    for ptr, data in allocator.pointer_to_data.items()
+                )
+            torch.cuda.synchronize()
+            before = torch.cuda.mem_get_info()[0]
+            Worker.sleep(worker, level=level)
+            after = torch.cuda.mem_get_info()[0]
+            assert after - before >= sum(cache.numel() * cache.element_size() for cache in caches)
+            Worker.wake_up(worker, tags=["weights"])
+            for model, cache, expected, pointer in zip(models, caches, saved, pointers):
+                assert cache.data_ptr() == pointer
+                torch.testing.assert_close(cache.cpu(), expected)
+                # Level 2 deliberately discards parameters; reload them before use.
+                model.fused_wkv_wgate.weight.data.copy_(expected.T)
+                x = torch.ones(1, 2048, dtype=torch.bfloat16, device="cuda")
+                torch.testing.assert_close(
+                    patch._compressor_mm(x, model.fused_wkv_wgate),
+                    torch.mm(x, expected.T.to("cuda"), out_dtype=torch.float32),
+                )
+        finally:
+            # Never leave global allocator mappings asleep if an assertion fails.
+            allocator.wake_up()
+
+    run_case()
+    # Drop this case's tensors before releasing retained MemPool references,
+    # so the next parametrized case starts with an unused allocator.
+    import gc
+
+    gc.collect()
+    allocator.release_pools()
+    gc.collect()

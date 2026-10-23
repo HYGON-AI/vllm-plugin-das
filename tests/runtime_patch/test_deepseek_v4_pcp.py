@@ -848,3 +848,27 @@ def test_local_prefill_runs_write_local_output_in_place(
                             + topk[selected, None, None])
     torch.testing.assert_close(local_out, expected)
     assert calls == ([2, 1] if custom_ops and enabled and contiguous else [3])
+
+
+@pytest.mark.parametrize("available", [False, True])
+def test_pcp_insert_op_uses_optional_public_attention_api(monkeypatch, available):
+    lightop = ModuleType("lightop")
+    lightop.__path__ = []
+    attention = ModuleType("lightop.attention")
+    native = lambda *args, **kwargs: None
+    if available:
+        attention.fused_deepseek_v4_qnorm_rope_kv_rope_quant_insert_pcp = native
+    lightop.attention = attention
+    # An available private dispatcher must never satisfy the public contract.
+    lightop.op = SimpleNamespace(
+        fused_deepseek_v4_qnorm_rope_kv_rope_quant_insert_pcp=lambda: pytest.fail(
+            "private LightOp dispatcher selected"
+        )
+    )
+    monkeypatch.setitem(sys.modules, "lightop", lightop)
+    monkeypatch.setitem(sys.modules, "lightop.attention", attention)
+    patch._pcp_insert_op.cache_clear()
+    try:
+        assert patch._pcp_insert_op() is (native if available else None)
+    finally:
+        patch._pcp_insert_op.cache_clear()
