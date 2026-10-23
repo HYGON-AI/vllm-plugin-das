@@ -260,9 +260,15 @@ def _setup_state(tmp_path, monkeypatch: pytest.MonkeyPatch, mode="static"):
     ):
         for name in names:
             monkeypatch.setattr(owner, name, inspect.unwrap(getattr(owner, name)))
-    # Register restoration even when the marker did not exist before apply().
-    # delattr(..., raising=False) records no undo action for an absent marker.
-    monkeypatch.setattr(upstream, api._MARKER, None, raising=False)
+    # Record absence too: apply_to_module adds these attributes directly.
+    for marker in (api._MARKER,):
+        if not hasattr(upstream, marker):
+            monkeypatch.setattr(upstream, marker, None, raising=False)
+        monkeypatch.delattr(upstream, marker, raising=False)
+
+    # CPU contracts exercise real map commits without device-backed pinned
+    # allocations. Hardware allocator behavior belongs to HCU-marked tests.
+    monkeypatch.setattr(upstream, "PIN_MEMORY", False)
 
     model = GenericMoE()
     config, path = config_and_map(tmp_path)
