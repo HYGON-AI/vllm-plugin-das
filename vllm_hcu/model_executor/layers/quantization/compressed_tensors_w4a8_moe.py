@@ -120,10 +120,31 @@ class HcuCompressedTensorsW4A8Int8MoEMethod(
         def shard_id(args, kwargs):
             return kwargs.get("shard_id", args[1] if len(args) > 1 else None)
 
+        def is_nonlocal_expert(load, args, kwargs):
+            # Reuse the loader owner's mapping, including non-contiguous EP
+            # placement. Do not interpret layer.expert_map: HCU may expose an
+            # AITER mask there instead of the native global-to-local mapping.
+            owner = getattr(load, "__self__", None)
+            mapper = getattr(owner, "_map_global_expert_id_to_local_expert_id", None)
+            expert = kwargs.get("expert_id", args[2] if len(args) > 2 else None)
+            return (
+                callable(mapper)
+                and expert is not None
+                and mapper(expert) == -1
+            )
+
+        def skipped_result(args, kwargs):
+            return_success = kwargs.get(
+                "return_success", args[3] if len(args) > 3 else False,
+            )
+            return False if return_success else None
+
         def wrap_weight(parameter, name):
             load = parameter.weight_loader
 
             def load_packed(param, loaded_weight, *args, **kwargs):
+                if is_nonlocal_expert(load, args, kwargs):
+                    return skipped_result(args, kwargs)
                 shard = shard_id(args, kwargs)
                 down = name == "w2_weight"
                 if shard not in (("w2",) if down else ("w1", "w3")):
@@ -167,6 +188,8 @@ class HcuCompressedTensorsW4A8Int8MoEMethod(
             load = parameter.weight_loader
 
             def load_scale(param, loaded_weight, *args, **kwargs):
+                if is_nonlocal_expert(load, args, kwargs):
+                    return skipped_result(args, kwargs)
                 shard = shard_id(args, kwargs)
                 down = name == "w2_weight_scale"
                 if shard not in (("w2",) if down else ("w1", "w3")):

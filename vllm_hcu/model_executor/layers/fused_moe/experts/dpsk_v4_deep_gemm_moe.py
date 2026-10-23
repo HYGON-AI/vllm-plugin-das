@@ -1206,6 +1206,20 @@ def make_deepep_auto_deepgemm_w4a8_moe_kernel(
 ) -> mk.FusedMoEKernel:
     """Build the unified DeepEP HT/LL kernel for SlimQuant W4A8."""
 
+    _validate_deepgemm_w4a8_quant_config(moe_quant_config)
+    return _make_deepep_auto_deepgemm_moe_kernel(
+        moe_quant_config=moe_quant_config,
+        moe_config=moe_config,
+        routing_tables=routing_tables,
+        experts_cls=DeepEPAutoW4A8Experts,
+    )
+
+
+def _validate_deepgemm_w4a8_quant_config(
+    moe_quant_config: FusedMoEQuantConfig,
+    *,
+    allow_clamp: bool = False,
+) -> None:
     if moe_quant_config.weight_quant_dtype != "int4":
         raise ValueError("SlimQuant auto factory requires INT4 W4A8 quantization")
     if (
@@ -1239,16 +1253,43 @@ def make_deepep_auto_deepgemm_w4a8_moe_kernel(
         moe_quant_config.w2_bias,
         moe_quant_config.gemm1_alpha,
         moe_quant_config.gemm1_beta,
-        moe_quant_config.gemm1_clamp_limit,
+        None if allow_clamp else moe_quant_config.gemm1_clamp_limit,
     )
     if any(value is not None for value in unsupported_metadata):
         raise ValueError(
             "SlimQuant auto factory requires symmetric W4A8 without "
             "auxiliary scales, zero points, biases, or clamps"
         )
-    return _make_deepep_auto_deepgemm_moe_kernel(
-        moe_quant_config=moe_quant_config,
-        moe_config=moe_config,
-        routing_tables=routing_tables,
-        experts_cls=DeepEPAutoW4A8Experts,
+
+
+def make_deepep_ht_deepgemm_w4a8_moe_kernel(
+    moe_quant_config: FusedMoEQuantConfig,
+    moe_config: FusedMoEConfig,
+    routing_tables: tuple[torch.Tensor, torch.Tensor, torch.Tensor] | None = None,
+) -> mk.FusedMoEKernel:
+    """Use the PCP HT communicator and one in-place contiguous W4A8 layout."""
+    from vllm.model_executor.layers.fused_moe.all2all_utils import (
+        maybe_make_prepare_finalize,
     )
+
+    _validate_deepgemm_w4a8_quant_config(moe_quant_config, allow_clamp=True)
+    prepare_finalize = maybe_make_prepare_finalize(
+        moe=moe_config,
+        quant_config=moe_quant_config,
+        routing_tables=routing_tables,
+        allow_new_interface=True,
+        use_monolithic=False,
+    )
+    if prepare_finalize is None:
+        raise RuntimeError(
+            "SlimQuant W4A8 PCP HT prepare/finalize was not constructed"
+        )
+    experts = DeepEPAutoW4A8Experts(
+        moe_config=moe_config,
+        quant_config=moe_quant_config,
+        max_num_tokens=0,
+        num_dispatchers=prepare_finalize.num_dispatchers(),
+        fixed_use_low_latency=False,
+    )
+    logger.info_once("Using HYV4 PCP DeepEP HT W4A8 MoE kernel.")
+    return mk.FusedMoEKernel(prepare_finalize, experts)

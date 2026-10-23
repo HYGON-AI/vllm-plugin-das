@@ -578,6 +578,35 @@ def test_w4a8_contiguous_runs_two_hipc_gemms_with_expert_map_and_scales(
     torch.testing.assert_close(output, torch.full_like(output, 2))
 
 
+def test_w4a8_contiguous_preserves_hyv4_swiglu_clamp(monkeypatch):
+    from vllm_hcu.model_executor.layers.quantization import (
+        slimquant_w4a8_deepgemm_runtime as module,
+    )
+
+    calls = []
+    result = (object(), object())
+    lightop = ModuleType("lightop")
+    activation = ModuleType("lightop.activation")
+
+    def clamp_quant(value, *, limit):
+        calls.append((value, limit))
+        return result
+
+    lightop.fuse_silu_mul_clamp_quant = clamp_quant
+    lightop.activation = activation
+    monkeypatch.setitem(sys.modules, "lightop", lightop)
+    monkeypatch.setitem(sys.modules, "lightop.activation", activation)
+    monkeypatch.setattr(
+        module, "fuse_silu_mul_quant",
+        lambda *_args, **_kwargs: pytest.fail("HYV4 clamp was dropped"),
+    )
+    experts = object.__new__(module.DeepEPDeepGemmW4A8ContiguousExperts)
+    experts.quant_config = SimpleNamespace(gemm1_clamp_limit=7.0)
+    gateup = torch.ones((2, 8))
+    assert experts._quantize_activation(gateup, None, None) is result
+    assert calls == [(gateup, 7.0)]
+
+
 def test_w4a8_contiguous_zero_token_output_skips_all_kernels(
     monkeypatch: pytest.MonkeyPatch,
 ):

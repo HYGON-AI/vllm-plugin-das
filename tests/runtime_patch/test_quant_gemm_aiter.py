@@ -4163,10 +4163,12 @@ def test_slimquant_w4a8_moe_method_is_a_direct_fused_moe_method():
 
 
 @pytest.mark.hcu
+@pytest.mark.parametrize("pcp_ht", [False, True])
 def test_slimquant_w4a8_deepep_auto_uses_w4a8_deepgemm_factory_not_aiter(
     monkeypatch: pytest.MonkeyPatch,
+    pcp_ht: bool,
 ):
-    """DP+EP W4A8 must own an auto DeepGEMM kernel, not an AITER fallback."""
+    """DP auto and HYV4 PCP HT must execute modular W4A8 experts."""
 
     from vllm_hcu.model_executor.layers.fused_moe.experts import (
         dpsk_v4_deep_gemm_moe as deepgemm_module,
@@ -4198,7 +4200,10 @@ def test_slimquant_w4a8_deepep_auto_uses_w4a8_deepgemm_factory_not_aiter(
 
     monkeypatch.setattr(
         deepgemm_module,
-        "make_deepep_auto_deepgemm_w4a8_moe_kernel",
+        (
+            "make_deepep_ht_deepgemm_w4a8_moe_kernel"
+            if pcp_ht else "make_deepep_auto_deepgemm_w4a8_moe_kernel"
+        ),
         make_deepep_auto_deepgemm_w4a8_moe_kernel,
         raising=False,
     )
@@ -4219,16 +4224,19 @@ def test_slimquant_w4a8_deepep_auto_uses_w4a8_deepgemm_factory_not_aiter(
 
     moe = SimpleNamespace(
         activation=SimpleNamespace(value="silu"),
-        moe_backend="auto",
+        moe_backend="deep_gemm" if pcp_ht else "auto",
         moe_parallel_config=SimpleNamespace(
-            dp_size=2,
+            dp_size=1 if pcp_ht else 2,
+            pcp_size=8 if pcp_ht else 1,
             use_ep=True,
-            all2all_backend="deepep_auto",
-            use_deepep_auto_kernels=True,
+            all2all_backend="deepep_high_throughput" if pcp_ht else "deepep_auto",
+            use_deepep_auto_kernels=not pcp_ht,
         ),
         _hcu_vllm_config=SimpleNamespace(
             model_config=SimpleNamespace(
-                architectures=["DeepseekV4ForCausalLM"]
+                architectures=[
+                    "HYV4ForCausalLM" if pcp_ht else "DeepseekV4ForCausalLM"
+                ]
             )
         ),
     )
@@ -4264,6 +4272,8 @@ def test_slimquant_w4a8_deepep_auto_uses_w4a8_deepgemm_factory_not_aiter(
     assert factory_calls == [(quant_config, moe, routing_tables)]
     assert processed_layers == [layer]
     assert method.moe_kernel is not None
+    method.process_weights_after_loading(layer)
+    assert processed_layers == [layer]
     x = torch.zeros((2, 4), dtype=torch.bfloat16)
     torch.testing.assert_close(
         method.apply(
