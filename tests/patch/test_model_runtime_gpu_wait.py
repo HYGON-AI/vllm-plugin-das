@@ -186,10 +186,21 @@ def test_dp_rank_uses_coordinator_result_and_restores_environment(monkeypatch):
     assert os.environ["HCU_CI_GPU_MEMORY_WAIT_TIMEOUT_S"] == "42"
 
 
-def test_release_wheel_direct_script_imports_wait_helper_outside_checkout(tmp_path):
+@pytest.mark.parametrize("shadow_tests_package", [False, True])
+def test_release_wheel_direct_script_imports_wait_helper_outside_checkout(
+    tmp_path, shadow_tests_package,
+):
     environment = os.environ.copy()
     environment["VLLM_HCU_RELEASE_WHEEL"] = "1"
     environment["PYTHONPATH"] = ""
+    if shadow_tests_package:
+        foreign_root = tmp_path / "foreign-packages"
+        foreign_tests = foreign_root / "tests"
+        foreign_tests.mkdir(parents=True)
+        (foreign_tests / "__init__.py").write_text(
+            "raise RuntimeError('unrelated installed tests package was imported')\n"
+        )
+        environment["PYTHONPATH"] = str(foreign_root)
     result = subprocess.run(
         [sys.executable, str(Path(runtime.__file__).resolve()), "--help"],
         cwd=tmp_path, env=environment, capture_output=True, text=True, timeout=30,

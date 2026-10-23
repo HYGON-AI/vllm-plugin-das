@@ -24,17 +24,13 @@ import time
 from contextlib import contextmanager
 from contextvars import ContextVar
 from pathlib import Path
-from typing import Any
+from typing import TYPE_CHECKING, Any
 
 import pytest
 
 REPOSITORY = Path(__file__).resolve().parents[2]
-if os.environ.get("VLLM_HCU_RELEASE_WHEEL") == "1":
-    repository_text = str(REPOSITORY)
-    if repository_text not in sys.path:
-        sys.path.append(repository_text)
-
-from tests.fixtures.resources import TestResources as HcuTestResources
+if TYPE_CHECKING:
+    from tests.fixtures.resources import TestResources as HcuTestResources
 
 if __package__:
     from .gpu_memory import configured_gpu_wait_timeout, wait_for_gpu_memory
