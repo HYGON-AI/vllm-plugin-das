@@ -1653,6 +1653,38 @@ def test_deepseek_v4_dspark_draft_clone_reuses_target_deepep_topology() -> None:
     assert get_hcu_config(target_additional).deepep_auto is True
 
 
+def test_deepseek_v4_dspark_megamoe_reuses_target_dp_ep_topology() -> None:
+    from vllm.config.speculative import SpeculativeConfig
+    from vllm.config import ParallelConfig
+
+    target_parallel = ParallelConfig(
+        tensor_parallel_size=1,
+        data_parallel_size=8,
+        enable_expert_parallel=True,
+    )
+    draft_parallel = SpeculativeConfig.create_draft_parallel_config(
+        target_parallel, speculative_draft_tensor_parallel_size=1
+    )
+    assert draft_parallel.data_parallel_size == 1
+    assert draft_parallel.enable_expert_parallel is False
+
+    config = _validation_config(HcuFeatureConfig())
+    config.kernel_config.moe_backend = "deep_gemm_mega_moe"
+    config.model_config.architectures = ["DeepseekV4ForCausalLM"]
+    config.parallel_config = draft_parallel
+    config.speculative_config = SimpleNamespace(
+        method="dspark",
+        target_parallel_config=target_parallel,
+        draft_parallel_config=draft_parallel,
+    )
+
+    patch_vllm_config.validate_and_update_hcu_config(config)
+
+    assert config.parallel_config is target_parallel
+    assert config.parallel_config.data_parallel_size == 8
+    assert config.parallel_config.enable_expert_parallel is True
+
+
 def test_deepseek_v4_dspark_deepep_rejects_mismatched_draft_tp() -> None:
     target_parallel = SimpleNamespace(
         all2all_backend="deepep_low_latency",

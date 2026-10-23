@@ -61,22 +61,29 @@ def _normalize_dspark_draft_deepep_topology(
     vllm_config: object,
     feature_config: HcuFeatureConfig,
 ) -> HcuFeatureConfig:
-    """Reuse the target's DeepEP topology for DeepSeek-V4 DSpark layers.
+    """Reuse the target's distributed-MoE topology for DSpark layers.
 
     Official DSpark constructs a draft ``VllmConfig`` with
     ``SpeculativeConfig.draft_parallel_config`` while retaining the target's
     ``additional_config`` object.  Its generic draft config intentionally drops
     DP and EP, but the DeepSeek-V4 DSpark head contains three real MoE decoder
-    layers.  Those layers must use the same EP group and DeepEP kernels as the
-    target; otherwise they enter naive dispatch against a DeepEP manager, whose
-    pre-routing interface is intentionally unsupported.
+    layers.  Those layers must use the same DP/EP group for DeepEP or MegaMoE;
+    otherwise DeepEP enters unsupported naive dispatch, while MegaMoE fails its
+    required EP8 topology validation.
 
     Object identity distinguishes this internal clone from the target config.
     Reusing the target config is safe only when both tensor-parallel sizes are
     equal, which is also the only topology validated here.
     """
 
-    if not feature_config.deepep_auto or not is_deepseek_v4(vllm_config):
+    kernel_config = getattr(vllm_config, "kernel_config", None)
+    uses_megamoe = (
+        getattr(kernel_config, "moe_backend", None) == "deep_gemm_mega_moe"
+    )
+    if (
+        not (feature_config.deepep_auto or uses_megamoe)
+        or not is_deepseek_v4(vllm_config)
+    ):
         return feature_config
     speculative_config = getattr(vllm_config, "speculative_config", None)
     if getattr(speculative_config, "method", None) != "dspark":
@@ -95,14 +102,14 @@ def _normalize_dspark_draft_deepep_topology(
         return feature_config
     if target_parallel_config is None:
         raise PatchCompatibilityError(
-            "DeepSeek-V4 DSpark deepep_auto requires "
+            "DeepSeek-V4 DSpark distributed MoE requires "
             "SpeculativeConfig.target_parallel_config"
         )
     draft_tp = int(getattr(draft_parallel_config, "tensor_parallel_size", 1))
     target_tp = int(getattr(target_parallel_config, "tensor_parallel_size", 1))
     if draft_tp != target_tp:
         raise ValueError(
-            "DeepSeek-V4 DSpark deepep_auto requires draft and target tensor "
+            "DeepSeek-V4 DSpark distributed MoE requires draft and target tensor "
             f"parallel sizes to match; got draft_tp={draft_tp}, "
             f"target_tp={target_tp}"
         )
