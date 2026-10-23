@@ -481,8 +481,6 @@ class BatchedDeepGemmExperts(mk.FusedMoEExpertsModular):
                     "SlimQuant W4A8 masked weights were not packed before apply"
                 )
             from deepgemm import m_grouped_w4a8_gemm_nt_masked_hipc
-            from lightop.activation import fuse_silu_mul_quant_ep
-
             m_grouped_w4a8_gemm_nt_masked_hipc(
                 (a1q, a1q_scale),
                 (self._deepgemm_w13, self.w1_scale),
@@ -490,10 +488,25 @@ class BatchedDeepGemmExperts(mk.FusedMoEExpertsModular):
                 expert_num_tokens,
                 expected_m,
             )
-            a2q, a2q_scale = fuse_silu_mul_quant_ep(
-                workspace1,
-                tokens_per_expert=expert_num_tokens,
+            clamp_limit = getattr(
+                self.quant_config, "gemm1_clamp_limit", None
             )
+            if clamp_limit is not None and clamp_limit > 0:
+                from lightop import fuse_silu_mul_clamp_quant_ep
+
+                a2q, a2q_scale = fuse_silu_mul_clamp_quant_ep(
+                    workspace1,
+                    limit=clamp_limit,
+                    mask_m=expert_num_tokens,
+                    expect_m=max_num_tokens,
+                )
+            else:
+                from lightop.activation import fuse_silu_mul_quant_ep
+
+                a2q, a2q_scale = fuse_silu_mul_quant_ep(
+                    workspace1,
+                    tokens_per_expert=expert_num_tokens,
+                )
             m_grouped_w4a8_gemm_nt_masked_hipc(
                 (a2q, a2q_scale),
                 (self._deepgemm_w2, self.w2_scale),

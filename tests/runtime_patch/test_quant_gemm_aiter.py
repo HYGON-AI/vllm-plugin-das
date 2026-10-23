@@ -4093,6 +4093,93 @@ def test_slimquant_w4a8_explicit_deep_gemm_requires_deepep_auto():
 
 
 @pytest.mark.hcu
+def test_hyv4_slimquant_w4a8_accepts_explicit_deepep_low_latency(
+    monkeypatch: pytest.MonkeyPatch,
+):
+    """HYV4 DP+EP LL must build the masked W4A8 DeepGEMM kernel."""
+
+    from vllm_hcu.model_executor.layers.fused_moe import deepep_runtime
+    from vllm_hcu.model_executor.layers.fused_moe.experts import (
+        dpsk_v4_deep_gemm_moe as deepgemm_module,
+    )
+    from vllm_hcu.model_executor.layers.quantization import slimquant_w4a8
+
+    factory_calls: list[tuple[object, object, object]] = []
+
+    class W4A8Experts:
+        @staticmethod
+        def process_weights_after_loading(_layer: object) -> None:
+            return None
+
+    class W4A8Kernel:
+        fused_experts = SimpleNamespace(experts=W4A8Experts())
+
+    def make_deepep_ll_deepgemm_w4a8_moe_kernel(
+        *,
+        moe_quant_config: object,
+        moe_config: object,
+        routing_tables: object = None,
+    ) -> W4A8Kernel:
+        factory_calls.append((moe_quant_config, moe_config, routing_tables))
+        return W4A8Kernel()
+
+    monkeypatch.setattr(
+        deepgemm_module,
+        "make_deepep_ll_deepgemm_w4a8_moe_kernel",
+        make_deepep_ll_deepgemm_w4a8_moe_kernel,
+        raising=False,
+    )
+    monkeypatch.setattr(
+        deepep_runtime,
+        "current_platform",
+        SimpleNamespace(is_rocm=lambda: True),
+    )
+    monkeypatch.setattr(
+        deepep_runtime,
+        "_require_slimquant_w4a8_hipc_runtime",
+        lambda **_kwargs: None,
+    )
+    moe = SimpleNamespace(
+        activation=SimpleNamespace(value="silu"),
+        moe_backend="deep_gemm",
+        moe_parallel_config=SimpleNamespace(
+            dp_size=8,
+            pcp_size=1,
+            use_ep=True,
+            all2all_backend="deepep_low_latency",
+            use_deepep_auto_kernels=False,
+        ),
+        _hcu_vllm_config=SimpleNamespace(
+            model_config=SimpleNamespace(architectures=["HYV4ForCausalLM"])
+        ),
+    )
+    method = slimquant_w4a8.SlimQuantW4A8Int8AiterMoEMethod(object(), moe)
+    routing_tables = (object(), object(), object())
+    layer = SimpleNamespace(
+        w13_weight=torch.nn.Parameter(
+            torch.zeros((2, 8, 2), dtype=torch.int8), requires_grad=False
+        ),
+        w2_weight=torch.nn.Parameter(
+            torch.zeros((2, 4, 2), dtype=torch.int8), requires_grad=False
+        ),
+        w13_weight_scale=torch.nn.Parameter(
+            torch.ones((2, 8, 1)), requires_grad=False
+        ),
+        w2_weight_scale=torch.nn.Parameter(
+            torch.ones((2, 4, 1)), requires_grad=False
+        ),
+        w13_input_scale=None,
+        w2_input_scale=None,
+        _expert_routing_tables=lambda: routing_tables,
+    )
+
+    method.process_weights_after_loading(layer)
+
+    assert factory_calls == [(method.moe_quant_config, moe, routing_tables)]
+    assert method.moe_kernel is not None
+
+
+@pytest.mark.hcu
 def test_slimquant_w4a8_dispatch_returns_none_for_unsupported_layer():
     from vllm_hcu.model_executor.layers.quantization import slimquant_w4a8
 
@@ -4338,7 +4425,7 @@ def test_slimquant_w4a8_deepep_auto_accepts_hyv4(
     monkeypatch.setattr(
         deepep_runtime,
         "_require_slimquant_w4a8_hipc_runtime",
-        lambda: None,
+        lambda **_kwargs: None,
     )
     moe = SimpleNamespace(
         activation=SimpleNamespace(value="silu"),
@@ -4355,6 +4442,120 @@ def test_slimquant_w4a8_deepep_auto_accepts_hyv4(
     )
 
     assert deepep_runtime.slimquant_w4a8_uses_deepep_auto(moe) is True
+
+
+@pytest.mark.hcu
+def test_slimquant_w4a8_deepep_auto_preserves_deepseek_arch_membership(
+    monkeypatch: pytest.MonkeyPatch,
+):
+    """Existing DeepSeek-V4 configs may advertise an additional arch."""
+
+    from vllm_hcu.model_executor.layers.fused_moe import deepep_runtime
+
+    monkeypatch.setattr(
+        deepep_runtime,
+        "current_platform",
+        SimpleNamespace(is_rocm=lambda: True),
+    )
+    monkeypatch.setattr(
+        deepep_runtime,
+        "_require_slimquant_w4a8_hipc_runtime",
+        lambda **_kwargs: None,
+    )
+    moe = SimpleNamespace(
+        activation="silu",
+        moe_backend="deep_gemm",
+        moe_parallel_config=SimpleNamespace(
+            dp_size=8,
+            use_ep=True,
+            all2all_backend="deepep_auto",
+            use_deepep_auto_kernels=True,
+        ),
+        _hcu_vllm_config=SimpleNamespace(
+            model_config=SimpleNamespace(
+                architectures=[
+                    "DeepseekV4ForCausalLM",
+                    "DeepseekV4ForSequenceClassification",
+                ]
+            )
+        ),
+    )
+
+    assert deepep_runtime.slimquant_w4a8_uses_deepep_auto(moe) is True
+
+
+@pytest.mark.hcu
+def test_slimquant_w4a8_ll_runtime_requires_only_masked_clamp_ops(
+    monkeypatch: pytest.MonkeyPatch,
+):
+    """Fixed LL must not depend on unused contiguous or unclamped ops."""
+
+    from vllm_hcu.model_executor.layers.fused_moe import deepep_runtime
+
+    noop = lambda *_args, **_kwargs: None
+    monkeypatch.setitem(
+        sys.modules,
+        "deepgemm",
+        _module(
+            "deepgemm",
+            pack_w4a8_moe_hipc_weight=noop,
+            view_w4a8_moe_hipc_weight_n32_layout=noop,
+            m_grouped_w4a8_gemm_nt_masked_hipc=noop,
+        ),
+    )
+    lightop = _package(
+        "lightop",
+        fuse_silu_mul_clamp_quant_ep=noop,
+    )
+    monkeypatch.setitem(sys.modules, "lightop", lightop)
+    monkeypatch.setitem(
+        sys.modules,
+        "lightop.activation",
+        _module("lightop.activation"),
+    )
+    deepep_runtime._require_slimquant_w4a8_hipc_runtime.cache_clear()
+    try:
+        deepep_runtime._require_slimquant_w4a8_hipc_runtime(
+            ll_only=True,
+            clamp=True,
+        )
+    finally:
+        deepep_runtime._require_slimquant_w4a8_hipc_runtime.cache_clear()
+
+
+@pytest.mark.hcu
+def test_slimquant_w4a8_auto_runtime_requires_both_clamp_ops(
+    monkeypatch: pytest.MonkeyPatch,
+):
+    """Auto can choose HT or LL, so clamped activation needs both ABIs."""
+
+    from vllm_hcu.model_executor.layers.fused_moe import deepep_runtime
+
+    noop = lambda *_args, **_kwargs: None
+    monkeypatch.setitem(
+        sys.modules,
+        "deepgemm",
+        _module(
+            "deepgemm",
+            pack_w4a8_moe_hipc_weight=noop,
+            view_w4a8_moe_hipc_weight_n32_layout=noop,
+            m_grouped_w4a8_gemm_nt_contiguous_hipc=noop,
+            m_grouped_w4a8_gemm_nt_masked_hipc=noop,
+        ),
+    )
+    lightop = _package(
+        "lightop",
+        fuse_silu_mul_clamp_quant_ep=noop,
+    )
+    monkeypatch.setitem(sys.modules, "lightop", lightop)
+    deepep_runtime._require_slimquant_w4a8_hipc_runtime.cache_clear()
+    try:
+        with pytest.raises(RuntimeError, match="fuse_silu_mul_clamp_quant"):
+            deepep_runtime._require_slimquant_w4a8_hipc_runtime(clamp=True)
+        lightop.fuse_silu_mul_clamp_quant = noop
+        deepep_runtime._require_slimquant_w4a8_hipc_runtime(clamp=True)
+    finally:
+        deepep_runtime._require_slimquant_w4a8_hipc_runtime.cache_clear()
 
 
 @pytest.mark.hcu
@@ -4532,7 +4733,7 @@ def test_slimquant_w4a8_deepep_auto_rejects_missing_ll_lightop(
             "deepep_low_latency",
             False,
             "auto",
-            "requires all2all_backend='deepep_auto'",
+            "DeepEP LL requires HYV4ForCausalLM",
         ),
         (
             1,

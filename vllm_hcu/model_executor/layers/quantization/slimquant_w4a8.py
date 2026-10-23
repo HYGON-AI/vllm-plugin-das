@@ -151,24 +151,30 @@ class SlimQuantW4A8Int8AiterMoEMethod(FusedMoEMethodBase):
         if moe_backend == "deep_gemm":
             from vllm_hcu.model_executor.layers.fused_moe.deepep_runtime import (
                 slimquant_w4a8_uses_deepep_ht,
+                slimquant_w4a8_uses_deepep_ll,
             )
 
             parallel_config = getattr(moe, "moe_parallel_config", None)
-            if not slimquant_w4a8_uses_deepep_ht(moe) and (
-                parallel_config is None
-                or getattr(parallel_config, "all2all_backend", None)
-                != "deepep_auto"
-                or getattr(
-                    parallel_config,
-                    "use_deepep_auto_kernels",
-                    None,
+            if (
+                not slimquant_w4a8_uses_deepep_ht(moe)
+                and not slimquant_w4a8_uses_deepep_ll(moe)
+                and (
+                    parallel_config is None
+                    or getattr(parallel_config, "all2all_backend", None)
+                    != "deepep_auto"
+                    or getattr(
+                        parallel_config,
+                        "use_deepep_auto_kernels",
+                        None,
+                    )
+                    is False
                 )
-                is False
             ):
                 raise ValueError(
                     "SlimQuant W4A8 deep_gemm requires DP+EP with "
-                    "all2all_backend='deepep_auto', or HYV4 PCP+EP with "
-                    "all2all_backend='deepep_high_throughput'"
+                    "all2all_backend='deepep_auto' or 'deepep_low_latency', "
+                    "or HYV4 PCP+EP with all2all_backend="
+                    "'deepep_high_throughput'"
                 )
         self.moe = moe
         self.quant_config = quant_config
@@ -281,11 +287,15 @@ class SlimQuantW4A8Int8AiterMoEMethod(FusedMoEMethodBase):
         from vllm_hcu.model_executor.layers.fused_moe.deepep_runtime import (
             slimquant_w4a8_uses_deepep_auto,
             slimquant_w4a8_uses_deepep_ht,
+            slimquant_w4a8_uses_deepep_ll,
         )
 
         uses_deepep_ht = slimquant_w4a8_uses_deepep_ht(getattr(self, "moe", None))
-        uses_deepep = uses_deepep_ht or slimquant_w4a8_uses_deepep_auto(
-            getattr(self, "moe", None)
+        uses_deepep_ll = slimquant_w4a8_uses_deepep_ll(getattr(self, "moe", None))
+        uses_deepep = (
+            uses_deepep_ht
+            or uses_deepep_ll
+            or slimquant_w4a8_uses_deepep_auto(getattr(self, "moe", None))
         )
         weight_generation = _slimquant_moe_tensor_generation(
             layer,
@@ -324,12 +334,17 @@ class SlimQuantW4A8Int8AiterMoEMethod(FusedMoEMethodBase):
             from vllm_hcu.model_executor.layers.fused_moe.experts.dpsk_v4_deep_gemm_moe import (
                 make_deepep_auto_deepgemm_w4a8_moe_kernel,
                 make_deepep_ht_deepgemm_w4a8_moe_kernel,
+                make_deepep_ll_deepgemm_w4a8_moe_kernel,
             )
 
             factory = (
                 make_deepep_ht_deepgemm_w4a8_moe_kernel
                 if uses_deepep_ht
-                else make_deepep_auto_deepgemm_w4a8_moe_kernel
+                else (
+                    make_deepep_ll_deepgemm_w4a8_moe_kernel
+                    if uses_deepep_ll
+                    else make_deepep_auto_deepgemm_w4a8_moe_kernel
+                )
             )
             self.moe_kernel = factory(
                 moe_quant_config=self.moe_quant_config,
@@ -441,6 +456,7 @@ class SlimQuantW4A8Int8AiterMoEMethod(FusedMoEMethodBase):
         from vllm_hcu.model_executor.layers.fused_moe.deepep_runtime import (
             slimquant_w4a8_uses_deepep_auto,
             slimquant_w4a8_uses_deepep_ht,
+            slimquant_w4a8_uses_deepep_ll,
         )
 
         moe_kernel = getattr(self, "moe_kernel", None)
@@ -449,6 +465,7 @@ class SlimQuantW4A8Int8AiterMoEMethod(FusedMoEMethodBase):
             moe = getattr(self, "moe", None)
             uses_deepep = (
                 slimquant_w4a8_uses_deepep_ht(moe)
+                or slimquant_w4a8_uses_deepep_ll(moe)
                 or slimquant_w4a8_uses_deepep_auto(moe)
             )
         if uses_deepep:

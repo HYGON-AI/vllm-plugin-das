@@ -3730,10 +3730,10 @@ def test_channel_int8_auto_factory_builds_unified_ht_ll_kernel(
     }
 
 
-@pytest.mark.parametrize("pcp_ht", [False, True])
-def test_slimquant_w4a8_auto_factory_reuses_unified_prepare_finalize(
+@pytest.mark.parametrize("route", ["auto", "ht", "ll"])
+def test_slimquant_w4a8_factory_reuses_unified_prepare_finalize(
     monkeypatch: pytest.MonkeyPatch,
-    pcp_ht: bool,
+    route: str,
 ):
     import vllm.model_executor.layers.fused_moe.all2all_utils as all2all_utils
     from vllm.model_executor.layers.fused_moe.config import FusedMoEQuantConfig
@@ -3754,13 +3754,18 @@ def test_slimquant_w4a8_auto_factory_reuses_unified_prepare_finalize(
             return 8
 
     prepare_finalize = (
-        SimpleNamespace(num_dispatchers=lambda: 8) if pcp_ht else PrepareFinalize()
+        PrepareFinalize()
+        if route == "auto"
+        else SimpleNamespace(
+            num_dispatchers=lambda: 8,
+            max_num_tokens_per_rank=lambda: 64,
+        )
     )
     prepare_calls = []
 
     def maybe_make_prepare_finalize(**kwargs):
         prepare_calls.append(kwargs)
-        if not pcp_ht:
+        if route == "auto":
             prepare_finalize.ll_prepare_finalize.routing_tables = kwargs[
                 "routing_tables"
             ]
@@ -3791,14 +3796,15 @@ def test_slimquant_w4a8_auto_factory_reuses_unified_prepare_finalize(
         per_out_ch_quant=False,
         block_shape=None,
         weight_dtype="int4",
-        gemm1_clamp_limit=7.0 if pcp_ht else None,
+        gemm1_clamp_limit=7.0,
     )
     moe_config = SimpleNamespace()
 
-    factory = (
-        module.make_deepep_ht_deepgemm_w4a8_moe_kernel
-        if pcp_ht else module.make_deepep_auto_deepgemm_w4a8_moe_kernel
-    )
+    factory = {
+        "auto": module.make_deepep_auto_deepgemm_w4a8_moe_kernel,
+        "ht": module.make_deepep_ht_deepgemm_w4a8_moe_kernel,
+        "ll": module.make_deepep_ll_deepgemm_w4a8_moe_kernel,
+    }[route]
     kernel = factory(
         moe_quant_config=quant_config,
         moe_config=moe_config,
@@ -3817,9 +3823,9 @@ def test_slimquant_w4a8_auto_factory_reuses_unified_prepare_finalize(
     assert constructed == {
         "moe_config": moe_config,
         "quant_config": quant_config,
-        "max_num_tokens": 0 if pcp_ht else 64,
+        "max_num_tokens": 0 if route == "ht" else 64,
         "num_dispatchers": 8,
-        "fixed_use_low_latency": False if pcp_ht else None,
+        "fixed_use_low_latency": {"auto": None, "ht": False, "ll": True}[route],
     }
 
 

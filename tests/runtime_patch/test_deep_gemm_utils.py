@@ -816,6 +816,87 @@ def test_w4a8_masked_batched_apply_propagates_scales_and_token_counts(
     assert activation_call["tokens_per_expert"] is expert_num_tokens
 
 
+def test_w4a8_masked_batched_apply_uses_configured_swiglu_clamp(
+    monkeypatch: pytest.MonkeyPatch,
+):
+    """The LL W4A8 activation must preserve HYV4's SwiGLU limit."""
+
+    clamp_call: dict[str, object] = {}
+
+    def clamp_quantize(tensor: torch.Tensor, **kwargs):
+        clamp_call.update(tensor=tensor, **kwargs)
+        return (
+            torch.full((1, 2, 64), 7, dtype=torch.int8),
+            torch.full((1, 2, 1), 0.5, dtype=torch.float32),
+        )
+
+    _install_categorized_lightop(
+        monkeypatch,
+        activation_name="fuse_silu_mul_quant_ep",
+        activation_kernel=lambda *_args, **_kwargs: (_ for _ in ()).throw(
+            AssertionError("unclamped W4A8 LL activation was selected")
+        ),
+        gemm_name="unused_w4a8_gemm",
+        gemm_kernel=lambda *_args: None,
+    )
+    sys.modules["lightop"].fuse_silu_mul_clamp_quant_ep = clamp_quantize
+
+    deepgemm = ModuleType("deepgemm")
+    deepgemm.__path__ = []
+    deepgemm.m_grouped_w4a8_gemm_nt_masked_hipc = lambda *_args: None
+    monkeypatch.setitem(sys.modules, "deepgemm", deepgemm)
+
+    hcu = _load_batched_deep_gemm_apply()
+    hcu["current_platform"] = SimpleNamespace(is_rocm=lambda: True)
+    expert_num_tokens = torch.tensor([2], dtype=torch.int32)
+    experts = SimpleNamespace(
+        block_shape=None,
+        quant_config=SimpleNamespace(
+            use_int8_w8a8=True,
+            use_fp8_w8a8=False,
+            weight_quant_dtype="int4",
+            gemm1_clamp_limit=10.0,
+        ),
+        w1_scale=torch.ones((1, 128, 1), dtype=torch.float32),
+        w2_scale=torch.ones((1, 64, 1), dtype=torch.float32),
+        _deepgemm_w13=torch.empty(
+            (1, 1, 4, 4, 32, 8), dtype=torch.int8
+        ),
+        _deepgemm_w2=torch.empty(
+            (1, 1, 2, 4, 32, 8), dtype=torch.int8
+        ),
+        _hcu_logical_n=128,
+        _hcu_logical_k=64,
+        moe_problem_size=lambda *_args: (1, 2, 128, 64, 1),
+        estimate_expected_m=lambda **_kwargs: 1,
+    )
+
+    hcu["apply"](
+        experts,
+        output=torch.empty((1, 2, 64), dtype=torch.bfloat16),
+        hidden_states=torch.zeros((1, 2, 64), dtype=torch.int8),
+        w1=torch.zeros((1, 128, 32), dtype=torch.int8),
+        w2=torch.zeros((1, 64, 32), dtype=torch.int8),
+        topk_weights=torch.ones((2, 1)),
+        topk_ids=torch.zeros((2, 1), dtype=torch.int32),
+        activation="silu",
+        global_num_experts=1,
+        expert_map=None,
+        a1q_scale=torch.ones((1, 2, 1), dtype=torch.float32),
+        a2_scale=None,
+        workspace13=torch.empty(256, dtype=torch.bfloat16),
+        workspace2=torch.empty(256, dtype=torch.bfloat16),
+        expert_tokens_meta=SimpleNamespace(
+            expert_num_tokens=expert_num_tokens
+        ),
+        apply_router_weight_on_input=False,
+    )
+
+    assert clamp_call["limit"] == 10.0
+    assert clamp_call["mask_m"] is expert_num_tokens
+    assert clamp_call["expect_m"] == 2
+
+
 def test_w4a8_masked_empty_dispatch_skips_all_kernels(
     monkeypatch: pytest.MonkeyPatch,
 ):

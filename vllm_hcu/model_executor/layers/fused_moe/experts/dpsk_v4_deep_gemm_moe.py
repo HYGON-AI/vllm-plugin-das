@@ -1206,7 +1206,7 @@ def make_deepep_auto_deepgemm_w4a8_moe_kernel(
 ) -> mk.FusedMoEKernel:
     """Build the unified DeepEP HT/LL kernel for SlimQuant W4A8."""
 
-    _validate_deepgemm_w4a8_quant_config(moe_quant_config)
+    _validate_deepgemm_w4a8_quant_config(moe_quant_config, allow_clamp=True)
     return _make_deepep_auto_deepgemm_moe_kernel(
         moe_quant_config=moe_quant_config,
         moe_config=moe_config,
@@ -1292,4 +1292,42 @@ def make_deepep_ht_deepgemm_w4a8_moe_kernel(
         fixed_use_low_latency=False,
     )
     logger.info_once("Using HYV4 PCP DeepEP HT W4A8 MoE kernel.")
+    return mk.FusedMoEKernel(prepare_finalize, experts)
+
+
+def make_deepep_ll_deepgemm_w4a8_moe_kernel(
+    moe_quant_config: FusedMoEQuantConfig,
+    moe_config: FusedMoEConfig,
+    routing_tables: tuple[torch.Tensor, torch.Tensor, torch.Tensor] | None = None,
+) -> mk.FusedMoEKernel:
+    """Use fixed DeepEP LL dispatch with one in-place N32 W4A8 layout."""
+    from vllm.model_executor.layers.fused_moe.all2all_utils import (
+        maybe_make_prepare_finalize,
+    )
+
+    _validate_deepgemm_w4a8_quant_config(moe_quant_config, allow_clamp=True)
+    prepare_finalize = maybe_make_prepare_finalize(
+        moe=moe_config,
+        quant_config=moe_quant_config,
+        routing_tables=routing_tables,
+        allow_new_interface=True,
+        use_monolithic=False,
+    )
+    if prepare_finalize is None:
+        raise RuntimeError(
+            "SlimQuant W4A8 DeepEP LL prepare/finalize was not constructed"
+        )
+    max_num_tokens = prepare_finalize.max_num_tokens_per_rank()
+    if max_num_tokens is None:
+        raise RuntimeError(
+            "SlimQuant W4A8 DeepEP LL token capacity is unavailable"
+        )
+    experts = DeepEPAutoW4A8Experts(
+        moe_config=moe_config,
+        quant_config=moe_quant_config,
+        max_num_tokens=max_num_tokens,
+        num_dispatchers=prepare_finalize.num_dispatchers(),
+        fixed_use_low_latency=True,
+    )
+    logger.info_once("Using HYV4 DeepEP LL W4A8 MoE kernel.")
     return mk.FusedMoEKernel(prepare_finalize, experts)
