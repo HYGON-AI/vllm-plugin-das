@@ -82,11 +82,11 @@ def _route(router, indices_type=None):
     return router._compute_routing(None, torch.ones((4, 4)), indices_type)
 
 
-def test_switch_disabled_by_default(monkeypatch):
+def test_switch_enabled_by_default(monkeypatch):
     from vllm_hcu.platforms import envs as henvs
 
     monkeypatch.delenv(ENV_VAR, raising=False)
-    assert henvs.VLLM_HCU_MOE_PAD_MASK_INPLACE is False
+    assert henvs.VLLM_HCU_MOE_PAD_MASK_INPLACE is True
 
 
 @pytest.mark.parametrize(

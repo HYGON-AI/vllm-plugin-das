@@ -166,10 +166,15 @@ _DECODE_NEW = """\
                     dec_pos = dec_pos[:, -1]
                 dec_pos = dec_pos.to(torch.int32) - 1
             out_cols = pool_ids.shape[1] * index_kpool + index_kpool - 1
+            # Write straight into topk_indices_buffer only when pool_ids does
+            # not alias it: the kernel's column tiles run unordered, so an
+            # aliased source could be overwritten before other tiles read it.
             dst = (
-                None
-                if decode_metadata.requires_padding
-                else topk_indices_buffer[:n, :out_cols]
+                topk_indices_buffer[:n, :out_cols]
+                if not decode_metadata.requires_padding
+                and pool_ids.untyped_storage().data_ptr()
+                != topk_indices_buffer.untyped_storage().data_ptr()
+                else None
             )
             out = kpool_ops.expand_pools_and_append_tail(
                 pool_ids, dec_pos, index_kpool, out=dst
