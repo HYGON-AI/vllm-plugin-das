@@ -358,3 +358,84 @@ def test_unified_aiter_moe_matches_vllm_triton(
             quantization,
         )
     _assert_moe_numerics(actual, reference, quantization)
+
+
+def test_glm5_aiter_biased_grouped_topk_matches_torch_reference():
+    """Cover GLM-5's AITER router ABI and routed scaling semantics."""
+    device = _hcu_device()
+    arch = str(
+        getattr(torch.cuda.get_device_properties(device), "gcnArchName", "")
+    ).lower()
+    if "gfx938" not in arch:
+        pytest.skip(f"GLM-5 AITER regression requires gfx938, got {arch}")
+
+    from vllm_hcu.model_executor.layers.fused_moe.aiter_ops import (
+        rocm_aiter_ops,
+    )
+
+    num_tokens = 8
+    num_experts = 256
+    top_k = 8
+    routed_scaling_factor = 2.5
+    generator = torch.Generator(device=device).manual_seed(20261024)
+    router_logits = torch.randn(
+        (num_tokens, num_experts),
+        dtype=torch.float32,
+        device=device,
+        generator=generator,
+    )
+    correction_bias = torch.randn(
+        (num_experts,),
+        dtype=torch.float32,
+        device=device,
+        generator=generator,
+    ) * 0.1
+    actual_weights = torch.empty(
+        (num_tokens, top_k), dtype=torch.float32, device=device
+    )
+    actual_ids = torch.empty(
+        (num_tokens, top_k), dtype=torch.int32, device=device
+    )
+
+    rocm_aiter_ops.biased_grouped_topk(
+        router_logits,
+        correction_bias,
+        actual_weights,
+        actual_ids,
+        1,
+        1,
+        True,
+        routed_scaling_factor,
+    )
+    torch.cuda.synchronize(device)
+
+    assert torch.all((actual_ids >= 0) & (actual_ids < num_experts)), (
+        "GLM-5 routed top-k returned an out-of-range expert id; this usually "
+        "means AITER interpreted need_renorm as num_fused_shared_experts"
+    )
+
+    scores = router_logits.sigmoid()
+    reference_ids = torch.topk(
+        scores + correction_bias.unsqueeze(0),
+        k=top_k,
+        dim=-1,
+        sorted=False,
+    ).indices
+    reference_weights = scores.gather(1, reference_ids)
+    reference_weights /= reference_weights.sum(dim=-1, keepdim=True)
+    reference_weights *= routed_scaling_factor
+
+    actual_order = torch.argsort(actual_ids, dim=-1)
+    reference_order = torch.argsort(reference_ids, dim=-1)
+    actual_ids = torch.gather(actual_ids, 1, actual_order)
+    actual_weights = torch.gather(actual_weights, 1, actual_order)
+    reference_ids = torch.gather(reference_ids, 1, reference_order).to(torch.int32)
+    reference_weights = torch.gather(reference_weights, 1, reference_order)
+
+    torch.testing.assert_close(actual_ids, reference_ids, rtol=0, atol=0)
+    torch.testing.assert_close(
+        actual_weights,
+        reference_weights,
+        rtol=1e-5,
+        atol=1e-6,
+    )
