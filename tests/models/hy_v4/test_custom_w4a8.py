@@ -636,6 +636,74 @@ def test_compressed_tensors_w4a8_conversion_runs_in_parameter_loader():
     )
 
 
+@pytest.mark.parametrize("keyword_protocol", [False, True])
+@pytest.mark.parametrize("return_success", [False, True])
+def test_compressed_tensors_w4a8_skips_nonlocal_before_conversion(
+    monkeypatch, keyword_protocol, return_success,
+):
+    from compressed_tensors.quantization import QuantizationArgs
+    from vllm_hcu.model_executor.layers.quantization import (
+        compressed_tensors_w4a8_moe as runtime,
+    )
+
+    moe = SimpleNamespace(
+        moe_backend="aiter", has_bias=False,
+        moe_parallel_config=SimpleNamespace(
+            all2all_backend=None, use_ep=True, tp_size=1,
+        ),
+    )
+    method = runtime.HcuCompressedTensorsW4A8Int8MoEMethod(
+        QuantizationArgs(
+            num_bits=4, type="int", strategy="channel", symmetric=True,
+            dynamic=False, group_size=-1,
+        ),
+        QuantizationArgs(
+            num_bits=8, type="int", strategy="token", symmetric=True, dynamic=True,
+        ),
+        moe,
+    )
+    mapped = []
+
+    class Owner:
+        def _map_global_expert_id_to_local_expert_id(self, expert):
+            mapped.append(expert)
+            return -1
+
+        def weight_loader(self, *_args, **_kwargs):
+            pytest.fail("nonlocal expert reached the parameter loader")
+
+    layer = torch.nn.Module()
+    layer.moe_config = moe
+    method.create_weights(
+        layer, num_experts=1, hidden_size=8,
+        intermediate_size_per_partition=8, params_dtype=torch.bfloat16,
+        weight_loader=Owner().weight_loader,
+    )
+    monkeypatch.setattr(
+        runtime, "repack_compressed_tensors_int4",
+        lambda *_args: pytest.fail("nonlocal expert was repacked"),
+    )
+    # No backing storage: neither weight conversion nor scale validation may
+    # read values for an expert that belongs to another rank.
+    weight = torch.empty((8, 1), device="meta", dtype=torch.int32)
+    for name, shard in (
+        ("w13_weight", "w1"), ("w2_weight", "w2"),
+        ("w13_weight_scale", "w3"), ("w2_weight_scale", "w2"),
+    ):
+        parameter = getattr(layer, name)
+        if keyword_protocol:
+            result = parameter.weight_loader(
+                param=parameter, loaded_weight=weight, weight_name=name,
+                shard_id=shard, expert_id=7, return_success=return_success,
+            )
+        else:
+            result = parameter.weight_loader(
+                parameter, weight, name, shard, 7, return_success,
+            )
+        assert result is (False if return_success else None)
+    assert mapped == [7] * 4
+
+
 def test_compressed_tensors_w4a8_loader_accepts_native_keyword_contract():
     from compressed_tensors.compressors.pack_quantized.helpers import pack_to_int32
     from compressed_tensors.quantization import QuantizationArgs
