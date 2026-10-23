@@ -267,11 +267,10 @@ def _reshape_modern_packed_cache(
 ) -> torch.Tensor:
     """Create a backend cache view from a packed byte descriptor."""
     storage_block_size = int(getattr(spec, "storage_block_size", spec.block_size))
-    kernel_block_size = int(getattr(spec, "block_size", storage_block_size))
-    if kernel_block_size <= 0 or storage_block_size % kernel_block_size:
-        raise ValueError(
-            "KV storage block size must be divisible by the kernel block size"
-        )
+    # Compressed MLA can store one row for 128 logical tokens. The backend
+    # consumes storage rows, so logical block size is not a storage divisor.
+    if int(spec.block_size) <= 0 or storage_block_size <= 0:
+        raise ValueError("KV storage block size must be positive")
     block_stride = int(getattr(descriptor, "block_stride", 0) or 0)
     if block_stride <= 0:
         raise ValueError("Packed KV descriptor must provide a positive block stride")
@@ -285,12 +284,21 @@ def _reshape_modern_packed_cache(
             "Packed KV descriptor and config disagree on block count: "
             f"descriptor={kernel_num_blocks} config={num_blocks}"
         )
+    from vllm.v1 import kv_cache_interface
+
+    mode = getattr(spec, "kv_quant_mode", None)
+    tq_spec = getattr(kv_cache_interface, "TQFullAttentionSpec", ())
+    layer_cache_dtype = (
+        "auto"
+        if mode == kv_cache_interface.KVQuantMode.NONE and not isinstance(spec, tq_spec)
+        else (getattr(spec, "cache_dtype_str", None) or cache_dtype)
+    )
     shape = backend.get_kv_cache_shape(
         kernel_num_blocks,
         storage_block_size,
         spec.num_kv_heads,
         spec.head_size,
-        cache_dtype_str=cache_dtype,
+        cache_dtype_str=layer_cache_dtype,
     )
     stride_order = tuple(backend.get_kv_cache_stride_order())
     if len(stride_order) != len(shape):

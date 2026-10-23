@@ -1527,6 +1527,7 @@ def test_deepep_auto_target_mtp_graph_mode_uses_shared_forward_context(
         with module.set_forward_context(
             None,
             config,
+            num_tokens=8,
             cudagraph_runtime_mode=runtime_mode,
         ):
             pass
@@ -2002,14 +2003,18 @@ def test_proposer_sidecar_init_cplb_fix_rocm_preservation_and_custom_sp_padding(
     assert prepared.num_kv_actual_tokens == 5
 
 
-def test_proposer_registers_hcu_spec_decode_metadata_once() -> None:
+def test_proposer_registers_hcu_spec_decode_metadata_once(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
     from vllm.v1.attention.backends.mla.flashmla_sparse import (
         FlashMLASparseMetadata,
     )
     from vllm_hcu.v1.spec_decode import proposer_runtime
-    from vllm_hcu.v1.attention.backends.flash_attn import (
-        FlashAttentionMetadata,
-    )
+    from tests.fixtures.flash_attention import load_hcu_flash_attention_module
+
+    FlashAttentionMetadata = load_hcu_flash_attention_module(
+        monkeypatch
+    ).FlashAttentionMetadata
 
     proposer = SimpleNamespace(allowed_attn_types=(str,))
     config = _proposer_config()
