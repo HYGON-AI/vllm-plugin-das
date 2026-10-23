@@ -199,6 +199,11 @@ class DeepEPDeepGemmW4A8ContiguousExperts(TritonExperts):
             )
 
     def _quantize_activation(self, gateup_output, quant_output, m_indices):
+        limit = getattr(self.quant_config, "gemm1_clamp_limit", None)
+        if limit is not None and limit > 0:
+            from lightop import fuse_silu_mul_clamp_quant
+
+            return fuse_silu_mul_clamp_quant(gateup_output, limit=limit)
         return fuse_silu_mul_quant(
             gateup_output, output=quant_output, expert_ids=m_indices,
         )

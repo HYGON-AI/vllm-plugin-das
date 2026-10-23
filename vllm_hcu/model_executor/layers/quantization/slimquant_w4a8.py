@@ -149,8 +149,12 @@ class SlimQuantW4A8Int8AiterMoEMethod(FusedMoEMethodBase):
                 f"{sorted(supported_backends)!r}"
             )
         if moe_backend == "deep_gemm":
+            from vllm_hcu.model_executor.layers.fused_moe.deepep_runtime import (
+                slimquant_w4a8_uses_deepep_ht,
+            )
+
             parallel_config = getattr(moe, "moe_parallel_config", None)
-            if (
+            if not slimquant_w4a8_uses_deepep_ht(moe) and (
                 parallel_config is None
                 or getattr(parallel_config, "all2all_backend", None)
                 != "deepep_auto"
@@ -163,7 +167,8 @@ class SlimQuantW4A8Int8AiterMoEMethod(FusedMoEMethodBase):
             ):
                 raise ValueError(
                     "SlimQuant W4A8 deep_gemm requires DP+EP with "
-                    "all2all_backend='deepep_auto'"
+                    "all2all_backend='deepep_auto', or HYV4 PCP+EP with "
+                    "all2all_backend='deepep_high_throughput'"
                 )
         self.moe = moe
         self.quant_config = quant_config
@@ -187,6 +192,7 @@ class SlimQuantW4A8Int8AiterMoEMethod(FusedMoEMethodBase):
             per_out_ch_quant=False,
             block_shape=None,
             weight_dtype="int4",
+            gemm1_clamp_limit=getattr(self.moe, "swiglu_limit", None),
         )
         return self.moe_quant_config
 
@@ -274,9 +280,11 @@ class SlimQuantW4A8Int8AiterMoEMethod(FusedMoEMethodBase):
             return
         from vllm_hcu.model_executor.layers.fused_moe.deepep_runtime import (
             slimquant_w4a8_uses_deepep_auto,
+            slimquant_w4a8_uses_deepep_ht,
         )
 
-        uses_deepep_auto = slimquant_w4a8_uses_deepep_auto(
+        uses_deepep_ht = slimquant_w4a8_uses_deepep_ht(getattr(self, "moe", None))
+        uses_deepep = uses_deepep_ht or slimquant_w4a8_uses_deepep_auto(
             getattr(self, "moe", None)
         )
         weight_generation = _slimquant_moe_tensor_generation(
@@ -288,7 +296,7 @@ class SlimQuantW4A8Int8AiterMoEMethod(FusedMoEMethodBase):
             "_hcu_slimquant_post_load_weight_generation",
             None,
         )
-        if not uses_deepep_auto and installed_weight_generation == weight_generation:
+        if not uses_deepep and installed_weight_generation == weight_generation:
             self.moe_quant_config = self.get_fused_moe_quant_config(layer)
             config = getattr(layer, "_hcu_slimquant_post_load_aiter_config", None)
             if config is not None:
@@ -312,12 +320,18 @@ class SlimQuantW4A8Int8AiterMoEMethod(FusedMoEMethodBase):
                 "weight postprocessing"
             )
 
-        if uses_deepep_auto:
+        if uses_deepep:
             from vllm_hcu.model_executor.layers.fused_moe.experts.dpsk_v4_deep_gemm_moe import (
                 make_deepep_auto_deepgemm_w4a8_moe_kernel,
+                make_deepep_ht_deepgemm_w4a8_moe_kernel,
             )
 
-            self.moe_kernel = make_deepep_auto_deepgemm_w4a8_moe_kernel(
+            factory = (
+                make_deepep_ht_deepgemm_w4a8_moe_kernel
+                if uses_deepep_ht
+                else make_deepep_auto_deepgemm_w4a8_moe_kernel
+            )
+            self.moe_kernel = factory(
                 moe_quant_config=self.moe_quant_config,
                 moe_config=self.moe,
                 routing_tables=layer._expert_routing_tables(),
@@ -327,7 +341,7 @@ class SlimQuantW4A8Int8AiterMoEMethod(FusedMoEMethodBase):
             process = getattr(experts, "process_weights_after_loading", None)
             if not callable(process):
                 raise RuntimeError(
-                    "SlimQuant W4A8 deepep_auto did not construct modular "
+                    "SlimQuant W4A8 DeepEP did not construct modular "
                     "experts before weight postprocessing"
                 )
             process(layer)
@@ -426,18 +440,21 @@ class SlimQuantW4A8Int8AiterMoEMethod(FusedMoEMethodBase):
             )
         from vllm_hcu.model_executor.layers.fused_moe.deepep_runtime import (
             slimquant_w4a8_uses_deepep_auto,
+            slimquant_w4a8_uses_deepep_ht,
         )
 
         moe_kernel = getattr(self, "moe_kernel", None)
-        uses_deepep_auto = moe_kernel is not None
-        if not uses_deepep_auto:
-            uses_deepep_auto = slimquant_w4a8_uses_deepep_auto(
-                getattr(self, "moe", None)
+        uses_deepep = moe_kernel is not None
+        if not uses_deepep:
+            moe = getattr(self, "moe", None)
+            uses_deepep = (
+                slimquant_w4a8_uses_deepep_ht(moe)
+                or slimquant_w4a8_uses_deepep_auto(moe)
             )
-        if uses_deepep_auto:
+        if uses_deepep:
             if moe_kernel is None:
                 raise RuntimeError(
-                    "SlimQuant W4A8 deepep_auto kernel was not initialized; "
+                    "SlimQuant W4A8 DeepEP kernel was not initialized; "
                     "process_weights_after_loading must run before apply"
                 )
             from vllm_hcu.model_executor.layers.fused_moe.aiter_moe_dispatch import (

@@ -4,7 +4,9 @@
 """HCU integration boundary for vLLM's Model Runner V2."""
 
 import functools
+from collections import deque
 from contextlib import nullcontext
+from dataclasses import dataclass
 
 import torch
 
@@ -22,6 +24,30 @@ from vllm_hcu.v1.pcp_manager import maybe_build_pcp_manager
 
 
 _FIXED_WIDTH_PP_BROADCAST_MARKER = "_vllm_hcu_fixed_width_pp_broadcast"
+_PP_DRAFT_QUEUE = "_vllm_hcu_pp_draft_queue"
+
+
+@dataclass
+class _PendingDraftRecv:
+    event: torch.cuda.Event
+    draft_tokens: torch.Tensor
+    idx_mapping: torch.Tensor
+    idx_mapping_np: object
+    gen_at_receive_np: object
+
+
+def _get_pp_draft_queue(model_runner: object) -> deque:
+    queue = getattr(model_runner, _PP_DRAFT_QUEUE, None)
+    if queue is not None:
+        return queue
+
+    pp_handler = getattr(model_runner, "pp_handler")
+    pipeline_depth = len(getattr(pp_handler, "queue", ()))
+    if pipeline_depth == 0:
+        pipeline_depth = int(getattr(pp_handler, "world_size"))
+    queue = deque([None] * pipeline_depth)
+    setattr(model_runner, _PP_DRAFT_QUEUE, queue)
+    return queue
 
 
 def install_fixed_width_pp_sample_broadcast(model_runner: object) -> bool:
@@ -75,9 +101,9 @@ def synchronize_pp_spec_draft_tokens(
     against the real drafts.
 
     Use the sampled-token broadcast stream and group so collective ordering is
-    identical on every rank.  The explicit stream completion is conservative
-    but necessary before a non-last rank publishes the received tensor into
-    its request state.
+    identical on every rank. Non-last ranks defer publishing the received
+    tensor until the same PP microbatch becomes eligible again. This mirrors
+    ``PPHandler`` and keeps last-rank proposal work off the PP critical path.
     """
 
     if getattr(model_runner, "_vllm_hcu_suppress_pp_spec_draft_sync", False):
@@ -99,6 +125,8 @@ def synchronize_pp_spec_draft_tokens(
         broadcast_stream.wait_stream(main_stream)
         if getattr(pp_handler, "is_last_rank"):
             draft_tokens = req_states.draft_tokens[idx_mapping].contiguous()
+            if idx_mapping.is_cuda:
+                idx_mapping.record_stream(broadcast_stream)
         else:
             draft_tokens = torch.empty(
                 (num_reqs, num_speculative_steps),
@@ -110,10 +138,60 @@ def synchronize_pp_spec_draft_tokens(
             src=getattr(pp_handler, "last_rank"),
             group=getattr(pp_handler, "broadcast_group"),
         )
-    broadcast_stream.synchronize()
+        if draft_tokens.is_cuda:
+            draft_tokens.record_stream(broadcast_stream)
+        if not getattr(pp_handler, "is_last_rank"):
+            event = broadcast_stream.record_event()
+            if draft_tokens.is_cuda:
+                draft_tokens.record_stream(main_stream)
 
     if not getattr(pp_handler, "is_last_rank"):
-        req_states.draft_tokens[idx_mapping] = draft_tokens
+        idx_mapping_np = getattr(input_batch, "idx_mapping_np", None)
+        if idx_mapping_np is None:
+            idx_mapping_np = idx_mapping.detach().cpu().numpy()
+        gen_at_receive_np = getattr(pp_handler, "req_idx_gen_np")[
+            idx_mapping_np
+        ].copy()
+        _get_pp_draft_queue(model_runner)[-1] = _PendingDraftRecv(
+            event,
+            draft_tokens,
+            idx_mapping,
+            idx_mapping_np,
+            gen_at_receive_np,
+        )
+    return True
+
+
+def consume_pending_pp_spec_draft_tokens(model_runner: object) -> bool:
+    """Publish drafts when their PP microbatch is scheduled again."""
+
+    pp_handler = getattr(model_runner, "pp_handler", None)
+    if pp_handler is None or getattr(pp_handler, "is_last_rank", False):
+        return False
+
+    queue = _get_pp_draft_queue(model_runner)
+    pending = queue.popleft()
+    queue.append(None)
+    if pending is None:
+        return False
+
+    current_gen = getattr(pp_handler, "req_idx_gen_np")[pending.idx_mapping_np]
+    valid_mask = current_gen == pending.gen_at_receive_np
+    if not valid_mask.any():
+        return False
+
+    main_stream = getattr(pp_handler, "main_stream")
+    main_stream.wait_event(pending.event)
+    if valid_mask.all():
+        idx_mapping = pending.idx_mapping
+        draft_tokens = pending.draft_tokens
+    else:
+        valid_rows = torch.from_numpy(valid_mask.nonzero()[0]).to(
+            device=getattr(model_runner, "device"), dtype=torch.int64
+        )
+        idx_mapping = pending.idx_mapping[valid_rows]
+        draft_tokens = pending.draft_tokens[valid_rows]
+    getattr(model_runner, "req_states").draft_tokens[idx_mapping] = draft_tokens
     return True
 
 
@@ -147,6 +225,10 @@ class HcuGPUModelRunnerV2(GPUModelRunner):
             input_batch = self.pcp_manager.partition_batch(input_batch)
         set_deepep_auto_request_phase(input_batch.is_prefilling_np)
         return input_batch
+
+    def update_pp_decode_requests(self):
+        super().update_pp_decode_requests()
+        consume_pending_pp_spec_draft_tokens(self)
 
     @functools.wraps(GPUModelRunner.execute_model)
     def execute_model(self, *args, **kwargs):
@@ -265,5 +347,6 @@ class HcuGPUModelRunnerV2(GPUModelRunner):
 __all__ = [
     "HcuGPUModelRunnerV2",
     "install_fixed_width_pp_sample_broadcast",
+    "consume_pending_pp_spec_draft_tokens",
     "synchronize_pp_spec_draft_tokens",
 ]

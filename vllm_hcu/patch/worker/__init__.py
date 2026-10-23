@@ -266,6 +266,7 @@ _OP_CALLBACKS: tuple[_CallbackSpec, ...] = (
     _CallbackSpec(_adapter("op_opt", "patch_compressed_tensors_scheme")),
     _CallbackSpec(_adapter("op_opt", "patch_compressed_tensors_w8a8_int8")),
     _CallbackSpec(_adapter("op_opt", "patch_compressed_tensors_w8a8_fp8")),
+    _CallbackSpec(_adapter("op_opt", "patch_compressed_tensors_moe_w4a8_int8")),
     _CallbackSpec(_adapter("op_opt", "patch_compressed_tensors_moe_w8a8_fp8")),
     _CallbackSpec(_adapter("op_opt", "patch_compressed_tensors_moe_wna16")),
 )

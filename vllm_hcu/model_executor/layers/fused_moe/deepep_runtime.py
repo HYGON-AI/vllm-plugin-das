@@ -16,8 +16,12 @@ import inspect
 from vllm.platforms import current_platform
 
 
-@functools.lru_cache(maxsize=1)
-def _require_slimquant_w4a8_hipc_runtime() -> None:
+@functools.lru_cache(maxsize=None)
+def _require_slimquant_w4a8_hipc_runtime(
+    *,
+    ht_only: bool = False,
+    clamp: bool = False,
+) -> None:
     required_ops = {
         "deepgemm": (
             "pack_w4a8_moe_hipc_weight",
@@ -30,6 +34,16 @@ def _require_slimquant_w4a8_hipc_runtime() -> None:
             "fuse_silu_mul_quant_ep",
         ),
     }
+    if ht_only:
+        required_ops = {
+            "deepgemm": (
+                "pack_w4a8_moe_hipc_weight",
+                "m_grouped_w4a8_gemm_nt_contiguous_hipc",
+            ),
+            "lightop" if clamp else "lightop.activation": (
+                "fuse_silu_mul_clamp_quant" if clamp else "fuse_silu_mul_quant",
+            ),
+        }
     missing: list[str] = []
     for module_name, op_names in required_ops.items():
         try:
@@ -44,17 +58,54 @@ def _require_slimquant_w4a8_hipc_runtime() -> None:
         )
     if missing:
         raise RuntimeError(
-            "SlimQuant W4A8 deepep_auto requires HIPC DeepGEMM/LightOP "
+            "SlimQuant W4A8 DeepEP requires HIPC DeepGEMM/LightOP "
             f"operators; missing {', '.join(missing)}"
         )
+
+
+def slimquant_w4a8_uses_deepep_ht(moe_config: object) -> bool:
+    """Select the fixed HT route for HYV4 PCP+EP, independently of DP auto."""
+    parallel = getattr(moe_config, "moe_parallel_config", None)
+    if (
+        getattr(parallel, "all2all_backend", None) != "deepep_high_throughput"
+        or getattr(parallel, "pcp_size", 1) <= 1
+        or getattr(parallel, "dp_size", 1) != 1
+        or not getattr(parallel, "use_ep", False)
+    ):
+        return False
+    if getattr(parallel, "use_deepep_auto_kernels", False):
+        raise ValueError("SlimQuant W4A8 PCP HT cannot use deepep_auto kernels")
+    from vllm.config import get_current_vllm_config_or_none
+    from vllm_hcu.deepseek_v4_runtime import model_architectures
+
+    config = get_current_vllm_config_or_none()
+    if config is None:
+        config = getattr(moe_config, "_hcu_vllm_config", None)
+    if model_architectures(config) != ("HYV4ForCausalLM",):
+        raise ValueError("SlimQuant W4A8 PCP HT requires HYV4ForCausalLM")
+    if getattr(moe_config, "moe_backend", "auto") not in ("auto", "deep_gemm"):
+        raise ValueError(
+            "SlimQuant W4A8 PCP HT requires moe_backend='auto' or 'deep_gemm'"
+        )
+    activation = getattr(moe_config, "activation", None)
+    if getattr(activation, "value", activation) != "silu":
+        raise ValueError("SlimQuant W4A8 PCP HT supports only SiLU activation")
+    if not current_platform.is_rocm():
+        raise RuntimeError("SlimQuant W4A8 PCP HT requires the HCU ROCm runtime")
+    limit = getattr(moe_config, "swiglu_limit", None)
+    _require_slimquant_w4a8_hipc_runtime(
+        ht_only=True, clamp=limit is not None and limit > 0,
+    )
+    return True
 
 
 def slimquant_w4a8_uses_deepep_auto(moe_config: object) -> bool:
     """Validate and classify the SlimQuant W4A8 MoE execution route.
 
     Pure TP remains owned by the quantization method's AITER/Triton path.
-    Once DeepEP or DP+EP metadata is present, only the synchronized
-    ``deepep_auto`` contract is supported; fixed DeepEP layouts must not fall
+    The HYV4 PCP HT route must be classified first by
+    ``slimquant_w4a8_uses_deepep_ht``. Remaining DeepEP or DP+EP metadata
+    requires the synchronized ``deepep_auto`` contract and must not fall
     through to a TP kernel.
     """
 

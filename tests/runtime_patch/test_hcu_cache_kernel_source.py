@@ -61,3 +61,20 @@ def test_flash_cache_writer_uses_runtime_strides_and_mutating_schema() -> None:
         bindings
     )
     assert 'ops.impl("reshape_and_cache_flash", torch::kCUDA' in bindings
+
+
+def test_cache_writers_use_the_dtk_torch_stream_abi() -> None:
+    kernel_source = (
+        REPO / "vllm_hcu/csrc/hcu_cache_kernel.cu"
+    ).read_text(encoding="utf-8")
+
+    assert "at::hip::getCurrentHIPStream" not in kernel_source
+
+    for function_name, next_function_name in (
+        ("reshape_and_cache_hcu", "reshape_and_cache_flash_hcu"),
+        ("reshape_and_cache_flash_hcu", "concat_and_cache_mla_hcu"),
+    ):
+        host = kernel_source.split(f"void {function_name}(", 1)[1].split(
+            f"void {next_function_name}(", 1
+        )[0]
+        assert "at::cuda::getCurrentCUDAStream()" in host
