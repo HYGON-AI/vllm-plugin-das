@@ -4289,7 +4289,16 @@ def test_slimquant_w4a8_deepep_auto_uses_w4a8_deepgemm_factory_not_aiter(
 
 
 @pytest.mark.hcu
-def test_slimquant_w4a8_deepep_auto_rejects_non_deepseek_v4_architecture():
+@pytest.mark.parametrize(
+    "architectures",
+    [
+        ["DeepseekV3ForCausalLM"],
+        ["HYV4ForCausalLM", "DeepseekV3ForCausalLM"],
+    ],
+)
+def test_slimquant_w4a8_deepep_auto_rejects_unsupported_architecture(
+    architectures: list[str],
+):
     from vllm_hcu.model_executor.layers.fused_moe.deepep_runtime import (
         slimquant_w4a8_uses_deepep_auto,
     )
@@ -4304,14 +4313,48 @@ def test_slimquant_w4a8_deepep_auto_rejects_non_deepseek_v4_architecture():
             use_deepep_auto_kernels=True,
         ),
         _hcu_vllm_config=SimpleNamespace(
-            model_config=SimpleNamespace(
-                architectures=["DeepseekV3ForCausalLM"]
-            )
+            model_config=SimpleNamespace(architectures=architectures)
         ),
     )
 
     with pytest.raises(ValueError, match="validated only for DeepSeek-V4"):
         slimquant_w4a8_uses_deepep_auto(moe)
+
+
+@pytest.mark.hcu
+def test_slimquant_w4a8_deepep_auto_accepts_hyv4(
+    monkeypatch: pytest.MonkeyPatch,
+):
+    """HYV4 DP+EP must use auto HT prefill and LL decode kernels."""
+
+    from vllm_hcu.model_executor.layers.fused_moe import deepep_runtime
+
+    monkeypatch.setattr(
+        deepep_runtime,
+        "current_platform",
+        SimpleNamespace(is_rocm=lambda: True),
+        raising=False,
+    )
+    monkeypatch.setattr(
+        deepep_runtime,
+        "_require_slimquant_w4a8_hipc_runtime",
+        lambda: None,
+    )
+    moe = SimpleNamespace(
+        activation=SimpleNamespace(value="silu"),
+        moe_backend="deep_gemm",
+        moe_parallel_config=SimpleNamespace(
+            dp_size=8,
+            use_ep=True,
+            all2all_backend="deepep_auto",
+            use_deepep_auto_kernels=True,
+        ),
+        _hcu_vllm_config=SimpleNamespace(
+            model_config=SimpleNamespace(architectures=["HYV4ForCausalLM"])
+        ),
+    )
+
+    assert deepep_runtime.slimquant_w4a8_uses_deepep_auto(moe) is True
 
 
 @pytest.mark.hcu

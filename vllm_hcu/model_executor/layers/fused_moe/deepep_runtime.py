@@ -167,9 +167,17 @@ def slimquant_w4a8_uses_deepep_auto(moe_config: object) -> bool:
     if vllm_config is None:
         vllm_config = getattr(moe_config, "_hcu_vllm_config", None)
     architectures = model_architectures(vllm_config)
-    if "DeepseekV4ForCausalLM" not in architectures:
+    supported_architectures = {
+        "DeepseekV4ForCausalLM",
+        "HYV4ForCausalLM",
+    }
+    if (
+        len(architectures) != 1
+        or architectures[0] not in supported_architectures
+    ):
         raise ValueError(
-            "SlimQuant W4A8 deepep_auto is validated only for DeepSeek-V4; "
+            "SlimQuant W4A8 deepep_auto is validated only for DeepSeek-V4 "
+            "or HY-V4; "
             f"got architectures={architectures!r}"
         )
     activation = getattr(moe_config, "activation", None)
