@@ -166,11 +166,11 @@ Logs and reports:
 
 Accuracy gates are asserted from EvalScope JSON reports:
 
-- GSM8K uses `mean_acc`; each model configuration declares its required score.
+- All GSM8K model tests use the first 100 samples without shuffling and require
+  `mean_acc >= 0.95`. Predictions, reviews, and report sample counts must each
+  be exactly 100.
 - Qwen3-VL MMMU smoke uses the `Art` subset and requires `mean_acc >= 0.55`.
-- Qwen3.5 GSM8K uses the first 100 samples without shuffling and disables
-  thinking through chat-template kwargs. Predictions, reviews, and report sample
-  counts must each be exactly 100, with mean accuracy at least 0.95.
+- Qwen3.5 GSM8K disables thinking through chat-template kwargs.
 
 CI model cases wait for their configured free GPU memory before the first model
 is created; evaluation servers wait before launch. The default is up to 600

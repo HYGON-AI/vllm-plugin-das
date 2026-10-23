@@ -958,14 +958,27 @@ def test_pass_at_one_requires_report_metric(tmp_path: Path) -> None:
         (100, 100, 99, 1.0, False),
     ],
 )
-def test_qwen35_gsm8k_requires_100_samples_and_95_percent(
-    tmp_path, monkeypatch, predictions, reviews, reported_samples, score, passes,
+@pytest.mark.parametrize(
+    "config_name",
+    [
+        "qwen3_8b_gsm8k_evalscope.yaml",
+        "qwen35_9b_gsm8k_evalscope.yaml",
+        "deepseek_r1_gsm8k_evalscope.yaml",
+    ],
+)
+def test_gsm8k_configs_require_100_samples_and_95_percent(
+    tmp_path, monkeypatch, config_name, predictions, reviews, reported_samples, score, passes,
 ):
     root = Path(__file__).resolve().parents[3]
+    monkeypatch.delenv("VLLM_HCU_TEST_UNUSED_GSM8K_CONFIG", raising=False)
     config = evalscope_server.load_config(
-        root / "tests/models/qwen35_9b_gsm8k_evalscope.yaml",
+        root / "tests/models" / config_name,
         "VLLM_HCU_TEST_UNUSED_GSM8K_CONFIG",
     )
+    assert config["evalscope"]["limit"] == 100
+    dataset_args = config["evalscope"]["dataset_args"]["gsm8k"]
+    assert dataset_args["few_shot_random"] is False
+    assert dataset_args["shuffle"] is False
     model_env = "VLLM_HCU_TEST_UNUSED_GSM8K_MODEL"
     monkeypatch.delenv(model_env, raising=False)
     model = Path(config["model"]).name
