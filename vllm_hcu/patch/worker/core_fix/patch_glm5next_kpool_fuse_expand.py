@@ -6,7 +6,7 @@ Removes 4 host-side elementwise kernels (pool_topk int64 cast, positions
 int32 cast + add, final topk_indices_buffer copy) from the sparse-indexer
 decode path by pushing the `+1` into the Triton kernel and letting it write
 straight into the caller's buffer. Gated by VLLM_HCU_GLM5NEXT_KPOOL_FUSE_EXPAND
-(default off) so it can be disabled if a future vLLM version changes the
+(default on) so it can be disabled if a future vLLM version changes the
 upstream function body underneath the textual patch below.
 """
 
@@ -137,22 +137,24 @@ _DECODE_OLD = """\
         topk_indices_buffer[: out.shape[0], : out.shape[-1]] = out
 """
 _DECODE_NEW = """\
+        _kpool_out_in_place = False
         if index_kpool > 1:
             pool_ids = pool_topk
             n = pool_topk.shape[0]
             # Decode seq_lens are pool-granular; recover token lengths from
             # positions using the padded [B, next_n] row layout when needed.
-            # expand_pools_and_append_tail adds 1 internally, so this derives
-            # raw positions (not positions + 1).
+            # expand_pools_and_append_tail adds 1 internally and casts the
+            # loaded position to int32 itself, so pass raw positions through
+            # (no host-side cast).
             if positions is not None:
                 if not decode_metadata.requires_padding:
-                    dec_pos = positions[: batch_size * next_n].to(torch.int32)
+                    dec_pos = positions[: batch_size * next_n]
                 else:
                     _scatter_idx = _build_decode_scatter_indices(
                         decode_lens, batch_size, num_decode_tokens
                     )
                     dec_pos = _scatter_decode_tokens_by_request(
-                        positions[:num_decode_tokens].to(torch.int32),
+                        positions[:num_decode_tokens],
                         -1,
                         batch_size,
                         next_n,
@@ -172,6 +174,7 @@ _DECODE_NEW = """\
             out = kpool_ops.expand_pools_and_append_tail(
                 pool_ids, dec_pos, index_kpool, out=dst
             )
+            _kpool_out_in_place = dst is not None
         else:
             out = topk_dst
 
@@ -180,7 +183,10 @@ _DECODE_NEW = """\
             out = unpack_seq_triton(
                 out.reshape(batch_size, -1, out.shape[-1]), decode_lens
             )
-        topk_indices_buffer[: out.shape[0], : out.shape[-1]] = out
+        if not _kpool_out_in_place:
+            # The non-padded index_kpool > 1 path already wrote into
+            # topk_indices_buffer via ``out=dst``; skip the self-copy.
+            topk_indices_buffer[: out.shape[0], : out.shape[-1]] = out
 """
 
 

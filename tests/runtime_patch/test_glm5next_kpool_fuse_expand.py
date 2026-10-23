@@ -68,11 +68,11 @@ def fused_expand(kpool_ops):
     return kpool_ops.expand_pools_and_append_tail
 
 
-def test_switch_disabled_by_default(monkeypatch):
+def test_switch_enabled_by_default(monkeypatch):
     from vllm_hcu.platforms import envs as henvs
 
     monkeypatch.delenv(fuse_patch.ENV_VAR, raising=False)
-    assert henvs.VLLM_HCU_GLM5NEXT_KPOOL_FUSE_EXPAND is False
+    assert henvs.VLLM_HCU_GLM5NEXT_KPOOL_FUSE_EXPAND is True
 
 
 @pytest.mark.parametrize(

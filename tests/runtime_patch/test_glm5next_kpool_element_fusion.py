@@ -31,11 +31,11 @@ def indexer_module(monkeypatch):
     return module
 
 
-def test_switch_disabled_by_default(monkeypatch):
+def test_switch_enabled_by_default(monkeypatch):
     from vllm_hcu.platforms import envs as henvs
 
     monkeypatch.delenv(fusion_patch.ENV_VAR, raising=False)
-    assert henvs.VLLM_HCU_GLM5NEXT_KPOOL_ELEMENT_FUSION is False
+    assert henvs.VLLM_HCU_GLM5NEXT_KPOOL_ELEMENT_FUSION is True
 
 
 def test_disabled_leaves_module_untouched(monkeypatch, indexer_module):

@@ -2,8 +2,8 @@
 # SPDX-FileCopyrightText: Copyright (c) 2026 Hygon Information Technology Co., Ltd.
 """Trim GLM5Next kpool sparse-indexer decode elementwise kernels.
 
-Two textual edits to ``sparse_attn_indexer_kpool``, opt-in via
-``VLLM_HCU_GLM5NEXT_KPOOL_ELEMENT_FUSION=1``:
+Two textual edits to ``sparse_attn_indexer_kpool``, enabled by default
+(disable via ``VLLM_HCU_GLM5NEXT_KPOOL_ELEMENT_FUSION=0``):
 
 1. Drop ``positions.to(torch.int32)`` before
    ``kpool_decode_update_and_maybe_write_cache_batched``. The kernel only does

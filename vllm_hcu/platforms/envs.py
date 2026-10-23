@@ -752,8 +752,8 @@ hcu_vllm_environment_variables: dict[str, Callable[[], Any]] = {
     # cast, a separate int32 positions cast + add, and a final whole-buffer
     # copy on the host. Removes 4 elementwise kernels per decode step on the
     # non-padded kpool>1 (index_kpool > 1) path. Consulted once at
-    # patch-apply time. See patch_glm5next_kpool_fuse_expand.py. Disabled
-    # by default (opt-in); set to 1 to enable.
+    # patch-apply time. See patch_glm5next_kpool_fuse_expand.py. Enabled
+    # by default; set to 0 / false to disable.
     "VLLM_HCU_GLM5NEXT_KPOOL_FUSE_EXPAND":
         lambda: os.environ.get("VLLM_HCU_GLM5NEXT_KPOOL_FUSE_EXPAND", "True").lower()
                     in ("true", "1"),
@@ -763,7 +763,8 @@ hcu_vllm_environment_variables: dict[str, Callable[[], Any]] = {
     # (drops a positions.to(int32) copy), and on pure short-context decode
     # replace the whole-buffer -1 fill + _fill_causal_indices chain with one
     # Triton kernel. Consulted once at patch-apply time. See
-    # patch_glm5next_kpool_element_fusion.py. Disabled by default (opt-in).
+    # patch_glm5next_kpool_element_fusion.py. Enabled by default; set to
+    # 0 / false to disable.
     "VLLM_HCU_GLM5NEXT_KPOOL_ELEMENT_FUSION":
         lambda: (os.environ.get("VLLM_HCU_GLM5NEXT_KPOOL_ELEMENT_FUSION", "True").lower() in
                     ("true", "1")),
