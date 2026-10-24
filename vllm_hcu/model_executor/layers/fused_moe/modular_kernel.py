@@ -1449,6 +1449,9 @@ class FusedMoEKernelModularImpl:
         shared_experts_input: torch.Tensor | None = None,
         quanted_hidden_states: torch.Tensor | None = None,
         scale: torch.Tensor | None = None,
+        shared_experts_x_and_scale_quanted: (
+            tuple[torch.Tensor, torch.Tensor] | None
+        ) = None,
     ) -> torch.Tensor:
         """
         This function computes a Mixture of Experts (MoE) layer using two sets
@@ -1534,9 +1537,13 @@ class FusedMoEKernelModularImpl:
             shared_experts=shared_experts,
             shared_experts_input=shared_experts_input,
             x_and_scale_quanted=(
-                (quanted_hidden_states, scale)
-                if quanted_hidden_states is not None and scale is not None
-                else None
+                shared_experts_x_and_scale_quanted
+                if shared_experts_x_and_scale_quanted is not None
+                else (
+                    (quanted_hidden_states, scale)
+                    if quanted_hidden_states is not None and scale is not None
+                    else None
+                )
             ),
         )
 
@@ -1733,6 +1740,9 @@ class FusedMoEKernel:
         shared_experts_input: torch.Tensor | None = None,
         quanted_hidden_states: torch.Tensor | None = None,
         scale: torch.Tensor | None = None,
+        shared_experts_x_and_scale_quanted: (
+            tuple[torch.Tensor, torch.Tensor] | None
+        ) = None,
     ) -> torch.Tensor:
         assert isinstance(self.impl, FusedMoEKernelModularImpl)
         return self.impl.apply(
@@ -1749,4 +1759,7 @@ class FusedMoEKernel:
             shared_experts_input=shared_experts_input,
             quanted_hidden_states=quanted_hidden_states,
             scale=scale,
+            shared_experts_x_and_scale_quanted=(
+                shared_experts_x_and_scale_quanted
+            ),
         )

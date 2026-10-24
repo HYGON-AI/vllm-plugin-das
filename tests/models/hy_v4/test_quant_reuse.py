@@ -3,6 +3,9 @@
 
 from __future__ import annotations
 
+import ast
+import inspect
+from pathlib import Path
 from types import SimpleNamespace
 
 import pytest
@@ -620,3 +623,238 @@ def test_slimquant_deepep_moe_rejects_prequantized_dispatch_input(
         )
 
     assert kernel_calls == []
+
+
+def _load_moe_runner_contract():
+    from vllm.model_executor.layers.fused_moe.runner.shared_experts import (
+        SharedExpertsOrder,
+    )
+
+    path = (
+        Path(__file__).resolve().parents[3]
+        / "vllm_hcu/model_executor/layers/fused_moe/moe_runner.py"
+    )
+    tree = ast.parse(path.read_text(encoding="utf-8"), filename=str(path))
+    owner = next(
+        node
+        for node in tree.body
+        if isinstance(node, ast.ClassDef) and node.name == "MoERunner"
+    )
+    method_names = {
+        "_quant_method",
+        "_maybe_apply_shared_experts",
+        "_quant_method_supports_quanted_inputs",
+        "_quant_method_supports_shared_quanted_inputs",
+        "_apply_quant_method",
+    }
+    methods = [
+        node
+        for node in owner.body
+        if isinstance(node, ast.FunctionDef) and node.name in method_names
+    ]
+    runner_class = ast.ClassDef(
+        name="MoERunnerContract",
+        bases=[],
+        keywords=[],
+        body=methods,
+        decorator_list=[],
+    )
+    module = ast.Module(
+        body=[
+            ast.ImportFrom(
+                module="__future__",
+                names=[ast.alias("annotations")],
+                level=0,
+            ),
+            runner_class,
+        ],
+        type_ignores=[],
+    )
+    ast.fix_missing_locations(module)
+    namespace = {
+        "inspect": inspect,
+        "torch": torch,
+        "SharedExpertsOrder": SharedExpertsOrder,
+    }
+    exec(compile(module, str(path), "exec"), namespace)
+    return namespace["MoERunnerContract"]
+
+
+def _runner_for_quant_method(quant_method, forward_modular):
+    runner_class = _load_moe_runner_contract()
+    runner = object.__new__(runner_class)
+
+    class _SharedExperts:
+        output = None
+
+        def __call__(self, *args, **kwargs):
+            del args, kwargs
+
+    runner.routed_experts = SimpleNamespace(
+        quant_method=quant_method,
+        forward_modular=forward_modular,
+    )
+    runner._shared_experts = _SharedExperts()
+    runner.router = SimpleNamespace(
+        select_experts=lambda **_: pytest.fail(
+            "preselected routing must bypass the router"
+        )
+    )
+    return runner
+
+
+def test_moe_runner_passes_shared_quanted_pair_without_quantizing_routed_input():
+    calls = []
+
+    class _SharedOnlyQuantMethod:
+        is_monolithic = False
+
+        def supports_quanted_inputs(self):
+            return False
+
+        def supports_shared_quanted_inputs(self):
+            return True
+
+        def apply(self, **kwargs):
+            calls.append(kwargs)
+            return kwargs["x"] + 1
+
+    runner = _runner_for_quant_method(
+        _SharedOnlyQuantMethod(),
+        lambda **_: pytest.fail("shared-only support must bypass public fallback"),
+    )
+    hidden = torch.ones(2, 3, dtype=torch.bfloat16)
+    pair = (torch.ones(2, 3, dtype=torch.int8), torch.ones(2, 1))
+
+    _, output = runner._apply_quant_method(
+        hidden,
+        None,
+        hidden,
+        quanted_hidden_states=pair[0],
+        scale=pair[1],
+        topk_weights=torch.ones(2, 1),
+        topk_ids=torch.zeros(2, 1, dtype=torch.int32),
+    )
+
+    assert calls[0]["x"] is hidden
+    shared_pair = calls[0]["shared_experts_x_and_scale_quanted"]
+    assert shared_pair[0] is pair[0]
+    assert shared_pair[1] is pair[1]
+    assert "i_q" not in calls[0] and "i_s" not in calls[0]
+    torch.testing.assert_close(output, hidden + 1)
+
+
+def test_moe_runner_shared_quanted_unsupported_uses_public_fallback():
+    fallback_calls = []
+
+    class _UnsupportedQuantMethod:
+        is_monolithic = False
+
+        def supports_quanted_inputs(self):
+            return False
+
+        def apply(self, **_):
+            pytest.fail("unsupported method must use public forward_modular")
+
+    def forward_modular(**kwargs):
+        fallback_calls.append(kwargs)
+        return kwargs["x"] + 2
+
+    runner = _runner_for_quant_method(_UnsupportedQuantMethod(), forward_modular)
+    hidden = torch.ones(2, 3, dtype=torch.bfloat16)
+    pair = (torch.ones(2, 3, dtype=torch.int8), torch.ones(2, 1))
+
+    _, output = runner._apply_quant_method(
+        hidden,
+        None,
+        hidden,
+        quanted_hidden_states=pair[0],
+        scale=pair[1],
+        topk_weights=torch.ones(2, 1),
+        topk_ids=torch.zeros(2, 1, dtype=torch.int32),
+    )
+
+    assert fallback_calls[0]["x"] is hidden
+    torch.testing.assert_close(output, hidden + 2)
+
+
+def test_slimquant_deepep_moe_forwards_shared_quanted_input_with_bf16_dispatch(
+    monkeypatch,
+) -> None:
+    pair = (torch.ones(2, 3, dtype=torch.int8), torch.full((2, 1), 0.25))
+    kernel_calls = []
+
+    class _Kernel:
+        def apply(self, **kwargs):
+            kernel_calls.append(kwargs)
+            return torch.ones(2, 3)
+
+    method = SlimQuantW4A8Int8AiterMoEMethod.__new__(
+        SlimQuantW4A8Int8AiterMoEMethod
+    )
+    method.moe_kernel = _Kernel()
+    method.moe = SimpleNamespace(num_experts=2, activation="silu")
+    layer = SimpleNamespace(
+        w13_weight=torch.ones(2, 4, 3, dtype=torch.int8),
+        w2_weight=torch.ones(2, 3, 2, dtype=torch.int8),
+        global_num_experts=2,
+        expert_map=None,
+        activation="silu",
+        apply_router_weight_on_input=False,
+    )
+    monkeypatch.setattr(
+        "vllm_hcu.model_executor.layers.fused_moe.aiter_moe_dispatch.resolve_aiter_expert_maps",
+        lambda expert_map, global_num_experts: (None, None),
+    )
+    hidden = torch.zeros(2, 3, dtype=torch.bfloat16)
+
+    assert method.supports_shared_quanted_inputs()
+    method.apply(
+        layer=layer,
+        x=hidden,
+        topk_weights=torch.ones(2, 1),
+        topk_ids=torch.zeros(2, 1, dtype=torch.int64),
+        shared_experts=object(),
+        shared_experts_input=hidden,
+        shared_experts_x_and_scale_quanted=pair,
+    )
+
+    assert kernel_calls[0]["hidden_states"] is hidden
+    assert kernel_calls[0]["shared_experts_x_and_scale_quanted"] is pair
+    assert "quanted_hidden_states" not in kernel_calls[0]
+    assert "scale" not in kernel_calls[0]
+
+
+def test_slimquant_deepep_moe_rejects_incomplete_shared_quanted_input(
+    monkeypatch,
+) -> None:
+    method = SlimQuantW4A8Int8AiterMoEMethod.__new__(
+        SlimQuantW4A8Int8AiterMoEMethod
+    )
+    method.moe_kernel = SimpleNamespace(
+        apply=lambda **_: pytest.fail("invalid pair must fail before kernel")
+    )
+    method.moe = SimpleNamespace(num_experts=2, activation="silu")
+    layer = SimpleNamespace(
+        w13_weight=torch.ones(2, 4, 3, dtype=torch.int8),
+        w2_weight=torch.ones(2, 3, 2, dtype=torch.int8),
+        global_num_experts=2,
+        expert_map=None,
+        activation="silu",
+        apply_router_weight_on_input=False,
+    )
+    monkeypatch.setattr(
+        "vllm_hcu.model_executor.layers.fused_moe.aiter_moe_dispatch.resolve_aiter_expert_maps",
+        lambda expert_map, global_num_experts: (None, None),
+    )
+
+    with pytest.raises(ValueError, match="both quantized input and scale"):
+        method.apply(
+            layer=layer,
+            x=torch.zeros(2, 3, dtype=torch.bfloat16),
+            topk_weights=torch.ones(2, 1),
+            topk_ids=torch.zeros(2, 1, dtype=torch.int64),
+            shared_experts=object(),
+            shared_experts_input=torch.zeros(2, 3, dtype=torch.bfloat16),
+            shared_experts_x_and_scale_quanted=(torch.ones(2, 3, dtype=torch.int8), None),
+        )

@@ -601,6 +601,95 @@ def test_modular_prepare_begins_auto_call_before_expert_contract_queries():
     ]
 
 
+def test_modular_internal_overlap_consumes_shared_quanted_pair_after_bf16_prepare():
+    from vllm_hcu.model_executor.layers.fused_moe import modular_kernel as module
+
+    events = []
+    hidden = torch.ones((2, 4), dtype=torch.bfloat16)
+    pair = (torch.ones((2, 4), dtype=torch.int8), torch.ones((2, 1)))
+    topk_weights = torch.ones((2, 1))
+    topk_ids = torch.zeros((2, 1), dtype=torch.int64)
+
+    class PrepareFinalize:
+        def supports_async(self):
+            return True
+
+        def finalize_async(self, *args):
+            del args
+            events.append("finalize")
+
+            def receive():
+                events.append("receive")
+
+            return receive
+
+    class Experts:
+        def finalize_weight_and_reduce_impl(self):
+            return object()
+
+    class SharedExperts:
+        def __call__(self, value, order, x_and_scale_quanted=None):
+            events.append(("shared", value, order, x_and_scale_quanted))
+
+    kernel = object.__new__(module.FusedMoEKernelModularImpl)
+    kernel.prepare_finalize = PrepareFinalize()
+    kernel.fused_experts = Experts()
+
+    def prepare(value, *args, **kwargs):
+        del args, kwargs
+        events.append(("prepare", value))
+        return hidden, None, None, topk_ids, topk_weights
+
+    kernel._prepare = prepare
+    kernel._fused_experts = lambda **_: torch.zeros_like(hidden)
+
+    kernel.apply(
+        hidden_states=hidden,
+        w1=torch.ones((2, 4, 4)),
+        w2=torch.ones((2, 4, 4)),
+        topk_weights=topk_weights,
+        topk_ids=topk_ids,
+        shared_experts=SharedExperts(),
+        shared_experts_input=hidden,
+        shared_experts_x_and_scale_quanted=pair,
+    )
+
+    assert events[0] == ("prepare", hidden)
+    shared_events = [event for event in events if event[0] == "shared"]
+    assert len(shared_events) == 1
+    assert shared_events[0][1] is hidden
+    assert shared_events[0][2] is module.SharedExpertsOrder.MK_INTERNAL_OVERLAPPED
+    assert shared_events[0][3] is pair
+
+
+def test_fused_moe_kernel_forwards_shared_quanted_pair_to_modular_impl():
+    from vllm_hcu.model_executor.layers.fused_moe import modular_kernel as module
+
+    calls = []
+    pair = (torch.ones((2, 4), dtype=torch.int8), torch.ones((2, 1)))
+    impl = object.__new__(module.FusedMoEKernelModularImpl)
+    impl.apply = lambda **kwargs: calls.append(kwargs) or kwargs["hidden_states"]
+    kernel = object.__new__(module.FusedMoEKernel)
+    kernel.impl = impl
+    hidden = torch.ones((2, 4), dtype=torch.bfloat16)
+
+    output = kernel.apply(
+        hidden_states=hidden,
+        w1=torch.ones((2, 4, 4)),
+        w2=torch.ones((2, 4, 4)),
+        topk_weights=torch.ones((2, 1)),
+        topk_ids=torch.zeros((2, 1), dtype=torch.int64),
+        activation=module.MoEActivation.SILU,
+        global_num_experts=2,
+        expert_map=None,
+        apply_router_weight_on_input=False,
+        shared_experts_x_and_scale_quanted=pair,
+    )
+
+    assert output is hidden
+    assert calls[0]["shared_experts_x_and_scale_quanted"] is pair
+
+
 @pytest.mark.parametrize(
     ("kv_role", "expected"),
     [("kv_producer", False), ("kv_consumer", True)],

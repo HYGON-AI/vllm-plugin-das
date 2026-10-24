@@ -232,6 +232,10 @@ class SlimQuantW4A8Int8AiterMoEMethod(FusedMoEMethodBase):
         """DeepEP dispatch currently requires the original BF16 input."""
         return False
 
+    def supports_shared_quanted_inputs(self) -> bool:
+        """Shared experts can reuse INT8 input without changing dispatch."""
+        return True
+
     def create_weights(
         self,
         layer: torch.nn.Module,
@@ -461,6 +465,9 @@ class SlimQuantW4A8Int8AiterMoEMethod(FusedMoEMethodBase):
         shared_experts_input: torch.Tensor | None,
         i_q: torch.Tensor | None = None,
         i_s: torch.Tensor | None = None,
+        shared_experts_x_and_scale_quanted: (
+            tuple[torch.Tensor, torch.Tensor] | None
+        ) = None,
         **_,
     ) -> torch.Tensor | tuple[torch.Tensor, torch.Tensor]:
 
@@ -471,6 +478,16 @@ class SlimQuantW4A8Int8AiterMoEMethod(FusedMoEMethodBase):
         if i_q is not None:
             raise RuntimeError(
                 "SlimQuant W4A8 routed input must preserve BF16 DeepEP dispatch"
+            )
+        if shared_experts_x_and_scale_quanted is not None and (
+            not isinstance(shared_experts_x_and_scale_quanted, tuple)
+            or len(shared_experts_x_and_scale_quanted) != 2
+            or shared_experts_x_and_scale_quanted[0] is None
+            or shared_experts_x_and_scale_quanted[1] is None
+        ):
+            raise ValueError(
+                "SlimQuant W4A8 shared prequantized input requires both "
+                "quantized input and scale"
             )
         if x.dim() != 2:
             raise ValueError(
@@ -543,6 +560,9 @@ class SlimQuantW4A8Int8AiterMoEMethod(FusedMoEMethodBase):
                 ),
                 shared_experts=shared_experts,
                 shared_experts_input=shared_experts_input,
+                shared_experts_x_and_scale_quanted=(
+                    shared_experts_x_and_scale_quanted
+                ),
             )
         # Pure TP shared experts remain runner-owned, matching the latest
         # unified AITER/Triton contract.

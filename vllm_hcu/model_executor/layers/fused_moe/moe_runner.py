@@ -451,6 +451,7 @@ class MoERunner(MoERunnerInterface):
     def _replace_quant_method(self, quant_method: FusedMoEMethodBase):
         self.routed_experts._replace_quant_method(quant_method)
         self.__dict__.pop("_supports_quanted_inputs", None)
+        self.__dict__.pop("_supports_shared_quanted_inputs", None)
         self._refresh_forward_entry()
 
     # TODO(bnell): Hack for elastic_ep. Get rid of this
@@ -779,6 +780,24 @@ class MoERunner(MoERunnerInterface):
         )
         return self._supports_quanted_inputs
 
+    def _quant_method_supports_shared_quanted_inputs(self) -> bool:
+        cached = getattr(self, "_supports_shared_quanted_inputs", None)
+        if cached is not None:
+            return cached
+        declared_support = getattr(
+            self._quant_method,
+            "supports_shared_quanted_inputs",
+            None,
+        )
+        if callable(declared_support):
+            try:
+                self._supports_shared_quanted_inputs = bool(declared_support())
+            except (AttributeError, RuntimeError, TypeError, ValueError):
+                self._supports_shared_quanted_inputs = False
+        else:
+            self._supports_shared_quanted_inputs = False
+        return self._supports_shared_quanted_inputs
+
     def _apply_quant_method(
         self,
         hidden_states: torch.Tensor,
@@ -842,10 +861,7 @@ class MoERunner(MoERunnerInterface):
                     input_ids=input_ids,
                 )
 
-            if (
-                quanted_hidden_states is None
-                or not self._quant_method_supports_quanted_inputs()
-            ):
+            if quanted_hidden_states is None:
                 fused_out = self.routed_experts.forward_modular(
                     x=hidden_states,
                     topk_weights=topk_weights,
@@ -853,7 +869,7 @@ class MoERunner(MoERunnerInterface):
                     shared_experts=self._shared_experts,
                     shared_experts_input=shared_experts_input,
                 )
-            else:
+            elif self._quant_method_supports_quanted_inputs():
                 fused_out = self._quant_method.apply(
                     layer=self.routed_experts,
                     x=hidden_states,
@@ -863,6 +879,27 @@ class MoERunner(MoERunnerInterface):
                     shared_experts_input=shared_experts_input,
                     i_q=quanted_hidden_states,
                     i_s=scale,
+                )
+            elif self._quant_method_supports_shared_quanted_inputs():
+                fused_out = self._quant_method.apply(
+                    layer=self.routed_experts,
+                    x=hidden_states,
+                    topk_weights=topk_weights,
+                    topk_ids=topk_ids,
+                    shared_experts=self._shared_experts,
+                    shared_experts_input=shared_experts_input,
+                    shared_experts_x_and_scale_quanted=(
+                        quanted_hidden_states,
+                        scale,
+                    ),
+                )
+            else:
+                fused_out = self.routed_experts.forward_modular(
+                    x=hidden_states,
+                    topk_weights=topk_weights,
+                    topk_ids=topk_ids,
+                    shared_experts=self._shared_experts,
+                    shared_experts_input=shared_experts_input,
                 )
 
         self._maybe_apply_shared_experts(
