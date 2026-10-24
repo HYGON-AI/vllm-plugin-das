@@ -360,6 +360,122 @@ def test_unified_aiter_moe_matches_vllm_triton(
     _assert_moe_numerics(actual, reference, quantization)
 
 
+def test_glm5_tp8_fp8_aiter_prefill_batch_matches_triton():
+    """Regress the MOE_C config selected by GLM-5 TP8 prefill batches."""
+    device = _hcu_device()
+    arch = str(
+        getattr(torch.cuda.get_device_properties(device), "gcnArchName", "")
+    ).lower()
+    if "gfx938" not in arch:
+        pytest.skip(f"GLM-5 AITER regression requires gfx938, got {arch}")
+
+    from aiter.moe import MoeQuantType
+    from vllm.model_executor.layers.fused_moe.fused_moe import fused_experts_impl
+
+    m = 512
+    experts = 256
+    hidden_size = 6144
+    intermediate_size = 256
+    top_k = 8
+    generator = torch.Generator(device=device).manual_seed(20261024)
+
+    hidden_states = torch.randn(
+        (m, hidden_size),
+        dtype=torch.bfloat16,
+        device=device,
+        generator=generator,
+    ) * 0.1
+    topk_ids = (
+        torch.arange(m * top_k, device=device).reshape(m, top_k) % experts
+    ).to(torch.int32)
+    topk_weights = torch.rand(
+        (m, top_k),
+        dtype=torch.float32,
+        device=device,
+        generator=generator,
+    )
+    topk_weights /= topk_weights.sum(dim=-1, keepdim=True)
+
+    raw_w1 = torch.randn(
+        (experts, 2 * intermediate_size, hidden_size),
+        dtype=torch.bfloat16,
+        device=device,
+        generator=generator,
+    ) * 0.03
+    w1, w1_scale = _channel_fp8(raw_w1)
+    del raw_w1
+    raw_w2 = torch.randn(
+        (experts, hidden_size, intermediate_size),
+        dtype=torch.bfloat16,
+        device=device,
+        generator=generator,
+    ) * 0.03
+    w2, w2_scale = _channel_fp8(raw_w2)
+    del raw_w2
+
+    reference = fused_experts_impl(
+        hidden_states,
+        w1,
+        w2,
+        topk_weights,
+        topk_ids,
+        activation="silu",
+        global_num_experts=experts,
+        w1_scale=w1_scale,
+        w2_scale=w2_scale,
+        use_fp8_w8a8=True,
+        per_channel_quant=True,
+    )
+    config = select_aiter_moe_config(
+        AiterMoeProblem(
+            M=m,
+            E=experts,
+            N1=2 * intermediate_size,
+            N2=hidden_size,
+            K=hidden_size,
+            top_k=top_k,
+            block_size=0,
+            dtype=hidden_states.dtype,
+            device=device,
+            quant_type=MoeQuantType.FP8_W8A8,
+            activation="silu",
+            use_shuffle=True,
+        ),
+        cache_owner=w1,
+    )
+    assert config is not None
+    assert _solution_token(config) == "MOE_C"
+    prepared_w1, prepared_w2 = prepare_aiter_moe_weights(
+        w1,
+        w2,
+        config,
+        cache_owner=w1,
+    )
+    prepared_w1_scale, prepared_w2_scale = prepare_aiter_moe_scales(
+        w1_scale,
+        w2_scale,
+        config,
+        cache_owner=w1_scale,
+    )
+    actual = execute_aiter_moe(
+        config,
+        hidden_states=hidden_states,
+        w1=prepared_w1,
+        w2=prepared_w2,
+        topk_weights=topk_weights,
+        topk_ids=topk_ids,
+        activation="silu",
+        w1_scale=prepared_w1_scale,
+        w2_scale=prepared_w2_scale,
+        global_num_experts=experts,
+        use_weight_shuffle=bool(getattr(config, "need_shuffle", False)),
+        output_dtype=hidden_states.dtype,
+    )
+    torch.cuda.synchronize(device)
+
+    _assert_moe_numerics(actual, reference, "fp8_w8a8")
+
+
 def test_glm5_aiter_biased_grouped_topk_matches_torch_reference():
     """Cover GLM-5's AITER router ABI and routed scaling semantics."""
     device = _hcu_device()
