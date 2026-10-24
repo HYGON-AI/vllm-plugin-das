@@ -57,6 +57,9 @@ from vllm.v1.attention.backend import (
 from vllm.v1.attention.selector import get_attn_backend
 from vllm.v1.kv_cache_interface import KVCacheSpec, get_kv_quant_mode
 
+from vllm_hcu.ops.fuse_rms_norm_quant import FusedRMSNormAndQuant
+from vllm_hcu.platforms import envs as henvs
+
 from .fp8_kv_dequant import LightOpKVReuseState
 
 logger = init_logger(__name__)
@@ -340,9 +343,14 @@ class Indexer(nn.Module):
         qr: torch.Tensor,
         positions: torch.Tensor,
         rotary_emb: nn.Module,
+        qr_and_scale_quanted: tuple[torch.Tensor, torch.Tensor] | None = None,
     ) -> torch.Tensor:
         hidden_states, q_quant, k, weights = self.prepare_inputs(
-            hidden_states, qr, positions, rotary_emb
+            hidden_states,
+            qr,
+            positions,
+            rotary_emb,
+            qr_and_scale_quanted=qr_and_scale_quanted,
         )
         return self.indexer_op(hidden_states, q_quant, k, weights)
 
@@ -352,9 +360,12 @@ class Indexer(nn.Module):
         qr: torch.Tensor,
         positions: torch.Tensor,
         rotary_emb: nn.Module,
+        qr_and_scale_quanted: tuple[torch.Tensor, torch.Tensor] | None = None,
     ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
         """Build the quantized query, key and per-head weights of the indexer."""
-        q, _ = self.wq_b(qr)
+        q, _ = self.wq_b._forward_with_hcu_quanted(
+            qr, qr_and_scale_quanted
+        )
         q = q.view(-1, self.n_head, self.head_dim)
         # Checkpoint (PTM) layout: pe occupies the LAST rope_dim dims.
         q_nope, q_pe = torch.split(
@@ -1045,6 +1056,24 @@ class HYV4MLAAttention(nn.Module):
                 quant_config=quant_config,
                 prefix=f"{prefix}.q_proj",
             )
+        input_proj = self.q_a_proj if self.q_a_proj is not None else self.q_proj
+        input_weight = getattr(input_proj, "weight", None)
+        self.input_quant_dtype = (
+            input_weight.dtype if input_weight is not None else None
+        )
+        q_lora_weight = getattr(self.q_b_proj, "weight", None)
+        self.enable_fuse_q_lora_rmsnorm_quant = bool(
+            self.q_a_layernorm is not None
+            and henvs.VLLM_HCU_USE_CUSTOM_OPS
+            and henvs.VLLM_HCU_USE_FUSED_RMS_QUANT
+            and q_lora_weight is not None
+            and q_lora_weight.dtype is torch.int8
+        )
+        if self.enable_fuse_q_lora_rmsnorm_quant:
+            self.q_a_layernorm = FusedRMSNormAndQuant(
+                self.q_lora_rank,
+                eps=config.rms_norm_eps,
+            )
         self.kv_a_layernorm = RMSNorm(self.kv_lora_rank, eps=config.rms_norm_eps)
         self.kv_b_proj = ColumnParallelLinear(
             self.kv_lora_rank,
@@ -1250,23 +1279,41 @@ class HYV4MLAAttention(nn.Module):
         positions: torch.Tensor,
         hidden_states: torch.Tensor,
         llama_4_scaling: torch.Tensor | None = None,
+        x_and_scale_quanted: tuple[torch.Tensor, torch.Tensor] | None = None,
     ) -> torch.Tensor:
         q_c = None
+        q_c_and_scale_quanted = None
         if self.q_lora_rank is not None:
             assert self.q_a_proj is not None
             assert self.q_a_layernorm is not None
             assert self.q_b_proj is not None
-            q_c = self.q_a_proj(hidden_states)[0]
-            q_c = self.q_a_layernorm(q_c)
+            q_c = self.q_a_proj._forward_with_hcu_quanted(
+                hidden_states, x_and_scale_quanted
+            )[0]
+            if self.enable_fuse_q_lora_rmsnorm_quant:
+                q_c_q, q_c_scale, _ = self.q_a_layernorm(
+                    q_c,
+                    quant_dtype=self.input_quant_dtype,
+                    update_input=True,
+                )
+                q_c_and_scale_quanted = (q_c_q, q_c_scale)
+            else:
+                q_c = self.q_a_layernorm(q_c)
             q_proj_layer = self.q_b_proj
-            q = q_proj_layer(q_c)[0]
+            q = q_proj_layer._forward_with_hcu_quanted(
+                q_c, q_c_and_scale_quanted
+            )[0]
         else:
             assert self.q_proj is not None
             q_proj_layer = self.q_proj
-            q = q_proj_layer(hidden_states)[0]
+            q = q_proj_layer._forward_with_hcu_quanted(
+                hidden_states, x_and_scale_quanted
+            )[0]
 
         assert self.kv_a_proj_with_mqa is not None
-        kv_lora = self.kv_a_proj_with_mqa(hidden_states)[0]
+        kv_lora = self.kv_a_proj_with_mqa._forward_with_hcu_quanted(
+            hidden_states, x_and_scale_quanted
+        )[0]
         kv_c, k_pe = kv_lora.split([self.kv_lora_rank, self.qk_rope_head_dim], dim=-1)
         kv_c_normed = self.kv_a_layernorm(kv_c)
 
@@ -1307,6 +1354,7 @@ class HYV4MLAAttention(nn.Module):
             k_pe,
             attn_out,
             q_dcp_replicated,
+            q_c_and_scale_quanted=q_c_and_scale_quanted,
         )
 
         if (
@@ -1337,6 +1385,7 @@ class HYV4MLAAttention(nn.Module):
         k_pe: torch.Tensor,
         out: torch.Tensor,  # [num_tokens, heads * v_head_dim], written in place
         q_dcp_replicated: torch.Tensor | None = None,
+        q_c_and_scale_quanted: tuple[torch.Tensor, torch.Tensor] | None = None,
     ) -> None:
         """Run the lightning indexer and MLA attention in one eager segment.
 
@@ -1348,7 +1397,13 @@ class HYV4MLAAttention(nn.Module):
         the capture is no longer active inside an eager segment.
         """
         if self.indexer is not None and self.is_sparse and not self.skip_topk:
-            self.indexer(hidden_states, q_c, positions, self.indexer_rope_emb)
+            self.indexer(
+                hidden_states,
+                q_c,
+                positions,
+                self.indexer_rope_emb,
+                qr_and_scale_quanted=q_c_and_scale_quanted,
+            )
         if self.gate_a2a_stream is None:
             out.copy_(
                 self.mla_attn(
