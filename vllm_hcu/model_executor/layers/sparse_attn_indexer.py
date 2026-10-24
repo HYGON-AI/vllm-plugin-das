@@ -41,6 +41,16 @@ from vllm_hcu.model_executor.layers.attention.pcp import (
     effective_pcp_world_size,
     maybe_gather_indexer_k,
 )
+from vllm_hcu.model_executor.layers.fp4_indexer import (
+    Fp4QTuple,
+    Fp4IndexerQuery,
+    fp4_cache_view,
+    fp4_chunk_slots,
+    lightop_fp4_decode,
+    lightop_fp4_prefill,
+    lightop_gather_index_k_fp4,
+    prepare_fp4_query,
+)
 from vllm_hcu.v1.attention.ops.decode_topk import (
     get_decode_topk_output_buffer,
     get_lightop_dcp_topk_metadata,
@@ -277,8 +287,9 @@ def fused_indexer_q_rope_quant(
     weights: torch.Tensor,
     softmax_scale: float,
     head_scale: float,
-    is_neox: bool,
-) -> tuple[torch.Tensor, torch.Tensor]:
+    is_neox: bool = False,
+    use_fp4: bool = False,
+) -> tuple[torch.Tensor, torch.Tensor] | Fp4IndexerQuery:
     # HCU exposes the CUDA dispatch surface through the ROCm platform enum.
     # Keep the v0.25.1 kernel contract and only widen this platform assertion.
     assert current_platform.is_cuda_alike()
@@ -286,6 +297,18 @@ def fused_indexer_q_rope_quant(
     assert q.shape[-1] == 128
     assert cos_sin_cache.shape[-1] == 64
     assert weights.shape == q.shape[:2]
+
+    if use_fp4:
+        # The HCU phase-1 adapter retains BF16 Q for LightOp prefill and also
+        # prepares the packed representation required by paged decode.  RoPE
+        # is deliberately not silently approximated here; the caller must
+        # pass the already-rotated BF16 query from the model's audited path.
+        return prepare_fp4_query(
+            q,
+            weights,
+            softmax_scale=softmax_scale,
+            head_scale=head_scale,
+        )
 
     q_fp8 = torch.empty_like(q, dtype=current_platform.fp8_dtype())
     weights_out = torch.empty_like(weights, dtype=torch.float32)
@@ -355,6 +378,15 @@ def kv_cache_as_quant_view(
             stride=(page_bytes, fp4_bytes, fp4_bytes, 1),
         )
     return kv_cache.unsqueeze(-2)
+
+
+def _fp4_flat_page_view(kv_cache: torch.Tensor) -> torch.Tensor:
+    """Expose allocator-owned FP4 pages as [pages, 64*68] without copying."""
+    from vllm_hcu.model_executor.layers.fp4_indexer import fp4_flat_page_view
+
+    return fp4_flat_page_view(kv_cache)
+
+
 
 
 @eager_break_during_capture
@@ -1021,7 +1053,39 @@ class SparseAttnIndexer(CustomOp):
         k: torch.Tensor | None,
         weights: torch.Tensor,
     ):
-        assert not self.use_fp4_cache, "HCU platform doesn't support fp4 cache yet"
+        if self.use_fp4_cache:
+            if self.use_pcp or self.dcp_world_size != 1:
+                raise RuntimeError("HCU FP4 indexer does not support context parallelism")
+            if not isinstance(q_quant, (Fp4IndexerQuery, Fp4QTuple)):
+                raise RuntimeError(
+                    "HCU FP4 indexer requires the phase-1 BF16/packed query adapter"
+                )
+            if isinstance(q_quant, Fp4IndexerQuery):
+                q_quant = Fp4QTuple(q_quant.packed, q_quant.scales, q_quant.bf16, q_quant.weights)
+            return rocm_aiter_sparse_attn_indexer_native(
+                hidden_states,
+                _encode_layer_name(self.k_cache.prefix),
+                self.k_cache.kv_cache,
+                q_quant,
+                k,
+                weights,
+                self.quant_block_size,
+                self.scale_fmt,
+                self.topk_tokens,
+                self.head_dim,
+                self.max_model_len,
+                self.max_total_seq_len,
+                self.topk_indices_buffer,
+                skip_k_cache_insert=self.skip_k_cache_insert,
+                dcp_rank=getattr(self, "dcp_rank", 0),
+                dcp_world_size=getattr(self, "dcp_world_size", 1),
+                cp_kv_cache_interleave_size=getattr(
+                    self, "cp_kv_cache_interleave_size", 1
+                ),
+                candidate_blocks=self.candidate_blocks,
+                candidate_block_size=self.candidate_block_size,
+                candidate_write=self.candidate_write,
+            )
         assert isinstance(q_quant, torch.Tensor), (
             "HCU sparse_attn_indexer expects a single FP8 q_quant tensor"
         )
@@ -1125,7 +1189,11 @@ class V32SparseAttnIndexer(SparseAttnIndexer):
         k: torch.Tensor,
         weights: torch.Tensor,
     ):
-        assert not self.use_fp4_cache, "HCU platform doesn't support fp4 cache yet"
+        if self.use_fp4_cache:
+            raise RuntimeError(
+                "HCU FP4 indexer is unsupported for V3.2/V4 shared-cache paths; "
+                "retain the original FP8 route"
+            )
         assert isinstance(q_quant, torch.Tensor), (
             "HCU sparse_attn_indexer expects a single FP8 q_quant tensor"
         )

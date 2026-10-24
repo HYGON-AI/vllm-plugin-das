@@ -61,6 +61,8 @@ if TYPE_CHECKING:
     VLLM_HCU_USE_LIGHTOP_MOE_ALIGN: bool = False
     VLLM_HCU_USE_LIGHTOP_EP_SCATTER: bool = True
     VLLM_HCU_USE_LIGHTOP_PER_TOKEN_QUANT_FP8: bool = False
+    VLLM_HCU_USE_FP4_INDEXER: bool = False
+    VLLM_HCU_USE_FP4_PACKER_LOWERING: bool = False
     VLLM_HCU_FUSED_MOE_CHUNK_SIZE: Optional[int] = None
     VLLM_HCU_USE_GLOBAL_MOE_CACHE: bool = False
     VLLM_HCU_USE_FUSED_RMS_QUANT: bool = False
@@ -480,6 +482,20 @@ hcu_vllm_environment_variables: dict[str, Callable[[], Any]] = {
     "VLLM_HCU_USE_LIGHTOP_PER_TOKEN_QUANT_FP8":
         lambda: (os.environ.get("VLLM_HCU_USE_LIGHTOP_PER_TOKEN_QUANT_FP8", "False").lower() in
                  ("true", "1")),
+    # Phase-1 HCU FP4 indexer integration is explicitly opt-in.  The custom-op
+    # master remains the parent gate; OFF must retain the original FP8 path.
+    "VLLM_HCU_USE_FP4_INDEXER":
+        lambda: optional_custom_op_enabled(
+            _environment_flag(os.environ.get("VLLM_HCU_USE_FP4_INDEXER", "False"))
+        ),
+    # Replace only the FP4 e2m1 conversion lowering at runtime.  The HCU
+    # custom-op master remains the parent gate; default is deliberately OFF.
+    "VLLM_HCU_USE_FP4_PACKER_LOWERING":
+        lambda: optional_custom_op_enabled(
+            _environment_flag(
+                os.environ.get("VLLM_HCU_USE_FP4_PACKER_LOWERING", "False")
+            )
+        ),
 
     # Optional override for LightOp's fused-MoE chunk size.
     "VLLM_HCU_FUSED_MOE_CHUNK_SIZE":
