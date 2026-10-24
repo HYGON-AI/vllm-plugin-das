@@ -457,12 +457,19 @@ def _validate_dspark_pd_scope(vllm_config: object) -> None:
 
     if connector == "MooncakeConnector" and is_deepseek_v4(vllm_config):
         return
+    # DecodeBenchConnector 例外：它不做跨节点 KV 传输，只在本机用 dummy 值填充
+    # KV cache 来模拟"已完成 prefill"，因此不涉及 Mooncake 那套 P→D 契约。
+    # 仅用于 decode 性能测试，不能用于正确性验证（dummy KV 的 logits/top-k 无语义）。
+    # 真实 PD 仍只允许 MooncakeConnector。
+    if connector == "DecodeBenchConnector" and is_deepseek_v4(vllm_config):
+        return
     architectures = getattr(
         getattr(vllm_config, "model_config", None), "architectures", ()
     )
     raise ValueError(
         "DeepSeek-V4 DSpark P/D disaggregation on HCU supports only "
-        f"MooncakeConnector; got connector={connector!r}, "
+        f"MooncakeConnector (or DecodeBenchConnector for local decode-only "
+        f"benchmarking); got connector={connector!r}, "
         f"architectures={architectures!r}."
     )
 
