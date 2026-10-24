@@ -820,7 +820,7 @@ class MoERunner(MoERunnerInterface):
                 "HCU preselected MoE routing requires topk_weights and topk_ids "
                 "together"
             )
-        if quanted_hidden_states is not None and scale is None:
+        if (quanted_hidden_states is None) != (scale is None):
             raise ValueError(
                 "HCU pre-quantized MoE input requires quanted_hidden_states and scale"
             )
@@ -995,8 +995,10 @@ class MoERunner(MoERunnerInterface):
                 "HCU preselected MoE routing requires topk_weights and topk_ids "
                 "together"
             )
-        if quanted_hidden_states is not None and scale is None:
-            raise ValueError("HCU pre-quantized MoE input requires scale")
+        if (quanted_hidden_states is None) != (scale is None):
+            raise ValueError(
+                "HCU pre-quantized MoE input requires quanted_hidden_states and scale"
+            )
 
         # Apply transform for routed experts (e.g., latent projection
         # for latent MoE)

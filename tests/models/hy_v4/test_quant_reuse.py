@@ -778,6 +778,31 @@ def test_moe_runner_shared_quanted_unsupported_uses_public_fallback():
     torch.testing.assert_close(output, hidden + 2)
 
 
+@pytest.mark.parametrize("missing", ["quanted_hidden_states", "scale"])
+def test_moe_runner_rejects_incomplete_quanted_input_pair(missing):
+    class _QuantMethod:
+        is_monolithic = False
+
+    runner = _runner_for_quant_method(
+        _QuantMethod(),
+        lambda **_: pytest.fail("incomplete pair must fail before dispatch"),
+    )
+    hidden = torch.ones(2, 3, dtype=torch.bfloat16)
+    kwargs = {
+        "quanted_hidden_states": torch.ones(2, 3, dtype=torch.int8),
+        "scale": torch.ones(2, 1),
+        "topk_weights": torch.ones(2, 1),
+        "topk_ids": torch.zeros(2, 1, dtype=torch.int32),
+    }
+    kwargs[missing] = None
+
+    with pytest.raises(
+        ValueError,
+        match="requires quanted_hidden_states and scale",
+    ):
+        runner._apply_quant_method(hidden, None, hidden, **kwargs)
+
+
 def test_slimquant_deepep_moe_forwards_shared_quanted_input_with_bf16_dispatch(
     monkeypatch,
 ) -> None:
