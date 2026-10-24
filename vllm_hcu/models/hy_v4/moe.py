@@ -35,6 +35,7 @@ def _quantize_int8(
 
     return per_token_quant_int8(value)
 
+
 _HYV4_MOE_CHUNK_SIZE_ENV = "VLLM_HCU_HYV4_MOE_CHUNK_SIZE"
 
 
@@ -236,10 +237,13 @@ class HYV4MoEFused(nn.Module):
             swiglu_limit=swiglu_limit,
             router_logits_dtype=torch.float32,
         )
+        shared_gate_up = getattr(self.shared_experts, "gate_up_proj", None)
+        shared_weight = getattr(shared_gate_up, "weight", None)
         self.enable_reuse_int8_quant = bool(
             henvs.VLLM_HCU_USE_CUSTOM_OPS
             and henvs.VLLM_HCU_USE_FUSED_RMS_QUANT
-            and quant_config is not None
+            and shared_weight is not None
+            and shared_weight.dtype is torch.int8
         )
         self.prefix = prefix
         if swiglu_limit is not None:

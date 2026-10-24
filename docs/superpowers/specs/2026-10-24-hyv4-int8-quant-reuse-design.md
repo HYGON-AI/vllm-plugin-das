@@ -13,9 +13,7 @@ output length 1024, concurrency 128.
 The routed W4A8 expert GEMMs are 44%--47% faster than their FP8 equivalents.
 The regression comes from the non-expert INT8 path: per-token INT8 activation
 quantization costs about 0.026--0.028 ms versus 0.007--0.008 ms for FP8, and
-HYV4 quantizes identical activations repeatedly. On the target HCU,
-RMSNorm plus INT8 quantization takes about 0.0306 ms while the existing fused
-LightOp kernel takes about 0.0094 ms and produces bit-identical quantized output.
+HYV4 quantizes identical activations repeatedly.
 
 This change is limited to the plugin repository. It does not modify the model,
 LightOp, DeepGEMM configuration files, or the installed Python environment.
@@ -25,20 +23,22 @@ LightOp, DeepGEMM configuration files, or the installed Python environment.
 When the existing `VLLM_HCU_USE_FUSED_RMS_QUANT` and custom-op switches are
 enabled and the consumer uses INT8 activation quantization:
 
-1. HYV4 decoder RMSNorm uses `FusedRMSNormAndQuant`. In the iHC path the fused
-   operator updates the reduced BF16 activation in place and returns one INT8
-   tensor/scale pair. The BF16 value remains available to unquantized gates and
-   indexer projections.
-2. Attention reuses the decoder pair for both `q_a_proj` and
-   `kv_a_proj_with_mqa` instead of quantizing the same normalized activation
-   twice.
-3. Q-LoRA RMSNorm similarly produces one pair reused by `q_b_proj` and the
-   sparse indexer's `wq_b` projection.
-4. Post-attention RMSNorm produces one pair passed through `HYV4MoEFused` to
-   both routed W4A8 experts and INT8 shared experts. Chunked MTP execution
-   slices the quantized tensors with the same token boundaries.
-5. The dense feed-forward path accepts a pre-quantized input and uses the
+1. Attention quantizes its normalized input once for both `q_a_proj` and
+   `kv_a_proj_with_mqa` instead of letting each linear quantize it separately.
+2. The normalized Q-LoRA activation is quantized once and reused by both
+   `q_b_proj` and the sparse indexer's `wq_b` projection.
+3. `HYV4MoEFused` quantizes its input once and passes the same pair to routed
+   W4A8 experts and INT8 shared experts. Chunked MTP execution slices the
+   quantized tensors with the same token boundaries.
+4. The dense feed-forward path accepts a pre-quantized input and uses the
    existing fused SiLU-multiply-quant operator for its INT8 down projection.
+
+An attempted decoder-level fused RMSNorm/quant implementation reduced some
+kernel work but reduced end-to-end throughput. The delivered implementation
+therefore keeps ordinary RMSNorm and creates quantized pairs inside attention
+and MoE. The final reuse path retains the latency benefit, but captured graph
+memory remains 3.63 GiB versus the 2.37 GiB baseline; this cost must be stated
+alongside benchmark results.
 
 All new arguments are optional. With the feature flag off, non-INT8 weights,
 or an unsupported quantization method, HYV4 keeps its current path.
@@ -47,9 +47,6 @@ or an unsupported quantization method, HYV4 keeps its current path.
 
 - Unit tests prove each shared pair reaches all intended consumers, chunk
   slicing stays aligned, and disabled/non-INT8 paths preserve old behavior.
-- HCU kernel accuracy compares fused RMSNorm/INT8 quant against the unfused
-  reference over decode batch sizes and requires matching quantized values and
-  scales within the existing kernel tolerances.
 - The repository's HYV4/runtime/accuracy regression suites remain green.
 - HumanEval cases 0--63 score at least 63/64 (no more than 2 percentage points
   below the 64/64 baseline).

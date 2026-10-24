@@ -403,6 +403,7 @@ class HYV4DecoderLayer(nn.Module):
             lightop_kv_reuse_state=lightop_kv_reuse_state,
             gate_a2a_stream=gate_a2a_stream,
         )
+        self.input_layernorm = RMSNorm(config.hidden_size, config.rms_norm_eps)
         if config.mlp_layer_types[layer_idx] == "dense":
             self.mlp = HYV4FeedForward(
                 hidden_size=config.hidden_size,
@@ -421,7 +422,6 @@ class HYV4DecoderLayer(nn.Module):
                 vllm_config=vllm_config,
             )
             self.block_type = "moe"
-        self.input_layernorm = RMSNorm(config.hidden_size, config.rms_norm_eps)
         self.post_attention_layernorm = RMSNorm(config.hidden_size, config.rms_norm_eps)
         self.hc_attn_layer = HYV4HCLayer(config, layer_idx)
         self.hc_mlp_layer = HYV4HCLayer(config, layer_idx)

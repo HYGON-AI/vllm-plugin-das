@@ -26,9 +26,8 @@ Unsupported quantization metadata still fails before kernel construction.
 
 ## Optional HYV4 INT8 activation reuse
 
-HYV4 Channel-INT4 checkpoints use dynamic INT8 activations for MLA and shared
-expert projections. Enable the reviewed fused RMSNorm/quantization reuse path
-with:
+HYV4 Channel-INT4 checkpoints use dynamic INT8 activations for MLA and expert
+projections. Enable the reviewed activation-quantization reuse path with:
 
 ```bash
 export VLLM_HCU_USE_CUSTOM_OPS=1
@@ -36,11 +35,12 @@ export VLLM_HCU_USE_FUSED_RMS_QUANT=1
 export VLLM_HCU_USE_FUSED_SILU_MUL_QUANT=1
 ```
 
-The first fused result is shared by q-a and kv-a projections, the Q-LoRA
-result is shared by q-b and the sparse indexer, and the post-attention result
-is shared by routed and shared experts. The optimization activates only for
-INT8 consumers; other quantization formats and launches without the switches
-retain their existing path.
+One quantized input is shared by q-a and kv-a projections, the normalized
+Q-LoRA input is quantized once for q-b and the sparse indexer, and one MoE
+input pair is shared by routed and shared experts. Dense feed-forward layers
+also fuse SiLU/multiply with the down-projection quantization. The optimization
+activates only for INT8 consumers; launches without the switches retain their
+existing path.
 
 ## Verification status
 

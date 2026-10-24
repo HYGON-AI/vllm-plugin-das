@@ -2,9 +2,9 @@
 
 > **For agentic workers:** REQUIRED SUB-SKILL: Use superpowers:subagent-driven-development (recommended) or superpowers:executing-plans to implement this plan task-by-task. Steps use checkbox (`- [ ]`) syntax for tracking.
 
-**Goal:** Reuse fused INT8 activations throughout HYV4 and ship the optimization only when accuracy drops by at most 2 percentage points and controlled decode performance improves.
+**Goal:** Reuse INT8 activations throughout HYV4 and ship the optimization only when accuracy drops by at most 2 percentage points and controlled decode performance improves.
 
-**Architecture:** Gate the optimization with the existing fused-RMS-quant environment switch and INT8 consumer detection. Produce one normalized BF16 activation plus one INT8 tensor/scale pair at each reusable boundary, then thread that pair through attention, indexer, dense MLP, and MoE APIs without changing disabled-path behavior.
+**Architecture:** Gate the optimization with the existing fused-RMS-quant environment switch and INT8 consumer detection. Produce one INT8 tensor/scale pair at each reusable boundary, then thread that pair through attention, indexer, dense MLP, and MoE APIs without changing disabled-path behavior. The final implementation deliberately keeps decoder RMSNorm unfused because decoder-level pairs enlarged graph capture and regressed throughput.
 
 **Tech Stack:** Python, PyTorch, vLLM 0.25.1, LightOp HCU custom operators, pytest, vLLM benchmark serving.
 

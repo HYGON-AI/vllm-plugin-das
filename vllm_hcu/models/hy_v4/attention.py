@@ -71,6 +71,7 @@ def _quantize_int8(
 
     return per_token_quant_int8(value)
 
+
 _SPARSE_LAYER_TYPES = (
     "sparse_attention",
     "sparse",
@@ -1068,11 +1069,6 @@ class HYV4MLAAttention(nn.Module):
                 quant_config=quant_config,
                 prefix=f"{prefix}.q_proj",
             )
-        input_proj = self.q_a_proj if self.q_a_proj is not None else self.q_proj
-        input_weight = getattr(input_proj, "weight", None)
-        self.input_quant_dtype = (
-            input_weight.dtype if input_weight is not None else None
-        )
         q_lora_weight = getattr(self.q_b_proj, "weight", None)
         self.enable_reuse_int8_quant = bool(
             henvs.VLLM_HCU_USE_CUSTOM_OPS

@@ -8,7 +8,6 @@ from types import SimpleNamespace
 import torch
 
 from vllm_hcu.models.hy_v4.attention import HYV4MLAAttention, Indexer
-from vllm_hcu.models.hy_v4.model import HYV4DecoderLayer
 from vllm_hcu.models.hy_v4.moe import HYV4FeedForward, HYV4MoEFused
 
 
@@ -28,27 +27,6 @@ class _RecordingLinear:
     ):
         self.pairs.append(pair)
         return self.output.clone(), None
-
-
-class _FusedNorm:
-    def __init__(
-        self,
-        quantized: torch.Tensor,
-        scale: torch.Tensor,
-    ) -> None:
-        self.quantized = quantized
-        self.scale = scale
-        self.calls: list[tuple[torch.dtype, bool]] = []
-
-    def __call__(
-        self,
-        value: torch.Tensor,
-        *,
-        quant_dtype: torch.dtype,
-        update_input: bool,
-    ):
-        self.calls.append((quant_dtype, update_input))
-        return self.quantized, self.scale, None
 
 
 def _attention_layer(*, reuse_quant: bool):
@@ -100,7 +78,6 @@ def _attention_layer(*, reuse_quant: bool):
         gate_a2a_stream=None,
         o_proj=_RecordingLinear(torch.full((2, 4), 3, dtype=torch.bfloat16)),
         enable_reuse_int8_quant=reuse_quant,
-        input_quant_dtype=torch.int8,
     )
     return (
         layer,
@@ -210,78 +187,6 @@ def test_attention_indexer_reuses_q_lora_quantized_pair(monkeypatch) -> None:
     )
 
     assert wq_b.pairs == [q_c_pair]
-
-
-class _DecoderBlock:
-    def __init__(self, increment: float) -> None:
-        self.increment = increment
-        self.calls: list[tuple[torch.Tensor, object]] = []
-
-    def __call__(self, *args, **kwargs):
-        value = kwargs.get("hidden_states", args[0] if args else None)
-        pair = kwargs.get("x_and_scale_quanted")
-        self.calls.append((value.clone(), pair))
-        return value + self.increment
-
-
-class _IdentityHC:
-    def prepare_input(self, value: torch.Tensor) -> torch.Tensor:
-        return value
-
-    def pre(self, value: torch.Tensor):
-        return value.clone(), torch.ones(value.shape[0], 1), value.clone()
-
-    def post(self, value, residual, post_gates):
-        return value
-
-
-def test_decoder_ihc_keeps_norm_outputs_unquantized() -> None:
-    attention = _DecoderBlock(1)
-    moe = _DecoderBlock(2)
-    layer = SimpleNamespace(
-        hc_attn_layer=_IdentityHC(),
-        hc_mlp_layer=_IdentityHC(),
-        input_layernorm=lambda value: value + 3,
-        post_attention_layernorm=lambda value: value + 4,
-        self_attn=attention,
-        mlp=moe,
-    )
-    hidden = torch.zeros(2, 4, dtype=torch.bfloat16)
-
-    actual, residual = HYV4DecoderLayer._forward_ihc(
-        layer,
-        positions=torch.arange(2),
-        hidden_states=hidden,
-    )
-
-    assert residual is None
-    assert attention.calls[0][1] is None
-    assert moe.calls[0][1] is None
-    torch.testing.assert_close(attention.calls[0][0], torch.full_like(hidden, 3))
-    torch.testing.assert_close(moe.calls[0][0], torch.full_like(hidden, 8))
-    torch.testing.assert_close(actual, torch.full_like(hidden, 10))
-
-
-def test_decoder_ihc_disabled_path_preserves_unquantized_calls() -> None:
-    attention = _DecoderBlock(1)
-    moe = _DecoderBlock(2)
-    layer = SimpleNamespace(
-        hc_attn_layer=_IdentityHC(),
-        hc_mlp_layer=_IdentityHC(),
-        input_layernorm=torch.nn.Identity(),
-        post_attention_layernorm=torch.nn.Identity(),
-        self_attn=attention,
-        mlp=moe,
-    )
-
-    HYV4DecoderLayer._forward_ihc(
-        layer,
-        positions=torch.arange(2),
-        hidden_states=torch.zeros(2, 4, dtype=torch.bfloat16),
-    )
-
-    assert attention.calls[0][1] is None
-    assert moe.calls[0][1] is None
 
 
 class _RecordingExperts:
