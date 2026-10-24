@@ -1123,6 +1123,9 @@ def test_hcu_custom_op_real_and_fake_share_dcp_schema_and_forward_constants():
         "dcp_rank": 2,
         "dcp_world_size": 4,
         "cp_kv_cache_interleave_size": 8,
+        "candidate_blocks": None,
+        "candidate_block_size": 0,
+        "candidate_write": False,
     }
 
     fake_op(*common_args, False, 2, 4, 8)
@@ -1142,7 +1145,13 @@ def test_hcu_sparse_indexer_custom_op_has_no_tensor_return() -> None:
     assert len(schema.returns) == 0
     schema_text = str(schema)
     assert "Tensor? k" in schema_text
-    assert "Tensor(a14!)? candidate_blocks=None" in schema_text
+    candidate_arg = next(
+        arg for arg in schema.arguments if arg.name == "candidate_blocks"
+    )
+    assert str(candidate_arg.type) == "Optional[Tensor]"
+    assert candidate_arg.default_value is None
+    assert candidate_arg.alias_info is not None
+    assert candidate_arg.alias_info.is_write
     assert "candidate_block_size=0" in schema_text
     assert "candidate_write=False" in schema_text
 
@@ -1254,6 +1263,312 @@ def test_hcu_candidate_policy_runs_before_token_topk(
         assert calls[0][4:] == (4, 8, candidates, 2)
     else:
         assert calls[0][4:] == (candidates, 8, 2)
+
+
+class _FakeCandidateTensor:
+    def __init__(
+        self,
+        shape: tuple[int, ...],
+        *,
+        dtype: object,
+        device: object,
+        is_cuda: bool = True,
+        contiguous: bool = True,
+        stride: tuple[int, ...] | None = None,
+    ) -> None:
+        self.shape = shape
+        self.ndim = len(shape)
+        self.dtype = dtype
+        self.device = device
+        self.is_cuda = is_cuda
+        self._contiguous = contiguous
+        self._stride = stride or (
+            (shape[1], 1) if len(shape) == 2 else (1,)
+        )
+        self.copy_source = None
+        self.slice_start = None
+        self.last_slice = None
+
+    def is_contiguous(self) -> bool:
+        return self._contiguous
+
+    def stride(self, dim: int | None = None):
+        if dim is None:
+            return self._stride
+        return self._stride[dim]
+
+    def numel(self) -> int:
+        result = 1
+        for size in self.shape:
+            result *= size
+        return result
+
+    def __getitem__(self, item):
+        start = 0 if item.start is None else item.start
+        stop = self.shape[0] if item.stop is None else item.stop
+        shape = (stop - start, *self.shape[1:])
+        view = _FakeCandidateTensor(
+            shape,
+            dtype=self.dtype,
+            device=self.device,
+            is_cuda=self.is_cuda,
+            contiguous=self._contiguous,
+        )
+        view.slice_start = start
+        if hasattr(self, "_candidate_ids_dtype"):
+            view._candidate_ids_dtype = self._candidate_ids_dtype
+        self.last_slice = view
+        return view
+
+    def copy_(self, source):
+        self.copy_source = source
+        return self
+
+
+def _load_lightop_candidate_helper(monkeypatch, *, producer):
+    source = (
+        REPO / "vllm_hcu/v1/attention/ops/rocm_aiter_mla_sparse.py"
+    ).read_text(encoding="utf-8")
+    tree = ast.parse(source)
+    selected = [
+        copy.deepcopy(node)
+        for node in tree.body
+        if isinstance(node, ast.FunctionDef)
+        and node.name
+        in {
+            "_lightop_dsv41_candidate_enabled",
+            "_lightop_decode_candidate_blocks",
+        }
+    ]
+    module = ast.Module(body=selected, type_ignores=[])
+    ast.fix_missing_locations(module)
+
+    float32 = object()
+    int32 = object()
+    device = object()
+    fake_torch = SimpleNamespace(
+        Tensor=object,
+        bool=bool,
+        float32=float32,
+        int32=int32,
+    )
+    attention = SimpleNamespace(dsv41_select_candidate_blocks=producer)
+    candidate_enabled = (
+        __import__("os").environ.get(
+            "VLLM_HCU_USE_LIGHTOP_DSV41_CANDIDATE_BLOCKS", "True"
+        ).lower()
+        in ("true", "1")
+    )
+    namespace = {
+        "torch": fake_torch,
+        "henvs": SimpleNamespace(
+            VLLM_HCU_USE_LIGHTOP_DSV41_CANDIDATE_BLOCKS=candidate_enabled
+        ),
+        "_get_lightop_attention": lambda: attention,
+        "_decode_row_ends_from_seq_lens": lambda seq_lens, next_n, rows: (
+            _FakeCandidateTensor(
+                (rows,), dtype=int32, device=device, is_cuda=True
+            )
+        ),
+    }
+    exec(compile(module, "lightop_candidate_helper", "exec"), namespace)
+    return namespace, float32, int32, device
+
+
+def test_lightop_decode_candidate_helper_copies_public_ids_only(monkeypatch):
+    monkeypatch.setenv("VLLM_HCU_USE_LIGHTOP_DSV41_CANDIDATE_BLOCKS", "1")
+    calls = []
+
+    def producer(logits, seq_lens, topk_blocks, block_size):
+        calls.append((logits, seq_lens, topk_blocks, block_size))
+        return (
+            _FakeCandidateTensor(
+                logits.shape, dtype=bool, device=logits.device
+            ),
+            _FakeCandidateTensor(
+                (logits.shape[0], topk_blocks),
+                dtype=logits._candidate_ids_dtype,
+                device=logits.device,
+            ),
+        )
+
+    namespace, float32, int32, device = _load_lightop_candidate_helper(
+        monkeypatch, producer=producer
+    )
+    logits = _FakeCandidateTensor(
+        (6, 32), dtype=float32, device=device, stride=(32, 1)
+    )
+    logits._candidate_ids_dtype = int32
+    seq_lens = _FakeCandidateTensor((1, 6), dtype=int32, device=device)
+    candidates = _FakeCandidateTensor(
+        (8, 2048), dtype=int32, device=device, stride=(2048, 1)
+    )
+
+    assert namespace["_lightop_decode_candidate_blocks"](
+        logits, seq_lens, 6, candidates, 8, 6
+    )
+    assert len(calls) == 1
+    assert calls[0][0].shape == logits.shape
+    assert calls[0][1].shape == (6,)
+    assert calls[0][2:] == (2048, 8)
+    assert candidates.last_slice is not None
+    assert candidates.last_slice.copy_source is not None
+    assert candidates.last_slice.copy_source.shape == (6, 2048)
+
+
+def test_lightop_decode_candidate_helper_does_not_copy_padded_rows(monkeypatch):
+    monkeypatch.setenv("VLLM_HCU_USE_LIGHTOP_DSV41_CANDIDATE_BLOCKS", "1")
+    calls = []
+
+    def producer(logits, seq_lens, topk_blocks, block_size):
+        calls.append((logits, seq_lens, topk_blocks, block_size))
+        return (
+            _FakeCandidateTensor(
+                logits.shape, dtype=bool, device=logits.device
+            ),
+            _FakeCandidateTensor(
+                (logits.shape[0], topk_blocks),
+                dtype=logits._candidate_ids_dtype,
+                device=logits.device,
+            ),
+        )
+
+    namespace, float32, int32, device = _load_lightop_candidate_helper(
+        monkeypatch, producer=producer
+    )
+    logits = _FakeCandidateTensor(
+        (6, 32), dtype=float32, device=device, stride=(32, 1)
+    )
+    logits._candidate_ids_dtype = int32
+    seq_lens = _FakeCandidateTensor((1, 6), dtype=int32, device=device)
+    candidates = _FakeCandidateTensor(
+        (8, 2048), dtype=int32, device=device, stride=(2048, 1)
+    )
+
+    assert namespace["_lightop_decode_candidate_blocks"](
+        logits, seq_lens, 6, candidates, 8, 3
+    )
+    assert len(calls) == 1
+    assert calls[0][0].shape == (3, 32)
+    assert calls[0][1].shape == (3,)
+    assert candidates.last_slice is not None
+    assert candidates.last_slice.slice_start == 0
+    assert candidates.last_slice.shape == (3, 2048)
+    assert candidates.last_slice.copy_source.shape == (3, 2048)
+
+
+@pytest.mark.parametrize(
+    "kwargs",
+    [
+        {"dtype": "bf16"},
+        {"is_cuda": False},
+        {"contiguous": False},
+        {"candidate_block_size": 16},
+        {"candidate_width": 1024},
+    ],
+)
+def test_lightop_decode_candidate_helper_falls_back_before_call(kwargs):
+    calls = []
+
+    def producer(*args):
+        calls.append(args)
+        raise AssertionError("unsupported input must not call LightOp")
+
+    namespace, float32, int32, device = _load_lightop_candidate_helper(
+        None, producer=producer
+    )
+    logits_dtype = float32 if kwargs.get("dtype") != "bf16" else object()
+    logits = _FakeCandidateTensor(
+        (2, 16),
+        dtype=logits_dtype,
+        device=device,
+        is_cuda=kwargs.get("is_cuda", True),
+        contiguous=kwargs.get("contiguous", True),
+    )
+    candidates = _FakeCandidateTensor(
+        (2, kwargs.get("candidate_width", 2048)),
+        dtype=int32,
+        device=device,
+        stride=(kwargs.get("candidate_width", 2048), 1),
+    )
+    result = namespace["_lightop_decode_candidate_blocks"](
+        logits,
+        _FakeCandidateTensor((2,), dtype=int32, device=device),
+        1,
+        candidates,
+        kwargs.get("candidate_block_size", 8),
+        2,
+    )
+    assert result is False
+    assert calls == []
+
+
+def test_lightop_decode_candidate_helper_falls_back_when_api_is_missing():
+    namespace, float32, int32, device = _load_lightop_candidate_helper(
+        None, producer=None
+    )
+    namespace["_get_lightop_attention"] = lambda: SimpleNamespace()
+    logits = _FakeCandidateTensor((2, 16), dtype=float32, device=device)
+    candidates = _FakeCandidateTensor(
+        (2, 2048), dtype=int32, device=device, stride=(2048, 1)
+    )
+    assert namespace["_lightop_decode_candidate_blocks"](
+        logits,
+        _FakeCandidateTensor((2,), dtype=int32, device=device),
+        1,
+        candidates,
+        8,
+        2,
+    ) is False
+
+
+@pytest.mark.parametrize(
+    ("value", "expected"),
+    [(None, True), ("0", False), ("1", True)],
+)
+def test_lightop_decode_candidate_helper_reads_registered_env_switch(
+    monkeypatch: pytest.MonkeyPatch, value: str | None, expected: bool
+):
+    name = "VLLM_HCU_USE_LIGHTOP_DSV41_CANDIDATE_BLOCKS"
+    if value is None:
+        monkeypatch.delenv(name, raising=False)
+    else:
+        monkeypatch.setenv(name, value)
+    namespace, float32, int32, device = _load_lightop_candidate_helper(
+        monkeypatch, producer=lambda *args: None
+    )
+    assert namespace["_lightop_dsv41_candidate_enabled"]() is expected
+
+
+def test_lightop_decode_candidate_helper_falls_back_for_empty_shapes():
+    namespace, float32, int32, device = _load_lightop_candidate_helper(
+        None, producer=lambda *args: (_ for _ in ()).throw(
+            AssertionError("empty input must not call LightOp")
+        )
+    )
+    logits = _FakeCandidateTensor((0, 16), dtype=float32, device=device)
+    candidates = _FakeCandidateTensor(
+        (0, 2048), dtype=int32, device=device, stride=(2048, 1)
+    )
+    assert namespace["_lightop_decode_candidate_blocks"](
+        logits,
+        _FakeCandidateTensor((0,), dtype=int32, device=device),
+        1,
+        candidates,
+        8,
+        0,
+    ) is False
+
+
+def test_lightop_candidate_is_decode_only_and_prefill_stays_old_path():
+    source = (
+        REPO / "vllm_hcu/v1/attention/ops/rocm_aiter_mla_sparse.py"
+    ).read_text(encoding="utf-8")
+    _, body = source.split("    if has_prefill:", 1)
+    prefill, decode = body.split("    if has_decode:", 1)
+    assert "_lightop_decode_candidate_blocks" not in prefill
+    assert "_lightop_decode_candidate_blocks" in decode
+    assert "candidate_write and _lightop_decode_candidate_blocks" in decode
 
 
 def test_sparse_indexer_non_aiter_fallback_stays_opaque(monkeypatch):

@@ -72,6 +72,110 @@ def _apply_candidate_policy(
         )
 
 
+def _lightop_dsv41_candidate_enabled() -> bool:
+    """Return the DSV4.1 candidate producer switch under the custom-op master."""
+    return henvs.VLLM_HCU_USE_LIGHTOP_DSV41_CANDIDATE_BLOCKS
+
+
+def _lightop_decode_candidate_blocks(
+    logits: torch.Tensor,
+    seq_lens: torch.Tensor,
+    next_n: int,
+    candidate_blocks: torch.Tensor,
+    candidate_block_size: int,
+    valid_rows: int | None = None,
+) -> bool:
+    """Use the public LightOp producer when its narrow contract is known.
+
+    The public API allocates and returns both a mask and block IDs.  The mask is
+    deliberately discarded; IDs are copied into the caller-owned shared buffer.
+    This helper is default-on and returns False only for pre-call contract gates.
+    Native execution errors are intentionally not converted into a fallback.
+    """
+    if not _lightop_dsv41_candidate_enabled():
+        return False
+    if valid_rows is None:
+        valid_rows = logits.shape[0]
+    if (
+        logits.ndim != 2
+        or not logits.is_cuda
+        or logits.dtype != torch.float32
+        or not logits.is_contiguous()
+        or logits.shape[0] == 0
+        or logits.shape[1] == 0
+        or logits.shape[1] % 8 != 0
+        or candidate_block_size != 8
+        or candidate_blocks.ndim != 2
+        or candidate_blocks.dtype != torch.int32
+        or not candidate_blocks.is_cuda
+        or candidate_blocks.device != logits.device
+        or candidate_blocks.shape[1] != 2048
+        or candidate_blocks.shape[0] < logits.shape[0]
+        or not candidate_blocks.is_contiguous()
+        or seq_lens.ndim not in (1, 2)
+        or seq_lens.dtype != torch.int32
+        or seq_lens.device != logits.device
+    ):
+        return False
+
+    if valid_rows < 0 or valid_rows > logits.shape[0]:
+        return False
+    if valid_rows == 0:
+        return False
+
+    effective_logits = logits if valid_rows == logits.shape[0] else logits[:valid_rows]
+
+    row_lens = seq_lens
+    if (
+        seq_lens.ndim == 2
+        and seq_lens.shape[1] == 1
+        and next_n > 1
+        and seq_lens.shape[0] * next_n == logits.shape[0]
+    ):
+        # The paged-MQA API may retain request-level lengths as [B, 1].
+        # Flattening here lets the existing shape-only helper derive the
+        # effective per-draft-row ends without reading a device value.
+        row_lens = seq_lens.reshape(-1)
+    row_ends = _decode_row_ends_from_seq_lens(row_lens, next_n, logits.shape[0])
+    row_ends = row_ends[:valid_rows]
+    if (
+        row_ends.numel() != valid_rows
+        or row_ends.dtype != torch.int32
+        or row_ends.device != logits.device
+        or not row_ends.is_contiguous()
+    ):
+        return False
+
+    try:
+        attention = _get_lightop_attention()
+    except (ImportError, AttributeError):
+        return False
+    producer = getattr(attention, "dsv41_select_candidate_blocks", None)
+    if not callable(producer):
+        return False
+
+    result = producer(effective_logits, row_ends, candidate_blocks.shape[1], 8)
+    if not isinstance(result, tuple) or len(result) != 2:
+        raise RuntimeError(
+            "LightOp dsv41_select_candidate_blocks returned an invalid result"
+        )
+    mask, block_ids = result
+    if (
+        mask.shape != effective_logits.shape
+        or mask.dtype != torch.bool
+        or mask.device != logits.device
+        or block_ids.shape != (valid_rows, candidate_blocks.shape[1])
+        or block_ids.dtype != torch.int32
+        or block_ids.device != logits.device
+    ):
+        raise RuntimeError(
+            "LightOp dsv41_select_candidate_blocks returned an invalid layout"
+        )
+
+    candidate_blocks[:valid_rows].copy_(block_ids)
+    return True
+
+
 def _get_lightop_attention():
     global lightop_attention
     if lightop_attention is None:
@@ -1716,19 +1820,31 @@ def rocm_aiter_sparse_attn_indexer_native(
 
         if candidate_blocks is not None:
             num_rows = logits.shape[0]
+            valid_decode_rows = (
+                num_decode_tokens if decode_metadata.requires_padding else num_rows
+            )
             vis = seq_lens.reshape(-1)
             row_repeat = next_n if vis.numel() != num_rows else 1
-            vis = vis[:num_rows]
-            decode_candidates = candidate_blocks[:num_rows]
-            _apply_candidate_policy(
+            vis = vis[:valid_decode_rows]
+            decode_candidates = candidate_blocks[:valid_decode_rows]
+            used_lightop = candidate_write and _lightop_decode_candidate_blocks(
                 logits,
-                None,
-                vis,
-                decode_candidates,
+                seq_lens,
+                next_n,
+                candidate_blocks,
                 candidate_block_size,
-                candidate_write,
-                row_repeat,
+                valid_decode_rows,
             )
+            if not used_lightop:
+                _apply_candidate_policy(
+                    logits[:valid_decode_rows],
+                    None,
+                    vis,
+                    decode_candidates,
+                    candidate_block_size,
+                    candidate_write,
+                    row_repeat,
+                )
 
         # A padded decode batch has more kernel rows than actual decode
         # tokens.  Do not point those extra rows at the shared output buffer:

@@ -24,6 +24,7 @@ if TYPE_CHECKING:
     VLLM_HCU_USE_FP8_MIXED_BATCH: bool = False
     VLLM_HCU_USE_CUSTOM_QUANTIZATION_GEMM : bool = False
     VLLM_HCU_USE_CUSTOM_OPS : bool = False
+    VLLM_HCU_USE_LIGHTOP_DSV41_CANDIDATE_BLOCKS: bool = True
     VLLM_HCU_QSA_BACKEND: str = "cutlass"
     VLLM_HCU_USE_CUSTOM_SILU_AND_MUL : bool = False
     VLLM_HCU_USE_CUSTOM_GEMMA_RMS_NORM : bool = False
@@ -303,6 +304,16 @@ hcu_vllm_environment_variables: dict[str, Callable[[], Any]] = {
     # If set, control hcu custom unfused or fused kernel ops
     "VLLM_HCU_USE_CUSTOM_OPS":
     custom_ops_enabled,
+    # DSV4.1 decode candidate producer. Default on; the custom-op master
+    # switch remains authoritative and any contract miss keeps the generic path.
+    "VLLM_HCU_USE_LIGHTOP_DSV41_CANDIDATE_BLOCKS":
+        lambda: optional_custom_op_enabled(
+            _environment_flag(
+                os.environ.get(
+                    "VLLM_HCU_USE_LIGHTOP_DSV41_CANDIDATE_BLOCKS", "True"
+                )
+            )
+        ),
     # Select the BF16 QSA implementation independently of the generic
     # FLASH_ATTN backend mode. The BF16 dispatcher applies
     # VLLM_HCU_USE_CUSTOM_OPS as its master gate; FP8 QSA is selected by the

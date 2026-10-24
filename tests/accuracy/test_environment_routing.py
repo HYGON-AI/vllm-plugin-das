@@ -119,6 +119,32 @@ def test_optional_custom_op_policy_reads_master_without_materialized_leak(
 
 
 @pytest.mark.parametrize(
+    ("master", "feature", "expected"),
+    ((None, None, True), ("1", "0", False), ("1", "1", True), ("0", "1", False)),
+)
+def test_dsv41_candidate_producer_switch_defaults_on_and_is_master_gated(
+    monkeypatch: pytest.MonkeyPatch,
+    master: str | None,
+    feature: str | None,
+    expected: bool,
+) -> None:
+    master_name = "VLLM_HCU_USE_CUSTOM_OPS"
+    feature_name = "VLLM_HCU_USE_LIGHTOP_DSV41_CANDIDATE_BLOCKS"
+    if master is None:
+        monkeypatch.delenv(master_name, raising=False)
+    else:
+        monkeypatch.setenv(master_name, master)
+    if feature is None:
+        monkeypatch.delenv(feature_name, raising=False)
+    else:
+        monkeypatch.setenv(feature_name, feature)
+
+    assert feature_name in hcu_envs.hcu_vllm_environment_variables
+    assert hcu_envs.VLLM_HCU_USE_LIGHTOP_DSV41_CANDIDATE_BLOCKS is expected
+    assert hcu_envs.is_set(feature_name) is (feature is not None)
+
+
+@pytest.mark.parametrize(
     ("value", "expected"),
     ((None, True), ("1", True), ("true", True), ("0", False), ("false", False)),
 )
