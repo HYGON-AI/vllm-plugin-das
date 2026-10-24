@@ -43,6 +43,31 @@ alongside benchmark results.
 All new arguments are optional. With the feature flag off, non-INT8 weights,
 or an unsupported quantization method, HYV4 keeps its current path.
 
+## Review follow-up: large offsets and internal overlap
+
+The persistent masked activation kernel must promote the expert index to
+64-bit before multiplying it by any tensor stride. This keeps input, output,
+scale, and token-count address arithmetic correct when a valid expert
+workspace crosses the signed 32-bit element boundary. A CPU semantic test
+will exercise the boundary without allocating the corresponding multi-GiB
+tensor, and the existing HCU accuracy test will cover kernel compilation and
+normal-size execution.
+
+For `MK_INTERNAL_OVERLAPPED`, the selected design adds a shared-only
+pre-quantized-input channel through `MoERunner`, the SlimQuant W4A8 quant
+method, and the HCU modular kernel. The routed DeepEP input remains BF16;
+only the shared expert receives the reusable `(int8, scale)` pair during the
+modular kernel's finalize phase. This avoids changing DeepEP dispatch while
+removing the duplicate shared gate/up quantization.
+
+Two alternatives were rejected: dropping the pair for internal overlap would
+discard work already produced by fused RMS quantization, while extending the
+upstream `RoutedExperts.forward_modular` public surface would broaden the
+replacement contract unnecessarily. The new contract tests must prove that
+internal overlap receives the pair exactly once, routed dispatch stays BF16,
+NO_OVERLAP behavior is unchanged, and unsupported methods retain their
+existing public-forward fallback.
+
 ## Validation gates
 
 - Unit tests prove each shared pair reaches all intended consumers, chunk
@@ -54,6 +79,30 @@ or an unsupported quantization method, HYV4 keeps its current path.
   latency, FP8 E4M3 KV cache, FULL_AND_PIECEWISE graphs, input 1, output 1024,
   concurrency 128, 16 warmups, and 128 measured requests. A separate PR is
   opened only if throughput increases or TPOT decreases.
+
+## Final review-follow-up results
+
+The final feature HEAD `35f35d3`, plus the review-hardening commit `c120cf1`,
+passed the portable contract gate with 2,574 tests collected and passing (192
+deselected), including 372 focused HYV4, DeepEP, and quantized-GEMM cases. The
+real HCU persistent-kernel accuracy entry also passed. HumanEval evaluated 64
+unique cases with no API errors and scored 64/64 (`mean_acc_pass@1 = 1.0`),
+so the accuracy change is 0 percentage points.
+
+The requested DP8/EP8/MTP3 service used DeepEP low latency, FP8 E4M3 KV
+cache, and FULL_AND_PIECEWISE graphs. The two controlled 128-request runs
+produced 1294.01 and 1266.70 output tok/s, for a 1280.36 tok/s mean. This is
+2.13% below the 1308.22 tok/s W4A8 reference mean, narrowly outside the 2%
+raw-throughput threshold, and 6.69% above the 1200.10 tok/s FP8 reference.
+
+The required investigation found that full-run throughput is dominated by
+one or two data-parallel tail requests: the prior W4A8 reference itself spans
+4.41% between its two runs. A same-host before/after check showed that the
+steady per-token cost did not regress: mean TPOT improved from 73.760 ms at
+`01e694f` to 73.355--73.393 ms at `35f35d3` (0.50%--0.55%), and after
+excluding the two makespan outliers the paired throughput was 1321.48 versus
+1322.66 tok/s. Raw makespan should therefore be reported with this variance
+qualification rather than treated as evidence of a kernel regression.
 
 ## Delivery
 
