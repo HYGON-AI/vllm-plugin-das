@@ -5191,22 +5191,29 @@ def test_moe_runner_and_shared_experts_cold_replacement_contract():
                 del layer, topk_weights, topk_ids, shared_experts_input
                 return x
 
-        runner.routed_experts.quant_method = UnsupportedQuantMethod()
+        fallback_calls = []
+
+        def forward_modular(**kwargs):
+            fallback_calls.append(kwargs)
+            return kwargs["x"] + 3
+
+        runner.routed_experts = SimpleNamespace(
+            quant_method=UnsupportedQuantMethod(),
+            forward_modular=forward_modular,
+        )
         runner.__dict__.pop("_supports_quanted_inputs", None)
-        try:
-            runner._apply_quant_method(
-                hidden,
-                None,
-                None,
-                quanted_hidden_states=quanted,
-                scale=scale,
-                topk_weights=topk_weights,
-                topk_ids=topk_ids,
-            )
-        except RuntimeError as error:
-            assert "does not accept i_q/i_s" in str(error)
-        else:
-            raise AssertionError("unsupported prequantized input did not fail")
+        shared, output = runner._apply_quant_method(
+            hidden,
+            None,
+            None,
+            quanted_hidden_states=quanted,
+            scale=scale,
+            topk_weights=topk_weights,
+            topk_ids=topk_ids,
+        )
+        assert shared is None
+        assert torch.equal(output, hidden + 3)
+        assert fallback_calls[0]["x"] is hidden
 
         class SharedLayer:
             def forward(self, value, x_and_scale_quanted=None):

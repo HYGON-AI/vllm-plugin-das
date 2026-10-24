@@ -72,6 +72,38 @@ def _quantize_int8(
     return per_token_quant_int8(value)
 
 
+def _linear_supports_quanted_inputs(layer: nn.Module) -> bool:
+    """Return whether the public layer can safely consume an HCU INT8 pair."""
+    hcu_forward = getattr(layer, "_forward_with_hcu_quanted", None)
+    weight = getattr(layer, "weight", None)
+    quant_method = getattr(layer, "quant_method", None)
+    supports = getattr(quant_method, "supports_quanted_inputs", None)
+    if (
+        not callable(hcu_forward)
+        or getattr(weight, "dtype", None) is not torch.int8
+        or not callable(supports)
+    ):
+        return False
+    try:
+        return bool(supports())
+    except (AttributeError, RuntimeError, TypeError, ValueError):
+        return False
+
+
+def _linear_forward(
+    layer: nn.Module,
+    value: torch.Tensor,
+    x_and_scale_quanted: tuple[torch.Tensor, torch.Tensor] | None = None,
+):
+    """Use the private HCU path only when a pair has a capable consumer."""
+    if (
+        x_and_scale_quanted is not None
+        and _linear_supports_quanted_inputs(layer)
+    ):
+        return layer._forward_with_hcu_quanted(value, x_and_scale_quanted)
+    return layer(value)
+
+
 _SPARSE_LAYER_TYPES = (
     "sparse_attention",
     "sparse",
@@ -376,9 +408,7 @@ class Indexer(nn.Module):
         qr_and_scale_quanted: tuple[torch.Tensor, torch.Tensor] | None = None,
     ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
         """Build the quantized query, key and per-head weights of the indexer."""
-        q, _ = self.wq_b._forward_with_hcu_quanted(
-            qr, qr_and_scale_quanted
-        )
+        q, _ = _linear_forward(self.wq_b, qr, qr_and_scale_quanted)
         q = q.view(-1, self.n_head, self.head_dim)
         # Checkpoint (PTM) layout: pe occupies the LAST rope_dim dims.
         q_nope, q_pe = torch.split(
@@ -1069,12 +1099,9 @@ class HYV4MLAAttention(nn.Module):
                 quant_config=quant_config,
                 prefix=f"{prefix}.q_proj",
             )
-        q_lora_weight = getattr(self.q_b_proj, "weight", None)
         self.enable_reuse_int8_quant = bool(
             henvs.VLLM_HCU_USE_CUSTOM_OPS
             and henvs.VLLM_HCU_USE_FUSED_RMS_QUANT
-            and q_lora_weight is not None
-            and q_lora_weight.dtype is torch.int8
         )
         self.kv_a_layernorm = RMSNorm(self.kv_lora_rank, eps=config.rms_norm_eps)
         self.kv_b_proj = ColumnParallelLinear(
@@ -1285,35 +1312,45 @@ class HYV4MLAAttention(nn.Module):
     ) -> torch.Tensor:
         q_c = None
         q_c_and_scale_quanted = None
+        input_projection = (
+            self.q_a_proj if self.q_lora_rank is not None else self.q_proj
+        )
         if (
             x_and_scale_quanted is None
             and getattr(self, "enable_reuse_int8_quant", False)
+            and input_projection is not None
+            and self.kv_a_proj_with_mqa is not None
+            and _linear_supports_quanted_inputs(input_projection)
+            and _linear_supports_quanted_inputs(self.kv_a_proj_with_mqa)
         ):
             x_and_scale_quanted = _quantize_int8(hidden_states)
         if self.q_lora_rank is not None:
             assert self.q_a_proj is not None
             assert self.q_a_layernorm is not None
             assert self.q_b_proj is not None
-            q_c = self.q_a_proj._forward_with_hcu_quanted(
-                hidden_states, x_and_scale_quanted
+            q_c = _linear_forward(
+                self.q_a_proj, hidden_states, x_and_scale_quanted
             )[0]
             q_c = self.q_a_layernorm(q_c)
-            if getattr(self, "enable_reuse_int8_quant", False):
+            if (
+                getattr(self, "enable_reuse_int8_quant", False)
+                and _linear_supports_quanted_inputs(self.q_b_proj)
+            ):
                 q_c_and_scale_quanted = _quantize_int8(q_c)
             q_proj_layer = self.q_b_proj
-            q = q_proj_layer._forward_with_hcu_quanted(
-                q_c, q_c_and_scale_quanted
-            )[0]
+            q = _linear_forward(q_proj_layer, q_c, q_c_and_scale_quanted)[0]
         else:
             assert self.q_proj is not None
             q_proj_layer = self.q_proj
-            q = q_proj_layer._forward_with_hcu_quanted(
-                hidden_states, x_and_scale_quanted
+            q = _linear_forward(
+                q_proj_layer, hidden_states, x_and_scale_quanted
             )[0]
 
         assert self.kv_a_proj_with_mqa is not None
-        kv_lora = self.kv_a_proj_with_mqa._forward_with_hcu_quanted(
-            hidden_states, x_and_scale_quanted
+        kv_lora = _linear_forward(
+            self.kv_a_proj_with_mqa,
+            hidden_states,
+            x_and_scale_quanted,
         )[0]
         kv_c, k_pe = kv_lora.split([self.kv_lora_rank, self.qk_rope_head_dim], dim=-1)
         kv_c_normed = self.kv_a_layernorm(kv_c)

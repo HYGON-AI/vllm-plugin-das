@@ -22,6 +22,11 @@ from vllm.model_executor.layers.quantization.compressed_tensors.schemes import (
     CompressedTensorsW8A8Int8,
 )
 from vllm.model_executor.utils import set_weight_attrs
+from vllm_hcu.model_executor.layers.quantization.int8_runtime import (
+    apply_int8_linear,
+)
+from vllm_hcu.platforms import envs as henvs
+
 
 class SlimQuantW4A8Int8Config(QuantizationConfig):
     """SlimQuant W4A8 configuration.
@@ -102,12 +107,29 @@ class SlimQuantW4A8Int8LinearMethod(LinearMethodBase):
         layer: torch.nn.Module,
         x: torch.Tensor,
         bias: torch.Tensor | None = None,
+        x_and_scale_quanted: tuple[torch.Tensor, torch.Tensor] | None = None,
     ):
         """Apply the layer's compressed linear scheme."""
         scheme = layer.scheme
         if scheme is None:
             raise ValueError("A scheme must be defined for each layer")
+        if x_and_scale_quanted is not None and self.supports_quanted_inputs():
+            return apply_int8_linear(
+                input=x,
+                weight=layer.weight,
+                weight_scale=layer.weight_scale,
+                params_dtype=layer.params_dtype,
+                input_scale=getattr(layer, "input_scale", None),
+                input_zero_point=getattr(layer, "input_zero_point", None),
+                azp_adj=getattr(layer, "azp_adj", None),
+                bias=bias,
+                x_and_scale_quanted=x_and_scale_quanted,
+            )
         return scheme.apply_weights(layer, x, bias=bias)
+
+    def supports_quanted_inputs(self) -> bool:
+        """The HCU INT8 scheme consumes a prequantized tensor and its scale."""
+        return bool(henvs.VLLM_HCU_USE_CUSTOM_QUANTIZATION_GEMM)
 
 
 _SLIMQUANT_MOE_LAYOUT_TENSORS = (
@@ -204,6 +226,10 @@ class SlimQuantW4A8Int8AiterMoEMethod(FusedMoEMethodBase):
 
     @property
     def is_monolithic(self) -> bool:
+        return False
+
+    def supports_quanted_inputs(self) -> bool:
+        """DeepEP dispatch currently requires the original BF16 input."""
         return False
 
     def create_weights(
@@ -433,9 +459,19 @@ class SlimQuantW4A8Int8AiterMoEMethod(FusedMoEMethodBase):
         topk_ids: torch.Tensor,
         shared_experts: object | None,
         shared_experts_input: torch.Tensor | None,
+        i_q: torch.Tensor | None = None,
+        i_s: torch.Tensor | None = None,
         **_,
     ) -> torch.Tensor | tuple[torch.Tensor, torch.Tensor]:
 
+        if (i_q is None) != (i_s is None):
+            raise ValueError(
+                "SlimQuant W4A8 prequantized input requires both i_q and i_s"
+            )
+        if i_q is not None:
+            raise RuntimeError(
+                "SlimQuant W4A8 routed input must preserve BF16 DeepEP dispatch"
+            )
         if x.dim() != 2:
             raise ValueError(
                 "SlimQuant W4A8 AITER Triton MoE expects rank-2 hidden states, "

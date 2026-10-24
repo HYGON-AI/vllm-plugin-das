@@ -201,7 +201,12 @@ class DeepEPDeepGemmW4A8ContiguousExperts(TritonExperts):
     def _quantize_activation(self, gateup_output, quant_output, m_indices):
         limit = getattr(self.quant_config, "gemm1_clamp_limit", None)
         if limit is not None and limit > 0:
-            from lightop import fuse_silu_mul_clamp_quant
+            # The clamp kernels are the only uncategorized LightOp ABI and
+            # have one audited owner.  Import it lazily to avoid the
+            # dpsk_v4_deep_gemm_moe -> this module import cycle.
+            from vllm_hcu.model_executor.layers.fused_moe.experts.dpsk_v4_deep_gemm_moe import (
+                fuse_silu_mul_clamp_quant,
+            )
 
             return fuse_silu_mul_clamp_quant(gateup_output, limit=limit)
         return fuse_silu_mul_quant(

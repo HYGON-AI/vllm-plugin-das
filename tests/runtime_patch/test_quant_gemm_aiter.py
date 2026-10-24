@@ -4488,7 +4488,7 @@ def test_slimquant_w4a8_deepep_auto_preserves_deepseek_arch_membership(
 def test_slimquant_w4a8_ll_runtime_requires_only_masked_clamp_ops(
     monkeypatch: pytest.MonkeyPatch,
 ):
-    """Fixed LL must not depend on unused contiguous or unclamped ops."""
+    """Fixed LL clamp uses the built-in persistent kernel, not LightOP."""
 
     from vllm_hcu.model_executor.layers.fused_moe import deepep_runtime
 
@@ -4503,16 +4503,8 @@ def test_slimquant_w4a8_ll_runtime_requires_only_masked_clamp_ops(
             m_grouped_w4a8_gemm_nt_masked_hipc=noop,
         ),
     )
-    lightop = _package(
-        "lightop",
-        fuse_silu_mul_clamp_quant_ep=noop,
-    )
-    monkeypatch.setitem(sys.modules, "lightop", lightop)
-    monkeypatch.setitem(
-        sys.modules,
-        "lightop.activation",
-        _module("lightop.activation"),
-    )
+    monkeypatch.setitem(sys.modules, "lightop", None)
+    monkeypatch.setitem(sys.modules, "lightop.activation", None)
     deepep_runtime._require_slimquant_w4a8_hipc_runtime.cache_clear()
     try:
         deepep_runtime._require_slimquant_w4a8_hipc_runtime(

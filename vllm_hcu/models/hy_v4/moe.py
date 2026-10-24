@@ -36,6 +36,76 @@ def _quantize_int8(
     return per_token_quant_int8(value)
 
 
+def _linear_supports_quanted_inputs(layer: nn.Module) -> bool:
+    hcu_forward = getattr(layer, "_forward_with_hcu_quanted", None)
+    weight = getattr(layer, "weight", None)
+    quant_method = getattr(layer, "quant_method", None)
+    supports = getattr(quant_method, "supports_quanted_inputs", None)
+    if (
+        not callable(hcu_forward)
+        or getattr(weight, "dtype", None) is not torch.int8
+        or not callable(supports)
+    ):
+        return False
+    try:
+        return bool(supports())
+    except (AttributeError, RuntimeError, TypeError, ValueError):
+        return False
+
+
+def _linear_forward(
+    layer: nn.Module,
+    value: torch.Tensor,
+    x_and_scale_quanted: tuple[torch.Tensor, torch.Tensor] | None = None,
+):
+    if (
+        x_and_scale_quanted is not None
+        and _linear_supports_quanted_inputs(layer)
+    ):
+        return layer._forward_with_hcu_quanted(value, x_and_scale_quanted)
+    return layer(value)
+
+
+def _moe_supports_auxiliary_inputs(experts: nn.Module) -> bool:
+    runner = experts
+    seen: set[int] = set()
+    while id(runner) not in seen:
+        seen.add(id(runner))
+        wrapped_runner = getattr(runner, "runner", None)
+        if wrapped_runner is not None and wrapped_runner is not runner:
+            runner = wrapped_runner
+            continue
+        base_layer = getattr(runner, "base_layer", None)
+        if base_layer is not None and base_layer is not runner:
+            runner = base_layer
+            continue
+        break
+
+    moe_config = getattr(runner, "moe_config", None)
+    if int(getattr(moe_config, "pcp_size", 1) or 1) > 1:
+        return False
+    if bool(getattr(runner, "do_naive_dispatch_combine", False)):
+        return False
+
+    routed_experts = getattr(runner, "routed_experts", None)
+    routed_weight = getattr(routed_experts, "w13_weight", None)
+    if getattr(routed_weight, "dtype", None) is not torch.int8:
+        return False
+
+    shared_experts = getattr(runner, "_shared_experts", None)
+    supports = getattr(
+        shared_experts,
+        "_layer_supports_x_and_scale_quanted",
+        None,
+    )
+    if not callable(supports):
+        return False
+    try:
+        return bool(supports())
+    except (AttributeError, RuntimeError, TypeError, ValueError):
+        return False
+
+
 _HYV4_MOE_CHUNK_SIZE_ENV = "VLLM_HCU_HYV4_MOE_CHUNK_SIZE"
 
 
@@ -91,15 +161,17 @@ class HYV4FeedForward(nn.Module):
         )
         weight = getattr(self.gate_up_proj, "weight", None)
         self.quant_dtype = weight.dtype if weight is not None else None
+        self.float_act_fn = SiluAndMul()
         self.enable_fuse_silu_mul_quant = bool(
             henvs.VLLM_HCU_USE_CUSTOM_OPS
             and henvs.VLLM_HCU_USE_FUSED_SILU_MUL_QUANT
             and self.quant_dtype is torch.int8
+            and _linear_supports_quanted_inputs(self.down_proj)
         )
         self.act_fn = (
             FusedSiluAndMulAndQuant()
             if self.enable_fuse_silu_mul_quant
-            else SiluAndMul()
+            else self.float_act_fn
         )
 
     def forward(
@@ -107,18 +179,22 @@ class HYV4FeedForward(nn.Module):
         x: torch.Tensor,
         x_and_scale_quanted: tuple[torch.Tensor, torch.Tensor] | None = None,
     ) -> torch.Tensor:
-        gate_up, _ = self.gate_up_proj._forward_with_hcu_quanted(
-            x, x_and_scale_quanted
+        gate_up, _ = _linear_forward(
+            self.gate_up_proj, x, x_and_scale_quanted
         )
-        if self.enable_fuse_silu_mul_quant:
+        if (
+            self.enable_fuse_silu_mul_quant
+            and _linear_supports_quanted_inputs(self.down_proj)
+        ):
             activated_q, activated_scale = self.act_fn(
                 gate_up, quant_dtype=self.quant_dtype
             )
-            output, _ = self.down_proj._forward_with_hcu_quanted(
+            output, _ = _linear_forward(
+                self.down_proj,
                 activated_q, (activated_q, activated_scale)
             )
         else:
-            activated = self.act_fn(gate_up)
+            activated = getattr(self, "float_act_fn", self.act_fn)(gate_up)
             output, _ = self.down_proj(activated)
         return output
 
@@ -258,9 +334,13 @@ class HYV4MoEFused(nn.Module):
         x_and_scale_quanted: tuple[torch.Tensor, torch.Tensor] | None = None,
     ) -> torch.Tensor:
         original_shape = hidden_states.shape
+        supports_auxiliary_inputs = _moe_supports_auxiliary_inputs(self.experts)
+        if not supports_auxiliary_inputs:
+            x_and_scale_quanted = None
         if (
             x_and_scale_quanted is None
             and getattr(self, "enable_reuse_int8_quant", False)
+            and supports_auxiliary_inputs
         ):
             x_and_scale_quanted = _quantize_int8(hidden_states)
         hidden_states = hidden_states.view(-1, hidden_states.shape[-1])

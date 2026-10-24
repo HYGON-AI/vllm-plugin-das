@@ -5,16 +5,36 @@ from __future__ import annotations
 
 from types import SimpleNamespace
 
+import pytest
 import torch
 
+from vllm_hcu.model_executor.layers.quantization.slimquant_w4a8 import (
+    SlimQuantW4A8Int8AiterMoEMethod,
+    SlimQuantW4A8Int8LinearMethod,
+)
 from vllm_hcu.models.hy_v4.attention import HYV4MLAAttention, Indexer
 from vllm_hcu.models.hy_v4.moe import HYV4FeedForward, HYV4MoEFused
 
 
+class _QuantMethod:
+    def __init__(self, supports_quanted_inputs: bool) -> None:
+        self._supports_quanted_inputs = supports_quanted_inputs
+
+    def supports_quanted_inputs(self) -> bool:
+        return self._supports_quanted_inputs
+
+
 class _RecordingLinear:
-    def __init__(self, output: torch.Tensor) -> None:
+    def __init__(
+        self,
+        output: torch.Tensor,
+        *,
+        supports_quanted_inputs: bool = True,
+    ) -> None:
         self.output = output
         self.pairs: list[tuple[torch.Tensor, torch.Tensor] | None] = []
+        self.quant_method = _QuantMethod(supports_quanted_inputs)
+        self.weight = torch.empty(1, dtype=torch.int8)
 
     def __call__(self, value: torch.Tensor):
         self.pairs.append(None)
@@ -26,6 +46,18 @@ class _RecordingLinear:
         pair: tuple[torch.Tensor, torch.Tensor] | None,
     ):
         self.pairs.append(pair)
+        return self.output.clone(), None
+
+
+class _PublicOnlyLinear:
+    """LoRA-like wrapper which intentionally exposes only public forward."""
+
+    def __init__(self, output: torch.Tensor) -> None:
+        self.output = output
+        self.calls: list[torch.Tensor] = []
+
+    def __call__(self, value: torch.Tensor):
+        self.calls.append(value)
         return self.output.clone(), None
 
 
@@ -190,12 +222,43 @@ def test_attention_indexer_reuses_q_lora_quantized_pair(monkeypatch) -> None:
 
 
 class _RecordingExperts:
-    def __init__(self) -> None:
+    def __init__(
+        self,
+        *,
+        pcp_size: int = 1,
+        naive_dispatch: bool = False,
+        routed_dtype: torch.dtype = torch.int8,
+        supports_quanted_inputs: bool = True,
+    ) -> None:
         self.calls: list[dict[str, torch.Tensor]] = []
+        self.moe_config = SimpleNamespace(pcp_size=pcp_size)
+        self.do_naive_dispatch_combine = naive_dispatch
+        self.routed_experts = SimpleNamespace(
+            w13_weight=torch.empty(1, dtype=routed_dtype)
+        )
+        self._shared_experts = SimpleNamespace(
+            _layer_supports_x_and_scale_quanted=lambda: True
+        )
+        self._supports_quanted_inputs = supports_quanted_inputs
+
+    def _quant_method_supports_quanted_inputs(self) -> bool:
+        return self._supports_quanted_inputs
 
     def __call__(self, **kwargs):
         self.calls.append(kwargs)
         return kwargs["hidden_states"] + 1
+
+
+class _WrappedExperts:
+    """FusedMoEWithLoRA-like wrapper around the actual runner."""
+
+    def __init__(self, runner: _RecordingExperts) -> None:
+        self.runner = runner
+        self.base_layer = runner
+        self.moe_config = runner.moe_config
+
+    def __call__(self, **kwargs):
+        return self.base_layer(**kwargs)
 
 
 class _RouterGate:
@@ -284,6 +347,94 @@ def test_moe_chunking_slices_hidden_quantized_input_and_scale_together(
     )
 
 
+@torch.no_grad()
+@pytest.mark.parametrize(
+    ("pcp_size", "naive_dispatch", "chunk_size", "supply_pair"),
+    [(8, False, None, False), (1, True, 2, True)],
+)
+def test_moe_drops_prequantized_auxiliary_input_for_dispatch_topologies(
+    monkeypatch,
+    pcp_size: int,
+    naive_dispatch: bool,
+    chunk_size: int | None,
+    supply_pair: bool,
+) -> None:
+    experts = _RecordingExperts(
+        pcp_size=pcp_size,
+        naive_dispatch=naive_dispatch,
+    )
+    layer = SimpleNamespace(
+        gate=_RouterGate(),
+        experts=experts,
+        prefix="model.layers.78.mlp",
+        enable_reuse_int8_quant=True,
+    )
+    hidden = torch.zeros(5, 3)
+    pair = (torch.ones(5, 3, dtype=torch.int8), torch.ones(5, 1))
+    quantize_calls = []
+    monkeypatch.setattr(
+        "vllm_hcu.models.hy_v4.moe._quantize_int8",
+        lambda value: quantize_calls.append(value) or pair,
+    )
+    monkeypatch.setattr(
+        "vllm_hcu.models.hy_v4.moe._hyv4_moe_chunk_size",
+        lambda: chunk_size,
+    )
+    monkeypatch.setattr(
+        "vllm_hcu.models.hy_v4.moe.linear_gate_pcp_shard_enabled", lambda: True
+    )
+    monkeypatch.setattr(
+        "vllm_hcu.models.hy_v4.moe.in_replicated_mtp_batch", lambda: True
+    )
+
+    HYV4MoEFused.forward(
+        layer,
+        hidden,
+        x_and_scale_quanted=pair if supply_pair else None,
+    )
+
+    assert quantize_calls == []
+    assert all("quanted_hidden_states" not in call for call in experts.calls)
+    assert all("scale" not in call for call in experts.calls)
+
+
+def test_moe_checks_naive_dispatch_on_lora_wrapped_runner(monkeypatch) -> None:
+    runner = _RecordingExperts(naive_dispatch=True)
+    experts = _WrappedExperts(runner)
+    layer = SimpleNamespace(
+        gate=_RouterGate(),
+        experts=experts,
+        prefix="model.layers.1.mlp",
+        enable_reuse_int8_quant=True,
+    )
+    hidden = torch.zeros(4, 3)
+    pair = (torch.ones(4, 3, dtype=torch.int8), torch.ones(4, 1))
+    monkeypatch.setattr("vllm_hcu.models.hy_v4.moe._hyv4_moe_chunk_size", lambda: None)
+
+    HYV4MoEFused.forward(layer, hidden, x_and_scale_quanted=pair)
+
+    assert "quanted_hidden_states" not in runner.calls[0]
+    assert "scale" not in runner.calls[0]
+
+
+def test_moe_rejects_int8_pair_for_non_int8_routed_experts(monkeypatch) -> None:
+    experts = _RecordingExperts(routed_dtype=torch.float8_e4m3fn)
+    layer = SimpleNamespace(
+        gate=_RouterGate(),
+        experts=experts,
+        prefix="model.layers.1.mlp",
+        enable_reuse_int8_quant=True,
+    )
+    hidden = torch.zeros(4, 3)
+    pair = (torch.ones(4, 3, dtype=torch.int8), torch.ones(4, 1))
+    monkeypatch.setattr("vllm_hcu.models.hy_v4.moe._hyv4_moe_chunk_size", lambda: None)
+
+    HYV4MoEFused.forward(layer, hidden, x_and_scale_quanted=pair)
+
+    assert "quanted_hidden_states" not in experts.calls[0]
+    assert "scale" not in experts.calls[0]
+
+
 class _FusedAct:
     def __init__(self, quantized: torch.Tensor, scale: torch.Tensor) -> None:
         self.quantized = quantized
@@ -316,3 +467,156 @@ def test_feed_forward_reuses_input_and_fuses_down_projection_quantization() -> N
     assert gate_up.pairs == [input_pair]
     assert down.pairs == [activated_pair]
     torch.testing.assert_close(actual, torch.full((2, 3), 7.0))
+
+
+def test_feed_forward_uses_float_activation_when_down_rejects_quanted_input() -> None:
+    gate_up = _RecordingLinear(torch.ones(2, 8))
+    down = _RecordingLinear(
+        torch.full((2, 3), 7.0),
+        supports_quanted_inputs=False,
+    )
+    fused_act = _FusedAct(
+        torch.ones(2, 4, dtype=torch.int8),
+        torch.ones(2, 1),
+    )
+    float_act = lambda value: value[..., :4]
+    layer = SimpleNamespace(
+        gate_up_proj=gate_up,
+        down_proj=down,
+        act_fn=fused_act,
+        float_act_fn=float_act,
+        enable_fuse_silu_mul_quant=True,
+        quant_dtype=torch.int8,
+    )
+
+    actual = HYV4FeedForward.forward(layer, torch.zeros(2, 3))
+
+    assert down.pairs == [None]
+    torch.testing.assert_close(actual, torch.full((2, 3), 7.0))
+
+
+def test_feed_forward_preserves_public_forward_for_lora_wrapper() -> None:
+    gate_up = _PublicOnlyLinear(torch.ones(2, 8))
+    down = _RecordingLinear(
+        torch.full((2, 3), 7.0),
+        supports_quanted_inputs=False,
+    )
+    layer = SimpleNamespace(
+        gate_up_proj=gate_up,
+        down_proj=down,
+        act_fn=lambda value: value[..., :4],
+        enable_fuse_silu_mul_quant=False,
+        quant_dtype=torch.int8,
+    )
+
+    input_pair = (torch.ones(2, 3, dtype=torch.int8), torch.ones(2, 1))
+    actual = HYV4FeedForward.forward(
+        layer,
+        torch.zeros(2, 3),
+        x_and_scale_quanted=input_pair,
+    )
+
+    assert gate_up.calls
+    torch.testing.assert_close(actual, torch.full((2, 3), 7.0))
+
+
+def test_attention_preserves_public_forward_for_lora_wrapper(monkeypatch) -> None:
+    layer, hidden, _, _, _, _, _, _ = _attention_layer(reuse_quant=True)
+    q_b = _PublicOnlyLinear(torch.ones(2, 2, dtype=torch.bfloat16))
+    layer.q_b_proj = q_b
+    monkeypatch.setattr(
+        "vllm_hcu.models.hy_v4.attention._quantize_int8",
+        lambda value: (
+            torch.ones_like(value, dtype=torch.int8),
+            torch.ones(*value.shape[:-1], 1),
+        ),
+    )
+
+    HYV4MLAAttention.forward(
+        layer,
+        positions=torch.arange(2),
+        hidden_states=hidden,
+    )
+
+    assert q_b.calls
+
+
+def test_slimquant_linear_forwards_prequantized_pair_to_hcu_runtime(
+    monkeypatch,
+) -> None:
+    pair = (torch.ones(2, 3, dtype=torch.int8), torch.full((2, 1), 0.25))
+    calls = []
+
+    class _Scheme:
+        pass
+
+    method = SlimQuantW4A8Int8LinearMethod.__new__(SlimQuantW4A8Int8LinearMethod)
+    layer = SimpleNamespace(
+        scheme=_Scheme(),
+        weight=torch.ones(4, 3, dtype=torch.int8),
+        weight_scale=torch.ones(4, 1),
+        params_dtype=torch.bfloat16,
+        input_scale=None,
+        input_zero_point=None,
+        azp_adj=None,
+    )
+    value = torch.zeros(2, 3)
+    monkeypatch.setattr(
+        method,
+        "supports_quanted_inputs",
+        lambda: True,
+    )
+    monkeypatch.setattr(
+        "vllm_hcu.model_executor.layers.quantization.slimquant_w4a8.apply_int8_linear",
+        lambda **kwargs: calls.append(kwargs) or torch.ones(2, 4),
+    )
+
+    method.apply(layer, value, x_and_scale_quanted=pair)
+
+    assert calls[0]["input"] is value
+    assert calls[0]["x_and_scale_quanted"] is pair
+
+
+def test_slimquant_deepep_moe_rejects_prequantized_dispatch_input(
+    monkeypatch,
+) -> None:
+    pair = (torch.ones(2, 3, dtype=torch.int8), torch.full((2, 1), 0.25))
+    kernel_calls = []
+
+    class _Kernel:
+        def apply(self, **kwargs):
+            kernel_calls.append(kwargs)
+            return torch.ones(2, 3)
+
+    method = SlimQuantW4A8Int8AiterMoEMethod.__new__(
+        SlimQuantW4A8Int8AiterMoEMethod
+    )
+    method.moe_kernel = _Kernel()
+    method.moe = SimpleNamespace(num_experts=2, activation="silu")
+    layer = SimpleNamespace(
+        w13_weight=torch.ones(2, 4, 3, dtype=torch.int8),
+        w2_weight=torch.ones(2, 3, 2, dtype=torch.int8),
+        global_num_experts=2,
+        expert_map=None,
+        activation="silu",
+        apply_router_weight_on_input=False,
+    )
+    monkeypatch.setattr(
+        "vllm_hcu.model_executor.layers.fused_moe.aiter_moe_dispatch.resolve_aiter_expert_maps",
+        lambda expert_map, global_num_experts: (None, None),
+    )
+
+    assert not method.supports_quanted_inputs()
+    with pytest.raises(RuntimeError, match="BF16 DeepEP dispatch"):
+        method.apply(
+            layer=layer,
+            x=torch.zeros(2, 3),
+            topk_weights=torch.ones(2, 1),
+            topk_ids=torch.zeros(2, 1, dtype=torch.int64),
+            shared_experts=None,
+            shared_experts_input=None,
+            i_q=pair[0],
+            i_s=pair[1],
+        )
+
+    assert kernel_calls == []

@@ -750,6 +750,17 @@ class MoERunner(MoERunnerInterface):
         cached = getattr(self, "_supports_quanted_inputs", None)
         if cached is not None:
             return cached
+        declared_support = getattr(
+            self._quant_method,
+            "supports_quanted_inputs",
+            None,
+        )
+        if callable(declared_support):
+            try:
+                self._supports_quanted_inputs = bool(declared_support())
+            except (AttributeError, RuntimeError, TypeError, ValueError):
+                self._supports_quanted_inputs = False
+            return self._supports_quanted_inputs
         apply = getattr(self._quant_method, "apply", None)
         if apply is None:
             self._supports_quanted_inputs = False
@@ -831,7 +842,10 @@ class MoERunner(MoERunnerInterface):
                     input_ids=input_ids,
                 )
 
-            if quanted_hidden_states is None:
+            if (
+                quanted_hidden_states is None
+                or not self._quant_method_supports_quanted_inputs()
+            ):
                 fused_out = self.routed_experts.forward_modular(
                     x=hidden_states,
                     topk_weights=topk_weights,
@@ -840,12 +854,6 @@ class MoERunner(MoERunnerInterface):
                     shared_experts_input=shared_experts_input,
                 )
             else:
-                if not self._quant_method_supports_quanted_inputs():
-                    raise RuntimeError(
-                        "HCU pre-quantized MoE input was enabled, but quant method "
-                        f"{type(self._quant_method).__name__}.apply does not accept "
-                        "i_q/i_s"
-                    )
                 fused_out = self._quant_method.apply(
                     layer=self.routed_experts,
                     x=hidden_states,
