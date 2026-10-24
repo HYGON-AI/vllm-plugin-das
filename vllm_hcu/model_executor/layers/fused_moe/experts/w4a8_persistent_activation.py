@@ -32,7 +32,7 @@ def _persistent_masked_m_silu_mul_clamp_int8_quant(
 ):
     """Persistent masked SwiGLU clamp and per-token INT8 quantization."""
     pid = tl.program_id(0)
-    expert = pid // PARALLEL_TOKENS
+    expert = (pid // PARALLEL_TOKENS).to(tl.int64)
     token_slot = pid % PARALLEL_TOKENS
     n_tokens = tl.load(counts_ptr + expert * stride_counts_e).to(tl.int64)
 

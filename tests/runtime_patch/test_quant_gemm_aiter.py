@@ -2428,6 +2428,79 @@ def test_aiter_replacement_rmsnorm_wrappers_delegate_without_retry_logic():
         assert not any(isinstance(node, ast.Try) for node in ast.walk(function))
 
 
+def test_persistent_w4a8_expert_offsets_promote_before_stride_multiply():
+    source = (
+        Path(__file__).resolve().parents[2]
+        / "vllm_hcu/model_executor/layers/fused_moe/experts/"
+        "w4a8_persistent_activation.py"
+    ).read_text(encoding="utf-8")
+    tree = ast.parse(source)
+    kernel = next(
+        node
+        for node in tree.body
+        if isinstance(node, ast.FunctionDef)
+        and node.name == "_persistent_masked_m_silu_mul_clamp_int8_quant"
+    )
+    expert_assignment = next(
+        node
+        for node in kernel.body
+        if isinstance(node, ast.Assign)
+        and any(
+            isinstance(target, ast.Name) and target.id == "expert"
+            for target in node.targets
+        )
+    )
+
+    environment = {
+        "pid": torch.tensor(16, dtype=torch.int32),
+        "PARALLEL_TOKENS": 1,
+        "tl": SimpleNamespace(int64=torch.int64),
+    }
+    expert = eval(
+        compile(
+            ast.fix_missing_locations(ast.Expression(expert_assignment.value)),
+            filename="<persistent-w4a8-expert>",
+            mode="eval",
+        ),
+        environment,
+    )
+
+    expert_stride_products = {
+        node.right.id: node
+        for node in ast.walk(kernel)
+        if isinstance(node, ast.BinOp)
+        and isinstance(node.op, ast.Mult)
+        and isinstance(node.left, ast.Name)
+        and node.left.id == "expert"
+        and isinstance(node.right, ast.Name)
+        and node.right.id.startswith("stride_")
+    }
+    expected_strides = {
+        "stride_counts_e",
+        "stride_i_e",
+        "stride_o_e",
+        "stride_s_e",
+    }
+    assert set(expert_stride_products) == expected_strides
+
+    for stride_name in expected_strides:
+        offset = eval(
+            compile(
+                ast.fix_missing_locations(
+                    ast.Expression(expert_stride_products[stride_name])
+                ),
+                filename=f"<persistent-w4a8-{stride_name}>",
+                mode="eval",
+            ),
+            {
+                "expert": expert,
+                stride_name: torch.tensor(134217728, dtype=torch.int32),
+            },
+        )
+        assert offset.dtype is torch.int64
+        assert offset.item() == 2147483648
+
+
 def test_aiter_replacement_maps_each_optional_capability_exactly():
     source = (
         Path(__file__).resolve().parents[2]
