@@ -40,7 +40,7 @@ def _require_slimquant_w4a8_hipc_runtime(
         activation_ops = []
         if not ll_only:
             activation_ops.append("fuse_silu_mul_clamp_quant")
-        if not ht_only:
+        if not ht_only and not ll_only:
             activation_ops.append("fuse_silu_mul_clamp_quant_ep")
     else:
         activation_module = "lightop.activation"
@@ -49,10 +49,9 @@ def _require_slimquant_w4a8_hipc_runtime(
             activation_ops.append("fuse_silu_mul_quant")
         if not ht_only:
             activation_ops.append("fuse_silu_mul_quant_ep")
-    required_ops = {
-        "deepgemm": tuple(deepgemm_ops),
-        activation_module: tuple(activation_ops),
-    }
+    required_ops = {"deepgemm": tuple(deepgemm_ops)}
+    if activation_ops:
+        required_ops[activation_module] = tuple(activation_ops)
     missing: list[str] = []
     for module_name, op_names in required_ops.items():
         try:

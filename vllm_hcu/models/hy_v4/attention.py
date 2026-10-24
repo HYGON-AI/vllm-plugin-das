@@ -57,9 +57,52 @@ from vllm.v1.attention.backend import (
 from vllm.v1.attention.selector import get_attn_backend
 from vllm.v1.kv_cache_interface import KVCacheSpec, get_kv_quant_mode
 
+from vllm_hcu.platforms import envs as henvs
+
 from .fp8_kv_dequant import LightOpKVReuseState
 
 logger = init_logger(__name__)
+
+
+def _quantize_int8(
+    value: torch.Tensor,
+) -> tuple[torch.Tensor, torch.Tensor]:
+    from lightop.quant import per_token_quant_int8
+
+    return per_token_quant_int8(value)
+
+
+def _linear_supports_quanted_inputs(layer: nn.Module) -> bool:
+    """Return whether the public layer can safely consume an HCU INT8 pair."""
+    hcu_forward = getattr(layer, "_forward_with_hcu_quanted", None)
+    weight = getattr(layer, "weight", None)
+    quant_method = getattr(layer, "quant_method", None)
+    supports = getattr(quant_method, "supports_quanted_inputs", None)
+    if (
+        not callable(hcu_forward)
+        or getattr(weight, "dtype", None) is not torch.int8
+        or not callable(supports)
+    ):
+        return False
+    try:
+        return bool(supports())
+    except (AttributeError, RuntimeError, TypeError, ValueError):
+        return False
+
+
+def _linear_forward(
+    layer: nn.Module,
+    value: torch.Tensor,
+    x_and_scale_quanted: tuple[torch.Tensor, torch.Tensor] | None = None,
+):
+    """Use the private HCU path only when a pair has a capable consumer."""
+    if (
+        x_and_scale_quanted is not None
+        and _linear_supports_quanted_inputs(layer)
+    ):
+        return layer._forward_with_hcu_quanted(value, x_and_scale_quanted)
+    return layer(value)
+
 
 _SPARSE_LAYER_TYPES = (
     "sparse_attention",
@@ -340,10 +383,20 @@ class Indexer(nn.Module):
         qr: torch.Tensor,
         positions: torch.Tensor,
         rotary_emb: nn.Module,
+        qr_and_scale_quanted: tuple[torch.Tensor, torch.Tensor] | None = None,
     ) -> torch.Tensor:
-        hidden_states, q_quant, k, weights = self.prepare_inputs(
-            hidden_states, qr, positions, rotary_emb
-        )
+        if qr_and_scale_quanted is None:
+            hidden_states, q_quant, k, weights = self.prepare_inputs(
+                hidden_states, qr, positions, rotary_emb
+            )
+        else:
+            hidden_states, q_quant, k, weights = self.prepare_inputs(
+                hidden_states,
+                qr,
+                positions,
+                rotary_emb,
+                qr_and_scale_quanted=qr_and_scale_quanted,
+            )
         return self.indexer_op(hidden_states, q_quant, k, weights)
 
     def prepare_inputs(
@@ -352,9 +405,10 @@ class Indexer(nn.Module):
         qr: torch.Tensor,
         positions: torch.Tensor,
         rotary_emb: nn.Module,
+        qr_and_scale_quanted: tuple[torch.Tensor, torch.Tensor] | None = None,
     ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
         """Build the quantized query, key and per-head weights of the indexer."""
-        q, _ = self.wq_b(qr)
+        q, _ = _linear_forward(self.wq_b, qr, qr_and_scale_quanted)
         q = q.view(-1, self.n_head, self.head_dim)
         # Checkpoint (PTM) layout: pe occupies the LAST rope_dim dims.
         q_nope, q_pe = torch.split(
@@ -1045,6 +1099,10 @@ class HYV4MLAAttention(nn.Module):
                 quant_config=quant_config,
                 prefix=f"{prefix}.q_proj",
             )
+        self.enable_reuse_int8_quant = bool(
+            henvs.VLLM_HCU_USE_CUSTOM_OPS
+            and henvs.VLLM_HCU_USE_FUSED_RMS_QUANT
+        )
         self.kv_a_layernorm = RMSNorm(self.kv_lora_rank, eps=config.rms_norm_eps)
         self.kv_b_proj = ColumnParallelLinear(
             self.kv_lora_rank,
@@ -1250,23 +1308,50 @@ class HYV4MLAAttention(nn.Module):
         positions: torch.Tensor,
         hidden_states: torch.Tensor,
         llama_4_scaling: torch.Tensor | None = None,
+        x_and_scale_quanted: tuple[torch.Tensor, torch.Tensor] | None = None,
     ) -> torch.Tensor:
         q_c = None
+        q_c_and_scale_quanted = None
+        input_projection = (
+            self.q_a_proj if self.q_lora_rank is not None else self.q_proj
+        )
+        if (
+            x_and_scale_quanted is None
+            and getattr(self, "enable_reuse_int8_quant", False)
+            and input_projection is not None
+            and self.kv_a_proj_with_mqa is not None
+            and _linear_supports_quanted_inputs(input_projection)
+            and _linear_supports_quanted_inputs(self.kv_a_proj_with_mqa)
+        ):
+            x_and_scale_quanted = _quantize_int8(hidden_states)
         if self.q_lora_rank is not None:
             assert self.q_a_proj is not None
             assert self.q_a_layernorm is not None
             assert self.q_b_proj is not None
-            q_c = self.q_a_proj(hidden_states)[0]
+            q_c = _linear_forward(
+                self.q_a_proj, hidden_states, x_and_scale_quanted
+            )[0]
             q_c = self.q_a_layernorm(q_c)
+            if (
+                getattr(self, "enable_reuse_int8_quant", False)
+                and _linear_supports_quanted_inputs(self.q_b_proj)
+            ):
+                q_c_and_scale_quanted = _quantize_int8(q_c)
             q_proj_layer = self.q_b_proj
-            q = q_proj_layer(q_c)[0]
+            q = _linear_forward(q_proj_layer, q_c, q_c_and_scale_quanted)[0]
         else:
             assert self.q_proj is not None
             q_proj_layer = self.q_proj
-            q = q_proj_layer(hidden_states)[0]
+            q = _linear_forward(
+                q_proj_layer, hidden_states, x_and_scale_quanted
+            )[0]
 
         assert self.kv_a_proj_with_mqa is not None
-        kv_lora = self.kv_a_proj_with_mqa(hidden_states)[0]
+        kv_lora = _linear_forward(
+            self.kv_a_proj_with_mqa,
+            hidden_states,
+            x_and_scale_quanted,
+        )[0]
         kv_c, k_pe = kv_lora.split([self.kv_lora_rank, self.qk_rope_head_dim], dim=-1)
         kv_c_normed = self.kv_a_layernorm(kv_c)
 
@@ -1307,6 +1392,7 @@ class HYV4MLAAttention(nn.Module):
             k_pe,
             attn_out,
             q_dcp_replicated,
+            q_c_and_scale_quanted=q_c_and_scale_quanted,
         )
 
         if (
@@ -1337,6 +1423,7 @@ class HYV4MLAAttention(nn.Module):
         k_pe: torch.Tensor,
         out: torch.Tensor,  # [num_tokens, heads * v_head_dim], written in place
         q_dcp_replicated: torch.Tensor | None = None,
+        q_c_and_scale_quanted: tuple[torch.Tensor, torch.Tensor] | None = None,
     ) -> None:
         """Run the lightning indexer and MLA attention in one eager segment.
 
@@ -1348,7 +1435,13 @@ class HYV4MLAAttention(nn.Module):
         the capture is no longer active inside an eager segment.
         """
         if self.indexer is not None and self.is_sparse and not self.skip_topk:
-            self.indexer(hidden_states, q_c, positions, self.indexer_rope_emb)
+            self.indexer(
+                hidden_states,
+                q_c,
+                positions,
+                self.indexer_rope_emb,
+                qr_and_scale_quanted=q_c_and_scale_quanted,
+            )
         if self.gate_a2a_stream is None:
             out.copy_(
                 self.mla_attn(

@@ -40,6 +40,9 @@ from vllm.utils.deep_gemm import (
     is_deep_gemm_supported,
 )
 from vllm.utils.math_utils import cdiv, round_up
+from vllm_hcu.model_executor.layers.fused_moe.experts.w4a8_persistent_activation import (
+    persistent_masked_m_silu_mul_clamp_int8_quant,
+)
 
 logger = init_logger(__name__)
 
@@ -492,13 +495,10 @@ class BatchedDeepGemmExperts(mk.FusedMoEExpertsModular):
                 self.quant_config, "gemm1_clamp_limit", None
             )
             if clamp_limit is not None and clamp_limit > 0:
-                from lightop import fuse_silu_mul_clamp_quant_ep
-
-                a2q, a2q_scale = fuse_silu_mul_clamp_quant_ep(
+                a2q, a2q_scale = persistent_masked_m_silu_mul_clamp_int8_quant(
                     workspace1,
+                    expert_num_tokens,
                     limit=clamp_limit,
-                    mask_m=expert_num_tokens,
-                    expect_m=max_num_tokens,
                 )
             else:
                 from lightop.activation import fuse_silu_mul_quant_ep

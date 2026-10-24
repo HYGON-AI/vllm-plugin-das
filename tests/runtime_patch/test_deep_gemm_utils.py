@@ -816,15 +816,19 @@ def test_w4a8_masked_batched_apply_propagates_scales_and_token_counts(
     assert activation_call["tokens_per_expert"] is expert_num_tokens
 
 
-def test_w4a8_masked_batched_apply_uses_configured_swiglu_clamp(
+def test_w4a8_masked_batched_apply_uses_persistent_swiglu_clamp(
     monkeypatch: pytest.MonkeyPatch,
 ):
     """The LL W4A8 activation must preserve HYV4's SwiGLU limit."""
 
     clamp_call: dict[str, object] = {}
 
-    def clamp_quantize(tensor: torch.Tensor, **kwargs):
-        clamp_call.update(tensor=tensor, **kwargs)
+    def clamp_quantize(tensor: torch.Tensor, tokens_per_expert, *, limit):
+        clamp_call.update(
+            tensor=tensor,
+            tokens_per_expert=tokens_per_expert,
+            limit=limit,
+        )
         return (
             torch.full((1, 2, 64), 7, dtype=torch.int8),
             torch.full((1, 2, 1), 0.5, dtype=torch.float32),
@@ -839,8 +843,6 @@ def test_w4a8_masked_batched_apply_uses_configured_swiglu_clamp(
         gemm_name="unused_w4a8_gemm",
         gemm_kernel=lambda *_args: None,
     )
-    sys.modules["lightop"].fuse_silu_mul_clamp_quant_ep = clamp_quantize
-
     deepgemm = ModuleType("deepgemm")
     deepgemm.__path__ = []
     deepgemm.m_grouped_w4a8_gemm_nt_masked_hipc = lambda *_args: None
@@ -848,6 +850,7 @@ def test_w4a8_masked_batched_apply_uses_configured_swiglu_clamp(
 
     hcu = _load_batched_deep_gemm_apply()
     hcu["current_platform"] = SimpleNamespace(is_rocm=lambda: True)
+    hcu["persistent_masked_m_silu_mul_clamp_int8_quant"] = clamp_quantize
     expert_num_tokens = torch.tensor([2], dtype=torch.int32)
     experts = SimpleNamespace(
         block_shape=None,
@@ -893,8 +896,7 @@ def test_w4a8_masked_batched_apply_uses_configured_swiglu_clamp(
     )
 
     assert clamp_call["limit"] == 10.0
-    assert clamp_call["mask_m"] is expert_num_tokens
-    assert clamp_call["expect_m"] == 2
+    assert clamp_call["tokens_per_expert"] is expert_num_tokens
 
 
 def test_w4a8_masked_empty_dispatch_skips_all_kernels(
