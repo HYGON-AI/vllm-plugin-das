@@ -277,15 +277,11 @@ def _is_glm53_mtp_pcp(vllm_config: object) -> bool:
 
 
 def _require_glm53_pcp_contract(vllm_config: object) -> None:
+    from vllm_hcu.v1.glm53_kda_cp_config import validate_glm53_pcp_topology
+
     model = vllm_config.model_config
     parallel = vllm_config.parallel_config
-    topology = (
-        parallel.tensor_parallel_size,
-        parallel.prefill_context_parallel_size,
-        parallel.pipeline_parallel_size,
-    )
-    if topology != (1, 8, 1):
-        raise ValueError("GLM-5.3 PCP baseline requires TP1/PCP8/PP1.")
+    validate_glm53_pcp_topology(vllm_config)
     mm = getattr(model, "multimodal_config", None)
     if model.is_multimodal_model and not getattr(mm, "language_model_only", False):
         raise ValueError("GLM-5.3 PCP baseline requires --language-model-only.")
@@ -298,15 +294,11 @@ def _require_glm53_pcp_contract(vllm_config: object) -> None:
 
 
 def _require_glm53_mtp_pcp_contract(vllm_config: object) -> None:
+    from vllm_hcu.v1.glm53_kda_cp_config import validate_glm53_pcp_topology
+
     model = vllm_config.model_config
     parallel = vllm_config.parallel_config
-    topology = (
-        parallel.tensor_parallel_size,
-        parallel.prefill_context_parallel_size,
-        parallel.pipeline_parallel_size,
-    )
-    if topology != (1, 8, 1):
-        raise ValueError("GLM-5.3 MTP PCP requires TP1/PCP8/PP1.")
+    validate_glm53_pcp_topology(vllm_config)
     if not model.use_mla:
         raise ValueError("GLM-5.3 MTP PCP requires the built-in MLA draft layer.")
     if getattr(parallel, "enable_eplb", False):
@@ -347,6 +339,8 @@ def _require_mrv2_pcp_contract(vllm_config: object) -> None:
     )
     is_glm53 = is_glm53_pcp(vllm_config)
     is_glm53_mtp = _is_glm53_mtp_pcp(vllm_config)
+    # Admission was relaxed for GLM5Next only; this is not execution support.
+    relaxed_glm53_topology = is_glm53 or is_glm53_mtp
     if is_glm53:
         _require_glm53_pcp_contract(vllm_config)
     if is_glm53_mtp:
@@ -394,14 +388,14 @@ def _require_mrv2_pcp_contract(vllm_config: object) -> None:
         _require_hy4_pcp8_contract(vllm_config)
     if _require_hcu_pcp_attribute(
         parallel_config, "pipeline_parallel_size", "ParallelConfig"
-    ) != 1 and hy4_topology != (1, 4, 2):
+    ) != 1 and hy4_topology != (1, 4, 2) and not relaxed_glm53_topology:
         raise ValueError("HCU PCP does not support pipeline parallelism.")
     dcp_size = int(
         _require_hcu_pcp_attribute(
             parallel_config, "decode_context_parallel_size", "ParallelConfig"
         )
     )
-    if use_mla and dcp_size != 1:
+    if use_mla and dcp_size != 1 and not relaxed_glm53_topology:
         raise ValueError("GLM-5.2 PCP does not support decode context parallelism.")
     if not use_mla and dcp_size != 1:
         raise ValueError(
@@ -409,13 +403,13 @@ def _require_mrv2_pcp_contract(vllm_config: object) -> None:
         )
     if _require_hcu_pcp_attribute(
         parallel_config, "data_parallel_size", "ParallelConfig"
-    ) != 1:
+    ) != 1 and not relaxed_glm53_topology:
         raise ValueError("HCU PCP does not support data parallelism.")
-    if use_mla and not _require_hcu_pcp_attribute(
+    if use_mla and not relaxed_glm53_topology and not _require_hcu_pcp_attribute(
         parallel_config, "enable_expert_parallel", "ParallelConfig"
     ):
         raise ValueError("GLM-5.2 PCP requires expert parallelism.")
-    if use_mla and not _require_hcu_pcp_attribute(
+    if use_mla and not relaxed_glm53_topology and not _require_hcu_pcp_attribute(
         model_config, "enforce_eager", "ModelConfig"
     ):
         raise ValueError("GLM-5.2 PCP requires eager execution without graphs.")
