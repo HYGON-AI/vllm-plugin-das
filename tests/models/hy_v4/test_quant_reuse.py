@@ -51,7 +51,7 @@ class _FusedNorm:
         return self.quantized, self.scale, None
 
 
-def _attention_layer(*, fused_q_lora: bool):
+def _attention_layer(*, reuse_quant: bool):
     hidden = torch.arange(8, dtype=torch.bfloat16).reshape(2, 4)
     input_q = torch.ones_like(hidden, dtype=torch.int8)
     input_scale = torch.ones(2, 1, dtype=torch.float32)
@@ -81,9 +81,7 @@ def _attention_layer(*, fused_q_lora: bool):
     layer = SimpleNamespace(
         q_lora_rank=3,
         q_a_proj=q_a,
-        q_a_layernorm=(
-            _FusedNorm(q_c_q, q_c_scale) if fused_q_lora else torch.nn.Identity()
-        ),
+        q_a_layernorm=torch.nn.Identity(),
         q_b_proj=q_b,
         q_proj=None,
         kv_a_proj_with_mqa=kv_a,
@@ -101,7 +99,7 @@ def _attention_layer(*, fused_q_lora: bool):
         linear_gate=None,
         gate_a2a_stream=None,
         o_proj=_RecordingLinear(torch.full((2, 4), 3, dtype=torch.bfloat16)),
-        enable_fuse_q_lora_rmsnorm_quant=fused_q_lora,
+        enable_reuse_int8_quant=reuse_quant,
         input_quant_dtype=torch.int8,
     )
     return (
@@ -116,9 +114,13 @@ def _attention_layer(*, fused_q_lora: bool):
     )
 
 
-def test_attention_reuses_input_quantization_for_q_a_and_kv_a() -> None:
-    layer, hidden, input_pair, _, q_a, _, kv_a, _ = _attention_layer(
-        fused_q_lora=True
+def test_attention_reuses_input_quantization_for_q_a_and_kv_a(monkeypatch) -> None:
+    layer, hidden, input_pair, q_c_pair, q_a, _, kv_a, _ = _attention_layer(
+        reuse_quant=True
+    )
+    monkeypatch.setattr(
+        "vllm_hcu.models.hy_v4.attention._quantize_int8",
+        lambda value: q_c_pair,
     )
 
     HYV4MLAAttention.forward(
@@ -132,9 +134,15 @@ def test_attention_reuses_input_quantization_for_q_a_and_kv_a() -> None:
     assert kv_a.pairs == [input_pair]
 
 
-def test_attention_reuses_fused_q_lora_quantization_for_q_b_and_indexer() -> None:
+def test_attention_quantizes_normalized_q_lora_once_for_q_b_and_indexer(
+    monkeypatch,
+) -> None:
     layer, hidden, input_pair, q_c_pair, _, q_b, _, indexer_pairs = (
-        _attention_layer(fused_q_lora=True)
+        _attention_layer(reuse_quant=True)
+    )
+    monkeypatch.setattr(
+        "vllm_hcu.models.hy_v4.attention._quantize_int8",
+        lambda value: q_c_pair,
     )
 
     HYV4MLAAttention.forward(
@@ -146,12 +154,11 @@ def test_attention_reuses_fused_q_lora_quantization_for_q_b_and_indexer() -> Non
 
     assert q_b.pairs == [q_c_pair]
     assert indexer_pairs == [q_c_pair]
-    assert layer.q_a_layernorm.calls == [(torch.int8, True)]
 
 
 def test_attention_disabled_path_does_not_supply_quantized_pairs() -> None:
     layer, hidden, _, _, q_a, q_b, kv_a, indexer_pairs = _attention_layer(
-        fused_q_lora=False
+        reuse_quant=False
     )
 
     HYV4MLAAttention.forward(
@@ -205,29 +212,6 @@ def test_attention_indexer_reuses_q_lora_quantized_pair(monkeypatch) -> None:
     assert wq_b.pairs == [q_c_pair]
 
 
-class _FusedDecoderNorm:
-    def __init__(self, offset: float) -> None:
-        self.offset = offset
-        self.pairs: list[tuple[torch.Tensor, torch.Tensor]] = []
-
-    def __call__(
-        self,
-        value: torch.Tensor,
-        *,
-        quant_dtype: torch.dtype,
-        update_input: bool,
-    ):
-        assert quant_dtype is torch.int8
-        assert update_input is True
-        value.add_(self.offset)
-        pair = (
-            value.to(torch.int8),
-            torch.full((*value.shape[:-1], 1), self.offset),
-        )
-        self.pairs.append(pair)
-        return pair[0], pair[1], None
-
-
 class _DecoderBlock:
     def __init__(self, increment: float) -> None:
         self.increment = increment
@@ -251,18 +235,16 @@ class _IdentityHC:
         return value
 
 
-def test_decoder_ihc_fuses_norm_and_reuses_pairs_for_attention_and_moe() -> None:
+def test_decoder_ihc_keeps_norm_outputs_unquantized() -> None:
     attention = _DecoderBlock(1)
     moe = _DecoderBlock(2)
     layer = SimpleNamespace(
         hc_attn_layer=_IdentityHC(),
         hc_mlp_layer=_IdentityHC(),
-        input_layernorm=_FusedDecoderNorm(3),
-        post_attention_layernorm=_FusedDecoderNorm(4),
+        input_layernorm=lambda value: value + 3,
+        post_attention_layernorm=lambda value: value + 4,
         self_attn=attention,
         mlp=moe,
-        enable_fuse_rmsnorm_quant=True,
-        quant_dtype=torch.int8,
     )
     hidden = torch.zeros(2, 4, dtype=torch.bfloat16)
 
@@ -273,10 +255,8 @@ def test_decoder_ihc_fuses_norm_and_reuses_pairs_for_attention_and_moe() -> None
     )
 
     assert residual is None
-    assert attention.calls[0][1][0] is layer.input_layernorm.pairs[0][0]
-    assert attention.calls[0][1][1] is layer.input_layernorm.pairs[0][1]
-    assert moe.calls[0][1][0] is layer.post_attention_layernorm.pairs[0][0]
-    assert moe.calls[0][1][1] is layer.post_attention_layernorm.pairs[0][1]
+    assert attention.calls[0][1] is None
+    assert moe.calls[0][1] is None
     torch.testing.assert_close(attention.calls[0][0], torch.full_like(hidden, 3))
     torch.testing.assert_close(moe.calls[0][0], torch.full_like(hidden, 8))
     torch.testing.assert_close(actual, torch.full_like(hidden, 10))
@@ -292,8 +272,6 @@ def test_decoder_ihc_disabled_path_preserves_unquantized_calls() -> None:
         post_attention_layernorm=torch.nn.Identity(),
         self_attn=attention,
         mlp=moe,
-        enable_fuse_rmsnorm_quant=False,
-        quant_dtype=torch.int8,
     )
 
     HYV4DecoderLayer._forward_ihc(
@@ -338,6 +316,30 @@ def test_moe_forwards_prequantized_input_to_routed_and_shared_experts(
     assert experts.calls[0]["quanted_hidden_states"].data_ptr() == pair[0].data_ptr()
     assert experts.calls[0]["scale"].data_ptr() == pair[1].data_ptr()
     torch.testing.assert_close(actual, hidden + 1)
+
+
+def test_moe_quantizes_input_once_when_pair_is_not_supplied(monkeypatch) -> None:
+    experts = _RecordingExperts()
+    hidden = torch.zeros(4, 3)
+    pair = (torch.ones(4, 3, dtype=torch.int8), torch.ones(4, 1))
+    layer = SimpleNamespace(
+        gate=_RouterGate(),
+        experts=experts,
+        prefix="model.layers.1.mlp",
+        enable_reuse_int8_quant=True,
+    )
+    calls = []
+    monkeypatch.setattr(
+        "vllm_hcu.models.hy_v4.moe._quantize_int8",
+        lambda value: calls.append(value) or pair,
+    )
+    monkeypatch.setattr("vllm_hcu.models.hy_v4.moe._hyv4_moe_chunk_size", lambda: None)
+
+    HYV4MoEFused.forward(layer, hidden)
+
+    assert calls == [hidden]
+    assert experts.calls[0]["quanted_hidden_states"].data_ptr() == pair[0].data_ptr()
+    assert experts.calls[0]["scale"].data_ptr() == pair[1].data_ptr()
 
 
 def test_moe_chunking_slices_hidden_quantized_input_and_scale_together(

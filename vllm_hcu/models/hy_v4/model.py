@@ -81,7 +81,6 @@ import vllm_hcu.platforms.envs as henvs
 from vllm_hcu.model_executor.layers.quantization.hyv4_ownership import (
     mark_hyv4_quant_config,
 )
-from vllm_hcu.ops.fuse_rms_norm_quant import FusedRMSNormAndQuant
 
 from .attention import (
     HYV4MLAAttention,
@@ -422,24 +421,8 @@ class HYV4DecoderLayer(nn.Module):
                 vllm_config=vllm_config,
             )
             self.block_type = "moe"
-        self.quant_dtype = getattr(self.self_attn, "input_quant_dtype", None)
-        self.enable_fuse_rmsnorm_quant = bool(
-            self.enable_ihc
-            and henvs.VLLM_HCU_USE_CUSTOM_OPS
-            and henvs.VLLM_HCU_USE_FUSED_RMS_QUANT
-            and self.quant_dtype is torch.int8
-        )
-        norm_cls = (
-            FusedRMSNormAndQuant
-            if self.enable_fuse_rmsnorm_quant
-            else RMSNorm
-        )
-        self.input_layernorm = norm_cls(
-            config.hidden_size, eps=config.rms_norm_eps
-        )
-        self.post_attention_layernorm = norm_cls(
-            config.hidden_size, eps=config.rms_norm_eps
-        )
+        self.input_layernorm = RMSNorm(config.hidden_size, config.rms_norm_eps)
+        self.post_attention_layernorm = RMSNorm(config.hidden_size, config.rms_norm_eps)
         self.hc_attn_layer = HYV4HCLayer(config, layer_idx)
         self.hc_mlp_layer = HYV4HCLayer(config, layer_idx)
 
@@ -486,42 +469,17 @@ class HYV4DecoderLayer(nn.Module):
         """iHC forward: each sub-block reduces and re-scatters the channels."""
         hidden_states = self.hc_attn_layer.prepare_input(hidden_states)
         hidden_states, post_gates, residual = self.hc_attn_layer.pre(hidden_states)
-        attn_input_pair = None
-        if getattr(self, "enable_fuse_rmsnorm_quant", False):
-            hidden_states_q, hidden_states_scale, _ = self.input_layernorm(
-                hidden_states,
-                quant_dtype=self.quant_dtype,
-                update_input=True,
-            )
-            attn_input_pair = (hidden_states_q, hidden_states_scale)
-            hidden_states = self.self_attn(
-                positions=positions,
-                hidden_states=hidden_states,
-                x_and_scale_quanted=attn_input_pair,
-            )
-        else:
-            hidden_states = self.input_layernorm(hidden_states)
-            hidden_states = self.self_attn(
-                positions=positions,
-                hidden_states=hidden_states,
-            )
+        hidden_states = self.input_layernorm(hidden_states)
+        hidden_states = self.self_attn(
+            positions=positions,
+            hidden_states=hidden_states,
+        )
         hidden_states = self.hc_attn_layer.post(hidden_states, residual, post_gates)
 
         hidden_states = self.hc_mlp_layer.prepare_input(hidden_states)
         hidden_states, post_gates, residual = self.hc_mlp_layer.pre(hidden_states)
-        if getattr(self, "enable_fuse_rmsnorm_quant", False):
-            hidden_states_q, hidden_states_scale, _ = self.post_attention_layernorm(
-                hidden_states,
-                quant_dtype=self.quant_dtype,
-                update_input=True,
-            )
-            hidden_states = self.mlp(
-                hidden_states,
-                x_and_scale_quanted=(hidden_states_q, hidden_states_scale),
-            )
-        else:
-            hidden_states = self.post_attention_layernorm(hidden_states)
-            hidden_states = self.mlp(hidden_states)
+        hidden_states = self.post_attention_layernorm(hidden_states)
+        hidden_states = self.mlp(hidden_states)
         hidden_states = self.hc_mlp_layer.post(hidden_states, residual, post_gates)
 
         # Under iHC the residual is carried inside hidden_states.

@@ -57,12 +57,19 @@ from vllm.v1.attention.backend import (
 from vllm.v1.attention.selector import get_attn_backend
 from vllm.v1.kv_cache_interface import KVCacheSpec, get_kv_quant_mode
 
-from vllm_hcu.ops.fuse_rms_norm_quant import FusedRMSNormAndQuant
 from vllm_hcu.platforms import envs as henvs
 
 from .fp8_kv_dequant import LightOpKVReuseState
 
 logger = init_logger(__name__)
+
+
+def _quantize_int8(
+    value: torch.Tensor,
+) -> tuple[torch.Tensor, torch.Tensor]:
+    from lightop.quant import per_token_quant_int8
+
+    return per_token_quant_int8(value)
 
 _SPARSE_LAYER_TYPES = (
     "sparse_attention",
@@ -1067,18 +1074,12 @@ class HYV4MLAAttention(nn.Module):
             input_weight.dtype if input_weight is not None else None
         )
         q_lora_weight = getattr(self.q_b_proj, "weight", None)
-        self.enable_fuse_q_lora_rmsnorm_quant = bool(
-            self.q_a_layernorm is not None
-            and henvs.VLLM_HCU_USE_CUSTOM_OPS
+        self.enable_reuse_int8_quant = bool(
+            henvs.VLLM_HCU_USE_CUSTOM_OPS
             and henvs.VLLM_HCU_USE_FUSED_RMS_QUANT
             and q_lora_weight is not None
             and q_lora_weight.dtype is torch.int8
         )
-        if self.enable_fuse_q_lora_rmsnorm_quant:
-            self.q_a_layernorm = FusedRMSNormAndQuant(
-                self.q_lora_rank,
-                eps=config.rms_norm_eps,
-            )
         self.kv_a_layernorm = RMSNorm(self.kv_lora_rank, eps=config.rms_norm_eps)
         self.kv_b_proj = ColumnParallelLinear(
             self.kv_lora_rank,
@@ -1288,6 +1289,11 @@ class HYV4MLAAttention(nn.Module):
     ) -> torch.Tensor:
         q_c = None
         q_c_and_scale_quanted = None
+        if (
+            x_and_scale_quanted is None
+            and getattr(self, "enable_reuse_int8_quant", False)
+        ):
+            x_and_scale_quanted = _quantize_int8(hidden_states)
         if self.q_lora_rank is not None:
             assert self.q_a_proj is not None
             assert self.q_a_layernorm is not None
@@ -1295,15 +1301,9 @@ class HYV4MLAAttention(nn.Module):
             q_c = self.q_a_proj._forward_with_hcu_quanted(
                 hidden_states, x_and_scale_quanted
             )[0]
-            if self.enable_fuse_q_lora_rmsnorm_quant:
-                q_c_q, q_c_scale, _ = self.q_a_layernorm(
-                    q_c,
-                    quant_dtype=self.input_quant_dtype,
-                    update_input=True,
-                )
-                q_c_and_scale_quanted = (q_c_q, q_c_scale)
-            else:
-                q_c = self.q_a_layernorm(q_c)
+            q_c = self.q_a_layernorm(q_c)
+            if getattr(self, "enable_reuse_int8_quant", False):
+                q_c_and_scale_quanted = _quantize_int8(q_c)
             q_proj_layer = self.q_b_proj
             q = q_proj_layer._forward_with_hcu_quanted(
                 q_c, q_c_and_scale_quanted

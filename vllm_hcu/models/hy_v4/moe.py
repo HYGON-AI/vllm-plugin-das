@@ -27,6 +27,14 @@ from vllm_hcu.platforms import envs as henvs
 
 logger = init_logger(__name__)
 
+
+def _quantize_int8(
+    value: torch.Tensor,
+) -> tuple[torch.Tensor, torch.Tensor]:
+    from lightop.quant import per_token_quant_int8
+
+    return per_token_quant_int8(value)
+
 _HYV4_MOE_CHUNK_SIZE_ENV = "VLLM_HCU_HYV4_MOE_CHUNK_SIZE"
 
 
@@ -228,6 +236,11 @@ class HYV4MoEFused(nn.Module):
             swiglu_limit=swiglu_limit,
             router_logits_dtype=torch.float32,
         )
+        self.enable_reuse_int8_quant = bool(
+            henvs.VLLM_HCU_USE_CUSTOM_OPS
+            and henvs.VLLM_HCU_USE_FUSED_RMS_QUANT
+            and quant_config is not None
+        )
         self.prefix = prefix
         if swiglu_limit is not None:
             logger.debug_once(
@@ -241,6 +254,11 @@ class HYV4MoEFused(nn.Module):
         x_and_scale_quanted: tuple[torch.Tensor, torch.Tensor] | None = None,
     ) -> torch.Tensor:
         original_shape = hidden_states.shape
+        if (
+            x_and_scale_quanted is None
+            and getattr(self, "enable_reuse_int8_quant", False)
+        ):
+            x_and_scale_quanted = _quantize_int8(hidden_states)
         hidden_states = hidden_states.view(-1, hidden_states.shape[-1])
         quanted_hidden_states = None
         scale = None
