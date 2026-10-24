@@ -8,6 +8,8 @@ from types import SimpleNamespace
 import torch
 
 from vllm_hcu.models.hy_v4.attention import HYV4MLAAttention, Indexer
+from vllm_hcu.models.hy_v4.model import HYV4DecoderLayer
+from vllm_hcu.models.hy_v4.moe import HYV4FeedForward, HYV4MoEFused
 
 
 class _RecordingLinear:
@@ -201,3 +203,209 @@ def test_attention_indexer_reuses_q_lora_quantized_pair(monkeypatch) -> None:
     )
 
     assert wq_b.pairs == [q_c_pair]
+
+
+class _FusedDecoderNorm:
+    def __init__(self, offset: float) -> None:
+        self.offset = offset
+        self.pairs: list[tuple[torch.Tensor, torch.Tensor]] = []
+
+    def __call__(
+        self,
+        value: torch.Tensor,
+        *,
+        quant_dtype: torch.dtype,
+        update_input: bool,
+    ):
+        assert quant_dtype is torch.int8
+        assert update_input is True
+        value.add_(self.offset)
+        pair = (
+            value.to(torch.int8),
+            torch.full((*value.shape[:-1], 1), self.offset),
+        )
+        self.pairs.append(pair)
+        return pair[0], pair[1], None
+
+
+class _DecoderBlock:
+    def __init__(self, increment: float) -> None:
+        self.increment = increment
+        self.calls: list[tuple[torch.Tensor, object]] = []
+
+    def __call__(self, *args, **kwargs):
+        value = kwargs.get("hidden_states", args[0] if args else None)
+        pair = kwargs.get("x_and_scale_quanted")
+        self.calls.append((value.clone(), pair))
+        return value + self.increment
+
+
+class _IdentityHC:
+    def prepare_input(self, value: torch.Tensor) -> torch.Tensor:
+        return value
+
+    def pre(self, value: torch.Tensor):
+        return value.clone(), torch.ones(value.shape[0], 1), value.clone()
+
+    def post(self, value, residual, post_gates):
+        return value
+
+
+def test_decoder_ihc_fuses_norm_and_reuses_pairs_for_attention_and_moe() -> None:
+    attention = _DecoderBlock(1)
+    moe = _DecoderBlock(2)
+    layer = SimpleNamespace(
+        hc_attn_layer=_IdentityHC(),
+        hc_mlp_layer=_IdentityHC(),
+        input_layernorm=_FusedDecoderNorm(3),
+        post_attention_layernorm=_FusedDecoderNorm(4),
+        self_attn=attention,
+        mlp=moe,
+        enable_fuse_rmsnorm_quant=True,
+        quant_dtype=torch.int8,
+    )
+    hidden = torch.zeros(2, 4, dtype=torch.bfloat16)
+
+    actual, residual = HYV4DecoderLayer._forward_ihc(
+        layer,
+        positions=torch.arange(2),
+        hidden_states=hidden,
+    )
+
+    assert residual is None
+    assert attention.calls[0][1][0] is layer.input_layernorm.pairs[0][0]
+    assert attention.calls[0][1][1] is layer.input_layernorm.pairs[0][1]
+    assert moe.calls[0][1][0] is layer.post_attention_layernorm.pairs[0][0]
+    assert moe.calls[0][1][1] is layer.post_attention_layernorm.pairs[0][1]
+    torch.testing.assert_close(attention.calls[0][0], torch.full_like(hidden, 3))
+    torch.testing.assert_close(moe.calls[0][0], torch.full_like(hidden, 8))
+    torch.testing.assert_close(actual, torch.full_like(hidden, 10))
+
+
+def test_decoder_ihc_disabled_path_preserves_unquantized_calls() -> None:
+    attention = _DecoderBlock(1)
+    moe = _DecoderBlock(2)
+    layer = SimpleNamespace(
+        hc_attn_layer=_IdentityHC(),
+        hc_mlp_layer=_IdentityHC(),
+        input_layernorm=torch.nn.Identity(),
+        post_attention_layernorm=torch.nn.Identity(),
+        self_attn=attention,
+        mlp=moe,
+        enable_fuse_rmsnorm_quant=False,
+        quant_dtype=torch.int8,
+    )
+
+    HYV4DecoderLayer._forward_ihc(
+        layer,
+        positions=torch.arange(2),
+        hidden_states=torch.zeros(2, 4, dtype=torch.bfloat16),
+    )
+
+    assert attention.calls[0][1] is None
+    assert moe.calls[0][1] is None
+
+
+class _RecordingExperts:
+    def __init__(self) -> None:
+        self.calls: list[dict[str, torch.Tensor]] = []
+
+    def __call__(self, **kwargs):
+        self.calls.append(kwargs)
+        return kwargs["hidden_states"] + 1
+
+
+class _RouterGate:
+    def __call__(self, value: torch.Tensor):
+        return torch.ones(value.shape[0], 2), None
+
+
+def test_moe_forwards_prequantized_input_to_routed_and_shared_experts(
+    monkeypatch,
+) -> None:
+    experts = _RecordingExperts()
+    layer = SimpleNamespace(
+        gate=_RouterGate(),
+        experts=experts,
+        prefix="model.layers.1.mlp",
+    )
+    hidden = torch.zeros(4, 3)
+    pair = (torch.ones(4, 3, dtype=torch.int8), torch.ones(4, 1))
+    monkeypatch.setattr("vllm_hcu.models.hy_v4.moe._hyv4_moe_chunk_size", lambda: None)
+
+    actual = HYV4MoEFused.forward(layer, hidden, x_and_scale_quanted=pair)
+
+    assert experts.calls[0]["quanted_hidden_states"].data_ptr() == pair[0].data_ptr()
+    assert experts.calls[0]["scale"].data_ptr() == pair[1].data_ptr()
+    torch.testing.assert_close(actual, hidden + 1)
+
+
+def test_moe_chunking_slices_hidden_quantized_input_and_scale_together(
+    monkeypatch,
+) -> None:
+    experts = _RecordingExperts()
+    layer = SimpleNamespace(
+        gate=_RouterGate(),
+        experts=experts,
+        prefix="model.layers.78.mlp",
+    )
+    hidden = torch.arange(15, dtype=torch.float32).reshape(5, 3)
+    quantized = torch.arange(15, dtype=torch.int8).reshape(5, 3)
+    scale = torch.arange(5, dtype=torch.float32).reshape(5, 1)
+    monkeypatch.setattr("vllm_hcu.models.hy_v4.moe._hyv4_moe_chunk_size", lambda: 2)
+    monkeypatch.setattr(
+        "vllm_hcu.models.hy_v4.moe.linear_gate_pcp_shard_enabled", lambda: True
+    )
+    monkeypatch.setattr(
+        "vllm_hcu.models.hy_v4.moe.in_replicated_mtp_batch", lambda: True
+    )
+
+    HYV4MoEFused.forward(
+        layer,
+        hidden,
+        x_and_scale_quanted=(quantized, scale),
+    )
+
+    assert [call["hidden_states"].shape[0] for call in experts.calls] == [2, 2, 1]
+    torch.testing.assert_close(
+        torch.cat([call["quanted_hidden_states"] for call in experts.calls]),
+        quantized,
+    )
+    torch.testing.assert_close(
+        torch.cat([call["scale"] for call in experts.calls]),
+        scale,
+    )
+
+
+class _FusedAct:
+    def __init__(self, quantized: torch.Tensor, scale: torch.Tensor) -> None:
+        self.quantized = quantized
+        self.scale = scale
+
+    def __call__(self, value: torch.Tensor, *, quant_dtype: torch.dtype):
+        assert quant_dtype is torch.int8
+        return self.quantized, self.scale
+
+
+def test_feed_forward_reuses_input_and_fuses_down_projection_quantization() -> None:
+    gate_up = _RecordingLinear(torch.ones(2, 8))
+    down = _RecordingLinear(torch.full((2, 3), 7.0))
+    input_pair = (torch.ones(2, 3, dtype=torch.int8), torch.ones(2, 1))
+    activated_pair = (torch.ones(2, 4, dtype=torch.int8), torch.ones(2, 1))
+    layer = SimpleNamespace(
+        gate_up_proj=gate_up,
+        down_proj=down,
+        act_fn=_FusedAct(*activated_pair),
+        enable_fuse_silu_mul_quant=True,
+        quant_dtype=torch.int8,
+    )
+
+    actual = HYV4FeedForward.forward(
+        layer,
+        torch.zeros(2, 3),
+        x_and_scale_quanted=input_pair,
+    )
+
+    assert gate_up.pairs == [input_pair]
+    assert down.pairs == [activated_pair]
+    torch.testing.assert_close(actual, torch.full((2, 3), 7.0))

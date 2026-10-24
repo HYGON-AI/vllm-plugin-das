@@ -345,13 +345,18 @@ class Indexer(nn.Module):
         rotary_emb: nn.Module,
         qr_and_scale_quanted: tuple[torch.Tensor, torch.Tensor] | None = None,
     ) -> torch.Tensor:
-        hidden_states, q_quant, k, weights = self.prepare_inputs(
-            hidden_states,
-            qr,
-            positions,
-            rotary_emb,
-            qr_and_scale_quanted=qr_and_scale_quanted,
-        )
+        if qr_and_scale_quanted is None:
+            hidden_states, q_quant, k, weights = self.prepare_inputs(
+                hidden_states, qr, positions, rotary_emb
+            )
+        else:
+            hidden_states, q_quant, k, weights = self.prepare_inputs(
+                hidden_states,
+                qr,
+                positions,
+                rotary_emb,
+                qr_and_scale_quanted=qr_and_scale_quanted,
+            )
         return self.indexer_op(hidden_states, q_quant, k, weights)
 
     def prepare_inputs(

@@ -22,6 +22,8 @@ from vllm.model_executor.layers.linear import (
 from vllm.model_executor.layers.quantization import QuantizationConfig
 from vllm_hcu.model_executor.layers.attention.pcp import in_replicated_mtp_batch
 from vllm_hcu.models.hy_v4.attention import linear_gate_pcp_shard_enabled
+from vllm_hcu.ops.fuse_silu_mul_quant import FusedSiluAndMulAndQuant
+from vllm_hcu.platforms import envs as henvs
 
 logger = init_logger(__name__)
 
@@ -78,12 +80,37 @@ class HYV4FeedForward(nn.Module):
             reduce_results=reduce_results,
             prefix=f"{prefix}.down_proj",
         )
-        self.act_fn = SiluAndMul()
+        weight = getattr(self.gate_up_proj, "weight", None)
+        self.quant_dtype = weight.dtype if weight is not None else None
+        self.enable_fuse_silu_mul_quant = bool(
+            henvs.VLLM_HCU_USE_CUSTOM_OPS
+            and henvs.VLLM_HCU_USE_FUSED_SILU_MUL_QUANT
+            and self.quant_dtype is torch.int8
+        )
+        self.act_fn = (
+            FusedSiluAndMulAndQuant()
+            if self.enable_fuse_silu_mul_quant
+            else SiluAndMul()
+        )
 
-    def forward(self, x: torch.Tensor) -> torch.Tensor:
-        gate_up, _ = self.gate_up_proj(x)
-        activated = self.act_fn(gate_up)
-        output, _ = self.down_proj(activated)
+    def forward(
+        self,
+        x: torch.Tensor,
+        x_and_scale_quanted: tuple[torch.Tensor, torch.Tensor] | None = None,
+    ) -> torch.Tensor:
+        gate_up, _ = self.gate_up_proj._forward_with_hcu_quanted(
+            x, x_and_scale_quanted
+        )
+        if self.enable_fuse_silu_mul_quant:
+            activated_q, activated_scale = self.act_fn(
+                gate_up, quant_dtype=self.quant_dtype
+            )
+            output, _ = self.down_proj._forward_with_hcu_quanted(
+                activated_q, (activated_q, activated_scale)
+            )
+        else:
+            activated = self.act_fn(gate_up)
+            output, _ = self.down_proj(activated)
         return output
 
 
@@ -208,9 +235,21 @@ class HYV4MoEFused(nn.Module):
                 swiglu_limit,
             )
 
-    def forward(self, hidden_states: torch.Tensor) -> torch.Tensor:
+    def forward(
+        self,
+        hidden_states: torch.Tensor,
+        x_and_scale_quanted: tuple[torch.Tensor, torch.Tensor] | None = None,
+    ) -> torch.Tensor:
         original_shape = hidden_states.shape
         hidden_states = hidden_states.view(-1, hidden_states.shape[-1])
+        quanted_hidden_states = None
+        scale = None
+        if x_and_scale_quanted is not None:
+            quanted_hidden_states, scale = x_and_scale_quanted
+            quanted_hidden_states = quanted_hidden_states.view(
+                -1, quanted_hidden_states.shape[-1]
+            )
+            scale = scale.view(-1, scale.shape[-1])
         # LINEAR_GATE_PCP_SHARD + MTP restore can inflate MoE workspace.
         # Chunk only when VLLM_HCU_HYV4_MOE_CHUNK_SIZE is set.
         chunk_size = _hyv4_moe_chunk_size()
@@ -221,9 +260,18 @@ class HYV4MoEFused(nn.Module):
             or hidden_states.shape[0] <= chunk_size
         ):
             router_logits, _ = self.gate(hidden_states)
+            quant_kwargs = (
+                {
+                    "quanted_hidden_states": quanted_hidden_states,
+                    "scale": scale,
+                }
+                if quanted_hidden_states is not None
+                else {}
+            )
             final_hidden_states = self.experts(
                 hidden_states=hidden_states,
                 router_logits=router_logits,
+                **quant_kwargs,
             )
         else:
             final_hidden_states = torch.empty_like(hidden_states)
@@ -231,9 +279,18 @@ class HYV4MoEFused(nn.Module):
                 end = min(start + chunk_size, hidden_states.shape[0])
                 chunk = hidden_states[start:end]
                 router_logits, _ = self.gate(chunk)
+                quant_kwargs = (
+                    {
+                        "quanted_hidden_states": quanted_hidden_states[start:end],
+                        "scale": scale[start:end],
+                    }
+                    if quanted_hidden_states is not None
+                    else {}
+                )
                 final_hidden_states[start:end] = self.experts(
                     hidden_states=chunk,
                     router_logits=router_logits,
+                    **quant_kwargs,
                 )
 
         return final_hidden_states.view(original_shape)
