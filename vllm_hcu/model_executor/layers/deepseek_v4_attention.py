@@ -40,6 +40,10 @@ from vllm_hcu.v1.attention.ops.rocm_aiter_mla_sparse import (
     rocm_forward_decode_fallback,
     rocm_inv_rope_einsum,
 )
+from vllm_hcu.model_executor.layers.fp4_indexer import (
+    fp4_indexer_requested,
+    select_fp4_indexer_capability,
+)
 
 if TYPE_CHECKING:
     from vllm.v1.attention.backends.mla.sparse_swa import (
@@ -1186,7 +1190,18 @@ class DeepseekV4Indexer(nn.Module):
         self.rope_dim = config.qk_rope_head_dim  # 64
         self.q_lora_rank = q_lora_rank  # 1536
         self.compress_ratio = compress_ratio
-        self.use_fp4_kv = self.vllm_config.attention_config.use_fp4_indexer_cache
+        requested_fp4 = (
+            self.vllm_config.attention_config.use_fp4_indexer_cache
+            and fp4_indexer_requested()
+        )
+        self.fp4_capability = select_fp4_indexer_capability(
+            requested=requested_fp4,
+            compress_ratio=compress_ratio,
+            # The phase-1 HCU producer/consumer native pair is intentionally
+            # not advertised until coordinator-authorized native validation.
+            native_available=False,
+        )
+        self.use_fp4_kv = self.fp4_capability.enabled
         logger.info_once(
             "Using %s indexer cache for Lightning Indexer.",
             "MXFP4" if self.use_fp4_kv else "FP8",

@@ -218,6 +218,7 @@ _CORE_CALLBACKS: tuple[_CallbackSpec, ...] = (
     _CallbackSpec(_adapter("core_fix", "patch_deepseek_v41_channel_fp8")),
     _CallbackSpec(_adapter("core_fix", "patch_deepseek_v41_attention")),
     _CallbackSpec(_adapter("core_fix", "patch_deepseek_v41_indexer_k_layout")),
+    _CallbackSpec(_adapter("core_fix", "patch_fp4_packer_lowering")),
     _CallbackSpec(_adapter("core_fix", "patch_deepseek_v41_dspark_load_weights")),
     _CallbackSpec(_adapter("core_fix", "patch_deepseek_v41_engram_offload")),
     _CallbackSpec(_adapter("core_fix", "patch_deepseek_v41_engram_hash")),

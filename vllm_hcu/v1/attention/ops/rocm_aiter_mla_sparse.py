@@ -21,7 +21,7 @@ from vllm.model_executor.kernels.attention.dsa.candidate_blocks import (
 )
 from vllm.platforms import current_platform
 from vllm.triton_utils import tl, triton
-from vllm.utils.torch_utils import LayerNameType
+from vllm.utils.torch_utils import LayerNameType, _resolve_layer_name
 from vllm.v1.attention.backends.mla.indexer import DeepseekV32IndexerMetadata
 from vllm.v1.attention.ops.common import pack_seq_triton, unpack_seq_triton
 
@@ -34,6 +34,16 @@ from vllm.v1.attention.backends.mla.indexer import DeepseekV32IndexerPrefillMeta
 import vllm_hcu.platforms.envs as henvs 
 from vllm_hcu.platforms.hcu import on_gfx938, on_gfx93x
 from vllm_hcu.v1.attention.ops.decode_topk import get_decode_topk_output_buffer
+from vllm_hcu.model_executor.layers.fp4_indexer import (
+    Fp4QTuple,
+    fp4_chunk_slots,
+    fp4_flat_page_view,
+    fp4_physical_page_size,
+    lightop_fp4_decode,
+    lightop_fp4_prefill,
+    lightop_gather_index_k_fp4,
+    stage_fp4_decode_pages,
+)
 
 
 lightop_attention = None
@@ -1541,11 +1551,150 @@ def _indexer_cache_as_hipc_view(kv_cache: torch.Tensor) -> torch.Tensor:
     )
 
 
+def _hcu_fp4_sparse_attn_indexer_native(
+    hidden_states,
+    k_cache_prefix,
+    kv_cache,
+    q_query: Fp4QTuple,
+    k,
+    weights,
+    quant_block_size,
+    scale_fmt,
+    topk_tokens,
+    head_dim,
+    max_model_len,
+    total_seq_lens,
+    topk_indices_buffer,
+    *,
+    skip_k_cache_insert,
+    candidate_blocks=None,
+    candidate_block_size=0,
+    candidate_write=False,
+):
+    """HCU-owned ratio1 FP4 reader lifecycle using current LightOp wrappers.
+
+    This path is selected only by the constructor-time V4.1 capability gate.
+    It intentionally rejects DCP/PCP metadata here rather than falling back to
+    an FP8 reader after FP4 allocation.
+    """
+    metadata = get_forward_context().attn_metadata
+    if not isinstance(metadata, dict):
+        # Account for the new byte-staging peak during vLLM's memory profile:
+        # gathered bytes + native pool + slot/index tensors. Do not let the
+        # allocator fill memory with cache blocks that this reader then needs.
+        rows = hidden_states.shape[0]
+        width = ((max_model_len + 63) // 64) * 64
+        staging_bytes = rows * width * (2 * 68 + 3 * 8 + 1)
+        prefill_bytes = total_seq_lens * 68 + rows * max_model_len * 4
+        _workspace = torch.empty(max(staging_bytes, prefill_bytes),
+                                 dtype=torch.uint8, device=hidden_states.device)
+        return topk_indices_buffer
+    del hidden_states, k, quant_block_size, scale_fmt, total_seq_lens
+    prefix = _resolve_layer_name(k_cache_prefix)
+    layer = metadata[prefix]
+    if getattr(layer, "num_decodes", 0) and getattr(layer, "num_prefills", 0):
+        # Mixed batches are supported below, but shared output and row metadata
+        # must be handled by the same format path; no per-step dtype switch.
+        pass
+    topk_indices_buffer[: topk_indices_buffer.shape[0]] = -1
+    if not skip_k_cache_insert:
+        raise RuntimeError("V4.1 FP4 producer must write K before indexer reader")
+
+    if layer.prefill is not None and layer.num_prefills > 0:
+        for chunk in layer.prefill.chunks:
+            rows = chunk.token_end - chunk.token_start
+            out = topk_indices_buffer[chunk.token_start:chunk.token_end, :topk_tokens]
+            if chunk.local_total_seq_lens == 0 or rows == 0:
+                out.fill_(-1)
+                continue
+            page_size = fp4_physical_page_size(kv_cache)
+            slots = fp4_chunk_slots(
+                chunk.block_table,
+                chunk.token_to_seq,
+                chunk.cu_seq_lens,
+                chunk.local_total_seq_lens,
+                page_size,
+            )
+            k_packed, k_scales = lightop_gather_index_k_fp4(
+                fp4_flat_page_view(kv_cache), slots, page_size
+            )
+            logits = lightop_fp4_prefill(
+                q_query.bf16[chunk.token_start:chunk.token_end].contiguous(),
+                k_packed,
+                k_scales,
+                weights[chunk.token_start:chunk.token_end],
+                chunk.cu_seqlen_ks,
+                chunk.cu_seqlen_ke,
+                max_seqlen_k=max_model_len,
+            )
+            # LightOp FP4 prefill returns window-local columns, not columns
+            # in the concatenated K workspace. Candidate IDs/top-k are local
+            # to that same request window, including for the second request.
+            row_lens = chunk.cu_seqlen_ke - chunk.cu_seqlen_ks
+            if candidate_blocks is not None:
+                _apply_candidate_policy(
+                    logits,
+                    None,
+                    row_lens,
+                    candidate_blocks[chunk.token_start:chunk.token_end],
+                    candidate_block_size,
+                    candidate_write,
+                )
+            out.copy_(_topk_indices_torch(
+                logits, topk_tokens, row_ends=row_lens
+            ))
+
+    if layer.decode is not None and layer.num_decodes > 0:
+        decode = layer.decode
+        num_tokens = layer.num_decode_tokens
+        if decode.requires_padding:
+            raise RuntimeError(
+                "FP4 decode requires per-token flattened metadata; padded native "
+                "multi-token decode is not supported"
+            )
+        q = q_query.packed[:num_tokens]
+        q_sf = q_query.scales[:num_tokens]
+        # Use the metadata's already-expanded per-token causal bounds. In
+        # particular, ratio2 must floor-divide each token's length *after*
+        # expansion; subtracting offsets in compressed space is incorrect.
+        row_ends = _decode_row_ends_from_seq_lens(
+            decode.seq_lens, num_tokens // decode.seq_lens.shape[0], num_tokens
+        ).contiguous()
+        if row_ends.numel() != num_tokens or decode.block_table.shape[0] != num_tokens:
+            raise RuntimeError("FP4 decode requires one block-table row per Q token")
+        q = q.reshape(num_tokens, 1, *q.shape[1:])
+        if q_sf.dtype == torch.uint8 and q_sf.shape[-1] == 4:
+            q_sf = q_sf.contiguous().view(torch.int32).squeeze(-1)
+        if q_sf.dtype != torch.int32 or q_sf.shape != (num_tokens, q.shape[2]):
+            raise RuntimeError("FP4 Q scales must be one packed int32 UE8M0 word per head")
+        q_sf = q_sf.reshape(num_tokens, 1, q.shape[2])
+        decode_cache, decode_table = stage_fp4_decode_pages(
+            kv_cache, decode.block_table, row_ends, max_model_len
+        )
+        logits = lightop_fp4_decode(
+            q.contiguous(), q_sf.contiguous(), decode_cache,
+            weights[:num_tokens].contiguous(),
+            row_ends, decode_table.contiguous(),
+            # Upstream's scheduler buffer is for another backend and may be
+            # uninitialized on HIP. LightOp explicitly accepts None.
+            None, max_model_len, 64, None, 1,
+        )
+        rows = logits.shape[0]
+        out = topk_indices_buffer[:rows, :topk_tokens]
+        if candidate_blocks is not None:
+            _apply_candidate_policy(
+                logits, None, row_ends, candidate_blocks[:rows],
+                candidate_block_size, candidate_write, 1,
+            )
+        out.copy_(_topk_indices_torch(logits, topk_tokens, row_ends=row_ends))
+    return topk_indices_buffer
+
+
 def rocm_aiter_sparse_attn_indexer_native(
     hidden_states: torch.Tensor,
     k_cache_prefix: LayerNameType,
     kv_cache: torch.Tensor,
-    q_fp8: torch.Tensor,
+    q_fp8: torch.Tensor | Fp4QTuple,
     k: torch.Tensor | None,
     weights: torch.Tensor,
     quant_block_size: int,
@@ -1564,6 +1713,29 @@ def rocm_aiter_sparse_attn_indexer_native(
     candidate_write: bool = False,
 ) -> torch.Tensor:
     # careful! this will be None in dummy run
+    fp4_query = q_fp8 if isinstance(q_fp8, Fp4QTuple) else None
+    if fp4_query is not None:
+        if dcp_world_size != 1:
+            raise RuntimeError("FP4 indexer does not support context-parallel cache reads")
+        return _hcu_fp4_sparse_attn_indexer_native(
+            hidden_states,
+            k_cache_prefix,
+            kv_cache,
+            fp4_query,
+            k,
+            weights,
+            quant_block_size,
+            scale_fmt,
+            topk_tokens,
+            head_dim,
+            max_model_len,
+            total_seq_lens,
+            topk_indices_buffer,
+            skip_k_cache_insert=skip_k_cache_insert,
+            candidate_blocks=candidate_blocks,
+            candidate_block_size=candidate_block_size,
+            candidate_write=candidate_write,
+        )
     attn_metadata = get_forward_context().attn_metadata
     packed_fp8_cache = skip_k_cache_insert and kv_cache.dtype == torch.uint8
     fp8_dtype = (
