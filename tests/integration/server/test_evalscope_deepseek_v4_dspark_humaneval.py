@@ -150,6 +150,17 @@ def test_deepseek_v4_dspark_tp8_humaneval_command_contract() -> None:
     assert "--all2all-backend" not in command
 
 
+@pytest.mark.parametrize("profile", TP8_PROFILES)
+def test_deepseek_v4_dspark_tp8_uses_piecewise_cudagraphs(
+    profile: str,
+) -> None:
+    command, _, _ = server_command(_load(profile), model_env=MODEL_ENV)
+
+    assert json.loads(_option_value(command, "--compilation-config")) == {
+        "cudagraph_mode": "PIECEWISE"
+    }
+
+
 @pytest.mark.parametrize(
     ("loader", "model_env"),
     ((_load, MODEL_ENV), (_load_int8, INT8_MODEL_ENV)),
