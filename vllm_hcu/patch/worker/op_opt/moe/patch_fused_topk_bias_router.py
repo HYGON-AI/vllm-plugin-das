@@ -64,15 +64,62 @@ def apply_to_module(module: ModuleType) -> bool:
     ):
         from vllm_hcu.model_executor.layers.fused_moe.sqrtsoftplus_routing import (
             can_use_lightop_sqrtsoftplus,
+            can_use_lightop_sqrtsoftplus_v41_fused,
+            apply_v41_padding_contract,
+            get_v41_padding_mask,
+            is_v41_padding_mask_compatible,
             is_lightop_sqrtsoftplus_available,
+            is_lightop_sqrtsoftplus_v41_fused_available,
             run_lightop_sqrtsoftplus,
+            run_lightop_sqrtsoftplus_v41_fused,
         )
         from vllm_hcu.platforms import envs as henvs
+
+        v41_bias = e_score_correction_bias
+        use_lightop_v41_fused = bool(
+            henvs.optional_custom_op_enabled(
+                getattr(
+                    henvs,
+                    "VLLM_HCU_USE_LIGHTOP_SQRTSOFTPLUS_V41_FUSED_GATE",
+                    True,
+                )
+            )
+            and can_use_lightop_sqrtsoftplus_v41_fused(
+                gating_output,
+                v41_bias,
+                topk=topk_indices.shape[-1],
+                indices_dtype=topk_indices.dtype,
+                input_tokens=input_tokens,
+                hash_indices_table=hash_indices_table,
+                bias_vl=bias_vl,
+                image_sentinel_lo=image_sentinel_lo,
+            )
+            and is_lightop_sqrtsoftplus_v41_fused_available()
+        )
+        padding_mask = get_v41_padding_mask()
+        padding_compatible = is_v41_padding_mask_compatible(
+            padding_mask,
+            rows=int(gating_output.shape[0]),
+            device=gating_output.device,
+        )
+        if use_lightop_v41_fused and padding_compatible:
+            fused_result = run_lightop_sqrtsoftplus_v41_fused(
+                gating_output,
+                v41_bias,
+                topk=topk_indices.shape[-1],
+                renormalize=renormalize,
+                routed_scaling_factor=routed_scaling_factor,
+                indices_dtype=topk_indices.dtype,
+            )
+            padded_result = apply_v41_padding_contract(*fused_result, padding_mask)
+            if padded_result is not None:
+                return padded_result
 
         use_lightop = bool(
             henvs.optional_custom_op_enabled(
                 henvs.VLLM_HCU_USE_LIGHTOP_SQRTSOFTPLUS_GATE
             )
+            and not use_lightop_v41_fused
             and can_use_lightop_sqrtsoftplus(
                 gating_output,
                 e_score_correction_bias,
