@@ -24,6 +24,24 @@ The server's HCU libraries must export:
 Fixed HT does not require the LL masked GEMM, N32 view or LL activation op.
 Unsupported quantization metadata still fails before kernel construction.
 
+## Optional HYV4 INT8 activation reuse
+
+HYV4 Channel-INT4 checkpoints use dynamic INT8 activations for MLA and shared
+expert projections. Enable the reviewed fused RMSNorm/quantization reuse path
+with:
+
+```bash
+export VLLM_HCU_USE_CUSTOM_OPS=1
+export VLLM_HCU_USE_FUSED_RMS_QUANT=1
+export VLLM_HCU_USE_FUSED_SILU_MUL_QUANT=1
+```
+
+The first fused result is shared by q-a and kv-a projections, the Q-LoRA
+result is shared by q-b and the sparse indexer, and the post-attention result
+is shared by routed and shared experts. The optimization activates only for
+INT8 consumers; other quantization formats and launches without the switches
+retain their existing path.
+
 ## Verification status
 
 Regression coverage includes HT route selection/rejection, required operator

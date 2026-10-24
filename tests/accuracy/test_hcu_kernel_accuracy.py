@@ -1282,6 +1282,49 @@ def test_lightop_fused_rms_quant_has_bounded_dequant_error(
     )
 
 
+@pytest.mark.parametrize("tokens", [1, 16, 32, 64, 128])
+def test_hyv4_fused_rms_int8_quant_matches_unfused_decode_reference(
+    tokens: int,
+) -> None:
+    device = _hcu_device()
+    try:
+        from lightop.norm import rms_norm, rms_norm_dynamic_per_token_quant
+        from lightop.quant import per_token_quant_int8
+    except (ImportError, AttributeError) as exc:
+        pytest.skip(f"LightOp RMS/INT8 quant kernels are unavailable: {exc}")
+
+    generator = torch.Generator(device=device).manual_seed(20261024 + tokens)
+    value = torch.randn(
+        (tokens, 6144),
+        generator=generator,
+        device=device,
+        dtype=torch.bfloat16,
+    )
+    fused_value = value.clone()
+    weight = torch.randn(
+        6144,
+        generator=generator,
+        device=device,
+        dtype=torch.bfloat16,
+    )
+    reference_value = rms_norm(value, weight, 1e-6)
+    reference_q, reference_scale = per_token_quant_int8(reference_value)
+
+    actual_q, actual_scale = rms_norm_dynamic_per_token_quant(
+        fused_value,
+        weight,
+        1e-6,
+        torch.int8,
+        residual=None,
+        update_input=True,
+    )
+    torch.cuda.synchronize(device)
+
+    torch.testing.assert_close(fused_value, reference_value, rtol=0, atol=0)
+    torch.testing.assert_close(actual_q, reference_q, rtol=0, atol=0)
+    torch.testing.assert_close(actual_scale, reference_scale, rtol=0, atol=0)
+
+
 @pytest.mark.parametrize("shape", [(3, 256), (2, 1024)])
 def test_lightop_per_token_fp8_quant_matches_dequant_reference(
     shape: tuple[int, int],
