@@ -4,7 +4,9 @@
 from __future__ import annotations
 
 import ast
+import gc
 import inspect
+import weakref
 from pathlib import Path
 from types import SimpleNamespace
 
@@ -86,8 +88,12 @@ def _attention_layer(*, reuse_quant: bool):
         k_pe,
         out,
         q_dcp_replicated=None,
-        q_c_and_scale_quanted=None,
+        q_c_quanted=None,
+        q_c_scale=None,
     ):
+        q_c_and_scale_quanted = (
+            (q_c_quanted, q_c_scale) if q_c_quanted is not None else None
+        )
         indexer_pairs.append(q_c_and_scale_quanted)
         out.fill_(2)
 
@@ -222,6 +228,85 @@ def test_attention_indexer_reuses_q_lora_quantized_pair(monkeypatch) -> None:
     )
 
     assert wq_b.pairs == [q_c_pair]
+
+
+def test_indexer_eager_break_does_not_retain_quanted_pair(monkeypatch) -> None:
+    from vllm.compilation import breakable_cudagraph as breakable
+
+    segments = []
+    capture = SimpleNamespace(
+        _capturing=True,
+        add_eager=lambda fn: segments.append(fn),
+    )
+    monkeypatch.setattr(breakable, "is_breakable_cudagraph_enabled", lambda: True)
+    monkeypatch.setattr(
+        breakable.BreakableCUDAGraphCapture,
+        "current",
+        lambda: capture,
+    )
+    monkeypatch.setattr(breakable, "is_forward_context_available", lambda: False)
+    monkeypatch.setattr(breakable, "weak_ref_tensor", weakref.ref)
+
+    indexer_and_attn = inspect.unwrap(HYV4MLAAttention._indexer_and_attn)
+    wrapped = breakable.eager_break_during_capture(indexer_and_attn)
+    parameters = inspect.signature(indexer_and_attn).parameters
+    tensor_refs = []
+
+    for num_tokens in (2, 4, 8):
+        quanted = torch.ones(num_tokens, 3, dtype=torch.int8)
+        scale = torch.ones(num_tokens, 1)
+        tensor_refs.extend((weakref.ref(quanted), weakref.ref(scale)))
+        if "q_c_quanted" in parameters:
+            quant_kwargs = {
+                "q_c_quanted": quanted,
+                "q_c_scale": scale,
+            }
+        else:
+            quant_kwargs = {
+                "q_c_and_scale_quanted": (quanted, scale),
+            }
+
+        wrapped(
+            SimpleNamespace(),
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+            **quant_kwargs,
+        )
+        del quanted, scale, quant_kwargs
+
+    gc.collect()
+
+    assert len(segments) == 3
+    assert all(ref() is None for ref in tensor_refs)
+
+
+@pytest.mark.parametrize("missing", ["quanted", "scale"])
+def test_indexer_eager_break_rejects_incomplete_quanted_pair(missing) -> None:
+    indexer_and_attn = inspect.unwrap(HYV4MLAAttention._indexer_and_attn)
+    quanted = (
+        None if missing == "quanted" else torch.ones(2, 3, dtype=torch.int8)
+    )
+    scale = None if missing == "scale" else torch.ones(2, 1)
+
+    with pytest.raises(ValueError, match="must be provided together"):
+        indexer_and_attn(
+            SimpleNamespace(),
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+            q_c_quanted=quanted,
+            q_c_scale=scale,
+        )
 
 
 class _RecordingExperts:

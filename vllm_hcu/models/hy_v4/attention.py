@@ -1383,6 +1383,10 @@ class HYV4MLAAttention(nn.Module):
         attn_out = torch.empty(
             output_shape, dtype=hidden_states.dtype, device=hidden_states.device
         )
+        q_c_quanted = None
+        q_c_scale = None
+        if q_c_and_scale_quanted is not None:
+            q_c_quanted, q_c_scale = q_c_and_scale_quanted
         self._indexer_and_attn(
             hidden_states,
             q_c,
@@ -1392,7 +1396,8 @@ class HYV4MLAAttention(nn.Module):
             k_pe,
             attn_out,
             q_dcp_replicated,
-            q_c_and_scale_quanted=q_c_and_scale_quanted,
+            q_c_quanted=q_c_quanted,
+            q_c_scale=q_c_scale,
         )
 
         if (
@@ -1423,7 +1428,8 @@ class HYV4MLAAttention(nn.Module):
         k_pe: torch.Tensor,
         out: torch.Tensor,  # [num_tokens, heads * v_head_dim], written in place
         q_dcp_replicated: torch.Tensor | None = None,
-        q_c_and_scale_quanted: tuple[torch.Tensor, torch.Tensor] | None = None,
+        q_c_quanted: torch.Tensor | None = None,
+        q_c_scale: torch.Tensor | None = None,
     ) -> None:
         """Run the lightning indexer and MLA attention in one eager segment.
 
@@ -1434,6 +1440,15 @@ class HYV4MLAAttention(nn.Module):
         ``unified_mla_attention_with_output`` breaks short-circuit here, since
         the capture is no longer active inside an eager segment.
         """
+        if (q_c_quanted is None) != (q_c_scale is None):
+            raise ValueError(
+                "q_c_quanted and q_c_scale must be provided together"
+            )
+        q_c_and_scale_quanted = (
+            (q_c_quanted, q_c_scale)
+            if q_c_quanted is not None and q_c_scale is not None
+            else None
+        )
         if self.indexer is not None and self.is_sparse and not self.skip_topk:
             self.indexer(
                 hidden_states,
