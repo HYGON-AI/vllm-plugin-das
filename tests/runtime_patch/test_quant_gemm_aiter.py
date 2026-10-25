@@ -4589,10 +4589,10 @@ def test_slimquant_w4a8_ll_runtime_requires_only_masked_clamp_ops(
 
 
 @pytest.mark.hcu
-def test_slimquant_w4a8_auto_runtime_requires_both_clamp_ops(
+def test_slimquant_w4a8_auto_runtime_requires_only_ht_clamp_op(
     monkeypatch: pytest.MonkeyPatch,
 ):
-    """Auto can choose HT or LL, so clamped activation needs both ABIs."""
+    """Clamped auto uses the HT LightOP ABI and the LL persistent kernel."""
 
     from vllm_hcu.model_executor.layers.fused_moe import deepep_runtime
 
@@ -4608,10 +4608,7 @@ def test_slimquant_w4a8_auto_runtime_requires_both_clamp_ops(
             m_grouped_w4a8_gemm_nt_masked_hipc=noop,
         ),
     )
-    lightop = _package(
-        "lightop",
-        fuse_silu_mul_clamp_quant_ep=noop,
-    )
+    lightop = _package("lightop")
     monkeypatch.setitem(sys.modules, "lightop", lightop)
     deepep_runtime._require_slimquant_w4a8_hipc_runtime.cache_clear()
     try:

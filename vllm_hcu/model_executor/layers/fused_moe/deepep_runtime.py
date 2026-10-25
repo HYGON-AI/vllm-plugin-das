@@ -40,8 +40,6 @@ def _require_slimquant_w4a8_hipc_runtime(
         activation_ops = []
         if not ll_only:
             activation_ops.append("fuse_silu_mul_clamp_quant")
-        if not ht_only and not ll_only:
-            activation_ops.append("fuse_silu_mul_clamp_quant_ep")
     else:
         activation_module = "lightop.activation"
         activation_ops = []
