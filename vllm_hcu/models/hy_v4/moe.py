@@ -341,6 +341,9 @@ class HYV4MoEFused(nn.Module):
             x_and_scale_quanted is None
             and getattr(self, "enable_reuse_int8_quant", False)
             and supports_auxiliary_inputs
+            and _linear_supports_quanted_inputs(
+                getattr(self.shared_experts, "gate_up_proj", None)
+            )
         ):
             x_and_scale_quanted = _quantize_int8(hidden_states)
         hidden_states = hidden_states.view(-1, hidden_states.shape[-1])

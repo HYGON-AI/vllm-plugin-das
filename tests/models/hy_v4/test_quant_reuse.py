@@ -296,6 +296,12 @@ def test_moe_quantizes_input_once_when_pair_is_not_supplied(monkeypatch) -> None
     layer = SimpleNamespace(
         gate=_RouterGate(),
         experts=experts,
+        shared_experts=SimpleNamespace(
+            gate_up_proj=_RecordingLinear(
+                torch.zeros_like(hidden),
+                supports_quanted_inputs=True,
+            )
+        ),
         prefix="model.layers.1.mlp",
         enable_reuse_int8_quant=True,
     )
@@ -311,6 +317,41 @@ def test_moe_quantizes_input_once_when_pair_is_not_supplied(monkeypatch) -> None
     assert calls == [hidden]
     assert experts.calls[0]["quanted_hidden_states"].data_ptr() == pair[0].data_ptr()
     assert experts.calls[0]["scale"].data_ptr() == pair[1].data_ptr()
+
+
+def test_moe_skips_auto_quantization_when_shared_gate_up_rejects_pair(
+    monkeypatch,
+) -> None:
+    experts = _RecordingExperts()
+    hidden = torch.zeros(4, 3)
+    pair = (torch.ones(4, 3, dtype=torch.int8), torch.ones(4, 1))
+    layer = SimpleNamespace(
+        gate=_RouterGate(),
+        experts=experts,
+        shared_experts=SimpleNamespace(
+            gate_up_proj=_RecordingLinear(
+                torch.zeros_like(hidden),
+                supports_quanted_inputs=False,
+            )
+        ),
+        prefix="model.layers.1.mlp",
+        enable_reuse_int8_quant=True,
+    )
+    calls = []
+    monkeypatch.setattr(
+        "vllm_hcu.models.hy_v4.moe._quantize_int8",
+        lambda value: calls.append(value) or pair,
+    )
+    monkeypatch.setattr(
+        "vllm_hcu.models.hy_v4.moe._hyv4_moe_chunk_size",
+        lambda: None,
+    )
+
+    HYV4MoEFused.forward(layer, hidden)
+
+    assert calls == []
+    assert "quanted_hidden_states" not in experts.calls[0]
+    assert "scale" not in experts.calls[0]
 
 
 def test_moe_chunking_slices_hidden_quantized_input_and_scale_together(
