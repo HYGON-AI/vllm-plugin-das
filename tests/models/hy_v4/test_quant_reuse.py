@@ -117,6 +117,9 @@ def _attention_layer(*, reuse_quant: bool):
         gated_mla=False,
         linear_gate=None,
         gate_a2a_stream=None,
+        attn_input_stream=None,
+        attn_input_start_event=None,
+        attn_input_done_event=None,
         o_proj=_RecordingLinear(torch.full((2, 4), 3, dtype=torch.bfloat16)),
         enable_reuse_int8_quant=reuse_quant,
     )
@@ -149,6 +152,45 @@ def test_attention_reuses_input_quantization_for_q_a_and_kv_a(monkeypatch) -> No
     )
 
     assert q_a.pairs == [input_pair]
+    assert kv_a.pairs == [input_pair]
+
+
+def test_attention_overlaps_q_and_kv_input_projections(monkeypatch) -> None:
+    layer, hidden, input_pair, q_c_pair, q_a, q_b, kv_a, _ = _attention_layer(
+        reuse_quant=True
+    )
+    stream = object()
+    start_event = object()
+    done_event = object()
+    layer.attn_input_stream = stream
+    layer.attn_input_start_event = start_event
+    layer.attn_input_done_event = done_event
+    calls = []
+
+    def execute(fn0, fn1, event0, event1, aux_stream):
+        calls.append((event0, event1, aux_stream))
+        return fn0(), fn1()
+
+    monkeypatch.setattr(
+        "vllm_hcu.models.hy_v4.attention.maybe_execute_in_parallel",
+        execute,
+        raising=False,
+    )
+    monkeypatch.setattr(
+        "vllm_hcu.models.hy_v4.attention._quantize_int8",
+        lambda value: q_c_pair,
+    )
+
+    HYV4MLAAttention.forward(
+        layer,
+        positions=torch.arange(2),
+        hidden_states=hidden,
+        x_and_scale_quanted=input_pair,
+    )
+
+    assert calls == [(start_event, done_event, stream)]
+    assert q_a.pairs == [input_pair]
+    assert q_b.pairs == [q_c_pair]
     assert kv_a.pairs == [input_pair]
 
 

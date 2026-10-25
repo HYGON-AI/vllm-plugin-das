@@ -13,6 +13,7 @@ from vllm.v1.kv_cache_interface import KVQuantMode, MLAAttentionSpec
 
 from vllm_hcu.models.hy_v4 import fp8_kv_dequant, hcu_sparse
 from vllm_hcu.models.hy_v4.attention import (
+    HYV4MLAAttention,
     HYV4MLAAttentionLayer,
     Indexer,
     _normalize_hy_v4_kv_cache_dtype,
@@ -282,6 +283,81 @@ def test_hy_v4_mla_layer_runs_backend_post_load_hook(monkeypatch) -> None:
         ("layer", layer, torch.bfloat16),
         ("impl", layer.impl, torch.bfloat16),
     ]
+
+
+def test_hy_v4_mla_layer_writes_into_caller_output(monkeypatch) -> None:
+    q = torch.ones(2, 1, 4)
+    kv_c_normed = torch.ones(2, 3)
+    k_pe = torch.ones(2, 1, 1)
+    output = torch.empty(2, 5)
+    calls: list[tuple[object, ...]] = []
+
+    monkeypatch.setattr(
+        torch.ops.vllm,
+        "unified_mla_kv_cache_update",
+        lambda *args: calls.append(("cache", *args)) or torch.empty(0),
+    )
+
+    def attention_with_output(*args, **kwargs):
+        calls.append(("attention", *args, kwargs))
+        args[3].fill_(7)
+
+    monkeypatch.setattr(
+        torch.ops.vllm,
+        "unified_mla_attention_with_output",
+        attention_with_output,
+    )
+    layer = object.__new__(HYV4MLAAttentionLayer)
+    layer.calculate_kv_scales = False
+    layer.use_direct_call = False
+    layer.layer_name = "model.layers.0.self_attn.attn"
+    layer.kv_cache_dtype = "fp8_ds_mla"
+    layer._k_scale = torch.ones(1)
+    layer._hcu_q_dcp_replicated = None
+    layer._hcu_dcp_a2a_overlap_fn = None
+
+    actual = layer.forward(
+        q,
+        kv_c_normed,
+        k_pe,
+        output_shape=output.shape,
+        output=output,
+    )
+
+    assert actual is output
+    torch.testing.assert_close(actual, torch.full_like(output, 7))
+    assert [call[0] for call in calls] == ["cache", "attention"]
+
+
+def test_hy_v4_attention_passes_preallocated_output_to_mla() -> None:
+    output = torch.empty(2, 5)
+
+    class InPlaceMLA:
+        def __call__(self, *_args, output=None, **_kwargs):
+            assert output is not None
+            output.fill_(11)
+            return output
+
+    layer = SimpleNamespace(
+        indexer=None,
+        is_sparse=True,
+        skip_topk=False,
+        gate_a2a_stream=None,
+        mla_attn=InPlaceMLA(),
+    )
+
+    HYV4MLAAttention._indexer_and_attn(
+        layer,
+        hidden_states=torch.ones(2, 4),
+        q_c=None,
+        positions=torch.arange(2),
+        q=torch.ones(2, 1, 4),
+        kv_c_normed=torch.ones(2, 3),
+        k_pe=torch.ones(2, 1, 1),
+        out=output,
+    )
+
+    torch.testing.assert_close(output, torch.full_like(output, 11))
 
 
 def test_full_and_shared_indexer_pattern() -> None:

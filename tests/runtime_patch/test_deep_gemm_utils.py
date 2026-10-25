@@ -291,6 +291,76 @@ def _load_batched_deep_gemm_apply():
     return namespace
 
 
+def _load_batched_deep_gemm_expected_m():
+    source_path = (
+        Path(__file__).parents[2]
+        / "vllm_hcu/model_executor/layers/fused_moe/experts/"
+        "batched_deep_gemm_moe.py"
+    )
+    tree = ast.parse(source_path.read_text(encoding="utf-8"))
+    experts = next(
+        node
+        for node in tree.body
+        if isinstance(node, ast.ClassDef) and node.name == "BatchedDeepGemmExperts"
+    )
+    function = next(
+        node
+        for node in experts.body
+        if isinstance(node, ast.FunctionDef)
+        and node.name == "estimate_expected_m"
+    )
+    module = ast.Module(
+        body=[
+            ast.ImportFrom(
+                module="__future__",
+                names=[ast.alias(name="annotations")],
+                level=0,
+            ),
+            function,
+        ],
+        type_ignores=[],
+    )
+    namespace: dict[str, object] = {
+        "is_forward_context_available": lambda: False,
+        "get_forward_context": lambda: pytest.fail(
+            "forward context should not be read when unavailable"
+        ),
+        "logger": SimpleNamespace(warning_once=lambda *_args: None),
+        "round_up": lambda value, multiple: (
+            (value + multiple - 1) // multiple * multiple
+        ),
+    }
+    exec(compile(ast.fix_missing_locations(module), source_path, "exec"), namespace)
+    return namespace["estimate_expected_m"]
+
+
+@pytest.mark.parametrize(
+    ("graph_expected_m", "max_tokens_per_expert", "expected"),
+    [
+        (7, 2048, 16),
+        (65, 2048, 80),
+        (4096, 2048, 2048),
+        (None, 2048, 2048),
+    ],
+)
+def test_batched_deep_gemm_uses_graph_expected_m_without_dp_metadata(
+    graph_expected_m: int | None,
+    max_tokens_per_expert: int,
+    expected: int,
+):
+    estimate_expected_m = _load_batched_deep_gemm_expected_m()
+    experts = SimpleNamespace(get_expected_m=lambda: graph_expected_m)
+
+    result = estimate_expected_m(
+        experts,
+        global_num_experts=256,
+        max_tokens_per_expert=max_tokens_per_expert,
+        topk=8,
+    )
+
+    assert result == expected
+
+
 def test_w8a8_batched_apply_uses_categorized_lightop_masked_api(
     monkeypatch,
 ):
