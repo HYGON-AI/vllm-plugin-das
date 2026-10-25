@@ -48,7 +48,13 @@ def _linear_supports_quanted_inputs(layer: nn.Module) -> bool:
     ):
         return False
     try:
-        return bool(supports())
+        if not bool(supports()):
+            return False
+        scheme = getattr(layer, "scheme", None)
+        if scheme is None:
+            return True
+        scheme_supports = getattr(scheme, "supports_quanted_inputs", None)
+        return callable(scheme_supports) and bool(scheme_supports())
     except (AttributeError, RuntimeError, TypeError, ValueError):
         return False
 

@@ -174,6 +174,31 @@ def test_attention_quantizes_normalized_q_lora_once_for_q_b_and_indexer(
     assert indexer_pairs == [q_c_pair]
 
 
+def test_attention_skips_q_lora_quant_when_q_b_scheme_rejects_pair(
+    monkeypatch,
+) -> None:
+    layer, hidden, input_pair, q_c_pair, _, q_b, _, indexer_pairs = (
+        _attention_layer(reuse_quant=True)
+    )
+    q_b.scheme = _QuantMethod(supports_quanted_inputs=False)
+    quantize_calls = []
+    monkeypatch.setattr(
+        "vllm_hcu.models.hy_v4.attention._quantize_int8",
+        lambda value: quantize_calls.append(value) or q_c_pair,
+    )
+
+    HYV4MLAAttention.forward(
+        layer,
+        positions=torch.arange(2),
+        hidden_states=hidden,
+        x_and_scale_quanted=input_pair,
+    )
+
+    assert quantize_calls == []
+    assert q_b.pairs == [None]
+    assert indexer_pairs == [None]
+
+
 def test_attention_disabled_path_does_not_supply_quantized_pairs() -> None:
     layer, hidden, _, _, q_a, q_b, kv_a, indexer_pairs = _attention_layer(
         reuse_quant=False
@@ -604,6 +629,30 @@ def test_feed_forward_uses_float_activation_when_down_rejects_quanted_input() ->
         torch.full((2, 3), 7.0),
         supports_quanted_inputs=False,
     )
+    fused_act = _FusedAct(
+        torch.ones(2, 4, dtype=torch.int8),
+        torch.ones(2, 1),
+    )
+    float_act = lambda value: value[..., :4]
+    layer = SimpleNamespace(
+        gate_up_proj=gate_up,
+        down_proj=down,
+        act_fn=fused_act,
+        float_act_fn=float_act,
+        enable_fuse_silu_mul_quant=True,
+        quant_dtype=torch.int8,
+    )
+
+    actual = HYV4FeedForward.forward(layer, torch.zeros(2, 3))
+
+    assert down.pairs == [None]
+    torch.testing.assert_close(actual, torch.full((2, 3), 7.0))
+
+
+def test_feed_forward_uses_float_activation_when_down_scheme_rejects_pair() -> None:
+    gate_up = _RecordingLinear(torch.ones(2, 8))
+    down = _RecordingLinear(torch.full((2, 3), 7.0))
+    down.scheme = _QuantMethod(supports_quanted_inputs=False)
     fused_act = _FusedAct(
         torch.ones(2, 4, dtype=torch.int8),
         torch.ones(2, 1),

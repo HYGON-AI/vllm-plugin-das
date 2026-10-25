@@ -8416,6 +8416,7 @@ def test_int8_scheme_layout_and_feature_off_delegation(monkeypatch: pytest.Monke
     patch_compressed_tensors_w8a8_int8.apply_to_module(module)
     scheme = module.CompressedTensorsW8A8Int8()
     layer = SimpleNamespace(weight=torch.nn.Parameter(torch.ones(2, 3)))
+    assert scheme.supports_quanted_inputs() is False
     assert scheme.apply_weights(layer, "x", None)[0] == "upstream"
     scheme.process_weights_after_loading(layer)
     assert layer.weight.shape == (3, 2)
@@ -8434,6 +8435,7 @@ def test_int8_scheme_layout_and_feature_off_delegation(monkeypatch: pytest.Monke
     )
     patch_compressed_tensors_w8a8_int8.apply_to_module(feature_module)
     feature_scheme = feature_module.CompressedTensorsW8A8Int8()
+    assert feature_scheme.supports_quanted_inputs() is True
     feature_layer = SimpleNamespace(
         weight=torch.nn.Parameter(torch.ones(2, 3)),
         weight_scale=torch.ones(2, 1),
