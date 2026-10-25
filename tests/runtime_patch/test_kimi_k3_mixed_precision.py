@@ -1,5 +1,6 @@
 # SPDX-License-Identifier: Apache-2.0
 """CPU contracts; native vLLM loaders, no accelerator/kernel initialization."""
+import inspect
 from types import ModuleType, SimpleNamespace
 
 import pytest
@@ -379,6 +380,15 @@ def test_mixed_and_fused_branches_compose_with_installed_kimi_model_loader():
             nn.Module.__init__(layer)
             layer.tp_size, layer.tp_rank = (1, 0) if replicated else (16, rank)
             layer.output_sizes = sizes
+            # Hermetic vs the installed linear class: __new__ skips the
+            # constructor, so materialize what a body OR plugin-fork
+            # weight_loader reads off self. The stub stands in for a W8A8
+            # layer (int8 weight + weight_scale), i.e. a QUANTIZED one --
+            # the fork's loader takes the NN-layout path under
+            # VLLM_USE_NN when is_quantization is False (param narrowed on
+            # dim 1 + transposed shard), which no realistic deployment
+            # binding would produce for this layer.
+            layer.is_quantization = True
             local = sum(sizes) // layer.tp_size
             layer.weight = _parameter((local, 4), torch.int8, layer.weight_loader)
             layer.weight_scale = _parameter((local, 1), torch.float32, layer.weight_loader)
@@ -425,7 +435,31 @@ def test_mixed_and_fused_branches_compose_with_installed_kimi_model_loader():
         entries.append(('direct.weight',torch.ones(1,4)))
         expected = {name: tensor.clone() for name, tensor in entries}
         loaded = model.load_weights(iter(reversed(entries)))
-        assert loaded == {name for name, _ in model.named_parameters()}
+        # Environment fingerprint: a CI-only loader delta (py version, vLLM
+        # build, loader module resolution) must be visible in the failure
+        # log without a local repro. No repr of the bound loader -- it
+        # reaches extra_repr on a __new__-built layer and would raise
+        # AttributeError inside the diagnostic itself.
+        import vllm as _vllm_mod
+
+        dense_loader = dense.weight.weight_loader
+        loader_func = getattr(dense_loader, "__func__", dense_loader)
+        loader_id = (
+            f"{getattr(loader_func, '__module__', '?')}."
+            f"{getattr(loader_func, '__qualname__', type(loader_func).__name__)}"
+        )
+        loaded_set, param_names = (
+            set(loaded), {name for name, _ in model.named_parameters()}
+        )
+        # Self-diagnosing: pin WHICH side diverged, which loader ran, and
+        # which vLLM build served the native K3 loader.
+        assert loaded_set == param_names, (
+            f"loader skipped {sorted(param_names - loaded_set)} and invented "
+            f"{sorted(loaded_set - param_names)}; dense loader is "
+            f"{loader_id}; K3 native load_weights sourcefile "
+            f"{inspect.getsourcefile(type(model).load_weights)}; "
+            f"vllm {_vllm_mod.__version__} from {_vllm_mod.__file__}"
+        )
 
         def local_rows(tensor, replicated=False):
             if replicated:

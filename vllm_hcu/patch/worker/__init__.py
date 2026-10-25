@@ -209,6 +209,7 @@ _CORE_CALLBACKS: tuple[_CallbackSpec, ...] = (
     _CallbackSpec(_adapter("core_fix", "patch_deepseek_v4_bf16_compressor")),
     _CallbackSpec(_adapter("core_fix", "patch_deepseek_v4_c128_splits")),
     _CallbackSpec(_adapter("core_fix", "patch_deepseek_v4_load_weights")),
+    _CallbackSpec(_adapter("core_fix", "patch_deepseek_v4_megamoe")),
     _CallbackSpec(_adapter("core_fix", "patch_deepseek_v4_eplb")),
     _CallbackSpec(_adapter("core_fix", "patch_deepseek_v4_mtp_eplb")),
     _CallbackSpec(_adapter("core_fix", "patch_deepseek_v4_dspark_target")),
@@ -272,6 +273,10 @@ _OP_CALLBACKS: tuple[_CallbackSpec, ...] = (
     _CallbackSpec(_adapter("op_opt", "patch_kimi_k3_eplb_model")),
     _CallbackSpec(_adapter("op_opt", "patch_kimi_k3_reference_paths")),
     _CallbackSpec(_adapter("op_opt", "patch_kimi_k3_mla_gate")),
+    # Must be applied after reference_paths: it wraps the
+    # forward_attn_residual that adapter installs and captures it as the
+    # non-SP chain. Opt-in: armed only with VLLM_HCU_K3_SP_MOE=1.
+    _CallbackSpec(_adapter("op_opt", "patch_kimi_k3_sp_moe")),
     _CallbackSpec(_adapter("op_opt", "patch_kimi_k3_mixed_kda")),
     _CallbackSpec(_adapter("op_opt", "patch_kimi_k3_mixed_linear")),
     # All GDN deltas bind Qwen's module-local symbols/class only.  The

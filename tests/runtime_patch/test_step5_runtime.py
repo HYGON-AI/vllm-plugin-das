@@ -78,6 +78,9 @@ def test_signature_drift_and_stale_marker_fail_closed():
     class Config:
         hf_config_override = staticmethod(lambda incompatible: None)
 
+        def __post_init__(self):
+            pass
+
     m.SpeculativeConfig = Config
     m.MTPModelTypes = Literal["step3p5_mtp"]
     with pytest.raises(RuntimeError, match="signature"):
@@ -102,6 +105,9 @@ def test_step5_mtp_config_keeps_quantization_and_delegates_other_models():
             calls.append(hf_config)
             return hf_config
 
+        def __post_init__(self):
+            pass
+
     class HF(SimpleNamespace):
         def update(self, values):
             self.__dict__.update(values)
@@ -122,6 +128,38 @@ def test_step5_mtp_config_keeps_quantization_and_delegates_other_models():
     assert text.quantization_config is quant and not calls
     other = HF(model_type="llama", architectures=["LlamaForCausalLM"])
     assert Config.hf_config_override(other) is other and calls == [other]
+
+
+def test_deepseek_v4_dspark_keeps_explicit_draft_quantization():
+    from vllm_hcu.patch.platform.core_fix import patch_step5_speculative_config as a
+
+    m = ModuleType(a.TARGET_MODULE)
+
+    class Config:
+        hf_config_override = staticmethod(lambda hf_config: hf_config)
+
+        def __post_init__(self):
+            # Mirror the audited native DeepSeek-V4 DSpark normalization.
+            self.draft_model_config.quantization = (
+                self.target_model_config.quantization
+            )
+
+    m.SpeculativeConfig = Config
+    m.MTPModelTypes = Literal["step3p5_mtp"]
+    a.apply_to_module(m)
+    config = Config()
+    config.method = "dspark"
+    config.quantization = "slimquant_w4a8"
+    config.target_model_config = SimpleNamespace(quantization="compressed-tensors")
+    config.draft_model_config = SimpleNamespace(
+        quantization="slimquant_w4a8",
+        architectures=["DSparkDraftModel"],
+        hf_config=SimpleNamespace(model_type="deepseek_v4"),
+    )
+
+    config.__post_init__()
+
+    assert config.draft_model_config.quantization == "slimquant_w4a8"
 
 
 def test_block_mirror_matches_expansion_overwrite_row_order_and_padding():

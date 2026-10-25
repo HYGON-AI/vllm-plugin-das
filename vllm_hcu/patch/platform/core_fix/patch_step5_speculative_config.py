@@ -14,12 +14,14 @@ TARGET_MODULE = "vllm.config.speculative"
 PATCH_ID = "platform.core_fix.step5_speculative_config"
 TARGETS = (
     "vllm.config.speculative.SpeculativeConfig.hf_config_override",
+    "vllm.config.speculative.SpeculativeConfig.__post_init__",
     "vllm.config.speculative.MTPModelTypes",
 )
 _MARKER = "_vllm_hcu_step5_speculative_config_applied"
 
 SIGNATURES = (
     ("vllm.config.speculative.SpeculativeConfig.hf_config_override", ("hf_config",)),
+    ("vllm.config.speculative.SpeculativeConfig.__post_init__", ("self",)),
 )
 REVIEWED_SOURCES = ()
 
@@ -34,6 +36,7 @@ def apply_to_module(module: ModuleType) -> bool:
 
     cls = getattr(target, "SpeculativeConfig", None)
     original = require_callable(cls, "hf_config_override", TARGETS[0])
+    original_post_init = require_callable(cls, "__post_init__", TARGETS[1])
     if "step5_mtp" not in get_args(target.MTPModelTypes):
         target.MTPModelTypes = Literal[(*get_args(target.MTPModelTypes), "step5_mtp")]
 
@@ -59,6 +62,27 @@ def apply_to_module(module: ModuleType) -> bool:
         return original(hf_config)
 
     cls.hf_config_override = staticmethod(hf_config_override)
+
+    @functools.wraps(original_post_init)
+    def post_init(self):
+        # Upstream makes an in-checkpoint DeepSeek-V4 DSpark draft inherit the
+        # target quantization unconditionally. Preserve an explicitly selected
+        # independent draft format so get_draft_quant_config dispatches to the
+        # requested HCU facade (not the target's compressed-tensors config).
+        explicit_quantization = getattr(self, "quantization", None)
+        result = original_post_init(self)
+        draft = getattr(self, "draft_model_config", None)
+        hf_config = getattr(draft, "hf_config", None)
+        if (
+            explicit_quantization is not None
+            and getattr(self, "method", None) == "dspark"
+            and getattr(hf_config, "model_type", None) == "deepseek_v4"
+            and "DSparkDraftModel" in (getattr(draft, "architectures", ()) or ())
+        ):
+            draft.quantization = explicit_quantization
+        return result
+
+    cls.__post_init__ = post_init
     remember_targets(target, _MARKER, TARGETS)
     return True
 

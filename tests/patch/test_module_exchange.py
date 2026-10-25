@@ -305,6 +305,11 @@ def test_deep_gemm_replacements_keep_target_features_and_scoped_hcu_deltas():
     assert "VLLM_HCU_USE_LIGHTOP_EP_SCATTER" in utils_source
     assert "_HCU_TOKEN_ALIGNMENT = 256" in utils_source
 
+    # The DeepEP-LL expected_m hint rides a private instance channel, never
+    # a widened upstream signature (the AST gate above pins public args).
+    assert "self._hcu_expected_m_local_tokens = topk_ids.size(0)" in batched_source
+    assert "local_num_tokens: int | None = None" not in batched_source
+
     call_sites = ast.parse(call_sites_path.read_text(encoding="utf-8"))
     deep_gemm_calls = [
         node

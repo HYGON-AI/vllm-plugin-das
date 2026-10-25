@@ -974,7 +974,9 @@ def test_kimi_ll_masked_apply_uses_situ_activation_and_eplb_token_mask(
         _hcu_situ_beta=1.25,
         _hcu_situ_linear_beta=2.0,
         moe_problem_size=lambda *_args: (1, 2, 128, 64, 1),
-        estimate_expected_m=lambda **_kwargs: 16,
+        # A value above lightop's tuned window (<=19) must still flow
+        # through unchanged to SiTU and both GEMMs.
+        estimate_expected_m=lambda **_kwargs: 160,
     )
     output = torch.empty((1, 2, 64), dtype=torch.bfloat16)
     hcu["apply"](
@@ -1000,4 +1002,182 @@ def test_kimi_ll_masked_apply_uses_situ_activation_and_eplb_token_mask(
     assert activation_call["masked_m"] is mask
     assert activation_call["situ_beta"] == 1.25
     assert activation_call["situ_linear_beta"] == 2.0
-    assert activation_call["expect_m"] == 16
+    # SiTU and GEMM1/GEMM2 share one expected_m; no clamping or pinning.
+    assert activation_call["expect_m"] == 160
+    assert gemm_calls[0][4] == 160
+    assert gemm_calls[1][4] == 160
+
+
+# ---------------------------------------------------------------------------
+# DeepEP-LL expected_m hint: the context-local token count reaches the
+# estimator through the private instance channel, so the estimate flows even
+# when DeepEP-LL skips dp_metadata -- while the published v0.25.1 signature
+# stays byte-identical (test_module_exchange signature gate).
+# ---------------------------------------------------------------------------
+
+
+def _expected_m_stub(num_dispatchers, local_tokens=..., **extra):
+    """A BatchedDeepGemmExperts stand-in whose method lookups delegate back
+    to the real (possibly monkeypatched) class implementations."""
+    from vllm_hcu.model_executor.layers.fused_moe.experts import (
+        batched_deep_gemm_moe as bdgm,
+    )
+
+    stub = SimpleNamespace(num_dispatchers=num_dispatchers, **extra)
+    stub.estimate_expected_m = lambda **kwargs: (
+        bdgm.BatchedDeepGemmExperts.estimate_expected_m(stub, **kwargs)
+    )
+    stub._hcu_estimate_expected_m = (
+        lambda global_num_experts, max_tokens_per_expert, topk, local: (
+            bdgm.BatchedDeepGemmExperts._hcu_estimate_expected_m(
+                stub, global_num_experts, max_tokens_per_expert, topk, local
+            )
+        )
+    )
+    if local_tokens is not ...:
+        stub._hcu_expected_m_local_tokens = local_tokens
+    return stub
+
+
+def test_expected_m_hint_scales_by_num_dispatchers():
+    from vllm_hcu.model_executor.layers.fused_moe.experts import (
+        batched_deep_gemm_moe as bdgm,
+    )
+
+    experts = _expected_m_stub(4, local_tokens=32)
+    # total = 32 * 4 = 128; replicated = 128 * 8 = 1024; //256 = 4 -> 16
+    estimate = bdgm.BatchedDeepGemmExperts._hcu_estimate_expected_m(
+        experts, 256, 64, 8, 32
+    )
+    assert estimate == 16
+    # The upstream-shaped public method must reuse the instance channel.
+    assert (
+        bdgm.BatchedDeepGemmExperts.estimate_expected_m(experts, 256, 64, 8)
+        == 16
+    )
+    # Discriminating multiplier case (review): with the OLD shape-16 inputs
+    # both the hinted and the no-dispatcher product round up to 16, so a
+    # memory mutation that drops the multiplier survives. Here the hinted
+    # estimate is 96*8*2 //64 = 24 -> round_up 32 while the mutated variant
+    # yields 3 -> 16, so this case fails without the multiplier.
+    experts = _expected_m_stub(8, local_tokens=96)
+    assert (
+        bdgm.BatchedDeepGemmExperts._hcu_estimate_expected_m(
+            experts, 64, 128, 2, 96
+        )
+        == 32
+    )
+    assert (
+        bdgm.BatchedDeepGemmExperts.estimate_expected_m(experts, 64, 128, 2)
+        == 32
+    )
+
+
+def test_expected_m_without_hint_keeps_upstream_warning_path():
+    from vllm_hcu.model_executor.layers.fused_moe.experts import (
+        batched_deep_gemm_moe as bdgm,
+    )
+
+    experts = _expected_m_stub(4)
+    assert (
+        bdgm.BatchedDeepGemmExperts.estimate_expected_m(experts, 256, 512, 8)
+        == 512
+    )
+
+
+def test_dp_metadata_beats_the_private_hint(monkeypatch):
+    from vllm_hcu.model_executor.layers.fused_moe.experts import (
+        batched_deep_gemm_moe as bdgm,
+    )
+
+    monkeypatch.setattr(bdgm, "is_forward_context_available", lambda: True)
+    monkeypatch.setattr(
+        bdgm,
+        "get_forward_context",
+        lambda: SimpleNamespace(
+            dp_metadata=SimpleNamespace(
+                num_tokens_across_dp_cpu=torch.tensor([1, 3])
+            )
+        ),
+    )
+    experts = _expected_m_stub(4, local_tokens=999999)
+    # total = 4; replicated = 32; //256 = 0 -> round_up 16. DP metadata wins;
+    # the local hint must not feed a second (conflicting) estimate.
+    assert (
+        bdgm.BatchedDeepGemmExperts.estimate_expected_m(experts, 256, 64, 8)
+        == 16
+    )
+
+
+def test_apply_sets_and_clears_the_hint_channel(monkeypatch):
+    """apply feeds the private channel around exactly the estimate call."""
+    seen = {}
+    hcu = _load_batched_deep_gemm_apply()
+    hcu["current_platform"] = SimpleNamespace(is_rocm=lambda: True)
+    experts = SimpleNamespace(
+        num_dispatchers=4,
+        block_shape=None,
+        max_num_tokens=None,
+        quant_config=SimpleNamespace(
+            use_int8_w8a8=True,
+            use_fp8_w8a8=False,
+            weight_quant_dtype="int4",
+            gemm1_clamp_limit=None,
+        ),
+        w1_scale=torch.ones((1, 128, 1), dtype=torch.float32),
+        w2_scale=torch.ones((1, 64, 1), dtype=torch.float32),
+        _deepgemm_w13=torch.empty((1, 1, 4, 4, 32, 8), dtype=torch.int8),
+        _deepgemm_w2=torch.empty((1, 1, 2, 4, 32, 8), dtype=torch.int8),
+        _hcu_logical_n=128,
+        _hcu_logical_k=64,
+        _hcu_situ_activation=True,
+        _hcu_situ_beta=1.25,
+        _hcu_situ_linear_beta=2.0,
+        moe_problem_size=lambda *_args: (1, 2, 128, 64, 1),
+        estimate_expected_m=lambda **_kwargs: (
+            seen.setdefault(
+                "channel_at_call", experts._hcu_expected_m_local_tokens
+            ),
+            160,
+        )[1],
+    )
+
+    def _vendor_boundary(*_args, **_kwargs):
+        raise RuntimeError("vendor boundary reached")
+
+    _install_deepgemm(
+        monkeypatch,
+        gemm_name="m_grouped_w4a8_gemm_nt_masked_hipc",
+        gemm_kernel=_vendor_boundary,
+    )
+    _install_categorized_lightop(
+        monkeypatch,
+        activation_name="fuse_silu_mul_quant_ep",
+        activation_kernel=lambda **k: None,
+        gemm_name="m_grouped_gemm_nt_masked",
+        gemm_kernel=lambda *a, **k: None,
+    )
+    out = torch.empty((1, 2, 64), dtype=torch.bfloat16)
+    # apply stops at the stubbed vendor GEMM; everything before it -- the
+    # hint channel, the estimate call, and the clear -- is what this pins.
+    with pytest.raises(RuntimeError, match="vendor boundary"):
+        hcu["apply"](
+            experts,
+            output=out,
+            hidden_states=torch.zeros((1, 2, 64), dtype=torch.int8),
+            w1=torch.empty((1, 128, 32), dtype=torch.int8),
+            w2=torch.empty((1, 64, 32), dtype=torch.int8),
+            topk_weights=torch.ones((2, 1)),
+            topk_ids=torch.zeros((2, 1), dtype=torch.int32),
+            activation="situ",
+            global_num_experts=1,
+            expert_map=None,
+            a1q_scale=torch.ones((1, 2, 1), dtype=torch.float32),
+            a2_scale=None,
+            workspace13=torch.empty(256, dtype=torch.bfloat16),
+            workspace2=torch.empty(256, dtype=torch.bfloat16),
+            expert_tokens_meta=SimpleNamespace(expert_num_tokens=None),
+            apply_router_weight_on_input=False,
+        )
+    assert seen["channel_at_call"] == 2  # topk_ids.size(0): 2 rows, topk 1
+    assert getattr(experts, "_hcu_expected_m_local_tokens", None) is None
