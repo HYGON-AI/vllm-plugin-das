@@ -7,6 +7,7 @@ from __future__ import annotations
 import importlib
 import inspect
 import sys
+from contextlib import contextmanager
 from dataclasses import dataclass
 from types import ModuleType, SimpleNamespace
 
@@ -63,6 +64,461 @@ def test_fla_selector_master_off_ignores_materialized_true_attribute(
     monkeypatch.setattr(backend, "_prefill_requested", "hcu-aiter")
 
     assert backend.requested_backend(stage) == "hcu-boltops"
+
+
+def test_fla_selector_logs_provider_specific_unavailable_reason(monkeypatch):
+    backend = _adapter("_gdn_backend")
+    warnings = []
+    fake_logger = SimpleNamespace(
+        warning_once=lambda message, *args: warnings.append(message % args),
+        info_once=lambda *args: None,
+    )
+    monkeypatch.setattr(backend, "logger", fake_logger)
+    monkeypatch.setattr(backend, "requested_backend", lambda stage: "hcu-aiter")
+
+    select = backend.make_provider_selector(
+        "prefill",
+        "recompute_w_u_fwd",
+        {"hcu-boltops": lambda: lambda: None},
+        unavailable_reasons={
+            "hcu-aiter": (
+                "it has no standalone vLLM-compatible entry point; "
+                "its recompute kernel is internal to ck_gdn_prefill"
+            )
+        },
+    )
+
+    provider, kernel = select()
+
+    assert provider == "hcu-boltops"
+    assert kernel is not None
+    assert warnings == [
+        "GDN prefill recompute_w_u_fwd: hcu-aiter cannot be used "
+        "(requested hcu-aiter) because it has no standalone vLLM-compatible "
+        "entry point; its recompute kernel is internal to ck_gdn_prefill; "
+        "falling back."
+    ]
+
+
+def _fake_ck_gdn_module():
+    def workspace_bytes(
+        q, v, cu_seqlens=None, use_g=True, use_gk=False, use_exp2=True,
+        transpose_state=False, qk_l2norm=False, gate_in_kernel=False,
+        has_dt_bias=False, beta_sigmoid_in_kernel=False,
+        output_final_state=True, cp_context=False, cp_world_size=2,
+    ):
+        del q, v, cu_seqlens, use_g, use_gk, use_exp2, transpose_state
+        del qk_l2norm, gate_in_kernel, has_dt_bias, beta_sigmoid_in_kernel
+        del output_final_state, cp_context, cp_world_size
+        return 257
+
+    def prefill(
+        q, k, v, g, beta, workspace=None, gk=None, a_log=None,
+        dt_bias=None, initial_state=None, cu_seqlens=None, scale=None,
+        use_g=True, use_gk=False, use_exp2=True, transpose_state=False,
+        qk_l2norm=False, gate_in_kernel=False, has_dt_bias=False,
+        beta_sigmoid_in_kernel=False, output_final_state=True,
+        cp_context=False, cp_world_size=2, cp_rank=1,
+    ):
+        del k, g, beta, workspace, gk, a_log, dt_bias, initial_state
+        del cu_seqlens, scale, use_g, use_gk, use_exp2, transpose_state
+        del qk_l2norm, gate_in_kernel, has_dt_bias, beta_sigmoid_in_kernel
+        del output_final_state, cp_context, cp_world_size, cp_rank
+        return q, v
+
+    return _module(
+        "aiter", ck_gdn_prefill=prefill,
+        ck_gdn_prefill_workspace_bytes=workspace_bytes,
+    )
+
+
+def _ck_inputs(hq=2, hv=8, dim=128, dtype=torch.bfloat16, sequences=1):
+    tokens = 65
+    q = torch.empty(tokens, hq, dim, dtype=dtype)
+    k = torch.empty_like(q)
+    v = torch.empty(tokens, hv, dim, dtype=dtype)
+    g = torch.empty(tokens, hv, dtype=torch.float32)
+    beta = torch.empty(tokens, hv, dtype=torch.float32)
+    state = torch.empty(sequences, hv, dim, dim, dtype=torch.float32)
+    cu = torch.tensor([0, tokens], dtype=torch.int64)
+    return q, k, v, g, beta, state, cu
+
+
+def test_ck_gdn_resolver_handles_missing_and_audits_signatures(monkeypatch):
+    adapter = _adapter("_aiter_ck_gdn")
+    real_import = adapter.importlib.import_module
+
+    def missing(name):
+        if name == "aiter":
+            raise ModuleNotFoundError("missing", name="aiter")
+        return real_import(name)
+
+    monkeypatch.setattr(adapter.importlib, "import_module", missing)
+    assert adapter.resolve_aiter_ck_gdn() is None
+
+    monkeypatch.setattr(adapter.importlib, "import_module", lambda name: _fake_ck_gdn_module())
+    ops = adapter.resolve_aiter_ck_gdn()
+    assert ops.prefill is not None
+    assert ops.workspace_bytes is not None
+
+    bad = _fake_ck_gdn_module()
+    bad.ck_gdn_prefill = lambda q: q
+    monkeypatch.setattr(adapter.importlib, "import_module", lambda name: bad)
+    with pytest.raises(adapter.PatchCompatibilityError, match="incompatible signature"):
+        adapter.resolve_aiter_ck_gdn()
+
+
+def test_ck_gdn_runtime_is_fail_closed_for_strong_decay_nan():
+    adapter = _adapter("_aiter_ck_gdn")
+
+    assert adapter.aiter_ck_runtime_safety_reason() == (
+        "AITER 0.1.7 CK prefill produces non-finite output for legal "
+        "strong-decay inputs"
+    )
+
+
+@pytest.mark.parametrize(("hq", "hv"), ((4, 4), (4, 8), (2, 8)))
+def test_ck_gdn_supported_contract_returns_no_reason(monkeypatch, hq, hv):
+    adapter = _adapter("_aiter_ck_gdn")
+    monkeypatch.setattr(adapter, "requested_backend", lambda stage: "hcu-aiter")
+    assert adapter.aiter_ck_unsupported(*_ck_inputs(hq=hq, hv=hv), capturing=False) is None
+
+
+@pytest.mark.parametrize(
+    ("inputs", "reason"),
+    (
+        (_ck_inputs(hq=2, hv=6), "value/key head ratio 3 is unsupported"),
+        (_ck_inputs(dim=64), "key/value dimensions must both be 128"),
+        (_ck_inputs(dtype=torch.float32), "activations must be fp16 or bf16"),
+    ),
+)
+def test_ck_gdn_rejects_incompatible_inputs(monkeypatch, inputs, reason):
+    adapter = _adapter("_aiter_ck_gdn")
+    monkeypatch.setattr(adapter, "requested_backend", lambda stage: "hcu-aiter")
+    assert adapter.aiter_ck_unsupported(*inputs, capturing=False) == reason
+
+
+def test_ck_gdn_respects_master_provider_and_varlen_graph(monkeypatch):
+    adapter = _adapter("_aiter_ck_gdn")
+    inputs = _ck_inputs(sequences=2)
+    inputs = (*inputs[:-1], torch.tensor([0, 17, 65], dtype=torch.int64))
+    monkeypatch.setattr(adapter, "requested_backend", lambda stage: "hcu-boltops")
+    assert adapter.aiter_ck_unsupported(*inputs, capturing=False) == (
+        "requested provider is hcu-boltops"
+    )
+    monkeypatch.setattr(adapter, "requested_backend", lambda stage: "hcu-aiter")
+    assert adapter.aiter_ck_unsupported(*inputs, capturing=False) is None
+    assert adapter.aiter_ck_unsupported(*inputs, capturing=True) == (
+        "packed variable-length metadata is not graph-safe"
+    )
+
+
+def test_ck_gdn_normalizes_only_fixed_single_sequence_metadata():
+    adapter = _adapter("_aiter_ck_gdn")
+    q, *_, cu = _ck_inputs()
+    assert adapter.aiter_ck_cu_seqlens(q, cu) is None
+    fixed_i32 = cu.to(torch.int32)
+    supported = (*_ck_inputs()[:-1], fixed_i32)
+    assert adapter.aiter_ck_unsupported(
+        *supported, capturing=True
+    ) is None
+    assert adapter.aiter_ck_cu_seqlens(q, fixed_i32) is None
+    varlen = torch.tensor([0, 17, 65], dtype=torch.int64)
+    assert adapter.aiter_ck_cu_seqlens(q, varlen) is varlen
+    packed_i32 = (*_ck_inputs(sequences=2)[:-1], varlen.to(torch.int32))
+    assert adapter.aiter_ck_unsupported(
+        *packed_i32, capturing=False
+    ) == "cu_seqlens must be contiguous int64"
+
+
+def test_ck_gdn_workspace_uses_workspace_manager(monkeypatch):
+    adapter = _adapter("_aiter_ck_gdn")
+    ops = SimpleNamespace(workspace_bytes=lambda *args, **kwargs: 257)
+    backing = torch.empty(512, dtype=torch.uint8)
+    calls = []
+
+    class Manager:
+        def get_simultaneous(self, *specs):
+            calls.append(specs)
+            return [backing[: specs[0][0][0]]]
+
+    monkeypatch.setattr(adapter, "current_workspace_manager", lambda: Manager())
+    q, _, v, *_, cu = _ck_inputs()
+    workspace = adapter.aiter_ck_workspace(ops, q, v, cu, {})
+    assert workspace.dtype == torch.uint8
+    assert workspace.numel() == 257
+    assert workspace.untyped_storage().data_ptr() == backing.untyped_storage().data_ptr()
+    assert calls == [(((257,), torch.uint8),)]
+
+
+def test_ck_gdn_workspace_reuses_lane_and_respects_lock(monkeypatch):
+    from vllm.v1.worker.workspace import WorkspaceManager, use_workspace_lane
+
+    adapter = _adapter("_aiter_ck_gdn")
+    manager = WorkspaceManager(torch.device("cpu"), num_ubatches=1, num_lanes=2)
+    monkeypatch.setattr(adapter, "current_workspace_manager", lambda: manager)
+    q, _, v, *_, cu = _ck_inputs()
+    size = [257]
+    ops = SimpleNamespace(workspace_bytes=lambda *args, **kwargs: size[0])
+
+    with use_workspace_lane(0):
+        first = adapter.aiter_ck_workspace(ops, q, v, cu, {})
+        again = adapter.aiter_ck_workspace(ops, q, v, cu, {})
+    with use_workspace_lane(1):
+        other_lane = adapter.aiter_ck_workspace(ops, q, v, cu, {})
+
+    assert first.untyped_storage().data_ptr() == again.untyped_storage().data_ptr()
+    assert first.untyped_storage().data_ptr() != other_lane.untyped_storage().data_ptr()
+
+    manager.lock()
+    size[0] = 513
+    with use_workspace_lane(0), pytest.raises(AssertionError, match="locked"):
+        adapter.aiter_ck_workspace(ops, q, v, cu, {})
+
+
+def test_ck_gdn_reserves_max_prefill_workspace_per_lane(monkeypatch):
+    adapter = _adapter("_aiter_ck_gdn")
+    monkeypatch.setattr(adapter, "aiter_ck_runtime_safety_reason", lambda: "")
+    layer = SimpleNamespace(
+        num_k_heads=8,
+        num_v_heads=32,
+        tp_size=4,
+        head_k_dim=128,
+        head_v_dim=128,
+        A_log=torch.empty(1),
+    )
+    config = SimpleNamespace(
+        compilation_config=SimpleNamespace(
+            static_forward_context={"layer": layer}
+        ),
+        model_config=SimpleNamespace(dtype=torch.bfloat16),
+    )
+    shapes = []
+    ops = SimpleNamespace(
+        workspace_bytes=lambda q, v, cu, **flags: (
+            shapes.append((q.shape, v.shape, cu, flags)) or 777
+        )
+    )
+    reservations = []
+
+    class Manager:
+        def get_simultaneous(self, *specs):
+            reservations.append(specs)
+            return [torch.empty(specs[0][0], dtype=specs[0][1])]
+
+    lanes = []
+
+    @contextmanager
+    def lane_scope(lane):
+        lanes.append(lane)
+        yield
+
+    monkeypatch.setattr(adapter, "requested_backend", lambda stage: adapter.AITER)
+    monkeypatch.setattr(adapter, "resolve_aiter_ck_gdn", lambda: ops)
+    monkeypatch.setattr(adapter, "current_workspace_manager", lambda: Manager())
+    monkeypatch.setattr(adapter, "use_workspace_lane", lane_scope)
+
+    required = adapter.reserve_aiter_ck_gdn_workspace(config, 8192, (0, 1))
+
+    assert required == 777
+    assert lanes == [0, 1]
+    assert reservations == [
+        (((777,), torch.uint8),),
+        (((777,), torch.uint8),),
+    ]
+    q_shape, v_shape, cu, flags = shapes[0]
+    assert q_shape == (8192, 2, 128)
+    assert v_shape == (8192, 8, 128)
+    assert cu is None
+    assert flags["transpose_state"] is True
+    assert flags["use_exp2"] is False
+
+
+def test_ck_gdn_fail_closed_does_not_reserve_workspace(monkeypatch):
+    adapter = _adapter("_aiter_ck_gdn")
+    monkeypatch.setattr(
+        adapter,
+        "resolve_aiter_ck_gdn",
+        lambda: pytest.fail("disabled CK ABI must not be resolved"),
+    )
+
+    assert adapter.reserve_aiter_ck_gdn_workspace(
+        SimpleNamespace(), 8192, (0, 1)
+    ) == 0
+
+
+def _ck_forward_native(
+    self, q, k, v, g, beta, initial_state, output_final_state,
+    cu_seqlens=None, chunk_indices=None, chunk_offsets=None,
+    use_qk_l2norm_in_kernel=True, core_attn_out=None,
+):
+    del self, q, k, v, g, beta, initial_state, output_final_state
+    del cu_seqlens, chunk_indices, chunk_offsets, use_qk_l2norm_in_kernel
+    del core_attn_out
+    return "official", "state"
+
+
+def _ck_qwen_module():
+    cls = type("ChunkGatedDeltaRule", (), {"forward_native": _ck_forward_native})
+    return _module(
+        "vllm.model_executor.layers.mamba.gdn.qwen_gdn_linear_attn",
+        ChunkGatedDeltaRule=cls,
+        logger=SimpleNamespace(info_once=lambda *args: None, warning_once=lambda *args: None),
+    )
+
+
+def test_ck_gdn_complete_prefill_fails_closed_for_runtime_safety(monkeypatch):
+    patch = _adapter("patch_gdn_ck_prefill")
+    module = _ck_qwen_module()
+    logs = []
+    module.logger.warning_once = lambda *args: logs.append(args)
+    ops = SimpleNamespace(
+        prefill=lambda *args, **kwargs: pytest.fail("unsafe CK must not run")
+    )
+    monkeypatch.setattr(patch, "resolve_aiter_ck_gdn", lambda: ops)
+    patch.apply_to_module(module)
+    q, k, v, g, beta, state, cu = _ck_inputs()
+
+    assert module.ChunkGatedDeltaRule().forward_native(
+        q[None], k[None], v[None], g[None], beta[None], state, True,
+        cu_seqlens=cu, use_qk_l2norm_in_kernel=False,
+    ) == ("official", "state")
+    assert any("non-finite output" in args[1] for args in logs)
+
+
+def test_ck_gdn_fail_closed_skips_optional_abi_resolution(monkeypatch):
+    patch = _adapter("patch_gdn_ck_prefill")
+    module = _ck_qwen_module()
+    monkeypatch.setattr(
+        patch,
+        "resolve_aiter_ck_gdn",
+        lambda: pytest.fail("disabled CK ABI must not be resolved"),
+    )
+
+    patch.apply_to_module(module)
+
+    q, k, v, g, beta, state, cu = _ck_inputs()
+    assert module.ChunkGatedDeltaRule().forward_native(
+        q[None], k[None], v[None], g[None], beta[None], state, True,
+        cu_seqlens=cu, use_qk_l2norm_in_kernel=False,
+    ) == ("official", "state")
+
+
+def test_ck_gdn_complete_prefill_routes_supported_call(monkeypatch):
+    patch = _adapter("patch_gdn_ck_prefill")
+    ck = _adapter("_aiter_ck_gdn")
+    module = _ck_qwen_module()
+    logs = []
+    module.logger.info_once = lambda *args: logs.append(args)
+    calls = []
+    ops = SimpleNamespace(prefill=lambda *args, **kwargs: calls.append((args, kwargs)) or (
+        torch.ones(65, 8, 128, dtype=torch.bfloat16),
+        torch.ones(1, 8, 128, 128, dtype=torch.float32),
+    ))
+    monkeypatch.setattr(patch, "resolve_aiter_ck_gdn", lambda: ops)
+    monkeypatch.setattr(patch, "aiter_ck_runtime_safety_reason", lambda: "")
+    monkeypatch.setattr(ck, "requested_backend", lambda stage: "hcu-aiter")
+    monkeypatch.setattr(patch, "aiter_ck_workspace", lambda *args: torch.empty(257, dtype=torch.uint8))
+    monkeypatch.setattr(torch.cuda, "is_current_stream_capturing", lambda: False)
+    patch.apply_to_module(module)
+    q, k, v, g, beta, state, cu = _ck_inputs()
+    out, final = module.ChunkGatedDeltaRule().forward_native(
+        q[None], k[None], v[None], g[None], beta[None], state, True,
+        cu_seqlens=cu, use_qk_l2norm_in_kernel=False,
+    )
+    assert out.shape == (1, 65, 8, 128)
+    assert final.shape == (1, 8, 128, 128)
+    assert calls[0][1]["cu_seqlens"] is None
+    assert calls[0][1]["use_exp2"] is False
+    assert calls[0][1]["transpose_state"] is True
+    assert any("fused CK prefill" in args[0] for args in logs)
+
+
+def test_ck_gdn_complete_prefill_falls_back_for_ratio_three(monkeypatch):
+    patch = _adapter("patch_gdn_ck_prefill")
+    ck = _adapter("_aiter_ck_gdn")
+    module = _ck_qwen_module()
+    ops = SimpleNamespace(prefill=lambda *args, **kwargs: pytest.fail("CK must not run"))
+    monkeypatch.setattr(patch, "resolve_aiter_ck_gdn", lambda: ops)
+    monkeypatch.setattr(patch, "aiter_ck_runtime_safety_reason", lambda: "")
+    monkeypatch.setattr(ck, "requested_backend", lambda stage: "hcu-aiter")
+    monkeypatch.setattr(torch.cuda, "is_current_stream_capturing", lambda: False)
+    patch.apply_to_module(module)
+    q, k, v, g, beta, state, cu = _ck_inputs(hq=2, hv=6)
+    assert module.ChunkGatedDeltaRule().forward_native(
+        q[None], k[None], v[None], g[None], beta[None], state, True,
+        cu_seqlens=cu, use_qk_l2norm_in_kernel=False,
+    ) == ("official", "state")
+
+
+def test_ck_gdn_complete_prefill_copies_core_output(monkeypatch):
+    patch = _adapter("patch_gdn_ck_prefill")
+    ck = _adapter("_aiter_ck_gdn")
+    module = _ck_qwen_module()
+    expected = torch.arange(65 * 8 * 128, dtype=torch.float32).to(torch.bfloat16).reshape(65, 8, 128)
+    calls = []
+    ops = SimpleNamespace(
+        prefill=lambda *args, **kwargs: calls.append((args, kwargs))
+        or (expected, None)
+    )
+    monkeypatch.setattr(patch, "resolve_aiter_ck_gdn", lambda: ops)
+    monkeypatch.setattr(patch, "aiter_ck_runtime_safety_reason", lambda: "")
+    monkeypatch.setattr(ck, "requested_backend", lambda stage: "hcu-aiter")
+    monkeypatch.setattr(patch, "aiter_ck_workspace", lambda *args: torch.empty(1, dtype=torch.uint8))
+    monkeypatch.setattr(torch.cuda, "is_current_stream_capturing", lambda: False)
+    patch.apply_to_module(module)
+    q, k, v, g, beta, state, cu = _ck_inputs()
+    backing = torch.empty_like(expected)
+    out, final = module.ChunkGatedDeltaRule().forward_native(
+        q[None], k[None], v[None], g[None], beta[None], state, False,
+        cu_seqlens=cu, use_qk_l2norm_in_kernel=False,
+        core_attn_out=backing,
+    )
+    assert torch.equal(backing, expected)
+    assert torch.equal(out[0], expected)
+    assert final is None
+    assert calls[0][1]["output_final_state"] is True
+
+
+def test_ck_gdn_complete_prefill_varlen_graph_falls_back(monkeypatch):
+    patch = _adapter("patch_gdn_ck_prefill")
+    ck = _adapter("_aiter_ck_gdn")
+    module = _ck_qwen_module()
+    ops = SimpleNamespace(prefill=lambda *args, **kwargs: pytest.fail("CK must not run"))
+    monkeypatch.setattr(patch, "resolve_aiter_ck_gdn", lambda: ops)
+    monkeypatch.setattr(patch, "aiter_ck_runtime_safety_reason", lambda: "")
+    monkeypatch.setattr(ck, "requested_backend", lambda stage: "hcu-aiter")
+    monkeypatch.setattr(torch.cuda, "is_current_stream_capturing", lambda: True)
+    patch.apply_to_module(module)
+    q, k, v, g, beta, _, _ = _ck_inputs()
+    state = torch.empty(2, 8, 128, 128, dtype=torch.float32)
+    cu = torch.tensor([0, 17, 65], dtype=torch.int64)
+    assert module.ChunkGatedDeltaRule().forward_native(
+        q[None], k[None], v[None], g[None], beta[None], state, True,
+        cu_seqlens=cu, use_qk_l2norm_in_kernel=False,
+    ) == ("official", "state")
+
+
+def test_ck_gdn_complete_prefill_propagates_provider_failure(monkeypatch):
+    patch = _adapter("patch_gdn_ck_prefill")
+    ck = _adapter("_aiter_ck_gdn")
+    module = _ck_qwen_module()
+
+    def failed(*args, **kwargs):
+        raise RuntimeError("native CK launch failed")
+
+    monkeypatch.setattr(patch, "resolve_aiter_ck_gdn", lambda: SimpleNamespace(prefill=failed))
+    monkeypatch.setattr(patch, "aiter_ck_runtime_safety_reason", lambda: "")
+    monkeypatch.setattr(ck, "requested_backend", lambda stage: "hcu-aiter")
+    monkeypatch.setattr(patch, "aiter_ck_workspace", lambda *args: torch.empty(1, dtype=torch.uint8))
+    monkeypatch.setattr(torch.cuda, "is_current_stream_capturing", lambda: False)
+    patch.apply_to_module(module)
+    q, k, v, g, beta, state, cu = _ck_inputs()
+    with pytest.raises(RuntimeError, match="native CK launch failed"):
+        module.ChunkGatedDeltaRule().forward_native(
+            q[None], k[None], v[None], g[None], beta[None], state, True,
+            cu_seqlens=cu, use_qk_l2norm_in_kernel=False,
+        )
 
 
 def _import_hcu_sparse_indexer_without_custom_op_registration(
