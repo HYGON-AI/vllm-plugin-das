@@ -59,6 +59,11 @@ def _worker(
     worker.tp_size = 2
     worker.finished_recving_reqs = set()
     worker._pp_layer_range = None
+    worker.pcp_size = 1
+    worker.pcp_rank = 0
+    worker.dsa_layer_split_enabled = False
+    worker._pcp_dummy_sender = False
+    worker._remote_pcp_info = {}
     return worker
 
 
@@ -1353,6 +1358,7 @@ def constructed_mooncake_workers(mooncake, monkeypatch):
 
     monkeypatch.setattr(mooncake, "TransferEngine", Engine)
     monkeypatch.setattr(mooncake, "MooncakeBootstrapServer", Bootstrap)
+    monkeypatch.setattr(mooncake, "HCUMooncakeBootstrapServer", Bootstrap)
     workers = []
 
     def make(*, role="kv_producer", pp_size=1, pp_rank=0, pcp_size=4):
@@ -1407,3 +1413,167 @@ def test_mooncake_worker_constructs_stage_range_from_pp_group(
     make, _, _ = constructed_mooncake_workers
     worker = make(role="kv_consumer", pp_size=2, pp_rank=1, pcp_size=1)
     assert worker._pp_layer_range == (41, 78)
+
+
+# ---- DSA cache layer split over PD transfer (SGLang #29421) ----------------
+
+
+def test_layer_split_registration_skips_non_owned_layers(mooncake):
+    worker = _worker(mooncake, blocks_first=True)
+    worker.pcp_size = 4
+    worker.pcp_rank = 1
+    worker.dsa_layer_split_enabled = True
+    worker._dsa_total_layers = 8
+    worker._dsa_owned_layer_range = (2, 4)
+    caches = {}
+    for idx in range(8):
+        name = f"model.layers.{idx}.self_attn"
+        caches[name] = torch.zeros((2, 2, 1, 2, 2), dtype=torch.float16)
+        worker._layer_specs[name] = object()
+        worker._layer_group_indices[name] = 0
+
+    worker.register_kv_caches(caches)
+
+    assert worker.registered_layer_indices == [2, 3]
+
+
+def test_layer_split_last_rank_carries_mtp_layers(mooncake):
+    worker = _worker(mooncake, blocks_first=True)
+    worker.pcp_size = 4
+    worker.pcp_rank = 3
+    worker.dsa_layer_split_enabled = True
+    worker._dsa_total_layers = 8
+    worker._dsa_owned_layer_range = (6, 8)
+    caches = {}
+    for idx in (5, 6, 7, 8):  # layer 8 is the MTP layer
+        name = f"model.layers.{idx}.self_attn"
+        caches[name] = torch.zeros((2, 2, 1, 2, 2), dtype=torch.float16)
+        worker._layer_specs[name] = object()
+        worker._layer_group_indices[name] = 0
+
+    worker.register_kv_caches(caches)
+
+    assert worker.registered_layer_indices == [6, 7, 8]
+    # A non-last rank must not transfer the MTP layer.
+    assert worker._dsa_owns_layer(8)
+    worker.pcp_rank = 0
+    assert not worker._dsa_owns_layer(8)
+
+
+def _receive_kv_calls(mooncake, worker, engine_id):
+    calls = []
+
+    async def receive(worker_addr, pull_metas):
+        calls.append(worker_addr)
+
+    worker.receive_kv_from_single_worker = receive
+    pull_meta = SimpleNamespace(pull_tasks_count=0)
+
+    async def run():
+        worker.receive_kv(engine_id, {"request": pull_meta})
+        await asyncio.sleep(0)
+
+    asyncio.run(run())
+    return calls, pull_meta
+
+
+def test_receive_kv_pulls_every_pcp_rank_under_layer_split(mooncake):
+    worker = _worker(mooncake, blocks_first=True)
+    worker.pp_size = 1
+    worker.pp_rank = 0
+    worker._tp_size = {"engine": 1}
+    worker._remote_pcp_info = {"engine": (4, True)}
+    worker._remote_agents = {
+        "engine": {rank: {0: f"vtp{rank}-pp0"} for rank in range(4)}
+    }
+    worker.transfer_topo.handshake_target_ranks = lambda remote_tp_size: [0]
+
+    calls, pull_meta = _receive_kv_calls(mooncake, worker, "engine")
+
+    assert calls == ["vtp0-pp0", "vtp1-pp0", "vtp2-pp0", "vtp3-pp0"]
+    assert pull_meta.pull_tasks_count == 4
+
+
+def test_receive_kv_pulls_rank0_only_without_layer_split(mooncake):
+    worker = _worker(mooncake, blocks_first=True)
+    worker.pp_size = 1
+    worker.pp_rank = 0
+    worker._tp_size = {"engine": 1}
+    worker._remote_pcp_info = {"engine": (4, False)}
+    worker._remote_agents = {
+        "engine": {rank: {0: f"vtp{rank}-pp0"} for rank in range(4)}
+    }
+    worker.transfer_topo.handshake_target_ranks = lambda remote_tp_size: [0]
+
+    calls, pull_meta = _receive_kv_calls(mooncake, worker, "engine")
+
+    assert calls == ["vtp0-pp0"]
+    assert pull_meta.pull_tasks_count == 1
+
+
+def test_bootstrap_payload_carries_pcp_topology(mooncake):
+    payload = mooncake.HCURegisterWorkerPayload(
+        engine_id="e",
+        dp_rank=0,
+        tp_rank=5,
+        pp_rank=0,
+        addr="tcp://127.0.0.1:1",
+        pcp_size=8,
+        enable_dsa_cache_layer_split=True,
+    )
+    dumped = payload.model_dump()
+    assert dumped["pcp_size"] == 8
+    assert dumped["enable_dsa_cache_layer_split"] is True
+    # Defaults keep non-PCP producers wire-compatible.
+    bare = mooncake.HCURegisterWorkerPayload(
+        engine_id="e", dp_rank=0, tp_rank=0, pp_rank=0, addr="tcp://127.0.0.1:1",
+    )
+    assert bare.pcp_size == 1
+    assert bare.enable_dsa_cache_layer_split is False
+
+
+def test_bootstrap_query_recovers_real_tp_size(mooncake):
+    worker = _worker(mooncake, blocks_first=True)
+    worker._remote_agents = {}
+    worker._tp_size = {}
+    worker._remote_pcp_info = {}
+    worker._pending_bootstrap_queries = {
+        "http://p:8998": asyncio.Event(),
+    }
+
+    class _Resp:
+        def raise_for_status(self):
+            pass
+
+        def json(self):
+            return {
+                "0": {
+                    "engine_id": "engine",
+                    "pcp_size": 4,
+                    "enable_dsa_cache_layer_split": True,
+                    "worker_addr": {
+                        str(rank): {"0": f"vtp{rank}"} for rank in range(8)
+                    },
+                }
+            }
+
+    class _Client:
+        async def __aenter__(self):
+            return self
+
+        async def __aexit__(self, *args):
+            return False
+
+        async def get(self, url):
+            return _Resp()
+
+    orig_client = mooncake.httpx.AsyncClient
+    mooncake.httpx.AsyncClient = _Client
+    try:
+        asyncio.run(worker._connect_to_prefiller_bootstrap("http://p:8998"))
+    finally:
+        mooncake.httpx.AsyncClient = orig_client
+
+    assert worker._tp_size["engine"] == 2  # 8 virtual ranks / pcp_size 4
+    assert worker._remote_pcp_info["engine"] == (4, True)
+    assert set(worker._remote_agents["engine"]) == set(range(8))

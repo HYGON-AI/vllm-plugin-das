@@ -16,6 +16,7 @@ from vllm_hcu.patch.kimi_k3_callbacks import register_kimi_k3_callbacks
 
 from .core_fix import register_platform_core_callbacks
 from .framework_opt import (
+    patch_dsa_layer_split_kv_config,
     patch_engine_core,
     patch_distributed_utils,
     patch_kv_cache_coordinator,
@@ -50,6 +51,7 @@ _ORDERED_FRAMEWORK_ADAPTERS = (
     patch_kv_connector_factory,
     patch_parallel_state,
     patch_pcp_kv_cache_utils,
+    patch_dsa_layer_split_kv_config,
     patch_pcp_kv_cache_interface,
     patch_pcp_single_type_kv_cache_manager,
     patch_pcp_kv_cache_coordinator,

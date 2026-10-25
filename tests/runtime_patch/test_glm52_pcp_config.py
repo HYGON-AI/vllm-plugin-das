@@ -50,6 +50,7 @@ def _make_pcp_config(**overrides: object) -> object:
         model_config=SimpleNamespace(
             architectures=[architecture],
             use_mla=use_mla,
+            hf_config=SimpleNamespace(index_topk=64),
             enforce_eager=enforce_eager,
             is_multimodal_model=multimodal,
             is_hybrid=hybrid,
@@ -317,6 +318,24 @@ def test_hyv4_pd_allows_only_mooncake_producer_pcp(make_pcp_config, pcp, tp):
     assert patch_vllm_config._validate_hcu_pcp_scope(config) is True
 
 
+@pytest.mark.parametrize(
+    "architecture",
+    [
+        "GlmMoeDsaForCausalLM",
+        "DeepseekV3ForCausalLM",
+        "DeepseekV32ForCausalLM",
+    ],
+)
+def test_dsa_mla_pd_allows_mooncake_producer_pcp(make_pcp_config, architecture):
+    config = make_pcp_config(architecture=architecture, pcp=4, tp=1)
+    config.kv_transfer_config = KVTransferConfig(
+        kv_connector="MooncakeConnector",
+        kv_role="kv_producer",
+        kv_buffer_device="cpu",
+    )
+    assert patch_vllm_config._validate_hcu_pcp_scope(config) is True
+
+
 @pytest.mark.parametrize("role", ["kv_consumer", "kv_both", None, "prefill"])
 def test_hyv4_pd_rejects_nonproducer_pcp(make_pcp_config, role):
     config = make_pcp_config(architecture="HYV4ForCausalLM")
@@ -382,6 +401,27 @@ def test_hyv4_pcp_rejects_incomplete_pd_configuration(
 ) -> None:
     config = make_hyv4_pp2_pcp4_config(pp=pp)
     config.kv_transfer_config = SimpleNamespace(kv_connector=None)
+    with pytest.raises(ValueError, match="P/D disaggregation"):
+        patch_vllm_config._validate_hcu_pcp_scope(config)
+
+
+@pytest.mark.parametrize(
+    "architecture",
+    [
+        "GlmMoeDsaForCausalLM",
+        "DeepseekV3ForCausalLM",
+        "DeepseekV32ForCausalLM",
+    ],
+)
+def test_dsa_mla_pcp_rejects_producer_without_connector(
+    make_pcp_config, architecture,
+) -> None:
+    config = make_pcp_config(architecture=architecture, pcp=4, tp=1)
+    config.kv_transfer_config = SimpleNamespace(
+        kv_connector=None,
+        kv_role="kv_producer",
+        kv_connector_module_path=None,
+    )
     with pytest.raises(ValueError, match="P/D disaggregation"):
         patch_vllm_config._validate_hcu_pcp_scope(config)
 
@@ -573,7 +613,7 @@ def test_gqa_pcp_rejects_hybrid_kv_cache_groups(make_pcp_config) -> None:
     ("override", "message"),
     [
         ({"use_v2": False}, "Model Runner V2"),
-        ({"architecture": "DeepseekV2ForCausalLM"}, "GLM-5.2"),
+        ({"architecture": "DeepseekV2ForCausalLM"}, "HCU MLA PCP"),
         ({"use_mla": False}, "MLA"),
         ({"pp": 2}, "pipeline parallel"),
         ({"dcp": 2}, "decode context parallel"),
