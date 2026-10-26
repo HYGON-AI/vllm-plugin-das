@@ -819,7 +819,14 @@ class FusedMoEExpertsModular(FusedMoEExperts):
         require a specialized implementation, like MarlinExperts, they are free
         to override this function.
         """
-        if w1.dim() == 6:
+        if w1.dim() == 7:
+            assert w2.dim() == 7 and w1.size(0) == w2.size(0)
+            E = w1.size(0)
+            # gfx938 pair32: [E, K/64, N/32, 2, 4, 16, 16].
+            N = w1.size(2) * w1.size(3) * w1.size(5)
+            K = w1.size(1) * w1.size(4) * w1.size(6)
+            assert w2.size(2) * w2.size(3) * w2.size(5) == K
+        elif w1.dim() == 6:
             assert w2.dim() == 6
             E = w1.size(0)
             # HCU FP8 DeepEP packed layout: [E, K/64, N/16, 4, 16, 16].

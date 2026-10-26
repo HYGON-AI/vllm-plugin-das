@@ -37,7 +37,10 @@ from hcu_ci_preflight import (  # noqa: E402
     _check_requirements,
     _version_specification,
 )
-from run_hcu_ci_job import _export_resolved_resource_environment  # noqa: E402
+from run_hcu_ci_job import (  # noqa: E402
+    _export_resolved_resource_environment,
+    _pid_cgroup_snapshot,
+)
 from build_hcu_matrix import MatrixError, build_matrix  # noqa: E402
 from compile_changed_python import _compile as compile_python_file  # noqa: E402
 from compile_changed_python import main as compile_changed_python_main  # noqa: E402
@@ -190,7 +193,7 @@ def test_nightly_matrix_explicitly_covers_extended_models_and_topology() -> None
     }.issubset(registry_jobs)
 
 
-def test_kimi_k25_humaneval_routes_to_eight_card_evalscope_job() -> None:
+def test_kimi_k25_keeps_configuration_but_is_not_scheduled() -> None:
     config = _config()
     job = config["jobs"]["kimi-k25-humaneval"]
     assert job == {
@@ -212,7 +215,13 @@ def test_kimi_k25_humaneval_routes_to_eight_card_evalscope_job() -> None:
                 "env": "VLLM_HCU_KIMI_K25_MODEL",
                 "relative": "Kimi-K2.5",
             },
+            {
+                "kind": "dataset",
+                "env": "VLLM_HCU_HUMANEVAL_DATASET",
+                "relative": "humaneval",
+            },
         ],
+        "isolate_generated_code": True,
     }
 
     target = (
@@ -223,10 +232,11 @@ def test_kimi_k25_humaneval_routes_to_eight_card_evalscope_job() -> None:
         registration.job == "kimi-k25-humaneval"
         and registration.target == target
         and registration.est_time == 14400
-        and registration.disabled is None
+        and registration.disabled is not None
+        and "startup" in registration.disabled
         for registration in parse_registry()
     )
-    assert "kimi-k25-humaneval" in {
+    assert "kimi-k25-humaneval" not in {
         item["registry_job"] for item in build_matrix(config, profile="nightly")
     }
 
@@ -234,7 +244,7 @@ def test_kimi_k25_humaneval_routes_to_eight_card_evalscope_job() -> None:
         config,
         ["tests/models/kimi_k25_humaneval_evalscope.yaml"],
     )
-    assert {item["registry_job"] for item in jobs} == {"kimi-k25-humaneval"}
+    assert jobs == []
     assert groups == ["kimi-k25-evalscope"]
     assert fallback is False
 
@@ -566,6 +576,24 @@ def test_v0281_runner_lock_matches_audited_runtime(
                 torch_hip="6.3.26113",
             )
 
+    with monkeypatch.context() as unsupported_python:
+        unsupported_python.setattr(
+            "hcu_ci_preflight.platform.python_version", lambda: "3.11.12"
+        )
+        with pytest.raises(PreflightError, match="runner Python drift"):
+            _check_environment_lock(
+                lock_path, versions=versions, torch_hip="6.3.26113"
+            )
+    with pytest.raises(PreflightError, match="runner torch HIP drift"):
+        _check_environment_lock(
+            lock_path, versions=versions, torch_hip="6.4.0"
+        )
+    version_file.write_text("27.01\n", encoding="utf-8")
+    with pytest.raises(PreflightError, match="DTK/ROCm drift"):
+        _check_environment_lock(
+            lock_path, versions=versions, torch_hip="6.3.26113"
+        )
+
 
 @pytest.fixture
 def dtk_environment_lock(
@@ -581,6 +609,7 @@ def dtk_environment_lock(
     lock["rocm"].pop("versions", None)
     lock["rocm"].update({"match": "release_line", "version": "26.04"})
     lock["python"] = "3.10.12"
+    lock["torch_hip"] = {"match": "prefix", "version": "6.3."}
     runtime_root = tmp_path / "dtk"
     version_file = runtime_root / lock["rocm"]["version_file"]
     version_file.parent.mkdir(parents=True)
@@ -1232,6 +1261,28 @@ def test_deepseek_runtime_change_selects_deepseek_jobs() -> None:
     assert fallback is False
 
 
+def test_gpu_memory_helper_selects_all_enabled_model_jobs() -> None:
+    config = _config()
+    selected, groups, fallback = select_jobs(
+        config, ["tests/integration/gpu_memory.py"],
+    )
+    selected_jobs = {job["registry_job"] for job in selected}
+    expected = {
+        job_id for job_id, job in config["jobs"].items()
+        if (job["suite"] == "model" or job_id == "integration-smoke-gfx938")
+        and job_id in _enabled_registry_jobs()
+    }
+    assert selected_jobs == expected
+    assert groups == ["gpu-memory-helper"]
+    assert fallback is False
+    assert selected_jobs.isdisjoint({
+        "qwen38-flash-next-humaneval",
+        "qwen38-flash-next-int8-pp2-tp4-humaneval",
+        "glm53-flash-channel-fp8-humaneval",
+        "kimi-k25-humaneval",
+    })
+
+
 def test_model_runtime_change_selects_text_vl_and_pooling_models() -> None:
     jobs, groups, fallback = select_jobs(
         _config(),
@@ -1296,10 +1347,17 @@ def test_kernel_accuracy_change_runs_both_supported_architectures() -> None:
     assert fallback is False
 
 
-def test_hcu_container_script_change_selects_ci_smoke() -> None:
+@pytest.mark.parametrize(
+    "changed_path",
+    [
+        "scripts/ci/hcu/hcu_ci_start_container.sh",
+        ".github/configs/hcu-test-map.json",
+    ],
+)
+def test_ci_preparation_change_selects_ci_smoke(changed_path: str) -> None:
     jobs, groups, fallback = select_jobs(
         _config(),
-        ["scripts/ci/hcu/hcu_ci_start_container.sh"],
+        [changed_path],
     )
     assert {job["registry_job"] for job in jobs} == {
         "accuracy-gfx936",
@@ -1477,3 +1535,105 @@ def test_preflight_hides_device_inspection_details(
 
     assert error.value.__suppress_context__ is True
     assert private_link_name not in str(error.value)
+
+
+def test_dataset_preflight_searches_dataset_roots(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    roots = [tmp_path / "public", tmp_path / "parastor"]
+    source = roots[1] / "gsm8k/main"
+    source.mkdir(parents=True)
+    (source / "test-00000-of-00001.parquet").write_bytes(b"parquet")
+    monkeypatch.setenv("VLLM_HCU_TEST_DATASET_ROOTS", os.pathsep.join(map(str, roots)))
+    monkeypatch.delenv("VLLM_HCU_GSM8K_DATASET", raising=False)
+    requirement = {"kind": "dataset", "env": "VLLM_HCU_GSM8K_DATASET", "relative": "gsm8k"}
+    assert _check_requirements([requirement], tmp_path / "models") == [
+        {"env": requirement["env"], "kind": "dataset", "path": str(source.parent)}
+    ]
+
+
+def test_dataset_preflight_rejects_empty_directory(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    source = tmp_path / "gsm8k"
+    source.mkdir()
+    monkeypatch.setenv("VLLM_HCU_TEST_DATASET_ROOT", str(tmp_path))
+    monkeypatch.delenv("VLLM_HCU_TEST_DATASET_ROOTS", raising=False)
+    monkeypatch.delenv("VLLM_HCU_GSM8K_DATASET", raising=False)
+    with pytest.raises(PreflightError, match="local dataset is unavailable"):
+        _check_requirements(
+            [{"kind": "dataset", "env": "VLLM_HCU_GSM8K_DATASET", "relative": "gsm8k"}], None
+        )
+
+
+def test_humaneval_jobs_request_isolated_containers() -> None:
+    human_jobs = [
+        job for name, job in _config()["jobs"].items() if "humaneval" in name
+    ]
+    assert human_jobs
+    assert all(job["isolate_generated_code"] is True for job in human_jobs)
+    assert all(
+        any(item.get("env") == "VLLM_HCU_HUMANEVAL_DATASET" for item in job["requirements"])
+        for job in human_jobs
+    )
+
+
+def test_temporarily_disabled_model_jobs_are_not_scheduled() -> None:
+    disabled_jobs = {
+        "kimi-k25-humaneval",
+        "qwen38-flash-next-humaneval",
+        "qwen38-flash-next-int8-pp2-tp4-humaneval",
+        "glm53-flash-channel-fp8-humaneval",
+    }
+    config = _config()
+    registrations = parse_registry()
+    for job in disabled_jobs:
+        entries = [entry for entry in registrations if entry.job == job]
+        assert entries
+        assert all(entry.disabled and "temporarily disabled" in entry.disabled for entry in entries)
+    nightly = build_matrix(config, profile="nightly")
+    assert disabled_jobs.isdisjoint({job["registry_job"] for job in nightly})
+    selected, _, _ = select_jobs(config, ["tests/integration/server/evalscope_server.py"])
+    assert disabled_jobs.isdisjoint({job["registry_job"] for job in selected})
+    assert "kimi-k25-humaneval" not in {job["registry_job"] for job in selected}
+
+
+@pytest.mark.parametrize("version", ["v1", "v2"])
+def test_pid_controller_snapshot_records_thread_limits_and_events(tmp_path: Path, version: str) -> None:
+    missing = tmp_path / "unavailable"
+    root = tmp_path / version
+    root.mkdir()
+    for name, value in {
+        "pids.max": "8192", "pids.current": "2305", "pids.events": "max 0"
+    }.items():
+        (root / name).write_text(value + "\n")
+    if version == "v2":
+        (root / "pids.peak").write_text("2306\n")
+    actual = _pid_cgroup_snapshot((missing, root))
+    assert actual == {
+        "path": str(root), "pids.max": "8192", "pids.current": "2305",
+        "pids.events": "max 0", "pids.peak": "2306" if version == "v2" else None,
+    }
+
+
+def test_pid_controller_snapshot_handles_missing_controller(tmp_path: Path) -> None:
+    assert _pid_cgroup_snapshot((tmp_path,)) == {"path": None}
+
+
+@pytest.mark.parametrize("value", ["0", "-1", "not-a-number", "8192; echo invalid"])
+def test_ci_container_rejects_invalid_pid_limit_before_docker(
+    tmp_path: Path, value: str
+) -> None:
+    env = os.environ.copy()
+    env.update(
+        HCU_CI_IMAGE="example.invalid/vllm@sha256:" + "0" * 64,
+        HCU_CI_CONTAINER_NAME="ci-pids-validation",
+        GITHUB_WORKSPACE=str(tmp_path),
+        HCU_CI_PIDS_LIMIT=value,
+    )
+    result = subprocess.run(
+        ["bash", str(REPOSITORY / "scripts/ci/hcu/hcu_ci_start_container.sh")],
+        env=env, text=True, capture_output=True,
+    )
+    assert result.returncode == 2
+    assert "HCU_CI_PIDS_LIMIT must be a positive integer" in result.stderr

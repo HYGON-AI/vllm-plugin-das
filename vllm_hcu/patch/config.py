@@ -24,6 +24,7 @@ _FEATURE_FIELDS = (
     "deepep_auto",
     "fused_qwen3_rms_rope",
     "qwen4_exp_hc_sp",
+    "k3_sp_moe",
     "dp_int8_allgather",
     "moe_backend",
     "hcu_flash_attn_mode",
@@ -44,6 +45,7 @@ _BOOLEAN_FIELDS = (
     "deepep_auto",
     "fused_qwen3_rms_rope",
     "qwen4_exp_hc_sp",
+    "k3_sp_moe",
     "dp_int8_allgather",
 )
 _SUPPORTED_MOE_BACKENDS = frozenset({"auto", "deep_gemm"})
@@ -107,6 +109,12 @@ class HcuFeatureConfig:
     # Qwen4Exp HC sequence parallelism (VLLM_HCU_QWEN4_EXP_HC_SP), resolved
     # the same way: it changes the traced graph, so it must partition caches.
     qwen4_exp_hc_sp: bool = True
+    # Effective opt-in policy for Kimi-K3 SP-MoE row sharding
+    # (VLLM_HCU_K3_SP_MOE). Persisted because the SP forward mutates the
+    # traced decoder layer (o_proj reduce_results plus the hcu_k3_sp_*
+    # collectives): opposite-mode restarts sharing a persistent compilation
+    # cache would load the other mode's no-guard AOT graph.
+    k3_sp_moe: bool = False
     # Effective opt-in policy for INT8 hidden-state transport in the naive
     # DP/EP AllGatherv dispatch path. Persisted because spawned workers do not
     # inherit arbitrary VLLM_HCU_* variables from the API process.

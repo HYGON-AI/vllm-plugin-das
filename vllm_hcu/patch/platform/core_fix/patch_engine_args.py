@@ -673,6 +673,7 @@ def apply_to_module(module: ModuleType) -> bool:
             if name in (
                 "fused_qwen3_rms_rope",
                 "qwen4_exp_hc_sp",
+                "k3_sp_moe",
                 "dp_int8_allgather",
             ) or (
                 name == "hcu_flash_attn_mode" and expected is None

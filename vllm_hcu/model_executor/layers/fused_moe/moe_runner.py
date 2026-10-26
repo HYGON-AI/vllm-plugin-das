@@ -472,6 +472,7 @@ class MoERunner(MoERunnerInterface):
         # conditions (custom AR availability, size) are checked in the op.
         self._ep_fused_combine = (
             _EP_FUSED_COMBINE
+            and not getattr(self._quant_method, "hcu_owns_dispatch", False)
             and shared_experts is not None
             and moe_config.dp_size > 1
             and moe_config.pcp_size == 1
@@ -607,6 +608,8 @@ class MoERunner(MoERunnerInterface):
 
     @property
     def _fused_output_is_reduced(self) -> bool:
+        if getattr(self._quant_method, "hcu_output_is_reduced", False):
+            return True
         return (
             self._quant_method.moe_kernel is not None
             and self._quant_method.moe_kernel.output_is_reduced()
@@ -1158,6 +1161,8 @@ class MoERunner(MoERunnerInterface):
 
     @property
     def do_naive_dispatch_combine(self) -> bool:
+        if getattr(self._quant_method, "hcu_owns_dispatch", False):
+            return False
         return (
             self.moe_config.dp_size > 1 or self.moe_config.is_sequence_parallel
         ) and not self._quant_method.supports_internal_mk
@@ -1192,6 +1197,9 @@ class MoERunner(MoERunnerInterface):
         hidden_states: torch.Tensor,
         router_logits: torch.Tensor | None,
     ) -> tuple[torch.Tensor, torch.Tensor | None]:
+        if getattr(self._quant_method, "hcu_owns_dispatch", False):
+            # MegaMoE addresses the complete TP/DP/PCP expert group itself.
+            return hidden_states, router_logits
         # For naive dispatch/combine Dp/Ep, dispatch the hidden states and
         # router logits to all experts.
         # NOTE: this will be removed once all kernels are migrated into the
@@ -1218,6 +1226,7 @@ class MoERunner(MoERunnerInterface):
         needs_fallback_pcp_collective = (
             self.moe_config.pcp_size > 1
             and not self.moe_config.moe_parallel_config.use_all2all_kernels
+            and not getattr(self._quant_method, "hcu_owns_dispatch", False)
         )
         if needs_fallback_pcp_collective:
             hidden_states = get_pcp_group().all_gather(
@@ -1237,6 +1246,7 @@ class MoERunner(MoERunnerInterface):
         if not (
             self.moe_config.pcp_size > 1
             and not self.moe_config.moe_parallel_config.use_all2all_kernels
+            and not getattr(self._quant_method, "hcu_owns_dispatch", False)
         ):
             yield input_ids
             return
@@ -1295,6 +1305,7 @@ class MoERunner(MoERunnerInterface):
         needs_fallback_pcp_collective = (
             self.moe_config.pcp_size > 1
             and not self.moe_config.moe_parallel_config.use_all2all_kernels
+            and not getattr(self._quant_method, "hcu_owns_dispatch", False)
         )
         if needs_fallback_pcp_collective:
             hidden_states = get_pcp_group().reduce_scatter(
@@ -1470,6 +1481,7 @@ class MoERunner(MoERunnerInterface):
         # we create the MK during process_weights_after_loading.
         if (
             self.routed_experts.quant_method.supports_internal_mk
+            or getattr(self.routed_experts.quant_method, "hcu_owns_dispatch", False)
             or self.routed_experts.quant_method.is_monolithic
         ):
             return None
