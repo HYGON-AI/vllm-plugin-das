@@ -117,6 +117,27 @@ def test_direct_reader_matches_token_order_oracle(
 
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="requires HCU GPU")
 @pytest.mark.parametrize("per_query", [False, True])
+def test_skip_tail_preserves_every_valid_row_prefix(per_query):
+    """Dirty tails are safe only when every row prefix remains exact."""
+    args, expected = _case(32, 73, 2, 3, per_query)
+    actual = gfx938_fp8_paged_mqa_logits(*args, fill_tail=False)
+    q, _, _, context, _, max_len = args
+    next_n = q.shape[1]
+    if per_query:
+        row_ends = context.reshape(-1)
+    else:
+        offsets = torch.arange(next_n, device=context.device)
+        row_ends = (context[:, None] - next_n + 1 + offsets).reshape(-1)
+    valid = torch.arange(max_len, device=actual.device)[None, :] < row_ends[:, None]
+    assert torch.equal(
+        torch.isneginf(actual[valid]), torch.isneginf(expected[valid])
+    )
+    finite = valid & torch.isfinite(expected)
+    torch.testing.assert_close(actual[finite], expected[finite], rtol=1e-3, atol=1e-2)
+
+
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="requires HCU GPU")
+@pytest.mark.parametrize("per_query", [False, True])
 def test_non_power_of_two_heads_and_dim_with_int64_metadata(per_query):
     """Tail lanes and 64-bit page indices must preserve oracle logits."""
     args, expected = _case(
