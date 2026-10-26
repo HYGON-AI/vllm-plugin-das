@@ -10,6 +10,7 @@ from __future__ import annotations
 import functools
 import importlib
 import logging
+import os
 from dataclasses import dataclass
 from typing import Callable
 
@@ -180,6 +181,32 @@ def pre(residual, fn, hc_scale, hc_base, rms_eps, hc_pre_eps,
                        hc_sinkhorn_eps, hc_post_mult_value, sinkhorn_repeat)
 
 
+def _delayed_pre_splits(tokens: int, hc: int, hidden: int, mode: str) -> int:
+    """Select delayed-Pre split-K without changing ordinary Pre defaults.
+
+    K is hc * hidden even for first-layer x: _staged_pre expands x and fn
+    to that width. Auto falls back to 1 outside the validated small V4.1
+    layout or if the HIP K constraints fail; explicit overrides fail loudly.
+    """
+    if mode not in ("auto", "1", "2", "4", "8", "16", "32"):
+        raise ValueError(
+            f"Invalid VLLM_HCU_MHC_PRE_SPLIT_K={mode!r}; "
+            "expected auto or one of 1, 2, 4, 8, 16, 32"
+        )
+    n_splits = (
+        32 if hc == 4 and hidden == 5120 and 0 < tokens <= 64 else 1
+    ) if mode == "auto" else int(mode)
+    width = hc * hidden
+    if width % (64 * n_splits) or width // n_splits < 2 * 64:
+        if mode == "auto":
+            return 1
+        raise ValueError(
+            f"VLLM_HCU_MHC_PRE_SPLIT_K={mode!r} is invalid for K={width}: "
+            "K must be divisible by 64 * split-K and K / split-K must be >= 128"
+        )
+    return n_splits
+
+
 def delayed_pre(
     residual: torch.Tensor,
     fn: torch.Tensor,
@@ -195,12 +222,21 @@ def delayed_pre(
 ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
     if residual.shape[0] == 0:
         return _empty_pre(residual)
-    # Conservative HCU layout; do not depend on gfx95-only AITER tuning helpers.
+    # Tune only delayed Pre; do not depend on gfx95-only AITER tuning helpers.
+    tokens, hc, hidden = residual.shape
+    n_splits = _delayed_pre_splits(
+        tokens, hc, hidden, henvs.VLLM_HCU_MHC_PRE_SPLIT_K,
+    )
+    if os.environ.get("VLLM_HCU_MHC_PRE_SPLIT_K_TRACE"):
+        logger.warning(
+            "MHC_SPLITK_TRACE tokens=%d hc=%d hidden=%d mode=%s n_splits=%d",
+            tokens, hc, hidden, henvs.VLLM_HCU_MHC_PRE_SPLIT_K, n_splits,
+        )
     post, comb, _, gemm, sqrsum = _staged_pre(
         residual, fn, hc_scale, hc_base, rms_eps, hc_pre_eps,
-        hc_sinkhorn_eps, hc_post_mult_value, sinkhorn_repeat, x=x,
+        hc_sinkhorn_eps, hc_post_mult_value, sinkhorn_repeat,
+        n_splits=n_splits, x=x,
     )
-    hc, hidden = residual.shape[1:]
     next_pre = torch.ops.vllm.mhc_pre_mix_triton(
         gemm, sqrsum, hc_scale, hc_base, hc, hc * hidden, rms_eps, hc_pre_eps,
     )

@@ -49,6 +49,7 @@ if TYPE_CHECKING:
     VLLM_HCU_USE_AITER_MHC: bool = True
     VLLM_HCU_USE_AITER_MHC_POST: bool = True
     VLLM_HCU_USE_AITER_MHC_PRE: bool = True
+    VLLM_HCU_MHC_PRE_SPLIT_K: str = "auto"
     VLLM_HCU_USE_AITER_TILELANG_MHC: bool = False
     VLLM_HCU_USE_AITER_MHC_FUSED: bool = False
     VLLM_HCU_USE_TILELANG_MHC_PRENORM: bool = True
@@ -427,6 +428,11 @@ hcu_vllm_environment_variables: dict[str, Callable[[], Any]] = {
         lambda: _environment_flag(
             os.environ.get("VLLM_HCU_USE_AITER_MHC_PRE", "True")
         ),
+
+    # Delayed Pre only: auto tunes validated small V4.1 shapes; 1 disables
+    # split-K. Explicit 1/2/4/8/16/32 values are validated against K at use.
+    "VLLM_HCU_MHC_PRE_SPLIT_K":
+        lambda: os.environ.get("VLLM_HCU_MHC_PRE_SPLIT_K", "auto"),
 
     # Match SGLang's opt-in HCU AITER TileLang mHC path.
     "VLLM_HCU_USE_AITER_TILELANG_MHC":
