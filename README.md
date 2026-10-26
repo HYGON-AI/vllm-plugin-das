@@ -6,6 +6,13 @@ vLLM HCU Plugin
 
 ---
 
+> **vLLM 0.32 users:** the repository-root `vllm_hcu` package is the retained
+> vLLM 0.28.1 development reference and must not be installed into a vLLM 0.32
+> environment. Build and install the independent optimization-only project in
+> [`adapter_extension/`](adapter_extension/) together with
+> `hcu-vllm-adapter`. The adapter owns the HCU platform; the DAS extension owns
+> only validated optimization capabilities.
+
 `vllm-plugin-das` provides HCU platform, model, and operator integration for
 [vLLM](https://github.com/vllm-project/vllm). Use the repository branch that
 matches your HCU/OpenDAS vLLM deployment.
