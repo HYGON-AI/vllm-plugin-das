@@ -75,7 +75,7 @@ def _step5_ep_chunk_provider(experts, hidden_states, w1, w2):
     """Use the implementation selected by the official runtime dispatcher."""
     if os.environ.get("HCU_STEP5_BOUNDED_EP_WORKSPACE", "0") != "1":
         return None
-    provider = getattr(experts, "step5_ep_chunk_size", None)
+    provider = getattr(experts, "_hcu_step5_ep_chunk_size", None)
     if provider is not None:
         return provider if getattr(experts, "_hcu_step5_owner", False) else None
     from vllm.model_executor.layers.fused_moe.experts.triton_deep_gemm_moe import (
@@ -84,7 +84,7 @@ def _step5_ep_chunk_provider(experts, hidden_states, w1, w2):
 
     if type(experts) is TritonOrDeepGemmExperts:
         selected = experts._select_experts_impl(hidden_states, w1, w2)
-        return (getattr(selected, "step5_ep_chunk_size", None)
+        return (getattr(selected, "_hcu_step5_ep_chunk_size", None)
                 if getattr(selected, "_hcu_step5_owner", False) else None)
     return None
 

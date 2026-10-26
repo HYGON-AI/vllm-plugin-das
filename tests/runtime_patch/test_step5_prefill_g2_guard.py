@@ -175,7 +175,7 @@ def test_bounded_workspace_replica_namespace_is_explicit(monkeypatch, local_e, g
     monkeypatch.setitem(sys.modules, support_name, support)
     monkeypatch.setitem(sys.modules, vendor_name, vendor)
     monkeypatch.setenv("HCU_STEP5_BOUNDED_EP_WORKSPACE", "1")
-    fn = load_function(DEEP, "step5_ep_chunk_size", dict(
+    fn = load_function(DEEP, "_hcu_step5_ep_chunk_size", dict(
         os=os, _EP_FUSED_MOE=True, current_platform=SimpleNamespace(is_rocm=lambda: True),
         henvs=SimpleNamespace(optional_custom_op_enabled=lambda value: value)))
     expert = SimpleNamespace(_hcu_step5_owner=True, block_shape=None, _lora_context=None,

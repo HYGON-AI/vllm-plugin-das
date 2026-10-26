@@ -311,7 +311,7 @@ def test_bounded_step5_scratch_requires_the_actual_channel_ep_backend(monkeypatc
     vendor.CHUNK=32768;monkeypatch.setitem(sys.modules,vendor.__name__,vendor)
     fn=load_function(
         "vllm_hcu/model_executor/layers/fused_moe/experts/deep_gemm_moe.py",
-        "step5_ep_chunk_size", {
+        "_hcu_step5_ep_chunk_size", {
             "os":os,"_EP_FUSED_MOE":case!="backend_disabled",
             "current_platform":SimpleNamespace(is_rocm=lambda:case!="not_rocm"),
             "henvs":SimpleNamespace(optional_custom_op_enabled=lambda enabled:enabled and case!="master_disabled"),
@@ -397,7 +397,7 @@ def test_runtime_selected_wrapper_uses_bounded_workspace(monkeypatch, mode):
     assert cls is selector.TritonOrDeepGemmExperts
     if mode=="unknown":cls=type("UnreviewedSelector",(cls,),{})
     outer=object.__new__(cls)
-    outer.experts=SimpleNamespace(_hcu_step5_owner=True,step5_ep_chunk_size=lambda *a:32768)
+    outer.experts=SimpleNamespace(_hcu_step5_owner=True,_hcu_step5_ep_chunk_size=lambda *a:32768)
     outer.fallback_experts=SimpleNamespace()
     monkeypatch.setattr(selector,"_valid_deep_gemm",lambda *a:mode!="fallback")
     monkeypatch.setattr(selector,"is_deep_gemm_e8m0_used",lambda:False)

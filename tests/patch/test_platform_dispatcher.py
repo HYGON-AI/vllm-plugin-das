@@ -420,10 +420,7 @@ def test_apply_platform_patches_is_idempotent_narrow_and_reported():
 
 
 def test_platform_framework_registration_is_lazy_on_clean_vllm():
-    # The reviewed base's GLM5Next strided-recurrent adapter imports FLA
-    # ops.op while enumerating metadata; FLA ops.__init__ also imports chunk.
-    # Account for that upstream dependency while keeping the exact inventory
-    # and the cold HCU replacement/business-module checks below intact.
+    # The current upstream GDN adapters keep FLA providers lazy.
     result = _run_fresh(
         "import builtins,json,sys; "
         "old=builtins.__import__; "
@@ -458,7 +455,6 @@ def test_platform_framework_registration_is_lazy_on_clean_vllm():
         "assert loaded_worker_callbacks == {"
         "'vllm.distributed.device_communicators.base_device_communicator',"
         "'vllm.forward_context',"
-        "'vllm.third_party.flash_linear_attention.ops.chunk',"
         "'vllm.utils.deep_gemm',"
         "'vllm.v1.attention.backend',"
         "'vllm.v1.worker.dp_utils',"

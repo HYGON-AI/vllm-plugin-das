@@ -197,6 +197,26 @@ def test_deep_gemm_replacements_preserve_v0251_surface_and_signatures(
     replacement_tree = ast.parse(
         (REPO_ROOT / replacement_relative).read_text(encoding="utf-8")
     )
+    modular_tree = ast.parse(
+        (TARGET_VLLM_ROOT / "vllm/model_executor/layers/fused_moe/modular_kernel.py")
+        .read_text(encoding="utf-8")
+    )
+    modular_classes = {
+        node.name: node for node in modular_tree.body if isinstance(node, ast.ClassDef)
+    }
+
+    def inherited_methods(node: ast.ClassDef) -> dict[str, ast.AST]:
+        methods = {}
+        for base in node.bases:
+            name = base.attr if isinstance(base, ast.Attribute) else getattr(base, "id", None)
+            parent = modular_classes.get(name)
+            if parent is not None:
+                methods.update(inherited_methods(parent))
+                methods.update({
+                    method.name: method for method in parent.body
+                    if isinstance(method, (ast.FunctionDef, ast.AsyncFunctionDef))
+                })
+        return methods
 
     def definitions(tree: ast.Module) -> list[ast.AST]:
         return [
@@ -235,11 +255,18 @@ def test_deep_gemm_replacements_preserve_v0251_surface_and_signatures(
             for node in replacement_node.body
             if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef))
         ]
-        # HCU may add private helpers; the target's methods must stay intact.
+        # Overrides of an existing base API keep its signature. Other additions
+        # must remain private; the target's directly defined methods stay intact.
+        inherited = inherited_methods(target_node)
+        for method in replacement_methods:
+            if method.name not in target_method_names and method.name in inherited:
+                assert ast.dump(method.args, include_attributes=False) == ast.dump(
+                    inherited[method.name].args, include_attributes=False
+                ), f"{target_node.name}.{method.name}: inherited signature changed"
         helper_names = [
             node.name
             for node in replacement_methods
-            if node.name not in target_method_names
+            if node.name not in target_method_names and node.name not in inherited
         ]
         assert all(
             name.startswith("_") and not name.endswith("__") for name in helper_names

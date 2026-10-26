@@ -295,7 +295,7 @@ class DeepGemmExperts(mk.FusedMoEExpertsModular):
     def finalize_weight_and_reduce_impl(self) -> mk.TopKWeightAndReduce:
         return TopKWeightAndReduceNoOP()
 
-    def step5_ep_chunk_size(
+    def _hcu_step5_ep_chunk_size(
         self, w1, w2, activation, global_num_experts, expert_map,
         top_k, apply_router_weight_on_input,
     ) -> int | None:
