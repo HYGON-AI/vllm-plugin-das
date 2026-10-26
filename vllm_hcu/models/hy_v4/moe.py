@@ -21,7 +21,6 @@ from vllm.model_executor.layers.linear import (
 )
 from vllm.model_executor.layers.quantization import QuantizationConfig
 from vllm_hcu.model_executor.layers.attention.pcp import in_replicated_mtp_batch
-from vllm_hcu.models.hy_v4.attention import linear_gate_pcp_shard_enabled
 from vllm_hcu.ops.fuse_silu_mul_quant import FusedSiluAndMulAndQuant
 from vllm_hcu.platforms import envs as henvs
 
@@ -361,12 +360,11 @@ class HYV4MoEFused(nn.Module):
                 -1, quanted_hidden_states.shape[-1]
             )
             scale = scale.view(-1, scale.shape[-1])
-        # LINEAR_GATE_PCP_SHARD + MTP restore can inflate MoE workspace.
+        # Replicated global MTP batches can inflate MoE workspace.
         # Chunk only when VLLM_HCU_HYV4_MOE_CHUNK_SIZE is set.
         chunk_size = _hyv4_moe_chunk_size()
         if (
             chunk_size is None
-            or not linear_gate_pcp_shard_enabled()
             or not in_replicated_mtp_batch()
             or hidden_states.shape[0] <= chunk_size
         ):

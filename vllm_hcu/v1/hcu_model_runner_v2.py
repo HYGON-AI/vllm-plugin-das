@@ -255,6 +255,30 @@ class HcuGPUModelRunnerV2(GPUModelRunner):
             )
             or 1
         )
+        speculator = getattr(self, "speculator", None)
+        architectures = getattr(
+            getattr(self.vllm_config, "model_config", None), "architectures", ()
+        )
+        if pcp_size > 1 and speculator is not None and "HYV4ForCausalLM" in architectures:
+            # Only draft profiling consumes the replicated global batch. Keep
+            # target profiling outside this scope, including its PCP metadata.
+            original_propose = speculator.propose
+            had_override = "propose" in vars(speculator)
+
+            @functools.wraps(original_propose)
+            def profile_propose(*args, **kwargs):
+                with replicated_mtp_batch_scope():
+                    return original_propose(*args, **kwargs)
+
+            speculator.propose = profile_propose
+            try:
+                return super().profile_run()
+            finally:
+                if had_override:
+                    speculator.propose = original_propose
+                else:
+                    del speculator.propose
+
         if pcp_size <= 1:
             return super().profile_run()
 

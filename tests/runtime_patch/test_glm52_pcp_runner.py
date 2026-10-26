@@ -1364,3 +1364,62 @@ def test_profile_run_restores_max_num_tokens_on_exception(
         runner.profile_run()
 
     assert runner.max_num_tokens == 4096
+
+
+@pytest.mark.parametrize("fail", [False, True])
+def test_hyv4_profile_chunks_only_draft_and_restores_propose(
+    pcp_runner_module, monkeypatch, fail,
+):
+    from vllm_hcu.models.hy_v4 import moe
+    from vllm_hcu.model_executor.layers.attention.pcp import in_replicated_mtp_batch
+
+    runner_module, _ = pcp_runner_module
+    monkeypatch.setenv("VLLM_HCU_HYV4_MOE_CHUNK_SIZE", "3")
+    monkeypatch.delenv("VLLM_HCU_ENABLE_LINEAR_GATE_PCP_SHARD", raising=False)
+    calls = []
+    layer = object.__new__(moe.HYV4MoEFused)
+    torch.nn.Module.__init__(layer)
+
+    class Gate(torch.nn.Module):
+        def forward(self, hidden_states):
+            return hidden_states, None
+
+    layer.gate = Gate()
+
+    class Experts(torch.nn.Module):
+        def forward(self, *, hidden_states, router_logits):
+            calls.append((in_replicated_mtp_batch(), len(hidden_states)))
+            return hidden_states + 1
+
+    layer.experts = Experts()
+    inputs = torch.zeros((8, 4))
+
+    class Speculator:
+        def propose(self, **kwargs):
+            torch.testing.assert_close(layer(inputs), inputs + 1)
+            if fail:
+                raise RuntimeError("draft profile failed")
+
+    def dummy_run(self, num_tokens):
+        assert num_tokens == 8
+        layer(inputs)  # Target remains outside replicated draft scope.
+        self.speculator.propose(dummy_run=True, is_profile=True)
+
+    def profile_run(self):
+        self._dummy_run(self.max_num_tokens)
+
+    monkeypatch.setattr(runner_module.GPUModelRunner, "profile_run", profile_run, raising=False)
+    monkeypatch.setattr(runner_module.GPUModelRunner, "_dummy_run", dummy_run, raising=False)
+    config = _config(8)
+    config.model_config = SimpleNamespace(architectures=["HYV4ForCausalLM"])
+    runner = runner_module.HcuGPUModelRunnerV2(config, "hcu:0")
+    runner.max_num_tokens = 8
+    runner.speculator = Speculator()
+    if fail:
+        with pytest.raises(RuntimeError, match="draft profile failed"):
+            runner.profile_run()
+    else:
+        runner.profile_run()
+    assert calls == [(False, 8), (True, 3), (True, 3), (True, 2)]
+    assert not in_replicated_mtp_batch()
+    assert "propose" not in vars(runner.speculator)
