@@ -1,0 +1,210 @@
+from __future__ import annotations
+
+from concurrent.futures import ThreadPoolExecutor
+import os
+from pathlib import Path
+import subprocess
+import sys
+from types import SimpleNamespace
+
+import pytest
+
+
+PLUGIN_SOURCE_ROOT = (
+    Path(__file__).resolve().parents[2] / "adapter_extension" / "src"
+)
+sys.path.insert(0, os.fspath(PLUGIN_SOURCE_ROOT))
+
+from hcu_vllm_adapter.extensions import ExtensionContext, ExtensionSpec
+from hcu_vllm_das import extension
+
+
+def context(version: str | None = "0.32.0") -> ExtensionContext:
+    return ExtensionContext(adapter_version="0.1.0.dev0", vllm_version=version)
+
+
+@pytest.fixture(autouse=True)
+def reset_activation(monkeypatch: pytest.MonkeyPatch):
+    monkeypatch.setattr(extension, "_activated", False)
+
+
+def successful_importer(calls: list[str]):
+    class SiluAndMul:
+        register_oot = staticmethod(lambda value: value)
+
+    modules = {
+        "lightop.activation": SimpleNamespace(silu_and_mul_opt=lambda out, x: None),
+        "vllm.model_executor.layers.activation": SimpleNamespace(
+            SiluAndMul=SiluAndMul
+        ),
+        "vllm.utils.torch_utils": SimpleNamespace(
+            direct_register_custom_op=lambda **kwargs: None
+        ),
+        "hcu_vllm_das.silu_and_mul": SimpleNamespace(),
+    }
+
+    def import_module(name: str):
+        calls.append(name)
+        return modules[name]
+
+    return import_module
+
+
+def test_factory_declares_the_adapter_api_and_only_migrated_capability() -> None:
+    spec = extension.extension_spec()
+
+    assert isinstance(spec, ExtensionSpec)
+    assert spec.name == "das-hcu"
+    assert spec.api_version == 1
+    assert spec.priority == 100
+    assert spec.capabilities == frozenset({"lightop-silu-and-mul"})
+    assert spec.activate is extension.activate_extension
+
+
+def test_discovery_and_factory_import_no_runtime_frameworks() -> None:
+    code = f"""
+import sys
+sys.path.insert(0, {os.fspath(PLUGIN_SOURCE_ROOT)!r})
+from hcu_vllm_das.extension import extension_spec
+spec = extension_spec()
+assert spec.name == "das-hcu"
+blocked = {{"torch", "vllm", "lightop", "vllm_hcu"}}
+assert blocked.isdisjoint(sys.modules), blocked.intersection(sys.modules)
+"""
+    result = subprocess.run(
+        [sys.executable, "-c", code],
+        check=False,
+        capture_output=True,
+        text=True,
+        env=dict(os.environ),
+    )
+
+    assert result.returncode == 0, result.stdout + result.stderr
+
+
+@pytest.mark.parametrize(
+    "version",
+    (
+        "0.32.0",
+        "0.32.0rc1",
+        "0.32.0.dev7",
+        "0.32.0.post1",
+        "0.32.0+rocm723",
+    ),
+)
+def test_activation_accepts_the_vllm_032_release_line(
+    monkeypatch: pytest.MonkeyPatch, version: str
+) -> None:
+    calls: list[str] = []
+    monkeypatch.setattr(extension, "_import_module", successful_importer(calls))
+
+    extension.activate_extension(context(version))
+
+    assert calls == [
+        "lightop.activation",
+        "vllm.model_executor.layers.activation",
+        "vllm.utils.torch_utils",
+        "hcu_vllm_das.silu_and_mul",
+    ]
+
+
+@pytest.mark.parametrize(
+    "version",
+    (None, "not-a-version", "1!0.32.0", "0.31.0", "0.33.0"),
+)
+def test_activation_rejects_unsupported_metadata_before_importing_runtime(
+    monkeypatch: pytest.MonkeyPatch, version: str | None
+) -> None:
+    calls: list[str] = []
+    monkeypatch.setattr(extension, "_import_module", successful_importer(calls))
+
+    with pytest.raises(extension.DasExtensionError, match="vLLM 0.32.0"):
+        extension.activate_extension(context(version))
+
+    assert calls == []
+    assert extension._activated is False
+
+
+def test_missing_lightop_symbol_fails_before_vllm_and_can_be_retried(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    calls: list[str] = []
+
+    def missing_lightop(name: str):
+        calls.append(name)
+        return SimpleNamespace()
+
+    monkeypatch.setattr(extension, "_import_module", missing_lightop)
+
+    with pytest.raises(extension.DasExtensionError, match="silu_and_mul_opt"):
+        extension.activate_extension(context())
+
+    assert calls == ["lightop.activation"]
+    assert extension._activated is False
+
+    retry_calls: list[str] = []
+    monkeypatch.setattr(
+        extension, "_import_module", successful_importer(retry_calls)
+    )
+    extension.activate_extension(context())
+
+    assert retry_calls[-1] == "hcu_vllm_das.silu_and_mul"
+    assert extension._activated is True
+
+
+@pytest.mark.parametrize(
+    ("module_name", "replacement", "message"),
+    (
+        (
+            "vllm.model_executor.layers.activation",
+            SimpleNamespace(SiluAndMul=SimpleNamespace()),
+            "register_oot",
+        ),
+        (
+            "vllm.utils.torch_utils",
+            SimpleNamespace(direct_register_custom_op=None),
+            "direct_register_custom_op",
+        ),
+    ),
+)
+def test_changed_vllm_api_fails_before_capability_registration(
+    monkeypatch: pytest.MonkeyPatch,
+    module_name: str,
+    replacement: object,
+    message: str,
+) -> None:
+    calls: list[str] = []
+    base = successful_importer(calls)
+
+    def changed_importer(name: str):
+        if name == module_name:
+            calls.append(name)
+            return replacement
+        return base(name)
+
+    monkeypatch.setattr(extension, "_import_module", changed_importer)
+
+    with pytest.raises(extension.DasExtensionError, match=message):
+        extension.activate_extension(context())
+
+    assert "hcu_vllm_das.silu_and_mul" not in calls
+    assert extension._activated is False
+
+
+def test_repeated_and_concurrent_activation_registers_capability_once(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    calls: list[str] = []
+    monkeypatch.setattr(extension, "_import_module", successful_importer(calls))
+
+    with ThreadPoolExecutor(max_workers=8) as pool:
+        tuple(pool.map(extension.activate_extension, [context()] * 32))
+    extension.activate_extension(context())
+
+    assert calls.count("hcu_vllm_das.silu_and_mul") == 1
+    assert calls == [
+        "lightop.activation",
+        "vllm.model_executor.layers.activation",
+        "vllm.utils.torch_utils",
+        "hcu_vllm_das.silu_and_mul",
+    ]
