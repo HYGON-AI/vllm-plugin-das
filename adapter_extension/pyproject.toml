@@ -1,0 +1,23 @@
+[build-system]
+requires = ["setuptools>=77"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "hcu-vllm-das-plugin"
+version = "0.1.0.dev0"
+description = "Optional DAS optimizations for hcu-vllm-adapter and vLLM 0.32"
+readme = "README.md"
+license = "Apache-2.0"
+requires-python = ">=3.11,<3.15"
+dependencies = [
+  "hcu-vllm-adapter>=0.1.0.dev0",
+  "packaging>=23",
+]
+
+[project.entry-points."hcu_vllm_adapter.extensions"]
+das_hcu = "hcu_vllm_das.extension:extension_spec"
+
+[tool.setuptools.packages.find]
+where = ["src"]
+include = ["hcu_vllm_das", "hcu_vllm_das.*"]
+
