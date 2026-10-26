@@ -5,9 +5,13 @@
 lifecycle; this wheel contributes optional, independently removable operator
 optimizations through the adapter extension API.
 
-The first validated capability is the LightOp `SiluAndMul` path on `gfx938`.
-No attention, MoE, model, topology, or performance support is implied by this
-initial slice.
+Version `0.2.0.dev0` contains two validated `gfx938` capabilities:
+
+- LightOp `SiluAndMul`.
+- LightOp ordinary and fused-add `RMSNorm`.
+
+No attention, MoE, model, topology, or performance support is implied by these
+operator-level capabilities.
 
 ## Compatibility
 
@@ -47,13 +51,36 @@ VLLM_PLUGINS=hcu_adapter python3 -E adapter_extension/tools/verify_installed.py
 
 The verifier fails closed unless all three distributions have non-empty wheel
 records, their imported modules are owned by those records, the adapter is the
-sole expected vLLM entry-point owner, the DAS extension is active, and vLLM's
-OOT registry selects `hcu_vllm_das.silu_and_mul.HcuSiluAndMul`.
+sole expected vLLM entry-point owner, the DAS extension is active with both
+declared capabilities, and vLLM's OOT registry selects these exact classes:
+
+```text
+hcu_vllm_das.silu_and_mul.HcuSiluAndMul
+hcu_vllm_das.rms_norm.HcuRMSNorm
+```
+
+## RMSNorm eligibility
+
+The LightOp RMSNorm path is selected only when all of the following hold:
+
+- the master and RMSNorm-specific switches are enabled;
+- vLLM batch-invariant mode is disabled;
+- the operation uses a real weight and no variance-size override;
+- the input dtype is BF16 or FP16;
+- input width equals the layer hidden size and is at least 64;
+- input, weight, and optional residual are contiguous;
+- input, weight, and optional residual use the same dtype; and
+- an optional residual has the same shape as the input.
+
+All other cases use vLLM's native RMSNorm implementation. `GemmaRMSNorm`,
+`RMSNormGated`, quantized fusion, model patches, and performance claims are out
+of scope for this release.
 
 ## Rollback
 
-The optimized path is enabled by default. Either switch below returns
-`SiluAndMul` to vLLM's native implementation without uninstalling the plugin:
+The optimized paths are enabled by default. The master switch returns both
+operators to vLLM native implementations; each child switch rolls back one
+operator without uninstalling the plugin:
 
 ```bash
 # Disable all optional DAS custom operators.
@@ -61,11 +88,23 @@ export VLLM_HCU_USE_CUSTOM_OPS=0
 
 # Or disable only the LightOp SiluAndMul path.
 export VLLM_HCU_USE_CUSTOM_SILU_AND_MUL=0
+
+# Or disable only ordinary and fused-add LightOp RMSNorm.
+export VLLM_HCU_USE_CUSTOM_RMS_NORM=0
+```
+
+The numerical evidence for this release is limited to `gfx938`. On a `gfx92a`
+production deployment, keep RMSNorm disabled until a separate live-device
+validation record exists:
+
+```bash
+export VLLM_HCU_USE_CUSTOM_RMS_NORM=0
 ```
 
 For complete removal, uninstall `hcu-vllm-das-plugin`; the adapter and vLLM
 remain installed and retain platform ownership.
 
-See
-[`docs/validation/v032-adapter-extension-silu.md`](../docs/validation/v032-adapter-extension-silu.md)
-for the exact wheel hashes and live-HCU evidence for this revision.
+See the historical
+[`SiluAndMul` record](../docs/validation/v032-adapter-extension-silu.md) and the
+current [`RMSNorm` record](../docs/validation/v032-adapter-extension-rmsnorm.md)
+for exact wheel hashes and live-HCU evidence.

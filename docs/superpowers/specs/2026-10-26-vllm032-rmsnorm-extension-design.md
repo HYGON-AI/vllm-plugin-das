@@ -52,6 +52,7 @@ The optimized path is therefore eligible only when all of these are true:
 - `VLLM_BATCH_INVARIANT` is false;
 - the selected ordinary/fused path passes a real weight;
 - `variance_size_override` is `None`;
+- the input dtype is BF16 or FP16;
 - the input width is at least 64 and equals the layer hidden size;
 - input and optional residual are contiguous, shape-compatible, and share
   dtype;

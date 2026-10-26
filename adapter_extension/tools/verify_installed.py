@@ -13,6 +13,15 @@ import sys
 from packaging.version import InvalidVersion, Version
 
 
+_REQUIRED_CAPABILITIES = frozenset(
+    {"lightop-rms-norm", "lightop-silu-and-mul"}
+)
+_REQUIRED_OOT_CLASSES = {
+    "RMSNorm": "hcu_vllm_das.rms_norm.HcuRMSNorm",
+    "SiluAndMul": "hcu_vllm_das.silu_and_mul.HcuSiluAndMul",
+}
+
+
 class InstalledVerificationError(RuntimeError):
     """Raised when installed files or runtime ownership are not proven."""
 
@@ -186,23 +195,33 @@ def collect_attestation() -> dict[str, object]:
             "DAS extension is not active: "
             + (extension_report.reason or str(status))
         )
+    capabilities = frozenset(extension_report.capabilities)
+    missing_capabilities = _REQUIRED_CAPABILITIES - capabilities
+    if missing_capabilities:
+        raise InstalledVerificationError(
+            "DAS extension is missing required capabilities: "
+            + ", ".join(sorted(missing_capabilities))
+        )
 
     custom_op = _import_module("vllm.model_executor.custom_op")
-    oot_class = custom_op.op_registry_oot.get("SiluAndMul")
-    if oot_class is None:
-        raise InstalledVerificationError(
-            "vLLM OOT registry has no DAS SiluAndMul implementation"
-        )
-    oot_name = f"{oot_class.__module__}.{oot_class.__qualname__}"
-    if not oot_name.startswith("hcu_vllm_das.silu_and_mul."):
-        raise InstalledVerificationError(
-            f"vLLM OOT SiluAndMul has unexpected owner: {oot_name}"
-        )
-    oot_module = _import_module(oot_class.__module__)
-    _module_origin(oot_module, plugin_owned, "hcu-vllm-das-plugin")
+    oot_classes: dict[str, str] = {}
+    for class_name, expected_name in _REQUIRED_OOT_CLASSES.items():
+        oot_class = custom_op.op_registry_oot.get(class_name)
+        if oot_class is None:
+            raise InstalledVerificationError(
+                f"vLLM OOT registry has no DAS {class_name} implementation"
+            )
+        oot_name = f"{oot_class.__module__}.{oot_class.__qualname__}"
+        if oot_name != expected_name:
+            raise InstalledVerificationError(
+                f"vLLM OOT {class_name} has unexpected owner: {oot_name}"
+            )
+        oot_module = _import_module(oot_class.__module__)
+        _module_origin(oot_module, plugin_owned, "hcu-vllm-das-plugin")
+        oot_classes[class_name] = oot_name
 
     return {
-        "schema_version": 1,
+        "schema_version": 2,
         "vllm": {
             **_distribution_report(vllm_dist, vllm_record),
             "module_origin": vllm_origin,
@@ -219,9 +238,9 @@ def collect_attestation() -> dict[str, object]:
             "entry_point": extension_report.entry_point_name,
             "name": extension_report.extension_name,
             "status": status,
-            "capabilities": sorted(extension_report.capabilities),
+            "capabilities": sorted(capabilities),
         },
-        "oot_class": oot_name,
+        "oot_classes": oot_classes,
     }
 
 

@@ -117,7 +117,7 @@ def activate_extension(context: ExtensionContext) -> None:
             _import_module("hcu_vllm_das.rms_norm")
         except Exception as error:
             raise DasExtensionError(
-                f"cannot register DAS SiluAndMul capability: {error}"
+                f"cannot register DAS operator capabilities: {error}"
             ) from error
         _activated = True
 

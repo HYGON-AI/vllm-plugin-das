@@ -26,7 +26,7 @@
 
 - A future Adapter API must still see plugin API v1 and reject it rather than accepting an unported protocol.
 - Weightless and variance-override RMSNorm must never reach LightOp.
-- Strided, mismatched-dtype, mismatched-shape, narrow, and batch-invariant inputs must use upstream behavior.
+- Strided, non-BF16/FP16, mismatched-dtype, mismatched-shape, narrow, and batch-invariant inputs must use upstream behavior.
 - Missing either LightOp RMSNorm symbol or a changed vLLM RMSNorm OOT API must fail before importing either capability module.
 - Repeated/concurrent activation must register both modules once and never duplicate Torch/OOT registrations.
 
@@ -89,7 +89,7 @@ importing first `hcu_vllm_das.silu_and_mul`, then `hcu_vllm_das.rms_norm`.
 Prove ordinary output allocation/call wiring, fused mutation schema and return
 identity, OOT registration, and upstream fallback for master/child switches,
 narrow width, batch invariance, missing weight, variance override, non-contiguous
-input/residual/weight, shape mismatch, and dtype mismatch. Pin official 0.32
+input/residual/weight, shape mismatch, unsupported dtype, and dtype mismatch. Pin official 0.32
 `RMSNorm` constructor fields and `forward_cuda` contract.
 
 - [ ] **Step 2: Run Task 2 tests and verify RED because `hcu_vllm_das.rms_norm` is absent.**

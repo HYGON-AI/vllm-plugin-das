@@ -64,7 +64,9 @@ def empty_like(value):
 
 torch = ModuleType("torch")
 torch.Tensor = Tensor
+torch.bfloat16 = "bf16"
 torch.empty_like = empty_like
+torch.float16 = "fp16"
 torch.ops = SimpleNamespace(vllm=SimpleNamespace())
 sys.modules["torch"] = torch
 
@@ -266,6 +268,7 @@ def test_fused_add_rmsnorm_returns_mutated_inputs() -> None:
         {"residual": True, "residual_width": 128},
         {"residual": True, "residual_dtype": "fp16"},
         {"weight_dtype": "fp16"},
+        {"input_dtype": "fp32", "weight_dtype": "fp32"},
     ),
     ids=(
         "master-switch",
@@ -280,6 +283,7 @@ def test_fused_add_rmsnorm_returns_mutated_inputs() -> None:
         "residual-shape",
         "residual-dtype",
         "weight-dtype",
+        "unsupported-dtype",
     ),
 )
 def test_unsupported_rmsnorm_cases_use_vllm_native_path(

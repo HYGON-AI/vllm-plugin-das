@@ -64,6 +64,13 @@ class HcuSiluAndMul:
 HcuSiluAndMul.__module__ = "hcu_vllm_das.silu_and_mul"
 
 
+class HcuRMSNorm:
+    pass
+
+
+HcuRMSNorm.__module__ = "hcu_vllm_das.rms_norm"
+
+
 def installed_fixture(monkeypatch: pytest.MonkeyPatch, tmp_path: Path):
     site = tmp_path / "site-packages"
     distributions = {
@@ -84,12 +91,13 @@ def installed_fixture(monkeypatch: pytest.MonkeyPatch, tmp_path: Path):
         ),
         "hcu-vllm-das-plugin": FakeDistribution(
             "hcu-vllm-das-plugin",
-            "0.1.0.dev0",
+            "0.2.0.dev0",
             site,
             [
                 "hcu_vllm_das/extension.py",
+                "hcu_vllm_das/rms_norm.py",
                 "hcu_vllm_das/silu_and_mul.py",
-                "hcu_vllm_das_plugin-0.1.0.dist-info/RECORD",
+                "hcu_vllm_das_plugin-0.2.0.dist-info/RECORD",
             ],
         ),
     }
@@ -121,7 +129,9 @@ def installed_fixture(monkeypatch: pytest.MonkeyPatch, tmp_path: Path):
             entry_point_name="das_hcu",
             extension_name="das-hcu",
             status=ActiveStatus(),
-            capabilities=frozenset({"lightop-silu-and-mul"}),
+            capabilities=frozenset(
+                {"lightop-rms-norm", "lightop-silu-and-mul"}
+            ),
             reason="",
         )
     ]
@@ -152,8 +162,14 @@ def installed_fixture(monkeypatch: pytest.MonkeyPatch, tmp_path: Path):
         "hcu_vllm_das.silu_and_mul": SimpleNamespace(
             __file__=os.fspath(site / "hcu_vllm_das" / "silu_and_mul.py")
         ),
+        "hcu_vllm_das.rms_norm": SimpleNamespace(
+            __file__=os.fspath(site / "hcu_vllm_das" / "rms_norm.py")
+        ),
         "vllm.model_executor.custom_op": SimpleNamespace(
-            op_registry_oot={"SiluAndMul": HcuSiluAndMul}
+            op_registry_oot={
+                "RMSNorm": HcuRMSNorm,
+                "SiluAndMul": HcuSiluAndMul,
+            }
         ),
     }
 
@@ -182,17 +198,20 @@ def test_attestation_accepts_owned_wheels_and_active_extension(
 
     report = verify_installed.collect_attestation()
 
-    assert report["schema_version"] == 1
+    assert report["schema_version"] == 2
     assert report["vllm"]["version"] == "0.32.0+rocm723"
     assert report["adapter"]["version"] == "0.1.0.dev0"
-    assert report["plugin"]["version"] == "0.1.0.dev0"
+    assert report["plugin"]["version"] == "0.2.0.dev0"
     assert report["extension"] == {
-        "capabilities": ["lightop-silu-and-mul"],
+        "capabilities": ["lightop-rms-norm", "lightop-silu-and-mul"],
         "entry_point": "das_hcu",
         "name": "das-hcu",
         "status": "active",
     }
-    assert report["oot_class"] == "hcu_vllm_das.silu_and_mul.HcuSiluAndMul"
+    assert report["oot_classes"] == {
+        "RMSNorm": "hcu_vllm_das.rms_norm.HcuRMSNorm",
+        "SiluAndMul": "hcu_vllm_das.silu_and_mul.HcuSiluAndMul",
+    }
     json.dumps(report, sort_keys=True)
 
 
@@ -273,17 +292,39 @@ def test_attestation_rejects_failed_activation(
     reports[0].status = FailedStatus()
     reports[0].reason = "activation failed"
 
-    with pytest.raises(verify_installed.InstalledVerificationError, match="activation failed"):
+    with pytest.raises(
+        verify_installed.InstalledVerificationError,
+        match="activation failed",
+    ):
         verify_installed.collect_attestation()
 
 
-def test_attestation_rejects_a_missing_silu_oot_registration(
-    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+@pytest.mark.parametrize("class_name", ("RMSNorm", "SiluAndMul"))
+def test_attestation_rejects_a_missing_oot_registration(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path, class_name: str
 ) -> None:
     _distributions, _points, _reports, modules = installed_fixture(
         monkeypatch, tmp_path
     )
-    modules["vllm.model_executor.custom_op"].op_registry_oot.clear()
+    del modules["vllm.model_executor.custom_op"].op_registry_oot[class_name]
 
-    with pytest.raises(verify_installed.InstalledVerificationError, match="SiluAndMul"):
+    with pytest.raises(
+        verify_installed.InstalledVerificationError,
+        match=class_name,
+    ):
+        verify_installed.collect_attestation()
+
+
+def test_attestation_rejects_a_missing_required_capability(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    _distributions, _points, reports, _modules = installed_fixture(
+        monkeypatch, tmp_path
+    )
+    reports[0].capabilities = frozenset({"lightop-silu-and-mul"})
+
+    with pytest.raises(
+        verify_installed.InstalledVerificationError,
+        match="lightop-rms-norm",
+    ):
         verify_installed.collect_attestation()

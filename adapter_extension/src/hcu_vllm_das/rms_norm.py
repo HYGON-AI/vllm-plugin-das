@@ -85,7 +85,8 @@ class HcuRMSNorm(RMSNorm):
         if not pass_weight or self.variance_size_override is not None:
             return False
         if (
-            x.shape[-1] < _LIGHTOP_RMS_NORM_MIN_WIDTH
+            x.dtype not in {torch.bfloat16, torch.float16}
+            or x.shape[-1] < _LIGHTOP_RMS_NORM_MIN_WIDTH
             or x.shape[-1] != self.hidden_size
             or not x.is_contiguous()
         ):
