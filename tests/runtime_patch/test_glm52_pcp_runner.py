@@ -1367,14 +1367,17 @@ def test_profile_run_restores_max_num_tokens_on_exception(
 
 
 @pytest.mark.parametrize("fail", [False, True])
+@pytest.mark.parametrize("chunk", [None, "1024"])
 def test_hyv4_profile_chunks_only_draft_and_restores_propose(
-    pcp_runner_module, monkeypatch, fail,
+    pcp_runner_module, monkeypatch, fail, chunk,
 ):
     from vllm_hcu.models.hy_v4 import moe
     from vllm_hcu.model_executor.layers.attention.pcp import in_replicated_mtp_batch
 
     runner_module, _ = pcp_runner_module
-    monkeypatch.setenv("VLLM_HCU_HYV4_MOE_CHUNK_SIZE", "3")
+    monkeypatch.delenv("VLLM_HCU_HYV4_MOE_CHUNK_SIZE", raising=False)
+    if chunk is not None:
+        monkeypatch.setenv("VLLM_HCU_HYV4_MOE_CHUNK_SIZE", chunk)
     monkeypatch.delenv("VLLM_HCU_ENABLE_LINEAR_GATE_PCP_SHARD", raising=False)
     calls = []
     layer = object.__new__(moe.HYV4MoEFused)
@@ -1392,18 +1395,35 @@ def test_hyv4_profile_chunks_only_draft_and_restores_propose(
             return hidden_states + 1
 
     layer.experts = Experts()
-    inputs = torch.zeros((8, 4))
+    inputs = torch.zeros((1152, 4))
+
+    from vllm.v1.worker.gpu.input_batch import InputBatch
+
+    def make_dummy(num_reqs, num_tokens, buffers):
+        return SimpleNamespace(num_reqs=num_reqs, num_tokens=num_tokens)
+
+    monkeypatch.setattr(InputBatch, "make_dummy", staticmethod(make_dummy))
 
     class Speculator:
         def propose(self, **kwargs):
-            torch.testing.assert_close(layer(inputs), inputs + 1)
+            hidden = kwargs["last_hidden_states"]
+            expected = 8192 if chunk else 1152
+            assert kwargs["input_batch"].num_tokens == expected
+            assert hidden.shape == (expected, 4)
+            assert len(kwargs["num_sampled"]) == kwargs["input_batch"].num_reqs
+            torch.testing.assert_close(layer(hidden), hidden + 1)
             if fail:
                 raise RuntimeError("draft profile failed")
 
     def dummy_run(self, num_tokens):
-        assert num_tokens == 8
+        assert num_tokens == 1152
         layer(inputs)  # Target remains outside replicated draft scope.
-        self.speculator.propose(dummy_run=True, is_profile=True)
+        self.speculator.propose(
+            dummy_run=True, is_profile=True, skip_attn_for_dummy_run=True,
+            input_batch=make_dummy(16, num_tokens, None),
+            last_hidden_states=inputs, aux_hidden_states=None,
+            num_sampled=torch.ones(16), num_rejected=torch.zeros(16),
+        )
 
     def profile_run(self):
         self._dummy_run(self.max_num_tokens)
@@ -1413,13 +1433,19 @@ def test_hyv4_profile_chunks_only_draft_and_restores_propose(
     config = _config(8)
     config.model_config = SimpleNamespace(architectures=["HYV4ForCausalLM"])
     runner = runner_module.HcuGPUModelRunnerV2(config, "hcu:0")
-    runner.max_num_tokens = 8
+    runner.max_num_tokens = 8192
+    runner.max_num_reqs = 16
+    runner.input_buffers = object()
     runner.speculator = Speculator()
     if fail:
         with pytest.raises(RuntimeError, match="draft profile failed"):
             runner.profile_run()
     else:
         runner.profile_run()
-    assert calls == [(False, 8), (True, 3), (True, 3), (True, 2)]
+    assert calls == (
+        [(False, 1152)] + [(True, 1024)] * 8
+        if chunk else [(False, 1152), (False, 1152)]
+    )
+    assert runner.max_num_tokens == 8192
     assert not in_replicated_mtp_batch()
     assert "propose" not in vars(runner.speculator)

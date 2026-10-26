@@ -259,21 +259,51 @@ class HcuGPUModelRunnerV2(GPUModelRunner):
         architectures = getattr(
             getattr(self.vllm_config, "model_config", None), "architectures", ()
         )
-        if pcp_size > 1 and speculator is not None and "HYV4ForCausalLM" in architectures:
+        profile_chunked_draft = False
+        if (
+            pcp_size > 1
+            and speculator is not None
+            and "HYV4ForCausalLM" in architectures
+        ):
+            from vllm_hcu.models.hy_v4.moe import _hyv4_moe_chunk_size
+
+            profile_chunked_draft = _hyv4_moe_chunk_size() is not None
+        if profile_chunked_draft:
             # Only draft profiling consumes the replicated global batch. Keep
             # target profiling outside this scope, including its PCP metadata.
             original_propose = speculator.propose
             had_override = "propose" in vars(speculator)
+            global_tokens = self.max_num_tokens
 
             @functools.wraps(original_propose)
             def profile_propose(*args, **kwargs):
+                from vllm.v1.worker.gpu.input_batch import InputBatch
+
+                assert kwargs["dummy_run"] and kwargs["is_profile"]
+                assert kwargs["skip_attn_for_dummy_run"]
+                assert kwargs["aux_hidden_states"] is None
+                num_reqs = min(global_tokens, self.max_num_reqs)
+                batch = InputBatch.make_dummy(
+                    num_reqs, global_tokens, self.input_buffers
+                )
+                hidden = kwargs["last_hidden_states"]
+                kwargs.update(
+                    input_batch=batch,
+                    last_hidden_states=hidden.new_zeros((global_tokens, *hidden.shape[1:])),
+                    num_sampled=torch.ones(num_reqs, dtype=torch.int32, device=hidden.device),
+                    num_rejected=torch.zeros(num_reqs, dtype=torch.int32, device=hidden.device),
+                    attn_metadata=None,
+                    slot_mappings=None,
+                )
                 with replicated_mtp_batch_scope():
                     return original_propose(*args, **kwargs)
 
             speculator.propose = profile_propose
+            self.max_num_tokens = max(1, (global_tokens // pcp_size) * 9 // 8)
             try:
                 return super().profile_run()
             finally:
+                self.max_num_tokens = global_tokens
                 if had_override:
                     speculator.propose = original_propose
                 else:
