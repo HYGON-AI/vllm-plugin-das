@@ -9,6 +9,7 @@ _TRUE_VALUES = frozenset({"1", "true", "yes", "on"})
 _FALSE_VALUES = frozenset({"0", "false", "no", "off"})
 _MASTER_SWITCH = "VLLM_HCU_USE_CUSTOM_OPS"
 _SILU_SWITCH = "VLLM_HCU_USE_CUSTOM_SILU_AND_MUL"
+_RMS_NORM_SWITCH = "VLLM_HCU_USE_CUSTOM_RMS_NORM"
 
 
 def _flag(name: str, *, default: bool) -> bool:
@@ -37,5 +38,10 @@ def silu_and_mul_enabled() -> bool:
     return custom_ops_enabled() and _flag(_SILU_SWITCH, default=True)
 
 
-__all__ = ["custom_ops_enabled", "silu_and_mul_enabled"]
+def rms_norm_enabled() -> bool:
+    """Return whether the migrated LightOp RMSNorm paths are enabled."""
 
+    return custom_ops_enabled() and _flag(_RMS_NORM_SWITCH, default=True)
+
+
+__all__ = ["custom_ops_enabled", "rms_norm_enabled", "silu_and_mul_enabled"]

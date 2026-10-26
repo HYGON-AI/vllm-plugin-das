@@ -14,6 +14,7 @@ PLUGIN_SOURCE_ROOT = (
 )
 sys.path.insert(0, os.fspath(PLUGIN_SOURCE_ROOT))
 
+from hcu_vllm_das import environment
 from hcu_vllm_das.environment import custom_ops_enabled, silu_and_mul_enabled
 
 
@@ -28,6 +29,30 @@ def test_environment_switches_default_on_and_each_can_roll_back(
     monkeypatch.setenv("VLLM_HCU_USE_CUSTOM_OPS", "0")
     assert custom_ops_enabled() is False
     assert silu_and_mul_enabled() is False
+
+
+def test_rms_norm_switch_defaults_on_and_each_level_can_roll_back(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.delenv("VLLM_HCU_USE_CUSTOM_OPS", raising=False)
+    monkeypatch.delenv("VLLM_HCU_USE_CUSTOM_RMS_NORM", raising=False)
+    assert environment.rms_norm_enabled() is True
+
+    monkeypatch.setenv("VLLM_HCU_USE_CUSTOM_OPS", "0")
+    assert environment.rms_norm_enabled() is False
+
+    monkeypatch.setenv("VLLM_HCU_USE_CUSTOM_OPS", "1")
+    monkeypatch.setenv("VLLM_HCU_USE_CUSTOM_RMS_NORM", "off")
+    assert environment.rms_norm_enabled() is False
+
+
+def test_rms_norm_switch_rejects_an_ambiguous_value(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setenv("VLLM_HCU_USE_CUSTOM_RMS_NORM", "enabled")
+
+    with pytest.raises(ValueError, match="VLLM_HCU_USE_CUSTOM_RMS_NORM"):
+        environment.rms_norm_enabled()
 
     monkeypatch.setenv("VLLM_HCU_USE_CUSTOM_OPS", "1")
     monkeypatch.setenv("VLLM_HCU_USE_CUSTOM_SILU_AND_MUL", "false")
@@ -183,4 +208,3 @@ def test_each_rollback_switch_uses_vllm_native_path(
     assert report["result"] == "native-result"
     assert ["native", "input"] in report["events"]
     assert not any(event[0] == "lightop" for event in report["events"])
-

@@ -15,7 +15,7 @@ from hcu_vllm_adapter.extensions import (
 from .version import TARGET_VLLM_RELEASE
 
 
-_CAPABILITIES = frozenset({"lightop-silu-and-mul"})
+_CAPABILITIES = frozenset({"lightop-rms-norm", "lightop-silu-and-mul"})
 _IMPLEMENTED_EXTENSION_API_VERSION = 1
 _activation_lock = threading.Lock()
 _activated = False
@@ -65,10 +65,29 @@ def activate_extension(context: ExtensionContext) -> None:
             "silu_and_mul_opt",
             "lightop.activation.silu_and_mul_opt",
         )
+        try:
+            lightop_norm = _import_module("lightop.norm")
+        except Exception as error:
+            raise DasExtensionError(
+                f"cannot import required LightOp norm module: {error}"
+            ) from error
+        _require_callable(
+            lightop_norm,
+            "rmsnorm_forward_autograd",
+            "lightop.norm.rmsnorm_forward_autograd",
+        )
+        _require_callable(
+            lightop_norm,
+            "fused_add_rms_norm",
+            "lightop.norm.fused_add_rms_norm",
+        )
 
         try:
             vllm_activation = _import_module(
                 "vllm.model_executor.layers.activation"
+            )
+            vllm_layernorm = _import_module(
+                "vllm.model_executor.layers.layernorm"
             )
             torch_utils = _import_module("vllm.utils.torch_utils")
         except Exception as error:
@@ -81,6 +100,12 @@ def activate_extension(context: ExtensionContext) -> None:
             "register_oot",
             "vllm.model_executor.layers.activation.SiluAndMul.register_oot",
         )
+        rms_norm = getattr(vllm_layernorm, "RMSNorm", None)
+        _require_callable(
+            rms_norm,
+            "register_oot",
+            "vllm.model_executor.layers.layernorm.RMSNorm.register_oot",
+        )
         _require_callable(
             torch_utils,
             "direct_register_custom_op",
@@ -89,6 +114,7 @@ def activate_extension(context: ExtensionContext) -> None:
 
         try:
             _import_module("hcu_vllm_das.silu_and_mul")
+            _import_module("hcu_vllm_das.rms_norm")
         except Exception as error:
             raise DasExtensionError(
                 f"cannot register DAS SiluAndMul capability: {error}"

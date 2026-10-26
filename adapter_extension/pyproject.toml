@@ -4,7 +4,7 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "hcu-vllm-das-plugin"
-version = "0.1.0.dev0"
+version = "0.2.0.dev0"
 description = "Optional DAS optimizations for hcu-vllm-adapter and vLLM 0.32"
 readme = "README.md"
 license = "Apache-2.0"

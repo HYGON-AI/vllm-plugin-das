@@ -19,7 +19,7 @@ def test_project_metadata_has_only_the_adapter_extension_entry_point() -> None:
     )["project"]
 
     assert metadata["name"] == "hcu-vllm-das-plugin"
-    assert metadata["version"] == "0.1.0.dev0"
+    assert metadata["version"] == "0.2.0.dev0"
     assert metadata["requires-python"] == ">=3.11,<3.15"
     assert metadata["dependencies"] == [
         "hcu-vllm-adapter>=0.1.0.dev0",
@@ -37,7 +37,7 @@ def test_package_exports_the_exact_vllm_target_without_framework_imports() -> No
 import sys
 sys.path.insert(0, {os.fspath(SOURCE_ROOT)!r})
 import hcu_vllm_das
-assert hcu_vllm_das.__version__ == "0.1.0.dev0"
+assert hcu_vllm_das.__version__ == "0.2.0.dev0"
 assert hcu_vllm_das.TARGET_VLLM_RELEASE == (0, 32, 0)
 assert hcu_vllm_das.VLLM_UPSTREAM_COMMIT == "5df63a7203cdb9328d824a27b682e77c7b9928be"
 blocked = {{"torch", "vllm", "lightop", "vllm_hcu"}}
@@ -92,7 +92,7 @@ def test_built_wheel_contains_only_the_new_plugin_namespace(tmp_path: Path) -> N
         entry_points = archive.read(entry_points_name).decode("utf-8")
 
     assert "Name: hcu-vllm-das-plugin\n" in wheel_metadata
-    assert "Version: 0.1.0.dev0\n" in wheel_metadata
+    assert "Version: 0.2.0.dev0\n" in wheel_metadata
     assert "[hcu_vllm_adapter.extensions]\n" in entry_points
     assert "das_hcu = hcu_vllm_das.extension:extension_spec\n" in entry_points
     assert any(name == "hcu_vllm_das/__init__.py" for name in names)
