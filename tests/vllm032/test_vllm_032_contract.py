@@ -42,6 +42,52 @@ def test_official_vllm_032_exposes_the_silu_oot_contract() -> None:
     assert {"forward_native", "forward_cuda"}.issubset(method_names(silu))
 
 
+def test_official_vllm_032_exposes_the_rmsnorm_oot_contract() -> None:
+    root = target_root()
+    source = root / "vllm" / "model_executor" / "layers" / "layernorm.py"
+    tree = ast.parse(source.read_text(encoding="utf-8"), filename=os.fspath(source))
+    rms_norm = find_class(tree, "RMSNorm")
+
+    decorators = [ast.unparse(value) for value in rms_norm.decorator_list]
+    assert decorators == ["CustomOp.register('rms_norm')"]
+    assert {"forward_native", "forward_cuda"}.issubset(method_names(rms_norm))
+    initializer = next(
+        item
+        for item in rms_norm.body
+        if isinstance(item, ast.FunctionDef) and item.name == "__init__"
+    )
+    parameter_names = [item.arg for item in initializer.args.args]
+    parameter_names.extend(item.arg for item in initializer.args.kwonlyargs)
+    assert parameter_names == [
+        "self",
+        "hidden_size",
+        "eps",
+        "var_hidden_size",
+        "has_weight",
+        "dtype",
+    ]
+    assigned_attributes = {
+        target.attr
+        for node in ast.walk(initializer)
+        if isinstance(node, (ast.Assign, ast.AnnAssign))
+        for target in (
+            node.targets if isinstance(node, ast.Assign) else [node.target]
+        )
+        if isinstance(target, ast.Attribute)
+        and isinstance(target.value, ast.Name)
+        and target.value.id == "self"
+    }
+    assert {
+        "has_weight",
+        "hidden_size",
+        "pass_weight",
+        "pass_weight_add",
+        "variance_epsilon",
+        "variance_size_override",
+        "weight",
+    }.issubset(assigned_attributes)
+
+
 def test_official_vllm_032_exposes_registration_interfaces() -> None:
     root = target_root()
     custom_op_path = root / "vllm" / "model_executor" / "custom_op.py"
