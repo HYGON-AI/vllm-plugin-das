@@ -7,6 +7,8 @@ import pytest
 
 pytestmark = pytest.mark.hcu
 
+SUPPORTED_LIVE_ARCHITECTURES = frozenset({"gfx936", "gfx938"})
+
 
 def _live_requested() -> bool:
     return os.environ.get("HCU_VLLM032_LIVE") == "1"
@@ -34,7 +36,7 @@ def test_installed_lightop_silu_matches_reference_and_rollback_paths(
 
     properties = torch.cuda.get_device_properties(0)
     architecture = properties.gcnArchName.split(":", 1)[0]
-    assert architecture == "gfx938"
+    assert architecture in SUPPORTED_LIVE_ARCHITECTURES
 
     torch.manual_seed(20261026)
     value = torch.randn((257, 8192), device="cuda", dtype=torch.bfloat16)

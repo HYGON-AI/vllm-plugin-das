@@ -7,6 +7,8 @@ import pytest
 
 pytestmark = pytest.mark.hcu
 
+SUPPORTED_LIVE_ARCHITECTURES = frozenset({"gfx936", "gfx938"})
+
 
 def _live_requested() -> bool:
     return os.environ.get("HCU_VLLM032_RMSNORM_LIVE") == "1"
@@ -49,7 +51,7 @@ def test_installed_lightop_rmsnorm_matches_references_and_fallbacks(
 
     properties = torch.cuda.get_device_properties(0)
     architecture = properties.gcnArchName.split(":", 1)[0]
-    assert architecture == "gfx938"
+    assert architecture in SUPPORTED_LIVE_ARCHITECTURES
 
     monkeypatch.setenv("VLLM_HCU_USE_CUSTOM_OPS", "1")
     monkeypatch.setenv("VLLM_HCU_USE_CUSTOM_RMS_NORM", "1")
