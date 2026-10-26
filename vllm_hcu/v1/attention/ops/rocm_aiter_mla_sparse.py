@@ -1582,6 +1582,7 @@ def _hcu_fp4_sparse_attn_indexer_native(
     an FP8 reader after FP4 allocation.
     """
     metadata = get_forward_context().attn_metadata
+    prefill_width = ((max_model_len + 3) // 4) * 4
     if not isinstance(metadata, dict):
         # Account for the new byte-staging peak during vLLM's memory profile:
         # gathered bytes + native pool + slot/index tensors. Do not let the
@@ -1589,7 +1590,7 @@ def _hcu_fp4_sparse_attn_indexer_native(
         rows = hidden_states.shape[0]
         width = ((max_model_len + 63) // 64) * 64
         staging_bytes = rows * width * (2 * 68 + 3 * 8 + 1)
-        prefill_bytes = total_seq_lens * 68 + rows * max_model_len * 4
+        prefill_bytes = total_seq_lens * 68 + rows * prefill_width * 4
         _workspace = torch.empty(max(staging_bytes, prefill_bytes),
                                  dtype=torch.uint8, device=hidden_states.device)
         return topk_indices_buffer
@@ -1629,7 +1630,7 @@ def _hcu_fp4_sparse_attn_indexer_native(
                 weights[chunk.token_start:chunk.token_end],
                 chunk.cu_seqlen_ks,
                 chunk.cu_seqlen_ke,
-                max_seqlen_k=max_model_len,
+                max_seqlen_k=prefill_width,
             )
             # LightOp FP4 prefill returns window-local columns, not columns
             # in the concatenated K workspace. Candidate IDs/top-k are local

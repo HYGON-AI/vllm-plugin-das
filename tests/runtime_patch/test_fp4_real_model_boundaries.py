@@ -245,3 +245,111 @@ def test_real_text_config_dp8_dspark5_domain_and_per_dimension_rejections(monkey
     assert not patch._fp4_domain_requested(target, cfg)
     monkeypatch.setenv("VLLM_HCU_USE_CUSTOM_OPS", "0")
     assert not patch._fp4_domain_requested(target, _domain_config())
+
+
+@pytest.mark.parametrize("max_model_len,expected_width", [
+    (4096, 4096), (4097, 4100), (4098, 4100), (4099, 4100),
+])
+def test_prefill_aligns_output_width_without_changing_gather_or_row_lengths(
+    max_model_len, expected_width
+):
+    page_count = (max_model_len + 63) // 64
+    block_table = torch.zeros(3, page_count, dtype=torch.int32)
+    block_table[0] = torch.arange(page_count, dtype=torch.int32)
+    block_table[1, 0] = page_count
+    starts = torch.tensor([0, max_model_len, max_model_len + 2], dtype=torch.int32)
+    ends = torch.tensor([max_model_len, max_model_len + 2, max_model_len + 2],
+                        dtype=torch.int32)
+    chunk = SimpleNamespace(
+        token_start=0, token_end=3, local_total_seq_lens=max_model_len + 2,
+        block_table=block_table,
+        token_to_seq=torch.cat((torch.zeros(max_model_len, dtype=torch.int32),
+                                torch.ones(2, dtype=torch.int32))),
+        cu_seq_lens=starts, cu_seqlen_ks=starts, cu_seqlen_ke=ends,
+    )
+    layer = SimpleNamespace(prefill=SimpleNamespace(chunks=[chunk]), decode=None,
+                            num_prefills=3, num_decodes=0)
+    calls = []
+
+    def gather(cache, slots, page_size):
+        assert page_size == 64
+        expected_slots = torch.cat((torch.arange(max_model_len),
+                                    torch.tensor([page_count * 64, page_count * 64 + 1])))
+        assert torch.equal(slots, expected_slots)
+        return (torch.zeros(max_model_len + 2, 64, dtype=torch.int8),
+                torch.zeros(max_model_len + 2, dtype=torch.int32))
+
+    def scorer(q, packed, scales, weights, ks, ke, *, max_seqlen_k):
+        assert max_seqlen_k == expected_width
+        assert max_seqlen_k % 4 == 0
+        assert ks is starts and ke is ends
+        assert packed.shape[0] == scales.shape[0] == max_model_len + 2
+        logits = torch.arange(expected_width, dtype=torch.float32).repeat(3, 1)
+        for row, length in enumerate((max_model_len, 2, 0)):
+            logits[row, length:] = 1e30
+        calls.append(max_seqlen_k)
+        return logits
+
+    fn = _reader(layer, lightop_gather_index_k_fp4=gather, lightop_fp4_prefill=scorer)
+    cache = torch.zeros(page_count + 1, 64, 68, dtype=torch.uint8)
+    out = torch.full((3, 3), -9, dtype=torch.int32)
+    fn(None, "cache", cache, _query(3), None, torch.ones(3, 32), 128, "ue8m0", 3,
+       128, max_model_len, max_model_len + 2, out, skip_k_cache_insert=True)
+    assert calls == [expected_width]
+    assert out.tolist() == [[max_model_len - 1, max_model_len - 2, max_model_len - 3],
+                            [0, 1, -1], [-1, -1, -1]]
+    print(f"P2_RUNTIME max_model_len={max_model_len} scorer_width={calls[0]} "
+          f"topk={out[0].tolist()}")
+
+
+def test_topk_masks_extreme_alignment_padding_and_returns_invalid_sentinel():
+    fn = _reader(None)
+    topk = fn.__globals__["_topk_indices_torch"]
+    logits = torch.arange(4100, dtype=torch.float32).repeat(3, 1)
+    row_lens = torch.tensor([4097, 2, 0], dtype=torch.int32)
+    for row, length in enumerate(row_lens.tolist()):
+        logits[row, length:] = 1e30
+    assert bool(torch.all(logits[0, 4097:] > 1e20))
+    unmasked = torch.topk(logits[0], k=3).indices
+    assert bool(torch.all(unmasked >= 4097))
+    selected = topk(logits, 3, row_ends=row_lens)
+    assert selected.tolist() == [[4096, 4095, 4094], [0, 1, -1], [-1, -1, -1]]
+    assert bool(torch.all(selected[0] < 4097))
+    assert torch.equal(selected, topk(logits[:, :4097], 3, row_ends=row_lens))
+    print(f"P2_PADDING unmasked={unmasked.tolist()} masked={selected.tolist()}")
+
+
+@pytest.mark.parametrize("max_model_len,prefill_width", [
+    (4096, 4096), (4097, 4100), (4098, 4100), (4099, 4100),
+])
+@pytest.mark.parametrize("total_seq_lens", [2, 32768])
+def test_fp4_profile_accounts_for_aligned_prefill_and_unchanged_staging(
+    max_model_len, prefill_width, total_seq_lens
+):
+    allocations = []
+
+    def allocate(size, *, dtype, device):
+        allocations.append((size, dtype, device))
+        return object()
+
+    hidden = torch.zeros(2, 128)
+    out = torch.zeros(2, 3, dtype=torch.int32)
+    fn = _reader(None, torch=SimpleNamespace(empty=allocate, uint8=torch.uint8,
+                                            Tensor=torch.Tensor),
+                 get_forward_context=lambda: SimpleNamespace(attn_metadata=None))
+    returned = fn(hidden, "cache", None, None, None, None, 128, "ue8m0", 3,
+                  128, max_model_len, total_seq_lens, out, skip_k_cache_insert=True)
+    staging_bytes = 2 * ((max_model_len + 63) // 64 * 64) * (2 * 68 + 3 * 8 + 1)
+    prefill_bytes = total_seq_lens * 68 + 2 * prefill_width * 4
+    assert returned is out
+    assert allocations == [(max(staging_bytes, prefill_bytes), torch.uint8, hidden.device)]
+    assert allocations[0][0] >= staging_bytes
+    assert allocations[0][0] >= prefill_bytes
+    if total_seq_lens == 32768:
+        old_prefill_bytes = total_seq_lens * 68 + 2 * max_model_len * 4
+        assert prefill_bytes > staging_bytes
+        assert allocations[0][0] - old_prefill_bytes == 2 * (prefill_width - max_model_len) * 4
+    else:
+        assert staging_bytes > prefill_bytes
+    print(f"P2_PROFILE max_model_len={max_model_len} total_seq_lens={total_seq_lens} "
+          f"prefill={prefill_bytes} staging={staging_bytes} allocated={allocations[0][0]}")

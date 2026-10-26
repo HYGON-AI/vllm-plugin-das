@@ -13,6 +13,7 @@ from vllm_hcu.model_executor.layers.fp4_indexer import (
     fp4_cache_view,
 )
 from vllm_hcu.patch.worker.core_fix import patch_deepseek_v41_indexer_k_layout as patch
+from vllm_hcu.patch.worker.core_fix import patch_fp4_packer_lowering as lowering
 
 
 def _v41_config(ratios=(1, 0, 1)):
@@ -128,7 +129,8 @@ def test_fp4_domain_keeps_unsupported_ratios_closed(monkeypatch):
 
 
 def test_allocation_metadata_selector_and_backend_geometry_are_consistent(monkeypatch):
-    target, _, _, _ = _target_module(monkeypatch, fp4=True)
+    target, _, store, _ = _target_module(monkeypatch, fp4=True)
+    _mock_lowering_modules(monkeypatch, store)
     backend = ModuleType("vllm.v1.attention.backends.mla.indexer")
     backend.dsa_indexer_uses_fp4 = lambda cfg: False
     monkeypatch.setitem(sys.modules, backend.__name__, backend)
@@ -167,3 +169,113 @@ def test_multi_request_chunk_maps_local_positions_to_physical_pages():
     torch.testing.assert_close(
         slots, torch.tensor([5 * 64, 5 * 64 + 1, 9 * 64, 9 * 64 + 1])
     )
+
+
+def _mock_lowering_modules(monkeypatch, store):
+    original = lambda x, y: x
+    owners = (
+        ModuleType("vllm.models.deepseek_v4.common.ops.fused_indexer_q"),
+        store,
+        ModuleType("vllm.models.deepseek_v41.common.ops.fused_compress_quant_cache"),
+    )
+    for owner in owners:
+        owner._fp32x2_to_fp4x2 = original
+        monkeypatch.setitem(sys.modules, owner.__name__, owner)
+    # Isolate only source recognition; use real apply/rebind/selector logic.
+    monkeypatch.setattr(
+        lowering, "_is_audited_inline_asm", lambda value: value is original
+    )
+    monkeypatch.setenv("VLLM_HCU_USE_FP4_PACKER_LOWERING", "1")
+    return owners, original
+
+
+@pytest.fixture
+def fp4_selector(monkeypatch):
+    target, _, store, _ = _target_module(monkeypatch, fp4=True)
+    owners, original = _mock_lowering_modules(monkeypatch, store)
+    backend = ModuleType("vllm.v1.attention.backends.mla.indexer")
+    backend.dsa_indexer_uses_fp4 = lambda cfg: False
+    monkeypatch.setitem(sys.modules, backend.__name__, backend)
+    target.dsa_indexer_uses_fp4 = lambda cfg: False
+
+    class Backend:
+        @staticmethod
+        def get_supported_kernel_block_sizes():
+            return [128]
+
+    target.DeepseekV41IndexerBackend = Backend
+    cfg = _v41_config()
+    cfg.model_config.hf_config.model_type = "deepseek_v41"
+    assert patch.apply_to_module(target)
+    return target, backend, cfg, owners, original
+
+
+def test_fp4_lowering_off_rejected_before_allocation(monkeypatch, fp4_selector):
+    target, _, cfg, owners, original = fp4_selector
+    monkeypatch.setenv("VLLM_HCU_USE_FP4_PACKER_LOWERING", "0")
+    allocations = []
+    with pytest.raises(RuntimeError, match="status=OFF"):
+        if target.dsa_indexer_uses_fp4(cfg):
+            allocations.append("FP4 cache allocation")
+    assert allocations == []
+    assert all(owner._fp32x2_to_fp4x2 is original for owner in owners)
+
+
+def test_fp4_lowering_binds_all_owners_and_is_idempotent(fp4_selector):
+    target, backend, cfg, owners, original = fp4_selector
+    # The lowering callback has not run; the selector must bind explicitly.
+    assert target.dsa_indexer_uses_fp4(cfg)
+    assert backend.dsa_indexer_uses_fp4(cfg)
+    assert target.dsa_indexer_uses_fp4(cfg)
+    for owner in owners:
+        assert owner._fp32x2_to_fp4x2 is lowering._fp32x2_to_fp4x2_arithmetic
+        assert getattr(owner, lowering._ORIGINAL) is original
+    assert lowering.apply_to_module(owners[1]) is False
+    lowering.require_fp4_packer_lowering()
+
+
+def test_fp4_upstream_changed_rejected_without_partial_binding(fp4_selector):
+    target, _, cfg, owners, original = fp4_selector
+    changed = object()
+    owners[2]._fp32x2_to_fp4x2 = changed
+    with pytest.raises(RuntimeError, match="status=UPSTREAM_CHANGED"):
+        target.dsa_indexer_uses_fp4(cfg)
+    assert owners[0]._fp32x2_to_fp4x2 is original
+    assert owners[1]._fp32x2_to_fp4x2 is original
+    assert owners[2]._fp32x2_to_fp4x2 is changed
+
+
+@pytest.mark.parametrize("owner_index", [0, 1, 2])
+def test_fp4_rejects_each_owner_binding_drift(fp4_selector, owner_index):
+    target, _, cfg, owners, _ = fp4_selector
+    assert target.dsa_indexer_uses_fp4(cfg)
+    owners[owner_index]._fp32x2_to_fp4x2 = object()
+    with pytest.raises(RuntimeError, match="status=APPLIED") as error:
+        target.dsa_indexer_uses_fp4(cfg)
+    assert owners[owner_index].__name__ in str(error.value)
+
+
+def test_fp4_off_does_not_call_lowering_check(monkeypatch, fp4_selector):
+    target, backend, cfg, owners, original = fp4_selector
+
+    def unexpected_check():
+        raise AssertionError("FP4 OFF must not check lowering")
+
+    monkeypatch.setattr(lowering, "require_fp4_packer_lowering", unexpected_check)
+    monkeypatch.setenv("VLLM_HCU_USE_FP4_INDEXER", "0")
+    monkeypatch.setenv("VLLM_HCU_USE_FP4_PACKER_LOWERING", "0")
+    assert target.dsa_indexer_uses_fp4(cfg) is False
+    assert backend.dsa_indexer_uses_fp4(cfg) is False
+    assert all(owner._fp32x2_to_fp4x2 is original for owner in owners)
+
+
+def test_fp4_domain_rejection_precedes_lowering_check(monkeypatch, fp4_selector):
+    target, _, cfg, _, _ = fp4_selector
+
+    def unexpected_check():
+        raise AssertionError("Unsupported domain must fail before lowering")
+
+    monkeypatch.setattr(lowering, "require_fp4_packer_lowering", unexpected_check)
+    cfg.parallel_config.decode_context_parallel_size = 8
+    with pytest.raises(RuntimeError, match="outside supported domain"):
+        target.dsa_indexer_uses_fp4(cfg)

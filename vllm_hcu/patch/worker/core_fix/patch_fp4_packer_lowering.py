@@ -165,6 +165,40 @@ def apply_to_module(module: ModuleType) -> bool:
     return True
 
 
+def require_fp4_packer_lowering() -> None:
+    """Require arithmetic bindings before the selector admits FP4 allocation."""
+    if not _enabled():
+        raise PatchCompatibilityError(
+            "HCU FP4 indexer requires VLLM_HCU_USE_FP4_PACKER_LOWERING=1 "
+            "under VLLM_HCU_USE_CUSTOM_OPS=1; lowering status=OFF"
+        )
+    owner_names = (
+        "vllm.models.deepseek_v4.common.ops.fused_indexer_q",
+        TARGET_MODULE,
+        "vllm.models.deepseek_v41.common.ops.fused_compress_quant_cache",
+    )
+    target = None
+    try:
+        target = load_exact_module(TARGET_MODULE, None)
+        apply_to_module(target)
+        mismatched = [
+            name for name in owner_names
+            if getattr(load_exact_module(name, None), "_fp32x2_to_fp4x2", None)
+            is not _fp32x2_to_fp4x2_arithmetic
+        ]
+    except (ImportError, OSError, PatchCompatibilityError) as exc:
+        status = getattr(target, _STATUS, "UNAVAILABLE")
+        raise PatchCompatibilityError(
+            f"HCU FP4 packer lowering unavailable; status={status}; {exc}"
+        ) from exc
+    if mismatched:
+        status = getattr(target, _STATUS, "NOT_APPLIED")
+        raise PatchCompatibilityError(
+            f"HCU FP4 packer lowering binding mismatch; status={status}; "
+            f"expected _fp32x2_to_fp4x2_arithmetic in {', '.join(mismatched)}"
+        )
+
+
 def apply(module: ModuleType | None = None) -> bool:
     return apply_to_module(load_exact_module(TARGET_MODULE, module))
 
@@ -175,5 +209,6 @@ __all__ = [
     "TARGETS",
     "apply",
     "apply_to_module",
+    "require_fp4_packer_lowering",
     "_fp32x2_to_fp4x2_arithmetic",
 ]

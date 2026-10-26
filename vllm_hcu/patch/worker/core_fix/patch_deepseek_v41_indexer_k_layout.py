@@ -244,6 +244,8 @@ def apply_to_module(module: ModuleType) -> bool:
             if blockers:
                 raise RuntimeError("HCU FP4 indexer requested outside supported domain: "
                                    + "; ".join(blockers))
+            from .patch_fp4_packer_lowering import require_fp4_packer_lowering
+            require_fp4_packer_lowering()
             return True
 
         target.dsa_indexer_uses_fp4 = select_fp4
