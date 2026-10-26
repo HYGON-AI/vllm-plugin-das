@@ -39,7 +39,6 @@ from vllm.model_executor.layers.fused_moe.fused_moe_method_base import (
 from vllm.model_executor.layers.fused_moe.fused_moe_modular_method import (
     FusedMoEModularMethod,
 )
-from vllm.model_executor.layers.fused_moe.modular_kernel import join_dp_moe_pipe
 from vllm.model_executor.layers.fused_moe.routed_experts import (
     RoutedExperts,
 )
@@ -973,7 +972,12 @@ class MoERunner(MoERunnerInterface):
         )
         # A pipelined DP MoE (HCU_DP_MOE_PIPE_MIN_TOKENS) left its last reduce
         # on a side stream; the late shared expert launched above overlaps it.
-        join_dp_moe_pipe()
+        if getattr(self, "_hcu_step5_owner", False):
+            from vllm.model_executor.layers.fused_moe.modular_kernel import (
+                join_dp_moe_pipe,
+            )
+
+            join_dp_moe_pipe()
 
         return (
             self._shared_experts.output if self._shared_experts is not None else None,
@@ -1297,7 +1301,7 @@ class MoERunner(MoERunnerInterface):
         return self._maybe_reduce_final_output(shared_output + hidden_states, None)
 
     def _wait_late_shared_experts(self) -> None:
-        if self._shared_experts is not None:
+        if getattr(self, "_hcu_step5_owner", False) and self._shared_experts is not None:
             self._shared_experts.wait_late()
 
     def _maybe_combine(

@@ -133,7 +133,8 @@ def test_foreign_shared_experts_ignore_inherited_late_stream_threshold():
 
 
 @pytest.mark.parametrize("owner", [False, True])
-def test_combine_hooks_install_only_for_step5_constructor(owner):
+@pytest.mark.parametrize("owns_dispatch", [False, True])
+def test_combine_hooks_install_only_for_step5_constructor(owner, owns_dispatch):
     path=ROOT/"vllm_hcu/model_executor/layers/fused_moe/moe_runner.py"
     tree=ast.parse(path.read_text(encoding="utf-8"))
     cls=next(n for n in tree.body if isinstance(n,ast.ClassDef) and n.name=="MoERunner")
@@ -141,12 +142,13 @@ def test_combine_hooks_install_only_for_step5_constructor(owner):
     index=next(i for i,n in enumerate(ctor.body) if isinstance(n,ast.Assign) and any(
         isinstance(t,ast.Attribute) and t.attr=="_ep_fused_combine" for t in n.targets))
     calls=[]
-    ns=dict(self=SimpleNamespace(_hcu_step5_owner=owner),_EP_FUSED_COMBINE=True,
+    ns=dict(self=SimpleNamespace(_hcu_step5_owner=owner,
+        _quant_method=SimpleNamespace(hcu_owns_dispatch=owns_dispatch)),_EP_FUSED_COMBINE=True,
         shared_experts=object(),moe_config=SimpleNamespace(dp_size=4,pcp_size=1,
         is_sequence_parallel=False,skip_final_all_reduce=False),routed_scaling_factor=1.0,
         routed_input_transform=None,routed_output_transform=None,
         _install_step5_combine_hooks=lambda:calls.append("installed"))
     exec(compile(ast.Module(body=ctor.body[index:index+2],type_ignores=[]),str(path),"exec"),ns)
-    assert calls==(["installed"] if owner else [])
+    assert calls==(["installed"] if owner and not owns_dispatch else [])
     assert not any(isinstance(n,ast.If) and isinstance(n.test,ast.Name)
                    and n.test.id=="_EP_FUSED_COMBINE" for n in tree.body)

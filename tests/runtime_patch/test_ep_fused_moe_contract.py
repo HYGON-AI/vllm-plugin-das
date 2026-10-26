@@ -263,6 +263,8 @@ def test_modular_chunk_scratch_has_independent_full_output(chunk, full):
         "current_workspace_manager": lambda: SimpleNamespace(get_simultaneous=allocate),
         "_resize_cache": lambda tensor, shape: tensor.flatten()[:math.prod(shape)].view(shape),
         "_step5_ep_workspace_announced": False,
+        "henvs": SimpleNamespace(VLLM_HCU_USE_CUSTOM_OPS=False),
+        "get_moe_workspaces": lambda manager, specs, growth: manager.get_simultaneous(*specs),
     }
     fn = load_function(
         "vllm_hcu/model_executor/layers/fused_moe/modular_kernel.py",
