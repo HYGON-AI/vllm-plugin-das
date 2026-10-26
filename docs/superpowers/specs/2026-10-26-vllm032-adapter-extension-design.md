@@ -2,7 +2,8 @@
 
 ## Intent
 
-Produce a real, independently installable DAS optimization plugin for the
+Produce a real, independently installable DAS optimization plugin subproject
+under `adapter_extension/` for the
 official vLLM `v0.32.0` release while preserving `hcu-vllm-adapter` as the
 only owner of HCU platform selection and baseline runtime lifecycle.
 
@@ -15,7 +16,7 @@ capabilities.
 
 ## Goals
 
-- Build a pure-Python `hcu-vllm-das-plugin` wheel targeting vLLM release
+- Build a pure-Python `adapter_extension/` `hcu-vllm-das-plugin` wheel targeting vLLM release
   `0.32.0`.
 - Expose exactly one runtime entry point:
   `hcu_vllm_adapter.extensions: das_hcu =
@@ -69,22 +70,26 @@ runtime surface and importing the root namespace could execute legacy setup.
 An accidental import would be difficult to distinguish from an authorized
 port. It is rejected for the first production slice.
 
-### New optimization-only namespace and wheel (selected)
+### New optimization-only subproject, namespace, and wheel (selected)
 
-Create `hcu_vllm_das` and package only migrated modules. The original
-`vllm_hcu` tree stays in Git as the pinned migration source but is absent from
-the wheel. Each capability enters the new namespace only with its own vLLM
-0.32 contract and runtime evidence. This makes wheel inspection an enforceable
-production boundary and avoids package-file collisions with historical DAS
-installations.
+Create `adapter_extension/src/hcu_vllm_das` and package only migrated modules.
+The root project and original `vllm_hcu` tree stay unchanged in Git as the
+pinned 0.28 migration source, but they are absent from the new wheel. Each
+capability enters the new namespace only with its own vLLM 0.32 contract and
+runtime evidence. This makes wheel inspection an enforceable production
+boundary, keeps the historical test suite usable as reference evidence, and
+avoids package-file collisions with historical DAS installations. Production
+instructions must explicitly build `adapter_extension/`; installing the
+repository root remains a 0.28 operation and is forbidden in a 0.32 stack.
 
 ## Package and activation boundary
 
-`setup.py` becomes dependency-light and does not import Torch or compile the
-legacy native extension. It discovers only `hcu_vllm_das` packages and defines
-only the adapter extension entry point. Runtime environments supply the
-audited vLLM, adapter, Torch/DTK, and LightOp wheels; installation uses
-`--no-deps` so pip cannot replace that prepared stack.
+`adapter_extension/pyproject.toml` is dependency-light and does not import
+Torch or compile the legacy native extension. It discovers only
+`hcu_vllm_das` packages and defines only the adapter extension entry point.
+Runtime environments supply the audited vLLM, adapter, Torch/DTK, and LightOp
+wheels; installation uses `--no-deps` so pip cannot replace that prepared
+stack.
 
 `hcu_vllm_das.extension` is safe during metadata discovery. Its factory
 returns adapter `ExtensionSpec(name="das-hcu", api_version=1, priority=100,
