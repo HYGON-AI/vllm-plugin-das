@@ -160,6 +160,44 @@ def test_fp8_idle_dp_rank_participates_and_clears_stale_routes(runtime, monkeypa
     assert len(calls) == 1  # All ranks empty: no collective required.
 
 
+def test_pcp_ignores_global_dp_metadata_and_launches_rank_local_tokens(
+    runtime, monkeypatch,
+):
+    _, moe, layer = valid_config()
+    moe.pcp_size = 8
+    method = runtime.HcuMegaMoEMethod(moe, "fp8", force_normal=True)
+    buf = NS(
+        topk_idx=torch.ones(16, 6, dtype=torch.int64),
+        topk_weights=torch.ones(16, 6),
+        x=torch.empty(16, 4096),
+        x_sf=torch.empty(16),
+    )
+    method._buffer, method._l1, method._l2 = buf, {}, {}
+    calls = []
+    fake = ModuleType("megamoe")
+    fake.cast_to_fp8_channelwise = lambda x: (
+        x.float(), torch.ones(x.shape[0], 1)
+    )
+    fake.fp8_w8a8_mega_moe = (
+        lambda *args, **kwargs: calls.append(kwargs)
+    )
+    monkeypatch.setitem(sys.modules, "megamoe", fake)
+    monkeypatch.setattr(torch.cuda, "is_current_stream_capturing", lambda: False)
+    # PCP scheduler coordination may retain the unsplit token count.  MegaMoE
+    # must size its dispatch from this rank's already-partitioned input.
+    monkeypatch.setattr(runtime, "get_forward_context", lambda: NS(
+        dp_metadata=NS(num_tokens_across_dp_cpu=torch.tensor([16]))
+    ))
+    x = torch.ones(2, 4096, dtype=torch.bfloat16)
+    method.apply(
+        layer, x, torch.ones(2, 6), torch.zeros(2, 6, dtype=torch.int64)
+    )
+
+    assert len(calls) == 1
+    assert calls[0]["capacity_num_tokens"] == 2
+    assert calls[0]["megamoe_backend"] == "normal"
+
+
 def test_fp8_stages_routes_and_scales(runtime, monkeypatch):
     _, moe, layer = valid_config()
     method = runtime.HcuMegaMoEMethod(moe, "fp8")
