@@ -31,15 +31,20 @@ is how many of those rows are real (``< N``)::
     shard  mlp attn_res(prefix_local, block_residual[rows_r]) + post-norm
     shard  KimiMoE: gate, latent down-proj, DeepEP dispatch of S rows,
            masked GEMM, combine, latent up-proj
-           shared expert: AG(x_local)->TP-sharded MLP->RS  (collectives 2,3)
+           shared expert: plain MLP(x_local) over disable_tp full-width
+           (replicated) weights -- no collective; the amd KimiMLP is
+           rebuilt at layer construction (see _replicate_shared_experts)
     shard  prefix_local += moe_local
-    AG     -> prefix_sum[N_pad] -> [:N]           (collective 4)
+    AG     -> prefix_sum[N_pad] -> [:N]           (collective 2)
 
-Per MoE layer this is RS+AG+RS+AG. Today it is AR(o_proj) + AR(shared
-expert), and an AR moves the same bytes as RS+AG, so TP communication
-volume stays the same. Each rank's DeepEP dispatch drops from ``N`` to
-``ceil(N/TP)`` rows. The trade is 4 collective launches instead of 2, which
-matters when decode is latency-bound (see risk R1).
+Per MoE layer this is RS+AG (2 collectives; today it is AR(o_proj) + AR
+(shared expert), and an AR moves the same bytes as RS+AG, so TP
+communication volume stays the same), and the shared expert contributes
+none of them: its weights are rebuilt as disable_tp full-width
+parameters -- the nvidia ``KimiMLP`` replicate semantics, applied here by
+reconstructing the projections because the amd construction ships no
+replication switch. Each rank's DeepEP dispatch drops from ``N`` to
+``ceil(N/TP)`` rows.
 
 Dense layers (``first_k_dense_replace``) keep the original forward. Their
 TP-sharded ``KimiMLP`` would need the same AG/RS pair and gains nothing from
@@ -62,11 +67,17 @@ partial output over TP in ``_maybe_reduce_shared_expert_output``. Once TP
 ranks hold different rows, an all-reduce over that sharded domain would sum
 index-aligned partials of DIFFERENT global rows (rank r's index u is global
 row r*S+u), so the result would be wrong with no error raised. For SP
-layers this patch therefore, at the instance level only:
+layers this patch, at the instance level only:
 
-* wraps the shared expert ``forward`` as ``AG(x_local) -> MLP -> RS``, which
-  gives exact rows for this rank's shard
-  (``RS(MLP_r(AG(x)))[rows_r] == AR(MLP_r(x))[rows_r]``);
+* rebuilds the shared expert's two projections as ``disable_tp``
+  full-width parameters (``_replicate_shared_experts``), so the shared
+  expert runs plain ``MLP(x_local)`` with exact per-rank rows and needs no
+  collective -- the nvidia ``KimiMLP`` replicate semantics (and
+  deepseek_v2's ``ReplicatedLinear`` shared experts) that upstream uses
+  for the same problem, applied by reconstructing the projections since
+  the amd construction ships no replication switch. Weights load at their
+  full widths afterwards -- identical loading semantics to a
+  ``ReplicatedLinear``;
 * makes that runner's ``_maybe_reduce_shared_expert_output`` a passthrough;
 * checks on layer construction (Python only, before any capture) that the
   runner has no other TP reduction left: ``moe_config.tp_size == 1`` (EP),
@@ -74,9 +85,14 @@ layers this patch therefore, at the instance level only:
   combine, the runner is not in upstream SP mode, and DBO is off. If any
   check fails it raises instead of producing wrong numerics.
 
-Upstream solves this with ``ReplicatedLinear`` shared experts when
-``is_sequence_parallel`` is set (deepseek_v2). That is not possible here
-without re-sharding the loaded W4A8 shared-expert weights.
+Cost: each rank streams the entire shared-expert weight instead of 1/TP of
+it (about TP times the sharded layout's per-rank bytes), so the decode
+shared expert GEMMs read TP-times more weight rows on small M. The prod
+trace that motivated this (2026-10-26) shows the sharded wrap's two extra
+pynccl collectives dominating layer latency (~77us each vs sglang's
+12-19us aiter kernels), which the replication removes entirely; whether
+the larger GEMM reads are cheaper than ~155us/layer of collectives must be
+measured (see R1).
 
 Trap 1: the attn-res residual domain
 ====================================
@@ -207,14 +223,14 @@ probed here (no role-separation accessors, no resolution latch).
   resolve this module through ``sys.modules``, so the already-registered ops
   keep calling the live code even after a reload of the patch module.
 
-Breakable cudagraph: the MoE body (including the shared expert's AG/RS) is
-captured by the HCU MoE replacement, so every SP collective inside a decode
-step is captured alongside it. The per-call predicate re-evaluates at
-capture time and selects the TP pynccl comm for captured segments, so
-capture and replay use the same communicator. Eager steps keep the stock
-routing (reduce-scatter on TP pynccl, all-gather on c10d). Each collective's
-comm is fixed per phase, so interleaving prefill and decode never changes
-which comm a given call uses.
+Breakable cudagraph: the MoE body (the shared expert is a plain replicated
+MLP inside it) is captured by the HCU MoE replacement, so every SP
+collective inside a decode step is captured alongside it. The per-call
+predicate re-evaluates at capture time and selects the TP pynccl comm for
+captured segments, so capture and replay use the same communicator. Eager
+steps keep the stock routing (reduce-scatter on TP pynccl, all-gather on
+c10d). Each collective's comm is fixed per phase, so interleaving prefill
+and decode never changes which comm a given call uses.
 
 Composition and provenance
 ==========================
@@ -240,11 +256,17 @@ workstream.
 
 Known risks
 ===========
-R1 latency: decode does 4 RCCL collectives per MoE layer instead of 2 ARs,
-   and the displaced ARs were most likely custom quick-reduce/aiter IPC
+R1 latency: decode does 2 RCCL collectives per MoE layer (o_proj RS +
+   layer-tail AG; the replicated shared expert needs none) instead of 2
+   ARs, and the displaced ARs were most likely custom quick-reduce/aiter IPC
    kernels (``CudaCommunicator.all_reduce`` prefers them over pynccl on
    ROCm), while the RS/AG here go to raw pynccl. At ``N <= 128`` both the
    a2a and the GEMM are latency-bound, so the net gain must be measured.
+   Prod-trace context (2026-10-26): an intermediate version that kept the
+   shared expert TP-sharded (AG->MLP->RS wrap) measured ~4x77us of pynccl
+   per layer vs sglang's single aiter RS+AG pair (~31.5us/layer) -- the
+   shared pair was the dominant, structurally redundant part and is now
+   gone; the remaining per-layer cost is the o_proj RS + tail AG pair.
    The compile-safe rewrite adds small constant costs even on already
    padded batches: one unconditional F.pad copy of the ``o_proj`` partial
    (aten returns a clone rather than the input) and an ``index_select``
@@ -252,22 +274,23 @@ R1 latency: decode does 4 RCCL collectives per MoE layer instead of 2 ARs,
    took a view. Follow-up: use
    ``ca_comm.custom_reduce_scatter`` / ``custom_all_gather``
    for the captured phase (same approach as ``patch_qwen4_exp_sp``, which
-   tries custom kernels first), or cross-layer SP that keeps ``prefix_sum``
+   tries custom kernels first -- note neither API exists today; an IPC/aiter
+   custom RS+AG pair would have to be built, mirroring ``ipc_all_gather``),
+   or cross-layer SP that keeps ``prefix_sum``
    and ``block_residual`` sharded and AGs only the normed attention input.
    That needs ``KimiLinearModel.forward`` changes and is out of scope here.
 R2 numerics: RS+AG versus AR can sum in a different order, so results match
    within fp tolerance, not bit-for-bit. Row-wise kernels (attn_res, RMSNorm,
    router GEMM) may choose different tiles for ``S`` rows than for ``N`` rows.
-R3 shared-expert collectives inside the DeepEP MK window: ``reference_paths``
-   pins the shared expert to the main stream, but DeepEP LL supports async
-   finalize, so the shared expert (now including its AG and RS) runs in the
-   MK_INTERNAL_OVERLAPPED window between ``finalize_async`` and the receive
-   hook, where previously no TP collective ran. Every rank runs the same
-   order and DeepEP LL does not use RCCL, so this is stream-safe, but two
-   RCCL kernels now sit between the captured DeepEP send and recv kernels:
-   treat long prefill/decode interleave soak as a mandatory validation
-   (see A4). Correcting the earlier claim that the window could not host
-   these collectives.
+R3 replicated shared-expert weight traffic: the shared expert now runs as
+   a plain TP-replicated MLP inside the DeepEP MK_INTERNAL_OVERLAPPED
+   window (``reference_paths`` pins it to the main stream; DeepEP LL
+   supports async finalize). No RCCL runs in that window anymore -- the
+   sharded wrap's AG/RS pair between the captured DeepEP send and recv
+   kernels is gone -- but each rank's shared-expert GEMMs now read TP
+   times more weight bytes per step, and the shortened window can expose
+   previously hidden DeepEP RDMA wait on the receive side. Measure both
+   against the sharded baseline before/after rolling out.
 R4 coupling: depends on the HCU ``MoERunner`` reduction layout. The
    construction-time check fails hard if that layout changes. Also depends on
    ``o_proj`` being the last op of ``self_attn`` and on ``RowParallelLinear``
@@ -684,24 +707,105 @@ def _attach_padding_window(moe, tp_rank: int, tp_size: int) -> None:
     router._hcu_sp_padding_window = (tp_rank, tp_size)
 
 
-def _wrap_shared_experts(shared: torch.nn.Module, tp_size: int) -> None:
-    down_proj = getattr(shared, "down_proj", None)
-    if getattr(down_proj, "reduce_results", None) is not False:
+def _build_replicated_linears(shared: torch.nn.Module):
+    """Lazy class lookup so tests can stub the vllm linear constructors."""
+    from vllm.model_executor.layers.linear import (
+        MergedColumnParallelLinear,
+        RowParallelLinear,
+    )
+
+    return MergedColumnParallelLinear, RowParallelLinear
+
+
+def _replicate_shared_experts(shared: torch.nn.Module, tp_size: int) -> str:
+    """Rebuild ``shared``'s projections with full-width disable_tp weights.
+
+    nvidia ``KimiMLP`` replicate semantics (``vllm/models/kimi_k3/nvidia/
+    model.py``: under sequence parallelism the shared expert's projections
+    are ``disable_tp``-replicated and the block needs no collective). Applied
+    to the amd row-sharded SP path it removes the shared expert's AG->MLP->RS
+    pair entirely: every rank holds the full shared weights and computes its
+    own rows directly, exactly like the reference ``MLP(x)`` restricted to
+    this rank's rows.
+
+    The KimiMLP instance object is kept (only its two linears are replaced)
+    because ``runner._shared_experts._layer`` and every other binding leads
+    back to this module; replacing the sublayers keeps ``forward`` and the
+    act_fn untouched. Weight loading happens later and picks up the full
+    widths through the unchanged parameter names -- identical loading
+    semantics to a ``ReplicatedLinear`` (which is a disable_tp
+    ColumnParallelLinear underneath).
+
+    Returns a one-line summary for the enablement log.
+    """
+    gate_up = shared.gate_up_proj
+    down = shared.down_proj
+    if getattr(gate_up, "disable_tp", False) or getattr(down, "disable_tp", False):
+        # Already replicated (retry after a transpose of the patch module).
+        if not (getattr(gate_up, "disable_tp", False) and getattr(down, "disable_tp", False)):
+            raise PatchCompatibilityError(
+                f"{ENV_SWITCH}: shared expert projections disagree on TP "
+                "sharding; cannot re-apply replication"
+            )
+        return "already replicated"
+
+    # Forward contracts this rebuild preserves (KimiMLP.forward unpacks the
+    # bias tuples and down never reduces; the amd construction sets both).
+    if getattr(gate_up, "return_bias", True) is not True or getattr(
+        down, "return_bias", True
+    ) is not True:
+        raise PatchCompatibilityError(
+            f"{ENV_SWITCH}: shared expert linears must use return_bias=True"
+        )
+    if getattr(down, "reduce_results", None) is not False:
         raise PatchCompatibilityError(
             f"{ENV_SWITCH}: shared expert down_proj must emit TP partial sums"
         )
-    # KimiMLP.forward has no x_and_scale_quanted parameter, so the HCU
-    # SharedExperts fast path (_run_layer with a pre-quantized tuple) is
-    # structurally unreachable for this layer: it always calls
-    # self._layer(x), i.e. exactly the instance forward wrapped below.
-    original_forward = shared.forward
 
-    def sp_shared_forward(x: torch.Tensor) -> torch.Tensor:
-        # RS(MLP_r(AG(x_local))) == rows of AR(MLP_r(x_full)) for this rank.
-        partial = original_forward(_sp_all_gather(x, tp_size))
-        return _sp_reduce_scatter(partial, tp_size)
+    hidden_size = down.output_size
+    intermediate_size = down.input_size
+    output_sizes = list(gate_up.output_sizes)
+    if sum(output_sizes) != 2 * intermediate_size or len(output_sizes) != 2:
+        raise PatchCompatibilityError(
+            f"{ENV_SWITCH}: shared expert gate_up output sizes {output_sizes} "
+            f"do not match down input {intermediate_size}; refusing to guess "
+            "the replication widths"
+        )
 
-    shared.forward = sp_shared_forward
+    mcls, rcls = _build_replicated_linears(shared)
+    shared.gate_up_proj = mcls(
+        hidden_size,
+        output_sizes,
+        bias=False,
+        quant_config=gate_up.quant_config,
+        prefix=gate_up.prefix,
+        return_bias=True,
+        disable_tp=True,
+    )
+    shared.down_proj = rcls(
+        intermediate_size,
+        hidden_size,
+        bias=False,
+        input_is_parallel=True,
+        reduce_results=False,
+        quant_config=down.quant_config,
+        prefix=down.prefix,
+        return_bias=True,
+        disable_tp=True,
+    )
+    # act_fn is a parameterless module (SiluAndMul / SituAndMul) and stays
+    # shared with the original construction, so hidden_act semantics and the
+    # situ betas are preserved without touching the checkpoint metadata.
+    rank_bytes = sum(
+        p.numel() * p.element_size()
+        for proj in (shared.gate_up_proj, shared.down_proj)
+        for p in proj.parameters()
+    )
+    return (
+        f"replicated shared expert (tp {tp_size}: full widths "
+        f"gate_up {output_sizes} x {hidden_size}, down {intermediate_size} "
+        f"-> {hidden_size}, ~{rank_bytes / 2**20:.1f} MiB/layer/rank)"
+    )
 
 
 def _tp_pynccl_usable() -> bool:
@@ -793,8 +897,20 @@ def _maybe_enable_layer(layer, decoder_cls, logger) -> _SpState | None:
 
     o_proj = _find_o_proj(layer.self_attn, tp_size)
     o_proj.reduce_results = False
+    shared_mode = "no shared experts"
     if shared is not None:
-        _wrap_shared_experts(shared, tp_size)
+        # The shared expert always runs replicated under SP: its weights are
+        # rebuilt as disable_tp full-width parameters (nvidia KimiMLP
+        # replicate semantics -- see _replicate_shared_experts), so it needs
+        # no collective and exact per-rank rows by construction. This is
+        # unconditional by design decision (2026-10-26): the prod decode
+        # trace showed the previous sharded wrap's AG->MLP->RS pair costing
+        # ~2x77us per MoE layer of pynccl latency -- the dominant part of
+        # SP's per-layer communication vs sglang's single aiter RS+AG pair.
+        # The runner passthrough is still required: each rank's rows of the
+        # shared output are final, and a TP all-reduce over the shard domain
+        # would sum mismatched global rows (see "Hidden prerequisite").
+        shared_mode = _replicate_shared_experts(shared, tp_size)
 
         def shared_output_already_sharded(shared_output, fused_output_is_reduced=None):
             return shared_output
@@ -811,9 +927,11 @@ def _maybe_enable_layer(layer, decoder_cls, logger) -> _SpState | None:
     _attach_padding_window(moe, get_tensor_model_parallel_rank(), tp_size)
 
     logger.info_once(
-        "Kimi-K3 SP-MoE enabled (%s=1): o_proj reduce-scatter, MoE dispatch "
-        "of ceil(N/%d) rows per TP rank, all-gather after MoE.",
+        "Kimi-K3 SP-MoE enabled (%s=1, shared experts: %s): o_proj "
+        "reduce-scatter, MoE dispatch of ceil(N/%d) rows per TP rank, "
+        "all-gather after MoE.",
         ENV_SWITCH,
+        shared_mode,
         tp_size,
     )
     return _SpState(tp_size, get_tensor_model_parallel_rank(), runner)
@@ -903,18 +1021,23 @@ __all__ = ["ENV_SWITCH", "PATCH_ID", "TARGET_MODULE", "TARGETS", "apply", "apply
 #    counts on both balanced and imbalanced DP steps.
 # A2 numerics: same prompts with greedy sampling, switch 0 vs 1. Per-layer
 #    prefix_sum and final logits must match within bf16 tolerance (AR vs
-#    RS+AG ordering only). Greedy tokens should match, and spec-decode
-#    acceptance rate should not change. Include a prefill with N % 4 != 0
-#    and a DP dummy batch with N=1.
+#    RS+AG ordering only; the shared expert output itself is identical --
+#    replicated MLP rows of the same full-precision math). Greedy tokens
+#    should match, and spec-decode acceptance rate should not change.
+#    Include a prefill with N % 4 != 0 and a DP dummy batch with N=1.
 # A3 graphs: with VLLM_USE_BREAKABLE_CUDAGRAPH=1, capture every decode size
 #    with the switch on, then replay mixed batch sizes. No shape mismatch, no
 #    capture error, and the output for each size equals an eager run of that
 #    size. All SP shapes are Python ints of N and the static TP rank.
-# A4 soak: the shared expert's AG/RS now run between the captured DeepEP
-#    send and recv kernels, which is a new position for RCCL work on these
-#    comms. Soak a long prefill/decode interleave (hours) with no RCCL hang.
-#    Eager SP collectives deliberately ride the same single-comm topology as
-#    every other eager TP collective in the deployment; when role-separated
-#    eager collectives land (a later workstream), repeat this soak with its
-#    env switch and strict collective tracing.
+# A4 shared-expert replication: per rank every SP layer's shared expert
+#    now holds full-width weights (the enablement log prints the
+#    MiB/layer/rank summary).
+#    Verify weight load completes (loader maps full widths like
+#    ReplicatedLinear) and numerics A2 still hold; then compare prod-trace
+#    per-layer comm time vs the sharded wrap baseline (~4x77us/layer) --
+#    expect 2 collectives/layer -- and the shared GEMM time growth from the
+#    TP-x weight reads. Soak a long prefill/decode interleave (hours); the
+#    sharded wrap's RCCL-in-DeepEP-window concern no longer applies (no RCCL
+#    between the captured send and recv kernels), but repeat the soak for
+#    the eager/captured single-comm routing.
 # ---------------------------------------------------------------------------

@@ -589,7 +589,8 @@ def validate_and_update_hcu_config(vllm_config: object) -> HcuFeatureConfig:
         # Kimi-K3 SP row sharding: persist the same master-and-child result
         # the SP patch enablement honors, so toggling VLLM_HCU_K3_SP_MOE
         # across restarts cannot load the opposite mode's AOT graph (on mode
-        # rewires o_proj.reduce_results and registers the hcu_k3_sp_* ops).
+        # rewires o_proj.reduce_results, registers the hcu_k3_sp_* ops, and
+        # rebuilds the shared experts as disable_tp full-width weights).
         "k3_sp_moe": hcu_envs.k3_sp_moe_enabled(),
         "dp_int8_allgather": hcu_envs.dp_int8_allgather_enabled(),
     }

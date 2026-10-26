@@ -111,9 +111,10 @@ class HcuFeatureConfig:
     qwen4_exp_hc_sp: bool = True
     # Effective opt-in policy for Kimi-K3 SP-MoE row sharding
     # (VLLM_HCU_K3_SP_MOE). Persisted because the SP forward mutates the
-    # traced decoder layer (o_proj reduce_results plus the hcu_k3_sp_*
-    # collectives): opposite-mode restarts sharing a persistent compilation
-    # cache would load the other mode's no-guard AOT graph.
+    # traced decoder layer (o_proj reduce_results, the hcu_k3_sp_*
+    # collectives, and the replicated full-width shared-expert rebuild):
+    # opposite-mode restarts sharing a persistent compilation cache would
+    # load the other mode's no-guard AOT graph and mismatch parameters.
     k3_sp_moe: bool = False
     # Effective opt-in policy for INT8 hidden-state transport in the naive
     # DP/EP AllGatherv dispatch path. Persisted because spawned workers do not

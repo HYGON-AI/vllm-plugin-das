@@ -553,6 +553,162 @@ def test_tp_pynccl_probe_matches_utilization_gate(monkeypatch):
 
 
 # ---------------------------------------------------------------------------
+# Shared-expert replication: SP always rebuilds the shared expert's two
+# projections as disable_tp full-width weights (nvidia KimiMLP replicate
+# semantics; 2026-10-26 trace decision -- the sharded AG->MLP->RS wrap cost
+# ~2x77us/layer of pynccl, the dominant part of SP communication). Contract:
+# same module object with rebuilt sublayers, every shard-contract drift hard
+# fails at construction instead of producing wrong numerics.
+# ---------------------------------------------------------------------------
+
+
+class _FakeLinear(torch.nn.Module):
+    """Minimal MergedColumn/RowParallelLinear attribute surface."""
+
+    def __init__(
+        self,
+        *,
+        disable_tp=False,
+        return_bias=True,
+        reduce_results=None,
+        output_sizes=None,
+        output_size=None,
+        input_size=None,
+        quant_config="qc",
+        prefix="p",
+    ):
+        super().__init__()
+        self.disable_tp = disable_tp
+        self.return_bias = return_bias
+        if reduce_results is not None:
+            self.reduce_results = reduce_results
+        if output_sizes is not None:
+            self.output_sizes = output_sizes
+        if output_size is not None:
+            self.output_size = output_size
+        if input_size is not None:
+            self.input_size = input_size
+        self.quant_config = quant_config
+        self.prefix = prefix
+        self.weight = torch.nn.Parameter(torch.zeros(1))
+
+    def forward(self, x):  # pragma: no cover - contract stub
+        return (x, None)
+
+
+class _ActStub(torch.nn.Module):
+    def forward(self, x):
+        return x
+
+
+class _SharedMLPStub(torch.nn.Module):
+    """amd KimiMLP shape: gate_up [I/TP]*2 -> down I/TP -> H, no reduce."""
+
+    def __init__(self, *, tp_sharded=True):
+        super().__init__()
+        self.act_fn = _ActStub()
+        self.gate_up_proj = _FakeLinear(
+            disable_tp=not tp_sharded,
+            output_sizes=[4, 4],
+            prefix="blk0.mlp.shared_experts.gate_up_proj",
+        )
+        self.down_proj = _FakeLinear(
+            disable_tp=not tp_sharded,
+            reduce_results=False,
+            input_size=4,
+            output_size=6,
+            prefix="blk0.mlp.shared_experts.down_proj",
+        )
+
+
+@pytest.fixture()
+def recorded_builder(monkeypatch):
+    """Replace the lazy vllm linear constructors with recording fakes."""
+    recorded = {}
+
+    def builder(shared):
+        class _RecCol(torch.nn.Module):
+            def __init__(self, *args, **kwargs):
+                super().__init__()
+                recorded["gate_up"] = (args, kwargs)
+
+        class _RecRow(torch.nn.Module):
+            def __init__(self, *args, **kwargs):
+                super().__init__()
+                recorded["down"] = (args, kwargs)
+
+        return _RecCol, _RecRow
+
+    monkeypatch.setattr(sp, "_build_replicated_linears", builder)
+    return recorded
+
+
+def test_replicate_shared_experts_rebuilds_both_projections(recorded_builder):
+    shared = _SharedMLPStub()
+    act = shared.act_fn
+
+    summary = sp._replicate_shared_experts(shared, tp_size=4)
+
+    # Same KimiMLP instance, untouched forward/act_fn: every binding that
+    # leads back to the module (runner._shared_experts._layer) stays valid.
+    assert shared.act_fn is act
+    args, kwargs = recorded_builder["gate_up"]
+    assert args == (6, [4, 4])  # hidden_size, full gate+up widths (4*2/1)
+    assert kwargs["disable_tp"] is True
+    assert kwargs["bias"] is False
+    assert kwargs["quant_config"] == "qc"
+    assert kwargs["prefix"] == "blk0.mlp.shared_experts.gate_up_proj"
+    args, kwargs = recorded_builder["down"]
+    assert args == (4, 6)  # full intermediate -> hidden
+    assert kwargs["input_is_parallel"] is True
+    assert kwargs["reduce_results"] is False
+    assert kwargs["disable_tp"] is True
+    assert kwargs["quant_config"] == "qc"
+    assert kwargs["prefix"] == "blk0.mlp.shared_experts.down_proj"
+    assert "replicated shared expert" in summary
+
+
+def test_replicate_shared_experts_is_idempotent(monkeypatch):
+    monkeypatch.setattr(
+        sp,
+        "_build_replicated_linears",
+        lambda shared: (_ for _ in ()).throw(
+            AssertionError("rebuild attempted on an already-replicated layer")
+        ),
+    )
+    shared = _SharedMLPStub(tp_sharded=False)  # nvidia-style replicated
+    assert sp._replicate_shared_experts(shared, tp_size=4) == "already replicated"
+
+
+def test_replicate_shared_experts_rejects_half_replicated_state():
+    shared = _SharedMLPStub()
+    shared.down_proj.disable_tp = True
+    with pytest.raises(sp.PatchCompatibilityError, match="disagree"):
+        sp._replicate_shared_experts(shared, tp_size=4)
+
+
+def test_replicate_shared_experts_rejects_reducing_down_proj(recorded_builder):
+    shared = _SharedMLPStub()
+    shared.down_proj.reduce_results = True
+    with pytest.raises(sp.PatchCompatibilityError, match="partial sums"):
+        sp._replicate_shared_experts(shared, tp_size=4)
+
+
+def test_replicate_shared_experts_rejects_bias_return_drift(recorded_builder):
+    shared = _SharedMLPStub()
+    shared.gate_up_proj.return_bias = False
+    with pytest.raises(sp.PatchCompatibilityError, match="return_bias"):
+        sp._replicate_shared_experts(shared, tp_size=4)
+
+
+def test_replicate_shared_experts_rejects_width_mismatch(recorded_builder):
+    shared = _SharedMLPStub()
+    shared.gate_up_proj.output_sizes = [3, 3]  # != 2 * down.input_size
+    with pytest.raises(sp.PatchCompatibilityError, match="refusing to guess"):
+        sp._replicate_shared_experts(shared, tp_size=4)
+
+
+# ---------------------------------------------------------------------------
 # Config-hash partitioning: the SP switch must share ONE parser with the
 # persisted HcuFeatureConfig policy, or enablement and the persistent
 # compilation-cache key can drift apart across restarts (review P1).
