@@ -1322,7 +1322,8 @@ class MoERunner(MoERunnerInterface):
             hidden_states = get_ep_group().combine(
                 hidden_states, self.moe_config.is_sequence_parallel
             )
-        self._wait_late_shared_experts()
+        if getattr(self, "_hcu_step5_owner", False):
+            self._wait_late_shared_experts()
 
         needs_fallback_pcp_collective = (
             self.moe_config.pcp_size > 1
