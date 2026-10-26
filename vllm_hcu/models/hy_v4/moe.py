@@ -22,8 +22,95 @@ from vllm.model_executor.layers.linear import (
 from vllm.model_executor.layers.quantization import QuantizationConfig
 from vllm_hcu.model_executor.layers.attention.pcp import in_replicated_mtp_batch
 from vllm_hcu.models.hy_v4.attention import linear_gate_pcp_shard_enabled
+from vllm_hcu.ops.fuse_silu_mul_quant import FusedSiluAndMulAndQuant
+from vllm_hcu.platforms import envs as henvs
 
 logger = init_logger(__name__)
+
+
+def _quantize_int8(
+    value: torch.Tensor,
+) -> tuple[torch.Tensor, torch.Tensor]:
+    from lightop.quant import per_token_quant_int8
+
+    return per_token_quant_int8(value)
+
+
+def _linear_supports_quanted_inputs(layer: nn.Module) -> bool:
+    hcu_forward = getattr(layer, "_forward_with_hcu_quanted", None)
+    weight = getattr(layer, "weight", None)
+    quant_method = getattr(layer, "quant_method", None)
+    supports = getattr(quant_method, "supports_quanted_inputs", None)
+    if (
+        not callable(hcu_forward)
+        or getattr(weight, "dtype", None) is not torch.int8
+        or not callable(supports)
+    ):
+        return False
+    try:
+        if not bool(supports()):
+            return False
+        scheme = getattr(layer, "scheme", None)
+        if scheme is None:
+            return True
+        scheme_supports = getattr(scheme, "supports_quanted_inputs", None)
+        return callable(scheme_supports) and bool(scheme_supports())
+    except (AttributeError, RuntimeError, TypeError, ValueError):
+        return False
+
+
+def _linear_forward(
+    layer: nn.Module,
+    value: torch.Tensor,
+    x_and_scale_quanted: tuple[torch.Tensor, torch.Tensor] | None = None,
+):
+    if (
+        x_and_scale_quanted is not None
+        and _linear_supports_quanted_inputs(layer)
+    ):
+        return layer._forward_with_hcu_quanted(value, x_and_scale_quanted)
+    return layer(value)
+
+
+def _moe_supports_auxiliary_inputs(experts: nn.Module) -> bool:
+    runner = experts
+    seen: set[int] = set()
+    while id(runner) not in seen:
+        seen.add(id(runner))
+        wrapped_runner = getattr(runner, "runner", None)
+        if wrapped_runner is not None and wrapped_runner is not runner:
+            runner = wrapped_runner
+            continue
+        base_layer = getattr(runner, "base_layer", None)
+        if base_layer is not None and base_layer is not runner:
+            runner = base_layer
+            continue
+        break
+
+    moe_config = getattr(runner, "moe_config", None)
+    if int(getattr(moe_config, "pcp_size", 1) or 1) > 1:
+        return False
+    if bool(getattr(runner, "do_naive_dispatch_combine", False)):
+        return False
+
+    routed_experts = getattr(runner, "routed_experts", None)
+    routed_weight = getattr(routed_experts, "w13_weight", None)
+    if getattr(routed_weight, "dtype", None) is not torch.int8:
+        return False
+
+    shared_experts = getattr(runner, "_shared_experts", None)
+    supports = getattr(
+        shared_experts,
+        "_layer_supports_x_and_scale_quanted",
+        None,
+    )
+    if not callable(supports):
+        return False
+    try:
+        return bool(supports())
+    except (AttributeError, RuntimeError, TypeError, ValueError):
+        return False
+
 
 _HYV4_MOE_CHUNK_SIZE_ENV = "VLLM_HCU_HYV4_MOE_CHUNK_SIZE"
 
@@ -78,12 +165,43 @@ class HYV4FeedForward(nn.Module):
             reduce_results=reduce_results,
             prefix=f"{prefix}.down_proj",
         )
-        self.act_fn = SiluAndMul()
+        weight = getattr(self.gate_up_proj, "weight", None)
+        self.quant_dtype = weight.dtype if weight is not None else None
+        self.float_act_fn = SiluAndMul()
+        self.enable_fuse_silu_mul_quant = bool(
+            henvs.VLLM_HCU_USE_CUSTOM_OPS
+            and henvs.VLLM_HCU_USE_FUSED_SILU_MUL_QUANT
+            and self.quant_dtype is torch.int8
+            and _linear_supports_quanted_inputs(self.down_proj)
+        )
+        self.act_fn = (
+            FusedSiluAndMulAndQuant()
+            if self.enable_fuse_silu_mul_quant
+            else self.float_act_fn
+        )
 
-    def forward(self, x: torch.Tensor) -> torch.Tensor:
-        gate_up, _ = self.gate_up_proj(x)
-        activated = self.act_fn(gate_up)
-        output, _ = self.down_proj(activated)
+    def forward(
+        self,
+        x: torch.Tensor,
+        x_and_scale_quanted: tuple[torch.Tensor, torch.Tensor] | None = None,
+    ) -> torch.Tensor:
+        gate_up, _ = _linear_forward(
+            self.gate_up_proj, x, x_and_scale_quanted
+        )
+        if (
+            self.enable_fuse_silu_mul_quant
+            and _linear_supports_quanted_inputs(self.down_proj)
+        ):
+            activated_q, activated_scale = self.act_fn(
+                gate_up, quant_dtype=self.quant_dtype
+            )
+            output, _ = _linear_forward(
+                self.down_proj,
+                activated_q, (activated_q, activated_scale)
+            )
+        else:
+            activated = getattr(self, "float_act_fn", self.act_fn)(gate_up)
+            output, _ = self.down_proj(activated)
         return output
 
 
@@ -201,6 +319,14 @@ class HYV4MoEFused(nn.Module):
             swiglu_limit=swiglu_limit,
             router_logits_dtype=torch.float32,
         )
+        shared_gate_up = getattr(self.shared_experts, "gate_up_proj", None)
+        shared_weight = getattr(shared_gate_up, "weight", None)
+        self.enable_reuse_int8_quant = bool(
+            henvs.VLLM_HCU_USE_CUSTOM_OPS
+            and henvs.VLLM_HCU_USE_FUSED_RMS_QUANT
+            and shared_weight is not None
+            and shared_weight.dtype is torch.int8
+        )
         self.prefix = prefix
         if swiglu_limit is not None:
             logger.debug_once(
@@ -208,9 +334,33 @@ class HYV4MoEFused(nn.Module):
                 swiglu_limit,
             )
 
-    def forward(self, hidden_states: torch.Tensor) -> torch.Tensor:
+    def forward(
+        self,
+        hidden_states: torch.Tensor,
+        x_and_scale_quanted: tuple[torch.Tensor, torch.Tensor] | None = None,
+    ) -> torch.Tensor:
         original_shape = hidden_states.shape
+        supports_auxiliary_inputs = _moe_supports_auxiliary_inputs(self.experts)
+        if not supports_auxiliary_inputs:
+            x_and_scale_quanted = None
+        if (
+            x_and_scale_quanted is None
+            and getattr(self, "enable_reuse_int8_quant", False)
+            and supports_auxiliary_inputs
+            and _linear_supports_quanted_inputs(
+                getattr(self.shared_experts, "gate_up_proj", None)
+            )
+        ):
+            x_and_scale_quanted = _quantize_int8(hidden_states)
         hidden_states = hidden_states.view(-1, hidden_states.shape[-1])
+        quanted_hidden_states = None
+        scale = None
+        if x_and_scale_quanted is not None:
+            quanted_hidden_states, scale = x_and_scale_quanted
+            quanted_hidden_states = quanted_hidden_states.view(
+                -1, quanted_hidden_states.shape[-1]
+            )
+            scale = scale.view(-1, scale.shape[-1])
         # LINEAR_GATE_PCP_SHARD + MTP restore can inflate MoE workspace.
         # Chunk only when VLLM_HCU_HYV4_MOE_CHUNK_SIZE is set.
         chunk_size = _hyv4_moe_chunk_size()
@@ -221,9 +371,18 @@ class HYV4MoEFused(nn.Module):
             or hidden_states.shape[0] <= chunk_size
         ):
             router_logits, _ = self.gate(hidden_states)
+            quant_kwargs = (
+                {
+                    "quanted_hidden_states": quanted_hidden_states,
+                    "scale": scale,
+                }
+                if quanted_hidden_states is not None
+                else {}
+            )
             final_hidden_states = self.experts(
                 hidden_states=hidden_states,
                 router_logits=router_logits,
+                **quant_kwargs,
             )
         else:
             final_hidden_states = torch.empty_like(hidden_states)
@@ -231,9 +390,18 @@ class HYV4MoEFused(nn.Module):
                 end = min(start + chunk_size, hidden_states.shape[0])
                 chunk = hidden_states[start:end]
                 router_logits, _ = self.gate(chunk)
+                quant_kwargs = (
+                    {
+                        "quanted_hidden_states": quanted_hidden_states[start:end],
+                        "scale": scale[start:end],
+                    }
+                    if quanted_hidden_states is not None
+                    else {}
+                )
                 final_hidden_states[start:end] = self.experts(
                     hidden_states=chunk,
                     router_logits=router_logits,
+                    **quant_kwargs,
                 )
 
         return final_hidden_states.view(original_shape)

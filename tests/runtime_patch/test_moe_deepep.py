@@ -601,6 +601,95 @@ def test_modular_prepare_begins_auto_call_before_expert_contract_queries():
     ]
 
 
+def test_modular_internal_overlap_consumes_shared_quanted_pair_after_bf16_prepare():
+    from vllm_hcu.model_executor.layers.fused_moe import modular_kernel as module
+
+    events = []
+    hidden = torch.ones((2, 4), dtype=torch.bfloat16)
+    pair = (torch.ones((2, 4), dtype=torch.int8), torch.ones((2, 1)))
+    topk_weights = torch.ones((2, 1))
+    topk_ids = torch.zeros((2, 1), dtype=torch.int64)
+
+    class PrepareFinalize:
+        def supports_async(self):
+            return True
+
+        def finalize_async(self, *args):
+            del args
+            events.append("finalize")
+
+            def receive():
+                events.append("receive")
+
+            return receive
+
+    class Experts:
+        def finalize_weight_and_reduce_impl(self):
+            return object()
+
+    class SharedExperts:
+        def __call__(self, value, order, x_and_scale_quanted=None):
+            events.append(("shared", value, order, x_and_scale_quanted))
+
+    kernel = object.__new__(module.FusedMoEKernelModularImpl)
+    kernel.prepare_finalize = PrepareFinalize()
+    kernel.fused_experts = Experts()
+
+    def prepare(value, *args, **kwargs):
+        del args, kwargs
+        events.append(("prepare", value))
+        return hidden, None, None, topk_ids, topk_weights
+
+    kernel._prepare = prepare
+    kernel._fused_experts = lambda **_: torch.zeros_like(hidden)
+
+    kernel.apply(
+        hidden_states=hidden,
+        w1=torch.ones((2, 4, 4)),
+        w2=torch.ones((2, 4, 4)),
+        topk_weights=topk_weights,
+        topk_ids=topk_ids,
+        shared_experts=SharedExperts(),
+        shared_experts_input=hidden,
+        shared_experts_x_and_scale_quanted=pair,
+    )
+
+    assert events[0] == ("prepare", hidden)
+    shared_events = [event for event in events if event[0] == "shared"]
+    assert len(shared_events) == 1
+    assert shared_events[0][1] is hidden
+    assert shared_events[0][2] is module.SharedExpertsOrder.MK_INTERNAL_OVERLAPPED
+    assert shared_events[0][3] is pair
+
+
+def test_fused_moe_kernel_forwards_shared_quanted_pair_to_modular_impl():
+    from vllm_hcu.model_executor.layers.fused_moe import modular_kernel as module
+
+    calls = []
+    pair = (torch.ones((2, 4), dtype=torch.int8), torch.ones((2, 1)))
+    impl = object.__new__(module.FusedMoEKernelModularImpl)
+    impl.apply = lambda **kwargs: calls.append(kwargs) or kwargs["hidden_states"]
+    kernel = object.__new__(module.FusedMoEKernel)
+    kernel.impl = impl
+    hidden = torch.ones((2, 4), dtype=torch.bfloat16)
+
+    output = kernel.apply(
+        hidden_states=hidden,
+        w1=torch.ones((2, 4, 4)),
+        w2=torch.ones((2, 4, 4)),
+        topk_weights=torch.ones((2, 1)),
+        topk_ids=torch.zeros((2, 1), dtype=torch.int64),
+        activation=module.MoEActivation.SILU,
+        global_num_experts=2,
+        expert_map=None,
+        apply_router_weight_on_input=False,
+        shared_experts_x_and_scale_quanted=pair,
+    )
+
+    assert output is hidden
+    assert calls[0]["shared_experts_x_and_scale_quanted"] is pair
+
+
 @pytest.mark.parametrize(
     ("kv_role", "expected"),
     [("kv_producer", False), ("kv_consumer", True)],
@@ -3730,10 +3819,10 @@ def test_channel_int8_auto_factory_builds_unified_ht_ll_kernel(
     }
 
 
-@pytest.mark.parametrize("pcp_ht", [False, True])
-def test_slimquant_w4a8_auto_factory_reuses_unified_prepare_finalize(
+@pytest.mark.parametrize("route", ["auto", "ht", "ll"])
+def test_slimquant_w4a8_factory_reuses_unified_prepare_finalize(
     monkeypatch: pytest.MonkeyPatch,
-    pcp_ht: bool,
+    route: str,
 ):
     import vllm.model_executor.layers.fused_moe.all2all_utils as all2all_utils
     from vllm.model_executor.layers.fused_moe.config import FusedMoEQuantConfig
@@ -3754,13 +3843,18 @@ def test_slimquant_w4a8_auto_factory_reuses_unified_prepare_finalize(
             return 8
 
     prepare_finalize = (
-        SimpleNamespace(num_dispatchers=lambda: 8) if pcp_ht else PrepareFinalize()
+        PrepareFinalize()
+        if route == "auto"
+        else SimpleNamespace(
+            num_dispatchers=lambda: 8,
+            max_num_tokens_per_rank=lambda: 64,
+        )
     )
     prepare_calls = []
 
     def maybe_make_prepare_finalize(**kwargs):
         prepare_calls.append(kwargs)
-        if not pcp_ht:
+        if route == "auto":
             prepare_finalize.ll_prepare_finalize.routing_tables = kwargs[
                 "routing_tables"
             ]
@@ -3791,14 +3885,15 @@ def test_slimquant_w4a8_auto_factory_reuses_unified_prepare_finalize(
         per_out_ch_quant=False,
         block_shape=None,
         weight_dtype="int4",
-        gemm1_clamp_limit=7.0 if pcp_ht else None,
+        gemm1_clamp_limit=7.0,
     )
     moe_config = SimpleNamespace()
 
-    factory = (
-        module.make_deepep_ht_deepgemm_w4a8_moe_kernel
-        if pcp_ht else module.make_deepep_auto_deepgemm_w4a8_moe_kernel
-    )
+    factory = {
+        "auto": module.make_deepep_auto_deepgemm_w4a8_moe_kernel,
+        "ht": module.make_deepep_ht_deepgemm_w4a8_moe_kernel,
+        "ll": module.make_deepep_ll_deepgemm_w4a8_moe_kernel,
+    }[route]
     kernel = factory(
         moe_quant_config=quant_config,
         moe_config=moe_config,
@@ -3817,9 +3912,9 @@ def test_slimquant_w4a8_auto_factory_reuses_unified_prepare_finalize(
     assert constructed == {
         "moe_config": moe_config,
         "quant_config": quant_config,
-        "max_num_tokens": 0 if pcp_ht else 64,
+        "max_num_tokens": 0 if route == "ht" else 64,
         "num_dispatchers": 8,
-        "fixed_use_low_latency": False if pcp_ht else None,
+        "fixed_use_low_latency": {"auto": None, "ht": False, "ll": True}[route],
     }
 
 
@@ -5185,22 +5280,29 @@ def test_moe_runner_and_shared_experts_cold_replacement_contract():
                 del layer, topk_weights, topk_ids, shared_experts_input
                 return x
 
-        runner.routed_experts.quant_method = UnsupportedQuantMethod()
+        fallback_calls = []
+
+        def forward_modular(**kwargs):
+            fallback_calls.append(kwargs)
+            return kwargs["x"] + 3
+
+        runner.routed_experts = SimpleNamespace(
+            quant_method=UnsupportedQuantMethod(),
+            forward_modular=forward_modular,
+        )
         runner.__dict__.pop("_supports_quanted_inputs", None)
-        try:
-            runner._apply_quant_method(
-                hidden,
-                None,
-                None,
-                quanted_hidden_states=quanted,
-                scale=scale,
-                topk_weights=topk_weights,
-                topk_ids=topk_ids,
-            )
-        except RuntimeError as error:
-            assert "does not accept i_q/i_s" in str(error)
-        else:
-            raise AssertionError("unsupported prequantized input did not fail")
+        shared, output = runner._apply_quant_method(
+            hidden,
+            None,
+            None,
+            quanted_hidden_states=quanted,
+            scale=scale,
+            topk_weights=topk_weights,
+            topk_ids=topk_ids,
+        )
+        assert shared is None
+        assert torch.equal(output, hidden + 3)
+        assert fallback_calls[0]["x"] is hidden
 
         class SharedLayer:
             def forward(self, value, x_and_scale_quanted=None):

@@ -2428,6 +2428,79 @@ def test_aiter_replacement_rmsnorm_wrappers_delegate_without_retry_logic():
         assert not any(isinstance(node, ast.Try) for node in ast.walk(function))
 
 
+def test_persistent_w4a8_expert_offsets_promote_before_stride_multiply():
+    source = (
+        Path(__file__).resolve().parents[2]
+        / "vllm_hcu/model_executor/layers/fused_moe/experts/"
+        "w4a8_persistent_activation.py"
+    ).read_text(encoding="utf-8")
+    tree = ast.parse(source)
+    kernel = next(
+        node
+        for node in tree.body
+        if isinstance(node, ast.FunctionDef)
+        and node.name == "_persistent_masked_m_silu_mul_clamp_int8_quant"
+    )
+    expert_assignment = next(
+        node
+        for node in kernel.body
+        if isinstance(node, ast.Assign)
+        and any(
+            isinstance(target, ast.Name) and target.id == "expert"
+            for target in node.targets
+        )
+    )
+
+    environment = {
+        "pid": torch.tensor(16, dtype=torch.int32),
+        "PARALLEL_TOKENS": 1,
+        "tl": SimpleNamespace(int64=torch.int64),
+    }
+    expert = eval(
+        compile(
+            ast.fix_missing_locations(ast.Expression(expert_assignment.value)),
+            filename="<persistent-w4a8-expert>",
+            mode="eval",
+        ),
+        environment,
+    )
+
+    expert_stride_products = {
+        node.right.id: node
+        for node in ast.walk(kernel)
+        if isinstance(node, ast.BinOp)
+        and isinstance(node.op, ast.Mult)
+        and isinstance(node.left, ast.Name)
+        and node.left.id == "expert"
+        and isinstance(node.right, ast.Name)
+        and node.right.id.startswith("stride_")
+    }
+    expected_strides = {
+        "stride_counts_e",
+        "stride_i_e",
+        "stride_o_e",
+        "stride_s_e",
+    }
+    assert set(expert_stride_products) == expected_strides
+
+    for stride_name in expected_strides:
+        offset = eval(
+            compile(
+                ast.fix_missing_locations(
+                    ast.Expression(expert_stride_products[stride_name])
+                ),
+                filename=f"<persistent-w4a8-{stride_name}>",
+                mode="eval",
+            ),
+            {
+                "expert": expert,
+                stride_name: torch.tensor(134217728, dtype=torch.int32),
+            },
+        )
+        assert offset.dtype is torch.int64
+        assert offset.item() == 2147483648
+
+
 def test_aiter_replacement_maps_each_optional_capability_exactly():
     source = (
         Path(__file__).resolve().parents[2]
@@ -4093,6 +4166,93 @@ def test_slimquant_w4a8_explicit_deep_gemm_requires_deepep_auto():
 
 
 @pytest.mark.hcu
+def test_hyv4_slimquant_w4a8_accepts_explicit_deepep_low_latency(
+    monkeypatch: pytest.MonkeyPatch,
+):
+    """HYV4 DP+EP LL must build the masked W4A8 DeepGEMM kernel."""
+
+    from vllm_hcu.model_executor.layers.fused_moe import deepep_runtime
+    from vllm_hcu.model_executor.layers.fused_moe.experts import (
+        dpsk_v4_deep_gemm_moe as deepgemm_module,
+    )
+    from vllm_hcu.model_executor.layers.quantization import slimquant_w4a8
+
+    factory_calls: list[tuple[object, object, object]] = []
+
+    class W4A8Experts:
+        @staticmethod
+        def process_weights_after_loading(_layer: object) -> None:
+            return None
+
+    class W4A8Kernel:
+        fused_experts = SimpleNamespace(experts=W4A8Experts())
+
+    def make_deepep_ll_deepgemm_w4a8_moe_kernel(
+        *,
+        moe_quant_config: object,
+        moe_config: object,
+        routing_tables: object = None,
+    ) -> W4A8Kernel:
+        factory_calls.append((moe_quant_config, moe_config, routing_tables))
+        return W4A8Kernel()
+
+    monkeypatch.setattr(
+        deepgemm_module,
+        "make_deepep_ll_deepgemm_w4a8_moe_kernel",
+        make_deepep_ll_deepgemm_w4a8_moe_kernel,
+        raising=False,
+    )
+    monkeypatch.setattr(
+        deepep_runtime,
+        "current_platform",
+        SimpleNamespace(is_rocm=lambda: True),
+    )
+    monkeypatch.setattr(
+        deepep_runtime,
+        "_require_slimquant_w4a8_hipc_runtime",
+        lambda **_kwargs: None,
+    )
+    moe = SimpleNamespace(
+        activation=SimpleNamespace(value="silu"),
+        moe_backend="deep_gemm",
+        moe_parallel_config=SimpleNamespace(
+            dp_size=8,
+            pcp_size=1,
+            use_ep=True,
+            all2all_backend="deepep_low_latency",
+            use_deepep_auto_kernels=False,
+        ),
+        _hcu_vllm_config=SimpleNamespace(
+            model_config=SimpleNamespace(architectures=["HYV4ForCausalLM"])
+        ),
+    )
+    method = slimquant_w4a8.SlimQuantW4A8Int8AiterMoEMethod(object(), moe)
+    routing_tables = (object(), object(), object())
+    layer = SimpleNamespace(
+        w13_weight=torch.nn.Parameter(
+            torch.zeros((2, 8, 2), dtype=torch.int8), requires_grad=False
+        ),
+        w2_weight=torch.nn.Parameter(
+            torch.zeros((2, 4, 2), dtype=torch.int8), requires_grad=False
+        ),
+        w13_weight_scale=torch.nn.Parameter(
+            torch.ones((2, 8, 1)), requires_grad=False
+        ),
+        w2_weight_scale=torch.nn.Parameter(
+            torch.ones((2, 4, 1)), requires_grad=False
+        ),
+        w13_input_scale=None,
+        w2_input_scale=None,
+        _expert_routing_tables=lambda: routing_tables,
+    )
+
+    method.process_weights_after_loading(layer)
+
+    assert factory_calls == [(method.moe_quant_config, moe, routing_tables)]
+    assert method.moe_kernel is not None
+
+
+@pytest.mark.hcu
 def test_slimquant_w4a8_dispatch_returns_none_for_unsupported_layer():
     from vllm_hcu.model_executor.layers.quantization import slimquant_w4a8
 
@@ -4289,7 +4449,16 @@ def test_slimquant_w4a8_deepep_auto_uses_w4a8_deepgemm_factory_not_aiter(
 
 
 @pytest.mark.hcu
-def test_slimquant_w4a8_deepep_auto_rejects_non_deepseek_v4_architecture():
+@pytest.mark.parametrize(
+    "architectures",
+    [
+        ["DeepseekV3ForCausalLM"],
+        ["HYV4ForCausalLM", "DeepseekV3ForCausalLM"],
+    ],
+)
+def test_slimquant_w4a8_deepep_auto_rejects_unsupported_architecture(
+    architectures: list[str],
+):
     from vllm_hcu.model_executor.layers.fused_moe.deepep_runtime import (
         slimquant_w4a8_uses_deepep_auto,
     )
@@ -4304,14 +4473,151 @@ def test_slimquant_w4a8_deepep_auto_rejects_non_deepseek_v4_architecture():
             use_deepep_auto_kernels=True,
         ),
         _hcu_vllm_config=SimpleNamespace(
-            model_config=SimpleNamespace(
-                architectures=["DeepseekV3ForCausalLM"]
-            )
+            model_config=SimpleNamespace(architectures=architectures)
         ),
     )
 
     with pytest.raises(ValueError, match="validated only for DeepSeek-V4"):
         slimquant_w4a8_uses_deepep_auto(moe)
+
+
+@pytest.mark.hcu
+def test_slimquant_w4a8_deepep_auto_accepts_hyv4(
+    monkeypatch: pytest.MonkeyPatch,
+):
+    """HYV4 DP+EP must use auto HT prefill and LL decode kernels."""
+
+    from vllm_hcu.model_executor.layers.fused_moe import deepep_runtime
+
+    monkeypatch.setattr(
+        deepep_runtime,
+        "current_platform",
+        SimpleNamespace(is_rocm=lambda: True),
+        raising=False,
+    )
+    monkeypatch.setattr(
+        deepep_runtime,
+        "_require_slimquant_w4a8_hipc_runtime",
+        lambda **_kwargs: None,
+    )
+    moe = SimpleNamespace(
+        activation=SimpleNamespace(value="silu"),
+        moe_backend="deep_gemm",
+        moe_parallel_config=SimpleNamespace(
+            dp_size=8,
+            use_ep=True,
+            all2all_backend="deepep_auto",
+            use_deepep_auto_kernels=True,
+        ),
+        _hcu_vllm_config=SimpleNamespace(
+            model_config=SimpleNamespace(architectures=["HYV4ForCausalLM"])
+        ),
+    )
+
+    assert deepep_runtime.slimquant_w4a8_uses_deepep_auto(moe) is True
+
+
+@pytest.mark.hcu
+def test_slimquant_w4a8_deepep_auto_preserves_deepseek_arch_membership(
+    monkeypatch: pytest.MonkeyPatch,
+):
+    """Existing DeepSeek-V4 configs may advertise an additional arch."""
+
+    from vllm_hcu.model_executor.layers.fused_moe import deepep_runtime
+
+    monkeypatch.setattr(
+        deepep_runtime,
+        "current_platform",
+        SimpleNamespace(is_rocm=lambda: True),
+    )
+    monkeypatch.setattr(
+        deepep_runtime,
+        "_require_slimquant_w4a8_hipc_runtime",
+        lambda **_kwargs: None,
+    )
+    moe = SimpleNamespace(
+        activation="silu",
+        moe_backend="deep_gemm",
+        moe_parallel_config=SimpleNamespace(
+            dp_size=8,
+            use_ep=True,
+            all2all_backend="deepep_auto",
+            use_deepep_auto_kernels=True,
+        ),
+        _hcu_vllm_config=SimpleNamespace(
+            model_config=SimpleNamespace(
+                architectures=[
+                    "DeepseekV4ForCausalLM",
+                    "DeepseekV4ForSequenceClassification",
+                ]
+            )
+        ),
+    )
+
+    assert deepep_runtime.slimquant_w4a8_uses_deepep_auto(moe) is True
+
+
+@pytest.mark.hcu
+def test_slimquant_w4a8_ll_runtime_requires_only_masked_clamp_ops(
+    monkeypatch: pytest.MonkeyPatch,
+):
+    """Fixed LL clamp uses the built-in persistent kernel, not LightOP."""
+
+    from vllm_hcu.model_executor.layers.fused_moe import deepep_runtime
+
+    noop = lambda *_args, **_kwargs: None
+    monkeypatch.setitem(
+        sys.modules,
+        "deepgemm",
+        _module(
+            "deepgemm",
+            pack_w4a8_moe_hipc_weight=noop,
+            view_w4a8_moe_hipc_weight_n32_layout=noop,
+            m_grouped_w4a8_gemm_nt_masked_hipc=noop,
+        ),
+    )
+    monkeypatch.setitem(sys.modules, "lightop", None)
+    monkeypatch.setitem(sys.modules, "lightop.activation", None)
+    deepep_runtime._require_slimquant_w4a8_hipc_runtime.cache_clear()
+    try:
+        deepep_runtime._require_slimquant_w4a8_hipc_runtime(
+            ll_only=True,
+            clamp=True,
+        )
+    finally:
+        deepep_runtime._require_slimquant_w4a8_hipc_runtime.cache_clear()
+
+
+@pytest.mark.hcu
+def test_slimquant_w4a8_auto_runtime_requires_only_ht_clamp_op(
+    monkeypatch: pytest.MonkeyPatch,
+):
+    """Clamped auto uses the HT LightOP ABI and the LL persistent kernel."""
+
+    from vllm_hcu.model_executor.layers.fused_moe import deepep_runtime
+
+    noop = lambda *_args, **_kwargs: None
+    monkeypatch.setitem(
+        sys.modules,
+        "deepgemm",
+        _module(
+            "deepgemm",
+            pack_w4a8_moe_hipc_weight=noop,
+            view_w4a8_moe_hipc_weight_n32_layout=noop,
+            m_grouped_w4a8_gemm_nt_contiguous_hipc=noop,
+            m_grouped_w4a8_gemm_nt_masked_hipc=noop,
+        ),
+    )
+    lightop = _package("lightop")
+    monkeypatch.setitem(sys.modules, "lightop", lightop)
+    deepep_runtime._require_slimquant_w4a8_hipc_runtime.cache_clear()
+    try:
+        with pytest.raises(RuntimeError, match="fuse_silu_mul_clamp_quant"):
+            deepep_runtime._require_slimquant_w4a8_hipc_runtime(clamp=True)
+        lightop.fuse_silu_mul_clamp_quant = noop
+        deepep_runtime._require_slimquant_w4a8_hipc_runtime(clamp=True)
+    finally:
+        deepep_runtime._require_slimquant_w4a8_hipc_runtime.cache_clear()
 
 
 @pytest.mark.hcu
@@ -4489,7 +4795,7 @@ def test_slimquant_w4a8_deepep_auto_rejects_missing_ll_lightop(
             "deepep_low_latency",
             False,
             "auto",
-            "requires all2all_backend='deepep_auto'",
+            "DeepEP LL requires HYV4ForCausalLM",
         ),
         (
             1,
@@ -8110,6 +8416,7 @@ def test_int8_scheme_layout_and_feature_off_delegation(monkeypatch: pytest.Monke
     patch_compressed_tensors_w8a8_int8.apply_to_module(module)
     scheme = module.CompressedTensorsW8A8Int8()
     layer = SimpleNamespace(weight=torch.nn.Parameter(torch.ones(2, 3)))
+    assert scheme.supports_quanted_inputs() is False
     assert scheme.apply_weights(layer, "x", None)[0] == "upstream"
     scheme.process_weights_after_loading(layer)
     assert layer.weight.shape == (3, 2)
@@ -8128,6 +8435,7 @@ def test_int8_scheme_layout_and_feature_off_delegation(monkeypatch: pytest.Monke
     )
     patch_compressed_tensors_w8a8_int8.apply_to_module(feature_module)
     feature_scheme = feature_module.CompressedTensorsW8A8Int8()
+    assert feature_scheme.supports_quanted_inputs() is True
     feature_layer = SimpleNamespace(
         weight=torch.nn.Parameter(torch.ones(2, 3)),
         weight_scale=torch.ones(2, 1),

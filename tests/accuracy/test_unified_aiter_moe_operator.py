@@ -30,6 +30,7 @@ from tests.accuracy.deepseek_v4_dspark_ops_cases import (
     test_lightop_int8_clamped_silu_quant_matches_vllm_for_ht_and_ll,
     test_masked_channel_fp8_deepgemm_matches_dequantized_reference,
     test_masked_channel_int8_deepgemm_matches_dequantized_reference,
+    test_persistent_int8_clamped_silu_quant_matches_vllm,
 )
 
 pytestmark = pytest.mark.hcu

@@ -20,30 +20,36 @@ from vllm.platforms import current_platform
 def _require_slimquant_w4a8_hipc_runtime(
     *,
     ht_only: bool = False,
+    ll_only: bool = False,
     clamp: bool = False,
 ) -> None:
-    required_ops = {
-        "deepgemm": (
-            "pack_w4a8_moe_hipc_weight",
-            "view_w4a8_moe_hipc_weight_n32_layout",
-            "m_grouped_w4a8_gemm_nt_contiguous_hipc",
-            "m_grouped_w4a8_gemm_nt_masked_hipc",
-        ),
-        "lightop.activation": (
-            "fuse_silu_mul_quant",
-            "fuse_silu_mul_quant_ep",
-        ),
-    }
-    if ht_only:
-        required_ops = {
-            "deepgemm": (
-                "pack_w4a8_moe_hipc_weight",
-                "m_grouped_w4a8_gemm_nt_contiguous_hipc",
-            ),
-            "lightop" if clamp else "lightop.activation": (
-                "fuse_silu_mul_clamp_quant" if clamp else "fuse_silu_mul_quant",
-            ),
-        }
+    if ht_only and ll_only:
+        raise ValueError("SlimQuant W4A8 runtime cannot be both HT-only and LL-only")
+    deepgemm_ops = ["pack_w4a8_moe_hipc_weight"]
+    if not ll_only:
+        deepgemm_ops.append("m_grouped_w4a8_gemm_nt_contiguous_hipc")
+    if not ht_only:
+        deepgemm_ops.extend(
+            (
+                "view_w4a8_moe_hipc_weight_n32_layout",
+                "m_grouped_w4a8_gemm_nt_masked_hipc",
+            )
+        )
+    if clamp:
+        activation_module = "lightop"
+        activation_ops = []
+        if not ll_only:
+            activation_ops.append("fuse_silu_mul_clamp_quant")
+    else:
+        activation_module = "lightop.activation"
+        activation_ops = []
+        if not ll_only:
+            activation_ops.append("fuse_silu_mul_quant")
+        if not ht_only:
+            activation_ops.append("fuse_silu_mul_quant_ep")
+    required_ops = {"deepgemm": tuple(deepgemm_ops)}
+    if activation_ops:
+        required_ops[activation_module] = tuple(activation_ops)
     missing: list[str] = []
     for module_name, op_names in required_ops.items():
         try:
@@ -95,6 +101,49 @@ def slimquant_w4a8_uses_deepep_ht(moe_config: object) -> bool:
     limit = getattr(moe_config, "swiglu_limit", None)
     _require_slimquant_w4a8_hipc_runtime(
         ht_only=True, clamp=limit is not None and limit > 0,
+    )
+    return True
+
+
+def slimquant_w4a8_uses_deepep_ll(moe_config: object) -> bool:
+    """Select fixed low-latency DeepEP for HYV4 DP+EP W4A8."""
+    parallel = getattr(moe_config, "moe_parallel_config", None)
+    if getattr(parallel, "all2all_backend", None) != "deepep_low_latency":
+        return False
+    if (
+        getattr(parallel, "dp_size", 1) <= 1
+        or not getattr(parallel, "use_ep", False)
+    ):
+        raise ValueError("SlimQuant W4A8 DeepEP LL requires DP+EP")
+    if getattr(parallel, "use_deepep_auto_kernels", False):
+        raise ValueError(
+            "SlimQuant W4A8 DeepEP LL cannot use deepep_auto kernels"
+        )
+    from vllm.config import get_current_vllm_config_or_none
+    from vllm_hcu.deepseek_v4_runtime import model_architectures
+
+    config = get_current_vllm_config_or_none()
+    if config is None:
+        config = getattr(moe_config, "_hcu_vllm_config", None)
+    if model_architectures(config) != ("HYV4ForCausalLM",):
+        raise ValueError("SlimQuant W4A8 DeepEP LL requires HYV4ForCausalLM")
+    if getattr(moe_config, "moe_backend", "auto") not in ("auto", "deep_gemm"):
+        raise ValueError(
+            "SlimQuant W4A8 DeepEP LL requires moe_backend='auto' or 'deep_gemm'"
+        )
+    activation = getattr(moe_config, "activation", None)
+    if getattr(activation, "value", activation) != "silu":
+        raise ValueError(
+            "SlimQuant W4A8 DeepEP LL supports only SiLU activation"
+        )
+    if not current_platform.is_rocm():
+        raise RuntimeError(
+            "SlimQuant W4A8 DeepEP LL requires the HCU ROCm runtime"
+        )
+    limit = getattr(moe_config, "swiglu_limit", None)
+    _require_slimquant_w4a8_hipc_runtime(
+        ll_only=True,
+        clamp=limit is not None and limit > 0,
     )
     return True
 
@@ -167,9 +216,12 @@ def slimquant_w4a8_uses_deepep_auto(moe_config: object) -> bool:
     if vllm_config is None:
         vllm_config = getattr(moe_config, "_hcu_vllm_config", None)
     architectures = model_architectures(vllm_config)
-    if "DeepseekV4ForCausalLM" not in architectures:
+    is_deepseek_v4 = "DeepseekV4ForCausalLM" in architectures
+    is_hyv4 = architectures == ("HYV4ForCausalLM",)
+    if not is_deepseek_v4 and not is_hyv4:
         raise ValueError(
-            "SlimQuant W4A8 deepep_auto is validated only for DeepSeek-V4; "
+            "SlimQuant W4A8 deepep_auto is validated only for DeepSeek-V4 "
+            "or HY-V4; "
             f"got architectures={architectures!r}"
         )
     activation = getattr(moe_config, "activation", None)
@@ -183,7 +235,10 @@ def slimquant_w4a8_uses_deepep_auto(moe_config: object) -> bool:
         raise RuntimeError(
             "SlimQuant W4A8 deepep_auto requires the HCU ROCm runtime"
         )
-    _require_slimquant_w4a8_hipc_runtime()
+    limit = getattr(moe_config, "swiglu_limit", None)
+    _require_slimquant_w4a8_hipc_runtime(
+        clamp=limit is not None and limit > 0,
+    )
     return True
 
 
