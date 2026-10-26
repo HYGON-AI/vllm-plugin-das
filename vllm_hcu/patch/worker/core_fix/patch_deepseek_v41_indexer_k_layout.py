@@ -34,7 +34,8 @@ def _fp4_domain_blockers(module: ModuleType, vllm_config=None) -> tuple[str, ...
     """Experimental V4.1 domain, selected once before cache allocation.
 
     DP ranks own independent request/cache metadata. DSpark(5) uses the
-    upstream per-token flattened decode metadata on HIP; no CP/PP/PD or
+    upstream per-token flattened decode metadata on HIP. PCP8 is limited to
+    the existing eager MRV2/EP compute contract; no DCP/PP/PD or
     padded-native multi-token ABI is admitted here.
     """
     reasons = []
@@ -57,10 +58,22 @@ def _fp4_domain_blockers(module: ModuleType, vllm_config=None) -> tuple[str, ...
     parallel = getattr(vllm_config, "parallel_config", None)
     if parallel is not None and any(
         int(getattr(parallel, name, 1)) != 1
-        for name in ("prefill_context_parallel_size", "decode_context_parallel_size",
-                      "pipeline_parallel_size", "tensor_parallel_size")
+        for name in ("decode_context_parallel_size", "pipeline_parallel_size",
+                      "tensor_parallel_size")
     ):
-        reasons.append("FP4 requires TP1/PP1/PCP1/DCP1")
+        reasons.append("FP4 requires TP1/PP1/DCP1")
+    pcp_size = int(getattr(parallel, "prefill_context_parallel_size", 1))
+    if pcp_size != 1:
+        from vllm_hcu.patch.platform.core_fix.patch_vllm_config import (
+            _dsv41_pcp_dspark,
+        )
+        if not (getattr(vllm_config, "use_v2_model_runner", False)
+                and _dsv41_pcp_dspark(vllm_config)):
+            reasons.append(
+                "FP4 PCP requires experimental eager MRV2 V4.1 "
+                "TP1/PCP8/DCP1/PP1/DP1 + EP with "
+                "deepep_high_throughput and DSpark(5)"
+            )
     if int(getattr(parallel, "data_parallel_size", 1)) not in (1, 8):
         reasons.append("only DP1 or experimental DP8 is admitted")
     speculative = getattr(vllm_config, "speculative_config", None)
