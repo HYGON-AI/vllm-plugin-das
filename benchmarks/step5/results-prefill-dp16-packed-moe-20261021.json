@@ -1,0 +1,91 @@
+{
+  "scope": "Idle-GPU local-partial MoE screen at global M=131072, split into two 65536-token calls. Synthetic token/expert associations reproduce captured training-route marginals while preserving the original contiguous expert placement. This is not a full-model throughput result.",
+  "source_commit": "1997af79d75cd070938faf77b72c3a0fbe344ab5",
+  "check_source_sha256": "51ecdd17685972cf224d80336ff8b93d978a8a5a2647d7686db80ce68b6d20cb",
+  "workloads": [
+    {
+      "label": "train-p10",
+      "baseline_median_ms": 16.847578048706055,
+      "packed_on_call_median_ms": 23.442527770996094,
+      "packed_on_call_change_percent": 39.145,
+      "prepacked_upper_bound_median_ms": 15.653739929199219,
+      "prepacked_upper_bound_change_percent": -7.086,
+      "maximum_packed_relative_l2": 0.00013469606346916407
+    },
+    {
+      "label": "train-p50",
+      "baseline_median_ms": 20.438620567321777,
+      "packed_on_call_median_ms": 26.584453582763672,
+      "packed_on_call_change_percent": 30.070,
+      "prepacked_upper_bound_median_ms": 18.82286262512207,
+      "prepacked_upper_bound_change_percent": -7.905,
+      "maximum_packed_relative_l2": 0.00010975272016366944
+    },
+    {
+      "label": "train-p90",
+      "baseline_median_ms": 24.911402702331543,
+      "packed_on_call_median_ms": 30.66155433654785,
+      "packed_on_call_change_percent": 23.082,
+      "prepacked_upper_bound_median_ms": 22.87148666381836,
+      "prepacked_upper_bound_change_percent": -8.189,
+      "maximum_packed_relative_l2": 0.00011390774307074025
+    }
+  ],
+  "geomean_changes_percent": {
+    "packed_on_call": 30.601,
+    "prepacked_upper_bound": -7.728
+  },
+  "measurement": {
+    "baseline_samples_per_workload": 30,
+    "candidate_samples_per_workload": 15,
+    "cache_updates_during_measurement": 0,
+    "all_process_exit_codes": 0,
+    "numerical_inputs": [
+      "original",
+      "zero",
+      "changed",
+      "clipped-scale"
+    ],
+    "all_outputs_finite": true,
+    "zero_input_outputs_exact": true
+  },
+  "decision": {
+    "packed_on_call": "Rejected: packing weights on each forward is consistently slower.",
+    "prepacked_upper_bound": "Rejected after full-model validation: the local GEMM advantage did not survive routing, permutation, padding, and complete-model execution.",
+    "production_changed": false
+  },
+  "native_validation": {
+    "source_commit": "d2aa5d8b611d5ed18fc67a26fc77266375e64638",
+    "case": "prefill-dp16-native-deepgemm-route",
+    "trial": "native-prefill-20261021-122316",
+    "backend": "DEEPGEMM FP8 MoE with existing allgather_reducescatter communication; DeepEP disabled",
+    "formal_rounds": [
+      3,
+      4,
+      5
+    ],
+    "formal_tps": [
+      25162.96062408295,
+      25190.15347091441,
+      25166.232575508253
+    ],
+    "mean_tps": 25173.115556835204,
+    "sample_stdev_tps": 14.845682997430778,
+    "relative_to_selected_baseline_percent": -11.134240238564175,
+    "clean_rounds": 3,
+    "complete_requests_per_round": 64,
+    "preemptions": 0,
+    "jit_or_cache_writes_during_formal_rounds": 0,
+    "minimum_startup_reported_kv_tokens": 671649,
+    "fixed_dp_output_controls": {
+      "requests": 64,
+      "baseline_cross_candidate_first_token_matches": 44,
+      "candidate_self_repeat_first_token_matches": 58,
+      "baseline_cross_candidate_top20_exact": 0,
+      "candidate_self_repeat_top20_exact": 0,
+      "performance_score": false,
+      "business_quality_evaluated": false
+    },
+    "accepted": false
+  }
+}

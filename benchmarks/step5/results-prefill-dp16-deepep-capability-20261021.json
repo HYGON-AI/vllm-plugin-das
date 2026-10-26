@@ -1,0 +1,52 @@
+{
+  "recorded": "2026-10-21T08:44:10.396205+08:00",
+  "scope": "Installed DeepEP HT buffer initialization at four physical nodes x four GPUs; no model or collective throughput result.",
+  "installed_deepep_version": "1.1.0+dtk2610.torch2110.2609211318.gc807df",
+  "cpp_sha256": "e40ac99158d7e304872b745198bfd2abdea93e3b0997df63054ee923bb3f90e9",
+  "runtime_source_commit": "1997af79d75cd070938faf77b72c3a0fbe344ab5",
+  "proof_case": "prefill-deepep-ht-proof16",
+  "check_script_sha256": "67e85c79ebb116a5862045ebfc0f4fa958ee699682557b74b3a6e7c000deff13",
+  "passed": false,
+  "failure": {
+    "stage": "Buffer.runtime.sync of exchanged IPC handles",
+    "error": "RuntimeError: CUDA error csrc/deep_ep.cu:328 'invalid device pointer'",
+    "affected_ranks": 16,
+    "supervisor_exit_codes": {
+      "p5c1": 1,
+      "p5c2": 1,
+      "p5c3": 1,
+      "p5c4": 1
+    }
+  },
+  "topology_query": {
+    "physical_device_count": 4,
+    "queries": [
+      {
+        "world": 4,
+        "rdma_ranks": 1,
+        "local_device": 0,
+        "inferred_local_group": 4
+      },
+      {
+        "world": 8,
+        "rdma_ranks": 1,
+        "local_device": 0,
+        "inferred_local_group": 8
+      },
+      {
+        "world": 16,
+        "rdma_ranks": 2,
+        "local_device": 0,
+        "inferred_local_group": 8
+      }
+    ],
+    "synchronized": false,
+    "buffer_bytes": 0
+  },
+  "interpretation": "The installed runtime uses two logical eight-GPU groups for world16, while this cluster has four physical four-GPU hosts. That topology mismatch is confirmed; cross-host IPC grouping is a likely cause of the observed sync failure. A suitable four-GPU-node build or a different implementation would require separate validation.",
+  "adopted": false,
+  "collective_latency_measured": false,
+  "full_model_performance_validated": false,
+  "cleanup": "All owned proof jobs exited and container process scans were idle; local zero-buffer topology-query process also exited.",
+  "unchanged": "Native model weights, expert placement, runtime source, and selected launch recipe are unchanged."
+}

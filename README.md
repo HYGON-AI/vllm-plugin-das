@@ -293,3 +293,13 @@ wheel so stale module identities and custom-op registrations cannot survive an
 upgrade.
 
 ---
+
+## Step5 P/D optimization snapshot
+
+The consolidated source and fresh Decode performance/accuracy verification are recorded in the [2026-10-24 follow-up](docs/step5_pd_verification_20261024.md).
+
+The 2026-10-23 Step5 branch inventory, measured results, opt-in reproduction profiles and validation limits are documented in [Step5 P/D optimizations](docs/step5_pd_optimizations_20261023.md).
+
+Fresh full GSM8K results for all three profiles are in the [2026-10-24 accuracy comparison](docs/step5_full_gsm8k_20261024.md).
+
+Step5 reproduction uses external tuning data and explicit model gates; see the [source cleanup contract](docs/step5_pd_verification_20261024.md#source-cleanup-after-the-recorded-measurements).

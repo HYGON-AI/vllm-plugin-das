@@ -116,6 +116,11 @@ class HcuGPUWorker(Worker):
             distributed_init_method=distributed_init_method,
             is_driver_worker=is_driver_worker,
         )
+        # After the parent picked the model runner: with DBO on, vLLM would
+        # fall back to Model Runner V1 (DBO + spec decoding unsupported).
+        from vllm_hcu.v1.hcu_dbo import enable_in_worker
+
+        enable_in_worker(vllm_config)
 
     def load_model(self, *, load_dummy_weights: bool = False) -> None:
         """Load the model, then require every enabled patch chain to be live."""

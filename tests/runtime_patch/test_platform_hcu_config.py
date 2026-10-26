@@ -97,7 +97,7 @@ def _run_fresh_target(code: str) -> subprocess.CompletedProcess[str]:
         env.pop(name, None)
     env["VLLM_PLUGINS"] = "__disabled__"
     env["VLLM_HCU_TARGET_ROOT"] = str(TARGET_VLLM_ROOT)
-    env["PYTHONPATH"] = os.pathsep.join((str(TARGET_VLLM_ROOT), str(REPO)))
+    env["PYTHONPATH"] = os.pathsep.join((str(REPO), str(TARGET_VLLM_ROOT)))
     return subprocess.run(
         [sys.executable, "-c", _TARGET_SOURCE_ASSERTION + code],
         check=False,
@@ -374,7 +374,8 @@ def test_engine_args_rejects_conflicting_gdn_prefill_backend() -> None:
         )
 
 
-def test_engine_args_extracts_nested_offline_eplb_fields() -> None:
+@pytest.mark.parametrize("policy", ["locality_fair", "token_hash"])
+def test_engine_args_extracts_nested_offline_eplb_fields(policy) -> None:
     module = _make_arg_utils_module()
     patch_engine_args.apply_to_module(module)
     eplb_config = {
@@ -382,7 +383,7 @@ def test_engine_args_extracts_nested_offline_eplb_fields() -> None:
         "step_interval": 100,
         "expert_map_path": "/maps/hy4.json",
         "disable_rearrange": True,
-        "static_dispatch_policy": "locality_fair",
+        "static_dispatch_policy": policy,
     }
 
     args = module.EngineArgs(eplb_config=eplb_config)
@@ -392,7 +393,7 @@ def test_engine_args_extracts_nested_offline_eplb_fields() -> None:
     assert get_hcu_config(args) == HcuFeatureConfig(
         expert_map_path="/maps/hy4.json",
         eplb_disable_rearrange=True,
-        eplb_static_dispatch_policy="locality_fair",
+        eplb_static_dispatch_policy=policy,
     )
 
     config = args.create_engine_config()
@@ -402,8 +403,14 @@ def test_engine_args_extracts_nested_offline_eplb_fields() -> None:
     assert config.parallel_config._vllm_hcu_eplb_disable_rearrange is True
     assert (
         config.parallel_config._vllm_hcu_eplb_static_dispatch_policy
-        == "locality_fair"
+        == policy
     )
+
+
+@pytest.mark.parametrize("policy", ["hash", "tokenhash", "round_robin", ""])
+def test_unknown_static_eplb_dispatch_policy_is_rejected(policy) -> None:
+    with pytest.raises(ValueError, match="eplb_static_dispatch_policy"):
+        HcuFeatureConfig(eplb_static_dispatch_policy=policy)
 
 
 def test_engine_args_extracts_nested_offline_eplb_record_path() -> None:
@@ -690,6 +697,9 @@ def test_real_v0251_engine_args_normalizes_legacy_deep_gemm_backend(
     result = _run_fresh_target(
         f"MODEL_PATH = {str(model_path)!r}\n" + r'''
 import os
+import json
+import tempfile
+from pathlib import Path
 os.environ["VLLM_USE_V2_MODEL_RUNNER"] = "0"
 from vllm.engine import arg_utils
 from vllm_hcu.patch.platform.core_fix import patch_engine_args
@@ -1933,10 +1943,10 @@ def test_slimquant_marlin_inherits_v0251_compressed_tensors_constructor() -> Non
 
     # v0.25.1's FusedMoE public symbol is a factory and may be wrapped by HCU;
     # quantization dispatch must use the target-owned RoutedExperts type.
-    source = Path(
+    source = (REPO / Path(
         "vllm_hcu/model_executor/layers/quantization/compressed_tensors/"
         "compressed_tensors_marlin.py"
-    ).read_text(encoding="utf-8-sig")
+    )).read_text(encoding="utf-8-sig")
     assert "isinstance(layer, RoutedExperts)" in source
     assert "isinstance(layer, FusedMoE)" not in source
     assert config.get_quant_method(torch.nn.Embedding(4, 4), "embed") is None

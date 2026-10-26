@@ -341,6 +341,10 @@ class HcuGPUModelRunnerV2(GPUModelRunner):
                 "official MRV2 did not initialize the selected HCU PCP manager"
             )
         self._init_host_seq_lens()
+        if self.ubatch_runner is not None:
+            from vllm_hcu.v1.hcu_dbo import install_runner
+
+            install_runner(self)
 
     # ------------------------------------------------------------------
     # Host mirror of num_computed_tokens.
@@ -390,6 +394,8 @@ class HcuGPUModelRunnerV2(GPUModelRunner):
             if input_batch is self._hsl_batch and input_batch.seq_lens_cpu is None:
                 self._hsl_resolve()
                 self._hsl_attach(input_batch)
+                from vllm_hcu.v1.step5_hot_context import check_hot_graph_context
+                check_hot_graph_context(input_batch, args[0] if args else None, getattr(self, "_step5_hot_context_real_batch", False))
             return original_prepare_attn(input_batch, *args, **kwargs)
 
         model_state.prepare_attn = prepare_attn

@@ -1,0 +1,43 @@
+{
+  "world": 16,
+  "dp": 4,
+  "tp": 4,
+  "cases": [
+    {
+      "ids_dtype": "torch.int32",
+      "mixed_local_strides": false,
+      "baseline_rank_max_ms": 0.06299987435340881,
+      "candidate_rank_max_ms": 0.09548050165176392,
+      "changed_input_graph_replays_per_rank": 3
+    },
+    {
+      "ids_dtype": "torch.int32",
+      "mixed_local_strides": true,
+      "baseline_rank_max_ms": 0.07228037714958191,
+      "candidate_rank_max_ms": 0.09504037350416183,
+      "changed_input_graph_replays_per_rank": 3
+    },
+    {
+      "ids_dtype": "torch.int64",
+      "mixed_local_strides": false,
+      "baseline_rank_max_ms": 0.061520375311374664,
+      "candidate_rank_max_ms": 0.10044000297784805,
+      "changed_input_graph_replays_per_rank": 3
+    },
+    {
+      "ids_dtype": "torch.int64",
+      "mixed_local_strides": true,
+      "baseline_rank_max_ms": 0.07448037713766098,
+      "candidate_rank_max_ms": 0.09436000138521194,
+      "changed_input_graph_replays_per_rank": 3
+    }
+  ],
+  "numerical_cases": 64,
+  "bitexact": true,
+  "changed_input_graph_replays": 192,
+  "full_model_performance_validated": false,
+  "selected": false,
+  "reason": "LeaderDPgather pluslocalTPbroadcast is slower inall4cases; no sourceintegration or fullmodel reload justified",
+  "explicit_synthetic_replica_contract": true,
+  "actual_model_replica_contract_validated": false
+}

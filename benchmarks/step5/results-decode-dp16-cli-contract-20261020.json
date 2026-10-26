@@ -1,0 +1,21 @@
+{
+  "exit": 0,
+  "stdout": "............                                                             [100%]\n12 passed in 0.33s\n",
+  "stderr": "",
+  "files_sha256": {
+    "benchmarks/step5/launch_multinode.sh": "9db300bceb3a9dcdb62632507f40f32fd54b205688ad5e4520a0e807e98777e4",
+    "benchmarks/step5/package_runtime.py": "fcc0fcf86c5e440157210e3d79b0ba85b5a8c2dbf7309cca7f2cc78696d16699",
+    "tests/runtime_patch/test_step5_launch_limits.py": "d1a803e93b9b94a90b64f5a9c3f7df1a5bdeb032d8b67ca28d0768e68f338a1b",
+    "tests/runtime_patch/test_step5_runtime_package.py": "5e26f07129a8496db18af6ec483bfb6754aeab06a81257d555feff4b82c54db8"
+  },
+  "gpu_work": false,
+  "scope": "Decode DP16 CLI/package contract; full advertised context requires DSA graph width auto sizing",
+  "dp": 16,
+  "tp": 1,
+  "ep": 16,
+  "max_num_batched_tokens": 32768,
+  "max_model_len": 1048576,
+  "default_long_prefill_token_threshold": 2048,
+  "dsa_graph_regions_override": 0,
+  "dp16_model_execution_validated": false
+}

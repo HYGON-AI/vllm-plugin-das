@@ -1,0 +1,45 @@
+{
+  "measured_at": "2026-10-21",
+  "case": "prefill-pipe-dbo-directsum-realmtp-eplb16",
+  "parallel": "DP16TP1EP16",
+  "source_commit": "1997af79d75cd070938faf77b72c3a0fbe344ab5",
+  "unchanged": {
+    "max_num_batched_tokens": 8192,
+    "max_model_len": 70000,
+    "pipe_min_tokens": 65536,
+    "dbo_min_tokens": 4096,
+    "direct_sum_min_tokens": 65536,
+    "standard_mtp": true
+  },
+  "candidate": {
+    "enable_eplb": true,
+    "num_redundant_experts": 16,
+    "physical_experts": 368,
+    "local_physical_experts": 23,
+    "window_size": 32,
+    "step_interval": 32,
+    "use_async": false,
+    "E23_tuned_table_present": false
+  },
+  "real_route_proxy": {
+    "heldout_before": 4583404.307692308,
+    "heldout_after": 3219097.599999999,
+    "change_percent": -29.766230864743893,
+    "heldout_used_for_optimization": false
+  },
+  "startup": {
+    "e23_inductor_compile_required": true,
+    "profile_rearrangement_seconds": 8.53
+  },
+  "warmup_round1": {
+    "prefill_tps": 12283.043183175523,
+    "latency_seconds": 341.4711,
+    "complete_requests": 64,
+    "runtime_rearrangement_seconds": 6.31
+  },
+  "selected_baseline_mean_tps": 39885.86428857278,
+  "delta_percent": -69.20452044286128,
+  "formal_rounds": 0,
+  "selected": false,
+  "reason": "E23 has no dedicated ep_fused_moe table and falls back to library kernels; the complete first warmup is 69.2% slower despite the strong load proxy. Dynamic weight rearrangement adds about6.3s per32-step round. Further rounds were stopped."
+}

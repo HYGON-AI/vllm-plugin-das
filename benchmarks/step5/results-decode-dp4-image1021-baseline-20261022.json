@@ -1,0 +1,53 @@
+{
+  "measured_at": "2026-10-21",
+  "recorded_at": "2026-10-22",
+  "case": "decode-dp4-baseline-image1021",
+  "container": "xuwq_vllm_1021",
+  "image": "10.16.1.152:5000/jenkins/model_test_env/vllm:0.28.1rc1-ubuntu22.04-dtk2610-py3.12-scalex40-20261021-0235",
+  "source_commit": "04c59a4b0c1b877c582164bdc6bb267640845e8d",
+  "trial": "native-itl6479-20261021-233614",
+  "parallel": "DP4TP4EP16",
+  "machines": 4,
+  "cards_per_machine": 4,
+  "batch": 64,
+  "per_dp_bs": 16,
+  "input_tokens": 65536,
+  "output_tokens": 4096,
+  "max_model_len": 1048576,
+  "max_num_batched_tokens": 32768,
+  "graph_regions": 8704,
+  "context_limitation": "Historical baseline declares 1M max_model_len but fixes DSA decode graph width at8704 regions (~69632tokens). This result does not validate full1M decoding. Full-context candidates are prepared separately.",
+  "mtp_tokens": 3,
+  "rejection_sample_method": "synthetic",
+  "synthetic_acceptance_rates": [
+    0.838992,
+    0.598322,
+    0.362686
+  ],
+  "actual_acceptance": 0.6019530805147477,
+  "expert_shape": "E22",
+  "eplb_enabled": false,
+  "expert_grid": true,
+  "placement_sha256": "431089b03db8fa4f6a3b2bc5cd73a0ac44683444303d2fe88ec10e355f53fa04",
+  "formal_rounds": [
+    2
+  ],
+  "warmup_rounds": [
+    1
+  ],
+  "warmup_itl_ms": 62.84254455918456,
+  "warmup_tps": 2857.5355175975637,
+  "formal_itl_ms": 62.61988341010915,
+  "formal_decode_tps": 2874.44907290081,
+  "complete_requests": 64,
+  "incomplete_requests": 0,
+  "preemptions": 0,
+  "jit_events": 0,
+  "cache_updates": 0,
+  "previous_image_itl_ms": 63.1138025247803,
+  "previous_image_tps": 2852.006998843105,
+  "under60ms": false,
+  "interpretation": "One audited formal round; new-image baseline, not a stability result or full-context validation.",
+  "itl_improvement_percent": 0.7825849416650432,
+  "decode_tps_improvement_percent": 0.7868870611751122
+}

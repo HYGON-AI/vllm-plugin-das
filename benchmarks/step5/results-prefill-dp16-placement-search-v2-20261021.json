@@ -1,0 +1,13 @@
+{
+  "measured_at": "2026-10-21",
+  "case": "prefill-placement-deeper-search-v2",
+  "parent_plan_sha256": "23c2b309031e909246884de62acf503f15f5d15df5a8e67d560d22fbcf3bdc61",
+  "method": "Four-start capacity22 minimax BM-padded-row search initialized from v1; 12k swaps/start; heldout excluded from search and selection",
+  "heldout_used_for_optimization": false,
+  "train_proxy_change_percent": -0.06680285163060962,
+  "heldout_proxy_change_percent": -0.054564749453234196,
+  "layers_changed": 88,
+  "full_model_test_run": false,
+  "selected": false,
+  "reason": "The deeper search improves the independent heldout proxy by only0.055%, below the measured full-model noise floor; preserve the validated v1 placement."
+}

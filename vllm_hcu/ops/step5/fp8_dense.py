@@ -15,12 +15,15 @@ these shapes (M=64: o_proj 29.5 -> 16.2 us, MLP down 39.5 -> 18.0 us; M>=2k:
 padded to a multiple of 256 with zero rows and the caller drops the pad columns.
 """
 
+import os
+
 import torch
 
 from vllm.utils.torch_utils import direct_register_custom_op
 
 FP8_MAX = 448.0
 N_ALIGN = 256
+_TUNED_DENSE = os.environ.get("HCU_STEP5_DENSE_TUNING", "0") == "1"
 
 
 @torch.no_grad()
@@ -57,6 +60,12 @@ def _step5_fp8_gemm(
     N = wq.shape[0]
     if M == 0:
         return torch.empty(0, N, device=xq.device, dtype=torch.bfloat16)
+    if _TUNED_DENSE:
+        from .fp8_dense_tuned import tuned_fp8_gemm
+
+        out = tuned_fp8_gemm(xq, xs, wq, ws)
+        if out is not None:
+            return out
     from lightop.gemm_ops import hipblaslt_w8a8_channelwise_gemm
 
     status, out = hipblaslt_w8a8_channelwise_gemm(

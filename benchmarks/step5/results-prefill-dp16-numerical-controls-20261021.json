@@ -1,0 +1,40 @@
+{
+  "scope": "Fixed-DP random-token diagnostic output comparisons; not throughput or business quality.",
+  "recorded": "2026-10-21T01:11:58.738785+08:00",
+  "protocol": {
+    "input_tokens": 65536,
+    "output_tokens": 1,
+    "requests": 64,
+    "waves": 4,
+    "concurrent_requests_per_wave": 16,
+    "dp_rank": "index%16 via X-data-parallel-rank",
+    "per_wave_destination_validation": "Per-engine success counter delta exactly one on all16 engines",
+    "routing_sanity": "A single short request pinned to rank5 increments only engine5 success counter"
+  },
+  "same_c65536_configuration_repeat": {
+    "reference_sha256": "ef25bd26ba4a759bb7fbf5e834d866ad57e61ac48518245c2bef3ada118ddbd7",
+    "candidate_sha256": "fb5673dc56adf4b80ca7a896cb45b13fa802f58f55f1293cee717e2a302ae8aa",
+    "diagnostic_only": true,
+    "formal_performance_score": false,
+    "requests": 64,
+    "token_matches": 64,
+    "top_logprobs_exact": 64,
+    "mean_centered_common_top_logprobs_rmse": 0.0,
+    "p95_centered_common_top_logprobs_rmse": 0.0,
+    "limits": "Random-token prompt diagnostics; fixed DP destination does not control exact scheduler timing or KV free-list history. Not a business-quality evaluation."
+  },
+  "c65536_versus_c131072": {
+    "reference_sha256": "ef25bd26ba4a759bb7fbf5e834d866ad57e61ac48518245c2bef3ada118ddbd7",
+    "candidate_sha256": "9948d0df4019dc03181f7571c22e363c9ccdf86102954a6711c1bb779161225c",
+    "diagnostic_only": true,
+    "formal_performance_score": false,
+    "requests": 64,
+    "token_matches": 59,
+    "top_logprobs_exact": 0,
+    "mean_centered_common_top_logprobs_rmse": 0.14587954742381315,
+    "p95_centered_common_top_logprobs_rmse": 0.4100501139541755,
+    "limits": "Random-token prompt diagnostics; fixed DP destination does not control exact scheduler timing or KV free-list history. Not a business-quality evaluation."
+  },
+  "interpretation": "The same c65536 configuration repeated exactly on these64 diagnostics; cross-chunk differences remain. These probes do not establish general determinism or business quality. c131072 remains rejected independently for lower measured throughput and KV capacity.",
+  "limits": "Random-token prompt diagnostics; fixed DP destination does not control exact scheduler timing or KV free-list history. Not a business-quality evaluation."
+}

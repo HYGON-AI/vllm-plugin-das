@@ -1,0 +1,692 @@
+{
+  "measured_at": "2026-10-22",
+  "timezone": "Asia/Shanghai",
+  "status": "complete_selected_synthetic_service_retained",
+  "parallel": "DP16TP1EP16",
+  "machines": 4,
+  "cards_per_machine": 4,
+  "concurrency": 64,
+  "input_tokens": 65536,
+  "output_tokens": 1,
+  "max_num_batched_tokens": 8192,
+  "max_model_len": 70000,
+  "mtp_tokens": 3,
+  "rejection_sample_method": "synthetic",
+  "synthetic_acceptance_rates": [
+    0.838992,
+    0.598322,
+    0.362686
+  ],
+  "source_runtime": "/opt/xuwq_step5_native_prefill_uniform_20261022",
+  "tested_source_base": "1997af79d75cd070938faf77b72c3a0fbe344ab5",
+  "tested_source_overlay": {
+    "base_commit": "1997af79d75cd070938faf77b72c3a0fbe344ab5",
+    "path": "source/vllm_hcu/model_executor/layers/fused_moe/modular_kernel.py",
+    "base_sha256": "1c53bbfc052660ca2a59bc92f36373b45f2dd122425ec7616e02f73f77ac7fa3",
+    "sha256": "a985165004c3fea1818013098c6a5144332c56d6a2527bfae612f41830da3c5a"
+  },
+  "expert_placement": {
+    "path": "/var/lib/xuwq_step5_assets/expert_placement_prefill_8192_ep16_20261020.pt",
+    "sha256": "876ac0f5963c51d7e9e0a4629e589de70ef2d2e9ba86b9b20437d8d0beb1bb32"
+  },
+  "eplb_enabled": false,
+  "controls": {
+    "HCU_DP_MOE_PIPE_UNIFORM": 1,
+    "HCU_DP_MOE_PIPE_MIN_TOKENS": 65536,
+    "HCU_DBO_MIN_TOKENS": 4096,
+    "HCU_EP_DIRECT_SUM": 65536,
+    "HCU_SHARED_EXPERTS_STREAM_MIN_TOKENS": 4096,
+    "EP_FUSED_MOE_CHUNK": 65536,
+    "HCU_STEP5_BOUNDED_EP_WORKSPACE": 1,
+    "NCCL_MAX_NCHANNELS": 32
+  },
+  "optimization": "Use native uniform AllGather/ReduceScatter only for equal positive full-DP DBO shards. Preserve grouped Broadcast/Reduce for all other cases.",
+  "uniform_log_hits": {
+    "p5c1": 352,
+    "p5c2": 352,
+    "p5c3": 352,
+    "p5c4": 352
+  },
+  "usage_ranks": {
+    "p5c1": [
+      0,
+      1,
+      2,
+      3
+    ],
+    "p5c2": [
+      4,
+      5,
+      6,
+      7
+    ],
+    "p5c3": [
+      8,
+      9,
+      10,
+      11
+    ],
+    "p5c4": [
+      12,
+      13,
+      14,
+      15
+    ]
+  },
+  "formal_rounds": [
+    3,
+    4,
+    5
+  ],
+  "rounds": [
+    {
+      "round": 3,
+      "prefill_tps": 40120.1325432876,
+      "prefill_latency_seconds": 104.5436227179598,
+      "complete_requests": 64,
+      "preemptions": 0,
+      "jit_events": 0,
+      "cache_updates": 0,
+      "iteration_start": 1792636083.4041214,
+      "iteration_end": 1792636188.43259
+    },
+    {
+      "round": 4,
+      "prefill_tps": 40211.929355710236,
+      "prefill_latency_seconds": 104.30496788397431,
+      "complete_requests": 64,
+      "preemptions": 0,
+      "jit_events": 0,
+      "cache_updates": 0,
+      "iteration_start": 1792636216.9259849,
+      "iteration_end": 1792636321.764575
+    },
+    {
+      "round": 5,
+      "prefill_tps": 40161.76532480617,
+      "prefill_latency_seconds": 104.43524994677864,
+      "complete_requests": 64,
+      "preemptions": 0,
+      "jit_events": 0,
+      "cache_updates": 0,
+      "iteration_start": 1792636348.04508,
+      "iteration_end": 1792636452.942546
+    }
+  ],
+  "mean_tps": 40164.609074601336,
+  "sample_stdev_tps": 45.96443056769463,
+  "previous_selected_mean_tps": 39672.55673833818,
+  "improvement_percent": 1.1066171084773702,
+  "baseline_comparison": "Same-source, same-image, fixed synthetic protocol; separate sequential three-round blocks with only HCU_DP_MOE_PIPE_UNIFORM changed. Not randomized alternating A/B.",
+  "h200_reference_tps": 69306,
+  "h200_percent": 57.952571313596714,
+  "collective_microbenchmark": {
+    "date": "2026-10-22",
+    "world_size": 16,
+    "scope": "idle GPU communication proxy, not model throughput",
+    "native": "16 grouped broadcasts/reduces per tensor",
+    "candidate": "uniform AllGather/ReduceScatter for full DP group",
+    "timings": [
+      {
+        "M": 4096,
+        "name": "dispatch",
+        "grouped_ms": 4.649116277694702,
+        "uniform_ms": 2.506317973136902
+      },
+      {
+        "M": 4096,
+        "name": "combine",
+        "grouped_ms": 4.741349935531616,
+        "uniform_ms": 4.265034914016724
+      },
+      {
+        "M": 4096,
+        "name": "pair",
+        "grouped_ms": 9.069833278656006,
+        "uniform_ms": 6.589190483093262
+      },
+      {
+        "M": 8192,
+        "name": "dispatch",
+        "grouped_ms": 6.743674993515015,
+        "uniform_ms": 4.587355375289917
+      },
+      {
+        "M": 8192,
+        "name": "combine",
+        "grouped_ms": 8.615833759307861,
+        "uniform_ms": 8.162630558013916
+      },
+      {
+        "M": 8192,
+        "name": "pair",
+        "grouped_ms": 15.044310569763184,
+        "uniform_ms": 12.652863502502441
+      }
+    ],
+    "changed_integer_sentinel_checks": 192,
+    "random_checks": 64,
+    "all_gather_bytes_exact": true,
+    "max_bf16_relative_l2": 0.005028660874813795,
+    "all_random_checks_pass_bf16_rounding_bound": true,
+    "fabric16_note": "AITER communicator supports initialization at world16, but installed should_custom_ag/should_custom_rs restrict these operations to world2/4/8. No validation bypass or direct Fabric16 deployment.",
+    "formal_model_results_pending": true
+  },
+  "quality": {
+    "speculation": "standard MTP3, no synthetic acceptance",
+    "gsm8k100": {
+      "dataset": "gsm8k",
+      "requested": 100,
+      "predictions": 100,
+      "correct": 97,
+      "score_percent": 97.0,
+      "metric": "EvalScope-1.12-compatible numeric accuracy",
+      "request_errors": 0,
+      "finish_reasons": {
+        "stop": 100
+      },
+      "max_observed_output_tokens": 2283,
+      "output_token_limit": 32768,
+      "few_shot_num": 0,
+      "repeats": 1,
+      "complete": true,
+      "concurrency": 64,
+      "generation": {
+        "temperature": 1.0,
+        "top_p": 0.95,
+        "top_k": -1,
+        "max_tokens": 32768,
+        "seed": 42,
+        "n": 1,
+        "stream": false
+      },
+      "elapsed_s": 140.38668155670166,
+      "historical_same_checkpoint_score_percent": 95.90598938589841,
+      "historical_same_checkpoint_correct": 1265,
+      "notes": "Frozen 1319 zero-shot prompts. Scoring reproduces EvalScope 1.12 GSM8K extract_answer and numeric comparison for numeric targets; concurrency differs from historical batch size 4."
+    },
+    "long_gsm8k16_summary": {
+      "kind": "long-context GSM8K16 smoke, separate from original GSM8K100",
+      "requested": 16,
+      "concurrency": 16,
+      "one_request_per_dp": true,
+      "prompt_tokens": [
+        24583,
+        24545,
+        24568,
+        24553,
+        24626,
+        24573,
+        24560,
+        24584,
+        24620,
+        24575,
+        24577,
+        24581,
+        24586,
+        24577,
+        24568,
+        24609
+      ],
+      "repeats": 1360,
+      "standard_mtp": true,
+      "started": 1792637870.1919127,
+      "complete": true,
+      "correct": 15,
+      "request_errors": 0,
+      "finished": 1792637921.5501206
+    },
+    "long_short_comparison": {
+      "short_first16_correct": 15,
+      "long_correct": 15,
+      "answer_matches": 16,
+      "correctness_matches": 16,
+      "same_incorrect_indices": [
+        12
+      ]
+    },
+    "all16_uniform_path_verified": true,
+    "note": "Long smoke adds unrelated background; it is a separate modified-input test, not a standard GSM8K score. Small samples do not prove full numerical or quality equivalence.",
+    "long_gsm8k16_finish_audit": {
+      "finish_reasons": {
+        "stop": 16
+      },
+      "max_output_tokens": 909,
+      "prompt_tokens_min": 24545,
+      "prompt_tokens_max": 24626,
+      "correct": 15,
+      "request_errors": 0
+    }
+  },
+  "limits": [
+    "Performance is a 64K input/one output Prefill test. No 70000-token end-to-end long Decode claim.",
+    "AllGather is byte exact; BF16 ReduceScatter reduction association can differ.",
+    "GSM8K100 and the modified-input long16 are small quality checks, not a full 1319-question evaluation."
+  ],
+  "excluded_runs": {
+    "first_instance": "Startup autotuning eventually completed. The investigator stopped the first instance during warmup2; only warmup1 completed. No formal score from that instance is used.",
+    "initial_micro_screens": "Harness corrections: use representable BF16 integer sentinel sums and capture returned out-of-place FP32 all-reduce tensors. Only corrected screen3 contributes timings."
+  },
+  "unchanged_decode": {
+    "mean_itl_ms": 57.03812376334747,
+    "mean_tps": 3149.196925200486,
+    "service_stopped_for_prefill": true,
+    "assets_preserved": true
+  },
+  "hardware_changes": false,
+  "max_num_seqs": 64,
+  "gpu_memory_utilization": 0.875,
+  "kv_cache_dtype": "fp8_e4m3",
+  "prefix_caching": false,
+  "image_inventory": [
+    {
+      "node": "p5c1",
+      "image_id": "sha256:8f0c57d79e8ad3a6892aae2e55701e9d961405e7b826ef262e3402373f348fcf",
+      "packages": {
+        "torch": "2.11.0+das.opt1.dtk2610.2609201632.gf74cd7",
+        "vllm": "0.28.1+dtk2610.torch2110.2610191943.g29071f",
+        "triton": "3.6.0+dtk2610.torch2110.2610171647.g46f0be",
+        "aiter": "0.1.7+dtk2610.torch2110.2610201311.gbc033a",
+        "flash_attn": "2.8.4+dtk2610.torch2110.2610191836.g18ee46"
+      }
+    },
+    {
+      "node": "p5c2",
+      "image_id": "sha256:8f0c57d79e8ad3a6892aae2e55701e9d961405e7b826ef262e3402373f348fcf",
+      "packages": {
+        "torch": "2.11.0+das.opt1.dtk2610.2609201632.gf74cd7",
+        "vllm": "0.28.1+dtk2610.torch2110.2610191943.g29071f",
+        "triton": "3.6.0+dtk2610.torch2110.2610171647.g46f0be",
+        "aiter": "0.1.7+dtk2610.torch2110.2610201311.gbc033a",
+        "flash_attn": "2.8.4+dtk2610.torch2110.2610191836.g18ee46"
+      }
+    },
+    {
+      "node": "p5c3",
+      "image_id": "sha256:8f0c57d79e8ad3a6892aae2e55701e9d961405e7b826ef262e3402373f348fcf",
+      "packages": {
+        "torch": "2.11.0+das.opt1.dtk2610.2609201632.gf74cd7",
+        "vllm": "0.28.1+dtk2610.torch2110.2610191943.g29071f",
+        "triton": "3.6.0+dtk2610.torch2110.2610171647.g46f0be",
+        "aiter": "0.1.7+dtk2610.torch2110.2610201311.gbc033a",
+        "flash_attn": "2.8.4+dtk2610.torch2110.2610191836.g18ee46"
+      }
+    },
+    {
+      "node": "p5c4",
+      "image_id": "sha256:9c437b9665a0408c2f2d42ab6bee6d9563ebdb4985ddb5a09aca7b7de0d67e36",
+      "packages": {
+        "torch": "2.11.0+das.opt1.dtk2610.2609201632.gf74cd7",
+        "vllm": "0.28.1+dtk2610.torch2110.2610191943.g29071f",
+        "triton": "3.6.0+dtk2610.torch2110.2610171647.g46f0be",
+        "aiter": "0.1.7+dtk2610.torch2110.2610201311.gbc033a",
+        "flash_attn": "2.8.4+dtk2610.torch2110.2610191836.g18ee46"
+      }
+    }
+  ],
+  "image_id_mismatch_previously_user_accepted": true,
+  "collective_check_script": "benchmarks/step5/check_prefill_dbo_uniform.py",
+  "collective_check_script_sha256": "dd21b42af4237a76660dae5cd626d2ed4e57284b15488589066c42551a9886a8",
+  "current_control": {
+    "case": "prefill-uniform-1022-control",
+    "trial": "native-prefill-20261022-111735",
+    "parallel": "DP16TP1EP16",
+    "concurrency": 64,
+    "input_tokens": 65536,
+    "output_tokens": 1,
+    "max_num_batched_tokens": 8192,
+    "max_model_len": 70000,
+    "formal_rounds": [
+      3,
+      4,
+      5
+    ],
+    "rounds": [
+      {
+        "round": 3,
+        "prefill_tps": 39666.70307593028,
+        "prefill_latency_seconds": 105.73865924705751,
+        "complete_requests": 64,
+        "preemptions": 0,
+        "jit_events": 0,
+        "cache_updates": 0,
+        "iteration_start": 1792639316.8468494,
+        "iteration_end": 1792639423.0869563
+      },
+      {
+        "round": 4,
+        "prefill_tps": 39749.1435156315,
+        "prefill_latency_seconds": 105.5193553629797,
+        "complete_requests": 64,
+        "preemptions": 0,
+        "jit_events": 0,
+        "cache_updates": 0,
+        "iteration_start": 1792639450.8720295,
+        "iteration_end": 1792639556.906279
+      },
+      {
+        "round": 5,
+        "prefill_tps": 39759.1695149766,
+        "prefill_latency_seconds": 105.49274673406035,
+        "complete_requests": 64,
+        "preemptions": 0,
+        "jit_events": 0,
+        "cache_updates": 0,
+        "iteration_start": 1792639582.5664897,
+        "iteration_end": 1792639688.6011372
+      }
+    ],
+    "mean_tps": 39725.00536884613,
+    "sample_stdev_tps": 50.73951305591053,
+    "previous_image1021_mean_tps": 39672.55673833818,
+    "change_vs_previous_percent": 0.13220380741749693,
+    "all16_uniform_collectives": false,
+    "uniform_log_hits": {
+      "p5c1": 0,
+      "p5c2": 0,
+      "p5c3": 0,
+      "p5c4": 0
+    },
+    "uniform_usage_ranks": {
+      "p5c1": [],
+      "p5c2": [],
+      "p5c3": [],
+      "p5c4": []
+    },
+    "source_overlay": {
+      "base_commit": "1997af79d75cd070938faf77b72c3a0fbe344ab5",
+      "path": "source/vllm_hcu/model_executor/layers/fused_moe/modular_kernel.py",
+      "base_sha256": "1c53bbfc052660ca2a59bc92f36373b45f2dd122425ec7616e02f73f77ac7fa3",
+      "sha256": "a985165004c3fea1818013098c6a5144332c56d6a2527bfae612f41830da3c5a"
+    },
+    "source_runtime": "/opt/xuwq_step5_native_prefill_uniform_20261022",
+    "source_commit": "1997af79d75cd070938faf77b72c3a0fbe344ab5",
+    "synthetic_acceptance_rates": [
+      0.838992,
+      0.598322,
+      0.362686
+    ],
+    "eplb_enabled": false,
+    "placement": "/var/lib/xuwq_step5_assets/expert_placement_prefill_8192_ep16_20261020.pt",
+    "quality_validation_pending": false,
+    "long_prefill_token_threshold": 0,
+    "quality_note": "Unchanged original group-collective path used only as a synthetic performance control."
+  },
+  "current_control_comparison": {
+    "candidate_tps": 40164.609074601336,
+    "candidate_stdev": 45.96443056769463,
+    "current_control_tps": 39725.00536884613,
+    "current_control_stdev": 50.73951305591053,
+    "change_percent": 1.1066171084773702,
+    "same_image": true,
+    "same_source": true,
+    "only_changed_control": "HCU_DP_MOE_PIPE_UNIFORM",
+    "randomized_AB": false
+  },
+  "current_control_mean_tps": 39725.00536884613,
+  "improvement_vs_historical_percent": 1.240283905845807,
+  "selected": true,
+  "long_quality_audit": {
+    "finish_reasons": {
+      "stop": 16
+    },
+    "max_output_tokens": 909,
+    "prompt_tokens_min": 24545,
+    "prompt_tokens_max": 24626,
+    "correct": 15,
+    "request_errors": 0
+  },
+  "source_integration_note": "Runtime tested pinned1997af79+one-file overlay. Repository integration preserves pre-existing seven-dimensional packed-weight support; the tested overlay is archived separately.",
+  "formal_measurement_state": "/var/lib/xuwq_step5_1021/prefill-uniform-1022-final",
+  "retained_service_state": "/var/lib/xuwq_step5_1021/prefill-uniform-1022-selected",
+  "not_adopted_experiments": [
+    "Native triton.autotune_at_compile_time launcher was prepared but never run; no compile-setting change was adopted.",
+    "Long-prefill-token-threshold2048 launcher was prepared but never run; threshold remains0."
+  ],
+  "model_config_sha256": "e6646ad7bd8c09f37122a7687826f77a2c1000de8297eb87d01bad6df211df61",
+  "retained_services": {
+    "p5c1": {
+      "pid": 309782,
+      "start_ticks": "119336332",
+      "rank": 0,
+      "phase": "prefill",
+      "log": "/var/lib/xuwq_step5_1021/prefill-uniform-1022-selected/logs/native-prefill-1021-placement-synthetic-node0-20261022-113512.log",
+      "runtime": "/opt/xuwq_step5_native_prefill_uniform_20261022",
+      "state": "/var/lib/xuwq_step5_1021/prefill-uniform-1022-selected",
+      "source_commit": "1997af79d75cd070938faf77b72c3a0fbe344ab5",
+      "uniform_collectives": true,
+      "source_overlay": {
+        "base_commit": "1997af79d75cd070938faf77b72c3a0fbe344ab5",
+        "path": "source/vllm_hcu/model_executor/layers/fused_moe/modular_kernel.py",
+        "base_sha256": "1c53bbfc052660ca2a59bc92f36373b45f2dd122425ec7616e02f73f77ac7fa3",
+        "sha256": "a985165004c3fea1818013098c6a5144332c56d6a2527bfae612f41830da3c5a"
+      },
+      "started": 1792640112.946756,
+      "tp": 1,
+      "dp": 16,
+      "ep": 16,
+      "local_dp": 4,
+      "batched_tokens": 8192,
+      "max_model_len": 70000,
+      "gpu_memory_utilization": 0.875,
+      "host": "127.0.0.1",
+      "port": 8018,
+      "pipe_min_tokens": 65536,
+      "dbo_min_tokens": 4096,
+      "direct_sum_min_tokens": 65536,
+      "moe_chunk": 65536,
+      "bounded_workspace": true,
+      "placement": "/var/lib/xuwq_step5_assets/expert_placement_prefill_8192_ep16_20261020.pt",
+      "expert_grid": false,
+      "worker_extension": false,
+      "shared_stream_min_tokens": 4096,
+      "synthetic_mtp": true,
+      "mtp_rejection_sampling": "synthetic",
+      "synthetic_acceptance_rates": [
+        0.838992,
+        0.598322,
+        0.362686
+      ],
+      "changed_controls": [
+        "HCU_DP_MOE_PIPE_MIN_TOKENS",
+        "HCU_DBO_MIN_TOKENS",
+        "HCU_EP_DIRECT_SUM"
+      ]
+    },
+    "p5c2": {
+      "pid": 291500,
+      "start_ticks": "119330345",
+      "rank": 1,
+      "phase": "prefill",
+      "log": "/var/lib/xuwq_step5_1021/prefill-uniform-1022-selected/logs/native-prefill-1021-placement-synthetic-node1-20261022-113512.log",
+      "runtime": "/opt/xuwq_step5_native_prefill_uniform_20261022",
+      "state": "/var/lib/xuwq_step5_1021/prefill-uniform-1022-selected",
+      "source_commit": "1997af79d75cd070938faf77b72c3a0fbe344ab5",
+      "uniform_collectives": true,
+      "source_overlay": {
+        "base_commit": "1997af79d75cd070938faf77b72c3a0fbe344ab5",
+        "path": "source/vllm_hcu/model_executor/layers/fused_moe/modular_kernel.py",
+        "base_sha256": "1c53bbfc052660ca2a59bc92f36373b45f2dd122425ec7616e02f73f77ac7fa3",
+        "sha256": "a985165004c3fea1818013098c6a5144332c56d6a2527bfae612f41830da3c5a"
+      },
+      "started": 1792640112.9469686,
+      "tp": 1,
+      "dp": 16,
+      "ep": 16,
+      "local_dp": 4,
+      "batched_tokens": 8192,
+      "max_model_len": 70000,
+      "gpu_memory_utilization": 0.875,
+      "host": "127.0.0.1",
+      "port": 8018,
+      "pipe_min_tokens": 65536,
+      "dbo_min_tokens": 4096,
+      "direct_sum_min_tokens": 65536,
+      "moe_chunk": 65536,
+      "bounded_workspace": true,
+      "placement": "/var/lib/xuwq_step5_assets/expert_placement_prefill_8192_ep16_20261020.pt",
+      "expert_grid": false,
+      "worker_extension": false,
+      "shared_stream_min_tokens": 4096,
+      "synthetic_mtp": true,
+      "mtp_rejection_sampling": "synthetic",
+      "synthetic_acceptance_rates": [
+        0.838992,
+        0.598322,
+        0.362686
+      ],
+      "changed_controls": [
+        "HCU_DP_MOE_PIPE_MIN_TOKENS",
+        "HCU_DBO_MIN_TOKENS",
+        "HCU_EP_DIRECT_SUM"
+      ]
+    },
+    "p5c3": {
+      "pid": 300729,
+      "start_ticks": "119336651",
+      "rank": 2,
+      "phase": "prefill",
+      "log": "/var/lib/xuwq_step5_1021/prefill-uniform-1022-selected/logs/native-prefill-1021-placement-synthetic-node2-20261022-113513.log",
+      "runtime": "/opt/xuwq_step5_native_prefill_uniform_20261022",
+      "state": "/var/lib/xuwq_step5_1021/prefill-uniform-1022-selected",
+      "source_commit": "1997af79d75cd070938faf77b72c3a0fbe344ab5",
+      "uniform_collectives": true,
+      "source_overlay": {
+        "base_commit": "1997af79d75cd070938faf77b72c3a0fbe344ab5",
+        "path": "source/vllm_hcu/model_executor/layers/fused_moe/modular_kernel.py",
+        "base_sha256": "1c53bbfc052660ca2a59bc92f36373b45f2dd122425ec7616e02f73f77ac7fa3",
+        "sha256": "a985165004c3fea1818013098c6a5144332c56d6a2527bfae612f41830da3c5a"
+      },
+      "started": 1792640113.0041976,
+      "tp": 1,
+      "dp": 16,
+      "ep": 16,
+      "local_dp": 4,
+      "batched_tokens": 8192,
+      "max_model_len": 70000,
+      "gpu_memory_utilization": 0.875,
+      "host": "127.0.0.1",
+      "port": 8018,
+      "pipe_min_tokens": 65536,
+      "dbo_min_tokens": 4096,
+      "direct_sum_min_tokens": 65536,
+      "moe_chunk": 65536,
+      "bounded_workspace": true,
+      "placement": "/var/lib/xuwq_step5_assets/expert_placement_prefill_8192_ep16_20261020.pt",
+      "expert_grid": false,
+      "worker_extension": false,
+      "shared_stream_min_tokens": 4096,
+      "synthetic_mtp": true,
+      "mtp_rejection_sampling": "synthetic",
+      "synthetic_acceptance_rates": [
+        0.838992,
+        0.598322,
+        0.362686
+      ],
+      "changed_controls": [
+        "HCU_DP_MOE_PIPE_MIN_TOKENS",
+        "HCU_DBO_MIN_TOKENS",
+        "HCU_EP_DIRECT_SUM"
+      ]
+    },
+    "p5c4": {
+      "pid": 299381,
+      "start_ticks": "24524540",
+      "rank": 3,
+      "phase": "prefill",
+      "log": "/var/lib/xuwq_step5_1021/prefill-uniform-1022-selected/logs/native-prefill-1021-placement-synthetic-node3-20261022-113512.log",
+      "runtime": "/opt/xuwq_step5_native_prefill_uniform_20261022",
+      "state": "/var/lib/xuwq_step5_1021/prefill-uniform-1022-selected",
+      "source_commit": "1997af79d75cd070938faf77b72c3a0fbe344ab5",
+      "uniform_collectives": true,
+      "source_overlay": {
+        "base_commit": "1997af79d75cd070938faf77b72c3a0fbe344ab5",
+        "path": "source/vllm_hcu/model_executor/layers/fused_moe/modular_kernel.py",
+        "base_sha256": "1c53bbfc052660ca2a59bc92f36373b45f2dd122425ec7616e02f73f77ac7fa3",
+        "sha256": "a985165004c3fea1818013098c6a5144332c56d6a2527bfae612f41830da3c5a"
+      },
+      "started": 1792640112.9527593,
+      "tp": 1,
+      "dp": 16,
+      "ep": 16,
+      "local_dp": 4,
+      "batched_tokens": 8192,
+      "max_model_len": 70000,
+      "gpu_memory_utilization": 0.875,
+      "host": "127.0.0.1",
+      "port": 8018,
+      "pipe_min_tokens": 65536,
+      "dbo_min_tokens": 4096,
+      "direct_sum_min_tokens": 65536,
+      "moe_chunk": 65536,
+      "bounded_workspace": true,
+      "placement": "/var/lib/xuwq_step5_assets/expert_placement_prefill_8192_ep16_20261020.pt",
+      "expert_grid": false,
+      "worker_extension": false,
+      "shared_stream_min_tokens": 4096,
+      "synthetic_mtp": true,
+      "mtp_rejection_sampling": "synthetic",
+      "synthetic_acceptance_rates": [
+        0.838992,
+        0.598322,
+        0.362686
+      ],
+      "changed_controls": [
+        "HCU_DP_MOE_PIPE_MIN_TOKENS",
+        "HCU_DBO_MIN_TOKENS",
+        "HCU_EP_DIRECT_SUM"
+      ]
+    }
+  },
+  "retained_capacities": {
+    "0": 789884,
+    "1": 783526,
+    "3": 785732,
+    "2": 785083,
+    "7": 788878,
+    "4": 783883,
+    "6": 784077,
+    "5": 787159,
+    "9": 786672,
+    "10": 783753,
+    "11": 786997,
+    "8": 788132,
+    "13": 785959,
+    "15": 789202,
+    "14": 783299,
+    "12": 783364
+  },
+  "deployment_smoke": {
+    "smoke_only": true,
+    "formal_performance_score": false,
+    "complete": true,
+    "requests": 64,
+    "input_tokens": 8192,
+    "output_tokens": 1,
+    "started": 1792641242.4428968,
+    "finished": 1792641257.510893,
+    "request_success_by_dp": {
+      "0": 4.0,
+      "1": 4.0,
+      "2": 4.0,
+      "3": 4.0,
+      "4": 4.0,
+      "5": 4.0,
+      "6": 4.0,
+      "7": 4.0,
+      "8": 4.0,
+      "9": 4.0,
+      "10": 4.0,
+      "11": 4.0,
+      "12": 4.0,
+      "13": 4.0,
+      "14": 4.0,
+      "15": 4.0
+    },
+    "preemptions": 0
+  },
+  "restored_serving_options_equal_measured_config": true,
+  "retained_queues_empty": true,
+  "reproduction_bundle": "prefill-dp16-uniform-image1021-20261022.zip",
+  "source_check_byte_fidelity_all4": true
+}

@@ -1,0 +1,127 @@
+{
+  "excluded_rounds": [
+    {
+      "round": 3,
+      "reason": "new MoE compilation cache entries during measured interval",
+      "itl_ms": 57.22986077939644
+    }
+  ],
+  "case": "decode-dp4-fabric-synthetic-final",
+  "runtime": "/opt/xuwq_step5_native_decode_fabric2_20261022",
+  "parallel": "DP4TP4EP16",
+  "batch": 64,
+  "per_dp_batch": 16,
+  "input_tokens": 65536,
+  "output_tokens": 4096,
+  "max_model_len": 1048576,
+  "max_num_batched_tokens": 32768,
+  "mtp_tokens": 3,
+  "rejection_sample_method": "synthetic",
+  "synthetic_acceptance_rates": [
+    0.838992,
+    0.598322,
+    0.362686
+  ],
+  "rounds": [
+    {
+      "round": 2,
+      "trial": "native-itl6479-20261022-061029",
+      "itl_ms": 57.16516578447483,
+      "decode_tps": 3148.7114823859606,
+      "acceptance": 0.6019530805147477,
+      "complete_requests": 64,
+      "preemptions": 0.0
+    },
+    {
+      "round": 4,
+      "trial": "native-itl6479-20261022-061029",
+      "itl_ms": 56.88178785686727,
+      "decode_tps": 3150.192595492868,
+      "acceptance": 0.5982873264996527,
+      "complete_requests": 64,
+      "preemptions": 0.0
+    },
+    {
+      "round": 5,
+      "trial": "native-itl6479-20261022-061029",
+      "itl_ms": 57.06741764870032,
+      "decode_tps": 3148.686697722629,
+      "acceptance": 0.5998835343076683,
+      "complete_requests": 64,
+      "preemptions": 0.0
+    }
+  ],
+  "mean_itl_ms": 57.03812376334747,
+  "stdev_itl_ms": 0.14394221497909584,
+  "mean_decode_tps": 3149.196925200486,
+  "all_three_under60": true,
+  "all_four_cache_audits_clean": true,
+  "all16_fabric_dispatch_and_combine": true,
+  "quality_mode": "standard MTP3; accuracy only",
+  "layerwise_graph_pair_checks": 4096,
+  "hardware_profile": "AI(default), auto; unchanged",
+  "services_retained": true,
+  "measured_at": "2026-10-22",
+  "machines": 4,
+  "cards_per_machine": 4,
+  "container": "xuwq_vllm_1021",
+  "image": "10.16.1.152:5000/jenkins/model_test_env/vllm:0.28.1rc1-ubuntu22.04-dtk2610-py3.12-scalex40-20261021-0235",
+  "model": "/data/model/Step5-Channel-FP8-w8a8",
+  "selected": true,
+  "base_source_commit": "04c59a4b0c1b877c582164bdc6bb267640845e8d",
+  "itl_statistic": "Mean streaming ITL, unchanged original benchmark definition",
+  "min_itl_ms": 56.88178785686727,
+  "max_itl_ms": 57.16516578447483,
+  "actual_mtp_acceptance_mean": 0.6000413137740229,
+  "prefix_caching": false,
+  "kv_cache_dtype": "fp8_e4m3",
+  "gpu_memory_utilization": 0.85,
+  "max_num_seqs": 64,
+  "enable_eplb": false,
+  "use_local_argmax_reduction": true,
+  "quality": {
+    "dataset": "gsm8k",
+    "requested": 100,
+    "predictions": 100,
+    "correct": 99,
+    "score_percent": 99.0,
+    "metric": "EvalScope-1.12-compatible numeric accuracy",
+    "request_errors": 0,
+    "finish_reasons": {
+      "stop": 100
+    },
+    "few_shot_num": 0,
+    "repeats": 1,
+    "concurrency": 64,
+    "generation": {
+      "temperature": 1.0,
+      "top_p": 0.95,
+      "top_k": -1,
+      "max_tokens": 32768,
+      "seed": 42,
+      "n": 1,
+      "stream": false
+    },
+    "complete": true
+  },
+  "quality_frozen_sha256": "c10cd5aec4ef1d542a9b4eaf0d4b7ae7a9a4b92d877e231a8a16d40a5525264c",
+  "quality_summary": "E:\\DTK\\step5\\outputs\\p5c1-4-regression-20261020\\decode-fabric-standard-gsm8k100-summary.json",
+  "proxy_unit_tests": 9,
+  "graph_regions": 8736,
+  "hot_graph_context_tokens": 69888,
+  "long_context_fallback": "Native DP-synchronized NONE mode beyond compact graph bound",
+  "actual_1m_end_to_end_tested": false,
+  "source_overlay": "E:\\DTK\\step5\\outputs\\p5c1-4-regression-20261020\\runtime-overlays\\decode-fabric2",
+  "source_overlay_manifest_sha256": "282e0c621e1bc37490a204f5831a72f1ddb76ba15b84bfbe796cc681962ea56a",
+  "runtime_controls": {
+    "HCU_STEP5_DP_FABRIC": 1,
+    "VLLM_HCU_DP_CUSTOM_AG": 0,
+    "VLLM_HCU_DP_PACKED_AG": 1,
+    "HCU_STEP5_EXPERT_GRID": 1,
+    "HCU_STEP5_ROUTER_SHARED_MAX_M": 64,
+    "HCU_STEP5_FUSED_ROUTER_STREAM": 0,
+    "GPU_MAX_HW_QUEUES": 4
+  },
+  "decode_placement": "/var/lib/xuwq_step5_assets/expert_placement_decode_c64_ep16.pt",
+  "decode_placement_sha256": "431089b03db8fa4f6a3b2bc5cd73a0ac44683444303d2fe88ec10e355f53fa04"
+}

@@ -1,0 +1,46 @@
+{
+  "measured_at": "2026-10-21",
+  "case": "prefill-pipe-dbo-directsum-placement-synthetic-ch16",
+  "parallel": "DP16TP1EP16",
+  "only_changed_control": {
+    "NCCL_MIN_NCHANNELS": {
+      "baseline": null,
+      "candidate": 16
+    },
+    "NCCL_MAX_NCHANNELS": {
+      "baseline": 32,
+      "candidate": 16
+    }
+  },
+  "unchanged": {
+    "expert_shape": "E22",
+    "placement_sha256": "876ac0f5963c51d7e9e0a4629e589de70ef2d2e9ba86b9b20437d8d0beb1bb32",
+    "synthetic_acceptance_rates": [
+      0.838992,
+      0.598322,
+      0.362686
+    ],
+    "pipe_min_tokens": 65536,
+    "dbo_min_tokens": 4096,
+    "direct_sum_min_tokens": 65536,
+    "max_num_batched_tokens": 8192,
+    "max_model_len": 70000
+  },
+  "candidate_warmup_tps": [
+    39347.302391564874,
+    39648.497565193094
+  ],
+  "candidate_formal_screen_tps": 39717.696996548424,
+  "baseline_corresponding_warmup_tps": [
+    39260.04252465781,
+    39745.55330216553
+  ],
+  "baseline_corresponding_formal_tps": 39702.46948376882,
+  "same_round_delta_percent": 0.03835406960221999,
+  "complete_requests": 64,
+  "preemptions": 0,
+  "jit_events": 0,
+  "cache_updates": 0,
+  "selected": false,
+  "reason": "The formal same-round gain is only0.038%; warmup comparisons disagree in sign. Keep32 channels."
+}

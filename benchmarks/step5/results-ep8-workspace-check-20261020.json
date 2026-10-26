@@ -1,0 +1,59 @@
+{
+  "date": "2026-10-20",
+  "scope": "Single idle BW1300 GPU operator proof; native serving throughput not measured by this file",
+  "local_experts": 44,
+  "ep": 8,
+  "baseline_runtime_commit": "1e1a30f9e699ed1dd354d38ca6c62b90e7fe216f",
+  "candidate_module_sha256": "bf557936c6c3eaa49cbcfc4c83b3e9343e852663fb564af00bfc219ace8a2b29",
+  "cpu_tests_passed": 77,
+  "gpu_proof_source_sha256": "3431bba416c7764f963d13b94f254c51f47228dc6c0a5e65cfcfe2a912f11c02",
+  "passed": true,
+  "cases": [
+    {
+      "rows": 256,
+      "chunk": 64,
+      "distribution": "all-local",
+      "eager_bitexact": true,
+      "changed_input_graph_replays": 3,
+      "graph_bitexact": true,
+      "old_workspace_bytes": 218103808,
+      "bounded_workspace_bytes": 195035136
+    },
+    {
+      "rows": 65536,
+      "chunk": 32768,
+      "distribution": "global",
+      "eager_bitexact": true,
+      "changed_input_graph_replays": 3,
+      "graph_bitexact": true,
+      "old_workspace_bytes": 8774483968,
+      "bounded_workspace_bytes": 5016387584
+    },
+    {
+      "rows": 65537,
+      "chunk": 32768,
+      "distribution": "all-local",
+      "eager_bitexact": true,
+      "changed_input_graph_replays": 3,
+      "graph_bitexact": true,
+      "old_workspace_bytes": 8774483968,
+      "bounded_workspace_bytes": 5016395776
+    },
+    {
+      "rows": 49152,
+      "chunk": 32768,
+      "distribution": "global",
+      "eager_bitexact": true,
+      "changed_input_graph_replays": 3,
+      "graph_bitexact": true,
+      "old_workspace_bytes": 6627000320,
+      "bounded_workspace_bytes": 4882169856
+    }
+  ],
+  "expert_dispatcher": "vllm.model_executor.layers.fused_moe.experts.triton_deep_gemm_moe.TritonOrDeepGemmExperts",
+  "decode_one_chunk_bitexact": true,
+  "decode_workspace_unchanged": true,
+  "full_model_quality_validated": false,
+  "full_model_performance_validated": false,
+  "memory_metric": "WorkspaceManager scratch/output storage bytes; not total GPU peak allocation"
+}

@@ -1,0 +1,321 @@
+{
+  "recorded_date": "2026-10-19",
+  "hardware": {
+    "platform": "BW1300_LC",
+    "architecture": "gfx938",
+    "nodes": 4,
+    "cards_per_node": 4,
+    "total_cards": 16
+  },
+  "precision": {
+    "weights": "channel FP8 W8A8",
+    "kv": "fp8_e4m3"
+  },
+  "runtime": {
+    "image_tag": "0.28.1rc1-ubuntu22.04-dtk2610-py3.12-20261016-0229",
+    "image_digest": "sha256:b51fcab04e705b5fde57b26a1b27a90baa48edfef55abd4ee77366df67bcf16f",
+    "versions": {
+      "torch": "2.11.0+das.opt1.dtk2610.2609201632.gf74cd7",
+      "vllm": "0.28.1+dtk2610.torch2110.2610151506.g77acaf",
+      "flash-attn": "2.8.4+dtk2610.torch2110.2610152108.g6f61e1",
+      "triton": "3.6.0+dtk2610.torch2110.2610151132.g69b5d8",
+      "lightop": "0.6.0+das.dtk2610.torch2110.2610092003.gcf0ecc",
+      "aiter": "0.1.7+dtk2610.torch2110.2610151745.ga40037"
+    },
+    "model_config_sha256": "e6646ad7bd8c09f37122a7687826f77a2c1000de8297eb87d01bad6df211df61"
+  },
+  "workload": {
+    "batch": 64,
+    "input_tokens": 65536,
+    "prefill_output_tokens": 1,
+    "decode_output_tokens": 4096,
+    "seed": 42,
+    "prefix_cache": false,
+    "mtp_tokens": 3,
+    "rejection_sample_method": "synthetic",
+    "target_acceptance": 0.6,
+    "synthetic_acceptance_rates": [
+      0.838992,
+      0.598322,
+      0.362686
+    ],
+    "benchmark_sha256": "d29320570bf0f70406b249444452ad47607b6038ef80ec7e7e8c0bd37586da9a"
+  },
+  "h200_reference": {
+    "source": "User-supplied two-node16-card reference; not remeasured",
+    "prefill_tps": 69306,
+    "decode_tps": 3483
+  },
+  "recommended": {
+    "prefill_parallel": "DP16 TP1 EP16",
+    "decode_parallel": "DP4 TP4 EP16",
+    "table": "vllm_hcu/model_executor/layers/fused_moe/ep_table.json",
+    "recorded_deployment_table_sha256": "a3a65756f57d8d95fdb4462e31112a3834ce342e6711253642b0775094314844",
+    "table_note": "Deployed table and tracked table are JSON-equivalent; original exported deployment used different line endings"
+  },
+  "candidate": {
+    "table": "benchmarks/step5/ep_table_decode_candidate.json",
+    "table_sha256": "42f81fa4dbca263dcd18b7821d0d743e52f18f97c0c5e725f6c12f1e3642cc6f",
+    "default_enabled": false,
+    "stable_model_speedup_established": false,
+    "changes": [
+      {
+        "path": [
+          "E=22,N=3072,K=4096,topk=8",
+          "256",
+          0,
+          "num_warps"
+        ],
+        "before": 2,
+        "after": 4
+      },
+      {
+        "path": [
+          "E=22,N=3072,K=4096,topk=8",
+          "256",
+          1,
+          "BLOCK_SIZE_N"
+        ],
+        "before": 128,
+        "after": 64
+      },
+      {
+        "path": [
+          "E=22,N=3072,K=4096,topk=8",
+          "256",
+          1,
+          "num_warps"
+        ],
+        "before": 2,
+        "after": 4
+      }
+    ],
+    "micro_baseline_ms": 0.3531998760435188,
+    "micro_candidate_ms": 0.3397431256738996,
+    "screening_decode_tps": 2642.6368727058007
+  },
+  "prefill_recommended": {
+    "measured_rounds": 3,
+    "mean_tps": 29085.030850366908,
+    "sample_stdev_tps": 10.353838065899533,
+    "rounds": [
+      {
+        "round": 3,
+        "tps": 29094.330155127005,
+        "preemptions": 0
+      },
+      {
+        "round": 4,
+        "tps": 29086.888437104106,
+        "preemptions": 0
+      },
+      {
+        "round": 5,
+        "tps": 29073.873958869615,
+        "preemptions": 0
+      }
+    ],
+    "reused_from_previous_test": true,
+    "cold_round_exclusion": "Full warmup1 and round2 containing two MoE compilations excluded; final rounds3,4,5"
+  },
+  "decode_recommended_reference": {
+    "measured_rounds": 1,
+    "tps": 2608.5586020480455,
+    "acceptance": 0.5982873264996527,
+    "itl_avg_ms": 68.63985588613158
+  },
+  "decode_candidate": {
+    "measured_rounds": 3,
+    "mean_tps": 2618.1847354389292,
+    "sample_stdev_tps": 13.03531568866807,
+    "mean_change_percent": 0.369021166836192,
+    "actual_acceptance": 0.5992467898676205,
+    "itl_avg_ms": 68.45645992692542,
+    "equivalent_tpot_ms": 24.444417207737875,
+    "rounds": [
+      {
+        "round": 2,
+        "decode_tps": 2630.6589711812303,
+        "window_seconds": 96.59822986705694,
+        "window_tokens": 254117,
+        "window_coverage": 0.9696605461178015,
+        "mtp_drafted": 280992.0,
+        "mtp_accepted": 169144.0,
+        "mtp_acceptance": 0.6019530805147477,
+        "itl_avg_ms": 68.30924383243722,
+        "itl_samples": 90436,
+        "preemptions": 0,
+        "completed_requests": 64
+      },
+      {
+        "round": 3,
+        "decode_tps": 2619.242447044014,
+        "window_seconds": 95.87924946902785,
+        "window_tokens": 251131,
+        "window_coverage": 0.958266556771525,
+        "mtp_drafted": 282324.0,
+        "mtp_accepted": 168692.0,
+        "mtp_acceptance": 0.5975120783213612,
+        "itl_avg_ms": 68.33693096881821,
+        "itl_samples": 89729,
+        "preemptions": 0,
+        "completed_requests": 64
+      },
+      {
+        "round": 4,
+        "decode_tps": 2604.652788091543,
+        "window_seconds": 97.09240370010957,
+        "window_tokens": 252892,
+        "window_coverage": 0.9649751403245685,
+        "mtp_drafted": 282132.0,
+        "mtp_accepted": 168796.0,
+        "mtp_acceptance": 0.5982873264996527,
+        "itl_avg_ms": 68.72249705220499,
+        "itl_samples": 90359,
+        "preemptions": 0,
+        "completed_requests": 64
+      }
+    ]
+  },
+  "definitions": {
+    "itl": "Client-observed interval between consecutive streaming chunks in the common Decode window; a chunk may contain multiple MTP tokens",
+    "acceptance": "Whole-case accepted/drafted service counter delta, including short in-script warmup; pooled across rounds by drafted-token count",
+    "equivalent_tpot": "Derived batch / decode tps *1000; not measured per-token ITL",
+    "prefill_decode_layouts": "P and D measured independently using different parallel layouts"
+  },
+  "validation": {
+    "real_model_completed_requests": 64,
+    "fa_verified_ranks": [
+      0,
+      1,
+      2,
+      3,
+      4,
+      5,
+      6,
+      7,
+      8,
+      9,
+      10,
+      11,
+      12,
+      13,
+      14,
+      15
+    ],
+    "measured_window_compilation_events": 0,
+    "measured_window_cache_updates": 0,
+    "numeric_cases": [
+      {
+        "m": 1,
+        "relative_l2": 0.0,
+        "max_abs": 0.0,
+        "valid": true
+      },
+      {
+        "m": 16,
+        "relative_l2": 0.0,
+        "max_abs": 0.0,
+        "valid": true
+      },
+      {
+        "m": 64,
+        "relative_l2": 0.0,
+        "max_abs": 0.0,
+        "valid": true,
+        "graph_replay_relative_l2": 0.0,
+        "graph_output_zeroed_before_replay": true
+      },
+      {
+        "m": 128,
+        "relative_l2": 0.0,
+        "max_abs": 0.0,
+        "valid": true
+      },
+      {
+        "m": 192,
+        "relative_l2": 0.0,
+        "max_abs": 0.0,
+        "valid": true
+      },
+      {
+        "m": 193,
+        "relative_l2": 0.0,
+        "max_abs": 0.0,
+        "valid": true,
+        "graph_replay_relative_l2": 0.0,
+        "graph_output_zeroed_before_replay": true
+      },
+      {
+        "m": 255,
+        "relative_l2": 4.6069772787318663e-07,
+        "max_abs": 1.52587890625e-05,
+        "valid": true
+      },
+      {
+        "m": 256,
+        "relative_l2": 3.5685470493412964e-06,
+        "max_abs": 0.0001220703125,
+        "valid": true,
+        "graph_replay_relative_l2": 3.5685470493412964e-06,
+        "graph_output_zeroed_before_replay": true
+      },
+      {
+        "m": 257,
+        "relative_l2": 0.0,
+        "max_abs": 0.0,
+        "valid": true
+      },
+      {
+        "m": 384,
+        "relative_l2": 0.0,
+        "max_abs": 0.0,
+        "valid": true,
+        "graph_replay_relative_l2": 0.0,
+        "graph_output_zeroed_before_replay": true
+      },
+      {
+        "m": 385,
+        "relative_l2": 0.0,
+        "max_abs": 0.0,
+        "valid": true
+      },
+      {
+        "m": 1024,
+        "relative_l2": 5.522284389340204e-07,
+        "max_abs": 3.0517578125e-05,
+        "valid": true
+      },
+      {
+        "m": 6144,
+        "relative_l2": 0.0,
+        "max_abs": 0.0,
+        "valid": true
+      },
+      {
+        "m": 8192,
+        "relative_l2": 0.0,
+        "max_abs": 0.0,
+        "valid": true
+      },
+      {
+        "m": 32768,
+        "relative_l2": 0.0,
+        "max_abs": 0.0,
+        "valid": true
+      }
+    ],
+    "full_model_quality_test": false
+  },
+  "rejected": {
+    "dp8_tp2_ep16": {
+      "tps": 2354.043605728881,
+      "change_percent": -9.756920780669375
+    },
+    "static_expert_placement": {
+      "tps": 2617.0067071143458,
+      "method": "Gaussian routing proxy, not production-traffic calibration",
+      "enabled_in_recommended_config": false
+    }
+  }
+}

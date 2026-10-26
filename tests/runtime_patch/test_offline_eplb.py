@@ -931,11 +931,14 @@ def test_static_add_restores_requested_communicator_when_factory_fails(
     assert fixture.state.model_states == {}
 
 
+@pytest.mark.parametrize("policy", ["nearest", "locality_fair", "token_hash"])
 def test_static_step_and_rearrange_are_strict_noops(
     tmp_path,
     monkeypatch: pytest.MonkeyPatch,
+    policy,
 ) -> None:
     fixture = _setup_state(tmp_path, monkeypatch, mode="static")
+    fixture.state.parallel_config._vllm_hcu_eplb_static_dispatch_policy = policy
     fixture.state.add_model(fixture.model, fixture.model_config)
     before = (
         fixture.state.expert_rearrangement_step,
@@ -950,6 +953,55 @@ def test_static_step_and_rearrange_are_strict_noops(
         fixture.state.expert_load_window_step,
     )
     assert fixture.transfer_calls == []
+
+
+def test_static_token_hash_preserves_all_candidates_and_selects_one_copy(
+    tmp_path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    from vllm.model_executor.layers.fused_moe.config import RoutingMethodType
+    from vllm.model_executor.layers.fused_moe.router import base_router
+    from vllm_hcu.patch.worker.op_opt.moe import patch_base_router
+    from vllm_hcu.platforms import envs as henvs
+
+    patch_base_router.apply()
+    fixture = _setup_state(tmp_path, monkeypatch, mode="static")
+    fixture.state.parallel_config._vllm_hcu_eplb_static_dispatch_policy = "token_hash"
+    fixture.group.rank_in_group = 1
+    fixture.group.device_group = SimpleNamespace(rank=lambda: 1, size=lambda: 2)
+    fixture.state.add_model(fixture.model, fixture.model_config)
+    live = fixture.state.model_states["static-model"]
+    layer_state = fixture.model.moe_layers[0].eplb_state
+    assert live.logical_to_physical_map[0, 1, :2].tolist() == [1, 3]
+    assert live.logical_replica_count[0].tolist() == [1, 2, 1]
+    assert not hasattr(layer_state, "_vllm_hcu_static_primary_replica_count")
+    assert not fixture.state.should_record_tensor.item()
+    monkeypatch.setattr(henvs, "VLLM_HCU_USE_TORCH_EPLB_MAP_RECORD", True)
+    monkeypatch.setattr(base_router, "dbo_current_ubatch_id", lambda: 0)
+
+    class HashRouter(base_router.BaseRouter):
+        @property
+        def routing_method_type(self):
+            return RoutingMethodType.Unspecified
+
+        def _compute_routing(self, *args, **kwargs):
+            raise AssertionError("Only the real map/record bridge is under test")
+
+    router = HashRouter(top_k=2, global_num_experts=3, eplb_state=layer_state)
+    logical = torch.tensor([[1, -1], [0, 1], [1, 2], [2, 1]])
+    physical = router._apply_eplb_mapping(logical)
+    assert physical.shape == logical.shape
+    assert physical.tolist() == [[1, -1], [0, 3], [1, 2], [2, 3]]
+    valid = logical >= 0
+    assert torch.equal(live.physical_to_logical_map[0][physical[valid]], logical[valid])
+    assert live.expert_load_pass.count_nonzero().item() == 0
+    assert fixture.transfer_calls == []
+
+    # Two copies do not imply uniform real traffic: Knuth modulo2 is parity.
+    correlated = torch.tensor([[1] if token % 2 == 0 else [0] for token in range(16)])
+    selected = router._apply_eplb_mapping(correlated)
+    assert (selected == 1).sum().item() == 8
+    assert (selected == 3).sum().item() == 0
 
 
 def test_static_state_rejects_models_bound_to_mixed_source_sha(

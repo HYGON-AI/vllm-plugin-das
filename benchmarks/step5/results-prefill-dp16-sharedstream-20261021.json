@@ -1,0 +1,71 @@
+{
+  "measured_at": "2026-10-21",
+  "case": "prefill-sharedstream-off",
+  "source_commit": "1997af79d75cd070938faf77b72c3a0fbe344ab5",
+  "parallel": "DP16TP1EP16",
+  "concurrency": 64,
+  "input_tokens": 65536,
+  "output_tokens": 1,
+  "max_num_batched_tokens": 8192,
+  "max_model_len": 70000,
+  "original_expert_placement": true,
+  "only_changed_control": {
+    "HCU_SHARED_EXPERTS_STREAM_MIN_TOKENS": {
+      "baseline": 4096,
+      "candidate": 0
+    }
+  },
+  "warmup_rounds": 2,
+  "formal_rounds": [
+    3,
+    4,
+    5
+  ],
+  "rounds": [
+    {
+      "round": 3,
+      "prefill_tps": 28309.375662136343,
+      "preemptions": 0,
+      "complete_requests": 64,
+      "jit_events": 0,
+      "cache_updates": 0,
+      "iteration_start": 1792565346.866959,
+      "iteration_end": 1792565495.5469067,
+      "queue_samples_in_measurement": 4,
+      "max_observed_running": 16.0,
+      "max_observed_waiting": 48.0
+    },
+    {
+      "round": 4,
+      "prefill_tps": 28288.590720525954,
+      "preemptions": 0,
+      "complete_requests": 64,
+      "jit_events": 0,
+      "cache_updates": 0,
+      "iteration_start": 1792565547.0344162,
+      "iteration_end": 1792565695.8238373,
+      "queue_samples_in_measurement": 4,
+      "max_observed_running": 16.0,
+      "max_observed_waiting": 48.0
+    },
+    {
+      "round": 5,
+      "prefill_tps": 28295.119112306613,
+      "preemptions": 0,
+      "complete_requests": 64,
+      "jit_events": 0,
+      "cache_updates": 0,
+      "iteration_start": 1792565745.8602042,
+      "iteration_end": 1792565894.5706048,
+      "queue_samples_in_measurement": 4,
+      "max_observed_running": 16.0,
+      "max_observed_waiting": 48.0
+    }
+  ],
+  "mean_tps": 28297.695164989636,
+  "sample_stdev_tps": 10.629227865000615,
+  "selected_baseline_mean_tps": 28327.12579559729,
+  "delta_percent": -0.10389557634621349,
+  "selected": false,
+  "reason": "Three clean formal rounds show no gain; retain the 4096-token late stream overlap."
+}

@@ -34,6 +34,7 @@ from vllm_hcu.patch.worker.framework_opt import (
     patch_forward_context,
     patch_gpu_ubatch_wrapper,
     patch_llm_base_proposer,
+    patch_mtp_prefill_tail,
     patch_pynccl,
     patch_pynccl_wrapper,
     patch_ubatch_utils,
@@ -323,6 +324,18 @@ def test_agrs_int8_quantizes_zero_token_rank_without_lightop() -> None:
     assert quantized.dtype is torch.int8
     assert scales.shape == (0, 1)
     assert scales.dtype is torch.float32
+
+
+def test_mtp_prefill_tail_adapter_contract() -> None:
+    assert patch_mtp_prefill_tail.PATCH_ID == (
+        "worker.framework_opt.spec_decode.mtp_prefill_tail"
+    )
+    assert patch_mtp_prefill_tail.TARGET_MODULE.endswith(
+        "multi_module_mtp.speculator"
+    )
+    assert patch_mtp_prefill_tail.TARGETS == (
+        f"{patch_mtp_prefill_tail.TARGET_MODULE}.MultiModuleMTPSpeculator.propose",
+    )
 
 
 def test_gloo_eplb_communicator_preserves_profile_buffer_reservation() -> None:

@@ -1,0 +1,126 @@
+{
+  "baseline": {
+    "case": "prefill-b8192-p0-c32768-selected",
+    "trial": "native-prefill-20261020-170008",
+    "source_commit": "04c59a4b0c1b877c582164bdc6bb267640845e8d",
+    "tp": 1,
+    "dp": 16,
+    "ep": 16,
+    "concurrency": 64,
+    "input_tokens": 65536,
+    "output_tokens": 1,
+    "batched_tokens": 8192,
+    "warmup_rounds": 2,
+    "formal_rounds": [
+      4,
+      5,
+      6
+    ],
+    "rounds": [
+      {
+        "round": 4,
+        "prefill_tps": 27809.636666659622,
+        "preemptions": 0,
+        "complete_requests": 64,
+        "jit_events": 0,
+        "cache_updates": 0,
+        "iteration_start": 1792487389.8761387,
+        "iteration_end": 1792487541.2550936
+      },
+      {
+        "round": 5,
+        "prefill_tps": 27821.724644291833,
+        "preemptions": 0,
+        "complete_requests": 64,
+        "jit_events": 0,
+        "cache_updates": 0,
+        "iteration_start": 1792487585.1402493,
+        "iteration_end": 1792487736.3581166
+      },
+      {
+        "round": 6,
+        "prefill_tps": 27840.458453228533,
+        "preemptions": 0,
+        "complete_requests": 64,
+        "jit_events": 0,
+        "cache_updates": 0,
+        "iteration_start": 1792487780.006387,
+        "iteration_end": 1792487931.1199348
+      }
+    ],
+    "mean_tps": 27823.93992139333,
+    "sample_stdev_tps": 15.52984936508367,
+    "strict_fa_dsa": true,
+    "worker_extension": false,
+    "placement": null,
+    "bounded_workspace": true,
+    "moe_chunk": 32768,
+    "pipe_min_tokens": 0,
+    "max_model_len": 70000
+  },
+  "candidate": {
+    "case": "prefill-b8192-p0-c65536-selected",
+    "trial": "native-prefill-20261020-191255",
+    "source_commit": "04c59a4b0c1b877c582164bdc6bb267640845e8d",
+    "tp": 1,
+    "dp": 16,
+    "ep": 16,
+    "concurrency": 64,
+    "input_tokens": 65536,
+    "output_tokens": 1,
+    "batched_tokens": 8192,
+    "warmup_rounds": 2,
+    "formal_rounds": [
+      3,
+      4,
+      5
+    ],
+    "rounds": [
+      {
+        "round": 3,
+        "prefill_tps": 28312.943639022596,
+        "preemptions": 0,
+        "complete_requests": 64,
+        "jit_events": 0,
+        "cache_updates": 0,
+        "iteration_start": 1792495158.946848,
+        "iteration_end": 1792495307.5733793
+      },
+      {
+        "round": 4,
+        "prefill_tps": 28292.5467127687,
+        "preemptions": 0,
+        "complete_requests": 64,
+        "jit_events": 0,
+        "cache_updates": 0,
+        "iteration_start": 1792495355.8025472,
+        "iteration_end": 1792495504.535573
+      },
+      {
+        "round": 5,
+        "prefill_tps": 28288.577684753454,
+        "preemptions": 0,
+        "complete_requests": 64,
+        "jit_events": 0,
+        "cache_updates": 0,
+        "iteration_start": 1792495550.8668408,
+        "iteration_end": 1792495699.643135
+      }
+    ],
+    "mean_tps": 28298.02267884825,
+    "sample_stdev_tps": 13.073430507704021,
+    "strict_fa_dsa": true,
+    "worker_extension": false,
+    "placement": null,
+    "bounded_workspace": true,
+    "moe_chunk": 65536,
+    "pipe_min_tokens": 0,
+    "max_model_len": 70000
+  },
+  "relative_change_percent": 1.7038663783571772,
+  "selected_chunk": 65536,
+  "next_case": "prefill-b4096-p0-c65536-selected",
+  "decode_dp16_deferred": true,
+  "measured_at": "2026-10-20",
+  "interpretation": "Three clean consecutive formal rounds per configuration after two excluded full warmups. Chunk65536 selected over32768 at batch8192. Broader workload generalization is not established."
+}

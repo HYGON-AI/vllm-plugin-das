@@ -1,0 +1,131 @@
+{
+  "measured_at": "2026-10-21",
+  "case": "prefill-dp16-gsm8k-synthetic-mtp-root-cause",
+  "parallel": "DP16TP1EP16",
+  "checkpoint": "/data/model/Step5-Channel-FP8-w8a8",
+  "source_commit": "1997af79d75cd070938faf77b72c3a0fbe344ab5",
+  "unchanged_prefill_controls": {
+    "HCU_DP_MOE_PIPE_MIN_TOKENS": 65536,
+    "HCU_DBO_MIN_TOKENS": 4096,
+    "HCU_EP_DIRECT_SUM": 65536
+  },
+  "protocol": {
+    "dataset": "GSM8K held-out frozen prompts",
+    "few_shot_num": 0,
+    "temperature": 1.0,
+    "top_p": 0.95,
+    "top_k": -1,
+    "seed": 42,
+    "max_tokens": 32768,
+    "scoring": "EvalScope 1.12-compatible answer extraction and numeric comparison; verified to reproduce historical 1265/1319 exactly"
+  },
+  "synthetic_mtp": {
+    "speculative_config": {
+      "method": "mtp",
+      "num_speculative_tokens": 3,
+      "rejection_sample_method": "synthetic",
+      "synthetic_acceptance_rates": [
+        0.838992,
+        0.598322,
+        0.362686
+      ],
+      "use_local_argmax_reduction": true
+    },
+    "smoke": {
+      "dataset": "gsm8k",
+      "requested": 4,
+      "predictions": 4,
+      "correct": 0,
+      "score_percent": 0.0,
+      "metric": "EvalScope-1.12-compatible numeric accuracy",
+      "request_errors": 0,
+      "finish_reasons": {
+        "stop": 4
+      },
+      "max_observed_output_tokens": 630,
+      "output_token_limit": 32768,
+      "few_shot_num": 0,
+      "repeats": 1,
+      "complete": true,
+      "concurrency": 4,
+      "generation": {
+        "temperature": 1.0,
+        "top_p": 0.95,
+        "top_k": -1,
+        "max_tokens": 32768,
+        "seed": 42,
+        "n": 1,
+        "stream": false
+      },
+      "elapsed_s": 27.875985383987427,
+      "historical_same_checkpoint_score_percent": 95.90598938589841,
+      "historical_same_checkpoint_correct": 1265,
+      "notes": "Frozen 1319 zero-shot prompts. Scoring reproduces EvalScope 1.12 GSM8K extract_answer and numeric comparison for numeric targets; concurrency differs from historical batch size 4."
+    },
+    "aborted_full_observation": {
+      "completed_outputs": 180,
+      "correct": 73,
+      "errors": 0,
+      "score_percent": 40.55555555555556
+    },
+    "raw_output_symptoms": [
+      "broken or nested boxed expressions",
+      "missing arithmetic operands",
+      "repeated final-answer paragraphs",
+      "wrong accepted continuation tokens"
+    ]
+  },
+  "standard_mtp": {
+    "speculative_config": {
+      "method": "mtp",
+      "num_speculative_tokens": 3,
+      "rejection_sample_method": "standard",
+      "use_local_argmax_reduction": true
+    },
+    "same_four_prompt_smoke": {
+      "dataset": "gsm8k",
+      "requested": 4,
+      "predictions": 4,
+      "correct": 4,
+      "score_percent": 100.0,
+      "metric": "EvalScope-1.12-compatible numeric accuracy",
+      "request_errors": 0,
+      "finish_reasons": {
+        "stop": 4
+      },
+      "max_observed_output_tokens": 1681,
+      "output_token_limit": 32768,
+      "few_shot_num": 0,
+      "repeats": 1,
+      "complete": true,
+      "concurrency": 4,
+      "generation": {
+        "temperature": 1.0,
+        "top_p": 0.95,
+        "top_k": -1,
+        "max_tokens": 32768,
+        "seed": 42,
+        "n": 1,
+        "stream": false
+      },
+      "elapsed_s": 45.26571702957153,
+      "historical_same_checkpoint_score_percent": 95.90598938589841,
+      "historical_same_checkpoint_correct": 1265,
+      "notes": "Frozen 1319 zero-shot prompts. Scoring reproduces EvalScope 1.12 GSM8K extract_answer and numeric comparison for numeric targets; concurrency differs from historical batch size 4."
+    },
+    "historical_full_same_checkpoint": {
+      "correct": 1265,
+      "total": 1319,
+      "score_percent": 95.90598938589841
+    }
+  },
+  "causal_conclusion": "Synthetic acceptance is the accuracy failure. It accepts draft tokens according to configured synthetic rates and is only valid for performance simulation. With all three Prefill controls unchanged, standard MTP changes the same four GSM8K prompts from 0/4 to 4/4.",
+  "switch_attribution": "The GSM8K prompts do not reach pipe/directsum 65536-token thresholds or the per-rank DBO 4096-token threshold, so this run does not implicate those controls.",
+  "current_live_service": {
+    "state": "/var/lib/xuwq_step5_native_itl60_20261019/prefill-pipe-dbo-directsum-realmtp",
+    "synthetic_mtp": false,
+    "rejection_sample_method": "standard",
+    "three_prefill_controls_enabled": true
+  },
+  "decision": "Keep pipe+DBO+directsum. Do not use synthetic rejection sampling for accuracy or production output; reserve it for fixed-length performance benchmarking."
+}

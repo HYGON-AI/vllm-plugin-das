@@ -1,0 +1,145 @@
+{
+  "schema_version": 1,
+  "stage": "prefill",
+  "platform": "4hosts x4 gfx938",
+  "parallelism": {
+    "DP": 16,
+    "TP": 1,
+    "EP": 16,
+    "local_experts": 23
+  },
+  "full_gsm8k": {
+    "correct": 1277,
+    "requested": 1319,
+    "score_percent": 96.81576952236543,
+    "request_errors": 0,
+    "finish_reasons": {
+      "stop": 1319
+    },
+    "strict_numeric_grading": true,
+    "standard_MTP3": true,
+    "source_scope": "Frozen measured implementation before removal of inactive code"
+  },
+  "performance": {
+    "prefill_tps": 45621.70011992929,
+    "single_formal_round": true,
+    "complete_requests": 64,
+    "incomplete_requests": 0,
+    "preemptions": 0,
+    "input_tokens": 65536,
+    "output_tokens": 1,
+    "max_num_batched_tokens": 8192,
+    "max_model_len": 70000,
+    "synthetic_acceptance_rates": [
+      0.838992,
+      0.598322,
+      0.362686
+    ],
+    "num_sms": 18,
+    "dispatch_send": 8,
+    "combine_send": 32,
+    "recv_tokens": 512
+  },
+  "CPU_tests": {
+    "passed": 151,
+    "subtests": 8
+  },
+  "post_cleanup_GPU_smoke": {
+    "passed": true,
+    "ranks": 16,
+    "checks": 208,
+    "max_reference_relative_l2": 0.011703116819262505,
+    "buffer_pair_overlap_verified": true,
+    "private_DBO_output_canaries_passed": true,
+    "planner_upper_bound_preserved": true
+  },
+  "post_cleanup_stability_and_trace": {
+    "stability": {
+      "formal_tps": [
+        45578.43164754803,
+        45598.6482779862,
+        45549.04829915651
+      ],
+      "mean_tps": 45575.376074896914,
+      "median_tps": 45578.43164754803,
+      "min_tps": 45549.04829915651,
+      "max_tps": 45598.6482779862,
+      "all64_complete": true,
+      "preemptions": 0,
+      "unprofiled": true,
+      "source_version": 16
+    },
+    "trace": {
+      "ranks": 16,
+      "active_steps_per_rank": 6,
+      "aligned_global_steps": 5,
+      "max_clock_halfwidth_us": 57.495,
+      "G2_latest_finish_counts": {
+        "5": 66,
+        "1": 38,
+        "0": 58,
+        "2": 298,
+        "6": 25,
+        "4": 201,
+        "3": 130,
+        "13": 2,
+        "11": 52,
+        "7": 5,
+        "12": 1,
+        "8": 4
+      },
+      "qualification": "Ordered-wave alignment; upstream attention can delay G2 finish. Profile timing is not TPS."
+    }
+  },
+  "followup_communication_trials": [
+    {
+      "label": "e23-sm12-d8c32-v2",
+      "num_sms": 12,
+      "dispatch_send": 8,
+      "combine_send": 32,
+      "prefill_tps": 44959.096755347935
+    },
+    {
+      "label": "e23-sm18-d16c8-v4",
+      "num_sms": 18,
+      "dispatch_send": 16,
+      "combine_send": 8,
+      "prefill_tps": 45854.606394779206
+    },
+    {
+      "label": "e23-sm18-d8c8-v3",
+      "num_sms": 18,
+      "dispatch_send": 8,
+      "combine_send": 8,
+      "prefill_tps": 47967.0286632504
+    },
+    {
+      "label": "e23-sm18-d8c8-repeat1-v5",
+      "num_sms": 18,
+      "dispatch_send": 8,
+      "combine_send": 8,
+      "prefill_tps": 45796.63639369018
+    },
+    {
+      "label": "e23-sm18-d8c8-repeat2-v6",
+      "num_sms": 18,
+      "dispatch_send": 8,
+      "combine_send": 8,
+      "prefill_tps": 45795.155155996414
+    }
+  ],
+  "D8C8_stability": {
+    "formal_tps": [
+      45796.63639369018,
+      45795.155155996414,
+      47967.0286632504
+    ],
+    "mean_tps": 46519.60673764566,
+    "min_tps": 45795.155155996414,
+    "max_tps": 47967.0286632504,
+    "stable_47967_not_proven": true,
+    "target48000_reached": false,
+    "source_version": 16
+  },
+  "target48000_reached": false
+}

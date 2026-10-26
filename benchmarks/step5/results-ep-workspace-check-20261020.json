@@ -1,0 +1,66 @@
+{
+  "source_commit": "48945c1cd21b6f1133901e3b06332e6491569dd6",
+  "cpu_meta_cases_passed": 55,
+  "linux_launch_cases_passed": 5,
+  "gpu_cases": [
+    {
+      "rows": 256,
+      "chunk": 64,
+      "distribution": "all-local",
+      "eager_bitexact": true,
+      "changed_input_graph_replays": 3,
+      "graph_bitexact": true,
+      "old_workspace_bytes": 125829120,
+      "bounded_workspace_bytes": 102760448
+    },
+    {
+      "rows": 131072,
+      "chunk": 32768,
+      "distribution": "global",
+      "eager_bitexact": true,
+      "changed_input_graph_replays": 3,
+      "graph_bitexact": true,
+      "old_workspace_bytes": 17272143872,
+      "bounded_workspace_bytes": 5460983808
+    },
+    {
+      "rows": 131073,
+      "chunk": 32768,
+      "distribution": "all-local",
+      "eager_bitexact": true,
+      "changed_input_graph_replays": 3,
+      "graph_bitexact": true,
+      "old_workspace_bytes": 17272143872,
+      "bounded_workspace_bytes": 5460992000
+    },
+    {
+      "rows": 262144,
+      "chunk": 32768,
+      "distribution": "global",
+      "eager_bitexact": true,
+      "changed_input_graph_replays": 3,
+      "graph_bitexact": true,
+      "old_workspace_bytes": 34452013056,
+      "bounded_workspace_bytes": 6534725632
+    },
+    {
+      "rows": 262145,
+      "chunk": 32768,
+      "distribution": "all-local",
+      "eager_bitexact": true,
+      "changed_input_graph_replays": 3,
+      "graph_bitexact": true,
+      "old_workspace_bytes": 34452013056,
+      "bounded_workspace_bytes": 6534733824
+    }
+  ],
+  "changed_input_graph_replays": 15,
+  "decode_one_chunk_bitexact": true,
+  "decode_workspace_unchanged": true,
+  "topk_input_contract": "eight distinct experts per token, as emitted by actual topk routing",
+  "rejected_fixture": "First script used randint routes with duplicate expert IDs. Its failed large-case run is excluded; corrected real-topk inputs pass with the same immutable production source.",
+  "full_model_quality_validated": false,
+  "full_model_performance_validated": false,
+  "worker_extension": false,
+  "pt_in_source": false
+}

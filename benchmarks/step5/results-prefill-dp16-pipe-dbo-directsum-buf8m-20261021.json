@@ -1,0 +1,35 @@
+{
+  "measured_at": "2026-10-21",
+  "case": "prefill-pipe-dbo-directsum-realmtp-buf8m",
+  "parallel": "DP16TP1EP16",
+  "only_changed_control": {
+    "NCCL_BUFFSIZE": {
+      "baseline": null,
+      "candidate": 8388608
+    }
+  },
+  "unchanged": {
+    "standard_mtp": true,
+    "pipe_min_tokens": 65536,
+    "dbo_min_tokens": 4096,
+    "direct_sum_min_tokens": 65536,
+    "max_num_batched_tokens": 8192,
+    "max_model_len": 70000,
+    "moe_chunk": 65536
+  },
+  "warmup_tps": [
+    34334.843988411034,
+    34653.926299449005
+  ],
+  "formal_screen_tps": 34685.59467896846,
+  "selected_baseline_three_round_mean_tps": 34662.204371379456,
+  "selected_baseline_sample_stdev_tps": 20.503460993903527,
+  "delta_percent_vs_mean": 0.06748072724513943,
+  "same_round_delta_percent": 0.016687643512680594,
+  "complete_requests": 64,
+  "preemptions": 0,
+  "jit_events": 0,
+  "cache_updates": 0,
+  "selected": false,
+  "reason": "The single formal screen is only 0.067% above the three-round baseline mean and 0.017% above the corresponding baseline round, well inside measured run-to-run variation."
+}

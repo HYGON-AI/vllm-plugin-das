@@ -1,0 +1,247 @@
+{
+  "date": "2026-10-23",
+  "source_snapshot_commit": "1ea46e1c094d870db6e118d42de1720d80214a59",
+  "decode_overlay_base_commit": "04c59a4b0c1b877c582164bdc6bb267640845e8d",
+  "platform": {
+    "architecture": "gfx938",
+    "nodes": 4,
+    "gpus_per_node": 4,
+    "image_tag": "0.28.1rc1-ubuntu22.04-dtk2610-py3.12-scalex40-20261021-0235"
+  },
+  "performance_sampling": {
+    "method": "mtp",
+    "num_speculative_tokens": 3,
+    "rejection_sample_method": "synthetic",
+    "synthetic_acceptance_rates": [
+      0.838992,
+      0.598322,
+      0.362686
+    ]
+  },
+  "prefill_protocol": {
+    "parallel": "DP16/TP1/EP16",
+    "concurrency": 64,
+    "input_tokens": 65536,
+    "output_tokens": 1,
+    "max_num_batched_tokens": 8192,
+    "max_model_len": 70000,
+    "prefix_caching": false,
+    "kv_cache_dtype": "fp8_e4m3",
+    "eplb": false
+  },
+  "prefill_dense_baseline": {
+    "mean_tps": 41580.14185103587,
+    "sample_stdev_tps": 61.055270773445024,
+    "formal_rounds": [
+      {
+        "round": 3,
+        "prefill_tps": 41512.93111340358,
+        "complete_requests": 64,
+        "preemptions": 0,
+        "jit_events": 0,
+        "cache_updates": 0
+      },
+      {
+        "round": 4,
+        "prefill_tps": 41595.31399850004,
+        "complete_requests": 64,
+        "preemptions": 0,
+        "jit_events": 0,
+        "cache_updates": 0
+      },
+      {
+        "round": 5,
+        "prefill_tps": 41632.180441204,
+        "complete_requests": 64,
+        "preemptions": 0,
+        "jit_events": 0,
+        "cache_updates": 0
+      }
+    ],
+    "source_delivery_commit": "eb4ce8dec6efd9a12b7f13d2e9c6beab94341e93",
+    "evidence_file": "prefill-45k-dp16-dense-fixed-summary.json",
+    "status": "previously selected baseline",
+    "g1": false,
+    "g2": false,
+    "quality": {
+      "mode": "standard MTP3; separate from performance",
+      "gsm8k100_correct": 98,
+      "long24k16_correct": 15,
+      "request_errors": 0
+    }
+  },
+  "prefill_g1_candidate": {
+    "mean_tps": 42045.838936641,
+    "sample_stdev_tps": 28.969482118173175,
+    "formal_rounds": [
+      {
+        "round": 3,
+        "prefill_tps": 42025.92410795588,
+        "complete_requests": 64,
+        "preemptions": 0,
+        "jit_events": 0,
+        "cache_updates": 0
+      },
+      {
+        "round": 4,
+        "prefill_tps": 42032.52017017513,
+        "complete_requests": 64,
+        "preemptions": 0,
+        "jit_events": 0,
+        "cache_updates": 0
+      },
+      {
+        "round": 5,
+        "prefill_tps": 42079.07253179199,
+        "complete_requests": 64,
+        "preemptions": 0,
+        "jit_events": 0,
+        "cache_updates": 0
+      }
+    ],
+    "source_delivery_commit": "b288866ece41cbe07cd8ca1f87046a62fca940b5",
+    "evidence_file": "prefill-45k-dp16-g1-specialized-summary.json",
+    "status": "opt-in candidate; not promoted",
+    "g1": true,
+    "g2": false,
+    "same_source_control_tps": 41542.6628947464,
+    "change_vs_control_percent": 1.211227222408584,
+    "quality": {
+      "mode": "standard MTP3",
+      "gsm8k100_correct_runs": [
+        96,
+        96
+      ],
+      "fresh_control_gsm8k100_correct_runs": [
+        98,
+        98
+      ],
+      "long24k16_correct": 15,
+      "long64k16_correct": 15,
+      "request_errors": 0,
+      "limits": "Short GSM prompts do not exercise the M65536 fast path. These stochastic samples do not establish a causal quality regression or equivalence."
+    }
+  },
+  "prefill_g2_candidate": {
+    "mean_tps": 42224.925919550384,
+    "sample_stdev_tps": 8.248002319483517,
+    "formal_rounds": [
+      {
+        "round": 3,
+        "prefill_tps": 42233.4044453295,
+        "complete_requests": 64,
+        "preemptions": 0,
+        "jit_events": 0,
+        "cache_updates": 0
+      },
+      {
+        "round": 4,
+        "prefill_tps": 42216.92959760861,
+        "complete_requests": 64,
+        "preemptions": 0,
+        "jit_events": 0,
+        "cache_updates": 0
+      },
+      {
+        "round": 5,
+        "prefill_tps": 42224.443715713045,
+        "complete_requests": 64,
+        "preemptions": 0,
+        "jit_events": 0,
+        "cache_updates": 0
+      }
+    ],
+    "source_delivery_commit": "1ea46e1c094d870db6e118d42de1720d80214a59",
+    "evidence_file": "prefill-45k-dp16-g2-fused-summary.json",
+    "status": "opt-in candidate; no default change",
+    "g1": false,
+    "g2": true,
+    "change_vs_previous_verified_percent": 1.5507019452326576,
+    "quality": {
+      "mode": "standard MTP3",
+      "gsm8k100_correct": 97,
+      "long24k16_correct": 15,
+      "long64k16_correct": 15,
+      "request_errors": 0,
+      "limits": "Short GSM prompts cannot exercise M65536; long-test dispatch counts were not recorded. No full-dataset quality-equivalence claim."
+    }
+  },
+  "decode_fabric": {
+    "mean_itl_ms": 57.03812376334747,
+    "stdev_itl_ms": 0.14394221497909584,
+    "mean_decode_tps": 3149.196925200486,
+    "parallel": "DP4TP4EP16",
+    "batch": 64,
+    "per_dp_batch": 16,
+    "input_tokens": 65536,
+    "output_tokens": 4096,
+    "max_model_len": 1048576,
+    "max_num_batched_tokens": 32768,
+    "hot_graph_context_tokens": 69888,
+    "actual_1m_end_to_end_tested": false,
+    "rounds": [
+      {
+        "round": 2,
+        "trial": "native-itl6479-20261022-061029",
+        "itl_ms": 57.16516578447483,
+        "decode_tps": 3148.7114823859606,
+        "acceptance": 0.6019530805147477,
+        "complete_requests": 64,
+        "preemptions": 0.0
+      },
+      {
+        "round": 4,
+        "trial": "native-itl6479-20261022-061029",
+        "itl_ms": 56.88178785686727,
+        "decode_tps": 3150.192595492868,
+        "acceptance": 0.5982873264996527,
+        "complete_requests": 64,
+        "preemptions": 0.0
+      },
+      {
+        "round": 5,
+        "trial": "native-itl6479-20261022-061029",
+        "itl_ms": 57.06741764870032,
+        "decode_tps": 3148.686697722629,
+        "acceptance": 0.5998835343076683,
+        "complete_requests": 64,
+        "preemptions": 0.0
+      }
+    ],
+    "quality": {
+      "mode": "standard MTP3",
+      "gsm8k100_correct": 99,
+      "request_errors": 0
+    },
+    "itl_definition": "Mean interval between streaming chunks; an MTP chunk may contain multiple output tokens. Not per-token TPOT."
+  },
+  "external_assets": {
+    "weights": "Step5-Channel-FP8-w8a8",
+    "prefill_placement_sha256": "876ac0f5963c51d7e9e0a4629e589de70ef2d2e9ba86b9b20437d8d0beb1bb32",
+    "decode_placement_sha256": "431089b03db8fa4f6a3b2bc5cd73a0ac44683444303d2fe88ec10e355f53fa04",
+    "note": "Model weights, placement PT files, tokenizer, native binaries, raw traces and dataset predictions are not included."
+  },
+  "excluded_candidates": {
+    "DeepEP_MNVL_DeepGEMM": "Regressed to 29680.43 tps; not selected as performance backend. Compatibility fixes retained.",
+    "AITER_Fabric16": "Isolated large-payload communication was slower; experimental AITER builds excluded.",
+    "ASM_tuning": "Ongoing isolated work; not part of this snapshot."
+  },
+  "validation_limits": [
+    "Existing HCU measurements apply to the recorded runtimes, not a fresh full-model run of this consolidated checkout.",
+    "New publication changes are launcher wiring, documentation, source integration and portable CPU tests; no serving process was changed.",
+    "G1/G2 stay disabled by default. The 45000 tps target is not reached."
+  ],
+  "publication_decode_integration_commit": "fb09e932df8eab312e49a91e82a0254b762e2b82",
+  "publication_checks": {
+    "portable_pytest_passed": 61,
+    "portable_subtests_passed": 4,
+    "python_files_ast_parsed": 707,
+    "patch_adapter_count": 171,
+    "patch_contract_missing": 0,
+    "vllm_dependent_checks_unavailable": {
+      "count": 16,
+      "reason": "Local Windows publication environment has no vLLM distribution; imports failed in the attempted environment-contract run."
+    },
+    "fresh_gpu_rebuild_or_fullmodel_rerun": false
+  }
+}

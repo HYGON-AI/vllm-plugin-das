@@ -1,0 +1,49 @@
+{
+  "measured_at": "2026-10-22",
+  "case": "decode-dp4-visible",
+  "container": "xuwq_vllm_1021",
+  "parallel": "DP4TP4EP16",
+  "machines": 4,
+  "cards_per_machine": 4,
+  "batch": 64,
+  "per_dp_bs": 16,
+  "input_tokens": 65536,
+  "output_tokens": 4096,
+  "max_model_len": 1048576,
+  "max_num_batched_tokens": 32768,
+  "mtp_tokens": 3,
+  "rejection_sample_method": "synthetic",
+  "synthetic_acceptance_rates": [
+    0.838992,
+    0.598322,
+    0.362686
+  ],
+  "actual_acceptance": 0.6019530805147477,
+  "base_source_commit": "04c59a4b0c1b877c582164bdc6bb267640845e8d",
+  "runtime": "/opt/xuwq_step5_native_decode_visible_20261021",
+  "changes": [
+    "full graph width131072region instead of8704",
+    "independent hybrid device-visible topk selector preserving vendor kernels",
+    "streaming fp8 stacked indexer key grid capped8192regions but loop covers full dynamic history",
+    "native torch profiler configured max3workersteps; inactive duringformal"
+  ],
+  "graph_regions": 131072,
+  "streaming_indexer_key_grid_regions": 8192,
+  "warmup_rounds": 1,
+  "formal_rounds": [
+    2
+  ],
+  "trial": "native-itl6479-20261022-003447",
+  "warmup_itl_ms": 64.06202318586345,
+  "formal_itl_ms": 64.06103584548345,
+  "formal_decode_tps": 2807.9392259951287,
+  "complete_requests": 64,
+  "incomplete_requests": 0,
+  "preemptions": 0,
+  "jit_events": 0,
+  "cache_updates": 0,
+  "selected_for_speed": false,
+  "under60ms": false,
+  "narrow_graph_baseline_itl_ms": 62.61988341010915,
+  "interpretation": "Full1M graph capacity retained and dynamic history bounds verified with changed-input graph replays, but one audited formal round is1.441ms slower than the historical-width baseline. Native torch profiler is configured but inactive during this formal round. Profile diagnostic results are separate and not performance scores."
+}

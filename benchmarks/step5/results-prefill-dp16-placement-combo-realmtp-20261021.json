@@ -1,0 +1,124 @@
+{
+  "measured_at": "2026-10-21",
+  "case": "prefill-pipe-dbo-directsum-realmtp-placement",
+  "trial": "native-prefill-20261021-174024",
+  "source_commit": "1997af79d75cd070938faf77b72c3a0fbe344ab5",
+  "parallel": "DP16TP1EP16",
+  "machines": 4,
+  "cards_per_machine": 4,
+  "concurrency": 64,
+  "input_tokens": 65536,
+  "output_tokens": 1,
+  "max_num_batched_tokens": 8192,
+  "max_model_len": 70000,
+  "mtp_tokens": 3,
+  "rejection_sample_method": "standard",
+  "controls": {
+    "HCU_DP_MOE_PIPE_MIN_TOKENS": 65536,
+    "HCU_DBO_MIN_TOKENS": 4096,
+    "HCU_EP_DIRECT_SUM": 65536,
+    "HCU_SHARED_EXPERTS_STREAM_MIN_TOKENS": 4096
+  },
+  "placement": {
+    "path": "/var/lib/xuwq_step5_assets/expert_placement_prefill_8192_ep16_20261020.pt",
+    "sha256": "876ac0f5963c51d7e9e0a4629e589de70ef2d2e9ba86b9b20437d8d0beb1bb32",
+    "shape": [
+      88,
+      352
+    ],
+    "training_route_sha256": {
+      "train-seed314159": "2c0de4dd1b360341a40af92194c90184e4c2af69c9aaa2136a952fe8afdebc13",
+      "train-seed161803": "8f18c2611eece8b914d18f6531eadda9ffdc2e03a4d3e6ff07e443ddc1868686"
+    },
+    "heldout_route_sha256": "50d25360707394a2bbc27b037a3b23c006fa76ea2e980a87e3c38abb9f94a5ad",
+    "heldout_used_for_optimization": false,
+    "heldout_max_load_proxy_change_percent": -34.59882770131672
+  },
+  "startup_model_loading_seconds": 381.810875,
+  "warmup_tps": [
+    39203.477093227746,
+    39731.97014131648
+  ],
+  "formal_rounds": [
+    3,
+    4,
+    5
+  ],
+  "rounds": [
+    {
+      "round": 3,
+      "prefill_tps": 39719.27529681825,
+      "complete_requests": 64,
+      "preemptions": 0,
+      "jit_events": 0,
+      "cache_updates": 0
+    },
+    {
+      "round": 4,
+      "prefill_tps": 39962.6226721525,
+      "complete_requests": 64,
+      "preemptions": 0,
+      "jit_events": 0,
+      "cache_updates": 0
+    },
+    {
+      "round": 5,
+      "prefill_tps": 39975.694896747606,
+      "complete_requests": 64,
+      "preemptions": 0,
+      "jit_events": 0,
+      "cache_updates": 0
+    }
+  ],
+  "mean_tps": 39885.86428857278,
+  "sample_stdev_tps": 144.41828102533054,
+  "previous_combo_standard_mtp_mean_tps": 34662.204371379456,
+  "improvement_vs_previous_combo_percent": 15.070189596788875,
+  "original_recommended_tps": 29085.030850366908,
+  "improvement_vs_original_recommended_percent": 37.13536868423031,
+  "h200_reference_tps": 69306,
+  "h200_percent": 57.55037700714625,
+  "gsm8k_100": {
+    "dataset": "gsm8k",
+    "requested": 100,
+    "predictions": 100,
+    "correct": 96,
+    "score_percent": 96.0,
+    "metric": "EvalScope-1.12-compatible numeric accuracy",
+    "request_errors": 0,
+    "finish_reasons": {
+      "stop": 100
+    },
+    "max_observed_output_tokens": 2363,
+    "output_token_limit": 32768,
+    "few_shot_num": 0,
+    "repeats": 1,
+    "complete": true,
+    "concurrency": 64,
+    "generation": {
+      "temperature": 1.0,
+      "top_p": 0.95,
+      "top_k": -1,
+      "max_tokens": 32768,
+      "seed": 42,
+      "n": 1,
+      "stream": false
+    },
+    "elapsed_s": 83.2084014415741,
+    "historical_same_checkpoint_score_percent": 95.90598938589841,
+    "historical_same_checkpoint_correct": 1265,
+    "notes": "Frozen 1319 zero-shot prompts. Scoring reproduces EvalScope 1.12 GSM8K extract_answer and numeric comparison for numeric targets; concurrency differs from historical batch size 4."
+  },
+  "historical_same_checkpoint_first100": {
+    "correct": 97,
+    "total": 100,
+    "score_percent": 97.0
+  },
+  "historical_same_checkpoint_full": {
+    "correct": 1265,
+    "total": 1319,
+    "score_percent": 95.90598938589841
+  },
+  "selected": true,
+  "selection_reason": "Three clean formal rounds improve throughput by 15.07% over the previous standard-MTP combo, and the user-requested GSM8K-100 sample scores 96/100 with no request errors, consistent with the historical checkpoint score."
+}

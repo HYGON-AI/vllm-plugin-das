@@ -1,0 +1,79 @@
+{
+  "case": "prefill-b8192-p0",
+  "trial": "native-prefill-20261020-055822",
+  "source_commit": "0fb5f6520ce5a156b31c80fc9b7d74bb0c1efb89",
+  "tp": 1,
+  "dp": 16,
+  "ep": 16,
+  "concurrency": 64,
+  "input_tokens": 65536,
+  "output_tokens": 1,
+  "batched_tokens": 8192,
+  "warmup_rounds": 2,
+  "formal_rounds": [
+    3,
+    4,
+    5
+  ],
+  "rounds": [
+    {
+      "round": 3,
+      "prefill_tps": 29057.171282554686,
+      "preemptions": 0,
+      "complete_requests": 64,
+      "jit_events": 0,
+      "cache_updates": 0,
+      "iteration_start": 1792447485.6786537,
+      "iteration_end": 1792447630.5304244
+    },
+    {
+      "round": 4,
+      "prefill_tps": 29068.075600524196,
+      "preemptions": 0,
+      "complete_requests": 64,
+      "jit_events": 0,
+      "cache_updates": 0,
+      "iteration_start": 1792447679.4085727,
+      "iteration_end": 1792447824.1827576
+    },
+    {
+      "round": 5,
+      "prefill_tps": 29007.726956182683,
+      "preemptions": 0,
+      "complete_requests": 64,
+      "jit_events": 0,
+      "cache_updates": 0,
+      "iteration_start": 1792447872.3394556,
+      "iteration_end": 1792448017.424013
+    }
+  ],
+  "mean_tps": 29044.32461308719,
+  "sample_stdev_tps": 32.16002807476936,
+  "h200_percent": 41.907373983619294,
+  "strict_fa_dsa": true,
+  "worker_extension": false,
+  "placement": null,
+  "measured_at": "2026-10-20",
+  "machines": 4,
+  "cards_per_machine": 4,
+  "platform": "BW1300_LC gfx938",
+  "precision": "w8a8-fp8; kvfp8_e4m3",
+  "per_dp_bs": 4,
+  "pipeline_min_tokens": 0,
+  "shared_stream_min_tokens": 4096,
+  "nccl_max_channels": 32,
+  "benchmark_source_sha256": "d29320570bf0f70406b249444452ad47607b6038ef80ec7e7e8c0bd37586da9a",
+  "prefix_caching": false,
+  "mtp_tokens": 3,
+  "synthetic_acceptance_rates": [
+    0.838992,
+    0.598322,
+    0.362686
+  ],
+  "complete_git_files_verified_per_node": 846,
+  "default_e22_entries": 21,
+  "pt_in_source": false,
+  "h200_reference_tps": 69306,
+  "h200_reference_provenance": "User-provided H200 two-host/16-GPU figure; different hardware and topology. Percentage is arithmetic, not a controlled comparison.",
+  "full_model_quality_validated": false
+}

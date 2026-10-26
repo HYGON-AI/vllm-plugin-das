@@ -1,0 +1,68 @@
+{
+  "measured_at": "2026-10-21",
+  "case": "prefill-pipe-dbo-directsum-realmtp",
+  "trial": "native-prefill-20261021-162353",
+  "source_commit": "1997af79d75cd070938faf77b72c3a0fbe344ab5",
+  "parallel": "DP16TP1EP16",
+  "machines": 4,
+  "cards_per_machine": 4,
+  "concurrency": 64,
+  "input_tokens": 65536,
+  "output_tokens": 1,
+  "max_num_batched_tokens": 8192,
+  "max_model_len": 70000,
+  "mtp_tokens": 3,
+  "rejection_sample_method": "standard",
+  "synthetic_acceptance_rates": null,
+  "controls": {
+    "HCU_DP_MOE_PIPE_MIN_TOKENS": 65536,
+    "HCU_DBO_MIN_TOKENS": 4096,
+    "HCU_EP_DIRECT_SUM": 65536,
+    "HCU_SHARED_EXPERTS_STREAM_MIN_TOKENS": 4096
+  },
+  "original_expert_placement": true,
+  "warmup_rounds": 2,
+  "formal_rounds": [
+    3,
+    4,
+    5
+  ],
+  "rounds": [
+    {
+      "round": 3,
+      "prefill_tps": 34679.8074363326,
+      "complete_requests": 64,
+      "preemptions": 0,
+      "jit_events": 0,
+      "cache_updates": 0
+    },
+    {
+      "round": 4,
+      "prefill_tps": 34667.113819572405,
+      "complete_requests": 64,
+      "preemptions": 0,
+      "jit_events": 0,
+      "cache_updates": 0
+    },
+    {
+      "round": 5,
+      "prefill_tps": 34639.69185823336,
+      "complete_requests": 64,
+      "preemptions": 0,
+      "jit_events": 0,
+      "cache_updates": 0
+    }
+  ],
+  "mean_tps": 34662.204371379456,
+  "sample_stdev_tps": 20.503460993903527,
+  "h200_reference_tps": 69306,
+  "h200_percent": 50.01328077133214,
+  "previous_recommended_tps": 29085.030850366908,
+  "improvement_percent": 19.1754086481988,
+  "selected": true,
+  "quality_evidence": {
+    "same_four_gsm8k_prompts": "4/4",
+    "historical_same_checkpoint_full_gsm8k": "1265/1319 (95.905989%)"
+  },
+  "integrity": "All three formal rounds completed 64/64 with zero preemptions, JIT events and cache writes."
+}

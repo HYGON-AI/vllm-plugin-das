@@ -1,0 +1,309 @@
+{
+  "date": "2026-10-24",
+  "tested_code_commit": "c2daed7ef0d34ea0313eda4d9e8058a0166766cd",
+  "source_snapshot_sha256": "fa4ea0835a49aa259e7500c28bafef59c92057c2f35c2bb6df84870a855402fb",
+  "prior_publication_head": "07e318f7860a98447d7687668724bcdab9bb8a4c",
+  "platform": {
+    "arch": "gfx938",
+    "nodes": 4,
+    "gpus_per_node": 4,
+    "containers": [
+      {
+        "node": "p5c1",
+        "image_tag": "0.28.1rc1-ubuntu22.04-dtk2610-py3.12-scalex40-20261021-0235",
+        "image_id": "sha256:8f0c57d79e8ad3a6892aae2e55701e9d961405e7b826ef262e3402373f348fcf",
+        "versions": {
+          "torch": "2.11.0+das.opt1.dtk2610.2609201632.gf74cd7",
+          "vllm": "0.28.1+dtk2610.torch2110.2610191943.g29071f",
+          "aiter": "0.1.7+dtk2610.torch2110.2610201311.gbc033a"
+        }
+      },
+      {
+        "node": "p5c2",
+        "image_tag": "0.28.1rc1-ubuntu22.04-dtk2610-py3.12-scalex40-20261021-0235",
+        "image_id": "sha256:8f0c57d79e8ad3a6892aae2e55701e9d961405e7b826ef262e3402373f348fcf",
+        "versions": {
+          "torch": "2.11.0+das.opt1.dtk2610.2609201632.gf74cd7",
+          "vllm": "0.28.1+dtk2610.torch2110.2610191943.g29071f",
+          "aiter": "0.1.7+dtk2610.torch2110.2610201311.gbc033a"
+        }
+      },
+      {
+        "node": "p5c3",
+        "image_tag": "0.28.1rc1-ubuntu22.04-dtk2610-py3.12-scalex40-20261021-0235",
+        "image_id": "sha256:8f0c57d79e8ad3a6892aae2e55701e9d961405e7b826ef262e3402373f348fcf",
+        "versions": {
+          "torch": "2.11.0+das.opt1.dtk2610.2609201632.gf74cd7",
+          "vllm": "0.28.1+dtk2610.torch2110.2610191943.g29071f",
+          "aiter": "0.1.7+dtk2610.torch2110.2610201311.gbc033a"
+        }
+      },
+      {
+        "node": "p5c4",
+        "image_tag": "0.28.1rc1-ubuntu22.04-dtk2610-py3.12-scalex40-20261021-0235",
+        "image_id": "sha256:9c437b9665a0408c2f2d42ab6bee6d9563ebdb4985ddb5a09aca7b7de0d67e36",
+        "versions": {
+          "torch": "2.11.0+das.opt1.dtk2610.2609201632.gf74cd7",
+          "vllm": "0.28.1+dtk2610.torch2110.2610191943.g29071f",
+          "aiter": "0.1.7+dtk2610.torch2110.2610201311.gbc033a"
+        }
+      }
+    ]
+  },
+  "decode": {
+    "complete": true,
+    "case": "decode-release-synthetic-20261024-v2",
+    "source_commit": "c2daed7ef0d34ea0313eda4d9e8058a0166766cd",
+    "source_snapshot": "fa4ea0835a49aa259e7500c28bafef59c92057c2f35c2bb6df84870a855402fb",
+    "runtime": "/opt/xuwq_step5_release_pd_20261024_v2",
+    "parallel": "DP4TP4EP16",
+    "nodes": 4,
+    "gpus_per_node": 4,
+    "concurrency": 64,
+    "per_DP_batch": 16,
+    "input_tokens": 65536,
+    "output_tokens": 4096,
+    "max_num_batched_tokens": 32768,
+    "max_model_len": 1048576,
+    "KV_dtype": "fp8_e4m3",
+    "prefix_caching": false,
+    "synthetic_acceptance_rates": [
+      0.838992,
+      0.598322,
+      0.362686
+    ],
+    "MTP_tokens": 3,
+    "mean_itl_ms": 56.441650239104035,
+    "sample_stdev_itl_ms": 0.23671910253886905,
+    "mean_decode_tps": 3177.99089515628,
+    "formal_rounds": [
+      2,
+      3,
+      4
+    ],
+    "rounds": [
+      {
+        "round": 2,
+        "itl_ms": 56.446878261625365,
+        "itl_p99_ms": 61.01561691146346,
+        "decode_tps": 3190.0347372657156,
+        "prefill_tps_same_decode_instance": 23042.88435368563,
+        "actual_acceptance": 0.6019530805147477,
+        "complete_requests": 64,
+        "preemptions": 0,
+        "cache_updates": 0,
+        "jit_events": 0,
+        "clean": true
+      },
+      {
+        "round": 3,
+        "itl_ms": 56.202360427766145,
+        "itl_p99_ms": 63.1143753696233,
+        "decode_tps": 3187.075798331445,
+        "prefill_tps_same_decode_instance": 23058.31756418256,
+        "actual_acceptance": 0.5975120783213612,
+        "complete_requests": 64,
+        "preemptions": 0,
+        "cache_updates": 0,
+        "jit_events": 0,
+        "clean": true
+      },
+      {
+        "round": 4,
+        "itl_ms": 56.675712027920596,
+        "itl_p99_ms": 61.9876466691494,
+        "decode_tps": 3156.8621498716793,
+        "prefill_tps_same_decode_instance": 23035.886276127847,
+        "actual_acceptance": 0.5982873264996527,
+        "complete_requests": 64,
+        "preemptions": 0,
+        "cache_updates": 0,
+        "jit_events": 0,
+        "clean": true
+      }
+    ],
+    "all_three_under60": true,
+    "all16_Fabric_dispatch_and_combine": true,
+    "all4_cache_audits_clean": true,
+    "actual_1M_end_to_end_tested": false,
+    "hot_graph_context_tokens": 69888,
+    "ITL_definition": "Original streaming chunk interval; MTP chunks may contain multiple tokens. Not per-token TPOT.",
+    "normal_native_extension": true,
+    "native_binary_sha256": "50fbca2b1b957e5eb121d80847f044d51e3fd1c185ca4aacb7444d78db10c2d5",
+    "native_source_unchanged": true,
+    "native_binary_rebuilt": false
+  },
+  "decode_accuracy": {
+    "dataset": "gsm8k",
+    "requested": 100,
+    "predictions": 100,
+    "correct": 98,
+    "score_percent": 98.0,
+    "metric": "EvalScope-1.12-compatible numeric accuracy",
+    "request_errors": 0,
+    "finish_reasons": {
+      "stop": 100
+    },
+    "max_observed_output_tokens": 5390,
+    "output_token_limit": 32768,
+    "few_shot_num": 0,
+    "repeats": 1,
+    "complete": true,
+    "concurrency": 64,
+    "generation": {
+      "temperature": 1.0,
+      "top_p": 0.95,
+      "top_k": -1,
+      "max_tokens": 32768,
+      "seed": 42,
+      "n": 1,
+      "stream": false
+    },
+    "elapsed_s": 117.42624497413635,
+    "source_commit": "c2daed7ef0d34ea0313eda4d9e8058a0166766cd",
+    "source_snapshot": "fa4ea0835a49aa259e7500c28bafef59c92057c2f35c2bb6df84870a855402fb",
+    "runtime": "/opt/xuwq_step5_release_pd_20261024_v2",
+    "quality_mode": "standard MTP3; accuracy only; not performance",
+    "dataset_sha256": "c10cd5aec4ef1d542a9b4eaf0d4b7ae7a9a4b92d877e231a8a16d40a5525264c",
+    "evaluator_sha256": "d449ee1f0454df42f7b65a4dcb1ad633c9bdd07af682c016355e3cf13bf8a55f",
+    "additional_strict_numeric_grading": {
+      "complete": true,
+      "requested": 100,
+      "strict_numeric_correct": 98,
+      "legacy_correct": 98,
+      "different_grading_indices": [],
+      "definition": "Decimal equality of extracted and target numbers; no percentage scaling or relative tolerance."
+    },
+    "historical_reference_gsm8k100_correct": 99,
+    "actual_1M_end_to_end_tested": false,
+    "full_dataset_quality_equivalence_claim": false
+  },
+  "historical_decode_reference": {
+    "mean_itl_ms": 57.03812376334747,
+    "mean_decode_tps": 3149.196925200486,
+    "GSM8K100": 99,
+    "note": "Previous recorded runtime, not a same-session causal control."
+  },
+  "prefill": {
+    "E22_cached_ASM": {
+      "mean_tps": 42565.786483389486,
+      "sample_stdev_tps": 60.3519774467916,
+      "source_delivery_commit": "70af815dbffd32ba7cf497019e4df115c22f3eb2",
+      "quality": {
+        "GSM8K100": 96,
+        "long24K16": 15,
+        "long64K16": 16,
+        "request_errors": 0
+      },
+      "source_case": "prefill-45k-dp16-asm-g1-cached",
+      "opt_in": true
+    },
+    "E23_fixed_cached_ASM": {
+      "mean_tps": 42666.451411884605,
+      "sample_stdev_tps": 31.303450487591316,
+      "source_delivery_commit": "8c6ab08360f5a4b62cff4145a013c1edfeb79809",
+      "source_snapshot": "1d9776a03017db3a9f14e01ae560fcb7f3d1fb9e67a5909c5db90c52b9cd095e",
+      "rounds": [
+        {
+          "round": 3,
+          "prefill_tps": 42656.60987105042,
+          "prefill_latency_seconds": 98.3271763199009,
+          "complete_requests": 64,
+          "preemptions": 0,
+          "jit_events": 0,
+          "cache_updates": 0,
+          "iteration_start": 1792809507.7917933,
+          "iteration_end": 1792809606.6425555
+        },
+        {
+          "round": 4,
+          "prefill_tps": 42701.49300679134,
+          "prefill_latency_seconds": 98.2238255541306,
+          "complete_requests": 64,
+          "preemptions": 0,
+          "jit_events": 0,
+          "cache_updates": 0,
+          "iteration_start": 1792809645.1060994,
+          "iteration_end": 1792809743.8693879
+        },
+        {
+          "round": 5,
+          "prefill_tps": 42641.25135781205,
+          "prefill_latency_seconds": 98.36259177303873,
+          "complete_requests": 64,
+          "preemptions": 0,
+          "jit_events": 0,
+          "cache_updates": 0,
+          "iteration_start": 1792809779.1878262,
+          "iteration_end": 1792809878.0527394
+        }
+      ],
+      "max_num_batched_tokens": 8192,
+      "max_model_len": 70000,
+      "concurrency": 64,
+      "input_tokens": 65536,
+      "output_tokens": 1,
+      "parallel": "DP16TP1EP16",
+      "synthetic_acceptance_rates": [
+        0.838992,
+        0.598322,
+        0.362686
+      ],
+      "solution": 13001,
+      "ASM_BM": 128,
+      "persistent_grid": 320,
+      "shuffle": 1,
+      "software_queue_cap": 8,
+      "complete_model_quality_validated": false,
+      "opt_in": true,
+      "note": "Performance-only candidate. Prefill measurements belong to the pinned experiment runtime; consolidated checkout Prefill was not rerun."
+    }
+  },
+  "validation": {
+    "portable_CPU_tests_passed": 136,
+    "real_ABI_tests_per_node": 2,
+    "real_ABI_nodes": 4,
+    "python_files_parsed": 716,
+    "source_files": 925,
+    "every_archived_source_file_matches_Git_blob": true,
+    "archive_core_autocrlf": false,
+    "normal_native_binary_sha256": "50fbca2b1b957e5eb121d80847f044d51e3fd1c185ca4aacb7444d78db10c2d5",
+    "native_source_unchanged_from_R9": true,
+    "native_binary_rebuilt": false,
+    "standalone_Dense_library": false,
+    "decode_fresh_full_model_verified": true,
+    "all_owned_verification_services_stopped": true,
+    "failed_SparseRS_and_local32_FA_metadata_experiments_excluded": true,
+    "isolated_static_map_tests_passed": 44,
+    "isolated_diagnostic_tests_passed": 17,
+    "isolated_diagnostic_subtests_passed": 12,
+    "isolated_static_worker_bridge_tests_passed": 10,
+    "isolated_EP_table_tests_passed": 16,
+    "offline_EPLB_tests_passed": 37,
+    "EP_contract_tests_passed": 93,
+    "repaired_complete_suites_passed": {
+      "tests/runtime_patch/test_platform_hcu_config.py": 149,
+      "tests/patch/test_worker_dispatcher.py": 21
+    },
+    "post_measurement_inference_code_changes": false,
+    "fixture_repairs": [
+      "AST globals and activation enum",
+      "Checkout plugin precedes installed plugin in subprocesses",
+      "Repository-relative path resolution",
+      "Local tiny config replaces network model lookup",
+      "Laziness asserts zero new imports relative to observed target-build baseline"
+    ]
+  },
+  "limits": [
+    "ITL is the original streaming-chunk interval. MTP chunks can contain multiple tokens; it is not per-token TPOT.",
+    "Decode queries use65536 input and4096 output tokens; max-model-len1048576 is preserved, but actual1M-token end-to-end inference was not tested.",
+    "GSM8K100 is a seeded stochastic sample using the frozen previous evaluator; no full-dataset or causal quality-equivalence claim.",
+    "E23 Prefill has no complete-model GSM8K result; E22 quality results cannot substitute for it.45000 Prefill tps was not reached."
+  ],
+  "external_evidence": {
+    "directory": "outputs/p5c1-4-regression-20261020",
+    "performance": "decode-release-synthetic-20261024-v2-summary.json",
+    "accuracy": "decode-release-standard-20261024-v2-gsm8k100-summary.json",
+    "raw_archives": "Local only; datasets, raw predictions, model weights, placement PT files and native binaries are not published."
+  }
+}

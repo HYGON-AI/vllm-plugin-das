@@ -1,0 +1,59 @@
+{
+  "world": 16,
+  "dp": 4,
+  "tp": 4,
+  "rows": [
+    {
+      "case": "auto",
+      "passed": true,
+      "ranks": 16,
+      "ag_rank_max_ms": 0.0599898137152195,
+      "rs_rank_max_ms": 0.056609999388456345,
+      "both_rank_max_ms": 0.10679006576538086,
+      "full_model_performance_validated": false
+    },
+    {
+      "case": "ll",
+      "passed": true,
+      "ranks": 16,
+      "ag_rank_max_ms": 0.06961999833583832,
+      "rs_rank_max_ms": 0.09452993422746658,
+      "both_rank_max_ms": 0.14928993582725525,
+      "full_model_performance_validated": false
+    },
+    {
+      "case": "ll128",
+      "passed": false
+    },
+    {
+      "case": "simple",
+      "passed": true,
+      "ranks": 16,
+      "ag_rank_max_ms": 0.06038012355566025,
+      "rs_rank_max_ms": 0.05538006126880646,
+      "both_rank_max_ms": 0.10689018666744232,
+      "full_model_performance_validated": false
+    },
+    {
+      "case": "channels8",
+      "passed": true,
+      "ranks": 16,
+      "ag_rank_max_ms": 0.06551993638277054,
+      "rs_rank_max_ms": 0.06405993551015854,
+      "both_rank_max_ms": 0.12125006318092346,
+      "full_model_performance_validated": false
+    },
+    {
+      "case": "channels16",
+      "passed": true,
+      "ranks": 16,
+      "ag_rank_max_ms": 0.06129999831318855,
+      "rs_rank_max_ms": 0.055470000952482224,
+      "both_rank_max_ms": 0.10649999976158142,
+      "full_model_performance_validated": false
+    }
+  ],
+  "selected": "auto",
+  "full_model_performance_validated": false,
+  "reason": "LL slower; LL128 unavailable for initialfloat32allreduce; Simple and16channels sameasauto;8channels slower. Keep automaticselection; no fullmodelreload for thesecontrols."
+}

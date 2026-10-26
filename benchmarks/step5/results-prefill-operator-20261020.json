@@ -1,0 +1,273 @@
+{
+  "measured_at": "2026-10-20",
+  "source_commit": "3a84ea30f1cbeb8b4cad3c68ddedf754789ef179",
+  "platform": "BW1300_LC gfx938",
+  "gpus_measured": 1,
+  "local_experts": 22,
+  "global_experts": 352,
+  "topk": 8,
+  "global_rows": 131072,
+  "precision": "FP8 per-token/per-channel with BF16 outputs; identical existing kernels/configurations",
+  "timed_cases": 18,
+  "nonbaseline_comparisons": 16,
+  "changed_input_chunk_cases": 8,
+  "all_comparisons_bitexact": true,
+  "actual_dp_collective_measured": false,
+  "full_model_score": false,
+  "language_quality_validated": false,
+  "rows": [
+    {
+      "distribution": "uniform",
+      "chunk": 32768,
+      "programs": 0,
+      "exact": true,
+      "median_ms": 10.59758186340332,
+      "samples_ms": [
+        10.948619842529297,
+        10.59646224975586,
+        10.590702056884766,
+        10.59758186340332,
+        10.614381790161133
+      ]
+    },
+    {
+      "distribution": "uniform",
+      "chunk": 65536,
+      "programs": 0,
+      "exact": true,
+      "median_ms": 10.084942817687988,
+      "samples_ms": [
+        10.106221199035645,
+        10.084942817687988,
+        10.092782974243164,
+        10.077422142028809,
+        10.071983337402344
+      ]
+    },
+    {
+      "distribution": "uniform",
+      "chunk": 131072,
+      "programs": 0,
+      "exact": true,
+      "median_ms": 10.283822059631348,
+      "samples_ms": [
+        10.333901405334473,
+        10.283822059631348,
+        10.271503448486328,
+        10.302701950073242,
+        10.282543182373047
+      ]
+    },
+    {
+      "distribution": "uniform",
+      "chunk": 32768,
+      "programs": 128,
+      "exact": true,
+      "median_ms": 10.987340927124023,
+      "samples_ms": [
+        10.985099792480469,
+        10.97822093963623,
+        10.987340927124023,
+        10.993581771850586,
+        11.024300575256348
+      ]
+    },
+    {
+      "distribution": "uniform",
+      "chunk": 32768,
+      "programs": 256,
+      "exact": true,
+      "median_ms": 11.029742240905762,
+      "samples_ms": [
+        11.037739753723145,
+        11.010380744934082,
+        11.03070068359375,
+        11.01150131225586,
+        11.029742240905762
+      ]
+    },
+    {
+      "distribution": "uniform",
+      "chunk": 32768,
+      "programs": 512,
+      "exact": true,
+      "median_ms": 11.126701354980469,
+      "samples_ms": [
+        11.143340110778809,
+        11.127660751342773,
+        11.126701354980469,
+        11.098381042480469,
+        11.072300910949707
+      ]
+    },
+    {
+      "distribution": "uniform",
+      "chunk": 131072,
+      "programs": 128,
+      "exact": true,
+      "median_ms": 10.689262390136719,
+      "samples_ms": [
+        10.806059837341309,
+        10.677581787109375,
+        10.974700927734375,
+        10.689262390136719,
+        10.68270206451416
+      ]
+    },
+    {
+      "distribution": "uniform",
+      "chunk": 131072,
+      "programs": 256,
+      "exact": true,
+      "median_ms": 10.711981773376465,
+      "samples_ms": [
+        10.824139595031738,
+        10.713261604309082,
+        10.711981773376465,
+        10.697901725769043,
+        10.700461387634277
+      ]
+    },
+    {
+      "distribution": "uniform",
+      "chunk": 131072,
+      "programs": 512,
+      "exact": true,
+      "median_ms": 10.75742244720459,
+      "samples_ms": [
+        10.837900161743164,
+        10.740141868591309,
+        10.736942291259766,
+        10.75742244720459,
+        10.778382301330566
+      ]
+    },
+    {
+      "distribution": "skewed",
+      "chunk": 32768,
+      "programs": 0,
+      "exact": true,
+      "median_ms": 30.108749389648438,
+      "samples_ms": [
+        30.062828063964844,
+        30.228267669677734,
+        30.108749389648438,
+        30.13258934020996,
+        30.100269317626953
+      ]
+    },
+    {
+      "distribution": "skewed",
+      "chunk": 65536,
+      "programs": 0,
+      "exact": true,
+      "median_ms": 31.077707290649414,
+      "samples_ms": [
+        31.11514663696289,
+        31.090347290039062,
+        31.07002830505371,
+        31.065547943115234,
+        31.077707290649414
+      ]
+    },
+    {
+      "distribution": "skewed",
+      "chunk": 131072,
+      "programs": 0,
+      "exact": true,
+      "median_ms": 32.406822204589844,
+      "samples_ms": [
+        32.406822204589844,
+        32.510826110839844,
+        32.47642517089844,
+        32.27834701538086,
+        32.28138732910156
+      ]
+    },
+    {
+      "distribution": "skewed",
+      "chunk": 32768,
+      "programs": 128,
+      "exact": true,
+      "median_ms": 31.628267288208008,
+      "samples_ms": [
+        31.551624298095703,
+        31.628267288208008,
+        31.600908279418945,
+        31.927467346191406,
+        31.674667358398438
+      ]
+    },
+    {
+      "distribution": "skewed",
+      "chunk": 32768,
+      "programs": 256,
+      "exact": true,
+      "median_ms": 31.867788314819336,
+      "samples_ms": [
+        31.836423873901367,
+        32.134185791015625,
+        31.867788314819336,
+        31.92266845703125,
+        31.85386848449707
+      ]
+    },
+    {
+      "distribution": "skewed",
+      "chunk": 32768,
+      "programs": 512,
+      "exact": true,
+      "median_ms": 32.12106704711914,
+      "samples_ms": [
+        32.11354446411133,
+        32.17066955566406,
+        32.29130554199219,
+        32.12106704711914,
+        32.02842712402344
+      ]
+    },
+    {
+      "distribution": "skewed",
+      "chunk": 131072,
+      "programs": 128,
+      "exact": true,
+      "median_ms": 34.77034378051758,
+      "samples_ms": [
+        34.739620208740234,
+        34.82186508178711,
+        34.77034378051758,
+        34.7365837097168,
+        34.88234329223633
+      ]
+    },
+    {
+      "distribution": "skewed",
+      "chunk": 131072,
+      "programs": 256,
+      "exact": true,
+      "median_ms": 34.85946273803711,
+      "samples_ms": [
+        34.83354187011719,
+        34.85946273803711,
+        34.972904205322266,
+        34.871463775634766,
+        34.828102111816406
+      ]
+    },
+    {
+      "distribution": "skewed",
+      "chunk": 131072,
+      "programs": 512,
+      "exact": true,
+      "median_ms": 34.6706657409668,
+      "samples_ms": [
+        34.827781677246094,
+        34.71370315551758,
+        34.6500244140625,
+        34.6706657409668,
+        34.609703063964844
+      ]
+    }
+  ],
+  "selection": "Retain chunk32768 default. Chunk65536 is an end-to-end candidate: faster uniform, slower skewed. Existing persistent variants are slower in both sampled distributions."
+}

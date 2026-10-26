@@ -1,0 +1,190 @@
+{
+  "scope": "Idle 16-GPU collective screen at local M8192,K4096; not full-model throughput.",
+  "source_commit": "1997af79d75cd070938faf77b72c3a0fbe344ab5",
+  "recorded": "2026-10-21T00:50:11.858844+08:00",
+  "baseline_fp8_proxy_mean_of_run_medians_ms": 12.443908452987671,
+  "rows": [
+    {
+      "case": "prefill-comm-ch32-auto",
+      "requested_environment": {
+        "NCCL_MIN_NCHANNELS": null,
+        "NCCL_MAX_NCHANNELS": "32",
+        "NCCL_BUFFSIZE": null
+      },
+      "effective_channels_all_16": [
+        32,
+        32,
+        32,
+        32,
+        32,
+        32,
+        32,
+        32,
+        32,
+        32,
+        32,
+        32,
+        32,
+        32,
+        32,
+        32
+      ],
+      "clamped_to_32": false,
+      "proxy_median_ms": {
+        "fp8-and-routing": 12.441986560821533,
+        "bf16-and-logits": 17.3239688873291
+      },
+      "passed": true,
+      "max_relative_l2": 0.005027623847126961,
+      "native_fp8_family_relative_ms_percent": -0.015444441538592368
+    },
+    {
+      "case": "prefill-comm-ch16-fixed",
+      "requested_environment": {
+        "NCCL_MIN_NCHANNELS": "16",
+        "NCCL_MAX_NCHANNELS": "16",
+        "NCCL_BUFFSIZE": null
+      },
+      "effective_channels_all_16": [
+        16,
+        16,
+        16,
+        16,
+        16,
+        16,
+        16,
+        16,
+        16,
+        16,
+        16,
+        16,
+        16,
+        16,
+        16,
+        16
+      ],
+      "clamped_to_32": false,
+      "proxy_median_ms": {
+        "fp8-and-routing": 12.45302152633667,
+        "bf16-and-logits": 17.3599796295166
+      },
+      "passed": true,
+      "max_relative_l2": 0.005027623847126961,
+      "native_fp8_family_relative_ms_percent": 0.07323320790593169
+    },
+    {
+      "case": "prefill-comm-ch64-fixed",
+      "requested_environment": {
+        "NCCL_MIN_NCHANNELS": "64",
+        "NCCL_MAX_NCHANNELS": "64",
+        "NCCL_BUFFSIZE": null
+      },
+      "effective_channels_all_16": [
+        32,
+        32,
+        32,
+        32,
+        32,
+        32,
+        32,
+        32,
+        32,
+        32,
+        32,
+        32,
+        32,
+        32,
+        32,
+        32
+      ],
+      "clamped_to_32": true,
+      "proxy_median_ms": {
+        "fp8-and-routing": 12.47567081451416,
+        "bf16-and-logits": 17.33334732055664
+      },
+      "passed": true,
+      "max_relative_l2": 0.005027623847126961,
+      "native_fp8_family_relative_ms_percent": 0.255244255825926
+    },
+    {
+      "case": "prefill-comm-ch32-buffer8m",
+      "requested_environment": {
+        "NCCL_MIN_NCHANNELS": null,
+        "NCCL_MAX_NCHANNELS": "32",
+        "NCCL_BUFFSIZE": "8388608"
+      },
+      "effective_channels_all_16": [
+        32,
+        32,
+        32,
+        32,
+        32,
+        32,
+        32,
+        32,
+        32,
+        32,
+        32,
+        32,
+        32,
+        32,
+        32,
+        32
+      ],
+      "clamped_to_32": false,
+      "proxy_median_ms": {
+        "fp8-and-routing": 12.448711395263672,
+        "bf16-and-logits": 17.233588218688965
+      },
+      "passed": true,
+      "max_relative_l2": 0.005027623847126961,
+      "native_fp8_family_relative_ms_percent": 0.03859673425070653
+    },
+    {
+      "case": "prefill-comm-ch32-repeat",
+      "requested_environment": {
+        "NCCL_MIN_NCHANNELS": null,
+        "NCCL_MAX_NCHANNELS": "32",
+        "NCCL_BUFFSIZE": null
+      },
+      "effective_channels_all_16": [
+        32,
+        32,
+        32,
+        32,
+        32,
+        32,
+        32,
+        32,
+        32,
+        32,
+        32,
+        32,
+        32,
+        32,
+        32,
+        32
+      ],
+      "clamped_to_32": false,
+      "proxy_median_ms": {
+        "fp8-and-routing": 12.445830345153809,
+        "bf16-and-logits": 17.326300621032715
+      },
+      "passed": true,
+      "max_relative_l2": 0.005027623847126961,
+      "native_fp8_family_relative_ms_percent": 0.01544444153860347
+    }
+  ],
+  "selected": "Keep 32-channel automatic minimum and default buffer.",
+  "reason": "Neither effective 16-channel nor 8MiB buffer improves the native FP8 family beyond baseline drift. Requested64 is clamped to32 and is not a valid64-channel candidate.",
+  "full_model_performance_validated": false,
+  "check_script": "benchmarks/step5/check_prefill_communication.py",
+  "check_script_sha256": "b35850b98949aea493679f6f93f833170d712c73f4ca2d5de3e41065a22ffec6",
+  "numerical_checks": {
+    "reference": "FP32 all-reduce versus BF16 reduce-scatter with standard gamma15 rounding bound",
+    "all_gather": "Exact peer/rank ordered sentinel data; changed input checked twice",
+    "reduce_scatter": "Exact destination-specific integer data; changed input checked twice"
+  },
+  "samples_per_family_per_rank": 20,
+  "warmup_iterations_per_family": 10
+}

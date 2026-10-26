@@ -1,0 +1,97 @@
+{
+  "measured_at": "2026-10-21",
+  "case": "prefill-pipe-dbo-directsum-placement-synthetic",
+  "trial": "native-prefill-20261021-190538",
+  "source_commit": "1997af79d75cd070938faf77b72c3a0fbe344ab5",
+  "parallel": "DP16TP1EP16",
+  "machines": 4,
+  "cards_per_machine": 4,
+  "concurrency": 64,
+  "input_tokens": 65536,
+  "output_tokens": 1,
+  "max_num_batched_tokens": 8192,
+  "max_model_len": 70000,
+  "mtp_tokens": 3,
+  "rejection_sample_method": "synthetic",
+  "synthetic_acceptance_rates": [
+    0.838992,
+    0.598322,
+    0.362686
+  ],
+  "controls": {
+    "HCU_DP_MOE_PIPE_MIN_TOKENS": 65536,
+    "HCU_DBO_MIN_TOKENS": 4096,
+    "HCU_EP_DIRECT_SUM": 65536,
+    "HCU_SHARED_EXPERTS_STREAM_MIN_TOKENS": 4096
+  },
+  "expert_shape": "E22,N3072,K4096,topk8",
+  "eplb_enabled": false,
+  "placement": {
+    "path": "/var/lib/xuwq_step5_assets/expert_placement_prefill_8192_ep16_20261020.pt",
+    "sha256": "876ac0f5963c51d7e9e0a4629e589de70ef2d2e9ba86b9b20437d8d0beb1bb32",
+    "shape": [
+      88,
+      352
+    ]
+  },
+  "warmup_tps": [
+    39260.04252465781,
+    39745.55330216553
+  ],
+  "formal_rounds": [
+    3,
+    4,
+    5
+  ],
+  "rounds": [
+    {
+      "round": 3,
+      "prefill_tps": 39702.46948376882,
+      "complete_requests": 64,
+      "preemptions": 0,
+      "jit_events": 0,
+      "cache_updates": 0,
+      "mtp_drafted": 672,
+      "mtp_accepted": 416,
+      "mtp_acceptance": 0.6190476190476191
+    },
+    {
+      "round": 4,
+      "prefill_tps": 39680.25577575066,
+      "complete_requests": 64,
+      "preemptions": 0,
+      "jit_events": 0,
+      "cache_updates": 0,
+      "mtp_drafted": 672,
+      "mtp_accepted": 448,
+      "mtp_acceptance": 0.6666666666666666
+    },
+    {
+      "round": 5,
+      "prefill_tps": 38535.52082929463,
+      "complete_requests": 64,
+      "preemptions": 0,
+      "jit_events": 0,
+      "cache_updates": 0,
+      "mtp_drafted": 624,
+      "mtp_accepted": 448,
+      "mtp_acceptance": 0.717948717948718
+    }
+  ],
+  "mean_tps": 39306.0820296047,
+  "sample_stdev_tps": 667.4179985387359,
+  "pooled_short_output_acceptance": 0.6666666666666666,
+  "pooled_acceptance_note": "Output length is one, so this pooled value is not the long-decode acceptance metric; the configured three-position rates define the requested performance protocol.",
+  "previous_unplaced_synthetic_combo_mean_tps": 34656.099263374315,
+  "improvement_vs_unplaced_synthetic_percent": 13.417501868551728,
+  "original_recommended_tps": 29085.030850366908,
+  "improvement_vs_original_recommended_percent": 35.14196437274488,
+  "h200_reference_tps": 69306,
+  "h200_percent": 56.71382279976438,
+  "quality_results_are_separate": {
+    "standard_mtp_gsm8k_100": "96/100",
+    "warning": "Synthetic rejection sampling is performance-only and must not be used as a model-quality score."
+  },
+  "selected_for_requested_performance_protocol": true,
+  "integrity": "All three fixed formal rounds completed64/64 with zero preemptions, JIT events and cache writes. Round5 is retained despite the lower throughput."
+}

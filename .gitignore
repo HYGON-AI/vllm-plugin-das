@@ -220,6 +220,10 @@ hip_compat.h
 
 # Benchmark dataset
 benchmarks/**/*.json
+# Reviewed Step5 launch configuration and aggregate measurements (no dataset).
+!benchmarks/step5/results-20261019.json
+# Calibrated expert-placement tensors are external runtime artifacts.
+benchmarks/step5/assets/*.pt
 
 # Linting
 actionlint
@@ -241,3 +245,7 @@ vllm/grpc/vllm_engine_pb2.pyi
 
 # Ignore generated cpu headers 
 csrc/cpu/cpu_attn_dispatch_generated.h
+
+# Machine-specific Step5 tuning artifacts remain external.
+vllm_hcu/**/ep_table*.json
+step5-tuning/

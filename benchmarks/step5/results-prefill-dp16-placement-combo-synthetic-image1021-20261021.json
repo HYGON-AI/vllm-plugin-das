@@ -1,0 +1,125 @@
+{
+  "measured_at": "2026-10-21",
+  "case": "prefill-1021-placement-synthetic",
+  "trial": "native-prefill-20261021-210804",
+  "container_name": "xuwq_vllm_1021",
+  "requested_image": "10.16.1.152:5000/jenkins/model_test_env/vllm:0.28.1rc1-ubuntu22.04-dtk2610-py3.12-scalex40-20261021-0235",
+  "image_ids": {
+    "p5c1": "sha256:8f0c57d79e8ad3a6892aae2e55701e9d961405e7b826ef262e3402373f348fcf",
+    "p5c2": "sha256:8f0c57d79e8ad3a6892aae2e55701e9d961405e7b826ef262e3402373f348fcf",
+    "p5c3": "sha256:8f0c57d79e8ad3a6892aae2e55701e9d961405e7b826ef262e3402373f348fcf",
+    "p5c4": "sha256:9c437b9665a0408c2f2d42ab6bee6d9563ebdb4985ddb5a09aca7b7de0d67e36"
+  },
+  "image_id_mismatch_user_accepted": true,
+  "packages": {
+    "python": "3.12.12",
+    "torch": "2.11.0+das.opt1.dtk2610.2609201632.gf74cd7",
+    "vllm": "0.28.1+dtk2610.torch2110.2610191943.g29071f",
+    "flash_attn": "2.8.4+dtk2610.torch2110.2610191836.g18ee46",
+    "triton": "3.6.0+dtk2610.torch2110.2610171647.g46f0be",
+    "aiter": "0.1.7+dtk2610.torch2110.2610201311.gbc033a"
+  },
+  "source_runtime": "/opt/xuwq_step5_native_prefill_dp16_user_20261020",
+  "source_commit": "1997af79d75cd070938faf77b72c3a0fbe344ab5",
+  "parallel": "DP16TP1EP16",
+  "machines": 4,
+  "cards_per_machine": 4,
+  "concurrency": 64,
+  "input_tokens": 65536,
+  "output_tokens": 1,
+  "max_num_batched_tokens": 8192,
+  "max_model_len": 70000,
+  "mtp_tokens": 3,
+  "rejection_sample_method": "synthetic",
+  "synthetic_acceptance_rates": [
+    0.838992,
+    0.598322,
+    0.362686
+  ],
+  "controls": {
+    "HCU_DP_MOE_PIPE_MIN_TOKENS": 65536,
+    "HCU_DBO_MIN_TOKENS": 4096,
+    "HCU_EP_DIRECT_SUM": 65536,
+    "HCU_SHARED_EXPERTS_STREAM_MIN_TOKENS": 4096,
+    "EP_FUSED_MOE_CHUNK": 65536,
+    "HCU_STEP5_BOUNDED_EP_WORKSPACE": 1,
+    "NCCL_MAX_NCHANNELS": 32
+  },
+  "expert_shape": "E22,N3072,K4096,topk8",
+  "eplb_enabled": false,
+  "placement": {
+    "path": "/var/lib/xuwq_step5_assets/expert_placement_prefill_8192_ep16_20261020.pt",
+    "sha256": "876ac0f5963c51d7e9e0a4629e589de70ef2d2e9ba86b9b20437d8d0beb1bb32",
+    "shape": [
+      88,
+      352
+    ]
+  },
+  "warmup_tps": [
+    35861.8286833219,
+    39439.381888169264
+  ],
+  "formal_rounds": [
+    3,
+    4,
+    5
+  ],
+  "rounds": [
+    {
+      "round": 3,
+      "prefill_tps": 39654.45984167626,
+      "prefill_latency_seconds": 105.77130584418774,
+      "complete_requests": 64,
+      "incomplete_requests": 0,
+      "preemptions": 0,
+      "jit_events": 0,
+      "cache_updates": 0,
+      "mtp_drafted": 672,
+      "mtp_accepted": 416,
+      "mtp_acceptance": 0.6190476190476191
+    },
+    {
+      "round": 4,
+      "prefill_tps": 39655.12310844752,
+      "prefill_latency_seconds": 105.76953672617674,
+      "complete_requests": 64,
+      "incomplete_requests": 0,
+      "preemptions": 0,
+      "jit_events": 0,
+      "cache_updates": 0,
+      "mtp_drafted": 672,
+      "mtp_accepted": 448,
+      "mtp_acceptance": 0.6666666666666666
+    },
+    {
+      "round": 5,
+      "prefill_tps": 39708.08726489075,
+      "prefill_latency_seconds": 105.62845729687251,
+      "complete_requests": 64,
+      "incomplete_requests": 0,
+      "preemptions": 0,
+      "jit_events": 0,
+      "cache_updates": 0,
+      "mtp_drafted": 624,
+      "mtp_accepted": 448,
+      "mtp_acceptance": 0.717948717948718
+    }
+  ],
+  "mean_tps": 39672.55673833818,
+  "sample_stdev_tps": 30.772125674543297,
+  "coefficient_of_variation_percent": 0.07756526980981335,
+  "pooled_short_output_acceptance": 0.6666666666666666,
+  "pooled_acceptance_note": "Output length is one, so this pooled value is not the long-decode acceptance metric; the configured three-position rates define the requested performance protocol.",
+  "previous_image_selected_mean_tps": 39306.0820296047,
+  "improvement_vs_previous_image_percent": 0.9323613288586108,
+  "original_recommended_tps": 29085.030850366908,
+  "improvement_vs_original_recommended_percent": 36.401975787616216,
+  "h200_reference_tps": 69306,
+  "h200_percent": 57.242600551666776,
+  "quality_results_are_separate": {
+    "standard_mtp_gsm8k_100": "96/100",
+    "warning": "Synthetic rejection sampling is performance-only and must not be used as a model-quality score."
+  },
+  "selected_for_requested_performance_protocol": true,
+  "integrity": "All three fixed formal rounds completed 64/64 with zero preemptions, JIT events and cache writes. The new-image result is stable and exceeds the previous selected mean by 0.93%."
+}
