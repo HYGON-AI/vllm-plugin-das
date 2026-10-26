@@ -163,6 +163,7 @@ PY
     fi
 else
     export HCU_STEP5_DENSE_TUNING=0 HCU_STEP5_PREFILL_G2=0 HCU_STEP5_PREFILL_ASM_G1=0 HCU_DP_MOE_PIPE_UNIFORM=0
+    export HCU_STEP5_BOUNDED_EP_WORKSPACE=1
     tokens=32768; max_len=1048576
     case "${STEP5_DECODE_PARALLEL:-dp4tp4}" in
         dp4tp4) tp=4; dp=4; local_dp=1; gpu_util=0.85 ;;
