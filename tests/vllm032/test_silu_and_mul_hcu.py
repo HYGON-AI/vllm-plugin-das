@@ -23,6 +23,7 @@ def test_installed_lightop_silu_matches_reference_and_rollback_paths(
     import torch.nn.functional as functional
 
     from vllm.config import VllmConfig, set_current_vllm_config
+    from vllm.model_executor.layers.activation import SiluAndMul
     from vllm.platforms import current_platform
     from vllm.plugins import load_general_plugins
 
@@ -45,19 +46,20 @@ def test_installed_lightop_silu_matches_reference_and_rollback_paths(
     # A full engine sets this context; this focused kernel test mirrors vLLM's
     # own ``default_vllm_config`` fixture explicitly.
     with set_current_vllm_config(VllmConfig()):
-        layer = HcuSiluAndMul()
+        layer = SiluAndMul()
+        assert isinstance(layer, HcuSiluAndMul)
 
         monkeypatch.setenv("VLLM_HCU_USE_CUSTOM_OPS", "1")
         monkeypatch.setenv("VLLM_HCU_USE_CUSTOM_SILU_AND_MUL", "1")
-        optimized = layer.forward_hip(value)
+        optimized = layer(value)
         torch.cuda.synchronize()
         torch.testing.assert_close(optimized, expected, rtol=2e-2, atol=2e-2)
 
         monkeypatch.setenv("VLLM_HCU_USE_CUSTOM_OPS", "0")
-        master_rollback = layer.forward_hip(value)
+        master_rollback = layer(value)
         torch.testing.assert_close(master_rollback, expected, rtol=2e-2, atol=2e-2)
 
         monkeypatch.setenv("VLLM_HCU_USE_CUSTOM_OPS", "1")
         monkeypatch.setenv("VLLM_HCU_USE_CUSTOM_SILU_AND_MUL", "0")
-        child_rollback = layer.forward_hip(value)
+        child_rollback = layer(value)
         torch.testing.assert_close(child_rollback, expected, rtol=2e-2, atol=2e-2)

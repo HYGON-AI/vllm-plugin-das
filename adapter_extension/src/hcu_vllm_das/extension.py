@@ -8,7 +8,6 @@ import threading
 from packaging.version import InvalidVersion, Version
 
 from hcu_vllm_adapter.extensions import (
-    EXTENSION_API_VERSION,
     ExtensionContext,
     ExtensionSpec,
 )
@@ -17,6 +16,7 @@ from .version import TARGET_VLLM_RELEASE
 
 
 _CAPABILITIES = frozenset({"lightop-silu-and-mul"})
+_IMPLEMENTED_EXTENSION_API_VERSION = 1
 _activation_lock = threading.Lock()
 _activated = False
 
@@ -101,7 +101,7 @@ def extension_spec() -> ExtensionSpec:
 
     return ExtensionSpec(
         name="das-hcu",
-        api_version=EXTENSION_API_VERSION,
+        api_version=_IMPLEMENTED_EXTENSION_API_VERSION,
         priority=100,
         capabilities=_CAPABILITIES,
         activate=activate_extension,

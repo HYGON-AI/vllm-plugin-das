@@ -61,6 +61,43 @@ def test_factory_declares_the_adapter_api_and_only_migrated_capability() -> None
     assert spec.activate is extension.activate_extension
 
 
+def test_factory_does_not_claim_a_future_adapter_api() -> None:
+    code = f"""
+import sys
+from types import ModuleType
+
+adapter = ModuleType("hcu_vllm_adapter")
+adapter.__path__ = []
+extensions = ModuleType("hcu_vllm_adapter.extensions")
+extensions.EXTENSION_API_VERSION = 2
+extensions.ExtensionContext = object
+
+class ExtensionSpec:
+    def __init__(self, *, name, api_version, priority, capabilities, activate):
+        self.name = name
+        self.api_version = api_version
+        self.priority = priority
+        self.capabilities = capabilities
+        self.activate = activate
+
+extensions.ExtensionSpec = ExtensionSpec
+sys.modules["hcu_vllm_adapter"] = adapter
+sys.modules["hcu_vllm_adapter.extensions"] = extensions
+sys.path.insert(0, {os.fspath(PLUGIN_SOURCE_ROOT)!r})
+
+from hcu_vllm_das.extension import extension_spec
+assert extension_spec().api_version == 1
+"""
+    result = subprocess.run(
+        [sys.executable, "-c", code],
+        check=False,
+        capture_output=True,
+        text=True,
+    )
+
+    assert result.returncode == 0, result.stdout + result.stderr
+
+
 def test_discovery_and_factory_import_no_runtime_frameworks() -> None:
     code = f"""
 import sys

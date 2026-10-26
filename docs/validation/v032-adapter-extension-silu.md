@@ -22,7 +22,7 @@ The tested wheel files and SHA256 values are:
 
 ```text
 0c9e3512dccbe5a4018218c710fb46608b4b6776cb5ef21b52d7f73e0cdfcd5d  hcu_vllm_adapter-0.1.0.dev0-py3-none-any.whl
-5e15d2f6fa2897737d8315961212f6435b9724407d8b55de6ba99c73e5c9893f  hcu_vllm_das_plugin-0.1.0.dev0-py3-none-any.whl
+9741f9a5a51c1aac6b88781eea2f4f461c5e640124d739fe7def31d8aafd0ac7  hcu_vllm_das_plugin-0.1.0.dev0-py3-none-any.whl
 da7bda7ce51871b064f957076cfae43b40fee7226711432e88dcf2a5c0c91640  vllm-0.32.0+rocm723-cp312-cp312-linux_x86_64.whl
 ```
 
@@ -55,7 +55,7 @@ The installed `RECORD` content hashes reported by the verifier were:
 ```text
 vllm:                766975ac0bb5d304e435903b782b3ab8295941bdf70ca9929bcc929839c22d40
 hcu-vllm-adapter:    80c6c83cd0a3588ea588dc31c51cbc91cc60c949ff2f950c019c50a266242d07
-hcu-vllm-das-plugin: bade87e7f517bbe1387768870b034f4491b8cffef1dec5fdd25c224f63f9871c
+hcu-vllm-das-plugin: 14a12f48ad8748210d30cf2867d3b9236c5de33af180f8cc85ac1e83f156be47
 ```
 
 ## Live HCU numerical check
@@ -74,7 +74,7 @@ master and operator-specific rollback paths against the same reference.
 
 ## Test-suite status
 
-The vLLM 0.32 release-gate suite completed with `35 passed, 1 skipped`; the
+The vLLM 0.32 release-gate suite completed with `36 passed, 1 skipped`; the
 single skipped case is the opt-in live-HCU test above, which passed separately
 against the installed final wheel (`1 passed`). The installed-state verifier
 also exited 0 against that wheel.

@@ -96,5 +96,11 @@ def test_built_wheel_contains_only_the_new_plugin_namespace(tmp_path: Path) -> N
     assert "[hcu_vllm_adapter.extensions]\n" in entry_points
     assert "das_hcu = hcu_vllm_das.extension:extension_spec\n" in entry_points
     assert any(name == "hcu_vllm_das/__init__.py" for name in names)
+    license_names = {
+        name.rsplit("/", 1)[-1]
+        for name in names
+        if ".dist-info/licenses/" in name
+    }
+    assert license_names == {"LICENSE", "NOTICE"}
     assert not any(name.startswith("vllm_hcu/") for name in names)
     assert not any(name.startswith("tests/") for name in names)
