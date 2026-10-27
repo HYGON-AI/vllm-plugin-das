@@ -1208,6 +1208,14 @@ class MooncakeConnectorWorker:
         self.engine_id: EngineId = engine_id
         self.tp_rank = get_tensor_model_parallel_rank()
         self.tp_size = get_tensor_model_parallel_world_size()
+        pcp_size = vllm_config.parallel_config.prefill_context_parallel_size
+        if self.is_kv_producer and pcp_size > 1:
+            # Mooncake's bootstrap and transfer topology address workers by TP
+            # rank. PCP workers share a tensor-parallel rank, so flatten the
+            # two dimensions for transfer identity only. All replicas handshake
+            # and release their blocks; the MLA transfer plan sends bytes once.
+            self.tp_rank += get_pcp_group().rank_in_group * self.tp_size
+            self.tp_size *= pcp_size
         self.block_len_per_layer: list[int] = []
         self.kv_block_len_per_layer: list[int] = []
         self.registered_layer_names: list[str] = []
