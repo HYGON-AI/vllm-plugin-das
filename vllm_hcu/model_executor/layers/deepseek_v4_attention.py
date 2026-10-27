@@ -248,12 +248,19 @@ class DeepseekV4MultiHeadLatentAttentionWrapper(PluggableLayer):
         self.ln_events = [torch.cuda.Event() for _ in range(4)]
 
         assert cache_config is not None, "DeepseekV4 attention requires cache_config"
+        from vllm_hcu.v1.attention.backends.mla.sparse_swa import (
+            resolve_swa_bounded_replay,
+        )
+
+        # Encoder/APC: exclude SWA from prefix cache when swa_bounded_replay
+        # is on (MRV2, no PCP). See BoundedReplaySlidingWindowMLASpec.
         self.swa_cache_layer = DeepseekV4SWACache(
             head_dim=self.head_dim,
             window_size=self.window_size,
             dtype=torch.uint8,
             prefix=f"{prefix}.swa_cache",
             cache_config=cache_config,
+            bounded_replay=resolve_swa_bounded_replay(mla_modules.vllm_config),
         )
 
         self.mla_attn = DeepseekV4MLAAttention(

@@ -344,7 +344,21 @@ def pcp_local_slot_view(
     if replicated_token_mask is None:
         return local_slots
     assert replicated_token_mask.dtype == torch.bool
-    assert replicated_token_mask.shape == (local_num_tokens,)
+    # Decoder SWA replay may hand a trimmed/padded local batch whose
+    # query_lens-derived mask is shorter/longer than the PCP equal-width
+    # segment (pad-to-num_padded then all_gather). Align to the segment.
+    if replicated_token_mask.numel() != local_num_tokens:
+        if replicated_token_mask.numel() < local_num_tokens:
+            pad = local_num_tokens - int(replicated_token_mask.numel())
+            replicated_token_mask = torch.nn.functional.pad(
+                replicated_token_mask.reshape(-1), (0, pad), value=False
+            )
+        else:
+            replicated_token_mask = replicated_token_mask.reshape(-1)[
+                :local_num_tokens
+            ]
+    else:
+        replicated_token_mask = replicated_token_mask.reshape(-1)
     return torch.where(
         replicated_token_mask,
         slot_mapping[:local_num_tokens],

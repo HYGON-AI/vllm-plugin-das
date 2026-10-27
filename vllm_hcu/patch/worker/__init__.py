@@ -217,11 +217,19 @@ _CORE_CALLBACKS: tuple[_CallbackSpec, ...] = (
     _CallbackSpec(_adapter("core_fix", "patch_deepseek_v32_config")),
     _CallbackSpec(_adapter("core_fix", "patch_deepseek_v41_channel_fp8")),
     _CallbackSpec(_adapter("core_fix", "patch_deepseek_v41_attention")),
+    # APC: set swa_cache_layer.bounded_replay before decoder_replay reads it.
+    _CallbackSpec(_adapter("core_fix", "patch_deepseek_v41_swa_bounded_replay")),
+    # forward_kv before model decoder_replay (write_kv calls attn.forward_kv).
+    _CallbackSpec(_adapter("core_fix", "patch_deepseek_v41_forward_kv")),
     _CallbackSpec(_adapter("core_fix", "patch_deepseek_v41_indexer_k_layout")),
     _CallbackSpec(_adapter("core_fix", "patch_deepseek_v41_dspark_load_weights")),
     _CallbackSpec(_adapter("core_fix", "patch_deepseek_v41_engram_offload")),
     _CallbackSpec(_adapter("core_fix", "patch_deepseek_v41_engram_hash")),
     _CallbackSpec(_adapter("core_fix", "patch_deepseek_v41_model_state")),
+    _CallbackSpec(_adapter("core_fix", "patch_deepseek_v41_decoder_replay")),
+    _CallbackSpec(_adapter("core_fix", "patch_deepseek_v41_decoder_replay_vl")),
+    # model_state prepare_attn / capture_inner after model decoder_replay.
+    _CallbackSpec(_adapter("core_fix", "patch_deepseek_v41_decoder_replay_state")),
     _CallbackSpec(_adapter("core_fix", "patch_hcu_uva_buffer")),
     _CallbackSpec(_adapter("core_fix", "patch_hcu_uva_offloader")),
     _CallbackSpec(_adapter("core_fix", "patch_deepseek_v4_attention")),
@@ -346,8 +354,19 @@ _FRAMEWORK_CALLBACKS: tuple[_CallbackSpec, ...] = (
     _CallbackSpec(
         _adapter("framework_opt", "patch_gpu_worker_shutdown"),
     ),
+    # PCPBatchMetadata for decoder SWA bounded replay under PCP (#62384).
+    _CallbackSpec(
+        _adapter("framework_opt", "patch_pcp_batch_metadata"),
+    ),
     _CallbackSpec(
         _adapter("framework_opt", "patch_mrv2_cudagraph_stream"),
+    ),
+    # ModelState.capture_inner_cudagraphs noop before DeepSeek state override.
+    _CallbackSpec(
+        _adapter("framework_opt", "patch_model_state_capture_inner"),
+    ),
+    _CallbackSpec(
+        _adapter("framework_opt", "patch_gpu_model_runner_capture_inner"),
     ),
     _CallbackSpec(
         _adapter("framework_opt", "patch_pcp_model_state"),
@@ -712,15 +731,70 @@ def prepare_worker_patches(
         return tuple(registrations)
 
 
-def _parallel_backend(vllm_config: object | None) -> str | None:
+def _parallel_config(vllm_config: object | None) -> object | None:
     parallel = getattr(vllm_config, "parallel_config", None)
     if parallel is None and isinstance(vllm_config, dict):
         parallel = vllm_config.get("parallel_config")
+    return parallel
+
+
+def _parallel_attr(parallel: object | None, name: str, default: object = None) -> object:
+    if parallel is None:
+        return default
     if isinstance(parallel, dict):
-        backend = parallel.get("all2all_backend")
-    else:
-        backend = getattr(parallel, "all2all_backend", None)
+        return parallel.get(name, default)
+    return getattr(parallel, name, default)
+
+
+def _parallel_backend(vllm_config: object | None) -> str | None:
+    backend = _parallel_attr(_parallel_config(vllm_config), "all2all_backend")
     return backend if isinstance(backend, str) else None
+
+
+def _uses_all2all(vllm_config: object | None) -> bool:
+    """Mirror vLLM ``ParallelConfig.use_all2all`` for communicator patch gating.
+
+    DeepEP ``device_communicators.all2all`` is only imported when this is true.
+    TP-only EP (DP=1, PCP=1) still selects DeepEP MoE prepare/finalize kernels,
+    but must not require the communicator runtime terminal patch.
+    """
+
+    parallel = _parallel_config(vllm_config)
+    try:
+        data_parallel_size = int(_parallel_attr(parallel, "data_parallel_size", 1) or 1)
+        tensor_parallel_size = int(
+            _parallel_attr(parallel, "tensor_parallel_size", 1) or 1
+        )
+        prefill_context_parallel_size = int(
+            _parallel_attr(parallel, "prefill_context_parallel_size", 1) or 1
+        )
+    except (TypeError, ValueError):
+        return False
+    enable_expert_parallel = bool(
+        _parallel_attr(parallel, "enable_expert_parallel", False)
+    )
+    backend = _parallel_backend(vllm_config)
+    use_sequence_parallel_moe = (
+        backend
+        in {
+            "allgather_reducescatter",
+            "deepep_high_throughput",
+            "deepep_low_latency",
+            "deepep_v2",
+            "flashinfer_nvlink_one_sided",
+            "mori_high_throughput",
+            "mori_low_latency",
+            "nixl_ep",
+        }
+        and enable_expert_parallel
+        and tensor_parallel_size > 1
+        and data_parallel_size > 1
+    )
+    return (
+        data_parallel_size > 1
+        or use_sequence_parallel_moe
+        or (enable_expert_parallel and prefill_context_parallel_size > 1)
+    )
 
 
 def _feature_states(
@@ -729,7 +803,11 @@ def _feature_states(
 ) -> dict[FeatureKey, bool]:
     backend = _parallel_backend(vllm_config)
     deepep_auto = config.deepep_auto
-    deepep = backend in {"deepep_high_throughput", "deepep_low_latency"}
+    # MoE prepare/finalize DeepEP adapters follow the configured backend.
+    # Communicator ``deep_ep_runtime`` (feature ``deepep``) only arms when vLLM
+    # will actually import ``device_communicators.all2all``.
+    deepep_backend = backend in {"deepep_high_throughput", "deepep_low_latency"}
+    deepep = (deepep_backend or deepep_auto) and _uses_all2all(vllm_config)
     # ``pynccl`` is not silently inferred from custom-SP.  Custom-SP has a
     # portable torch.distributed path; only an explicit backend selection may
     # turn the optional RCCL symbol into a required startup capability.
@@ -737,7 +815,7 @@ def _feature_states(
     return {
         "always": True,
         "custom_sp": config.enable_custom_sp,
-        "deepep": deepep or deepep_auto,
+        "deepep": deepep,
         "deepep_high_throughput": (
             backend == "deepep_high_throughput" or deepep_auto
         ),

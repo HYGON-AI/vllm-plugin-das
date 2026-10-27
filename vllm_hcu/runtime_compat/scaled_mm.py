@@ -102,11 +102,72 @@ def _make_lightop_scaled_mm(
     return lightop_scaled_mm
 
 
+def _harden_lightop_utils_cus() -> None:
+    """Make ``lightop.utils`` import-safe under multiprocess spawn.
+
+    Upstream ``lightop.utils`` does ``os.environ["LIGHTOP_GPU_CUS"] = get_CUs()``
+    at import time. ``get_CUs()`` parses ``rocminfo`` and can return ``None``
+    when several EngineCore workers probe at once, which raises
+    ``TypeError: str expected, not NoneType`` and aborts startup. Preload a
+    None-safe copy into ``sys.modules`` before anything else imports lightop.
+    """
+    import importlib.util
+    import os
+    import subprocess
+    import sys
+    from pathlib import Path
+
+    if "lightop.utils" in sys.modules:
+        return
+
+    cus = os.environ.get("LIGHTOP_GPU_CUS")
+    if not cus:
+        for _ in range(5):
+            try:
+                result = subprocess.run(
+                    ["rocminfo"],
+                    stdout=subprocess.PIPE,
+                    stderr=subprocess.PIPE,
+                    text=True,
+                    timeout=60,
+                    check=False,
+                )
+                for line in reversed(result.stdout.splitlines()):
+                    if "compute unit" in line.lower():
+                        cus = line.split(":")[-1].strip() or None
+                        if cus:
+                            break
+                if cus:
+                    break
+            except Exception:
+                continue
+    if not cus:
+        # Cluster default for gfx938 HCU cards used with this plugin.
+        cus = "64"
+    os.environ["LIGHTOP_GPU_CUS"] = str(cus)
+
+    spec = importlib.util.find_spec("lightop.utils")
+    if spec is None or not spec.origin:
+        return
+    source = Path(spec.origin).read_text()
+    needle = 'os.environ["LIGHTOP_GPU_CUS"] = CUs'
+    replacement = (
+        'os.environ["LIGHTOP_GPU_CUS"] = str('
+        'CUs or os.environ.get("LIGHTOP_GPU_CUS") or "64")'
+    )
+    if needle not in source:
+        return
+    module = importlib.util.module_from_spec(spec)
+    sys.modules["lightop.utils"] = module
+    exec(compile(source.replace(needle, replacement, 1), spec.origin, "exec"), module.__dict__)
+
+
 def _resolve_scaled_mm_backend() -> tuple[str, Callable[..., torch.Tensor]]:
     if _custom_quantization_gemm_enabled():
         try:
+            _harden_lightop_utils_cus()
             from lightop.gemm_ops import hipblaslt_w8a8_channelwise_gemm
-        except (AttributeError, ImportError) as exc:
+        except (AttributeError, ImportError, TypeError) as exc:
             raise RuntimeError(
                 "VLLM_HCU_USE_CUSTOM_QUANTIZATION_GEMM requires LightOp "
                 "hipblaslt_w8a8_channelwise_gemm"
