@@ -134,12 +134,33 @@ def apply_to_module(module: ModuleType) -> bool:
         treat_short_extends_as_decodes=True,
     ):
         del treat_short_extends_as_decodes
-        return split_decodes_and_prefills(
+        counts = split_decodes_and_prefills(
             common_attn_metadata,
             decode_threshold=decode_threshold,
             require_uniform=require_uniform,
             treat_short_extends_as_decodes=False,
         )
+        num_decodes = counts[0]
+        if require_uniform and num_decodes:
+            # v0.25.1's uniform-CG shortcut accepts zero-width rows and returns
+            # before checking is_prefilling. PCP virtual padding can produce
+            # those rows in eager batches too: e.g. 20 tokens / 6 rows cannot
+            # be reshaped by the FP8 decode kernel. Respect phase and require
+            # a nonempty, uniform decode prefix; the remainder uses prefill.
+            starts = common_attn_metadata.query_start_loc_cpu
+            widths = starts[1:num_decodes + 1] - starts[:num_decodes]
+            invalid = (widths <= 0) | (widths != widths[0])
+            invalid |= common_attn_metadata.is_prefilling[:num_decodes]
+            if invalid.any().item():
+                num_decodes = invalid.nonzero()[0].item()
+                num_decode_tokens = starts[num_decodes].item()
+                return (
+                    num_decodes,
+                    common_attn_metadata.num_reqs - num_decodes,
+                    num_decode_tokens,
+                    common_attn_metadata.num_actual_tokens - num_decode_tokens,
+                )
+        return counts
 
     # Execute the audited v0.25.1 helper bytecode with only its phase splitter
     # rebound. This preserves its shape, workspace, and chunk construction
@@ -204,10 +225,16 @@ def apply_to_module(module: ModuleType) -> bool:
                 )
             cp_kv_cache_interleave_size = int(cp_kv_cache_interleave_size)
         pcp_world_size = effective_pcp_world_size(pcp_world_size)
-        if not henvs.VLLM_HCU_USE_FP8_MIXED_BATCH:
-            has_fp8_metadata = (
-                getattr(result, "fp8_extra_metadata", None) is not None
-            )
+        has_fp8_metadata = getattr(result, "fp8_extra_metadata", None) is not None
+        # The flag permits mixed kernels; it does not force them. Models with
+        # enough heads still select separate FP8 metadata under its True default.
+        # That metadata needs the PCP splitter regardless of the flag value.
+        separate_pcp_metadata = (
+            pcp_world_size > 1
+            and has_fp8_metadata
+            and not getattr(result, "fp8_use_mixed_batch", False)
+        )
+        if not henvs.VLLM_HCU_USE_FP8_MIXED_BATCH or separate_pcp_metadata:
             if pcp_world_size > 1 and (
                 getattr(result, "fp8_use_mixed_batch", False)
                 or has_fp8_metadata
@@ -238,7 +265,7 @@ def apply_to_module(module: ModuleType) -> bool:
                 result.num_prefills,
                 result.num_decode_tokens,
                 _,
-            ) = split_decodes_and_prefills(
+            ) = pcp_split_decodes_and_prefills(
                 common_attn_metadata,
                 decode_threshold=getattr(
                     self, "reorder_batch_threshold", None
