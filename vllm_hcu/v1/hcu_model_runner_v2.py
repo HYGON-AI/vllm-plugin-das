@@ -218,6 +218,8 @@ class HcuGPUModelRunnerV2(GPUModelRunner):
                 self.req_states,
                 self.block_tables,
             )
+            if getattr(getattr(self, "speculator", None), "pcp_local_prefill", False):
+                self.speculator.pcp_manager = self.pcp_manager
 
     def prepare_inputs(self, scheduler_output, batch_desc):
         input_batch = super().prepare_inputs(scheduler_output, batch_desc)
@@ -338,7 +340,22 @@ class HcuGPUModelRunnerV2(GPUModelRunner):
     def sample_tokens(self, grammar_output):
         execute_model_state = self.execute_model_state
         use_replicated_mtp_batch = False
+        local_mtp_prefill = (
+            self.pcp_manager is not None
+            and bool(getattr(getattr(self, "speculator", None), "pcp_local_prefill", False))
+        )
         if self.pcp_manager is not None and execute_model_state is not None:
+            if local_mtp_prefill:
+                # Sampling consumes global hidden states, but MTP's first
+                # forward must keep the target-local pre-HC residual/order.
+                hidden = execute_model_state.hidden_states
+                getter = getattr(self.model, "get_mtp_target_hidden_states", None)
+                if getter is not None:
+                    hidden = getter()
+                assert hidden is not None
+                self.pcp_manager.draft_target_hidden_states = hidden[
+                    :execute_model_state.input_batch.num_tokens_after_padding
+                ]
             if (
                 execute_model_state.hidden_states is None
                 and not self.is_last_pp_rank
@@ -359,7 +376,9 @@ class HcuGPUModelRunnerV2(GPUModelRunner):
                 hidden_states=restored_hidden_states,
                 input_batch=restored_input_batch,
             )
-            use_replicated_mtp_batch = getattr(self, "speculator", None) is not None
+            use_replicated_mtp_batch = (
+                getattr(self, "speculator", None) is not None and not local_mtp_prefill
+            )
             self.execute_model_state = execute_model_state
         input_batch = (
             None
@@ -392,7 +411,12 @@ class HcuGPUModelRunnerV2(GPUModelRunner):
                     slot_mappings_by_layer=slot_mappings_by_layer,
                 )
                 self.execute_model_state = execute_model_state
-            output = super().sample_tokens(grammar_output)
+            try:
+                output = super().sample_tokens(grammar_output)
+            finally:
+                if local_mtp_prefill:
+                    self.pcp_manager.draft_target_hidden_states = None
+                    self.pcp_manager.draft_prefill_batch = None
         if input_batch is not None:
             synchronize_pp_spec_draft_tokens(self, input_batch)
         return output
