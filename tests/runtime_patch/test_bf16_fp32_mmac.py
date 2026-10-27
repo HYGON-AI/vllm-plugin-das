@@ -71,6 +71,29 @@ def test_supported_limits_buffer_resource_by_bytes(monkeypatch, k, expected):
     assert bf16_fp32_mmac.supported(x, weight) is expected
 
 
+@pytest.mark.parametrize("case", ["cpu", "different_device", "unsupported_arch"])
+def test_direct_entry_rejects_unsupported_tensors(monkeypatch, case):
+    monkeypatch.setattr(
+        bf16_fp32_mmac,
+        "_jit_module",
+        lambda: pytest.fail("unsupported tensors reached the JIT kernel"),
+    )
+    if case == "cpu":
+        x = torch.empty(8, 512, dtype=torch.bfloat16)
+        weight = torch.empty(256, 512, dtype=torch.bfloat16)
+    elif case == "different_device":
+        monkeypatch.setattr(bf16_fp32_mmac, "_device_has_mmac", lambda _: True)
+        x = torch.empty(8, 512, dtype=torch.bfloat16, device="cuda")
+        weight = torch.empty(256, 512, dtype=torch.bfloat16)
+    else:
+        monkeypatch.setattr(bf16_fp32_mmac, "_device_has_mmac", lambda _: False)
+        x = torch.empty(8, 512, dtype=torch.bfloat16, device="cuda")
+        weight = torch.empty(256, 512, dtype=torch.bfloat16, device="cuda")
+
+    with pytest.raises(ValueError, match="does not support"):
+        bf16_fp32_mmac.linear_bf16_fp32_mmac(x, weight)
+
+
 def test_dispatcher_routes_small_m(monkeypatch):
     monkeypatch.setenv("VLLM_HCU_USE_CUSTOM_OPS", "1")
     monkeypatch.setenv("VLLM_HCU_BF16_FP32_MMAC", "1")

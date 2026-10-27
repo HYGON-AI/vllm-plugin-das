@@ -332,4 +332,6 @@ def supported(x: torch.Tensor, weight: torch.Tensor) -> bool:
 
 def linear_bf16_fp32_mmac(x: torch.Tensor, weight: torch.Tensor) -> torch.Tensor:
     """Compute ``x @ weight.T`` for BF16 [M, K] x [N, K] -> FP32 [M, N]."""
+    if not supported(x, weight):
+        raise ValueError("MMAC BF16-to-FP32 GEMM does not support these tensors")
     return _jit_module().linear_bf16_fp32_mmac(x, weight)
