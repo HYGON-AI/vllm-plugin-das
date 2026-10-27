@@ -228,6 +228,14 @@ class _LightOpVisitor(ast.NodeVisitor):
         module = node.module or ""
         for alias in node.names:
             self._reject_getattr_binding(node, alias.asname or alias.name)
+            if (
+                alias.name == "*"
+                and self.relative_path in LEGACY_MODULE_OWNERS
+            ):
+                self._violate(
+                    node,
+                    "wildcard import can shadow builtins in legacy owner",
+                )
         if module == "lmslim" or module.startswith("lmslim."):
             self._violate(node, f"external LMSlim import from {module!r}")
         elif module == "lightop":
@@ -301,7 +309,11 @@ class _LightOpVisitor(ast.NodeVisitor):
                 self.used.add((f"lightop.{self.category_aliases[root.id]}", parts[0]))
             elif root.id in self.legacy_module_aliases:
                 allowed = self.legacy_module_aliases[root.id]
-                if len(parts) != 1 or parts[0] not in allowed:
+                if (
+                    not isinstance(node.ctx, ast.Load)
+                    or len(parts) != 1
+                    or parts[0] not in allowed
+                ):
                     reference = ".".join((root.id, *parts))
                     self._violate(
                         node,
@@ -930,6 +942,50 @@ def test_scanner_rejects_shadowed_getattr_in_legacy_owner(
     violations = scan_lightop_imports(root)
 
     assert any("builtin 'getattr' is shadowed" in item for item in violations)
+
+
+def test_scanner_rejects_wildcard_import_in_legacy_owner(
+    tmp_path: Path,
+) -> None:
+    root = _write_mutation_owner(tmp_path)
+    relative_path, _, _ = next(iter(LEGACY_TOP_LEVEL_MODULE_IMPORTS))
+    owner = tmp_path / relative_path
+    with owner.open("a", encoding="utf-8") as stream:
+        stream.write("\nfrom helpers import *\n")
+
+    violations = scan_lightop_imports(root)
+
+    assert any(
+        "wildcard import can shadow builtins" in item for item in violations
+    )
+
+
+@pytest.mark.parametrize(
+    "statement",
+    [
+        "legacy_native."
+        "fused_deepseek_v4_qnorm_rope_kv_rope_quant_insert_pcp = None",
+        "del legacy_native."
+        "fused_deepseek_v4_qnorm_rope_kv_rope_quant_insert_pcp",
+    ],
+    ids=["store", "delete"],
+)
+def test_scanner_rejects_legacy_member_mutation(
+    tmp_path: Path,
+    statement: str,
+) -> None:
+    root = _write_mutation_owner(tmp_path)
+    relative_path, _, _ = next(iter(LEGACY_TOP_LEVEL_MODULE_IMPORTS))
+    owner = tmp_path / relative_path
+    with owner.open("a", encoding="utf-8") as stream:
+        stream.write(f"\n{statement}\n")
+
+    violations = scan_lightop_imports(root)
+
+    assert any(
+        "unapproved legacy LightOp module attribute" in item
+        for item in violations
+    )
 
 
 def test_scanner_rejects_injected_direct_lmslim_call_with_location(
