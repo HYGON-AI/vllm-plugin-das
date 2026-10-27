@@ -172,9 +172,12 @@ class HcuTritonMLAMetadataBuilder(TritonMLAMetadataBuilder):
                         (num_sms * 4, 8), dtype=torch.int32,
                         device=device,
                     ),
-                    "nsplits": torch.zeros(
-                        max_seqs, dtype=torch.int32, device=device
-                    ),
+            # FIX13: +2 -- a FULL-graph capture pads the batch to the max
+            # and the vendor hands back B_pad+1 split rows; one spare row
+            # keeps that contract satisfiable at the largest padded batch.
+            "nsplits": torch.zeros(
+                max_seqs + 1, dtype=torch.int32, device=device
+            ),
                     "bt": torch.zeros(
                         (max_seqs, self._hcu_bt_width),
                         dtype=torch.int32, device=device,
@@ -340,12 +343,21 @@ class HcuTritonMLAMetadataBuilder(TritonMLAMetadataBuilder):
                 f"hcu plan mismatch: nsplits rows {m} != decodes+1 "
                 f"{num_decodes + 1}"
             )
-        if getattr(self, "_hcu_sched_rows", None) is None:
-            self._hcu_sched_rows = n
-        elif n != self._hcu_sched_rows:
+        # Tile row count is stamped per graph shape (padded_B, query_len,
+        # heads): FULL capture runs several padded batch sizes through the
+        # same builder, so each shape pins its own captured row count and
+        # a later fill of the SAME shape must reproduce it exactly --
+        # replay keeps the captured launch geometry.
+        shape_key = (num_decodes, query_len, q_heads)
+        stamp = getattr(self, "_hcu_sched_stamps", None)
+        if stamp is None:
+            stamp = self._hcu_sched_stamps = {}
+        if shape_key not in stamp:
+            stamp[shape_key] = n
+        elif n != stamp[shape_key]:
             raise RuntimeError(
                 f"hcu plan mismatch: scheduler rows {n} != captured "
-                f"{self._hcu_sched_rows}"
+                f"{stamp[shape_key]} for shape {shape_key}"
             )
 
         # Write section (no-throw): only the walked window is expanded.
@@ -366,8 +378,10 @@ class HcuTritonMLAMetadataBuilder(TritonMLAMetadataBuilder):
         )
         bt3[:, :walk_cols].add_(self._hcu_bt_sub_arange)
         if self._hcu_pool_pages > 0:
+            # Both bounds: min=0 keeps a corrupted/negative id from tipping
+            # below the pool base -- the kernel dereferences ids directly.
             bt3[:, :walk_cols].clamp_(
-                max=self._hcu_pool_pages - 1
+                min=0, max=self._hcu_pool_pages - 1
             )
         # Views of the persistent buffers keep their data_ptr across steps;
         # the captured kernel binds these addresses at capture time.
