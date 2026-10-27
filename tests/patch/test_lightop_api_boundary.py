@@ -96,7 +96,14 @@ class _LightOpVisitor(ast.NodeVisitor):
         # requiring a local import would leave dynamic bindings unscanned.
         self.lmslim_root_aliases: set[str] = {"lmslim"}
         self.category_aliases: dict[str, str] = {}
-        self.legacy_module_aliases: dict[str, frozenset[str]] = {}
+        # Global names are resolved when a function is called, not when its
+        # body is defined. Seed configured aliases so helpers appearing before
+        # the approved import cannot evade the legacy boundary.
+        self.legacy_module_aliases: dict[str, frozenset[str]] = {
+            alias: symbols
+            for (path, alias), symbols in LEGACY_MODULE_ALLOWED_SYMBOLS.items()
+            if path == relative_path
+        }
         self.used: set[tuple[str, str]] = set()
         self.allowed_calls: list[tuple[str, str, int]] = []
         self.allowed_legacy_imports: list[tuple[str, str, str | None, int]] = []
@@ -979,6 +986,29 @@ def test_scanner_rejects_legacy_member_mutation(
     owner = tmp_path / relative_path
     with owner.open("a", encoding="utf-8") as stream:
         stream.write(f"\n{statement}\n")
+
+    violations = scan_lightop_imports(root)
+
+    assert any(
+        "unapproved legacy LightOp module attribute" in item
+        for item in violations
+    )
+
+
+def test_scanner_preloads_legacy_alias_before_import(
+    tmp_path: Path,
+) -> None:
+    root = _write_mutation_owner(tmp_path)
+    relative_path, _, _ = next(iter(LEGACY_TOP_LEVEL_MODULE_IMPORTS))
+    owner = tmp_path / relative_path
+    original = owner.read_text(encoding="utf-8")
+    owner.write_text(
+        "def forbidden_before_import():\n"
+        "    return legacy_native.any_private_kernel()\n"
+        f"{original}"
+        "forbidden_before_import()\n",
+        encoding="utf-8",
+    )
 
     violations = scan_lightop_imports(root)
 
