@@ -456,7 +456,13 @@ def test_flashmla_sparse_mixed_metadata_exposes_pcp_cache_phase(monkeypatch):
             cp_kv_cache_interleave_size=1,
         )
     )
-    common = SimpleNamespace(num_actual_tokens=8)
+    common = SimpleNamespace(
+        num_actual_tokens=8,
+        num_reqs=5,
+        max_query_len=3,
+        query_start_loc_cpu=torch.tensor([0, 1, 2, 3, 5, 8]),
+        is_prefilling=torch.tensor([False, False, False, True, True]),
+    )
 
     metadata = builder.build(0, common)
 
@@ -473,6 +479,7 @@ def _make_flashmla_sparse_separate_metadata_module(
     *,
     get_mla_metadata=lambda: None,
     indirect_split=False,
+    original_mixed_batch=True,
 ):
     from vllm.v1.attention.backends.utils import (
         split_decodes_and_prefills as upstream_split_decodes_and_prefills,
@@ -489,8 +496,8 @@ def _make_flashmla_sparse_separate_metadata_module(
         ):
             del self, common_prefix_len, common_attn_metadata, fast_build
             return SimpleNamespace(
-                fp8_use_mixed_batch=True,
-                fp8_extra_metadata=None,
+                fp8_use_mixed_batch=original_mixed_batch,
+                fp8_extra_metadata=None if original_mixed_batch else SimpleNamespace(),
             )
 
     class FlashMLASparseImpl:
@@ -615,8 +622,23 @@ def test_flashmla_sparse_rejects_helper_from_different_module_globals():
     assert not hasattr(module, adapter._MARKER)
 
 
+@pytest.mark.parametrize(
+    ("use_mixed_batch", "original_mixed_batch"),
+    [(False, True), (False, False), (True, False)],
+)
+@pytest.mark.parametrize(
+    ("starts", "phases", "threshold", "expected"),
+    [
+        ([0, 1, 2, 4, 4], [False, True, True, False], 1, (1, 3, 1, 3)),
+        ([0, 4, 8, 12, 16, 20, 20], [True]*6, 4, (0, 6, 0, 20)),
+        ([0, 4, 8, 12, 16, 20, 20], [False]*2+[True]*4, 4, (2, 4, 8, 12)),
+        ([0, 4, 8, 12, 16, 20, 20], [False]*6, 4, (5, 1, 20, 0)),
+        ([0, 4, 8, 12], [False]*3, 4, (3, 0, 12, 0)),
+        ([0, 4, 8, 10, 14], [False]*4, 4, (2, 2, 8, 6)),
+    ],
+)
 def test_flashmla_sparse_pcp_separate_metadata_keeps_short_extend_as_prefill(
-    monkeypatch,
+    monkeypatch, starts, phases, threshold, expected, use_mixed_batch, original_mixed_batch,
 ):
     """Nested FP8 metadata must use the same PCP phase split as its parent."""
 
@@ -636,6 +658,7 @@ def test_flashmla_sparse_pcp_separate_metadata_keeps_short_extend_as_prefill(
         adapter,
         split_calls,
         get_mla_metadata=cuda_get_mla_metadata,
+        original_mixed_batch=original_mixed_batch,
     )
     import vllm_hcu.v1.attention.ops.flashmla as hcu_flashmla
     from vllm_hcu.platforms import envs as henvs
@@ -653,11 +676,12 @@ def test_flashmla_sparse_pcp_separate_metadata_keeps_short_extend_as_prefill(
     monkeypatch.setattr(
         henvs,
         "VLLM_HCU_USE_FP8_MIXED_BATCH",
-        False,
+        use_mixed_batch,
         raising=False,
     )
     assert adapter.apply_to_module(module)
     builder = builder_cls()
+    builder.reorder_batch_threshold = threshold
     builder.vllm_config = SimpleNamespace(
         parallel_config=SimpleNamespace(
             prefill_context_parallel_size=2,
@@ -665,11 +689,11 @@ def test_flashmla_sparse_pcp_separate_metadata_keeps_short_extend_as_prefill(
         )
     )
     common = SimpleNamespace(
-        num_actual_tokens=4,
-        num_reqs=4,
-        max_query_len=2,
-        query_start_loc_cpu=torch.tensor([0, 1, 2, 4, 4]),
-        is_prefilling=torch.tensor([False, True, True, False]),
+        num_actual_tokens=starts[-1],
+        num_reqs=len(phases),
+        max_query_len=max(b-a for a, b in zip(starts, starts[1:])),
+        query_start_loc_cpu=torch.tensor(starts),
+        is_prefilling=torch.tensor(phases),
     )
 
     metadata = builder.build(0, common)
@@ -686,9 +710,9 @@ def test_flashmla_sparse_pcp_separate_metadata_keeps_short_extend_as_prefill(
         nested.num_prefills,
         nested.num_decode_tokens,
         nested.num_prefill_tokens,
-    ) == (1, 3, 1, 3)
-    assert nested.decode_metadata == "hcu-metadata"
-    assert metadata_calls == ["hcu"]
+    ) == expected
+    assert nested.decode_metadata == ("hcu-metadata" if expected[0] else None)
+    assert metadata_calls == (["hcu"] if expected[0] else [])
     assert split_calls == [False, False]
 
 

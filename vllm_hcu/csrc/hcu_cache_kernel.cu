@@ -884,7 +884,7 @@ void reshape_and_cache_hcu(
   dim3 block(std::min(num_heads * head_size, 512));
 
   const at::OptionalDeviceGuard device_guard(device_of(key));
-  hipStream_t stream = at::hip::getCurrentHIPStream();
+  hipStream_t stream = at::cuda::getCurrentCUDAStream();
 
   // 使用 scalar_type() 替代 dtype()
   DISPATCH_BY_KV_CACHE_DTYPE(key.dtype(), kv_cache_dtype,
@@ -981,7 +981,7 @@ void reshape_and_cache_flash_hcu(
   dim3 grid(num_tokens);
   dim3 block(std::min(num_heads * head_size, 256));
   const at::OptionalDeviceGuard device_guard(device_of(key));
-  hipStream_t stream = at::hip::getCurrentHIPStream();
+  hipStream_t stream = at::cuda::getCurrentCUDAStream();
 
   DISPATCH_BY_KV_CACHE_DTYPE(key.dtype(), kv_cache_dtype,
       CALL_RESHAPE_AND_CACHE_FLASH_HCU);

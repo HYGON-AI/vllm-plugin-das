@@ -4,7 +4,9 @@
 """HCU integration boundary for vLLM's Model Runner V2."""
 
 import functools
+from collections import deque
 from contextlib import nullcontext
+from dataclasses import dataclass
 
 import torch
 
@@ -22,6 +24,30 @@ from vllm_hcu.v1.pcp_manager import maybe_build_pcp_manager
 
 
 _FIXED_WIDTH_PP_BROADCAST_MARKER = "_vllm_hcu_fixed_width_pp_broadcast"
+_PP_DRAFT_QUEUE = "_vllm_hcu_pp_draft_queue"
+
+
+@dataclass
+class _PendingDraftRecv:
+    event: torch.cuda.Event
+    draft_tokens: torch.Tensor
+    idx_mapping: torch.Tensor
+    idx_mapping_np: object
+    gen_at_receive_np: object
+
+
+def _get_pp_draft_queue(model_runner: object) -> deque:
+    queue = getattr(model_runner, _PP_DRAFT_QUEUE, None)
+    if queue is not None:
+        return queue
+
+    pp_handler = getattr(model_runner, "pp_handler")
+    pipeline_depth = len(getattr(pp_handler, "queue", ()))
+    if pipeline_depth == 0:
+        pipeline_depth = int(getattr(pp_handler, "world_size"))
+    queue = deque([None] * pipeline_depth)
+    setattr(model_runner, _PP_DRAFT_QUEUE, queue)
+    return queue
 
 
 def install_fixed_width_pp_sample_broadcast(model_runner: object) -> bool:
@@ -75,9 +101,9 @@ def synchronize_pp_spec_draft_tokens(
     against the real drafts.
 
     Use the sampled-token broadcast stream and group so collective ordering is
-    identical on every rank.  The explicit stream completion is conservative
-    but necessary before a non-last rank publishes the received tensor into
-    its request state.
+    identical on every rank. Non-last ranks defer publishing the received
+    tensor until the same PP microbatch becomes eligible again. This mirrors
+    ``PPHandler`` and keeps last-rank proposal work off the PP critical path.
     """
 
     if getattr(model_runner, "_vllm_hcu_suppress_pp_spec_draft_sync", False):
@@ -99,6 +125,8 @@ def synchronize_pp_spec_draft_tokens(
         broadcast_stream.wait_stream(main_stream)
         if getattr(pp_handler, "is_last_rank"):
             draft_tokens = req_states.draft_tokens[idx_mapping].contiguous()
+            if idx_mapping.is_cuda:
+                idx_mapping.record_stream(broadcast_stream)
         else:
             draft_tokens = torch.empty(
                 (num_reqs, num_speculative_steps),
@@ -110,10 +138,60 @@ def synchronize_pp_spec_draft_tokens(
             src=getattr(pp_handler, "last_rank"),
             group=getattr(pp_handler, "broadcast_group"),
         )
-    broadcast_stream.synchronize()
+        if draft_tokens.is_cuda:
+            draft_tokens.record_stream(broadcast_stream)
+        if not getattr(pp_handler, "is_last_rank"):
+            event = broadcast_stream.record_event()
+            if draft_tokens.is_cuda:
+                draft_tokens.record_stream(main_stream)
 
     if not getattr(pp_handler, "is_last_rank"):
-        req_states.draft_tokens[idx_mapping] = draft_tokens
+        idx_mapping_np = getattr(input_batch, "idx_mapping_np", None)
+        if idx_mapping_np is None:
+            idx_mapping_np = idx_mapping.detach().cpu().numpy()
+        gen_at_receive_np = getattr(pp_handler, "req_idx_gen_np")[
+            idx_mapping_np
+        ].copy()
+        _get_pp_draft_queue(model_runner)[-1] = _PendingDraftRecv(
+            event,
+            draft_tokens,
+            idx_mapping,
+            idx_mapping_np,
+            gen_at_receive_np,
+        )
+    return True
+
+
+def consume_pending_pp_spec_draft_tokens(model_runner: object) -> bool:
+    """Publish drafts when their PP microbatch is scheduled again."""
+
+    pp_handler = getattr(model_runner, "pp_handler", None)
+    if pp_handler is None or getattr(pp_handler, "is_last_rank", False):
+        return False
+
+    queue = _get_pp_draft_queue(model_runner)
+    pending = queue.popleft()
+    queue.append(None)
+    if pending is None:
+        return False
+
+    current_gen = getattr(pp_handler, "req_idx_gen_np")[pending.idx_mapping_np]
+    valid_mask = current_gen == pending.gen_at_receive_np
+    if not valid_mask.any():
+        return False
+
+    main_stream = getattr(pp_handler, "main_stream")
+    main_stream.wait_event(pending.event)
+    if valid_mask.all():
+        idx_mapping = pending.idx_mapping
+        draft_tokens = pending.draft_tokens
+    else:
+        valid_rows = torch.from_numpy(valid_mask.nonzero()[0]).to(
+            device=getattr(model_runner, "device"), dtype=torch.int64
+        )
+        idx_mapping = pending.idx_mapping[valid_rows]
+        draft_tokens = pending.draft_tokens[valid_rows]
+    getattr(model_runner, "req_states").draft_tokens[idx_mapping] = draft_tokens
     return True
 
 
@@ -140,6 +218,8 @@ class HcuGPUModelRunnerV2(GPUModelRunner):
                 self.req_states,
                 self.block_tables,
             )
+            if getattr(getattr(self, "speculator", None), "pcp_local_prefill", False):
+                self.speculator.pcp_manager = self.pcp_manager
 
     def prepare_inputs(self, scheduler_output, batch_desc):
         input_batch = super().prepare_inputs(scheduler_output, batch_desc)
@@ -147,6 +227,10 @@ class HcuGPUModelRunnerV2(GPUModelRunner):
             input_batch = self.pcp_manager.partition_batch(input_batch)
         set_deepep_auto_request_phase(input_batch.is_prefilling_np)
         return input_batch
+
+    def update_pp_decode_requests(self):
+        super().update_pp_decode_requests()
+        consume_pending_pp_spec_draft_tokens(self)
 
     @functools.wraps(GPUModelRunner.execute_model)
     def execute_model(self, *args, **kwargs):
@@ -173,6 +257,60 @@ class HcuGPUModelRunnerV2(GPUModelRunner):
             )
             or 1
         )
+        speculator = getattr(self, "speculator", None)
+        architectures = getattr(
+            getattr(self.vllm_config, "model_config", None), "architectures", ()
+        )
+        profile_chunked_draft = False
+        if (
+            pcp_size > 1
+            and speculator is not None
+            and "HYV4ForCausalLM" in architectures
+        ):
+            from vllm_hcu.models.hy_v4.moe import _hyv4_moe_chunk_size
+
+            profile_chunked_draft = _hyv4_moe_chunk_size() is not None
+        if profile_chunked_draft:
+            # Only draft profiling consumes the replicated global batch. Keep
+            # target profiling outside this scope, including its PCP metadata.
+            original_propose = speculator.propose
+            had_override = "propose" in vars(speculator)
+            global_tokens = self.max_num_tokens
+
+            @functools.wraps(original_propose)
+            def profile_propose(*args, **kwargs):
+                from vllm.v1.worker.gpu.input_batch import InputBatch
+
+                assert kwargs["dummy_run"] and kwargs["is_profile"]
+                assert kwargs["skip_attn_for_dummy_run"]
+                assert kwargs["aux_hidden_states"] is None
+                num_reqs = min(global_tokens, self.max_num_reqs)
+                batch = InputBatch.make_dummy(
+                    num_reqs, global_tokens, self.input_buffers
+                )
+                hidden = kwargs["last_hidden_states"]
+                kwargs.update(
+                    input_batch=batch,
+                    last_hidden_states=hidden.new_zeros((global_tokens, *hidden.shape[1:])),
+                    num_sampled=torch.ones(num_reqs, dtype=torch.int32, device=hidden.device),
+                    num_rejected=torch.zeros(num_reqs, dtype=torch.int32, device=hidden.device),
+                    attn_metadata=None,
+                    slot_mappings=None,
+                )
+                with replicated_mtp_batch_scope():
+                    return original_propose(*args, **kwargs)
+
+            speculator.propose = profile_propose
+            self.max_num_tokens = max(1, (global_tokens // pcp_size) * 9 // 8)
+            try:
+                return super().profile_run()
+            finally:
+                self.max_num_tokens = global_tokens
+                if had_override:
+                    speculator.propose = original_propose
+                else:
+                    del speculator.propose
+
         if pcp_size <= 1:
             return super().profile_run()
 
@@ -202,7 +340,22 @@ class HcuGPUModelRunnerV2(GPUModelRunner):
     def sample_tokens(self, grammar_output):
         execute_model_state = self.execute_model_state
         use_replicated_mtp_batch = False
+        local_mtp_prefill = (
+            self.pcp_manager is not None
+            and bool(getattr(getattr(self, "speculator", None), "pcp_local_prefill", False))
+        )
         if self.pcp_manager is not None and execute_model_state is not None:
+            if local_mtp_prefill:
+                # Sampling consumes global hidden states, but MTP's first
+                # forward must keep the target-local pre-HC residual/order.
+                hidden = execute_model_state.hidden_states
+                getter = getattr(self.model, "get_mtp_target_hidden_states", None)
+                if getter is not None:
+                    hidden = getter()
+                assert hidden is not None
+                self.pcp_manager.draft_target_hidden_states = hidden[
+                    :execute_model_state.input_batch.num_tokens_after_padding
+                ]
             if (
                 execute_model_state.hidden_states is None
                 and not self.is_last_pp_rank
@@ -223,7 +376,9 @@ class HcuGPUModelRunnerV2(GPUModelRunner):
                 hidden_states=restored_hidden_states,
                 input_batch=restored_input_batch,
             )
-            use_replicated_mtp_batch = getattr(self, "speculator", None) is not None
+            use_replicated_mtp_batch = (
+                getattr(self, "speculator", None) is not None and not local_mtp_prefill
+            )
             self.execute_model_state = execute_model_state
         input_batch = (
             None
@@ -256,7 +411,12 @@ class HcuGPUModelRunnerV2(GPUModelRunner):
                     slot_mappings_by_layer=slot_mappings_by_layer,
                 )
                 self.execute_model_state = execute_model_state
-            output = super().sample_tokens(grammar_output)
+            try:
+                output = super().sample_tokens(grammar_output)
+            finally:
+                if local_mtp_prefill:
+                    self.pcp_manager.draft_target_hidden_states = None
+                    self.pcp_manager.draft_prefill_batch = None
         if input_batch is not None:
             synchronize_pp_spec_draft_tokens(self, input_batch)
         return output
@@ -265,5 +425,6 @@ class HcuGPUModelRunnerV2(GPUModelRunner):
 __all__ = [
     "HcuGPUModelRunnerV2",
     "install_fixed_width_pp_sample_broadcast",
+    "consume_pending_pp_spec_draft_tokens",
     "synchronize_pp_spec_draft_tokens",
 ]

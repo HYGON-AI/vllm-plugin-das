@@ -481,6 +481,7 @@ def test_hyv4_pp2_mtp3_current_sample_body_restores_and_synchronizes(
     events = []
     batch = SimpleNamespace(req_ids=["b", "a"], num_reqs=2,
                             idx_mapping=torch.tensor([3, 1]),
+                            idx_mapping_np=np.array([3, 1]),
                             query_start_loc=torch.tensor([0, 1, 2]))
     hidden = torch.ones(2, 4)
     drafts = torch.tensor([[101, 102, 103], [201, 202, 203]])
@@ -509,7 +510,14 @@ def test_hyv4_pp2_mtp3_current_sample_body_restores_and_synchronizes(
                         lambda slots, cache: {"draft": slots})
     class Stream:
         def wait_stream(self, other): pass
-        def synchronize(self): events.append("draft_complete")
+        def record_event(self):
+            events.append("draft_queued")
+            return "draft_event"
+        def wait_event(self, event):
+            assert event == "draft_event"
+            events.append("draft_complete")
+        def synchronize(self):
+            pytest.fail("draft broadcast must not synchronize the host")
     def sample_broadcast(ids, *args):
         assert ids.shape == (2, 4)
         assert ids[:, 0].tolist() == [11, 21]
@@ -518,7 +526,8 @@ def test_hyv4_pp2_mtp3_current_sample_body_restores_and_synchronizes(
         is_last_rank=is_last, last_rank=4, max_sample_len=4,
         broadcast=sample_broadcast,
         receive=lambda b: events.append("target_width4") or True,
-        broadcast_stream=Stream(), main_stream=object(), broadcast_group="pp")
+        broadcast_stream=Stream(), main_stream=Stream(), broadcast_group="pp",
+        world_size=2, req_idx_gen_np=np.zeros(5, dtype=np.int32))
     adapter.install_fixed_width_pp_sample_broadcast(runner)
     monkeypatch.setattr(adapter.torch.cuda, "stream", lambda _: contextlib.nullcontext())
     def broadcast(ids, *, src, group):
@@ -558,9 +567,13 @@ def test_hyv4_pp2_mtp3_current_sample_body_restores_and_synchronizes(
         assert "draft_width3" not in events
     else:
         runner.sample_tokens(None)
+        if not is_last:
+            assert runner.req_states.draft_tokens[batch.idx_mapping].eq(0).all()
+            assert adapter.consume_pending_pp_spec_draft_tokens(runner) is False
+            assert adapter.consume_pending_pp_spec_draft_tokens(runner) is True
         torch.testing.assert_close(runner.req_states.draft_tokens[batch.idx_mapping], drafts)
         assert events.index("target_width4") < events.index("draft_width3")
-        assert events[-1] == "draft_complete"
+        assert ("draft_complete" in events) is (not is_last)
     assert runner.execute_model_state is None
     assert pcp.effective_pcp_world_size(4) == 4
     assert ("propose" in events) is is_last
@@ -1351,3 +1364,88 @@ def test_profile_run_restores_max_num_tokens_on_exception(
         runner.profile_run()
 
     assert runner.max_num_tokens == 4096
+
+
+@pytest.mark.parametrize("fail", [False, True])
+@pytest.mark.parametrize("chunk", [None, "1024"])
+def test_hyv4_profile_chunks_only_draft_and_restores_propose(
+    pcp_runner_module, monkeypatch, fail, chunk,
+):
+    from vllm_hcu.models.hy_v4 import moe
+    from vllm_hcu.model_executor.layers.attention.pcp import in_replicated_mtp_batch
+
+    runner_module, _ = pcp_runner_module
+    monkeypatch.delenv("VLLM_HCU_HYV4_MOE_CHUNK_SIZE", raising=False)
+    if chunk is not None:
+        monkeypatch.setenv("VLLM_HCU_HYV4_MOE_CHUNK_SIZE", chunk)
+    monkeypatch.delenv("VLLM_HCU_ENABLE_LINEAR_GATE_PCP_SHARD", raising=False)
+    calls = []
+    layer = object.__new__(moe.HYV4MoEFused)
+    torch.nn.Module.__init__(layer)
+
+    class Gate(torch.nn.Module):
+        def forward(self, hidden_states):
+            return hidden_states, None
+
+    layer.gate = Gate()
+
+    class Experts(torch.nn.Module):
+        def forward(self, *, hidden_states, router_logits):
+            calls.append((in_replicated_mtp_batch(), len(hidden_states)))
+            return hidden_states + 1
+
+    layer.experts = Experts()
+    inputs = torch.zeros((1152, 4))
+
+    from vllm.v1.worker.gpu.input_batch import InputBatch
+
+    def make_dummy(num_reqs, num_tokens, buffers):
+        return SimpleNamespace(num_reqs=num_reqs, num_tokens=num_tokens)
+
+    monkeypatch.setattr(InputBatch, "make_dummy", staticmethod(make_dummy))
+
+    class Speculator:
+        def propose(self, **kwargs):
+            hidden = kwargs["last_hidden_states"]
+            expected = 8192 if chunk else 1152
+            assert kwargs["input_batch"].num_tokens == expected
+            assert hidden.shape == (expected, 4)
+            assert len(kwargs["num_sampled"]) == kwargs["input_batch"].num_reqs
+            torch.testing.assert_close(layer(hidden), hidden + 1)
+            if fail:
+                raise RuntimeError("draft profile failed")
+
+    def dummy_run(self, num_tokens):
+        assert num_tokens == 1152
+        layer(inputs)  # Target remains outside replicated draft scope.
+        self.speculator.propose(
+            dummy_run=True, is_profile=True, skip_attn_for_dummy_run=True,
+            input_batch=make_dummy(16, num_tokens, None),
+            last_hidden_states=inputs, aux_hidden_states=None,
+            num_sampled=torch.ones(16), num_rejected=torch.zeros(16),
+        )
+
+    def profile_run(self):
+        self._dummy_run(self.max_num_tokens)
+
+    monkeypatch.setattr(runner_module.GPUModelRunner, "profile_run", profile_run, raising=False)
+    monkeypatch.setattr(runner_module.GPUModelRunner, "_dummy_run", dummy_run, raising=False)
+    config = _config(8)
+    config.model_config = SimpleNamespace(architectures=["HYV4ForCausalLM"])
+    runner = runner_module.HcuGPUModelRunnerV2(config, "hcu:0")
+    runner.max_num_tokens = 8192
+    runner.max_num_reqs = 16
+    runner.input_buffers = object()
+    runner.speculator = Speculator()
+    if fail:
+        with pytest.raises(RuntimeError, match="draft profile failed"):
+            runner.profile_run()
+    else:
+        runner.profile_run()
+    assert calls == (
+        [(False, 1152)] + [(True, 1024)] * 8
+        if chunk else [(False, 1152), (False, 1152)]
+    )
+    assert runner.max_num_tokens == 8192
+    assert not in_replicated_mtp_batch()
+    assert "propose" not in vars(runner.speculator)

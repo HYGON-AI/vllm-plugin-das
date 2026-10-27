@@ -19,6 +19,7 @@ from torch import nn
 from torch.nn.parameter import Parameter
 from transformers import DeepseekV2Config, DeepseekV3Config, PretrainedConfig
 
+import vllm.model_executor.layers.attention.mla_attention as upstream_mla
 from vllm.compilation.breakable_cudagraph import eager_break_during_capture
 from vllm.config import CacheConfig, VllmConfig, get_current_vllm_config
 from vllm.config.cache import CacheDType
@@ -57,9 +58,74 @@ from vllm.v1.attention.backend import (
 from vllm.v1.attention.selector import get_attn_backend
 from vllm.v1.kv_cache_interface import KVCacheSpec, get_kv_quant_mode
 
+from vllm_hcu.platforms import envs as henvs
+from vllm_hcu.utils.multi_stream_utils import maybe_execute_in_parallel
+
 from .fp8_kv_dequant import LightOpKVReuseState
 
 logger = init_logger(__name__)
+
+_attn_input_stream: torch.cuda.Stream | None = None
+
+
+def _get_attn_input_stream() -> torch.cuda.Stream | None:
+    """Return the process-local HYV4 attention projection stream."""
+    if not (
+        henvs.VLLM_HCU_USE_CUSTOM_OPS
+        and henvs.VLLM_HCU_ENABLE_HYV4_ATTN_INPUT_OVERLAP
+    ):
+        return None
+    global _attn_input_stream
+    if _attn_input_stream is None:
+        _attn_input_stream = torch.cuda.Stream()
+    return _attn_input_stream
+
+
+def _quantize_int8(
+    value: torch.Tensor,
+) -> tuple[torch.Tensor, torch.Tensor]:
+    from lightop.quant import per_token_quant_int8
+
+    return per_token_quant_int8(value)
+
+
+def _linear_supports_quanted_inputs(layer: nn.Module) -> bool:
+    """Return whether the public layer can safely consume an HCU INT8 pair."""
+    hcu_forward = getattr(layer, "_forward_with_hcu_quanted", None)
+    weight = getattr(layer, "weight", None)
+    quant_method = getattr(layer, "quant_method", None)
+    supports = getattr(quant_method, "supports_quanted_inputs", None)
+    if (
+        not callable(hcu_forward)
+        or getattr(weight, "dtype", None) is not torch.int8
+        or not callable(supports)
+    ):
+        return False
+    try:
+        if not bool(supports()):
+            return False
+        scheme = getattr(layer, "scheme", None)
+        if scheme is None:
+            return True
+        scheme_supports = getattr(scheme, "supports_quanted_inputs", None)
+        return callable(scheme_supports) and bool(scheme_supports())
+    except (AttributeError, RuntimeError, TypeError, ValueError):
+        return False
+
+
+def _linear_forward(
+    layer: nn.Module,
+    value: torch.Tensor,
+    x_and_scale_quanted: tuple[torch.Tensor, torch.Tensor] | None = None,
+):
+    """Use the private HCU path only when a pair has a capable consumer."""
+    if (
+        x_and_scale_quanted is not None
+        and _linear_supports_quanted_inputs(layer)
+    ):
+        return layer._forward_with_hcu_quanted(value, x_and_scale_quanted)
+    return layer(value)
+
 
 _SPARSE_LAYER_TYPES = (
     "sparse_attention",
@@ -340,10 +406,20 @@ class Indexer(nn.Module):
         qr: torch.Tensor,
         positions: torch.Tensor,
         rotary_emb: nn.Module,
+        qr_and_scale_quanted: tuple[torch.Tensor, torch.Tensor] | None = None,
     ) -> torch.Tensor:
-        hidden_states, q_quant, k, weights = self.prepare_inputs(
-            hidden_states, qr, positions, rotary_emb
-        )
+        if qr_and_scale_quanted is None:
+            hidden_states, q_quant, k, weights = self.prepare_inputs(
+                hidden_states, qr, positions, rotary_emb
+            )
+        else:
+            hidden_states, q_quant, k, weights = self.prepare_inputs(
+                hidden_states,
+                qr,
+                positions,
+                rotary_emb,
+                qr_and_scale_quanted=qr_and_scale_quanted,
+            )
         return self.indexer_op(hidden_states, q_quant, k, weights)
 
     def prepare_inputs(
@@ -352,9 +428,10 @@ class Indexer(nn.Module):
         qr: torch.Tensor,
         positions: torch.Tensor,
         rotary_emb: nn.Module,
+        qr_and_scale_quanted: tuple[torch.Tensor, torch.Tensor] | None = None,
     ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
         """Build the quantized query, key and per-head weights of the indexer."""
-        q, _ = self.wq_b(qr)
+        q, _ = _linear_forward(self.wq_b, qr, qr_and_scale_quanted)
         q = q.view(-1, self.n_head, self.head_dim)
         # Checkpoint (PTM) layout: pe occupies the LAST rope_dim dims.
         q_nope, q_pe = torch.split(
@@ -428,12 +505,44 @@ class HYV4MLAAttentionLayer(MLAAttention):
         output_shape: torch.Size | None = None,
         q_dcp_replicated: torch.Tensor | None = None,
         dcp_a2a_overlap_fn: Callable[[], None] | None = None,
+        output: torch.Tensor | None = None,
     ) -> torch.Tensor:
-        """Forward local Q while exposing group-replicated Q to decode."""
+        """Forward local Q into an optional caller-owned output buffer."""
         self._hcu_q_dcp_replicated = q_dcp_replicated
         self._hcu_dcp_a2a_overlap_fn = dcp_a2a_overlap_fn
         try:
-            return super().forward(q, kv_c_normed, k_pe, output_shape)
+            if output is None or self.use_direct_call:
+                result = super().forward(q, kv_c_normed, k_pe, output_shape)
+                if output is None:
+                    return result
+                output.copy_(result)
+                return output
+
+            if self.calculate_kv_scales:
+                torch.ops.vllm.maybe_calc_kv_scales(
+                    q,
+                    kv_c_normed,
+                    k_pe,
+                    upstream_mla._encode_layer_name(self.layer_name),
+                )
+
+            encoded = upstream_mla._encode_layer_name(self.layer_name)
+            kv_cache_dummy_dep = torch.ops.vllm.unified_mla_kv_cache_update(
+                kv_c_normed,
+                k_pe,
+                encoded,
+                self.kv_cache_dtype,
+                self._k_scale,
+            )
+            torch.ops.vllm.unified_mla_attention_with_output(
+                q,
+                kv_c_normed,
+                k_pe,
+                output,
+                encoded,
+                kv_cache_dummy_dep=kv_cache_dummy_dep,
+            )
+            return output
         finally:
             self._hcu_q_dcp_replicated = None
             self._hcu_dcp_a2a_overlap_fn = None
@@ -1045,6 +1154,17 @@ class HYV4MLAAttention(nn.Module):
                 quant_config=quant_config,
                 prefix=f"{prefix}.q_proj",
             )
+        self.enable_reuse_int8_quant = bool(
+            henvs.VLLM_HCU_USE_CUSTOM_OPS
+            and henvs.VLLM_HCU_USE_FUSED_RMS_QUANT
+        )
+        self.attn_input_stream = _get_attn_input_stream()
+        self.attn_input_start_event = (
+            torch.cuda.Event() if self.attn_input_stream is not None else None
+        )
+        self.attn_input_done_event = (
+            torch.cuda.Event() if self.attn_input_stream is not None else None
+        )
         self.kv_a_layernorm = RMSNorm(self.kv_lora_rank, eps=config.rms_norm_eps)
         self.kv_b_proj = ColumnParallelLinear(
             self.kv_lora_rank,
@@ -1250,25 +1370,74 @@ class HYV4MLAAttention(nn.Module):
         positions: torch.Tensor,
         hidden_states: torch.Tensor,
         llama_4_scaling: torch.Tensor | None = None,
+        x_and_scale_quanted: tuple[torch.Tensor, torch.Tensor] | None = None,
     ) -> torch.Tensor:
-        q_c = None
-        if self.q_lora_rank is not None:
-            assert self.q_a_proj is not None
-            assert self.q_a_layernorm is not None
-            assert self.q_b_proj is not None
-            q_c = self.q_a_proj(hidden_states)[0]
-            q_c = self.q_a_layernorm(q_c)
-            q_proj_layer = self.q_b_proj
-            q = q_proj_layer(q_c)[0]
-        else:
-            assert self.q_proj is not None
-            q_proj_layer = self.q_proj
-            q = q_proj_layer(hidden_states)[0]
+        input_projection = (
+            self.q_a_proj if self.q_lora_rank is not None else self.q_proj
+        )
+        if (
+            x_and_scale_quanted is None
+            and getattr(self, "enable_reuse_int8_quant", False)
+            and input_projection is not None
+            and self.kv_a_proj_with_mqa is not None
+            and _linear_supports_quanted_inputs(input_projection)
+            and _linear_supports_quanted_inputs(self.kv_a_proj_with_mqa)
+        ):
+            x_and_scale_quanted = _quantize_int8(hidden_states)
 
-        assert self.kv_a_proj_with_mqa is not None
-        kv_lora = self.kv_a_proj_with_mqa(hidden_states)[0]
-        kv_c, k_pe = kv_lora.split([self.kv_lora_rank, self.qk_rope_head_dim], dim=-1)
-        kv_c_normed = self.kv_a_layernorm(kv_c)
+        def project_q():
+            q_c = None
+            q_c_and_scale_quanted = None
+            if self.q_lora_rank is not None:
+                assert self.q_a_proj is not None
+                assert self.q_a_layernorm is not None
+                assert self.q_b_proj is not None
+                q_c = _linear_forward(
+                    self.q_a_proj, hidden_states, x_and_scale_quanted
+                )[0]
+                q_c = self.q_a_layernorm(q_c)
+                if (
+                    getattr(self, "enable_reuse_int8_quant", False)
+                    and _linear_supports_quanted_inputs(self.q_b_proj)
+                ):
+                    q_c_and_scale_quanted = _quantize_int8(q_c)
+                q_proj_layer = self.q_b_proj
+                q = _linear_forward(
+                    q_proj_layer, q_c, q_c_and_scale_quanted
+                )[0]
+            else:
+                assert self.q_proj is not None
+                q_proj_layer = self.q_proj
+                q = _linear_forward(
+                    q_proj_layer, hidden_states, x_and_scale_quanted
+                )[0]
+            return q_c, q_c_and_scale_quanted, q_proj_layer, q
+
+        def project_kv():
+            assert self.kv_a_proj_with_mqa is not None
+            kv_lora = _linear_forward(
+                self.kv_a_proj_with_mqa,
+                hidden_states,
+                x_and_scale_quanted,
+            )[0]
+            kv_c, k_pe = kv_lora.split(
+                [self.kv_lora_rank, self.qk_rope_head_dim], dim=-1
+            )
+            return self.kv_a_layernorm(kv_c), k_pe
+
+        attn_input_stream = getattr(self, "attn_input_stream", None)
+        if attn_input_stream is None:
+            q_result, kv_result = project_q(), project_kv()
+        else:
+            q_result, kv_result = maybe_execute_in_parallel(
+                project_q,
+                project_kv,
+                self.attn_input_start_event,
+                self.attn_input_done_event,
+                attn_input_stream,
+            )
+        q_c, q_c_and_scale_quanted, q_proj_layer, q = q_result
+        kv_c_normed, k_pe = kv_result
 
         q_heads = self.num_local_heads
         if self.dcp_q_replicate:
@@ -1298,6 +1467,10 @@ class HYV4MLAAttention(nn.Module):
         attn_out = torch.empty(
             output_shape, dtype=hidden_states.dtype, device=hidden_states.device
         )
+        q_c_quanted = None
+        q_c_scale = None
+        if q_c_and_scale_quanted is not None:
+            q_c_quanted, q_c_scale = q_c_and_scale_quanted
         self._indexer_and_attn(
             hidden_states,
             q_c,
@@ -1307,6 +1480,8 @@ class HYV4MLAAttention(nn.Module):
             k_pe,
             attn_out,
             q_dcp_replicated,
+            q_c_quanted=q_c_quanted,
+            q_c_scale=q_c_scale,
         )
 
         if (
@@ -1337,6 +1512,8 @@ class HYV4MLAAttention(nn.Module):
         k_pe: torch.Tensor,
         out: torch.Tensor,  # [num_tokens, heads * v_head_dim], written in place
         q_dcp_replicated: torch.Tensor | None = None,
+        q_c_quanted: torch.Tensor | None = None,
+        q_c_scale: torch.Tensor | None = None,
     ) -> None:
         """Run the lightning indexer and MLA attention in one eager segment.
 
@@ -1347,17 +1524,31 @@ class HYV4MLAAttention(nn.Module):
         ``unified_mla_attention_with_output`` breaks short-circuit here, since
         the capture is no longer active inside an eager segment.
         """
+        if (q_c_quanted is None) != (q_c_scale is None):
+            raise ValueError(
+                "q_c_quanted and q_c_scale must be provided together"
+            )
+        q_c_and_scale_quanted = (
+            (q_c_quanted, q_c_scale)
+            if q_c_quanted is not None and q_c_scale is not None
+            else None
+        )
         if self.indexer is not None and self.is_sparse and not self.skip_topk:
-            self.indexer(hidden_states, q_c, positions, self.indexer_rope_emb)
+            self.indexer(
+                hidden_states,
+                q_c,
+                positions,
+                self.indexer_rope_emb,
+                qr_and_scale_quanted=q_c_and_scale_quanted,
+            )
         if self.gate_a2a_stream is None:
-            out.copy_(
-                self.mla_attn(
-                    q,
-                    kv_c_normed,
-                    k_pe,
-                    output_shape=out.shape,
-                    q_dcp_replicated=q_dcp_replicated,
-                )
+            self.mla_attn(
+                q,
+                kv_c_normed,
+                k_pe,
+                output_shape=out.shape,
+                q_dcp_replicated=q_dcp_replicated,
+                output=out,
             )
             return
 
@@ -1367,15 +1558,14 @@ class HYV4MLAAttention(nn.Module):
         def compute_gate() -> None:
             gate_scores.append(self.linear_gate(hidden_states)[0])
 
-        out.copy_(
-            self.mla_attn(
-                q,
-                kv_c_normed,
-                k_pe,
-                output_shape=out.shape,
-                q_dcp_replicated=q_dcp_replicated,
-                dcp_a2a_overlap_fn=compute_gate,
-            )
+        self.mla_attn(
+            q,
+            kv_c_normed,
+            k_pe,
+            output_shape=out.shape,
+            q_dcp_replicated=q_dcp_replicated,
+            dcp_a2a_overlap_fn=compute_gate,
+            output=out,
         )
         # Dummy/profile forwards may have no live DCP metadata and therefore
         # never enter the A2A call site. Preserve correctness in that case.

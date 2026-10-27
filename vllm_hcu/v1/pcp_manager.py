@@ -112,6 +112,9 @@ class HcuPCPManager:
         self._req_states = req_states
         self._block_tables = block_tables
         self._global_batch: InputBatch | None = None
+        self._local_batch: InputBatch | None = None
+        self.draft_prefill_batch: InputBatch | None = None
+        self.draft_target_hidden_states: torch.Tensor | None = None
         self._global_attn_ready = False
         self._hidden_restore_idx: torch.Tensor | None = None
         self._padded_gather_idx: torch.Tensor | None = None
@@ -430,6 +433,8 @@ class HcuPCPManager:
                 "PCP spec decode requires per-request draft-token counts"
             )
         self._global_batch = input_batch
+        self.draft_prefill_batch = None
+        self.draft_target_hidden_states = None
         self._global_has_prefill = bool(input_batch.is_prefilling_np.any())
         self._global_attn_ready = False
         segments_by_rank, per_rank_num_tokens = self._build_batch_layout(input_batch)
@@ -658,7 +663,7 @@ class HcuPCPManager:
                     "PCP+MTP draft tokens are only valid for decode requests"
                 )
             local_num_draft_tokens = int(local_num_draft_tokens_per_req.sum())
-        return replace(
+        self._local_batch = replace(
             input_batch,
             req_ids=[input_batch.req_ids[index] for index in global_req_indices],
             num_reqs=num_local_reqs,
@@ -695,6 +700,54 @@ class HcuPCPManager:
             cu_num_logits=cu_num_logits,
             cu_num_logits_np=cu_num_logits_np,
             prompt_lens=None,
+        )
+        return self._local_batch
+
+    def prepare_draft_prefill(
+        self, input_batch: InputBatch, input_ids: torch.Tensor
+    ) -> None:
+        """Reuse the target-local layout for shifted global MTP input IDs.
+
+        Backport of vLLM #56107. HCU virtual padding rows are not global
+        tokens and must remain zero-filled rather than acquire a KV write.
+        """
+        if input_batch is not self._global_batch or self._local_batch is None:
+            return
+        local = self._local_batch
+        local.input_ids.zero_()
+        for segment in self._local_segments:
+            size = segment.num_actual_tokens
+            if size:
+                start = segment.local_slice.start
+                local.input_ids[start:start + size].copy_(
+                    input_ids[segment.global_slice]
+                )
+        self.draft_prefill_batch = local
+
+    def get_draft_input_buffers(self, input_buffers):
+        return self.draft_prefill_batch or input_buffers
+
+    def restore_draft_prefill(self, last_hidden_states, hidden_states):
+        """Restore global request order before selecting the first draft."""
+        if self.draft_prefill_batch is None:
+            return last_hidden_states, hidden_states
+        try:
+            restored = self.restore_hidden_states(last_hidden_states)
+            feedback = (
+                restored if hidden_states is last_hidden_states
+                else self.restore_hidden_states(hidden_states)
+            )
+            return restored, feedback
+        finally:
+            self.draft_prefill_batch = None
+
+    def refresh_draft_block_tables(self, input_batch: InputBatch):
+        """Populate canonical global rows before replicated draft decodes."""
+        if input_batch is not self._global_batch:
+            raise ValueError("draft block tables require the current global batch")
+        return self._block_tables.gather_block_tables(
+            input_batch.idx_mapping,
+            num_reqs_padded=input_batch.num_reqs_after_padding,
         )
 
     def prepare_attn(
