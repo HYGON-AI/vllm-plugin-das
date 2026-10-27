@@ -255,11 +255,19 @@ class _LightOpVisitor(ast.NodeVisitor):
                         node,
                         f"unapproved legacy LightOp module attribute {reference!r}",
                     )
+                # Do not visit the root Name: this exact attribute lookup is
+                # the only non-getattr use permitted for the legacy module.
+                return
         self.generic_visit(node)
 
     def visit_Name(self, node: ast.Name) -> None:
         if node.id in self.lmslim_root_aliases:
             self._violate(node, f"external LMSlim root {node.id!r}")
+        if node.id in self.legacy_module_aliases:
+            self._violate(
+                node,
+                f"bare legacy LightOp module use {node.id!r}",
+            )
 
     def visit_Call(self, node: ast.Call) -> None:
         direct_lmslim_call: str | None = None
@@ -380,6 +388,15 @@ class _LightOpVisitor(ast.NodeVisitor):
                         node,
                         "unapproved legacy LightOp module attribute lookup",
                     )
+                # The module Name is valid only as the owner of this guarded
+                # lookup. Visit every other expression so nested violations
+                # are still detected without treating the owner as a bare use.
+                self.visit(node.func)
+                for argument in node.args[1:]:
+                    self.visit(argument)
+                for keyword in node.keywords:
+                    self.visit(keyword.value)
+                return
         self.generic_visit(node)
 
 
@@ -762,6 +779,31 @@ def test_scanner_restricts_legacy_module_alias(
         "unapproved legacy LightOp module" in item
         for item in violations
     )
+
+
+@pytest.mark.parametrize(
+    "source",
+    [
+        "alias = legacy_native\nalias.any_private_kernel()",
+        "consume(legacy_native)",
+        "return legacy_native",
+    ],
+    ids=["copied", "passed", "returned"],
+)
+def test_scanner_rejects_bare_legacy_module_uses(
+    tmp_path: Path,
+    source: str,
+) -> None:
+    root = _write_mutation_owner(tmp_path)
+    relative_path, _, _ = next(iter(LEGACY_TOP_LEVEL_MODULE_IMPORTS))
+    owner = tmp_path / relative_path
+    indented = "\n".join(f"    {line}" for line in source.splitlines())
+    with owner.open("a", encoding="utf-8") as stream:
+        stream.write(f"\ndef forbidden():\n{indented}\n")
+
+    violations = scan_lightop_imports(root)
+
+    assert any("bare legacy LightOp module use" in item for item in violations)
 
 
 def test_scanner_rejects_injected_direct_lmslim_call_with_location(
