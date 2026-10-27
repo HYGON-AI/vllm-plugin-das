@@ -25,6 +25,7 @@ _BUFFER_RESOURCE_RANGE_BYTES = 0x80000000
 _SOURCE = r"""
 #include <torch/extension.h>
 #include <ATen/cuda/CUDAContext.h>
+#include <c10/cuda/CUDAGuard.h>
 #include <hip/hip_bf16.h>
 #include <cstdint>
 
@@ -234,6 +235,8 @@ static bool uses_splitk(int64_t m, int64_t n, int64_t k) {
 
 torch::Tensor linear_bf16_fp32_mmac(torch::Tensor x, torch::Tensor w) {
   TORCH_CHECK(x.dim() == 2 && w.dim() == 2, "x and w must be 2-D");
+  TORCH_CHECK(x.is_cuda() && w.is_cuda(), "x and w must be CUDA tensors");
+  TORCH_CHECK(x.device() == w.device(), "x and w must be on the same device");
   TORCH_CHECK(x.scalar_type() == torch::kBFloat16 &&
                   w.scalar_type() == torch::kBFloat16,
               "x and w must be BF16");
@@ -246,6 +249,7 @@ torch::Tensor linear_bf16_fp32_mmac(torch::Tensor x, torch::Tensor w) {
               "unsupported N ", n);
   TORCH_CHECK(k > 0 && k % 128 == 0, "K must be a multiple of 128, got ", k);
 
+  const at::cuda::OptionalCUDAGuard device_guard(device_of(x));
   const bool splitk = uses_splitk(m, n, k);
   auto out = splitk
       ? torch::zeros({m, n}, x.options().dtype(torch::kFloat32))

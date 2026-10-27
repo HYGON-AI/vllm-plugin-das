@@ -94,6 +94,14 @@ def test_direct_entry_rejects_unsupported_tensors(monkeypatch, case):
         bf16_fp32_mmac.linear_bf16_fp32_mmac(x, weight)
 
 
+def test_cpp_entry_guards_input_device_before_launch_setup():
+    source = bf16_fp32_mmac._SOURCE
+    guard = source.index("OptionalCUDAGuard device_guard(device_of(x))")
+    output_allocation = source.index("auto out = splitk")
+    stream_lookup = source.index("getCurrentCUDAStream()")
+    assert guard < output_allocation < stream_lookup
+
+
 def test_dispatcher_routes_small_m(monkeypatch):
     monkeypatch.setenv("VLLM_HCU_USE_CUSTOM_OPS", "1")
     monkeypatch.setenv("VLLM_HCU_BF16_FP32_MMAC", "1")
