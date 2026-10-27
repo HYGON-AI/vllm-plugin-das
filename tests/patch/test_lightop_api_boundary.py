@@ -62,6 +62,9 @@ LEGACY_TOP_LEVEL_MODULE_IMPORTS = {
         "legacy_native",
     ),
 }
+LEGACY_MODULE_OWNERS = {
+    path for path, _symbol, _alias in LEGACY_TOP_LEVEL_MODULE_IMPORTS
+}
 LEGACY_MODULE_ALLOWED_SYMBOLS = {
     (
         "vllm_hcu/patch/worker/core_fix/patch_deepseek_v4_pcp.py",
@@ -108,7 +111,12 @@ class _LightOpVisitor(ast.NodeVisitor):
             self._violation_keys.add(key)
             self.violations.append(f"{self.relative_path}:{line}: {detail}")
 
+    def _reject_getattr_binding(self, node: ast.AST, name: str) -> None:
+        if name == "getattr" and self.relative_path in LEGACY_MODULE_OWNERS:
+            self._violate(node, "builtin 'getattr' is shadowed in legacy owner")
+
     def visit_FunctionDef(self, node: ast.FunctionDef) -> None:
+        self._reject_getattr_binding(node, node.name)
         saved_root_aliases = self.root_aliases.copy()
         saved_lmslim_root_aliases = self.lmslim_root_aliases.copy()
         saved_category_aliases = self.category_aliases.copy()
@@ -122,6 +130,8 @@ class _LightOpVisitor(ast.NodeVisitor):
             arguments.append(node.args.vararg)
         if node.args.kwarg is not None:
             arguments.append(node.args.kwarg)
+        for argument in arguments:
+            self._reject_getattr_binding(argument, argument.arg)
 
         # Decorators, defaults, and annotations are evaluated in the outer
         # scope, before parameter names shadow imported aliases in the body.
@@ -152,7 +162,22 @@ class _LightOpVisitor(ast.NodeVisitor):
 
     visit_AsyncFunctionDef = visit_FunctionDef
 
+    def visit_Lambda(self, node: ast.Lambda) -> None:
+        arguments = (
+            list(node.args.posonlyargs)
+            + list(node.args.args)
+            + list(node.args.kwonlyargs)
+        )
+        if node.args.vararg is not None:
+            arguments.append(node.args.vararg)
+        if node.args.kwarg is not None:
+            arguments.append(node.args.kwarg)
+        for argument in arguments:
+            self._reject_getattr_binding(argument, argument.arg)
+        self.generic_visit(node)
+
     def visit_ClassDef(self, node: ast.ClassDef) -> None:
+        self._reject_getattr_binding(node, node.name)
         saved_root_aliases = self.root_aliases.copy()
         saved_lmslim_root_aliases = self.lmslim_root_aliases.copy()
         saved_category_aliases = self.category_aliases.copy()
@@ -166,6 +191,10 @@ class _LightOpVisitor(ast.NodeVisitor):
     def visit_Import(self, node: ast.Import) -> None:
         for alias in node.names:
             module = alias.name
+            self._reject_getattr_binding(
+                node,
+                alias.asname or module.split(".", maxsplit=1)[0],
+            )
             if module == "lmslim" or module.startswith("lmslim."):
                 self.lmslim_root_aliases.add(
                     alias.asname or module.split(".", maxsplit=1)[0]
@@ -197,6 +226,8 @@ class _LightOpVisitor(ast.NodeVisitor):
 
     def visit_ImportFrom(self, node: ast.ImportFrom) -> None:
         module = node.module or ""
+        for alias in node.names:
+            self._reject_getattr_binding(node, alias.asname or alias.name)
         if module == "lmslim" or module.startswith("lmslim."):
             self._violate(node, f"external LMSlim import from {module!r}")
         elif module == "lightop":
@@ -282,6 +313,8 @@ class _LightOpVisitor(ast.NodeVisitor):
         self.generic_visit(node)
 
     def visit_Name(self, node: ast.Name) -> None:
+        if isinstance(node.ctx, (ast.Store, ast.Del)):
+            self._reject_getattr_binding(node, node.id)
         if node.id in self.lmslim_root_aliases:
             self._violate(node, f"external LMSlim root {node.id!r}")
         if node.id in self.legacy_module_aliases:
@@ -289,6 +322,26 @@ class _LightOpVisitor(ast.NodeVisitor):
                 node,
                 f"bare legacy LightOp module use {node.id!r}",
             )
+
+    def visit_ExceptHandler(self, node: ast.ExceptHandler) -> None:
+        if node.name is not None:
+            self._reject_getattr_binding(node, node.name)
+        self.generic_visit(node)
+
+    def visit_MatchAs(self, node: ast.MatchAs) -> None:
+        if node.name is not None:
+            self._reject_getattr_binding(node, node.name)
+        self.generic_visit(node)
+
+    def visit_MatchStar(self, node: ast.MatchStar) -> None:
+        if node.name is not None:
+            self._reject_getattr_binding(node, node.name)
+        self.generic_visit(node)
+
+    def visit_MatchMapping(self, node: ast.MatchMapping) -> None:
+        if node.rest is not None:
+            self._reject_getattr_binding(node, node.rest)
+        self.generic_visit(node)
 
     def visit_Call(self, node: ast.Call) -> None:
         direct_lmslim_call: str | None = None
@@ -853,6 +906,32 @@ def test_scanner_checks_function_outer_scope_before_parameter_shadowing(
     assert any("legacy LightOp module" in item for item in violations)
 
 
+@pytest.mark.parametrize(
+    "binding",
+    [
+        "def getattr(*args):\n    return None",
+        "from helpers import resolve as getattr",
+        "def forbidden(getattr):\n"
+        "    return getattr(legacy_native, "
+        "'fused_deepseek_v4_qnorm_rope_kv_rope_quant_insert_pcp')",
+    ],
+    ids=["defined", "imported", "parameter"],
+)
+def test_scanner_rejects_shadowed_getattr_in_legacy_owner(
+    tmp_path: Path,
+    binding: str,
+) -> None:
+    root = _write_mutation_owner(tmp_path)
+    relative_path, _, _ = next(iter(LEGACY_TOP_LEVEL_MODULE_IMPORTS))
+    owner = tmp_path / relative_path
+    with owner.open("a", encoding="utf-8") as stream:
+        stream.write(f"\n{binding}\n")
+
+    violations = scan_lightop_imports(root)
+
+    assert any("builtin 'getattr' is shadowed" in item for item in violations)
+
+
 def test_scanner_rejects_injected_direct_lmslim_call_with_location(
     tmp_path: Path,
 ) -> None:
@@ -1015,7 +1094,11 @@ def test_installed_lightop_exports_cover_production_symbols() -> None:
             "_fallback in optional_fallbacks}; "
             "required_public=[(name, symbol) for name, symbol in required "
             "if (name, symbol) not in optional_keys]; "
-            "missing_public=[(name, symbol) for name, symbol in required_public "
+            "bound_optional=[(name, symbol) for name, symbol, _module, "
+            "_fallback in optional_fallbacks "
+            "if callable(getattr(modules[name], symbol, None))]; "
+            "audited_public=required_public + bound_optional; "
+            "missing_public=[(name, symbol) for name, symbol in audited_public "
             "if symbol not in modules[name].__all__]; "
             "missing_bound=[(name, symbol) for name, symbol in required_public "
             "if not hasattr(modules[name], symbol)]; "
