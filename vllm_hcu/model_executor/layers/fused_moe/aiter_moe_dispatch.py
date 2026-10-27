@@ -4,6 +4,8 @@
 
 from __future__ import annotations
 
+import functools
+import inspect
 from collections import OrderedDict
 from dataclasses import dataclass, replace
 from importlib import import_module
@@ -22,6 +24,7 @@ _SELECTION_CACHE_ATTR = "_hcu_aiter_moe_selection_cache"
 _WEIGHT_CACHE_ATTR = "_hcu_aiter_moe_weight_cache"
 _SCALE_CACHE_ATTR = "_hcu_aiter_moe_scale_cache"
 _NATIVE_EXPERT_MAP_ATTR = "_vllm_hcu_native_expert_map"
+_AITER_MOEC_CONFIG_GUARD_MARKER = "_vllm_hcu_gfx938_fp8_config_guard"
 _ROUTE_LOG_CACHE: OrderedDict["AiterMoeProblem", None] = OrderedDict()
 _ROUTE_LOG_LOCK = Lock()
 
@@ -117,6 +120,225 @@ def _solution_token(config: object) -> str:
     solution = getattr(config, "solution_type", None)
     solution = getattr(solution, "value", solution)
     return str(solution).rsplit(".", 1)[-1].upper()
+
+
+def _is_broken_gfx938_fp8_mode(config: object) -> bool:
+    """Identify the inaccurate MOE_C family-2 channel-FP8 kernels."""
+
+    if not isinstance(config, dict):
+        return False
+    try:
+        mode = int(config.get("MODE", 0))
+    except (TypeError, ValueError):
+        return False
+    if not 10_000_000 <= mode < 30_000_000:
+        return False
+    routing = (mode // 1_000_000) % 10
+    family = (mode // 100_000) % 10
+    return routing == 0 and family == 2
+
+
+def _is_gfx938_device(device: torch.device) -> bool:
+    if device.type != "cuda":
+        return False
+    device_index = device.index
+    if device_index is None:
+        device_index = torch.cuda.current_device()
+    try:
+        arch = str(
+            getattr(torch.cuda.get_device_properties(device_index), "gcnArchName", "")
+        ).lower()
+    except (AssertionError, RuntimeError):
+        return False
+    return arch.split(":", 1)[0] == "gfx938"
+
+
+def _valid_moe_c_config_pair(top: object, bottom: object) -> bool:
+    if not isinstance(top, dict) or not isinstance(bottom, dict):
+        return False
+    try:
+        top_mode = int(top["MODE"])
+        bottom_mode = int(bottom["MODE"])
+        top_block_m = int(top["BLOCK_SIZE_M"])
+        bottom_block_m = int(bottom["BLOCK_SIZE_M"])
+    except (KeyError, TypeError, ValueError):
+        return False
+    if not 10_000_000 <= top_mode < 20_000_000:
+        return False
+    if not 20_000_000 <= bottom_mode < 30_000_000:
+        return False
+    top_routing = (top_mode // 1_000_000) % 10
+    bottom_routing = (bottom_mode // 1_000_000) % 10
+    return (
+        top_block_m > 0
+        and top_block_m == bottom_block_m
+        and top_routing == bottom_routing
+    )
+
+
+def _install_gfx938_fp8_moe_c_config_guard() -> None:
+    """Replace inaccurate gfx938 FP8 config pairs with the nearest safe pair.
+
+    AITER's channel-FP8 tuning table contains family-2 MOE_C entries which
+    produce large numerical errors on gfx938.  The table is paired: GEMM1 and
+    GEMM2 must use the same token key and block-M.  Filter the pair together
+    so the existing AITER implementation can keep owning kernel execution and
+    weight layout.
+    """
+
+    module = import_module("aiter.fused_moe_c")
+    current = getattr(module, "try_get_optimal_moe_config_marlin", None)
+    if not callable(current):
+        raise HcuAiterMoeDispatchError(
+            "AITER MOE_C exposes no callable config selector"
+        )
+    if bool(getattr(current, _AITER_MOEC_CONFIG_GUARD_MARKER, False)):
+        return
+    try:
+        parameters = tuple(inspect.signature(current).parameters)
+    except (TypeError, ValueError) as exc:
+        raise HcuAiterMoeDispatchError(
+            "AITER MOE_C config selector has no inspectable ABI"
+        ) from exc
+    expected_parameters = (
+        "w1_shape",
+        "w2_shape",
+        "top_k",
+        "dtype",
+        "M",
+        "is_marlin",
+        "block_shape",
+        "is_bottom",
+        "use_moe_wna16_cuda",
+        "indtype",
+    )
+    if parameters != expected_parameters:
+        raise HcuAiterMoeDispatchError(
+            "AITER MOE_C config selector exposes unsupported arguments "
+            f"{parameters!r}"
+        )
+    config_tables = getattr(module, "get_moe_configs_marlin", None)
+    if not callable(config_tables):
+        raise HcuAiterMoeDispatchError(
+            "AITER MOE_C exposes no callable config-table loader"
+        )
+
+    original = current
+
+    @functools.wraps(original)
+    def guarded_config(
+        w1_shape,
+        w2_shape,
+        top_k,
+        dtype,
+        M,
+        is_marlin=False,
+        block_shape=None,
+        is_bottom=False,
+        use_moe_wna16_cuda=False,
+        indtype=None,
+    ):
+        selected = original(
+            w1_shape,
+            w2_shape,
+            top_k,
+            dtype,
+            M,
+            is_marlin,
+            block_shape,
+            is_bottom,
+            use_moe_wna16_cuda,
+            indtype,
+        )
+        if dtype != "fp8_w8a8" or block_shape is not None:
+            return selected
+        if not isinstance(selected, dict):
+            raise HcuAiterMoeDispatchError(
+                "AITER MOE_C config selector returned a non-dictionary config"
+            )
+        selected_key = selected.get("selected_m_key")
+        if selected_key is None:
+            if _is_broken_gfx938_fp8_mode(selected):
+                raise HcuAiterMoeDispatchError(
+                    "AITER selected an inaccurate gfx938 channel-FP8 MOE_C "
+                    "mode without a paired table key"
+                )
+            return selected
+        experts = int(w1_shape[0])
+        intermediate = int(w2_shape[2])
+        model_dim = int(w1_shape[2])
+        table_kwargs = dict(
+            K=model_dim,
+            top_k=top_k,
+            indtype=indtype,
+        )
+        top_configs = config_tables(
+            experts,
+            intermediate,
+            dtype,
+            0,
+            0,
+            False,
+            use_moe_wna16_cuda,
+            **table_kwargs,
+        )
+        bottom_configs = config_tables(
+            experts,
+            intermediate,
+            dtype,
+            0,
+            0,
+            True,
+            use_moe_wna16_cuda,
+            **table_kwargs,
+        )
+        if not isinstance(top_configs, dict) or not isinstance(
+            bottom_configs, dict
+        ):
+            raise HcuAiterMoeDispatchError(
+                "AITER returned malformed gfx938 channel-FP8 MOE_C config tables"
+            )
+        paired_top = top_configs.get(selected_key)
+        paired_bottom = bottom_configs.get(selected_key)
+        if not _valid_moe_c_config_pair(paired_top, paired_bottom):
+            raise HcuAiterMoeDispatchError(
+                "AITER returned an invalid paired gfx938 channel-FP8 MOE_C "
+                f"config for key={selected_key!r}"
+            )
+        if not (
+            _is_broken_gfx938_fp8_mode(paired_top)
+            or _is_broken_gfx938_fp8_mode(paired_bottom)
+        ):
+            return selected
+
+        safe_keys = [
+            key
+            for key in top_configs.keys() & bottom_configs.keys()
+            if _valid_moe_c_config_pair(top_configs[key], bottom_configs[key])
+            and not _is_broken_gfx938_fp8_mode(top_configs[key])
+            and not _is_broken_gfx938_fp8_mode(bottom_configs[key])
+        ]
+        if not safe_keys:
+            raise HcuAiterMoeDispatchError(
+                "AITER has no numerically safe paired gfx938 channel-FP8 "
+                "MOE_C configuration"
+            )
+        safe_key = min(safe_keys, key=lambda key: (abs(int(key) - M), int(key)))
+        replacement = dict(
+            (bottom_configs if is_bottom else top_configs)[safe_key]
+        )
+        replacement["selected_m_key"] = safe_key
+        logger.warning_once(
+            "Replacing inaccurate gfx938 AITER channel-FP8 MOE_C config "
+            "key=%s with safe paired key=%s",
+            selected_key,
+            safe_key,
+        )
+        return replacement
+
+    setattr(guarded_config, _AITER_MOEC_CONFIG_GUARD_MARKER, True)
+    setattr(guarded_config, "_vllm_hcu_original", original)
+    module.try_get_optimal_moe_config_marlin = guarded_config
 
 
 def aiter_moe_config_supports_expert_map(config: object) -> bool:
@@ -547,6 +769,15 @@ def execute_aiter_moe(
 ) -> torch.Tensor:
     """Execute the selected config through AITER's public MoE entry point."""
 
+    quant_type = getattr(config, "quant_type", None)
+    quant_type = getattr(quant_type, "value", quant_type)
+    if (
+        _solution_token(config) == "MOE_C"
+        and str(quant_type).rsplit(".", 1)[-1].lower() == "fp8_w8a8"
+        and block_shape is None
+        and _is_gfx938_device(hidden_states.device)
+    ):
+        _install_gfx938_fp8_moe_c_config_guard()
     moe_module = import_module("aiter.moe")
     operation = getattr(moe_module, "aiter_moe", None)
     if not callable(operation):

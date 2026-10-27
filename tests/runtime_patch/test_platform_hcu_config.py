@@ -85,6 +85,40 @@ def test_hcu_accepts_gptq_alias_selected_by_current_vllm() -> None:
     HCUPlatform.verify_quantization(resolved)
 
 
+def test_hcu_disables_incompatible_aiter_quant_fp8_custom_op(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    from vllm_hcu.patch import import_coordinator, worker
+    from vllm_hcu.platforms.hcu import HCUPlatform
+
+    monkeypatch.setattr(
+        import_coordinator.IMPORT_COORDINATOR,
+        "drain_ready_callbacks",
+        lambda: None,
+    )
+    monkeypatch.setattr(worker, "prepare_worker_patches", lambda: None)
+    aiter_ops = SimpleNamespace(
+        is_fused_moe_enabled=lambda: True,
+        is_linear_fp8_enabled=lambda: True,
+        is_fusion_moe_shared_experts_enabled=lambda: False,
+    )
+    monkeypatch.setitem(
+        sys.modules,
+        "vllm._aiter_ops",
+        SimpleNamespace(rocm_aiter_ops=aiter_ops),
+    )
+    config = SimpleNamespace(
+        compilation_config=SimpleNamespace(custom_ops=["all", "+quant_fp8"])
+    )
+
+    HCUPlatform.apply_config_platform_defaults(config)
+
+    assert "+quant_fp8" not in config.compilation_config.custom_ops
+    assert "-quant_fp8" in config.compilation_config.custom_ops
+    assert "+grouped_topk" in config.compilation_config.custom_ops
+    assert "+sparse_attn_indexer" in config.compilation_config.custom_ops
+
+
 def _run_fresh_target(code: str) -> subprocess.CompletedProcess[str]:
     env = dict(os.environ)
     for name in (

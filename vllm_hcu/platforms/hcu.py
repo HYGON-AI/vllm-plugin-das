@@ -587,8 +587,22 @@ class HCUPlatform(Platform):
         use_aiter_fp8_linear = rocm_aiter_ops.is_linear_fp8_enabled()
         use_aiter_fused_se = rocm_aiter_ops.is_fusion_moe_shared_experts_enabled()
 
-        if use_aiter_fp8_linear and "-quant_fp8" not in compilation_config.custom_ops:
-            compilation_config.custom_ops.append("+quant_fp8")
+        if use_aiter_fp8_linear:
+            # The current HCU AITER quantization entry points do not satisfy
+            # vLLM QuantFP8's complete output contract (including token
+            # padding), and enabling this custom op corrupts batched
+            # prefill/MTP output for channel-wise FP8 checkpoints.  Keep
+            # AITER linear and fused-MoE selection independent while routing
+            # activation quantization through vLLM's validated fallback.
+            while "+quant_fp8" in compilation_config.custom_ops:
+                compilation_config.custom_ops.remove("+quant_fp8")
+            if "-quant_fp8" not in compilation_config.custom_ops:
+                compilation_config.custom_ops.append("-quant_fp8")
+            logger.warning_once(
+                "Disabling the vLLM quant_fp8 custom op because HCU AITER "
+                "quantization does not implement its complete contract. "
+                "AITER linear and fused MoE remain enabled."
+            )
 
         if use_aiter_fused_se and "-grouped_topk" in compilation_config.custom_ops:
             logger.warning_once(
