@@ -179,8 +179,12 @@ class _LightOpVisitor(ast.NodeVisitor):
     def _reject_builtin_namespace(self, node: ast.AST, name: str) -> None:
         # Reject the namespace source, including when copied to another alias:
         # checking only Name(Store) misses mapping writes and update/setattr.
+        # sys.modules exposes builtins too. Reject the sys namespace at its
+        # source (including imports and loader calls) so aliases or computed
+        # registry keys cannot bypass this guard. This restriction is scoped
+        # to legacy owners, which do not need sys for their audited fallback.
         if self.relative_path in LEGACY_MODULE_OWNERS and name in {
-            "globals", "locals", "vars", "__builtins__", "builtins",
+            "globals", "locals", "vars", "__builtins__", "builtins", "sys",
         }:
             self._violate(node, "builtin namespace access in legacy owner")
 
@@ -1124,6 +1128,54 @@ def test_scanner_accepts_safe_literal_loader_aliases(
     owner = tmp_path / relative_path
     with owner.open("a", encoding="utf-8") as stream:
         stream.write(f"\n{binding}\nload('math')\n")
+
+    assert scan_lightop_imports(root) == []
+
+
+@pytest.mark.parametrize(
+    "mutation",
+    [
+        'sys.modules["builtins"].getattr = replacement',
+        'import sys; sys.modules["builtins"].getattr = replacement',
+        'import sys as runtime; runtime.modules["builtins"].getattr = replacement',
+        'from sys import modules as registry; registry["builtins"].getattr = replacement',
+        'import sys; registry = sys.modules; registry["builtins"].getattr = replacement',
+        'import sys; getattr(sys, "modules")["builtins"].getattr = replacement',
+        'import sys; sys.modules["builtins"].__dict__["getattr"] = replacement',
+        'import importlib; importlib.import_module("sys").modules["builtins"].getattr = replacement',
+        '__import__("sys").modules["builtins"].getattr = replacement',
+        'from importlib import import_module as load; load("sys").modules["builtins"].getattr = replacement',
+    ],
+)
+def test_scanner_rejects_sys_module_registry_in_legacy_owner(
+    tmp_path: Path,
+    mutation: str,
+) -> None:
+    root = _write_mutation_owner(tmp_path)
+    relative_path, _, _ = next(iter(LEGACY_TOP_LEVEL_MODULE_IMPORTS))
+    owner = tmp_path / relative_path
+    with owner.open("a", encoding="utf-8") as stream:
+        stream.write(
+            "\nreplacement = lambda owner, _name, *default: owner.any_private_kernel\n"
+            f"{mutation}\n"
+            "getattr(legacy_native, "
+            "'fused_deepseek_v4_qnorm_rope_kv_rope_quant_insert_pcp', None)\n"
+        )
+
+    violations = scan_lightop_imports(root)
+
+    assert any(
+        "builtin namespace access in legacy owner" in item
+        for item in violations
+    )
+
+
+def test_scanner_allows_sys_outside_legacy_owner(tmp_path: Path) -> None:
+    root = _write_mutation_owner(tmp_path)
+    (root / "ordinary.py").write_text(
+        "import sys\nmodules = sys.modules\n",
+        encoding="utf-8",
+    )
 
     assert scan_lightop_imports(root) == []
 
