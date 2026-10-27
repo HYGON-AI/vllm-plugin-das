@@ -375,23 +375,32 @@ class _LightOpVisitor(ast.NodeVisitor):
         self.generic_visit(node)
 
     def visit_Call(self, node: ast.Call) -> None:
-        # Dynamic imports can expose the same mutable builtin namespace.
+        # A computed module name could resolve to the mutable builtin
+        # namespace. Require a literal in legacy owners instead of attempting
+        # to evaluate arbitrary expressions or track their runtime values.
         if (
-            (
-                (
-                    isinstance(node.func, ast.Name)
-                    and node.func.id == "__import__"
-                )
-                or (
-                    isinstance(node.func, ast.Attribute)
-                    and node.func.attr == "import_module"
+            isinstance(node.func, ast.Name)
+            and node.func.id in {"__import__", "import_module"}
+        ) or (
+            isinstance(node.func, ast.Attribute)
+            and node.func.attr == "import_module"
+        ):
+            module_name = (
+                node.args[0]
+                if node.args
+                else next(
+                    (keyword.value for keyword in node.keywords
+                     if keyword.arg == "name"),
+                    None,
                 )
             )
-            and node.args
-            and isinstance(node.args[0], ast.Constant)
-            and isinstance(node.args[0].value, str)
-        ):
-            self._reject_builtin_namespace(node, node.args[0].value)
+            if (
+                isinstance(module_name, ast.Constant)
+                and isinstance(module_name.value, str)
+            ):
+                self._reject_builtin_namespace(node, module_name.value)
+            elif self.relative_path in LEGACY_MODULE_OWNERS:
+                self._violate(node, "nonliteral dynamic import in legacy owner")
         direct_lmslim_call: str | None = None
         if isinstance(node.func, ast.Name):
             if node.func.id in self.lmslim_root_aliases:
@@ -916,6 +925,8 @@ def test_scanner_rejects_relative_legacy_imports(
         'from builtins import __dict__ as ns; ns["getattr"] = replacement',
         'import importlib; importlib.import_module("builtins").getattr = replacement',
         '__import__("builtins").getattr = replacement',
+        'import importlib; importlib.import_module(name="builtins").getattr = replacement',
+        '__import__(name="builtins").getattr = replacement',
     ],
 )
 def test_scanner_rejects_indirect_getattr_rebinding(
@@ -939,6 +950,67 @@ def test_scanner_rejects_indirect_getattr_rebinding(
         "builtin namespace access in legacy owner" in item
         for item in violations
     )
+
+
+@pytest.mark.parametrize(
+    "import_call",
+    [
+        "importlib.import_module(module_name)",
+        "__import__(module_name)",
+        "importlib.import_module(name=module_name)",
+        "__import__(name=module_name)",
+        "importlib.import_module(*[module_name])",
+        "__import__(**{'name': module_name})",
+        "importlib.import_module(f'{module_name}')",
+        "import_module(module_name)",
+    ],
+)
+def test_scanner_rejects_nonliteral_imports_in_legacy_owner(
+    tmp_path: Path,
+    import_call: str,
+) -> None:
+    root = _write_mutation_owner(tmp_path)
+    relative_path, _, _ = next(iter(LEGACY_TOP_LEVEL_MODULE_IMPORTS))
+    owner = tmp_path / relative_path
+    with owner.open("a", encoding="utf-8") as stream:
+        stream.write(
+            "\nimport importlib\n"
+            "from importlib import import_module\n"
+            "module_name = 'builtins'\n"
+            "replacement = lambda owner, _name, *default: owner.any_private_kernel\n"
+            f"{import_call}.getattr = replacement\n"
+            "getattr(legacy_native, "
+            "'fused_deepseek_v4_qnorm_rope_kv_rope_quant_insert_pcp', None)\n"
+        )
+
+    violations = scan_lightop_imports(root)
+
+    assert any(
+        "nonliteral dynamic import in legacy owner" in item
+        for item in violations
+    )
+
+
+@pytest.mark.parametrize(
+    "import_call",
+    [
+        "importlib.import_module('math')",
+        "importlib.import_module(name='math')",
+        "__import__('math')",
+        "__import__(name='math')",
+    ],
+)
+def test_scanner_accepts_literal_safe_imports_in_legacy_owner(
+    tmp_path: Path,
+    import_call: str,
+) -> None:
+    root = _write_mutation_owner(tmp_path)
+    relative_path, _, _ = next(iter(LEGACY_TOP_LEVEL_MODULE_IMPORTS))
+    owner = tmp_path / relative_path
+    with owner.open("a", encoding="utf-8") as stream:
+        stream.write(f"\nimport importlib\n{import_call}\n")
+
+    assert scan_lightop_imports(root) == []
 
 
 @pytest.mark.parametrize(
