@@ -1018,6 +1018,58 @@ def test_scanner_checks_function_outer_scope_before_parameter_shadowing(
     assert any("legacy LightOp module" in item for item in violations)
 
 
+@pytest.mark.parametrize("definition", ["def", "async def"])
+@pytest.mark.parametrize(
+    ("decorator", "detail"),
+    [
+        (
+            "legacy_native.any_private_kernel",
+            "unapproved legacy LightOp module attribute",
+        ),
+        (
+            "getattr(legacy_native, name)",
+            "unapproved legacy LightOp module attribute lookup",
+        ),
+        (
+            "getattr(lightop, name)",
+            "dynamic top-level LightOp attribute lookup",
+        ),
+        (
+            "getattr(attention, name)",
+            "dynamic categorized LightOp attribute lookup",
+        ),
+    ],
+)
+def test_scanner_rejects_forbidden_function_decorators(
+    tmp_path: Path,
+    definition: str,
+    decorator: str,
+    detail: str,
+) -> None:
+    root = _write_mutation_owner(tmp_path)
+    relative_path, _, _ = next(iter(LEGACY_TOP_LEVEL_MODULE_IMPORTS))
+    owner = tmp_path / relative_path
+    with owner.open("a", encoding="utf-8") as stream:
+        stream.write(
+            "from lightop import attention\n"
+            f"@{decorator}\n"
+            f"{definition} forbidden(legacy_native, lightop, attention):\n"
+            "    pass\n"
+        )
+    decorator_line = next(
+        index
+        for index, line in enumerate(owner.read_text(encoding="utf-8").splitlines(), 1)
+        if line == f"@{decorator}"
+    )
+
+    violations = scan_lightop_imports(root)
+
+    assert any(
+        item.startswith(f"{relative_path}:{decorator_line}: {detail}")
+        for item in violations
+    )
+
+
 @pytest.mark.parametrize(
     "binding",
     [
