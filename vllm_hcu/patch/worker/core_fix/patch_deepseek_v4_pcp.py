@@ -59,11 +59,29 @@ def _pcp_insert_op():
     try:
         from lightop import attention as native
     except ImportError:
-        return None
+        native = None
     try:
-        op = getattr(native, "fused_deepseek_v4_qnorm_rope_kv_rope_quant_insert_pcp")
+        op = getattr(
+            native,
+            "fused_deepseek_v4_qnorm_rope_kv_rope_quant_insert_pcp",
+        )
     except AttributeError:
+        op = None
+    if callable(op):
+        return op
+
+    # DTK 26.04 wheels still expose this versioned PCP entry only through the
+    # legacy dispatcher. Keep this narrowly scoped fallback until those wheels
+    # provide the categorized attention export.
+    try:
+        from lightop import op as legacy_native
+    except ImportError:
         return None
+    op = getattr(
+        legacy_native,
+        "fused_deepseek_v4_qnorm_rope_kv_rope_quant_insert_pcp",
+        None,
+    )
     return op if callable(op) else None
 
 

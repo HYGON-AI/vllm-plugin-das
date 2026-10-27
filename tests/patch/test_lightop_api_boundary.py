@@ -49,6 +49,21 @@ LEGACY_TOP_LEVEL_IMPORTS = {
         "lightop_gather",
     ),
 }
+LEGACY_TOP_LEVEL_MODULE_IMPORTS = {
+    (
+        "vllm_hcu/patch/worker/core_fix/patch_deepseek_v4_pcp.py",
+        "op",
+        "legacy_native",
+    ),
+}
+LEGACY_MODULE_ALLOWED_SYMBOLS = {
+    (
+        "vllm_hcu/patch/worker/core_fix/patch_deepseek_v4_pcp.py",
+        "legacy_native",
+    ): frozenset({
+        "fused_deepseek_v4_qnorm_rope_kv_rope_quant_insert_pcp",
+    }),
+}
 
 
 def _attribute_parts(node: ast.Attribute) -> tuple[ast.expr, list[str]]:
@@ -72,6 +87,7 @@ class _LightOpVisitor(ast.NodeVisitor):
         # requiring a local import would leave dynamic bindings unscanned.
         self.lmslim_root_aliases: set[str] = {"lmslim"}
         self.category_aliases: dict[str, str] = {}
+        self.legacy_module_aliases: dict[str, frozenset[str]] = {}
         self.used: set[tuple[str, str]] = set()
         self.allowed_calls: list[tuple[str, str, int]] = []
         self.allowed_legacy_imports: list[tuple[str, str, str | None, int]] = []
@@ -90,6 +106,7 @@ class _LightOpVisitor(ast.NodeVisitor):
         saved_root_aliases = self.root_aliases.copy()
         saved_lmslim_root_aliases = self.lmslim_root_aliases.copy()
         saved_category_aliases = self.category_aliases.copy()
+        saved_legacy_module_aliases = self.legacy_module_aliases.copy()
         arguments = (
             list(node.args.posonlyargs)
             + list(node.args.args)
@@ -103,12 +120,14 @@ class _LightOpVisitor(ast.NodeVisitor):
             self.root_aliases.discard(argument.arg)
             self.lmslim_root_aliases.discard(argument.arg)
             self.category_aliases.pop(argument.arg, None)
+            self.legacy_module_aliases.pop(argument.arg, None)
         self._functions.append(node.name)
         self.generic_visit(node)
         self._functions.pop()
         self.root_aliases = saved_root_aliases
         self.lmslim_root_aliases = saved_lmslim_root_aliases
         self.category_aliases = saved_category_aliases
+        self.legacy_module_aliases = saved_legacy_module_aliases
 
     visit_AsyncFunctionDef = visit_FunctionDef
 
@@ -116,10 +135,12 @@ class _LightOpVisitor(ast.NodeVisitor):
         saved_root_aliases = self.root_aliases.copy()
         saved_lmslim_root_aliases = self.lmslim_root_aliases.copy()
         saved_category_aliases = self.category_aliases.copy()
+        saved_legacy_module_aliases = self.legacy_module_aliases.copy()
         self.generic_visit(node)
         self.root_aliases = saved_root_aliases
         self.lmslim_root_aliases = saved_lmslim_root_aliases
         self.category_aliases = saved_category_aliases
+        self.legacy_module_aliases = saved_legacy_module_aliases
 
     def visit_Import(self, node: ast.Import) -> None:
         for alias in node.names:
@@ -165,7 +186,7 @@ class _LightOpVisitor(ast.NodeVisitor):
                     self.relative_path,
                     alias.name,
                     alias.asname,
-                ) in LEGACY_TOP_LEVEL_IMPORTS:
+                ) in LEGACY_TOP_LEVEL_IMPORTS | LEGACY_TOP_LEVEL_MODULE_IMPORTS:
                     self.allowed_legacy_imports.append(
                         (
                             self.relative_path,
@@ -174,6 +195,15 @@ class _LightOpVisitor(ast.NodeVisitor):
                             node.lineno,
                         )
                     )
+                    module_key = (
+                        self.relative_path,
+                        alias.asname or alias.name,
+                    )
+                    allowed_symbols = LEGACY_MODULE_ALLOWED_SYMBOLS.get(module_key)
+                    if allowed_symbols is not None:
+                        self.legacy_module_aliases[alias.asname or alias.name] = (
+                            allowed_symbols
+                        )
                 else:
                     self._violate(
                         node,
@@ -217,6 +247,14 @@ class _LightOpVisitor(ast.NodeVisitor):
                     )
             elif root.id in self.category_aliases:
                 self.used.add((f"lightop.{self.category_aliases[root.id]}", parts[0]))
+            elif root.id in self.legacy_module_aliases:
+                allowed = self.legacy_module_aliases[root.id]
+                if len(parts) != 1 or parts[0] not in allowed:
+                    reference = ".".join((root.id, *parts))
+                    self._violate(
+                        node,
+                        f"unapproved legacy LightOp module attribute {reference!r}",
+                    )
         self.generic_visit(node)
 
     def visit_Name(self, node: ast.Name) -> None:
@@ -329,6 +367,19 @@ class _LightOpVisitor(ast.NodeVisitor):
                             node,
                             "dynamic categorized LightOp attribute lookup",
                         )
+            elif owner in self.legacy_module_aliases:
+                allowed = self.legacy_module_aliases[owner]
+                symbol = (
+                    node.args[1].value
+                    if isinstance(node.args[1], ast.Constant)
+                    and isinstance(node.args[1].value, str)
+                    else None
+                )
+                if symbol not in allowed:
+                    self._violate(
+                        node,
+                        "unapproved legacy LightOp module attribute lookup",
+                    )
         self.generic_visit(node)
 
 
@@ -517,7 +568,9 @@ def _scan(root: Path) -> tuple[list[str], set[tuple[str, str]]]:
         (path, symbol, alias)
         for path, symbol, alias, _ in allowed_legacy_imports
     )
-    expected_legacy = Counter(LEGACY_TOP_LEVEL_IMPORTS)
+    expected_legacy = Counter(
+        LEGACY_TOP_LEVEL_IMPORTS | LEGACY_TOP_LEVEL_MODULE_IMPORTS
+    )
     if actual_legacy != expected_legacy:
         details = {
             "missing": sorted((expected_legacy - actual_legacy).elements()),
@@ -525,6 +578,20 @@ def _scan(root: Path) -> tuple[list[str], set[tuple[str, str]]]:
         }
         violations.append(
             "vllm_hcu:1: legacy top-level LightOp import allowlist mismatch: "
+            f"{details}"
+        )
+    expected_module_aliases = {
+        (path, alias or symbol)
+        for path, symbol, alias in LEGACY_TOP_LEVEL_MODULE_IMPORTS
+    }
+    actual_module_aliases = set(LEGACY_MODULE_ALLOWED_SYMBOLS)
+    if actual_module_aliases != expected_module_aliases:
+        details = {
+            "missing": sorted(expected_module_aliases - actual_module_aliases),
+            "extra": sorted(actual_module_aliases - expected_module_aliases),
+        }
+        violations.append(
+            "vllm_hcu:1: legacy LightOp module symbol allowlist mismatch: "
             f"{details}"
         )
     if owner_tree is None or not _clamp_resolver_is_exact(owner_tree):
@@ -637,6 +704,11 @@ def _write_mutation_owner(
             f"from lightop import {symbol} as {alias}\n",
             encoding="utf-8",
         )
+    for relative_path, symbol, alias in LEGACY_TOP_LEVEL_MODULE_IMPORTS:
+        legacy_owner = tmp_path / relative_path
+        legacy_owner.parent.mkdir(parents=True, exist_ok=True)
+        with legacy_owner.open("a", encoding="utf-8") as stream:
+            stream.write(f"from lightop import {symbol} as {alias}\n")
     return root
 
 
@@ -664,6 +736,32 @@ def test_scanner_rejects_forbidden_forms_with_locations(tmp_path: Path) -> None:
         "vllm_hcu/mutation.py:6: moved top-level LightOp import 'moved'",
     }
     assert expected <= set(violations)
+
+
+@pytest.mark.parametrize(
+    "expression",
+    [
+        "legacy_native.any_private_kernel()",
+        "getattr(legacy_native, name)",
+        "legacy_native.nested.any_private_kernel()",
+    ],
+)
+def test_scanner_restricts_legacy_module_alias(
+    tmp_path: Path,
+    expression: str,
+) -> None:
+    root = _write_mutation_owner(tmp_path)
+    relative_path, _, _ = next(iter(LEGACY_TOP_LEVEL_MODULE_IMPORTS))
+    owner = tmp_path / relative_path
+    with owner.open("a", encoding="utf-8") as stream:
+        stream.write(f"\ndef forbidden(name='dynamic'):\n    return {expression}\n")
+
+    violations = scan_lightop_imports(root)
+
+    assert any(
+        "unapproved legacy LightOp module" in item
+        for item in violations
+    )
 
 
 def test_scanner_rejects_injected_direct_lmslim_call_with_location(
@@ -797,6 +895,9 @@ def test_installed_lightop_exports_cover_production_symbols() -> None:
     env["LIGHTOP_REQUIRED_LEGACY_ROOT_EXPORTS"] = json.dumps(
         sorted({symbol for _, symbol, _ in LEGACY_TOP_LEVEL_IMPORTS})
     )
+    env["LIGHTOP_REQUIRED_LEGACY_ROOT_MODULES"] = json.dumps(
+        sorted({symbol for _, symbol, _ in LEGACY_TOP_LEVEL_MODULE_IMPORTS})
+    )
     env["ROCM_HOME"] = env.get("ROCM_HOME", env.get("ROCM_PATH", "/opt/dtk"))
     result = subprocess.run(
         [
@@ -816,6 +917,8 @@ def test_installed_lightop_exports_cover_production_symbols() -> None:
             "required=json.loads(os.environ['LIGHTOP_REQUIRED_EXPORTS']); "
             "legacy_required=json.loads("
             "os.environ['LIGHTOP_REQUIRED_LEGACY_ROOT_EXPORTS']); "
+            "legacy_modules=json.loads("
+            "os.environ['LIGHTOP_REQUIRED_LEGACY_ROOT_MODULES']); "
             "modules={name: importlib.import_module(name) "
             "for name, _symbol in required}; "
             "optional=json.loads(os.environ['LIGHTOP_OPTIONAL_EXPORTS']); "
@@ -828,10 +931,14 @@ def test_installed_lightop_exports_cover_production_symbols() -> None:
             "if not hasattr(modules[name], symbol)]; "
             "missing_legacy=[symbol for symbol in legacy_required "
             "if not callable(getattr(lightop, symbol, None))]; "
+            "missing_legacy_modules=[symbol for symbol in legacy_modules "
+            "if getattr(lightop, symbol, None) is None]; "
             "assert not missing_public, f'not public: {missing_public}'; "
             "assert not missing_bound, f'not bound: {missing_bound}'; "
             "assert not missing_legacy, "
-            "f'legacy root exports are not callable: {missing_legacy}'",
+            "f'legacy root exports are not callable: {missing_legacy}'; "
+            "assert not missing_legacy_modules, "
+            "f'legacy root modules are absent: {missing_legacy_modules}'",
         ],
         cwd=REPOSITORY,
         env=env,
