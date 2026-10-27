@@ -47,21 +47,29 @@ def _is_flash_kv_dtype(kv_cache_dtype: str) -> bool:
     )
 
 
-# FIX13 (2026-10-27): the TP8 fault root cause was a builder rebuild
-# after the capture epoch freeing the persistent buffers that captured
-# DSpark graphs still reference. With the buffer registry below the fast
-# path is always on -- no debug ladder, no gate: an unloaded DSpark draft
-# never constructs these buffers, and availability follows from the
-# same conditions the stock path checks (dp dtype, page geometry,
-# vendor presence). VA-LEDGER keeps its reuse=/gen= fields as the
-# standing self-check of the fix.
+# FIX13 (2026-10-27): the historical TP8 startup fault is UNEXPLAINED as
+# a mechanism (jointly recorded by both independent reviewers); the
+#抢救 defensive invariants below are what the shipped fix actually rests
+# on, and each is locally provable regardless of TP shape:
+#   - fast-path metadata buffers live in a process-lifetime registry, so
+#     no builder rebuild can free storage a captured graph still points
+#     at (the class of hazard codex/claude converged on as plausible);
+#   - a fill failure after capture is fatal, never swallowed -- a stale
+#     plan cannot ride a replay;
+#   - tile/nsplits plan geometry is stamped per (shape -> rows) and the
+#     stamps survive rebuilds;
+#   - every expanded page id is clamped into the live KV pool bounds.
+# The fast path is always on -- no debug ladder, no gate: an unloaded
+# DSpark draft never constructs these buffers, and availability follows
+# from the same conditions the stock path checks (kv dtype, page
+# geometry, vendor presence). VA-LEDGER reuse=/gen= fields are the
+# standing self-check.
 
-# FIX13 (TP8 root cause): process-lifetime storage for flash fast-path
-# metadata buffers. The engine rebuilds builders after the capture epoch
-# (KV-cache sizing step); each rebuild must re-bind the SAME tensors, not
-# allocate fresh ones a captured graph would never see. Keyed by
-# (device, layer-names group, page, dims); values survive for the whole
-# process -- a few MB per rank, deliberately immortal.
+# FIX13: process-lifetime storage for flash fast-path metadata buffers.
+# Rebuilds re-bind the SAME tensors instead of allocating fresh ones
+# behind captured graphs' backs. Keyed by (device, layer-names group,
+# page, dims); values survive for the whole process -- a few MB per
+# rank, deliberately immortal.
 _FLASH_BUF_REGISTRY: dict = {}
 
 
@@ -93,11 +101,7 @@ class HcuTritonMLAMetadataBuilder(TritonMLAMetadataBuilder):
     ``__init__`` at the service's upper bounds and each step only writes into
     fixed-size views of them. Runtime overflow raises instead of reallocating:
     a ``data_ptr`` change after capture would leave graphs reading stale
-    addresses (the TP8 root cause of 2026-10-27: vLLM rebuilt this builder
-    after the capture epoch -- KV-cache sizing step -- which freed the
-    epoch-1 buffers that captured DSpark graphs still referenced; the
-    replayed flash node then read page ids from memory recycled into the
-    KV pool). Quantities derived from Python ints (query_len, head count)
+    addresses. Quantities derived from Python ints (query_len, head count)
     are stashed alongside so the impl can reject a stale match.
     """
 
@@ -151,16 +155,12 @@ class HcuTritonMLAMetadataBuilder(TritonMLAMetadataBuilder):
             )
             self._hcu_bt_cols = max_cols
             self._hcu_bt_width = max_cols * subpage
-            # FIX13 (TP8 root cause): builder rebuilds on every engine
-            # re-init (KV-cache sizing reconstructs workers), and each
-            # rebuild used to allocate NEW buffers, freeing the old ones
-            # that captured graphs still reference (use-after-free at the
-            # next FULL-graph replay). Register the buffers in a
-            # process-lifetime registry keyed by (device, group): every
-            # rebuild of the same group Binds the SAME tensors, so a
-            # captured graph's pointers stay valid for the whole service
-            # lifetime. The registry holds strong references -- these
-            # few MB are deliberately immortal.
+            # FIX13: register the buffers in a process-lifetime registry
+            # keyed by (device, group): every rebuild of the same group
+            # re-binds the SAME tensors, so captured graphs' pointers stay
+            # valid for the whole service lifetime and no rebuild can
+            # free storage behind their backs. The registry holds strong
+            # references -- these few MB are deliberately immortal.
             reg_key = (
                 str(device), tuple(sorted(layer_names)), page,
                 num_sms * 4, max_seqs, self._hcu_bt_width,
@@ -436,10 +436,9 @@ class HcuTritonMLAImpl(TritonMLAImpl):
         if (
             not attn_metadata.causal
             and _flash_gate_enabled()
-            # FIX13: fast path lives inside DSpark FULL graphs again. The
-            # TP8 fault was a builder rebuild freeing capture-bound
-            # buffers (use-after-free at replay), fixed by the registry;
-            # no capture-context exclusion is wanted.
+            # FIX13: designed to live inside DSpark FULL graphs (no
+            # capture-context exclusion); the registry keeps the bound
+            # buffers alive across any builder rebuild.
             and _is_flash_kv_dtype(self.kv_cache_dtype)
             # The vendor kernel walks 64-token pages. A manager block of
             # any whole multiple works through an expanded block table;
