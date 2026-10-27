@@ -31,8 +31,14 @@ PUBLIC_CATEGORIES = {
 }
 # This versioned fast path has a maintained fallback when older wheels omit it.
 # If installed, it must still be exported by the public category.
-OPTIONAL_CATEGORIZED_EXPORTS = {
-    ("lightop.attention", "fused_deepseek_v4_qnorm_rope_kv_rope_quant_insert_pcp"),
+OPTIONAL_CATEGORIZED_FALLBACKS = {
+    (
+        "lightop.attention",
+        "fused_deepseek_v4_qnorm_rope_kv_rope_quant_insert_pcp",
+    ): (
+        "op",
+        "fused_deepseek_v4_qnorm_rope_kv_rope_quant_insert_pcp",
+    ),
 }
 CLAMP_OWNER = (
     "vllm_hcu/model_executor/layers/fused_moe/experts/"
@@ -116,13 +122,28 @@ class _LightOpVisitor(ast.NodeVisitor):
             arguments.append(node.args.vararg)
         if node.args.kwarg is not None:
             arguments.append(node.args.kwarg)
+
+        # Decorators, defaults, and annotations are evaluated in the outer
+        # scope, before parameter names shadow imported aliases in the body.
+        for decorator in node.decorator_list:
+            self.visit(decorator)
+        for default in (*node.args.defaults, *node.args.kw_defaults):
+            if default is not None:
+                self.visit(default)
+        for argument in arguments:
+            if argument.annotation is not None:
+                self.visit(argument.annotation)
+        if node.returns is not None:
+            self.visit(node.returns)
+
         for argument in arguments:
             self.root_aliases.discard(argument.arg)
             self.lmslim_root_aliases.discard(argument.arg)
             self.category_aliases.pop(argument.arg, None)
             self.legacy_module_aliases.pop(argument.arg, None)
         self._functions.append(node.name)
-        self.generic_visit(node)
+        for statement in node.body:
+            self.visit(statement)
         self._functions.pop()
         self.root_aliases = saved_root_aliases
         self.lmslim_root_aliases = saved_lmslim_root_aliases
@@ -806,6 +827,32 @@ def test_scanner_rejects_bare_legacy_module_uses(
     assert any("bare legacy LightOp module use" in item for item in violations)
 
 
+@pytest.mark.parametrize(
+    "source",
+    [
+        "@legacy_native.any_private_kernel\n"
+        "def forbidden(legacy_native):\n"
+        "    pass\n",
+        "def forbidden(legacy_native=legacy_native):\n"
+        "    legacy_native.any_private_kernel()\n",
+    ],
+    ids=["decorator", "default"],
+)
+def test_scanner_checks_function_outer_scope_before_parameter_shadowing(
+    tmp_path: Path,
+    source: str,
+) -> None:
+    root = _write_mutation_owner(tmp_path)
+    relative_path, _, _ = next(iter(LEGACY_TOP_LEVEL_MODULE_IMPORTS))
+    owner = tmp_path / relative_path
+    with owner.open("a", encoding="utf-8") as stream:
+        stream.write(f"\n{source}")
+
+    violations = scan_lightop_imports(root)
+
+    assert any("legacy LightOp module" in item for item in violations)
+
+
 def test_scanner_rejects_injected_direct_lmslim_call_with_location(
     tmp_path: Path,
 ) -> None:
@@ -933,12 +980,12 @@ def test_installed_lightop_exports_cover_production_symbols() -> None:
     used = categorized_symbols(REPOSITORY / "vllm_hcu")
     env = dict(os.environ)
     env["LIGHTOP_REQUIRED_EXPORTS"] = json.dumps(sorted(used))
-    env["LIGHTOP_OPTIONAL_EXPORTS"] = json.dumps(sorted(OPTIONAL_CATEGORIZED_EXPORTS))
+    env["LIGHTOP_OPTIONAL_FALLBACKS"] = json.dumps([
+        (*public, *legacy)
+        for public, legacy in sorted(OPTIONAL_CATEGORIZED_FALLBACKS.items())
+    ])
     env["LIGHTOP_REQUIRED_LEGACY_ROOT_EXPORTS"] = json.dumps(
         sorted({symbol for _, symbol, _ in LEGACY_TOP_LEVEL_IMPORTS})
-    )
-    env["LIGHTOP_REQUIRED_LEGACY_ROOT_MODULES"] = json.dumps(
-        sorted({symbol for _, symbol, _ in LEGACY_TOP_LEVEL_MODULE_IMPORTS})
     )
     env["ROCM_HOME"] = env.get("ROCM_HOME", env.get("ROCM_PATH", "/opt/dtk"))
     result = subprocess.run(
@@ -959,28 +1006,33 @@ def test_installed_lightop_exports_cover_production_symbols() -> None:
             "required=json.loads(os.environ['LIGHTOP_REQUIRED_EXPORTS']); "
             "legacy_required=json.loads("
             "os.environ['LIGHTOP_REQUIRED_LEGACY_ROOT_EXPORTS']); "
-            "legacy_modules=json.loads("
-            "os.environ['LIGHTOP_REQUIRED_LEGACY_ROOT_MODULES']); "
+            "optional_fallbacks=json.loads("
+            "os.environ['LIGHTOP_OPTIONAL_FALLBACKS']); "
             "modules={name: importlib.import_module(name) "
             "for name, _symbol in required}; "
-            "optional=json.loads(os.environ['LIGHTOP_OPTIONAL_EXPORTS']); "
-            "required=[(name, symbol) for name, symbol in required "
-            "if [name, symbol] not in optional or hasattr(modules[name], symbol)]; "
             "lightop=importlib.import_module('lightop'); "
-            "missing_public=[(name, symbol) for name, symbol in required "
+            "optional_keys={(name, symbol) for name, symbol, _module, "
+            "_fallback in optional_fallbacks}; "
+            "required_public=[(name, symbol) for name, symbol in required "
+            "if (name, symbol) not in optional_keys]; "
+            "missing_public=[(name, symbol) for name, symbol in required_public "
             "if symbol not in modules[name].__all__]; "
-            "missing_bound=[(name, symbol) for name, symbol in required "
+            "missing_bound=[(name, symbol) for name, symbol in required_public "
             "if not hasattr(modules[name], symbol)]; "
             "missing_legacy=[symbol for symbol in legacy_required "
             "if not callable(getattr(lightop, symbol, None))]; "
-            "missing_legacy_modules=[symbol for symbol in legacy_modules "
-            "if getattr(lightop, symbol, None) is None]; "
+            "missing_fallbacks=[(name, symbol) for name, symbol, legacy_module, "
+            "legacy_symbol in optional_fallbacks "
+            "if not (callable(getattr(modules[name], symbol, None)) or "
+            "callable(getattr(getattr(lightop, legacy_module, None), "
+            "legacy_symbol, None)))]; "
             "assert not missing_public, f'not public: {missing_public}'; "
             "assert not missing_bound, f'not bound: {missing_bound}'; "
             "assert not missing_legacy, "
             "f'legacy root exports are not callable: {missing_legacy}'; "
-            "assert not missing_legacy_modules, "
-            "f'legacy root modules are absent: {missing_legacy_modules}'",
+            "assert not missing_fallbacks, "
+            "f'optional public/legacy fallbacks are not callable: "
+            "{missing_fallbacks}'",
         ],
         cwd=REPOSITORY,
         env=env,
