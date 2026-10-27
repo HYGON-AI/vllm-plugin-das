@@ -44,6 +44,49 @@ def cache_strategy():
     return value
 
 
+def state_backend():
+    value = os.environ.get("VLLM_KIMI_KDA_STATE_BACKEND", "boltops").lower()
+    if value not in ("boltops", "aiter"):
+        raise ValueError("VLLM_KIMI_KDA_STATE_BACKEND must be boltops or aiter")
+    return value
+
+
+@lru_cache(maxsize=1)
+def aiter_state_kernel():
+    module = importlib.import_module("aiter.ops.fla")
+    name = "chunk_gated_delta_rule_fwd_sglang_hip_blockdim64"
+    fn = getattr(module, name, None)
+    required = {"k", "w", "u", "gk", "initial_state", "initial_state_indices",
+                "cu_seqlens", "chunk_indices", "chunk_size", "use_exp2",
+                "output_final_state", "save_new_value", "transpose_state_layout"}
+    if not callable(fn) or not required <= inspect.signature(fn).parameters.keys():
+        raise RuntimeError(f"Incompatible AITER KDA state interface: {name}")
+    return fn
+
+
+def _chunk_gated_delta_rule_fwd_h_aiter(
+    *, k, w, u, gk, initial_state, cu_seqlens, chunk_indices
+):
+    """SGLang HIP path, with a private in-place FP32 final-state pool.
+
+    The returned chunk history is BF16. Never pass the caller's state pool to
+    AITER: the SGLang entry point always updates valid slots in place.
+    """
+    if k.shape[-1] != 128 or u.shape[-1] != 128:
+        raise ValueError("AITER KDA state kernel requires K=V=128")
+    final = initial_state.to(dtype=torch.float32).contiguous().clone()
+    indices = torch.arange(final.shape[0], device=final.device, dtype=torch.int32)
+    h, vn = aiter_state_kernel()(
+        k=k, w=w, u=u, gk=gk, initial_state=final,
+        initial_state_indices=indices, output_final_state=True,
+        chunk_size=CHUNK_SIZE, save_new_value=True, cu_seqlens=cu_seqlens,
+        chunk_indices=chunk_indices, use_exp2=True, transpose_state_layout=True,
+    )
+    if h.dtype != torch.bfloat16:
+        raise RuntimeError(f"AITER KDA expected BF16 chunk history, got {h.dtype}")
+    return h, vn, final
+
+
 @lru_cache(maxsize=1)
 def boltops_kernels():
     """Check named parameters; **kwargs on the public API discards exports."""
@@ -92,6 +135,8 @@ def install_checkpoint_spec(layer):
         strategy = cache_strategy()
         if prefill_backend() == "boltops":
             boltops_kernels()  # Fail at construction, before scheduler activation.
+            if state_backend() == "aiter":
+                aiter_state_kernel()
         if strategy != "extra_buffer":
             return result
         cache = config.cache_config
@@ -122,7 +167,7 @@ def install_checkpoint_spec(layer):
             num_prefill_checkpoint_blocks=1,
             prefill_checkpoint_alignment=CHUNK_SIZE,
         )
-        logger.info_once(
+        logger.info(
             "Kimi KDA cache spec: mode=extra_buffer, prefix_caching=True, "
             "attention_and_mamba_block=%d, state_update_chunk=%d, checkpoint_pages=%d",
             configured.block_size, CHUNK_SIZE,
@@ -344,7 +389,12 @@ def chunk_kda(**kwargs):
         if active is not None else None
     )
     initial_state = kwargs["initial_state"].contiguous()
-    if payload is not None:
+    if state_backend() == "aiter":
+        h, vn, final = _chunk_gated_delta_rule_fwd_h_aiter(
+            k=kg, w=w, u=u, gk=g, initial_state=initial_state,
+            cu_seqlens=cu, chunk_indices=ci,
+        )
+    elif payload is not None:
         h, vn, final = _chunk_gated_delta_rule_fwd_h_fp32(
             state,
             k=kg,
