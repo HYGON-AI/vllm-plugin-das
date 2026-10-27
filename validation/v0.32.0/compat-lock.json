@@ -1,7 +1,7 @@
 {
   "schema_version": 1,
   "validation_id": "vllm-v0.32.0-gfx936-20261027",
-  "status": "pending",
+  "status": "passed",
   "repository": {
     "name": "vllm-plugin-das",
     "url": "https://github.com/alexanderbin123/vllm-plugin-das.git",
@@ -21,18 +21,155 @@
   },
   "human_eval": {
     "commit": "6d43fb980f9fee3c892a914eda09951f772ad10d",
-    "tasks": "HumanEval/0-63"
+    "tasks": "HumanEval/0-63",
+    "samples": 64,
+    "timeouts": 0,
+    "pass_at_1": 0.953125
   },
   "hardware": {
-    "architecture": "gfx936"
+    "architecture": "gfx936",
+    "card_count": 8,
+    "card_series": "BW"
   },
-  "toolchain": {},
-  "serving": {},
+  "toolchain": {
+    "python": "3.12.12",
+    "torch": "2.11.0",
+    "hip": "7.2.26365",
+    "dtk": "26.10",
+    "build": "1.3.0",
+    "lightop": "0.6.0+dtk2610.torch2110.2610231814.gb2f8c9"
+  },
+  "serving": {
+    "enforce_eager": false,
+    "compilation": "VLLM_COMPILE",
+    "cudagraph_capture": true,
+    "max_model_len": 4096,
+    "max_num_seqs": 1,
+    "attention_backend": "TRITON_ATTN",
+    "kv_cache_layout": "LBNHC"
+  },
   "tag": {
     "name": "validated/vllm-v0.32.0-gfx936-20261027"
   },
-  "artifacts": {},
-  "gates": {},
-  "evidence": {},
-  "completed_at": null
+  "artifacts": {
+    "adapter_wheel": {
+      "filename": "hcu_vllm_adapter-0.1.0.dev0-py3-none-any.whl",
+      "sha256": "a056c879b3ca64a41c197945ce8ee9a8ee46753782cfce37db9c69a358f7adb4",
+      "build_commit": "f8caf39e5a347a9d3681fdb7c868fb72ccb17f0e"
+    },
+    "plugin_wheel": {
+      "filename": "hcu_vllm_das_plugin-0.2.0.dev0-py3-none-any.whl",
+      "sha256": "fc5b23142f04d713d5e58445d2c372fd1abbcb7bf1fd9c63ae0e80b0ce0b4d40",
+      "build_commit": "ef90fd4bcaae2eaf93323bb628314f07908d5767"
+    },
+    "vllm_wheel": {
+      "filename": "vllm-0.32.0+rocm723-cp312-cp312-linux_x86_64.whl",
+      "sha256": "d7f084b8754288893dd9ba28d24784ec4b4e59350c9bfb5038ec24ac3af9572b",
+      "upstream_commit": "5df63a7203cdb9328d824a27b682e77c7b9928be"
+    }
+  },
+  "gates": {
+    "source_provenance": {
+      "status": "pass",
+      "command": "validate pinned branches, ancestors, vLLM and HumanEval commits",
+      "exit_status": 0,
+      "result": "all source provenance predicates passed",
+      "evidence_sha256": "3fa71e1dd82fcf96f1718ca8a5497b187ce5cbe21ae2ab131be060606fee6785"
+    },
+    "static_portable_tests": {
+      "status": "pass",
+      "command": "pytest adapter candidate/contract/integration/validation and plugin tests/vllm032",
+      "exit_status": 0,
+      "result": "adapter 168 passed; plugin 60 passed with 2 live tests deselected",
+      "evidence_sha256": "d1bfe96afdfaf9efd43edc7d84aa3f7bb4e66051ef90a0bc62424bab79dd99aa"
+    },
+    "build": {
+      "status": "pass",
+      "command": "build isolated adapter, plugin, and patched vLLM wheels for gfx936",
+      "exit_status": 0,
+      "result": "three wheels built; 4 GPU-bearing ELF files target exact gfx936; RECORD valid",
+      "evidence_sha256": "d1bfe96afdfaf9efd43edc7d84aa3f7bb4e66051ef90a0bc62424bab79dd99aa"
+    },
+    "installed_integration": {
+      "status": "pass",
+      "command": "verify installed wheel identities, platform, extension and OOT classes",
+      "exit_status": 0,
+      "result": "adapter binding passed and das_hcu extension is active",
+      "evidence_sha256": "90640f1d826c33062ce42459a74f6a380f453d5de37b30a8391702ca184ed820"
+    },
+    "live_hardware_operators": {
+      "status": "pass",
+      "command": "run RMSNorm and SiluAndMul live pytest files separately on card0",
+      "exit_status": 0,
+      "result": "2 passed; 0 skipped; 0 xfailed",
+      "evidence_sha256": "88a94892dcc59a59b77533c6b4c4a454f8081d7f0685b8d14e63c289128d09cf"
+    },
+    "model_parity": {
+      "status": "pass",
+      "command": "run isolated Qwen3-8B control and custom-op enabled probes",
+      "exit_status": 0,
+      "result": "text, 32 token IDs, finish reason, platform and backend match exactly",
+      "evidence_sha256": "d3becc2e6831815c796199f5200480e875577eba0f2d9fb557c0c94ce39b8fb1"
+    },
+    "serving": {
+      "status": "pass",
+      "command": "serve Qwen3-8B at length 4096 without --enforce-eager and run API smoke checks",
+      "exit_status": 0,
+      "result": "VLLM_COMPILE and FULL_AND_PIECEWISE captured; health/models/chat passed",
+      "evidence_sha256": "77cf94924bdf593ac1d8fe3f2e353dceb28e26f16e435f3e3afc4583efa9c31a"
+    },
+    "humaneval_prefix": {
+      "status": "pass",
+      "command": "generate HumanEval/0-63 sequentially and score with official checker in Bubblewrap",
+      "exit_status": 0,
+      "result": "61/64 pass@1 0.953125 with zero timeouts and zero scoring stderr",
+      "evidence_sha256": "f167d8dab00fec92f8a9c8fcd9448d1dc6fd09a7eeb99ace866b14db6fac3dad"
+    },
+    "cleanup": {
+      "status": "pass",
+      "command": "stop validation service and inspect port, processes and HBM",
+      "exit_status": 0,
+      "result": "port closed; zero survivors; eight cards at zero utilization and memory use",
+      "evidence_sha256": "2d63b82fada022348583908b819ac4bba3d39e86d03fdf974f86fb5279c807b3"
+    }
+  },
+  "evidence": {
+    "source_preflight": {
+      "path": "source-preflight.json",
+      "sha256": "3fa71e1dd82fcf96f1718ca8a5497b187ce5cbe21ae2ab131be060606fee6785"
+    },
+    "build_sources": {
+      "path": "evidence/build-sources.json",
+      "sha256": "d1bfe96afdfaf9efd43edc7d84aa3f7bb4e66051ef90a0bc62424bab79dd99aa"
+    },
+    "installed_validation": {
+      "path": "evidence/installed-validation.json",
+      "sha256": "90640f1d826c33062ce42459a74f6a380f453d5de37b30a8391702ca184ed820"
+    },
+    "live_operators": {
+      "path": "evidence/live-operators.json",
+      "sha256": "88a94892dcc59a59b77533c6b4c4a454f8081d7f0685b8d14e63c289128d09cf"
+    },
+    "model_comparison": {
+      "path": "evidence/model-comparison.json",
+      "sha256": "d3becc2e6831815c796199f5200480e875577eba0f2d9fb557c0c94ce39b8fb1"
+    },
+    "service_smoke": {
+      "path": "evidence/service-smoke.json",
+      "sha256": "de2f175565952ac8fbc45409e2e194ba335968f3a6138a1ff7d06519909f1654"
+    },
+    "service_log": {
+      "path": "evidence/service-graph-4096.log",
+      "sha256": "77cf94924bdf593ac1d8fe3f2e353dceb28e26f16e435f3e3afc4583efa9c31a"
+    },
+    "humaneval_score": {
+      "path": "evidence/humaneval64/score-summary.json",
+      "sha256": "f167d8dab00fec92f8a9c8fcd9448d1dc6fd09a7eeb99ace866b14db6fac3dad"
+    },
+    "cleanup": {
+      "path": "evidence/cleanup.json",
+      "sha256": "2d63b82fada022348583908b819ac4bba3d39e86d03fdf974f86fb5279c807b3"
+    }
+  },
+  "completed_at": "2026-10-27T04:33:11Z"
 }
