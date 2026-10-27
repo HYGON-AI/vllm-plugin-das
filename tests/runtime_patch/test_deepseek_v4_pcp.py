@@ -856,9 +856,15 @@ def test_local_prefill_runs_write_local_output_in_place(
     (False, True, "legacy"),
     (False, False, None),
 ])
+@pytest.mark.parametrize("shadow_getattr", [False, True])
 def test_pcp_insert_op_prefers_public_api_with_dtk_legacy_fallback(
-    monkeypatch, public, legacy, expected,
+    monkeypatch, public, legacy, expected, shadow_getattr,
 ):
+    if shadow_getattr:
+        # The audited resolver must not dispatch through this mutable name.
+        monkeypatch.setattr(
+            patch, "getattr", lambda *args: lambda: "private", raising=False,
+        )
     lightop = ModuleType("lightop")
     lightop.__path__ = []
     attention = ModuleType("lightop.attention")

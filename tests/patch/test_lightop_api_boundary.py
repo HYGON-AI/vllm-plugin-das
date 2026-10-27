@@ -1,7 +1,11 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright (c) 2026 Hygon Information Technology Co., Ltd.
 
-"""Fail-closed production boundary for the public categorized LightOp API."""
+"""Source policy for public LightOp imports, with an exact legacy fallback.
+
+This audits repository source; it is not a sandbox for arbitrary Python code
+or external modules that mutate interpreter state.
+"""
 
 from __future__ import annotations
 
@@ -75,6 +79,27 @@ LEGACY_MODULE_ALLOWED_SYMBOLS = {
 }
 
 
+# Reviewed syntax for the sole legacy dispatcher fallback. Comments and source
+# positions are intentionally ignored; executable changes require a new audit.
+PCP_RESOLVER_SOURCE = """\
+@functools.cache
+def _pcp_insert_op():
+    try:
+        from lightop import attention as native
+        op = native.fused_deepseek_v4_qnorm_rope_kv_rope_quant_insert_pcp
+    except (ImportError, AttributeError):
+        op = None
+    if callable(op):
+        return op
+    try:
+        from lightop import op as legacy_native
+        op = legacy_native.fused_deepseek_v4_qnorm_rope_kv_rope_quant_insert_pcp
+    except (ImportError, AttributeError):
+        return None
+    return op if callable(op) else None
+"""
+
+
 def _attribute_parts(node: ast.Attribute) -> tuple[ast.expr, list[str]]:
     parts: list[str] = []
     current: ast.expr = node
@@ -111,6 +136,9 @@ class _LightOpVisitor(ast.NodeVisitor):
         self._violation_keys: set[tuple[int, str]] = set()
         self._functions: list[str] = []
         self.dynamic_loader_aliases: set[str] = {"__import__", "import_module"}
+        self._audited_legacy_nodes: set[int] = set()
+        self._functools_imports: set[int] = set()
+        self._pcp_calls: set[int] = set()
 
     def _violate(self, node: ast.AST, detail: str) -> None:
         line = getattr(node, "lineno", 1)
@@ -143,6 +171,34 @@ class _LightOpVisitor(ast.NodeVisitor):
 
     def visit_Module(self, node: ast.Module) -> None:
         if self.relative_path in LEGACY_MODULE_OWNERS:
+            self._functools_imports = {
+                id(child) for child in node.body
+                if isinstance(child, ast.Import)
+                and len(child.names) == 1
+                and child.names[0].name == "functools"
+                and child.names[0].asname is None
+            }
+            if len(self._functools_imports) != 1:
+                self._violate(node, "PCP fallback requires one absolute functools import")
+            self._pcp_calls = {
+                id(child.func) for child in ast.walk(node)
+                if isinstance(child, ast.Call)
+                and isinstance(child.func, ast.Name)
+                and child.func.id == "_pcp_insert_op"
+            }
+            resolver = _resolver(node, "_pcp_insert_op")
+            expected = ast.parse(PCP_RESOLVER_SOURCE).body[0]
+            if (
+                resolver is None
+                or ast.dump(resolver) != ast.dump(expected)
+            ):
+                self._violate(
+                    node, "PCP resolver is not the exact audited fallback",
+                )
+            else:
+                self._audited_legacy_nodes = {
+                    id(child) for child in ast.walk(resolver)
+                }
             # Globals are resolved when helpers run, so collect aliases before
             # visiting any body. Keep aliases conservatively across scopes and
             # rebindings: this boundary must not grant an unchecked loader call.
@@ -175,6 +231,16 @@ class _LightOpVisitor(ast.NodeVisitor):
     def _reject_getattr_binding(self, node: ast.AST, name: str) -> None:
         if name == "getattr" and self.relative_path in LEGACY_MODULE_OWNERS:
             self._violate(node, "builtin 'getattr' is shadowed in legacy owner")
+        if (
+            self.relative_path in LEGACY_MODULE_OWNERS
+            and name in {
+                "callable", "ImportError", "AttributeError",
+                "functools", "_pcp_insert_op",
+            }
+            and id(node) not in self._audited_legacy_nodes
+            and id(node) not in self._functools_imports
+        ):
+            self._violate(node, f"PCP fallback dependency {name!r} is rebound")
 
     def _reject_builtin_namespace(self, node: ast.AST, name: str) -> None:
         # Reject the namespace source, including when copied to another alias:
@@ -185,7 +251,8 @@ class _LightOpVisitor(ast.NodeVisitor):
         # to legacy owners, which do not need sys for their audited fallback.
         if self.relative_path in LEGACY_MODULE_OWNERS and name in {
             "globals", "locals", "vars", "__builtins__", "builtins", "sys",
-        }:
+            "functools",
+        } and id(node) not in self._functools_imports:
             self._violate(node, "builtin namespace access in legacy owner")
 
     def visit_FunctionDef(self, node: ast.FunctionDef) -> None:
@@ -210,6 +277,8 @@ class _LightOpVisitor(ast.NodeVisitor):
         # scope, before parameter names shadow imported aliases in the body.
         for decorator in node.decorator_list:
             self.visit(decorator)
+        for parameter in getattr(node, "type_params", ()):
+            self.visit(parameter)
         for default in (*node.args.defaults, *node.args.kw_defaults):
             if default is not None:
                 self.visit(default)
@@ -314,6 +383,10 @@ class _LightOpVisitor(ast.NodeVisitor):
                 )
         if module == "lmslim" or module.startswith("lmslim."):
             self._violate(node, f"external LMSlim import from {module!r}")
+        elif node.level and (
+            module == "lightop" or module.startswith("lightop.")
+        ):
+            self._violate(node, "relative LightOp import is not a public import")
         elif module == "lightop":
             for alias in node.names:
                 if alias.name in PUBLIC_CATEGORIES:
@@ -336,6 +409,13 @@ class _LightOpVisitor(ast.NodeVisitor):
                         alias.asname or alias.name,
                     )
                     allowed_symbols = LEGACY_MODULE_ALLOWED_SYMBOLS.get(module_key)
+                    if (
+                        allowed_symbols is not None
+                        and id(node) not in self._audited_legacy_nodes
+                    ):
+                        self._violate(
+                            node, "legacy import outside exact PCP fallback",
+                        )
                     if allowed_symbols is not None:
                         self.legacy_module_aliases[alias.asname or alias.name] = (
                             allowed_symbols
@@ -362,6 +442,20 @@ class _LightOpVisitor(ast.NodeVisitor):
     def visit_Attribute(self, node: ast.Attribute) -> None:
         root, parts = _attribute_parts(node)
         if isinstance(root, ast.Name) and parts:
+            if (
+                self.relative_path in LEGACY_MODULE_OWNERS
+                and root.id in {"functools", "_pcp_insert_op"}
+            ):
+                if (
+                    root.id == "_pcp_insert_op"
+                    or not isinstance(node.ctx, ast.Load)
+                    or len(parts) != 1
+                    or parts[0] not in {"cache", "wraps"}
+                    or (parts[0] == "cache"
+                        and id(node) not in self._audited_legacy_nodes)
+                ):
+                    self._violate(node, "PCP fallback dependency attribute escape")
+                return
             if root.id in self.lmslim_root_aliases:
                 reference = ".".join((root.id, *parts))
                 self._violate(
@@ -386,7 +480,8 @@ class _LightOpVisitor(ast.NodeVisitor):
             elif root.id in self.legacy_module_aliases:
                 allowed = self.legacy_module_aliases[root.id]
                 if (
-                    not isinstance(node.ctx, ast.Load)
+                    id(node) not in self._audited_legacy_nodes
+                    or not isinstance(node.ctx, ast.Load)
                     or len(parts) != 1
                     or parts[0] not in allowed
                 ):
@@ -402,6 +497,13 @@ class _LightOpVisitor(ast.NodeVisitor):
 
     def visit_Name(self, node: ast.Name) -> None:
         self._reject_builtin_namespace(node, node.id)
+        if (
+            self.relative_path in LEGACY_MODULE_OWNERS
+            and node.id == "_pcp_insert_op"
+            and isinstance(node.ctx, ast.Load)
+            and id(node) not in self._pcp_calls
+        ):
+            self._violate(node, "bare PCP fallback function escape")
         if isinstance(node.ctx, (ast.Store, ast.Del)):
             self._reject_getattr_binding(node, node.id)
         if node.id in self.lmslim_root_aliases:
@@ -559,21 +661,12 @@ class _LightOpVisitor(ast.NodeVisitor):
                             "dynamic categorized LightOp attribute lookup",
                         )
             elif owner in self.legacy_module_aliases:
-                allowed = self.legacy_module_aliases[owner]
-                symbol = (
-                    node.args[1].value
-                    if isinstance(node.args[1], ast.Constant)
-                    and isinstance(node.args[1].value, str)
-                    else None
+                # No getattr exemption: a rebound builtin can ignore even an
+                # allowlisted literal. Only the audited direct attribute is
+                # permitted. Still inspect every remaining argument.
+                self._violate(
+                    node, "unapproved legacy LightOp module attribute lookup",
                 )
-                if symbol not in allowed:
-                    self._violate(
-                        node,
-                        "unapproved legacy LightOp module attribute lookup",
-                    )
-                # The module Name is valid only as the owner of this guarded
-                # lookup. Visit every other expression so nested violations
-                # are still detected without treating the owner as a bare use.
                 self.visit(node.func)
                 for argument in node.args[1:]:
                     self.visit(argument)
@@ -908,7 +1001,7 @@ def _write_mutation_owner(
         legacy_owner = tmp_path / relative_path
         legacy_owner.parent.mkdir(parents=True, exist_ok=True)
         with legacy_owner.open("a", encoding="utf-8") as stream:
-            stream.write(f"from lightop import {symbol} as {alias}\n")
+            stream.write("import functools\n" + PCP_RESOLVER_SOURCE)
     return root
 
 
@@ -1178,6 +1271,143 @@ def test_scanner_allows_sys_outside_legacy_owner(tmp_path: Path) -> None:
     )
 
     assert scan_lightop_imports(root) == []
+
+
+@pytest.mark.parametrize(
+    ("old", "new"),
+    [
+        ("@functools.cache", "@replacement"),
+        ("def _pcp_insert_op():", "def _pcp_insert_op(getattr=replacement):"),
+        ("from lightop import op as legacy_native",
+         "from .lightop import op as legacy_native"),
+        ("op = legacy_native.", "op = other."),
+        ("    if callable(op):", "    if False:"),
+        ("    return op if callable(op) else None", "    return replacement"),
+        ("    try:\n        from lightop import op",
+         "    replacement()\n    try:\n        from lightop import op"),
+    ],
+)
+def test_scanner_rejects_changed_pcp_resolver(
+    tmp_path: Path,
+    old: str,
+    new: str,
+) -> None:
+    root = _write_mutation_owner(tmp_path)
+    relative_path, _, _ = next(iter(LEGACY_TOP_LEVEL_MODULE_IMPORTS))
+    owner = tmp_path / relative_path
+    source = owner.read_text(encoding="utf-8")
+    assert old in source
+    owner.write_text(source.replace(old, new, 1), encoding="utf-8")
+
+    assert any(
+        "PCP resolver is not the exact audited fallback" in item
+        for item in scan_lightop_imports(root)
+    )
+
+
+@pytest.mark.parametrize(
+    "mutation",
+    [
+        "callable = replacement",
+        "ImportError = Exception",
+        "AttributeError = Exception",
+        "_pcp_insert_op = replacement",
+        "del _pcp_insert_op",
+        "from helpers import replacement as _pcp_insert_op",
+        "functools = replacement",
+        "functools.cache = replacement",
+        "cache = functools.cache",
+        "module = functools",
+        "functools.__dict__['cache'] = replacement",
+        "_pcp_insert_op.__wrapped__ = replacement",
+        "target = _pcp_insert_op",
+        "def other(_pcp_insert_op):\n    pass",
+        "import importlib; importlib.import_module('functools').cache = replacement",
+    ],
+)
+def test_scanner_rejects_pcp_fallback_dependency_mutation(
+    tmp_path: Path,
+    mutation: str,
+) -> None:
+    root = _write_mutation_owner(tmp_path)
+    relative_path, _, _ = next(iter(LEGACY_TOP_LEVEL_MODULE_IMPORTS))
+    owner = tmp_path / relative_path
+    with owner.open("a", encoding="utf-8") as stream:
+        stream.write(f"\n{mutation}\n")
+
+    assert scan_lightop_imports(root)
+
+
+def test_scanner_allows_pcp_resolver_comments(tmp_path: Path) -> None:
+    root = _write_mutation_owner(tmp_path)
+    relative_path, _, _ = next(iter(LEGACY_TOP_LEVEL_MODULE_IMPORTS))
+    owner = tmp_path / relative_path
+    owner.write_text(
+        owner.read_text(encoding="utf-8").replace(
+            "def _pcp_insert_op():",
+            "def _pcp_insert_op():\n    # Documentation is not executable.",
+        ),
+        encoding="utf-8",
+    )
+
+    assert scan_lightop_imports(root) == []
+
+
+@pytest.mark.parametrize(
+    "expression",
+    [
+        "legacy_native.fused_deepseek_v4_qnorm_rope_kv_rope_quant_insert_pcp",
+        "getattr(legacy_native, "
+        "'fused_deepseek_v4_qnorm_rope_kv_rope_quant_insert_pcp', None)",
+    ],
+)
+def test_scanner_rejects_approved_symbol_outside_pcp_resolver(
+    tmp_path: Path,
+    expression: str,
+) -> None:
+    root = _write_mutation_owner(tmp_path)
+    relative_path, _, _ = next(iter(LEGACY_TOP_LEVEL_MODULE_IMPORTS))
+    owner = tmp_path / relative_path
+    with owner.open("a", encoding="utf-8") as stream:
+        stream.write(f"\ndef outside():\n    return {expression}\n")
+
+    assert any(
+        "unapproved legacy LightOp module attribute" in item
+        for item in scan_lightop_imports(root)
+    )
+
+
+@pytest.mark.parametrize("module", ["lightop", "lightop.attention"])
+def test_scanner_rejects_relative_category_import(
+    tmp_path: Path,
+    module: str,
+) -> None:
+    root = _write_mutation_owner(tmp_path)
+    (root / "relative.py").write_text(
+        f"from .{module} import attention\n", encoding="utf-8",
+    )
+
+    assert any(
+        "relative LightOp import is not a public import" in item
+        for item in scan_lightop_imports(root)
+    )
+
+
+@pytest.mark.skipif(sys.version_info < (3, 12), reason="PEP 695 requires Python 3.12")
+def test_scanner_checks_function_type_parameter_bounds(tmp_path: Path) -> None:
+    root = _write_mutation_owner(tmp_path)
+    relative_path, _, _ = next(iter(LEGACY_TOP_LEVEL_MODULE_IMPORTS))
+    owner = tmp_path / relative_path
+    with owner.open("a", encoding="utf-8") as stream:
+        stream.write(
+            "\ndef forbidden[T: legacy_native.any_private_kernel]():\n"
+            "    pass\n"
+        )
+
+    assert any(
+        "unapproved legacy LightOp module attribute" in item
+        for item in scan_lightop_imports(root)
+    )
 
 
 @pytest.mark.parametrize(
