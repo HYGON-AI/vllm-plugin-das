@@ -33,6 +33,11 @@ def test_worker_binds_target_and_draft_in_initial_pool(monkeypatch, with_draft, 
     pool_entries = []
     allocations = []
     bound = set()
+    vllm_config = SimpleNamespace()
+
+    def is_deepseek_v4(config):
+        assert config is vllm_config
+        return False
 
     @contextmanager
     def weights_pool():
@@ -73,8 +78,12 @@ def test_worker_binds_target_and_draft_in_initial_pool(monkeypatch, with_draft, 
         def get_draft_model(self):
             return self.draft
 
+    RunnerBase.vllm_config = vllm_config
     runner_cls = load_method(
-        "vllm_hcu/v1/hcu_model_runner_v2.py", "HcuGPUModelRunnerV2", RunnerBase, {},
+        "vllm_hcu/v1/hcu_model_runner_v2.py",
+        "HcuGPUModelRunnerV2",
+        RunnerBase,
+        {"is_deepseek_v4": is_deepseek_v4},
     )
 
     class WorkerBase:
