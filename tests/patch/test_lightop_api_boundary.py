@@ -110,6 +110,7 @@ class _LightOpVisitor(ast.NodeVisitor):
         self.violations: list[str] = []
         self._violation_keys: set[tuple[int, str]] = set()
         self._functions: list[str] = []
+        self.dynamic_loader_aliases: set[str] = {"__import__", "import_module"}
 
     def _violate(self, node: ast.AST, detail: str) -> None:
         line = getattr(node, "lineno", 1)
@@ -117,6 +118,59 @@ class _LightOpVisitor(ast.NodeVisitor):
         if key not in self._violation_keys:
             self._violation_keys.add(key)
             self.violations.append(f"{self.relative_path}:{line}: {detail}")
+
+    def _is_dynamic_loader(self, node: ast.AST) -> bool:
+        return (
+            isinstance(node, ast.Name)
+            and node.id in self.dynamic_loader_aliases
+        ) or (
+            isinstance(node, ast.Attribute)
+            and node.attr in {"import_module", "__import__"}
+        )
+
+    def _collect_loader_assignment(
+        self, target: ast.expr, value: ast.expr,
+    ) -> None:
+        if isinstance(target, ast.Name) and self._is_dynamic_loader(value):
+            self.dynamic_loader_aliases.add(target.id)
+        elif (
+            isinstance(target, (ast.Tuple, ast.List))
+            and isinstance(value, (ast.Tuple, ast.List))
+            and len(target.elts) == len(value.elts)
+        ):
+            for child_target, child_value in zip(target.elts, value.elts):
+                self._collect_loader_assignment(child_target, child_value)
+
+    def visit_Module(self, node: ast.Module) -> None:
+        if self.relative_path in LEGACY_MODULE_OWNERS:
+            # Globals are resolved when helpers run, so collect aliases before
+            # visiting any body. Keep aliases conservatively across scopes and
+            # rebindings: this boundary must not grant an unchecked loader call.
+            nodes = list(ast.walk(node))
+            for child in nodes:
+                if isinstance(child, ast.ImportFrom) and child.level == 0:
+                    for alias in child.names:
+                        if (child.module, alias.name) in {
+                            ("importlib", "import_module"),
+                            ("builtins", "__import__"),
+                        }:
+                            self.dynamic_loader_aliases.add(
+                                alias.asname or alias.name
+                            )
+            while True:
+                previous = self.dynamic_loader_aliases.copy()
+                for child in nodes:
+                    if isinstance(child, ast.Assign):
+                        for target in child.targets:
+                            self._collect_loader_assignment(target, child.value)
+                    elif isinstance(child, (ast.AnnAssign, ast.NamedExpr)):
+                        if child.value is not None:
+                            self._collect_loader_assignment(
+                                child.target, child.value,
+                            )
+                if self.dynamic_loader_aliases == previous:
+                    break
+        self.generic_visit(node)
 
     def _reject_getattr_binding(self, node: ast.AST, name: str) -> None:
         if name == "getattr" and self.relative_path in LEGACY_MODULE_OWNERS:
@@ -378,13 +432,7 @@ class _LightOpVisitor(ast.NodeVisitor):
         # A computed module name could resolve to the mutable builtin
         # namespace. Require a literal in legacy owners instead of attempting
         # to evaluate arbitrary expressions or track their runtime values.
-        if (
-            isinstance(node.func, ast.Name)
-            and node.func.id in {"__import__", "import_module"}
-        ) or (
-            isinstance(node.func, ast.Attribute)
-            and node.func.attr == "import_module"
-        ):
+        if self._is_dynamic_loader(node.func):
             module_name = (
                 node.args[0]
                 if node.args
@@ -1009,6 +1057,73 @@ def test_scanner_accepts_literal_safe_imports_in_legacy_owner(
     owner = tmp_path / relative_path
     with owner.open("a", encoding="utf-8") as stream:
         stream.write(f"\nimport importlib\n{import_call}\n")
+
+    assert scan_lightop_imports(root) == []
+
+
+@pytest.mark.parametrize(
+    "binding",
+    [
+        "from importlib import import_module as load",
+        "import importlib as il; load = il.import_module",
+        "load = __import__",
+        "from importlib import import_module; load = import_module",
+        "from importlib import import_module as first; load = first",
+        "import importlib; first = importlib.import_module; load = first",
+        "import importlib; first = second = importlib.import_module; load = second",
+        "import importlib; load: object = importlib.import_module",
+        "import importlib; (load := importlib.import_module)",
+        "import importlib; load, other = importlib.import_module, None",
+    ],
+)
+@pytest.mark.parametrize("module_arg", ["module_name", "'builtins'"])
+def test_scanner_rejects_dynamic_loader_aliases(
+    tmp_path: Path,
+    binding: str,
+    module_arg: str,
+) -> None:
+    root = _write_mutation_owner(tmp_path)
+    relative_path, _, _ = next(iter(LEGACY_TOP_LEVEL_MODULE_IMPORTS))
+    owner = tmp_path / relative_path
+    with owner.open("a", encoding="utf-8") as stream:
+        # The helper precedes its global binding to exercise runtime lookup.
+        stream.write(
+            "\ndef forbidden():\n"
+            f"    load({module_arg}).getattr = replacement\n"
+            "    return getattr(legacy_native, "
+            "'fused_deepseek_v4_qnorm_rope_kv_rope_quant_insert_pcp', None)\n"
+            "module_name = 'builtins'\n"
+            "replacement = lambda owner, _name, *default: owner.any_private_kernel\n"
+            f"{binding}\n"
+            "forbidden()\n"
+        )
+
+    violations = scan_lightop_imports(root)
+
+    assert any(
+        "nonliteral dynamic import in legacy owner" in item
+        or "builtin namespace access in legacy owner" in item
+        for item in violations
+    )
+
+
+@pytest.mark.parametrize(
+    "binding",
+    [
+        "from importlib import import_module as load",
+        "import importlib; first = importlib.import_module; load = first",
+        "load = __import__",
+    ],
+)
+def test_scanner_accepts_safe_literal_loader_aliases(
+    tmp_path: Path,
+    binding: str,
+) -> None:
+    root = _write_mutation_owner(tmp_path)
+    relative_path, _, _ = next(iter(LEGACY_TOP_LEVEL_MODULE_IMPORTS))
+    owner = tmp_path / relative_path
+    with owner.open("a", encoding="utf-8") as stream:
+        stream.write(f"\n{binding}\nload('math')\n")
 
     assert scan_lightop_imports(root) == []
 
