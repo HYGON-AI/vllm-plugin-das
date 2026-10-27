@@ -209,6 +209,7 @@ _CORE_CALLBACKS: tuple[_CallbackSpec, ...] = (
     _CallbackSpec(_adapter("core_fix", "patch_deepseek_v4_bf16_compressor")),
     _CallbackSpec(_adapter("core_fix", "patch_deepseek_v4_c128_splits")),
     _CallbackSpec(_adapter("core_fix", "patch_deepseek_v4_load_weights")),
+    _CallbackSpec(_adapter("core_fix", "patch_deepseek_v4_megamoe")),
     _CallbackSpec(_adapter("core_fix", "patch_deepseek_v4_eplb")),
     _CallbackSpec(_adapter("core_fix", "patch_deepseek_v4_mtp_eplb")),
     _CallbackSpec(_adapter("core_fix", "patch_deepseek_v4_dspark_target")),
@@ -411,8 +412,9 @@ _FRAMEWORK_CALLBACKS: tuple[_CallbackSpec, ...] = (
         _adapter("framework_opt", "patch_draft_speculator_inputs"),
     ),
     # Wraps whatever DSpark draft loader adapter installed at callback time
-    # by object identity, so the K3 smoke layer limit never reaches the
-    # draft model.  Order after patch_draft_speculator_inputs is required.
+    # by object identity, not by rebinding module globals (role-separation
+    # adapters do not exist on this line; ordering after
+    # patch_draft_speculator_inputs is still required).
     _CallbackSpec(
         _adapter("framework_opt", "patch_smoke_draft_guard"),
     ),
