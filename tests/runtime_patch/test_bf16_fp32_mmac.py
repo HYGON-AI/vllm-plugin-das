@@ -39,6 +39,38 @@ def test_supported_contract(m, n, k, expected):
     assert bf16_fp32_mmac.supported(x, w) is expected
 
 
+@pytest.mark.parametrize(
+    ("k", "expected"),
+    [
+        (524288, True),
+        (524416, False),
+        (786432, False),
+    ],
+)
+def test_supported_limits_buffer_resource_by_bytes(monkeypatch, k, expected):
+    class FakeTensor:
+        dtype = torch.bfloat16
+        device = torch.device("cuda:0")
+        is_cuda = True
+
+        def __init__(self, shape):
+            self.shape = shape
+
+        def dim(self):
+            return 2
+
+        def is_contiguous(self):
+            return True
+
+        def data_ptr(self):
+            return 16
+
+    monkeypatch.setattr(bf16_fp32_mmac, "_device_has_mmac", lambda _: True)
+    x = FakeTensor((8, k))
+    weight = FakeTensor((2048, k))
+    assert bf16_fp32_mmac.supported(x, weight) is expected
+
+
 def test_dispatcher_routes_small_m(monkeypatch):
     monkeypatch.setenv("VLLM_HCU_USE_CUSTOM_OPS", "1")
     monkeypatch.setenv("VLLM_HCU_BF16_FP32_MMAC", "1")

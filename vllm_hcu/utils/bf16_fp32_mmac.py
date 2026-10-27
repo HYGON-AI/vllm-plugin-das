@@ -18,7 +18,9 @@ import torch
 SUPPORTED_N = frozenset((256, 512, 1024, 2048))
 _MMAC_ARCHES = ("gfx928", "gfx936", "gfx938")
 MAX_M = 64
-_MAX_INT32 = (1 << 31) - 1
+_BF16_BYTES = 2
+# Must match the byte range encoded in make_buffer_resource().
+_BUFFER_RESOURCE_RANGE_BYTES = 0x80000000
 
 _SOURCE = r"""
 #include <torch/extension.h>
@@ -315,8 +317,8 @@ def supported(x: torch.Tensor, weight: torch.Tensor) -> bool:
         and k == weight_k
         and k > 0
         and k % 128 == 0
-        and m * k <= _MAX_INT32
-        and n * k <= _MAX_INT32
+        and m * k * _BF16_BYTES <= _BUFFER_RESOURCE_RANGE_BYTES
+        and n * k * _BF16_BYTES <= _BUFFER_RESOURCE_RANGE_BYTES
         and x.dtype == torch.bfloat16
         and weight.dtype == torch.bfloat16
         and x.is_cuda
