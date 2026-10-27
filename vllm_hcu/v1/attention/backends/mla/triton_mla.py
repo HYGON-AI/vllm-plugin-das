@@ -24,7 +24,6 @@ from vllm.v1.attention.backends.utils import (
 
 logger = init_logger(__name__)
 
-_DSPARK_FLASH_ENV = "VLLM_HCU_K3_DSPARK_FLASH_MLA"
 _FP8_E4M3 = torch.float8_e4m3fn
 # The vendor fp8 kernel consumes 64-token pages (its kBlockN tile). Hybrid
 # page-size alignment may enlarge the *manager* block to a whole multiple of
@@ -48,21 +47,14 @@ def _is_flash_kv_dtype(kv_cache_dtype: str) -> bool:
     )
 
 
-# Debug-level knob for the non-causal fast path (TP8 fault hunt,
-# 2026-10-27). Semantics, highest first; a fault at level L with a pass at
-# L-1 localizes the trigger to the feature L adds:
-#   4 full fast path: buffers + metadata calls + launches (OPT-IN ONLY)
-#   3           level 2 + single-split eager launches (fix10 guard)
-#   2           level 1 + ALL vendor metadata calls (builder per-step
-#               get_mla_metadata_dense_fp8, eager rebuild), zero kernel
-#               launches from the fast path
-#   1           persistent buffers allocated, zero vendor ops, zero
-#               launches -- pure VA-layout probe
-#   0           fast path fully inert (allocations included)
-# DEFAULT IS 0 (inert): on TP8 every gate-on startup this day crashed
-# before serving one request. Re-enable with LEVEL=4 or the legacy
-# VLLM_HCU_K3_DSPARK_FLASH_MLA=1 once the root cause is fixed.
-_DFLASH_LEVEL_ENV = "VLLM_HCU_K3_DSPARK_FLASH_LEVEL"
+# FIX13 (2026-10-27): the TP8 fault root cause was a builder rebuild
+# after the capture epoch freeing the persistent buffers that captured
+# DSpark graphs still reference. With the buffer registry below the fast
+# path is always on -- no debug ladder, no gate: an unloaded DSpark draft
+# never constructs these buffers, and availability follows from the
+# same conditions the stock path checks (dp dtype, page geometry,
+# vendor presence). VA-LEDGER keeps its reuse=/gen= fields as the
+# standing self-check of the fix.
 
 # FIX13 (TP8 root cause): process-lifetime storage for flash fast-path
 # metadata buffers. The engine rebuilds builders after the capture epoch
@@ -73,26 +65,12 @@ _DFLASH_LEVEL_ENV = "VLLM_HCU_K3_DSPARK_FLASH_LEVEL"
 _FLASH_BUF_REGISTRY: dict = {}
 
 
-def _dflash_level() -> int:
-    raw = os.environ.get(_DFLASH_LEVEL_ENV, "").strip()
-    if raw:
-        try:
-            return max(0, min(4, int(raw)))
-        except ValueError:
-            pass
-    # Default INERT until the TP8 fault root cause is fixed: every gate-on
-    # restart this day (160236-174757) died before serving one request, so
-    # silence must mean safe, and enabling the fast path is always an
-    # explicit act (LEVEL=4, or the legacy gate set to a truthy value).
-    gate = os.environ.get(_DSPARK_FLASH_ENV)
-    if gate is None:
-        return 0
-    return 0 if gate in ("0", "false", "False") else 4
-
-
 def _flash_gate_enabled() -> bool:
-    # Kill-switch for the non-causal multi-row decode fast path.
-    return _dflash_level() > 0
+    # FIX13: always on wherever the buffers can exist; the guard chain in
+    # forward_mqa/_fill_flash_sched retains every correctness gate
+    # (non-causal group, multi-row query, fp8 kv, page geometry, vendor
+    # ops import).
+    return True
 
 
 def _dense_flash_ok() -> bool:
@@ -194,7 +172,7 @@ class HcuTritonMLAMetadataBuilder(TritonMLAMetadataBuilder):
                         (num_sms * 4, 8), dtype=torch.int32,
                         device=device,
                     ),
-                    "nsplits": torch.empty(
+                    "nsplits": torch.zeros(
                         max_seqs, dtype=torch.int32, device=device
                     ),
                     "bt": torch.zeros(
@@ -218,21 +196,24 @@ class HcuTritonMLAMetadataBuilder(TritonMLAMetadataBuilder):
             # vLLM pads table columns beyond a request's allocation with
             # out-of-pool null-block ids; every id this builder hands to
             # the flash kernel is clipped into [0, _hcu_pool_pages) so
-            # even a speculative over-read lands on a real page.
-            self._hcu_pool_pages = (
-                int(getattr(kv_cache_spec, "num_blocks", 0) or 0) * subpage
-            )
+            # even a speculative over-read lands on a real page. num_blocks
+            # lives on the cache config, not the spec: the spec attribute
+            # is always absent, which silently disabled fix9's clamp
+            # (pool_pages=0 in every LEDGER line so far).
+            n_gpu_blocks = getattr(
+                vllm_config.cache_config, "num_gpu_blocks", 0
+            ) or 0
+            self._hcu_pool_pages = int(n_gpu_blocks) * subpage
             # Faulthunt VA ledger (2026-10-27): one line per rank mapping
             # every persistent tensor address+extent, so a fault VA can be
             # placed against (or between) tensor bounds without a rerun.
-            # fix13 adds reuse= : the acceptance check for the TP8 fix is
-            # now "16 unique address sets, each logged twice with
-            # reuse=yes" (one line per draft group per rebuild wave).
+            # fix13 adds reuse=/gen=: acceptance = every address pair
+            # logged once per rebuild wave with reuse=yes gen=N/N+1.
             _vllogger.info(
-                "HcuTritonMLA VA-LEDGER dev=%s level=%d reuse=%s gen=%d "
+                "HcuTritonMLA VA-LEDGER dev=%s reuse=%s gen=%d "
                 "sched=[0x%x +64 rows x8] nsplits=[0x%x +%d] "
                 "bt=[0x%x +%d B (%dx%d i32)] pool_pages=%d",
-                device, _dflash_level(),
+                device,
                 "yes" if self._hcu_buf_reused else "no",
                 self._hcu_buf_gen,
                 self._hcu_sched_buf.data_ptr(),
@@ -263,33 +244,16 @@ class HcuTritonMLAMetadataBuilder(TritonMLAMetadataBuilder):
             num_decode_tokens,
             dcp_tot_seq_lens_device,
         )
-        if self._hcu_flash_ready and _dflash_level() >= 2:
-            # Level 4/3 launch the kernel; level 2 exercises the vendor
-            # metadata side effect only (faulthunt); the fill below raises
-            # on multi-split demand, so level 2 still stops short of any
-            # metadata output being consumed by a captured graph.
-            try:
-                self._fill_flash_sched(
-                    decode_md, seq_lens_device, block_table_tensor,
-                    max_seq_len, num_decode_tokens,
-                )
-            except Exception as exc:
-                # Refresh failures must not disable the builder: graphs
-                # already captured around the flash kernel keep replaying
-                # from these buffers, and a stopped builder would leave
-                # them reading stale page tables. New shapes re-derive
-                # their scheduler only on the next successful fill.
-                # warning_once takes no exc_info kwarg in this vLLM, so
-                # the cause is inlined instead; str(exc) (not the exc
-                # object) keeps the once-dedupe key hashable by value --
-                # exception instances would log a line per step and pin
-                # their tracebacks in the logger's lru_cache.
-                logger.warning_once(
-                    "HcuTritonMLA: FlashMLA scheduler precompute failed "
-                    "this step (%s: %s); later steps retry the flash "
-                    "path and keep the stock Triton path meanwhile.",
-                    type(exc).__name__, str(exc),
-                )
+        if self._hcu_flash_ready:
+            # FIX13: a swallowed fill failure after capture equals a
+            # replay with a stale plan (tile/nsplits from a different
+            # batch), and the captured node re-reads the buffers without
+            # running any Python. Buffer-state inconsistencies are there-
+            # fore fatal, not degradable: raise out of the build step.
+            self._fill_flash_sched(
+                decode_md, seq_lens_device, block_table_tensor,
+                max_seq_len, num_decode_tokens,
+            )
         return decode_md
 
     def _fill_flash_sched(
@@ -339,24 +303,6 @@ class HcuTritonMLAMetadataBuilder(TritonMLAMetadataBuilder):
         demand_cols = (
             -(-max_seq_len // _FLASH_PAGE_BLOCK) + subpage - 1
         ) // subpage
-        if demand_cols > 1:
-            # Split-KV engagement guard (TP8 VMFault, runs 160236/163011/
-            # 171312): every observed fault wave had the fast-path kernel
-            # in a multi-split launch (real long-prefix decode, or the
-            # profile-length FULL-capture dummy), while every green
-            # launch -- DSpark capture dummies on both nodes, TP4 smoke,
-            # 12 startup passes -- was single-split (<= one manager
-            # block). The in-pool id clamp removed the sentinel writer,
-            # yet the fault persisted, so a second over-read lives in the
-            # vendor split/combine path's assumptions about our persistent
-            # scheduler views. Until that is pinned, refuse multi-split
-            # fills here on the CPU side (no device sync, capture-safe):
-            # the step degrades to the stock kernel via the missing
-            # hcu_flash_sched metadata, never to a partial buffer.
-            raise RuntimeError(
-                f"hcu flash fast path refused: multi-split window "
-                f"(pages {demand_cols} > 1) not yet proven safe"
-            )
         if demand_cols > self._hcu_bt_cols:
             raise RuntimeError(
                 f"hcu walk window {demand_cols} exceeds flash buffer "
@@ -381,6 +327,25 @@ class HcuTritonMLAMetadataBuilder(TritonMLAMetadataBuilder):
             raise RuntimeError(
                 f"hcu nsplits rows {m} exceed buffer "
                 f"{self._hcu_nsplits_buf.shape[0]}"
+            )
+        # Plan-consistency invariant (fix13 plan/graph desync defense):
+        # the captured node allocates o/lse/o_accum/lse_accum sized from
+        # the CAPTURE-time B + n, and the split writes/combine reads are
+        # bounded only when tile and nsplits belong to the SAME call for
+        # the SAME batch. A different row count means a shape change the
+        # graph cannot absorb -- fail loudly here instead of letting the
+        # replay step out of the capture pool.
+        if m != num_decodes + 1:
+            raise RuntimeError(
+                f"hcu plan mismatch: nsplits rows {m} != decodes+1 "
+                f"{num_decodes + 1}"
+            )
+        if getattr(self, "_hcu_sched_rows", None) is None:
+            self._hcu_sched_rows = n
+        elif n != self._hcu_sched_rows:
+            raise RuntimeError(
+                f"hcu plan mismatch: scheduler rows {n} != captured "
+                f"{self._hcu_sched_rows}"
             )
 
         # Write section (no-throw): only the walked window is expanded.
@@ -444,12 +409,10 @@ class HcuTritonMLAImpl(TritonMLAImpl):
         if (
             not attn_metadata.causal
             and _flash_gate_enabled()
-            and _dflash_level() >= 3
-            # FIX13 removes the eager-only exclusion: the TP8 fault was a
-            # builder rebuild after capture (use-after-free of the
-            # epoch-1 persistent buffers inside replayed draft graphs),
-            # not a capture-context hazard. The flash node belongs in the
-            # DSpark FULL graph; the registry keeps its buffers alive.
+            # FIX13: fast path lives inside DSpark FULL graphs again. The
+            # TP8 fault was a builder rebuild freeing capture-bound
+            # buffers (use-after-free at replay), fixed by the registry;
+            # no capture-context exclusion is wanted.
             and _is_flash_kv_dtype(self.kv_cache_dtype)
             # The vendor kernel walks 64-token pages. A manager block of
             # any whole multiple works through an expanded block table;
@@ -530,21 +493,13 @@ class HcuTritonMLAImpl(TritonMLAImpl):
                     "scheduler; this capture replays the stock Triton path."
                 )
                 return None
-            # faulthunt levels: level 2 = metadata side effect only, and it
-            # must not reach a launch; level >=3 pays the .item() sync for
-            # the single-split gate too, before any vendor call lands.
-            level = _dflash_level()
+            # Eager rebuild (spec-decode step shapes the builder did not
+            # see): full walk budget, no level gate. pages_needed pays a
+            # .item() sync -- acceptable only off the capture path.
             pages_needed = -(
                 -int(seq_lens[:num_decodes].max().item())
                 // _FLASH_PAGE_BLOCK
             )
-            if level < 3 and pages_needed > subpage:
-                logger.warning_once(
-                    "HcuTritonMLA: non-causal flash rebuild skipped "
-                    "(level=%d, pages %d > %d).",
-                    level, pages_needed, subpage,
-                )
-                return None
             tile, nsplits = get_mla_metadata_dense_fp8(
                 seq_lens, num_q_tokens_per_head_k, 1  # MQA shared latent
             )
@@ -555,17 +510,11 @@ class HcuTritonMLAImpl(TritonMLAImpl):
             # block pool); a full-width expansion would hand those to
             # the kernel, and split-KV stragglers do read them.
             bt_stock = decode.block_table[:num_decodes]
-            pages_needed = -(
-                -int(seq_lens[:num_decodes].max().item())
-                // _FLASH_PAGE_BLOCK
-            )
-            if pages_needed > subpage:
-                # Guard order note (faulthunt): the level<3 case with a
-                # multi-split demand bailed above BEFORE the vendor call;
-                # this second check only ever sees level>=3 (or a
-                # single-split demand that passed the first), so the
-                # multi-split launch guard keeps its fix10 meaning.
-                return None
+            if m != num_decodes + 1:
+                raise RuntimeError(
+                    f"hcu plan mismatch: eager nsplits rows {m} != "
+                    f"decodes+1 {num_decodes + 1}"
+                )
             src_cols = min(
                 -(-pages_needed // subpage),
                 bt_stock.shape[1],

@@ -155,9 +155,12 @@ class FlashMLAMetadataBuilder(MLACommonMetadataBuilder[FlashMLAMetadata]):
 
         if self.compilation_config.cudagraph_mode.has_full_cudagraphs():
             self.cg_buf_tile_scheduler_metadata = torch.zeros(
-                # Upper bound on size (<= #SMs, TileSchedulerMetaDataSize)
-                # TileSchedulerMetaDataSize = 8
-                (num_sms, 8),
+                # Fixed 4x upper bound: HCU dense-FP8 metadata rows can
+                # exceed #SMs (they grow with num_q_tokens_per_head_k, e.g.
+                # 128 for 7x16 on a 64-CU part), and growing later would
+                # free storage that captured graphs still point at.
+                # TileSchedulerMetaDataSize = 8.
+                (num_sms * 4, 8),
                 device=self.device,
                 dtype=torch.int32,
             )
@@ -194,21 +197,24 @@ class FlashMLAMetadataBuilder(MLACommonMetadataBuilder[FlashMLAMetadata]):
                 1,  # MQA for the decode path
             )
             # HCU dense-FP8 metadata can require more rows than the initial
-            # one-row-per-CU graph buffer. Grow persistent buffers when
-            # needed, but let the copy below return only the valid prefix.
-            if (
-                self.cg_buf_tile_scheduler_metadata is not None
-                and self.cg_buf_tile_scheduler_metadata.shape[0]
-                < tile_scheduler_metadata.shape[0]
-            ):
-                self.cg_buf_tile_scheduler_metadata = torch.empty_like(
-                    tile_scheduler_metadata
+            # one-row-per-CU graph buffer. NEVER grow after startup: a
+            # reallocated buffer frees the old storage while graphs already
+            # captured around the flash kernel still hold its data_ptr
+            # (use-after-free at replay). Size to a fixed upper bound
+            # (4x num_sms like the triton-MLA builder) and raise instead
+            # if a step ever demands more.
+            if self.cg_buf_tile_scheduler_metadata is not None:
+                assert tile_scheduler_metadata.shape[0] <= (
+                    self.cg_buf_tile_scheduler_metadata.shape[0]
+                ), (
+                    "hcu flash tile metadata rows "
+                    f"{tile_scheduler_metadata.shape[0]} exceed graph buffer"
                 )
-            if (
-                self.cg_buf_num_splits is not None
-                and self.cg_buf_num_splits.shape[0] < num_splits.shape[0]
-            ):
-                self.cg_buf_num_splits = torch.empty_like(num_splits)
+            if self.cg_buf_num_splits is not None:
+                assert num_splits.shape[0] <= self.cg_buf_num_splits.shape[0], (
+                    f"hcu flash nsplits rows {num_splits.shape[0]} exceed "
+                    "graph buffer"
+                )
 
             # Copy FP8 metadata into persistent CUDA graph buffers
             if self.compilation_config.cudagraph_mode.has_full_cudagraphs():
