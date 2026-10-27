@@ -109,8 +109,7 @@ def test_dense_build_dependency_is_explicit(monkeypatch,build):
 def test_retired_runtime_and_tuning_artifacts_are_absent():
     for name in ["vllm_hcu/ops/step5/prefill_g1.py",
                  "vllm_hcu/distributed/static_eplb_diagnostics.py",
-                 "vllm_hcu/model_executor/layers/fused_moe/ep_table.json",
-                 "benchmarks/step5/ep_table_decode_candidate.json"]:
+                 "vllm_hcu/model_executor/layers/fused_moe/ep_table.json"]:
         assert not (ROOT/name).exists()
 
 

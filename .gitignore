@@ -220,10 +220,8 @@ hip_compat.h
 
 # Benchmark dataset
 benchmarks/**/*.json
-# Reviewed Step5 launch configuration and aggregate measurements (no dataset).
-!benchmarks/step5/results-20261019.json
-# Calibrated expert-placement tensors are external runtime artifacts.
-benchmarks/step5/assets/*.pt
+# Step5 deployment and benchmark tooling is distributed outside the source tree.
+/benchmarks/step5/
 
 # Linting
 actionlint
