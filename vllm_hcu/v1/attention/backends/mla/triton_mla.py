@@ -195,14 +195,16 @@ class HcuTritonMLAMetadataBuilder(TritonMLAMetadataBuilder):
             self._hcu_bt_sub_arange = reg["arange"]
             self._hcu_buf_gen = reg["gen"]
             self._hcu_buf_reused = reg["gen"] > 1
-            # Expanded-unit page count of this group's own pool slice.
-            # vLLM pads table columns beyond a request's allocation with
-            # out-of-pool null-block ids; every id this builder hands to
-            # the flash kernel is clipped into [0, _hcu_pool_pages) so
-            # even a speculative over-read lands on a real page. num_blocks
-            # lives on the cache config, not the spec: the spec attribute
-            # is always absent, which silently disabled fix9's clamp
-            # (pool_pages=0 in every LEDGER line so far).
+            # Geometry stamps live with the REGISTERED buffers, not the
+            # builder instance: a rebuilt builder must inherit the row
+            # counts pinned by graphs captured against these same
+            # tensors, or the plan-pinning invariant dies at the first
+            # rebuild. (codex round-6, countersigned claude round-7.)
+            self._hcu_sched_stamps = reg.setdefault("sched_stamps", {})
+            # LEDGER-only snapshot of the pool bound at construction
+            # time: zero in the V1 profiling epoch (num_gpu_blocks is
+            # assigned only after initialize_kv_cache). The authoritative
+            # bound is read per fill in _fill_flash_sched.
             n_gpu_blocks = getattr(
                 vllm_config.cache_config, "num_gpu_blocks", 0
             ) or 0
@@ -347,17 +349,31 @@ class HcuTritonMLAMetadataBuilder(TritonMLAMetadataBuilder):
         # heads): FULL capture runs several padded batch sizes through the
         # same builder, so each shape pins its own captured row count and
         # a later fill of the SAME shape must reproduce it exactly --
-        # replay keeps the captured launch geometry.
+        # replay keeps the captured launch geometry. Stamps are bound in
+        # __init__ from the registry, so they survive builder rebuilds.
         shape_key = (num_decodes, query_len, q_heads)
-        stamp = getattr(self, "_hcu_sched_stamps", None)
-        if stamp is None:
-            stamp = self._hcu_sched_stamps = {}
+        stamp = self._hcu_sched_stamps
         if shape_key not in stamp:
             stamp[shape_key] = n
         elif n != stamp[shape_key]:
             raise RuntimeError(
                 f"hcu plan mismatch: scheduler rows {n} != captured "
                 f"{stamp[shape_key]} for shape {shape_key}"
+            )
+
+        # Live pool bound: num_gpu_blocks is assigned only AFTER the
+        # profiling call that constructs this builder (V1 runner), so the
+        # constructor snapshot can be zero -- read it per fill and refuse
+        # to fill without a pool (else the clamp silently no-ops and
+        # out-of-pool null ids reach the kernel).
+        pool_pages = int(
+            getattr(self.vllm_config.cache_config,
+                    "num_gpu_blocks", 0) or 0
+        ) * subpage
+        if pool_pages <= 0:
+            raise RuntimeError(
+                "hcu flash fill refused: KV pool size not yet assigned "
+                "(num_gpu_blocks unset)"
             )
 
         # Write section (no-throw): only the walked window is expanded.
@@ -377,12 +393,9 @@ class HcuTritonMLAMetadataBuilder(TritonMLAMetadataBuilder):
             block_table_tensor[:, :walk_cols].unsqueeze(-1) * subpage
         )
         bt3[:, :walk_cols].add_(self._hcu_bt_sub_arange)
-        if self._hcu_pool_pages > 0:
-            # Both bounds: min=0 keeps a corrupted/negative id from tipping
-            # below the pool base -- the kernel dereferences ids directly.
-            bt3[:, :walk_cols].clamp_(
-                min=0, max=self._hcu_pool_pages - 1
-            )
+        # Unconditional both-bounds clamp (min=0 keeps a corrupted id from
+        # tipping below the pool base; the kernel dereferences ids directly).
+        bt3[:, :walk_cols].clamp_(min=0, max=pool_pages - 1)
         # Views of the persistent buffers keep their data_ptr across steps;
         # the captured kernel binds these addresses at capture time.
         tile_view = self._hcu_sched_buf[:n]
@@ -524,6 +537,7 @@ class HcuTritonMLAImpl(TritonMLAImpl):
             # block pool); a full-width expansion would hand those to
             # the kernel, and split-KV stragglers do read them.
             bt_stock = decode.block_table[:num_decodes]
+            m = nsplits.shape[0]
             if m != num_decodes + 1:
                 raise RuntimeError(
                     f"hcu plan mismatch: eager nsplits rows {m} != "
@@ -547,11 +561,12 @@ class HcuTritonMLAImpl(TritonMLAImpl):
                 )
             )
             # Same pool clip as the builder path: padded table cells past
-            # a short request's allocation carry out-of-pool null ids.
+            # a short request's allocation carry out-of-pool null ids;
+            # both bounds, matching the builder's fill clamp.
             pool_cap = (
                 kv_c_and_k_pe_cache.shape[0] * subpage - 1
             )
-            bt3v.clamp_(max=pool_cap)
+            bt3v.clamp_(min=0, max=pool_cap)
 
         # Kernel contract: [pages, page_tokens, 1, D] (kv head axis at -2)
         # over 64-token kernel pages. A stored-view cache reshapes without
