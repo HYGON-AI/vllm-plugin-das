@@ -10,7 +10,8 @@ from vllm.triton_utils import tl, triton
 def _masked_clamp_quant(X, Y, S, E, n_rows, D: tl.constexpr,
                        LIMIT: tl.constexpr, BLOCK: tl.constexpr,
                        ROW_TILE: tl.constexpr):
-    row = tl.program_id(0) * ROW_TILE + tl.arange(0, ROW_TILE)
+    # Promote before workspace offsets can exceed 2**31 elements.
+    row = (tl.program_id(0) * ROW_TILE + tl.arange(0, ROW_TILE)).to(tl.int64)
     valid = tl.load(E + row, row < n_rows, other=-1) >= 0
     # DeepGEMM also skips these rows: their GEMM output is uninitialized.
     if tl.sum(valid.to(tl.int32), 0) > 0:

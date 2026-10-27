@@ -1,10 +1,66 @@
 # SPDX-License-Identifier: Apache-2.0
 """GPU parity with LightOp, including invalid DeepGEMM workspace rows."""
+import ast
 import importlib.util
 from pathlib import Path
+from types import SimpleNamespace
 
 import pytest
 import torch
+
+
+@pytest.mark.parametrize("width", [512, 1024, 1536, 2048])
+@pytest.mark.parametrize("stride_factor", [1, 2])
+def test_workspace_offsets_do_not_overflow_int32(width, stride_factor):
+    path = (Path(__file__).resolve().parents[2] / "vllm_hcu/model_executor/"
+            "layers/quantization/slimquant_w4a8_activation.py")
+    kernel = next(node for node in ast.parse(path.read_text()).body
+                  if isinstance(node, ast.FunctionDef)
+                  and node.name == "_masked_clamp_quant")
+    row_expr = next(node.value for node in kernel.body
+                    if isinstance(node, ast.Assign)
+                    and isinstance(node.targets[0], ast.Name)
+                    and node.targets[0].id == "row")
+    # Evaluate the actual address expressions on tiny CPU tensors at both
+    # input (2 * D) and output (D) signed-INT32 overflow boundaries.
+    first_overflow_row = ((1 << 31) + stride_factor * width - 1) // (
+        stride_factor * width)
+    tile = 8
+    block = first_overflow_row // tile
+    tl = SimpleNamespace(
+        program_id=lambda axis: torch.tensor(block, dtype=torch.int32),
+        arange=lambda start, end: torch.arange(start, end, dtype=torch.int32),
+        int64=torch.int64,
+    )
+    namespace = {"tl": tl, "ROW_TILE": tile, "D": width,
+                 "col": torch.tensor([0, width - 1], dtype=torch.int32),
+                 "X": 0, "Y": 0}
+
+    def evaluate(expr):
+        return eval(compile(ast.Expression(expr), str(path), "eval"), namespace)
+
+    namespace["row"] = evaluate(row_expr)
+    expected_rows = torch.arange(block * tile, (block + 1) * tile,
+                                 dtype=torch.int64)[:, None]
+    expected_col = namespace["col"].to(torch.int64)[None, :]
+    offsets = []
+    for node in ast.walk(kernel):
+        if (isinstance(node, ast.Call)
+                and isinstance(node.func, ast.Attribute)
+                and node.func.attr in ("load", "store")):
+            expr = node.args[0]
+            names = {item.id for item in ast.walk(expr)
+                     if isinstance(item, ast.Name)}
+            if "X" in names or "Y" in names:
+                offsets.append((expr, names))
+    assert len(offsets) == 3  # gate, up, output
+    for expr, names in offsets:
+        expected = expected_rows * (2 * width if "X" in names else width)
+        if "X" in names and " + D + " in ast.unparse(expr):
+            expected = expected + width
+        actual = evaluate(expr)
+        assert actual.dtype == torch.int64
+        torch.testing.assert_close(actual, expected + expected_col, rtol=0, atol=0)
 
 
 @pytest.mark.parametrize("width", [512, 1024, 1536, 2048])
