@@ -15,6 +15,7 @@ import json
 import os
 import subprocess
 import sys
+from importlib.util import resolve_name
 from collections import Counter
 from pathlib import Path
 from types import SimpleNamespace
@@ -113,6 +114,7 @@ def _attribute_parts(node: ast.Attribute) -> tuple[ast.expr, list[str]]:
 class _LightOpVisitor(ast.NodeVisitor):
     def __init__(self, relative_path: str) -> None:
         self.relative_path = relative_path
+        self.module_name = relative_path.removesuffix(".py").replace("/", ".")
         # Also recognize an injected/global ``lightop`` name so a call such as
         # ``lightop.op.foo()`` cannot evade the policy by omitting its import
         # from the scanned file.
@@ -255,6 +257,41 @@ class _LightOpVisitor(ast.NodeVisitor):
         } and id(node) not in self._functools_imports:
             self._violate(node, "builtin namespace access in legacy owner")
 
+    def _reject_self_module_import(self, node: ast.AST, module: str) -> None:
+        # A parent package also exposes this module through its attributes.
+        # Reject the source before it can be copied or used to overwrite the
+        # audited resolver through a module attribute.
+        if self.relative_path in LEGACY_MODULE_OWNERS and (
+            module == self.module_name
+            or self.module_name.startswith(module + ".")
+        ):
+            self._violate(node, "self-module import in legacy owner")
+
+    def _check_dynamic_module_import(self, node: ast.Call, module: str) -> None:
+        if self.relative_path not in LEGACY_MODULE_OWNERS:
+            return
+        if module.startswith("."):
+            package = next(
+                (keyword.value for keyword in node.keywords
+                 if keyword.arg == "package"),
+                node.args[1] if len(node.args) > 1 else None,
+            )
+            if isinstance(package, ast.Constant) and isinstance(package.value, str):
+                package_name = package.value
+            elif isinstance(package, ast.Name) and package.id == "__package__":
+                package_name = self.module_name.rpartition(".")[0]
+            elif isinstance(package, ast.Name) and package.id == "__name__":
+                package_name = self.module_name
+            else:
+                self._violate(node, "unresolved relative dynamic import in legacy owner")
+                return
+            try:
+                module = resolve_name(module, package_name)
+            except (ImportError, ValueError):
+                self._violate(node, "unresolved relative dynamic import in legacy owner")
+                return
+        self._reject_self_module_import(node, module)
+
     def _reject_reflective_namespace(self, node: ast.AST, name: str) -> None:
         # Reject the source of the mutable mapping, not just writes to a
         # particular key. Otherwise copying __globals__ to an alias bypasses
@@ -348,6 +385,7 @@ class _LightOpVisitor(ast.NodeVisitor):
     def visit_Import(self, node: ast.Import) -> None:
         for alias in node.names:
             module = alias.name
+            self._reject_self_module_import(node, module)
             self._reject_builtin_namespace(node, module)
             self._reject_getattr_binding(
                 node,
@@ -384,6 +422,24 @@ class _LightOpVisitor(ast.NodeVisitor):
 
     def visit_ImportFrom(self, node: ast.ImportFrom) -> None:
         module = node.module or ""
+        if self.relative_path in LEGACY_MODULE_OWNERS:
+            try:
+                imported = (
+                    resolve_name(
+                        "." * node.level + module,
+                        self.module_name.rpartition(".")[0],
+                    )
+                    if node.level else module
+                )
+            except (ImportError, ValueError):
+                self._violate(node, "unresolved relative import in legacy owner")
+            else:
+                if imported == self.module_name:
+                    self._reject_self_module_import(node, imported)
+                for alias in node.names:
+                    self._reject_self_module_import(
+                        node, f"{imported}.{alias.name}",
+                    )
         self._reject_builtin_namespace(node, module)
         for alias in node.names:
             self._reject_builtin_namespace(node, alias.name)
@@ -555,6 +611,19 @@ class _LightOpVisitor(ast.NodeVisitor):
         # namespace. Require a literal in legacy owners instead of attempting
         # to evaluate arbitrary expressions or track their runtime values.
         if self._is_dynamic_loader(node.func):
+            # __import__ also accepts a separate relative level. Do not infer
+            # its globals/package mapping from arbitrary runtime expressions.
+            level = next(
+                (keyword.value for keyword in node.keywords
+                 if keyword.arg == "level"),
+                node.args[4] if len(node.args) > 4 else None,
+            )
+            if (
+                self.relative_path in LEGACY_MODULE_OWNERS
+                and level is not None
+                and not (isinstance(level, ast.Constant) and level.value == 0)
+            ):
+                self._violate(node, "relative dynamic loader level in legacy owner")
             module_name = (
                 node.args[0]
                 if node.args
@@ -569,6 +638,7 @@ class _LightOpVisitor(ast.NodeVisitor):
                 and isinstance(module_name.value, str)
             ):
                 self._reject_builtin_namespace(node, module_name.value)
+                self._check_dynamic_module_import(node, module_name.value)
             elif self.relative_path in LEGACY_MODULE_OWNERS:
                 self._violate(node, "nonliteral dynamic import in legacy owner")
         direct_lmslim_call: str | None = None
@@ -1415,6 +1485,87 @@ def test_scanner_allows_reflection_outside_legacy_owner(tmp_path: Path) -> None:
     )
 
     assert scan_lightop_imports(root) == []
+
+
+@pytest.mark.parametrize(
+    "mutation",
+    [
+        'import importlib; importlib.import_module("vllm_hcu.patch.worker.core_fix.patch_deepseek_v4_pcp")._pcp_insert_op = replacement',
+        'from importlib import import_module as load; load("vllm_hcu.patch.worker.core_fix.patch_deepseek_v4_pcp")._pcp_insert_op = replacement',
+        'import importlib; owner = importlib.import_module(name="vllm_hcu.patch.worker.core_fix.patch_deepseek_v4_pcp"); owner._pcp_insert_op = replacement',
+        '__import__("vllm_hcu.patch.worker.core_fix.patch_deepseek_v4_pcp", fromlist=["_pcp_insert_op"])._pcp_insert_op = replacement',
+        'import importlib; importlib.import_module(".patch_deepseek_v4_pcp", __package__)._pcp_insert_op = replacement',
+        'import importlib; importlib.import_module(".patch_deepseek_v4_pcp", package="vllm_hcu.patch.worker.core_fix")._pcp_insert_op = replacement',
+        'import importlib; importlib.import_module("vllm_hcu.patch.worker.core_fix").patch_deepseek_v4_pcp._pcp_insert_op = replacement',
+        'import vllm_hcu.patch.worker.core_fix.patch_deepseek_v4_pcp as owner; owner._pcp_insert_op = replacement',
+        'from vllm_hcu.patch.worker.core_fix import patch_deepseek_v4_pcp as owner; owner._pcp_insert_op = replacement',
+        'from . import patch_deepseek_v4_pcp as owner; owner._pcp_insert_op = replacement',
+        'from ..core_fix import patch_deepseek_v4_pcp as owner; owner._pcp_insert_op = replacement',
+        'import vllm_hcu as package; package.patch.worker.core_fix.patch_deepseek_v4_pcp._pcp_insert_op = replacement',
+    ],
+)
+def test_scanner_rejects_self_module_imports(
+    tmp_path: Path,
+    mutation: str,
+) -> None:
+    root = _write_mutation_owner(tmp_path)
+    relative_path, _, _ = next(iter(LEGACY_TOP_LEVEL_MODULE_IMPORTS))
+    owner = tmp_path / relative_path
+    with owner.open("a", encoding="utf-8") as stream:
+        stream.write(f"\nreplacement = lambda: None\n{mutation}\n")
+
+    assert any(
+        "self-module import in legacy owner" in item
+        for item in scan_lightop_imports(root)
+    )
+
+
+@pytest.mark.parametrize(
+    "statement",
+    [
+        "from . import _common",
+        "from ._common import require_callable",
+        'import importlib; importlib.import_module("._common", __package__)',
+    ],
+)
+def test_scanner_allows_sibling_imports_in_legacy_owner(
+    tmp_path: Path,
+    statement: str,
+) -> None:
+    root = _write_mutation_owner(tmp_path)
+    relative_path, _, _ = next(iter(LEGACY_TOP_LEVEL_MODULE_IMPORTS))
+    with (tmp_path / relative_path).open("a", encoding="utf-8") as stream:
+        stream.write(f"\n{statement}\n")
+
+    assert scan_lightop_imports(root) == []
+
+
+@pytest.mark.parametrize(
+    "expression",
+    [
+        'importlib.import_module(".patch_deepseek_v4_pcp", package_name)',
+        'importlib.import_module(".patch_deepseek_v4_pcp")',
+        'importlib.import_module("....patch_deepseek_v4_pcp", "short")',
+        '__import__("patch_deepseek_v4_pcp", {}, {}, ["_pcp_insert_op"], 1)',
+        '__import__("patch_deepseek_v4_pcp", level=relative_level)',
+    ],
+)
+def test_scanner_rejects_unresolved_relative_dynamic_imports(
+    tmp_path: Path,
+    expression: str,
+) -> None:
+    root = _write_mutation_owner(tmp_path)
+    relative_path, _, _ = next(iter(LEGACY_TOP_LEVEL_MODULE_IMPORTS))
+    with (tmp_path / relative_path).open("a", encoding="utf-8") as stream:
+        stream.write(
+            "\nimport importlib\n"
+            f"{expression}._pcp_insert_op = lambda: None\n"
+        )
+
+    assert any(
+        "relative dynamic" in item
+        for item in scan_lightop_imports(root)
+    )
 
 
 @pytest.mark.parametrize(
