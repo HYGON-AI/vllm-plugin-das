@@ -1067,6 +1067,54 @@ def test_hyv4_worker_construction_starts_bootstrap_once(constructed_mooncake_wor
     assert launches == [0]
 
 
+def test_hyv4_pcp_workers_register_unique_transfer_ranks(
+    mooncake, constructed_mooncake_workers,
+):
+    from vllm.distributed.kv_transfer.kv_connector.v1.mooncake.mooncake_utils import (
+        MooncakeBootstrapServer,
+    )
+
+    make, group, _ = constructed_mooncake_workers
+    bootstrap = MooncakeBootstrapServer('127.0.0.1', 18998)
+    workers = []
+    for rank in range(4):
+        group.rank = rank
+        group.rank_in_group = rank
+        worker = make()
+        workers.append(worker)
+        payload = mooncake.RegisterWorkerPayload(
+            engine_id=worker.engine_id, dp_rank=0,
+            tp_rank=worker.tp_rank, pp_rank=0,
+            addr=f'tcp://127.0.0.1:{20000 + rank}',
+        )
+        asyncio.run(bootstrap.register_worker(payload))
+
+    assert [(w.tp_rank, w.tp_size) for w in workers] == [
+        (0, 4), (1, 4), (2, 4), (3, 4),
+    ]
+    # All PCP workers complete the handshake and release their P-side blocks;
+    # replicated MLA bytes are sent once to a TP1 consumer.
+    plans = [w._get_sender_transfer_plan(128, 128, 0, 1) for w in workers]
+    assert [plan[0] for plan in plans] == [True, False, False, False]
+
+
+def test_hyv4_pcp_transfer_rank_preserves_tensor_parallel_rank(
+    mooncake, monkeypatch, constructed_mooncake_workers,
+):
+    make, group, _ = constructed_mooncake_workers
+    monkeypatch.setattr(mooncake, 'get_tensor_model_parallel_rank', lambda: 1)
+    monkeypatch.setattr(mooncake, 'get_tensor_model_parallel_world_size', lambda: 2)
+    ranks = []
+    for rank in range(4):
+        group.rank = 2 * rank + 1
+        group.rank_in_group = rank
+        worker = make()
+        ranks.append((worker.tp_rank, worker.tp_size))
+    assert ranks == [(1, 8), (3, 8), (5, 8), (7, 8)]
+    consumer = make(role='kv_consumer', pcp_size=1)
+    assert (consumer.tp_rank, consumer.tp_size) == (1, 2)
+
+
 def test_mooncake_worker_constructs_stage_range_from_pp_group(
     mooncake, monkeypatch, constructed_mooncake_workers,
 ):
