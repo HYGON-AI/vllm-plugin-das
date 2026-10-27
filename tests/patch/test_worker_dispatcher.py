@@ -115,6 +115,10 @@ def test_worker_inventory_is_complete_explicit_and_dependency_ordered():
         ),
     )
     assert callbacks
+    assert (
+        "worker.core_fix.kimi_k25.vision_conv",
+        "vllm.model_executor.models.kimi_k25_vit",
+    ) in callbacks
     assert len({patch_id for patch_id, _ in callbacks}) == len(callbacks)
 
     positions = {patch_id: index for index, (patch_id, _) in enumerate(callbacks)}
