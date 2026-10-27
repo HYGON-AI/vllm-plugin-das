@@ -163,7 +163,9 @@ def _run_w8a8_apply(
     logical_k = 64 if packed_weights else 4
     experts = SimpleNamespace(
         block_shape=(128, 128),
-        quant_config=SimpleNamespace(use_int8_w8a8=True, use_fp8_w8a8=False),
+        quant_config=SimpleNamespace(
+            use_int8_w8a8=True, use_fp8_w8a8=False, gemm1_clamp_limit=None
+        ),
         w1_scale=torch.ones((1, 1), dtype=torch.float32),
         w2_scale=torch.ones((1, 1), dtype=torch.float32),
         _hcu_logical_n=logical_n,
@@ -341,11 +343,14 @@ def test_w8a8_batched_apply_uses_deepgemm_masked_api(
     hcu["current_platform"] = SimpleNamespace(is_rocm=lambda: True)
     experts = SimpleNamespace(
         block_shape=(128, 128),
-        quant_config=SimpleNamespace(use_int8_w8a8=True, use_fp8_w8a8=False),
+        quant_config=SimpleNamespace(
+            use_int8_w8a8=True, use_fp8_w8a8=False, gemm1_clamp_limit=None
+        ),
         w1_scale=torch.ones((1, 16), dtype=torch.float32),
         w2_scale=torch.ones((1, 64), dtype=torch.float32),
         _hcu_logical_n=16,
         _hcu_logical_k=64,
+        activation_config=SimpleNamespace(clamp_limit=None),
         moe_problem_size=lambda *_args: (1, 2, 16, 64, 1),
         estimate_expected_m=lambda **_kwargs: 2,
     )

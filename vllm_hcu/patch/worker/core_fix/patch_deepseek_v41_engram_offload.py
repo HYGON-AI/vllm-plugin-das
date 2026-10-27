@@ -478,9 +478,12 @@ def _accelerator_view_from_cpu_tensor(tensor: torch.Tensor) -> torch.Tensor:
 def _host_register(pointer: int, num_bytes: int) -> None:
     """Register an existing host allocation as pinned device-visible memory."""
     result = torch.cuda.cudart().cudaHostRegister(pointer, num_bytes, 0)
-    value = getattr(result, "value", result)
+    value = int(getattr(result, "value", result))
     if value != 0:
-        raise RuntimeError(f"cudaHostRegister failed: {result}")
+        raise RuntimeError(
+            f"cudaHostRegister failed: code={value}, pointer={pointer:#x}, "
+            f"bytes={num_bytes}, page_offset={pointer % mmap.PAGESIZE}, result={result}"
+        )
 
 
 def _host_unregister(pointer: int) -> None:

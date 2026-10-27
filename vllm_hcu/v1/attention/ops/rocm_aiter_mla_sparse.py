@@ -1503,8 +1503,12 @@ def rocm_aiter_sparse_attn_indexer_fake(
         [total_seq_lens, head_dim + 4], device=device, dtype=torch.uint8
     )
     fp8_dtype = current_platform.fp8_dtype()
-    _k_fp8 = _flattened_kv[..., :head_dim].view(fp8_dtype).contiguous()
-    _k_scale = _flattened_kv[..., head_dim:].view(torch.float32).contiguous()
+    # The stage above already reserves the whole flattened KV buffer. Its
+    # slices are non-contiguous, so ``.contiguous()`` duplicated the full
+    # buffer here even though this fake never consumes these views, inflating
+    # the profiled peak by several GiB and causing a spurious startup OOM.
+    _k_fp8 = _flattened_kv[..., :head_dim].view(fp8_dtype)
+    _k_scale = _flattened_kv[..., head_dim:].view(torch.float32)
     # Account for the maximum padded Top-K staging allocation during memory
     # profiling.  The runtime scratch is allocated only for variable-length
     # decode batches, but its peak size is bounded by max_num_batched_tokens.

@@ -61,6 +61,15 @@ def m_grouped_w4a8_gemm_nt_contiguous_hipc(*args, **kwargs):
 
 
 def fuse_silu_mul_quant(*args, **kwargs):
+    limit = kwargs.pop("limit", None)
+    if limit is not None:
+        # The installed LightOP contiguous INT8 entry rejects limit (only its
+        # FP8 entry fuses it). Clamp GEMM1's BF16 workspace first; both expert
+        # GEMMs and the subsequent INT8 SiLU quantization remain HIPC/LightOP.
+        gateup = args[0]
+        gate, up = gateup.chunk(2, dim=-1)
+        gate.clamp_(max=limit)
+        up.clamp_(min=-limit, max=limit)
     from lightop.activation import fuse_silu_mul_quant as lightop_fuse_silu_mul_quant
 
     return lightop_fuse_silu_mul_quant(*args, **kwargs)
@@ -135,7 +144,7 @@ class DeepEPDeepGemmW4A8ContiguousExperts(TritonExperts):
         self._deepgemm_w13: torch.Tensor | None = None
         self._deepgemm_w2: torch.Tensor | None = None
         logger.info_once(
-            "Using SlimQuant W4A8 contiguous HIPC DeepGEMM experts."
+            "Using W4A8 contiguous HIPC DeepGEMM experts."
         )
 
     @staticmethod
@@ -236,7 +245,9 @@ class DeepEPDeepGemmW4A8ContiguousExperts(TritonExperts):
         expert_tokens_meta: mk.ExpertTokensMetadata | None,
         apply_router_weight_on_input: bool,
     ) -> None:
-        del global_num_experts, a2_scale, apply_router_weight_on_input
+        del global_num_experts, a2_scale
+        if apply_router_weight_on_input:
+            raise NotImplementedError("W4A8 HIPC does not support router weights on input")
         if hidden_states.size(0) == 0:
             return
         if activation != MoEActivation.SILU:
@@ -276,6 +287,9 @@ class DeepEPDeepGemmW4A8ContiguousExperts(TritonExperts):
                 expert_map=expert_map,
                 expert_tokens_meta=expert_tokens_meta,
                 aq_out=input_workspace,
+                # W4A8 is per-token, not block-128 quantized. The upstream
+                # scatter derives scale columns from K // block_size.
+                block_size=K,
             )
         )
         m_indices = m_indices.to(dtype=torch.int32).contiguous()
@@ -292,10 +306,17 @@ class DeepEPDeepGemmW4A8ContiguousExperts(TritonExperts):
             workspace13.view(dtype=torch.int8),
             (m_aligned, activation_out_dim),
         )
+        activation_kwargs = {}
+        clamp_limit = getattr(
+            getattr(self, "activation_config", None), "clamp_limit", None
+        )
+        if clamp_limit is not None:
+            activation_kwargs["limit"] = clamp_limit
         q_activation, q_activation_scale = fuse_silu_mul_quant(
             gateup_output,
             output=quant_output,
             expert_ids=m_indices,
+            **activation_kwargs,
         )
         down_output = _resize_cache(workspace2, (m_aligned, K))
         m_grouped_w4a8_gemm_nt_contiguous_hipc(
