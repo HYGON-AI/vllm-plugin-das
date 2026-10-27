@@ -122,6 +122,14 @@ class _LightOpVisitor(ast.NodeVisitor):
         if name == "getattr" and self.relative_path in LEGACY_MODULE_OWNERS:
             self._violate(node, "builtin 'getattr' is shadowed in legacy owner")
 
+    def _reject_builtin_namespace(self, node: ast.AST, name: str) -> None:
+        # Reject the namespace source, including when copied to another alias:
+        # checking only Name(Store) misses mapping writes and update/setattr.
+        if self.relative_path in LEGACY_MODULE_OWNERS and name in {
+            "globals", "locals", "vars", "__builtins__", "builtins",
+        }:
+            self._violate(node, "builtin namespace access in legacy owner")
+
     def visit_FunctionDef(self, node: ast.FunctionDef) -> None:
         self._reject_getattr_binding(node, node.name)
         saved_root_aliases = self.root_aliases.copy()
@@ -198,6 +206,7 @@ class _LightOpVisitor(ast.NodeVisitor):
     def visit_Import(self, node: ast.Import) -> None:
         for alias in node.names:
             module = alias.name
+            self._reject_builtin_namespace(node, module)
             self._reject_getattr_binding(
                 node,
                 alias.asname or module.split(".", maxsplit=1)[0],
@@ -233,7 +242,9 @@ class _LightOpVisitor(ast.NodeVisitor):
 
     def visit_ImportFrom(self, node: ast.ImportFrom) -> None:
         module = node.module or ""
+        self._reject_builtin_namespace(node, module)
         for alias in node.names:
+            self._reject_builtin_namespace(node, alias.name)
             self._reject_getattr_binding(node, alias.asname or alias.name)
             if (
                 alias.name == "*"
@@ -249,7 +260,7 @@ class _LightOpVisitor(ast.NodeVisitor):
             for alias in node.names:
                 if alias.name in PUBLIC_CATEGORIES:
                     self.category_aliases[alias.asname or alias.name] = alias.name
-                elif (
+                elif node.level == 0 and (
                     self.relative_path,
                     alias.name,
                     alias.asname,
@@ -332,6 +343,7 @@ class _LightOpVisitor(ast.NodeVisitor):
         self.generic_visit(node)
 
     def visit_Name(self, node: ast.Name) -> None:
+        self._reject_builtin_namespace(node, node.id)
         if isinstance(node.ctx, (ast.Store, ast.Del)):
             self._reject_getattr_binding(node, node.id)
         if node.id in self.lmslim_root_aliases:
@@ -363,6 +375,23 @@ class _LightOpVisitor(ast.NodeVisitor):
         self.generic_visit(node)
 
     def visit_Call(self, node: ast.Call) -> None:
+        # Dynamic imports can expose the same mutable builtin namespace.
+        if (
+            (
+                (
+                    isinstance(node.func, ast.Name)
+                    and node.func.id == "__import__"
+                )
+                or (
+                    isinstance(node.func, ast.Attribute)
+                    and node.func.attr == "import_module"
+                )
+            )
+            and node.args
+            and isinstance(node.args[0], ast.Constant)
+            and isinstance(node.args[0].value, str)
+        ):
+            self._reject_builtin_namespace(node, node.args[0].value)
         direct_lmslim_call: str | None = None
         if isinstance(node.func, ast.Name):
             if node.func.id in self.lmslim_root_aliases:
@@ -846,6 +875,70 @@ def test_scanner_rejects_forbidden_forms_with_locations(tmp_path: Path) -> None:
         "vllm_hcu/mutation.py:6: moved top-level LightOp import 'moved'",
     }
     assert expected <= set(violations)
+
+
+@pytest.mark.parametrize("level", [1, 2])
+@pytest.mark.parametrize(
+    ("relative_path", "symbol", "alias"),
+    sorted(LEGACY_TOP_LEVEL_IMPORTS | LEGACY_TOP_LEVEL_MODULE_IMPORTS),
+)
+def test_scanner_rejects_relative_legacy_imports(
+    tmp_path: Path,
+    level: int,
+    relative_path: str,
+    symbol: str,
+    alias: str,
+) -> None:
+    root = _write_mutation_owner(tmp_path)
+    owner = tmp_path / relative_path
+    owner.write_text(
+        f"from {'.' * level}lightop import {symbol} as {alias}\n",
+        encoding="utf-8",
+    )
+
+    violations = scan_lightop_imports(root)
+
+    assert any(
+        "legacy top-level LightOp import allowlist mismatch" in item
+        for item in violations
+    )
+
+
+@pytest.mark.parametrize(
+    "mutation",
+    [
+        'globals()["getattr"] = replacement',
+        'namespace = globals(); namespace["getattr"] = replacement',
+        'locals().update(getattr=replacement)',
+        'vars().update(getattr=replacement)',
+        '__builtins__["getattr"] = replacement',
+        'import builtins as bi; bi.getattr = replacement',
+        'from builtins import __dict__ as ns; ns["getattr"] = replacement',
+        'import importlib; importlib.import_module("builtins").getattr = replacement',
+        '__import__("builtins").getattr = replacement',
+    ],
+)
+def test_scanner_rejects_indirect_getattr_rebinding(
+    tmp_path: Path,
+    mutation: str,
+) -> None:
+    root = _write_mutation_owner(tmp_path)
+    relative_path, _, _ = next(iter(LEGACY_TOP_LEVEL_MODULE_IMPORTS))
+    owner = tmp_path / relative_path
+    with owner.open("a", encoding="utf-8") as stream:
+        stream.write(
+            "\nreplacement = lambda owner, _name, *default: owner.any_private_kernel\n"
+            f"{mutation}\n"
+            "getattr(legacy_native, "
+            "'fused_deepseek_v4_qnorm_rope_kv_rope_quant_insert_pcp', None)\n"
+        )
+
+    violations = scan_lightop_imports(root)
+
+    assert any(
+        "builtin namespace access in legacy owner" in item
+        for item in violations
+    )
 
 
 @pytest.mark.parametrize(
