@@ -15,6 +15,7 @@ import torch
 from vllm.logger import init_logger
 from vllm.utils.torch_utils import direct_register_custom_op
 
+from vllm_hcu.platforms import envs as henvs
 from vllm_hcu.utils import bf16_fp32_mmac
 
 logger = init_logger(__name__)
@@ -24,9 +25,9 @@ _MMAC_DISABLED = False
 
 
 def _mmac_enabled() -> bool:
-    return os.environ.get("VLLM_HCU_BF16_FP32_MMAC", "1").lower() in (
-        "1",
-        "true",
+    return henvs.optional_custom_op_enabled(
+        os.environ.get("VLLM_HCU_BF16_FP32_MMAC", "1").lower()
+        in ("1", "true")
     )
 
 

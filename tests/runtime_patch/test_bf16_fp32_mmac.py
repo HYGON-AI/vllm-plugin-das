@@ -40,6 +40,8 @@ def test_supported_contract(m, n, k, expected):
 
 
 def test_dispatcher_routes_small_m(monkeypatch):
+    monkeypatch.setenv("VLLM_HCU_USE_CUSTOM_OPS", "1")
+    monkeypatch.setenv("VLLM_HCU_BF16_FP32_MMAC", "1")
     calls = []
     real = bf16_fp32_mmac.linear_bf16_fp32_mmac
 
@@ -64,6 +66,23 @@ def test_dispatcher_routes_small_m(monkeypatch):
         torch.randn(48, 4096, dtype=torch.bfloat16, device="cuda"), w
     )
     assert calls == [48]
+
+
+@pytest.mark.parametrize(
+    ("custom_ops", "mmac", "expected"),
+    [
+        ("0", "0", False),
+        ("0", "1", False),
+        ("1", "0", False),
+        ("1", "1", True),
+    ],
+)
+def test_mmac_enabled_honors_custom_ops_switch(
+    monkeypatch, custom_ops, mmac, expected
+):
+    monkeypatch.setenv("VLLM_HCU_USE_CUSTOM_OPS", custom_ops)
+    monkeypatch.setenv("VLLM_HCU_BF16_FP32_MMAC", mmac)
+    assert bf16_fp32_gemm._mmac_enabled() is expected
 
 
 def test_cuda_graph_replay():
