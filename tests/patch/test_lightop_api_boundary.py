@@ -255,6 +255,21 @@ class _LightOpVisitor(ast.NodeVisitor):
         } and id(node) not in self._functools_imports:
             self._violate(node, "builtin namespace access in legacy owner")
 
+    def _reject_reflective_namespace(self, node: ast.AST, name: str) -> None:
+        # Reject the source of the mutable mapping, not just writes to a
+        # particular key. Otherwise copying __globals__ to an alias bypasses
+        # binding checks. Literal names also cover getattr aliases and
+        # __getattribute__; frame mappings expose the same mutable state.
+        if self.relative_path in LEGACY_MODULE_OWNERS and name in {
+            "__globals__", "__builtins__", "func_globals",
+            "f_globals", "f_builtins", "f_locals",
+        }:
+            self._violate(node, "reflective namespace access in legacy owner")
+
+    def visit_Constant(self, node: ast.Constant) -> None:
+        if isinstance(node.value, str):
+            self._reject_reflective_namespace(node, node.value)
+
     def visit_FunctionDef(self, node: ast.FunctionDef) -> None:
         self._reject_getattr_binding(node, node.name)
         saved_root_aliases = self.root_aliases.copy()
@@ -440,6 +455,7 @@ class _LightOpVisitor(ast.NodeVisitor):
         self.generic_visit(node)
 
     def visit_Attribute(self, node: ast.Attribute) -> None:
+        self._reject_reflective_namespace(node, node.attr)
         root, parts = _attribute_parts(node)
         if isinstance(root, ast.Name) and parts:
             if (
@@ -1348,6 +1364,54 @@ def test_scanner_allows_pcp_resolver_comments(tmp_path: Path) -> None:
             "def _pcp_insert_op():\n    # Documentation is not executable.",
         ),
         encoding="utf-8",
+    )
+
+    assert scan_lightop_imports(root) == []
+
+
+@pytest.mark.parametrize(
+    "mutation",
+    [
+        '_can_use_local_queries.__globals__["_pcp_insert_op"] = replacement',
+        'namespace = _can_use_local_queries.__globals__; namespace["_pcp_insert_op"] = replacement',
+        'function = _can_use_local_queries; function.__globals__.update(_pcp_insert_op=replacement)',
+        'del _can_use_local_queries.__globals__["_pcp_insert_op"]',
+        'getattr(_can_use_local_queries, "__globals__")["_pcp_insert_op"] = replacement',
+        'lookup = getattr; lookup(_can_use_local_queries, "__globals__")["_pcp_insert_op"] = replacement',
+        'attribute = "__globals__"; getattr(_can_use_local_queries, attribute)["_pcp_insert_op"] = replacement',
+        'object.__getattribute__(_can_use_local_queries, "__globals__")["_pcp_insert_op"] = replacement',
+        'get_function().__globals__["_pcp_insert_op"] = replacement',
+        'if enabled:\n    _can_use_local_queries.__globals__["_pcp_insert_op"] = replacement',
+        '_can_use_local_queries.__builtins__["callable"] = replacement',
+        'frame.f_globals["_pcp_insert_op"] = replacement',
+        'frame.f_builtins["callable"] = replacement',
+        'frame.f_locals["_pcp_insert_op"] = replacement',
+    ],
+)
+def test_scanner_rejects_reflective_namespace_escape(
+    tmp_path: Path,
+    mutation: str,
+) -> None:
+    root = _write_mutation_owner(tmp_path)
+    relative_path, _, _ = next(iter(LEGACY_TOP_LEVEL_MODULE_IMPORTS))
+    owner = tmp_path / relative_path
+    with owner.open("a", encoding="utf-8") as stream:
+        stream.write(
+            "\ndef _can_use_local_queries():\n    return True\n"
+            "replacement = lambda: None\n"
+            f"{mutation}\n"
+        )
+
+    assert any(
+        "reflective namespace access in legacy owner" in item
+        for item in scan_lightop_imports(root)
+    )
+
+
+def test_scanner_allows_reflection_outside_legacy_owner(tmp_path: Path) -> None:
+    root = _write_mutation_owner(tmp_path)
+    (root / "ordinary_reflection.py").write_text(
+        "namespace = function.__globals__\n", encoding="utf-8",
     )
 
     assert scan_lightop_imports(root) == []
