@@ -201,6 +201,13 @@ class DeepEPDeepGemmW4A8ContiguousExperts(TritonExperts):
     def _quantize_activation(self, gateup_output, quant_output, m_indices):
         limit = getattr(self.quant_config, "gemm1_clamp_limit", None)
         if limit is not None and limit > 0:
+            if gateup_output.is_cuda and gateup_output.dtype == torch.bfloat16:
+                from .slimquant_w4a8_activation import masked_silu_mul_clamp_quant
+
+                return masked_silu_mul_clamp_quant(
+                    gateup_output, limit=limit, output=quant_output,
+                    expert_ids=m_indices,
+                )
             # The clamp kernels are the only uncategorized LightOp ABI and
             # have one audited owner.  Import it lazily to avoid the
             # dpsk_v4_deep_gemm_moe -> this module import cycle.
