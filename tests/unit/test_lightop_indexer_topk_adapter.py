@@ -352,14 +352,15 @@ def test_decode_adapter_rejects_missing_symbol_without_fallback():
     ns = _load_helpers()
     logits = torch.zeros((1, 3), dtype=torch.float32)
     output = torch.empty((1, 2), dtype=torch.int32)
-    with pytest.raises(RuntimeError, match="unavailable"):
-        ns["decode_topk"](None, logits, torch.tensor([3]), output, 2)
+    # Fail closed: ABI precondition misses return False so the caller keeps
+    # its exact Torch fallback instead of raising.
+    assert ns["decode_topk"](None, logits, torch.tensor([3]), output, 2) is False
 
 
 def test_decode_adapter_rejects_unsupported_dtypes():
     ns = _load_helpers()
     output = torch.empty((1, 2), dtype=torch.int64)
-    with pytest.raises(RuntimeError, match="int32"):
+    assert (
         ns["decode_topk"](
             lambda *_args: None,
             torch.zeros((1, 3), dtype=torch.float32),
@@ -367,6 +368,8 @@ def test_decode_adapter_rejects_unsupported_dtypes():
             output,
             2,
         )
+        is False
+    )
 
 
 def test_decode_adapter_covers_empty_short_and_long_rows():

@@ -1474,26 +1474,41 @@ def _lightop_topk_indices_decode(
             _topk_indices_torch(logits, topk_tokens, row_ends=row_ends)
         )
         return
+    if henvs.VLLM_HCU_USE_LIGHTOP_INDEXER_TOPK_ADAPTER:
+        # Resolve the legacy symbol lazily and fail closed: a broken LightOp
+        # installation must degrade to the exact Torch reference, never turn
+        # an optional optimization into a process-level failure.
+        try:
+            native_decode = getattr(
+                _get_lightop_attention(), "top_k_per_row_decode", None
+            )
+        except Exception:
+            native_decode = None
+        if not decode_topk(
+            native_decode, logits, row_ends, topk_indices, topk_tokens
+        ):
+            topk_indices.copy_(
+                _topk_indices_torch(logits, topk_tokens, row_ends=row_ends)
+            )
+        return
+    if not topk_indices.is_contiguous():
+        topk_indices.copy_(_topk_indices_torch(logits, topk_tokens, row_ends=row_ends))
+        return
     native_decode = getattr(
         _get_lightop_attention(), "top_k_per_row_decode", None
     )
-    if henvs.VLLM_HCU_USE_LIGHTOP_INDEXER_TOPK_ADAPTER:
-        decode_topk(native_decode, logits, row_ends, topk_indices, topk_tokens)
-    elif topk_indices.is_contiguous():
-        if not callable(native_decode):
-            raise RuntimeError("LightOp decode TopK symbol is unavailable")
-        native_decode(
-            logits,
-            1,
-            row_ends.to(device=logits.device, dtype=torch.int32),
-            topk_indices,
-            logits.shape[0],
-            logits.stride(0),
-            logits.stride(1),
-            topk_tokens,
-        )
-    else:
-        topk_indices.copy_(_topk_indices_torch(logits, topk_tokens, row_ends=row_ends))
+    if not callable(native_decode):
+        raise RuntimeError("LightOp decode TopK symbol is unavailable")
+    native_decode(
+        logits,
+        1,
+        row_ends.to(device=logits.device, dtype=torch.int32),
+        topk_indices,
+        logits.shape[0],
+        logits.stride(0),
+        logits.stride(1),
+        topk_tokens,
+    )
 
 
 def rocm_aiter_sparse_attn_indexer_fake(
