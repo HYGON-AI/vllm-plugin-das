@@ -201,6 +201,10 @@ setup(
             "*.so",
             "so/*.so",
             "include/*.h",
+            "csrc/*.h",
+            "csrc/*.cuh",
+            "csrc/*.cu",
+            "csrc/*.cpp",
         ]
     },
     ext_modules=ext_modules,

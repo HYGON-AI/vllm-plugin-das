@@ -220,8 +220,6 @@ hip_compat.h
 
 # Benchmark dataset
 benchmarks/**/*.json
-# Step5 deployment and benchmark tooling is distributed outside the source tree.
-/benchmarks/step5/
 
 # Linting
 actionlint
@@ -243,7 +241,3 @@ vllm/grpc/vllm_engine_pb2.pyi
 
 # Ignore generated cpu headers 
 csrc/cpu/cpu_attn_dispatch_generated.h
-
-# Machine-specific Step5 tuning artifacts remain external.
-vllm_hcu/**/ep_table*.json
-step5-tuning/
