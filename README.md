@@ -150,6 +150,8 @@ vllm serve /path/to/model \
 The option defaults to `false`. It requires an untied BF16 head, a hidden size
 divisible by 256, and HCU LightOp with custom quantization GEMM enabled. LoRA,
 already-quantized heads, and pre-processed/IPC weight caches are not supported.
+Heads using `UnquantizedLinearMethod` with `VLLM_USE_NN` enabled are also not
+supported; the standard unquantized embedding head remains supported.
 INT8 conversion is approximate; check accuracy and performance in the target
 environment.
 

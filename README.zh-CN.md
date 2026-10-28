@@ -125,7 +125,9 @@ vllm serve /path/to/model \
 插件在加载后将原 BF16 head 转换为 ConvRot INT8，保留完整词表和其他层的原有
 配置。该功能要求 head 与输入 embedding 不绑权重、hidden size 可被 256 整除，
 并依赖 HCU LightOp 的量化 GEMM。不支持 LoRA、已量化 head 和预处理/IPC 权重
-缓存。INT8 转换存在近似误差，请在目标环境验证精度和性能。
+缓存。启用 `VLLM_USE_NN` 时不支持 `UnquantizedLinearMethod` 类型的 head，
+标准的未量化 embedding head 仍受支持。INT8 转换存在近似误差，请在目标环境
+验证精度和性能。
 
 ### MHA/GQA 使用 FlashAttention
 

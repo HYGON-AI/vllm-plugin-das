@@ -138,8 +138,22 @@ def install_convrot_lm_head(layer: nn.Module, vllm_config: object) -> None:
         return
     if type(layer.quant_method) not in (UnquantizedEmbeddingMethod, UnquantizedLinearMethod):
         raise ConvRotLMHeadError("ConvRot INT8 requires an unquantized BF16 lm_head method")
+    if type(layer.quant_method) is UnquantizedLinearMethod:
+        from vllm_hcu.platforms import envs as henvs
+
+        if henvs.VLLM_USE_NN:
+            raise ConvRotLMHeadError(
+                "ConvRot INT8 does not support UnquantizedLinearMethod with "
+                "VLLM_USE_NN enabled (NN weight layout)"
+            )
     if layer.weight.dtype != torch.bfloat16 or layer.embedding_dim % BLOCK_SIZE:
         raise ConvRotLMHeadError("ConvRot INT8 requires a BF16 lm_head with K divisible by 256")
+    expected_shape = (layer.num_embeddings_per_partition, layer.embedding_dim)
+    if tuple(layer.weight.shape) != expected_shape:
+        raise ConvRotLMHeadError(
+            f"ConvRot INT8 requires lm_head weight shape {expected_shape} "
+            f"[vocab_shard, hidden_size], got {tuple(layer.weight.shape)}"
+        )
     if getattr(layer, "weight_scale", None) is not None:
         raise ConvRotLMHeadError("ConvRot INT8 cannot requantize a head with existing weight scales")
     model_config = getattr(vllm_config, "model_config", None)

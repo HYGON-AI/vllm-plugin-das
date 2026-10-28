@@ -221,6 +221,7 @@ def _target_module():
         ):
             super().__init__()
             self.embedding_dim = embedding_dim
+            self.num_embeddings_per_partition = num_embeddings
             self.weight = nn.Parameter(torch.zeros(num_embeddings, embedding_dim, dtype=params_dtype or torch.bfloat16), requires_grad=False)
             self.quant_method = UnquantizedEmbeddingMethod()
 
@@ -270,6 +271,57 @@ def test_default_off_does_not_import_convrot_runtime(monkeypatch):
     patch.apply_to_module(module)
     layer = module.ParallelLMHead(37, 512)
     assert type(layer.quant_method) is module.UnquantizedEmbeddingMethod
+
+
+@pytest.mark.parametrize("vocab_size", [768, 512])
+def test_nn_layout_linear_head_is_rejected_before_conversion(runtime, monkeypatch, vocab_size):
+    module = _target_module()
+    linear = ModuleType("vllm.model_executor.layers.linear")
+    linear.UnquantizedLinearMethod = type("UnquantizedLinearMethod", (), {})
+    monkeypatch.setitem(sys.modules, module.__name__, module)
+    monkeypatch.setitem(sys.modules, linear.__name__, linear)
+    monkeypatch.delenv("VLLM_USE_NN", raising=False)  # Default is enabled.
+    layer = module.ParallelLMHead(vocab_size, 512)
+    layer.weight = nn.Parameter(torch.zeros(512, vocab_size, dtype=torch.bfloat16), requires_grad=False)
+    layer.quant_method = linear.UnquantizedLinearMethod()
+    original_weight, original_method = layer.weight, layer.quant_method
+
+    with pytest.raises(runtime.ConvRotLMHeadError, match="VLLM_USE_NN"):
+        runtime.install_convrot_lm_head(layer, SimpleNamespace())
+    assert layer.weight is original_weight
+    assert layer.quant_method is original_method
+
+
+def test_output_major_linear_head_is_supported_without_nn_layout(runtime, monkeypatch, int8_oracle):
+    module = _target_module()
+    linear = ModuleType("vllm.model_executor.layers.linear")
+    linear.UnquantizedLinearMethod = type("UnquantizedLinearMethod", (), {})
+    monkeypatch.setitem(sys.modules, module.__name__, module)
+    monkeypatch.setitem(sys.modules, linear.__name__, linear)
+    monkeypatch.setenv("VLLM_USE_NN", "0")
+    layer = module.ParallelLMHead(37, 512)
+    layer.quant_method = linear.UnquantizedLinearMethod()
+
+    runtime.install_convrot_lm_head(layer, SimpleNamespace())
+    layer.quant_method.process_weights_after_loading(layer)
+    assert layer.quant_method.apply(layer, torch.ones(2, 512, dtype=torch.bfloat16)).shape == (2, 37)
+    assert int8_oracle == [(2, 37, 512)]
+
+
+@pytest.mark.parametrize("shape", [(512, 37), (38, 512), (37 * 512,)])
+def test_rejects_weight_shape_inconsistent_with_head_metadata(runtime, monkeypatch, shape):
+    module = _target_module()
+    linear = ModuleType("vllm.model_executor.layers.linear")
+    linear.UnquantizedLinearMethod = type("UnquantizedLinearMethod", (), {})
+    monkeypatch.setitem(sys.modules, module.__name__, module)
+    monkeypatch.setitem(sys.modules, linear.__name__, linear)
+    layer = module.ParallelLMHead(37, 512)
+    layer.weight = nn.Parameter(torch.zeros(shape, dtype=torch.bfloat16), requires_grad=False)
+    original_method = layer.quant_method
+
+    with pytest.raises(runtime.ConvRotLMHeadError, match="weight shape"):
+        runtime.install_convrot_lm_head(layer, SimpleNamespace())
+    assert layer.quant_method is original_method
 
 
 @pytest.mark.parametrize("policy", ["quantized", "fp16", "tied", "fp32_head", "lora", "bad_k"])
