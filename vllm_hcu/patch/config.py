@@ -26,6 +26,7 @@ _FEATURE_FIELDS = (
     "qwen4_exp_hc_sp",
     "k3_sp_moe",
     "dp_int8_allgather",
+    "lm_head_convrot_int8",
     "moe_backend",
     "hcu_flash_attn_mode",
     "hcu_gdn_prefill_backend",
@@ -47,6 +48,7 @@ _BOOLEAN_FIELDS = (
     "qwen4_exp_hc_sp",
     "k3_sp_moe",
     "dp_int8_allgather",
+    "lm_head_convrot_int8",
 )
 _SUPPORTED_MOE_BACKENDS = frozenset({"auto", "deep_gemm"})
 _LEGACY_DEEP_GEMM_BACKEND = "dpsk_deep_gemm"
@@ -119,6 +121,9 @@ class HcuFeatureConfig:
     # DP/EP AllGatherv dispatch path. Persisted because spawned workers do not
     # inherit arbitrary VLLM_HCU_* variables from the API process.
     dp_int8_allgather: bool = False
+    # Convert an originally BF16 full-vocabulary head after checkpoint loading.
+    # Serialized here so spawned workers and compilation-cache keys agree.
+    lm_head_convrot_int8: bool = False
     moe_backend: str = "auto"
     hcu_flash_attn_mode: str | None = None
     # HCU provider requested through --gdn-prefill-backend (hcu-boltops or

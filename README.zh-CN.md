@@ -113,6 +113,20 @@ HCU 专用开关参见 [环境配置](vllm_hcu/platforms/envs.py)。
 Attention/MoE 后端、KV cache 格式、推测解码及并行拓扑应按对应模型配置选择，
 并非所有组合都经过验证。
 
+### 原 BF16 全词表 lm_head 的 ConvRot INT8 优化
+
+通过插件配置显式开启，默认关闭：
+
+```bash
+vllm serve /path/to/model \
+  --additional-config '{"hcu":{"lm_head_convrot_int8":true}}'
+```
+
+插件在加载后将原 BF16 head 转换为 ConvRot INT8，保留完整词表和其他层的原有
+配置。该功能要求 head 与输入 embedding 不绑权重、hidden size 可被 256 整除，
+并依赖 HCU LightOp 的量化 GEMM。不支持 LoRA、已量化 head 和预处理/IPC 权重
+缓存。INT8 转换存在近似误差，请在目标环境验证精度和性能。
+
 ### MHA/GQA 使用 FlashAttention
 
 对于使用 `--attention-backend FLASH_ATTN` 的 MHA/GQA 模型，建议在模型选用的
