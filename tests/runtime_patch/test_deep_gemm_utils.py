@@ -12,6 +12,8 @@ from types import ModuleType, SimpleNamespace
 import pytest
 import torch
 
+from vllm_hcu.platforms import envs as henvs
+
 
 def _install_categorized_lightop(
     monkeypatch,
@@ -140,6 +142,7 @@ def _load_deep_gemm_apply():
         "nullcontext": nullcontext,
         "_HCU_HT_EP_TOKEN_ALIGNMENT": 256,
         "_EP_FUSED_MOE": False,
+        "henvs": henvs,
         "compute_aligned_M_and_alignment": lambda **_kwargs: (2, 256),
         "get_mk_alignment_for_contiguous_layout": lambda: (128, 128),
         "_resize_cache": lambda tensor, shape: torch.zeros(

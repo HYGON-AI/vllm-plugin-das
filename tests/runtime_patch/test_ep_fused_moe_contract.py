@@ -17,11 +17,13 @@ from vllm.model_executor.layers.fused_moe.activation import MoEActivation
 from vllm_hcu.model_executor.layers.fused_moe.ep_fused_moe_support import (
     supports_channel_ep_fused,
 )
+from vllm_hcu.platforms import envs as henvs
 
 ROOT = Path(__file__).parents[2]
 
 
 def load_function(path, name, namespace):
+    namespace.setdefault("henvs", henvs)
     tree = ast.parse((ROOT / path).read_text())
     function = next(n for n in ast.walk(tree)
                     if isinstance(n, ast.FunctionDef) and n.name == name)
@@ -78,7 +80,8 @@ class NativePathReached(Exception):
     pass
 
 
-def test_block_fp8_uses_original_deepgemm_path_with_opt_in_enabled():
+def test_block_fp8_uses_original_deepgemm_path_with_opt_in_enabled(monkeypatch):
+    monkeypatch.setenv("VLLM_HCU_USE_CUSTOM_OPS", "1")
     def native(**kwargs):
         raise NativePathReached
 
@@ -390,6 +393,7 @@ def test_carve_reuses_disjoint_views_of_one_backing_allocation():
 @pytest.mark.parametrize("mode", ["main", "fallback", "unknown", "flag_off", "sp", "dbo"])
 def test_runtime_selected_wrapper_uses_bounded_workspace(monkeypatch, mode):
     """Exercise the same outer expert class returned by the installed FP8 oracle."""
+    monkeypatch.setenv("VLLM_HCU_USE_CUSTOM_OPS", "1")
     from vllm.model_executor.layers.fused_moe.experts import triton_deep_gemm_moe as selector
     from vllm.model_executor.layers.fused_moe.prepare_finalize import naive_dp_ep
     from vllm.model_executor.layers.fused_moe.oracle.fp8 import (

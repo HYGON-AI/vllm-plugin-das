@@ -6,9 +6,17 @@ so these ordering tests cannot import optional GPU libraries or create a
 device context.
 """
 import ast
+import importlib.util
+import json
+import os
 from pathlib import Path
 from types import SimpleNamespace
 import unittest
+
+_env_spec = importlib.util.spec_from_file_location(
+    "step5_dispatch_test_envs", Path(__file__).parents[2] / "vllm_hcu/platforms/envs.py")
+HENVS = importlib.util.module_from_spec(_env_spec)
+_env_spec.loader.exec_module(HENVS)
 
 
 def _load_dispatch():
@@ -19,7 +27,8 @@ def _load_dispatch():
     functions = [node for node in tree.body
                  if isinstance(node, ast.FunctionDef) and node.name in names]
     assert len(functions) == len(names)
-    namespace = {}
+    namespace = dict(henvs=HENVS, os=os, json=json,
+                     _step5_ht_runtime_config=None, _step5_ht_runtime_applied=None)
     exec(compile(ast.Module(body=functions, type_ignores=[]), str(path), "exec"),
          namespace)
     return namespace["ht_do_dispatch"]
