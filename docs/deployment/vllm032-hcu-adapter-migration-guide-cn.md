@@ -156,6 +156,12 @@ HIP_VISIBLE_DEVICES=0 \
 
 模型路径按目标机实际目录替换。
 
+本轮新三 wheel 组合已在 `gfx936` 单卡上用 `/model/Qwen3-8B` 完成一次真实
+非 eager 服务验证：EngineCore 确认 `enforce_eager=False`、`VLLM_COMPILE` 和
+`FULL_AND_PIECEWISE` CUDA Graph，`/health`、`/version`、`/v1/models` 与
+`/v1/chat/completions` 均返回 HTTP 200，固定请求返回 `42`。详细命令和边界见
+[`docs/validation/vllm032-adapter-das-qwen3-8b-smoke.md`](../validation/vllm032-adapter-das-qwen3-8b-smoke.md)。
+
 ## 9. 回滚
 
 ```bash
@@ -176,7 +182,7 @@ export VLLM_HCU_USE_CUSTOM_SILU_AND_MUL=0
 
 - `/model` 下目标模型的 enabled/disabled 精度 A/B；
 - HumanEval `0-63` 共 64 条；
-- 非 eager 服务健康、日志 fatal 扫描与显存回收；
+- 更长上下文和更长运行区间的日志 fatal 扫描；
 - 长稳、并发、拓扑和性能门禁。
 
 在这些证据完成并写回 compat lock 前，状态保持 `pending`，不得宣称生产支持。

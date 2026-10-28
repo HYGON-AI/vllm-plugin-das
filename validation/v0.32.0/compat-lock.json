@@ -40,8 +40,9 @@
   "serving": {
     "enforce_eager": false,
     "compilation": "VLLM_COMPILE",
-    "cudagraph_capture": true,
-    "max_model_len": 4096,
+    "cudagraph_capture": "FULL_AND_PIECEWISE",
+    "model": "/model/Qwen3-8B",
+    "max_model_len": 512,
     "max_num_seqs": 1,
     "attention_backend": "TRITON_ATTN",
     "kv_cache_layout": "LBNHC"
@@ -84,12 +85,22 @@
       "status": "pending"
     },
     "serving": {
-      "status": "pending"
+      "status": "pass",
+      "result": "Qwen3-8B single-card non-eager service reached readiness; health, version, models and chat endpoints returned HTTP 200; deterministic chat returned 42; no process remained and all cards returned to 0% / 2 MiB"
     },
     "humaneval_prefix": {
       "status": "pending"
     }
   },
-  "evidence": {},
+  "evidence": {
+    "serving_smoke": {
+      "document": "docs/validation/vllm032-adapter-das-qwen3-8b-smoke.md",
+      "validated_at": "2026-10-28T11:04:59Z",
+      "vllm_version": "0.32.0",
+      "system_fingerprint": "vllm-0.32.0-b2902db1",
+      "response": "42",
+      "finish_reason": "stop"
+    }
+  },
   "completed_at": null
 }
