@@ -71,6 +71,13 @@ class HcuRMSNorm:
 HcuRMSNorm.__module__ = "hcu_vllm_das.rms_norm"
 
 
+class HcuPlatform:
+    pass
+
+
+HcuPlatform.__module__ = "hcu_adapter.bridges.vllm"
+
+
 def installed_fixture(monkeypatch: pytest.MonkeyPatch, tmp_path: Path):
     site = tmp_path / "site-packages"
     distributions = {
@@ -80,13 +87,14 @@ def installed_fixture(monkeypatch: pytest.MonkeyPatch, tmp_path: Path):
             site,
             ["vllm/__init__.py", "vllm-0.32.0.dist-info/RECORD"],
         ),
-        "hcu-vllm-adapter": FakeDistribution(
-            "hcu-vllm-adapter",
-            "0.1.0.dev0",
+        "sgl-kernel": FakeDistribution(
+            "sgl-kernel",
+            "0.1.0",
             site,
             [
-                "hcu_vllm_adapter/extensions.py",
-                "hcu_vllm_adapter-0.1.0.dist-info/RECORD",
+                "hcu_adapter/extensions.py",
+                "hcu_adapter/bridges/vllm.py",
+                "sgl_kernel-0.1.0.dist-info/RECORD",
             ],
         ),
         "hcu-vllm-das-plugin": FakeDistribution(
@@ -105,18 +113,18 @@ def installed_fixture(monkeypatch: pytest.MonkeyPatch, tmp_path: Path):
         "vllm.platform_plugins": [
             FakeEntryPoint(
                 "hcu_adapter",
-                "hcu_vllm_adapter.plugin:hcu_platform_plugin",
-                distributions["hcu-vllm-adapter"],
+                "hcu_adapter.bridges.vllm:hcu_platform_plugin",
+                distributions["sgl-kernel"],
             )
         ],
         "vllm.general_plugins": [
             FakeEntryPoint(
                 "hcu_adapter",
-                "hcu_vllm_adapter.plugin:hcu_runtime_plugin",
-                distributions["hcu-vllm-adapter"],
+                "hcu_adapter.bridges.vllm:hcu_runtime_plugin",
+                distributions["sgl-kernel"],
             )
         ],
-        "hcu_vllm_adapter.extensions": [
+        "hcu_adapter.extensions": [
             FakeEntryPoint(
                 "das_hcu",
                 "hcu_vllm_das.extension:extension_spec",
@@ -142,19 +150,22 @@ def installed_fixture(monkeypatch: pytest.MonkeyPatch, tmp_path: Path):
             self.vllm_version = vllm_version
 
     def activate_extensions(context, points):
-        assert context.adapter_version == "0.1.0.dev0"
+        assert context.adapter_version == "0.1.0"
         assert context.vllm_version == "0.32.0+rocm723"
-        assert points == entry_points["hcu_vllm_adapter.extensions"]
+        assert points == entry_points["hcu_adapter.extensions"]
         return tuple(reports)
 
     modules = {
         "vllm": SimpleNamespace(
             __file__=os.fspath(site / "vllm" / "__init__.py")
         ),
-        "hcu_vllm_adapter.extensions": SimpleNamespace(
-            __file__=os.fspath(site / "hcu_vllm_adapter" / "extensions.py"),
+        "hcu_adapter.extensions": SimpleNamespace(
+            __file__=os.fspath(site / "hcu_adapter" / "extensions.py"),
             ExtensionContext=ExtensionContext,
             activate_extensions=activate_extensions,
+        ),
+        "hcu_adapter.bridges.vllm": SimpleNamespace(
+            __file__=os.fspath(site / "hcu_adapter" / "bridges" / "vllm.py")
         ),
         "hcu_vllm_das.extension": SimpleNamespace(
             __file__=os.fspath(site / "hcu_vllm_das" / "extension.py")
@@ -171,6 +182,7 @@ def installed_fixture(monkeypatch: pytest.MonkeyPatch, tmp_path: Path):
                 "SiluAndMul": HcuSiluAndMul,
             }
         ),
+        "vllm.platforms": SimpleNamespace(current_platform=HcuPlatform()),
     }
 
     monkeypatch.setattr(
@@ -200,7 +212,7 @@ def test_attestation_accepts_owned_wheels_and_active_extension(
 
     assert report["schema_version"] == 2
     assert report["vllm"]["version"] == "0.32.0+rocm723"
-    assert report["adapter"]["version"] == "0.1.0.dev0"
+    assert report["adapter"]["version"] == "0.1.0"
     assert report["plugin"]["version"] == "0.2.0.dev0"
     assert report["extension"] == {
         "capabilities": ["lightop-rms-norm", "lightop-silu-and-mul"],
@@ -208,6 +220,7 @@ def test_attestation_accepts_owned_wheels_and_active_extension(
         "name": "das-hcu",
         "status": "active",
     }
+    assert report["platform"] == "hcu_adapter.bridges.vllm.HcuPlatform"
     assert report["oot_classes"] == {
         "RMSNorm": "hcu_vllm_das.rms_norm.HcuRMSNorm",
         "SiluAndMul": "hcu_vllm_das.silu_and_mul.HcuSiluAndMul",
@@ -277,9 +290,24 @@ def test_attestation_rejects_a_missing_adapter_extension_entry_point(
     monkeypatch: pytest.MonkeyPatch, tmp_path: Path
 ) -> None:
     _distributions, points, *_ = installed_fixture(monkeypatch, tmp_path)
-    points["hcu_vllm_adapter.extensions"].clear()
+    points["hcu_adapter.extensions"].clear()
 
     with pytest.raises(verify_installed.InstalledVerificationError, match="das_hcu"):
+        verify_installed.collect_attestation()
+
+
+def test_attestation_rejects_an_unexpected_selected_platform(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    _distributions, _points, _reports, modules = installed_fixture(
+        monkeypatch, tmp_path
+    )
+    modules["vllm.platforms"].current_platform = SimpleNamespace()
+
+    with pytest.raises(
+        verify_installed.InstalledVerificationError,
+        match="selected platform",
+    ):
         verify_installed.collect_attestation()
 
 

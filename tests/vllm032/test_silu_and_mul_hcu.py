@@ -29,7 +29,8 @@ def test_installed_lightop_silu_matches_reference_and_rollback_paths(
     from vllm.platforms import current_platform
     from vllm.plugins import load_general_plugins
 
-    assert current_platform.__class__.__module__ == "hcu_vllm_adapter.platform.hcu"
+    assert current_platform.__class__.__module__ == "hcu_adapter.bridges.vllm"
+    assert current_platform.__class__.__name__ == "HcuPlatform"
     load_general_plugins()
 
     from hcu_vllm_das.silu_and_mul import HcuSiluAndMul

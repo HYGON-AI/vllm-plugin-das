@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Verify an installed vLLM 0.32 adapter plus DAS extension stack."""
+"""Verify an installed vLLM 0.32 adapter-das plus DAS extension stack."""
 
 from __future__ import annotations
 
@@ -20,6 +20,7 @@ _REQUIRED_OOT_CLASSES = {
     "RMSNorm": "hcu_vllm_das.rms_norm.HcuRMSNorm",
     "SiluAndMul": "hcu_vllm_das.silu_and_mul.HcuSiluAndMul",
 }
+_REQUIRED_PLATFORM = "hcu_adapter.bridges.vllm.HcuPlatform"
 
 
 class InstalledVerificationError(RuntimeError):
@@ -129,9 +130,7 @@ def collect_attestation() -> dict[str, object]:
     """Return a fail-closed installed-state attestation."""
 
     vllm_dist, vllm_owned, vllm_record = _distribution("vllm")
-    adapter_dist, adapter_owned, adapter_record = _distribution(
-        "hcu-vllm-adapter"
-    )
+    adapter_dist, adapter_owned, adapter_record = _distribution("sgl-kernel")
     plugin_dist, plugin_owned, plugin_record = _distribution(
         "hcu-vllm-das-plugin"
     )
@@ -149,28 +148,32 @@ def collect_attestation() -> dict[str, object]:
     _require_entry_point(
         "vllm.platform_plugins",
         name="hcu_adapter",
-        value="hcu_vllm_adapter.plugin:hcu_platform_plugin",
-        distribution="hcu-vllm-adapter",
+        value="hcu_adapter.bridges.vllm:hcu_platform_plugin",
+        distribution="sgl-kernel",
     )
     _require_entry_point(
         "vllm.general_plugins",
         name="hcu_adapter",
-        value="hcu_vllm_adapter.plugin:hcu_runtime_plugin",
-        distribution="hcu-vllm-adapter",
+        value="hcu_adapter.bridges.vllm:hcu_runtime_plugin",
+        distribution="sgl-kernel",
     )
     extension_point = _require_entry_point(
-        "hcu_vllm_adapter.extensions",
+        "hcu_adapter.extensions",
         name="das_hcu",
         value="hcu_vllm_das.extension:extension_spec",
         distribution="hcu-vllm-das-plugin",
     )
 
     vllm_module = _import_module("vllm")
-    adapter_extensions = _import_module("hcu_vllm_adapter.extensions")
+    adapter_extensions = _import_module("hcu_adapter.extensions")
+    adapter_bridge = _import_module("hcu_adapter.bridges.vllm")
     plugin_extension = _import_module("hcu_vllm_das.extension")
     vllm_origin = _module_origin(vllm_module, vllm_owned, "vllm")
     adapter_origin = _module_origin(
-        adapter_extensions, adapter_owned, "hcu-vllm-adapter"
+        adapter_extensions, adapter_owned, "sgl-kernel"
+    )
+    adapter_bridge_origin = _module_origin(
+        adapter_bridge, adapter_owned, "sgl-kernel"
     )
     plugin_origin = _module_origin(
         plugin_extension, plugin_owned, "hcu-vllm-das-plugin"
@@ -203,6 +206,16 @@ def collect_attestation() -> dict[str, object]:
             + ", ".join(sorted(missing_capabilities))
         )
 
+    platforms = _import_module("vllm.platforms")
+    selected_platform = getattr(platforms, "current_platform", None)
+    platform_class = selected_platform.__class__
+    platform_name = f"{platform_class.__module__}.{platform_class.__qualname__}"
+    if platform_name != _REQUIRED_PLATFORM:
+        raise InstalledVerificationError(
+            f"unexpected selected platform: {platform_name}; "
+            f"expected {_REQUIRED_PLATFORM}"
+        )
+
     custom_op = _import_module("vllm.model_executor.custom_op")
     oot_classes: dict[str, str] = {}
     for class_name, expected_name in _REQUIRED_OOT_CLASSES.items():
@@ -229,6 +242,7 @@ def collect_attestation() -> dict[str, object]:
         "adapter": {
             **_distribution_report(adapter_dist, adapter_record),
             "module_origin": adapter_origin,
+            "bridge_origin": adapter_bridge_origin,
         },
         "plugin": {
             **_distribution_report(plugin_dist, plugin_record),
@@ -240,6 +254,7 @@ def collect_attestation() -> dict[str, object]:
             "status": status,
             "capabilities": sorted(capabilities),
         },
+        "platform": platform_name,
         "oot_classes": oot_classes,
     }
 
