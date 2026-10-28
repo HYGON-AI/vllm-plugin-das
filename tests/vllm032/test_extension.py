@@ -113,11 +113,13 @@ def test_discovery_and_factory_import_no_runtime_frameworks() -> None:
     code = f"""
 import sys
 sys.path.insert(0, {os.fspath(PLUGIN_SOURCE_ROOT)!r})
+blocked = {{"torch", "vllm", "lightop", "vllm_hcu"}}
+before = set(sys.modules)
 from hcu_vllm_das.extension import extension_spec
 spec = extension_spec()
 assert spec.name == "das-hcu"
-blocked = {{"torch", "vllm", "lightop", "vllm_hcu"}}
-assert blocked.isdisjoint(sys.modules), blocked.intersection(sys.modules)
+introduced = (set(sys.modules) - before).intersection(blocked)
+assert not introduced, introduced
 """
     result = subprocess.run(
         [sys.executable, "-c", code],

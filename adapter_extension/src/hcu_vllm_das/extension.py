@@ -7,7 +7,7 @@ import threading
 
 from packaging.version import InvalidVersion, Version
 
-from hcu_vllm_adapter.extensions import (
+from hcu_adapter.extensions import (
     ExtensionContext,
     ExtensionSpec,
 )

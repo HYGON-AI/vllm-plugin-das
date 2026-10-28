@@ -38,12 +38,14 @@ def test_package_exports_the_exact_vllm_target_without_framework_imports() -> No
     code = f"""
 import sys
 sys.path.insert(0, {os.fspath(SOURCE_ROOT)!r})
+blocked = {{"torch", "vllm", "lightop", "vllm_hcu"}}
+before = set(sys.modules)
 import hcu_vllm_das
 assert hcu_vllm_das.__version__ == "0.2.0.dev0"
 assert hcu_vllm_das.TARGET_VLLM_RELEASE == (0, 32, 0)
 assert hcu_vllm_das.VLLM_UPSTREAM_COMMIT == "5df63a7203cdb9328d824a27b682e77c7b9928be"
-blocked = {{"torch", "vllm", "lightop", "vllm_hcu"}}
-assert blocked.isdisjoint(sys.modules), blocked.intersection(sys.modules)
+introduced = (set(sys.modules) - before).intersection(blocked)
+assert not introduced, introduced
 """
 
     result = subprocess.run(

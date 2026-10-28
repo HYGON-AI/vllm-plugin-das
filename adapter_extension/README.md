@@ -1,7 +1,7 @@
 # HCU vLLM DAS optimization plugin
 
 `hcu-vllm-das-plugin` is the optimization-only extension for official vLLM
-0.32 and `hcu-vllm-adapter`. The adapter owns the HCU platform and runtime
+0.32 and `adapter-das`. The adapter owns the HCU platform and runtime
 lifecycle; this wheel contributes optional, independently removable operator
 optimizations through the adapter extension API.
 
@@ -17,7 +17,8 @@ operator-level capabilities.
 
 - vLLM release: exactly `0.32.0`; prerelease, postrelease, development, and
   local version suffixes on that release are accepted.
-- Adapter: `hcu-vllm-adapter>=0.1.0.dev0`, extension API v1.
+- Adapter distribution: `sgl-kernel>=0.1.0`, extension API v1 from
+  `hcu_adapter.extensions`.
 - Runtime: a prepared HCU PyTorch/DTK/LightOp stack. LightOp is intentionally
   not fetched by pip because production deployments must use an ABI-matched
   local build.
@@ -38,7 +39,7 @@ resolution, in this order:
 
 ```bash
 python3 -m pip install --no-deps /wheels/vllm-0.32.0+rocm*.whl
-python3 -m pip install --no-deps /wheels/hcu_vllm_adapter-*.whl
+python3 -m pip install --no-deps /wheels/sgl_kernel-*.whl
 python3 -m pip install --no-deps /wheels/hcu_vllm_das_plugin-*.whl
 ```
 
