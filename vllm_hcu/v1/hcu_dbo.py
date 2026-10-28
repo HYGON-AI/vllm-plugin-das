@@ -25,8 +25,9 @@ What the framework's V2 microbatching misses for Step5, fixed here:
   its own without stepping the table; its closed regions are released with the
   first's.
 - a microbatch that ends up all padding or decode-only would take paths that
-  are not microbatch-aware, so a step is only split when every rank has real
-  prefill tokens in both halves (_MIN_TAIL).
+  are not microbatch-aware, so every rank checks the actual query boundaries
+  at the shared split point and agrees to split only if both halves have a
+  prefill row.
 - the microbatch threads run on GPU 0 unless given this rank's HIP context
   (_patch_thread_device), and the second microbatch's workspace is never sized.
 
@@ -38,6 +39,7 @@ interleaved): ~22.93k -> ~23.85k tok/s random (+3.9%), 23.2k -> 24.1k real
 from __future__ import annotations
 
 import contextlib
+import contextvars
 import dataclasses
 import os
 import sys
@@ -52,10 +54,11 @@ from vllm.logger import init_logger
 logger = init_logger(__name__)
 
 DBO_MIN_TOKENS = int(os.environ.get("HCU_DBO_MIN_TOKENS", "0"))
-# Real tokens every rank must have in the second (padded) half. More than the
-# decode threshold (1 + num_speculative_tokens), so that half's first row --
-# the only one that can be short -- is never classified as a decode.
+# Minimum real tokens every rank must have in the second (padded) half.
+# This count alone does not exclude decode-only halves in mixed batches;
+# _has_prefill_in_both_ubatches also checks the sliced query lengths.
 _MIN_TAIL = 64
+_DBO_BATCH = contextvars.ContextVar("hcu_step5_dbo_batch", default=None)
 
 
 def enable_in_worker(vllm_config) -> bool:
@@ -138,6 +141,78 @@ def _patch_revalidation() -> None:
     VllmConfig.__post_init__ = __post_init__
 
 
+@contextlib.contextmanager
+def dbo_batch_scope(runner, batch_req_state):
+    """Make only this dispatch's ordered request metadata visible to the gate."""
+    token = _DBO_BATCH.set((runner, batch_req_state))
+    try:
+        yield
+    finally:
+        _DBO_BATCH.reset(token)
+
+
+def _has_prefill_in_both_ubatches(
+    query_lens, num_tokens: int, split_point: int, decode_threshold: int | None
+) -> bool:
+    """Match DSA's query-length classification after truncating at the split.
+
+    BatchReqState is already in the order used by prepare_inputs. A request
+    straddling the split contributes a separate, shorter query to each half.
+    Padding is deliberately absent here: it cannot provide a prefill row.
+    """
+    if (
+        query_lens is None
+        or not isinstance(decode_threshold, (int, np.integer))
+        or isinstance(decode_threshold, (bool, np.bool_))
+        or decode_threshold < 1
+    ):
+        return False
+    try:
+        query_lens = np.asarray(query_lens)
+    except (TypeError, ValueError, OverflowError):
+        return False
+    if (
+        query_lens.ndim != 1
+        or not np.issubdtype(query_lens.dtype, np.integer)
+        or np.any(query_lens <= 0)
+        or np.any(query_lens > num_tokens)
+    ):
+        return False
+    ends = np.cumsum(query_lens, dtype=np.int64)
+    if ends.size == 0 or int(ends[-1]) != num_tokens:
+        # Missing metadata, dummy batches and PCP-transformed token layouts
+        # must fall back rather than validate a different batch's boundaries.
+        return False
+    starts = ends - query_lens
+    left = np.minimum(ends, split_point) - np.minimum(starts, split_point)
+    right = np.maximum(ends, split_point) - np.maximum(starts, split_point)
+    return bool(np.any(left > decode_threshold) and np.any(right > decode_threshold))
+
+
+def _dsa_decode_threshold(runner) -> int | None:
+    # Use the initialized builders, not runner.decode_query_len: DSA's
+    # threshold also depends on parallel drafting and decode context parallelism.
+    mod = sys.modules.get("vllm_hcu.model_executor.layers.step4_dsa")
+    builder_cls = getattr(mod, "Step4DSAMetadataBuilder", None)
+    if builder_cls is None:
+        return None
+    thresholds = [
+        getattr(builder, "reorder_batch_threshold", None)
+        for groups in getattr(runner, "attn_groups", ())
+        for group in groups
+        for builder in getattr(group, "metadata_builders", ())
+        if isinstance(builder, builder_cls)
+    ]
+    if not thresholds or any(
+        not isinstance(t, (int, np.integer))
+        or isinstance(t, (bool, np.bool_))
+        or t < 1
+        for t in thresholds
+    ):
+        return None
+    return int(max(thresholds))
+
+
 def _patch_dp_threshold() -> None:
     import vllm.v1.worker.gpu.dp_utils as dpu
 
@@ -149,14 +224,51 @@ def _patch_dp_threshold() -> None:
     def check_ubatch_thresholds(config, num_tokens, uniform_decode):
         if not getattr(config, "_hcu_step5_dbo", False):
             return original_threshold(config, num_tokens, uniform_decode)
-        if uniform_decode or num_tokens < DBO_MIN_TOKENS:
+        if num_tokens < DBO_MIN_TOKENS:
             return False
         # The caller passes the smallest rank's count; the split point is half
         # the largest, which only the caller's all-reduced tensor knows.
-        across = sys._getframe(1).f_locals.get("num_tokens_across_dp")
+        caller = sys._getframe(1)
+        across = caller.f_locals.get("num_tokens_across_dp")
         if across is None:
             return False
-        return num_tokens - int(across.max()) // 2 >= _MIN_TAIL
+        split_point = int(across.max()) // 2
+        if num_tokens - split_point < _MIN_TAIL:
+            return False
+
+        # InputBatch is built only after this decision. The Step5 execution
+        # route supplies its ordered BatchReqState for this dispatch explicitly.
+        current = _DBO_BATCH.get()
+        runner, batch = (None, None) if current is None else current
+        eligible = False
+        try:
+            eligible = (
+                not uniform_decode
+                and runner is not None
+                and getattr(runner, "parallel_config", None) is config
+                # These modes rewrite query boundaries after dispatch; their
+                # original BatchReqState cannot prove the eventual split safe.
+                and getattr(runner, "pcp_manager", None) is None
+                and getattr(runner, "adaptive_verification", None) is None
+                and _has_prefill_in_both_ubatches(
+                    getattr(batch, "num_scheduled_tokens", None),
+                    caller.f_locals.get("num_tokens", -1),
+                    split_point,
+                    _dsa_decode_threshold(runner),
+                )
+            )
+        except (AttributeError, TypeError, ValueError, OverflowError):
+            # Invalid or unavailable local metadata is a veto, never a local
+            # exception that could strand the other ranks at the vote below.
+            eligible = False
+        # Totals and the allow_ubatching vote above are already DP-unanimous,
+        # so every rank reaches this collective. Query distributions need not
+        # match: one unsafe (or unavailable) local layout vetoes DBO everywhere.
+        vote = torch.tensor([int(eligible)], dtype=torch.int32, device="cpu")
+        dpu.dist.all_reduce(
+            vote, op=dpu.dist.ReduceOp.MIN, group=dpu.get_dp_group().cpu_group
+        )
+        return bool(vote.item())
 
     check_ubatch_thresholds._hcu_dbo = True
     dpu.check_ubatch_thresholds = check_ubatch_thresholds

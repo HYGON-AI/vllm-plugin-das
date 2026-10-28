@@ -116,10 +116,10 @@ def test_retired_runtime_and_tuning_artifacts_are_absent():
 def test_threshold_hook_uses_parallel_owner_marker_and_keeps_native_dbo():
     fn = function("vllm_hcu/v1/hcu_dbo.py", "check_ubatch_thresholds", dict(
         original_threshold=lambda *args: "native", DBO_MIN_TOKENS=4096,
-        _MIN_TAIL=64, sys=SimpleNamespace(_getframe=lambda _:SimpleNamespace(
-            f_locals={"num_tokens_across_dp":SimpleNamespace(max=lambda:8192)}))))
+        _MIN_TAIL=64, sys=SimpleNamespace(_getframe=lambda _:SimpleNamespace(f_locals={}))))
     assert fn(SimpleNamespace(),8192,False)=="native"
-    assert fn(SimpleNamespace(_hcu_step5_dbo=True),8192,False) is True
+    # A count alone no longer establishes safe query boundaries or DP agreement.
+    assert fn(SimpleNamespace(_hcu_step5_dbo=True),8192,False) is False
     assert fn(SimpleNamespace(_hcu_step5_dbo=True),8192,True) is False
 
 

@@ -108,3 +108,107 @@ def test_mtp_tail_preserves_dynamic_mirrors_on_clean_input_batch(monkeypatch):
     )
     assert trimmed.block_tables_np is batch.block_tables_np
     assert sync is None and batch.num_tokens == 12
+
+
+@pytest.mark.parametrize("peer_rows,expected_ubatches,expected_votes", [
+    ([4] * 512 + [2048], 1, [0, 1]),
+    ([4] * 256 + [3072], 2, [1, 1]),
+], ids=["unsafe-peer-veto", "safe-mixed-dbo"])
+def test_step5_real_cpu_dispatch_agrees_before_slicing(
+    monkeypatch, peer_rows, expected_ubatches, expected_votes
+):
+    """Exercise installed dispatch/sync bodies and the full Step5 entry point.
+
+    Only the DP communication boundary is simulated. Stop immediately after
+    dispatch, before input preparation or model/device work can begin.
+    """
+    from concurrent.futures import ThreadPoolExecutor
+    import threading
+
+    from vllm.v1.worker.gpu import dp_utils
+    from vllm.v1.worker.gpu.model_runner import BatchReqState
+    from vllm_hcu.model_executor.layers import step4_dsa as dsa
+    from vllm_hcu.v1 import hcu_dbo, step5_execution
+
+    assert step5_execution.dispatch_cg_and_sync_dp is dp_utils.dispatch_cg_and_sync_dp
+    original_threshold = dp_utils.check_ubatch_thresholds
+    monkeypatch.setattr(dp_utils, "check_ubatch_thresholds", original_threshold)
+    monkeypatch.setattr(hcu_dbo, "DBO_MIN_TOKENS", 4096)
+    hcu_dbo._patch_dp_threshold()
+
+    cpu_group = object()
+    monkeypatch.setattr(dp_utils, "get_dp_group", lambda: SimpleNamespace(cpu_group=cpu_group))
+    ops = dp_utils.dist.ReduceOp
+    barriers = {ops.SUM: threading.Barrier(2), ops.MIN: threading.Barrier(2)}
+    contributions = {ops.SUM: [], ops.MIN: []}
+    lock = threading.Lock()
+
+    def all_reduce(tensor, *, group, op=ops.SUM):
+        assert group is cpu_group
+        assert tensor.device.type == "cpu" and tensor.dtype == torch.int32
+        assert tuple(tensor.shape) == ((6, 2) if op == ops.SUM else (1,))
+        with lock:
+            contributions[op].append(tensor.clone())
+        barriers[op].wait(timeout=10)
+        values = torch.stack(contributions[op])
+        result = values.sum(dim=0) if op == ops.SUM else values.amin(dim=0)
+        tensor.copy_(result)
+
+    monkeypatch.setattr(dp_utils.dist, "all_reduce", all_reduce)
+
+    def forbid_cuda_init():
+        raise AssertionError("CPU dispatch regression must not initialize CUDA")
+
+    monkeypatch.setattr(torch.cuda, "_lazy_init", forbid_cuda_init)
+
+    class DispatchComplete(Exception):
+        def __init__(self, descriptor):
+            self.descriptor = descriptor
+
+    def stop_after_dispatch(runner, descriptor):
+        assert hcu_dbo._DBO_BATCH.get() is None
+        raise DispatchComplete(descriptor)
+
+    monkeypatch.setattr(step5_execution, "record_context_graph_mode", stop_after_dispatch)
+
+    def run_rank(rank, rows):
+        qlens = np.array(rows, dtype=np.int32)
+        req_ids = [f"rank{rank}-req{i}" for i in range(len(rows))]
+        batch = BatchReqState(
+            req_ids=req_ids, num_scheduled_tokens=qlens, num_tokens=int(qlens.sum()),
+            idx_mapping_np=np.arange(len(rows), dtype=np.int32),
+            prefill_len_np=qlens.copy(),
+            num_computed_prefill_tokens_np=np.zeros_like(qlens),
+            is_prefilling_np=qlens > 4, has_prefill=True,
+        )
+        builder = dsa.Step4DSAMetadataBuilder.__new__(dsa.Step4DSAMetadataBuilder)
+        builder.reorder_batch_threshold = 4
+        noop = lambda *args: None
+        runner = SimpleNamespace(
+            update_pp_decode_requests=noop, finish_requests=noop, free_states=noop,
+            add_requests=noop, update_requests=noop,
+            block_tables=SimpleNamespace(apply_staged_writes=noop),
+            gather_batch_req_state=lambda *args: (batch, None),
+            pcp_manager=None, adaptive_verification=None, lora_config=None,
+            is_encoder_decoder=False, cudagraph_manager=None,
+            parallel_config=SimpleNamespace(
+                _hcu_step5_dbo=True, use_ubatching=True, num_ubatches=2
+            ),
+            dp_size=2, dp_rank=rank, decode_query_len=4, ubatch_runner=object(),
+            attn_groups=[[SimpleNamespace(metadata_builders=[builder, builder])]],
+        )
+        scheduler = SimpleNamespace(
+            num_scheduled_tokens=dict(zip(req_ids, rows)),
+            total_num_scheduled_tokens=batch.num_tokens,
+        )
+        with pytest.raises(DispatchComplete) as stopped:
+            step5_execution.execute_model(runner, scheduler, is_profile=True)
+        assert hcu_dbo._DBO_BATCH.get() is None
+        return stopped.value.descriptor.num_ubatches
+
+    with ThreadPoolExecutor(max_workers=2) as pool:
+        futures = [pool.submit(run_rank, 0, [4096]), pool.submit(run_rank, 1, peer_rows)]
+        decisions = [future.result(timeout=15) for future in futures]
+    assert decisions == [expected_ubatches, expected_ubatches]
+    assert len(contributions[ops.SUM]) == len(contributions[ops.MIN]) == 2
+    assert sorted(int(v.item()) for v in contributions[ops.MIN]) == expected_votes
