@@ -40,3 +40,20 @@ conservative startup workspace planning remain unchanged.
 The test environment used the exact pinned Python sources with image Torch and
 native extensions providing import dependencies. These checks do not constitute
 GPU kernel numerics, a hardware distributed run, or a model-performance rerun.
+
+
+## Native DBO ownership follow-up
+
+At head `fea967ee2e5fa8e1915d5df14a8b5c0c53088cd8`, an already enabled
+native DBO configuration skipped HCU initialization but still acquired the HCU
+runner and DSA hooks when the Step5 environment threshold was positive.
+`install_runner` now requires both enabled DBO and the exact HCU owner marker.
+Explicit native DBO retains its own threshold and methods; the environment
+threshold does not partially take over that runner. HCU auto-enable and
+idempotent hook installation remain available.
+
+The new26-case CPU ownership suite reproduces9 unwanted-mutation failures on
+that reviewed head and passes after the guard. The combined portable regression
+selection passes119 tests. These cases execute actual enable/install/DSA bodies
+with runtime dependencies doubled; no GPU or thread-hang experiment was run.
+This follow-up adds no per-step collective or model operator.

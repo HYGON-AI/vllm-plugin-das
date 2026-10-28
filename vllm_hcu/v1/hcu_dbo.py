@@ -368,10 +368,16 @@ def _patch_slicing() -> None:
 
 def install_runner(runner) -> None:
     """Per-runner hooks, once the ubatch runner and the model exist."""
+    config = getattr(runner, "vllm_config", None)
+    pc = getattr(config, "parallel_config", None)
     if (DBO_MIN_TOKENS <= 0
-            or not is_step5_config(getattr(runner, "vllm_config", None))
+            or not is_step5_config(config)
+            or not getattr(pc, "enable_dbo", False)
+            or getattr(pc, "_hcu_step5_dbo", False) is not True
             or not henvs.optional_custom_op_enabled(True)):
         return
+    # Explicit native DBO skips enable_in_worker(), so it has neither the HCU
+    # split-safety gate nor slicing/device setup. Only wrap our owned runners.
     ur = getattr(runner, "ubatch_runner", None)
     if ur is None or getattr(ur, "_hcu_dbo", False):
         return
