@@ -160,8 +160,8 @@ def test_fp8_idle_dp_rank_participates_and_clears_stale_routes(runtime, monkeypa
     assert len(calls) == 1  # All ranks empty: no collective required.
 
 
-def test_pcp_ignores_global_dp_metadata_and_launches_rank_local_tokens(
-    runtime, monkeypatch,
+def test_pcp_defensively_ignores_injected_dp_metadata(
+    runtime, monkeypatch, context=None,
 ):
     _, moe, layer = valid_config()
     moe.pcp_size = 8
@@ -183,9 +183,9 @@ def test_pcp_ignores_global_dp_metadata_and_launches_rank_local_tokens(
     )
     monkeypatch.setitem(sys.modules, "megamoe", fake)
     monkeypatch.setattr(torch.cuda, "is_current_stream_capturing", lambda: False)
-    # PCP scheduler coordination may retain the unsplit token count.  MegaMoE
-    # must size its dispatch from this rank's already-partitioned input.
-    monkeypatch.setattr(runtime, "get_forward_context", lambda: NS(
+    # Synthetic defensive input: the supported TP1/DP1/PCP8 builders do not
+    # create DP metadata, even when passed an unsplit token count.
+    monkeypatch.setattr(runtime, "get_forward_context", lambda: context if context is not None else NS(
         dp_metadata=NS(num_tokens_across_dp_cpu=torch.tensor([16]))
     ))
     x = torch.ones(2, 4096, dtype=torch.bfloat16)
@@ -1008,3 +1008,93 @@ def test_optional_megamoe_import_error(runtime, monkeypatch, missing):
         with pytest.raises(ModuleNotFoundError) as exc:
             method.process_weights_after_loading(None)
         assert exc.value.name == missing
+
+
+def _native_context_symbols():
+    """Execute installed source definitions without GPU/platform import effects.
+
+    Keep the original builder, DPMetadata.make and ParallelConfig property;
+    only context storage and platform hooks are replaced below.
+    """
+    import ast
+    from contextlib import contextmanager
+    from dataclasses import dataclass
+
+    native = next((Path(p) / "vllm/forward_context.py" for p in sys.path
+                   if (Path(p) / "vllm/forward_context.py").is_file()), None)
+    if native is None:
+        pytest.skip("requires installed native vLLM context source")
+    tree = ast.parse(native.read_text())
+    definitions = [n for n in tree.body if isinstance(n, (ast.FunctionDef, ast.ClassDef))
+                   and n.name in {"DPMetadata", "set_forward_context"}]
+    assert len(definitions) == 2
+    module = ModuleType("test_native_context_source")
+    module.__dict__.update(torch=torch, contextmanager=contextmanager,
+                           dataclass=dataclass, CUDAGraphMode=NS(NONE=0))
+    # Postpone annotations just as an isolated source loader would.
+    code = ast.Module(body=[ast.ImportFrom(module="__future__",
+                      names=[ast.alias(name="annotations")], level=0), *definitions],
+                      type_ignores=[])
+    sys.modules[module.__name__] = module
+    try:
+        exec(compile(ast.fix_missing_locations(code), str(native), "exec"), module.__dict__)
+    finally:
+        sys.modules.pop(module.__name__, None)
+    parallel = ast.parse((native.parent / "config/parallel.py").read_text())
+    cls = next(n for n in parallel.body if isinstance(n, ast.ClassDef)
+               and n.name == "ParallelConfig")
+    prop = next(n for n in cls.body if isinstance(n, ast.FunctionDef)
+                and n.name == "use_sequence_parallel_moe")
+    namespace = {}
+    exec(compile(ast.fix_missing_locations(ast.Module(body=[prop], type_ignores=[])),
+                 str(native.parent / "config/parallel.py"), "exec"), namespace)
+    return module, namespace["use_sequence_parallel_moe"]
+
+
+@pytest.mark.parametrize("builder", ["native", "hcu"])
+@pytest.mark.parametrize("dp_size,global_tokens", [(1, None), (1, [16]), (2, [2, 7])])
+def test_pcp_metadata_from_actual_context_builders(runtime, monkeypatch, builder,
+                                                   dp_size, global_tokens):
+    from contextlib import contextmanager
+
+    module, sp_property = _native_context_symbols()
+    parallel = NS(tensor_parallel_size=1, data_parallel_size=dp_size,
+                  data_parallel_rank=0, prefill_context_parallel_size=8,
+                  enable_expert_parallel=True, is_moe_model=True,
+                  all2all_backend="allgather_reducescatter")
+    parallel.use_sequence_parallel_moe = sp_property.fget(parallel)
+    assert parallel.use_sequence_parallel_moe is False
+    config = NS(parallel_config=parallel)
+    contexts = []
+
+    @contextmanager
+    def override(context):
+        contexts.append(context)
+        try:
+            yield
+        finally:
+            contexts.pop()
+
+    module.track_batchsize = False
+    module.current_platform = NS(set_additional_forward_context=lambda **kw: {})
+    module.create_forward_context = lambda *args, **kw: NS(dp_metadata=args[2])
+    module.override_forward_context = override
+    tokens = None if global_tokens is None else torch.tensor(global_tokens, dtype=torch.int32)
+    if builder == "hcu":
+        hcu = load_file(monkeypatch, "test_hcu_context_source",
+                        "vllm_hcu/forward_context_runtime.py")
+        scope = hcu.set_forward_context(module, None, config, num_tokens=2,
+                                       num_tokens_across_dp=tokens)
+    else:
+        scope = module.set_forward_context(None, config, num_tokens=2,
+                                          num_tokens_across_dp=tokens)
+    with scope:
+        context = contexts[-1]
+        if dp_size == 1:
+            assert context.dp_metadata is None
+            test_pcp_defensively_ignores_injected_dp_metadata(runtime, monkeypatch, context)
+        else:
+            # Control for the actual creation branch; DP2/PCP8 is not a
+            # supported MegaMoE configuration and must not be sent to apply.
+            assert context.dp_metadata.num_tokens_across_dp_cpu.tolist() == [2, 7]
+    assert contexts == []
