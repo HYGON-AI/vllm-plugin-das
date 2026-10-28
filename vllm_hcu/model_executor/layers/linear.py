@@ -212,6 +212,12 @@ class LinearMethodBase(QuantizeMethodBase):
 class UnquantizedLinearMethod(LinearMethodBase):
     """Linear method without quantization."""
 
+    @property
+    def supports_pre_processed_weights(self) -> bool:
+        # HCU/ROCm post-load does not transform this method's weights.
+        # CPU dispatch may pack/remove them and is not IPC-audited.
+        return current_platform.is_cuda_alike()
+
     def create_weights(
         self,
         layer: torch.nn.Module,

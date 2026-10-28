@@ -57,6 +57,14 @@ EXPECTED_ORDER = (
         "runtime_method.kimi_k25_vision_prompt",
         "vllm.model_executor.models.kimi_k25",
     ),
+    (
+        "runtime_method.weight_cache_daemon",
+        "vllm.model_executor.model_loader.weight_cache.daemon",
+    ),
+    (
+        "runtime_method.weight_cache_loader",
+        "vllm.model_executor.model_loader.weight_cache.ipc_loader",
+    ),
 )
 
 EXPECTED_IMPLEMENTATIONS = {

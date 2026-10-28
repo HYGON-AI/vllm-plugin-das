@@ -1,0 +1,102 @@
+# SPDX-License-Identifier: Apache-2.0
+from dataclasses import dataclass
+from types import SimpleNamespace
+
+import pytest
+
+
+def test_pipeline_rank_plan_keeps_stage_and_tp_rank_isolated():
+    from vllm_hcu.preload.pp_daemon import plan_local_pipeline_ranks
+
+    node0 = plan_local_pipeline_ranks(8, 2, 2, 0)
+    node1 = plan_local_pipeline_ranks(8, 2, 2, 1)
+    assert node0[0] == (0, 0, 0, 0)
+    assert node0[-1] == (7, 7, 0, 7)
+    assert node1[0] == (8, 0, 1, 0)
+    assert node1[-1] == (15, 7, 1, 7)
+
+
+def test_pipeline_rank_plan_rejects_unbalanced_nodes():
+    from vllm_hcu.preload.pp_daemon import plan_local_pipeline_ranks
+
+    with pytest.raises(ValueError, match="divisible"):
+        plan_local_pipeline_ranks(3, 2, 4, 0)
+
+
+def test_pipeline_socket_scope_uses_stage(monkeypatch):
+    from vllm_hcu.runtime_compat.weight_cache import (
+        _pipeline_context,
+        _pp_socket_identifier,
+    )
+
+    monkeypatch.setenv("VLLM_HCU_PRELOAD_PP_SIZE", "2")
+    monkeypatch.setenv("VLLM_HCU_PRELOAD_PP_RANK", "1")
+    assert _pipeline_context() == (2, 1)
+    assert _pp_socket_identifier("uuid-GPU-1") == "uuid-GPU-1-pp1"
+
+    monkeypatch.setenv("VLLM_HCU_PRELOAD_PP_SIZE", "1")
+    monkeypatch.setenv("VLLM_HCU_PRELOAD_PP_RANK", "0")
+    assert _pp_socket_identifier("uuid-GPU-1") == "uuid-GPU-1"
+
+
+def test_pipeline_cache_key_includes_stage(monkeypatch, tmp_path):
+    from vllm_hcu.runtime_compat.weight_cache import install_key_fingerprint
+
+    @dataclass(frozen=True)
+    class Key:
+        checkpoint: str
+        vllm_version: str
+
+        @classmethod
+        def from_model_config(cls, model_config, tp_size, tp_rank):
+            return cls("base", "vllm")
+
+    module = SimpleNamespace(WeightCacheKey=Key)
+    install_key_fingerprint(module)
+    config = SimpleNamespace(
+        model=str(tmp_path), hf_config=SimpleNamespace(to_dict=lambda: {}),
+        model_class_overrides={},
+    )
+    monkeypatch.setenv("VLLM_HCU_PRELOAD_PP_SIZE", "2")
+    monkeypatch.setenv("VLLM_HCU_PRELOAD_PP_RANK", "0")
+    first = Key.from_model_config(config, 8, 0)
+    monkeypatch.setenv("VLLM_HCU_PRELOAD_PP_RANK", "1")
+    second = Key.from_model_config(config, 8, 0)
+    assert first.checkpoint != second.checkpoint
+    assert "hcu-pp:2:0" in first.checkpoint
+    assert "hcu-pp:2:1" in second.checkpoint
+
+
+def test_slimquant_ipc_gate_is_explicit(monkeypatch):
+    from vllm_hcu.runtime_compat.weight_cache import install_ipc_quant_support
+
+    module = SimpleNamespace(IPC_QUANT_ALLOWLIST={None: lambda _: True})
+    install_ipc_quant_support(module)
+    monkeypatch.delenv("VLLM_HCU_PRELOAD_ALLOW_SLIMQUANT_W4A8", raising=False)
+    assert not module.IPC_QUANT_ALLOWLIST["slimquant_w4a8"](None)
+    monkeypatch.setenv("VLLM_HCU_PRELOAD_ALLOW_SLIMQUANT_W4A8", "1")
+    assert module.IPC_QUANT_ALLOWLIST["slimquant_w4a8"](None)
+
+
+def test_slimquant_ipc_gate_is_idempotent():
+    from vllm_hcu.runtime_compat.weight_cache import install_ipc_quant_support
+
+    module = SimpleNamespace(IPC_QUANT_ALLOWLIST={None: lambda _: True})
+    install_ipc_quant_support(module)
+    predicate = module.IPC_QUANT_ALLOWLIST["slimquant_w4a8"]
+    install_ipc_quant_support(module)
+    assert module.IPC_QUANT_ALLOWLIST["slimquant_w4a8"] is predicate
+
+
+def test_slimquant_ipc_gate_overrides_preexisting_permissive_entry(monkeypatch):
+    from vllm_hcu.runtime_compat.weight_cache import install_ipc_quant_support
+
+    module = SimpleNamespace(IPC_QUANT_ALLOWLIST={
+        None: lambda _: True,
+        "slimquant_w4a8": lambda _: True,
+    })
+    install_ipc_quant_support(module)
+    monkeypatch.delenv("VLLM_HCU_PRELOAD_ALLOW_SLIMQUANT_W4A8", raising=False)
+    assert not module.IPC_QUANT_ALLOWLIST["slimquant_w4a8"](None)
+    monkeypatch.setenv("VLLM_HCU_PRELOAD_ALLOW_SLIMQUANT_W4A8", "1")
+    assert module.IPC_QUANT_ALLOWLIST["slimquant_w4a8"](None)

@@ -121,8 +121,34 @@ class HcuGPUWorker(Worker):
         """Load the model, then require every enabled patch chain to be live."""
 
         super().load_model(load_dummy_weights=load_dummy_weights)
-        from vllm_hcu.patch.worker import validate_worker_patches
+        # Router bias is replicated: every TP rank routes its local tokens
+        # against the full expert set.  A Kimi router can retain an aliased
+        # Parameter that Module.to() does not place with the rank-local model,
+        # so reconcile it once after checkpoint/cache loading and before the
+        # first forward (never copy it in the token-routing hot path).
+        from vllm_hcu.runtime_compat.weight_cache import (
+            reconcile_router_state_devices,
+        )
+
         model_runner = getattr(self, "model_runner", None)
+        models = [getattr(model_runner, "model", None)]
+        get_draft_model = getattr(model_runner, "get_draft_model", None)
+        if callable(get_draft_model):
+            models.append(get_draft_model())
+        for model in models:
+            if model is None:
+                continue
+            moved_router_state = reconcile_router_state_devices(
+                model, self.device
+            )
+            if moved_router_state:
+                runner_logger.info(
+                    "Placed %d router state tensors on rank-local device %s",
+                    len(moved_router_state),
+                    self.device,
+                )
+
+        from vllm_hcu.patch.worker import validate_worker_patches
         num_compressor_weights = getattr(
             model_runner, "_vllm_hcu_num_compressor_weights", 0
         )
@@ -255,6 +281,11 @@ class HcuGPUWorker(Worker):
                 self.local_rank,
                 current_platform.dist_backend,
             )
+            from vllm_hcu.v1.config_consistency import (
+                validate_distributed_engine_config,
+            )
+
+            validate_distributed_engine_config(self.vllm_config, torch.distributed)
 
             if self.use_v2_model_runner:
                 logger.info_once("Using V2 Model Runner", scope="local")
