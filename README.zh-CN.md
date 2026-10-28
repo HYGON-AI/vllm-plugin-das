@@ -127,7 +127,8 @@ vllm serve /path/to/model \
 并依赖 HCU LightOp 的量化 GEMM。不支持 LoRA、已量化 head 和预处理/IPC 权重
 缓存。启用 `VLLM_USE_NN` 时不支持 `UnquantizedLinearMethod` 类型的 head，
 标准的未量化 embedding head 仍受支持。INT8 转换存在近似误差，请在目标环境
-验证精度和性能。
+验证精度和性能。启用该功能时不支持 checkpoint 格式的进程内权重重载，
+请使用新 checkpoint 重启 worker。
 
 ### MHA/GQA 使用 FlashAttention
 

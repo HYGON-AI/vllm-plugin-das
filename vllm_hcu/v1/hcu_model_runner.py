@@ -235,6 +235,15 @@ from vllm_hcu.patch.config import get_hcu_config
 
 logger = init_logger(__name__)
 
+
+def _has_convrot_lm_head(model: nn.Module) -> bool:
+    """Return whether the model owns the opt-in ConvRot INT8 output head."""
+    return any(
+        type(getattr(module, "quant_method", None)).__name__
+        == "ConvRotINT8LMHeadMethod"
+        for module in model.modules()
+    )
+
 AttnMetadataDict: TypeAlias = dict[str, AttentionMetadata]
 # list when ubatching is enabled
 PerLayerAttnMetadata: TypeAlias = list[AttnMetadataDict] | AttnMetadataDict
@@ -5302,6 +5311,11 @@ class GPUModelRunner(
             )
 
         model = self.get_model()
+        if is_checkpoint_format and _has_convrot_lm_head(model):
+            raise RuntimeError(
+                "ConvRot INT8 lm_head does not support checkpoint-format "
+                "weight reload; restart the worker with the new checkpoint"
+            )
         weights_to_load = {name for name, _ in model.named_parameters()}
         counter_before_reloading = time.perf_counter()
 

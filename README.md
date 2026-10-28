@@ -152,6 +152,8 @@ divisible by 256, and HCU LightOp with custom quantization GEMM enabled. LoRA,
 already-quantized heads, and pre-processed/IPC weight caches are not supported.
 Heads using `UnquantizedLinearMethod` with `VLLM_USE_NN` enabled are also not
 supported; the standard unquantized embedding head remains supported.
+Checkpoint-format in-place weight reload is not supported while this option is
+enabled; restart the worker with the new checkpoint instead.
 INT8 conversion is approximate; check accuracy and performance in the target
 environment.
 
