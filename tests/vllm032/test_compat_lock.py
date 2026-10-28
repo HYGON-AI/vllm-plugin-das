@@ -6,6 +6,8 @@ from pathlib import Path
 
 ROOT = Path(__file__).resolve().parents[2]
 LOCK = ROOT / "validation" / "v0.32.0" / "compat-lock.json"
+OLD_ADAPTER_DISTRIBUTION = "hcu-vllm" + "-adapter"
+OLD_ADAPTER_NAMESPACE = "hcu_vllm" + "_adapter"
 
 
 def _contains_forbidden_key(value: object) -> bool:
@@ -24,7 +26,7 @@ def test_plugin_compat_lock_pins_vllm032_pair_without_circular_commits() -> None
     document = json.loads(LOCK.read_text(encoding="utf-8"))
 
     assert document["schema_version"] == 1
-    assert document["validation_id"] == "vllm-v0.32.0-gfx936-20261027"
+    assert document["validation_id"] == "vllm-v0.32.0-adapter-das-20261028"
     assert document["status"] in {"pending", "passed"}
     assert document["repository"] == {
         "name": "vllm-plugin-das",
@@ -34,10 +36,10 @@ def test_plugin_compat_lock_pins_vllm032_pair_without_circular_commits() -> None
         "test_policy_commit": "af84424cf652893fbbf392f9e1759ff19241ff96",
     }
     assert document["peer"] == {
-        "name": "hcu-vllm-adapter",
-        "url": "https://github.com/alexanderbin123/hcu-vllm-adapter.git",
-        "branch": "compat/vllm-v0.32.0",
-        "source_base": "7f9fa4d5a2b38d2e6d848bbfaa9bb2679fe86ff1",
+        "name": "adapter-das",
+        "url": "https://github.com/alexanderbin123/adapter-das.git",
+        "branch": "feat/vllm032-runtime-integration",
+        "source_base": "81361880e203cb33cf631f77716ac8244f5f299f",
     }
     assert document["vllm"] == {
         "version": "0.32.0",
@@ -48,3 +50,26 @@ def test_plugin_compat_lock_pins_vllm032_pair_without_circular_commits() -> None
     )
     assert document["hardware"]["architecture"] == "gfx936"
     assert not _contains_forbidden_key(document)
+
+
+def test_runtime_build_verifier_and_vllm032_contracts_drop_old_adapter() -> None:
+    targets = (
+        ROOT / "adapter_extension",
+        ROOT / "tests" / "vllm032",
+        LOCK,
+    )
+    offenders: list[str] = []
+    for target in targets:
+        paths = (target,) if target.is_file() else target.rglob("*")
+        for path in paths:
+            if (
+                not path.is_file()
+                or "__pycache__" in path.parts
+                or path.suffix not in {".json", ".md", ".py", ".toml"}
+            ):
+                continue
+            text = path.read_text(encoding="utf-8")
+            if OLD_ADAPTER_DISTRIBUTION in text or OLD_ADAPTER_NAMESPACE in text:
+                offenders.append(path.relative_to(ROOT).as_posix())
+
+    assert offenders == []

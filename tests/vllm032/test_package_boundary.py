@@ -22,14 +22,16 @@ def test_project_metadata_has_only_the_adapter_extension_entry_point() -> None:
     assert metadata["version"] == "0.2.0.dev0"
     assert metadata["requires-python"] == ">=3.11,<3.15"
     assert metadata["dependencies"] == [
-        "hcu-vllm-adapter>=0.1.0.dev0",
+        "sgl-kernel>=0.1.0",
         "packaging>=23",
     ]
     assert metadata["entry-points"] == {
-        "hcu_vllm_adapter.extensions": {
+        "hcu_adapter.extensions": {
             "das_hcu": "hcu_vllm_das.extension:extension_spec"
         }
     }
+    assert "vllm.platform_plugins" not in metadata["entry-points"]
+    assert "vllm.general_plugins" not in metadata["entry-points"]
 
 
 def test_package_exports_the_exact_vllm_target_without_framework_imports() -> None:
@@ -93,8 +95,11 @@ def test_built_wheel_contains_only_the_new_plugin_namespace(tmp_path: Path) -> N
 
     assert "Name: hcu-vllm-das-plugin\n" in wheel_metadata
     assert "Version: 0.2.0.dev0\n" in wheel_metadata
-    assert "[hcu_vllm_adapter.extensions]\n" in entry_points
+    assert "Requires-Dist: sgl-kernel>=0.1.0\n" in wheel_metadata
+    assert "[hcu_adapter.extensions]\n" in entry_points
     assert "das_hcu = hcu_vllm_das.extension:extension_spec\n" in entry_points
+    assert "[vllm.platform_plugins]\n" not in entry_points
+    assert "[vllm.general_plugins]\n" not in entry_points
     assert any(name == "hcu_vllm_das/__init__.py" for name in names)
     license_names = {
         name.rsplit("/", 1)[-1]
