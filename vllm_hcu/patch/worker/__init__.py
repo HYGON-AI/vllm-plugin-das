@@ -917,8 +917,12 @@ def _bind_deserialized_hcu_config(vllm_config: object) -> HcuFeatureConfig:
     from vllm_hcu.patch.platform.core_fix.patch_compilation_config import (
         bind_hcu_config,
     )
-    from vllm_hcu.patch.config import bind_hcu_eplb_config
+    from vllm_hcu.patch.config import (
+        bind_hcu_eplb_config,
+        validate_offline_eplb_config,
+    )
 
+    validate_offline_eplb_config(vllm_config)
     normalized = bind_hcu_config(vllm_config)
     bind_hcu_eplb_config(vllm_config)
     return normalized

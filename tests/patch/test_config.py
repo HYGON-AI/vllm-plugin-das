@@ -194,3 +194,28 @@ def test_invalid_values_are_rejected(payload: dict[str, object], error: type[Exc
 def test_write_requires_mutable_mapping() -> None:
     with pytest.raises(TypeError, match="mutable mapping"):
         write_hcu_config(({},), HcuFeatureConfig())  # type: ignore[arg-type]
+
+
+@pytest.mark.parametrize("field", ["expert_map_path", "expert_map_record_path"])
+@pytest.mark.parametrize("as_mapping", [False, True])
+def test_offline_eplb_paths_require_eplb_and_expert_parallel(field, as_mapping):
+    from vllm_hcu.patch.config import validate_offline_eplb_config
+
+    for eplb, ep, expected in (
+        (False, True, "--enable-eplb"),
+        (True, False, "--enable-expert-parallel"),
+        (True, True, None),
+    ):
+        parallel = {"enable_eplb": eplb, "enable_expert_parallel": ep}
+        additional = {"hcu": {field: "/tmp/expert-map.json"}}
+        config = {"parallel_config": parallel, "additional_config": additional}
+        if not as_mapping:
+            config = SimpleNamespace(
+                parallel_config=SimpleNamespace(**parallel),
+                additional_config=additional,
+            )
+        if expected:
+            with pytest.raises(ValueError, match=expected):
+                validate_offline_eplb_config(config)
+        else:
+            validate_offline_eplb_config(config)

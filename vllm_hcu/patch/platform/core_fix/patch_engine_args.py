@@ -21,6 +21,7 @@ from typing import Any
 from vllm_hcu.patch.config import (
     HcuFeatureConfig,
     bind_hcu_eplb_config,
+    validate_offline_eplb_config,
     get_hcu_config,
     normalize_hcu_moe_backend,
     set_hcu_config,
@@ -573,6 +574,7 @@ def apply_to_module(module: ModuleType) -> bool:
     @functools.wraps(create_engine_config)
     def hcu_create_engine_config(self, *args: Any, **kwargs: Any):
         feature_config = _normalise_existing_engine_args(self)
+        validate_offline_eplb_config(self)
         config = create_engine_config(self, *args, **kwargs)
         resolved_config = get_hcu_config(config)
         # VllmConfig.__post_init__ calls the platform hook before returning

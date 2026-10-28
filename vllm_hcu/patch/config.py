@@ -318,6 +318,29 @@ def set_hcu_config(
     return normalized
 
 
+def validate_offline_eplb_config(vllm_config: object) -> None:
+    """Reject offline EPLB paths unless expert parallel and EPLB are enabled."""
+    feature = get_hcu_config(vllm_config)
+    if not (feature.expert_map_path or feature.expert_map_record_path):
+        return
+    if isinstance(vllm_config, Mapping):
+        parallel = vllm_config.get("parallel_config", vllm_config)
+    else:
+        parallel = getattr(vllm_config, "parallel_config", vllm_config)
+
+    def enabled(name: str) -> bool:
+        if isinstance(parallel, Mapping):
+            return bool(parallel.get(name, False))
+        return bool(getattr(parallel, name, False))
+
+    if not enabled("enable_eplb"):
+        raise ValueError("HCU offline EPLB expert map paths require --enable-eplb")
+    if not enabled("enable_expert_parallel"):
+        raise ValueError(
+            "HCU offline EPLB expert map paths require --enable-expert-parallel"
+        )
+
+
 def bind_hcu_eplb_config(vllm_config: object) -> None:
     """Restore offline-EPLB sidecar fields on ``parallel_config``.
 
@@ -375,4 +398,5 @@ __all__ = [
     "pop_hcu_feature_kwargs",
     "set_hcu_config",
     "write_hcu_config",
+    "validate_offline_eplb_config",
 ]
