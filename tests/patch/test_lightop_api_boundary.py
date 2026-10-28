@@ -178,11 +178,11 @@ class _LightOpVisitor(ast.NodeVisitor):
             "importlib", "import_module", "__import__", "globals", "locals",
             "vars", "sys", "builtins", "__builtins__", "__globals__",
             "func_globals", "f_globals", "f_locals", "f_builtins",
-            "eval", "exec", "compile",
+            "eval", "exec", "compile", "load_exact_module",
         }
         protected = {
             "getattr", "callable", "ImportError", "AttributeError",
-            "functools", "_pcp_insert_op",
+            "functools", "_pcp_insert_op", "TARGET_MODULE", "load_exact_module",
         }
         parents = {
             id(child): parent for parent in ast.walk(tree)
@@ -195,6 +195,24 @@ class _LightOpVisitor(ast.NodeVisitor):
             id(child) for node in ast.walk(tree)
             if isinstance(node, ast.Call) and ast.dump(node) == expected_import
             for child in ast.walk(node)
+        }
+        # The imported coordinator helper is a loader too. Permit only its
+        # existing call shape, with the target pinned to the reviewed module.
+        expected_loader = ast.dump(ast.parse(
+            "load_exact_module(TARGET_MODULE, module)"
+        ).body[0].value)
+        reviewed_exact_loaders = {
+            id(node.func) for node in ast.walk(tree)
+            if isinstance(node, ast.Call) and ast.dump(node) == expected_loader
+        }
+        expected_target = ast.dump(ast.parse(
+            'TARGET_MODULE = "vllm.models.deepseek_v4.amd.rocm"'
+        ).body[0])
+        targets = [node for node in tree.body if ast.dump(node) == expected_target]
+        if reviewed_exact_loaders and len(targets) != 1:
+            self._violate(tree, "module loader requires the exact TARGET_MODULE")
+        reviewed_target_nodes = {
+            id(child) for node in targets for child in ast.walk(node)
         }
         for node in ast.walk(tree):
             parent = parents.get(id(node))
@@ -228,10 +246,16 @@ class _LightOpVisitor(ast.NodeVisitor):
                 and node.asname is None and isinstance(parent, ast.Import)
                 and len(parent.names) == 1 and parent in tree.body
             )
+            plain_exact_loader = (
+                isinstance(node, ast.alias) and node.name == "load_exact_module"
+                and node.asname is None and isinstance(parent, ast.ImportFrom)
+                and parent.level == 1 and parent.module == "_common"
+            )
             if (
                 isinstance(token, str) and token in forbidden
                 and id(node) not in reviewed_loader_nodes
-                and not plain_importlib
+                and not plain_importlib and not plain_exact_loader
+                and id(node) not in reviewed_exact_loaders
             ):
                 self._violate(node, "dynamic namespace capability in legacy owner")
             if isinstance(node, ast.Constant) and token == "_pcp_insert_op":
@@ -255,7 +279,7 @@ class _LightOpVisitor(ast.NodeVisitor):
             binding = None
             if isinstance(node, ast.Name) and isinstance(node.ctx, (ast.Store, ast.Del)):
                 binding = node.id
-            elif isinstance(node, ast.arg):
+            elif isinstance(node, (ast.arg, ast.keyword)):
                 binding = node.arg
             elif isinstance(node, ast.alias):
                 binding = node.asname or node.name.split(".")[0]
@@ -266,7 +290,10 @@ class _LightOpVisitor(ast.NodeVisitor):
                 binding = node.name
             elif isinstance(node, ast.MatchMapping):
                 binding = node.rest
-            if binding in protected and id(node) not in self._audited_legacy_nodes:
+            if (
+                binding in protected and id(node) not in self._audited_legacy_nodes
+                and id(node) not in reviewed_target_nodes and not plain_exact_loader
+            ):
                 if not (isinstance(parent, ast.Import) and binding == "functools"
                         and node.name == "functools" and node.asname is None
                         and parent in tree.body):
@@ -949,6 +976,65 @@ def test_legacy_owner_allows_reviewed_imports(tmp_path: Path, source: str) -> No
         stream.write(f"\n{source}\n")
 
     assert scan_lightop_imports(root) == []
+
+
+@pytest.mark.parametrize("source", [
+    "load_exact_module(__name__, None)",
+    "load_exact_module(TARGET_MODULE, None)",
+    "load_exact_module(target=__name__, module=None)",
+    "load_exact_module(*(__name__, None))",
+    "load = load_exact_module; load(__name__, None)",
+    "from ._common import load_exact_module as load; load(__name__, None)",
+    'getattr(common, "load_exact_module")(__name__, None)',
+])
+def test_legacy_owner_restricts_exact_module_loader(tmp_path: Path, source: str) -> None:
+    root = _write_mutation_owner(tmp_path)
+    relative_path, _, _ = next(iter(LEGACY_TOP_LEVEL_MODULE_IMPORTS))
+    with (tmp_path / relative_path).open("a", encoding="utf-8") as stream:
+        stream.write(f"\n{source}\n")
+
+    assert scan_lightop_imports(root)
+
+
+@pytest.mark.parametrize("source", [
+    "load_exact_module(__name__, None).__dict__.update(_pcp_insert_op=lambda: None)",
+    "owner.__dict__.update(_pcp_insert_op=lambda: None)",
+    "owner.__dict__.update(callable=replacement)",
+    "owner.__dict__.update(TARGET_MODULE=__name__)",
+    "TARGET_MODULE = __name__",
+])
+def test_legacy_owner_rejects_indirect_dependency_updates(
+    tmp_path: Path, source: str,
+) -> None:
+    root = _write_mutation_owner(tmp_path)
+    relative_path, _, _ = next(iter(LEGACY_TOP_LEVEL_MODULE_IMPORTS))
+    with (tmp_path / relative_path).open("a", encoding="utf-8") as stream:
+        stream.write(f"\n{source}\n")
+
+    assert scan_lightop_imports(root)
+
+
+@pytest.mark.parametrize("target", [
+    'TARGET_MODULE = "vllm.models.deepseek_v4.amd.rocm"',
+    "TARGET_MODULE = __name__",
+    "",
+])
+def test_legacy_owner_pins_exact_loader_target(tmp_path: Path, target: str) -> None:
+    root = _write_mutation_owner(tmp_path)
+    relative_path, _, _ = next(iter(LEGACY_TOP_LEVEL_MODULE_IMPORTS))
+    with (tmp_path / relative_path).open("a", encoding="utf-8") as stream:
+        stream.write(
+            "\nfrom ._common import load_exact_module\n"
+            f"{target}\n"
+            "def resolve(module):\n"
+            "    return load_exact_module(TARGET_MODULE, module)\n"
+        )
+
+    violations = scan_lightop_imports(root)
+
+    assert (violations == []) == (
+        target == 'TARGET_MODULE = "vllm.models.deepseek_v4.amd.rocm"'
+    )
 
 
 @pytest.mark.parametrize(
