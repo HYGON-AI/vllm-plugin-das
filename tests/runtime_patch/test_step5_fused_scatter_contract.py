@@ -7,6 +7,7 @@ extensions. It checks layout selection and validation, not kernel numerics.
 from __future__ import annotations
 
 import ast
+import importlib.util
 from contextlib import nullcontext
 from math import prod
 import os
@@ -22,8 +23,15 @@ EXPERTS = "vllm_hcu/model_executor/layers/fused_moe/experts/deep_gemm_moe.py"
 SIZING = "vllm_hcu/model_executor/layers/fused_moe/deep_gemm_utils.py"
 
 
+_env_spec = importlib.util.spec_from_file_location(
+    "step5_scatter_test_envs", ROOT / "vllm_hcu/platforms/envs.py")
+HENVS = importlib.util.module_from_spec(_env_spec)
+_env_spec.loader.exec_module(HENVS)
+
+
 def load(path, *names, scope=None):
     scope = {} if scope is None else scope
+    scope.setdefault("henvs", HENVS)
     tree = ast.parse((ROOT / path).read_text(encoding="utf-8"))
     functions = [next(node for node in ast.walk(tree)
                       if isinstance(node, ast.FunctionDef) and node.name == name)
@@ -128,7 +136,8 @@ class FusedScatterContractTest(unittest.TestCase):
             _HCU_HT_EP_TOKEN_ALIGNMENT=256, _EP_FUSED_MOE=False,
             current_platform=SimpleNamespace(is_rocm=lambda: True),
             henvs=SimpleNamespace(VLLM_HCU_DEEPEP_HT_EXACT_LAYOUT=False,
-                                  optional_custom_op_enabled=lambda flag: flag),
+                                  optional_custom_op_enabled=HENVS.optional_custom_op_enabled,
+                                  custom_ops_enabled=HENVS.custom_ops_enabled),
             round_up=lambda value, align: (value + align - 1) // align * align,
             init_logger=lambda _: SimpleNamespace(info=lambda *a: None),
             MoEActivation=SimpleNamespace(SWIGLUSTEP="swiglustep"),

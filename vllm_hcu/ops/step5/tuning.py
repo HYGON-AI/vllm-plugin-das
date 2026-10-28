@@ -6,6 +6,8 @@ import os
 from pathlib import Path
 import re
 
+from vllm_hcu.platforms import envs as henvs
+
 
 @lru_cache(maxsize=8)
 def _read(path):
@@ -18,12 +20,21 @@ def _read(path):
 
 
 def tuning_data():
+    if not henvs.custom_ops_enabled():
+        return {}
     path = os.environ.get("HCU_STEP5_TUNING_CONFIG", "")
     return _read(str(Path(path).resolve())) if path else {}
 
 
-@lru_cache(maxsize=1)
 def dense_recipe():
+    # Apply the master before a cached recipe can be returned.
+    if not henvs.custom_ops_enabled():
+        return None
+    return _dense_recipe()
+
+
+@lru_cache(maxsize=1)
+def _dense_recipe():
     dense = tuning_data().get("dense")
     if dense is None:
         return None
@@ -44,8 +55,14 @@ def dense_recipe():
     return choices, dense["hipblaslt_sha256"]
 
 
-@lru_cache(maxsize=2)
 def asm_recipe(local_experts):
+    if not henvs.custom_ops_enabled():
+        return None
+    return _asm_recipe(local_experts)
+
+
+@lru_cache(maxsize=2)
+def _asm_recipe(local_experts):
     asm = tuning_data().get("asm_g1")
     if asm is None:
         return None

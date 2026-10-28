@@ -20,10 +20,13 @@ import os
 import torch
 
 from vllm.utils.torch_utils import direct_register_custom_op
+from vllm_hcu.platforms import envs as henvs
 
 FP8_MAX = 448.0
 N_ALIGN = 256
-_TUNED_DENSE = os.environ.get("HCU_STEP5_DENSE_TUNING", "0") == "1"
+_TUNED_DENSE = henvs.optional_custom_op_enabled(
+    os.environ.get("HCU_STEP5_DENSE_TUNING", "0") == "1"
+)
 
 
 @torch.no_grad()
@@ -60,7 +63,7 @@ def _step5_fp8_gemm(
     N = wq.shape[0]
     if M == 0:
         return torch.empty(0, N, device=xq.device, dtype=torch.bfloat16)
-    if _TUNED_DENSE:
+    if henvs.optional_custom_op_enabled(_TUNED_DENSE):
         from .fp8_dense_tuned import tuned_fp8_gemm
 
         out = tuned_fp8_gemm(xq, xs, wq, ws)

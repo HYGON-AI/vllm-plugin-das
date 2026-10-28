@@ -8,6 +8,8 @@ import functools
 import os
 from types import ModuleType
 
+from vllm_hcu.platforms import envs as henvs
+
 from ._common import (
     PatchCompatibilityError,
     already_applied,
@@ -148,7 +150,8 @@ def apply_to_module(module: ModuleType) -> bool:
 
         self._hcu_step5_owner = is_step5_owner(moe)
         original_init(self, weight_quant, input_quant, moe, layer_name)
-        if (self._hcu_step5_owner
+        if (henvs.custom_ops_enabled()
+                and self._hcu_step5_owner
                 and os.environ.get("HCU_STEP5_PREFILL_ASM_G1", "0") == "1"):
             self._hcu_step5_asm_g1_owner_context = _asm_g1_owner_context(layer_name, moe)
         if channel_token:
@@ -200,7 +203,8 @@ def apply_to_module(module: ModuleType) -> bool:
                     "before weight postprocessing"
                 )
             process(layer)
-        if (getattr(self, "_hcu_step5_owner", False)
+        if (henvs.custom_ops_enabled()
+                and getattr(self, "_hcu_step5_owner", False)
                 and selected_backend in ("DEEPGEMM", "HCU_DEEPGEMM")
                 and os.environ.get("HCU_STEP5_PREFILL_ASM_G1", "0") == "1"):
             from vllm_hcu.ops.step5.prefill_asm_g1 import prepare_prefill_asm_g1_cache

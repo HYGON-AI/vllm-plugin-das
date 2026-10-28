@@ -47,7 +47,9 @@ _USE_HOST_SEQ_LENS = henvs.optional_custom_op_enabled(
     os.environ.get("VLLM_HCU_HOST_SEQ_LENS", "1") == "1"
 )
 # Debug: compare the mirror against the device seq_lens every step.
-_CHECK_HOST_SEQ_LENS = os.environ.get("VLLM_HCU_CHECK_HOST_SEQ_LENS", "0") == "1"
+_CHECK_HOST_SEQ_LENS = henvs.optional_custom_op_enabled(
+    os.environ.get("VLLM_HCU_CHECK_HOST_SEQ_LENS", "0") == "1"
+)
 _SAMPLER_WARMUP = ContextVar("hcu_sampler_warmup", default=False)
 _DEEPEP_AUTO_DUMMY_PHASE: ContextVar[bool | None] = ContextVar(
     "vllm_hcu_deepep_auto_dummy_phase", default=None
@@ -516,7 +518,9 @@ class HcuGPUModelRunnerV2(GPUModelRunner):
                 and get_hcu_config(self.vllm_config).deepep_auto
             ):
                 set_deepep_auto_request_phase(dummy_phase)
-            if is_step5_config(getattr(self, "vllm_config", None)):
+            if henvs.custom_ops_enabled() and is_step5_config(
+                getattr(self, "vllm_config", None)
+            ):
                 from vllm_hcu.v1.step5_execution import execute_model
 
                 return execute_model(self, *args, **kwargs)

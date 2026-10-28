@@ -139,7 +139,11 @@ _DSA_INDEXER_SUBSTRINGS = (
 DISABLE_DSA = is_dsa_disabled()
 
 # Apply placement while checkpoint tensors stream through the plugin loader.
-EXPERT_PLACEMENT = os.environ.get("VLLM_STEP5_EXPERT_PLACEMENT", "")
+EXPERT_PLACEMENT = (
+    os.environ.get("VLLM_STEP5_EXPERT_PLACEMENT", "")
+    if henvs.custom_ops_enabled()
+    else ""
+)
 _PLACED_TENSOR = re.compile(
     r"layers\.(\d+)\.moe\.(?:(?:gate|up|down)_proj\.weight(?:_scale(?:_inv)?)?"
     r"|gate\.weight|router_bias)$"

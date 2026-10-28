@@ -53,7 +53,10 @@ from vllm.logger import init_logger
 
 logger = init_logger(__name__)
 
-DBO_MIN_TOKENS = int(os.environ.get("HCU_DBO_MIN_TOKENS", "0"))
+DBO_MIN_TOKENS = (
+    int(os.environ.get("HCU_DBO_MIN_TOKENS", "0"))
+    if henvs.optional_custom_op_enabled() else 0
+)
 # Minimum real tokens every rank must have in the second (padded) half.
 # This count alone does not exclude decode-only halves in mixed batches;
 # _has_prefill_in_both_ubatches also checks the sliced query lengths.

@@ -13,6 +13,7 @@ import threading
 
 import torch
 from vllm.logger import init_logger
+from vllm_hcu.platforms import envs as henvs
 
 logger = init_logger("vllm.hcu.step5_dense")
 
@@ -50,6 +51,8 @@ def _native_gemm():
 
 def tuned_fp8_gemm(x, xs, w, ws):
     """Return tuned BF16 output or None for the unchanged LightOp fallback."""
+    if not henvs.custom_ops_enabled():
+        return None
     m, k = x.shape
     n = w.shape[0]
     relevant = _BY_NK.get((n, k))

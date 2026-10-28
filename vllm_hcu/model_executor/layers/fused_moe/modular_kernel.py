@@ -61,9 +61,17 @@ logger = init_logger(__name__)
 # joins the side stream with join_dp_moe_pipe() (after launching a late shared
 # expert, which then overlaps the last reduce).  Not VLLM_HCU_*: eager-only
 # inside the MoE custom op, must not change the compile hash.
-_DP_MOE_PIPE_MIN_TOKENS = int(os.environ.get("HCU_DP_MOE_PIPE_MIN_TOKENS", "0"))
-_EP_DIRECT_SUM = int(os.environ.get("HCU_EP_DIRECT_SUM", "0"))
-_DP_PIPE_UNIFORM = os.environ.get("HCU_DP_MOE_PIPE_UNIFORM", "0") == "1"
+_DP_MOE_PIPE_MIN_TOKENS = (
+    int(os.environ.get("HCU_DP_MOE_PIPE_MIN_TOKENS", "0"))
+    if henvs.custom_ops_enabled() else 0
+)
+_EP_DIRECT_SUM = (
+    int(os.environ.get("HCU_EP_DIRECT_SUM", "0"))
+    if henvs.custom_ops_enabled() else 0
+)
+_DP_PIPE_UNIFORM = henvs.optional_custom_op_enabled(
+    os.environ.get("HCU_DP_MOE_PIPE_UNIFORM", "0") == "1"
+)
 _dp_pipe_stream: torch.cuda.Stream | None = None
 # (side stream, tensors it still reads/writes) until the main stream joins it.
 _dp_pipe_pending: tuple | None = None
@@ -73,7 +81,9 @@ _step5_ep_workspace_announced = False
 
 def _step5_ep_chunk_provider(experts, hidden_states, w1, w2):
     """Use the implementation selected by the official runtime dispatcher."""
-    if os.environ.get("HCU_STEP5_BOUNDED_EP_WORKSPACE", "0") != "1":
+    if not henvs.optional_custom_op_enabled(
+        os.environ.get("HCU_STEP5_BOUNDED_EP_WORKSPACE", "0") == "1"
+    ):
         return None
     provider = getattr(experts, "_hcu_step5_ep_chunk_size", None)
     if provider is not None:
@@ -1606,6 +1616,8 @@ class FusedMoEKernelModularImpl:
         expert_map: torch.Tensor | None,
     ) -> torch.Tensor | None:
         """See _DP_MOE_PIPE_MIN_TOKENS.  None: not applicable, nothing done."""
+        if not henvs.custom_ops_enabled():
+            return None
         global _dp_pipe_stream, _dp_pipe_pending
         from vllm.distributed import get_dp_group
         from vllm.distributed.device_communicators.pynccl_wrapper import (
@@ -1882,7 +1894,8 @@ class FusedMoEKernelModularImpl:
             global_num_experts = local_num_experts
 
         if (
-            _DP_MOE_PIPE_MIN_TOKENS > 0
+            henvs.custom_ops_enabled()
+            and _DP_MOE_PIPE_MIN_TOKENS > 0
             and self._hcu_step5_owner
             and quanted_hidden_states is None
             and not apply_router_weight_on_input

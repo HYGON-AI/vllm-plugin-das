@@ -11,7 +11,12 @@ import os
 
 import numpy as np
 
-HOT_REGIONS = int(os.environ.get("HCU_STEP5_CONTEXT_GRAPH_REGIONS", "0"))
+from vllm_hcu.platforms import envs as henvs
+
+HOT_REGIONS = (
+    int(os.environ.get("HCU_STEP5_CONTEXT_GRAPH_REGIONS", "0"))
+    if henvs.custom_ops_enabled() else 0
+)
 if HOT_REGIONS < 0:
     raise ValueError("HCU_STEP5_CONTEXT_GRAPH_REGIONS must be nonnegative")
 

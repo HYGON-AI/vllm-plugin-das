@@ -143,7 +143,11 @@ DENSE_EQUIV = os.environ.get("VLLM_STEP4_DSA_DENSE_EQUIV", "0") == "1"
 # then made at full length. That peak is bounded by --max-num-batched-tokens and
 # freed immediately, which is why the default is still 0; set
 # VLLM_STEP4_DSA_Q_CHUNK to a positive token count to trade it back.
-INDEXER_Q_CHUNK = int(os.environ.get("VLLM_STEP4_DSA_Q_CHUNK", "0"))
+INDEXER_Q_CHUNK = (
+    int(os.environ.get("VLLM_STEP4_DSA_Q_CHUNK", "0"))
+    if henvs.custom_ops_enabled()
+    else 0
+)
 
 # Prefill indexer scoring through ``prefill_indexer_logits`` (causal tile skip, fp8
 # MFMA on the already-e4m3 q and summary keys) instead of the bf16 full-rectangle
@@ -160,8 +164,15 @@ PREFILL_FP8_INDEXER = henvs.optional_custom_op_enabled(
 # server started with --max-model-len 65536 does an eighth of the region scan a
 # 512K one does. Set this only to go *below* max_model_len deliberately -- a
 # batch whose real history exceeds it is rejected loudly, never truncated.
-GRAPH_REGIONS_OVERRIDE = int(os.environ.get("VLLM_STEP4_DSA_GRAPH_REGIONS", "0"))
-_HOT_CONTEXT_EAGER_FALLBACK = int(os.environ.get("HCU_STEP5_CONTEXT_GRAPH_REGIONS", "0")) > 0
+GRAPH_REGIONS_OVERRIDE = (
+    int(os.environ.get("VLLM_STEP4_DSA_GRAPH_REGIONS", "0"))
+    if henvs.custom_ops_enabled()
+    else 0
+)
+_HOT_CONTEXT_EAGER_FALLBACK = (
+    henvs.custom_ops_enabled()
+    and int(os.environ.get("HCU_STEP5_CONTEXT_GRAPH_REGIONS", "0")) > 0
+)
 if _HOT_CONTEXT_EAGER_FALLBACK and GRAPH_REGIONS_OVERRIDE != int(os.environ["HCU_STEP5_CONTEXT_GRAPH_REGIONS"]):
     raise ValueError("Step5 hot context width must match the decode graph width")
 

@@ -30,13 +30,20 @@ from boltops.fused_moe.triton.moe_op import fused_moe as invoke_fused_moe_kernel
 from boltops.fused_moe.triton.moe_config_utils import try_get_optimal_moe_config
 from boltops.fused_moe.triton.moe_compat import per_token_quant_triton
 from boltops.fused_moe.triton.moe_sorting_hipc import moe_sorting_fwd
+from vllm_hcu.platforms import envs as henvs
 
 FP8 = torch.float8_e4m3fn
 _announced = False
-STEP5_EXPERT_GRID = os.environ.get("HCU_STEP5_EXPERT_GRID", "0") == "1"
+STEP5_EXPERT_GRID = henvs.optional_custom_op_enabled(
+    os.environ.get("HCU_STEP5_EXPERT_GRID", "0") == "1"
+)
 _step5_grid_announced = False
-STEP5_PREFILL_G2 = os.environ.get("HCU_STEP5_PREFILL_G2", "0") == "1"
-STEP5_PREFILL_ASM_G1 = os.environ.get("HCU_STEP5_PREFILL_ASM_G1", "0") == "1"
+STEP5_PREFILL_G2 = henvs.optional_custom_op_enabled(
+    os.environ.get("HCU_STEP5_PREFILL_G2", "0") == "1"
+)
+STEP5_PREFILL_ASM_G1 = henvs.optional_custom_op_enabled(
+    os.environ.get("HCU_STEP5_PREFILL_ASM_G1", "0") == "1"
+)
 
 
 @triton.jit
@@ -147,7 +154,10 @@ def _ep_masked_moe_sum_kernel(
 # fp32 sum order as ep_masked_moe_sum, so bit-exact, without the (M, topk, K) round trip.
 # If the scratch would overflow (very skewed routing), device-side gates run the
 # cache3 + masked-sum path instead, so no host sync is needed.
-DIRECT_MIN = int(os.environ.get("HCU_EP_DIRECT_SUM", "0"))
+DIRECT_MIN = (
+    int(os.environ.get("HCU_EP_DIRECT_SUM", "0"))
+    if henvs.custom_ops_enabled() else 0
+)
 direct_scratch = None
 _DIRECT_BIG = 2**31 - 1
 DIRECT_TPP = 1
@@ -358,7 +368,10 @@ def _ep_sort_kernel(ids_ptr, w_ptr, emap_ptr, sids_ptr, sw_ptr, eids_ptr, nvalid
 # Largest M*topk sorted by _ep_sort_kernel (all routes live in one tile); above
 # it moe_sorting_fwd is used. At decode sizes the Triton sort takes 3-6 us vs
 # 13-27 us for the CK multi-phase sort plus its workspace memset.
-EP_SORT_MAX_ROUTES = int(os.environ.get("EP_FUSED_MOE_SORT_MAX_ROUTES", "2048"))
+EP_SORT_MAX_ROUTES = (
+    int(os.environ.get("EP_FUSED_MOE_SORT_MAX_ROUTES", "2048"))
+    if henvs.custom_ops_enabled() else 2048
+)
 
 
 def ep_sorting(topk_ids, topk_weights, expert_mask, global_E, local_E, bm, expert_map=None,
@@ -410,12 +423,15 @@ def lib_configs(w1, w2, topk, M):
 # uniform random routing). A cfg with PERSISTENT_PROGRAMS runs the persistent kernel.
 # {"E=..,N=..,K=..,topk=..": {M: [gemm1_cfg, gemm2_cfg]}}, nearest M wins (same rule as boltops).
 # Shapes without an entry fall back to the library tables.
-EP_TABLE_PATH = os.environ.get("EP_FUSED_MOE_TABLE", "")
+EP_TABLE_PATH = (
+    os.environ.get("EP_FUSED_MOE_TABLE", "")
+    if henvs.custom_ops_enabled() else ""
+)
 
 
 @functools.lru_cache(maxsize=None)
 def _ep_table(key):
-    if not EP_TABLE_PATH:
+    if not henvs.custom_ops_enabled() or not EP_TABLE_PATH:
         return None
     if not os.path.exists(EP_TABLE_PATH):
         return None
@@ -431,7 +447,10 @@ def _device_arch(device_index):
 def pick_configs(w1, w2, topk, M):
     E, N, K = w1.shape
     arch = _device_arch(w1.device.index)
-    t = _ep_table(f"E={E},N={N},K={K},topk={topk}") if arch == "gfx938" else None
+    t = (
+        _ep_table(f"E={E},N={N},K={K},topk={topk}")
+        if arch == "gfx938" and henvs.custom_ops_enabled() else None
+    )
     if t:
         return t[min(t, key=lambda x: abs(x - M))]
     return lib_configs(w1, w2, topk, M)
@@ -539,7 +558,10 @@ def ep_gather_sorted(a_q, a_s, sorted_ids, nvalid, rows, ws=None):
     return a_g, s_g
 
 
-CHUNK = int(os.environ.get("EP_FUSED_MOE_CHUNK", "32768"))
+CHUNK = (
+    int(os.environ.get("EP_FUSED_MOE_CHUNK", "32768"))
+    if henvs.custom_ops_enabled() else 32768
+)
 
 
 def _carve(ws, shape, dtype, device, *, avoid=None):

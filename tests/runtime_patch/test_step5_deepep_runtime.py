@@ -1,6 +1,7 @@
 # SPDX-License-Identifier: Apache-2.0
 """CPU contracts for opt-in routing and asynchronous return lifetimes."""
 import ast
+import importlib.util
 import json
 import os
 from pathlib import Path
@@ -10,13 +11,19 @@ import unittest
 from unittest.mock import patch
 
 
+_env_spec = importlib.util.spec_from_file_location(
+    "step5_deepep_test_envs", Path(__file__).parents[2] / "vllm_hcu/platforms/envs.py")
+HENVS = importlib.util.module_from_spec(_env_spec)
+_env_spec.loader.exec_module(HENVS)
+
+
 def load_functions(*names):
     path = (Path(__file__).parents[2]
             / "vllm_hcu/model_executor/layers/fused_moe/deepep_runtime.py")
     nodes = [n for n in ast.parse(path.read_text(encoding="utf-8")).body
              if isinstance(n, ast.FunctionDef) and n.name in names]
     assert len(nodes) == len(names)
-    scope = dict(os=os, json=json, _step5_ht_runtime_config=None,
+    scope = dict(os=os, json=json, henvs=HENVS, _step5_ht_runtime_config=None,
                  _step5_ht_runtime_applied=None)
     exec(compile(ast.Module(body=nodes, type_ignores=[]), str(path), "exec"), scope)
     return scope

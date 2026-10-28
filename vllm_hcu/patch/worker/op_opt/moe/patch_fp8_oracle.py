@@ -8,6 +8,8 @@ import functools
 import os
 from types import ModuleType
 
+from vllm_hcu.platforms import envs as henvs
+
 from vllm_hcu.deepseek_v4_runtime import model_architectures
 from vllm_hcu.patch.config import HcuFeatureConfig, get_hcu_config
 
@@ -389,7 +391,9 @@ def apply_to_module(module: ModuleType) -> bool:
             fp8_backend,
             routing_tables,
         )
-        if os.environ.get("HCU_STEP5_DEEPEP_PROFILE_DBO_OUTPUT", "0") == "1":
+        if henvs.custom_ops_enabled() and os.environ.get(
+            "HCU_STEP5_DEEPEP_PROFILE_DBO_OUTPUT", "0"
+        ) == "1":
             from vllm_hcu.model_executor.layers.fused_moe.deepep_runtime import (
                 configure_step5_ht_kernel,
             )

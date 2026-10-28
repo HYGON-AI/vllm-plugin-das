@@ -16,6 +16,7 @@ import json
 import os
 
 from vllm.platforms import current_platform
+from vllm_hcu.platforms import envs as henvs
 
 _step5_ht_runtime_config = None
 _step5_ht_runtime_applied = None
@@ -23,7 +24,10 @@ _step5_ht_runtime_applied = None
 
 def _apply_step5_ht_runtime_config(prepare) -> None:
     """Apply a validated communication budget between benchmark workloads."""
-    if not getattr(prepare, "_hcu_step5_runtime_tuning_allowed", False):
+    if not (
+        getattr(prepare, "_hcu_step5_runtime_tuning_allowed", False)
+        and henvs.custom_ops_enabled()
+    ):
         return
     path = os.environ.get("HCU_STEP5_DEEPEP_RUNTIME_CONFIG")
     if not path:
@@ -73,7 +77,10 @@ def _apply_step5_ht_runtime_config(prepare) -> None:
 
 
 def step5_ht_launch_config(prepare, original, *, combine=False):
-    if not getattr(prepare, "_hcu_step5_runtime_tuning_allowed", False):
+    if not (
+        getattr(prepare, "_hcu_step5_runtime_tuning_allowed", False)
+        and henvs.custom_ops_enabled()
+    ):
         return original
     send = getattr(prepare, "_hcu_step5_combine_send" if combine else "_hcu_step5_dispatch_send", 8)
     recv_tokens = getattr(prepare, "_hcu_step5_recv_tokens", 512)
@@ -91,7 +98,9 @@ def step5_ht_launch_config(prepare, original, *, combine=False):
 
 def configure_step5_ht_kernel(kernel, moe_quant_config, moe_config):
     """Reserve Step5-only DBO storage before profiling and KV planning."""
-    if os.environ.get("HCU_STEP5_DEEPEP_PROFILE_DBO_OUTPUT", "0") != "1":
+    if not henvs.optional_custom_op_enabled(
+        os.environ.get("HCU_STEP5_DEEPEP_PROFILE_DBO_OUTPUT", "0") == "1"
+    ):
         return kernel
     from vllm.config import get_current_vllm_config_or_none
     from vllm_hcu.runtime_compat.step5 import is_step5_owner

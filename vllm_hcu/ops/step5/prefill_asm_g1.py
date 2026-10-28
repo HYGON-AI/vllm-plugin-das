@@ -24,6 +24,7 @@ import triton.language as tl
 
 from vllm_hcu.model_executor.layers.fused_moe import ep_fused_moe as ep
 from vllm_hcu.model_executor.layers.fused_moe.ep_fused_moe import _ep_swiglu_chunk
+from vllm_hcu.platforms import envs as henvs
 
 _ATTR = "_hcu_step5_prefill_asm_g1_cache"
 _SKIP = "_hcu_step5_prefill_asm_g1_skip"
@@ -53,7 +54,9 @@ class _PackedWeight:
 
 
 def _enabled() -> bool:
-    return os.environ.get("HCU_STEP5_PREFILL_ASM_G1", "0") == "1"
+    return henvs.optional_custom_op_enabled(
+        os.environ.get("HCU_STEP5_PREFILL_ASM_G1", "0") == "1"
+    )
 
 
 @functools.lru_cache(maxsize=None)

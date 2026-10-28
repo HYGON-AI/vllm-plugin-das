@@ -36,7 +36,10 @@ logger = init_logger("vllm.hcu.shared_experts")
 # CUs.  Smaller batches (decode) keep the configured order.  0 disables.  Not a
 # VLLM_HCU_* name on purpose: it only changes eager stream use inside the MoE
 # custom op, not the traced graph, so it must not change the compile hash.
-_LATE_STREAM_MIN_TOKENS = int(os.environ.get("HCU_SHARED_EXPERTS_STREAM_MIN_TOKENS", "0"))
+_LATE_STREAM_MIN_TOKENS = (
+    int(os.environ.get("HCU_SHARED_EXPERTS_STREAM_MIN_TOKENS", "0"))
+    if henvs.custom_ops_enabled() else 0
+)
 _fused_router_stream_announced = False
 
 
@@ -326,7 +329,8 @@ class SharedExperts(torch.nn.Module):
 
     def _late_stream(self, hidden_states: torch.Tensor) -> bool:
         return (
-            getattr(self, "_hcu_step5_owner", False)
+            henvs.custom_ops_enabled()
+            and getattr(self, "_hcu_step5_owner", False)
             and _LATE_STREAM_MIN_TOKENS > 0
             and self._stream is not None
             and hidden_states.shape[0] >= _LATE_STREAM_MIN_TOKENS

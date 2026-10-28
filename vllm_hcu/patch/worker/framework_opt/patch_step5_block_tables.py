@@ -32,6 +32,7 @@ def apply_to_module(module: ModuleType) -> bool:
     import functools
     import os
     import numpy as np
+    from vllm_hcu.platforms import envs as henvs
 
     cls = getattr(target, "BlockTables", None)
     original = require_callable(cls, "append_block_ids", TARGETS[0])
@@ -45,7 +46,7 @@ def apply_to_module(module: ModuleType) -> bool:
             self._vllm_hcu_block_tables_np = [
                 np.zeros(tuple(b.gpu.shape), dtype=np.int32) for b in self.block_tables
             ]
-            self._vllm_hcu_compact_block_tables = (
+            self._vllm_hcu_compact_block_tables = henvs.optional_custom_op_enabled(
                 os.environ.get("HCU_STEP5_COMPACT_HOST_BLOCK_TABLES", "0") == "1"
             )
             if self._vllm_hcu_compact_block_tables:

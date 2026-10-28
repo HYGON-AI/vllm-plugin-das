@@ -193,7 +193,8 @@ class DeepGemmExperts(mk.FusedMoEExpertsModular):
         super().__init__(moe_config=moe_config, quant_config=quant_config)
         self._hcu_step5_owner = is_step5_owner(moe_config)
         self._hcu_step5_compact_ht = (
-            self._hcu_step5_owner
+            henvs.custom_ops_enabled()
+            and self._hcu_step5_owner
             and os.environ.get("HCU_STEP5_DEEPEP_COMPACT_ROWS", "0") == "1"
         )
         # MXFP8: FP8 e4m3 values + UE8M0 1x32 block scales (Blackwell). Reuses
@@ -567,14 +568,16 @@ class DeepGemmExperts(mk.FusedMoEExpertsModular):
             global_num_experts = local_num_experts
 
         native_channel_fp8 = (
-            _EP_FUSED_MOE
+            henvs.optional_custom_op_enabled(_EP_FUSED_MOE)
             and getattr(self, "_hcu_step5_owner", False)
             and self.block_shape is None
             and self.quant_config.use_fp8_w8a8
             and w1.dim() == 3
         )
         step5_channel_fp8 = (
-            getattr(self, "_hcu_step5_owner", False)
+            henvs.optional_custom_op_enabled(
+                getattr(self, "_hcu_step5_owner", False)
+            )
             and current_platform.is_rocm()
             and activation == MoEActivation.SWIGLUSTEP
             and self.block_shape is None

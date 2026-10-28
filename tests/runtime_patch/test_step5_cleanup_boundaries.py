@@ -123,9 +123,14 @@ def test_threshold_hook_uses_parallel_owner_marker_and_keeps_native_dbo():
     assert fn(SimpleNamespace(_hcu_step5_dbo=True),8192,True) is False
 
 
-def test_foreign_shared_experts_ignore_inherited_late_stream_threshold():
+def test_foreign_shared_experts_ignore_inherited_late_stream_threshold(monkeypatch):
+    monkeypatch.setenv("VLLM_HCU_USE_CUSTOM_OPS", "1")
+    spec = importlib.util.spec_from_file_location(
+        "step5_late_stream_test_envs", ROOT / "vllm_hcu/platforms/envs.py")
+    henvs = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(henvs)
     fn = function("vllm_hcu/model_executor/layers/fused_moe/shared_experts.py", "_late_stream", dict(
-        _LATE_STREAM_MIN_TOKENS=1, dbo_enabled=lambda: False))
+        henvs=henvs, _LATE_STREAM_MIN_TOKENS=1, dbo_enabled=lambda: False))
     hidden=SimpleNamespace(shape=(65536,4096))
     assert fn(SimpleNamespace(_hcu_step5_owner=False,_stream=object()),hidden) is False
     assert fn(SimpleNamespace(_hcu_step5_owner=True,_stream=object()),hidden) is True

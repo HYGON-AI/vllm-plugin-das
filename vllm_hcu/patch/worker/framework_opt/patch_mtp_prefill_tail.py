@@ -25,6 +25,8 @@ from types import ModuleType
 import numpy as np
 import torch
 
+from vllm_hcu.platforms import envs as henvs
+
 from ._common import (
     already_applied,
     load_exact_module,
@@ -38,10 +40,15 @@ TARGETS = (f"{TARGET_MODULE}.MultiModuleMTPSpeculator.propose",)
 _MARKER = "_vllm_hcu_mtp_prefill_tail_applied"
 _WRAPPER = "_vllm_hcu_mtp_prefill_tail_wrapper"
 
-_TAIL = int(os.environ.get("HCU_MTP_PREFILL_TAIL", "0"))
+_TAIL = (
+    int(os.environ.get("HCU_MTP_PREFILL_TAIL", "0"))
+    if henvs.custom_ops_enabled() else 0
+)
 
 
 def _tail_enabled(self) -> bool:
+    if not henvs.custom_ops_enabled():
+        return False
     ok = getattr(self, "_hcu_mtp_tail_ok", None)
     if ok is None:
         from vllm_hcu.runtime_compat.step5 import is_step5_config
