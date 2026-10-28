@@ -164,14 +164,27 @@ def apply_to_module(module: ModuleType) -> bool:
         enabled = bool(
             getattr(vllm_config.cache_config, "swa_bounded_replay", True)
         )
-        # Upstream also requires the last-KV-source SWA cache's bounded_replay
-        # (set by patch_deepseek_v41_swa_bounded_replay / APC wiring).
-        swa_bounded = bool(
-            getattr(self.layers[cut].attn.swa_cache_layer, "bounded_replay", False)
-        )
         use_mrv2 = bool(getattr(vllm_config, "use_v2_model_runner", False))
         has_tail = cut < self.end_layer - 1
-        if not (enabled and swa_bounded and use_mrv2 and has_tail):
+        # PP stages that do not own ``cut`` hold ``PPMissingLayer`` there.
+        # Gate before any ``self.layers[cut]`` attribute access so disabling
+        # bounded replay (or running on a non-owning stage) cannot AttributeError.
+        owns_cut = self.start_layer <= cut < self.end_layer
+        swa_bounded = False
+        if owns_cut:
+            cut_attn = getattr(self.layers[cut], "attn", None)
+            swa_cache = getattr(cut_attn, "swa_cache_layer", None)
+            swa_bounded = bool(getattr(swa_cache, "bounded_replay", False))
+        if not owns_cut:
+            if enabled:
+                logger.warning_once(
+                    "Decoder SWA bounded replay is off on this PP stage: "
+                    "cut=%s start_layer=%s end_layer=%s.",
+                    cut,
+                    self.start_layer,
+                    self.end_layer,
+                )
+        elif not (enabled and swa_bounded and use_mrv2 and has_tail):
             logger.warning(
                 "Decoder SWA bounded replay is off: enabled=%s "
                 "swa_layer.bounded_replay=%s use_v2_model_runner=%s "

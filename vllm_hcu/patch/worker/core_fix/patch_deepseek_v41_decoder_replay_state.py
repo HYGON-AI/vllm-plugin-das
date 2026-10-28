@@ -395,12 +395,22 @@ def _prepare_replay_batch(
         seq_lens_g_cpu = [
             int(pcp.global_seq_lens_cpu_upper_bound_np[i]) for i in first_indices
         ]
+        # prompt_logprobs rows must keep the full extend; others take the SWA
+        # window. keeps_rows is indexed by local batch rows (== first_indices
+        # representatives for each logical request).
+        per_request_tail_lens = [
+            int(extend_lens_cpu[j])
+            if bool(keeps_rows[int(first_indices[j])])
+            else min(int(layers.window), int(extend_lens_cpu[j]))
+            for j in range(len(extend_lens_cpu))
+        ]
         device = slot_mappings.device
         token_indices, tail_lens_cpu, window_floors = late_layer_tail_layout(
             extend_lens_cpu=extend_lens_cpu,
             seq_lens_cpu=seq_lens_g_cpu,
             tail_len=int(layers.window),
             device=device,
+            per_request_tail_lens=per_request_tail_lens,
         )
         global_positions = getattr(
             input_batch, "_vllm_hcu_pcp_global_positions", None
@@ -550,6 +560,12 @@ def _prepare_replay_batch(
                 ],
                 dim=1,
             )
+        # Piecewise graph dispatch may round ``num_padded`` above the real
+        # tail (+ plan.pad_rows). Pad positions/slots to that size so metadata
+        # builders never read past the provided tensors.
+        kept_slots, kept_positions = _pad_kept_slots(
+            kept_slots, kept_positions, num_padded
+        )
         kept_query_start_loc_np = np.zeros(n_logical + 1, dtype=np.int32)
         kept_query_start_loc_np[1:] = np.cumsum(
             np.asarray(tail_lens_cpu, dtype=np.int32), dtype=np.int32
@@ -570,10 +586,14 @@ def _prepare_replay_batch(
         max_query_len = int(max(tail_lens_cpu)) if tail_lens_cpu else num_padded
         if num_padded > max_query_len:
             max_query_len = num_padded
-        # Per-request SWA window floors: seq_len - tail_len.
+        # Only trimmed requests lose KV below the kept tail. Untrimmed decode
+        # (or prompt_logprobs full-extend) rows keep kv_start=0 so prior SWA
+        # window KV stays visible — matching the non-PCP gather path.
         kv_start_np = np.asarray(
             [
                 max(0, int(seq_lens_g_cpu[i]) - int(tail_lens_cpu[i]))
+                if int(extend_lens_cpu[i]) > int(tail_lens_cpu[i])
+                else 0
                 for i in range(n_logical)
             ],
             dtype=np.int32,
@@ -587,6 +607,13 @@ def _prepare_replay_batch(
 
         kept_block_tables = _gather_block_tables_for_reqs(
             block_tables, first_indices, device
+        )
+
+        is_prefilling_logical = np.asarray(
+            [bool(input_batch.is_prefilling_np[int(i)]) for i in first_indices],
+            dtype=np.bool_,
+        ) if hasattr(input_batch, "is_prefilling_np") else np.ones(
+            n_logical, dtype=np.bool_
         )
 
         kept_batch = replace(
@@ -607,7 +634,7 @@ def _prepare_replay_batch(
             ),
             positions=kept_positions[:num_padded],
             fast_prefill=None,
-            is_prefilling_np=np.ones(n_logical, dtype=np.bool_),
+            is_prefilling_np=is_prefilling_logical,
         )
         if hasattr(kept_batch, "pcp"):
             kept_batch.pcp = None

@@ -30,13 +30,29 @@ def late_layer_tail_layout(
     seq_lens_cpu: list[int],
     tail_len: int,
     device: torch.device,
+    per_request_tail_lens: list[int] | None = None,
 ) -> tuple[torch.Tensor, list[int], torch.Tensor]:
     """Global extend indices for each request's last ``min(tail_len, extend)`` tokens.
+
+    ``per_request_tail_lens`` (optional) overrides the uniform window, e.g. keep
+    the full extend for ``prompt_logprobs`` rows. Each entry is still capped by
+    that request's extend length.
 
     Returns ``(token_indices, per_request_tail_lens, per_row_window_floor)``.
     Mirrors SGLang ``late_layer_tail_layout``.
     """
-    tail_lens_cpu = [min(tail_len, n) for n in extend_lens_cpu]
+    if per_request_tail_lens is None:
+        tail_lens_cpu = [min(tail_len, n) for n in extend_lens_cpu]
+    else:
+        if len(per_request_tail_lens) != len(extend_lens_cpu):
+            raise ValueError(
+                "per_request_tail_lens must match extend_lens_cpu length: "
+                f"{len(per_request_tail_lens)} != {len(extend_lens_cpu)}"
+            )
+        tail_lens_cpu = [
+            min(int(t), int(n))
+            for t, n in zip(per_request_tail_lens, extend_lens_cpu, strict=True)
+        ]
     if len(extend_lens_cpu) == 1:
         n, t, s = extend_lens_cpu[0], tail_lens_cpu[0], seq_lens_cpu[0]
         floor = torch.full((t,), s - t, dtype=torch.int32, device=device)

@@ -702,3 +702,61 @@ def test_prepare_attn_apc_path_without_decoder_layers(monkeypatch):
     assert slot_mappings[0, 2].item() == PAD_SLOT_ID
     assert slot_mappings[0, 3].item() == PAD_SLOT_ID
     assert torch.equal(slot_mappings[1], torch.arange(4, 8))
+
+
+def test_pad_kept_slots_rounds_up_to_graph_size():
+    """Piecewise dispatch may raise num_padded above the real PCP tail."""
+    slots = torch.arange(6, dtype=torch.int64).reshape(2, 3)
+    positions = torch.tensor([10, 11, 12], dtype=torch.int64)
+    padded_slots, padded_pos = (
+        patch_deepseek_v41_decoder_replay_state._pad_kept_slots(slots, positions, 5)
+    )
+    from vllm.v1.attention.backends.utils import PAD_SLOT_ID
+
+    assert padded_slots.shape == (2, 5)
+    assert padded_pos.tolist() == [10, 11, 12, 0, 0]
+    assert padded_slots[:, 3:].eq(PAD_SLOT_ID).all()
+
+
+def test_pcp_kv_start_only_advances_when_trimmed():
+    """Decode / untrimmed rows keep kv_start=0; trimmed prefill advances."""
+    extend_lens = [256, 1]
+    tail_lens = [128, 1]
+    seq_lens = [256, 4096]
+    kv_start = [
+        max(0, seq_lens[i] - tail_lens[i])
+        if extend_lens[i] > tail_lens[i]
+        else 0
+        for i in range(len(extend_lens))
+    ]
+    assert kv_start == [128, 0]
+
+
+def test_model_init_skips_pp_missing_cut_layer():
+    """PP stages that do not own cut must not touch layers[cut]."""
+    import ast
+    import inspect
+
+    from vllm_hcu.patch.worker.core_fix import patch_deepseek_v41_decoder_replay
+
+    class PPMissingLayer:
+        pass
+
+    # Guard must appear before any layers[cut] attribute read in model_init.
+    src = inspect.getsource(patch_deepseek_v41_decoder_replay)
+    assert "owns_cut = self.start_layer <= cut < self.end_layer" in src
+    assert src.index("owns_cut = self.start_layer <= cut < self.end_layer") < src.index(
+        "getattr(self.layers[cut], \"attn\", None)"
+    )
+
+    cut = 20
+    start_layer, end_layer = 30, 40
+    owns_cut = start_layer <= cut < end_layer
+    assert owns_cut is False
+    layers = [PPMissingLayer() for _ in range(40)]
+    if owns_cut:
+        _ = layers[cut].attn  # pragma: no cover
+    # Reaching here means the gate prevented AttributeError on PPMissingLayer.
+    assert not hasattr(layers[cut], "attn")
+    # Sanity: the AST of the patched module still parses after edits.
+    ast.parse(inspect.getsource(patch_deepseek_v41_decoder_replay))

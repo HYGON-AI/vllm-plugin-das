@@ -8,6 +8,7 @@ import torch
 from vllm_hcu.patch.worker.core_fix.late_layer_tail_cp import (
     index_copy_masked,
     late_layer_tail_cp_layout,
+    late_layer_tail_layout,
     nonzero_static_flat,
 )
 
@@ -47,3 +48,19 @@ def test_late_layer_tail_cp_layout_matches_legacy_nonzero():
     )
     assert plan.local_tail_rows.tolist() == list(range(17))
     assert plan.max_local == 17
+
+
+def test_late_layer_tail_layout_per_request_keeps_full_extend():
+    """prompt_logprobs rows can keep the full extend while others take window."""
+    device = torch.device("cpu")
+    token_indices, tail_lens, floors = late_layer_tail_layout(
+        extend_lens_cpu=[8, 8],
+        seq_lens_cpu=[100, 200],
+        tail_len=4,
+        device=device,
+        per_request_tail_lens=[8, 4],
+    )
+    assert tail_lens == [8, 4]
+    assert token_indices.tolist() == list(range(0, 8)) + list(range(12, 16))
+    # Floors are seq_len - tail_len per kept row.
+    assert floors.tolist() == [92] * 8 + [196] * 4
