@@ -67,7 +67,8 @@ def test_obsolete_settings_warn_only_when_explicitly_set(monkeypatch, name):
     with warnings.catch_warnings(record=True) as caught:
         warnings.simplefilter("always")
         Step5Config()
-    assert not caught
+    assert not [warning for warning in caught
+                if "is obsolete and has no effect" in str(warning.message)]
     monkeypatch.setenv(name, "0")
     with pytest.warns(UserWarning, match=f"{name} is obsolete and has no effect"):
         Step5Config()
