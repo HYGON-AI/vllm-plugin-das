@@ -35,8 +35,9 @@ def _fp4_domain_blockers(module: ModuleType, vllm_config=None) -> tuple[str, ...
 
     DP ranks own independent request/cache metadata. DSpark(5) uses the
     upstream per-token flattened decode metadata on HIP. PCP8 is limited to
-    the existing eager MRV2/EP compute contract; no DCP/PP/PD or
-    padded-native multi-token ABI is admitted here.
+    the existing eager MRV2/EP compute contract. Mooncake PD relies on the
+    same deployment agreement as FP8; DCP/PP and padded-native multi-token
+    ABI remain outside this domain.
     """
     reasons = []
     if not fp4_indexer_requested():
@@ -88,15 +89,32 @@ def _fp4_domain_blockers(module: ModuleType, vllm_config=None) -> tuple[str, ...
     if getattr(attention, "indexer_sparse_logits", False):
         reasons.append("sparse-logits backend is not supported by this dense FP4 adapter")
     if getattr(vllm_config, "kv_transfer_config", None) is not None:
-        # 真实 PD 仍不支持：FP4 indexer cache 是 68B/记录的独立格式，没有 P→D
-        # 传输契约，P 端写 FP4、D 端读 FP8（或反之）会静默错位。
-        # DecodeBenchConnector 例外：它不跨节点传输，只在本机用 dummy 值填充
-        # KV cache 来模拟“已完成 prefill”，因此不涉及该契约。它仅用于 decode
-        # 性能测试，不能用于正确性验证（dummy KV 的 logits/top-k 无语义）。
-        kv_connector = getattr(
-            getattr(vllm_config, "kv_transfer_config", None), "kv_connector", None
-        )
-        if kv_connector != "DecodeBenchConnector":
+        transfer = vllm_config.kv_transfer_config
+        kv_connector = getattr(transfer, "kv_connector", None)
+        if kv_connector == "MooncakeConnector":
+            # Deployment contract, identical to FP8: both peers must use the
+            # same revision, cache formats and per-layer compression settings.
+            # There is deliberately no format negotiation. Misconfigured peers
+            # may silently produce wrong results; a crash is not guaranteed.
+            role = getattr(transfer, "kv_role", None)
+            dp_size = int(getattr(parallel, "data_parallel_size", 1))
+            backend = getattr(parallel, "all2all_backend", None)
+            producer = (role == "kv_producer" and pcp_size == 8
+                        and dp_size == 1 and backend == "deepep_high_throughput")
+            consumer = (role == "kv_consumer" and pcp_size == 1
+                        and dp_size == 8 and backend == "deepep_low_latency")
+            if not (
+                (producer or consumer)
+                and _is_v41(vllm_config)
+                and getattr(config, "use_mla", False)
+                and getattr(config, "enforce_eager", False)
+                and getattr(vllm_config, "use_v2_model_runner", False)
+                and getattr(parallel, "enable_expert_parallel", False)
+                and method == "dspark"
+                and getattr(transfer, "kv_connector_module_path", None) is None
+            ):
+                reasons.append("FP4 Mooncake requires the fixed PCP8 producer or DP8 consumer")
+        elif kv_connector != "DecodeBenchConnector":
             reasons.append("PD KV transfer has no FP4 indexer cache contract")
     return tuple(reasons)
 

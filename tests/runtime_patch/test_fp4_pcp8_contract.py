@@ -119,11 +119,27 @@ def test_existing_pcp1_dp1_dp8_remain_admitted(dp):
     assert patch._fp4_domain_blockers(SimpleNamespace(), config) == ()
 
 
-def test_pcp8_does_not_admit_mooncake_before_format_contract():
+@pytest.mark.parametrize("role", ["kv_producer", "kv_consumer"])
+def test_admits_fixed_mooncake_deployment(role):
     config = _config()
     config.kv_transfer_config = SimpleNamespace(
-        kv_connector="MooncakeConnector", kv_role="kv_producer"
+        kv_connector="MooncakeConnector", kv_role=role
     )
-    assert patch._fp4_domain_blockers(SimpleNamespace(), config) == (
-        "PD KV transfer has no FP4 indexer cache contract",
+    if role == "kv_consumer":
+        config.parallel_config.prefill_context_parallel_size = 1
+        config.parallel_config.data_parallel_size = 8
+        config.parallel_config.all2all_backend = "deepep_low_latency"
+    assert patch._fp4_domain_blockers(SimpleNamespace(), config) == ()
+
+
+@pytest.mark.parametrize("connector,role", [
+    ("MooncakeConnector", "kv_consumer"),
+    ("MooncakeConnector", "kv_both"),
+    ("OtherConnector", "kv_producer"),
+])
+def test_pd_gate_remains_limited_to_fixed_deployment(connector, role):
+    config = _config()
+    config.kv_transfer_config = SimpleNamespace(
+        kv_connector=connector, kv_role=role
     )
+    assert patch._fp4_domain_blockers(SimpleNamespace(), config)
