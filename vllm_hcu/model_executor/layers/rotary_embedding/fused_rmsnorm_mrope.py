@@ -204,3 +204,170 @@ def fused_rmsnorm_mrope(
         num_warps     = num_warps,
     )
     return q, k
+
+
+@triton.jit
+def _fused_qkv_split_rmsnorm_mrope_fwd(
+    qkv_ptr,           # [num_tokens, ld]: per q head [q | gate] (gated) or [q],
+                       # then k heads, then v heads
+    q_out_ptr,         # [num_tokens, num_qh * head_dim]
+    k_out_ptr,         # [num_tokens, num_kvh * head_dim]
+    v_out_ptr,         # [num_tokens, num_kvh * head_dim]
+    q_weight_ptr,
+    k_weight_ptr,
+    cos_sin_cache_ptr,
+    pos_ptr,
+    pos_stride_dim,
+    pos_stride_tok,
+    qkv_stride_tok,
+    cache_stride,
+    eps,
+    num_qh: tl.constexpr,
+    num_kvh: tl.constexpr,
+    q_head_stride: tl.constexpr,   # 2 * head_dim when gated, else head_dim
+    head_dim: tl.constexpr,
+    rotary_dim: tl.constexpr,
+    half_rd: tl.constexpr,
+    BLOCK: tl.constexpr,
+):
+    """Grid: (num_tokens, num_qh + 2 * num_kvh).
+
+    Reads q/k/v straight out of the packed projection (no contiguous copies)
+    and writes contiguous q/k (RMSNorm + interleaved MRoPE) and v.
+    """
+    pid_tok = tl.program_id(0).to(tl.int64)
+    pid_head = tl.program_id(1)
+    offs = tl.arange(0, BLOCK)
+    mask = offs < head_dim
+    row = qkv_ptr + pid_tok * qkv_stride_tok
+    k_base_col = num_qh * q_head_stride
+    v_base_col = k_base_col + num_kvh * head_dim
+
+    if pid_head >= num_qh + num_kvh:
+        vh = pid_head - num_qh - num_kvh
+        xv = tl.load(row + v_base_col + vh * head_dim + offs, mask=mask)
+        tl.store(v_out_ptr + pid_tok * (num_kvh * head_dim) + vh * head_dim
+                 + offs, xv, mask=mask)
+    else:
+        if pid_head >= num_qh:
+            local_head = pid_head - num_qh
+            src = row + k_base_col + local_head * head_dim
+            dst = (k_out_ptr + pid_tok * (num_kvh * head_dim)
+                   + local_head * head_dim)
+            weight_ptr = k_weight_ptr
+        else:
+            src = row + pid_head * q_head_stride
+            dst = q_out_ptr + pid_tok * (num_qh * head_dim) + pid_head * head_dim
+            weight_ptr = q_weight_ptr
+
+        x = tl.load(src + offs, mask=mask, other=0.0).to(tl.float32)
+        var = tl.sum(x * x, axis=0) * (1.0 / head_dim)
+        rstd = tl.rsqrt(var + eps)
+        w = tl.load(weight_ptr + offs, mask=mask, other=0.0).to(tl.float32)
+        xn = x * rstd * (1.0 + w)
+
+        pos_tok = pos_ptr + pid_tok * pos_stride_tok
+        pos_t = tl.load(pos_tok).to(tl.int64)
+        pos_h = tl.load(pos_tok + pos_stride_dim).to(tl.int64)
+        pos_w = tl.load(pos_tok + 2 * pos_stride_dim).to(tl.int64)
+        rd_offs = tl.arange(0, half_rd)
+        cos_t = tl.load(cos_sin_cache_ptr + pos_t * cache_stride + rd_offs).to(tl.float32)
+        sin_t = tl.load(cos_sin_cache_ptr + pos_t * cache_stride + half_rd + rd_offs).to(tl.float32)
+        cos_h = tl.load(cos_sin_cache_ptr + pos_h * cache_stride + rd_offs).to(tl.float32)
+        sin_h = tl.load(cos_sin_cache_ptr + pos_h * cache_stride + half_rd + rd_offs).to(tl.float32)
+        cos_w = tl.load(cos_sin_cache_ptr + pos_w * cache_stride + rd_offs).to(tl.float32)
+        sin_w = tl.load(cos_sin_cache_ptr + pos_w * cache_stride + half_rd + rd_offs).to(tl.float32)
+        mod3 = rd_offs % 3
+        t_sel = (mod3 == 0).to(tl.float32)
+        h_sel = (mod3 == 1).to(tl.float32)
+        w_sel = (mod3 == 2).to(tl.float32)
+        cos_row = t_sel * cos_t + h_sel * cos_h + w_sel * cos_w
+        sin_row = t_sel * sin_t + h_sel * sin_h + w_sel * sin_w
+
+        x1 = tl.load(src + rd_offs).to(tl.float32) * rstd * (
+            1.0 + tl.load(weight_ptr + rd_offs).to(tl.float32))
+        x2 = tl.load(src + half_rd + rd_offs).to(tl.float32) * rstd * (
+            1.0 + tl.load(weight_ptr + half_rd + rd_offs).to(tl.float32))
+        out_dtype = q_out_ptr.dtype.element_ty
+        tl.store(dst + offs, xn.to(out_dtype), mask=mask & (offs >= rotary_dim))
+        tl.store(dst + rd_offs, (x1 * cos_row - x2 * sin_row).to(out_dtype))
+        tl.store(dst + half_rd + rd_offs,
+                 (x2 * cos_row + x1 * sin_row).to(out_dtype))
+
+
+def fused_qkv_split_rmsnorm_mrope(
+    qkv: torch.Tensor,
+    num_qh: int,
+    num_kvh: int,
+    gated: bool,
+    q_weight: torch.Tensor,
+    k_weight: torch.Tensor,
+    cos_sin_cache: torch.Tensor,
+    positions: torch.Tensor,
+    head_dim: int,
+    rotary_dim: int,
+    eps: float,
+    num_warps: int = 4,
+) -> tuple:
+    """Out-of-place split + RMSNorm + interleaved MRoPE from packed qkv.
+
+    Returns contiguous (q, k, v) of shapes [T, num_qh*hd], [T, num_kvh*hd]
+    and [T, num_kvh*hd]; the attention gate (if any) stays inside ``qkv``.
+    """
+    assert positions.ndim == 2 and positions.shape[0] == 3
+    assert qkv.stride(-1) == 1
+    num_tokens = qkv.shape[0]
+    q = qkv.new_empty(num_tokens, num_qh * head_dim)
+    k = qkv.new_empty(num_tokens, num_kvh * head_dim)
+    v = qkv.new_empty(num_tokens, num_kvh * head_dim)
+    if num_tokens == 0:
+        return q, k, v
+    _fused_qkv_split_rmsnorm_mrope_fwd[(num_tokens, num_qh + 2 * num_kvh)](
+        qkv, q, k, v,
+        q_weight, k_weight,
+        cos_sin_cache,
+        positions,
+        pos_stride_dim=positions.stride(0),
+        pos_stride_tok=positions.stride(1),
+        qkv_stride_tok=qkv.stride(0),
+        cache_stride=cos_sin_cache.shape[1],
+        eps=eps,
+        num_qh=num_qh,
+        num_kvh=num_kvh,
+        q_head_stride=(2 if gated else 1) * head_dim,
+        head_dim=head_dim,
+        rotary_dim=rotary_dim,
+        half_rd=rotary_dim // 2,
+        BLOCK=triton.next_power_of_2(head_dim),
+        num_warps=num_warps,
+    )
+    return q, k, v
+
+
+@triton.jit
+def _strided_sigmoid_gate_mul_kernel(x_ptr, qkv_ptr, qkv_stride_tok, out_ptr,
+                                     num_qh: tl.constexpr,
+                                     head_dim: tl.constexpr):
+    """out[t, h*hd + i] = x[t, h*hd + i] * sigmoid(qkv[t, h*2*hd + hd + i])."""
+    t = tl.program_id(0).to(tl.int64)
+    h = tl.program_id(1)
+    offs = tl.arange(0, head_dim)
+    x = tl.load(x_ptr + t * (num_qh * head_dim) + h * head_dim + offs).to(tl.float32)
+    g = tl.load(qkv_ptr + t * qkv_stride_tok + h * 2 * head_dim + head_dim
+                + offs).to(tl.float32)
+    tl.store(out_ptr + t * (num_qh * head_dim) + h * head_dim + offs,
+             (x / (1.0 + tl.exp(-g))).to(out_ptr.dtype.element_ty))
+
+
+def strided_sigmoid_gate_mul(attn_out: torch.Tensor, qkv: torch.Tensor,
+                             num_qh: int, head_dim: int) -> torch.Tensor:
+    """attn_out * sigmoid(gate) with the gate read in place from packed qkv."""
+    num_tokens = attn_out.shape[0]
+    x = attn_out.reshape(num_tokens, num_qh * head_dim)
+    assert x.is_contiguous() and qkv.stride(-1) == 1
+    out = torch.empty_like(x)
+    if num_tokens:
+        _strided_sigmoid_gate_mul_kernel[(num_tokens, num_qh)](
+            x, qkv, qkv.stride(0), out, num_qh=num_qh, head_dim=head_dim,
+            num_warps=4)
+    return out.view(attn_out.shape)

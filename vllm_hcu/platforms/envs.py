@@ -37,6 +37,10 @@ if TYPE_CHECKING:
     # +11% it buys; set 0 to fall back if the serving loop lacks a
     # restart-on-stall watchdog.
     VLLM_HCU_USE_CUSTOM_STRIDED_Z: bool = True
+    VLLM_HCU_USE_FUSED_QWEN35_MOE_BLOCK: bool = True
+    VLLM_HCU_FUSED_QWEN35_MOE_NORM: bool = True
+    VLLM_HCU_W8A16_CACHE_DEQUANT: bool = False
+    VLLM_HCU_INT8_LM_HEAD: bool = False
     VLLM_HCU_USE_CUSTOM_RMS_NORM : bool = False
     VLLM_HCU_USE_CUSTOM_AITER_FLA : bool = False
     VLLM_HCU_GDN_DECODE_BACKEND: str = "hcu-aiter"
@@ -360,6 +364,34 @@ hcu_vllm_environment_variables: dict[str, Callable[[], Any]] = {
 
     "VLLM_HCU_USE_CUSTOM_STRIDED_Z":
         lambda: (os.environ.get("VLLM_HCU_USE_CUSTOM_STRIDED_Z", "True").lower() in
+                 ("true", "1")),
+
+    # Qwen3.5/Qwen3-Next W8A16 MoE block: one GEMM for router + shared-expert
+    # gate + shared gate_up, a strided top-k kernel, and one fused tail
+    # (routed sum + sigmoid-gated shared expert).
+    "VLLM_HCU_USE_FUSED_QWEN35_MOE_BLOCK":
+        lambda: (os.environ.get("VLLM_HCU_USE_FUSED_QWEN35_MOE_BLOCK", "True").lower() in
+                 ("true", "1")),
+
+    # With the fused MoE block: fold each MoE tail into the next layer's
+    # Gemma fused-add RMSNorm (one kernel less per layer).
+    "VLLM_HCU_FUSED_QWEN35_MOE_NORM":
+        lambda: (os.environ.get("VLLM_HCU_FUSED_QWEN35_MOE_NORM", "True").lower() in
+                 ("true", "1")),
+
+    # Keep a dequantized W16 copy of every W8A16 dense weight for the
+    # large-M (prefill) GEMM path instead of re-dequantizing per call.
+    # ~2x faster prefill dense GEMMs; costs 2 bytes/param of extra memory.
+    # Requires VLLM_HCU_USE_CUSTOM_OPS.
+    "VLLM_HCU_W8A16_CACHE_DEQUANT":
+        lambda: (os.environ.get("VLLM_HCU_W8A16_CACHE_DEQUANT", "False").lower() in
+                 ("true", "1")),
+
+    # Per-channel int8 copy of a 16-bit lm_head for decode-sized batches
+    # (<= 32 rows), read by the DeepGEMM W8A16 GEMV.  Halves the lm_head
+    # read; changes logits numerics, so off by default.
+    "VLLM_HCU_INT8_LM_HEAD":
+        lambda: (os.environ.get("VLLM_HCU_INT8_LM_HEAD", "False").lower() in
                  ("true", "1")),
 
     "VLLM_HCU_DEEPGEMM_W8A16_PRESHUFFLE":

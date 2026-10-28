@@ -20,8 +20,17 @@ PORTED_ADAPTERS = (
     "patch_qwen_gdn_ops",
     # Fused shared-expert sigmoid-mul gate.
     "patch_qwen2_moe",
-    # Stride-safe fused RMSNorm + MRoPE (vllm-hcu 4e01bc8).
+    # Stride-safe fused RMSNorm + MRoPE (vllm-hcu 4e01bc8), plus the fused
+    # q/k/v split and in-place output gate of the attention forward.
     "patch_qwen35_mrope",
+    # Fused Qwen3.5 MoE block (one router/shared GEMM, strided top-k, tail
+    # folded into the next Gemma fused-add RMSNorm).
+    "patch_qwen35_moe_block",
+    # GDN core-attention buffer without the per-layer zero fill, and the
+    # extended chunked-prefill kernel warmup.
+    "patch_qwen_gdn_forward",
+    # Opt-in per-channel int8 lm_head for decode-sized batches.
+    "patch_int8_lm_head",
 )
 
 

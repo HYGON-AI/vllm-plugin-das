@@ -129,6 +129,53 @@ def _w8a16_dequant(
     return deepgemm.op.w8a16_dequant_weight(w, scale)
 
 
+# HCU-measured DeepGEMM configs for marlin-layout weights where the bundled
+# table (tuned for the raw layout) is slow: (N, K) -> [(max_m, config)].
+# K=4096 GEMV (GDN out_proj / attention o_proj): 21.0 -> 16.2 us at M=1,
+# 24.7 -> 18.2 us at M=8.
+_SPLITK_K4096 = dict(NUM_K_WARPS=4, N_PER_WARP=32, K_PER_WARP=128,
+                     NUM_N_WARPS=2, BLOCK_M=16, KERNEL_TYPE=0)
+_MARLIN_CONFIG_OVERRIDES = {
+    (2048, 4096): ((1, {**_SPLITK_K4096, "SPLITK": 8}),
+                   (8, {**_SPLITK_K4096, "SPLITK": 4})),
+}
+
+
+def _config_override(m: int, n: int, k: int, weight_layout: int):
+    if weight_layout != W8A16_LAYOUT_MARLIN:
+        return None
+    for max_m, cfg in _MARLIN_CONFIG_OVERRIDES.get((n, k), ()):
+        if m <= max_m:
+            return cfg
+    return None
+
+
+# data_ptr -> (int8 weight, dequantized weight).  Holding the int8 tensor
+# keeps its storage (and therefore the key) alive.
+_DEQUANT_CACHE: dict[int, tuple[torch.Tensor, torch.Tensor]] = {}
+
+
+def _cached_dequant(w, scale, dtype, weight_layout):
+    """Large-M path: reuse a dequantized copy instead of re-dequantizing every
+    call (~2x faster prefill GEMMs) at the cost of a W16 copy per weight.
+
+    Opt-in via VLLM_HCU_W8A16_CACHE_DEQUANT.  The copy is only created
+    outside CUDA-graph capture (the eager profile run reaches this path with
+    max_num_batched_tokens, so every layer is cached before capture and the
+    memory is accounted for before the KV cache is sized).
+    """
+    if not henvs.optional_custom_op_enabled(henvs.VLLM_HCU_W8A16_CACHE_DEQUANT):
+        return None
+    hit = _DEQUANT_CACHE.get(w.data_ptr())
+    if hit is not None and hit[0].shape == w.shape and hit[1].dtype == dtype:
+        return hit[1]
+    if torch.cuda.is_current_stream_capturing():
+        return None
+    w16 = _w8a16_dequant(w, scale, dtype, weight_layout)
+    _DEQUANT_CACHE[w.data_ptr()] = (w, w16)
+    return w16
+
+
 def _w8a16_gemm_deepgemm(
     x: torch.Tensor,
     w: torch.Tensor,
@@ -154,10 +201,13 @@ def _w8a16_gemm_deepgemm(
     config = deepgemm.get_w8a16_linear_config(m, n, k)
     kernel_type = int(config.get("KERNEL_TYPE", 0))
     if kernel_type == 2 and weight_layout == W8A16_LAYOUT_MARLIN:
-        w16 = _w8a16_dequant(w, scale, x.dtype, weight_layout)
+        w16 = _cached_dequant(w, scale, x.dtype, weight_layout)
+        if w16 is None:
+            w16 = _w8a16_dequant(w, scale, x.dtype, weight_layout)
         return torch.nn.functional.linear(x, w16, bias)
 
-    config = {**config, "WEIGHT_LAYOUT": weight_layout}
+    override = _config_override(m, n, k, weight_layout)
+    config = {**(override or config), "WEIGHT_LAYOUT": weight_layout}
     out = deepgemm.w8a16_linear(x, w, scale, config=config)
     if bias is not None:
         out = out + bias
