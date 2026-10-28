@@ -10,6 +10,7 @@ import torch
 from torch import nn
 
 import vllm_hcu.models.hy_v4.moe as moe
+from vllm_hcu.patch.config import HcuFeatureConfig
 
 
 class _FakeGate(nn.Module):
@@ -65,10 +66,17 @@ def _vllm_config(
     enable_expert_parallel: bool = True,
 ) -> SimpleNamespace:
     return SimpleNamespace(
+        additional_config={"hcu": HcuFeatureConfig().to_dict()},
         kernel_config=SimpleNamespace(moe_backend=backend),
         parallel_config=SimpleNamespace(
             enable_expert_parallel=enable_expert_parallel,
-            eplb_config=SimpleNamespace(num_redundant_experts=0),
+            enable_eplb=False,
+            enable_elastic_ep=False,
+            pipeline_parallel_size=1,
+            eplb_config=SimpleNamespace(
+                num_redundant_experts=0,
+                use_async=False,
+            ),
         ),
     )
 
@@ -144,12 +152,12 @@ def test_hy_v4_moe_preserves_router_and_clamp_contract(monkeypatch) -> None:
     torch.testing.assert_close(weights.gather(1, order),
                                torch.tensor([[0.2827, 0.5654, 0.8481, 1.1308]]))
 
-    with pytest.raises(NotImplementedError, match="not supported"):
+    with pytest.raises(ValueError, match="enable_eplb"):
         moe.HYV4MoEFused(config=_hf_config(), vllm_config=_vllm_config("triton"),
                         enable_eplb=True, prefix="model.layers.1.mlp")
     redundant = _vllm_config("triton")
     redundant.parallel_config.eplb_config.num_redundant_experts = 8
-    with pytest.raises(NotImplementedError, match="not supported"):
+    with pytest.raises(ValueError, match="enable_eplb"):
         moe.HYV4MoEFused(config=_hf_config(), vllm_config=redundant,
                         prefix="model.layers.1.mlp")
 

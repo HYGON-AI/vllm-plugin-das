@@ -1346,3 +1346,118 @@ def test_mhc_pre_changed_signature_is_rejected_before_any_patch(monkeypatch):
         patch_mhc_pre_backend.apply_to_module(module)
     assert MHCPreOp.forward_hip is original
     assert not hasattr(module, "_vllm_hcu_mhc_pre_backend_applied")
+
+
+@pytest.mark.parametrize("path_field", ["expert_map_path", "expert_map_record_path"])
+def test_dspark_draft_does_not_inherit_target_eplb_map(monkeypatch, path_field):
+    from dataclasses import replace
+    from copy import deepcopy
+    from vllm_hcu.patch.config import bind_hcu_eplb_config, get_hcu_config
+    from vllm_hcu.model_executor.layers.fused_moe.static_eplb import bind_static_eplb_plan
+
+    @dataclass
+    class EplbConfig:
+        num_redundant_experts: int = 8
+
+    @dataclass
+    class ParallelConfig:
+        enable_eplb: bool = True
+        enable_expert_parallel: bool = True
+        enable_elastic_ep: bool = False
+        tensor_parallel_size: int = 1
+        all2all_backend: str = "deepep_high_throughput"
+        eplb_config: EplbConfig = field(default_factory=EplbConfig)
+
+    @dataclass
+    class KernelConfig:
+        moe_backend: str = "deep_gemm"
+
+    @dataclass
+    class Config:
+        additional_config: dict
+        speculative_config: object = field(default_factory=lambda: SimpleNamespace(
+            method="dspark", moe_backend="deep_gemm"))
+        parallel_config: ParallelConfig = field(default_factory=ParallelConfig)
+        kernel_config: KernelConfig = field(default_factory=KernelConfig)
+
+    def original_parallel(parallel_config, tensor_parallel_size):
+        return replace(parallel_config, enable_eplb=False,
+                       tensor_parallel_size=tensor_parallel_size,
+                       eplb_config=replace(parallel_config.eplb_config,
+                                           num_redundant_experts=0))
+
+    target_config = Config(additional_config={"hcu": {
+        path_field: "/target-only.json", "eplb_disable_rearrange": True,
+        "eplb_static_dispatch_policy": "locality_fair", "moe_backend": "deep_gemm",
+    }, "other_feature": {"value": 7}})
+    before = deepcopy(target_config.additional_config)
+    seen = []
+
+    def original_load(target_model, vllm_config):
+        # Exercise the same copy order as the audited upstream DSpark loader.
+        draft = replace(vllm_config, parallel_config=module._get_dspark_parallel_config(
+            vllm_config.parallel_config, 1))
+        bind_hcu_eplb_config(draft)
+        hcu = get_hcu_config(draft)
+        assert hcu.expert_map_path is None
+        assert hcu.expert_map_record_path is None
+        assert hcu.eplb_disable_rearrange is False
+        assert draft.parallel_config.enable_eplb is False
+        assert draft.parallel_config.eplb_config.num_redundant_experts == 0
+        assert draft.parallel_config.enable_expert_parallel is True
+        assert draft.parallel_config.all2all_backend == "allgather_reducescatter"
+        draft_model = torch.nn.Module()
+        assert bind_static_eplb_plan(draft, draft_model) is None
+        assert not hasattr(draft_model, "_vllm_hcu_static_eplb_plan")
+        seen.append(draft)
+        return draft_model
+
+    monkeypatch.setattr(patch_dspark_draft_a2a, "_install_draft_run_model_scope", lambda: None)
+    module = _module(patch_dspark_draft_a2a.TARGET_MODULE,
+                     _get_dspark_parallel_config=original_parallel,
+                     load_dspark_model=original_load)
+    patch_dspark_draft_a2a.apply_to_module(module)
+    module.load_dspark_model(torch.nn.Module(), target_config)
+    assert len(seen) == 1
+    assert target_config.additional_config == before
+    assert target_config.parallel_config.enable_eplb is True
+    assert target_config.parallel_config.eplb_config.num_redundant_experts == 8
+    assert target_config.parallel_config.all2all_backend == "deepep_high_throughput"
+
+
+@pytest.mark.parametrize("target_budget", [128, 32768])
+def test_dspark_pcp1_init_uses_private_eplb_disabled_config(target_budget):
+    from vllm.config import ParallelConfig, replace
+    from vllm.config.parallel import EPLBConfig
+
+    target_parallel = ParallelConfig(
+        tensor_parallel_size=1, prefill_context_parallel_size=8,
+        data_parallel_size=1, enable_expert_parallel=True, enable_eplb=True,
+        eplb_config=EPLBConfig(num_redundant_experts=8),
+    )
+    config = SimpleNamespace(
+        parallel_config=target_parallel,
+        scheduler_config=SimpleNamespace(
+            max_num_seqs=32, max_num_batched_tokens=target_budget),
+        speculative_config=SimpleNamespace(
+            num_speculative_tokens=5,
+            draft_model_config=SimpleNamespace(hf_config=SimpleNamespace()),
+        ),
+    )
+    # Reproduce DFlashSpeculator's actual Pydantic failure before isolation.
+    with pytest.raises(ValueError, match="EPLB requires"):
+        replace(target_parallel, prefill_context_parallel_size=1)
+
+    draft = patch_dspark_query_capacity._draft_capacity_config(config)
+    local = replace(draft.parallel_config, prefill_context_parallel_size=1)
+
+    assert local.enable_eplb is False
+    assert local.enable_expert_parallel is True
+    assert local.eplb_config.num_redundant_experts == 0
+    assert draft is not config
+    assert draft.parallel_config is not target_parallel
+    assert draft.scheduler_config.max_num_batched_tokens == max(target_budget, 160)
+    assert target_parallel.prefill_context_parallel_size == 8
+    assert target_parallel.enable_eplb is True
+    assert target_parallel.eplb_config.num_redundant_experts == 8
+    assert config.scheduler_config.max_num_batched_tokens == target_budget

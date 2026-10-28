@@ -24,6 +24,10 @@ _FEATURE_FIELDS = (
     "fused_qwen3_rms_rope",
     "moe_backend",
     "hcu_flash_attn_mode",
+    "expert_map_path",
+    "expert_map_record_path",
+    "eplb_disable_rearrange",
+    "eplb_static_dispatch_policy",
 )
 _BOOLEAN_FIELDS = _FEATURE_FIELDS[:6]
 _SUPPORTED_MOE_BACKENDS = frozenset({"auto", "deep_gemm"})
@@ -33,6 +37,15 @@ _legacy_backend_warning_emitted = False
 _legacy_backend_warning_lock = threading.Lock()
 _SUPPORTED_FLASH_ATTN_MODES = frozenset(
     {"classic", "cutlass", "varlen"}
+)
+_SUPPORTED_EPLB_STATIC_DISPATCH_POLICIES = frozenset(
+    {"nearest", "locality_fair"}
+)
+_EPLB_SIDECAR_FIELDS = (
+    "expert_map_path",
+    "expert_map_record_path",
+    "eplb_disable_rearrange",
+    "eplb_static_dispatch_policy",
 )
 
 
@@ -74,6 +87,10 @@ class HcuFeatureConfig:
     fused_qwen3_rms_rope: bool = True
     moe_backend: str = "auto"
     hcu_flash_attn_mode: str | None = None
+    expert_map_path: str | None = None
+    expert_map_record_path: str | None = None
+    eplb_disable_rearrange: bool = False
+    eplb_static_dispatch_policy: str = "nearest"
 
     def __post_init__(self) -> None:
         for name in _BOOLEAN_FIELDS:
@@ -110,6 +127,41 @@ class HcuFeatureConfig:
                 )
         if self.enable_lightly_cplb and not self.enable_lightly_cp:
             raise ValueError("enable_lightly_cplb requires enable_lightly_cp")
+        for name in ("expert_map_path", "expert_map_record_path"):
+            value = getattr(self, name)
+            if value is not None and not isinstance(value, str):
+                raise TypeError(
+                    f"HCU config field {name!r} must be str or None, "
+                    f"got {type(value).__name__}"
+                )
+            if isinstance(value, str) and not value.strip():
+                raise ValueError(f"HCU config field {name!r} must not be empty")
+        if (
+            self.expert_map_path is not None
+            and self.expert_map_record_path is not None
+        ):
+            raise ValueError(
+                "expert_map_path and expert_map_record_path are mutually exclusive"
+            )
+        if not isinstance(self.eplb_disable_rearrange, bool):
+            raise TypeError(
+                "HCU config field 'eplb_disable_rearrange' must be bool, "
+                f"got {type(self.eplb_disable_rearrange).__name__}"
+            )
+        if not isinstance(self.eplb_static_dispatch_policy, str):
+            raise TypeError(
+                "HCU config field 'eplb_static_dispatch_policy' must be str, "
+                f"got {type(self.eplb_static_dispatch_policy).__name__}"
+            )
+        if (
+            self.eplb_static_dispatch_policy
+            not in _SUPPORTED_EPLB_STATIC_DISPATCH_POLICIES
+        ):
+            supported = ", ".join(sorted(_SUPPORTED_EPLB_STATIC_DISPATCH_POLICIES))
+            raise ValueError(
+                "unsupported HCU eplb_static_dispatch_policy "
+                f"{self.eplb_static_dispatch_policy!r}; expected one of {supported}"
+            )
 
     @classmethod
     def from_mapping(cls, values: Mapping[str, Any] | None) -> "HcuFeatureConfig":
@@ -266,6 +318,31 @@ def set_hcu_config(
     return normalized
 
 
+def bind_hcu_eplb_config(vllm_config: object) -> None:
+    """Restore offline-EPLB sidecar fields on ``parallel_config``.
+
+    ``ParallelConfig`` cannot own plugin-specific schema fields, so consumers
+    read private runtime attributes populated from the serialized HCU sidecar.
+    Mapping forms are supported for config reconstruction in spawned workers.
+    """
+
+    if isinstance(vllm_config, Mapping):
+        parallel_config = vllm_config.get("parallel_config")
+    else:
+        parallel_config = getattr(vllm_config, "parallel_config", None)
+    if parallel_config is None:
+        return
+
+    feature_config = get_hcu_config(vllm_config)
+    for name in _EPLB_SIDECAR_FIELDS:
+        attribute = f"_vllm_hcu_{name}"
+        value = getattr(feature_config, name)
+        if isinstance(parallel_config, MutableMapping):
+            parallel_config[attribute] = value
+        else:
+            setattr(parallel_config, attribute, value)
+
+
 def pop_hcu_feature_kwargs(
     kwargs: MutableMapping[str, Any],
     *,
@@ -273,7 +350,7 @@ def pop_hcu_feature_kwargs(
 ) -> HcuFeatureConfig:
     """Extract legacy HCU keyword arguments before constructing VllmConfig.
 
-    Only the five owned fields are removed.  This helper is intentionally
+    Only HCU-owned fields are removed.  This helper is intentionally
     independent of vLLM's constructor and can be used by CLI and Python-entry
     wrappers without adding fields to upstream classes.
     """
@@ -292,6 +369,7 @@ def pop_hcu_feature_kwargs(
 
 __all__ = [
     "HcuFeatureConfig",
+    "bind_hcu_eplb_config",
     "get_hcu_config",
     "normalize_hcu_moe_backend",
     "pop_hcu_feature_kwargs",

@@ -55,6 +55,9 @@ FeatureKey = Literal[
     "forward_context",
     "lightly_cp",
     "multi_layers_mtp",
+    "eplb",
+    "offline_eplb",
+    "eplb_control",
     "proposer",
     "pynccl_all_to_all",
 ]
@@ -67,6 +70,7 @@ class _CallbackSpec:
     patch_id: str | None = None
     targets_from: int = 0
     optional_capability: bool = False
+    defer_until_enabled: bool = False
 
 
 @dataclass(frozen=True, slots=True)
@@ -224,6 +228,11 @@ _CORE_CALLBACKS: tuple[_CallbackSpec, ...] = (
     _CallbackSpec(_adapter("core_fix", "patch_deepseek_v41_indexer_k_layout")),
     _CallbackSpec(_adapter("core_fix", "patch_fp4_packer_lowering")),
     _CallbackSpec(_adapter("core_fix", "patch_deepseek_v41_dspark_load_weights")),
+    _CallbackSpec(
+        _adapter("core_fix", "patch_deepseek_v41_eplb"),
+        feature="eplb",
+        defer_until_enabled=True,
+    ),
     _CallbackSpec(_adapter("core_fix", "patch_deepseek_v41_engram_offload")),
     _CallbackSpec(_adapter("core_fix", "patch_deepseek_v41_engram_hash")),
     _CallbackSpec(_adapter("core_fix", "patch_deepseek_v41_model_state")),
@@ -322,6 +331,11 @@ _MOE_RUNTIME_CALLBACKS: tuple[_CallbackSpec, ...] = (
     _CallbackSpec(_adapter("op_opt.moe", "patch_rocm_aiter_moe")),
     _CallbackSpec(_adapter("op_opt.moe", "patch_triton_moe")),
     _CallbackSpec(_adapter("op_opt.moe", "patch_base_router")),
+    _CallbackSpec(
+        _adapter("op_opt.moe", "patch_static_eplb_router"),
+        feature="offline_eplb",
+        defer_until_enabled=True,
+    ),
     _CallbackSpec(_adapter("op_opt.moe", "patch_fused_topk_bias_router")),
     _CallbackSpec(_adapter("op_opt.moe", "patch_router_factory")),
     _CallbackSpec(
@@ -355,6 +369,26 @@ _CUDA_VALIDATION_ID = (
 # proposer/eagle/ubatch -> DeepEP all2all.  The PyNccl pair is optional unless
 # an explicit ``all2all_backend='pynccl'`` config requests it.
 _FRAMEWORK_CALLBACKS: tuple[_CallbackSpec, ...] = (
+    _CallbackSpec(
+        _adapter("framework_opt", "patch_model_loader_static_eplb"),
+        feature="offline_eplb",
+        defer_until_enabled=True,
+    ),
+    _CallbackSpec(
+        _adapter("framework_opt", "patch_static_expert_mapping"),
+        feature="offline_eplb",
+        defer_until_enabled=True,
+    ),
+    _CallbackSpec(
+        _adapter("framework_opt", "patch_offline_eplb"),
+        feature="eplb_control",
+        defer_until_enabled=True,
+    ),
+    _CallbackSpec(
+        _adapter("framework_opt", "patch_eplb_communicator"),
+        feature="offline_eplb",
+        defer_until_enabled=True,
+    ),
     _CallbackSpec(
         _adapter("framework_opt", "patch_gpu_worker_shutdown"),
     ),
@@ -648,6 +682,7 @@ def _register_callbacks(
                     feature_enabled=_registration_feature(
                         coordinator, patch_id, spec.feature == "always"
                     ),
+                    defer_until_enabled=spec.defer_until_enabled,
                 )
             )
     return registrations
@@ -801,6 +836,15 @@ def _uses_all2all(vllm_config: object | None) -> bool:
     )
 
 
+def _parallel_eplb_enabled(vllm_config: object | None) -> bool:
+    parallel = getattr(vllm_config, "parallel_config", None)
+    if isinstance(vllm_config, dict):
+        parallel = vllm_config.get("parallel_config")
+    if isinstance(parallel, dict):
+        return bool(parallel.get("enable_eplb", False))
+    return bool(getattr(parallel, "enable_eplb", False))
+
+
 def _feature_states(
     vllm_config: object | None,
     config: HcuFeatureConfig,
@@ -837,6 +881,15 @@ def _feature_states(
         ),
         "lightly_cp": config.enable_lightly_cp,
         "multi_layers_mtp": config.enable_multi_layers_mtp,
+        "eplb": _parallel_eplb_enabled(vllm_config),
+        "offline_eplb": bool(
+            config.expert_map_path or config.expert_map_record_path
+        ),
+        "eplb_control": bool(
+            config.expert_map_path
+            or config.expert_map_record_path
+            or config.eplb_disable_rearrange
+        ),
         "proposer": bool(
             config.enable_lightly_cp or config.enable_multi_layers_mtp
         ),
@@ -864,8 +917,11 @@ def _bind_deserialized_hcu_config(vllm_config: object) -> HcuFeatureConfig:
     from vllm_hcu.patch.platform.core_fix.patch_compilation_config import (
         bind_hcu_config,
     )
+    from vllm_hcu.patch.config import bind_hcu_eplb_config
 
-    return bind_hcu_config(vllm_config)
+    normalized = bind_hcu_config(vllm_config)
+    bind_hcu_eplb_config(vllm_config)
+    return normalized
 
 
 def apply_worker_patches(vllm_config: object | None = None) -> None:
