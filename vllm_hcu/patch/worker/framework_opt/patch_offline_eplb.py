@@ -210,9 +210,9 @@ def _start_offline_record_session(path: str | Path) -> None:
 
     if _ep_rank() != 0:
         return
-    output = Path(path).expanduser()
-    if not str(output):
+    if not str(path).strip():
         raise ValueError("Offline EPLB record path must be nonempty")
+    output = Path(path).expanduser()
     output.parent.mkdir(parents=True, exist_ok=True)
     lock_path = output.with_suffix(output.suffix + ".lock")
     with lock_path.open("a", encoding="utf-8") as lock_file:
@@ -260,9 +260,9 @@ def record_offline_expert_map(
     }
     _validate_model_entry(model_key, entry)
 
-    output = Path(path).expanduser()
-    if not str(output):
+    if not str(path).strip():
         raise ValueError("Offline EPLB record path must be nonempty")
+    output = Path(path).expanduser()
     output.parent.mkdir(parents=True, exist_ok=True)
     lock_path = output.with_suffix(output.suffix + ".lock")
     with lock_path.open("a", encoding="utf-8") as lock_file:

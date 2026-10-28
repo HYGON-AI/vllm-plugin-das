@@ -320,6 +320,14 @@ def set_hcu_config(
 
 def validate_offline_eplb_config(vllm_config: object) -> None:
     """Reject offline EPLB paths unless expert parallel and EPLB are enabled."""
+    # Lightweight platform/test configs may carry no HCU payload at all.
+    # Only skip that case; malformed explicit sidecars must still raise.
+    if (
+        not isinstance(vllm_config, (Mapping, HcuFeatureConfig))
+        and not hasattr(vllm_config, "additional_config")
+        and not any(hasattr(vllm_config, name) for name in _FEATURE_FIELDS)
+    ):
+        return
     feature = get_hcu_config(vllm_config)
     if not (feature.expert_map_path or feature.expert_map_record_path):
         return

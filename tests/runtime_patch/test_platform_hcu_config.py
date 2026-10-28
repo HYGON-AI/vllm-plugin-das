@@ -106,6 +106,8 @@ def _make_arg_utils_module() -> ModuleType:
             default_factory=_KernelConfig
         )
         eplb_config: dict[str, Any] = field(default_factory=dict)
+        enable_eplb: bool = False
+        enable_expert_parallel: bool = False
         speculative_config: dict[str, Any] | None = None
 
         def __post_init__(self) -> None:
@@ -125,7 +127,9 @@ def _make_arg_utils_module() -> ModuleType:
                 additional_config=copy.deepcopy(self.additional_config),
                 kernel_config=kernel_config,
                 parallel_config=SimpleNamespace(
-                    all2all_backend=self.all2all_backend
+                    all2all_backend=self.all2all_backend,
+                    enable_eplb=self.enable_eplb,
+                    enable_expert_parallel=self.enable_expert_parallel,
                 ),
             )
 
@@ -210,6 +214,8 @@ def test_engine_args_legacy_keywords_are_removed_before_official_init() -> None:
         "moe_backend",
         "kernel_config",
         "eplb_config",
+        "enable_eplb",
+        "enable_expert_parallel",
         "speculative_config",
     }
 
@@ -245,7 +251,9 @@ def test_engine_args_extracts_nested_offline_eplb_fields() -> None:
         "static_dispatch_policy": "locality_fair",
     }
 
-    args = module.EngineArgs(eplb_config=eplb_config)
+    args = module.EngineArgs(
+        eplb_config=eplb_config, enable_eplb=True, enable_expert_parallel=True
+    )
 
     assert eplb_config["expert_map_path"] == "/maps/hy4.json"
     assert args.eplb_config == {"window_size": 512, "step_interval": 100}
@@ -2221,3 +2229,22 @@ def test_sidecar_changes_upstream_hash_and_crosses_serialization_boundaries() ->
     process.join(timeout=30)
     assert process.exitcode == 0
     assert queue.get(timeout=5) == enabled["hcu"]
+
+
+@pytest.mark.parametrize("path_field", ["expert_map_path", "expert_map_record_path"])
+@pytest.mark.parametrize(
+    "eplb,ep,message",
+    [(False, True, "--enable-eplb"), (True, False, "--enable-expert-parallel")],
+)
+def test_engine_args_rejects_offline_map_without_required_flags(
+    path_field, eplb, ep, message
+):
+    module = _make_arg_utils_module()
+    patch_engine_args.apply_to_module(module)
+    args = module.EngineArgs(
+        additional_config={"hcu": {path_field: "/maps/test.json"}},
+        enable_eplb=eplb,
+        enable_expert_parallel=ep,
+    )
+    with pytest.raises(ValueError, match=message):
+        args.create_engine_config()

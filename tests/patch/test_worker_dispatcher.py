@@ -853,3 +853,31 @@ print(json.dumps({
         "second": False,
         "signature_preserved": True,
     }
+
+
+@pytest.mark.parametrize("path_field", ["expert_map_path", "expert_map_record_path"])
+@pytest.mark.parametrize(
+    "eplb,ep,message",
+    [(False, True, "--enable-eplb"), (True, False, "--enable-expert-parallel"),
+     (True, True, None)],
+)
+def test_deserialized_worker_preserves_offline_eplb_validation(
+    path_field, eplb, ep, message
+):
+    # Exercise the worker boundary directly, without an EngineArgs entry point.
+    from types import SimpleNamespace
+
+    config = SimpleNamespace(
+        additional_config={"hcu": {path_field: "/maps/test.json"}},
+        parallel_config=SimpleNamespace(
+            enable_eplb=eplb, enable_expert_parallel=ep
+        ),
+        compilation_config=type("CompilationConfig", (), {})(),
+    )
+    if message:
+        with pytest.raises(ValueError, match=message):
+            worker_dispatcher._bind_deserialized_hcu_config(config)
+    else:
+        feature = worker_dispatcher._bind_deserialized_hcu_config(config)
+        assert getattr(feature, path_field) == "/maps/test.json"
+        assert getattr(config.parallel_config, "_vllm_hcu_" + path_field) == "/maps/test.json"

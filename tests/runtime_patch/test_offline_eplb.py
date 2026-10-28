@@ -1173,3 +1173,21 @@ def test_record_profile_skips_policy_collectives_and_weight_transfer(
         fixture.state.expert_load_window_step,
     )
     assert fixture.transfer_calls == []
+
+
+@pytest.mark.parametrize("path", ["", " ", "\t\n"])
+@pytest.mark.parametrize("operation", ["start", "record"])
+def test_offline_record_rejects_blank_path_before_filesystem_access(
+    path, operation, tmp_path, monkeypatch
+):
+    import vllm_hcu.patch.worker.framework_opt.patch_offline_eplb as api
+
+    monkeypatch.setattr(api, "_ep_rank", lambda: 0)
+    monkeypatch.chdir(tmp_path)
+    if operation == "start":
+        call = api._start_offline_record_session
+    else:
+        call = _record
+    with pytest.raises(ValueError, match="record path must be nonempty"):
+        call(path)
+    assert list(tmp_path.iterdir()) == []

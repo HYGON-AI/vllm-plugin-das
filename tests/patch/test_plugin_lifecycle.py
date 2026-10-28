@@ -514,7 +514,12 @@ config.additional_config = {
     ).to_dict()
 }
 config.compilation_config = CompilationConfig()
-config.parallel_config = ParallelConfig(all2all_backend="deepep_low_latency")
+config.parallel_config = ParallelConfig(
+    tensor_parallel_size=8,
+    enable_eplb=True,
+    enable_expert_parallel=True,
+    all2all_backend="deepep_low_latency",
+)
 config = pickle.loads(pickle.dumps(config))
 assert get_hcu_config(config).expert_map_path == "/maps/hy4-static.json"
 assert config.use_v2_model_runner is True

@@ -219,3 +219,33 @@ def test_offline_eplb_paths_require_eplb_and_expert_parallel(field, as_mapping):
                 validate_offline_eplb_config(config)
         else:
             validate_offline_eplb_config(config)
+
+
+@pytest.mark.parametrize(
+    "config",
+    [
+        None,
+        SimpleNamespace(),
+        SimpleNamespace(parallel_config=SimpleNamespace()),
+        {"parallel_config": {}},
+    ],
+)
+def test_offline_eplb_validation_allows_configs_without_hcu_sidecar(config):
+    hcu_config_module.validate_offline_eplb_config(config)
+
+
+@pytest.mark.parametrize(
+    "config",
+    [
+        SimpleNamespace(additional_config=7),
+        {"additional_config": 7},
+        SimpleNamespace(additional_config={"hcu": 7}),
+        {"additional_config": {"hcu": 7}},
+        SimpleNamespace(additional_config={"hcu": {"expert_map_path": 7}}),
+        {"additional_config": {"hcu": {"expert_map_record_path": 7}}},
+        SimpleNamespace(expert_map_record_path=7),
+    ],
+)
+def test_offline_eplb_validation_preserves_malformed_config_errors(config):
+    with pytest.raises(TypeError):
+        hcu_config_module.validate_offline_eplb_config(config)
