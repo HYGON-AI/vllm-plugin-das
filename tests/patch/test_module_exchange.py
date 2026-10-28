@@ -189,7 +189,7 @@ def test_deep_gemm_replacements_preserve_v0251_surface_and_signatures(
     target_relative: str,
     replacement_relative: str,
 ):
-    """Always-on whole-module replacements must keep the exact v0.25.1 API."""
+    """Preserve every target definition/signature; added helpers stay private."""
 
     target_tree = ast.parse(
         (TARGET_VLLM_ROOT / target_relative).read_text(encoding="utf-8")
@@ -227,6 +227,18 @@ def test_deep_gemm_replacements_preserve_v0251_surface_and_signatures(
 
     target_definitions = definitions(target_tree)
     replacement_definitions = definitions(replacement_tree)
+    target_names = {node.name for node in target_definitions}
+    helpers = [
+        node for node in replacement_definitions if node.name not in target_names
+    ]
+    assert all(
+        isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef))
+        and node.name.startswith("_") and not node.name.endswith("__")
+        for node in helpers
+    ), f"non-private module additions: {[node.name for node in helpers]}"
+    replacement_definitions = [
+        node for node in replacement_definitions if node.name in target_names
+    ]
     assert [node.name for node in replacement_definitions] == [
         node.name for node in target_definitions
     ]
@@ -930,3 +942,64 @@ def test_modular_kernel_strict_late_policy_keeps_official_and_hcu_exclusive(
     assert replacement not in sys.modules
     record = registry.get("module_exchange.modular_kernel")
     assert record is not None and record.status is PatchStatus.FAILED
+
+
+@pytest.mark.parametrize(
+    ("change", "accepted"),
+    [
+        ("private_helper", True),
+        ("public_helper", False),
+        ("dunder_helper", False),
+        ("private_class", False),
+        ("missing_definition", False),
+        ("changed_signature", False),
+    ],
+)
+def test_deep_gemm_surface_guard_checks_required_api(monkeypatch, change, accepted):
+    target_relative = "vllm/model_executor/layers/fused_moe/experts/deep_gemm_moe.py"
+    replacement_relative = (
+        "vllm_hcu/model_executor/layers/fused_moe/experts/deep_gemm_moe.py"
+    )
+    replacement_path = REPO_ROOT / replacement_relative
+    original_read_text = Path.read_text
+    tree = ast.parse(original_read_text(replacement_path, encoding="utf-8"))
+    if change in {"private_helper", "public_helper", "dunder_helper"}:
+        name = {
+            "private_helper": "_contract_extra_helper",
+            "public_helper": "contract_extra_helper",
+            "dunder_helper": "__contract_extra_helper__",
+        }[change]
+        tree.body.append(ast.parse(f"def {name}(): pass").body[0])
+    elif change == "private_class":
+        tree.body.append(ast.parse("class _ContractExtraHelper: pass").body[0])
+    elif change == "missing_definition":
+        tree.body = [
+            node for node in tree.body
+            if getattr(node, "name", None) != "_valid_deep_gemm_shape"
+        ]
+    else:
+        function = next(
+            node for node in tree.body
+            if isinstance(node, ast.FunctionDef)
+            and node.name == "_valid_deep_gemm_shape"
+        )
+        function.args.args.append(ast.arg(arg="unexpected_contract_argument"))
+    changed_source = ast.unparse(ast.fix_missing_locations(tree))
+
+    def read_text(path, *args, **kwargs):
+        if path == replacement_path:
+            return changed_source
+        return original_read_text(path, *args, **kwargs)
+
+    monkeypatch.setattr(Path, "read_text", read_text)
+
+    def check():
+        test_deep_gemm_replacements_preserve_v0251_surface_and_signatures(
+            target_relative, replacement_relative
+        )
+
+    if accepted:
+        check()
+    else:
+        with pytest.raises(AssertionError):
+            check()
