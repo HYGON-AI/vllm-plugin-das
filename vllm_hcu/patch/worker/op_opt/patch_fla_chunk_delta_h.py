@@ -109,6 +109,16 @@ def apply_to_module(module: ModuleType) -> bool:
         use_exp2=False,
     ):
         provider, kernel = select_provider()
+        if (
+            provider == AITER
+            and initial_state is not None
+            and initial_state.dtype in (torch.float16, torch.bfloat16)
+        ):
+            # fp16/bf16 SSM state cache: the HIP kernel accumulates in fp32
+            # and already returns an fp32 final state, so upcasting the
+            # gathered per-sequence initial states is cheap and keeps the
+            # fast path instead of falling back to Triton.
+            initial_state = initial_state.float()
         if provider == AITER:
             reason = _aiter_unsupported(k, u, g, gk, initial_state, chunk_size)
             if reason is not None:
