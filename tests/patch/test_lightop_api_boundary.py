@@ -199,12 +199,46 @@ class _LightOpVisitor(ast.NodeVisitor):
             "importlib", "import_module", "__import__", "globals", "locals",
             "vars", "sys", "builtins", "__builtins__", "__globals__",
             "func_globals", "f_globals", "f_locals", "f_builtins",
-            "eval", "exec", "compile", "load_exact_module",
+            "eval", "exec", "compile", "load_exact_module", "__dict__",
+            "__getattribute__", "__setattr__", "__delattr__",
         }
         protected = {
             "getattr", "callable", "ImportError", "AttributeError",
             "functools", "_pcp_insert_op", "TARGET_MODULE", "load_exact_module",
+            "_MARKER",
         }
+        reflection = {"getattr", "setattr", "delattr"}
+        forbidden |= reflection
+        protected |= reflection
+        # Existing wrapper/marker operations are the only reviewed uses of
+        # dynamic attribute names. Other lookups/writes must use constant
+        # strings; do not try to evaluate arbitrary string-building calls.
+        reviewed_reflection = {
+            ast.dump(stmt.value) for stmt in ast.parse("""
+getattr(cls, _MARKER, False)
+getattr(getattr(cls, name), _MARKER, False)
+getattr(cls, name)
+getattr(rocm.rocm_sparse_attn_prefill, _MARKER, False)
+getattr(quant, _MARKER, False)
+setattr(local_indexer_quant, _MARKER, True)
+setattr(wrapper, _MARKER, True)
+setattr(cls, name, wrapper)
+setattr(indexer_wrapper, _MARKER, True)
+setattr(sparse_prefill, _MARKER, True)
+setattr(cls, _MARKER, True)
+""").body
+        }
+        # These exceptions apply only to the existing calls in the one
+        # top-level patch entry point, not matching calls appended elsewhere.
+        entry = _resolver(tree, "apply_to_module")
+        reflection_nodes: set[int] = set()
+        for pattern in reviewed_reflection:
+            matches = [
+                node for node in ast.walk(entry) if isinstance(node, ast.Call)
+                and ast.dump(node) == pattern
+            ] if entry is not None else []
+            if len(matches) == 1:
+                reflection_nodes.add(id(matches[0].func))
         parents = {
             id(child): parent for parent in ast.walk(tree)
             for child in ast.iter_child_nodes(parent)
@@ -235,6 +269,15 @@ class _LightOpVisitor(ast.NodeVisitor):
         reviewed_target_nodes = {
             id(child) for node in targets for child in ast.walk(node)
         }
+        expected_marker = ast.dump(ast.parse(
+            '_MARKER = "_vllm_hcu_deepseek_v4_pcp_applied"'
+        ).body[0])
+        markers = [node for node in tree.body if ast.dump(node) == expected_marker]
+        if reflection_nodes and len(markers) != 1:
+            self._violate(tree, "dynamic reflection requires the exact patch marker")
+        reviewed_target_nodes.update(
+            id(child) for node in markers for child in ast.walk(node)
+        )
         for node in ast.walk(tree):
             parent = parents.get(id(node))
             if isinstance(node, (ast.Import, ast.ImportFrom)):
@@ -271,10 +314,20 @@ class _LightOpVisitor(ast.NodeVisitor):
                 and node.asname is None and isinstance(parent, ast.ImportFrom)
                 and parent.level == 1 and parent.module == "_common"
             )
+            direct_reflection = (
+                isinstance(node, ast.Name) and node.id in reflection
+                and isinstance(parent, ast.Call) and parent.func is node
+            )
+            if direct_reflection and (
+                len(parent.args) < 2
+                or _constant_string(parent.args[1]) is None
+            ) and id(node) not in reflection_nodes:
+                self._violate(node, "nonliteral reflective access in legacy owner")
             if (
                 isinstance(token, str) and token in forbidden
                 and id(node) not in reviewed_loader_nodes
                 and not plain_importlib and not plain_exact_loader
+                and not direct_reflection
                 and id(node) not in reviewed_exact_loaders
             ):
                 self._violate(node, "dynamic namespace capability in legacy owner")
@@ -1081,6 +1134,35 @@ def test_legacy_owner_allows_benign_string_concatenation(tmp_path: Path) -> None
     relative_path, _, _ = next(iter(LEGACY_TOP_LEVEL_MODULE_IMPORTS))
     with (tmp_path / relative_path).open("a", encoding="utf-8") as stream:
         stream.write('\nlabel = "public_" + "kernel"\n')
+
+    assert scan_lightop_imports(root) == []
+
+
+@pytest.mark.parametrize("source", [
+    'getattr(_can_use_local_queries, "__gloXbals__".replace("X", ""))["_pcp_Xinsert_op".replace("X", "")] = lambda: None',
+    'getattr(helper, attribute_name)',
+    'getattr(cls, name)',
+    '_MARKER = "__gloXbals__".replace("X", "")',
+    'lookup = getattr; lookup(helper, attribute_name)',
+    'helper.__getattribute__(attribute_name)',
+    'setattr(owner, attribute_name, replacement)',
+    'delattr(owner, attribute_name)',
+    'namespace = owner.__dict__; namespace[key_name] = replacement',
+])
+def test_legacy_owner_rejects_dynamic_reflection(tmp_path: Path, source: str) -> None:
+    root = _write_mutation_owner(tmp_path)
+    relative_path, _, _ = next(iter(LEGACY_TOP_LEVEL_MODULE_IMPORTS))
+    with (tmp_path / relative_path).open("a", encoding="utf-8") as stream:
+        stream.write(f"\n{source}\n")
+
+    assert scan_lightop_imports(root)
+
+
+def test_legacy_owner_allows_literal_attribute_lookup(tmp_path: Path) -> None:
+    root = _write_mutation_owner(tmp_path)
+    relative_path, _, _ = next(iter(LEGACY_TOP_LEVEL_MODULE_IMPORTS))
+    with (tmp_path / relative_path).open("a", encoding="utf-8") as stream:
+        stream.write('\ngetattr(layer, "head_" + "dim", None)\n')
 
     assert scan_lightop_imports(root) == []
 
