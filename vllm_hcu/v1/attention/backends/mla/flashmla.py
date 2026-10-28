@@ -166,6 +166,10 @@ class FlashMLAMetadata(MLACommonMetadata[FlashMLADecodeMetadata]):
 class FlashMLAMetadataBuilder(MLACommonMetadataBuilder[FlashMLAMetadata]):
     _cudagraph_support: ClassVar[AttentionCGSupport] = AttentionCGSupport.UNIFORM_BATCH
     query_len_support: ClassVar[QueryLenSupport] = QueryLenSupport.UNIFORM
+    # TASK2: the builder (not only the backend) must own this ClassVar --
+    # the MLACommon build() flatten gate reads it off the builder class,
+    # mirroring upstream TritonMLAMetadataBuilder.
+    supports_non_causal_multi_token_decode: ClassVar[bool] = True
     reorder_batch_threshold: int = 128  # process small prefills with decode pathway
     # ^ TODO(matt): tune this
 
