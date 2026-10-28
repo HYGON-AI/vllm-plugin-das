@@ -404,15 +404,17 @@ def install_key_fingerprint(module: ModuleType) -> None:
 
         # Header hashes alone do not encode model overrides or nested Kimi
         # compression settings. Include the resolved HF config and the model
-        # options that affect model construction, before post-load can mutate
-        # the quantization config. An unrepresentable config must fail closed.
+        # options that affect weight interpretation, before post-load can
+        # mutate the quantization config. Runtime capacity settings such as
+        # max_model_len must not participate: the preload daemon and serving
+        # engine can use different KV-cache budgets for the same weights.
         hf_config = getattr(model_config, "hf_config", None)
         hf_dict = hf_config.to_dict() if hf_config is not None else None
         options = {
             name: getattr(model_config, name, None)
             for name in (
                 "code_revision", "model_weights", "model_impl", "convert",
-                "max_model_len", "model_class_overrides", "quantization_config",
+                "model_class_overrides", "quantization_config",
             )
         }
         # HCU switches alter post-processed layouts and must match in both
@@ -433,7 +435,7 @@ def install_key_fingerprint(module: ModuleType) -> None:
         hasher.update(config_bytes)
         scope = f"|hcu-pp:{pp_size}:{pp_rank}" if pp_size > 1 else ""
         key = dataclasses.replace(
-            key, checkpoint="hcu-config-v2:" + hasher.hexdigest() + scope
+            key, checkpoint="hcu-config-v3:" + hasher.hexdigest() + scope
         )
         return dataclasses.replace(key, vllm_version=f"{key.vllm_version}|hcu:{__hcu_version__}")
 
