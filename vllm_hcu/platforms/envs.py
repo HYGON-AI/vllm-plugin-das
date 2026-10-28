@@ -45,6 +45,7 @@ if TYPE_CHECKING:
     VLLM_HCU_LIGHTLY_CP_THRESHOLD: int = 2048
     VLLM_HCU_USE_LIGHTOP_TOPK: bool = False
     VLLM_HCU_USE_LIGHTOP_SPARSE_MLA_TOPK: bool = True
+    VLLM_HCU_USE_LIGHTOP_INDEXER_TOPK_ADAPTER: bool = False
     VLLM_HCU_USE_LIGHTOP_FAST_TOPK_TRANSFORM: bool = True
     VLLM_HCU_USE_AITER_MHC: bool = True
     VLLM_HCU_USE_AITER_MHC_POST: bool = True
@@ -405,6 +406,12 @@ hcu_vllm_environment_variables: dict[str, Callable[[], Any]] = {
     "VLLM_HCU_USE_LIGHTOP_SPARSE_MLA_TOPK":
         lambda: (os.environ.get("VLLM_HCU_USE_LIGHTOP_SPARSE_MLA_TOPK", "True").lower() in
                     ("true", "1")),
+
+    # Opt in to the ABI-safe ordinary decode TopK output adapter.
+    "VLLM_HCU_USE_LIGHTOP_INDEXER_TOPK_ADAPTER":
+        lambda: _environment_flag(
+            os.environ.get("VLLM_HCU_USE_LIGHTOP_INDEXER_TOPK_ADAPTER", "False")
+        ),
 
     # Use fused TopK + page-table transform for sparse MLA DCP candidates.
     "VLLM_HCU_USE_LIGHTOP_FAST_TOPK_TRANSFORM":

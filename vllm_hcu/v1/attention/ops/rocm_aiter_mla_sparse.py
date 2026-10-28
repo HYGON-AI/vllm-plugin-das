@@ -44,6 +44,10 @@ from vllm_hcu.model_executor.layers.fp4_indexer import (
     lightop_gather_index_k_fp4,
     stage_fp4_decode_pages,
 )
+from vllm_hcu.v1.attention.ops.lightop_indexer_topk import (
+    decode_topk,
+    decode_topk_v2,
+)
 
 
 lightop_attention = None
@@ -1460,20 +1464,36 @@ def _lightop_topk_indices_decode(
 ) -> None:
     row_ends = _decode_row_ends_from_seq_lens(seq_lens, next_n, logits.shape[0])
     if topk_tokens == 512:
+        if (
+            henvs.VLLM_HCU_USE_CUSTOM_OPS
+            and henvs.VLLM_HCU_USE_LIGHTOP_INDEXER_TOPK_ADAPTER
+            and decode_topk_v2(logits, row_ends, topk_indices, topk_tokens)
+        ):
+            return
         topk_indices.copy_(
             _topk_indices_torch(logits, topk_tokens, row_ends=row_ends)
         )
         return
-    _get_lightop_attention().top_k_per_row_decode(
-        logits,
-        1,
-        row_ends.to(device=logits.device, dtype=torch.int32),
-        topk_indices,
-        logits.shape[0],
-        logits.stride(0),
-        logits.stride(1),
-        topk_tokens,
+    native_decode = getattr(
+        _get_lightop_attention(), "top_k_per_row_decode", None
     )
+    if henvs.VLLM_HCU_USE_LIGHTOP_INDEXER_TOPK_ADAPTER:
+        decode_topk(native_decode, logits, row_ends, topk_indices, topk_tokens)
+    elif topk_indices.is_contiguous():
+        if not callable(native_decode):
+            raise RuntimeError("LightOp decode TopK symbol is unavailable")
+        native_decode(
+            logits,
+            1,
+            row_ends.to(device=logits.device, dtype=torch.int32),
+            topk_indices,
+            logits.shape[0],
+            logits.stride(0),
+            logits.stride(1),
+            topk_tokens,
+        )
+    else:
+        topk_indices.copy_(_topk_indices_torch(logits, topk_tokens, row_ends=row_ends))
 
 
 def rocm_aiter_sparse_attn_indexer_fake(
@@ -1645,9 +1665,18 @@ def _hcu_fp4_sparse_attn_indexer_native(
                     candidate_block_size,
                     candidate_write,
                 )
-            out.copy_(_topk_indices_torch(
-                logits, topk_tokens, row_ends=row_lens
-            ))
+            # LightOp FP4 prefill returns window-local columns, so the window
+            # starts at column 0 and the row length doubles as the row end.
+            # Try the fused ragged-v2 selector first; any ABI mismatch falls
+            # back to the exact Torch reference below.
+            if not (
+                henvs.VLLM_HCU_USE_CUSTOM_OPS
+                and henvs.VLLM_HCU_USE_LIGHTOP_INDEXER_TOPK_ADAPTER
+                and decode_topk_v2(logits, row_lens, out, topk_tokens)
+            ):
+                out.copy_(_topk_indices_torch(
+                    logits, topk_tokens, row_ends=row_lens
+                ))
 
     if layer.decode is not None and layer.num_decodes > 0:
         decode = layer.decode
@@ -1691,7 +1720,16 @@ def _hcu_fp4_sparse_attn_indexer_native(
                 logits, None, row_ends, candidate_blocks[:rows],
                 candidate_block_size, candidate_write, 1,
             )
-        out.copy_(_topk_indices_torch(logits, topk_tokens, row_ends=row_ends))
+        # `out` may be a strided slice of the shared TopK buffer; the adapter
+        # writes a contiguous temporary and copies back, so that layout is
+        # supported. A row-count mismatch makes decode_topk_v2 return False
+        # and the exact Torch reference runs instead.
+        if not (
+            henvs.VLLM_HCU_USE_CUSTOM_OPS
+            and henvs.VLLM_HCU_USE_LIGHTOP_INDEXER_TOPK_ADAPTER
+            and decode_topk_v2(logits, row_ends, out, topk_tokens)
+        ):
+            out.copy_(_topk_indices_torch(logits, topk_tokens, row_ends=row_ends))
     return topk_indices_buffer
 
 
