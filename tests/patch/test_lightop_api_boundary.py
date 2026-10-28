@@ -103,6 +103,27 @@ def _pcp_insert_op():
 """
 
 
+def _constant_string(node: ast.AST) -> str | None:
+    """Fold literal concatenation and plain literal-only f-strings safely."""
+    if isinstance(node, ast.Constant) and isinstance(node.value, str):
+        return node.value
+    if isinstance(node, ast.BinOp) and isinstance(node.op, ast.Add):
+        left, right = _constant_string(node.left), _constant_string(node.right)
+        return left + right if left is not None and right is not None else None
+    if isinstance(node, ast.FormattedValue):
+        if node.conversion == -1 and node.format_spec is None:
+            return _constant_string(node.value)
+    if isinstance(node, ast.JoinedStr):
+        parts: list[str] = []
+        for value in node.values:
+            part = _constant_string(value)
+            if part is None:
+                return None
+            parts.append(part)
+        return "".join(parts)
+    return None
+
+
 def _attribute_parts(node: ast.Attribute) -> tuple[ast.expr, list[str]]:
     parts: list[str] = []
     current: ast.expr = node
@@ -232,13 +253,12 @@ class _LightOpVisitor(ast.NodeVisitor):
                     )
                 ):
                     self._violate(node, "legacy owner requires plain dependency imports")
-            token = None
+            literal = _constant_string(node)
+            token = literal
             if isinstance(node, ast.Name):
                 token = node.id
             elif isinstance(node, ast.Attribute):
                 token = node.attr
-            elif isinstance(node, ast.Constant):
-                token = node.value
             elif isinstance(node, ast.alias):
                 token = node.name
             plain_importlib = (
@@ -258,7 +278,7 @@ class _LightOpVisitor(ast.NodeVisitor):
                 and id(node) not in reviewed_exact_loaders
             ):
                 self._violate(node, "dynamic namespace capability in legacy owner")
-            if isinstance(node, ast.Constant) and token == "_pcp_insert_op":
+            if literal == "_pcp_insert_op":
                 self._violate(node, "indirect PCP resolver reference in legacy owner")
             if isinstance(node, ast.Name) and isinstance(node.ctx, ast.Load):
                 if node.id == "_pcp_insert_op" and not (
@@ -1035,6 +1055,34 @@ def test_legacy_owner_pins_exact_loader_target(tmp_path: Path, target: str) -> N
     assert (violations == []) == (
         target == 'TARGET_MODULE = "vllm.models.deepseek_v4.amd.rocm"'
     )
+
+
+@pytest.mark.parametrize("source", [
+    'getattr(_can_use_local_queries, "__glob" + "als__")["_pcp_" + "insert_op"] = lambda: None',
+    'owner.__dict__["_pcp_" + "insert_op"] = lambda: None',
+    'getattr(helper, "__glo" + ("bals" + "__"))',
+    'key = "_pcp_" + "insert_" + "op"; owner.__dict__[key] = replacement',
+    'lookup = getattr; lookup(helper, "__glob" + "als__")["_pcp_" + "insert_op"] = replacement',
+    'getattr(helper, f"{\'__glob\'}{\'als__\'}")["_pcp_" + "insert_op"] = replacement',
+])
+def test_legacy_owner_rejects_computed_protected_names(
+    tmp_path: Path, source: str,
+) -> None:
+    root = _write_mutation_owner(tmp_path)
+    relative_path, _, _ = next(iter(LEGACY_TOP_LEVEL_MODULE_IMPORTS))
+    with (tmp_path / relative_path).open("a", encoding="utf-8") as stream:
+        stream.write(f"\n{source}\n")
+
+    assert scan_lightop_imports(root)
+
+
+def test_legacy_owner_allows_benign_string_concatenation(tmp_path: Path) -> None:
+    root = _write_mutation_owner(tmp_path)
+    relative_path, _, _ = next(iter(LEGACY_TOP_LEVEL_MODULE_IMPORTS))
+    with (tmp_path / relative_path).open("a", encoding="utf-8") as stream:
+        stream.write('\nlabel = "public_" + "kernel"\n')
+
+    assert scan_lightop_imports(root) == []
 
 
 @pytest.mark.parametrize(
