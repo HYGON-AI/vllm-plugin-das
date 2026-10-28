@@ -3,19 +3,21 @@
 
 """Source policy for public LightOp imports, with an exact legacy fallback.
 
-This audits repository source; it is not a sandbox for arbitrary Python code
-or external modules that mutate interpreter state.
+The PCP compatibility owner permits reviewed static imports and one existing
+fixed-target vLLM import. Other loader and namespace capabilities are rejected
+at their source, without alias analysis. This is a source policy, not a Python
+sandbox for external modules that mutate interpreter state.
 """
 
 from __future__ import annotations
 
 import ast
+import copy
 import importlib
 import json
 import os
 import subprocess
 import sys
-from importlib.util import resolve_name
 from collections import Counter
 from pathlib import Path
 from types import SimpleNamespace
@@ -114,7 +116,6 @@ def _attribute_parts(node: ast.Attribute) -> tuple[ast.expr, list[str]]:
 class _LightOpVisitor(ast.NodeVisitor):
     def __init__(self, relative_path: str) -> None:
         self.relative_path = relative_path
-        self.module_name = relative_path.removesuffix(".py").replace("/", ".")
         # Also recognize an injected/global ``lightop`` name so a call such as
         # ``lightop.op.foo()`` cannot evade the policy by omitting its import
         # from the scanned file.
@@ -137,11 +138,7 @@ class _LightOpVisitor(ast.NodeVisitor):
         self.violations: list[str] = []
         self._violation_keys: set[tuple[int, str]] = set()
         self._functions: list[str] = []
-        self.dynamic_loader_aliases: set[str] = {"__import__", "import_module"}
-        self.attribute_lookup_aliases: set[str] = {"getattr"}
         self._audited_legacy_nodes: set[int] = set()
-        self._functools_imports: set[int] = set()
-        self._pcp_calls: set[int] = set()
 
     def _violate(self, node: ast.AST, detail: str) -> None:
         line = getattr(node, "lineno", 1)
@@ -150,203 +147,138 @@ class _LightOpVisitor(ast.NodeVisitor):
             self._violation_keys.add(key)
             self.violations.append(f"{self.relative_path}:{line}: {detail}")
 
-    def _is_attribute_lookup(self, node: ast.AST) -> bool:
-        return (
-            isinstance(node, ast.Name)
-            and node.id in self.attribute_lookup_aliases
-        ) or (
-            isinstance(node, ast.Attribute)
-            and node.attr in {"getattr", "__getattribute__"}
-        ) or (
-            isinstance(node, ast.Call)
-            and self._reflected_attribute(node) in {"getattr", "__getattribute__"}
-        )
-
-    def _reflected_attribute(self, node: ast.AST) -> str | None:
-        if not isinstance(node, ast.Call) or not self._is_attribute_lookup(node.func):
-            return None
-        # getattr / unbound __getattribute__ take (owner, name); a bound
-        # __getattribute__ takes only (name). Optional getattr defaults do not
-        # change which argument names the attribute.
-        if not node.args:
-            return None
-        name = node.args[0] if len(node.args) == 1 else node.args[1]
-        return name.value if (
-            isinstance(name, ast.Constant) and isinstance(name.value, str)
-        ) else None
-
-    def _is_dynamic_loader(self, node: ast.AST) -> bool:
-        return (
-            isinstance(node, ast.Name)
-            and node.id in self.dynamic_loader_aliases
-        ) or (
-            isinstance(node, ast.Attribute)
-            and node.attr in {"import_module", "__import__"}
-        ) or (
-            isinstance(node, ast.Call)
-            and self._reflected_attribute(node) in {"import_module", "__import__"}
-        )
-
-    def _collect_loader_assignment(
-        self, target: ast.expr, value: ast.expr,
-    ) -> None:
-        if isinstance(target, ast.Name):
-            if self._is_dynamic_loader(value):
-                self.dynamic_loader_aliases.add(target.id)
-            if self._is_attribute_lookup(value):
-                self.attribute_lookup_aliases.add(target.id)
-        elif (
-            isinstance(target, (ast.Tuple, ast.List))
-            and isinstance(value, (ast.Tuple, ast.List))
-            and len(target.elts) == len(value.elts)
-        ):
-            for child_target, child_value in zip(target.elts, value.elts):
-                self._collect_loader_assignment(child_target, child_value)
 
     def visit_Module(self, node: ast.Module) -> None:
         if self.relative_path in LEGACY_MODULE_OWNERS:
-            self._functools_imports = {
-                id(child) for child in node.body
-                if isinstance(child, ast.Import)
-                and len(child.names) == 1
-                and child.names[0].name == "functools"
-                and child.names[0].asname is None
-            }
-            if len(self._functools_imports) != 1:
-                self._violate(node, "PCP fallback requires one absolute functools import")
-            self._pcp_calls = {
-                id(child.func) for child in ast.walk(node)
-                if isinstance(child, ast.Call)
-                and isinstance(child.func, ast.Name)
-                and child.func.id == "_pcp_insert_op"
-            }
             resolver = _resolver(node, "_pcp_insert_op")
-            expected = ast.parse(PCP_RESOLVER_SOURCE).body[0]
-            if (
-                resolver is None
-                or ast.dump(resolver) != ast.dump(expected)
+            if resolver is None or ast.dump(resolver) != ast.dump(
+                ast.parse(PCP_RESOLVER_SOURCE).body[0]
             ):
-                self._violate(
-                    node, "PCP resolver is not the exact audited fallback",
-                )
+                self._violate(node, "PCP resolver is not the exact audited fallback")
             else:
-                self._audited_legacy_nodes = {
-                    id(child) for child in ast.walk(resolver)
-                }
-            # Globals are resolved when helpers run, so collect aliases before
-            # visiting any body. Keep aliases conservatively across scopes and
-            # rebindings: this boundary must not grant an unchecked loader call.
-            nodes = list(ast.walk(node))
-            for child in nodes:
-                if isinstance(child, ast.ImportFrom) and child.level == 0:
-                    for alias in child.names:
-                        if (child.module, alias.name) in {
-                            ("importlib", "import_module"),
-                            ("builtins", "__import__"),
-                        }:
-                            self.dynamic_loader_aliases.add(
-                                alias.asname or alias.name
-                            )
-            while True:
-                previous = (
-                    self.dynamic_loader_aliases.copy(),
-                    self.attribute_lookup_aliases.copy(),
-                )
-                for child in nodes:
-                    if isinstance(child, ast.Assign):
-                        for target in child.targets:
-                            self._collect_loader_assignment(target, child.value)
-                    elif isinstance(child, (ast.AnnAssign, ast.NamedExpr)):
-                        if child.value is not None:
-                            self._collect_loader_assignment(
-                                child.target, child.value,
-                            )
-                if (
-                    self.dynamic_loader_aliases,
-                    self.attribute_lookup_aliases,
-                ) == previous:
-                    break
+                self._audited_legacy_nodes = {id(n) for n in ast.walk(resolver)}
+            self._audit_legacy_owner(node)
         self.generic_visit(node)
 
-    def _reject_getattr_binding(self, node: ast.AST, name: str) -> None:
-        if name == "getattr" and self.relative_path in LEGACY_MODULE_OWNERS:
+    def _audit_legacy_owner(self, tree: ast.Module) -> None:
+        # Static imports plus one existing, fixed-target vLLM import suffice
+        # for this compatibility owner. Reject other dynamic capabilities at
+        # their source instead of implementing aliases or Python data flow.
+        static_modules = {
+            "__future__", "functools", "importlib", "contextvars", "types", "torch",
+            "vllm.logger", "._common", "lightop", "vllm_hcu.platforms",
+            "vllm.forward_context", "vllm.models.deepseek_v4",
+            "vllm.models.deepseek_v4.attention",
+            "vllm.models.deepseek_v4.compressor",
+            "vllm.v1.attention.backends.mla.sparse_swa",
+            "vllm_hcu.model_executor.layers.attention.pcp",
+            "vllm_hcu.v1.glm53_pcp",
+        }
+        forbidden = {
+            "importlib", "import_module", "__import__", "globals", "locals",
+            "vars", "sys", "builtins", "__builtins__", "__globals__",
+            "func_globals", "f_globals", "f_locals", "f_builtins",
+            "eval", "exec", "compile",
+        }
+        protected = {
+            "getattr", "callable", "ImportError", "AttributeError",
+            "functools", "_pcp_insert_op",
+        }
+        parents = {
+            id(child): parent for parent in ast.walk(tree)
+            for child in ast.iter_child_nodes(parent)
+        }
+        expected_import = ast.dump(ast.parse(
+            'importlib.import_module("vllm.models.deepseek_v4.attention")'
+        ).body[0].value)
+        reviewed_loader_nodes = {
+            id(child) for node in ast.walk(tree)
+            if isinstance(node, ast.Call) and ast.dump(node) == expected_import
+            for child in ast.walk(node)
+        }
+        for node in ast.walk(tree):
+            parent = parents.get(id(node))
+            if isinstance(node, (ast.Import, ast.ImportFrom)):
+                modules = (
+                    [a.name for a in node.names] if isinstance(node, ast.Import)
+                    else ["." * node.level + (node.module or "")]
+                )
+                if any(module not in static_modules for module in modules):
+                    self._violate(node, "legacy owner requires reviewed static imports")
+                if (
+                    isinstance(node, ast.ImportFrom)
+                    and node.module in {"functools", "importlib"}
+                ) or (
+                    isinstance(node, ast.Import) and any(
+                        a.name == "functools" and a.asname for a in node.names
+                    )
+                ):
+                    self._violate(node, "legacy owner requires plain dependency imports")
+            token = None
+            if isinstance(node, ast.Name):
+                token = node.id
+            elif isinstance(node, ast.Attribute):
+                token = node.attr
+            elif isinstance(node, ast.Constant):
+                token = node.value
+            elif isinstance(node, ast.alias):
+                token = node.name
+            plain_importlib = (
+                isinstance(node, ast.alias) and node.name == "importlib"
+                and node.asname is None and isinstance(parent, ast.Import)
+                and len(parent.names) == 1 and parent in tree.body
+            )
+            if (
+                isinstance(token, str) and token in forbidden
+                and id(node) not in reviewed_loader_nodes
+                and not plain_importlib
+            ):
+                self._violate(node, "dynamic namespace capability in legacy owner")
+            if isinstance(node, ast.Constant) and token == "_pcp_insert_op":
+                self._violate(node, "indirect PCP resolver reference in legacy owner")
+            if isinstance(node, ast.Name) and isinstance(node.ctx, ast.Load):
+                if node.id == "_pcp_insert_op" and not (
+                    isinstance(parent, ast.Call) and parent.func is node
+                ):
+                    self._violate(node, "bare PCP fallback function escape")
+                if node.id == "functools" and not (
+                    isinstance(parent, ast.Attribute) and parent.value is node
+                    and parent.attr in {"cache", "wraps"}
+                    and isinstance(parent.ctx, ast.Load)
+                    and (parent.attr == "wraps"
+                         or id(parent) in self._audited_legacy_nodes)
+                ):
+                    self._violate(node, "PCP fallback decorator escape")
+            if isinstance(node, ast.Attribute) and not isinstance(node.ctx, ast.Load):
+                if node.attr in protected | {"cache", "wraps"}:
+                    self._violate(node, "PCP fallback dependency mutation")
+            binding = None
+            if isinstance(node, ast.Name) and isinstance(node.ctx, (ast.Store, ast.Del)):
+                binding = node.id
+            elif isinstance(node, ast.arg):
+                binding = node.arg
+            elif isinstance(node, ast.alias):
+                binding = node.asname or node.name.split(".")[0]
+            elif isinstance(node, (
+                ast.FunctionDef, ast.AsyncFunctionDef, ast.ClassDef,
+                ast.ExceptHandler, ast.MatchAs, ast.MatchStar,
+            )):
+                binding = node.name
+            elif isinstance(node, ast.MatchMapping):
+                binding = node.rest
+            if binding in protected and id(node) not in self._audited_legacy_nodes:
+                if not (isinstance(parent, ast.Import) and binding == "functools"
+                        and node.name == "functools" and node.asname is None
+                        and parent in tree.body):
+                    self._reject_protected_binding(node, binding)
+
+    def _reject_protected_binding(self, node: ast.AST, name: str) -> None:
+        if name == "getattr":
             self._violate(node, "builtin 'getattr' is shadowed in legacy owner")
-        if (
-            self.relative_path in LEGACY_MODULE_OWNERS
-            and name in {
-                "callable", "ImportError", "AttributeError",
-                "functools", "_pcp_insert_op",
-            }
-            and id(node) not in self._audited_legacy_nodes
-            and id(node) not in self._functools_imports
-        ):
+        else:
             self._violate(node, f"PCP fallback dependency {name!r} is rebound")
 
-    def _reject_builtin_namespace(self, node: ast.AST, name: str) -> None:
-        # Reject the namespace source, including when copied to another alias:
-        # checking only Name(Store) misses mapping writes and update/setattr.
-        # sys.modules exposes builtins too. Reject the sys namespace at its
-        # source (including imports and loader calls) so aliases or computed
-        # registry keys cannot bypass this guard. This restriction is scoped
-        # to legacy owners, which do not need sys for their audited fallback.
-        if self.relative_path in LEGACY_MODULE_OWNERS and name in {
-            "globals", "locals", "vars", "__builtins__", "builtins", "sys",
-            "functools",
-        } and id(node) not in self._functools_imports:
-            self._violate(node, "builtin namespace access in legacy owner")
-
-    def _reject_self_module_import(self, node: ast.AST, module: str) -> None:
-        # A parent package also exposes this module through its attributes.
-        # Reject the source before it can be copied or used to overwrite the
-        # audited resolver through a module attribute.
-        if self.relative_path in LEGACY_MODULE_OWNERS and (
-            module == self.module_name
-            or self.module_name.startswith(module + ".")
-        ):
-            self._violate(node, "self-module import in legacy owner")
-
-    def _check_dynamic_module_import(self, node: ast.Call, module: str) -> None:
-        if self.relative_path not in LEGACY_MODULE_OWNERS:
-            return
-        if module.startswith("."):
-            package = next(
-                (keyword.value for keyword in node.keywords
-                 if keyword.arg == "package"),
-                node.args[1] if len(node.args) > 1 else None,
-            )
-            if isinstance(package, ast.Constant) and isinstance(package.value, str):
-                package_name = package.value
-            elif isinstance(package, ast.Name) and package.id == "__package__":
-                package_name = self.module_name.rpartition(".")[0]
-            elif isinstance(package, ast.Name) and package.id == "__name__":
-                package_name = self.module_name
-            else:
-                self._violate(node, "unresolved relative dynamic import in legacy owner")
-                return
-            try:
-                module = resolve_name(module, package_name)
-            except (ImportError, ValueError):
-                self._violate(node, "unresolved relative dynamic import in legacy owner")
-                return
-        self._reject_self_module_import(node, module)
-
-    def _reject_reflective_namespace(self, node: ast.AST, name: str) -> None:
-        # Reject the source of the mutable mapping, not just writes to a
-        # particular key. Otherwise copying __globals__ to an alias bypasses
-        # binding checks. Literal names also cover getattr aliases and
-        # __getattribute__; frame mappings expose the same mutable state.
-        if self.relative_path in LEGACY_MODULE_OWNERS and name in {
-            "__globals__", "__builtins__", "func_globals",
-            "f_globals", "f_builtins", "f_locals",
-        }:
-            self._violate(node, "reflective namespace access in legacy owner")
-
-    def visit_Constant(self, node: ast.Constant) -> None:
-        if isinstance(node.value, str):
-            self._reject_reflective_namespace(node, node.value)
-
     def visit_FunctionDef(self, node: ast.FunctionDef) -> None:
-        self._reject_getattr_binding(node, node.name)
         saved_root_aliases = self.root_aliases.copy()
         saved_lmslim_root_aliases = self.lmslim_root_aliases.copy()
         saved_category_aliases = self.category_aliases.copy()
@@ -360,8 +292,6 @@ class _LightOpVisitor(ast.NodeVisitor):
             arguments.append(node.args.vararg)
         if node.args.kwarg is not None:
             arguments.append(node.args.kwarg)
-        for argument in arguments:
-            self._reject_getattr_binding(argument, argument.arg)
 
         # Decorators, defaults, and annotations are evaluated in the outer
         # scope, before parameter names shadow imported aliases in the body.
@@ -394,22 +324,7 @@ class _LightOpVisitor(ast.NodeVisitor):
 
     visit_AsyncFunctionDef = visit_FunctionDef
 
-    def visit_Lambda(self, node: ast.Lambda) -> None:
-        arguments = (
-            list(node.args.posonlyargs)
-            + list(node.args.args)
-            + list(node.args.kwonlyargs)
-        )
-        if node.args.vararg is not None:
-            arguments.append(node.args.vararg)
-        if node.args.kwarg is not None:
-            arguments.append(node.args.kwarg)
-        for argument in arguments:
-            self._reject_getattr_binding(argument, argument.arg)
-        self.generic_visit(node)
-
     def visit_ClassDef(self, node: ast.ClassDef) -> None:
-        self._reject_getattr_binding(node, node.name)
         saved_root_aliases = self.root_aliases.copy()
         saved_lmslim_root_aliases = self.lmslim_root_aliases.copy()
         saved_category_aliases = self.category_aliases.copy()
@@ -423,12 +338,6 @@ class _LightOpVisitor(ast.NodeVisitor):
     def visit_Import(self, node: ast.Import) -> None:
         for alias in node.names:
             module = alias.name
-            self._reject_self_module_import(node, module)
-            self._reject_builtin_namespace(node, module)
-            self._reject_getattr_binding(
-                node,
-                alias.asname or module.split(".", maxsplit=1)[0],
-            )
             if module == "lmslim" or module.startswith("lmslim."):
                 self.lmslim_root_aliases.add(
                     alias.asname or module.split(".", maxsplit=1)[0]
@@ -460,28 +369,7 @@ class _LightOpVisitor(ast.NodeVisitor):
 
     def visit_ImportFrom(self, node: ast.ImportFrom) -> None:
         module = node.module or ""
-        if self.relative_path in LEGACY_MODULE_OWNERS:
-            try:
-                imported = (
-                    resolve_name(
-                        "." * node.level + module,
-                        self.module_name.rpartition(".")[0],
-                    )
-                    if node.level else module
-                )
-            except (ImportError, ValueError):
-                self._violate(node, "unresolved relative import in legacy owner")
-            else:
-                if imported == self.module_name:
-                    self._reject_self_module_import(node, imported)
-                for alias in node.names:
-                    self._reject_self_module_import(
-                        node, f"{imported}.{alias.name}",
-                    )
-        self._reject_builtin_namespace(node, module)
         for alias in node.names:
-            self._reject_builtin_namespace(node, alias.name)
-            self._reject_getattr_binding(node, alias.asname or alias.name)
             if (
                 alias.name == "*"
                 and self.relative_path in LEGACY_MODULE_OWNERS
@@ -549,23 +437,8 @@ class _LightOpVisitor(ast.NodeVisitor):
         self.generic_visit(node)
 
     def visit_Attribute(self, node: ast.Attribute) -> None:
-        self._reject_reflective_namespace(node, node.attr)
         root, parts = _attribute_parts(node)
         if isinstance(root, ast.Name) and parts:
-            if (
-                self.relative_path in LEGACY_MODULE_OWNERS
-                and root.id in {"functools", "_pcp_insert_op"}
-            ):
-                if (
-                    root.id == "_pcp_insert_op"
-                    or not isinstance(node.ctx, ast.Load)
-                    or len(parts) != 1
-                    or parts[0] not in {"cache", "wraps"}
-                    or (parts[0] == "cache"
-                        and id(node) not in self._audited_legacy_nodes)
-                ):
-                    self._violate(node, "PCP fallback dependency attribute escape")
-                return
             if root.id in self.lmslim_root_aliases:
                 reference = ".".join((root.id, *parts))
                 self._violate(
@@ -606,16 +479,6 @@ class _LightOpVisitor(ast.NodeVisitor):
         self.generic_visit(node)
 
     def visit_Name(self, node: ast.Name) -> None:
-        self._reject_builtin_namespace(node, node.id)
-        if (
-            self.relative_path in LEGACY_MODULE_OWNERS
-            and node.id == "_pcp_insert_op"
-            and isinstance(node.ctx, ast.Load)
-            and id(node) not in self._pcp_calls
-        ):
-            self._violate(node, "bare PCP fallback function escape")
-        if isinstance(node.ctx, (ast.Store, ast.Del)):
-            self._reject_getattr_binding(node, node.id)
         if node.id in self.lmslim_root_aliases:
             self._violate(node, f"external LMSlim root {node.id!r}")
         if node.id in self.legacy_module_aliases:
@@ -624,61 +487,7 @@ class _LightOpVisitor(ast.NodeVisitor):
                 f"bare legacy LightOp module use {node.id!r}",
             )
 
-    def visit_ExceptHandler(self, node: ast.ExceptHandler) -> None:
-        if node.name is not None:
-            self._reject_getattr_binding(node, node.name)
-        self.generic_visit(node)
-
-    def visit_MatchAs(self, node: ast.MatchAs) -> None:
-        if node.name is not None:
-            self._reject_getattr_binding(node, node.name)
-        self.generic_visit(node)
-
-    def visit_MatchStar(self, node: ast.MatchStar) -> None:
-        if node.name is not None:
-            self._reject_getattr_binding(node, node.name)
-        self.generic_visit(node)
-
-    def visit_MatchMapping(self, node: ast.MatchMapping) -> None:
-        if node.rest is not None:
-            self._reject_getattr_binding(node, node.rest)
-        self.generic_visit(node)
-
     def visit_Call(self, node: ast.Call) -> None:
-        # A computed module name could resolve to the mutable builtin
-        # namespace. Require a literal in legacy owners instead of attempting
-        # to evaluate arbitrary expressions or track their runtime values.
-        if self._is_dynamic_loader(node.func):
-            # __import__ also accepts a separate relative level. Do not infer
-            # its globals/package mapping from arbitrary runtime expressions.
-            level = next(
-                (keyword.value for keyword in node.keywords
-                 if keyword.arg == "level"),
-                node.args[4] if len(node.args) > 4 else None,
-            )
-            if (
-                self.relative_path in LEGACY_MODULE_OWNERS
-                and level is not None
-                and not (isinstance(level, ast.Constant) and level.value == 0)
-            ):
-                self._violate(node, "relative dynamic loader level in legacy owner")
-            module_name = (
-                node.args[0]
-                if node.args
-                else next(
-                    (keyword.value for keyword in node.keywords
-                     if keyword.arg == "name"),
-                    None,
-                )
-            )
-            if (
-                isinstance(module_name, ast.Constant)
-                and isinstance(module_name.value, str)
-            ):
-                self._reject_builtin_namespace(node, module_name.value)
-                self._check_dynamic_module_import(node, module_name.value)
-            elif self.relative_path in LEGACY_MODULE_OWNERS:
-                self._violate(node, "nonliteral dynamic import in legacy owner")
         direct_lmslim_call: str | None = None
         if isinstance(node.func, ast.Name):
             if node.func.id in self.lmslim_root_aliases:
@@ -821,136 +630,37 @@ def _resolver_body(resolver: ast.FunctionDef) -> list[ast.stmt]:
     return body
 
 
-def _has_exact_name_argument(resolver: ast.FunctionDef) -> bool:
-    arguments = resolver.args
-    return (
-        not arguments.posonlyargs
-        and len(arguments.args) == 1
-        and arguments.args[0].arg == "name"
-        and arguments.vararg is None
-        and not arguments.kwonlyargs
-        and arguments.kwarg is None
-        and not arguments.defaults
-        and not arguments.kw_defaults
-    )
-
-
-def _has_exact_lru_cache_decorator(resolver: ast.FunctionDef) -> bool:
-    if len(resolver.decorator_list) != 1:
+def _resolver_matches(tree: ast.Module, name: str, body: str) -> bool:
+    resolver = _resolver(tree, name)
+    if resolver is None:
         return False
-    decorator = resolver.decorator_list[0]
-    return (
-        isinstance(decorator, ast.Call)
-        and isinstance(decorator.func, ast.Attribute)
-        and isinstance(decorator.func.value, ast.Name)
-        and decorator.func.value.id == "functools"
-        and decorator.func.attr == "lru_cache"
-        and not decorator.args
-        and len(decorator.keywords) == 1
-        and decorator.keywords[0].arg == "maxsize"
-        and isinstance(decorator.keywords[0].value, ast.Constant)
-        and decorator.keywords[0].value.value is None
-    )
-
-
-def _is_exact_getattr_return(
-    node: ast.stmt,
-    *,
-    owner: str,
-) -> bool:
-    if not isinstance(node, ast.Return) or not isinstance(node.value, ast.Call):
-        return False
-    call = node.value
-    return (
-        isinstance(call.func, ast.Name)
-        and call.func.id == "getattr"
-        and len(call.args) == 2
-        and not call.keywords
-        and isinstance(call.args[0], ast.Name)
-        and call.args[0].id == owner
-        and isinstance(call.args[1], ast.Name)
-        and call.args[1].id == "name"
-    )
+    resolver = copy.deepcopy(resolver)
+    resolver.body = _resolver_body(resolver)
+    # Type annotations do not change these import/dispatch boundaries.
+    for argument in resolver.args.args:
+        argument.annotation = None
+    resolver.returns = None
+    expected = ast.parse(
+        f"@functools.lru_cache(maxsize=None)\ndef {name}(name):\n" + body
+    ).body[0]
+    return ast.dump(resolver) == ast.dump(expected)
 
 
 def _clamp_resolver_is_exact(tree: ast.Module) -> bool:
-    expected = {symbol for _, symbol in ALLOWED_TOP_LEVEL}
-    resolver = _resolver(tree, "_lightop_clamp")
-    if (
-        resolver is None
-        or not _has_exact_name_argument(resolver)
-        or not _has_exact_lru_cache_decorator(resolver)
-    ):
-        return False
-    body = _resolver_body(resolver)
-    if len(body) != 3:
-        return False
-    guard, import_node, return_node = body
-    if not (
-        isinstance(guard, ast.If)
-        and not guard.orelse
-        and isinstance(guard.test, ast.Compare)
-        and isinstance(guard.test.left, ast.Name)
-        and guard.test.left.id == "name"
-        and len(guard.test.ops) == 1
-        and isinstance(guard.test.ops[0], ast.NotIn)
-        and len(guard.test.comparators) == 1
-        and isinstance(guard.test.comparators[0], ast.Set)
-    ):
-        return False
-    elements = guard.test.comparators[0].elts
-    values = {
-        element.value
-        for element in elements
-        if isinstance(element, ast.Constant) and isinstance(element.value, str)
-    }
-    if values != expected or len(elements) != len(expected):
-        return False
-    if len(guard.body) != 1 or not isinstance(guard.body[0], ast.Raise):
-        return False
-    raised = guard.body[0]
-    if not (
-        isinstance(raised.exc, ast.Call)
-        and isinstance(raised.exc.func, ast.Name)
-        and raised.exc.func.id == "AttributeError"
-        and len(raised.exc.args) == 1
-        and not raised.exc.keywords
-        and isinstance(raised.exc.args[0], ast.Name)
-        and raised.exc.args[0].id == "name"
-        and raised.cause is None
-    ):
-        return False
-    if not (
-        isinstance(import_node, ast.Import)
-        and len(import_node.names) == 1
-        and import_node.names[0].name == "lightop"
-        and import_node.names[0].asname is None
-    ):
-        return False
-    return _is_exact_getattr_return(return_node, owner="lightop")
+    return _resolver_matches(tree, "_lightop_clamp", (
+        '    if name not in {"fuse_silu_mul_clamp_quant", '
+        '"fuse_silu_mul_clamp_quant_ep"}:\n'
+        '        raise AttributeError(name)\n'
+        '    import lightop\n'
+        '    return getattr(lightop, name)\n'
+    ))
 
 
 def _activation_resolver_is_exact(tree: ast.Module) -> bool:
-    resolver = _resolver(tree, "_lightop_activation")
-    if (
-        resolver is None
-        or not _has_exact_name_argument(resolver)
-        or not _has_exact_lru_cache_decorator(resolver)
-    ):
-        return False
-    body = _resolver_body(resolver)
-    if len(body) != 2:
-        return False
-    import_node, return_node = body
-    return (
-        isinstance(import_node, ast.ImportFrom)
-        and import_node.module == "lightop"
-        and import_node.level == 0
-        and len(import_node.names) == 1
-        and import_node.names[0].name == "activation"
-        and import_node.names[0].asname is None
-        and _is_exact_getattr_return(return_node, owner="activation")
-    )
+    return _resolver_matches(tree, "_lightop_activation", (
+        '    from lightop import activation\n'
+        '    return getattr(activation, name)\n'
+    ))
 
 
 def _scan(root: Path) -> tuple[list[str], set[tuple[str, str]]]:
@@ -1183,216 +893,60 @@ def test_scanner_rejects_relative_legacy_imports(
 
 
 @pytest.mark.parametrize(
-    "mutation",
+    "source",
     [
-        'globals()["getattr"] = replacement',
-        'namespace = globals(); namespace["getattr"] = replacement',
-        'locals().update(getattr=replacement)',
-        'vars().update(getattr=replacement)',
-        '__builtins__["getattr"] = replacement',
-        'import builtins as bi; bi.getattr = replacement',
-        'from builtins import __dict__ as ns; ns["getattr"] = replacement',
-        'import importlib; importlib.import_module("builtins").getattr = replacement',
-        '__import__("builtins").getattr = replacement',
-        'import importlib; importlib.import_module(name="builtins").getattr = replacement',
-        '__import__(name="builtins").getattr = replacement',
-    ],
-)
-def test_scanner_rejects_indirect_getattr_rebinding(
-    tmp_path: Path,
-    mutation: str,
-) -> None:
-    root = _write_mutation_owner(tmp_path)
-    relative_path, _, _ = next(iter(LEGACY_TOP_LEVEL_MODULE_IMPORTS))
-    owner = tmp_path / relative_path
-    with owner.open("a", encoding="utf-8") as stream:
-        stream.write(
-            "\nreplacement = lambda owner, _name, *default: owner.any_private_kernel\n"
-            f"{mutation}\n"
-            "getattr(legacy_native, "
-            "'fused_deepseek_v4_qnorm_rope_kv_rope_quant_insert_pcp', None)\n"
-        )
-
-    violations = scan_lightop_imports(root)
-
-    assert any(
-        "builtin namespace access in legacy owner" in item
-        for item in violations
-    )
-
-
-@pytest.mark.parametrize(
-    "import_call",
-    [
-        "importlib.import_module(module_name)",
-        "__import__(module_name)",
-        "importlib.import_module(name=module_name)",
-        "__import__(name=module_name)",
-        "importlib.import_module(*[module_name])",
-        "__import__(**{'name': module_name})",
-        "importlib.import_module(f'{module_name}')",
-        "import_module(module_name)",
-    ],
-)
-def test_scanner_rejects_nonliteral_imports_in_legacy_owner(
-    tmp_path: Path,
-    import_call: str,
-) -> None:
-    root = _write_mutation_owner(tmp_path)
-    relative_path, _, _ = next(iter(LEGACY_TOP_LEVEL_MODULE_IMPORTS))
-    owner = tmp_path / relative_path
-    with owner.open("a", encoding="utf-8") as stream:
-        stream.write(
-            "\nimport importlib\n"
-            "from importlib import import_module\n"
-            "module_name = 'builtins'\n"
-            "replacement = lambda owner, _name, *default: owner.any_private_kernel\n"
-            f"{import_call}.getattr = replacement\n"
-            "getattr(legacy_native, "
-            "'fused_deepseek_v4_qnorm_rope_kv_rope_quant_insert_pcp', None)\n"
-        )
-
-    violations = scan_lightop_imports(root)
-
-    assert any(
-        "nonliteral dynamic import in legacy owner" in item
-        for item in violations
-    )
-
-
-@pytest.mark.parametrize(
-    "import_call",
-    [
-        "importlib.import_module('math')",
-        "importlib.import_module(name='math')",
-        "__import__('math')",
-        "__import__(name='math')",
-    ],
-)
-def test_scanner_accepts_literal_safe_imports_in_legacy_owner(
-    tmp_path: Path,
-    import_call: str,
-) -> None:
-    root = _write_mutation_owner(tmp_path)
-    relative_path, _, _ = next(iter(LEGACY_TOP_LEVEL_MODULE_IMPORTS))
-    owner = tmp_path / relative_path
-    with owner.open("a", encoding="utf-8") as stream:
-        stream.write(f"\nimport importlib\n{import_call}\n")
-
-    assert scan_lightop_imports(root) == []
-
-
-@pytest.mark.parametrize(
-    "binding",
-    [
-        "from importlib import import_module as load",
-        "import importlib as il; load = il.import_module",
-        "load = __import__",
-        "from importlib import import_module; load = import_module",
-        "from importlib import import_module as first; load = first",
-        "import importlib; first = importlib.import_module; load = first",
-        "import importlib; first = second = importlib.import_module; load = second",
-        "import importlib; load: object = importlib.import_module",
-        "import importlib; (load := importlib.import_module)",
-        "import importlib; load, other = importlib.import_module, None",
-    ],
-)
-@pytest.mark.parametrize("module_arg", ["module_name", "'builtins'"])
-def test_scanner_rejects_dynamic_loader_aliases(
-    tmp_path: Path,
-    binding: str,
-    module_arg: str,
-) -> None:
-    root = _write_mutation_owner(tmp_path)
-    relative_path, _, _ = next(iter(LEGACY_TOP_LEVEL_MODULE_IMPORTS))
-    owner = tmp_path / relative_path
-    with owner.open("a", encoding="utf-8") as stream:
-        # The helper precedes its global binding to exercise runtime lookup.
-        stream.write(
-            "\ndef forbidden():\n"
-            f"    load({module_arg}).getattr = replacement\n"
-            "    return getattr(legacy_native, "
-            "'fused_deepseek_v4_qnorm_rope_kv_rope_quant_insert_pcp', None)\n"
-            "module_name = 'builtins'\n"
-            "replacement = lambda owner, _name, *default: owner.any_private_kernel\n"
-            f"{binding}\n"
-            "forbidden()\n"
-        )
-
-    violations = scan_lightop_imports(root)
-
-    assert any(
-        "nonliteral dynamic import in legacy owner" in item
-        or "builtin namespace access in legacy owner" in item
-        for item in violations
-    )
-
-
-@pytest.mark.parametrize(
-    "binding",
-    [
-        "from importlib import import_module as load",
-        "import importlib; first = importlib.import_module; load = first",
-        "load = __import__",
-    ],
-)
-def test_scanner_accepts_safe_literal_loader_aliases(
-    tmp_path: Path,
-    binding: str,
-) -> None:
-    root = _write_mutation_owner(tmp_path)
-    relative_path, _, _ = next(iter(LEGACY_TOP_LEVEL_MODULE_IMPORTS))
-    owner = tmp_path / relative_path
-    with owner.open("a", encoding="utf-8") as stream:
-        stream.write(f"\n{binding}\nload('math')\n")
-
-    assert scan_lightop_imports(root) == []
-
-
-@pytest.mark.parametrize(
-    "mutation",
-    [
-        'sys.modules["builtins"].getattr = replacement',
+        "legacy_native.any_private_kernel()",
+        "alias = legacy_native",
+        "consume(legacy_native)",
+        "legacy_native.fused_deepseek_v4_qnorm_rope_kv_rope_quant_insert_pcp",
+        "legacy_native.fused_deepseek_v4_qnorm_rope_kv_rope_quant_insert_pcp = None",
+        "getattr(legacy_native, 'fused_deepseek_v4_qnorm_rope_kv_rope_quant_insert_pcp', None)",
+        "def helper(legacy_native=legacy_native):\n    pass",
+        "def getattr(*args):\n    pass",
+        "from helpers import resolve as getattr",
+        "from helpers import *",
+        "globals()['getattr'] = replacement",
+        "import builtins as bi; bi.getattr = replacement",
         'import sys; sys.modules["builtins"].getattr = replacement',
-        'import sys as runtime; runtime.modules["builtins"].getattr = replacement',
-        'from sys import modules as registry; registry["builtins"].getattr = replacement',
-        'import sys; registry = sys.modules; registry["builtins"].getattr = replacement',
-        'import sys; getattr(sys, "modules")["builtins"].getattr = replacement',
-        'import sys; sys.modules["builtins"].__dict__["getattr"] = replacement',
-        'import importlib; importlib.import_module("sys").modules["builtins"].getattr = replacement',
-        '__import__("sys").modules["builtins"].getattr = replacement',
-        'from importlib import import_module as load; load("sys").modules["builtins"].getattr = replacement',
+        '_can_use_local_queries.__globals__["_pcp_insert_op"] = replacement',
+        'lookup = getattr; lookup(helper, "__globals__")["_pcp_insert_op"] = replacement',
+        "import importlib; importlib.import_module(module_name)",
+        "from importlib import import_module as load; load(module_name)",
+        "load = __import__; load(module_name)",
+        'getattr(importlib, "import_module")(module_name)',
+        'lookup = getattr; load = lookup(importlib, "import_module"); load(module_name)',
+        'importlib.import_module("vllm_hcu.patch.worker.core_fix.patch_deepseek_v4_pcp")',
+        "import vllm_hcu.patch.worker.core_fix.patch_deepseek_v4_pcp as owner",
+        "from . import patch_deepseek_v4_pcp as owner",
+        "owner._pcp_insert_op = replacement",
+        "functools.cache = replacement",
+        "cache = functools.cache",
+        "_pcp_insert_op = replacement",
+        "_pcp_insert_op.__wrapped__ = replacement",
+        "function = _pcp_insert_op",
+        "callable = replacement",
     ],
 )
-def test_scanner_rejects_sys_module_registry_in_legacy_owner(
-    tmp_path: Path,
-    mutation: str,
+def test_legacy_owner_rejects_review_regressions(
+    tmp_path: Path, source: str,
 ) -> None:
     root = _write_mutation_owner(tmp_path)
     relative_path, _, _ = next(iter(LEGACY_TOP_LEVEL_MODULE_IMPORTS))
-    owner = tmp_path / relative_path
-    with owner.open("a", encoding="utf-8") as stream:
-        stream.write(
-            "\nreplacement = lambda owner, _name, *default: owner.any_private_kernel\n"
-            f"{mutation}\n"
-            "getattr(legacy_native, "
-            "'fused_deepseek_v4_qnorm_rope_kv_rope_quant_insert_pcp', None)\n"
-        )
+    with (tmp_path / relative_path).open("a", encoding="utf-8") as stream:
+        stream.write(f"\n{source}\n")
 
-    violations = scan_lightop_imports(root)
-
-    assert any(
-        "builtin namespace access in legacy owner" in item
-        for item in violations
-    )
+    assert scan_lightop_imports(root)
 
 
-def test_scanner_allows_sys_outside_legacy_owner(tmp_path: Path) -> None:
+@pytest.mark.parametrize("source", [
+    "from ._common import require_callable",
+    'import importlib\nimportlib.import_module("vllm.models.deepseek_v4.attention")',
+])
+def test_legacy_owner_allows_reviewed_imports(tmp_path: Path, source: str) -> None:
     root = _write_mutation_owner(tmp_path)
-    (root / "ordinary.py").write_text(
-        "import sys\nmodules = sys.modules\n",
-        encoding="utf-8",
-    )
+    relative_path, _, _ = next(iter(LEGACY_TOP_LEVEL_MODULE_IMPORTS))
+    with (tmp_path / relative_path).open("a", encoding="utf-8") as stream:
+        stream.write(f"\n{source}\n")
 
     assert scan_lightop_imports(root) == []
 
@@ -1429,39 +983,6 @@ def test_scanner_rejects_changed_pcp_resolver(
     )
 
 
-@pytest.mark.parametrize(
-    "mutation",
-    [
-        "callable = replacement",
-        "ImportError = Exception",
-        "AttributeError = Exception",
-        "_pcp_insert_op = replacement",
-        "del _pcp_insert_op",
-        "from helpers import replacement as _pcp_insert_op",
-        "functools = replacement",
-        "functools.cache = replacement",
-        "cache = functools.cache",
-        "module = functools",
-        "functools.__dict__['cache'] = replacement",
-        "_pcp_insert_op.__wrapped__ = replacement",
-        "target = _pcp_insert_op",
-        "def other(_pcp_insert_op):\n    pass",
-        "import importlib; importlib.import_module('functools').cache = replacement",
-    ],
-)
-def test_scanner_rejects_pcp_fallback_dependency_mutation(
-    tmp_path: Path,
-    mutation: str,
-) -> None:
-    root = _write_mutation_owner(tmp_path)
-    relative_path, _, _ = next(iter(LEGACY_TOP_LEVEL_MODULE_IMPORTS))
-    owner = tmp_path / relative_path
-    with owner.open("a", encoding="utf-8") as stream:
-        stream.write(f"\n{mutation}\n")
-
-    assert scan_lightop_imports(root)
-
-
 def test_scanner_allows_pcp_resolver_comments(tmp_path: Path) -> None:
     root = _write_mutation_owner(tmp_path)
     relative_path, _, _ = next(iter(LEGACY_TOP_LEVEL_MODULE_IMPORTS))
@@ -1475,217 +996,6 @@ def test_scanner_allows_pcp_resolver_comments(tmp_path: Path) -> None:
     )
 
     assert scan_lightop_imports(root) == []
-
-
-@pytest.mark.parametrize(
-    "mutation",
-    [
-        '_can_use_local_queries.__globals__["_pcp_insert_op"] = replacement',
-        'namespace = _can_use_local_queries.__globals__; namespace["_pcp_insert_op"] = replacement',
-        'function = _can_use_local_queries; function.__globals__.update(_pcp_insert_op=replacement)',
-        'del _can_use_local_queries.__globals__["_pcp_insert_op"]',
-        'getattr(_can_use_local_queries, "__globals__")["_pcp_insert_op"] = replacement',
-        'lookup = getattr; lookup(_can_use_local_queries, "__globals__")["_pcp_insert_op"] = replacement',
-        'attribute = "__globals__"; getattr(_can_use_local_queries, attribute)["_pcp_insert_op"] = replacement',
-        'object.__getattribute__(_can_use_local_queries, "__globals__")["_pcp_insert_op"] = replacement',
-        'get_function().__globals__["_pcp_insert_op"] = replacement',
-        'if enabled:\n    _can_use_local_queries.__globals__["_pcp_insert_op"] = replacement',
-        '_can_use_local_queries.__builtins__["callable"] = replacement',
-        'frame.f_globals["_pcp_insert_op"] = replacement',
-        'frame.f_builtins["callable"] = replacement',
-        'frame.f_locals["_pcp_insert_op"] = replacement',
-    ],
-)
-def test_scanner_rejects_reflective_namespace_escape(
-    tmp_path: Path,
-    mutation: str,
-) -> None:
-    root = _write_mutation_owner(tmp_path)
-    relative_path, _, _ = next(iter(LEGACY_TOP_LEVEL_MODULE_IMPORTS))
-    owner = tmp_path / relative_path
-    with owner.open("a", encoding="utf-8") as stream:
-        stream.write(
-            "\ndef _can_use_local_queries():\n    return True\n"
-            "replacement = lambda: None\n"
-            f"{mutation}\n"
-        )
-
-    assert any(
-        "reflective namespace access in legacy owner" in item
-        for item in scan_lightop_imports(root)
-    )
-
-
-def test_scanner_allows_reflection_outside_legacy_owner(tmp_path: Path) -> None:
-    root = _write_mutation_owner(tmp_path)
-    (root / "ordinary_reflection.py").write_text(
-        "namespace = function.__globals__\n", encoding="utf-8",
-    )
-
-    assert scan_lightop_imports(root) == []
-
-
-@pytest.mark.parametrize(
-    "mutation",
-    [
-        'import importlib; importlib.import_module("vllm_hcu.patch.worker.core_fix.patch_deepseek_v4_pcp")._pcp_insert_op = replacement',
-        'from importlib import import_module as load; load("vllm_hcu.patch.worker.core_fix.patch_deepseek_v4_pcp")._pcp_insert_op = replacement',
-        'import importlib; owner = importlib.import_module(name="vllm_hcu.patch.worker.core_fix.patch_deepseek_v4_pcp"); owner._pcp_insert_op = replacement',
-        '__import__("vllm_hcu.patch.worker.core_fix.patch_deepseek_v4_pcp", fromlist=["_pcp_insert_op"])._pcp_insert_op = replacement',
-        'import importlib; importlib.import_module(".patch_deepseek_v4_pcp", __package__)._pcp_insert_op = replacement',
-        'import importlib; importlib.import_module(".patch_deepseek_v4_pcp", package="vllm_hcu.patch.worker.core_fix")._pcp_insert_op = replacement',
-        'import importlib; importlib.import_module("vllm_hcu.patch.worker.core_fix").patch_deepseek_v4_pcp._pcp_insert_op = replacement',
-        'import vllm_hcu.patch.worker.core_fix.patch_deepseek_v4_pcp as owner; owner._pcp_insert_op = replacement',
-        'from vllm_hcu.patch.worker.core_fix import patch_deepseek_v4_pcp as owner; owner._pcp_insert_op = replacement',
-        'from . import patch_deepseek_v4_pcp as owner; owner._pcp_insert_op = replacement',
-        'from ..core_fix import patch_deepseek_v4_pcp as owner; owner._pcp_insert_op = replacement',
-        'import vllm_hcu as package; package.patch.worker.core_fix.patch_deepseek_v4_pcp._pcp_insert_op = replacement',
-    ],
-)
-def test_scanner_rejects_self_module_imports(
-    tmp_path: Path,
-    mutation: str,
-) -> None:
-    root = _write_mutation_owner(tmp_path)
-    relative_path, _, _ = next(iter(LEGACY_TOP_LEVEL_MODULE_IMPORTS))
-    owner = tmp_path / relative_path
-    with owner.open("a", encoding="utf-8") as stream:
-        stream.write(f"\nreplacement = lambda: None\n{mutation}\n")
-
-    assert any(
-        "self-module import in legacy owner" in item
-        for item in scan_lightop_imports(root)
-    )
-
-
-@pytest.mark.parametrize(
-    "statement",
-    [
-        "from . import _common",
-        "from ._common import require_callable",
-        'import importlib; importlib.import_module("._common", __package__)',
-    ],
-)
-def test_scanner_allows_sibling_imports_in_legacy_owner(
-    tmp_path: Path,
-    statement: str,
-) -> None:
-    root = _write_mutation_owner(tmp_path)
-    relative_path, _, _ = next(iter(LEGACY_TOP_LEVEL_MODULE_IMPORTS))
-    with (tmp_path / relative_path).open("a", encoding="utf-8") as stream:
-        stream.write(f"\n{statement}\n")
-
-    assert scan_lightop_imports(root) == []
-
-
-@pytest.mark.parametrize(
-    ("binding", "loader"),
-    [
-        ("", 'getattr(importlib, "import_module")'),
-        ("", 'getattr(importlib, "import_module", None)'),
-        ('load = getattr(importlib, "import_module")', "load"),
-        ('first = getattr(importlib, "import_module"); load = first', "load"),
-        ('lookup = getattr', 'lookup(importlib, "import_module")'),
-        ('lookup = getattr; load = lookup(importlib, "import_module")', "load"),
-        ("", 'importlib.__getattribute__("import_module")'),
-        ("", 'object.__getattribute__(importlib, "import_module")'),
-        ('lookup = importlib.__getattribute__', 'lookup("import_module")'),
-        ("", 'getattr(importlib, "__getattribute__")("import_module")'),
-    ],
-)
-@pytest.mark.parametrize(
-    "module_arg",
-    [
-        '"vllm_hcu.patch.worker.core_fix.patch_deepseek_v4_pcp"',
-        "module_name",
-    ],
-)
-def test_scanner_rejects_reflected_loader_self_import(
-    tmp_path: Path,
-    binding: str,
-    loader: str,
-    module_arg: str,
-) -> None:
-    root = _write_mutation_owner(tmp_path)
-    relative_path, _, _ = next(iter(LEGACY_TOP_LEVEL_MODULE_IMPORTS))
-    with (tmp_path / relative_path).open("a", encoding="utf-8") as stream:
-        stream.write(
-            "\nimport importlib\n"
-            'module_name = "vllm_hcu.patch.worker.core_fix.patch_deepseek_v4_pcp"\n'
-            f"{binding}\n"
-            f"{loader}({module_arg})._pcp_insert_op = lambda: None\n"
-        )
-
-    assert any(
-        "self-module import in legacy owner" in item
-        or "nonliteral dynamic import in legacy owner" in item
-        for item in scan_lightop_imports(root)
-    )
-
-
-def test_scanner_allows_safe_reflected_loader(tmp_path: Path) -> None:
-    root = _write_mutation_owner(tmp_path)
-    relative_path, _, _ = next(iter(LEGACY_TOP_LEVEL_MODULE_IMPORTS))
-    with (tmp_path / relative_path).open("a", encoding="utf-8") as stream:
-        stream.write(
-            '\nimport importlib\n'
-            'load = getattr(importlib, "import_module")\n'
-            'load("math")\n'
-        )
-
-    assert scan_lightop_imports(root) == []
-
-
-@pytest.mark.parametrize(
-    "expression",
-    [
-        'importlib.import_module(".patch_deepseek_v4_pcp", package_name)',
-        'importlib.import_module(".patch_deepseek_v4_pcp")',
-        'importlib.import_module("....patch_deepseek_v4_pcp", "short")',
-        '__import__("patch_deepseek_v4_pcp", {}, {}, ["_pcp_insert_op"], 1)',
-        '__import__("patch_deepseek_v4_pcp", level=relative_level)',
-    ],
-)
-def test_scanner_rejects_unresolved_relative_dynamic_imports(
-    tmp_path: Path,
-    expression: str,
-) -> None:
-    root = _write_mutation_owner(tmp_path)
-    relative_path, _, _ = next(iter(LEGACY_TOP_LEVEL_MODULE_IMPORTS))
-    with (tmp_path / relative_path).open("a", encoding="utf-8") as stream:
-        stream.write(
-            "\nimport importlib\n"
-            f"{expression}._pcp_insert_op = lambda: None\n"
-        )
-
-    assert any(
-        "relative dynamic" in item
-        for item in scan_lightop_imports(root)
-    )
-
-
-@pytest.mark.parametrize(
-    "expression",
-    [
-        "legacy_native.fused_deepseek_v4_qnorm_rope_kv_rope_quant_insert_pcp",
-        "getattr(legacy_native, "
-        "'fused_deepseek_v4_qnorm_rope_kv_rope_quant_insert_pcp', None)",
-    ],
-)
-def test_scanner_rejects_approved_symbol_outside_pcp_resolver(
-    tmp_path: Path,
-    expression: str,
-) -> None:
-    root = _write_mutation_owner(tmp_path)
-    relative_path, _, _ = next(iter(LEGACY_TOP_LEVEL_MODULE_IMPORTS))
-    owner = tmp_path / relative_path
-    with owner.open("a", encoding="utf-8") as stream:
-        stream.write(f"\ndef outside():\n    return {expression}\n")
-
-    assert any(
-        "unapproved legacy LightOp module attribute" in item
-        for item in scan_lightop_imports(root)
-    )
 
 
 @pytest.mark.parametrize("module", ["lightop", "lightop.attention"])
@@ -1719,83 +1029,6 @@ def test_scanner_checks_function_type_parameter_bounds(tmp_path: Path) -> None:
         "unapproved legacy LightOp module attribute" in item
         for item in scan_lightop_imports(root)
     )
-
-
-@pytest.mark.parametrize(
-    "expression",
-    [
-        "legacy_native.any_private_kernel()",
-        "getattr(legacy_native, name)",
-        "legacy_native.nested.any_private_kernel()",
-    ],
-)
-def test_scanner_restricts_legacy_module_alias(
-    tmp_path: Path,
-    expression: str,
-) -> None:
-    root = _write_mutation_owner(tmp_path)
-    relative_path, _, _ = next(iter(LEGACY_TOP_LEVEL_MODULE_IMPORTS))
-    owner = tmp_path / relative_path
-    with owner.open("a", encoding="utf-8") as stream:
-        stream.write(f"\ndef forbidden(name='dynamic'):\n    return {expression}\n")
-
-    violations = scan_lightop_imports(root)
-
-    assert any(
-        "unapproved legacy LightOp module" in item
-        for item in violations
-    )
-
-
-@pytest.mark.parametrize(
-    "source",
-    [
-        "alias = legacy_native\nalias.any_private_kernel()",
-        "consume(legacy_native)",
-        "return legacy_native",
-    ],
-    ids=["copied", "passed", "returned"],
-)
-def test_scanner_rejects_bare_legacy_module_uses(
-    tmp_path: Path,
-    source: str,
-) -> None:
-    root = _write_mutation_owner(tmp_path)
-    relative_path, _, _ = next(iter(LEGACY_TOP_LEVEL_MODULE_IMPORTS))
-    owner = tmp_path / relative_path
-    indented = "\n".join(f"    {line}" for line in source.splitlines())
-    with owner.open("a", encoding="utf-8") as stream:
-        stream.write(f"\ndef forbidden():\n{indented}\n")
-
-    violations = scan_lightop_imports(root)
-
-    assert any("bare legacy LightOp module use" in item for item in violations)
-
-
-@pytest.mark.parametrize(
-    "source",
-    [
-        "@legacy_native.any_private_kernel\n"
-        "def forbidden(legacy_native):\n"
-        "    pass\n",
-        "def forbidden(legacy_native=legacy_native):\n"
-        "    legacy_native.any_private_kernel()\n",
-    ],
-    ids=["decorator", "default"],
-)
-def test_scanner_checks_function_outer_scope_before_parameter_shadowing(
-    tmp_path: Path,
-    source: str,
-) -> None:
-    root = _write_mutation_owner(tmp_path)
-    relative_path, _, _ = next(iter(LEGACY_TOP_LEVEL_MODULE_IMPORTS))
-    owner = tmp_path / relative_path
-    with owner.open("a", encoding="utf-8") as stream:
-        stream.write(f"\n{source}")
-
-    violations = scan_lightop_imports(root)
-
-    assert any("legacy LightOp module" in item for item in violations)
 
 
 @pytest.mark.parametrize("definition", ["def", "async def"])
@@ -1846,99 +1079,6 @@ def test_scanner_rejects_forbidden_function_decorators(
 
     assert any(
         item.startswith(f"{relative_path}:{decorator_line}: {detail}")
-        for item in violations
-    )
-
-
-@pytest.mark.parametrize(
-    "binding",
-    [
-        "def getattr(*args):\n    return None",
-        "from helpers import resolve as getattr",
-        "def forbidden(getattr):\n"
-        "    return getattr(legacy_native, "
-        "'fused_deepseek_v4_qnorm_rope_kv_rope_quant_insert_pcp')",
-    ],
-    ids=["defined", "imported", "parameter"],
-)
-def test_scanner_rejects_shadowed_getattr_in_legacy_owner(
-    tmp_path: Path,
-    binding: str,
-) -> None:
-    root = _write_mutation_owner(tmp_path)
-    relative_path, _, _ = next(iter(LEGACY_TOP_LEVEL_MODULE_IMPORTS))
-    owner = tmp_path / relative_path
-    with owner.open("a", encoding="utf-8") as stream:
-        stream.write(f"\n{binding}\n")
-
-    violations = scan_lightop_imports(root)
-
-    assert any("builtin 'getattr' is shadowed" in item for item in violations)
-
-
-def test_scanner_rejects_wildcard_import_in_legacy_owner(
-    tmp_path: Path,
-) -> None:
-    root = _write_mutation_owner(tmp_path)
-    relative_path, _, _ = next(iter(LEGACY_TOP_LEVEL_MODULE_IMPORTS))
-    owner = tmp_path / relative_path
-    with owner.open("a", encoding="utf-8") as stream:
-        stream.write("\nfrom helpers import *\n")
-
-    violations = scan_lightop_imports(root)
-
-    assert any(
-        "wildcard import can shadow builtins" in item for item in violations
-    )
-
-
-@pytest.mark.parametrize(
-    "statement",
-    [
-        "legacy_native."
-        "fused_deepseek_v4_qnorm_rope_kv_rope_quant_insert_pcp = None",
-        "del legacy_native."
-        "fused_deepseek_v4_qnorm_rope_kv_rope_quant_insert_pcp",
-    ],
-    ids=["store", "delete"],
-)
-def test_scanner_rejects_legacy_member_mutation(
-    tmp_path: Path,
-    statement: str,
-) -> None:
-    root = _write_mutation_owner(tmp_path)
-    relative_path, _, _ = next(iter(LEGACY_TOP_LEVEL_MODULE_IMPORTS))
-    owner = tmp_path / relative_path
-    with owner.open("a", encoding="utf-8") as stream:
-        stream.write(f"\n{statement}\n")
-
-    violations = scan_lightop_imports(root)
-
-    assert any(
-        "unapproved legacy LightOp module attribute" in item
-        for item in violations
-    )
-
-
-def test_scanner_preloads_legacy_alias_before_import(
-    tmp_path: Path,
-) -> None:
-    root = _write_mutation_owner(tmp_path)
-    relative_path, _, _ = next(iter(LEGACY_TOP_LEVEL_MODULE_IMPORTS))
-    owner = tmp_path / relative_path
-    original = owner.read_text(encoding="utf-8")
-    owner.write_text(
-        "def forbidden_before_import():\n"
-        "    return legacy_native.any_private_kernel()\n"
-        f"{original}"
-        "forbidden_before_import()\n",
-        encoding="utf-8",
-    )
-
-    violations = scan_lightop_imports(root)
-
-    assert any(
-        "unapproved legacy LightOp module attribute" in item
         for item in violations
     )
 
