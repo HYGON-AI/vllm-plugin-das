@@ -138,6 +138,7 @@ class _LightOpVisitor(ast.NodeVisitor):
         self._violation_keys: set[tuple[int, str]] = set()
         self._functions: list[str] = []
         self.dynamic_loader_aliases: set[str] = {"__import__", "import_module"}
+        self.attribute_lookup_aliases: set[str] = {"getattr"}
         self._audited_legacy_nodes: set[int] = set()
         self._functools_imports: set[int] = set()
         self._pcp_calls: set[int] = set()
@@ -149,6 +150,31 @@ class _LightOpVisitor(ast.NodeVisitor):
             self._violation_keys.add(key)
             self.violations.append(f"{self.relative_path}:{line}: {detail}")
 
+    def _is_attribute_lookup(self, node: ast.AST) -> bool:
+        return (
+            isinstance(node, ast.Name)
+            and node.id in self.attribute_lookup_aliases
+        ) or (
+            isinstance(node, ast.Attribute)
+            and node.attr in {"getattr", "__getattribute__"}
+        ) or (
+            isinstance(node, ast.Call)
+            and self._reflected_attribute(node) in {"getattr", "__getattribute__"}
+        )
+
+    def _reflected_attribute(self, node: ast.AST) -> str | None:
+        if not isinstance(node, ast.Call) or not self._is_attribute_lookup(node.func):
+            return None
+        # getattr / unbound __getattribute__ take (owner, name); a bound
+        # __getattribute__ takes only (name). Optional getattr defaults do not
+        # change which argument names the attribute.
+        if not node.args:
+            return None
+        name = node.args[0] if len(node.args) == 1 else node.args[1]
+        return name.value if (
+            isinstance(name, ast.Constant) and isinstance(name.value, str)
+        ) else None
+
     def _is_dynamic_loader(self, node: ast.AST) -> bool:
         return (
             isinstance(node, ast.Name)
@@ -156,13 +182,19 @@ class _LightOpVisitor(ast.NodeVisitor):
         ) or (
             isinstance(node, ast.Attribute)
             and node.attr in {"import_module", "__import__"}
+        ) or (
+            isinstance(node, ast.Call)
+            and self._reflected_attribute(node) in {"import_module", "__import__"}
         )
 
     def _collect_loader_assignment(
         self, target: ast.expr, value: ast.expr,
     ) -> None:
-        if isinstance(target, ast.Name) and self._is_dynamic_loader(value):
-            self.dynamic_loader_aliases.add(target.id)
+        if isinstance(target, ast.Name):
+            if self._is_dynamic_loader(value):
+                self.dynamic_loader_aliases.add(target.id)
+            if self._is_attribute_lookup(value):
+                self.attribute_lookup_aliases.add(target.id)
         elif (
             isinstance(target, (ast.Tuple, ast.List))
             and isinstance(value, (ast.Tuple, ast.List))
@@ -216,7 +248,10 @@ class _LightOpVisitor(ast.NodeVisitor):
                                 alias.asname or alias.name
                             )
             while True:
-                previous = self.dynamic_loader_aliases.copy()
+                previous = (
+                    self.dynamic_loader_aliases.copy(),
+                    self.attribute_lookup_aliases.copy(),
+                )
                 for child in nodes:
                     if isinstance(child, ast.Assign):
                         for target in child.targets:
@@ -226,7 +261,10 @@ class _LightOpVisitor(ast.NodeVisitor):
                             self._collect_loader_assignment(
                                 child.target, child.value,
                             )
-                if self.dynamic_loader_aliases == previous:
+                if (
+                    self.dynamic_loader_aliases,
+                    self.attribute_lookup_aliases,
+                ) == previous:
                     break
         self.generic_visit(node)
 
@@ -1536,6 +1574,64 @@ def test_scanner_allows_sibling_imports_in_legacy_owner(
     relative_path, _, _ = next(iter(LEGACY_TOP_LEVEL_MODULE_IMPORTS))
     with (tmp_path / relative_path).open("a", encoding="utf-8") as stream:
         stream.write(f"\n{statement}\n")
+
+    assert scan_lightop_imports(root) == []
+
+
+@pytest.mark.parametrize(
+    ("binding", "loader"),
+    [
+        ("", 'getattr(importlib, "import_module")'),
+        ("", 'getattr(importlib, "import_module", None)'),
+        ('load = getattr(importlib, "import_module")', "load"),
+        ('first = getattr(importlib, "import_module"); load = first', "load"),
+        ('lookup = getattr', 'lookup(importlib, "import_module")'),
+        ('lookup = getattr; load = lookup(importlib, "import_module")', "load"),
+        ("", 'importlib.__getattribute__("import_module")'),
+        ("", 'object.__getattribute__(importlib, "import_module")'),
+        ('lookup = importlib.__getattribute__', 'lookup("import_module")'),
+        ("", 'getattr(importlib, "__getattribute__")("import_module")'),
+    ],
+)
+@pytest.mark.parametrize(
+    "module_arg",
+    [
+        '"vllm_hcu.patch.worker.core_fix.patch_deepseek_v4_pcp"',
+        "module_name",
+    ],
+)
+def test_scanner_rejects_reflected_loader_self_import(
+    tmp_path: Path,
+    binding: str,
+    loader: str,
+    module_arg: str,
+) -> None:
+    root = _write_mutation_owner(tmp_path)
+    relative_path, _, _ = next(iter(LEGACY_TOP_LEVEL_MODULE_IMPORTS))
+    with (tmp_path / relative_path).open("a", encoding="utf-8") as stream:
+        stream.write(
+            "\nimport importlib\n"
+            'module_name = "vllm_hcu.patch.worker.core_fix.patch_deepseek_v4_pcp"\n'
+            f"{binding}\n"
+            f"{loader}({module_arg})._pcp_insert_op = lambda: None\n"
+        )
+
+    assert any(
+        "self-module import in legacy owner" in item
+        or "nonliteral dynamic import in legacy owner" in item
+        for item in scan_lightop_imports(root)
+    )
+
+
+def test_scanner_allows_safe_reflected_loader(tmp_path: Path) -> None:
+    root = _write_mutation_owner(tmp_path)
+    relative_path, _, _ = next(iter(LEGACY_TOP_LEVEL_MODULE_IMPORTS))
+    with (tmp_path / relative_path).open("a", encoding="utf-8") as stream:
+        stream.write(
+            '\nimport importlib\n'
+            'load = getattr(importlib, "import_module")\n'
+            'load("math")\n'
+        )
 
     assert scan_lightop_imports(root) == []
 
