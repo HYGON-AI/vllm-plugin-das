@@ -84,6 +84,16 @@ register_hcu_ci(
     target="tests/runtime_patch/test_gate_linear_context.py",
     est_time=180,
 )
+register_hcu_ci(
+    job="accuracy-gfx938",
+    target="tests/runtime_patch/test_bf16_fp32_mmac.py",
+    est_time=300,
+)
+register_hcu_ci(
+    job="accuracy-gfx938",
+    target="tests/runtime_patch/test_dsv4_skinny_lm_head.py",
+    est_time=180,
+)
 
 register_hcu_ci(
     job="contract-hcu-gfx936",
