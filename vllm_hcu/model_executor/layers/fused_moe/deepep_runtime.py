@@ -569,11 +569,21 @@ def ht_receiver(
     expert_tokens_meta._hcu_deepep_ht_local_counts = True
     ubatch_id = module.dbo_current_ubatch_id()
     if getattr(self, "_hcu_step5_fused_scatter_enabled", False):
-        rows = sum(expert_num_tokens_per_expert_list)
+        counts = tuple(expert_num_tokens_per_expert_list)
+        if len(counts) not in (22, 23) or any(
+            type(c) is not int or c < 0 or c % 256 for c in counts
+        ):
+            raise ValueError("Step5 fused scatter requires aligned E22/E23 dispatch counts")
+        rows = sum(counts)
         sx, ss, si, sm = self._hcu_step5_scatter_buffers[(id(self.buffer), ubatch_id)]
         for tensor in (sx, ss, si, sm):
             tensor.record_stream(module.torch.cuda.current_stream())
         expert_tokens_meta._hcu_step5_fused_scatter = (sx[:rows], ss[:rows], sm[:rows], si)
+        # This is the physical, already permuted dispatch layout. Bind it to
+        # the received batch independently of optional compact/exact sizing.
+        expert_tokens_meta._hcu_step5_fused_scatter_layout = (
+            tuple(expert_topk_ids.shape), counts,
+        )
         expert_tokens_meta._hcu_step5_fused_scatter_guard = self._hcu_step5_scatter_guards[(id(self.buffer), ubatch_id)]
         from vllm.logger import init_logger
 

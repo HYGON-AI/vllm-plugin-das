@@ -154,6 +154,38 @@ def _valid_deep_gemm(
     return True
 
 
+def _step5_fused_scatter_rows(meta, topk_ids, local_num_experts, hidden_size):
+    """Validate the dispatch-owned layout before reusing its GEMM inputs."""
+    layout = getattr(meta, "_hcu_step5_fused_scatter_layout", None)
+    scatter = getattr(meta, "_hcu_step5_fused_scatter", None)
+    if (
+        not isinstance(layout, tuple) or len(layout) != 2
+        or not isinstance(scatter, tuple) or len(scatter) != 4
+    ):
+        raise ValueError("Step5 fused scatter is missing dispatch layout metadata")
+    shape, counts = layout
+    if (
+        shape != tuple(topk_ids.shape)
+        or not isinstance(counts, tuple)
+        or len(counts) != local_num_experts
+        or any(type(c) is not int or c < 0 or c % 256 for c in counts)
+    ):
+        raise ValueError("Step5 fused scatter has mismatched dispatch counts or batch shape")
+    rows = sum(counts)
+    aq, scales, expert_ids, inv_perm = scatter
+    if (
+        aq.shape != (rows, hidden_size) or scales.shape != (rows, 1)
+        or expert_ids.shape != (rows,) or inv_perm.shape != topk_ids.shape
+        or (rows == 0) != (topk_ids.size(0) == 0)
+        or aq.dtype != torch.float8_e4m3fn or scales.dtype != torch.float32
+        or expert_ids.dtype != torch.int32 or inv_perm.dtype != torch.int32
+        or any(t.device != topk_ids.device or not t.is_contiguous() for t in scatter)
+        or not isinstance(getattr(meta, "_hcu_step5_fused_scatter_guard", None), dict)
+    ):
+        raise ValueError("Step5 fused scatter tensors do not match the dispatch layout")
+    return rows
+
+
 class DeepGemmExperts(mk.FusedMoEExpertsModular):
     """DeepGemm-based fused MoE expert implementation."""
 
@@ -575,18 +607,6 @@ class DeepGemmExperts(mk.FusedMoEExpertsModular):
             _, N, K = w1.size()
             assert w2.size(1) == K
 
-        M_sum, _ = compute_aligned_M_and_alignment(
-            M=topk_ids.size(0),
-            num_topk=topk_ids.size(1),
-            local_num_experts=local_num_experts,
-            alignment=(
-                _HCU_HT_EP_TOKEN_ALIGNMENT
-                if current_platform.is_rocm()
-                else get_mk_alignment_for_contiguous_layout()[0]
-            ),
-            expert_tokens_meta=expert_tokens_meta,
-        )
-
         permuted_dtype = (
             a1q.dtype
             if self.quant_config.use_int8_w8a8
@@ -596,14 +616,29 @@ class DeepGemmExperts(mk.FusedMoEExpertsModular):
         if getattr(self, "_hcu_step5_fused_scatter_enabled", False):
             if not step5_channel_fp8 or fused_scatter is None or local_num_experts not in (22, 23):
                 raise ValueError("Step5 DeepGEMM requires matching fused-scatter metadata")
+            # DeepEP already wrote aligned expert slices. Their exact row
+            # count is part of this input contract, regardless of whether
+            # compact sizing is enabled for the separate permutation path.
+            M_sum = _step5_fused_scatter_rows(
+                expert_tokens_meta, topk_ids, local_num_experts, K,
+            )
             if topk_ids.size(0) == 0:
                 output.zero_()
                 return
             a1q, a1q_scale, expert_ids, inv_perm = fused_scatter
             align_used = _HCU_HT_EP_TOKEN_ALIGNMENT
-            assert inv_perm.shape == topk_ids.shape and a1q.shape == (M_sum, K)
-            assert expert_ids.shape == (M_sum,) and a1q_scale.shape == (M_sum, 1)
         else:
+            M_sum, _ = compute_aligned_M_and_alignment(
+                M=topk_ids.size(0),
+                num_topk=topk_ids.size(1),
+                local_num_experts=local_num_experts,
+                alignment=(
+                    _HCU_HT_EP_TOKEN_ALIGNMENT
+                    if current_platform.is_rocm()
+                    else get_mk_alignment_for_contiguous_layout()[0]
+                ),
+                expert_tokens_meta=expert_tokens_meta,
+            )
             a1q_perm = _resize_cache(workspace13.view(dtype=permuted_dtype), (M_sum, K))
             a1q, a1q_scale, expert_ids, inv_perm, align_used = deepgemm_moe_permute(
                 aq=a1q,
