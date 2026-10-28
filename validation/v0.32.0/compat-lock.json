@@ -5,7 +5,7 @@
   "repository": {
     "name": "vllm-plugin-das",
     "url": "https://github.com/alexanderbin123/vllm-plugin-das.git",
-    "branch": "compat/vllm-v0.32.0",
+    "branch": "feat/adapter-das-extension-api",
     "source_base": "1be8d694edff552eebe8b3b9a9c3b2e44235d486",
     "test_policy_commit": "af84424cf652893fbbf392f9e1759ff19241ff96"
   },
@@ -50,7 +50,7 @@
     "adapter_wheel": {
       "filename": "sgl_kernel-0.1.0-py3-none-any.whl",
       "sha256": "bbc7de3745d736b5b8e82f55dfdab5e3a80ad8e8908e5388de76d394e7e0f50a",
-      "build_commit": "81361880e203cb33cf631f77716ac8244f5f299f"
+      "build_commit": "2ea9b1b4280e4740a1764fbb7c07d038d3615502"
     },
     "plugin_wheel": {
       "filename": "hcu_vllm_das_plugin-0.2.0.dev0-py3-none-any.whl",
