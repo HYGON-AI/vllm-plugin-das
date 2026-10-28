@@ -33,11 +33,28 @@ _DEFAULTS: dict[str, Any] = {
 }
 
 
+def _coerce_field(name: str, value: Any) -> Any:
+    default = _DEFAULTS[name]
+    if value is None:
+        return list(default) if isinstance(default, list) else default
+    if isinstance(default, list):
+        return list(value)
+    return value
+
+
 def _ensure_fields(compilation_config: object) -> None:
     for name, default in _DEFAULTS.items():
         if not hasattr(compilation_config, name):
             value = list(default) if isinstance(default, list) else default
             object.__setattr__(compilation_config, name, value)
+
+
+def _pop_replay_kwargs(kwargs: dict[str, Any]) -> dict[str, Any]:
+    extras: dict[str, Any] = {}
+    for name in _DEFAULTS:
+        if name in kwargs:
+            extras[name] = kwargs.pop(name)
+    return extras
 
 
 def apply_to_module(module: ModuleType) -> bool:
@@ -58,6 +75,24 @@ def apply_to_module(module: ModuleType) -> bool:
                 list(default) if isinstance(default, list) else default,
             )
 
+    # Always wrap __init__ so CompilationConfig(decoder_replay_trim_threshold=...)
+    # (and deserialization that hits __init__) can pass the new keywords.
+    original_init = require_callable(
+        compilation_config,
+        "__init__",
+        f"{TARGET_MODULE}.CompilationConfig.__init__",
+    )
+
+    @functools.wraps(original_init)
+    def hcu_init(self, *args: Any, **kwargs: Any) -> None:
+        extras = _pop_replay_kwargs(kwargs)
+        original_init(self, *args, **kwargs)
+        for name, value in extras.items():
+            object.__setattr__(self, name, _coerce_field(name, value))
+        _ensure_fields(self)
+
+    setattr(compilation_config, "__init__", hcu_init)
+
     post_init = getattr(compilation_config, "__post_init__", None)
     if callable(post_init):
 
@@ -68,19 +103,6 @@ def apply_to_module(module: ModuleType) -> bool:
             return result
 
         setattr(compilation_config, "__post_init__", hcu_post_init)
-    else:
-        original_init = require_callable(
-            compilation_config,
-            "__init__",
-            f"{TARGET_MODULE}.CompilationConfig.__init__",
-        )
-
-        @functools.wraps(original_init)
-        def hcu_init(self, *args: Any, **kwargs: Any) -> None:
-            original_init(self, *args, **kwargs)
-            _ensure_fields(self)
-
-        setattr(compilation_config, "__init__", hcu_init)
 
     setattr(compilation_config, _MARKER, True)
     return True

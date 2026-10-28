@@ -210,6 +210,38 @@ def _pad_kept_slots(
     return kept_slots, kept_positions
 
 
+def _replay_kv_starts(
+    extend_lens: list[int] | np.ndarray,
+    tail_lens: list[int] | np.ndarray,
+    seq_lens: list[int] | np.ndarray,
+) -> np.ndarray:
+    """SWA window floors for replay rows: advance only when actually trimmed."""
+    n = len(extend_lens)
+    out = np.zeros(n, dtype=np.int32)
+    for i in range(n):
+        extend_i = int(extend_lens[i])
+        tail_i = int(tail_lens[i])
+        if extend_i > tail_i:
+            out[i] = max(0, int(seq_lens[i]) - tail_i)
+    return out
+
+
+def _bump_last_seq_len_for_query_pad(
+    seq_lens: list[int] | np.ndarray, *, real_tokens: int, num_padded: int
+) -> list[int]:
+    """Keep ``seq_len - query_len`` stable when pad hangs off the last request.
+
+    Graph dispatch may extend ``query_start_loc[-1]`` past the real tail. SWA
+    builders derive each token's absolute position from ``seq_len - query_len``,
+    so the last request's sequence length must grow by the same pad delta.
+    """
+    out = [int(x) for x in seq_lens]
+    pad_n = int(num_padded) - int(real_tokens)
+    if pad_n > 0 and out:
+        out[-1] += pad_n
+    return out
+
+
 def _copy_attn_groups(attn_groups, prefixes: set[str], vllm_config, device):
     own_groups = []
     for groups in attn_groups:
@@ -572,7 +604,8 @@ def _prepare_replay_batch(
         )
         # Pad rows (if any) hang off the last request so builders see a dense
         # [0, num_padded] span without inventing an extra request.
-        if num_padded > int(kept_query_start_loc_np[-1]):
+        real_tail_tokens = int(kept_query_start_loc_np[-1])
+        if num_padded > real_tail_tokens:
             kept_query_start_loc_np[-1] = int(num_padded)
         kept_query_start_loc = torch.as_tensor(
             kept_query_start_loc_np, device=device, dtype=torch.int32
@@ -589,14 +622,8 @@ def _prepare_replay_batch(
         # Only trimmed requests lose KV below the kept tail. Untrimmed decode
         # (or prompt_logprobs full-extend) rows keep kv_start=0 so prior SWA
         # window KV stays visible — matching the non-PCP gather path.
-        kv_start_np = np.asarray(
-            [
-                max(0, int(seq_lens_g_cpu[i]) - int(tail_lens_cpu[i]))
-                if int(extend_lens_cpu[i]) > int(tail_lens_cpu[i])
-                else 0
-                for i in range(n_logical)
-            ],
-            dtype=np.int32,
+        kv_start_np = _replay_kv_starts(
+            extend_lens_cpu, tail_lens_cpu, seq_lens_g_cpu
         )
         self._kept_kv_start[:n_logical].copy_(
             torch.as_tensor(kv_start_np, device=device, dtype=torch.int32)
@@ -616,6 +643,9 @@ def _prepare_replay_batch(
             n_logical, dtype=np.bool_
         )
 
+        seq_lens_padded = _bump_last_seq_len_for_query_pad(
+            seq_lens_g_cpu, real_tokens=real_tail_tokens, num_padded=num_padded
+        )
         kept_batch = replace(
             input_batch,
             num_reqs=n_logical,
@@ -625,10 +655,10 @@ def _prepare_replay_batch(
             query_start_loc_np=kept_query_start_loc_np,
             max_query_len=max_query_len,
             seq_lens=torch.as_tensor(
-                seq_lens_g_cpu, device=device, dtype=input_batch.seq_lens.dtype
+                seq_lens_padded, device=device, dtype=input_batch.seq_lens.dtype
             ),
             seq_lens_cpu_upper_bound=torch.as_tensor(
-                seq_lens_g_cpu,
+                seq_lens_padded,
                 device="cpu",
                 dtype=input_batch.seq_lens_cpu_upper_bound.dtype,
             ),
@@ -747,6 +777,9 @@ def _prepare_replay_batch(
     kept_query_start_loc_np = np.zeros(num_reqs + 1, dtype=np.int32)
     np.cumsum(kept_lens, out=kept_query_start_loc_np[1:])
     batch_num_tokens = num_tokens
+    seq_lens_padded = _bump_last_seq_len_for_query_pad(
+        seq_lens, real_tokens=num_tokens, num_padded=num_padded
+    )
     if num_padded > num_tokens:
         kept_query_start_loc_np[-1] = int(num_padded)
         batch_num_tokens = int(num_padded)
@@ -767,6 +800,16 @@ def _prepare_replay_batch(
         query_start_loc=kept_query_start_loc,
         query_start_loc_np=kept_query_start_loc_np,
         max_query_len=max_query_len,
+        seq_lens=torch.as_tensor(
+            seq_lens_padded,
+            device=input_batch.seq_lens.device,
+            dtype=input_batch.seq_lens.dtype,
+        ),
+        seq_lens_cpu_upper_bound=torch.as_tensor(
+            seq_lens_padded,
+            device="cpu",
+            dtype=input_batch.seq_lens_cpu_upper_bound.dtype,
+        ),
         positions=kept_positions,
         fast_prefill=None,
     )

@@ -720,16 +720,23 @@ def test_pad_kept_slots_rounds_up_to_graph_size():
 
 def test_pcp_kv_start_only_advances_when_trimmed():
     """Decode / untrimmed rows keep kv_start=0; trimmed prefill advances."""
-    extend_lens = [256, 1]
-    tail_lens = [128, 1]
-    seq_lens = [256, 4096]
-    kv_start = [
-        max(0, seq_lens[i] - tail_lens[i])
-        if extend_lens[i] > tail_lens[i]
-        else 0
-        for i in range(len(extend_lens))
-    ]
-    assert kv_start == [128, 0]
+    kv_start = patch_deepseek_v41_decoder_replay_state._replay_kv_starts(
+        [256, 1], [128, 1], [256, 4096]
+    )
+    np.testing.assert_array_equal(kv_start, np.array([128, 0], dtype=np.int32))
+
+
+def test_bump_last_seq_len_keeps_prefix_stable_under_query_pad():
+    """seq_len grows with query pad so SWA prefix_len = seq_len - query_len holds."""
+    bumped = patch_deepseek_v41_decoder_replay_state._bump_last_seq_len_for_query_pad(
+        [100, 200], real_tokens=130, num_padded=160
+    )
+    assert bumped == [100, 230]
+    # Last request real query 30 → padded query 60; prefix stays 170.
+    assert bumped[-1] - 60 == 200 - 30
+    assert patch_deepseek_v41_decoder_replay_state._bump_last_seq_len_for_query_pad(
+        [100], real_tokens=128, num_padded=128
+    ) == [100]
 
 
 def test_model_init_skips_pp_missing_cut_layer():

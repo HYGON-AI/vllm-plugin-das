@@ -63,6 +63,28 @@ def _install_cache_config(module: ModuleType) -> bool:
 
     setattr(cache_config, "swa_bounded_replay", _DEFAULT)
 
+    # Always wrap __init__ so CacheConfig(swa_bounded_replay=False) is accepted
+    # before the underlying dataclass/Pydantic constructor rejects the keyword.
+    original_init = require_callable(
+        cache_config, "__init__", f"{TARGET_MODULE}.CacheConfig.__init__"
+    )
+
+    @functools.wraps(original_init)
+    def hcu_init(self, *args: Any, **kwargs: Any) -> None:
+        if "swa_bounded_replay" in kwargs:
+            value = kwargs.pop("swa_bounded_replay")
+            if value is None:
+                value = _DEFAULT
+        else:
+            value = None
+        original_init(self, *args, **kwargs)
+        if value is None:
+            _ensure_cache_attr(self, _DEFAULT)
+        else:
+            object.__setattr__(self, "swa_bounded_replay", bool(value))
+
+    setattr(cache_config, "__init__", hcu_init)
+
     post_init = getattr(cache_config, "__post_init__", None)
     if callable(post_init):
 
@@ -73,17 +95,6 @@ def _install_cache_config(module: ModuleType) -> bool:
             return result
 
         setattr(cache_config, "__post_init__", hcu_post_init)
-    else:
-        original_init = require_callable(
-            cache_config, "__init__", f"{TARGET_MODULE}.CacheConfig.__init__"
-        )
-
-        @functools.wraps(original_init)
-        def hcu_init(self, *args: Any, **kwargs: Any) -> None:
-            original_init(self, *args, **kwargs)
-            _ensure_cache_attr(self, _DEFAULT)
-
-        setattr(cache_config, "__init__", hcu_init)
 
     setattr(cache_config, _CACHE_MARKER, True)
     return True
