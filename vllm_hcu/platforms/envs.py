@@ -39,10 +39,10 @@ if TYPE_CHECKING:
     VLLM_HCU_USE_CUSTOM_STRIDED_Z: bool = True
     VLLM_HCU_USE_FUSED_QWEN35_MOE_BLOCK: bool = True
     VLLM_HCU_FUSED_QWEN35_MOE_NORM: bool = True
-    VLLM_HCU_W8A16_CACHE_DEQUANT: bool = False
+    VLLM_HCU_W8A16_CACHE_DEQUANT: bool = True
     VLLM_HCU_PREFILL_BATCH_WAIT_MS: int = 0
     VLLM_HCU_PREFILL_BATCH_MIN: int = 0
-    VLLM_HCU_PREFILL_BATCH_MIN_RUNNING: int = 0
+    VLLM_HCU_PREFILL_BATCH_MIN_RUNNING: int = 12
     VLLM_HCU_INT8_LM_HEAD: bool = False
     VLLM_HCU_USE_CUSTOM_RMS_NORM : bool = False
     VLLM_HCU_USE_CUSTOM_AITER_FLA : bool = False
@@ -384,16 +384,19 @@ hcu_vllm_environment_variables: dict[str, Callable[[], Any]] = {
 
     # Keep a dequantized W16 copy of every W8A16 dense weight for the
     # large-M (prefill) GEMM path instead of re-dequantizing per call.
-    # ~2x faster prefill dense GEMMs; costs 2 bytes/param of extra memory.
+    # ~2x faster prefill dense GEMMs; costs 2 bytes/param of extra memory
+    # (+2.6 GB for Qwen3.5-35B-A3B).  On by default; set 0 to save memory.
     # Requires VLLM_HCU_USE_CUSTOM_OPS.
     "VLLM_HCU_W8A16_CACHE_DEQUANT":
-        lambda: (os.environ.get("VLLM_HCU_W8A16_CACHE_DEQUANT", "False").lower() in
+        lambda: (os.environ.get("VLLM_HCU_W8A16_CACHE_DEQUANT", "True").lower() in
                  ("true", "1")),
 
     # Hold new prefills (while decodes are running) until the oldest waiting
     # request has waited this many ms, so several arrivals share one mixed
     # step.  On weight-bandwidth-bound MoE models every mixed step reads all
-    # experts, so fewer, larger prefill batches raise throughput.  0 = off.
+    # experts, so fewer, larger prefill batches raise throughput.  0 = off
+    # (default: it trades TTFT for throughput, so enable per model; 120 is
+    # the value tuned on Qwen3.5-35B-A3B translation).
     # Requires VLLM_HCU_USE_CUSTOM_OPS.
     "VLLM_HCU_PREFILL_BATCH_WAIT_MS":
         lambda: int(os.environ.get("VLLM_HCU_PREFILL_BATCH_WAIT_MS", "0")),
@@ -405,9 +408,10 @@ hcu_vllm_environment_variables: dict[str, Callable[[], Any]] = {
 
     # With VLLM_HCU_PREFILL_BATCH_WAIT_MS: only hold prefills while at least
     # this many requests are running.  At low concurrency a mixed step is
-    # cheap and holding only adds latency.  0 = hold whenever decodes run.
+    # cheap and holding only adds latency.  Default 12 (only takes effect
+    # with WAIT_MS > 0); 0 = hold whenever decodes run.
     "VLLM_HCU_PREFILL_BATCH_MIN_RUNNING":
-        lambda: int(os.environ.get("VLLM_HCU_PREFILL_BATCH_MIN_RUNNING", "0")),
+        lambda: int(os.environ.get("VLLM_HCU_PREFILL_BATCH_MIN_RUNNING", "12")),
 
     # Per-channel int8 copy of a 16-bit lm_head for decode-sized batches
     # (<= 32 rows), read by the DeepGEMM W8A16 GEMV.  Halves the lm_head

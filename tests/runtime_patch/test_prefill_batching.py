@@ -103,3 +103,32 @@ def test_cache_dequant_follows_master_switch(monkeypatch, master, expected_none)
     w = torch.zeros(16, 128, dtype=torch.int8)
     out = w8a16_gemm._cached_dequant(w, None, torch.float16, 0)
     assert (out is None) is expected_none
+
+
+def test_defaults(monkeypatch):
+    """int8 lm_head and prefill batching are opt-in (they change numerics /
+    trade TTFT for throughput on every model); the other Qwen3.5
+    optimizations are on."""
+    import vllm_hcu.platforms.envs as henvs
+
+    names = (
+        "VLLM_HCU_INT8_LM_HEAD",
+        "VLLM_HCU_USE_FUSED_QWEN35_MOE_BLOCK",
+        "VLLM_HCU_FUSED_QWEN35_MOE_NORM",
+        "VLLM_HCU_W8A16_CACHE_DEQUANT",
+        "VLLM_HCU_PREFILL_BATCH_WAIT_MS",
+        "VLLM_HCU_PREFILL_BATCH_MIN",
+        "VLLM_HCU_PREFILL_BATCH_MIN_RUNNING",
+    )
+    for name in names:
+        monkeypatch.delenv(name, raising=False)
+    defaults = {n: henvs.hcu_vllm_environment_variables[n]() for n in names}
+    assert defaults == {
+        "VLLM_HCU_INT8_LM_HEAD": False,
+        "VLLM_HCU_USE_FUSED_QWEN35_MOE_BLOCK": True,
+        "VLLM_HCU_FUSED_QWEN35_MOE_NORM": True,
+        "VLLM_HCU_W8A16_CACHE_DEQUANT": True,
+        "VLLM_HCU_PREFILL_BATCH_WAIT_MS": 0,
+        "VLLM_HCU_PREFILL_BATCH_MIN": 0,
+        "VLLM_HCU_PREFILL_BATCH_MIN_RUNNING": 12,
+    }

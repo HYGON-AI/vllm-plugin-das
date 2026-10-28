@@ -159,10 +159,10 @@ def _cached_dequant(w, scale, dtype, weight_layout):
     """Large-M path: reuse a dequantized copy instead of re-dequantizing every
     call (~2x faster prefill GEMMs) at the cost of a W16 copy per weight.
 
-    Opt-in via VLLM_HCU_W8A16_CACHE_DEQUANT.  The copy is only created
-    outside CUDA-graph capture (the eager profile run reaches this path with
-    max_num_batched_tokens, so every layer is cached before capture and the
-    memory is accounted for before the KV cache is sized).
+    On by default; VLLM_HCU_W8A16_CACHE_DEQUANT=0 disables it.  The copy is
+    only created outside CUDA-graph capture (the eager profile run reaches
+    this path with max_num_batched_tokens, so every layer is cached before
+    capture and the memory is accounted for before the KV cache is sized).
     """
     if not henvs.optional_custom_op_enabled(henvs.VLLM_HCU_W8A16_CACHE_DEQUANT):
         return None
