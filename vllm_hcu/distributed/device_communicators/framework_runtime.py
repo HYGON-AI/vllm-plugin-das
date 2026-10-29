@@ -12,19 +12,6 @@ _HT_NVL_BUFFER_BYTES = 1_000_000_000
 _HT_RDMA_BUFFER_BYTES = 500_000_000
 
 
-
-
-def _k3_scaled_hint(value: int) -> int:
-    """v29: optional RDMA hint override (KIMI3_LL_HINT_SCALE, default 1)."""
-    import os as _os
-
-    try:
-        scale = float(_os.getenv("KIMI3_LL_HINT_SCALE", "1"))
-    except (TypeError, ValueError):
-        scale = 1.0
-    return int(value * scale) if scale > 1.0 else value
-
-
 def initialize_deep_ep_manager(manager: object) -> None:
     """Use the HCU-tuned initial DeepEP communication budget."""
 
@@ -171,9 +158,9 @@ def make_deep_ep_ll_kwargs(
     return {
         "group": manager.cpu_group,
         "num_nvl_bytes": envs.VLLM_DEEPEP_BUFFER_SIZE_MB * 1024 * 1024,
-        "num_rdma_bytes": _k3_scaled_hint(num_rdma_bytes),
+        "num_rdma_bytes": num_rdma_bytes,
         "low_latency_mode": True,
-        "num_qps_per_rank": 16,  # v24 qps experiment
+        "num_qps_per_rank": num_local_experts,
         "allow_nvlink_for_low_latency_mode": True,
         "allow_mnnvl": envs.VLLM_DEEPEP_LOW_LATENCY_USE_MNNVL,
         "explicitly_destroy": True,
@@ -228,9 +215,9 @@ def install_deep_ep_auto_manager(module: object) -> type:
             return {
                 "group": self.cpu_group,
                 "num_nvl_bytes": max(_HT_NVL_BUFFER_BYTES, ll_nvl_bytes),
-                "num_rdma_bytes": max(ht_rdma_bytes, _k3_scaled_hint(ll_rdma_bytes)),
+                "num_rdma_bytes": max(ht_rdma_bytes, ll_rdma_bytes),
                 "low_latency_mode": True,
-                "num_qps_per_rank": max(ht_qps_per_rank, 16),  # v24
+                "num_qps_per_rank": max(ht_qps_per_rank, num_local_experts),
                 "allow_nvlink_for_low_latency_mode": True,
                 "allow_mnnvl": module.envs.VLLM_DEEPEP_LOW_LATENCY_USE_MNNVL,
                 "explicitly_destroy": True,
