@@ -34,7 +34,9 @@ def custom_ops_enabled() -> bool:
 def rms_norm_enabled() -> bool:
     """Return whether the migrated LightOp RMSNorm paths are enabled."""
 
-    return custom_ops_enabled() and _flag(_RMS_NORM_SWITCH, default=False)
+    master_enabled = custom_ops_enabled()
+    child_enabled = _flag(_RMS_NORM_SWITCH, default=False)
+    return master_enabled and child_enabled
 
 
 __all__ = ["custom_ops_enabled", "rms_norm_enabled"]

@@ -309,8 +309,15 @@ def test_rmsnorm_oot_enablement_preserves_plugin_and_official_paths(
     assert report["effective_enabled"] is expected
 
 
-def test_invalid_rmsnorm_policy_fails_before_consulting_official_base() -> None:
-    report = run_fake_runtime(child="enabled", base_enabled=True)
+@pytest.mark.parametrize("master", ("1", "0"))
+def test_invalid_rmsnorm_policy_fails_before_consulting_official_base(
+    master: str,
+) -> None:
+    report = run_fake_runtime(
+        master=master,
+        child="enabled",
+        base_enabled=True,
+    )
 
     assert "VLLM_HCU_USE_CUSTOM_RMS_NORM" in report["enabled_error"]
     assert ["base-enabled"] not in report["events"]
