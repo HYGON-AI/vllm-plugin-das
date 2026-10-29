@@ -541,3 +541,32 @@ def test_opt_in_fused_qkv_reuses_quant_method_and_preserves_gate(monkeypatch, tr
     projection.k_proj.scheme.is_static_input_scheme = True
     with pytest.raises(ValueError, match='Incompatible'):
         projection._make_fused_qkv(5)
+
+
+def test_fused_qkv_refresh_preserves_storage_and_updates_values():
+    projection = KimiK3MixedKDAProjection.__new__(KimiK3MixedKDAProjection)
+    nn.Module.__init__(projection)
+    for name, value in zip(('q_proj', 'k_proj', 'v_proj'), (1, 2, 3)):
+        layer = nn.Module()
+        layer.weight = nn.Parameter(torch.full((2, 4), value, dtype=torch.int8), requires_grad=False)
+        layer.weight_scale = nn.Parameter(torch.ones(2, 1), requires_grad=False)
+        setattr(projection, name, layer)
+    projection._fused_qkv = SimpleNamespace(weight=torch.zeros(6, 4, dtype=torch.int8), weight_scale=torch.zeros(6, 1))
+    weight_ptr = projection._fused_qkv.weight.data_ptr()
+    scale_ptr = projection._fused_qkv.weight_scale.data_ptr()
+    projection.refresh_fused_qkv()
+    assert projection._fused_qkv.weight.data_ptr() == weight_ptr
+    assert projection._fused_qkv.weight_scale.data_ptr() == scale_ptr
+    assert projection._fused_qkv.weight[:, 0].tolist() == [1, 1, 2, 2, 3, 3]
+    torch.testing.assert_close(projection._fused_qkv.weight_scale, torch.ones(6, 1))
+    def loader(param, tensor):
+        with torch.no_grad():
+            param.copy_(tensor)
+    projection.q_proj.weight.weight_loader = loader
+    projection.k_proj.weight_scale.weight_loader = loader
+    projection.load_branch('q_proj', 'weight', torch.full((2, 4), 7, dtype=torch.int8))
+    projection.load_branch('k_proj', 'weight_scale', torch.full((2, 1), 3.0))
+    assert projection._fused_qkv.weight.data_ptr() == weight_ptr
+    assert projection._fused_qkv.weight_scale.data_ptr() == scale_ptr
+    assert projection._fused_qkv.weight[:2].eq(7).all()
+    assert projection._fused_qkv.weight_scale[2:4].eq(3).all()

@@ -156,6 +156,8 @@ class HcuGPUWorker(Worker):
 
         refresh_glm53_router_gates(self.model_runner.model)
         refresh_compressor_nt_weights(self.model_runner.model)
+        from vllm_hcu.model_executor.layers.kimi_k3_mixed_precision import refresh_kimi_kda_fused_qkv
+        refresh_kimi_kda_fused_qkv(self.model_runner.model)
 
     def finish_weight_update(self) -> None:
         super().finish_weight_update()
@@ -169,6 +171,8 @@ class HcuGPUWorker(Worker):
         )
 
         refresh_compressor_nt_weights(model)
+        from vllm_hcu.model_executor.layers.kimi_k3_mixed_precision import refresh_kimi_kda_fused_qkv
+        refresh_kimi_kda_fused_qkv(model)
         if not self._weight_update_is_draft:
             from vllm_hcu.model_executor.layers.fused_moe.glm53_router_gemv import (
                 refresh_glm53_router_gates,

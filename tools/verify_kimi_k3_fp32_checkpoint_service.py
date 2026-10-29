@@ -1,6 +1,9 @@
 #!/usr/bin/env python3
 # SPDX-License-Identifier: Apache-2.0
-"""Compare prefix-hit continuation with a cold request against a live vLLM API."""
+"""Compare prefix-hit continuation with a cold request against a live vLLM API.
+
+The server must be dedicated to this test: hit counters are global.
+"""
 
 from __future__ import annotations
 
@@ -8,6 +11,9 @@ import json
 import random
 import sys
 import time
+import uuid
+
+from check_kimi_k3_kda_prefix import compare_logprobs
 import urllib.error
 import urllib.request
 from pathlib import Path
@@ -61,8 +67,8 @@ rng = random.Random(20261027)
 prefix = [rng.randrange(1000, 50000) for _ in range(3072)]
 producer_tail = [rng.randrange(1000, 50000) for _ in range(1024)]
 consumer_tail = [rng.randrange(1000, 50000) for _ in range(1024)]
-shared_salt = "kda-fp32-h-shared-20261027"
-cold_salt = "kda-fp32-h-cold-20261027"
+shared_salt = uuid.uuid4().hex
+cold_salt = uuid.uuid4().hex
 
 
 def completion(name, prompt, salt):
@@ -102,12 +108,15 @@ try:
     result["producer"] = completion(
         "producer_shared_salt", prefix + producer_tail, shared_salt
     )
+    result["metrics_before_cached"] = metrics_snippet()
     result["cached_consumer"] = completion(
         "consumer_shared_salt", prefix + consumer_tail, shared_salt
     )
+    result["metrics_before_cold"] = metrics_snippet()
     result["cold_consumer"] = completion(
         "consumer_cold_salt", prefix + consumer_tail, cold_salt
     )
+    result["metrics_after_cold"] = metrics_snippet()
 finally:
     if profile_active:
         request("/stop_profile", {})
@@ -135,5 +144,26 @@ print(json.dumps({
     "cold_usage": cold.get("usage"),
 }, ensure_ascii=False, indent=2))
 
-if not result["comparison"]["token_ids_equal"]:
+def hits(lines):
+    return sum(float(line.rsplit(None, 1)[-1]) for line in lines
+               if line.startswith("vllm:prefix_cache_hits_total{")
+               or line.startswith("vllm:prefix_cache_hits_total "))
+
+try:
+    before, middle, after = (result[k] for k in
+        ("metrics_before_cached", "metrics_before_cold", "metrics_after_cold"))
+    if not all(any(line.startswith("vllm:prefix_cache_hits_total") for line in x)
+               for x in (before, middle, after)):
+        raise ValueError("missing prefix cache hit metrics")
+    cached_hits, cold_hits = hits(middle) - hits(before), hits(after) - hits(middle)
+    ids = cached.get("token_ids")
+    if not isinstance(ids, list) or not ids or ids != cold.get("token_ids"):
+        raise ValueError("missing or mismatched token IDs")
+    delta = compare_logprobs(cached.get("logprobs"), cold.get("logprobs"))
+    if len(ids) != len(cached["logprobs"]["tokens"]):
+        raise ValueError("token IDs and logprobs have different lengths")
+    if cached_hits < len(prefix) or cold_hits != 0 or delta > 0.005:
+        raise ValueError(f"unexpected cache hits or logprob delta: {cached_hits}, {cold_hits}, {delta}")
+except (ValueError, TypeError) as exc:
+    print(f"Verification failed: {exc}", file=sys.stderr)
     raise SystemExit(1)
