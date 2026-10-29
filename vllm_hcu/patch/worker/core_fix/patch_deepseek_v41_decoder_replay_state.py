@@ -83,22 +83,26 @@ class ReplayAttnMetadata(ModelSpecificAttnMetadata):
 
 
 def _pcp_local_slot_mappings(
-    slot_mappings: torch.Tensor, pcp_size: int
+    slot_mappings: torch.Tensor,
+    pcp_size: int,
+    *,
+    local_num_tokens: int | None = None,
 ) -> tuple[torch.Tensor, bool]:
     """Slice the rank-local segment from an expanded PCP slot mapping.
 
     Upstream #62183 assumes ``slot_mappings`` is laid out as
     ``[num_groups, pcp_size * local_tokens]``. Decode / warmup on HCU 0.29
-    often pass a rank-local width only; ``chunk(pcp_size)`` then IndexErrors
-    and the follow-on all_gather shape-mismatches. Return
-    ``(local_view, True)`` only when the tensor is the global expanded layout.
+    often pass a rank-local or unexpanded global width that still happens to
+    be divisible by ``pcp_size`` (e.g. local=16, PCP=8); treating that as
+    expanded would truncate APC padding and corrupt the follow-on all_gather.
+    Only chunk when the width exactly matches ``pcp_size * local_num_tokens``.
     """
-    if (
-        pcp_size <= 1
-        or slot_mappings.ndim != 2
-        or slot_mappings.shape[1] < pcp_size
-        or slot_mappings.shape[1] % pcp_size != 0
-    ):
+    if pcp_size <= 1 or slot_mappings.ndim != 2:
+        return slot_mappings, False
+    if local_num_tokens is None or int(local_num_tokens) <= 0:
+        return slot_mappings, False
+    expected = int(pcp_size) * int(local_num_tokens)
+    if slot_mappings.shape[1] != expected:
         return slot_mappings, False
     from vllm.distributed.parallel_state import get_pcp_group
 
@@ -106,6 +110,50 @@ def _pcp_local_slot_mappings(
         slot_mappings.chunk(pcp_size, dim=1)[get_pcp_group().rank_in_group],
         True,
     )
+
+
+def _pcp_global_slots_for_replay(
+    slot_mappings: torch.Tensor,
+    *,
+    pcp_size: int,
+    local_num_tokens: int,
+    global_num_tokens: int,
+    restore_idx: torch.Tensor,
+) -> torch.Tensor | None:
+    """Map ``slot_mappings`` into global token order for PCP late-tail replay.
+
+    Returns ``None`` when the layout cannot be restored; callers should skip
+    trim and run the full batch rather than writing PAD slots for real tokens.
+    """
+    if slot_mappings.ndim != 2:
+        return None
+    width = int(slot_mappings.shape[1])
+    local_num = int(local_num_tokens)
+    world = int(pcp_size)
+    global_num = int(global_num_tokens)
+    expanded_width = world * local_num if world > 1 and local_num > 0 else -1
+
+    # Rank-local width: gather peers then restore DualChunk order.
+    if world > 1 and local_num > 0 and width == local_num:
+        from vllm.distributed.parallel_state import get_pcp_group
+
+        expanded = get_pcp_group().all_gather(slot_mappings, dim=1)
+        if int(expanded.shape[1]) != expanded_width:
+            return None
+        return expanded.index_select(1, restore_idx)
+
+    # Expanded rank-major: one equal-width segment per rank.
+    # Prefer this over "already global" when widths coincide
+    # (``pcp * local == global`` with no pad), because late-tail is only
+    # entered with DualChunk restore metadata from the prefill gather path.
+    if width == expanded_width:
+        return slot_mappings.index_select(1, restore_idx)
+
+    # Already global (unexpanded buffer whose width is not pcp*local).
+    if global_num > 0 and width == global_num:
+        return slot_mappings
+
+    return None
 
 
 def pad_replayed_slots(
@@ -579,15 +627,30 @@ def _prepare_replay_batch(
         restore_idx = pcp_meta.pcp_restore_idx
         local_num = int(pcp_meta.pcp_local_num_tokens)
         pcp_size = int(pcp_meta.pcp_world_size)
-        if (
-            slot_mappings.ndim == 2
-            and slot_mappings.shape[1] == pcp_size * local_num
-        ):
-            global_slots = slot_mappings.index_select(1, restore_idx)
-        else:
-            # Rank-local width: treat as already-local; pad/trim only.
-            global_slots = None
+        global_num = int(getattr(pcp_meta, "pcp_global_num_tokens", 0) or 0)
+        global_slots = _pcp_global_slots_for_replay(
+            slot_mappings,
+            pcp_size=pcp_size,
+            local_num_tokens=local_num,
+            global_num_tokens=global_num,
+            restore_idx=restore_idx,
+        )
         share = pcp_tail_plan.global_token_indices[pcp_tail_plan.local_tail_rows]
+        if global_slots is None and share.numel():
+            # Cannot restore real tail slots → skip trim (full execution)
+            # rather than writing PAD_SLOT_ID over live late-layer KV.
+            logger.warning_once(
+                "Decoder SWA PCP late-tail: slot mapping width=%s does not "
+                "match expanded (%s*%s), local (%s), or global (%s); "
+                "skipping decoder trim for this step.",
+                int(slot_mappings.shape[1]) if slot_mappings.ndim == 2 else -1,
+                pcp_size,
+                local_num,
+                local_num,
+                global_num,
+            )
+            layers.replay_batch = None
+            return
         if global_slots is not None and share.numel():
             kept_slots = global_slots.index_select(1, share)
         else:
@@ -1042,13 +1105,20 @@ def apply_to_module(module: ModuleType) -> bool:
             )
             # Decode / warmup often pass rank-local slots; only chunk+gather
             # when input_batch.pcp is set and slots are expanded (#62183).
+            # Require exact ``pcp_size * local_num_tokens`` — bare divisibility
+            # false-positives on local widths like 16 under PCP=8.
             pcp = getattr(input_batch, "pcp", None)
             pcp_size = int(getattr(self, "pcp_size", 1) or 1)
             local_slot_mappings = slot_mappings
             use_pcp_slots = False
             if pcp is not None and pcp_size > 1:
+                local_num_tokens = getattr(
+                    input_batch, "_vllm_hcu_pcp_local_num_tokens", None
+                )
                 local_slot_mappings, use_pcp_slots = _pcp_local_slot_mappings(
-                    slot_mappings, pcp_size
+                    slot_mappings,
+                    pcp_size,
+                    local_num_tokens=local_num_tokens,
                 )
             if replay_start_np.any():
                 pad_replayed_slots(

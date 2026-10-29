@@ -423,6 +423,107 @@ def test_compilation_config_owns_replay_capture_size_list():
     assert a.decoder_replay_cudagraph_capture_sizes == [256]
 
 
+def test_pcp_local_slot_mappings_requires_exact_expanded_width(monkeypatch):
+    """Local widths divisible by PCP must not be mistaken for expanded layout."""
+    from vllm.distributed import parallel_state
+
+    class FakeGroup:
+        world_size = 8
+        rank_in_group = 0
+
+    monkeypatch.setattr(parallel_state, "get_pcp_group", lambda: FakeGroup())
+
+    # Rank-local width 16 under PCP=8 is divisible by 8 but is NOT expanded.
+    local = torch.arange(2 * 16, dtype=torch.int64).reshape(2, 16)
+    view, used = patch_deepseek_v41_decoder_replay_state._pcp_local_slot_mappings(
+        local, pcp_size=8, local_num_tokens=16
+    )
+    assert used is False
+    assert torch.equal(view, local)
+
+    # Without local_num_tokens, never chunk on divisibility alone.
+    view2, used2 = patch_deepseek_v41_decoder_replay_state._pcp_local_slot_mappings(
+        local, pcp_size=8
+    )
+    assert used2 is False
+    assert torch.equal(view2, local)
+
+    # True expanded: width == pcp_size * local_num_tokens.
+    expanded = torch.arange(2 * 8 * 16, dtype=torch.int64).reshape(2, 8 * 16)
+    view3, used3 = patch_deepseek_v41_decoder_replay_state._pcp_local_slot_mappings(
+        expanded, pcp_size=8, local_num_tokens=16
+    )
+    assert used3 is True
+    assert view3.shape == (2, 16)
+    assert torch.equal(view3, expanded[:, :16])
+
+
+def test_pcp_global_slots_for_replay_layouts(monkeypatch):
+    from vllm.distributed import parallel_state
+
+    class FakeGroup:
+        world_size = 2
+        rank_in_group = 0
+
+        def all_gather(self, tensor, dim=1):
+            # Peer rank fills [local_num : 2*local_num] with +1000.
+            assert dim == 1
+            peer = tensor + 1000
+            return torch.cat([tensor, peer], dim=1)
+
+    monkeypatch.setattr(parallel_state, "get_pcp_group", lambda: FakeGroup())
+
+    restore = torch.tensor([0, 2, 1, 3], dtype=torch.long)
+    # Expanded 2*2 → restore to global order.
+    expanded = torch.tensor([[10, 11, 20, 21]], dtype=torch.int64)
+    got = patch_deepseek_v41_decoder_replay_state._pcp_global_slots_for_replay(
+        expanded,
+        pcp_size=2,
+        local_num_tokens=2,
+        global_num_tokens=4,
+        restore_idx=restore,
+    )
+    assert got is not None
+    assert torch.equal(got, expanded.index_select(1, restore))
+
+    # Rank-local: gather then restore.
+    local = torch.tensor([[10, 11]], dtype=torch.int64)
+    got_local = patch_deepseek_v41_decoder_replay_state._pcp_global_slots_for_replay(
+        local,
+        pcp_size=2,
+        local_num_tokens=2,
+        global_num_tokens=4,
+        restore_idx=restore,
+    )
+    assert got_local is not None
+    assert got_local.shape == (1, 4)
+
+    # Already-global width distinct from pcp*local (no pad coincidence).
+    global_slots = torch.arange(5, dtype=torch.int64).unsqueeze(0)
+    got_global = patch_deepseek_v41_decoder_replay_state._pcp_global_slots_for_replay(
+        global_slots,
+        pcp_size=2,
+        local_num_tokens=2,
+        global_num_tokens=5,
+        restore_idx=restore,
+    )
+    assert got_global is not None
+    assert torch.equal(got_global, global_slots)
+
+    # Unknown width → None (caller must skip trim).
+    bad = torch.arange(3, dtype=torch.int64).unsqueeze(0)
+    assert (
+        patch_deepseek_v41_decoder_replay_state._pcp_global_slots_for_replay(
+            bad,
+            pcp_size=2,
+            local_num_tokens=2,
+            global_num_tokens=4,
+            restore_idx=restore,
+        )
+        is None
+    )
+
+
 def test_pad_replayed_slots_pads_cacheable_groups_only():
     from vllm.v1.attention.backends.utils import PAD_SLOT_ID
 
