@@ -5,7 +5,7 @@
 lifecycle; this wheel contributes optional, independently removable operator
 optimizations through the adapter extension API.
 
-Version `0.2.0.dev0` contains one validated `gfx936` capability:
+Version `0.2.0.dev0` contains one retained, default-OFF `gfx936` candidate:
 
 - LightOp ordinary and fused-add `RMSNorm`.
 
@@ -109,8 +109,8 @@ export VLLM_HCU_USE_CUSTOM_RMS_NORM=0
 For complete removal, uninstall `hcu-vllm-das-plugin`; the adapter and vLLM
 remain installed and retain platform ownership.
 
-See the historical
-[`SiluAndMul` record](../docs/validation/v032-adapter-extension-silu.md) for the
-candidate that was evaluated but not retained, and the current
-[`RMSNorm` record](../docs/validation/v032-adapter-extension-rmsnorm.md) for
-exact wheel hashes and live-HCU evidence.
+The [`SiluAndMul`](../docs/validation/v032-adapter-extension-silu.md) and
+[`RMSNorm`](../docs/validation/v032-adapter-extension-rmsnorm.md) records are
+historical candidate evidence. The current three-way identities, upstream
+takeover decision, and pending final-wheel gates are recorded in the
+[`vLLM 0.32 upstream-first validation`](../docs/validation/vllm032-upstream-first-operator-ab.md).
