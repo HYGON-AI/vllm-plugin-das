@@ -11,6 +11,7 @@ import torch
 import torch.nn.functional as F
 
 from vllm.forward_context import get_forward_context
+from vllm.config import CUDAGraphMode
 from vllm.logger import init_logger
 from vllm.platforms import current_platform
 from vllm.triton_utils import tl, triton
@@ -1651,6 +1652,26 @@ def rocm_aiter_sparse_attn_indexer_native(
                 )
                 topk_indices.fill_(-1)
             else:
+                if (
+                    henvs.VLLM_HCU_ENABLE_PREFILL_MQA_GROUPING
+                    and dcp_world_size == 1
+                    and not v4_fp8_fallback
+                    and current_platform.is_rocm()
+                    and on_gfx938()
+                    and _use_lightop_sparse_mla_topk()
+                    and getattr(get_forward_context(), "cudagraph_runtime_mode", None) == CUDAGraphMode.NONE
+                    and not torch.cuda.is_current_stream_capturing()
+                ):
+                    from vllm._aiter_ops import rocm_aiter_ops
+                    from vllm_hcu.v1.attention.ops.prefill_mqa import run_grouped_prefill_mqa
+                    if not rocm_aiter_ops.is_enabled() and run_grouped_prefill_mqa(
+                        q_slice, k_fp8, k_scale.view(torch.float32),
+                        weights[chunk.token_start:chunk.token_end],
+                        chunk.cu_seqlen_ks, chunk.cu_seqlen_ke, topk_indices,
+                        getattr(chunk, "hcu_mqa_groups", ()),
+                        mqa=rocm_fp8_mqa_logits, topk=_lightop_topk_indices_prefill,
+                    ):
+                        continue
                 logits_fn = (
                     fp8_mqa_logits_torch
                     if v4_fp8_fallback

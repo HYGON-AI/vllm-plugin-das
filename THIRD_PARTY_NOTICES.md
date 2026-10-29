@@ -69,6 +69,13 @@ are retained in the corresponding local files.
 
 ## Additional Notes
 
+- `vllm_hcu/v1/attention/ops/prefill_mqa.py` adapts the contiguous request
+  grouping cost model from `maxiaobetter/sglang-das`, commit
+  `d50074e6a6942df5c91da0076acf273c977738cc`,
+  `python/sglang/srt/layers/attention/dsa/mqa_request_split.py` (Apache-2.0).
+  The local implementation adds vLLM CPU query-slice planning and an opt-in
+  eager runtime boundary; the original project attribution is retained here.
+
 Some model implementations retain additional file-level notices from projects
 such as DeepSeek, ZhipuAI, HuggingFace Transformers, EleutherAI, SGLang, and HY
 where those notices are present in source headers. Those notices remain part of
