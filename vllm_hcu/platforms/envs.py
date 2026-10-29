@@ -43,6 +43,8 @@ if TYPE_CHECKING:
     VLLM_HCU_USE_LIGHTOP_TOPK: bool = False
     VLLM_HCU_USE_LIGHTOP_SPARSE_MLA_TOPK: bool = True
     VLLM_HCU_USE_LIGHTOP_FAST_TOPK_TRANSFORM: bool = True
+    VLLM_HCU_ENABLE_PREFILL_MQA_GROUPING: bool = False
+    VLLM_HCU_PREFILL_MQA_GROUP_MIN_SAVED_CELLS: int = 2_000_000
     VLLM_HCU_USE_AITER_OPUS_PAGED_MQA_LOGITS: bool = True
     VLLM_DCP_Q_REPLICATE: bool = False
     VLLM_HCU_USE_AITER_MHC: bool = True
@@ -318,6 +320,12 @@ hcu_vllm_environment_variables: dict[str, Callable[[], Any]] = {
         lambda: (os.environ.get(
             "VLLM_HCU_USE_LIGHTOP_FAST_TOPK_TRANSFORM", "True"
         ).lower() in ("true", "1")),
+
+    # Experimental eager FP8 prefill grouping; decode is unaffected.
+    "VLLM_HCU_ENABLE_PREFILL_MQA_GROUPING":
+        lambda: os.getenv("VLLM_HCU_ENABLE_PREFILL_MQA_GROUPING", "0").lower() in ("1", "true"),
+    "VLLM_HCU_PREFILL_MQA_GROUP_MIN_SAVED_CELLS":
+        lambda: int(os.getenv("VLLM_HCU_PREFILL_MQA_GROUP_MIN_SAVED_CELLS", "2000000")),
 
     # Use AITER Opus paged-MQA for HCU DSA decode by default.
     "VLLM_HCU_USE_AITER_OPUS_PAGED_MQA_LOGITS":
