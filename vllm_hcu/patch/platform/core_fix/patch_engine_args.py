@@ -584,14 +584,6 @@ def apply_to_module(module: ModuleType) -> bool:
     def hcu_create_engine_config(self, *args: Any, **kwargs: Any):
         feature_config = _normalise_existing_engine_args(self)
         config = create_engine_config(self, *args, **kwargs)
-        # VllmConfig resolves this default once. Do not overwrite it with
-        # the pre-construction EngineArgs snapshot, which still contains None.
-        if feature_config.sparse_mla_prefill_workspace_factor is None:
-            feature_config = feature_config.with_updates(
-                sparse_mla_prefill_workspace_factor=(
-                    get_hcu_config(config).sparse_mla_prefill_workspace_factor
-                )
-            )
         set_hcu_config(config, feature_config)
         for public, sidecar in _HCU_EPLB_FIELDS.items():
             attribute = f"_vllm_hcu_{sidecar}"

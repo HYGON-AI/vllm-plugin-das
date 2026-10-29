@@ -22,7 +22,6 @@ TARGETS = (
     f"{TARGET_MODULE}.split_indexer_prefill_chunks",
     f"{TARGET_MODULE}.split_decodes_and_prefills",
     f"{TARGET_MODULE}.DeepseekV32IndexerMetadataBuilder.build",
-    f"{TARGET_MODULE}.get_max_prefill_buffer_size",
 )
 _MARKER = "_vllm_hcu_mla_indexer_applied"
 _WRAPPER = "_vllm_hcu_mla_indexer_wrapper"
@@ -133,11 +132,7 @@ def apply_to_module(module: ModuleType) -> bool:
 
 
 def apply(module: ModuleType | None = None) -> bool:
-    indexer = load_exact_module(TARGET_MODULE, module)
-    changed = apply_to_module(indexer)
-    from vllm_hcu.v1.attention.ops.sparse_mla_workspace import indexer_rows
-    indexer.get_max_prefill_buffer_size = indexer_rows
-    return changed
+    return apply_to_module(load_exact_module(TARGET_MODULE, module))
 
 
 __all__ = ["PATCH_ID", "TARGET_MODULE", "TARGETS", "apply", "apply_to_module"]

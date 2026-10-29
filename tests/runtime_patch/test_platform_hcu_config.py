@@ -833,7 +833,6 @@ class _FakeModelConfig:
         self.model_arch_config = self.get_model_arch_config()
         self.enforce_eager = enforce_eager
         self.use_mla = False
-        self.max_model_len = 88000
 
     def get_model_arch_config(self) -> str:
         return self.hf_text_config.name
@@ -2058,17 +2057,3 @@ def test_sidecar_changes_upstream_hash_and_crosses_serialization_boundaries() ->
     process.join(timeout=30)
     assert process.exitcode == 0
     assert queue.get(timeout=5) == enabled["hcu"]
-
-
-@pytest.mark.parametrize('max_model_len,expected', [(88000, 5), (1048576, 2)])
-def test_engine_args_preserves_resolved_workspace_default(monkeypatch, max_model_len, expected):
-    module = _make_arg_utils_module()
-    def create_engine_config(self, usage_context=None, headless=False):
-        from vllm_hcu.v1.attention.ops.sparse_mla_workspace import resolve_workspace_factor
-        config = SimpleNamespace(additional_config=dict(self.additional_config), model_config=SimpleNamespace(max_model_len=max_model_len), parallel_config=SimpleNamespace())
-        resolve_workspace_factor(config)
-        return config
-    monkeypatch.setattr(module.EngineArgs, 'create_engine_config', create_engine_config)
-    patch_engine_args.apply_to_module(module)
-    config = module.EngineArgs().create_engine_config()
-    assert get_hcu_config(config).sparse_mla_prefill_workspace_factor == expected

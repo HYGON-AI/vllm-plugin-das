@@ -1,0 +1,110 @@
+--- a/vllm/config/attention.py
++++ b/vllm/config/attention.py
+@@ -3,7 +3,7 @@
+ 
+ from typing import Any, Literal
+ 
+-from pydantic import field_validator
++from pydantic import Field, field_validator
+ 
+ from vllm.config.utils import config
+ from vllm.v1.attention.backends.mla.prefill.registry import MLAPrefillBackendEnum
+@@ -58,6 +58,12 @@
+ 
+     use_non_causal: bool = False
+     """Whether to use non-causal (bidirectional) attention."""
++
++    sparse_mla_prefill_workspace_factor: int | None = Field(default=None, ge=2)
++    """Sparse MLA prefill workspace rows in multiples of max_model_len.
++    The sparse indexer buffer fits within the same memory budget.
++    Defaults to 5 through 256K context, otherwise 2. A minimum of 2
++    leaves room for context-parallel shard rounding."""
+ 
+     flex_attn_block_m: int | None = None
+     """Triton kernel BLOCK_M tile size for flex attention.
+--- a/vllm/config/vllm.py
++++ b/vllm/config/vllm.py
+@@ -1593,6 +1593,15 @@
+         # Log the custom passes that are enabled
+         self.compilation_config.pass_config.log_enabled_passes()
+ 
++        if (
++            self.attention_config.sparse_mla_prefill_workspace_factor is None
++            and self.model_config is not None
++        ):
++            # Resolve once before KV auto-fit can lower max_model_len.
++            self.attention_config.sparse_mla_prefill_workspace_factor = (
++                5 if self.model_config.max_model_len <= 256 * 1024 else 2
++            )
++
+     def update_sizes_for_sequence_parallelism(self, possible_sizes: list) -> list:
+         # remove the sizes that not multiple of tp_size when
+         # enable sequence parallelism
+--- a/vllm/v1/attention/backends/mla/flashmla_sparse.py
++++ b/vllm/v1/attention/backends/mla/flashmla_sparse.py
+@@ -218,14 +218,11 @@
+     fp8_use_mixed_batch: bool = False
+ 
+ 
+-def get_prefill_workspace_size(max_model_len: int):
+-    # NOTE(Lucas): 5 is a magic number for controlling the prefill buffer size.
+-    # May be tuned later.
+-    # Memory usage: 5 * max_model_len * 576 * 2 bytes
+-    #   Example: DeepSeek-V3.2 with max_model_len=163840 ->
+-    #            5 * 163840 * 576 * 2 = ~900 MB
+-    # This fits nicely below the typical MoE workspace size of >2GB so this is "free"
+-    return max_model_len * 5
++def get_prefill_workspace_size(vllm_config: VllmConfig) -> int:
++    # vllm-project/vllm#61023: use one factor for allocation and chunking.
++    factor = vllm_config.attention_config.sparse_mla_prefill_workspace_factor
++    assert factor is not None
++    return vllm_config.model_config.max_model_len * factor
+ 
+ 
+ class FlashMLASparseMetadataBuilder(AttentionMetadataBuilder[FlashMLASparseMetadata]):
+@@ -414,9 +411,7 @@
+             )
+ 
+             # Chunk prefill requests to fit within workspace size
+-            max_prefill_buffer_size = get_prefill_workspace_size(
+-                self.vllm_config.model_config.max_model_len
+-            )
++            max_prefill_buffer_size = get_prefill_workspace_size(self.vllm_config)
+             chunk_bounds = split_prefill_chunks(
+                 prefill_seq_lens_cpu, max_prefill_buffer_size
+             )
+@@ -592,9 +587,7 @@
+         if kv_cache_dtype == "fp8_ds_mla":
+             # Reserve workspace during initialization
+             assert vllm_config is not None and vllm_config.model_config is not None
+-            prefill_workspace_size = get_prefill_workspace_size(
+-                vllm_config.model_config.max_model_len
+-            )
++            prefill_workspace_size = get_prefill_workspace_size(vllm_config)
+             self.prefill_workspace_shape = (prefill_workspace_size, head_size)
+             self.q_concat_buffer, self.prefill_bf16_workspace = (
+                 current_workspace_manager().get_simultaneous(
+--- a/vllm/v1/attention/backends/mla/indexer.py
++++ b/vllm/v1/attention/backends/mla/indexer.py
+@@ -226,15 +226,17 @@
+ 
+ def get_max_prefill_buffer_size(vllm_config: VllmConfig):
+     max_model_len = vllm_config.model_config.max_model_len
+-    # NOTE(Chen): 40 is a magic number for controlling the prefill buffer size.
++    # vllm-project/vllm#61023: couple this budget to sparse MLA workspace.
+     # Each entry is 128 fp8 bytes and 4 scale bytes for a total of 132 bytes.
+-    # The flashmla_sparse backend uses a workspace size of 5 * max_model_len.
++    # The flashmla_sparse backend uses a workspace size of factor * max_model_len.
+     # The memory usage of the workspace there is 576 * 2 bytes; so we size this as
+-    # (576 * 2 // 132) * 5 = 40 to maximize this workspace size while still fitting
++    # (576 * 2 // 132) * factor (40 at factor 5) to maximize this workspace size while still fitting
+     # within the flashmla_sparse workspace.
+     # For DeepSeek-V3.2, the max_model_len is 163840.
+     #   40 * 163840 * 132 = 865075200 bytes = 825 MB
+-    return max_model_len * 40
++    factor = vllm_config.attention_config.sparse_mla_prefill_workspace_factor
++    assert factor is not None
++    return max_model_len * (576 * 2 // 132) * factor
+ 
+ 
+ class DeepseekV32IndexerMetadataBuilder(AttentionMetadataBuilder):

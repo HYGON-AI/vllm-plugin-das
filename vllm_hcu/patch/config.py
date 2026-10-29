@@ -27,7 +27,6 @@ _FEATURE_FIELDS = (
     "expert_map_record_path",
     "eplb_disable_rearrange",
     "eplb_static_dispatch_policy",
-    "sparse_mla_prefill_workspace_factor",
 )
 _BOOLEAN_FIELDS = _FEATURE_FIELDS[:5]
 _SUPPORTED_MOE_BACKENDS = frozenset({"auto", "deep_gemm"})
@@ -79,12 +78,7 @@ class HcuFeatureConfig:
     eplb_disable_rearrange: bool = False
     eplb_static_dispatch_policy: str = "nearest"
 
-    sparse_mla_prefill_workspace_factor: int | None = None
-
     def __post_init__(self) -> None:
-        factor = self.sparse_mla_prefill_workspace_factor
-        if factor is not None and (type(factor) is not int or factor < 2):
-            raise ValueError("sparse_mla_prefill_workspace_factor must be an integer >= 2")
         for name in ("expert_map_path", "expert_map_record_path"):
             value = getattr(self, name)
             if value is not None and (not isinstance(value, str) or not value.strip()):

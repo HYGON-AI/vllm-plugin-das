@@ -25,7 +25,6 @@ TARGETS = (
     f"{TARGET_MODULE}.FlashMLASparseImpl._bf16_flash_mla_kernel",
     f"{TARGET_MODULE}.split_decodes_and_prefills",
     f"{TARGET_MODULE}.FlashMLASparseMetadataBuilder._build_fp8_separate_prefill_decode",
-    f"{TARGET_MODULE}.FlashMLASparseImpl.__init__",
 )
 _MARKER = "_vllm_hcu_flashmla_sparse_applied"
 _WRAPPER = "_vllm_hcu_flashmla_sparse_wrapper"
@@ -181,10 +180,6 @@ def apply_to_module(module: ModuleType) -> bool:
     pcp_build_fp8_separate_prefill_decode.__kwdefaults__ = (
         build_fp8_separate_prefill_decode.__kwdefaults__
     )
-    from vllm_hcu.v1.attention.ops.sparse_mla_workspace import wrap_workspace_builder
-    pcp_build_fp8_separate_prefill_decode = wrap_workspace_builder(
-        pcp_build_fp8_separate_prefill_decode, "_hcu_workspace_pcp_build")
-
     @functools.wraps(build)
     def hcu_build(self, common_prefix_len, common_attn_metadata, fast_build=False):
         result = build(self, common_prefix_len, common_attn_metadata, fast_build)
@@ -342,11 +337,7 @@ def apply_to_module(module: ModuleType) -> bool:
 
 
 def apply(module: ModuleType | None = None) -> bool:
-    flash = load_exact_module(TARGET_MODULE, module)
-    changed = apply_to_module(flash)
-    from vllm_hcu.v1.attention.ops.sparse_mla_workspace import install_workspace_adapters
-    install_workspace_adapters(flash)
-    return changed
+    return apply_to_module(load_exact_module(TARGET_MODULE, module))
 
 
 __all__ = ["PATCH_ID", "TARGET_MODULE", "TARGETS", "apply", "apply_to_module"]
