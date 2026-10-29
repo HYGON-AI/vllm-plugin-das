@@ -140,6 +140,8 @@ assert not introduced, introduced
         "0.32.0.dev7",
         "0.32.0.post1",
         "0.32.0+rocm723",
+        "0.32.1",
+        "0.32.7+das.1",
     ),
 )
 def test_activation_accepts_the_vllm_032_release_line(
@@ -163,7 +165,7 @@ def test_activation_accepts_the_vllm_032_release_line(
 
 @pytest.mark.parametrize(
     "version",
-    (None, "not-a-version", "1!0.32.0", "0.31.0", "0.33.0"),
+    (None, "not-a-version", "1!0.32.0", "0.31.0", "0.31.9", "0.33.0"),
 )
 def test_activation_rejects_unsupported_metadata_before_importing_runtime(
     monkeypatch: pytest.MonkeyPatch, version: str | None
@@ -171,7 +173,10 @@ def test_activation_rejects_unsupported_metadata_before_importing_runtime(
     calls: list[str] = []
     monkeypatch.setattr(extension, "_import_module", successful_importer(calls))
 
-    with pytest.raises(extension.DasExtensionError, match="vLLM 0.32.0"):
+    with pytest.raises(
+        extension.DasExtensionError,
+        match=r">=0\.32\.0,<0\.33\.0",
+    ):
         extension.activate_extension(context(version))
 
     assert calls == []

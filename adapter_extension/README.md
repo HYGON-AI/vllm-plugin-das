@@ -15,8 +15,9 @@ operator-level capabilities.
 
 ## Compatibility
 
-- vLLM release: exactly `0.32.0`; prerelease, postrelease, development, and
-  local version suffixes on that release are accepted.
+- vLLM release line: `>=0.32.0,<0.33.0`; prerelease, postrelease,
+  development, patch, and local version suffixes are accepted when the
+  required operator APIs and LightOp capabilities are present.
 - Adapter distribution: `sgl-kernel>=0.1.0`, extension API v1 from
   `hcu_adapter.extensions`.
 - Runtime: a prepared HCU PyTorch/DTK/LightOp stack. LightOp is intentionally

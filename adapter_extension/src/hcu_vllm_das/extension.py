@@ -25,7 +25,7 @@ class DasExtensionError(RuntimeError):
     """Raised before an incompatible optimization can be activated."""
 
 
-def _require_vllm_032(raw_version: str | None) -> None:
+def _require_vllm_032_release_line(raw_version: str | None) -> None:
     try:
         parsed = Version(raw_version) if raw_version is not None else None
     except (InvalidVersion, TypeError):
@@ -33,10 +33,10 @@ def _require_vllm_032(raw_version: str | None) -> None:
     if (
         parsed is None
         or parsed.epoch != 0
-        or parsed.release != TARGET_VLLM_RELEASE
+        or parsed.release[:2] != TARGET_VLLM_RELEASE[:2]
     ):
         raise DasExtensionError(
-            "DAS adapter extension requires vLLM 0.32.0; "
+            "DAS adapter extension requires vLLM >=0.32.0,<0.33.0; "
             f"received {raw_version!r}"
         )
 
@@ -50,7 +50,7 @@ def activate_extension(context: ExtensionContext) -> None:
     """Validate and register the migrated optimization capability once."""
 
     global _activated
-    _require_vllm_032(context.vllm_version)
+    _require_vllm_032_release_line(context.vllm_version)
     with _activation_lock:
         if _activated:
             return
