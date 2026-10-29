@@ -1,6 +1,9 @@
 #!/usr/bin/env python3
 # SPDX-License-Identifier: Apache-2.0
-"""Replay the fixed workload and compare cached/uncached prefix continuations."""
+"""Compare cached/uncached continuations; server needs VLLM_SERVER_DEV_MODE=1.
+
+The server must be dedicated to this check: it resets the shared prefix cache.
+"""
 import argparse
 import json
 import random
@@ -8,6 +11,60 @@ import math
 import time
 import urllib.request
 from pathlib import Path
+
+
+def prefix_probe(request, completion, base, probe):
+    """Compare a cold probe with reuse caused only by its producer."""
+    def reset():
+        result = request("/reset_prefix_cache", {})
+        if result.get("success") is not True:
+            raise RuntimeError(f"prefix cache reset failed: {result!r}")
+
+    reset()
+    reference, _ = completion(probe, "prefix_uncached", max_tokens=8)
+    reset()
+    completion(base, "prefix_producer")
+    before = request("/metrics", raw=True)
+    cached, _ = completion(probe, "prefix_cached", max_tokens=8)
+    after = request("/metrics", raw=True)
+    return reference, cached, before, after
+
+
+def compare_logprobs(reference, cached):
+    """Validate complete per-token evidence and compare common top candidates."""
+    if not isinstance(reference, dict) or not isinstance(cached, dict):
+        raise ValueError("missing logprobs")
+    tokens = reference.get("tokens")
+    other_tokens = cached.get("tokens")
+    if not isinstance(tokens, list) or not tokens or tokens != other_tokens:
+        raise ValueError("missing or mismatched generated tokens")
+    count = len(tokens)
+    deltas = []
+
+    def add_delta(left, right):
+        if (not isinstance(left, (int, float)) or isinstance(left, bool)
+                or not isinstance(right, (int, float)) or isinstance(right, bool)
+                or not math.isfinite(left) or not math.isfinite(right)):
+            raise ValueError("missing or non-finite logprob")
+        deltas.append(abs(left - right))
+
+    for key in ("token_logprobs", "top_logprobs"):
+        left_rows, right_rows = reference.get(key), cached.get(key)
+        if (not isinstance(left_rows, list) or not isinstance(right_rows, list)
+                or len(left_rows) != count or len(right_rows) != count):
+            raise ValueError(f"missing or truncated {key}")
+        for left, right in zip(left_rows, right_rows):
+            if key == "token_logprobs":
+                add_delta(left, right)
+            else:
+                if not isinstance(left, dict) or not isinstance(right, dict):
+                    raise ValueError("missing top_logprobs row")
+                common = left.keys() & right.keys()
+                if not common:
+                    raise ValueError("top_logprobs rows have no common tokens")
+                for token in common:
+                    add_delta(left[token], right[token])
+    return max(deltas)
 
 
 def main():
@@ -64,11 +121,7 @@ def main():
     generator = random.Random(20261026)
     base = [generator.randrange(100000, 150000) for _ in range(4096)]
     probe = base[:3072] + [generator.randrange(50000, 99999) for _ in range(1024)]
-    reference, _ = completion(probe, "prefix_uncached", max_tokens=8)
-    completion(base, "prefix_producer")
-    before = request("/metrics", raw=True)
-    cached, _ = completion(probe, "prefix_cached", max_tokens=8)
-    after = request("/metrics", raw=True)
+    reference, cached, before, after = prefix_probe(request, completion, base, probe)
     (args.output / "metrics_before.txt").write_text(before)
     (args.output / "metrics_after.txt").write_text(after)
     ref_choice, choice = reference["choices"][0], cached["choices"][0]
@@ -76,20 +129,9 @@ def main():
         return sum(float(line.rsplit(" ", 1)[1]) for line in metrics.splitlines()
                    if line.startswith("vllm:prefix_cache_hits_total{"))
     hit_tokens = hits(after) - hits(before)
-    ref_logprobs = ref_choice.get("logprobs") or {}
-    cache_logprobs = choice.get("logprobs") or {}
-    def max_logprob_delta():
-        deltas = []
-        for key in ("token_logprobs",):
-            for left, right in zip(ref_logprobs.get(key) or [], cache_logprobs.get(key) or []):
-                if left is not None and right is not None:
-                    deltas.append(abs(left - right))
-        for left_row, right_row in zip(ref_logprobs.get("top_logprobs") or [],
-                                       cache_logprobs.get("top_logprobs") or []):
-            deltas.extend(abs(left_row[token] - right_row[token])
-                          for token in left_row.keys() & right_row.keys())
-        return max(deltas, default=0.0)
-    delta = max_logprob_delta()
+    ref_logprobs = ref_choice.get("logprobs")
+    cache_logprobs = choice.get("logprobs")
+    delta = compare_logprobs(ref_logprobs, cache_logprobs)
     token_pieces_equal = (ref_logprobs.get("tokens") == cache_logprobs.get("tokens"))
     summary = dict(text_equal=ref_choice["text"] == choice["text"],
                    token_pieces_equal=token_pieces_equal,

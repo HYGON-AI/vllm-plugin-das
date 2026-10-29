@@ -60,7 +60,7 @@ class KimiK3MixedKDAProjection(nn.Module):
         return torch.cat(values, dim=-1), None
 
     def _make_fused_qkv(self, input_size):
-        """Combine post-processed rank-local weights without modifying IPC cache."""
+        """Combine post-processed rank-local weights for fused QKV."""
         layers = [self.q_proj, self.k_proj, self.v_proj]
         scheme = layers[0].scheme
         if (getattr(scheme, "is_static_input_scheme", True)

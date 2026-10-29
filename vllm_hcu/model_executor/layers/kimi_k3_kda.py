@@ -321,8 +321,11 @@ def finalize_checkpoints(metadata, layer=None):
         )
     for conv_target, conv_values in payload.conv_snapshots:
         conv_target[payload.slots] = conv_values
+    payload.conv_snapshots.clear()
     if payload.recurrent_values is not None:
         payload.recurrent_target[payload.slots] = payload.recurrent_values
+        payload.recurrent_target = None
+        payload.recurrent_values = None
 
 
 def _chunk_gated_delta_rule_fwd_h_fp32(

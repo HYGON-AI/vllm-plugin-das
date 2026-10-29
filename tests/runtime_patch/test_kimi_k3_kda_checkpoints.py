@@ -81,6 +81,32 @@ def test_conv_checkpoints_survive_final_state_update():
     assert states[0].eq(-1).all()
 
 
+def test_finalization_does_not_replay_previous_layer_snapshots():
+    payload = kda.Checkpoints(torch.tensor([1]), torch.tensor([0]), (4,), (4,))
+    metadata = SimpleNamespace(nums_dict={kda.CHECKPOINT_KEY: payload})
+    first_conv = torch.zeros((2, 1, 2))
+    first_recurrent = torch.zeros((2, 1))
+    kda.save_conv_checkpoints(torch.tensor([[1., 2., 3., 4.]]), first_conv, metadata)
+    payload.recurrent_target = first_recurrent
+    payload.recurrent_values = torch.tensor([[5.]])
+    kda.finalize_checkpoints(metadata)
+    torch.testing.assert_close(first_conv[1], torch.tensor([[3., 4.]]))
+    torch.testing.assert_close(first_recurrent[1], torch.tensor([5.]))
+    assert payload.conv_snapshots == []
+    assert payload.recurrent_target is payload.recurrent_values is None
+
+    # A later layer uses the same metadata. Publishing it must not write the
+    # previous layer's cache again, even if that cache has since changed.
+    first_conv[1].fill_(9.)
+    first_recurrent[1].fill_(9.)
+    second_conv = torch.zeros_like(first_conv)
+    kda.save_conv_checkpoints(torch.tensor([[6., 7., 8., 9.]]), second_conv, metadata)
+    kda.finalize_checkpoints(metadata)
+    torch.testing.assert_close(first_conv[1], torch.tensor([[9., 9.]]))
+    torch.testing.assert_close(first_recurrent[1], torch.tensor([9.]))
+    torch.testing.assert_close(second_conv[1], torch.tensor([[8., 9.]]))
+
+
 def test_invalid_strategy_fails_explicitly(monkeypatch):
     monkeypatch.setenv("VLLM_KIMI_KDA_CACHE_STRATEGY", "extra_buffer")
     monkeypatch.setenv("VLLM_KIMI_KDA_PREFILL_BACKEND", "legacy")
