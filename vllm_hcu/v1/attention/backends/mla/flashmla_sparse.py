@@ -10,12 +10,43 @@ import torch
 from vllm.v1.attention.backends.mla.flashmla_sparse import (
     FlashMLASparseBackend,
     FlashMLASparseImpl,
+    FlashMLASparseMetadataBuilder,
 )
+
+
+class HcuFlashMLASparseMetadataBuilder(FlashMLASparseMetadataBuilder):
+    def build(self, common_prefix_len, common_attn_metadata, fast_build=False):
+        metadata = super().build(common_prefix_len, common_attn_metadata, fast_build)
+        from vllm_hcu.platforms import envs as henvs
+
+        if (
+            henvs.VLLM_HCU_SPARSE_MLA_PREFILL_WORKSPACE_DEDUP
+            and self.vllm_config.parallel_config.decode_context_parallel_size == 1
+        ):
+            from .workspace_dedup import build_workspace_metadata
+
+            metadata.hcu_workspace_dedup = build_workspace_metadata(
+                self, common_attn_metadata, metadata
+            )
+        return metadata
 
 
 class HcuFlashMLASparseImpl(FlashMLASparseImpl):
     supports_pcp: bool = True
     can_return_lse_for_decode: bool = True
+
+    def _forward_fp8_kv_separate_prefill_decode(
+        self, q, kv_c_and_k_pe_cache, topk_indices, attn_metadata
+    ):
+        if getattr(attn_metadata, "hcu_workspace_dedup", None) is None:
+            return super()._forward_fp8_kv_separate_prefill_decode(
+                q, kv_c_and_k_pe_cache, topk_indices, attn_metadata
+            )
+        from .workspace_dedup import forward_workspace_dedup
+
+        return forward_workspace_dedup(
+            self, q, kv_c_and_k_pe_cache, topk_indices, attn_metadata
+        )
 
     def forward_mqa(
         self,
@@ -51,20 +82,16 @@ class HcuFlashMLASparseImpl(FlashMLASparseImpl):
         num_actual_toks = q.shape[0]
         assert self.topk_indices_buffer is not None
         topk_indices = self.topk_indices_buffer[:num_actual_toks]
-        topk_indices, topk_length = (
-            triton_filter_and_convert_dcp_index(
-                attn_metadata.req_id_per_token[:num_actual_toks],
-                attn_metadata.block_table,
-                topk_indices,
-                dcp_size=self.dcp_world_size,
-                dcp_rank=self.dcp_rank,
-                cp_kv_cache_interleave_size=(
-                    attn_metadata.cp_kv_cache_interleave_size
-                ),
-                BLOCK_SIZE=attn_metadata.block_size,
-                NUM_TOPK_TOKENS=topk_indices.shape[1],
-                return_valid_counts=True,
-            )
+        topk_indices, topk_length = triton_filter_and_convert_dcp_index(
+            attn_metadata.req_id_per_token[:num_actual_toks],
+            attn_metadata.block_table,
+            topk_indices,
+            dcp_size=self.dcp_world_size,
+            dcp_rank=self.dcp_rank,
+            cp_kv_cache_interleave_size=(attn_metadata.cp_kv_cache_interleave_size),
+            BLOCK_SIZE=attn_metadata.block_size,
+            NUM_TOPK_TOKENS=topk_indices.shape[1],
+            return_valid_counts=True,
         )
         cache = kv_c_and_k_pe_cache.view(
             -1,
@@ -93,8 +120,16 @@ class HcuFlashMLASparseBackend(FlashMLASparseBackend):
         return "FLASHMLA_SPARSE"
 
     @staticmethod
+    def get_builder_cls() -> type[HcuFlashMLASparseMetadataBuilder]:
+        return HcuFlashMLASparseMetadataBuilder
+
+    @staticmethod
     def get_impl_cls() -> type[HcuFlashMLASparseImpl]:
         return HcuFlashMLASparseImpl
 
 
-__all__ = ["HcuFlashMLASparseBackend", "HcuFlashMLASparseImpl"]
+__all__ = [
+    "HcuFlashMLASparseBackend",
+    "HcuFlashMLASparseImpl",
+    "HcuFlashMLASparseMetadataBuilder",
+]

@@ -138,6 +138,7 @@ ext_modules = [
     CUDAExtension(
         name='vllm_hcu.hcu_ops', 
         sources=['vllm_hcu/csrc/hcu_cache_kernel.cu',
+                 'vllm_hcu/csrc/sparse_mla_workspace.cu',
                  'vllm_hcu/csrc/torch_bindings.cpp',
                  'vllm_hcu/csrc/custom_all_reduce.cu',
                  'vllm_hcu/csrc/hipblaslt_fp8_bmm.cu',

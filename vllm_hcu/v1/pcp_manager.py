@@ -745,10 +745,13 @@ class HcuPCPManager:
         """Populate canonical global rows before replicated draft decodes."""
         if input_batch is not self._global_batch:
             raise ValueError("draft block tables require the current global batch")
-        return self._block_tables.gather_block_tables(
+        tables = self._block_tables.gather_block_tables(
             input_batch.idx_mapping,
             num_reqs_padded=input_batch.num_reqs_after_padding,
         )
+        from vllm_hcu.v1.workspace_block_tables import attach_workspace_block_tables
+
+        return attach_workspace_block_tables(self._block_tables, tables, input_batch)
 
     def prepare_attn(
         self, input_batch: InputBatch
@@ -842,6 +845,11 @@ class HcuPCPManager:
         global_slots = self._global_slot_mappings[
             :, : self._global_batch.num_tokens
         ]
+        from vllm_hcu.v1.workspace_block_tables import attach_workspace_block_tables
+
+        block_tables = attach_workspace_block_tables(
+            self._block_tables, block_tables, self._global_batch
+        )
         return block_tables, global_slots
 
     def _convert_slot_mappings(self, global_slots: torch.Tensor) -> torch.Tensor:

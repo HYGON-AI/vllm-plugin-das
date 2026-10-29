@@ -2049,10 +2049,16 @@ def test_common_attention_metadata_accepts_hcu_fields_and_unpads():
     )
     adapter.apply_to_module(module)
     tensor = torch.arange(4)
+    host_table = torch.tensor([[5, 1], [5, 2]], dtype=torch.int32).numpy()
+    tensor._hcu_sparse_mla_workspace_cpu_table = host_table
     metadata = CommonAttentionMetadata(
         tensor, tensor, tensor, 1, 4, 4, 4, tensor, tensor,
         num_kv_actual_tokens=7, gather_indexes_tensor=tensor,
     )
+    assert metadata.sparse_mla_workspace_block_table_cpu is host_table
+    assert metadata.replace(max_seq_len=9).sparse_mla_workspace_block_table_cpu is host_table
+    assert metadata.unpadded(2, 1).sparse_mla_workspace_block_table_cpu.tolist() == [[5, 1]]
+    assert metadata.replace(block_table_tensor=torch.zeros(1)).sparse_mla_workspace_block_table_cpu is None
     assert metadata.num_kv_actual_tokens == 7
     assert metadata.gather_indexes_tensor is tensor
     assert metadata.replace(max_seq_len=9).num_kv_actual_tokens == 7

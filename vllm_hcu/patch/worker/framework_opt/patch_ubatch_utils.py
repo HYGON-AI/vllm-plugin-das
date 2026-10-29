@@ -98,6 +98,10 @@ def apply_to_module(module: ModuleType) -> bool:
         request_slice = ubatch_slice.request_slice
         positions = getattr(attn_metadata, "positions", None)
         is_prefilling = getattr(attn_metadata, "is_prefilling", None)
+        host = getattr(attn_metadata, "sparse_mla_workspace_block_table_cpu", None)
+        result.sparse_mla_workspace_block_table_cpu = (
+            None if host is None else host[request_slice]
+        )
         result.positions = None if positions is None else positions[token_slice]
         result.is_prefilling = (
             None if is_prefilling is None else is_prefilling[request_slice]
