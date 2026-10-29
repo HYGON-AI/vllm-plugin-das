@@ -971,6 +971,13 @@ def apply_to_module(module: ModuleType) -> bool:
             self._replay_start_np[req_index] = int(
                 getattr(new_req_data, "replay_start", 0) or 0
             )
+            req_id = getattr(new_req_data, "req_id", None)
+            if req_id is not None:
+                mapping = getattr(self, "_replay_req_id_to_index", None)
+                if mapping is None:
+                    mapping = {}
+                    self._replay_req_id_to_index = mapping
+                mapping[req_id] = int(req_index)
             layers = getattr(self, "decoder_replay_layers", None)
             if layers is None:
                 return
@@ -989,6 +996,26 @@ def apply_to_module(module: ModuleType) -> bool:
         raise PatchCompatibilityError(
             f"{TARGET_MODULE}.DeepseekV41ModelState.add_request is missing"
         )
+
+    # Preemption / finish calls remove_request before the slot is reused.
+    # Clear the APC floor so a resumed or recycled index cannot clamp SWA
+    # with a stale replay_start after KV was discarded.
+    original_remove = getattr(cls, "remove_request", None)
+    if callable(original_remove):
+
+        @functools.wraps(original_remove)
+        def replay_remove_request(self, req_id: str) -> None:
+            mapping = getattr(self, "_replay_req_id_to_index", None)
+            idx = mapping.pop(req_id, None) if mapping is not None else None
+            if idx is not None:
+                self._replay_start_np[idx] = 0
+                keeps = getattr(self, "_keeps_rows_np", None)
+                if keeps is not None:
+                    keeps[idx] = False
+            original_remove(self, req_id)
+
+        setattr(replay_remove_request, _WRAPPER, True)
+        cls.remove_request = replay_remove_request
 
     @functools.wraps(original_prepare)
     def replay_prepare(

@@ -57,6 +57,7 @@ SCHEDULER_TARGETS = (
     f"{SCHEDULER_TARGET_MODULE}.Scheduler.schedule",
     f"{SCHEDULER_TARGET_MODULE}.Scheduler._mark_prefix_replay",
     f"{SCHEDULER_TARGET_MODULE}.Scheduler._update_waiting_for_remote_kv",
+    f"{SCHEDULER_TARGET_MODULE}.Scheduler._preempt_request",
 )
 TARGETS = SCHEDULER_TARGETS
 
@@ -284,6 +285,9 @@ def apply_scheduler_to_module(module: ModuleType) -> bool:
     original_remote = require_callable(
         scheduler, "_update_waiting_for_remote_kv", SCHEDULER_TARGETS[3]
     )
+    original_preempt = require_callable(
+        scheduler, "_preempt_request", SCHEDULER_TARGETS[4]
+    )
 
     @functools.wraps(original_init)
     def hcu_init(
@@ -345,14 +349,25 @@ def apply_scheduler_to_module(module: ModuleType) -> bool:
             request.num_computed_tokens = request.num_tokens - 1
         self.finished_recving_kv_req_ids.remove(request.request_id)
 
+    @functools.wraps(original_preempt)
+    def hcu_preempt_request(self, request, *args: Any, **kwargs: Any) -> None:
+        # KV blocks are freed; drop the APC SWA floor so a later reschedule
+        # cannot clamp attention with a stale replay_start until a new hit
+        # re-marks via _mark_prefix_replay.
+        if hasattr(request, "replay_start"):
+            request.replay_start = 0
+        return original_preempt(self, request, *args, **kwargs)
+
     setattr(hcu_init, _WRAPPER, True)
     setattr(hcu_update_waiting_for_remote_kv, _WRAPPER, True)
+    setattr(hcu_preempt_request, _WRAPPER, True)
     functools.update_wrapper(hcu_update_waiting_for_remote_kv, original_remote)
 
     scheduler.__init__ = hcu_init  # type: ignore[method-assign]
     scheduler.schedule = _rebuild_schedule(original_schedule)  # type: ignore[method-assign]
     scheduler._mark_prefix_replay = _mark_prefix_replay  # type: ignore[method-assign]
     scheduler._update_waiting_for_remote_kv = hcu_update_waiting_for_remote_kv  # type: ignore[method-assign]
+    scheduler._preempt_request = hcu_preempt_request  # type: ignore[method-assign]
     setattr(target, _SCHEDULER_MARKER, True)
     return True
 

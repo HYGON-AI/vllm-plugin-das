@@ -279,6 +279,118 @@ def test_new_request_data_carries_replay_start():
     assert data.replay_start == 42
 
 
+def test_preempt_request_clears_replay_start(monkeypatch):
+    from types import ModuleType
+
+    module = ModuleType(patch_swa_bounded_replay_apc.SCHEDULER_TARGET_MODULE)
+
+    class Scheduler:
+        def __init__(self, *args, **kwargs):
+            del args, kwargs
+
+        def schedule(self, *args, **kwargs):
+            del args, kwargs
+            return None
+
+        def _update_waiting_for_remote_kv(self, request):
+            del request
+
+        def _preempt_request(self, request, *args, **kwargs):
+            del args, kwargs
+            request.preempted = True
+
+    module.Scheduler = Scheduler
+    # Stub schedule has no 0.29 needles; skip surgery for this contract test.
+    monkeypatch.setattr(
+        patch_swa_bounded_replay_apc,
+        "_rebuild_schedule",
+        lambda original: original,
+    )
+    assert patch_swa_bounded_replay_apc.apply_scheduler_to_module(module) is True
+
+    req = SimpleNamespace(replay_start=72, preempted=False)
+    sched = object.__new__(module.Scheduler)
+    sched._preempt_request(req)
+    assert req.preempted is True
+    assert req.replay_start == 0
+
+
+def test_remove_request_clears_replay_start_floor():
+    from types import ModuleType
+
+    from vllm_hcu.patch.worker.core_fix import (
+        patch_deepseek_v41_decoder_replay_state as state_patch,
+    )
+
+    module = ModuleType(state_patch.TARGET_MODULE)
+
+    class DeepseekV41ModelState:
+        def __init__(self, *args, **kwargs):
+            del args, kwargs
+
+        def prepare_attn(self, *args, **kwargs):
+            del args, kwargs
+
+        def add_request(self, req_index, new_req_data):
+            del req_index, new_req_data
+
+        def remove_request(self, req_id):
+            self.removed = req_id
+
+    module.DeepseekV41ModelState = DeepseekV41ModelState
+    assert state_patch.apply_to_module(module) is True
+
+    state = object.__new__(module.DeepseekV41ModelState)
+    state._replay_start_np = np.array([0, 72, 0], dtype=np.int32)
+    state._keeps_rows_np = np.array([False, True, False], dtype=np.bool_)
+    state._replay_req_id_to_index = {"r1": 1}
+    state.removed = None
+    state.remove_request("r1")
+    assert state.removed == "r1"
+    assert state._replay_start_np[1] == 0
+    assert not bool(state._keeps_rows_np[1])
+    assert "r1" not in state._replay_req_id_to_index
+
+
+def test_async_engine_args_accepts_swa_bounded_replay():
+    from dataclasses import dataclass
+    from types import ModuleType
+
+    from vllm_hcu.patch.platform.core_fix import patch_cache_config
+
+    module = ModuleType(patch_cache_config.ENGINE_TARGET_MODULE)
+
+    @dataclass
+    class EngineArgs:
+        max_model_len: int = 1024
+
+        @staticmethod
+        def add_cli_args(parser):
+            return parser
+
+        @classmethod
+        def from_cli_args(cls, args):
+            del args
+            return cls()
+
+        def create_engine_config(self, *args, **kwargs):
+            del args, kwargs
+            return SimpleNamespace(cache_config=SimpleNamespace())
+
+    @dataclass
+    class AsyncEngineArgs(EngineArgs):
+        enable_log_requests: bool = False
+
+    module.EngineArgs = EngineArgs
+    module.AsyncEngineArgs = AsyncEngineArgs
+    assert patch_cache_config.apply_engine_args_to_module(module) is True
+
+    async_args = module.AsyncEngineArgs(swa_bounded_replay=False)
+    assert async_args.swa_bounded_replay is False
+    default_args = module.AsyncEngineArgs()
+    assert default_args.swa_bounded_replay is True
+
+
 def test_pad_replayed_slots_pads_cacheable_groups_only():
     from vllm.v1.attention.backends.utils import PAD_SLOT_ID
 
@@ -417,37 +529,85 @@ def test_replay_buffers_cover_pcp_request_capacity(
     ids=("two_requests", "fragmented_requests", "reproduced_batch"),
 )
 def test_pcp_replay_keeps_multi_request_boundaries(monkeypatch, idx_mapping_np):
+    """Multi-req PCP must build per-logical-request tails (not a single span)."""
     from vllm.config.compilation import CUDAGraphMode
+    from vllm.distributed import parallel_state
 
-    def reject_packed_layout(**kwargs):
-        pytest.fail("Multiple requests must not use single-request tail metadata")
+    class FakeGroup:
+        world_size = 8
+        rank_in_group = 0
+
+    monkeypatch.setattr(parallel_state, "get_pcp_group", lambda: FakeGroup())
+
+    captured: dict[str, object] = {}
+    real_layout = patch_deepseek_v41_decoder_replay_state.late_layer_tail_layout
+
+    def spy_layout(**kwargs):
+        captured["extend_lens_cpu"] = list(kwargs["extend_lens_cpu"])
+        captured["seq_lens_cpu"] = list(kwargs["seq_lens_cpu"])
+        return real_layout(**kwargs)
 
     monkeypatch.setattr(
-        patch_deepseek_v41_decoder_replay_state,
-        "late_layer_tail_layout",
-        reject_packed_layout,
+        patch_deepseek_v41_decoder_replay_state, "late_layer_tail_layout", spy_layout
     )
+
     num_reqs = len(idx_mapping_np)
+    unique_ids = np.unique(idx_mapping_np)
+    n_logical = int(unique_ids.shape[0])
+    # Per-logical extend / seq lens (local rows share the logical id's values).
+    logical_extend = {int(i): 200 + 10 * int(i) for i in unique_ids}
+    logical_seq = {int(i): 400 + 10 * int(i) for i in unique_ids}
+    global_query = np.array(
+        [logical_extend[int(i)] for i in idx_mapping_np], dtype=np.int32
+    )
+    global_seq = np.array(
+        [logical_seq[int(i)] for i in idx_mapping_np], dtype=np.int32
+    )
     layers = SimpleNamespace(window=128, replay_batch=object())
-    state = SimpleNamespace(decoder_replay_layers=layers)
+    state = SimpleNamespace(
+        decoder_replay_layers=layers,
+        _keeps_rows_np=np.zeros(max(int(idx_mapping_np.max()) + 1, 1), dtype=np.bool_),
+        vllm_config=SimpleNamespace(),
+        device=torch.device("cpu"),
+        _replay_attn_groups=None,
+        _kept_kv_start=torch.zeros(n_logical + 8, dtype=torch.int32),
+        pcp_size=8,
+    )
     input_batch = SimpleNamespace(
         num_reqs=num_reqs,
-        num_tokens_after_padding=num_reqs,
+        num_tokens_after_padding=sum(logical_extend[int(i)] for i in unique_ids),
         idx_mapping_np=idx_mapping_np,
         query_start_loc_np=np.arange(num_reqs + 1, dtype=np.int32),
-        seq_lens_cpu_upper_bound=torch.full((num_reqs,), 128, dtype=torch.int32),
-        pcp=SimpleNamespace(),
+        seq_lens_cpu_upper_bound=torch.as_tensor(global_seq, dtype=torch.int32),
+        positions=torch.arange(int(global_query.sum()) + 8, dtype=torch.int64),
+        is_prefilling_np=np.ones(num_reqs, dtype=np.bool_),
+        # Restore metadata intentionally missing → fall back after layout.
+        pcp=SimpleNamespace(
+            global_query_lens_np=global_query,
+            global_seq_lens_cpu_upper_bound_np=global_seq,
+            global_num_tokens=int(global_query.sum()),
+        ),
     )
     patch_deepseek_v41_decoder_replay_state._prepare_replay_batch(
         state,
         input_batch,
         CUDAGraphMode.NONE,
         block_tables=(),
-        slot_mappings=torch.empty((0, 0), dtype=torch.int64),
+        slot_mappings=torch.empty((1, 0), dtype=torch.int64),
         attn_groups=[],
         kv_cache_config=SimpleNamespace(),
         replay_start=torch.zeros(num_reqs, dtype=torch.int32),
     )
+    # One entry per logical request (first occurrence order).
+    _, first = np.unique(idx_mapping_np, return_index=True)
+    first = np.sort(first)
+    assert captured["extend_lens_cpu"] == [
+        logical_extend[int(idx_mapping_np[i])] for i in first
+    ]
+    assert captured["seq_lens_cpu"] == [
+        logical_seq[int(idx_mapping_np[i])] for i in first
+    ]
+    # Missing DualChunk restore metadata → no PCP interleaved replay batch.
     assert layers.replay_batch is None
 
 

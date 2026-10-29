@@ -40,6 +40,7 @@ ENGINE_TARGETS = (
     f"{ENGINE_TARGET_MODULE}.EngineArgs.add_cli_args",
     f"{ENGINE_TARGET_MODULE}.EngineArgs.from_cli_args",
     f"{ENGINE_TARGET_MODULE}.EngineArgs.create_engine_config",
+    f"{ENGINE_TARGET_MODULE}.AsyncEngineArgs.__init__",
 )
 _CACHE_MARKER = "_vllm_hcu_swa_bounded_replay_cache_applied"
 _ENGINE_MARKER = "_vllm_hcu_swa_bounded_replay_engine_applied"
@@ -207,6 +208,25 @@ def _install_engine_args(module: ModuleType | None = None) -> bool:
         return config
 
     setattr(engine_args, "create_engine_config", swa_create_engine_config)
+
+    # AsyncEngineArgs has its own generated dataclass __init__; wrap it so
+    # AsyncEngineArgs(swa_bounded_replay=False) is accepted like EngineArgs.
+    async_engine_args = getattr(arg_utils, "AsyncEngineArgs", None)
+    if isinstance(async_engine_args, type):
+        setattr(async_engine_args, "swa_bounded_replay", _DEFAULT)
+        async_init = vars(async_engine_args).get("__init__")
+        if callable(async_init):
+
+            @functools.wraps(async_init)
+            def swa_async_init(self, *args: Any, **kwargs: Any) -> None:
+                value = kwargs.pop("swa_bounded_replay", _DEFAULT)
+                if value is None:
+                    value = _DEFAULT
+                async_init(self, *args, **kwargs)
+                object.__setattr__(self, "swa_bounded_replay", bool(value))
+
+            setattr(async_engine_args, "__init__", swa_async_init)
+
     setattr(arg_utils, _ENGINE_MARKER, True)
     return True
 
