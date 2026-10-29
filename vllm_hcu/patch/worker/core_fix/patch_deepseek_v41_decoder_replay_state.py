@@ -470,10 +470,10 @@ def _prepare_replay_batch(
     needs_replay_batch = False
 
     if pcp is not None:
-        # One row per logical request (PCP may expand idx_mapping).
-        _, first_indices = np.unique(idx_mapping_np, return_index=True)
-        first_indices = np.sort(first_indices)
-
+        # Check DualChunk restore metadata *before* indexing global tails.
+        # Falling back to rank-local ``positions`` with global token indices
+        # OOBs when the global sequence is longer than the local batch, and
+        # never reaches the missing-metadata fallback below.
         from types import SimpleNamespace
 
         from vllm.distributed.parallel_state import get_pcp_group
@@ -481,58 +481,6 @@ def _prepare_replay_batch(
             logical_pcp_metadata_scope,
         )
 
-        extend_lens_cpu = [
-            int(pcp.global_query_lens_np[i]) for i in first_indices
-        ]
-        seq_lens_g_cpu = [
-            int(pcp.global_seq_lens_cpu_upper_bound_np[i]) for i in first_indices
-        ]
-        # prompt_logprobs rows must keep the full extend; others take the SWA
-        # window. keeps_rows is indexed by local batch rows (== first_indices
-        # representatives for each logical request).
-        per_request_tail_lens = [
-            int(extend_lens_cpu[j])
-            if bool(keeps_rows[int(first_indices[j])])
-            else min(int(layers.window), int(extend_lens_cpu[j]))
-            for j in range(len(extend_lens_cpu))
-        ]
-        device = slot_mappings.device
-        token_indices, tail_lens_cpu, window_floors = late_layer_tail_layout(
-            extend_lens_cpu=extend_lens_cpu,
-            seq_lens_cpu=seq_lens_g_cpu,
-            tail_len=int(layers.window),
-            device=device,
-            per_request_tail_lens=per_request_tail_lens,
-        )
-        global_positions = getattr(
-            input_batch, "_vllm_hcu_pcp_global_positions", None
-        )
-        if global_positions is None:
-            global_positions = input_batch.positions
-        tail_positions = global_positions[: int(pcp.global_num_tokens)].index_select(
-            0, token_indices
-        )
-        pcp_group = get_pcp_group()
-        pcp_size = int(pcp_group.world_size)
-        pcp_rank = int(pcp_group.rank_in_group)
-        tail_lens_t = torch.tensor(tail_lens_cpu, dtype=torch.int32, device=device)
-        # HCU fused SWA builders need contiguous Q rows: replicate the full
-        # global tail on every rank (logical CP width 1). Physical DualChunk
-        # ownership is still used in decoder_replay.to_local_tail / scatter.
-        pcp_tail_plan = late_layer_tail_cp_layout(
-            token_indices=token_indices,
-            tail_lens=tail_lens_t,
-            positions=tail_positions,
-            window_floors=window_floors,
-            pcp_rank=0,
-            pcp_size=1,
-            batch_size=len(extend_lens_cpu),
-        )
-        num_padded = int(pcp_tail_plan.max_local)
-        num_tokens = int(pcp_tail_plan.num_real)
-        needs_replay_batch = force_replay_batch or (
-            num_padded < int(input_batch.num_tokens_after_padding)
-        )
         restore_idx = getattr(input_batch, "_vllm_hcu_pcp_restore_idx", None)
         local_num_tokens = getattr(
             input_batch, "_vllm_hcu_pcp_local_num_tokens", None
@@ -540,18 +488,72 @@ def _prepare_replay_batch(
         global_num_tokens = getattr(
             input_batch, "_vllm_hcu_pcp_global_num_tokens", None
         )
+        global_positions = getattr(
+            input_batch, "_vllm_hcu_pcp_global_positions", None
+        )
         if (
             restore_idx is None
             or local_num_tokens is None
             or global_num_tokens is None
+            or global_positions is None
         ):
             logger.warning_once(
                 "Decoder SWA PCP late-tail: missing restore metadata; "
                 "falling back to non-PCP trim."
             )
-            pcp_tail_plan = None
             pcp = None  # fall through to non-PCP path below
         else:
+            # One row per logical request (PCP may expand idx_mapping).
+            _, first_indices = np.unique(idx_mapping_np, return_index=True)
+            first_indices = np.sort(first_indices)
+
+            extend_lens_cpu = [
+                int(pcp.global_query_lens_np[i]) for i in first_indices
+            ]
+            seq_lens_g_cpu = [
+                int(pcp.global_seq_lens_cpu_upper_bound_np[i]) for i in first_indices
+            ]
+            # prompt_logprobs rows must keep the full extend; others take the SWA
+            # window. keeps_rows is indexed by local batch rows (== first_indices
+            # representatives for each logical request).
+            per_request_tail_lens = [
+                int(extend_lens_cpu[j])
+                if bool(keeps_rows[int(first_indices[j])])
+                else min(int(layers.window), int(extend_lens_cpu[j]))
+                for j in range(len(extend_lens_cpu))
+            ]
+            device = slot_mappings.device
+            token_indices, tail_lens_cpu, window_floors = late_layer_tail_layout(
+                extend_lens_cpu=extend_lens_cpu,
+                seq_lens_cpu=seq_lens_g_cpu,
+                tail_len=int(layers.window),
+                device=device,
+                per_request_tail_lens=per_request_tail_lens,
+            )
+            tail_positions = global_positions[: int(global_num_tokens)].index_select(
+                0, token_indices
+            )
+            pcp_group = get_pcp_group()
+            pcp_size = int(pcp_group.world_size)
+            pcp_rank = int(pcp_group.rank_in_group)
+            tail_lens_t = torch.tensor(tail_lens_cpu, dtype=torch.int32, device=device)
+            # HCU fused SWA builders need contiguous Q rows: replicate the full
+            # global tail on every rank (logical CP width 1). Physical DualChunk
+            # ownership is still used in decoder_replay.to_local_tail / scatter.
+            pcp_tail_plan = late_layer_tail_cp_layout(
+                token_indices=token_indices,
+                tail_lens=tail_lens_t,
+                positions=tail_positions,
+                window_floors=window_floors,
+                pcp_rank=0,
+                pcp_size=1,
+                batch_size=len(extend_lens_cpu),
+            )
+            num_padded = int(pcp_tail_plan.max_local)
+            num_tokens = int(pcp_tail_plan.num_real)
+            needs_replay_batch = force_replay_batch or (
+                num_padded < int(input_batch.num_tokens_after_padding)
+            )
             pcp_meta = SimpleNamespace(
                 pcp_world_size=pcp_size,
                 pcp_has_global_prefill=True,

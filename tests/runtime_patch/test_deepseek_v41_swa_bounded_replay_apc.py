@@ -706,19 +706,27 @@ def test_pcp_replay_keeps_multi_request_boundaries(monkeypatch, idx_mapping_np):
         _kept_kv_start=torch.zeros(n_logical + 8, dtype=torch.int32),
         pcp_size=8,
     )
+    global_num_tokens = int(global_query.sum())
+    # Unknown slot width → late-tail cannot restore; skip trim after layout.
+    slot_mappings = torch.arange(3, dtype=torch.int64).unsqueeze(0)
     input_batch = SimpleNamespace(
         num_reqs=num_reqs,
         num_tokens_after_padding=sum(logical_extend[int(i)] for i in unique_ids),
         idx_mapping_np=idx_mapping_np,
         query_start_loc_np=np.arange(num_reqs + 1, dtype=np.int32),
         seq_lens_cpu_upper_bound=torch.as_tensor(global_seq, dtype=torch.int32),
-        positions=torch.arange(int(global_query.sum()) + 8, dtype=torch.int64),
+        positions=torch.arange(global_num_tokens + 8, dtype=torch.int64),
         is_prefilling_np=np.ones(num_reqs, dtype=np.bool_),
-        # Restore metadata intentionally missing → fall back after layout.
         pcp=SimpleNamespace(
             global_query_lens_np=global_query,
             global_seq_lens_cpu_upper_bound_np=global_seq,
-            global_num_tokens=int(global_query.sum()),
+            global_num_tokens=global_num_tokens,
+        ),
+        _vllm_hcu_pcp_restore_idx=torch.arange(global_num_tokens, dtype=torch.long),
+        _vllm_hcu_pcp_local_num_tokens=max(global_num_tokens // 8, 1),
+        _vllm_hcu_pcp_global_num_tokens=global_num_tokens,
+        _vllm_hcu_pcp_global_positions=torch.arange(
+            global_num_tokens, dtype=torch.int64
         ),
     )
     patch_deepseek_v41_decoder_replay_state._prepare_replay_batch(
@@ -726,7 +734,7 @@ def test_pcp_replay_keeps_multi_request_boundaries(monkeypatch, idx_mapping_np):
         input_batch,
         CUDAGraphMode.NONE,
         block_tables=(),
-        slot_mappings=torch.empty((1, 0), dtype=torch.int64),
+        slot_mappings=slot_mappings,
         attn_groups=[],
         kv_cache_config=SimpleNamespace(),
         replay_start=torch.zeros(num_reqs, dtype=torch.int32),
@@ -740,8 +748,72 @@ def test_pcp_replay_keeps_multi_request_boundaries(monkeypatch, idx_mapping_np):
     assert captured["seq_lens_cpu"] == [
         logical_seq[int(idx_mapping_np[i])] for i in first
     ]
-    # Missing DualChunk restore metadata → no PCP interleaved replay batch.
+    # Unknown slot width → skip PCP interleaved trim (full execution).
     assert layers.replay_batch is None
+
+
+def test_pcp_missing_restore_metadata_falls_back_before_global_index(
+    monkeypatch,
+):
+    """Missing DualChunk meta must not index_select global tails with local positions."""
+    from vllm.config.compilation import CUDAGraphMode
+    from vllm.distributed import parallel_state
+
+    class FakeGroup:
+        world_size = 8
+        rank_in_group = 0
+
+    monkeypatch.setattr(parallel_state, "get_pcp_group", lambda: FakeGroup())
+
+    called = {"layout": False}
+
+    def boom_layout(**kwargs):
+        called["layout"] = True
+        raise AssertionError("late_layer_tail_layout must not run without restore meta")
+
+    monkeypatch.setattr(
+        patch_deepseek_v41_decoder_replay_state, "late_layer_tail_layout", boom_layout
+    )
+
+    # Local positions shorter than global span that a naive index_select would use.
+    layers = SimpleNamespace(window=128, replay_batch=object())
+    state = SimpleNamespace(
+        decoder_replay_layers=layers,
+        _keeps_rows_np=np.zeros(2, dtype=np.bool_),
+        vllm_config=SimpleNamespace(),
+        device=torch.device("cpu"),
+        _replay_attn_groups=None,
+        _kept_kv_start=torch.zeros(8, dtype=torch.int32),
+        pcp_size=8,
+    )
+    input_batch = SimpleNamespace(
+        num_reqs=2,
+        num_tokens_after_padding=4,
+        idx_mapping_np=np.array([0, 1], dtype=np.int32),
+        query_start_loc_np=np.array([0, 2, 4], dtype=np.int32),
+        seq_lens_cpu_upper_bound=torch.tensor([400, 500], dtype=torch.int32),
+        positions=torch.arange(4, dtype=torch.int64),  # rank-local only
+        is_prefilling_np=np.ones(2, dtype=np.bool_),
+        pcp=SimpleNamespace(
+            global_query_lens_np=np.array([200, 200], dtype=np.int32),
+            global_seq_lens_cpu_upper_bound_np=np.array([400, 500], dtype=np.int32),
+            global_num_tokens=400,
+        ),
+        # Intentionally omit _vllm_hcu_pcp_global_positions / restore_idx.
+    )
+    patch_deepseek_v41_decoder_replay_state._prepare_replay_batch(
+        state,
+        input_batch,
+        CUDAGraphMode.NONE,
+        block_tables=(),
+        slot_mappings=torch.empty((1, 4), dtype=torch.int64),
+        attn_groups=[],
+        kv_cache_config=SimpleNamespace(),
+        replay_start=torch.zeros(2, dtype=torch.int32),
+    )
+    assert called["layout"] is False
+    # Falls back to non-PCP local trim (may still set a local replay_batch).
+    # Must not OOB before that fallback.
 
 
 def test_pcp_replicated_tail_restores_outputs_without_duplicate_gather(monkeypatch):
