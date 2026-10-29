@@ -139,6 +139,12 @@ __global__ void gemm_nt_bf16_fp32(
     }
   }
 }
+
+// The current DTK toolchain emits an empty gfx938 code object when the split-K raw
+// LDS load path is present in this JIT translation unit. Keep it out of device
+// compilation until it can be built as an independent extension.
+#define VLLM_HCU_ENABLE_MMAC_SPLITK 0
+#if VLLM_HCU_ENABLE_MMAC_SPLITK
 // Split-K variant with double-buffered LDS staging; partial sums are
 // accumulated with atomicAdd, so the output must be zero-initialized.
 template <int kWarps, int kNPerBlock, int kStage, int kSplit>
@@ -228,10 +234,10 @@ __global__ void gemm_nt_bf16_fp32_splitk(
     }
   }
 }
-
 static bool uses_splitk(int64_t m, int64_t n, int64_t k) {
   return k % 512 == 0 && (n == 1024 || (n == 2048 && m >= 8));
 }
+#endif
 
 torch::Tensor linear_bf16_fp32_mmac(torch::Tensor x, torch::Tensor w) {
   TORCH_CHECK(x.dim() == 2 && w.dim() == 2, "x and w must be 2-D");
@@ -250,7 +256,11 @@ torch::Tensor linear_bf16_fp32_mmac(torch::Tensor x, torch::Tensor w) {
   TORCH_CHECK(k > 0 && k % 128 == 0, "K must be a multiple of 128, got ", k);
 
   const at::cuda::OptionalCUDAGuard device_guard(device_of(x));
+#if VLLM_HCU_ENABLE_MMAC_SPLITK
   const bool splitk = uses_splitk(m, n, k);
+#else
+  constexpr bool splitk = false;
+#endif
   auto out = splitk
       ? torch::zeros({m, n}, x.options().dtype(torch::kFloat32))
       : torch::empty({m, n}, x.options().dtype(torch::kFloat32));
@@ -261,6 +271,7 @@ torch::Tensor linear_bf16_fp32_mmac(torch::Tensor x, torch::Tensor w) {
   const int mi = static_cast<int>(m), ni = static_cast<int>(n),
             ki = static_cast<int>(k);
   const unsigned blocks_y = static_cast<unsigned>((m + 15) / 16);
+#if VLLM_HCU_ENABLE_MMAC_SPLITK
   if (splitk) {
     const dim3 grid(static_cast<unsigned>(n / 64), blocks_y, n == 1024 ? 8 : 4);
     if (n == 1024) {
@@ -270,7 +281,9 @@ torch::Tensor linear_bf16_fp32_mmac(torch::Tensor x, torch::Tensor w) {
       hipLaunchKernelGGL((gemm_nt_bf16_fp32_splitk<4, 64, 64, 4>), grid,
                          dim3(256), 0, stream, a, b, o, mi, ni, ki);
     }
-  } else {
+  } else
+#endif
+  {
     const dim3 grid(static_cast<unsigned>(n / 16), blocks_y);
     hipLaunchKernelGGL((gemm_nt_bf16_fp32<4, 16>), grid, dim3(256),
                        2 * 16 * 16 * sizeof(float), stream, a, b, o, mi, ni,
