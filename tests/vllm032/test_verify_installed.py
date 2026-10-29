@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+from enum import Enum
 import json
 import os
 from pathlib import Path, PurePosixPath
@@ -64,6 +65,18 @@ class HcuRMSNorm:
 HcuRMSNorm.__module__ = "hcu_vllm_das.rms_norm"
 
 
+class HcuAiterInt8Experts:
+    pass
+
+
+HcuAiterInt8Experts.__module__ = "hcu_vllm_das.moe.int8_oracle"
+
+
+class Int8MoeBackend(Enum):
+    TRITON = "TRITON"
+    AITER = "AITER"
+
+
 class HcuPlatform:
     pass
 
@@ -97,6 +110,9 @@ def installed_fixture(monkeypatch: pytest.MonkeyPatch, tmp_path: Path):
             [
                 "hcu_vllm_das/extension.py",
                 "hcu_vllm_das/rms_norm.py",
+                "hcu_vllm_das/moe/__init__.py",
+                "hcu_vllm_das/moe/fused_moe_aiter.py",
+                "hcu_vllm_das/moe/int8_oracle.py",
                 "hcu_vllm_das_plugin-0.2.0.dist-info/RECORD",
             ],
         ),
@@ -129,7 +145,9 @@ def installed_fixture(monkeypatch: pytest.MonkeyPatch, tmp_path: Path):
             entry_point_name="das_hcu",
             extension_name="das-hcu",
             status=ActiveStatus(),
-            capabilities=frozenset({"lightop-rms-norm"}),
+            capabilities=frozenset(
+                {"lightop-rms-norm", "aiter-int8-moe"}
+            ),
             reason="",
         )
     ]
@@ -163,6 +181,25 @@ def installed_fixture(monkeypatch: pytest.MonkeyPatch, tmp_path: Path):
         "hcu_vllm_das.rms_norm": SimpleNamespace(
             __file__=os.fspath(site / "hcu_vllm_das" / "rms_norm.py")
         ),
+        "hcu_vllm_das.moe.int8_oracle": SimpleNamespace(
+            __file__=os.fspath(
+                site / "hcu_vllm_das" / "moe" / "int8_oracle.py"
+            ),
+            HcuAiterInt8Experts=HcuAiterInt8Experts,
+        ),
+        "vllm.model_executor.layers.fused_moe.oracle.int8": SimpleNamespace(
+            Int8MoeBackend=Int8MoeBackend,
+            map_int8_backend=lambda value: (
+                Int8MoeBackend.AITER
+                if value == "aiter"
+                else Int8MoeBackend.TRITON
+            ),
+            backend_to_kernel_cls=lambda backend: (
+                [HcuAiterInt8Experts]
+                if backend is Int8MoeBackend.AITER
+                else [object]
+            ),
+        ),
         "vllm.model_executor.custom_op": SimpleNamespace(
             op_registry_oot={"RMSNorm": HcuRMSNorm}
         ),
@@ -194,12 +231,12 @@ def test_attestation_accepts_owned_wheels_and_active_extension(
 
     report = verify_installed.collect_attestation()
 
-    assert report["schema_version"] == 2
+    assert report["schema_version"] == 3
     assert report["vllm"]["version"] == "0.32.0+rocm723"
     assert report["adapter"]["version"] == "0.1.0"
     assert report["plugin"]["version"] == "0.2.0.dev0"
     assert report["extension"] == {
-        "capabilities": ["lightop-rms-norm"],
+        "capabilities": ["aiter-int8-moe", "lightop-rms-norm"],
         "entry_point": "das_hcu",
         "name": "das-hcu",
         "status": "active",
@@ -207,6 +244,19 @@ def test_attestation_accepts_owned_wheels_and_active_extension(
     assert report["platform"] == "hcu_adapter.bridges.vllm.HcuPlatform"
     assert report["oot_classes"] == {
         "RMSNorm": "hcu_vllm_das.rms_norm.HcuRMSNorm",
+    }
+    assert report["int8_moe"] == {
+        "backend": "AITER",
+        "experts_class": (
+            "hcu_vllm_das.moe.int8_oracle.HcuAiterInt8Experts"
+        ),
+        "oracle_module_origin": os.fspath(
+            tmp_path
+            / "site-packages"
+            / "hcu_vllm_das"
+            / "moe"
+            / "int8_oracle.py"
+        ),
     }
     json.dumps(report, sort_keys=True)
 
@@ -347,5 +397,35 @@ def test_attestation_rejects_a_missing_required_capability(
     with pytest.raises(
         verify_installed.InstalledVerificationError,
         match="lightop-rms-norm",
+    ):
+        verify_installed.collect_attestation()
+
+
+def test_attestation_rejects_an_unowned_int8_oracle_module(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    _distributions, _points, _reports, modules = installed_fixture(
+        monkeypatch, tmp_path
+    )
+    modules["hcu_vllm_das.moe.int8_oracle"].__file__ = "/unowned/oracle.py"
+
+    with pytest.raises(verify_installed.InstalledVerificationError, match="not owned"):
+        verify_installed.collect_attestation()
+
+
+def test_attestation_rejects_a_non_aiter_explicit_selector(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    _distributions, _points, _reports, modules = installed_fixture(
+        monkeypatch, tmp_path
+    )
+    official_oracle = modules[
+        "vllm.model_executor.layers.fused_moe.oracle.int8"
+    ]
+    official_oracle.map_int8_backend = lambda value: Int8MoeBackend.TRITON
+
+    with pytest.raises(
+        verify_installed.InstalledVerificationError,
+        match="explicit AITER",
     ):
         verify_installed.collect_attestation()

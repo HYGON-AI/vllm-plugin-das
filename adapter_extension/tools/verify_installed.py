@@ -13,11 +13,16 @@ import sys
 from packaging.version import InvalidVersion, Version
 
 
-_REQUIRED_CAPABILITIES = frozenset({"lightop-rms-norm"})
+_REQUIRED_CAPABILITIES = frozenset(
+    {"lightop-rms-norm", "aiter-int8-moe"}
+)
 _REQUIRED_OOT_CLASSES = {
     "RMSNorm": "hcu_vllm_das.rms_norm.HcuRMSNorm",
 }
 _REQUIRED_PLATFORM = "hcu_adapter.bridges.vllm.HcuPlatform"
+_REQUIRED_INT8_EXPERT = (
+    "hcu_vllm_das.moe.int8_oracle.HcuAiterInt8Experts"
+)
 
 
 class InstalledVerificationError(RuntimeError):
@@ -231,8 +236,42 @@ def collect_attestation() -> dict[str, object]:
         _module_origin(oot_module, plugin_owned, "hcu-vllm-das-plugin")
         oot_classes[class_name] = oot_name
 
+    plugin_int8_oracle = _import_module("hcu_vllm_das.moe.int8_oracle")
+    oracle_origin = _module_origin(
+        plugin_int8_oracle,
+        plugin_owned,
+        "hcu-vllm-das-plugin",
+    )
+    official_int8_oracle = _import_module(
+        "vllm.model_executor.layers.fused_moe.oracle.int8"
+    )
+    try:
+        selected_backend = official_int8_oracle.map_int8_backend("aiter")
+        selected_classes = official_int8_oracle.backend_to_kernel_cls(
+            selected_backend
+        )
+    except Exception as error:
+        raise InstalledVerificationError(
+            f"explicit AITER INT8 selector is unavailable: {error}"
+        ) from error
+    backend_name = getattr(selected_backend, "value", None)
+    experts_class = getattr(plugin_int8_oracle, "HcuAiterInt8Experts", None)
+    if backend_name != "AITER" or selected_classes != [experts_class]:
+        raise InstalledVerificationError(
+            "explicit AITER INT8 selector did not resolve to the Plugin expert"
+        )
+    experts_name = (
+        f"{experts_class.__module__}.{experts_class.__qualname__}"
+        if isinstance(experts_class, type)
+        else ""
+    )
+    if experts_name != _REQUIRED_INT8_EXPERT:
+        raise InstalledVerificationError(
+            f"AITER INT8 expert has unexpected owner: {experts_name}"
+        )
+
     return {
-        "schema_version": 2,
+        "schema_version": 3,
         "vllm": {
             **_distribution_report(vllm_dist, vllm_record),
             "module_origin": vllm_origin,
@@ -254,6 +293,11 @@ def collect_attestation() -> dict[str, object]:
         },
         "platform": platform_name,
         "oot_classes": oot_classes,
+        "int8_moe": {
+            "backend": backend_name,
+            "experts_class": experts_name,
+            "oracle_module_origin": oracle_origin,
+        },
     }
 
 

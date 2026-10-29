@@ -5,16 +5,18 @@
 lifecycle; this wheel contributes optional, independently removable operator
 optimizations through the adapter extension API.
 
-Version `0.2.0.dev0` contains one retained, default-OFF `gfx936` candidate:
+Version `0.2.0.dev0` contains two independently selected capabilities:
 
-- LightOp ordinary and fused-add `RMSNorm`.
+- a default-OFF LightOp ordinary and fused-add `RMSNorm` candidate; and
+- an explicit AITER INT8 W8A8 MoE route selected by
+  `--moe-backend aiter`.
 
 vLLM's native `SiluAndMul` remains the selected implementation. Warmed
 compiled A/B measurements on `gfx936` did not justify replacing the upstream
 operator, so the plugin neither registers nor ships a `SiluAndMul` override.
 
-No attention, MoE, model, topology, or performance support is implied by these
-operator-level capabilities.
+No attention, model, topology, or broad performance support is implied by
+these operator-level capabilities.
 
 ## Compatibility
 
@@ -23,9 +25,9 @@ operator-level capabilities.
   required operator APIs and LightOp capabilities are present.
 - Adapter distribution: `sgl-kernel>=0.1.0`, extension API v1 from
   `hcu_adapter.extensions`.
-- Runtime: a prepared HCU PyTorch/DTK/LightOp stack. LightOp is intentionally
-  not fetched by pip because production deployments must use an ABI-matched
-  local build.
+- Runtime: a prepared HCU PyTorch/DTK/LightOp/AITER stack. LightOp and AITER
+  are intentionally not fetched by pip because production deployments must
+  use ABI-matched local builds.
 - The plugin does not own `vllm.platform_plugins` or `vllm.general_plugins`.
 
 The repository root remains the vLLM 0.28.1 development reference. Build only
@@ -38,8 +40,8 @@ python3 -m pip wheel --no-deps --wheel-dir ./dist ./adapter_extension
 ## Production installation
 
 Start with a fresh virtual environment or image containing the matching HCU
-PyTorch, DTK, and LightOp builds. Install audited local wheels without dependency
-resolution, in this order:
+PyTorch, DTK, LightOp, and AITER builds. Install audited local wheels without
+dependency resolution, in this order:
 
 ```bash
 python3 -m pip install --no-deps /wheels/vllm-0.32.0+rocm*.whl
@@ -56,12 +58,37 @@ VLLM_PLUGINS=hcu_adapter python3 -E adapter_extension/tools/verify_installed.py
 
 The verifier fails closed unless all three distributions have non-empty wheel
 records, their imported modules are owned by those records, the adapter is the
-sole expected vLLM entry-point owner, the DAS extension is active with its
-declared capability, and vLLM's OOT registry selects this exact class:
+sole expected vLLM entry-point owner, the DAS extension is active with both
+declared capabilities, vLLM's OOT registry selects this exact class, and
+explicit `aiter` INT8 selection resolves to the Plugin-owned expert:
 
 ```text
 hcu_vllm_das.rms_norm.HcuRMSNorm
+hcu_vllm_das.moe.int8_oracle.HcuAiterInt8Experts
 ```
+
+## AITER INT8 W8A8 MoE
+
+The Plugin reuses vLLM 0.32's official channel-weight/token-activation W8A8
+quant configuration and kernel construction. It adds only the explicit AITER
+selector and translates the resulting tensors to the public `aiter.moe` API;
+the vendor wheel continues to own kernels and tuned configurations.
+
+Select the route through vLLM's existing CLI option:
+
+```bash
+vllm serve /model/Qwen3.5-35B-A3B-W8A8 --moe-backend aiter
+```
+
+Each unseen shape logs whether it found and executed a native AITER config. A
+shape with no compatible config, or a config requiring an unsupported shuffle
+layout, is logged as an official vLLM Triton INT8 fallback and is not counted
+as an AITER hit. Once a compatible AITER config is selected, a vendor execution
+error is raised rather than silently changing providers.
+
+Leaving `--moe-backend` at its default preserves vLLM's upstream backend
+priority. Uninstalling this wheel removes the added selector without changing
+the Adapter's platform/runtime ownership.
 
 ## RMSNorm eligibility
 
