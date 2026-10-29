@@ -15,6 +15,9 @@ import torch
 import vllm.envs as envs
 import vllm_hcu.platforms.envs as henvs
 from vllm_hcu.model_executor.layers.fused_moe.workspace_growth import get_moe_workspaces
+from vllm_hcu.model_executor.layers.fused_moe.combine_runtime import (
+    suspend_ep_shared_add,
+)
 from vllm.logger import init_logger
 from vllm.model_executor.layers.fused_moe.activation import (
     ApplyMoEActivationConfig,
@@ -1758,27 +1761,31 @@ class FusedMoEKernelModularImpl:
             )
             if S:
                 _ep_mod.direct_scratch = moe_full[M:]
-            fe.apply(
-                output=moe_out[a:b],
-                hidden_states=gath[0][a:b],
-                w1=w1,
-                w2=w2,
-                topk_weights=gath[1][a:b],
-                topk_ids=gath[2][a:b],
-                activation=activation,
-                global_num_experts=global_num_experts,
-                expert_map=expert_map,
-                a1q_scale=(
-                    a1q_scale[a:b]
-                    if a1q_scale is not None and a1q_scale.numel() > 1
-                    else a1q_scale
-                ),
-                a2_scale=fe.a2_scale,
-                workspace13=workspace13,
-                workspace2=workspace2,
-                expert_tokens_meta=None,
-                apply_router_weight_on_input=False,
-            )
+            # This path owns its NCCL combine and never calls finalize_hook.
+            # Keep the shared result separate for the runner's final add. The
+            # scope is local to this microbatch's compute, not the global hook.
+            with suspend_ep_shared_add():
+                fe.apply(
+                    output=moe_out[a:b],
+                    hidden_states=gath[0][a:b],
+                    w1=w1,
+                    w2=w2,
+                    topk_weights=gath[1][a:b],
+                    topk_ids=gath[2][a:b],
+                    activation=activation,
+                    global_num_experts=global_num_experts,
+                    expert_map=expert_map,
+                    a1q_scale=(
+                        a1q_scale[a:b]
+                        if a1q_scale is not None and a1q_scale.numel() > 1
+                        else a1q_scale
+                    ),
+                    a2_scale=fe.a2_scale,
+                    workspace13=workspace13,
+                    workspace2=workspace2,
+                    expert_tokens_meta=None,
+                    apply_router_weight_on_input=False,
+                )
             if S:
                 _ep_mod.direct_scratch = None
 

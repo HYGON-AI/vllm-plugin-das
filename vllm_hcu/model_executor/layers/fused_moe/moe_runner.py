@@ -62,6 +62,9 @@ from vllm.utils.torch_utils import (
     direct_register_custom_op,
 )
 from vllm_hcu.platforms import envs as henvs
+from vllm_hcu.model_executor.layers.fused_moe.combine_runtime import (
+    ep_shared_add_allowed,
+)
 
 logger = init_logger(__name__)
 
@@ -154,7 +157,7 @@ class _EpFusedCombineState:
         """For the EP fused experts: (shared_output, row_start) to add into
         the rows of ``out`` the finalize hook would add it to, else None.
         Only when the hook is then guaranteed to take the fused path."""
-        if self.shared is None or self.added_to is not None:
+        if not ep_shared_add_allowed() or self.shared is None or self.added_to is not None:
             return None
         rows = _ep_fused_rows(out)
         if rows is None:
