@@ -12,6 +12,9 @@ and OFF configurations.
 
 - Keep Plugin development in the independent `vllm-plugin-das` repository and
   branch `feat/vllm032-plugin-onoff-gates`.
+- Base the work on `HYGON-AI/vllm-plugin-das:v0.32.0` at
+  `e76220d9c0006cc3c9d886587a4771a31e7d83e8`, synchronized to the personal
+  fork, and target that upstream branch for the final MR.
 - Pair the Plugin with Adapter commit
   `c99886d41f435e594050d47663e03ea94081fdc6` and the existing HCU vLLM
   `0.32.0+rocm723` wheel.
