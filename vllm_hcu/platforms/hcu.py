@@ -245,6 +245,7 @@ class HCUPlatform(Platform):
     supported_quantization: list[str] = [
         "awq",
         "awq_marlin",  # will be overwritten with awq
+        "auto_awq",  # current vLLM resolves compatible AWQ checkpoints here
         "gptq",
         "gptq_marlin",  # will be overwritten with gptq
         "auto_gptq",  # current vLLM resolves compatible GPTQ checkpoints here

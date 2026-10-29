@@ -85,6 +85,25 @@ def test_hcu_accepts_gptq_alias_selected_by_current_vllm() -> None:
     HCUPlatform.verify_quantization(resolved)
 
 
+def test_hcu_accepts_awq_alias_selected_by_current_vllm() -> None:
+    from vllm.model_executor.layers.quantization import get_quantization_config
+    from vllm_hcu.platforms.hcu import HCUPlatform
+
+    awq_config = {
+        "quant_method": "awq",
+        "bits": 4,
+        "group_size": 128,
+        "zero_point": True,
+    }
+    resolved = get_quantization_config("awq").override_quantization_method(
+        awq_config,
+        user_quant=None,
+    )
+
+    assert resolved == "auto_awq"
+    HCUPlatform.verify_quantization(resolved)
+
+
 def _run_fresh_target(code: str) -> subprocess.CompletedProcess[str]:
     env = dict(os.environ)
     for name in (
