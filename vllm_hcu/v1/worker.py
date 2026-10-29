@@ -126,27 +126,26 @@ class HcuGPUWorker(Worker):
         # Parameter that Module.to() does not place with the rank-local model,
         # so reconcile it once after checkpoint/cache loading and before the
         # first forward (never copy it in the token-routing hot path).
-        from vllm_hcu.runtime_compat.weight_cache import (
-            reconcile_router_state_devices,
-        )
-
         model_runner = getattr(self, "model_runner", None)
-        models = [getattr(model_runner, "model", None)]
-        get_draft_model = getattr(model_runner, "get_draft_model", None)
-        if callable(get_draft_model):
-            models.append(get_draft_model())
-        for model in models:
-            if model is None:
-                continue
-            moved_router_state = reconcile_router_state_devices(
-                model, self.device
+        if self.vllm_config.load_config.load_format == "ipc_cache":
+            from vllm_hcu.runtime_compat.weight_cache import (
+                reconcile_router_state_devices,
             )
-            if moved_router_state:
-                runner_logger.info(
-                    "Placed %d router state tensors on rank-local device %s",
-                    len(moved_router_state),
-                    self.device,
-                )
+
+            models = [getattr(model_runner, "model", None)]
+            get_draft_model = getattr(model_runner, "get_draft_model", None)
+            if callable(get_draft_model):
+                models.append(get_draft_model())
+            for model in models:
+                if model is None:
+                    continue
+                moved_router_state = reconcile_router_state_devices(model, self.device)
+                if moved_router_state:
+                    runner_logger.info(
+                        "Placed %d router state tensors on rank-local device %s",
+                        len(moved_router_state),
+                        self.device,
+                    )
 
         from vllm_hcu.patch.worker import validate_worker_patches
         num_compressor_weights = getattr(

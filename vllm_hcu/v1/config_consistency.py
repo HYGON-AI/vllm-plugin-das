@@ -17,6 +17,7 @@ def engine_config_signature(vllm_config: Any) -> dict[str, Any]:
     parallel = getattr(vllm_config, "parallel_config", None)
     scheduler = getattr(vllm_config, "scheduler_config", None)
     cache = getattr(vllm_config, "cache_config", None)
+    load = getattr(vllm_config, "load_config", None)
 
     def value(obj: Any, name: str, default: Any = None) -> Any:
         item = getattr(obj, name, default)
@@ -29,6 +30,7 @@ def engine_config_signature(vllm_config: Any) -> dict[str, Any]:
         "revision": value(model, "revision"),
         "dtype": value(model, "dtype"),
         "quantization": value(model, "quantization"),
+        "load_format": value(load, "load_format"),
         "max_model_len": value(model, "max_model_len"),
         "tensor_parallel_size": value(parallel, "tensor_parallel_size"),
         "pipeline_parallel_size": value(parallel, "pipeline_parallel_size"),

@@ -94,6 +94,17 @@ def test_scheduler_drift_fails_before_model_loading():
             validate_distributed_engine_config(local, FakeDist(signatures))
 
 
+def test_load_format_drift_fails_on_all_ranks():
+    baseline = make_config()
+    baseline.load_config = SimpleNamespace(load_format="auto")
+    ipc = make_config()
+    ipc.load_config = SimpleNamespace(load_format="ipc_cache")
+    signatures = [engine_config_signature(baseline), engine_config_signature(ipc)]
+    for local in (baseline, ipc):
+        with pytest.raises(RuntimeError, match="rank 1: load_format"):
+            validate_distributed_engine_config(local, FakeDist(signatures))
+
+
 def test_scheduler_drift_stops_all_real_ranks(tmp_path):
     import multiprocessing
 
