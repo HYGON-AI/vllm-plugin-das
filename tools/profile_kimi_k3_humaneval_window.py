@@ -53,15 +53,21 @@ def main():
     request(args.api_base, "/v1/chat/completions", payload(data[0], 8))
     records, profile_started = [], False
     start_result = stop_result = None
+    empty_window = False
     started = time.time()
     with ThreadPoolExecutor(max_workers=args.concurrency) as pool:
         futures = {pool.submit(request, args.api_base, "/v1/chat/completions", payload(row, args.max_tokens)): row["task_id"]
                    for row in data[:args.concurrency]}
         try:
             time.sleep(args.delay_seconds)
+            if all(f.done() for f in futures):
+                empty_window = True
+                raise RuntimeError("All measured requests completed before profiling started")
             print("Starting profiler; server PROFILE_MAX_STEPS bounds worker steps", flush=True)
             start_result = request(args.api_base, "/start_profile", {})
             profile_started = True
+            if all(f.done() for f in futures):
+                empty_window = True
             for future in as_completed(futures):
                 task_id = futures[future]
                 try:
@@ -72,6 +78,10 @@ def main():
                 except Exception as exc:
                     records.append(dict(task_id=task_id, error=f"{type(exc).__name__}: {exc}"))
                     print(task_id, "ERROR", exc, flush=True)
+        except RuntimeError as exc:
+            if not empty_window:
+                raise
+            start_result = dict(error=str(exc))
         finally:
             if profile_started:
                 print("Stopping profiler and waiting for trace export", flush=True)
@@ -81,8 +91,8 @@ def main():
                     stop_result = dict(error=f"{type(exc).__name__}: {exc}")
     dest.write_text(json.dumps(dict(concurrency=args.concurrency, max_tokens=args.max_tokens,
         delay_seconds=args.delay_seconds, started_unix=started, finished_unix=time.time(),
-        profile_start=start_result, profile_stop=stop_result, requests=records), indent=2) + "\n")
-    return 1 if any("error" in x for x in records) or (isinstance(stop_result, dict) and "error" in stop_result) else 0
+        profile_start=start_result, profile_stop=stop_result, empty_window=empty_window, requests=records), indent=2) + "\n")
+    return 1 if empty_window or any("error" in x for x in records) or (isinstance(stop_result, dict) and "error" in stop_result) else 0
 
 
 if __name__ == "__main__":

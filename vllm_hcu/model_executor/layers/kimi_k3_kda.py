@@ -17,7 +17,6 @@ from functools import lru_cache, wraps
 
 import torch
 from vllm.logger import init_logger
-from vllm.model_executor.layers.mamba.mamba_utils import is_conv_state_dim_first
 
 logger = init_logger("vllm.hcu.kimi_k3_kda")
 CHECKPOINT_KEY = "_vllm_hcu_kimi_kda_checkpoints"
@@ -285,8 +284,9 @@ def save_conv_checkpoints(x, conv_states, metadata):
     payload = (getattr(metadata, "nums_dict", None) or {}).get(CHECKPOINT_KEY)
     if payload is None:
         return
-    dim_first = is_conv_state_dim_first()
-    width = conv_states.shape[-1 if dim_first else -2]
+    # Kimi's forward normalizes the physical cache layout before splitting Q/K/V.
+    # The convolution hook always receives [slot, channels, window].
+    width = conv_states.shape[-1]
     # Save raw projected inputs before causal_conv1d may update them in place.
     indices = torch.tensor(
         [[end - width + i for i in range(width)] for end in payload.conv_ends],
@@ -295,8 +295,6 @@ def save_conv_checkpoints(x, conv_states, metadata):
     # causal_conv1d updates the running-state slots after this hook. Keep a
     # private snapshot and restore it only after the complete layer forward.
     values = x[:, indices].permute(1, 0, 2).to(conv_states.dtype).clone()
-    if not dim_first:
-        values = values.transpose(1, 2)
     payload.conv_snapshots.append((conv_states, values))
 
 
