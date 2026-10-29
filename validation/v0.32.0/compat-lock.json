@@ -1,19 +1,19 @@
 {
   "schema_version": 1,
-  "validation_id": "vllm-v0.32.0-adapter-das-20261028",
+  "validation_id": "vllm-v0.32.0-upstream-first-plugin-20261029",
   "status": "pending",
   "repository": {
     "name": "vllm-plugin-das",
     "url": "https://github.com/alexanderbin123/vllm-plugin-das.git",
-    "branch": "feat/adapter-das-extension-api",
-    "source_base": "1be8d694edff552eebe8b3b9a9c3b2e44235d486",
-    "test_policy_commit": "af84424cf652893fbbf392f9e1759ff19241ff96"
+    "branch": "feat/vllm032-plugin-onoff-gates",
+    "source_base": "e76220d9c0006cc3c9d886587a4771a31e7d83e8",
+    "test_policy_commit": "46923fbcf2068c1491090ca4d00e519b2abad91f"
   },
   "peer": {
     "name": "adapter-das",
     "url": "https://github.com/alexanderbin123/adapter-das.git",
-    "branch": "feat/vllm032-runtime-integration",
-    "source_base": "81361880e203cb33cf631f77716ac8244f5f299f"
+    "branch": "feat/vllm032-adapter-delivery-gates",
+    "source_base": "c99886d41f435e594050d47663e03ea94081fdc6"
   },
   "vllm": {
     "version": "0.32.0",
@@ -41,7 +41,7 @@
     "enforce_eager": false,
     "compilation": "VLLM_COMPILE",
     "cudagraph_capture": "FULL_AND_PIECEWISE",
-    "model": "/model/Qwen3-8B",
+    "model": "/model/Qwen2-0.5B-Instruct",
     "max_model_len": 512,
     "max_num_seqs": 1,
     "attention_backend": "TRITON_ATTN",
@@ -50,56 +50,55 @@
   "artifacts": {
     "adapter_wheel": {
       "filename": "sgl_kernel-0.1.0-py3-none-any.whl",
-      "sha256": "bbc7de3745d736b5b8e82f55dfdab5e3a80ad8e8908e5388de76d394e7e0f50a",
-      "build_commit": "2ea9b1b4280e4740a1764fbb7c07d038d3615502"
+      "sha256": "69b655ca747718eed3c4487e984fe749b73880369f20ab0288fc76799db0c6db",
+      "build_commit": "c99886d41f435e594050d47663e03ea94081fdc6"
     },
     "plugin_wheel": {
       "filename": "hcu_vllm_das_plugin-0.2.0.dev0-py3-none-any.whl",
-      "sha256": "7186603c9c5aa09ad2a19c38589bebc68944b42ac90f51fe0922a44f2c73729c",
-      "build_commit": "b9ff5993d9e8bfe78c50487be360e5c89ba88e05"
+      "sha256": "b57733fbde63fb252e74492596aaed4c69b40b724eefb14e97eb51324ae11e14",
+      "build_commit": "46923fbcf2068c1491090ca4d00e519b2abad91f"
     },
     "vllm_wheel": {
       "filename": "vllm-0.32.0+rocm723-cp312-cp312-linux_x86_64.whl",
-      "sha256": "de61890d0a66ae12b84908962c5426bc7a64d66ac8d8c64ceb2c2bc0c31f722a",
-      "upstream_commit": "5df63a7203cdb9328d824a27b682e77c7b9928be"
+      "sha256": "d7f084b8754288893dd9ba28d24784ec4b4e59350c9bfb5038ec24ac3af9572b",
+      "upstream_commit": "5df63a7203cdb9328d824a27b682e77c7b9928be",
+      "build_commit": "7c13676e497262b71a8b107a3186b0f6641dcbf1"
     }
   },
   "gates": {
     "static_portable_tests": {
       "status": "pass",
-      "result": "62 passed, 2 live-HCU tests skipped by default"
+      "result": "61 passed, 3 live-HCU tests skipped by default"
     },
     "build": {
       "status": "pass",
-      "result": "adapter and plugin wheels built and entry-point metadata inspected"
+      "result": "clean-commit adapter and plugin wheels built; Plugin has one Adapter extension entry point and no Silu module"
     },
     "installed_integration": {
       "status": "pass",
       "result": "installed vLLM 0.32, adapter-das and plugin wheel ownership, platform, extension and OOT classes verified"
     },
     "live_hardware_operators": {
-      "status": "pass",
-      "result": "gfx936 RMSNorm 1 passed; SiluAndMul 1 passed; card returned to 0% and 2 MiB baseline"
+      "status": "pending",
+      "result": "final-wheel run deferred: shared-node baseline held 58088-58216 MiB per card outside the container PID namespace"
     },
     "model_parity": {
       "status": "pending"
     },
     "serving": {
-      "status": "pass",
-      "result": "Qwen3-8B single-card non-eager service reached readiness; health, version, models and chat endpoints returned HTTP 200; deterministic chat returned 42; no process remained and all cards returned to 0% / 2 MiB"
+      "status": "pending",
+      "result": "Qwen2-0.5B-Instruct non-eager ON/OFF smoke awaits an idle card"
     },
     "humaneval_prefix": {
       "status": "pending"
     }
   },
   "evidence": {
-    "serving_smoke": {
-      "document": "docs/validation/vllm032-adapter-das-qwen3-8b-smoke.md",
-      "validated_at": "2026-10-28T11:04:59Z",
-      "vllm_version": "0.32.0",
-      "system_fingerprint": "vllm-0.32.0-b2902db1",
-      "response": "42",
-      "finish_reason": "stop"
+    "upstream_first_operator_ab": {
+      "document": "docs/validation/vllm032-upstream-first-operator-ab.md",
+      "validated_at": "2026-10-29",
+      "retained_capability": "lightop-rms-norm",
+      "upstream_takeover": "SiluAndMul"
     }
   },
   "completed_at": null

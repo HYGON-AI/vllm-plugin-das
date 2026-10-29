@@ -4,7 +4,7 @@
 
 **Goal:** Deliver an independently installable DAS Plugin for the vLLM 0.32 release line whose optional LightOp operators are Graph-safe, explicitly selectable, and retained only with evidence that official vLLM does not fully take over the HCU use case.
 
-**Architecture:** Adapter remains the sole owner of vLLM platform/runtime compatibility and activates one Plugin extension entry point. Plugin owns only optional `SiluAndMul` and ordinary/fused-add `RMSNorm` implementations, with official vLLM as the complete fallback. Runtime admission uses the 0.32 release line plus API/capability checks; immutable SHAs identify evidence, not runtime locks.
+**Architecture:** Adapter remains the sole owner of vLLM platform/runtime compatibility and activates one Plugin extension entry point. The audit retained only optional ordinary/fused-add `RMSNorm`; warmed evidence delegated `SiluAndMul` completely to official vLLM. Runtime admission uses the 0.32 release line plus API/capability checks; immutable SHAs identify evidence, not runtime locks.
 
 **Tech Stack:** Python 3.12, PyTorch 2.11 custom operators and `torch.compile`, vLLM 0.32 OOT `CustomOp`, LightOp, pytest, HCU `gfx936`.
 
@@ -141,6 +141,11 @@ Expected: all portable tests pass with only live-HCU skips.
 Commit: `fix(vllm032): make lightop paths explicit graph-safe opt-ins`
 
 ### Task 4: Installed HCU Takeover Gate and Delivery Evidence
+
+**Audit outcome:** Warmed A/B removed the candidate Silu override and its tests,
+switch, capability, module, and OOT registration. Final-wheel live Graph and
+small-model service rows remain pending while the shared node is externally
+holding about 58 GiB per card; no occupied card is commandeered for this task.
 
 **Files:**
 - Create: `tests/vllm032/test_operator_graph_hcu.py`

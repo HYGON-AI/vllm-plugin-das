@@ -26,20 +26,23 @@ def test_plugin_compat_lock_pins_vllm032_pair_without_circular_commits() -> None
     document = json.loads(LOCK.read_text(encoding="utf-8"))
 
     assert document["schema_version"] == 1
-    assert document["validation_id"] == "vllm-v0.32.0-adapter-das-20261028"
+    assert (
+        document["validation_id"]
+        == "vllm-v0.32.0-upstream-first-plugin-20261029"
+    )
     assert document["status"] in {"pending", "passed"}
     assert document["repository"] == {
         "name": "vllm-plugin-das",
         "url": "https://github.com/alexanderbin123/vllm-plugin-das.git",
-        "branch": "feat/adapter-das-extension-api",
-        "source_base": "1be8d694edff552eebe8b3b9a9c3b2e44235d486",
-        "test_policy_commit": "af84424cf652893fbbf392f9e1759ff19241ff96",
+        "branch": "feat/vllm032-plugin-onoff-gates",
+        "source_base": "e76220d9c0006cc3c9d886587a4771a31e7d83e8",
+        "test_policy_commit": "46923fbcf2068c1491090ca4d00e519b2abad91f",
     }
     assert document["peer"] == {
         "name": "adapter-das",
         "url": "https://github.com/alexanderbin123/adapter-das.git",
-        "branch": "feat/vllm032-runtime-integration",
-        "source_base": "81361880e203cb33cf631f77716ac8244f5f299f",
+        "branch": "feat/vllm032-adapter-delivery-gates",
+        "source_base": "c99886d41f435e594050d47663e03ea94081fdc6",
     }
     assert document["vllm"] == {
         "version": "0.32.0",
@@ -49,6 +52,15 @@ def test_plugin_compat_lock_pins_vllm032_pair_without_circular_commits() -> None
         "6d43fb980f9fee3c892a914eda09951f772ad10d"
     )
     assert document["hardware"]["architecture"] == "gfx936"
+    assert document["artifacts"]["plugin_wheel"] == {
+        "filename": "hcu_vllm_das_plugin-0.2.0.dev0-py3-none-any.whl",
+        "sha256": (
+            "b57733fbde63fb252e74492596aaed4c69b40b724eefb14e97eb51324ae11e14"
+        ),
+        "build_commit": "46923fbcf2068c1491090ca4d00e519b2abad91f",
+    }
+    assert document["gates"]["live_hardware_operators"]["status"] == "pending"
+    assert document["gates"]["serving"]["status"] == "pending"
     assert not _contains_forbidden_key(document)
 
 
