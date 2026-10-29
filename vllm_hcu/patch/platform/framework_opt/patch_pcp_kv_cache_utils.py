@@ -52,6 +52,9 @@ def apply_to_module(module: ModuleType) -> bool:
 
     @functools.wraps(original)
     def hcu_resolve_kv_cache_block_sizes(kv_cache_config, vllm_config):
+        from .patch_glm53_pcp_kv_cache import mark_glm53_cache_ownership
+
+        mark_glm53_cache_ownership(kv_cache_config, vllm_config)
         # Current vLLM already resolves cache ownership from DCP only and
         # handles prefix_match_unit, prefix-cacheable groups, and Mamba align
         # mode.  Reimplementing that policy here made this adapter depend on

@@ -26,6 +26,10 @@ from vllm_hcu.forward_context_runtime import (
 )
 from vllm_hcu.patch.config import get_hcu_config
 from vllm_hcu.v1.pcp_manager import make_hcu_pcp_manager_cls
+from vllm_hcu.v1.glm53_pcp_mtp_sync import (
+    install_glm53_pcp_mtp_sync,
+    sync_glm53_pcp_sampler_output,
+)
 from vllm_hcu.patch.platform.core_fix.patch_vllm_config import is_glm53_pcp
 from vllm_hcu.deepseek_v4_runtime import is_deepseek_v4
 
@@ -347,6 +351,8 @@ class HcuGPUModelRunnerV2(GPUModelRunner):
                 "official MRV2 did not initialize the selected HCU PCP manager"
             )
         self._init_host_seq_lens()
+        if not is_profiling:
+            install_glm53_pcp_mtp_sync(self)
 
     # ------------------------------------------------------------------
     # Host mirror of num_computed_tokens.
@@ -469,6 +475,9 @@ class HcuGPUModelRunnerV2(GPUModelRunner):
 
     def sample(self, hidden_states, input_batch, grammar_output):
         out = super().sample(hidden_states, input_batch, grammar_output)
+        # Commit identical PCP decisions before post_update() and KDA state
+        # advancement. The manager can be hidden by sample_tokens() here.
+        out = sync_glm53_pcp_sampler_output(self, out)
         if self._hsl_enabled and input_batch is self._hsl_batch:
             self._hsl_batch = None
             self._hsl_record(input_batch, out[2])
