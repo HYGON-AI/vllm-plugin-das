@@ -200,6 +200,25 @@ class DecoderReplayLayers:
         local_tail = to_local_tail(hidden_states)
         state_tails = [None if t is None else to_local_tail(t) for t in states]
 
+        # Piecewise dispatch may round ``num_padded`` above the packed tail
+        # (``plan.max_local``). Metadata already spans that size; pad
+        # activations to match. PCP interleaved inputs are already gathered,
+        # so do not use ``run_graph`` (it index_selects DualChunk-local rows).
+        packed_rows = int(local_tail.shape[0])
+        num_padded = replay_batch.num_padded
+        if num_padded is not None and int(num_padded) > packed_rows:
+            pad_n = int(num_padded) - packed_rows
+
+            def _pad_rows(t: torch.Tensor) -> torch.Tensor:
+                return torch.cat(
+                    (t, t.new_zeros((pad_n, *t.shape[1:]))), dim=0
+                )
+
+            local_tail = _pad_rows(local_tail)
+            state_tails = [
+                None if t is None else _pad_rows(t) for t in state_tails
+            ]
+
         with (
             override_forward_context(replay_batch.forward_context),
             replicated_mtp_batch_scope(),
@@ -207,6 +226,8 @@ class DecoderReplayLayers:
             row_outputs = self.run_layers(local_tail, *state_tails)
 
         def scatter_out(local_out: torch.Tensor) -> torch.Tensor:
+            # Drop graph-size pad rows before DualChunk scatter / unpack.
+            local_out = local_out[:packed_rows]
             if plan.pcp_size == 1:
                 tail_out = local_out
             else:

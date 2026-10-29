@@ -226,6 +226,18 @@ def _replay_kv_starts(
     return out
 
 
+def _subsequent_replay_kv_start(
+    replay_start: torch.Tensor, trim_kv_start: torch.Tensor
+) -> torch.Tensor:
+    """Lower bound for non-first SWA layers: APC floor and trim floor.
+
+    First SWA keeps the raw ``replay_start`` (prefix rebuild). Later layers
+    must not drop below that floor when trim did not advance
+    (``trim_kv_start == 0``), or a short APC chunk can read unrebuilt KV.
+    """
+    return torch.maximum(replay_start, trim_kv_start)
+
+
 def _bump_last_seq_len_for_query_pad(
     seq_lens: list[int] | np.ndarray, *, real_tokens: int, num_padded: int
 ) -> list[int]:
@@ -686,6 +698,14 @@ def _prepare_replay_batch(
             )
         replay_groups, first_swa_groups = self._replay_attn_groups
 
+        first_kv_start = (
+            kept_replay_start[:n_logical]
+            if kept_replay_start.numel()
+            else self._kept_kv_start[:n_logical]
+        )
+        subsequent_kv_start = _subsequent_replay_kv_start(
+            first_kv_start, self._kept_kv_start[:n_logical]
+        )
         with logical_pcp_metadata_scope(1):
             attn_metadata = _build_subbatch_attn_metadata(
                 self,
@@ -695,7 +715,7 @@ def _prepare_replay_batch(
                 attn_groups=replay_groups,
                 kv_cache_config=kv_cache_config,
                 model_specific_attn_metadata=ReplayAttnMetadata(
-                    self._kept_kv_start[:n_logical]
+                    subsequent_kv_start
                 ),
                 ubatch_idx=ubatch_idx,
             )
@@ -707,11 +727,7 @@ def _prepare_replay_batch(
                 slot_mappings=kept_slots,
                 attn_groups=first_swa_groups,
                 kv_cache_config=kv_cache_config,
-                model_specific_attn_metadata=ReplayAttnMetadata(
-                    kept_replay_start[:n_logical]
-                    if kept_replay_start.numel()
-                    else self._kept_kv_start[:n_logical]
-                ),
+                model_specific_attn_metadata=ReplayAttnMetadata(first_kv_start),
                 ubatch_idx=ubatch_idx,
             )[first_swa]
 
@@ -832,6 +848,9 @@ def _prepare_replay_batch(
         )
     replay_groups, first_swa_groups = self._replay_attn_groups
 
+    subsequent_kv_start = _subsequent_replay_kv_start(
+        replay_start[:num_reqs], self._kept_kv_start[:num_reqs]
+    )
     attn_metadata = _build_subbatch_attn_metadata(
         self,
         input_batch=kept_batch,
@@ -839,9 +858,7 @@ def _prepare_replay_batch(
         slot_mappings=kept_slots,
         attn_groups=replay_groups,
         kv_cache_config=kv_cache_config,
-        model_specific_attn_metadata=ReplayAttnMetadata(
-            self._kept_kv_start[:num_reqs]
-        ),
+        model_specific_attn_metadata=ReplayAttnMetadata(subsequent_kv_start),
         ubatch_idx=ubatch_idx,
     )
     first_swa = layers.first_swa_prefix
@@ -958,10 +975,12 @@ def apply_to_module(module: ModuleType) -> bool:
             if layers is None:
                 return
             params = getattr(new_req_data, "sampling_params", None)
+            # prompt_logprobs and pooling need the full extend: trimming would
+            # zero-fill omitted prompt rows and corrupt scores / embeddings.
             self._keeps_rows_np[req_index] = (
                 params is not None
                 and getattr(params, "prompt_logprobs", None) is not None
-            )
+            ) or getattr(new_req_data, "pooling_params", None) is not None
 
         setattr(replay_add_request, _WRAPPER, True)
         cls.add_request = replay_add_request

@@ -504,12 +504,84 @@ def test_pcp_replicated_tail_restores_outputs_without_duplicate_gather(monkeypat
             pcp_local_num_tokens=4, pcp_restore_idx=torch.arange(4)
         ),
         forward_context=object(),
+        num_padded=None,
+        run_graph=None,
     )
     hidden_states = torch.arange(8, dtype=torch.float32).reshape(4, 2)
     outputs = runner._run_pcp_interleaved_tail(hidden_states)
     assert torch.equal(outputs[0], hidden_states * 2)
     assert group.gather_count == 1
     assert not in_replicated_mtp_batch()
+
+
+def test_pcp_interleaved_tail_pads_activations_to_graph_size(monkeypatch):
+    """Graph num_padded > packed tail must pad model inputs before run_layers."""
+    from contextlib import nullcontext
+
+    from vllm.distributed import parallel_state
+    from vllm_hcu.patch.worker.core_fix import decoder_replay
+    from vllm_hcu.patch.worker.core_fix.late_layer_tail_cp import (
+        late_layer_tail_cp_layout,
+    )
+
+    class FakeGroup:
+        world_size = 1
+        rank_in_group = 0
+
+        def all_gather(self, tensor, dim):
+            return tensor
+
+    monkeypatch.setattr(parallel_state, "get_pcp_group", lambda: FakeGroup())
+    monkeypatch.setattr(
+        decoder_replay, "override_forward_context", lambda context: nullcontext()
+    )
+    plan = late_layer_tail_cp_layout(
+        token_indices=torch.arange(3),
+        tail_lens=torch.tensor([3]),
+        positions=torch.arange(3),
+        window_floors=torch.zeros(3, dtype=torch.int32),
+        pcp_rank=0,
+        pcp_size=1,
+        batch_size=1,
+    )
+    seen = {}
+
+    def run_layers(hidden_states, *states):
+        seen["shape"] = tuple(hidden_states.shape)
+        return (hidden_states + 1,)
+
+    runner = decoder_replay.DecoderReplayLayers(
+        128,
+        run_layers=run_layers,
+        write_batch_kv=lambda *args: None,
+        metadata_prefixes=set(),
+        first_swa_prefix="cache",
+    )
+    runner.replay_batch = SimpleNamespace(
+        pcp_tail=plan,
+        pcp_meta=SimpleNamespace(
+            pcp_local_num_tokens=3, pcp_restore_idx=torch.arange(3)
+        ),
+        forward_context=object(),
+        num_padded=5,
+        run_graph=None,
+    )
+    hidden_states = torch.arange(6, dtype=torch.float32).reshape(3, 2)
+    outputs = runner._run_pcp_interleaved_tail(hidden_states)
+    assert seen["shape"] == (5, 2)
+    # Pad rows must not leak into DualChunk scatter destinations.
+    assert outputs[0].shape == hidden_states.shape
+    assert torch.equal(outputs[0], hidden_states + 1)
+
+
+def test_subsequent_replay_kv_start_keeps_apc_floor():
+    """Short APC chunk with trim=0 must keep replay_start on later SWA layers."""
+    replay_start = torch.tensor([1024, 0], dtype=torch.int32)
+    trim = torch.tensor([0, 128], dtype=torch.int32)
+    out = patch_deepseek_v41_decoder_replay_state._subsequent_replay_kv_start(
+        replay_start, trim
+    )
+    assert out.tolist() == [1024, 128]
 
 
 def test_forward_kv_restores_full_pcp_cache_inputs(monkeypatch):
