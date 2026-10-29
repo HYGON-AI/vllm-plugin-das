@@ -2,6 +2,9 @@
 """K3 SlimQuant mixed projections, preserving checkpoint branch precision."""
 from __future__ import annotations
 
+import os
+from types import SimpleNamespace
+
 import torch
 from torch import nn
 
@@ -37,6 +40,8 @@ class KimiK3MixedKDAProjection(nn.Module):
         self.fp_gate = merged_linear(
             input_size, output_sizes[3:], replicated_shard_id=1, tp_size=tp_size,
             quant_config=None, prefix=f"{prefix}.fp_gate", **kwargs)
+        self._fuse_qkv = os.environ.get("VLLM_HCU_KIMI_KDA_FUSE_QKV", "0") == "1"
+        self._fused_qkv = None
 
     @property
     def weight(self):
@@ -44,9 +49,58 @@ class KimiK3MixedKDAProjection(nn.Module):
         return self.fp_gate.weight
 
     def forward(self, x):
-        values = [getattr(self, name)(x)[0]
-                  for name in ("q_proj", "k_proj", "v_proj", "fp_gate")]
+        if self._fuse_qkv:
+            if self._fused_qkv is None:
+                self._fused_qkv = self._make_fused_qkv(x.shape[-1])
+            qkv = self.q_proj.quant_method.apply(self._fused_qkv, x, bias=None)
+            values = [qkv, self.fp_gate(x)[0]]
+        else:
+            values = [getattr(self, name)(x)[0]
+                      for name in ("q_proj", "k_proj", "v_proj", "fp_gate")]
         return torch.cat(values, dim=-1), None
+
+    def _make_fused_qkv(self, input_size):
+        """Combine post-processed rank-local weights for fused QKV."""
+        layers = [self.q_proj, self.k_proj, self.v_proj]
+        scheme = layers[0].scheme
+        if (getattr(scheme, "is_static_input_scheme", True)
+                or not getattr(scheme, "input_symmetric", False)
+                or str(getattr(scheme, "strategy", "")).lower().split(".")[-1] != "channel"):
+            raise ValueError("Fused KDA QKV requires dynamic symmetric channelwise W8A8")
+        for layer in layers:
+            s = layer.scheme
+            if (type(layer.quant_method) is not type(layers[0].quant_method)
+                    or type(s) is not type(scheme)
+                    or (s.strategy, s.is_static_input_scheme, s.input_symmetric)
+                    != (scheme.strategy, scheme.is_static_input_scheme, scheme.input_symmetric)
+                    or layer.weight.dtype != torch.int8
+                    or layer.weight_scale.dtype != torch.float32
+                    or layer.weight_scale.ndim != 2
+                    or layer.weight_scale.shape[1] != 1
+                    or any(getattr(layer, name, None) is not None for name in
+                           ("input_scale", "input_zero_point", "azp_adj", "bias"))):
+                raise ValueError("Incompatible KDA QKV quantization or weight layout")
+        # Post-load kernels use either [N,K] (HCU) or [K,N] (Triton).
+        shape = layers[0].weight.shape
+        n = layers[0].weight_scale.shape[0]
+        if shape == (n, input_size) and shape != (input_size, n):
+            axis = 0
+        elif shape == (input_size, n) and shape != (n, input_size):
+            axis = 1
+        else:
+            raise ValueError("Ambiguous or unsupported KDA QKV weight layout")
+        if any(layer.weight.shape != shape or layer.weight_scale.shape != (n, 1)
+               or layer.weight.device != layers[0].weight.device
+               or layer.weight_scale.device != layers[0].weight.device
+               for layer in layers):
+            raise ValueError("KDA QKV rank-local weights or scales do not match")
+        with torch.no_grad():
+            return SimpleNamespace(
+                weight=torch.cat([layer.weight for layer in layers], dim=axis).contiguous(),
+                weight_scale=torch.cat([layer.weight_scale for layer in layers], dim=0),
+                input_scale=None, input_zero_point=None, azp_adj=None,
+                scheme=scheme, params_dtype=layers[0].params_dtype,
+            )
 
     def load_branch(self, branch, suffix, tensor):
         if branch in ("q_proj", "k_proj", "v_proj"):

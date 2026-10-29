@@ -23,9 +23,12 @@ def apply_to_module(module: ModuleType) -> bool:
         return False
     original_fn, original_update = target.causal_conv1d_fn, target.causal_conv1d_update
     original_chunk = target.chunk_kda_with_fused_gate
+    from vllm_hcu.model_executor.layers import kimi_k3_kda
+    kimi_k3_kda.install_checkpoint_spec(target.KimiK3DeltaAttention)
 
     def hcu_fn(x, weight, bias, *, activation, conv_states, has_initial_state,
                cache_indices, query_start_loc, metadata):
+        kimi_k3_kda.save_conv_checkpoints(x, conv_states, metadata)
         lengths = cpu_lengths(metadata)
         if (not enabled("VLLM_HCU_USE_CUSTOM_OPS")
                 or x.ndim != 2 or x.stride(0) != 1
@@ -63,6 +66,9 @@ def apply_to_module(module: ModuleType) -> bool:
     target.causal_conv1d_fn, target.causal_conv1d_update = hcu_fn, hcu_update
 
     def hcu_chunk(**kwargs):
+        if kimi_k3_kda.prefill_backend() == "boltops":
+            kimi_k3_kda.cache_strategy()
+            return kimi_k3_kda.chunk_kda(**kwargs)
         q = kwargs["q"]
         if (not enabled("VLLM_HCU_USE_CUSTOM_OPS")
                 or not kernel_policy("VLLM_KIMI_FLASHKDA_BACKEND", PREFILL_LENGTHS.get(),
@@ -94,9 +100,13 @@ def apply_to_module(module: ModuleType) -> bool:
         if lengths is not None:
             lengths = lengths[getattr(metadata, "num_decodes", 0):]
         token = PREFILL_LENGTHS.set(lengths)
+        state_token = kimi_k3_kda.ACTIVE_LAYER.set((self, metadata))
         try:
-            return original_forward(self, *args, **kwargs)
+            result = original_forward(self, *args, **kwargs)
+            kimi_k3_kda.finalize_checkpoints(metadata, self)
+            return result
         finally:
+            kimi_k3_kda.ACTIVE_LAYER.reset(state_token)
             PREFILL_LENGTHS.reset(token)
 
     target.KimiK3DeltaAttention._forward = forward

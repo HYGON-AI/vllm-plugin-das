@@ -490,3 +490,54 @@ def test_mixed_and_fused_branches_compose_with_installed_kimi_model_loader():
         torch.testing.assert_close(proj.fp_gate.weight, torch.cat(gate_rows),
                                    rtol=0, atol=0)
         assert torch.all(model.direct.weight == 1)
+
+@pytest.mark.parametrize('transposed', [False, True])
+def test_opt_in_fused_qkv_reuses_quant_method_and_preserves_gate(monkeypatch, transposed):
+    monkeypatch.setenv('VLLM_HCU_KIMI_KDA_FUSE_QKV', '1')
+    calls = []
+
+    class Method:
+        def apply(self, layer, x, bias=None):
+            calls.append(tuple(layer.weight.shape))
+            w = layer.weight.T if transposed else layer.weight
+            return x @ (w.float() * layer.weight_scale).T
+
+    class Column(nn.Module):
+        def __init__(self, input_size, output_size, **kwargs):
+            super().__init__()
+            w = torch.randint(-4, 5, (output_size, input_size), dtype=torch.int8)
+            self.weight = nn.Parameter(w.T.contiguous() if transposed else w, requires_grad=False)
+            self.weight_scale = nn.Parameter(torch.rand(output_size, 1), requires_grad=False)
+            self.scheme = SimpleNamespace(strategy='channel', is_static_input_scheme=False, input_symmetric=True)
+            self.quant_method = Method()
+            self.params_dtype = torch.float32
+            self.bias = None
+
+        def forward(self, x):
+            return self.quant_method.apply(self, x), None
+
+    class Gate(nn.Module):
+        def __init__(self, input_size, output_sizes, **kwargs):
+            super().__init__()
+            self.weight = nn.Parameter(torch.randn(sum(output_sizes), input_size))
+        def forward(self, x):
+            return x @ self.weight.T, None
+
+    projection = KimiK3MixedKDAProjection(5, [3, 3, 3, 3, 2, 3], 4, 1,
+        column_linear=Column, merged_linear=Gate, quant_config=None,
+        prefix='model.self_attn.in_proj_qkvgfab')
+    x = torch.randn(4, 5)
+    projection._fuse_qkv = False
+    expected = projection(x)[0]
+    calls.clear()
+    projection._fuse_qkv = True
+    actual = projection(x)[0]
+    torch.testing.assert_close(actual, expected)
+    assert len(calls) == 1
+    cache = projection._fused_qkv
+    projection(x)
+    assert projection._fused_qkv is cache
+    assert cache.weight.data_ptr() != projection.q_proj.weight.data_ptr()
+    projection.k_proj.scheme.is_static_input_scheme = True
+    with pytest.raises(ValueError, match='Incompatible'):
+        projection._make_fused_qkv(5)
