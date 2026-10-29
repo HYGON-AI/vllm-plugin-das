@@ -63,6 +63,7 @@ def test_installed_lightop_rmsnorm_matches_references_and_fallbacks(
         for dtype in (torch.bfloat16, torch.float16):
             layer = RMSNorm(256).to(device="cuda", dtype=dtype)
             assert isinstance(layer, HcuRMSNorm)
+            assert layer._forward_method.__name__ == "forward_hip"
             layer.weight.data.normal_(mean=1.0, std=0.1)
 
             value = torch.randn((17, 256), device="cuda", dtype=dtype)

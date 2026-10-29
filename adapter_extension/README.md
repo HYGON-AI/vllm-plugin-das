@@ -5,10 +5,13 @@
 lifecycle; this wheel contributes optional, independently removable operator
 optimizations through the adapter extension API.
 
-Version `0.2.0.dev0` contains two validated `gfx938` capabilities:
+Version `0.2.0.dev0` contains one validated `gfx938` capability:
 
-- LightOp `SiluAndMul`.
 - LightOp ordinary and fused-add `RMSNorm`.
+
+vLLM's native `SiluAndMul` remains the selected implementation. Warmed
+compiled A/B measurements on `gfx938` did not justify replacing the upstream
+operator, so the plugin neither registers nor ships a `SiluAndMul` override.
 
 No attention, MoE, model, topology, or performance support is implied by these
 operator-level capabilities.
@@ -53,11 +56,10 @@ VLLM_PLUGINS=hcu_adapter python3 -E adapter_extension/tools/verify_installed.py
 
 The verifier fails closed unless all three distributions have non-empty wheel
 records, their imported modules are owned by those records, the adapter is the
-sole expected vLLM entry-point owner, the DAS extension is active with both
-declared capabilities, and vLLM's OOT registry selects these exact classes:
+sole expected vLLM entry-point owner, the DAS extension is active with its
+declared capability, and vLLM's OOT registry selects this exact class:
 
 ```text
-hcu_vllm_das.silu_and_mul.HcuSiluAndMul
 hcu_vllm_das.rms_norm.HcuRMSNorm
 ```
 
@@ -80,22 +82,19 @@ of scope for this release.
 
 ## Opt in and rollback
 
-The two optimized paths default to OFF while their upstream-takeover A/B is
-being established. Enable a child path explicitly; the master switch remains
-the highest-priority rollback and returns both operators to complete vLLM
-implementations without uninstalling the plugin:
+The optimized path defaults to OFF. Enable it explicitly; the master switch
+remains the highest-priority rollback and returns RMSNorm to vLLM's complete
+implementation without uninstalling the plugin:
 
 ```bash
-# Explicitly enable both validated candidate paths.
+# Explicitly enable the validated RMSNorm path.
 export VLLM_HCU_USE_CUSTOM_OPS=1
-export VLLM_HCU_USE_CUSTOM_SILU_AND_MUL=1
 export VLLM_HCU_USE_CUSTOM_RMS_NORM=1
 
 # Roll back all optional DAS custom operators.
 export VLLM_HCU_USE_CUSTOM_OPS=0
 
-# Or roll back one LightOp path while leaving the other policy unchanged.
-export VLLM_HCU_USE_CUSTOM_SILU_AND_MUL=0
+# Or roll back only the LightOp RMSNorm path.
 export VLLM_HCU_USE_CUSTOM_RMS_NORM=0
 ```
 
@@ -111,6 +110,7 @@ For complete removal, uninstall `hcu-vllm-das-plugin`; the adapter and vLLM
 remain installed and retain platform ownership.
 
 See the historical
-[`SiluAndMul` record](../docs/validation/v032-adapter-extension-silu.md) and the
-current [`RMSNorm` record](../docs/validation/v032-adapter-extension-rmsnorm.md)
-for exact wheel hashes and live-HCU evidence.
+[`SiluAndMul` record](../docs/validation/v032-adapter-extension-silu.md) for the
+candidate that was evaluated but not retained, and the current
+[`RMSNorm` record](../docs/validation/v032-adapter-extension-rmsnorm.md) for
+exact wheel hashes and live-HCU evidence.

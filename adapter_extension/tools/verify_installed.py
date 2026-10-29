@@ -13,12 +13,9 @@ import sys
 from packaging.version import InvalidVersion, Version
 
 
-_REQUIRED_CAPABILITIES = frozenset(
-    {"lightop-rms-norm", "lightop-silu-and-mul"}
-)
+_REQUIRED_CAPABILITIES = frozenset({"lightop-rms-norm"})
 _REQUIRED_OOT_CLASSES = {
     "RMSNorm": "hcu_vllm_das.rms_norm.HcuRMSNorm",
-    "SiluAndMul": "hcu_vllm_das.silu_and_mul.HcuSiluAndMul",
 }
 _REQUIRED_PLATFORM = "hcu_adapter.bridges.vllm.HcuPlatform"
 
@@ -140,9 +137,10 @@ def collect_attestation() -> dict[str, object]:
         raise InstalledVerificationError(
             f"installed vLLM version is invalid: {vllm_dist.version!r}"
         ) from error
-    if parsed_vllm.epoch != 0 or parsed_vllm.release != (0, 32, 0):
+    if parsed_vllm.epoch != 0 or parsed_vllm.release[:2] != (0, 32):
         raise InstalledVerificationError(
-            f"installed vLLM must be release 0.32.0, got {vllm_dist.version!r}"
+            "installed vLLM must satisfy >=0.32.0,<0.33.0, "
+            f"got {vllm_dist.version!r}"
         )
 
     _require_entry_point(

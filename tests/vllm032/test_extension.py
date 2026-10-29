@@ -29,26 +29,18 @@ def reset_activation(monkeypatch: pytest.MonkeyPatch):
 
 
 def successful_importer(calls: list[str]):
-    class SiluAndMul:
-        register_oot = staticmethod(lambda value: value)
-
     class RMSNorm:
         register_oot = staticmethod(lambda value: value)
 
     modules = {
-        "lightop.activation": SimpleNamespace(silu_and_mul_opt=lambda out, x: None),
         "lightop.norm": SimpleNamespace(
             fused_add_rms_norm=lambda x, residual, weight, eps: (x, residual),
             rmsnorm_forward_autograd=lambda x, weight, eps, training: x,
-        ),
-        "vllm.model_executor.layers.activation": SimpleNamespace(
-            SiluAndMul=SiluAndMul
         ),
         "vllm.model_executor.layers.layernorm": SimpleNamespace(RMSNorm=RMSNorm),
         "vllm.utils.torch_utils": SimpleNamespace(
             direct_register_custom_op=lambda **kwargs: None
         ),
-        "hcu_vllm_das.silu_and_mul": SimpleNamespace(),
         "hcu_vllm_das.rms_norm": SimpleNamespace(),
     }
 
@@ -66,9 +58,7 @@ def test_factory_declares_the_adapter_api_and_migrated_capabilities() -> None:
     assert spec.name == "das-hcu"
     assert spec.api_version == 1
     assert spec.priority == 100
-    assert spec.capabilities == frozenset(
-        {"lightop-silu-and-mul", "lightop-rms-norm"}
-    )
+    assert spec.capabilities == frozenset({"lightop-rms-norm"})
     assert spec.activate is extension.activate_extension
 
 
@@ -153,12 +143,9 @@ def test_activation_accepts_the_vllm_032_release_line(
     extension.activate_extension(context(version))
 
     assert calls == [
-        "lightop.activation",
         "lightop.norm",
-        "vllm.model_executor.layers.activation",
         "vllm.model_executor.layers.layernorm",
         "vllm.utils.torch_utils",
-        "hcu_vllm_das.silu_and_mul",
         "hcu_vllm_das.rms_norm",
     ]
 
@@ -181,36 +168,6 @@ def test_activation_rejects_unsupported_metadata_before_importing_runtime(
 
     assert calls == []
     assert extension._activated is False
-
-
-def test_missing_lightop_symbol_fails_before_vllm_and_can_be_retried(
-    monkeypatch: pytest.MonkeyPatch,
-) -> None:
-    calls: list[str] = []
-
-    def missing_lightop(name: str):
-        calls.append(name)
-        return SimpleNamespace()
-
-    monkeypatch.setattr(extension, "_import_module", missing_lightop)
-
-    with pytest.raises(extension.DasExtensionError, match="silu_and_mul_opt"):
-        extension.activate_extension(context())
-
-    assert calls == ["lightop.activation"]
-    assert extension._activated is False
-
-    retry_calls: list[str] = []
-    monkeypatch.setattr(
-        extension, "_import_module", successful_importer(retry_calls)
-    )
-    extension.activate_extension(context())
-
-    assert retry_calls[-2:] == [
-        "hcu_vllm_das.silu_and_mul",
-        "hcu_vllm_das.rms_norm",
-    ]
-    assert extension._activated is True
 
 
 @pytest.mark.parametrize(
@@ -251,7 +208,6 @@ def test_missing_lightop_rmsnorm_symbol_fails_before_product_imports(
     with pytest.raises(extension.DasExtensionError, match=message):
         extension.activate_extension(context())
 
-    assert "hcu_vllm_das.silu_and_mul" not in calls
     assert "hcu_vllm_das.rms_norm" not in calls
     assert extension._activated is False
 
@@ -259,11 +215,6 @@ def test_missing_lightop_rmsnorm_symbol_fails_before_product_imports(
 @pytest.mark.parametrize(
     ("module_name", "replacement", "message"),
     (
-        (
-            "vllm.model_executor.layers.activation",
-            SimpleNamespace(SiluAndMul=SimpleNamespace()),
-            "register_oot",
-        ),
         (
             "vllm.model_executor.layers.layernorm",
             SimpleNamespace(RMSNorm=SimpleNamespace()),
@@ -296,7 +247,6 @@ def test_changed_vllm_api_fails_before_capability_registration(
     with pytest.raises(extension.DasExtensionError, match=message):
         extension.activate_extension(context())
 
-    assert "hcu_vllm_das.silu_and_mul" not in calls
     assert "hcu_vllm_das.rms_norm" not in calls
     assert extension._activated is False
 
@@ -311,14 +261,10 @@ def test_repeated_and_concurrent_activation_registers_capability_once(
         tuple(pool.map(extension.activate_extension, [context()] * 32))
     extension.activate_extension(context())
 
-    assert calls.count("hcu_vllm_das.silu_and_mul") == 1
     assert calls.count("hcu_vllm_das.rms_norm") == 1
     assert calls == [
-        "lightop.activation",
         "lightop.norm",
-        "vllm.model_executor.layers.activation",
         "vllm.model_executor.layers.layernorm",
         "vllm.utils.torch_utils",
-        "hcu_vllm_das.silu_and_mul",
         "hcu_vllm_das.rms_norm",
     ]

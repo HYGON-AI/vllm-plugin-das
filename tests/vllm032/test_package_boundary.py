@@ -103,6 +103,7 @@ def test_built_wheel_contains_only_the_new_plugin_namespace(tmp_path: Path) -> N
     assert "[vllm.platform_plugins]\n" not in entry_points
     assert "[vllm.general_plugins]\n" not in entry_points
     assert any(name == "hcu_vllm_das/__init__.py" for name in names)
+    assert "hcu_vllm_das/silu_and_mul.py" not in names
     license_names = {
         name.rsplit("/", 1)[-1]
         for name in names

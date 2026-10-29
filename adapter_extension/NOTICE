@@ -3,7 +3,7 @@ Copyright (c) 2026 Hygon Information Technology Co., Ltd.
 
 This product is licensed under the Apache License, Version 2.0.
 
-The LightOp SiluAndMul and RMSNorm integrations are adapted from
+The LightOp RMSNorm integration is adapted from
 HYGON-AI/vllm-plugin-das branch v0.28.1-dev at commit
 cd412a0d53b9b517fbc3dcdf96121dc3daa1096c.
 That project and vLLM are licensed under the Apache License, Version 2.0.
