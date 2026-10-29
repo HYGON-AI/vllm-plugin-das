@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import os
+import warnings
 
 import pytest
 
@@ -139,3 +140,58 @@ def test_installed_lightop_rmsnorm_matches_references_and_fallbacks(
             expected = layer.forward_native(value.clone())
             actual = layer(value.clone())
             torch.testing.assert_close(actual, expected, rtol=2e-2, atol=2e-2)
+
+
+@pytest.mark.skipif(
+    not _live_requested(),
+    reason=(
+        "set HCU_VLLM032_RMSNORM_LIVE=1 for installed-wheel HCU "
+        "RMSNorm validation"
+    ),
+)
+def test_installed_fused_rmsnorm_compile_replay_has_no_alias_warning() -> None:
+    import torch
+
+    from vllm.plugins import load_general_plugins
+
+    load_general_plugins()
+
+    torch.manual_seed(20261029)
+    weight = torch.randn((256,), device="cuda", dtype=torch.bfloat16)
+
+    def fused(value, residual):
+        torch.ops.vllm.hcu_fused_add_rms_norm_lightop(
+            value,
+            residual,
+            weight,
+            1e-6,
+        )
+        return value, residual
+
+    compiled = torch.compile(fused, dynamic=True)
+    first_value = torch.randn((8, 256), device="cuda", dtype=torch.bfloat16)
+    first_residual = torch.randn_like(first_value)
+    second_value = first_value + 0.125
+    second_residual = first_residual - 0.25
+    expected_sum = second_value.float() + second_residual.float()
+    expected = _reference(expected_sum, weight, 1e-6)
+
+    with warnings.catch_warnings(record=True) as caught:
+        warnings.simplefilter("always")
+        compiled(first_value.clone(), first_residual.clone())
+        actual, updated_residual = compiled(
+            second_value.clone(),
+            second_residual.clone(),
+        )
+        torch.cuda.synchronize()
+
+    alias_warnings = [
+        str(item.message)
+        for item in caught
+        if "may not alias any inputs" in str(item.message)
+    ]
+    assert alias_warnings == []
+    torch.testing.assert_close(
+        updated_residual.float(), expected_sum, rtol=2e-2, atol=2e-2
+    )
+    torch.testing.assert_close(actual.float(), expected, rtol=4e-2, atol=4e-2)

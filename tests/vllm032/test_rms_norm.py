@@ -198,6 +198,23 @@ fused_fake = fused_registration["fake_impl"](
     layer.weight,
     layer.variance_epsilon,
 )
+layer_events = list(events)
+impl_probe_value = Tensor(
+    (3, {width!r}),
+    dtype={input_dtype!r},
+    tag="impl-probe-input",
+)
+impl_probe_residual = Tensor(
+    (3, {residual_width!r}),
+    dtype={residual_dtype!r},
+    tag="impl-probe-residual",
+)
+fused_impl = fused_registration["op_func"](
+    impl_probe_value,
+    impl_probe_residual,
+    layer.weight,
+    layer.variance_epsilon,
+)
 print(json.dumps({{
     "registration_names": [item["op_name"] for item in registrations],
     "ordinary_mutates": ordinary_registration["mutates_args"],
@@ -210,13 +227,9 @@ print(json.dumps({{
         and result[1] is residual_value
     ),
     "ordinary_fake_shape": list(ordinary_fake.shape),
-    "fused_fake_identity": (
-        fused_fake[0] is value
-        and fused_fake[1] is (
-            residual_value if residual_value is not None else value
-        )
-    ),
-    "events": events,
+    "fused_impl_returns_none": fused_impl is None,
+    "fused_fake_returns_none": fused_fake is None,
+    "events": layer_events,
 }}))
 """
     result = subprocess.run(
@@ -249,7 +262,8 @@ def test_fused_add_rmsnorm_returns_mutated_inputs() -> None:
 
     assert report["result"] == ["fused-output", "fused-residual"]
     assert report["fused_result_identity"] is True
-    assert report["fused_fake_identity"] is True
+    assert report["fused_impl_returns_none"] is True
+    assert report["fused_fake_returns_none"] is True
     assert any(event[0] == "fused-lightop" for event in report["events"])
 
 

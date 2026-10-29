@@ -39,9 +39,8 @@ def _fused_add_rms_norm_impl(
     residual: torch.Tensor,
     weight: torch.Tensor,
     variance_epsilon: float,
-) -> tuple[torch.Tensor, torch.Tensor]:
+) -> None:
     fused_add_rms_norm(x, residual, weight, variance_epsilon)
-    return x, residual
 
 
 def _fused_add_rms_norm_fake(
@@ -49,9 +48,8 @@ def _fused_add_rms_norm_fake(
     residual: torch.Tensor,
     weight: torch.Tensor,
     variance_epsilon: float,
-) -> tuple[torch.Tensor, torch.Tensor]:
-    del weight, variance_epsilon
-    return x, residual
+) -> None:
+    del x, residual, weight, variance_epsilon
 
 
 direct_register_custom_op(
@@ -119,12 +117,13 @@ class HcuRMSNorm(RMSNorm):
                 self.variance_epsilon,
                 self.training,
             )
-        return torch.ops.vllm.hcu_fused_add_rms_norm_lightop(
+        torch.ops.vllm.hcu_fused_add_rms_norm_lightop(
             x,
             residual,
             weight,
             self.variance_epsilon,
         )
+        return x, residual
 
 
 __all__ = ["HcuRMSNorm"]
