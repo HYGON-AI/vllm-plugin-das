@@ -72,7 +72,7 @@ env -u PYTHONPATH \
   -m pytest -q tests/vllm032
 ```
 
-Result: `61 passed, 3 skipped in 135.05s`.
+Result: `61 passed, 3 skipped in 162.52s`.
 
 Installed ownership and activation gate:
 
@@ -80,14 +80,16 @@ Installed ownership and activation gate:
 env -u PYTHONPATH \
   HCU_ADAPTER_HOST=vllm \
   VLLM_PLUGINS=hcu_adapter \
-  /dev/shm/adapter-das-pr11-vllm032-qwen2-05b/venv/bin/python \
-  adapter_extension/tools/verify_installed.py
+  /dev/shm/adapter-das-pr11-vllm032-qwen2-05b/venv/bin/python -S -c \
+  'import runpy,sys; sys.path[:0]=["/dev/shm/adapter-das-pr11-vllm032-qwen2-05b/venv/lib/python3.12/site-packages","/usr/local/lib/python3.12/site-packages"]; import sitecustomize; runpy.run_path("adapter_extension/tools/verify_installed.py", run_name="__main__")'
 ```
 
 Result: pass. All three imported roots were owned by their installed wheel
 RECORDs; the platform was `hcu_adapter.bridges.vllm.HcuPlatform`; the extension
 was active with only `lightop-rms-norm`; the only required OOT owner was
-`hcu_vllm_das.rms_norm.HcuRMSNorm`.
+`hcu_vllm_das.rms_norm.HcuRMSNorm`. The explicit venv-first launcher isolates
+the same node-level system-package ordering issue described in the service
+section below.
 
 ## Warmed compiled operator A/B
 
@@ -147,26 +149,78 @@ Raw microseconds per call:
 
 Dispatch was `forward_native` for both classes in OFF and `forward_hip` for
 both candidate classes in ON. These microbenchmarks establish the ownership
-decision only. They are not a serving-throughput claim, and the retained final
-RMSNorm wheel remains default OFF until its pending final-wheel gates execute.
+decision only. They are not a serving-throughput claim. RMSNorm remains an
+explicit, default-OFF opt-in after the final-wheel gates below passed.
 
 ## Live Graph and service gates
 
-The final-wheel live Graph and small-model non-eager ON/OFF commands must only
-run on an idle shared node. At `2026-10-29T07:06:38Z`, every visible card was at
-0% compute but held 58,088--58,216 MiB of 65,520 MiB VRAM from a process outside
-this container's PID namespace. No process was terminated and no new HCU test
-or service was started against that occupied baseline.
+The final-wheel live Graph and small-model non-eager ON/OFF commands ran only
+after the shared node became idle. Earlier, at `2026-10-29T07:06:38Z`, every
+visible card was at 0% compute but held 58,088--58,216 MiB of 65,520 MiB VRAM
+from a process outside this container's PID namespace. No process was
+terminated and no test was started against that occupied baseline. At
+`2026-10-29T07:32:14Z`, all eight cards had returned to 0% compute and 2 MiB
+used, so the final gates proceeded on card 0.
 
-Pending rows:
+Final-wheel eager, compile-replay, and ON/OFF Graph command:
 
-- final-wheel ordinary and fused-add RMSNorm eager numerics;
-- final-wheel changed-input `torch.compile` replay with no mutable-output alias
-  warning;
-- final-wheel ON/OFF Graph dispatch (`HcuRMSNorm.forward_hip` versus
-  `forward_native`, while official `SiluAndMul.forward_native` remains fixed);
-- `/model/Qwen2-0.5B-Instruct` ON/OFF service in default non-eager
-  `FULL_AND_PIECEWISE` mode, without `--enforce-eager`;
-- clean owned-process teardown and return to the node's pre-run VRAM baseline.
+```bash
+env -u PYTHONPATH \
+  HCU_ADAPTER_HOST=vllm VLLM_PLUGINS=hcu_adapter \
+  HIP_VISIBLE_DEVICES=0 \
+  HCU_VLLM032_RMSNORM_LIVE=1 HCU_VLLM032_GRAPH_LIVE=1 \
+  /dev/shm/adapter-das-pr11-vllm032-qwen2-05b/venv/bin/python \
+  -m pytest -q \
+  tests/vllm032/test_rms_norm_hcu.py \
+  tests/vllm032/test_operator_graph_hcu.py -vv
+```
+
+Result: `3 passed, 14 warnings in 98.17s`. This covers ordinary and fused-add
+RMSNorm numerics, changed-input `torch.compile` replay without a mutable-output
+alias warning, and fresh-process ON/OFF Graph dispatch. Explicit ON selected
+`HcuRMSNorm.forward_hip`; master OFF selected `forward_native`; official
+`SiluAndMul.forward_native` remained fixed in both rows.
+
+The service used `/model/Qwen2-0.5B-Instruct` with BF16, max model length 512,
+one sequence, `TRITON_ATTN`, and 20% device-memory utilization. It deliberately
+did not pass `--enforce-eager`. Both fresh processes reported
+`enforce_eager=False`, `VLLM_COMPILE`, `FULL_AND_PIECEWISE`, completed PIECEWISE
+and FULL graph capture, and exposed vLLM `0.32.0`.
+
+The validation venv uses `--system-site-packages`, and this node also contains a
+global vLLM 0.28.1 ahead of the venv on normal startup. To prevent that global
+package from contaminating the 0.32 service gate, both modes used the following
+explicit venv-first launcher. ON used port 18015 and an isolated `on-cache`:
+
+```bash
+env -u PYTHONPATH \
+  HCU_ADAPTER_HOST=vllm VLLM_PLUGINS=hcu_adapter \
+  HIP_VISIBLE_DEVICES=0 HSA_VISIBLE_DEVICES=0 \
+  VLLM_HCU_USE_CUSTOM_OPS=1 \
+  VLLM_HCU_USE_CUSTOM_RMS_NORM=1 \
+  XDG_CACHE_HOME=/dev/shm/vllm032-plugin-service-final/on-cache \
+  TRITON_CACHE_DIR=/dev/shm/vllm032-plugin-service-final/on-cache/triton \
+  /dev/shm/adapter-das-pr11-vllm032-qwen2-05b/venv/bin/python -S -c \
+  'import sys; sys.path[:0]=["/dev/shm/adapter-das-pr11-vllm032-qwen2-05b/venv/lib/python3.12/site-packages","/usr/local/lib/python3.12/site-packages"]; import sitecustomize; from vllm.entrypoints.cli.main import main; main()' \
+  serve /model/Qwen2-0.5B-Instruct \
+  --served-model-name Qwen2-0.5B-Instruct \
+  --host 127.0.0.1 --port 18015 \
+  --dtype bfloat16 --max-model-len 512 \
+  --gpu-memory-utilization 0.20 --max-num-seqs 1 \
+  --disable-custom-all-reduce --attention-backend TRITON_ATTN
+```
+
+OFF repeated that command in a fresh process with port 18016, an isolated
+`off-cache`, `VLLM_HCU_USE_CUSTOM_OPS=0`, and the child deliberately left at
+`VLLM_HCU_USE_CUSTOM_RMS_NORM=1` to prove that the master switch wins. Each
+mode received proxy-bypassed `/health`, `/version`, `/v1/models`, and
+temperature-zero chat probes. All four endpoints returned HTTP 200 in both
+modes; both chats returned exactly `42` with identical 28 prompt, 3 completion,
+and 31 total token counts. The sampled first chat times were 57.9 ms ON and
+60.6 ms OFF. They are correctness samples, not a serving-performance claim.
+
+Each owned service was stopped through its PTY with SIGINT. No vLLM or
+EngineCore process remained, all cards returned to 0% compute and 0% reported
+memory use, and no external process was signalled.
 
 HumanEval-64 and broader model precision remain not run for this candidate.

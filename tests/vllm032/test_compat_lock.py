@@ -59,8 +59,10 @@ def test_plugin_compat_lock_pins_vllm032_pair_without_circular_commits() -> None
         ),
         "build_commit": "46923fbcf2068c1491090ca4d00e519b2abad91f",
     }
-    assert document["gates"]["live_hardware_operators"]["status"] == "pending"
-    assert document["gates"]["serving"]["status"] == "pending"
+    assert document["gates"]["live_hardware_operators"]["status"] == "pass"
+    assert document["gates"]["serving"]["status"] == "pass"
+    assert document["gates"]["model_parity"]["status"] == "pending"
+    assert document["gates"]["humaneval_prefix"]["status"] == "pending"
     assert not _contains_forbidden_key(document)
 
 

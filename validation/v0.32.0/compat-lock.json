@@ -79,15 +79,15 @@
       "result": "installed vLLM 0.32, adapter-das and plugin wheel ownership, platform, extension and OOT classes verified"
     },
     "live_hardware_operators": {
-      "status": "pending",
-      "result": "final-wheel run deferred: shared-node baseline held 58088-58216 MiB per card outside the container PID namespace"
+      "status": "pass",
+      "result": "final wheels: RMSNorm eager/compile replay and ON/OFF graph dispatch passed, 3 passed in 98.17s"
     },
     "model_parity": {
       "status": "pending"
     },
     "serving": {
-      "status": "pending",
-      "result": "Qwen2-0.5B-Instruct non-eager ON/OFF smoke awaits an idle card"
+      "status": "pass",
+      "result": "Qwen2-0.5B-Instruct fresh-process ON/OFF: vLLM 0.32.0, enforce_eager=false, FULL_AND_PIECEWISE captured, health/version/models/chat HTTP 200, deterministic output 42, clean teardown"
     },
     "humaneval_prefix": {
       "status": "pending"
@@ -98,7 +98,13 @@
       "document": "docs/validation/vllm032-upstream-first-operator-ab.md",
       "validated_at": "2026-10-29",
       "retained_capability": "lightop-rms-norm",
-      "upstream_takeover": "SiluAndMul"
+      "upstream_takeover": "SiluAndMul",
+      "live_graph_result": "3 passed, 14 warnings in 98.17s",
+      "serving_modes": [
+        "master-on-rms-on",
+        "master-off-rms-on"
+      ],
+      "serving_probe_result": "both modes returned HTTP 200 and deterministic chat output 42"
     }
   },
   "completed_at": null

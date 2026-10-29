@@ -143,9 +143,10 @@ Commit: `fix(vllm032): make lightop paths explicit graph-safe opt-ins`
 ### Task 4: Installed HCU Takeover Gate and Delivery Evidence
 
 **Audit outcome:** Warmed A/B removed the candidate Silu override and its tests,
-switch, capability, module, and OOT registration. Final-wheel live Graph and
-small-model service rows remain pending while the shared node is externally
-holding about 58 GiB per card; no occupied card is commandeered for this task.
+switch, capability, module, and OOT registration. After the shared-node
+occupancy cleared without interference, the final-wheel live Graph and fresh
+non-eager ON/OFF small-model service rows passed. HumanEval and broader-model
+precision remain explicitly pending.
 
 **Files:**
 - Create: `tests/vllm032/test_operator_graph_hcu.py`
@@ -159,29 +160,29 @@ holding about 58 GiB per card; no occupied card is commandeered for this task.
 - Consumes: the Plugin wheel from Tasks 1-3, Adapter `c99886d`, and vLLM `0.32.0+rocm723`.
 - Produces: fresh-process ON/OFF numerical and dispatch results, changed-input compile/Graph replay, warmed repeated A/B measurements, wheel hashes, and final P-032-02/P-032-03 dispositions.
 
-- [ ] **Step 1: Write the opt-in Graph integration test and verify it initially fails against the pre-Task-3 wheel**
+- [x] **Step 1: Write the opt-in Graph integration test and verify it initially fails against the pre-Task-3 wheel**
 
 The test must assert selected OOT class and `_forward_method`, execute ordinary/fused RMSNorm and SiluAndMul with explicit ON, replay changed inputs, reject alias warnings, and compare with fresh-process official OFF output.
 
-- [ ] **Step 2: Build and install the clean candidate wheel**
+- [x] **Step 2: Build and install the clean candidate wheel**
 
 Build from `adapter_extension/`, install with `--no-deps` into the dedicated v0.32 environment, and record SHA256 plus import roots. Inspect metadata for exactly one `hcu_adapter.extensions` entry point and no vLLM platform/general entry points.
 
-- [ ] **Step 3: Run live HCU operator and Graph gates**
+- [x] **Step 3: Run live HCU operator and Graph gates**
 
 Use `HIP_VISIBLE_DEVICES=0`, `VLLM_PLUGINS=hcu_adapter`, current Adapter source first on `PYTHONPATH`, and explicit operator switches. Run all three live test files in fresh processes/parameter rows.
 
 Expected: numerical parity, `forward_hip` for explicit ON, official fallback for OFF, changed-input replay, and no mutable-alias warning.
 
-- [ ] **Step 4: Run warmed upstream takeover A/B**
+- [x] **Step 4: Run warmed upstream takeover A/B**
 
 Compare official default compiled native against explicit LightOp for representative Qwen dense shapes and ordinary/fused RMSNorm, with identical inputs, at least three independent measurements, warmup excluded, and raw latency distributions recorded. Do not invent a pass threshold; absent a project criterion, keep child defaults OFF and report the measurements without a speedup claim.
 
-- [ ] **Step 5: Run small-model non-eager ON/OFF service smoke**
+- [x] **Step 5: Run small-model non-eager ON/OFF service smoke**
 
 Use a model under `/model`, default `FULL_AND_PIECEWISE` Graph policy, proxy-bypassed `/health`, `/v1/models`, and deterministic chat requests. Start and stop each owned service through its PTY session and require HCU memory to return to baseline.
 
-- [ ] **Step 6: Update evidence and run final verification**
+- [x] **Step 6: Update evidence and run final verification**
 
 Update the compatibility lock to the current three-way SHAs, wheel hashes, commands, raw statuses, and explicit not-run/blocked rows. Run the full portable suite, all live operator/Graph gates, wheel verifier, and `git diff --check`.
 
