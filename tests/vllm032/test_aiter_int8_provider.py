@@ -56,6 +56,53 @@ def native_config(**overrides: object) -> SimpleNamespace:
     return SimpleNamespace(**values)
 
 
+def test_shape_evidence_uses_vllm_runtime_logger(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    calls: list[tuple[int, str, tuple[object, ...]]] = []
+    logger_names: list[str] = []
+    runtime_logger = SimpleNamespace(
+        log=lambda level, message, *args: calls.append((level, message, args))
+    )
+
+    def init_logger(name: str):
+        logger_names.append(name)
+        return runtime_logger
+
+    def load_module(name: str):
+        assert name == "vllm.logger"
+        return SimpleNamespace(init_logger=init_logger)
+
+    monkeypatch.setattr(provider, "import_module", load_module)
+    provider._record_once(
+        provider.logging.INFO,
+        "selected",
+        (7, 4, 12, 8, 8, 2),
+        "asm",
+        native_config(),
+    )
+
+    assert logger_names == ["vllm.hcu_vllm_das.moe.fused_moe_aiter"]
+    assert calls == [
+        (
+            provider.logging.INFO,
+            "HCU AITER INT8 MoE %s: M=%d E=%d N1=%d N2=%d K=%d top_k=%d "
+            "solution=%s config=%s",
+            (
+                "selected",
+                7,
+                4,
+                12,
+                8,
+                8,
+                2,
+                "asm",
+                {"SOL_ID1": 10010, "SOL_ID2": 20000, "BLOCK_SIZE_M": 16},
+            ),
+        )
+    ]
+
+
 def test_native_config_invokes_public_aiter_w8a8_api(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:

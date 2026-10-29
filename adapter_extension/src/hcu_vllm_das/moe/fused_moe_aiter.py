@@ -10,6 +10,7 @@ from typing import Any, Callable
 
 
 LOG = logging.getLogger(__name__)
+VLLM_LOGGER_NAME = f"vllm.{__name__}"
 
 
 @dataclass(frozen=True)
@@ -21,6 +22,18 @@ class _AiterApi:
 
 _evidence_lock = Lock()
 _reported_evidence: set[tuple[object, ...]] = set()
+
+
+def _runtime_logger() -> logging.Logger:
+    """Use vLLM's configured logger once the product module is active."""
+
+    try:
+        init_logger = import_module("vllm.logger").init_logger
+    except (ImportError, AttributeError):
+        return LOG
+    # vLLM configures a non-propagating handler on the ``vllm`` namespace.
+    # Keep the Plugin module identity as a child so INFO evidence reaches it.
+    return init_logger(VLLM_LOGGER_NAME)
 
 
 def _load_aiter_api() -> _AiterApi:
@@ -78,7 +91,7 @@ def _record_once(
         if key in _reported_evidence:
             return
         _reported_evidence.add(key)
-    LOG.log(
+    _runtime_logger().log(
         level,
         "HCU AITER INT8 MoE %s: M=%d E=%d N1=%d N2=%d K=%d top_k=%d "
         "solution=%s config=%s",
