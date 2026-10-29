@@ -9,6 +9,9 @@
 #include <torch/extension.h>
 
 using fptr_t = int64_t;
+void hipblaslt_fp8_bmm(torch::Tensor const& x, torch::Tensor const& weight,
+                      torch::Tensor const& x_scale,
+                      torch::Tensor const& weight_scale, torch::Tensor& out);
 fptr_t init_custom_ar(const std::vector<int64_t>& fake_ipc_ptrs,
                       torch::Tensor& rank_data, int64_t rank,
                       bool fully_connected);

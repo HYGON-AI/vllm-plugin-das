@@ -34,6 +34,10 @@ python3 setup.py bdist_wheel
 
 Set `ADD_GIT_VERSION=1` when the wheel version should include the Git revision.
 
+HY4 can opt into HIPBLASLt FP8 value projection with
+`VLLM_HCU_HY4_FP8_V_UP_PROJ=1`. See the [configuration and validation
+notes](docs/hy4_blaslt_fp8_v_up_proj.md).
+
 No post-install source-patching step is required. Installation and plugin startup
 do not rewrite files in the vLLM package and do not create source-tree symlinks.
 `setup.py` computes the wheel version from read-only Git/environment metadata;

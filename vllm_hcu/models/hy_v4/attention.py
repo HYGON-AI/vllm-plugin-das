@@ -400,6 +400,9 @@ class HYV4MLAAttentionLayer(MLAAttention):
     def process_weights_after_loading(self, act_dtype: torch.dtype) -> None:
         """Prepare MLA projections, then run the selected backend's hook."""
         super().process_weights_after_loading(act_dtype)
+        from vllm_hcu.models.hy_v4.v_up_proj import prepare_fp8_v_up_proj
+
+        self._hcu_blaslt_v_up_proj = prepare_fp8_v_up_proj(self, act_dtype)
         if getattr(self, "_hcu_dcp_q_replicate", False):
             if (
                 self.is_aiter_triton_fp4_bmm_enabled
@@ -413,6 +416,13 @@ class HYV4MLAAttentionLayer(MLAAttention):
                 self.W_UK_T.contiguous(), dim=0
             )
         self.impl.process_weights_after_loading(act_dtype)
+
+    def _v_up_proj(self, x: torch.Tensor, out: torch.Tensor):
+        if not getattr(self, "_hcu_blaslt_v_up_proj", False):
+            return super()._v_up_proj(x, out)
+        from vllm_hcu.models.hy_v4.v_up_proj import fp8_v_up_proj
+
+        fp8_v_up_proj(self, x, out)
 
     def forward(
         self,
