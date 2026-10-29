@@ -194,6 +194,31 @@ def _has_hcu_low_latency_dispatch_abi(buffer) -> bool:
     )
 
 
+def _claim_ll_buffer_cleanup(buffer) -> bool:
+    """Return True for the first LL dispatch on ``buffer`` in this forward.
+
+    DeepEP auto latches one mode per forward, and LL kernels re-zero their
+    next buffer themselves, so only HT traffic from an earlier forward can
+    leave the shared buffer dirty.  One clean per forward (captured into the
+    FULL graph when capturing) is enough; repeating it per MoE layer only adds
+    two EP-wide barriers per layer.
+    """
+    from vllm.forward_context import get_forward_context, is_forward_context_available
+
+    if not is_forward_context_available():
+        return True
+    context = get_forward_context()
+    cleaned = getattr(context, "_vllm_hcu_ll_cleaned_buffers", None)
+    if cleaned is None:
+        cleaned = set()
+        context._vllm_hcu_ll_cleaned_buffers = cleaned
+    key = id(buffer)
+    if key in cleaned:
+        return False
+    cleaned.add(key)
+    return True
+
+
 def _uses_post_dispatch_channel_fp8_quant(quant_config) -> bool:
     """Whether HCU DeepGEMM quantizes Channel-FP8 after routing."""
 
@@ -664,7 +689,9 @@ def ll_prepare_async(
             if block_k is None and quant_config.per_act_token_quant
             else module.DEEPEP_QUANT_BLOCK_SIZE
         )
-    if getattr(self, "_vllm_hcu_clean_low_latency_buffer", False):
+    if getattr(
+        self, "_vllm_hcu_clean_low_latency_buffer", False
+    ) and _claim_ll_buffer_cleanup(self.buffer):
         cleanup = getattr(self.buffer, "clean_low_latency_buffer", None)
         if not callable(cleanup):
             raise RuntimeError(
