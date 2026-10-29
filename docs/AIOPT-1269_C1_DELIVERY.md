@@ -23,6 +23,33 @@ this document:
   MoE.
 - C1 is a target-model bf16 MoE tile specialization, **not MTP MoE tuning**.
 
+## Ownership and selector boundary (final head)
+
+The tuned artifact is owned by AITER, not by this plugin.  The original C1
+commit (`67b757d`) carried the JSON under
+`vllm_hcu/model_executor/layers/fused_moe/moe_configs`; the final head removes
+that copy and points `VLLM_TUNED_CONFIG_FOLDER` at
+`<aiter>/configs/vllm_moe` (a user-supplied folder still wins).  The AITER
+table is byte-identical for the measured target rows, so the decode evidence
+below transfers unchanged.
+
+vLLM selects a table row with the nearest-M rule
+(`configs[min(configs.keys(), key=lambda x: abs(x - M))]`).  The AITER
+boundary follow-up (required before this plugin PR merges) adds keys `257`,
+`513`, `5675` and `5676` so that this rule reproduces the native vLLM default
+for every `M > 256`:
+
+```
+CONFIGURED_TUNED_RANGE=1..256
+TUNED_AND_MEASURED_M=16,32,64,128
+NON_TARGET_M>256=vLLM native-default-equivalent via boundary rows
+MISMATCH_BEFORE_M>256=853 (M=257..384, 513..768, 5676..6144)
+MISMATCH_AFTER_M>256=0
+```
+
+Only `M=16/32/64/128` were performance-measured.  No claim is made that other
+M values inside the configured tuned range were performance-tuned.
+
 ## Frozen base
 
 ```
@@ -42,6 +69,10 @@ C1_ARM=67b757d3b5617b964e90a2aed8481a8a766af5a1   (8b7fae2 + C1 09d83cc)
 PIN_FIX_COMMIT=509affd0df1a5efbe50f1c172c87755b01087dff
 C1_SOURCE_COMMIT=09d83cc7fbf01d82269a6028e1c4341e6b3bda23
 ```
+
+`VALIDATED_CODE_HEAD=67b757d` predates the ownership migration.  The final
+head keeps the same tuned rows for `M<=256`; only the artifact owner and the
+`M>256` boundary rows differ.
 
 Pure upstream `56d23cd` cannot start the deployed Step5 runtime: the runtime
 `_generate_drafts` source hashes to `dcabfd6f...`, which is absent from the
@@ -90,13 +121,19 @@ SEMANTIC_EQUIVALENCE_PROVEN=YES
 ```
 A0 (frozen upstream + pin fix): VLLM_TUNED_CONFIG_FOLDER=None
                                 get_moe_configs(44,1536,None)=None  -> default
-C1 (candidate):                 VLLM_TUNED_CONFIG_FOLDER=<isolate>/.../moe_configs
-                                get_moe_configs(44,1536,None)=19 keys
-                                M=16..256 -> tuned tile BM16 BN64 BK128 w2 s1
-FALLBACK: E=352 miss; dtype=fp8 miss; M=65536 -> vLLM default tile;
+C1 (final head):                plugin points VLLM_TUNED_CONFIG_FOLDER at
+                                <aiter>/configs/vllm_moe (user override wins)
+                                get_moe_configs(44,1536,None)=23 keys
+                                M<=256 -> tuned tile BM16 BN64 BK128 w2 s1
+                                M>256  -> native-default-equivalent boundary rows
+FALLBACK: E=352 miss; dtype=fp8 miss; device-name miss -> vLLM bundled/default;
           user VLLM_TUNED_CONFIG_FOLDER is preserved and wins.
 BW1100 / BW1101 alias smoke: PASS
 ```
+
+The validated `67b757d` run used the 19-key plugin-owned table.  The final
+AITER table adds only the four `M>256` boundary rows; the `M<=256` rows are
+byte-identical, so the decode measurements below are unchanged.
 
 ## Local correctness
 
@@ -204,14 +241,13 @@ acceptance evidence.
 ## Scope
 
 ```
-merge-base(56d23cd, HEAD)=56d23cd
-commits=4 (pin fix + C1 + delivery doc + target/metrics correction)
-files=8 (7 code files +573 lines, plus this doc)
+VALIDATION_HEAD=67b757d3b5617b964e90a2aed8481a8a766af5a1
+FINAL_OWNERSHIP=AITER configs/vllm_moe (plugin-owned JSON removed)
+FINAL_PR_SCOPE=config discovery + AITER ownership + stale package-data removal + tests + docs
 OLD_PATCH_CHAIN_INCLUDED=NO
 UNRELATED_COMMITS=NO
 UNRELATED_DIFF=NO
 SCOPE_CONTAMINATION=NO
-CORRECTION_COMMIT=DOC_AND_TEST_COMMENT_ONLY
 ```
 
 ## Delivery drift
@@ -238,3 +274,10 @@ Host evidence root (not shipped in the repo):
 - `evidence/local_bench_current_mainline.json` / `.log`
 - `evidence/e2e_frozen_base_summary.{json,txt}`
 - `harness/runs/<RUN_ID>/` — 3 paired clean-restart lives
+
+Boundary-fix evidence (not shipped in the repo):
+
+`<host-evidence-root>/experiments/AIOPT-1269/C1_BOUNDARY_FIX_20261029/`
+
+- `evidence/selector_sweep_after.txt` — production selector sweep for both
+  BW1100/BW1101 aliases; `M>256` mismatch count after the boundary rows is 0

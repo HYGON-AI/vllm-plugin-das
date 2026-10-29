@@ -170,6 +170,86 @@ def test_prefill_sized_batches_keep_vllms_own_tiling():
         assert config == expected, m
 
 
+@pytest.fixture
+def production_selector(monkeypatch):
+    """Expose vLLM's real nearest-M selector with AITER's folder selected."""
+
+    pytest.importorskip("vllm")
+    from vllm.platforms import current_platform
+
+    if not current_platform.is_rocm():
+        pytest.skip("AITER's Step5 table targets HCU/ROCm defaults")
+
+    from vllm.model_executor.layers import fused_moe as fused_moe_package
+    from vllm.model_executor.layers.fused_moe import fused_moe as fused_moe_impl
+
+    # try_get_optimal_moe_config() imports this override at call time.
+    monkeypatch.setattr(
+        fused_moe_package, "get_config", lambda: None, raising=False
+    )
+    monkeypatch.setenv(TUNED_CONFIG_FOLDER_ENV, str(_aiter_folder()))
+    fused_moe_impl.get_moe_configs.cache_clear()
+    try:
+        yield (
+            fused_moe_impl.try_get_optimal_moe_config,
+            fused_moe_impl.get_default_config,
+            fused_moe_impl.get_moe_configs,
+        )
+    finally:
+        fused_moe_impl.get_moe_configs.cache_clear()
+
+
+def test_real_selector_boundary_keeps_target_and_native_fallback(
+    production_selector,
+):
+    """The real vLLM selector must not leak the decode tile past M=256."""
+
+    try_get_config, get_default_config, get_moe_configs = production_selector
+    table = get_moe_configs(
+        DRAFT_MOE_E, DRAFT_MOE_N, None, 0, 0
+    )
+    assert table is not None
+
+    w1_shape = (DRAFT_MOE_E, 2 * DRAFT_MOE_N, DRAFT_MOE_K)
+    w2_shape = (DRAFT_MOE_E, DRAFT_MOE_K, DRAFT_MOE_N)
+
+    def selected(m: int) -> dict[str, int]:
+        return try_get_config(
+            w1_shape, w2_shape, DRAFT_MOE_TOPK, None, m
+        )
+
+    for m in (16, 32, 64, 128, TUNED_MAX_M):
+        assert selected(m) == TUNED_TILE, m
+
+    expected_keys = {
+        257: 257,
+        300: 257,
+        384: 257,
+        385: 512,
+        512: 512,
+        513: 513,
+        600: 513,
+        768: 513,
+        769: 1024,
+        4096: 4096,
+        5675: 5675,
+        5676: 5676,
+        6000: 5676,
+        6144: 5676,
+        6145: 5676,
+        8192: 8192,
+        65536: 32768,
+    }
+    for m, expected_key in expected_keys.items():
+        actual_key = min(table, key=lambda bucket: abs(bucket - m))
+        assert actual_key == expected_key, (m, actual_key)
+        expected = get_default_config(
+            m, DRAFT_MOE_E, DRAFT_MOE_N, DRAFT_MOE_K, DRAFT_MOE_TOPK, None
+        )
+        expected.pop("SPLIT_K")
+        assert selected(m) == expected, m
+
+
 def test_unset_folder_is_armed_with_aiter_configs():
     """The plugin points vLLM at AITER only when nothing was chosen."""
 
@@ -192,7 +272,7 @@ def test_a_user_selected_folder_is_preserved():
 
 
 def test_an_empty_user_selection_still_arms_the_aiter_configs():
-    """An empty value counts as unset, matching how vLLM reads the variable."""
+    """The plugin treats an empty value as unset and arms the AITER configs."""
 
     folder = _aiter_folder()
     environ = {TUNED_CONFIG_FOLDER_ENV: ""}
