@@ -31,3 +31,16 @@ standalone MQA/TopK time is not an end-to-end RPS claim.
 The contiguous grouping cost model is adapted from
 [sglang-das d50074e](https://github.com/maxiaobetter/sglang-das/commit/d50074e6a6942df5c91da0076acf273c977738cc),
 licensed under Apache-2.0.
+
+Grouping also requires explicitly synchronous scheduling
+(`scheduler_config.async_scheduling=False`). Async scheduling and unknown
+scheduling provenance retain the original native path, even for chunks named
+prefill: non-uniform speculative decode rows can enter those chunks, and their
+CPU sequence lengths may only be upper bounds after draft rejection. The
+grouped path must not use such upper bounds as physical gathered-K offsets.
+
+Using the same LightOp API does not guarantee the same reduction kernel:
+splitting can cross M/N dispatch thresholds (including non-beta split-K
+atomic reduction paths). Repeated paired logits/TopK checks with representative
+real Q/K/scales/weights are still required; the earlier small HumanEval subset
+and baseline output variation do not establish bitwise equivalence or its cause.

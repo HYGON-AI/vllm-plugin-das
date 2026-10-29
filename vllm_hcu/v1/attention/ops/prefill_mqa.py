@@ -85,8 +85,10 @@ def run_grouped_prefill_mqa(
 ):
     """Run a prevalidated DCP=1 plan, retaining request-relative indices.
 
-    Caller guards eager execution and FP8/LightOp dispatch. No original logits
-    matrix survives this function, so it must not be used for DCP score exchange.
+    Caller guards eager execution, FP8/LightOp dispatch and exact CPU K lengths.
+    Async CPU upper bounds must never be used as physical K slice offsets.
+    No original logits matrix survives this function, so it must not be used
+    for DCP score exchange.
     """
     if not chunks:
         return False

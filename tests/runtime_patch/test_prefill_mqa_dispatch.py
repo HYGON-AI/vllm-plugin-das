@@ -81,7 +81,7 @@ def _native_function(namespace):
 )
 def test_native_prefill_grouping_dispatch_and_dcp_scores(
     monkeypatch, enabled, mode, capturing, dcp, aiter, has_plan,
-    expected_group_calls, expected_mqa_rows,
+    expected_group_calls, expected_mqa_rows, cpu_lengths_exact=True,
 ):
     helper = _helper_module()
     group_calls, logits_calls, topk_calls, merge_calls = [], [], [], []
@@ -104,6 +104,7 @@ def test_native_prefill_grouping_dispatch_and_dcp_scores(
         slot_mapping=torch.tensor([0, 1], dtype=torch.int32),
         num_kv_actual_tokens=2, num_decodes=0, num_decode_tokens=0,
         num_prefills=2, prefill=SimpleNamespace(chunks=[chunk]), decode=None,
+        hcu_mqa_cpu_lengths_exact=cpu_lengths_exact,
     )
     context = SimpleNamespace(attn_metadata={"layer": metadata})
     if mode is not None:
@@ -244,3 +245,13 @@ def test_chunk_builder_signature_drift_fails_before_patching(mismatch):
     assert upstream.split_indexer_prefill_chunks is chunks
     assert upstream.split_decodes_and_prefills is split
     assert not getattr(upstream, adapter._MARKER, False)
+
+
+@pytest.mark.parametrize("exact", [False, None])
+def test_async_or_unknown_cpu_k_bounds_use_original_gpu_path(monkeypatch, exact):
+    # A valid-looking allocation-sized plan is insufficient: async CPU lengths
+    # can overestimate the exact device gather prefix after draft rejection.
+    test_native_prefill_grouping_dispatch_and_dcp_scores(
+        monkeypatch, True, _GraphMode.NONE, False, 1, False, True,
+        0, [2], cpu_lengths_exact=exact,
+    )

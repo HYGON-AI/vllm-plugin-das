@@ -146,6 +146,13 @@ def apply_to_module(module: ModuleType) -> bool:
             common_attn_metadata.num_actual_tokens,
         )
         vllm_config = getattr(self, "vllm_config", None)
+        scheduler_config = getattr(vllm_config, "scheduler_config", None)
+        # Async speculative rejection can make CPU lengths upper bounds even
+        # inside a native prefill chunk (e.g. non-uniform decode query widths).
+        # Allocation capacity is not proof of the device gather's K offsets.
+        result.hcu_mqa_cpu_lengths_exact = (
+            getattr(scheduler_config, "async_scheduling", None) is False
+        )
         if vllm_config is None:
             result.pcp_world_size = effective_pcp_world_size(
                 int(getattr(common_attn_metadata, "pcp_world_size", 1))

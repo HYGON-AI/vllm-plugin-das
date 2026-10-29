@@ -1658,6 +1658,9 @@ def rocm_aiter_sparse_attn_indexer_native(
                     and not v4_fp8_fallback
                     and current_platform.is_rocm()
                     and on_gfx938()
+                    and getattr(
+                        layer_attn_metadata, "hcu_mqa_cpu_lengths_exact", False
+                    ) is True
                     and _use_lightop_sparse_mla_topk()
                     and getattr(get_forward_context(), "cudagraph_runtime_mode", None) == CUDAGraphMode.NONE
                     and not torch.cuda.is_current_stream_capturing()
