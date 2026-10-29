@@ -123,6 +123,10 @@ class HcuGPUWorker(Worker):
         super().load_model(load_dummy_weights=load_dummy_weights)
         from vllm_hcu.patch.worker import validate_worker_patches
         model_runner = getattr(self, "model_runner", None)
+        if os.environ.get("VLLM_KIMI_KDA_PREFILL_BACKEND", "legacy").lower() == "boltops":
+            from vllm_hcu.model_executor.layers.kimi_k3_kda import validate_loaded_kda_model
+
+            validate_loaded_kda_model(getattr(model_runner, "model", None))
         num_compressor_weights = getattr(
             model_runner, "_vllm_hcu_num_compressor_weights", 0
         )

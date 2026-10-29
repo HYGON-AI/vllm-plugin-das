@@ -25,6 +25,8 @@ def apply_to_module(module: ModuleType) -> bool:
     def build_metadata(self, common_prefix_len, common_attn_metadata, *args, **kwargs):
         result = original_build(self, common_prefix_len, common_attn_metadata,
                                 *args, **kwargs)
+        from vllm_hcu.model_executor.layers.kimi_k3_kda import attach_checkpoints
+        attach_checkpoints(self, common_attn_metadata, result)
         from vllm_hcu.model_executor.layers.kimi_k3_prefill import (
             LENGTHS_KEY, enabled,
         )
