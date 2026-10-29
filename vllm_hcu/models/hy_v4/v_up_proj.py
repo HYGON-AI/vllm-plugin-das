@@ -6,8 +6,12 @@ import os
 
 import torch
 
+from vllm_hcu.platforms import envs as henvs
+
 
 def prepare_fp8_v_up_proj(layer, act_dtype: torch.dtype) -> bool:
+    if not henvs.VLLM_HCU_USE_CUSTOM_OPS:
+        return False
     if os.environ.get("VLLM_HCU_HY4_FP8_V_UP_PROJ", "0") != "1":
         return False
     if (

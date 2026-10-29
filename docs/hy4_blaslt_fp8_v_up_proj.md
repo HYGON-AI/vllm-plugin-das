@@ -2,6 +2,10 @@
 
 Build the plugin against DTK with HIPBLASLt development headers and library,
 then set `VLLM_HCU_HY4_FP8_V_UP_PROJ=1` before starting vLLM. The default is `0`.
+The master switch `VLLM_HCU_USE_CUSTOM_OPS` must also be enabled (its default).
+Setting it to `0` disables this path even when the FP8 sub-switch is `1`,
+before FP8 dtype checks, extension imports, or weight quantization. The
+original projection remains selected for both BF16 and FP16 activations.
 This option requires BF16 activations and disabled AITER FP4/FP8 MLA BMM flags.
 It applies only to HY4's `_v_up_proj`; query projection and other models keep
 their existing paths, including DCP replicated-query weight preparation.

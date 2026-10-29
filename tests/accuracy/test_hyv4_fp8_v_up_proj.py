@@ -20,6 +20,7 @@ _spec.loader.exec_module(v_up_proj)
 @pytest.fixture
 def quant_ops(monkeypatch):
     calls = []
+    monkeypatch.setenv("VLLM_HCU_USE_CUSTOM_OPS", "1")
     monkeypatch.setenv("VLLM_HCU_HY4_FP8_V_UP_PROJ", "1")
     monkeypatch.setattr(torch.version, "hip", "test")
 
@@ -91,6 +92,27 @@ def test_empty_projection_does_not_quantize_or_launch(quant_ops):
 def test_disabled_path_requires_no_weights_or_native_extension(monkeypatch):
     monkeypatch.delenv("VLLM_HCU_HY4_FP8_V_UP_PROJ", raising=False)
     assert not v_up_proj.prepare_fp8_v_up_proj(object(), torch.bfloat16)
+
+
+@pytest.mark.parametrize("dtype", [torch.bfloat16, torch.float16])
+def test_master_switch_disables_fp8_before_validation_or_imports(monkeypatch, dtype):
+    import builtins
+
+    monkeypatch.setenv("VLLM_HCU_USE_CUSTOM_OPS", "0")
+    monkeypatch.setenv("VLLM_HCU_HY4_FP8_V_UP_PROJ", "1")
+    # No valid device or weight attributes: the master switch must take
+    # precedence over every FP8-specific precondition and side effect.
+    monkeypatch.setattr(torch.version, "hip", None)
+    original_import = builtins.__import__
+
+    def checked_import(name, *args, **kwargs):
+        assert name not in ("vllm", "vllm_hcu.hcu_ops"), name
+        return original_import(name, *args, **kwargs)
+
+    monkeypatch.setattr(builtins, "__import__", checked_import)
+    layer = SimpleNamespace()
+    assert not v_up_proj.prepare_fp8_v_up_proj(layer, dtype)
+    assert not vars(layer)
 
 
 @pytest.mark.parametrize("unsupported", ["cuda", "fp16", "fp4_bmm", "fp8_bmm"])
