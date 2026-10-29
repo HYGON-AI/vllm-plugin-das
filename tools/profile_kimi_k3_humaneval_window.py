@@ -82,7 +82,7 @@ def main():
     dest.write_text(json.dumps(dict(concurrency=args.concurrency, max_tokens=args.max_tokens,
         delay_seconds=args.delay_seconds, started_unix=started, finished_unix=time.time(),
         profile_start=start_result, profile_stop=stop_result, requests=records), indent=2) + "\n")
-    return 1 if any("error" in x for x in records) else 0
+    return 1 if any("error" in x for x in records) or (isinstance(stop_result, dict) and "error" in stop_result) else 0
 
 
 if __name__ == "__main__":
