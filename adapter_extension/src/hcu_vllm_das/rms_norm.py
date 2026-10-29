@@ -71,6 +71,12 @@ direct_register_custom_op(
 class HcuRMSNorm(RMSNorm):
     """Select LightOp for compatible RMSNorm calls and otherwise use vLLM."""
 
+    @classmethod
+    def enabled(cls) -> bool:
+        """Expose an explicit opt-in without hiding official enablement."""
+
+        return rms_norm_enabled() or super().enabled()
+
     def _can_use_lightop(
         self,
         x: torch.Tensor,

@@ -78,20 +78,24 @@ All other cases use vLLM's native RMSNorm implementation. `GemmaRMSNorm`,
 `RMSNormGated`, quantized fusion, model patches, and performance claims are out
 of scope for this release.
 
-## Rollback
+## Opt in and rollback
 
-The optimized paths are enabled by default. The master switch returns both
-operators to vLLM native implementations; each child switch rolls back one
-operator without uninstalling the plugin:
+The two optimized paths default to OFF while their upstream-takeover A/B is
+being established. Enable a child path explicitly; the master switch remains
+the highest-priority rollback and returns both operators to complete vLLM
+implementations without uninstalling the plugin:
 
 ```bash
-# Disable all optional DAS custom operators.
+# Explicitly enable both validated candidate paths.
+export VLLM_HCU_USE_CUSTOM_OPS=1
+export VLLM_HCU_USE_CUSTOM_SILU_AND_MUL=1
+export VLLM_HCU_USE_CUSTOM_RMS_NORM=1
+
+# Roll back all optional DAS custom operators.
 export VLLM_HCU_USE_CUSTOM_OPS=0
 
-# Or disable only the LightOp SiluAndMul path.
+# Or roll back one LightOp path while leaving the other policy unchanged.
 export VLLM_HCU_USE_CUSTOM_SILU_AND_MUL=0
-
-# Or disable only ordinary and fused-add LightOp RMSNorm.
 export VLLM_HCU_USE_CUSTOM_RMS_NORM=0
 ```
 

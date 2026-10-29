@@ -35,13 +35,13 @@ def custom_ops_enabled() -> bool:
 def silu_and_mul_enabled() -> bool:
     """Return whether the migrated LightOp SwiGLU path is enabled."""
 
-    return custom_ops_enabled() and _flag(_SILU_SWITCH, default=True)
+    return custom_ops_enabled() and _flag(_SILU_SWITCH, default=False)
 
 
 def rms_norm_enabled() -> bool:
     """Return whether the migrated LightOp RMSNorm paths are enabled."""
 
-    return custom_ops_enabled() and _flag(_RMS_NORM_SWITCH, default=True)
+    return custom_ops_enabled() and _flag(_RMS_NORM_SWITCH, default=False)
 
 
 __all__ = ["custom_ops_enabled", "rms_norm_enabled", "silu_and_mul_enabled"]

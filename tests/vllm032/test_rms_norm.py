@@ -31,6 +31,7 @@ def run_fake_runtime(
     residual_dtype: str = "bf16",
     weight_dtype: str = "bf16",
     residual_width: int | None = None,
+    base_enabled: bool = False,
 ) -> dict[str, object]:
     width = hidden_size if input_width is None else input_width
     residual_width = width if residual_width is None else residual_width
@@ -111,6 +112,11 @@ class RMSNorm:
         events.append(["register_oot", replacement.__name__])
         return replacement
 
+    @classmethod
+    def enabled(cls):
+        events.append(["base-enabled"])
+        return {base_enabled!r}
+
     def __init__(self):
         self.hidden_size = {hidden_size!r}
         self.variance_epsilon = 1e-6
@@ -155,6 +161,12 @@ for name, module in (
 
 module = importlib.import_module("hcu_vllm_das.rms_norm")
 layer = module.HcuRMSNorm()
+try:
+    effective_enabled = module.HcuRMSNorm.enabled()
+    enabled_error = None
+except ValueError as error:
+    effective_enabled = None
+    enabled_error = str(error)
 value = Tensor(
     (3, {width!r}),
     dtype={input_dtype!r},
@@ -169,7 +181,11 @@ if {residual!r}:
         tag="residual",
         contiguous={residual_contiguous!r},
     )
-result = layer.forward_hip(value, residual_value)
+result = (
+    layer.forward_hip(value, residual_value)
+    if enabled_error is None
+    else "not-run"
+)
 if isinstance(result, str):
     serialized_result = result
 elif isinstance(result, tuple):
@@ -220,6 +236,8 @@ print(json.dumps({{
     "ordinary_mutates": ordinary_registration["mutates_args"],
     "fused_mutates": fused_registration["mutates_args"],
     "oot": sorted(oot),
+    "effective_enabled": effective_enabled,
+    "enabled_error": enabled_error,
     "result": serialized_result,
     "fused_result_identity": (
         isinstance(result, tuple)
@@ -265,6 +283,37 @@ def test_fused_add_rmsnorm_returns_mutated_inputs() -> None:
     assert report["fused_impl_returns_none"] is True
     assert report["fused_fake_returns_none"] is True
     assert any(event[0] == "fused-lightop" for event in report["events"])
+
+
+@pytest.mark.parametrize(
+    ("master", "child", "base_enabled", "expected"),
+    (
+        ("1", "1", False, True),
+        ("0", "1", True, True),
+        ("1", "0", True, True),
+        ("0", "1", False, False),
+    ),
+)
+def test_rmsnorm_oot_enablement_preserves_plugin_and_official_paths(
+    master: str,
+    child: str,
+    base_enabled: bool,
+    expected: bool,
+) -> None:
+    report = run_fake_runtime(
+        master=master,
+        child=child,
+        base_enabled=base_enabled,
+    )
+
+    assert report["effective_enabled"] is expected
+
+
+def test_invalid_rmsnorm_policy_fails_before_consulting_official_base() -> None:
+    report = run_fake_runtime(child="enabled", base_enabled=True)
+
+    assert "VLLM_HCU_USE_CUSTOM_RMS_NORM" in report["enabled_error"]
+    assert ["base-enabled"] not in report["events"]
 
 
 @pytest.mark.parametrize(

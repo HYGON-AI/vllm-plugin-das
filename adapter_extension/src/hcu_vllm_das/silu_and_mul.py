@@ -43,6 +43,12 @@ direct_register_custom_op(
 class HcuSiluAndMul(SiluAndMul):
     """Select LightOp on HCU with two explicit rollback switches."""
 
+    @classmethod
+    def enabled(cls) -> bool:
+        """Expose an explicit opt-in without hiding official enablement."""
+
+        return silu_and_mul_enabled() or super().enabled()
+
     def forward_hip(self, input_value: torch.Tensor) -> torch.Tensor:
         if silu_and_mul_enabled():
             return torch.ops.vllm.hcu_silu_and_mul_lightop(input_value)

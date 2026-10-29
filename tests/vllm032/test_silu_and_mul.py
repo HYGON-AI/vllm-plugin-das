@@ -18,12 +18,15 @@ from hcu_vllm_das import environment
 from hcu_vllm_das.environment import custom_ops_enabled, silu_and_mul_enabled
 
 
-def test_environment_switches_default_on_and_each_can_roll_back(
+def test_operator_switches_default_off_and_can_be_enabled_explicitly(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     monkeypatch.delenv("VLLM_HCU_USE_CUSTOM_OPS", raising=False)
     monkeypatch.delenv("VLLM_HCU_USE_CUSTOM_SILU_AND_MUL", raising=False)
     assert custom_ops_enabled() is True
+    assert silu_and_mul_enabled() is False
+
+    monkeypatch.setenv("VLLM_HCU_USE_CUSTOM_SILU_AND_MUL", "1")
     assert silu_and_mul_enabled() is True
 
     monkeypatch.setenv("VLLM_HCU_USE_CUSTOM_OPS", "0")
@@ -31,11 +34,14 @@ def test_environment_switches_default_on_and_each_can_roll_back(
     assert silu_and_mul_enabled() is False
 
 
-def test_rms_norm_switch_defaults_on_and_each_level_can_roll_back(
+def test_rms_norm_switch_defaults_off_and_each_level_can_enable_or_roll_back(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     monkeypatch.delenv("VLLM_HCU_USE_CUSTOM_OPS", raising=False)
     monkeypatch.delenv("VLLM_HCU_USE_CUSTOM_RMS_NORM", raising=False)
+    assert environment.rms_norm_enabled() is False
+
+    monkeypatch.setenv("VLLM_HCU_USE_CUSTOM_RMS_NORM", "1")
     assert environment.rms_norm_enabled() is True
 
     monkeypatch.setenv("VLLM_HCU_USE_CUSTOM_OPS", "0")
@@ -76,7 +82,9 @@ def test_environment_switches_reject_ambiguous_values(
         silu_and_mul_enabled()
 
 
-def run_fake_runtime(*, master: str = "1", child: str = "1") -> dict[str, object]:
+def run_fake_runtime(
+    *, master: str = "1", child: str = "1", base_enabled: bool = False
+) -> dict[str, object]:
     code = f"""
 import importlib
 import json
@@ -135,6 +143,11 @@ class SiluAndMul:
         events.append(["register_oot", replacement.__name__])
         return replacement
 
+    @classmethod
+    def enabled(cls):
+        events.append(["base-enabled"])
+        return {base_enabled!r}
+
     def forward_cuda(self, value):
         events.append(["native", value.tag])
         return "native-result"
@@ -159,7 +172,17 @@ for name, module in (
 first = importlib.import_module("hcu_vllm_das.silu_and_mul")
 second = importlib.import_module("hcu_vllm_das.silu_and_mul")
 value = Tensor((3, 16))
-result = first.HcuSiluAndMul().forward_hip(value)
+try:
+    effective_enabled = first.HcuSiluAndMul.enabled()
+    enabled_error = None
+except ValueError as error:
+    effective_enabled = None
+    enabled_error = str(error)
+result = (
+    first.HcuSiluAndMul().forward_hip(value)
+    if enabled_error is None
+    else "not-run"
+)
 fake = registrations[0]["fake_impl"](value)
 print(json.dumps({{
     "same_module": first is second,
@@ -167,6 +190,8 @@ print(json.dumps({{
     "op_name": registrations[0]["op_name"],
     "mutates_args": registrations[0]["mutates_args"],
     "oot": sorted(oot),
+    "effective_enabled": effective_enabled,
+    "enabled_error": enabled_error,
     "result": getattr(result, "tag", result),
     "result_shape": list(result.shape) if hasattr(result, "shape") else None,
     "fake_shape": list(fake.shape),
@@ -194,6 +219,37 @@ def test_enabled_operator_registers_once_and_calls_lightop() -> None:
     assert report["result"] == "output"
     assert report["result_shape"] == [3, 8]
     assert ["lightop", "output", "input"] in report["events"]
+
+
+@pytest.mark.parametrize(
+    ("master", "child", "base_enabled", "expected"),
+    (
+        ("1", "1", False, True),
+        ("0", "1", True, True),
+        ("1", "0", True, True),
+        ("0", "1", False, False),
+    ),
+)
+def test_oot_enablement_preserves_explicit_plugin_and_official_paths(
+    master: str,
+    child: str,
+    base_enabled: bool,
+    expected: bool,
+) -> None:
+    report = run_fake_runtime(
+        master=master,
+        child=child,
+        base_enabled=base_enabled,
+    )
+
+    assert report["effective_enabled"] is expected
+
+
+def test_invalid_silu_policy_fails_before_consulting_official_base() -> None:
+    report = run_fake_runtime(child="enabled", base_enabled=True)
+
+    assert "VLLM_HCU_USE_CUSTOM_SILU_AND_MUL" in report["enabled_error"]
+    assert ["base-enabled"] not in report["events"]
 
 
 @pytest.mark.parametrize(
