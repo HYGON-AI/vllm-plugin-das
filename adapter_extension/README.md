@@ -5,12 +5,12 @@
 lifecycle; this wheel contributes optional, independently removable operator
 optimizations through the adapter extension API.
 
-Version `0.2.0.dev0` contains one validated `gfx938` capability:
+Version `0.2.0.dev0` contains one validated `gfx936` capability:
 
 - LightOp ordinary and fused-add `RMSNorm`.
 
 vLLM's native `SiluAndMul` remains the selected implementation. Warmed
-compiled A/B measurements on `gfx938` did not justify replacing the upstream
+compiled A/B measurements on `gfx936` did not justify replacing the upstream
 operator, so the plugin neither registers nor ships a `SiluAndMul` override.
 
 No attention, MoE, model, topology, or performance support is implied by these
@@ -98,9 +98,9 @@ export VLLM_HCU_USE_CUSTOM_OPS=0
 export VLLM_HCU_USE_CUSTOM_RMS_NORM=0
 ```
 
-The numerical evidence for this release is limited to `gfx938`. On a `gfx92a`
-production deployment, keep RMSNorm disabled until a separate live-device
-validation record exists:
+The numerical evidence for this release is limited to `gfx936`. On another HCU
+architecture, keep RMSNorm disabled until a separate live-device validation
+record exists:
 
 ```bash
 export VLLM_HCU_USE_CUSTOM_RMS_NORM=0
