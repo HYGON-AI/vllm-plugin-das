@@ -277,4 +277,127 @@ Node-local raw evidence hashes:
 
 Both services remained healthy after all requests, stopped cleanly through
 their owned PTY sessions, and all cards returned to 0% reported memory use.
+
+## Qwen2 MoE HumanEval/0-63
+
+The same installed wheel pair was then exercised with the BF16
+`/model/Qwen2-57B-A14B-Instruct` checkpoint (`Qwen2MoeForCausalLM`, 64 experts,
+top 8) on four gfx936 cards. Adapter source
+`c99886d41f435e594050d47663e03ea94081fdc6`, which was subsequently merged by
+[HYGON-AI/adapter-das#11](https://github.com/HYGON-AI/adapter-das/pull/11),
+reported `runtime: no ops installed (pure upstream)`.
+The active Plugin extension advertised only `lightop-rms-norm`; it did not
+register or replace a MoE expert implementation.
+
+Both modes used TP4, BF16, max model length 4096, max sequences 1, memory
+utilization 0.75, `TRITON_ATTN`, disabled custom all-reduce, and the upstream
+default non-eager `VLLM_COMPILE` plus `FULL_AND_PIECEWISE` Graph policy. Expert
+parallelism was not enabled. No `--moe-backend` override was supplied: vLLM
+resolved `moe_backend='auto'` to its unquantized Triton route with
+`MoEPrepareAndFinalizeNoDPEPModular` and `TritonExperts`.
+
+Representative server arguments, with ports 18020 (master OFF) and 18021
+(master/RMS ON), were:
+
+```bash
+serve /model/Qwen2-57B-A14B-Instruct \
+  --served-model-name Qwen2-57B-A14B-Instruct \
+  --host 127.0.0.1 --port 18021 \
+  --dtype bfloat16 --max-model-len 4096 \
+  --tensor-parallel-size 4 --gpu-memory-utilization 0.75 \
+  --max-num-seqs 1 --disable-custom-all-reduce \
+  --attention-backend TRITON_ATTN
+```
+
+ON set both `VLLM_HCU_USE_CUSTOM_OPS=1` and
+`VLLM_HCU_USE_CUSTOM_RMS_NORM=1`. OFF set the master to `0` while deliberately
+leaving the RMSNorm child at `1`. Health, version, model discovery, arithmetic
+chat, changed-input Graph replay, PIECEWISE capture, and FULL capture passed in
+both modes. Each rank loaded about 26.78 GiB of weights and used about 49.7 GiB
+after KV-cache allocation.
+
+Generation reused the pinned HumanEval commit and isolation protocol described
+above, with temperature 0, seed 0, max output 2048, and thinking disabled. All
+128 requests returned `finish_reason=stop`; there were no HTTP failures,
+truncations, or evaluator timeouts. A fresh Bubblewrap rescore produced:
+
+```bash
+env -u PYTHONPATH \
+  TMPDIR=/dev/shm/vllm032-qwen2moe-RyvxTJ/on2-tmp \
+  /dev/shm/adapter-das-pr11-vllm032-qwen2-05b/venv/bin/python -S \
+  /dev/shm/hcu-vllm032-work/tools/humaneval64_client.py \
+  --human-eval-root /dev/shm/hcu-vllm032-work/src/human-eval \
+  --output-dir /dev/shm/vllm032-qwen2moe-RyvxTJ/on-humaneval64 \
+  --base-url http://127.0.0.1:18021 \
+  --model Qwen2-57B-A14B-Instruct \
+  --limit 64 --max-tokens 2048 --timeout 600
+```
+
+OFF repeated the client with port 18020, `off-tmp`, and
+`off-humaneval64`. The scorer was run separately for each mode; the following
+is the ON command before its JSON lines were summarized:
+
+```bash
+ulimit -v 2097152
+ulimit -u 128
+ulimit -n 256
+ulimit -c 0
+/dev/shm/hcu-vllm032-work/tools/bubblewrap/usr/bin/bwrap \
+  --unshare-all --die-with-parent --new-session --cap-drop ALL \
+  --uid 65534 --gid 65534 --clearenv \
+  --setenv PATH /usr/bin --setenv PYTHONDONTWRITEBYTECODE 1 \
+  --ro-bind /usr /usr --ro-bind /lib /lib --ro-bind /lib64 /lib64 \
+  --proc /proc --dev /dev --tmpfs /tmp \
+  --ro-bind /dev/shm/hcu-vllm032-work/src/human-eval /human-eval \
+  --ro-bind /dev/shm/vllm032-plugin-humaneval-current/score_humaneval.py \
+    /score_humaneval.py \
+  --ro-bind /dev/shm/vllm032-qwen2moe-RyvxTJ/on-humaneval64 /eval \
+  --chdir /tmp \
+  /usr/bin/python3 /score_humaneval.py \
+    --human-eval-root /human-eval \
+    --problems /eval/problems.jsonl \
+    --samples /eval/samples.jsonl --timeout 10 \
+  > /dev/shm/vllm032-qwen2moe-RyvxTJ/on-humaneval64/score-results.jsonl
+```
+
+| Mode | Passed | pass@1 | Failed tasks | Completion tokens | Generation wall time |
+| --- | ---: | ---: | --- | ---: | ---: |
+| master ON, RMS ON | 56/64 | 0.875000 | 9, 11, 19, 26, 32, 33, 41, 54 | 10,142 | 131.60 s |
+| master OFF, RMS child ON | 55/64 | 0.859375 | 9, 11, 19, 26, 32, 33, 41, 54, 55 | 9,865 | 126.14 s |
+
+Forty-four completions were byte-identical and twenty differed. HumanEval/55
+was the only pass/fail difference. Repeating the OFF prewarm prefix within one
+service had already produced different completion lengths for tasks 1, 4, and
+7 despite temperature 0 and seed 0. The one-task ON advantage therefore is not
+attributed to RMSNorm. This evidence establishes no observed ON accuracy
+regression; it does not establish token-exact equivalence or an accuracy gain.
+
+The observed completion-token rates were 77.07 tokens/s ON and 78.22 tokens/s
+OFF. They are not a performance comparison because the modes had different
+cache and prewarm histories, generated different token counts, and were each
+measured only once. A performance claim requires matched warm state and at
+least three independent repetitions.
+
+Node-local raw evidence hashes:
+
+| Artifact | ON SHA256 | OFF SHA256 |
+| --- | --- | --- |
+| `problems.jsonl` | `3a64d077946f2c1b8707e13217e7069cc4bcefc034a6992f7ded9104c2dc59bd` | `3a64d077946f2c1b8707e13217e7069cc4bcefc034a6992f7ded9104c2dc59bd` |
+| `responses.jsonl` | `19ccb5755c35d2deeb2efdbdb960dd5d3f1bc7c445072e1eab71b30c6cd08e85` | `c7ec5c0fda2bfde5b86493a652bd30d5d9dbeeee571b6fd4d7e2899ae612f93a` |
+| `samples.jsonl` | `25df7bb9152bb2461d8370fffac1771345978c47cad3dbe9651f3579b708da67` | `42900b4b45b265134a6dadbb7e31315f40cab1433c58ce00e5e97ccd4a6efcd4` |
+| `score-results.jsonl` | `59481093251d639929223038237bdfe9a1bc978d310b83b3a99225d17c5ada9d` | `b7d8f6988c52e8bbeaf79eb1acdfabb9ee41a1dd5bec82fb7cbbeb9244bbf959` |
+| `generation-summary.json` | `48486dc5ddc6d221b5711a5aef6e1c6124dd3000a241838122eb2aa56d433d14` | `ef81547e657f2dd5016d32ae8432b4a9ac218898e9b7f342ad156f24b43f8960` |
+
+Upstream emitted two actionable MoE observations. It found no tuned Triton
+configuration named `E=64,N=640,device_name=BW.json`, so it used its default
+configuration, and the first real request still JIT-compiled
+`fused_moe_kernel`. These are upstream configuration and warmup opportunities,
+not evidence for adding a duplicate Plugin-owned MoE implementation.
+
+All owned processes exited with status zero, no workers remained, and all eight
+cards returned to 0% compute and 2 MiB reported memory. Python emitted a
+`resource_tracker` warning about one leaked shared-memory object during each
+service shutdown. The resources were reclaimed, but the warning remains an
+explicit teardown follow-up rather than being classified as clean shutdown.
+
 Broader multi-model precision remains pending for this candidate.
