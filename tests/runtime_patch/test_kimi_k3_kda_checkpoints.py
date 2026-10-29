@@ -61,11 +61,13 @@ def test_chunk_budget_keeps_existing_boundary_rules():
             block_size=1536, hash_size=1536)[0] == []
 
 
-def test_conv_checkpoints_survive_final_state_update():
+@pytest.mark.parametrize("dim_first", [True, False])
+def test_conv_checkpoints_survive_final_state_update(monkeypatch, dim_first):
+    monkeypatch.setattr(kda, "is_conv_state_dim_first", lambda: dim_first)
     metadata = SimpleNamespace(nums_dict={kda.CHECKPOINT_KEY: kda.Checkpoints(
         torch.tensor([2, 4]), torch.tensor([1, 3]), (64, 192), (64, 192))})
     raw = torch.arange(3 * 256, dtype=torch.float32).reshape(3, 256)
-    states = torch.full((6, 3, 3), -1.0)
+    states = torch.full((6, 3, 4) if dim_first else (6, 4, 3), -1.0)
     kda.save_conv_checkpoints(raw, states, metadata)
     raw_second = raw + 1000
     states_second = torch.full_like(states, -1.0)
@@ -75,13 +77,15 @@ def test_conv_checkpoints_survive_final_state_update():
     states[5].fill_(3000)
     states_second[2].fill_(4000)
     kda.finalize_checkpoints(metadata)
-    torch.testing.assert_close(states[2], raw[:, 61:64])
-    torch.testing.assert_close(states[4], raw[:, 189:192])
-    torch.testing.assert_close(states_second[2], raw_second[:, 61:64])
+    expected = lambda x: x if dim_first else x.T
+    torch.testing.assert_close(states[2], expected(raw[:, 60:64]))
+    torch.testing.assert_close(states[4], expected(raw[:, 188:192]))
+    torch.testing.assert_close(states_second[2], expected(raw_second[:, 60:64]))
     assert states[0].eq(-1).all()
 
 
-def test_finalization_does_not_replay_previous_layer_snapshots():
+def test_finalization_does_not_replay_previous_layer_snapshots(monkeypatch):
+    monkeypatch.setattr(kda, "is_conv_state_dim_first", lambda: True)
     payload = kda.Checkpoints(torch.tensor([1]), torch.tensor([0]), (4,), (4,))
     metadata = SimpleNamespace(nums_dict={kda.CHECKPOINT_KEY: payload})
     first_conv = torch.zeros((2, 1, 2))
