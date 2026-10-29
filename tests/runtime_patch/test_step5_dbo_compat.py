@@ -89,6 +89,8 @@ def test_mtp_tail_preserves_dynamic_mirrors_on_clean_input_batch(monkeypatch):
     monkeypatch.setattr(tail, "_TAIL", 4)
     monkeypatch.setattr(torch.Tensor, "pin_memory", lambda self: self)
     batch = InputBatch.make_dummy(2, 12, InputBuffers(2, 12, torch.device("cpu")))
+    batch.is_prefilling_np[:] = True
+    batch.has_prefill = True
     batch.input_ids.copy_(torch.arange(12))
     batch.positions.copy_(torch.arange(12))
     batch.seq_lens_cpu = torch.tensor([16, 26], dtype=torch.int32)

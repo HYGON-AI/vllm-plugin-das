@@ -7,8 +7,9 @@ tokens, but nothing reads the result except its KV cache slots inside the window
 of a later query, and K/V are per-position.  With N >= steps * (W - 1) + 1 kept
 tokens at the end of each request's query, module k's KV is exact for the last
 N - k * (W - 1) positions, so the last token's drafts and every later query
-(next chunk or decode) see exactly what a full run would have written.  Shorter
-queries (decode, small chunks) are untouched.
+(next chunk or decode) see exactly what a full run would have written. Decode
+and verification queries are always kept intact; prefill chunks no longer
+than the retained tail are untouched as well.
 For differing windows, retain 1 + sum(W - 1) across executed modules, counting
 reused modules on every invocation.
 
@@ -120,17 +121,27 @@ def _tail_enabled(self) -> bool:
 
 def _trim(self, input_batch, last_hidden_states, dp_sync):
     """Return (input_batch, last_hidden_states, dp_sync) restricted to the last
-    _TAIL tokens of each request, or None when nothing would be dropped."""
+    _TAIL tokens of prefill requests, keeping decode/verification intact."""
     num_reqs = input_batch.num_reqs
+    prefilling = getattr(input_batch, "is_prefilling_np", None)
+    if (
+        not isinstance(prefilling, np.ndarray)
+        or prefilling.dtype != np.bool_
+        or prefilling.shape != (num_reqs,)
+    ):
+        # Query length does not distinguish chunked prefill from speculative
+        # verification. Missing request-phase metadata cannot safely opt in.
+        return None
     qsl = input_batch.query_start_loc_np[: num_reqs + 1].astype(np.int64)
     q = np.diff(qsl)
-    if q.max(initial=0) <= _TAIL:
+    n = q.copy()
+    n[prefilling] = np.minimum(q[prefilling], _TAIL)
+    if np.array_equal(n, q):
         return None
     if self.dp_size > 1 and (dp_sync is None or not dp_sync.eager):
         # Only reuse an eager agreement: anything else would need a new
         # collective that ranks without long queries would not join.
         return None
-    n = np.minimum(q, _TAIL)
     new_qsl = np.zeros(num_reqs + 1, dtype=np.int64)
     np.cumsum(n, out=new_qsl[1:])
     total = int(new_qsl[-1])

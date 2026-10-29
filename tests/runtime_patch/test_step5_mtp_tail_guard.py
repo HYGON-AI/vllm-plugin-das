@@ -77,6 +77,8 @@ def _propose(monkeypatch, owner):
     runner = MultiModuleMTPSpeculator()
     runner.__dict__.update(vars(owner))
     batch = InputBatch.make_dummy(1, 12, InputBuffers(1, 12, torch.device("cpu")))
+    batch.is_prefilling_np[:] = True
+    batch.has_prefill = True
     batch.input_ids.copy_(torch.arange(12))
     batch.positions.copy_(torch.arange(12))
     hidden = torch.arange(24).reshape(12, 2)
