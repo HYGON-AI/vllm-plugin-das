@@ -1,6 +1,13 @@
 // SPDX-License-Identifier: Apache-2.0
 // SPDX-FileCopyrightText: Copyright (c) 2026 Hygon Information Technology Co., Ltd.
 
+#include <rocm_version.h>
+// PyTorch gates the managed BLASLt handle declaration on ROCM_VERSION, while
+// extension builds may only receive the toolkit's component version macros.
+#if defined(USE_ROCM) && !defined(ROCM_VERSION)
+#define ROCM_VERSION (ROCM_VERSION_MAJOR * 10000 + ROCM_VERSION_MINOR * 100 + ROCM_VERSION_PATCH)
+#endif
+
 #include <torch/extension.h>
 #include <ATen/cuda/CUDAContext.h>
 #include <c10/cuda/CUDAGuard.h>
@@ -17,10 +24,10 @@ void check(hipblasStatus_t status) {
 }
 
 // Thread-local plans keep heuristic searches out of steady-state execution.
-// Each plan owns its handle and descriptors; no scale pointer is shared across
-// host threads. Device and all layout dimensions participate in the cache key.
+// Plans own only descriptors/algorithms, borrowing PyTorch's managed handle.
+// No descriptor is shared across host threads. Device and all layout
+// dimensions participate in the cache key.
 struct Plan {
-  hipblasLtHandle_t handle = nullptr;
   hipblasLtMatmulDesc_t desc = nullptr;
   hipblasLtMatrixLayout_t a = nullptr, b = nullptr, d = nullptr;
   hipblasLtMatmulPreference_t preference = nullptr;
@@ -32,13 +39,25 @@ struct Plan {
     if (b) hipblasLtMatrixLayoutDestroy(b);
     if (a) hipblasLtMatrixLayoutDestroy(a);
     if (desc) hipblasLtMatmulDescDestroy(desc);
-    if (handle) hipblasLtDestroy(handle);
   }
 
-  void initialize(int64_t tokens, int32_t heads, int64_t latent,
-                  int64_t value, hipDataType dtype) {
-    check(hipblasLtCreate(&handle));
+  void set_scales(const void* weight_scale, const void* x_scale) {
+    check(hipblasLtMatmulDescSetAttribute(
+        desc, HIPBLASLT_MATMUL_DESC_A_SCALE_POINTER,
+        &weight_scale, sizeof(weight_scale)));
+    check(hipblasLtMatmulDescSetAttribute(
+        desc, HIPBLASLT_MATMUL_DESC_B_SCALE_POINTER,
+        &x_scale, sizeof(x_scale)));
+  }
+
+  void initialize(hipblasLtHandle_t handle, int64_t tokens, int32_t heads,
+                  int64_t latent, int64_t value, hipDataType dtype,
+                  const void* weight_scale, const void* x_scale) {
     check(hipblasLtMatmulDescCreate(&desc, HIPBLAS_COMPUTE_32F, HIP_R_32F));
+    // Scale-pointer presence participates in heuristic filtering (UseScaleAB).
+    // Select an algorithm for the actual scalar-scaled problem, never for a
+    // descriptor with null scales that is modified only after selection.
+    set_scales(weight_scale, x_scale);
     hipblasOperation_t trans_a = HIPBLAS_OP_T;
     hipblasOperation_t trans_b = HIPBLAS_OP_N;
     check(hipblasLtMatmulDescSetAttribute(
@@ -127,23 +146,20 @@ void hipblaslt_fp8_bmm(torch::Tensor const& x, torch::Tensor const& weight,
     TORCH_CHECK(capture_status == hipStreamCaptureStatusNone,
                 "Warm up HY4 HIPBLASLt FP8 BMM before graph capture");
     auto plan = std::make_unique<Plan>();
-    plan->initialize(tokens, static_cast<int32_t>(heads), latent, value, dtype);
+    plan->initialize(at::cuda::getCurrentCUDABlasLtHandle(), tokens,
+                     static_cast<int32_t>(heads), latent, value, dtype,
+                     weight_scale.data_ptr(), x_scale.data_ptr());
     it = plans.emplace(key, std::move(plan)).first;
   }
   auto& plan = *it->second;
-  const void* a_scale = weight_scale.data_ptr();
-  const void* b_scale = x_scale.data_ptr();
-  check(hipblasLtMatmulDescSetAttribute(
-      plan.desc, HIPBLASLT_MATMUL_DESC_A_SCALE_POINTER, &a_scale, sizeof(a_scale)));
-  check(hipblasLtMatmulDescSetAttribute(
-      plan.desc, HIPBLASLT_MATMUL_DESC_B_SCALE_POINTER, &b_scale, sizeof(b_scale)));
+  plan.set_scales(weight_scale.data_ptr(), x_scale.data_ptr());
   // PyTorch's allocator handles temporary workspace lifetime during capture
   // and on the current stream, without synchronizing or allocating raw HIP memory.
   auto workspace = torch::empty(
       {static_cast<int64_t>(plan.result.workspaceSize)}, x.options().dtype(at::kByte));
   const float alpha = 1.0f, beta = 0.0f;
   check(hipblasLtMatmul(
-      plan.handle, plan.desc, &alpha, weight.data_ptr(), plan.a,
+      at::cuda::getCurrentCUDABlasLtHandle(), plan.desc, &alpha, weight.data_ptr(), plan.a,
       x.data_ptr(), plan.b, &beta, out.data_ptr(), plan.d,
       out.data_ptr(), plan.d, &plan.result.algo, workspace.data_ptr(),
       plan.result.workspaceSize, at::cuda::getCurrentCUDAStream().stream()));

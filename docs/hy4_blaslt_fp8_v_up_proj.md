@@ -14,8 +14,13 @@ directly into the caller's `[tokens, heads, value]` output buffer. Both FP8
 operands use scalar dequantization scales shared by all heads. BF16 weights
 remain available to the attention backend.
 
-BLASLt plans are cached per host thread, device, dtype and shape. Warm up each
-token shape before CUDA graph capture; a first call during capture raises an
+BLASLt plans cache descriptors and algorithms per host thread, device, dtype
+and shape. They reuse PyTorch's managed BLASLt handle rather than creating a
+handle (and its internal device buffers) for every token count. PyTorch's
+handle pool owns the handle lifetime; shape plans do not destroy it. Both
+non-null scalar FP8 scale pointers are installed before heuristic selection
+and refreshed on each call. Warm up each token shape before CUDA graph
+capture; a first call during capture raises an
 error. Each plan's workspace is limited to 4 MiB. Allocation uses PyTorch's
 stream-aware allocator. A missing BLASLt algorithm or unsupported format
 raises an error instead of silently switching precision.
@@ -28,11 +33,18 @@ python -m pytest tests/accuracy/test_hyv4_fp8_v_up_proj.py -m 'not hcu' -q
 ```
 
 On an HCU with the rebuilt extension, run native accuracy and graph replay
-tests, including modified device scales during replay:
+tests, including changed scale allocations, modified device scales during
+replay, and driver-visible memory growth over 64 additional token counts:
 
 ```bash
 python -m pytest tests/accuracy/test_hyv4_fp8_v_up_proj.py -m hcu -q
 ```
+
+Run the memory-growth check on an otherwise idle HCU. It clears PyTorch's
+unused allocator cache before measuring driver free memory, so raw BLASLt
+allocations are included. The 128 MiB tolerance permits lazy library setup
+while detecting the previous per-shape handle growth. The 4 MiB workspace
+limit applies only to GEMM workspace, not the managed handle's internal buffers.
 
 FP8 introduces rounding relative to the BF16 projection. Real-model accuracy,
 end-to-end latency, and native HCU graph replay must be validated before making

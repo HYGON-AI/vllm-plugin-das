@@ -122,6 +122,8 @@ def test_native_hipblaslt_fp8_bmm_and_graph_replay(tokens, heads):
     w = torch.randn(heads, value, latent, device="cuda", dtype=torch.bfloat16)
     q, xs = ops.scaled_fp8_quant(x.reshape(-1, latent))
     qw, ws = ops.scaled_fp8_quant(w.reshape(-1, latent))
+    assert xs.numel() == ws.numel() == 1
+    assert xs.item() != 1 and ws.item() != 1
     output = torch.full((tokens + 2, heads, value), 123, device="cuda", dtype=x.dtype)
 
     def run():
@@ -137,9 +139,29 @@ def test_native_hipblaslt_fp8_bmm_and_graph_replay(tokens, heads):
         output[:tokens], expected.to(x.dtype), atol=0.125, rtol=0.02
     )
     assert torch.all(output[tokens:] == 123)
+    # Reuse the same plan with different scale allocations as well as values.
+    # Descriptor pointers must be refreshed on each eager call.
+    xs = xs.clone() * 0.75
+    ws = ws.clone() * 1.25
+    run()
+    expected.mul_(0.75 * 1.25)
+    torch.testing.assert_close(
+        output[:tokens], expected.to(x.dtype), atol=0.125, rtol=0.02
+    )
     graph = torch.cuda.CUDAGraph()
     with torch.cuda.graph(graph):
         run()
+    # Creating another shape plan must not invalidate captured resources.
+    extra_x = torch.randn(
+        tokens + 131, heads, latent, device="cuda", dtype=torch.bfloat16
+    )
+    extra_q, extra_scale = ops.scaled_fp8_quant(extra_x.reshape(-1, latent))
+    extra_out = torch.empty(
+        tokens + 131, heads, value, device="cuda", dtype=torch.bfloat16
+    )
+    torch.ops.hcu_ops.hipblaslt_fp8_bmm(
+        extra_q.view_as(extra_x), qw.view_as(w), extra_scale, ws, extra_out
+    )
     # Scales must be device inputs to the captured GEMM, not cached host values.
     xs.mul_(0.5)
     output[:tokens].zero_()
@@ -149,3 +171,37 @@ def test_native_hipblaslt_fp8_bmm_and_graph_replay(tokens, heads):
         output[:tokens], (expected * 0.5).to(x.dtype), atol=0.125, rtol=0.02
     )
     assert torch.all(output[tokens:] == 123)
+
+
+@pytest.mark.hcu
+def test_native_hipblaslt_varied_shapes_do_not_allocate_per_shape_handles():
+    if not torch.cuda.is_available() or torch.version.hip is None:
+        pytest.skip("requires a live HCU with the HIPBLASLt extension built")
+    import vllm_hcu.hcu_ops  # noqa: F401
+    from vllm import _custom_ops as ops
+
+    heads, latent, value = 2, 512, 128
+    w = torch.randn(heads, value, latent, device="cuda", dtype=torch.bfloat16)
+    qw, ws = ops.scaled_fp8_quant(w.reshape(-1, latent))
+
+    def run(tokens):
+        x = torch.randn(tokens, heads, latent, device="cuda", dtype=torch.bfloat16)
+        q, xs = ops.scaled_fp8_quant(x.reshape(-1, latent))
+        out = torch.empty(tokens, heads, value, device="cuda", dtype=torch.bfloat16)
+        torch.ops.hcu_ops.hipblaslt_fp8_bmm(q.view_as(x), qw.view_as(w), xs, ws, out)
+
+    # Initialize the managed handle and library before recording device memory.
+    run(1)
+    torch.cuda.synchronize()
+    torch.cuda.empty_cache()
+    free_before, _ = torch.cuda.mem_get_info()
+    for tokens in range(2, 66):
+        run(tokens)
+    torch.cuda.synchronize()
+    torch.cuda.empty_cache()
+    free_after, _ = torch.cuda.mem_get_info()
+    growth = free_before - free_after
+    # Use driver free memory, since handle hipMalloc allocations are invisible
+    # to torch.cuda.memory_allocated(). Allow lazy library setup, but reject
+    # the roughly 1.6 GiB retained by 64 independent 25 MiB handles.
+    assert growth < 128 * 1024**2, f"Varied-shape BLASLt memory growth: {growth} bytes"
