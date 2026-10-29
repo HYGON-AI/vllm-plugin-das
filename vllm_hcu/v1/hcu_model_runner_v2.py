@@ -275,6 +275,12 @@ class HcuGPUModelRunnerV2(GPUModelRunner):
             if model is not None
         )
 
+        if is_deepseek_v4(self.vllm_config):
+            from vllm_hcu.model_executor.layers import skinny_lm_head
+
+            for model in (self.model, self.get_draft_model()):
+                skinny_lm_head.enable_for_model(model)
+
     @property
     def pcp_manager_cls(self):
         if self._hcu_pcp_manager_cls is None:
