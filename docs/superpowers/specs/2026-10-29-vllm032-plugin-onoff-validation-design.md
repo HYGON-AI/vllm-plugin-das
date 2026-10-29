@@ -20,8 +20,11 @@ and OFF configurations.
   `0.32.0+rocm723` wheel.
 - Reuse Extension API v1 through `hcu_adapter.extensions`; Adapter remains the
   only owner of `vllm.platform_plugins` and `vllm.general_plugins`.
-- Validate the existing LightOp `RMSNorm` and `SiluAndMul` capabilities with the
-  master switch and each operator switch independently ON and OFF.
+- Audit the existing LightOp `RMSNorm` and `SiluAndMul` capabilities against
+  the official vLLM 0.32 native/IR paths before deciding whether each operator
+  is retained, made opt-in, or removed.
+- Validate every retained capability with the master switch and each operator
+  switch independently ON and OFF.
 - Compare numerical behavior, Graph capture/replay, model responses, and warmed
   performance. Performance readings are evidence, not a correctness substitute.
 - If a defect is found, reproduce it with a failing test before the smallest
@@ -34,8 +37,9 @@ and OFF configurations.
 - Do not port additional vLLM 0.28.1 optimizations in this workstream.
 - Do not change official vLLM source or claim support beyond the tested HCU
   vLLM 0.32 artifact.
-- Do not broaden the Plugin's exact `0.32.0` release gate without live evidence
-  from another 0.32 patch wheel.
+- Do not use an exact wheel string as a runtime compatibility lock. Admit the
+  vLLM 0.32 release line and fail closed on missing required APIs or
+  capabilities; keep validation claims scoped to the exact artifact tested.
 - Do not claim a performance win from cold compile time or a single un-warmed
   request.
 
@@ -68,23 +72,69 @@ execute the supported native vLLM fallback without uninstalling the Plugin. All
 switch changes take effect in a fresh process; dynamic in-process unregister is
 out of scope.
 
+## Frozen source and artifact contract
+
+The immutable identifiers below describe this experiment and its evidence. They
+do not become exact-match runtime gates.
+
+| Role | Repository/artifact | Immutable identity |
+| --- | --- | --- |
+| Plugin upstream base | `HYGON-AI/vllm-plugin-das:v0.32.0` | `e76220d9c0006cc3c9d886587a4771a31e7d83e8` |
+| Plugin candidate at audit start | `alexanderbin123/vllm-plugin-das:feat/vllm032-plugin-onoff-gates` | `fdf427fe615d913f9d42c47287c2a1a804eb0021` |
+| Adapter candidate | `adapter-das:feat/vllm032-adapter-delivery-gates` | `c99886d41f435e594050d47663e03ea94081fdc6` |
+| Official vLLM target source | `vllm-project/vllm:v0.32.0` | `5df63a7203cdb9328d824a27b682e77c7b9928be` |
+| HCU vLLM target wheel | `vllm-0.32.0+rocm723-cp312-cp312-linux_x86_64.whl` | SHA256 `de61890d0a66ae12b84908962c5426bc7a64d66ac8d8c64ceb2c2bc0c31f722a` |
+
+The current test host also has a global vLLM 0.28.1 installation ahead of a
+test venv through inherited `PYTHONPATH`. Every v0.32 command must replace that
+variable explicitly and print `vllm.__version__` plus `vllm.__file__`; otherwise
+the result is invalid target evidence.
+
+## Upstream-first patch migration ledger
+
+| ID | Legacy/candidate behavior | Official vLLM 0.32 owner | Provisional disposition | Required evidence |
+| --- | --- | --- | --- | --- |
+| P-032-01 | Adapter Extension API activation | vLLM owns platform/general plugin lifecycle; Adapter owns the HCU extension seam | Keep the single `hcu_adapter.extensions` entry point; no Plugin platform/general entry point | Wheel metadata, parent/child import roots, active extension report |
+| P-032-02 | LightOp `SiluAndMul` | `SiluAndMul.forward_native` and the official HIP `_C.silu_and_mul` path | Candidate only. Compare default compiled native and LightOp; retain only for a demonstrated HCU benefit | Actual selected forward method, kernel marker, eager and Graph numerics, warmed A/B |
+| P-032-03 | LightOp ordinary `RMSNorm` | vLLM IR owns native, `vllm_c`, and optional AITER providers | Candidate only. Do not override the official IR path by default without correctness and performance evidence | IR provider, selected forward method, eager and Graph numerics, warmed A/B |
+| P-032-04 | LightOp fused-add `RMSNorm` custom op returns mutated inputs | Official/PyTorch mutable custom-op contract | Fix before enabling in Graph: the custom op is side-effect-only and the Python wrapper returns its owned buffers | Schema/no-return test, changed-input compile/Graph replay, alias-warning absence |
+| P-032-05 | Master and per-op rollback switches | Plugin policy | Keep, but evaluate in fresh processes and prove OFF reaches the complete official path | Four ON/OFF process rows and dispatch evidence |
+| P-032-06 | Exact `0.32.0` version comparison | Adapter release-line gate plus Plugin capability checks | Change to vLLM `>=0.32.0,<0.33.0`; preserve fail-closed API/symbol checks | Boundary unit tests and actual 0.32.0 artifact import |
+| P-032-07 | Old compatibility lock and service record | No upstream owner | Regenerate for the current three-way SHA pair; old service success is historical only | New wheel hashes, commands, logs, raw results and statuses |
+
+Audit findings on the frozen pair:
+
+- Portable compatibility tests pass (`62 passed, 2 skipped`) when
+  `VLLM_TARGET_ROOT` points at the official v0.32.0 source.
+- Installed-wheel live eager numerics pass for both operators (`2 passed`) on
+  `gfx936` with the current Adapter source and Plugin wheel.
+- The default non-eager vLLM configuration resolves to
+  `custom_ops=['+sparse_attn_indexer', 'none']`. Although the extension is
+  active and OOT classes are selected, both instances bind `forward_native`;
+  therefore the old service smoke does not prove either LightOp kernel ran.
+- Direct `torch.compile` execution of the fused-add LightOp path emits the
+  PyTorch mutable-output alias deprecation warning. This is expected to become
+  an error in PyTorch 2.12 and confirms P-032-04 is required.
+
 ## Validation matrix
 
-1. Run portable package, Extension lifecycle, version-gate, and ON/OFF fallback
-   tests.
+1. Run portable package, Extension lifecycle, release-line/capability gate, and
+   ON/OFF fallback tests.
 2. Build the Plugin wheel and inspect metadata: exactly one
    `hcu_adapter.extensions:das_hcu` entry point and no vLLM platform/general
    entry points.
 3. Install vLLM, current Adapter, and Plugin into an isolated environment and
    run the installed verifier. Require the Extension report to be active and OOT
    owners to be `HcuRMSNorm` and `HcuSiluAndMul`.
-4. On an idle `gfx936`, compare operator output against the native fallback for:
+4. On an idle `gfx936`, record the selected forward method and IR/provider, then
+   compare operator output against the native fallback for:
    master OFF, RMSNorm-only OFF, SiluAndMul-only OFF, and all ON. Include ordinary
    and fused-add RMSNorm, supported dtypes/shapes, and Graph capture/replay with
    changed inputs.
 5. Run at least one small dense model in non-eager mode with all ON and master
-   OFF. Require FULL and PIECEWISE Graph capture, HTTP 200 probes, deterministic
-   semantic answers, and no fatal runtime log.
+   OFF in fresh processes. Require evidence that the intended ON/OFF path
+   actually executes, FULL and PIECEWISE Graph capture, changed-input replay,
+   HTTP 200 probes, deterministic semantic answers, and no fatal runtime log.
 6. Record warmed operator latency and serving throughput for ON/OFF using the
    same process policy, model, prompts, and sampling configuration. Report
    regressions without hiding them behind correctness success.
@@ -108,6 +158,8 @@ out of scope.
 
 - Existing portable tests are green against Adapter `c99886d`.
 - Installed ownership and Extension activation are correct.
+- Every retained optimization has an upstream-takeover disposition backed by
+  dispatch, numerical, Graph, and warmed performance evidence.
 - All ON/OFF combinations select the expected optimized or native path.
 - Eager numerical and non-eager Graph replay parity pass on live HCU.
 - The selected small-model ON/OFF service checks pass and performance evidence is
