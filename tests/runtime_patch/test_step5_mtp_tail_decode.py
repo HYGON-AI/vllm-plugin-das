@@ -89,7 +89,10 @@ class _CPUOps:
 def _native_prepare(batch, rejected, sampled=None):
     from vllm.v1.worker.gpu.spec_decode.multi_module_mtp import speculator
 
-    fn = speculator._prepare_input_buffers_kernel.fn
+    kernel = speculator._prepare_input_buffers_kernel
+    # Triton's CPU fallback may leave jit as an identity decorator.
+    # Both forms must execute the same original Python kernel body below.
+    fn = getattr(kernel, "fn", kernel)
     tree = ast.parse(textwrap.dedent(inspect.getsource(fn)))
     function = next(node for node in tree.body if isinstance(node, ast.FunctionDef))
     function.decorator_list = []
@@ -229,6 +232,25 @@ def test_native_cpu_checker_detects_the_original_negative_write(rejected):
     unsafe = _batch([1], [False])
     with pytest.raises(AssertionError, match="store OOB at -1 in draft_input_ids"):
         _native_prepare(unsafe, [rejected])
+
+
+@pytest.mark.parametrize("wrapped", [False, True], ids=["python", "jit"])
+def test_native_cpu_checker_accepts_both_kernel_forms(monkeypatch, wrapped):
+    from vllm.v1.worker.gpu.spec_decode.multi_module_mtp import speculator
+
+    kernel = speculator._prepare_input_buffers_kernel
+    function = getattr(kernel, "fn", kernel)
+    monkeypatch.setattr(
+        speculator, "_prepare_input_buffers_kernel",
+        SimpleNamespace(fn=function) if wrapped else function,
+    )
+    safe = _batch([4], [False])
+    for rejected in (0, 1, 2, 3):
+        indices = _native_prepare(safe, [rejected])
+        assert indices.tolist() == [3 if rejected == 0 else 2]
+    for rejected in (1, 2, 3):
+        with pytest.raises(AssertionError, match="store OOB at -1 in draft_input_ids"):
+            _native_prepare(_batch([1], [False]), [rejected])
 
 
 @pytest.mark.parametrize("phase", [None, [True], np.array([1], dtype=np.int32),
