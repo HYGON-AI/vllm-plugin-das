@@ -157,14 +157,11 @@ def test_pipeline_cache_key_includes_stage(monkeypatch, tmp_path):
     assert "hcu-pp:2:1" in second.checkpoint
 
 
-def test_slimquant_ipc_gate_is_explicit(monkeypatch):
+def test_slimquant_ipc_is_allowed_without_extra_configuration():
     from vllm_hcu.runtime_compat.weight_cache import install_ipc_quant_support
 
     module = SimpleNamespace(IPC_QUANT_ALLOWLIST={None: lambda _: True})
     install_ipc_quant_support(module)
-    monkeypatch.delenv("VLLM_HCU_PRELOAD_ALLOW_SLIMQUANT_W4A8", raising=False)
-    assert not module.IPC_QUANT_ALLOWLIST["slimquant_w4a8"](None)
-    monkeypatch.setenv("VLLM_HCU_PRELOAD_ALLOW_SLIMQUANT_W4A8", "1")
     assert module.IPC_QUANT_ALLOWLIST["slimquant_w4a8"](None)
 
 
@@ -178,15 +175,12 @@ def test_slimquant_ipc_gate_is_idempotent():
     assert module.IPC_QUANT_ALLOWLIST["slimquant_w4a8"] is predicate
 
 
-def test_slimquant_ipc_gate_overrides_preexisting_permissive_entry(monkeypatch):
+def test_slimquant_ipc_overrides_preexisting_entry():
     from vllm_hcu.runtime_compat.weight_cache import install_ipc_quant_support
 
     module = SimpleNamespace(IPC_QUANT_ALLOWLIST={
         None: lambda _: True,
-        "slimquant_w4a8": lambda _: True,
+        "slimquant_w4a8": lambda _: False,
     })
     install_ipc_quant_support(module)
-    monkeypatch.delenv("VLLM_HCU_PRELOAD_ALLOW_SLIMQUANT_W4A8", raising=False)
-    assert not module.IPC_QUANT_ALLOWLIST["slimquant_w4a8"](None)
-    monkeypatch.setenv("VLLM_HCU_PRELOAD_ALLOW_SLIMQUANT_W4A8", "1")
     assert module.IPC_QUANT_ALLOWLIST["slimquant_w4a8"](None)

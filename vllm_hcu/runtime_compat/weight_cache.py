@@ -243,27 +243,18 @@ def install_expert_export_metadata(module: ModuleType) -> None:
 
 
 def install_ipc_quant_support(module: ModuleType) -> None:
-    """Register the audited HCU quantization gate for IPC weight sharing.
-
-    vLLM's protocol intentionally fails closed for unknown quantizers.  The
-    HCU W4A8 path is enabled only behind an explicit deployment flag until the
-    partial-layer and full fastsafetensors round trips have both passed.  The
-    same flag is required by daemon and engine processes, so a stale or mixed
-    deployment cannot silently fall back to a different layout.
-    """
+    """Allow SlimQuant W4A8 through the vLLM IPC quantization check."""
     allowlist = getattr(module, "IPC_QUANT_ALLOWLIST", None)
     if not isinstance(allowlist, dict):
         raise RuntimeError("Incompatible weight cache protocol: missing IPC allowlist")
     existing = allowlist.get("slimquant_w4a8")
-    if getattr(existing, "_hcu_hard_gate", False):
+    if getattr(existing, "_hcu_slimquant_ipc", False):
         return
 
     def slimquant_w4a8_ipc_enabled(_quant_config):
-        import os
+        return True
 
-        return os.environ.get("VLLM_HCU_PRELOAD_ALLOW_SLIMQUANT_W4A8") == "1"
-
-    slimquant_w4a8_ipc_enabled._hcu_hard_gate = True
+    slimquant_w4a8_ipc_enabled._hcu_slimquant_ipc = True
     allowlist["slimquant_w4a8"] = slimquant_w4a8_ipc_enabled
 
 
