@@ -62,7 +62,9 @@ def test_plugin_compat_lock_pins_vllm032_pair_without_circular_commits() -> None
     assert document["gates"]["live_hardware_operators"]["status"] == "pass"
     assert document["gates"]["serving"]["status"] == "pass"
     assert document["gates"]["model_parity"]["status"] == "pending"
-    assert document["gates"]["humaneval_prefix"]["status"] == "pending"
+    assert document["gates"]["humaneval_prefix"]["status"] == "pass"
+    assert document["human_eval"]["plugin_on"]["passed"] == 61
+    assert document["human_eval"]["plugin_off"]["passed"] == 60
     assert not _contains_forbidden_key(document)
 
 

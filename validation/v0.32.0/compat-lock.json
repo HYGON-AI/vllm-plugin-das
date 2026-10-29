@@ -23,7 +23,25 @@
     "commit": "6d43fb980f9fee3c892a914eda09951f772ad10d",
     "tasks": "HumanEval/0-63",
     "samples": 64,
-    "status": "not-run-with-adapter-das-pair"
+    "status": "pass",
+    "model": "/model/Qwen3-8B",
+    "temperature": 0,
+    "seed": 0,
+    "max_tokens": 2048,
+    "plugin_on": {
+      "passed": 61,
+      "pass_at_1": 0.953125,
+      "failed_tasks": [26, 32, 54],
+      "timeouts": 0
+    },
+    "plugin_off": {
+      "passed": 60,
+      "pass_at_1": 0.9375,
+      "failed_tasks": [18, 26, 32, 54],
+      "timeouts": 0
+    },
+    "completion_equal": 58,
+    "sandbox": "bubblewrap-0.6.1-no-network-no-capabilities-uid65534"
   },
   "hardware": {
     "architecture": "gfx936",
@@ -90,7 +108,8 @@
       "result": "Qwen2-0.5B-Instruct fresh-process ON/OFF: vLLM 0.32.0, enforce_eager=false, FULL_AND_PIECEWISE captured, health/version/models/chat HTTP 200, deterministic output 42, clean teardown"
     },
     "humaneval_prefix": {
-      "status": "pending"
+      "status": "pass",
+      "result": "Qwen3-8B HumanEval/0-63 non-eager graph: Plugin ON 61/64 pass@1=0.953125, master OFF 60/64 pass@1=0.9375, zero timeouts; no ON regression"
     }
   },
   "evidence": {

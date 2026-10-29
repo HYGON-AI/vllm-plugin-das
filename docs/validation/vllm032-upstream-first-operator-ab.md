@@ -223,4 +223,58 @@ Each owned service was stopped through its PTY with SIGINT. No vLLM or
 EngineCore process remained, all cards returned to 0% compute and 0% reported
 memory use, and no external process was signalled.
 
-HumanEval-64 and broader model precision remain not run for this candidate.
+## HumanEval/0-63 accuracy
+
+The final Adapter/Plugin wheel pair was also evaluated on the ordered
+HumanEval/0-63 prefix with `/model/Qwen3-8B`. ON and OFF used fresh processes,
+independent compile caches, BF16, max model length 4096, max sequences 1,
+`TRITON_ATTN`, temperature 0, seed 0, max output 2048, thinking disabled, and
+the same non-eager `VLLM_COMPILE` plus `FULL_AND_PIECEWISE` Graph policy used by
+the service gate. The HumanEval repository was pinned to
+`6d43fb980f9fee3c892a914eda09951f772ad10d`.
+
+Generation command, repeated against ports 18017 (master/RMS ON) and 18018
+(master OFF, RMS child deliberately ON):
+
+```bash
+env -u PYTHONPATH \
+  TMPDIR=/dev/shm/vllm032-plugin-humaneval-current/on-tmp \
+  python3 -S /dev/shm/hcu-vllm032-work/tools/humaneval64_client.py \
+  --human-eval-root /dev/shm/hcu-vllm032-work/src/human-eval \
+  --output-dir /dev/shm/vllm032-plugin-humaneval-current/on \
+  --base-url http://127.0.0.1:18017 \
+  --model Qwen3-8B --limit 64 --max-tokens 2048 --timeout 600
+```
+
+Generated code was not executed by the service client or directly on the host.
+Scoring used official `human_eval.execution.check_correctness`, one sample per
+task and a 10-second timeout, inside Bubblewrap 0.6.1 with unshared network,
+PID, IPC, and UTS namespaces, UID/GID 65534, all capabilities dropped,
+read-only host binds, tmpfs `/tmp`, and 2 GiB address-space, 128-process,
+256-file, and zero-core limits. Both scoring stderr files were empty.
+
+| Mode | Passed | pass@1 | Failed tasks | Timeouts | Generation wall time |
+| --- | ---: | ---: | --- | ---: | ---: |
+| master ON, RMS ON | 61/64 | 0.953125 | 26, 32, 54 | 0 | 167.67 s |
+| master OFF, RMS child ON | 60/64 | 0.937500 | 18, 26, 32, 54 | 0 | 169.47 s |
+
+Fifty-eight completions were byte-identical. The six differing tasks were 12,
+18, 25, 32, 38, and 59; only task 18 changed pass/fail status. The ON answer
+used a regular-expression lookahead to count overlapping substrings and passed,
+while OFF used non-overlapping `finditer` and failed. Therefore this run proves
+no HumanEval pass@1 regression from enabling the retained RMSNorm path, but it
+does not claim token-exact numerical equivalence.
+
+Node-local raw evidence hashes:
+
+| Artifact | ON SHA256 | OFF SHA256 |
+| --- | --- | --- |
+| `problems.jsonl` | `3a64d077946f2c1b8707e13217e7069cc4bcefc034a6992f7ded9104c2dc59bd` | `3a64d077946f2c1b8707e13217e7069cc4bcefc034a6992f7ded9104c2dc59bd` |
+| `responses.jsonl` | `ff47e25b6ebd7d07d92a30df8bf88b26abbfdd3957004b232eef6eda163e4fef` | `a6e46c0ad793441f6cb68e9f4d4067824f54a739f2341a27f8100aa75cf0a228` |
+| `samples.jsonl` | `c4b09fd5a4479485b11080f2e70ebf450034e9360362145c04216794ac049521` | `6b213e3fd51d45d1b3ebc2f0bc4a5a438bb403ea29b694c687a3978ef2d8f775` |
+| `score-results.jsonl` | `2d94ef218efc3dc949da20beb56d9c89b23b0bff8ff8cb9c6b8088f4a472a931` | `755add454228c2afac9b808553031ee4a3472746b98858fb1f1b271136526711` |
+| `generation-summary.json` | `02a74d15dbc7a3cef274eff04db48b4a95a7cae904718563535ca1c642158678` | `bf828927a8b68a929ca17f1be3f3bc146fd2094bb36f34440a3221db0876f986` |
+
+Both services remained healthy after all requests, stopped cleanly through
+their owned PTY sessions, and all cards returned to 0% reported memory use.
+Broader multi-model precision remains pending for this candidate.
