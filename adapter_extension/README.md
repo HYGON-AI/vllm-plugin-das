@@ -139,5 +139,8 @@ remain installed and retain platform ownership.
 The [`SiluAndMul`](../docs/validation/v032-adapter-extension-silu.md) and
 [`RMSNorm`](../docs/validation/v032-adapter-extension-rmsnorm.md) records are
 historical candidate evidence. The current three-way identities, upstream
-takeover decision, and pending final-wheel gates are recorded in the
+takeover decision, and base final-wheel gates are recorded in the
 [`vLLM 0.32 upstream-first validation`](../docs/validation/vllm032-upstream-first-operator-ab.md).
+The explicit AITER W8A8 route, public vendor-kernel evidence, Graph replay,
+model smoke, and isolated HumanEval64 result are recorded in the
+[`vLLM 0.32 AITER INT8 MoE validation`](../docs/validation/vllm032-aiter-int8-moe.md).
