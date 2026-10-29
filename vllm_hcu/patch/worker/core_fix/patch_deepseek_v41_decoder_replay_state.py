@@ -497,11 +497,16 @@ def _prepare_replay_batch(
             or global_num_tokens is None
             or global_positions is None
         ):
+            # DualChunk local tails are not the global SWA window. Missing
+            # restore meta must not fall through to rank-local last-window
+            # trim (including PIECEWISE force_replay_batch); keep the full
+            # forward instead.
             logger.warning_once(
                 "Decoder SWA PCP late-tail: missing restore metadata; "
-                "falling back to non-PCP trim."
+                "skipping decoder trim (full forward)."
             )
-            pcp = None  # fall through to non-PCP path below
+            layers.replay_batch = None
+            return
         else:
             # One row per logical request (PCP may expand idx_mapping).
             _, first_indices = np.unique(idx_mapping_np, return_index=True)
@@ -575,35 +580,29 @@ def _prepare_replay_batch(
             )
 
     if pcp is None or pcp_tail_plan is None:
-        # Non-PCP / fallback: last-window rows of the local batch.
-        if pcp_tail_plan is None and getattr(input_batch, "pcp", None) is not None:
-            # restore failed; use local min(query, window)
-            kept_lens = np.where(
-                keeps_rows, query_lens, np.minimum(query_lens, layers.window)
-            ).astype(np.int32)
-            needs_replay_batch = force_replay_batch or bool(
-                (kept_lens < query_lens)[input_batch.is_prefilling_np[:num_reqs]].any()
+        # PCP batches must not use rank-local last-window trim: DualChunk local
+        # tails are not the global SWA window. Only true non-PCP batches trim
+        # locally; a PCP batch without a late-tail plan keeps full forward.
+        if getattr(input_batch, "pcp", None) is not None:
+            logger.warning_once(
+                "Decoder SWA PCP late-tail: no usable late-tail plan; "
+                "skipping decoder trim (full forward)."
             )
-        elif pcp is None:
-            kept_lens = np.where(
-                keeps_rows, query_lens, np.minimum(query_lens, layers.window)
-            ).astype(np.int32)
-            is_dummy = not input_batch.is_prefilling_np[:num_reqs].any() and bool(
-                (seq_lens == query_lens).all()
-            )
-            if is_dummy and capture_desc is None:
-                kept_lens = np.zeros_like(kept_lens)
-                kept_lens[0] = 1
-            needs_replay_batch = force_replay_batch or bool(
-                (kept_lens < query_lens)[input_batch.is_prefilling_np[:num_reqs]].any()
-            )
-        else:
-            kept_lens = np.where(
-                keeps_rows, query_lens, np.minimum(query_lens, layers.window)
-            ).astype(np.int32)
-            needs_replay_batch = force_replay_batch or bool(
-                (kept_lens < query_lens)[input_batch.is_prefilling_np[:num_reqs]].any()
-            )
+            layers.replay_batch = None
+            return
+
+        kept_lens = np.where(
+            keeps_rows, query_lens, np.minimum(query_lens, layers.window)
+        ).astype(np.int32)
+        is_dummy = not input_batch.is_prefilling_np[:num_reqs].any() and bool(
+            (seq_lens == query_lens).all()
+        )
+        if is_dummy and capture_desc is None:
+            kept_lens = np.zeros_like(kept_lens)
+            kept_lens[0] = 1
+        needs_replay_batch = force_replay_batch or bool(
+            (kept_lens < query_lens)[input_batch.is_prefilling_np[:num_reqs]].any()
+        )
         kv_start_np = None
         num_padded = None
         pcp_tail_plan = None

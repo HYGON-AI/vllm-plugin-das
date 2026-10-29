@@ -752,10 +752,18 @@ def test_pcp_replay_keeps_multi_request_boundaries(monkeypatch, idx_mapping_np):
     assert layers.replay_batch is None
 
 
-def test_pcp_missing_restore_metadata_falls_back_before_global_index(
-    monkeypatch,
+@pytest.mark.parametrize(
+    "cudagraph_mode,force_graph_replay",
+    [
+        ("NONE", False),
+        ("PIECEWISE", True),
+    ],
+    ids=("eager", "piecewise_force"),
+)
+def test_pcp_missing_restore_metadata_skips_trim_full_forward(
+    monkeypatch, cudagraph_mode, force_graph_replay
 ):
-    """Missing DualChunk meta must not index_select global tails with local positions."""
+    """Missing DualChunk meta → full forward; never rank-local last-window trim."""
     from vllm.config.compilation import CUDAGraphMode
     from vllm.distributed import parallel_state
 
@@ -775,8 +783,13 @@ def test_pcp_missing_restore_metadata_falls_back_before_global_index(
         patch_deepseek_v41_decoder_replay_state, "late_layer_tail_layout", boom_layout
     )
 
+    mode = getattr(CUDAGraphMode, cudagraph_mode)
     # Local positions shorter than global span that a naive index_select would use.
-    layers = SimpleNamespace(window=128, replay_batch=object())
+    layers = SimpleNamespace(
+        window=128,
+        replay_batch=object(),
+        graph_uses_replay_batch=lambda _n: force_graph_replay,
+    )
     state = SimpleNamespace(
         decoder_replay_layers=layers,
         _keeps_rows_np=np.zeros(2, dtype=np.bool_),
@@ -788,9 +801,10 @@ def test_pcp_missing_restore_metadata_falls_back_before_global_index(
     )
     input_batch = SimpleNamespace(
         num_reqs=2,
-        num_tokens_after_padding=4,
+        # > window so a naive local-trim fallback would otherwise trim.
+        num_tokens_after_padding=256,
         idx_mapping_np=np.array([0, 1], dtype=np.int32),
-        query_start_loc_np=np.array([0, 2, 4], dtype=np.int32),
+        query_start_loc_np=np.array([0, 128, 256], dtype=np.int32),
         seq_lens_cpu_upper_bound=torch.tensor([400, 500], dtype=torch.int32),
         positions=torch.arange(4, dtype=torch.int64),  # rank-local only
         is_prefilling_np=np.ones(2, dtype=np.bool_),
@@ -804,7 +818,7 @@ def test_pcp_missing_restore_metadata_falls_back_before_global_index(
     patch_deepseek_v41_decoder_replay_state._prepare_replay_batch(
         state,
         input_batch,
-        CUDAGraphMode.NONE,
+        mode,
         block_tables=(),
         slot_mappings=torch.empty((1, 4), dtype=torch.int64),
         attn_groups=[],
@@ -812,8 +826,7 @@ def test_pcp_missing_restore_metadata_falls_back_before_global_index(
         replay_start=torch.zeros(2, dtype=torch.int32),
     )
     assert called["layout"] is False
-    # Falls back to non-PCP local trim (may still set a local replay_batch).
-    # Must not OOB before that fallback.
+    assert layers.replay_batch is None
 
 
 def test_pcp_replicated_tail_restores_outputs_without_duplicate_gather(monkeypatch):
