@@ -48,25 +48,26 @@ def engine_config_signature(vllm_config: Any) -> dict[str, Any]:
 
 
 def validate_distributed_engine_config(vllm_config: Any, dist: Any) -> None:
-    """Broadcast rank 0's signature and fail before model loading on drift."""
+    """Fail on every rank before model loading if any configuration differs."""
     if not dist.is_available() or not dist.is_initialized():
         return
 
     local = engine_config_signature(vllm_config)
-    reference = [local if dist.get_rank() == 0 else None]
-    dist.broadcast_object_list(reference, src=0)
-    expected = reference[0]
-    if local == expected:
+    signatures = [None] * dist.get_world_size()
+    dist.all_gather_object(signatures, local)
+    expected = signatures[0]
+    mismatches = [(rank, signature) for rank, signature in enumerate(signatures)
+                  if signature != expected]
+    if not mismatches:
         return
 
-    differing = sorted(
-        name
-        for name in set(local) | set(expected)
-        if local.get(name) != expected.get(name)
-    )
-    details = ", ".join(
-        f"{name}={local.get(name)!r} (rank0={expected.get(name)!r})"
-        for name in differing
+    details = "; ".join(
+        f"rank {rank}: " + ", ".join(
+            f"{name}={signature.get(name)!r} (rank0={expected.get(name)!r})"
+            for name in sorted(set(signature) | set(expected))
+            if signature.get(name) != expected.get(name)
+        )
+        for rank, signature in mismatches
     )
     raise RuntimeError(
         "Distributed EngineConfig mismatch before model loading: " + details

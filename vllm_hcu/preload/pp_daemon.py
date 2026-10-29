@@ -9,6 +9,7 @@ the stage selected by vLLM's normal PP group and serves a UUID+stage socket.
 from __future__ import annotations
 
 import multiprocessing
+from multiprocessing.connection import wait
 import os
 import queue
 import signal
@@ -154,17 +155,36 @@ def main(daemon_module) -> None:
         process.start()
         processes.append(process)
 
+    stopping = False
+
     def shutdown(_signum, _frame):
+        nonlocal stopping
+        stopping = True
         for process in processes:
             process.terminate()
 
     signal.signal(signal.SIGINT, shutdown)
     signal.signal(signal.SIGTERM, shutdown)
+    if not _wait_until_ready(processes, ready_queue, local_world_size, lambda: stopping):
+        return
+    print(
+        f"Weight cache daemon READY: node {node_rank}/{nnodes}, "
+        f"{local_world_size} local TP/PP ranks, PP={pp_size}",
+        flush=True,
+    )
+    _monitor_processes(processes, lambda: stopping)
+
+
+def _wait_until_ready(processes, ready_queue, local_world_size, is_stopping):
     ready = set()
     while len(ready) < local_world_size:
+        if is_stopping():
+            break
         try:
             ready.add(ready_queue.get(timeout=1.0))
         except queue.Empty:
+            if is_stopping():
+                break
             dead = [process for process in processes if process.exitcode is not None]
             if dead:
                 for process in processes:
@@ -172,23 +192,27 @@ def main(daemon_module) -> None:
                 for process in processes:
                     process.join()
                 raise SystemExit(max(process.exitcode or 1 for process in dead))
-    print(
-        f"Weight cache daemon READY: node {node_rank}/{nnodes}, "
-        f"{local_world_size} local TP/PP ranks, PP={pp_size}",
-        flush=True,
-    )
+    if is_stopping():
+        for process in processes:
+            process.join()
+        return False
+    return True
+
+
+def _monitor_processes(processes, is_stopping):
+    """Stop the local group when any indefinitely serving child exits."""
+    ready = set(wait([process.sentinel for process in processes]))
+    failed = [process for process in processes if process.sentinel in ready]
+    for process in failed:
+        process.join()
+    for process in processes:
+        if process.exitcode is None:
+            process.terminate()
     for process in processes:
         process.join()
-
-
-def argv_requests_pp(argv: list[str]) -> bool:
-    """Detect PP>1 without importing EngineArgs during plugin bootstrap."""
-    for index, value in enumerate(argv):
-        if value == "--pipeline-parallel-size" and index + 1 < len(argv):
-            return int(argv[index + 1]) > 1
-        if value.startswith("--pipeline-parallel-size="):
-            return int(value.split("=", 1)[1]) > 1
-    return False
+    if not is_stopping():
+        names = ", ".join(f"{p.name} (exit={p.exitcode})" for p in failed)
+        raise SystemExit(f"Weight cache daemon exited unexpectedly: {names}")
 
 
 def plan_local_pipeline_ranks(

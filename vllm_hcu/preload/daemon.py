@@ -49,12 +49,11 @@ def main():
         )
     sys.argv.remove(_FULL_MODEL_FLAG)
     daemon = _prepare()
-    from vllm_hcu.preload.pp_daemon import argv_requests_pp, main as pp_main
-    if argv_requests_pp(sys.argv[1:]):
-        return pp_main(daemon)
-    # Spawn imports this module by name and executes run_daemon in every rank.
+    from vllm_hcu.preload.pp_daemon import main as pp_main
+    # Spawn imports this module by name and executes run_daemon in every TP
+    # rank. The PP-aware launcher delegates TP-only configurations upstream.
     daemon._run_daemon = run_daemon
-    daemon.main()
+    return pp_main(daemon)
 
 
 if __name__ == "__main__":

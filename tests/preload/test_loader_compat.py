@@ -4,6 +4,14 @@ from types import SimpleNamespace
 
 import pytest
 
+
+def fingerprint(key, config, tp_size, tp_rank):
+    from vllm_hcu.runtime_compat.weight_cache import _weight_cache_config_scope
+
+    vllm_config = SimpleNamespace(kernel_config=SimpleNamespace(moe_backend="auto"))
+    with _weight_cache_config_scope(vllm_config):
+        return key.from_model_config(config, tp_size, tp_rank)
+
 from vllm_hcu.runtime_compat.weight_cache import (
     install_loader_compat, install_uuid_daemon,
 )
@@ -145,9 +153,9 @@ def test_checkpoint_fingerprint_changes_with_shard(tmp_path):
     module = SimpleNamespace(WeightCacheKey=Key)
     install_key_fingerprint(module)
     config = SimpleNamespace(model=str(tmp_path))
-    first = Key.from_model_config(config, 1, 0)
+    first = fingerprint(Key, config, 1, 0)
     path.write_bytes(b"new data")
-    second = Key.from_model_config(config, 1, 0)
+    second = fingerprint(Key, config, 1, 0)
     assert first.checkpoint != second.checkpoint
     assert "|hcu:" in first.vllm_version
 
@@ -155,9 +163,11 @@ def test_checkpoint_fingerprint_changes_with_shard(tmp_path):
 def test_launcher_installs_spawn_target_before_main(monkeypatch):
     import sys
     from vllm_hcu.preload import daemon as launcher
+    from vllm_hcu.preload import pp_daemon
     called = []
     upstream = SimpleNamespace(_run_daemon=lambda *args: None)
     upstream.main = lambda: called.append(upstream._run_daemon)
+    monkeypatch.setattr(pp_daemon, "main", lambda daemon: daemon.main())
     monkeypatch.setattr(launcher, "_prepare", lambda: upstream)
     monkeypatch.setattr(sys, "argv", ["vllm-hcu-preload", "--enable-full-model-preload", "--model", "x"])
     launcher.main()
@@ -195,13 +205,123 @@ def test_checkpoint_fingerprint_captures_nested_config_and_overrides(tmp_path):
     module = SimpleNamespace(WeightCacheKey=Key)
     install_key_fingerprint(module)
     config = SimpleNamespace(model=str(tmp_path), hf_config=HFConfig(), model_class_overrides={})
-    first = Key.from_model_config(config, 1, 0)
+    first = fingerprint(Key, config, 1, 0)
     config.hf_config.weight_bits = 8
-    second = Key.from_model_config(config, 1, 0)
+    second = fingerprint(Key, config, 1, 0)
     config.hf_config.weight_bits = 4
     config.model_class_overrides = {"architecture": "OtherModel"}
-    third = Key.from_model_config(config, 1, 0)
+    third = fingerprint(Key, config, 1, 0)
     assert len({first.checkpoint, second.checkpoint, third.checkpoint}) == 3
+
+
+def test_checkpoint_fingerprint_captures_effective_aiter_shuffle(tmp_path, monkeypatch):
+    from dataclasses import dataclass
+    from vllm_hcu.platforms.envs import resolve_aiter_moe_shuffle
+    from vllm_hcu.runtime_compat.weight_cache import install_key_fingerprint
+
+    @dataclass(frozen=True)
+    class Key:
+        checkpoint: str
+        vllm_version: str
+
+        @classmethod
+        def from_model_config(cls, model_config, tp_size, tp_rank):
+            return cls("same-header", "vllm")
+
+    install_key_fingerprint(SimpleNamespace(WeightCacheKey=Key))
+    config = SimpleNamespace(model=str(tmp_path))
+    try:
+        with monkeypatch.context() as patch:
+            patch.delenv("VLLM_HCU_USE_AITER_MOE_SHUFFLE", raising=False)
+            resolve_aiter_moe_shuffle.cache_clear()
+            default = fingerprint(Key, config, 1, 0)
+            patch.setenv("VLLM_HCU_USE_AITER_MOE_SHUFFLE", "1")
+            resolve_aiter_moe_shuffle.cache_clear()
+            enabled = fingerprint(Key, config, 1, 0)
+            patch.setenv("VLLM_HCU_USE_AITER_MOE_SHUFFLE", "0")
+            resolve_aiter_moe_shuffle.cache_clear()
+            disabled = fingerprint(Key, config, 1, 0)
+            assert default.checkpoint == enabled.checkpoint
+            assert enabled.checkpoint != disabled.checkpoint
+    finally:
+        resolve_aiter_moe_shuffle.cache_clear()
+
+
+def test_checkpoint_fingerprint_uses_effective_nn_setting(tmp_path, monkeypatch):
+    from dataclasses import dataclass
+    from vllm_hcu.runtime_compat.weight_cache import install_key_fingerprint
+
+    @dataclass(frozen=True)
+    class Key:
+        checkpoint: str
+        vllm_version: str
+
+        @classmethod
+        def from_model_config(cls, model_config, tp_size, tp_rank):
+            return cls("header", "vllm")
+
+    install_key_fingerprint(SimpleNamespace(WeightCacheKey=Key))
+    config = SimpleNamespace(model=str(tmp_path))
+    monkeypatch.delenv("VLLM_USE_NN", raising=False)
+    default = fingerprint(Key, config, 1, 0)
+    monkeypatch.setenv("VLLM_USE_NN", "true")
+    enabled = fingerprint(Key, config, 1, 0)
+    monkeypatch.setenv("VLLM_USE_NN", "1")
+    assert fingerprint(Key, config, 1, 0) == enabled == default
+    monkeypatch.setenv("VLLM_USE_NN", "0")
+    disabled = fingerprint(Key, config, 1, 0)
+    monkeypatch.setenv("VLLM_USE_NN", "false")
+    assert fingerprint(Key, config, 1, 0) == disabled
+    assert disabled != enabled
+
+
+def test_daemon_and_loader_fingerprint_moe_backend_and_restore_scope(tmp_path):
+    from dataclasses import dataclass
+    from vllm_hcu.runtime_compat.weight_cache import install_key_fingerprint
+
+    @dataclass(frozen=True)
+    class Key:
+        checkpoint: str
+        vllm_version: str
+
+        @classmethod
+        def from_model_config(cls, model_config, tp_size, tp_rank):
+            return cls("header", "vllm")
+
+    model_config = SimpleNamespace(model=str(tmp_path))
+
+    class Daemon:
+        def __init__(self, vllm_config):
+            self.key = Key.from_model_config(model_config, 1, 0)
+
+    class PipelineDaemon(Daemon):
+        pass
+
+    class Loader:
+        def load_model(self, vllm_config):
+            if getattr(vllm_config, "fail", False):
+                raise ValueError("load failed")
+            return Key.from_model_config(model_config, 1, 0)
+
+        def load_weights(self):
+            return Key.from_model_config(model_config, 1, 0)
+
+    install_key_fingerprint(SimpleNamespace(WeightCacheKey=Key, WeightCacheDaemon=Daemon))
+    install_key_fingerprint(SimpleNamespace(WeightCacheKey=Key, IpcModelLoader=Loader))
+    aiter = SimpleNamespace(kernel_config=SimpleNamespace(moe_backend="aiter"))
+    triton = SimpleNamespace(kernel_config=SimpleNamespace(moe_backend="triton"))
+    daemon_key = PipelineDaemon(aiter).key
+    assert daemon_key == Loader().load_model(aiter)
+    assert daemon_key != Loader().load_model(triton)
+    with pytest.raises(RuntimeError, match="requires vLLM kernel configuration"):
+        Loader().load_weights()
+    with pytest.raises(RuntimeError, match="kernel_config.moe_backend"):
+        Loader().load_model(SimpleNamespace())
+    aiter.fail = True
+    with pytest.raises(ValueError, match="load failed"):
+        Loader().load_model(aiter)
+    with pytest.raises(RuntimeError, match="requires vLLM kernel configuration"):
+        Key.from_model_config(model_config, 1, 0)
 
 
 def test_incomplete_meta_parameters_fail_closed():

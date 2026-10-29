@@ -3,6 +3,49 @@
 from __future__ import annotations
 
 from types import ModuleType
+from contextlib import contextmanager
+from contextvars import ContextVar
+
+_cache_moe_backend = ContextVar("hcu_weight_cache_moe_backend", default=None)
+
+
+@contextmanager
+def _weight_cache_config_scope(vllm_config):
+    kernel_config = getattr(vllm_config, "kernel_config", None)
+    backend = getattr(kernel_config, "moe_backend", None)
+    if backend is None:
+        raise RuntimeError("weight cache requires kernel_config.moe_backend")
+    token = _cache_moe_backend.set(str(backend))
+    try:
+        yield
+    finally:
+        _cache_moe_backend.reset(token)
+
+
+def _install_cache_config_scope(module):
+    import functools
+
+    for class_name, method_name in (("WeightCacheDaemon", "__init__"),
+                                    ("IpcModelLoader", "load_model")):
+        cls = getattr(module, class_name, None)
+        if cls is None:
+            continue
+        method = getattr(cls, method_name, None)
+        if not callable(method):
+            raise RuntimeError(f"Incompatible weight cache: missing {class_name}.{method_name}")
+        if getattr(method, "_hcu_cache_config_scope", False):
+            continue
+
+        def wrap(original):
+            @functools.wraps(original)
+            def scoped(self, vllm_config, *args, **kwargs):
+                with _weight_cache_config_scope(vllm_config):
+                    return original(self, vllm_config, *args, **kwargs)
+
+            scoped._hcu_cache_config_scope = True
+            return scoped
+
+        setattr(cls, method_name, wrap(method))
 
 
 def reconcile_router_state_devices(model, target_device):
@@ -380,6 +423,7 @@ def install_key_fingerprint(module: ModuleType) -> None:
     import json
     import os
 
+    _install_cache_config_scope(module)
     cls = module.WeightCacheKey
     if cls.__dict__.get("_hcu_fingerprint", False):
         return
@@ -391,6 +435,9 @@ def install_key_fingerprint(module: ModuleType) -> None:
     def from_model_config(key_cls, model_config, tp_size, tp_rank):
         from vllm_hcu.version import __hcu_version__
 
+        moe_backend = _cache_moe_backend.get()
+        if moe_backend is None:
+            raise RuntimeError("weight cache key requires vLLM kernel configuration")
         key = original(model_config, tp_size=tp_size, tp_rank=tp_rank)
         pp_size, pp_rank = _pipeline_context()
         model_path = model_config.model
@@ -419,11 +466,18 @@ def install_key_fingerprint(module: ModuleType) -> None:
         }
         # HCU switches alter post-processed layouts and must match in both
         # daemon and engine. Record effective values rather than raw spelling.
-        from vllm_hcu.platforms.envs import custom_ops_enabled, custom_quantization_gemm_enabled
+        from vllm_hcu.platforms import envs as henvs
+        from vllm_hcu.platforms.envs import (
+            custom_ops_enabled,
+            custom_quantization_gemm_enabled,
+            resolve_aiter_moe_shuffle,
+        )
         options["hcu_runtime"] = {
             "custom_ops": custom_ops_enabled(),
             "custom_quantization_gemm": custom_quantization_gemm_enabled(),
-            "use_nn": os.environ.get("VLLM_USE_NN", "1"),
+            "aiter_moe_shuffle": resolve_aiter_moe_shuffle(),
+            "moe_backend": moe_backend,
+            "use_nn": bool(henvs.VLLM_USE_NN),
         }
         try:
             config_bytes = json.dumps(

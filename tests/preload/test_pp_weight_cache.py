@@ -5,6 +5,96 @@ from types import SimpleNamespace
 import pytest
 
 
+def fingerprint(key, config, tp_size, tp_rank):
+    from vllm_hcu.runtime_compat.weight_cache import _weight_cache_config_scope
+
+    vllm_config = SimpleNamespace(kernel_config=SimpleNamespace(moe_backend="auto"))
+    with _weight_cache_config_scope(vllm_config):
+        return key.from_model_config(config, tp_size, tp_rank)
+
+
+@pytest.mark.parametrize("mode", ["short", "underscore", "yaml", "tp_only"])
+def test_launcher_selects_pipeline_using_engine_args(mode, tmp_path, monkeypatch):
+    import sys
+    from vllm.engine.arg_utils import EngineArgs
+    from vllm_hcu.preload.pp_daemon import main
+
+    if mode == "yaml":
+        path = tmp_path / "engine.yaml"
+        path.write_text("pipeline-parallel-size: 2\n")
+        options = ["--config", str(path)]
+    elif mode == "short":
+        options = ["-pp=2"]
+    elif mode == "underscore":
+        options = ["--pipeline_parallel_size", "2"]
+    else:
+        options = ["--pipeline-parallel-size", "1"]
+    monkeypatch.setattr(sys, "argv", ["preload", *options])
+
+    def fake_create(self):
+        return SimpleNamespace(
+            parallel_config=SimpleNamespace(
+                tensor_parallel_size=1,
+                pipeline_parallel_size=self.pipeline_parallel_size,
+            ),
+            load_config=SimpleNamespace(load_format="ipc_cache"),
+        )
+
+    monkeypatch.setattr(EngineArgs, "create_engine_config", fake_create)
+    calls = []
+    upstream = SimpleNamespace(main=lambda: calls.append("tp"))
+    if mode == "tp_only":
+        main(upstream)
+        assert calls == ["tp"]
+    else:
+        with pytest.raises(ValueError, match="must load from disk"):
+            main(upstream)
+        assert not calls
+
+
+def test_startup_signal_during_queue_wait_is_not_a_failure():
+    import queue
+    from vllm_hcu.preload.pp_daemon import _wait_until_ready
+
+    state = {"stopping": False, "joined": False}
+
+    class ReadyQueue:
+        def get(self, timeout):
+            state["stopping"] = True
+            raise queue.Empty
+
+    class Process:
+        exitcode = -15
+
+        def join(self):
+            state["joined"] = True
+
+    assert not _wait_until_ready([Process()], ReadyQueue(), 1, lambda: state["stopping"])
+    assert state["joined"]
+
+
+def test_daemon_monitor_stops_survivors_when_child_exits():
+    import multiprocessing
+    import time
+
+    from vllm_hcu.preload.pp_daemon import _monitor_processes
+
+    ctx = multiprocessing.get_context("spawn")
+    survivor = ctx.Process(target=time.sleep, args=(30,), name="survivor")
+    failed = ctx.Process(target=time.sleep, args=(0,), name="exited")
+    survivor.start()
+    failed.start()
+    try:
+        with pytest.raises(SystemExit, match="exited unexpectedly: exited"):
+            _monitor_processes([survivor, failed], lambda: False)
+        assert survivor.exitcode is not None
+    finally:
+        for process in (survivor, failed):
+            if process.is_alive():
+                process.terminate()
+            process.join()
+
+
 def test_pipeline_rank_plan_keeps_stage_and_tp_rank_isolated():
     from vllm_hcu.preload.pp_daemon import plan_local_pipeline_ranks
 
@@ -59,9 +149,9 @@ def test_pipeline_cache_key_includes_stage(monkeypatch, tmp_path):
     )
     monkeypatch.setenv("VLLM_HCU_PRELOAD_PP_SIZE", "2")
     monkeypatch.setenv("VLLM_HCU_PRELOAD_PP_RANK", "0")
-    first = Key.from_model_config(config, 8, 0)
+    first = fingerprint(Key, config, 8, 0)
     monkeypatch.setenv("VLLM_HCU_PRELOAD_PP_RANK", "1")
-    second = Key.from_model_config(config, 8, 0)
+    second = fingerprint(Key, config, 8, 0)
     assert first.checkpoint != second.checkpoint
     assert "hcu-pp:2:0" in first.checkpoint
     assert "hcu-pp:2:1" in second.checkpoint
