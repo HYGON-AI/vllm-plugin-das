@@ -87,7 +87,7 @@ remains the highest-priority rollback and returns RMSNorm to vLLM's complete
 implementation without uninstalling the plugin:
 
 ```bash
-# Explicitly enable the validated RMSNorm path.
+# Explicitly enable the retained RMSNorm candidate.
 export VLLM_HCU_USE_CUSTOM_OPS=1
 export VLLM_HCU_USE_CUSTOM_RMS_NORM=1
 
