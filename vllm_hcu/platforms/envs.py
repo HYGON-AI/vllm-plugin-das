@@ -81,6 +81,7 @@ if TYPE_CHECKING:
     VLLM_HCU_KV_ZERO_BY_GROUP: bool = True
     VLLM_HCU_DEEPSEEK_V4_PCP_LOCAL_SLICES: bool = True
     VLLM_HCU_COMPRESSOR_GEMM_BACKEND: str = "blaslt"
+    VLLM_HCU_BF16_FP32_MMAC: bool = True
     VLLM_HCU_C128_HEAD_SPLITS: int = 4
     VLLM_HCU_INVERSE_ROPE_SUFFIX: bool = True
     VLLM_HCU_SHARED_EXPERTS_EARLY_LAUNCH: bool = False
@@ -662,6 +663,11 @@ hcu_vllm_environment_variables: dict[str, Callable[[], Any]] = {
     # weight + shared BF16->FP32 BLASLt GEMM) or torch (original torch.mm).
     "VLLM_HCU_COMPRESSOR_GEMM_BACKEND":
         lambda: os.getenv("VLLM_HCU_COMPRESSOR_GEMM_BACKEND", "blaslt"),
+
+    # Small-M (<=64) BF16->FP32 NT GEMM on HCU MMAC for the compressor
+    # projections; 0 keeps hipBLASLt for every shape.
+    "VLLM_HCU_BF16_FP32_MMAC":
+        lambda: _environment_flag(os.getenv("VLLM_HCU_BF16_FP32_MMAC", "1")),
 
     # C128 prefill head tiles on HCU; 0 restores the upstream CU heuristic.
     "VLLM_HCU_C128_HEAD_SPLITS":
