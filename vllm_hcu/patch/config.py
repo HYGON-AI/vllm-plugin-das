@@ -57,7 +57,7 @@ _SUPPORTED_FLASH_ATTN_MODES = frozenset(
     {"classic", "cutlass", "varlen"}
 )
 # HCU-only --gdn-prefill-backend values. vLLM itself only sees "triton".
-HCU_GDN_PREFILL_BACKENDS = ("hcu-boltops", "hcu-aiter")
+HCU_GDN_PREFILL_BACKENDS = ("hcu-boltops", "hcu-aiter", "hcu-aiter-ck")
 _SUPPORTED_EPLB_STATIC_DISPATCH_POLICIES = frozenset(
     {"nearest", "locality_fair"}
 )
