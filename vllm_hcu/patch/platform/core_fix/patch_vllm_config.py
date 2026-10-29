@@ -589,7 +589,11 @@ def apply_to_module(module: ModuleType) -> bool:
     @functools.wraps(post_init)
     def hcu_post_init(self):
         _apply_kimi_k3_source_compilation_defaults(self)
-        return post_init(self)
+        result = post_init(self)
+        from vllm_hcu.v1.attention.ops.sparse_mla_workspace import resolve_workspace_factor
+        # Resolve once, before KV auto-fit can lower max_model_len.
+        resolve_workspace_factor(self)
+        return result
 
     setattr(
         model_config_class,
