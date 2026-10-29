@@ -918,7 +918,8 @@ def test_hcu_model_runner_v2_binds_router_while_worker_weight_pool_is_active(
 
     class UpstreamGPUModelRunner:
         def __init__(self, vllm_config, device):
-            del vllm_config, device
+            self.vllm_config = vllm_config
+            del device
             self.model = None
 
         def load_model(self, load_dummy_weights=False):

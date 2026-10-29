@@ -7054,3 +7054,26 @@ def test_channel_fp8_auto_experts_share_identical_marlin_layouts(
     reloaded.process_weights_after_loading(raw_layer(layer))
     assert reloaded.ll_experts._deepgemm_w13 is layer.w13_weight
     assert torch.equal(layer.w13_weight, pack(w13))
+
+
+def test_deepep_ll_cleanup_runs_once_per_forward(monkeypatch: pytest.MonkeyPatch):
+    import vllm.forward_context as fc
+
+    from vllm_hcu.model_executor.layers.fused_moe import deepep_runtime
+
+    buffer_a, buffer_b = object(), object()
+    contexts = [SimpleNamespace(), SimpleNamespace()]
+    current = {"ctx": contexts[0]}
+    monkeypatch.setattr(fc, "is_forward_context_available", lambda: True)
+    monkeypatch.setattr(fc, "get_forward_context", lambda: current["ctx"])
+
+    claim = deepep_runtime._claim_ll_buffer_cleanup
+    assert claim(buffer_a) is True
+    assert claim(buffer_a) is False
+    assert claim(buffer_b) is True
+    current["ctx"] = contexts[1]
+    assert claim(buffer_a) is True
+
+    monkeypatch.setattr(fc, "is_forward_context_available", lambda: False)
+    assert claim(buffer_a) is True
+    assert claim(buffer_a) is True

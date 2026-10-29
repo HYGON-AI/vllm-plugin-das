@@ -89,3 +89,22 @@ def skinny_linear(x: torch.Tensor, weight: torch.Tensor) -> torch.Tensor:
         x2, weight, out, M, N, K, BM=BM, BN=BN, BK=_BK, num_warps=nw, num_stages=1
     )
     return out.reshape(*x.shape[:-1], N)
+
+
+def enable_for_model(model: torch.nn.Module | None) -> int:
+    """Opt every LogitsProcessor in ``model`` into the skinny lm_head GEMM.
+
+    DeepSeek V4 decodes with M <= 64 rows per rank against a 129280-row head:
+    the target lm_head and the DSpark draft head (base logits plus the
+    per-position K=256 Markov bias) all hit hipBLASLt's 256x256 tile.
+    """
+    from vllm.model_executor.layers.logits_processor import LogitsProcessor
+
+    if model is None:
+        return 0
+    count = 0
+    for module in model.modules():
+        if isinstance(module, LogitsProcessor):
+            module._step5_skinny_lm_head = True
+            count += 1
+    return count
