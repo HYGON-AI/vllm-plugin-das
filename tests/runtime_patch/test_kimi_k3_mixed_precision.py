@@ -570,3 +570,29 @@ def test_fused_qkv_refresh_preserves_storage_and_updates_values():
     assert projection._fused_qkv.weight_scale.data_ptr() == scale_ptr
     assert projection._fused_qkv.weight[:2].eq(7).all()
     assert projection._fused_qkv.weight_scale[2:4].eq(3).all()
+
+
+def test_fused_qkv_defers_refresh_until_layerwise_reload_finishes():
+    projection = KimiK3MixedKDAProjection.__new__(KimiK3MixedKDAProjection)
+    nn.Module.__init__(projection)
+    projection._fused_refresh_deferred = False
+    projection._fused_qkv = SimpleNamespace(weight=torch.zeros(6, 4, dtype=torch.int8), weight_scale=torch.zeros(6, 1))
+    for name in ('q_proj', 'k_proj', 'v_proj'):
+        layer = nn.Module()
+        layer.weight = nn.Parameter(torch.empty((2, 4), dtype=torch.int8, device='meta'), requires_grad=False)
+        layer.weight_scale = nn.Parameter(torch.empty((2, 1), device='meta'), requires_grad=False)
+        setattr(projection, name, layer)
+    projection.q_proj.weight.weight_loader = lambda param, tensor: None
+    projection.load_branch('q_proj', 'weight', torch.ones((2, 4), dtype=torch.int8))
+    assert projection._fused_refresh_deferred
+    for layer in (projection.q_proj, projection.k_proj, projection.v_proj):
+        layer.weight = nn.Parameter(torch.ones((2, 4), dtype=torch.int8), requires_grad=False)
+        layer.weight_scale = nn.Parameter(torch.ones((2, 1)), requires_grad=False)
+    projection.q_proj.weight.weight_loader = lambda param, tensor: param.data.copy_(tensor)
+    projection.load_branch('q_proj', 'weight', torch.full((2, 4), 2, dtype=torch.int8))
+    assert projection._fused_qkv.weight.eq(0).all()
+    ptr = projection._fused_qkv.weight.data_ptr()
+    projection.refresh_fused_qkv()
+    assert projection._fused_qkv.weight.data_ptr() == ptr
+    assert projection._fused_qkv.weight[:2].eq(2).all()
+    assert not projection._fused_refresh_deferred

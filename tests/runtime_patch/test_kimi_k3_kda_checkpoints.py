@@ -63,15 +63,16 @@ def test_chunk_budget_keeps_existing_boundary_rules():
 
 @pytest.mark.parametrize("dim_first", [True, False])
 def test_conv_checkpoints_survive_final_state_update(monkeypatch, dim_first):
-    monkeypatch.setattr(kda, "is_conv_state_dim_first", lambda: dim_first)
     metadata = SimpleNamespace(nums_dict={kda.CHECKPOINT_KEY: kda.Checkpoints(
         torch.tensor([2, 4]), torch.tensor([1, 3]), (64, 192), (64, 192))})
     raw = torch.arange(3 * 256, dtype=torch.float32).reshape(3, 256)
     states = torch.full((6, 3, 4) if dim_first else (6, 4, 3), -1.0)
-    kda.save_conv_checkpoints(raw, states, metadata)
+    view = states if dim_first else states.transpose(-1, -2)
+    kda.save_conv_checkpoints(raw, view, metadata)
     raw_second = raw + 1000
     states_second = torch.full_like(states, -1.0)
-    kda.save_conv_checkpoints(raw_second, states_second, metadata)
+    view_second = states_second if dim_first else states_second.transpose(-1, -2)
+    kda.save_conv_checkpoints(raw_second, view_second, metadata)
     states[2].fill_(1000)  # The conv kernel may overwrite a reserved slot.
     states[4].fill_(2000)
     states[5].fill_(3000)
@@ -84,8 +85,7 @@ def test_conv_checkpoints_survive_final_state_update(monkeypatch, dim_first):
     assert states[0].eq(-1).all()
 
 
-def test_finalization_does_not_replay_previous_layer_snapshots(monkeypatch):
-    monkeypatch.setattr(kda, "is_conv_state_dim_first", lambda: True)
+def test_finalization_does_not_replay_previous_layer_snapshots():
     payload = kda.Checkpoints(torch.tensor([1]), torch.tensor([0]), (4,), (4,))
     metadata = SimpleNamespace(nums_dict={kda.CHECKPOINT_KEY: payload})
     first_conv = torch.zeros((2, 1, 2))

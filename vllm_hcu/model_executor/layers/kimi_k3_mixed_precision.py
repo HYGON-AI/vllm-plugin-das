@@ -42,6 +42,7 @@ class KimiK3MixedKDAProjection(nn.Module):
             quant_config=None, prefix=f"{prefix}.fp_gate", **kwargs)
         self._fuse_qkv = os.environ.get("VLLM_HCU_KIMI_KDA_FUSE_QKV", "0") == "1"
         self._fused_qkv = None
+        self._fused_refresh_deferred = False
 
     @property
     def weight(self):
@@ -112,6 +113,7 @@ class KimiK3MixedKDAProjection(nn.Module):
         with torch.no_grad():
             torch.cat([x.weight for x in layers], dim=axis, out=fused.weight)
             torch.cat([x.weight_scale for x in layers], dim=0, out=fused.weight_scale)
+        self._fused_refresh_deferred = False
 
     def load_branch(self, branch, suffix, tensor):
         if branch in ("q_proj", "k_proj", "v_proj"):
@@ -123,7 +125,12 @@ class KimiK3MixedKDAProjection(nn.Module):
                 raise TypeError(f"{branch}.weight_scale must be FP32")
             param = getattr(getattr(self, branch), suffix)
             param.weight_loader(param, tensor)
-            self.refresh_fused_qkv()
+            layers = (self.q_proj, self.k_proj, self.v_proj)
+            if any(getattr(layer, name).is_meta for layer in layers
+                   for name in ("weight", "weight_scale")):
+                self._fused_refresh_deferred = True
+            elif not self._fused_refresh_deferred:
+                self.refresh_fused_qkv()
             return f"{branch}.{suffix}"
         if suffix != "weight" or not tensor.is_floating_point():
             raise ValueError(f"K3 floating gate requires {branch}.weight")
