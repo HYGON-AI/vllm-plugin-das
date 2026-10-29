@@ -28,6 +28,7 @@ from vllm_hcu.patch.worker.framework_opt import (
     patch_base_device_communicator,
     patch_cuda_communicator,
     patch_dp_utils,
+    patch_draft_dummy_dp_uniform,
     patch_draft_speculator_inputs,
     patch_eagle_utils,
     patch_eplb_communicator,
@@ -1903,6 +1904,65 @@ class _Buffer:
         self.size = size
 
 
+def test_draft_dummy_propose_reuses_agreed_dp_uniform_count():
+    seen = []
+
+    def get_uniform_decode_token_count(num_reqs, num_tokens, max_query_len, has_prefill):
+        return -1  # local recompute that disagrees with the DP agreement
+
+    class AutoRegressiveSpeculator:
+        def propose(
+            self,
+            input_batch,
+            attn_metadata,
+            slot_mappings,
+            last_hidden_states,
+            aux_hidden_states,
+            num_sampled,
+            num_rejected,
+            last_sampled,
+            next_prefill_tokens,
+            temperature,
+            seeds,
+            dp_sync=None,
+            dummy_run=False,
+            skip_attn_for_dummy_run=False,
+            mm_inputs=None,
+            is_profile=False,
+        ):
+            seen.append(module.get_uniform_decode_token_count(1, 8, 8, False))
+            return "out"
+
+    module = _module(
+        patch_draft_dummy_dp_uniform.TARGET_MODULE,
+        AutoRegressiveSpeculator=AutoRegressiveSpeculator,
+        get_uniform_decode_token_count=get_uniform_decode_token_count,
+    )
+    assert patch_draft_dummy_dp_uniform.apply_to_module(module) is True
+    assert patch_draft_dummy_dp_uniform.apply_to_module(module) is False
+
+    obj = AutoRegressiveSpeculator()
+    args = (None,) * 11
+    sync = SimpleNamespace(uniform_token_count=4)
+
+    # Dummy run with a DP sync (keyword and positional): agreed value is used.
+    assert obj.propose(*args, dp_sync=sync, dummy_run=True) == "out"
+    assert obj.propose(*args, sync, True) == "out"
+    # Agreed "not uniform" is passed through as None as well.
+    obj.propose(*args, dp_sync=SimpleNamespace(uniform_token_count=None), dummy_run=True)
+    assert seen == [4, 4, None]
+    # The module-level function is restored afterwards.
+    assert module.get_uniform_decode_token_count is get_uniform_decode_token_count
+
+    # Real runs and dummy runs without a DP sync keep the local computation.
+    seen.clear()
+    obj.propose(*args, dp_sync=sync, dummy_run=False)
+    obj.propose(*args, dp_sync=None, dummy_run=True)
+    obj.propose(*args)
+    assert seen == [-1, -1, -1]
+
+
+
 def _fake_proposer_module() -> ModuleType:
     class SpecDecodeBaseProposer:
         def __init__(
@@ -2869,7 +2929,8 @@ assert target_file.is_relative_to(target_root), (
 print('VLLM_SOURCE', vllm.__file__)
 from vllm_hcu.patch.worker.framework_opt import (
     patch_all2all, patch_base_device_communicator, patch_cuda_communicator,
-    patch_dp_utils, patch_draft_speculator_inputs, patch_eagle_utils,
+    patch_dp_utils, patch_draft_dummy_dp_uniform, patch_draft_speculator_inputs,
+    patch_eagle_utils,
     patch_forward_context,
     patch_gpu_ubatch_wrapper, patch_llm_base_proposer, patch_pynccl,
     patch_pynccl_wrapper, patch_ubatch_utils,
@@ -2878,6 +2939,7 @@ adapters = (
     patch_all2all, patch_base_device_communicator, patch_forward_context,
     patch_llm_base_proposer, patch_dp_utils,
     patch_draft_speculator_inputs,
+    patch_draft_dummy_dp_uniform,
     patch_eagle_utils,
     patch_gpu_ubatch_wrapper, patch_ubatch_utils,
 )
