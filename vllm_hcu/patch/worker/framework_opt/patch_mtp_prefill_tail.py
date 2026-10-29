@@ -9,10 +9,13 @@ tokens at the end of each request's query, module k's KV is exact for the last
 N - k * (W - 1) positions, so the last token's drafts and every later query
 (next chunk or decode) see exactly what a full run would have written.  Shorter
 queries (decode, small chunks) are untouched.
+For differing windows, retain 1 + sum(W - 1) across executed modules, counting
+reused modules on every invocation.
 
 HCU_MTP_PREFILL_TAIL=N enables it (0, the default, disables).  Requires
-prefix caching off: a cached block's MTP slots outside every chunk tail were
-never written.  Not a VLLM_HCU_* name: eager-only, no compile-hash change.
+prefix caching off and a finite sliding window in every executed MTP layer:
+a cached block's MTP slots outside every chunk tail were never written.
+Not a VLLM_HCU_* name: eager-only, no compile-hash change.
 """
 
 from __future__ import annotations
@@ -46,6 +49,47 @@ _TAIL = (
 )
 
 
+def _mtp_tail_required_tokens(self) -> int | None:
+    """Bound dependencies of the exact modules selected by Step5's MTP loop."""
+    hf = self.draft_model_config.hf_text_config
+    predictor = getattr(getattr(self, "model", None), "model", None)
+    start = getattr(predictor, "mtp_start_layer_idx", None)
+    count = getattr(predictor, "num_mtp_layers", None)
+    steps = self.num_speculative_steps
+    layer_types = getattr(hf, "layer_types_with_mtp", None)
+    if (
+        type(start) is not int or start < 0
+        or type(count) is not int or count <= 0
+        or type(steps) is not int or steps <= 0
+        or start != getattr(hf, "num_hidden_layers", None)
+        or count != getattr(hf, "num_nextn_predict_layers", None)
+        or not isinstance(layer_types, (list, tuple))
+        or len(layer_types) < start + count
+    ):
+        return None
+    layers = getattr(predictor, "layers", None)
+    need = 1
+    for step in range(steps):
+        # Step5MultiTokenPredictor._layer reuses modules modulo their count.
+        # Count repeated windows again: each invocation expands dependencies.
+        idx = start + step % count
+        if layer_types[idx] != "sliding_attention":
+            return None
+        try:
+            layer = layers[str(idx)]
+        except (KeyError, IndexError, TypeError):
+            return None
+        attention = getattr(
+            getattr(getattr(layer, "mtp_block", None), "self_attn", None),
+            "attn", None,
+        )
+        window = getattr(attention, "sliding_window", None)
+        if type(window) is not int or window <= 0:
+            return None
+        need += window - 1
+    return need
+
+
 def _tail_enabled(self) -> bool:
     if not henvs.custom_ops_enabled():
         return False
@@ -59,17 +103,14 @@ def _tail_enabled(self) -> bool:
         cache_config = self.vllm_config.cache_config
         ok = _TAIL > 0 and not cache_config.enable_prefix_caching
         if ok:
-            hf = self.draft_model_config.hf_text_config
-            window = getattr(hf, "sliding_window", None)
-            need = self.num_speculative_steps * (window - 1) + 1 if window else None
+            need = _mtp_tail_required_tokens(self)
             if need is None or _TAIL < need:
                 from vllm.logger import init_logger
 
                 init_logger(__name__).warning(
-                    "HCU_MTP_PREFILL_TAIL=%d ignored: drafter sliding window %s "
-                    "needs >= %s",
+                    "HCU_MTP_PREFILL_TAIL=%d ignored: executed MTP layers must "
+                    "all have finite sliding windows and require >= %s tokens",
                     _TAIL,
-                    window,
                     need,
                 )
                 ok = False
