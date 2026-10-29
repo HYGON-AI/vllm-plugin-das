@@ -188,6 +188,6 @@ Update the compatibility lock to the current three-way SHAs, wheel hashes, comma
 
 Expected: all executed required rows pass; unexecuted model/accuracy/performance acceptance rows remain explicitly pending rather than inheriting old results.
 
-- [ ] **Step 7: Commit**
+- [x] **Step 7: Commit**
 
 Commit: `test(vllm032): record upstream takeover and graph evidence`
