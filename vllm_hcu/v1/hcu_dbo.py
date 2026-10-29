@@ -445,13 +445,27 @@ def _patch_dsa() -> None:
 
     def schedule(self, md):
         if not dbo_enabled():
+            # An unsplit forward starts a separate cache lifetime. Do not keep
+            # microbatch metadata/tensors alive or carry its active cache into
+            # a later split forward.
+            self.__dict__.pop("_hcu_dbo_sched", None)
+            self.__dict__.pop("_hcu_dbo_cache_uid", None)
             return orig_schedule(self, md)
         uid = dbo_current_ubatch_id()
         per_ub = self.__dict__.get("_hcu_dbo_sched")
         if per_ub is None:
             per_ub = self._hcu_dbo_sched = [None, None]
+        previous_uid = self.__dict__.get("_hcu_dbo_cache_uid")
+        if previous_uid is not None and per_ub[previous_uid] is not None:
+            previous = per_ub[previous_uid]
+            # Step4Indexer.run resets step_cache *after* schedule() on the
+            # first DSA layer. Save the actual dict at the next handoff rather
+            # than retaining the empty dict installed before that reset.
+            per_ub[previous_uid] = (previous[0], previous[1], self.step_cache)
         hit = per_ub[uid]
         if hit is not None and hit[0] is md:
+            self.step_cache = hit[2]
+            self._hcu_dbo_cache_uid = uid
             return hit[1]
         if md.schedule is not None or md.num_prefills == 0:
             raise RuntimeError(
@@ -476,7 +490,9 @@ def _patch_dsa() -> None:
             if main is not None and main is not sched:
                 main.completed_slots.extend(sched.completed_slots)
                 sched.completed_slots = []
-        per_ub[uid] = (md, sched)
+        self.step_cache = {}
+        per_ub[uid] = (md, sched, self.step_cache)
+        self._hcu_dbo_cache_uid = uid
         return sched
 
     schedule._hcu_dbo = True
