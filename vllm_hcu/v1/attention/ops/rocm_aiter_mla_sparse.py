@@ -908,6 +908,7 @@ def rocm_fp8_paged_mqa_logits(
     *,
     force_aiter_triton: bool = False,
     kcache_layout: str = "preshuffle",
+    clean_logits: bool = True,
 ) -> torch.Tensor:
     """Compute FP8 MQA logits using paged KV-cache.
 
@@ -929,6 +930,8 @@ def rocm_fp8_paged_mqa_logits(
         kcache_layout: Page layout of gfx938 caches with block_size > 1:
             "preshuffle" (16x16 tiles) or "normal" (token-major). "normal"
             is rejected on other platforms.
+        clean_logits: Whether positions past each row's context end must be
+            -inf.  Only the gfx938 direct reader honors False.
 
     Returns:
         Logits tensor of shape [B * next_n, max_model_len], dtype
@@ -1040,6 +1043,7 @@ def rocm_fp8_paged_mqa_logits(
             context_lens,
             block_tables,
             max_model_len,
+            fill_tail=clean_logits,
         )
 
     aiter_paged_mqa_logits_module = None
@@ -1944,6 +1948,10 @@ def rocm_aiter_sparse_attn_indexer_native(
             decode_metadata.block_table,
             decode_metadata.schedule_metadata,
             max_model_len=max_model_len,
+            # Both decode top-k selectors bound each row by its end.  The DCP
+            # merge gathers scores only at those selected indices, so no
+            # decode consumer reads the unwritten tail.
+            clean_logits=False,
         )
 
         # A padded decode batch has more kernel rows than actual decode
