@@ -391,6 +391,38 @@ def test_async_engine_args_accepts_swa_bounded_replay():
     assert default_args.swa_bounded_replay is True
 
 
+def test_mega_moe_replay_buffers_use_int64_on_029_alias():
+    from vllm_hcu.patch.worker.core_fix import decoder_replay_cudagraph as m
+
+    # Import may leave NATIVE_MEGA_MOE_BACKENDS empty on 0.29; the alias must
+    # still select int64 input-id buffers for MegaMoE replay graphs.
+    assert "deep_gemm_mega_moe" in m._MEGA_MOE_INPUT_ID_BACKENDS
+
+
+def test_compilation_config_owns_replay_capture_size_list():
+    from types import ModuleType
+
+    from vllm_hcu.patch.platform.core_fix import patch_decoder_replay_compilation
+
+    module = ModuleType(patch_decoder_replay_compilation.TARGET_MODULE)
+
+    class CompilationConfig:
+        def __init__(self, **kwargs):
+            for key, value in kwargs.items():
+                setattr(self, key, value)
+
+    module.CompilationConfig = CompilationConfig
+    assert patch_decoder_replay_compilation.apply_to_module(module) is True
+
+    a = module.CompilationConfig()
+    b = module.CompilationConfig()
+    assert a.decoder_replay_cudagraph_capture_sizes == []
+    assert b.decoder_replay_cudagraph_capture_sizes == []
+    a.decoder_replay_cudagraph_capture_sizes.append(256)
+    assert b.decoder_replay_cudagraph_capture_sizes == []
+    assert a.decoder_replay_cudagraph_capture_sizes == [256]
+
+
 def test_pad_replayed_slots_pads_cacheable_groups_only():
     from vllm.v1.attention.backends.utils import PAD_SLOT_ID
 

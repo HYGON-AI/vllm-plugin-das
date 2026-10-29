@@ -43,10 +43,18 @@ def _coerce_field(name: str, value: Any) -> Any:
 
 
 def _ensure_fields(compilation_config: object) -> None:
+    # List defaults are installed on the class as a shared sentinel; always
+    # materialize a per-instance copy so one engine cannot mutate another's.
+    instance_dict = getattr(compilation_config, "__dict__", None)
     for name, default in _DEFAULTS.items():
+        if isinstance(default, list):
+            if instance_dict is None or name not in instance_dict:
+                current = getattr(compilation_config, name, None)
+                value = list(current) if isinstance(current, list) else list(default)
+                object.__setattr__(compilation_config, name, value)
+            continue
         if not hasattr(compilation_config, name):
-            value = list(default) if isinstance(default, list) else default
-            object.__setattr__(compilation_config, name, value)
+            object.__setattr__(compilation_config, name, default)
 
 
 def _pop_replay_kwargs(kwargs: dict[str, Any]) -> dict[str, Any]:

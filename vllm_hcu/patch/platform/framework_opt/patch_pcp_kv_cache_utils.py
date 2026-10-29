@@ -66,9 +66,6 @@ def apply_to_module(module: ModuleType) -> bool:
     @functools.wraps(original)
     def hcu_resolve_kv_cache_block_sizes(kv_cache_config, vllm_config):
         parallel_config = vllm_config.parallel_config
-        cache_config = vllm_config.cache_config
-        dcp = parallel_config.decode_context_parallel_size
-        groups = kv_cache_config.kv_cache_groups
         pcp = parallel_config.prefill_context_parallel_size
 
         # Upstream gcd is over prefix_cacheable groups only. SWA bounded
@@ -76,10 +73,16 @@ def apply_to_module(module: ModuleType) -> bool:
         # hash unit above a still-cached smaller group's block size and trip
         # ``assert block_size % hash_block_size == 0`` in resolve_block_hashes.
         # Always shrink the hash unit so every group block size divides it.
+        #
+        # Delegate PCP=1 before touching kv_cache_groups so opaque / minimal
+        # configs (and unit tests) still pass through to ``original``.
         if pcp == 1:
             scheduler_block_size, hash_block_size = original(
                 kv_cache_config, vllm_config
             )
+            cache_config = vllm_config.cache_config
+            dcp = parallel_config.decode_context_parallel_size
+            groups = getattr(kv_cache_config, "kv_cache_groups", None) or ()
             if (
                 len(groups) > 1
                 and bool(getattr(cache_config, "enable_prefix_caching", False))
@@ -96,6 +99,10 @@ def apply_to_module(module: ModuleType) -> bool:
                 ):
                     hash_block_size = math.gcd(hash_block_size, *group_block_sizes)
             return scheduler_block_size, hash_block_size
+
+        cache_config = vllm_config.cache_config
+        dcp = parallel_config.decode_context_parallel_size
+        groups = kv_cache_config.kv_cache_groups
 
         if len(groups) <= 1:
             block_size = cache_config.block_size * dcp

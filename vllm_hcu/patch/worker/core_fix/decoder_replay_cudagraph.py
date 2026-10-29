@@ -29,6 +29,12 @@ try:
 except ImportError:  # pragma: no cover - missing on 0.29.1rc0.dev283
     NATIVE_MEGA_MOE_BACKENDS = ()
 
+# 0.29 may omit NATIVE_MEGA_MOE_BACKENDS while still shipping MegaMoE; the
+# patched DeepseekV4Model.forward casts input_ids to int64 for this backend.
+_MEGA_MOE_INPUT_ID_BACKENDS = frozenset(NATIVE_MEGA_MOE_BACKENDS) | {
+    "deep_gemm_mega_moe",
+}
+
 
 class DecoderReplayCudaGraphManager(CudaGraphManager):
     """Breakable PIECEWISE graphs of the replay layers keyed by the replay batch's
@@ -72,8 +78,11 @@ class DecoderReplayCudaGraphManager(CudaGraphManager):
         # DeepseekV4Model.forward casts input_ids to int64 for native MegaMoE only.
         kernel_config = getattr(vllm_config, "kernel_config", None)
         moe_backend = getattr(kernel_config, "moe_backend", None)
-        native = bool(NATIVE_MEGA_MOE_BACKENDS) and moe_backend in NATIVE_MEGA_MOE_BACKENDS
-        ids = torch.int64 if native else torch.int32
+        ids = (
+            torch.int64
+            if moe_backend in _MEGA_MOE_INPUT_ID_BACKENDS
+            else torch.int32
+        )
         # hidden_states, positions, input_ids, pre_mix, post_mix, res_mix, residual
         shapes = [(h,), (), (), (hc,), (hc, 1), (hc, hc), (hc, h)]
         dtypes = [act, torch.int64, ids, f32, f32, f32, act]
