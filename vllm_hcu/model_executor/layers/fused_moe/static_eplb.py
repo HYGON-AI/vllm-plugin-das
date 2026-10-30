@@ -505,6 +505,51 @@ def _expert_storage_key(weight: torch.Tensor) -> tuple[object, ...]:
     )
 
 
+def _resolve_static_eplb_owner(model: torch.nn.Module):
+    """Match Step5's static preload owner to its normal runtime EPLB owner."""
+    from vllm.model_executor.models.interfaces import (
+        get_mixture_of_experts_model,
+        is_mixture_of_experts,
+    )
+
+    if is_mixture_of_experts(model):
+        return model
+    # Only these already-constructed Step5 classes need special handling.
+    # A similarly named foreign class must not silently bypass validation.
+    if type(model).__name__ == "Step5MTP":
+        from vllm_hcu.models.step5_mtp import Step5MTP
+
+        if (
+            isinstance(model, Step5MTP)
+            and getattr(model, "is_dense_mtp", None) is True
+            and type(getattr(model, "num_moe_layers", None)) is int
+            and getattr(model, "num_moe_layers", None) == 0
+            and not tuple(getattr(model, "moe_layers", (None,)))
+            and all(
+                type(getattr(model, name, None)) is int
+                and getattr(model, name, None) == 0
+                for name in (
+                    "num_logical_experts",
+                    "num_physical_experts",
+                    "num_local_physical_experts",
+                    "num_routed_experts",
+                    "num_redundant_experts",
+                    "num_shared_experts",
+                )
+            )
+        ):
+            return None
+    if type(model).__name__ == "Step5ForConditionalGeneration":
+        from vllm_hcu.models.step5_text import Step5ForCausalLM
+        from vllm_hcu.models.step5_vl import Step5ForConditionalGeneration
+
+        if isinstance(model, Step5ForConditionalGeneration):
+            owner = get_mixture_of_experts_model(model)
+            if isinstance(owner, Step5ForCausalLM) and is_mixture_of_experts(owner):
+                return owner
+    raise ValueError("Static EPLB requires a current MixtureOfExperts model")
+
+
 def bind_static_eplb_plan(
     vllm_config: object,
     model: torch.nn.Module,
@@ -519,14 +564,17 @@ def bind_static_eplb_plan(
     from vllm.model_executor.layers.fused_moe.routed_experts import (
         RoutedExperts,
     )
-    from vllm.model_executor.models.interfaces import is_mixture_of_experts
-
     from vllm_hcu.patch.config import bind_hcu_eplb_config
 
     bind_hcu_eplb_config(vllm_config)
     parallel_config = getattr(vllm_config, "parallel_config", None)
     path = getattr(parallel_config, "_vllm_hcu_expert_map_path", None)
     if not path:
+        return None
+    model = _resolve_static_eplb_owner(model)
+    if model is None:
+        # A dense Step5 drafter can retain the target's HCU map sidecar while
+        # its own parallel config correctly disables EP and EPLB.
         return None
     if not getattr(parallel_config, "enable_eplb", False) or not getattr(
         parallel_config,
@@ -536,9 +584,6 @@ def bind_static_eplb_plan(
         raise ValueError("Static EPLB requires EPLB and expert parallel")
     if getattr(parallel_config, "enable_ep_weight_filter", False):
         raise ValueError("Static EPLB cannot use the upstream EP weight filter")
-    if not is_mixture_of_experts(model):
-        raise ValueError("Static EPLB requires a current MixtureOfExperts model")
-
     layers = tuple(model.moe_layers)
     if not layers:
         raise ValueError("Static EPLB found no local MoE layers")
