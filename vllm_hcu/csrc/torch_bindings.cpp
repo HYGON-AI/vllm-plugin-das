@@ -34,9 +34,6 @@ TORCH_LIBRARY_EXPAND(TORCH_EXTENSION_NAME, ops) {
           "Tensor(a!) dst, Tensor descriptors) -> ()");
   ops.impl("cp_gather_and_upconvert_fp8_kv_cache_pages", torch::kCUDA,
            &cp_gather_and_upconvert_fp8_kv_cache_pages);
-  ops.def("hipblaslt_fp8_bmm(Tensor x, Tensor weight, Tensor x_scale, "
-          "Tensor weight_scale, Tensor(a!) out) -> ()");
-  ops.impl("hipblaslt_fp8_bmm", torch::kCUDA, &hipblaslt_fp8_bmm);
   ops.def("init_custom_ar(int[] ipc_tensors, Tensor rank_data, int rank, bool fully_connected) -> int");
   ops.impl("init_custom_ar", torch::kCUDA, &init_custom_ar);
   ops.def("all_reduce(int fa, Tensor inp, Tensor! out, int reg_buffer, int reg_buffer_sz_bytes) -> ()");
