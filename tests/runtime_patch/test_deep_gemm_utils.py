@@ -12,6 +12,8 @@ from types import ModuleType, SimpleNamespace
 import pytest
 import torch
 
+from vllm_hcu.platforms import envs as henvs
+
 
 def _install_categorized_lightop(
     monkeypatch,
@@ -140,6 +142,7 @@ def _load_deep_gemm_apply():
         "nullcontext": nullcontext,
         "_HCU_HT_EP_TOKEN_ALIGNMENT": 256,
         "_EP_FUSED_MOE": False,
+        "henvs": henvs,
         "compute_aligned_M_and_alignment": lambda **_kwargs: (2, 256),
         "get_mk_alignment_for_contiguous_layout": lambda: (128, 128),
         "_resize_cache": lambda tensor, shape: torch.zeros(
@@ -157,6 +160,98 @@ def _load_deep_gemm_apply():
     }
     exec(compile(ast.fix_missing_locations(module), source_path, "exec"), namespace)
     return namespace
+
+
+def test_valid_deep_gemm_accepts_gfx938_pair32_weights():
+    source_path = (
+        Path(__file__).parents[2]
+        / "vllm_hcu/model_executor/layers/fused_moe/experts/deep_gemm_moe.py"
+    )
+    tree = ast.parse(source_path.read_text(encoding="utf-8"))
+    function = next(
+        node
+        for node in tree.body
+        if isinstance(node, ast.FunctionDef) and node.name == "_valid_deep_gemm"
+    )
+    module = ast.Module(body=[function], type_ignores=[])
+    namespace = {
+        "torch": torch,
+        "has_deep_gemm": lambda: True,
+        "logger": SimpleNamespace(debug_once=lambda *_args: None),
+    }
+    exec(compile(ast.fix_missing_locations(module), source_path, "exec"), namespace)
+    assert namespace["_valid_deep_gemm"](
+        torch.empty((131072, 4096), device="meta"),
+        torch.empty((22, 64, 96, 2, 4, 16, 16), device="meta"),
+        torch.empty((22, 24, 128, 2, 4, 16, 16), device="meta"),
+    )
+
+
+def _load_deep_gemm_problem_size():
+    source_path = (
+        Path(__file__).parents[2]
+        / "vllm_hcu/model_executor/layers/fused_moe/experts/deep_gemm_moe.py"
+    )
+    tree = ast.parse(source_path.read_text(encoding="utf-8"))
+    experts = next(
+        node
+        for node in tree.body
+        if isinstance(node, ast.ClassDef) and node.name == "DeepGemmExperts"
+    )
+    function = next(
+        node
+        for node in experts.body
+        if isinstance(node, ast.FunctionDef) and node.name == "moe_problem_size"
+    )
+    module = ast.Module(body=[function], type_ignores=[])
+    namespace = {
+        "torch": torch,
+        "current_platform": SimpleNamespace(is_rocm=lambda: True),
+    }
+    exec(compile(ast.fix_missing_locations(module), source_path, "exec"), namespace)
+    return namespace["moe_problem_size"]
+
+
+def test_hcu_problem_size_uses_logical_dimensions_for_gfx938_pair32_weights():
+    problem_size = _load_deep_gemm_problem_size()
+    experts = SimpleNamespace(_hcu_logical_n=3072, _hcu_logical_k=4096)
+    assert problem_size(
+        experts,
+        torch.empty((131072, 4096), device="meta"),
+        torch.empty((22, 64, 96, 2, 4, 16, 16), device="meta"),
+        torch.empty((22, 24, 128, 2, 4, 16, 16), device="meta"),
+        torch.empty((131072, 8), dtype=torch.int32, device="meta"),
+    ) == (22, 131072, 3072, 4096, 8)
+
+
+def test_generic_problem_size_understands_gfx938_pair32_weights():
+    source_path = (
+        Path(__file__).parents[2]
+        / "vllm_hcu/model_executor/layers/fused_moe/modular_kernel.py"
+    )
+    tree = ast.parse(source_path.read_text(encoding="utf-8"))
+    experts = next(
+        node
+        for node in tree.body
+        if isinstance(node, ast.ClassDef)
+        and node.name == "FusedMoEExpertsModular"
+    )
+    function = next(
+        node
+        for node in experts.body
+        if isinstance(node, ast.FunctionDef) and node.name == "moe_problem_size"
+    )
+    module = ast.Module(body=[function], type_ignores=[])
+    namespace = {"torch": torch}
+    exec(compile(ast.fix_missing_locations(module), source_path, "exec"), namespace)
+    problem_size = namespace["moe_problem_size"]
+    assert problem_size(
+        object(),
+        torch.empty((131072, 4096), device="meta"),
+        torch.empty((22, 64, 96, 2, 4, 16, 16), device="meta"),
+        torch.empty((22, 24, 128, 2, 4, 16, 16), device="meta"),
+        torch.empty((131072, 8), dtype=torch.int32, device="meta"),
+    ) == (22, 131072, 3072, 4096, 8)
 
 
 def _run_w8a8_apply(
@@ -179,12 +274,12 @@ def _run_w8a8_apply(
         output=torch.empty((2, logical_k)),
         hidden_states=torch.zeros((2, logical_k), dtype=torch.int8),
         w1=(
-            torch.zeros((1, 1, 1, 4, 16, 16), dtype=torch.int8)
+            torch.zeros((1, 1, 1, 2, 4, 16, 16), dtype=torch.int8)
             if packed_weights
             else torch.zeros((1, 4, 4), dtype=torch.int8)
         ),
         w2=(
-            torch.zeros((1, 1, 4, 4, 16, 16), dtype=torch.int8)
+            torch.zeros((1, 1, 4, 2, 4, 16, 16), dtype=torch.int8)
             if packed_weights
             else torch.zeros((1, 4, 4), dtype=torch.int8)
         ),
@@ -272,8 +367,8 @@ def test_w8a8_apply_uses_deepgemm_contiguous_api(
     assert len(calls) == 2
     assert tuple(calls[0][0][0].shape) == (2, 64)
     assert tuple(calls[1][0][0].shape) == (2, 8)
-    assert tuple(calls[0][1][0].shape) == (1, 1, 1, 4, 16, 16)
-    assert tuple(calls[1][1][0].shape) == (1, 1, 4, 4, 16, 16)
+    assert tuple(calls[0][1][0].shape) == (1, 1, 1, 2, 4, 16, 16)
+    assert tuple(calls[1][1][0].shape) == (1, 1, 4, 2, 4, 16, 16)
     assert tuple(calls[0][2].shape) == (2, 16)
     assert tuple(calls[1][2].shape) == (2, 64)
     assert calls[0][3] is calls[1][3]

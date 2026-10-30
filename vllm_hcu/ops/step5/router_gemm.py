@@ -13,9 +13,12 @@ the partials in split order, so the result is deterministic and no memset or
 separate reduce kernel is needed. The per-tile counters reset themselves.
 """
 
+import os
+
 import torch
 
 from vllm.triton_utils import tl, triton
+from vllm_hcu.platforms import envs as henvs
 
 # (max M, (BM, BN, BK, SPLIT_K, num_warps, num_stages)), tuned on gfx938 for
 # K=4096, N=352. Only the last bucket may use SPLIT_K=1.
@@ -160,7 +163,12 @@ def router_gemm_bf16_fp32(x: torch.Tensor, weight: torch.Tensor) -> torch.Tensor
 # (max M, (BM, BN, BK, SPLIT_K, num_warps, num_stages)), tuned on gfx938 for
 # K=4096, router N=352, shared intermediate 384 per rank.
 _RSG_CONFIGS = ((64, (32, 64, 64, 8, 4, 2)),)
-RSG_MAX_M = _RSG_CONFIGS[-1][0]
+RSG_MAX_M = (
+    int(os.environ.get("HCU_STEP5_ROUTER_SHARED_MAX_M", "64"))
+    if henvs.custom_ops_enabled() else 0
+)
+if RSG_MAX_M not in (0, 16, 32, 64):
+    raise ValueError("HCU_STEP5_ROUTER_SHARED_MAX_M must be 0, 16, 32, or 64")
 
 _rsg_workspace: dict[torch.device, tuple[torch.Tensor, torch.Tensor]] = {}
 

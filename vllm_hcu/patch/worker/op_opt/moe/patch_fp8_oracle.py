@@ -5,7 +5,10 @@
 from __future__ import annotations
 
 import functools
+import os
 from types import ModuleType
+
+from vllm_hcu.platforms import envs as henvs
 
 from vllm_hcu.deepseek_v4_runtime import model_architectures
 from vllm_hcu.patch.config import HcuFeatureConfig, get_hcu_config
@@ -293,11 +296,14 @@ def apply_to_module(module: ModuleType) -> bool:
 
             from vllm_hcu.platforms import envs as henvs
 
+            from vllm_hcu.runtime_compat.step5 import is_step5_owner
+
             ep_fused = False
             if (
                 henvs.optional_custom_op_enabled(
                     os.environ.get("VLLM_HCU_EP_FUSED_MOE", "0") == "1"
                 )
+                and is_step5_owner(layer)
                 and fp8_backend == hcu_enum.DEEPGEMM
                 and w13_input_scale is None
                 and w2_input_scale is None
@@ -378,13 +384,22 @@ def apply_to_module(module: ModuleType) -> bool:
                 moe_config=moe_config,
                 routing_tables=routing_tables,
             )
-        return make_kernel(
+        kernel = make_kernel(
             moe_quant_config,
             moe_config,
             experts_cls,
             fp8_backend,
             routing_tables,
         )
+        if henvs.custom_ops_enabled() and os.environ.get(
+            "HCU_STEP5_DEEPEP_PROFILE_DBO_OUTPUT", "0"
+        ) == "1":
+            from vllm_hcu.model_executor.layers.fused_moe.deepep_runtime import (
+                configure_step5_ht_kernel,
+            )
+
+            configure_step5_ht_kernel(kernel, moe_quant_config, moe_config)
+        return kernel
 
     target._vllm_hcu_original_backend_to_kernel_cls = backend_to_cls
     target.backend_to_kernel_cls = hcu_backend_to_kernel_cls
