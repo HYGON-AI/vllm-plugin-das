@@ -32,6 +32,7 @@ def run_fake_runtime(
     weight_dtype: str = "bf16",
     residual_width: int | None = None,
     base_enabled: bool = False,
+    custom_ops: tuple[str, ...] | None = None,
 ) -> dict[str, object]:
     width = hidden_size if input_width is None else input_width
     residual_width = width if residual_width is None else residual_width
@@ -111,15 +112,24 @@ torch_utils = ModuleType("vllm.utils.torch_utils")
 
 oot = {{}}
 class RMSNorm:
+    name = "rms_norm"
+
     @classmethod
     def register_oot(cls, replacement):
         oot[cls.__name__] = replacement
+        replacement.name = cls.__name__
         events.append(["register_oot", replacement.__name__])
         return replacement
 
     @classmethod
     def enabled(cls):
         events.append(["base-enabled"])
+        custom_ops = {custom_ops!r}
+        if custom_ops is not None:
+            enabled = f"+{{cls.name}}" in custom_ops
+            disabled = f"-{{cls.name}}" in custom_ops
+            default_on = "all" in custom_ops
+            return (default_on or enabled) and not disabled
         return {base_enabled!r}
 
     def __init__(self):
@@ -323,6 +333,26 @@ def test_rmsnorm_stays_disabled_when_only_child_switch_is_enabled() -> None:
 
     assert report["effective_enabled"] is False
     assert report["result"] == "native-result"
+
+
+@pytest.mark.parametrize(
+    ("custom_ops", "expected"),
+    (
+        (("none", "+rms_norm"), True),
+        (("all", "-rms_norm"), False),
+    ),
+)
+def test_rmsnorm_oot_enablement_uses_official_registered_name(
+    custom_ops: tuple[str, ...],
+    expected: bool,
+) -> None:
+    report = run_fake_runtime(
+        master="0",
+        child="0",
+        custom_ops=custom_ops,
+    )
+
+    assert report["effective_enabled"] is expected
 
 
 @pytest.mark.parametrize("master", ("1", "0"))

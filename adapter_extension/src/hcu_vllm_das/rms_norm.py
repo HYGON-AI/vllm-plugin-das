@@ -132,4 +132,7 @@ class HcuRMSNorm(RMSNorm):
         return x, residual
 
 
+HcuRMSNorm.name = RMSNorm.name
+
+
 __all__ = ["HcuRMSNorm"]
