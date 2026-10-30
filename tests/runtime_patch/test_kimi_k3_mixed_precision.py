@@ -624,8 +624,8 @@ def test_fused_qkv_defers_refresh_until_layerwise_reload_finishes():
     assert not projection._fused_refresh_deferred
 
 
-def _fused_projection(monkeypatch):
-    monkeypatch.setenv('VLLM_HCU_KIMI_KDA_FUSE_QKV', '1')
+def _fused_projection(monkeypatch, fuse=True):
+    monkeypatch.setenv('VLLM_HCU_KIMI_KDA_FUSE_QKV', '1' if fuse else '0')
 
     class Method:
         def apply(self, layer, x, bias=None):
@@ -665,6 +665,18 @@ def test_fused_qkv_rejects_uva_offloaded_branches(monkeypatch):
     projection.q_proj.weight._vllm_is_uva_offloaded = True
     with pytest.raises(ValueError, match='incompatible with weight offloading'):
         projection._make_fused_qkv(5)
+
+
+@pytest.mark.parametrize('sleep,fuse,rejected', [(True, True, True), (True, False, False), (False, True, False)])
+def test_fused_qkv_sleep_mode_contract(monkeypatch, sleep, fuse, rejected):
+    from vllm.config import set_current_vllm_config
+    config = SimpleNamespace(model_config=SimpleNamespace(enable_sleep_mode=sleep))
+    with set_current_vllm_config(config):
+        if rejected:
+            with pytest.raises(ValueError, match='incompatible with sleep mode'):
+                _fused_projection(monkeypatch, fuse)
+        else:
+            assert _fused_projection(monkeypatch, fuse)._fuse_qkv is fuse
 
 
 def test_fused_qkv_rejects_prefetch_offloaded_branches(monkeypatch):

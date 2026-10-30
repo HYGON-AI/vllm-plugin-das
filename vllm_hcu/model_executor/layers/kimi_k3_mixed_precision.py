@@ -7,6 +7,7 @@ from types import SimpleNamespace
 
 import torch
 from torch import nn
+from vllm.config import get_current_vllm_config_or_none
 
 
 def _get_offloader():
@@ -65,6 +66,15 @@ class KimiK3MixedKDAProjection(nn.Module):
         super().__init__()
         if replicated_shard_id != 4 or len(output_sizes) not in (6, 7):
             raise ValueError("Mixed K3 KDA requires full-rank Q/K/V/G/Fa/B layout")
+        fuse_qkv = os.environ.get("VLLM_HCU_KIMI_KDA_FUSE_QKV", "0") == "1"
+        vllm_config = get_current_vllm_config_or_none()
+        model_config = getattr(vllm_config, "model_config", None)
+        if fuse_qkv and getattr(model_config, "enable_sleep_mode", False):
+            raise ValueError(
+                "VLLM_HCU_KIMI_KDA_FUSE_QKV=1 is incompatible with sleep mode: "
+                "fused QKV storage is allocated outside the weights pool. "
+                "Disable fused KDA QKV or sleep mode."
+            )
         parent = prefix.removesuffix(".in_proj_qkvgfab")
         for name, size in zip(("q_proj", "k_proj", "v_proj"), output_sizes[:3]):
             layer = column_linear(input_size, size, quant_config=quant_config,
@@ -78,7 +88,7 @@ class KimiK3MixedKDAProjection(nn.Module):
         # Record ownership after loading, before an offloader's functional_call
         # temporarily replaces CPU parameters with device tensors.
         self._qkv_offloaded = False
-        self._fuse_qkv = os.environ.get("VLLM_HCU_KIMI_KDA_FUSE_QKV", "0") == "1"
+        self._fuse_qkv = fuse_qkv
         self._fused_qkv = None
         self._fused_refresh_deferred = False
 
