@@ -54,6 +54,7 @@ FeatureKey = Literal[
     "deep_gemm",
     "forward_context",
     "lightly_cp",
+    "lm_head_convrot_int8",
     "multi_layers_mtp",
     "offline_eplb",
     "eplb_control",
@@ -302,6 +303,10 @@ _OP_CALLBACKS: tuple[_CallbackSpec, ...] = (
     _CallbackSpec(_adapter("op_opt", "patch_compressed_tensors")),
     _CallbackSpec(_adapter("op_opt", "patch_compressed_tensors_scheme")),
     _CallbackSpec(_adapter("op_opt", "patch_compressed_tensors_w8a8_int8")),
+    _CallbackSpec(
+        _adapter("op_opt", "patch_lm_head_convrot_int8"),
+        feature="lm_head_convrot_int8",
+    ),
     _CallbackSpec(_adapter("op_opt", "patch_compressed_tensors_w8a8_fp8")),
     _CallbackSpec(_adapter("op_opt", "patch_compressed_tensors_moe_w8a8_int8")),
     _CallbackSpec(_adapter("op_opt", "patch_compressed_tensors_moe_w8a8_fp8")),
@@ -476,6 +481,7 @@ _REQUIRED_TERMINAL_IDS = frozenset(
         "worker.framework_opt.communicator.pynccl_all_to_all",
         "worker.framework_opt.spec_decode.eagle_topk_buffer",
         "worker.framework_opt.communicator.deep_ep_runtime",
+        "worker.op_opt.lm_head.convrot_int8",
     }
 )
 
@@ -786,6 +792,7 @@ def _feature_states(
             config.enable_lightly_cp or backend == "deepep_low_latency" or deepep_auto
         ),
         "lightly_cp": config.enable_lightly_cp,
+        "lm_head_convrot_int8": config.lm_head_convrot_int8,
         "multi_layers_mtp": config.enable_multi_layers_mtp,
         "offline_eplb": bool(
             config.expert_map_path or config.expert_map_record_path

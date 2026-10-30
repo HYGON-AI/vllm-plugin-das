@@ -59,6 +59,7 @@ def test_dict_vllm_config_uses_canonical_storage_path() -> None:
                 "qwen4_exp_hc_sp": True,
                 "k3_sp_moe": False,
                 "dp_int8_allgather": False,
+                "lm_head_convrot_int8": False,
                 "moe_backend": "auto",
                 "hcu_flash_attn_mode": None,
                 "hcu_gdn_prefill_backend": None,

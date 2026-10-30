@@ -25,6 +25,11 @@ register_hcu_ci(
     est_time=900,
 )
 register_hcu_ci(
+    job="accuracy-gfx936",
+    target="tests/accuracy/test_lm_head_convrot_int8_accuracy.py",
+    est_time=60,
+)
+register_hcu_ci(
     job="accuracy-gfx938",
     target="tests/accuracy/test_hcu_kernel_accuracy.py",
     est_time=900,

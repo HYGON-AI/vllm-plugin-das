@@ -137,6 +137,27 @@ switches. Select attention/MoE backends, KV-cache format, speculative decoding,
 and parallel topology from a matching model profile; these options are not
 validated in every combination.
 
+### BF16 Full-Vocabulary LM Head With ConvRot INT8
+
+The opt-in HCU setting converts an original BF16 output head to ConvRot INT8
+after checkpoint loading. The complete vocabulary and other layers are retained.
+
+```bash
+vllm serve /path/to/model \
+  --additional-config '{"hcu":{"lm_head_convrot_int8":true}}'
+```
+
+The option defaults to `false` and relies on HCU LightOp quantized GEMM. A head
+that does not meet the requirements (tied to the input embeddings, hidden size
+not divisible by 256, not BF16, already quantized, LoRA enabled, or a
+`UnquantizedLinearMethod` head with `VLLM_USE_NN` enabled) is not converted: a
+warning is logged and the head stays BF16, so startup is unaffected. The
+standard unquantized embedding head remains supported.
+Checkpoint-format in-place weight reload is not supported while this option is
+enabled; restart the worker with the new checkpoint instead.
+INT8 conversion is approximate; check accuracy and performance in the target
+environment.
+
 ### MHA/GQA With FlashAttention
 
 For MHA/GQA models using `--attention-backend FLASH_ATTN`, set
