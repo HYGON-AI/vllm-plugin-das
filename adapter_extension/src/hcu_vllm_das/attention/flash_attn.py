@@ -4,7 +4,7 @@ from __future__ import annotations
 
 from collections.abc import Callable
 from importlib import import_module
-from typing import Any
+from typing import Any, ClassVar
 
 import torch
 from vllm.v1.attention.backends.flash_attn import (
@@ -15,6 +15,22 @@ from vllm.v1.kv_cache_layout import KVCacheLayout
 
 _FA4_ONLY_ARGUMENTS = ("dynamic_causal", "mask_mod", "aux_tensors")
 _KERNEL_BLOCK_SIZE = 64
+_REQUIRED_VLLM_SEAMS = (
+    "_get_kv_cache_views",
+    "_get_kv_cache_write_views",
+    "_run_flash_attention",
+)
+_MISSING_VLLM_SEAMS = tuple(
+    name
+    for name in _REQUIRED_VLLM_SEAMS
+    if not callable(getattr(FlashAttentionImpl, name, None))
+)
+if _MISSING_VLLM_SEAMS:
+    missing = ", ".join(_MISSING_VLLM_SEAMS)
+    raise RuntimeError(
+        "HCU FLASH_ATTN requires the vLLM 0.32 HCU attention seams; "
+        f"missing: {missing}. Install the matching HCU vLLM wheel."
+    )
 
 
 def _vendor_varlen_func() -> Callable[..., Any]:
@@ -75,6 +91,8 @@ def _dense_hnd_kv_cache_views(
 class HcuFlashAttentionImpl(FlashAttentionImpl):
     """Expose dense HND pages to the HCU vendor varlen ABI."""
 
+    supports_dcp = False
+
     def __init__(self, *args: Any, **kwargs: Any) -> None:
         super().__init__(*args, **kwargs)
         if self.vllm_flash_attn_version is None:
@@ -122,6 +140,40 @@ class HcuFlashAttentionImpl(FlashAttentionImpl):
 class HcuFlashAttentionBackend(FlashAttentionBackend):
     """Select the dense HND HCU implementation through vLLM's backend seam."""
 
+    supported_kv_cache_dtypes: ClassVar[list[str]] = [
+        "auto",
+        "float16",
+        "bfloat16",
+    ]
+
+    @classmethod
+    def supports_head_size(cls, head_size: int) -> bool:
+        return head_size % 8 == 0 and head_size <= 256
+
+    @classmethod
+    def supports_block_size(cls, block_size: int | None) -> bool:
+        return block_size is None or block_size == _KERNEL_BLOCK_SIZE
+
+    @classmethod
+    def supports_dcp(cls) -> bool:
+        return False
+
+    @classmethod
+    def supports_mm_prefix(cls) -> bool:
+        return False
+
+    @classmethod
+    def supports_sink(cls) -> bool:
+        return False
+
+    @classmethod
+    def supports_rswa(cls) -> bool:
+        return False
+
+    @classmethod
+    def supports_per_head_quant_scales(cls) -> bool:
+        return False
+
     @classmethod
     def supported_kv_cache_layouts(cls) -> tuple[KVCacheLayout, ...]:
         return (KVCacheLayout.LBHNC,)
@@ -135,7 +187,8 @@ class HcuFlashAttentionBackend(FlashAttentionBackend):
 
     @classmethod
     def get_preferred_block_size(cls, default_block_size: int) -> int:
-        return max(default_block_size, _KERNEL_BLOCK_SIZE)
+        del default_block_size
+        return _KERNEL_BLOCK_SIZE
 
     @staticmethod
     def get_impl_cls() -> type[HcuFlashAttentionImpl]:

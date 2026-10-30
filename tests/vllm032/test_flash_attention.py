@@ -15,10 +15,24 @@ PLUGIN_SOURCE_ROOT = (
 sys.path.insert(0, os.fspath(PLUGIN_SOURCE_ROOT))
 
 
-def load_flash_attention(monkeypatch: pytest.MonkeyPatch):
+def load_flash_attention(
+    monkeypatch: pytest.MonkeyPatch,
+    *,
+    with_vllm_seams: bool = True,
+):
     class FlashAttentionImpl:
+        supports_dcp = True
+
         def __init__(self, *args, **kwargs):
             self.vllm_flash_attn_version = kwargs.pop("version", None)
+
+    if with_vllm_seams:
+        for name in (
+            "_get_kv_cache_views",
+            "_get_kv_cache_write_views",
+            "_run_flash_attention",
+        ):
+            setattr(FlashAttentionImpl, name, lambda self, *args, **kwargs: None)
 
     class FlashAttentionBackend:
         @classmethod
@@ -53,6 +67,11 @@ def load_flash_attention(monkeypatch: pytest.MonkeyPatch):
         raising=False,
     )
     return importlib.import_module("hcu_vllm_das.attention.flash_attn")
+
+
+def test_import_rejects_vllm_without_required_flash_attention_seams(monkeypatch):
+    with pytest.raises(RuntimeError, match="_get_kv_cache_write_views"):
+        load_flash_attention(monkeypatch, with_vllm_seams=False)
 
 
 def test_dense_hnd_views_separate_kv_and_preserve_block_stride(monkeypatch):
@@ -140,6 +159,18 @@ def test_backend_selects_fa2_hnd_layout_and_64_token_pages(monkeypatch):
     )
     assert flash.HcuFlashAttentionBackend.get_supported_kernel_block_sizes() == [64]
     assert flash.HcuFlashAttentionBackend.get_preferred_block_size(16) == 64
+    assert flash.HcuFlashAttentionBackend.get_preferred_block_size(128) == 64
+    assert flash.HcuFlashAttentionBackend.supports_block_size(64) is True
+    assert flash.HcuFlashAttentionBackend.supports_block_size(128) is False
+    assert flash.HcuFlashAttentionBackend.supported_kv_cache_dtypes == [
+        "auto",
+        "float16",
+        "bfloat16",
+    ]
+    assert flash.HcuFlashAttentionBackend.supports_dcp() is False
+    assert flash.HcuFlashAttentionBackend.supports_mm_prefix() is False
+    assert flash.HcuFlashAttentionBackend.supports_sink() is False
+    assert flash.HcuFlashAttentionBackend.supports_rswa() is False
 
 
 def test_varlen_boundary_forwards_fa2_keywords_without_fa4_options(monkeypatch):
@@ -201,6 +232,50 @@ def test_varlen_boundary_avoids_vendor_short_prefill_mtp_misclassification(
     )
 
     assert calls[0]["max_seqlen_q"] == 6
+
+
+@pytest.mark.parametrize(
+    ("max_seqlen_q", "query_tokens", "batch_size", "has_block_table"),
+    (
+        (1, 1, 1, True),
+        (16, 16, 1, True),
+        (5, 9, 2, True),
+        (5, 5, 1, False),
+    ),
+)
+def test_varlen_boundary_preserves_non_rectangular_or_non_paged_shapes(
+    monkeypatch,
+    max_seqlen_q,
+    query_tokens,
+    batch_size,
+    has_block_table,
+):
+    flash = load_flash_attention(monkeypatch)
+    calls = []
+    monkeypatch.setattr(
+        flash,
+        "_vendor_varlen_func",
+        lambda: lambda **kwargs: calls.append(kwargs),
+    )
+    impl = flash.HcuFlashAttentionImpl()
+
+    impl._run_flash_attention(
+        q=torch.empty(query_tokens, 4, 64),
+        k=torch.empty(1, 2, 64, 64),
+        v=torch.empty(1, 2, 64, 64),
+        cu_seqlens_q=torch.arange(
+            batch_size + 1,
+            dtype=torch.int32,
+        ),
+        max_seqlen_q=max_seqlen_q,
+        block_table=(
+            torch.zeros((batch_size, 1), dtype=torch.int32)
+            if has_block_table
+            else None
+        ),
+    )
+
+    assert calls[0]["max_seqlen_q"] == max_seqlen_q
 
 
 @pytest.mark.parametrize("name", ("dynamic_causal", "mask_mod", "aux_tensors"))
