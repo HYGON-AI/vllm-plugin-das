@@ -36,11 +36,15 @@ def _reference_attention(
     )
 
 
-@pytest.mark.parametrize(("query_len", "kv_len"), ((3, 3), (1, 5)))
+@pytest.mark.parametrize(
+    ("query_len", "kv_len", "num_query_heads"),
+    ((3, 3, 4), (1, 5, 4), (5, 5, 14)),
+)
 @torch.inference_mode()
-def test_hcu_writer_to_vendor_varlen_matches_reference(query_len, kv_len):
+def test_hcu_writer_to_vendor_varlen_matches_reference(
+    query_len, kv_len, num_query_heads
+):
     import vllm._C_stable_libtorch  # noqa: F401
-    from flash_attn import flash_attn_varlen_func
     from hcu_vllm_das.attention.flash_attn import HcuFlashAttentionImpl
     from vllm import _custom_ops as ops
 
@@ -48,7 +52,7 @@ def test_hcu_writer_to_vendor_varlen_matches_reference(query_len, kv_len):
     device = torch.device("cuda")
     dtype = torch.bfloat16
     block_size, num_blocks = 64, 1
-    num_query_heads, num_kv_heads, head_size = 4, 2, 64
+    num_kv_heads, head_size = 2, 64
     query = torch.randn(
         query_len,
         num_query_heads,
@@ -97,7 +101,7 @@ def test_hcu_writer_to_vendor_varlen_matches_reference(query_len, kv_len):
         value_cache[0, :, :kv_len].transpose(0, 1), value
     )
 
-    output = flash_attn_varlen_func(
+    output = impl._run_flash_attention(
         q=query,
         k=key_cache,
         v=value_cache,

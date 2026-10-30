@@ -98,6 +98,22 @@ class HcuFlashAttentionImpl(FlashAttentionImpl):
                 raise NotImplementedError(
                     f"HCU FlashAttention FA2 does not support {name}"
                 )
+        max_query_len = kwargs.get("max_seqlen_q")
+        query = kwargs.get("q")
+        cu_query_lens = kwargs.get("cu_seqlens_q")
+        if (
+            kwargs.get("block_table") is not None
+            and isinstance(max_query_len, int)
+            and 1 < max_query_len < 16
+            and isinstance(query, torch.Tensor)
+            and isinstance(cu_query_lens, torch.Tensor)
+            and max_query_len * (cu_query_lens.shape[0] - 1) == query.shape[0]
+        ):
+            # The vendor wrapper otherwise classifies rectangular short
+            # prefill as MTP and can select an incompatible direct-paged tile.
+            # max_seqlen_q is an upper bound, so incrementing it preserves the
+            # ragged sequence contract while selecting the regular prefill path.
+            kwargs["max_seqlen_q"] = max_query_len + 1
         kwargs["layout"] = "bhsd"
         kwargs["fa_version"] = 2
         return _vendor_varlen_func()(**kwargs)

@@ -114,8 +114,11 @@ vllm serve /model/Qwen2-0.5B-Instruct \
 The Plugin reinterprets each allocated page as dense `[K/V, H, N, D]`
 storage. This is required because the vendor kernel does not consume vLLM's
 default non-dense views produced by splitting `[..., 2D]`. The official
-stride-aware HIP cache writer writes directly into those dense views; there is
-no per-forward cache copy.
+stride-aware HIP cache writer writes through a zero-copy NHD alias of those
+dense views. The Plugin does not copy the full KV cache on decode. The vendor's
+regular prefill path may gather paged KV internally; rectangular short prefill
+uses that path by passing a conservative `max_seqlen_q` upper bound, avoiding
+the vendor wrapper's incompatible MTP tile selection.
 
 FA4-only `dynamic_causal`, `mask_mod`, and `aux_tensors` are accepted only
 when inactive (`None`). An active feature fails closed instead of silently

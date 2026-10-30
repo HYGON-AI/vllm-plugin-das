@@ -178,6 +178,31 @@ def test_varlen_boundary_forwards_fa2_keywords_without_fa4_options(monkeypatch):
     ]
 
 
+def test_varlen_boundary_avoids_vendor_short_prefill_mtp_misclassification(
+    monkeypatch,
+):
+    flash = load_flash_attention(monkeypatch)
+    calls = []
+
+    def vendor(**kwargs):
+        calls.append(kwargs)
+        return "vendor-output"
+
+    monkeypatch.setattr(flash, "_vendor_varlen_func", lambda: vendor)
+    impl = flash.HcuFlashAttentionImpl()
+
+    impl._run_flash_attention(
+        q=torch.empty(5, 14, 64),
+        k=torch.empty(1, 2, 64, 64),
+        v=torch.empty(1, 2, 64, 64),
+        cu_seqlens_q=torch.tensor([0, 5], dtype=torch.int32),
+        max_seqlen_q=5,
+        block_table=torch.zeros((1, 1), dtype=torch.int32),
+    )
+
+    assert calls[0]["max_seqlen_q"] == 6
+
+
 @pytest.mark.parametrize("name", ("dynamic_causal", "mask_mod", "aux_tensors"))
 def test_varlen_boundary_rejects_active_fa4_options(monkeypatch, name):
     flash = load_flash_attention(monkeypatch)
