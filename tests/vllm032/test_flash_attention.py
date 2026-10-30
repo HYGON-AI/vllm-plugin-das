@@ -70,6 +70,9 @@ def test_dense_hnd_views_separate_kv_and_preserve_block_stride(monkeypatch):
     )
 
     key, value = flash._dense_hnd_kv_cache_views(packed, head_size)
+    impl = flash.HcuFlashAttentionImpl()
+    impl.head_size = head_size
+    write_key, write_value = impl._get_kv_cache_write_views(packed)
     key.fill_(11)
     value.fill_(22)
 
@@ -87,6 +90,14 @@ def test_dense_hnd_views_separate_kv_and_preserve_block_stride(monkeypatch):
     )
     assert key.storage_offset() == storage_offset
     assert value.storage_offset() == storage_offset + half_page
+    assert write_key.shape == write_value.shape == (
+        num_blocks,
+        block_size,
+        num_heads,
+        head_size,
+    )
+    assert write_key.stride() == key.transpose(1, 2).stride()
+    assert write_value.stride() == value.transpose(1, 2).stride()
     torch.testing.assert_close(
         raw[storage_offset : storage_offset + half_page],
         torch.full((half_page,), 11.0),

@@ -85,6 +85,12 @@ class HcuFlashAttentionImpl(FlashAttentionImpl):
     ) -> tuple[torch.Tensor, torch.Tensor]:
         return _dense_hnd_kv_cache_views(kv_cache, self.head_size)
 
+    def _get_kv_cache_write_views(
+        self, kv_cache: torch.Tensor
+    ) -> tuple[torch.Tensor, torch.Tensor]:
+        key_cache, value_cache = self._get_kv_cache_views(kv_cache)
+        return key_cache.transpose(1, 2), value_cache.transpose(1, 2)
+
     def _run_flash_attention(self, **kwargs: Any) -> Any:
         for name in _FA4_ONLY_ARGUMENTS:
             value = kwargs.pop(name, None)
