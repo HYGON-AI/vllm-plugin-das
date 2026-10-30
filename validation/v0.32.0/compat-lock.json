@@ -1,0 +1,153 @@
+{
+  "schema_version": 1,
+  "validation_id": "vllm-v0.32.0-upstream-first-plugin-20261030",
+  "status": "pending",
+  "repository": {
+    "name": "vllm-plugin-das",
+    "url": "https://github.com/alexanderbin123/vllm-plugin-das.git",
+    "branch": "feat/vllm032-plugin-onoff-gates",
+    "source_base": "e76220d9c0006cc3c9d886587a4771a31e7d83e8",
+    "test_policy_commit": "a7f5c2bd15c19296ab00219f188b3b7d65b45f50"
+  },
+  "peer": {
+    "name": "adapter-das",
+    "url": "https://github.com/alexanderbin123/adapter-das.git",
+    "branch": "feat/vllm032-adapter-delivery-gates",
+    "source_base": "c99886d41f435e594050d47663e03ea94081fdc6"
+  },
+  "vllm": {
+    "version": "0.32.0",
+    "commit": "5df63a7203cdb9328d824a27b682e77c7b9928be"
+  },
+  "human_eval": {
+    "commit": "6d43fb980f9fee3c892a914eda09951f772ad10d",
+    "tasks": "HumanEval/0-63",
+    "samples": 64,
+    "status": "pass",
+    "current_candidate": false,
+    "plugin_build_commit": "46923fbcf2068c1491090ca4d00e519b2abad91f",
+    "model": "/model/Qwen3-8B",
+    "temperature": 0,
+    "seed": 0,
+    "max_tokens": 2048,
+    "plugin_on": {
+      "passed": 61,
+      "pass_at_1": 0.953125,
+      "failed_tasks": [26, 32, 54],
+      "timeouts": 0
+    },
+    "plugin_off": {
+      "passed": 60,
+      "pass_at_1": 0.9375,
+      "failed_tasks": [18, 26, 32, 54],
+      "timeouts": 0
+    },
+    "completion_equal": 58,
+    "sandbox": "bubblewrap-0.6.1-no-network-no-capabilities-uid65534"
+  },
+  "hardware": {
+    "architecture": "gfx936",
+    "card_count": 8,
+    "card_series": "BW"
+  },
+  "toolchain": {
+    "python": "3.12.12",
+    "torch": "2.11.0",
+    "hip": "7.2.26365",
+    "dtk": "26.10",
+    "lightop": "0.6.0+dtk2610.torch2110.2610231814.gb2f8c9"
+  },
+  "serving": {
+    "current_candidate": false,
+    "plugin_build_commit": "46923fbcf2068c1491090ca4d00e519b2abad91f",
+    "enforce_eager": false,
+    "compilation": "VLLM_COMPILE",
+    "cudagraph_capture": "FULL_AND_PIECEWISE",
+    "model": "/model/Qwen2-0.5B-Instruct",
+    "max_model_len": 512,
+    "max_num_seqs": 1,
+    "attention_backend": "TRITON_ATTN",
+    "kv_cache_layout": "LBNHC"
+  },
+  "artifacts": {
+    "adapter_wheel": {
+      "filename": "sgl_kernel-0.1.0-py3-none-any.whl",
+      "sha256": "69b655ca747718eed3c4487e984fe749b73880369f20ab0288fc76799db0c6db",
+      "build_commit": "c99886d41f435e594050d47663e03ea94081fdc6"
+    },
+    "plugin_wheel": {
+      "filename": "hcu_vllm_das_plugin-0.2.0.dev0-py3-none-any.whl",
+      "sha256": "67db8901f289e5e9cc7ee8476be2e9c13980225d185cfe32665d9af8873893b9",
+      "build_commit": "a7f5c2bd15c19296ab00219f188b3b7d65b45f50",
+      "capabilities": ["aiter-int8-moe", "lightop-rms-norm"]
+    },
+    "vllm_wheel": {
+      "filename": "vllm-0.32.0+rocm723-cp312-cp312-linux_x86_64.whl",
+      "sha256": "d7f084b8754288893dd9ba28d24784ec4b4e59350c9bfb5038ec24ac3af9572b",
+      "upstream_commit": "5df63a7203cdb9328d824a27b682e77c7b9928be",
+      "build_commit": "7c13676e497262b71a8b107a3186b0f6641dcbf1"
+    }
+  },
+  "gates": {
+    "static_portable_tests": {
+      "status": "pass",
+      "result": "100 passed, 6 live-HCU tests skipped by default"
+    },
+    "build": {
+      "status": "pass",
+      "result": "Plugin wheel built from clean commit a7f5c2bd; one Adapter extension entry point, RMSNorm and AITER MoE modules present, no Silu override"
+    },
+    "installed_integration": {
+      "status": "pass",
+      "result": "fresh isolated install verified exact vLLM, Adapter and Plugin wheels; capabilities aiter-int8-moe/lightop-rms-norm active; oracle, EP map/mask and RMSNorm naming probes passed"
+    },
+    "live_hardware_operators": {
+      "status": "pass",
+      "result": "exact a7f5c2bd/67db8901 wheel on gfx936 card 0: RMSNorm eager/compile, ON/OFF graph, and AITER INT8 M=1/16/128 numerics plus graph replay passed; 6 passed, 14 warnings in 112.02s"
+    },
+    "model_parity": {
+      "status": "pending"
+    },
+    "serving": {
+      "status": "pending",
+      "result": "current Plugin wheel a7f5c2bd/67db8901 has not run a model service gate; prior 46923fbc result is historical only"
+    },
+    "humaneval_prefix": {
+      "status": "pending",
+      "result": "current Plugin wheel a7f5c2bd/67db8901 has not run HumanEval; recorded 46923fbc results are historical only"
+    }
+  },
+  "evidence": {
+    "upstream_first_operator_ab": {
+      "document": "docs/validation/vllm032-upstream-first-operator-ab.md",
+      "validated_at": "2026-10-29",
+      "plugin_build_commit": "46923fbcf2068c1491090ca4d00e519b2abad91f",
+      "applies_to_current_candidate": false,
+      "retained_capability": "lightop-rms-norm",
+      "upstream_takeover": "SiluAndMul",
+      "live_graph_result": "3 passed, 14 warnings in 98.17s",
+      "serving_modes": [
+        "master-on-rms-on",
+        "master-off-rms-on"
+      ],
+      "serving_probe_result": "both modes returned HTTP 200 and deterministic chat output 42"
+    },
+    "aiter_int8_moe": {
+      "document": "docs/validation/vllm032-aiter-int8-moe.md",
+      "validated_at": "2026-10-29",
+      "plugin_build_commit": "c40a2c67658261f50506142cf5357240c903e105",
+      "plugin_wheel_sha256": "bba4ffba753362a118f826398bc1eaa5f208f7401d3ceb7ea471cc78aa42f240",
+      "applies_to_current_candidate": false
+    },
+    "current_candidate": {
+      "document": "docs/validation/vllm032-pr310-runtime-contract-candidate.md",
+      "validated_at": "2026-10-30",
+      "plugin_build_commit": "a7f5c2bd15c19296ab00219f188b3b7d65b45f50",
+      "portable_result": "100 passed, 6 skipped",
+      "installed_result": "pass",
+      "live_hardware_result": "6 passed, 14 warnings in 112.02s on gfx936 card 0",
+      "ep_communication_result": "pending"
+    }
+  },
+  "completed_at": null
+}
