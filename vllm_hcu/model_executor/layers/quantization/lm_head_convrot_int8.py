@@ -84,6 +84,15 @@ class ConvRotINT8LMHeadMethod(QuantizeMethodBase):
         n, k = weight.shape
         if n == 0 or k == 0 or k % BLOCK_SIZE:
             raise ConvRotLMHeadError("ConvRot INT8 requires nonempty weights and K divisible by 256")
+        if torch.isnan(weight).all().item():
+            # A head the checkpoint omitted is left as an all-NaN placeholder
+            # that the MTP loader later replaces with the (converted) target
+            # head. Converting it would only fail; leave it for the sharing.
+            logger.warning(
+                "lm_head_convrot_int8: head is an all-NaN placeholder, "
+                "skipping conversion (expected to be replaced by head sharing)"
+            )
+            return
         _require_hcu_backend(weight)
         hadamard = _hadamard(weight.device)
         quantized = torch.empty_like(weight, dtype=torch.int8)

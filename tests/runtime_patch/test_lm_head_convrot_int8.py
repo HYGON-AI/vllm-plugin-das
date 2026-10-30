@@ -207,6 +207,16 @@ def test_failed_conversion_does_not_publish_partial_int8_weights(runtime, monkey
     assert not getattr(layer, "_hcu_convrot_ready", False)
 
 
+def test_all_nan_placeholder_head_is_left_for_sharing(runtime, caplog):
+    layer = _head()
+    layer.weight.data.fill_(float("nan"))
+    _method(runtime, layer).process_weights_after_loading(layer)
+    assert layer.weight.dtype == torch.bfloat16
+    assert not getattr(layer, "_hcu_convrot_ready", False)
+    assert not hasattr(layer, "weight_scale")
+    assert "placeholder" in caplog.text
+
+
 def test_device_guard_rejects_cpu_without_loading_lightop(monkeypatch):
     base = ModuleType("vllm.model_executor.layers.quantization.base_config")
     base.QuantizeMethodBase = type("QuantizeMethodBase", (), {})
