@@ -12,7 +12,7 @@ default HCU attention backend remains vLLM's upstream Triton backend.
 | --- | --- | --- | --- |
 | vLLM | `923e3284c` | `vllm-0.32.0+rocm723-cp312-cp312-linux_x86_64.whl` | `3e2798384365084cbcbcb61d0fff713a8c27fae22c0980fb85b6dd93d3e47c22` |
 | Adapter | `d7487a8` | `sgl_kernel-0.1.0-py3-none-any.whl` | `a8e2b7fea4a13352c7f3dc3365f8c4579cc8ac941bd4d2f408100f24286affd7` |
-| Plugin | `e9091776` | `hcu_vllm_das_plugin-0.2.0.dev0-py3-none-any.whl` | `d6b29546e2e9eaa5887862c2176b8c0fc0bdea6aa77c235580a3a3f93f228f53` |
+| Plugin | `a6f43ed3` | `hcu_vllm_das_plugin-0.2.0.dev0-py3-none-any.whl` | `4e18c536fe7b374613c9b89cf3e6308b0a7b7bab203c2d9b5dd8a48ae563af61` |
 
 Installed-state inspection resolved all three packages from the isolated
 candidate environment. The installed upstream class exposed
@@ -49,7 +49,9 @@ Negative tests verify that a stock vLLM 0.32 build without all three seams
 fails during explicit Plugin import. Explicit Adapter selection calls the
 Plugin backend's normal `validate_configuration()` path. DCP, FP8 KV, page
 sizes other than 64, sinks, RSWA, multimodal prefix masks, and active FA4-only
-arguments fail closed.
+arguments fail closed. Encoder/cross attention, sliding-window attention,
+non-causal attention, and batch-invariance mode also fail validation because
+they are outside this release's tested decoder matrix.
 
 ## Non-eager model service gate
 
