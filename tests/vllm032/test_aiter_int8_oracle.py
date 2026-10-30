@@ -32,7 +32,13 @@ def _get_priority_backends(config):
     return [Int8MoeBackend.TRITON, Int8MoeBackend.HUMMING, Int8MoeBackend.CPU]
 
 def backend_to_kernel_cls(backend):
-    return [backend.value.lower()]
+    if backend in (
+        Int8MoeBackend.TRITON,
+        Int8MoeBackend.HUMMING,
+        Int8MoeBackend.CPU,
+    ):
+        return [backend.value.lower()]
+    raise ValueError(f"Unknown Int8 MoE backend: {backend!r}")
 
 def map_int8_backend(runner_backend):
     mapping = {"triton": Int8MoeBackend.TRITON, "humming": Int8MoeBackend.HUMMING}
@@ -41,7 +47,11 @@ def map_int8_backend(runner_backend):
     raise ValueError(f"unsupported: {runner_backend}")
 
 def select_int8_moe_backend(config, weight_key="int8-channel", activation_key="int8-token"):
-    backend = map_int8_backend(config.moe_backend)
+    backend = (
+        _get_priority_backends(config)[0]
+        if config.moe_backend == "auto"
+        else map_int8_backend(config.moe_backend)
+    )
     cls = backend_to_kernel_cls(backend)[0]
     if isinstance(cls, str):
         return backend, cls
@@ -53,6 +63,12 @@ def select_int8_moe_backend(config, weight_key="int8-channel", activation_key="i
     return backend, cls
 
 def convert_to_int8_moe_kernel_format(int8_backend, w13, w2, layer=None, w13_scale=None):
+    if int8_backend not in (
+        Int8MoeBackend.TRITON,
+        Int8MoeBackend.HUMMING,
+        Int8MoeBackend.CPU,
+    ):
+        raise ValueError(f"Unsupported Int8 MoE backend: {int8_backend!r}")
     return (f"converted:{int8_backend.value}:{w13}", f"converted:{int8_backend.value}:{w2}")
 
 def make_int8_moe_quant_config(int8_backend, w1_scale, w2_scale, a1_scale=None, a2_scale=None, w1_bias=None, w2_bias=None, per_act_token_quant=False, layer=None):
@@ -127,16 +143,24 @@ def test_install_maps_explicit_aiter_and_preserves_official_factories(
 
     assert target.map_int8_backend("aiter") is target.Int8MoeBackend.AITER
     assert target.map_int8_backend("triton") is target.Int8MoeBackend.TRITON
+    assert target.map_int8_backend("humming") is target.Int8MoeBackend.HUMMING
     assert target.backend_to_kernel_cls(target.Int8MoeBackend.AITER) == [
         oracle.HcuAiterInt8Experts
     ]
     assert target.backend_to_kernel_cls(target.Int8MoeBackend.TRITON) == ["triton"]
+    assert target.backend_to_kernel_cls(target.Int8MoeBackend.HUMMING) == [
+        "humming"
+    ]
+    assert target.backend_to_kernel_cls(target.Int8MoeBackend.CPU) == ["cpu"]
     assert target.convert_to_int8_moe_kernel_format(
         target.Int8MoeBackend.AITER, "w13", "w2"
     ) == ("w13", "w2")
     assert target.convert_to_int8_moe_kernel_format(
         target.Int8MoeBackend.TRITON, "w13", "w2"
     ) == ("converted:TRITON:w13", "converted:TRITON:w2")
+    assert target.convert_to_int8_moe_kernel_format(
+        target.Int8MoeBackend.CPU, "w13", "w2"
+    ) == ("converted:CPU:w13", "converted:CPU:w2")
     assert target.select_int8_moe_backend is original_select
     assert target.make_int8_moe_quant_config is original_quant
     assert target.make_int8_moe_kernel is original_kernel
@@ -146,6 +170,12 @@ def test_install_maps_explicit_aiter_and_preserves_official_factories(
     )
     assert backend is target.Int8MoeBackend.AITER
     assert experts is oracle.HcuAiterInt8Experts
+
+    backend, experts = target.select_int8_moe_backend(
+        SimpleNamespace(moe_backend="auto")
+    )
+    assert backend is target.Int8MoeBackend.TRITON
+    assert experts == "triton"
 
 
 def test_install_keeps_auto_priority_and_is_idempotent(
@@ -250,4 +280,3 @@ def test_install_fails_before_mutation_when_an_int8_consumer_is_already_loaded(
 
     assert target.Int8MoeBackend is original_enum
     assert not getattr(target, oracle.INSTALL_MARKER, False)
-

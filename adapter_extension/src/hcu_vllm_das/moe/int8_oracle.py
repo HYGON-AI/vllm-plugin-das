@@ -234,11 +234,9 @@ def install() -> bool:
     def hcu_backend_to_kernel_cls(backend):
         if backend == extended_enum.AITER:
             return [experts_class]
-        try:
-            official_backend = old_enum(backend.value)
-        except (AttributeError, ValueError) as error:
-            raise ValueError(f"Unknown Int8 MoE backend: {backend!r}") from error
-        return backend_to_kernel_cls(official_backend)
+        if not isinstance(backend, extended_enum):
+            raise ValueError(f"Unknown Int8 MoE backend: {backend!r}")
+        return backend_to_kernel_cls(backend)
 
     @functools.wraps(map_int8_backend)
     def hcu_map_int8_backend(runner_backend):
@@ -257,12 +255,10 @@ def install() -> bool:
     ):
         if int8_backend == extended_enum.AITER:
             return w13, w2
-        try:
-            official_backend = old_enum(int8_backend.value)
-        except (AttributeError, ValueError) as error:
-            raise ValueError(f"Unknown Int8 MoE backend: {int8_backend!r}") from error
+        if not isinstance(int8_backend, extended_enum):
+            raise ValueError(f"Unknown Int8 MoE backend: {int8_backend!r}")
         return convert_to_int8_moe_kernel_format(
-            official_backend,
+            int8_backend,
             w13,
             w2,
             layer,
