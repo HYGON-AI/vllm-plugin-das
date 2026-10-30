@@ -9,6 +9,7 @@ from types import ModuleType, SimpleNamespace
 import sys
 
 import pytest
+import torch
 
 
 ROOT = Path(__file__).parents[2]
@@ -77,8 +78,8 @@ def test_worker_binds_target_and_draft_in_initial_pool(monkeypatch, with_draft, 
         def load_model(self, load_dummy_weights=False):
             assert active_pool == "weights"
             assert load_dummy_weights is dummy
-            self.model = object()
-            self.draft = object() if with_draft else None
+            self.model = torch.nn.Module()
+            self.draft = torch.nn.Module() if with_draft else None
 
         def get_draft_model(self):
             return self.draft

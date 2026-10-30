@@ -8,6 +8,7 @@ The server must be dedicated to this test: hit counters are global.
 from __future__ import annotations
 
 import json
+import argparse
 import random
 import sys
 import time
@@ -19,11 +20,13 @@ import urllib.request
 from pathlib import Path
 
 
-if len(sys.argv) != 3:
-    raise SystemExit(f"Usage: {sys.argv[0]} <api-base> <output-json>")
-
-api_base = sys.argv[1].rstrip("/")
-output_path = Path(sys.argv[2])
+parser = argparse.ArgumentParser(description=__doc__)
+parser.add_argument("api_base")
+parser.add_argument("output_json", type=Path)
+parser.add_argument("--profile", action="store_true", help="profile requests on a profiler-enabled server")
+args = parser.parse_args()
+api_base = args.api_base.rstrip("/")
+output_path = args.output_json
 output_path.parent.mkdir(parents=True, exist_ok=True)
 opener = urllib.request.build_opener(urllib.request.ProxyHandler({}))
 
@@ -103,8 +106,9 @@ result = {
 }
 profile_active = False
 try:
-    request("/start_profile", {})
-    profile_active = True
+    if args.profile:
+        request("/start_profile", {})
+        profile_active = True
     result["producer"] = completion(
         "producer_shared_salt", prefix + producer_tail, shared_salt
     )
