@@ -81,6 +81,7 @@ class _Entry:
     action: ImportAction
     payload: ModuleCallback | ModuleReplacement
     feature_enabled: bool
+    defer_until_enabled: bool = False
     late_policy: LateReplacementPolicy = "fail"
     replacement_module: ModuleType | None = None
     previous_module: object | None = None
@@ -248,8 +249,15 @@ class ExactImportCoordinator(importlib.abc.MetaPathFinder):
         *,
         targets: str | Sequence[str] | None = None,
         feature_enabled: bool = True,
+        defer_until_enabled: bool = False,
     ) -> ImportRegistration:
-        """Run ``callback(module)`` once, immediately if already imported."""
+        """Run a callback once; opt-in gated callbacks wait for configuration.
+
+        ``feature_enabled`` normally controls validation only. With
+        ``defer_until_enabled``, a disabled callback stays armed without
+        mutating its target. Enabling it later also handles already loaded
+        modules. Disabling never undoes a callback that has already run.
+        """
 
         if not callable(callback):
             raise TypeError("callback must be callable")
@@ -260,6 +268,7 @@ class ExactImportCoordinator(importlib.abc.MetaPathFinder):
             action=ImportAction.CALLBACK,
             payload=callback,
             feature_enabled=self._validate_feature_enabled(feature_enabled),
+            defer_until_enabled=self._validate_feature_enabled(defer_until_enabled),
         )
         existing = self._register(entry)
         if existing is not entry:
@@ -463,7 +472,16 @@ class ExactImportCoordinator(importlib.abc.MetaPathFinder):
                 raise KeyError(f"unknown import registration {patch_id!r}") from exc
             entry.feature_enabled = enabled
             self._registry.set_feature_enabled(patch_id, enabled)
-            return self._view(entry)
+        # A gated target may have been imported before the Worker config arrived.
+        if entry.defer_until_enabled and enabled:
+            loaded = sys.modules.get(entry.module_name)
+            if (
+                isinstance(loaded, ModuleType)
+                and not self._module_is_initializing(loaded)
+                and self._is_armed(entry)
+            ):
+                self._apply_callback(entry, loaded)
+        return self._view(entry)
 
     def reset_for_tests(self, *, reset_registry: bool = True) -> None:
         """Uninstall, restore module aliases, and clear registrations."""
@@ -550,6 +568,7 @@ class ExactImportCoordinator(importlib.abc.MetaPathFinder):
             and left.action is right.action
             and left.payload is right.payload
             and left.late_policy == right.late_policy
+            and left.defer_until_enabled == right.defer_until_enabled
         )
 
     def _active_replacement(self, entries: list[_Entry]) -> _Entry | None:
@@ -605,10 +624,16 @@ class ExactImportCoordinator(importlib.abc.MetaPathFinder):
         with self._lock:
             entries = [self._entries[key] for key in self._by_module.get(fullname, ())]
         for entry in entries:
-            if entry.action is ImportAction.CALLBACK and self._is_armed(entry):
+            if (
+                entry.action is ImportAction.CALLBACK
+                and self._is_armed(entry)
+                and not (entry.defer_until_enabled and not entry.feature_enabled)
+            ):
                 self._registry.mark_failed(entry.patch_id, error)
 
     def _apply_callback(self, entry: _Entry, module: ModuleType) -> None:
+        if entry.defer_until_enabled and not entry.feature_enabled:
+            return
         if not self._registry.begin(entry.patch_id):
             return
         callback = entry.payload
@@ -778,6 +803,7 @@ def register_post_import(
     *,
     targets: str | Sequence[str] | None = None,
     feature_enabled: bool = True,
+    defer_until_enabled: bool = False,
 ) -> ImportRegistration:
     return IMPORT_COORDINATOR.register_callback(
         patch_id,
@@ -785,6 +811,7 @@ def register_post_import(
         callback,
         targets=targets,
         feature_enabled=feature_enabled,
+        defer_until_enabled=defer_until_enabled,
     )
 
 

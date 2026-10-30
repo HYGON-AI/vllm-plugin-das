@@ -630,6 +630,9 @@ class HCUPlatform(Platform):
             validate_and_update_hcu_config,
         )
 
+        from vllm_hcu.patch.config import validate_offline_eplb_config
+
+        validate_offline_eplb_config(vllm_config)
         IMPORT_COORDINATOR.drain_ready_callbacks()
         feature_config = validate_and_update_hcu_config(vllm_config)
 

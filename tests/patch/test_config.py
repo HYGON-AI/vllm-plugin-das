@@ -12,6 +12,7 @@ import pytest
 import vllm_hcu.patch.config as hcu_config_module
 from vllm_hcu.patch.config import (
     HcuFeatureConfig,
+    bind_hcu_eplb_config,
     get_hcu_config,
     pop_hcu_feature_kwargs,
     set_hcu_config,
@@ -56,6 +57,10 @@ def test_dict_vllm_config_uses_canonical_storage_path() -> None:
                 "fused_qwen3_rms_rope": True,
                 "moe_backend": "auto",
                 "hcu_flash_attn_mode": None,
+                "expert_map_path": None,
+                "expert_map_record_path": None,
+                "eplb_disable_rearrange": False,
+                "eplb_static_dispatch_policy": "nearest",
             }
         }
     }
@@ -72,6 +77,50 @@ def test_sidecar_is_pickle_safe_for_spawned_process_config() -> None:
     original = {"additional_config": {"hcu": HcuFeatureConfig(enable_custom_sp=True).to_dict()}}
     restored = pickle.loads(pickle.dumps(original))
     assert get_hcu_config(restored) == HcuFeatureConfig(enable_custom_sp=True)
+
+
+def test_offline_eplb_sidecar_round_trip_and_parallel_binding() -> None:
+    feature_config = HcuFeatureConfig(
+        expert_map_path="/maps/hy4.json",
+        eplb_disable_rearrange=True,
+        eplb_static_dispatch_policy="locality_fair",
+    )
+    vllm_config = SimpleNamespace(
+        additional_config={"hcu": feature_config.to_dict()},
+        parallel_config=SimpleNamespace(),
+    )
+
+    restored = pickle.loads(pickle.dumps(vllm_config))
+    bind_hcu_eplb_config(restored)
+
+    assert get_hcu_config(restored) == feature_config
+    assert restored.parallel_config._vllm_hcu_expert_map_path == "/maps/hy4.json"
+    assert restored.parallel_config._vllm_hcu_expert_map_record_path is None
+    assert restored.parallel_config._vllm_hcu_eplb_disable_rearrange is True
+    assert (
+        restored.parallel_config._vllm_hcu_eplb_static_dispatch_policy
+        == "locality_fair"
+    )
+
+
+def test_offline_eplb_binding_supports_mapping_parallel_config() -> None:
+    vllm_config = {
+        "additional_config": {
+            "hcu": HcuFeatureConfig(
+                expert_map_record_path="/maps/record.json"
+            ).to_dict()
+        },
+        "parallel_config": {},
+    }
+
+    bind_hcu_eplb_config(vllm_config)
+
+    assert vllm_config["parallel_config"] == {
+        "_vllm_hcu_expert_map_path": None,
+        "_vllm_hcu_expert_map_record_path": "/maps/record.json",
+        "_vllm_hcu_eplb_disable_rearrange": False,
+        "_vllm_hcu_eplb_static_dispatch_policy": "nearest",
+    }
 
 
 def test_pop_legacy_keywords_leaves_upstream_kwargs_untouched() -> None:
@@ -118,6 +167,21 @@ def test_legacy_deep_gemm_sidecar_is_normalized_with_one_warning(
         ({"enable_lightly_cp": 1}, TypeError),
         ({"moe_backend": "triton"}, ValueError),
         ({"hcu_flash_attn_mode": "future"}, ValueError),
+        ({"expert_map_path": ""}, ValueError),
+        ({"expert_map_path": "   "}, ValueError),
+        ({"expert_map_path": 7}, TypeError),
+        ({"expert_map_record_path": ""}, ValueError),
+        ({"expert_map_record_path": 7}, TypeError),
+        ({"eplb_disable_rearrange": 1}, TypeError),
+        ({"eplb_static_dispatch_policy": "round_robin"}, ValueError),
+        ({"eplb_static_dispatch_policy": 1}, TypeError),
+        (
+            {
+                "expert_map_path": "/maps/load.json",
+                "expert_map_record_path": "/maps/record.json",
+            },
+            ValueError,
+        ),
         ({"future_typo": True}, ValueError),
         ({"enable_lightly_cplb": True}, ValueError),
     ],
@@ -130,3 +194,58 @@ def test_invalid_values_are_rejected(payload: dict[str, object], error: type[Exc
 def test_write_requires_mutable_mapping() -> None:
     with pytest.raises(TypeError, match="mutable mapping"):
         write_hcu_config(({},), HcuFeatureConfig())  # type: ignore[arg-type]
+
+
+@pytest.mark.parametrize("field", ["expert_map_path", "expert_map_record_path"])
+@pytest.mark.parametrize("as_mapping", [False, True])
+def test_offline_eplb_paths_require_eplb_and_expert_parallel(field, as_mapping):
+    from vllm_hcu.patch.config import validate_offline_eplb_config
+
+    for eplb, ep, expected in (
+        (False, True, "--enable-eplb"),
+        (True, False, "--enable-expert-parallel"),
+        (True, True, None),
+    ):
+        parallel = {"enable_eplb": eplb, "enable_expert_parallel": ep}
+        additional = {"hcu": {field: "/tmp/expert-map.json"}}
+        config = {"parallel_config": parallel, "additional_config": additional}
+        if not as_mapping:
+            config = SimpleNamespace(
+                parallel_config=SimpleNamespace(**parallel),
+                additional_config=additional,
+            )
+        if expected:
+            with pytest.raises(ValueError, match=expected):
+                validate_offline_eplb_config(config)
+        else:
+            validate_offline_eplb_config(config)
+
+
+@pytest.mark.parametrize(
+    "config",
+    [
+        None,
+        SimpleNamespace(),
+        SimpleNamespace(parallel_config=SimpleNamespace()),
+        {"parallel_config": {}},
+    ],
+)
+def test_offline_eplb_validation_allows_configs_without_hcu_sidecar(config):
+    hcu_config_module.validate_offline_eplb_config(config)
+
+
+@pytest.mark.parametrize(
+    "config",
+    [
+        SimpleNamespace(additional_config=7),
+        {"additional_config": 7},
+        SimpleNamespace(additional_config={"hcu": 7}),
+        {"additional_config": {"hcu": 7}},
+        SimpleNamespace(additional_config={"hcu": {"expert_map_path": 7}}),
+        {"additional_config": {"hcu": {"expert_map_record_path": 7}}},
+        SimpleNamespace(expert_map_record_path=7),
+    ],
+)
+def test_offline_eplb_validation_preserves_malformed_config_errors(config):
+    with pytest.raises(TypeError):
+        hcu_config_module.validate_offline_eplb_config(config)

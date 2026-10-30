@@ -33,13 +33,26 @@ def _draft_capacity_config(vllm_config):
     capacity = max(
         scheduler.max_num_batched_tokens, scheduler.max_num_seqs * query_width
     )
-    if capacity == scheduler.max_num_batched_tokens:
+    parallel = getattr(vllm_config, "parallel_config", None)
+    isolate_eplb = bool(getattr(parallel, "enable_eplb", False))
+    if capacity == scheduler.max_num_batched_tokens and not isolate_eplb:
         return vllm_config
-    # Preserve target scheduling and capture choices; only the drafter and its
-    # model/metadata allocations receive the expanded token capacity.
+    # Preserve the target's scheduling and EPLB state. DFlashSpeculator drops
+    # draft PCP to 1 during __init__, before load_dspark_model can disable EPLB;
+    # carrying target EPLB into that replace() fails TP1/PCP1/DP1 validation.
     config = copy.copy(vllm_config)
-    config.scheduler_config = copy.copy(scheduler)
-    config.scheduler_config.max_num_batched_tokens = capacity
+    if capacity != scheduler.max_num_batched_tokens:
+        config.scheduler_config = copy.copy(scheduler)
+        config.scheduler_config.max_num_batched_tokens = capacity
+    if isolate_eplb:
+        from vllm.config import replace
+
+        config.parallel_config = replace(
+            parallel,
+            enable_eplb=False,
+            eplb_config=replace(parallel.eplb_config, num_redundant_experts=0),
+            enable_elastic_ep=False,
+        )
     return config
 
 

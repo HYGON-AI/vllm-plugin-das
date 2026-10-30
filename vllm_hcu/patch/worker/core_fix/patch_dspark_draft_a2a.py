@@ -187,6 +187,13 @@ def apply_to_module(module: ModuleType) -> bool:
         sidecar = get_hcu_config(vllm_config).with_updates(
             moe_backend="deep_gemm" if backend == "deep_gemm" else "auto",
             deepep_auto=False,
+            # The upstream loader disables EPLB on its draft-only ParallelConfig.
+            # Clear the serialized sidecar too: preload hooks would otherwise
+            # bind the target's 384-expert map to the 128-expert DSpark model,
+            # or let the draft overwrite the target's calibration artifact.
+            expert_map_path=None,
+            expert_map_record_path=None,
+            eplb_disable_rearrange=False,
         )
         additional = dict(vllm_config.additional_config or {})
         additional["hcu"] = sidecar.to_dict()
