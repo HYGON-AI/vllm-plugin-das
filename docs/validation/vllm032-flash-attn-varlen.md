@@ -1,0 +1,102 @@
+# vLLM 0.32 HCU FlashAttention varlen validation
+
+This record validates the explicit Plugin-owned `FLASH_ATTN` route. vLLM owns
+the default-preserving KV read/write and kernel seams, the Adapter owns HCU
+platform selection and configuration validation, and the Plugin owns the
+optional public `flash_attn.flash_attn_varlen_func` implementation. The
+default HCU attention backend remains vLLM's upstream Triton backend.
+
+## Candidate ownership
+
+| Component | Revision | Wheel | SHA256 |
+| --- | --- | --- | --- |
+| vLLM | `923e3284c` | `vllm-0.32.0+rocm723-cp312-cp312-linux_x86_64.whl` | `3e2798384365084cbcbcb61d0fff713a8c27fae22c0980fb85b6dd93d3e47c22` |
+| Adapter | `d7487a8` | `sgl_kernel-0.1.0-py3-none-any.whl` | `a8e2b7fea4a13352c7f3dc3365f8c4579cc8ac941bd4d2f408100f24286affd7` |
+| Plugin | `e9091776` | `hcu_vllm_das_plugin-0.2.0.dev0-py3-none-any.whl` | `d6b29546e2e9eaa5887862c2176b8c0fc0bdea6aa77c235580a3a3f93f228f53` |
+
+Installed-state inspection resolved all three packages from the isolated
+candidate environment. The installed upstream class exposed
+`_get_kv_cache_views`, `_get_kv_cache_write_views`, and
+`_run_flash_attention`; the Plugin reported DCP disabled, exact block-size 64
+support, and only `auto`, `float16`, and `bfloat16` KV cache dtypes.
+
+## Numerical and Graph gate
+
+The live HCU test writes K/V through vLLM's official stride-aware cache writer,
+reads the same storage through the Plugin's zero-copy HND aliases, and compares
+the public vendor varlen result with a Torch float32 reference. It covers BF16
+prefill, BF16 decode, Qwen-style 14/2 short GQA, FP16 MHA, FP16 GQA, and Graph
+replay after changing Q/K/V at the same addresses.
+
+```bash
+HCU_ADAPTER_HOST=none \
+VLLM_PLUGINS=hcu_adapter \
+VLLM_CUDART_SO_PATH=/opt/dtk/lib/libamdhip64.so \
+HIP_VISIBLE_DEVICES=0 \
+VLLM032_HCU_TEST=1 \
+PYTHONPATH=<plugin-source>:<candidate-site-packages> \
+<candidate-python> -m pytest -q \
+  tests/vllm032/test_flash_attention_hcu.py
+```
+
+Result: `6 passed` in 35.27 seconds. The audited absolute and relative
+tolerance was 0.016. Portable Plugin tests were `96 passed, 12 skipped`;
+Adapter bridge/extension tests were `49 passed`; the Adapter L0 gate was GREEN
+with 32 pre-existing bare-environment warnings; vLLM seam tests were `2 passed,
+158 deselected`.
+
+Negative tests verify that a stock vLLM 0.32 build without all three seams
+fails during explicit Plugin import. Explicit Adapter selection calls the
+Plugin backend's normal `validate_configuration()` path. DCP, FP8 KV, page
+sizes other than 64, sinks, RSWA, multimodal prefix masks, and active FA4-only
+arguments fail closed.
+
+## Non-eager model service gate
+
+The final wheel set was launched without `--enforce-eager`:
+
+```bash
+HCU_ADAPTER_HOST=none \
+VLLM_PLUGINS=hcu_adapter \
+VLLM_CUDART_SO_PATH=/opt/dtk/lib/libamdhip64.so \
+HIP_VISIBLE_DEVICES=0 \
+PYTHONPATH=<candidate-site-packages> \
+vllm serve /model/Qwen2-0.5B-Instruct \
+  --host 127.0.0.1 --port 18083 \
+  --dtype bfloat16 \
+  --attention-backend FLASH_ATTN \
+  --block-size 64 \
+  --gpu-memory-utilization 0.05 \
+  --max-model-len 512 \
+  --max-num-seqs 4
+```
+
+The engine reported vLLM `0.32.0+rocm723`, `enforce_eager=False`, LBHNC KV
+layout, and `FULL_AND_PIECEWISE`. Both PIECEWISE and FULL Graph captures
+completed; the second capture reported 0.17 GiB actual Graph memory. A prompt
+with five tokens exercised the short-prefill boundary and returned HTTP 200,
+24 completion tokens, and the `vllm-0.32.0+rocm723` fingerprint. The service
+then shut down cleanly and left no owned API or engine process.
+
+## HumanEval/0-15 control
+
+Before the fail-closed review patch, the same kernel implementation and model
+served the ordered HumanEval/0-15 prefix from HumanEval commit
+`6d43fb980f9fee3c892a914eda09951f772ad10d`. Requests used temperature 0,
+seed 0, thinking disabled, and 320 maximum tokens. All 16 requests completed
+in 13.08 seconds with 4,184 completion tokens; finish reasons were 12 stop and
+4 length.
+
+Sandboxed scoring produced **5/16, pass@1 0.3125**, with tasks 3, 7, 8, 13,
+and 15 passing. The Triton control produced the same score and exact passing
+task set. The later review patch changes only compatibility/configuration
+fail-closed checks and test coverage; the final wheels were revalidated by the
+numerical, Graph, and model-service gates above. Raw evidence is under
+`/dev/shm/vllm032-flash-candidate.KQDH7R/humaneval16-flash`.
+
+## Scope
+
+This validates the available single-device HCU topology, BF16/FP16 dense
+decoder MHA/GQA, LBHNC storage, 64-token pages, and the public vendor varlen
+interface. It does not claim DCP, FP8 KV, hybrid cache layouts, alternate page
+sizes, FA4-only masks, tensor parallelism, or a throughput improvement.
