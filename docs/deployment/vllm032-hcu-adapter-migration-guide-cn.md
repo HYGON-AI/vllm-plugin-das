@@ -1,6 +1,6 @@
 # adapter-das + vLLM 0.32 跨机器迁移与验证手册
 
-更新时间：2026-10-28
+更新时间：2026-10-30
 
 本文面向在 HCU 服务器部署官方 vLLM `v0.32.0`、`adapter-das` 与 DAS
 优化插件的工程人员。本文只描述新组合；旧 Adapter 的验证结论不能直接继承。
@@ -13,8 +13,8 @@ official vLLM 0.32.0
        ├─ vllm.platform_plugins / vllm.general_plugins
        └─ hcu_adapter.extensions API v1
             └─ hcu-vllm-das-plugin
-                 ├─ LightOp RMSNorm
-                 └─ LightOp SiluAndMul
+                 ├─ LightOp RMSNorm（显式 opt-in）
+                 └─ AITER INT8 W8A8 MoE（`--moe-backend aiter`）
 ```
 
 - Adapter 独占 vLLM platform/general plugin 入口和版本、平台、DTK 门禁。
@@ -27,21 +27,23 @@ official vLLM 0.32.0
 | 组件 | 仓库/分支或提交 |
 | --- | --- |
 | 官方 vLLM | tag `v0.32.0`，commit `5df63a7203cdb9328d824a27b682e77c7b9928be` |
-| Adapter | `https://github.com/alexanderbin123/adapter-das.git`，branch `feat/vllm032-runtime-integration`，验证基线 `81361880e203cb33cf631f77716ac8244f5f299f` |
-| DAS Plugin | `https://github.com/alexanderbin123/vllm-plugin-das.git`，branch `feat/adapter-das-extension-api` |
+| Adapter | `https://github.com/alexanderbin123/adapter-das.git`，branch `feat/vllm032-adapter-delivery-gates`，验证基线 `c99886d41f435e594050d47663e03ea94081fdc6` |
+| DAS Plugin | `https://github.com/alexanderbin123/vllm-plugin-das.git`，branch `feat/vllm032-plugin-onoff-gates` |
 
 Plugin 仓库根目录仍保留其他 vLLM 版本的开发代码；vLLM 0.32 只构建
 `adapter_extension/`。
 
 ## 3. 当前候选 wheel
 
-`validation/v0.32.0/compat-lock.json` 是机器可读锁。当前候选为：
+[`validation/v0.32.0/compat-lock.json`](../../validation/v0.32.0/compat-lock.json)
+是当前候选的机器可读权威来源。下表只是该锁文件的部署快照；两者不一致时必须
+停止部署并更新本文，不能绕过锁文件校验：
 
 | wheel | SHA256 |
 | --- | --- |
-| `vllm-0.32.0+rocm723-cp312-cp312-linux_x86_64.whl` | `de61890d0a66ae12b84908962c5426bc7a64d66ac8d8c64ceb2c2bc0c31f722a` |
-| `sgl_kernel-0.1.0-py3-none-any.whl` | `bbc7de3745d736b5b8e82f55dfdab5e3a80ad8e8908e5388de76d394e7e0f50a` |
-| `hcu_vllm_das_plugin-0.2.0.dev0-py3-none-any.whl` | `7186603c9c5aa09ad2a19c38589bebc68944b42ac90f51fe0922a44f2c73729c` |
+| `vllm-0.32.0+rocm723-cp312-cp312-linux_x86_64.whl` | `d7f084b8754288893dd9ba28d24784ec4b4e59350c9bfb5038ec24ac3af9572b` |
+| `sgl_kernel-0.1.0-py3-none-any.whl` | `69b655ca747718eed3c4487e984fe749b73880369f20ab0288fc76799db0c6db` |
+| `hcu_vllm_das_plugin-0.2.0.dev0-py3-none-any.whl` | `b57733fbde63fb252e74492596aaed4c69b40b724eefb14e97eb51324ae11e14` |
 
 这些哈希只标识本轮候选，不等于生产批准。重新构建后必须生成新哈希和新证据。
 
@@ -105,7 +107,9 @@ HSA_VISIBLE_DEVICES=0 HIP_VISIBLE_DEVICES=0 \
 - Adapter 是期望的 vLLM platform/general entry-point owner；
 - 当前平台精确为 `hcu_adapter.bridges.vllm.HcuPlatform`；
 - Plugin wheel 拥有 `das_hcu`，扩展状态为 `active`；
-- RMSNorm/SiluAndMul capability 和 OOT class owner 精确匹配。
+- Plugin capability 精确包含 `lightop-rms-norm` 与 `aiter-int8-moe`；
+- RMSNorm OOT class owner 精确为 Plugin，`SiluAndMul` 继续由官方 vLLM 提供；
+- 显式选择 `--moe-backend aiter` 时，INT8 oracle 精确解析到 Plugin provider。
 
 editable 安装、空 RECORD、模块来源越界、入口缺失、平台错误或扩展降级都不通过。
 
@@ -118,26 +122,34 @@ VLLM_TARGET_ROOT=/opt/src/vllm-0.32.0 \
 "$HCU_VENV/bin/python" -m pytest -q tests/vllm032
 ```
 
-未设置 live 开关时，两项 HCU 测试应 skip；skip 不能当作实机通过。
-本轮新组合的便携契约结果为 `62 passed, 2 skipped`。
+未设置 live 开关时，HCU 测试应 skip；skip 不能当作实机通过。已锁定候选的
+便携结果以 compat lock 的 `gates.static_portable_tests` 为准。
 
-在确认卡空闲后分别执行：
+在确认卡空闲后执行 RMSNorm eager/compile 与 ON/OFF Graph 验收：
 
 ```bash
-VLLM_PLUGINS=hcu_adapter HCU_VLLM032_RMSNORM_LIVE=1 \
+VLLM_PLUGINS=hcu_adapter \
+HCU_VLLM032_RMSNORM_LIVE=1 HCU_VLLM032_GRAPH_LIVE=1 \
 HSA_VISIBLE_DEVICES=0 HIP_VISIBLE_DEVICES=0 \
 "$HCU_VENV/bin/python" -m pytest -q -rs \
-  tests/vllm032/test_rms_norm_hcu.py
-
-VLLM_PLUGINS=hcu_adapter HCU_VLLM032_LIVE=1 \
-HSA_VISIBLE_DEVICES=0 HIP_VISIBLE_DEVICES=0 \
-"$HCU_VENV/bin/python" -m pytest -q -rs \
-  tests/vllm032/test_silu_and_mul_hcu.py
+  tests/vllm032/test_rms_norm_hcu.py \
+  tests/vllm032/test_operator_graph_hcu.py
 ```
 
-测试只接受 `gfx936`/`gfx938`，并同时验证优化数值和 master/算子级回滚。
-本轮在空闲 `gfx936` card 0 上 RMSNorm 与 SiluAndMul 分别得到
-`1 passed`；结束后 8 张卡均回到 `0%` 使用率、`2 MiB` 显存基线。
+需要验收显式 AITER INT8 W8A8 MoE 路径时，单独执行：
+
+```bash
+VLLM_PLUGINS=hcu_adapter HCU_VLLM032_AITER_INT8_LIVE=1 \
+HSA_VISIBLE_DEVICES=0 HIP_VISIBLE_DEVICES=0 \
+"$HCU_VENV/bin/python" -m pytest -q -rs \
+  tests/vllm032/test_aiter_int8_hcu.py
+```
+
+这些测试只接受 `gfx936`/`gfx938`，并验证数值与 Graph replay。RMSNorm
+还验证 master/算子级回滚；AITER 路径只在显式指定 `--moe-backend aiter`
+时接管。实机结果分别记录在
+[`vllm032-upstream-first-operator-ab.md`](../validation/vllm032-upstream-first-operator-ab.md)
+和 [`vllm032-aiter-int8-moe.md`](../validation/vllm032-aiter-int8-moe.md)。
 
 ## 8. 关闭 eager 模式
 
@@ -147,7 +159,6 @@ vLLM 默认 `enforce_eager=False`。服务命令不要传 `--enforce-eager`，�
 ```bash
 VLLM_PLUGINS=hcu_adapter \
 VLLM_HCU_USE_CUSTOM_OPS=1 \
-VLLM_HCU_USE_CUSTOM_SILU_AND_MUL=1 \
 VLLM_HCU_USE_CUSTOM_RMS_NORM=1 \
 HIP_VISIBLE_DEVICES=0 \
 "$HCU_VENV/bin/python" -m vllm.entrypoints.cli.main \
@@ -165,13 +176,15 @@ HIP_VISIBLE_DEVICES=0 \
 ## 9. 回滚
 
 ```bash
-# 全部优化回到 vLLM 原生实现
+# 所有环境变量门控的 LightOp 优化回到 vLLM 原生实现
 export VLLM_HCU_USE_CUSTOM_OPS=0
 
-# 或只关闭一个算子
+# 或只关闭 RMSNorm
 export VLLM_HCU_USE_CUSTOM_RMS_NORM=0
-export VLLM_HCU_USE_CUSTOM_SILU_AND_MUL=0
 ```
+
+AITER INT8 MoE 不受上述环境变量控制；回滚时不要传
+`--moe-backend aiter`，让 vLLM 使用其默认 backend 选择策略。
 
 也可卸载 `hcu-vllm-das-plugin`。卸载后必须重启进程，不能在运行中的进程动态
 撤销 OOT 注册。Adapter 和官方 vLLM 保持安装。

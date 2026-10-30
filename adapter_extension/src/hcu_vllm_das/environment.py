@@ -28,7 +28,7 @@ def _flag(name: str, *, default: bool) -> bool:
 def custom_ops_enabled() -> bool:
     """Return the process-wide rollback state for DAS custom operators."""
 
-    return _flag(_MASTER_SWITCH, default=True)
+    return _flag(_MASTER_SWITCH, default=False)
 
 
 def rms_norm_enabled() -> bool:
