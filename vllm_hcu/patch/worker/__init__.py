@@ -273,6 +273,10 @@ _OP_CALLBACKS: tuple[_CallbackSpec, ...] = (
     _CallbackSpec(_adapter("op_opt", "patch_kimi_k3_eplb_model")),
     _CallbackSpec(_adapter("op_opt", "patch_kimi_k3_reference_paths")),
     _CallbackSpec(_adapter("op_opt", "patch_kimi_k3_mla_gate")),
+    # fp8 decode epilogue: Triton q-concat + cache-rope route replacing the
+    # vendor fused op, which drops warp writes at large B under FULL
+    # cudagraph replay. Opt-out: VLLM_HCU_K3_QCAT_TRITON=0.
+    _CallbackSpec(_adapter("op_opt", "patch_kimi_k3_nc_qcat")),
     # Must be applied after reference_paths: it wraps the
     # forward_attn_residual that adapter installs and captures it as the
     # non-SP chain. Opt-in: armed only with VLLM_HCU_K3_SP_MOE=1.
