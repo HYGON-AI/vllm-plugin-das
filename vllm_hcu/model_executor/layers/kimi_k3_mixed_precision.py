@@ -157,7 +157,7 @@ class KimiK3MixedKDAProjection(nn.Module):
         fused = self._fused_qkv
         layers = [self.q_proj, self.k_proj, self.v_proj]
         axis = 0 if fused.weight.shape[0] == sum(x.weight.shape[0] for x in layers) else 1
-        with torch.no_grad():
+        with torch.inference_mode():
             torch.cat([x.weight for x in layers], dim=axis, out=fused.weight)
             torch.cat([x.weight_scale for x in layers], dim=0, out=fused.weight_scale)
         self._fused_refresh_deferred = False
