@@ -30,9 +30,6 @@
   }
 
 TORCH_LIBRARY_EXPAND(TORCH_EXTENSION_NAME, ops) {
-  ops.def("hipblaslt_fp8_bmm(Tensor x, Tensor weight, Tensor x_scale, "
-          "Tensor weight_scale, Tensor(a!) out) -> ()");
-  ops.impl("hipblaslt_fp8_bmm", torch::kCUDA, &hipblaslt_fp8_bmm);
   ops.def("init_custom_ar(int[] ipc_tensors, Tensor rank_data, int rank, bool fully_connected) -> int");
   ops.impl("init_custom_ar", torch::kCUDA, &init_custom_ar);
   ops.def("all_reduce(int fa, Tensor inp, Tensor! out, int reg_buffer, int reg_buffer_sz_bytes) -> ()");
