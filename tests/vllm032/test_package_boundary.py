@@ -94,13 +94,15 @@ def test_built_wheel_contains_only_the_new_plugin_namespace(tmp_path: Path) -> N
         wheel_metadata = archive.read(metadata_name).decode("utf-8")
         entry_points = archive.read(entry_points_name).decode("utf-8")
 
-    assert "Name: hcu-vllm-das-plugin\n" in wheel_metadata
-    assert "Version: 0.2.0.dev0\n" in wheel_metadata
-    assert "Requires-Dist: sgl-kernel>=0.1.0\n" in wheel_metadata
-    assert "[hcu_adapter.extensions]\n" in entry_points
-    assert "das_hcu = hcu_vllm_das.extension:extension_spec\n" in entry_points
-    assert "[vllm.platform_plugins]\n" not in entry_points
-    assert "[vllm.general_plugins]\n" not in entry_points
+    metadata_lines = wheel_metadata.splitlines()
+    entry_point_lines = entry_points.splitlines()
+    assert "Name: hcu-vllm-das-plugin" in metadata_lines
+    assert "Version: 0.2.0.dev0" in metadata_lines
+    assert "Requires-Dist: sgl-kernel>=0.1.0" in metadata_lines
+    assert "[hcu_adapter.extensions]" in entry_point_lines
+    assert "das_hcu = hcu_vllm_das.extension:extension_spec" in entry_point_lines
+    assert "[vllm.platform_plugins]" not in entry_point_lines
+    assert "[vllm.general_plugins]" not in entry_point_lines
     assert any(name == "hcu_vllm_das/__init__.py" for name in names)
     assert "hcu_vllm_das/attention/__init__.py" in names
     assert "hcu_vllm_das/attention/flash_attn.py" in names
