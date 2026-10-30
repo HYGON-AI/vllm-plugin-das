@@ -493,7 +493,8 @@ def test_mixed_and_fused_branches_compose_with_installed_kimi_model_loader():
         assert torch.all(model.direct.weight == 1)
 
 @pytest.mark.parametrize('transposed', [False, True])
-def test_opt_in_fused_qkv_reuses_quant_method_and_preserves_gate(monkeypatch, transposed):
+@pytest.mark.parametrize('entry', ['reload_weights', 'finish_target', 'finish_draft'])
+def test_opt_in_fused_qkv_reuses_quant_method_and_preserves_gate(monkeypatch, transposed, entry):
     monkeypatch.setenv('VLLM_HCU_KIMI_KDA_FUSE_QKV', '1')
     calls = []
 
@@ -532,10 +533,34 @@ def test_opt_in_fused_qkv_reuses_quant_method_and_preserves_gate(monkeypatch, tr
     expected = projection(x)[0]
     calls.clear()
     projection._fuse_qkv = True
-    actual = projection(x)[0]
+    with torch.inference_mode():
+        actual = projection(x)[0]
     torch.testing.assert_close(actual, expected)
     assert len(calls) == 1
     cache = projection._fused_qkv
+    assert cache.weight.is_inference() and cache.weight_scale.is_inference()
+    from vllm.v1.worker.gpu_worker import Worker
+    from vllm_hcu.v1.worker import HcuGPUWorker
+    from vllm_hcu.patch.worker.core_fix import patch_deepseek_v4_attention
+    from vllm_hcu.model_executor.layers.fused_moe import glm53_router_gemv
+    monkeypatch.setattr(patch_deepseek_v4_attention, 'refresh_compressor_nt_weights', lambda model: None)
+    monkeypatch.setattr(glm53_router_gemv, 'refresh_glm53_router_gates', lambda model: None)
+    name = 'reload_weights' if entry == 'reload_weights' else 'finish_weight_update'
+    monkeypatch.setattr(Worker, name, lambda self, *args, **kwargs: None)
+    worker = object.__new__(HcuGPUWorker)
+    worker._weight_update_is_draft = entry == 'finish_draft'
+    other = nn.Module()
+    target = other if entry == 'finish_draft' else projection
+    draft = projection if entry == 'finish_draft' else other
+    worker.model_runner = SimpleNamespace(model=target, get_draft_model=lambda: draft)
+    weight_ptr, scale_ptr = cache.weight.data_ptr(), cache.weight_scale.data_ptr()
+    with torch.no_grad():
+        projection.q_proj.weight.fill_(2)
+        projection.k_proj.weight_scale.fill_(3)
+    getattr(worker, name)()
+    assert cache.weight.data_ptr() == weight_ptr and cache.weight_scale.data_ptr() == scale_ptr
+    assert cache.weight_scale[3:6].eq(3).all()
+    assert (cache.weight[:, :3] if transposed else cache.weight[:3]).eq(2).all()
     projection(x)
     assert projection._fused_qkv is cache
     assert cache.weight.data_ptr() != projection.q_proj.weight.data_ptr()
