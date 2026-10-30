@@ -85,6 +85,95 @@ def test_hcu_accepts_gptq_alias_selected_by_current_vllm() -> None:
     HCUPlatform.verify_quantization(resolved)
 
 
+def test_hcu_accepts_awq_alias_selected_by_current_vllm(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    from vllm.model_executor.layers.quantization import get_quantization_config
+    from vllm_hcu.platforms.hcu import HCUPlatform
+
+    monkeypatch.delenv("VLLM_USE_TRITON_AWQ", raising=False)
+    awq_config = {
+        "quant_method": "awq",
+        "bits": 4,
+        "group_size": 128,
+        "zero_point": True,
+    }
+    resolved = get_quantization_config("awq").override_quantization_method(
+        awq_config,
+        user_quant=None,
+    )
+
+    assert resolved == "auto_awq"
+    HCUPlatform.verify_quantization(resolved)
+    assert os.environ.get("VLLM_USE_TRITON_AWQ") == "1"
+
+
+@pytest.mark.parametrize(("num_tokens", "expected"), ((1, 3.0), (256, 128.0)))
+def test_hcu_auto_awq_dense_linear_uses_triton_when_lightop_is_disabled(
+    monkeypatch: pytest.MonkeyPatch,
+    num_tokens: int,
+    expected: float,
+) -> None:
+    import vllm.model_executor.parameter as parameter
+    from vllm.model_executor.layers.linear import ReplicatedLinear
+    from vllm.model_executor.layers.quantization import awq_triton
+    from vllm.model_executor.layers.quantization.auto_awq import (
+        AutoAWQConfig,
+        AutoAWQLinearMethod,
+    )
+    from vllm_hcu.platforms.hcu import HCUPlatform
+
+    monkeypatch.delenv("VLLM_USE_TRITON_AWQ", raising=False)
+    monkeypatch.setenv("VLLM_HCU_USE_LIGHTOP_AWQ", "0")
+    monkeypatch.setattr(parameter, "get_tensor_model_parallel_rank", lambda: 0)
+    monkeypatch.setattr(
+        parameter, "get_tensor_model_parallel_world_size", lambda: 1
+    )
+
+    def triton_gemm(input, qweight, scales, qzeros, split_k_iters):
+        return torch.full(
+            (input.shape[0], qweight.shape[1] * 8),
+            3.0,
+            dtype=input.dtype,
+            device=input.device,
+        )
+
+    def triton_dequantize(qweight, scales, qzeros):
+        return torch.ones(
+            (qweight.shape[0], qweight.shape[1] * 8),
+            dtype=scales.dtype,
+            device=scales.device,
+        )
+
+    monkeypatch.setattr(awq_triton, "awq_gemm_triton", triton_gemm)
+    monkeypatch.setattr(awq_triton, "awq_dequantize_triton", triton_dequantize)
+
+    HCUPlatform.verify_quantization("auto_awq")
+    assert os.environ.get("VLLM_USE_TRITON_AWQ") == "1"
+
+    config = AutoAWQConfig(4, 128, True, False)
+    layer = ReplicatedLinear(
+        128,
+        8,
+        bias=False,
+        params_dtype=torch.float16,
+        quant_config=config,
+        return_bias=False,
+        disable_tp=True,
+    )
+    assert isinstance(layer.quant_method, AutoAWQLinearMethod)
+
+    inputs = torch.ones((num_tokens, 128), dtype=torch.float16)
+    output = layer(inputs)
+
+    torch.testing.assert_close(
+        output,
+        torch.full_like(output, expected),
+        rtol=0,
+        atol=0,
+    )
+
+
 def _run_fresh_target(code: str) -> subprocess.CompletedProcess[str]:
     env = dict(os.environ)
     for name in (
