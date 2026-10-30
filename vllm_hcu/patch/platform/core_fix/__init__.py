@@ -34,6 +34,7 @@ from . import (
     patch_import_utils,
     patch_gdn_conv_probe,
     patch_smoke_layer_filter,
+    patch_decode_bench_connector,
     patch_layer_name,
     patch_nixl_utils,
     patch_qwen4_exp_pp,
@@ -68,6 +69,7 @@ _ORDERED_ADAPTERS = (
     patch_step5_ep_graph_capture,
     patch_smoke_layer_filter,
     patch_gdn_conv_probe,
+    patch_decode_bench_connector,
 )
 
 
