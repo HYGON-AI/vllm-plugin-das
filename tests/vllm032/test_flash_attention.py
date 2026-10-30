@@ -1,0 +1,181 @@
+from __future__ import annotations
+
+import importlib
+import os
+import sys
+from pathlib import Path
+from types import ModuleType, SimpleNamespace
+
+import pytest
+import torch
+
+PLUGIN_SOURCE_ROOT = (
+    Path(__file__).resolve().parents[2] / "adapter_extension" / "src"
+)
+sys.path.insert(0, os.fspath(PLUGIN_SOURCE_ROOT))
+
+
+def load_flash_attention(monkeypatch: pytest.MonkeyPatch):
+    class FlashAttentionImpl:
+        def __init__(self, *args, **kwargs):
+            self.vllm_flash_attn_version = kwargs.pop("version", None)
+
+    class FlashAttentionBackend:
+        @classmethod
+        def get_preferred_block_size(cls, default_block_size):
+            return default_block_size
+
+    vllm = ModuleType("vllm")
+    vllm.__path__ = []
+    v1 = ModuleType("vllm.v1")
+    v1.__path__ = []
+    attention = ModuleType("vllm.v1.attention")
+    attention.__path__ = []
+    backends = ModuleType("vllm.v1.attention.backends")
+    backends.__path__ = []
+    official = ModuleType("vllm.v1.attention.backends.flash_attn")
+    official.FlashAttentionImpl = FlashAttentionImpl
+    official.FlashAttentionBackend = FlashAttentionBackend
+    layouts = ModuleType("vllm.v1.kv_cache_layout")
+    layouts.KVCacheLayout = SimpleNamespace(LBHNC="LBHNC")
+    for name, module in (
+        ("vllm", vllm),
+        ("vllm.v1", v1),
+        ("vllm.v1.attention", attention),
+        ("vllm.v1.attention.backends", backends),
+        ("vllm.v1.attention.backends.flash_attn", official),
+        ("vllm.v1.kv_cache_layout", layouts),
+    ):
+        monkeypatch.setitem(sys.modules, name, module)
+    monkeypatch.delitem(
+        sys.modules,
+        "hcu_vllm_das.attention.flash_attn",
+        raising=False,
+    )
+    return importlib.import_module("hcu_vllm_das.attention.flash_attn")
+
+
+def test_dense_hnd_views_separate_kv_and_preserve_block_stride(monkeypatch):
+    flash = load_flash_attention(monkeypatch)
+    num_blocks, num_heads, block_size, head_size = 2, 3, 4, 5
+    half_page = num_heads * block_size * head_size
+    block_stride = 2 * half_page + 17
+    storage_offset = 13
+    raw = torch.zeros(storage_offset + block_stride * num_blocks)
+    packed = torch.as_strided(
+        raw,
+        size=(num_blocks, num_heads, block_size, 2 * head_size),
+        stride=(block_stride, block_size * 2 * head_size, 2 * head_size, 1),
+        storage_offset=storage_offset,
+    )
+
+    key, value = flash._dense_hnd_kv_cache_views(packed, head_size)
+    key.fill_(11)
+    value.fill_(22)
+
+    assert key.shape == value.shape == (
+        num_blocks,
+        num_heads,
+        block_size,
+        head_size,
+    )
+    assert key.stride() == value.stride() == (
+        block_stride,
+        block_size * head_size,
+        head_size,
+        1,
+    )
+    assert key.storage_offset() == storage_offset
+    assert value.storage_offset() == storage_offset + half_page
+    torch.testing.assert_close(
+        raw[storage_offset : storage_offset + half_page],
+        torch.full((half_page,), 11.0),
+    )
+    torch.testing.assert_close(
+        raw[storage_offset + half_page : storage_offset + 2 * half_page],
+        torch.full((half_page,), 22.0),
+    )
+    torch.testing.assert_close(
+        raw[
+            storage_offset + block_stride : storage_offset
+            + block_stride
+            + half_page
+        ],
+        torch.full((half_page,), 11.0),
+    )
+    torch.testing.assert_close(
+        raw[
+            storage_offset + block_stride + half_page : storage_offset
+            + block_stride
+            + 2 * half_page
+        ],
+        torch.full((half_page,), 22.0),
+    )
+    torch.testing.assert_close(
+        raw[storage_offset + 2 * half_page : storage_offset + block_stride],
+        torch.zeros(17),
+    )
+
+
+def test_backend_selects_fa2_hnd_layout_and_64_token_pages(monkeypatch):
+    flash = load_flash_attention(monkeypatch)
+
+    impl = flash.HcuFlashAttentionImpl()
+
+    assert impl.vllm_flash_attn_version == 2
+    assert flash.HcuFlashAttentionBackend.get_impl_cls() is type(impl)
+    assert flash.HcuFlashAttentionBackend.supported_kv_cache_layouts() == (
+        "LBHNC",
+    )
+    assert flash.HcuFlashAttentionBackend.get_supported_kernel_block_sizes() == [64]
+    assert flash.HcuFlashAttentionBackend.get_preferred_block_size(16) == 64
+
+
+def test_varlen_boundary_forwards_fa2_keywords_without_fa4_options(monkeypatch):
+    flash = load_flash_attention(monkeypatch)
+    calls = []
+
+    def vendor(**kwargs):
+        calls.append(kwargs)
+        return "vendor-output"
+
+    monkeypatch.setattr(flash, "_vendor_varlen_func", lambda: vendor)
+    impl = flash.HcuFlashAttentionImpl()
+
+    result = impl._run_flash_attention(
+        q="q",
+        k="k",
+        v="v",
+        out="out",
+        dynamic_causal=None,
+        mask_mod=None,
+        aux_tensors=None,
+        num_splits=3,
+    )
+
+    assert result == "vendor-output"
+    assert calls == [
+        {
+            "q": "q",
+            "k": "k",
+            "v": "v",
+            "out": "out",
+            "num_splits": 3,
+            "layout": "bhsd",
+            "fa_version": 2,
+        }
+    ]
+
+
+@pytest.mark.parametrize("name", ("dynamic_causal", "mask_mod", "aux_tensors"))
+def test_varlen_boundary_rejects_active_fa4_options(monkeypatch, name):
+    flash = load_flash_attention(monkeypatch)
+    monkeypatch.setattr(
+        flash,
+        "_vendor_varlen_func",
+        lambda: pytest.fail("vendor must not run"),
+    )
+    impl = flash.HcuFlashAttentionImpl()
+
+    with pytest.raises(NotImplementedError, match=name):
+        impl._run_flash_attention(q="q", k="k", v="v", **{name: object()})
