@@ -75,6 +75,16 @@ register_hcu_ci(
     est_time=60,
 )
 register_hcu_ci(
+    job="accuracy-gfx936",
+    target="tests/accuracy/test_autoawq_triton_bf16.py",
+    est_time=60,
+)
+register_hcu_ci(
+    job="accuracy-gfx938",
+    target="tests/accuracy/test_autoawq_triton_bf16.py",
+    est_time=60,
+)
+register_hcu_ci(
     job="accuracy-gfx938",
     target="tests/accuracy/test_moe_align_fallback_graph.py",
     est_time=120,
