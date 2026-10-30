@@ -401,16 +401,16 @@ def _worker_guard():
     # vllm_hcu.v1.worker needs a full vLLM; execute only the guard functions.
     source = (Path(__file__).parents[2] / "vllm_hcu/v1/worker.py").read_text(encoding="utf-8")
     tree = ast.parse(source)
-    names = {"_has_convrot_lm_head", "_reject_convrot_checkpoint_reload"}
+    names = {"_has_convrot_lm_head", "_reject_convrot_checkpoint_reload", "_reject_convrot_weight_update"}
     nodes = [n for n in tree.body if isinstance(n, ast.FunctionDef) and n.name in names]
     assert {n.name for n in nodes} == names
     namespace = {"torch": torch}
     exec(compile(ast.Module(nodes, []), "worker", "exec"), namespace)
-    return tree, namespace["_reject_convrot_checkpoint_reload"]
+    return tree, namespace["_reject_convrot_checkpoint_reload"], namespace["_reject_convrot_weight_update"]
 
 
 def test_checkpoint_reload_guard_rejects_only_checkpoint_format_on_convrot_head(runtime):
-    _, reject = _worker_guard()
+    _, reject, _ = _worker_guard()
     plain = nn.Sequential(nn.Linear(2, 2), _head())
     convrot = nn.Sequential(nn.Linear(2, 2), _head())
     convrot[1].quant_method = runtime.ConvRotINT8LMHeadMethod(SimpleNamespace())
@@ -424,15 +424,33 @@ def test_checkpoint_reload_guard_rejects_only_checkpoint_format_on_convrot_head(
     reject(convrot, (), {"is_checkpoint_format": False})
 
 
-def test_worker_reload_weights_runs_the_guard_before_the_runner():
-    tree, _ = _worker_guard()
+def test_online_weight_update_guard_rejects_convrot_head(runtime):
+    _, _, reject = _worker_guard()
+    plain = nn.Sequential(nn.Linear(2, 2), _head())
+    convrot = nn.Sequential(nn.Linear(2, 2), _head())
+    convrot[1].quant_method = runtime.ConvRotINT8LMHeadMethod(SimpleNamespace())
+    reject(plain)
+    with pytest.raises(RuntimeError, match="online weight updates"):
+        reject(convrot)
+
+
+@pytest.mark.parametrize(
+    ("method", "guard", "parent"),
+    [
+        ("reload_weights", "_reject_convrot_checkpoint_reload", "super().reload_weights"),
+        ("start_weight_update", "_reject_convrot_weight_update", "super().start_weight_update"),
+        ("start_draft_weight_update", "_reject_convrot_weight_update", "super().start_draft_weight_update"),
+    ],
+)
+def test_worker_entry_points_run_the_guard_before_mutating(method, guard, parent):
+    tree, _, _ = _worker_guard()
     worker = next(n for n in tree.body if isinstance(n, ast.ClassDef) and n.name == "HcuGPUWorker")
-    method = next(n for n in worker.body if isinstance(n, ast.FunctionDef) and n.name == "reload_weights")
+    node = next(n for n in worker.body if isinstance(n, ast.FunctionDef) and n.name == method)
     calls = [
-        ast.unparse(n.value.func) for n in method.body
+        ast.unparse(n.value.func) for n in node.body
         if isinstance(n, ast.Expr) and isinstance(n.value, ast.Call)
     ]
-    assert calls.index("_reject_convrot_checkpoint_reload") < calls.index("super().reload_weights")
+    assert calls.index(guard) < calls.index(parent)
 
 
 def test_adapter_constructor_contract_matches_target_source():

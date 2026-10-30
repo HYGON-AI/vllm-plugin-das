@@ -114,6 +114,20 @@ def _reject_convrot_checkpoint_reload(model: torch.nn.Module, args, kwargs) -> N
         )
 
 
+def _reject_convrot_weight_update(model: torch.nn.Module) -> None:
+    """Refuse an online weight-transfer session before it mutates any weight.
+
+    The transfer pushes BF16 weights and bypasses reload_weights(), so it would
+    leave the converted head with raw weights and stale scales. The draft model
+    shares the target head, so checking the target model covers both.
+    """
+    if _has_convrot_lm_head(model):
+        raise RuntimeError(
+            "ConvRot INT8 lm_head does not support online weight updates; "
+            "restart the worker with the new checkpoint"
+        )
+
+
 class HcuGPUWorker(Worker):
     """A worker class that executes (a partition of) the model on a HCU.
     Each worker is associated with a single HCU. In case of
@@ -166,6 +180,14 @@ class HcuGPUWorker(Worker):
                 "GLM5Next FP32 router GEMV bound to %d layers", num_router_gates
             )
         validate_worker_patches(require_applied=True)
+
+    def start_weight_update(self) -> None:
+        _reject_convrot_weight_update(self.model_runner.model)
+        super().start_weight_update()
+
+    def start_draft_weight_update(self) -> None:
+        _reject_convrot_weight_update(self.model_runner.model)
+        super().start_draft_weight_update()
 
     def reload_weights(self, *args, **kwargs) -> None:
         _reject_convrot_checkpoint_reload(self.model_runner.model, args, kwargs)
