@@ -75,12 +75,9 @@ class KimiK3MixedKDAProjection(nn.Module):
         self.fp_gate = merged_linear(
             input_size, output_sizes[3:], replicated_shard_id=1, tp_size=tp_size,
             quant_config=None, prefix=f"{prefix}.fp_gate", **kwargs)
-        # Parameters may be replaced or offloaded after construction, so keep
-        # the original objects to recognize offloader-managed Q/K/V storage.
-        self._qkv_param_refs = tuple(
-            param for layer in (self.q_proj, self.k_proj, self.v_proj)
-            for param in (layer.weight, layer.weight_scale)
-        )
+        # Record ownership after loading, before an offloader's functional_call
+        # temporarily replaces CPU parameters with device tensors.
+        self._qkv_offloaded = False
         self._fuse_qkv = os.environ.get("VLLM_HCU_KIMI_KDA_FUSE_QKV", "0") == "1"
         self._fused_qkv = None
         self._fused_refresh_deferred = False
@@ -104,10 +101,9 @@ class KimiK3MixedKDAProjection(nn.Module):
     def _make_fused_qkv(self, input_size):
         """Combine post-processed rank-local weights for fused QKV."""
         layers = [self.q_proj, self.k_proj, self.v_proj]
-        candidates = list(getattr(self, "_qkv_param_refs", ()))
-        candidates.extend(param for layer in layers
-                          for param in (layer.weight, layer.weight_scale))
-        if any(_is_offloaded_parameter(param) for param in candidates):
+        candidates = (param for layer in layers
+                      for param in (layer.weight, layer.weight_scale))
+        if getattr(self, "_qkv_offloaded", False) or any(_is_offloaded_parameter(param) for param in candidates):
             raise ValueError(
                 "VLLM_HCU_KIMI_KDA_FUSE_QKV is incompatible with weight "
                 "offloading: the fused QKV copy is not managed by the "
@@ -196,3 +192,15 @@ def refresh_kimi_kda_fused_qkv(model):
         for module in model.modules():
             if isinstance(module, KimiK3MixedKDAProjection):
                 module.refresh_fused_qkv()
+
+
+def record_kimi_kda_offload_ownership(model):
+    """Record ownership without retaining the pre-postprocessing parameters."""
+    if model is not None:
+        for module in model.modules():
+            if isinstance(module, KimiK3MixedKDAProjection):
+                module._qkv_offloaded = any(
+                    _is_offloaded_parameter(param)
+                    for layer in (module.q_proj, module.k_proj, module.v_proj)
+                    for param in (layer.weight, layer.weight_scale)
+                )

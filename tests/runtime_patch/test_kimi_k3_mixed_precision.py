@@ -661,3 +661,32 @@ def test_fused_qkv_allows_parameters_outside_offload(monkeypatch):
     monkeypatch.setattr(mixed, '_get_offloader', lambda: fake_offloader)
     fused = projection._make_fused_qkv(5)
     assert fused.weight.shape == (9, 5)
+
+
+@pytest.mark.parametrize('fuse', [False, True])
+def test_cpu_offload_ownership_survives_functional_call_without_retaining_parameters(monkeypatch, fuse):
+    import gc
+    import weakref
+    projection = _fused_projection(monkeypatch)
+    projection._fuse_qkv = fuse
+    originals = [weakref.ref(getattr(layer, name))
+                 for layer in (projection.q_proj, projection.k_proj, projection.v_proj)
+                 for name in ('weight', 'weight_scale')]
+    for layer in (projection.q_proj, projection.k_proj, projection.v_proj):
+        for name in ('weight', 'weight_scale'):
+            param = getattr(layer, name)
+            setattr(layer, name, nn.Parameter(param.detach().clone(), requires_grad=False))
+    del param
+    gc.collect()
+    assert all(ref() is None for ref in originals)
+    monkeypatch.setattr(mixed, '_get_offloader', lambda: SimpleNamespace(uva_offloading=False))
+    mixed.record_kimi_kda_offload_ownership(projection)
+    assert projection._qkv_offloaded
+    replacements = {name: param.detach().clone() for name, param in projection.named_parameters()}
+    # During functional_call the offloader-visible CPU parameters are replaced.
+    monkeypatch.setattr(mixed, '_get_offloader', lambda: None)
+    if fuse:
+        with pytest.raises(ValueError, match='incompatible with weight offloading'):
+            torch.func.functional_call(projection, replacements, (torch.ones(1, 5),))
+    else:
+        torch.func.functional_call(projection, replacements, (torch.ones(1, 5),))
