@@ -19,6 +19,7 @@ if TYPE_CHECKING:
     VLLM_HCU_USE_CAT_MLA: bool = False
     VLLM_HCU_DISABLE_DSA: bool = False
     VLLM_HCU_USE_FP8_MIXED_BATCH: bool = False
+    VLLM_HCU_SPARSE_MLA_PREFILL_WORKSPACE_DEDUP: bool = False
     VLLM_HCU_USE_CUSTOM_QUANTIZATION_GEMM: bool = True
     VLLM_HCU_USE_CUSTOM_OPS : bool = False
     VLLM_HCU_USE_CUSTOM_SILU_AND_MUL : bool = False
@@ -173,6 +174,8 @@ def resolve_hcu_flash_attn_mode(explicit_mode: Optional[str]) -> str:
     return "varlen"
 
 hcu_vllm_environment_variables: dict[str, Callable[[], Any]] = {
+    "VLLM_HCU_SPARSE_MLA_PREFILL_WORKSPACE_DEDUP":
+    lambda: _environment_flag(os.getenv("VLLM_HCU_SPARSE_MLA_PREFILL_WORKSPACE_DEDUP", "0")),
     # path to the logs of redirect-output, abstrac of related are ok
 
     # If set, vLLM will transpose weight to use nn layout.

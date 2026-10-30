@@ -31,6 +31,7 @@ _WRAPPER = "_vllm_hcu_attention_backend_metadata_wrapper"
 _HCU_FIELDS = (
     "num_kv_actual_tokens", "seq_indexes_list", "scatter_indexes_tensor",
     "gather_indexes_tensor", "cp_common_metadata",
+    "sparse_mla_workspace_block_table_cpu",
 )
 
 
@@ -92,6 +93,10 @@ def apply_to_module(module: ModuleType) -> bool:
     def hcu_common_init(self, *args, **kwargs):
         extras = {name: kwargs.pop(name, None) for name in _HCU_FIELDS}
         original_init(self, *args, **kwargs)
+        if extras["sparse_mla_workspace_block_table_cpu"] is None:
+            extras["sparse_mla_workspace_block_table_cpu"] = getattr(
+                self.block_table_tensor, "_hcu_sparse_mla_workspace_cpu_table", None
+            )
         if extras["num_kv_actual_tokens"] is None:
             extras["num_kv_actual_tokens"] = self.num_actual_tokens
         for name, value in extras.items():
@@ -101,10 +106,21 @@ def apply_to_module(module: ModuleType) -> bool:
     def hcu_unpadded(self, num_actual_tokens, num_actual_reqs):
         result = unpadded(self, num_actual_tokens, num_actual_reqs)
         result.num_kv_actual_tokens = num_actual_tokens
+        host = getattr(self, "sparse_mla_workspace_block_table_cpu", None)
+        result.sparse_mla_workspace_block_table_cpu = (
+            None if host is None else host[:num_actual_reqs]
+        )
         return result
 
     @functools.wraps(replace)
     def hcu_replace(self, **kwargs):
+        if (
+            "block_table_tensor" in kwargs
+            and "sparse_mla_workspace_block_table_cpu" not in kwargs
+        ):
+            kwargs["sparse_mla_workspace_block_table_cpu"] = getattr(
+                kwargs["block_table_tensor"], "_hcu_sparse_mla_workspace_cpu_table", None
+            )
         extras = {
             name: kwargs.pop(name, getattr(self, name, None)) for name in _HCU_FIELDS
         }

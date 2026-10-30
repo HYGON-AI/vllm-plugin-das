@@ -2410,9 +2410,11 @@ def test_ubatch_list_splits_use_python_ints_and_preserve_attention_metadata():
         )
     )
     metadata = SimpleNamespace(
-        positions=torch.arange(6), is_prefilling=torch.tensor([True, False])
+        positions=torch.arange(6), is_prefilling=torch.tensor([True, False]),
+        sparse_mla_workspace_block_table_cpu=np.array([[5, 1], [5, 2]], dtype=np.int32),
     )
     result = module._make_metadata_with_slice(slices[0], metadata)
+    assert result.sparse_mla_workspace_block_table_cpu.tolist() == [[5, 1]]
     torch.testing.assert_close(result.positions, torch.arange(3))
     torch.testing.assert_close(result.is_prefilling, torch.tensor([True]))
 

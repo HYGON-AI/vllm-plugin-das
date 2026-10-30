@@ -34,3 +34,6 @@ including the HCU adapter's existing PCP clone of the core builder.
 At 89088 max length the default stays 5. A larger factor reserves more workspace;
 this change has no measured serving-performance or model-accuracy claim.
 DeepSeek-V4.1 independent FlashMLA workspace builders remain out of scope.
+
+The optional plugin-side [workspace deduplication](sparse_mla_workspace_dedup.md)
+reduces repeated KV staging within this capacity without changing the allocation.

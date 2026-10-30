@@ -1449,3 +1449,38 @@ def test_hyv4_profile_chunks_only_draft_and_restores_propose(
     assert runner.max_num_tokens == 8192
     assert not in_replicated_mtp_batch()
     assert "propose" not in vars(runner.speculator)
+
+
+def test_workspace_dedup_runner_preserves_virtual_request_rows(
+    pcp_runner_module, monkeypatch,
+):
+    from vllm_hcu.v1.workspace_block_tables import HOST_TABLE_ATTRIBUTE
+
+    runner_module, events = pcp_runner_module
+
+    class Tables:
+        block_tables = [SimpleNamespace(gpu=torch.zeros((4, 4), dtype=torch.int32))]
+        blocks_per_kv_block = [1]
+        num_blocks = SimpleNamespace(np=np.zeros((1, 4), dtype=np.int32))
+
+        def append_block_ids(self, req_index, new_block_ids, overwrite):
+            self.num_blocks.np[0, req_index] = len(new_block_ids[0])
+
+    def initialize(self, config):
+        self.block_tables = Tables()
+
+    monkeypatch.setattr(runner_module.GPUModelRunner, 'initialize_kv_cache', initialize)
+    monkeypatch.setenv('VLLM_HCU_SPARSE_MLA_PREFILL_WORKSPACE_DEDUP', '1')
+    tables = (torch.zeros((2, 4), dtype=torch.int32),)
+    manager = SimpleNamespace(prepare_attn=lambda batch: (tables, 'slots'))
+    monkeypatch.setattr(runner_module, 'maybe_build_pcp_manager', lambda *args: manager)
+    config = _config(2)
+    config.parallel_config.decode_context_parallel_size = 1
+    runner = runner_module.HcuGPUModelRunnerV2(config, 'cpu')
+    runner.initialize_kv_cache(SimpleNamespace(kv_cache_groups=[object()]))
+    runner.block_tables.append_block_ids(2, ([5, 7],), True)
+    batch = SimpleNamespace(idx_mapping_np=np.array([2, 2]),
+                            is_prefilling_np=np.array([True, True]))
+    result, slots = runner.prepare_attn(batch)
+    assert slots == 'slots'
+    assert getattr(result[0], HOST_TABLE_ATTRIBUTE).tolist() == [[5, 7, 0, 0]] * 2

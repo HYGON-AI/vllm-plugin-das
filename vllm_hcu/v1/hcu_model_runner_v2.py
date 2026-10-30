@@ -211,6 +211,17 @@ class HcuGPUModelRunnerV2(GPUModelRunner):
                 "HCU PCP requires exactly one KV cache group."
             )
         super().initialize_kv_cache(kv_cache_config)
+        from vllm_hcu.platforms import envs as henvs
+
+        if (
+            henvs.VLLM_HCU_SPARSE_MLA_PREFILL_WORKSPACE_DEDUP
+            and self.vllm_config.parallel_config.decode_context_parallel_size == 1
+        ):
+            from vllm_hcu.v1.workspace_block_tables import (
+                install_workspace_block_table_mirrors,
+            )
+
+            install_workspace_block_table_mirrors(self.block_tables)
         if pcp_size > 1:
             self.pcp_manager = maybe_build_pcp_manager(
                 self.vllm_config,
@@ -323,8 +334,16 @@ class HcuGPUModelRunnerV2(GPUModelRunner):
 
     def prepare_attn(self, input_batch):
         if self.pcp_manager is None:
-            return super().prepare_attn(input_batch)
-        return self.pcp_manager.prepare_attn(input_batch)
+            tables, slots = super().prepare_attn(input_batch)
+        else:
+            tables, slots = self.pcp_manager.prepare_attn(input_batch)
+        if hasattr(self.block_tables, "_hcu_workspace_mirrors"):
+            from vllm_hcu.v1.workspace_block_tables import attach_workspace_block_tables
+
+            tables = attach_workspace_block_tables(
+                self.block_tables, tables, input_batch
+            )
+        return tables, slots
 
     def prepare_dummy_attn(self, input_batch):
         if self.pcp_manager is None:

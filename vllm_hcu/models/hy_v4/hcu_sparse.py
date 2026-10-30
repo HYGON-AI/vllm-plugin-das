@@ -37,12 +37,12 @@ from vllm_hcu.models.hy_v4.fp8_kv_dequant import (
     gather_dequantize_fp8_ds_mla_cache,
 )
 from vllm.v1.attention.backends.mla.flashmla_sparse import (
-    FlashMLASparseImpl,
     FlashMLASparseMetadata,
-    FlashMLASparseMetadataBuilder,
 )
 from vllm_hcu.v1.attention.backends.mla.flashmla_sparse import (
     HcuFlashMLASparseBackend,
+    HcuFlashMLASparseImpl,
+    HcuFlashMLASparseMetadataBuilder,
 )
 from vllm_hcu.v1.attention.ops.flashmla import (
     flash_mla_sparse_fwd,
@@ -111,7 +111,7 @@ def _lightop_mapping_reuse_group_size(
     return metadata.max_query_len if uniform_width and pure_decode else 1
 
 
-class HYV4FlashMLASparseMetadataBuilder(FlashMLASparseMetadataBuilder):
+class HYV4FlashMLASparseMetadataBuilder(HcuFlashMLASparseMetadataBuilder):
     """Mark only pure multi-token decode batches as LightOp reuse groups."""
 
     def build(
@@ -132,7 +132,7 @@ class HYV4FlashMLASparseMetadataBuilder(FlashMLASparseMetadataBuilder):
         return metadata
 
 
-class HYV4FlashMLASparseImpl(FlashMLASparseImpl):
+class HYV4FlashMLASparseImpl(HcuFlashMLASparseImpl):
     """FlashMLA sparse impl that applies HY V4's per-head learnable sink.
 
     The sink enters as the ``sinks`` impl kwarg of

@@ -10,12 +10,12 @@ import pytest
 import torch
 from vllm.model_executor.layers.attention.mla_attention import MLAAttention
 from vllm.v1.kv_cache_interface import KVQuantMode, MLAAttentionSpec
+from vllm.v1.attention.backends.mla.flashmla_sparse import FlashMLASparseImpl
 
 from vllm_hcu.models.hy_v4 import fp8_kv_dequant, hcu_sparse
 from vllm_hcu.models.hy_v4.attention import (
     HYV4MLAAttention,
     HYV4MLAAttentionLayer,
-    Indexer,
     _normalize_hy_v4_kv_cache_dtype,
     _require_accuracy_safe_kv_cache_dtype,
     _require_sparse_mqa_backend,
@@ -1090,7 +1090,7 @@ def test_dcp_gathers_sink_once_after_weights_load(monkeypatch) -> None:
             return torch.cat((tensor, tensor + 10), dim=dim)
 
     monkeypatch.setattr(
-        hcu_sparse.FlashMLASparseImpl,
+        FlashMLASparseImpl,
         "process_weights_after_loading",
         fake_parent_process,
     )
@@ -1419,7 +1419,7 @@ def test_dcp_size_one_delegates_to_upstream_forward(monkeypatch) -> None:
         return expected
 
     monkeypatch.setattr(
-        hcu_sparse.FlashMLASparseImpl,
+        FlashMLASparseImpl,
         "forward_mqa",
         fake_parent_forward,
     )

@@ -56,3 +56,7 @@ void concat_and_cache_mla_hcu(torch::Tensor& kv_c, torch::Tensor& k_pe,
 void deepseek_v4_inv_rope(torch::Tensor& rope,
                           torch::Tensor const& position_ids,
                           torch::Tensor const& cos_sin_cache);
+
+void cp_gather_and_upconvert_fp8_kv_cache_pages(
+    const torch::Tensor& src, const torch::Tensor& dst,
+    const torch::Tensor& descriptors);
