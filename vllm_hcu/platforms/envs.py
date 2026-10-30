@@ -71,6 +71,7 @@ if TYPE_CHECKING:
     VLLM_HCU_MAMBA_SSM_CACHE_DTYPE: bool = False
     VLLM_HCU_USE_AITER_W4A16_MOE: bool = False
     VLLM_HCU_USE_TORCH_EPLB_MAP_RECORD: bool = False
+    VLLM_HCU_MOE_PAD_MASK_INPLACE: bool = True
     VLLM_HCU_USE_AITER_MOE_SHUFFLE: bool = True
     VLLM_HCU_USE_AITER_MOE_CONFIG: bool = True
     VLLM_HCU_MOONCAKE_TTFT_TRACE: bool = False
@@ -93,9 +94,11 @@ if TYPE_CHECKING:
     VLLM_HCU_PLE_CPU_OFFLOAD: bool = False
     VLLM_HCU_PLE_PREFETCH_STREAM: bool = False
     VLLM_HCU_QWEN4_EXP_HC_SP: bool = True
-    VLLM_HCU_DP_INT8_ALLGATHER: bool = False
     VLLM_HCU_MHC_FUSED_RMSNORM: bool = True
     VLLM_HCU_GLM5NEXT_KDA_STRIDED_INPUTS: bool = True
+    VLLM_HCU_DP_INT8_ALLGATHER: bool = False
+    VLLM_HCU_GLM5NEXT_KPOOL_FUSE_EXPAND: bool = True
+    VLLM_HCU_GLM5NEXT_KPOOL_ELEMENT_FUSION: bool = True
 
 def maybe_convert_int(value: Optional[str]) -> Optional[int]:
     """
@@ -617,6 +620,16 @@ hcu_vllm_environment_variables: dict[str, Callable[[], Any]] = {
         lambda: (os.environ.get("VLLM_HCU_USE_TORCH_EPLB_MAP_RECORD", "False").lower() in
                     ("true", "1")),
 
+    # If set, HcuGroupedTopKRouter fills the padded-row region of the
+    # LightOp moe_fused_gate output (topk_weights/topk_ids) in place instead
+    # of via out-of-place masked_fill. The LightOp output is freshly
+    # allocated and never aliased, so the out-of-place clone this skips is
+    # pure overhead: it shows up as a Memcpy DtoD per tensor right after
+    # moe_fused_gate in the profiler trace.
+    "VLLM_HCU_MOE_PAD_MASK_INPLACE":
+        lambda: (os.environ.get("VLLM_HCU_MOE_PAD_MASK_INPLACE", "True").lower() in
+                    ("true", "1")),
+
     # Shuffle AITER MoE weights for any quantization mode (default True).
     "VLLM_HCU_USE_AITER_MOE_SHUFFLE": resolve_aiter_moe_shuffle,
 
@@ -771,6 +784,30 @@ hcu_vllm_environment_variables: dict[str, Callable[[], Any]] = {
     # to disable.
     "VLLM_HCU_GLM5NEXT_KDA_STRIDED_INPUTS":
         lambda: (os.environ.get("VLLM_HCU_GLM5NEXT_KDA_STRIDED_INPUTS", "True").lower() in
+                    ("true", "1")),
+
+    # Fuse the GLM5Next kpool sparse-indexer's pool-expand step: derive the
+    # token-granular seq_len (positions + 1) inside
+    # expand_pools_and_append_tail's Triton kernel and let it write straight
+    # into topk_indices_buffer, instead of precomputing an int64 pool-id
+    # cast, a separate int32 positions cast + add, and a final whole-buffer
+    # copy on the host. Removes 4 elementwise kernels per decode step on the
+    # non-padded kpool>1 (index_kpool > 1) path. Consulted once at
+    # patch-apply time. See patch_glm5next_kpool_fuse_expand.py. Enabled
+    # by default; set to 0 / false to disable.
+    "VLLM_HCU_GLM5NEXT_KPOOL_FUSE_EXPAND":
+        lambda: os.environ.get("VLLM_HCU_GLM5NEXT_KPOOL_FUSE_EXPAND", "True").lower()
+                    in ("true", "1"),
+
+    # Trim elementwise kernels on the GLM5Next kpool sparse-indexer decode
+    # path: pass int64 positions straight to the kpool decode-update kernel
+    # (drops a positions.to(int32) copy), and on pure short-context decode
+    # replace the whole-buffer -1 fill + _fill_causal_indices chain with one
+    # Triton kernel. Consulted once at patch-apply time. See
+    # patch_glm5next_kpool_element_fusion.py. Enabled by default; set to
+    # 0 / false to disable.
+    "VLLM_HCU_GLM5NEXT_KPOOL_ELEMENT_FUSION":
+        lambda: (os.environ.get("VLLM_HCU_GLM5NEXT_KPOOL_ELEMENT_FUSION", "True").lower() in
                     ("true", "1")),
 }
 
