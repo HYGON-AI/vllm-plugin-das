@@ -171,6 +171,22 @@ class HcuFlashAttentionBackend(FlashAttentionBackend):
         return False
 
     @classmethod
+    def supports_attn_type(cls, attn_type: str) -> bool:
+        return attn_type == "decoder"
+
+    @classmethod
+    def supports_sliding_window(cls) -> bool:
+        return False
+
+    @classmethod
+    def supports_non_causal(cls) -> bool:
+        return False
+
+    @classmethod
+    def supports_batch_invariance(cls) -> bool:
+        return False
+
+    @classmethod
     def supports_per_head_quant_scales(cls) -> bool:
         return False
 

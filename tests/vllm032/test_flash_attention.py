@@ -171,6 +171,11 @@ def test_backend_selects_fa2_hnd_layout_and_64_token_pages(monkeypatch):
     assert flash.HcuFlashAttentionBackend.supports_mm_prefix() is False
     assert flash.HcuFlashAttentionBackend.supports_sink() is False
     assert flash.HcuFlashAttentionBackend.supports_rswa() is False
+    assert flash.HcuFlashAttentionBackend.supports_attn_type("decoder") is True
+    assert flash.HcuFlashAttentionBackend.supports_attn_type("encoder") is False
+    assert flash.HcuFlashAttentionBackend.supports_sliding_window() is False
+    assert flash.HcuFlashAttentionBackend.supports_non_causal() is False
+    assert flash.HcuFlashAttentionBackend.supports_batch_invariance() is False
 
 
 def test_varlen_boundary_forwards_fa2_keywords_without_fa4_options(monkeypatch):
