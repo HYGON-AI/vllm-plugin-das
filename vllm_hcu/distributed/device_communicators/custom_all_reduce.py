@@ -3,6 +3,7 @@
 # SPDX-FileCopyrightText: Copyright (c) 2026 Hygon Information Technology Co., Ltd.
 # Modified by Hygon Information Technology Co., Ltd., 2026.
 
+import os
 from contextlib import contextmanager
 from typing import cast
 
@@ -28,6 +29,23 @@ except Exception:
     custom_ar = False
 
 logger = init_logger(__name__)
+
+
+def _contains_uuid_device_id(value: str | None) -> bool:
+    return bool(value) and any(
+        device_id.startswith("GPU-") for device_id in value.split(",")
+    )
+
+
+def _has_unresolved_uuid_visibility(
+    cuda_visible_devices: str | None,
+) -> bool:
+    """Return whether physical integer IDs are unavailable for custom AR."""
+
+    return _contains_uuid_device_id(cuda_visible_devices) or (
+        not cuda_visible_devices
+        and _contains_uuid_device_id(os.environ.get("HIP_VISIBLE_DEVICES"))
+    )
 
 
 def _can_p2p(rank: int, world_size: int) -> bool:
@@ -140,6 +158,12 @@ class CustomAllreduce:
                     max_size,
                 )
         cuda_visible_devices = envs.CUDA_VISIBLE_DEVICES
+        if _has_unresolved_uuid_visibility(cuda_visible_devices):
+            logger.warning(
+                "Custom allreduce is disabled because UUID visibility could "
+                "not be resolved to physical device ordinals."
+            )
+            return
         if cuda_visible_devices:
             device_ids = list(map(int, cuda_visible_devices.split(",")))
         else:
