@@ -8,21 +8,27 @@ optimizations through the adapter extension API.
 Version `0.2.0.dev0` contains two independently selected capabilities:
 
 - a default-OFF LightOp ordinary and fused-add `RMSNorm` candidate; and
-- an explicit AITER INT8 W8A8 MoE route selected by
-  `--moe-backend aiter`.
+- an explicit AITER INT8 W8A8 MoE route selected by `--moe-backend aiter`.
+
+It also provides an explicit HCU FlashAttention backend selected by
+`--attention-backend FLASH_ATTN`. The backend keeps vLLM's official metadata,
+scheduler, allocation, cache writer, and forward orchestration. It changes only
+the provider boundaries needed by the HCU vendor varlen ABI: dense HND K/V page
+views, FA2 keyword compatibility, and a 64-token kernel page.
 
 vLLM's native `SiluAndMul` remains the selected implementation. Warmed
 compiled A/B measurements on `gfx936` did not justify replacing the upstream
 operator, so the plugin neither registers nor ships a `SiluAndMul` override.
 
-No attention, model, topology, or broad performance support is implied by
-these operator-level capabilities.
+No model, topology, FP8-KV, or broad performance support is implied by these
+operator-level capabilities.
 
 ## Compatibility
 
 - vLLM release line: `>=0.32.0,<0.33.0`; prerelease, postrelease,
   development, patch, and local version suffixes are accepted when the
-  required operator APIs and LightOp capabilities are present.
+  required operator APIs and LightOp capabilities are present. FLASH_ATTN also
+  requires the OpenDAS vLLM cache-view and kernel-call extension seams.
 - Adapter distribution: `sgl-kernel>=0.1.0`, extension API v1 from
   `hcu_adapter.extensions`.
 - Runtime: a prepared HCU PyTorch/DTK/LightOp/AITER stack. LightOp and AITER
@@ -90,6 +96,35 @@ Leaving `--moe-backend` at its default preserves vLLM's upstream backend
 priority. Uninstalling this wheel removes the added selector without changing
 the Adapter's platform/runtime ownership.
 
+## HCU FlashAttention varlen backend
+
+The initial supported path is BF16/FP16 dense MHA/GQA with LBHNC (HND) cache
+layout and 64-token pages. The public vendor ABI is
+`flash_attn.flash_attn_varlen_func`; no classic, custom, or alternate public
+attention entry point is registered.
+
+Run with Graph enabled (the vLLM default):
+
+```bash
+vllm serve /model/Qwen2-0.5B-Instruct \
+  --attention-backend FLASH_ATTN \
+  --block-size 64
+```
+
+The Plugin reinterprets each allocated page as dense `[K/V, H, N, D]`
+storage. This is required because the vendor kernel does not consume vLLM's
+default non-dense views produced by splitting `[..., 2D]`. The official
+stride-aware HIP cache writer writes through a zero-copy NHD alias of those
+dense views. The Plugin does not copy the full KV cache on decode. The vendor's
+regular prefill path may gather paged KV internally; rectangular short prefill
+uses that path by passing a conservative `max_seqlen_q` upper bound, avoiding
+the vendor wrapper's incompatible MTP tile selection.
+
+FA4-only `dynamic_causal`, `mask_mod`, and `aux_tensors` are accepted only
+when inactive (`None`). An active feature fails closed instead of silently
+changing its mask. FP8 KV, DCP, hybrid caches, and layouts other than LBHNC
+remain unvalidated and are not claimed by this release.
+
 ## RMSNorm eligibility
 
 The LightOp RMSNorm path is selected only when all of the following hold:
@@ -123,6 +158,9 @@ export VLLM_HCU_USE_CUSTOM_OPS=0
 
 # Or roll back only the LightOp RMSNorm path.
 export VLLM_HCU_USE_CUSTOM_RMS_NORM=0
+
+# Roll back FlashAttention without changing the Plugin installation.
+vllm serve /model/Qwen2-0.5B-Instruct --attention-backend TRITON_ATTN
 ```
 
 The numerical evidence for this release is limited to `gfx936`. On another HCU

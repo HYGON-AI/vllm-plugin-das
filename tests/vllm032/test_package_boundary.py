@@ -1,12 +1,11 @@
 from __future__ import annotations
 
 import os
-from pathlib import Path
 import subprocess
 import sys
 import tomllib
+from pathlib import Path
 from zipfile import ZipFile
-
 
 REPO_ROOT = Path(__file__).resolve().parents[2]
 PROJECT_ROOT = REPO_ROOT / "adapter_extension"
@@ -105,6 +104,8 @@ def test_built_wheel_contains_only_the_new_plugin_namespace(tmp_path: Path) -> N
     assert "[vllm.platform_plugins]" not in entry_point_lines
     assert "[vllm.general_plugins]" not in entry_point_lines
     assert any(name == "hcu_vllm_das/__init__.py" for name in names)
+    assert "hcu_vllm_das/attention/__init__.py" in names
+    assert "hcu_vllm_das/attention/flash_attn.py" in names
     assert "hcu_vllm_das/moe/__init__.py" in names
     assert "hcu_vllm_das/moe/fused_moe_aiter.py" in names
     assert "hcu_vllm_das/moe/int8_oracle.py" in names
