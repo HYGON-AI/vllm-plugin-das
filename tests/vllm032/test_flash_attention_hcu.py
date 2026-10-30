@@ -116,3 +116,104 @@ def test_hcu_writer_to_vendor_varlen_matches_reference(query_len, kv_len):
     expected = _reference_attention(query, key, value)
 
     torch.testing.assert_close(output, expected, atol=1.6e-2, rtol=1.6e-2)
+
+
+@torch.inference_mode()
+def test_hcu_writer_and_vendor_varlen_replay_with_changed_graph_inputs():
+    import vllm._C_stable_libtorch  # noqa: F401
+    from flash_attn import flash_attn_varlen_func
+    from hcu_vllm_das.attention.flash_attn import HcuFlashAttentionImpl
+    from vllm import _custom_ops as ops
+
+    torch.manual_seed(29)
+    device = torch.device("cuda")
+    dtype = torch.bfloat16
+    query_len, kv_len = 1, 5
+    block_size, num_query_heads, num_kv_heads, head_size = 64, 4, 2, 64
+    query = torch.randn(
+        query_len, num_query_heads, head_size, device=device, dtype=dtype
+    )
+    key = torch.randn(
+        kv_len, num_kv_heads, head_size, device=device, dtype=dtype
+    )
+    value = torch.randn_like(key)
+    packed_cache = torch.empty(
+        1,
+        num_kv_heads,
+        block_size,
+        2 * head_size,
+        device=device,
+        dtype=dtype,
+    )
+    output = torch.empty_like(query)
+    impl = object.__new__(HcuFlashAttentionImpl)
+    impl.head_size = head_size
+    key_cache, value_cache = impl._get_kv_cache_views(packed_cache)
+    write_key_cache, write_value_cache = impl._get_kv_cache_write_views(
+        packed_cache
+    )
+    slot_mapping = torch.arange(kv_len, device=device, dtype=torch.long)
+    scale = torch.ones((), device=device, dtype=torch.float32)
+    cu_seqlens_q = torch.tensor(
+        [0, query_len], device=device, dtype=torch.int32
+    )
+    seqused_k = torch.tensor([kv_len], device=device, dtype=torch.int32)
+    block_table = torch.zeros((1, 1), device=device, dtype=torch.int32)
+
+    def run() -> None:
+        ops.reshape_and_cache_flash(
+            key,
+            value,
+            write_key_cache,
+            write_value_cache,
+            slot_mapping,
+            "auto",
+            scale,
+            scale,
+        )
+        flash_attn_varlen_func(
+            q=query,
+            k=key_cache,
+            v=value_cache,
+            out=output,
+            cu_seqlens_q=cu_seqlens_q,
+            seqused_k=seqused_k,
+            max_seqlen_q=query_len,
+            max_seqlen_k=kv_len,
+            softmax_scale=1.0 / math.sqrt(head_size),
+            causal=True,
+            block_table=block_table,
+            layout="bhsd",
+            fa_version=2,
+        )
+
+    warmup_stream = torch.cuda.Stream()
+    warmup_stream.wait_stream(torch.cuda.current_stream())
+    with torch.cuda.stream(warmup_stream):
+        for _ in range(3):
+            run()
+    torch.cuda.current_stream().wait_stream(warmup_stream)
+    graph = torch.cuda.CUDAGraph()
+    with torch.cuda.graph(graph):
+        run()
+    torch.cuda.synchronize()
+
+    expected_first = _reference_attention(query, key, value)
+    graph.replay()
+    torch.cuda.synchronize()
+    first_output = output.clone()
+    torch.testing.assert_close(
+        first_output, expected_first, atol=1.6e-2, rtol=1.6e-2
+    )
+
+    query.copy_(torch.randn_like(query))
+    key.copy_(torch.randn_like(key))
+    value.copy_(torch.randn_like(value))
+    expected_second = _reference_attention(query, key, value)
+    graph.replay()
+    torch.cuda.synchronize()
+
+    torch.testing.assert_close(
+        output, expected_second, atol=1.6e-2, rtol=1.6e-2
+    )
+    assert not torch.equal(output, first_output)
