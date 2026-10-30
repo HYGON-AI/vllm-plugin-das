@@ -89,6 +89,13 @@ def apply_to_module(module: ModuleType) -> bool:
         return output, final_state
 
     original_forward = target.KimiK3DeltaAttention._forward
+    try:
+        # The native ``_forward`` is decorated as an eager break. The plugin
+        # must be the outermost break as well, otherwise breakable graph replay
+        # only records the native body and skips checkpoint binding/finalize.
+        from vllm.compilation.breakable_cudagraph import eager_break_during_capture
+    except ImportError:  # pragma: no cover - older vLLM has no breakable graphs
+        eager_break_during_capture = None
 
     @wraps(original_forward)
     def forward(self, *args, **kwargs):
@@ -108,6 +115,11 @@ def apply_to_module(module: ModuleType) -> bool:
         finally:
             kimi_k3_kda.ACTIVE_LAYER.reset(state_token)
             PREFILL_LENGTHS.reset(token)
+
+    if eager_break_during_capture is not None:
+        # Capture records this wrapper (not the native method body), so replay
+        # binds the current metadata and publishes its checkpoint state.
+        forward = eager_break_during_capture(forward)
 
     target.KimiK3DeltaAttention._forward = forward
     target.chunk_kda_with_fused_gate = hcu_chunk

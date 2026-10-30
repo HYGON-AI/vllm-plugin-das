@@ -9,6 +9,41 @@ import torch
 from torch import nn
 
 
+def _get_offloader():
+    try:
+        from vllm.model_executor.offloader.base import get_offloader
+        return get_offloader()
+    except Exception:  # pragma: no cover - offloading is optional
+        return None
+
+
+def _is_offloaded_parameter(param) -> bool:
+    """Whether vLLM's weight offloader owns ``param``.
+
+    The fused QKV copy is a private tensor outside the offloader's storage, so
+    building it from offloaded branches would duplicate the weights in
+    accelerator memory.
+    """
+    if getattr(param, "_vllm_is_uva_offloaded", False):
+        return True
+    offloader = _get_offloader()
+    if offloader is None:
+        return False
+    for module_offloader in getattr(offloader, "module_offloaders", ()):
+        for param_offloader in getattr(module_offloader, "_param_offloaders", {}).values():
+            try:
+                if param_offloader._param is param:
+                    return True
+            except (AttributeError, RuntimeError):
+                continue
+    # UVA's CPU fallback (UVA unavailable or disabled) leaves the parameter on
+    # CPU between forwards and swaps in a device copy through functional_call.
+    if (getattr(offloader, "uva_offloading", None) is False
+            and param.data.device.type == "cpu"):
+        return True
+    return False
+
+
 def is_mixed_slimquant(config) -> bool:
     return (config is not None
             and config.get_name() == "slimquant_w4a8"
@@ -40,6 +75,12 @@ class KimiK3MixedKDAProjection(nn.Module):
         self.fp_gate = merged_linear(
             input_size, output_sizes[3:], replicated_shard_id=1, tp_size=tp_size,
             quant_config=None, prefix=f"{prefix}.fp_gate", **kwargs)
+        # Parameters may be replaced or offloaded after construction, so keep
+        # the original objects to recognize offloader-managed Q/K/V storage.
+        self._qkv_param_refs = tuple(
+            param for layer in (self.q_proj, self.k_proj, self.v_proj)
+            for param in (layer.weight, layer.weight_scale)
+        )
         self._fuse_qkv = os.environ.get("VLLM_HCU_KIMI_KDA_FUSE_QKV", "0") == "1"
         self._fused_qkv = None
         self._fused_refresh_deferred = False
@@ -63,6 +104,16 @@ class KimiK3MixedKDAProjection(nn.Module):
     def _make_fused_qkv(self, input_size):
         """Combine post-processed rank-local weights for fused QKV."""
         layers = [self.q_proj, self.k_proj, self.v_proj]
+        candidates = list(getattr(self, "_qkv_param_refs", ()))
+        candidates.extend(param for layer in layers
+                          for param in (layer.weight, layer.weight_scale))
+        if any(_is_offloaded_parameter(param) for param in candidates):
+            raise ValueError(
+                "VLLM_HCU_KIMI_KDA_FUSE_QKV is incompatible with weight "
+                "offloading: the fused QKV copy is not managed by the "
+                "offloader. Disable fused KDA QKV or exclude Q/K/V from "
+                "offloading."
+            )
         scheme = layers[0].scheme
         if (getattr(scheme, "is_static_input_scheme", True)
                 or not getattr(scheme, "input_symmetric", False)
