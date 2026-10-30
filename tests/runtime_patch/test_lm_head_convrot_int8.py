@@ -397,21 +397,42 @@ def test_backend_guard_requires_custom_quantization_gemm(monkeypatch):
         runtime._require_hcu_backend(SimpleNamespace(is_cuda=True))
 
 
-def test_runner_guard_detects_convrot_head_by_marker(runtime):
-    # hcu_model_runner needs a full vLLM; execute just the guard function.
-    source = (Path(__file__).parents[2] / "vllm_hcu/v1/hcu_model_runner.py").read_text(encoding="utf-8")
-    node = next(
-        n for n in ast.parse(source).body
-        if isinstance(n, ast.FunctionDef) and n.name == "_has_convrot_lm_head"
-    )
-    namespace = {"nn": nn}
-    exec(compile(ast.Module([node], []), "hcu_model_runner", "exec"), namespace)
-    has_convrot = namespace["_has_convrot_lm_head"]
+def _worker_guard():
+    # vllm_hcu.v1.worker needs a full vLLM; execute only the guard functions.
+    source = (Path(__file__).parents[2] / "vllm_hcu/v1/worker.py").read_text(encoding="utf-8")
+    tree = ast.parse(source)
+    names = {"_has_convrot_lm_head", "_reject_convrot_checkpoint_reload"}
+    nodes = [n for n in tree.body if isinstance(n, ast.FunctionDef) and n.name in names]
+    assert {n.name for n in nodes} == names
+    namespace = {"torch": torch}
+    exec(compile(ast.Module(nodes, []), "worker", "exec"), namespace)
+    return tree, namespace["_reject_convrot_checkpoint_reload"]
 
-    model = nn.Sequential(nn.Linear(2, 2), _head())
-    assert has_convrot(model) is False
-    model[1].quant_method = runtime.ConvRotINT8LMHeadMethod(SimpleNamespace())
-    assert has_convrot(model) is True
+
+def test_checkpoint_reload_guard_rejects_only_checkpoint_format_on_convrot_head(runtime):
+    _, reject = _worker_guard()
+    plain = nn.Sequential(nn.Linear(2, 2), _head())
+    convrot = nn.Sequential(nn.Linear(2, 2), _head())
+    convrot[1].quant_method = runtime.ConvRotINT8LMHeadMethod(SimpleNamespace())
+
+    reject(plain, (), {})  # no ConvRot head: never blocked
+    reject(plain, (None, None, True), {})
+    for args, kwargs in (((), {}), ((None, None, True), {}), ((), {"is_checkpoint_format": True})):
+        with pytest.raises(RuntimeError, match="checkpoint-format"):
+            reject(convrot, args, kwargs)
+    reject(convrot, (None, None, False), {})  # kernel-format reload is allowed
+    reject(convrot, (), {"is_checkpoint_format": False})
+
+
+def test_worker_reload_weights_runs_the_guard_before_the_runner():
+    tree, _ = _worker_guard()
+    worker = next(n for n in tree.body if isinstance(n, ast.ClassDef) and n.name == "HcuGPUWorker")
+    method = next(n for n in worker.body if isinstance(n, ast.FunctionDef) and n.name == "reload_weights")
+    calls = [
+        ast.unparse(n.value.func) for n in method.body
+        if isinstance(n, ast.Expr) and isinstance(n.value, ast.Call)
+    ]
+    assert calls.index("_reject_convrot_checkpoint_reload") < calls.index("super().reload_weights")
 
 
 def test_adapter_constructor_contract_matches_target_source():

@@ -88,6 +88,32 @@ def _init_hcu_workspace_manager(
     init_workspace_manager(device, num_ubatches, num_lanes)
 
 
+def _has_convrot_lm_head(model: torch.nn.Module) -> bool:
+    """Return whether the model owns the opt-in ConvRot INT8 output head."""
+    return any(
+        getattr(getattr(module, "quant_method", None), "hcu_convrot_lm_head", False)
+        for module in model.modules()
+    )
+
+
+def _reject_convrot_checkpoint_reload(model: torch.nn.Module, args, kwargs) -> None:
+    """Refuse checkpoint-format reloads that would leave a stale INT8 head.
+
+    The head is converted once after loading, so a checkpoint-format reload
+    would write BF16 weights into a converted INT8 parameter. Reloads of
+    already-processed (kernel-format) weights are not affected.
+    """
+    # reload_weights(weights_iterator=None, weights_path=None, is_checkpoint_format=True)
+    is_checkpoint_format = kwargs.get(
+        "is_checkpoint_format", args[2] if len(args) > 2 else True
+    )
+    if is_checkpoint_format and _has_convrot_lm_head(model):
+        raise RuntimeError(
+            "ConvRot INT8 lm_head does not support checkpoint-format "
+            "weight reload; restart the worker with the new checkpoint"
+        )
+
+
 class HcuGPUWorker(Worker):
     """A worker class that executes (a partition of) the model on a HCU.
     Each worker is associated with a single HCU. In case of
@@ -142,6 +168,7 @@ class HcuGPUWorker(Worker):
         validate_worker_patches(require_applied=True)
 
     def reload_weights(self, *args, **kwargs) -> None:
+        _reject_convrot_checkpoint_reload(self.model_runner.model, args, kwargs)
         super().reload_weights(*args, **kwargs)
         from vllm_hcu.patch.worker.core_fix.patch_deepseek_v4_attention import (
             refresh_compressor_nt_weights,
