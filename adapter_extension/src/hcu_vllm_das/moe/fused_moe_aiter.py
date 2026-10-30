@@ -8,6 +8,8 @@ import logging
 from threading import Lock
 from typing import Any, Callable
 
+import torch
+
 
 LOG = logging.getLogger(__name__)
 VLLM_LOGGER_NAME = f"vllm.{__name__}"
@@ -57,6 +59,13 @@ def _activation_name(activation: object) -> str:
     if not isinstance(value, str) or not value:
         raise ValueError("AITER INT8 MoE requires a named activation")
     return value.lower()
+
+
+def _aiter_expert_mask(expert_map: object) -> object:
+    if expert_map is None:
+        return None
+    mask = (expert_map >= 0).to(dtype=expert_map.dtype)
+    return torch.cat((mask, expert_map.new_zeros((1,))))
 
 
 def _shape(tensor: object, rank: int, label: str) -> tuple[int, ...]:
@@ -221,7 +230,7 @@ def apply_aiter_int8_moe(
         a2_scale=getattr(quant_config, "a2_scale", None),
         block_shape=None,
         global_num_experts=global_num_experts,
-        expert_map=expert_map,
+        expert_map=_aiter_expert_mask(expert_map),
         routed_scaling_factor=1.0,
         use_weight_shuffle=False,
         output_dtype=output_dtype,

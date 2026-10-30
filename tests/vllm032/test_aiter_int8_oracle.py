@@ -86,6 +86,8 @@ def make_int8_moe_kernel(int8_backend, moe_quant_config, moe_config, experts_cls
 
 
 class FakeAiterExperts:
+    consumes_expert_mask = True
+
     def __init__(self, *, moe_config: object, quant_config: object, **kwargs: object):
         self.moe_config = moe_config
         self.quant_config = quant_config
@@ -195,6 +197,7 @@ def test_plugin_expert_adds_only_int8_channel_token_support(
     install_fake(monkeypatch)
     experts = oracle.HcuAiterInt8Experts
 
+    assert experts.consumes_expert_mask is False
     assert experts._supports_quant_scheme("int8-channel", "int8-token") is True
     assert experts._supports_quant_scheme("fp8-channel", "fp8-token") is True
     assert experts._supports_quant_scheme("int8-channel", "static-int8") is False

@@ -6,6 +6,7 @@ import sys
 from types import SimpleNamespace
 
 import pytest
+import torch
 
 
 PLUGIN_SOURCE_ROOT = (
@@ -40,7 +41,7 @@ def inputs() -> dict[str, object]:
             a2_scale="a2-scale",
         ),
         "activation": SimpleNamespace(value="silu"),
-        "expert_map": "expert-map",
+        "expert_map": None,
         "output_dtype": "bf16-output",
     }
 
@@ -160,7 +161,7 @@ def test_native_config_invokes_public_aiter_w8a8_api(
             "a2_scale": "a2-scale",
             "block_shape": None,
             "global_num_experts": 8,
-            "expert_map": "expert-map",
+            "expert_map": None,
             "routed_scaling_factor": 1.0,
             "use_weight_shuffle": False,
             "output_dtype": "bf16-output",
@@ -177,14 +178,31 @@ def test_native_config_invokes_public_aiter_w8a8_api(
     ),
     ids=("config-miss", "weight-shuffle", "scale-shuffle"),
 )
+@pytest.mark.parametrize(
+    "expert_map",
+    (
+        torch.tensor([0, 1, -1, -1], dtype=torch.int32),
+        torch.tensor([-1, -1, 0, 1], dtype=torch.int32),
+        torch.tensor([0, -1, 1, -1], dtype=torch.int32),
+        torch.tensor([-1, 0, -1, 1], dtype=torch.int32),
+    ),
+    ids=(
+        "linear-rank0",
+        "linear-rank1",
+        "round-robin-rank0",
+        "round-robin-rank1",
+    ),
+)
 def test_unsupported_aiter_layout_uses_official_int8_triton_fallback(
     monkeypatch: pytest.MonkeyPatch,
     found: bool,
     config: SimpleNamespace,
+    expert_map: torch.Tensor,
 ) -> None:
     calls: list[dict[str, object]] = []
     expected = object()
     arguments = inputs()
+    arguments["expert_map"] = expert_map
     monkeypatch.setattr(
         provider,
         "_load_aiter_api",
@@ -204,8 +222,10 @@ def test_unsupported_aiter_layout_uses_official_int8_triton_fallback(
     result = provider.apply_aiter_int8_moe(**arguments)
 
     assert result is expected
-    assert calls == [
-        {
+    assert len(calls) == 1
+    fallback_call = calls[0]
+    assert fallback_call.pop("expert_map") is expert_map
+    assert fallback_call == {
             "hidden_states": arguments["hidden_states"],
             "w1": arguments["w1"],
             "w2": arguments["w2"],
@@ -219,7 +239,6 @@ def test_unsupported_aiter_layout_uses_official_int8_triton_fallback(
             "use_int4_w4a16": False,
             "per_channel_quant": True,
             "global_num_experts": 8,
-            "expert_map": "expert-map",
             "w1_scale": "w1-scale",
             "w2_scale": "w2-scale",
             "w1_zp": "w1-zp",
@@ -228,7 +247,45 @@ def test_unsupported_aiter_layout_uses_official_int8_triton_fallback(
             "a2_scale": "a2-scale",
             "block_shape": None,
         }
-    ]
+
+
+@pytest.mark.parametrize(
+    ("expert_map", "expected_mask"),
+    (
+        ([0, 1, -1, -1], [1, 1, 0, 0, 0]),
+        ([-1, -1, 0, 1], [0, 0, 1, 1, 0]),
+        ([0, -1, 1, -1], [1, 0, 1, 0, 0]),
+        ([-1, 0, -1, 1], [0, 1, 0, 1, 0]),
+    ),
+    ids=("linear-rank0", "linear-rank1", "round-robin-rank0", "round-robin-rank1"),
+)
+def test_native_aiter_receives_mask_derived_from_canonical_expert_map(
+    monkeypatch: pytest.MonkeyPatch,
+    expert_map: list[int],
+    expected_mask: list[int],
+) -> None:
+    arguments = inputs()
+    arguments["expert_map"] = torch.tensor(expert_map, dtype=torch.int32)
+    calls: list[dict[str, object]] = []
+
+    monkeypatch.setattr(
+        provider,
+        "_load_aiter_api",
+        lambda: SimpleNamespace(
+            quant_type_w8a8="int8_w8a8",
+            get_config=lambda *args, **kwargs: (True, native_config()),
+            aiter_moe=lambda **kwargs: calls.append(kwargs) or object(),
+        ),
+    )
+
+    provider.apply_aiter_int8_moe(**arguments)
+
+    assert len(calls) == 1
+    actual_mask = calls[0]["expert_map"]
+    assert torch.equal(
+        actual_mask,
+        torch.tensor(expected_mask, dtype=torch.int32),
+    )
 
 
 def test_vendor_failure_after_config_selection_does_not_change_provider(

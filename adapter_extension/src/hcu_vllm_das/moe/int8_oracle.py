@@ -89,6 +89,8 @@ def _make_experts_class(
     int8_activation_key: object,
 ) -> type:
     class _HcuAiterInt8Experts(parent):
+        consumes_expert_mask = False
+
         @staticmethod
         def _supports_current_device() -> bool:
             return True
