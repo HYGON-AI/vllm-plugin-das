@@ -28,7 +28,7 @@ official vLLM 0.32.0
 | --- | --- |
 | 官方 vLLM | tag `v0.32.0`，commit `5df63a7203cdb9328d824a27b682e77c7b9928be` |
 | Adapter | `https://github.com/alexanderbin123/adapter-das.git`，branch `feat/vllm032-adapter-delivery-gates`，验证基线 `c99886d41f435e594050d47663e03ea94081fdc6` |
-| DAS Plugin | `https://github.com/alexanderbin123/vllm-plugin-das.git`，branch `feat/vllm032-plugin-onoff-gates` |
+| DAS Plugin | `https://github.com/alexanderbin123/vllm-plugin-das.git`，branch `feat/vllm032-plugin-onoff-gates`，构建提交 `a7f5c2bd15c19296ab00219f188b3b7d65b45f50` |
 
 Plugin 仓库根目录仍保留其他 vLLM 版本的开发代码；vLLM 0.32 只构建
 `adapter_extension/`。
@@ -43,7 +43,7 @@ Plugin 仓库根目录仍保留其他 vLLM 版本的开发代码；vLLM 0.32 只
 | --- | --- |
 | `vllm-0.32.0+rocm723-cp312-cp312-linux_x86_64.whl` | `d7f084b8754288893dd9ba28d24784ec4b4e59350c9bfb5038ec24ac3af9572b` |
 | `sgl_kernel-0.1.0-py3-none-any.whl` | `69b655ca747718eed3c4487e984fe749b73880369f20ab0288fc76799db0c6db` |
-| `hcu_vllm_das_plugin-0.2.0.dev0-py3-none-any.whl` | `b57733fbde63fb252e74492596aaed4c69b40b724eefb14e97eb51324ae11e14` |
+| `hcu_vllm_das_plugin-0.2.0.dev0-py3-none-any.whl` | `67db8901f289e5e9cc7ee8476be2e9c13980225d185cfe32665d9af8873893b9` |
 
 这些哈希只标识本轮候选，不等于生产批准。重新构建后必须生成新哈希和新证据。
 
@@ -147,9 +147,13 @@ HSA_VISIBLE_DEVICES=0 HIP_VISIBLE_DEVICES=0 \
 
 这些测试只接受 `gfx936`/`gfx938`，并验证数值与 Graph replay。RMSNorm
 还验证 master/算子级回滚；AITER 路径只在显式指定 `--moe-backend aiter`
-时接管。实机结果分别记录在
+时接管。当前候选在 `gfx936` card 0 上的上述三组测试结果为
+`6 passed, 14 warnings in 112.02s`；测试后 8 张卡均回到 0% 计算和 0% 显存。
+两 rank EP 通信仍未实测。历史结果分别记录在
 [`vllm032-upstream-first-operator-ab.md`](../validation/vllm032-upstream-first-operator-ab.md)
-和 [`vllm032-aiter-int8-moe.md`](../validation/vllm032-aiter-int8-moe.md)。
+和 [`vllm032-aiter-int8-moe.md`](../validation/vllm032-aiter-int8-moe.md)，不能继承为
+当前候选结论。当前构建、便携与安装态证据见
+[`vllm032-pr310-runtime-contract-candidate.md`](../validation/vllm032-pr310-runtime-contract-candidate.md)。
 
 ## 8. 关闭 eager 模式
 
@@ -167,11 +171,8 @@ HIP_VISIBLE_DEVICES=0 \
 
 模型路径按目标机实际目录替换。
 
-本轮新三 wheel 组合已在 `gfx936` 单卡上用 `/model/Qwen3-8B` 完成一次真实
-非 eager 服务验证：EngineCore 确认 `enforce_eager=False`、`VLLM_COMPILE` 和
-`FULL_AND_PIECEWISE` CUDA Graph，`/health`、`/version`、`/v1/models` 与
-`/v1/chat/completions` 均返回 HTTP 200，固定请求返回 `42`。详细命令和边界见
-[`docs/validation/vllm032-adapter-das-qwen3-8b-smoke.md`](../validation/vllm032-adapter-das-qwen3-8b-smoke.md)。
+当前 `a7f5c2bd` Plugin wheel 尚未执行模型服务门禁。旧候选的非 eager 服务结果
+只能作为历史参考，不能用于批准本候选；当前状态以 compat lock 为准。
 
 ## 9. 回滚
 

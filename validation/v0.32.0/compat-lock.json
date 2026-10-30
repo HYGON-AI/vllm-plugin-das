@@ -1,13 +1,13 @@
 {
   "schema_version": 1,
-  "validation_id": "vllm-v0.32.0-upstream-first-plugin-20261029",
+  "validation_id": "vllm-v0.32.0-upstream-first-plugin-20261030",
   "status": "pending",
   "repository": {
     "name": "vllm-plugin-das",
     "url": "https://github.com/alexanderbin123/vllm-plugin-das.git",
     "branch": "feat/vllm032-plugin-onoff-gates",
     "source_base": "e76220d9c0006cc3c9d886587a4771a31e7d83e8",
-    "test_policy_commit": "46923fbcf2068c1491090ca4d00e519b2abad91f"
+    "test_policy_commit": "a7f5c2bd15c19296ab00219f188b3b7d65b45f50"
   },
   "peer": {
     "name": "adapter-das",
@@ -24,6 +24,8 @@
     "tasks": "HumanEval/0-63",
     "samples": 64,
     "status": "pass",
+    "current_candidate": false,
+    "plugin_build_commit": "46923fbcf2068c1491090ca4d00e519b2abad91f",
     "model": "/model/Qwen3-8B",
     "temperature": 0,
     "seed": 0,
@@ -56,6 +58,8 @@
     "lightop": "0.6.0+dtk2610.torch2110.2610231814.gb2f8c9"
   },
   "serving": {
+    "current_candidate": false,
+    "plugin_build_commit": "46923fbcf2068c1491090ca4d00e519b2abad91f",
     "enforce_eager": false,
     "compilation": "VLLM_COMPILE",
     "cudagraph_capture": "FULL_AND_PIECEWISE",
@@ -73,8 +77,9 @@
     },
     "plugin_wheel": {
       "filename": "hcu_vllm_das_plugin-0.2.0.dev0-py3-none-any.whl",
-      "sha256": "b57733fbde63fb252e74492596aaed4c69b40b724eefb14e97eb51324ae11e14",
-      "build_commit": "46923fbcf2068c1491090ca4d00e519b2abad91f"
+      "sha256": "67db8901f289e5e9cc7ee8476be2e9c13980225d185cfe32665d9af8873893b9",
+      "build_commit": "a7f5c2bd15c19296ab00219f188b3b7d65b45f50",
+      "capabilities": ["aiter-int8-moe", "lightop-rms-norm"]
     },
     "vllm_wheel": {
       "filename": "vllm-0.32.0+rocm723-cp312-cp312-linux_x86_64.whl",
@@ -86,36 +91,38 @@
   "gates": {
     "static_portable_tests": {
       "status": "pass",
-      "result": "61 passed, 3 live-HCU tests skipped by default"
+      "result": "100 passed, 6 live-HCU tests skipped by default"
     },
     "build": {
       "status": "pass",
-      "result": "clean-commit adapter and plugin wheels built; Plugin has one Adapter extension entry point and no Silu module"
+      "result": "Plugin wheel built from clean commit a7f5c2bd; one Adapter extension entry point, RMSNorm and AITER MoE modules present, no Silu override"
     },
     "installed_integration": {
       "status": "pass",
-      "result": "installed vLLM 0.32, adapter-das and plugin wheel ownership, platform, extension and OOT classes verified"
+      "result": "fresh isolated install verified exact vLLM, Adapter and Plugin wheels; capabilities aiter-int8-moe/lightop-rms-norm active; oracle, EP map/mask and RMSNorm naming probes passed"
     },
     "live_hardware_operators": {
       "status": "pass",
-      "result": "final wheels: RMSNorm eager/compile replay and ON/OFF graph dispatch passed, 3 passed in 98.17s"
+      "result": "exact a7f5c2bd/67db8901 wheel on gfx936 card 0: RMSNorm eager/compile, ON/OFF graph, and AITER INT8 M=1/16/128 numerics plus graph replay passed; 6 passed, 14 warnings in 112.02s"
     },
     "model_parity": {
       "status": "pending"
     },
     "serving": {
-      "status": "pass",
-      "result": "Qwen2-0.5B-Instruct fresh-process ON/OFF: vLLM 0.32.0, enforce_eager=false, FULL_AND_PIECEWISE captured, health/version/models/chat HTTP 200, deterministic output 42, clean teardown"
+      "status": "pending",
+      "result": "current Plugin wheel a7f5c2bd/67db8901 has not run a model service gate; prior 46923fbc result is historical only"
     },
     "humaneval_prefix": {
-      "status": "pass",
-      "result": "Qwen3-8B HumanEval/0-63 non-eager graph: Plugin ON 61/64 pass@1=0.953125, master OFF 60/64 pass@1=0.9375, zero timeouts; no ON regression"
+      "status": "pending",
+      "result": "current Plugin wheel a7f5c2bd/67db8901 has not run HumanEval; recorded 46923fbc results are historical only"
     }
   },
   "evidence": {
     "upstream_first_operator_ab": {
       "document": "docs/validation/vllm032-upstream-first-operator-ab.md",
       "validated_at": "2026-10-29",
+      "plugin_build_commit": "46923fbcf2068c1491090ca4d00e519b2abad91f",
+      "applies_to_current_candidate": false,
       "retained_capability": "lightop-rms-norm",
       "upstream_takeover": "SiluAndMul",
       "live_graph_result": "3 passed, 14 warnings in 98.17s",
@@ -124,6 +131,22 @@
         "master-off-rms-on"
       ],
       "serving_probe_result": "both modes returned HTTP 200 and deterministic chat output 42"
+    },
+    "aiter_int8_moe": {
+      "document": "docs/validation/vllm032-aiter-int8-moe.md",
+      "validated_at": "2026-10-29",
+      "plugin_build_commit": "c40a2c67658261f50506142cf5357240c903e105",
+      "plugin_wheel_sha256": "bba4ffba753362a118f826398bc1eaa5f208f7401d3ceb7ea471cc78aa42f240",
+      "applies_to_current_candidate": false
+    },
+    "current_candidate": {
+      "document": "docs/validation/vllm032-pr310-runtime-contract-candidate.md",
+      "validated_at": "2026-10-30",
+      "plugin_build_commit": "a7f5c2bd15c19296ab00219f188b3b7d65b45f50",
+      "portable_result": "100 passed, 6 skipped",
+      "installed_result": "pass",
+      "live_hardware_result": "6 passed, 14 warnings in 112.02s on gfx936 card 0",
+      "ep_communication_result": "pending"
     }
   },
   "completed_at": null

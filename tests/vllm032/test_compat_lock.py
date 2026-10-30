@@ -28,7 +28,7 @@ def test_plugin_compat_lock_pins_vllm032_pair_without_circular_commits() -> None
     assert document["schema_version"] == 1
     assert (
         document["validation_id"]
-        == "vllm-v0.32.0-upstream-first-plugin-20261029"
+        == "vllm-v0.32.0-upstream-first-plugin-20261030"
     )
     assert document["status"] in {"pending", "passed"}
     assert document["repository"] == {
@@ -36,7 +36,7 @@ def test_plugin_compat_lock_pins_vllm032_pair_without_circular_commits() -> None
         "url": "https://github.com/alexanderbin123/vllm-plugin-das.git",
         "branch": "feat/vllm032-plugin-onoff-gates",
         "source_base": "e76220d9c0006cc3c9d886587a4771a31e7d83e8",
-        "test_policy_commit": "46923fbcf2068c1491090ca4d00e519b2abad91f",
+        "test_policy_commit": "a7f5c2bd15c19296ab00219f188b3b7d65b45f50",
     }
     assert document["peer"] == {
         "name": "adapter-das",
@@ -55,14 +55,28 @@ def test_plugin_compat_lock_pins_vllm032_pair_without_circular_commits() -> None
     assert document["artifacts"]["plugin_wheel"] == {
         "filename": "hcu_vllm_das_plugin-0.2.0.dev0-py3-none-any.whl",
         "sha256": (
-            "b57733fbde63fb252e74492596aaed4c69b40b724eefb14e97eb51324ae11e14"
+            "67db8901f289e5e9cc7ee8476be2e9c13980225d185cfe32665d9af8873893b9"
         ),
-        "build_commit": "46923fbcf2068c1491090ca4d00e519b2abad91f",
+        "build_commit": "a7f5c2bd15c19296ab00219f188b3b7d65b45f50",
+        "capabilities": ["aiter-int8-moe", "lightop-rms-norm"],
     }
-    assert document["gates"]["live_hardware_operators"]["status"] == "pass"
-    assert document["gates"]["serving"]["status"] == "pass"
+    assert document["gates"]["static_portable_tests"] == {
+        "status": "pass",
+        "result": "100 passed, 6 live-HCU tests skipped by default",
+    }
+    assert document["gates"]["build"]["status"] == "pass"
+    assert document["gates"]["installed_integration"]["status"] == "pass"
+    assert document["gates"]["live_hardware_operators"] == {
+        "status": "pass",
+        "result": (
+            "exact a7f5c2bd/67db8901 wheel on gfx936 card 0: RMSNorm "
+            "eager/compile, ON/OFF graph, and AITER INT8 M=1/16/128 "
+            "numerics plus graph replay passed; 6 passed, 14 warnings in 112.02s"
+        ),
+    }
+    assert document["gates"]["serving"]["status"] == "pending"
     assert document["gates"]["model_parity"]["status"] == "pending"
-    assert document["gates"]["humaneval_prefix"]["status"] == "pass"
+    assert document["gates"]["humaneval_prefix"]["status"] == "pending"
     assert document["human_eval"]["plugin_on"]["passed"] == 61
     assert document["human_eval"]["plugin_off"]["passed"] == 60
     assert not _contains_forbidden_key(document)
