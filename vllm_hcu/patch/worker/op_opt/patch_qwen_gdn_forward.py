@@ -1,14 +1,21 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright (c) 2026 Hygon Information Technology Co., Ltd.
-"""Skip the per-layer zero fill of the Qwen GDN core-attention buffer.
+"""Skip the per-layer zero fill of the Qwen GDN core-attention buffer on
+pure packed-decode steps.
 
 Upstream allocates ``core_attn_out`` with ``torch.zeros`` (vLLM PR 28182)
-because rows past ``num_actual_tokens`` may never be written.  Every row below
-``num_actual_tokens`` is always written by the core op (the HCU packed decode
-kernel writes zeros for null-slot padding rows, and FULL-graph decode
-metadata is token-padded), so only the tail beyond ``num_actual_tokens`` needs
-clearing.  On decode steps that tail is empty, which removes one fill kernel
-per GDN layer (30 per step for Qwen3.5-35B).
+because the core op may leave rows unwritten.  On a pure non-spec packed
+decode step every row below ``num_actual_tokens`` is written (the HCU packed
+decode kernel writes zeros for null-slot padding rows, and FULL-graph decode
+metadata is token-padded), so only the tail beyond ``num_actual_tokens`` is
+cleared; on decode steps that tail is empty, which removes one fill kernel per
+GDN layer (30 per step for Qwen3.5-35B).
+
+Any step with prefill rows keeps the upstream full zero fill: the hcu-aiter
+chunked prefill leaves some rows unwritten, and with ``torch.empty`` those
+rows carried stale memory into the output (garbled, nondeterministic answers
+on long prompts).  A prefill step is tens of ms, so the fill is negligible
+there.
 """
 
 from __future__ import annotations
@@ -187,16 +194,19 @@ def apply_to_module(module: ModuleType) -> bool:
         z = z.reshape(z.size(0), -1, self.head_v_dim)
         b, a = self.split_ba(ba)
 
-        core_attn_out = torch.empty(
-            (num_tokens, self.num_v_heads // self.tp_size, self.head_v_dim),
-            dtype=hidden_states.dtype,
-            device=hidden_states.device,
-        )
-        if num_actual < num_tokens:
-            core_attn_out[num_actual:].zero_()
-        # The packed decode kernel reads a/b through their row stride, so
-        # the two per-layer gather copies are only needed by prefill paths.
-        if not _is_packed_decode(self, metadata):
+        packed_decode = _is_packed_decode(self, metadata)
+        out_shape = (num_tokens, self.num_v_heads // self.tp_size, self.head_v_dim)
+        if packed_decode:
+            core_attn_out = torch.empty(
+                out_shape, dtype=hidden_states.dtype, device=hidden_states.device)
+            if num_actual < num_tokens:
+                core_attn_out[num_actual:].zero_()
+        else:
+            # Prefill kernels may leave rows unwritten (see module docstring).
+            core_attn_out = torch.zeros(
+                out_shape, dtype=hidden_states.dtype, device=hidden_states.device)
+            # The packed decode kernel reads a/b through their row stride, so
+            # the two per-layer gather copies are only needed by prefill paths.
             b, a = b.contiguous(), a.contiguous()
         torch.ops.vllm.qwen_gdn_attention_core(
             mixed_qkv,
