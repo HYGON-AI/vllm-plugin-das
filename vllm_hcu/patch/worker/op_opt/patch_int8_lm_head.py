@@ -33,6 +33,33 @@ _CFG_LARGE = dict(NUM_K_WARPS=1, N_PER_WARP=32, K_PER_WARP=128, NUM_N_WARPS=1,
                   SPLITK=1, BLOCK_M=16, KERNEL_TYPE=0, WEIGHT_LAYOUT=1)
 
 
+# 512-wide K tile for K not divisible by 1024 (Qwen3.5-4B, K=2560): measured
+# 520-556 us at M=1..16 vs ~1050 us fp16 and 580-1210 us DeepGEMM default.
+_CFG_SMALL_K512 = dict(NUM_K_WARPS=2, N_PER_WARP=32, K_PER_WARP=256,
+                       NUM_N_WARPS=2, SPLITK=1, BLOCK_M=16, KERNEL_TYPE=0,
+                       WEIGHT_LAYOUT=1)
+
+
+def _k_tile(cfg: dict) -> int:
+    return cfg["NUM_K_WARPS"] * cfg["K_PER_WARP"] * cfg["SPLITK"]
+
+
+def _config(m: int, n: int, k: int) -> dict:
+    """First tuned config whose K tile divides K, else DeepGEMM's default.
+
+    A partial K tile makes the kernel return NaN (_CFG_SMALL's 1024-wide
+    tile with Qwen3.5-4B's K=2560 produced garbage output), so a tuned
+    config is only used when K is a multiple of its K tile.
+    """
+    import deepgemm
+
+    candidates = (_CFG_SMALL, _CFG_SMALL_K512) if m <= 16 else (_CFG_LARGE,)
+    for cfg in candidates:
+        if k % _k_tile(cfg) == 0:
+            return cfg
+    return {**deepgemm.get_w8a16_linear_config(m, n, k), "WEIGHT_LAYOUT": 1}
+
+
 def _build_state(lm_head):
     weight = getattr(lm_head, "weight", None)
     if (
@@ -89,7 +116,7 @@ def apply_to_module(module: ModuleType) -> bool:
             return original(self, lm_head, hidden_states, embedding_bias)
         import deepgemm
 
-        cfg = _CFG_SMALL if hidden_states.shape[0] <= 16 else _CFG_LARGE
+        cfg = _config(hidden_states.shape[0], *state[0].shape)
         return deepgemm.w8a16_linear(
             hidden_states.contiguous(), state[0], state[1], config=cfg)
 
