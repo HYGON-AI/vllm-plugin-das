@@ -12,8 +12,156 @@ from __future__ import annotations
 import functools
 import importlib
 import inspect
+import json
+import os
 
 from vllm.platforms import current_platform
+from vllm_hcu.platforms import envs as henvs
+
+_step5_ht_runtime_config = None
+_step5_ht_runtime_applied = None
+
+
+def _apply_step5_ht_runtime_config(prepare) -> None:
+    """Apply a validated communication budget between benchmark workloads."""
+    if not (
+        getattr(prepare, "_hcu_step5_runtime_tuning_allowed", False)
+        and henvs.custom_ops_enabled()
+    ):
+        return
+    path = os.environ.get("HCU_STEP5_DEEPEP_RUNTIME_CONFIG")
+    if not path:
+        return
+    global _step5_ht_runtime_config, _step5_ht_runtime_applied
+    stamp = os.stat(path).st_mtime_ns
+    cached = _step5_ht_runtime_config
+    if cached is None or cached[:2] != (path, stamp):
+        with open(path) as handle:
+            config = json.load(handle)
+        version, num_sms = config.get("version"), config.get("num_sms")
+        dispatch_send = config.get("dispatch_send", 8)
+        combine_send = config.get("combine_send", 8)
+        recv_tokens = config.get("recv_tokens", 512)
+        async_layout = config.get("async_layout", False)
+        overlap = config.get("overlap", False)
+        if type(version) is not int or version < 1 or type(num_sms) is not int or num_sms not in (12, 16, 18, 24, 30, 36):
+            raise ValueError("Step5 DeepEP runtime config requires a positive version and num_sms in12/16/18/24/30/36")
+        if type(dispatch_send) is not int or type(combine_send) is not int or dispatch_send not in (8, 16, 32, 64) or combine_send not in (8, 16, 32, 64) or type(async_layout) is not bool:
+            raise ValueError("Step5 DeepEP runtime config has invalid NVL chunk or async_layout")
+        if type(overlap) is not bool:
+            raise ValueError("Step5 DeepEP overlap must be a boolean")
+        if type(recv_tokens) is not int or recv_tokens not in (256, 512):
+            raise ValueError("Step5 DeepEP NVL receive queue must contain256 or512 tokens")
+        cached = (path, stamp, version, num_sms, dispatch_send, combine_send, async_layout, overlap, recv_tokens)
+        _step5_ht_runtime_config = cached
+    _, _, version, num_sms, dispatch_send, combine_send, async_layout, overlap, recv_tokens = cached
+    # The selected profile belongs to this prepare/finalize instance. Do not
+    # change DeepEP's class-wide defaults used by unrelated model instances.
+    prepare._hcu_step5_num_sms = num_sms
+    prepare._hcu_step5_dispatch_send = dispatch_send
+    prepare._hcu_step5_combine_send = combine_send
+    prepare._hcu_step5_recv_tokens = recv_tokens
+    prepare._hcu_step5_async_layout = async_layout
+    if overlap and len(getattr(prepare, "_hcu_step5_buffer_pair", ())) != 2:
+        raise ValueError("Step5 DeepEP overlap requires two preallocated communication buffers")
+    prepare._hcu_step5_overlap = overlap
+    applied = (path, version, num_sms, dispatch_send, combine_send, async_layout, overlap, recv_tokens)
+    if _step5_ht_runtime_applied != applied:
+        from vllm.logger import init_logger
+
+        init_logger("vllm.hcu.step5_deepep").info(
+            "Step5 DeepEP runtime config: version=%d num_sms=%d dispatch_send=%d combine_send=%d async_layout=%s overlap=%s recv_tokens=%d",
+            version, num_sms, dispatch_send, combine_send, async_layout, overlap, recv_tokens,
+        )
+        _step5_ht_runtime_applied = applied
+
+
+def step5_ht_launch_config(prepare, original, *, combine=False):
+    if not (
+        getattr(prepare, "_hcu_step5_runtime_tuning_allowed", False)
+        and henvs.custom_ops_enabled()
+    ):
+        return original
+    send = getattr(prepare, "_hcu_step5_combine_send" if combine else "_hcu_step5_dispatch_send", 8)
+    recv_tokens = getattr(prepare, "_hcu_step5_recv_tokens", 512)
+    if not hasattr(prepare, "_hcu_step5_num_sms"):
+        return original
+    if prepare.num_dispatchers_ != 16 or original is None:
+        raise ValueError("Step5 custom NVL chunks require EP16 high-throughput configuration")
+    config = type(original)(prepare._hcu_step5_num_sms, send, recv_tokens, 16, 128)
+    # A smaller receive queue lets more channels fit the startup allocation.
+    # Enforce the conservative BF16-width hint even for FP8 dispatch.
+    if config.get_nvl_buffer_size_hint(4096 * 2, 16) > prepare.buffer.num_nvl_bytes:
+        raise ValueError("Step5 DeepEP runtime config exceeds its reserved NVL buffer")
+    return config
+
+
+def configure_step5_ht_kernel(kernel, moe_quant_config, moe_config):
+    """Reserve Step5-only DBO storage before profiling and KV planning."""
+    if not henvs.optional_custom_op_enabled(
+        os.environ.get("HCU_STEP5_DEEPEP_PROFILE_DBO_OUTPUT", "0") == "1"
+    ):
+        return kernel
+    from vllm.config import get_current_vllm_config_or_none
+    from vllm_hcu.runtime_compat.step5 import is_step5_owner
+
+    prepare = getattr(kernel, "prepare_finalize", None)
+    if type(prepare).__name__ == "DeepEPHTPrepareAndFinalize":
+        wrapper = getattr(kernel, "fused_experts", None)
+        experts = getattr(wrapper, "experts", wrapper)
+        owner = getattr(experts, "_hcu_step5_owner", False) is True or is_step5_owner(moe_config)
+        config = get_current_vllm_config_or_none()
+        configured_dbo = (
+            config is not None and config.parallel_config.enable_dbo
+        ) or int(os.environ.get("HCU_DBO_MIN_TOKENS", "0")) > 0
+        # Ownership/configuration are construction-time facts. Runtime
+        # custom-op threads need not retain the initialization context.
+        prepare._hcu_step5_profile_dbo_output_requested = bool(owner and configured_dbo)
+        prepare._hcu_step5_runtime_tuning_allowed = bool(owner)
+        if owner and configured_dbo and os.environ.get("HCU_STEP5_DEEPEP_DBO_BUFFER_PAIR", "0") == "1":
+            if prepare.num_dispatchers_ != 16 or os.environ.get("DEEP_EP_NORMAL_MNVL") != "1":
+                raise ValueError("Step5 DeepEP buffer-pair overlap requires EP16 NORMAL MNVL")
+            fused_scatter_requested = os.environ.get("HCU_STEP5_DEEPEP_FUSED_SCATTER", "0") == "1"
+            if fused_scatter_requested:
+                if not (
+                    type(experts).__name__ == "DeepGemmExperts"
+                    and getattr(experts, "_hcu_logical_n", None) == 3072
+                    and getattr(experts, "_hcu_logical_k", None) == 4096
+                    and moe_quant_config.use_fp8_w8a8
+                    and moe_quant_config.per_out_ch_quant
+                    and moe_quant_config.per_act_token_quant
+                    and moe_quant_config.block_shape is None
+                ):
+                    raise ValueError("Step5 fused DeepEP scatter requires TP1 channel-FP8 DeepGemmExperts")
+            import deep_ep
+            from vllm.model_executor.layers.fused_moe.all2all_utils import get_ep_all2all_manager
+
+            manager = get_ep_all2all_manager()
+            if manager.get_handle({}) is not prepare.buffer:
+                raise RuntimeError("Step5 DeepEP buffer pair resolved a different EP manager")
+            buffer_kwargs = manager._make_all2all_kwargs().copy()
+            # A distinct valid cache key gives each ubatch independent
+            # communication storage; the normal manager destroys both.
+            buffer_kwargs["num_nvl_bytes"] += 4096
+            second = manager.handle_cache.get_or_create(buffer_kwargs, deep_ep.Buffer)
+            assert second is not prepare.buffer
+            prepare._hcu_step5_buffer_pair = (prepare.buffer, second)
+            from vllm.logger import init_logger
+
+            init_logger("vllm.hcu.step5_deepep").info_once(
+                "Step5 DeepEP DBO buffer pair preallocated before KV planning",
+                scope="all",
+            )
+            if fused_scatter_requested:
+                if not hasattr(manager, "_hcu_step5_scatter_buffers"):
+                    manager._hcu_step5_scatter_buffers = {}
+                    manager._hcu_step5_scatter_guards = {}
+                prepare._hcu_step5_scatter_buffers = manager._hcu_step5_scatter_buffers
+                prepare._hcu_step5_scatter_guards = manager._hcu_step5_scatter_guards
+                prepare._hcu_step5_fused_scatter_enabled = True
+                experts._hcu_step5_fused_scatter_enabled = True
+
+    return kernel
 
 
 @functools.lru_cache(maxsize=1)
@@ -246,8 +394,43 @@ def ht_do_dispatch(
     quant_config,
     defer_input_quant,
 ):
+    _apply_step5_ht_runtime_config(self)
+    ubatch_id = module.dbo_current_ubatch_id()
+    pair_active = bool(module.dbo_enabled() and getattr(self, "_hcu_step5_overlap", False))
+    buffer = self._hcu_step5_buffer_pair[ubatch_id] if pair_active else self.buffer
+    if not hasattr(self, "_hcu_step5_pair_active"):
+        self._hcu_step5_pair_active = {}
+        self._hcu_step5_inflight = {}
+    self._hcu_step5_pair_active[ubatch_id] = pair_active
+    if pair_active:
+        if ubatch_id in self._hcu_step5_inflight:
+            raise RuntimeError("DeepEP communication buffer reused before its prior receiver completed")
+        self._hcu_step5_inflight[ubatch_id] = [tokens, token_scales, rank_topk_ids, rank_topk_weights]
+        from vllm.logger import init_logger
+
+        init_logger("vllm.hcu.step5_deepep").info_once(
+            "Step5 DeepEP dual-buffer overlap active: independent storage and event dependencies",
+            scope="all",
+        )
+    # HCU DBO shares compute scratch between microbatches. An HT result must
+    # survive a handoff until combine consumes it, so its final output needs
+    # separate ownership. Recompute the policy as runtime DBO varies by step.
+    reserve_profile_output = bool(
+        getattr(self, "_hcu_step5_profile_dbo_output_requested", False)
+    )
+    # Startup profiling runs unsplit even when DBO is configured. Retain the
+    # same private-output allocation there so KV planning sees its live peak.
+    self._hcu_dbo_private_output = bool(module.dbo_enabled() or reserve_profile_output)
+    if reserve_profile_output:
+        from vllm.logger import init_logger
+
+        init_logger("vllm.hcu.step5_deepep").info_once(
+            "Step5 DeepEP DBO output reservation: unsplit profiling also owns private output",
+            scope="all",
+        )
     has_scales = token_scales is not None
-    previous_event = module.dbo_get_previous_event(self.buffer.capture)
+    async_layout = bool(getattr(self, "_hcu_step5_async_layout", False))
+    previous_event = module.dbo_get_previous_event(buffer.capture)
     module.dbo_yield_and_switch_from_compute_to_comm()
     (
         num_tokens_per_rank,
@@ -255,13 +438,19 @@ def ht_do_dispatch(
         dispatch_expert_num_tokens,
         is_token_in_rank,
         event,
-    ) = self.buffer.get_dispatch_layout(
+    ) = buffer.get_dispatch_layout(
         topk_idx=rank_topk_ids,
         num_experts=num_experts,
         previous_event=previous_event,
-        async_finish=False,
+        async_finish=async_layout,
         allocate_on_comm_stream=False,
     )
+    dispatch_previous_event = event if async_layout else previous_event
+    if pair_active:
+        self._hcu_step5_inflight[ubatch_id].extend([
+            num_tokens_per_rank, num_tokens_per_rdma_rank, dispatch_expert_num_tokens,
+            is_token_in_rank, previous_event, event,
+        ])
     token_data = (tokens, token_scales) if has_scales else tokens
     post_dispatch_channel_fp8 = _uses_post_dispatch_channel_fp8_quant(
         quant_config
@@ -279,6 +468,33 @@ def ht_do_dispatch(
             else 1
         )
     )
+    fused_scatter = bool(getattr(self, "_hcu_step5_fused_scatter_enabled", False))
+    scatter_kwargs = {}
+    if fused_scatter:
+        if not (has_scales and expert_alignment == 256 and num_experts in (352, 368)):
+            raise ValueError("Step5 fused scatter requires E22/E23 with EP16 per-token FP8 scales")
+        data, scales = token_data
+        if data.dtype != module.torch.float8_e4m3fn or scales.shape != (data.size(0), 1):
+            raise ValueError("Step5 fused scatter requires FP8 [M,4096] and float32 [M,1]")
+        key = (id(self.buffer), ubatch_id)
+        cache = self._hcu_step5_scatter_buffers
+        if key not in cache:
+            cache[key] = [
+                module.torch.empty((0, data.size(1)), device=data.device, dtype=data.dtype),
+                module.torch.empty((0, 1), device=data.device, dtype=scales.dtype),
+                module.torch.empty((0, rank_topk_ids.size(1)), device=data.device, dtype=module.torch.int32),
+                module.torch.empty((0,), device=data.device, dtype=module.torch.int32),
+            ]
+        sx, ss, si, sm = cache[key]
+        guard = self._hcu_step5_scatter_guards.setdefault(key, {})
+        if guard.get("last_use") is not None:
+            # A different layer can share this ubatch's buffers. Chain its
+            # final Gather use into DeepEP's own stream before any overwrite.
+            module.torch.cuda.current_stream().wait_event(guard["last_use"])
+            dispatch_previous_event = buffer.capture()
+        scatter_kwargs = dict(scatter_x=sx, scatter_x_scales=ss,
+                              scatter_output_index=si, scatter_m_indices=sm)
+    dispatch = buffer.dispatch_scatter if fused_scatter else buffer.dispatch
     (
         token_data,
         expert_topk_ids,
@@ -286,8 +502,9 @@ def ht_do_dispatch(
         expert_num_tokens_per_expert_list,
         handle,
         event,
-    ) = self.buffer.dispatch(
+    ) = dispatch(
         x=token_data,
+        **scatter_kwargs,
         handle=None,
         num_tokens_per_rank=num_tokens_per_rank,
         num_tokens_per_rdma_rank=num_tokens_per_rdma_rank,
@@ -300,10 +517,25 @@ def ht_do_dispatch(
         # every other per-token quantization path.
         expert_alignment=expert_alignment,
         config=self._get_dispatch_config(),
-        previous_event=previous_event,
-        async_finish=self.async_prepare and not module.dbo_enabled(),
+        previous_event=dispatch_previous_event,
+        async_finish=self.async_prepare and (pair_active or not module.dbo_enabled()),
         allocate_on_comm_stream=False,
     )
+    if fused_scatter and reserve_profile_output and not module.dbo_enabled():
+        # Share a pair across layers, and expose both ubatch input buffers to
+        # startup's peak-memory measurement before KV capacity is selected.
+        partner_key = (id(self.buffer), 1)
+        partner = cache.get(partner_key)
+        if partner is None or any(p.numel() < t.numel() for p, t in zip(partner, cache[key])):
+            cache[partner_key] = [module.torch.empty_like(t) for t in cache[key]]
+    # Preserve the stock ROCm fence: the next microbatch must not reuse the
+    # Buffer-owned communication workspace before this dispatch completes.
+    if pair_active:
+        self._hcu_step5_inflight[ubatch_id].extend([
+            token_data, expert_topk_ids, expert_topk_weights, event,
+        ])
+    else:
+        self._sync_dbo_comm_if_needed()
     self.handles[module.dbo_current_ubatch_id()] = handle
     module.dbo_switch_to_compute_sync()
     return lambda: self._receiver(
@@ -366,6 +598,38 @@ def ht_receiver(
         expert_num_tokens_per_expert_list,
         device=expert_x.device,
     )
+    # Counts were produced by this dispatch, after physical expert routing.
+    # Consumers must still explicitly opt in before using them to shrink work.
+    expert_tokens_meta._hcu_deepep_ht_local_counts = True
+    ubatch_id = module.dbo_current_ubatch_id()
+    if getattr(self, "_hcu_step5_fused_scatter_enabled", False):
+        counts = tuple(expert_num_tokens_per_expert_list)
+        if len(counts) not in (22, 23) or any(
+            type(c) is not int or c < 0 or c % 256 for c in counts
+        ):
+            raise ValueError("Step5 fused scatter requires aligned E22/E23 dispatch counts")
+        rows = sum(counts)
+        sx, ss, si, sm = self._hcu_step5_scatter_buffers[(id(self.buffer), ubatch_id)]
+        for tensor in (sx, ss, si, sm):
+            tensor.record_stream(module.torch.cuda.current_stream())
+        expert_tokens_meta._hcu_step5_fused_scatter = (sx[:rows], ss[:rows], sm[:rows], si)
+        # This is the physical, already permuted dispatch layout. Bind it to
+        # the received batch independently of optional compact/exact sizing.
+        expert_tokens_meta._hcu_step5_fused_scatter_layout = (
+            tuple(expert_topk_ids.shape), counts,
+        )
+        expert_tokens_meta._hcu_step5_fused_scatter_guard = self._hcu_step5_scatter_guards[(id(self.buffer), ubatch_id)]
+        from vllm.logger import init_logger
+
+        init_logger("vllm.hcu.step5_deepep").info_once(
+            "Step5 DeepEP fused scatter active: communication writes expert-major GEMM input",
+            scope="all",
+        )
+    if getattr(self, "_hcu_step5_pair_active", {}).get(ubatch_id, False):
+        self._hcu_step5_inflight[ubatch_id].extend([
+            expert_tokens_meta.expert_num_tokens,
+            expert_tokens_meta.expert_num_tokens_cpu,
+        ])
     post_dispatch_channel_fp8 = _uses_post_dispatch_channel_fp8_quant(
         quant_config
     )
@@ -476,6 +740,70 @@ def ht_prepare_async(
         quant_config=quant_config,
         defer_input_quant=defer_input_quant,
     )
+
+
+def ht_finalize_with_buffer_pair(
+    module, self, output, fused_expert_output, topk_weights, topk_ids,
+    apply_router_weight_on_input, weight_and_reduce_impl, do_async, original,
+):
+    uid = module.dbo_current_ubatch_id()
+    if not getattr(self, "_hcu_step5_pair_active", {}).get(uid, False):
+        return original(
+            self, output, fused_expert_output, topk_weights, topk_ids,
+            apply_router_weight_on_input, weight_and_reduce_impl, do_async,
+        )
+    if not do_async or not module.dbo_enabled():
+        raise RuntimeError("Step5 buffer-pair overlap requires the asynchronous DBO finalizer")
+    buffer = self._hcu_step5_buffer_pair[uid]
+    handle = self.handles[uid]
+    assert handle is not None
+    inflight = self._hcu_step5_inflight[uid]
+    inflight.append(fused_expert_output)
+    if fused_expert_output.numel():
+        if isinstance(weight_and_reduce_impl, module.TopKWeightAndReduceDelegate):
+            weight_and_reduce_impl = module.TopKWeightAndReduceContiguous()
+        fused_expert_output = weight_and_reduce_impl.apply(
+            output=None, fused_expert_output=fused_expert_output,
+            topk_weights=topk_weights, topk_ids=topk_ids,
+            apply_router_weight_on_input=apply_router_weight_on_input,
+        )
+    inflight.append(fused_expert_output)
+    previous_event = module.dbo_get_previous_event(buffer.capture)
+    module.dbo_yield_and_switch_from_compute_to_comm()
+    assert fused_expert_output.dtype == module.torch.bfloat16
+    combined_x, _, event = buffer.combine(
+        x=fused_expert_output, handle=handle, topk_weights=None,
+        config=self._get_combine_config(), previous_event=previous_event,
+        async_finish=True, allocate_on_comm_stream=False,
+    )
+    # Each ubatch has independent Buffer-owned scratch. Completion is carried
+    # by the event; the shared-buffer CPU stream fence is unnecessary here.
+    module.dbo_switch_to_compute()
+
+    def receiver():
+        module.dbo_switch_to_comm()
+        # The copy is enqueued on the scheduler communication stream, so wait
+        # on this stream rather than on the compute stream before switching.
+        if event.event is not None:
+            event.current_stream_wait()
+        output.copy_(combined_x, non_blocking=True)
+        stream = module.torch.cuda.current_stream()
+
+        def record(value):
+            if isinstance(value, module.torch.Tensor):
+                if value.is_cuda:
+                    value.record_stream(stream)
+            elif isinstance(value, (tuple, list)):
+                for item in value:
+                    record(item)
+
+        record(inflight)
+        record(combined_x)
+        self._hcu_step5_inflight.pop(uid)
+        self._hcu_step5_pair_active[uid] = False
+        module.dbo_yield_and_switch_from_comm_to_compute()
+
+    return receiver
 
 
 def ll_init(

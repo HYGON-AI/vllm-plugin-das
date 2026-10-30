@@ -5,7 +5,10 @@
 from __future__ import annotations
 
 import functools
+import os
 from types import ModuleType
+
+from vllm_hcu.platforms import envs as henvs
 
 from ._common import (
     PatchCompatibilityError,
@@ -66,6 +69,37 @@ def _requested_selected_backend(moe) -> str | None:
     return selected_backend
 
 
+def _asm_g1_owner_context(layer_name, moe):
+    """Capture owner metadata while model construction has its VllmConfig."""
+    from vllm.config import get_current_vllm_config_or_none
+
+    config = get_current_vllm_config_or_none() or getattr(moe, "_hcu_vllm_config", None)
+    if config is None:
+        return None
+    model = config.model_config
+    from vllm_hcu.runtime_compat.step5 import is_step5_config
+    parallel = config.parallel_config
+    eplb = getattr(parallel, "eplb_config", None)
+    return dict(
+        is_step5=bool(is_step5_config(config)),
+        is_draft=(getattr(model, "runner", None) == "draft"
+                  or ".mtp_block." in str(layer_name)),
+        tp_size=parallel.tensor_parallel_size,
+        dp_size=parallel.data_parallel_size,
+        enable_ep=bool(parallel.enable_expert_parallel),
+        enable_eplb=bool(parallel.enable_eplb),
+        static_expert_map_path=getattr(parallel, "_vllm_hcu_expert_map_path", None),
+        expert_map_record_path=getattr(parallel, "_vllm_hcu_expert_map_record_path", None),
+        eplb_disable_rearrange=getattr(parallel, "_vllm_hcu_eplb_disable_rearrange", False),
+        static_dispatch_policy=getattr(parallel, "_vllm_hcu_eplb_static_dispatch_policy", None),
+        num_redundant_experts=getattr(eplb, "num_redundant_experts", 0),
+        eplb_use_async=getattr(eplb, "use_async", None),
+        enable_elastic_ep=bool(getattr(parallel, "enable_elastic_ep", False)),
+        enable_ep_weight_filter=bool(getattr(parallel, "enable_ep_weight_filter", False)),
+        layer_name=layer_name,
+    )
+
+
 def apply_to_module(module: ModuleType) -> bool:
     fp8_moe_module = load_exact_module(TARGET_MODULE, module)
     method_class = require_class(
@@ -112,7 +146,14 @@ def apply_to_module(module: ModuleType) -> bool:
         requested_backend = None
         if channel_token:
             requested_backend = _requested_selected_backend(moe)
+        from vllm_hcu.runtime_compat.step5 import is_step5_owner
+
+        self._hcu_step5_owner = is_step5_owner(moe)
         original_init(self, weight_quant, input_quant, moe, layer_name)
+        if (henvs.custom_ops_enabled()
+                and self._hcu_step5_owner
+                and os.environ.get("HCU_STEP5_PREFILL_ASM_G1", "0") == "1"):
+            self._hcu_step5_asm_g1_owner_context = _asm_g1_owner_context(layer_name, moe)
         if channel_token:
             selected_backend = _selected_backend_name(self)
             if selected_backend is None:
@@ -132,6 +173,7 @@ def apply_to_module(module: ModuleType) -> bool:
 
     @functools.wraps(original_process)
     def hcu_process_weights_after_loading(self, layer):
+        layer._hcu_step5_owner = getattr(self, "_hcu_step5_owner", False)
         original_process(self, layer)
         selected_backend = _selected_backend_name(self)
         if selected_backend == "AITER":
@@ -150,18 +192,28 @@ def apply_to_module(module: ModuleType) -> bool:
                 quant_config,
             )
             return
-        if selected_backend != "HCU_DEEPGEMM":
-            return
-        moe_kernel = getattr(self, "moe_kernel", None)
-        fused_experts = getattr(moe_kernel, "fused_experts", None)
-        experts = getattr(fused_experts, "experts", fused_experts)
-        process = getattr(experts, "process_weights_after_loading", None)
-        if not callable(process):
-            raise RuntimeError(
-                "HCU_DEEPGEMM FP8 backend did not construct modular experts "
-                "before weight postprocessing"
+        if selected_backend == "HCU_DEEPGEMM":
+            moe_kernel = getattr(self, "moe_kernel", None)
+            fused_experts = getattr(moe_kernel, "fused_experts", None)
+            experts = getattr(fused_experts, "experts", fused_experts)
+            process = getattr(experts, "process_weights_after_loading", None)
+            if not callable(process):
+                raise RuntimeError(
+                    "HCU_DEEPGEMM FP8 backend did not construct modular experts "
+                    "before weight postprocessing"
+                )
+            process(layer)
+        if (henvs.custom_ops_enabled()
+                and getattr(self, "_hcu_step5_owner", False)
+                and selected_backend in ("DEEPGEMM", "HCU_DEEPGEMM")
+                and os.environ.get("HCU_STEP5_PREFILL_ASM_G1", "0") == "1"):
+            from vllm_hcu.ops.step5.prefill_asm_g1 import prepare_prefill_asm_g1_cache
+
+            # All backend-owned normalization/repacking has finished. This
+            # allocation still belongs to model_loader's DeviceMemoryProfiler.
+            prepare_prefill_asm_g1_cache(
+                self, layer, getattr(self, "_hcu_step5_asm_g1_owner_context", None),
             )
-        process(layer)
 
     setattr(hcu_init, _WRAPPER_MARKER, True)
     setattr(hcu_process_weights_after_loading, _WRAPPER_MARKER, True)

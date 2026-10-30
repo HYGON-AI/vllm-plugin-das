@@ -5,6 +5,7 @@
 """HCU-owned v0.25.1 shared-expert execution."""
 
 import inspect
+import os
 from collections.abc import Callable
 from enum import IntEnum
 
@@ -23,9 +24,32 @@ from vllm.utils.torch_utils import (
 )
 from vllm.v1.worker.ubatching import (
     dbo_current_ubatch_id,
+    dbo_enabled,
 )
 
 logger = init_logger("vllm.hcu.shared_experts")
+
+# Batches of at least this many tokens (prefill) run the shared expert on the
+# aux stream launched after the routed experts, so it overlaps the DP combine
+# (NCCL reduce-scatter); the runner joins it right before the shared add (see
+# wait_late).  Launched any earlier it only competes with compute kernels for
+# CUs.  Smaller batches (decode) keep the configured order.  0 disables.  Not a
+# VLLM_HCU_* name on purpose: it only changes eager stream use inside the MoE
+# custom op, not the traced graph, so it must not change the compile hash.
+_LATE_STREAM_MIN_TOKENS = (
+    int(os.environ.get("HCU_SHARED_EXPERTS_STREAM_MIN_TOKENS", "0"))
+    if henvs.custom_ops_enabled() else 0
+)
+_fused_router_stream_announced = False
+
+
+def _fused_router_stream_enabled() -> bool:
+    # Worker unpickling can import this module before the executor installs
+    # its environment. Resolve at use time so an early import cannot freeze
+    # the feature off for the lifetime of that worker.
+    return henvs.optional_custom_op_enabled(
+        os.environ.get("HCU_STEP5_FUSED_ROUTER_STREAM", "0") == "1"
+    )
 
 
 class SharedExpertsOrder(IntEnum):
@@ -40,6 +64,10 @@ class SharedExpertsOrder(IntEnum):
 
     # Overlapped with the gate, router, experts in aux stream.
     MULTI_STREAM_OVERLAPPED = (3,)
+
+    # The router has produced an independent shared activation. Only its down
+    # projection runs on the aux stream, starting after the producer event.
+    FUSED_ROUTER_OVERLAPPED = (4,)
 
 
 class SharedExperts(torch.nn.Module):
@@ -57,9 +85,14 @@ class SharedExperts(torch.nn.Module):
         # an MK's finalize method.  We keep a list of outputs indexed by current
         # DBO ubatch id to handle this case.  If DBO is not enabled, the
         # index is always 0 and the second output list element is ignored.
+        from vllm_hcu.runtime_compat.step5 import is_step5_owner
+
+        self._hcu_step5_owner = is_step5_owner(moe_config)
         self.enable_dbo = enable_dbo
         self._output: list[torch.Tensor | None] = [None, None]
         self._output_pending_on_stream: list[bool] = [False, False]
+        self._output_pending_late: list[bool] = [False, False]
+        self._output_pending_fused_router: list[bool] = [False, False]
         self._layer = layer
         self._moe_config = moe_config
 
@@ -165,10 +198,35 @@ class SharedExperts(torch.nn.Module):
             and parallel_config.all2all_backend != "allgather_reducescatter"
         ) or parallel_config.use_fi_nvl_two_sided_kernels
 
+    def _requires_main_stream_for_fused_activation(
+        self,
+        hidden_states: torch.Tensor,
+    ) -> bool:
+        """Return whether a producer left an activation on the main stream."""
+        layer = getattr(self, "_layer", None)
+        requires_main_stream = getattr(
+            layer,
+            "requires_main_stream_for_fused_activation",
+            None,
+        )
+        return bool(requires_main_stream(hidden_states)) if callable(
+            requires_main_stream
+        ) else False
+
     def _determine_shared_experts_order(
         self,
         hidden_states: torch.Tensor,
     ) -> SharedExpertsOrder:
+        pending = getattr(self, "_output_pending_fused_router", None)
+        if pending is not None and pending[self._output_idx]:
+            return SharedExpertsOrder.FUSED_ROUTER_OVERLAPPED
+        # A fused router can produce the shared gate_up + activation on the
+        # current stream before the runner invokes this layer. Running the
+        # shared expert on the auxiliary stream would fail the stream handoff
+        # check and recompute both operations, so serialize this short path.
+        if self._requires_main_stream_for_fused_activation(hidden_states):
+            return SharedExpertsOrder.NO_OVERLAP
+
         force_stream = bool(
             henvs.VLLM_HCU_USE_CUSTOM_OPS
             and (
@@ -183,6 +241,8 @@ class SharedExperts(torch.nn.Module):
             )
         if self._disable_shared_experts_overlap:
             return SharedExpertsOrder.NO_OVERLAP
+        if self._late_stream(hidden_states):
+            return SharedExpertsOrder.MULTI_STREAM_OVERLAPPED
 
         should_run_shared_in_aux_stream = self._should_run_shared_in_aux_stream(
             hidden_states
@@ -201,6 +261,55 @@ class SharedExperts(torch.nn.Module):
             return SharedExpertsOrder.MULTI_STREAM_OVERLAPPED
         return SharedExpertsOrder.NO_OVERLAP
 
+    def maybe_launch_fused_router_activation(
+        self, hidden_states: torch.Tensor
+    ) -> bool:
+        """Launch only after the internal router has handed off its activation.
+
+        Take the cache on its producer stream, then record the dependency and
+        allocator ownership explicitly. The auxiliary projection never reads
+        hidden_states, which routed experts are allowed to overwrite.
+        """
+        if (
+            not getattr(self, "_hcu_step5_owner", False)
+            or not _fused_router_stream_enabled()
+            or self.enable_dbo
+            or self._stream is None
+            or self._disable_shared_experts_overlap
+            or getattr(self._moe_config, "is_sequence_parallel", False)
+            or getattr(self._moe_config, "pcp_size", 1) > 1
+            or not self._requires_main_stream_for_fused_activation(hidden_states)
+        ):
+            return False
+        take = getattr(self._layer, "pop_fused_router_activation", None)
+        project = getattr(self._layer, "forward_fused_router_activation", None)
+        if not callable(take) or not callable(project):
+            return False
+        index = self._output_idx
+        assert self._output[index] is None
+        activation = take(hidden_states)
+        if activation is None:
+            return False
+        assert activation.device == hidden_states.device
+        assert activation.shape[0] == hidden_states.shape[0]
+        self._stream.wait_stream(current_stream())
+        activation.record_stream(self._stream)
+        with torch.cuda.stream(self._stream):
+            self._output[index] = project(activation)
+        self._output_pending_on_stream[index] = True
+        self._output_pending_fused_router[index] = True
+        # HCU replacement modules retain a vllm_hcu logger name, which can be
+        # filtered independently of vllm's INFO configuration. Match the other
+        # Step5 native activation markers and emit once after a real launch.
+        global _fused_router_stream_announced
+        if not _fused_router_stream_announced:
+            _fused_router_stream_announced = True
+            print(
+                "Step5 fused-router shared down projection: auxiliary stream active",
+                flush=True,
+            )
+        return True
+
     def requires_input_preservation(self, hidden_states: torch.Tensor) -> bool:
         """Return whether routed experts can mutate this input concurrently."""
         return self._determine_shared_experts_order(hidden_states) in (
@@ -217,6 +326,24 @@ class SharedExperts(torch.nn.Module):
         return not torch._C._is_alias_of(
             routed_input, shared_input
         ) or not self.requires_input_preservation(shared_input)
+
+    def _late_stream(self, hidden_states: torch.Tensor) -> bool:
+        return (
+            henvs.custom_ops_enabled()
+            and getattr(self, "_hcu_step5_owner", False)
+            and _LATE_STREAM_MIN_TOKENS > 0
+            and self._stream is not None
+            and hidden_states.shape[0] >= _LATE_STREAM_MIN_TOKENS
+            # Microbatched: the combine already overlaps the other microbatch.
+            and not dbo_enabled()
+        )
+
+    def wait_late(self) -> None:
+        """Join a late-launched shared expert (see _LATE_STREAM_MIN_TOKENS)."""
+        if self._output_pending_late[self._output_idx]:
+            assert self._stream is not None
+            current_stream().wait_stream(self._stream)
+            self._output_pending_late[self._output_idx] = False
 
     def _should_run_shared_in_aux_stream(
         self,
@@ -262,6 +389,7 @@ class SharedExperts(torch.nn.Module):
                 henvs.VLLM_HCU_USE_CUSTOM_OPS
                 and (henvs.VLLM_HCU_SHARED_EXPERTS_EARLY_LAUNCH
                      or self._can_overlap_deepep_eplb())
+                and not self._late_stream(shared_experts_input)
             ):
                 if self._can_overlap_deepep_eplb():
                     logger.info_once(
@@ -318,6 +446,9 @@ class SharedExperts(torch.nn.Module):
             self._output_pending_on_stream[self._output_idx] = False
         output = self._output[self._output_idx]
         self._output[self._output_idx] = None
+        pending = getattr(self, "_output_pending_fused_router", None)
+        if pending is not None:
+            pending[self._output_idx] = False
         return output
 
     def forward(
@@ -342,7 +473,20 @@ class SharedExperts(torch.nn.Module):
 
         assert self._output[self._output_idx] is None
 
-        if order == SharedExpertsOrder.MULTI_STREAM_OVERLAPPED:
+        if order == SharedExpertsOrder.MULTI_STREAM_OVERLAPPED and self._late_stream(
+            shared_experts_input
+        ):
+            # Start only once the routed experts are done: the aux stream waits
+            # on the main stream as of now, not as of the sync at layer entry.
+            assert self._stream is not None
+            self._stream.wait_stream(current_stream())
+            with torch.cuda.stream(self._stream):
+                self._output[self._output_idx] = self._run_layer(
+                    shared_experts_input,
+                    x_and_scale_quanted=x_and_scale_quanted,
+                )
+            self._output_pending_late[self._output_idx] = True
+        elif order == SharedExpertsOrder.MULTI_STREAM_OVERLAPPED:
             self._output[self._output_idx] = self._run_in_aux_stream(
                 shared_experts_input,
                 x_and_scale_quanted=x_and_scale_quanted,

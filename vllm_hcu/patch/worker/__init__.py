@@ -353,18 +353,6 @@ _CUDA_VALIDATION_ID = (
 _FRAMEWORK_CALLBACKS: tuple[_CallbackSpec, ...] = (
     _CallbackSpec(_adapter("framework_opt", "patch_agrs_int8")),
     _CallbackSpec(
-        _adapter("framework_opt", "patch_model_loader_static_eplb"),
-        feature="offline_eplb",
-    ),
-    _CallbackSpec(
-        _adapter("framework_opt", "patch_static_expert_mapping"),
-        feature="offline_eplb",
-    ),
-    _CallbackSpec(
-        _adapter("framework_opt", "patch_eplb_communicator"),
-        feature="offline_eplb",
-    ),
-    _CallbackSpec(
         _adapter("framework_opt", "patch_gpu_worker_shutdown"),
     ),
     _CallbackSpec(
@@ -412,6 +400,9 @@ _FRAMEWORK_CALLBACKS: tuple[_CallbackSpec, ...] = (
     _CallbackSpec(
         _adapter("framework_opt", "patch_draft_speculator_inputs"),
     ),
+    _CallbackSpec(
+        _adapter("framework_opt", "patch_mtp_prefill_tail"),
+    ),
     _CallbackSpec(_adapter("framework_opt", "patch_gpu_ubatch_wrapper")),
     _CallbackSpec(_adapter("framework_opt", "patch_ubatch_utils")),
     _CallbackSpec(_adapter("framework_opt", "patch_all2all"), feature="deepep"),
@@ -431,12 +422,24 @@ _FRAMEWORK_CALLBACKS: tuple[_CallbackSpec, ...] = (
     _CallbackSpec(_adapter("framework_opt", "patch_step5_eplb_transfer")),
     _CallbackSpec(_adapter("framework_opt", "patch_step5_eplb_async_worker")),
     _CallbackSpec(_adapter("framework_opt", "patch_step5_eplb_state")),
-    # Offline recording/static-map policy wraps the final EPLB runtime.
+    _CallbackSpec(_adapter("framework_opt", "patch_step5_deep_gemm_api")),
+    # Baseline Step5 replacements must be inside offline lifecycle guards.
+    _CallbackSpec(
+        _adapter("framework_opt", "patch_model_loader_static_eplb"),
+        feature="offline_eplb",
+    ),
+    _CallbackSpec(
+        _adapter("framework_opt", "patch_static_expert_mapping"),
+        feature="offline_eplb",
+    ),
     _CallbackSpec(
         _adapter("framework_opt", "patch_offline_eplb"),
         feature="eplb_control",
     ),
-    _CallbackSpec(_adapter("framework_opt", "patch_step5_deep_gemm_api")),
+    _CallbackSpec(
+        _adapter("framework_opt", "patch_eplb_communicator"),
+        feature="offline_eplb",
+    ),
 )
 
 

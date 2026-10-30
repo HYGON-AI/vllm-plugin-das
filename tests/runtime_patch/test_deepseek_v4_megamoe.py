@@ -743,7 +743,8 @@ def test_ll_selection_respects_native_scratch_and_stride(runtime, monkeypatch, b
 
 
 @pytest.mark.parametrize("owns_dispatch,expected", [(True, False), (False, True)])
-def test_ep_fused_combine_excludes_backend_owned_dispatch(owns_dispatch, expected):
+@pytest.mark.parametrize("step5_owner", [False, True])
+def test_ep_fused_combine_excludes_backend_owned_dispatch(owns_dispatch, expected, step5_owner):
     import ast
     path = REPO / "vllm_hcu/model_executor/layers/fused_moe/moe_runner.py"
     tree = ast.parse(path.read_text())
@@ -753,7 +754,8 @@ def test_ep_fused_combine_excludes_backend_owned_dispatch(owns_dispatch, expecte
             isinstance(target, ast.Attribute) and target.attr == "_ep_fused_combine"
             for target in node.targets)
     )
-    runner = NS(_quant_method=NS(hcu_owns_dispatch=owns_dispatch))
+    runner = NS(_quant_method=NS(hcu_owns_dispatch=owns_dispatch),
+                _hcu_step5_owner=step5_owner)
     namespace = dict(
         self=runner, _EP_FUSED_COMBINE=True, shared_experts=object(),
         moe_config=NS(dp_size=8, pcp_size=1, is_sequence_parallel=False,
@@ -763,7 +765,7 @@ def test_ep_fused_combine_excludes_backend_owned_dispatch(owns_dispatch, expecte
     )
     exec(compile(ast.fix_missing_locations(ast.Module(body=[assignment], type_ignores=[])),
                  str(path), "exec"), namespace)
-    assert runner._ep_fused_combine is expected
+    assert runner._ep_fused_combine is (expected and step5_owner)
 
 
 @pytest.mark.parametrize("mode,match", [("normal", "stride"), ("ll", "LL scratch")])
