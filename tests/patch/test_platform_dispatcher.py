@@ -75,6 +75,10 @@ def test_target_root_is_installed_vllm():
 def test_platform_core_inventory_is_explicit_and_ordered():
     assert platform_core_callback_names() == (
         ("platform.core_fix.envs", "vllm.envs"),
+        (
+            "platform.core_fix.config_utils.replace_runtime_attributes",
+            "vllm.config.utils",
+        ),
         ("platform.core_fix.engram_config.hcu", "vllm.config.engram"),
         ("platform.core_fix.import_utils.deep_gemm", "vllm.utils.import_utils"),
         (
@@ -86,8 +90,17 @@ def test_platform_core_inventory_is_explicit_and_ordered():
             "vllm.distributed.nixl_utils",
         ),
         ("platform.core_fix.hcu_config.engine_args", "vllm.engine.arg_utils"),
+        ("platform.core_fix.cache.swa_bounded_replay", "vllm.config.cache"),
+        (
+            "platform.core_fix.cache.swa_bounded_replay.engine",
+            "vllm.engine.arg_utils",
+        ),
         (
             "platform.core_fix.hcu_config.compilation_cudagraph",
+            "vllm.config.compilation",
+        ),
+        (
+            "platform.core_fix.compilation.decoder_replay_cudagraph",
             "vllm.config.compilation",
         ),
         ("platform.core_fix.hcu_config.vllm", "vllm.config.vllm"),
@@ -159,6 +172,22 @@ def test_platform_framework_inventory_is_explicit_and_dependency_ordered():
         ),
         (
             "platform.framework_opt.hcu_scheduler",
+            "vllm.v1.core.sched.scheduler",
+        ),
+        (
+            "platform.framework_opt.swa_bounded_replay.kv_spec",
+            "vllm.v1.kv_cache_interface",
+        ),
+        (
+            "platform.framework_opt.swa_bounded_replay.request",
+            "vllm.v1.request",
+        ),
+        (
+            "platform.framework_opt.swa_bounded_replay.new_request_data",
+            "vllm.v1.core.sched.output",
+        ),
+        (
+            "platform.framework_opt.swa_bounded_replay.scheduler",
             "vllm.v1.core.sched.scheduler",
         ),
         ("platform.framework_opt.engine_core", "vllm.v1.engine.core"),

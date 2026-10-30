@@ -67,8 +67,38 @@ def apply_to_module(module: ModuleType) -> bool:
     def hcu_resolve_kv_cache_block_sizes(kv_cache_config, vllm_config):
         parallel_config = vllm_config.parallel_config
         pcp = parallel_config.prefill_context_parallel_size
+
+        # Upstream gcd is over prefix_cacheable groups only. SWA bounded
+        # replay marks SWA non-prefix-cacheable (#56227), which can raise the
+        # hash unit above a still-cached smaller group's block size and trip
+        # ``assert block_size % hash_block_size == 0`` in resolve_block_hashes.
+        # Always shrink the hash unit so every group block size divides it.
+        #
+        # Delegate PCP=1 before touching kv_cache_groups so opaque / minimal
+        # configs (and unit tests) still pass through to ``original``.
         if pcp == 1:
-            return original(kv_cache_config, vllm_config)
+            scheduler_block_size, hash_block_size = original(
+                kv_cache_config, vllm_config
+            )
+            cache_config = vllm_config.cache_config
+            dcp = parallel_config.decode_context_parallel_size
+            groups = getattr(kv_cache_config, "kv_cache_groups", None) or ()
+            if (
+                len(groups) > 1
+                and bool(getattr(cache_config, "enable_prefix_caching", False))
+            ):
+                group_block_sizes = [
+                    group.kv_cache_spec.block_size * dcp
+                    if isinstance(group.kv_cache_spec, attention_spec)
+                    else group.kv_cache_spec.block_size
+                    for group in groups
+                ]
+                if group_block_sizes and any(
+                    block_size % hash_block_size != 0
+                    for block_size in group_block_sizes
+                ):
+                    hash_block_size = math.gcd(hash_block_size, *group_block_sizes)
+            return scheduler_block_size, hash_block_size
 
         cache_config = vllm_config.cache_config
         dcp = parallel_config.decode_context_parallel_size

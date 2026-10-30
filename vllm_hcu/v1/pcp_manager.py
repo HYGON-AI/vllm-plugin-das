@@ -830,7 +830,7 @@ class HcuPCPManager(PCPManager):
                     "PCP+MTP draft tokens are only valid for decode requests"
                 )
             local_num_draft_tokens = int(local_num_draft_tokens_per_req.sum())
-        return replace(
+        local = replace(
             input_batch,
             req_ids=[input_batch.req_ids[index] for index in global_req_indices],
             num_reqs=num_local_reqs,
@@ -864,6 +864,28 @@ class HcuPCPManager(PCPManager):
             cu_num_logits_np=cu_num_logits_np,
             prompt_lens=None,
         )
+        # Decoder SWA bounded replay needs each request's *global* trailing
+        # window (#62384). HcuPCPManager overrides partition_batch, so the
+        # base-class patch_pcp_batch_metadata wrapper never runs — attach here.
+        from vllm_hcu.patch.worker.framework_opt.patch_pcp_batch_metadata import (
+            PCPBatchMetadata,
+        )
+
+        local.pcp = PCPBatchMetadata(
+            global_num_tokens=int(input_batch.num_tokens),
+            global_query_lens_np=np.asarray(
+                input_batch.num_scheduled_tokens[global_req_indices],
+                dtype=np.int32,
+            ),
+            global_seq_lens_cpu_upper_bound_np=np.asarray(
+                input_batch.seq_lens_cpu_upper_bound.numpy()[global_req_indices],
+                dtype=np.int32,
+            ),
+            dcp_local_seq_lens_cpu_upper_bound=getattr(
+                local, "dcp_local_seq_lens_cpu_upper_bound", None
+            ),
+        )
+        return local
 
     def prepare_attn(
         self, input_batch: InputBatch

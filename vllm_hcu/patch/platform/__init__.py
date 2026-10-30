@@ -31,6 +31,7 @@ from .framework_opt import (
     patch_pcp_single_type_kv_cache_manager,
     patch_qwen4_exp_mtp_kv_cache_groups,
     patch_scheduler,
+    patch_swa_bounded_replay_apc,
 )
 
 
@@ -58,6 +59,8 @@ _ORDERED_FRAMEWORK_ADAPTERS = (
     patch_pcp_kv_cache_coordinator,
     patch_kv_cache_coordinator,
     patch_scheduler,
+    # After patch_scheduler so __init__/schedule wrappers compose correctly.
+    patch_swa_bounded_replay_apc,
     patch_engine_core,
     patch_output_processor,
     patch_multiproc_executor,
@@ -69,6 +72,39 @@ def _register_platform_framework_callbacks() -> None:
     """Arm platform/framework adapters without importing their targets."""
 
     for adapter in _ORDERED_FRAMEWORK_ADAPTERS:
+        if adapter is patch_swa_bounded_replay_apc:
+            # One feature, four exact-import targets (spec / request / output /
+            # scheduler), same pattern as platform core cache_config.
+            for patch_id, target, callback, targets in (
+                (
+                    adapter.KV_PATCH_ID,
+                    adapter.KV_TARGET_MODULE,
+                    adapter.apply_kv_spec_to_module,
+                    adapter.KV_TARGETS,
+                ),
+                (
+                    adapter.REQUEST_PATCH_ID,
+                    adapter.REQUEST_TARGET_MODULE,
+                    adapter.apply_request_to_module,
+                    adapter.REQUEST_TARGETS,
+                ),
+                (
+                    adapter.OUTPUT_PATCH_ID,
+                    adapter.OUTPUT_TARGET_MODULE,
+                    adapter.apply_new_request_data_to_module,
+                    adapter.OUTPUT_TARGETS,
+                ),
+                (
+                    adapter.SCHEDULER_PATCH_ID,
+                    adapter.SCHEDULER_TARGET_MODULE,
+                    adapter.apply_scheduler_to_module,
+                    adapter.SCHEDULER_TARGETS,
+                ),
+            ):
+                IMPORT_COORDINATOR.register_callback(
+                    patch_id, target, callback, targets=targets
+                )
+            continue
         IMPORT_COORDINATOR.register_callback(
             adapter.PATCH_ID,
             adapter.TARGET_MODULE,
@@ -80,10 +116,20 @@ def _register_platform_framework_callbacks() -> None:
 def platform_framework_callback_names() -> tuple[tuple[str, str], ...]:
     """Return the frozen platform/framework callback inventory for tests."""
 
-    return tuple(
-        (adapter.PATCH_ID, adapter.TARGET_MODULE)
-        for adapter in _ORDERED_FRAMEWORK_ADAPTERS
-    )
+    names: list[tuple[str, str]] = []
+    for adapter in _ORDERED_FRAMEWORK_ADAPTERS:
+        if adapter is patch_swa_bounded_replay_apc:
+            names.extend(
+                (
+                    (adapter.KV_PATCH_ID, adapter.KV_TARGET_MODULE),
+                    (adapter.REQUEST_PATCH_ID, adapter.REQUEST_TARGET_MODULE),
+                    (adapter.OUTPUT_PATCH_ID, adapter.OUTPUT_TARGET_MODULE),
+                    (adapter.SCHEDULER_PATCH_ID, adapter.SCHEDULER_TARGET_MODULE),
+                )
+            )
+            continue
+        names.append((adapter.PATCH_ID, adapter.TARGET_MODULE))
+    return tuple(names)
 
 
 def apply_platform_patches() -> None:

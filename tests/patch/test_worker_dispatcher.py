@@ -456,6 +456,38 @@ def test_apply_orders_platform_role_sidecar_prepare_and_feature_binding(
     ]
 
 
+def test_deepep_communicator_feature_follows_use_all2all():
+    config = worker_dispatcher.HcuFeatureConfig(moe_backend="deep_gemm")
+    tp_only = SimpleNamespace(
+        parallel_config=SimpleNamespace(
+            all2all_backend="deepep_high_throughput",
+            data_parallel_size=1,
+            tensor_parallel_size=8,
+            enable_expert_parallel=True,
+            prefill_context_parallel_size=1,
+        )
+    )
+    dp = SimpleNamespace(
+        parallel_config=SimpleNamespace(
+            all2all_backend="deepep_low_latency",
+            data_parallel_size=8,
+            tensor_parallel_size=1,
+            enable_expert_parallel=True,
+            prefill_context_parallel_size=1,
+        )
+    )
+
+    tp_states = worker_dispatcher._feature_states(tp_only, config)
+    dp_states = worker_dispatcher._feature_states(dp, config)
+
+    assert worker_dispatcher._uses_all2all(tp_only) is False
+    assert tp_states["deepep"] is False
+    assert tp_states["deepep_high_throughput"] is True
+    assert worker_dispatcher._uses_all2all(dp) is True
+    assert dp_states["deepep"] is True
+    assert dp_states["deepep_low_latency"] is True
+
+
 def test_terminal_validation_rejects_enabled_armed_but_allows_feature_off():
     patch_id = "worker.op_opt.mla.lightly_cp_wrapper"
     coordinator = ExactImportCoordinator(registry=PatchRegistry())

@@ -140,6 +140,64 @@ def test_builder_signature_drift_is_atomic():
         patch.apply_to_module(ModuleType("vllm.models.deepseek_v4.amd.rocm"))
 
 
+def test_forwards_replay_start_via_parent_when_rocm_omits_it(enabled, monkeypatch):
+    """Installed ROCm build omits replay_start; parent already accepts it."""
+    parent_calls = []
+
+    class Parent:
+        def build(
+            self,
+            common_prefix_len,
+            common_attn_metadata,
+            fast_build=False,
+            replay_start=None,
+        ):
+            parent_calls.append(
+                (common_prefix_len, common_attn_metadata, fast_build, replay_start)
+            )
+            return SimpleNamespace(
+                num_decode_tokens=0,
+                max_decode_query_len=1,
+                decode_swa_indices=None,
+                decode_swa_lens=None,
+                decode_swa_width=0,
+                replay_start=replay_start,
+            )
+
+    class Child(Parent):
+        def build(self, common_prefix_len, common_attn_metadata, fast_build=False):
+            raise AssertionError("ROCm build must not be used when replay_start is set")
+
+    class RocmMeta:
+        def __init__(self, **kwargs):
+            self.__dict__.update(kwargs)
+
+    module = ModuleType(patch.TARGET_MODULE)
+    module.DeepseekV4ROCMAiterSparseSWAMetadataBuilder = Child
+    module.DeepseekV4ROCMAiterSparseSWAMetadata = RocmMeta
+    module.build_ragged_indices_from_dense = lambda *a, **k: (_ for _ in ()).throw(
+        AssertionError("no decode tokens")
+    )
+    module._copy_ragged_to_graph_buffers = lambda *a, **k: (_ for _ in ()).throw(
+        AssertionError("no decode tokens")
+    )
+    instance = Child()
+    instance.layer_names = ["target.layer0.swa_cache"]
+    instance.vllm_config = SimpleNamespace(
+        parallel_config=SimpleNamespace(
+            prefill_context_parallel_size=1, decode_context_parallel_size=1,
+        ),
+        speculative_config=None,
+    )
+    monkeypatch.setattr(runtime, "_decode_bindings", lambda: None)
+    assert patch.apply_to_module(module)
+    replay = torch.tensor([3, 0], dtype=torch.int32)
+    out = instance.build(0, object(), replay_start=replay)
+    assert parent_calls == [(0, parent_calls[0][1], False, replay)]
+    assert out.replay_start is replay
+    assert getattr(out, SCHEDULERS_ATTR) is None
+
+
 def test_builder_instances_and_steps_do_not_share_state(enabled, monkeypatch):
     module, target, target_metadata, _ = builder()
     draft = type(target)()

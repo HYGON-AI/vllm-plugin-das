@@ -17,8 +17,10 @@ from vllm_hcu.patch.import_coordinator import (
 )
 
 from . import (
+    patch_cache_config,
     patch_compilation_config,
     patch_config_utils,
+    patch_decoder_replay_compilation,
     patch_engram_config,
     patch_engine_args,
     patch_envs,
@@ -44,7 +46,11 @@ _ORDERED_ADAPTERS = (
     patch_layer_name,
     patch_nixl_utils,
     patch_engine_args,
+    # After EngineArgs wrappers so CLI / create_engine_config compose correctly.
+    patch_cache_config,
     patch_compilation_config,
+    # After compilation_config so CompilationConfig class exists / is patched.
+    patch_decoder_replay_compilation,
     patch_vllm_config,
     patch_qwen4_exp_pp,
     patch_slimquant_registry,
@@ -68,6 +74,26 @@ def register_platform_core_callbacks(
             # decorator boundary before publishing the normal post-import
             # callback; the public patch registry keeps both paths one-shot.
             patch_engine_args.arm_partial_import_bridge()
+        if adapter is patch_cache_config:
+            # CacheConfig exact-import callback.
+            registrations.append(
+                coordinator.register_callback(
+                    adapter.PATCH_ID,
+                    adapter.TARGET_MODULE,
+                    adapter.apply_to_module,
+                    targets=adapter.TARGETS,
+                )
+            )
+            # EngineArgs wiring must run after patch_engine_args wrappers.
+            registrations.append(
+                coordinator.register_callback(
+                    adapter.ENGINE_PATCH_ID,
+                    adapter.ENGINE_TARGET_MODULE,
+                    adapter.apply_engine_args_to_module,
+                    targets=adapter.ENGINE_TARGETS,
+                )
+            )
+            continue
         registrations.append(
             coordinator.register_callback(
                 adapter.PATCH_ID,
@@ -82,9 +108,14 @@ def register_platform_core_callbacks(
 def platform_core_callback_names() -> tuple[tuple[str, str], ...]:
     """Return the frozen callback inventory for doctor/tests."""
 
-    return tuple(
-        (adapter.PATCH_ID, adapter.TARGET_MODULE) for adapter in _ORDERED_ADAPTERS
-    )
+    names: list[tuple[str, str]] = []
+    for adapter in _ORDERED_ADAPTERS:
+        names.append((adapter.PATCH_ID, adapter.TARGET_MODULE))
+        if adapter is patch_cache_config:
+            names.append(
+                (adapter.ENGINE_PATCH_ID, adapter.ENGINE_TARGET_MODULE)
+            )
+    return tuple(names)
 
 
 __all__ = [
