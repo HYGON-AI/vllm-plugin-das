@@ -67,7 +67,7 @@ def test_qwen38_flash_next_int8_pp2_tp4_command_contract(
         "--max-model-len",
         "32768",
         "--max-num-batched-tokens",
-        "8192",
+        "4096",
         "--default-chat-template-kwargs",
         '{"enable_thinking":false}',
         "--served-model-name",
@@ -81,11 +81,13 @@ def test_qwen38_flash_next_int8_pp2_tp4_command_contract(
             "HIP_VISIBLE_DEVICES",
             "VLLM_HCU_USE_AITER_MOE_SHUFFLE",
             "VLLM_HCU_PLE_PREFETCH_STREAM",
+            "VLLM_HCU_QSA_BACKEND",
         )
     } == {
         "HIP_VISIBLE_DEVICES": "0,1,2,3,4,5,6,7",
         "VLLM_HCU_USE_AITER_MOE_SHUFFLE": "0",
         "VLLM_HCU_PLE_PREFETCH_STREAM": "1",
+        "VLLM_HCU_QSA_BACKEND": "triton",
     }
     assert evaluation == [
         sys.executable,
