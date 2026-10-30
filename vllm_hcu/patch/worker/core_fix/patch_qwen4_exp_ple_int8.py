@@ -7,7 +7,7 @@ an unquantized ``PLEVocabParallelEmbedding``.  This patch keeps that model
 implementation intact and replaces only the module-local PLE storage class
 and its shard loader at worker startup.
 
-When EngramConfig.cpu_offload is enabled, INT8 and SlimQuant BF16 PLE weights
+When EngramConfig.cpu_offload is enabled, INT8, SlimQuant BF16 and plain BF16 PLE weights
 are allocated in CPU pinned memory instead of GPU. The legacy VLLM_HCU_PLE_CPU_OFFLOAD
 environment variable remains a fallback when EngramConfig is omitted. The
 offload path requires the HCU UVA bridge and fails during model initialization
@@ -534,6 +534,18 @@ def _make_storage_class(module: ModuleType, quant_config):
                             "operator torch.ops._C.get_cuda_view_from_cpu_tensor"
                         )
                     kwargs["quant_method"] = HcuQwen4ExpPLEUnquantizedUVAEmbeddingMethod()
+            elif (
+                effective_quant_config is None
+                and kwargs.get("quant_method") is None
+                and _should_offload_ple_to_cpu()
+            ):
+                # Plain BF16 checkpoint without any quant config.
+                if not _is_uva_available():
+                    raise RuntimeError(
+                        "Qwen4Exp BF16 PLE CPU offload requires the HCU UVA "
+                        "operator torch.ops._C.get_cuda_view_from_cpu_tensor"
+                    )
+                kwargs["quant_method"] = HcuQwen4ExpPLEUnquantizedUVAEmbeddingMethod()
             super().__init__(*args, **kwargs)
             try:
                 tp_size = get_tp_group().world_size
