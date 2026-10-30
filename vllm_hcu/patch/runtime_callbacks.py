@@ -200,6 +200,53 @@ def apply_kimi_k25_vision_prompt(module: ModuleType) -> None:
         )
 
 
+def apply_weight_cache_daemon(module: ModuleType) -> None:
+    target = "vllm.model_executor.model_loader.weight_cache.daemon"
+    module = require_exact_module(module, target)
+    cls = require_type(module, "WeightCacheDaemon", f"{target}.WeightCacheDaemon")
+    function = _load_runtime_callable(
+        "vllm_hcu.runtime_compat.weight_cache", "install_per_client_export"
+    )
+    function(module)
+    _load_runtime_callable(
+        "vllm_hcu.runtime_compat.weight_cache", "install_expert_export_metadata"
+    )(module)
+    _load_runtime_callable(
+        "vllm_hcu.runtime_compat.weight_cache", "install_key_fingerprint"
+    )(module)
+    _load_runtime_callable(
+        "vllm_hcu.runtime_compat.weight_cache", "install_uuid_daemon"
+    )(module)
+    protocol = importlib.import_module(
+        "vllm.model_executor.model_loader.weight_cache.protocol"
+    )
+    _load_runtime_callable(
+        "vllm_hcu.runtime_compat.weight_cache", "install_ipc_quant_support"
+    )(protocol)
+    if not getattr(cls, "_hcu_per_client_export", False):
+        raise Stage3CompatibilityError("weight cache per-client export patch did not apply")
+
+
+def apply_weight_cache_loader(module: ModuleType) -> None:
+    target = "vllm.model_executor.model_loader.weight_cache.ipc_loader"
+    module = require_exact_module(module, target)
+    cls = require_type(module, "IpcModelLoader", f"{target}.IpcModelLoader")
+    _load_runtime_callable(
+        "vllm_hcu.runtime_compat.weight_cache", "install_key_fingerprint"
+    )(module)
+    _load_runtime_callable(
+        "vllm_hcu.runtime_compat.weight_cache", "install_loader_compat"
+    )(module)
+    protocol = importlib.import_module(
+        "vllm.model_executor.model_loader.weight_cache.protocol"
+    )
+    _load_runtime_callable(
+        "vllm_hcu.runtime_compat.weight_cache", "install_ipc_quant_support"
+    )(protocol)
+    if not getattr(cls, "_hcu_weight_cache_loader", False):
+        raise Stage3CompatibilityError("weight cache loader patch did not apply")
+
+
 # Explicit order preserves ``patch_module_class_function`` behavior while each
 # callback remains dormant until its own exact target is imported.
 _ORDERED_CALLBACKS: tuple[
@@ -272,13 +319,28 @@ _ORDERED_CALLBACKS: tuple[
             "KimiK25DummyInputsBuilder.get_dummy_text",
         ),
     ),
+    (
+        "runtime_method.weight_cache_daemon",
+        "vllm.model_executor.model_loader.weight_cache.daemon",
+        apply_weight_cache_daemon,
+        (
+            "vllm.model_executor.model_loader.weight_cache.daemon."
+            "WeightCacheDaemon._handle_get_state",
+        ),
+    ),
+    (
+        "runtime_method.weight_cache_loader",
+        "vllm.model_executor.model_loader.weight_cache.ipc_loader",
+        apply_weight_cache_loader,
+        ("vllm.model_executor.model_loader.weight_cache.ipc_loader.IpcModelLoader._fetch_entries",),
+    ),
 )
 
 
 def register_runtime_method_callbacks(
     coordinator: ExactImportCoordinator = IMPORT_COORDINATOR,
 ) -> tuple[ImportRegistration, ...]:
-    """Arm all six runtime patches in explicit deterministic order."""
+    """Arm runtime patches in explicit deterministic order."""
 
     return tuple(
         coordinator.register_callback(
@@ -305,6 +367,8 @@ __all__ = [
     "apply_kimi_k25_vision_prompt",
     "apply_qwen35_lora_cudagraph",
     "apply_weight_debug_skip",
+    "apply_weight_cache_daemon",
+    "apply_weight_cache_loader",
     "register_runtime_method_callbacks",
     "runtime_callback_names",
 ]

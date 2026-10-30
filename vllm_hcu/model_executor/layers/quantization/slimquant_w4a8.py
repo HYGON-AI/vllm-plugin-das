@@ -29,7 +29,7 @@ from vllm.model_executor.layers.quantization.compressed_tensors.schemes import (
 from vllm.model_executor.layers.quantization.compressed_tensors.utils import (
     should_ignore_layer,
 )
-from vllm.model_executor.utils import set_weight_attrs
+from vllm.model_executor.utils import is_weights_pre_processed, set_weight_attrs
 
 if TYPE_CHECKING:
     from vllm.model_executor.models.utils import WeightsMapper
@@ -166,8 +166,33 @@ class SlimQuantW4A8Int8LinearMethod(LinearMethodBase):
             params_dtype=params_dtype,
             weight_loader=weight_loader,
         )
+        # Audited AITER and Triton W8A8 kernels only transform tensor layout
+        # in the post-load hook. Other kernels may initialize additional state.
+        kernel_type = type(getattr(layer.scheme, "kernel", None))
+        self.supports_pre_processed_weights = (
+            (kernel_type.__module__, kernel_type.__name__) in {
+                ("vllm.model_executor.kernels.linear.scaled_mm.aiter",
+                 "AiterInt8ScaledMMLinearKernel"),
+                ("vllm.model_executor.kernels.linear.scaled_mm.triton",
+                 "TritonInt8ScaledMMLinearKernel"),
+            }
+        )
 
     def process_weights_after_loading(self, layer: torch.nn.Module) -> None:
+        if is_weights_pre_processed():
+            if not self.supports_pre_processed_weights:
+                raise RuntimeError("SlimQuant linear kernel cannot restore preprocessed weights")
+            # The HCU scheme selects the Triton kernel during ordinary
+            # post-processing when its custom quantized GEMM is disabled.
+            # Rebuild that Python-side selection without transforming weights.
+            scheme = layer.scheme
+            if getattr(type(scheme), "_vllm_hcu_w8a8_int8_applied", False):
+                from vllm_hcu.patch.worker.op_opt.patch_compressed_tensors_w8a8_int8 import (
+                    _custom_quantization_enabled, _make_triton_int8_kernel,
+                )
+                if not _custom_quantization_enabled():
+                    scheme.kernel = _make_triton_int8_kernel(scheme)
+            return
         layer.scheme.process_weights_after_loading(layer)
 
     def apply(
@@ -234,6 +259,13 @@ class SlimQuantW4A8Int8AiterMoEMethod(FusedMoEMethodBase):
         self.moe_quant_config: FusedMoEQuantConfig | None = None
         self.moe_kernel: mk.FusedMoEKernel | None = None
         self._supports_int8_allgatherv_input = False
+
+    @property
+    def supports_pre_processed_weights(self) -> bool:
+        # The daemon exports the packed expert tensors after this method's
+        # post-load layout selection. The client rebuilds the AITER metadata
+        # below without applying a second weight transform.
+        return True
 
     def get_fused_moe_quant_config(
         self, layer: torch.nn.Module
@@ -405,6 +437,25 @@ class SlimQuantW4A8Int8AiterMoEMethod(FusedMoEMethodBase):
         layer.register_parameter("w2_input_scale", w2_input_scale)
 
     def process_weights_after_loading(self, layer: torch.nn.Module) -> None:
+        if is_weights_pre_processed():
+            self.moe_quant_config = self.get_fused_moe_quant_config(layer)
+            if getattr(self.moe, "moe_backend", "auto") == "triton":
+                from vllm_hcu.model_executor.layers.quantization.compressed_tensors_moe_runtime import (
+                    prepare_boltops_w4a8_moe,
+                )
+                prepare_boltops_w4a8_moe(self, layer)
+                return
+            from vllm_hcu.model_executor.layers.quantization.compressed_tensors_moe_runtime import (
+                install_aiter_moe_scale_layout,
+                prewarm_aiter_w4a8_moe,
+            )
+            config = prewarm_aiter_w4a8_moe(self, layer)
+            if config is not None:
+                install_aiter_moe_scale_layout(
+                    layer, self.moe_quant_config, config, prefer_quant_config=True
+                )
+                self._supports_int8_allgatherv_input = True
+            return
         # Keep SlimQuant W4A8 weights in the raw packed checkpoint layout.
         # AITER's channel-wise W4A8 Triton path consumes the raw [E, N, K // 2]
         # / [E, K, N // 2] tensors directly.  Pre-shuffling here routes the

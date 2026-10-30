@@ -215,6 +215,7 @@ setup(
         "console_scripts": [
             "vllm-hcu-apply-patches = vllm_hcu.post_install:main",
             "vllm-hcu-doctor = vllm_hcu.doctor:main",
+            "vllm-hcu-preload = vllm_hcu.preload.daemon:main",
         ],
         "vllm.platform_plugins": [
             "hcu = vllm_hcu:hcu_platform_plugin",
