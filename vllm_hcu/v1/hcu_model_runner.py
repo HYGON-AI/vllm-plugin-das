@@ -239,8 +239,7 @@ logger = init_logger(__name__)
 def _has_convrot_lm_head(model: nn.Module) -> bool:
     """Return whether the model owns the opt-in ConvRot INT8 output head."""
     return any(
-        type(getattr(module, "quant_method", None)).__name__
-        == "ConvRotINT8LMHeadMethod"
+        getattr(getattr(module, "quant_method", None), "hcu_convrot_lm_head", False)
         for module in model.modules()
     )
 

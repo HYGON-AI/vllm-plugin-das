@@ -147,11 +147,12 @@ vllm serve /path/to/model \
   --additional-config '{"hcu":{"lm_head_convrot_int8":true}}'
 ```
 
-The option defaults to `false`. It requires an untied BF16 head, a hidden size
-divisible by 256, and HCU LightOp with custom quantization GEMM enabled. LoRA,
-already-quantized heads, and pre-processed/IPC weight caches are not supported.
-Heads using `UnquantizedLinearMethod` with `VLLM_USE_NN` enabled are also not
-supported; the standard unquantized embedding head remains supported.
+The option defaults to `false` and relies on HCU LightOp quantized GEMM. A head
+that does not meet the requirements (tied to the input embeddings, hidden size
+not divisible by 256, not BF16, already quantized, LoRA enabled, or a
+`UnquantizedLinearMethod` head with `VLLM_USE_NN` enabled) is not converted: a
+warning is logged and the head stays BF16, so startup is unaffected. The
+standard unquantized embedding head remains supported.
 Checkpoint-format in-place weight reload is not supported while this option is
 enabled; restart the worker with the new checkpoint instead.
 INT8 conversion is approximate; check accuracy and performance in the target

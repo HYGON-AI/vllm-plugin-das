@@ -9,16 +9,16 @@ dimension; output channels are never pruned or remapped.
 
 from __future__ import annotations
 
-import logging
 import math
 
 import torch
 from torch import nn
 
+from vllm.logger import init_logger
 from vllm.model_executor.layers.quantization.base_config import QuantizeMethodBase
 from vllm_hcu.model_executor.layers.quantization.int8_runtime import apply_int8_linear
 
-logger = logging.getLogger(__name__)
+logger = init_logger(__name__)
 BLOCK_SIZE = 256
 _WEIGHT_CHUNK_ROWS = 4096
 
@@ -37,16 +37,6 @@ def _require_hcu_backend(weight: torch.Tensor) -> None:
             "lm_head_convrot_int8 requires VLLM_HCU_USE_CUSTOM_OPS and "
             "VLLM_HCU_USE_CUSTOM_QUANTIZATION_GEMM"
         )
-    try:
-        from lightop.quant import per_token_quant_int8
-        from lightop.gemm_ops import hipblaslt_w8a8_gemm
-    except (ImportError, AttributeError) as exc:
-        raise ConvRotLMHeadError(
-            "ConvRot INT8 lm_head requires LightOp per_token_quant_int8 and "
-            "hipblaslt_w8a8_gemm"
-        ) from exc
-    if not callable(per_token_quant_int8) or not callable(hipblaslt_w8a8_gemm):
-        raise ConvRotLMHeadError("ConvRot INT8 lm_head LightOp APIs are not callable")
 
 
 def _hadamard(device: torch.device) -> torch.Tensor:
@@ -69,6 +59,9 @@ class ConvRotINT8LMHeadMethod(QuantizeMethodBase):
     continue to use the layer's registered storage. Pre-processed/IPC weight
     caches are deliberately not advertised as supported by this online format.
     """
+
+    # Lets other modules detect this method without importing this module.
+    hcu_convrot_lm_head = True
 
     def __init__(self, original_method: QuantizeMethodBase):
         self.original_method = original_method
@@ -111,6 +104,9 @@ class ConvRotINT8LMHeadMethod(QuantizeMethodBase):
         layer.register_parameter("weight_scale", nn.Parameter(scales, requires_grad=False))
         layer.register_buffer("_hcu_convrot_hadamard", hadamard)
         layer._hcu_convrot_ready = True
+        # The BF16 shard was just freed; return its cached blocks to the device
+        # so the memory profiler (and thus the KV cache budget) sees the saving.
+        torch.cuda.empty_cache()
         logger.info(
             "ConvRot INT8 lm_head: converted BF16 shard [%d, %d], block=256, "
             "full vocabulary retained", n, k,
@@ -130,41 +126,60 @@ class ConvRotINT8LMHeadMethod(QuantizeMethodBase):
         )
 
 
-def install_convrot_lm_head(layer: nn.Module, vllm_config: object) -> None:
+def _unsupported_reason(layer: nn.Module, vllm_config: object) -> str | None:
+    """Why this head cannot be converted, or None when it can."""
     from vllm.model_executor.layers.linear import UnquantizedLinearMethod
     from vllm.model_executor.layers.vocab_parallel_embedding import UnquantizedEmbeddingMethod
 
-    if isinstance(layer.quant_method, ConvRotINT8LMHeadMethod):
-        return
     if type(layer.quant_method) not in (UnquantizedEmbeddingMethod, UnquantizedLinearMethod):
-        raise ConvRotLMHeadError("ConvRot INT8 requires an unquantized BF16 lm_head method")
+        return "the head is not an unquantized BF16 head"
     if type(layer.quant_method) is UnquantizedLinearMethod:
         from vllm_hcu.platforms import envs as henvs
 
         if henvs.VLLM_USE_NN:
-            raise ConvRotLMHeadError(
-                "ConvRot INT8 does not support UnquantizedLinearMethod with "
-                "VLLM_USE_NN enabled (NN weight layout)"
-            )
-    if layer.weight.dtype != torch.bfloat16 or layer.embedding_dim % BLOCK_SIZE:
-        raise ConvRotLMHeadError("ConvRot INT8 requires a BF16 lm_head with K divisible by 256")
+            return "UnquantizedLinearMethod with VLLM_USE_NN uses the NN weight layout"
+    if layer.weight.dtype != torch.bfloat16:
+        return f"head weight dtype is {layer.weight.dtype}, expected torch.bfloat16"
+    if layer.embedding_dim % BLOCK_SIZE:
+        return f"hidden size {layer.embedding_dim} is not divisible by {BLOCK_SIZE}"
     expected_shape = (layer.num_embeddings_per_partition, layer.embedding_dim)
     if tuple(layer.weight.shape) != expected_shape:
-        raise ConvRotLMHeadError(
-            f"ConvRot INT8 requires lm_head weight shape {expected_shape} "
-            f"[vocab_shard, hidden_size], got {tuple(layer.weight.shape)}"
+        return (
+            f"weight shape {tuple(layer.weight.shape)} is not "
+            f"[vocab_shard, hidden_size] = {expected_shape}"
         )
     if getattr(layer, "weight_scale", None) is not None:
-        raise ConvRotLMHeadError("ConvRot INT8 cannot requantize a head with existing weight scales")
+        return "the head already has weight scales"
     model_config = getattr(vllm_config, "model_config", None)
     text_config = getattr(model_config, "hf_text_config", None)
     if (
         getattr(text_config, "tie_word_embeddings", False)
         or getattr(model_config, "word_embeddings_untied_by_checkpoint", False)
     ):
-        raise ConvRotLMHeadError("ConvRot INT8 lm_head requires untied input embeddings")
+        return "the head is tied to the input embeddings"
     if getattr(model_config, "head_dtype", None) not in (None, torch.bfloat16):
-        raise ConvRotLMHeadError("ConvRot INT8 lm_head is incompatible with a non-BF16 head_dtype")
+        return "head_dtype is not BF16"
     if getattr(vllm_config, "lora_config", None) is not None:
-        raise ConvRotLMHeadError("ConvRot INT8 lm_head does not yet support LoRA")
+        return "LoRA is enabled"
+    return None
+
+
+def install_convrot_lm_head(layer: nn.Module, vllm_config: object) -> bool:
+    """Switch one head to ConvRot INT8; True when the head is (now) converted.
+
+    A head this format cannot serve keeps its original BF16 method and a warning
+    is logged, so one unsupported head (tied, quantized, odd hidden size, ...)
+    does not abort model construction. Errors in the post-load conversion itself
+    still raise, because the head has been selected by then.
+    """
+    if isinstance(layer.quant_method, ConvRotINT8LMHeadMethod):
+        return True
+    reason = _unsupported_reason(layer, vllm_config)
+    if reason is not None:
+        logger.warning(
+            "lm_head_convrot_int8 is not applied to this head, keeping BF16: %s",
+            reason,
+        )
+        return False
     layer.quant_method = ConvRotINT8LMHeadMethod(layer.quant_method)
+    return True

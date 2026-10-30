@@ -26,6 +26,15 @@ from vllm_hcu.patch.config import HcuFeatureConfig, get_hcu_config, set_hcu_conf
 from vllm_hcu.patch.worker.op_opt import patch_lm_head_convrot_int8 as patch
 
 
+def _stub_vllm_logger(monkeypatch):
+    # vllm.logger needs a vLLM install; stdlib logging keeps caplog working.
+    import logging
+
+    logger_module = ModuleType("vllm.logger")
+    logger_module.init_logger = logging.getLogger
+    monkeypatch.setitem(sys.modules, logger_module.__name__, logger_module)
+
+
 @pytest.fixture
 def runtime(monkeypatch):
     # Only the vLLM type boundary is stubbed. Rotation, post-load conversion,
@@ -42,6 +51,7 @@ def runtime(monkeypatch):
         exec(compile(ast.fix_missing_locations(code), str(path), "exec"), namespace)
         base.QuantizeMethodBase = namespace["QuantizeMethodBase"]
     monkeypatch.setitem(sys.modules, base.__name__, base)
+    _stub_vllm_logger(monkeypatch)
     name = "vllm_hcu.model_executor.layers.quantization.lm_head_convrot_int8"
     monkeypatch.delitem(sys.modules, name, raising=False)
     module = importlib.import_module(name)
@@ -201,6 +211,7 @@ def test_device_guard_rejects_cpu_without_loading_lightop(monkeypatch):
     base = ModuleType("vllm.model_executor.layers.quantization.base_config")
     base.QuantizeMethodBase = type("QuantizeMethodBase", (), {})
     monkeypatch.setitem(sys.modules, base.__name__, base)
+    _stub_vllm_logger(monkeypatch)
     runtime = importlib.import_module("vllm_hcu.model_executor.layers.quantization.lm_head_convrot_int8")
     with pytest.raises(runtime.ConvRotLMHeadError, match="HCU/HIP"):
         runtime._require_hcu_backend(torch.ones(2, 256, dtype=torch.bfloat16))
@@ -274,7 +285,7 @@ def test_default_off_does_not_import_convrot_runtime(monkeypatch):
 
 
 @pytest.mark.parametrize("vocab_size", [768, 512])
-def test_nn_layout_linear_head_is_rejected_before_conversion(runtime, monkeypatch, vocab_size):
+def test_nn_layout_linear_head_is_skipped_before_conversion(runtime, monkeypatch, caplog, vocab_size):
     module = _target_module()
     linear = ModuleType("vllm.model_executor.layers.linear")
     linear.UnquantizedLinearMethod = type("UnquantizedLinearMethod", (), {})
@@ -286,8 +297,8 @@ def test_nn_layout_linear_head_is_rejected_before_conversion(runtime, monkeypatc
     layer.quant_method = linear.UnquantizedLinearMethod()
     original_weight, original_method = layer.weight, layer.quant_method
 
-    with pytest.raises(runtime.ConvRotLMHeadError, match="VLLM_USE_NN"):
-        runtime.install_convrot_lm_head(layer, SimpleNamespace())
+    assert runtime.install_convrot_lm_head(layer, SimpleNamespace()) is False
+    assert "VLLM_USE_NN" in caplog.text
     assert layer.weight is original_weight
     assert layer.quant_method is original_method
 
@@ -309,7 +320,7 @@ def test_output_major_linear_head_is_supported_without_nn_layout(runtime, monkey
 
 
 @pytest.mark.parametrize("shape", [(512, 37), (38, 512), (37 * 512,)])
-def test_rejects_weight_shape_inconsistent_with_head_metadata(runtime, monkeypatch, shape):
+def test_skips_weight_shape_inconsistent_with_head_metadata(runtime, monkeypatch, caplog, shape):
     module = _target_module()
     linear = ModuleType("vllm.model_executor.layers.linear")
     linear.UnquantizedLinearMethod = type("UnquantizedLinearMethod", (), {})
@@ -319,13 +330,13 @@ def test_rejects_weight_shape_inconsistent_with_head_metadata(runtime, monkeypat
     layer.weight = nn.Parameter(torch.zeros(shape, dtype=torch.bfloat16), requires_grad=False)
     original_method = layer.quant_method
 
-    with pytest.raises(runtime.ConvRotLMHeadError, match="weight shape"):
-        runtime.install_convrot_lm_head(layer, SimpleNamespace())
+    assert runtime.install_convrot_lm_head(layer, SimpleNamespace()) is False
+    assert "weight shape" in caplog.text
     assert layer.quant_method is original_method
 
 
 @pytest.mark.parametrize("policy", ["quantized", "fp16", "tied", "fp32_head", "lora", "bad_k"])
-def test_enabled_head_rejects_incompatible_policies(runtime, monkeypatch, policy):
+def test_enabled_head_skips_incompatible_policies(runtime, monkeypatch, caplog, policy):
     module = _target_module()
     linear = ModuleType("vllm.model_executor.layers.linear")
     linear.UnquantizedLinearMethod = type("UnquantizedLinearMethod", (), {})
@@ -345,8 +356,62 @@ def test_enabled_head_rejects_incompatible_policies(runtime, monkeypatch, policy
         config.lora_config = object()
     elif policy == "bad_k":
         layer.embedding_dim = 300
-    with pytest.raises(runtime.ConvRotLMHeadError):
-        runtime.install_convrot_lm_head(layer, config)
+    original_method = layer.quant_method
+    assert runtime.install_convrot_lm_head(layer, config) is False
+    assert "keeping BF16" in caplog.text
+    assert layer.quant_method is original_method
+
+
+def _real_runtime(monkeypatch):
+    # The `runtime` fixture stubs the backend guard; load an unstubbed copy.
+    base = ModuleType("vllm.model_executor.layers.quantization.base_config")
+    base.QuantizeMethodBase = type("QuantizeMethodBase", (), {})
+    monkeypatch.setitem(sys.modules, base.__name__, base)
+    _stub_vllm_logger(monkeypatch)
+    name = "vllm_hcu.model_executor.layers.quantization.lm_head_convrot_int8"
+    monkeypatch.delitem(sys.modules, name, raising=False)
+    return importlib.import_module(name)
+
+
+def test_backend_guard_leaves_lightop_availability_to_the_int8_runtime(monkeypatch):
+    runtime = _real_runtime(monkeypatch)
+    # apply_int8_linear already reports a missing LightOp; the guard only checks
+    # the device and the custom quantization GEMM switch.
+    monkeypatch.setitem(sys.modules, "lightop", None)
+    monkeypatch.setattr(torch.version, "hip", "6.0", raising=False)
+    monkeypatch.setattr(
+        importlib.import_module("vllm_hcu.platforms.envs"),
+        "custom_quantization_gemm_enabled", lambda: True,
+    )
+    runtime._require_hcu_backend(SimpleNamespace(is_cuda=True))
+
+
+def test_backend_guard_requires_custom_quantization_gemm(monkeypatch):
+    runtime = _real_runtime(monkeypatch)
+    monkeypatch.setattr(torch.version, "hip", "6.0", raising=False)
+    monkeypatch.setattr(
+        importlib.import_module("vllm_hcu.platforms.envs"),
+        "custom_quantization_gemm_enabled", lambda: False,
+    )
+    with pytest.raises(runtime.ConvRotLMHeadError, match="CUSTOM_QUANTIZATION_GEMM"):
+        runtime._require_hcu_backend(SimpleNamespace(is_cuda=True))
+
+
+def test_runner_guard_detects_convrot_head_by_marker(runtime):
+    # hcu_model_runner needs a full vLLM; execute just the guard function.
+    source = (Path(__file__).parents[2] / "vllm_hcu/v1/hcu_model_runner.py").read_text(encoding="utf-8")
+    node = next(
+        n for n in ast.parse(source).body
+        if isinstance(n, ast.FunctionDef) and n.name == "_has_convrot_lm_head"
+    )
+    namespace = {"nn": nn}
+    exec(compile(ast.Module([node], []), "hcu_model_runner", "exec"), namespace)
+    has_convrot = namespace["_has_convrot_lm_head"]
+
+    model = nn.Sequential(nn.Linear(2, 2), _head())
+    assert has_convrot(model) is False
+    model[1].quant_method = runtime.ConvRotINT8LMHeadMethod(SimpleNamespace())
+    assert has_convrot(model) is True
 
 
 def test_adapter_constructor_contract_matches_target_source():
