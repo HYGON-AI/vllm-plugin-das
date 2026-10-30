@@ -293,7 +293,10 @@ def test_sparse_attention_with_shared_workspace_rows():
 
 @pytest.mark.skipif(not HAS_GPU, reason="requires compiled HCU gather and FlashMLA")
 @pytest.mark.parametrize("decode", [False, True])
-def test_hcu_backend_build_and_forward_with_unmodified_vllm(monkeypatch, decode):
+@pytest.mark.parametrize("hyv4_sinks", [False, True])
+def test_hcu_backend_build_and_forward_with_unmodified_vllm(
+    monkeypatch, decode, hyv4_sinks
+):
     from types import SimpleNamespace
 
     from vllm.v1.attention import backend as backend_module
@@ -305,8 +308,7 @@ def test_hcu_backend_build_and_forward_with_unmodified_vllm(monkeypatch, decode)
     )
     from vllm_hcu.v1.workspace_block_tables import HOST_TABLE_ATTRIBUTE
     from vllm_hcu.v1.attention.backends.mla.flashmla_sparse import (
-        HcuFlashMLASparseImpl,
-        HcuFlashMLASparseMetadataBuilder,
+        HcuFlashMLASparseBackend,
     )
 
     patch_attention_backend.apply_to_module(backend_module)
@@ -339,7 +341,14 @@ def test_hcu_backend_build_and_forward_with_unmodified_vllm(monkeypatch, decode)
         is_prefilling=torch.tensor(([False] if decode else []) + [True] * 3),
     )
     assert common.sparse_mla_workspace_block_table_cpu is table
-    builder = HcuFlashMLASparseMetadataBuilder.__new__(HcuFlashMLASparseMetadataBuilder)
+    backend = HcuFlashMLASparseBackend
+    if hyv4_sinks:
+        from vllm_hcu.models.hy_v4.hcu_sparse import HYV4FlashMLASparseBackend
+
+        backend = HYV4FlashMLASparseBackend
+        monkeypatch.setenv("VLLM_HCU_HYV4_FP8_KV_DEQUANT", "0")
+    builder_cls = backend.get_builder_cls()
+    builder = builder_cls.__new__(builder_cls)
     builder.vllm_config = SimpleNamespace(
         model_config=SimpleNamespace(max_model_len=190),
         attention_config=SimpleNamespace(),
@@ -366,10 +375,17 @@ def test_hcu_backend_build_and_forward_with_unmodified_vllm(monkeypatch, decode)
     )
     metadata = builder.build(0, common)
     assert metadata.hcu_workspace_dedup.chunks[0].num_tokens == 212
-    impl = HcuFlashMLASparseImpl.__new__(HcuFlashMLASparseImpl)
+    impl_cls = backend.get_impl_cls()
+    impl = impl_cls.__new__(impl_cls)
     impl.num_heads = 128
     impl.kv_lora_rank = 512
     impl.softmax_scale = 576**-0.5
+    if hyv4_sinks:
+        impl.sinks = torch.linspace(-2, 2, 128, dtype=torch.float32, device="cuda")
+        impl._dcp_sinks = None
+        impl.dcp_world_size = 1
+        impl.prefill_padding = 128
+        impl.fp8_decode_padded_heads = 128
     impl.prefill_bf16_workspace = torch.empty(
         (950, 576), dtype=torch.bfloat16, device="cuda"
     )

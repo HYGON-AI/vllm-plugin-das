@@ -35,6 +35,10 @@ that group. A descriptor records the physical page, valid token count, and
 compact workspace start. A second table maps each request's logical pages to
 those compact starts.
 
+HYV4's learnable-sink backend inherits the same HCU builder and separate-prefill
+hooks. Its BF16 and FP8 kernel overrides still supply the attention sinks, and
+its LightOp decode/mixed-batch and DCP overrides remain in effect.
+
 The plugin's HIP gather reads each unique page once per group, dequantizes its
 512 FP8 values with four FP32 scales, and copies the 64 BF16 RoPE values. It
 uses 256 threads, with eight 32-lane token groups per tile. The existing sparse
@@ -73,6 +77,17 @@ CPU planner, metadata, and host-mirror tests:
     tests/runtime_patch/test_sparse_mla_workspace_planner.py \
     tests/runtime_patch/test_sparse_mla_workspace_metadata.py -q
 ```
+
+CPU regression for HYV4's model-selected sink backend, including flag on/off,
+workspace capacity groups, sink-aware outputs and mixed multi-token decode:
+
+```bash
+.venv/bin/python -m pytest tests/models/hy_v4/test_workspace_dedup.py -q
+```
+
+This regression uses Torch references for remapping, gather and FlashMLA; it
+does not execute HIP or Triton kernels. The GPU backend-equivalence test below
+also covers HYV4 with nonzero sinks.
 
 GPU gather, remapping, graph replay, and real HCU-backend equivalence:
 
