@@ -123,6 +123,11 @@ class HcuGPUWorker(Worker):
         super().load_model(load_dummy_weights=load_dummy_weights)
         from vllm_hcu.patch.worker import validate_worker_patches
         model_runner = getattr(self, "model_runner", None)
+        from vllm_hcu.model_executor.layers.kimi_k3_mixed_precision import record_kimi_kda_offload_ownership
+        record_kimi_kda_offload_ownership(getattr(model_runner, "model", None))
+        get_draft_model = getattr(model_runner, "get_draft_model", None)
+        if callable(get_draft_model):
+            record_kimi_kda_offload_ownership(get_draft_model())
         if os.environ.get("VLLM_KIMI_KDA_PREFILL_BACKEND", "legacy").lower() == "boltops":
             from vllm_hcu.model_executor.layers.kimi_k3_kda import validate_loaded_kda_model
 
