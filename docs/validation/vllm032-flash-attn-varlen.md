@@ -133,6 +133,19 @@ requests returned HTTP 200, five prompt tokens, sixteen completion tokens, and
 the same response text on both layouts. Both owned service trees were stopped
 and no API server or EngineCore process remained.
 
+The final installed wheel was also served with explicit NHD for the ordered
+HumanEval/0-15 control, using the same dataset commit, prompts, temperature 0,
+seed 0, thinking-disabled setting, and 320-token limit as the historical HND
+run. All 16 requests completed in 12.72 seconds with 4,184 completion tokens
+and the same 12 stop / 4 length finish-reason split. Every generated content,
+finish reason, prompt-token count, and completion-token count matched the HND
+record; both `samples.jsonl` files have SHA256
+`32f43cabdda392f515946d6b417423d808b08f31e71fb83cc37b8283f9429cc5`.
+The already sandboxed score therefore remains **5/16, pass@1 0.3125**, with
+the same passing task set, without re-executing identical generated code. Raw
+NHD evidence is under
+`/dev/shm/vllm032-flash-dual-layout-he16-nhd-63395e0d`.
+
 The two model-service runs above used the isolated vLLM seam candidate
 `923e3284c` and loaded the Plugin branch directly through `PYTHONPATH`; they do
 not replace the historical installed-wheel identities above. The subsequent
