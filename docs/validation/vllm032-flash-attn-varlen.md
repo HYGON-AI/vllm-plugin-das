@@ -1,9 +1,10 @@
 # vLLM 0.32 HCU FlashAttention varlen validation
 
 This record validates the explicit Plugin-owned `FLASH_ATTN` route. vLLM owns
-the default-preserving KV read/write and kernel seams, the Adapter owns HCU
+the default-preserving KV allocation and kernel seams, the Adapter owns HCU
 platform selection and configuration validation, and the Plugin owns the
-optional public `flash_attn.flash_attn_varlen_func` implementation. The
+optional public `flash_attn.flash_attn_varlen_func` implementation plus the
+narrow E5M2 cache writer selected only by that implementation. The
 default HCU attention backend remains vLLM's upstream Triton backend.
 
 ## Candidate ownership
@@ -12,13 +13,13 @@ default HCU attention backend remains vLLM's upstream Triton backend.
 | --- | --- | --- | --- |
 | vLLM | `923e3284c` | `vllm-0.32.0+rocm723-cp312-cp312-linux_x86_64.whl` | `3e2798384365084cbcbcb61d0fff713a8c27fae22c0980fb85b6dd93d3e47c22` |
 | Adapter | `d7487a8` | `sgl_kernel-0.1.0-py3-none-any.whl` | `a8e2b7fea4a13352c7f3dc3365f8c4579cc8ac941bd4d2f408100f24286affd7` |
-| Plugin | `a6f43ed3` | `hcu_vllm_das_plugin-0.2.0.dev0-py3-none-any.whl` | `4e18c536fe7b374613c9b89cf3e6308b0a7b7bab203c2d9b5dd8a48ae563af61` |
+| Plugin | `57687161` | `hcu_vllm_das_plugin-0.2.0.dev0-py3-none-any.whl` | `0814ebc46b59bcac09882b7cf56cb620c1ad012be71a2e162d8e47ab48a5b47b` |
 
 Installed-state inspection resolved all three packages from the isolated
 candidate environment. The installed upstream class exposed
 `_get_kv_cache_views`, `_get_kv_cache_write_views`, and
 `_run_flash_attention`; the Plugin reported DCP disabled, exact block-size 64
-support, and only `auto`, `float16`, and `bfloat16` KV cache dtypes.
+support, and `auto`, `float16`, `bfloat16`, and `fp8_e5m2` KV cache dtypes.
 
 ## Numerical and Graph gate
 
@@ -47,7 +48,7 @@ with 32 pre-existing bare-environment warnings; vLLM seam tests were `2 passed,
 
 Negative tests verify that a stock vLLM 0.32 build without all three seams
 fails during explicit Plugin import. Explicit Adapter selection calls the
-Plugin backend's normal `validate_configuration()` path. DCP, FP8 KV, page
+Plugin backend's normal `validate_configuration()` path. DCP, E4M3 KV, page
 sizes other than 64, sinks, RSWA, multimodal prefix masks, and active FA4-only
 arguments fail closed. Encoder/cross attention, sliding-window attention,
 non-causal attention, and batch-invariance mode also fail validation because
@@ -98,10 +99,10 @@ numerical, Graph, and model-service gates above. Raw evidence is under
 
 ## Scope
 
-This validates the available single-device HCU topology, BF16/FP16 dense
-decoder MHA/GQA, LBHNC storage, 64-token pages, and the public vendor varlen
-interface. It does not claim DCP, FP8 KV, hybrid cache layouts, alternate page
-sizes, FA4-only masks, tensor parallelism, or a throughput improvement.
+This initial gate validated the available single-device HCU topology,
+BF16/FP16 dense decoder MHA/GQA, LBHNC storage, 64-token pages, and the public
+vendor varlen interface. It did not claim DCP, hybrid cache layouts, alternate
+page sizes, FA4-only masks, tensor parallelism, or a throughput improvement.
 
 ## Dual-layout follow-up (2026-10-31)
 
@@ -211,3 +212,62 @@ with a BL-preferring DeepSeek-V4 indexer or kpool tail fails during layout
 resolution instead of silently reinterpreting its cache. Large MLA and sparse
 MLA checkpoints were not loaded in this single-card follow-up, so this section
 is a routing/layout-contract result rather than an MLA model-accuracy claim.
+
+## E5M2 KV-cache follow-up (2026-10-31)
+
+The ordinary decoder `FLASH_ATTN` route now accepts `--kv-cache-dtype
+fp8_e5m2` without model-name routing. vLLM remains responsible for cache
+allocation, slot mapping, scales, and every non-E5M2 write. For E5M2 only,
+`HcuFlashAttentionImpl.do_kv_cache_update()` selects a Plugin-owned Triton
+writer that stores OCP E5M2 bytes, then the existing public vendor
+`flash_attn_varlen_func` reads the same storage through an E5M2 view. Query
+compute remains BF16/FP16.
+
+This writer was required by live RED evidence rather than capability
+assumption: the installed HCU vLLM `reshape_and_cache_flash` raised
+`Unsupported data type of kv cache: fp8_e5m2` before reader dispatch. Relabeling
+the request as E4M3 was rejected because the formats have different byte
+semantics. The Plugin override is confined to its implementation subclass;
+non-E5M2 calls continue to delegate to vLLM unchanged.
+
+The source-tree portable gate used the HCU vLLM source at `923e3284c`:
+
+```bash
+PYTHONNOUSERSITE=1 HCU_ADAPTER_HOST=none \
+VLLM_TARGET_ROOT=/dev/shm/hcu-vllm032-compat-20261027/src/vllm-f8caf39 \
+<candidate-python> -m pytest -q tests/vllm032 \
+  --ignore=tests/vllm032/test_flash_attention_hcu.py
+```
+
+Result: `137 passed, 6 skipped` in 155.85 seconds. The live source-tree HCU
+matrix completed with `20 passed` in 35.10 seconds. It covers LBHNC/BHSD and
+LBNHC/BSHD, BF16 and FP16 controls, E5M2 prefill and GQA decode, padded block-1
+writes, scalar and per-head scales, and changed-input Graph replay. Writer
+bytes are compared exactly (`rtol=atol=0`) with `torch.float8_e5m2`; the
+writer-to-reader output uses the explicit audited E5M2 tolerance
+`rtol=atol=0.03`. Existing BF16/FP16 rows retain `rtol=atol=0.016`.
+
+The final Plugin wheel for this gate is:
+
+```text
+/dev/shm/vllm-plugin-e5m2-wheel.G7dfij/
+  hcu_vllm_das_plugin-0.2.0.dev0-py3-none-any.whl
+SHA256 0814ebc46b59bcac09882b7cf56cb620c1ad012be71a2e162d8e47ab48a5b47b
+```
+
+It was installed with `--no-deps --target` at
+`/dev/shm/vllm-plugin-e5m2-install.FjzYme`. Module-origin inspection resolved
+`hcu_vllm_das`, `attention.flash_attn`, and `attention.e5m2_cache` from that
+target rather than the source tree. Package-boundary, extension, compat-lock,
+and installed-verifier fixture tests completed with `44 passed`; the complete
+live HCU matrix repeated from the isolated wheel with `20 passed` in 35.10
+seconds. The real installed-state verifier reported Plugin RECORD SHA256
+`b61731639f7214a1d77c2647af0b06e82f0c8403b50b9a742baa08a85363250b`,
+active `das_hcu`, Adapter version `0.1.0`, and vLLM
+`0.32.0+rocm723` from their isolated candidate locations.
+
+This route still does not replace MLA, sparse MLA, multimodal-prefix, hybrid,
+sliding-window, sink, DCP, PCP, or FA4-only paths. Those continue to follow
+their existing backend selection or fail-closed validation. Cross-model
+BF16-KV/E5M2-KV service results are recorded separately below when available;
+passing the operator matrix alone is not an accuracy claim.
