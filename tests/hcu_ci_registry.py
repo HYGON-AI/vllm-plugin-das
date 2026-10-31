@@ -217,6 +217,11 @@ register_hcu_ci(
 )
 register_hcu_ci(
     job="contract-hcu-gfx936",
+    target="tests/runtime_patch/test_slimquant_w4a8_fixed_deepep.py",
+    est_time=60,
+)
+register_hcu_ci(
+    job="contract-hcu-gfx936",
     target="tests/runtime_patch/test_kimi_k3_eplb_model.py",
     est_time=60,
 )
