@@ -229,13 +229,17 @@ class Case:
     lengths: list[int]
     indices: list[list[int]]
     accepted: list[int] | None
+    state_backing: object | None = None
 
     @property
     def state(self):
         return self.args["initial_state"]
 
     def pointers(self):
-        return {k: v.data_ptr() for k, v in self.args.items() if hasattr(v, "data_ptr")}
+        pointers = {k: v.data_ptr() for k, v in self.args.items() if hasattr(v, "data_ptr")}
+        if self.state_backing is not None:
+            pointers["state_backing"] = self.state_backing.data_ptr()
+        return pointers
 
 
 class Runtime:
@@ -257,6 +261,8 @@ class Runtime:
                       dt_bias=self.rand((hv,), t.float32),
                       initial_state=self.rand((SLOTS, hv, DIM, DIM), t.float32, 0.05),
                       scale=DIM**-0.5, use_qk_l2norm_in_kernel=True)
+        if mode == "pool":
+            common["initial_state"] = common["initial_state"][:8]
         if name == self.p.PACKED:
             width = (2 * hk + hv) * DIM
             backing = self.rand((batch, width + 16))
@@ -278,6 +284,16 @@ class Runtime:
             rows[(wave + 1) % count] = [-1]
             accepted, cu = None, None
             indices = self.integer([row[0] for row in rows])
+        elif mode == "pool":
+            # Reproduce the witnessed B1/T32, eight-slot pool and [8,4]
+            # speculative indices. Each sequence owns a distinct slot; repeated
+            # indices within its row exercise sequential in-place MTP updates.
+            bsz, total, count, lengths = 1, 32, 8, [4] * 8
+            rows = [[(n + wave) % 8] * 4 for n in range(count)]
+            if wave % 2:
+                rows[next(n for n, row in enumerate(rows) if row[0] == 0)] = [-1] * 4
+            accepted = [1 + (wave + n) % 4 for n in range(count)]
+            cu, indices = self.integer(list(range(0, 33, 4))), self.integer(rows)
         elif mode == "fixed_multi":
             bsz, total, lengths, count = 2, 4, [4, 4], 2
             rows = [[1 + n * 7 + i + wave % 2 for i in range(4)] for n in range(count)]
@@ -312,19 +328,56 @@ class Runtime:
     def clone(self, case):
         # Preserve source strides, including Qwen's sliced projection rows.
         copied = {}
+        backing = None if case.state_backing is None else case.state_backing.clone()
         for k, value in case.args.items():
             if isinstance(value, self.t.Tensor):
-                target = self.t.empty_strided(value.shape, value.stride(), dtype=value.dtype, device=value.device)
-                target.copy_(value)
+                if k == "initial_state" and backing is not None:
+                    target = backing.as_strided(value.shape, value.stride(), value.storage_offset())
+                else:
+                    target = self.t.empty_strided(value.shape, value.stride(), dtype=value.dtype, device=value.device)
+                    target.copy_(value)
                 copied[k] = target
             else:
                 copied[k] = value
-        return Case(case.name, copied, case.lengths, case.indices, case.accepted)
+        return Case(case.name, copied, case.lengths, case.indices, case.accepted, backing)
+
+    def pad_state(self, case, *, offset):
+        """Model shared-pool slot pitch, with protected prefix/gaps/trailer."""
+        assert case.state_backing is None
+        state = case.state
+        slots, hv, values, keys = state.shape
+        pitch = hv * values * keys + 24576  # Real tiny-model slot gap: 96 KiB FP32.
+        backing = self.t.full((offset + slots * pitch + 29,), -918.25,
+                              dtype=state.dtype, device=state.device)
+        view = backing.as_strided(state.shape, (pitch, values * keys, keys, 1), offset)
+        view.copy_(state)
+        case.args["initial_state"], case.state_backing = view, backing
+        return case
+
+    def check_state_padding(self, case, before, *, label):
+        t, state, backing = self.t, case.state, case.state_backing
+        assert backing is not None and backing.shape == before.shape
+        assert state.data_ptr() == backing.data_ptr() + state.storage_offset() * state.element_size()
+        protected = t.ones(backing.shape, device=backing.device, dtype=t.bool)
+        protected.as_strided(state.shape, state.stride(), state.storage_offset()).fill_(False)
+        actual, expected = backing[protected], before[protected]
+        assert actual.numel() > 0
+        assert t.equal(actual.view(t.uint8), expected.view(t.uint8)), f"{label}: shared-pool padding changed"
+        return {"label": label, "shape": list(state.shape), "strides": list(state.stride()),
+                "storage_offset": state.storage_offset(), "protected_elements": actual.numel(),
+                "padding_bitwise_untouched": True}
 
     def update(self, destination, source):
         assert destination.args.keys() == source.args.keys()
+        if destination.state_backing is not None:
+            assert source.state_backing is not None
+            assert destination.state.stride() == source.state.stride()
+            assert destination.state.storage_offset() == source.state.storage_offset()
+            destination.state_backing.copy_(source.state_backing)
         for k, value in destination.args.items():
             if isinstance(value, self.t.Tensor):
+                if k == "initial_state" and destination.state_backing is not None:
+                    continue
                 value.copy_(source.args[k])
             else:
                 assert value == source.args[k]
@@ -414,7 +467,7 @@ class Runtime:
             nrmse = error.square().mean().sqrt().item() / max(rms, 1e-12)
             assert rms > 1e-5 and nrmse <= limit, (label, kind, rms, nrmse)
             stats[kind] = {"reference_rms": rms, "nrmse": nrmse, "max_abs": error.abs().max().item()}
-        untouched = [i for i in range(SLOTS) if i not in touched]
+        untouched = [i for i in range(case.state.shape[0]) if i not in touched]
         t.testing.assert_close(state[untouched], expected_s[untouched], rtol=0, atol=0)
         assert (expected_s[active] != case.state[active]).any().item()
         return {"label": label, "metrics": stats, "defined_tokens": sum(valid),
@@ -486,6 +539,28 @@ def test_sigmoid_native_matches_official_state_alias_mtp_varlen(runtime, hk, hv,
            provider_vs_official=pair, kernel=rt.launched[-1], aliases=True)
 
 
+@pytest.mark.parametrize("hk,hv", GEOMETRIES)
+@pytest.mark.parametrize("entry", ["packed", "sigmoid"])
+@pytest.mark.parametrize("offset", [0, 37], ids=["padded-slot", "padded-slot-offset"])
+def test_slot_pitched_state_native_preserves_storage_offset_and_padding(runtime, hk, hv, entry, offset):
+    rt = runtime
+    name = rt.p.PACKED if entry == "packed" else rt.p.SIGMOID
+    base = rt.pad_state(rt.make(name, hk, hv, mode="pool"), offset=offset)
+    reference = rt.oracle(base)
+    official, vendor = rt.clone(base), rt.clone(base)
+    before = base.state_backing.clone()
+    a, b = rt.call(official, vendor=False), rt.call(vendor, vendor=True)
+    rt.t.cuda.synchronize()
+    pair = rt.compare_pair(b, a, reference, label=f"{entry}-slot-pitch-provider-vs-official")
+    checks = [rt.compare(base, a, reference, label="official-slot-pitch-vs-physical"),
+              rt.compare(base, b, reference, label="provider-slot-pitch-vs-physical")]
+    padding = [rt.check_state_padding(case, before, label=label)
+               for case, label in [(official, "official"), (vendor, "provider")]]
+    record("slot_pitched_native_pass", entry=entry, hk=hk, hv=hv, dim=DIM,
+           checks=checks, padding=padding, provider_vs_official=pair,
+           kernel=rt.launched[-1], aliases=True)
+
+
 def capture(rt, case, *, vendor):
     stream = rt.t.cuda.Stream()
     stream.wait_stream(rt.t.cuda.current_stream())
@@ -498,6 +573,49 @@ def capture(rt, case, *, vendor):
     with rt.t.cuda.graph(graph, stream=stream):
         outputs = rt.call(case, vendor=vendor)
     return graph, outputs
+
+
+@pytest.mark.parametrize("hk,hv", GEOMETRIES)
+@pytest.mark.parametrize("entry", ["packed", "sigmoid"])
+def test_slot_pitched_state_graph_same_addresses_offset_padding_all_waves(runtime, hk, hv, entry):
+    rt = runtime
+    name = rt.p.PACKED if entry == "packed" else rt.p.SIGMOID
+    base = rt.pad_state(rt.make(name, hk, hv, mode="pool"), offset=37)
+    official, vendor = rt.clone(base), rt.clone(base)
+    before = base.state_backing.clone()
+    reference_graph, reference_out = capture(rt, official, vendor=False)
+    provider_graph, provider_out = capture(rt, vendor, vendor=True)
+    capture_padding = [rt.check_state_padding(case, before, label=f"{label}-capture")
+                       for case, label in [(official, "official"), (vendor, "provider")]]
+    pointers = [case.pointers() for case in (official, vendor)]
+    output_pointers = [result[0].data_ptr() for result in (reference_out, provider_out)]
+    waves, digests = [], []
+    for wave in range(8):
+        fresh = rt.pad_state(rt.make(name, hk, hv, mode="pool", wave=wave), offset=37)
+        expected = rt.oracle(fresh)
+        rt.update(official, fresh)
+        rt.update(vendor, fresh)
+        reference_graph.replay()
+        provider_graph.replay()
+        rt.t.cuda.synchronize()
+        assert [case.pointers() for case in (official, vendor)] == pointers
+        assert [result[0].data_ptr() for result in (reference_out, provider_out)] == output_pointers
+        assert reference_out[1] is official.state and provider_out[1] is vendor.state
+        pair = rt.compare_pair(provider_out, reference_out, expected,
+                               label=f"{entry}-slot-pitch-graph-wave-{wave}")
+        checks = [rt.compare(fresh, reference_out, expected, label="official-slot-pitch-graph-vs-physical"),
+                  rt.compare(fresh, provider_out, expected, label="provider-slot-pitch-graph-vs-physical")]
+        padding = [rt.check_state_padding(case, fresh.state_backing, label=label)
+                   for case, label in [(official, "official"), (vendor, "provider")]]
+        defined = provider_out[0].reshape(-1, hv, DIM)[rt.integer(expected[2]).bool()]
+        digests.append(hashlib.sha256(defined.float().cpu().numpy().tobytes()).hexdigest())
+        waves.append({"wave": wave, "lengths": fresh.lengths, "indices": fresh.indices,
+                      "accepted": fresh.accepted, "checks": checks, "padding": padding,
+                      "provider_vs_official": pair})
+    assert len(set(digests)) == len(digests)
+    record("slot_pitched_graph_pass", entry=entry, hk=hk, hv=hv, dim=DIM,
+           capture_padding=capture_padding, waves=waves, kernel=rt.launched[-1],
+           input_addresses_stable=True, output_address_stable=True, output_digests=digests)
 
 
 @pytest.mark.parametrize("hk,hv", GEOMETRIES)

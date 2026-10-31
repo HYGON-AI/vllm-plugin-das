@@ -45,14 +45,14 @@ class Tensor:
     def is_contiguous(self):
         return self.contiguous
 
-    def stride(self, axis):
+    def stride(self, axis=None):
         if self.strides is not None:
-            return self.strides[axis]
+            return self.strides if axis is None else self.strides[axis]
         strides, step = [], 1 if self.contiguous else 2
         for dim in reversed(self.shape):
             strides.insert(0, step)
             step *= dim
-        return strides[axis]
+        return tuple(strides) if axis is None else strides[axis]
 
     def item(self):
         raise AssertionError("dispatch must not inspect tensor contents")
@@ -328,6 +328,54 @@ def test_packed_row_pitched_gate_views_are_supported_without_copy(runtime, monke
     assert_forwarded(runtime, runtime.p.PACKED, values, "vendor")
 
 
+@pytest.mark.parametrize("entry", ["packed", "sigmoid"])
+@pytest.mark.parametrize("offset", [0, 37])
+def test_state_pool_slot_pitch_preserves_original_view(runtime, monkeypatch, entry, offset):
+    activate(runtime, monkeypatch)
+    values = packed_inputs() if entry == "packed" else sigmoid_inputs()
+    hv = values["initial_state"].shape[1]
+    state = Tensor((8, hv, 128, 128), "torch.float32", contiguous=False,
+                   strides=(hv * 16384 + 24576, 16384, 128, 1))
+    state.storage_offset = lambda: offset
+    # Dispatch must forward this exact view; no copying, normalization or data reads.
+    state.contiguous = state.clone = state.item
+    values["initial_state"] = state
+    key = runtime.p.PACKED if entry == "packed" else runtime.p.SIGMOID
+    assert_forwarded(runtime, key, values, "vendor")
+    assert runtime.events[-1][2]["initial_state"] is state
+
+
+@pytest.mark.parametrize("entry", ["packed", "sigmoid"])
+@pytest.mark.parametrize("strides", [
+    (0, 16384, 128, 1), (-286720, 16384, 128, 1),
+    (262143, 16384, 128, 1), (286720, 16385, 128, 1),
+    (286720, 16384, 129, 1), (286720, 16384, 128, 2),
+])
+def test_state_pool_inner_strides_or_overlapping_slots_fall_back(runtime, monkeypatch, entry, strides):
+    activate(runtime, monkeypatch)
+    values = packed_inputs(hv=16) if entry == "packed" else sigmoid_inputs(hv=16)
+    values["initial_state"] = Tensor((8, 16, 128, 128), "torch.float32",
+                                     contiguous=False, strides=strides)
+    key = runtime.p.PACKED if entry == "packed" else runtime.p.SIGMOID
+    assert_forwarded(runtime, key, values, "official")
+
+
+def test_witness_sigmoid_shape_with_slot_pitched_state_selects_provider(runtime, monkeypatch):
+    activate(runtime, monkeypatch)
+    values = sigmoid_inputs(hv=16)
+    values.update(
+        q=Tensor((1, 32, 16, 128)), k=Tensor((1, 32, 16, 128)),
+        v=Tensor((1, 32, 16, 128)), a=Tensor((32, 16)), b=Tensor((32, 16)),
+        initial_state=Tensor((8, 16, 128, 128), "torch.float32", contiguous=False,
+                             strides=(286720, 16384, 128, 1)),
+        cu_seqlens=Tensor((9,), "torch.int32"),
+        ssm_state_indices=Tensor((8, 4), "torch.int32"),
+        num_accepted_tokens=Tensor((8,), "torch.int32"),
+    )
+    # cu/gates here are valid constructed metadata, not missing witness fields.
+    assert_forwarded(runtime, runtime.p.SIGMOID, values, "vendor")
+
+
 @pytest.mark.parametrize("varlen,accepted", [(False, False), (True, True)])
 def test_sigmoid_preserves_full_metadata_and_nondefault_scalars(runtime, monkeypatch, varlen, accepted):
     activate(runtime, monkeypatch)
@@ -503,6 +551,83 @@ def test_real_target_and_installed_provider_signature_contracts(runtime):
                    for n in triton_init.body)
                for name, filename in [(runtime.p.PACKED, "fused_recurrent"),
                                       (runtime.p.SIGMOID, "fused_sigmoid_gating")])
+
+
+@pytest.mark.parametrize("entry", ["packed", "sigmoid"])
+@pytest.mark.parametrize("offset", [0, 37])
+def test_real_vendor_wrapper_forwards_slot_pitch_and_state_alias_without_copy(runtime, entry, offset):
+    # Execute the installed public wrapper's AST, with metadata tensors and a
+    # launch recorder. No provider import, tensor storage or kernel execution.
+    class MetadataTensor(Tensor):
+        def __init__(self, shape, dtype="torch.bfloat16", **kwargs):
+            super().__init__(shape, dtype, **kwargs)
+            self.contiguous_flag = self.contiguous
+            del self.contiguous
+
+        @property
+        def ndim(self):
+            return len(self.shape)
+
+        def __len__(self):
+            return self.shape[0]
+
+        def numel(self):
+            size = 1
+            for dim in self.shape:
+                size *= dim
+            return size
+
+        def contiguous(self):
+            assert self.contiguous_flag, "state normalization/copy is forbidden"
+            return self
+
+        def new_empty(self, *shape, **kwargs):
+            return MetadataTensor(shape, kwargs.get("dtype", self.dtype))
+
+        def squeeze(self, axis):
+            assert axis == 0 and self.shape[0] == 1
+            return MetadataTensor(self.shape[1:], self.dtype)
+
+    launches = []
+
+    class Launch:
+        def __getitem__(self, grid):
+            def record(**kwargs):
+                launches.append((grid, kwargs))
+                return object()
+            return record
+
+    name = runtime.p.PACKED if entry == "packed" else runtime.p.SIGMOID
+    filename = "fused_recurrent.py" if entry == "packed" else "fused_sigmoid_gating.py"
+    bases = [Path(p) for p in sys.path if p]
+    path = next((p / "boltops/fla/gdn/triton" / filename for p in bases
+                 if (p / "boltops/fla/gdn/triton" / filename).is_file()), None)
+    assert path is not None, "installed provider wrapper is required for this ABI gate"
+    namespace = {
+        "triton": SimpleNamespace(next_power_of_2=lambda n: 1 << (n - 1).bit_length(),
+                                  cdiv=lambda a, b: (a + b - 1) // b),
+        name + "_kernel": Launch(),
+    }
+    _functions(path, (name,), namespace)
+    inputs = packed_inputs(hv=16) if entry == "packed" else sigmoid_inputs(hv=16)
+    inputs = {key: MetadataTensor(value.shape, value.dtype) if isinstance(value, Tensor) else value
+              for key, value in inputs.items()}
+    state = MetadataTensor((8, 16, 128, 128), "torch.float32", contiguous=False,
+                           strides=(286720, 16384, 128, 1))
+    state.storage_offset = lambda: offset
+    inputs["initial_state"] = state
+    output, final_state = namespace[name](
+        **inputs, null_state_index=0, kernel_cfg={"BV": 64, "num_warps": 4, "num_stages": 2},
+    )
+    assert final_state is state
+    if entry == "packed":
+        assert output is inputs["out"]
+    assert len(launches) == 1
+    kwargs = launches[0][1]
+    assert kwargs["h0"] is state and kwargs["ht"] is state
+    assert kwargs["stride_init_state_token"] == kwargs["stride_final_state_token"] == 286720
+    assert kwargs["NULL_STATE_INDEX"] == 0
+    assert kwargs["h0"].storage_offset() == offset
 
 
 @pytest.fixture

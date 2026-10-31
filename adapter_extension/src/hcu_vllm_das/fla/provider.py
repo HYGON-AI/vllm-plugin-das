@@ -189,7 +189,7 @@ def _provider_identity(module: ModuleType, functions: dict, architecture: str) -
         "architecture": architecture,
         "boundary": CONSUMER,
         "null_state_index": 0,
-        "envelope": "bf16-fp32-k128-v128-indexed-inplace-gdn-grid65535-v1",
+        "envelope": "bf16-fp32-k128-v128-indexed-inplace-gdn-grid65535-slot-pitch-v2",
         "provider": files,
         "public_module": _file_hash(Path(module.__file__)),
         "adapter": _file_hash(Path(__file__)),
@@ -222,6 +222,23 @@ def _row_contiguous(tensor: object) -> bool:
         callable(getattr(tensor, "stride", None))
         and tensor.stride(-1) == 1
         and tensor.stride(0) >= _shape(tensor)[-1]
+    )
+
+
+def _state_slot_pitched(tensor: object) -> bool:
+    # Both indexed, in-place vendor entries pass state.stride(0) to their
+    # kernels. H/V/K offsets inside each slot are hard-coded as packed; only
+    # the outer slot pitch may include padding/shared-pool bytes. Pass the
+    # original view so its pointer includes storage_offset and alias is kept.
+    shape = _shape(tensor)
+    if len(shape) != 4 or not callable(getattr(tensor, "stride", None)):
+        return False
+    _, heads, values, keys = shape
+    return (
+        tensor.stride(3) == 1
+        and tensor.stride(2) == keys
+        and tensor.stride(1) == values * keys
+        and tensor.stride(0) >= heads * values * keys
     )
 
 
@@ -260,7 +277,8 @@ def _packed_supported(x, a, b, A_log, dt_bias, scale, state, out, indices, norm)
         and _dtype(b) == _dtype(a)
         and all(_dtype(t) == "torch.float32" for t in (A_log, dt_bias, state))
         and all(_row_contiguous(t) for t in (x, a, b))
-        and all(_contiguous(t) for t in (A_log, dt_bias, state, out))
+        and all(_contiguous(t) for t in (A_log, dt_bias, out))
+        and _state_slot_pitched(state)
         and _indices(indices, (batch,))
         and _positive_scale(scale) and type(norm) is bool
     )
@@ -305,7 +323,8 @@ def _sigmoid_supported(A_log, a, b, dt_bias, q, k, v, beta, threshold, scale,
         and _shape(b) == _shape(a)
         and _shape(A_log) == _shape(dt_bias) == (hv,)
         and all(_dtype(t) == "torch.float32" for t in (A_log, dt_bias, state))
-        and all(_contiguous(t) for t in (A_log, dt_bias, state))
+        and all(_contiguous(t) for t in (A_log, dt_bias))
+        and _state_slot_pitched(state)
         and _positive_scale(beta) and _positive_scale(threshold)
         and _positive_scale(scale, allow_none=True)
     )
