@@ -20,6 +20,18 @@ def register_hcu_ci(
 
 
 register_hcu_ci(
+    job="contract-hcu-gfx936",
+    target="tests/vllm032/test_fla_provider_hcu.py",
+    est_time=180,
+    disabled=(
+        "Requires an audited vLLM 0.32 three-wheel environment and exclusive GPU; "
+        "the configured contract-hcu image targets vLLM 0.28.1. "
+        "Run the explicit installed-wheel command in the FLA validation report."
+    ),
+)
+
+
+register_hcu_ci(
     job="accuracy-gfx936",
     target="tests/accuracy/test_hcu_kernel_accuracy.py",
     est_time=900,

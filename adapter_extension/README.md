@@ -5,10 +5,11 @@
 lifecycle; this wheel contributes optional, independently removable operator
 optimizations through the adapter extension API.
 
-Version `0.2.0.dev0` contains two independently selected capabilities:
+Version `0.2.0.dev0` contains three independently selected capabilities:
 
 - a default-OFF LightOp ordinary and fused-add `RMSNorm` candidate; and
-- an explicit AITER INT8 W8A8 MoE route selected by `--moe-backend aiter`.
+- an explicit AITER INT8 W8A8 MoE route selected by `--moe-backend aiter`; and
+- default-OFF BoltOPs Qwen GDN decode selected through the existing FLA flags.
 
 It also provides an explicit HCU FlashAttention backend selected by
 `--attention-backend FLASH_ATTN`. The backend keeps vLLM's official metadata,
@@ -22,6 +23,28 @@ operator, so the plugin neither registers nor ships a `SiluAndMul` override.
 
 No model, topology, FP8-KV, or broad performance support is implied by these
 operator-level capabilities.
+
+## Optional Qwen GDN decode
+
+Set both `VLLM_HCU_USE_CUSTOM_OPS=1` and
+`VLLM_HCU_USE_CUSTOM_AITER_FLA=1` before starting the model to request the
+`boltops-fla-decode` capability. Both switches default to OFF. Requesting this
+capability as required through the Adapter fails startup if it cannot mount;
+an optional unsupported request leaves the official functions selected.
+
+The extension owns only two imported decode aliases in official Qwen GDN.
+It retains the official prefill, convolution, model, runner, scheduler and state
+allocation. The supported envelope uses BF16 activations, FP32 state/A_log,
+BF16 or FP32 dt_bias, K=V=128, indexed in-place GDN and the vendor grid limit.
+Padded outer state-slot pitch and storage offset are passed without copying
+the state. Unsupported argument metadata and batch-invariant mode use the
+original official entry. Errors from a selected vendor call propagate.
+
+The mounted implementation/config identity enters both ordinary and model AOT
+cache factors. Changing the policy requires a fresh worker; uninstalling Python
+aliases does not rewrite existing compiled or captured graphs. The current
+model, native, cache and performance evidence, including incomplete gates, is
+recorded in [the FLA validation report](../docs/validation/vllm032-fla-decode.md).
 
 ## Compatibility
 

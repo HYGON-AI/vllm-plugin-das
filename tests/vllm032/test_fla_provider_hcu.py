@@ -27,6 +27,7 @@ import os
 from pathlib import Path
 import statistics
 import sys
+import tempfile
 
 import pytest
 
@@ -108,6 +109,15 @@ def installed_record(distribution_name, module_path, *, venv=None):
 
 @pytest.fixture(scope="module")
 def runtime():
+    # DTK may JIT native Torch kernels through TMPDIR before any FLA call.
+    # A missing directory otherwise surfaces as an unrelated device-function error.
+    scratch = Path(os.environ.get("TMPDIR", ""))
+    assert os.environ.get("TMPDIR") and scratch.is_absolute() and scratch.is_dir(), (
+        "create an absolute writable TMPDIR before starting the HCU test process"
+    )
+    with tempfile.TemporaryFile(dir=scratch) as probe:
+        probe.write(b"hcu-fla-scratch-preflight")
+        probe.flush()
     assert TEST_MODE in {"source", "installed-wheel"}, f"unknown FLA test mode: {TEST_MODE}"
     wheel_mode = TEST_MODE == "installed-wheel"
     physical_gpu = int(os.environ.get("HCU_FLA_PHYSICAL_GPU", "2")) if wheel_mode else 1
