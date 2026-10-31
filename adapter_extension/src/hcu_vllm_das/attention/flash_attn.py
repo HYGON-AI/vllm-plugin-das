@@ -15,6 +15,7 @@ from vllm.v1.attention.backends.flash_attn import (
 from vllm.v1.kv_cache_layout import KVCacheLayout
 
 _FA4_ONLY_ARGUMENTS = ("dynamic_causal", "mask_mod", "aux_tensors")
+_E5M2_KV_CACHE_DTYPE = "fp8_e5m2"
 _KERNEL_BLOCK_SIZE = 64
 _REQUIRED_VLLM_SEAMS = (
     "_get_kv_cache_views",
@@ -50,6 +51,34 @@ def _vendor_varlen_func() -> Callable[..., Any]:
 
 def _layout_name(layout: KVCacheLayout) -> str:
     return getattr(layout, "name", str(layout))
+
+
+def _upstream_constructor_args(
+    args: tuple[Any, ...],
+    kwargs: dict[str, Any],
+) -> tuple[tuple[Any, ...], dict[str, Any], bool]:
+    """Hide only HCU E5M2 from upstream's NVIDIA capability guard."""
+    upstream_args = list(args)
+    upstream_kwargs = dict(kwargs)
+    if "kv_cache_dtype" in upstream_kwargs:
+        uses_e5m2 = upstream_kwargs["kv_cache_dtype"] == _E5M2_KV_CACHE_DTYPE
+        if uses_e5m2:
+            upstream_kwargs["kv_cache_dtype"] = "auto"
+    elif len(upstream_args) > 6:
+        uses_e5m2 = upstream_args[6] == _E5M2_KV_CACHE_DTYPE
+        if uses_e5m2:
+            upstream_args[6] = "auto"
+    else:
+        uses_e5m2 = False
+    return tuple(upstream_args), upstream_kwargs, uses_e5m2
+
+
+def _e5m2_byte_view(tensor: torch.Tensor) -> torch.Tensor:
+    if tensor.element_size() != 1:
+        raise ValueError("HCU E5M2 FlashAttention requires one-byte K/V storage")
+    if tensor.dtype == torch.float8_e5m2:
+        return tensor
+    return tensor.view(torch.float8_e5m2)
 
 
 def _dense_kv_cache_views(
@@ -118,7 +147,15 @@ class HcuFlashAttentionImpl(FlashAttentionImpl):
     supports_dcp = False
 
     def __init__(self, *args: Any, **kwargs: Any) -> None:
-        super().__init__(*args, **kwargs)
+        upstream_args, upstream_kwargs, uses_e5m2 = _upstream_constructor_args(
+            args,
+            kwargs,
+        )
+        super().__init__(*upstream_args, **upstream_kwargs)
+        if uses_e5m2:
+            self.kv_cache_dtype = _E5M2_KV_CACHE_DTYPE
+            # The vendor E5M2 path consumes BF16/FP16 Q with E5M2 K/V.
+            self.supports_quant_query_input = False
         vllm_config = get_current_vllm_config_or_none()
         self.cache_config = (
             vllm_config.cache_config if vllm_config is not None else None
@@ -185,6 +222,9 @@ class HcuFlashAttentionImpl(FlashAttentionImpl):
             if self.kv_cache_layout == KVCacheLayout.LBHNC
             else "bshd"
         )
+        if self.kv_cache_dtype == _E5M2_KV_CACHE_DTYPE:
+            kwargs["k"] = _e5m2_byte_view(kwargs["k"])
+            kwargs["v"] = _e5m2_byte_view(kwargs["v"])
         kwargs["fa_version"] = 2
         return _vendor_varlen_func()(**kwargs)
 
@@ -196,7 +236,41 @@ class HcuFlashAttentionBackend(FlashAttentionBackend):
         "auto",
         "float16",
         "bfloat16",
+        _E5M2_KV_CACHE_DTYPE,
     ]
+
+    @classmethod
+    def supports_kv_cache_dtype(cls, kv_cache_dtype: str | None) -> bool:
+        if kv_cache_dtype == _E5M2_KV_CACHE_DTYPE:
+            return True
+        return super().supports_kv_cache_dtype(kv_cache_dtype)
+
+    @classmethod
+    def supports_combination(
+        cls,
+        head_size: int,
+        dtype: torch.dtype,
+        kv_cache_dtype: str | None,
+        block_size: int | None,
+        use_mla: bool,
+        has_sink: bool,
+        use_sparse: bool,
+        use_mm_prefix: bool,
+        device_capability: Any,
+    ) -> str | None:
+        if kv_cache_dtype == _E5M2_KV_CACHE_DTYPE:
+            return None
+        return super().supports_combination(
+            head_size,
+            dtype,
+            kv_cache_dtype,
+            block_size,
+            use_mla,
+            has_sink,
+            use_sparse,
+            use_mm_prefix,
+            device_capability,
+        )
 
     @classmethod
     def supports_head_size(cls, head_size: int) -> bool:

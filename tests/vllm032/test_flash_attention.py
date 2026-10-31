@@ -25,6 +25,15 @@ def load_flash_attention(
         supports_dcp = True
 
         def __init__(self, *args, **kwargs):
+            kv_cache_dtype = kwargs.get(
+                "kv_cache_dtype",
+                args[6] if len(args) > 6 else None,
+            )
+            self.upstream_kv_cache_dtype = kv_cache_dtype
+            if kv_cache_dtype == "fp8_e5m2":
+                raise NotImplementedError("upstream rejects fp8_e5m2")
+            self.kv_cache_dtype = kv_cache_dtype
+            self.supports_quant_query_input = True
             self.vllm_flash_attn_version = kwargs.pop("version", None)
 
     if with_vllm_seams:
@@ -39,6 +48,27 @@ def load_flash_attention(
         @classmethod
         def get_preferred_block_size(cls, default_block_size):
             return default_block_size
+
+        @classmethod
+        def supports_kv_cache_dtype(cls, kv_cache_dtype):
+            return kv_cache_dtype != "fp8_e5m2"
+
+        @classmethod
+        def supports_combination(
+            cls,
+            head_size,
+            dtype,
+            kv_cache_dtype,
+            block_size,
+            use_mla,
+            has_sink,
+            use_sparse,
+            use_mm_prefix,
+            device_capability,
+        ):
+            if kv_cache_dtype == "fp8_e5m2":
+                return "upstream rejects fp8_e5m2"
+            return "delegated-combination-result"
 
     vllm = ModuleType("vllm")
     vllm.__path__ = []
@@ -204,6 +234,7 @@ def test_backend_selects_fa2_dual_layout_and_64_token_pages(monkeypatch):
         "auto",
         "float16",
         "bfloat16",
+        "fp8_e5m2",
     ]
     assert flash.HcuFlashAttentionBackend.supports_dcp() is False
     assert flash.HcuFlashAttentionBackend.supports_mm_prefix() is False
@@ -214,6 +245,159 @@ def test_backend_selects_fa2_dual_layout_and_64_token_pages(monkeypatch):
     assert flash.HcuFlashAttentionBackend.supports_sliding_window() is False
     assert flash.HcuFlashAttentionBackend.supports_non_causal() is False
     assert flash.HcuFlashAttentionBackend.supports_batch_invariance() is False
+
+
+def test_backend_accepts_only_hcu_e5m2_extension_and_delegates_other_dtypes(
+    monkeypatch,
+):
+    flash = load_flash_attention(monkeypatch)
+    backend = flash.HcuFlashAttentionBackend
+    common = dict(
+        head_size=128,
+        dtype=torch.bfloat16,
+        block_size=64,
+        use_mla=False,
+        has_sink=False,
+        use_sparse=False,
+        use_mm_prefix=False,
+        device_capability=object(),
+    )
+
+    assert backend.supports_kv_cache_dtype("fp8_e5m2") is True
+    assert (
+        backend.supports_combination(
+            kv_cache_dtype="fp8_e5m2",
+            **common,
+        )
+        is None
+    )
+    assert backend.supports_kv_cache_dtype("bfloat16") is True
+    assert (
+        backend.supports_combination(
+            kv_cache_dtype="bfloat16",
+            **common,
+        )
+        == "delegated-combination-result"
+    )
+
+
+@pytest.mark.parametrize("constructor_style", ("keyword", "positional"))
+def test_e5m2_constructor_bypasses_only_upstream_guard(
+    monkeypatch,
+    constructor_style,
+):
+    flash = load_flash_attention(monkeypatch)
+
+    if constructor_style == "keyword":
+        impl = flash.HcuFlashAttentionImpl(kv_cache_dtype="fp8_e5m2")
+    else:
+        impl = flash.HcuFlashAttentionImpl(
+            4,
+            64,
+            0.125,
+            2,
+            None,
+            None,
+            "fp8_e5m2",
+        )
+
+    assert impl.upstream_kv_cache_dtype == "auto"
+    assert impl.kv_cache_dtype == "fp8_e5m2"
+    assert impl.supports_quant_query_input is False
+
+
+def test_non_e5m2_constructor_preserves_upstream_dtype_state(monkeypatch):
+    flash = load_flash_attention(monkeypatch)
+
+    impl = flash.HcuFlashAttentionImpl(kv_cache_dtype="bfloat16")
+
+    assert impl.upstream_kv_cache_dtype == "bfloat16"
+    assert impl.kv_cache_dtype == "bfloat16"
+    assert impl.supports_quant_query_input is True
+
+
+@pytest.mark.parametrize(
+    "incoming_dtype",
+    (torch.uint8, torch.float8_e4m3fn, torch.float8_e5m2),
+)
+def test_e5m2_vendor_boundary_reinterprets_kv_bytes_only(
+    monkeypatch,
+    incoming_dtype,
+):
+    flash = load_flash_attention(monkeypatch)
+    calls = []
+    monkeypatch.setattr(
+        flash,
+        "_vendor_varlen_func",
+        lambda: lambda **kwargs: calls.append(kwargs) or "output",
+    )
+    impl = flash.HcuFlashAttentionImpl()
+    impl.kv_cache_dtype = "fp8_e5m2"
+    query = torch.empty(1, 4, 64, dtype=torch.bfloat16)
+    raw_key = torch.arange(64, dtype=torch.uint8)
+    raw_value = torch.arange(64, dtype=torch.uint8).flip(0)
+    key = raw_key if incoming_dtype == torch.uint8 else raw_key.view(incoming_dtype)
+    value = (
+        raw_value
+        if incoming_dtype == torch.uint8
+        else raw_value.view(incoming_dtype)
+    )
+    k_descale = torch.tensor(0.5)
+    v_descale = torch.tensor(0.25)
+
+    result = impl._run_flash_attention(
+        q=query,
+        k=key,
+        v=value,
+        k_descale=k_descale,
+        v_descale=v_descale,
+    )
+
+    assert result == "output"
+    assert calls[0]["q"] is query
+    assert calls[0]["k"].dtype == torch.float8_e5m2
+    assert calls[0]["v"].dtype == torch.float8_e5m2
+    assert calls[0]["k"].view(torch.uint8).data_ptr() == raw_key.data_ptr()
+    assert calls[0]["v"].view(torch.uint8).data_ptr() == raw_value.data_ptr()
+    assert calls[0]["k_descale"] is k_descale
+    assert calls[0]["v_descale"] is v_descale
+
+
+def test_e5m2_vendor_boundary_rejects_non_byte_kv_storage(monkeypatch):
+    flash = load_flash_attention(monkeypatch)
+    monkeypatch.setattr(
+        flash,
+        "_vendor_varlen_func",
+        lambda: pytest.fail("vendor must not run"),
+    )
+    impl = flash.HcuFlashAttentionImpl()
+    impl.kv_cache_dtype = "fp8_e5m2"
+
+    with pytest.raises(ValueError, match="one-byte K/V storage"):
+        impl._run_flash_attention(
+            q=torch.empty(1, 4, 64, dtype=torch.bfloat16),
+            k=torch.empty(64, dtype=torch.bfloat16),
+            v=torch.empty(64, dtype=torch.bfloat16),
+        )
+
+
+def test_non_e5m2_vendor_boundary_preserves_kv_dtype(monkeypatch):
+    flash = load_flash_attention(monkeypatch)
+    calls = []
+    monkeypatch.setattr(
+        flash,
+        "_vendor_varlen_func",
+        lambda: lambda **kwargs: calls.append(kwargs),
+    )
+    impl = flash.HcuFlashAttentionImpl()
+    impl.kv_cache_dtype = "auto"
+    key = torch.empty(64, dtype=torch.float8_e4m3fn)
+    value = torch.empty_like(key)
+
+    impl._run_flash_attention(q="q", k=key, v=value)
+
+    assert calls[0]["k"] is key
+    assert calls[0]["v"] is value
 
 
 @pytest.mark.parametrize("head_size", (64, 128, 192, 256))
