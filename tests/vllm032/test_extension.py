@@ -44,6 +44,7 @@ def reset_activation(monkeypatch: pytest.MonkeyPatch):
     monkeypatch.setattr(extension, "_activated", False)
     monkeypatch.setattr(extension, "_commit_failure", None)
     monkeypatch.setattr(extension, "_committing_error_type", None)
+    monkeypatch.setattr(extension, "_activating_error_type", None)
 
 
 def successful_importer(calls: list[str]):

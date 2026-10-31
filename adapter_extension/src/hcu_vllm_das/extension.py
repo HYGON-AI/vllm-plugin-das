@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+from contextlib import contextmanager
 from importlib import import_module as _import_module
 import inspect
 import json
@@ -69,18 +70,30 @@ _activation_lock = threading.Lock()
 _activated = False
 _commit_failure = None
 _committing_error_type = None
+_activating_error_type = None
 
 
 def _after_fork_child():
     global _activation_lock, _commit_failure
     _activation_lock = threading.Lock()
-    if _committing_error_type is not None and _commit_failure is None:
-        _commit_failure = (_committing_error_type,
-                           "fork inherited incomplete DAS publication; use a fresh process")
+    inherited = _activating_error_type or _committing_error_type
+    if inherited is not None and _commit_failure is None:
+        _commit_failure = (inherited,
+                           "fork inherited incomplete DAS preparation/publication; use a fresh process")
 
 
 if hasattr(os, "register_at_fork"):
     os.register_at_fork(after_in_child=_after_fork_child)
+
+
+@contextmanager
+def _activation_attempt(error_type):
+    global _activating_error_type
+    _activating_error_type = error_type
+    try:
+        yield
+    finally:
+        _activating_error_type = None
 
 
 class DasExtensionError(RuntimeError):
@@ -164,7 +177,7 @@ def activate_extension(context: ExtensionContext) -> None:
     _require_vllm_032_release_line(context.vllm_version)
     fatal, health = _require_commit_failure_abi()
     health()  # Never wait on the host gate while holding the owner lock.
-    with _activation_lock:
+    with _activation_lock, _activation_attempt(fatal.ExtensionCommitError):
         if _commit_failure is not None:
             error_type, message = _commit_failure
             raise error_type(message)

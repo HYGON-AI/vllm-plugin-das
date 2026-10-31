@@ -19,6 +19,14 @@ required FLA fails cleanly before factor or alias publication; a clean optional
 preparation error retains the official baseline and later owners may run.
 Preparation is not a reservation: installation rechecks current state.
 
+Preparation may initialize the official GDN consumer, which registers classes
+and Torch dispatcher ops at import. This is not a pure side-effect-free phase:
+a failed consumer import explicitly signals fatal because partial official
+registration may survive. A successful complete official import does not mount
+Plugin aliases. The owner also tracks the entire preparation lifetime across
+fork; a child inheriting preparation or publication in progress refuses direct
+activation. Provider locks are reconstructed without clearing owner failure.
+
 The first compile-factor registration is a shared-state commit boundary. Every
 exception thereafter, including interrupted activation, raises the public fatal
 signal. Adapter stops later owners, preserves actual reports and latches its

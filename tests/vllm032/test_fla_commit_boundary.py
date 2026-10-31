@@ -18,6 +18,7 @@ def activation(monkeypatch):
     monkeypatch.setattr(extension, "_activated", False)
     monkeypatch.setattr(extension, "_commit_failure", None)
     monkeypatch.setattr(extension, "_committing_error_type", None)
+    monkeypatch.setattr(extension, "_activating_error_type", None)
     imports = []
     importer = successful_importer(imports)
     importer.fla.requested = True
@@ -106,6 +107,89 @@ def test_actual_runtime_latches_failed_optional_bundle_and_preserves_report(acti
     assert importer.fla.mounted
     with pytest.raises(bridge.LatchedVllmRuntimeError):
         bridge.require_runtime_healthy()
+
+
+def test_failed_consumer_import_preserves_dispatcher_state_and_signals_fatal(activation, monkeypatch):
+    import torch
+    from hcu_vllm_das.fla import provider
+
+    importer, _ = activation
+    library = torch.library.Library("hcu_fla_prepare_failure", "FRAGMENT")
+
+    def load(name):
+        assert name == provider.CONSUMER
+        # The actual official consumer registers classes and dispatcher ops.
+        # This bounded CPU fault uses a real dispatcher registration, then
+        # fails import; it does not simulate any native FLA arithmetic.
+        library.define("published_before_import_failure() -> ()")
+        raise ImportError("failure after dispatcher registration")
+
+    monkeypatch.setattr(provider, "import_module", load)
+    monkeypatch.setattr(importer.fla, "preflight_install",
+                        lambda *args, **kwargs: provider._load_consumer())
+    later = []
+    with pytest.raises(host.ExtensionCommitError) as caught:
+        host.activate_extensions(context(), [
+            point("das-hcu", 10, extension.activate_extension),
+            point("later", 0, lambda _: later.append(True))])
+    assert [r.status.value for r in caught.value.reports] == ["failed"]
+    assert not later and not importer.fla.mounted
+    assert hasattr(torch.ops.hcu_fla_prepare_failure, "published_before_import_failure")
+    assert importer.modules["vllm.envs"].environment_variables == {}
+    with pytest.raises(host.ExtensionCommitError, match="preparation inherited"):
+        extension.activate_extension(context())
+
+
+@pytest.mark.skipif(not hasattr(os, "fork"), reason="requires actual fork")
+def test_preparing_fork_refuses_direct_owner_and_resets_provider_lock(activation, monkeypatch):
+    from hcu_vllm_das.fla import provider
+
+    importer, _ = activation
+
+    def prepare(*args, **kwargs):
+        read_fd, write_fd = os.pipe()
+        # Another thread owns the provider lock, matching an actual fork's
+        # risk: the child cannot wait for a vanished thread to release it.
+        import threading
+        entered, release = threading.Event(), threading.Event()
+
+        def hold():
+            with provider._lock:
+                entered.set()
+                release.wait(8)
+
+        thread = threading.Thread(target=hold, daemon=True)
+        thread.start()
+        assert entered.wait(2)
+        pid = os.fork()
+        if pid == 0:
+            os.close(read_fd)
+            signal.alarm(4)
+            acquired = provider._lock.acquire(blocking=False)
+            if acquired:
+                provider._lock.release()
+            try:
+                extension.activate_extension(context())
+            except host.ExtensionCommitError:
+                os.write(write_fd, b"refused-and-reset" if acquired else b"provider-stuck")
+                os._exit(0)
+            os._exit(1)
+        os.close(write_fd)
+        try:
+            ready, _, _ = select.select([read_fd], [], [], 6)
+            assert ready and os.read(read_fd, 64) == b"refused-and-reset"
+        finally:
+            release.set()
+            thread.join(2)
+            os.close(read_fd)
+            _, status = os.waitpid(pid, 0)
+        assert os.waitstatus_to_exitcode(status) == 0
+        return True
+
+    monkeypatch.setattr(importer.fla, "preflight_install", prepare)
+    extension.activate_extension(context())
+    assert extension._activated and extension._commit_failure is None
+    assert extension._activating_error_type is None
 
 
 @pytest.mark.skipif(not hasattr(os, "fork"), reason="requires actual fork")

@@ -58,6 +58,17 @@ _envs: ModuleType | None = None
 _installation: _Installation | None = None
 
 
+def _after_fork_child():
+    global _lock
+    # The owner separately refuses inherited activation-in-progress. Resetting
+    # synchronization does not clear that owner failure or publish anything.
+    _lock = threading.RLock()
+
+
+if hasattr(os, "register_at_fork"):
+    os.register_at_fork(after_in_child=_after_fork_child)
+
+
 class FlaInstallError(RuntimeError):
     """The target ABI, ownership or activation order needs review."""
 
@@ -365,6 +376,20 @@ def _make_wrappers(originals: dict, providers: dict) -> dict:
     return {PACKED: packed, SIGMOID: sigmoid}
 
 
+def _load_consumer():
+    # The official consumer registers CustomOp classes and Torch dispatcher
+    # schemas at import. A failed import can leave published framework state;
+    # it is never an ordinary optional provider-unavailable result.
+    from hcu_adapter.extensions import ExtensionCommitError
+
+    try:
+        return import_module(CONSUMER)
+    except BaseException as error:
+        raise ExtensionCommitError(
+            "official GDN consumer import failed after possible registration; use a fresh process"
+        ) from error
+
+
 def _prepare_install(vllm_envs, architecture):
     if not is_requested(vllm_envs):
         return None
@@ -387,7 +412,7 @@ def _prepare_install(vllm_envs, architecture):
     originals = {name: getattr(import_module(owner), name) for name, owner in _OWNERS.items()}
     if not all(_signature_matches(fn, name, vendor=False) for name, fn in originals.items()):
         raise FlaInstallError("official GDN function signature changed; review mount")
-    consumer = import_module(CONSUMER)
+    consumer = _load_consumer()
     if any(getattr(consumer, name, None) is not fn for name, fn in originals.items()):
         raise FlaInstallError("Qwen GDN aliases have another owner; refusing replacement")
     identity = _provider_identity(module, providers, architecture)
@@ -396,7 +421,11 @@ def _prepare_install(vllm_envs, architecture):
 
 
 def preflight_install(vllm_envs, *, architecture: str | None = None) -> bool:
-    """Validate requested aliases/provider ABI without publishing any changes."""
+    """Prepare provider/aliases without mounting Plugin aliases.
+
+    Successful official consumer import initializes official registrations.
+    Failed import is explicitly fatal because partial registration may survive.
+    """
     with _lock:
         preflight_compile_factors(vllm_envs)
         return _prepare_install(vllm_envs, architecture) is not None
