@@ -9,12 +9,15 @@ This owner does not install RMS, AITER, quantization aliases or lifecycle hooks.
 
 from __future__ import annotations
 
+from contextlib import contextmanager
 from dataclasses import dataclass
 from importlib import import_module
 import os
 from threading import RLock
 
-from hcu_adapter.extensions import ExtensionCommitError, ExtensionContext, ExtensionSpec
+from hcu_adapter.extensions import (
+    ExtensionCommitError, ExtensionContext, ExtensionSpec, is_fatal_extension_error,
+)
 from packaging.version import InvalidVersion, Version
 
 
@@ -40,7 +43,7 @@ def _after_fork_child():
     global _lock, _failure
     _lock = RLock()
     if _publishing and _failure is None:
-        _failure = "fork inherited unfinished Flash registry publication; use a fresh spawned process"
+        _failure = "fork inherited unfinished Flash preparation/publication; use a fresh spawned process"
 
 
 if hasattr(os, "register_at_fork"):
@@ -64,6 +67,18 @@ def _fatal(reason, error=None):
                 detail = reason
             _failure = detail
     raise ExtensionCommitError(_failure) from error
+
+
+@contextmanager
+def _activation_attempt():
+    global _publishing
+    if _publishing:
+        _fatal("recursive Flash preparation/publication")
+    _publishing = True
+    try:
+        yield
+    finally:
+        _publishing = False
 
 
 def _owned(registry, publication):
@@ -98,7 +113,7 @@ def check_health() -> None:
 
 
 def activate(context: ExtensionContext) -> None:
-    global _published, _publishing
+    global _published
     if _failure is not None:
         _fatal(_failure)
     try:
@@ -114,17 +129,15 @@ def activate(context: ExtensionContext) -> None:
 
     # Hardware/runtime admission belongs to Adapter. This owner prepares only
     # its backend/vendor ABI, then uses the official process-local registry.
-    with _lock:
+    with _lock, _activation_attempt():
         if _failure is not None:
             _fatal(_failure)
-        if _publishing:
-            _fatal("recursive Flash registry publication")
         try:
             registry = import_module(REGISTRY)
             enum = registry.AttentionBackendEnum.FLASH_ATTN
         except BaseException as error:
-            if _published is not None:
-                _fatal("published Flash registry unavailable", error)
+            if _published is not None or is_fatal_extension_error(error):
+                _fatal("Flash registry unavailable after a fatal failure", error)
             raise
         if _published is not None:
             try:
@@ -156,14 +169,17 @@ def activate(context: ExtensionContext) -> None:
                     raise TypeError("missing public registry method: "+name)
             if not callable(registry.register_backend):
                 raise TypeError("missing public register_backend")
-        except Exception as error:
+        except BaseException as error:
+            if is_fatal_extension_error(error):
+                _fatal("Flash preparation inherited a fatal failure", error)
+            if not isinstance(error, Exception):
+                raise
             raise FlashActivationError(
                 f"cannot prepare HCU Flash backend: {type(error).__name__}: {error}"
             ) from error
         if enum.is_overridden():
             raise FlashActivationError("FLASH_ATTN foreign override appeared during preparation")
         publication = _Publication(os.getpid(), enum, registry.register_backend, cls, vendor)
-        _publishing = True
         try:
             registry.register_backend(enum, BACKEND)
             # Once publication was attempted, an exception has uncertain shared
@@ -173,8 +189,6 @@ def activate(context: ExtensionContext) -> None:
                 _fatal("Flash registry publication verification failed")
         except BaseException as error:
             _fatal("Flash registry commit failed", error)
-        finally:
-            _publishing = False
 
 
 def extension_spec() -> ExtensionSpec:

@@ -216,6 +216,78 @@ def test_fork_requires_explicit_current_process_activation(provider):
     _,status=os.waitpid(pid,0);assert os.waitstatus_to_exitcode(status)==0
 
 
+@pytest.mark.skipif(not hasattr(os, "fork"), reason="requires bounded CPU fork")
+def test_fork_during_flash_preparation_refuses_child(provider, monkeypatch):
+    import signal
+    calls, _ = provider
+    original = activation.import_module
+    children = []
+
+    def load(name):
+        if name == "hcu_vllm_das.attention.flash_attn":
+            pid = os.fork()
+            if pid == 0:
+                signal.alarm(3)
+                activation.import_module = original
+                try:
+                    activation.activate(context())
+                except BaseException as error:
+                    os._exit(0 if isinstance(error, ExtensionCommitError) else 2)
+                os._exit(3)
+            _, status = os.waitpid(pid, 0)
+            children.append(os.waitstatus_to_exitcode(status))
+        return original(name)
+
+    monkeypatch.setattr(activation, "import_module", load)
+    activation.activate(context())
+    assert children == [0]
+    assert activation._failure is None and calls.count("publish") == 1
+
+
+@pytest.mark.parametrize("render_error", [RuntimeError, KeyboardInterrupt])
+def test_preparation_dispatcher_write_then_public_fatal_stops_later_owner(
+    provider, monkeypatch, render_error
+):
+    """CPU: real dispatcher declaration, synthetic failed dependency import."""
+    import torch
+    calls, _ = provider
+    original = activation.import_module
+    libraries, observed, later = [], [], []
+
+    class BadString(ExtensionCommitError):
+        def __str__(self):
+            observed.append(activation._failure)
+            raise render_error("diagnostic failed")
+
+    failure = BadString("dependency failed after dispatcher publication")
+    namespace = "hcu_flash_prepare_fatal_v032_" + render_error.__name__.lower()
+
+    def load(name):
+        if name == "hcu_vllm_das.attention.e5m2_cache":
+            library = torch.library.Library(namespace, "FRAGMENT")
+            library.define("probe(Tensor x) -> Tensor")
+            libraries.append(library)
+            assert getattr(torch.ops, namespace).probe is not None
+            raise failure
+        return original(name)
+
+    monkeypatch.setattr(activation, "import_module", load)
+    point = SimpleNamespace(name="later", load=lambda: lambda: ExtensionSpec(
+        "later", 1, 0, {"later"}, lambda _: later.append(True)
+    ))
+    caught = None
+    try:
+        activate_extensions(context(), (POINT, point))
+    except BaseException as error:
+        caught = error
+    assert isinstance(caught, ExtensionCommitError)
+    assert libraries and observed and all(observed)
+    assert not later and "publish" not in calls
+    assert caught.reports[0].status is ExtensionStatus.FAILED
+    with pytest.raises(ExtensionCommitError):
+        activation.activate(context())
+
+
 def test_clean_legacy_failure_does_not_change_independent_flash_ownership(provider):
     class Legacy:
         name = "das_hcu"
