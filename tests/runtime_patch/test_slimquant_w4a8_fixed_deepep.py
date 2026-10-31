@@ -277,10 +277,12 @@ def test_fixed_deepep_factory_uses_role_fixed_experts_and_single_prepare_finaliz
         return prepare_finalize
 
     expert_calls: list[dict[str, object]] = []
+    expert_instances: list[object] = []
 
     class FakeExperts:
         def __init__(self, **kwargs: object) -> None:
             expert_calls.append(kwargs)
+            expert_instances.append(self)
 
     kernel_calls: list[tuple[object, object]] = []
 
@@ -311,7 +313,9 @@ def test_fixed_deepep_factory_uses_role_fixed_experts_and_single_prepare_finaliz
     assert expert_calls[0]["max_num_tokens"] == expected_tokens
     assert expert_calls[0]["num_dispatchers"] == 4
     assert expert_calls[0]["quant_config"] is quant_config
-    assert kernel_calls == [(prepare_finalize, kernel_calls[0][1])]
+    assert len(kernel_calls) == 1
+    assert kernel_calls[0][0] is prepare_finalize
+    assert kernel_calls[0][1] is expert_instances[0]
 
 
 @pytest.mark.hcu
