@@ -4,7 +4,7 @@
 
 **Goal:** Provide a correct, Graph-capable HCU FLASH_ATTN backend for vLLM 0.32 without copying official orchestration.
 
-**Architecture:** OpenDAS vLLM adds two default-preserving protected seams. The Plugin subclasses them to expose dense LBHNC K/V pages to the vendor varlen ABI. The Adapter only routes explicit backend selection to the Plugin class.
+**Architecture:** OpenDAS vLLM adds default-preserving protected seams. The Plugin subclasses them to expose dense LBHNC or LBNHC K/V pages to the vendor varlen ABI. The Adapter only routes explicit backend selection to the Plugin class.
 
 **Tech Stack:** Python 3.12, PyTorch/DTK, vLLM 0.32, vendor flash-attn 2.8.x, pytest.
 
@@ -108,3 +108,26 @@
 - [ ] Run ordered HumanEval16 with matched prompts and generation settings; retain raw responses and finish reasons.
 - [ ] Stop only owned services, verify no owned EngineCore remains, and record remaining validation gaps.
 - [ ] Review complete diffs before any push or MR update.
+
+### Task 6: Add dual HND/NHD layout support
+
+**Files:**
+- Modify: `adapter_extension/src/hcu_vllm_das/attention/flash_attn.py`
+- Modify: `tests/vllm032/test_flash_attention.py`
+- Modify: `tests/vllm032/test_flash_attention_hcu.py`
+- Modify: `adapter_extension/README.md`
+- Modify: `docs/validation/vllm032-flash-attn-varlen.md`
+
+**Interfaces:**
+- Consumes: vLLM's resolved `KVCacheLayout` and official NHD writer contract.
+- Produces: LBHNC/`bhsd` and LBNHC/`bshd` zero-copy read paths.
+
+- [x] Add failing portable tests for both physical stride contracts, vendor
+  layout selection, ambiguous geometry, and unsupported-layout failure.
+- [x] Implement dual dense views without changing Adapter or vLLM.
+- [x] Run BF16/FP16, MHA/GQA, prefill/decode numerical tests on both layouts.
+- [x] Run changing-input Graph replay on both layouts.
+- [x] Start Graph-enabled model services with explicit HND and NHD and compare
+  deterministic responses.
+- [x] Build the Plugin wheel and run package gates.
+- [ ] Attach final evidence to the MR.

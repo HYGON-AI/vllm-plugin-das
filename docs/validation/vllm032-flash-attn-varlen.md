@@ -102,3 +102,48 @@ This validates the available single-device HCU topology, BF16/FP16 dense
 decoder MHA/GQA, LBHNC storage, 64-token pages, and the public vendor varlen
 interface. It does not claim DCP, FP8 KV, hybrid cache layouts, alternate page
 sizes, FA4-only masks, tensor parallelism, or a throughput improvement.
+
+## Dual-layout follow-up (2026-10-31)
+
+The follow-up branch based on Plugin `11f331601` adds the second block-compact
+layout without changing vLLM or Adapter. The Plugin reads the layout already
+resolved by vLLM and applies these zero-copy contracts:
+
+| vLLM layout | Legacy alias | Dense vendor view | Vendor argument |
+| --- | --- | --- | --- |
+| `LBHNC` | `HND` | `[B, H, N, D]` | `layout="bhsd"` |
+| `LBNHC` | `NHD` | `[B, N, H, D]` | `layout="bshd"` |
+
+Portable vLLM 0.32 tests completed with `126 passed, 18 skipped`. Live HCU
+tests covered BF16 and FP16, MHA and GQA, prefill and decode, plus changed-input
+Graph replay for each layout: `12 passed` in 34.69 seconds at
+`atol=rtol=0.016` from the final installed wheel. The official
+`reshape_and_cache_flash` writer populated the second of two padded cache
+blocks in both physical layouts before the public vendor reader was compared
+with the Torch float32 reference. Capability tests also reject head sizes not
+divisible by 64 before vendor dispatch, matching the installed public vendor
+entry point; the supported set through 256 is 64, 128, 192, and 256.
+
+Graph-enabled services were then started twice with the same
+`/model/Qwen2-0.5B-Instruct` arguments, first with
+`VLLM_KV_CACHE_LAYOUT=HND` and then `NHD`. The engine reported LBHNC and LBNHC
+respectively, retained `enforce_eager=False` and `FULL_AND_PIECEWISE`, and
+completed both PIECEWISE and FULL capture. Identical deterministic completion
+requests returned HTTP 200, five prompt tokens, sixteen completion tokens, and
+the same response text on both layouts. Both owned service trees were stopped
+and no API server or EngineCore process remained.
+
+The two model-service runs above used the isolated vLLM seam candidate
+`923e3284c` and loaded the Plugin branch directly through `PYTHONPATH`; they do
+not replace the historical installed-wheel identities above. The subsequent
+HCU matrix used an isolated installation of the final wheel built as
+`hcu_vllm_das_plugin-0.2.0.dev0-py3-none-any.whl`, SHA256
+`25964ff51e99b5a29d66cafaeca310e3767b6d81d42c065bfcab4c4853e0db87`;
+package-boundary, installed-verifier fixture, and compat-lock gates completed
+with `18 passed`. An isolated target installation then passed the real
+installed-state verifier: Plugin version `0.2.0.dev0`, Plugin RECORD SHA256
+`cd25ede7f641db6dcb2f64cd62ee4faeb27f4e5fc8010908c25adb8b342f8733`,
+active `das_hcu` extension, expected RMSNorm/AITER owners, Adapter platform,
+and vLLM `0.32.0+rocm723` ownership were all confirmed. The target directory
+was layered over the isolated candidate environment and did not modify its
+installed Plugin.

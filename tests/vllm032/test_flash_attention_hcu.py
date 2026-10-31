@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import math
 import os
+from types import SimpleNamespace
 
 import pytest
 import torch
@@ -36,27 +37,94 @@ def _reference_attention(
     )
 
 
+def _make_packed_cache(
+    *,
+    layout_name: str,
+    num_blocks: int,
+    num_heads: int,
+    block_size: int,
+    head_size: int,
+    device: torch.device,
+    dtype: torch.dtype,
+    block_padding: int = 0,
+) -> torch.Tensor:
+    packed_head_size = 2 * head_size
+    block_stride = (
+        num_heads * block_size * packed_head_size + block_padding
+    )
+    if layout_name == "LBHNC":
+        strides = (
+            block_stride,
+            block_size * packed_head_size,
+            packed_head_size,
+            1,
+        )
+    elif layout_name == "LBNHC":
+        strides = (
+            block_stride,
+            packed_head_size,
+            num_heads * packed_head_size,
+            1,
+        )
+    else:
+        raise AssertionError(f"unexpected test layout: {layout_name}")
+    return torch.empty_strided(
+        (num_blocks, num_heads, block_size, packed_head_size),
+        strides,
+        device=device,
+        dtype=dtype,
+    )
+
+
+def _make_impl(layout_name: str, head_size: int):
+    from hcu_vllm_das.attention.flash_attn import HcuFlashAttentionImpl
+    from vllm.v1.kv_cache_layout import KVCacheLayout
+
+    impl = object.__new__(HcuFlashAttentionImpl)
+    impl.head_size = head_size
+    layout = getattr(KVCacheLayout, layout_name)
+    impl.cache_config = SimpleNamespace(
+        get_resolved_kv_cache_layout=lambda: layout
+    )
+    return impl
+
+
 @pytest.mark.parametrize(
-    ("query_len", "kv_len", "num_query_heads", "num_kv_heads", "dtype"),
     (
-        (3, 3, 4, 2, torch.bfloat16),
-        (1, 5, 4, 2, torch.bfloat16),
-        (5, 5, 14, 2, torch.bfloat16),
-        (3, 3, 2, 2, torch.float16),
-        (3, 3, 4, 2, torch.float16),
+        "layout_name",
+        "query_len",
+        "kv_len",
+        "num_query_heads",
+        "num_kv_heads",
+        "dtype",
+    ),
+    tuple(
+        (layout, query_len, kv_len, num_query_heads, num_kv_heads, dtype)
+        for layout in ("LBHNC", "LBNHC")
+        for query_len, kv_len, num_query_heads, num_kv_heads, dtype in (
+            (3, 3, 4, 2, torch.bfloat16),
+            (1, 5, 4, 2, torch.bfloat16),
+            (5, 5, 14, 2, torch.bfloat16),
+            (3, 3, 2, 2, torch.float16),
+            (3, 3, 4, 2, torch.float16),
+        )
     ),
 )
 @torch.inference_mode()
 def test_hcu_writer_to_vendor_varlen_matches_reference(
-    query_len, kv_len, num_query_heads, num_kv_heads, dtype
+    layout_name,
+    query_len,
+    kv_len,
+    num_query_heads,
+    num_kv_heads,
+    dtype,
 ):
     import vllm._C_stable_libtorch  # noqa: F401
-    from hcu_vllm_das.attention.flash_attn import HcuFlashAttentionImpl
     from vllm import _custom_ops as ops
 
     torch.manual_seed(17 + query_len)
     device = torch.device("cuda")
-    block_size, num_blocks = 64, 1
+    block_size, num_blocks, cache_block = 64, 2, 1
     head_size = 64
     query = torch.randn(
         query_len,
@@ -73,21 +141,24 @@ def test_hcu_writer_to_vendor_varlen_matches_reference(
         dtype=dtype,
     )
     value = torch.randn_like(key)
-    packed_cache = torch.empty(
-        num_blocks,
-        num_kv_heads,
-        block_size,
-        2 * head_size,
+    packed_cache = _make_packed_cache(
+        layout_name=layout_name,
+        num_blocks=num_blocks,
+        num_heads=num_kv_heads,
+        block_size=block_size,
+        head_size=head_size,
         device=device,
         dtype=dtype,
+        block_padding=64,
     )
-    impl = object.__new__(HcuFlashAttentionImpl)
-    impl.head_size = head_size
+    impl = _make_impl(layout_name, head_size)
     key_cache, value_cache = impl._get_kv_cache_views(packed_cache)
     write_key_cache, write_value_cache = impl._get_kv_cache_write_views(
         packed_cache
     )
-    slot_mapping = torch.arange(kv_len, device=device, dtype=torch.long)
+    slot_mapping = cache_block * block_size + torch.arange(
+        kv_len, device=device, dtype=torch.long
+    )
     scale = torch.ones((), device=device, dtype=torch.float32)
     ops.reshape_and_cache_flash(
         key,
@@ -99,12 +170,13 @@ def test_hcu_writer_to_vendor_varlen_matches_reference(
         scale,
         scale,
     )
-    torch.testing.assert_close(
-        key_cache[0, :, :kv_len].transpose(0, 1), key
-    )
-    torch.testing.assert_close(
-        value_cache[0, :, :kv_len].transpose(0, 1), value
-    )
+    cached_key = key_cache[cache_block, :, :kv_len].transpose(0, 1)
+    cached_value = value_cache[cache_block, :, :kv_len].transpose(0, 1)
+    if layout_name == "LBNHC":
+        cached_key = key_cache[cache_block, :kv_len]
+        cached_value = value_cache[cache_block, :kv_len]
+    torch.testing.assert_close(cached_key, key)
+    torch.testing.assert_close(cached_value, value)
 
     output = impl._run_flash_attention(
         q=query,
@@ -118,8 +190,9 @@ def test_hcu_writer_to_vendor_varlen_matches_reference(
         max_seqlen_k=kv_len,
         softmax_scale=1.0 / math.sqrt(head_size),
         causal=True,
-        block_table=torch.zeros((1, 1), device=device, dtype=torch.int32),
-        layout="bhsd",
+        block_table=torch.full(
+            (1, 1), cache_block, device=device, dtype=torch.int32
+        ),
         fa_version=2,
     )
     expected = _reference_attention(query, key, value)
@@ -127,11 +200,12 @@ def test_hcu_writer_to_vendor_varlen_matches_reference(
     torch.testing.assert_close(output, expected, atol=1.6e-2, rtol=1.6e-2)
 
 
+@pytest.mark.parametrize("layout_name", ("LBHNC", "LBNHC"))
 @torch.inference_mode()
-def test_hcu_writer_and_vendor_varlen_replay_with_changed_graph_inputs():
+def test_hcu_writer_and_vendor_varlen_replay_with_changed_graph_inputs(
+    layout_name,
+):
     import vllm._C_stable_libtorch  # noqa: F401
-    from flash_attn import flash_attn_varlen_func
-    from hcu_vllm_das.attention.flash_attn import HcuFlashAttentionImpl
     from vllm import _custom_ops as ops
 
     torch.manual_seed(29)
@@ -146,28 +220,34 @@ def test_hcu_writer_and_vendor_varlen_replay_with_changed_graph_inputs():
         kv_len, num_kv_heads, head_size, device=device, dtype=dtype
     )
     value = torch.randn_like(key)
-    packed_cache = torch.empty(
-        1,
-        num_kv_heads,
-        block_size,
-        2 * head_size,
+    cache_block = 1
+    packed_cache = _make_packed_cache(
+        layout_name=layout_name,
+        num_blocks=2,
+        num_heads=num_kv_heads,
+        block_size=block_size,
+        head_size=head_size,
         device=device,
         dtype=dtype,
+        block_padding=64,
     )
     output = torch.empty_like(query)
-    impl = object.__new__(HcuFlashAttentionImpl)
-    impl.head_size = head_size
+    impl = _make_impl(layout_name, head_size)
     key_cache, value_cache = impl._get_kv_cache_views(packed_cache)
     write_key_cache, write_value_cache = impl._get_kv_cache_write_views(
         packed_cache
     )
-    slot_mapping = torch.arange(kv_len, device=device, dtype=torch.long)
+    slot_mapping = cache_block * block_size + torch.arange(
+        kv_len, device=device, dtype=torch.long
+    )
     scale = torch.ones((), device=device, dtype=torch.float32)
     cu_seqlens_q = torch.tensor(
         [0, query_len], device=device, dtype=torch.int32
     )
     seqused_k = torch.tensor([kv_len], device=device, dtype=torch.int32)
-    block_table = torch.zeros((1, 1), device=device, dtype=torch.int32)
+    block_table = torch.full(
+        (1, 1), cache_block, device=device, dtype=torch.int32
+    )
 
     def run() -> None:
         ops.reshape_and_cache_flash(
@@ -180,7 +260,7 @@ def test_hcu_writer_and_vendor_varlen_replay_with_changed_graph_inputs():
             scale,
             scale,
         )
-        flash_attn_varlen_func(
+        impl._run_flash_attention(
             q=query,
             k=key_cache,
             v=value_cache,
@@ -192,8 +272,6 @@ def test_hcu_writer_and_vendor_varlen_replay_with_changed_graph_inputs():
             softmax_scale=1.0 / math.sqrt(head_size),
             causal=True,
             block_table=block_table,
-            layout="bhsd",
-            fa_version=2,
         )
 
     warmup_stream = torch.cuda.Stream()

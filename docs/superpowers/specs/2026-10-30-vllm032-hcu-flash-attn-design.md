@@ -23,17 +23,20 @@ it does not honor the packed split-view stride. Live HCU probes showed:
 
 ## Selected approach
 
-Add two protected extension seams to the OpenDAS vLLM 0.32
-`FlashAttentionImpl`: one that derives K/V views from the allocated cache and
-one that invokes the attention kernel. The default implementations preserve
-official behavior exactly.
+Add three protected extension seams to the OpenDAS vLLM 0.32
+`FlashAttentionImpl`: independent K/V read and write views derived from the
+allocated cache, plus the attention-kernel invocation. The default
+implementations preserve official behavior exactly.
 
-The Plugin subclasses the official implementation. It reinterprets each flat
-LBHNC page as dense `[K/V, H, N, D]` storage, uses the official stride-aware
-HIP cache writer, and invokes only the public vendor
-`flash_attn_varlen_func` with `layout="bhsd"`. Unsupported FA4-only optional
-arguments are accepted only when inactive (`None`); active use fails closed.
-The backend advertises a 64-token kernel page and LBHNC layout.
+The Plugin subclasses the official implementation. It reads vLLM's resolved
+cache layout and reinterprets a flat LBHNC page as dense `[K/V, H, N, D]`
+storage or a flat LBNHC page as dense `[K/V, N, H, D]` storage. It uses the
+official stride-aware HIP cache writer and invokes only the public vendor
+`flash_attn_varlen_func`, mapping LBHNC to `layout="bhsd"` and LBNHC to
+`layout="bshd"`. Unsupported FA4-only optional arguments are accepted only
+when inactive (`None`); active use fails closed. The backend advertises a
+64-token kernel page and both layouts, retaining LBHNC as its first preference
+to preserve the deployed default.
 
 The Adapter maps explicit `FLASH_ATTN` selection to the Plugin backend class.
 It contains no FlashAttention numerical logic and does not import the Plugin
@@ -53,8 +56,8 @@ at bootstrap time.
 
 - Target release line: vLLM `>=0.32.0,<0.33.0`; no exact wheel lock.
 - Final validation keeps Graph enabled; eager is diagnostic only.
-- Initial supported path is BF16/FP16, LBHNC, 64-token pages, single-card
-  dense MHA/GQA, and the vendor varlen ABI.
+- The supported path is BF16/FP16, head size 64/128/192/256, LBHNC or LBNHC,
+  64-token pages, single-card dense MHA/GQA, and the vendor varlen ABI.
 - FP8 KV, DCP, hybrid caches, long-prefix reuse, and performance promotion are
   not implied until their own matrix rows pass.
 - The Adapter change must remain a class-path routing seam only.
@@ -64,8 +67,9 @@ at bootstrap time.
 ## Success criteria
 
 1. Portable tests prove default vLLM seams preserve existing packed views.
-2. Plugin tests prove dense K/V views do not overlap, preserve block stride,
-   and reject active unsupported FA4 features.
+2. Plugin tests prove LBHNC and LBNHC dense K/V views do not overlap, preserve
+   block stride, map to the right vendor layout, and reject active unsupported
+   FA4 features.
 3. Live writer-to-reader probes match a Torch reference for prefill and
    decode, including changing-input Graph replay.
 4. `/model/Qwen2-0.5B-Instruct` starts with explicit FLASH_ATTN and Graph,

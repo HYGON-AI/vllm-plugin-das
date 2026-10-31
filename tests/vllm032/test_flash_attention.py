@@ -19,6 +19,7 @@ def load_flash_attention(
     monkeypatch: pytest.MonkeyPatch,
     *,
     with_vllm_seams: bool = True,
+    kv_cache_layout: str = "LBHNC",
 ):
     class FlashAttentionImpl:
         supports_dcp = True
@@ -51,9 +52,17 @@ def load_flash_attention(
     official.FlashAttentionImpl = FlashAttentionImpl
     official.FlashAttentionBackend = FlashAttentionBackend
     layouts = ModuleType("vllm.v1.kv_cache_layout")
-    layouts.KVCacheLayout = SimpleNamespace(LBHNC="LBHNC")
+    layouts.KVCacheLayout = SimpleNamespace(LBHNC="LBHNC", LBNHC="LBNHC")
+    config = ModuleType("vllm.config")
+    cache_config = SimpleNamespace(
+        get_resolved_kv_cache_layout=lambda: kv_cache_layout
+    )
+    config.get_current_vllm_config_or_none = lambda: SimpleNamespace(
+        cache_config=cache_config
+    )
     for name, module in (
         ("vllm", vllm),
+        ("vllm.config", config),
         ("vllm.v1", v1),
         ("vllm.v1.attention", attention),
         ("vllm.v1.attention.backends", backends),
@@ -74,8 +83,36 @@ def test_import_rejects_vllm_without_required_flash_attention_seams(monkeypatch)
         load_flash_attention(monkeypatch, with_vllm_seams=False)
 
 
-def test_dense_hnd_views_separate_kv_and_preserve_block_stride(monkeypatch):
-    flash = load_flash_attention(monkeypatch)
+@pytest.mark.parametrize(
+    (
+        "layout",
+        "packed_inner_strides",
+        "read_shape",
+        "read_inner_strides",
+    ),
+    (
+        (
+            "LBHNC",
+            lambda h, n, d: (n * 2 * d, 2 * d, 1),
+            lambda b, h, n, d: (b, h, n, d),
+            lambda h, n, d: (n * d, d, 1),
+        ),
+        (
+            "LBNHC",
+            lambda h, n, d: (2 * d, h * 2 * d, 1),
+            lambda b, h, n, d: (b, n, h, d),
+            lambda h, n, d: (h * d, d, 1),
+        ),
+    ),
+)
+def test_dense_views_separate_kv_and_preserve_block_stride(
+    monkeypatch,
+    layout,
+    packed_inner_strides,
+    read_shape,
+    read_inner_strides,
+):
+    flash = load_flash_attention(monkeypatch, kv_cache_layout=layout)
     num_blocks, num_heads, block_size, head_size = 2, 3, 4, 5
     half_page = num_heads * block_size * head_size
     block_stride = 2 * half_page + 17
@@ -84,28 +121,26 @@ def test_dense_hnd_views_separate_kv_and_preserve_block_stride(monkeypatch):
     packed = torch.as_strided(
         raw,
         size=(num_blocks, num_heads, block_size, 2 * head_size),
-        stride=(block_stride, block_size * 2 * head_size, 2 * head_size, 1),
+        stride=(
+            block_stride,
+            *packed_inner_strides(num_heads, block_size, head_size),
+        ),
         storage_offset=storage_offset,
     )
 
-    key, value = flash._dense_hnd_kv_cache_views(packed, head_size)
     impl = flash.HcuFlashAttentionImpl()
     impl.head_size = head_size
+    key, value = impl._get_kv_cache_views(packed)
     write_key, write_value = impl._get_kv_cache_write_views(packed)
     key.fill_(11)
     value.fill_(22)
 
-    assert key.shape == value.shape == (
-        num_blocks,
-        num_heads,
-        block_size,
-        head_size,
+    assert key.shape == value.shape == read_shape(
+        num_blocks, num_heads, block_size, head_size
     )
     assert key.stride() == value.stride() == (
         block_stride,
-        block_size * head_size,
-        head_size,
-        1,
+        *read_inner_strides(num_heads, block_size, head_size),
     )
     assert key.storage_offset() == storage_offset
     assert value.storage_offset() == storage_offset + half_page
@@ -115,8 +150,10 @@ def test_dense_hnd_views_separate_kv_and_preserve_block_stride(monkeypatch):
         num_heads,
         head_size,
     )
-    assert write_key.stride() == key.transpose(1, 2).stride()
-    assert write_value.stride() == value.transpose(1, 2).stride()
+    expected_write_key = key.transpose(1, 2) if layout == "LBHNC" else key
+    expected_write_value = value.transpose(1, 2) if layout == "LBHNC" else value
+    assert write_key.stride() == expected_write_key.stride()
+    assert write_value.stride() == expected_write_value.stride()
     torch.testing.assert_close(
         raw[storage_offset : storage_offset + half_page],
         torch.full((half_page,), 11.0),
@@ -147,7 +184,7 @@ def test_dense_hnd_views_separate_kv_and_preserve_block_stride(monkeypatch):
     )
 
 
-def test_backend_selects_fa2_hnd_layout_and_64_token_pages(monkeypatch):
+def test_backend_selects_fa2_dual_layout_and_64_token_pages(monkeypatch):
     flash = load_flash_attention(monkeypatch)
 
     impl = flash.HcuFlashAttentionImpl()
@@ -156,6 +193,7 @@ def test_backend_selects_fa2_hnd_layout_and_64_token_pages(monkeypatch):
     assert flash.HcuFlashAttentionBackend.get_impl_cls() is type(impl)
     assert flash.HcuFlashAttentionBackend.supported_kv_cache_layouts() == (
         "LBHNC",
+        "LBNHC",
     )
     assert flash.HcuFlashAttentionBackend.get_supported_kernel_block_sizes() == [64]
     assert flash.HcuFlashAttentionBackend.get_preferred_block_size(16) == 64
@@ -178,8 +216,30 @@ def test_backend_selects_fa2_hnd_layout_and_64_token_pages(monkeypatch):
     assert flash.HcuFlashAttentionBackend.supports_batch_invariance() is False
 
 
-def test_varlen_boundary_forwards_fa2_keywords_without_fa4_options(monkeypatch):
+@pytest.mark.parametrize("head_size", (64, 128, 192, 256))
+def test_backend_accepts_vendor_supported_head_sizes(monkeypatch, head_size):
     flash = load_flash_attention(monkeypatch)
+
+    assert flash.HcuFlashAttentionBackend.supports_head_size(head_size) is True
+
+
+@pytest.mark.parametrize("head_size", (8, 32, 80, 96, 264))
+def test_backend_rejects_vendor_unsupported_head_sizes(monkeypatch, head_size):
+    flash = load_flash_attention(monkeypatch)
+
+    assert flash.HcuFlashAttentionBackend.supports_head_size(head_size) is False
+
+
+@pytest.mark.parametrize(
+    ("kv_cache_layout", "kernel_layout"),
+    (("LBHNC", "bhsd"), ("LBNHC", "bshd")),
+)
+def test_varlen_boundary_forwards_fa2_keywords_without_fa4_options(
+    monkeypatch, kv_cache_layout, kernel_layout
+):
+    flash = load_flash_attention(
+        monkeypatch, kv_cache_layout=kv_cache_layout
+    )
     calls = []
 
     def vendor(**kwargs):
@@ -208,10 +268,57 @@ def test_varlen_boundary_forwards_fa2_keywords_without_fa4_options(monkeypatch):
             "v": "v",
             "out": "out",
             "num_splits": 3,
-            "layout": "bhsd",
+            "layout": kernel_layout,
             "fa_version": 2,
         }
     ]
+
+
+def test_layout_selection_uses_resolved_config_when_geometry_is_ambiguous(
+    monkeypatch,
+):
+    flash = load_flash_attention(monkeypatch, kv_cache_layout="LBNHC")
+    calls = []
+    monkeypatch.setattr(
+        flash,
+        "_vendor_varlen_func",
+        lambda: lambda **kwargs: calls.append(kwargs),
+    )
+    impl = flash.HcuFlashAttentionImpl()
+    impl.head_size = 8
+    packed = torch.empty_strided(
+        (1, 4, 4, 16),
+        (256, 16, 64, 1),
+    )
+
+    key, _ = impl._get_kv_cache_views(packed)
+    impl._run_flash_attention(q="q", k=key, v=key)
+
+    assert key.shape == (1, 4, 4, 8)
+    assert key.stride() == (256, 32, 8, 1)
+    assert calls[0]["layout"] == "bshd"
+
+
+def test_resolved_layout_rejects_other_layout_strides(monkeypatch):
+    flash = load_flash_attention(monkeypatch, kv_cache_layout="LBHNC")
+    impl = flash.HcuFlashAttentionImpl()
+    impl.head_size = 8
+    nhd_packed = torch.empty_strided(
+        (1, 4, 4, 16),
+        (256, 16, 64, 1),
+    )
+
+    with pytest.raises(ValueError, match="strides do not match resolved layout"):
+        impl._get_kv_cache_views(nhd_packed)
+
+
+def test_unknown_resolved_layout_fails_closed(monkeypatch):
+    flash = load_flash_attention(monkeypatch, kv_cache_layout="LHBNC")
+    impl = flash.HcuFlashAttentionImpl()
+    impl.head_size = 8
+
+    with pytest.raises(ValueError, match="unsupported resolved KV cache layout"):
+        impl._get_kv_cache_views(torch.empty(1, 1, 1, 16))
 
 
 def test_varlen_boundary_avoids_vendor_short_prefill_mtp_misclassification(
