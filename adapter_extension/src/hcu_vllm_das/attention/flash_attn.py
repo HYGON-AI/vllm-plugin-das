@@ -275,6 +275,15 @@ class HcuFlashAttentionImpl(FlashAttentionImpl):
             kwargs["k"] = _e5m2_byte_view(kwargs["k"])
             kwargs["v"] = _e5m2_byte_view(kwargs["v"])
         kwargs["fa_version"] = 2
+        if (
+            self.kv_cache_dtype == _E5M2_KV_CACHE_DTYPE
+            and kwargs.get("block_table") is not None
+            and isinstance(max_query_len, int)
+            and max_query_len >= 1
+        ):
+            from hcu_vllm_das.attention.e5m2_scales import run_e5m2_attention
+
+            return run_e5m2_attention(_vendor_varlen_func(), kwargs)
         return _vendor_varlen_func()(**kwargs)
 
 
