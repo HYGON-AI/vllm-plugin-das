@@ -5,6 +5,34 @@ This candidate adds two decode providers at the imported aliases of official
 the review branch is based on its commit `057bf829`. It does not enable RMS.
 The provider defaults OFF and has not passed a performance acceptance gate.
 
+## Publication-failure revision
+
+The follow-up based on published PR325 `19db5e0` additionally requires Adapter's
+public `ExtensionCommitError`, `is_fatal_extension_error(error)` and read-only
+`require_runtime_healthy()` ABI. The minimal Adapter candidate is `60efffb`
+on PR17; these interfaces call no model-load API and do not require PR19.
+Compatibility is checked by public callable shapes, without an exact wheel pin.
+
+Before publication, the owner validates compile-factor ownership/policy, the
+oracle install callable, and requested FLA provider/alias compatibility. Missing
+required FLA fails cleanly before factor or alias publication; a clean optional
+preparation error retains the official baseline and later owners may run.
+Preparation is not a reservation: installation rechecks current state.
+
+The first compile-factor registration is a shared-state commit boundary. Every
+exception thereafter, including interrupted activation, raises the public fatal
+signal. Adapter stops later owners, preserves actual reports and latches its
+runtime. Plugin also keeps its own failure across direct retries and fork.
+Removing the original error, changing flags or resetting reports cannot heal
+this process. No generic rollback of Torch ops, classes, aliases or factors is
+claimed; use a fresh process. Health is queried before acquiring the owner lock.
+
+This follow-up changes preparation and failure control flow; its historical
+GPU/model/performance results below belong to the frozen artifacts listed there.
+CPU fixture mount markers are not evidence of native FLA execution. New source,
+wheel, installed discovery and affected hardware results must be recorded for
+the new artifacts separately before promotion.
+
 ## Ownership and behavior
 
 Adapter retains the platform and general-plugin lifecycle. The extension

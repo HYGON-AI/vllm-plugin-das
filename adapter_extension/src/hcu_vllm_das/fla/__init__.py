@@ -12,6 +12,8 @@ from .provider import (
     effective_compile_factor,
     install,
     is_requested,
+    preflight_compile_factors,
+    preflight_install,
     register_compile_factors,
     uninstall,
 )
@@ -22,6 +24,8 @@ __all__ = [
     "effective_compile_factor",
     "install",
     "is_requested",
+    "preflight_compile_factors",
+    "preflight_install",
     "register_compile_factors",
     "uninstall",
 ]

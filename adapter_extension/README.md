@@ -24,6 +24,12 @@ operator, so the plugin neither registers nor ships a `SiluAndMul` override.
 No model, topology, FP8-KV, or broad performance support is implied by these
 operator-level capabilities.
 
+Activation requires Adapter's public commit-fatal signal, classifier and
+read-only runtime-health query. This failure protocol is independent of PR19
+model-load hooks. Clean preparation errors may remain optional; a failure after
+shared publication stops activation and requires a fresh process, without a
+rollback or retry guarantee. See the [publication-failure contract](../docs/validation/vllm032-fla-decode.md#publication-failure-revision).
+
 ## Optional Qwen GDN decode
 
 Set both `VLLM_HCU_USE_CUSTOM_OPS=1` and

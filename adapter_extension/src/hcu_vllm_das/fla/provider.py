@@ -90,13 +90,15 @@ def _batch_invariant() -> bool:
     return bool(getattr(_envs, "VLLM_BATCH_INVARIANT", False))
 
 
-def is_requested() -> bool:
+def is_requested(vllm_envs=None) -> bool:
     """Read the effective opt-in policy without importing providers or hardware.
 
     Register compile factors first so vLLM's batch-invariant policy is visible.
     This expresses intent, not evidence that a provider has been mounted.
     """
-    return _enabled() and not _batch_invariant()
+    batch_invariant = (_batch_invariant() if vllm_envs is None else
+                       bool(getattr(vllm_envs, "VLLM_BATCH_INVARIANT", False)))
+    return _enabled() and not batch_invariant
 
 
 def effective_compile_factor() -> str:
@@ -127,6 +129,22 @@ def effective_compile_factor() -> str:
     return json.dumps(policy, sort_keys=True, separators=(",", ":"))
 
 
+def preflight_compile_factors(vllm_envs: ModuleType) -> None:
+    """Pure registry/policy validation; does not bind envs or install aliases."""
+    with _lock:
+        registry = getattr(vllm_envs, "environment_variables", None)
+        if not isinstance(registry, dict) or not callable(getattr(vllm_envs, "compile_factors", None)):
+            raise FlaInstallError("vLLM compile-factor registry is unavailable")
+        if getattr(vllm_envs, "_is_envs_cache_enabled", lambda: False)():
+            raise FlaInstallError("register FLA factors before vLLM caches env values")
+        previous = registry.get(COMPILE_FACTOR)
+        if previous is not None and previous is not effective_compile_factor:
+            raise FlaInstallError("FLA compile factor has another owner")
+        if _envs is not None and _envs is not vllm_envs:
+            raise FlaInstallError("FLA factors are already bound to another env module")
+        _enabled()
+
+
 def register_compile_factors(vllm_envs: ModuleType) -> None:
     """Explicit integration hook; call in every process before any cache lookup.
 
@@ -135,21 +153,8 @@ def register_compile_factors(vllm_envs: ModuleType) -> None:
     """
     global _envs
     with _lock:
-        registry = getattr(vllm_envs, "environment_variables", None)
-        if not isinstance(registry, dict) or not callable(
-            getattr(vllm_envs, "compile_factors", None)
-        ):
-            raise FlaInstallError("vLLM compile-factor registry is unavailable")
-        cached = getattr(vllm_envs, "_is_envs_cache_enabled", lambda: False)
-        if cached():
-            raise FlaInstallError("register FLA factors before vLLM caches env values")
-        previous = registry.get(COMPILE_FACTOR)
-        if previous is not None and previous is not effective_compile_factor:
-            raise FlaInstallError("FLA compile factor has another owner")
-        if _envs is not None and _envs is not vllm_envs:
-            raise FlaInstallError("FLA factors are already bound to another env module")
-        _enabled()  # Reject invalid activation settings before registration.
-        registry[COMPILE_FACTOR] = effective_compile_factor
+        preflight_compile_factors(vllm_envs)
+        vllm_envs.environment_variables[COMPILE_FACTOR] = effective_compile_factor
         _envs = vllm_envs
 
 
@@ -360,6 +365,43 @@ def _make_wrappers(originals: dict, providers: dict) -> dict:
     return {PACKED: packed, SIGMOID: sigmoid}
 
 
+def _prepare_install(vllm_envs, architecture):
+    if not is_requested(vllm_envs):
+        return None
+    if architecture not in _ARCHES:
+        return None
+    if _installation is not None:
+        if architecture != _installation.identity["architecture"] or any(
+            getattr(_installation.consumer, name) is not wrapper
+            for name, wrapper in _installation.wrappers.items()
+        ):
+            raise FlaInstallError("FLA alias ownership or architecture changed")
+        return _installation
+    try:
+        module = import_module("boltops.fla.gdn")
+        providers = {name: getattr(module, name) for name in _CONTRACTS}
+    except (ImportError, AttributeError):
+        return None
+    if not all(_signature_matches(fn, name, vendor=True) for name, fn in providers.items()):
+        return None
+    originals = {name: getattr(import_module(owner), name) for name, owner in _OWNERS.items()}
+    if not all(_signature_matches(fn, name, vendor=False) for name, fn in originals.items()):
+        raise FlaInstallError("official GDN function signature changed; review mount")
+    consumer = import_module(CONSUMER)
+    if any(getattr(consumer, name, None) is not fn for name, fn in originals.items()):
+        raise FlaInstallError("Qwen GDN aliases have another owner; refusing replacement")
+    identity = _provider_identity(module, providers, architecture)
+    wrappers = _make_wrappers(originals, providers)
+    return _Installation(consumer, originals, wrappers, identity)
+
+
+def preflight_install(vllm_envs, *, architecture: str | None = None) -> bool:
+    """Validate requested aliases/provider ABI without publishing any changes."""
+    with _lock:
+        preflight_compile_factors(vllm_envs)
+        return _prepare_install(vllm_envs, architecture) is not None
+
+
 def install(*, architecture: str | None = None) -> bool:
     """Mount both aliases atomically, after explicit opt-in/capability preflight.
 
@@ -374,33 +416,13 @@ def install(*, architecture: str | None = None) -> bool:
     with _lock:
         if _envs is None or _envs.environment_variables.get(COMPILE_FACTOR) is not effective_compile_factor:
             raise FlaInstallError("register FLA compile factors before install/cache lookup")
-        if architecture not in _ARCHES:
+        preflight_compile_factors(_envs)
+        plan = _prepare_install(_envs, architecture)
+        if plan is None:
             return False
-        if _installation is not None:
-            if architecture != _installation.identity["architecture"] or any(
-                getattr(_installation.consumer, name) is not wrapper
-                for name, wrapper in _installation.wrappers.items()
-            ):
-                raise FlaInstallError("FLA alias ownership or architecture changed")
-            return True
-        try:
-            module = import_module("boltops.fla.gdn")
-            providers = {name: getattr(module, name) for name in _CONTRACTS}
-        except (ImportError, AttributeError):
-            return False
-        if not all(_signature_matches(fn, name, vendor=True) for name, fn in providers.items()):
-            return False
-        originals = {name: getattr(import_module(owner), name) for name, owner in _OWNERS.items()}
-        if not all(_signature_matches(fn, name, vendor=False) for name, fn in originals.items()):
-            raise FlaInstallError("official GDN function signature changed; review mount")
-        consumer = import_module(CONSUMER)
-        if any(getattr(consumer, name, None) is not fn for name, fn in originals.items()):
-            raise FlaInstallError("Qwen GDN aliases have another owner; refusing replacement")
-        identity = _provider_identity(module, providers, architecture)
-        wrappers = _make_wrappers(originals, providers)
-        for name, wrapper in wrappers.items():
-            setattr(consumer, name, wrapper)
-        _installation = _Installation(consumer, originals, wrappers, identity)
+        for name, wrapper in plan.wrappers.items():
+            setattr(plan.consumer, name, wrapper)
+        _installation = plan
         return True
 
 

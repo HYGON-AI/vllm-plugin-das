@@ -17,6 +17,7 @@ PLUGIN_SOURCE_ROOT = (
 sys.path.insert(0, os.fspath(PLUGIN_SOURCE_ROOT))
 
 from hcu_adapter.extensions import (
+    ExtensionCommitError,
     ExtensionContext,
     ExtensionSpec,
     ExtensionStatus,
@@ -41,6 +42,8 @@ def context(
 @pytest.fixture(autouse=True)
 def reset_activation(monkeypatch: pytest.MonkeyPatch):
     monkeypatch.setattr(extension, "_activated", False)
+    monkeypatch.setattr(extension, "_commit_failure", None)
+    monkeypatch.setattr(extension, "_committing_error_type", None)
 
 
 def successful_importer(calls: list[str]):
@@ -52,11 +55,19 @@ def successful_importer(calls: list[str]):
         install_result = True
 
         @staticmethod
+        def preflight_compile_factors(envs):
+            return None
+
+        @classmethod
+        def preflight_install(cls, envs, *, architecture):
+            return cls.install_result
+
+        @staticmethod
         def register_compile_factors(envs):
             lifecycle.append(("register", envs))
 
         @classmethod
-        def is_requested(cls):
+        def is_requested(cls, envs=None):
             lifecycle.append(("requested",))
             return cls.requested
 
@@ -155,7 +166,9 @@ def successful_importer(calls: list[str]):
         "hcu_vllm_das.rms_norm": SimpleNamespace(),
         "hcu_vllm_das.moe.int8_oracle": Int8Oracle,
         "hcu_vllm_das.fla": FlaProvider,
-        "hcu_adapter.bridges.vllm": SimpleNamespace(detect_hcu=detect_hcu),
+        "hcu_adapter.extensions": __import__("hcu_adapter.extensions", fromlist=["extensions"]),
+        "hcu_adapter.bridges.vllm": SimpleNamespace(
+            detect_hcu=detect_hcu, require_runtime_healthy=lambda: None),
     }
 
     def import_module(name: str):
@@ -266,15 +279,15 @@ def test_activation_accepts_the_vllm_032_release_line(
 
     extension.activate_extension(context(version))
 
-    assert calls == [
+    assert [name for name in calls if not name.startswith("hcu_adapter.")] == [
         "lightop.norm",
         "aiter.moe",
         "vllm.model_executor.layers.layernorm",
         "vllm.utils.torch_utils",
         "vllm.envs",
         "hcu_vllm_das.fla",
-        "hcu_vllm_das.rms_norm",
         "hcu_vllm_das.moe.int8_oracle",
+        "hcu_vllm_das.rms_norm",
     ]
 
 
@@ -486,15 +499,15 @@ def test_repeated_and_concurrent_activation_registers_capability_once(
     assert calls.count("hcu_vllm_das.rms_norm") == 1
     assert calls.count("hcu_vllm_das.moe.int8_oracle") == 1
     assert importer.int8_oracle.installs == 1
-    assert calls == [
+    assert [name for name in calls if not name.startswith("hcu_adapter.")] == [
         "lightop.norm",
         "aiter.moe",
         "vllm.model_executor.layers.layernorm",
         "vllm.utils.torch_utils",
         "vllm.envs",
         "hcu_vllm_das.fla",
-        "hcu_vllm_das.rms_norm",
         "hcu_vllm_das.moe.int8_oracle",
+        "hcu_vllm_das.rms_norm",
     ]
 
 
@@ -524,7 +537,6 @@ def test_fla_default_off_registers_real_factor_without_provider_or_detection(
     policy = json.loads(envs.environment_variables[fla.COMPILE_FACTOR]())
     assert policy["route"] == "official" and not policy["mounted"]
     assert not fla.is_requested()
-    assert "hcu_adapter.bridges.vllm" not in calls
     assert importer.lifecycle == []
 
 
@@ -544,8 +556,8 @@ def test_fla_registers_then_detects_real_architecture_before_install(
     extension.activate_extension(ctx)
 
     assert importer.lifecycle == [
-        ("register", importer.modules["vllm.envs"]),
-        ("requested",), ("detect",), ("install", architecture),
+        ("requested",), ("detect",),
+        ("register", importer.modules["vllm.envs"]), ("install", architecture),
     ]
     assert importer.fla.mounted and extension._activated
 
@@ -576,9 +588,9 @@ def test_unmounted_fla_is_optional_but_required_capability_fails(
         assert reports[0].status is ExtensionStatus.ACTIVE
         assert extension._activated
     assert not importer.fla.mounted
-    assert ("hcu_adapter.bridges.vllm" in calls) == (failure != "off")
+    assert (("detect",) in importer.lifecycle) == (failure != "off")
     installs = [event for event in importer.lifecycle if event[0] == "install"]
-    assert len(installs) == (failure == "provider-unavailable")
+    assert installs == []  # Unsupported providers are rejected during preparation.
 
 
 @pytest.mark.parametrize("stage", ["register", "detect", "install"])
@@ -600,7 +612,8 @@ def test_fla_activation_errors_propagate_without_marking_success(
         monkeypatch.setattr(importer.fla, name, fail)
     monkeypatch.setattr(extension, "_import_module", importer)
 
-    with pytest.raises(extension.DasExtensionError, match=f"FLA {stage} failed") as error:
+    error_type = extension.DasExtensionError if stage == "detect" else ExtensionCommitError
+    with pytest.raises(error_type, match=f"FLA {stage} failed") as error:
         extension.activate_extension(context())
 
     assert error.value.__cause__ is failure
@@ -643,7 +656,7 @@ def test_required_fla_activation_is_idempotent_under_concurrency(
         tuple(pool.map(extension.activate_extension, [context(required_fla=True)] * 32))
 
     assert importer.lifecycle == [
-        ("register", importer.modules["vllm.envs"]),
-        ("requested",), ("detect",), ("install", "gfx936"),
+        ("requested",), ("detect",),
+        ("register", importer.modules["vllm.envs"]), ("install", "gfx936"),
     ]
     assert importer.int8_oracle.installs == 1

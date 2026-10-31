@@ -40,6 +40,19 @@ def rms_norm_enabled() -> bool:
     return master_enabled and child_enabled
 
 
+def preflight_compile_factors(vllm_envs: object) -> None:
+    """Check registry ownership and policy without publishing a getter."""
+    registry = getattr(vllm_envs, "environment_variables", None)
+    if not isinstance(registry, dict) or not callable(getattr(vllm_envs, "compile_factors", None)):
+        raise RuntimeError("vLLM environment compile-factor registry is unavailable")
+    if getattr(vllm_envs, "_is_envs_cache_enabled", lambda: False)():
+        raise RuntimeError("register RMS factors before vLLM caches env values")
+    existing = registry.get(_RMS_NORM_COMPILE_FACTOR)
+    if existing is not None and existing is not rms_norm_enabled:
+        raise RuntimeError("HCU RMSNorm compile factor already has another owner")
+    rms_norm_enabled()
+
+
 def register_compile_factors(vllm_envs: object) -> None:
     """Include effective RMS policy in vLLM's normal and AOT cache keys.
 
@@ -48,15 +61,8 @@ def register_compile_factors(vllm_envs: object) -> None:
     the two raw switches alone would unnecessarily split those cache entries.
     This registration must happen before model construction or AOT loading.
     """
-    registry = getattr(vllm_envs, "environment_variables", None)
-    if not isinstance(registry, dict) or not callable(
-        getattr(vllm_envs, "compile_factors", None)
-    ):
-        raise RuntimeError("vLLM environment compile-factor registry is unavailable")
-    existing = registry.get(_RMS_NORM_COMPILE_FACTOR)
-    if existing is not None and existing is not rms_norm_enabled:
-        raise RuntimeError("HCU RMSNorm compile factor already has another owner")
-    registry[_RMS_NORM_COMPILE_FACTOR] = rms_norm_enabled
+    preflight_compile_factors(vllm_envs)
+    vllm_envs.environment_variables[_RMS_NORM_COMPILE_FACTOR] = rms_norm_enabled
 
 
-__all__ = ["custom_ops_enabled", "rms_norm_enabled", "register_compile_factors"]
+__all__ = ["custom_ops_enabled", "rms_norm_enabled", "preflight_compile_factors", "register_compile_factors"]
