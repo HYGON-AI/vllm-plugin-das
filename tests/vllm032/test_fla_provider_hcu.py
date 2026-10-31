@@ -255,10 +255,10 @@ class Runtime:
     def integer(self, values):
         return self.t.tensor(values, dtype=self.t.int32, device=self.device)
 
-    def make(self, name, hk, hv, *, batch=4, mode="varlen", wave=0):
+    def make(self, name, hk, hv, *, batch=4, mode="varlen", wave=0, bias_dtype="float32"):
         t = self.t
         common = dict(A_log=self.rand((hv,), t.float32) - 1.5,
-                      dt_bias=self.rand((hv,), t.float32),
+                      dt_bias=self.rand((hv,), getattr(t, bias_dtype)),
                       initial_state=self.rand((SLOTS, hv, DIM, DIM), t.float32, 0.05),
                       scale=DIM**-0.5, use_qk_l2norm_in_kernel=True)
         if mode == "pool":
@@ -541,11 +541,12 @@ def test_sigmoid_native_matches_official_state_alias_mtp_varlen(runtime, hk, hv,
 
 @pytest.mark.parametrize("hk,hv", GEOMETRIES)
 @pytest.mark.parametrize("entry", ["packed", "sigmoid"])
-@pytest.mark.parametrize("offset", [0, 37], ids=["padded-slot", "padded-slot-offset"])
-def test_slot_pitched_state_native_preserves_storage_offset_and_padding(runtime, hk, hv, entry, offset):
+@pytest.mark.parametrize("offset", [0, 37, 18432], ids=["padded-slot", "padded-slot-offset", "model-offset"])
+@pytest.mark.parametrize("bias_dtype", ["float32", "bfloat16"])
+def test_slot_pitched_state_native_preserves_storage_offset_and_padding(runtime, hk, hv, entry, offset, bias_dtype):
     rt = runtime
     name = rt.p.PACKED if entry == "packed" else rt.p.SIGMOID
-    base = rt.pad_state(rt.make(name, hk, hv, mode="pool"), offset=offset)
+    base = rt.pad_state(rt.make(name, hk, hv, mode="pool", bias_dtype=bias_dtype), offset=offset)
     reference = rt.oracle(base)
     official, vendor = rt.clone(base), rt.clone(base)
     before = base.state_backing.clone()
@@ -556,7 +557,7 @@ def test_slot_pitched_state_native_preserves_storage_offset_and_padding(runtime,
               rt.compare(base, b, reference, label="provider-slot-pitch-vs-physical")]
     padding = [rt.check_state_padding(case, before, label=label)
                for case, label in [(official, "official"), (vendor, "provider")]]
-    record("slot_pitched_native_pass", entry=entry, hk=hk, hv=hv, dim=DIM,
+    record("slot_pitched_native_pass", entry=entry, hk=hk, hv=hv, dim=DIM, bias_dtype=bias_dtype,
            checks=checks, padding=padding, provider_vs_official=pair,
            kernel=rt.launched[-1], aliases=True)
 
@@ -577,10 +578,11 @@ def capture(rt, case, *, vendor):
 
 @pytest.mark.parametrize("hk,hv", GEOMETRIES)
 @pytest.mark.parametrize("entry", ["packed", "sigmoid"])
-def test_slot_pitched_state_graph_same_addresses_offset_padding_all_waves(runtime, hk, hv, entry):
+@pytest.mark.parametrize("bias_dtype", ["float32", "bfloat16"])
+def test_slot_pitched_state_graph_same_addresses_offset_padding_all_waves(runtime, hk, hv, entry, bias_dtype):
     rt = runtime
     name = rt.p.PACKED if entry == "packed" else rt.p.SIGMOID
-    base = rt.pad_state(rt.make(name, hk, hv, mode="pool"), offset=37)
+    base = rt.pad_state(rt.make(name, hk, hv, mode="pool", bias_dtype=bias_dtype), offset=18432)
     official, vendor = rt.clone(base), rt.clone(base)
     before = base.state_backing.clone()
     reference_graph, reference_out = capture(rt, official, vendor=False)
@@ -591,7 +593,7 @@ def test_slot_pitched_state_graph_same_addresses_offset_padding_all_waves(runtim
     output_pointers = [result[0].data_ptr() for result in (reference_out, provider_out)]
     waves, digests = [], []
     for wave in range(8):
-        fresh = rt.pad_state(rt.make(name, hk, hv, mode="pool", wave=wave), offset=37)
+        fresh = rt.pad_state(rt.make(name, hk, hv, mode="pool", wave=wave, bias_dtype=bias_dtype), offset=18432)
         expected = rt.oracle(fresh)
         rt.update(official, fresh)
         rt.update(vendor, fresh)
@@ -613,7 +615,7 @@ def test_slot_pitched_state_graph_same_addresses_offset_padding_all_waves(runtim
                       "accepted": fresh.accepted, "checks": checks, "padding": padding,
                       "provider_vs_official": pair})
     assert len(set(digests)) == len(digests)
-    record("slot_pitched_graph_pass", entry=entry, hk=hk, hv=hv, dim=DIM,
+    record("slot_pitched_graph_pass", entry=entry, hk=hk, hv=hv, dim=DIM, bias_dtype=bias_dtype,
            capture_padding=capture_padding, waves=waves, kernel=rt.launched[-1],
            input_addresses_stable=True, output_address_stable=True, output_digests=digests)
 

@@ -6,7 +6,8 @@ Retire this mount when upstream provides per-function registration or a native
 HCU route. Install/uninstall and flags must be settled before model compilation;
 uninstall restores Python aliases, not already compiled or captured graphs.
 
-The conservative envelope is BF16 activations, FP32 state/parameters, K=V=128,
+The conservative envelope is BF16 activations, FP32 state/A_log, BF16 or FP32
+dt_bias, K=V=128,
 indexed in-place GDN (not KDA), and the vendor's unsplit grid limit. All gates
 inspect metadata only. Numerical, NULL/padded-slot, MTP and changed-input Graph
 validation on real tensors is still required; CPU contract tests are not that
@@ -189,7 +190,7 @@ def _provider_identity(module: ModuleType, functions: dict, architecture: str) -
         "architecture": architecture,
         "boundary": CONSUMER,
         "null_state_index": 0,
-        "envelope": "bf16-fp32-k128-v128-indexed-inplace-gdn-grid65535-slot-pitch-v2",
+        "envelope": "bf16-fp32-k128-v128-indexed-inplace-gdn-grid65535-slot-pitch-bf16-bias-v3",
         "provider": files,
         "public_module": _file_hash(Path(module.__file__)),
         "adapter": _file_hash(Path(__file__)),
@@ -275,7 +276,10 @@ def _packed_supported(x, a, b, A_log, dt_bias, scale, state, out, indices, norm)
         and _dtype(x) == _dtype(out) == "torch.bfloat16"
         and _dtype(a) in {"torch.bfloat16", "torch.float32"}
         and _dtype(b) == _dtype(a)
-        and all(_dtype(t) == "torch.float32" for t in (A_log, dt_bias, state))
+        and all(_dtype(t) == "torch.float32" for t in (A_log, state))
+        # Both public kernels load dt_bias in its own dtype and promote to FP32.
+        # Official Qwen GDN keeps this parameter in the model's BF16 dtype.
+        and _dtype(dt_bias) in {"torch.bfloat16", "torch.float32"}
         and all(_row_contiguous(t) for t in (x, a, b))
         and all(_contiguous(t) for t in (A_log, dt_bias, out))
         and _state_slot_pitched(state)
@@ -322,7 +326,8 @@ def _sigmoid_supported(A_log, a, b, dt_bias, q, k, v, beta, threshold, scale,
         and _shape(a) in ((batch * tokens, hv), (batch, tokens, hv))
         and _shape(b) == _shape(a)
         and _shape(A_log) == _shape(dt_bias) == (hv,)
-        and all(_dtype(t) == "torch.float32" for t in (A_log, dt_bias, state))
+        and all(_dtype(t) == "torch.float32" for t in (A_log, state))
+        and _dtype(dt_bias) in {"torch.bfloat16", "torch.float32"}
         and all(_contiguous(t) for t in (A_log, dt_bias))
         and _state_slot_pitched(state)
         and _positive_scale(beta) and _positive_scale(threshold)

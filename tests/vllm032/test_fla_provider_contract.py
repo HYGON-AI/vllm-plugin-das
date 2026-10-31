@@ -371,9 +371,24 @@ def test_witness_sigmoid_shape_with_slot_pitched_state_selects_provider(runtime,
         cu_seqlens=Tensor((9,), "torch.int32"),
         ssm_state_indices=Tensor((8, 4), "torch.int32"),
         num_accepted_tokens=Tensor((8,), "torch.int32"),
+        dt_bias=Tensor((16,), "torch.bfloat16"),
     )
-    # cu/gates here are valid constructed metadata, not missing witness fields.
+    # Matches the read-only real-worker witness, including BF16 dt_bias.
     assert_forwarded(runtime, runtime.p.SIGMOID, values, "vendor")
+
+
+@pytest.mark.parametrize("entry", ["packed", "sigmoid"])
+@pytest.mark.parametrize("dtype,route", [
+    ("torch.bfloat16", "vendor"), ("torch.float32", "vendor"),
+    ("torch.float16", "official"), ("torch.float64", "official"),
+    ("torch.int32", "official"),
+])
+def test_dt_bias_dtype_envelope_preserves_original_parameter(runtime, monkeypatch, entry, dtype, route):
+    activate(runtime, monkeypatch)
+    values = packed_inputs(hv=16) if entry == "packed" else sigmoid_inputs(hv=16)
+    values["dt_bias"] = Tensor((16,), dtype)
+    key = runtime.p.PACKED if entry == "packed" else runtime.p.SIGMOID
+    assert_forwarded(runtime, key, values, route)
 
 
 @pytest.mark.parametrize("varlen,accepted", [(False, False), (True, True)])
