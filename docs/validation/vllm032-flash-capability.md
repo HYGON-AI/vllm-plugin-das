@@ -30,5 +30,33 @@ Exact clean-review source validation on target `a198423b7`: Plugin55 CPU tests
 passed, Adapter49 bridge/Flash CPU tests passed. Existing Flash tests differ
 from the larger integration candidate; its58/78 counts and installed GPU36
 result are not assigned to this review artifact. Installed and actual CLI
-checks for this exact clean pair remain pending. No full model/quality,
+checks for this exact clean pair are recorded below. No full model/quality,
 Graph device-trace completeness or dirty-host recovery claim is made.
+
+
+Exact clean pair installed validation completed: Plugin55 passed;
+Adapter48 passed/one source-layout test deselected. The initial absolute
+node-id deselection did not match pytest's relative node-id and retained that
+source-only failure; the final runner used the exact test name selection,
+without production changes. Source49 includes this assertion.
+
+Independent wheels bind12 Plugin/194 Adapter Python files and every hashed
+RECORD row;2649 target Python/native files plus parent/child native module
+origins were checked. Plugin wheel SHA256
+`7e6052468f71d543724309fb887510aa68fb98d046de4704b3dfa7fc295ba5e9`;
+Adapter wheel SHA256
+`d5c3abd89bd11751a9079ecf5a5a52e33f9bdfb846b70ebde5b0576c110c77d6`.
+
+The actual installed, unmodified official CLI with real HCU/vendor imports
+passed. Its process-local reports and selector accepted explicit auto/E5M2
+Flash, refused invalid block128, and returned official Triton by default.
+No provider/platform/discovery doubles or GPU/model claims are involved.
+The PR17 baseline does not include the separate required-startup env gate;
+this evidence checks actual reports and selector behavior directly.
+
+With the target and paired wheels installed in an isolated environment,
+run `python tests/tools/check_flash_owner_cli.py /tmp/flash-owner-cli.json`
+from outside production source paths, with empty PYTHONPATH,
+`HCU_ADAPTER_HOST=none`, `VLLM_PLUGINS=hcu_adapter`, actual DTK/HCU library
+settings and one visible HCU. The output path must not already exist.
+The driver observes unmodified official `--help` and the public selector.
