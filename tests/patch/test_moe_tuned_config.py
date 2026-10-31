@@ -4,14 +4,18 @@
 
 AITER owns the concrete vLLM-schema tuning data in ``aiter/configs/vllm_moe``.
 The plugin keeps only the discovery hook that points
-``VLLM_TUNED_CONFIG_FOLDER`` at that package directory.  These tests pin the
-ownership boundary and the target lookup; the tile values themselves are
-validated in AITER's own static test
+``VLLM_TUNED_CONFIG_FOLDER`` at that package directory.  The hook arms the
+folder only when both Step5 aliases carry the final selector-boundary rows; an
+older !406-only table is rejected and vLLM's native fallback remains.  These
+tests pin the ownership boundary, the guard, and the target lookup; the tile
+values themselves are validated in AITER's own static test
 (``op_tests/test_vllm_moe_config_delivery.py``).
 """
 
 from __future__ import annotations
 
+import json
+import logging
 import os
 import subprocess
 import sys
@@ -73,6 +77,60 @@ def _config_table() -> dict[int, dict[str, int]]:
     )
     assert table is not None
     return table
+
+
+OLD_AITER_TABLE_KEYS = (
+    1, 2, 4, 8, 16, 24, 32, 48, 64, 96, 128, 256,
+    512, 1024, 2048, 4096, 8192, 16384, 32768,
+)
+FIXED_AITER_TABLE_KEYS = (
+    1, 2, 4, 8, 16, 24, 32, 48, 64, 96, 128, 256, 257,
+    512, 513, 1024, 2048, 4096, 5675, 5676, 8192, 16384, 32768,
+)
+
+
+def _write_target_tables(
+    root: Path,
+    keys: tuple[int, ...],
+    aliases: tuple[str, ...] = ALIAS_DEVICE_NAMES,
+    *,
+    malformed: bool = False,
+) -> Path:
+    """Create a test-only AITER package with the target Step5 aliases."""
+
+    config_dir = root / "aiter" / "configs" / "vllm_moe"
+    config_dir.mkdir(parents=True)
+    for alias in aliases:
+        path = config_dir / (
+            f"E={DRAFT_MOE_E},N={DRAFT_MOE_N},device_name={alias}.json"
+        )
+        if malformed:
+            path.write_text("{not valid json", encoding="utf-8")
+        else:
+            table = {str(key): {"BLOCK_SIZE_M": 16} for key in keys}
+            path.write_text(json.dumps(table), encoding="utf-8")
+    return config_dir
+
+
+def _fake_aiter_package(
+    monkeypatch,
+    root: Path,
+    keys: tuple[int, ...],
+    aliases: tuple[str, ...] = ALIAS_DEVICE_NAMES,
+    *,
+    malformed: bool = False,
+):
+    """Point the plugin's discovery at a test-only AITER package tree."""
+
+    from vllm_hcu import moe_config_env
+
+    config_dir = _write_target_tables(
+        root, keys, aliases, malformed=malformed
+    )
+    monkeypatch.setattr(
+        moe_config_env, "_aiter_package_dir", lambda: str(root / "aiter")
+    )
+    return moe_config_env, config_dir
 
 
 def test_plugin_no_longer_ships_authoritative_tuned_config():
@@ -282,7 +340,7 @@ def test_an_empty_user_selection_still_arms_the_aiter_configs():
     assert environ[TUNED_CONFIG_FOLDER_ENV] == str(folder)
 
 
-def test_missing_aiter_leaves_vllm_lookup_untouched(monkeypatch):
+def test_missing_aiter_leaves_vllm_lookup_untouched(monkeypatch, caplog):
     """Without AITER the plugin must not substitute a local tuning table."""
 
     from vllm_hcu import moe_config_env
@@ -290,9 +348,112 @@ def test_missing_aiter_leaves_vllm_lookup_untouched(monkeypatch):
     monkeypatch.setattr(moe_config_env, "_aiter_package_dir", lambda: None)
     environ: dict[str, str] = {}
 
-    moe_config_env.configure_tuned_moe_config_folder(environ)
+    with caplog.at_level(
+        logging.WARNING, logger="vllm_hcu.moe_config_env"
+    ):
+        moe_config_env.configure_tuned_moe_config_folder(environ)
 
     assert TUNED_CONFIG_FOLDER_ENV not in environ
+    assert "was not found" in caplog.text
+
+
+def test_old_aiter_table_is_not_armed(monkeypatch, tmp_path, caplog):
+    """An !406-only 19-key table must not be armed."""
+
+    module, _ = _fake_aiter_package(
+        monkeypatch, tmp_path, OLD_AITER_TABLE_KEYS
+    )
+    environ: dict[str, str] = {}
+
+    with caplog.at_level(
+        logging.WARNING, logger="vllm_hcu.moe_config_env"
+    ):
+        module.configure_tuned_moe_config_folder(environ)
+
+    assert TUNED_CONFIG_FOLDER_ENV not in environ
+    assert "selector-boundary contract" in caplog.text
+
+
+def test_fixed_aiter_table_is_armed(monkeypatch, tmp_path):
+    """The !410 23-key table is accepted and armed."""
+
+    module, config_dir = _fake_aiter_package(
+        monkeypatch, tmp_path, FIXED_AITER_TABLE_KEYS
+    )
+    environ: dict[str, str] = {}
+
+    module.configure_tuned_moe_config_folder(environ)
+
+    assert environ[TUNED_CONFIG_FOLDER_ENV] == str(config_dir)
+
+
+def test_incomplete_alias_contract_is_not_armed(monkeypatch, tmp_path, caplog):
+    """Both BW aliases are required; one alias alone is insufficient."""
+
+    module, _ = _fake_aiter_package(
+        monkeypatch,
+        tmp_path,
+        FIXED_AITER_TABLE_KEYS,
+        aliases=(TUNED_DEVICE_NAME,),
+    )
+    environ: dict[str, str] = {}
+
+    with caplog.at_level(
+        logging.WARNING, logger="vllm_hcu.moe_config_env"
+    ):
+        module.configure_tuned_moe_config_folder(environ)
+
+    assert TUNED_CONFIG_FOLDER_ENV not in environ
+    assert "selector-boundary contract" in caplog.text
+
+
+def test_malformed_aiter_table_is_not_armed(monkeypatch, tmp_path, caplog):
+    """A malformed target table must fall back, not crash or arm."""
+
+    module, _ = _fake_aiter_package(
+        monkeypatch, tmp_path, FIXED_AITER_TABLE_KEYS, malformed=True
+    )
+    environ: dict[str, str] = {}
+
+    with caplog.at_level(
+        logging.WARNING, logger="vllm_hcu.moe_config_env"
+    ):
+        module.configure_tuned_moe_config_folder(environ)
+
+    assert TUNED_CONFIG_FOLDER_ENV not in environ
+    assert "selector-boundary contract" in caplog.text
+
+
+def test_user_override_wins_even_with_old_aiter_table(monkeypatch, tmp_path):
+    """An explicit user folder is preserved before any contract check."""
+
+    module, _ = _fake_aiter_package(
+        monkeypatch, tmp_path, OLD_AITER_TABLE_KEYS
+    )
+    environ = {TUNED_CONFIG_FOLDER_ENV: "/opt/user-tuned"}
+
+    module.configure_tuned_moe_config_folder(environ)
+
+    assert environ[TUNED_CONFIG_FOLDER_ENV] == "/opt/user-tuned"
+
+
+def test_empty_selection_with_old_table_is_not_armed(
+    monkeypatch, tmp_path, caplog
+):
+    """An empty value is unset, but an old table is still rejected."""
+
+    module, _ = _fake_aiter_package(
+        monkeypatch, tmp_path, OLD_AITER_TABLE_KEYS
+    )
+    environ = {TUNED_CONFIG_FOLDER_ENV: ""}
+
+    with caplog.at_level(
+        logging.WARNING, logger="vllm_hcu.moe_config_env"
+    ):
+        module.configure_tuned_moe_config_folder(environ)
+
+    assert environ[TUNED_CONFIG_FOLDER_ENV] == ""
+    assert "selector-boundary contract" in caplog.text
 
 
 def test_package_import_arms_the_folder_before_vllm_reads_it():

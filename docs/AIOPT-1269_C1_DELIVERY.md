@@ -33,6 +33,12 @@ that copy and points `VLLM_TUNED_CONFIG_FOLDER` at
 table is byte-identical for the measured target rows, so the decode evidence
 below transfers unchanged.
 
+The discovery hook arms AITER's folder only when both Step5 aliases
+(BW1100/BW1101) carry the final selector-boundary rows (`257/513/5675/5676`).
+An older !406-only table without those rows is rejected with a warning and
+`VLLM_TUNED_CONFIG_FOLDER` stays unset, so vLLM's native lookup and fallback
+remain in effect.  An explicit user folder is always preserved.
+
 vLLM selects a table row with the nearest-M rule
 (`configs[min(configs.keys(), key=lambda x: abs(x - M))]`).  The AITER
 boundary follow-up (required before this plugin PR merges) adds keys `257`,

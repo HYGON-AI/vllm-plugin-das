@@ -12,11 +12,17 @@ AITER owns the concrete vLLM-compatible tuning data in
 points vLLM at that package directory; it ships no tuning row of its own.  A
 user-selected folder is left untouched: it is the documented way to tune a
 shape AITER does not ship, and vLLM consults it before the bundled configs.
+
+The hook arms the folder only when both Step5 device aliases carry the final
+selector-boundary contract (the ``257/513/5675/5676`` rows).  An older AITER
+that predates that contract is rejected, leaving ``VLLM_TUNED_CONFIG_FOLDER``
+unset so vLLM keeps its own lookup and fallback.
 """
 
 from __future__ import annotations
 
 import importlib.util
+import json
 import logging
 import os
 from collections.abc import MutableMapping
@@ -27,6 +33,13 @@ logger = logging.getLogger(__name__)
 TUNED_CONFIG_FOLDER_ENV = "VLLM_TUNED_CONFIG_FOLDER"
 AITER_PACKAGE = "aiter"
 AITER_MOE_CONFIG_SUBDIR = ("configs", "vllm_moe")
+
+# Step5 target artifact whose selector-boundary contract must be present
+# before the plugin arms AITER's folder.  The keys are the boundary rows added
+# by the AITER !410 follow-up; an older !406-only table has none of them.
+TARGET_MOE_SHAPE = "E=44,N=1536"
+TARGET_DEVICE_NAMES = ("BW1100", "BW1101")
+REQUIRED_BOUNDARY_KEYS = ("257", "513", "5675", "5676")
 
 
 def _aiter_package_dir() -> str | None:
@@ -60,6 +73,32 @@ def get_tuned_moe_config_folder() -> str | None:
     return folder if os.path.isdir(folder) else None
 
 
+def _target_contract_present(folder: str) -> bool:
+    """Return True when both Step5 aliases carry the final boundary rows.
+
+    This reads only the two target JSON files; it does not import AITER and
+    does not build a second tuning table.  Both aliases are required.
+    """
+
+    for device_name in TARGET_DEVICE_NAMES:
+        path = os.path.join(
+            folder, f"{TARGET_MOE_SHAPE},device_name={device_name}.json"
+        )
+        try:
+            with open(path, encoding="utf-8") as config_file:
+                table = json.load(config_file)
+        except (OSError, ValueError):
+            return False
+        if not isinstance(table, dict):
+            return False
+        if any(
+            not isinstance(table.get(key), dict)
+            for key in REQUIRED_BOUNDARY_KEYS
+        ):
+            return False
+    return True
+
+
 # Resolved at import for callers that only need the path; configure() resolves
 # it again so tests and late installs are not stuck with an import-time miss.
 MOE_CONFIG_FOLDER = get_tuned_moe_config_folder()
@@ -84,6 +123,17 @@ def configure_tuned_moe_config_folder(
         logger.warning(
             "AITER's vLLM-compatible MoE config folder was not found; "
             "leaving %s unset so vLLM uses its own configs.",
+            TUNED_CONFIG_FOLDER_ENV,
+        )
+        return
+
+    if not _target_contract_present(folder):
+        logger.warning(
+            "AITER's vLLM-compatible MoE config folder does not contain the "
+            "required Step5 selector-boundary contract (keys %s for %s); "
+            "leaving %s unset so vLLM uses its own configs.",
+            ", ".join(REQUIRED_BOUNDARY_KEYS),
+            "/".join(TARGET_DEVICE_NAMES),
             TUNED_CONFIG_FOLDER_ENV,
         )
         return
