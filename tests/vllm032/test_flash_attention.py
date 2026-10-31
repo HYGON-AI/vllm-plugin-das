@@ -602,6 +602,31 @@ def test_varlen_boundary_avoids_vendor_short_prefill_mtp_misclassification(
     assert calls[0]["max_seqlen_q"] == 6
 
 
+@pytest.mark.parametrize("query_len", (1, 3, 16))
+def test_e5m2_paged_descale_adapter_handles_decode_and_prefill(monkeypatch, query_len):
+    flash = load_flash_attention(monkeypatch)
+    calls = []
+    adapter = ModuleType("hcu_vllm_das.attention.e5m2_scales")
+    adapter.run_e5m2_attention = lambda vendor, kwargs: calls.append(("descale", kwargs))
+    monkeypatch.setitem(sys.modules, adapter.__name__, adapter)
+    monkeypatch.setattr(
+        flash, "_vendor_varlen_func",
+        lambda: lambda **kwargs: calls.append(("native", kwargs)),
+    )
+    impl = flash.HcuFlashAttentionImpl(kv_cache_dtype="fp8_e5m2")
+    impl._run_flash_attention(
+        q=torch.empty(query_len, 4, 64),
+        k=torch.empty(1, 2, 64, 64, dtype=torch.uint8),
+        v=torch.empty(1, 2, 64, 64, dtype=torch.uint8),
+        cu_seqlens_q=torch.tensor([0, query_len], dtype=torch.int32),
+        max_seqlen_q=query_len,
+        block_table=torch.zeros((1, 1), dtype=torch.int32),
+    )
+    assert len(calls) == 1
+    assert calls[0][0] == "descale"
+    assert calls[0][1]["k"].dtype == torch.float8_e5m2
+
+
 @pytest.mark.parametrize(
     ("max_seqlen_q", "query_tokens", "batch_size", "has_block_table"),
     (
