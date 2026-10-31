@@ -160,3 +160,54 @@ active `das_hcu` extension, expected RMSNorm/AITER owners, Adapter platform,
 and vLLM `0.32.0+rocm723` ownership were all confirmed. The target directory
 was layered over the isolated candidate environment and did not modify its
 installed Plugin.
+
+### Additional model-service matrix
+
+The final installed Plugin wheel was then exercised on additional dense GQA
+checkpoints with one visible HCU, BF16 weights, `FLASH_ATTN`, 64-token pages,
+the V2 model runner, and the default `FULL_AND_PIECEWISE` Graph mode. No run
+used `--enforce-eager`. Requests used temperature 0, seed 0, thinking disabled,
+and two different prompts; the Qwen3 requests were submitted concurrently.
+
+| Checkpoint | Q/KV heads | Layout | GPU memory utilization | Result |
+| --- | ---: | --- | ---: | --- |
+| `/model/Qwen2-1.5B-Instruct` | 12/2 | `LBHNC` (`HND`) | 0.08 | Both Graph modes captured; two changed-input requests returned HTTP 200 and normal `stop`, with correct definition and arithmetic answers. |
+| `/model/Qwen3-1.7B` | 16/8 | `LBNHC` (`NHD`) | 0.10 | Both Graph modes captured; two concurrent requests returned HTTP 200 and normal `stop`, with correct definition and arithmetic answers. |
+| `/model/Qwen3-8B` | 32/8 | `LBNHC` (`NHD`) | 0.30 | Both Graph modes captured; two concurrent requests returned HTTP 200 and normal `stop`, with correct definition and arithmetic answers. |
+
+The first Qwen3-1.7B launch used a 0.08 memory budget. It completed model load
+and both Graph captures, but vLLM measured -0.07 GiB available for KV blocks
+and failed its official cache-capacity check. Repeating with only the memory
+budget raised to 0.10 left 1.96 GiB for KV cache and passed. This is recorded as
+a launch-configuration control, not an attention or numerical failure. All
+owned services were stopped after the requests; no API server or EngineCore
+remained and `rocm-smi --showmemuse --json` reported zero percent memory use on
+all eight cards.
+
+### MLA and sparse-MLA isolation
+
+The Adapter route was checked together with the installed vLLM 0.32 backend
+classes. It substitutes this Plugin only when the selected top-level enum is
+exactly `FLASH_ATTN`; `FLASHMLA`, `FLASHMLA_SPARSE`,
+`ROCM_AITER_MLA_SPARSE`, `FLASH_ATTN_MLA`, and other selections continue to
+the upstream ROCm/platform implementation. The Plugin therefore does not
+replace an MLA or sparse-MLA kernel.
+
+The global KV-layout resolver was also executed with the real backend classes:
+
+| Backend combination | Declared/common layouts | Result |
+| --- | --- | --- |
+| Plugin + `FlashMLABackend` | MLA declares any layout | `LBHNC`, `LBNHC` |
+| Plugin + `FlashMLASparseBackend` | sparse MLA declares any layout | `LBHNC`, `LBNHC` |
+| Plugin + `ROCMAiterMLASparseBackend` | AITER declares `LBNHC`, `LBHNC`, `BLHNC` | common `LBHNC`, `LBNHC` |
+| Plugin + `DeepseekV4IndexerBackend` | indexer requires `BLHNC` or `BLNHC` | explicit `ValueError`: no common layout |
+| Plugin + `KpoolTailBackend` | tail requires `BLHNC` | explicit `ValueError`: no common layout |
+
+Thus ordinary MLA and sparse-MLA backend selection is not affected by this
+Plugin change. In a valid composite worker, adding NHD expands the common
+FlashAttention/AITER sparse-MLA set to both block-compact HND and NHD. An
+explicitly forced composite that mixes this ordinary FlashAttention backend
+with a BL-preferring DeepSeek-V4 indexer or kpool tail fails during layout
+resolution instead of silently reinterpreting its cache. Large MLA and sparse
+MLA checkpoints were not loaded in this single-card follow-up, so this section
+is a routing/layout-contract result rather than an MLA model-accuracy claim.
