@@ -1,14 +1,24 @@
-"""Opt-in real HCU tests of the source-stage FLA provider, without a model.
+"""Opt-in real HCU tests of the FLA provider, without a model.
 
 Run only with an exclusive physical GPU1 allocation. HCU_FLA_SOURCE_ROOT points
 to adapter_extension/src; vLLM must come from the exact a198 target venv. All
 scratch/cache paths must be supplied under /dev/shm by the launcher. These tests
 do not activate the extension entry point or certify an integration wheel.
+
+For installed-wheel validation set HCU_FLA_TEST_MODE=installed-wheel and
+HCU_VLLM032_FLA_LIVE=1. Use features-integration-venv (override its expected path
+with HCU_FLA_WHEEL_VENV), unset PYTHONPATH/HCU_FLA_SOURCE_ROOT/ROCR_VISIBLE_DEVICES,
+set HIP_VISIBLE_DEVICES=CUDA_VISIBLE_DEVICES=HCU_FLA_PHYSICAL_GPU=2 and
+VLLM_PLUGINS=hcu_adapter. This mode never inserts source or calls install();
+it requires the official general-plugin lifecycle to mount the installed FLA.
+Use -k 'hk16-hv16 and not performance' for the tiny model's real head geometry.
+The caller owns the exclusive device allocation and all shm cache/temp paths.
 """
 
 from __future__ import annotations
 
 from dataclasses import dataclass
+import base64
 import ctypes
 import hashlib
 from importlib import import_module, metadata
@@ -23,9 +33,13 @@ import pytest
 
 pytestmark = [
     pytest.mark.hcu,
-    pytest.mark.skipif(os.getenv("HCU_VLLM032_FLA_LIVE") != "1", reason="explicit GPU1 allocation required"),
+    pytest.mark.skipif(os.getenv("HCU_VLLM032_FLA_LIVE") != "1", reason="explicit exclusive GPU allocation required"),
 ]
+TEST_MODE = os.getenv("HCU_FLA_TEST_MODE", "source")
 GEOMETRIES = [(16, 32), (8, 16), (4, 8), (4, 12)]
+if TEST_MODE == "installed-wheel":
+    GEOMETRIES = [pytest.param(hk, hv, id=f"hk{hk}-hv{hv}")
+                  for hk, hv in [(16, 16), *GEOMETRIES]]
 DIM = 128
 SLOTS = 32
 
@@ -61,12 +75,58 @@ class KernelWitness:
         return observed
 
 
+def installed_record(distribution_name, module_path, *, venv=None):
+    """Verify the actual origin against the installed distribution's RECORD."""
+    dist = metadata.distribution(distribution_name)
+    files = dist.files
+    assert files, f"{distribution_name}: missing RECORD"
+    path = Path(module_path).resolve(strict=True)
+    if venv is not None:
+        assert path.is_relative_to(venv / "lib"), f"source/shared shadow: {path}"
+    matches = [f for f in files if Path(dist.locate_file(f)).resolve() == path]
+    assert len(matches) == 1, f"{path} is not uniquely owned by {distribution_name}"
+    entry = matches[0]
+    assert entry.hash is not None and entry.hash.mode == "sha256", f"missing SHA256: {path}"
+    data = path.read_bytes()
+    digest = hashlib.sha256(data).digest()
+    encoded = base64.urlsafe_b64encode(digest).decode().rstrip("=")
+    assert encoded == entry.hash.value, f"RECORD hash mismatch: {path}"
+    assert entry.size == len(data), f"RECORD size mismatch: {path}"
+    records = [f for f in files if str(f).endswith(".dist-info/RECORD")]
+    assert len(records) == 1, f"{distribution_name}: ambiguous RECORD"
+    record_path = Path(dist.locate_file(records[0])).resolve(strict=True)
+    if venv is not None:
+        assert record_path.is_relative_to(venv / "lib"), f"shared RECORD: {record_path}"
+    # Do not print direct_url.json: it can contain authenticated source URLs.
+    direct = dist.read_text("direct_url.json")
+    assert not direct or not json.loads(direct).get("dir_info", {}).get("editable"), "editable installs are not wheel evidence"
+    return {"distribution": distribution_name, "version": dist.version,
+            "origin": str(path), "sha256": digest.hex(), "record_entry": str(entry),
+            "record": str(record_path),
+            "record_sha256": hashlib.sha256(record_path.read_bytes()).hexdigest()}
+
+
 @pytest.fixture(scope="module")
 def runtime():
-    assert os.environ.get("HIP_VISIBLE_DEVICES") == "1"
-    assert os.environ.get("CUDA_VISIBLE_DEVICES") == "1"
+    assert TEST_MODE in {"source", "installed-wheel"}, f"unknown FLA test mode: {TEST_MODE}"
+    wheel_mode = TEST_MODE == "installed-wheel"
+    physical_gpu = int(os.environ.get("HCU_FLA_PHYSICAL_GPU", "2")) if wheel_mode else 1
+    assert physical_gpu >= 0
+    assert os.environ.get("HIP_VISIBLE_DEVICES") == str(physical_gpu)
+    assert os.environ.get("CUDA_VISIBLE_DEVICES") == str(physical_gpu)
     assert not os.environ.get("ROCR_VISIBLE_DEVICES")
-    assert sys.prefix == "/data/models/vllm032-upgrade-20261031/target-venv"
+    if wheel_mode:
+        venv = Path(os.environ.get("HCU_FLA_WHEEL_VENV",
+                    "/dev/shm/vllm032-upgrade-20261031/features-integration-venv")).resolve(strict=True)
+        assert Path(sys.prefix).resolve() == venv, "use the independent integration venv"
+        assert not os.environ.get("PYTHONPATH"), "installed-wheel mode forbids PYTHONPATH"
+        assert not os.environ.get("HCU_FLA_SOURCE_ROOT"), "installed-wheel mode forbids source insertion"
+        allowed = os.environ.get("VLLM_PLUGINS")
+        assert allowed is None or "hcu_adapter" in allowed.split(","), "general-plugin lifecycle is disabled"
+        os.environ["VLLM_HCU_USE_CUSTOM_OPS"] = "1"
+        os.environ["VLLM_HCU_USE_CUSTOM_AITER_FLA"] = "1"
+    else:
+        assert sys.prefix == "/data/models/vllm032-upgrade-20261031/target-venv"
     import torch
     import vllm
     import vllm.envs as envs
@@ -76,22 +136,61 @@ def runtime():
     hip = ctypes.CDLL("libamdhip64.so")
     pci = ctypes.create_string_buffer(32)
     assert hip.hipDeviceGetPCIBusId(pci, 32, 0) == 0
-    expected = Path("/sys/class/drm/renderD129/device").resolve().name
+    render = Path(f"/sys/class/drm/renderD{128 + physical_gpu}/device")
+    expected = render.resolve(strict=True).name
     assert pci.value.decode().lower() == expected.lower()
     assert vllm.__version__ == "0.32.0+das.a198423b7.dtk2610"
-    assert str(Path(vllm.__file__)).startswith(sys.prefix + "/")
-    source = Path(os.environ["HCU_FLA_SOURCE_ROOT"]).resolve()
-    sys.path.insert(0, str(source))
-    from hcu_vllm_das.fla import provider as p
-
-    assert Path(p.__file__).resolve() == source / "hcu_vllm_das/fla/provider.py"
-    os.environ["VLLM_HCU_USE_CUSTOM_OPS"] = "1"
-    os.environ["VLLM_HCU_USE_CUSTOM_AITER_FLA"] = "1"
-    p.register_compile_factors(envs)
+    assert Path(vllm.__file__).resolve().is_relative_to(Path(sys.prefix).resolve())
     arch = props.gcnArchName.split(":")[0]
-    assert p.install(architecture=arch), "provider unavailable: not a native pass"
+    wheel_evidence = {}
+    if wheel_mode:
+        from vllm.plugins import load_general_plugins
+
+        entries = [e for e in metadata.entry_points(group="vllm.general_plugins")
+                   if e.name == "hcu_adapter"]
+        assert len(entries) == 1 and entries[0].value == "hcu_adapter.bridges.vllm:hcu_runtime_plugin"
+        load_general_plugins()
+        from hcu_adapter import extensions
+        from hcu_adapter.bridges import vllm as bridge
+        from hcu_vllm_das import environment, extension, fla
+        from hcu_vllm_das.fla import provider as p
+
+        reports = [r for r in bridge.extension_reports() if r.extension_name == "das-hcu"]
+        assert len(reports) == 1 and reports[0].status is extensions.ExtensionStatus.ACTIVE, reports
+        assert "boltops-fla-decode" in reports[0].capabilities
+        policy = json.loads(p.effective_compile_factor())
+        assert policy["route"] == "boltops" and policy["mounted"] and policy["owned"], policy
+        assert p._installation is not None, "lifecycle did not mount the real provider"
+        modules = [("vllm", vllm), ("vllm", envs), ("vllm", import_module("vllm.plugins")),
+                   ("sgl-kernel", bridge), ("sgl-kernel", extensions),
+                   ("hcu-vllm-das-plugin", fla), ("hcu-vllm-das-plugin", p),
+                   ("hcu-vllm-das-plugin", extension), ("hcu-vllm-das-plugin", environment),
+                   ("vllm", p._installation.consumer)]
+        wheel_evidence["files"] = [installed_record(dist, mod.__file__, venv=venv) for dist, mod in modules]
+        provider_proof = next(r for r in wheel_evidence["files"] if r["origin"] == str(Path(p.__file__).resolve()))
+        assert policy["identity"]["adapter"] == provider_proof["sha256"]
+        expected_record = os.environ.get("HCU_FLA_EXPECT_PLUGIN_RECORD_SHA256")
+        assert expected_record is None or provider_proof["record_sha256"] == expected_record, "unexpected installed Plugin RECORD"
+        wheel_evidence["entry_point"] = entries[0].value
+        wheel_evidence["activation_report"] = {"name": reports[0].extension_name,
+            "status": reports[0].status.value, "capabilities": sorted(reports[0].capabilities)}
+    else:
+        source = Path(os.environ["HCU_FLA_SOURCE_ROOT"]).resolve()
+        sys.path.insert(0, str(source))
+        from hcu_vllm_das.fla import provider as p
+
+        assert Path(p.__file__).resolve() == source / "hcu_vllm_das/fla/provider.py"
+        os.environ["VLLM_HCU_USE_CUSTOM_OPS"] = "1"
+        os.environ["VLLM_HCU_USE_CUSTOM_AITER_FLA"] = "1"
+        p.register_compile_factors(envs)
+        assert p.install(architecture=arch), "provider unavailable: not a native pass"
     originals = p._installation.originals.copy()
     vendor = import_module("boltops.fla.gdn")
+    if wheel_mode:
+        wheel_evidence["vendor_files"] = [installed_record("boltops", vendor.__file__)]
+        for name in (p.PACKED, p.SIGMOID):
+            owner = import_module(getattr(vendor, name).__module__)
+            wheel_evidence["vendor_files"].append(installed_record("boltops", owner.__file__))
     launched = []
     patch = pytest.MonkeyPatch()
     for name in (p.PACKED, p.SIGMOID):
@@ -103,9 +202,12 @@ def runtime():
     manifest = {
         "python": sys.executable, "vllm_version": vllm.__version__,
         "vllm_file": vllm.__file__, "plugin_source": p.__file__,
-        "stage": "FLA worktree source plus exact target vLLM wheel; not integration wheel",
+        "stage": ("installed integration wheel via official general-plugin lifecycle" if wheel_mode else
+                  "FLA worktree source plus exact target vLLM wheel; not integration wheel"),
+        "mode": TEST_MODE, "installed_wheel": wheel_evidence,
         "architecture": arch, "compute_units": props.multi_processor_count,
-        "physical_gpu": 1, "pci": pci.value.decode(), "visible_count": 1,
+        "physical_gpu": physical_gpu, "pci": pci.value.decode(), "visible_count": 1,
+        "pci_sysfs": str(render), "plugin_file": p.__file__,
         "versions": {name: metadata.version(name) for name in ("torch", "triton", "boltops", "vllm")},
         "factor": json.loads(p.effective_compile_factor()),
         "test_sha256": hashlib.sha256(Path(__file__).read_bytes()).hexdigest(),
