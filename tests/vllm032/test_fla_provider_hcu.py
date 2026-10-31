@@ -421,6 +421,38 @@ class Runtime:
                 "undefined_null_or_empty_tokens": len(valid) - sum(valid), "touched_slots": touched}
 
 
+    def compare_pair(self, provider, official, reference, *, label):
+        """Report direct equality separately from FP32-oracle/model gates."""
+        t = self.t
+        valid, touched = reference[2:]
+        mask, active = self.integer(valid).bool(), self.integer(touched).long()
+        output = provider[0].reshape(-1, provider[0].shape[-2], DIM)[mask]
+        baseline = official[0].reshape(-1, official[0].shape[-2], DIM)[mask]
+        pairs = {"output": (output, baseline), "state": (provider[1], official[1]),
+                 "state_updated": (provider[1][active], official[1][active])}
+        metrics = {}
+        for kind, (x, y) in pairs.items():
+            assert x.shape == y.shape and x.dtype == y.dtype and x.numel() > 0
+            error = x.float() - y.float()
+            rms = y.float().square().mean().sqrt().item()
+            metrics[kind] = {
+                "exact": t.equal(x, y),
+                "bitwise_exact": t.equal(x.contiguous().view(t.uint8), y.contiguous().view(t.uint8)),
+                "num_elements": x.numel(), "num_mismatched": (x != y).sum().item(),
+                "max_abs": error.abs().max().item(), "reference_rms": rms,
+                "nrmse": error.square().mean().sqrt().item() / max(rms, 1e-12),
+            }
+        result = {"label": label, "defined_tokens": sum(valid),
+                  "undefined_null_or_empty_tokens": len(valid) - sum(valid),
+                  "output_scope": "defined tokens only", "state_scope": "full pool and updated slots",
+                  "metrics": metrics}
+        # Preserve diagnostic metrics even when the direct comparison fails.
+        record("provider_official_comparison", **result)
+        t.testing.assert_close(output, baseline, rtol=0.02, atol=0.002)
+        t.testing.assert_close(provider[1], official[1], rtol=0.002, atol=0.0002)
+        return result
+
+
 @pytest.mark.parametrize("hk,hv", GEOMETRIES)
 @pytest.mark.parametrize("batch", [1, 4, 16])
 def test_packed_native_matches_official_state_alias_and_null(runtime, hk, hv, batch):
@@ -430,12 +462,11 @@ def test_packed_native_matches_official_state_alias_and_null(runtime, hk, hv, ba
     official, vendor = rt.clone(base), rt.clone(base)
     a, b = rt.call(official, vendor=False), rt.call(vendor, vendor=True)
     rt.t.cuda.synchronize()
+    pair = rt.compare_pair(b, a, reference, label="packed-provider-vs-official")
     rows = [rt.compare(base, a, reference, label="official-vs-physical"),
             rt.compare(base, b, reference, label="provider-vs-physical")]
-    rt.t.testing.assert_close(b[0], a[0], rtol=0.02, atol=0.002)
-    rt.t.testing.assert_close(b[1], a[1], rtol=0.002, atol=0.0002)
     record("native_pass", entry="packed", hk=hk, hv=hv, dim=DIM, batch=batch,
-           checks=rows, kernel=rt.launched[-1], aliases=True)
+           checks=rows, provider_vs_official=pair, kernel=rt.launched[-1], aliases=True)
 
 
 @pytest.mark.parametrize("hk,hv", GEOMETRIES)
@@ -447,13 +478,12 @@ def test_sigmoid_native_matches_official_state_alias_mtp_varlen(runtime, hk, hv,
     official, vendor = rt.clone(base), rt.clone(base)
     a, b = rt.call(official, vendor=False), rt.call(vendor, vendor=True)
     rt.t.cuda.synchronize()
+    pair = rt.compare_pair(b, a, reference, label="sigmoid-provider-vs-official")
     rows = [rt.compare(base, a, reference, label="official-vs-physical"),
             rt.compare(base, b, reference, label="provider-vs-physical")]
-    mask = rt.integer(reference[2]).bool()
-    rt.t.testing.assert_close(b[0].reshape(-1, hv, DIM)[mask], a[0].reshape(-1, hv, DIM)[mask], rtol=0.02, atol=0.002)
-    rt.t.testing.assert_close(b[1], a[1], rtol=0.002, atol=0.0002)
     record("native_pass", entry="sigmoid", hk=hk, hv=hv, dim=DIM, mode=mode,
-           lengths=base.lengths, accepted=base.accepted, checks=rows, kernel=rt.launched[-1], aliases=True)
+           lengths=base.lengths, accepted=base.accepted, checks=rows,
+           provider_vs_official=pair, kernel=rt.launched[-1], aliases=True)
 
 
 def capture(rt, case, *, vendor):
@@ -492,12 +522,15 @@ def test_graph_multiple_waves_same_addresses_changed_inputs_indices_accepted(run
         rt.t.cuda.synchronize()
         assert vendor.pointers() == ptrs and provider_out[0].data_ptr() == output_ptr
         assert provider_out[1] is vendor.state
+        pair = rt.compare_pair(provider_out, reference_out, expected,
+                               label=f"{entry}-graph-wave-{wave}-provider-vs-official")
         a = rt.compare(fresh, reference_out, expected, label="official-graph-vs-physical")
         b = rt.compare(fresh, provider_out, expected, label="provider-graph-vs-physical")
         defined = provider_out[0].reshape(-1, hv, DIM)[rt.integer(expected[2]).bool()]
         digests.append(hashlib.sha256(defined.float().cpu().numpy().tobytes()).hexdigest())
         waves.append({"wave": wave, "lengths": fresh.lengths, "indices": fresh.indices,
-                      "accepted": fresh.accepted, "checks": [a, b]})
+                      "accepted": fresh.accepted, "checks": [a, b],
+                      "provider_vs_official": pair})
     assert len(set(digests)) == len(digests)
     record("graph_pass", entry=entry, hk=hk, hv=hv, dim=DIM, waves=waves,
            input_addresses_stable=True, output_address_stable=True,
