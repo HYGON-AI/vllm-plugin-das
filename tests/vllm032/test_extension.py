@@ -95,6 +95,9 @@ def successful_importer(calls: list[str]):
         "vllm.utils.torch_utils": SimpleNamespace(
             direct_register_custom_op=lambda **kwargs: None
         ),
+        "vllm.envs": SimpleNamespace(
+            environment_variables={}, compile_factors=lambda: {}
+        ),
         "aiter.moe": SimpleNamespace(
             MoeQuantType=MoeQuantType,
             get_aiter_moe_config=get_aiter_moe_config,
@@ -210,6 +213,7 @@ def test_activation_accepts_the_vllm_032_release_line(
         "aiter.moe",
         "vllm.model_executor.layers.layernorm",
         "vllm.utils.torch_utils",
+        "vllm.envs",
         "hcu_vllm_das.rms_norm",
         "hcu_vllm_das.moe.int8_oracle",
     ]
@@ -428,6 +432,7 @@ def test_repeated_and_concurrent_activation_registers_capability_once(
         "aiter.moe",
         "vllm.model_executor.layers.layernorm",
         "vllm.utils.torch_utils",
+        "vllm.envs",
         "hcu_vllm_das.rms_norm",
         "hcu_vllm_das.moe.int8_oracle",
     ]

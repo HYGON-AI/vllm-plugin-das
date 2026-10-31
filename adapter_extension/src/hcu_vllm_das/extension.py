@@ -13,6 +13,7 @@ from hcu_adapter.extensions import (
     ExtensionSpec,
 )
 
+from .environment import register_compile_factors
 from .version import TARGET_VLLM_RELEASE
 
 
@@ -167,6 +168,7 @@ def activate_extension(context: ExtensionContext) -> None:
         )
 
         try:
+            register_compile_factors(_import_module("vllm.envs"))
             _import_module("hcu_vllm_das.rms_norm")
             int8_oracle = _import_module("hcu_vllm_das.moe.int8_oracle")
             install_oracle = getattr(int8_oracle, "install", None)
