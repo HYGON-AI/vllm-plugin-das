@@ -150,6 +150,32 @@ def activate(rt, monkeypatch):
     assert rt.p.install(architecture="gfx936")
 
 
+@pytest.mark.parametrize("master,family,invariant,expected", [
+    (None, None, False, False), ("1", None, False, False),
+    (None, "1", False, False), ("0", "1", False, False),
+    ("true", "yes", False, True), ("1", "1", True, False),
+])
+def test_public_is_requested_is_effective_and_lazy(
+    runtime, monkeypatch, master, family, invariant, expected,
+):
+    runtime.p.register_compile_factors(runtime.envs)
+    for name, value in [("VLLM_HCU_USE_CUSTOM_OPS", master),
+                        ("VLLM_HCU_USE_CUSTOM_AITER_FLA", family)]:
+        if value is not None:
+            monkeypatch.setenv(name, value)
+    runtime.envs.VLLM_BATCH_INVARIANT = invariant
+    assert runtime.package.is_requested() is expected
+    assert runtime.imports == []
+    assert runtime.p._installation is None
+
+
+def test_public_is_requested_rejects_invalid_policy_before_runtime_imports(runtime, monkeypatch):
+    monkeypatch.setenv("VLLM_HCU_USE_CUSTOM_AITER_FLA", "invalid")
+    with pytest.raises(ValueError, match="must be a boolean"):
+        runtime.package.is_requested()
+    assert runtime.imports == []
+
+
 def packed_inputs(batch=2, hv=8, heads=4):
     return dict(
         mixed_qkv=Tensor((batch, 2 * heads * 128 + hv * 128)),

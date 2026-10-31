@@ -4,6 +4,7 @@ from __future__ import annotations
 
 from importlib import import_module as _import_module
 import inspect
+import json
 import threading
 
 from packaging.version import InvalidVersion, Version
@@ -17,7 +18,10 @@ from .environment import register_compile_factors
 from .version import TARGET_VLLM_RELEASE
 
 
-_CAPABILITIES = frozenset({"lightop-rms-norm", "aiter-int8-moe"})
+_FLA_CAPABILITY = "boltops-fla-decode"
+_CAPABILITIES = frozenset(
+    {"lightop-rms-norm", "aiter-int8-moe", _FLA_CAPABILITY}
+)
 _IMPLEMENTED_EXTENSION_API_VERSION = 1
 _AITER_SIGNATURES = {
     "get_aiter_moe_config": (
@@ -113,6 +117,10 @@ def activate_extension(context: ExtensionContext) -> None:
     _require_vllm_032_release_line(context.vllm_version)
     with _activation_lock:
         if _activated:
+            if _FLA_CAPABILITY in context.requested_capabilities:
+                fla = _import_module("hcu_vllm_das.fla")
+                policy = json.loads(fla.effective_compile_factor())
+                _require_fla_mount(context, policy.get("route") == "boltops")
             return
         try:
             lightop_norm = _import_module("lightop.norm")
@@ -168,7 +176,17 @@ def activate_extension(context: ExtensionContext) -> None:
         )
 
         try:
-            register_compile_factors(_import_module("vllm.envs"))
+            vllm_envs = _import_module("vllm.envs")
+            register_compile_factors(vllm_envs)
+            fla = _import_module("hcu_vllm_das.fla")
+            fla.register_compile_factors(vllm_envs)
+            mounted = False
+            if fla.is_requested():
+                bridge = _import_module("hcu_adapter.bridges.vllm")
+                detection = bridge.detect_hcu()
+                if detection.detected:
+                    mounted = fla.install(architecture=detection.architecture)
+            _require_fla_mount(context, mounted)
             _import_module("hcu_vllm_das.rms_norm")
             int8_oracle = _import_module("hcu_vllm_das.moe.int8_oracle")
             install_oracle = getattr(int8_oracle, "install", None)
@@ -185,6 +203,14 @@ def activate_extension(context: ExtensionContext) -> None:
                 f"cannot register DAS operator capabilities: {error}"
             ) from error
         _activated = True
+
+
+def _require_fla_mount(context: ExtensionContext, mounted: bool) -> None:
+    if _FLA_CAPABILITY in context.requested_capabilities and not mounted:
+        raise DasExtensionError(
+            f"required capability {_FLA_CAPABILITY!r} is not mounted; "
+            "enable the FLA flags and provide a supported HCU/BoltOPs ABI"
+        )
 
 
 def extension_spec() -> ExtensionSpec:

@@ -11,6 +11,7 @@ from .provider import (
     FlaInstallError,
     effective_compile_factor,
     install,
+    is_requested,
     register_compile_factors,
     uninstall,
 )
@@ -20,6 +21,7 @@ __all__ = [
     "FlaInstallError",
     "effective_compile_factor",
     "install",
+    "is_requested",
     "register_compile_factors",
     "uninstall",
 ]

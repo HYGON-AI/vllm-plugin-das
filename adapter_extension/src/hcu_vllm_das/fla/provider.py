@@ -89,6 +89,15 @@ def _batch_invariant() -> bool:
     return bool(getattr(_envs, "VLLM_BATCH_INVARIANT", False))
 
 
+def is_requested() -> bool:
+    """Read the effective opt-in policy without importing providers or hardware.
+
+    Register compile factors first so vLLM's batch-invariant policy is visible.
+    This expresses intent, not evidence that a provider has been mounted.
+    """
+    return _enabled() and not _batch_invariant()
+
+
 def effective_compile_factor() -> str:
     """Derived, JSON-serializable factor for ordinary and second-level AOT keys.
 
@@ -97,7 +106,7 @@ def effective_compile_factor() -> str:
     including its code/config bytes, rather than just the requested env value.
     """
     try:
-        enabled = _enabled() and not _batch_invariant()
+        enabled = is_requested()
         installed = _installation
         owned = installed is not None and all(
             getattr(installed.consumer, name, None) is wrapper
@@ -308,7 +317,7 @@ def _make_wrappers(originals: dict, providers: dict) -> dict:
                ssm_state_indices, use_qk_l2norm_in_kernel=False):
         args = (mixed_qkv, a, b, A_log, dt_bias, scale, initial_state, out,
                 ssm_state_indices, use_qk_l2norm_in_kernel)
-        if not _enabled() or _batch_invariant() or not _packed_supported(*args):
+        if not is_requested() or not _packed_supported(*args):
             return originals[PACKED](*args)
         return providers[PACKED](*args, null_state_index=0)
 
@@ -320,7 +329,7 @@ def _make_wrappers(originals: dict, providers: dict) -> dict:
         args = (A_log, a, b, dt_bias, q, k, v, beta, threshold, scale,
                 initial_state, inplace_final_state, cu_seqlens, ssm_state_indices,
                 num_accepted_tokens, use_qk_l2norm_in_kernel, is_kda)
-        if not _enabled() or _batch_invariant() or not _sigmoid_supported(*args):
+        if not is_requested() or not _sigmoid_supported(*args):
             return originals[SIGMOID](*args)
         return providers[SIGMOID](*args, null_state_index=0)
 
@@ -336,7 +345,7 @@ def install(*, architecture: str | None = None) -> bool:
     A selected provider's runtime errors are never caught by these wrappers.
     """
     global _installation
-    if not _enabled() or _batch_invariant():
+    if not is_requested():
         return False
     with _lock:
         if _envs is None or _envs.environment_variables.get(COMPILE_FACTOR) is not effective_compile_factor:
