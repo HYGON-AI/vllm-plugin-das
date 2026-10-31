@@ -58,13 +58,26 @@ change production Python. The wheel has no SlimQuant or non-unit E5M2 changes.
 | Fine-prefix/MTP mechanism | 56 requests passed; accepted2648/drafted2832 | Actual manager page560, hash unit16, cold/warm output equality and a sibling fine-prefix hit; no independent semantic accuracy claim. |
 | Actual worker calls | 846 BoltOPs successful sigmoid launches; 1 official warmup launch | Read-only monitoring of actual JIT completion; replay bypasses Python, so these are not per-request counts. |
 
-The model used a fresh cache root and saved target/draft AOT artifacts. A repeat
-on the separate integration wheel with identical FLA provider bytes reloaded
-its own target/draft AOT and reproduced ON15/OFF14 on the same GPU. This is
-supporting integration evidence, not an independent review-wheel OFF/AOT repeat.
-The previous tiny-model ON/OFF performance sample, on different GPUs, measured
-ratios 0.999848 at concurrency1 and 1.009724 at concurrency8. It does not prove
-a repeatable improvement; default OFF remains. The integration wheel also passed
+The independent artifact's same-GPU1 sequence is ON initial load, OFF control,
+then a fresh ON process loading the original target/draft AOT artifacts. All
+original ON compile factors match; ON/OFF ordinary and AOT keys are separate.
+The repeat reproduced raw1/normalized15 and all32 normalized completion strings
+exactly. OFF was raw1/normalized14. This is not per-task dominance: ON gains
+2/18 and loses0 relative to this OFF. Earlier integration OFF repeats changed
+their0/18 pass vector at unchanged14count; do not infer numerical equivalence
+from the aggregate score.
+
+The same-wheel, same-GPU1 performance control used64 input/128 forced output
+tokens, max_num_seqs8, two warmups plus five measured rounds per concurrency.
+Median ON/OFF tokens/s were360.025/348.967 atc1,1095.292/1076.675 atc4, and
+2009.317/1977.725 atc8: +3.16885%/+1.72914%/+1.59741%. Sequential time/order
+confounding remains and no measured gain reaches5%; defaultOFF remains.
+The initial OFF timing attempt possibly overlapped a read-only snapshot RPC and
+is retained but excluded. Only its fresh exclusive rerun is the control; the
+matched exclusive phases include per-round timestamps and no other API traffic.
+Evidence: `fla-review-same-gpu-aot-performance-summary.json`.
+
+The integration wheel also passed
 124 HCU cases/240 Graph waves across five head geometries and a 35B combined
 SlimQuant+FLA HumanEval32 run, but those are separate artifacts and not counted
 as this independent wheel's model/config coverage.
@@ -120,5 +133,5 @@ Evidence: `fla-review-legacy-runtime-patch-summary.json`,
 The new HCU test has a literal registry entry. It is explicitly disabled in the
 existing v0.28.1 contract image, with its reason in the registry; running v0.32
 code in that image would give false coverage. An audited v0.32 CI environment,
-gfx938 validation, independent exact-wheel OFF/AOT repeat, larger-model coverage
+gfx938 validation, larger-model coverage
 and performance acceptance remain required before broad release/default enable.
