@@ -13,8 +13,8 @@ Version `0.2.0.dev0` contains two independently selected capabilities:
 It also provides an explicit HCU FlashAttention backend selected by
 `--attention-backend FLASH_ATTN`. The backend keeps vLLM's official metadata,
 scheduler, allocation, cache writer, and forward orchestration. It changes only
-the provider boundaries needed by the HCU vendor varlen ABI: dense HND K/V page
-views, FA2 keyword compatibility, and a 64-token kernel page.
+the provider boundaries needed by the HCU vendor varlen ABI: dense HND/NHD K/V
+page views, FA2 keyword compatibility, and a 64-token kernel page.
 
 vLLM's native `SiluAndMul` remains the selected implementation. Warmed
 compiled A/B measurements on `gfx936` did not justify replacing the upstream
@@ -98,8 +98,9 @@ the Adapter's platform/runtime ownership.
 
 ## HCU FlashAttention varlen backend
 
-The initial supported path is BF16/FP16 dense MHA/GQA with LBHNC (HND) cache
-layout and 64-token pages. The public vendor ABI is
+The supported path is BF16/FP16 dense MHA/GQA with head size 64, 128, 192, or
+256, LBHNC (HND) or LBNHC (NHD) cache layout, and 64-token pages. The public
+vendor ABI is
 `flash_attn.flash_attn_varlen_func`; no classic, custom, or alternate public
 attention entry point is registered.
 
@@ -111,19 +112,35 @@ vllm serve /model/Qwen2-0.5B-Instruct \
   --block-size 64
 ```
 
-The Plugin reinterprets each allocated page as dense `[K/V, H, N, D]`
-storage. This is required because the vendor kernel does not consume vLLM's
-default non-dense views produced by splitting `[..., 2D]`. The official
-stride-aware HIP cache writer writes through a zero-copy NHD alias of those
-dense views. The Plugin does not copy the full KV cache on decode. The vendor's
-regular prefill path may gather paged KV internally; rectangular short prefill
-uses that path by passing a conservative `max_seqlen_q` upper bound, avoiding
-the vendor wrapper's incompatible MTP tile selection.
+The Plugin keeps LBHNC first in its preference list to preserve the existing
+default. Select either layout through vLLM's native setting when a deployment
+needs an explicit layout:
+
+```bash
+# LBHNC storage, vendor layout="bhsd"
+VLLM_KV_CACHE_LAYOUT=HND vllm serve /model/Qwen2-0.5B-Instruct \
+  --attention-backend FLASH_ATTN --block-size 64
+
+# LBNHC storage, vendor layout="bshd"
+VLLM_KV_CACHE_LAYOUT=NHD vllm serve /model/Qwen2-0.5B-Instruct \
+  --attention-backend FLASH_ATTN --block-size 64
+```
+
+The Plugin reads vLLM's resolved cache layout rather than inferring it from
+tensor geometry. It reinterprets each allocated page as dense
+`[K/V, H, N, D]` or `[K/V, N, H, D]` storage. This is required because the
+vendor kernel does not consume vLLM's non-dense views produced by splitting
+`[..., 2D]`. The official stride-aware HIP cache writer always receives its
+NHD contract through a zero-copy alias. The Plugin does not copy the full KV
+cache on decode. The vendor's regular prefill path may gather paged KV
+internally; rectangular short prefill uses that path by passing a conservative
+`max_seqlen_q` upper bound, avoiding the vendor wrapper's incompatible MTP tile
+selection.
 
 FA4-only `dynamic_causal`, `mask_mod`, and `aux_tensors` are accepted only
 when inactive (`None`). An active feature fails closed instead of silently
-changing its mask. FP8 KV, DCP, hybrid caches, and layouts other than LBHNC
-remain unvalidated and are not claimed by this release.
+changing its mask. FP8 KV, DCP, hybrid caches, and layouts other than LBHNC and
+LBNHC remain unvalidated and are not claimed by this release.
 
 ## RMSNorm eligibility
 
