@@ -4,7 +4,7 @@
 
 **Goal:** Add model-independent `fp8_e5m2` KV-cache support to the Plugin-owned vLLM 0.32 HCU `FLASH_ATTN` backend and validate it across layouts, Graph, and model families.
 
-**Architecture:** vLLM keeps cache allocation and native writes; the Plugin narrowly adapts the upstream constructor capability check and converts byte-backed K/V views to E5M2 at the public vendor boundary. Adapter and vLLM remain unchanged, and the implementation contains no model-name routing.
+**Architecture:** vLLM keeps cache allocation, scales, slot mapping, and all non-E5M2 writes; the Plugin narrowly adapts the upstream constructor capability check, selects an HCU Triton E5M2 writer from its implementation subclass, and converts byte-backed K/V views to E5M2 at the public vendor boundary. Adapter and vLLM remain unchanged, and the implementation contains no model-name routing.
 
 **Tech Stack:** Python, PyTorch/HIP, vLLM 0.32 attention seams, HCU `flash_attn_varlen_func`, pytest, isolated wheels.
 
@@ -13,7 +13,7 @@
 ## Global Constraints
 
 - Plugin-only runtime change; do not modify vLLM or Adapter.
-- Preserve official `reshape_and_cache_flash`, LBHNC/LBNHC, block size 64, and default Graph mode.
+- Preserve official `reshape_and_cache_flash` for every non-E5M2 dtype, LBHNC/LBNHC, block size 64, and default Graph mode.
 - Do not change global platform FP8 dtype or add model/checkpoint allowlists.
 - Keep MLA, sparse MLA, multimodal-prefix, hybrid, DCP, PCP, sliding-window, sink, and RSWA behavior unchanged and fail closed.
 - Use TDD for every production behavior and compare model E5M2 with an otherwise identical BF16-KV run.
@@ -69,11 +69,14 @@ Commit the test and implementation with a root-cause message describing the upst
 ### Task 2: Live HCU writer-reader and Graph matrix
 
 **Files:**
+- Add: `adapter_extension/src/hcu_vllm_das/attention/e5m2_cache.py`
+- Modify: `adapter_extension/src/hcu_vllm_das/attention/flash_attn.py`
+- Modify: `tests/vllm032/test_flash_attention.py`
 - Modify: `tests/vllm032/test_flash_attention_hcu.py`
 
 **Interfaces:**
 - Consumes: Task 1's E5M2 vendor-boundary normalization.
-- Produces: numerical and changed-input Graph evidence for native writer to Plugin reader.
+- Produces: a narrow Plugin E5M2 writer plus numerical and changed-input Graph evidence for Plugin writer to vendor reader.
 
 - [ ] **Step 1: Write E5M2 HCU tests before any further production change**
 
@@ -83,7 +86,10 @@ Cover LBHNC/LBNHC, prefill/decode, MHA/GQA, padded two-block storage, block 1 wr
 
 Run: `VLLM032_HCU_TEST=1 <candidate-python> -m pytest -q tests/vllm032/test_flash_attention_hcu.py -k e5m2`
 
-Expected: pass after Task 1; any numerical/provider failure triggers systematic debugging, not a fallback backend.
+Expected initial result: either pass or a precise writer/reader failure. The
+actual RED result was the installed HCU native writer rejecting
+`fp8_e5m2`; implement the minimum Plugin-owned Triton writer, while preserving
+upstream delegation for all other dtypes, then rerun.
 
 - [ ] **Step 3: Run the full HCU attention matrix**
 

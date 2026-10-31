@@ -81,6 +81,28 @@ def _e5m2_byte_view(tensor: torch.Tensor) -> torch.Tensor:
     return tensor.view(torch.float8_e5m2)
 
 
+def _reshape_and_cache_e5m2(
+    key: torch.Tensor,
+    value: torch.Tensor,
+    key_cache: torch.Tensor,
+    value_cache: torch.Tensor,
+    slot_mapping: torch.Tensor,
+    k_scale: torch.Tensor,
+    v_scale: torch.Tensor,
+) -> None:
+    from hcu_vllm_das.attention.e5m2_cache import reshape_and_cache_e5m2
+
+    reshape_and_cache_e5m2(
+        key,
+        value,
+        key_cache,
+        value_cache,
+        slot_mapping,
+        k_scale,
+        v_scale,
+    )
+
+
 def _dense_kv_cache_views(
     kv_cache: torch.Tensor,
     head_size: int,
@@ -193,6 +215,33 @@ class HcuFlashAttentionImpl(FlashAttentionImpl):
         if self.kv_cache_layout == KVCacheLayout.LBHNC:
             return key_cache.transpose(1, 2), value_cache.transpose(1, 2)
         return key_cache, value_cache
+
+    def do_kv_cache_update(
+        self,
+        layer: torch.nn.Module,
+        key: torch.Tensor,
+        value: torch.Tensor,
+        kv_cache: torch.Tensor,
+        slot_mapping: torch.Tensor,
+    ) -> None:
+        if self.kv_cache_dtype != _E5M2_KV_CACHE_DTYPE:
+            return super().do_kv_cache_update(
+                layer,
+                key,
+                value,
+                kv_cache,
+                slot_mapping,
+            )
+        key_cache, value_cache = self._get_kv_cache_write_views(kv_cache)
+        _reshape_and_cache_e5m2(
+            key,
+            value,
+            key_cache,
+            value_cache,
+            slot_mapping,
+            layer._k_scale,
+            layer._v_scale,
+        )
 
     def _run_flash_attention(self, **kwargs: Any) -> Any:
         for name in _FA4_ONLY_ARGUMENTS:

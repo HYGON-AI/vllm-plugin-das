@@ -36,6 +36,22 @@ def load_flash_attention(
             self.supports_quant_query_input = True
             self.vllm_flash_attn_version = kwargs.pop("version", None)
 
+        def do_kv_cache_update(
+            self,
+            layer,
+            key,
+            value,
+            kv_cache,
+            slot_mapping,
+        ):
+            self.upstream_cache_update = (
+                layer,
+                key,
+                value,
+                kv_cache,
+                slot_mapping,
+            )
+
     if with_vllm_seams:
         for name in (
             "_get_kv_cache_views",
@@ -314,6 +330,62 @@ def test_non_e5m2_constructor_preserves_upstream_dtype_state(monkeypatch):
     assert impl.upstream_kv_cache_dtype == "bfloat16"
     assert impl.kv_cache_dtype == "bfloat16"
     assert impl.supports_quant_query_input is True
+
+
+def test_e5m2_cache_update_uses_plugin_writer_and_resolved_write_views(
+    monkeypatch,
+):
+    flash = load_flash_attention(monkeypatch, kv_cache_layout="LBHNC")
+    calls = []
+    monkeypatch.setattr(
+        flash,
+        "_reshape_and_cache_e5m2",
+        lambda *args: calls.append(args),
+    )
+    impl = flash.HcuFlashAttentionImpl()
+    impl.kv_cache_dtype = "fp8_e5m2"
+    impl.head_size = 4
+    key = torch.randn(2, 3, 4)
+    value = torch.randn_like(key)
+    packed = torch.empty(1, 3, 5, 8, dtype=torch.uint8)
+    slots = torch.tensor([0, 1], dtype=torch.long)
+    layer = SimpleNamespace(
+        _k_scale=torch.tensor(0.5),
+        _v_scale=torch.tensor(0.25),
+    )
+
+    impl.do_kv_cache_update(layer, key, value, packed, slots)
+
+    assert len(calls) == 1
+    written_key, written_value = impl._get_kv_cache_write_views(packed)
+    assert calls[0][0] is key
+    assert calls[0][1] is value
+    assert calls[0][2].shape == written_key.shape
+    assert calls[0][2].stride() == written_key.stride()
+    assert calls[0][2].data_ptr() == written_key.data_ptr()
+    assert calls[0][3].shape == written_value.shape
+    assert calls[0][3].stride() == written_value.stride()
+    assert calls[0][3].data_ptr() == written_value.data_ptr()
+    assert calls[0][4] is slots
+    assert calls[0][5] is layer._k_scale
+    assert calls[0][6] is layer._v_scale
+    assert not hasattr(impl, "upstream_cache_update")
+
+
+def test_non_e5m2_cache_update_delegates_unchanged_to_upstream(monkeypatch):
+    flash = load_flash_attention(monkeypatch)
+    monkeypatch.setattr(
+        flash,
+        "_reshape_and_cache_e5m2",
+        lambda *args: pytest.fail("E5M2 writer must not run"),
+    )
+    impl = flash.HcuFlashAttentionImpl()
+    impl.kv_cache_dtype = "bfloat16"
+    args = tuple(object() for _ in range(5))
+
+    impl.do_kv_cache_update(*args)
+
+    assert impl.upstream_cache_update == args
 
 
 @pytest.mark.parametrize(
