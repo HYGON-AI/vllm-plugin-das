@@ -43,9 +43,10 @@ Torch2.11. `e5m2-scale-final-attestation.json` binds source and wheel content.
   Graph waves, preserved query and output alias, and prefill LSE return.
   Scales include the original range and values multiplied by0.001, covering
   a smaller calibration scale range without changing the acceptance tolerance.
-- The preceding candidate's portable suite: **140 passed**. The final
-  computational change only widens the GPU row index to 64 bits; final
-  physical/HCU tests above execute that change.
+- Final source portable suite: **140 passed**, with explicit target source,
+  empty GPU visibility and live suites excluded; see
+  `e5m2-scale-final-portable.log`. The preceding candidate also passed140;
+  the final computational change widens the GPU row index to 64 bits.
 
 Original failed matrices, unit-scale controls and ABI diagnostics are retained.
 The independent FP32 reference is not the vendor gather output or an unscaled
