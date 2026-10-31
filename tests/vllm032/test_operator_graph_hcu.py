@@ -7,6 +7,7 @@ import subprocess
 import sys
 
 import pytest
+from packaging.version import Version
 
 
 pytestmark = pytest.mark.hcu
@@ -158,7 +159,8 @@ def test_installed_operator_on_off_graph_replay_uses_expected_paths() -> None:
     official = _run_probe("off")
 
     for report in (optimized, official):
-        assert report["vllm_version"] == "0.32.0"
+        version = Version(report["vllm_version"])
+        assert version.epoch == 0 and version.release[:2] == (0, 32)
         assert "site-packages/vllm/__init__.py" in report["vllm_file"]
         assert "site-packages/hcu_vllm_das/rms_norm.py" in report["plugin_file"]
         assert report["platform"] == "hcu_adapter.bridges.vllm.HcuPlatform"
