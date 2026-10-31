@@ -21,11 +21,14 @@ is an optional FAILED report unless this capability/extension is required.
 A clean legacy preparation failure does not invalidate this independent owner;
 this change makes no rollback claim for dirty legacy activation failures.
 
-Source validation on frozen target a198423b7: Adapter 78 CPU tests passed,
-including missing/failed/duplicate owners and actual fork. The unchanged
-baseline fails six new owner/fork assertions (six others pass). Plugin 58 CPU
-tests passed, including blocked-runtime discovery, real public host/entry point
-contracts and existing Flash tests. First discovery attempt exposed the existing
-attention package's eager backend import; the factory was moved to a top-level
-module, preserving the package's existing exports. Both failure logs remain in
-the task evidence directory. Installed/native/model evidence is pending.
+Review branch baseline: merged Plugin MR321 `153e4d9` and Adapter PR17
+`35f8f05`. The Plugin review adds only this independent entry point/factory,
+tests and this note; it contains no W4, E5M2 scale, RMS, FLA or SlimQuant changes.
+The paired Adapter review adds only its own-capability selector gate/tests.
+
+Exact clean-review source validation on target `a198423b7`: Plugin55 CPU tests
+passed, Adapter49 bridge/Flash CPU tests passed. Existing Flash tests differ
+from the larger integration candidate; its58/78 counts and installed GPU36
+result are not assigned to this review artifact. Installed and actual CLI
+checks for this exact clean pair remain pending. No full model/quality,
+Graph device-trace completeness or dirty-host recovery claim is made.
