@@ -1,5 +1,9 @@
 # Explicit Flash capability ownership
 
+The current [public-registry owner contract](vllm032-flash-registry.md) replaces
+Adapter class-path selection. Historical observations below retain their
+original scope and are not new candidate acceptance counts.
+
 The independent `das_hcu_flash` entry point declares `hcu-flash-attention`.
 Its factory imports no framework/vendor runtime. Preparation checks the
 vLLM 0.32 release line, actual Adapter HCU detection, the existing official

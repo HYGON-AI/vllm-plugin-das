@@ -1,5 +1,9 @@
 # HCU vLLM DAS optimization plugin
 
+Independent Flash public-registry publication and health contract:
+[Flash registry owner](../docs/validation/vllm032-flash-registry.md). Its
+activation dependencies are independent of the legacy RMS/INT8 bundle.
+
 `hcu-vllm-das-plugin` is the optimization-only extension for official vLLM
 0.32 and `adapter-das`. The adapter owns the HCU platform and runtime
 lifecycle; this wheel contributes optional, independently removable operator
