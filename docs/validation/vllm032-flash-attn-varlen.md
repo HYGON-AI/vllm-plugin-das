@@ -271,3 +271,33 @@ sliding-window, sink, DCP, PCP, or FA4-only paths. Those continue to follow
 their existing backend selection or fail-closed validation. Cross-model
 BF16-KV/E5M2-KV service results are recorded separately below when available;
 passing the operator matrix alone is not an accuracy claim.
+
+### Cross-model E5M2 service and accuracy matrix
+
+The installed E5M2 wheel above was served in fresh processes against three
+dense decoder checkpoints. Every run used explicit `FLASH_ATTN`, 64-token
+pages, prefix caching, temperature 0, seed 0, no `--enforce-eager`, and the
+default `FULL_AND_PIECEWISE` Graph policy. Each BF16/E5M2 pair kept the same
+model, layout, memory budget, prompts, and HumanEval/0-15 harness.
+
+| Checkpoint | Layout | BF16 / E5M2 KV tokens | HumanEval16 BF16 | HumanEval16 E5M2 | Disposition |
+| --- | --- | ---: | ---: | ---: | --- |
+| `/model/Qwen3-8B` | `LBHNC` / BHSD | 36,352 / 72,768 | 16/16 | 16/16 | Graph, prefix reuse, definition, and arithmetic probes passed in both runs. |
+| `/model/Qwen2-0.5B-Instruct` | `LBNHC` / BSHD | 235,648 / 471,424 | 5/16 | 5/16 | Aggregate score tied but passing-task sets changed; the repeated long-prefix probe answered 42 with BF16 and 32 with E5M2. |
+| `/model/LLM-Research/Meta-Llama-3.1-8B-Instruct` | `LBHNC` / BHSD | 71,360 / 142,784 | 15/16 | 14/16 | Non-Qwen runtime/Graph gate passed, but E5M2 added a deterministic HumanEval/1 failure while retaining the BF16 HumanEval/4 failure. |
+
+Thus the byte/layout implementation is model-name independent and delivered
+approximately two times the KV capacity in both BHSD and BSHD. It does **not**
+establish model-independent accuracy parity when checkpoints provide no
+calibrated KV scales. E5M2 therefore remains explicit opt-in and must be
+accepted per checkpoint against its BF16 control; this evidence does not
+justify making it the global default. Raw logs, requests, generations, and
+sandboxed results are under
+`/dev/shm/vllm032-e5m2-model-matrix.hP7fAV`.
+
+The follow-up non-Qwen MLA probe used `/model/GLM-4.7-Flash`. It confirmed the
+ordinary FlashAttention Plugin was not selected. With the Adapter routing
+candidate `e38e4c8`, an unspecified attention backend resolved to official
+`TRITON_MLA`; explicit `ROCM_AITER_MLA` also reached the official vLLM backend.
+This is routing evidence only: the 58.16-GiB checkpoint load was intentionally
+stopped after backend selection, so no GLM E5M2 accuracy result is claimed.
