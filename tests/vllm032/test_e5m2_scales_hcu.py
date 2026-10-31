@@ -29,8 +29,9 @@ def _reference(q, k, v):
 @pytest.mark.parametrize("layout", ("LBHNC", "LBNHC"))
 @pytest.mark.parametrize("dtype", (torch.bfloat16, torch.float16))
 @pytest.mark.parametrize("nq", ((3, 11), (1, 1)))
+@pytest.mark.parametrize("scale_multiplier", (1.0, 0.001))
 @torch.inference_mode()
-def test_nonunit_attention_changed_graph_inputs(layout, dtype, nq):
+def test_nonunit_attention_changed_graph_inputs(layout, dtype, nq, scale_multiplier):
     import vllm._C_stable_libtorch  # noqa: F401
     from hcu_vllm_das.attention.e5m2_cache import reshape_and_cache_e5m2
 
@@ -55,8 +56,8 @@ def test_nonunit_attention_changed_graph_inputs(layout, dtype, nq):
     cu_q = torch.tensor([0, nq[0], sum(nq)], device=device, dtype=torch.int32)
     # Each sequence has a distinct scalar, expanded with zero head stride just
     # as vLLM expands layer scale tensors; replay changes values at the same address.
-    ks = torch.tensor([[0.5], [0.75]], device=device).expand(2, hk)
-    vs = torch.tensor([[1.25], [1.5]], device=device).expand(2, hk)
+    ks = (torch.tensor([[0.5], [0.75]], device=device) * scale_multiplier).expand(2, hk)
+    vs = (torch.tensor([[1.25], [1.5]], device=device) * scale_multiplier).expand(2, hk)
     out = torch.empty_like(query)
     slots = [torch.empty(n, device=device, dtype=torch.int64) for n in nk]
     lse = []
@@ -108,8 +109,8 @@ def test_nonunit_attention_changed_graph_inputs(layout, dtype, nq):
         for key, value in zip(keys, values):
             key.copy_(torch.randn_like(key))
             value.copy_(torch.randn_like(value))
-        ks[:, 0].copy_(torch.tensor([0.625 + wave * 0.125, 1.125 + wave * 0.125], device=device))
-        vs[:, 0].copy_(torch.tensor([1.375 + wave * 0.125, 0.875 + wave * 0.125], device=device))
+        ks[:, 0].copy_(torch.tensor([0.625 + wave * 0.125, 1.125 + wave * 0.125], device=device) * scale_multiplier)
+        vs[:, 0].copy_(torch.tensor([1.375 + wave * 0.125, 0.875 + wave * 0.125], device=device) * scale_multiplier)
         table.copy_(table.flip(1))
         saved_query = query.clone()
         graph.replay()
