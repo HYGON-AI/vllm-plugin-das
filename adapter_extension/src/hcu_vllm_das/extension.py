@@ -2,8 +2,11 @@
 
 from __future__ import annotations
 
+from contextlib import contextmanager
 from importlib import import_module as _import_module
 import inspect
+import json
+import os
 import threading
 
 from packaging.version import InvalidVersion, Version
@@ -13,10 +16,14 @@ from hcu_adapter.extensions import (
     ExtensionSpec,
 )
 
+from .environment import register_compile_factors
 from .version import TARGET_VLLM_RELEASE
 
 
-_CAPABILITIES = frozenset({"lightop-rms-norm", "aiter-int8-moe"})
+_FLA_CAPABILITY = "boltops-fla-decode"
+_CAPABILITIES = frozenset(
+    {"lightop-rms-norm", "aiter-int8-moe", _FLA_CAPABILITY}
+)
 _IMPLEMENTED_EXTENSION_API_VERSION = 1
 _AITER_SIGNATURES = {
     "get_aiter_moe_config": (
@@ -61,6 +68,32 @@ _AITER_SIGNATURES = {
 }
 _activation_lock = threading.Lock()
 _activated = False
+_commit_failure = None
+_committing_error_type = None
+_activating_error_type = None
+
+
+def _after_fork_child():
+    global _activation_lock, _commit_failure
+    _activation_lock = threading.Lock()
+    inherited = _activating_error_type or _committing_error_type
+    if inherited is not None and _commit_failure is None:
+        _commit_failure = (inherited,
+                           "fork inherited incomplete DAS preparation/publication; use a fresh process")
+
+
+if hasattr(os, "register_at_fork"):
+    os.register_at_fork(after_in_child=_after_fork_child)
+
+
+@contextmanager
+def _activation_attempt(error_type):
+    global _activating_error_type
+    _activating_error_type = error_type
+    try:
+        yield
+    finally:
+        _activating_error_type = None
 
 
 class DasExtensionError(RuntimeError):
@@ -105,13 +138,54 @@ def _require_signature(owner: object, name: str, qualified_name: str) -> None:
         )
 
 
-def activate_extension(context: ExtensionContext) -> None:
-    """Validate and register the migrated optimization capability once."""
+def _require_commit_failure_abi():
+    """Require the public host protocol before any shared registration."""
+    try:
+        api = _import_module("hcu_adapter.extensions")
+        error_type = getattr(api, "ExtensionCommitError", None)
+        if not inspect.isclass(error_type) or not issubclass(error_type, RuntimeError):
+            raise TypeError("missing ExtensionCommitError")
+        inspect.signature(error_type).bind("publication failed", reports=())
+        bridge = _import_module("hcu_adapter.bridges.vllm")
+        health = getattr(bridge, "require_runtime_healthy", None)
+        classifier = getattr(api, "is_fatal_extension_error", None)
+        for function, arguments in ((health, ()), (classifier, (RuntimeError(),))):
+            if not callable(function):
+                raise TypeError("missing public health query or fatal classifier")
+            implementations = (function,) if inspect.isroutine(function) else (function, function.__call__)
+            if any(check(value) for value in implementations for check in (
+                inspect.iscoroutinefunction, inspect.isasyncgenfunction, inspect.isgeneratorfunction,
+            )):
+                raise TypeError("public failure protocol must be synchronous")
+            inspect.signature(function).bind(*arguments)
+        return api, health
+    except Exception as error:
+        raise DasExtensionError(
+            "DAS requires Adapter public ExtensionCommitError, "
+            "is_fatal_extension_error and require_runtime_healthy ABI; "
+            f"preflight failed: {error}"
+        ) from error
 
-    global _activated
+
+def activate_extension(context: ExtensionContext) -> None:
+    """Prepare known boundaries, then publish once without rollback claims."""
+
+    global _activated, _commit_failure, _committing_error_type
+    if _commit_failure is not None:
+        error_type, message = _commit_failure
+        raise error_type(message)
     _require_vllm_032_release_line(context.vllm_version)
-    with _activation_lock:
+    fatal, health = _require_commit_failure_abi()
+    health()  # Never wait on the host gate while holding the owner lock.
+    with _activation_lock, _activation_attempt(fatal.ExtensionCommitError):
+        if _commit_failure is not None:
+            error_type, message = _commit_failure
+            raise error_type(message)
         if _activated:
+            if _FLA_CAPABILITY in context.requested_capabilities:
+                fla = _import_module("hcu_vllm_das.fla")
+                policy = json.loads(fla.effective_compile_factor())
+                _require_fla_mount(context, policy.get("route") == "boltops")
             return
         try:
             lightop_norm = _import_module("lightop.norm")
@@ -167,22 +241,60 @@ def activate_extension(context: ExtensionContext) -> None:
         )
 
         try:
-            _import_module("hcu_vllm_das.rms_norm")
+            vllm_envs = _import_module("vllm.envs")
+            fla = _import_module("hcu_vllm_das.fla")
             int8_oracle = _import_module("hcu_vllm_das.moe.int8_oracle")
-            install_oracle = getattr(int8_oracle, "install", None)
-            if not callable(install_oracle):
-                raise DasExtensionError(
-                    "required callable is unavailable: "
-                    "hcu_vllm_das.moe.int8_oracle.install"
-                )
-            install_oracle()
+            _require_callable(int8_oracle, "install", "hcu_vllm_das.moe.int8_oracle.install")
+            # Pure checks before the first shared publication. These are not
+            # reservations: later failures must still signal a dirty commit.
+            from .environment import preflight_compile_factors
+            preflight_compile_factors(vllm_envs)
+            fla.preflight_compile_factors(vllm_envs)
+            architecture = None
+            mounted = False
+            if fla.is_requested(vllm_envs):
+                bridge = _import_module("hcu_adapter.bridges.vllm")
+                detection = bridge.detect_hcu()
+                if detection.detected:
+                    architecture = detection.architecture
+                    mounted = fla.preflight_install(vllm_envs, architecture=architecture)
+            _require_fla_mount(context, mounted)
         except Exception as error:
+            if fatal.is_fatal_extension_error(error):
+                _commit_failure = (fatal.ExtensionCommitError,
+                                   f"DAS preparation inherited a fatal failure: {error}")
+                raise fatal.ExtensionCommitError(_commit_failure[1]) from error
             if isinstance(error, DasExtensionError):
                 raise
-            raise DasExtensionError(
-                f"cannot register DAS operator capabilities: {error}"
-            ) from error
+            raise DasExtensionError(f"cannot prepare DAS operator capabilities: {error}") from error
+
+        # Registering compile factors is already shared-state publication.
+        # An exception from this point has uncertain effects; never continue
+        # as a clean optional failure or silently retry it in this process.
+        _committing_error_type = fatal.ExtensionCommitError
+        try:
+            register_compile_factors(vllm_envs)
+            fla.register_compile_factors(vllm_envs)
+            if mounted:
+                mounted = fla.install(architecture=architecture)
+            _require_fla_mount(context, mounted)
+            _import_module("hcu_vllm_das.rms_norm")
+            int8_oracle.install()
+        except BaseException as error:
+            message = f"DAS activation failed after publication: {type(error).__name__}: {error}"
+            _commit_failure = (fatal.ExtensionCommitError, message)
+            raise fatal.ExtensionCommitError(message) from error
+        finally:
+            _committing_error_type = None
         _activated = True
+
+
+def _require_fla_mount(context: ExtensionContext, mounted: bool) -> None:
+    if _FLA_CAPABILITY in context.requested_capabilities and not mounted:
+        raise DasExtensionError(
+            f"required capability {_FLA_CAPABILITY!r} is not mounted; "
+            "enable the FLA flags and provide a supported HCU/BoltOPs ABI"
+        )
 
 
 def extension_spec() -> ExtensionSpec:
