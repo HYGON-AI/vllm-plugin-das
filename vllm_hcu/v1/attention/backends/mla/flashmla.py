@@ -456,9 +456,25 @@ class FlashMLAMetadataBuilder(MLACommonMetadataBuilder[FlashMLAMetadata]):
         # Live pool bound: num_gpu_blocks is assigned after profiling, so
         # read it per fill and refuse without a pool (an unchecked clamp
         # would let out-of-pool sentinels reach the kernel).
+        # The kernel indexes the KV cache in 64-token kernel pages, while
+        # cache_config.num_gpu_blocks counts MANAGER blocks (e.g. 1536
+        # tokens).  One manager block spans manager/kernel pages, so the
+        # legal kernel-page bound is num_gpu_blocks * ratio.  Using
+        # num_gpu_blocks * subpage clamps real page ids down to the manager
+        # count, which made the NC attention read empty pages and emit a
+        # constant junk token.
+        _mgr_block = int(
+            getattr(self.vllm_config.cache_config, "block_size", 0) or 0
+        )
+        _pages_per_block = (
+            _mgr_block // _NC_PAGE_BLOCK
+            if _mgr_block >= _NC_PAGE_BLOCK
+            and _mgr_block % _NC_PAGE_BLOCK == 0
+            else 1
+        )
         pool_pages = int(
             getattr(self.vllm_config.cache_config, "num_gpu_blocks", 0) or 0
-        ) * subpage
+        ) * _pages_per_block
         if pool_pages <= 0:
             raise RuntimeError(
                 "nc flash fill refused: KV pool size not yet assigned"
@@ -684,6 +700,13 @@ class FlashMLAImpl(MLACommonImpl[FlashMLAMetadata]):
         k_cache = kv_c_and_k_pe_cache.view(
             blocks * subpage, _NC_PAGE_BLOCK, kv_c_and_k_pe_cache.shape[2]
         ).unsqueeze(-2)
+        # Final safety bound: the computed pool bound assumes the standard
+        # uncompressed storage layout, while k_cache.shape[0] is the actual
+        # number of kernel pages the launch will index.  Clamp our own
+        # expanded table to it before the kernel sees it.
+        decode.block_table[:num_decodes].clamp_(
+            min=0, max=k_cache.shape[0] - 1
+        )
         if k_cache.dtype != _FP8_E4M3:
             k_cache = k_cache.view(_FP8_E4M3)
         # gfx938 fp8 kernel consumes the pre-quantized query (same
