@@ -5,10 +5,11 @@
 lifecycle; this wheel contributes optional, independently removable operator
 optimizations through the adapter extension API.
 
-Version `0.2.0.dev0` contains two independently selected capabilities:
+Version `0.2.0.dev0` contains these independently selected capabilities:
 
 - a default-OFF LightOp ordinary and fused-add `RMSNorm` candidate; and
-- an explicit AITER INT8 W8A8 MoE route selected by `--moe-backend aiter`.
+- an explicit AITER INT8 W8A8 MoE route selected by `--moe-backend aiter`; and
+- an independent SlimQuant W4A8 checkpoint owner with explicit native opt-in.
 
 It also provides an explicit HCU FlashAttention backend selected by
 `--attention-backend FLASH_ATTN`. The backend keeps vLLM's official metadata,
@@ -199,3 +200,34 @@ takeover decision, and base final-wheel gates are recorded in the
 The explicit AITER W8A8 route, public vendor-kernel evidence, Graph replay,
 model smoke, and isolated HumanEval64 result are recorded in the
 [`vLLM 0.32 AITER INT8 MoE validation`](../docs/validation/vllm032-aiter-int8-moe.md).
+
+## Optional SlimQuant W4A8 owner
+
+The independent `das_hcu_w4a8` entry point recognizes the checkpoint's existing
+SlimQuant W4A8 configuration through official `CompressedTensorsConfig` loader
+and mixed-layer interfaces. It keeps signed packed nibble loading and the
+checkpoint's weight/scale convention. The default uses the matching official
+INT8 MoE math; native AITER W4A8 requires the explicit
+`VLLM_HCU_DAS_W4A8_NATIVE=1` opt-in and supported prepack/layout/config contracts.
+A native execution error is fatal rather than a fallback success.
+
+The native method uses official `skip_forward_padding` and
+`has_unpadded_output` properties: routing sees logical activations, while the
+method pads zero tails only for its kernel and returns a logical-width output.
+It does not replace the model, router or global runner.
+
+See [the lifecycle ABI](W4A8_LIFECYCLE_ABI.md) for the minimum public Adapter
+requirements, including atomic hook registration and commit-fatal health.
+With Adapter PR20, a deployment may require `das_hcu_w4a8` and capability
+`slimquant-w4a8`. Require `das_hcu` as well only when that bundle is part of the
+intended deployment; W4 can activate alone and does not import its private
+helpers. It preserves the official INT8 path when the bundle is absent. If the
+bundle is present, its priority100 oracle precedes W4's priority90, and a
+pre-imported foreign INT8 consumer still causes refusal. Minimum W4 source
+dependencies are Adapter PR17 + public-facade PR19 + public-fatal PR23;
+required-env policy additionally uses PR20. Other optional features remain
+separate. See the [W4 maintenance skill](../skills/vllm032-w4a8/SKILL.md).
+
+The review proposal adds no MTP, INT8 PLE, EP or `deepep_auto` acceptance.
+See [scope and validation](../docs/validation/vllm032-w4a8.md) for exact evidence
+boundaries and the unresolved forced-shutdown observation.

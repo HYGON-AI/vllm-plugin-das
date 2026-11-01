@@ -26,7 +26,8 @@ def test_project_metadata_has_only_the_adapter_extension_entry_point() -> None:
     ]
     assert metadata["entry-points"] == {
         "hcu_adapter.extensions": {
-            "das_hcu": "hcu_vllm_das.extension:extension_spec"
+            "das_hcu": "hcu_vllm_das.extension:extension_spec",
+            "das_hcu_w4a8": "hcu_vllm_das.w4a8.lifecycle:extension_spec"
         }
     }
     assert "vllm.platform_plugins" not in metadata["entry-points"]
@@ -101,6 +102,7 @@ def test_built_wheel_contains_only_the_new_plugin_namespace(tmp_path: Path) -> N
     assert "Requires-Dist: sgl-kernel>=0.1.0" in metadata_lines
     assert "[hcu_adapter.extensions]" in entry_point_lines
     assert "das_hcu = hcu_vllm_das.extension:extension_spec" in entry_point_lines
+    assert "das_hcu_w4a8 = hcu_vllm_das.w4a8.lifecycle:extension_spec" in entry_point_lines
     assert "[vllm.platform_plugins]" not in entry_point_lines
     assert "[vllm.general_plugins]" not in entry_point_lines
     assert any(name == "hcu_vllm_das/__init__.py" for name in names)
