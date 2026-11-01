@@ -17,6 +17,7 @@ dependencies = [
 
 [project.entry-points."hcu_adapter.extensions"]
 das_hcu = "hcu_vllm_das.extension:extension_spec"
+das_hcu_w4a8 = "hcu_vllm_das.w4a8.lifecycle:extension_spec"
 
 [tool.setuptools.packages.find]
 where = ["src"]
