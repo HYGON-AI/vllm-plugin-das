@@ -281,6 +281,13 @@ class HcuFlashAttentionImpl(FlashAttentionImpl):
 class HcuFlashAttentionBackend(FlashAttentionBackend):
     """Select dense HND/NHD HCU views through vLLM's backend seam."""
 
+    @classmethod
+    def validate_configuration(cls, *args, **kwargs):
+        from hcu_vllm_das.flash_activation import require_published
+
+        require_published(cls)
+        return super().validate_configuration(*args, **kwargs)
+
     supported_kv_cache_dtypes: ClassVar[list[str]] = [
         "auto",
         "float16",
