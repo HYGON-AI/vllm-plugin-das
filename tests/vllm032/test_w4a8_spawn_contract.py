@@ -275,11 +275,15 @@ def _run(case):
         assert identity is not None, "missing owned spawn birth identity"
         assert reader.poll(75), "spawn child failed to report"
         row = reader.recv()
-        process.join(5)
+        if "QNT009_SPAWN_EVIDENCE_DIR" in os.environ:
+            (destination / f"{case}-reported.json").write_text(
+                json.dumps(row, indent=2) + "\n"
+            )
+        process.join(10)
         row["child_exitcode"] = process.exitcode
         row["spawn_pid"] = process.pid
         row["spawn_identity"] = identity
-        assert process.exitcode == 0
+        assert process.exitcode == 0, ("spawn child did not exit cleanly", row)
         assert not torch.cuda.is_initialized()
     finally:
         try:
