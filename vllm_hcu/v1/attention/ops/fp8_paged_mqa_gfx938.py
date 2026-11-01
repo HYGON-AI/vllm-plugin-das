@@ -5,6 +5,9 @@
 import torch
 from vllm.triton_utils import tl, triton
 
+# Per-row program count of the decode grid, which skips the -inf tail fill.
+_LIVE_TILE_PROGRAMS = 32
+
 
 @triton.jit
 def _paged_logits(
@@ -99,6 +102,93 @@ def _paged_logits(
         tokens < MAX_LEN,
     )
 
+
+@triton.jit
+def _paged_logits_live_tiles(
+    Q,
+    Cache,
+    Weights,
+    Lengths,
+    Tables,
+    Out,
+    Q_BATCH: tl.constexpr,
+    Q_NEXT: tl.constexpr,
+    Q_HEAD: tl.constexpr,
+    W_ROW: tl.constexpr,
+    W_HEAD: tl.constexpr,
+    L_BATCH: tl.constexpr,
+    L_NEXT: tl.constexpr,
+    T_BATCH: tl.constexpr,
+    T_PAGE: tl.constexpr,
+    NEXT_N: tl.constexpr,
+    HEADS: tl.constexpr,
+    DIM: tl.constexpr,
+    PAGE_SIZE: tl.constexpr,
+    CACHE_PAGE_STRIDE: tl.constexpr,
+    NUM_PAGES: tl.constexpr,
+    TABLE_WIDTH: tl.constexpr,
+    MAX_LEN: tl.constexpr,
+    PER_QUERY: tl.constexpr,
+    BLOCK_H: tl.constexpr,
+    BLOCK_D: tl.constexpr,
+    BLOCK_T: tl.constexpr,
+    TILE_PROGRAMS: tl.constexpr,
+):
+    """_paged_logits without the -inf tail, on a fixed [rows, TILE_PROGRAMS] grid.
+
+    Each program loads its query and head weights once and strides over the
+    row's live tiles.  A grid sized by max_model_len spends ~200 us per layer
+    on programs past the context end at 1M context, even though they exit
+    immediately.
+    """
+    row = tl.program_id(0)
+    batch = row // NEXT_N
+    query = row % NEXT_N
+    heads = tl.arange(0, BLOCK_H)
+    dims = tl.arange(0, BLOCK_D)
+    if PER_QUERY:
+        end = tl.load(Lengths + batch * L_BATCH + query * L_NEXT)
+    else:
+        end = tl.load(Lengths + batch * L_BATCH) - NEXT_N + 1 + query
+    query_values = tl.load(
+        Q + batch * Q_BATCH + query * Q_NEXT + heads[:, None] * Q_HEAD + dims[None, :],
+        (heads[:, None] < HEADS) & (dims[None, :] < DIM),
+        0.0,
+    )
+    weights = tl.load(Weights + row * W_ROW + heads * W_HEAD, heads < HEADS, 0)
+    for tile in range(tl.program_id(1), tl.cdiv(end, BLOCK_T), TILE_PROGRAMS):
+        tokens = tile * BLOCK_T + tl.arange(0, BLOCK_T)
+        logical_page = tokens // PAGE_SIZE
+        valid = (tokens < MAX_LEN) & (tokens < end) & (logical_page < TABLE_WIDTH)
+        page = tl.load(
+            Tables + batch * T_BATCH + logical_page * T_PAGE, valid, other=-1
+        ).to(tl.int64)
+        valid = valid & (page >= 0) & (page < NUM_PAGES)
+        # HCU still faults on masked OOB pointers; clamp before forming addresses.
+        page = tl.where(valid, page, 0)
+        slot = tokens % PAGE_SIZE
+        page_base = page.to(tl.int64) * CACHE_PAGE_STRIDE
+        in_page_offset = (
+            (slot[None, :] // 16) * (16 * DIM)
+            + (dims[:, None] // 16) * 256
+            + (slot[None, :] % 16) * 16
+            + dims[:, None] % 16
+        )
+        offset = page_base[None, :] + in_page_offset.to(tl.int64)
+        keys = tl.load(Cache + offset, (dims[:, None] < DIM) & valid[None, :], 0.0)
+        dots = tl.dot(query_values, keys)
+        scale_ptr = (Cache + page_base + PAGE_SIZE * DIM + slot * 4).to(
+            tl.pointer_type(tl.float32)
+        )
+        scales = tl.load(scale_ptr, valid, 0)
+        scores = tl.sum(tl.maximum(dots, 0) * weights[:, None], axis=0) * scales
+        tl.store(
+            Out + row * MAX_LEN + tokens,
+            tl.where(valid, scores, -float("inf")),
+            tokens < MAX_LEN,
+        )
+
+
 def gfx938_fp8_paged_mqa_logits(
     q_fp8: torch.Tensor,
     kv_cache_fp8: torch.Tensor,
@@ -170,7 +260,16 @@ def gfx938_fp8_paged_mqa_logits(
         return output
 
     cache = kv_cache_fp8.view(q_fp8.dtype)
-    _paged_logits[(batch * next_n, triton.cdiv(max_model_len, 64))](
+    num_tiles = triton.cdiv(max_model_len, 64)
+    if fill_tail:
+        kernel, grid, tile_args = _paged_logits, (batch * next_n, num_tiles), (fill_tail,)
+    else:
+        # The tail is left unwritten, so a fixed per-row program count
+        # striding over live tiles covers any context length.
+        tile_programs = min(num_tiles, _LIVE_TILE_PROGRAMS)
+        kernel = _paged_logits_live_tiles
+        grid, tile_args = (batch * next_n, tile_programs), (tile_programs,)
+    kernel[grid](
         q_fp8,
         cache,
         weights,
@@ -194,7 +293,7 @@ def gfx938_fp8_paged_mqa_logits(
         max(16, triton.next_power_of_2(heads)),
         triton.next_power_of_2(dim),
         64,
-        fill_tail,
+        *tile_args,
         num_warps=4,
     )
     return output

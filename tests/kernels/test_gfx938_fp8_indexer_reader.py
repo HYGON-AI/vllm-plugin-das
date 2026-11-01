@@ -137,6 +137,30 @@ def test_skip_tail_preserves_every_valid_row_prefix(per_query):
 
 
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="requires HCU GPU")
+@pytest.mark.parametrize("per_query", [False, True])
+def test_skip_tail_strides_live_tiles_past_decode_grid(per_query):
+    """Rows with more live tiles than decode-grid programs loop over them."""
+    from vllm_hcu.v1.attention.ops import fp8_paged_mqa_gfx938
+
+    tile_programs = fp8_paged_mqa_gfx938._LIVE_TILE_PROGRAMS
+    args, expected = _case(64, 64 * (2 * tile_programs + 5) + 7, 2, 3, per_query)
+    actual = gfx938_fp8_paged_mqa_logits(*args, fill_tail=False)
+    q, _, _, context, _, max_len = args
+    next_n = q.shape[1]
+    if per_query:
+        row_ends = context.reshape(-1)
+    else:
+        offsets = torch.arange(next_n, device=context.device)
+        row_ends = (context[:, None] - next_n + 1 + offsets).reshape(-1)
+    valid = torch.arange(max_len, device=actual.device)[None, :] < row_ends[:, None]
+    assert torch.equal(
+        torch.isneginf(actual[valid]), torch.isneginf(expected[valid])
+    )
+    finite = valid & torch.isfinite(expected)
+    torch.testing.assert_close(actual[finite], expected[finite], rtol=1e-3, atol=1e-2)
+
+
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="requires HCU GPU")
 def test_skip_tail_graph_replay_masks_empty_and_short_rows_in_topk():
     """Skipped tiles may stay dirty, but the production top-k must ignore them."""
     from vllm_hcu.v1.attention.ops.rocm_aiter_mla_sparse import (
