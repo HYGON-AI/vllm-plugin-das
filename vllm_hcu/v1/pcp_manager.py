@@ -297,6 +297,17 @@ class HcuPCPManager:
             largest = max(largest, local_tokens)
         return largest
 
+    @staticmethod
+    def _pinned(array: np.ndarray) -> torch.Tensor:
+        # A pinned snapshot lets the H2D copy run without a host sync; a
+        # pageable copy waits for all queued GPU work (the previous step's
+        # drafter), which exposed ~4 ms of metadata building per decode step.
+        # The snapshot also keeps reused numpy scratch buffers safe to edit.
+        return torch.from_numpy(array).pin_memory()
+
+    def _to_device(self, array: np.ndarray) -> torch.Tensor:
+        return self._pinned(array).to(self.device, non_blocking=True)
+
     @property
     def input_buffers(self) -> InputBuffers:
         return self._input_buffers
@@ -489,17 +500,11 @@ class HcuPCPManager:
                         dtype=np.int64,
                     )
 
-        self._hidden_restore_idx = torch.from_numpy(hidden_restore_idx).to(
-            self.device
-        )
+        self._hidden_restore_idx = self._to_device(hidden_restore_idx)
         self._hidden_restore_idx_np = hidden_restore_idx
         self._padded_num_tokens = padded_num_tokens
-        self._padded_gather_idx = torch.from_numpy(padded_gather_idx).to(
-            self.device
-        )
-        self._gathered_kv_write_mask = torch.from_numpy(kv_write_mask).to(
-            self.device
-        )
+        self._padded_gather_idx = self._to_device(padded_gather_idx)
+        self._gathered_kv_write_mask = self._to_device(kv_write_mask)
         return segments_by_rank, per_rank_num_tokens
 
     def partition_batch(
@@ -554,13 +559,13 @@ class HcuPCPManager:
         local_idx_mapping_np = self._idx_mapping_np[:num_local_reqs]
         local_idx_mapping_np[:] = input_batch.idx_mapping_np[global_req_indices]
         local_idx_mapping = self._idx_mapping[:num_local_reqs]
-        local_idx_mapping.copy_(torch.from_numpy(local_idx_mapping_np).to(self.device))
+        local_idx_mapping.copy_(self._pinned(local_idx_mapping_np), non_blocking=True)
 
         query_start_np = self._query_start_loc_np[: num_local_reqs + 1]
         query_start_np[0] = 0
         np.cumsum(local_lengths, out=query_start_np[1:])
         query_start = self._query_start_loc[: num_local_reqs + 1]
-        query_start.copy_(torch.from_numpy(query_start_np).to(self.device))
+        query_start.copy_(self._pinned(query_start_np), non_blocking=True)
 
         local_start_pos_np = np.fromiter(
             (
@@ -638,7 +643,7 @@ class HcuPCPManager:
             :num_padded_tokens
         ]
         replicated_slot_indices.copy_(
-            torch.from_numpy(replicated_slot_indices_np).to(self.device)
+            self._pinned(replicated_slot_indices_np), non_blocking=True
         )
 
         # A full request row can reuse MRV2's rejection-corrected device
@@ -656,7 +661,7 @@ class HcuPCPManager:
         seq_index = self._logits_indices[:num_local_reqs]
         if full_request_rows:
             seq_scratch_np[:] = global_req_indices
-            seq_index.copy_(torch.from_numpy(seq_scratch_np).to(self.device))
+            seq_index.copy_(self._pinned(seq_scratch_np), non_blocking=True)
             torch.index_select(
                 input_batch.seq_lens,
                 0,
@@ -667,7 +672,7 @@ class HcuPCPManager:
             # Split prefill rows use the last preserved position as their local
             # sequence end. Padding-only rows retain their virtual row width.
             seq_scratch_np[:] = [segment.padding_tokens for segment in segments]
-            seq_lens.copy_(torch.from_numpy(seq_scratch_np).to(self.device))
+            seq_lens.copy_(self._pinned(seq_scratch_np), non_blocking=True)
             actual_rows = [
                 row
                 for row, segment in enumerate(segments)
@@ -683,9 +688,7 @@ class HcuPCPManager:
                 ]
                 actual_last_index = self._logits_indices[:num_actual_rows]
                 actual_last_index.copy_(
-                    torch.from_numpy(seq_scratch_np[:num_actual_rows]).to(
-                        self.device
-                    )
+                    self._pinned(seq_scratch_np[:num_actual_rows]), non_blocking=True
                 )
                 actual_seq_lens_i64 = self._seq_lens_i64[:num_actual_rows]
                 torch.index_select(
@@ -698,9 +701,7 @@ class HcuPCPManager:
                 seq_scratch_np[:num_actual_rows] = actual_rows
                 actual_row_index = self._logits_indices[:num_actual_rows]
                 actual_row_index.copy_(
-                    torch.from_numpy(seq_scratch_np[:num_actual_rows]).to(
-                        self.device
-                    )
+                    self._pinned(seq_scratch_np[:num_actual_rows]), non_blocking=True
                 )
                 seq_lens.index_copy_(
                     0,
@@ -734,17 +735,15 @@ class HcuPCPManager:
                 dtype=np.int64,
             )
             logits_offset += count
-        logits_indices.copy_(torch.from_numpy(logits_indices_np).to(self.device))
+        logits_indices.copy_(self._pinned(logits_indices_np), non_blocking=True)
         cu_num_logits_np = self._cu_num_logits_np[: num_local_reqs + 1]
         cu_num_logits_np[0] = 0
         np.cumsum(local_num_logits, out=cu_num_logits_np[1:])
         cu_num_logits = self._cu_num_logits[: num_local_reqs + 1]
-        cu_num_logits.copy_(torch.from_numpy(cu_num_logits_np).to(self.device))
+        cu_num_logits.copy_(self._pinned(cu_num_logits_np), non_blocking=True)
 
         if num_logits:
-            local_num_logits_tensor = torch.from_numpy(local_num_logits).to(
-                self.device
-            )
+            local_num_logits_tensor = self._to_device(local_num_logits)
             expanded_idx_mapping = torch.repeat_interleave(
                 local_idx_mapping,
                 local_num_logits_tensor,
@@ -1069,10 +1068,10 @@ class HcuPCPManager:
         context_cu_np = np.zeros(len(local_context_lens_np) + 1, dtype=np.int32)
         np.cumsum(local_context_lens_np, out=context_cu_np[1:])
 
-        new_kv_idx = torch.from_numpy(new_kv_idx_np).to(self.device)
-        packed_int32 = torch.from_numpy(
+        new_kv_idx = self._to_device(new_kv_idx_np)
+        packed_int32 = self._to_device(
             np.concatenate((new_cu_np, local_context_lens_np, context_cu_np))
-        ).to(self.device)
+        )
         num_new_cu = len(new_cu_np)
         new_cu_kv = packed_int32[:num_new_cu]
 
