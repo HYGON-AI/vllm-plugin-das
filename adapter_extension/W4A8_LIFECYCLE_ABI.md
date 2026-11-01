@@ -22,7 +22,8 @@ These must be synchronous callables whose signatures accept the documented
 arguments without extra required parameters. Compatible optional arguments are
 accepted. This is a minimum capability requirement, not an exact Adapter wheel,
 version string or commit check. Adapter PR19's public facade revision
-`2be0047` supplies these vLLM admission queries and reexports the shared pair
+`3cc62f8` (same callable ABI as `2be0047`, corrected non-None guard diagnostics)
+supplies these vLLM admission queries and reexports the shared pair
 API. Declarations, contexts and synchronization remain framework-free in
 `hcu_adapter.model_load`; worker/executor/env-cache admission belongs to the
 facade. Do not add reverse imports or old-path aliases to the shared module.
@@ -83,7 +84,14 @@ usable. An already fatal dependency (including suppressed exception context)
 remains fatal even before W4 publishes anything. Clean pair-registration failure
 remains optional and retryable after the Adapter rolls back its two hooks.
 
-Minimum source dependencies are Adapter PR17, public-facade PR19 (`2be0047`)
+Preflight also preserves the raw cause without interpolating it into optional
+ABI diagnostics. Once the public fatal classifier/type are validated, a typed
+fatal dependency is latched before rendering, including during actual extension
+activation before `install()`. The activation attempt is fork-protected and
+nested install attempts preserve that marker. Clean preflight refusals still
+remain optional; diagnostic failure alone never upgrades them to fatal.
+
+Minimum source dependencies are Adapter PR17, public-facade PR19 (`3cc62f8`)
 and independent public-fatal PR23 (`09bd79a`). PR23 does not depend on PR19.
 Environment-driven required owner/capability deployment additionally uses PR20;
 the existing public ExtensionContext required API is not evidence of PR20 env

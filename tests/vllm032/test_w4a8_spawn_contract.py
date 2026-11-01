@@ -14,6 +14,7 @@ import inspect
 import json
 import os
 from pathlib import Path
+import signal
 import subprocess
 import sys
 import traceback
@@ -26,6 +27,66 @@ CONSUMER = (
     "compressed_tensors_moe.compressed_tensors_moe_w8a8_int8"
 )
 IMPORT_STACKS = []
+
+
+def _process_identity(pid):
+    try:
+        fields = Path(f"/proc/{pid}/stat").read_text().rsplit(")", 1)[1].split()
+    except FileNotFoundError:
+        return None
+    return dict(pid=pid, starttime=int(fields[19]))
+
+
+def _cleanup_spawn_child(process, identity, *, term_s=5, kill_s=5):
+    """Signal only this multiprocessing child and prove its identity disappeared."""
+    terminated = killed = False
+    if process.is_alive():
+        process.terminate()
+        terminated = True
+        process.join(term_s)
+    if process.is_alive():
+        process.kill()
+        killed = True
+        process.join(kill_s)
+    process.join(0)
+    assert not process.is_alive() and process.exitcode is not None, (
+        "owned spawn child survived bounded TERM/KILL", identity
+    )
+    observed = _process_identity(process.pid)
+    assert observed is None or observed != identity, (
+        "owned spawn identity remains after reap", identity, observed
+    )
+    return dict(identity=identity, terminated=terminated, killed=killed,
+                exitcode=process.exitcode, all_owned_absent=True)
+
+
+def _ignore_term_child(writer):
+    signal.signal(signal.SIGTERM, signal.SIG_IGN)
+    writer.send(True)
+    writer.close()
+    while True:
+        signal.pause()
+
+
+@pytest.mark.skipif(not hasattr(os, "fork"), reason="requires POSIX owned fork")
+def test_spawn_cleanup_escalates_only_its_term_resistant_child():
+    """Real stdlib child, no framework/provider imports or device access."""
+    import multiprocessing as mp
+
+    context = mp.get_context("fork")
+    reader, writer = context.Pipe(duplex=False)
+    process = context.Process(target=_ignore_term_child, args=(writer,))
+    process.start()
+    identity = _process_identity(process.pid)
+    writer.close()
+    try:
+        assert reader.poll(5) and reader.recv() is True
+    finally:
+        receipt = _cleanup_spawn_child(process, identity, term_s=.1, kill_s=2)
+        reader.close()
+    assert identity is not None
+    assert receipt["terminated"] and receipt["killed"]
+    assert receipt["exitcode"] == -signal.SIGKILL
 
 
 class ObserveConsumer(importlib.abc.MetaPathFinder):
@@ -78,6 +139,8 @@ def test_spawn_config_does_not_freeze_int8_consumer_before_oracle(tmp_path, case
     assert row["start_method"] == "spawn" and row["config_roundtrip"]
     assert not row["consumer_at_child_entry"], row
     assert row["GPU"] == "not-run" and row["child_exitcode"] == 0
+    assert row["cleanup"]["all_owned_absent"]
+    assert row["cleanup"]["identity"] == row["spawn_identity"]
     assert "unexpected_error" not in row, row
     assert row["consumer_alias_matches_oracle"], row
     if case == "foreign-consumer":
@@ -202,21 +265,33 @@ def _run(case):
     reader, writer = context.Pipe(duplex=False)
     process = context.Process(target=_child, args=(config, expected, case, writer))
     process.start()
+    identity = _process_identity(process.pid)
     writer.close()
+    destination = Path(os.environ.get("QNT009_SPAWN_EVIDENCE_DIR", "."))
+    if "QNT009_SPAWN_EVIDENCE_DIR" in os.environ:
+        destination.mkdir(parents=True, exist_ok=True)
+        (destination / f"{case}-birth.json").write_text(json.dumps(identity) + "\n")
     try:
-        assert reader.poll(90), "spawn child failed to report"
+        assert identity is not None, "missing owned spawn birth identity"
+        assert reader.poll(75), "spawn child failed to report"
         row = reader.recv()
-        process.join(10)
+        process.join(5)
         row["child_exitcode"] = process.exitcode
         row["spawn_pid"] = process.pid
+        row["spawn_identity"] = identity
         assert process.exitcode == 0
         assert not torch.cuda.is_initialized()
-        print("SPAWN_EVIDENCE=" + json.dumps(row), flush=True)
     finally:
-        if process.is_alive():
-            process.terminate()
-            process.join(10)
-        reader.close()
+        try:
+            cleanup = _cleanup_spawn_child(process, identity)
+            if "QNT009_SPAWN_EVIDENCE_DIR" in os.environ:
+                (destination / f"{case}-cleanup.json").write_text(
+                    json.dumps(cleanup, indent=2) + "\n"
+                )
+        finally:
+            reader.close()
+    row["cleanup"] = cleanup
+    print("SPAWN_EVIDENCE=" + json.dumps(row), flush=True)
 
 
 if __name__ == "__main__":

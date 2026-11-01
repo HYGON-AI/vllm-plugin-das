@@ -63,7 +63,8 @@ Those gates must run on a new immutable build after dependency review.
 ## Dependencies and remaining scope
 
 Minimum dependencies are Adapter PR17, PR19's public
-`bridges.vllm_model_load` facade (`2be0047`) and independent public-fatal PR23
+`bridges.vllm_model_load` facade (`3cc62f8`, ABI-compatible diagnostic follow-up
+to `2be0047`) and independent public-fatal PR23
 (`09bd79a`). Source CPU contracts use a test-only composition of exactly these
 published sources, not the broader integration tree. PR20 supplies optional
 environment-required startup policy; public ExtensionContext required tests
@@ -95,3 +96,18 @@ MTP, INT8 PLE, EP and `deepep_auto` remain pending independent implementation an
 hardware/model gates. Checkpoint MTP tensor inventory is not a working draft
 path. This proposal makes no new topology, shutdown-cleanliness or performance
 claim and does not merge unrelated optional features.
+
+The follow-up to candidate `b0d30ca` closes activation-preflight diagnostic
+formatting outside `install()`: typed fatal causes latch before rendering,
+while clean optional failures preserve their cause and stay retryable. Actual
+public extension/host regression cases cover both fatal-ABI and lifecycle-facade
+preflight, bad strings raising Exception/BaseException, retry and bounded fork.
+Their final framework source/installed execution is pending release of the
+exclusive RMS resource window; the old 189-pass/one-fail run is not a final pass.
+
+Spawn helpers record PID/starttime immediately, shorten their bounded report
+wait, and escalate only their owned multiprocessing child through TERM/KILL,
+reap and identity-absence checks. The test suite includes an actual stdlib
+TERM-resistant child. This is test harness cleanup, not a model shutdown fix.
+The original `384460b` test fixture and its failure evidence remain immutable;
+final tests must use a new fixture incorporating exact PR19 `3cc62f8`.

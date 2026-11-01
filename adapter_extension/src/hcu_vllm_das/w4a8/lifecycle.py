@@ -58,32 +58,41 @@ class W4LifecycleError(RuntimeError):
     """The optional W4 owner cannot safely load, freeze or mutate models."""
 
 
+def _require_synchronous_abi(function, arguments):
+    if not callable(function):
+        raise TypeError("missing public classifier/runtime health query")
+    implementations = (function,) if inspect.isroutine(function) else (function, function.__call__)
+    if any(check(value) for value in implementations for check in (
+        inspect.iscoroutinefunction, inspect.isasyncgenfunction, inspect.isgeneratorfunction,
+    )):
+        raise TypeError("requires synchronous fatal ABI")
+    inspect.signature(function).bind(*arguments)
+
+
 def _require_commit_failure_abi():
-    """Pure ABI validation; callers query health before taking owner locks."""
+    """Validate public ABI and preserve fatal chains; query health before locks."""
+    fatal = None
     try:
         api = import_module("hcu_adapter.extensions")
         error_type = getattr(api, "ExtensionCommitError", None)
         if not inspect.isclass(error_type) or not issubclass(error_type, RuntimeError):
             raise TypeError("missing public ExtensionCommitError type")
         inspect.signature(error_type).bind("commit failed", reports=())
+        _require_synchronous_abi(
+            getattr(api, "is_fatal_extension_error", None), (RuntimeError(),)
+        )
+        fatal = api
         bridge = import_module("hcu_adapter.bridges.vllm")
         health = getattr(bridge, "require_runtime_healthy", None)
-        for function, arguments in ((getattr(api, "is_fatal_extension_error", None), (RuntimeError(),)),
-                                    (health, ())):
-            if not callable(function):
-                raise TypeError("missing public classifier/runtime health query")
-            implementations = (function,) if inspect.isroutine(function) else (function, function.__call__)
-            if any(check(value) for value in implementations for check in (
-                inspect.iscoroutinefunction, inspect.isasyncgenfunction, inspect.isgeneratorfunction,
-            )):
-                raise TypeError("requires synchronous fatal ABI")
-            inspect.signature(function).bind(*arguments)
+        _require_synchronous_abi(health, ())
         return api, health
     except Exception as error:
+        if fatal is not None and fatal.is_fatal_extension_error(error):
+            _raise_install_failure(fatal.ExtensionCommitError, error, published=False)
         raise W4LifecycleError(
             "Optional W4A8 requires Adapter public commit-fatal ABI: ExtensionCommitError, "
             "is_fatal_extension_error(error), require_runtime_healthy(); "
-            f"preflight failed: {error}"
+            "preflight failed (original cause preserved)"
         ) from error
 
 
@@ -122,11 +131,12 @@ if hasattr(os, "register_at_fork"):
 @contextmanager
 def _installation_attempt(error_type):
     global _installing_error_type
+    previous = _installing_error_type
     _installing_error_type = error_type
     try:
         yield
     finally:
-        _installing_error_type = None
+        _installing_error_type = previous
 
 
 def _raise_install_failure(error_type, error, *, published):
@@ -288,7 +298,7 @@ def _lifecycle_arguments():
 
 def _preflight_adapter():
     _check_commit_failure()
-    _require_commit_failure_abi()
+    fatal, _ = _require_commit_failure_abi()
     subject = "hcu_adapter.bridges.vllm_model_load"
     try:
         module = import_module(subject)
@@ -342,8 +352,10 @@ def _preflight_adapter():
         module.preflight_model_lifecycle_hooks(**_lifecycle_arguments())
         return module
     except Exception as error:
+        if fatal.is_fatal_extension_error(error):
+            _raise_install_failure(fatal.ExtensionCommitError, error, published=False)
         raise W4LifecycleError(
-            f"Optional W4A8 requires Adapter postload + mutation ABI with public atomic lifecycle hooks; {subject}: {error}"
+            f"Optional W4A8 requires Adapter postload + mutation ABI with public atomic lifecycle hooks; {subject} (original cause preserved)"
         ) from error
 
 
@@ -522,19 +534,25 @@ def install():
 
 def activate(context):
     _check_commit_failure()
-    _, health = _require_commit_failure_abi()
+    fatal, health = _require_commit_failure_abi()
     health()
     from packaging.version import Version
 
     version = Version(context.vllm_version)
     if version.epoch != 0 or version.release[:2] != (0, 32):
         raise W4LifecycleError("QNT009 requires the vLLM 0.32 release line")
-    _preflight_adapter()
-    from hcu_adapter.bridges.vllm import detect_hcu
+    with _installation_attempt(fatal.ExtensionCommitError):
+        try:
+            _preflight_adapter()
+            from hcu_adapter.bridges.vllm import detect_hcu
 
-    if not detect_hcu().detected:
-        raise W4LifecycleError("QNT009 requires a detected HCU host")
-    install()
+            if not detect_hcu().detected:
+                raise W4LifecycleError("QNT009 requires a detected HCU host")
+            install()
+        except Exception as error:
+            if fatal.is_fatal_extension_error(error):
+                _raise_install_failure(fatal.ExtensionCommitError, error, published=False)
+            raise
 
 
 def extension_spec():

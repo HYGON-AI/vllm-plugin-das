@@ -894,8 +894,10 @@ def test_independent_public_fatal_abi_rejects_async_health(monkeypatch):
         return None
 
     monkeypatch.setattr(bridge, "require_runtime_healthy", incompatible)
-    with pytest.raises(owner.W4LifecycleError, match="synchronous fatal ABI"):
+    with pytest.raises(owner.W4LifecycleError, match="public commit-fatal ABI") as caught:
         owner.install()
+    assert isinstance(caught.value.__cause__, TypeError)
+    assert str(caught.value.__cause__) == "requires synchronous fatal ABI"
     assert not owner._installed
 
 
@@ -1101,3 +1103,142 @@ def test_clean_atomic_second_hook_failure_remains_optional_and_retryable(monkeyp
     adapter.register_post_model_load(owner.OWNER, owner.after_model_load)
     monkeypatch.setattr(adapter, "register_model_mutation_guard", original)
     assert owner.install()
+
+
+@pytest.mark.parametrize("stage", ["fatal-abi", "facade"])
+@pytest.mark.parametrize("render_error", [RuntimeError, KeyboardInterrupt])
+@pytest.mark.parametrize("fork_in_render", [False, True])
+def test_actual_activation_preflight_preserves_unrenderable_fatal(
+    monkeypatch, stage, render_error, fork_in_render,
+):
+    """Actual public activation/runtime host; dependency fault before any packing."""
+    import hcu_adapter.extensions as public
+    from hcu_adapter.bridges import vllm as host
+
+    if fork_in_render and not hasattr(os, "fork"):
+        pytest.skip("POSIX fork required")
+    actions = host.ProcessLocalActions()
+    original_import = owner.import_module
+    seen, later = [], []
+
+    class BadFatal(public.ExtensionCommitError):
+        def __str__(self):
+            seen.append(owner._commit_failure is not None)
+            if fork_in_render:
+                _bounded_fork_refusal(owner.install)
+            raise render_error("unrenderable typed preflight failure")
+
+    failure = BadFatal("dependency already failed")
+    subject = ("hcu_adapter.bridges.vllm" if stage == "fatal-abi" else
+               "hcu_adapter.bridges.vllm_model_load")
+
+    def dependency(name):
+        if name == subject:
+            raise failure
+        return original_import(name)
+
+    monkeypatch.setattr(owner, "import_module", dependency)
+    points = [
+        NS(name="w4", load=lambda: owner.extension_spec),
+        NS(name="later", load=lambda: lambda: public.ExtensionSpec(
+            "later", 1, 0, {"later"}, lambda context: later.append(True))),
+    ]
+    context = public.ExtensionContext("cpu", "0.32.0")
+
+    def boot():
+        public.activate_extensions(context, points)
+
+    with pytest.raises(host.LatchedVllmRuntimeError) as caught:
+        actions.run_once("vllm-runtime", boot)
+    assert seen and all(seen) and not later
+    assert owner._commit_failure is not None
+    assert owner._installing_error_type is None
+    assert owner.FACTOR not in envs.environment_variables
+    assert "slimquant_w4a8" not in registry._CUSTOMIZED_METHOD_TO_QUANT_CONFIG
+    chain, current = [], caught.value
+    while current is not None and all(current is not c for c in chain):
+        chain.append(current)
+        current = current.__cause__
+    assert any(c is failure for c in chain)
+    reports = next(c.reports for c in chain
+                   if isinstance(c, public.ExtensionCommitError) and c.reports)
+    assert len(reports) == 1 and reports[0].status.value == "failed"
+    with pytest.raises(host.LatchedVllmRuntimeError):
+        actions.require_runtime_healthy()
+    with pytest.raises(host.LatchedVllmRuntimeError):
+        actions.run_once("vllm-runtime", lambda: later.append(True))
+    for operation in (owner.install, owner.require_selection,
+                      lambda: owner.activate(context)):
+        with pytest.raises(public.ExtensionCommitError):
+            operation()
+    monkeypatch.setattr(owner, "import_module", original_import)
+    if fork_in_render:
+        _bounded_fork_refusal(owner.install)
+
+
+@pytest.mark.parametrize("stage", ["fatal-abi", "facade"])
+def test_actual_activation_clean_preflight_stays_optional_without_rendering(
+    monkeypatch, stage,
+):
+    import hcu_adapter.extensions as public
+    from hcu_adapter.bridges import vllm as host
+
+    original_import = owner.import_module
+    rendered, later = [], []
+
+    class CleanFailure(RuntimeError):
+        def __str__(self):
+            rendered.append(True)
+            raise KeyboardInterrupt("clean diagnostic cannot render")
+
+    failure = CleanFailure("no publication")
+    subject = ("hcu_adapter.bridges.vllm" if stage == "fatal-abi" else
+               "hcu_adapter.bridges.vllm_model_load")
+
+    def dependency(name):
+        if name == subject:
+            raise failure
+        return original_import(name)
+
+    monkeypatch.setattr(owner, "import_module", dependency)
+    points = [
+        NS(name="w4", load=lambda: owner.extension_spec),
+        NS(name="later", load=lambda: lambda: public.ExtensionSpec(
+            "later", 1, 0, {"later"}, lambda context: later.append(True))),
+    ]
+    actions, reports = host.ProcessLocalActions(), []
+    actions.run_once("vllm-runtime", lambda: reports.extend(
+        public.activate_extensions(public.ExtensionContext("cpu", "0.32.0"), points)
+    ))
+    assert not rendered and later == [True]
+    assert {report.entry_point_name: report.status.value for report in reports} == {
+        "w4": "failed", "later": "active",
+    }
+    assert owner._commit_failure is None and owner._installing_error_type is None
+    assert owner.FACTOR not in envs.environment_variables
+    assert "slimquant_w4a8" not in registry._CUSTOMIZED_METHOD_TO_QUANT_CONFIG
+    actions.require_runtime_healthy()
+    monkeypatch.setattr(owner, "import_module", original_import)
+    assert owner.install()
+
+
+@pytest.mark.skipif(not hasattr(os, "fork"), reason="requires bounded POSIX fork")
+def test_actual_activation_preflight_fork_refuses_child_but_not_clean_parent(monkeypatch):
+    import hcu_adapter.extensions as public
+
+    original = owner._preflight_adapter
+
+    def preflight():
+        def child_retry():
+            owner._preflight_adapter = original
+            owner.install()
+        _bounded_fork_refusal(child_retry)
+        raise owner.W4LifecycleError("clean dependency refusal after child receipt")
+
+    monkeypatch.setattr(owner, "_preflight_adapter", preflight)
+    point = NS(name="w4", load=lambda: owner.extension_spec)
+    reports = public.activate_extensions(public.ExtensionContext("cpu", "0.32.0"), [point])
+    assert reports[0].status.value == "failed"
+    assert owner._commit_failure is None and owner._installing_error_type is None
+    assert owner.FACTOR not in envs.environment_variables
+    assert "slimquant_w4a8" not in registry._CUSTOMIZED_METHOD_TO_QUANT_CONFIG

@@ -28,6 +28,10 @@ Store a fixed refusal before formatting: `__str__` can throw BaseException,
 reenter or fork. Fatal dependency chains cannot become clean optional errors.
 An inflight/failed/frozen parent cannot become a fresh healthy child by resetting
 locks. Host health queries occur before owner locks; never implement recovery.
+Cover actual `activate()` preflight as well as late `install()` publication:
+preserve raw causes without formatting clean optional errors, and latch an
+already typed fatal dependency before rendering. Fork protection starts at
+activation preflight; nested install markers must preserve their outer scope.
 
 Preserve explicit `-q slimquant_w4a8`, native default OFF via
 `VLLM_HCU_DAS_W4A8_NATIVE=0`, and `1` as opt-in. Global AITER stays OFF unless
@@ -48,6 +52,9 @@ pytest compatible and bound their own fork children. Real registry/hooks/Worker
 contracts and CPU doubles must be identified separately. Test pure import,
 callable signature failures, clean versus fatal publication, broken formatting,
 fork before/during publication, target/draft guards, config overrides and hashes.
+Spawn helpers must retain the exact child PID/starttime, bound TERM/KILL and
+reap/absence verification. Include a real TERM-resistant owned-child regression;
+never signal an external process or call successful parent exit clean teardown.
 
 Source tests do not prove installation, HCU numerics, changed-input Graph,
 engine AOT persistence, model32 accuracy or clean exit. Rebuild immutable
