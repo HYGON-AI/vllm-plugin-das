@@ -102,12 +102,14 @@ formatting outside `install()`: typed fatal causes latch before rendering,
 while clean optional failures preserve their cause and stay retryable. Actual
 public extension/host regression cases cover both fatal-ABI and lifecycle-facade
 preflight, bad strings raising Exception/BaseException, retry and bounded fork.
-Their final framework source/installed execution is pending release of the
-exclusive RMS resource window; the old 189-pass/one-fail run is not a final pass.
+Execution was deferred during the exclusive RMS resource window. After release,
+the final source and isolated installed gates passed; exact identities, counts,
+commands and retained initial failures belong to the external immutable handoff.
+The old 189-pass/one-fail run is not promoted to a final pass.
 
 Spawn helpers record PID/starttime immediately, shorten their bounded report
 wait, and escalate only their owned multiprocessing child through TERM/KILL,
 reap and identity-absence checks. The test suite includes an actual stdlib
 TERM-resistant child. This is test harness cleanup, not a model shutdown fix.
 The original `384460b` test fixture and its failure evidence remain immutable;
-final tests must use a new fixture incorporating exact PR19 `3cc62f8`.
+final tests use a separate fixture incorporating exact PR19 `3cc62f8`.
