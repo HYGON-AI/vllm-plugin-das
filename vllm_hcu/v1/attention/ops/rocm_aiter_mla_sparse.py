@@ -11,7 +11,7 @@ import torch
 import torch.nn.functional as F
 
 from vllm.forward_context import get_forward_context
-from vllm.config import CUDAGraphMode
+from vllm.config import CUDAGraphMode, get_current_vllm_config
 from vllm.logger import init_logger
 from vllm.platforms import current_platform
 from vllm.triton_utils import tl, triton
@@ -100,14 +100,29 @@ def _reserve_lightop_identity_page_table_for_profile(
         and q_fp8.dtype == torch.float8_e4m3fn
     ):
         return
-    _lightop_identity_page_table(
-        hidden_states.device,
-        hidden_states.shape[0],
-        max_model_len,
-    )
-    _lightop_unit_query_cu_seqlens(
-        hidden_states.device, hidden_states.shape[0]
-    )
+    rows = hidden_states.shape[0]
+    try:
+        vllm_config = get_current_vllm_config()
+    except AssertionError:
+        # Standalone callers may not have an active configuration.
+        vllm_config = None
+    if vllm_config is not None:
+        speculative = vllm_config.speculative_config
+        speculative_tokens = (
+            speculative.num_speculative_tokens if speculative is not None else 0
+        )
+        if speculative_tokens is not None:
+            # This mapping is decode-only. Profiling can instead present an
+            # entire prefill batch, especially for a replicated MTP draft.
+            # Include verification and padding rows; a padded decode batch can
+            # exceed the number of actually scheduled tokens.
+            rows = min(
+                rows,
+                vllm_config.scheduler_config.max_num_seqs
+                * (speculative_tokens + 1),
+            )
+    _lightop_identity_page_table(hidden_states.device, rows, max_model_len)
+    _lightop_unit_query_cu_seqlens(hidden_states.device, rows)
 
 
 def _get_lightop_attention():
