@@ -1,0 +1,24 @@
+--- a/vllm/config/parallel.py
++++ b/vllm/config/parallel.py
+@@ -480,11 +480,18 @@
+                 )
+             if not self.enable_expert_parallel:
+                 raise ValueError("enable_expert_parallel must be True to use EPLB.")
+-            if self.tensor_parallel_size * self.data_parallel_size <= 1:
++            if (
++                self.tensor_parallel_size
++                * self.data_parallel_size
++                * self.prefill_context_parallel_size
++                <= 1
++            ):
+                 raise ValueError(
+-                    "EPLB requires tensor_parallel_size or data_parallel_size "
++                    "EPLB requires tensor_parallel_size, data_parallel_size "
++                    "or prefill_context_parallel_size "
+                     f"to be greater than 1, but got "
+-                    f"TP={self.tensor_parallel_size},DP={self.data_parallel_size}."
++                    f"TP={self.tensor_parallel_size},DP={self.data_parallel_size},"
++                    f"PCP={self.prefill_context_parallel_size}."
+                 )
+         else:
+             if self.eplb_config.num_redundant_experts != 0:
