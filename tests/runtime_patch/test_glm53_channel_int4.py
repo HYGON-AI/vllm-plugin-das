@@ -843,7 +843,11 @@ def test_projection_target_order_matches_native_with_broad_owner(
     projections = ("gate_proj", "up_proj", "down_proj")
     targets = (
         [r"re:^model\.layers\.4\.mlp\.experts\.\d+\.(gate_proj|up_proj|down_proj)$"]
-        if projection_regex else [f"{prefix}.0.{proj}" for proj in projections]
+        if projection_regex else [
+            f"{prefix}.{index}.{proj}"
+            for index in range(2)
+            for proj in projections
+        ]
     )
     groups = [
         ("local", dict(schemes[local_bits], targets=targets)),
@@ -864,7 +868,7 @@ def test_projection_target_order_matches_native_with_broad_owner(
     config.packed_modules_mapping = {}
     for index in layer_order:
         layer = RoutedExperts.__new__(RoutedExperts)
-        layer.moe_config = SimpleNamespace()
+        layer.moe_config = SimpleNamespace(num_logical_experts=2)
         current_prefix = f"model.layers.{index}.mlp.experts"
         expected_bits = local_bits if local_first and index == 4 else owner_bits
         native_bits = [
@@ -878,7 +882,7 @@ def test_projection_target_order_matches_native_with_broad_owner(
         assert config.get_quant_method(layer, current_prefix) == expected_method
     # Re-select after any parent-generated class alias has been installed.
     layer = RoutedExperts.__new__(RoutedExperts)
-    layer.moe_config = SimpleNamespace()
+    layer.moe_config = SimpleNamespace(num_logical_experts=2)
     assert config.get_quant_method(layer, prefix) == (
         "int4" if (local_bits if local_first else owner_bits) == 4 else "int8"
     )
@@ -1016,6 +1020,177 @@ def test_expert_projection_targets_and_class_fallback_agree(
     assert routed_expert_uses_glm_channel_int4(config, layer, runtime_prefix) is expected
     config.ignore = [f"{checkpoint_prefix}.0.down_proj"]
     assert routed_expert_uses_glm_channel_int4(config, layer, runtime_prefix) is False
+
+
+@pytest.mark.parametrize("kind", ["target", "ignore"])
+@pytest.mark.parametrize("expert_id", [0, 1])
+@pytest.mark.parametrize("projection_regex", [False, True])
+@pytest.mark.parametrize("wrapped", [False, True])
+def test_heterogeneous_experts_fail_before_fused_method_creation(
+    glm_quant_method_labels, kind, expert_id, projection_regex, wrapped
+) -> None:
+    from vllm.model_executor.layers.fused_moe import RoutedExperts
+    from vllm_hcu.model_executor.layers.quantization.glm_channel_int4 import (
+        routed_expert_uses_glm_channel_int4,
+    )
+
+    checkpoint_prefix = "model.layers.4.mlp.experts"
+    prefix = (
+        "model.layers.4.mtp_block.mlp.experts" if wrapped else checkpoint_prefix
+    )
+    projections = ("gate_proj", "up_proj", "down_proj")
+    targets = (
+        [rf"re:^model\.layers\.4\.mlp\.experts\.{expert_id}\."
+         r"(gate_proj|up_proj|down_proj)$"]
+        if projection_regex else [
+            f"{checkpoint_prefix}.{expert_id}.{proj}" for proj in projections
+        ]
+    )
+    quant = _quant_config()
+    if kind == "target":
+        quant["config_groups"]["group_int4"]["targets"] = targets
+    else:
+        quant["ignore"] = targets
+    hf_config = _glm_hf_config()
+    hf_config.n_routed_experts = 2
+    assert GlmMoeDsaW4A8Facade.override_quantization_method(
+        quant, None, hf_config
+    ) == "glm_moe_dsa_w4a8"
+    config = glm_quant_method_labels.GlmMoeDsaChannelW4A8Config.from_config(quant)
+    config.packed_modules_mapping = {}
+    layer = RoutedExperts.__new__(RoutedExperts)
+    # Validate global logical IDs even when EP only owns one expert and EPLB
+    # has allocated extra physical slots.
+    layer.moe_config = SimpleNamespace(
+        num_logical_experts=2, num_experts=4, num_local_experts=1
+    )
+    layer.global_num_experts = 4
+    layer.local_num_experts = 1
+    config._add_fused_moe_to_target_scheme_map()
+    for index in range(2):
+        schemes = [
+            config.get_scheme_dict(layer, f"{checkpoint_prefix}.{index}.{proj}")
+            for proj in projections
+        ]
+        bits = [scheme["weights"].num_bits if scheme else None for scheme in schemes]
+        expected = (4 if index == expert_id else 8) if kind == "target" else (
+            None if index == expert_id else 4
+        )
+        assert bits == [expected] * 3
+    for select in (
+        lambda: routed_expert_uses_glm_channel_int4(config, layer, prefix),
+        lambda: config.get_quant_method(layer, prefix),
+    ):
+        with pytest.raises(NotImplementedError, match="all logical experts") as error:
+            select()
+        assert prefix in str(error.value)
+        assert ".0." in str(error.value) and ".1." in str(error.value)
+
+
+@pytest.mark.parametrize("wrapped", [False, True])
+@pytest.mark.parametrize("projection", ["gate_proj", "up_proj", "down_proj"])
+def test_single_ignored_projection_is_not_hidden_by_other_experts(
+    glm_quant_method_labels, wrapped, projection
+) -> None:
+    from vllm.model_executor.layers.fused_moe import RoutedExperts
+
+    quant = _quant_config()
+    quant["ignore"] = [f"model.layers.4.mlp.experts.1.{projection}"]
+    config = glm_quant_method_labels.GlmMoeDsaChannelW4A8Config.from_config(quant)
+    config.packed_modules_mapping = {}
+    layer = RoutedExperts.__new__(RoutedExperts)
+    layer.moe_config = SimpleNamespace(num_logical_experts=2)
+    prefix = "model.layers.4.mlp.experts"
+    if wrapped:
+        prefix = "model.layers.4.mtp_block.mlp.experts"
+    with pytest.raises(NotImplementedError, match="all logical experts"):
+        config.get_quant_method(layer, prefix)
+
+
+@pytest.mark.parametrize("target_kind", ["projections", "owner", "class"])
+@pytest.mark.parametrize("wrapped", [False, True])
+def test_all_logical_experts_keep_uniform_int4_selection(
+    glm_quant_method_labels, target_kind, wrapped
+) -> None:
+    from vllm.model_executor.layers.fused_moe import RoutedExperts
+
+    prefix = "model.layers.4.mlp.experts"
+    quant = _quant_config()
+    targets = {
+        "projections": [
+            f"{prefix}.{index}.{proj}"
+            for index in range(2)
+            for proj in ("gate_proj", "up_proj", "down_proj")
+        ],
+        "owner": [prefix],
+        "class": ["RoutedExperts"],
+    }
+    quant["config_groups"]["group_int4"]["targets"] = targets[target_kind]
+    # EPLB physical slots are not checkpoint expert IDs and must not be probed.
+    quant["ignore"] = [f"{prefix}.2.gate_proj"]
+    config = glm_quant_method_labels.GlmMoeDsaChannelW4A8Config.from_config(quant)
+    config.packed_modules_mapping = {}
+    layer = RoutedExperts.__new__(RoutedExperts)
+    layer.moe_config = SimpleNamespace(
+        num_logical_experts=2, num_experts=4, num_local_experts=1
+    )
+    layer.global_num_experts = 4
+    layer.local_num_experts = 1
+    if wrapped:
+        prefix = "model.layers.4.mtp_block.mlp.experts"
+    assert config.get_quant_method(layer, prefix) == "int4"
+
+
+@pytest.mark.parametrize("wrapped", [False, True])
+@pytest.mark.parametrize("ignore_kind", ["owner", "projections"])
+def test_all_ignored_experts_do_not_select_glm_int4(wrapped, ignore_kind) -> None:
+    from vllm.model_executor.layers.fused_moe import RoutedExperts
+    from vllm_hcu.model_executor.layers.quantization.glm_channel_int4 import (
+        routed_expert_uses_glm_channel_int4,
+    )
+
+    checkpoint_prefix = "model.layers.4.mlp.experts"
+    ignores = {
+        "owner": [checkpoint_prefix],
+        "projections": [
+            f"{checkpoint_prefix}.{index}.{proj}"
+            for index in range(2)
+            for proj in ("gate_proj", "up_proj", "down_proj")
+        ],
+    }
+    config = _selection_config(ignore=ignores[ignore_kind])
+    layer = RoutedExperts.__new__(RoutedExperts)
+    layer.moe_config = SimpleNamespace(num_logical_experts=2)
+    prefix = (
+        "model.layers.4.mtp_block.mlp.experts" if wrapped else checkpoint_prefix
+    )
+    assert routed_expert_uses_glm_channel_int4(config, layer, prefix) is False
+    quant = _quant_config()
+    quant["ignore"] = ignores[ignore_kind]
+    hf_config = _glm_hf_config()
+    hf_config.n_routed_experts = 2
+    quant["config_groups"]["group_int4"]["targets"] = [
+        r"re:^model\.layers\.4\.mlp\.experts.*"
+    ]
+    assert GlmMoeDsaW4A8Facade.override_quantization_method(
+        quant, None, hf_config
+    ) is None
+
+
+@pytest.mark.parametrize("projection", ["gate_proj", "up_proj", "down_proj"])
+def test_last_logical_expert_is_checked_without_ep_locality(projection) -> None:
+    from vllm_hcu.model_executor.layers.quantization.glm_channel_int4 import (
+        routed_expert_uses_glm_channel_int4,
+    )
+
+    prefix = "model.layers.4.mlp.experts"
+    layer = SimpleNamespace(
+        moe_config=SimpleNamespace(num_logical_experts=16, num_local_experts=1),
+        local_num_experts=1,
+    )
+    config = _selection_config(ignore=[f"{prefix}.15.{projection}"])
+    with pytest.raises(NotImplementedError, match=r"experts\.15\."):
+        routed_expert_uses_glm_channel_int4(config, layer, prefix)
 
 
 def test_expert_loaders_convert_weights_and_scales() -> None:

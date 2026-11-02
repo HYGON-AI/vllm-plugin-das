@@ -14,7 +14,7 @@ names.
 from __future__ import annotations
 
 import re
-from collections.abc import Callable, Mapping
+from collections.abc import Callable, Iterable, Mapping
 from typing import Any
 
 import torch
@@ -185,15 +185,17 @@ def _probe_layer_indexes(targets: list[str], hf_config: Any) -> list[int]:
 
 def _routed_expert_probes(
     targets: list[str], hf_config: Any = None
-) -> list[tuple[str, str]]:
-    """Return ``(module_prefix, match_name)`` for candidate expert layers."""
-    probes = []
+) -> Iterable[tuple[str, str, int]]:
+    """Yield owner/projection probes for every logical checkpoint expert."""
+    count = getattr(hf_config, "n_routed_experts", 1)
+    if not isinstance(count, int) or isinstance(count, bool) or count <= 0:
+        count = 1
     for index in _probe_layer_indexes(targets, hf_config):
         prefix = f"model.layers.{index}.mlp.experts"
-        probes.append((prefix, prefix))
-        for proj_name in ("gate_proj", "up_proj", "down_proj"):
-            probes.append((prefix, f"{prefix}.0.{proj_name}"))
-    return probes
+        for expert_id in range(count):
+            yield prefix, prefix, expert_id
+            for proj_name in ("gate_proj", "up_proj", "down_proj"):
+                yield prefix, f"{prefix}.{expert_id}.{proj_name}", expert_id
 
 
 def _targets_cover_routed_experts(
@@ -211,8 +213,8 @@ def _targets_cover_routed_experts(
         is_equal_or_regex_match,
     )
 
-    for module_prefix, probe in _routed_expert_probes(targets, hf_config):
-        if _ignore_covers_expert(None, module_prefix, ignore, {}):
+    for module_prefix, probe, expert_id in _routed_expert_probes(targets, hf_config):
+        if _ignore_covers_expert(None, module_prefix, ignore, {}, expert_id):
             continue
         for target in targets:
             if target == "RoutedExperts" or is_equal_or_regex_match(probe, target):
@@ -355,8 +357,12 @@ def _match_target_by_names(
     )
 
 
-def _projection_names(layer: Any, prefix: str) -> tuple[str, str, str]:
-    return tuple(f"{prefix}.0.{proj_name}" for proj_name in _expert_proj_names(layer))
+def _projection_names(
+    layer: Any, prefix: str, expert_id: int = 0
+) -> tuple[str, str, str]:
+    return tuple(
+        f"{prefix}.{expert_id}.{proj_name}" for proj_name in _expert_proj_names(layer)
+    )
 
 
 def _expert_proj_names(layer: Any) -> tuple[str, str, str]:
@@ -368,7 +374,7 @@ def _expert_proj_names(layer: Any) -> tuple[str, str, str]:
 
 
 def _ignore_covers_expert(
-    layer: Any, prefix: str, ignore: Any, fused_mapping: Any
+    layer: Any, prefix: str, ignore: Any, fused_mapping: Any, expert_id: int = 0
 ) -> bool:
     """Apply owner/projection exclusions to runtime and checkpoint paths."""
     prefixes = [prefix]
@@ -378,21 +384,20 @@ def _ignore_covers_expert(
         _ignore_covers_prefix(candidate, ignore, fused_mapping)
         or any(
             _ignore_covers_prefix(proj_name, ignore, fused_mapping)
-            for proj_name in _projection_names(layer, candidate)
+            for proj_name in _projection_names(layer, candidate, expert_id)
         )
         for candidate in prefixes
     )
 
 
-def _explicit_expert_scheme(
-    config: Any, layer: Any, prefix: str
-) -> tuple[bool, Any]:
-    """Return ``(matched, scheme)`` for a routed-expert prefix.
+def _expert_projection_schemes(
+    config: Any, layer: Any, prefix: str, expert_id: int
+) -> list[Any]:
+    """Resolve one expert's projections in native target order.
 
-    ``matched`` is false when no target names this prefix, its class, or any
-    projection. Projections may use different target strings; they
-    select INT4 only when every projection's scheme is channel INT4. A generic
-    ``Linear`` class target is not an expert scheme.
+    Fused-owner targets are compatibility aliases only when none of this
+    expert's projection names match. Generic ``Linear`` class targets stay
+    on the parent method.
     """
     scheme_map = getattr(config, "target_scheme_map", None) or {}
     fused_mapping = getattr(config, "packed_modules_mapping", None) or {}
@@ -406,7 +411,7 @@ def _explicit_expert_scheme(
     # that appears earlier for a projection.
     proj_targets = [
         _match_target_by_names(
-            [f"{candidate}.0.{proj_name}" for candidate in prefixes],
+            [f"{candidate}.{expert_id}.{proj_name}" for candidate in prefixes],
             scheme_map,
             fused_mapping,
         )
@@ -417,20 +422,67 @@ def _explicit_expert_scheme(
         # Only use them when no projection name has selected a scheme.
         matched = _match_target_by_names(prefixes, scheme_map, fused_mapping)
         if matched is not None:
-            return True, scheme_map.get(matched)
+            return [scheme_map.get(matched)] * 3
 
     # Parent dispatch can add RoutedExperts -> Linear to this shared config.
     # Match projection names first and use the class only for missing names.
     class_target = _match_target_by_class(layer, scheme_map)
-    if class_target is None and all(target is None for target in proj_targets):
-        return False, None
-    proj_schemes = [
+    return [
         scheme_map.get(target if target is not None else class_target)
         for target in proj_targets
     ]
-    if all(_scheme_is_channel_int4(scheme, config) for scheme in proj_schemes):
-        return True, proj_schemes[0]
-    return True, None
+
+
+def _logical_expert_count(layer: Any) -> int | None:
+    """Use logical IDs, excluding EP locality and redundant EPLB slots."""
+    moe = getattr(layer, "moe_config", None)
+    for count in (
+        getattr(moe, "num_logical_experts", None),
+        getattr(layer, "num_logical_experts", None),
+        getattr(layer, "global_num_experts", None),
+        getattr(moe, "num_experts", None),
+    ):
+        if isinstance(count, int) and not isinstance(count, bool) and count > 0:
+            return count
+    return None
+
+
+def _uniform_glm_channel_int4_experts(
+    config: Any, layer: Any, prefix: str, count: int
+) -> bool:
+    """Reject heterogeneous checkpoint experts before allocating fused weights."""
+    ignore = getattr(config, "ignore", None) or []
+    fused_mapping = getattr(config, "packed_modules_mapping", None) or {}
+    prefixes = [prefix]
+    unwrapped = prefix.replace(_MTP_BLOCK_MARKER, ".")
+    if unwrapped != prefix:
+        prefixes.append(unwrapped)
+    if any(_ignore_covers_prefix(name, ignore, fused_mapping) for name in prefixes):
+        return False
+    first_int4 = first_other = None
+    for expert_id in range(count):
+        schemes = _expert_projection_schemes(config, layer, prefix, expert_id)
+        for projection, scheme in zip(_expert_proj_names(layer), schemes):
+            name = f"{prefix}.{expert_id}.{projection}"
+            ignored = any(
+                _ignore_covers_prefix(
+                    f"{candidate}.{expert_id}.{projection}", ignore, fused_mapping
+                )
+                for candidate in prefixes
+            )
+            if not ignored and _scheme_is_channel_int4(scheme, config):
+                first_int4 = first_int4 or name
+            else:
+                first_other = first_other or name
+            if first_int4 is not None and first_other is not None:
+                raise NotImplementedError(
+                    f"GLM channel INT4 fused MoE at {prefix!r} requires channel "
+                    "INT4 W4A8 for all logical experts and projections; "
+                    f"{first_int4!r} selects it but {first_other!r} is ignored "
+                    "or selects another scheme. Heterogeneous expert "
+                    "quantization is not supported."
+                )
+    return first_int4 is not None
 
 
 def routed_expert_uses_glm_channel_int4(
@@ -442,20 +494,26 @@ def routed_expert_uses_glm_channel_int4(
 ) -> bool:
     """Return whether this routed-expert prefix should load channel INT4.
 
-    ``ignore`` wins. A prefix matches when its name, or all three projection
-    names, select the channel INT4 scheme. Different target strings with that
-    same scheme still match. MTP is retried only by removing ``.mtp_block.``;
+    All logical experts and projections must select channel INT4 without
+    being ignored. Mixing it with another scheme/ignore raises before fused
+    weights are allocated. Different target strings with the same scheme
+    still match. MTP is retried only by removing ``.mtp_block.``;
     it never borrows another layer's scheme. ``num_hidden_layers`` remains
     accepted for existing callers but does not affect target matching.
     """
+    count = _logical_expert_count(layer)
+    if count is not None:
+        return _uniform_glm_channel_int4_experts(config, layer, prefix, count)
+    # Name-only probes have no runtime MoE config. Actual RoutedExperts carries
+    # the logical count before get_quant_method and always takes the check above.
     ignore = getattr(config, "ignore", None) or []
     fused_mapping = getattr(config, "packed_modules_mapping", None) or {}
     if _ignore_covers_expert(layer, prefix, ignore, fused_mapping):
         return False
-    matched, scheme = _explicit_expert_scheme(config, layer, prefix)
-    if matched:
-        return _scheme_is_channel_int4(scheme, config)
-    return False
+    return all(
+        _scheme_is_channel_int4(scheme, config)
+        for scheme in _expert_projection_schemes(config, layer, prefix, 0)
+    )
 
 
 def _expert_owner_prefixes(name: str) -> list[str]:
