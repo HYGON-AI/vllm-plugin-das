@@ -103,12 +103,6 @@ _LAYER_INDEX_IN_TARGET = re.compile(r"layers\\*\.(\d+)")
 # Class-name targets such as Linear stay on the parent method. RoutedExperts
 # is the fused expert module and is matched the same way as the facade.
 _GENERIC_CLASS_TARGETS = frozenset({"Linear", "Module", "object"})
-# Backbone and MTP experts share this shape. The index is what a published
-# regex often fails to extend past ``num_hidden_layers``.
-_LAYER_EXPERT_PREFIX = re.compile(
-    r"^(?P<head>.*?layers\.)(?P<idx>\d+)"
-    r"(?P<tail>(?:\.mtp_block)?\.mlp\.experts(?:\..*)?)$"
-)
 
 
 def _quant_field(value: Any, name: str, default: Any = None) -> Any:
@@ -131,12 +125,12 @@ def _is_channel_int4_w4a8_scheme(
     return (
         _quant_field(weights, "num_bits") == 4
         and _quant_field(weights, "strategy") == "channel"
-        and _quant_field(weights, "type") == "int"
+        and _quant_field(weights, "type", "int") == "int"
         and _quant_field(weights, "symmetric", True) is True
         and _quant_field(activations, "num_bits", 8) == 8
         and _quant_field(activations, "strategy") == "token"
         and _quant_field(activations, "dynamic") is True
-        and _quant_field(activations, "type") == "int"
+        and _quant_field(activations, "type", "int") == "int"
         and _quant_field(activations, "symmetric") is not False
         and getattr(group_format, "value", group_format) == "pack-quantized"
     )
@@ -146,11 +140,11 @@ def _is_channel_int8_scheme(weights: Any, activations: Any) -> bool:
     return (
         _quant_field(weights, "num_bits", 8) == 8
         and _quant_field(weights, "strategy") == "channel"
-        and _quant_field(weights, "type") == "int"
+        and _quant_field(weights, "type", "int") == "int"
         and _quant_field(activations, "num_bits", 8) == 8
         and _quant_field(activations, "strategy") == "token"
         and _quant_field(activations, "dynamic") is True
-        and _quant_field(activations, "type") == "int"
+        and _quant_field(activations, "type", "int") == "int"
     )
 
 
@@ -407,90 +401,6 @@ def _explicit_expert_scheme(
     return True, None
 
 
-def _infer_num_hidden_layers() -> int | None:
-    """Return the active model backbone size, when vLLM has one."""
-    try:
-        from vllm.config import get_current_vllm_config
-
-        hf_config = get_current_vllm_config().model_config.hf_config
-    except Exception:
-        return None
-    count = getattr(hf_config, "num_hidden_layers", None)
-    if isinstance(count, bool) or not isinstance(count, int) or count < 0:
-        return None
-    return count
-
-
-def _mtp_alias_prefixes(prefix: str, num_hidden_layers: int | None) -> list[str]:
-    """Prefixes to retry when a published expert regex misses MTP.
-
-    ``.mtp_block.`` is only inserted into some checkpoint names. The quant
-    prefix itself stays ``model.layers.{N}.mlp.experts``, with ``N`` at or
-    past ``num_hidden_layers``. Backbone experts keep their own index and are
-    not rewritten.
-    """
-    aliases: list[str] = []
-    if _MTP_BLOCK_MARKER in prefix:
-        aliases.append(prefix.replace(_MTP_BLOCK_MARKER, "."))
-    if not isinstance(num_hidden_layers, int) or num_hidden_layers <= 0:
-        return _dedupe_prefixes(prefix, aliases)
-    match = _LAYER_EXPERT_PREFIX.fullmatch(prefix)
-    if match is None or int(match.group("idx")) < num_hidden_layers:
-        return _dedupe_prefixes(prefix, aliases)
-    head = match.group("head")
-    tail = match.group("tail")
-    tail_without_mtp = tail.replace(_MTP_BLOCK_MARKER, ".")
-    for backbone in range(num_hidden_layers):
-        aliases.append(f"{head}{backbone}{tail}")
-        if tail_without_mtp != tail:
-            aliases.append(f"{head}{backbone}{tail_without_mtp}")
-    return _dedupe_prefixes(prefix, aliases)
-
-
-def _dedupe_prefixes(prefix: str, aliases: list[str]) -> list[str]:
-    unique: list[str] = []
-    for alias in aliases:
-        if alias != prefix and alias not in unique:
-            unique.append(alias)
-    return unique
-
-
-def _has_generic_backbone_int4_target(
-    config: Any, num_hidden_layers: int
-) -> bool:
-    """Return whether a target describes a shared backbone expert scheme.
-
-    MTP layers may inherit a published backbone policy only when that policy
-    clearly covers multiple backbone indexes. A one-off exact target remains
-    local to its own layer and cannot change the MTP storage format.
-    """
-    scheme_map = getattr(config, "target_scheme_map", None) or {}
-    from vllm.model_executor.layers.quantization.utils.config_utils import (
-        is_equal_or_regex_match,
-    )
-
-    for target, scheme in scheme_map.items():
-        if target == "RoutedExperts" and _scheme_is_channel_int4(scheme, config):
-            return True
-        if not isinstance(target, str) or not target.startswith("re:"):
-            continue
-        matched_indexes = set()
-        for index in range(num_hidden_layers):
-            owner = f"model.layers.{index}.mlp.experts"
-            candidates = (
-                owner,
-                *(f"{owner}.0.{name}" for name in _expert_proj_names(None)),
-            )
-            if any(
-                is_equal_or_regex_match(candidate, target)
-                for candidate in candidates
-            ):
-                matched_indexes.add(index)
-        if len(matched_indexes) >= 2 and _scheme_is_channel_int4(scheme, config):
-            return True
-    return False
-
-
 def routed_expert_uses_glm_channel_int4(
     config: Any,
     layer: Any,
@@ -502,9 +412,9 @@ def routed_expert_uses_glm_channel_int4(
 
     ``ignore`` wins. A prefix matches when its name, or all three projection
     names, select the channel INT4 scheme. Different target strings with that
-    same scheme still match. MTP is retried only by removing ``.mtp_block.``
-    or by comparing a layer index at or past ``num_hidden_layers`` with the
-    backbone expert scheme.
+    same scheme still match. MTP is retried only by removing ``.mtp_block.``;
+    it never borrows another layer's scheme. ``num_hidden_layers`` remains
+    accepted for existing callers but does not affect target matching.
     """
     ignore = getattr(config, "ignore", None) or []
     fused_mapping = getattr(config, "packed_modules_mapping", None) or {}
@@ -518,18 +428,6 @@ def routed_expert_uses_glm_channel_int4(
         matched, scheme = _explicit_expert_scheme(config, layer, unwrapped)
         if matched:
             return _scheme_is_channel_int4(scheme, config)
-    if num_hidden_layers is None:
-        num_hidden_layers = _infer_num_hidden_layers()
-    if not isinstance(num_hidden_layers, int) or num_hidden_layers <= 0:
-        return False
-    if not _has_generic_backbone_int4_target(config, num_hidden_layers):
-        return False
-    for alias in _mtp_alias_prefixes(prefix, num_hidden_layers):
-        if _ignore_covers_expert(layer, alias, ignore, fused_mapping):
-            continue
-        matched, scheme = _explicit_expert_scheme(config, layer, alias)
-        if matched and _scheme_is_channel_int4(scheme, config):
-            return True
     return False
 
 

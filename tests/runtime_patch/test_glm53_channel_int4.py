@@ -289,6 +289,47 @@ def test_quant_num_bits_defaults_are_applied_to_raw_detection(
     ) == "glm_moe_dsa_w4a8"
 
 
+@pytest.mark.parametrize("group_name", ["group_int4", "group_int8"])
+@pytest.mark.parametrize("field", ["weights", "input_activations"])
+@pytest.mark.parametrize("quant_type", ["omitted", "int", "float", None])
+def test_quant_type_defaults_and_explicit_overrides(
+    group_name, field, quant_type
+) -> None:
+    from vllm_hcu.model_executor.layers.quantization.glm_channel_int4 import (
+        routed_expert_uses_glm_channel_int4,
+    )
+    from vllm_hcu.model_executor.layers.quantization.glm_moe_dsa_w4a8 import (
+        GlmMoeDsaChannelW4A8Config,
+    )
+
+    quant = _quant_config()
+    group = quant["config_groups"][group_name]
+    if quant_type == "omitted":
+        del group[field]["type"]
+    else:
+        group[field]["type"] = quant_type
+    expected = quant_type in ("omitted", "int")
+    assert is_glm_channel_int4_w4a8(quant, _glm_hf_config()) is expected
+    for config_cls in (GlmMoeDsaW4A8Facade, GlmMoeDsaChannelW4A8Config):
+        assert config_cls.override_quantization_method(
+            quant, None, _glm_hf_config()
+        ) == ("glm_moe_dsa_w4a8" if expected else None)
+    if group_name == "group_int4":
+        for args_as_objects in (False, True):
+            scheme = dict(group)
+            if args_as_objects:
+                scheme["weights"] = SimpleNamespace(**group["weights"])
+                scheme["input_activations"] = SimpleNamespace(
+                    **group["input_activations"]
+                )
+            config = _selection_config(
+                target_scheme_map={group["targets"][0]: scheme}
+            )
+            assert routed_expert_uses_glm_channel_int4(
+                config, SimpleNamespace(), "model.layers.3.mlp.experts"
+            ) is expected
+
+
 @pytest.mark.parametrize("symmetric", [None, True, False])
 @pytest.mark.parametrize("args_as_objects", [False, True])
 def test_int4_activation_symmetry_is_respected(symmetric, args_as_objects) -> None:
@@ -383,7 +424,7 @@ def test_mtp_backbone_alias_honors_projection_ignores(wrapped, projection) -> No
     assert routed_expert_uses_glm_channel_int4(
         config, SimpleNamespace(), prefix, num_hidden_layers=61
     ) is False
-    # Two exact layer targets are still local, not a generic MTP policy.
+    # Backbone targets do not change MTP's quantization scheme.
     config.target_scheme_map[target.replace("layers\\.0", "layers\\.1")] = _int4_scheme()
     assert routed_expert_uses_glm_channel_int4(
         config, SimpleNamespace(), prefix, num_hidden_layers=61
@@ -576,6 +617,71 @@ def test_mtp_does_not_inherit_single_exact_backbone_expert_scheme() -> None:
     ) is False
 
 
+@pytest.mark.parametrize("indexes", ["(3|4)", "[34]", "[0-4]"])
+@pytest.mark.parametrize("wrapped", [False, True])
+@pytest.mark.parametrize("mtp_scheme", [None, "int4", "int8"])
+def test_mtp_requires_its_own_quantization_target(
+    monkeypatch, indexes, wrapped, mtp_scheme
+) -> None:
+    from vllm.model_executor.layers.fused_moe import RoutedExperts
+    from vllm.model_executor.layers.quantization.compressed_tensors.compressed_tensors import (
+        CompressedTensorsConfig,
+    )
+    from vllm_hcu.model_executor.layers.quantization import glm_moe_dsa_w4a8
+    from vllm_hcu.model_executor.layers.quantization.glm_channel_int4 import (
+        routed_expert_uses_glm_channel_int4,
+    )
+
+    hf_config = _glm_hf_config()
+    hf_config.num_hidden_layers = 5
+    hf_config.first_k_dense_replace = 3
+    hf_config.num_nextn_predict_layers = 1
+    monkeypatch.setattr(
+        "vllm.config.get_current_vllm_config",
+        lambda: SimpleNamespace(model_config=SimpleNamespace(hf_config=hf_config)),
+    )
+    monkeypatch.setattr(
+        glm_moe_dsa_w4a8, "GlmMoeDsaW4A8MoEMethod", lambda *args: "int4"
+    )
+    monkeypatch.setattr(
+        CompressedTensorsConfig, "get_quant_method", lambda *args: "parent"
+    )
+    quant = _quant_config()
+    target = rf"re:^model\.layers\.{indexes}\.mlp\.experts.*"
+    quant["config_groups"]["group_int4"]["targets"] = [target]
+    assert GlmMoeDsaW4A8Facade.override_quantization_method(
+        quant, None, hf_config
+    ) == "glm_moe_dsa_w4a8"
+    config = glm_moe_dsa_w4a8.GlmMoeDsaChannelW4A8Config.__new__(
+        glm_moe_dsa_w4a8.GlmMoeDsaChannelW4A8Config
+    )
+    config.ignore = []
+    config.packed_modules_mapping = {}
+    config.target_scheme_map = {target: _int4_scheme(), "Linear": _int8_scheme()}
+    layer = RoutedExperts.__new__(RoutedExperts)
+    layer.moe_config = SimpleNamespace()
+    for index in (3, 4):
+        assert (
+            config.get_quant_method(layer, f"model.layers.{index}.mlp.experts")
+            == "int4"
+        )
+    checkpoint_prefix = "model.layers.5.mlp.experts"
+    prefix = checkpoint_prefix
+    if wrapped:
+        prefix = "model.layers.5.mtp_block.mlp.experts"
+    if mtp_scheme is not None:
+        config.target_scheme_map[checkpoint_prefix] = (
+            _int4_scheme() if mtp_scheme == "int4" else _int8_scheme()
+        )
+    expected = mtp_scheme == "int4"
+    assert routed_expert_uses_glm_channel_int4(
+        config, layer, prefix, num_hidden_layers=5
+    ) is expected
+    assert config.get_quant_method(layer, prefix) == ("int4" if expected else "parent")
+    config.ignore = [f"{checkpoint_prefix}.0.down_proj"]
+    assert config.get_quant_method(layer, prefix) == "parent"
+
+
 def test_get_quant_method_follows_prefix_scheme(monkeypatch) -> None:
     from vllm.model_executor.layers.fused_moe import RoutedExperts
     from vllm.model_executor.layers.quantization.compressed_tensors.compressed_tensors import (
@@ -617,11 +723,6 @@ def test_get_quant_method_follows_prefix_scheme(monkeypatch) -> None:
         "Linear": _int8_scheme(),
     }
     assert config.get_quant_method(layer, "model.layers.0.mlp.experts") == "parent"
-    monkeypatch.setattr(
-        "vllm_hcu.model_executor.layers.quantization.glm_channel_int4."
-        "_infer_num_hidden_layers",
-        lambda: 61,
-    )
     config.target_scheme_map = {
         "re:^model\\.layers\\.0\\.mlp\\.experts.*": _int4_scheme(),
     }
@@ -636,6 +737,11 @@ def test_get_quant_method_follows_prefix_scheme(monkeypatch) -> None:
     config.quant_format = "pack-quantized"
     config.target_scheme_map = {"RoutedExperts": omitted_format}
     assert config.get_quant_method(layer, "model.layers.60.mlp.experts") == "int4"
+    assert config.get_quant_method(layer, "model.layers.61.mlp.experts") == "int4"
+    assert (
+        config.get_quant_method(layer, "model.layers.61.mtp_block.mlp.experts")
+        == "int4"
+    )
 
 
 def test_expert_loaders_convert_weights_and_scales() -> None:
