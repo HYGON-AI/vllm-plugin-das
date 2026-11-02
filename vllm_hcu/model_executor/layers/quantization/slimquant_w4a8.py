@@ -433,14 +433,18 @@ class SlimQuantW4A8Int8AiterMoEMethod(FusedMoEMethodBase):
         is_kimi_ll = self._is_kimi_ll()
         if is_kimi_ht or is_kimi_ll:
             uses_deepep_auto = False
+            fixed_use_low_latency = None
         else:
             from vllm_hcu.model_executor.layers.fused_moe.deepep_runtime import (
+                slimquant_w4a8_fixed_deepep_use_low_latency,
                 slimquant_w4a8_uses_deepep_auto,
             )
 
-            uses_deepep_auto = slimquant_w4a8_uses_deepep_auto(
-                getattr(self, "moe", None)
+            moe = getattr(self, "moe", None)
+            fixed_use_low_latency = slimquant_w4a8_fixed_deepep_use_low_latency(
+                moe
             )
+            uses_deepep_auto = slimquant_w4a8_uses_deepep_auto(moe)
         weight_generation = _slimquant_moe_tensor_generation(
             layer,
             _SLIMQUANT_MOE_WEIGHT_TENSORS,
@@ -450,7 +454,11 @@ class SlimQuantW4A8Int8AiterMoEMethod(FusedMoEMethodBase):
             "_hcu_slimquant_post_load_weight_generation",
             None,
         )
-        if not uses_deepep_auto and installed_weight_generation == weight_generation:
+        if (
+            not uses_deepep_auto
+            and fixed_use_low_latency is None
+            and installed_weight_generation == weight_generation
+        ):
             self.moe_quant_config = self.get_fused_moe_quant_config(layer)
             if getattr(self.moe, "moe_backend", "auto") == "triton":
                 from vllm_hcu.model_executor.layers.quantization.compressed_tensors_moe_runtime import (
@@ -549,17 +557,26 @@ class SlimQuantW4A8Int8AiterMoEMethod(FusedMoEMethodBase):
             )
             return
 
-        if uses_deepep_auto:
+        if uses_deepep_auto or fixed_use_low_latency is not None:
             from vllm_hcu.model_executor.layers.fused_moe.experts.dpsk_v4_deep_gemm_moe import (
                 make_deepep_auto_deepgemm_w4a8_moe_kernel,
+                make_fixed_deepep_deepgemm_w4a8_moe_kernel,
             )
 
             deepgemm_quant_config = self._get_deepgemm_moe_quant_config(layer)
-            self.moe_kernel = make_deepep_auto_deepgemm_w4a8_moe_kernel(
-                moe_quant_config=deepgemm_quant_config,
-                moe_config=self.moe,
-                routing_tables=layer._expert_routing_tables(),
-            )
+            if fixed_use_low_latency is None:
+                self.moe_kernel = make_deepep_auto_deepgemm_w4a8_moe_kernel(
+                    moe_quant_config=deepgemm_quant_config,
+                    moe_config=self.moe,
+                    routing_tables=layer._expert_routing_tables(),
+                )
+            else:
+                self.moe_kernel = make_fixed_deepep_deepgemm_w4a8_moe_kernel(
+                    moe_quant_config=deepgemm_quant_config,
+                    moe_config=self.moe,
+                    routing_tables=layer._expert_routing_tables(),
+                    use_low_latency=fixed_use_low_latency,
+                )
             fused_experts = getattr(self.moe_kernel, "fused_experts", None)
             experts = getattr(fused_experts, "experts", fused_experts)
             process = getattr(experts, "process_weights_after_loading", None)
