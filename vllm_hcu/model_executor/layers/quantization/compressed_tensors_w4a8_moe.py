@@ -4,6 +4,8 @@
 
 from __future__ import annotations
 
+from types import MethodType
+
 import torch
 from compressed_tensors.quantization import (
     QuantizationArgs,
@@ -17,6 +19,20 @@ from .slimquant_w4a8 import SlimQuantW4A8Int8AiterMoEMethod
 HCU_COMPRESSED_W4A8_METHOD_MARKER = (
     "_vllm_hcu_compressed_tensors_w4a8_int8_moe"
 )
+
+
+def _compose_checkpoint_loader(original, conversion):
+    """Keep the current loader owner visible through format conversion."""
+    owner = getattr(original, "__self__", None)
+    if owner is None:
+        return conversion
+
+    def load(instance, *args, **kwargs):
+        if instance is not owner:
+            raise ValueError("compressed-tensors W4A8 loader owner changed")
+        return conversion(*args, **kwargs)
+
+    return MethodType(load, owner)
 
 
 def repack_compressed_tensors_int4(weight: torch.Tensor) -> torch.Tensor:
@@ -80,6 +96,33 @@ class HcuCompressedTensorsW4A8Int8MoEMethod(
         self.input_quant = input_quant
         self.layer_name = layer_name
         super().__init__(quant_config=None, moe=moe)
+        # Static direct loading reorders the original logical checkpoint;
+        # dynamic EPLB would additionally require a weight-transfer lifecycle.
+        from vllm.config import get_current_vllm_config_or_none
+
+        config = get_current_vllm_config_or_none()
+        parallel = getattr(config, "parallel_config", None)
+        moe_parallel = getattr(moe, "moe_parallel_config", None)
+        self._hcu_static_eplb = bool(
+            getattr(parallel, "enable_eplb", False)
+            and getattr(parallel, "enable_expert_parallel", False)
+            and getattr(parallel, "_vllm_hcu_expert_map_path", None)
+            and getattr(parallel, "tensor_parallel_size", None) == 1
+            and getattr(getattr(parallel, "eplb_config", None),
+                        "num_redundant_experts", None) == 0
+            and getattr(moe_parallel, "all2all_backend", None)
+                == "deepep_high_throughput"
+            and getattr(moe_parallel, "pcp_size", None) == 16
+            and getattr(moe_parallel, "ep_size", None) == 16
+            and getattr(moe_parallel, "tp_size", None) == 1
+            and getattr(moe_parallel, "dp_size", 1) == 1
+            and getattr(moe_parallel, "use_ep", False)
+            and getattr(moe, "moe_backend", None) in ("auto", "deep_gemm")
+        )
+
+    @property
+    def supports_eplb(self) -> bool:
+        return getattr(self, "_hcu_static_eplb", False)
 
     def create_weights(
         self,
@@ -181,8 +224,7 @@ class HcuCompressedTensorsW4A8Int8MoEMethod(
                 loaded_weight = repack_compressed_tensors_int4(loaded_weight)
                 return load(param, loaded_weight, *args, **kwargs)
 
-            load_packed.__self__ = getattr(load, "__self__", None)
-            parameter.weight_loader = load_packed
+            parameter.weight_loader = _compose_checkpoint_loader(load, load_packed)
 
         def wrap_scale(parameter, name):
             load = parameter.weight_loader
@@ -221,8 +263,7 @@ class HcuCompressedTensorsW4A8Int8MoEMethod(
                     )
                 return load(param, converted_scale, *args, **kwargs)
 
-            load_scale.__self__ = getattr(load, "__self__", None)
-            parameter.weight_loader = load_scale
+            parameter.weight_loader = _compose_checkpoint_loader(load, load_scale)
 
         wrap_weight(layer.w13_weight, "w13_weight")
         wrap_weight(layer.w2_weight, "w2_weight")
