@@ -133,7 +133,7 @@ def _is_channel_int4_w4a8_scheme(
         and _quant_field(weights, "strategy") == "channel"
         and _quant_field(weights, "type") == "int"
         and _quant_field(weights, "symmetric", True) is True
-        and _quant_field(activations, "num_bits") == 8
+        and _quant_field(activations, "num_bits", 8) == 8
         and _quant_field(activations, "strategy") == "token"
         and _quant_field(activations, "dynamic") is True
         and _quant_field(activations, "type") == "int"
@@ -144,10 +144,10 @@ def _is_channel_int4_w4a8_scheme(
 
 def _is_channel_int8_scheme(weights: Any, activations: Any) -> bool:
     return (
-        _quant_field(weights, "num_bits") == 8
+        _quant_field(weights, "num_bits", 8) == 8
         and _quant_field(weights, "strategy") == "channel"
         and _quant_field(weights, "type") == "int"
-        and _quant_field(activations, "num_bits") == 8
+        and _quant_field(activations, "num_bits", 8) == 8
         and _quant_field(activations, "strategy") == "token"
         and _quant_field(activations, "dynamic") is True
         and _quant_field(activations, "type") == "int"
@@ -455,6 +455,42 @@ def _dedupe_prefixes(prefix: str, aliases: list[str]) -> list[str]:
     return unique
 
 
+def _has_generic_backbone_int4_target(
+    config: Any, num_hidden_layers: int
+) -> bool:
+    """Return whether a target describes a shared backbone expert scheme.
+
+    MTP layers may inherit a published backbone policy only when that policy
+    clearly covers multiple backbone indexes. A one-off exact target remains
+    local to its own layer and cannot change the MTP storage format.
+    """
+    scheme_map = getattr(config, "target_scheme_map", None) or {}
+    from vllm.model_executor.layers.quantization.utils.config_utils import (
+        is_equal_or_regex_match,
+    )
+
+    for target, scheme in scheme_map.items():
+        if target == "RoutedExperts" and _scheme_is_channel_int4(scheme, config):
+            return True
+        if not isinstance(target, str) or not target.startswith("re:"):
+            continue
+        matched_indexes = set()
+        for index in range(num_hidden_layers):
+            owner = f"model.layers.{index}.mlp.experts"
+            candidates = (
+                owner,
+                *(f"{owner}.0.{name}" for name in _expert_proj_names(None)),
+            )
+            if any(
+                is_equal_or_regex_match(candidate, target)
+                for candidate in candidates
+            ):
+                matched_indexes.add(index)
+        if len(matched_indexes) >= 2 and _scheme_is_channel_int4(scheme, config):
+            return True
+    return False
+
+
 def routed_expert_uses_glm_channel_int4(
     config: Any,
     layer: Any,
@@ -484,6 +520,10 @@ def routed_expert_uses_glm_channel_int4(
             return _scheme_is_channel_int4(scheme, config)
     if num_hidden_layers is None:
         num_hidden_layers = _infer_num_hidden_layers()
+    if not isinstance(num_hidden_layers, int) or num_hidden_layers <= 0:
+        return False
+    if not _has_generic_backbone_int4_target(config, num_hidden_layers):
+        return False
     for alias in _mtp_alias_prefixes(prefix, num_hidden_layers):
         if _ignore_covers_expert(layer, alias, ignore, fused_mapping):
             continue

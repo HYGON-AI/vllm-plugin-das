@@ -2,9 +2,14 @@
 # SPDX-FileCopyrightText: Copyright (c) 2026 Hygon Information Technology Co., Ltd.
 """Packing conversion, AITER gemm2 layout, and quant detection for GLM-5.3 channel INT4."""
 
+import ast
 import sys
+import time
+from collections.abc import Iterable
 from functools import partial
+from pathlib import Path
 from types import ModuleType, SimpleNamespace
+from typing import cast
 
 import pytest
 import torch
@@ -267,6 +272,23 @@ def test_int4_weight_symmetry_defaults_only_when_omitted(
     ) is expected
 
 
+@pytest.mark.parametrize("group_name,field_path", [
+    ("group_int8", ("weights", "num_bits")),
+    ("group_int8", ("input_activations", "num_bits")),
+    ("group_int4", ("input_activations", "num_bits")),
+])
+def test_quant_num_bits_defaults_are_applied_to_raw_detection(
+    group_name, field_path
+) -> None:
+    quant = _quant_config()
+    group = quant["config_groups"][group_name]
+    del group[field_path[0]][field_path[1]]
+    assert is_glm_channel_int4_w4a8(quant, _glm_hf_config()) is True
+    assert GlmMoeDsaW4A8Facade.override_quantization_method(
+        quant, None, _glm_hf_config()
+    ) == "glm_moe_dsa_w4a8"
+
+
 @pytest.mark.parametrize("symmetric", [None, True, False])
 @pytest.mark.parametrize("args_as_objects", [False, True])
 def test_int4_activation_symmetry_is_respected(symmetric, args_as_objects) -> None:
@@ -361,8 +383,16 @@ def test_mtp_backbone_alias_honors_projection_ignores(wrapped, projection) -> No
     assert routed_expert_uses_glm_channel_int4(
         config, SimpleNamespace(), prefix, num_hidden_layers=61
     ) is False
-    # Continue to a valid backbone scheme instead of rejecting all aliases.
+    # Two exact layer targets are still local, not a generic MTP policy.
     config.target_scheme_map[target.replace("layers\\.0", "layers\\.1")] = _int4_scheme()
+    assert routed_expert_uses_glm_channel_int4(
+        config, SimpleNamespace(), prefix, num_hidden_layers=61
+    ) is False
+    config.target_scheme_map = {
+        "re:^model\\.layers\\.\\d+\\.mlp\\.experts\\.0\\.(gate_proj|up_proj|down_proj)$": (
+            _int4_scheme()
+        )
+    }
     assert routed_expert_uses_glm_channel_int4(
         config, SimpleNamespace(), prefix, num_hidden_layers=61
     ) is True
@@ -387,7 +417,7 @@ def test_wrapped_backbone_alias_honors_checkpoint_projection_ignores(projection)
     config.ignore = []
     assert routed_expert_uses_glm_channel_int4(
         config, SimpleNamespace(), prefix, num_hidden_layers=61
-    ) is True
+    ) is False
 
 
 def test_routed_expert_selection_respects_targets_ignore_and_mtp() -> None:
@@ -467,10 +497,10 @@ def test_routed_expert_selection_respects_targets_ignore_and_mtp() -> None:
     backbone_expert = "model.layers.3.mlp.experts"
     assert routed_expert_uses_glm_channel_int4(
         layer0_only, layer, mtp_expert, num_hidden_layers=61
-    )
+    ) is False
     assert routed_expert_uses_glm_channel_int4(
         layer0_only, layer, mtp, num_hidden_layers=61
-    )
+    ) is False
     assert (
         routed_expert_uses_glm_channel_int4(
             layer0_only, layer, backbone_expert, num_hidden_layers=61
@@ -528,6 +558,24 @@ def test_routed_expert_selection_respects_targets_ignore_and_mtp() -> None:
     )
 
 
+def test_mtp_does_not_inherit_single_exact_backbone_expert_scheme() -> None:
+    from vllm_hcu.model_executor.layers.quantization.glm_channel_int4 import (
+        routed_expert_uses_glm_channel_int4,
+    )
+
+    config = _selection_config(
+        target_scheme_map={
+            "re:^model\\.layers\\.3\\.mlp\\.experts.*": _int4_scheme(),
+        }
+    )
+    assert routed_expert_uses_glm_channel_int4(
+        config, SimpleNamespace(), "model.layers.3.mlp.experts", num_hidden_layers=4
+    ) is True
+    assert routed_expert_uses_glm_channel_int4(
+        config, SimpleNamespace(), "model.layers.4.mlp.experts", num_hidden_layers=4
+    ) is False
+
+
 def test_get_quant_method_follows_prefix_scheme(monkeypatch) -> None:
     from vllm.model_executor.layers.fused_moe import RoutedExperts
     from vllm.model_executor.layers.quantization.compressed_tensors.compressed_tensors import (
@@ -577,7 +625,7 @@ def test_get_quant_method_follows_prefix_scheme(monkeypatch) -> None:
     config.target_scheme_map = {
         "re:^model\\.layers\\.0\\.mlp\\.experts.*": _int4_scheme(),
     }
-    assert config.get_quant_method(layer, "model.layers.61.mlp.experts") == "int4"
+    assert config.get_quant_method(layer, "model.layers.61.mlp.experts") == "parent"
     assert config.get_quant_method(layer, "model.layers.3.mlp.experts") == "parent"
     config.ignore = ["re:.*experts\\.\\d+\\.(gate_proj|up_proj|down_proj)$"]
     config.target_scheme_map = {"re:.*\\.mlp\\.experts.*": _int4_scheme()}
@@ -927,6 +975,49 @@ def test_reload_scale_refresh_is_scoped_to_glm_installed_layout(
         assert quant_config.w2_scale is old_w2_scale
 
 
+def test_reload_scale_refresh_rebinds_deepep_auto_kernel_configs() -> None:
+    from vllm_hcu.model_executor.layers.quantization.glm_moe_dsa_w4a8 import (
+        GlmMoeDsaW4A8MoEMethod,
+        commit_installed_glm_w4a8_gemm2_generations,
+    )
+
+    def config(w1, w2):
+        return SimpleNamespace(
+            _w1=SimpleNamespace(scale=w1),
+            _w2=SimpleNamespace(scale=w2),
+        )
+
+    old_w1 = torch.full((2, 8, 1), 2.0)
+    old_w2 = torch.full((2, 4, 1), 3.0)
+    method_config = config(old_w1, old_w2)
+    kernel_config = config(old_w1, old_w2)
+    ht_config = config(old_w1, old_w2)
+    ll_config = config(old_w1, old_w2)
+    method = GlmMoeDsaW4A8MoEMethod.__new__(GlmMoeDsaW4A8MoEMethod)
+    method.moe_quant_config = method_config
+    method.moe_kernel = SimpleNamespace(
+        fused_experts=SimpleNamespace(
+            quant_config=kernel_config,
+            ht_experts=SimpleNamespace(quant_config=ht_config),
+            ll_experts=SimpleNamespace(quant_config=ll_config),
+        )
+    )
+    layer = torch.nn.Module()
+    layer.quant_method = method
+    layer.w13_weight_scale = torch.nn.Parameter(
+        torch.full((2, 8, 1), 7.0), requires_grad=False
+    )
+    layer.w2_weight_scale = torch.nn.Parameter(
+        torch.full((2, 4, 1), 11.0), requires_grad=False
+    )
+
+    commit_installed_glm_w4a8_gemm2_generations(layer)
+
+    for quant_config in (method_config, kernel_config, ht_config, ll_config):
+        assert quant_config._w1.scale is layer.w13_weight_scale
+        assert quant_config._w2.scale is layer.w2_weight_scale
+
+
 def _v2_reload_runner(model):
     from vllm_hcu.v1.hcu_model_runner_v2 import HcuGPUModelRunnerV2
 
@@ -941,6 +1032,53 @@ def _v2_reload_runner(model):
     runner.reset_encoder_cache = lambda: None
     runner.reset_mm_cache = lambda: None
     return runner
+
+
+def _legacy_reload_method():
+    """Extract the production legacy reload method without importing its runner.
+
+    The full HCU legacy runner imports optional communication APIs that are not
+    present in every CPU contract lane. This keeps the test on the production
+    method body while isolating those unrelated imports.
+    """
+    source_path = Path(__file__).parents[2] / "vllm_hcu/v1/hcu_model_runner.py"
+    tree = ast.parse(source_path.read_text(encoding="utf-8"))
+    runner_class = next(
+        node
+        for node in tree.body
+        if isinstance(node, ast.ClassDef) and node.name == "GPUModelRunner"
+    )
+    method = next(
+        node
+        for node in runner_class.body
+        if isinstance(node, ast.FunctionDef) and node.name == "reload_weights"
+    )
+    namespace = {
+        "torch": torch,
+        "Iterable": Iterable,
+        "cast": cast,
+        "initialize_layerwise_reload": sys.modules[
+            "vllm.model_executor.model_loader.reload.layerwise"
+        ].initialize_layerwise_reload,
+        "finalize_layerwise_reload": sys.modules[
+            "vllm.model_executor.model_loader.reload.layerwise"
+        ].finalize_layerwise_reload,
+        "logger": SimpleNamespace(
+            warning=lambda *args, **kwargs: None,
+            warning_once=lambda *args, **kwargs: None,
+            info_once=lambda *args, **kwargs: None,
+        ),
+        "time": time,
+    }
+    exec(
+        compile(
+            ast.fix_missing_locations(ast.Module(body=[method], type_ignores=[])),
+            str(source_path),
+            "exec",
+        ),
+        namespace,
+    )
+    return namespace["reload_weights"]
 
 
 @pytest.mark.parametrize("runner_kind", ["legacy", "v2"])
@@ -1050,14 +1188,12 @@ def test_reload_weights_keeps_scale_owners_for_later_forward(
         runner = _v2_reload_runner(model)
         reload_weights = runner.reload_weights
     else:
-        from vllm_hcu.v1.hcu_model_runner import GPUModelRunner
-
         runner = SimpleNamespace(
             get_model=lambda: model,
             model_config=SimpleNamespace(quantization="glm_moe_dsa_w4a8"),
             load_config=SimpleNamespace(),
         )
-        reload_weights = partial(GPUModelRunner.reload_weights, runner)
+        reload_weights = partial(_legacy_reload_method(), runner)
     checkpoint = [
         ("w13_weight", _pack_compressed_tensors_int4(
             torch.ones((2, 16, 8), dtype=torch.int8)

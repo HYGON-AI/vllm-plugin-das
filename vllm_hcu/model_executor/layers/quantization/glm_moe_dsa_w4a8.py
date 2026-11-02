@@ -36,6 +36,44 @@ _GLM_W4A8_GEMM2_GENERATION = "_glm_w4a8_gemm2_generation"
 _GLM_EXPERT_WEIGHTS = ("w13_weight", "w2_weight")
 
 
+def _replace_glm_scale_references(
+    method: object,
+    layer: torch.nn.Module,
+) -> bool:
+    """Rebind GLM method and DeepEP auto configs to final scale owners."""
+    if not isinstance(method, GlmMoeDsaW4A8MoEMethod):
+        return False
+    kernel = getattr(method, "moe_kernel", None)
+    experts = getattr(kernel, "fused_experts", None)
+    if not (
+        getattr(experts, "ht_experts", None) is not None
+        or getattr(experts, "ll_experts", None) is not None
+    ):
+        return False
+    configs = []
+    for owner in (
+        method,
+        experts,
+        getattr(experts, "ht_experts", None),
+        getattr(experts, "ll_experts", None),
+    ):
+        config = getattr(owner, "moe_quant_config", None)
+        if config is None:
+            config = getattr(owner, "quant_config", None)
+        if config is not None and all(config is not existing for existing in configs):
+            configs.append(config)
+    if not configs:
+        return False
+    from vllm_hcu.model_executor.layers.quantization.compressed_tensors_moe_runtime import (
+        _replace_tensor_reference,
+    )
+
+    for config in configs:
+        _replace_tensor_reference(config, "w1_scale", layer.w13_weight_scale)
+        _replace_tensor_reference(config, "w2_scale", layer.w2_weight_scale)
+    return True
+
+
 def _expert_weight_generation(layer: torch.nn.Module) -> tuple[object, ...]:
     """Identity of the two expert weight tensors for one load generation."""
     generation = []
@@ -85,7 +123,10 @@ def commit_installed_glm_w4a8_gemm2_generation(layer: torch.nn.Module) -> None:
         getattr(getattr(layer, name, None), "_hcu_vllm_w4a8_unpacked", False)
         for name in _GLM_EXPERT_WEIGHTS
     ):
-        return
+        if not _replace_glm_scale_references(
+            getattr(layer, "quant_method", None), layer
+        ):
+            return
     method = getattr(layer, "quant_method", None)
     if isinstance(method, GlmMoeDsaW4A8MoEMethod):
         quant_config = getattr(method, "moe_quant_config", None)
