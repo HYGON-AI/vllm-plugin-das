@@ -22,15 +22,15 @@ HCU_COMPRESSED_W4A8_METHOD_MARKER = (
 
 
 def _compose_checkpoint_loader(original, conversion):
-    """Keep the current loader owner visible through format conversion."""
+    """Preserve owner binding and named parameters used by layerwise reload."""
     owner = getattr(original, "__self__", None)
     if owner is None:
         return conversion
 
-    def load(instance, *args, **kwargs):
+    def load(instance, param, loaded_weight, *args, **kwargs):
         if instance is not owner:
             raise ValueError("compressed-tensors W4A8 loader owner changed")
-        return conversion(*args, **kwargs)
+        return conversion(param, loaded_weight, *args, **kwargs)
 
     return MethodType(load, owner)
 
