@@ -378,24 +378,41 @@ def _explicit_expert_scheme(
 ) -> tuple[bool, Any]:
     """Return ``(matched, scheme)`` for a routed-expert prefix.
 
-    ``matched`` is false when no target names this prefix, its class, or all
-    three projections. Projections may use different target strings; they
+    ``matched`` is false when no target names this prefix, its class, or any
+    projection. Projections may use different target strings; they
     select INT4 only when every projection's scheme is channel INT4. A generic
     ``Linear`` class target is not an expert scheme.
     """
     scheme_map = getattr(config, "target_scheme_map", None) or {}
     fused_mapping = getattr(config, "packed_modules_mapping", None) or {}
-    matched = _match_target_by_name(prefix, scheme_map, fused_mapping)
-    if matched is None:
-        matched = _match_target_by_class(layer, scheme_map)
-    if matched is not None:
-        return True, scheme_map.get(matched)
+    prefixes = [prefix]
+    unwrapped = prefix.replace(_MTP_BLOCK_MARKER, ".")
+    if unwrapped != prefix:
+        prefixes.append(unwrapped)
+    for candidate in prefixes:
+        matched = _match_target_by_name(candidate, scheme_map, fused_mapping)
+        if matched is not None:
+            return True, scheme_map.get(matched)
+
+    # Parent MoE dispatch may add RoutedExperts -> Linear to the shared map.
+    # Match each projection name before using that class entry as a fallback,
+    # including the checkpoint alias of a wrapped MTP prefix.
+    class_target = _match_target_by_class(layer, scheme_map)
+    has_target = class_target is not None
     proj_schemes = []
-    for proj_name in _projection_names(layer, prefix):
-        proj_target = _match_target_by_name(proj_name, scheme_map, fused_mapping)
-        if proj_target is None:
-            return False, None
-        proj_schemes.append(scheme_map.get(proj_target))
+    for proj_name in _expert_proj_names(layer):
+        proj_target = None
+        for candidate in prefixes:
+            proj_target = _match_target_by_name(
+                f"{candidate}.0.{proj_name}", scheme_map, fused_mapping
+            )
+            if proj_target is not None:
+                break
+        has_target |= proj_target is not None
+        target = proj_target if proj_target is not None else class_target
+        proj_schemes.append(scheme_map.get(target))
+    if not has_target:
+        return False, None
     if all(_scheme_is_channel_int4(scheme, config) for scheme in proj_schemes):
         return True, proj_schemes[0]
     return True, None
@@ -423,11 +440,6 @@ def routed_expert_uses_glm_channel_int4(
     matched, scheme = _explicit_expert_scheme(config, layer, prefix)
     if matched:
         return _scheme_is_channel_int4(scheme, config)
-    unwrapped = prefix.replace(_MTP_BLOCK_MARKER, ".")
-    if unwrapped != prefix:
-        matched, scheme = _explicit_expert_scheme(config, layer, unwrapped)
-        if matched:
-            return _scheme_is_channel_int4(scheme, config)
     return False
 
 

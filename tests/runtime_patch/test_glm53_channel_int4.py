@@ -744,6 +744,118 @@ def test_get_quant_method_follows_prefix_scheme(monkeypatch) -> None:
     )
 
 
+@pytest.mark.parametrize(
+    "projection_targets",
+    [
+        [
+            "model.layers.4.mlp.experts.0.gate_proj",
+            "model.layers.4.mlp.experts.0.up_proj",
+            "model.layers.4.mlp.experts.0.down_proj",
+        ],
+        [
+            r"re:^model\.layers\.4\.mlp\.experts\.\d+\.(gate_proj|up_proj|down_proj)$",
+        ],
+    ],
+)
+@pytest.mark.parametrize("layer_order", [(3, 4), (4, 3)])
+def test_projection_targets_precede_generated_routed_experts_target(
+    monkeypatch, projection_targets, layer_order
+) -> None:
+    """Resolve both layers with one parsed config and the actual parent dispatch."""
+    from vllm.model_executor.layers.fused_moe import RoutedExperts
+    from vllm_hcu.model_executor.layers.quantization import glm_moe_dsa_w4a8
+
+    monkeypatch.setattr(
+        glm_moe_dsa_w4a8,
+        "GlmMoeDsaW4A8MoEMethod",
+        lambda config, moe: "int4",
+    )
+    # Keep parser, parent get_quant_method, MoE dispatch and matching real.
+    # Only replace final backend constructors so this is a CPU contract test.
+    native_package = (
+        "vllm.model_executor.layers.quantization.compressed_tensors."
+        "compressed_tensors_moe"
+    )
+    for module_name, method_name, result in (
+        (
+            "compressed_tensors_moe_w8a8_int8",
+            "CompressedTensorsW8A8Int8MoEMethod",
+            "int8",
+        ),
+        (
+            "compressed_tensors_moe_w4a8_int8",
+            "CompressedTensorsW4A8Int8MoEMethod",
+            "native-int4",
+        ),
+    ):
+        name = f"{native_package}.{module_name}"
+        module = ModuleType(name)
+        setattr(module, method_name, partial(lambda label, *args: label, result))
+        monkeypatch.setitem(sys.modules, name, module)
+
+    hf_config = _glm_hf_config()
+    hf_config.num_hidden_layers = 5
+    hf_config.first_k_dense_replace = 3
+    quant = _quant_config()
+    quant["config_groups"]["group_int4"]["targets"] = projection_targets
+    assert GlmMoeDsaW4A8Facade.override_quantization_method(
+        quant, None, hf_config
+    ) == "glm_moe_dsa_w4a8"
+    config = glm_moe_dsa_w4a8.GlmMoeDsaChannelW4A8Config.from_config(quant)
+    config.packed_modules_mapping = {}
+    assert "RoutedExperts" not in config.target_scheme_map
+    for index in layer_order:
+        layer = RoutedExperts.__new__(RoutedExperts)
+        layer.moe_config = SimpleNamespace()
+        assert config.get_quant_method(layer, f"model.layers.{index}.mlp.experts") == (
+            "int8" if index == 3 else "int4"
+        )
+        if index == 3:
+            assert config.target_scheme_map["RoutedExperts"] is (
+                config.target_scheme_map["Linear"]
+            )
+
+
+@pytest.mark.parametrize("wrapped", [False, True])
+@pytest.mark.parametrize(
+    "class_bits,projection_bits,expected",
+    [
+        (8, (4, 4, 4), True),
+        (4, (8, 8, 8), False),
+        (4, (4, None, None), True),
+        (8, (4, None, None), False),
+        (4, (None, None, 8), False),
+        (4, (None, None, None), True),
+        (8, (None, None, None), False),
+        (4, (4, 8, 4), False),
+    ],
+)
+def test_expert_projection_targets_and_class_fallback_agree(
+    wrapped, class_bits, projection_bits, expected
+) -> None:
+    from vllm.model_executor.layers.fused_moe import RoutedExperts
+    from vllm_hcu.model_executor.layers.quantization.glm_channel_int4 import (
+        routed_expert_uses_glm_channel_int4,
+    )
+
+    schemes = {4: _int4_scheme(), 8: _int8_scheme()}
+    checkpoint_prefix = "model.layers.61.mlp.experts"
+    runtime_prefix = (
+        "model.layers.61.mtp_block.mlp.experts" if wrapped else checkpoint_prefix
+    )
+    scheme_map = {"RoutedExperts": schemes[class_bits]}
+    for projection, bits in zip(
+        ("gate_proj", "up_proj", "down_proj"), projection_bits
+    ):
+        if bits is not None:
+            scheme_map[f"{checkpoint_prefix}.0.{projection}"] = schemes[bits]
+    config = _selection_config(target_scheme_map=scheme_map)
+    layer = RoutedExperts.__new__(RoutedExperts)
+    assert routed_expert_uses_glm_channel_int4(config, layer, runtime_prefix) is expected
+    config.ignore = [f"{checkpoint_prefix}.0.down_proj"]
+    assert routed_expert_uses_glm_channel_int4(config, layer, runtime_prefix) is False
+
+
 def test_expert_loaders_convert_weights_and_scales() -> None:
     import inspect
 

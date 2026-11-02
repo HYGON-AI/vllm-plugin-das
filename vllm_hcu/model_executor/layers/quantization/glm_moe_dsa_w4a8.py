@@ -5,9 +5,9 @@
 Routed experts whose prefix matches the INT4 targets are compressed-tensors
 pack-quantized INT4 with BF16 per-channel scales and dynamic per-token INT8
 activations. Other linears stay on compressed-tensors channel INT8. MTP experts
-retry only when ``.mtp_block.`` hides the published name, or when their layer
-index is past the backbone and the backbone expert scheme is channel INT4.
-Ignored prefixes and non-expert INT4 groups stay on the parent method.
+retry only when ``.mtp_block.`` hides the same expert's published name; they do
+not inherit a scheme from another layer. Ignored prefixes and non-expert INT4
+groups stay on the parent method.
 """
 
 from __future__ import annotations
