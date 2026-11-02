@@ -23,6 +23,7 @@ from .framework_opt import (
     patch_mooncake_connector,
     patch_multiproc_executor,
     patch_output_processor,
+    patch_detokenizer,
     patch_outputs,
     patch_parallel_state,
     patch_pcp_kv_cache_coordinator,
@@ -57,6 +58,7 @@ _ORDERED_FRAMEWORK_ADAPTERS = (
     patch_scheduler,
     patch_engine_core,
     patch_output_processor,
+    patch_detokenizer,
     patch_multiproc_executor,
     patch_outputs,
 )
