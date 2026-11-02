@@ -744,25 +744,9 @@ def test_get_quant_method_follows_prefix_scheme(monkeypatch) -> None:
     )
 
 
-@pytest.mark.parametrize(
-    "projection_targets",
-    [
-        [
-            "model.layers.4.mlp.experts.0.gate_proj",
-            "model.layers.4.mlp.experts.0.up_proj",
-            "model.layers.4.mlp.experts.0.down_proj",
-        ],
-        [
-            r"re:^model\.layers\.4\.mlp\.experts\.\d+\.(gate_proj|up_proj|down_proj)$",
-        ],
-    ],
-)
-@pytest.mark.parametrize("layer_order", [(3, 4), (4, 3)])
-def test_projection_targets_precede_generated_routed_experts_target(
-    monkeypatch, projection_targets, layer_order
-) -> None:
-    """Resolve both layers with one parsed config and the actual parent dispatch."""
-    from vllm.model_executor.layers.fused_moe import RoutedExperts
+@pytest.fixture
+def glm_quant_method_labels(monkeypatch):
+    """Keep native parsing/dispatch and replace only backend constructors."""
     from vllm_hcu.model_executor.layers.quantization import glm_moe_dsa_w4a8
 
     monkeypatch.setattr(
@@ -792,6 +776,30 @@ def test_projection_targets_precede_generated_routed_experts_target(
         module = ModuleType(name)
         setattr(module, method_name, partial(lambda label, *args: label, result))
         monkeypatch.setitem(sys.modules, name, module)
+    return glm_moe_dsa_w4a8
+
+
+@pytest.mark.parametrize(
+    "projection_targets",
+    [
+        [
+            "model.layers.4.mlp.experts.0.gate_proj",
+            "model.layers.4.mlp.experts.0.up_proj",
+            "model.layers.4.mlp.experts.0.down_proj",
+        ],
+        [
+            r"re:^model\.layers\.4\.mlp\.experts\.\d+\.(gate_proj|up_proj|down_proj)$",
+        ],
+    ],
+)
+@pytest.mark.parametrize("layer_order", [(3, 4), (4, 3)])
+def test_projection_targets_precede_generated_routed_experts_target(
+    glm_quant_method_labels, projection_targets, layer_order
+) -> None:
+    """Resolve both layers with one parsed config and the actual parent dispatch."""
+    from vllm.model_executor.layers.fused_moe import RoutedExperts
+
+    glm_moe_dsa_w4a8 = glm_quant_method_labels
 
     hf_config = _glm_hf_config()
     hf_config.num_hidden_layers = 5
@@ -814,6 +822,160 @@ def test_projection_targets_precede_generated_routed_experts_target(
             assert config.target_scheme_map["RoutedExperts"] is (
                 config.target_scheme_map["Linear"]
             )
+
+
+@pytest.mark.parametrize("local_bits,owner_bits", [(8, 4), (4, 8)])
+@pytest.mark.parametrize("projection_regex", [False, True])
+@pytest.mark.parametrize("local_first", [True, False])
+@pytest.mark.parametrize("layer_order", [(3, 4), (4, 3)])
+def test_projection_target_order_matches_native_with_broad_owner(
+    glm_quant_method_labels,
+    local_bits,
+    owner_bits,
+    projection_regex,
+    local_first,
+    layer_order,
+) -> None:
+    from vllm.model_executor.layers.fused_moe import RoutedExperts
+
+    schemes = {4: _int4_scheme(), 8: _int8_scheme()}
+    prefix = "model.layers.4.mlp.experts"
+    projections = ("gate_proj", "up_proj", "down_proj")
+    targets = (
+        [r"re:^model\.layers\.4\.mlp\.experts\.\d+\.(gate_proj|up_proj|down_proj)$"]
+        if projection_regex else [f"{prefix}.0.{proj}" for proj in projections]
+    )
+    groups = [
+        ("local", dict(schemes[local_bits], targets=targets)),
+        ("owner", dict(schemes[owner_bits], targets=[r"re:.*\.mlp\.experts.*"])),
+    ]
+    if not local_first:
+        groups.reverse()
+    quant = _quant_config()
+    quant["config_groups"] = {
+        **dict(groups),
+        "linears": dict(_int8_scheme(), targets=["Linear"]),
+    }
+    hf_config = _glm_hf_config()
+    assert GlmMoeDsaW4A8Facade.override_quantization_method(
+        quant, None, hf_config
+    ) == "glm_moe_dsa_w4a8"
+    config = glm_quant_method_labels.GlmMoeDsaChannelW4A8Config.from_config(quant)
+    config.packed_modules_mapping = {}
+    for index in layer_order:
+        layer = RoutedExperts.__new__(RoutedExperts)
+        layer.moe_config = SimpleNamespace()
+        current_prefix = f"model.layers.{index}.mlp.experts"
+        expected_bits = local_bits if local_first and index == 4 else owner_bits
+        native_bits = [
+            config.get_scheme_dict(layer, f"{current_prefix}.0.{proj}")[
+                "weights"
+            ].num_bits
+            for proj in projections
+        ]
+        assert native_bits == [expected_bits] * 3
+        expected_method = "int4" if expected_bits == 4 else "int8"
+        assert config.get_quant_method(layer, current_prefix) == expected_method
+    # Re-select after any parent-generated class alias has been installed.
+    layer = RoutedExperts.__new__(RoutedExperts)
+    layer.moe_config = SimpleNamespace()
+    assert config.get_quant_method(layer, prefix) == (
+        "int4" if (local_bits if local_first else owner_bits) == 4 else "int8"
+    )
+
+
+@pytest.mark.parametrize("local_bits,owner_bits", [(8, 4), (4, 8)])
+@pytest.mark.parametrize("projection_regex", [False, True])
+def test_mixed_projections_are_not_hidden_by_broad_owner(
+    glm_quant_method_labels, local_bits, owner_bits, projection_regex
+) -> None:
+    from vllm.model_executor.layers.fused_moe import RoutedExperts
+
+    schemes = {4: _int4_scheme(), 8: _int8_scheme()}
+    prefix = "model.layers.4.mlp.experts"
+    target = (
+        r"re:^model\.layers\.4\.mlp\.experts\.\d+\.gate_proj$"
+        if projection_regex else f"{prefix}.0.gate_proj"
+    )
+    quant = _quant_config()
+    quant["config_groups"] = {
+        "local": dict(schemes[local_bits], targets=[target]),
+        "owner": dict(schemes[owner_bits], targets=[r"re:.*\.mlp\.experts.*"]),
+        "linears": dict(_int8_scheme(), targets=["Linear"]),
+    }
+    config = glm_quant_method_labels.GlmMoeDsaChannelW4A8Config.from_config(quant)
+    config.packed_modules_mapping = {}
+    layer = RoutedExperts.__new__(RoutedExperts)
+    layer.moe_config = SimpleNamespace()
+    with pytest.raises(ValueError, match="All MoE projections need to have same"):
+        config.get_quant_method(layer, prefix)
+
+
+@pytest.mark.parametrize("wrapped", [False, True])
+@pytest.mark.parametrize("local_bits,owner_bits", [(8, 4), (4, 8)])
+@pytest.mark.parametrize("local_first", [True, False])
+def test_projection_target_order_across_checkpoint_aliases(
+    wrapped, local_bits, owner_bits, local_first
+) -> None:
+    from vllm.model_executor.layers.fused_moe import RoutedExperts
+    from vllm_hcu.model_executor.layers.quantization.glm_channel_int4 import (
+        routed_expert_uses_glm_channel_int4,
+    )
+
+    schemes = {4: _int4_scheme(), 8: _int8_scheme()}
+    local = (
+        r"re:^model\.layers\.61\.mlp\.experts\.\d+\.(gate_proj|up_proj|down_proj)$",
+        schemes[local_bits],
+    )
+    owner = (r"re:.*\.mlp\.experts.*", schemes[owner_bits])
+    targets = dict((local, owner) if local_first else (owner, local))
+    prefix = "model.layers.61.mlp.experts"
+    if wrapped:
+        prefix = "model.layers.61.mtp_block.mlp.experts"
+    config = _selection_config(target_scheme_map=targets)
+    layer = RoutedExperts.__new__(RoutedExperts)
+    assert routed_expert_uses_glm_channel_int4(config, layer, prefix) is (
+        (local_bits if local_first else owner_bits) == 4
+    )
+
+
+@pytest.mark.parametrize("wrapped", [False, True])
+@pytest.mark.parametrize("owner_regex", [False, True])
+@pytest.mark.parametrize(
+    "owner_bits,gate_bits,class_bits,expected",
+    [
+        (4, None, 8, True),
+        (8, None, 4, False),
+        (4, 8, 4, False),
+        (8, 4, 4, True),
+        (4, 4, 8, False),
+        (4, 4, None, False),
+    ],
+)
+def test_fused_owner_fallback_requires_no_projection_name_match(
+    wrapped, owner_regex, owner_bits, gate_bits, class_bits, expected
+) -> None:
+    from vllm.model_executor.layers.fused_moe import RoutedExperts
+    from vllm_hcu.model_executor.layers.quantization.glm_channel_int4 import (
+        routed_expert_uses_glm_channel_int4,
+    )
+
+    schemes = {4: _int4_scheme(), 8: _int8_scheme()}
+    checkpoint_prefix = "model.layers.61.mlp.experts"
+    owner_target = (
+        r"re:^model\.layers\.61\.mlp\.experts$" if owner_regex else checkpoint_prefix
+    )
+    targets = {owner_target: schemes[owner_bits]}
+    if gate_bits is not None:
+        targets[f"{checkpoint_prefix}.0.gate_proj"] = schemes[gate_bits]
+    if class_bits is not None:
+        targets["RoutedExperts"] = schemes[class_bits]
+    config = _selection_config(target_scheme_map=targets)
+    prefix = (
+        "model.layers.61.mtp_block.mlp.experts" if wrapped else checkpoint_prefix
+    )
+    layer = RoutedExperts.__new__(RoutedExperts)
+    assert routed_expert_uses_glm_channel_int4(config, layer, prefix) is expected
 
 
 @pytest.mark.parametrize("wrapped", [False, True])

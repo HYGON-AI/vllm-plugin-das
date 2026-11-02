@@ -344,6 +344,17 @@ def _match_target_by_class(layer: Any, targets: Any) -> str | None:
     return None
 
 
+def _match_target_by_names(
+    names: list[str], targets: Any, fused_mapping: Any
+) -> str | None:
+    """Preserve target order across runtime/checkpoint aliases of one name."""
+    matches = {_match_target_by_name(name, targets, fused_mapping) for name in names}
+    return next(
+        (target for target in targets if target is not None and target in matches),
+        None,
+    )
+
+
 def _projection_names(layer: Any, prefix: str) -> tuple[str, str, str]:
     return tuple(f"{prefix}.0.{proj_name}" for proj_name in _expert_proj_names(layer))
 
@@ -389,30 +400,34 @@ def _explicit_expert_scheme(
     unwrapped = prefix.replace(_MTP_BLOCK_MARKER, ".")
     if unwrapped != prefix:
         prefixes.append(unwrapped)
-    for candidate in prefixes:
-        matched = _match_target_by_name(candidate, scheme_map, fused_mapping)
+
+    # Native MoE dispatch resolves each checkpoint projection in target order.
+    # An owner regex may also match these names, but must not bypass a target
+    # that appears earlier for a projection.
+    proj_targets = [
+        _match_target_by_names(
+            [f"{candidate}.0.{proj_name}" for candidate in prefixes],
+            scheme_map,
+            fused_mapping,
+        )
+        for proj_name in _expert_proj_names(layer)
+    ]
+    if all(target is None for target in proj_targets):
+        # Exact/anchored fused-owner targets are an HCU compatibility alias.
+        # Only use them when no projection name has selected a scheme.
+        matched = _match_target_by_names(prefixes, scheme_map, fused_mapping)
         if matched is not None:
             return True, scheme_map.get(matched)
 
-    # Parent MoE dispatch may add RoutedExperts -> Linear to the shared map.
-    # Match each projection name before using that class entry as a fallback,
-    # including the checkpoint alias of a wrapped MTP prefix.
+    # Parent dispatch can add RoutedExperts -> Linear to this shared config.
+    # Match projection names first and use the class only for missing names.
     class_target = _match_target_by_class(layer, scheme_map)
-    has_target = class_target is not None
-    proj_schemes = []
-    for proj_name in _expert_proj_names(layer):
-        proj_target = None
-        for candidate in prefixes:
-            proj_target = _match_target_by_name(
-                f"{candidate}.0.{proj_name}", scheme_map, fused_mapping
-            )
-            if proj_target is not None:
-                break
-        has_target |= proj_target is not None
-        target = proj_target if proj_target is not None else class_target
-        proj_schemes.append(scheme_map.get(target))
-    if not has_target:
+    if class_target is None and all(target is None for target in proj_targets):
         return False, None
+    proj_schemes = [
+        scheme_map.get(target if target is not None else class_target)
+        for target in proj_targets
+    ]
     if all(_scheme_is_channel_int4(scheme, config) for scheme in proj_schemes):
         return True, proj_schemes[0]
     return True, None
