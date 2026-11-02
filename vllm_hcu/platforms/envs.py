@@ -78,6 +78,9 @@ if TYPE_CHECKING:
     VLLM_HCU_DPSK_V4_DEEPEP_LL_USE_HCU_DISPATCH_API: bool = False
     VLLM_HCU_SHARED_EXPERTS_STREAM_FORCE: bool = False
     VLLM_HCU_DEEPSEEK_V4_PCP_LOCAL_QUERIES: bool = True
+    VLLM_HCU_PCP_ISOLATE_PREFILL: bool = True
+    VLLM_HCU_PCP_ISOLATE_PREFILL_MIN_TOKENS: int = 1024
+    VLLM_HCU_PCP_ISOLATE_PREFILL_MAX_STEPS: int = 4
     VLLM_HCU_KV_ZERO_BY_GROUP: bool = True
     VLLM_HCU_DEEPSEEK_V4_PCP_LOCAL_SLICES: bool = True
     VLLM_HCU_COMPRESSOR_GEMM_BACKEND: str = "blaslt"
@@ -648,6 +651,20 @@ hcu_vllm_environment_variables: dict[str, Callable[[], Any]] = {
     "VLLM_HCU_DEEPSEEK_V4_PCP_LOCAL_QUERIES":
         lambda: os.getenv("VLLM_HCU_DEEPSEEK_V4_PCP_LOCAL_QUERIES", "True").lower()
         in ("1", "true"),
+
+    # DeepSeek V4 PCP: keep decode requests out of steps that schedule a long
+    # prefill, so the prefill keeps the rank-local query path (a mixed batch
+    # falls back to global attention at roughly twice the prefill time).
+    "VLLM_HCU_PCP_ISOLATE_PREFILL":
+        lambda: _environment_flag(os.getenv("VLLM_HCU_PCP_ISOLATE_PREFILL", "1")),
+
+    # Pending prefill tokens from which VLLM_HCU_PCP_ISOLATE_PREFILL applies.
+    "VLLM_HCU_PCP_ISOLATE_PREFILL_MIN_TOKENS":
+        lambda: int(os.getenv("VLLM_HCU_PCP_ISOLATE_PREFILL_MIN_TOKENS", "1024")),
+
+    # Consecutive prefill-only steps before one decode-only step (0: no limit).
+    "VLLM_HCU_PCP_ISOLATE_PREFILL_MAX_STEPS":
+        lambda: int(os.getenv("VLLM_HCU_PCP_ISOLATE_PREFILL_MAX_STEPS", "4")),
 
     # Zero a new KV block only in its owning cache group's layer pages.
     "VLLM_HCU_KV_ZERO_BY_GROUP":
