@@ -400,6 +400,11 @@ def _load_batched_deep_gemm_apply():
                 names=[ast.alias(name="annotations")],
                 level=0,
             ),
+            next(
+                node for node in tree.body
+                if isinstance(node, ast.FunctionDef)
+                and node.name == "_w4a8_masked_kernel_weight"
+            ),
             function,
         ],
         type_ignores=[],
@@ -946,8 +951,12 @@ def test_w4a8_masked_batched_apply_propagates_scales_and_token_counts(
     )
 
     assert len(gemm_calls) == 2
-    assert gemm_calls[0][1] == (derived_w13, w13_scale)
-    assert gemm_calls[1][1] == (derived_w2, w2_scale)
+    assert gemm_calls[0][1][0].shape == (1, 128, 32)
+    assert gemm_calls[0][1][0].data_ptr() == derived_w13.data_ptr()
+    assert gemm_calls[0][1][1] is w13_scale
+    assert gemm_calls[1][1][0].shape == (1, 64, 32)
+    assert gemm_calls[1][1][0].data_ptr() == derived_w2.data_ptr()
+    assert gemm_calls[1][1][1] is w2_scale
     assert gemm_calls[0][3] is expert_num_tokens
     assert gemm_calls[1][3] is expert_num_tokens
     assert gemm_calls[0][4] == 2
