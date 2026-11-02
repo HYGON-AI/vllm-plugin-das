@@ -115,6 +115,8 @@ def configure_tuned_moe_config_folder(
     """
 
     environ = os.environ if environ is None else environ
+    # Preserve an explicit user override as an expert escape hatch.
+    # The AITER contract guard applies only to plugin-managed automatic discovery.
     if environ.get(TUNED_CONFIG_FOLDER_ENV):
         return
 
