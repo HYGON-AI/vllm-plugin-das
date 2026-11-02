@@ -1100,3 +1100,54 @@ def test_pcp_metadata_from_actual_context_builders(runtime, monkeypatch, builder
             # supported MegaMoE configuration and must not be sent to apply.
             assert context.dp_metadata.num_tokens_across_dp_cpu.tolist() == [2, 7]
     assert contexts == []
+
+
+def test_hcu_context_preserves_supplied_metadata_for_deepep_low_latency(
+    monkeypatch,
+):
+    from contextlib import contextmanager
+
+    module, sp_property = _native_context_symbols()
+    parallel = NS(
+        tensor_parallel_size=1,
+        data_parallel_size=2,
+        data_parallel_rank=0,
+        prefill_context_parallel_size=1,
+        enable_expert_parallel=True,
+        is_moe_model=True,
+        all2all_backend="deepep_low_latency",
+    )
+    parallel.use_sequence_parallel_moe = sp_property.fget(parallel)
+    config = NS(parallel_config=parallel)
+    contexts = []
+
+    @contextmanager
+    def override(context):
+        contexts.append(context)
+        try:
+            yield
+        finally:
+            contexts.pop()
+
+    module.track_batchsize = False
+    module.current_platform = NS(set_additional_forward_context=lambda **kw: {})
+    module.create_forward_context = lambda *args, **kw: NS(dp_metadata=args[2])
+    module.override_forward_context = override
+    hcu = load_file(
+        monkeypatch,
+        "test_hcu_context_low_latency",
+        "vllm_hcu/forward_context_runtime.py",
+    )
+    supplied = torch.tensor([2, 7], dtype=torch.int32)
+
+    with hcu.set_forward_context(
+        module,
+        None,
+        config,
+        num_tokens=2,
+        num_tokens_across_dp=supplied,
+    ):
+        metadata = contexts[-1].dp_metadata
+
+    assert metadata.num_tokens_across_dp_cpu.tolist() == [2, 7]
+    assert contexts == []
