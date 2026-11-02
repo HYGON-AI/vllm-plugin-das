@@ -39,6 +39,9 @@ from vllm.platforms import current_platform
 from vllm.sequence import IntermediateTensors
 
 import vllm_hcu.platforms.envs as henvs
+from vllm_hcu.model_executor.layers.quantization.glm_channel_int4 import (
+    normalize_routed_expert_checkpoint_name,
+)
 from vllm_hcu.v1.attention.lightly_cp_utils import lightly_cp_inputs_splitting
 
 from .deepseek_v2 import (
@@ -350,6 +353,12 @@ class DeepSeekMTP(nn.Module, DeepseekV2MixtureOfExperts, SupportsPP):
         for name, loaded_weight in weights:
             if "rotary_emb.inv_freq" in name:
                 continue
+            normalized_name = normalize_routed_expert_checkpoint_name(
+                name, params_dict=params_dict
+            )
+            if normalized_name is None:
+                continue
+            name = normalized_name
             #  Skip loading mtp indexer weights
             if "indexer" in name and not mtp_has_indexer:
                 logger.info(f"Skipping mtp indexer weight (DSA disabled): {name}")

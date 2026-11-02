@@ -283,6 +283,15 @@ class HcuGPUModelRunnerV2(GPUModelRunner):
             for model in (self.model, self.get_draft_model()):
                 skinny_lm_head.enable_for_model(model)
 
+    def reload_weights(self, *args, **kwargs) -> None:
+        """Refresh GLM gemm2 state after upstream restores runtime parameters."""
+        super().reload_weights(*args, **kwargs)
+        from vllm_hcu.model_executor.layers.quantization.glm_moe_dsa_w4a8 import (
+            commit_installed_glm_w4a8_gemm2_generations,
+        )
+
+        commit_installed_glm_w4a8_gemm2_generations(self.get_model())
+
     @property
     def pcp_manager_cls(self):
         if self._hcu_pcp_manager_cls is None:

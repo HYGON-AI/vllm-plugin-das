@@ -1083,6 +1083,18 @@ def apply_aiter_w4a8_moe(
                 cache_owner=w1,
                 solution_type="moe_c",
             )
+        # GLM gemm2 weights are finalized for one weight generation. A
+        # different M can select a config that sets need_shuffle; clear it
+        # only while the installed tensors are still that generation.
+        from vllm_hcu.model_executor.layers.quantization.glm_moe_dsa_w4a8 import (
+            glm_expert_weights_use_gemm2_layout,
+        )
+
+        if aiter_config is not None and glm_expert_weights_use_gemm2_layout(layer):
+            if getattr(aiter_config, "need_shuffle", False):
+                aiter_config.need_shuffle = False
+            if getattr(aiter_config, "need_shuffle_scale", False):
+                aiter_config.need_shuffle_scale = False
     else:
         installed_solution = None
     global_num_experts = getattr(

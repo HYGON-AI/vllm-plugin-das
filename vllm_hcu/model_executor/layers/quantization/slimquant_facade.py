@@ -21,6 +21,11 @@ from vllm.model_executor.layers.quantization.base_config import (
     QuantizeMethodBase,
 )
 
+from vllm_hcu.model_executor.layers.quantization.glm_channel_int4 import (
+    is_glm_channel_int4_w4a8,
+    is_glm_moe_dsa_model,
+)
+
 
 class _SlimQuantFacade(QuantizationConfig):
     _registry_name: ClassVar[str]
@@ -135,17 +140,44 @@ class SlimQuantW4A8Facade(_SlimQuantFacade):
         return None
 
 
+class GlmMoeDsaW4A8Facade(_SlimQuantFacade):
+    """Auto quantization entry for GLM MoE DSA channel INT4 experts."""
+
+    _registry_name = "glm_moe_dsa_w4a8"
+    _implementation_module = (
+        "vllm_hcu.model_executor.layers.quantization.glm_moe_dsa_w4a8"
+    )
+    _implementation_class = "GlmMoeDsaChannelW4A8Config"
+
+    @classmethod
+    def override_quantization_method(
+        cls,
+        hf_quant_cfg: dict[str, Any],
+        user_quant: str | None,
+        hf_config: Any = None,
+    ) -> str | None:
+        if user_quant not in (None, cls._registry_name):
+            return None
+        if not is_glm_moe_dsa_model(hf_config):
+            return None
+        if not is_glm_channel_int4_w4a8(hf_quant_cfg, hf_config):
+            return None
+        return cls._registry_name
+
+
 SLIMQUANT_FACADES: dict[str, type[QuantizationConfig]] = {
     "slimquant_marlin": SlimQuantMarlinFacade,
     "slimquant_compressed_tensors_marlin": (
         SlimQuantCompressedTensorsMarlinFacade
     ),
     "slimquant_w4a8": SlimQuantW4A8Facade,
+    "glm_moe_dsa_w4a8": GlmMoeDsaW4A8Facade,
 }
 
 
 __all__ = [
     "SLIMQUANT_FACADES",
+    "GlmMoeDsaW4A8Facade",
     "SlimQuantCompressedTensorsMarlinFacade",
     "SlimQuantMarlinFacade",
     "SlimQuantW4A8Facade",

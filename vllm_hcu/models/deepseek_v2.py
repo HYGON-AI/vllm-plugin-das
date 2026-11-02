@@ -118,6 +118,9 @@ from vllm.model_executor.models.utils import (
 )
 
 import vllm_hcu.platforms.envs as henvs
+from vllm_hcu.model_executor.layers.quantization.glm_channel_int4 import (
+    normalize_routed_expert_checkpoint_name,
+)
 from vllm_hcu.patch.config import get_hcu_config
 from vllm_hcu.platforms.hcu import on_gfx938
 from vllm_hcu.v1.attention.lightly_cp_utils import lightly_cp_inputs_splitting
@@ -1695,7 +1698,13 @@ class DeepseekV2Model(nn.Module):
         for name, loaded_weight in weights:
             if "rotary_emb.inv_freq" in name:
                 continue
-            
+            normalized_name = normalize_routed_expert_checkpoint_name(
+                name, params_dict=params_dict
+            )
+            if normalized_name is None:
+                continue
+            name = normalized_name
+
             if not _is_local_indexer_weight(name, indexer_present_prefixes):
                 continue
 

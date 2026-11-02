@@ -5340,6 +5340,15 @@ class GPUModelRunner(
                 param.copy_(loaded_weight)
                 loaded_weights.add(name)
 
+        # Checkpoint reload restores the original Parameters after gemm2
+        # post-load. Kernel-format reload only copy_s into them. Record the
+        # generation on those final owners without repacking gemm2 bytes.
+        from vllm_hcu.model_executor.layers.quantization.glm_moe_dsa_w4a8 import (
+            commit_installed_glm_w4a8_gemm2_generations,
+        )
+
+        commit_installed_glm_w4a8_gemm2_generations(model)
+
         # logging and validation
         counter_after_reloading = time.perf_counter()
         diff_seconds = counter_after_reloading - counter_before_reloading
