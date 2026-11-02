@@ -31,6 +31,19 @@ def replay(backend, ids, output, skip, burst=1):
             for i in range(0, len(output), burst)]
 
 
+class RecordingTokenizer:
+    """Count real native decode work without changing ByteLevel semantics."""
+
+    def __init__(self, backend):
+        self.backend = backend
+        self.decoder = backend.decoder
+        self.decode_sizes = []
+
+    def decode(self, ids, **kwargs):
+        self.decode_sizes.append(len(ids))
+        return self.backend.decode(ids, **kwargs)
+
+
 class ByteLevelPromptTailTests(unittest.TestCase):
     def setUp(self):
         self.assertTrue(SOURCE.is_file(), "prompt-tail helper has not been implemented")
@@ -79,6 +92,43 @@ class ByteLevelPromptTailTests(unittest.TestCase):
     def test_literal_replacement_character_keeps_conservative_fallback(self):
         ids = self.backend.encode("ordinary prefix " * 100 + "\ufffd end").ids
         self.assertIs(self.choose(self.backend, ids, True), ids)
+
+    def test_three_token_character_finds_adjacent_clean_boundary(self):
+        char = self.backend.encode("汉").ids
+        self.assertEqual(len(char), 3)
+        ids = char * 28333
+        self.assertEqual(self.backend.decode(ids), "汉" * 28333)
+        self.assertIn("\ufffd", self.backend.decode(ids[-32:]))
+        self.assertNotIn("\ufffd", self.backend.decode(ids[-33:]))
+        output = self.backend.encode("你好 😀 abc").ids
+        for skip in [True, False]:
+            with self.subTest(skip=skip):
+                recorded = RecordingTokenizer(self.backend)
+                tail = self.choose(recorded, ids, skip)
+                self.assertEqual(len(tail), 33)
+                self.assertEqual(recorded.decode_sizes, [32, 33])
+                for burst in [1, 3, 7]:
+                    self.assertEqual(replay(self.backend, ids, output, skip, burst),
+                                     replay(self.backend, tail, output, skip, burst))
+
+    def test_fallback_decode_work_has_a_prompt_length_independent_budget(self):
+        special = self.backend.token_to_id("[SPECIAL]")
+        partial_char = self.backend.encode("😀").ids[:1]
+        for repeats in [28333, 56666]:
+            prefix = self.backend.encode("abc").ids * repeats
+            cases = {
+                "literal_replacement": prefix + self.backend.encode("\ufffd end").ids,
+                "incomplete_character": prefix + partial_char,
+                "long_skipped_run": prefix + [special] * 4096,
+            }
+            for name, ids in cases.items():
+                with self.subTest(case=name, prompt_tokens=len(ids)):
+                    recorded = RecordingTokenizer(self.backend)
+                    self.assertTrue(self.choose(recorded, ids, True) is ids,
+                                    "budget-exhausted selection must keep the original IDs")
+                    self.assertLessEqual(len(recorded.decode_sizes), 8)
+                    self.assertLessEqual(sum(recorded.decode_sizes), 512)
+                    self.assertLessEqual(max(recorded.decode_sizes), 67)
 
     def test_other_decoder_keeps_full_prompt(self):
         ids = self.backend.encode("ordinary prefix " * 100).ids

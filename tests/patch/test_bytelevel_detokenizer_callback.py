@@ -117,3 +117,35 @@ def test_decode_stream_monkeypatch_before_or_after_callback_is_preserved(monkeyp
     assert instance.stream is constructed[0]
     assert instance.stream.ids is request.prompt_token_ids
     assert instance.stream.skip_special_tokens is True
+
+
+@pytest.mark.parametrize("clean_boundary", [True, False])
+def test_adjacent_boundary_or_bounded_fallback_keeps_native_chunks(monkeypatch, clean_boundary):
+    adapter = load_adapter()
+    monkeypatch.setenv(FLAG, "1")
+    module, tokenizer, request = target_module()
+    backend = tokenizer._tokenizer
+    request.prompt_token_ids = (
+        backend.encode("汉").ids * 28333 if clean_boundary else
+        backend.encode("abc " * 22000 + "\ufffd end").ids
+    )
+    baseline = module.FastIncrementalDetokenizer(tokenizer, request)
+    original_init = module.FastIncrementalDetokenizer.__init__
+    original_streams = []
+
+    def record_original(self, tokenizer, request):
+        original_init(self, tokenizer, request)
+        original_streams.append(self.stream)
+
+    module.FastIncrementalDetokenizer.__init__ = record_original
+    assert adapter.apply_to_module(module) is True
+    candidate = module.FastIncrementalDetokenizer(tokenizer, request)
+    assert len(original_streams) == 1
+    assert candidate.original_ids is request.prompt_token_ids
+    if clean_boundary:
+        assert candidate.stream is not original_streams[0]
+    else:
+        assert candidate.stream is original_streams[0]
+    output = backend.encode("你好 😀 abc").ids
+    assert [baseline.stream.step(backend, token) for token in output] == [
+        candidate.stream.step(backend, token) for token in output]

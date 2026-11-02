@@ -22,8 +22,13 @@ def choose_prompt_tail(
     ):
         return prompt_token_ids
 
-    size = 32
-    while size < len(prompt_token_ids):
+    # Nearby starts can recover UTF-8 boundaries missed by power-of-two
+    # windows. Keep selection work independent of prompt length: at most
+    # eight decodes, 67 tokens per candidate and 396 tokens in total.
+    # The second group still handles modest runs of skipped special tokens.
+    for size in (32, 33, 34, 35, 64, 65, 66, 67):
+        if size >= len(prompt_token_ids):
+            break
         tail = prompt_token_ids[-size:]
         try:
             decoded = tokenizer.decode(tail, skip_special_tokens=skip_special_tokens)
@@ -32,5 +37,4 @@ def choose_prompt_tail(
             return prompt_token_ids
         if decoded and "\ufffd" not in decoded:
             return tail
-        size *= 2
     return prompt_token_ids
