@@ -181,6 +181,7 @@ def test_native_decode_matches_custom_op_writer_layout(monkeypatch, gfx938):
     )
     assert calls == [{
         "max_model_len": 6,
+        "clean_logits": False,
         "kcache_layout": "normal" if gfx938 else "preshuffle",
     }]
     assert set(result[0].tolist()) == {1, 2}
