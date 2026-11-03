@@ -202,6 +202,29 @@ def test_plugin_expert_adds_only_int8_channel_token_support(
     assert experts._supports_quant_scheme("int8-channel", "static-int8") is False
 
 
+def test_explicit_aiter_rejects_expert_bias_before_weight_conversion(monkeypatch):
+    target = install_fake(monkeypatch)
+    with pytest.raises(ValueError, match="expert bias"):
+        target.select_int8_moe_backend(SimpleNamespace(moe_backend="aiter", has_bias=True))
+    # The same configuration can still be delegated to the official backend.
+    backend, experts = target.select_int8_moe_backend(
+        SimpleNamespace(moe_backend="triton", has_bias=True)
+    )
+    assert backend is target.Int8MoeBackend.TRITON
+    assert experts == "triton"
+
+
+@pytest.mark.parametrize("activation", ("situ", "swigluoai", "swigluoai_uninterleave"))
+def test_plugin_expert_does_not_inherit_unforwarded_activation_parameters(
+    monkeypatch, activation
+):
+    install_fake(monkeypatch)
+    experts = oracle.HcuAiterInt8Experts
+    assert experts._supports_activation(SimpleNamespace(value=activation)) is False
+    assert experts._supports_activation(SimpleNamespace(value="silu")) is True
+    assert experts._supports_activation(SimpleNamespace(value="gelu")) is True
+
+
 def test_plugin_expert_delegates_int8_execution_to_provider(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:

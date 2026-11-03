@@ -224,6 +224,11 @@ def apply_aiter_int8_moe(
 
     if not bool(getattr(quant_config, "use_int8_w8a8", False)):
         raise ValueError("AITER INT8 MoE requires an INT8 W8A8 quant config")
+    if any(getattr(quant_config, name, None) is not None for name in ("w1_bias", "w2_bias")):
+        raise ValueError("HCU AITER INT8 MoE does not support expert bias")
+    activation_name = _activation_name(activation)
+    if activation_name not in ("silu", "gelu"):
+        raise ValueError(f"HCU AITER INT8 MoE does not support {activation_name} activation")
 
     m, k = _shape(hidden_states, 2, "hidden_states")
     e, n1, weight_k = _shape(w1, 3, "w1")
@@ -234,7 +239,6 @@ def apply_aiter_int8_moe(
     if _shape(topk_weights, 2, "topk_weights") != (m, top_k):
         raise ValueError("AITER INT8 MoE top-k weights and IDs must match")
 
-    activation_name = _activation_name(activation)
     global_num_experts = int(getattr(moe_config, "num_experts", e))
     problem = (m, e, n1, n2, k, top_k)
     api = _load_aiter_api()

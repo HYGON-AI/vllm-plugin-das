@@ -55,6 +55,24 @@ def native_config(**overrides: object) -> SimpleNamespace:
     return SimpleNamespace(**values)
 
 
+@pytest.mark.parametrize("bias", ("w1_bias", "w2_bias"))
+def test_direct_provider_rejects_expert_bias_before_config_or_execution(monkeypatch, bias):
+    arguments = inputs()
+    setattr(arguments["quant_config"], bias, object())
+    monkeypatch.setattr(provider, "_load_aiter_api", lambda: pytest.fail("vendor reached"))
+    with pytest.raises(ValueError, match="expert bias"):
+        provider.apply_aiter_int8_moe(**arguments)
+
+
+@pytest.mark.parametrize("activation", ("situ", "swigluoai", "swigluoai_uninterleave"))
+def test_direct_provider_rejects_unforwarded_activation_parameters(monkeypatch, activation):
+    arguments = inputs()
+    arguments["activation"] = SimpleNamespace(value=activation)
+    monkeypatch.setattr(provider, "_load_aiter_api", lambda: pytest.fail("vendor reached"))
+    with pytest.raises(ValueError, match="activation"):
+        provider.apply_aiter_int8_moe(**arguments)
+
+
 def test_shape_evidence_uses_vllm_runtime_logger(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:

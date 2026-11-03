@@ -96,6 +96,22 @@ def _make_experts_class(
             return True
 
         @staticmethod
+        def _supports_activation(activation: object) -> bool:
+            # Other parent activations need parameters this INT8 ABI does not
+            # forward (for example SITU beta or SwiGLU-OAI clamping).
+            return getattr(activation, "value", activation) in ("silu", "gelu")
+
+        @staticmethod
+        def is_supported_config(
+            cls, moe_config, weight_key, activation_key, activation_format
+        ):
+            if getattr(moe_config, "has_bias", False):
+                return False, "HCU AITER INT8 MoE does not support expert bias"
+            return super().is_supported_config(
+                cls, moe_config, weight_key, activation_key, activation_format
+            )
+
+        @staticmethod
         def _supports_quant_scheme(
             weight_key: object,
             activation_key: object,
