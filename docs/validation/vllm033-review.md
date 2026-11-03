@@ -1,5 +1,10 @@
 # v0.33 Plugin review and follow-up validation
 
+Subsequent [INT8 math follow-up](vllm033-int8-math.md) fixes the default ASM
+quantization/activation compatibility in `529855a5`; its installed strict EP
+checks now pass. The ASM failures below remain the original review snapshot.
+Unchanged vendor-Triton and model quality gates still prevent merging PR330.
+
 Review base: `153e4d9eb88a82f3c59a6fd5e87d790c59675104` on `v0.33.0`.
 Reviewed production revisions: hybrid admission fix `597bbaa8`, then EP map fix
 `ecf67052`. Both belong to existing [PR330](https://github.com/HYGON-AI/vllm-plugin-das/pull/330)
