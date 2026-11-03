@@ -7,7 +7,8 @@ pack-quantized INT4 with BF16 per-channel scales and dynamic per-token INT8
 activations. Other linears stay on compressed-tensors channel INT8. MTP experts
 retry only when ``.mtp_block.`` hides the same expert's published name; they do
 not inherit a scheme from another layer. Ignored prefixes and non-expert INT4
-groups stay on the parent method.
+groups stay on the parent method; an ignored fused owner uses the unquantized
+MoE method so the parent cannot reinterpret the ignore through expert 0.
 """
 
 from __future__ import annotations
@@ -15,7 +16,10 @@ from __future__ import annotations
 from typing import Any
 
 import torch
-from vllm.model_executor.layers.fused_moe import RoutedExperts
+from vllm.model_executor.layers.fused_moe import (
+    RoutedExperts,
+    UnquantizedFusedMoEMethod,
+)
 from vllm.model_executor.layers.quantization.compressed_tensors.compressed_tensors import (
     CompressedTensorsConfig,
 )
@@ -25,6 +29,7 @@ from vllm_hcu.model_executor.layers.quantization.glm_channel_int4 import (
     is_glm_channel_int4_w4a8,
     is_glm_moe_dsa_model,
     repack_and_shuffle_w4a8_gemm2,
+    routed_expert_owner_is_ignored,
     routed_expert_uses_glm_channel_int4,
 )
 from vllm_hcu.model_executor.layers.quantization.slimquant_w4a8 import (
@@ -286,8 +291,12 @@ class GlmMoeDsaChannelW4A8Config(CompressedTensorsConfig):
         return cls.get_name()
 
     def get_quant_method(self, layer: torch.nn.Module, prefix: str):
-        if isinstance(layer, RoutedExperts) and routed_expert_uses_glm_channel_int4(
-            self, layer, prefix
-        ):
-            return GlmMoeDsaW4A8MoEMethod(self, layer.moe_config)
+        if isinstance(layer, RoutedExperts):
+            # The parent matcher only sees expert-0 projection names. An
+            # owner-level ignore therefore must bypass it explicitly, or the
+            # ignored owner can fall back to native CPU-only W4A8.
+            if routed_expert_owner_is_ignored(self, prefix):
+                return UnquantizedFusedMoEMethod(layer.moe_config)
+            if routed_expert_uses_glm_channel_int4(self, layer, prefix):
+                return GlmMoeDsaW4A8MoEMethod(self, layer.moe_config)
         return super().get_quant_method(layer, prefix)

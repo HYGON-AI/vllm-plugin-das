@@ -695,6 +695,11 @@ def test_get_quant_method_follows_prefix_scheme(monkeypatch) -> None:
         lambda config, moe: "int4",
     )
     monkeypatch.setattr(
+        glm_moe_dsa_w4a8,
+        "UnquantizedFusedMoEMethod",
+        lambda moe: "unquantized",
+    )
+    monkeypatch.setattr(
         CompressedTensorsConfig,
         "get_quant_method",
         lambda self, layer, prefix: "parent",
@@ -716,7 +721,10 @@ def test_get_quant_method_follows_prefix_scheme(monkeypatch) -> None:
         == "int4"
     )
     config.ignore = ["re:.*mlp\\.experts.*"]
-    assert config.get_quant_method(layer, "model.layers.0.mlp.experts") == "parent"
+    assert (
+        config.get_quant_method(layer, "model.layers.0.mlp.experts")
+        == "unquantized"
+    )
     config.ignore = []
     config.target_scheme_map = {
         "re:.*self_attn.*": _int4_scheme(),
@@ -753,6 +761,11 @@ def glm_quant_method_labels(monkeypatch):
         glm_moe_dsa_w4a8,
         "GlmMoeDsaW4A8MoEMethod",
         lambda config, moe: "int4",
+    )
+    monkeypatch.setattr(
+        glm_moe_dsa_w4a8,
+        "UnquantizedFusedMoEMethod",
+        lambda moe: "unquantized",
     )
     # Keep parser, parent get_quant_method, MoE dispatch and matching real.
     # Only replace final backend constructors so this is a CPU contract test.
@@ -1175,6 +1188,49 @@ def test_all_ignored_experts_do_not_select_glm_int4(wrapped, ignore_kind) -> Non
     assert GlmMoeDsaW4A8Facade.override_quantization_method(
         quant, None, hf_config
     ) is None
+
+
+@pytest.mark.parametrize(
+    "owner_ignore",
+    [
+        "model.layers.4.mlp.experts",
+        r"re:^model\.layers\.4\.mlp\.experts$",
+    ],
+)
+@pytest.mark.parametrize("wrapped", [False, True])
+def test_owner_ignore_bypasses_parent_moe_dispatch(
+    glm_quant_method_labels, monkeypatch, owner_ignore, wrapped
+) -> None:
+    from vllm.model_executor.layers.fused_moe import RoutedExperts
+    from vllm.model_executor.layers.quantization.compressed_tensors.compressed_tensors import (
+        CompressedTensorsConfig,
+    )
+
+    quant = _quant_config()
+    quant["ignore"] = [owner_ignore]
+    quant["config_groups"]["group_int4"]["targets"] = [
+        r"re:.*\.mlp\.experts.*"
+    ]
+    config = glm_quant_method_labels.GlmMoeDsaChannelW4A8Config.from_config(quant)
+    config.packed_modules_mapping = {}
+    layer = RoutedExperts.__new__(RoutedExperts)
+    layer.moe_config = SimpleNamespace(num_logical_experts=2)
+    prefix = (
+        "model.layers.4.mtp_block.mlp.experts" if wrapped
+        else "model.layers.4.mlp.experts"
+    )
+    # Another layer still uses GLM INT4, so the facade remains active.
+    assert config.get_quant_method(
+        layer, "model.layers.3.mlp.experts"
+    ) == "int4"
+    monkeypatch.setattr(
+        CompressedTensorsConfig,
+        "get_quant_method",
+        lambda *args: (_ for _ in ()).throw(
+            AssertionError("owner ignore must not call parent MoE dispatch")
+        ),
+    )
+    assert config.get_quant_method(layer, prefix) == "unquantized"
 
 
 @pytest.mark.parametrize("projection", ["gate_proj", "up_proj", "down_proj"])

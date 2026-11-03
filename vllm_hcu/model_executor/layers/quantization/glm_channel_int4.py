@@ -390,6 +390,20 @@ def _ignore_covers_expert(
     )
 
 
+def routed_expert_owner_is_ignored(config: Any, prefix: str) -> bool:
+    """Return whether an ignore rule covers the whole fused expert owner."""
+    ignore = getattr(config, "ignore", None) or []
+    fused_mapping = getattr(config, "packed_modules_mapping", None) or {}
+    prefixes = [prefix]
+    unwrapped = prefix.replace(_MTP_BLOCK_MARKER, ".")
+    if unwrapped != prefix:
+        prefixes.append(unwrapped)
+    return any(
+        _ignore_covers_prefix(candidate, ignore, fused_mapping)
+        for candidate in prefixes
+    )
+
+
 def _expert_projection_schemes(
     config: Any, layer: Any, prefix: str, expert_id: int
 ) -> list[Any]:
@@ -457,7 +471,7 @@ def _uniform_glm_channel_int4_experts(
     unwrapped = prefix.replace(_MTP_BLOCK_MARKER, ".")
     if unwrapped != prefix:
         prefixes.append(unwrapped)
-    if any(_ignore_covers_prefix(name, ignore, fused_mapping) for name in prefixes):
+    if routed_expert_owner_is_ignored(config, prefix):
         return False
     first_int4 = first_other = None
     for expert_id in range(count):
