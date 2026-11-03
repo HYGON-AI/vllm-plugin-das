@@ -531,13 +531,16 @@ def test_e5m2_cache_update_uses_plugin_writer_and_resolved_write_views(
 
 
 @pytest.mark.parametrize("layout", ("LBHNC", "LBNHC"))
-def test_non_e5m2_cache_update_uses_native_writer_with_dense_views(monkeypatch, layout):
+@pytest.mark.parametrize("kv_cache_dtype", ("auto", "bfloat16", "float16"))
+def test_non_e5m2_cache_update_uses_native_writer_with_dense_views(
+    monkeypatch, layout, kv_cache_dtype
+):
     flash = load_flash_attention(monkeypatch, kv_cache_layout=layout)
     calls = []
     native = ModuleType("vllm._custom_ops")
     native.reshape_and_cache_flash = lambda *args: calls.append(args)
     monkeypatch.setitem(sys.modules, "vllm._custom_ops", native)
-    impl = make_impl(flash, kv_cache_dtype="bfloat16")
+    impl = make_impl(flash, kv_cache_dtype=kv_cache_dtype)
     impl.head_size = 4
     strides = (120, 40, 8, 1) if layout == "LBHNC" else (120, 8, 24, 1)
     packed = torch.empty_strided((1, 3, 5, 8), strides)
@@ -556,7 +559,8 @@ def test_non_e5m2_cache_update_uses_native_writer_with_dense_views(monkeypatch, 
     assert calls[0][2].stride() == k.stride()
     assert calls[0][3].stride() == v.stride()
     assert calls[0][4] is slots
-    assert calls[0][5] == "bfloat16"
+    # v0.33 native dtype dispatch owns the public unquantized aliases.
+    assert calls[0][5] == kv_cache_dtype
 
 
 @pytest.mark.parametrize(

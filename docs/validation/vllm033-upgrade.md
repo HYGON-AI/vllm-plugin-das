@@ -133,3 +133,6 @@ are recorded separately in [the additional feature batch](vllm033-feature-batch.
 its exact scope and remaining gates apply. No v0.32 score or wheel
 hash is relabeled as v0.33. The old compatibility lock under `validation/v0.32.0`
 is retained unchanged; the new combination is not last-good.
+
+Further v0.33 ownership checks and the E5M2 first-token-difference investigation
+are recorded in [the task status](vllm033-task-status.md). Model quality remains OPEN.
