@@ -5,6 +5,7 @@ from __future__ import annotations
 import asyncio
 import importlib
 import os
+import threading
 from types import SimpleNamespace
 
 import msgspec
@@ -957,6 +958,338 @@ def test_hyv4_producer_only_pcp_launches_one_bootstrap_per_global_first_rank(
     assert owners == ([0] if role == "kv_producer" else [])
 
 
+def test_pcp_disabled_does_not_query_pcp_group(mooncake, monkeypatch):
+    def _unused_group():
+        raise AssertionError("PCP group is not consulted when pcp_size <= 1")
+
+    monkeypatch.setattr(mooncake, "get_pcp_group", _unused_group)
+    size, rank = mooncake._pcp_kv_replica_coord(
+        SimpleNamespace(prefill_context_parallel_size=1)
+    )
+    worker = object.__new__(mooncake.MooncakeConnectorWorker)
+    worker.pcp_size = size
+    worker.pcp_rank = rank
+
+    assert (size, rank) == (1, 0)
+    assert worker._is_canonical_pcp_kv_replica()
+
+
+def test_pcp_tp_registers_one_sender_per_tp_group_and_pairs_decode(
+    mooncake, monkeypatch
+):
+    """HYV4 producer PCP=2 TP=4 keeps four senders and one bootstrap server.
+
+    PCP groups are [0, 4], [1, 5], [2, 6], [3, 7]. Global rank 0 is the only
+    bootstrap owner. Each group's rank_in_group 0 (global ranks 0-3) must
+    still register, or Decode infers producer TP size 1 and rejects D ranks
+    1-3.
+    """
+
+    from vllm.distributed import parallel_state
+
+    tp_size = 4
+    pcp_size = 2
+    world = tp_size * pcp_size
+    group = object.__new__(parallel_state.GroupCoordinator)
+    monkeypatch.setattr(mooncake, "get_pcp_group", lambda: group)
+    monkeypatch.setattr(
+        mooncake, "get_pp_group", lambda: SimpleNamespace(rank_in_group=0)
+    )
+    config = SimpleNamespace(
+        kv_transfer_config=SimpleNamespace(kv_role="kv_producer"),
+        parallel_config=SimpleNamespace(
+            prefill_context_parallel_size=pcp_size,
+            local_engines_only=False,
+            data_parallel_index=0,
+        ),
+    )
+    senders: dict[int, int] = {}
+    bootstrap_owners: list[int] = []
+    for global_rank in range(world):
+        tp_rank = global_rank % tp_size
+        members = list(range(tp_rank, world, tp_size))
+        group.rank = global_rank
+        group.ranks = members
+        group.rank_in_group = members.index(global_rank)
+        monkeypatch.setattr(
+            mooncake,
+            "get_tensor_model_parallel_rank",
+            lambda tp_rank=tp_rank: tp_rank,
+        )
+        size, pcp_rank = mooncake._pcp_kv_replica_coord(config.parallel_config)
+        worker = object.__new__(mooncake.MooncakeConnectorWorker)
+        worker.pcp_size = size
+        worker.pcp_rank = pcp_rank
+        if worker._is_canonical_pcp_kv_replica():
+            senders[tp_rank] = global_rank
+        if mooncake.should_launch_bootstrap_server(config):
+            bootstrap_owners.append(global_rank)
+
+    assert senders == {0: 0, 1: 1, 2: 2, 3: 3}
+    assert bootstrap_owners == [0]
+
+    registry = {
+        "0": {
+            "engine_id": "prefill",
+            "worker_addr": {
+                str(tp_rank): {"0": f"tcp://prefill:{9000 + tp_rank}"}
+                for tp_rank in senders
+            },
+        }
+    }
+
+    class _Response:
+        def raise_for_status(self):
+            return None
+
+        def json(self):
+            return registry
+
+    class _Client:
+        async def __aenter__(self):
+            return self
+
+        async def __aexit__(self, *_args):
+            return False
+
+        async def get(self, url):
+            assert url.endswith("/query")
+            return _Response()
+
+    monkeypatch.setattr(mooncake.httpx, "AsyncClient", lambda *_a, **_k: _Client())
+    decoder = object.__new__(mooncake.MooncakeConnectorWorker)
+    decoder._remote_agents = {}
+    decoder._tp_size = {}
+    decoder._pending_bootstrap_queries = {"http://prefill:1": asyncio.Event()}
+    asyncio.run(decoder._connect_to_prefiller_bootstrap("http://prefill:1"))
+
+    assert decoder._tp_size["prefill"] == tp_size
+    assert sorted(decoder._remote_agents["prefill"]) == [0, 1, 2, 3]
+
+    class _KvShapeBackend:
+        """Satisfy vLLM 0.25.1 TransferTopology.__post_init__ attn_backends[0]."""
+
+        @staticmethod
+        def get_kv_cache_shape(num_blocks, block_size, num_kv_heads, head_size):
+            return (2, num_blocks, num_kv_heads, block_size, head_size)
+
+    def _topology(tp_rank: int):
+        return mooncake.TransferTopology(
+            tp_rank=tp_rank,
+            tp_size=tp_size,
+            block_size=16,
+            engine_id="engine",
+            is_mla=True,
+            is_mamba=False,
+            total_num_kv_heads=tp_size,
+            attn_backends=[_KvShapeBackend],
+        )
+
+    for decode_rank in range(tp_size):
+        targets = _topology(decode_rank).handshake_target_ranks(
+            decoder._tp_size["prefill"]
+        )
+        assert targets == [decode_rank]
+        accepted = _topology(targets[0]).handshake_target_ranks(tp_size)
+        assert decode_rank in accepted
+
+
+def test_pcp_tp_multi_sender_holds_blocks_until_every_sender_finishes(
+    mooncake, monkeypatch
+):
+    """PCP=2 TP=4 keeps four live senders and does not free blocks early.
+
+    Replica ranks report completion without RDMA. The scheduler aggregator
+    still waits until each TP group's PCP-local rank 0 finishes its send.
+    """
+
+    from vllm.distributed import parallel_state
+    from vllm.distributed.kv_transfer.kv_connector.utils import KVOutputAggregator
+    from vllm.v1.outputs import KVConnectorOutput, ModelRunnerOutput
+
+    tp_size = 4
+    pcp_size = 2
+    world = tp_size * pcp_size
+    req_id = "prefill-1"
+    transfer_id = "xfer-pcp"
+    group = object.__new__(parallel_state.GroupCoordinator)
+    monkeypatch.setattr(mooncake, "get_pcp_group", lambda: group)
+
+    scheduler = object.__new__(mooncake.MooncakeConnectorScheduler)
+    scheduler.is_kv_producer = True
+    scheduler.is_kv_consumer = False
+    scheduler._reqs_need_recv = {}
+    scheduler._reqs_need_send = {}
+    scheduler._reqs_not_processed = set()
+    scheduler._is_hma_required = False
+    scheduler._has_mamba = False
+    scheduler.blocks_per_sw = []
+    request = SimpleNamespace(
+        request_id=req_id,
+        kv_transfer_params={"do_remote_decode": True, "transfer_id": transfer_id},
+        status=mooncake.RequestStatus.FINISHED_LENGTH_CAPPED,
+    )
+    delay_free, _params = scheduler.request_finished(request, ([11, 12],))
+    metadata = scheduler.build_connector_meta(SimpleNamespace())
+    assert delay_free is True
+    assert metadata.reqs_to_send[req_id] == (transfer_id, [[11, 12]])
+
+    loop = asyncio.new_event_loop()
+    thread = threading.Thread(target=loop.run_forever, daemon=True)
+    thread.start()
+    scheduled: list[asyncio.Future] = []
+    real_submit = asyncio.run_coroutine_threadsafe
+
+    def _submit(coro, target_loop):
+        future = real_submit(coro, target_loop)
+        scheduled.append(future)
+        return future
+
+    monkeypatch.setattr(mooncake.asyncio, "run_coroutine_threadsafe", _submit)
+    workers = []
+    try:
+        for global_rank in range(world):
+            tp_rank = global_rank % tp_size
+            members = list(range(tp_rank, world, tp_size))
+            group.rank = global_rank
+            group.ranks = members
+            group.rank_in_group = members.index(global_rank)
+            size, pcp_rank = mooncake._pcp_kv_replica_coord(
+                SimpleNamespace(prefill_context_parallel_size=pcp_size)
+            )
+            worker = object.__new__(mooncake.MooncakeConnectorWorker)
+            worker.sender_loop = loop
+            worker.is_kv_producer = True
+            worker.is_kv_consumer = False
+            worker.tp_rank = tp_rank
+            worker.tp_size = tp_size
+            worker.pcp_size = size
+            worker.pcp_rank = pcp_rank
+            worker.finished_sending_reqs = set()
+            worker.finished_recving_reqs = set()
+            worker.reqs_need_send = {}
+            worker.registered_layer_names = []
+            worker.registered_layer_indices = []
+            worker.registered_group_indices = []
+            worker.kv_caches_base_addr = []
+            worker.block_len_per_layer = []
+            worker.kv_block_len_per_layer = []
+            worker._encoder = msgspec.msgpack.Encoder()
+            worker._get_transfer_regions = lambda *_args, **_kwargs: []
+            worker.transfer_topo = SimpleNamespace(
+                local_replicates_kv_cache=False,
+                handshake_target_ranks=lambda remote_tp_size, rank=tp_rank: [rank]
+                if remote_tp_size == tp_size
+                else [],
+            )
+            if worker._is_canonical_pcp_kv_replica():
+                worker.reqs_need_send[transfer_id] = mooncake.SendBlockMeta(
+                    p_req_id="",
+                    transfer_id=transfer_id,
+                    local_block_ids=[],
+                    ready=asyncio.Event(),
+                )
+            before = len(scheduled)
+            worker.start_load_kv(metadata)
+            scheduled[before].result(timeout=5)
+            workers.append(worker)
+
+        canonical = [worker for worker in workers if worker._is_canonical_pcp_kv_replica()]
+        replicas = [worker for worker in workers if worker not in canonical]
+        assert [worker.tp_rank for worker in canonical] == [0, 1, 2, 3]
+        assert all(worker.pcp_rank == 0 for worker in canonical)
+        assert all(worker.finished_sending_reqs == set() for worker in canonical)
+        assert all(
+            worker.reqs_need_send[transfer_id].ready.is_set()
+            and worker.reqs_need_send[transfer_id].local_block_ids == [[11, 12]]
+            for worker in canonical
+        )
+        assert all(worker.finished_sending_reqs == {req_id} for worker in replicas)
+        assert all(transfer_id not in worker.reqs_need_send for worker in replicas)
+
+        def _runner(finished: set[str] | None) -> ModelRunnerOutput:
+            return ModelRunnerOutput(
+                req_ids=[req_id],
+                req_id_to_index={req_id: 0},
+                kv_connector_output=KVConnectorOutput(finished_sending=finished),
+            )
+
+        aggregator = KVOutputAggregator(world)
+        held = aggregator.aggregate(
+            [
+                _runner(set(worker.finished_sending_reqs) or None)
+                for worker in workers
+            ]
+        )
+        assert held is not None
+        assert not held.kv_connector_output.finished_sending
+
+        transfer_calls: list[int] = []
+
+        async def _stand_in_transfer(
+            ready_reqs,
+            _agent_meta,
+            _local_regions,
+            _remote_regions,
+            tp_rank,
+        ):
+            assert ready_reqs[0][1].local_block_ids == [[11, 12]]
+            transfer_calls.append(tp_rank)
+            return [], [], [], [], None
+
+        class _Sock:
+            def __init__(self):
+                self.sent: list[tuple] = []
+
+            async def send_multipart(self, parts):
+                self.sent.append(parts)
+
+        def _transfer_for(tp_rank: int):
+            async def _run(ready_reqs, agent_meta, local_regions, remote_regions):
+                return await _stand_in_transfer(
+                    ready_reqs,
+                    agent_meta,
+                    local_regions,
+                    remote_regions,
+                    tp_rank,
+                )
+
+            return _run
+
+        for worker in canonical:
+            worker._build_transfer_params = _transfer_for(worker.tp_rank)
+            sock = _Sock()
+            xfer = _metadata(
+                mooncake,
+                remote_tp_size=tp_size,
+                remote_tp_rank=worker.tp_rank,
+                req_blocks={"decode-1": (transfer_id, [[21, 22]])},
+            )
+            real_submit(
+                worker.send_kv_to_decode(b"decode", sock, xfer), loop
+            ).result(timeout=5)
+            response = msgspec.msgpack.decode(
+                sock.sent[-1][1], type=mooncake.MooncakeXferResponse
+            )
+            assert response.status == mooncake.MooncakeXferResponseStatus.FINISH
+            assert response.err_reqs is None
+            finished = real_submit(
+                worker.fetch_finished_sending_reqs(), loop
+            ).result(timeout=5)
+            assert finished == {req_id}
+
+        assert transfer_calls == [0, 1, 2, 3]
+        released = aggregator.aggregate(
+            [_runner({req_id}) for _worker in canonical]
+            + [_runner(None) for _worker in replicas]
+        )
+        assert released.kv_connector_output.finished_sending == {req_id}
+    finally:
+        loop.call_soon_threadsafe(loop.stop)
+        thread.join(timeout=5)
+        loop.close()
+
+
 @pytest.mark.parametrize("role,expected", [
     ("kv_producer", True), ("kv_both", True), ("kv_consumer", False), (None, False),
 ])
@@ -1067,7 +1400,7 @@ def test_hyv4_worker_construction_starts_bootstrap_once(constructed_mooncake_wor
     assert launches == [0]
 
 
-def test_hyv4_pcp_workers_register_unique_transfer_ranks(
+def test_hyv4_pcp_workers_register_only_canonical_transfer_rank(
     mooncake, constructed_mooncake_workers,
 ):
     from vllm.distributed.kv_transfer.kv_connector.v1.mooncake.mooncake_utils import (
@@ -1075,44 +1408,86 @@ def test_hyv4_pcp_workers_register_unique_transfer_ranks(
     )
 
     make, group, _ = constructed_mooncake_workers
-    bootstrap = MooncakeBootstrapServer('127.0.0.1', 18998)
+    bootstrap = MooncakeBootstrapServer("127.0.0.1", 18998)
     workers = []
+    registered = []
     for rank in range(4):
         group.rank = rank
         group.rank_in_group = rank
         worker = make()
         workers.append(worker)
-        payload = mooncake.RegisterWorkerPayload(
-            engine_id=worker.engine_id, dp_rank=0,
-            tp_rank=worker.tp_rank, pp_rank=0,
-            addr=f'tcp://127.0.0.1:{20000 + rank}',
-        )
-        asyncio.run(bootstrap.register_worker(payload))
+        if worker._is_canonical_pcp_kv_replica():
+            payload = mooncake.RegisterWorkerPayload(
+                engine_id=worker.engine_id, dp_rank=0,
+                tp_rank=worker.tp_rank, pp_rank=0,
+                addr=f"tcp://127.0.0.1:{20000 + rank}",
+            )
+            asyncio.run(bootstrap.register_worker(payload))
+            registered.append(worker)
 
-    assert [(w.tp_rank, w.tp_size) for w in workers] == [
+    assert [(w.tp_rank, w.tp_size) for w in workers] == [(0, 1)] * 4
+    assert [(w.pcp_rank, w.pcp_size) for w in workers] == [
         (0, 4), (1, 4), (2, 4), (3, 4),
     ]
-    # All PCP workers complete the handshake and release their P-side blocks;
-    # replicated MLA bytes are sent once to a TP1 consumer.
-    plans = [w._get_sender_transfer_plan(128, 128, 0, 1) for w in workers]
-    assert [plan[0] for plan in plans] == [True, False, False, False]
+    assert registered == [workers[0]]
+    # Only the canonical PCP replica participates in the transfer topology.
+    # The remaining replicas report completion without an external handshake.
+    plans = [w._get_sender_transfer_plan(128, 128, 0, 1) for w in registered]
+    assert [plan[0] for plan in plans] == [True]
 
 
+@pytest.mark.parametrize("pcp_rank", [0, 1, 15])
+def test_pcp_cache_registration_starts_listener_only_on_canonical_replica(
+    mooncake, monkeypatch, pcp_rank,
+):
+    worker = _worker(mooncake, blocks_first=False, use_mla=True)
+    worker.is_kv_consumer = False
+    worker.pcp_size = 16
+    worker.pcp_rank = pcp_rank
+    worker.sender_loop = object()
+    name = "model.layers.0.self_attn"
+    worker._layer_specs[name] = object()
+    worker._layer_group_indices[name] = 0
+    listeners = []
+
+    async def listen(ready):
+        listeners.append(worker.pcp_rank)
+        ready.set()
+
+    def submit(coro, loop):
+        assert loop is worker.sender_loop
+        asyncio.run(coro)
+
+    monkeypatch.setattr(worker, "_mooncake_sender_listener", listen)
+    monkeypatch.setattr(mooncake.asyncio, "run_coroutine_threadsafe", submit)
+    worker.register_kv_caches({name: torch.zeros((2, 3), dtype=torch.float16)})
+    assert len(worker.engine.calls) == 1
+    assert listeners == ([0] if pcp_rank == 0 else [])
+
+
+@pytest.mark.parametrize("tp_size", [1, 2, 4])
+@pytest.mark.parametrize("pcp_size", [1, 2, 16])
 def test_hyv4_pcp_transfer_rank_preserves_tensor_parallel_rank(
-    mooncake, monkeypatch, constructed_mooncake_workers,
+    mooncake, monkeypatch, constructed_mooncake_workers, tp_size, pcp_size,
 ):
     make, group, _ = constructed_mooncake_workers
-    monkeypatch.setattr(mooncake, 'get_tensor_model_parallel_rank', lambda: 1)
-    monkeypatch.setattr(mooncake, 'get_tensor_model_parallel_world_size', lambda: 2)
-    ranks = []
-    for rank in range(4):
-        group.rank = 2 * rank + 1
-        group.rank_in_group = rank
-        worker = make()
-        ranks.append((worker.tp_rank, worker.tp_size))
-    assert ranks == [(1, 8), (3, 8), (5, 8), (7, 8)]
-    consumer = make(role='kv_consumer', pcp_size=1)
-    assert (consumer.tp_rank, consumer.tp_size) == (1, 2)
+    monkeypatch.setattr(mooncake, "get_tensor_model_parallel_world_size", lambda: tp_size)
+    senders = []
+    for tp_rank in range(tp_size):
+        monkeypatch.setattr(
+            mooncake, "get_tensor_model_parallel_rank", lambda: tp_rank,
+        )
+        group.ranks = list(range(tp_rank, tp_size * pcp_size, tp_size))
+        for pcp_rank in range(pcp_size):
+            group.rank = tp_size * pcp_rank + tp_rank
+            group.rank_in_group = pcp_rank
+            worker = make(pcp_size=pcp_size)
+            assert (worker.tp_rank, worker.tp_size) == (tp_rank, tp_size)
+            if worker._is_canonical_pcp_kv_replica():
+                senders.append((worker.tp_rank, worker.tp_size, worker.pcp_rank))
+        consumer = make(role="kv_consumer", pcp_size=1)
+        assert (consumer.tp_rank, consumer.tp_size) == (tp_rank, tp_size)
+    assert senders == [(rank, tp_size, 0) for rank in range(tp_size)]
 
 
 def test_mooncake_worker_constructs_stage_range_from_pp_group(

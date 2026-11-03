@@ -1208,14 +1208,12 @@ class MooncakeConnectorWorker:
         self.engine_id: EngineId = engine_id
         self.tp_rank = get_tensor_model_parallel_rank()
         self.tp_size = get_tensor_model_parallel_world_size()
-        pcp_size = vllm_config.parallel_config.prefill_context_parallel_size
-        if self.is_kv_producer and pcp_size > 1:
-            # Mooncake's bootstrap and transfer topology address workers by TP
-            # rank. PCP workers share a tensor-parallel rank, so flatten the
-            # two dimensions for transfer identity only. All replicas handshake
-            # and release their blocks; the MLA transfer plan sends bytes once.
-            self.tp_rank += get_pcp_group().rank_in_group * self.tp_size
-            self.tp_size *= pcp_size
+        # PCP replicates KV inside one TP group. Each TP group exposes its
+        # PCP-local rank 0. GroupCoordinator.rank is global and must not be
+        # used here; one bootstrap server for the engine is a separate check.
+        self.pcp_size, self.pcp_rank = _pcp_kv_replica_coord(
+            vllm_config.parallel_config
+        )
         self.block_len_per_layer: list[int] = []
         self.kv_block_len_per_layer: list[int] = []
         self.registered_layer_names: list[str] = []
@@ -2134,6 +2132,15 @@ class MooncakeConnectorWorker:
         # No need to launch server for D node.
         if self.is_kv_consumer:
             return
+        # Non-canonical PCP replicas do not listen or register externally.
+        if not self._is_canonical_pcp_kv_replica():
+            logger.info(
+                "Mooncake PCP replica skip listen/register: pcp_rank=%s "
+                "pcp_size=%s (rank0 sends the KV replica)",
+                self.pcp_rank,
+                self.pcp_size,
+            )
+            return
 
         ready_event = threading.Event()
         asyncio.run_coroutine_threadsafe(
@@ -2458,6 +2465,28 @@ class MooncakeConnectorWorker:
             if send_meta is not None:
                 assert not send_meta.ready.is_set()
 
+    def _is_canonical_pcp_kv_replica(self) -> bool:
+        """Return whether this TP group's PCP-local rank 0 owns the send."""
+
+        return int(getattr(self, "pcp_size", 1) or 1) <= 1 or int(
+            getattr(self, "pcp_rank", 0)
+        ) == 0
+
+    async def _complete_noncanonical_pcp_sends(
+        self, metadata: MooncakeConnectorMetadata
+    ) -> None:
+        """Complete sends without transferring KV so the scheduler does not wait."""
+
+        for p_req_id, (_transfer_id, block_ids) in metadata.reqs_to_send.items():
+            if not block_ids:
+                # Alloc-time placeholder; report complete on request_finished.
+                continue
+            self.finished_sending_reqs.add(p_req_id)
+        for transfer_id in metadata.reqs_not_processed:
+            send_meta = self.reqs_need_send.pop(transfer_id, None)
+            if send_meta is not None and send_meta.p_req_id:
+                self.finished_sending_reqs.add(send_meta.p_req_id)
+
     def start_load_kv(self, metadata: MooncakeConnectorMetadata):
         if not self.is_kv_producer and metadata.reqs_to_recv:
             asyncio.run_coroutine_threadsafe(
@@ -2467,9 +2496,12 @@ class MooncakeConnectorWorker:
         if not self.is_kv_consumer and (
             metadata.reqs_to_send or metadata.reqs_not_processed
         ):
-            asyncio.run_coroutine_threadsafe(
-                self.record_send_reqs(metadata), self.sender_loop
+            send_coro = (
+                self.record_send_reqs(metadata)
+                if self._is_canonical_pcp_kv_replica()
+                else self._complete_noncanonical_pcp_sends(metadata)
             )
+            asyncio.run_coroutine_threadsafe(send_coro, self.sender_loop)
 
     def _producer_cache_is_replicated(self) -> bool:
         return self.transfer_topo.local_replicates_kv_cache
@@ -2572,6 +2604,21 @@ def get_mooncake_side_channel_port(vllm_config: VllmConfig) -> int:
 def _async_loop(loop: asyncio.AbstractEventLoop):
     asyncio.set_event_loop(loop)
     loop.run_forever()
+
+
+def _pcp_kv_replica_coord(parallel_config) -> tuple[int, int]:
+    """Return ``(pcp_size, pcp_rank_in_group)`` for the external KV replica.
+
+    ``GroupCoordinator.rank`` is the global process rank. Sender registration
+    is per TP group, so the canonical replica is ``rank_in_group == 0``.
+    """
+
+    pcp_size = int(
+        getattr(parallel_config, "prefill_context_parallel_size", 1) or 1
+    )
+    if pcp_size <= 1:
+        return pcp_size, 0
+    return pcp_size, int(get_pcp_group().rank_in_group)
 
 
 def should_launch_bootstrap_server(vllm_config: VllmConfig) -> bool:
