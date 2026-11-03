@@ -123,3 +123,24 @@ are not silently replaced by these diagnostics. BF16 MoE admission/neutral
 ABI work belongs to Adapter around the official expert and is not an added
 Plugin merge prerequisite. All owned jobs exited and latest ports18161–18164
 are closed. Goal remains active;1passed/46partial/101not-run,last_good=false.
+
+
+## Official ownership correction after the user constraint review
+
+[Correction and installed evidence](vllm033-official-ownership.md): the earlier
+INT8 integration rebound official oracle globals. Numeric success did not make
+that a public seam. Production6c2152e4 removes the private installer and capability
+advertisement, preserving official INT8 auto/triton selection/config/conversion/
+kernel construction. Standalone AITER experiments and frozen successful wheels
+remain separate; corrected native AITER model integration is unavailable.
+263portable passed/66skipped; installed seven-symbol identity, official expert,
+retired installer and required-capability rejection verified. Actual serve CLI
+rejects the missing capability before model/engine loading (expected exit1).
+All14 files match source/wheel/both environments.
+
+Current merge HOLD is for the active Flash/E5M2 model quality regressions. The
+retired model route's standalone vendor-Triton numerical row remains unfinished
+upgrade work; it is not added as a new merge prerequisite after removing that
+capability. Earlier review decisions refer to their frozen active candidates.
+Core runtime/Adapter production unchanged; allowned jobs exited,18165closed,
+eightGPUs2MiB, protected5/6 untouched. v0.33goal active,last_good=false.

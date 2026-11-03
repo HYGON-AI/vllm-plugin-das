@@ -53,11 +53,24 @@ Triton expert selection, and rejects a surviving private installer marker
 or false AITER capability advertisement. A mutation-in-activation regression
 ensures that merely observing an ACTIVE report cannot pass this check.
 
-Final candidate/wheel and installed evidence will be recorded in
-`validation/v0.33.0/official-ownership-gfx936-candidate.json`.
+Final evidence: **263 portable passed,66 skipped**;62 extension/prototype
+and14 verifier checks passed. The two new regressions fail before the fix.
+Production source is `6c2152e49295cb64d23c6842d4980c7eba5f81dc`; wheel SHA256
+`6a71808eddedf310136bb50f60b08b674bf897297d1df0a37b1dd14e5ca6bbec`.
+All14 packaged Python files match source/wheel/both isolated environments.
+Actual installed activation preserves all seven official symbols and selects
+official Triton. The retired installer and required-capability requests reject.
+A real `vllm serve` with `HCU_ADAPTER_VLLM_REQUIRED_CAPABILITIES=aiter-int8-moe`
+exits1 during CLI parser/general-plugin initialization, before engine/model
+loading or port18165 binding. This is an expected rejection, not a model pass.
+Both installed logs retain a HIP-runtime discovery warning; imports initialize
+Torch CUDA, but no model or native kernel is accepted by these metadata checks.
+See `validation/v0.33.0/official-ownership-gfx936-candidate.json`.
 Earlier ec01e209/529855a5 wheels, numerical results and all failed model
 profiles remain frozen. The corrected candidate must not inherit their
 native AITER model claim. No Core runtime or Adapter production edit is
-needed for this removal. PR330 remains on hold for its existing quality
-gates and incomplete AITER public integration. Goal remains active;
+needed for this removal. PR330 remains on hold for its active Flash/E5M2 quality gates.
+AITER public integration remains explicitly unavailable; standalone vendor-Triton
+numerical limits stay recorded as unfinished upgrade work, not a newly imposed
+merge prerequisite for a capability that this candidate no longer advertises. Goal remains active;
 `last_good=false`. AI assistance was used.

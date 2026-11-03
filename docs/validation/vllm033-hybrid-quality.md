@@ -81,10 +81,12 @@ must preserve that contract. The existing E5M2 helper applies scales; it does
 not implement bounded paged gathering. No new gather kernel, vendor private-call
 copy or global rebinding is shipped.
 
-Next implementation work must compare a bounded paged route with the current
-native path, including layouts, ragged/empty/padded batches, changed metadata,
-Graph, latency/memory, and the original MTP3 full-model protocol. An operator
-diagnostic alone does not close the original quality gate.
+Next work must first inspect official and native provider capability/fixes;
+reuse their implementations wherever applicable. Only a demonstrated remaining
+HCU gap can justify a new optional Plugin route. Any candidate still needs
+layouts, ragged/empty/padded batches, changed metadata, Graph, latency/memory,
+and the original MTP3 full-model protocol. An operator diagnostic alone does
+not close the original quality gate.
 
 ## Separate BF16 MoE ownership audit
 
