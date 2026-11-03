@@ -390,6 +390,71 @@ def test_dense_views_separate_kv_and_preserve_block_stride(
     )
 
 
+@pytest.mark.parametrize("manager_page", (64, 128, 576, 1088, 2176))
+def test_upstream_accepts_manager_pages_and_selects_64_token_kernel(
+    monkeypatch, manager_page
+):
+    """Run target admission and block selection, preserving their distinct roles."""
+    import __future__
+
+    root = Path(os.environ["VLLM_TARGET_ROOT"])
+    backend_source = root / "vllm/v1/attention/backend.py"
+    backend_tree = ast.parse(backend_source.read_text())
+    base = next(
+        node
+        for node in backend_tree.body
+        if isinstance(node, ast.ClassDef) and node.name == "AttentionBackend"
+    )
+    method = next(
+        node
+        for node in base.body
+        if isinstance(node, ast.FunctionDef) and node.name == "supports_block_size"
+    )
+    # All exercised declarations are fixed integer kernel sizes, not MultipleOf.
+    namespace = {"MultipleOf": type("MultipleOf", (), {})}
+    exec(
+        compile(
+            ast.Module(body=[method], type_ignores=[]),
+            str(backend_source),
+            "exec",
+            flags=__future__.annotations.compiler_flag,
+        ),
+        namespace,
+    )
+    flash = load_flash_attention(monkeypatch)
+    parent = flash.HcuFlashAttentionBackend.__bases__[0]
+    monkeypatch.setattr(
+        parent, "supports_block_size", namespace["supports_block_size"], raising=False
+    )
+    assert "supports_block_size" not in flash.HcuFlashAttentionBackend.__dict__
+    assert flash.HcuFlashAttentionBackend.supports_block_size(manager_page)
+    assert not flash.HcuFlashAttentionBackend.supports_block_size(manager_page + 1)
+
+    worker_source = root / "vllm/v1/worker/utils.py"
+    definitions = [
+        node
+        for node in ast.parse(worker_source.read_text()).body
+        if isinstance(node, ast.FunctionDef)
+        and node.name in {"_block_size_is_supported", "select_common_block_size"}
+    ]
+    assert len(definitions) == 2
+    exec(
+        compile(
+            ast.Module(body=definitions, type_ignores=[]),
+            str(worker_source),
+            "exec",
+            flags=__future__.annotations.compiler_flag,
+        ),
+        namespace,
+    )
+    assert (
+        namespace["select_common_block_size"](
+            manager_page, [flash.HcuFlashAttentionBackend]
+        )
+        == 64
+    )
+
+
 def test_backend_selects_fa2_dual_layout_and_64_token_pages(monkeypatch):
     flash = load_flash_attention(monkeypatch)
 
@@ -404,8 +469,6 @@ def test_backend_selects_fa2_dual_layout_and_64_token_pages(monkeypatch):
     assert flash.HcuFlashAttentionBackend.get_supported_kernel_block_sizes() == [64]
     assert flash.HcuFlashAttentionBackend.get_preferred_block_size(16) == 64
     assert flash.HcuFlashAttentionBackend.get_preferred_block_size(128) == 64
-    assert flash.HcuFlashAttentionBackend.supports_block_size(64) is True
-    assert flash.HcuFlashAttentionBackend.supports_block_size(128) is False
     assert flash.HcuFlashAttentionBackend.supported_kv_cache_dtypes == [
         "auto",
         "float16",

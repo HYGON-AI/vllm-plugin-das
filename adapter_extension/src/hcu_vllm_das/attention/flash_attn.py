@@ -384,10 +384,6 @@ class HcuFlashAttentionBackend(FlashAttentionBackend):
         return head_size in (64, 128, 192, 256)
 
     @classmethod
-    def supports_block_size(cls, block_size: int | None) -> bool:
-        return block_size is None or block_size == _KERNEL_BLOCK_SIZE
-
-    @classmethod
     def supports_dcp(cls) -> bool:
         return False
 
