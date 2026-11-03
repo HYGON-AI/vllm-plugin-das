@@ -420,7 +420,17 @@ def apply_to_module(module: ModuleType) -> bool:
             # gfx938 has the quantized indexer cache reader. gfx936 selects
             # the BF16 HIPC writer/gather path, so its allocation contract
             # must contain raw BF16 keys rather than FP8 bytes plus scales.
-            if not on_gfx938():
+            if on_gfx938():
+                if not self.use_fp4_kv:
+                    # Native V4 constructs vllm.models.deepseek_v4.compressor,
+                    # not the legacy HCU compressor. Register its token-major
+                    # FP8 pages here, on the indexer that actually owns them.
+                    from vllm_hcu.v1.attention.ops.rocm_aiter_mla_sparse import (
+                        set_indexer_cache_token_major,
+                    )
+
+                    set_indexer_cache_token_major(True)
+            else:
                 self.k_cache.dtype = torch.bfloat16
                 self.k_cache.head_dim = self.head_dim
 

@@ -785,6 +785,7 @@ def test_deepseek_v4_indexer_cache_matches_hcu_reader_contract(
                 prefix,
                 aux_stream,
             )
+            self.use_fp4_kv = False
             self.head_dim = 128
             self.k_cache = SimpleNamespace(dtype=torch.uint8, head_dim=132)
 
@@ -823,9 +824,16 @@ def test_deepseek_v4_indexer_cache_matches_hcu_reader_contract(
         raising=False,
     )
 
+    from vllm_hcu.v1.attention.ops import rocm_aiter_mla_sparse as sparse
+
+    registered_layouts = []
+    monkeypatch.setattr(
+        sparse, "set_indexer_cache_token_major", registered_layouts.append,
+    )
     patch_deepseek_v4_attention.apply_to_module(module)
     indexer = DeepseekV4Indexer(None, None, 1, 1, None, None, None)
 
+    assert registered_layouts == ([True] if is_gfx938 else [])
     assert indexer.k_cache.dtype is expected_dtype
     assert indexer.k_cache.head_dim == expected_head_dim
     q_result = module.fused_indexer_q_rope_quant(
