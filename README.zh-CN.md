@@ -16,8 +16,9 @@
 - vLLM 负责官方模型、调度、分配与执行接口。
 - Adapter（分发名 `sgl-kernel`，包名 `hcu_adapter`）负责真实 HCU 身份、
   runtime 准入、平台/通用插件入口和进程健康。
-- 本 Plugin 经 `hcu_adapter.extensions` 注册可选 RMSNorm、显式 AITER
-  INT8 MoE 和 FlashAttention provider；各能力独立检查前置条件与验收门槛。
+- 本 Plugin 经 `hcu_adapter.extensions` 注册可选 RMSNorm 和显式
+  FlashAttention provider。INT8 模型路由沿用官方实现，历史 AITER INT8
+  原型不作为已注册的模型能力；各有效能力独立检查前置条件与验收门槛。
 
 仓库根目录的 `vllm_hcu` 和 `setup.py` 保留为 vLLM 0.28.1 历史开发参考。
 部署本发布线时，不要在仓库根目录执行 `pip install .`。
@@ -43,6 +44,9 @@ python3 -m pip install --no-deps ./dist/hcu_vllm_das_plugin-*.whl
 设备/模型待验项目见 [v0.33 验证记录](docs/validation/vllm033-upgrade.md)。
 CPU 契约、设备数值、变输入 Graph、模型精度和性能分别验收；源码测试
 不代替安装态 wheel 的验证。
+
+本轮用户允许 7B 以下模型出现精度误差；原始分数、适用范围及 PR330 的
+审查口径见 [验收更新](docs/validation/vllm033-small-model-acceptance.md)。
 
 `validation/v0.32.0`、`tests/vllm032` 及旧版本设计/验证文档为历史证据，
 其中的分数和产物不能转授本发布线。历史兼容锁测试与其输入保持对应。

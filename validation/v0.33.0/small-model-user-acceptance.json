@@ -1,0 +1,160 @@
+{
+  "schema": 1,
+  "user_instruction": "允许7B以下有精度误差",
+  "scope": "this vLLM v0.33.0 upgrade and Plugin PR330 acceptance",
+  "model_size_scope": "below7B; no extension to larger models or active-parameter MoE labels",
+  "authorized_differences": "Retain and accept observed numerical/HumanEval score and passed-task differences of these small models; no invented percentage threshold. Original scores/protocols remain frozen.",
+  "not_waived": [
+    "crash/hang/garbled-output/cache corruption",
+    "operator reference and Graph correctness",
+    "official API/owner/lifecycle requirements",
+    "larger-model accuracy and remaining upgrade features"
+  ],
+  "models": [
+    {
+      "model": "Qwen2-0.5B-Instruct",
+      "checkpoint_path": "/model/Qwen2-0.5B-Instruct",
+      "stored_tensor_elements": 494032768,
+      "under_7b": true,
+      "count_basis": "safetensors tensor shapes, includes stored MTP/vision/buffers; unquantized checkpoints, not active-expert size",
+      "files": [
+        {
+          "name": "model.safetensors",
+          "header_sha256": "bd808652be103f0e4e29786b9aa8829e0f38607880486926c7246ee2de577a76",
+          "stored_tensor_elements": 494032768
+        }
+      ],
+      "unquantized_config_verified": true
+    },
+    {
+      "model": "Qwen3-1.7B",
+      "checkpoint_path": "/model/Qwen3-1.7B",
+      "stored_tensor_elements": 2031739904,
+      "under_7b": true,
+      "count_basis": "safetensors tensor shapes, includes stored MTP/vision/buffers; unquantized checkpoints, not active-expert size",
+      "files": [
+        {
+          "name": "model-00001-of-00002.safetensors",
+          "header_sha256": "3abda69cd4fc96c7ea331905c96d6b833ba91113ae83fa39e472226296eb1eca",
+          "stored_tensor_elements": 1720574976
+        },
+        {
+          "name": "model-00002-of-00002.safetensors",
+          "header_sha256": "a00b3db329342bbac56d1b73e00b1fe814a57a7da04defaf7df48a4ab706eb82",
+          "stored_tensor_elements": 311164928
+        }
+      ],
+      "unquantized_config_verified": true
+    },
+    {
+      "model": "Qwen3.5-0.8B",
+      "checkpoint_path": "/model/Qwen3.5-0.8B/Qwen3.5-0.8B",
+      "stored_tensor_elements": 873438784,
+      "under_7b": true,
+      "count_basis": "safetensors tensor shapes, includes stored MTP/vision/buffers; unquantized checkpoints, not active-expert size",
+      "files": [
+        {
+          "name": "model.safetensors-00001-of-00001.safetensors",
+          "header_sha256": "c894b6055113f9d5a9c5c68e703662de8ba27df5a9631b47f10b75ac3fe0b083",
+          "stored_tensor_elements": 873438784
+        }
+      ],
+      "unquantized_config_verified": true
+    }
+  ],
+  "last_good": false,
+  "reviewed_runtime_sha": "8bfc11f59e590ad27d5869e3c87bc53cd34779f8",
+  "review_decision": "No remaining blocking issue found for advertised capabilities under explicit below7B precision policy; eligible for merge after commit-bound review",
+  "checks": {
+    "portable": {
+      "tests": 329,
+      "passed": 263,
+      "skipped": 66,
+      "failures": 0,
+      "errors": 0,
+      "xml_sha256": "cec657955dffafc70aa7a7bde1436a6477bb9e760f4b3370d45c8698f7b9d12a",
+      "log_sha256": "f13b47e97ed00c6f5cb6564c084c4ea08204eb700b85de8af5faedb15c1d229e"
+    },
+    "device": {
+      "tests": 55,
+      "passed": 55,
+      "skipped": 0,
+      "failures": 0,
+      "errors": 0,
+      "xml_sha256": "f0c815764b1afbae7e4937a05f33e86fb98ad2a9aaa0c44ee327aa14a027d3a8",
+      "log_sha256": "ac9218d66cf178fcae5338a7b3c86239aba424049a67c8623aa64da0c1f41fe6"
+    },
+    "installed": {
+      "schema_version": 4,
+      "official_int8_symbols_unchanged": true,
+      "platform": "hcu_adapter.bridges.vllm.HcuPlatform",
+      "official_experts": "vllm.model_executor.layers.fused_moe.experts.triton_moe.TritonExperts",
+      "log_sha256": "b8e8b74d00a591e67c7a3c89e408510ac8814e0bcbb178cbe07e5f67b3fc0c5a",
+      "warnings_retained": [
+        "HIP runtime discovery warning"
+      ]
+    }
+  },
+  "production_wheel": "/data/models/vllm033-upgrade-20261103/wheels/official-ownership-plugin/hcu_vllm_das_plugin-0.3.0.dev0-py3-none-any.whl",
+  "production_wheel_sha256": "6a71808eddedf310136bb50f60b08b674bf897297d1df0a37b1dd14e5ca6bbec",
+  "packaged_python_files": [
+    {
+      "file": "hcu_vllm_das/__init__.py",
+      "sha256": "71b746268fa5a31439aa6511d8d79f60a90d7ff3f7a6913ed558e74ca82bd84b"
+    },
+    {
+      "file": "hcu_vllm_das/environment.py",
+      "sha256": "519bd00e243af5ec58a1a112bb440ec2048c6c9b4d12231738b26d9585120c62"
+    },
+    {
+      "file": "hcu_vllm_das/extension.py",
+      "sha256": "7938aeb236c6f1c2003d97c88743e6227924d85931054f4d081c44d3e648138a"
+    },
+    {
+      "file": "hcu_vllm_das/flash_activation.py",
+      "sha256": "5cc858150111ca77c2ff651f0291e0e23088802e088415eb51daf27981bcd2ed"
+    },
+    {
+      "file": "hcu_vllm_das/rms_norm.py",
+      "sha256": "a51593a859ff7a24fa2313b45890c2af0c5ef1f6a66eb4689d047d772e0708b0"
+    },
+    {
+      "file": "hcu_vllm_das/version.py",
+      "sha256": "0433fc8fc76eeb871e411bdfcef0e8d1fe34710322663c29d985242065ff1351"
+    },
+    {
+      "file": "hcu_vllm_das/attention/__init__.py",
+      "sha256": "8d5108ef92b53f9ba457042d1c10724f70bab75caef6c737f309399b6f8dcf46"
+    },
+    {
+      "file": "hcu_vllm_das/attention/e5m2_cache.py",
+      "sha256": "57f9e1f6e2b9091a8c46ed732a850fba49b306d1d771aad1e95cd748b9eba56c"
+    },
+    {
+      "file": "hcu_vllm_das/attention/e5m2_scales.py",
+      "sha256": "1fa6dae52b64f601ba17b47d5a0210b74f452c5c5e7954b93d8f5f88e5ac75f6"
+    },
+    {
+      "file": "hcu_vllm_das/attention/flash_attn.py",
+      "sha256": "a6a28694a3aa918e531c4bf9d380222bfe817fd3275b9ca7ac1b57a05d9139e5"
+    },
+    {
+      "file": "hcu_vllm_das/moe/__init__.py",
+      "sha256": "07ef819fcc489a7c711f0d707c25b9ff7a2fc107b994f515b4c9e6a54f1b2d6a"
+    },
+    {
+      "file": "hcu_vllm_das/moe/fused_moe_aiter.py",
+      "sha256": "598b8ac6b0febd22ff6293a6c1c31f772c320bae5b58f57e0bcabcfa3c17501a"
+    },
+    {
+      "file": "hcu_vllm_das/moe/int8_asm.py",
+      "sha256": "f1a9ad90aa174d81de0747e2d151d3da65bfce3817dc9fe22760d478d0aa4304"
+    },
+    {
+      "file": "hcu_vllm_das/moe/int8_oracle.py",
+      "sha256": "6538934872ff6929c6af9c3774ae82141fa367aa27b2b113447a5a5ba69a7dc3"
+    }
+  ],
+  "remote_ci": "No check/status contexts for v0.33.0; legacy workflows target v0.28.1-dev. Manual checks are not a remote CI pass.",
+  "merge_scope": "Existing PR330 into v0.33.0 only; full upgrade/unsupported AITER/native AR and larger-model gates remain incomplete."
+}

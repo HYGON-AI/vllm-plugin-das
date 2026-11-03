@@ -1,5 +1,10 @@
 # v0.33 Plugin review and follow-up validation
 
+The score-based HOLD below is historical. The user subsequently allowed
+precision differences for models below7B; current scope and review are in
+[the acceptance update](vllm033-small-model-acceptance.md). Retired AITER model
+integration and unrelated official-path gates stay separate.
+
 Subsequent [INT8 math follow-up](vllm033-int8-math.md) fixes the default ASM
 quantization/activation compatibility in `529855a5`; its installed strict EP
 checks now pass. The ASM failures below remain the original review snapshot.

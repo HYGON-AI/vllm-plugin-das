@@ -18,9 +18,10 @@ Passing release admission does not validate the native ABI or a model.
 - vLLM owns models, scheduling, allocation and official execution interfaces.
 - Adapter (`sgl-kernel`, package `hcu_adapter`) owns real HCU identity,
   runtime admission, platform/general entry points and process health.
-- This Plugin uses `hcu_adapter.extensions` to register optional RMSNorm,
-  explicit AITER INT8 MoE and FlashAttention providers. Each provider has
-  separate prerequisites and acceptance gates.
+- This Plugin uses `hcu_adapter.extensions` to register optional RMSNorm and
+  explicit FlashAttention providers. Official vLLM retains INT8 model routing;
+  the historical AITER INT8 prototype is not an advertised model capability.
+  Each active provider has separate prerequisites and acceptance gates.
 
 The retained repository-root `vllm_hcu` package and `setup.py` are the legacy
 vLLM 0.28.1 development reference. They are not the package for this release.
@@ -49,6 +50,10 @@ implementation boundaries and remaining device/model gates are recorded in
 [v0.33 validation](docs/validation/vllm033-upgrade.md). CPU contracts, device
 numerics, changed-input Graph replay, model accuracy and performance are
 separate results; source tests do not certify an installed wheel.
+
+The current task's user-authorized acceptance of precision differences for
+models below 7B, preserved original scores and PR330 review scope are recorded
+in [the acceptance review](docs/validation/vllm033-small-model-acceptance.md).
 
 Files under `validation/v0.32.0`, `tests/vllm032` and older versioned design or
 validation documents are historical evidence. Their scores and artifacts do

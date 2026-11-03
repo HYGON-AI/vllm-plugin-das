@@ -1,5 +1,11 @@
 # v0.33 Plugin migration
 
+Current PR330 acceptance policy: the user allows precision differences for
+models below7B. See the [updated review](vllm033-small-model-acceptance.md).
+Earlier HOLD statements below are preserved historical decisions; scores and
+strict operator/functional checks are unchanged. This does not complete the
+overall upgrade or establish a last-good deployment.
+
 Target: official vLLM `v0.33.0`, commit
 `4ba787ec9959e566d3b587a796dff07673324da5`.
 The release branch starts at merged Plugin commit
