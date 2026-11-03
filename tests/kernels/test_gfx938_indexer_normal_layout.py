@@ -12,10 +12,13 @@ from vllm_hcu.patch.worker.core_fix import patch_glm5next_channel_fp8 as glm_pat
 from vllm_hcu.platforms.hcu import on_gfx938
 
 # The dispatcher rejects kcache_layout="normal" off gfx938.
-pytestmark = pytest.mark.skipif(
-    not torch.cuda.is_available() or not on_gfx938(),
-    reason="requires gfx938 HCU",
-)
+pytestmark = [
+    pytest.mark.hcu,
+    pytest.mark.skipif(
+        not torch.cuda.is_available() or not on_gfx938(),
+        reason="requires gfx938 HCU",
+    ),
+]
 
 
 def _pin_normal_layout(monkeypatch):
@@ -461,3 +464,54 @@ def test_lightop_normal_mtp_fold_replays_in_cuda_graph():
     assert torch.equal(torch.isneginf(out), torch.isneginf(eager))
     finite = torch.isfinite(eager)
     torch.testing.assert_close(out[finite], eager[finite])
+
+
+def test_custom_op_indexer_writer_feeds_normal_decode():
+    from vllm import _custom_ops as ops
+
+    torch.manual_seed(20261101)
+    length, dimension, heads, page_size = 3072, 128, 32, 64
+    pages = length // page_size
+    keys = torch.randn(length, dimension, device="cuda", dtype=torch.bfloat16)
+    cache = torch.zeros(pages, page_size, dimension + 4, device="cuda", dtype=torch.uint8)
+    table = torch.randperm(pages, device="cuda", dtype=torch.int32).unsqueeze(0)
+    positions = torch.arange(length, device="cuda", dtype=torch.int64)
+    slots = table[0, positions // page_size].long() * page_size + positions % page_size
+    ops.indexer_k_quant_and_cache(keys, cache, slots, dimension, "ue8m0")
+    packed = cache.reshape(pages, -1)
+    stored_keys = packed[:, :page_size * dimension].reshape(pages, page_size, dimension)
+    stored_keys = stored_keys.contiguous().view(torch.float8_e4m3fn)
+    stored_scales = packed[:, page_size * dimension:].contiguous().view(torch.float32)
+    logical_keys = stored_keys[table[0].long()].reshape(1, length, dimension)
+    logical_scales = stored_scales[table[0].long()].reshape(1, length)
+    query = (torch.randn(1, 1, heads, dimension, device="cuda") * 3).to(torch.float8_e4m3fn)
+    weights = torch.randn(1, heads, device="cuda", dtype=torch.float32)
+    lengths = torch.tensor([length], device="cuda", dtype=torch.int32)
+    expected = _oracle(query, logical_keys, logical_scales, weights, lengths, length)
+    actual = _decode(query, cache.unsqueeze(2), weights, lengths, table, length)
+    _check_rows(actual, expected)
+
+
+def test_decode_topk_ties_keep_distinct_valid_positions():
+    from vllm_hcu.v1.attention.ops import rocm_aiter_mla_sparse as sparse
+
+    torch.manual_seed(20261102)
+    width = 139264
+    lengths = torch.tensor(
+        [154, 2048, 2049, 8192, 32767, 65536, 102401, 131071, 131226, 139263],
+        device="cuda", dtype=torch.int32,
+    )
+    scores = (torch.randn(10, width, device="cuda") * 2).round().clamp_min(0)
+    columns = torch.arange(width, device="cuda")
+    scores.masked_fill_(columns.unsqueeze(0) >= lengths.unsqueeze(1), -float("inf"))
+    output = torch.full((10, 2048), -777, device="cuda", dtype=torch.int32)
+    sparse._lightop_topk_indices_decode(scores, lengths, 1, output, 2048)
+    for row, length in enumerate(lengths.tolist()):
+        selected = output[row]
+        assert torch.all((selected == -1) | ((selected >= 0) & (selected < length)))
+        valid = selected[selected >= 0].long()
+        expected_count = min(length, 2048)
+        assert valid.numel() == expected_count
+        assert valid.unique().numel() == expected_count
+        expected_values = scores[row, :length].topk(expected_count).values
+        torch.testing.assert_close(scores[row, valid].sort().values, expected_values.sort().values)
