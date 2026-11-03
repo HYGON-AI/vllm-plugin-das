@@ -39,6 +39,7 @@ def _paged_logits(
     BLOCK_D: tl.constexpr,
     BLOCK_T: tl.constexpr,
     FILL_TAIL: tl.constexpr,
+    TOKEN_MAJOR: tl.constexpr,
 ):
     row = tl.program_id(0)
     batch = row // NEXT_N
@@ -76,12 +77,15 @@ def _paged_logits(
     # exceed the signed-int32 offset range because pages retain their packed
     # cross-layer stride.
     page_base = page.to(tl.int64) * CACHE_PAGE_STRIDE
-    in_page_offset = (
-        (slot[None, :] // 16) * (16 * DIM)
-        + (dims[:, None] // 16) * 256
-        + (slot[None, :] % 16) * 16
-        + dims[:, None] % 16
-    )
+    if TOKEN_MAJOR:
+        in_page_offset = slot[None, :] * DIM + dims[:, None]
+    else:
+        in_page_offset = (
+            (slot[None, :] // 16) * (16 * DIM)
+            + (dims[:, None] // 16) * 256
+            + (slot[None, :] % 16) * 16
+            + dims[:, None] % 16
+        )
     offset = page_base[None, :] + in_page_offset.to(tl.int64)
     keys = tl.load(Cache + offset, (dims[:, None] < DIM) & valid[None, :], 0.0)
     query_values = tl.load(
@@ -133,6 +137,7 @@ def _paged_logits_live_tiles(
     BLOCK_D: tl.constexpr,
     BLOCK_T: tl.constexpr,
     TILE_PROGRAMS: tl.constexpr,
+    TOKEN_MAJOR: tl.constexpr,
 ):
     """_paged_logits without the -inf tail, on a fixed [rows, TILE_PROGRAMS] grid.
 
@@ -168,12 +173,15 @@ def _paged_logits_live_tiles(
         page = tl.where(valid, page, 0)
         slot = tokens % PAGE_SIZE
         page_base = page.to(tl.int64) * CACHE_PAGE_STRIDE
-        in_page_offset = (
-            (slot[None, :] // 16) * (16 * DIM)
-            + (dims[:, None] // 16) * 256
-            + (slot[None, :] % 16) * 16
-            + dims[:, None] % 16
-        )
+        if TOKEN_MAJOR:
+            in_page_offset = slot[None, :] * DIM + dims[:, None]
+        else:
+            in_page_offset = (
+                (slot[None, :] // 16) * (16 * DIM)
+                + (dims[:, None] // 16) * 256
+                + (slot[None, :] % 16) * 16
+                + dims[:, None] % 16
+            )
         offset = page_base[None, :] + in_page_offset.to(tl.int64)
         keys = tl.load(Cache + offset, (dims[:, None] < DIM) & valid[None, :], 0.0)
         dots = tl.dot(query_values, keys)
@@ -197,6 +205,7 @@ def gfx938_fp8_paged_mqa_logits(
     block_tables: torch.Tensor,
     max_model_len: int,
     fill_tail: bool = True,
+    token_major: bool = False,
 ) -> torch.Tensor:
     """Compute weighted logits without materializing token-major K storage.
 
@@ -209,6 +218,9 @@ def gfx938_fp8_paged_mqa_logits(
         context_lens: Int32/int64 final lengths [batch] or exact ends [batch,next_n].
         block_tables: Int32/int64 logical-to-physical page IDs [batch, pages].
         max_model_len: Number of output token positions.
+        token_major: Pages hold token-major rows (slot * D + d) instead of
+            16x16 tiles.  DeepSeek-V4's compressor writes its indexer cache
+            token-major and its prefill gather reads it that way.
         fill_tail: Write -inf past each row's context end.  When False those
             positions are left unwritten and consumers must bound reads by the
             per-row end, as the decode top-k selectors do.
@@ -294,6 +306,7 @@ def gfx938_fp8_paged_mqa_logits(
         triton.next_power_of_2(dim),
         64,
         *tile_args,
+        token_major,
         num_warps=4,
     )
     return output

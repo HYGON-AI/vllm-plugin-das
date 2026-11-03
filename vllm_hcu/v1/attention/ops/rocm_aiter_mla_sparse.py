@@ -48,6 +48,20 @@ def _get_lightop_attention():
 
 _GLOBAL_LOGITS_BUFFERS = {}
 
+# DeepSeek-V4's compressor writes the sparse-indexer K cache token-major
+# (slot * D + d), unlike the 16x16 tiles of indexer_k_quant_and_cache.  Its
+# prefill gather already reads token-major; the gfx938 decode reader must too.
+_INDEXER_CACHE_TOKEN_MAJOR = False
+
+
+def set_indexer_cache_token_major(value: bool = True) -> None:
+    global _INDEXER_CACHE_TOKEN_MAJOR
+    _INDEXER_CACHE_TOKEN_MAJOR = value
+
+
+def indexer_cache_token_major() -> bool:
+    return _INDEXER_CACHE_TOKEN_MAJOR
+
 # mqa_logits分块全局缓存大小，避免大输入打开pc时OOM
 MAX_ELEMENTS = 16384 * 16384
 
@@ -909,6 +923,7 @@ def rocm_fp8_paged_mqa_logits(
     force_aiter_triton: bool = False,
     kcache_layout: str = "preshuffle",
     clean_logits: bool = True,
+    token_major: bool = False,
 ) -> torch.Tensor:
     """Compute FP8 MQA logits using paged KV-cache.
 
@@ -1044,6 +1059,7 @@ def rocm_fp8_paged_mqa_logits(
             block_tables,
             max_model_len,
             fill_tail=clean_logits,
+            token_major=token_major,
         )
 
     aiter_paged_mqa_logits_module = None
@@ -1952,6 +1968,7 @@ def rocm_aiter_sparse_attn_indexer_native(
             # merge gathers scores only at those selected indices, so no
             # decode consumer reads the unwritten tail.
             clean_logits=False,
+            token_major=indexer_cache_token_major(),
         )
 
         # A padded decode batch has more kernel rows than actual decode
