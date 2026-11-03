@@ -187,9 +187,8 @@ def test_native_decode_matches_custom_op_writer_layout(monkeypatch, gfx938):
     assert set(result[0].tolist()) == {1, 2}
 
 
-@pytest.mark.parametrize("ragged_api", ["missing", "noncallable", "available"])
 @pytest.mark.parametrize("topk_tokens", [2, 2048])
-def test_decode_topk_optional_ragged_api(monkeypatch, ragged_api, topk_tokens):
+def test_decode_topk_selects_required_ragged_api(monkeypatch, topk_tokens):
     calls = []
     logits = torch.arange(24, dtype=torch.float32).reshape(4, 6)[:, ::2]
     seq_lens = torch.tensor([3, 2], dtype=torch.int64)
@@ -214,16 +213,15 @@ def test_decode_topk_optional_ragged_api(monkeypatch, ragged_api, topk_tokens):
         calls.append("ragged")
         return torch.full_like(output, 9)
 
-    attention = SimpleNamespace(top_k_per_row_decode=legacy)
-    if ragged_api != "missing":
-        attention.fast_topk_transform_ragged_fused = (
-            ragged if ragged_api == "available" else None
-        )
+    attention = SimpleNamespace(
+        top_k_per_row_decode=legacy,
+        fast_topk_transform_ragged_fused=ragged,
+    )
     monkeypatch.setattr(sparse, "_get_lightop_attention", lambda: attention)
 
     sparse._lightop_topk_indices_decode(logits, seq_lens, 2, output, topk_tokens)
 
-    uses_ragged = topk_tokens == 2048 and ragged_api == "available"
+    uses_ragged = topk_tokens == 2048
     assert calls == ["ragged" if uses_ragged else "legacy"]
     assert torch.all(output == (9 if uses_ragged else 7))
 

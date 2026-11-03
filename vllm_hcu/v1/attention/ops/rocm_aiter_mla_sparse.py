@@ -1546,11 +1546,10 @@ def _lightop_topk_indices_decode(
 ) -> None:
     row_ends = _decode_row_ends_from_seq_lens(seq_lens, next_n, logits.shape[0])
     attention = _get_lightop_attention()
-    ragged_topk = getattr(attention, "fast_topk_transform_ragged_fused", None)
-    if topk_tokens == 2048 and callable(ragged_topk):
+    if topk_tokens == 2048:
         row_ends = row_ends.to(device=logits.device, dtype=torch.int32).contiguous()
         row_starts = torch.zeros_like(row_ends)
-        selected = ragged_topk(
+        selected = attention.fast_topk_transform_ragged_fused(
             logits.contiguous(), row_ends, row_starts, topk_tokens,
             row_starts=row_starts,
         )
