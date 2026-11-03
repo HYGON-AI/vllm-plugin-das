@@ -236,11 +236,17 @@ def slimquant_w4a8_uses_deepep_auto(moe_config: object) -> bool:
     if all2all_backend in fixed_deepep_backends or (
         is_dp_ep and all2all_backend not in supported_dp_ep_backends
     ):
+        if slimquant_w4a8_fixed_deepep_use_low_latency(moe_config) is not None:
+            # A supported fixed HT/LL layout is built by the caller from its
+            # fixed role; it is not a deepep_auto route.
+            return False
         raise ValueError(
             "SlimQuant W4A8 DP+EP requires all2all_backend='deepep_auto' "
             "or 'allgather_reducescatter'; fixed or "
             "incompatible all-to-all "
-            f"backend {all2all_backend!r} is unsupported"
+            f"backend {all2all_backend!r} is unsupported "
+            "(fixed deepep_high_throughput/deepep_low_latency are "
+            "supported only for Qwen4Exp)"
         )
 
     if all2all_backend != "deepep_auto":
@@ -267,17 +273,7 @@ def slimquant_w4a8_uses_deepep_auto(moe_config: object) -> bool:
             "SlimQuant W4A8 deepep_auto requires moe_backend='auto' or "
             f"'deep_gemm', got {moe_backend!r}"
         )
-    from vllm.config import get_current_vllm_config_or_none
-    from vllm_hcu.deepseek_v4_runtime import model_architectures
-
-    vllm_config = get_current_vllm_config_or_none()
-    if vllm_config is None:
-        vllm_config = getattr(moe_config, "_hcu_vllm_config", None)
-    architectures = model_architectures(vllm_config)
-    if not architectures:
-        architectures = tuple(
-            getattr(moe_config, "_hcu_model_architectures", ())
-        )
+    architectures = _slimquant_w4a8_deepep_architectures(moe_config)
     supported_architectures = {
         "DeepseekV4ForCausalLM",
         "DeepSeekV4MTPModel",
@@ -298,19 +294,95 @@ def slimquant_w4a8_uses_deepep_auto(moe_config: object) -> bool:
             "and its native MTP draft, GLM MoE DSA, or Qwen4Exp; "
             f"got architectures={architectures!r}"
         )
+    _require_slimquant_w4a8_silu_hcu_runtime(moe_config, "deepep_auto")
+    return True
+
+
+def _slimquant_w4a8_deepep_architectures(moe_config: object) -> tuple:
+    from vllm.config import get_current_vllm_config_or_none
+    from vllm_hcu.deepseek_v4_runtime import model_architectures
+
+    vllm_config = get_current_vllm_config_or_none()
+    if vllm_config is None:
+        vllm_config = getattr(moe_config, "_hcu_vllm_config", None)
+    architectures = model_architectures(vllm_config)
+    if not architectures:
+        architectures = tuple(
+            getattr(moe_config, "_hcu_model_architectures", ())
+        )
+    return architectures
+
+
+def _require_slimquant_w4a8_silu_hcu_runtime(
+    moe_config: object, route: str
+) -> None:
     activation = getattr(moe_config, "activation", None)
     activation_name = getattr(activation, "value", activation)
     if activation_name != "silu":
         raise ValueError(
-            "SlimQuant W4A8 deepep_auto supports only SiLU activation; "
+            f"SlimQuant W4A8 {route} supports only SiLU activation; "
             f"got {activation_name!r}"
         )
     if not current_platform.is_rocm():
         raise RuntimeError(
-            "SlimQuant W4A8 deepep_auto requires the HCU ROCm runtime"
+            f"SlimQuant W4A8 {route} requires the HCU ROCm runtime"
         )
     _require_slimquant_w4a8_hipc_runtime()
-    return True
+
+
+_FIXED_DEEPEP_W4A8_ARCHITECTURES = frozenset(
+    {
+        "Qwen4ExpForCausalLM",
+        "Qwen4ExpForConditionalGeneration",
+    }
+)
+
+
+def slimquant_w4a8_fixed_deepep_use_low_latency(
+    moe_config: object,
+) -> bool | None:
+    """Classify SlimQuant W4A8 on a fixed DeepEP backend.
+
+    Returns ``False`` for ``deepep_high_throughput`` and ``True`` for
+    ``deepep_low_latency`` when the model is a supported SiLU architecture
+    (Qwen4Exp), and ``None`` for every other combination so the caller keeps
+    its existing routing.  Both fixed layouts reuse the role-fixed SiLU
+    HIPC experts of ``deepep_auto``, which already pad Qwen's 640-wide
+    intermediate dimension to the HIPC contract.
+    """
+
+    parallel_config = getattr(moe_config, "moe_parallel_config", None)
+    all2all_backend = getattr(parallel_config, "all2all_backend", None)
+    if all2all_backend not in ("deepep_high_throughput", "deepep_low_latency"):
+        return None
+    architectures = _slimquant_w4a8_deepep_architectures(moe_config)
+    if _FIXED_DEEPEP_W4A8_ARCHITECTURES.isdisjoint(architectures):
+        return None
+
+    route = f"fixed {all2all_backend}"
+    if not (
+        getattr(parallel_config, "dp_size", 1) > 1
+        and getattr(parallel_config, "use_ep", False)
+    ):
+        raise ValueError(
+            f"SlimQuant W4A8 {route} requires dp_size > 1 with expert "
+            "parallelism enabled"
+        )
+    if getattr(parallel_config, "use_deepep_auto_kernels", False) is True:
+        raise ValueError(
+            "SlimQuant W4A8 has incompatible use_deepep_auto_kernels "
+            f"metadata for all2all_backend={all2all_backend!r}"
+        )
+    if getattr(parallel_config, "enable_eplb", False):
+        raise ValueError(f"SlimQuant W4A8 {route} does not support EPLB")
+    moe_backend = getattr(moe_config, "moe_backend", "auto")
+    if moe_backend not in ("auto", "deep_gemm"):
+        raise ValueError(
+            f"SlimQuant W4A8 {route} requires moe_backend='auto' or "
+            f"'deep_gemm', got {moe_backend!r}"
+        )
+    _require_slimquant_w4a8_silu_hcu_runtime(moe_config, route)
+    return all2all_backend == "deepep_low_latency"
 
 
 def _has_hcu_low_latency_dispatch_abi(buffer) -> bool:
@@ -1083,5 +1155,6 @@ __all__ = [
     "ll_init",
     "ll_prepare_async",
     "ll_receiver",
+    "slimquant_w4a8_fixed_deepep_use_low_latency",
     "slimquant_w4a8_uses_deepep_auto",
 ]
