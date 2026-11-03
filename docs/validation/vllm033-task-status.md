@@ -106,3 +106,12 @@ independent eager reference is not a replacement for the original Graph gate.
 Both services exit zero with a retained resource-tracker semaphore warning.
 Owned ports are closed and all cards return to about 2 MiB. GPU5/6 and the
 pre-existing port18127 service are untouched. The Plugin MR remains a draft.
+
+
+## Subsequent review findings
+
+The [review follow-up](vllm033-review.md) records two Plugin fixes, new full
+hybrid-model/MTP1/2 observations, strict EP numerical failures and the current
+merge decision. It supersedes this document's earlier MTP1/2 and hybrid
+not-run state. PR330 remains open because its own accuracy/numerical gates
+are unresolved. The goal manager has been verified v0.33 active.
