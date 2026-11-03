@@ -1,7 +1,7 @@
 # HCU vLLM DAS optimization plugin
 
 Independent Flash public-registry publication and health contract:
-[Flash registry owner](../docs/validation/vllm032-flash-registry.md). Its
+[v0.33 provider ownership](../docs/validation/vllm033-upgrade.md#ownership-and-changes). Its
 activation dependencies are independent of the legacy RMS/INT8 bundle.
 
 `hcu-vllm-das-plugin` is the optimization-only extension for official vLLM
@@ -199,9 +199,11 @@ export VLLM_HCU_USE_CUSTOM_RMS_NORM=0
 vllm serve /model/Qwen2-0.5B-Instruct --attention-backend TRITON_ATTN
 ```
 
-The numerical evidence for this release is limited to `gfx936`. On another HCU
-architecture, keep RMSNorm disabled until a separate live-device validation
-record exists:
+Device acceptance for v0.33 is tracked separately in the
+[current validation record](../docs/validation/vllm033-upgrade.md).
+Historical gfx936 results do not certify this release or another architecture.
+Keep RMSNorm disabled until the intended stack has a live-device validation
+record:
 
 ```bash
 export VLLM_HCU_USE_CUSTOM_RMS_NORM=0
@@ -210,10 +212,12 @@ export VLLM_HCU_USE_CUSTOM_RMS_NORM=0
 For complete removal, uninstall `hcu-vllm-das-plugin`; the adapter and vLLM
 remain installed and retain platform ownership.
 
+## Historical v0.32 evidence
+
 The [`SiluAndMul`](../docs/validation/v032-adapter-extension-silu.md) and
 [`RMSNorm`](../docs/validation/v032-adapter-extension-rmsnorm.md) records are
-historical candidate evidence. The current three-way identities, upstream
-takeover decision, and base final-wheel gates are recorded in the
+historical candidate evidence. The v0.32 three-way identities, upstream
+takeover decision, and base final-wheel gates were recorded in the
 [`vLLM 0.32 upstream-first validation`](../docs/validation/vllm032-upstream-first-operator-ab.md).
 The explicit AITER W8A8 route, public vendor-kernel evidence, Graph replay,
 model smoke, and isolated HumanEval64 result are recorded in the

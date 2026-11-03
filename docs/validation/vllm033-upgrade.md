@@ -36,7 +36,8 @@ ABI checks precede operator publication.
 
 ## Current evidence and remaining gates
 
-Portable suite: **223 passed, 42 skipped**. A subsequent targeted suite
+Portable suite after the release-documentation and Graph-version review:
+**225 passed, 42 skipped**. A targeted suite
 covering the actual v0.33 public ABC, forward metadata/output padding,
 unsupported configuration, cache views and real target AOT cache keys:
 **64 passed**; after tightening head-size admission, the full Flash CPU file
@@ -46,8 +47,34 @@ these are CPU contracts, not native/device or model acceptance.
 All three trial wheels were built and installed normally into an isolated
 environment. Parent and real spawn child loaded the new Core's four native
 extensions with matching module origins and no GPU initialization. The actual
-installed v0.33 public ROCm selector also selected the Plugin backend through
-its registered owner in the CPU-only normal case (zero provider compute).
+installed v0.33 public ROCm selector selected the Plugin backend through
+its registered owner. Normal, clear, foreign, fork and spawn CPU cases passed;
+an additional configuration case rejected unsupported head/page sizes, DCP,
+MLA, sparse and sinks through the actual official validation (zero compute).
+
+The current MR production sources were rebuilt into wheels and installed in
+fresh environments. Core was built for gfx936 with DTK 26.10 / Torch 2.11 /
+Python 3.12; parent and real spawn loaded its four native extensions from that
+environment. Source/wheel Python bytes matched (Core 2,991 files, Adapter 203,
+Plugin 13). Later changes to tests and documentation do not replace the build
+commit identity or create new numerical claims.
+
+## gfx936 device checks (2026-11-03)
+
+| Installed-wheel test | Result | Scope |
+| --- | --- | --- |
+| `test_flash_attention_hcu.py` + `test_e5m2_scales_hcu.py` | 36 passed | BF16/FP16, both layouts, E5M2 non-unit scales, changed-input Graph |
+| `test_rms_norm_hcu.py` | 2 passed | ordinary/fused RMSNorm, fallback, compiled changed-input replay |
+| `test_operator_graph_hcu.py` | 1 passed | optimized/official operator selection and compiled numerical comparison |
+| `test_aiter_int8_hcu.py` | 3 passed | native AITER W8A8 M=1/16/128, Triton comparison, changed-input Graph |
+
+The first operator Graph attempt reached both providers but its test rejected
+the valid `0.33.0+das...` build suffix. The revised test checks epoch zero and
+the 0.33 release line, preserving the existing path, provider and numerical
+assertions; its independent rerun passed. No numerical threshold was changed.
+These device checks cover the listed shapes and gfx936, not gfx92a or a model
+family. HumanEval32, model prefix/MTP, communication and performance are still
+separate acceptance gates.
 
 ```bash
 HCU_ADAPTER_HOST=none HIP_VISIBLE_DEVICES=-1 CUDA_VISIBLE_DEVICES=-1 \
@@ -56,8 +83,8 @@ HCU_ADAPTER_HOST=none HIP_VISIBLE_DEVICES=-1 CUDA_VISIBLE_DEVICES=-1 \
   .venv/bin/python -m pytest -q tests/vllm033
 ```
 
-Normal wheel installation/provenance, real selector and loader integration,
-BF16/E5M2 numerical and changed-input Graph tests, model accuracy, prefix/MTP,
-communication and performance remain separate gates. No v0.32 score or wheel
+The listed wheel/provenance, selector and operator checks have passed. Full
+loader/model integration, model accuracy, prefix/MTP, communication and
+performance remain separate gates. No v0.32 score or wheel
 hash is relabeled as v0.33. The old compatibility lock under `validation/v0.32.0`
 is retained unchanged; the new combination is not last-good.
