@@ -2,7 +2,7 @@
 
 Independent Flash public-registry publication and health contract:
 [v0.33 provider ownership](../docs/validation/vllm033-upgrade.md#ownership-and-changes). Its
-activation dependencies are independent of the legacy RMS/INT8 bundle.
+activation dependencies are independent of the optional RMS provider.
 
 `hcu-vllm-das-plugin` is the optimization-only extension for official vLLM
 0.33 and `adapter-das`. The adapter owns the HCU platform and runtime
@@ -12,10 +12,9 @@ optimizations through the adapter extension API.
 Version `0.3.0.dev0` targets the `v0.33.0` branch. Migration status and current
 evidence are recorded in [v0.33 validation](../docs/validation/vllm033-upgrade.md);
 the v0.32 documents below are historical evidence and do not certify v0.33.
-It contains two independently selected operator capabilities:
-
-- a default-OFF LightOp ordinary and fused-add `RMSNorm` candidate; and
-- an explicit AITER INT8 W8A8 MoE route selected by `--moe-backend aiter`.
+The operator extension currently advertises only the default-OFF LightOp
+ordinary and fused-add `RMSNorm` candidate. INT8 model selection, weight
+conversion, quantization and kernel construction remain official vLLM owners.
 
 It also provides an explicit HCU FlashAttention backend selected by
 `--attention-backend FLASH_ATTN`. The backend keeps vLLM's official metadata,
@@ -73,37 +72,32 @@ VLLM_PLUGINS=hcu_adapter python3 -E adapter_extension/tools/verify_installed.py
 
 The verifier fails closed unless all three distributions have non-empty wheel
 records, their imported modules are owned by those records, the adapter is the
-sole expected vLLM entry-point owner, the DAS extension is active with both
-declared capabilities, vLLM's OOT registry selects this exact class, and
-explicit `aiter` INT8 selection resolves to the Plugin-owned expert:
+sole expected vLLM entry-point owner, the RMS extension is active, and
+vLLM's public OOT registry selects `hcu_vllm_das.rms_norm.HcuRMSNorm`.
+Schema4 additionally verifies that the seven official INT8 oracle symbols
+remain identical across activation, the module is owned by the Core wheel,
+and explicit Triton selection resolves to an official expert.
 
-```text
-hcu_vllm_das.rms_norm.HcuRMSNorm
-hcu_vllm_das.moe.int8_oracle.HcuAiterInt8Experts
-```
+## INT8 ownership and unavailable AITER model integration
 
-## AITER INT8 W8A8 MoE
+Use official `--moe-backend auto` or `--moe-backend triton` for INT8 models.
+The retired Plugin installer extended/rebound the official oracle enum and
+functions; that private integration conflicts with the upstream-first skill
+and has been removed. No `aiter-int8-moe` capability is advertised. Calling
+its old `install()` entry point explicitly rejects before importing or
+modifying Core. An Adapter request requiring that capability must fail.
 
-The Plugin reuses vLLM 0.33's official channel-weight/token-activation W8A8
-quant configuration and kernel construction. It adds only the explicit AITER
-selector and translates the resulting tensors to the public `aiter.moe` API;
-the vendor wheel continues to own kernels and tuned configurations.
+The official v0.33 INT8 oracle provides Triton/Humming/CPU and has no public
+expert registry for adding AITER. The general public quantization-config
+registry is not equivalent: a future distinct quantization method would need
+its own loader/lifecycle/full-dataflow evidence. It must not overwrite the
+official `compressed-tensors` entry or rebind oracle globals.
 
-Select the route through vLLM's existing CLI option:
-
-```bash
-vllm serve /model/Qwen3.5-35B-A3B-W8A8 --moe-backend aiter
-```
-
-Each unseen shape logs whether it found and executed a native AITER config. A
-shape with no compatible config, or a config requiring an unsupported shuffle
-layout, is logged as an official vLLM Triton INT8 fallback and is not counted
-as an AITER hit. Once a compatible AITER config is selected, a vendor execution
-error is raised rather than silently changing providers.
-
-Leaving `--moe-backend` at its default preserves vLLM's upstream backend
-priority. Uninstalling this wheel removes the added selector without changing
-the Adapter's platform/runtime ownership.
+The standalone INT8 provider, ASM composition and unregistered expert factory
+are retained for operator experiments. Their prior native/Graph and full-model
+results are frozen historical evidence; they do not make AITER selectable in
+the corrected candidate. Preserving official ownership does not certify that
+unavailable capability. See [ownership correction](../docs/validation/vllm033-official-ownership.md).
 
 ## HCU FlashAttention varlen backend
 

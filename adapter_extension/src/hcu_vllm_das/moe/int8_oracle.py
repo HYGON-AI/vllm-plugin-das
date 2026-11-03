@@ -1,17 +1,13 @@
-"""Register the HCU AITER channel/token INT8 backend in vLLM 0.33."""
+"""Unregistered INT8 expert prototype; official v0.33 owns model routing.
+
+The historical installer rebound official oracle globals. It is deliberately
+unavailable: v0.33 has no public INT8 expert registry. Direct-provider/operator
+experiments do not certify production model integration.
+"""
 
 from __future__ import annotations
 
-from enum import Enum
-import functools
-from importlib import import_module as _import_module
-import inspect
-import sys
-from types import ModuleType
-from typing import Any
-
 from .fused_moe_aiter import apply_aiter_int8_moe
-
 
 TARGET_MODULE = "vllm.model_executor.layers.fused_moe.oracle.int8"
 EXPERTS_MODULE = "vllm.model_executor.layers.fused_moe.experts.rocm_aiter_moe"
@@ -32,55 +28,6 @@ class Int8OracleInstallError(RuntimeError):
 
 
 HcuAiterInt8Experts: type | None = None
-
-
-_REQUIRED_SIGNATURES = {
-    "backend_to_kernel_cls": ("backend",),
-    "map_int8_backend": ("runner_backend",),
-    "select_int8_moe_backend": ("config", "weight_key", "activation_key"),
-    "convert_to_int8_moe_kernel_format": (
-        "int8_backend",
-        "w13",
-        "w2",
-        "layer",
-        "w13_scale",
-    ),
-    "make_int8_moe_quant_config": (
-        "int8_backend",
-        "w1_scale",
-        "w2_scale",
-        "a1_scale",
-        "a2_scale",
-        "w1_bias",
-        "w2_bias",
-        "per_act_token_quant",
-        "layer",
-    ),
-    "make_int8_moe_kernel": (
-        "int8_backend",
-        "moe_quant_config",
-        "moe_config",
-        "experts_cls",
-        "routing_tables",
-    ),
-}
-
-
-def _require_callable(module: ModuleType, name: str) -> Any:
-    value = getattr(module, name, None)
-    if not callable(value):
-        raise Int8OracleInstallError(
-            f"required vLLM 0.33 INT8 oracle callable is unavailable: "
-            f"{TARGET_MODULE}.{name}"
-        )
-    actual = tuple(inspect.signature(value).parameters)
-    expected = _REQUIRED_SIGNATURES[name]
-    if actual != expected:
-        raise Int8OracleInstallError(
-            f"vLLM 0.33 INT8 oracle signature changed for {name}: "
-            f"expected {expected}, got {actual}"
-        )
-    return value
 
 
 def _make_experts_class(
@@ -186,120 +133,11 @@ def _make_experts_class(
     return _HcuAiterInt8Experts
 
 
+
 def install() -> bool:
-    """Install the explicit AITER INT8 route before consumers freeze aliases."""
-
-    global HcuAiterInt8Experts
-
-    target = _import_module(TARGET_MODULE)
-    if getattr(target, INSTALL_MARKER, False):
-        return False
-
-    loaded_consumers = [name for name in INT8_CONSUMER_MODULES if name in sys.modules]
-    if loaded_consumers:
-        raise Int8OracleInstallError(
-            "vLLM INT8 consumer already imported before AITER oracle install: "
-            + ", ".join(loaded_consumers)
-        )
-
-    old_enum = getattr(target, "Int8MoeBackend", None)
-    if not isinstance(old_enum, type) or not issubclass(old_enum, Enum):
-        raise Int8OracleInstallError(
-            f"required enum is unavailable: {TARGET_MODULE}.Int8MoeBackend"
-        )
-    old_values = {member.name: member.value for member in old_enum}
-    if "AITER" in old_values:
-        raise Int8OracleInstallError(
-            "vLLM INT8 oracle already exposes AITER outside this extension"
-        )
-
-    backend_to_kernel_cls = _require_callable(target, "backend_to_kernel_cls")
-    map_int8_backend = _require_callable(target, "map_int8_backend")
-    _require_callable(target, "select_int8_moe_backend")
-    convert_to_int8_moe_kernel_format = _require_callable(
-        target, "convert_to_int8_moe_kernel_format"
+    """Reject the retired private-oracle integration without importing Core."""
+    raise Int8OracleInstallError(
+        "HCU AITER INT8 model integration requires a public expert registration "
+        "API unavailable in vLLM 0.33; use official INT8 auto/triton. "
+        "No official oracle was modified."
     )
-    _require_callable(target, "make_int8_moe_quant_config")
-    _require_callable(target, "make_int8_moe_kernel")
-
-    experts_module = _import_module(EXPERTS_MODULE)
-    parent_experts = getattr(experts_module, "AiterExperts", None)
-    if not isinstance(parent_experts, type):
-        raise Int8OracleInstallError(
-            f"required class is unavailable: {EXPERTS_MODULE}.AiterExperts"
-        )
-    quant_utils = _import_module(QUANT_UTILS_MODULE)
-    try:
-        int8_weight_key = quant_utils.kInt8StaticChannelSym
-        int8_activation_key = quant_utils.kInt8DynamicTokenSym
-    except AttributeError as error:
-        raise Int8OracleInstallError(
-            "vLLM 0.33 INT8 channel/token quant keys are unavailable"
-        ) from error
-
-    extended_values = dict(old_values)
-    extended_values["AITER"] = "AITER"
-    extended_enum = Enum("Int8MoeBackend", extended_values, module=TARGET_MODULE)
-    experts_class = _make_experts_class(
-        parent_experts,
-        int8_weight_key,
-        int8_activation_key,
-    )
-
-    @functools.wraps(backend_to_kernel_cls)
-    def hcu_backend_to_kernel_cls(backend):
-        if backend == extended_enum.AITER:
-            return [experts_class]
-        if not isinstance(backend, extended_enum):
-            raise ValueError(f"Unknown Int8 MoE backend: {backend!r}")
-        return backend_to_kernel_cls(backend)
-
-    @functools.wraps(map_int8_backend)
-    def hcu_map_int8_backend(runner_backend):
-        if runner_backend == "aiter":
-            return extended_enum.AITER
-        official_backend = map_int8_backend(runner_backend)
-        return extended_enum(official_backend.value)
-
-    @functools.wraps(convert_to_int8_moe_kernel_format)
-    def hcu_convert_to_int8_moe_kernel_format(
-        int8_backend,
-        w13,
-        w2,
-        layer=None,
-        w13_scale=None,
-    ):
-        if int8_backend == extended_enum.AITER:
-            return w13, w2
-        if not isinstance(int8_backend, extended_enum):
-            raise ValueError(f"Unknown Int8 MoE backend: {int8_backend!r}")
-        return convert_to_int8_moe_kernel_format(
-            int8_backend,
-            w13,
-            w2,
-            layer,
-            w13_scale,
-        )
-
-    target._hcu_vllm_das_original_int8_moe_backend = old_enum
-    target._hcu_vllm_das_original_backend_to_kernel_cls = backend_to_kernel_cls
-    target._hcu_vllm_das_original_map_int8_backend = map_int8_backend
-    target._hcu_vllm_das_original_convert_to_int8_moe_kernel_format = (
-        convert_to_int8_moe_kernel_format
-    )
-    target.Int8MoeBackend = extended_enum
-    target.backend_to_kernel_cls = hcu_backend_to_kernel_cls
-    target.map_int8_backend = hcu_map_int8_backend
-    target.convert_to_int8_moe_kernel_format = hcu_convert_to_int8_moe_kernel_format
-    HcuAiterInt8Experts = experts_class
-    setattr(target, INSTALL_MARKER, True)
-    return True
-
-
-__all__ = [
-    "HcuAiterInt8Experts",
-    "INSTALL_MARKER",
-    "INT8_CONSUMER_MODULES",
-    "Int8OracleInstallError",
-    "install",
-]

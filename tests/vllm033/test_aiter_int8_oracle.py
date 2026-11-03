@@ -121,79 +121,17 @@ def fake_imports(target: ModuleType) -> dict[str, object]:
     }
 
 
-def install_fake(
-    monkeypatch: pytest.MonkeyPatch,
-    target: ModuleType | None = None,
-) -> ModuleType:
+def standalone_fake(monkeypatch, target=None):
     target = fake_oracle_module() if target is None else target
-    modules = fake_imports(target)
-    monkeypatch.setattr(oracle, "_import_module", modules.__getitem__)
-    assert oracle.install() is True
+    cls = oracle._make_experts_class(FakeAiterExperts, "int8-channel", "int8-token")
+    monkeypatch.setattr(oracle, "HcuAiterInt8Experts", cls)
     return target
-
-
-def test_install_maps_explicit_aiter_and_preserves_official_factories(
-    monkeypatch: pytest.MonkeyPatch,
-) -> None:
-    target = fake_oracle_module()
-    original_select = target.select_int8_moe_backend
-    original_quant = target.make_int8_moe_quant_config
-    original_kernel = target.make_int8_moe_kernel
-
-    install_fake(monkeypatch, target)
-
-    assert target.map_int8_backend("aiter") is target.Int8MoeBackend.AITER
-    assert target.map_int8_backend("triton") is target.Int8MoeBackend.TRITON
-    assert target.map_int8_backend("humming") is target.Int8MoeBackend.HUMMING
-    assert target.backend_to_kernel_cls(target.Int8MoeBackend.AITER) == [
-        oracle.HcuAiterInt8Experts
-    ]
-    assert target.backend_to_kernel_cls(target.Int8MoeBackend.TRITON) == ["triton"]
-    assert target.backend_to_kernel_cls(target.Int8MoeBackend.HUMMING) == [
-        "humming"
-    ]
-    assert target.backend_to_kernel_cls(target.Int8MoeBackend.CPU) == ["cpu"]
-    assert target.convert_to_int8_moe_kernel_format(
-        target.Int8MoeBackend.AITER, "w13", "w2"
-    ) == ("w13", "w2")
-    assert target.convert_to_int8_moe_kernel_format(
-        target.Int8MoeBackend.TRITON, "w13", "w2"
-    ) == ("converted:TRITON:w13", "converted:TRITON:w2")
-    assert target.convert_to_int8_moe_kernel_format(
-        target.Int8MoeBackend.CPU, "w13", "w2"
-    ) == ("converted:CPU:w13", "converted:CPU:w2")
-    assert target.select_int8_moe_backend is original_select
-    assert target.make_int8_moe_quant_config is original_quant
-    assert target.make_int8_moe_kernel is original_kernel
-
-    backend, experts = target.select_int8_moe_backend(
-        SimpleNamespace(moe_backend="aiter")
-    )
-    assert backend is target.Int8MoeBackend.AITER
-    assert experts is oracle.HcuAiterInt8Experts
-
-    backend, experts = target.select_int8_moe_backend(
-        SimpleNamespace(moe_backend="auto")
-    )
-    assert backend is target.Int8MoeBackend.TRITON
-    assert experts == "triton"
-
-
-def test_install_keeps_auto_priority_and_is_idempotent(
-    monkeypatch: pytest.MonkeyPatch,
-) -> None:
-    target = install_fake(monkeypatch)
-
-    assert [
-        backend.value for backend in target._get_priority_backends(object())
-    ] == ["TRITON", "HUMMING", "CPU"]
-    assert oracle.install() is False
 
 
 def test_plugin_expert_adds_only_int8_channel_token_support(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    install_fake(monkeypatch)
+    standalone_fake(monkeypatch)
     experts = oracle.HcuAiterInt8Experts
 
     assert experts.consumes_expert_mask is False
@@ -203,9 +141,12 @@ def test_plugin_expert_adds_only_int8_channel_token_support(
 
 
 def test_explicit_aiter_rejects_expert_bias_before_weight_conversion(monkeypatch):
-    target = install_fake(monkeypatch)
-    with pytest.raises(ValueError, match="expert bias"):
-        target.select_int8_moe_backend(SimpleNamespace(moe_backend="aiter", has_bias=True))
+    target = standalone_fake(monkeypatch)
+    experts = oracle.HcuAiterInt8Experts
+    supported, reason = experts.is_supported_config(
+        experts, SimpleNamespace(has_bias=True), "int8-channel", "int8-token", "standard"
+    )
+    assert not supported and "expert bias" in reason
     # The same configuration can still be delegated to the official backend.
     backend, experts = target.select_int8_moe_backend(
         SimpleNamespace(moe_backend="triton", has_bias=True)
@@ -218,7 +159,7 @@ def test_explicit_aiter_rejects_expert_bias_before_weight_conversion(monkeypatch
 def test_plugin_expert_does_not_inherit_unforwarded_activation_parameters(
     monkeypatch, activation
 ):
-    install_fake(monkeypatch)
+    standalone_fake(monkeypatch)
     experts = oracle.HcuAiterInt8Experts
     assert experts._supports_activation(SimpleNamespace(value=activation)) is False
     assert experts._supports_activation(SimpleNamespace(value="silu")) is True
@@ -228,7 +169,7 @@ def test_plugin_expert_does_not_inherit_unforwarded_activation_parameters(
 def test_plugin_expert_delegates_int8_execution_to_provider(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    install_fake(monkeypatch)
+    standalone_fake(monkeypatch)
     calls: list[dict[str, object]] = []
     result = object()
 
@@ -290,18 +231,14 @@ def test_plugin_expert_delegates_int8_execution_to_provider(
 
 
 @pytest.mark.parametrize("consumer", oracle.INT8_CONSUMER_MODULES)
-def test_install_fails_before_mutation_when_an_int8_consumer_is_already_loaded(
-    monkeypatch: pytest.MonkeyPatch,
-    consumer: str,
-) -> None:
+def test_retired_install_does_not_modify_or_import_official_oracle(monkeypatch, consumer):
     target = fake_oracle_module()
-    original_enum = target.Int8MoeBackend
+    before = vars(target).copy()
+    monkeypatch.setitem(sys.modules, oracle.TARGET_MODULE, target)
     monkeypatch.setitem(sys.modules, consumer, ModuleType(consumer))
-    modules = fake_imports(target)
-    monkeypatch.setattr(oracle, "_import_module", modules.__getitem__)
-
-    with pytest.raises(oracle.Int8OracleInstallError, match="already imported"):
+    with pytest.raises(oracle.Int8OracleInstallError, match="public expert registration"):
         oracle.install()
-
-    assert target.Int8MoeBackend is original_enum
+    assert vars(target) == before
     assert not getattr(target, oracle.INSTALL_MARKER, False)
+    with pytest.raises(ValueError, match="unsupported"):
+        target.map_int8_backend("aiter")

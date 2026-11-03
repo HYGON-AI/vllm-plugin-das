@@ -136,3 +136,13 @@ is retained unchanged; the new combination is not last-good.
 
 Further v0.33 ownership checks and the E5M2 first-token-difference investigation
 are recorded in [the task status](vllm033-task-status.md). Model quality remains OPEN.
+
+
+### Current ownership correction
+
+The later [official-ownership correction](vllm033-official-ownership.md) removes
+the private INT8 oracle installer. Earlier AITER model/operator profiles remain
+frozen evidence, not current model integration. Official v0.33 INT8 auto/triton
+owns model selection/conversion/construction; the corrected extension advertises
+only LightOp RMSNorm plus the separately registered Flash provider. Required
+AITER INT8 capability is unavailable until a supported public integration exists.

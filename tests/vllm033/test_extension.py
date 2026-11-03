@@ -125,9 +125,28 @@ def test_factory_declares_the_adapter_api_and_migrated_capabilities() -> None:
     assert spec.api_version == 1
     assert spec.priority == 100
     assert spec.capabilities == frozenset(
-        {"lightop-rms-norm", "aiter-int8-moe"}
+        {"lightop-rms-norm"}
     )
     assert spec.activate is extension.activate_extension
+
+
+def test_operator_activation_does_not_require_or_modify_int8_routing(monkeypatch):
+    calls = []
+    base = successful_importer(calls)
+
+    def importer(name):
+        if name == "aiter.moe" or name.startswith("hcu_vllm_das.moe"):
+            raise AssertionError("Official INT8 routing must remain independent")
+        return base(name)
+
+    monkeypatch.setattr(extension, "_import_module", importer)
+    extension.activate_extension(context())
+    assert extension._activated is True
+    assert "hcu_vllm_das.rms_norm" in calls
+
+
+def test_extension_does_not_advertise_int8_without_public_registration():
+    assert "aiter-int8-moe" not in extension.extension_spec().capabilities
 
 
 def test_factory_does_not_claim_a_future_adapter_api() -> None:
@@ -212,12 +231,10 @@ def test_activation_accepts_the_vllm_033_release_line(
 
     assert calls == [
         "lightop.norm",
-        "aiter.moe",
         "vllm.model_executor.layers.layernorm",
         "vllm.utils.torch_utils",
         "vllm.envs",
         "hcu_vllm_das.rms_norm",
-        "hcu_vllm_das.moe.int8_oracle",
     ]
 
 
@@ -321,7 +338,7 @@ def test_missing_lightop_rmsnorm_symbol_fails_before_product_imports(
         ),
     ),
 )
-def test_missing_aiter_int8_symbol_fails_before_product_imports(
+def test_missing_aiter_int8_symbols_do_not_affect_rms_activation(
     monkeypatch: pytest.MonkeyPatch,
     replacement: object,
     message: str,
@@ -337,12 +354,10 @@ def test_missing_aiter_int8_symbol_fails_before_product_imports(
 
     monkeypatch.setattr(extension, "_import_module", changed_importer)
 
-    with pytest.raises(extension.DasExtensionError, match=message):
-        extension.activate_extension(context())
-
-    assert "hcu_vllm_das.rms_norm" not in calls
+    extension.activate_extension(context())
+    assert "aiter.moe" not in calls
     assert "hcu_vllm_das.moe.int8_oracle" not in calls
-    assert extension._activated is False
+    assert extension._activated is True
 
 
 @pytest.mark.parametrize(
@@ -360,7 +375,7 @@ def test_missing_aiter_int8_symbol_fails_before_product_imports(
         ),
     ),
 )
-def test_changed_aiter_abi_fails_before_product_imports(
+def test_changed_aiter_abi_does_not_affect_rms_activation(
     monkeypatch: pytest.MonkeyPatch,
     module_name: str,
     callable_name: str,
@@ -377,12 +392,10 @@ def test_changed_aiter_abi_fails_before_product_imports(
 
     monkeypatch.setattr(extension, "_import_module", changed_importer)
 
-    with pytest.raises(extension.DasExtensionError, match="signature changed"):
-        extension.activate_extension(context())
-
-    assert "hcu_vllm_das.rms_norm" not in calls
+    extension.activate_extension(context())
+    assert "aiter.moe" not in calls
     assert "hcu_vllm_das.moe.int8_oracle" not in calls
-    assert extension._activated is False
+    assert extension._activated is True
 
 
 @pytest.mark.parametrize(
@@ -436,16 +449,13 @@ def test_repeated_and_concurrent_activation_registers_capability_once(
     extension.activate_extension(context())
 
     assert calls.count("hcu_vllm_das.rms_norm") == 1
-    assert calls.count("hcu_vllm_das.moe.int8_oracle") == 1
-    assert importer.int8_oracle.installs == 1
+    assert importer.int8_oracle.installs == 0
     assert calls == [
         "lightop.norm",
-        "aiter.moe",
         "vllm.model_executor.layers.layernorm",
         "vllm.utils.torch_utils",
         "vllm.envs",
         "hcu_vllm_das.rms_norm",
-        "hcu_vllm_das.moe.int8_oracle",
     ]
 
 
