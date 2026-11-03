@@ -127,7 +127,9 @@ HCU_ADAPTER_HOST=none HIP_VISIBLE_DEVICES=-1 CUDA_VISIBLE_DEVICES=-1 \
 ```
 
 The listed wheel/provenance, selector and operator checks have passed. Broader
-loader/model integration, model accuracy, MTP, communication and performance
-remain open; prefix evidence above covers only Qwen2. No v0.32 score or wheel
+loader/model integration and model-accuracy gates remain open. Additional
+Qwen3 INT8/TP2, GLM MLA/EP/MTP, official communication and GDN observations
+are recorded separately in [the additional feature batch](vllm033-feature-batch.md);
+its exact scope and remaining gates apply. No v0.32 score or wheel
 hash is relabeled as v0.33. The old compatibility lock under `validation/v0.32.0`
 is retained unchanged; the new combination is not last-good.
