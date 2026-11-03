@@ -7,6 +7,7 @@ from importlib import import_module
 import logging
 from threading import Lock
 from typing import Callable
+from types import SimpleNamespace
 
 import torch
 
@@ -40,10 +41,70 @@ def _runtime_logger() -> logging.Logger:
 
 def _load_aiter_api() -> _AiterApi:
     module = import_module("aiter.moe")
+
+    def execute(**arguments):
+        solution = arguments["moe_config"].solution_type
+        if solution != "asm":
+            if solution == "ck":
+                arguments["expert_map"] = _aiter_expert_mask(arguments["expert_map"])
+            return module.aiter_moe(**arguments)
+        from .int8_asm import execute as execute_asm, unsupported_reason
+
+        native = import_module("aiter")
+        native_arguments = dict(
+            arguments, expert_map=_aiter_expert_mask(arguments["expert_map"])
+        )
+        reason = unsupported_reason(native_arguments, native)
+        if reason is None:
+            return execute_asm(native=native, **native_arguments)
+        hidden, w1, w2, topk = (
+            arguments[name] for name in ("hidden_states", "w1", "w2", "topk_ids")
+        )
+        problem = (
+            hidden.shape[0],
+            w1.shape[0],
+            w1.shape[1],
+            w2.shape[1],
+            hidden.shape[1],
+            topk.shape[1],
+        )
+        _record_once(
+            logging.WARNING,
+            f"fallback:{reason}",
+            problem,
+            "asm",
+            arguments["moe_config"],
+        )
+        # Fall back before any native launch, preserving the canonical map.
+        canonical_map = arguments["expert_map"]
+        return _triton_fallback(
+            hidden_states=hidden,
+            w1=w1,
+            w2=w2,
+            topk_weights=arguments["topk_weights"],
+            topk_ids=topk,
+            activation=arguments["activation"],
+            global_num_experts=arguments["global_num_experts"],
+            expert_map=canonical_map,
+            quant_config=SimpleNamespace(
+                **{
+                    name: arguments[name]
+                    for name in (
+                        "w1_scale",
+                        "w2_scale",
+                        "w1_zp",
+                        "w2_zp",
+                        "a1_scale",
+                        "a2_scale",
+                    )
+                }
+            ),
+        )
+
     return _AiterApi(
         quant_type_w8a8=module.MoeQuantType.W8A8,
         get_config=module.get_aiter_moe_config,
-        aiter_moe=module.aiter_moe,
+        aiter_moe=execute,
     )
 
 
@@ -240,11 +301,8 @@ def apply_aiter_int8_moe(
         a2_scale=getattr(quant_config, "a2_scale", None),
         block_shape=None,
         global_num_experts=global_num_experts,
-        # ASM/CK sorting takes a mask with a sentinel; Triton and MoE-C
-        # consume the canonical global-to-local map, including remote -1s.
-        expert_map=(
-            _aiter_expert_mask(expert_map) if solution in ("asm", "ck") else expert_map
-        ),
+        # Keep canonical routing until the final solution-specific boundary.
+        expert_map=expert_map,
         routed_scaling_factor=1.0,
         use_weight_shuffle=False,
         output_dtype=output_dtype,

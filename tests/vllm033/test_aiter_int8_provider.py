@@ -266,15 +266,26 @@ def test_native_aiter_receives_mask_derived_from_canonical_expert_map(
     arguments["expert_map"] = torch.tensor(expert_map, dtype=torch.int32)
     calls: list[dict[str, object]] = []
 
+    from hcu_vllm_das.moe import int8_asm
+
+    vendor = SimpleNamespace(
+        MoeQuantType=SimpleNamespace(W8A8="int8_w8a8"),
+        get_aiter_moe_config=lambda *a, **kw: (True, native_config()),
+        aiter_moe=lambda **kw: pytest.fail("ASM must use explicit stages"),
+    )
+    native = SimpleNamespace()
+    original_import = provider.import_module
     monkeypatch.setattr(
         provider,
-        "_load_aiter_api",
-        lambda: SimpleNamespace(
-            quant_type_w8a8="int8_w8a8",
-            get_config=lambda *args, **kwargs: (True, native_config()),
-            aiter_moe=lambda **kwargs: calls.append(kwargs) or object(),
-        ),
+        "import_module",
+        lambda name: vendor
+        if name == "aiter.moe"
+        else native
+        if name == "aiter"
+        else original_import(name),
     )
+    monkeypatch.setattr(int8_asm, "unsupported_reason", lambda a, n: None)
+    monkeypatch.setattr(int8_asm, "execute", lambda **kw: calls.append(kw) or object())
 
     provider.apply_aiter_int8_moe(**arguments)
 
