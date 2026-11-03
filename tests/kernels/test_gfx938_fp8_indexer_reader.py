@@ -489,3 +489,41 @@ def test_layer_split_sized_stride_with_high_page_ids_matches_oracle():
         q, strided, weights, lengths, table, max_len
     )
     _check(actual, expected)
+
+
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="requires HCU GPU")
+@pytest.mark.parametrize("fill_tail", [False, True])
+@pytest.mark.parametrize("per_query", [False, True])
+@pytest.mark.parametrize("page_size", [16, 32, 64])
+def test_token_major_compressor_layout_matches_oracle(page_size, per_query, fill_tail):
+    # Convert independently packed HIPC tiles back to the compressor's rows;
+    # preserve the scale region and permuted block table from the oracle case.
+    args, expected = _case(page_size, 4359, 2, 6, per_query)
+    q, cache, weights, context, table, max_len = args
+    dim = q.shape[-1]
+    raw = cache.reshape(cache.shape[0], -1)
+    values = raw[:, : page_size * dim].clone()
+    raw[:, : page_size * dim] = (
+        values.reshape(-1, page_size // 16, dim // 16, 16, 16)
+        .permute(0, 1, 3, 2, 4)
+        .reshape(-1, page_size * dim)
+    )
+    actual = gfx938_fp8_paged_mqa_logits(
+        *args, fill_tail=fill_tail, token_major=True
+    )
+    if fill_tail:
+        _check(actual, expected)
+    else:
+        ends = (
+            context if per_query else
+            context[:, None] - q.shape[1] + 1
+            + torch.arange(q.shape[1], device=context.device)
+        ).reshape(-1)
+        valid = torch.arange(max_len, device=q.device)[None, :] < ends[:, None]
+        assert torch.equal(
+            torch.isneginf(actual[valid]), torch.isneginf(expected[valid])
+        )
+        finite = valid & torch.isfinite(expected)
+        torch.testing.assert_close(
+            actual[finite], expected[finite], rtol=1e-3, atol=1e-2
+        )
