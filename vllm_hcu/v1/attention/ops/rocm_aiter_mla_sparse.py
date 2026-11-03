@@ -1545,6 +1545,15 @@ def _lightop_topk_indices_decode(
     topk_tokens: int,
 ) -> None:
     row_ends = _decode_row_ends_from_seq_lens(seq_lens, next_n, logits.shape[0])
+    if topk_tokens == 2048:
+        row_ends = row_ends.to(device=logits.device, dtype=torch.int32).contiguous()
+        row_starts = torch.zeros_like(row_ends)
+        selected = _get_lightop_attention().fast_topk_transform_ragged_fused(
+            logits.contiguous(), row_ends, row_starts, topk_tokens,
+            row_starts=row_starts,
+        )
+        topk_indices.copy_(selected)
+        return
     _get_lightop_attention().top_k_per_row_decode(
         logits,
         1,
@@ -1952,6 +1961,7 @@ def rocm_aiter_sparse_attn_indexer_native(
             # merge gathers scores only at those selected indices, so no
             # decode consumer reads the unwritten tail.
             clean_logits=False,
+            kcache_layout="normal" if on_gfx938() else "preshuffle",
         )
 
         # A padded decode batch has more kernel rows than actual decode

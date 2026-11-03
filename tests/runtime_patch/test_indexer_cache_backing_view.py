@@ -2,6 +2,9 @@
 # SPDX-FileCopyrightText: Copyright (c) 2026 Hygon Information Technology Co., Ltd.
 """CPU contracts for sparse-indexer KV-cache backing views."""
 
+from types import SimpleNamespace
+
+import pytest
 import torch
 
 from vllm_hcu.v1.attention.ops import rocm_aiter_mla_sparse as sparse
@@ -129,3 +132,55 @@ def test_bf16_gather_passes_logical_4d_cache_as_nhd_to_kernel(monkeypatch):
     assert kernel.args[0].shape == (3, 64 * 128)
     assert kernel.args[0].stride(0) == 64 * 128
     assert kernel.args[4:10] == (64, 1, 2, 64 * 128, 128, 2)
+
+
+@pytest.mark.parametrize("gfx938", [False, True])
+def test_native_decode_matches_custom_op_writer_layout(monkeypatch, gfx938):
+    from vllm import _custom_ops as ops
+
+    prefix = "test.indexer"
+    decode = SimpleNamespace(
+        decode_lens=torch.tensor([1], dtype=torch.int32),
+        requires_padding=False,
+        seq_lens=torch.tensor([[4]], dtype=torch.int32),
+        block_table=torch.tensor([[0]], dtype=torch.int32),
+        schedule_metadata=None,
+    )
+    metadata = SimpleNamespace(
+        num_kv_actual_tokens=1,
+        slot_mapping=torch.tensor([3], dtype=torch.int64),
+        num_decodes=1,
+        num_prefills=0,
+        num_decode_tokens=1,
+        decode=decode,
+    )
+    monkeypatch.setattr(sparse, "DeepseekV32IndexerMetadata", SimpleNamespace)
+    monkeypatch.setattr(
+        sparse, "get_forward_context",
+        lambda: SimpleNamespace(attn_metadata={prefix: metadata}),
+    )
+    monkeypatch.setattr(sparse, "on_gfx938", lambda: gfx938)
+    monkeypatch.setattr(sparse, "_use_lightop_sparse_mla_topk", lambda: False)
+    monkeypatch.setattr(ops, "indexer_k_quant_and_cache", lambda *args: None)
+    monkeypatch.setattr(sparse, "indexer_k_bf16_cache_triton", lambda *args: None)
+    calls = []
+
+    def logits(*args, **kwargs):
+        calls.append(kwargs)
+        return torch.tensor([[1.0, 3.0, 2.0, 0.0, -torch.inf, -torch.inf]])
+
+    monkeypatch.setattr(sparse, "rocm_fp8_paged_mqa_logits", logits)
+    output = torch.empty((1, 2), dtype=torch.int32)
+    result = sparse.rocm_aiter_sparse_attn_indexer_native(
+        torch.zeros((1, 8)), prefix,
+        torch.zeros((1, 64, 132), dtype=torch.uint8),
+        torch.zeros((1, 2, 128), dtype=torch.bfloat16).to(torch.float8_e4m3fn),
+        torch.zeros((1, 128), dtype=torch.bfloat16),
+        torch.ones((1, 2), dtype=torch.float32),
+        128, "ue8m0", 2, 128, 6, None, output,
+    )
+    assert calls == [{
+        "max_model_len": 6,
+        "kcache_layout": "normal" if gfx938 else "preshuffle",
+    }]
+    assert set(result[0].tolist()) == {1, 2}
