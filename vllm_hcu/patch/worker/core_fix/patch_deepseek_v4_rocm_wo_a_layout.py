@@ -7,6 +7,8 @@ from __future__ import annotations
 import functools
 from types import ModuleType, SimpleNamespace
 
+from vllm_hcu.platforms import envs as henvs
+
 from ._common import (
     PatchCompatibilityError,
     load_exact_module,
@@ -59,7 +61,17 @@ def apply_to_module(module: ModuleType) -> bool:
 
         # Quantized wo_a retains upstream storage.  Only the unquantized BF16
         # parameter is transposed by HCU's VLLM_USE_NN linear loader.
-        if hasattr(wo_a, "weight_scale_inv") or tuple(weight.shape) == expected_shape:
+        if hasattr(wo_a, "weight_scale_inv") or hasattr(wo_a, "weight_scale"):
+            return original(wo_a, n_local_groups, o_lora_rank, hidden_dim)
+        # Pro TP4 produces a square [4096, 4096] shard, so physical shape
+        # cannot distinguish NN from NT. Consult the HCU linear loader's
+        # layout contract in that case; quantized and upstream layers retain NT.
+        square_nn = (
+            expected_shape == nn_shape
+            and henvs.VLLM_USE_NN
+            and getattr(wo_a, "is_quantization", None) is False
+        )
+        if tuple(weight.shape) == expected_shape and not square_nn:
             return original(wo_a, n_local_groups, o_lora_rank, hidden_dim)
         if tuple(weight.shape) != nn_shape:
             raise RuntimeError(
