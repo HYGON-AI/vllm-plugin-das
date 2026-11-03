@@ -31,6 +31,8 @@ from . import (
     patch_envs,
     patch_hy_v3_reasoning_parser,
     patch_hy_v3_tool_parser,
+    patch_step5_reasoning_parser,
+    patch_step5_tool_parser,
     patch_import_utils,
     patch_layer_name,
     patch_nixl_utils,
@@ -64,6 +66,8 @@ _ORDERED_ADAPTERS = (
     patch_step5_splitting_ops,
     patch_step5_compile_prefix,
     patch_step5_ep_graph_capture,
+    patch_step5_reasoning_parser,
+    patch_step5_tool_parser,
 )
 
 
