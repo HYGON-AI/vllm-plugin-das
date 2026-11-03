@@ -3,13 +3,14 @@
 """Portable ownership/build contracts; graph/speculation remain gated off."""
 
 import ast
+import sys
 from types import ModuleType, SimpleNamespace
 
 import pytest
 import torch
 
 from tests.fixtures.vllm_source import resolve_target_vllm_root
-from tests.runtime_patch.test_deepseek_v41_flashmla_decode import inputs, model
+from tests.runtime_patch.test_deepseek_v41_flashmla_decode import cpu_decode_indices, inputs, model
 from vllm_hcu.patch.worker.op_opt import (
     patch_deepseek_v41_rocm_flashmla_decode as decode_patch,
     patch_deepseek_v41_rocm_flashmla_metadata as patch,
@@ -32,6 +33,10 @@ def enabled(monkeypatch):
     monkeypatch.setenv("VLLM_HCU_DSV41_FLASHMLA_DECODE", "1")
     monkeypatch.setattr(runtime, "_supported_device", lambda q: True)
     monkeypatch.setattr(torch.cuda, "is_current_stream_capturing", lambda: False)
+    monkeypatch.setitem(
+        sys.modules, "vllm_hcu.v1.attention.ops.deepseek_v41_decode_indices",
+        SimpleNamespace(prepare_decode_indices=cpu_decode_indices),
+    )
 
 
 def builder():

@@ -187,30 +187,19 @@ def try_flashmla_decode(
     if bindings is None:
         _log_fallback("native FlashMLA decode unavailable")
         return False
-    kernel, map_indices, get_metadata = bindings
+    kernel, _map_indices, get_metadata = bindings
     # Framework metadata owns per-layer leases. Raw holders remain supported
     # for standalone callers and pre-patch metadata; never initialize a shared
     # per-type holder in place. Consume only after every fallback check passes.
     plan = scheduler.take() if isinstance(scheduler, DecodeScheduler) else get_metadata()[0]
-    extra_indices, extra_lens = None, None
-    if kv_cache is not None:
-        extra_indices, extra_lens = map_indices(
-            topk_indices, token_to_req_indices, block_table, kv_cache.shape[1],
-            is_valid_token,
-        )
-        # The model utility counts but does not compact scattered -1 holes.
-        # Sort valid physical slots before the sentinels, keeping duplicates.
-        sentinel = torch.iinfo(torch.int32).max
-        extra_indices = torch.where(extra_indices >= 0, extra_indices, sentinel)
-        extra_indices = extra_indices.sort(dim=-1).values.view(q.shape[0], 1, -1)
-        columns = torch.arange(extra_indices.shape[-1], device=q.device)
-        extra_indices = torch.where(
-            columns[None, None, :] < extra_lens[:, None, None], extra_indices, -1,
-        )
-    main_indices = swa_indices.reshape(q.shape[0], 1, -1)
-    columns = torch.arange(main_indices.shape[-1], device=q.device)
-    main_indices = torch.where(
-        columns[None, None, :] < swa_lens[:, None, None], main_indices, -1,
+    from vllm_hcu.v1.attention.ops.deepseek_v41_decode_indices import prepare_decode_indices
+
+    main_indices, extra_indices, extra_lens = prepare_decode_indices(
+        swa_indices, swa_lens,
+        topk_indices if kv_cache is not None else None,
+        token_to_req_indices, block_table,
+        kv_cache.shape[1] if kv_cache is not None else 1,
+        is_valid_token,
     )
     result, _ = kernel(
         # One native batch row per query token, including DSpark verify/draft.

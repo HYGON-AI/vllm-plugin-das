@@ -791,6 +791,72 @@ def test_hcu_worker_rejects_model_runner_v1(cpu_safe_hcu_worker_module):
         )
 
 
+def test_worker_profiler_windows_align_across_real_dummy_and_empty_dp_batches(
+    monkeypatch, cpu_safe_hcu_worker_module,
+):
+    import torch
+
+    worker_module = cpu_safe_hcu_worker_module
+    dummy_calls = []
+    monkeypatch.setattr(
+        worker_module.Worker, "execute_dummy_batch",
+        lambda self: dummy_calls.append(self), raising=False,
+    )
+    def annotate_profile(worker, scheduler_output):
+        from contextlib import nullcontext
+
+        worker.profiler.step()
+        return nullcontext()
+
+    monkeypatch.setattr(
+        worker_module.Worker, "annotate_profile", annotate_profile, raising=False,
+    )
+    capture_rounds = []
+    for rank in range(8):
+        worker = object.__new__(worker_module.HcuGPUWorker)
+        completed_rounds = []
+        current_round = 0
+        profiler = torch.profiler.profile(
+            activities=[torch.profiler.ProfilerActivity.CPU],
+            schedule=torch.profiler.schedule(wait=2, warmup=1, active=2, repeat=1),
+            on_trace_ready=lambda profile: completed_rounds.append(current_round),
+        )
+        worker.profiler = profiler
+        with profiler:
+            for current_round in range(1, 13):
+                for empty_batch in range(rank % 3):
+                    with worker.annotate_profile(
+                        SimpleNamespace(total_num_scheduled_tokens=0)
+                    ):
+                        pass
+                if (current_round + rank) % 3:
+                    with worker.annotate_profile(
+                        SimpleNamespace(total_num_scheduled_tokens=6)
+                    ):
+                        pass
+                else:
+                    worker.execute_dummy_batch()
+        capture_rounds.append(completed_rounds)
+
+    assert len(dummy_calls) == 32
+    assert capture_rounds == [[5]] * 8
+
+
+def test_worker_dummy_batch_without_profiler_preserves_parent_execution(
+    monkeypatch, cpu_safe_hcu_worker_module,
+):
+    worker_module = cpu_safe_hcu_worker_module
+    calls = []
+    monkeypatch.setattr(
+        worker_module.Worker, "execute_dummy_batch",
+        lambda self: calls.append(self), raising=False,
+    )
+    worker = object.__new__(worker_module.HcuGPUWorker)
+    worker.profiler = None
+    worker.execute_dummy_batch()
+    assert calls == [worker]
+
+
 def test_explicit_model_runner_v2_config(monkeypatch):
     from vllm import envs
     from vllm.config import AttentionConfig, VllmConfig

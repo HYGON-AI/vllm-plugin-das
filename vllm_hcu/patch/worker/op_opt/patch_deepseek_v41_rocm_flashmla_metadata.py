@@ -1,9 +1,10 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright (c) 2026 Hygon Information Technology Co., Ltd.
-"""Attach isolated native decode schedulers to V4.1 ROCm SWA metadata.
+"""Build V4.1 ROCm SWA metadata and attach isolated native decode schedulers.
 
-Wrap the final ROCm builder, retaining V4.1/PCP indices and original ragged
-fallback buffers. Do not bypass the inheritance chain or change V4 builders.
+Wrap the final ROCm builder, with an optional fused decode path writing its
+persistent dense and ragged buffers. Other batches retain the V4.1/PCP builder
+inheritance chain and original ragged post-process.
 
 Installed ROCm ``DeepseekV4ROCMAiterSparseSWAMetadataBuilder.build`` may omit
 ``replay_start`` while its parent (plugin ``DeepseekSparseSWAMetadataBuilder`` /
@@ -148,7 +149,19 @@ def apply_to_module(module: ModuleType) -> bool:
         fast_build=False,
         replay_start=None,
     ):
-        if supports_replay_start:
+        metadata = None
+        if hasattr(self, "no_replay_start"):
+            from vllm_hcu.v1.attention.ops.deepseek_v41_swa_metadata import (
+                build_fused_decode_metadata,
+            )
+
+            metadata = build_fused_decode_metadata(
+                self,
+                common_attn_metadata,
+                replay_start,
+                target.DeepseekV4ROCMAiterSparseSWAMetadata,
+            )
+        if metadata is None and supports_replay_start:
             metadata = original(
                 self,
                 common_prefix_len,
@@ -156,14 +169,14 @@ def apply_to_module(module: ModuleType) -> bool:
                 fast_build,
                 replay_start=replay_start,
             )
-        elif replay_start is None:
+        elif metadata is None and replay_start is None:
             metadata = original(
                 self,
                 common_prefix_len,
                 common_attn_metadata,
                 fast_build,
             )
-        else:
+        elif metadata is None:
             # Installed ROCm build drops replay_start; parent already has it.
             if parent_with_replay is None:
                 raise TypeError(
