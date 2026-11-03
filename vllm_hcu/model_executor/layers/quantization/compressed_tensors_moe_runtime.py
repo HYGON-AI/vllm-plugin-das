@@ -696,14 +696,205 @@ def _clamped_w4a8_triton_experts_cls() -> type:
 
     global _CLAMPED_W4A8_TRITON_EXPERTS_CLS
     if _CLAMPED_W4A8_TRITON_EXPERTS_CLS is None:
+        from inspect import signature
+
+        from vllm.model_executor.layers.fused_moe.activation import MoEActivation
+        from vllm.model_executor.layers.fused_moe.experts import triton_moe
         from vllm.model_executor.layers.fused_moe.experts.triton_moe import (
             TritonExperts,
         )
 
+        expected_parameters = (
+            "self",
+            "output",
+            "hidden_states",
+            "w1",
+            "w2",
+            "topk_weights",
+            "topk_ids",
+            "activation",
+            "global_num_experts",
+            "expert_map",
+            "a1q_scale",
+            "a2_scale",
+            "workspace13",
+            "workspace2",
+            "expert_tokens_meta",
+            "apply_router_weight_on_input",
+        )
+        if tuple(signature(TritonExperts.apply).parameters) != expected_parameters:
+            raise HcuCompressedTensorsMoeError(
+                "clamped W4A8 requires the audited TritonExperts.apply contract"
+            )
+
         class ClampedW4A8TritonExperts(TritonExperts):
+            @staticmethod
+            def supports_lora() -> bool:
+                return False
+
             @property
             def expects_unquantized_inputs(self) -> bool:
                 return True
+
+            def apply(
+                self,
+                output: torch.Tensor,
+                hidden_states: torch.Tensor,
+                w1: torch.Tensor,
+                w2: torch.Tensor,
+                topk_weights: torch.Tensor,
+                topk_ids: torch.Tensor,
+                activation: MoEActivation,
+                global_num_experts: int,
+                expert_map: torch.Tensor | None,
+                a1q_scale: torch.Tensor | None,
+                a2_scale: torch.Tensor | None,
+                workspace13: torch.Tensor,
+                workspace2: torch.Tensor,
+                expert_tokens_meta: object | None,
+                apply_router_weight_on_input: bool,
+            ) -> None:
+                # W8A8 mainline from vLLM 752a3a504485790a2e8491cacbb35c137339ad34
+                # TritonExperts.apply. Keep float compute/workspace types before
+                # deferred INT8 quantization; the Triton GEMM still accumulates
+                # and dequantizes in FP32. LoRA/FP8/WNA16 are outside this adapter.
+                del expert_tokens_meta
+                if (
+                    self._lora_context is not None
+                    or self.quantization_emulation
+                    or self.quant_dtype != torch.int8
+                    or self.weight_quant_dtype != "int4"
+                    or not self.per_act_token_quant
+                    or self.block_shape is not None
+                    or activation != MoEActivation.SILU
+                    or self.gemm1_clamp_limit is None
+                    or self.gemm1_clamp_limit <= 0
+                ):
+                    raise HcuCompressedTensorsMoeError(
+                        "clamped W4A8 supports only unpacked INT8 weights, "
+                        "per-token INT8 activations and clamped SiLU without LoRA"
+                    )
+                compute_types = {
+                    torch.bfloat16: triton_moe.tl.bfloat16,
+                    torch.float16: triton_moe.tl.float16,
+                    torch.float32: triton_moe.tl.float32,
+                }
+                if hidden_states.dtype not in compute_types or a1q_scale is not None:
+                    raise HcuCompressedTensorsMoeError(
+                        "clamped W4A8 requires unquantized BF16/FP16/FP32 inputs"
+                    )
+                compute_type = compute_types[hidden_states.dtype]
+                if any(
+                    tensor.dtype != hidden_states.dtype
+                    for tensor in (output, workspace13, workspace2)
+                ):
+                    raise HcuCompressedTensorsMoeError(
+                        "clamped W4A8 output and workspaces must match input dtype"
+                    )
+                assert hidden_states.dim() == 2 and hidden_states.is_contiguous()
+                assert w1.dtype == w2.dtype == torch.int8
+                assert w1.stride(-1) == w2.stride(-1) == 1
+                assert hidden_states.size(-1) == w1.size(2)
+                assert topk_weights.shape == topk_ids.shape
+                E, num_tokens, N, K, top_k_num = self.moe_problem_size(
+                    hidden_states, w1, w2, topk_ids
+                )
+                if global_num_experts == -1:
+                    global_num_experts = E
+                config = triton_moe.try_get_optimal_moe_config(
+                    w1.size(),
+                    w2.size(),
+                    top_k_num,
+                    self.quant_config.config_name(hidden_states.dtype),
+                    num_tokens,
+                    block_shape=self.block_shape,
+                )
+                hidden_states, a1q_scale = triton_moe.moe_kernel_quantize_input(
+                    hidden_states,
+                    self.a1_scale,
+                    self.quant_dtype,
+                    self.per_act_token_quant,
+                    self.block_shape,
+                    quantization_emulation=False,
+                )
+                cache1 = triton_moe._resize_cache(
+                    workspace2, (num_tokens, top_k_num, N)
+                )
+                cache2 = triton_moe._resize_cache(
+                    workspace13,
+                    (
+                        num_tokens * top_k_num,
+                        self.adjust_N_for_activation(N, activation),
+                    ),
+                )
+                cache3 = triton_moe._resize_cache(
+                    workspace2, (num_tokens, top_k_num, K)
+                )
+                sorted_ids, expert_ids, num_padded = (
+                    triton_moe._prepare_expert_assignment(
+                        topk_ids,
+                        config,
+                        num_tokens,
+                        top_k_num,
+                        global_num_experts,
+                        expert_map,
+                        use_int8_w8a16=False,
+                        use_int4_w4a16=False,
+                        block_shape=self.block_shape,
+                    )
+                )
+                kernel_options = {
+                    "compute_type": compute_type,
+                    "use_fp8_w8a8": False,
+                    "use_int8_w8a8": True,
+                    "use_int8_w8a16": False,
+                    "use_int4_w4a16": False,
+                    "per_channel_quant": self.per_act_token_quant,
+                    "block_shape": self.block_shape,
+                }
+                triton_moe.invoke_fused_moe_triton_kernel(
+                    hidden_states,
+                    w1,
+                    cache1,
+                    a1q_scale,
+                    self.w1_scale,
+                    None,
+                    sorted_ids,
+                    expert_ids,
+                    num_padded,
+                    False,
+                    top_k_num,
+                    config,
+                    B_bias=self.w1_bias,
+                    **kernel_options,
+                )
+                self.activation(activation, cache2, cache1.view(-1, N))
+                qcache2, a2q_scale = triton_moe.moe_kernel_quantize_input(
+                    cache2,
+                    a2_scale,
+                    self.quant_dtype,
+                    self.per_act_token_quant,
+                    self.block_shape,
+                    quantization_emulation=False,
+                )
+                # prepare/finalize has already weighted inputs when requested.
+                triton_moe.invoke_fused_moe_triton_kernel(
+                    qcache2,
+                    w2,
+                    cache3,
+                    a2q_scale,
+                    self.w2_scale,
+                    topk_weights,
+                    sorted_ids,
+                    expert_ids,
+                    num_padded,
+                    not apply_router_weight_on_input,
+                    1,
+                    config,
+                    B_bias=self.w2_bias,
+                    **kernel_options,
+                )
+                self.moe_sum(cache3, output)
 
         _CLAMPED_W4A8_TRITON_EXPERTS_CLS = ClampedW4A8TritonExperts
     return _CLAMPED_W4A8_TRITON_EXPERTS_CLS
