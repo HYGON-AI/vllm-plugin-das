@@ -108,3 +108,18 @@ nonaliasing and inactive/dummy `-1` checks. They do not prove constructor,
 device-stream ordering, dedicated Graph or DP acceptance. Native AITER AR,
 W4A8 lifecycle, sparse MLA, other architectures and broader model/topology/
 performance requirements remain separate unfinished tasks.
+
+
+## Hybrid-quality follow-up
+
+See [hybrid-quality investigation](vllm033-hybrid-quality.md) and
+`validation/v0.33.0/hybrid-quality-gfx936-candidate.json`. Original MTP3 new
+failure/0 remains recorded. The diagnostic pair has15/14 with new failure/20;
+MTPoff13/13 still loses/2 and gains/20. Same-input operator query-shape
+dependence is confirmed, but the continuous-KV Graph diagnosis excludes
+paged gather and model quality. No production fix or merge is claimed.
+The earlier review's failure IDs describe its frozen original profile; they
+are not silently replaced by these diagnostics. BF16 MoE admission/neutral
+ABI work belongs to Adapter around the official expert and is not an added
+Plugin merge prerequisite. All owned jobs exited and latest ports18161–18164
+are closed. Goal remains active;1passed/46partial/101not-run,last_good=false.
