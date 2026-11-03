@@ -283,6 +283,14 @@ class HcuGPUModelRunnerV2(GPUModelRunner):
             for model in (self.model, self.get_draft_model()):
                 skinny_lm_head.enable_for_model(model)
 
+    def reload_weights(self, *args, **kwargs) -> None:
+        super().reload_weights(*args, **kwargs)
+        from vllm_hcu.patch.worker.core_fix.patch_deepseek_v4_rocm_wo_a_layout import (
+            refresh_wo_a_bf16_caches,
+        )
+
+        refresh_wo_a_bf16_caches(self.get_model())
+
     @property
     def pcp_manager_cls(self):
         if self._hcu_pcp_manager_cls is None:
