@@ -554,6 +554,47 @@ def test_lightop_int8_clamped_silu_quant_matches_vllm_for_ht_and_ll() -> None:
         assert error.max() < 0.07
 
 
+def test_persistent_int8_clamped_silu_quant_matches_vllm() -> None:
+    from vllm_hcu.model_executor.layers.fused_moe.experts.batched_deep_gemm_moe import (
+        persistent_masked_m_silu_mul_clamp_int8_quant,
+    )
+
+    device = _hcu_device()
+    generator = torch.Generator(device=device).manual_seed(743)
+    limit = 10.0
+    value = torch.randn(
+        (2, 32, 4096),
+        generator=generator,
+        device=device,
+        dtype=torch.bfloat16,
+    )
+    # The first expert intentionally exceeds the persistent parallel-token
+    # count so the grid-stride loop is covered.
+    token_counts_storage = torch.tensor(
+        [19, 0, 5, 0], device=device, dtype=torch.int32
+    )
+    tokens_per_expert = token_counts_storage[::2]
+
+    quantized, scales = persistent_masked_m_silu_mul_clamp_int8_quant(
+        value,
+        tokens_per_expert,
+        limit=limit,
+    )
+
+    gate, up = value.float().chunk(2, dim=-1)
+    expected = functional.silu(gate.clamp(max=limit)) * up.clamp(
+        min=-limit,
+        max=limit,
+    )
+    for expert, count in enumerate(tokens_per_expert.tolist()):
+        error = (
+            quantized[expert, :count].float() * scales[expert, :count]
+            - expected[expert, :count]
+        ).abs()
+        assert error.mean() < 1.5e-2
+        assert error.max() < 0.07
+
+
 def test_dspark_non_pcp_lightop_context_insert_writes_fp8_cache() -> None:
     from vllm_hcu.models.deepseek_v4_dspark import _insert_context_kv
 

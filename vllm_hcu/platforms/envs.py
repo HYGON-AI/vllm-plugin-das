@@ -19,6 +19,8 @@ if TYPE_CHECKING:
     VLLM_HCU_USE_CAT_MLA: bool = False
     VLLM_HCU_DISABLE_DSA: bool = False
     VLLM_HCU_USE_FP8_MIXED_BATCH: bool = False
+    VLLM_HCU_SPARSE_MLA_PREFILL_WORKSPACE_DEDUP: bool = False
+    VLLM_HCU_ENABLE_BYTELEVEL_DETOKENIZER_TAIL: bool = False
     VLLM_HCU_USE_CUSTOM_QUANTIZATION_GEMM: bool = True
     VLLM_HCU_USE_CUSTOM_OPS : bool = False
     VLLM_HCU_USE_CUSTOM_SILU_AND_MUL : bool = False
@@ -43,6 +45,8 @@ if TYPE_CHECKING:
     VLLM_HCU_USE_LIGHTOP_TOPK: bool = False
     VLLM_HCU_USE_LIGHTOP_SPARSE_MLA_TOPK: bool = True
     VLLM_HCU_USE_LIGHTOP_FAST_TOPK_TRANSFORM: bool = True
+    VLLM_HCU_ENABLE_PREFILL_MQA_GROUPING: bool = False
+    VLLM_HCU_PREFILL_MQA_GROUP_MIN_SAVED_CELLS: int = 2_000_000
     VLLM_HCU_USE_AITER_OPUS_PAGED_MQA_LOGITS: bool = True
     VLLM_DCP_Q_REPLICATE: bool = False
     VLLM_HCU_USE_AITER_MHC: bool = True
@@ -52,6 +56,7 @@ if TYPE_CHECKING:
     VLLM_HCU_DEEPSEEK_V4_ROCM_FLASHMLA_PREFILL: bool = True
     VLLM_HCU_HYV4_FP8_KV_DEQUANT: bool = False
     VLLM_HCU_ENABLE_HYV4_GATE_A2A_OVERLAP: bool = False
+    VLLM_HCU_ENABLE_HYV4_ATTN_INPUT_OVERLAP: bool = False
     VLLM_HCU_DEEPSEEK_V4_ROCM_FAST_WOA: bool = True
     VLLM_HCU_ENABLE_DEEPSEEK_V4_MULTI_STREAM: bool = True
     VLLM_HCU_DEEPSEEK_V4_MULTI_STREAM_GEMM_TOKEN_THRESHOLD: int = 16384
@@ -170,6 +175,10 @@ def resolve_hcu_flash_attn_mode(explicit_mode: Optional[str]) -> str:
     return "varlen"
 
 hcu_vllm_environment_variables: dict[str, Callable[[], Any]] = {
+    "VLLM_HCU_SPARSE_MLA_PREFILL_WORKSPACE_DEDUP":
+    lambda: _environment_flag(os.getenv("VLLM_HCU_SPARSE_MLA_PREFILL_WORKSPACE_DEDUP", "0")),
+    "VLLM_HCU_ENABLE_BYTELEVEL_DETOKENIZER_TAIL":
+    lambda: _environment_flag(os.getenv("VLLM_HCU_ENABLE_BYTELEVEL_DETOKENIZER_TAIL", "0")),
     # path to the logs of redirect-output, abstrac of related are ok
 
     # If set, vLLM will transpose weight to use nn layout.
@@ -318,6 +327,12 @@ hcu_vllm_environment_variables: dict[str, Callable[[], Any]] = {
             "VLLM_HCU_USE_LIGHTOP_FAST_TOPK_TRANSFORM", "True"
         ).lower() in ("true", "1")),
 
+    # Experimental eager FP8 prefill grouping; decode is unaffected.
+    "VLLM_HCU_ENABLE_PREFILL_MQA_GROUPING":
+        lambda: os.getenv("VLLM_HCU_ENABLE_PREFILL_MQA_GROUPING", "0").lower() in ("1", "true"),
+    "VLLM_HCU_PREFILL_MQA_GROUP_MIN_SAVED_CELLS":
+        lambda: int(os.getenv("VLLM_HCU_PREFILL_MQA_GROUP_MIN_SAVED_CELLS", "2000000")),
+
     # Use AITER Opus paged-MQA for HCU DSA decode by default.
     "VLLM_HCU_USE_AITER_OPUS_PAGED_MQA_LOGITS":
         lambda: (os.environ.get(
@@ -366,6 +381,12 @@ hcu_vllm_environment_variables: dict[str, Callable[[], Any]] = {
     "VLLM_HCU_ENABLE_HYV4_GATE_A2A_OVERLAP":
         lambda: (os.environ.get(
             "VLLM_HCU_ENABLE_HYV4_GATE_A2A_OVERLAP", "False"
+        ).lower() in ("true", "1")),
+
+    # Overlap HY V4's independent Q and KV-A input projections.
+    "VLLM_HCU_ENABLE_HYV4_ATTN_INPUT_OVERLAP":
+        lambda: (os.environ.get(
+            "VLLM_HCU_ENABLE_HYV4_ATTN_INPUT_OVERLAP", "False"
         ).lower() in ("true", "1")),
 
     # Whether to use the local inverse-RoPE + BF16 einsum path for DeepSeek V4 ROCm WO_A.

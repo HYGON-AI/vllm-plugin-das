@@ -7,12 +7,18 @@ import re
 from collections.abc import Iterable, Iterator
 
 import torch
+from compressed_tensors.quantization import (
+    QuantizationStrategy,
+    QuantizationType,
+)
 
 from .slimquant_facade import SlimQuantW4A8Facade
 
 CHECKPOINT_FORMAT = "hy4-w4a8-custom-v1"
 NATIVE_FORMAT = "hy4_w4a8_v1"
 PACKING = "signed nibble, even input in low bits"
+PACKED_EXPERT_ADAPTER_MARKER = "_vllm_hcu_hyv4_packed_expert_adapter"
+_ROUTED_EXPERTS_TARGET = type("RoutedExperts", (), {})()
 
 
 class HYV4W4A8Facade(SlimQuantW4A8Facade):
@@ -116,4 +122,82 @@ def adapt_checkpoint_weights(quant_config, weights):
 
         if isinstance(quant_config, HYV4W4A8Config):
             return quant_config.adapt_weights(weights)
+    get_name = getattr(quant_config, "get_name", None)
+    if callable(get_name) and get_name() == "compressed-tensors":
+        setattr(quant_config, PACKED_EXPERT_ADAPTER_MARKER, True)
+        return _adapt_compressed_tensors_experts(quant_config, weights)
     return weights
+
+
+def _is_supported_compressed_expert(quant_config, name: str) -> bool:
+    add_fused_moe = getattr(
+        quant_config, "_add_fused_moe_to_target_scheme_map", None
+    )
+    get_scheme_dict = getattr(quant_config, "get_scheme_dict", None)
+    if not callable(add_fused_moe) or not callable(get_scheme_dict):
+        return False
+    add_fused_moe()
+    layer_name = re.sub(
+        r"\.\d+\.(?:gate_proj|up_proj|down_proj)$", "", name
+    )
+    if layer_name == name:
+        return False
+    schemes = [
+        get_scheme_dict(
+            _ROUTED_EXPERTS_TARGET,
+            layer_name=layer_name + projection,
+        )
+        for projection in (".0.gate_proj", ".0.up_proj", ".0.down_proj")
+    ]
+    scheme = schemes[-1]
+    if not all(candidate == scheme for candidate in schemes[:-1]):
+        return False
+    if not isinstance(scheme, dict):
+        return False
+    weight = scheme.get("weights")
+    activation = scheme.get("input_activations")
+    return bool(
+        scheme.get("format") == "pack-quantized"
+        and weight is not None
+        and weight.num_bits == 4
+        and weight.type == QuantizationType.INT
+        and weight.strategy == QuantizationStrategy.CHANNEL
+        and weight.symmetric
+        and not weight.dynamic
+        and weight.group_size in (None, -1)
+        and activation is not None
+        and activation.num_bits == 8
+        and activation.type == QuantizationType.INT
+        and activation.strategy == QuantizationStrategy.TOKEN
+        and activation.symmetric
+        and activation.dynamic
+    )
+
+
+def _adapt_compressed_tensors_experts(
+    quant_config,
+    weights: Iterable[tuple[str, torch.Tensor]],
+) -> Iterator[tuple[str, torch.Tensor]]:
+    """Rename split expert tensors before PP-local parameter loading."""
+    expert = re.compile(r"\.mlp\.experts\.\d+\.")
+    for name, weight in weights:
+        match = expert.search(name)
+        projection_name = re.sub(
+            r"\.(?:weight_packed|weight_scale|weight_shape)$", "", name
+        )
+        if match is None or not _is_supported_compressed_expert(
+            quant_config, projection_name
+        ):
+            yield name, weight
+            continue
+        if name.endswith(".weight_shape"):
+            continue
+        if name.endswith(".weight_packed"):
+            if weight.dtype != torch.int32 or weight.ndim != 2:
+                raise ValueError(
+                    "HYV4 compressed-tensors expert weight_packed must be "
+                    "rank-2 INT32"
+                )
+            yield name.removesuffix(".weight_packed") + ".weight", weight
+            continue
+        yield name, weight

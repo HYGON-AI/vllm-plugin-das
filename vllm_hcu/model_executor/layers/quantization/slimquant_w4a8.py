@@ -22,6 +22,11 @@ from vllm.model_executor.layers.quantization.compressed_tensors.schemes import (
     CompressedTensorsW8A8Int8,
 )
 from vllm.model_executor.utils import set_weight_attrs
+from vllm_hcu.model_executor.layers.quantization.int8_runtime import (
+    apply_int8_linear,
+)
+from vllm_hcu.platforms import envs as henvs
+
 
 class SlimQuantW4A8Int8Config(QuantizationConfig):
     """SlimQuant W4A8 configuration.
@@ -102,12 +107,29 @@ class SlimQuantW4A8Int8LinearMethod(LinearMethodBase):
         layer: torch.nn.Module,
         x: torch.Tensor,
         bias: torch.Tensor | None = None,
+        x_and_scale_quanted: tuple[torch.Tensor, torch.Tensor] | None = None,
     ):
         """Apply the layer's compressed linear scheme."""
         scheme = layer.scheme
         if scheme is None:
             raise ValueError("A scheme must be defined for each layer")
+        if x_and_scale_quanted is not None and self.supports_quanted_inputs():
+            return apply_int8_linear(
+                input=x,
+                weight=layer.weight,
+                weight_scale=layer.weight_scale,
+                params_dtype=layer.params_dtype,
+                input_scale=getattr(layer, "input_scale", None),
+                input_zero_point=getattr(layer, "input_zero_point", None),
+                azp_adj=getattr(layer, "azp_adj", None),
+                bias=bias,
+                x_and_scale_quanted=x_and_scale_quanted,
+            )
         return scheme.apply_weights(layer, x, bias=bias)
+
+    def supports_quanted_inputs(self) -> bool:
+        """The HCU INT8 scheme consumes a prequantized tensor and its scale."""
+        return bool(henvs.VLLM_HCU_USE_CUSTOM_QUANTIZATION_GEMM)
 
 
 _SLIMQUANT_MOE_LAYOUT_TENSORS = (
@@ -149,21 +171,32 @@ class SlimQuantW4A8Int8AiterMoEMethod(FusedMoEMethodBase):
                 f"{sorted(supported_backends)!r}"
             )
         if moe_backend == "deep_gemm":
+            from vllm_hcu.model_executor.layers.fused_moe.deepep_runtime import (
+                slimquant_w4a8_uses_deepep_ht,
+                slimquant_w4a8_uses_deepep_ll,
+            )
+
             parallel_config = getattr(moe, "moe_parallel_config", None)
             if (
-                parallel_config is None
-                or getattr(parallel_config, "all2all_backend", None)
-                != "deepep_auto"
-                or getattr(
-                    parallel_config,
-                    "use_deepep_auto_kernels",
-                    None,
+                not slimquant_w4a8_uses_deepep_ht(moe)
+                and not slimquant_w4a8_uses_deepep_ll(moe)
+                and (
+                    parallel_config is None
+                    or getattr(parallel_config, "all2all_backend", None)
+                    != "deepep_auto"
+                    or getattr(
+                        parallel_config,
+                        "use_deepep_auto_kernels",
+                        None,
+                    )
+                    is False
                 )
-                is False
             ):
                 raise ValueError(
                     "SlimQuant W4A8 deep_gemm requires DP+EP with "
-                    "all2all_backend='deepep_auto'"
+                    "all2all_backend='deepep_auto' or 'deepep_low_latency', "
+                    "or HYV4 PCP+EP with all2all_backend="
+                    "'deepep_high_throughput'"
                 )
         self.moe = moe
         self.quant_config = quant_config
@@ -187,12 +220,21 @@ class SlimQuantW4A8Int8AiterMoEMethod(FusedMoEMethodBase):
             per_out_ch_quant=False,
             block_shape=None,
             weight_dtype="int4",
+            gemm1_clamp_limit=getattr(self.moe, "swiglu_limit", None),
         )
         return self.moe_quant_config
 
     @property
     def is_monolithic(self) -> bool:
         return False
+
+    def supports_quanted_inputs(self) -> bool:
+        """DeepEP dispatch currently requires the original BF16 input."""
+        return False
+
+    def supports_shared_quanted_inputs(self) -> bool:
+        """Shared experts can reuse INT8 input without changing dispatch."""
+        return True
 
     def create_weights(
         self,
@@ -274,10 +316,16 @@ class SlimQuantW4A8Int8AiterMoEMethod(FusedMoEMethodBase):
             return
         from vllm_hcu.model_executor.layers.fused_moe.deepep_runtime import (
             slimquant_w4a8_uses_deepep_auto,
+            slimquant_w4a8_uses_deepep_ht,
+            slimquant_w4a8_uses_deepep_ll,
         )
 
-        uses_deepep_auto = slimquant_w4a8_uses_deepep_auto(
-            getattr(self, "moe", None)
+        uses_deepep_ht = slimquant_w4a8_uses_deepep_ht(getattr(self, "moe", None))
+        uses_deepep_ll = slimquant_w4a8_uses_deepep_ll(getattr(self, "moe", None))
+        uses_deepep = (
+            uses_deepep_ht
+            or uses_deepep_ll
+            or slimquant_w4a8_uses_deepep_auto(getattr(self, "moe", None))
         )
         weight_generation = _slimquant_moe_tensor_generation(
             layer,
@@ -288,7 +336,7 @@ class SlimQuantW4A8Int8AiterMoEMethod(FusedMoEMethodBase):
             "_hcu_slimquant_post_load_weight_generation",
             None,
         )
-        if not uses_deepep_auto and installed_weight_generation == weight_generation:
+        if not uses_deepep and installed_weight_generation == weight_generation:
             self.moe_quant_config = self.get_fused_moe_quant_config(layer)
             config = getattr(layer, "_hcu_slimquant_post_load_aiter_config", None)
             if config is not None:
@@ -312,12 +360,23 @@ class SlimQuantW4A8Int8AiterMoEMethod(FusedMoEMethodBase):
                 "weight postprocessing"
             )
 
-        if uses_deepep_auto:
+        if uses_deepep:
             from vllm_hcu.model_executor.layers.fused_moe.experts.dpsk_v4_deep_gemm_moe import (
                 make_deepep_auto_deepgemm_w4a8_moe_kernel,
+                make_deepep_ht_deepgemm_w4a8_moe_kernel,
+                make_deepep_ll_deepgemm_w4a8_moe_kernel,
             )
 
-            self.moe_kernel = make_deepep_auto_deepgemm_w4a8_moe_kernel(
+            factory = (
+                make_deepep_ht_deepgemm_w4a8_moe_kernel
+                if uses_deepep_ht
+                else (
+                    make_deepep_ll_deepgemm_w4a8_moe_kernel
+                    if uses_deepep_ll
+                    else make_deepep_auto_deepgemm_w4a8_moe_kernel
+                )
+            )
+            self.moe_kernel = factory(
                 moe_quant_config=self.moe_quant_config,
                 moe_config=self.moe,
                 routing_tables=layer._expert_routing_tables(),
@@ -327,7 +386,7 @@ class SlimQuantW4A8Int8AiterMoEMethod(FusedMoEMethodBase):
             process = getattr(experts, "process_weights_after_loading", None)
             if not callable(process):
                 raise RuntimeError(
-                    "SlimQuant W4A8 deepep_auto did not construct modular "
+                    "SlimQuant W4A8 DeepEP did not construct modular "
                     "experts before weight postprocessing"
                 )
             process(layer)
@@ -404,9 +463,32 @@ class SlimQuantW4A8Int8AiterMoEMethod(FusedMoEMethodBase):
         topk_ids: torch.Tensor,
         shared_experts: object | None,
         shared_experts_input: torch.Tensor | None,
+        i_q: torch.Tensor | None = None,
+        i_s: torch.Tensor | None = None,
+        shared_experts_x_and_scale_quanted: (
+            tuple[torch.Tensor, torch.Tensor] | None
+        ) = None,
         **_,
     ) -> torch.Tensor | tuple[torch.Tensor, torch.Tensor]:
 
+        if (i_q is None) != (i_s is None):
+            raise ValueError(
+                "SlimQuant W4A8 prequantized input requires both i_q and i_s"
+            )
+        if i_q is not None:
+            raise RuntimeError(
+                "SlimQuant W4A8 routed input must preserve BF16 DeepEP dispatch"
+            )
+        if shared_experts_x_and_scale_quanted is not None and (
+            not isinstance(shared_experts_x_and_scale_quanted, tuple)
+            or len(shared_experts_x_and_scale_quanted) != 2
+            or shared_experts_x_and_scale_quanted[0] is None
+            or shared_experts_x_and_scale_quanted[1] is None
+        ):
+            raise ValueError(
+                "SlimQuant W4A8 shared prequantized input requires both "
+                "quantized input and scale"
+            )
         if x.dim() != 2:
             raise ValueError(
                 "SlimQuant W4A8 AITER Triton MoE expects rank-2 hidden states, "
@@ -426,18 +508,23 @@ class SlimQuantW4A8Int8AiterMoEMethod(FusedMoEMethodBase):
             )
         from vllm_hcu.model_executor.layers.fused_moe.deepep_runtime import (
             slimquant_w4a8_uses_deepep_auto,
+            slimquant_w4a8_uses_deepep_ht,
+            slimquant_w4a8_uses_deepep_ll,
         )
 
         moe_kernel = getattr(self, "moe_kernel", None)
-        uses_deepep_auto = moe_kernel is not None
-        if not uses_deepep_auto:
-            uses_deepep_auto = slimquant_w4a8_uses_deepep_auto(
-                getattr(self, "moe", None)
+        uses_deepep = moe_kernel is not None
+        if not uses_deepep:
+            moe = getattr(self, "moe", None)
+            uses_deepep = (
+                slimquant_w4a8_uses_deepep_ht(moe)
+                or slimquant_w4a8_uses_deepep_ll(moe)
+                or slimquant_w4a8_uses_deepep_auto(moe)
             )
-        if uses_deepep_auto:
+        if uses_deepep:
             if moe_kernel is None:
                 raise RuntimeError(
-                    "SlimQuant W4A8 deepep_auto kernel was not initialized; "
+                    "SlimQuant W4A8 DeepEP kernel was not initialized; "
                     "process_weights_after_loading must run before apply"
                 )
             from vllm_hcu.model_executor.layers.fused_moe.aiter_moe_dispatch import (
@@ -473,6 +560,9 @@ class SlimQuantW4A8Int8AiterMoEMethod(FusedMoEMethodBase):
                 ),
                 shared_experts=shared_experts,
                 shared_experts_input=shared_experts_input,
+                shared_experts_x_and_scale_quanted=(
+                    shared_experts_x_and_scale_quanted
+                ),
             )
         # Pure TP shared experts remain runner-owned, matching the latest
         # unified AITER/Triton contract.

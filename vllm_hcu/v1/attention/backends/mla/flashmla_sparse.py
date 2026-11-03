@@ -10,12 +10,43 @@ import torch
 from vllm.v1.attention.backends.mla.flashmla_sparse import (
     FlashMLASparseBackend,
     FlashMLASparseImpl,
+    FlashMLASparseMetadataBuilder,
 )
+
+
+class HcuFlashMLASparseMetadataBuilder(FlashMLASparseMetadataBuilder):
+    def build(self, common_prefix_len, common_attn_metadata, fast_build=False):
+        metadata = super().build(common_prefix_len, common_attn_metadata, fast_build)
+        from vllm_hcu.platforms import envs as henvs
+
+        if (
+            henvs.VLLM_HCU_SPARSE_MLA_PREFILL_WORKSPACE_DEDUP
+            and self.vllm_config.parallel_config.decode_context_parallel_size == 1
+        ):
+            from .workspace_dedup import build_workspace_metadata
+
+            metadata.hcu_workspace_dedup = build_workspace_metadata(
+                self, common_attn_metadata, metadata
+            )
+        return metadata
 
 
 class HcuFlashMLASparseImpl(FlashMLASparseImpl):
     supports_pcp: bool = True
     can_return_lse_for_decode: bool = True
+
+    def _forward_fp8_kv_separate_prefill_decode(
+        self, q, kv_c_and_k_pe_cache, topk_indices, attn_metadata
+    ):
+        if getattr(attn_metadata, "hcu_workspace_dedup", None) is None:
+            return super()._forward_fp8_kv_separate_prefill_decode(
+                q, kv_c_and_k_pe_cache, topk_indices, attn_metadata
+            )
+        from .workspace_dedup import forward_workspace_dedup
+
+        return forward_workspace_dedup(
+            self, q, kv_c_and_k_pe_cache, topk_indices, attn_metadata
+        )
 
     def forward_mqa(
         self,
@@ -93,8 +124,16 @@ class HcuFlashMLASparseBackend(FlashMLASparseBackend):
         return "FLASHMLA_SPARSE"
 
     @staticmethod
+    def get_builder_cls() -> type[HcuFlashMLASparseMetadataBuilder]:
+        return HcuFlashMLASparseMetadataBuilder
+
+    @staticmethod
     def get_impl_cls() -> type[HcuFlashMLASparseImpl]:
         return HcuFlashMLASparseImpl
 
 
-__all__ = ["HcuFlashMLASparseBackend", "HcuFlashMLASparseImpl"]
+__all__ = [
+    "HcuFlashMLASparseBackend",
+    "HcuFlashMLASparseImpl",
+    "HcuFlashMLASparseMetadataBuilder",
+]

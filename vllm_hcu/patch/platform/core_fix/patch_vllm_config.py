@@ -133,7 +133,22 @@ def _require_hyv4_pcp_mtp_contract(vllm_config: object) -> None:
         or feature_cfg.expert_map_record_path
         or feature_cfg.eplb_disable_rearrange
     ):
-        raise ValueError("HYV4 PCP MTP does not support EPLB.")
+        static_pcp = (
+            parallel.enable_eplb
+            and feature_cfg.expert_map_path
+            and not feature_cfg.expert_map_record_path
+            and not feature_cfg.eplb_disable_rearrange
+            and getattr(target, "quantization", None) == "compressed-tensors"
+            and getattr(parallel, "pipeline_parallel_size", None) == 1
+            and getattr(parallel, "tensor_parallel_size", None) == 1
+            and getattr(parallel, "prefill_context_parallel_size", None) == 16
+            and getattr(parallel, "data_parallel_size", None) == 1
+            and getattr(parallel, "decode_context_parallel_size", None) == 1
+            and getattr(getattr(parallel, "eplb_config", None),
+                        "num_redundant_experts", None) == 0
+        )
+        if not static_pcp:
+            raise ValueError("HYV4 PCP MTP does not support EPLB outside static W4A8 PCP16.")
 
 
 def _require_mrv2_pcp_contract(vllm_config: object) -> None:

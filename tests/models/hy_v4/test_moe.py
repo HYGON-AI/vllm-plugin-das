@@ -42,6 +42,27 @@ class _FakeSharedExperts(nn.Module):
         return hidden_states
 
 
+@pytest.mark.parametrize("replicated", [False, True])
+def test_mtp_chunking_without_linear_gate_shard(monkeypatch, replicated):
+    monkeypatch.delenv("VLLM_HCU_ENABLE_LINEAR_GATE_PCP_SHARD", raising=False)
+    monkeypatch.setenv("VLLM_HCU_HYV4_MOE_CHUNK_SIZE", "3")
+    monkeypatch.setattr(moe, "in_replicated_mtp_batch", lambda: replicated)
+    layer = object.__new__(moe.HYV4MoEFused)
+    nn.Module.__init__(layer)
+    layer.gate = _FakeGate()
+    calls = []
+
+    class Experts(nn.Module):
+        def forward(self, *, hidden_states, router_logits):
+            calls.append(hidden_states.shape[0])
+            return hidden_states + 1
+
+    layer.experts = Experts()
+    inputs = torch.arange(32, dtype=torch.float32).reshape(2, 4, 4)
+    torch.testing.assert_close(layer(inputs), inputs + 1)
+    assert calls == ([3, 3, 2] if replicated else [8])
+
+
 def _hf_config() -> SimpleNamespace:
     return SimpleNamespace(
         hidden_size=32,

@@ -36,6 +36,20 @@ _FACTORY_MARKER = "_vllm_hcu_moe_layer_factory"
 _EXPERT_MAP_MARKER = "_vllm_hcu_moe_layer_expert_map"
 _GET_WEIGHTS_MARKER = "_vllm_hcu_moe_layer_get_weights"
 _LOAD_WEIGHTS_MARKER = "_vllm_hcu_moe_layer_load_weights"
+_HCU_COMPRESSED_W4A8_METHOD_MARKER = (
+    "_vllm_hcu_compressed_tensors_w4a8_int8_moe"
+)
+_PACKED_EXPERT_ADAPTER_MARKER = "_vllm_hcu_hyv4_packed_expert_adapter"
+
+
+def _should_adapt_packed_expert_names(owner) -> bool:
+    return not bool(
+        getattr(
+            getattr(owner, "quant_config", None),
+            _PACKED_EXPERT_ADAPTER_MARKER,
+            False,
+        )
+    )
 
 
 def apply_to_module(module: ModuleType) -> bool:
@@ -288,7 +302,22 @@ def apply_to_module(module: ModuleType) -> bool:
 
     @functools.wraps(load_weights)
     def hcu_load_weights(self, weights):
+        uses_hcu_compressed_w4a8 = bool(
+            getattr(
+                getattr(self, "quant_method", None),
+                _HCU_COMPRESSED_W4A8_METHOD_MARKER,
+                False,
+            )
+        )
         for expert_name, loaded_weight in weights:
+            if uses_hcu_compressed_w4a8 and _should_adapt_packed_expert_names(self):
+                if expert_name.endswith(".weight_shape"):
+                    continue
+                if expert_name.endswith(".weight_packed"):
+                    suffix = "" if loaded_weight.ndim == 3 else ".weight"
+                    expert_name = (
+                        expert_name.removesuffix(".weight_packed") + suffix
+                    )
             loaded_names = _load_fused_channel_scale(
                 self, expert_name, loaded_weight
             )

@@ -266,6 +266,7 @@ _OP_CALLBACKS: tuple[_CallbackSpec, ...] = (
     _CallbackSpec(_adapter("op_opt", "patch_compressed_tensors_scheme")),
     _CallbackSpec(_adapter("op_opt", "patch_compressed_tensors_w8a8_int8")),
     _CallbackSpec(_adapter("op_opt", "patch_compressed_tensors_w8a8_fp8")),
+    _CallbackSpec(_adapter("op_opt", "patch_compressed_tensors_moe_w4a8_int8")),
     _CallbackSpec(_adapter("op_opt", "patch_compressed_tensors_moe_w8a8_fp8")),
     _CallbackSpec(_adapter("op_opt", "patch_compressed_tensors_moe_wna16")),
 )
@@ -368,6 +369,9 @@ _FRAMEWORK_CALLBACKS: tuple[_CallbackSpec, ...] = (
     ),
     _CallbackSpec(
         _adapter("framework_opt", "patch_draft_speculator_inputs"),
+    ),
+    _CallbackSpec(
+        _adapter("framework_opt", "patch_pcp_mtp_speculator"),
     ),
     _CallbackSpec(_adapter("framework_opt", "patch_gpu_ubatch_wrapper")),
     _CallbackSpec(_adapter("framework_opt", "patch_ubatch_utils")),

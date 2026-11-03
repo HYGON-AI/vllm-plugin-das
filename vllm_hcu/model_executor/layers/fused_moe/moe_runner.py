@@ -451,6 +451,7 @@ class MoERunner(MoERunnerInterface):
     def _replace_quant_method(self, quant_method: FusedMoEMethodBase):
         self.routed_experts._replace_quant_method(quant_method)
         self.__dict__.pop("_supports_quanted_inputs", None)
+        self.__dict__.pop("_supports_shared_quanted_inputs", None)
         self._refresh_forward_entry()
 
     # TODO(bnell): Hack for elastic_ep. Get rid of this
@@ -750,6 +751,17 @@ class MoERunner(MoERunnerInterface):
         cached = getattr(self, "_supports_quanted_inputs", None)
         if cached is not None:
             return cached
+        declared_support = getattr(
+            self._quant_method,
+            "supports_quanted_inputs",
+            None,
+        )
+        if callable(declared_support):
+            try:
+                self._supports_quanted_inputs = bool(declared_support())
+            except (AttributeError, RuntimeError, TypeError, ValueError):
+                self._supports_quanted_inputs = False
+            return self._supports_quanted_inputs
         apply = getattr(self._quant_method, "apply", None)
         if apply is None:
             self._supports_quanted_inputs = False
@@ -767,6 +779,24 @@ class MoERunner(MoERunnerInterface):
             or ("i_q" in parameters and "i_s" in parameters)
         )
         return self._supports_quanted_inputs
+
+    def _quant_method_supports_shared_quanted_inputs(self) -> bool:
+        cached = getattr(self, "_supports_shared_quanted_inputs", None)
+        if cached is not None:
+            return cached
+        declared_support = getattr(
+            self._quant_method,
+            "supports_shared_quanted_inputs",
+            None,
+        )
+        if callable(declared_support):
+            try:
+                self._supports_shared_quanted_inputs = bool(declared_support())
+            except (AttributeError, RuntimeError, TypeError, ValueError):
+                self._supports_shared_quanted_inputs = False
+        else:
+            self._supports_shared_quanted_inputs = False
+        return self._supports_shared_quanted_inputs
 
     def _apply_quant_method(
         self,
@@ -790,7 +820,7 @@ class MoERunner(MoERunnerInterface):
                 "HCU preselected MoE routing requires topk_weights and topk_ids "
                 "together"
             )
-        if quanted_hidden_states is not None and scale is None:
+        if (quanted_hidden_states is None) != (scale is None):
             raise ValueError(
                 "HCU pre-quantized MoE input requires quanted_hidden_states and scale"
             )
@@ -839,13 +869,7 @@ class MoERunner(MoERunnerInterface):
                     shared_experts=self._shared_experts,
                     shared_experts_input=shared_experts_input,
                 )
-            else:
-                if not self._quant_method_supports_quanted_inputs():
-                    raise RuntimeError(
-                        "HCU pre-quantized MoE input was enabled, but quant method "
-                        f"{type(self._quant_method).__name__}.apply does not accept "
-                        "i_q/i_s"
-                    )
+            elif self._quant_method_supports_quanted_inputs():
                 fused_out = self._quant_method.apply(
                     layer=self.routed_experts,
                     x=hidden_states,
@@ -855,6 +879,27 @@ class MoERunner(MoERunnerInterface):
                     shared_experts_input=shared_experts_input,
                     i_q=quanted_hidden_states,
                     i_s=scale,
+                )
+            elif self._quant_method_supports_shared_quanted_inputs():
+                fused_out = self._quant_method.apply(
+                    layer=self.routed_experts,
+                    x=hidden_states,
+                    topk_weights=topk_weights,
+                    topk_ids=topk_ids,
+                    shared_experts=self._shared_experts,
+                    shared_experts_input=shared_experts_input,
+                    shared_experts_x_and_scale_quanted=(
+                        quanted_hidden_states,
+                        scale,
+                    ),
+                )
+            else:
+                fused_out = self.routed_experts.forward_modular(
+                    x=hidden_states,
+                    topk_weights=topk_weights,
+                    topk_ids=topk_ids,
+                    shared_experts=self._shared_experts,
+                    shared_experts_input=shared_experts_input,
                 )
 
         self._maybe_apply_shared_experts(
@@ -950,8 +995,10 @@ class MoERunner(MoERunnerInterface):
                 "HCU preselected MoE routing requires topk_weights and topk_ids "
                 "together"
             )
-        if quanted_hidden_states is not None and scale is None:
-            raise ValueError("HCU pre-quantized MoE input requires scale")
+        if (quanted_hidden_states is None) != (scale is None):
+            raise ValueError(
+                "HCU pre-quantized MoE input requires quanted_hidden_states and scale"
+            )
 
         # Apply transform for routed experts (e.g., latent projection
         # for latent MoE)

@@ -40,6 +40,9 @@ from vllm.utils.deep_gemm import (
     is_deep_gemm_supported,
 )
 from vllm.utils.math_utils import cdiv, round_up
+from vllm_hcu.model_executor.layers.fused_moe.experts.w4a8_persistent_activation import (
+    persistent_masked_m_silu_mul_clamp_int8_quant,
+)
 
 logger = init_logger(__name__)
 
@@ -398,6 +401,11 @@ class BatchedDeepGemmExperts(mk.FusedMoEExpertsModular):
             else None
         )
         if dp_meta is None:
+            graph_expected_m = self.get_expected_m()
+            if graph_expected_m is not None:
+                estimate = round_up(int(graph_expected_m), 16)
+                estimate = max(estimate, 16)
+                return min(max_tokens_per_expert, estimate)
             logger.warning_once(
                 "DPMetadata unavailable. Defaulting expected_m to "
                 f"{max_tokens_per_expert}.",
@@ -481,8 +489,6 @@ class BatchedDeepGemmExperts(mk.FusedMoEExpertsModular):
                     "SlimQuant W4A8 masked weights were not packed before apply"
                 )
             from deepgemm import m_grouped_w4a8_gemm_nt_masked_hipc
-            from lightop.activation import fuse_silu_mul_quant_ep
-
             m_grouped_w4a8_gemm_nt_masked_hipc(
                 (a1q, a1q_scale),
                 (self._deepgemm_w13, self.w1_scale),
@@ -490,10 +496,22 @@ class BatchedDeepGemmExperts(mk.FusedMoEExpertsModular):
                 expert_num_tokens,
                 expected_m,
             )
-            a2q, a2q_scale = fuse_silu_mul_quant_ep(
-                workspace1,
-                tokens_per_expert=expert_num_tokens,
+            clamp_limit = getattr(
+                self.quant_config, "gemm1_clamp_limit", None
             )
+            if clamp_limit is not None and clamp_limit > 0:
+                a2q, a2q_scale = persistent_masked_m_silu_mul_clamp_int8_quant(
+                    workspace1,
+                    expert_num_tokens,
+                    limit=clamp_limit,
+                )
+            else:
+                from lightop.activation import fuse_silu_mul_quant_ep
+
+                a2q, a2q_scale = fuse_silu_mul_quant_ep(
+                    workspace1,
+                    tokens_per_expert=expert_num_tokens,
+                )
             m_grouped_w4a8_gemm_nt_masked_hipc(
                 (a2q, a2q_scale),
                 (self._deepgemm_w2, self.w2_scale),

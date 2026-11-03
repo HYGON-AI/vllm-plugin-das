@@ -126,7 +126,7 @@ def apply_to_module(module: ModuleType) -> bool:
         )
 
     def supports_quanted_inputs(self) -> bool:
-        return True
+        return _custom_quantization_enabled()
 
     for function in (hcu_process_weights_after_loading, hcu_apply_weights):
         setattr(function, _WRAPPER_MARKER, True)

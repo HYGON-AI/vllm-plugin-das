@@ -30,6 +30,10 @@
   }
 
 TORCH_LIBRARY_EXPAND(TORCH_EXTENSION_NAME, ops) {
+  ops.def("cp_gather_and_upconvert_fp8_kv_cache_pages(Tensor src, "
+          "Tensor(a!) dst, Tensor descriptors) -> ()");
+  ops.impl("cp_gather_and_upconvert_fp8_kv_cache_pages", torch::kCUDA,
+           &cp_gather_and_upconvert_fp8_kv_cache_pages);
   ops.def("init_custom_ar(int[] ipc_tensors, Tensor rank_data, int rank, bool fully_connected) -> int");
   ops.impl("init_custom_ar", torch::kCUDA, &init_custom_ar);
   ops.def("all_reduce(int fa, Tensor inp, Tensor! out, int reg_buffer, int reg_buffer_sz_bytes) -> ()");

@@ -2451,6 +2451,21 @@ class GPUModelRunner(
                 if enable_lightly_cp and cm.seq_indexes_list is not None:
                     cm.block_table_tensor = cm.block_table_tensor[cm.seq_indexes_list]
 
+            if (
+                henvs.VLLM_HCU_SPARSE_MLA_PREFILL_WORKSPACE_DEDUP
+                and not for_cudagraph_capture
+                and not enable_lightly_cp
+                and self.dcp_world_size == 1
+                and not isinstance(
+                    kv_cache_group.kv_cache_spec, EncoderOnlyAttentionSpec
+                )
+                and is_prefilling.any().item()
+            ):
+                cm.sparse_mla_workspace_block_table_cpu = (
+                    self.input_batch.block_table[kv_cache_gid]
+                    .get_cpu_tensor()[:num_reqs_padded].numpy()
+                )
+
             if self.speculative_config and spec_decode_common_attn_metadata is None and get_pp_group().is_last_rank:
                 if isinstance(
                     self.drafter, (EagleProposer, DFlashProposer, Gemma4Proposer)

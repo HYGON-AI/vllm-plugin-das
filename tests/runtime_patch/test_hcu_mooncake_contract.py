@@ -1400,6 +1400,96 @@ def test_hyv4_worker_construction_starts_bootstrap_once(constructed_mooncake_wor
     assert launches == [0]
 
 
+def test_hyv4_pcp_workers_register_only_canonical_transfer_rank(
+    mooncake, constructed_mooncake_workers,
+):
+    from vllm.distributed.kv_transfer.kv_connector.v1.mooncake.mooncake_utils import (
+        MooncakeBootstrapServer,
+    )
+
+    make, group, _ = constructed_mooncake_workers
+    bootstrap = MooncakeBootstrapServer("127.0.0.1", 18998)
+    workers = []
+    registered = []
+    for rank in range(4):
+        group.rank = rank
+        group.rank_in_group = rank
+        worker = make()
+        workers.append(worker)
+        if worker._is_canonical_pcp_kv_replica():
+            payload = mooncake.RegisterWorkerPayload(
+                engine_id=worker.engine_id, dp_rank=0,
+                tp_rank=worker.tp_rank, pp_rank=0,
+                addr=f"tcp://127.0.0.1:{20000 + rank}",
+            )
+            asyncio.run(bootstrap.register_worker(payload))
+            registered.append(worker)
+
+    assert [(w.tp_rank, w.tp_size) for w in workers] == [(0, 1)] * 4
+    assert [(w.pcp_rank, w.pcp_size) for w in workers] == [
+        (0, 4), (1, 4), (2, 4), (3, 4),
+    ]
+    assert registered == [workers[0]]
+    # Only the canonical PCP replica participates in the transfer topology.
+    # The remaining replicas report completion without an external handshake.
+    plans = [w._get_sender_transfer_plan(128, 128, 0, 1) for w in registered]
+    assert [plan[0] for plan in plans] == [True]
+
+
+@pytest.mark.parametrize("pcp_rank", [0, 1, 15])
+def test_pcp_cache_registration_starts_listener_only_on_canonical_replica(
+    mooncake, monkeypatch, pcp_rank,
+):
+    worker = _worker(mooncake, blocks_first=False, use_mla=True)
+    worker.is_kv_consumer = False
+    worker.pcp_size = 16
+    worker.pcp_rank = pcp_rank
+    worker.sender_loop = object()
+    name = "model.layers.0.self_attn"
+    worker._layer_specs[name] = object()
+    worker._layer_group_indices[name] = 0
+    listeners = []
+
+    async def listen(ready):
+        listeners.append(worker.pcp_rank)
+        ready.set()
+
+    def submit(coro, loop):
+        assert loop is worker.sender_loop
+        asyncio.run(coro)
+
+    monkeypatch.setattr(worker, "_mooncake_sender_listener", listen)
+    monkeypatch.setattr(mooncake.asyncio, "run_coroutine_threadsafe", submit)
+    worker.register_kv_caches({name: torch.zeros((2, 3), dtype=torch.float16)})
+    assert len(worker.engine.calls) == 1
+    assert listeners == ([0] if pcp_rank == 0 else [])
+
+
+@pytest.mark.parametrize("tp_size", [1, 2, 4])
+@pytest.mark.parametrize("pcp_size", [1, 2, 16])
+def test_hyv4_pcp_transfer_rank_preserves_tensor_parallel_rank(
+    mooncake, monkeypatch, constructed_mooncake_workers, tp_size, pcp_size,
+):
+    make, group, _ = constructed_mooncake_workers
+    monkeypatch.setattr(mooncake, "get_tensor_model_parallel_world_size", lambda: tp_size)
+    senders = []
+    for tp_rank in range(tp_size):
+        monkeypatch.setattr(
+            mooncake, "get_tensor_model_parallel_rank", lambda: tp_rank,
+        )
+        group.ranks = list(range(tp_rank, tp_size * pcp_size, tp_size))
+        for pcp_rank in range(pcp_size):
+            group.rank = tp_size * pcp_rank + tp_rank
+            group.rank_in_group = pcp_rank
+            worker = make(pcp_size=pcp_size)
+            assert (worker.tp_rank, worker.tp_size) == (tp_rank, tp_size)
+            if worker._is_canonical_pcp_kv_replica():
+                senders.append((worker.tp_rank, worker.tp_size, worker.pcp_rank))
+        consumer = make(role="kv_consumer", pcp_size=1)
+        assert (consumer.tp_rank, consumer.tp_size) == (tp_rank, tp_size)
+    assert senders == [(rank, tp_size, 0) for rank in range(tp_size)]
+
+
 def test_mooncake_worker_constructs_stage_range_from_pp_group(
     mooncake, monkeypatch, constructed_mooncake_workers,
 ):

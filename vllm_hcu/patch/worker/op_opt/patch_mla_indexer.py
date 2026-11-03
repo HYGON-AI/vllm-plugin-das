@@ -27,6 +27,45 @@ _MARKER = "_vllm_hcu_mla_indexer_applied"
 _WRAPPER = "_vllm_hcu_mla_indexer_wrapper"
 
 
+def _wrap_prefill_chunk_builder(build_prefill):
+    @functools.wraps(build_prefill)
+    def hcu_prefill_chunk(
+        start_idx, end_idx, query_start_loc, query_start_loc_cpu,
+        uncompressed_seq_lens, compressed_seq_lens, compressed_seq_lens_cpu,
+        block_table, compress_ratio, query_slice=None, skip_kv_gather=False,
+        dcp_rank=0, dcp_world_size=1, cp_kv_cache_interleave_size=1,
+    ):
+        result = build_prefill(
+            start_idx, end_idx, query_start_loc, query_start_loc_cpu,
+            uncompressed_seq_lens, compressed_seq_lens, compressed_seq_lens_cpu,
+            block_table, compress_ratio, query_slice, skip_kv_gather,
+            dcp_rank, dcp_world_size, cp_kv_cache_interleave_size,
+        )
+        from vllm_hcu.platforms import envs as henvs
+        if (result is None or not henvs.VLLM_HCU_ENABLE_PREFILL_MQA_GROUPING
+                or dcp_world_size != 1 or compress_ratio != 1):
+            return result
+        from vllm import envs
+        from vllm_hcu.v1.attention.ops.prefill_mqa import plan_prefill_mqa_chunks
+        # Both tensors are already CPU metadata. Never pull CUDA row bounds
+        # back to the host or run the planner in each model layer.
+        if query_start_loc_cpu.device.type != "cpu" or compressed_seq_lens_cpu.device.type != "cpu":
+            raise PatchCompatibilityError("prefill MQA grouping requires CPU request lengths")
+        offsets = query_start_loc_cpu[start_idx:end_idx + 1].tolist()
+        q_lens = [b - a for a, b in zip(offsets, offsets[1:])]
+        k_lens = compressed_seq_lens_cpu[start_idx:end_idx].tolist()
+        result.hcu_mqa_groups = plan_prefill_mqa_chunks(
+            q_lens, k_lens,
+            0 if query_slice is None else query_slice.start,
+            sum(q_lens) if query_slice is None else query_slice.stop,
+            min_saved_cells=henvs.VLLM_HCU_PREFILL_MQA_GROUP_MIN_SAVED_CELLS,
+            max_logits_bytes=envs.VLLM_SPARSE_INDEXER_MAX_LOGITS_MB * 1024 * 1024,
+        )
+        return result
+    setattr(hcu_prefill_chunk, _WRAPPER, True)
+    return hcu_prefill_chunk
+
+
 def apply_to_module(module: ModuleType) -> bool:
     indexer = load_exact_module(TARGET_MODULE, module)
     builder_cls = require_class(indexer, "DeepseekV32IndexerMetadataBuilder", f"{TARGET_MODULE}.DeepseekV32IndexerMetadataBuilder")
@@ -35,8 +74,22 @@ def apply_to_module(module: ModuleType) -> bool:
         (indexer, "split_decodes_and_prefills", TARGETS[1], _WRAPPER),
         (builder_cls, "build", TARGETS[2], _WRAPPER),
     )
+    chunk_builder = getattr(indexer, "build_prefill_chunk_metadata", None)
+    if chunk_builder is not None:
+        wrapped += ((indexer, "build_prefill_chunk_metadata",
+                     f"{TARGET_MODULE}.build_prefill_chunk_metadata", _WRAPPER),)
     if already_applied(indexer, _MARKER, wrapped):
         return False
+    if chunk_builder is not None:
+        require_exact_signature(
+            chunk_builder, f"{TARGET_MODULE}.build_prefill_chunk_metadata",
+            positional=("start_idx", "end_idx", "query_start_loc", "query_start_loc_cpu",
+                        "uncompressed_seq_lens", "compressed_seq_lens", "compressed_seq_lens_cpu",
+                        "block_table", "compress_ratio", "query_slice", "skip_kv_gather",
+                        "dcp_rank", "dcp_world_size", "cp_kv_cache_interleave_size"),
+            defaults={"query_slice": None, "skip_kv_gather": False,
+                      "dcp_rank": 0, "dcp_world_size": 1, "cp_kv_cache_interleave_size": 1},
+        )
     split_chunks = require_callable(indexer, "split_indexer_prefill_chunks", TARGETS[0])
     require_exact_signature(
         split_chunks, TARGETS[0],
@@ -93,6 +146,13 @@ def apply_to_module(module: ModuleType) -> bool:
             common_attn_metadata.num_actual_tokens,
         )
         vllm_config = getattr(self, "vllm_config", None)
+        scheduler_config = getattr(vllm_config, "scheduler_config", None)
+        # Async speculative rejection can make CPU lengths upper bounds even
+        # inside a native prefill chunk (e.g. non-uniform decode query widths).
+        # Allocation capacity is not proof of the device gather's K offsets.
+        result.hcu_mqa_cpu_lengths_exact = (
+            getattr(scheduler_config, "async_scheduling", None) is False
+        )
         if vllm_config is None:
             result.pcp_world_size = effective_pcp_world_size(
                 int(getattr(common_attn_metadata, "pcp_world_size", 1))
@@ -127,6 +187,8 @@ def apply_to_module(module: ModuleType) -> bool:
     setattr(indexer, "split_indexer_prefill_chunks", hcu_split_chunks)
     setattr(indexer, "split_decodes_and_prefills", hcu_split_batch)
     setattr(builder_cls, "build", hcu_build)
+    if chunk_builder is not None:
+        setattr(indexer, "build_prefill_chunk_metadata", _wrap_prefill_chunk_builder(chunk_builder))
     setattr(indexer, _MARKER, True)
     return True
 
