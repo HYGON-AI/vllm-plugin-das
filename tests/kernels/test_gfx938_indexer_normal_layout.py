@@ -12,10 +12,13 @@ from vllm_hcu.patch.worker.core_fix import patch_glm5next_channel_fp8 as glm_pat
 from vllm_hcu.platforms.hcu import on_gfx938
 
 # The dispatcher rejects kcache_layout="normal" off gfx938.
-pytestmark = pytest.mark.skipif(
-    not torch.cuda.is_available() or not on_gfx938(),
-    reason="requires gfx938 HCU",
-)
+pytestmark = [
+    pytest.mark.hcu,
+    pytest.mark.skipif(
+        not torch.cuda.is_available() or not on_gfx938(),
+        reason="requires gfx938 HCU",
+    ),
+]
 
 
 def _pin_normal_layout(monkeypatch):
