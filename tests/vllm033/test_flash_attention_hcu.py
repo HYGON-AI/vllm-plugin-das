@@ -8,8 +8,8 @@ import pytest
 import torch
 
 pytestmark = pytest.mark.skipif(
-    os.getenv("VLLM032_HCU_TEST") != "1",
-    reason="set VLLM032_HCU_TEST=1 on a prepared HCU node",
+    os.getenv("VLLM033_HCU_TEST") != "1",
+    reason="set VLLM033_HCU_TEST=1 on a prepared HCU node",
 )
 
 
@@ -337,7 +337,6 @@ def test_hcu_e5m2_writer_to_vendor_varlen_matches_quantized_reference(
     num_kv_heads,
 ):
     import vllm._C_stable_libtorch  # noqa: F401
-    from vllm import _custom_ops as ops
 
     torch.manual_seed(71 + query_len)
     device = torch.device("cuda")

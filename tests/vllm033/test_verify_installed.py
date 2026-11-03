@@ -89,9 +89,9 @@ def installed_fixture(monkeypatch: pytest.MonkeyPatch, tmp_path: Path):
     distributions = {
         "vllm": FakeDistribution(
             "vllm",
-            "0.32.0+rocm723",
+            "0.33.0+rocm723",
             site,
-            ["vllm/__init__.py", "vllm-0.32.0.dist-info/RECORD"],
+            ["vllm/__init__.py", "vllm-0.33.0.dist-info/RECORD"],
         ),
         "sgl-kernel": FakeDistribution(
             "sgl-kernel",
@@ -105,7 +105,7 @@ def installed_fixture(monkeypatch: pytest.MonkeyPatch, tmp_path: Path):
         ),
         "hcu-vllm-das-plugin": FakeDistribution(
             "hcu-vllm-das-plugin",
-            "0.2.0.dev0",
+            "0.3.0.dev0",
             site,
             [
                 "hcu_vllm_das/extension.py",
@@ -113,7 +113,7 @@ def installed_fixture(monkeypatch: pytest.MonkeyPatch, tmp_path: Path):
                 "hcu_vllm_das/moe/__init__.py",
                 "hcu_vllm_das/moe/fused_moe_aiter.py",
                 "hcu_vllm_das/moe/int8_oracle.py",
-                "hcu_vllm_das_plugin-0.2.0.dist-info/RECORD",
+                "hcu_vllm_das_plugin-0.3.0.dist-info/RECORD",
             ],
         ),
     }
@@ -232,9 +232,9 @@ def test_attestation_accepts_owned_wheels_and_active_extension(
     report = verify_installed.collect_attestation()
 
     assert report["schema_version"] == 3
-    assert report["vllm"]["version"] == "0.32.0+rocm723"
+    assert report["vllm"]["version"] == "0.33.0+rocm723"
     assert report["adapter"]["version"] == "0.1.0"
-    assert report["plugin"]["version"] == "0.2.0.dev0"
+    assert report["plugin"]["version"] == "0.3.0.dev0"
     assert report["extension"] == {
         "capabilities": ["aiter-int8-moe", "lightop-rms-norm"],
         "entry_point": "das_hcu",
@@ -261,25 +261,25 @@ def test_attestation_accepts_owned_wheels_and_active_extension(
     json.dumps(report, sort_keys=True)
 
 
-def test_attestation_rejects_a_non_032_vllm(
+def test_attestation_rejects_a_non_033_vllm(
     monkeypatch: pytest.MonkeyPatch, tmp_path: Path
 ) -> None:
     distributions, *_ = installed_fixture(monkeypatch, tmp_path)
     distributions["vllm"].version = "0.31.0"
 
-    with pytest.raises(verify_installed.InstalledVerificationError, match="0.32.0"):
+    with pytest.raises(verify_installed.InstalledVerificationError, match="0.33.0"):
         verify_installed.collect_attestation()
 
 
-def test_attestation_accepts_a_vllm_032_patch_release(
+def test_attestation_accepts_a_vllm_033_patch_release(
     monkeypatch: pytest.MonkeyPatch, tmp_path: Path
 ) -> None:
     distributions, *_ = installed_fixture(monkeypatch, tmp_path)
-    distributions["vllm"].version = "0.32.1+rocm723"
+    distributions["vllm"].version = "0.33.1+rocm723"
 
     report = verify_installed.collect_attestation()
 
-    assert report["vllm"]["version"] == "0.32.1+rocm723"
+    assert report["vllm"]["version"] == "0.33.1+rocm723"
 
 
 def test_attestation_rejects_editable_or_unrecorded_installations(

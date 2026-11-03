@@ -1,20 +1,29 @@
 # HCU vLLM DAS optimization plugin
 
+Independent Flash public-registry publication and health contract:
+[Flash registry owner](../docs/validation/vllm032-flash-registry.md). Its
+activation dependencies are independent of the legacy RMS/INT8 bundle.
+
 `hcu-vllm-das-plugin` is the optimization-only extension for official vLLM
-0.32 and `adapter-das`. The adapter owns the HCU platform and runtime
+0.33 and `adapter-das`. The adapter owns the HCU platform and runtime
 lifecycle; this wheel contributes optional, independently removable operator
 optimizations through the adapter extension API.
 
-Version `0.2.0.dev0` contains two independently selected capabilities:
+Version `0.3.0.dev0` targets the `v0.33.0` branch. Migration status and current
+evidence are recorded in [v0.33 validation](../docs/validation/vllm033-upgrade.md);
+the v0.32 documents below are historical evidence and do not certify v0.33.
+It contains two independently selected operator capabilities:
 
 - a default-OFF LightOp ordinary and fused-add `RMSNorm` candidate; and
 - an explicit AITER INT8 W8A8 MoE route selected by `--moe-backend aiter`.
 
 It also provides an explicit HCU FlashAttention backend selected by
 `--attention-backend FLASH_ATTN`. The backend keeps vLLM's official metadata,
-scheduler, allocation, cache writer, and forward orchestration. It changes only
-the provider boundaries needed by the HCU vendor varlen ABI: dense HND/NHD K/V
-page views, FA2 keyword compatibility, and a 64-token kernel page.
+scheduler and allocation. Its public `AttentionImpl` owns the HCU provider call
+and dense HND/NHD cache views, routes BF16 writes to the native vLLM writer,
+and retains a Plugin E5M2 writer and descale adapter. The kernel page is 64
+tokens. It neither copies nor replaces the official Flash forward method and
+does not require private HCU hooks in the Core.
 
 vLLM's native `SiluAndMul` remains the selected implementation. Warmed
 compiled A/B measurements on `gfx936` did not justify replacing the upstream
@@ -25,10 +34,10 @@ operator-level capabilities.
 
 ## Compatibility
 
-- vLLM release line: `>=0.32.0,<0.33.0`; prerelease, postrelease,
+- vLLM release line: `>=0.33.0,<0.34.0`; prerelease, postrelease,
   development, patch, and local version suffixes are accepted when the
-  required operator APIs and LightOp capabilities are present. FLASH_ATTN also
-  requires the OpenDAS vLLM cache-view and kernel-call extension seams.
+  required operator APIs and LightOp capabilities are present. FLASH_ATTN uses
+  the official public backend registry and AttentionImpl contract.
 - Adapter distribution: `sgl-kernel>=0.1.0`, extension API v1 from
   `hcu_adapter.extensions`.
 - Runtime: a prepared HCU PyTorch/DTK/LightOp/AITER stack. LightOp and AITER
@@ -37,7 +46,7 @@ operator-level capabilities.
 - The plugin does not own `vllm.platform_plugins` or `vllm.general_plugins`.
 
 The repository root remains the vLLM 0.28.1 development reference. Build only
-this directory for vLLM 0.32:
+this directory for vLLM 0.33:
 
 ```bash
 python3 -m pip wheel --no-deps --wheel-dir ./dist ./adapter_extension
@@ -50,7 +59,7 @@ PyTorch, DTK, LightOp, and AITER builds. Install audited local wheels without
 dependency resolution, in this order:
 
 ```bash
-python3 -m pip install --no-deps /wheels/vllm-0.32.0+rocm*.whl
+python3 -m pip install --no-deps /wheels/vllm-0.33.0+*.whl
 python3 -m pip install --no-deps /wheels/sgl_kernel-*.whl
 python3 -m pip install --no-deps /wheels/hcu_vllm_das_plugin-*.whl
 ```
@@ -75,7 +84,7 @@ hcu_vllm_das.moe.int8_oracle.HcuAiterInt8Experts
 
 ## AITER INT8 W8A8 MoE
 
-The Plugin reuses vLLM 0.32's official channel-weight/token-activation W8A8
+The Plugin reuses vLLM 0.33's official channel-weight/token-activation W8A8
 quant configuration and kernel construction. It adds only the explicit AITER
 selector and translates the resulting tensors to the public `aiter.moe` API;
 the vendor wheel continues to own kernels and tuned configurations.
@@ -143,6 +152,16 @@ changing its mask. FP8 KV, DCP, hybrid caches, and layouts other than LBHNC and
 LBNHC remain unvalidated and are not claimed by this release.
 
 ## RMSNorm eligibility
+
+Provider admission checks the actual four-positional-argument call ABI before
+compile-factor or operator publication. It accepts normal Python signatures and,
+only for uninspectable native builtins, a compatible concrete declaration from
+generated binding documentation, including overloads and optional additions.
+Declarations are parsed without evaluating annotations or defaults. Missing or
+incompatible documentation, uninspectable Python callables, and asynchronous or
+generator providers are rejected. This extends the existing activation preflight;
+its provider checks still run even when the RMS execution flags are OFF.
+It neither invokes a provider nor proves kernel, Graph or model correctness.
 
 The LightOp RMSNorm path is selected only when all of the following hold:
 

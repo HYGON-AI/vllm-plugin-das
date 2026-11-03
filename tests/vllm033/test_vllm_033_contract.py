@@ -8,7 +8,7 @@ from pathlib import Path
 def target_root() -> Path:
     value = os.environ.get("VLLM_TARGET_ROOT")
     if not value:
-        raise AssertionError("VLLM_TARGET_ROOT must name the official vLLM 0.32 source")
+        raise AssertionError("VLLM_TARGET_ROOT must name the official vLLM 0.33 source")
     root = Path(value).resolve()
     if not (root / "vllm" / "__init__.py").is_file():
         raise AssertionError(f"VLLM_TARGET_ROOT does not contain vLLM: {root}")
@@ -31,7 +31,7 @@ def method_names(node: ast.ClassDef) -> set[str]:
     }
 
 
-def test_official_vllm_032_exposes_the_silu_oot_contract() -> None:
+def test_official_vllm_033_exposes_the_silu_oot_contract() -> None:
     root = target_root()
     source = root / "vllm" / "model_executor" / "layers" / "activation.py"
     tree = ast.parse(source.read_text(encoding="utf-8"), filename=os.fspath(source))
@@ -42,7 +42,7 @@ def test_official_vllm_032_exposes_the_silu_oot_contract() -> None:
     assert {"forward_native", "forward_cuda"}.issubset(method_names(silu))
 
 
-def test_official_vllm_032_exposes_the_rmsnorm_oot_contract() -> None:
+def test_official_vllm_033_exposes_the_rmsnorm_oot_contract() -> None:
     root = target_root()
     source = root / "vllm" / "model_executor" / "layers" / "layernorm.py"
     tree = ast.parse(source.read_text(encoding="utf-8"), filename=os.fspath(source))
@@ -88,7 +88,7 @@ def test_official_vllm_032_exposes_the_rmsnorm_oot_contract() -> None:
     }.issubset(assigned_attributes)
 
 
-def test_official_vllm_032_exposes_registration_interfaces() -> None:
+def test_official_vllm_033_exposes_registration_interfaces() -> None:
     root = target_root()
     custom_op_path = root / "vllm" / "model_executor" / "custom_op.py"
     custom_op_tree = ast.parse(

@@ -6,7 +6,7 @@ from dataclasses import dataclass
 from importlib import import_module
 import logging
 from threading import Lock
-from typing import Any, Callable
+from typing import Callable
 
 import torch
 

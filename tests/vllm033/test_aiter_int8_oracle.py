@@ -1,6 +1,5 @@
 from __future__ import annotations
 
-from enum import Enum
 import os
 from pathlib import Path
 import sys
@@ -199,7 +198,7 @@ def test_plugin_expert_adds_only_int8_channel_token_support(
 
     assert experts.consumes_expert_mask is False
     assert experts._supports_quant_scheme("int8-channel", "int8-token") is True
-    assert experts._supports_quant_scheme("fp8-channel", "fp8-token") is True
+    assert experts._supports_quant_scheme("fp8-channel", "fp8-token") is False
     assert experts._supports_quant_scheme("int8-channel", "static-int8") is False
 
 

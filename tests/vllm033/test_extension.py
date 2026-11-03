@@ -1,6 +1,8 @@
 from __future__ import annotations
 
 from concurrent.futures import ThreadPoolExecutor
+import inspect
+import math
 import os
 from pathlib import Path
 import subprocess
@@ -19,7 +21,7 @@ from hcu_adapter.extensions import ExtensionContext, ExtensionSpec
 from hcu_vllm_das import extension
 
 
-def context(version: str | None = "0.32.0") -> ExtensionContext:
+def context(version: str | None = "0.33.0") -> ExtensionContext:
     return ExtensionContext(adapter_version="0.1.0.dev0", vllm_version=version)
 
 
@@ -94,6 +96,9 @@ def successful_importer(calls: list[str]):
         "vllm.model_executor.layers.layernorm": SimpleNamespace(RMSNorm=RMSNorm),
         "vllm.utils.torch_utils": SimpleNamespace(
             direct_register_custom_op=lambda **kwargs: None
+        ),
+        "vllm.envs": SimpleNamespace(
+            environment_variables={}, compile_factors=lambda: {}
         ),
         "aiter.moe": SimpleNamespace(
             MoeQuantType=MoeQuantType,
@@ -188,16 +193,16 @@ assert not introduced, introduced
 @pytest.mark.parametrize(
     "version",
     (
-        "0.32.0",
-        "0.32.0rc1",
-        "0.32.0.dev7",
-        "0.32.0.post1",
-        "0.32.0+rocm723",
-        "0.32.1",
-        "0.32.7+das.1",
+        "0.33.0",
+        "0.33.0rc1",
+        "0.33.0.dev7",
+        "0.33.0.post1",
+        "0.33.0+rocm723",
+        "0.33.1",
+        "0.33.7+das.1",
     ),
 )
-def test_activation_accepts_the_vllm_032_release_line(
+def test_activation_accepts_the_vllm_033_release_line(
     monkeypatch: pytest.MonkeyPatch, version: str
 ) -> None:
     calls: list[str] = []
@@ -210,6 +215,7 @@ def test_activation_accepts_the_vllm_032_release_line(
         "aiter.moe",
         "vllm.model_executor.layers.layernorm",
         "vllm.utils.torch_utils",
+        "vllm.envs",
         "hcu_vllm_das.rms_norm",
         "hcu_vllm_das.moe.int8_oracle",
     ]
@@ -217,7 +223,7 @@ def test_activation_accepts_the_vllm_032_release_line(
 
 @pytest.mark.parametrize(
     "version",
-    (None, "not-a-version", "1!0.32.0", "0.31.0", "0.31.9", "0.33.0"),
+    (None, "not-a-version", "1!0.33.0", "0.31.0", "0.31.9", "0.34.0"),
 )
 def test_activation_rejects_unsupported_metadata_before_importing_runtime(
     monkeypatch: pytest.MonkeyPatch, version: str | None
@@ -227,7 +233,7 @@ def test_activation_rejects_unsupported_metadata_before_importing_runtime(
 
     with pytest.raises(
         extension.DasExtensionError,
-        match=r">=0\.32\.0,<0\.33\.0",
+        match=r">=0\.33\.0,<0\.34\.0",
     ):
         extension.activate_extension(context(version))
 
@@ -428,6 +434,213 @@ def test_repeated_and_concurrent_activation_registers_capability_once(
         "aiter.moe",
         "vllm.model_executor.layers.layernorm",
         "vllm.utils.torch_utils",
+        "vllm.envs",
         "hcu_vllm_das.rms_norm",
         "hcu_vllm_das.moe.int8_oracle",
     ]
+
+
+@pytest.mark.parametrize("documentation", (
+    "rmsnorm_forward_autograd(arg0: torch.Tensor, arg1: torch.Tensor, arg2: typing.SupportsFloat, arg3: bool) -> torch.Tensor",
+    "rmsnorm_forward_autograd(*args, **kwargs)\nOverloaded function.\n\n"
+    "1. rmsnorm_forward_autograd(a, b, epsilon, training, required_extra)\n"
+    "2. rmsnorm_forward_autograd(a, b, epsilon, training, optional_extra=False)",
+))
+def test_uninspectable_native_rms_uses_documented_call_abi_before_publication(
+    monkeypatch: pytest.MonkeyPatch, documentation: str,
+) -> None:
+    # A real C builtin without inspect metadata stands in for the pybind export.
+    # Only its documentation is doubled; it must never be invoked by preflight.
+    with pytest.raises(ValueError):
+        inspect.signature(math.log)
+    monkeypatch.setenv("VLLM_HCU_USE_CUSTOM_OPS", "1")
+    monkeypatch.setenv("VLLM_HCU_USE_CUSTOM_RMS_NORM", "1")
+    calls = []
+    base = successful_importer(calls)
+    getdoc = inspect.getdoc
+    monkeypatch.setattr(inspect, "getdoc", lambda value: documentation if value is math.log else getdoc(value))
+
+    def changed_importer(name):
+        module = base(name)
+        if name == "lightop.norm":
+            module.rmsnorm_forward_autograd = math.log
+        return module
+
+    monkeypatch.setattr(extension, "_import_module", changed_importer)
+    extension.activate_extension(context())
+    assert extension._activated is True
+    assert calls.index("lightop.norm") < calls.index("hcu_vllm_das.rms_norm")
+
+
+@pytest.mark.parametrize("documentation", (
+    None,
+    "rmsnorm_forward_autograd(*args, **kwargs)",
+    "rmsnorm_forward_autograd(a, b, epsilon)",
+    "rmsnorm_forward_autograd(a, b, epsilon, training, required_extra)",
+    "rmsnorm_forward_autograd(a, b, epsilon, *, training)",
+    "another_function(a, b, epsilon, training)",
+))
+def test_uninspectable_native_rms_rejects_unproven_or_incompatible_doc_abi(
+    monkeypatch: pytest.MonkeyPatch, documentation: str | None,
+) -> None:
+    monkeypatch.setenv("VLLM_HCU_USE_CUSTOM_OPS", "1")
+    monkeypatch.setenv("VLLM_HCU_USE_CUSTOM_RMS_NORM", "1")
+    calls = []
+    base = successful_importer(calls)
+    getdoc = inspect.getdoc
+    monkeypatch.setattr(inspect, "getdoc", lambda value: documentation if value is math.log else getdoc(value))
+
+    def changed_importer(name):
+        module = base(name)
+        if name == "lightop.norm":
+            module.rmsnorm_forward_autograd = math.log
+        return module
+
+    monkeypatch.setattr(extension, "_import_module", changed_importer)
+    with pytest.raises(extension.DasExtensionError, match="documented.*argument"):
+        extension.activate_extension(context())
+    assert calls == ["lightop.norm"]
+    assert extension._activated is False
+    assert "hcu_vllm_das.rms_norm" not in calls
+
+
+def test_uninspectable_python_rms_is_not_treated_as_a_native_binding(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    class OpaquePythonCallable:
+        """rmsnorm_forward_autograd(x, weight, epsilon, training) -> Tensor"""
+
+        __signature__ = 42
+
+        def __call__(self, x, weight, epsilon, training):
+            raise AssertionError("preflight must not call providers")
+
+    monkeypatch.setenv("VLLM_HCU_USE_CUSTOM_OPS", "1")
+    monkeypatch.setenv("VLLM_HCU_USE_CUSTOM_RMS_NORM", "1")
+    calls = []
+    base = successful_importer(calls)
+
+    def changed_importer(name):
+        module = base(name)
+        if name == "lightop.norm":
+            module.rmsnorm_forward_autograd = OpaquePythonCallable()
+        return module
+
+    monkeypatch.setattr(extension, "_import_module", changed_importer)
+    with pytest.raises(extension.DasExtensionError, match="four-positional-argument") as caught:
+        extension.activate_extension(context())
+    assert calls == ["lightop.norm"]
+    assert extension._activated is False
+    assert "hcu_vllm_das.rms_norm" not in calls
+
+    assert isinstance(caught.value.__cause__, TypeError)
+    assert "__signature__" in str(caught.value.__cause__)
+
+
+@pytest.mark.parametrize("name", ("rmsnorm_forward_autograd", "fused_add_rms_norm"))
+@pytest.mark.parametrize("kind", (
+    "required_fifth", "only_three", "keyword_only", "coroutine", "generator", "async_generator",
+))
+def test_rms_call_contract_rejects_before_factors_or_oot_publication(
+    monkeypatch: pytest.MonkeyPatch, name: str, kind: str,
+) -> None:
+    def required_fifth(a, b, c, d, e):
+        raise AssertionError("preflight must not call providers")
+
+    def only_three(a, b, c):
+        raise AssertionError("preflight must not call providers")
+
+    def keyword_only(a, b, c, *, d):
+        raise AssertionError("preflight must not call providers")
+
+    async def coroutine(a, b, c, d):
+        raise AssertionError("preflight must not call providers")
+
+    def generator(a, b, c, d):
+        raise AssertionError("preflight must not call providers")
+        yield
+
+    async def async_generator(a, b, c, d):
+        raise AssertionError("preflight must not call providers")
+        yield
+
+    replacements = {
+        "required_fifth": required_fifth, "only_three": only_three,
+        "keyword_only": keyword_only, "coroutine": coroutine,
+        "generator": generator, "async_generator": async_generator,
+    }
+    calls: list[str] = []
+    base = successful_importer(calls)
+
+    def changed_importer(module_name: str):
+        module = base(module_name)
+        if module_name == "lightop.norm":
+            setattr(module, name, replacements[kind])
+        return module
+
+    monkeypatch.setattr(extension, "_import_module", changed_importer)
+    with pytest.raises(extension.DasExtensionError, match="four-positional-argument|synchronous"):
+        extension.activate_extension(context())
+
+    assert extension._activated is False
+    assert calls == ["lightop.norm"]
+
+
+def test_inspectable_native_rms_cannot_use_documentation_to_hide_wrong_arity(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    inspect.signature(math.sin).bind(0)
+    calls: list[str] = []
+    base = successful_importer(calls)
+    getdoc = inspect.getdoc
+    documentation_reads = []
+
+    def documentation(function):
+        if function is math.sin:
+            documentation_reads.append(function)
+            return "rmsnorm_forward_autograd(x, weight, epsilon, training)"
+        return getdoc(function)
+
+    def changed_importer(name: str):
+        module = base(name)
+        if name == "lightop.norm":
+            module.rmsnorm_forward_autograd = math.sin
+        return module
+
+    monkeypatch.setattr(inspect, "getdoc", documentation)
+    monkeypatch.setattr(extension, "_import_module", changed_importer)
+    with pytest.raises(extension.DasExtensionError, match="four-positional-argument"):
+        extension.activate_extension(context())
+
+    assert calls == ["lightop.norm"]
+    assert documentation_reads == []
+    assert extension._activated is False
+
+
+def test_native_rms_documentation_defaults_and_annotations_are_not_evaluated(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    marker = "HCU_RMS_DOC_SHOULD_NOT_EXECUTE"
+    monkeypatch.delenv(marker, raising=False)
+    documentation = (
+        "rmsnorm_forward_autograd(a, b, epsilon, training, "
+        "optional_extra=__import__('os').environ.__setitem__('"
+        + marker + "', '1')) -> __import__('os').environ.__setitem__('"
+        + marker + "', '1')"
+    )
+    calls: list[str] = []
+    base = successful_importer(calls)
+    getdoc = inspect.getdoc
+    monkeypatch.setattr(inspect, "getdoc", lambda function: documentation if function is math.log else getdoc(function))
+
+    def changed_importer(name: str):
+        module = base(name)
+        if name == "lightop.norm":
+            module.rmsnorm_forward_autograd = math.log
+        return module
+
+    monkeypatch.setattr(extension, "_import_module", changed_importer)
+    extension.activate_extension(context())
+
+    assert extension._activated is True
+    assert marker not in os.environ

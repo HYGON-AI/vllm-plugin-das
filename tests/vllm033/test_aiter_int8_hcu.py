@@ -22,7 +22,7 @@ INT8_LIMITS = {
 
 
 def _live_requested() -> bool:
-    return os.environ.get("HCU_VLLM032_AITER_INT8_LIVE") == "1"
+    return os.environ.get("HCU_VLLM033_AITER_INT8_LIVE") == "1"
 
 
 def _assert_int8_numerics(actual, reference) -> dict[str, float]:
@@ -79,7 +79,7 @@ def _inputs(torch, m: int, device):
 def qwen_int8_tensors():
     if not _live_requested():
         pytest.skip(
-            "set HCU_VLLM032_AITER_INT8_LIVE=1 for live AITER INT8 MoE"
+            "set HCU_VLLM033_AITER_INT8_LIVE=1 for live AITER INT8 MoE"
         )
 
     import torch
@@ -133,7 +133,7 @@ def qwen_int8_tensors():
 
 @pytest.mark.skipif(
     not _live_requested(),
-    reason="set HCU_VLLM032_AITER_INT8_LIVE=1 for live AITER INT8 MoE",
+    reason="set HCU_VLLM033_AITER_INT8_LIVE=1 for live AITER INT8 MoE",
 )
 @pytest.mark.parametrize("m", (1, 16, 128))
 def test_aiter_int8_matches_triton_and_replays_graph(

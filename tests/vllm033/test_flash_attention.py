@@ -1,17 +1,18 @@
 from __future__ import annotations
 
 import importlib
+import ast
 import os
 import sys
 from pathlib import Path
 from types import ModuleType, SimpleNamespace
+from abc import ABC, abstractmethod
+from typing import ClassVar, Generic, TypeVar
 
 import pytest
 import torch
 
-PLUGIN_SOURCE_ROOT = (
-    Path(__file__).resolve().parents[2] / "adapter_extension" / "src"
-)
+PLUGIN_SOURCE_ROOT = Path(__file__).resolve().parents[2] / "adapter_extension" / "src"
 sys.path.insert(0, os.fspath(PLUGIN_SOURCE_ROOT))
 
 
@@ -21,44 +22,12 @@ def load_flash_attention(
     with_vllm_seams: bool = True,
     kv_cache_layout: str = "LBHNC",
 ):
-    class FlashAttentionImpl:
-        supports_dcp = True
+    class AttentionImpl:
+        dcp_world_size = pcp_world_size = 1
 
-        def __init__(self, *args, **kwargs):
-            kv_cache_dtype = kwargs.get(
-                "kv_cache_dtype",
-                args[6] if len(args) > 6 else None,
-            )
-            self.upstream_kv_cache_dtype = kv_cache_dtype
-            if kv_cache_dtype == "fp8_e5m2":
-                raise NotImplementedError("upstream rejects fp8_e5m2")
-            self.kv_cache_dtype = kv_cache_dtype
-            self.supports_quant_query_input = True
-            self.vllm_flash_attn_version = kwargs.pop("version", None)
-
-        def do_kv_cache_update(
-            self,
-            layer,
-            key,
-            value,
-            kv_cache,
-            slot_mapping,
-        ):
-            self.upstream_cache_update = (
-                layer,
-                key,
-                value,
-                kv_cache,
-                slot_mapping,
-            )
-
-    if with_vllm_seams:
-        for name in (
-            "_get_kv_cache_views",
-            "_get_kv_cache_write_views",
-            "_run_flash_attention",
-        ):
-            setattr(FlashAttentionImpl, name, lambda self, *args, **kwargs: None)
+        @classmethod
+        def __class_getitem__(cls, item):
+            return cls
 
     class FlashAttentionBackend:
         @classmethod
@@ -95,14 +64,14 @@ def load_flash_attention(
     backends = ModuleType("vllm.v1.attention.backends")
     backends.__path__ = []
     official = ModuleType("vllm.v1.attention.backends.flash_attn")
-    official.FlashAttentionImpl = FlashAttentionImpl
+    official.FlashAttentionMetadata = SimpleNamespace
+    public_api = ModuleType("vllm.v1.attention.backend")
+    public_api.AttentionImpl = AttentionImpl
     official.FlashAttentionBackend = FlashAttentionBackend
     layouts = ModuleType("vllm.v1.kv_cache_layout")
     layouts.KVCacheLayout = SimpleNamespace(LBHNC="LBHNC", LBNHC="LBNHC")
     config = ModuleType("vllm.config")
-    cache_config = SimpleNamespace(
-        get_resolved_kv_cache_layout=lambda: kv_cache_layout
-    )
+    cache_config = SimpleNamespace(get_resolved_kv_cache_layout=lambda: kv_cache_layout)
     config.get_current_vllm_config_or_none = lambda: SimpleNamespace(
         cache_config=cache_config
     )
@@ -111,6 +80,7 @@ def load_flash_attention(
         ("vllm.config", config),
         ("vllm.v1", v1),
         ("vllm.v1.attention", attention),
+        ("vllm.v1.attention.backend", public_api),
         ("vllm.v1.attention.backends", backends),
         ("vllm.v1.attention.backends.flash_attn", official),
         ("vllm.v1.kv_cache_layout", layouts),
@@ -124,9 +94,193 @@ def load_flash_attention(
     return importlib.import_module("hcu_vllm_das.attention.flash_attn")
 
 
-def test_import_rejects_vllm_without_required_flash_attention_seams(monkeypatch):
-    with pytest.raises(RuntimeError, match="_get_kv_cache_write_views"):
-        load_flash_attention(monkeypatch, with_vllm_seams=False)
+def test_import_requires_only_public_attention_api(monkeypatch):
+    flash = load_flash_attention(monkeypatch, with_vllm_seams=False)
+    assert flash.HcuFlashAttentionImpl.__bases__[0].__name__ == "AttentionImpl"
+
+
+def test_constructs_against_target_public_abstract_base(monkeypatch):
+    """Execute the target ABC, including its real __new__, without native ops.
+
+    Only group/config dependencies are CPU doubles; constructor/abstract and
+    fusion contracts come from the selected source rather than a fake class.
+    Full installed vLLM imports remain a separate native-ABI gate.
+    """
+    root = Path(os.environ["VLLM_TARGET_ROOT"])
+    source = root / "vllm/v1/attention/backend.py"
+    tree = ast.parse(source.read_text())
+    definitions = [
+        node
+        for node in tree.body
+        if isinstance(node, ast.ClassDef)
+        and node.name in {"AttentionImplBase", "AttentionImpl"}
+    ]
+    namespace = dict(
+        ABC=ABC,
+        abstractmethod=abstractmethod,
+        Generic=Generic,
+        ClassVar=ClassVar,
+        T=TypeVar("T"),
+        AttentionType=SimpleNamespace(DECODER="decoder"),
+    )
+    # Compile annotations without evaluating framework-only type names.
+    import __future__
+
+    exec(
+        compile(
+            ast.Module(body=definitions, type_ignores=[]),
+            str(source),
+            "exec",
+            flags=__future__.annotations.compiler_flag,
+        ),
+        namespace,
+    )
+    flash = load_flash_attention(monkeypatch)
+    public = sys.modules["vllm.v1.attention.backend"]
+    public.AttentionImpl = namespace["AttentionImpl"]
+    groups = ModuleType("vllm.distributed.parallel_state")
+    groups.get_dcp_world_size_and_rank = lambda enabled: (1, 0)
+    groups.get_pcp_group = lambda: SimpleNamespace(world_size=1, rank_in_group=0)
+    monkeypatch.setitem(sys.modules, "vllm.distributed.parallel_state", groups)
+    sys.modules["vllm.config"].get_current_vllm_config_or_none = lambda: None
+    monkeypatch.delitem(sys.modules, "hcu_vllm_das.attention.flash_attn")
+    flash = importlib.import_module("hcu_vllm_das.attention.flash_attn")
+    impl = make_impl(flash)
+    assert impl.dcp_world_size == impl.pcp_world_size == 1
+    assert impl.fused_output_quant_supported(None) is False
+    assert impl.fused_qk_norm_rope_kvcache_supported() is False
+    assert impl.fused_rope_kvcache_supported() is False
+
+
+def metadata(tokens=2):
+    return SimpleNamespace(
+        num_actual_tokens=tokens,
+        causal=True,
+        query_start_loc=torch.tensor([0, tokens], dtype=torch.int32),
+        max_query_len=tokens,
+        seq_lens=torch.tensor([7], dtype=torch.int32),
+        max_seq_len=7,
+        block_table=torch.tensor([[1]], dtype=torch.int32),
+        mm_prefix_query_range_tensor=None,
+        rswa_prefix_lens=None,
+        dcp_context_kv_lens=None,
+    )
+
+
+@pytest.mark.parametrize("layout", ("LBHNC", "LBNHC"))
+@pytest.mark.parametrize("dtype", ("bfloat16", "fp8_e5m2"))
+def test_forward_preserves_output_padding_and_passes_paged_metadata(
+    monkeypatch, layout, dtype
+):
+    flash = load_flash_attention(monkeypatch, kv_cache_layout=layout)
+    impl = make_impl(flash, kv_cache_dtype=dtype)
+    query = torch.randn(5, 4, 64)
+    output = torch.full_like(query, -99.0)
+    layer = SimpleNamespace(_k_scale=torch.tensor(0.5), _v_scale=torch.tensor(0.25))
+    cache_dtype = torch.uint8 if dtype == "fp8_e5m2" else torch.bfloat16
+    cache = torch.empty_strided(
+        (2, 4, 64, 128),
+        (32768, 8192, 128, 1) if layout == "LBHNC" else (32768, 128, 512, 1),
+        dtype=cache_dtype,
+    )
+    calls = []
+
+    def provider(**arguments):
+        calls.append(arguments)
+        arguments["out"].fill_(7)
+
+    monkeypatch.setattr(impl, "_run_flash_attention", provider)
+    batch = metadata()
+    result = impl.forward(layer, query, query, query, cache, batch, output)
+
+    assert result is output
+    torch.testing.assert_close(output[:2], torch.full_like(output[:2], 7.0))
+    torch.testing.assert_close(output[2:], torch.full_like(output[2:], -99.0))
+    assert len(calls) == 1
+    arguments = calls[0]
+    assert arguments["q"].shape == (2, 4, 64)
+    assert arguments["out"].data_ptr() == output.data_ptr()
+    assert arguments["block_table"] is batch.block_table
+    assert arguments["cu_seqlens_q"] is batch.query_start_loc
+    assert arguments["seqused_k"] is batch.seq_lens
+    assert arguments["max_seqlen_k"] == 7
+    assert arguments["q_descale"] is None
+    if dtype == "fp8_e5m2":
+        torch.testing.assert_close(arguments["k_descale"], torch.full((1, 4), 0.5))
+        torch.testing.assert_close(arguments["v_descale"], torch.full((1, 4), 0.25))
+    else:
+        assert arguments["k_descale"] is arguments["v_descale"] is None
+
+
+def test_forward_profiles_without_provider_and_leaves_empty_batch_untouched(
+    monkeypatch,
+):
+    flash = load_flash_attention(monkeypatch)
+    impl = make_impl(flash)
+    monkeypatch.setattr(
+        impl,
+        "_run_flash_attention",
+        lambda **kw: pytest.fail("unexpected provider call"),
+    )
+    output = torch.ones(3, 4, 64)
+    assert impl.forward(None, None, None, None, None, None, output) is output
+    assert torch.count_nonzero(output) == 0
+    output.fill_(3)
+    assert impl.forward(None, None, None, None, None, metadata(0), output) is output
+    assert torch.all(output == 3)
+
+
+@pytest.mark.parametrize(
+    "field,value",
+    (
+        ("causal", False),
+        ("causal", torch.tensor([True])),
+        ("mm_prefix_query_range_tensor", torch.empty(2, 2)),
+        ("rswa_prefix_lens", torch.tensor([1])),
+        ("dcp_context_kv_lens", torch.tensor([1])),
+    ),
+)
+def test_forward_rejects_unsupported_metadata_before_provider(
+    monkeypatch, field, value
+):
+    flash = load_flash_attention(monkeypatch)
+    impl = make_impl(flash)
+    batch = metadata()
+    setattr(batch, field, value)
+    with pytest.raises(NotImplementedError, match="metadata"):
+        impl.forward(None, None, None, None, None, batch, None)
+
+
+@pytest.mark.parametrize("argument", ("output_scale", "output_block_scale"))
+def test_forward_rejects_fused_output_quantization(monkeypatch, argument):
+    impl = make_impl(load_flash_attention(monkeypatch))
+    with pytest.raises(NotImplementedError, match="output quantization"):
+        impl.forward(
+            None, None, None, None, None, None, None, **{argument: torch.tensor(1.0)}
+        )
+
+
+@pytest.mark.parametrize(
+    "kwargs",
+    (
+        {"attn_type": "encoder"},
+        {"sliding_window": 128},
+        {"sinks": torch.empty(4)},
+        {"kv_cache_dtype": "fp8_e4m3"},
+        {"head_size": 96},
+        {"num_kv_heads": 3},
+    ),
+)
+def test_constructor_rejects_unsupported_configuration(monkeypatch, kwargs):
+    flash = load_flash_attention(monkeypatch)
+    with pytest.raises((ValueError, NotImplementedError)):
+        make_impl(flash, **kwargs)
+
+
+def make_impl(flash, **kwargs):
+    arguments = dict(num_heads=4, head_size=64, scale=0.125)
+    arguments.update(kwargs)
+    return flash.HcuFlashAttentionImpl(**arguments)
 
 
 @pytest.mark.parametrize(
@@ -174,27 +328,37 @@ def test_dense_views_separate_kv_and_preserve_block_stride(
         storage_offset=storage_offset,
     )
 
-    impl = flash.HcuFlashAttentionImpl()
+    impl = make_impl(flash)
     impl.head_size = head_size
     key, value = impl._get_kv_cache_views(packed)
     write_key, write_value = impl._get_kv_cache_write_views(packed)
     key.fill_(11)
     value.fill_(22)
 
-    assert key.shape == value.shape == read_shape(
-        num_blocks, num_heads, block_size, head_size
+    assert (
+        key.shape
+        == value.shape
+        == read_shape(num_blocks, num_heads, block_size, head_size)
     )
-    assert key.stride() == value.stride() == (
-        block_stride,
-        *read_inner_strides(num_heads, block_size, head_size),
+    assert (
+        key.stride()
+        == value.stride()
+        == (
+            block_stride,
+            *read_inner_strides(num_heads, block_size, head_size),
+        )
     )
     assert key.storage_offset() == storage_offset
     assert value.storage_offset() == storage_offset + half_page
-    assert write_key.shape == write_value.shape == (
-        num_blocks,
-        block_size,
-        num_heads,
-        head_size,
+    assert (
+        write_key.shape
+        == write_value.shape
+        == (
+            num_blocks,
+            block_size,
+            num_heads,
+            head_size,
+        )
     )
     expected_write_key = key.transpose(1, 2) if layout == "LBHNC" else key
     expected_write_value = value.transpose(1, 2) if layout == "LBHNC" else value
@@ -209,11 +373,7 @@ def test_dense_views_separate_kv_and_preserve_block_stride(
         torch.full((half_page,), 22.0),
     )
     torch.testing.assert_close(
-        raw[
-            storage_offset + block_stride : storage_offset
-            + block_stride
-            + half_page
-        ],
+        raw[storage_offset + block_stride : storage_offset + block_stride + half_page],
         torch.full((half_page,), 11.0),
     )
     torch.testing.assert_close(
@@ -233,7 +393,7 @@ def test_dense_views_separate_kv_and_preserve_block_stride(
 def test_backend_selects_fa2_dual_layout_and_64_token_pages(monkeypatch):
     flash = load_flash_attention(monkeypatch)
 
-    impl = flash.HcuFlashAttentionImpl()
+    impl = make_impl(flash)
 
     assert impl.vllm_flash_attn_version == 2
     assert flash.HcuFlashAttentionBackend.get_impl_cls() is type(impl)
@@ -293,19 +453,19 @@ def test_backend_accepts_only_hcu_e5m2_extension_and_delegates_other_dtypes(
             kv_cache_dtype="bfloat16",
             **common,
         )
-        == "delegated-combination-result"
+        is None
     )
 
 
 @pytest.mark.parametrize("constructor_style", ("keyword", "positional"))
-def test_e5m2_constructor_bypasses_only_upstream_guard(
+def test_e5m2_constructor_preserves_public_dtype_contract(
     monkeypatch,
     constructor_style,
 ):
     flash = load_flash_attention(monkeypatch)
 
     if constructor_style == "keyword":
-        impl = flash.HcuFlashAttentionImpl(kv_cache_dtype="fp8_e5m2")
+        impl = make_impl(flash, kv_cache_dtype="fp8_e5m2")
     else:
         impl = flash.HcuFlashAttentionImpl(
             4,
@@ -317,19 +477,17 @@ def test_e5m2_constructor_bypasses_only_upstream_guard(
             "fp8_e5m2",
         )
 
-    assert impl.upstream_kv_cache_dtype == "auto"
     assert impl.kv_cache_dtype == "fp8_e5m2"
     assert impl.supports_quant_query_input is False
 
 
-def test_non_e5m2_constructor_preserves_upstream_dtype_state(monkeypatch):
+def test_non_e5m2_constructor_uses_unquantized_query_input(monkeypatch):
     flash = load_flash_attention(monkeypatch)
 
-    impl = flash.HcuFlashAttentionImpl(kv_cache_dtype="bfloat16")
+    impl = make_impl(flash, kv_cache_dtype="bfloat16")
 
-    assert impl.upstream_kv_cache_dtype == "bfloat16"
     assert impl.kv_cache_dtype == "bfloat16"
-    assert impl.supports_quant_query_input is True
+    assert impl.supports_quant_query_input is False
 
 
 def test_e5m2_cache_update_uses_plugin_writer_and_resolved_write_views(
@@ -342,7 +500,7 @@ def test_e5m2_cache_update_uses_plugin_writer_and_resolved_write_views(
         "_reshape_and_cache_e5m2",
         lambda *args: calls.append(args),
     )
-    impl = flash.HcuFlashAttentionImpl()
+    impl = make_impl(flash)
     impl.kv_cache_dtype = "fp8_e5m2"
     impl.head_size = 4
     key = torch.randn(2, 3, 4)
@@ -372,20 +530,33 @@ def test_e5m2_cache_update_uses_plugin_writer_and_resolved_write_views(
     assert not hasattr(impl, "upstream_cache_update")
 
 
-def test_non_e5m2_cache_update_delegates_unchanged_to_upstream(monkeypatch):
-    flash = load_flash_attention(monkeypatch)
-    monkeypatch.setattr(
-        flash,
-        "_reshape_and_cache_e5m2",
-        lambda *args: pytest.fail("E5M2 writer must not run"),
-    )
-    impl = flash.HcuFlashAttentionImpl()
-    impl.kv_cache_dtype = "bfloat16"
-    args = tuple(object() for _ in range(5))
+@pytest.mark.parametrize("layout", ("LBHNC", "LBNHC"))
+def test_non_e5m2_cache_update_uses_native_writer_with_dense_views(monkeypatch, layout):
+    flash = load_flash_attention(monkeypatch, kv_cache_layout=layout)
+    calls = []
+    native = ModuleType("vllm._custom_ops")
+    native.reshape_and_cache_flash = lambda *args: calls.append(args)
+    monkeypatch.setitem(sys.modules, "vllm._custom_ops", native)
+    impl = make_impl(flash, kv_cache_dtype="bfloat16")
+    impl.head_size = 4
+    strides = (120, 40, 8, 1) if layout == "LBHNC" else (120, 8, 24, 1)
+    packed = torch.empty_strided((1, 3, 5, 8), strides)
+    key = torch.randn(2, 3, 4)
+    value = torch.randn_like(key)
+    slots = torch.tensor([0, 1], dtype=torch.long)
+    layer = SimpleNamespace(_k_scale=torch.tensor(1.0), _v_scale=torch.tensor(1.0))
 
-    impl.do_kv_cache_update(*args)
+    impl.do_kv_cache_update(layer, key, value, packed, slots)
 
-    assert impl.upstream_cache_update == args
+    assert len(calls) == 1
+    k, v = impl._get_kv_cache_write_views(packed)
+    assert calls[0][:2] == (key, value)
+    assert calls[0][2].data_ptr() == k.data_ptr()
+    assert calls[0][3].data_ptr() == v.data_ptr()
+    assert calls[0][2].stride() == k.stride()
+    assert calls[0][3].stride() == v.stride()
+    assert calls[0][4] is slots
+    assert calls[0][5] == "bfloat16"
 
 
 @pytest.mark.parametrize(
@@ -403,16 +574,14 @@ def test_e5m2_vendor_boundary_reinterprets_kv_bytes_only(
         "_vendor_varlen_func",
         lambda: lambda **kwargs: calls.append(kwargs) or "output",
     )
-    impl = flash.HcuFlashAttentionImpl()
+    impl = make_impl(flash)
     impl.kv_cache_dtype = "fp8_e5m2"
     query = torch.empty(1, 4, 64, dtype=torch.bfloat16)
     raw_key = torch.arange(64, dtype=torch.uint8)
     raw_value = torch.arange(64, dtype=torch.uint8).flip(0)
     key = raw_key if incoming_dtype == torch.uint8 else raw_key.view(incoming_dtype)
     value = (
-        raw_value
-        if incoming_dtype == torch.uint8
-        else raw_value.view(incoming_dtype)
+        raw_value if incoming_dtype == torch.uint8 else raw_value.view(incoming_dtype)
     )
     k_descale = torch.tensor(0.5)
     v_descale = torch.tensor(0.25)
@@ -442,7 +611,7 @@ def test_e5m2_vendor_boundary_rejects_non_byte_kv_storage(monkeypatch):
         "_vendor_varlen_func",
         lambda: pytest.fail("vendor must not run"),
     )
-    impl = flash.HcuFlashAttentionImpl()
+    impl = make_impl(flash)
     impl.kv_cache_dtype = "fp8_e5m2"
 
     with pytest.raises(ValueError, match="one-byte K/V storage"):
@@ -461,7 +630,7 @@ def test_non_e5m2_vendor_boundary_preserves_kv_dtype(monkeypatch):
         "_vendor_varlen_func",
         lambda: lambda **kwargs: calls.append(kwargs),
     )
-    impl = flash.HcuFlashAttentionImpl()
+    impl = make_impl(flash)
     impl.kv_cache_dtype = "auto"
     key = torch.empty(64, dtype=torch.float8_e4m3fn)
     value = torch.empty_like(key)
@@ -479,7 +648,7 @@ def test_backend_accepts_vendor_supported_head_sizes(monkeypatch, head_size):
     assert flash.HcuFlashAttentionBackend.supports_head_size(head_size) is True
 
 
-@pytest.mark.parametrize("head_size", (8, 32, 80, 96, 264))
+@pytest.mark.parametrize("head_size", (-64, 0, 8, 32, 80, 96, 264))
 def test_backend_rejects_vendor_unsupported_head_sizes(monkeypatch, head_size):
     flash = load_flash_attention(monkeypatch)
 
@@ -493,9 +662,7 @@ def test_backend_rejects_vendor_unsupported_head_sizes(monkeypatch, head_size):
 def test_varlen_boundary_forwards_fa2_keywords_without_fa4_options(
     monkeypatch, kv_cache_layout, kernel_layout
 ):
-    flash = load_flash_attention(
-        monkeypatch, kv_cache_layout=kv_cache_layout
-    )
+    flash = load_flash_attention(monkeypatch, kv_cache_layout=kv_cache_layout)
     calls = []
 
     def vendor(**kwargs):
@@ -503,7 +670,7 @@ def test_varlen_boundary_forwards_fa2_keywords_without_fa4_options(
         return "vendor-output"
 
     monkeypatch.setattr(flash, "_vendor_varlen_func", lambda: vendor)
-    impl = flash.HcuFlashAttentionImpl()
+    impl = make_impl(flash)
 
     result = impl._run_flash_attention(
         q="q",
@@ -540,7 +707,7 @@ def test_layout_selection_uses_resolved_config_when_geometry_is_ambiguous(
         "_vendor_varlen_func",
         lambda: lambda **kwargs: calls.append(kwargs),
     )
-    impl = flash.HcuFlashAttentionImpl()
+    impl = make_impl(flash)
     impl.head_size = 8
     packed = torch.empty_strided(
         (1, 4, 4, 16),
@@ -557,7 +724,7 @@ def test_layout_selection_uses_resolved_config_when_geometry_is_ambiguous(
 
 def test_resolved_layout_rejects_other_layout_strides(monkeypatch):
     flash = load_flash_attention(monkeypatch, kv_cache_layout="LBHNC")
-    impl = flash.HcuFlashAttentionImpl()
+    impl = make_impl(flash)
     impl.head_size = 8
     nhd_packed = torch.empty_strided(
         (1, 4, 4, 16),
@@ -570,7 +737,7 @@ def test_resolved_layout_rejects_other_layout_strides(monkeypatch):
 
 def test_unknown_resolved_layout_fails_closed(monkeypatch):
     flash = load_flash_attention(monkeypatch, kv_cache_layout="LHBNC")
-    impl = flash.HcuFlashAttentionImpl()
+    impl = make_impl(flash)
     impl.head_size = 8
 
     with pytest.raises(ValueError, match="unsupported resolved KV cache layout"):
@@ -588,7 +755,7 @@ def test_varlen_boundary_avoids_vendor_short_prefill_mtp_misclassification(
         return "vendor-output"
 
     monkeypatch.setattr(flash, "_vendor_varlen_func", lambda: vendor)
-    impl = flash.HcuFlashAttentionImpl()
+    impl = make_impl(flash)
 
     impl._run_flash_attention(
         q=torch.empty(5, 14, 64),
@@ -600,6 +767,34 @@ def test_varlen_boundary_avoids_vendor_short_prefill_mtp_misclassification(
     )
 
     assert calls[0]["max_seqlen_q"] == 6
+
+
+@pytest.mark.parametrize("query_len", (1, 3, 16))
+def test_e5m2_paged_descale_adapter_handles_decode_and_prefill(monkeypatch, query_len):
+    flash = load_flash_attention(monkeypatch)
+    calls = []
+    adapter = ModuleType("hcu_vllm_das.attention.e5m2_scales")
+    adapter.run_e5m2_attention = lambda vendor, kwargs: calls.append(
+        ("descale", kwargs)
+    )
+    monkeypatch.setitem(sys.modules, adapter.__name__, adapter)
+    monkeypatch.setattr(
+        flash,
+        "_vendor_varlen_func",
+        lambda: lambda **kwargs: calls.append(("native", kwargs)),
+    )
+    impl = make_impl(flash, kv_cache_dtype="fp8_e5m2")
+    impl._run_flash_attention(
+        q=torch.empty(query_len, 4, 64),
+        k=torch.empty(1, 2, 64, 64, dtype=torch.uint8),
+        v=torch.empty(1, 2, 64, 64, dtype=torch.uint8),
+        cu_seqlens_q=torch.tensor([0, query_len], dtype=torch.int32),
+        max_seqlen_q=query_len,
+        block_table=torch.zeros((1, 1), dtype=torch.int32),
+    )
+    assert len(calls) == 1
+    assert calls[0][0] == "descale"
+    assert calls[0][1]["k"].dtype == torch.float8_e5m2
 
 
 @pytest.mark.parametrize(
@@ -625,7 +820,7 @@ def test_varlen_boundary_preserves_non_rectangular_or_non_paged_shapes(
         "_vendor_varlen_func",
         lambda: lambda **kwargs: calls.append(kwargs),
     )
-    impl = flash.HcuFlashAttentionImpl()
+    impl = make_impl(flash)
 
     impl._run_flash_attention(
         q=torch.empty(query_tokens, 4, 64),
@@ -637,9 +832,7 @@ def test_varlen_boundary_preserves_non_rectangular_or_non_paged_shapes(
         ),
         max_seqlen_q=max_seqlen_q,
         block_table=(
-            torch.zeros((batch_size, 1), dtype=torch.int32)
-            if has_block_table
-            else None
+            torch.zeros((batch_size, 1), dtype=torch.int32) if has_block_table else None
         ),
     )
 
@@ -654,7 +847,7 @@ def test_varlen_boundary_rejects_active_fa4_options(monkeypatch, name):
         "_vendor_varlen_func",
         lambda: pytest.fail("vendor must not run"),
     )
-    impl = flash.HcuFlashAttentionImpl()
+    impl = make_impl(flash)
 
     with pytest.raises(NotImplementedError, match=name):
         impl._run_flash_attention(q="q", k="k", v="v", **{name: object()})

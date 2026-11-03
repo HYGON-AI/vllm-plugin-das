@@ -1,7 +1,7 @@
 """Immutable package and target-version metadata."""
 
-__version__ = "0.2.0.dev0"
-TARGET_VLLM_RELEASE = (0, 32, 0)
-VLLM_UPSTREAM_COMMIT = "5df63a7203cdb9328d824a27b682e77c7b9928be"
+__version__ = "0.3.0.dev0"
+TARGET_VLLM_RELEASE = (0, 33, 0)
+VLLM_UPSTREAM_COMMIT = "4ba787ec9959e566d3b587a796dff07673324da5"
 
 __all__ = ["TARGET_VLLM_RELEASE", "VLLM_UPSTREAM_COMMIT", "__version__"]

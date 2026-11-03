@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Verify an installed vLLM 0.32 adapter-das plus DAS extension stack."""
+"""Verify an installed vLLM 0.33 adapter-das plus DAS extension stack."""
 
 from __future__ import annotations
 
@@ -142,9 +142,9 @@ def collect_attestation() -> dict[str, object]:
         raise InstalledVerificationError(
             f"installed vLLM version is invalid: {vllm_dist.version!r}"
         ) from error
-    if parsed_vllm.epoch != 0 or parsed_vllm.release[:2] != (0, 32):
+    if parsed_vllm.epoch != 0 or parsed_vllm.release[:2] != (0, 33):
         raise InstalledVerificationError(
-            "installed vLLM must satisfy >=0.32.0,<0.33.0, "
+            "installed vLLM must satisfy >=0.33.0,<0.34.0, "
             f"got {vllm_dist.version!r}"
         )
 

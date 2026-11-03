@@ -1,4 +1,4 @@
-"""Register the HCU AITER channel/token INT8 backend in vLLM 0.32."""
+"""Register the HCU AITER channel/token INT8 backend in vLLM 0.33."""
 
 from __future__ import annotations
 
@@ -70,14 +70,14 @@ def _require_callable(module: ModuleType, name: str) -> Any:
     value = getattr(module, name, None)
     if not callable(value):
         raise Int8OracleInstallError(
-            f"required vLLM 0.32 INT8 oracle callable is unavailable: "
+            f"required vLLM 0.33 INT8 oracle callable is unavailable: "
             f"{TARGET_MODULE}.{name}"
         )
     actual = tuple(inspect.signature(value).parameters)
     expected = _REQUIRED_SIGNATURES[name]
     if actual != expected:
         raise Int8OracleInstallError(
-            f"vLLM 0.32 INT8 oracle signature changed for {name}: "
+            f"vLLM 0.33 INT8 oracle signature changed for {name}: "
             f"expected {expected}, got {actual}"
         )
     return value
@@ -100,12 +100,10 @@ def _make_experts_class(
             weight_key: object,
             activation_key: object,
         ) -> bool:
-            if (
+            return (
                 weight_key == int8_weight_key
                 and activation_key == int8_activation_key
-            ):
-                return True
-            return parent._supports_quant_scheme(weight_key, activation_key)
+            )
 
         def apply(
             self,
@@ -220,7 +218,7 @@ def install() -> bool:
         int8_activation_key = quant_utils.kInt8DynamicTokenSym
     except AttributeError as error:
         raise Int8OracleInstallError(
-            "vLLM 0.32 INT8 channel/token quant keys are unavailable"
+            "vLLM 0.33 INT8 channel/token quant keys are unavailable"
         ) from error
 
     extended_values = dict(old_values)
