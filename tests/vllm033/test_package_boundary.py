@@ -18,7 +18,7 @@ def test_project_metadata_has_only_the_adapter_extension_entry_point() -> None:
     )["project"]
 
     assert metadata["name"] == "hcu-vllm-das-plugin"
-    assert metadata["version"] == "0.2.0.dev0"
+    assert metadata["version"] == "0.3.0.dev0"
     assert metadata["requires-python"] == ">=3.11,<3.15"
     assert metadata["dependencies"] == [
         "sgl-kernel>=0.1.0",
@@ -26,7 +26,8 @@ def test_project_metadata_has_only_the_adapter_extension_entry_point() -> None:
     ]
     assert metadata["entry-points"] == {
         "hcu_adapter.extensions": {
-            "das_hcu": "hcu_vllm_das.extension:extension_spec"
+            "das_hcu": "hcu_vllm_das.extension:extension_spec",
+            "das_hcu_flash": "hcu_vllm_das.flash_activation:extension_spec"
         }
     }
     assert "vllm.platform_plugins" not in metadata["entry-points"]
@@ -40,9 +41,9 @@ sys.path.insert(0, {os.fspath(SOURCE_ROOT)!r})
 blocked = {{"torch", "vllm", "lightop", "vllm_hcu"}}
 before = set(sys.modules)
 import hcu_vllm_das
-assert hcu_vllm_das.__version__ == "0.2.0.dev0"
-assert hcu_vllm_das.TARGET_VLLM_RELEASE == (0, 32, 0)
-assert hcu_vllm_das.VLLM_UPSTREAM_COMMIT == "5df63a7203cdb9328d824a27b682e77c7b9928be"
+assert hcu_vllm_das.__version__ == "0.3.0.dev0"
+assert hcu_vllm_das.TARGET_VLLM_RELEASE == (0, 33, 0)
+assert hcu_vllm_das.VLLM_UPSTREAM_COMMIT == "4ba787ec9959e566d3b587a796dff07673324da5"
 introduced = (set(sys.modules) - before).intersection(blocked)
 assert not introduced, introduced
 """
@@ -97,7 +98,7 @@ def test_built_wheel_contains_only_the_new_plugin_namespace(tmp_path: Path) -> N
     metadata_lines = wheel_metadata.splitlines()
     entry_point_lines = entry_points.splitlines()
     assert "Name: hcu-vllm-das-plugin" in metadata_lines
-    assert "Version: 0.2.0.dev0" in metadata_lines
+    assert "Version: 0.3.0.dev0" in metadata_lines
     assert "Requires-Dist: sgl-kernel>=0.1.0" in metadata_lines
     assert "[hcu_adapter.extensions]" in entry_point_lines
     assert "das_hcu = hcu_vllm_das.extension:extension_spec" in entry_point_lines

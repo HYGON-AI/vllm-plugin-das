@@ -1,4 +1,4 @@
-"""vLLM 0.32 OOT LightOp implementation of ``RMSNorm``."""
+"""vLLM 0.33 OOT LightOp implementation of ``RMSNorm``."""
 
 from __future__ import annotations
 

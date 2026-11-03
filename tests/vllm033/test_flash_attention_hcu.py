@@ -8,8 +8,8 @@ import pytest
 import torch
 
 pytestmark = pytest.mark.skipif(
-    os.getenv("VLLM032_HCU_TEST") != "1",
-    reason="set VLLM032_HCU_TEST=1 on a prepared HCU node",
+    os.getenv("VLLM033_HCU_TEST") != "1",
+    reason="set VLLM033_HCU_TEST=1 on a prepared HCU node",
 )
 
 
@@ -115,6 +115,7 @@ def _e5m2_round_trip(tensor: torch.Tensor) -> torch.Tensor:
         )
     ),
 )
+@pytest.mark.parametrize("explicit_kv_dtype", (False, True))
 @torch.inference_mode()
 def test_hcu_writer_to_vendor_varlen_matches_reference(
     layout_name,
@@ -123,9 +124,9 @@ def test_hcu_writer_to_vendor_varlen_matches_reference(
     num_query_heads,
     num_kv_heads,
     dtype,
+    explicit_kv_dtype,
 ):
     import vllm._C_stable_libtorch  # noqa: F401
-    from vllm import _custom_ops as ops
 
     torch.manual_seed(17 + query_len)
     device = torch.device("cuda")
@@ -157,23 +158,19 @@ def test_hcu_writer_to_vendor_varlen_matches_reference(
         block_padding=64,
     )
     impl = _make_impl(layout_name, head_size)
+    if explicit_kv_dtype:
+        impl.kv_cache_dtype = str(dtype).removeprefix("torch.")
     key_cache, value_cache = impl._get_kv_cache_views(packed_cache)
-    write_key_cache, write_value_cache = impl._get_kv_cache_write_views(
-        packed_cache
-    )
     slot_mapping = cache_block * block_size + torch.arange(
         kv_len, device=device, dtype=torch.long
     )
     scale = torch.ones((), device=device, dtype=torch.float32)
-    ops.reshape_and_cache_flash(
+    impl.do_kv_cache_update(
+        SimpleNamespace(_k_scale=scale, _v_scale=scale),
         key,
         value,
-        write_key_cache,
-        write_value_cache,
+        packed_cache,
         slot_mapping,
-        "auto",
-        scale,
-        scale,
     )
     cached_key = key_cache[cache_block, :, :kv_len].transpose(0, 1)
     cached_value = value_cache[cache_block, :, :kv_len].transpose(0, 1)
@@ -206,16 +203,18 @@ def test_hcu_writer_to_vendor_varlen_matches_reference(
 
 
 @pytest.mark.parametrize("layout_name", ("LBHNC", "LBNHC"))
+@pytest.mark.parametrize("dtype", (torch.bfloat16, torch.float16))
+@pytest.mark.parametrize("explicit_kv_dtype", (False, True))
 @torch.inference_mode()
 def test_hcu_writer_and_vendor_varlen_replay_with_changed_graph_inputs(
     layout_name,
+    dtype,
+    explicit_kv_dtype,
 ):
     import vllm._C_stable_libtorch  # noqa: F401
-    from vllm import _custom_ops as ops
 
     torch.manual_seed(29)
     device = torch.device("cuda")
-    dtype = torch.bfloat16
     query_len, kv_len = 1, 5
     block_size, num_query_heads, num_kv_heads, head_size = 64, 4, 2, 64
     query = torch.randn(
@@ -238,10 +237,9 @@ def test_hcu_writer_and_vendor_varlen_replay_with_changed_graph_inputs(
     )
     output = torch.empty_like(query)
     impl = _make_impl(layout_name, head_size)
+    if explicit_kv_dtype:
+        impl.kv_cache_dtype = str(dtype).removeprefix("torch.")
     key_cache, value_cache = impl._get_kv_cache_views(packed_cache)
-    write_key_cache, write_value_cache = impl._get_kv_cache_write_views(
-        packed_cache
-    )
     slot_mapping = cache_block * block_size + torch.arange(
         kv_len, device=device, dtype=torch.long
     )
@@ -255,15 +253,12 @@ def test_hcu_writer_and_vendor_varlen_replay_with_changed_graph_inputs(
     )
 
     def run() -> None:
-        ops.reshape_and_cache_flash(
+        impl.do_kv_cache_update(
+            SimpleNamespace(_k_scale=scale, _v_scale=scale),
             key,
             value,
-            write_key_cache,
-            write_value_cache,
+            packed_cache,
             slot_mapping,
-            "auto",
-            scale,
-            scale,
         )
         impl._run_flash_attention(
             q=query,
@@ -337,7 +332,6 @@ def test_hcu_e5m2_writer_to_vendor_varlen_matches_quantized_reference(
     num_kv_heads,
 ):
     import vllm._C_stable_libtorch  # noqa: F401
-    from vllm import _custom_ops as ops
 
     torch.manual_seed(71 + query_len)
     device = torch.device("cuda")

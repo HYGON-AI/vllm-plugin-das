@@ -8,7 +8,7 @@ from pathlib import Path
 def target_root() -> Path:
     value = os.environ.get("VLLM_TARGET_ROOT")
     if not value:
-        raise AssertionError("VLLM_TARGET_ROOT must name official vLLM 0.32 source")
+        raise AssertionError("VLLM_TARGET_ROOT must name official vLLM 0.33 source")
     root = Path(value).resolve()
     if not (root / "vllm" / "__init__.py").is_file():
         raise AssertionError(f"VLLM_TARGET_ROOT does not contain vLLM: {root}")
@@ -27,7 +27,7 @@ def top_level_functions(tree: ast.Module) -> dict[str, ast.FunctionDef]:
     }
 
 
-def test_official_int8_oracle_exposes_the_guarded_v032_contract() -> None:
+def test_official_int8_oracle_exposes_the_guarded_v033_contract() -> None:
     source = (
         target_root()
         / "vllm/model_executor/layers/fused_moe/oracle/int8.py"
@@ -71,7 +71,7 @@ def test_official_int8_oracle_exposes_the_guarded_v032_contract() -> None:
     )
 
 
-def test_official_aiter_expert_exposes_the_v032_apply_contract() -> None:
+def test_official_aiter_expert_exposes_the_v033_apply_contract() -> None:
     source = (
         target_root()
         / "vllm/model_executor/layers/fused_moe/experts/rocm_aiter_moe.py"
@@ -88,7 +88,17 @@ def test_official_aiter_expert_exposes_the_v032_apply_contract() -> None:
         if isinstance(node, ast.FunctionDef)
     }
 
-    assert function_parameters(methods["_supports_quant_scheme"]) == (
+    # v0.33 moved quantization admission to concrete expert subclasses. The
+    # plugin supplies its own INT8-only predicate; the parent remains shared.
+    unquantized = next(
+        node for node in tree.body
+        if isinstance(node, ast.ClassDef) and node.name == "AiterUnquantizedExperts"
+    )
+    predicate = next(
+        node for node in unquantized.body
+        if isinstance(node, ast.FunctionDef) and node.name == "_supports_quant_scheme"
+    )
+    assert function_parameters(predicate) == (
         "weight_key",
         "activation_key",
     )
@@ -112,7 +122,7 @@ def test_official_aiter_expert_exposes_the_v032_apply_contract() -> None:
     )
 
 
-def test_v032_int8_consumers_freeze_oracle_aliases_at_import_time() -> None:
+def test_v033_int8_consumers_freeze_oracle_aliases_at_import_time() -> None:
     relative_paths = (
         "vllm/model_executor/layers/quantization/compressed_tensors/"
         "compressed_tensors_moe/compressed_tensors_moe_w8a8_int8.py",

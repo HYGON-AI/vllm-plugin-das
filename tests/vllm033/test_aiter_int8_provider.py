@@ -9,9 +9,7 @@ import pytest
 import torch
 
 
-PLUGIN_SOURCE_ROOT = (
-    Path(__file__).resolve().parents[2] / "adapter_extension" / "src"
-)
+PLUGIN_SOURCE_ROOT = Path(__file__).resolve().parents[2] / "adapter_extension" / "src"
 sys.path.insert(0, os.fspath(PLUGIN_SOURCE_ROOT))
 
 from hcu_vllm_das.moe import fused_moe_aiter as provider
@@ -55,6 +53,24 @@ def native_config(**overrides: object) -> SimpleNamespace:
     }
     values.update(overrides)
     return SimpleNamespace(**values)
+
+
+@pytest.mark.parametrize("bias", ("w1_bias", "w2_bias"))
+def test_direct_provider_rejects_expert_bias_before_config_or_execution(monkeypatch, bias):
+    arguments = inputs()
+    setattr(arguments["quant_config"], bias, object())
+    monkeypatch.setattr(provider, "_load_aiter_api", lambda: pytest.fail("vendor reached"))
+    with pytest.raises(ValueError, match="expert bias"):
+        provider.apply_aiter_int8_moe(**arguments)
+
+
+@pytest.mark.parametrize("activation", ("situ", "swigluoai", "swigluoai_uninterleave"))
+def test_direct_provider_rejects_unforwarded_activation_parameters(monkeypatch, activation):
+    arguments = inputs()
+    arguments["activation"] = SimpleNamespace(value=activation)
+    monkeypatch.setattr(provider, "_load_aiter_api", lambda: pytest.fail("vendor reached"))
+    with pytest.raises(ValueError, match="activation"):
+        provider.apply_aiter_int8_moe(**arguments)
 
 
 def test_shape_evidence_uses_vllm_runtime_logger(
@@ -226,27 +242,27 @@ def test_unsupported_aiter_layout_uses_official_int8_triton_fallback(
     fallback_call = calls[0]
     assert fallback_call.pop("expert_map") is expert_map
     assert fallback_call == {
-            "hidden_states": arguments["hidden_states"],
-            "w1": arguments["w1"],
-            "w2": arguments["w2"],
-            "topk_weights": arguments["topk_weights"],
-            "topk_ids": arguments["topk_ids"],
-            "activation": "silu",
-            "apply_router_weight_on_input": False,
-            "use_fp8_w8a8": False,
-            "use_int8_w8a8": True,
-            "use_int8_w8a16": False,
-            "use_int4_w4a16": False,
-            "per_channel_quant": True,
-            "global_num_experts": 8,
-            "w1_scale": "w1-scale",
-            "w2_scale": "w2-scale",
-            "w1_zp": "w1-zp",
-            "w2_zp": "w2-zp",
-            "a1_scale": "a1-scale",
-            "a2_scale": "a2-scale",
-            "block_shape": None,
-        }
+        "hidden_states": arguments["hidden_states"],
+        "w1": arguments["w1"],
+        "w2": arguments["w2"],
+        "topk_weights": arguments["topk_weights"],
+        "topk_ids": arguments["topk_ids"],
+        "activation": "silu",
+        "apply_router_weight_on_input": False,
+        "use_fp8_w8a8": False,
+        "use_int8_w8a8": True,
+        "use_int8_w8a16": False,
+        "use_int4_w4a16": False,
+        "per_channel_quant": True,
+        "global_num_experts": 8,
+        "w1_scale": "w1-scale",
+        "w2_scale": "w2-scale",
+        "w1_zp": "w1-zp",
+        "w2_zp": "w2-zp",
+        "a1_scale": "a1-scale",
+        "a2_scale": "a2-scale",
+        "block_shape": None,
+    }
 
 
 @pytest.mark.parametrize(
@@ -268,15 +284,26 @@ def test_native_aiter_receives_mask_derived_from_canonical_expert_map(
     arguments["expert_map"] = torch.tensor(expert_map, dtype=torch.int32)
     calls: list[dict[str, object]] = []
 
+    from hcu_vllm_das.moe import int8_asm
+
+    vendor = SimpleNamespace(
+        MoeQuantType=SimpleNamespace(W8A8="int8_w8a8"),
+        get_aiter_moe_config=lambda *a, **kw: (True, native_config()),
+        aiter_moe=lambda **kw: pytest.fail("ASM must use explicit stages"),
+    )
+    native = SimpleNamespace()
+    original_import = provider.import_module
     monkeypatch.setattr(
         provider,
-        "_load_aiter_api",
-        lambda: SimpleNamespace(
-            quant_type_w8a8="int8_w8a8",
-            get_config=lambda *args, **kwargs: (True, native_config()),
-            aiter_moe=lambda **kwargs: calls.append(kwargs) or object(),
-        ),
+        "import_module",
+        lambda name: vendor
+        if name == "aiter.moe"
+        else native
+        if name == "aiter"
+        else original_import(name),
     )
+    monkeypatch.setattr(int8_asm, "unsupported_reason", lambda a, n: None)
+    monkeypatch.setattr(int8_asm, "execute", lambda **kw: calls.append(kw) or object())
 
     provider.apply_aiter_int8_moe(**arguments)
 
@@ -311,3 +338,58 @@ def test_vendor_failure_after_config_selection_does_not_change_provider(
 
     with pytest.raises(RuntimeError, match="vendor kernel failed"):
         provider.apply_aiter_int8_moe(**inputs())
+
+
+@pytest.mark.parametrize("solution", ("triton", "moe_c"))
+@pytest.mark.parametrize(
+    "mapping", ([0, 1, -1, -1], [-1, -1, 0, 1], [0, -1, 1, -1], [-1, 0, -1, 1])
+)
+def test_index_map_solutions_preserve_canonical_ep_mapping(
+    monkeypatch, solution, mapping
+):
+    arguments = inputs()
+    canonical = torch.tensor(mapping, dtype=torch.int32)
+    arguments["expert_map"] = canonical
+    calls = []
+    monkeypatch.setattr(
+        provider,
+        "_load_aiter_api",
+        lambda: SimpleNamespace(
+            quant_type_w8a8="int8_w8a8",
+            get_config=lambda *a, **k: (True, native_config(solution_type=solution)),
+            aiter_moe=lambda **k: calls.append(k) or object(),
+        ),
+    )
+    provider.apply_aiter_int8_moe(**arguments)
+    assert len(calls) == 1
+    assert calls[0]["expert_map"] is canonical
+    assert canonical.tolist() == mapping
+
+
+def test_unknown_ep_solution_uses_official_fallback_before_vendor(monkeypatch):
+    arguments = inputs()
+    canonical = torch.tensor([0, -1, 1, -1], dtype=torch.int32)
+    arguments["expert_map"] = canonical
+    calls = []
+    expected = object()
+    monkeypatch.setattr(
+        provider,
+        "_load_aiter_api",
+        lambda: SimpleNamespace(
+            quant_type_w8a8="int8_w8a8",
+            get_config=lambda *a, **k: (
+                True,
+                native_config(solution_type="new-vendor-abi"),
+            ),
+            aiter_moe=lambda **k: pytest.fail(
+                "unknown EP map ABI must not launch vendor"
+            ),
+        ),
+    )
+    monkeypatch.setattr(
+        provider,
+        "_load_triton_fallback",
+        lambda: lambda **k: calls.append(k) or expected,
+    )
+    assert provider.apply_aiter_int8_moe(**arguments) is expected
+    assert len(calls) == 1 and calls[0]["expert_map"] is canonical

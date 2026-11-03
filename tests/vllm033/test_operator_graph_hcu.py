@@ -7,6 +7,7 @@ import subprocess
 import sys
 
 import pytest
+from packaging.version import Version
 
 
 pytestmark = pytest.mark.hcu
@@ -122,7 +123,7 @@ print("HCU_GRAPH_RESULT=" + json.dumps(report, sort_keys=True))
 
 
 def _live_requested() -> bool:
-    return os.environ.get("HCU_VLLM032_GRAPH_LIVE") == "1"
+    return os.environ.get("HCU_VLLM033_GRAPH_LIVE") == "1"
 
 
 def _run_probe(mode: str) -> dict[str, object]:
@@ -151,14 +152,15 @@ def _run_probe(mode: str) -> dict[str, object]:
 
 @pytest.mark.skipif(
     not _live_requested(),
-    reason="set HCU_VLLM032_GRAPH_LIVE=1 for installed-wheel Graph validation",
+    reason="set HCU_VLLM033_GRAPH_LIVE=1 for installed-wheel Graph validation",
 )
 def test_installed_operator_on_off_graph_replay_uses_expected_paths() -> None:
     optimized = _run_probe("on")
     official = _run_probe("off")
 
     for report in (optimized, official):
-        assert report["vllm_version"] == "0.32.0"
+        version = Version(report["vllm_version"])
+        assert version.epoch == 0 and version.release[:2] == (0, 33)
         assert "site-packages/vllm/__init__.py" in report["vllm_file"]
         assert "site-packages/hcu_vllm_das/rms_norm.py" in report["plugin_file"]
         assert report["platform"] == "hcu_adapter.bridges.vllm.HcuPlatform"

@@ -12,7 +12,7 @@ SUPPORTED_LIVE_ARCHITECTURES = frozenset({"gfx936", "gfx938"})
 
 
 def _live_requested() -> bool:
-    return os.environ.get("HCU_VLLM032_RMSNORM_LIVE") == "1"
+    return os.environ.get("HCU_VLLM033_RMSNORM_LIVE") == "1"
 
 
 def _reference(value, weight, epsilon: float):
@@ -31,7 +31,7 @@ def _reference(value, weight, epsilon: float):
 @pytest.mark.skipif(
     not _live_requested(),
     reason=(
-        "set HCU_VLLM032_RMSNORM_LIVE=1 for installed-wheel HCU "
+        "set HCU_VLLM033_RMSNORM_LIVE=1 for installed-wheel HCU "
         "RMSNorm validation"
     ),
 )
@@ -146,7 +146,7 @@ def test_installed_lightop_rmsnorm_matches_references_and_fallbacks(
 @pytest.mark.skipif(
     not _live_requested(),
     reason=(
-        "set HCU_VLLM032_RMSNORM_LIVE=1 for installed-wheel HCU "
+        "set HCU_VLLM033_RMSNORM_LIVE=1 for installed-wheel HCU "
         "RMSNorm validation"
     ),
 )

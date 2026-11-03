@@ -1,20 +1,28 @@
 # HCU vLLM DAS optimization plugin
 
+Independent Flash public-registry publication and health contract:
+[v0.33 provider ownership](../docs/validation/vllm033-upgrade.md#ownership-and-changes). Its
+activation dependencies are independent of the optional RMS provider.
+
 `hcu-vllm-das-plugin` is the optimization-only extension for official vLLM
-0.32 and `adapter-das`. The adapter owns the HCU platform and runtime
+0.33 and `adapter-das`. The adapter owns the HCU platform and runtime
 lifecycle; this wheel contributes optional, independently removable operator
 optimizations through the adapter extension API.
 
-Version `0.2.0.dev0` contains two independently selected capabilities:
-
-- a default-OFF LightOp ordinary and fused-add `RMSNorm` candidate; and
-- an explicit AITER INT8 W8A8 MoE route selected by `--moe-backend aiter`.
+Version `0.3.0.dev0` targets the `v0.33.0` branch. Migration status and current
+evidence are recorded in [v0.33 validation](../docs/validation/vllm033-upgrade.md);
+the v0.32 documents below are historical evidence and do not certify v0.33.
+The operator extension currently advertises only the default-OFF LightOp
+ordinary and fused-add `RMSNorm` candidate. INT8 model selection, weight
+conversion, quantization and kernel construction remain official vLLM owners.
 
 It also provides an explicit HCU FlashAttention backend selected by
 `--attention-backend FLASH_ATTN`. The backend keeps vLLM's official metadata,
-scheduler, allocation, cache writer, and forward orchestration. It changes only
-the provider boundaries needed by the HCU vendor varlen ABI: dense HND/NHD K/V
-page views, FA2 keyword compatibility, and a 64-token kernel page.
+scheduler and allocation. Its public `AttentionImpl` owns the HCU provider call
+and dense HND/NHD cache views, routes BF16 writes to the native vLLM writer,
+and retains a Plugin E5M2 writer and descale adapter. The kernel page is 64
+tokens. It neither copies nor replaces the official Flash forward method and
+does not require private HCU hooks in the Core.
 
 vLLM's native `SiluAndMul` remains the selected implementation. Warmed
 compiled A/B measurements on `gfx936` did not justify replacing the upstream
@@ -25,10 +33,10 @@ operator-level capabilities.
 
 ## Compatibility
 
-- vLLM release line: `>=0.32.0,<0.33.0`; prerelease, postrelease,
+- vLLM release line: `>=0.33.0,<0.34.0`; prerelease, postrelease,
   development, patch, and local version suffixes are accepted when the
-  required operator APIs and LightOp capabilities are present. FLASH_ATTN also
-  requires the OpenDAS vLLM cache-view and kernel-call extension seams.
+  required operator APIs and LightOp capabilities are present. FLASH_ATTN uses
+  the official public backend registry and AttentionImpl contract.
 - Adapter distribution: `sgl-kernel>=0.1.0`, extension API v1 from
   `hcu_adapter.extensions`.
 - Runtime: a prepared HCU PyTorch/DTK/LightOp/AITER stack. LightOp and AITER
@@ -37,7 +45,7 @@ operator-level capabilities.
 - The plugin does not own `vllm.platform_plugins` or `vllm.general_plugins`.
 
 The repository root remains the vLLM 0.28.1 development reference. Build only
-this directory for vLLM 0.32:
+this directory for vLLM 0.33:
 
 ```bash
 python3 -m pip wheel --no-deps --wheel-dir ./dist ./adapter_extension
@@ -50,7 +58,7 @@ PyTorch, DTK, LightOp, and AITER builds. Install audited local wheels without
 dependency resolution, in this order:
 
 ```bash
-python3 -m pip install --no-deps /wheels/vllm-0.32.0+rocm*.whl
+python3 -m pip install --no-deps /wheels/vllm-0.33.0+*.whl
 python3 -m pip install --no-deps /wheels/sgl_kernel-*.whl
 python3 -m pip install --no-deps /wheels/hcu_vllm_das_plugin-*.whl
 ```
@@ -64,37 +72,32 @@ VLLM_PLUGINS=hcu_adapter python3 -E adapter_extension/tools/verify_installed.py
 
 The verifier fails closed unless all three distributions have non-empty wheel
 records, their imported modules are owned by those records, the adapter is the
-sole expected vLLM entry-point owner, the DAS extension is active with both
-declared capabilities, vLLM's OOT registry selects this exact class, and
-explicit `aiter` INT8 selection resolves to the Plugin-owned expert:
+sole expected vLLM entry-point owner, the RMS extension is active, and
+vLLM's public OOT registry selects `hcu_vllm_das.rms_norm.HcuRMSNorm`.
+Schema4 additionally verifies that the seven official INT8 oracle symbols
+remain identical across activation, the module is owned by the Core wheel,
+and explicit Triton selection resolves to an official expert.
 
-```text
-hcu_vllm_das.rms_norm.HcuRMSNorm
-hcu_vllm_das.moe.int8_oracle.HcuAiterInt8Experts
-```
+## INT8 ownership and unavailable AITER model integration
 
-## AITER INT8 W8A8 MoE
+Use official `--moe-backend auto` or `--moe-backend triton` for INT8 models.
+The retired Plugin installer extended/rebound the official oracle enum and
+functions; that private integration conflicts with the upstream-first skill
+and has been removed. No `aiter-int8-moe` capability is advertised. Calling
+its old `install()` entry point explicitly rejects before importing or
+modifying Core. An Adapter request requiring that capability must fail.
 
-The Plugin reuses vLLM 0.32's official channel-weight/token-activation W8A8
-quant configuration and kernel construction. It adds only the explicit AITER
-selector and translates the resulting tensors to the public `aiter.moe` API;
-the vendor wheel continues to own kernels and tuned configurations.
+The official v0.33 INT8 oracle provides Triton/Humming/CPU and has no public
+expert registry for adding AITER. The general public quantization-config
+registry is not equivalent: a future distinct quantization method would need
+its own loader/lifecycle/full-dataflow evidence. It must not overwrite the
+official `compressed-tensors` entry or rebind oracle globals.
 
-Select the route through vLLM's existing CLI option:
-
-```bash
-vllm serve /model/Qwen3.5-35B-A3B-W8A8 --moe-backend aiter
-```
-
-Each unseen shape logs whether it found and executed a native AITER config. A
-shape with no compatible config, or a config requiring an unsupported shuffle
-layout, is logged as an official vLLM Triton INT8 fallback and is not counted
-as an AITER hit. Once a compatible AITER config is selected, a vendor execution
-error is raised rather than silently changing providers.
-
-Leaving `--moe-backend` at its default preserves vLLM's upstream backend
-priority. Uninstalling this wheel removes the added selector without changing
-the Adapter's platform/runtime ownership.
+The standalone INT8 provider, ASM composition and unregistered expert factory
+are retained for operator experiments. Their prior native/Graph and full-model
+results are frozen historical evidence; they do not make AITER selectable in
+the corrected candidate. Preserving official ownership does not certify that
+unavailable capability. See [ownership correction](../docs/validation/vllm033-official-ownership.md).
 
 ## HCU FlashAttention varlen backend
 
@@ -144,6 +147,16 @@ LBNHC remain unvalidated and are not claimed by this release.
 
 ## RMSNorm eligibility
 
+Provider admission checks the actual four-positional-argument call ABI before
+compile-factor or operator publication. It accepts normal Python signatures and,
+only for uninspectable native builtins, a compatible concrete declaration from
+generated binding documentation, including overloads and optional additions.
+Declarations are parsed without evaluating annotations or defaults. Missing or
+incompatible documentation, uninspectable Python callables, and asynchronous or
+generator providers are rejected. This extends the existing activation preflight;
+its provider checks still run even when the RMS execution flags are OFF.
+It neither invokes a provider nor proves kernel, Graph or model correctness.
+
 The LightOp RMSNorm path is selected only when all of the following hold:
 
 - the master and RMSNorm-specific switches are enabled;
@@ -180,9 +193,11 @@ export VLLM_HCU_USE_CUSTOM_RMS_NORM=0
 vllm serve /model/Qwen2-0.5B-Instruct --attention-backend TRITON_ATTN
 ```
 
-The numerical evidence for this release is limited to `gfx936`. On another HCU
-architecture, keep RMSNorm disabled until a separate live-device validation
-record exists:
+Device acceptance for v0.33 is tracked separately in the
+[current validation record](../docs/validation/vllm033-upgrade.md).
+Historical gfx936 results do not certify this release or another architecture.
+Keep RMSNorm disabled until the intended stack has a live-device validation
+record:
 
 ```bash
 export VLLM_HCU_USE_CUSTOM_RMS_NORM=0
@@ -191,10 +206,12 @@ export VLLM_HCU_USE_CUSTOM_RMS_NORM=0
 For complete removal, uninstall `hcu-vllm-das-plugin`; the adapter and vLLM
 remain installed and retain platform ownership.
 
+## Historical v0.32 evidence
+
 The [`SiluAndMul`](../docs/validation/v032-adapter-extension-silu.md) and
 [`RMSNorm`](../docs/validation/v032-adapter-extension-rmsnorm.md) records are
-historical candidate evidence. The current three-way identities, upstream
-takeover decision, and base final-wheel gates are recorded in the
+historical candidate evidence. The v0.32 three-way identities, upstream
+takeover decision, and base final-wheel gates were recorded in the
 [`vLLM 0.32 upstream-first validation`](../docs/validation/vllm032-upstream-first-operator-ab.md).
 The explicit AITER W8A8 route, public vendor-kernel evidence, Graph replay,
 model smoke, and isolated HumanEval64 result are recorded in the

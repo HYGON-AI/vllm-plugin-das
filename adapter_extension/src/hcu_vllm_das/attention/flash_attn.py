@@ -1,4 +1,4 @@
-"""HCU vendor varlen FlashAttention backend for vLLM 0.32."""
+"""HCU vendor varlen FlashAttention through vLLM's public backend API."""
 
 from __future__ import annotations
 
@@ -8,31 +8,16 @@ from typing import Any, ClassVar
 
 import torch
 from vllm.config import get_current_vllm_config_or_none
+from vllm.v1.attention.backend import AttentionImpl
 from vllm.v1.attention.backends.flash_attn import (
     FlashAttentionBackend,
-    FlashAttentionImpl,
+    FlashAttentionMetadata,
 )
 from vllm.v1.kv_cache_layout import KVCacheLayout
 
 _FA4_ONLY_ARGUMENTS = ("dynamic_causal", "mask_mod", "aux_tensors")
 _E5M2_KV_CACHE_DTYPE = "fp8_e5m2"
 _KERNEL_BLOCK_SIZE = 64
-_REQUIRED_VLLM_SEAMS = (
-    "_get_kv_cache_views",
-    "_get_kv_cache_write_views",
-    "_run_flash_attention",
-)
-_MISSING_VLLM_SEAMS = tuple(
-    name
-    for name in _REQUIRED_VLLM_SEAMS
-    if not callable(getattr(FlashAttentionImpl, name, None))
-)
-if _MISSING_VLLM_SEAMS:
-    missing = ", ".join(_MISSING_VLLM_SEAMS)
-    raise RuntimeError(
-        "HCU FLASH_ATTN requires the vLLM 0.32 HCU attention seams; "
-        f"missing: {missing}. Install the matching HCU vLLM wheel."
-    )
 
 
 def _vendor_varlen_func() -> Callable[..., Any]:
@@ -51,26 +36,6 @@ def _vendor_varlen_func() -> Callable[..., Any]:
 
 def _layout_name(layout: KVCacheLayout) -> str:
     return getattr(layout, "name", str(layout))
-
-
-def _upstream_constructor_args(
-    args: tuple[Any, ...],
-    kwargs: dict[str, Any],
-) -> tuple[tuple[Any, ...], dict[str, Any], bool]:
-    """Hide only HCU E5M2 from upstream's NVIDIA capability guard."""
-    upstream_args = list(args)
-    upstream_kwargs = dict(kwargs)
-    if "kv_cache_dtype" in upstream_kwargs:
-        uses_e5m2 = upstream_kwargs["kv_cache_dtype"] == _E5M2_KV_CACHE_DTYPE
-        if uses_e5m2:
-            upstream_kwargs["kv_cache_dtype"] = "auto"
-    elif len(upstream_args) > 6:
-        uses_e5m2 = upstream_args[6] == _E5M2_KV_CACHE_DTYPE
-        if uses_e5m2:
-            upstream_args[6] = "auto"
-    else:
-        uses_e5m2 = False
-    return tuple(upstream_args), upstream_kwargs, uses_e5m2
 
 
 def _e5m2_byte_view(tensor: torch.Tensor) -> torch.Tensor:
@@ -112,9 +77,7 @@ def _dense_kv_cache_views(
         raise ValueError("HCU FLASH_ATTN requires a 4D KV cache")
     num_blocks, num_heads, block_size, packed_head_size = kv_cache.shape
     if packed_head_size != 2 * head_size:
-        raise ValueError(
-            "HCU FLASH_ATTN requires KV cache content size 2 * head_size"
-        )
+        raise ValueError("HCU FLASH_ATTN requires KV cache content size 2 * head_size")
     if layout == KVCacheLayout.LBHNC:
         expected_inner_strides = (
             block_size * packed_head_size,
@@ -163,27 +126,108 @@ def _dense_kv_cache_views(
     return key_cache, value_cache
 
 
-class HcuFlashAttentionImpl(FlashAttentionImpl):
-    """Expose dense HND or NHD pages to the HCU vendor varlen ABI."""
+class HcuFlashAttentionImpl(AttentionImpl[FlashAttentionMetadata]):
+    """Own the vendor call and cache ABI without replacing Core internals."""
 
     supports_dcp = False
 
-    def __init__(self, *args: Any, **kwargs: Any) -> None:
-        upstream_args, upstream_kwargs, uses_e5m2 = _upstream_constructor_args(
-            args,
-            kwargs,
+    def __init__(
+        self,
+        num_heads: int,
+        head_size: int,
+        scale: float,
+        num_kv_heads: int | None = None,
+        alibi_slopes: list[float] | None = None,
+        sliding_window: int | None = None,
+        kv_cache_dtype: str = "auto",
+        logits_soft_cap: float | None = None,
+        attn_type: str = "decoder",
+        kv_sharing_target_layer_name: str | None = None,
+        sinks: torch.Tensor | None = None,
+    ) -> None:
+        if attn_type != "decoder" or sliding_window is not None or sinks is not None:
+            raise NotImplementedError("HCU Flash supports full decoder attention only")
+        if self.dcp_world_size != 1 or self.pcp_world_size != 1:
+            raise NotImplementedError("HCU Flash does not support context parallelism")
+        if not HcuFlashAttentionBackend.supports_head_size(head_size):
+            raise ValueError(f"unsupported HCU Flash head size: {head_size}")
+        if not HcuFlashAttentionBackend.supports_kv_cache_dtype(kv_cache_dtype):
+            raise ValueError(f"unsupported HCU Flash KV cache dtype: {kv_cache_dtype}")
+        self.num_heads = num_heads
+        self.num_kv_heads = num_heads if num_kv_heads is None else num_kv_heads
+        if self.num_kv_heads <= 0 or num_heads <= 0 or num_heads % self.num_kv_heads:
+            raise ValueError("HCU Flash requires positive grouped query heads")
+        self.head_size = head_size
+        self.scale = scale
+        self.kv_cache_dtype = kv_cache_dtype
+        self.attn_type = attn_type
+        self.kv_sharing_target_layer_name = kv_sharing_target_layer_name
+        self.alibi_slopes = (
+            torch.tensor(alibi_slopes, dtype=torch.float32, device="cuda")
+            if alibi_slopes is not None
+            else None
         )
-        super().__init__(*upstream_args, **upstream_kwargs)
-        if uses_e5m2:
-            self.kv_cache_dtype = _E5M2_KV_CACHE_DTYPE
-            # The vendor E5M2 path consumes BF16/FP16 Q with E5M2 K/V.
-            self.supports_quant_query_input = False
+        self.logits_soft_cap = 0.0 if logits_soft_cap is None else logits_soft_cap
+        # Both vendor paths consume unquantized BF16/FP16 Q. Keep the public
+        # base's fusion support disabled: native fused writers use another ABI.
+        self.supports_quant_query_input = False
+        self.vllm_flash_attn_version = 2
         vllm_config = get_current_vllm_config_or_none()
         self.cache_config = (
             vllm_config.cache_config if vllm_config is not None else None
         )
-        if self.vllm_flash_attn_version is None:
-            self.vllm_flash_attn_version = 2
+
+    def forward(
+        self,
+        layer: torch.nn.Module,
+        query: torch.Tensor,
+        key: torch.Tensor,
+        value: torch.Tensor,
+        kv_cache: torch.Tensor,
+        attn_metadata: FlashAttentionMetadata | None,
+        output: torch.Tensor,
+        output_scale: torch.Tensor | None = None,
+        output_block_scale: torch.Tensor | None = None,
+    ) -> torch.Tensor:
+        if output_scale is not None or output_block_scale is not None:
+            raise NotImplementedError(
+                "HCU Flash does not support fused output quantization"
+            )
+        if attn_metadata is None:
+            return output.fill_(0)
+        if (
+            attn_metadata.causal is not True
+            or attn_metadata.mm_prefix_query_range_tensor is not None
+            or attn_metadata.rswa_prefix_lens is not None
+            or attn_metadata.dcp_context_kv_lens is not None
+        ):
+            raise NotImplementedError("unsupported HCU Flash attention metadata")
+        tokens = attn_metadata.num_actual_tokens
+        if tokens == 0:
+            return output
+        key_cache, value_cache = self._get_kv_cache_views(kv_cache)
+        descale_shape = (attn_metadata.query_start_loc.shape[0] - 1, self.num_kv_heads)
+        uses_e5m2 = self.kv_cache_dtype == _E5M2_KV_CACHE_DTYPE
+        self._run_flash_attention(
+            q=query[:tokens],
+            k=key_cache,
+            v=value_cache,
+            out=output[:tokens],
+            cu_seqlens_q=attn_metadata.query_start_loc,
+            max_seqlen_q=attn_metadata.max_query_len,
+            seqused_k=attn_metadata.seq_lens,
+            max_seqlen_k=attn_metadata.max_seq_len,
+            block_table=attn_metadata.block_table,
+            softmax_scale=self.scale,
+            causal=True,
+            alibi_slopes=self.alibi_slopes,
+            window_size=(-1, -1),
+            softcap=self.logits_soft_cap,
+            q_descale=None,
+            k_descale=layer._k_scale.expand(descale_shape) if uses_e5m2 else None,
+            v_descale=layer._v_scale.expand(descale_shape) if uses_e5m2 else None,
+        )
+        return output
 
     @property
     def kv_cache_layout(self) -> KVCacheLayout:
@@ -224,15 +268,21 @@ class HcuFlashAttentionImpl(FlashAttentionImpl):
         kv_cache: torch.Tensor,
         slot_mapping: torch.Tensor,
     ) -> None:
+        key_cache, value_cache = self._get_kv_cache_write_views(kv_cache)
         if self.kv_cache_dtype != _E5M2_KV_CACHE_DTYPE:
-            return super().do_kv_cache_update(
-                layer,
+            from vllm._custom_ops import reshape_and_cache_flash
+
+            reshape_and_cache_flash(
                 key,
                 value,
-                kv_cache,
+                key_cache,
+                value_cache,
                 slot_mapping,
+                self.kv_cache_dtype,
+                layer._k_scale,
+                layer._v_scale,
             )
-        key_cache, value_cache = self._get_kv_cache_write_views(kv_cache)
+            return
         _reshape_and_cache_e5m2(
             key,
             value,
@@ -267,19 +317,33 @@ class HcuFlashAttentionImpl(FlashAttentionImpl):
             # ragged sequence contract while selecting the regular prefill path.
             kwargs["max_seqlen_q"] = max_query_len + 1
         kwargs["layout"] = (
-            "bhsd"
-            if self.kv_cache_layout == KVCacheLayout.LBHNC
-            else "bshd"
+            "bhsd" if self.kv_cache_layout == KVCacheLayout.LBHNC else "bshd"
         )
         if self.kv_cache_dtype == _E5M2_KV_CACHE_DTYPE:
             kwargs["k"] = _e5m2_byte_view(kwargs["k"])
             kwargs["v"] = _e5m2_byte_view(kwargs["v"])
         kwargs["fa_version"] = 2
+        if (
+            self.kv_cache_dtype == _E5M2_KV_CACHE_DTYPE
+            and kwargs.get("block_table") is not None
+            and isinstance(max_query_len, int)
+            and max_query_len >= 1
+        ):
+            from hcu_vllm_das.attention.e5m2_scales import run_e5m2_attention
+
+            return run_e5m2_attention(_vendor_varlen_func(), kwargs)
         return _vendor_varlen_func()(**kwargs)
 
 
 class HcuFlashAttentionBackend(FlashAttentionBackend):
     """Select dense HND/NHD HCU views through vLLM's backend seam."""
+
+    @classmethod
+    def validate_configuration(cls, *args, **kwargs):
+        from hcu_vllm_das.flash_activation import require_published
+
+        require_published(cls)
+        return super().validate_configuration(*args, **kwargs)
 
     supported_kv_cache_dtypes: ClassVar[list[str]] = [
         "auto",
@@ -290,9 +354,13 @@ class HcuFlashAttentionBackend(FlashAttentionBackend):
 
     @classmethod
     def supports_kv_cache_dtype(cls, kv_cache_dtype: str | None) -> bool:
-        if kv_cache_dtype == _E5M2_KV_CACHE_DTYPE:
-            return True
-        return super().supports_kv_cache_dtype(kv_cache_dtype)
+        return kv_cache_dtype is None or kv_cache_dtype in cls.supported_kv_cache_dtypes
+
+    @classmethod
+    def supports_compute_capability(cls, capability: Any) -> bool:
+        # Adapter admission verifies real HCU. NVIDIA SM numbers do not express
+        # this provider's capability; do not fabricate an NVIDIA architecture.
+        return True
 
     @classmethod
     def supports_combination(
@@ -307,27 +375,13 @@ class HcuFlashAttentionBackend(FlashAttentionBackend):
         use_mm_prefix: bool,
         device_capability: Any,
     ) -> str | None:
-        if kv_cache_dtype == _E5M2_KV_CACHE_DTYPE:
-            return None
-        return super().supports_combination(
-            head_size,
-            dtype,
-            kv_cache_dtype,
-            block_size,
-            use_mla,
-            has_sink,
-            use_sparse,
-            use_mm_prefix,
-            device_capability,
-        )
+        if use_mla or has_sink or use_sparse or use_mm_prefix:
+            return "HCU Flash supports ordinary full decoder attention only"
+        return None
 
     @classmethod
     def supports_head_size(cls, head_size: int) -> bool:
-        return head_size % 64 == 0 and head_size <= 256
-
-    @classmethod
-    def supports_block_size(cls, block_size: int | None) -> bool:
-        return block_size is None or block_size == _KERNEL_BLOCK_SIZE
+        return head_size in (64, 128, 192, 256)
 
     @classmethod
     def supports_dcp(cls) -> bool:
@@ -370,9 +424,7 @@ class HcuFlashAttentionBackend(FlashAttentionBackend):
         return (KVCacheLayout.LBHNC, KVCacheLayout.LBNHC)
 
     @classmethod
-    def get_supported_kernel_block_sizes(
-        cls, kv_cache_spec: Any = None
-    ) -> list[int]:
+    def get_supported_kernel_block_sizes(cls, kv_cache_spec: Any = None) -> list[int]:
         del kv_cache_spec
         return [_KERNEL_BLOCK_SIZE]
 

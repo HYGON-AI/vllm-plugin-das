@@ -1,0 +1,637 @@
+{
+  "target": "v0.33.0",
+  "model": "/model/Qwen3.5-35B-A3B-W8A8",
+  "architecture": "gfx936",
+  "core_adapter_provenance": "final033-build-provenance.json",
+  "plugin_math_provenance": {
+    "plugin_build_source_sha": "529855a50e509a867911839d2a2197b1db594dcd",
+    "plugin_wheel": "/data/models/vllm033-upgrade-20261103/wheels/asm-math-plugin/hcu_vllm_das_plugin-0.3.0.dev0-py3-none-any.whl",
+    "plugin_wheel_sha256": "e905ce20ef0a9025b32d478806af6c015da0863f94965f3455793297e7450925",
+    "installed_root": "/data/models/vllm033-upgrade-20261103/.venv-plugin-review/lib/python3.12/site-packages",
+    "exact_python_files": 14,
+    "core_adapter_provenance": "final033-build-provenance.json",
+    "change": "ASM uses public native sorting/GEMMs with official quantization, activation and reduction; other vendor solutions retain their prior path"
+  },
+  "later_admission_provenance": "int8-admission-plugin-build-provenance.json",
+  "checkpoint": {
+    "config.json": {
+      "size": 4385,
+      "sha256": "949b9c61923397d44c75c8f31830a6b0e2d466ce6baa9505850b4c678ba810d5"
+    },
+    "configuration.json": {
+      "size": 51,
+      "sha256": "2d4464e2ead06bc9bc718c781309ad1e7baded626d66e8dcdc8b469ba185faf0"
+    },
+    "generation_config.json": {
+      "size": 244,
+      "sha256": "4f25002776b741773666203dcea8f54619f177ace3ae483d311102092a4658e0"
+    },
+    "model.safetensors-00001-of-00014.safetensors": {
+      "size": 2689598792,
+      "sha256": "baa6913f4e46eef3ad957a45e70fc0fc8ca54fd7d7f2741cb930afda83e1ceea"
+    },
+    "model.safetensors-00002-of-00014.safetensors": {
+      "size": 2689598784,
+      "sha256": "fb461628b4ee641fd78e50eb8e11693014f2f85788cc48105e3c21e933270b2c"
+    },
+    "model.safetensors-00003-of-00014.safetensors": {
+      "size": 2689598784,
+      "sha256": "2ffaf810cb4487bca51cfaf076d9450adb9626294a33edb2486235746ac0d3de"
+    },
+    "model.safetensors-00004-of-00014.safetensors": {
+      "size": 2689598792,
+      "sha256": "a38404a4ffa2973f7ee9d1ed879cb54f7c2e100342127aca453c38fa006562fa"
+    },
+    "model.safetensors-00005-of-00014.safetensors": {
+      "size": 2689598792,
+      "sha256": "dac8fda8958c5a675647cd421c7d10774482d2c6f8495ccc1dd33fffe3dc9c4f"
+    },
+    "model.safetensors-00006-of-00014.safetensors": {
+      "size": 2689598792,
+      "sha256": "61f2ba665025174df3433b2d0e12d748eb2a3f7a8616cc0b84139ec614de85b5"
+    },
+    "model.safetensors-00007-of-00014.safetensors": {
+      "size": 2689598784,
+      "sha256": "3d4fe0ad46f151042bd2a99c0b285a5187a48b8437e7cf87bc4df01e1394f3e8"
+    },
+    "model.safetensors-00008-of-00014.safetensors": {
+      "size": 2689598784,
+      "sha256": "a5d280fe5813bc9fd2fbb9c889cc7fbf406238dca204dc176b89ccf004bcab10"
+    },
+    "model.safetensors-00009-of-00014.safetensors": {
+      "size": 3657434888,
+      "sha256": "0964805c3f9d4b5dfb72e37e31e813409aee0ce399cdb9c86bf4db49897ae92b"
+    },
+    "model.safetensors-00010-of-00014.safetensors": {
+      "size": 2705328712,
+      "sha256": "44e991729e170d756eb3f8e23bfb6a563aea4aa7e2fddce38abd052a77b5d8df"
+    },
+    "model.safetensors-00011-of-00014.safetensors": {
+      "size": 2705328720,
+      "sha256": "06c770dd8885584f81e958a0d84d6822868d760c040aa01d90c8ae1f70bc5853"
+    },
+    "model.safetensors-00012-of-00014.safetensors": {
+      "size": 2705328712,
+      "sha256": "b3aac8a7a10e4fe9a71cdf7ffffa196dacdf8d706feb2c529fdc0b019ca1be30"
+    },
+    "model.safetensors-00013-of-00014.safetensors": {
+      "size": 3021215200,
+      "sha256": "da5d34c3aa52c98af166a1d17c3fb1ec5c39208720df43a49dc3518c15389b64"
+    },
+    "model.safetensors-00014-of-00014.safetensors": {
+      "size": 1271216544,
+      "sha256": "3d72846cb8bcd257a8befc9760ca38ab30f65787cfa60716bbb7d10b11719092"
+    },
+    "model.safetensors.index.json": {
+      "size": 309392,
+      "sha256": "193298e44530fd94311879dabfb7825379c367bde2d5cb4d10554de611004d4a"
+    },
+    "preprocessor_config.json": {
+      "size": 390,
+      "sha256": "27225450ac9c6529872ee1924fcb0962ff5634834f817040f444118116f4e516"
+    },
+    "tokenizer.json": {
+      "size": 12807982,
+      "sha256": "5f9e4d4901a92b997e463c1f46055088b6cca5ca61a6522d1b9f64c4bb81cb42"
+    },
+    "tokenizer_config.json": {
+      "size": 16710,
+      "sha256": "316230d6a809701f4db5ea8f8fc862bc3a6f3229c937c174e674ff3ca0a64ac8"
+    },
+    "video_preprocessor_config.json": {
+      "size": 385,
+      "sha256": "7768af27c1fafa9cc9011c1dc20067e03f8915e03b63504550e11d5066986d13"
+    },
+    "vocab.json": {
+      "size": 6722759,
+      "sha256": "ce99b4cb2983d118806ce0a8b777a35b093e2000a503ebde25853284c9dfa003"
+    }
+  },
+  "common_protocol": {
+    "client_sha256": "ae8fd06a2b61de5db774a8c4baa7d41c0f34d6d1c27436d832cdb4bb59eef571",
+    "common_sha256": "74b72da951c3232e0ad765720f5f436ce64580ec29006f9258ac4c1350ddef3c",
+    "count": 32,
+    "evaluator_revision": "6d43fb980f9fee3c892a914eda09951f772ad10d",
+    "instruction": "Complete the following Python function. Return only the complete Python code, including required imports and the function definition.\n\n",
+    "max_tokens": 4096,
+    "model": "/model/Qwen3.5-35B-A3B-W8A8",
+    "normalization": "v2: remove one leading <think> block; extract one python/py/unlabelled fence; preserve whitespace; prepend newline for entry-point def found by ast.walk; on SyntaxError/ValueError preserve literal body; never repair indentation",
+    "problems_sha256": "d3dca5d1c416b09fb3a42455f0a08d4fca0c699a9ec728f5ee28e09989bef7c5",
+    "schema": 1,
+    "seed": 0,
+    "source_sha256": {
+      "data/HumanEval.jsonl.gz": "b796127e635a67f93fb35c04f4cb03cf06f38c8072ee7cee8833d7bee06979ef",
+      "human_eval/__init__.py": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855",
+      "human_eval/data.py": "e1351f0ded89b072490180ce94ce33b88bac4e38b26f08eb26ab0714586585ab",
+      "human_eval/evaluate_functional_correctness.py": "fe8cf3b5074c180f045517dc5efedaea608aa6887a077885aeafae5b194e9217",
+      "human_eval/evaluation.py": "e926d5e9b8f1ec040096cd5952e8cf79f8dc0b7fb80ba6667ce604ffea0397bc",
+      "human_eval/execution.py": "79901c6f5b59701c465b164aed290fa53abc35abc80a5378fc10f4dac1f9a84c"
+    },
+    "tasks": [
+      "HumanEval/0",
+      "HumanEval/1",
+      "HumanEval/2",
+      "HumanEval/3",
+      "HumanEval/4",
+      "HumanEval/5",
+      "HumanEval/6",
+      "HumanEval/7",
+      "HumanEval/8",
+      "HumanEval/9",
+      "HumanEval/10",
+      "HumanEval/11",
+      "HumanEval/12",
+      "HumanEval/13",
+      "HumanEval/14",
+      "HumanEval/15",
+      "HumanEval/16",
+      "HumanEval/17",
+      "HumanEval/18",
+      "HumanEval/19",
+      "HumanEval/20",
+      "HumanEval/21",
+      "HumanEval/22",
+      "HumanEval/23",
+      "HumanEval/24",
+      "HumanEval/25",
+      "HumanEval/26",
+      "HumanEval/27",
+      "HumanEval/28",
+      "HumanEval/29",
+      "HumanEval/30",
+      "HumanEval/31"
+    ],
+    "temperature": 0,
+    "thinking": "off"
+  },
+  "request_comparison": "All32 task IDs, body and wire_body are exact; only loopback URL differs",
+  "settings": {
+    "attention": "TRITON_ATTN",
+    "dense_int8": "TritonInt8ScaledMMLinearKernel",
+    "quantization": "compressed-tensors, INT8 channel weights / dynamic token activations",
+    "dtype": "bfloat16",
+    "graph": "FULL_AND_PIECEWISE",
+    "combo_kernels": false,
+    "prefix_enabled": true,
+    "manager_page": 1056,
+    "mtp": 0,
+    "tp": 1,
+    "distributed_ep": false
+  },
+  "arms": {
+    "triton": {
+      "status": "COMPLETE",
+      "scores": {
+        "raw": {
+          "passed": 31,
+          "count": 32,
+          "failed": [
+            {
+              "task_id": "HumanEval/24",
+              "result": "failed: invalid syntax (<string>, line 8)"
+            }
+          ],
+          "protocol_sha256": "faa8b67ff6a7b318f219e75d46ffad2aebcac021e2f294ac001332a3d1b78b9d"
+        },
+        "normalized": {
+          "passed": 32,
+          "count": 32,
+          "failed": [],
+          "protocol_sha256": "faa8b67ff6a7b318f219e75d46ffad2aebcac021e2f294ac001332a3d1b78b9d"
+        }
+      },
+      "finish_reasons": {
+        "stop": 32
+      },
+      "prompt_tokens": 4203,
+      "completion_tokens": 4872,
+      "experts": {
+        "vllm.model_executor.layers.fused_moe.experts.triton_moe.TritonExperts": 40
+      },
+      "first_expert": {
+        "name": "language_model.model.layers.0.mlp.experts.routed_experts",
+        "layer": "vllm.model_executor.layers.fused_moe.routed_experts.RoutedExperts",
+        "method": "vllm.model_executor.layers.quantization.compressed_tensors.compressed_tensors_moe.compressed_tensors_moe_w8a8_int8.CompressedTensorsW8A8Int8MoEMethod",
+        "kernel": "vllm.model_executor.layers.fused_moe.modular_kernel.FusedMoEKernel",
+        "experts": "vllm.model_executor.layers.fused_moe.experts.triton_moe.TritonExperts",
+        "backend": "Int8MoeBackend.TRITON",
+        "w13_weight": {
+          "shape": [
+            256,
+            1024,
+            2048
+          ],
+          "stride": [
+            2097152,
+            2048,
+            1
+          ],
+          "dtype": "torch.int8",
+          "device": "cuda:0"
+        },
+        "w2_weight": {
+          "shape": [
+            256,
+            2048,
+            512
+          ],
+          "stride": [
+            1048576,
+            512,
+            1
+          ],
+          "dtype": "torch.int8",
+          "device": "cuda:0"
+        },
+        "w13_weight_scale": {
+          "shape": [
+            256,
+            1024,
+            1
+          ],
+          "stride": [
+            1024,
+            1,
+            1
+          ],
+          "dtype": "torch.float32",
+          "device": "cuda:0"
+        },
+        "w2_weight_scale": {
+          "shape": [
+            256,
+            2048,
+            1
+          ],
+          "stride": [
+            2048,
+            1,
+            1
+          ],
+          "dtype": "torch.float32",
+          "device": "cuda:0"
+        }
+      },
+      "elapsed_s": 1075.6379411609378,
+      "graph": "FULL_AND_PIECEWISE; captured and used with sequential and concurrent serving",
+      "prefix": {
+        "enabled": true,
+        "queries": 6239.0,
+        "hits": 0.0,
+        "accepted": false,
+        "reason": "Requests do not establish positive cache reuse at manager page1056"
+      },
+      "smoke_requests": 4,
+      "concurrent_waves": 2,
+      "requests_per_wave": 4
+    },
+    "aiter": {
+      "status": "COMPLETE",
+      "scores": {
+        "raw": {
+          "passed": 32,
+          "count": 32,
+          "failed": [],
+          "protocol_sha256": "507524c7dde39bafb66061538a8e973c66dec36d172ff1d4c64bb97d60a6238d"
+        },
+        "normalized": {
+          "passed": 32,
+          "count": 32,
+          "failed": [],
+          "protocol_sha256": "507524c7dde39bafb66061538a8e973c66dec36d172ff1d4c64bb97d60a6238d"
+        }
+      },
+      "finish_reasons": {
+        "stop": 32
+      },
+      "prompt_tokens": 4203,
+      "completion_tokens": 4896,
+      "experts": {
+        "hcu_vllm_das.moe.int8_oracle.HcuAiterInt8Experts": 40
+      },
+      "first_expert": {
+        "name": "language_model.model.layers.0.mlp.experts.routed_experts",
+        "layer": "vllm.model_executor.layers.fused_moe.routed_experts.RoutedExperts",
+        "method": "vllm.model_executor.layers.quantization.compressed_tensors.compressed_tensors_moe.compressed_tensors_moe_w8a8_int8.CompressedTensorsW8A8Int8MoEMethod",
+        "kernel": "vllm.model_executor.layers.fused_moe.modular_kernel.FusedMoEKernel",
+        "experts": "hcu_vllm_das.moe.int8_oracle.HcuAiterInt8Experts",
+        "backend": "Int8MoeBackend.AITER",
+        "w13_weight": {
+          "shape": [
+            256,
+            1024,
+            2048
+          ],
+          "stride": [
+            2097152,
+            2048,
+            1
+          ],
+          "dtype": "torch.int8",
+          "device": "cuda:0"
+        },
+        "w2_weight": {
+          "shape": [
+            256,
+            2048,
+            512
+          ],
+          "stride": [
+            1048576,
+            512,
+            1
+          ],
+          "dtype": "torch.int8",
+          "device": "cuda:0"
+        },
+        "w13_weight_scale": {
+          "shape": [
+            256,
+            1024,
+            1
+          ],
+          "stride": [
+            1024,
+            1,
+            1
+          ],
+          "dtype": "torch.float32",
+          "device": "cuda:0"
+        },
+        "w2_weight_scale": {
+          "shape": [
+            256,
+            2048,
+            1
+          ],
+          "stride": [
+            2048,
+            1,
+            1
+          ],
+          "dtype": "torch.float32",
+          "device": "cuda:0"
+        }
+      },
+      "elapsed_s": 1042.5952395771164,
+      "graph": "FULL_AND_PIECEWISE; captured and used with sequential and concurrent serving",
+      "prefix": {
+        "enabled": true,
+        "queries": 6239.0,
+        "hits": 0.0,
+        "accepted": false,
+        "reason": "Requests do not establish positive cache reuse at manager page1056"
+      },
+      "smoke_requests": 4,
+      "concurrent_waves": 2,
+      "requests_per_wave": 4,
+      "native_execution": {
+        "selected_m": [
+          1,
+          2,
+          4,
+          8,
+          26,
+          27,
+          75,
+          79,
+          82,
+          83,
+          90,
+          91,
+          101,
+          102,
+          103,
+          115,
+          117,
+          121,
+          125,
+          126,
+          132,
+          137,
+          138,
+          143,
+          146,
+          148,
+          150,
+          151,
+          152,
+          156,
+          157,
+          165,
+          182,
+          200,
+          206,
+          598,
+          1024
+        ],
+        "fallback_events": 0,
+        "stage_code_objects": [
+          "[aiter] hipModuleLoad: /usr/local/lib/python3.12/site-packages/aiter_meta/hsa/gfx936/w8a8/stage1/Cijk_Alik_Bljk_I8HS_BH_SABV_UserArgs_MT256x64x256_T_PGR3_SB3_SWMNK8_1_1_moe1.co GetFunction: MOE_w8a8_MT256x64x256_gemm1 Success",
+          "[aiter] hipModuleLoad: /usr/local/lib/python3.12/site-packages/aiter_meta/hsa/gfx936/w8a8/stage2/Cijk_Alik_Bljk_I8HS_BH_SABV_UserArgs_MT128x64x128_SN_K1_SB3_SWMNK4_1_1_moe2.co GetFunction: MOE_w8a8_MT128x64x128_gemm2 Success",
+          "[aiter] hipModuleLoad: /usr/local/lib/python3.12/site-packages/aiter_meta/hsa/gfx936/w8a8/stage1/Cijk_Alik_Bljk_I8HS_BH_SABV_UserArgs_MT256x16x256_T_PGR2_SB3_SWMNK8_1_1_moe1.co GetFunction: MOE_w8a8_MT256x16x256_gemm1 Success",
+          "[aiter] hipModuleLoad: /usr/local/lib/python3.12/site-packages/aiter_meta/hsa/gfx936/w8a8/stage2/Cijk_Alik_Bljk_I8HS_BH_SABV_UserArgs_MT128x16x128_SN_K1_SB3_SWMNK4_1_1_moe2.co GetFunction: MOE_w8a8_MT128x16x128_gemm2 Success",
+          "[aiter] hipModuleLoad: /usr/local/lib/python3.12/site-packages/aiter_meta/hsa/gfx936/w8a8/stage1/Cijk_Alik_Bljk_I8HS_BH_SABV_UserArgs_MT128x16x256_T_PGR2_SB3_SWMNK8_1_1_moe1.co GetFunction: MOE_w8a8_MT128x16x256_gemm1 Success",
+          "[aiter] hipModuleLoad: /usr/local/lib/python3.12/site-packages/aiter_meta/hsa/gfx936/w8a8/stage1/Cijk_Alik_Bljk_I8HS_BH_SABV_UserArgs_MT128x16x256_T_PGR4_SB3_SWMNK8_1_1_moe1.co GetFunction: MOE_w8a8_MT128x16x256_gemm1 Success",
+          "[aiter] hipModuleLoad: /usr/local/lib/python3.12/site-packages/aiter_meta/hsa/gfx936/w8a8/stage1/Cijk_Alik_Bljk_I8HS_BH_SABV_UserArgs_MT256x32x256_T_PGR2_SB3_SWMNK8_1_1_moe1.co GetFunction: MOE_w8a8_MT256x32x256_gemm1 Success",
+          "[aiter] hipModuleLoad: /usr/local/lib/python3.12/site-packages/aiter_meta/hsa/gfx936/w8a8/stage2/Cijk_Alik_Bljk_I8HS_BH_SABV_UserArgs_MT128x32x128_SN_K1_SB3_SWMNK4_1_1_moe2.co GetFunction: MOE_w8a8_MT128x32x128_gemm2 Success",
+          "[aiter] hipModuleLoad: /usr/local/lib/python3.12/site-packages/aiter_meta/hsa/gfx936/w8a8/stage1/Cijk_Alik_Bljk_I8HS_BH_SABV_UserArgs_MT256x16x256_T_PGR3_SB3_SWMNK8_1_1_moe1.co GetFunction: MOE_w8a8_MT256x16x256_gemm1 Success",
+          "[aiter] hipModuleLoad: /usr/local/lib/python3.12/site-packages/aiter_meta/hsa/gfx936/w8a8/stage1/Cijk_Alik_Bljk_I8HS_BH_SABV_UserArgs_MT128x16x256_T_PGR3_SB3_SWMNK8_1_1_moe1.co GetFunction: MOE_w8a8_MT128x16x256_gemm1 Success",
+          "[aiter] hipModuleLoad: /usr/local/lib/python3.12/site-packages/aiter_meta/hsa/gfx936/w8a8/stage2/Cijk_Alik_Bljk_I8HS_BH_SABV_UserArgs_MT256x16x128_SN_K1_SB3_SWMNK4_1_1_moe2.co GetFunction: MOE_w8a8_MT256x16x128_gemm2 Success"
+        ]
+      }
+    }
+  },
+  "evidence": [
+    {
+      "path": "/data/models/vllm033-upgrade-20261103/evidence/int8-model-triton-attempt1/result.json",
+      "sha256": "baa48b63ff1fb4af619032d17855518294d87013244f210fd11748dc49274719",
+      "size": 5153
+    },
+    {
+      "path": "/data/models/vllm033-upgrade-20261103/evidence/int8-model-triton-attempt1/launch.json",
+      "sha256": "b6d3b040eff76ebc4dd5a0bef27bd5e196dd0f92c9568a0c24cd3ce45c8345a3",
+      "size": 4987
+    },
+    {
+      "path": "/data/models/vllm033-upgrade-20261103/evidence/int8-model-triton-attempt1/server.log",
+      "sha256": "313032cfaa0a5612a1fa40d36fc09c6fecae79764f3c6c75808dfcd17a42730d",
+      "size": 43815
+    },
+    {
+      "path": "/data/models/vllm033-upgrade-20261103/evidence/int8-model-triton-attempt1/int8-inspection.json",
+      "sha256": "96fda66a3d1e71f5e414c7428d895ed9b96c6bcf03ba972d9a2603ec53cdccdc",
+      "size": 148766
+    },
+    {
+      "path": "/data/models/vllm033-upgrade-20261103/evidence/int8-model-triton-attempt1/model-inspection.json",
+      "sha256": "2618a9c07000f6e7f72cc1332b35a4ee23cb56ede73d68abd432969c27fa399c",
+      "size": 5923
+    },
+    {
+      "path": "/data/models/vllm033-upgrade-20261103/evidence/int8-model-triton-attempt1/metrics-before.txt",
+      "sha256": "51bacc3c60a55e163d5337c06bfdee70b2417320ef2b44c8f14b94f6c84c4ca7",
+      "size": 59578
+    },
+    {
+      "path": "/data/models/vllm033-upgrade-20261103/evidence/int8-model-triton-attempt1/metrics-after.txt",
+      "sha256": "ad28697f2bfcc69a178161dbd4f2bb1606f5311481e7fdd831a249867126456d",
+      "size": 61072
+    },
+    {
+      "path": "/data/models/vllm033-upgrade-20261103/evidence/int8-model-triton-attempt1/metrics-after-concurrent.txt",
+      "sha256": "9404f9bee88e7ee0b827369a664014c53d5b2cae23ccd66d12e9994ed0347537",
+      "size": 61258
+    },
+    {
+      "path": "/data/models/vllm033-upgrade-20261103/evidence/int8-model-triton-attempt1/metrics-final.txt",
+      "sha256": "6db9295ee27f4ad2d6332d4a251d6fec1e2b6e19bf5b33dc5d83f11b20cec2a0",
+      "size": 61367
+    },
+    {
+      "path": "/data/models/vllm033-upgrade-20261103/evidence/int8-model-triton-attempt1/smoke-responses.json",
+      "sha256": "49adb75198c95954f844940578ed249ec01968330b2ec9b34087b4540430da98",
+      "size": 14237
+    },
+    {
+      "path": "/data/models/vllm033-upgrade-20261103/evidence/int8-model-triton-attempt1/concurrent-responses.json",
+      "sha256": "d3ad8afeb1d86e0cc18e7853ccb935f2d71d6da4e22956d91d286990d571430d",
+      "size": 12474
+    },
+    {
+      "path": "/data/models/vllm033-upgrade-20261103/evidence/int8-model-triton-attempt1/humaneval32/protocol.json",
+      "sha256": "4cc343f8ae804a8c0ba5329f35e8873e11945c66c2ddc956396f3e8cd60a74aa",
+      "size": 2144
+    },
+    {
+      "path": "/data/models/vllm033-upgrade-20261103/evidence/int8-model-triton-attempt1/humaneval32/responses.jsonl",
+      "sha256": "b4e7f3d81f63e28cda84281a60099a5ac02e482789e450db35f16bba72032c8a",
+      "size": 151562
+    },
+    {
+      "path": "/data/models/vllm033-upgrade-20261103/evidence/int8-model-triton-attempt1/humaneval32/requests.jsonl",
+      "sha256": "7f5cd3aa3d11e451f70c97b1afcdadc504c1f317ce8771d73933fc0eb2a19295",
+      "size": 46709
+    },
+    {
+      "path": "/data/models/vllm033-upgrade-20261103/evidence/int8-model-triton-attempt1/humaneval32/samples.raw.jsonl",
+      "sha256": "5acf977e82e74e3f33055e1d36ff361b8fcc8820b604828a8a1cebb3226b68c5",
+      "size": 18721
+    },
+    {
+      "path": "/data/models/vllm033-upgrade-20261103/evidence/int8-model-triton-attempt1/humaneval32/samples.normalized.jsonl",
+      "sha256": "87f62fcb4116222cee291c15095c0a07059c31fb84e50383d4cd9c0590176190",
+      "size": 18771
+    },
+    {
+      "path": "/data/models/vllm033-upgrade-20261103/evidence/int8-model-triton-attempt1/humaneval32-scores/score.raw.json",
+      "sha256": "00ec3f253f3637bc794e6cbc4dc23a6e0504c50fbad16d16278bf322ee5dd40a",
+      "size": 21102
+    },
+    {
+      "path": "/data/models/vllm033-upgrade-20261103/evidence/int8-model-triton-attempt1/humaneval32-scores/score.normalized.json",
+      "sha256": "54149f93ca52e3eb4a9a2375667f19d00f273168130be33c084f35932d5eb1f8",
+      "size": 21119
+    },
+    {
+      "path": "/data/models/vllm033-upgrade-20261103/evidence/int8-model-aiter-attempt1/result.json",
+      "sha256": "0792ad650abe8ebf57a134b2b542debd5f9d20473c2f9c3fa4ae0c64200b43ed",
+      "size": 5140
+    },
+    {
+      "path": "/data/models/vllm033-upgrade-20261103/evidence/int8-model-aiter-attempt1/launch.json",
+      "sha256": "ba41b1a6f6ec3ab85b16e411350044767da9b931b6312cda38ae392b59926a87",
+      "size": 4974
+    },
+    {
+      "path": "/data/models/vllm033-upgrade-20261103/evidence/int8-model-aiter-attempt1/server.log",
+      "sha256": "a522d42fafb64c24def113d956917827b190712c7ae0fc23cec40ca91fd919a1",
+      "size": 52256
+    },
+    {
+      "path": "/data/models/vllm033-upgrade-20261103/evidence/int8-model-aiter-attempt1/int8-inspection.json",
+      "sha256": "6204d5cab2b5fd753c190134cb00c3a5b7705fa8d203f2e94e17272866d0b288",
+      "size": 147886
+    },
+    {
+      "path": "/data/models/vllm033-upgrade-20261103/evidence/int8-model-aiter-attempt1/model-inspection.json",
+      "sha256": "2618a9c07000f6e7f72cc1332b35a4ee23cb56ede73d68abd432969c27fa399c",
+      "size": 5923
+    },
+    {
+      "path": "/data/models/vllm033-upgrade-20261103/evidence/int8-model-aiter-attempt1/metrics-before.txt",
+      "sha256": "faa4b386e34e20005d058dd06ea7c54637b7b8ae30688080ed3be5b876b0aa51",
+      "size": 59589
+    },
+    {
+      "path": "/data/models/vllm033-upgrade-20261103/evidence/int8-model-aiter-attempt1/metrics-after.txt",
+      "sha256": "29bd2f76a0fdaf0da6f7a78fbecd4eca24b1a96ec81360e7609b2bf3ef45b2bb",
+      "size": 61061
+    },
+    {
+      "path": "/data/models/vllm033-upgrade-20261103/evidence/int8-model-aiter-attempt1/metrics-after-concurrent.txt",
+      "sha256": "a7c99acc65d686548d8052166f442c3e84587655031d73ea97eaafebd2010407",
+      "size": 61289
+    },
+    {
+      "path": "/data/models/vllm033-upgrade-20261103/evidence/int8-model-aiter-attempt1/metrics-final.txt",
+      "sha256": "33bdea3aacb51409bd954d7edbb8cb2c03e6bae37de20a35d972ec3c480096b6",
+      "size": 61382
+    },
+    {
+      "path": "/data/models/vllm033-upgrade-20261103/evidence/int8-model-aiter-attempt1/smoke-responses.json",
+      "sha256": "a73465da04d77c4eb3ea13d822ecaa6adccbda2b316525d60c7fdf1841584274",
+      "size": 14237
+    },
+    {
+      "path": "/data/models/vllm033-upgrade-20261103/evidence/int8-model-aiter-attempt1/concurrent-responses.json",
+      "sha256": "119554e1ccb089fabe44bec0f597cd4eec23ea0978f02363c78cc6a5f88b7a23",
+      "size": 12474
+    },
+    {
+      "path": "/data/models/vllm033-upgrade-20261103/evidence/int8-model-aiter-attempt1/humaneval32/protocol.json",
+      "sha256": "3fbc6aa2b9373df444e5481f45e3fc584fa2d7163f1b3d58274a34787bd12985",
+      "size": 2144
+    },
+    {
+      "path": "/data/models/vllm033-upgrade-20261103/evidence/int8-model-aiter-attempt1/humaneval32/responses.jsonl",
+      "sha256": "a07f353b8c3074547a287092cc14ec1170369a1b76c3e3984093e7a849b7d3fb",
+      "size": 151781
+    },
+    {
+      "path": "/data/models/vllm033-upgrade-20261103/evidence/int8-model-aiter-attempt1/humaneval32/requests.jsonl",
+      "sha256": "607643c02148f9f5ab575f78ffbfa324747728e2b1944e3b514dda16d4969faa",
+      "size": 46709
+    },
+    {
+      "path": "/data/models/vllm033-upgrade-20261103/evidence/int8-model-aiter-attempt1/humaneval32/samples.raw.jsonl",
+      "sha256": "8c0a7a2b7e90e5ad130a53520f2e4dfae34798b1aced76cdc39ad4f4aa1868e9",
+      "size": 18835
+    },
+    {
+      "path": "/data/models/vllm033-upgrade-20261103/evidence/int8-model-aiter-attempt1/humaneval32/samples.normalized.jsonl",
+      "sha256": "dfd3fc29088e7fb066fe295ca5d7487f20f6b0abd034cc3fde836e8cce62b05c",
+      "size": 18899
+    },
+    {
+      "path": "/data/models/vllm033-upgrade-20261103/evidence/int8-model-aiter-attempt1/humaneval32-scores/score.raw.json",
+      "sha256": "e4aa6fd7fe10459e4fd8cda92e3e23028416c07f00ced03ca0dc4c9a7f8826e0",
+      "size": 21176
+    },
+    {
+      "path": "/data/models/vllm033-upgrade-20261103/evidence/int8-model-aiter-attempt1/humaneval32-scores/score.normalized.json",
+      "sha256": "334f505ab32e6ae085d55579d3079ae4b30672d4ee994764a98a54d4f470fb99",
+      "size": 21247
+    }
+  ],
+  "outcome": "No normalized HumanEval regression in this profile; 32/32 both, raw31/32 versus32/32",
+  "limitations": [
+    "Frozen529855a5 model wheel; later admission-only wheel has separate262 CPU/11 native checks",
+    "No positive prefix hit; prefix correctness not accepted by this experiment",
+    "Not default combo policy, MTP, distributed EP, vendor-Triton pipeline or E5M2 acceptance",
+    "No model speedup claim; wall time includes loading, compilation and cleanup"
+  ],
+  "owned_ports_closed": true,
+  "last_good": false,
+  "merge_decision": "HOLD PR330: unchanged E5M2/hybrid-model and vendor-Triton numerical gates remain open"
+}

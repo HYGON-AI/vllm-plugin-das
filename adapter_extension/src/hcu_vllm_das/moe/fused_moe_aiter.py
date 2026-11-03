@@ -6,7 +6,8 @@ from dataclasses import dataclass
 from importlib import import_module
 import logging
 from threading import Lock
-from typing import Any, Callable
+from typing import Callable
+from types import SimpleNamespace
 
 import torch
 
@@ -40,17 +41,75 @@ def _runtime_logger() -> logging.Logger:
 
 def _load_aiter_api() -> _AiterApi:
     module = import_module("aiter.moe")
+
+    def execute(**arguments):
+        solution = arguments["moe_config"].solution_type
+        if solution != "asm":
+            if solution == "ck":
+                arguments["expert_map"] = _aiter_expert_mask(arguments["expert_map"])
+            return module.aiter_moe(**arguments)
+        from .int8_asm import execute as execute_asm, unsupported_reason
+
+        native = import_module("aiter")
+        native_arguments = dict(
+            arguments, expert_map=_aiter_expert_mask(arguments["expert_map"])
+        )
+        reason = unsupported_reason(native_arguments, native)
+        if reason is None:
+            return execute_asm(native=native, **native_arguments)
+        hidden, w1, w2, topk = (
+            arguments[name] for name in ("hidden_states", "w1", "w2", "topk_ids")
+        )
+        problem = (
+            hidden.shape[0],
+            w1.shape[0],
+            w1.shape[1],
+            w2.shape[1],
+            hidden.shape[1],
+            topk.shape[1],
+        )
+        _record_once(
+            logging.WARNING,
+            f"fallback:{reason}",
+            problem,
+            "asm",
+            arguments["moe_config"],
+        )
+        # Fall back before any native launch, preserving the canonical map.
+        canonical_map = arguments["expert_map"]
+        return _triton_fallback(
+            hidden_states=hidden,
+            w1=w1,
+            w2=w2,
+            topk_weights=arguments["topk_weights"],
+            topk_ids=topk,
+            activation=arguments["activation"],
+            global_num_experts=arguments["global_num_experts"],
+            expert_map=canonical_map,
+            quant_config=SimpleNamespace(
+                **{
+                    name: arguments[name]
+                    for name in (
+                        "w1_scale",
+                        "w2_scale",
+                        "w1_zp",
+                        "w2_zp",
+                        "a1_scale",
+                        "a2_scale",
+                    )
+                }
+            ),
+        )
+
     return _AiterApi(
         quant_type_w8a8=module.MoeQuantType.W8A8,
         get_config=module.get_aiter_moe_config,
-        aiter_moe=module.aiter_moe,
+        aiter_moe=execute,
     )
 
 
 def _load_triton_fallback() -> Callable[..., object]:
-    module = import_module(
-        "vllm.model_executor.layers.fused_moe.fused_moe"
-    )
+    module = import_module("vllm.model_executor.layers.fused_moe.fused_moe")
     return module.fused_experts_impl
 
 
@@ -165,6 +224,11 @@ def apply_aiter_int8_moe(
 
     if not bool(getattr(quant_config, "use_int8_w8a8", False)):
         raise ValueError("AITER INT8 MoE requires an INT8 W8A8 quant config")
+    if any(getattr(quant_config, name, None) is not None for name in ("w1_bias", "w2_bias")):
+        raise ValueError("HCU AITER INT8 MoE does not support expert bias")
+    activation_name = _activation_name(activation)
+    if activation_name not in ("silu", "gelu"):
+        raise ValueError(f"HCU AITER INT8 MoE does not support {activation_name} activation")
 
     m, k = _shape(hidden_states, 2, "hidden_states")
     e, n1, weight_k = _shape(w1, 3, "w1")
@@ -175,7 +239,6 @@ def apply_aiter_int8_moe(
     if _shape(topk_weights, 2, "topk_weights") != (m, top_k):
         raise ValueError("AITER INT8 MoE top-k weights and IDs must match")
 
-    activation_name = _activation_name(activation)
     global_num_experts = int(getattr(moe_config, "num_experts", e))
     problem = (m, e, n1, n2, k, top_k)
     api = _load_aiter_api()
@@ -197,8 +260,20 @@ def apply_aiter_int8_moe(
         getattr(selected, "need_shuffle", False)
         or getattr(selected, "need_shuffle_scale", False)
     )
-    if not found or unsupported_layout:
-        reason = "config-miss" if not found else "unsupported-layout"
+    unsupported_expert_map = expert_map is not None and solution not in (
+        "asm",
+        "ck",
+        "triton",
+        "moe_c",
+    )
+    if not found or unsupported_layout or unsupported_expert_map:
+        reason = (
+            "config-miss"
+            if not found
+            else "unsupported-layout"
+            if unsupported_layout
+            else "unsupported-expert-map"
+        )
         _record_once(logging.WARNING, f"fallback:{reason}", problem, solution, selected)
         return _triton_fallback(
             hidden_states=hidden_states,
@@ -230,7 +305,8 @@ def apply_aiter_int8_moe(
         a2_scale=getattr(quant_config, "a2_scale", None),
         block_shape=None,
         global_num_experts=global_num_experts,
-        expert_map=_aiter_expert_mask(expert_map),
+        # Keep canonical routing until the final solution-specific boundary.
+        expert_map=expert_map,
         routed_scaling_factor=1.0,
         use_weight_shuffle=False,
         output_dtype=output_dtype,

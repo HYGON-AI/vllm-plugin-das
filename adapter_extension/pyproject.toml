@@ -4,8 +4,8 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "hcu-vllm-das-plugin"
-version = "0.2.0.dev0"
-description = "Optional DAS optimizations for adapter-das and vLLM 0.32"
+version = "0.3.0.dev0"
+description = "Optional DAS optimizations for adapter-das and vLLM 0.33"
 readme = "README.md"
 license = "Apache-2.0"
 license-files = ["LICENSE", "NOTICE"]
@@ -17,6 +17,7 @@ dependencies = [
 
 [project.entry-points."hcu_adapter.extensions"]
 das_hcu = "hcu_vllm_das.extension:extension_spec"
+das_hcu_flash = "hcu_vllm_das.flash_activation:extension_spec"
 
 [tool.setuptools.packages.find]
 where = ["src"]
