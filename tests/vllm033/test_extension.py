@@ -223,7 +223,16 @@ def test_activation_accepts_the_vllm_033_release_line(
 
 @pytest.mark.parametrize(
     "version",
-    (None, "not-a-version", "1!0.33.0", "0.31.0", "0.31.9", "0.34.0"),
+    (
+        None,
+        "not-a-version",
+        "1!0.33.0",
+        "0.31.0",
+        "0.31.9",
+        "0.32.0",
+        "0.32.9+das.1",
+        "0.34.0",
+    ),
 )
 def test_activation_rejects_unsupported_metadata_before_importing_runtime(
     monkeypatch: pytest.MonkeyPatch, version: str | None

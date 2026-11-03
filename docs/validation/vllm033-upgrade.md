@@ -43,6 +43,9 @@ unsupported configuration, cache views and real target AOT cache keys:
 **64 passed**; after tightening head-size admission, the full Flash CPU file
 passed **62 tests**. Commands use `VLLM_TARGET_ROOT` for the new source and hide GPUs;
 these are CPU contracts, not native/device or model acceptance.
+After adding explicit rejection cases for the previous 0.32 release line,
+the focused version-admission suite passed **15 tests** (36 deselected).
+Those two rejection cases were added after the full portable batch above.
 
 All three trial wheels were built and installed normally into an isolated
 environment. Parent and real spawn child loaded the new Core's four native
@@ -73,8 +76,48 @@ the valid `0.33.0+das...` build suffix. The revised test checks epoch zero and
 the 0.33 release line, preserving the existing path, provider and numerical
 assertions; its independent rerun passed. No numerical threshold was changed.
 These device checks cover the listed shapes and gfx936, not gfx92a or a model
-family. HumanEval32, model prefix/MTP, communication and performance are still
-separate acceptance gates.
+family. Model accuracy, prefix/MTP, communication and performance are separate
+acceptance gates; the Qwen2 observations below do not close the model matrix.
+
+## Qwen2 model observations (2026-11-03)
+
+Candidate summary, checkpoint/tool hashes and wheel build identities:
+[`qwen2-gfx936-candidate.json`](../../validation/v0.33.0/qwen2-gfx936-candidate.json).
+This is an unresolved candidate record, not a new compatibility lock.
+
+The installed-wheel runs use the same `Qwen2-0.5B-Instruct` checkpoint,
+BF16 weights, TP1, seed 0, temperature 0, HumanEval/0–31 and 2,048 generated
+tokens per sample. Prefix caching and the default FULL_AND_PIECEWISE Graph
+remain enabled. Each arm was independently restarted with fresh caches and
+repeated using identical HTTP request bodies; endpoints differ.
+
+| Backend / KV | raw, both runs | normalized, both runs | Prefix hit delta per run |
+| --- | --- | --- | --- |
+| Official Triton / BF16, no Plugin | 0/32 | 16/32 | 1,184 tokens |
+| Plugin Flash / BF16 | 0/32 | 16/32 | 1,152 tokens |
+| Plugin Flash / E5M2 | 0/32 | 13/32 | 1,152 tokens |
+
+Raw outputs include code formatting; normalized scoring is reported separately.
+Both scorings execute only inside the existing isolated evaluator, uid 65534,
+with networking and GPU access blocked. Each arm's repeated raw sample file
+is byte-identical. BF16's equal total masks a changed task set: Plugin newly
+fails /4 and newly passes /29 versus official Triton. E5M2 versus Plugin BF16
+newly fails /0,/8,/16,/25,/31 and newly passes /5,/26. Its lower score is
+reproducible and unaccepted; no accuracy tolerance was introduced. Control and
+Plugin BF16 each have one length-limited completion per run; E5M2 has none.
+
+An additional official Triton E5M2/page64 control fails before generation:
+upstream initializes query quantization, then Attention.forward asserts that
+the cache format is E4M3/NVFP4. This is a startup failure with no accuracy
+score. No Core runtime workaround was added, and this failed control does not
+establish the cause of the Plugin E5M2 score loss.
+
+All six completed runs pass arithmetic and three repeated long-prefix output
+probes, record positive cache hits and exit zero. Shutdown still reports one
+resource_tracker semaphore warning. Owned services were stopped and all eight
+cards returned to approximately 2 MiB. GPU5/6 were never used. The original
+diagnostic-endpoint 404 failures are retained as zero-inference tool failures.
+**Quality remains OPEN and last_good=false; the Plugin PR remains a draft.**
 
 ```bash
 HCU_ADAPTER_HOST=none HIP_VISIBLE_DEVICES=-1 CUDA_VISIBLE_DEVICES=-1 \
@@ -83,8 +126,8 @@ HCU_ADAPTER_HOST=none HIP_VISIBLE_DEVICES=-1 CUDA_VISIBLE_DEVICES=-1 \
   .venv/bin/python -m pytest -q tests/vllm033
 ```
 
-The listed wheel/provenance, selector and operator checks have passed. Full
-loader/model integration, model accuracy, prefix/MTP, communication and
-performance remain separate gates. No v0.32 score or wheel
+The listed wheel/provenance, selector and operator checks have passed. Broader
+loader/model integration, model accuracy, MTP, communication and performance
+remain open; prefix evidence above covers only Qwen2. No v0.32 score or wheel
 hash is relabeled as v0.33. The old compatibility lock under `validation/v0.32.0`
 is retained unchanged; the new combination is not last-good.
