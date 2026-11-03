@@ -31,6 +31,12 @@ _WRAPPER_MARKER = "_vllm_hcu_dsv41_compressor_layout_wrapper"
 def _compressor_mm(hidden_states: torch.Tensor, weight: torch.Tensor) -> torch.Tensor:
     """Multiply HCU ``[in, out]`` or upstream ``[out, in]`` weights."""
 
+    if hidden_states.device.type == "cuda":
+        from vllm_hcu.model_executor.layers.dsv41_compressor_projection import try_compressor_projection
+
+        result = try_compressor_projection(hidden_states, weight)
+        if result is not None:
+            return result
     rhs = weight if weight.shape[0] == hidden_states.shape[-1] else weight.T
     return torch.mm(hidden_states, rhs, out_dtype=torch.float32)
 

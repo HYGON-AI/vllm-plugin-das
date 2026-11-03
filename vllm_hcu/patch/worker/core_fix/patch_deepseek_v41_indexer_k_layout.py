@@ -33,11 +33,11 @@ def use_normal_indexer_k_layout() -> bool:
 def _fp4_domain_blockers(module: ModuleType, vllm_config=None) -> tuple[str, ...]:
     """Experimental V4.1 domain, selected once before cache allocation.
 
-    DP ranks own independent request/cache metadata. DSpark(5) uses the
-    upstream per-token flattened decode metadata on HIP. PCP8 is limited to
-    the existing eager MRV2/EP compute contract. Mooncake PD relies on the
-    same deployment agreement as FP8; DCP/PP and padded-native multi-token
-    ABI remain outside this domain.
+    DP ranks own independent request/cache metadata. Non-adaptive DSpark
+    uses the upstream per-token flattened decode metadata on HIP (any
+    num_speculative_tokens). PCP8 is limited to the existing eager MRV2/EP
+    compute contract. Mooncake PD relies on the same deployment agreement as
+    FP8; DCP/PP and padded-native multi-token ABI remain outside this domain.
     """
     reasons = []
     if not fp4_indexer_requested():
@@ -81,10 +81,10 @@ def _fp4_domain_blockers(module: ModuleType, vllm_config=None) -> tuple[str, ...
     method = getattr(speculative, "method", None)
     if method and not (
         method == "dspark"
-        and getattr(speculative, "num_speculative_tokens", 0) == 5
+        and int(getattr(speculative, "num_speculative_tokens", 0) or 0) > 0
         and not getattr(speculative, "enable_adaptive_verification", False)
     ):
-        reasons.append("only non-adaptive DSpark(5) speculative decode is admitted")
+        reasons.append("only non-adaptive DSpark speculative decode is admitted")
     attention = getattr(vllm_config, "attention_config", None)
     if getattr(attention, "indexer_sparse_logits", False):
         reasons.append("sparse-logits backend is not supported by this dense FP4 adapter")
