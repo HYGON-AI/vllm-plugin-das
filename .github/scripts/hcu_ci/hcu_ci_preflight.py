@@ -172,6 +172,21 @@ def _check_requirements(
             )
             continue
 
+        if kind == "dataset":
+            roots = tuple(
+                Path(value) for value in os.environ.get(
+                    "VLLM_HCU_TEST_DATASET_ROOTS",
+                    os.environ.get("VLLM_HCU_TEST_DATASET_ROOT", ""),
+                ).split(os.pathsep) if value
+            )
+            path = _resolve_requirement(
+                item, roots[0] if roots else None, roots[1:]
+            )
+            if not path.is_dir() or not any(path.rglob("*.parquet")):
+                raise PreflightError(f"local dataset is unavailable: {path}")
+            resolved.append({"env": str(item["env"]), "kind": kind, "path": str(path)})
+            continue
+
         if kind not in {"model", "path"}:
             raise PreflightError(f"unsupported requirement kind: {kind!r}")
         path = _resolve_requirement(item, model_root, additional_model_roots)

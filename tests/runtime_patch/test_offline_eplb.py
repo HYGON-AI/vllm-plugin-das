@@ -260,7 +260,15 @@ def _setup_state(tmp_path, monkeypatch: pytest.MonkeyPatch, mode="static"):
     ):
         for name in names:
             monkeypatch.setattr(owner, name, inspect.unwrap(getattr(owner, name)))
-    monkeypatch.delattr(upstream, api._MARKER, raising=False)
+    # Record absence too: apply_to_module adds these attributes directly.
+    for marker in (api._MARKER,):
+        if not hasattr(upstream, marker):
+            monkeypatch.setattr(upstream, marker, None, raising=False)
+        monkeypatch.delattr(upstream, marker, raising=False)
+
+    # CPU contracts exercise real map commits without device-backed pinned
+    # allocations. Hardware allocator behavior belongs to HCU-marked tests.
+    monkeypatch.setattr(upstream, "PIN_MEMORY", False)
 
     model = GenericMoE()
     config, path = config_and_map(tmp_path)
@@ -923,11 +931,14 @@ def test_static_add_restores_requested_communicator_when_factory_fails(
     assert fixture.state.model_states == {}
 
 
+@pytest.mark.parametrize("policy", ["nearest", "locality_fair", "token_hash"])
 def test_static_step_and_rearrange_are_strict_noops(
     tmp_path,
     monkeypatch: pytest.MonkeyPatch,
+    policy,
 ) -> None:
     fixture = _setup_state(tmp_path, monkeypatch, mode="static")
+    fixture.state.parallel_config._vllm_hcu_eplb_static_dispatch_policy = policy
     fixture.state.add_model(fixture.model, fixture.model_config)
     before = (
         fixture.state.expert_rearrangement_step,
@@ -942,6 +953,55 @@ def test_static_step_and_rearrange_are_strict_noops(
         fixture.state.expert_load_window_step,
     )
     assert fixture.transfer_calls == []
+
+
+def test_static_token_hash_preserves_all_candidates_and_selects_one_copy(
+    tmp_path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    from vllm.model_executor.layers.fused_moe.config import RoutingMethodType
+    from vllm.model_executor.layers.fused_moe.router import base_router
+    from vllm_hcu.patch.worker.op_opt.moe import patch_base_router
+    from vllm_hcu.platforms import envs as henvs
+
+    patch_base_router.apply()
+    fixture = _setup_state(tmp_path, monkeypatch, mode="static")
+    fixture.state.parallel_config._vllm_hcu_eplb_static_dispatch_policy = "token_hash"
+    fixture.group.rank_in_group = 1
+    fixture.group.device_group = SimpleNamespace(rank=lambda: 1, size=lambda: 2)
+    fixture.state.add_model(fixture.model, fixture.model_config)
+    live = fixture.state.model_states["static-model"]
+    layer_state = fixture.model.moe_layers[0].eplb_state
+    assert live.logical_to_physical_map[0, 1, :2].tolist() == [1, 3]
+    assert live.logical_replica_count[0].tolist() == [1, 2, 1]
+    assert not hasattr(layer_state, "_vllm_hcu_static_primary_replica_count")
+    assert not fixture.state.should_record_tensor.item()
+    monkeypatch.setattr(henvs, "VLLM_HCU_USE_TORCH_EPLB_MAP_RECORD", True)
+    monkeypatch.setattr(base_router, "dbo_current_ubatch_id", lambda: 0)
+
+    class HashRouter(base_router.BaseRouter):
+        @property
+        def routing_method_type(self):
+            return RoutingMethodType.Unspecified
+
+        def _compute_routing(self, *args, **kwargs):
+            raise AssertionError("Only the real map/record bridge is under test")
+
+    router = HashRouter(top_k=2, global_num_experts=3, eplb_state=layer_state)
+    logical = torch.tensor([[1, -1], [0, 1], [1, 2], [2, 1]])
+    physical = router._apply_eplb_mapping(logical)
+    assert physical.shape == logical.shape
+    assert physical.tolist() == [[1, -1], [0, 3], [1, 2], [2, 3]]
+    valid = logical >= 0
+    assert torch.equal(live.physical_to_logical_map[0][physical[valid]], logical[valid])
+    assert live.expert_load_pass.count_nonzero().item() == 0
+    assert fixture.transfer_calls == []
+
+    # Two copies do not imply uniform real traffic: Knuth modulo2 is parity.
+    correlated = torch.tensor([[1] if token % 2 == 0 else [0] for token in range(16)])
+    selected = router._apply_eplb_mapping(correlated)
+    assert (selected == 1).sum().item() == 8
+    assert (selected == 3).sum().item() == 0
 
 
 def test_static_state_rejects_models_bound_to_mixed_source_sha(
@@ -989,6 +1049,21 @@ def test_dynamic_eplb_delegates_to_current_initialization(
         "dynamic-model"
     ].physical_to_logical_map.tolist() == [[0, 1, 2, 0]] * 2
     assert not hasattr(fixture.state, "_vllm_hcu_offline_proposal_events")
+
+
+def test_setup_state_restores_offline_patch_state(tmp_path):
+    import vllm.distributed.eplb.eplb_state as upstream
+    import vllm_hcu.patch.worker.framework_opt.patch_offline_eplb as api
+
+    missing = object()
+    marker = getattr(upstream, api._MARKER, missing)
+    originals = tuple(getattr(owner, name) for owner, name in _offline_hooks(upstream))
+    with pytest.MonkeyPatch.context() as scoped:
+        _setup_state(tmp_path, scoped, mode="record")
+        assert getattr(upstream, api._MARKER, None) is not None
+    assert getattr(upstream, api._MARKER, missing) is marker
+    assert all(getattr(owner, name) is original
+               for (owner, name), original in zip(_offline_hooks(upstream), originals))
 
 
 def _isolated_offline_target():
@@ -1046,3 +1121,34 @@ def test_offline_adapter_rejects_stale_wrapper_identity(index) -> None:
     setattr(owner, name, inspect.unwrap(getattr(owner, name)))
     with pytest.raises(api.PatchCompatibilityError, match="stale"):
         api.apply_to_module(target)
+
+
+def test_offline_outer_wrappers_preserve_step5_idempotence_and_stale_checks():
+    from vllm_hcu.patch.worker.framework_opt import patch_step5_eplb_state as step5
+    from vllm_hcu.runtime_compat.step5_patch_contract import remember_targets
+
+    api, target = _isolated_offline_target()
+    target.EplbState._propagate_shared_tensors = lambda *a: None
+    target._move_to_workspace = lambda *a: None
+    target.create_eplb_communicator = lambda *a: None
+    original_step = target.EplbState.step
+    remember_targets(target, step5._MARKER, step5.TARGETS)
+    assert api.apply_to_module(target)
+    assert inspect.unwrap(target.EplbState.step) is original_step
+    assert step5.apply_to_module(target) is False
+    assert api.apply_to_module(target) is False
+    target.EplbState.step = original_step
+    with pytest.raises(RuntimeError, match="[Ss]tale"):
+        step5.apply_to_module(target)
+    with pytest.raises(RuntimeError, match="stale"):
+        api.apply_to_module(target)
+
+
+def test_step5_rejects_installation_over_existing_offline_policy():
+    from vllm_hcu.patch.worker.framework_opt import patch_step5_eplb_state as step5
+    api, target = _isolated_offline_target()
+    api.apply_to_module(target)
+    wrappers = tuple(getattr(owner, name) for owner, name in _offline_hooks(target))
+    with pytest.raises(RuntimeError, match="before offline EPLB policy"):
+        step5.apply_to_module(target)
+    assert wrappers == tuple(getattr(owner, name) for owner, name in _offline_hooks(target))

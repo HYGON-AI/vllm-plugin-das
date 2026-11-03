@@ -78,6 +78,9 @@ def test_signature_drift_and_stale_marker_fail_closed():
     class Config:
         hf_config_override = staticmethod(lambda incompatible: None)
 
+        def __post_init__(self):
+            pass
+
     m.SpeculativeConfig = Config
     m.MTPModelTypes = Literal["step3p5_mtp"]
     with pytest.raises(RuntimeError, match="signature"):
@@ -102,6 +105,9 @@ def test_step5_mtp_config_keeps_quantization_and_delegates_other_models():
             calls.append(hf_config)
             return hf_config
 
+        def __post_init__(self):
+            pass
+
     class HF(SimpleNamespace):
         def update(self, values):
             self.__dict__.update(values)
@@ -124,9 +130,43 @@ def test_step5_mtp_config_keeps_quantization_and_delegates_other_models():
     assert Config.hf_config_override(other) is other and calls == [other]
 
 
-def test_block_mirror_matches_expansion_overwrite_row_order_and_padding():
+def test_deepseek_v4_dspark_keeps_explicit_draft_quantization():
+    from vllm_hcu.patch.platform.core_fix import patch_step5_speculative_config as a
+
+    m = ModuleType(a.TARGET_MODULE)
+
+    class Config:
+        hf_config_override = staticmethod(lambda hf_config: hf_config)
+
+        def __post_init__(self):
+            # Mirror the audited native DeepSeek-V4 DSpark normalization.
+            self.draft_model_config.quantization = (
+                self.target_model_config.quantization
+            )
+
+    m.SpeculativeConfig = Config
+    m.MTPModelTypes = Literal["step3p5_mtp"]
+    a.apply_to_module(m)
+    config = Config()
+    config.method = "dspark"
+    config.quantization = "slimquant_w4a8"
+    config.target_model_config = SimpleNamespace(quantization="compressed-tensors")
+    config.draft_model_config = SimpleNamespace(
+        quantization="slimquant_w4a8",
+        architectures=["DSparkDraftModel"],
+        hf_config=SimpleNamespace(model_type="deepseek_v4"),
+    )
+
+    config.__post_init__()
+
+    assert config.draft_model_config.quantization == "slimquant_w4a8"
+
+
+@pytest.mark.parametrize("compact", [False, True])
+def test_block_mirror_matches_expansion_overwrite_row_order_and_padding(monkeypatch, compact):
     from vllm_hcu.patch.worker.framework_opt import patch_step5_block_tables as a
 
+    monkeypatch.setenv("HCU_STEP5_COMPACT_HOST_BLOCK_TABLES", str(int(compact)))
     m = ModuleType(a.TARGET_MODULE)
 
     class Tables:
@@ -153,8 +193,24 @@ def test_block_mirror_matches_expansion_overwrite_row_order_and_padding():
     assert gathered[0, :6].tolist() == [6, 7, 10, 11, 14, 15]
     assert gathered[1, :2].tolist() == [4, 5]
     assert not gathered[2].any()
+    assert gathered.shape == (3, 6 if compact else 16)
     t.append_block_ids(1, ([9],), True)
-    assert t.gather_block_tables_np(np.array([1]), 1)[0][0, :2].tolist() == [18, 19]
+    replaced = t.gather_block_tables_np(np.array([1]), 1)[0]
+    assert replaced[0, :2].tolist() == [18, 19]
+    assert replaced.shape == (1, 2 if compact else 16)
+    assert gathered[0, :6].tolist() == [6, 7, 10, 11, 14, 15]
+    # Grow to the full configured capacity, then reorder and repeat rows.
+    t.append_block_ids(1, ([10, 11, 12, 13, 14, 15, 16],), False)
+    full = t.gather_block_tables_np(np.array([0, 1, 1]), 3)[0]
+    assert full.shape == (3, 16)
+    assert full[1].tolist() == list(range(18, 34))
+    assert np.array_equal(full[1], full[2])
+    # Empty batches still provide an inert column for padded metadata.
+    empty = t.gather_block_tables_np(np.array([], dtype=np.int64), 2)[0]
+    assert empty.shape == (2, 1 if compact else 16)
+    assert not empty.any()
+    assert not t.gather_block_tables_np(np.array([2]), 1)[0].any()
+    assert not np.shares_memory(full, t._vllm_hcu_block_tables_np[0])
 
 
 def test_metadata_extension_is_owned_without_changing_upstream_dataclass():
@@ -202,7 +258,9 @@ def test_disabled_host_seq_lens_does_not_allocate_mirror(monkeypatch):
 
 
 def test_disabled_swa_decode_uses_baseline_branch(monkeypatch):
-    from vllm_hcu.v1.attention.backends import flash_attn
+    from tests.fixtures.flash_attention import load_hcu_flash_attention_module
+
+    flash_attn = load_hcu_flash_attention_module(monkeypatch)
 
     monkeypatch.setattr(flash_attn, "_SWA_DECODE_ENABLED", False)
     impl = SimpleNamespace(

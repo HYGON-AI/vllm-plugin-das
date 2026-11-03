@@ -142,6 +142,11 @@ def apply_to_module(module: ModuleType) -> bool:
 
     @functools.wraps(original_shutdown)
     def hcu_shutdown(self):
+        megamoe_runtime = sys.modules.get(
+            "vllm_hcu.model_executor.layers.fused_moe.megamoe_runtime"
+        )
+        if megamoe_runtime is not None:
+            megamoe_runtime.release_buffers()
         cumem_loaded = _CUMEM_MODULE in sys.modules
         try:
             return original_shutdown(self)

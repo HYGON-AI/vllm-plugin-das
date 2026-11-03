@@ -209,6 +209,7 @@ _CORE_CALLBACKS: tuple[_CallbackSpec, ...] = (
     _CallbackSpec(_adapter("core_fix", "patch_deepseek_v4_bf16_compressor")),
     _CallbackSpec(_adapter("core_fix", "patch_deepseek_v4_c128_splits")),
     _CallbackSpec(_adapter("core_fix", "patch_deepseek_v4_load_weights")),
+    _CallbackSpec(_adapter("core_fix", "patch_deepseek_v4_megamoe")),
     _CallbackSpec(_adapter("core_fix", "patch_deepseek_v4_eplb")),
     _CallbackSpec(_adapter("core_fix", "patch_deepseek_v4_mtp_eplb")),
     _CallbackSpec(_adapter("core_fix", "patch_deepseek_v4_dspark_target")),
@@ -223,6 +224,7 @@ _CORE_CALLBACKS: tuple[_CallbackSpec, ...] = (
     _CallbackSpec(_adapter("core_fix", "patch_deepseek_v4_inverse_rope")),
     _CallbackSpec(_adapter("core_fix", "patch_deepseek_v4_pcp")),
     _CallbackSpec(_adapter("core_fix", "patch_gpt_oss_mlp_block")),
+    _CallbackSpec(_adapter("core_fix", "patch_kimi_k25_vision_conv")),
     _CallbackSpec(_adapter("core_fix", "patch_glm5next_channel_fp8")),
     _CallbackSpec(_adapter("core_fix", "patch_qwen3_5_mamba_state_dtype")),
     _CallbackSpec(_adapter("core_fix", "patch_qwen3_5_mtp_shared_gate")),
@@ -272,6 +274,12 @@ _OP_CALLBACKS: tuple[_CallbackSpec, ...] = (
     _CallbackSpec(_adapter("op_opt", "patch_kimi_k3_eplb_model")),
     _CallbackSpec(_adapter("op_opt", "patch_kimi_k3_reference_paths")),
     _CallbackSpec(_adapter("op_opt", "patch_kimi_k3_mla_gate")),
+    # Must be applied after reference_paths: it wraps the
+    # forward_attn_residual that adapter installs and captures it as the
+    # non-SP chain. Opt-in: armed only with VLLM_HCU_K3_SP_MOE=1.
+    _CallbackSpec(_adapter("op_opt", "patch_kimi_k3_sp_moe")),
+    _CallbackSpec(_adapter("op_opt", "patch_kimi_k3_mixed_kda")),
+    _CallbackSpec(_adapter("op_opt", "patch_kimi_k3_mixed_linear")),
     # All GDN deltas bind Qwen's module-local symbols/class only.  The
     # canonical causal-conv module and the shared GDN base remain vLLM-owned
     # so Kimi, Olmo, MambaMixer, MambaMixer2, and ShortConv are not patched by
@@ -345,22 +353,6 @@ _CUDA_VALIDATION_ID = (
 _FRAMEWORK_CALLBACKS: tuple[_CallbackSpec, ...] = (
     _CallbackSpec(_adapter("framework_opt", "patch_agrs_int8")),
     _CallbackSpec(
-        _adapter("framework_opt", "patch_model_loader_static_eplb"),
-        feature="offline_eplb",
-    ),
-    _CallbackSpec(
-        _adapter("framework_opt", "patch_static_expert_mapping"),
-        feature="offline_eplb",
-    ),
-    _CallbackSpec(
-        _adapter("framework_opt", "patch_offline_eplb"),
-        feature="eplb_control",
-    ),
-    _CallbackSpec(
-        _adapter("framework_opt", "patch_eplb_communicator"),
-        feature="offline_eplb",
-    ),
-    _CallbackSpec(
         _adapter("framework_opt", "patch_gpu_worker_shutdown"),
     ),
     _CallbackSpec(
@@ -408,6 +400,9 @@ _FRAMEWORK_CALLBACKS: tuple[_CallbackSpec, ...] = (
     _CallbackSpec(
         _adapter("framework_opt", "patch_draft_speculator_inputs"),
     ),
+    _CallbackSpec(
+        _adapter("framework_opt", "patch_mtp_prefill_tail"),
+    ),
     _CallbackSpec(_adapter("framework_opt", "patch_gpu_ubatch_wrapper")),
     _CallbackSpec(_adapter("framework_opt", "patch_ubatch_utils")),
     _CallbackSpec(_adapter("framework_opt", "patch_all2all"), feature="deepep"),
@@ -428,6 +423,23 @@ _FRAMEWORK_CALLBACKS: tuple[_CallbackSpec, ...] = (
     _CallbackSpec(_adapter("framework_opt", "patch_step5_eplb_async_worker")),
     _CallbackSpec(_adapter("framework_opt", "patch_step5_eplb_state")),
     _CallbackSpec(_adapter("framework_opt", "patch_step5_deep_gemm_api")),
+    # Baseline Step5 replacements must be inside offline lifecycle guards.
+    _CallbackSpec(
+        _adapter("framework_opt", "patch_model_loader_static_eplb"),
+        feature="offline_eplb",
+    ),
+    _CallbackSpec(
+        _adapter("framework_opt", "patch_static_expert_mapping"),
+        feature="offline_eplb",
+    ),
+    _CallbackSpec(
+        _adapter("framework_opt", "patch_offline_eplb"),
+        feature="eplb_control",
+    ),
+    _CallbackSpec(
+        _adapter("framework_opt", "patch_eplb_communicator"),
+        feature="offline_eplb",
+    ),
 )
 
 

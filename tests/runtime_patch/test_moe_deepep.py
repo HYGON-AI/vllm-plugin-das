@@ -5410,6 +5410,19 @@ def test_slimquant_w4a8_auto_factory_rejects_auxiliary_quant_metadata(
 @pytest.mark.parametrize("use_fp8", [True, False])
 def test_deepep_ht_preserves_channel_quant_dispatch_contract(use_fp8: bool):
     class DeepEPHTPrepareAndFinalize:
+        def _sync_dbo_comm_if_needed(self):
+            pass
+
+        def _get_dispatch_config(self):
+            return "config"
+
+        def _get_combine_config(self):
+            return "combine-config"
+
+        def _finalize(self, output, fused_expert_output, topk_weights, topk_ids,
+                      apply_router_weight_on_input, weight_and_reduce_impl, do_async):
+            return "legacy-finalizer"
+
         def _do_dispatch(
             self,
             tokens,
@@ -5464,7 +5477,8 @@ def test_deepep_ht_preserves_channel_quant_dispatch_contract(use_fp8: bool):
     class ExpertTokensMetadata:
         @staticmethod
         def make_from_list(values, device=None):
-            return values, device
+            return SimpleNamespace(expert_num_tokens_cpu=torch.tensor(values),
+                                   expert_num_tokens=torch.tensor(values))
 
     dispatched = {}
 
@@ -5572,7 +5586,7 @@ def test_deepep_ht_preserves_channel_quant_dispatch_contract(use_fp8: bool):
     else:
         assert expert_x is captured["tokens"]
         assert expert_scale is captured["token_scales"]
-    assert metadata[0] == [1]
+    assert metadata.expert_num_tokens_cpu.tolist() == [1]
 
 
 def test_router_factory_feature_gated_hcu_subclass_contract(
@@ -6389,6 +6403,10 @@ def test_moe_runner_and_shared_experts_cold_replacement_contract():
 
         coordinator = ExactImportCoordinator(registry=PatchRegistry())
         coordinator.install()
+        # The runner imports join_dp_moe_pipe from the HCU modular kernel.
+        # Arm the same prerequisite as the production platform registration.
+        from vllm_hcu.patch.module_exchange import register_modular_kernel_exchange
+        register_modular_kernel_exchange(coordinator)
         coordinator.register_replacement(
             patch_shared_experts.PATCH_ID,
             patch_shared_experts.TARGET_MODULE,
@@ -7054,3 +7072,26 @@ def test_channel_fp8_auto_experts_share_identical_marlin_layouts(
     reloaded.process_weights_after_loading(raw_layer(layer))
     assert reloaded.ll_experts._deepgemm_w13 is layer.w13_weight
     assert torch.equal(layer.w13_weight, pack(w13))
+
+
+def test_deepep_ll_cleanup_runs_once_per_forward(monkeypatch: pytest.MonkeyPatch):
+    import vllm.forward_context as fc
+
+    from vllm_hcu.model_executor.layers.fused_moe import deepep_runtime
+
+    buffer_a, buffer_b = object(), object()
+    contexts = [SimpleNamespace(), SimpleNamespace()]
+    current = {"ctx": contexts[0]}
+    monkeypatch.setattr(fc, "is_forward_context_available", lambda: True)
+    monkeypatch.setattr(fc, "get_forward_context", lambda: current["ctx"])
+
+    claim = deepep_runtime._claim_ll_buffer_cleanup
+    assert claim(buffer_a) is True
+    assert claim(buffer_a) is False
+    assert claim(buffer_b) is True
+    current["ctx"] = contexts[1]
+    assert claim(buffer_a) is True
+
+    monkeypatch.setattr(fc, "is_forward_context_available", lambda: False)
+    assert claim(buffer_a) is True
+    assert claim(buffer_a) is True

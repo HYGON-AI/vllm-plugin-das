@@ -81,6 +81,7 @@ if TYPE_CHECKING:
     VLLM_HCU_KV_ZERO_BY_GROUP: bool = True
     VLLM_HCU_DEEPSEEK_V4_PCP_LOCAL_SLICES: bool = True
     VLLM_HCU_COMPRESSOR_GEMM_BACKEND: str = "blaslt"
+    VLLM_HCU_BF16_FP32_MMAC: bool = True
     VLLM_HCU_C128_HEAD_SPLITS: int = 4
     VLLM_HCU_INVERSE_ROPE_SUFFIX: bool = True
     VLLM_HCU_SHARED_EXPERTS_EARLY_LAUNCH: bool = False
@@ -159,6 +160,32 @@ def dp_int8_allgather_enabled() -> bool:
             os.environ.get("VLLM_HCU_DP_INT8_ALLGATHER", "False")
         )
     )
+
+
+def k3_sp_moe_requested() -> bool:
+    """Raw Kimi-K3 SP-MoE opt-in parse (child switch only).
+
+    Keep this the ONLY parser of ``VLLM_HCU_K3_SP_MOE`` spelling: it feeds
+    :func:`k3_sp_moe_enabled` (master AND child), which the platform
+    persists into the compilation-cache partition and the SP patch's
+    ``_switch_enabled`` delegates to, so neither can disagree on spelling.
+    """
+    return os.environ.get("VLLM_HCU_K3_SP_MOE", "0").strip().lower() in (
+        "1",
+        "true",
+    )
+
+
+def k3_sp_moe_enabled() -> bool:
+    """Effective Kimi-K3 SP-MoE opt-in under the custom-op master.
+
+    The row-sharded forward rewires KimiDecoderLayer at patch-apply time
+    (``o_proj.reduce_results`` plus the ``hcu_k3_sp_*`` collectives), so the
+    resolved master-and-child result must be persisted before VllmConfig
+    computes its compilation-cache hash: opposite-mode AOT graphs cannot
+    share an entry.
+    """
+    return optional_custom_op_enabled(k3_sp_moe_requested())
 
 
 def glm53_router_gemv_enabled() -> bool:
@@ -637,6 +664,11 @@ hcu_vllm_environment_variables: dict[str, Callable[[], Any]] = {
     "VLLM_HCU_COMPRESSOR_GEMM_BACKEND":
         lambda: os.getenv("VLLM_HCU_COMPRESSOR_GEMM_BACKEND", "blaslt"),
 
+    # Small-M (<=64) BF16->FP32 NT GEMM on HCU MMAC for the compressor
+    # projections; 0 keeps hipBLASLt for every shape.
+    "VLLM_HCU_BF16_FP32_MMAC":
+        lambda: _environment_flag(os.getenv("VLLM_HCU_BF16_FP32_MMAC", "1")),
+
     # C128 prefill head tiles on HCU; 0 restores the upstream CU heuristic.
     "VLLM_HCU_C128_HEAD_SPLITS":
         lambda: int(os.getenv("VLLM_HCU_C128_HEAD_SPLITS", "4")),
@@ -702,6 +734,15 @@ hcu_vllm_environment_variables: dict[str, Callable[[], Any]] = {
     # VLLM_HCU_USE_CUSTOM_OPS.
     "VLLM_HCU_QWEN4_EXP_HC_SP":
         qwen4_exp_hc_sp_enabled,
+
+    # Kimi-K3 SP-MoE row-sharded forward (opt-in). The SP patch's
+    # _switch_enabled delegates to this k3_sp_moe_enabled() (master AND
+    # child) and the same effective result is persisted into
+    # HcuFeatureConfig before VllmConfig.compute_hash, so 0->1 restarts
+    # cannot reuse AOT graphs and a master-off rollback skips the SP
+    # install instead of failing at model construction.
+    "VLLM_HCU_K3_SP_MOE":
+        k3_sp_moe_enabled,
 
     # gfx938 GLM5Next sparse-indexer K-cache page layout: "preshuffle"
     # (official 16x16 tiles, HCU Triton decode reader) or "normal"

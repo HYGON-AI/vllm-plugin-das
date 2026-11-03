@@ -18,7 +18,7 @@ from tests.integration.model_runtime import (
 
 
 QWEN35_35B_A3B = "qwen3.5/Qwen3.5-35B-A3B"
-DEEPSEEK_R1_CHANNEL_INT8 = "vllm-w8a8-models/DeepSeek-R1-0528-Channel-INT8"
+DEEPSEEK_R1_CHANNEL_INT8 = "vllm-w8a8-models/DeepSeek-R1-0528-Channel-INT8-w8a8"
 GLM52_CHANNEL_INT8 = "GLM-5.2-Channel-INT8-w8a8"
 GLM52_DEEPEP_MODES = (
     pytest.param("deepep_high_throughput", id="high-throughput"),

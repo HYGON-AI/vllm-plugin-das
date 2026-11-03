@@ -63,6 +63,26 @@ def _junit_counts(path: Path) -> tuple[int, int, int]:
     return tests, skipped, failures
 
 
+def _pid_cgroup_snapshot(
+    roots: tuple[Path, ...] = (
+        Path("/sys/fs/cgroup/pids"), Path("/sys/fs/cgroup")
+    ),
+) -> dict[str, str | None]:
+    """Record the process/thread controller counters without starting helpers."""
+
+    for root in roots:
+        if not (root / "pids.max").is_file():
+            continue
+        snapshot: dict[str, str | None] = {"path": str(root)}
+        for name in ("pids.max", "pids.current", "pids.peak", "pids.events"):
+            try:
+                snapshot[name] = (root / name).read_text(encoding="utf-8").strip()
+            except OSError:
+                snapshot[name] = None
+        return snapshot
+    return {"path": None}
+
+
 def _tested_git_sha() -> str:
     result = subprocess.run(
         ["git", "rev-parse", "HEAD"],
@@ -130,9 +150,13 @@ def main() -> int:
         integration_dir = job_root / "integration"
         evalscope_dir = job_root / "evalscope"
         integration_dir.mkdir(parents=True, exist_ok=True)
-        evalscope_dir.mkdir(parents=True, exist_ok=True)
+        from tests.integration.server.evalscope_server import (
+            create_evalscope_work_dir,
+        )
+
+        evalscope_work_dir = create_evalscope_work_dir(evalscope_dir)
         os.environ["VLLM_HCU_INTEGRATION_LOG_DIR"] = str(integration_dir)
-        os.environ["VLLM_HCU_EVAL_WORK_DIR"] = str(evalscope_dir)
+        os.environ["VLLM_HCU_EVAL_WORK_DIR"] = str(evalscope_work_dir)
 
         request = {
             "job_id": job_id,
@@ -209,6 +233,7 @@ def main() -> int:
         print(f"HCU CI job={job_id}")
         print(f"artifacts={job_root}")
         print(f"command: {command_text}", flush=True)
+        pid_snapshot_before = _pid_cgroup_snapshot()
         with (job_root / "pytest.log").open("wb") as log:
             process = subprocess.Popen(
                 command,
@@ -225,6 +250,12 @@ def main() -> int:
                 sys.stdout.buffer.flush()
             returncode = process.wait()
 
+        pid_snapshots = {"before": pid_snapshot_before, "after": _pid_cgroup_snapshot()}
+        (job_root / "process-resources.json").write_text(
+            json.dumps(pid_snapshots, indent=2, sort_keys=True) + "\n",
+            encoding="utf-8",
+        )
+        print(f"Process/thread resources: {json.dumps(pid_snapshots, sort_keys=True)}", flush=True)
         if not junit_path.is_file():
             raise PreflightError(
                 f"pytest did not produce the required JUnit report: {junit_path}"

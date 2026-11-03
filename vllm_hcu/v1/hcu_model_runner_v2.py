@@ -47,7 +47,9 @@ _USE_HOST_SEQ_LENS = henvs.optional_custom_op_enabled(
     os.environ.get("VLLM_HCU_HOST_SEQ_LENS", "1") == "1"
 )
 # Debug: compare the mirror against the device seq_lens every step.
-_CHECK_HOST_SEQ_LENS = os.environ.get("VLLM_HCU_CHECK_HOST_SEQ_LENS", "0") == "1"
+_CHECK_HOST_SEQ_LENS = henvs.optional_custom_op_enabled(
+    os.environ.get("VLLM_HCU_CHECK_HOST_SEQ_LENS", "0") == "1"
+)
 _SAMPLER_WARMUP = ContextVar("hcu_sampler_warmup", default=False)
 _DEEPEP_AUTO_DUMMY_PHASE: ContextVar[bool | None] = ContextVar(
     "vllm_hcu_deepep_auto_dummy_phase", default=None
@@ -275,6 +277,12 @@ class HcuGPUModelRunnerV2(GPUModelRunner):
             if model is not None
         )
 
+        if is_deepseek_v4(self.vllm_config):
+            from vllm_hcu.model_executor.layers import skinny_lm_head
+
+            for model in (self.model, self.get_draft_model()):
+                skinny_lm_head.enable_for_model(model)
+
     @property
     def pcp_manager_cls(self):
         if self._hcu_pcp_manager_cls is None:
@@ -341,6 +349,10 @@ class HcuGPUModelRunnerV2(GPUModelRunner):
                 "official MRV2 did not initialize the selected HCU PCP manager"
             )
         self._init_host_seq_lens()
+        if is_step5_config(self.vllm_config) and getattr(self, "ubatch_runner", None) is not None:
+            from vllm_hcu.v1.hcu_dbo import install_runner
+
+            install_runner(self)
 
     # ------------------------------------------------------------------
     # Host mirror of num_computed_tokens.
@@ -390,6 +402,8 @@ class HcuGPUModelRunnerV2(GPUModelRunner):
             if input_batch is self._hsl_batch and input_batch.seq_lens_cpu is None:
                 self._hsl_resolve()
                 self._hsl_attach(input_batch)
+                from vllm_hcu.v1.step5_hot_context import check_hot_graph_context
+                check_hot_graph_context(input_batch, args[0] if args else None, getattr(self, "_step5_hot_context_real_batch", False))
             return original_prepare_attn(input_batch, *args, **kwargs)
 
         model_state.prepare_attn = prepare_attn
@@ -510,7 +524,9 @@ class HcuGPUModelRunnerV2(GPUModelRunner):
                 and get_hcu_config(self.vllm_config).deepep_auto
             ):
                 set_deepep_auto_request_phase(dummy_phase)
-            if is_step5_config(getattr(self, "vllm_config", None)):
+            if henvs.custom_ops_enabled() and is_step5_config(
+                getattr(self, "vllm_config", None)
+            ):
                 from vllm_hcu.v1.step5_execution import execute_model
 
                 return execute_model(self, *args, **kwargs)

@@ -6,7 +6,7 @@ Current TP+EP coverage:
 
 - `qwen3.5/Qwen3.5-35B-A3B` with TP4/EP4 and TP2/EP2 across the unquantized
   MoE backend paths.
-- `vllm-w8a8-models/DeepSeek-R1-0528-Channel-INT8` with TP8 + expert
+- `vllm-w8a8-models/DeepSeek-R1-0528-Channel-INT8-w8a8` with TP8 + expert
   parallelism across the INT8 MoE backend paths.
 
 The Qwen3.5-35B-A3B matrix intentionally fails on backend/runtime errors so a

@@ -4,7 +4,6 @@
 # Modified by Hygon Information Technology Co., Ltd., 2026.
 import functools
 import importlib
-import importlib.metadata as importlib_metadata
 import inspect
 from collections.abc import Callable
 from typing import Any
@@ -16,44 +15,12 @@ from flash_attn import (
     hg_flash_attn_varlen_func as _hg_flash_attn_varlen_func,
     varlen_fwd_unified as _varlen_fwd_unified,
 )
-from packaging.specifiers import SpecifierSet
-from packaging.version import InvalidVersion, Version
 from torch import Tensor
 from vllm_hcu.platforms import envs as hcu_envs
 from vllm_hcu.v1.attention.kv_cache_layout import get_kv_cache_layout
-
-
-
-# This range describes the Python/native API line exercised by the plugin. It
-# does not attest that a particular vendor artifact contains the native
-# long-prefill gather workspace fix; deployment images must validate that
-# binary capability separately.
-_FLASH_ATTN_COMPATIBLE_VERSIONS = SpecifierSet(
-    ">=2.8.4,<2.9", prereleases=False
+from vllm_hcu.v1.attention._flash_attn_compat import (
+    require_compatible_flash_attn as _require_compatible_flash_attn,
 )
-
-
-def _require_compatible_flash_attn() -> None:
-    try:
-        actual = importlib_metadata.version("flash_attn")
-    except importlib_metadata.PackageNotFoundError:
-        actual = None
-
-    try:
-        parsed = None if actual is None else Version(actual)
-    except InvalidVersion as exc:
-        raise RuntimeError(
-            f"Invalid flash_attn distribution version: {actual!r}"
-        ) from exc
-
-    if parsed is None or parsed not in _FLASH_ATTN_COMPATIBLE_VERSIONS:
-        raise RuntimeError(
-            "HCU requires a compatible flash_attn release "
-            f"({_FLASH_ATTN_COMPATIBLE_VERSIONS}); found {actual!r}. "
-            "The deployed vendor wheel must separately be validated for "
-            "native long-prefill gather."
-        )
-
 
 _require_compatible_flash_attn()
 

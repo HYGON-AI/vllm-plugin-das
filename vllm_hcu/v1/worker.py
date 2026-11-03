@@ -52,11 +52,13 @@ def _create_model_runner(
         # breakable graph execution as v0.25.1. The retained HCU MRV1 copy has
         # stale imports on v0.28; use upstream's maintained MRV1 with the HCU
         # worker/model/operator callbacks already installed above.
+        model_config = getattr(vllm_config, "model_config", None)
+        parallel_config = getattr(vllm_config, "parallel_config", None)
         if (
-            getattr(vllm_config.model_config.hf_config, "model_type", None)
+            getattr(getattr(model_config, "hf_config", None), "model_type", None)
             == "kimi_k3"
-            and vllm_config.parallel_config.data_parallel_size == 1
-            and vllm_config.parallel_config.prefill_context_parallel_size == 1
+            and getattr(parallel_config, "data_parallel_size", None) == 1
+            and getattr(parallel_config, "prefill_context_parallel_size", None) == 1
         ):
             from vllm.v1.worker.gpu_model_runner import GPUModelRunner
 
@@ -114,6 +116,11 @@ class HcuGPUWorker(Worker):
             distributed_init_method=distributed_init_method,
             is_driver_worker=is_driver_worker,
         )
+        # After the parent picked the model runner: with DBO on, vLLM would
+        # fall back to Model Runner V1 (DBO + spec decoding unsupported).
+        from vllm_hcu.v1.hcu_dbo import enable_in_worker
+
+        enable_in_worker(vllm_config)
 
     def load_model(self, *, load_dummy_weights: bool = False) -> None:
         """Load the model, then require every enabled patch chain to be live."""
@@ -121,6 +128,15 @@ class HcuGPUWorker(Worker):
         super().load_model(load_dummy_weights=load_dummy_weights)
         from vllm_hcu.patch.worker import validate_worker_patches
         model_runner = getattr(self, "model_runner", None)
+        from vllm_hcu.model_executor.layers.kimi_k3_mixed_precision import record_kimi_kda_offload_ownership
+        record_kimi_kda_offload_ownership(getattr(model_runner, "model", None))
+        get_draft_model = getattr(model_runner, "get_draft_model", None)
+        if callable(get_draft_model):
+            record_kimi_kda_offload_ownership(get_draft_model())
+        if os.environ.get("VLLM_KIMI_KDA_PREFILL_BACKEND", "legacy").lower() == "boltops":
+            from vllm_hcu.model_executor.layers.kimi_k3_kda import validate_loaded_kda_model
+
+            validate_loaded_kda_model(getattr(model_runner, "model", None))
         num_compressor_weights = getattr(
             model_runner, "_vllm_hcu_num_compressor_weights", 0
         )
@@ -150,6 +166,8 @@ class HcuGPUWorker(Worker):
 
         refresh_glm53_router_gates(self.model_runner.model)
         refresh_compressor_nt_weights(self.model_runner.model)
+        from vllm_hcu.model_executor.layers.kimi_k3_mixed_precision import refresh_kimi_kda_fused_qkv
+        refresh_kimi_kda_fused_qkv(self.model_runner.model)
 
     def finish_weight_update(self) -> None:
         super().finish_weight_update()
@@ -163,6 +181,8 @@ class HcuGPUWorker(Worker):
         )
 
         refresh_compressor_nt_weights(model)
+        from vllm_hcu.model_executor.layers.kimi_k3_mixed_precision import refresh_kimi_kda_fused_qkv
+        refresh_kimi_kda_fused_qkv(model)
         if not self._weight_update_is_draft:
             from vllm_hcu.model_executor.layers.fused_moe.glm53_router_gemv import (
                 refresh_glm53_router_gates,

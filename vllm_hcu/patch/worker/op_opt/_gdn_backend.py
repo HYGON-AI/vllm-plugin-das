@@ -130,11 +130,14 @@ def make_provider_selector(
     stage: Stage,
     op: str,
     resolvers: Mapping[str, Resolver],
+    unavailable_reasons: Mapping[str, str] | None = None,
 ) -> Callable[[], tuple[str, Callable | None]]:
     """Return a selector yielding ``(provider, kernel)`` for ``op``.
 
     ``resolvers`` maps ``hcu-boltops``/``hcu-aiter`` to lazy kernel
     resolvers; a provider without an entry has no kernel for ``op``.
+    ``unavailable_reasons`` may describe a known incompatibility more
+    precisely than that default.
     ``triton`` carries no kernel: the caller runs the original vLLM
     function.  The choice is cached per requested backend.
     """
@@ -152,7 +155,9 @@ def make_provider_selector(
                 break
             resolve = resolvers.get(candidate)
             if resolve is None:
-                reason = "it has no kernel for this operator"
+                reason = (
+                    unavailable_reasons or {}
+                ).get(candidate, "it has no kernel for this operator")
             else:
                 kernel = resolve()
                 reason = "the package or kernel is not installed"

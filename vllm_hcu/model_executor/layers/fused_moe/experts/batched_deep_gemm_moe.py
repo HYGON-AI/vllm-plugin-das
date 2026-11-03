@@ -390,21 +390,52 @@ class BatchedDeepGemmExperts(mk.FusedMoEExpertsModular):
         return (workspace13, workspace2, output)
 
     def estimate_expected_m(
-        self, global_num_experts: int, max_tokens_per_expert: int, topk: int
+        self,
+        global_num_experts: int,
+        max_tokens_per_expert: int,
+        topk: int,
+    ) -> int:
+        """Upstream v0.25.1 signature, byte-for-byte (module-exchange contract).
+
+        The DeepEP-LL hint plumbing lives in ``_hcu_estimate_expected_m``,
+        which ``apply`` routes through; the public method stays the exact
+        upstream surface.
+        """
+        # The context-local token count rides the instance hint slot (see
+        # _hcu_estimate_expected_m): upstream surfaces must not widen.
+        local_num_tokens = getattr(self, "_hcu_expected_m_local_tokens", None)
+        return self._hcu_estimate_expected_m(
+            global_num_experts,
+            max_tokens_per_expert,
+            topk,
+            local_num_tokens,
+        )
+
+    def _hcu_estimate_expected_m(
+        self,
+        global_num_experts: int,
+        max_tokens_per_expert: int,
+        topk: int,
+        local_num_tokens: int | None,
     ) -> int:
         dp_meta = (
             get_forward_context().dp_metadata
             if is_forward_context_available()
             else None
         )
-        if dp_meta is None:
+        if dp_meta is not None:
+            total_num_tokens = dp_meta.num_tokens_across_dp_cpu.sum().item()
+        elif local_num_tokens is not None and self.num_dispatchers is not None:
+            # DeepEP-LL skips dp_metadata by design. Every dispatcher pads to
+            # the same graph batch size, so local * num_dispatchers is a pure
+            # Python int and safe to bake into a cudagraph.
+            total_num_tokens = int(local_num_tokens) * int(self.num_dispatchers)
+        else:
             logger.warning_once(
                 "DPMetadata unavailable. Defaulting expected_m to "
                 f"{max_tokens_per_expert}.",
             )
             return max_tokens_per_expert
-
-        total_num_tokens = dp_meta.num_tokens_across_dp_cpu.sum().item()
         total_num_tokens_replicated = total_num_tokens * topk
 
         # Assume even load balancing
@@ -462,11 +493,16 @@ class BatchedDeepGemmExperts(mk.FusedMoEExpertsModular):
 
         workspace1 = _resize_cache(workspace13, (E, max_num_tokens, N))
 
+        # Private hint channel instead of widening the upstream signature:
+        # the module-exchange contract pins every public method's args AST
+        # to the v0.25.1 surface (test_module_exchange signature gate).
+        self._hcu_expected_m_local_tokens = topk_ids.size(0)
         expected_m = self.estimate_expected_m(
             global_num_experts=global_num_experts,
             max_tokens_per_expert=max_num_tokens,
             topk=topk_ids.size(-1),
         )
+        self._hcu_expected_m_local_tokens = None
 
         if use_w4a8:
             is_situ = (

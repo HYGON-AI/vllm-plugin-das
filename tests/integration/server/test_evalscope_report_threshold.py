@@ -176,6 +176,38 @@ def test_evaluation_environment_preserves_proxy_and_removes_host_secrets(
     assert "127.0.0.1" in environment["NO_PROXY"]
 
 
+
+@pytest.mark.skipif(sys.platform != "linux", reason="requires POSIX signals")
+def test_evaluator_native_crash_writes_stack_to_log(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setenv("PYTHONFAULTHANDLER", "0")
+    monkeypatch.setenv("PYTHONUNBUFFERED", "0")
+    log_path = tmp_path / "evalscope.log"
+    with log_path.open("w") as log:
+        result = subprocess.run(
+            [
+                sys.executable,
+                "-c",
+                "import os, resource, signal; "
+                "resource.setrlimit(resource.RLIMIT_CORE, (0, 0)); "
+                "print('dataset loading started'); "
+                "os.kill(os.getpid(), signal.SIGSEGV)",
+            ],
+            env=_evaluation_environment({}),
+            stdout=log,
+            stderr=subprocess.STDOUT,
+            check=False,
+        )
+
+    assert result.returncode == -signal.SIGSEGV
+    output = log_path.read_text()
+    assert "dataset loading started" in output
+    assert "Fatal Python error: Segmentation fault" in output
+    assert 'File "<string>", line 1' in output
+
+
 def test_evalscope_command_keeps_api_key_out_of_argv(tmp_path: Path) -> None:
     secret = "must-not-appear-in-process-list"
     config = {
@@ -587,6 +619,30 @@ def test_reset_evalscope_artifacts_removes_stale_outputs_only(
     assert log.read_text(encoding="utf-8") == "keep"
 
 
+def test_ci_evalscope_directory_is_owned_and_isolated(tmp_path: Path) -> None:
+    parent = tmp_path / "hcu-ci-artifacts/evalscope"
+    unrelated = parent / "reports/keep.json"
+    unrelated.parent.mkdir(parents=True)
+    unrelated.write_text("keep", encoding="utf-8")
+
+    first = evalscope_server.create_evalscope_work_dir(parent)
+    second = evalscope_server.create_evalscope_work_dir(parent)
+    assert first != second
+    assert first.parent == second.parent == parent
+    stale = first / "reports/stale.json"
+    stale.parent.mkdir()
+    stale.write_text("stale", encoding="utf-8")
+
+    evalscope_server._reset_evalscope_artifacts(first)
+    evalscope_server._reset_evalscope_artifacts(second)
+
+    assert not stale.exists()
+    assert unrelated.read_text(encoding="utf-8") == "keep"
+    assert (first / evalscope_server.EVALSCOPE_OWNER_MARKER).read_text(
+        encoding="utf-8"
+    ) == evalscope_server.EVALSCOPE_OWNER_SIGNATURE
+
+
 def test_reset_evalscope_artifacts_rejects_unowned_broad_path(
     tmp_path: Path,
 ) -> None:
@@ -887,6 +943,131 @@ def test_pass_at_one_requires_report_metric(tmp_path: Path) -> None:
             work_dir=tmp_path,
             eval_log_path=tmp_path / "logs/evalscope.log",
         )
+
+
+
+@pytest.mark.parametrize(
+    ("predictions", "reviews", "reported_samples", "score", "passes"),
+    [
+        (100, 100, 100, 1.0, True),
+        (100, 100, 100, 0.95, True),
+        (100, 100, 100, 0.96, True),
+        (100, 100, 100, 0.94, False),
+        (99, 100, 100, 1.0, False),
+        (100, 99, 100, 1.0, False),
+        (100, 100, 99, 1.0, False),
+    ],
+)
+@pytest.mark.parametrize(
+    "config_name",
+    [
+        "qwen3_8b_gsm8k_evalscope.yaml",
+        "qwen35_9b_gsm8k_evalscope.yaml",
+        "deepseek_r1_gsm8k_evalscope.yaml",
+    ],
+)
+def test_gsm8k_configs_require_100_samples_and_95_percent(
+    tmp_path, monkeypatch, config_name, predictions, reviews, reported_samples, score, passes,
+):
+    root = Path(__file__).resolve().parents[3]
+    monkeypatch.delenv("VLLM_HCU_TEST_UNUSED_GSM8K_CONFIG", raising=False)
+    config = evalscope_server.load_config(
+        root / "tests/models" / config_name,
+        "VLLM_HCU_TEST_UNUSED_GSM8K_CONFIG",
+    )
+    assert config["evalscope"]["limit"] == 100
+    dataset_args = config["evalscope"]["dataset_args"]["gsm8k"]
+    assert dataset_args["few_shot_random"] is False
+    assert dataset_args["shuffle"] is False
+    model_env = "VLLM_HCU_TEST_UNUSED_GSM8K_MODEL"
+    monkeypatch.delenv(model_env, raising=False)
+    model = Path(config["model"]).name
+    report_path = tmp_path / "reports" / model / "gsm8k.json"
+    report_path.parent.mkdir(parents=True)
+    report_path.write_text(json.dumps({
+        "dataset_name": "gsm8k", "model_name": model,
+        "metrics": [{"name": "mean_acc", "score": score, "num": reported_samples}],
+    }))
+    for artifact, count in (("predictions", predictions), ("reviews", reviews)):
+        path = tmp_path / artifact / model / "gsm8k_main.jsonl"
+        path.parent.mkdir(parents=True)
+        path.write_text("".join(json.dumps({"sample_id": i}) + "\n" for i in range(count)))
+
+    def check():
+        _assert_pass_criteria(
+            config, model_env=model_env, work_dir=tmp_path,
+            eval_log_path=tmp_path / "logs/evalscope.log",
+        )
+
+    if passes:
+        check()
+    else:
+        with pytest.raises(AssertionError):
+            check()
+
+
+
+@pytest.mark.parametrize("resources_ready", [False, True])
+def test_server_waits_for_configured_memory_before_launch(
+    tmp_path, monkeypatch, resources_ready,
+):
+    from tests.integration.gpu_memory import GpuMemoryUnavailableError
+
+    work_dir = evalscope_server.create_evalscope_work_dir(tmp_path / "reports")
+    # CI supplies a shared report override; keep this mocked server test local.
+    monkeypatch.setenv("VLLM_HCU_EVAL_WORK_DIR", str(work_dir))
+    config = {
+        "model": "/models/example",
+        "server": {
+            "args": ["--gpu-memory-utilization", "0.4"],
+            "startup_timeout_s": 10,
+            "environment": {"CUDA_VISIBLE_DEVICES": "3"},
+        },
+        "evalscope": {"datasets": [], "work_dir": str(work_dir)},
+    }
+    events = []
+    monkeypatch.setattr(evalscope_server, "_require_runtime", lambda *a, **k: None)
+
+    def wait(**kwargs):
+        assert kwargs["required_cards"] == 1
+        assert kwargs["gpu_memory_utilization"] == 0.4
+        assert kwargs["env"]["CUDA_VISIBLE_DEVICES"] == "3"
+        events.append("wait")
+        kwargs["report"]("GPU memory resource check")
+        if not resources_ready:
+            raise GpuMemoryUnavailableError("GPU still busy")
+
+    def launch(*args, **kwargs):
+        events.append("launch")
+        return SimpleNamespace()
+
+    def healthy(proc, url, timeout):
+        events.append("health")
+        assert timeout == 10
+
+    monkeypatch.setattr(evalscope_server, "wait_for_gpu_memory", wait)
+    monkeypatch.setattr(evalscope_server.subprocess, "Popen", launch)
+    monkeypatch.setattr(evalscope_server, "_wait_for_server", healthy)
+    monkeypatch.setattr(evalscope_server, "_run_prefix_probe", lambda *a, **k: None)
+    monkeypatch.setattr(evalscope_server, "evalscope_command", lambda *a, **k: ["evaluate"])
+    monkeypatch.setattr(evalscope_server.subprocess, "run", lambda *a, **k: SimpleNamespace(returncode=0))
+    monkeypatch.setattr(evalscope_server, "_assert_pass_criteria", lambda *a, **k: None)
+    monkeypatch.setattr(evalscope_server, "_terminate_process_group", lambda *a, **k: None)
+
+    def execute():
+        evalscope_server.run_evalscope_server_test(
+            config, model_env="VLLM_HCU_TEST_UNUSED_MEMORY_MODEL",
+            model_label="example", required_hcu_count=1,
+        )
+
+    if resources_ready:
+        execute()
+        assert events == ["wait", "launch", "health"]
+    else:
+        with pytest.raises(GpuMemoryUnavailableError, match="still busy"):
+            execute()
+        assert events == ["wait"]
+    assert "GPU memory resource check" in (work_dir / "logs/vllm_server.log").read_text()
 
 
 def _exact_humaneval_config() -> dict:
@@ -1294,3 +1475,42 @@ def test_evalscope_sandbox_does_not_reexecute_completion_on_host(
         work_dir=tmp_path,
         eval_log_path=tmp_path / "logs/evalscope.log",
     )
+
+
+def test_local_dataset_staging_preserves_read_only_mirror(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    monkeypatch.setattr(evalscope_server, "EVALSCOPE_OWNED_ROOT", tmp_path / "cache")
+    source = tmp_path / "shared/gsm8k"
+    (source / "main").mkdir(parents=True)
+    for split in ("train", "test"):
+        (source / "main" / f"{split}-00000-of-00001.parquet").write_bytes(b"parquet")
+    metadata = source / "dataset_infos.json"
+    metadata.write_text("keep")
+    monkeypatch.setenv("VLLM_HCU_GSM8K_DATASET", str(source))
+    config = {"evalscope": {"datasets": ["gsm8k"], "dataset_args": {"gsm8k": {"few_shot_num": 4}}}}
+    prepared = evalscope_server.prepare_evalscope_datasets(config, tmp_path / "work")
+    target = Path(prepared["evalscope"]["dataset_args"]["gsm8k"]["dataset_id"])
+    assert target != source
+    assert not target.is_relative_to(tmp_path / "work")
+    assert target.is_relative_to(tmp_path / "cache")
+    assert metadata.read_text() == "keep"
+    assert not (target / "dataset_infos.json").exists()
+    assert (target / "main/test-00000-of-00001.parquet").is_symlink()
+    assert prepared["evalscope"]["dataset_args"]["gsm8k"]["few_shot_num"] == 4
+    assert "dataset_id" not in config["evalscope"]["dataset_args"]["gsm8k"]
+    assert "config_name: main" in (target / "README.md").read_text()
+    assert (target / "README.md").read_text().startswith("---\n")
+
+
+def test_local_dataset_staging_rejects_empty_mirror(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    monkeypatch.setattr(evalscope_server, "EVALSCOPE_OWNED_ROOT", tmp_path / "cache")
+    source = tmp_path / "empty"
+    source.mkdir()
+    monkeypatch.setenv("VLLM_HCU_MMMU_DATASET", str(source))
+    with pytest.raises(FileNotFoundError, match="no parquet"):
+        evalscope_server.prepare_evalscope_datasets(
+            {"evalscope": {"datasets": ["mmmu"]}}, tmp_path / "work"
+        )

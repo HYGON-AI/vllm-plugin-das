@@ -7,6 +7,7 @@ from vllm_hcu.runtime_compat.step5_patch_contract import (
     already_applied,
     remember_targets,
     require_signatures,
+    Step5PatchCompatibilityError,
 )
 from ._common import load_exact_module, require_callable
 
@@ -74,6 +75,10 @@ def apply_to_module(module: ModuleType) -> bool:
     target = load_exact_module(TARGET_MODULE, module)
     if already_applied(target, _MARKER, TARGETS):
         return False
+    if getattr(target, "_vllm_hcu_offline_eplb", None) is not None:
+        raise Step5PatchCompatibilityError(
+            "Install Step5 EPLB runtime before offline EPLB policy; restart the process"
+        )
     require_signatures(target, SIGNATURES, REVIEWED_SOURCES)
     cls = getattr(target, "EplbState", None)
     for name, symbol in zip(
