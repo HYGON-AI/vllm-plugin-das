@@ -40,11 +40,11 @@ def test_native_gather_capacity_and_output(
     monkeypatch.setitem(sys.modules, interface.__name__, interface)
     monkeypatch.setattr(torch.cuda, "is_current_stream_capturing", lambda: capturing)
     # Meta gather buffers check realistic capacity without allocating GiBs on CPU.
-    q = torch.zeros((batch * 5, 16, 512), dtype=torch.bfloat16)
+    q = torch.zeros((batch * 17, 16, 512), dtype=torch.bfloat16)
     k = torch.empty((2, 64, 2, 512), dtype=torch.bfloat16, device="meta")
     v = torch.empty_like(k)
     out = torch.empty_like(q)
-    cu_q = torch.arange(batch + 1, dtype=torch.int32) * 5
+    cu_q = torch.arange(batch + 1, dtype=torch.int32) * 17
     seq = torch.full((batch,), used, dtype=torch.int32)
     if capturing:
         seq = seq.to("meta")  # A host read of dummy lengths would fail.
@@ -55,7 +55,7 @@ def test_native_gather_capacity_and_output(
         v=v,
         out=out,
         cu_seqlens_q=cu_q,
-        max_seqlen_q=5,
+        max_seqlen_q=17,
         seqused_k=seq,
         max_seqlen_k=max_k,
         softmax_scale=1.0,
@@ -74,4 +74,4 @@ def test_native_gather_capacity_and_output(
     assert native_args[3] is out
     assert native_args[5] is gather_args[6]
     assert native_args[6:10] == (None, None, None, None)
-    assert native_args[10:20] == (5, max_k, 0.0, 1.0, False, True, -1, -1, 0.0, False)
+    assert native_args[10:20] == (17, max_k, 0.0, 1.0, False, True, -1, -1, 0.0, False)

@@ -148,7 +148,7 @@ class Gemma4FAAttentionImpl(TritonAttentionImpl):
         # empty lists here rather than reading device data during capture.
         q_len = metadata.max_query_len
         return (
-            (q_len > 16 or q_len == 5)
+            q_len > 16
             and metadata.num_actual_tokens > 0
             and not metadata.use_cascade
             and getattr(metadata, "causal", True) is True

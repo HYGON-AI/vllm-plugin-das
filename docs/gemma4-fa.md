@@ -9,11 +9,14 @@ layout, cache writes, and backend name. It does not globally override
 # Default: normal vLLM backend selection (Triton in the current HCU Gemma4 setup).
 export VLLM_HCU_GEMMA4_USE_FA=0
 
-# Gemma4 full D512: FA for supported Q>16 or Q=5 calls, Triton otherwise.
+# Gemma4 full D512: FA for supported Q>16 calls, Triton otherwise.
 export VLLM_HCU_GEMMA4_USE_FA=1
 ```
 
 Read the switch at plugin model registration; restart the service to change it.
+Q=5 MTP verification calls fall back to Triton when the batch maximum query
+length is 5. The threshold uses the batch maximum, so a mixed batch whose
+maximum exceeds 16 can still include shorter query segments in the FA call.
 `HCU_FLASH_ATTN_Q5` is obsolete and does not affect routing. A conflicting
 explicit backend setting fails at initialization instead of being overridden.
 
@@ -57,8 +60,8 @@ capture batches; moving allocation into the plugin does not reduce its size.
 For BF16 D512 and two KV heads per rank, both buffers together consume
 `capacity * 4096` bytes (about 1.90 GiB at 25 requests and max length 19968).
 Limit capture sizes to the intended workload and available memory. Capture
-sizes count query tokens, not requests: Q5 with 24 requests needs size 120.
-D512 Q1 remains on Triton.
+sizes count query tokens, not requests. D512 Q1 and Q5 remain on Triton when
+they are the maximum query length in their batch.
 
 When migrating a locally modified legacy server, remove its hard-coded FA
 dispatch and source-patch adapter and restore the FA package before enabling

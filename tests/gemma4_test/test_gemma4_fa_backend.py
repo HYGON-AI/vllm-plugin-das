@@ -79,7 +79,7 @@ def inputs(lengths, heads=16, kv_heads=2, padding=0, block=32):
 
 
 @pytest.mark.parametrize("batch", [1, 2, 20, 22, 24])
-@pytest.mark.parametrize("q_len", [5, 17])
+@pytest.mark.parametrize("q_len", [17, 32])
 @pytest.mark.parametrize("block", [32, 64])
 def test_flash_uses_all_requests_and_preserves_output_contract(
     implementation, batch, q_len, block
@@ -103,7 +103,7 @@ def test_flash_uses_all_requests_and_preserves_output_contract(
 def test_unsupported_cache_block_falls_back(implementation):
     module, calls = implementation
     impl = module.Gemma4FAAttentionImpl()
-    q, cache, metadata, output = inputs([5], block=128)
+    q, cache, metadata, output = inputs([17], block=128)
     impl.forward(None, q, q, q, cache, metadata, output)
     assert calls[-1][0] == "triton"
 
@@ -111,17 +111,28 @@ def test_unsupported_cache_block_falls_back(implementation):
 def test_mixed_queries_and_non_tp2_heads_do_not_force_batch_one(implementation):
     module, calls = implementation
     impl = module.Gemma4FAAttentionImpl(heads=8, kv_heads=1)
-    q, cache, metadata, output = inputs([5, 1, 4, 0], heads=8, kv_heads=1)
+    q, cache, metadata, output = inputs([17, 5, 4, 0], heads=8, kv_heads=1)
     impl.forward(None, q, q, q, cache, metadata, output)
     assert calls[-1][0] == "flash"
 
 
-@pytest.mark.parametrize("q_len", [1, 4, 16])
+@pytest.mark.parametrize("q_len", [1, 4, 5, 16])
 def test_other_query_lengths_retain_original_forward(implementation, q_len):
     module, calls = implementation
     impl = module.Gemma4FAAttentionImpl()
     q, cache, metadata, output = inputs([q_len])
     assert impl.forward(None, q, q, q, cache, metadata, output) is output
+    assert calls[-1][0] == "triton"
+
+
+@pytest.mark.parametrize("batch", [1, 2, 24])
+@pytest.mark.parametrize("legacy_flag", ["0", "1"])
+def test_q5_falls_back_for_all_batch_sizes(implementation, monkeypatch, batch, legacy_flag):
+    monkeypatch.setenv("HCU_FLASH_ATTN_Q5", legacy_flag)
+    module, calls = implementation
+    impl = module.Gemma4FAAttentionImpl()
+    q, cache, metadata, output = inputs([5] * batch)
+    impl.forward(None, q, q, q, cache, metadata, output)
     assert calls[-1][0] == "triton"
 
 
@@ -132,7 +143,7 @@ def test_other_query_lengths_retain_original_forward(implementation, q_len):
 def test_unrepresented_mask_semantics_fall_back(implementation, field):
     module, calls = implementation
     impl = module.Gemma4FAAttentionImpl()
-    q, cache, metadata, output = inputs([5])
+    q, cache, metadata, output = inputs([17])
     setattr(metadata, field, object())
     impl.forward(None, q, q, q, cache, metadata, output)
     assert calls[-1][0] == "triton"
@@ -146,7 +157,7 @@ def test_profiling_metadata_none_uses_original_forward(implementation):
     assert calls[-1][0] == "triton"
 
 
-@pytest.mark.parametrize("q_len", [5, 17])
+@pytest.mark.parametrize("q_len", [17, 32])
 @pytest.mark.parametrize("ranges", [{}, {0: [], 1: []}])
 def test_empty_prefix_lm_ranges_admit_text_without_reading_device_mask(
     implementation, q_len, ranges
@@ -163,7 +174,7 @@ def test_empty_prefix_lm_ranges_admit_text_without_reading_device_mask(
     assert metadata.mm_prefix_range_tensor.device.type == "meta"
 
 
-@pytest.mark.parametrize("q_len", [5, 17])
+@pytest.mark.parametrize("q_len", [17, 32])
 @pytest.mark.parametrize("ranges", [{0: [(1, 4)]}, {0: [], 1: [(1, 4)]}])
 def test_real_bidirectional_prefix_ranges_remain_on_triton(
     implementation, q_len, ranges
@@ -181,7 +192,7 @@ def test_real_bidirectional_prefix_ranges_remain_on_triton(
 def test_tensor_only_prefix_mask_is_not_assumed_empty(implementation, shape):
     module, calls = implementation
     impl = module.Gemma4FAAttentionImpl()
-    q, cache, metadata, output = inputs([5])
+    q, cache, metadata, output = inputs([17])
     metadata.mm_prefix_range_tensor = torch.empty(shape, device="meta")
     impl.forward(None, q, q, q, cache, metadata, output)
     assert calls[-1][0] == "triton"
@@ -201,8 +212,8 @@ def test_outer_attention_updates_kv_before_fa_and_preserves_sharing(
     assert module.Gemma4FAAttentionBackend.forward_includes_kv_cache_update is False
     assert callable(module.TritonAttentionImpl.do_kv_cache_update)
     impl = module.Gemma4FAAttentionImpl()
-    q, cache, metadata, _ = inputs([5])
-    key = torch.full((5, 2, 512), 2, dtype=torch.bfloat16)
+    q, cache, metadata, _ = inputs([17])
+    key = torch.full((17, 2, 512), 2, dtype=torch.bfloat16)
     value = torch.full_like(key, 6)
     layer = SimpleNamespace(
         calculate_kv_scales=False,
@@ -220,13 +231,13 @@ def test_outer_attention_updates_kv_before_fa_and_preserves_sharing(
 
     def update(layer, k, v, kv, slots):
         events.append("update")
-        kv[0, 0, :5].copy_(k)
-        kv[0, 1, :5].copy_(v)
+        kv[0, 0, :17].copy_(k)
+        kv[0, 1, :17].copy_(v)
 
     def flash(**kwargs):
         events.append("flash")
-        assert torch.equal(kwargs["k"][0, :5], key)
-        assert torch.equal(kwargs["v"][0, :5], value)
+        assert torch.equal(kwargs["k"][0, :17], key)
+        assert torch.equal(kwargs["v"][0, :17], value)
         kwargs["out"].fill_(3)
 
     def compute(query, k, v, output, layer_name, **kwargs):
@@ -236,11 +247,11 @@ def test_outer_attention_updates_kv_before_fa_and_preserves_sharing(
     monkeypatch.setattr(impl, "_flash_attention", flash)
     if sharing:
         # The source layer has already populated the shared target cache.
-        cache[0, 0, :5].copy_(key)
-        cache[0, 1, :5].copy_(value)
+        cache[0, 0, :17].copy_(key)
+        cache[0, 1, :17].copy_(value)
     upstream = SimpleNamespace(
         _resolve_layer_name=lambda name: name,
-        get_attention_context=lambda name: (None, layer, cache, torch.arange(5)),
+        get_attention_context=lambda name: (None, layer, cache, torch.arange(17)),
         unified_attention_with_output=compute,
     )
     output = attention_forward(upstream, layer, q, key, value)
