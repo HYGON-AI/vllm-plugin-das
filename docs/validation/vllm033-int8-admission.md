@@ -1,5 +1,9 @@
 # INT8 expert admission review
 
+The subsequent [full-model comparison](vllm033-int8-model.md) completed:
+normalized32/32 in both arms, with its frozen ASM wheel and compiler-policy
+limits preserved. The pending status below records the admission-review snapshot.
+
 Production fix: `ec01e209`, on existing [PR330](https://github.com/HYGON-AI/vllm-plugin-das/pull/330),
 target `v0.33.0`. [Candidate and evidence hashes](../../validation/v0.33.0/int8-admission-gfx936-candidate.json).
 AI assistance was used. Core runtime and Adapter production are unchanged.
