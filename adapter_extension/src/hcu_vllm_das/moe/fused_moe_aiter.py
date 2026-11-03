@@ -48,9 +48,7 @@ def _load_aiter_api() -> _AiterApi:
 
 
 def _load_triton_fallback() -> Callable[..., object]:
-    module = import_module(
-        "vllm.model_executor.layers.fused_moe.fused_moe"
-    )
+    module = import_module("vllm.model_executor.layers.fused_moe.fused_moe")
     return module.fused_experts_impl
 
 
@@ -197,8 +195,20 @@ def apply_aiter_int8_moe(
         getattr(selected, "need_shuffle", False)
         or getattr(selected, "need_shuffle_scale", False)
     )
-    if not found or unsupported_layout:
-        reason = "config-miss" if not found else "unsupported-layout"
+    unsupported_expert_map = expert_map is not None and solution not in (
+        "asm",
+        "ck",
+        "triton",
+        "moe_c",
+    )
+    if not found or unsupported_layout or unsupported_expert_map:
+        reason = (
+            "config-miss"
+            if not found
+            else "unsupported-layout"
+            if unsupported_layout
+            else "unsupported-expert-map"
+        )
         _record_once(logging.WARNING, f"fallback:{reason}", problem, solution, selected)
         return _triton_fallback(
             hidden_states=hidden_states,
@@ -230,7 +240,11 @@ def apply_aiter_int8_moe(
         a2_scale=getattr(quant_config, "a2_scale", None),
         block_shape=None,
         global_num_experts=global_num_experts,
-        expert_map=_aiter_expert_mask(expert_map),
+        # ASM/CK sorting takes a mask with a sentinel; Triton and MoE-C
+        # consume the canonical global-to-local map, including remote -1s.
+        expert_map=(
+            _aiter_expert_mask(expert_map) if solution in ("asm", "ck") else expert_map
+        ),
         routed_scaling_factor=1.0,
         use_weight_shuffle=False,
         output_dtype=output_dtype,
