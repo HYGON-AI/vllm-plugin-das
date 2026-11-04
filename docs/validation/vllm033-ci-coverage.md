@@ -23,7 +23,9 @@ It does not certify the whole portable suite, native ABI, or model quality.
 The prepared-image job runs all non-`*_hcu.py` files in `tests/vllm033` with
 devices hidden, then all `*_hcu.py` files with the actual live flags. It
 installs only the independent `adapter_extension` project, never root
-`setup.py`. Empty results, failures, errors, skips/xfails and unexpected passes
+`setup.py`, and explicitly selects the Adapter platform entry point in every
+tier so an image's legacy platform entry point cannot be discovered. Empty
+results, failures, errors, skips/xfails and unexpected passes
 fail the result gate. JUnit reports preserve each tier separately. The shared
 HCU registration assertion recognizes only files actually executed by this
 release runner; all other HCU files still require the legacy registry.

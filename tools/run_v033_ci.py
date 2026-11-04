@@ -45,6 +45,7 @@ def main():
         raise ValueError('v0.33 suite is empty')
     environment = dict(os.environ)
     environment['PYTEST_DISABLE_PLUGIN_AUTOLOAD'] = '1'
+    environment['VLLM_PLUGINS'] = 'hcu_adapter'
     if args.tier in {'source', 'portable'}:
         environment.update(HCU_ADAPTER_HOST='none', HIP_VISIBLE_DEVICES='-1',
                            ROCR_VISIBLE_DEVICES='-1', CUDA_VISIBLE_DEVICES='-1')
