@@ -1,0 +1,128 @@
+name: HCU v0.33 release contracts
+
+on:
+  pull_request:
+    types: [opened, synchronize, reopened, ready_for_review]
+    branches: [v0.33.0]
+  push:
+    branches: [v0.33.0]
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: hcu-v033-${{ github.event.pull_request.number || github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  select:
+    runs-on: ubuntu-latest
+    outputs:
+      has_jobs: ${{ steps.select.outputs.has_jobs }}
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: ${{ github.event.pull_request.head.sha || github.sha }}
+          fetch-depth: 0
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+      - name: Release and selector contracts
+        env:
+          RELEASE_REF: ${{ github.base_ref || github.ref_name }}
+        run: |
+          test "$RELEASE_REF" = v0.33.0
+          python -B -m unittest discover -s tests/ci -v
+      - name: Select this release without the legacy registry
+        id: select
+        env:
+          BASE_SHA: ${{ github.event.pull_request.base.sha || github.event.before }}
+          HEAD_SHA: ${{ github.event.pull_request.head.sha || github.sha }}
+          EVENT_NAME: ${{ github.event_name }}
+        run: |
+          if [[ "$EVENT_NAME" == workflow_dispatch || -z "$BASE_SHA" || "$BASE_SHA" =~ ^0+$ ]]; then
+            printf '%s\n' adapter_extension/ > changed-v033.txt
+          else
+            git diff --name-only --no-renames "$BASE_SHA" "$HEAD_SHA" > changed-v033.txt
+          fi
+          python .github/scripts/hcu_ci/select_hcu_tests.py --release v0.33.0 \
+            --paths-from changed-v033.txt --github-output "$GITHUB_OUTPUT" > selection-v033.json
+      - uses: actions/upload-artifact@v4
+        with:
+          name: v033-selection
+          path: selection-v033.json
+
+  v033-source-contract:
+    needs: select
+    if: needs.select.outputs.has_jobs == 'true'
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: ${{ github.event.pull_request.head.sha || github.sha }}
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+      - uses: actions/checkout@v4
+        with:
+          repository: vllm-project/vllm
+          ref: 4ba787ec9959e566d3b587a796dff07673324da5
+          path: target-vllm
+      - run: python -m pip install pytest packaging 'setuptools>=77' wheel
+      - name: Source and packaging contracts (CPU only)
+        env:
+          VLLM_TARGET_ROOT: ${{ github.workspace }}/target-vllm
+          PYTEST_DISABLE_PLUGIN_AUTOLOAD: '1'
+        run: python tools/run_v033_ci.py --tier source --junit v033-source.xml
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: v033-source-contract
+          path: v033-source.xml
+
+  resolve-device-image:
+    needs: select
+    if: needs.select.outputs.has_jobs == 'true'
+    runs-on: ubuntu-latest
+    outputs:
+      image: ${{ steps.image.outputs.image }}
+    steps:
+      - name: Require a prepared v0.33 image
+        id: image
+        env:
+          HCU_CI_IMAGE_V033: ${{ vars.HCU_CI_IMAGE_V033 }}
+        run: |
+          if [[ -z "${HCU_CI_IMAGE_V033//[[:space:]]/}" ]]; then
+            echo 'HCU_CI_IMAGE_V033 must name a prepared v0.33 DTK/Core/Adapter/vendor image' >&2
+            exit 2
+          fi
+          echo "image=$HCU_CI_IMAGE_V033" >> "$GITHUB_OUTPUT"
+
+  v033-device-gfx936:
+    needs: [select, resolve-device-image]
+    if: needs.select.outputs.has_jobs == 'true'
+    runs-on: [self-hosted, ci, bw1000]
+    timeout-minutes: 45
+    container:
+      image: ${{ needs.resolve-device-image.outputs.image }}
+      options: --device=/dev/kfd --device=/dev/dri --group-add video
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: ${{ github.event.pull_request.head.sha || github.sha }}
+      - name: Full v0.33 portable contracts (devices hidden)
+        env:
+          PYTEST_DISABLE_PLUGIN_AUTOLOAD: '1'
+        run: python tools/run_v033_ci.py --tier portable --junit v033-portable.xml
+      - name: Installed Plugin operator and Graph contracts
+        env:
+          PYTEST_DISABLE_PLUGIN_AUTOLOAD: '1'
+        run: python tools/run_v033_ci.py --tier device --junit v033-device.xml
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: v033-device-gfx936
+          path: |
+            v033-portable.xml
+            v033-device.xml
