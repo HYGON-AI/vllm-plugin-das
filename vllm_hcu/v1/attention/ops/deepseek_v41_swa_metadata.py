@@ -365,14 +365,20 @@ def _ptr_scratch(device: torch.device, n: int) -> dict[str, object]:
     bufs = _PTR_SCRATCH.get(key)
     if bufs is None:
         bufs = {
-            "host_i64": torch.empty(
-                (len(_I64_ROWS), n), dtype=torch.int64, pin_memory=True
-            ),
+            # Ping-pong host staging so a later refill cannot clobber an
+            # in-flight non_blocking H2D that still reads the prior slot.
+            "host_i64": [
+                torch.empty((len(_I64_ROWS), n), dtype=torch.int64, pin_memory=True),
+                torch.empty((len(_I64_ROWS), n), dtype=torch.int64, pin_memory=True),
+            ],
+            "host_i32": [
+                torch.empty((len(_I32_ROWS), n), dtype=torch.int32, pin_memory=True),
+                torch.empty((len(_I32_ROWS), n), dtype=torch.int32, pin_memory=True),
+            ],
+            "host_events": [None, None],
+            "host_slot": 0,
             "dev_i64": torch.empty(
                 (len(_I64_ROWS), n), dtype=torch.int64, device=device
-            ),
-            "host_i32": torch.empty(
-                (len(_I32_ROWS), n), dtype=torch.int32, pin_memory=True
             ),
             "dev_i32": torch.empty(
                 (len(_I32_ROWS), n), dtype=torch.int32, device=device
@@ -410,11 +416,23 @@ def _fill_ptr_scratch(bunch: list[SwaMetaJob]) -> dict[str, torch.Tensor]:
     device = bunch[0].slot_mapping.device
     g = len(bunch)
     bufs = _ptr_scratch(device, g)
-    host64 = bufs["host_i64"]
-    host32 = bufs["host_i32"]
-    assert isinstance(host64, torch.Tensor) and isinstance(host32, torch.Tensor)
+    host64_pool = bufs["host_i64"]
+    host32_pool = bufs["host_i32"]
+    host_events = bufs["host_events"]
+    assert isinstance(host64_pool, list) and isinstance(host32_pool, list)
+    assert isinstance(host_events, list)
     sig = _bunch_ptr_sig(bunch)
     if bufs["sig"] != sig:
+        # Advance to the alternate host slot; wait only if that slot still has
+        # an outstanding H2D (depth-2 covers the common single-batch case).
+        slot = 1 - int(bufs["host_slot"])
+        prev_event = host_events[slot]
+        if prev_event is not None:
+            # Host stores are not ordered by CUDA streams.
+            prev_event.synchronize()
+        host64 = host64_pool[slot]
+        host32 = host32_pool[slot]
+        assert isinstance(host64, torch.Tensor) and isinstance(host32, torch.Tensor)
         # One packed host write (no per-row torch.as_tensor) then a single HtoD.
         vals64 = [
             [j.replay_start.data_ptr() for j in bunch],
@@ -439,6 +457,12 @@ def _fill_ptr_scratch(bunch: list[SwaMetaJob]) -> dict[str, torch.Tensor]:
         assert isinstance(bufs["dev_i32"], torch.Tensor)
         bufs["dev_i64"][:, :g].copy_(host64[:, :g], non_blocking=True)
         bufs["dev_i32"][:, :g].copy_(host32[:, :g], non_blocking=True)
+        event = host_events[slot]
+        if event is None:
+            event = torch.cuda.Event()
+            host_events[slot] = event
+        event.record()
+        bufs["host_slot"] = slot
         bufs["sig"] = sig
     out = {
         name: bufs["dev_i64"][i, :g]  # type: ignore[index]

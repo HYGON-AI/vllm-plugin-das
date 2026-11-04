@@ -10,9 +10,11 @@ Mitigations:
 
 1. Round-robin registered (``cudaHostRegister``) staging pools so the hot
    path does not call ``hipHostMalloc``. Pools grow lazily up to
-   ``_POOL_DEPTH`` so outstanding ``non_blocking`` H2Ds do not clobber a
-   buffer still owned by DMA.
-2. One deferred ``pin_memory`` slab warmup as fallback if register is
+   ``_POOL_DEPTH``.
+2. Each slot records a CUDA event after its non_blocking H2D; the slot is
+   not overwritten until that event completes (CPU-side synchronize). CUDA
+   stream waits alone cannot protect host memory from CPU stores.
+3. One deferred ``pin_memory`` slab warmup as fallback if register is
    unavailable (still keeps upstream empty semantics on that path).
 """
 
@@ -20,6 +22,7 @@ from __future__ import annotations
 
 import functools
 import importlib
+from dataclasses import dataclass
 from types import ModuleType
 
 import numpy as np
@@ -54,12 +57,21 @@ _REBIND_MODULES = (
     "vllm.v1.attention.backends.mla.indexer",
 )
 
+
 class _StagingOwner:
     """Must support weakref for ``cudaHostRegister`` finalizers."""
 
 
+@dataclass
+class _StagingSlot:
+    buf: torch.Tensor
+    event: torch.cuda.Event | None = None
+    # Device index that last recorded ``event`` (for correct device context).
+    event_device: int | None = None
+
+
 _STAGING_OWNER = _StagingOwner()
-_STAGING_POOLS: dict[tuple[torch.dtype, int], list[torch.Tensor]] = {}
+_STAGING_POOLS: dict[tuple[torch.dtype, int], list[_StagingSlot]] = {}
 _STAGING_CURSORS: dict[tuple[torch.dtype, int], int] = {}
 _STAGING_MAPPINGS: list[object] = []
 _POOL_DEPTH = 64
@@ -81,7 +93,43 @@ def _capacity(numel: int) -> int:
     return max(256, 1 << max(numel - 1, 0).bit_length())
 
 
-def _get_staging(shape: tuple[int, ...], dtype: torch.dtype) -> torch.Tensor | None:
+def _device_index(device: torch.device | str | int | None) -> int:
+    if device is None:
+        return torch.cuda.current_device()
+    if isinstance(device, int):
+        return device
+    if isinstance(device, str):
+        device = torch.device(device)
+    if getattr(device, "type", None) != "cuda":
+        return torch.cuda.current_device()
+    idx = device.index
+    return torch.cuda.current_device() if idx is None else int(idx)
+
+
+def _wait_slot_ready(slot: _StagingSlot) -> None:
+    """Block CPU until any in-flight H2D from this host slot has finished."""
+
+    ev = slot.event
+    if ev is None:
+        return
+    # Host stores are not ordered by CUDA streams; must sync the event.
+    ev.synchronize()
+
+
+def _record_slot_h2d(slot: _StagingSlot, device: torch.device | str | int | None) -> None:
+    """Record completion of the just-enqueued H2D that reads ``slot.buf``."""
+
+    idx = _device_index(device)
+    with torch.cuda.device(idx):
+        if slot.event is None or slot.event_device != idx:
+            slot.event = torch.cuda.Event()
+            slot.event_device = idx
+        slot.event.record()
+
+
+def _acquire_staging(
+    shape: tuple[int, ...], dtype: torch.dtype
+) -> tuple[torch.Tensor, _StagingSlot] | None:
     global _REGISTER_OK
     if not _REGISTER_OK:
         return None
@@ -99,13 +147,15 @@ def _get_staging(shape: tuple[int, ...], dtype: torch.dtype) -> torch.Tensor | N
             _REGISTER_OK = False
             return None
         _STAGING_MAPPINGS.append(mapping)
-        pool.append(raw)
+        slot = _StagingSlot(buf=raw)
+        pool.append(slot)
         # Prefer the freshly allocated slot so early calls never alias.
         _STAGING_CURSORS[key] = len(pool)
-        return raw[:numel].view(shape)
-    buf = pool[cursor % len(pool)]
+        return raw[:numel].view(shape), slot
+    slot = pool[cursor % len(pool)]
     _STAGING_CURSORS[key] = cursor + 1
-    return buf[:numel].view(shape)
+    _wait_slot_ready(slot)
+    return slot.buf[:numel].view(shape), slot
 
 
 def _warm_pin_fallback_slabs() -> None:
@@ -125,14 +175,15 @@ def _warm_pin_fallback_slabs() -> None:
 
 def _stage_unpinned(
     t: torch.Tensor, dtype: torch.dtype, pin_memory: bool
-) -> torch.Tensor:
-    staging = _get_staging(tuple(t.shape), dtype)
-    if staging is not None:
+) -> tuple[torch.Tensor, _StagingSlot | None]:
+    acquired = _acquire_staging(tuple(t.shape), dtype)
+    if acquired is not None:
+        staging, slot = acquired
         if t.dtype == dtype:
             staging.copy_(t)
         else:
             staging.copy_(t.to(dtype=dtype))
-        return staging
+        return staging, slot
     if pin_memory:
         _warm_pin_fallback_slabs()
     out = torch.empty(t.shape, dtype=dtype, device="cpu", pin_memory=pin_memory)
@@ -140,7 +191,7 @@ def _stage_unpinned(
         out.copy_(t)
     else:
         out.copy_(t.to(dtype=dtype))
-    return out
+    return out, None
 
 
 def apply_to_module(module: ModuleType) -> bool:
@@ -159,6 +210,7 @@ def apply_to_module(module: ModuleType) -> bool:
 
     @functools.wraps(original)
     def hcu_async_tensor_h2d(data, device=None, dtype=None, out=None):
+        slot: _StagingSlot | None = None
         if dtype is None and out is not None:
             dtype = out.dtype
         if isinstance(data, np.ndarray):
@@ -166,22 +218,28 @@ def apply_to_module(module: ModuleType) -> bool:
         if isinstance(data, torch.Tensor):
             t = data
             if pin_memory and not t.is_pinned():
-                t = _stage_unpinned(t, dtype or t.dtype, pin_memory)
+                t, slot = _stage_unpinned(t, dtype or t.dtype, pin_memory)
             elif dtype is not None and t.dtype != dtype:
                 t = t.to(dtype=dtype)
         else:
             tmp = torch.tensor(data, dtype=dtype, device="cpu")
             if pin_memory:
-                t = _stage_unpinned(tmp, tmp.dtype, pin_memory)
+                t, slot = _stage_unpinned(tmp, tmp.dtype, pin_memory)
             else:
                 t = tmp
         assert t.is_cpu
 
         if out is not None:
             assert out.dtype == dtype
-            return out.copy_(t, non_blocking=True)
+            result = out.copy_(t, non_blocking=True)
+            if slot is not None:
+                _record_slot_h2d(slot, out.device)
+            return result
         assert device is not None, "must provide destination tensor or device"
-        return t.to(device=device, dtype=dtype, non_blocking=True)
+        result = t.to(device=device, dtype=dtype, non_blocking=True)
+        if slot is not None:
+            _record_slot_h2d(slot, device)
+        return result
 
     setattr(hcu_async_tensor_h2d, _MARKER, True)
     setattr(hcu_async_tensor_h2d, _WRAPPER, True)
