@@ -57,6 +57,12 @@ def compute_aligned_M_and_alignment(
         # lag a post-dispatch expert remap, so it may raise the bound but must
         # never shrink the worst-case workspace derived from the routed batch.
         alignment = max(alignment, _HCU_TOKEN_ALIGNMENT)
+        if getattr(expert_tokens_meta, "_hcu_static_ht_scratch", None) is not None:
+            from vllm_hcu.model_executor.layers.fused_moe.static_ht_scratch import get_plan
+
+            plan = get_plan(expert_tokens_meta, local_num_experts, alignment)
+            if plan is not None and M > 0:
+                return sum(plan.bounds), alignment
         M_sum_upper = round_up(
             (M * num_topk) + local_num_experts * (alignment - 1), alignment
         )
@@ -617,6 +623,15 @@ def deepgemm_moe_permute(
         expert_num_tokens = count_expert_num_tokens(
             topk_ids, local_num_experts, expert_map
         )
+
+    if getattr(expert_tokens_meta, "_hcu_static_ht_scratch", None) is not None:
+        from vllm_hcu.model_executor.layers.fused_moe.static_ht_scratch import (
+            check_recount, check_scatter_map, get_plan,
+        )
+        check_scatter_map(expert_tokens_meta, expert_map)
+        plan = get_plan(expert_tokens_meta, local_num_experts, align_used)
+        if plan is not None and plan.diagnostic:
+            check_recount(plan.bounds, expert_num_tokens)
 
     ep_scatter(
         recv_x=aq,
