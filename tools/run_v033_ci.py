@@ -46,6 +46,8 @@ def main():
     environment = dict(os.environ)
     environment['PYTEST_DISABLE_PLUGIN_AUTOLOAD'] = '1'
     environment['VLLM_PLUGINS'] = 'hcu_adapter'
+    environment.pop('PYTHONPATH', None)
+    environment['PYTHONNOUSERSITE'] = '1'
     if args.tier in {'source', 'portable'}:
         environment.update(HCU_ADAPTER_HOST='none', HIP_VISIBLE_DEVICES='-1',
                            ROCR_VISIBLE_DEVICES='-1', CUDA_VISIBLE_DEVICES='-1')

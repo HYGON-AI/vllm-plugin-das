@@ -108,7 +108,8 @@ class SelectionTests(unittest.TestCase):
     def test_portable_runner_does_not_discover_a_legacy_platform_plugin(self):
         sys.path.insert(0, str(ROOT / 'tools'))
         import run_v033_ci
-        with patch.dict('os.environ', {'VLLM_PLUGINS': 'legacy_platform'}), \
+        with patch.dict('os.environ', {'VLLM_PLUGINS': 'legacy_platform',
+                                      'PYTHONPATH': '/old/vllm', 'PYTHONNOUSERSITE': '0'}), \
              patch.object(sys, 'argv', ['run_v033_ci.py', '--tier', 'portable']), \
              patch('importlib.metadata.version', return_value='0.33.0'), \
              patch.object(run_v033_ci, 'validate_result'), \
@@ -119,6 +120,8 @@ class SelectionTests(unittest.TestCase):
             for call in run.call_args_list:
                 self.assertEqual(call.kwargs['env']['VLLM_PLUGINS'], 'hcu_adapter')
                 self.assertEqual(call.kwargs['env']['HCU_ADAPTER_HOST'], 'none')
+                self.assertNotIn('PYTHONPATH', call.kwargs['env'])
+                self.assertEqual(call.kwargs['env']['PYTHONNOUSERSITE'], '1')
 
 
 if __name__ == '__main__':

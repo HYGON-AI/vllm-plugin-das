@@ -74,7 +74,7 @@ jobs:
         env:
           VLLM_TARGET_ROOT: ${{ github.workspace }}/target-vllm
           PYTEST_DISABLE_PLUGIN_AUTOLOAD: '1'
-        run: python tools/run_v033_ci.py --tier source --junit v033-source.xml
+        run: python -I tools/run_v033_ci.py --tier source --junit v033-source.xml
       - uses: actions/upload-artifact@v4
         if: always()
         with:
@@ -114,11 +114,11 @@ jobs:
       - name: Full v0.33 portable contracts (devices hidden)
         env:
           PYTEST_DISABLE_PLUGIN_AUTOLOAD: '1'
-        run: python tools/run_v033_ci.py --tier portable --junit v033-portable.xml
+        run: python -I tools/run_v033_ci.py --tier portable --junit v033-portable.xml
       - name: Installed Plugin operator and Graph contracts
         env:
           PYTEST_DISABLE_PLUGIN_AUTOLOAD: '1'
-        run: python tools/run_v033_ci.py --tier device --junit v033-device.xml
+        run: python -I tools/run_v033_ci.py --tier device --junit v033-device.xml
       - uses: actions/upload-artifact@v4
         if: always()
         with:
