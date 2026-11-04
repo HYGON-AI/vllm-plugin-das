@@ -44,12 +44,12 @@ and the remaining release matrix remain separate acceptance gates.
 CPU verification commands:
 
 ```bash
-python -B -m unittest discover -s tests/ci -v
+python -I -B -m unittest discover -s tests/ci -v
 PYTEST_DISABLE_PLUGIN_AUTOLOAD=1 HCU_ADAPTER_HOST=none \
   HIP_VISIBLE_DEVICES=-1 ROCR_VISIBLE_DEVICES=-1 CUDA_VISIBLE_DEVICES=-1 \
-  python -B -m pytest -q tests/ci tests/patch/test_hcu_ci_selector.py
+  python -I -B -m pytest -q tests/ci tests/patch/test_hcu_ci_selector.py
 VLLM_TARGET_ROOT=/path/to/official-v033 \
-  python -B tools/run_v033_ci.py --tier source --junit v033-source.xml
+  python -I -B tools/run_v033_ci.py --tier source --junit v033-source.xml
 ```
 
 The upgrade audit preserves the original zero-job probe and the first full
