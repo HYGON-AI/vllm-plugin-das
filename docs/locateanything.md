@@ -100,6 +100,9 @@ The synthetic request count is also capped by actual KV blocks across all cache
 groups, reserving block 0. Fully using IDs through `num_blocks - 1` is valid.
 Fast rejects vLLM speculative decoding before scheduler/worker setup; its own
 six-position generation must not be combined with `--speculative-config`.
+Fast requires `pipeline_parallel_size=1`: the launcher, scheduler and worker
+reject pipeline parallelism before Fast warmup or device stream setup. Slow
+does not use this Fast restriction.
 
 The seven substantial Fast modules retain the original upstream vLLM license
 headers. They are qualified against the exact base files listed in the packaged
@@ -146,6 +149,12 @@ sampling starts only once the complete query and required image encoding fit.
 Fast also rejects legacy `guided_choice` at the API boundary, consistently
 with other unsupported structured-output options, rather than silently
 ignoring a client's requested constraint.
+Offline sampling parameters are validated before the scheduler queues or
+registers a request. A Fast-only InputProcessor callback rejects them in the
+client before EngineCore IPC, so ordinary invalid offline calls do not fail
+inside the engine process. InputProcessor, admission and the worker share one sampling contract,
+so unsupported stop strings/token IDs, penalties, logprobs and structured
+outputs fail before request, model or block-table state is inserted.
 
 The three inline `nosemgrep: rules.hygon.python.dynamic-eval` exceptions are
 limited to these oracle calls. They do not suppress dynamic execution in the

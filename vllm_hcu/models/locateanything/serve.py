@@ -21,6 +21,12 @@ def build_command(mode: str, model: str, max_num_seqs: int, extra: list[str]) ->
         for x in extra
     ):
         raise ValueError("LocateAnything Fast does not support --speculative-config")
+    if mode == "fast":
+        from vllm_hcu.v1.locateanything.limits import reject_pipeline_parallelism
+        parallel_parser = argparse.ArgumentParser(add_help=False, allow_abbrev=False, exit_on_error=False)
+        parallel_parser.add_argument("--pipeline-parallel-size", "--pipeline_parallel_size", "-pp", type=int, default=1)
+        parallel_args, _ = parallel_parser.parse_known_args(extra)
+        reject_pipeline_parallelism(parallel_args.pipeline_parallel_size)
     sizes = []; size = 1
     while size < max_num_seqs:
         sizes.append(size); size *= 2

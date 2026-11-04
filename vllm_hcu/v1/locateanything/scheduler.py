@@ -75,7 +75,8 @@ from vllm.v1.spec_decode.dynamic.utils import build_dynamic_sd_schedule_lookup
 from vllm.v1.spec_decode.metrics import SpecDecodingStats
 from vllm.v1.structured_output import StructuredOutputGrammar, StructuredOutputManager
 from vllm.v1.utils import record_function_or_nullcontext
-from vllm_hcu.v1.locateanything.limits import context_error, logical_context_limit, reject_speculative_decoding
+from vllm_hcu.v1.locateanything.limits import context_error, logical_context_limit, reject_pipeline_parallelism, reject_speculative_decoding
+from vllm_hcu.v1.locateanything.request_contract import validate_sampling_params
 
 logger = init_logger(__name__)
 
@@ -93,6 +94,7 @@ class Scheduler(SchedulerInterface):
         log_stats: bool = False,
     ) -> None:
         reject_speculative_decoding(vllm_config.speculative_config)
+        reject_pipeline_parallelism(vllm_config.parallel_config.pipeline_parallel_size)
         if getattr(vllm_config.model_config.hf_config, "model_type", None) != "locateanything":
             raise ValueError("LocateAnything Fast mode is process-wide and requires a LocateAnything checkpoint")
         if vllm_config.scheduler_config.async_scheduling or vllm_config.scheduler_config.enable_chunked_prefill:
@@ -2516,6 +2518,9 @@ class Scheduler(SchedulerInterface):
         return self.kv_cache_manager.usage
 
     def add_request(self, request: Request) -> None:
+        error = validate_sampling_params(request.sampling_params)
+        if error is not None:
+            raise ValueError(error)
         error = context_error(self.max_model_len, request.num_tokens, request.max_tokens)
         if error is not None:
             raise ValueError(error)

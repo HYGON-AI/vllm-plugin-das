@@ -1,7 +1,28 @@
 # Copyright (c) 2026 Hygon Information Technology Co., Ltd.
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright (c) 2026 Hygon Information Technology Co., Ltd.
-"""Reject unsupported Fast API options before they reach the engine worker."""
+"""Fast API and sampling contracts checked before request state is mutated."""
+
+
+def validate_sampling_params(params):
+    """Shared by offline admission and the worker; preserve the Fast contract."""
+    if params is None:
+        return 'LocateAnything Fast requires generation sampling parameters'
+    allowed = {
+        'n': (1,), 'logprobs': (None,), 'prompt_logprobs': (None,),
+        'presence_penalty': (0.0,), 'frequency_penalty': (0.0,),
+        'min_p': (0.0,), 'min_tokens': (0,), 'ignore_eos': (False,),
+    }
+    bad = [key for key, values in allowed.items() if getattr(params, key) not in values]
+    for key in ('logit_bias', 'bad_words', 'allowed_token_ids', 'structured_outputs',
+                'stop', 'stop_token_ids'):
+        if getattr(params, key):
+            bad.append(key)
+    if bad:
+        return 'Fast supports the original sampling contract only; unsupported options: ' + ', '.join(bad)
+    return None
+
+
 def validate_request(request):
     allowed={
         'stream':(None,False),'n':(None,1),'logprobs':(None,False,0),

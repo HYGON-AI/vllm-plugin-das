@@ -10,6 +10,11 @@ def reject_speculative_decoding(speculative_config) -> None:
         raise ValueError("LocateAnything Fast uses six-position block generation and does not support vLLM speculative decoding")
 
 
+def reject_pipeline_parallelism(pipeline_parallel_size: int) -> None:
+    if pipeline_parallel_size != 1:
+        raise ValueError("LocateAnything Fast requires pipeline_parallel_size=1; pipeline parallelism is not supported")
+
+
 def logical_context_limit(max_model_len: int) -> int:
     """Reserve probes and leave room for a nonempty prompt and output."""
     limit = max_model_len - PROBE_TOKENS

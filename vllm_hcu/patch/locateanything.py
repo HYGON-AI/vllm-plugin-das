@@ -109,6 +109,36 @@ def _patch_completion_detection_tokens(module):
     return _patch_detection_endpoint(module, "OpenAIServingCompletion", "create_completion")
 
 
+def _patch_fast_input_sampling(module):
+    """Reject invalid offline requests in the client, before EngineCore IPC."""
+    from vllm import SamplingParams
+    from vllm.exceptions import VLLMValidationError
+    from vllm_hcu.patch.platform.framework_opt._common import (
+        require_callable, require_class, require_signature_prefix,
+    )
+    from vllm_hcu.v1.locateanything.request_contract import validate_sampling_params
+
+    target = f"{module.__name__}.InputProcessor._validate_params"
+    cls = require_class(module, "InputProcessor", target)
+    original = require_callable(cls, "_validate_params", target)
+    if getattr(original, "_locateanything_fast_sampling", False):
+        return False
+    require_signature_prefix(original, target, ("self", "params", "supported_tasks"))
+
+    @wraps(original)
+    def validate_fast_sampling(self, params, supported_tasks):
+        if (self.model_config.hf_config.model_type == "locateanything"
+                and isinstance(params, SamplingParams)):
+            error = validate_sampling_params(params)
+            if error is not None:
+                raise VLLMValidationError(error)
+        return original(self, params, supported_tasks)
+
+    validate_fast_sampling._locateanything_fast_sampling = True
+    cls._validate_params = validate_fast_sampling
+    return True
+
+
 def register_locateanything_api_callbacks(coordinator):
     # These callbacks wrap shared Slow or exchanged Fast endpoints, selected by
     # the serving model's config, and leave other model families untouched.
@@ -121,4 +151,10 @@ def register_locateanything_api_callbacks(coordinator):
         coordinator.register_callback(
             "locateanything.api." + method, module, callback,
             targets=(f"{module}.{cls}.{method}",),
+        )
+    if locateanything_mode() == "fast":
+        coordinator.register_callback(
+            "locateanything.input.sampling", "vllm.v1.engine.input_processor",
+            _patch_fast_input_sampling,
+            targets=("vllm.v1.engine.input_processor.InputProcessor._validate_params",),
         )

@@ -184,8 +184,9 @@ logger = init_logger(__name__)
 
 class GPUModelRunner(LoRAModelRunnerMixin):
     def __init__(self, vllm_config: VllmConfig, device: torch.device):
-        from vllm_hcu.v1.locateanything.limits import reject_speculative_decoding
+        from vllm_hcu.v1.locateanything.limits import reject_pipeline_parallelism, reject_speculative_decoding
         reject_speculative_decoding(vllm_config.speculative_config)
+        reject_pipeline_parallelism(vllm_config.parallel_config.pipeline_parallel_size)
         self.vllm_config = vllm_config
         self.model_config = vllm_config.model_config
         self.cache_config = vllm_config.cache_config

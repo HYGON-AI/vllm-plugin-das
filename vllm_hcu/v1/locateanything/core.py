@@ -14,6 +14,7 @@ import triton.language as tl
 from vllm.v1.worker.gpu.model_states.default import DefaultModelState
 from vllm.v1.worker.gpu.sample.sampler import Sampler
 from vllm.v1.worker.gpu.sample.output import SamplerOutput
+from vllm_hcu.v1.locateanything.request_contract import validate_sampling_params
 
 PROBES = 6
 BOX, BOX_END, REF, REF_END = 151668, 151669, 151672, 151673
@@ -114,12 +115,9 @@ class FastSampler(Sampler):
 
     def add_request(self, req_idx, prompt_len, sampling_params):
         p = sampling_params
-        if (p.n != 1 or p.logprobs is not None or p.prompt_logprobs is not None
-                or p.presence_penalty or p.frequency_penalty or p.min_p
-                or p.min_tokens or p.logit_bias or p.bad_words
-                or p.allowed_token_ids or p.structured_outputs
-                or p.stop or p.stop_token_ids or p.ignore_eos):
-            raise ValueError('Fast supports the original sampling contract only; unsupported sampling option')
+        error = validate_sampling_params(p)
+        if error is not None:
+            raise ValueError(error)
         super().add_request(req_idx, prompt_len, p)
         req_id = self.req_states.index_to_req_id[req_idx]
         g = self.fast_request_generators.get(req_id)
