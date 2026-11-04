@@ -1,5 +1,9 @@
 # HYV4VL decode graph evaluation (2026-11-05)
 
+For the later FULL_AND_PIECEWISE comparison and remaining optimization probes,
+see the [full/piecewise report](hy4_vl_piecewise_performance.md). Complete
+[server/client commands](hy4_vl_serving.md) cover all three execution modes.
+
 This evaluates the installed breakable decode graph implementation on top of
 `9eaf4d5`, after the [ViT/M-RoPE optimization](hy4_vl_performance.md).
 The fixed-concurrency-1 RealWorldQA pair passes the predeclared raw-prediction acceptance check.
@@ -112,6 +116,7 @@ one/two-token decode batches. Actual per-rank dispatcher counts are retained,
 rather than treating successful capture as proof of replay.
 
 ```bash
+export PYTHONPATH="$PWD${PYTHONPATH:+:$PYTHONPATH}"
 VLLM_WORKER_MULTIPROC_METHOD=spawn VLLM_USE_BREAKABLE_CUDAGRAPH=1 \
 vllm serve /module/Hy4-testing-Channel-FP8-w8a8 \
   --served-model-name hy4-vl --tensor-parallel-size 8 --moe-backend triton \

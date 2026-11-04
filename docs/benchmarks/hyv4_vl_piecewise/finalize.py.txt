@@ -1,0 +1,40 @@
+import json
+import signal
+import subprocess
+import time
+from pathlib import Path
+import psutil
+import requests
+
+r=Path('/root/hy4-perf-stage3')
+for _ in range(3600):
+    log=(r/'pipeline.log').read_text()
+    if 'DONE ALL' in log:break
+    if 'Traceback' in log:raise RuntimeError('Serving validation failed; inspect before finalizing')
+    time.sleep(2)
+else:raise RuntimeError('Validation did not finish')
+base='http://127.0.0.1:8010'
+def rpc(method,*args):
+    reply=requests.post(base+'/collective_rpc',json={'method':method,'args':list(args),'timeout':120},timeout=150)
+    reply.raise_for_status();return reply.json()
+(r/'final-smoke-mode.json').write_text(json.dumps(rpc('stage3_set_mode','full_piecewise'),indent=2))
+for endpoint in ['reset_encoder_cache','reset_mm_cache']:
+    reply=requests.post(base+'/'+endpoint,timeout=60);reply.raise_for_status()
+print('START final smoke',flush=True)
+with (r/'smoke-full-piecewise-final.log').open('w') as out:
+    subprocess.run(['python','tools/hyv4_vl_image_smoke.py','--output-dir',str(r/'smoke-full-piecewise-final'),'--photo','/root/hy4-vl-validation/cherry_blossom.jpg'],stdout=out,stderr=subprocess.STDOUT,check=True)
+(r/'final-smoke-dispatch.json').write_text(json.dumps(rpc('stage3_stats'),indent=2))
+print('DONE final smoke',flush=True)
+parent=psutil.Process(289662)
+assert parent.cmdline()[1]=='/usr/local/bin/vllm' and 'stage3_worker.Stage3Worker' in parent.cmdline()
+owned=[parent]+parent.children(recursive=True)
+parent.send_signal(signal.SIGTERM)
+_,alive=psutil.wait_procs(owned,timeout=30)
+remaining=[p for p in alive if p.is_running() and p.status()!=psutil.STATUS_ZOMBIE]
+if remaining:
+    raise RuntimeError('Owned server processes remain: '+str([p.pid for p in remaining]))
+print('DONE server stopped',flush=True)
+print('START offline MoE gate/up probe',flush=True)
+with (r/'moe-gate-probe.log').open('w') as out:
+    subprocess.run(['python',str(r/'moe_gate_probe.py'),'--output-dir',str(r/'moe-gate-probe')],stdout=out,stderr=subprocess.STDOUT,check=True)
+print('DONE offline MoE gate/up probe',flush=True)

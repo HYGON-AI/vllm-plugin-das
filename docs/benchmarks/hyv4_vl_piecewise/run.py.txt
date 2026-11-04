@@ -1,0 +1,54 @@
+import json
+import subprocess
+import time
+from pathlib import Path
+import requests
+
+r = Path('/root/hy4-perf-stage3')
+base = 'http://127.0.0.1:8010'
+for _ in range(900):
+    try:
+        if requests.get(base+'/health', timeout=2).status_code == 200:
+            break
+    except requests.RequestException:
+        pass
+    time.sleep(2)
+else:
+    raise RuntimeError('server did not become healthy')
+
+def rpc(method, *args):
+    reply = requests.post(base+'/collective_rpc', json={'method': method, 'args': list(args), 'timeout': 120}, timeout=150)
+    reply.raise_for_status()
+    return reply.json()
+
+def save(name, data):
+    (r/name).write_text(json.dumps(data, indent=2)+'\n')
+
+def mode(name, label):
+    save(label+'-mode.json', rpc('stage3_set_mode', name))
+    for endpoint in ('reset_encoder_cache', 'reset_mm_cache'):
+        reply = requests.post(base+'/'+endpoint, timeout=60)
+        reply.raise_for_status()
+
+def run(label, cmd):
+    print('START', label, flush=True)
+    with (r/(label+'.log')).open('w') as out:
+        subprocess.run(cmd, stdout=out, stderr=subprocess.STDOUT, check=True)
+    save(label+'-dispatch.json', rpc('stage3_stats'))
+    print('DONE', label, flush=True)
+
+mode('full_piecewise', 'smoke-full-piecewise')
+run('smoke-full-piecewise', ['python', 'tools/hyv4_vl_image_smoke.py', '--output-dir', str(r/'smoke-full-piecewise'), '--photo', '/root/hy4-vl-validation/cherry_blossom.jpg'])
+for name in ('full_piecewise', 'decode_only', 'eager'):
+    label = 'e2e-'+name
+    mode(name, label)
+    run(label, ['python', 'tools/hyv4_vl_perf.py', '--data-dir', '/root/hy4-realworldqa/data/data', '--output-dir', str(r/label)])
+for name in ('full_piecewise', 'decode_only'):
+    label = 'accuracy-'+name
+    mode(name, label)
+    run(label, ['python', 'tools/hyv4_realworldqa_eval.py', '--data-dir', '/root/hy4-realworldqa/data/data', '--output-dir', str(r/label), '--mcq-extractor', '/root/hy4-realworldqa/reference/mcq_extract.py', '--max-pixels', '1048576', '--concurrency', '1'])
+for name in ('full_piecewise', 'decode_only'):
+    label = 'e2e-'+name+'-repeat'
+    mode(name, label)
+    run(label, ['python', 'tools/hyv4_vl_perf.py', '--data-dir', '/root/hy4-realworldqa/data/data', '--output-dir', str(r/label)])
+print('DONE ALL', flush=True)

@@ -1,0 +1,204 @@
+{
+  "results": [
+    {
+      "mode": "full_piecewise",
+      "dispatch_counts": {
+        "PIECEWISE": 1467,
+        "FULL": 1553
+      },
+      "dispatch_shapes": {
+        "(<CUDAGraphMode.PIECEWISE: 1>, BatchDescriptor(num_tokens=768, num_reqs=None, uniform=False, has_lora=False, num_active_loras=0))": 20,
+        "(<CUDAGraphMode.FULL: 2>, BatchDescriptor(num_tokens=1, num_reqs=1, uniform=True, has_lora=False, num_active_loras=0))": 1553,
+        "(<CUDAGraphMode.PIECEWISE: 1>, BatchDescriptor(num_tokens=1024, num_reqs=None, uniform=False, has_lora=False, num_active_loras=0))": 708,
+        "(<CUDAGraphMode.PIECEWISE: 1>, BatchDescriptor(num_tokens=128, num_reqs=None, uniform=False, has_lora=False, num_active_loras=0))": 701,
+        "(<CUDAGraphMode.PIECEWISE: 1>, BatchDescriptor(num_tokens=512, num_reqs=None, uniform=False, has_lora=False, num_active_loras=0))": 37,
+        "(<CUDAGraphMode.PIECEWISE: 1>, BatchDescriptor(num_tokens=256, num_reqs=None, uniform=False, has_lora=False, num_active_loras=0))": 1
+      },
+      "config_mode": "FULL_AND_PIECEWISE",
+      "capture_sizes": [
+        1,
+        2,
+        128,
+        256,
+        512,
+        768,
+        1024
+      ]
+    },
+    {
+      "mode": "full_piecewise",
+      "dispatch_counts": {
+        "PIECEWISE": 1467,
+        "FULL": 1553
+      },
+      "dispatch_shapes": {
+        "(<CUDAGraphMode.PIECEWISE: 1>, BatchDescriptor(num_tokens=768, num_reqs=None, uniform=False, has_lora=False, num_active_loras=0))": 20,
+        "(<CUDAGraphMode.FULL: 2>, BatchDescriptor(num_tokens=1, num_reqs=1, uniform=True, has_lora=False, num_active_loras=0))": 1553,
+        "(<CUDAGraphMode.PIECEWISE: 1>, BatchDescriptor(num_tokens=1024, num_reqs=None, uniform=False, has_lora=False, num_active_loras=0))": 708,
+        "(<CUDAGraphMode.PIECEWISE: 1>, BatchDescriptor(num_tokens=128, num_reqs=None, uniform=False, has_lora=False, num_active_loras=0))": 701,
+        "(<CUDAGraphMode.PIECEWISE: 1>, BatchDescriptor(num_tokens=512, num_reqs=None, uniform=False, has_lora=False, num_active_loras=0))": 37,
+        "(<CUDAGraphMode.PIECEWISE: 1>, BatchDescriptor(num_tokens=256, num_reqs=None, uniform=False, has_lora=False, num_active_loras=0))": 1
+      },
+      "config_mode": "FULL_AND_PIECEWISE",
+      "capture_sizes": [
+        1,
+        2,
+        128,
+        256,
+        512,
+        768,
+        1024
+      ]
+    },
+    {
+      "mode": "full_piecewise",
+      "dispatch_counts": {
+        "PIECEWISE": 1467,
+        "FULL": 1553
+      },
+      "dispatch_shapes": {
+        "(<CUDAGraphMode.PIECEWISE: 1>, BatchDescriptor(num_tokens=768, num_reqs=None, uniform=False, has_lora=False, num_active_loras=0))": 20,
+        "(<CUDAGraphMode.FULL: 2>, BatchDescriptor(num_tokens=1, num_reqs=1, uniform=True, has_lora=False, num_active_loras=0))": 1553,
+        "(<CUDAGraphMode.PIECEWISE: 1>, BatchDescriptor(num_tokens=1024, num_reqs=None, uniform=False, has_lora=False, num_active_loras=0))": 708,
+        "(<CUDAGraphMode.PIECEWISE: 1>, BatchDescriptor(num_tokens=128, num_reqs=None, uniform=False, has_lora=False, num_active_loras=0))": 701,
+        "(<CUDAGraphMode.PIECEWISE: 1>, BatchDescriptor(num_tokens=512, num_reqs=None, uniform=False, has_lora=False, num_active_loras=0))": 37,
+        "(<CUDAGraphMode.PIECEWISE: 1>, BatchDescriptor(num_tokens=256, num_reqs=None, uniform=False, has_lora=False, num_active_loras=0))": 1
+      },
+      "config_mode": "FULL_AND_PIECEWISE",
+      "capture_sizes": [
+        1,
+        2,
+        128,
+        256,
+        512,
+        768,
+        1024
+      ]
+    },
+    {
+      "mode": "full_piecewise",
+      "dispatch_counts": {
+        "PIECEWISE": 1467,
+        "FULL": 1553
+      },
+      "dispatch_shapes": {
+        "(<CUDAGraphMode.PIECEWISE: 1>, BatchDescriptor(num_tokens=768, num_reqs=None, uniform=False, has_lora=False, num_active_loras=0))": 20,
+        "(<CUDAGraphMode.FULL: 2>, BatchDescriptor(num_tokens=1, num_reqs=1, uniform=True, has_lora=False, num_active_loras=0))": 1553,
+        "(<CUDAGraphMode.PIECEWISE: 1>, BatchDescriptor(num_tokens=1024, num_reqs=None, uniform=False, has_lora=False, num_active_loras=0))": 708,
+        "(<CUDAGraphMode.PIECEWISE: 1>, BatchDescriptor(num_tokens=128, num_reqs=None, uniform=False, has_lora=False, num_active_loras=0))": 701,
+        "(<CUDAGraphMode.PIECEWISE: 1>, BatchDescriptor(num_tokens=512, num_reqs=None, uniform=False, has_lora=False, num_active_loras=0))": 37,
+        "(<CUDAGraphMode.PIECEWISE: 1>, BatchDescriptor(num_tokens=256, num_reqs=None, uniform=False, has_lora=False, num_active_loras=0))": 1
+      },
+      "config_mode": "FULL_AND_PIECEWISE",
+      "capture_sizes": [
+        1,
+        2,
+        128,
+        256,
+        512,
+        768,
+        1024
+      ]
+    },
+    {
+      "mode": "full_piecewise",
+      "dispatch_counts": {
+        "PIECEWISE": 1467,
+        "FULL": 1553
+      },
+      "dispatch_shapes": {
+        "(<CUDAGraphMode.PIECEWISE: 1>, BatchDescriptor(num_tokens=768, num_reqs=None, uniform=False, has_lora=False, num_active_loras=0))": 20,
+        "(<CUDAGraphMode.FULL: 2>, BatchDescriptor(num_tokens=1, num_reqs=1, uniform=True, has_lora=False, num_active_loras=0))": 1553,
+        "(<CUDAGraphMode.PIECEWISE: 1>, BatchDescriptor(num_tokens=1024, num_reqs=None, uniform=False, has_lora=False, num_active_loras=0))": 708,
+        "(<CUDAGraphMode.PIECEWISE: 1>, BatchDescriptor(num_tokens=128, num_reqs=None, uniform=False, has_lora=False, num_active_loras=0))": 701,
+        "(<CUDAGraphMode.PIECEWISE: 1>, BatchDescriptor(num_tokens=512, num_reqs=None, uniform=False, has_lora=False, num_active_loras=0))": 37,
+        "(<CUDAGraphMode.PIECEWISE: 1>, BatchDescriptor(num_tokens=256, num_reqs=None, uniform=False, has_lora=False, num_active_loras=0))": 1
+      },
+      "config_mode": "FULL_AND_PIECEWISE",
+      "capture_sizes": [
+        1,
+        2,
+        128,
+        256,
+        512,
+        768,
+        1024
+      ]
+    },
+    {
+      "mode": "full_piecewise",
+      "dispatch_counts": {
+        "PIECEWISE": 1467,
+        "FULL": 1553
+      },
+      "dispatch_shapes": {
+        "(<CUDAGraphMode.PIECEWISE: 1>, BatchDescriptor(num_tokens=768, num_reqs=None, uniform=False, has_lora=False, num_active_loras=0))": 20,
+        "(<CUDAGraphMode.FULL: 2>, BatchDescriptor(num_tokens=1, num_reqs=1, uniform=True, has_lora=False, num_active_loras=0))": 1553,
+        "(<CUDAGraphMode.PIECEWISE: 1>, BatchDescriptor(num_tokens=1024, num_reqs=None, uniform=False, has_lora=False, num_active_loras=0))": 708,
+        "(<CUDAGraphMode.PIECEWISE: 1>, BatchDescriptor(num_tokens=128, num_reqs=None, uniform=False, has_lora=False, num_active_loras=0))": 701,
+        "(<CUDAGraphMode.PIECEWISE: 1>, BatchDescriptor(num_tokens=512, num_reqs=None, uniform=False, has_lora=False, num_active_loras=0))": 37,
+        "(<CUDAGraphMode.PIECEWISE: 1>, BatchDescriptor(num_tokens=256, num_reqs=None, uniform=False, has_lora=False, num_active_loras=0))": 1
+      },
+      "config_mode": "FULL_AND_PIECEWISE",
+      "capture_sizes": [
+        1,
+        2,
+        128,
+        256,
+        512,
+        768,
+        1024
+      ]
+    },
+    {
+      "mode": "full_piecewise",
+      "dispatch_counts": {
+        "PIECEWISE": 1467,
+        "FULL": 1553
+      },
+      "dispatch_shapes": {
+        "(<CUDAGraphMode.PIECEWISE: 1>, BatchDescriptor(num_tokens=768, num_reqs=None, uniform=False, has_lora=False, num_active_loras=0))": 20,
+        "(<CUDAGraphMode.FULL: 2>, BatchDescriptor(num_tokens=1, num_reqs=1, uniform=True, has_lora=False, num_active_loras=0))": 1553,
+        "(<CUDAGraphMode.PIECEWISE: 1>, BatchDescriptor(num_tokens=1024, num_reqs=None, uniform=False, has_lora=False, num_active_loras=0))": 708,
+        "(<CUDAGraphMode.PIECEWISE: 1>, BatchDescriptor(num_tokens=128, num_reqs=None, uniform=False, has_lora=False, num_active_loras=0))": 701,
+        "(<CUDAGraphMode.PIECEWISE: 1>, BatchDescriptor(num_tokens=512, num_reqs=None, uniform=False, has_lora=False, num_active_loras=0))": 37,
+        "(<CUDAGraphMode.PIECEWISE: 1>, BatchDescriptor(num_tokens=256, num_reqs=None, uniform=False, has_lora=False, num_active_loras=0))": 1
+      },
+      "config_mode": "FULL_AND_PIECEWISE",
+      "capture_sizes": [
+        1,
+        2,
+        128,
+        256,
+        512,
+        768,
+        1024
+      ]
+    },
+    {
+      "mode": "full_piecewise",
+      "dispatch_counts": {
+        "PIECEWISE": 1467,
+        "FULL": 1553
+      },
+      "dispatch_shapes": {
+        "(<CUDAGraphMode.PIECEWISE: 1>, BatchDescriptor(num_tokens=768, num_reqs=None, uniform=False, has_lora=False, num_active_loras=0))": 20,
+        "(<CUDAGraphMode.FULL: 2>, BatchDescriptor(num_tokens=1, num_reqs=1, uniform=True, has_lora=False, num_active_loras=0))": 1553,
+        "(<CUDAGraphMode.PIECEWISE: 1>, BatchDescriptor(num_tokens=1024, num_reqs=None, uniform=False, has_lora=False, num_active_loras=0))": 708,
+        "(<CUDAGraphMode.PIECEWISE: 1>, BatchDescriptor(num_tokens=128, num_reqs=None, uniform=False, has_lora=False, num_active_loras=0))": 701,
+        "(<CUDAGraphMode.PIECEWISE: 1>, BatchDescriptor(num_tokens=512, num_reqs=None, uniform=False, has_lora=False, num_active_loras=0))": 37,
+        "(<CUDAGraphMode.PIECEWISE: 1>, BatchDescriptor(num_tokens=256, num_reqs=None, uniform=False, has_lora=False, num_active_loras=0))": 1
+      },
+      "config_mode": "FULL_AND_PIECEWISE",
+      "capture_sizes": [
+        1,
+        2,
+        128,
+        256,
+        512,
+        768,
+        1024
+      ]
+    }
+  ]
+}

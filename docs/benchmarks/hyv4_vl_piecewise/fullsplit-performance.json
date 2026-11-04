@@ -1,0 +1,24 @@
+{
+  "items": 765,
+  "unique_encoded_images": 762,
+  "concurrency": 1,
+  "order": [
+    "full_piecewise",
+    "decode_only"
+  ],
+  "timing_includes": "client image decoding/RGB/PNG encoding, non-streaming HTTP and task scoring",
+  "modes": {
+    "full_piecewise": {
+      "wall_seconds": 764.928890834999,
+      "requests_per_second": 1.0000929617979566,
+      "median_request_seconds": 1.0245834770030342
+    },
+    "decode_only": {
+      "wall_seconds": 829.2714211220009,
+      "requests_per_second": 0.9224965198546913,
+      "median_request_seconds": 1.1179194830037886
+    }
+  },
+  "throughput_increase_percent": 8.411570154810777,
+  "median_latency_reduction_percent": 8.349081254936685
+}

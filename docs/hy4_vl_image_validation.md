@@ -1,5 +1,11 @@
 # HYV4VL image support (experimental)
 
+For current standalone server/client commands, see the
+[serving guide](hy4_vl_serving.md). Later graph-mode evaluations have their own
+scoped results in the [decode](hy4_vl_graph_performance.md) and
+[full/piecewise](hy4_vl_piecewise_performance.md) reports; this page records the
+initial eager validation.
+
 The v0.25.1 baseline at `70a25cd5a2b5fe26427aad1cfc4f85124d53dd5e`
 fails to load `Hy4-testing-Channel-FP8-w8a8`: its `hy_v4_vl` model type is
 unregistered. This change adds configuration/model registration, the checkpoint's

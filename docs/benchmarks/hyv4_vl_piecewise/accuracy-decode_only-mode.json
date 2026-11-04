@@ -1,0 +1,36 @@
+{
+  "results": [
+    {
+      "mode": "decode_only",
+      "runner": "GPUModelRunner"
+    },
+    {
+      "mode": "decode_only",
+      "runner": "GPUModelRunner"
+    },
+    {
+      "mode": "decode_only",
+      "runner": "GPUModelRunner"
+    },
+    {
+      "mode": "decode_only",
+      "runner": "GPUModelRunner"
+    },
+    {
+      "mode": "decode_only",
+      "runner": "GPUModelRunner"
+    },
+    {
+      "mode": "decode_only",
+      "runner": "GPUModelRunner"
+    },
+    {
+      "mode": "decode_only",
+      "runner": "GPUModelRunner"
+    },
+    {
+      "mode": "decode_only",
+      "runner": "GPUModelRunner"
+    }
+  ]
+}

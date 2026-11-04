@@ -1,0 +1,8 @@
+{
+  "items": 765,
+  "protocol": "across-process decode-only c1, same source kernels/data/prompts/scorer; distinct graph allocation/config controls",
+  "raw_changed": 0,
+  "previous_correct": 561,
+  "current_correct": 561,
+  "changes": []
+}

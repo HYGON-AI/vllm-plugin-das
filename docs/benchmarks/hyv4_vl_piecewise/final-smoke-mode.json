@@ -1,0 +1,36 @@
+{
+  "results": [
+    {
+      "mode": "full_piecewise",
+      "runner": "GPUModelRunner"
+    },
+    {
+      "mode": "full_piecewise",
+      "runner": "GPUModelRunner"
+    },
+    {
+      "mode": "full_piecewise",
+      "runner": "GPUModelRunner"
+    },
+    {
+      "mode": "full_piecewise",
+      "runner": "GPUModelRunner"
+    },
+    {
+      "mode": "full_piecewise",
+      "runner": "GPUModelRunner"
+    },
+    {
+      "mode": "full_piecewise",
+      "runner": "GPUModelRunner"
+    },
+    {
+      "mode": "full_piecewise",
+      "runner": "GPUModelRunner"
+    },
+    {
+      "mode": "full_piecewise",
+      "runner": "GPUModelRunner"
+    }
+  ]
+}

@@ -1,0 +1,19 @@
+{
+  "probe": "TP0 layer-1 gate/up GEMM only; fixed-K tile 128; alternate M/N tiles and warp counts",
+  "weights": "actual checkpoint first TP shard, all 256 experts",
+  "weights_scales_sha256": "6ef722edf8e669d0c84a55d68bb7af20b096cea4c559ed4a68a6c91ed500d870",
+  "inputs": "synthetic seeded BF16, native dynamic per-token FP8 quantization",
+  "routing": "synthetic top8, unique experts per token",
+  "timing": "CUDA-event median of five rounds, 64 kernel calls/round under graph replay",
+  "excluded": "activation/clamp, down projection, routing cost, expert alignment cost, TP reduction and HTTP",
+  "deployment_changed": false,
+  "environment": {
+    "VLLM_BATCH_INVARIANT": null,
+    "VLLM_TUNED_CONFIG_FOLDER": null,
+    "VLLM_ROCM_USE_AITER": null
+  },
+  "software": {
+    "torch": "2.11.0"
+  },
+  "device": "BW1101"
+}
