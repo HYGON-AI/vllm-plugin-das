@@ -145,7 +145,9 @@ def _require_hyv4_pcp_mtp_contract(vllm_config: object) -> None:
             and getattr(parallel, "data_parallel_size", None) == 1
             and getattr(parallel, "decode_context_parallel_size", None) == 1
             and getattr(getattr(parallel, "eplb_config", None),
-                        "num_redundant_experts", None) == 0
+                        "num_redundant_experts", None) in (
+                            (0, 16) if __import__("os").environ.get(
+                                "HY4_EXPERIMENTAL_STATIC_R16") == "1" else (0,))
         )
         if not static_pcp:
             raise ValueError("HYV4 PCP MTP does not support EPLB outside static W4A8 PCP16.")

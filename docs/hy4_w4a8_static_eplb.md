@@ -2,8 +2,8 @@
 
 This adds direct loading of a previously generated expert placement for HYV4
 compressed-tensors channel W4A8. It is a draft integration, not a validated
-end-to-end performance improvement. Dynamic expert transfers and redundant
-experts remain unsupported by this quantization method.
+end-to-end performance improvement. Dynamic expert transfers remain unsupported. The default path uses zero
+redundancy; an explicit experimental R16 opt-in is described below.
 
 ## Supported contract and core dependency
 
@@ -117,3 +117,44 @@ does not inherit the earlier deployment-combination speedup, and remains draft
 pending numerical-risk evaluation, core integration and matched real-routing
 performance measurement. The 32-case functional result does not establish
 general model-quality equivalence or production readiness.
+
+## Experimental R16 opt-in
+
+The guarded PP1/TP1/PCP16/DP1/DCP1/EP16 W4A8 HT route can opt into exactly
+16 redundant experts. There are still 256 logical experts; each main/MTP map
+row contains 272 physical slots, with 17 physical experts per rank. Counts
+other than zero or 16 remain unsupported. The existing zero-redundancy behavior
+is retained when the flag is unset or is not exactly `1`.
+
+```bash
+export HY4_EXPERIMENTAL_STATIC_R16=1
+# Append to the matching eager PCP16/native-MTP3 command:
+--enable-eplb \
+--eplb-config '{"expert_map_path":"/absolute/path/offline-r16-map.json","num_redundant_experts":16,"static_dispatch_policy":"nearest"}'
+```
+
+Use a version-2 plan with 77 `HYV4ForCausalLM` rows and one `HYV4MTP` row.
+Each physical-slot row must cover all 256 logical IDs; 16 slots are extra
+replicas. The existing loader validates the plan and loads duplicated physical
+weights/scales from logical checkpoint IDs. Model top-k and logical expert
+count are unchanged. Redundant routed-expert storage rises by approximately
+6.25%; actual peak memory also depends on workspaces and KV cache.
+
+This opt-in changes only the two capability predicates. Loader ownership,
+parameter names, static-map validation, core PCP eligibility and backend
+restrictions retain the existing implementation. The optional count-scratch
+optimization and Mooncake grouping reuse are separate patches. Performance
+observations from a combined deployment do not isolate R16's contribution.
+
+Portable checks of the actual source predicates can run without GPU imports:
+
+```bash
+python tests/runtime_patch/test_hyv4_static_r16.py
+```
+
+Native validation has checked all 16 ranks, main/MTP row bindings, replica
+counts, inverse maps, 17-expert registered tensor shapes and packed aliases.
+Prior selected natural-MTP coding cases passed, while complete output texts
+and some next-token distributions differed across placements. These results
+do not establish general model-quality equivalence. This remains experimental
+and draft pending broader correctness and isolated performance validation.

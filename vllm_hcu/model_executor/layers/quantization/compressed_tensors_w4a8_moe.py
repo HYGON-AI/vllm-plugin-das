@@ -109,7 +109,9 @@ class HcuCompressedTensorsW4A8Int8MoEMethod(
             and getattr(parallel, "_vllm_hcu_expert_map_path", None)
             and getattr(parallel, "tensor_parallel_size", None) == 1
             and getattr(getattr(parallel, "eplb_config", None),
-                        "num_redundant_experts", None) == 0
+                        "num_redundant_experts", None) in (
+                            (0, 16) if __import__("os").environ.get(
+                                "HY4_EXPERIMENTAL_STATIC_R16") == "1" else (0,))
             and getattr(moe_parallel, "all2all_backend", None)
                 == "deepep_high_throughput"
             and getattr(moe_parallel, "pcp_size", None) == 16
