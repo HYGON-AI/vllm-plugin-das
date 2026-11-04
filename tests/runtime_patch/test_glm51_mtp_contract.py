@@ -20,6 +20,7 @@ REPO = Path(__file__).resolve().parents[2]
 @pytest.fixture
 def mtp_module(monkeypatch: pytest.MonkeyPatch) -> ModuleType:
     """Load deepseek_mtp with only its HCU-owned dependencies stubbed."""
+    monkeypatch.setenv("VLLM_HCU_GLM_MTP_QUANT_PREFIX_FIX", "1")
 
     deepseek_v2 = ModuleType("vllm_hcu.models.deepseek_v2")
 
@@ -215,3 +216,262 @@ def test_mtp_lightly_cp_gathers_both_hidden_state_contracts(
 
     torch.testing.assert_close(logits_hidden, torch.tensor([[111.0], [11.0]]))
     torch.testing.assert_close(recycle_hidden, torch.tensor([[121.0], [21.0]]))
+
+
+def _glm_engine(quant_config, **kwargs):
+    return SimpleNamespace(
+        quant_config=quant_config,
+        model_config=SimpleNamespace(
+            hf_config=SimpleNamespace(model_type="glm_moe_dsa"),
+        ),
+        **kwargs,
+    )
+
+
+def _mixed_quant_config(target: str):
+    from vllm.model_executor.layers.quantization.compressed_tensors.compressed_tensors import (
+        CompressedTensorsConfig,
+    )
+
+    def scheme(bits, targets, quant_format):
+        return {
+            "targets": targets,
+            "format": quant_format,
+            "weights": {
+                "num_bits": bits, "type": "int", "strategy": "channel",
+                "symmetric": True, "dynamic": False, "group_size": -1,
+            },
+            "input_activations": {
+                "num_bits": 8, "type": "int", "strategy": "token",
+                "symmetric": True, "dynamic": True,
+            },
+        }
+
+    return CompressedTensorsConfig.from_config({
+        "quant_method": "compressed-tensors",
+        "quantization_status": "compressed",
+        "format": "pack-quantized",
+        "config_groups": {
+            "group_int4": scheme(4, [target], "pack-quantized"),
+            "group_int8": scheme(8, ["Linear"], "int-quantized"),
+        },
+        "ignore": [r"re:^model\.decoder\.self_attn\.kv_b_proj$"],
+    })
+
+
+@pytest.mark.parametrize("layer_idx", [78, 79])
+@pytest.mark.parametrize("target", [
+    r"re:^model\.decoder\.mlp\.experts\.\d+\.(?:gate_proj|up_proj|down_proj)$",
+    r"re:model\.decoder\.mlp\.experts\.\d+\.(?:gate_proj|up_proj|down_proj)$",
+    "model.decoder.mlp.experts.0.down_proj",
+])
+def test_mtp_decoder_quant_targets_select_int4_without_mutating_target_config(
+    mtp_module, layer_idx, target,
+):
+    qconfig = _mixed_quant_config(target)
+    original_targets = dict(qconfig.target_scheme_map)
+    original_ignore = list(qconfig.ignore)
+    engine = _glm_engine(qconfig, compilation_config=object())
+    prefix = f"model.layers.{layer_idx}"
+    linear = nn.Linear(8, 8, bias=False)
+    name = prefix + ".mlp.experts.0.down_proj"
+    assert qconfig.get_scheme_dict(linear, name)["weights"].num_bits == 8
+
+    adapted = mtp_module._mtp_quantization_config(engine, prefix)
+    scheme = adapted.quant_config.get_scheme_dict(linear, name)
+    assert scheme["weights"].num_bits == 4
+    assert scheme["input_activations"].num_bits == 8
+    assert scheme["input_activations"].dynamic
+    assert scheme["format"] == "pack-quantized"
+    assert adapted.quant_config.get_scheme_dict(
+        linear, prefix + ".self_attn.kv_b_proj",
+    ) is None
+    assert adapted.quant_config.get_scheme_dict(
+        linear, prefix + ".self_attn.q_b_proj",
+    )["weights"].num_bits == 8
+    assert adapted.quant_config.get_scheme_dict(
+        linear, "model.layers.77.mlp.experts.0.down_proj",
+    )["weights"].num_bits == 8
+    assert adapted is not engine
+    assert adapted.quant_config is not qconfig
+    assert adapted.compilation_config is engine.compilation_config
+    assert qconfig.target_scheme_map == original_targets
+    assert qconfig.ignore == original_ignore
+    assert qconfig.get_scheme_dict(linear, name)["weights"].num_bits == 8
+
+
+def test_mtp_explicit_actual_prefix_ignore_and_target_take_priority(mtp_module):
+    qconfig = _mixed_quant_config(r"re:^model\.decoder\.mlp\.experts\.0\.down_proj$")
+    actual = r"re:^model\.layers\.78\.mlp\.experts\.0\.down_proj$"
+    qconfig.target_scheme_map[actual] = qconfig.target_scheme_map["Linear"]
+    qconfig.ignore.append(r"re:^model\.layers\.78\.self_attn\.")
+    adapted = mtp_module._mtp_quantization_config(
+        _glm_engine(qconfig), "model.layers.78",
+    )
+    linear = nn.Linear(8, 8, bias=False)
+    assert adapted.quant_config.get_scheme_dict(
+        linear, "model.layers.78.mlp.experts.0.down_proj",
+    )["weights"].num_bits == 8
+    assert adapted.quant_config.get_scheme_dict(
+        linear, "model.layers.78.self_attn.q_b_proj",
+    ) is None
+
+
+@pytest.mark.parametrize("quant_config", [None, SimpleNamespace()])
+def test_non_compressed_tensors_mtp_config_is_unchanged(mtp_module, quant_config):
+    engine = _glm_engine(quant_config)
+    assert mtp_module._mtp_quantization_config(engine, "model.layers.78") is engine
+
+
+def test_legacy_mtp_quantization_ignore_remains_unchanged(mtp_module):
+    qconfig = _mixed_quant_config("Linear")
+    qconfig.ignore = [r"re:^model\.layers\.78(?:\..*)?$"]
+    engine = _glm_engine(qconfig)
+    assert mtp_module._mtp_quantization_config(engine, "model.layers.78") is engine
+    assert qconfig.get_scheme_dict(
+        nn.Linear(8, 8, bias=False), "model.layers.78.mlp.experts.0.down_proj",
+    ) is None
+
+
+@pytest.mark.parametrize("converted_draft", [False, True])
+def test_mtp_constructor_passes_private_quant_config_to_decoder(
+    mtp_module, monkeypatch, converted_draft,
+):
+    from copy import deepcopy
+    from transformers import PretrainedConfig
+    from vllm.config.speculative import SpeculativeConfig
+
+    qconfig = _mixed_quant_config(r"re:^model\.decoder\.mlp\.experts\.\d+\.down_proj$")
+    hf_config = PretrainedConfig(
+        hidden_size=8, rms_norm_eps=1e-6, num_hidden_layers=78,
+        num_nextn_predict_layers=1, architectures=["GlmMoeDsaForCausalLM"],
+    )
+    hf_config.model_type = "glm_moe_dsa"
+    target_config = SimpleNamespace(hf_config=hf_config)
+    draft_hf_config = deepcopy(hf_config)
+    if converted_draft:
+        draft_hf_config = SpeculativeConfig.hf_config_override(draft_hf_config)
+        assert draft_hf_config.model_type == "deepseek_mtp"
+    draft_config = SimpleNamespace(hf_config=draft_hf_config)
+    engine = _glm_engine(
+        qconfig,
+        speculative_config=SimpleNamespace(
+            target_model_config=target_config,
+            draft_model_config=draft_config,
+        ),
+    )
+    engine.model_config = draft_config if converted_draft else target_config
+    observed = {}
+
+    class Decoder(nn.Module):
+        def __init__(self, vllm_config, prefix, **kwargs):
+            super().__init__()
+            observed["config"] = vllm_config
+            observed["scheme"] = vllm_config.quant_config.get_scheme_dict(
+                nn.Linear(8, 8, bias=False), prefix + ".mlp.experts.0.down_proj",
+            )
+
+    monkeypatch.setattr(mtp_module, "DeepseekV2DecoderLayer", Decoder)
+    monkeypatch.setattr(mtp_module, "RMSNorm", lambda *args, **kwargs: nn.Identity())
+    monkeypatch.setattr(mtp_module, "SharedHead", lambda **kwargs: nn.Identity())
+    layer = mtp_module.DeepSeekMultiTokenPredictorLayer(engine, "model.layers.78")
+    assert isinstance(layer.mtp_block, Decoder)
+    assert observed["config"] is not engine
+    assert observed["scheme"]["weights"].num_bits == 4
+    assert engine.quant_config is qconfig
+
+
+@pytest.mark.parametrize("model_type", ["deepseek_v3", "deepseek_v32"])
+def test_converted_deepseek_draft_does_not_enable_glm_fix(mtp_module, model_type):
+    from copy import deepcopy
+    from transformers import PretrainedConfig
+    from vllm.config.speculative import SpeculativeConfig
+
+    target_hf = PretrainedConfig(
+        num_hidden_layers=78, num_nextn_predict_layers=1,
+        architectures=["DeepseekV3ForCausalLM"],
+    )
+    target_hf.model_type = model_type
+    draft_hf = SpeculativeConfig.hf_config_override(deepcopy(target_hf))
+    assert draft_hf.model_type == "deepseek_mtp"
+    qconfig = _mixed_quant_config(r"re:^model\.decoder\.mlp\.experts\.\d+\.down_proj$")
+    engine = _glm_engine(qconfig, speculative_config=SimpleNamespace(
+        target_model_config=SimpleNamespace(hf_config=target_hf),
+    ))
+    engine.model_config = SimpleNamespace(hf_config=draft_hf)
+    assert mtp_module._mtp_quantization_config(engine, "model.layers.78") is engine
+
+
+def test_eagle_loader_uses_original_target_for_glm_quant_aliases(mtp_module, monkeypatch):
+    from copy import deepcopy
+    from transformers import PretrainedConfig
+    from vllm.config.speculative import SpeculativeConfig
+    from vllm_hcu.patch.worker.framework_opt import patch_eagle_utils as eagle
+
+    target_hf = PretrainedConfig(
+        num_hidden_layers=78, num_nextn_predict_layers=1,
+        architectures=["GlmMoeDsaForCausalLM"],
+    )
+    target_hf.model_type = "glm_moe_dsa"
+    target_config = SimpleNamespace(hf_config=target_hf)
+    draft_hf = SpeculativeConfig.hf_config_override(deepcopy(target_hf))
+    draft_config = SimpleNamespace(hf_config=draft_hf)
+    qconfig = _mixed_quant_config(r"re:^model\.decoder\.mlp\.experts\.\d+\.down_proj$")
+    engine = _glm_engine(qconfig, speculative_config=SimpleNamespace(
+        target_model_config=target_config, draft_model_config=draft_config,
+    ), compilation_config=SimpleNamespace(static_forward_context={}, static_all_moe_layers=[]))
+    engine.model_config = target_config
+    result = object()
+
+    def load_eagle_model(target_model, vllm_config):
+        assert vllm_config.model_config is draft_config
+        assert vllm_config.model_config.hf_config.model_type == "deepseek_mtp"
+        adapted = mtp_module._mtp_quantization_config(vllm_config, "model.layers.78")
+        assert adapted is not vllm_config
+        assert adapted.quant_config.get_scheme_dict(
+            nn.Linear(8, 8, bias=False), "model.layers.78.mlp.experts.0.down_proj",
+        )["weights"].num_bits == 4
+        return result
+
+    def should_share(eagle, flag, draft, target):
+        return False
+
+    module = ModuleType(eagle.TARGET_MODULE)
+    module.load_eagle_model = load_eagle_model
+    module._should_share = should_share
+    monkeypatch.setattr(eagle, "get_hcu_config", lambda _: SimpleNamespace(enable_multi_layers_mtp=False))
+    eagle.apply_to_module(module)
+    assert module.load_eagle_model(object(), engine) is result
+    assert engine.model_config is target_config
+    assert engine.quant_config is qconfig
+
+
+@pytest.mark.parametrize("value", [None, "0", "false", "unexpected"])
+def test_mtp_prefix_fix_is_opt_in(mtp_module, monkeypatch, value):
+    if value is None:
+        monkeypatch.delenv("VLLM_HCU_GLM_MTP_QUANT_PREFIX_FIX", raising=False)
+    else:
+        monkeypatch.setenv("VLLM_HCU_GLM_MTP_QUANT_PREFIX_FIX", value)
+    qconfig = _mixed_quant_config(r"re:^model\.decoder\.mlp\.experts\.\d+\.down_proj$")
+    engine = _glm_engine(qconfig)
+    assert mtp_module._mtp_quantization_config(engine, "model.layers.78") is engine
+    assert qconfig.get_scheme_dict(
+        nn.Linear(8, 8, bias=False), "model.layers.78.mlp.experts.0.down_proj",
+    )["weights"].num_bits == 8
+
+
+@pytest.mark.parametrize("model_type", [
+    "deepseek_v2", "deepseek_v3", "deepseek_v32", "mimo_v2_flash",
+    "qwen3_moe", "glm4_moe", None,
+])
+def test_non_glm_dsa_model_keeps_original_config_even_with_opt_in(
+    mtp_module, model_type,
+):
+    qconfig = _mixed_quant_config(r"re:^model\.decoder\.mlp\.experts\.\d+\.down_proj$")
+    engine = _glm_engine(qconfig)
+    engine.model_config.hf_config.model_type = model_type
+    original_targets = dict(qconfig.target_scheme_map)
+    original_ignore = list(qconfig.ignore)
+    assert mtp_module._mtp_quantization_config(engine, "model.layers.78") is engine
+    assert qconfig.target_scheme_map == original_targets
+    assert qconfig.ignore == original_ignore

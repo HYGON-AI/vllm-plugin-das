@@ -142,5 +142,157 @@ def test_postload_preserves_scale_domain_and_releases_original_buffers(monkeypat
         assert getattr(layer,prefix+"_weight_packed") is getattr(layer,prefix+"_weight")
     assert method._hcu_ct_w4a8_loaded
     assert method.moe_quant_config is method._hcu_ct_w4a8_delegate.moe_quant_config
-    with pytest.raises(RuntimeError,match="only once"):
+    with pytest.raises(RuntimeError,match="fresh rank-3 packed INT32"):
         runtime._process_weights_after_loading(method,layer)
+
+
+@pytest.fixture
+def native_wna16(monkeypatch):
+    """Use the real CT loader; replace only accelerator backend selection."""
+    from vllm.model_executor.layers.quantization.compressed_tensors.compressed_tensors_moe import compressed_tensors_moe_wna16 as native
+    from vllm_hcu.patch.worker.op_opt import patch_compressed_tensors_moe_wna16 as wna16_patch
+
+    cls = native.CompressedTensorsWNA16MoEMethod
+    original = dict(vars(cls))
+    monkeypatch.setattr(
+        native, "select_wna16_moe_backend",
+        lambda **_: (native.WNA16MoEBackend.TRITON, None),
+    )
+    # Exercise the HCU channel-storage wrapper, including its real qzeros
+    # creation, without depending on process-global platform/environment flags.
+    monkeypatch.setattr(wna16_patch, "_aiter_requested", lambda _: True)
+    wna16_patch.apply_to_module(native)
+    try:
+        yield native
+    finally:
+        for name in set(vars(cls)) - set(original):
+            delattr(cls, name)
+        for name, value in original.items():
+            if name not in ("__dict__", "__weakref__"):
+                setattr(cls, name, value)
+
+
+def _native_layer(group_size, backend):
+    from compressed_tensors.quantization import QuantizationArgs
+
+    weight = QuantizationArgs(num_bits=4, type="int", symmetric=True,
+                              dynamic=False, strategy="channel", group_size=group_size)
+    activation = QuantizationArgs(num_bits=8, type="int", symmetric=True,
+                                  dynamic=True, strategy="token")
+    moe = SimpleNamespace(has_bias=False, activation="silu",
+                          is_act_and_mul=True, moe_backend=backend)
+    method = runtime.make_hcu_w4a8_method(weight, activation, moe, "experts")
+    layer = torch.nn.Module()
+    layer.moe_config = moe
+    layer.quant_method = method
+    method.create_weights(layer, 2, 32, 16, torch.bfloat16,
+                          intermediate_size_full=16)
+    return weight, method, layer
+
+
+@pytest.mark.parametrize("group_size", [None, -1])
+def test_channel_group_size_uses_real_wna16_storage(native_wna16, group_size):
+    weight, method, layer = _native_layer(group_size, "aiter")
+    assert weight.group_size == group_size  # caller's config remains untouched
+    assert method.weight_quant.group_size == method.group_size == -1
+    assert type(method) is native_wna16.CompressedTensorsWNA16MoEMethod
+    assert layer.w13_weight_packed.shape == (2, 4, 32)
+    assert layer.w2_weight_packed.shape == (2, 2, 32)
+    assert layer.w13_weight_scale.shape == layer.w2_weight_scale.shape == (2, 1, 32)
+    assert layer.w13_qzeros.shape == layer.w2_qzeros.shape == (2, 16, 1)
+    assert torch.all(layer.w13_qzeros == 0x88)
+    assert torch.all(layer.w2_qzeros == 0x88)
+
+
+@pytest.mark.parametrize("group_size", [None, -1])
+@pytest.mark.parametrize("layout", ["aiter", "native_fallback", "packed_triton"])
+def test_checkpoint_reloads_use_native_layerwise_lifecycle(
+    monkeypatch, native_wna16, group_size, layout,
+):
+    from compressed_tensors.compressors.pack_quantized.helpers import pack_to_int32
+    from vllm.model_executor.model_loader.reload.layerwise import (
+        record_metadata_for_reloading, initialize_layerwise_reload,
+        finalize_layerwise_reload,
+    )
+    from vllm_hcu.model_executor.layers.quantization import compressed_tensors_moe_runtime as kernels
+
+    # Run the real SlimQuant delegate's post-load and native CT loader on CPU.
+    # Accelerator stages use distinguishable layouts so reload must rebuild
+    # kernel storage from checkpoint data, rather than silently skip conversion.
+    prepares = []
+
+    def prepare(method, layer):
+        prepares.append(layout)
+        if layout == "native_fallback":
+            for prefix in ("w13", "w2"):
+                packed = getattr(layer, prefix + "_weight").view(torch.uint8)
+                high, low = packed >> 4, packed & 15
+                signed = torch.stack((high, low), dim=-1).flatten(-2).to(torch.int8)
+                signed = torch.where(signed >= 8, signed - 16, signed)
+                setattr(layer, prefix + "_weight", torch.nn.Parameter(signed, requires_grad=False))
+
+    monkeypatch.setattr(kernels, "prewarm_aiter_w4a8_moe",
+                        lambda *_: object() if layout == "aiter" else None)
+    monkeypatch.setattr(kernels, "install_aiter_moe_weight_layout",
+                        lambda layer, config, **_: prepare(None, layer))
+    monkeypatch.setattr(kernels, "install_aiter_moe_scale_layout", lambda *_, **__: None)
+    monkeypatch.setattr(kernels, "mark_aiter_moe_native_layout", lambda _: None)
+    monkeypatch.setattr(kernels, "prepare_vllm_w4a8_moe", prepare)
+    monkeypatch.setattr(kernels, "prepare_boltops_w4a8_moe", prepare)
+    _, method, layer = _native_layer(group_size, "triton" if layout == "packed_triton" else "aiter")
+    record_metadata_for_reloading(layer)
+    checkpoint = {name: torch.zeros_like(param) for name, param in layer.named_parameters()}
+    kernel_parameters = None
+
+    for generation in range(3):
+        generator = torch.Generator().manual_seed(100 + generation)
+        expected = {}
+        for prefix, shape in (("w13", (2, 32, 32)), ("w2", (2, 32, 16))):
+            q = torch.randint(-8, 8, shape, dtype=torch.int8, generator=generator)
+            scale = torch.rand(shape[0], shape[1], 1, generator=generator).to(torch.bfloat16)
+            checkpoint[prefix + "_weight_packed"] = pack_to_int32(q, 4).transpose(1, 2).contiguous()
+            checkpoint[prefix + "_weight_scale"] = scale.transpose(1, 2).contiguous()
+            expected[prefix] = (q, scale.float() / 16)
+
+        if generation:
+            # Same public helpers used by checkpoint-format reload_weights and
+            # weight-transfer updates. The quant_method instance is retained.
+            initialize_layerwise_reload(layer)
+        for name, tensor in checkpoint.items():
+            param = getattr(layer, name)
+            loader = getattr(param, "weight_loader", None)
+            if loader is None:
+                param.data.copy_(tensor)
+            else:
+                loader(param, tensor)
+        if generation:
+            finalize_layerwise_reload(layer, None)
+        else:
+            method.process_weights_after_loading(layer)
+            kernel_parameters = dict(layer.named_parameters(remove_duplicate=False))
+
+        assert layer.quant_method is method
+        assert method._hcu_ct_w4a8_loaded
+        assert len(prepares) == generation + 1
+        for prefix, (q, scale) in expected.items():
+            packed = getattr(layer, prefix + "_weight_packed")
+            assert packed is getattr(layer, prefix + "_weight")
+            assert packed is kernel_parameters[prefix + "_weight"]
+            expected_weight = q if layout == "native_fallback" else runtime.repack_ct_int4(
+                checkpoint[prefix + "_weight_packed"], transposed=True)
+            assert torch.equal(packed, expected_weight)
+            assert torch.equal(getattr(layer, prefix + "_weight_scale"), scale)
+
+
+def test_mixed_checkpoint_storage_fails_before_conversion():
+    layer = torch.nn.Module()
+    layer.w13_weight_packed = torch.nn.Parameter(torch.zeros(2, 4, 32, dtype=torch.int32), requires_grad=False)
+    layer.w2_weight_packed = torch.nn.Parameter(torch.zeros(2, 32, 8, dtype=torch.int8), requires_grad=False)
+    original = layer.w13_weight_packed
+    method = SimpleNamespace(_hcu_ct_w4a8_loaded=True)
+    with pytest.raises(RuntimeError, match="w2_weight_packed"):
+        runtime._process_weights_after_loading(method, layer)
+    assert layer.w13_weight_packed is original
+    assert not method._hcu_ct_w4a8_loaded
+    with pytest.raises(RuntimeError, match="requires completed weight post-load"):
+        runtime._apply(method, layer, None, None, None)

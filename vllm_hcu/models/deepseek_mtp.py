@@ -2,8 +2,10 @@
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 # SPDX-FileCopyrightText: Copyright (c) 2026 Hygon Information Technology Co., Ltd.
 # Modified by Hygon Information Technology Co., Ltd., 2026.
+import re
 import typing
 from collections.abc import Callable, Iterable
+from copy import copy
 
 import torch
 import torch.nn as nn
@@ -52,6 +54,68 @@ from .deepseek_v2 import (
 logger = init_logger(__name__)
 
 
+def _mtp_quantization_config(vllm_config: VllmConfig, prefix: str) -> VllmConfig:
+    """Alias canonical decoder targets to this HCU MTP layer's quant prefix."""
+    if not henvs.VLLM_HCU_GLM_MTP_QUANT_PREFIX_FIX:
+        return vllm_config
+    # Eagle replaces model_config with the converted draft config, whose type
+    # is deepseek_mtp for GLM DSA as well as DeepSeek. Identify the original
+    # target through SpeculativeConfig rather than widening the architecture
+    # gate to every model sharing that draft type.
+    speculative_config = getattr(vllm_config, "speculative_config", None)
+    model_config = getattr(speculative_config, "target_model_config", None)
+    if model_config is None:
+        model_config = getattr(vllm_config, "model_config", None)
+    hf_config = getattr(model_config, "hf_config", None)
+    if getattr(hf_config, "model_type", None) != "glm_moe_dsa":
+        return vllm_config
+    quant_config = vllm_config.quant_config
+    if quant_config is None:
+        return vllm_config
+    from vllm.model_executor.layers.quantization.compressed_tensors.compressed_tensors import (
+        CompressedTensorsConfig,
+    )
+
+    if not isinstance(quant_config, CompressedTensorsConfig):
+        return vllm_config
+
+    def alias(target: str) -> str | None:
+        if target.startswith("re:"):
+            expression = target[3:]
+            anchor = "^" if expression.startswith("^") else ""
+            source = anchor + re.escape("model.decoder")
+            if expression.startswith(source + r"\."):
+                return "re:" + anchor + re.escape(prefix) + expression[len(source):]
+        elif target.startswith("model.decoder."):
+            return prefix + target[len("model.decoder"):]
+        return None
+
+    targets = dict(quant_config.target_scheme_map)
+    ignore = list(quant_config.ignore)
+    for target, scheme in quant_config.target_scheme_map.items():
+        mapped = alias(target)
+        if mapped is not None:
+            targets.setdefault(mapped, scheme)
+    for target in quant_config.ignore:
+        mapped = alias(target)
+        if mapped is not None and mapped not in ignore:
+            ignore.append(mapped)
+    if targets == quant_config.target_scheme_map and ignore == quant_config.ignore:
+        return vllm_config
+
+    # Keep the target model and other MTP layers' quantization rules unchanged.
+    # copy(), unlike dataclasses.replace(), does not rerun engine validation.
+    mtp_quant_config = copy(quant_config)
+    mtp_quant_config.target_scheme_map = targets
+    mtp_quant_config.ignore = ignore
+    mtp_vllm_config = copy(vllm_config)
+    mtp_vllm_config.quant_config = mtp_quant_config
+    logger.info_once(
+        "Aliasing compressed-tensors MTP targets from model.decoder to %s", prefix
+    )
+    return mtp_vllm_config
+
+
 class SharedHead(nn.Module):
     def __init__(
         self,
@@ -78,6 +142,7 @@ class DeepSeekMultiTokenPredictorLayer(nn.Module):
 
         config = vllm_config.speculative_config.draft_model_config.hf_config
         self.config = config
+        vllm_config = _mtp_quantization_config(vllm_config, prefix)
         quant_config = vllm_config.quant_config
 
         self.enorm = RMSNorm(config.hidden_size, eps=config.rms_norm_eps)

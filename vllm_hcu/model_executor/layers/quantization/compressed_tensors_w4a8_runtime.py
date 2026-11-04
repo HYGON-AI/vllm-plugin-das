@@ -8,6 +8,7 @@ execution are adapted to the existing HCU dynamic per-token INT8 runtime.
 
 from __future__ import annotations
 
+from copy import copy
 from types import MethodType
 
 
@@ -75,10 +76,25 @@ def _create_weights(
 
 
 def _process_weights_after_loading(self, layer) -> None:
+    import torch
     from vllm.model_executor.utils import replace_parameter
 
-    if getattr(self, "_hcu_ct_w4a8_loaded", False):
-        raise RuntimeError("HCU CT W4A8 post-load conversion must run only once")
+    # Native checkpoint reload restores INT32 checkpoint Parameters without
+    # recreating this method. A lifetime flag would reject every later reload.
+    # Validate both projections before mutation: runtime INT8 aliases must never
+    # be repacked or have their scales divided by 16 a second time.
+    self._hcu_ct_w4a8_loaded = False
+    for prefix in ("w13", "w2"):
+        packed = getattr(layer, prefix + "_weight_packed", None)
+        if (
+            not isinstance(packed, torch.Tensor)
+            or packed.dtype != torch.int32
+            or packed.ndim != 3
+        ):
+            raise RuntimeError(
+                "HCU CT W4A8 post-load requires fresh rank-3 packed INT32 "
+                f"checkpoint weights: {prefix}_weight_packed"
+            )
     for prefix in ("w13", "w2"):
         packed = getattr(layer, prefix + "_weight_packed")
         converted = repack_ct_int4(packed, transposed=self.is_transposed)
@@ -147,6 +163,13 @@ def make_hcu_w4a8_method(weight_quant, input_quant, moe, layer_name=None):
     from vllm_hcu.model_executor.layers.quantization.slimquant_w4a8 import (
         SlimQuantW4A8Int8AiterMoEMethod,
     )
+
+    # Omitted channel group_size and -1 mean the same thing. Canonicalize a
+    # private descriptor before WNA16 construction without changing the config
+    # shared by other layers (native create_weights also normalizes this).
+    if getattr(weight_quant, "group_size", None) is None:
+        weight_quant = copy(weight_quant)
+        weight_quant.group_size = -1
 
     # Preserve the loader's exact class identity: RoutedExperts uses it to
     # transpose CT checkpoint tensors and provide intermediate_size_full.
