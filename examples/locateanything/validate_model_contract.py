@@ -1,4 +1,5 @@
 #!/usr/bin/env python3
+# Copyright (c) 2026 Hygon Information Technology Co., Ltd.
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright (c) 2026 Hygon Information Technology Co., Ltd.
 """CPU contract checks against checkpoint source, not a second adapter implementation.
@@ -33,7 +34,10 @@ def source_definition(path, name, namespace, class_name=None):
     code = ast.Module(body=[ast.ImportFrom(module="__future__", names=[ast.alias(name="annotations")], level=0), node], type_ignores=[])
     ast.fix_missing_locations(code)
     scope = dict(namespace)
-    exec(compile(code, str(path), "exec"), scope)
+    # Offline CLI oracle: only explicit, trusted local checkpoint/vLLM source.
+    # Executing the unchanged definition avoids validating a second rewrite.
+    # See docs/locateanything.md#validation-source-trust for the audited boundary.
+    exec(compile(code, str(path), "exec"), scope)  # nosemgrep: rules.hygon.python.dynamic-eval
     return scope[name]
 
 

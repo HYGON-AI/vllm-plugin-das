@@ -1,3 +1,4 @@
+# Copyright (c) 2026 Hygon Information Technology Co., Ltd.
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright (c) 2026 Hygon Information Technology Co., Ltd.
 """LocateAnything Fast: six temporary probes, independent real KV accounting.
@@ -133,6 +134,16 @@ class FastSampler(Sampler):
             folder = Path(teacher_root) / str(p.seed)
             manifest = json.loads((folder / 'manifest.json').read_text())
             self.fast_teachers[req_idx] = {'folder':folder,'manifest':manifest,'step':0}
+
+    def remove_fast_request_slot(self, req_idx):
+        """Release slot references on removal, including preemption."""
+        self.fast_generators.pop(req_idx, None)
+        self.fast_teachers.pop(req_idx, None)
+
+    def finish_fast_requests(self, req_ids):
+        """Release RNGs only on completion/abort, even after preemption."""
+        for req_id in req_ids:
+            self.fast_request_generators.pop(req_id, None)
 
     def __call__(self, logits, input_batch):
         batch = input_batch

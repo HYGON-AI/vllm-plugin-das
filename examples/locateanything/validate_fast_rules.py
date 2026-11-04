@@ -1,3 +1,4 @@
+# Copyright (c) 2026 Hygon Information Technology Co., Ltd.
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright (c) 2026 Hygon Information Technology Co., Ltd.
 """CPU oracle tests using the untouched checkpoint's own Python functions."""
@@ -13,7 +14,9 @@ tree = ast.parse((root/'core.py').read_text())
 nodes = [n for n in tree.body if isinstance(n, ast.Assign)
          or (isinstance(n, ast.FunctionDef) and n.name == 'select_blocks')]
 ns = {'torch':torch}
-exec(compile(ast.Module(body=nodes, type_ignores=[]), 'rules_only', 'exec'), ns)
+# Offline oracle over fixed package source, never HTTP/client input; see
+# docs/locateanything.md#validation-source-trust for this narrow exception.
+exec(compile(ast.Module(body=nodes, type_ignores=[]), 'rules_only', 'exec'), ns)  # nosemgrep: rules.hygon.python.dynamic-eval
 spec = importlib.util.spec_from_file_location('reference', '/workspace/LocateAnything/generate_utils.py')
 ref = importlib.util.module_from_spec(spec)
 spec.loader.exec_module(ref)

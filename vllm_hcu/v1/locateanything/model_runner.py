@@ -1,3 +1,6 @@
+# Copyright contributors to the vLLM project
+# Copyright (c) 2026 Hygon Information Technology Co., Ltd.
+# Modified by Hygon Information Technology Co., Ltd., 2026.
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 """
@@ -1013,6 +1016,8 @@ class GPUModelRunner(LoRAModelRunnerMixin):
         req_idx = self.req_states.remove_request(req_id)
         if req_idx is None:
             return False
+        if self.sampler is not None:
+            self.sampler.remove_fast_request_slot(req_idx)
         if self.pooling_runner is not None:
             self.pooling_runner.remove_request(req_idx)
         if self.pp_handler is not None:
@@ -1026,6 +1031,10 @@ class GPUModelRunner(LoRAModelRunnerMixin):
 
     def finish_requests(self, scheduler_output: SchedulerOutput) -> None:
         finished_req_ids = scheduler_output.finished_req_ids
+        if self.sampler is not None:
+            # Finished includes aborts; a previously preempted request may no
+            # longer have a slot, but still owns a persistent RNG to release.
+            self.sampler.finish_fast_requests(finished_req_ids)
         if self.pooling_runner is not None:
             # Preempted docs keep their query-use reservation until rescheduled.
             self.pooling_runner.on_requests_finished(finished_req_ids)

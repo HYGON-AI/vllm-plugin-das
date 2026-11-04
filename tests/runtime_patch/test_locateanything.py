@@ -1,3 +1,4 @@
+# Copyright (c) 2026 Hygon Information Technology Co., Ltd.
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright (c) 2026 Hygon Information Technology Co., Ltd.
 """Portable contracts for package-owned LocateAnything loading and isolation."""
@@ -5,6 +6,9 @@ from pathlib import Path
 import ast
 import importlib.util
 import hashlib
+import os
+import subprocess
+import sys
 
 import pytest
 
@@ -65,24 +69,25 @@ def test_source_drift_fails_before_registration(tmp_path, adapter):
         adapter.validate_fast_sources(contract, tmp_path)
 
 
-def test_fast_registration_is_reentrant(monkeypatch, adapter):
-    from vllm_hcu.patch.import_coordinator import ExactImportCoordinator
-    from vllm_hcu.patch.runtime_state import PatchRegistry
-    coordinator = ExactImportCoordinator(registry=PatchRegistry())
-    monkeypatch.setenv("VLLM_HCU_LOCATEANYTHING_MODE", "fast")
-    monkeypatch.setattr(adapter, "validate_fast_sources", lambda contract: None)
-    adapter.register_locateanything_exchanges(coordinator)
-    adapter.register_locateanything_exchanges(coordinator)
+def test_fast_registration_is_reentrant():
+    # The suite can already have imported the GPU runner. Cold registration is
+    # a startup contract: use a fresh interpreter and leave parent modules alone.
+    result = subprocess.run(
+        [sys.executable, str(ROOT / "tests/runtime_patch/fixtures/locateanything_cold_import.py")],
+        cwd=ROOT, env={**os.environ, "VLLM_PLUGINS": "__disabled__", "VLLM_HCU_LOCATEANYTHING_MODE": "slow",
+                       "PYTHONPATH": str(ROOT)},
+        capture_output=True, text=True, timeout=90,
+    )
+    assert result.returncode == 0, result.stdout + result.stderr
+    assert "cold registration, reentry and late-import rejection passed" in result.stdout
 
 
 def test_replacement_preserves_globals_and_exact_callback_name(monkeypatch, adapter):
     import sys
-    from types import ModuleType
     owner = "vllm_hcu.v1.locateanything.contract_fixture"
     canonical = "vllm.locateanything_contract_fixture"
-    module = ModuleType(owner)
+    module = load_file(owner, "tests/runtime_patch/fixtures/locateanything_globals.py")
     module.__file__ = "/installed/vllm_hcu/fixture.py"
-    exec("value = 1\ndef read_value(): return value", module.__dict__)
     monkeypatch.setitem(sys.modules, owner, module)
     factory = adapter._canonical_factory(canonical, owner)
     assert factory is adapter._canonical_factory(canonical, owner)

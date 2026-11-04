@@ -1,3 +1,4 @@
+# Copyright (c) 2026 Hygon Information Technology Co., Ltd.
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright (c) 2026 Hygon Information Technology Co., Ltd.
 import ast
@@ -26,7 +27,9 @@ tree=ast.parse((Path(importlib.util.find_spec('vllm_hcu').origin).parent/'v1/loc
 node=next(n for c in tree.body if isinstance(c,ast.ClassDef) for n in c.body
           if isinstance(n,ast.FunctionDef) and n.name=='_update_request_with_output')
 ns={'Request':Request,'RequestStatus':Status}
-exec(compile(ast.Module(body=[node],type_ignores=[]),'fast_stop','exec'),ns)
+# Offline oracle over fixed package source, never HTTP/client input; see
+# docs/locateanything.md#validation-source-trust for this narrow exception.
+exec(compile(ast.Module(body=[node],type_ignores=[]),'fast_stop','exec'),ns)  # nosemgrep: rules.hygon.python.dynamic-eval
 update=ns['_update_request_with_output']
 tested=0
 for budget in range(1,7):

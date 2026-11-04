@@ -49,6 +49,12 @@ for Slow/Fast. Do not enable Fast for other model families.
 The model names are `locateanything-native-slow` and `locateanything-native-fast`.
 Use one image and the original detection question with `/v1/chat/completions`.
 The original special-token output is interpreted by the official box parser.
+For this model, Chat in Slow/Fast and Completions in Slow preserve special tokens
+and disable spaces between them. Fast image requests use `/v1/chat/completions`;
+its Completions route returns HTTP 400 with that instruction. The adapter sets
+`skip_special_tokens=False` and `spaces_between_special_tokens=False`, including
+when a client sends `True`: BOX/REF markers and coordinate tokens are required
+output syntax. Other model families retain their normal API behavior.
 
 ## Ownership and execution
 
@@ -94,3 +100,28 @@ python3 -m pytest tests/runtime_patch/test_locateanything.py \
 Hardware validation must check actual graph dispatch, changing request batches,
 official prompt IDs, source/module origins, complete output records and official
 COCO scoring. Diagnostic teacher forcing is not an accuracy or performance run.
+
+### Validation source trust
+
+The standalone `validate_model_contract.py`, `validate_fast_rules.py` and
+`validate_fast_contract.py` scripts execute selected, unchanged AST definitions
+from local sources to compare the adapter with its reference implementation.
+They are offline developer tools, never imported by a serving endpoint. Their
+inputs are fixed package paths or the developer's explicit `--model-dir` and
+`--vllm-source` directories. Use only trusted, reviewed local source trees;
+these scripts are not a sandbox for untrusted checkpoints. The model-contract
+validator also loads checkpoint Python through the Transformers local-code
+interface, so its entire checkpoint directory must be trusted.
+
+The three inline `nosemgrep: rules.hygon.python.dynamic-eval` exceptions are
+limited to these oracle calls. They do not suppress dynamic execution in the
+production package or across directories. The ordinary unit tests import the
+CPU-only warmup geometry normally and use a real fixture module for the globals
+contract, with no `exec`. The cold-import regression runs in a child interpreter
+and checks reentry as well as rejection of already imported targets, independent
+of full-suite collection order.
+
+Fast owns request RNG state by request ID across preemption, and releases it on
+completion or abort, including cancellation while preempted. Slot-indexed RNG
+and diagnostic references are released whenever a slot is removed. Reusing a
+completed request ID creates a generator from the new request's seed.

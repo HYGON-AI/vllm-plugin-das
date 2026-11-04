@@ -127,3 +127,27 @@ Original SPDX/copyright notices are retained. Modifications implement
 LocateAnything six-position generation, masks, real KV accounting and API
 semantics. The exact source identities qualified for these implementations
 are recorded in the packaged `source_contract.json`.
+
+The HCU-specific modifications in those seven files are Copyright (c) 2026
+Hygon Information Technology Co., Ltd. Original vLLM SPDX declarations and
+attribution remain in each file; conventional Copyright lines are included as
+well for tooling that does not recognize `SPDX-FileCopyrightText`.
+
+### External LocateAnything checkpoint and reference assets
+
+The adapter implements LocateAnything preprocessing, prompt and block-generation
+behavior using native vLLM/PyTorch interfaces. The local checkpoint is an
+external input: the wheel does not bundle NVIDIA's original checkpoint Python
+files, weights or tokenizer assets. The offline validators read those files
+only from the developer's existing trusted checkpoint directory.
+
+Reference assets are the [LocateAnything-3B checkpoint](https://huggingface.co/nvidia/LocateAnything-3B),
+mirrored by [nv-community on ModelScope](https://modelscope.cn/models/nv-community/LocateAnything-3B),
+and the [NVIDIA Eagle Embodied project](https://github.com/NVlabs/Eagle/tree/main/Embodied).
+Their NVIDIA copyright notices and [model license](https://huggingface.co/nvidia/LocateAnything-3B/blob/main/LICENSE)
+remain applicable to those external assets. The checkpoint's published terms
+restrict use to academic/non-profit research and do not grant general commercial
+use. The repository's Apache-2.0 license for its own integration code does not
+relicense the checkpoint, its original reference scripts, or its third-party
+Qwen/MoonViT components. Keep the original notices with any separately obtained
+or redistributed model assets.

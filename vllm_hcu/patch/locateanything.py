@@ -1,3 +1,4 @@
+# Copyright (c) 2026 Hygon Information Technology Co., Ltd.
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright (c) 2026 Hygon Information Technology Co., Ltd.
 """Mode-gated, exact cold imports for LocateAnything Fast.
@@ -14,6 +15,7 @@ import json
 import os
 from pathlib import Path
 from functools import lru_cache
+from functools import wraps
 
 
 def locateanything_mode() -> str:
@@ -66,4 +68,57 @@ def register_locateanything_exchanges(coordinator) -> None:
             canonical,
             _canonical_factory(canonical, spec["module"]),
             targets=(canonical,),
+        )
+
+
+def _patch_detection_endpoint(module, class_name, method_name):
+    """Keep the checkpoint's output syntax for this model in both modes."""
+    from vllm_hcu.patch.platform.framework_opt._common import (
+        require_callable, require_class, require_signature_prefix,
+    )
+
+    target_name = f"{module.__name__}.{class_name}.{method_name}"
+    cls = require_class(module, class_name, target_name)
+    original = require_callable(cls, method_name, target_name)
+    if getattr(original, "_locateanything_detection_tokens", False):
+        return False
+    require_signature_prefix(original, target_name, ("self", "request", "raw_request"))
+
+    @wraps(original)
+    async def preserve_detection_tokens(self, request, *args, **kwargs):
+        if self.model_config.hf_config.model_type == "locateanything":
+            # BOX/REF and all coordinate tokens are special tokens. Dropping
+            # them destroys detections; these flags describe the model format,
+            # including when a client explicitly requests the generic defaults.
+            request = request.model_copy(update={
+                "skip_special_tokens": False,
+                "spaces_between_special_tokens": False,
+            })
+        return await original(self, request, *args, **kwargs)
+
+    preserve_detection_tokens._locateanything_detection_tokens = True
+    setattr(cls, method_name, preserve_detection_tokens)
+    return True
+
+
+def _patch_chat_detection_tokens(module):
+    return _patch_detection_endpoint(module, "OpenAIServingChat", "create_chat_completion")
+
+
+def _patch_completion_detection_tokens(module):
+    return _patch_detection_endpoint(module, "OpenAIServingCompletion", "create_completion")
+
+
+def register_locateanything_api_callbacks(coordinator):
+    # These callbacks wrap shared Slow or exchanged Fast endpoints, selected by
+    # the serving model's config, and leave other model families untouched.
+    for module, cls, method, callback in (
+        ("vllm.entrypoints.openai.chat_completion.serving", "OpenAIServingChat",
+         "create_chat_completion", _patch_chat_detection_tokens),
+        ("vllm.entrypoints.openai.completion.serving", "OpenAIServingCompletion",
+         "create_completion", _patch_completion_detection_tokens),
+    ):
+        coordinator.register_callback(
+            "locateanything.api." + method, module, callback,
+            targets=(f"{module}.{cls}.{method}",),
         )
