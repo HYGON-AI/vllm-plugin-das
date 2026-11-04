@@ -764,11 +764,6 @@ def _validate_phase1_kv_cache_config(
             "HCU Mooncake requires a positive number of physical kernel "
             "blocks per logical KV block."
         )
-    if kv_cache_config.has_mamba_layers:
-        raise NotImplementedError(
-            "HCU Mooncake phase-1 does not support Mamba/GDN hybrid cache "
-            "groups."
-        )
     if not kv_cache_config.kv_cache_groups:
         raise ValueError(
             "HCU Mooncake requires at least one KV cache group."
@@ -1320,6 +1315,7 @@ class MooncakeConnectorWorker:
         self.model_config = vllm_config.model_config
         self.cache_config = vllm_config.cache_config
         self.kv_cache_config = kv_cache_config
+        self._has_mamba = kv_cache_config.has_mamba_layers
         self.use_mla = self.model_config.use_mla
         # Capture device BEFORE TransferEngine init — MNNVL's NVLink allocator
         # may change the current CUDA device during engine.initialize().
@@ -1730,6 +1726,16 @@ class MooncakeConnectorWorker:
             if metadata_err is not None:
                 await reject_metadata(metadata_err)
                 return
+        if self._has_mamba and self.transfer_topo.tp_ratio(meta.remote_tp_size) != 1:
+            # The TP offset math below slices a page by head. A GDN page packs
+            # conv and SSM state, so slicing it would copy the wrong bytes
+            # without raising. Only equal P/D TP is supported for now.
+            await reject_metadata(
+                "Mooncake Mamba/GDN state transfer requires equal producer and "
+                f"consumer TP size; producer={self.tp_size}, "
+                f"consumer={meta.remote_tp_size}."
+            )
+            return
         local_regions = self._get_transfer_regions(
             self.kv_caches_base_addr,
             self.block_len_per_layer,
@@ -2323,10 +2329,23 @@ class MooncakeConnectorWorker:
                         raise ValueError(
                             "Mooncake KV page shape does not match its spec."
                         )
+            elif isinstance(layer_spec, MambaSpec):
+                # v0.28 gives a Mamba/GDN layer the same [B, H, N, C] byte view
+                # as attention: conv and SSM state are packed inside one page,
+                # and mamba blocks are never split into kernel blocks. One
+                # page is therefore one region whose payload is the whole page
+                # content (stride(0) may exceed it when page_size_padded is set).
+                kv_block_len = cache[0].numel() * cache.element_size()
+                if kv_block_len < layer_spec.state_content_size_bytes:
+                    raise ValueError(
+                        "Mooncake Mamba/GDN page is smaller than its state "
+                        f"content: layer={layer_name}, payload={kv_block_len}, "
+                        f"state={layer_spec.state_content_size_bytes}."
+                    )
             else:
                 raise NotImplementedError(
-                    "HCU Mooncake supports attention KV pages only; "
-                    f"layer={layer_name}, spec={type(layer_spec).__name__}."
+                    "HCU Mooncake supports attention and Mamba/GDN KV pages "
+                    f"only; layer={layer_name}, spec={type(layer_spec).__name__}."
                 )
             # Keep padded page strides separate from head payload lengths.
             # MLA copies its complete aligned page; sharded attention copies
