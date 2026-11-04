@@ -58,6 +58,7 @@ def test_dict_vllm_config_uses_canonical_storage_path() -> None:
                 "fused_qwen3_rms_rope": True,
                 "qwen4_exp_hc_sp": True,
                 "k3_sp_moe": False,
+                "glm53_kda_cp_head_shard": None,
                 "dp_int8_allgather": False,
                 "moe_backend": "auto",
                 "hcu_flash_attn_mode": None,
@@ -70,6 +71,29 @@ def test_dict_vllm_config_uses_canonical_storage_path() -> None:
         }
     }
     assert get_hcu_config(vllm_config) == normalized
+
+
+@pytest.mark.parametrize("head_shard", [None, False, True])
+@pytest.mark.parametrize("container_kind", ["dict", "object"])
+def test_glm53_kda_cp_head_shard_round_trips_through_sidecar(
+    head_shard: bool | None, container_kind: str
+) -> None:
+    vllm_config = (
+        {} if container_kind == "dict" else SimpleNamespace(additional_config={})
+    )
+    normalized = set_hcu_config(
+        vllm_config, {"glm53_kda_cp_head_shard": head_shard}
+    )
+    additional_config = (
+        vllm_config["additional_config"]
+        if isinstance(vllm_config, dict)
+        else vllm_config.additional_config
+    )
+
+    assert additional_config["hcu"]["glm53_kda_cp_head_shard"] is head_shard
+    restored = pickle.loads(pickle.dumps(vllm_config))
+    assert get_hcu_config(restored) == normalized
+    assert get_hcu_config(restored).glm53_kda_cp_head_shard is head_shard
 
 
 def test_gdn_prefill_backend_round_trips_through_sidecar() -> None:
