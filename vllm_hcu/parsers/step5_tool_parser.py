@@ -3,19 +3,33 @@
 """Step5 tool parser registered by the HCU runtime patch coordinator.
 
 Step5 answers with the same XML tool-call format as Step3.5, so extraction and
-streaming are inherited from ``Step3p5ToolParser`` unchanged. The two inherited
-behaviours that must differ are the required/named tool-choice dispatch flag and
-the generation-side request adjustment; see the class docstring.
+streaming are inherited from ``Step3p5ToolParser`` unchanged. The inherited
+behaviours that must differ are the required/named tool-choice dispatch flag,
+the generation-side request adjustment and the Responses API schemas; see the
+class docstring.
 """
 
 from __future__ import annotations
 
+from typing import TYPE_CHECKING
+
+from openai.types.responses import FunctionTool
+from openai.types.responses.response import ToolChoiceFunction
 from vllm.entrypoints.generate.base.protocol import (
     ExtractedToolCallInformation,
+    FunctionDefinition,
 )
-from vllm.entrypoints.openai.chat_completion.protocol import ChatCompletionRequest
+from vllm.entrypoints.openai.chat_completion.protocol import (
+    ChatCompletionNamedToolChoiceParam,
+    ChatCompletionRequest,
+    ChatCompletionToolsParam,
+)
 from vllm.logger import init_logger
+from vllm.tokenizers import TokenizerLike
 from vllm.tool_parsers.step3p5_tool_parser import Step3p5ToolParser
+
+if TYPE_CHECKING:
+    from vllm.entrypoints.openai.responses.protocol import ResponsesRequest
 
 logger = init_logger(__name__)
 
@@ -35,19 +49,60 @@ for _method_name in ("extract_tool_calls", "extract_tool_calls_streaming"):
         )
 
 
-def _named_tool_choice_function(request: ChatCompletionRequest) -> str | None:
-    """Function name pinned by a named tool choice, or None for the other modes."""
+def _named_tool_choice_function(
+    request: ChatCompletionRequest | ResponsesRequest,
+) -> str | None:
+    """Function name pinned by a named tool choice, or None for the other modes.
+
+    Chat Completions nests the name under ``function``; the Responses API puts
+    it on the choice itself. Mirrors ``DelegatingParser._get_function_name``.
+    """
     tool_choice = request.tool_choice
-    if tool_choice is None or isinstance(tool_choice, str):
-        return None
-    return tool_choice.function.name
+    if isinstance(tool_choice, ChatCompletionNamedToolChoiceParam):
+        return tool_choice.function.name
+    if isinstance(tool_choice, ToolChoiceFunction):
+        return tool_choice.name
+    return None
+
+
+def _chat_completion_tools(
+    tools: list[ChatCompletionToolsParam | FunctionTool] | None,
+) -> list[ChatCompletionToolsParam | FunctionTool]:
+    """Express Responses ``FunctionTool`` entries in the nested Chat shape.
+
+    ``ToolParser`` keeps both ``ChatCompletionToolsParam`` and Responses
+    ``FunctionTool`` objects, but the inherited XML parser locates parameter
+    types through ``tool.function.parameters``. A flat Responses tool carries
+    ``name``/``parameters`` on the tool itself, so without this mapping every
+    argument would be parsed as a string.
+    """
+    if not tools:
+        return []
+    normalized: list[ChatCompletionToolsParam | FunctionTool] = []
+    for tool in tools:
+        if isinstance(tool, FunctionTool):
+            normalized.append(
+                ChatCompletionToolsParam(
+                    type="function",
+                    function=FunctionDefinition(
+                        name=tool.name,
+                        description=tool.description,
+                        parameters=tool.parameters,
+                        strict=tool.strict,
+                        defer_loading=getattr(tool, "defer_loading", None),
+                    ),
+                )
+            )
+        else:
+            normalized.append(tool)
+    return normalized
 
 
 class Step5ToolParser(Step3p5ToolParser):
     """Tool parser for Step5.
 
     Step5 answers with the same XML tool-call format as Step3.5, so extraction is
-    inherited unchanged. Two inherited behaviours do have to change.
+    inherited unchanged. Three inherited behaviours do have to change.
 
     ``supports_required_and_named`` is False: the generic serving path reads a
     True value as "this model satisfies required/named tool choice through the
@@ -57,11 +112,24 @@ class Step5ToolParser(Step3p5ToolParser):
 
     ``adjust_request`` is overridden for the matching reason on the generation
     side; see the method.
+
+    ``__init__`` maps Responses ``FunctionTool`` entries onto the Chat
+    Completions shape the inherited XML parser reads; ``extract_tool_calls``
+    reads the named tool choice from either request schema.
     """
 
     supports_required_and_named = False
 
-    def adjust_request(self, request: ChatCompletionRequest) -> ChatCompletionRequest:
+    def __init__(
+        self,
+        tokenizer: TokenizerLike,
+        tools: list[ChatCompletionToolsParam | FunctionTool] | None = None,
+    ) -> None:
+        super().__init__(tokenizer, _chat_completion_tools(tools))
+
+    def adjust_request(
+        self, request: ChatCompletionRequest | ResponsesRequest
+    ) -> ChatCompletionRequest | ResponsesRequest:
         # ``ToolParser.adjust_request`` derives a JSON Schema from the tool
         # definitions for required and named tool choice and installs it as
         # ``structured_outputs``, i.e. guided decoding. That grammar holds the
@@ -74,7 +142,7 @@ class Step5ToolParser(Step3p5ToolParser):
         return request
 
     def extract_tool_calls(
-        self, model_output: str, request: ChatCompletionRequest
+        self, model_output: str, request: ChatCompletionRequest | ResponsesRequest
     ) -> ExtractedToolCallInformation:
         info = super().extract_tool_calls(model_output, request)
 
