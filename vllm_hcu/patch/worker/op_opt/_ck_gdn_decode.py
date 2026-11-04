@@ -2,12 +2,13 @@
 # SPDX-FileCopyrightText: Copyright (c) 2026 Hygon Information Technology Co., Ltd.
 """Non-speculative Qwen GDN decode through ``aiter.ck_gdn_decode``.
 
-CK has no state-pool index argument, so the recurrent states of the
-scheduled slots are gathered into a dense ``[N, HV, V, K]`` fp32 tensor, run
-through CK (``transpose_state=True`` matches the pool's ``[V, K]`` layout),
-and scattered back.  vLLM treats slot ids <= 0 as padding; those rows read
-and rewrite slot 0 unchanged, so the pool is never polluted.  Every
-operation is device-side (no boolean indexing, no host sync).
+The recurrent state pool ``[slots, HV, V, K]`` fp32 and the per-sequence slot
+ids go straight to CK (``initial_state_indices``; ``transpose_state=True``
+matches the pool's ``[V, K]`` layout).  The kernel reads and writes the pool in
+place using its ``stride(0)`` as slot stride, so there is no gather/scatter.
+vLLM treats slot ids <= 0 as padding; CK starts those rows from a zero state
+and does not write them back, so the pool is never polluted.  Every operation
+is device-side (no host sync).
 """
 
 from __future__ import annotations
@@ -38,12 +39,13 @@ def ck_decode_step(
             "GDN decode hcu-aiter-ck supports only K=V=128, got "
             f"K={q.shape[-1]} V={v.shape[-1]}"
         )
-    device = q.device
-    idx = state_indices[:num_seqs].to(torch.int64)
-    safe = torch.where(idx > 0, idx, torch.zeros_like(idx))
-    state = state_pool.index_select(0, safe).to(torch.float32).contiguous()
-    cu = torch.arange(num_seqs + 1, dtype=torch.int64, device=device)
-    out, new_state = kernel(
+    if state_pool.dtype != torch.float32:
+        raise RuntimeError(
+            "GDN decode hcu-aiter-ck needs an fp32 recurrent state pool, got "
+            f"{state_pool.dtype}"
+        )
+    cu = torch.arange(num_seqs + 1, dtype=torch.int64, device=q.device)
+    out, _ = kernel(
         q.contiguous(),
         k.contiguous(),
         v.contiguous(),
@@ -51,7 +53,8 @@ def ck_decode_step(
         torch.sigmoid(b.float()).contiguous(),
         a_log=A_log.float().contiguous(),
         dt_bias=dt_bias.contiguous(),
-        initial_state=state,
+        initial_state=state_pool,
+        initial_state_indices=state_indices[:num_seqs],
         cu_seqlens=cu,
         scale=float(scale),
         use_g=True,
@@ -62,8 +65,4 @@ def ck_decode_step(
         store_final_state=True,
         validate_varlen=False,
     )
-    # Padding rows (slot <= 0) keep whatever slot 0 held.
-    keep = (idx > 0).view(-1, 1, 1, 1)
-    new_state = torch.where(keep, new_state, state)
-    state_pool.index_copy_(0, safe, new_state.to(state_pool.dtype))
     return out

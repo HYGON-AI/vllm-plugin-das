@@ -5,8 +5,8 @@
 ``hcu-aiter-ck`` runs the whole GDN prefill (kkt/solve/recompute/fwd_h/fwd_o)
 as one ``aiter.ck_gdn_prefill`` call instead of the per-operator FLA pipeline,
 and GDN decode as ``aiter.ck_gdn_decode``.  The audited contract is the
-installed aiter 0.1.7 wheel (``aiter.ops.ck_gdn``), not the older 0.1.6 source
-snapshot.
+installed aiter 0.1.8 wheel (``aiter.ops.ck_gdn``, ga1a2bc or newer: decode
+takes ``initial_state_indices``), not the older 0.1.6/0.1.7 builds.
 """
 
 from __future__ import annotations
@@ -17,7 +17,7 @@ from collections.abc import Callable
 from ._common import PatchCompatibilityError, require_exact_signature
 
 _MODULE = "aiter.ops.ck_gdn"
-_AUDITED_VERSION = "0.1.7"
+_AUDITED_VERSION = "0.1.8"
 
 _PREFILL_POSITIONAL = (
     "q", "k", "v", "g", "beta", "workspace", "gk", "a_log", "dt_bias",
@@ -50,8 +50,8 @@ _PREFILL_DEFAULTS: dict[str, object] = {
 
 _DECODE_POSITIONAL = (
     "q", "k", "v", "g", "beta", "gk", "gv", "a_log", "dt_bias",
-    "initial_state", "cu_seqlens", "scale", "use_g", "use_gk", "use_gv",
-    "beta_headwise", "use_qk_l2norm", "use_exp2", "transpose_state",
+    "initial_state", "initial_state_indices", "cu_seqlens", "scale", "use_g",
+    "use_gk", "use_gv", "beta_headwise", "use_qk_l2norm", "use_exp2", "transpose_state",
     "gate_in_kernel", "has_dt_bias", "store_final_state", "validate_varlen",
 )
 _DECODE_DEFAULTS: dict[str, object] = {
@@ -60,6 +60,7 @@ _DECODE_DEFAULTS: dict[str, object] = {
     "a_log": None,
     "dt_bias": None,
     "initial_state": None,
+    "initial_state_indices": None,
     "cu_seqlens": None,
     "scale": None,
     "use_g": True,
