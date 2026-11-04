@@ -38,7 +38,7 @@ def warmup(runner, execute, sample):
     start.total_num_scheduled_tokens=sum(start.num_scheduled_tokens.values())
     assert start.total_num_scheduled_tokens <= runner.max_num_tokens
     start.num_common_prefix_blocks=[0]*len(specs)
-    if runner.kv_block_zeroer is not None:runner.kv_block_zeroer.warmup(runner.kv_cache_config)
+    if runner.kv_block_zeroer is not None:runner.kv_block_zeroer.warmup(runner.kv_cache_config.num_blocks)
     runner.kv_connector.set_disabled(True)
     records=[]
     schedule=start

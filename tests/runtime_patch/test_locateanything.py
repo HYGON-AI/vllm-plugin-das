@@ -111,10 +111,35 @@ def test_launch_graph_capacity_and_packaged_template(mode, sequences, last):
     assert "--no-enable-chunked-prefill" in cmd if mode == "fast" else "--no-enable-chunked-prefill" not in cmd
 
 
+def external_adapter_imports(source):
+    forbidden = {"fast_core", "fast_warmup", "request_contract", "teacher_compare", "locateanything_vllm_native"}
+    imports = []
+    for node in ast.walk(ast.parse(source)):
+        if isinstance(node, ast.ImportFrom) and node.level == 0 and node.module:
+            imports.append(node.module)
+        elif isinstance(node, ast.Import):
+            imports.extend(alias.name for alias in node.names)
+    return [name for name in imports if name.split(".")[0] in forbidden]
+
+
+@pytest.mark.parametrize("source", [
+    "import fast_core", "import fast_core as alias", "import os, fast_core.helpers as alias",
+    "from fast_core import value", "from fast_core.helpers import value",
+    "def nested():\n    import fast_warmup",
+])
+def test_external_dependency_guard_covers_absolute_import_forms(source):
+    assert external_adapter_imports(source)
+
+
+@pytest.mark.parametrize("source", [
+    "import os, vllm_hcu.v1.locateanything.fast_warmup",
+    "from .fast_warmup import warmup", "from vllm_hcu.v1.locateanything import fast_warmup",
+])
+def test_external_dependency_guard_allows_package_owned_imports(source):
+    assert not external_adapter_imports(source)
+
+
 def test_fast_imports_have_no_external_adapter_dependency():
     runtime = ROOT / "vllm_hcu/v1/locateanything"
-    forbidden = {"fast_core", "fast_warmup", "request_contract", "teacher_compare", "locateanything_vllm_native"}
     for p in runtime.glob("*.py"):
-        for node in ast.walk(ast.parse(p.read_text())):
-            if isinstance(node, ast.ImportFrom):
-                assert not node.module or node.module.split(".")[0] not in forbidden, (p,node.module)
+        assert not external_adapter_imports(p.read_text(encoding="utf-8")), p

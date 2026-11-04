@@ -12,7 +12,7 @@ def validate_request(request):
     }
     bad=[key for key,values in allowed.items() if getattr(request,key,None) not in values]
     for key in ('stop','stop_token_ids','logit_bias','bad_words','allowed_token_ids',
-                'structured_outputs','tools','guided_json','guided_regex','guided_grammar'):
+                'structured_outputs','tools','guided_json','guided_regex','guided_grammar','guided_choice'):
         if getattr(request,key,None):bad.append(key)
     fmt=getattr(request,'response_format',None)
     if fmt is not None and getattr(fmt,'type','text')!='text':bad.append('response_format')

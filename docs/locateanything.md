@@ -113,7 +113,10 @@ is rewritten. Slow and other model processes do not activate these exchanges.
 python3 tools/check_production_boundary.py --json
 python3 tools/check_patch_test_coverage.py --json
 python3 -m pytest tests/runtime_patch/test_locateanything.py \
-  tests/runtime_patch/test_locateanything_warmup_budget.py -q
+  tests/runtime_patch/test_locateanything_warmup_budget.py \
+  tests/runtime_patch/test_locateanything_limits_loading.py \
+  tests/runtime_patch/test_locateanything_scheduler_edges.py -q
+python3 examples/locateanything/validate_fast_rules.py --model-dir /path/to/trusted/checkpoint
 ```
 
 Hardware validation must check actual graph dispatch, changing request batches,
@@ -131,6 +134,18 @@ inputs are fixed package paths or the developer's explicit `--model-dir` and
 these scripts are not a sandbox for untrusted checkpoints. The model-contract
 validator also loads checkpoint Python through the Transformers local-code
 interface, so its entire checkpoint directory must be trusted.
+The Fast rules oracle resolves both `generate_utils.py` and
+`mask_sdpa_utils.py` from `--model-dir`, loads the mask reference once, and
+reports both reference SHA-256 digests for reproducibility. Missing reference
+files produce an explicit CLI error; no machine-specific source path is used.
+
+Fast scheduler admission validates the same logical prompt/output limits as
+Chat, including offline engine requests. Waiting multimodal requests stay
+queued if encoder or token budgets clip the full suffix plus six probes;
+sampling starts only once the complete query and required image encoding fit.
+Fast also rejects legacy `guided_choice` at the API boundary, consistently
+with other unsupported structured-output options, rather than silently
+ignoring a client's requested constraint.
 
 The three inline `nosemgrep: rules.hygon.python.dynamic-eval` exceptions are
 limited to these oracle calls. They do not suppress dynamic execution in the

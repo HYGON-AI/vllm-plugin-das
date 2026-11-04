@@ -75,7 +75,7 @@ from vllm.v1.spec_decode.dynamic.utils import build_dynamic_sd_schedule_lookup
 from vllm.v1.spec_decode.metrics import SpecDecodingStats
 from vllm.v1.structured_output import StructuredOutputGrammar, StructuredOutputManager
 from vllm.v1.utils import record_function_or_nullcontext
-from vllm_hcu.v1.locateanything.limits import logical_context_limit, reject_speculative_decoding
+from vllm_hcu.v1.locateanything.limits import context_error, logical_context_limit, reject_speculative_decoding
 
 logger = init_logger(__name__)
 
@@ -1047,6 +1047,7 @@ class Scheduler(SchedulerInterface):
                     # `request.num_prompt_tokens` to consider the resumed
                     # requests, which have output tokens.
                     num_new_tokens = request.num_tokens - num_computed_tokens + 6
+                    required_fast_tokens = num_new_tokens
 
                     # Pad new decode requests to uniform spec decoding size to
                     # preserve full cudagraph for this step.
@@ -1135,6 +1136,12 @@ class Scheduler(SchedulerInterface):
 
                     if num_new_tokens == 0:
                         # The request cannot be scheduled.
+                        break
+
+                    # Fast samples six probe rows only after the entire real
+                    # suffix is ready. Encoder/token caps must not turn this
+                    # into a partial prefill that is mistaken for generation.
+                    if num_new_tokens != required_fast_tokens:
                         break
 
                 # During async KV load, no forward pass is run yet.
@@ -2509,6 +2516,9 @@ class Scheduler(SchedulerInterface):
         return self.kv_cache_manager.usage
 
     def add_request(self, request: Request) -> None:
+        error = context_error(self.max_model_len, request.num_tokens, request.max_tokens)
+        if error is not None:
+            raise ValueError(error)
         existing = self.requests.get(request.request_id)
         if existing is not None:
             update = StreamingUpdate.from_request(request)
