@@ -160,8 +160,14 @@ def apply_to_module(module: ModuleType) -> bool:
             # for it instead of failing the whole model.
             if getattr(moe_config, "moe_backend", "auto") != "aiter":
                 raise
-            batched = moe_config.moe_parallel_config.use_batched_activation_format
-            backend = hcu_enum.BATCHED_TRITON if batched else hcu_enum.TRITON
+            # The DeepEP auto prepare/finalize path may expose a Standard
+            # activation format even when the parallel config advertises the
+            # batched dispatch capability. Selecting BatchedTritonExperts from
+            # that capability alone causes the upstream oracle to construct a
+            # batched expert without its required token/dispatcher arguments.
+            # Use the standard Triton expert for this unquantized fallback;
+            # its prepare/finalize contract is selected by the actual kernel.
+            backend = hcu_enum.TRITON
             # hcu_backend_to_kernel_cls, not the captured original: the original
             # compares against the module-global enum, which is hcu_enum now.
             experts = hcu_backend_to_kernel_cls(backend)[0]
