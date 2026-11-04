@@ -1,0 +1,17 @@
+{
+  "ranks": 8,
+  "graph_per_rank": {
+    "mode": "graph",
+    "dispatch_counts": {
+      "NONE": 1467,
+      "FULL": 1553
+    }
+  },
+  "eager_per_rank": {
+    "mode": "eager",
+    "dispatch_counts": {
+      "NONE": 3020
+    }
+  },
+  "pass": true
+}

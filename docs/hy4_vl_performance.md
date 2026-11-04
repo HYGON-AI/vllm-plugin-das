@@ -1,5 +1,9 @@
 # HYV4VL ViT and end-to-end performance (2026-11-05)
 
+For the later explicit decode-only graph configuration, full concurrency-1
+accuracy pair and performance controls, see the
+[graph follow-up](hy4_vl_graph_performance.md).
+
 This compares the working image implementation at `bd1545a` against the ViT and
 M-RoPE optimization at `edeb432`, using the same real
 `/module/Hy4-testing-Channel-FP8-w8a8` checkpoint. Checkpoint parameters, image

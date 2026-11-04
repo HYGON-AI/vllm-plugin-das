@@ -1,0 +1,52 @@
+{
+  "plugin_revision": "9eaf4d58e6e6ff4ca406fbd6b55db746ed1221e7",
+  "skills_revision": "371dee04ee30ed918b240823b2a12c139d1a67fa",
+  "model": "/module/Hy4-testing-Channel-FP8-w8a8",
+  "hardware": "8 x BW1101; TP8",
+  "packages": {
+    "torch": "2.11.0+dtk2604.2610161756.g18ae4f",
+    "vllm": "0.25.1+das185.dtk2604.torch2110.2608171710.g7b108a",
+    "transformers": "5.20.1",
+    "triton": "3.6.0+dtk2604.torch2110.2610171646.g46f0be"
+  },
+  "source_sha256": {
+    "vllm_hcu/models/hy_v4/vl.py": "e288f02f60213d29db02d1aac8443852b093e2634b69dc28a3d0c608857b7656",
+    "vllm_hcu/models/hy_v4/mrope.py": "57fea9ddb2feb8e80088a2cfc11b22627debbf54283e87c8374f62ae8ba0aba5"
+  },
+  "worker_extension_sha256": "0412e824eacd98c4fe959473230cc0687bb3c09360363eafa99de1a8e1c5eb0d",
+  "target": "another 50% request throughput relative to stage1 optimized, same c1/c2 workload",
+  "max_pixels": 1048576,
+  "precision": "existing channel FP8 LM / BF16 vision unchanged",
+  "prefix_cache": false,
+  "processor_cache_gb": 0,
+  "encoder_cache": "default LRU, reset before each timed suite sequence",
+  "graph_config": {
+    "mode": 0,
+    "cudagraph_mode": "FULL_DECODE_ONLY",
+    "cudagraph_capture_sizes": [
+      1,
+      2
+    ]
+  },
+  "environment": {
+    "VLLM_USE_BREAKABLE_CUDAGRAPH": "1",
+    "VLLM_WORKER_MULTIPROC_METHOD": "spawn"
+  },
+  "profiler_active_during_timings": false,
+  "formal_runs": {
+    "profiler_configured": false,
+    "order": [
+      "graph-accuracy-c1",
+      "eager-accuracy-c1",
+      "e2e-eager-control",
+      "e2e-graph-repeat"
+    ],
+    "same_loaded_weights": true,
+    "eager_control": "dispatcher valid_modes={NONE}; captured graph memory remains allocated",
+    "reset_between_runs": [
+      "GPU encoder embedding LRU",
+      "CPU MM processor cache"
+    ],
+    "production_defaults_changed": false
+  }
+}

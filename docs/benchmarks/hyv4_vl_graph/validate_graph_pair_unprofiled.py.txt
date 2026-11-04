@@ -1,0 +1,27 @@
+import base64,io,json,requests,subprocess,time
+from pathlib import Path
+import pyarrow.parquet as pq
+from PIL import Image
+r=Path('/root/hy4-perf-stage2');base='http://127.0.0.1:8010'
+for _ in range(900):
+ try:
+  if requests.get(base+'/health',timeout=2).status_code==200:break
+ except requests.RequestException:pass
+ time.sleep(2)
+else:raise RuntimeError('server failed to become ready')
+def rpc(method,*args):
+ reply=requests.post(base+'/collective_rpc',json={'method':method,'args':list(args),'timeout':120},timeout=150);reply.raise_for_status();return reply.json()
+def save(name,data):(r/name).write_text(json.dumps(data,indent=2))
+def reset():
+ for endpoint in ('reset_encoder_cache','reset_mm_cache'):
+  reply=requests.post(base+'/'+endpoint,timeout=60);reply.raise_for_status()
+for mode in ('graph','eager'):
+ save(mode+'-accuracy-runtime-mode.json',rpc('stage2_set_mode',mode));reset()
+ name=mode+'-accuracy-c1';print('START',name,flush=True)
+ cmd=['python','tools/hyv4_realworldqa_eval.py','--data-dir','/root/hy4-realworldqa/data/data','--output-dir',str(r/name),'--mcq-extractor','/root/hy4-realworldqa/reference/mcq_extract.py','--max-pixels','1048576','--concurrency','1']
+ with (r/(name+'.log')).open('w') as out:subprocess.run(cmd,stdout=out,stderr=subprocess.STDOUT,check=True)
+ save(mode+'-accuracy-dispatch.json',rpc('stage2_stats'));print('DONE',name,flush=True)
+# Same loaded weights, explicit eager runtime control, same timing sequence.
+save('eager-performance-mode.json',rpc('stage2_set_mode','eager'));reset();print('START eager timing',flush=True)
+with (r/'e2e-eager-control.log').open('w') as out:subprocess.run(['python','tools/hyv4_vl_perf.py','--data-dir','/root/hy4-realworldqa/data/data','--output-dir',str(r/'e2e-eager-control')],stdout=out,stderr=subprocess.STDOUT,check=True)
+save('eager-performance-dispatch.json',rpc('stage2_stats'));print('DONE eager timing',flush=True)

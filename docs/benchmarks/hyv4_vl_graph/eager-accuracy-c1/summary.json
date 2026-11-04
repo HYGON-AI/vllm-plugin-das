@@ -1,0 +1,50 @@
+{
+  "manifest": {
+    "plugin_revision": "9eaf4d58e6e6ff4ca406fbd6b55db746ed1221e7",
+    "evaluator_sha256": "1665cd7d5a9896479baf34b1558bdce66168fb69680bbd6203f468574f4a7fb0",
+    "dataset": "xai-org/RealworldQA",
+    "revision": "17e7f75e092e47169732462ea3cdfebe911105dd",
+    "dataset_sha256": {
+      "test-00000-of-00002.parquet": "2cf29e308a34e0255f23520796fc04445a01b8baab18686f1a4b3c3943f695b2",
+      "test-00001-of-00002.parquet": "dac5b9f7cfb947a4865ea3424abfbdb3449d09e0a0b911a787cdc930cefefdc0"
+    },
+    "scorer": "EvolvingLMMs-Lab/lmms-eval",
+    "scorer_revision": "7847ad8539889c87533b78c93e280ddfc117d16b",
+    "extractor_sha256": "1872cbec87a72ff20be299eef52ef5e0fbb6edf2a695d2a8d883067771bc9db5",
+    "model": "hy4-vl",
+    "temperature": 0,
+    "top_p": 1.0,
+    "seed": 0,
+    "max_tokens": 16,
+    "max_pixels": 1048576,
+    "reasoning_effort": "no_think",
+    "concurrency": 1,
+    "prompt": "original question verbatim; no added system or answer prompt"
+  },
+  "dataset_total": 765,
+  "completed": 765,
+  "complete": true,
+  "correct": 561,
+  "accuracy": 0.7333333333333333,
+  "wilson_95_percent_interval": [
+    0.7008875093207453,
+    0.7634474922640976
+  ],
+  "strict_correct": 546,
+  "http_errors": 0,
+  "truncated": 0,
+  "empty_answers": 0,
+  "median_request_seconds": 1.2911649099987699,
+  "groups": {
+    "multiple_choice": {
+      "correct": 343,
+      "total": 438,
+      "accuracy": 0.7831050228310502
+    },
+    "open_ended": {
+      "correct": 218,
+      "total": 327,
+      "accuracy": 0.6666666666666666
+    }
+  }
+}

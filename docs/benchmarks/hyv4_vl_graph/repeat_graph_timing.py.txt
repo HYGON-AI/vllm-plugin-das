@@ -1,0 +1,14 @@
+import requests,time,subprocess,json
+from pathlib import Path
+r=Path('/root/hy4-perf-stage2');url='http://127.0.0.1:8010'
+for _ in range(3600):
+ text=(r/'unprofiled-pair.log').read_text()
+ if 'DONE eager timing' in text:break
+ if 'Traceback' in text:raise RuntimeError(text)
+ time.sleep(2)
+else:raise RuntimeError('paired run did not finish')
+rp=requests.post(url+'/collective_rpc',json={'method':'stage2_set_mode','args':['graph'],'timeout':120},timeout=150);rp.raise_for_status();(r/'graph-repeat-mode.json').write_text(json.dumps(rp.json(),indent=2))
+for endpoint in ('reset_encoder_cache','reset_mm_cache'):
+ rp=requests.post(url+'/'+endpoint,timeout=60);rp.raise_for_status()
+with (r/'e2e-graph-repeat.log').open('w') as out:subprocess.run(['python','tools/hyv4_vl_perf.py','--data-dir','/root/hy4-realworldqa/data/data','--output-dir',str(r/'e2e-graph-repeat')],stdout=out,stderr=subprocess.STDOUT,check=True)
+rp=requests.post(url+'/collective_rpc',json={'method':'stage2_stats','args':[],'timeout':120},timeout=150);rp.raise_for_status();(r/'graph-repeat-dispatch.json').write_text(json.dumps(rp.json(),indent=2));print('DONE graph repeat timing',flush=True)

@@ -1,0 +1,60 @@
+{
+  "results": [
+    {
+      "mode": "graph",
+      "dispatch_counts": {
+        "NONE": 9,
+        "FULL": 84
+      }
+    },
+    {
+      "mode": "graph",
+      "dispatch_counts": {
+        "NONE": 9,
+        "FULL": 84
+      }
+    },
+    {
+      "mode": "graph",
+      "dispatch_counts": {
+        "NONE": 9,
+        "FULL": 84
+      }
+    },
+    {
+      "mode": "graph",
+      "dispatch_counts": {
+        "NONE": 9,
+        "FULL": 84
+      }
+    },
+    {
+      "mode": "graph",
+      "dispatch_counts": {
+        "NONE": 9,
+        "FULL": 84
+      }
+    },
+    {
+      "mode": "graph",
+      "dispatch_counts": {
+        "NONE": 9,
+        "FULL": 84
+      }
+    },
+    {
+      "mode": "graph",
+      "dispatch_counts": {
+        "NONE": 9,
+        "FULL": 84
+      }
+    },
+    {
+      "mode": "graph",
+      "dispatch_counts": {
+        "NONE": 9,
+        "FULL": 84
+      }
+    }
+  ]
+}

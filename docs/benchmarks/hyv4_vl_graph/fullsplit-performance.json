@@ -1,0 +1,24 @@
+{
+  "items": 765,
+  "unique_encoded_images": 762,
+  "concurrency": 1,
+  "timing_includes": "client image decode, RGB/PNG encoding, JSON/HTTP, server processing and scoring; non-streaming API",
+  "graph_first": true,
+  "encoder_cache": "default LRU reset before each full evaluation",
+  "modes": {
+    "eager": {
+      "wall_seconds": 969.8812487320101,
+      "requests_per_second": 0.7887563565128567,
+      "latency_p50_seconds": 1.2911649099987699,
+      "latency_p95_seconds": 1.4656462200073292
+    },
+    "graph": {
+      "wall_seconds": 834.5322100780031,
+      "requests_per_second": 0.9166812146513745,
+      "latency_p50_seconds": 1.1215284920035629,
+      "latency_p95_seconds": 1.278263970001717
+    }
+  },
+  "throughput_increase_percent": 16.218551785000113,
+  "latency_p50_reduction_percent": 13.138245678886108
+}

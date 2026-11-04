@@ -1,0 +1,50 @@
+[
+  {
+    "rank": "0",
+    "kernel_events": 14688,
+    "kernel_ms_sum": 575.37,
+    "nonzero_gpu": true
+  },
+  {
+    "rank": "1",
+    "kernel_events": 14608,
+    "kernel_ms_sum": 828.92,
+    "nonzero_gpu": true
+  },
+  {
+    "rank": "2",
+    "kernel_events": 14608,
+    "kernel_ms_sum": 833.23,
+    "nonzero_gpu": true
+  },
+  {
+    "rank": "3",
+    "kernel_events": 14608,
+    "kernel_ms_sum": 826.2,
+    "nonzero_gpu": true
+  },
+  {
+    "rank": "4",
+    "kernel_events": 14608,
+    "kernel_ms_sum": 816.3,
+    "nonzero_gpu": true
+  },
+  {
+    "rank": "5",
+    "kernel_events": 14608,
+    "kernel_ms_sum": 828.65,
+    "nonzero_gpu": true
+  },
+  {
+    "rank": "6",
+    "kernel_events": 14608,
+    "kernel_ms_sum": 822.89,
+    "nonzero_gpu": true
+  },
+  {
+    "rank": "7",
+    "kernel_events": 14608,
+    "kernel_ms_sum": 823.34,
+    "nonzero_gpu": true
+  }
+]

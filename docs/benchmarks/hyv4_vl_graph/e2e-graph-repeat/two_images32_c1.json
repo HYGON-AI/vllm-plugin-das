@@ -1,0 +1,62 @@
+[
+  {
+    "ttft_seconds": 1.123617186996853,
+    "latency_seconds": 3.3274763700028416,
+    "decode_seconds_per_token": 0.07107883590346788,
+    "usage": {
+      "prompt_tokens": 2039,
+      "total_tokens": 2071,
+      "completion_tokens": 32
+    },
+    "answer": "The first image depicts a daytime street scene under overcast, rainy conditions. The road is wet, reflecting the gray sky and surrounding elements. Multiple vehicles are visible",
+    "finish_reason": "length",
+    "index": 112,
+    "second_index": 507,
+    "reference": "A"
+  },
+  {
+    "ttft_seconds": 0.9279870400059735,
+    "latency_seconds": 2.9508072989992797,
+    "decode_seconds_per_token": 0.0652386864192874,
+    "usage": {
+      "prompt_tokens": 1585,
+      "total_tokens": 1617,
+      "completion_tokens": 32
+    },
+    "answer": "Image 1:\nThe first image shows two glass seasoning grinders placed side by side on a light-colored wooden cutting board or countertop. The gr",
+    "finish_reason": "length",
+    "index": 422,
+    "second_index": 204,
+    "reference": "B"
+  },
+  {
+    "ttft_seconds": 1.124187172987149,
+    "latency_seconds": 3.3298061629902804,
+    "decode_seconds_per_token": 0.07113457003264732,
+    "usage": {
+      "prompt_tokens": 2039,
+      "total_tokens": 2071,
+      "completion_tokens": 32
+    },
+    "answer": "Here is a detailed description of both images in their original order:\n\n**Image 1:**\nThe first image displays a daytime view of a street intersection in a",
+    "finish_reason": "length",
+    "index": 287,
+    "second_index": 719,
+    "reference": "No"
+  },
+  {
+    "ttft_seconds": 1.121000911007286,
+    "latency_seconds": 3.3261515220074216,
+    "decode_seconds_per_token": 0.07112048777391113,
+    "usage": {
+      "prompt_tokens": 2039,
+      "total_tokens": 2071,
+      "completion_tokens": 32
+    },
+    "answer": "Here is a detailed description of both images, in their original order:\n\n### Image 1\nThis is a street-level photograph taken from inside a vehicle, looking",
+    "finish_reason": "length",
+    "index": 478,
+    "second_index": 618,
+    "reference": "11"
+  }
+]

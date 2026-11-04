@@ -1,0 +1,36 @@
+{
+  "results": [
+    {
+      "mode": "graph",
+      "runner": "GPUModelRunner"
+    },
+    {
+      "mode": "graph",
+      "runner": "GPUModelRunner"
+    },
+    {
+      "mode": "graph",
+      "runner": "GPUModelRunner"
+    },
+    {
+      "mode": "graph",
+      "runner": "GPUModelRunner"
+    },
+    {
+      "mode": "graph",
+      "runner": "GPUModelRunner"
+    },
+    {
+      "mode": "graph",
+      "runner": "GPUModelRunner"
+    },
+    {
+      "mode": "graph",
+      "runner": "GPUModelRunner"
+    },
+    {
+      "mode": "graph",
+      "runner": "GPUModelRunner"
+    }
+  ]
+}

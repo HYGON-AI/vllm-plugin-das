@@ -1,0 +1,41 @@
+import json,shutil,statistics
+from pathlib import Path
+r=Path('/root/hy4-perf-stage2')
+load=lambda path:json.loads((r/path).read_text())
+base=load('eager-accuracy-c1/summary.json');head=load('graph-accuracy-c1/summary.json')
+assert base['complete'] and head['complete'] and base['completed']==head['completed']==765
+assert load('eager-accuracy-c1/manifest.json') == load('graph-accuracy-c1/manifest.json')
+bs={v['index']:v for v in map(json.loads,(r/'eager-accuracy-c1/results.jsonl').read_text().splitlines())};hs={v['index']:v for v in map(json.loads,(r/'graph-accuracy-c1/results.jsonl').read_text().splitlines())};assert bs.keys()==hs.keys()
+changes=[];rows=[]
+for i in sorted(bs):
+ a,b=bs[i],hs[i];assert a['image_sha256']==b['image_sha256'] and a['question']==b['question'] and a['answer']==b['answer']
+ row={'index':i,'question':a['question'],'reference':a['answer'],'image_sha256':a['image_sha256'],'eager_prediction':a['prediction'],'graph_prediction':b['prediction'],'eager_correct':a['correct'],'graph_correct':b['correct'],'eager_strict_correct':a['strict_correct'],'graph_strict_correct':b['strict_correct'],'eager_seconds':a['seconds'],'graph_seconds':b['seconds']};rows.append(row)
+ if a['prediction']!=b['prediction']:changes.append(row)
+result={'items':765,'protocol':'same loaded weights, c1, reset CPU/encoder caches, graph dispatch vs forced NONE; no profiler','eager_correct':base['correct'],'graph_correct':head['correct'],'eager_strict_correct':base['strict_correct'],'graph_strict_correct':head['strict_correct'],'raw_changed':len(changes),'gained':sum(not x['eager_correct'] and x['graph_correct'] for x in changes),'regressed':sum(x['eager_correct'] and not x['graph_correct'] for x in changes),'http_errors':{mode:s['http_errors'] for mode,s in [('eager',base),('graph',head)]},'empty':{mode:s['empty_answers'] for mode,s in [('eager',base),('graph',head)]},'truncated':{mode:s['truncated'] for mode,s in [('eager',base),('graph',head)]},'changes':changes}
+result['strict_acceptance_pass']=not changes and all(s[k]==0 for s in [base,head] for k in ['http_errors','empty_answers','truncated'])
+(r/'accuracy-comparison.json').write_text(json.dumps(result,ensure_ascii=False,indent=2))
+with (r/'paired-predictions.jsonl').open('w') as out:
+ for row in rows:out.write(json.dumps(row,ensure_ascii=False)+'\n')
+print(json.dumps(result,ensure_ascii=False,indent=2))
+
+# Validate actual runtime selection on all TP ranks, independently of output scores.
+graph_modes=load('graph-accuracy-dispatch.json')['results']
+eager_modes=load('eager-accuracy-dispatch.json')['results']
+assert len(graph_modes)==len(eager_modes)==8
+assert all(x['mode']=='graph' and x['dispatch_counts'].get('FULL',0)>0 and x['dispatch_counts'].get('NONE',0)>0 for x in graph_modes)
+assert all(x['mode']=='eager' and set(x['dispatch_counts'])=={'NONE'} for x in eager_modes)
+assert all(x==graph_modes[0] for x in graph_modes)
+assert all(x==eager_modes[0] for x in eager_modes)
+(r/'runtime-mode-validation.json').write_text(json.dumps({'ranks':8,'graph_per_rank':graph_modes[0], 'eager_per_rank':eager_modes[0], 'pass':True},indent=2)+'\n')
+
+fullsplit={'items':765,'unique_encoded_images':len({x['image_sha256'] for x in rows}), 'concurrency':1, 'timing_includes':'client image decode, RGB/PNG encoding, JSON/HTTP, server processing and scoring; non-streaming API', 'graph_first':True, 'encoder_cache':'default LRU reset before each full evaluation', 'modes':{}}
+for mode,data in [('eager',bs),('graph',hs)]:
+ values=sorted(x['seconds'] for x in data.values())
+ logrows=[json.loads(line) for line in (r/(mode+'-accuracy-c1.log')).read_text().splitlines() if line.startswith('{')]
+ assert logrows[-1]['completed']==765
+ wall=logrows[-1]['seconds']
+ fullsplit['modes'][mode]={'wall_seconds':wall,'requests_per_second':765/wall,'latency_p50_seconds':statistics.median(values),'latency_p95_seconds':values[round((len(values)-1)*.95)]}
+e,g=fullsplit['modes']['eager'],fullsplit['modes']['graph']
+fullsplit['throughput_increase_percent']=(g['requests_per_second']/e['requests_per_second']-1)*100
+fullsplit['latency_p50_reduction_percent']=(1-g['latency_p50_seconds']/e['latency_p50_seconds'])*100
+(r/'fullsplit-performance.json').write_text(json.dumps(fullsplit,indent=2)+'\n')

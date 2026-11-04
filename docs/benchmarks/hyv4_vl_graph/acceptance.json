@@ -1,0 +1,8 @@
+{
+  "realworldqa_c1_raw_prediction_check": true,
+  "all_timing_suite_raw_answers_identical": false,
+  "two_image_caption_raw_changed": 2,
+  "two_image_caption_requests": 4,
+  "production_default_promoted": false,
+  "decision": "Keep explicit decode graph configuration experimental: matched two-image caption raw predictions change; no general numerical-equivalence claim."
+}
