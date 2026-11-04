@@ -15,6 +15,12 @@ def build_command(mode: str, model: str, max_num_seqs: int, extra: list[str]) ->
         raise ValueError("max-num-seqs must be positive")
     if any(x == "--enforce-eager" or x.startswith("--enforce-eager=") for x in extra):
         raise ValueError("This LocateAnything launch profile requires graph execution")
+    if mode == "fast" and any(
+        x.split("=", 1)[0].replace("_", "-") == "--speculative-config"
+        or x.split("=", 1)[0].replace("_", "-").startswith("--speculative-config.")
+        for x in extra
+    ):
+        raise ValueError("LocateAnything Fast does not support --speculative-config")
     sizes = []; size = 1
     while size < max_num_seqs:
         sizes.append(size); size *= 2

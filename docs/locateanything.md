@@ -96,6 +96,10 @@ prompt lengths are bounded by the runner token budget; KV blocks cover each
 prompt's generation budget and six probe positions. This keeps the startup
 checks valid at capacities such as 128 and 256 without disabling assertions or
 decode graphs.
+The synthetic request count is also capped by actual KV blocks across all cache
+groups, reserving block 0. Fully using IDs through `num_blocks - 1` is valid.
+Fast rejects vLLM speculative decoding before scheduler/worker setup; its own
+six-position generation must not be combined with `--speculative-config`.
 
 The seven substantial Fast modules retain the original upstream vLLM license
 headers. They are qualified against the exact base files listed in the packaged

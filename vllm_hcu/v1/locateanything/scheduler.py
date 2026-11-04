@@ -75,7 +75,7 @@ from vllm.v1.spec_decode.dynamic.utils import build_dynamic_sd_schedule_lookup
 from vllm.v1.spec_decode.metrics import SpecDecodingStats
 from vllm.v1.structured_output import StructuredOutputGrammar, StructuredOutputManager
 from vllm.v1.utils import record_function_or_nullcontext
-from vllm_hcu.v1.locateanything.limits import logical_context_limit
+from vllm_hcu.v1.locateanything.limits import logical_context_limit, reject_speculative_decoding
 
 logger = init_logger(__name__)
 
@@ -92,6 +92,7 @@ class Scheduler(SchedulerInterface):
         include_finished_set: bool = False,
         log_stats: bool = False,
     ) -> None:
+        reject_speculative_decoding(vllm_config.speculative_config)
         if getattr(vllm_config.model_config.hf_config, "model_type", None) != "locateanything":
             raise ValueError("LocateAnything Fast mode is process-wide and requires a LocateAnything checkpoint")
         if vllm_config.scheduler_config.async_scheduling or vllm_config.scheduler_config.enable_chunked_prefill:

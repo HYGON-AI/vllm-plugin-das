@@ -7,6 +7,7 @@ import torch
 from vllm import SamplingParams
 from vllm.v1.core.sched.output import NewRequestData, CachedRequestData, SchedulerOutput
 from vllm_hcu.v1.locateanything.warmup_budget import warmup_prompts as _warmup_prompts
+from vllm_hcu.v1.locateanything.warmup_budget import warmup_request_plan
 from vllm_hcu.v1.locateanything.limits import logical_context_limit
 
 
@@ -16,7 +17,9 @@ def warmup(runner, execute, sample):
     specs=[g.kv_cache_spec for g in runner.kv_cache_config.kv_cache_groups]
     logical_limit=logical_context_limit(runner.model_config.max_model_len)
     prompts=_warmup_prompts(runner.max_num_reqs, runner.max_num_tokens, logical_limit)
-    n=len(prompts)
+    plan=warmup_request_plan(prompts,logical_limit,runner.kv_cache_config.num_blocks,specs,block_count)
+    prompts=[prompt for prompt,_,_ in plan]
+    n=len(plan)
     ids=[f'_locate_fast_warmup_{i}' for i in range(n)]
     next_block=1
     def allocate(size):
@@ -26,11 +29,11 @@ def warmup(runner, execute, sample):
     start=SchedulerOutput.make_empty()
     start.scheduled_new_reqs=[NewRequestData(
         req_id=rid,prompt_token_ids=prompt,mm_features=[],
-        sampling_params=SamplingParams(max_tokens=min(128,logical_limit-len(prompt)),temperature=.7,top_p=.9,repetition_penalty=1.1,seed=i),
-        pooling_params=None,block_ids=tuple(allocate(block_count(len(prompt)+min(128,logical_limit-len(prompt))+6,s)) for s in specs),
+        sampling_params=SamplingParams(max_tokens=budget,temperature=.7,top_p=.9,repetition_penalty=1.1,seed=i),
+        pooling_params=None,block_ids=tuple(allocate(count) for count in counts),
         num_computed_tokens=0,lora_request=None,prefill_token_ids=prompt)
-        for i,(rid,prompt) in enumerate(zip(ids,prompts))]
-    assert next_block < runner.kv_cache_config.num_blocks
+        for i,(rid,(prompt,budget,counts)) in enumerate(zip(ids,plan))]
+    assert next_block <= runner.kv_cache_config.num_blocks
     start.num_scheduled_tokens={rid:len(prompt)+6 for rid,prompt in zip(ids,prompts)}
     start.total_num_scheduled_tokens=sum(start.num_scheduled_tokens.values())
     assert start.total_num_scheduled_tokens <= runner.max_num_tokens
@@ -85,5 +88,8 @@ def warmup(runner, execute, sample):
         runner.kv_connector.set_disabled(False)
         torch.cuda.synchronize()
     print('LOCATE_FAST_KV_WARMUP '+json.dumps({'passed':True,'capacity':runner.max_num_reqs,
+        'warmup_requests':n,'kv_blocks_available':runner.kv_cache_config.num_blocks-1,
+        'kv_blocks_reserved':next_block-1,
+        'kv_block_sizes':[s.block_size for s in specs],
         'token_budget':runner.max_num_tokens,'prefill_tokens':start.total_num_scheduled_tokens,
         'max_prompt_length':max(map(len,prompts)),'steps':records}),flush=True)

@@ -179,3 +179,85 @@ def test_processing_info_fallback_keeps_model_revision_and_auth(monkeypatch):
     info=processing_info({},token)
     info.get_hf_processor()
     assert seen == [('private/model',dict(revision='pinned-revision',token=token))]
+
+
+def real_block_counter():
+    from vllm_hcu.v1.locateanything.warmup import _reserved_block_count
+    def count(tokens, spec):
+        return _reserved_block_count(tokens, spec, num_lookahead_tokens=0,
+                                     max_model_len=4096, max_encoder_len=0)
+    return count
+
+
+@pytest.mark.parametrize('block_sizes', [(16,),(16,32),(32,64)])
+def test_warmup_plan_fits_exact_last_valid_block_and_all_groups(block_sizes):
+    from vllm_hcu.v1.locateanything.warmup_budget import warmup_request_plan
+    prompts=warmup_prompts(64,32768,4090)
+    specs=[SimpleNamespace(block_size=size) for size in block_sizes]
+    count=real_block_counter()
+    first_two=sum(count(len(p)+134,s) for p in prompts[:2] for s in specs)
+    plan=warmup_request_plan(prompts,4090,first_two+1,specs,count)
+    assert len(plan)==2 and [p for p,_,_ in plan]==prompts[:2]
+    ids=[];next_block=1
+    for _,_,counts in plan:
+        assert len(counts)==len(specs)
+        for size in counts:
+            ids.extend(range(next_block,next_block+size));next_block+=size
+    assert min(ids)==1 and max(ids)==first_two and len(ids)==len(set(ids))
+    assert next_block==first_two+1  # Last valid ID = num_blocks - 1.
+
+
+def test_warmup_64_slots_is_reduced_for_295_block_pool():
+    from vllm_hcu.v1.locateanything.warmup_budget import warmup_request_plan
+    prompts=warmup_prompts(64,32768,4090)
+    plan=warmup_request_plan(prompts,4090,295,[SimpleNamespace(block_size=16)],real_block_counter())
+    assert len(plan)==28 and sum(sum(counts) for _,_,counts in plan)==294
+
+
+@pytest.mark.parametrize('blocks',[0,1,5])
+def test_warmup_too_small_for_one_request_has_clear_error(blocks):
+    from vllm_hcu.v1.locateanything.warmup_budget import warmup_request_plan
+    with pytest.raises(ValueError,match='insufficient KV blocks'):
+        warmup_request_plan(warmup_prompts(64,32768,4090),4090,blocks,
+                            [SimpleNamespace(block_size=16)],real_block_counter())
+
+
+@pytest.mark.parametrize('capacity',[16,128,256])
+def test_abundant_kv_keeps_original_synthetic_requests(capacity):
+    from vllm_hcu.v1.locateanything.warmup_budget import warmup_request_plan
+    prompts=warmup_prompts(capacity,32768,16384)
+    plan=warmup_request_plan(prompts,16384,100000,[SimpleNamespace(block_size=16)],real_block_counter())
+    assert [p for p,_,_ in plan]==prompts
+    assert all(budget==128 for _,budget,_ in plan)
+    assert plan[0][2]==(10,)
+
+
+@pytest.mark.parametrize('spec',[{},False,SimpleNamespace(method='ngram'),SimpleNamespace(method='eagle')])
+def test_fast_rejects_nonnull_speculation_before_scheduler_and_worker_setup(monkeypatch,spec):
+    import torch
+    from vllm_hcu.v1.locateanything.scheduler import Scheduler
+    from vllm_hcu.v1.locateanything.model_runner import GPUModelRunner
+    def unexpected(*args,**kwargs):pytest.fail('A rejected config must not create a device stream')
+    monkeypatch.setattr(torch.cuda,'Stream',unexpected)
+    config=SimpleNamespace(speculative_config=spec)
+    with pytest.raises(ValueError,match='does not support vLLM speculative decoding'):
+        Scheduler(config,None,None,16)
+    with pytest.raises(ValueError,match='does not support vLLM speculative decoding'):
+        GPUModelRunner(config,torch.device('cpu'))
+
+
+def test_no_speculation_is_accepted_by_config_guard():
+    from vllm_hcu.v1.locateanything.limits import reject_speculative_decoding
+    assert reject_speculative_decoding(None) is None
+
+
+@pytest.mark.parametrize('extra',[
+    ['--speculative-config','{}'],['--speculative-config={}'],
+    ['--speculative_config','{}'],['--speculative-config.method','ngram'],
+    ['--speculative_config.method=ngram'],
+])
+def test_fast_cli_rejects_speculative_flags_and_slow_retains_them(extra):
+    from vllm_hcu.models.locateanything.serve import build_command
+    with pytest.raises(ValueError,match='does not support --speculative-config'):
+        build_command('fast','/model',16,extra)
+    assert build_command('slow','/model',16,extra)[-len(extra):]==extra
