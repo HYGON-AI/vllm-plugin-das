@@ -6,10 +6,16 @@
 from vllm import ModelRegistry
 
 from vllm_hcu.models.hy_v4.config import register_hy_v4_config
+from vllm_hcu.models.hy_v4.vl_config import register_hy_v4_vl_config
 
 
 def register_model():
     register_hy_v4_config()
+    register_hy_v4_vl_config()
+    ModelRegistry.register_model(
+        "HYV4VLForConditionalGeneration",
+        "vllm_hcu.models.hy_v4.vl:HYV4VLForConditionalGeneration",
+    )
 
     ModelRegistry.register_model(
         "KimiK3ForConditionalGeneration",

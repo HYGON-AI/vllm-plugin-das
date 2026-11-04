@@ -67,6 +67,16 @@ are retained in the corresponding local files.
 | `vllm_hcu/v1/hcu_model_runner.py` | vLLM project | `https://github.com/vllm-project/vllm.git` | branch `releases/v0.25.1`, tag `v0.25.1`, commit `752a3a504485790a2e8491cacbb35c137339ad34` | Copyright contributors to the vLLM project; Copyright (c) 2026 Hygon Information Technology Co., Ltd.; additional file-level notices retained where present | Apache-2.0 | HYGON contribution copyright and modification notice retained for substantive HCU/DAS runtime integration. |
 | `vllm_hcu/v1/worker.py` | vLLM project | `https://github.com/vllm-project/vllm.git` | branch `releases/v0.25.1`, tag `v0.25.1`, commit `752a3a504485790a2e8491cacbb35c137339ad34` | Copyright contributors to the vLLM project; Copyright (c) 2026 Hygon Information Technology Co., Ltd. | Apache-2.0 | Adapted from `vllm/v1/worker/gpu_worker.py` for HCU device initialization, memory handling, and HCU model-runner integration; upstream notices retained. |
 
+## HYV4VL image integration
+
+`vllm_hcu/models/hy_v4/vl.py` adapts the RMSNorm/Conv2d image projector and
+three-axis position contract from Tencent-Hunyuan/HY-Embodied,
+`Hy-Embodied-VLM-1.0/inference/vllm/hy_embodied_vllm/hunyuan_vision.py`,
+commit `711d267dff2c6811c81c108ad5e9c96dd829b5f0` (Apache-2.0; Copyright
+2025 The HunYuan team and the vLLM team). It reuses vLLM v0.25.1 Hunyuan vision
+blocks and preprocessing through imports. The language backbone and checkpoint
+accounting remain HCU HYV4 implementations.
+
 ## Additional Notes
 
 - `vllm_hcu/v1/attention/ops/prefill_mqa.py` adapts the contiguous request

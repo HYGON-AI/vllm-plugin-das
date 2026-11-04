@@ -1,0 +1,121 @@
+# SPDX-License-Identifier: Apache-2.0
+from types import SimpleNamespace
+
+import pytest
+import torch
+
+from vllm_hcu.models.hy_v4.vl import HYV4VisionMerger, HYV4VLForConditionalGeneration
+from vllm_hcu.models.hy_v4.vl_config import HYV4VLConfig
+
+
+@pytest.mark.parametrize(
+    "case,answer,expected",
+    [
+        ("red", "红色", True),
+        ("red", "蓝色", False),
+        ("blue", "blue", True),
+        ("count", "3", True),
+        ("count", "2", False),
+        ("ocr", "HY4 7285", True),
+        ("ocr", "HY4 7286", False),
+        ("multi", "第一张红色，第二张蓝色", True),
+        ("multi", "第一张蓝色，第二张红色", False),
+        ("red_repeat", "", False),
+    ],
+)
+def test_image_smoke_checks_answers(case, answer, expected):
+    from tools.hyv4_vl_image_smoke import check_answer
+
+    assert check_answer(case, answer) == expected
+
+
+def test_flat_config_round_trip():
+    config = HYV4VLConfig(
+        hidden_size=16, vision_config={"hidden_size": 8, "out_hidden_size": 16}
+    )
+    copy = HYV4VLConfig.from_dict(config.to_dict())
+    assert copy.model_type == "hy_v4_vl"
+    assert copy.hidden_size == 16
+    assert copy.vision_config.hidden_size == 8
+    assert copy.kv_lora_rank == 512
+
+
+def test_positions_two_rectangular_images_include_row_separators():
+    model = HYV4VLForConditionalGeneration.__new__(HYV4VLForConditionalGeneration)
+    torch.nn.Module.__init__(model)
+    model.config = SimpleNamespace(vision_config=SimpleNamespace(spatial_merge_size=2))
+
+    def feature(offset, h, w):
+        return SimpleNamespace(
+            mm_position=SimpleNamespace(offset=offset),
+            data={"image_grid_thw": SimpleNamespace(data=torch.tensor([1, h, w]))},
+        )
+
+    positions, delta = model.get_mrope_input_positions(
+        list(range(16)), [feature(2, 4, 4), feature(10, 2, 4)]
+    )
+    assert positions.tolist() == [
+        [0, 1, 2, 2, 2, 2, 2, 2, 5, 6, 7, 7, 7, 10, 11, 12],
+        [0, 1, 2, 2, 2, 3, 3, 3, 5, 6, 7, 7, 7, 10, 11, 12],
+        [0, 1, 2, 3, 4, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12],
+    ]
+    assert delta == -3
+
+
+def test_no_image_positions_are_sequential():
+    model = HYV4VLForConditionalGeneration.__new__(HYV4VLForConditionalGeneration)
+    positions, delta = model.get_mrope_input_positions([1, 2, 3], [])
+    assert torch.equal(positions, torch.arange(3).repeat(3, 1))
+    assert delta == 0
+
+
+def test_merger_inserts_checkpoint_newline_at_each_row():
+    config = SimpleNamespace(
+        hidden_size=2, out_hidden_size=8, rms_norm_eps=1e-5, spatial_merge_size=2
+    )
+    from vllm.config import VllmConfig, set_current_vllm_config
+
+    with set_current_vllm_config(VllmConfig()):
+        merger = HYV4VisionMerger(config)
+        merger.norm._forward_method = merger.norm.forward_native
+    with torch.no_grad():
+        merger.image_newline.copy_(torch.arange(8))
+    output = merger(torch.randn(1, 24, 2), size=(4, 6))
+    assert output.shape == (1, 8, 8)
+    torch.testing.assert_close(output[0, 3], torch.arange(8, dtype=output.dtype))
+    torch.testing.assert_close(output[0, 7], torch.arange(8, dtype=output.dtype))
+
+
+def test_multiaxis_rope_matches_interleaved_pair_rotation():
+    from vllm.config import VllmConfig, set_current_vllm_config
+    from vllm.model_executor.layers.rotary_embedding.mrope import MRotaryEmbedding
+
+    with set_current_vllm_config(VllmConfig()):
+        rope = MRotaryEmbedding(
+            64,
+            64,
+            32,
+            10000,
+            False,
+            torch.float32,
+            mrope_section=[12, 10, 10],
+            mrope_interleaved=True,
+        )
+    positions = torch.tensor([[1, 2], [3, 4], [5, 6]])
+    query = torch.randn(2, 2, 64)
+    key = torch.randn(2, 1, 64)
+    actual_q, actual_k = rope.forward_native(positions, query, key)
+    axes = torch.zeros(32, dtype=torch.long)
+    axes[1:30:3] = 1
+    axes[2:30:3] = 2
+    frequencies = 10000 ** (-torch.arange(0, 64, 2, dtype=torch.float32) / 64)
+    angles = positions[axes].T * frequencies
+
+    def rotate(x):
+        pairs = x.reshape(2, -1, 32, 2)
+        even, odd = pairs.unbind(-1)
+        c, s = angles.cos().unsqueeze(1), angles.sin().unsqueeze(1)
+        return torch.stack([even * c - odd * s, odd * c + even * s], -1).reshape_as(x)
+
+    torch.testing.assert_close(actual_q, rotate(query))
+    torch.testing.assert_close(actual_k, rotate(key))
