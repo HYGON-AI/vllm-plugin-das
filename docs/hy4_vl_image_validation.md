@@ -8,8 +8,9 @@ and interleaved three-axis position encoding. It retains the HYV4 language
 backbone and strict language/vision weight completeness checks.
 
 Images are supported by the adapter; video, precomputed image embeddings and
-speculative decoding are explicitly unsupported. End-to-end image generation
-has **not** been validated; this implementation remains experimental.
+speculative decoding are explicitly unsupported. End-to-end eager TP8 image generation passes the synthetic smoke checks below.
+The adapter remains experimental: reference-model accuracy parity, video and
+non-eager execution have not been validated.
 
 ## Validation
 
@@ -17,7 +18,7 @@ On 2026-11-04, using vLLM `0.25.1+das185`, PyTorch `2.11.0+dtk2604`,
 Transformers `5.20.1`, and eight BW1101 HCUs:
 
 - Baseline model loading reproduced the unknown `hy_v4_vl` error.
-- 114 tests passed across `test_vl.py`, `test_registration.py`,
+- 115 tests passed across `test_vl.py`, `test_registration.py`,
   `test_runtime_config.py`, and `test_weight_loading.py` in `tests/models/hy_v4/`.
 - Actual checkpoint/tokenizer preprocessing of a 384x256 image produced grid
   `[1,16,24]`, pixels `[384,768]`, and 104 image tokens (8 rows x 13 positions).
@@ -27,15 +28,41 @@ Transformers `5.20.1`, and eight BW1101 HCUs:
   forwarded red, blue, counting, OCR and photographic fixtures. Outputs were
   finite with shapes `[104,6144]`, `[104,6144]`, `[136,6144]`, `[136,6144]`,
   and `[260,6144]` respectively. This checks the encoder only, not answer accuracy.
-- The adapted TP8 server resolved `HYV4VLForConditionalGeneration`, then failed
-  the device memory check: approximately 11 GiB free of 143.98 GiB per HCU,
-  versus 129.59 GiB requested. Other workloads occupied all eight HCUs.
-  No image answers or accuracy pass rate are claimed.
+- Built the native extension with `MAX_JOBS=8 python setup.py build_ext --inplace`.
+- With idle HCUs, loaded all 246 checkpoint shards (738.74 GiB) in 422.57 seconds.
+  TP8 serving started successfully with the command below. Per-rank model
+  weights consumed approximately 95.78 GiB; the run used the channel FP8 linear
+  kernel and Triton FP8 MoE backend.
+- Fixed a serving-path processor defect: vLLM tokenizes cached multimodal
+  prompts without supplying images, so those placeholders must remain intact.
+  The new regression failed before the fix and passes after it.
+- All eight final HTTP requests returned 200 and finished with `stop`.
+  Seven constrained checks passed, including the text baseline:
 
-A previous default-backend attempt selected a DeepGEMM implementation that
-asserted `not quant_config.per_out_ch_quant`. Explicitly select a channel-capable
-backend for the next run; the command below requests Triton. This rerun still
-needs idle hardware and must pass loading, generation and answer checks.
+| Case | Expected | Actual | Result |
+| --- | --- | --- | --- |
+| Text | 2 | 2 | pass |
+| Red rectangle | red | 红色 | pass |
+| Blue rectangle | blue | 蓝色 | pass |
+| Three red circles | 3 | 3 | pass |
+| OCR | HY4 7285 | HY4 7285 | pass |
+| Two images | red, then blue | 第一张图片中的矩形是红色，第二张图片中的矩形是蓝色。 | pass |
+| Repeated red image | red | 红色 | pass |
+
+The initial OCR prompt allowed explanations: the answer read the text correctly
+but failed the client's exact-match rule. The final prompt explicitly requests
+only the original text; the exact-match rule was retained. No answer-checking
+threshold was relaxed.
+
+The optional photo produced a coherent description of pink cherry blossoms and a
+blue sky, but also named the landmark “广州塔”. That identity is not established
+by this evaluation and must not be counted as an accuracy pass. The photo case
+is manual review only (`correct: null`). Synthetic checks are not a general
+multimodal benchmark or a comparison with the reference checkpoint implementation.
+
+Earlier attempts with occupied hardware stopped at the memory check. A default
+MoE backend also selected DeepGEMM, which rejected per-channel quantization;
+explicit `--moe-backend triton` avoids that incompatibility for this checkpoint.
 
 ## Reproduction on idle hardware
 
@@ -44,7 +71,7 @@ From this checkout with the plugin dependencies installed:
 ```bash
 export PYTHONPATH="$PWD${PYTHONPATH:+:$PYTHONPATH}"
 export VLLM_WORKER_MULTIPROC_METHOD=spawn
-vllm serve /hy4_model/Hy4-testing-Channel-FP8-w8a8 \
+vllm serve /module/Hy4-testing-Channel-FP8-w8a8 \
   --served-model-name hy4-vl \
   --tensor-parallel-size 8 --moe-backend triton \
   --gpu-memory-utilization 0.90 --max-model-len 4096 \

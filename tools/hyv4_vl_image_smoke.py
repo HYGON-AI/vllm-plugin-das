@@ -61,7 +61,7 @@ def main():
         ("red", [root / "red.png"], "图中矩形是什么颜色？只回答颜色。"),
         ("blue", [root / "blue.png"], "图中矩形是什么颜色？只回答颜色。"),
         ("count", [root / "three_circles.png"], "图中有几个红色圆形？只回答数量。"),
-        ("ocr", [root / "ocr.png"], "请逐字读出图中的文字。"),
+        ("ocr", [root / "ocr.png"], "请读出图中的文字。只输出原文，不要解释。"),
         (
             "multi",
             [root / "red.png", root / "blue.png"],
@@ -70,7 +70,7 @@ def main():
         ("red_repeat", [root / "red.png"], "图中矩形是什么颜色？只回答颜色。"),
     ]
     if args.photo:
-        cases.append(("photo", [args.photo], "请描述这张图片。"))
+        cases.append(("photo", [args.photo], "请用一句话描述这张图片。"))
     results = []
     for name, paths, prompt in cases:
         content = []
