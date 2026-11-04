@@ -2,7 +2,7 @@ name: HCU v0.33 release contracts
 
 on:
   pull_request:
-    types: [opened, synchronize, reopened, ready_for_review]
+    types: [opened, synchronize, reopened, ready_for_review, labeled, unlabeled]
     branches: [v0.33.0]
   push:
     branches: [v0.33.0]
@@ -81,9 +81,44 @@ jobs:
           name: v033-source-contract
           path: v033-source.xml
 
-  resolve-device-image:
+  authorize-device:
     needs: select
     if: needs.select.outputs.has_jobs == 'true'
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      issues: read
+    outputs:
+      authorized: ${{ steps.pr-authorization.outputs.authorized || steps.release-authorization.outputs.authorized }}
+    steps:
+      - name: Checkout trusted PR authorization helper
+        if: github.event_name == 'pull_request'
+        uses: actions/checkout@v4
+        with:
+          ref: ${{ github.event.pull_request.base.sha }}
+          persist-credentials: false
+      - name: Reuse existing HCU author and ready-hcu checks
+        if: github.event_name == 'pull_request'
+        id: pr-authorization
+        env:
+          GITHUB_TOKEN: ${{ github.token }}
+        run: python -I -B .github/scripts/hcu_ci/check_hcu_ci_authorization.py
+      - name: Authorize release push or manual run
+        if: github.event_name != 'pull_request'
+        id: release-authorization
+        env:
+          EVENT_NAME: ${{ github.event_name }}
+          RELEASE_REF: ${{ github.ref }}
+        run: |
+          if [[ "$RELEASE_REF" != refs/heads/v0.33.0 || ( "$EVENT_NAME" != push && "$EVENT_NAME" != workflow_dispatch ) ]]; then
+            echo 'Hardware execution requires a push or manual run on v0.33.0' >&2
+            exit 2
+          fi
+          echo 'authorized=true' >> "$GITHUB_OUTPUT"
+
+  resolve-device-image:
+    needs: [select, authorize-device]
+    if: needs.select.outputs.has_jobs == 'true' && needs.authorize-device.outputs.authorized == 'true'
     runs-on: ubuntu-latest
     outputs:
       image: ${{ steps.image.outputs.image }}
@@ -100,8 +135,8 @@ jobs:
           echo "image=$HCU_CI_IMAGE_V033" >> "$GITHUB_OUTPUT"
 
   v033-device-gfx936:
-    needs: [select, resolve-device-image]
-    if: needs.select.outputs.has_jobs == 'true'
+    needs: [select, authorize-device, resolve-device-image]
+    if: needs.select.outputs.has_jobs == 'true' && needs.authorize-device.outputs.authorized == 'true'
     runs-on: [self-hosted, ci, bw1000]
     timeout-minutes: 45
     container:
@@ -126,3 +161,29 @@ jobs:
           path: |
             v033-portable.xml
             v033-device.xml
+
+  v033-ci-gate:
+    if: always()
+    needs: [select, v033-source-contract, authorize-device, resolve-device-image, v033-device-gfx936]
+    runs-on: ubuntu-latest
+    env:
+      SELECT_RESULT: ${{ needs.select.result }}
+      HAS_JOBS: ${{ needs.select.outputs.has_jobs }}
+      SOURCE_RESULT: ${{ needs.v033-source-contract.result }}
+      AUTH_RESULT: ${{ needs.authorize-device.result }}
+      AUTHORIZED: ${{ needs.authorize-device.outputs.authorized }}
+      IMAGE_RESULT: ${{ needs.resolve-device-image.result }}
+      DEVICE_RESULT: ${{ needs.v033-device-gfx936.result }}
+    steps:
+      - name: Require each selected stage to pass
+        run: |
+          [[ "$SELECT_RESULT" == success ]] || exit 1
+          if [[ "$HAS_JOBS" == false ]]; then
+            exit 0
+          fi
+          [[ "$HAS_JOBS" == true && "$SOURCE_RESULT" == success ]] || exit 1
+          if [[ "$AUTH_RESULT" != success || "$AUTHORIZED" != true ]]; then
+            echo 'Selected HCU tests require a trusted author or trusted ready-hcu authorization' >&2
+            exit 1
+          fi
+          [[ "$IMAGE_RESULT" == success && "$DEVICE_RESULT" == success ]] || exit 1
