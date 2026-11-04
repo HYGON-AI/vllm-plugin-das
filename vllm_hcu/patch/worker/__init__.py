@@ -274,6 +274,7 @@ _OP_CALLBACKS: tuple[_CallbackSpec, ...] = (
     _CallbackSpec(_adapter("op_opt", "patch_kimi_k3_cpu_metadata")),
     _CallbackSpec(_adapter("op_opt", "patch_kimi_k3_eplb_model")),
     _CallbackSpec(_adapter("op_opt", "patch_kimi_k3_reference_paths")),
+    _CallbackSpec(_adapter("op_opt", "patch_kimi_k3_pp_aux")),
     _CallbackSpec(_adapter("op_opt", "patch_kimi_k3_mla_gate")),
     # Must be applied after reference_paths: it wraps the
     # forward_attn_residual that adapter installs and captures it as the
