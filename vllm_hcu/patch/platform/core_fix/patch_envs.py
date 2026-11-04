@@ -24,6 +24,8 @@ TARGET_MODULE = "vllm.envs"
 PATCH_ID = "platform.core_fix.envs"
 TARGETS = (
     "vllm.envs.environment_variables.VLLM_ROCM_USE_AITER_MOE",
+    "vllm.envs.environment_variables.VLLM_MULTI_STREAM_GEMM_TOKEN_THRESHOLD",
+    "vllm.envs.environment_variables.VLLM_DISABLE_SHARED_EXPERTS_STREAM",
 )
 _MARKER = "_vllm_hcu_envs_patch_applied"
 
@@ -40,16 +42,30 @@ def apply_to_module(module: ModuleType) -> bool:
         raise PatchCompatibilityError(
             "required HCU patch target vllm.envs.environment_variables must be a dict"
         )
-    old_aiter_getter = environment_variables.get("VLLM_ROCM_USE_AITER_MOE")
-    if not callable(old_aiter_getter):
-        raise PatchCompatibilityError(
-            "required HCU patch target "
-            "vllm.envs.environment_variables['VLLM_ROCM_USE_AITER_MOE'] is missing"
+    original_getters = {
+        name: environment_variables.get(name)
+        for name in (
+            "VLLM_ROCM_USE_AITER_MOE",
+            "VLLM_MULTI_STREAM_GEMM_TOKEN_THRESHOLD",
+            "VLLM_DISABLE_SHARED_EXPERTS_STREAM",
         )
+    }
+    for name, getter in original_getters.items():
+        if not callable(getter):
+            raise PatchCompatibilityError(
+                "required HCU patch target "
+                f"vllm.envs.environment_variables[{name!r}] is missing"
+            )
 
     environment_variables["VLLM_ROCM_USE_AITER_MOE"] = lambda: os.getenv(
         "VLLM_ROCM_USE_AITER_MOE", "False"
     ).lower() in ("true", "1")
+    environment_variables["VLLM_MULTI_STREAM_GEMM_TOKEN_THRESHOLD"] = lambda: int(
+        os.getenv("VLLM_MULTI_STREAM_GEMM_TOKEN_THRESHOLD", "0")
+    )
+    environment_variables["VLLM_DISABLE_SHARED_EXPERTS_STREAM"] = lambda: bool(
+        int(os.getenv("VLLM_DISABLE_SHARED_EXPERTS_STREAM", "1"))
+    )
     # vLLM can cache module-level environment reads.  Clear stale values so a
     # pre-plugin lookup cannot preserve the upstream True default.
     env_getattr = getattr(envs, "__getattr__", None)
@@ -57,13 +73,18 @@ def apply_to_module(module: ModuleType) -> bool:
     if callable(cache_clear):
         cache_clear()
 
-    setattr(envs, "_vllm_hcu_original_aiter_moe_getter", old_aiter_getter)
+    setattr(
+        envs,
+        "_vllm_hcu_original_aiter_moe_getter",
+        original_getters["VLLM_ROCM_USE_AITER_MOE"],
+    )
+    setattr(envs, "_vllm_hcu_original_environment_getters", original_getters)
     setattr(envs, _MARKER, True)
     return True
 
 
 def apply(module: ModuleType | None = None) -> bool:
-    """Disable AITER MoE by default until the user opts in."""
+    """Default AITER MoE and auxiliary stream overlap off on HCU."""
 
     envs = load_exact_module(TARGET_MODULE, module)
 

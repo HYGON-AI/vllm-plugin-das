@@ -11,6 +11,8 @@ from typing import Any
 
 import torch
 
+from vllm_hcu.platforms import envs as henvs
+
 from ._common import (
     PatchCompatibilityError,
     load_exact_module,
@@ -23,6 +25,7 @@ TARGET_MODULE = "vllm.models.deepseek_v41.attention"
 PATCH_ID = "worker.core_fix.deepseek_v41.compressor_weight_layout"
 TARGETS = (
     f"{TARGET_MODULE}.DeepseekV4Attention._run_parallel_input_projections",
+    f"{TARGET_MODULE}.DeepseekV4Attention.__init__",
 )
 _CLASS_MARKER = "_vllm_hcu_dsv41_compressor_layout_applied"
 _WRAPPER_MARKER = "_vllm_hcu_dsv41_compressor_layout_wrapper"
@@ -48,10 +51,27 @@ def apply_to_module(module: ModuleType) -> bool:
     require_exact_signature(original, TARGETS[0], positional=("self", "hidden_states"))
 
     if getattr(cls, _CLASS_MARKER, False):
-        current = vars(cls).get("_run_parallel_input_projections")
-        if not getattr(current, _WRAPPER_MARKER, False):
-            raise PatchCompatibilityError(f"required HCU patch marker for {TARGETS[0]} is stale")
+        for method_name in ("_run_parallel_input_projections", "__init__"):
+            if not getattr(vars(cls).get(method_name), _WRAPPER_MARKER, False):
+                raise PatchCompatibilityError(
+                    f"required HCU patch marker for {PATCH_ID} is stale"
+                )
         return False
+
+    original_init = require_callable(cls, "__init__", TARGETS[1])
+    require_exact_signature(
+        original_init,
+        TARGETS[1],
+        positional=(
+            "self", "vllm_config", "prefix", "topk_indices_buffer",
+            "aux_stream_list", "candidate_block_buffer",
+        ),
+        defaults={
+            "topk_indices_buffer": None,
+            "aux_stream_list": None,
+            "candidate_block_buffer": None,
+        },
+    )
 
     execute_in_parallel = require_callable(
         target, "execute_in_parallel", f"{TARGET_MODULE}.execute_in_parallel"
@@ -59,6 +79,22 @@ def apply_to_module(module: ModuleType) -> bool:
     envs = getattr(target, "envs", None)
     if envs is None:
         raise PatchCompatibilityError(f"required HCU patch target {TARGET_MODULE}.envs is missing")
+
+    @functools.wraps(original_init)
+    def hcu_init(
+        self,
+        vllm_config,
+        prefix,
+        topk_indices_buffer=None,
+        aux_stream_list=None,
+        candidate_block_buffer=None,
+    ):
+        if not henvs.VLLM_HCU_ENABLE_DEEPSEEK_V4_MULTI_STREAM:
+            aux_stream_list = None
+        original_init(
+            self, vllm_config, prefix, topk_indices_buffer,
+            aux_stream_list, candidate_block_buffer,
+        )
 
     @functools.wraps(original)
     def hcu_run_parallel_input_projections(self, hidden_states) -> tuple[Any, ...]:
@@ -97,6 +133,9 @@ def apply_to_module(module: ModuleType) -> bool:
         )
         return qr_kv, kv_score, indexer_weights
 
+    setattr(hcu_init, _WRAPPER_MARKER, True)
+    setattr(cls, "_vllm_hcu_original_attention_init", original_init)
+    setattr(cls, "__init__", hcu_init)
     setattr(hcu_run_parallel_input_projections, _WRAPPER_MARKER, True)
     setattr(cls, "_vllm_hcu_original_run_parallel_input_projections", original)
     setattr(cls, "_run_parallel_input_projections", hcu_run_parallel_input_projections)

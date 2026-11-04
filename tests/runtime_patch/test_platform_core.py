@@ -278,7 +278,7 @@ def test_engram_config_rejects_signature_and_source_contract_drift():
         patch_engram_config.apply(bad_helper)
 
 
-def test_envs_defaults_aiter_moe_off(monkeypatch: pytest.MonkeyPatch):
+def test_envs_defaults_aiter_moe_and_aux_streams_off(monkeypatch: pytest.MonkeyPatch):
     _clear_vllm_environment(monkeypatch)
 
     module = _module(
@@ -286,6 +286,8 @@ def test_envs_defaults_aiter_moe_off(monkeypatch: pytest.MonkeyPatch):
         environment_variables={
             "VLLM_KNOWN": lambda: "known",
             "VLLM_ROCM_USE_AITER_MOE": lambda: True,
+            "VLLM_MULTI_STREAM_GEMM_TOKEN_THRESHOLD": lambda: 1024,
+            "VLLM_DISABLE_SHARED_EXPERTS_STREAM": lambda: False,
         },
         logger=logging.getLogger("test.hcu.envs"),
     )
@@ -296,6 +298,15 @@ def test_envs_defaults_aiter_moe_off(monkeypatch: pytest.MonkeyPatch):
     assert getter() is False
     monkeypatch.setenv("VLLM_ROCM_USE_AITER_MOE", "1")
     assert getter() is True
+    threshold = module.environment_variables["VLLM_MULTI_STREAM_GEMM_TOKEN_THRESHOLD"]
+    shared_disabled = module.environment_variables["VLLM_DISABLE_SHARED_EXPERTS_STREAM"]
+    assert threshold() == 0
+    assert shared_disabled() is True
+    monkeypatch.setenv("VLLM_MULTI_STREAM_GEMM_TOKEN_THRESHOLD", "1024")
+    monkeypatch.setenv("VLLM_DISABLE_SHARED_EXPERTS_STREAM", "0")
+    assert threshold() == 1024
+    assert shared_disabled() is False
+    assert module.environment_variables["VLLM_KNOWN"]() == "known"
 
     record = PATCH_REGISTRY.get(patch_envs.PATCH_ID)
     assert record is not None and record.status is PatchStatus.APPLIED
@@ -330,13 +341,27 @@ def test_hcu_platform_validate_environ_allows_only_hcu_namespace(
     assert "VLLM_HCU" in caplog.text
 
 
-def test_envs_rejects_missing_aiter_moe_target():
+@pytest.mark.parametrize(
+    "missing",
+    [
+        "VLLM_ROCM_USE_AITER_MOE",
+        "VLLM_MULTI_STREAM_GEMM_TOKEN_THRESHOLD",
+        "VLLM_DISABLE_SHARED_EXPERTS_STREAM",
+    ],
+)
+def test_envs_rejects_missing_required_target(missing):
+    getters = {
+        "VLLM_ROCM_USE_AITER_MOE": lambda: True,
+        "VLLM_MULTI_STREAM_GEMM_TOKEN_THRESHOLD": lambda: 1024,
+        "VLLM_DISABLE_SHARED_EXPERTS_STREAM": lambda: False,
+    }
+    getters.pop(missing)
     module = _module(
         patch_envs.TARGET_MODULE,
-        environment_variables={},
+        environment_variables=getters,
         logger=logging.getLogger("test.hcu.bad_envs"),
     )
-    with pytest.raises(PatchCompatibilityError, match="VLLM_ROCM_USE_AITER_MOE"):
+    with pytest.raises(PatchCompatibilityError, match=missing):
         patch_envs.apply(module)
     record = PATCH_REGISTRY.get(patch_envs.PATCH_ID)
     assert record is not None and record.status is PatchStatus.FAILED
