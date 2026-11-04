@@ -10,14 +10,24 @@ from vllm_hcu.patch.worker.op_opt import patch_kimi_k3_pp_aux as patch
 
 
 @pytest.mark.parametrize("attn_res", [False, True])
-@pytest.mark.parametrize("split,total,aux_layers", [
-    (6, 12, (2, 4, 6, 8, 10)),
-    (47, 93, (3, 24, 48, 72, 90)),
+@pytest.mark.parametrize("partitions,aux_layers", [
+    ((6, 6), (2, 4, 6, 8, 10)),
+    ((47, 46), (3, 24, 48, 72, 90)),
+    ((4, 4, 4), (0, 2, 4, 8, 10)),
+    ((3, 3, 3, 3), (0, 2, 3, 10, 12)),  # Two middle stages have no taps.
 ])
-def test_aux_values_and_order_across_pipeline_boundary(attn_res, split, total, aux_layers):
+def test_aux_values_and_order_across_pipeline_boundary(
+    monkeypatch, attn_res, partitions, aux_layers,
+):
     from bisect import bisect_right
 
-    pp = SimpleNamespace(world_size=2, is_first_rank=True, is_last_rank=False)
+    from vllm.distributed import parallel_state
+    from vllm.v1.worker.gpu.pp_utils import PPHandler
+
+    total = sum(partitions)
+    pp = SimpleNamespace(world_size=len(partitions), is_first_rank=True, is_last_rank=False)
+    monkeypatch.setattr(parallel_state, "model_parallel_is_initialized", lambda: True)
+    monkeypatch.setattr(parallel_state, "get_pp_group", lambda: pp)
 
     class Decoder(EagleModelMixin):
         def __init__(self, **kwargs):
@@ -44,27 +54,50 @@ def test_aux_values_and_order_across_pipeline_boundary(attn_res, split, total, a
     def layer(positions, hidden_states, residual):
         return hidden_states + 1, (residual if attn_res else torch.zeros_like(hidden_states))
 
-    def decoder(start, end, upstream):
+    def decoder(start, end):
         obj = object.__new__(Decoder)
         obj.config = SimpleNamespace(attn_res_block_size=12 if attn_res else None)
         obj.start_layer, obj.end_layer = start, end
         obj.layers = [layer] * total
-        obj.aux_hidden_state_layers = aux_layers
-        obj._aux_slot_base_cached = upstream
-        obj._aux_upstream_total_cached = upstream if pp.is_last_rank else 0
+        obj._set_aux_hidden_state_layers(aux_layers)
         obj.output_attn_res_proj = obj.output_attn_res_norm = None
         return obj
 
     positions = torch.tensor([0, 1])
     initial = torch.zeros(2, 3)
-    first = decoder(0, split, 0)
-    intermediate = first.forward(None, positions, None, inputs_embeds=initial)
-    upstream_count = bisect_right(aux_layers, split)
-    assert set(intermediate.tensors) == {"hidden_states", "residual"} | {
-        "aux_hidden_states_" + str(i) for i in range(upstream_count)}
-    pp.is_first_rank, pp.is_last_rank = False, True
-    last = decoder(split, total, upstream_count)
-    hidden, aux = last.forward(None, positions, intermediate)
+    intermediate = None
+    start = 0
+    for rank, size in enumerate(partitions):
+        pp.is_first_rank = rank == 0
+        pp.is_last_rank = rank == len(partitions) - 1
+        model = decoder(start, start + size)
+        incoming = intermediate
+        output = model.forward(
+            None, positions, incoming,
+            inputs_embeds=initial if pp.is_first_rank else None,
+        )
+        if not pp.is_last_rank:
+            upstream_count = bisect_right(aux_layers, start + size)
+            assert set(output.tensors) == {"hidden_states", "residual"} | {
+                "aux_hidden_states_" + str(i) for i in range(upstream_count)
+            }
+            for i, expected in enumerate(aux_layers[:upstream_count]):
+                key = "aux_hidden_states_" + str(i)
+                torch.testing.assert_close(output[key], initial + expected)
+                if incoming is not None and key in incoming.tensors:
+                    assert output[key] is incoming[key]  # Relay without copying.
+            handler = SimpleNamespace(aux_hidden_state_relay_keys=tuple(
+                "aux_hidden_states_" + str(i)
+                for i in range(model._aux_slot_base_cached)
+            ))
+            relayed = PPHandler.relay_aux_hidden_states(handler, incoming, output)
+            assert set(relayed.tensors) == set(output.tensors)
+            assert all(relayed[key] is value for key, value in output.tensors.items())
+            intermediate = relayed
+        else:
+            hidden, aux = output
+        start += size
+
     torch.testing.assert_close(hidden, initial + total)
     assert len(aux) == len(aux_layers)  # Sending stage owns the boundary tap.
     for value, expected in zip(aux, aux_layers):

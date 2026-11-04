@@ -72,6 +72,7 @@ DSpark 接受率使用评测前后 `/metrics` 中 `spec_decode_num_accepted_toke
 
 ## 验证与限制
 
+- PP relay review 修复：decoder 的两个非末级返回分支均保留全部入站辅助槽位，再合并本级捕获的槽位，沿用全局编号和 tensor 引用；中间级没有辅助层时也继续转发。PP2/PP3/PP4 回归覆盖普通 residual、attn-res、边界 tap、连续两个无本地 tap 的中间级，并验证与原生 PPHandler relay 重复转发兼容。新增 PP3/PP4 用例在修复前 4 项失败；修复后定向 CPU 测试 88 项全部通过。本节补充不代表对新修复重跑完整模型或验证 PP3+ 完整模型精度，上面的 HumanEval 成绩对应明确标注的实现提交。
 - Patch coverage、变更 Python 语法、HCU 测试登记、nightly/quarantine matrix 与环境 lock 六项 CI 静态检查全部通过。
 - 定向 CPU 测试 84 项通过，覆盖 PP 边界捕获、93 层辅助状态顺序、普通 residual/attn-res、末级 embedding、patch 幂等、非 PP 分派、Conv1D stride，以及已有 checkpoint/eager-break 和 worker dispatcher。
 - 完整 CPU contract 首轮为 4724 passed、67 skipped、5 failed。worktree 容器路径导致的 setup provenance 失败在修正路径后独立复测通过。其余 4 项 BoltOps 公共 API 测试在未修改的基线 `807c0821` 上同样失败：容器 BoltOps `0.1.0+dtk2604.torch2110.2610081830.gc0f3c9` 缺少 paged-MQA 导出，且 W4A8 接口签名不同于基线要求；本次未修改这些测试或放宽接口校验。完整 Kimi 服务日志确认使用 AITER int8_w4a8 MoE 路径。

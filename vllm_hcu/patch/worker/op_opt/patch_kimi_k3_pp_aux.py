@@ -38,6 +38,21 @@ def apply_to_module(module: ModuleType) -> bool:
                 prefix=f"{prefix}.embed_tokens",
             )
 
+    def pack_aux_hidden_states(self, intermediate_tensors, aux_hidden_states):
+        # Preserve every incoming slot, even when this stage has no local taps.
+        # Keep the global numbering and tensor references; the runner's relay
+        # may also forward these same slots without changing their values.
+        upstream = {}
+        if self._aux_slot_base_cached:
+            assert intermediate_tensors is not None
+            upstream = {
+                f"{self.AUX_HIDDEN_STATE_KEY}{i}": intermediate_tensors[
+                    f"{self.AUX_HIDDEN_STATE_KEY}{i}"
+                ]
+                for i in range(self._aux_slot_base_cached)
+            }
+        return upstream | self.pack_local_aux_hidden_states(aux_hidden_states)
+
     def forward(
         self,
         input_ids: torch.Tensor | None,
@@ -81,7 +96,8 @@ def apply_to_module(module: ModuleType) -> bool:
             if not get_pp_group().is_last_rank:
                 return IntermediateTensors(
                     {"hidden_states": hidden_states, "residual": residual,
-                     **self.pack_local_aux_hidden_states(aux_hidden_states)}
+                     **pack_aux_hidden_states(
+                         self, intermediate_tensors, aux_hidden_states)}
                 )
 
             # NOTE: the final norm is applied in compute_logits instead of here,
@@ -120,7 +136,8 @@ def apply_to_module(module: ModuleType) -> bool:
         if not get_pp_group().is_last_rank:
             return IntermediateTensors(
                 {"hidden_states": hidden_states, "residual": residual,
-                 **self.pack_local_aux_hidden_states(aux_hidden_states)}
+                 **pack_aux_hidden_states(
+                     self, intermediate_tensors, aux_hidden_states)}
             )
 
         hidden_states = _apply_attn_res(
