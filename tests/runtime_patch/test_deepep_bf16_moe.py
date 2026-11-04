@@ -79,3 +79,8 @@ def test_bf16_rejects_fixed_all2all_instead_of_building_auto(monkeypatch):
     )
     assert not supported
     assert "parallel config" in reason
+
+
+def test_bf16_does_not_request_deferred_quantization():
+    experts = object.__new__(DeepEPBF16ContiguousExperts)
+    assert experts.expects_unquantized_inputs is False

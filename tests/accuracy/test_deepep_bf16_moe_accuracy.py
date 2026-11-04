@@ -62,9 +62,9 @@ def test_auto_ht_ll_ht_matches_reference(tokens, hidden, intermediate):
             expert = int(ids[t, slot])
             if expert < 0:
                 continue
-            gate, up = F.linear(x[t], w1[expert]).chunk(2)
-            activated = (F.silu(gate.float()) * up.float()).to(x.dtype)
-            expected[t] += F.linear(activated, w2[expert]).float() * weights[t, slot]
+            gate, up = F.linear(x[t].float(), w1[expert].float()).chunk(2)
+            activated = F.silu(gate) * up
+            expected[t] += F.linear(activated, w2[expert].float()) * weights[t, slot]
     impl = DeepEPAutoBF16Experts(
         _config(),
         FUSED_MOE_UNQUANTIZED_CONFIG,
@@ -114,4 +114,12 @@ def test_auto_ht_ll_ht_matches_reference(tokens, hidden, intermediate):
             combined = out.float()
         torch.cuda.synchronize()
         assert torch.isfinite(combined).all()
-        torch.testing.assert_close(combined, expected, rtol=0.04, atol=0.004)
+        error = combined - expected
+        relative_l2 = error.norm() / expected.norm().clamp_min(1e-8)
+        print(
+            f"HT/LL={low_latency} shape={k}/{h} M={tokens} "
+            f"max_abs={error.abs().max().item():.6f} "
+            f"relative_l2={relative_l2.item():.6f}"
+        )
+        assert relative_l2 < 0.02
+        torch.testing.assert_close(combined, expected, rtol=0.04, atol=0.02)

@@ -77,7 +77,9 @@ class DeepEPBF16ContiguousExperts(TritonExperts):
 
     @property
     def expects_unquantized_inputs(self):
-        return True
+        # quant_dtype=None already keeps BF16 dispatch unquantized. True
+        # requests deferred input quantization, unsupported by DeepEP LL.
+        return False
 
     def apply(
         self,
