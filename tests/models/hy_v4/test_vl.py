@@ -5,6 +5,8 @@ import pytest
 import torch
 
 from vllm_hcu.models.hy_v4.vl import (
+    HYV4PatchProjection,
+    HYV4VisionBlock,
     HYV4VisionMerger,
     HYV4VLForConditionalGeneration,
     HYV4VLProcessor,
@@ -98,6 +100,90 @@ def test_merger_inserts_checkpoint_newline_at_each_row():
     assert output.shape == (1, 8, 8)
     torch.testing.assert_close(output[0, 3], torch.arange(8, dtype=output.dtype))
     torch.testing.assert_close(output[0, 7], torch.arange(8, dtype=output.dtype))
+
+
+@pytest.mark.parametrize("bias", [False, True])
+def test_patch_projection_matches_checkpoint_convolution(bias):
+    projection = HYV4PatchProjection(3, 16, 4, stride=4, bias=bias)
+    patches = torch.randn(11, 3, 4, 4)
+    reference = torch.nn.functional.conv2d(
+        patches, projection.weight, projection.bias, stride=4
+    )
+    torch.testing.assert_close(projection(patches), reference)
+    assert set(projection.state_dict()) == ({"weight", "bias"} if bias else {"weight"})
+
+
+@pytest.mark.hcu
+@pytest.mark.parametrize("patches", [384, 3900, 7788])
+def test_patch_projection_preserves_hcu_bf16_rounding(patches):
+    if not torch.cuda.is_available():
+        pytest.skip("a live HCU/ROCm device is required")
+    with torch.device("cuda"), torch.inference_mode():
+        projection = HYV4PatchProjection(3, 1536, 16, stride=16).bfloat16()
+        inputs = torch.randn(patches, 3, 16, 16, dtype=torch.bfloat16)
+        reference = torch.nn.functional.conv2d(
+            inputs, projection.weight, projection.bias, stride=16
+        )
+        torch.testing.assert_close(projection(inputs), reference, rtol=0, atol=0)
+
+
+def test_packed_vision_attention_preserves_image_boundaries(monkeypatch):
+    from types import MethodType
+
+    from vllm.config import VllmConfig, set_current_vllm_config
+    from vllm.model_executor.layers.attention.mm_encoder_attention import (
+        MMEncoderAttention,
+    )
+    from vllm.model_executor.models.hunyuan_vision import (
+        HunYuanVisionAttention,
+        HunYuanVisionBlock,
+    )
+    from vllm.v1.attention.ops.vit_attn_wrappers import torch_sdpa_wrapper
+
+    # This HCU build registers the SDPA custom op only for CUDA. Exercise its
+    # real implementation directly so this boundary test remains CPU-only.
+    monkeypatch.setattr(
+        "vllm.model_executor.layers.attention.mm_encoder_attention.vit_torch_sdpa_wrapper",
+        torch_sdpa_wrapper,
+    )
+
+    class TupleLinear(torch.nn.Linear):
+        def forward(self, x):
+            return super().forward(x), None
+
+    block = HYV4VisionBlock.__new__(HYV4VisionBlock)
+    torch.nn.Module.__init__(block)
+    block.input_layernorm = torch.nn.LayerNorm(8)
+    block.post_attention_layernorm = torch.nn.LayerNorm(8)
+    block.mlp = torch.nn.Sequential(
+        torch.nn.Linear(8, 16), torch.nn.GELU(), torch.nn.Linear(16, 8)
+    )
+    block.self_attn = torch.nn.Module()
+    block.self_attn.qkv = TupleLinear(8, 24)
+    block.self_attn.o_proj = TupleLinear(8, 8)
+    with set_current_vllm_config(VllmConfig()):
+        block.self_attn.attn = MMEncoderAttention(2, 4, 0.5)
+        block.self_attn.attn._forward_method = block.self_attn.attn.forward_native
+    block.self_attn.forward = MethodType(
+        HunYuanVisionAttention.forward, block.self_attn
+    )
+    images = [torch.randn(1, length, 8) for length in (6, 10, 4)]
+    reference = torch.cat([HunYuanVisionBlock.forward(block, x) for x in images], dim=1)
+    actual = block(
+        torch.cat(images, dim=1),
+        torch.tensor([0, 6, 16, 20], dtype=torch.int32),
+        torch.tensor(10),
+    )
+    torch.testing.assert_close(actual, reference)
+    # Altering the middle image must not affect either neighbouring image.
+    images[1] = images[1] * 10 + 5
+    changed = block(
+        torch.cat(images, dim=1),
+        torch.tensor([0, 6, 16, 20], dtype=torch.int32),
+        torch.tensor(10),
+    )
+    torch.testing.assert_close(changed[:, :6], actual[:, :6])
+    torch.testing.assert_close(changed[:, 16:], actual[:, 16:])
 
 
 def test_multiaxis_rope_matches_interleaved_pair_rotation():

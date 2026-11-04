@@ -5,9 +5,12 @@
 """HYV4 image tower and vLLM multimodal integration."""
 
 from functools import partial
+from itertools import accumulate
+from types import MethodType
 
 import torch
 from torch import nn
+from torch.nn import functional as F
 from transformers import BatchFeature
 from vllm.model_executor.layers.activation import get_act_fn
 from vllm.model_executor.layers.layernorm import RMSNorm
@@ -27,6 +30,7 @@ from vllm.transformers_utils.processors.hunyuan_vl import HunYuanVLProcessor
 from vllm.transformers_utils.processors.hunyuan_vl_image import HunYuanVLImageProcessor
 
 from .model import HYV4ForCausalLM
+from .mrope import forward_hcu_mrope
 
 
 class HYV4VLProcessor(HunYuanVLProcessor):
@@ -85,7 +89,9 @@ class HYV4VLProcessor(HunYuanVLProcessor):
                     grid = next(grids, None)
                     if grid is None:
                         raise ValueError("More image placeholders than images")
-                    h, w = (int(x) // self.image_processor.merge_size for x in grid[-2:])
+                    h, w = (
+                        int(x) // self.image_processor.merge_size for x in grid[-2:]
+                    )
                     expanded += self.image_token * (h * (w + 1)) + tail
                 texts[i] = expanded
             if next(grids, None) is not None:
@@ -126,6 +132,41 @@ class HYV4VLMultiModalProcessor(HunYuanVLMultiModalProcessor):
         ]
 
 
+class HYV4PatchProjection(nn.Conv2d):
+    """Collapse extracted patches into channels for an efficient 1x1 convolution."""
+
+    def forward(self, patches):
+        # Keep MIOpen's accumulation and bias rounding, and the checkpoint layout.
+        return F.conv2d(
+            patches.flatten(1)[:, :, None, None],
+            self.weight.flatten(1)[:, :, None, None],
+            self.bias,
+        )
+
+
+class HYV4VisionPatchEmbed(HunYuanVisionPatchEmbed):
+    def __init__(self, config):
+        super().__init__(config)
+        self.patch_embedding = HYV4PatchProjection(
+            config.num_channels,
+            config.hidden_size,
+            kernel_size=config.patch_size,
+            stride=config.patch_size,
+            bias=True,
+        )
+
+
+class HYV4VisionBlock(HunYuanVisionBlock):
+    def forward(self, x, cu_seqlens, max_seqlen):
+        attention = self.self_attn
+        qkv, _ = attention.qkv(self.input_layernorm(x))
+        q, k, v = qkv.chunk(3, dim=-1)
+        out = attention.attn(q, k, v, cu_seqlens, max_seqlen)
+        out, _ = attention.o_proj(out)
+        x = x + out
+        return x + self.mlp(self.post_attention_layernorm(x))
+
+
 class HYV4VisionMerger(nn.Module):
     def __init__(self, config):
         super().__init__()
@@ -157,10 +198,10 @@ class HYV4VisionTransformer(HunYuanVisionTransformer):
         self.hidden_size = config.hidden_size
         self.num_heads = config.num_attention_heads
         self.spatial_merge_size = config.spatial_merge_size
-        self.embeddings = HunYuanVisionPatchEmbed(config)
+        self.embeddings = HYV4VisionPatchEmbed(config)
         self.layers = nn.ModuleList(
             [
-                HunYuanVisionBlock(
+                HYV4VisionBlock(
                     dim=config.hidden_size,
                     num_heads=config.num_attention_heads,
                     mlp_hidden_dim=config.intermediate_size,
@@ -173,6 +214,46 @@ class HYV4VisionTransformer(HunYuanVisionTransformer):
             ]
         )
         self.perceive = HYV4VisionMerger(config)
+
+    def forward(self, x, grid_thw):
+        lengths = [int(h) * int(w) for _, h, w in grid_thw]
+        hidden_states = self.embeddings(
+            x.to(device=self.device, dtype=self.dtype), grid_thw
+        )
+        if self.layers and self.layers[0].self_attn.tp_size > 1:
+            # Changing GEMM batch shapes under TP changes BF16 accumulation;
+            # small differences amplify through this 40-layer vision tower.
+            # Keep per-image GEMMs/collectives, with attention metadata prepared
+            # once rather than allocating boundaries in every attention layer.
+            metadata = [
+                (
+                    torch.tensor([0, length], dtype=torch.int32, device=self.device),
+                    torch.tensor(length, dtype=torch.int32),
+                )
+                for length in lengths
+            ]
+            for layer in self.layers:
+                hidden_states = torch.cat(
+                    [
+                        layer(item, *meta)
+                        for item, meta in zip(
+                            hidden_states.split(lengths, dim=1), metadata
+                        )
+                    ],
+                    dim=1,
+                )
+        else:
+            cu_seqlens = torch.tensor(
+                [0, *accumulate(lengths)], dtype=torch.int32, device=self.device
+            )
+            # The attention wrapper reads .item(); keep this scalar on the CPU.
+            max_seqlen = torch.tensor(max(lengths), dtype=torch.int32)
+            for layer in self.layers:
+                hidden_states = layer(hidden_states, cu_seqlens, max_seqlen)
+        return [
+            self.perceive(item.contiguous(), size=grid[1:]).squeeze(0)
+            for grid, item in zip(grid_thw, hidden_states.split(lengths, dim=1))
+        ]
 
 
 @MULTIMODAL_REGISTRY.register_processor(
@@ -198,12 +279,12 @@ class HYV4VLForConditionalGeneration(
         super().__init__(vllm_config=vllm_config, prefix=prefix)
         with self._mark_tower_model(vllm_config, {"image"}):
             self.vit = HYV4VisionTransformer(self.config.vision_config, prefix="vit")
-        # HCU's fused 1-D RoPE kernel does not implement the three M-RoPE axes.
+        # The generic HCU RoPE kernel only supports a single position axis.
         for layer in self.model.layers:
             for name in ("rotary_emb", "indexer_rope_emb"):
                 rope = getattr(getattr(layer, "self_attn", None), name, None)
                 if rope is not None:
-                    rope._forward_method = rope.forward_native
+                    rope._forward_method = MethodType(forward_hcu_mrope, rope)
 
     @classmethod
     def get_placeholder_str(cls, modality, i):
