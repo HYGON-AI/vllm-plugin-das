@@ -115,3 +115,15 @@ The following plugin files map to vLLM upstream paths and were reviewed under th
 | `vllm_hcu/v1/executor/multiproc_executor.py` | `vllm/v1/executor/multiproc_executor.py` | vLLM copyright retained; HYGON modification notice retained. HYGON contribution copyright retained for substantive plugin changes. |
 | `vllm_hcu/v1/spec_decode/__init__.py` | `vllm/v1/spec_decode/__init__.py` | vLLM copyright retained; HYGON modification notice retained. HYGON contribution copyright retained for substantive plugin changes. |
 | `vllm_hcu/version.py` | `vllm/version.py` | vLLM copyright retained; HYGON modification notice retained. HYGON contribution copyright retained for substantive plugin changes. |
+
+
+## LocateAnything Fast execution integration
+
+The files under `vllm_hcu/v1/locateanything/` named `scheduler.py`,
+`model_runner.py`, `input_batch.py`, `warmup.py`, `chat_serving.py`,
+`completion_serving.py`, and `triton_unified_attention.py` are adapted from the
+matching vLLM sources (https://github.com/vllm-project/vllm), Apache License 2.0.
+Original SPDX/copyright notices are retained. Modifications implement
+LocateAnything six-position generation, masks, real KV accounting and API
+semantics. The exact source identities qualified for these implementations
+are recorded in the packaged `source_contract.json`.

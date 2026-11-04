@@ -574,3 +574,14 @@ register_hcu_ci(
     target="tests/distributed/single_node/test_topology_contracts.py",
     est_time=60,
 )
+
+register_hcu_ci(
+    job="contract-hcu-gfx936",
+    target="tests/runtime_patch/test_locateanything.py",
+    est_time=60,
+)
+register_hcu_ci(
+    job="contract-hcu-gfx936",
+    target="tests/runtime_patch/test_locateanything_warmup_budget.py",
+    est_time=60,
+)
