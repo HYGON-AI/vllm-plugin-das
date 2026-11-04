@@ -1,0 +1,578 @@
+[
+  {
+    "dtype": "torch.bfloat16",
+    "interleaved": true,
+    "ndim": 1,
+    "tokens": 1,
+    "partial": false,
+    "exact": true
+  },
+  {
+    "dtype": "torch.bfloat16",
+    "interleaved": true,
+    "ndim": 1,
+    "tokens": 1,
+    "partial": true,
+    "exact": true
+  },
+  {
+    "dtype": "torch.bfloat16",
+    "interleaved": true,
+    "ndim": 1,
+    "tokens": 7,
+    "partial": false,
+    "exact": true
+  },
+  {
+    "dtype": "torch.bfloat16",
+    "interleaved": true,
+    "ndim": 1,
+    "tokens": 7,
+    "partial": true,
+    "exact": true
+  },
+  {
+    "dtype": "torch.bfloat16",
+    "interleaved": true,
+    "ndim": 1,
+    "tokens": 1024,
+    "partial": false,
+    "exact": true
+  },
+  {
+    "dtype": "torch.bfloat16",
+    "interleaved": true,
+    "ndim": 1,
+    "tokens": 1024,
+    "partial": true,
+    "exact": true
+  },
+  {
+    "dtype": "torch.bfloat16",
+    "interleaved": true,
+    "ndim": 2,
+    "tokens": 1,
+    "partial": false,
+    "exact": true
+  },
+  {
+    "dtype": "torch.bfloat16",
+    "interleaved": true,
+    "ndim": 2,
+    "tokens": 1,
+    "partial": true,
+    "exact": true
+  },
+  {
+    "dtype": "torch.bfloat16",
+    "interleaved": true,
+    "ndim": 2,
+    "tokens": 7,
+    "partial": false,
+    "exact": true
+  },
+  {
+    "dtype": "torch.bfloat16",
+    "interleaved": true,
+    "ndim": 2,
+    "tokens": 7,
+    "partial": true,
+    "exact": true
+  },
+  {
+    "dtype": "torch.bfloat16",
+    "interleaved": true,
+    "ndim": 2,
+    "tokens": 1024,
+    "partial": false,
+    "exact": true
+  },
+  {
+    "dtype": "torch.bfloat16",
+    "interleaved": true,
+    "ndim": 2,
+    "tokens": 1024,
+    "partial": true,
+    "exact": true
+  },
+  {
+    "dtype": "torch.bfloat16",
+    "interleaved": false,
+    "ndim": 1,
+    "tokens": 1,
+    "partial": false,
+    "exact": true
+  },
+  {
+    "dtype": "torch.bfloat16",
+    "interleaved": false,
+    "ndim": 1,
+    "tokens": 1,
+    "partial": true,
+    "exact": true
+  },
+  {
+    "dtype": "torch.bfloat16",
+    "interleaved": false,
+    "ndim": 1,
+    "tokens": 7,
+    "partial": false,
+    "exact": true
+  },
+  {
+    "dtype": "torch.bfloat16",
+    "interleaved": false,
+    "ndim": 1,
+    "tokens": 7,
+    "partial": true,
+    "exact": true
+  },
+  {
+    "dtype": "torch.bfloat16",
+    "interleaved": false,
+    "ndim": 1,
+    "tokens": 1024,
+    "partial": false,
+    "exact": true
+  },
+  {
+    "dtype": "torch.bfloat16",
+    "interleaved": false,
+    "ndim": 1,
+    "tokens": 1024,
+    "partial": true,
+    "exact": true
+  },
+  {
+    "dtype": "torch.bfloat16",
+    "interleaved": false,
+    "ndim": 2,
+    "tokens": 1,
+    "partial": false,
+    "exact": true
+  },
+  {
+    "dtype": "torch.bfloat16",
+    "interleaved": false,
+    "ndim": 2,
+    "tokens": 1,
+    "partial": true,
+    "exact": true
+  },
+  {
+    "dtype": "torch.bfloat16",
+    "interleaved": false,
+    "ndim": 2,
+    "tokens": 7,
+    "partial": false,
+    "exact": true
+  },
+  {
+    "dtype": "torch.bfloat16",
+    "interleaved": false,
+    "ndim": 2,
+    "tokens": 7,
+    "partial": true,
+    "exact": true
+  },
+  {
+    "dtype": "torch.bfloat16",
+    "interleaved": false,
+    "ndim": 2,
+    "tokens": 1024,
+    "partial": false,
+    "exact": true
+  },
+  {
+    "dtype": "torch.bfloat16",
+    "interleaved": false,
+    "ndim": 2,
+    "tokens": 1024,
+    "partial": true,
+    "exact": true
+  },
+  {
+    "dtype": "torch.float16",
+    "interleaved": true,
+    "ndim": 1,
+    "tokens": 1,
+    "partial": false,
+    "exact": true
+  },
+  {
+    "dtype": "torch.float16",
+    "interleaved": true,
+    "ndim": 1,
+    "tokens": 1,
+    "partial": true,
+    "exact": true
+  },
+  {
+    "dtype": "torch.float16",
+    "interleaved": true,
+    "ndim": 1,
+    "tokens": 7,
+    "partial": false,
+    "exact": true
+  },
+  {
+    "dtype": "torch.float16",
+    "interleaved": true,
+    "ndim": 1,
+    "tokens": 7,
+    "partial": true,
+    "exact": true
+  },
+  {
+    "dtype": "torch.float16",
+    "interleaved": true,
+    "ndim": 1,
+    "tokens": 1024,
+    "partial": false,
+    "exact": true
+  },
+  {
+    "dtype": "torch.float16",
+    "interleaved": true,
+    "ndim": 1,
+    "tokens": 1024,
+    "partial": true,
+    "exact": true
+  },
+  {
+    "dtype": "torch.float16",
+    "interleaved": true,
+    "ndim": 2,
+    "tokens": 1,
+    "partial": false,
+    "exact": true
+  },
+  {
+    "dtype": "torch.float16",
+    "interleaved": true,
+    "ndim": 2,
+    "tokens": 1,
+    "partial": true,
+    "exact": true
+  },
+  {
+    "dtype": "torch.float16",
+    "interleaved": true,
+    "ndim": 2,
+    "tokens": 7,
+    "partial": false,
+    "exact": true
+  },
+  {
+    "dtype": "torch.float16",
+    "interleaved": true,
+    "ndim": 2,
+    "tokens": 7,
+    "partial": true,
+    "exact": true
+  },
+  {
+    "dtype": "torch.float16",
+    "interleaved": true,
+    "ndim": 2,
+    "tokens": 1024,
+    "partial": false,
+    "exact": true
+  },
+  {
+    "dtype": "torch.float16",
+    "interleaved": true,
+    "ndim": 2,
+    "tokens": 1024,
+    "partial": true,
+    "exact": true
+  },
+  {
+    "dtype": "torch.float16",
+    "interleaved": false,
+    "ndim": 1,
+    "tokens": 1,
+    "partial": false,
+    "exact": true
+  },
+  {
+    "dtype": "torch.float16",
+    "interleaved": false,
+    "ndim": 1,
+    "tokens": 1,
+    "partial": true,
+    "exact": true
+  },
+  {
+    "dtype": "torch.float16",
+    "interleaved": false,
+    "ndim": 1,
+    "tokens": 7,
+    "partial": false,
+    "exact": true
+  },
+  {
+    "dtype": "torch.float16",
+    "interleaved": false,
+    "ndim": 1,
+    "tokens": 7,
+    "partial": true,
+    "exact": true
+  },
+  {
+    "dtype": "torch.float16",
+    "interleaved": false,
+    "ndim": 1,
+    "tokens": 1024,
+    "partial": false,
+    "exact": true
+  },
+  {
+    "dtype": "torch.float16",
+    "interleaved": false,
+    "ndim": 1,
+    "tokens": 1024,
+    "partial": true,
+    "exact": true
+  },
+  {
+    "dtype": "torch.float16",
+    "interleaved": false,
+    "ndim": 2,
+    "tokens": 1,
+    "partial": false,
+    "exact": true
+  },
+  {
+    "dtype": "torch.float16",
+    "interleaved": false,
+    "ndim": 2,
+    "tokens": 1,
+    "partial": true,
+    "exact": true
+  },
+  {
+    "dtype": "torch.float16",
+    "interleaved": false,
+    "ndim": 2,
+    "tokens": 7,
+    "partial": false,
+    "exact": true
+  },
+  {
+    "dtype": "torch.float16",
+    "interleaved": false,
+    "ndim": 2,
+    "tokens": 7,
+    "partial": true,
+    "exact": true
+  },
+  {
+    "dtype": "torch.float16",
+    "interleaved": false,
+    "ndim": 2,
+    "tokens": 1024,
+    "partial": false,
+    "exact": true
+  },
+  {
+    "dtype": "torch.float16",
+    "interleaved": false,
+    "ndim": 2,
+    "tokens": 1024,
+    "partial": true,
+    "exact": true
+  },
+  {
+    "dtype": "torch.float32",
+    "interleaved": true,
+    "ndim": 1,
+    "tokens": 1,
+    "partial": false,
+    "exact": true
+  },
+  {
+    "dtype": "torch.float32",
+    "interleaved": true,
+    "ndim": 1,
+    "tokens": 1,
+    "partial": true,
+    "exact": true
+  },
+  {
+    "dtype": "torch.float32",
+    "interleaved": true,
+    "ndim": 1,
+    "tokens": 7,
+    "partial": false,
+    "exact": true
+  },
+  {
+    "dtype": "torch.float32",
+    "interleaved": true,
+    "ndim": 1,
+    "tokens": 7,
+    "partial": true,
+    "exact": true
+  },
+  {
+    "dtype": "torch.float32",
+    "interleaved": true,
+    "ndim": 1,
+    "tokens": 1024,
+    "partial": false,
+    "exact": true
+  },
+  {
+    "dtype": "torch.float32",
+    "interleaved": true,
+    "ndim": 1,
+    "tokens": 1024,
+    "partial": true,
+    "exact": true
+  },
+  {
+    "dtype": "torch.float32",
+    "interleaved": true,
+    "ndim": 2,
+    "tokens": 1,
+    "partial": false,
+    "exact": true
+  },
+  {
+    "dtype": "torch.float32",
+    "interleaved": true,
+    "ndim": 2,
+    "tokens": 1,
+    "partial": true,
+    "exact": true
+  },
+  {
+    "dtype": "torch.float32",
+    "interleaved": true,
+    "ndim": 2,
+    "tokens": 7,
+    "partial": false,
+    "exact": true
+  },
+  {
+    "dtype": "torch.float32",
+    "interleaved": true,
+    "ndim": 2,
+    "tokens": 7,
+    "partial": true,
+    "exact": true
+  },
+  {
+    "dtype": "torch.float32",
+    "interleaved": true,
+    "ndim": 2,
+    "tokens": 1024,
+    "partial": false,
+    "exact": true
+  },
+  {
+    "dtype": "torch.float32",
+    "interleaved": true,
+    "ndim": 2,
+    "tokens": 1024,
+    "partial": true,
+    "exact": true
+  },
+  {
+    "dtype": "torch.float32",
+    "interleaved": false,
+    "ndim": 1,
+    "tokens": 1,
+    "partial": false,
+    "exact": true
+  },
+  {
+    "dtype": "torch.float32",
+    "interleaved": false,
+    "ndim": 1,
+    "tokens": 1,
+    "partial": true,
+    "exact": true
+  },
+  {
+    "dtype": "torch.float32",
+    "interleaved": false,
+    "ndim": 1,
+    "tokens": 7,
+    "partial": false,
+    "exact": true
+  },
+  {
+    "dtype": "torch.float32",
+    "interleaved": false,
+    "ndim": 1,
+    "tokens": 7,
+    "partial": true,
+    "exact": true
+  },
+  {
+    "dtype": "torch.float32",
+    "interleaved": false,
+    "ndim": 1,
+    "tokens": 1024,
+    "partial": false,
+    "exact": true
+  },
+  {
+    "dtype": "torch.float32",
+    "interleaved": false,
+    "ndim": 1,
+    "tokens": 1024,
+    "partial": true,
+    "exact": true
+  },
+  {
+    "dtype": "torch.float32",
+    "interleaved": false,
+    "ndim": 2,
+    "tokens": 1,
+    "partial": false,
+    "exact": true
+  },
+  {
+    "dtype": "torch.float32",
+    "interleaved": false,
+    "ndim": 2,
+    "tokens": 1,
+    "partial": true,
+    "exact": true
+  },
+  {
+    "dtype": "torch.float32",
+    "interleaved": false,
+    "ndim": 2,
+    "tokens": 7,
+    "partial": false,
+    "exact": true
+  },
+  {
+    "dtype": "torch.float32",
+    "interleaved": false,
+    "ndim": 2,
+    "tokens": 7,
+    "partial": true,
+    "exact": true
+  },
+  {
+    "dtype": "torch.float32",
+    "interleaved": false,
+    "ndim": 2,
+    "tokens": 1024,
+    "partial": false,
+    "exact": true
+  },
+  {
+    "dtype": "torch.float32",
+    "interleaved": false,
+    "ndim": 2,
+    "tokens": 1024,
+    "partial": true,
+    "exact": true
+  }
+]

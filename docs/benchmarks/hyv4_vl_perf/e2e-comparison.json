@@ -1,0 +1,26 @@
+[
+  {
+    "suite": "qa_c1",
+    "ttft_reduction_percent": 10.535173964112566,
+    "latency_reduction_percent": 10.135765464966685,
+    "throughput_increase_percent": 14.39178005673616
+  },
+  {
+    "suite": "qa_c2",
+    "ttft_reduction_percent": 11.250755769191256,
+    "latency_reduction_percent": 11.165520514329852,
+    "throughput_increase_percent": 12.695768816968744
+  },
+  {
+    "suite": "caption32_c1",
+    "ttft_reduction_percent": 10.668441199682533,
+    "latency_reduction_percent": 9.146110687334508,
+    "throughput_increase_percent": 9.9456010670397
+  },
+  {
+    "suite": "two_images32_c1",
+    "ttft_reduction_percent": 11.095474043731969,
+    "latency_reduction_percent": 9.988373448018717,
+    "throughput_increase_percent": 10.61244837295099
+  }
+]

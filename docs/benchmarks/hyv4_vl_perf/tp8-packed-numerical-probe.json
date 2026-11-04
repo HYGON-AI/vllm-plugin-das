@@ -1,0 +1,89 @@
+{
+  "status": "Rejected TP8 image packing diagnostic; excluded from final implementation",
+  "baseline": "bd1545a",
+  "packed_candidate": "527314f",
+  "final": "edeb432",
+  "cases": [
+    {
+      "label": "sensitive552",
+      "grids": [
+        [
+          1,
+          50,
+          78
+        ]
+      ],
+      "image_sha256": [
+        "df760831b4409adc8d565c95777b0f58b1397115dd847ee3b9771057ebdcfce8"
+      ],
+      "comparison": [
+        {
+          "cosine": 0.9999999403953552,
+          "relative_l2": 0.0,
+          "max_abs": 0.0
+        }
+      ]
+    },
+    {
+      "label": "sensitive571",
+      "grids": [
+        [
+          1,
+          50,
+          78
+        ]
+      ],
+      "image_sha256": [
+        "feee49cf2c002eb4f9e01992d9287528e75d7d00b2e9facb6d387b4e90fe418a"
+      ],
+      "comparison": [
+        {
+          "cosine": 1.0,
+          "relative_l2": 0.0,
+          "max_abs": 0.0
+        }
+      ]
+    },
+    {
+      "label": "two",
+      "grids": [
+        [
+          1,
+          50,
+          78
+        ],
+        [
+          1,
+          50,
+          78
+        ]
+      ],
+      "image_sha256": [
+        "df760831b4409adc8d565c95777b0f58b1397115dd847ee3b9771057ebdcfce8",
+        "feee49cf2c002eb4f9e01992d9287528e75d7d00b2e9facb6d387b4e90fe418a"
+      ],
+      "comparison": [
+        {
+          "cosine": 0.9879195690155029,
+          "relative_l2": 0.1557716280221939,
+          "max_abs": 1.0341796875
+        },
+        {
+          "cosine": 0.9840670228004456,
+          "relative_l2": 0.17872998118400574,
+          "max_abs": 0.5712890625
+        }
+      ],
+      "packed_vs_individual": [
+        {
+          "cosine": 0.9879195690155029,
+          "relative_l2": 0.1557716280221939
+        },
+        {
+          "cosine": 0.9840670228004456,
+          "relative_l2": 0.17872998118400574
+        }
+      ]
+    }
+  ]
+}

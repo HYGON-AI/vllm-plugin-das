@@ -1,5 +1,9 @@
 # HYV4VL RealWorldQA evaluation
 
+The subsequent ViT/M-RoPE performance changes and full accuracy regression are
+documented in [the performance report](hy4_vl_performance.md). This page records
+the original working-image baseline.
+
 This evaluation uses the full 765-question `test` split of the original
 [xAI RealWorldQA dataset](https://huggingface.co/datasets/xai-org/RealworldQA),
 revision `17e7f75e092e47169732462ea3cdfebe911105dd`. The split contains

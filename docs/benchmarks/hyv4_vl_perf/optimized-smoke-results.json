@@ -1,0 +1,354 @@
+[
+  {
+    "case": "text",
+    "status": 200,
+    "seconds": 0.46022858598735183,
+    "response": {
+      "id": "chatcmpl-b1afd59e83b9c21c",
+      "object": "chat.completion",
+      "created": 1793811747,
+      "model": "hy4-vl",
+      "choices": [
+        {
+          "index": 0,
+          "message": {
+            "role": "assistant",
+            "content": "2",
+            "refusal": null,
+            "annotations": null,
+            "audio": null,
+            "function_call": null,
+            "reasoning": null
+          },
+          "logprobs": null,
+          "finish_reason": "stop",
+          "stop_reason": null,
+          "token_ids": null,
+          "routed_experts": null
+        }
+      ],
+      "service_tier": null,
+      "system_fingerprint": "vllm-0.25.1-tp8-1717c158",
+      "usage": {
+        "prompt_tokens": 34,
+        "total_tokens": 36,
+        "completion_tokens": 2,
+        "prompt_tokens_details": null
+      },
+      "prompt_logprobs": null,
+      "prompt_token_ids": null,
+      "prompt_text": null,
+      "kv_transfer_params": null,
+      "metrics": null
+    },
+    "correct": true
+  },
+  {
+    "case": "red",
+    "status": 200,
+    "seconds": 0.7126846649916843,
+    "response": {
+      "id": "chatcmpl-a67a2635bd128f09",
+      "object": "chat.completion",
+      "created": 1793811747,
+      "model": "hy4-vl",
+      "choices": [
+        {
+          "index": 0,
+          "message": {
+            "role": "assistant",
+            "content": "红色",
+            "refusal": null,
+            "annotations": null,
+            "audio": null,
+            "function_call": null,
+            "reasoning": null
+          },
+          "logprobs": null,
+          "finish_reason": "stop",
+          "stop_reason": null,
+          "token_ids": null,
+          "routed_experts": null
+        }
+      ],
+      "service_tier": null,
+      "system_fingerprint": "vllm-0.25.1-tp8-1717c158",
+      "usage": {
+        "prompt_tokens": 139,
+        "total_tokens": 141,
+        "completion_tokens": 2,
+        "prompt_tokens_details": null
+      },
+      "prompt_logprobs": null,
+      "prompt_token_ids": null,
+      "prompt_text": null,
+      "kv_transfer_params": null,
+      "metrics": null
+    },
+    "correct": true
+  },
+  {
+    "case": "blue",
+    "status": 200,
+    "seconds": 0.6941949499887414,
+    "response": {
+      "id": "chatcmpl-b0187292f94494ea",
+      "object": "chat.completion",
+      "created": 1793811748,
+      "model": "hy4-vl",
+      "choices": [
+        {
+          "index": 0,
+          "message": {
+            "role": "assistant",
+            "content": "蓝色",
+            "refusal": null,
+            "annotations": null,
+            "audio": null,
+            "function_call": null,
+            "reasoning": null
+          },
+          "logprobs": null,
+          "finish_reason": "stop",
+          "stop_reason": null,
+          "token_ids": null,
+          "routed_experts": null
+        }
+      ],
+      "service_tier": null,
+      "system_fingerprint": "vllm-0.25.1-tp8-1717c158",
+      "usage": {
+        "prompt_tokens": 139,
+        "total_tokens": 141,
+        "completion_tokens": 2,
+        "prompt_tokens_details": null
+      },
+      "prompt_logprobs": null,
+      "prompt_token_ids": null,
+      "prompt_text": null,
+      "kv_transfer_params": null,
+      "metrics": null
+    },
+    "correct": true
+  },
+  {
+    "case": "count",
+    "status": 200,
+    "seconds": 0.7060912669985555,
+    "response": {
+      "id": "chatcmpl-8b776057b65f748a",
+      "object": "chat.completion",
+      "created": 1793811749,
+      "model": "hy4-vl",
+      "choices": [
+        {
+          "index": 0,
+          "message": {
+            "role": "assistant",
+            "content": "3",
+            "refusal": null,
+            "annotations": null,
+            "audio": null,
+            "function_call": null,
+            "reasoning": null
+          },
+          "logprobs": null,
+          "finish_reason": "stop",
+          "stop_reason": null,
+          "token_ids": null,
+          "routed_experts": null
+        }
+      ],
+      "service_tier": null,
+      "system_fingerprint": "vllm-0.25.1-tp8-1717c158",
+      "usage": {
+        "prompt_tokens": 172,
+        "total_tokens": 174,
+        "completion_tokens": 2,
+        "prompt_tokens_details": null
+      },
+      "prompt_logprobs": null,
+      "prompt_token_ids": null,
+      "prompt_text": null,
+      "kv_transfer_params": null,
+      "metrics": null
+    },
+    "correct": true
+  },
+  {
+    "case": "ocr",
+    "status": 200,
+    "seconds": 1.5838938289962243,
+    "response": {
+      "id": "chatcmpl-92c7d7433a0b3ade",
+      "object": "chat.completion",
+      "created": 1793811750,
+      "model": "hy4-vl",
+      "choices": [
+        {
+          "index": 0,
+          "message": {
+            "role": "assistant",
+            "content": "HY4 7285",
+            "refusal": null,
+            "annotations": null,
+            "audio": null,
+            "function_call": null,
+            "reasoning": null
+          },
+          "logprobs": null,
+          "finish_reason": "stop",
+          "stop_reason": null,
+          "token_ids": null,
+          "routed_experts": null
+        }
+      ],
+      "service_tier": null,
+      "system_fingerprint": "vllm-0.25.1-tp8-1717c158",
+      "usage": {
+        "prompt_tokens": 174,
+        "total_tokens": 180,
+        "completion_tokens": 6,
+        "prompt_tokens_details": null
+      },
+      "prompt_logprobs": null,
+      "prompt_token_ids": null,
+      "prompt_text": null,
+      "kv_transfer_params": null,
+      "metrics": null
+    },
+    "correct": true
+  },
+  {
+    "case": "multi",
+    "status": 200,
+    "seconds": 4.059073779993923,
+    "response": {
+      "id": "chatcmpl-b6ac609b9a239b25",
+      "object": "chat.completion",
+      "created": 1793811751,
+      "model": "hy4-vl",
+      "choices": [
+        {
+          "index": 0,
+          "message": {
+            "role": "assistant",
+            "content": "第一张图片中的矩形是红色，第二张图片中的矩形是蓝色。",
+            "refusal": null,
+            "annotations": null,
+            "audio": null,
+            "function_call": null,
+            "reasoning": null
+          },
+          "logprobs": null,
+          "finish_reason": "stop",
+          "stop_reason": null,
+          "token_ids": null,
+          "routed_experts": null
+        }
+      ],
+      "service_tier": null,
+      "system_fingerprint": "vllm-0.25.1-tp8-1717c158",
+      "usage": {
+        "prompt_tokens": 248,
+        "total_tokens": 265,
+        "completion_tokens": 17,
+        "prompt_tokens_details": null
+      },
+      "prompt_logprobs": null,
+      "prompt_token_ids": null,
+      "prompt_text": null,
+      "kv_transfer_params": null,
+      "metrics": null
+    },
+    "correct": true
+  },
+  {
+    "case": "red_repeat",
+    "status": 200,
+    "seconds": 0.6933729899901664,
+    "response": {
+      "id": "chatcmpl-a6f9e66ebedb9a09",
+      "object": "chat.completion",
+      "created": 1793811755,
+      "model": "hy4-vl",
+      "choices": [
+        {
+          "index": 0,
+          "message": {
+            "role": "assistant",
+            "content": "红色",
+            "refusal": null,
+            "annotations": null,
+            "audio": null,
+            "function_call": null,
+            "reasoning": null
+          },
+          "logprobs": null,
+          "finish_reason": "stop",
+          "stop_reason": null,
+          "token_ids": null,
+          "routed_experts": null
+        }
+      ],
+      "service_tier": null,
+      "system_fingerprint": "vllm-0.25.1-tp8-1717c158",
+      "usage": {
+        "prompt_tokens": 139,
+        "total_tokens": 141,
+        "completion_tokens": 2,
+        "prompt_tokens_details": null
+      },
+      "prompt_logprobs": null,
+      "prompt_token_ids": null,
+      "prompt_text": null,
+      "kv_transfer_params": null,
+      "metrics": null
+    },
+    "correct": true
+  },
+  {
+    "case": "photo",
+    "status": 200,
+    "seconds": 12.029661528998986,
+    "response": {
+      "id": "chatcmpl-80cd495e658fd33f",
+      "object": "chat.completion",
+      "created": 1793811756,
+      "model": "hy4-vl",
+      "choices": [
+        {
+          "index": 0,
+          "message": {
+            "role": "assistant",
+            "content": "这张春日图景里，粉嫩的樱花枝桠在前景舒展，湛蓝晴空下，中央电视塔在花簇间露出银白塔身，明媚的花与冷峻的建筑相映，满是春日的清新浪漫。",
+            "refusal": null,
+            "annotations": null,
+            "audio": null,
+            "function_call": null,
+            "reasoning": null
+          },
+          "logprobs": null,
+          "finish_reason": "stop",
+          "stop_reason": null,
+          "token_ids": null,
+          "routed_experts": null
+        }
+      ],
+      "service_tier": null,
+      "system_fingerprint": "vllm-0.25.1-tp8-1717c158",
+      "usage": {
+        "prompt_tokens": 1072,
+        "total_tokens": 1123,
+        "completion_tokens": 51,
+        "prompt_tokens_details": null
+      },
+      "prompt_logprobs": null,
+      "prompt_token_ids": null,
+      "prompt_text": null,
+      "kv_transfer_params": null,
+      "metrics": null
+    },
+    "correct": null
+  }
+]

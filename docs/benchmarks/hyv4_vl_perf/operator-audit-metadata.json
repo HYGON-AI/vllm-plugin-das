@@ -1,0 +1,24 @@
+{
+  "cases": {
+    "368": {
+      "png_sha256": "55aad8f1ebffe32e6b60cd7a6e250ae17fc6ad995ab04b3e564be39e33b7a5f7",
+      "dataset_image_sha256": "55aad8f1ebffe32e6b60cd7a6e250ae17fc6ad995ab04b3e564be39e33b7a5f7"
+    },
+    "374": {
+      "png_sha256": "11f453ba8125a8fbb832ec422fcac3156270152d95c17fdafb0081418679df69",
+      "dataset_image_sha256": "11f453ba8125a8fbb832ec422fcac3156270152d95c17fdafb0081418679df69"
+    },
+    "552": {
+      "png_sha256": "df760831b4409adc8d565c95777b0f58b1397115dd847ee3b9771057ebdcfce8",
+      "dataset_image_sha256": "df760831b4409adc8d565c95777b0f58b1397115dd847ee3b9771057ebdcfce8"
+    },
+    "571": {
+      "png_sha256": "feee49cf2c002eb4f9e01992d9287528e75d7d00b2e9facb6d387b4e90fe418a",
+      "dataset_image_sha256": "feee49cf2c002eb4f9e01992d9287528e75d7d00b2e9facb6d387b4e90fe418a"
+    }
+  },
+  "source_sha256": {
+    "hyv4_perf_worker.py": "0f89ee4170431e7fca38911963f48f6e2e7b2bac4bce36a51d2da06b9dd999ab",
+    "run_operator_audit.py": "13e28bfbe7b91d042aa73f515e7ee45ea61fe75a1f755eac0d1dfc2002bcc5bd"
+  }
+}

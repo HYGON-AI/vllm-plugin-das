@@ -1,8 +1,8 @@
 # SPDX-License-Identifier: Apache-2.0
 """Compare real HYV4 vision weights with an isolated reference plugin checkout.
 
-Uses one HCU (TP1), five warmups and 15 CUDA-event samples per input case.
-Supply image cases with --case NAME IMAGE [IMAGE ...].
+Defaults to one HCU (TP1), five warmups and 15 CUDA-event samples per input case.
+Use torchrun and --tp-size for TP8. Supply cases with --case NAME IMAGE [IMAGE ...].
 """
 
 import argparse

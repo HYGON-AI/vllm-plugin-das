@@ -1,8 +1,8 @@
 # SPDX-License-Identifier: Apache-2.0
-"""Measure cold-image TTFT, latency and throughput on fixed RealWorldQA items.
+"""Measure streaming TTFT, latency and throughput on fixed RealWorldQA items.
 
-Run the server with both prefix caching and the MM processor cache disabled.
-Inputs are encoded before timing. Streaming measurements start before HTTP POST.
+Disable prefix and MM processor caches; the GPU encoder LRU remains enabled.
+Inputs are encoded before timing. Measurements start before HTTP POST.
 """
 
 import argparse
@@ -132,6 +132,7 @@ def main():
         "max_pixels": 1048576,
         "prefix_cache": False,
         "mm_processor_cache_gb": 0,
+        "encoder_embedding_cache": "default vLLM LRU; embeddings may be reused",
         "timing": "streaming HTTP; payload prepared before timing",
     }
     (args.output_dir / "manifest.json").write_text(json.dumps(manifest, indent=2))

@@ -1,0 +1,49 @@
+{
+  "items": 765,
+  "baseline_correct": 560,
+  "optimized_correct": 558,
+  "baseline_strict_correct": 545,
+  "optimized_strict_correct": 542,
+  "raw_answer_changes": 4,
+  "normalized_answer_changes": 4,
+  "gained": 1,
+  "regressed": 3,
+  "changes": [
+    {
+      "index": 368,
+      "reference": "No",
+      "baseline": "No",
+      "optimized": "Yes",
+      "baseline_correct": true,
+      "optimized_correct": false,
+      "normalized_changed": true
+    },
+    {
+      "index": 374,
+      "reference": "Pedestrian",
+      "baseline": "The pedestrian",
+      "optimized": "pedestrian",
+      "baseline_correct": false,
+      "optimized_correct": true,
+      "normalized_changed": true
+    },
+    {
+      "index": 552,
+      "reference": "2",
+      "baseline": "2",
+      "optimized": "3",
+      "baseline_correct": true,
+      "optimized_correct": false,
+      "normalized_changed": true
+    },
+    {
+      "index": 571,
+      "reference": "Red",
+      "baseline": "Red",
+      "optimized": "Green",
+      "baseline_correct": true,
+      "optimized_correct": false,
+      "normalized_changed": true
+    }
+  ]
+}

@@ -1,0 +1,62 @@
+[
+  {
+    "ttft_seconds": 1.0060394180036383,
+    "latency_seconds": 8.660372248006752,
+    "decode_seconds_per_token": 0.24689033864518523,
+    "usage": {
+      "prompt_tokens": 1032,
+      "total_tokens": 1064,
+      "completion_tokens": 32
+    },
+    "answer": "This is a view from inside a vehicle, looking out through a rain-streaked windshield onto a wide, multi-lane road on a heavily overcast,",
+    "finish_reason": "length",
+    "index": 112,
+    "second_index": null,
+    "reference": "A"
+  },
+  {
+    "ttft_seconds": 0.4082791010005167,
+    "latency_seconds": 8.062375516004977,
+    "decode_seconds_per_token": 0.24689152890313115,
+    "usage": {
+      "prompt_tokens": 578,
+      "total_tokens": 610,
+      "completion_tokens": 32
+    },
+    "answer": "This is a close-up, slightly high-angle shot of two glass spice grinders placed side-by-side on a light-colored wooden cutting board or countertop. The",
+    "finish_reason": "length",
+    "index": 422,
+    "second_index": null,
+    "reference": "B"
+  },
+  {
+    "ttft_seconds": 0.8433332040003734,
+    "latency_seconds": 8.51658460899489,
+    "decode_seconds_per_token": 0.2475093957097758,
+    "usage": {
+      "prompt_tokens": 1032,
+      "total_tokens": 1064,
+      "completion_tokens": 32
+    },
+    "answer": "This is a daytime, wide-angle shot of a quiet urban intersection, likely in a hilly city like San Francisco, given the steep street and architectural style.",
+    "finish_reason": "length",
+    "index": 287,
+    "second_index": null,
+    "reference": "No"
+  },
+  {
+    "ttft_seconds": 0.8417509229911957,
+    "latency_seconds": 8.521212715000729,
+    "decode_seconds_per_token": 0.24771157006457103,
+    "usage": {
+      "prompt_tokens": 1032,
+      "total_tokens": 1064,
+      "completion_tokens": 32
+    },
+    "answer": "This is a street scene, likely in San Francisco, California, given the street sign and the style of the traffic lights and banners. The photo is taken",
+    "finish_reason": "length",
+    "index": 478,
+    "second_index": null,
+    "reference": "11"
+  }
+]

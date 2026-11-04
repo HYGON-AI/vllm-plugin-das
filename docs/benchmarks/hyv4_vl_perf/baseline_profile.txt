@@ -1,0 +1,41 @@
+-------------------------------------------------------  ------------  ------------  ------------  ------------  ------------  ------------  ------------  ------------  ------------  ------------
+                                                   Name    Self CPU %      Self CPU   CPU total %     CPU total  CPU time avg     Self CUDA   Self CUDA %    CUDA total  CUDA time avg    # of Calls
+-------------------------------------------------------  ------------  ------------  ------------  ------------  ------------  ------------  ------------  ------------  ------------  ------------
+                               aten::miopen_convolution         0.19%     298.991us         0.25%     396.300us     132.100us      60.373ms        37.23%      60.488ms      20.163ms             3
+conv2d_nchw_bf16_fwd_implicitgemm_wg128x128_tt8x8_su...         0.00%       0.000us         0.00%       0.000us       0.000us      58.783ms        36.25%      58.783ms      58.783ms             1
+                                               aten::mm         1.66%       2.626ms         2.21%       3.490ms      21.810us      38.074ms        23.48%      38.074ms     237.963us           160
+Cijk_Ailk_Bljk_BBH_MT256x256x16_SE_AMAS3_BW_DTL0_BL1...         0.00%       0.000us         0.00%       0.000us       0.000us      33.670ms        20.76%      33.670ms     280.587us           120
+                           flash_attn2_c_op::varlen_fwd         0.33%     525.530us         0.67%       1.057ms      26.415us      31.183ms        19.23%      31.183ms     779.575us            40
+void flash_fwd_kernel_16x64_prefetch<Flash_fwd_kerne...         0.00%       0.000us         0.00%       0.000us       0.000us      31.183ms        19.23%      31.183ms     779.575us            40
+                                              aten::add         0.89%       1.403ms         1.34%       2.124ms       8.779us      14.231ms         8.78%      14.231ms      58.804us           242
+void at::native::elementwise_kernel_manual_unroll<12...         0.00%       0.000us         0.00%       0.000us       0.000us      12.338ms         7.61%      12.338ms      75.692us           163
+                                             aten::gelu         0.14%     214.736us         0.21%     334.412us       8.156us      10.496ms         6.47%      10.496ms     256.007us            41
+void at::native::vectorized_elementwise_kernel<8, at...         0.00%       0.000us         0.00%       0.000us       0.000us      10.496ms         6.47%      10.496ms     256.007us            41
+                                aten::native_layer_norm         0.37%     587.085us         0.86%       1.367ms      17.091us       6.014ms         3.71%       6.014ms      75.179us            80
+void at::native::(anonymous namespace)::vectorized_l...         0.00%       0.000us         0.00%       0.000us       0.000us       6.014ms         3.71%       6.014ms      75.179us            80
+Cijk_Ailk_Bljk_BBH_MT256x256x16_SE_AMAS3_BW_DTL0_BL1...         0.00%       0.000us         0.00%       0.000us       0.000us       4.404ms         2.72%       4.404ms     110.091us            40
+void at::native::vectorized_elementwise_kernel<8, at...         0.00%       0.000us         0.00%       0.000us       0.000us       2.004ms         1.24%       2.004ms      24.746us            81
+                                              aten::cat         0.26%     407.421us         0.53%     838.582us      19.966us       1.008ms         0.62%       1.008ms      23.995us            42
+                         Memcpy DtoD (Device -> Device)         0.00%       0.000us         0.00%       0.000us       0.000us     882.519us         0.54%     882.519us      21.525us            41
+conv2d_ncxdhw16_bf16_fwd_implicitgemm_wg128x128_tt8x...         0.00%       0.000us         0.00%       0.000us       0.000us     657.279us         0.41%     657.279us     657.279us             1
+                            nchw2cxhwn16_fp16_nopadding         0.00%       0.000us         0.00%       0.000us       0.000us     488.959us         0.30%     488.959us     488.959us             1
+Cijk_Ailk_Bljk_BBH_MT256x256x16_SE_AMAS3_BW_DTL0_BL1...         0.00%       0.000us         0.00%       0.000us       0.000us     398.239us         0.25%     398.239us     398.239us             1
+                                            aten::copy_         0.06%      93.858us        88.62%     140.161ms      23.360ms     231.670us         0.14%     231.670us      38.612us             6
+                                           aten::arange         0.16%     248.805us         0.62%     986.524us      12.332us     212.440us         0.13%     424.880us       5.311us            80
+void (anonymous namespace)::elementwise_kernel_with_...         0.00%       0.000us         0.00%       0.000us       0.000us     212.440us         0.13%     212.440us       5.311us            40
+void at::native::(anonymous namespace)::CatArrayBatc...         0.00%       0.000us         0.00%       0.000us       0.000us     125.279us         0.08%     125.279us     125.279us             1
+                                             aten::add_         0.02%      31.490us         0.03%      40.960us      13.653us     115.517us         0.07%     115.517us      38.506us             3
+                                              aten::mul         0.01%      16.619us         0.01%      23.179us      11.590us      91.678us         0.06%      91.678us      45.839us             2
+                              aten::upsample_bilinear2d         0.01%      17.390us         0.02%      23.890us      23.890us      68.639us         0.04%      68.639us      68.639us             1
+void at::native::(anonymous namespace)::upsample_bil...         0.00%       0.000us         0.00%       0.000us       0.000us      68.639us         0.04%      68.639us      68.639us             1
+                           Memcpy DtoH (Device -> Host)         0.00%       0.000us         0.00%       0.000us       0.000us      63.677us         0.04%      63.677us      63.677us             1
+                           Memcpy HtoD (Host -> Device)         0.00%       0.000us         0.00%       0.000us       0.000us      53.917us         0.03%      53.917us      53.917us             1
+void at::native::elementwise_kernel_manual_unroll<12...         0.00%       0.000us         0.00%       0.000us       0.000us      51.039us         0.03%      51.039us      51.039us             1
+void at::native::vectorized_elementwise_kernel<4, at...         0.00%       0.000us         0.00%       0.000us       0.000us      45.918us         0.03%      45.918us      22.959us             2
+void at::native::(anonymous namespace)::permute_copy...         0.00%       0.000us         0.00%       0.000us       0.000us      45.759us         0.03%      45.759us      45.759us             1
+void at::native::elementwise_kernel_manual_unroll<12...         0.00%       0.000us         0.00%       0.000us       0.000us      40.639us         0.03%      40.639us      40.639us             1
+                            nchw2ncxhw16_fp16_nopadding         0.00%       0.000us         0.00%       0.000us       0.000us      39.839us         0.02%      39.839us      39.839us             1
+                                             aten::mean         0.01%      20.299us         0.02%      24.409us      24.409us      31.039us         0.02%      31.039us      31.039us             1
+-------------------------------------------------------  ------------  ------------  ------------  ------------  ------------  ------------  ------------  ------------  ------------  ------------
+Self CPU time total: 158.160ms
+Self CUDA time total: 162.169ms
