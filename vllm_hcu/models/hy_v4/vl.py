@@ -75,19 +75,21 @@ class HYV4VLProcessor(HunYuanVLProcessor):
                 images=images, return_tensors="pt", **image_kwargs
             )
         texts = [text] if isinstance(text, str) else list(text)
-        grids = iter(image_inputs.get("image_grid_thw", []))
-        for i, prompt in enumerate(texts):
-            pieces = prompt.split(self.image_token)
-            expanded = pieces[0]
-            for tail in pieces[1:]:
-                grid = next(grids, None)
-                if grid is None:
-                    raise ValueError("More image placeholders than images")
-                h, w = (int(x) // self.image_processor.merge_size for x in grid[-2:])
-                expanded += self.image_token * (h * (w + 1)) + tail
-            texts[i] = expanded
-        if next(grids, None) is not None:
-            raise ValueError("More images than image placeholders")
+        # Cached multimodal inputs are tokenized without images by vLLM.
+        if images is not None:
+            grids = iter(image_inputs.get("image_grid_thw", []))
+            for i, prompt in enumerate(texts):
+                pieces = prompt.split(self.image_token)
+                expanded = pieces[0]
+                for tail in pieces[1:]:
+                    grid = next(grids, None)
+                    if grid is None:
+                        raise ValueError("More image placeholders than images")
+                    h, w = (int(x) // self.image_processor.merge_size for x in grid[-2:])
+                    expanded += self.image_token * (h * (w + 1)) + tail
+                texts[i] = expanded
+            if next(grids, None) is not None:
+                raise ValueError("More images than image placeholders")
         tokens = self.tokenizer(
             texts, add_special_tokens=False, return_tensors=return_tensors, **kwargs
         )

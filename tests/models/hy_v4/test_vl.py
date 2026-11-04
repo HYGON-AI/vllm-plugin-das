@@ -4,7 +4,11 @@ from types import SimpleNamespace
 import pytest
 import torch
 
-from vllm_hcu.models.hy_v4.vl import HYV4VisionMerger, HYV4VLForConditionalGeneration
+from vllm_hcu.models.hy_v4.vl import (
+    HYV4VisionMerger,
+    HYV4VLForConditionalGeneration,
+    HYV4VLProcessor,
+)
 from vllm_hcu.models.hy_v4.vl_config import HYV4VLConfig
 
 
@@ -38,6 +42,16 @@ def test_flat_config_round_trip():
     assert copy.hidden_size == 16
     assert copy.vision_config.hidden_size == 8
     assert copy.kv_lora_rank == 512
+
+
+def test_text_only_cached_prompt_preserves_image_placeholders():
+    def tokenize(texts, **kwargs):
+        assert texts == ["before<image>after"]
+        return {"input_ids": [[1, 120120, 2]]}
+
+    processor = SimpleNamespace(image_token="<image>", tokenizer=tokenize)
+    result = HYV4VLProcessor.__call__(processor, text="before<image>after")
+    assert result["input_ids"] == [[1, 120120, 2]]
 
 
 def test_positions_two_rectangular_images_include_row_separators():
