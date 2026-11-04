@@ -1051,6 +1051,25 @@ def rocm_fp8_paged_mqa_logits(
                 max_context_len=max_model_len,
                 clean_logits=False,
             )
+        # Keep the packed LightOp workspace below its 2 GiB offset limit.
+        # Native MTP verification may flatten all queries to next_n == 1.
+        if (
+            token_major and not clean_logits and block_size == 64
+            and q_fp8.shape[2:] == (64, 128) and batch_size * next_n >= 6
+            and (kv_cache_fp8.shape[0] + 1) * block_size * 132 < (1 << 31)
+            and kv_cache_fp8.stride(0) % 4 == 0
+            and henvs.optional_custom_op_enabled(
+                henvs.VLLM_HCU_DSV4_INDEXER_COMPACT_DECODE
+            )
+        ):
+            from vllm_hcu.v1.attention.ops.dsv4_compact_indexer import (
+                compact_indexer_logits,
+            )
+
+            return compact_indexer_logits(
+                q_fp8, kv_cache_fp8, weights, context_lens,
+                block_tables, max_model_len,
+            )
         return gfx938_fp8_paged_mqa_logits(
             q_fp8,
             kv_cache_fp8,

@@ -42,6 +42,7 @@ if TYPE_CHECKING:
     VLLM_HCU_LIGHTLY_CP_THRESHOLD: int = 2048
     VLLM_HCU_USE_LIGHTOP_TOPK: bool = False
     VLLM_HCU_USE_LIGHTOP_SPARSE_MLA_TOPK: bool = True
+    VLLM_HCU_DSV4_INDEXER_COMPACT_DECODE: bool = True
     VLLM_HCU_USE_LIGHTOP_FAST_TOPK_TRANSFORM: bool = True
     VLLM_HCU_USE_AITER_MHC: bool = True
     VLLM_HCU_USE_TILELANG_MHC_PRENORM: bool = True
@@ -471,6 +472,11 @@ hcu_vllm_environment_variables: dict[str, Callable[[], Any]] = {
     "VLLM_HCU_USE_LIGHTOP_TOPK":
         lambda: (os.environ.get("VLLM_HCU_USE_LIGHTOP_TOPK", "True").lower() in
                     ("true", "1")),
+
+    # Stage live token-major indexer pages for gfx938 speculative decode.
+    "VLLM_HCU_DSV4_INDEXER_COMPACT_DECODE":
+        lambda: os.environ.get("VLLM_HCU_DSV4_INDEXER_COMPACT_DECODE", "1").lower()
+        in ("true", "1"),
 
     # If set, use LightOp top_k_per_row kernels for sparse MLA prefill/decode indices.
     "VLLM_HCU_USE_LIGHTOP_SPARSE_MLA_TOPK":

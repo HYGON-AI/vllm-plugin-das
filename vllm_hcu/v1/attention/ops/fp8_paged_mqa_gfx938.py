@@ -9,6 +9,23 @@ from vllm.triton_utils import tl, triton
 _LIVE_TILE_PROGRAMS = 32
 
 
+class _FlatAddressCache:
+    """Keep HCU's pointer specialization from narrowing large page offsets."""
+
+    def __init__(self, tensor):
+        self.tensor = tensor
+        self.dtype = tensor.dtype
+        self.device = tensor.device
+
+    def data_ptr(self):
+        return self.tensor.data_ptr()
+
+    def ptr_range(self):
+        # The HCU buffer path treats 2--4 GiB byte offsets as signed int32.
+        # No 32-bit range promise: retain the kernel's explicit int64 math.
+        return 1 << 63
+
+
 @triton.jit
 def _paged_logits(
     Q,
@@ -281,9 +298,13 @@ def gfx938_fp8_paged_mqa_logits(
         tile_programs = min(num_tiles, _LIVE_TILE_PROGRAMS)
         kernel = _paged_logits_live_tiles
         grid, tile_args = (batch * next_n, tile_programs), (tile_programs,)
+    physical_bytes = (
+        (cache.shape[0] - 1) * cache.stride(0) + cache.shape[1] * (dim + 4)
+    )
+    cache_arg = _FlatAddressCache(cache) if physical_bytes >= (1 << 31) else cache
     kernel[grid](
         q_fp8,
-        cache,
+        cache_arg,
         weights,
         context_lens,
         block_tables,
