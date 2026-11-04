@@ -162,9 +162,11 @@ def test_deepseek_v4_dspark_keeps_explicit_draft_quantization():
     assert config.draft_model_config.quantization == "slimquant_w4a8"
 
 
-def test_block_mirror_matches_expansion_overwrite_row_order_and_padding():
+@pytest.mark.parametrize("compact", [False, True])
+def test_block_mirror_matches_expansion_overwrite_row_order_and_padding(monkeypatch, compact):
     from vllm_hcu.patch.worker.framework_opt import patch_step5_block_tables as a
 
+    monkeypatch.setenv("HCU_STEP5_COMPACT_HOST_BLOCK_TABLES", str(int(compact)))
     m = ModuleType(a.TARGET_MODULE)
 
     class Tables:
@@ -191,8 +193,24 @@ def test_block_mirror_matches_expansion_overwrite_row_order_and_padding():
     assert gathered[0, :6].tolist() == [6, 7, 10, 11, 14, 15]
     assert gathered[1, :2].tolist() == [4, 5]
     assert not gathered[2].any()
+    assert gathered.shape == (3, 6 if compact else 16)
     t.append_block_ids(1, ([9],), True)
-    assert t.gather_block_tables_np(np.array([1]), 1)[0][0, :2].tolist() == [18, 19]
+    replaced = t.gather_block_tables_np(np.array([1]), 1)[0]
+    assert replaced[0, :2].tolist() == [18, 19]
+    assert replaced.shape == (1, 2 if compact else 16)
+    assert gathered[0, :6].tolist() == [6, 7, 10, 11, 14, 15]
+    # Grow to the full configured capacity, then reorder and repeat rows.
+    t.append_block_ids(1, ([10, 11, 12, 13, 14, 15, 16],), False)
+    full = t.gather_block_tables_np(np.array([0, 1, 1]), 3)[0]
+    assert full.shape == (3, 16)
+    assert full[1].tolist() == list(range(18, 34))
+    assert np.array_equal(full[1], full[2])
+    # Empty batches still provide an inert column for padded metadata.
+    empty = t.gather_block_tables_np(np.array([], dtype=np.int64), 2)[0]
+    assert empty.shape == (2, 1 if compact else 16)
+    assert not empty.any()
+    assert not t.gather_block_tables_np(np.array([2]), 1)[0].any()
+    assert not np.shares_memory(full, t._vllm_hcu_block_tables_np[0])
 
 
 def test_metadata_extension_is_owned_without_changing_upstream_dataclass():

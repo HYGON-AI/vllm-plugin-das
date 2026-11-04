@@ -1,10 +1,14 @@
 """CPU tests with a fake broadcast; NOT multi-GPU correctness validation."""
+import ast
+import copy
 import importlib.util
 from pathlib import Path
-from types import SimpleNamespace
+import sys
+from types import ModuleType, SimpleNamespace
 import unittest
 from unittest.mock import patch
 
+import pytest
 import torch
 
 module_path = Path(__file__).resolve().parents[2]/"vllm_hcu/v1/glm53_pcp_mtp_sync.py"
@@ -100,6 +104,59 @@ class SyncTests(unittest.TestCase):
         out=(SimpleNamespace(sampled_token_ids=torch.empty((0,4),dtype=torch.int64)),counts,counts.clone())
         sync.sync_glm53_pcp_sampler_output(SimpleNamespace(_hcu_glm53_pcp_mtp_sync_group=group),out)
         self.assertEqual(group.calls,0)
+
+
+@pytest.mark.parametrize("is_profiling", [False, True])
+@pytest.mark.parametrize("is_step5", [False, True])
+@pytest.mark.parametrize("ubatch_state", ["missing", "none", "present"])
+def test_runner_initialization_keeps_glm53_sync_and_step5_dbo_independent(
+    monkeypatch, is_profiling, is_step5, ubatch_state
+):
+    """Execute the actual merged initialization tail with CPU-only doubles."""
+    path = Path(__file__).resolve().parents[2] / "vllm_hcu/v1/hcu_model_runner_v2.py"
+    tree = ast.parse(path.read_text(encoding="utf-8"))
+    owner = next(
+        node for node in tree.body
+        if isinstance(node, ast.ClassDef) and node.name == "HcuGPUModelRunnerV2"
+    )
+    method = copy.deepcopy(next(
+        node for node in owner.body
+        if isinstance(node, ast.FunctionDef) and node.name == "initialize_kv_cache"
+    ))
+    start = next(
+        index for index, node in enumerate(method.body)
+        if isinstance(node, ast.Expr)
+        and isinstance(node.value, ast.Call)
+        and isinstance(node.value.func, ast.Attribute)
+        and node.value.func.attr == "_init_host_seq_lens"
+    )
+    method.body = method.body[start:]
+    method.decorator_list = []
+    module = ast.fix_missing_locations(ast.Module(body=[method], type_ignores=[]))
+
+    calls = []
+    dbo = ModuleType("vllm_hcu.v1.hcu_dbo")
+    dbo.install_runner = lambda runner: calls.append("step5_dbo")
+    monkeypatch.setitem(sys.modules, dbo.__name__, dbo)
+    namespace = {
+        "is_step5_config": lambda config: config.step5,
+        "install_glm53_pcp_mtp_sync": lambda runner: calls.append("glm53_sync"),
+    }
+    exec(compile(module, str(path), "exec"), namespace)
+    runner = SimpleNamespace(
+        vllm_config=SimpleNamespace(step5=is_step5),
+        _init_host_seq_lens=lambda: calls.append("host_seq_lens"),
+    )
+    if ubatch_state != "missing":
+        runner.ubatch_runner = object() if ubatch_state == "present" else None
+    namespace["initialize_kv_cache"](runner, None, is_profiling=is_profiling)
+
+    expected = ["host_seq_lens"]
+    if not is_profiling:
+        expected.append("glm53_sync")
+    if is_step5 and ubatch_state == "present":
+        expected.append("step5_dbo")
+    assert calls == expected
 
 
 if __name__=="__main__":

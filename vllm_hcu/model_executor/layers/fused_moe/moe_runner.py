@@ -62,6 +62,9 @@ from vllm.utils.torch_utils import (
     direct_register_custom_op,
 )
 from vllm_hcu.platforms import envs as henvs
+from vllm_hcu.model_executor.layers.fused_moe.combine_runtime import (
+    ep_shared_add_allowed,
+)
 
 logger = init_logger(__name__)
 
@@ -154,7 +157,7 @@ class _EpFusedCombineState:
         """For the EP fused experts: (shared_output, row_start) to add into
         the rows of ``out`` the finalize hook would add it to, else None.
         Only when the hook is then guaranteed to take the fused path."""
-        if self.shared is None or self.added_to is not None:
+        if not ep_shared_add_allowed() or self.shared is None or self.added_to is not None:
             return None
         rows = _ep_fused_rows(out)
         if rows is None:
@@ -185,7 +188,7 @@ class _EpFusedCombineState:
 
 
 _EP_COMBINE = _EpFusedCombineState()
-if _EP_FUSED_COMBINE:
+def _install_step5_combine_hooks():
     from vllm_hcu.model_executor.layers.fused_moe.combine_runtime import (
         set_finalize_combine_hook,
     )
@@ -430,6 +433,9 @@ class MoERunner(MoERunnerInterface):
         routed_scaling_factor: float = 1.0,
     ):
         super().__init__()
+        from vllm_hcu.runtime_compat.step5 import is_step5_owner
+
+        self._hcu_step5_owner = is_step5_owner(moe_config)
         self.moe_config = moe_config
         self.router = router
         self.routed_input_transform = routed_input_transform
@@ -473,6 +479,7 @@ class MoERunner(MoERunnerInterface):
         self._ep_fused_combine = (
             _EP_FUSED_COMBINE
             and not getattr(self._quant_method, "hcu_owns_dispatch", False)
+            and self._hcu_step5_owner
             and shared_experts is not None
             and moe_config.dp_size > 1
             and moe_config.pcp_size == 1
@@ -482,6 +489,8 @@ class MoERunner(MoERunnerInterface):
             and routed_input_transform is None
             and routed_output_transform is None
         )
+        if self._ep_fused_combine:
+            _install_step5_combine_hooks()
 
         # Needed for string -> MoERunner layer lookup in custom ops.
         self.layer_name = layer_name
@@ -964,6 +973,14 @@ class MoERunner(MoERunnerInterface):
             SharedExpertsOrder.MULTI_STREAM_OVERLAPPED,
             x_and_scale_quanted=shared_experts_quanted_input,
         )
+        # A pipelined DP MoE (HCU_DP_MOE_PIPE_MIN_TOKENS) left its last reduce
+        # on a side stream; the late shared expert launched above overlaps it.
+        if getattr(self, "_hcu_step5_owner", False):
+            from vllm.model_executor.layers.fused_moe.modular_kernel import (
+                join_dp_moe_pipe,
+            )
+
+            join_dp_moe_pipe()
 
         return (
             self._shared_experts.output if self._shared_experts is not None else None,
@@ -1274,14 +1291,21 @@ class MoERunner(MoERunnerInterface):
     ) -> torch.Tensor:
         """Final MoE output when the finalize hook did not already fuse it."""
         if self.do_naive_dispatch_combine:
-            if not self._fused_output_is_reduced:
+            if not self._fused_output_is_reduced and _ep_fused_rows(hidden_states):
+                self._wait_late_shared_experts()
                 reduced = _ep_fused_all_reduce(hidden_states, shared_output)
                 if reduced is not None:
                     return reduced
             hidden_states = get_ep_group().combine(hidden_states, False)
+        # A late-launched shared expert overlaps the combine above.
+        self._wait_late_shared_experts()
         # Unfused tail, identical to forward() for this configuration.
         shared_output = self._maybe_reduce_shared_expert_output(shared_output)
         return self._maybe_reduce_final_output(shared_output + hidden_states, None)
+
+    def _wait_late_shared_experts(self) -> None:
+        if getattr(self, "_hcu_step5_owner", False) and self._shared_experts is not None:
+            self._shared_experts.wait_late()
 
     def _maybe_combine(
         self,
@@ -1301,6 +1325,8 @@ class MoERunner(MoERunnerInterface):
             hidden_states = get_ep_group().combine(
                 hidden_states, self.moe_config.is_sequence_parallel
             )
+        if getattr(self, "_hcu_step5_owner", False):
+            self._wait_late_shared_experts()
 
         needs_fallback_pcp_collective = (
             self.moe_config.pcp_size > 1
@@ -1395,7 +1421,22 @@ class MoERunner(MoERunnerInterface):
                 self._maybe_fuse_gate_weights()
                 router_logits = F.linear(hidden_states, self._combined_gate_weight)
             else:
-                router_logits, _ = self.gate(hidden_states)
+                router_logits, gate_aux = self.gate(hidden_states)
+                if gate_aux is not None and getattr(
+                    self.gate, "returns_fused_shared_activation", False
+                ):
+                    shared_layer = (
+                        self._shared_experts._layer
+                        if self._shared_experts is not None else None
+                    )
+                    receive_activation = getattr(
+                        shared_layer, "cache_fused_router_activation", None
+                    )
+                    if callable(receive_activation):
+                        receive_activation(hidden_states, gate_aux)
+                        self._shared_experts.maybe_launch_fused_router_activation(
+                            hidden_states
+                        )
 
         with self._sequence_parallel_context():
             # TODO(bnell): parts of the dispatch/combine steps will go away once

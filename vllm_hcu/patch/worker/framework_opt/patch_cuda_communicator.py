@@ -13,6 +13,7 @@ import torch
 
 from vllm_hcu.patch.config import get_hcu_config
 from vllm_hcu.platforms import envs as henvs
+from vllm_hcu.runtime_compat.step5 import is_step5_config
 
 from vllm_hcu.patch.import_coordinator import (
     IMPORT_COORDINATOR,
@@ -201,12 +202,27 @@ def apply_to_module(module: ModuleType) -> bool:
             tcp_store_group,
             use_all2all,
         )
+        from vllm.config import get_current_vllm_config_or_none
+
+        self._hcu_dp_packed_ag = False
         try:
+            # Preserve the upstream opt-in collective and cleanup lifecycle.
+            # Only the new packed/Fabric providers are Step5-specific.
             _maybe_init_ep_custom_allreduce(self, unique_name)
             _maybe_init_dp_ipc_all_gather(self, unique_name)
-            from vllm.config import get_current_vllm_config_or_none
-
             vllm_config = get_current_vllm_config_or_none()
+            step5_owner = vllm_config is not None and is_step5_config(vllm_config)
+            self._hcu_dp_packed_ag = (
+                step5_owner
+                and henvs.optional_custom_op_enabled(
+                    os.environ.get("VLLM_HCU_DP_PACKED_AG", "0") == "1"
+                )
+                and unique_name.split(":")[0] == "dp"
+                and 2 <= self.world_size <= 16
+            )
+            from vllm_hcu.distributed.device_communicators.step5_dp_fabric import maybe_install
+            maybe_install(self, cpu_group, device, unique_name,
+                          vllm_config=vllm_config)
             if vllm_config is None or not get_hcu_config(vllm_config).deepep_auto:
                 return
             # CudaCommunicator is constructed for DP/TP/PP as well as EP groups.
@@ -237,6 +253,16 @@ def apply_to_module(module: ModuleType) -> bool:
     @functools.wraps(all_gatherv)
     def hcu_all_gatherv(self, input_, dim=0, sizes=None):
         ag = getattr(self, "_hcu_ipc_ag", None)
+        if getattr(self, "_hcu_dp_packed_ag", False) and ag is None:
+            from vllm_hcu.distributed.device_communicators.packed_all_gather import (
+                packed_step5_all_gatherv,
+            )
+
+            packed = packed_step5_all_gatherv(
+                self, input_, all_gatherv, dim=dim, sizes=sizes
+            )
+            if packed is not None:
+                return packed
         if ag is not None and dim == 0:
             single = isinstance(input_, torch.Tensor)
             tensors = [input_] if single else list(input_)

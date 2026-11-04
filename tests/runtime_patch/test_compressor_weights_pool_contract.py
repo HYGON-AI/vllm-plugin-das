@@ -3,11 +3,13 @@
 
 import ast
 from contextlib import contextmanager
+import os
 from pathlib import Path
 from types import ModuleType, SimpleNamespace
 import sys
 
 import pytest
+import torch
 
 
 ROOT = Path(__file__).parents[2]
@@ -29,6 +31,10 @@ def load_method(path, name, base, namespace):
 @pytest.mark.parametrize("with_draft", [False, True])
 @pytest.mark.parametrize("dummy", [False, True])
 def test_worker_binds_target_and_draft_in_initial_pool(monkeypatch, with_draft, dummy):
+    # The extracted method body reads this backend switch through the exec
+    # namespace. Keep this non-Kimi contract on the default path regardless of
+    # ambient developer or CI settings.
+    monkeypatch.setenv("VLLM_KIMI_KDA_PREFILL_BACKEND", "legacy")
     active_pool = None
     pool_entries = []
     allocations = []
@@ -72,8 +78,8 @@ def test_worker_binds_target_and_draft_in_initial_pool(monkeypatch, with_draft, 
         def load_model(self, load_dummy_weights=False):
             assert active_pool == "weights"
             assert load_dummy_weights is dummy
-            self.model = object()
-            self.draft = object() if with_draft else None
+            self.model = torch.nn.Module()
+            self.draft = torch.nn.Module() if with_draft else None
 
         def get_draft_model(self):
             return self.draft
@@ -95,7 +101,9 @@ def test_worker_binds_target_and_draft_in_initial_pool(monkeypatch, with_draft, 
 
     worker_cls = load_method(
         "vllm_hcu/v1/worker.py", "HcuGPUWorker", WorkerBase,
-        {"runner_logger": SimpleNamespace(info=lambda *args: None)},
+        # The extracted body does not inherit module-level imports, so provide
+        # every module-level dependency it reads directly.
+        {"runner_logger": SimpleNamespace(info=lambda *args: None), "os": os},
     )
     worker = worker_cls()
     worker.model_runner = runner_cls()
