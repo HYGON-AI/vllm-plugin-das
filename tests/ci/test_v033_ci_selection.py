@@ -105,18 +105,18 @@ class SelectionTests(unittest.TestCase):
         for job in EXPECTED:
             self.assertIn(job + ':', source)
 
-    def test_portable_runner_does_not_discover_a_legacy_platform_plugin(self):
+    def test_source_runner_does_not_discover_a_legacy_platform_plugin(self):
         sys.path.insert(0, str(ROOT / 'tools'))
         import run_v033_ci
         with patch.dict('os.environ', {'VLLM_PLUGINS': 'legacy_platform',
-                                      'PYTHONPATH': '/old/vllm', 'PYTHONNOUSERSITE': '0'}), \
-             patch.object(sys, 'argv', ['run_v033_ci.py', '--tier', 'portable']), \
-             patch('importlib.metadata.version', return_value='0.33.0'), \
+                                      'PYTHONPATH': '/old/vllm', 'PYTHONNOUSERSITE': '0',
+                                      'VLLM_TARGET_ROOT': str(ROOT)}), \
+             patch.object(sys, 'argv', ['run_v033_ci.py', '--tier', 'source']), \
              patch.object(run_v033_ci, 'validate_result'), \
              patch.object(run_v033_ci.subprocess, 'run') as run:
             run.return_value = subprocess.CompletedProcess([], 0)
             self.assertEqual(run_v033_ci.main(), 0)
-            self.assertEqual(run.call_count, 2)
+            self.assertEqual(run.call_count, 1)
             for call in run.call_args_list:
                 self.assertEqual(call.kwargs['env']['VLLM_PLUGINS'], 'hcu_adapter')
                 self.assertEqual(call.kwargs['env']['HCU_ADAPTER_HOST'], 'none')
