@@ -85,7 +85,7 @@ def test_glm53_rejects_unsupported_speculation(overrides):
 
 @pytest.mark.parametrize("overrides", [
     {"tp": 2}, {"tp": 8}, {"pp": 2}, {"dp": 2}, {"dcp": 2},
-    {"enforce_eager": False}, {"enable_expert_parallel": False},
+    {"enable_expert_parallel": False},
 ])
 @pytest.mark.parametrize("speculative", [False, True])
 def test_glm53_relaxed_topology_admission(overrides, speculative):
@@ -101,8 +101,63 @@ def test_glm53_relaxed_topology_admission(overrides, speculative):
 def test_glm53_combined_relaxed_admission_is_not_execution_qualification(architecture):
     assert _validate_hcu_pcp_scope(_config(
         architecture=architecture, tp=2, pp=2, dp=2, dcp=2,
-        enforce_eager=False, enable_expert_parallel=False,
+        enforce_eager=True, enable_expert_parallel=True,
         multimodal=False, speculative=True,
+    )) is True
+
+
+@pytest.mark.parametrize("architecture", [
+    "Glm5NextForConditionalGeneration", "Glm5NextForCausalLM", "Glm5NextMTPModel",
+])
+@pytest.mark.parametrize("cp_size", [2, 4, 8])
+@pytest.mark.parametrize("head_switch", ["0", "1"])
+@pytest.mark.parametrize("speculative", [False, True])
+def test_glm53_rejects_graph_until_pcp_capture_is_adapted(
+    monkeypatch, architecture, cp_size, head_switch, speculative,
+):
+    monkeypatch.setenv("VLLM_HCU_GLM53_KDA_CP_HEAD_SHARD", head_switch)
+    cfg = _config(
+        architecture=architecture, pcp=cp_size, enforce_eager=False,
+        enable_expert_parallel=True, multimodal=False, speculative=speculative,
+    )
+    with pytest.raises(ValueError, match="GLM-5.3 PCP requires eager execution"):
+        _validate_hcu_pcp_scope(cfg)
+
+
+@pytest.mark.parametrize("architecture", [
+    "Glm5NextForConditionalGeneration", "Glm5NextForCausalLM", "Glm5NextMTPModel",
+])
+@pytest.mark.parametrize("cp_size", [2, 4, 8])
+@pytest.mark.parametrize("dp_size", [2, 4])
+@pytest.mark.parametrize("head_switch", ["0", "1"])
+@pytest.mark.parametrize("speculative", [False, True])
+def test_glm53_rejects_dp_pcp_without_joint_ep_dispatch(
+    monkeypatch, architecture, cp_size, dp_size, head_switch, speculative,
+):
+    monkeypatch.setenv("VLLM_HCU_GLM53_KDA_CP_HEAD_SHARD", head_switch)
+    cfg = _config(
+        architecture=architecture, pcp=cp_size, dp=dp_size,
+        enforce_eager=True, enable_expert_parallel=False, multimodal=False,
+        speculative=speculative, all2all_backend="allgather_reducescatter",
+    )
+    with pytest.raises(ValueError, match=r"GLM-5.3 DP\+PCP without expert parallelism"):
+        _validate_hcu_pcp_scope(cfg)
+
+
+@pytest.mark.parametrize("architecture", [
+    "Glm5NextForConditionalGeneration", "Glm5NextForCausalLM", "Glm5NextMTPModel",
+])
+@pytest.mark.parametrize("cp_size", [2, 4, 8])
+@pytest.mark.parametrize("dp_size", [1, 2, 4])
+def test_glm53_guarded_eager_admission_does_not_hardcode_pcp8(
+    architecture, cp_size, dp_size,
+):
+    # DP1 does not require EP. DP>1 must use EP; admission alone is still not
+    # a full-model correctness qualification for these experimental widths.
+    assert _validate_hcu_pcp_scope(_config(
+        architecture=architecture, pcp=cp_size, dp=dp_size,
+        enforce_eager=True, enable_expert_parallel=(dp_size > 1),
+        multimodal=False,
     )) is True
 
 

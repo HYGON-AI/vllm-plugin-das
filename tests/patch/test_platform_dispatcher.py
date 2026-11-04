@@ -174,6 +174,10 @@ def test_platform_framework_inventory_is_explicit_and_dependency_ordered():
             "vllm.v1.core.kv_cache_coordinator",
         ),
         (
+            "platform.framework_opt.glm53.kda_cp_state",
+            "vllm.models.glm5next.nvidia.model",
+        ),
+        (
             "platform.framework_opt.mtp_indexer_kv_cache_coordinator",
             "vllm.v1.core.kv_cache_coordinator",
         ),
@@ -410,9 +414,9 @@ def test_apply_platform_patches_is_idempotent_narrow_and_reported():
     assert result.returncode == 0, result.stderr
     payload = json.loads(result.stdout.strip().splitlines()[-1])
     assert payload == {
-        "count": 68,
+        "count": 69,
         "replacements": 20,
-        "callbacks": 48,
+        "callbacks": 49,
         "failed": [],
         "builtins_same": True,
         "role": "Main",

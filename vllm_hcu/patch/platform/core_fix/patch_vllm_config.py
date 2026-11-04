@@ -339,7 +339,8 @@ def _require_mrv2_pcp_contract(vllm_config: object) -> None:
     )
     is_glm53 = is_glm53_pcp(vllm_config)
     is_glm53_mtp = _is_glm53_mtp_pcp(vllm_config)
-    # Admission was relaxed for GLM5Next only; this is not execution support.
+    # Arithmetic admission is relaxed for GLM5Next, not every runtime path.
+    # Keep graph capture and combined DP/PCP dispatch behind their own guards.
     relaxed_glm53_topology = is_glm53 or is_glm53_mtp
     if is_glm53:
         _require_glm53_pcp_contract(vllm_config)
@@ -405,6 +406,17 @@ def _require_mrv2_pcp_contract(vllm_config: object) -> None:
         parallel_config, "data_parallel_size", "ParallelConfig"
     ) != 1 and not relaxed_glm53_topology:
         raise ValueError("HCU PCP does not support data parallelism.")
+    if relaxed_glm53_topology and _require_hcu_pcp_attribute(
+        parallel_config, "data_parallel_size", "ParallelConfig"
+    ) > 1 and not _require_hcu_pcp_attribute(
+        parallel_config, "enable_expert_parallel", "ParallelConfig"
+    ):
+        # PCP gathers expand token rows before MoE dispatch. Without EP, the
+        # native DP split sizes still describe the pre-gather local rows.
+        raise ValueError(
+            "GLM-5.3 DP+PCP without expert parallelism is not supported; "
+            "enable expert parallelism or use DP1."
+        )
     if use_mla and not relaxed_glm53_topology and not _require_hcu_pcp_attribute(
         parallel_config, "enable_expert_parallel", "ParallelConfig"
     ):
@@ -413,6 +425,16 @@ def _require_mrv2_pcp_contract(vllm_config: object) -> None:
         model_config, "enforce_eager", "ModelConfig"
     ):
         raise ValueError("GLM-5.2 PCP requires eager execution without graphs.")
+    if relaxed_glm53_topology and not _require_hcu_pcp_attribute(
+        model_config, "enforce_eager", "ModelConfig"
+    ):
+        # Breakable graph capture uses local dummy rows, while real PCP
+        # prefill supplies global KDA metadata. CompilationMode.NONE alone
+        # does not disable that PIECEWISE capture/replay path.
+        raise ValueError(
+            "GLM-5.3 PCP requires eager execution without graphs; "
+            "use --enforce-eager until PCP graph capture/replay is adapted."
+        )
     speculative_config = _require_hcu_pcp_attribute(
         vllm_config, "speculative_config", "VllmConfig"
     )
@@ -571,6 +593,9 @@ def validate_and_update_hcu_config(vllm_config: object) -> HcuFeatureConfig:
         vllm_config, feature_config
     )
     from vllm_hcu.platforms import envs as hcu_envs
+    from vllm_hcu.v1.glm53_kda_cp_config import (
+        glm53_kda_cp_head_shard_enabled,
+    )
 
     updates: dict[str, str | bool] = {
         # The Qwen3 forward wrapper closes over this effective policy. Persist
@@ -585,6 +610,13 @@ def validate_and_update_hcu_config(vllm_config: object) -> HcuFeatureConfig:
         # across restarts cannot load the opposite mode's AOT graph (on mode
         # rewires o_proj.reduce_results and registers the hcu_k3_sp_* ops).
         "k3_sp_moe": hcu_envs.k3_sp_moe_enabled(),
+        # This changes KDA parameter/state shapes and adds PCP reductions.
+        # Freeze the effective mode before hashing, including feature-off.
+        # Revalidation of a serialized worker config keeps its frozen value.
+        "glm53_kda_cp_head_shard": (
+            glm53_kda_cp_head_shard_enabled(vllm_config)
+            if is_glm53_pcp(vllm_config) else False
+        ),
         "dp_int8_allgather": hcu_envs.dp_int8_allgather_enabled(),
     }
     if feature_config.hcu_flash_attn_mode is None:

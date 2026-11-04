@@ -676,7 +676,8 @@ def apply_to_module(module: ModuleType) -> bool:
                 "k3_sp_moe",
                 "dp_int8_allgather",
             ) or (
-                name == "hcu_flash_attn_mode" and expected is None
+                name in ("hcu_flash_attn_mode", "glm53_kda_cp_head_shard")
+                and expected is None
             ):
                 continue
             if resolved[name] != expected:

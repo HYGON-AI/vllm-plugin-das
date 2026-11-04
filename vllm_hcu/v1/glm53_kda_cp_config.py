@@ -10,6 +10,24 @@ from typing import Literal
 KDA_CP_HEAD_ENV = "VLLM_HCU_GLM53_KDA_CP_HEAD_SHARD"
 
 
+def glm53_kda_cp_head_shard_enabled(vllm_config: object) -> bool:
+    """Read the frozen policy, or resolve the initial launch environment.
+
+    Platform validation persists this decision before compilation hashing.
+    Keep the environment fallback for unvalidated CPU-only config adapters;
+    serialized engine/worker configs must not change modes with local env.
+    """
+    from vllm_hcu.patch.config import get_hcu_config
+
+    feature = get_hcu_config(getattr(vllm_config, "additional_config", None))
+    if feature.glm53_kda_cp_head_shard is not None:
+        return feature.glm53_kda_cp_head_shard
+    value = os.environ.get(KDA_CP_HEAD_ENV, "0")
+    if value not in ("0", "1"):
+        raise ValueError(f"{KDA_CP_HEAD_ENV} must be 0 or 1, got {value!r}")
+    return value == "1"
+
+
 def _positive_size(value: int, name: str) -> int:
     if type(value) is not int or value <= 0:
         raise ValueError(f"{name} must be a positive integer, got {value!r}")
@@ -65,12 +83,10 @@ def resolve_kda_head_parallel(vllm_config: object) -> KdaHeadParallelPlan:
     TP/PCP. Topology admission is deliberately relaxed; execution capability
     still depends on the model, metadata, communication and graph paths.
     """
-    value = os.environ.get(KDA_CP_HEAD_ENV, "0")
-    if value not in ("0", "1"):
-        raise ValueError(f"{KDA_CP_HEAD_ENV} must be 0 or 1, got {value!r}")
+    enabled = glm53_kda_cp_head_shard_enabled(vllm_config)
     parallel = vllm_config.parallel_config
     tp_size = _positive_size(parallel.tensor_parallel_size, "TP size")
-    if value == "0":
+    if not enabled:
         return KdaHeadParallelPlan("tp", tp_size)
     pcp_size = _positive_size(parallel.prefill_context_parallel_size, "PCP size")
     if pcp_size == 1:
