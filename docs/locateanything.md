@@ -46,6 +46,21 @@ For direct `vllm serve`, set this variable to `slow` or `fast` before startup an
 use the same flags as the wrapper. Mode is process-wide: use independent servers
 for Slow/Fast. Do not enable Fast for other model families.
 
+Fast interprets `--max-model-len` as the physical capacity, including six probe
+slots. Its logical prompt/output limit is `max-model-len - 6` throughout API
+validation, default output-budget calculation, scheduling and stopping. For
+example, `--max-model-len 4096` allows 4090 logical tokens. Requests that exceed
+this logical budget are rejected before generation; the final Fast block keeps
+its original up-to-five-token budget overshoot and finishes before another
+physical query is needed. Startup synthetic requests also respect this context
+limit. The default physical/logical pair remains 16390/16384.
+
+`--model` accepts either a downloaded directory or a Hugging Face model ID, such
+as `nvidia/LocateAnything-3B`. The processor reuses vLLM's resolved image config;
+fallback and standalone loading use the standard Transformers Hub resolver,
+preserving revision, authentication and cache options. Offline use requires the
+requested revision and files to be present in the Hub cache.
+
 The model names are `locateanything-native-slow` and `locateanything-native-fast`.
 Use one image and the original detection question with `/v1/chat/completions`.
 The original special-token output is interpreted by the official box parser.

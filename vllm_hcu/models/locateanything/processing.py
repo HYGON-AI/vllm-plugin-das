@@ -17,6 +17,7 @@ import torch
 from PIL import Image
 from torchvision.transforms import functional as TF
 from transformers import BatchFeature
+from transformers.utils.hub import cached_file
 
 IMAGE_TOKEN = "<IMG_CONTEXT>"
 
@@ -167,11 +168,20 @@ class LocateAnythingImageProcessor:
             raise ValueError("merge_kernel_size must contain two positive integers")
 
     @classmethod
-    def from_pretrained(cls, model_path, **overrides):
-        config_path = Path(model_path) / "preprocessor_config.json"
-        if not config_path.is_file():
-            raise FileNotFoundError(f"Original checkpoint preprocessor config required: {config_path}")
+    def from_pretrained(cls, model_path, *, revision=None, token=None, cache_dir=None,
+                        local_files_only=False, subfolder="", **overrides):
+        config_path = cached_file(model_path, "preprocessor_config.json", revision=revision,
+                                  token=token, cache_dir=cache_dir,
+                                  local_files_only=local_files_only, subfolder=subfolder)
+        if config_path is None:
+            raise FileNotFoundError("Original checkpoint preprocessor_config.json is required")
+        config_path = Path(config_path)
         settings = json.loads(config_path.read_text(encoding="utf-8"))
+        return cls.from_config(settings, **overrides)
+
+    @classmethod
+    def from_config(cls, settings, **overrides):
+        settings = dict(settings)
         names = ("patch_size", "in_token_limit", "image_mean", "image_std", "merge_kernel_size")
         settings.update({k: v for k, v in overrides.items() if k in names})
         return cls(**settings)

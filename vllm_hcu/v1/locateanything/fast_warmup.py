@@ -7,13 +7,15 @@ import torch
 from vllm import SamplingParams
 from vllm.v1.core.sched.output import NewRequestData, CachedRequestData, SchedulerOutput
 from vllm_hcu.v1.locateanything.warmup_budget import warmup_prompts as _warmup_prompts
+from vllm_hcu.v1.locateanything.limits import logical_context_limit
 
 
 def warmup(runner, execute, sample):
     from vllm.v1.worker.gpu.warmup import _warmup_block_counter
     block_count=_warmup_block_counter(runner)
     specs=[g.kv_cache_spec for g in runner.kv_cache_config.kv_cache_groups]
-    prompts=_warmup_prompts(runner.max_num_reqs, runner.max_num_tokens)
+    logical_limit=logical_context_limit(runner.model_config.max_model_len)
+    prompts=_warmup_prompts(runner.max_num_reqs, runner.max_num_tokens, logical_limit)
     n=len(prompts)
     ids=[f'_locate_fast_warmup_{i}' for i in range(n)]
     next_block=1
@@ -24,8 +26,8 @@ def warmup(runner, execute, sample):
     start=SchedulerOutput.make_empty()
     start.scheduled_new_reqs=[NewRequestData(
         req_id=rid,prompt_token_ids=prompt,mm_features=[],
-        sampling_params=SamplingParams(max_tokens=128,temperature=.7,top_p=.9,repetition_penalty=1.1,seed=i),
-        pooling_params=None,block_ids=tuple(allocate(block_count(len(prompt)+128+6,s)) for s in specs),
+        sampling_params=SamplingParams(max_tokens=min(128,logical_limit-len(prompt)),temperature=.7,top_p=.9,repetition_penalty=1.1,seed=i),
+        pooling_params=None,block_ids=tuple(allocate(block_count(len(prompt)+min(128,logical_limit-len(prompt))+6,s)) for s in specs),
         num_computed_tokens=0,lora_request=None,prefill_token_ids=prompt)
         for i,(rid,prompt) in enumerate(zip(ids,prompts))]
     assert next_block < runner.kv_cache_config.num_blocks
@@ -62,9 +64,11 @@ def warmup(runner, execute, sample):
             records.append({'step':step,'requests':len(mapping),'query_lengths':physical,
                             'committed_kv':after,'new_output_counts':[t-c for t,c in zip(totals,after)]})
             # Shrink/reorder batches to exercise request-index independence.
-            selected=list(reversed(range(len(mapping))))
+            selected=[i for i in reversed(range(len(mapping))) if totals[i] < logical_limit]
             if step==1:selected=selected[::2]
             if step==3:selected=selected[:1]
+            if not selected:
+                break
             cached=CachedRequestData.make_empty()
             cached.req_ids=[batch.req_ids[i] for i in selected]
             cached.num_computed_tokens=[after[i] for i in selected]

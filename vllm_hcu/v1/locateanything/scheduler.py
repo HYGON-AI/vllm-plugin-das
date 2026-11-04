@@ -75,6 +75,7 @@ from vllm.v1.spec_decode.dynamic.utils import build_dynamic_sd_schedule_lookup
 from vllm.v1.spec_decode.metrics import SpecDecodingStats
 from vllm.v1.structured_output import StructuredOutputGrammar, StructuredOutputManager
 from vllm.v1.utils import record_function_or_nullcontext
+from vllm_hcu.v1.locateanything.limits import logical_context_limit
 
 logger = init_logger(__name__)
 
@@ -136,6 +137,7 @@ class Scheduler(SchedulerInterface):
             else self.scheduler_config.max_num_batched_tokens
         )
         self.max_model_len = vllm_config.model_config.max_model_len
+        self.fast_max_model_len = logical_context_limit(self.max_model_len)
         self.enable_kv_cache_events = (
             self.kv_events_config is not None
             and self.kv_events_config.enable_kv_cache_events
@@ -2379,7 +2381,7 @@ class Scheduler(SchedulerInterface):
                 request.status = RequestStatus.FINISHED_STOPPED
                 return new_token_ids, True
             if (request.num_output_tokens >= request.max_tokens
-                    or request.num_tokens >= 16384):
+                    or request.num_tokens >= self.fast_max_model_len):
                 request.status = RequestStatus.FINISHED_LENGTH_CAPPED
                 return new_token_ids, True
         return new_token_ids, False

@@ -66,6 +66,7 @@ from vllm.parser import ParserManager
 from vllm.parser.abstract_parser import Parser
 from vllm.renderers.online_renderer import OnlineRenderer
 from vllm.sampling_params import BeamSearchParams, SamplingParams
+from vllm_hcu.v1.locateanything.limits import context_error, logical_context_limit
 from vllm.tokenizers import TokenizerLike
 from vllm.utils.collection_utils import as_list
 from vllm.utils.serial_utils import numpy2base64
@@ -301,14 +302,16 @@ class OpenAIServingChat(GenerateBaseServing):
         data_parallel_rank = self._get_data_parallel_rank(raw_request)
 
         # Schedule the request and get the result generator.
-        max_model_len = self.model_config.max_model_len
+        max_model_len = logical_context_limit(self.model_config.max_model_len)
         generators: list[AsyncGenerator[RequestOutput, None]] = []
         mm_token_counts: dict[str, int] | None = None
         for i, engine_input in enumerate(engine_inputs):
             prompt_token_ids = self._extract_prompt_components(engine_input).token_ids
-            fast_budget = request.max_completion_tokens or request.max_tokens
-            if len(prompt_token_ids) >= 16384 or (fast_budget and len(prompt_token_ids) + fast_budget > 16384):
-                return self.create_error_response("Fast logical context is 16384; six physical probe slots are reserved separately")
+            fast_budget = (request.max_completion_tokens if request.max_completion_tokens is not None
+                           else request.max_tokens)
+            error = context_error(self.model_config.max_model_len, len(prompt_token_ids), fast_budget)
+            if error is not None:
+                return self.create_error_response(error)
             mm_token_counts = _get_mm_token_counts(engine_input)
 
             # If we are creating sub requests for multiple prompts, ensure that they

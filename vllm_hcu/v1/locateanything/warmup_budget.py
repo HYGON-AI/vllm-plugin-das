@@ -3,14 +3,20 @@
 """CPU-only synthetic request geometry shared by startup and its unit tests."""
 
 
-def warmup_prompts(max_num_reqs, max_num_tokens):
+def warmup_prompts(max_num_reqs, max_num_tokens, logical_limit=None):
     """Keep the synthetic prefill and all decode steps within runner buffers."""
-    minimum_prompt = 13
+    if logical_limit is not None and logical_limit < 2:
+        raise ValueError("Fast warmup needs a logical context of at least two tokens")
+    minimum_prompt = 13 if logical_limit is None else min(13, logical_limit - 1)
     physical_tail = 6
-    if max_num_reqs < 1 or max_num_tokens < minimum_prompt + physical_tail:
-        raise ValueError("Fast warmup requires a request and at least 19 tokens")
-    n = min(max_num_reqs, max_num_tokens // (minimum_prompt + physical_tail))
+    max_decode_query = 12 if logical_limit is None else min(12, logical_limit + 5)
+    minimum_budget = max(minimum_prompt + physical_tail, max_decode_query)
+    if max_num_reqs < 1 or max_num_tokens < minimum_budget:
+        raise ValueError(f"Fast warmup requires a request and at least {minimum_budget} tokens")
+    n = min(max_num_reqs, max_num_tokens // minimum_budget)
     maximum_prompt = min(minimum_prompt + n - 1,
                          max_num_tokens // n - physical_tail)
+    if logical_limit is not None:
+        maximum_prompt = min(maximum_prompt, logical_limit - 1)
     period = maximum_prompt - minimum_prompt + 1
     return [list(range(minimum_prompt + i % period)) for i in range(n)]

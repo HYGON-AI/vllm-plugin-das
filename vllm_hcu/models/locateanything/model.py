@@ -45,11 +45,21 @@ class LocateAnythingProcessingInfo(KimiVLProcessingInfo):
     def get_hf_config(self):
         return self.ctx.get_hf_config(LocateAnythingConfig)
 
+    def _image_processor(self, **overrides):
+        # vLLM already resolved this config with the model revision/token and
+        # Hub cache policy. Reuse it for both default and per-request shapes.
+        settings = self.ctx.get_hf_image_processor_config()
+        if settings:
+            return LocateAnythingImageProcessor.from_config(settings, **overrides)
+        # Some providers do not expose an image-processor config on the context.
+        load_kwargs = dict(overrides)
+        load_kwargs.setdefault("revision", self.ctx.model_config.revision)
+        load_kwargs.setdefault("token", self.ctx.model_config.hf_token)
+        return LocateAnythingImageProcessor.from_pretrained(self.model_id, **load_kwargs)
+
     @cached_property
     def _native_processor(self):
-        image_processor = LocateAnythingImageProcessor.from_pretrained(
-            self.model_id, **self.ctx.get_merged_mm_kwargs({}, modality="image")
-        )
+        image_processor = self._image_processor(**self.ctx.get_merged_mm_kwargs({}, modality="image"))
         config = self.get_hf_config()
         if image_processor.patch_size != config.vision_config.patch_size:
             raise ValueError("Image processor patch size does not match vision weights")
@@ -63,7 +73,7 @@ class LocateAnythingProcessingInfo(KimiVLProcessingInfo):
         merged = self.ctx.get_merged_mm_kwargs(kwargs, modality="image")
         shape_keys = {"patch_size", "in_token_limit", "merge_kernel_size", "image_mean", "image_std"}
         if shape_keys.intersection(merged):
-            image_processor = LocateAnythingImageProcessor.from_pretrained(self.model_id, **merged)
+            image_processor = self._image_processor(**merged)
             config = self.get_hf_config().vision_config
             if image_processor.patch_size != config.patch_size or tuple(image_processor.merge_kernel_size) != tuple(config.merge_kernel_size):
                 raise ValueError("Cannot override checkpoint patch or merge size")
