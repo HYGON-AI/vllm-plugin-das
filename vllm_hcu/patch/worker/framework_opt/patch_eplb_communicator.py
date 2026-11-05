@@ -1,6 +1,6 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright (c) 2026 Hygon Information Technology Co., Ltd.
-"""Skip transfer-profile buffers for offline EPLB instances with no transfers."""
+"""Skip Gloo profile buffers only for static offline EPLB instances."""
 
 from __future__ import annotations
 
@@ -18,7 +18,6 @@ TARGETS = (
     ),
 )
 STATIC_MODE_MARKER = "_vllm_hcu_static_offline_eplb"
-OFFLINE_NO_TRANSFER_MARKER = "_vllm_hcu_offline_eplb_no_weight_transfer"
 _MARKER = "_vllm_hcu_gloo_eplb_profile_reservation_applied"
 _PROPERTY_MARKER = "_vllm_hcu_gloo_eplb_profile_reservation_property"
 
@@ -73,7 +72,6 @@ def apply_to_module(module: ModuleType) -> bool:
     def hcu_needs_profile_buffer_reservation(self) -> bool:
         return bool(base_policy.fget(self)) and not bool(
             getattr(self, STATIC_MODE_MARKER, False)
-            or getattr(self, OFFLINE_NO_TRANSFER_MARKER, False)
         )
 
     setattr(hcu_needs_profile_buffer_reservation, _PROPERTY_MARKER, True)
@@ -94,7 +92,6 @@ __all__ = [
     "PATCH_ID",
     "PatchCompatibilityError",
     "STATIC_MODE_MARKER",
-    "OFFLINE_NO_TRANSFER_MARKER",
     "TARGET_MODULE",
     "TARGETS",
     "apply",

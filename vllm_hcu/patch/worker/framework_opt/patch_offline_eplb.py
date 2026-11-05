@@ -31,7 +31,7 @@ from ._common import (
     require_class,
     require_exact_signature,
 )
-from .patch_eplb_communicator import STATIC_MODE_MARKER, OFFLINE_NO_TRANSFER_MARKER
+from .patch_eplb_communicator import STATIC_MODE_MARKER
 
 
 TARGET_MODULE = "vllm.distributed.eplb.eplb_state"
@@ -56,30 +56,17 @@ class _RecordOnlyPolicyProxy:
         self,
         policy: object,
         captured: list[tuple[torch.Tensor, bool]],
-        cumulative: list[torch.Tensor] | None = None,
     ) -> None:
         self._policy = policy
         self._captured = captured
-        self._cumulative = cumulative
 
     def rebalance_experts(self, *args, **kwargs):
+        candidate = self._policy.rebalance_experts(*args, **kwargs)
         global_load = args[0] if args else kwargs.get("expert_load")
         if not isinstance(global_load, torch.Tensor):
             raise TypeError(
                 "Offline EPLB policy must receive a global load tensor"
             )
-        if self._cumulative is not None:
-            index = len(self._captured)
-            current = global_load.to(torch.int64)
-            if index == len(self._cumulative):
-                self._cumulative.append(current.clone())
-            else:
-                self._cumulative[index].add_(current)
-            if args:
-                args = (self._cumulative[index], *args[1:])
-            else:
-                kwargs = dict(kwargs, expert_load=self._cumulative[index])
-        candidate = self._policy.rebalance_experts(*args, **kwargs)
         if not isinstance(candidate, torch.Tensor):
             raise TypeError("Offline EPLB policy must return a map tensor")
         self._captured.append(
@@ -219,9 +206,9 @@ def _start_offline_record_session(path: str | Path) -> None:
 
     if _ep_rank() != 0:
         return
-    if not str(path).strip():
-        raise ValueError("Offline EPLB record path must be nonempty")
     output = Path(path).expanduser()
+    if not str(output):
+        raise ValueError("Offline EPLB record path must be nonempty")
     output.parent.mkdir(parents=True, exist_ok=True)
     lock_path = output.with_suffix(output.suffix + ".lock")
     with lock_path.open("a", encoding="utf-8") as lock_file:
@@ -269,9 +256,9 @@ def record_offline_expert_map(
     }
     _validate_model_entry(model_key, entry)
 
-    if not str(path).strip():
-        raise ValueError("Offline EPLB record path must be nonempty")
     output = Path(path).expanduser()
+    if not str(output):
+        raise ValueError("Offline EPLB record path must be nonempty")
     output.parent.mkdir(parents=True, exist_ok=True)
     lock_path = output.with_suffix(output.suffix + ".lock")
     with lock_path.open("a", encoding="utf-8") as lock_file:
@@ -497,28 +484,28 @@ def apply_to_module(module) -> bool:
             verify_static_plan_across_ep_ranks(plan)
 
         model.num_moe_layers = len(tuple(model.moe_layers))
-        # Both offline modes prohibit runtime expert-weight transfers. Avoid
-        # registering every model weight with NIXL merely to record a proposal.
-        eplb_config = self.parallel_config.eplb_config
-        communicator = eplb_config.communicator
-        if communicator not in (
-            "torch_nccl",
-            "torch_gloo",
-            "nixl",
-            "pynccl",
-        ):
-            raise PatchCompatibilityError(
-                "Offline EPLB communicator is unresolved or unsupported"
-            )
-        try:
-            eplb_config.communicator = "torch_gloo"
+        if plan is not None:
+            eplb_config = self.parallel_config.eplb_config
+            communicator = eplb_config.communicator
+            if communicator not in (
+                "torch_nccl",
+                "torch_gloo",
+                "nixl",
+                "pynccl",
+            ):
+                raise PatchCompatibilityError(
+                    "Static EPLB communicator is unresolved or unsupported"
+                )
+            try:
+                eplb_config.communicator = "torch_gloo"
+                original_add(self, model, model_config)
+            finally:
+                eplb_config.communicator = communicator
+        else:
             original_add(self, model, model_config)
-        finally:
-            eplb_config.communicator = communicator
 
         model_state = self.model_states[model_config.compute_hash()]
         setattr(model_state.communicator, STATIC_MODE_MARKER, plan is not None)
-        setattr(model_state.communicator, OFFLINE_NO_TRANSFER_MARKER, True)
         model_state._hcu_offline_record_path = record_path
         model_state._hcu_offline_owner = self
         model_state._hcu_offline_model_key = resolve_offline_eplb_model_key(
@@ -611,18 +598,10 @@ def apply_to_module(module) -> bool:
                 is_profile=is_profile,
                 log_stats=log_stats,
             )
-        if is_profile:
-            # Startup profiling is collective across ranks and cannot contribute
-            # real load. Ordinary dummy ranks must still follow upstream step
-            # sequencing, because other EP ranks may have real requests.
-            for model_state in self.model_states.values():
-                model_state.expert_load_pass.zero_()
-            self._update_layer_should_record(log_stats=log_stats)
-            return None
         return original_step(
             self,
             is_dummy=is_dummy,
-            is_profile=False,
+            is_profile=is_profile,
             log_stats=log_stats,
         )
 
@@ -630,8 +609,6 @@ def apply_to_module(module) -> bool:
     def rearrange(self, is_profile=False, rank_mapping=None):
         load_path, record_path = _paths(self.parallel_config)
         if load_path:
-            return None
-        if record_path and is_profile:
             return None
         if not record_path and (
             not is_profile
@@ -654,10 +631,7 @@ def apply_to_module(module) -> bool:
             )
         captured: list[tuple[torch.Tensor, bool]] = []
         original_policy = self.policy
-        cumulative = getattr(self, "_hcu_offline_cumulative_load", None)
-        if cumulative is None:
-            cumulative = self._hcu_offline_cumulative_load = []
-        self.policy = _RecordOnlyPolicyProxy(original_policy, captured, cumulative)
+        self.policy = _RecordOnlyPolicyProxy(original_policy, captured)
         token = _RECORD_ONLY.set(True)
         try:
             result = original_rearrange(
