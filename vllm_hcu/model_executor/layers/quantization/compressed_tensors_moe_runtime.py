@@ -890,7 +890,14 @@ def prewarm_aiter_w4a8_moe(
     method: object,
     layer: object,
 ) -> object | None:
-    """Probe SlimQuant W4A8 at M=1 while canonical weights are loaded."""
+    """Probe SlimQuant W4A8 at M=1 while canonical weights are loaded.
+
+    Callers install this result as the permanent weight layout. An
+    expert-parallel MOE_C hit is rejected, including M=1 ``moe_align``: a
+    later token count can select CK sorting inside the same solution, and
+    that sorting does not apply the global-to-local expert map. Keeping the
+    canonical packed weights lets the caller use the unpacked fallback.
+    """
 
     w1, w2, logical_k, activation = _slimquant_w4a8_metadata(method, layer)
     moe = getattr(method, "moe", None)
@@ -926,7 +933,14 @@ def prewarm_aiter_w4a8_moe(
         cache_owner=w1,
         solution_type="moe_c",
     )
-    return config
+    # Same permanent-layout rule as the W8A8 prewarm. Rejecting the config
+    # here also covers the second probe made while the parent installs it.
+    return _aiter_config_for_expert_parallel(
+        config,
+        local_num_experts=int(w1.shape[0]),
+        global_num_experts=getattr(moe, "num_experts", int(w1.shape[0])),
+        permanent_layout=True,
+    )
 
 
 def _unpack_slimquant_w4a8_tensor(packed: torch.Tensor) -> torch.Tensor:

@@ -272,6 +272,36 @@ def test_quantized_aiter_ep_config_guard(
     assert (selected is config) is allowed
 
 
+@pytest.mark.parametrize(
+    ("mode", "local_num_experts", "global_num_experts", "allowed"),
+    [
+        (11106104, 72, 288, False),
+        (10202101, 72, 288, False),
+        (11106104, 72, 72, True),
+    ],
+)
+def test_permanent_moe_c_layout_is_rejected_for_expert_parallel(
+    mode: int,
+    local_num_experts: int,
+    global_num_experts: int,
+    allowed: bool,
+):
+    """Installing M=1 moe_align is still unsafe once the layout is permanent."""
+    config = SimpleNamespace(
+        solution_type="moe_c",
+        config={"MODE": mode},
+    )
+
+    selected = compressed_tensors_moe_runtime._aiter_config_for_expert_parallel(
+        config,
+        local_num_experts=local_num_experts,
+        global_num_experts=global_num_experts,
+        permanent_layout=True,
+    )
+
+    assert (selected is config) is allowed
+
+
 def test_aiter_dispatch_can_pin_asm_shuffle_solution(
     monkeypatch: pytest.MonkeyPatch,
 ):

@@ -2407,6 +2407,100 @@ def _patch_glm_post_load(monkeypatch, config):
     return calls
 
 
+def test_glm_expert_parallel_keeps_canonical_weights(monkeypatch) -> None:
+    """EP must not gemm2-repack an M=1 MOE_C hit, including moe_align."""
+    from vllm_hcu.model_executor.layers.fused_moe import deepep_runtime
+    from vllm_hcu.model_executor.layers.quantization import (
+        compressed_tensors_moe_runtime,
+        glm_moe_dsa_w4a8,
+        slimquant_w4a8,
+    )
+    from vllm_hcu.model_executor.layers.quantization.glm_moe_dsa_w4a8 import (
+        GlmMoeDsaW4A8MoEMethod,
+    )
+
+    moe_align = SimpleNamespace(
+        solution_type="MOE_C",
+        need_shuffle=True,
+        need_shuffle_scale=True,
+        config={"MODE": 11106104},
+    )
+    aiter_moe = ModuleType("aiter.moe")
+    aiter_moe.MoeQuantType = SimpleNamespace(W4A8=object())
+    monkeypatch.setitem(sys.modules, "aiter.moe", aiter_moe)
+    monkeypatch.setattr(
+        compressed_tensors_moe_runtime,
+        "select_aiter_moe_config",
+        lambda *args, **kwargs: moe_align,
+    )
+    monkeypatch.setattr(
+        deepep_runtime, "slimquant_w4a8_uses_deepep_auto", lambda moe: False
+    )
+    repack_calls = {"count": 0}
+
+    def fake_repack(weight):
+        repack_calls["count"] += 1
+        return weight + 1
+
+    parent_calls = {"count": 0}
+
+    def fake_parent(self, layer):
+        parent_calls["count"] += 1
+
+    monkeypatch.setattr(
+        glm_moe_dsa_w4a8, "repack_and_shuffle_w4a8_gemm2", fake_repack
+    )
+    monkeypatch.setattr(
+        slimquant_w4a8.SlimQuantW4A8Int8AiterMoEMethod,
+        "process_weights_after_loading",
+        fake_parent,
+    )
+
+    def make_method(global_experts: int):
+        method = GlmMoeDsaW4A8MoEMethod.__new__(GlmMoeDsaW4A8MoEMethod)
+        method.moe = SimpleNamespace(
+            moe_backend="auto",
+            experts_per_token=2,
+            in_dtype=torch.bfloat16,
+            hidden_dim=8,
+            num_experts=global_experts,
+            activation=SimpleNamespace(value="silu"),
+        )
+        layer = torch.nn.Module()
+        layer.w13_weight = torch.nn.Parameter(
+            torch.arange(32, dtype=torch.int8).reshape(1, 8, 4),
+            requires_grad=False,
+        )
+        layer.w2_weight = torch.nn.Parameter(
+            torch.arange(16, dtype=torch.int8).reshape(1, 8, 2),
+            requires_grad=False,
+        )
+        return method, layer
+
+    ep_method, ep_layer = make_method(8)
+    original = ep_layer.w13_weight.detach().clone()
+    assert (
+        compressed_tensors_moe_runtime.prewarm_aiter_w4a8_moe(ep_method, ep_layer)
+        is None
+    )
+    ep_method.process_weights_after_loading(ep_layer)
+    assert repack_calls["count"] == 0
+    assert parent_calls["count"] == 1
+    assert torch.equal(ep_layer.w13_weight, original)
+    assert not hasattr(ep_layer, "_glm_w4a8_gemm2_generation")
+
+    tp_method, tp_layer = make_method(1)
+    assert (
+        compressed_tensors_moe_runtime.prewarm_aiter_w4a8_moe(tp_method, tp_layer)
+        is moe_align
+    )
+    tp_method.process_weights_after_loading(tp_layer)
+    assert repack_calls["count"] == 2
+    assert parent_calls["count"] == 2
+    assert moe_align.need_shuffle is False
+    assert moe_align.need_shuffle_scale is False
+
+
 def test_glm_aiter_post_load_installs_gemm2_layout_once(monkeypatch) -> None:
     config = SimpleNamespace(need_shuffle=True, need_shuffle_scale=True)
     calls = _patch_glm_post_load(monkeypatch, config)

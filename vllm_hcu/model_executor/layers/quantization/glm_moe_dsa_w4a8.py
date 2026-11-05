@@ -220,6 +220,9 @@ class GlmMoeDsaW4A8MoEMethod(SlimQuantW4A8Int8AiterMoEMethod):
         parent also calls ``aiter_moe_shfl_weight``, which is a different
         layout; stacking the two still yields garbage on a single run.
         Triton (BoltOps) and DeepEP keep the unshuffled SlimQuant packing.
+        Expert-parallel all-gather does too: the M=1 probe rejects a
+        permanent MOE_C layout, so the repack below does not run and the
+        parent keeps the unpacked fallback.
         """
         backend = getattr(self.moe, "moe_backend", "auto")
         from vllm_hcu.model_executor.layers.fused_moe.deepep_runtime import (
