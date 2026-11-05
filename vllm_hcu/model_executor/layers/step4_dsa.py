@@ -55,7 +55,11 @@ import torch.nn.functional as F
 import numpy as np
 from torch import nn
 
-from vllm.config import CUDAGraphMode, VllmConfig, get_current_vllm_config
+from vllm.config import (
+    CUDAGraphMode, VllmConfig, get_current_vllm_config,
+    get_current_vllm_config_or_none,
+)
+from vllm_hcu.runtime_compat.step5 import is_step5_pd_config
 from vllm.forward_context import get_forward_context
 from vllm.logger import init_logger
 from vllm_hcu.model_executor.layers.step4_dsa_kernels import (
@@ -1882,6 +1886,7 @@ class Step4DSAImpl(AttentionImpl[Step4DSAMetadata]):
         self.num_kv_heads = num_kv_heads if num_kv_heads is not None else num_heads
         self.kv_cache_dtype = kv_cache_dtype
         self.attn_type = attn_type
+        self._step5_pd = is_step5_pd_config(get_current_vllm_config_or_none())
 
         if BOLTOPS_STAGES:
             stages = _boltops_attention()
@@ -1922,6 +1927,8 @@ class Step4DSAImpl(AttentionImpl[Step4DSAMetadata]):
         slot_mapping: torch.Tensor,
         k_scale: float = 1.0,
         v_scale: float = 1.0,
+        attn_metadata: Step4DSAMetadata | None = None,
+        allow_paged_bridge: bool = False,
     ) -> tuple[torch.Tensor, torch.Tensor]:
         """Scatter K/V into the paged cache and return the flattened views.
 
@@ -1971,6 +1978,14 @@ class Step4DSAImpl(AttentionImpl[Step4DSAMetadata]):
                 if kv_cache.dtype == torch.uint8
                 else kv_cache
             )
+            if allow_paged_bridge and base.stride(0) != block_size * base.stride(2):
+                from vllm_hcu.model_executor.layers.step5_paged_kv import (
+                    write_paged_kv_and_get_flat,
+                )
+                return write_paged_kv_and_get_flat(
+                    kv_cache, key, value, slot_mapping, k_scale, v_scale,
+                    metadata=attn_metadata,
+                )
             sizes = (num_blocks * block_size, num_kv_heads, head_size)
             strides = (base.stride(2), base.stride(1), 1)
             k_flat = base.as_strided(sizes, strides)
@@ -2024,6 +2039,8 @@ class Step4DSAImpl(AttentionImpl[Step4DSAMetadata]):
             attn_metadata.slot_mapping,
             k_scale,
             v_scale,
+            attn_metadata=attn_metadata,
+            allow_paged_bridge=getattr(self, "_step5_pd", False),
         )
 
         plan = getattr(layer, "step4_sparse_plan", None)
@@ -4141,6 +4158,9 @@ class Step4Indexer:
         index_q, index_k, index_z, weights = self._project(
             hidden_states[:num_tokens], positions[:num_tokens], num_tokens
         )
+        pd_capture = getattr(state, "_pd_aux_capture", None)
+        if pd_capture is not None:
+            pd_capture(self, md, sched, index_k, index_z)
         self._update_summaries(sched, index_k, index_z)
         prefill_logits, decode_logits, width = self._score(md, sched, index_q, weights)
 
