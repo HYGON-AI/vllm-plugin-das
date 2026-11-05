@@ -17,7 +17,8 @@ def _stage_pages(Cache, Compact, Lengths, Tables, NewLengths, NewTables,
                  LB: tl.constexpr, LN: tl.constexpr, TB: tl.constexpr,
                  TP: tl.constexpr, NEXT: tl.constexpr, WIDTH: tl.constexpr,
                  PS: tl.constexpr, CS_WORDS: tl.constexpr,
-                 PAGES: tl.constexpr, MAXLEN: tl.constexpr,
+                 PAGES: tl.constexpr, COMPACT_PAGES: tl.constexpr,
+                 USE_PHYSICAL: tl.constexpr, MAXLEN: tl.constexpr,
                  PER_QUERY: tl.constexpr, PROGRAMS: tl.constexpr,
                  WORDS: tl.constexpr, BLOCK: tl.constexpr):
     row = tl.program_id(0)
@@ -29,31 +30,36 @@ def _stage_pages(Cache, Compact, Lengths, Tables, NewLengths, NewTables,
     end = tl.minimum(tl.maximum(end, 0), tl.minimum(MAXLEN, WIDTH * PS))
     if tl.program_id(1) == 0:
         tl.store(NewLengths + row, end)
-    previous = tl.maximum(row - 1, 0)
-    pb, pq = previous // NEXT, previous % NEXT
-    if PER_QUERY:
-        prev_end = tl.load(Lengths + pb * LB + pq * LN)
-    else:
-        prev_end = tl.load(Lengths + pb * LB) - NEXT + 1 + pq
-    prev_end = tl.minimum(tl.maximum(prev_end, 0), tl.minimum(MAXLEN, WIDTH * PS))
     words = tl.arange(0, BLOCK)
     source = Cache.to(tl.pointer_type(tl.uint32))
     dest = Compact.to(tl.pointer_type(tl.uint32))
     for logical in range(tl.program_id(1), tl.cdiv(end, PS), PROGRAMS):
         page = tl.load(Tables + batch * TB + logical * TP).to(tl.int64)
-        prev_page = tl.load(Tables + pb * TB + logical * TP).to(tl.int64)
         valid = (page >= 0) & (page < PAGES)
-        tl.store(NewTables + row * WIDTH + logical, tl.where(valid, page, PAGES))
-        # Adjacent verify rows usually refer to the same physical pages.
-        # All copies complete before LightOp starts, so a preceding row can
-        # own the copy even when its program executes later on the device.
-        copy = valid & (
-            (row == 0) | (logical >= tl.cdiv(prev_end, PS)) | (page != prev_page)
+        # Give every referenced logical page in this batch its own compact
+        # slot.  The slot count is bounded by rows * WIDTH instead of the
+        # entire physical KV-cache capacity, and remains graph-safe because
+        # the mapping is produced on device from the live block table.
+        compact_page = tl.where(
+            USE_PHYSICAL,
+            page,
+            row * WIDTH + logical,
         )
-        if copy:
-            values = tl.load(source + page.to(tl.int64) * CS_WORDS + words,
-                             words < WORDS, 0)
-            tl.store(dest + page.to(tl.int64) * WORDS + words, values, words < WORDS)
+        tl.store(
+            NewTables + row * WIDTH + logical,
+            tl.where(valid, compact_page, COMPACT_PAGES),
+        )
+        if valid:
+            values = tl.load(
+                source + page.to(tl.int64) * CS_WORDS + words,
+                words < WORDS,
+                0,
+            )
+            tl.store(
+                dest + compact_page * WORDS + words,
+                values,
+                words < WORDS,
+            )
 
 
 @triton.jit
@@ -89,37 +95,72 @@ def compact_indexer_logits(q, cache, weights, lengths, table, max_len):
     pages, page_size = cache.shape[:2]
     width = table.shape[1]
     # Separate streams may run independently; each owns its staging buffers.
+    # Include the page shape in the key because a stream can serve more than
+    # one indexer configuration during worker lifetime.
     key = (
         q.device, torch.cuda.current_stream(q.device).cuda_stream,
-        pages, page_size, width,
+        pages, page_size, width, dim,
     )
     state = _WORKSPACES.get(key)
+    required_slots = max(1, rows * width)
+    use_physical = required_slots >= pages
+    required_pages = pages if use_physical else required_slots
     if state is None:
-        compact = torch.empty(
-            (pages + 1, page_size, 1, dim + 4),
-            device=q.device, dtype=torch.uint8,
-        )
-        compact[-1].zero_()  # invalid-page sentinel
-        state = [compact, None, None, 0, []]
+        state = {
+            "compact": None,
+            "mapped": None,
+            "new_lengths": None,
+            "page_capacity": 0,
+            "row_capacity": 0,
+            "old": [],
+        }
         _WORKSPACES[key] = state
-    if state[3] < rows:
-        # Earlier CUDA graphs may still reference the smaller metadata buffers.
-        if state[1] is not None:
-            state[4].append((state[1], state[2]))
-        capacity = triton.next_power_of_2(rows)
-        state[1] = torch.zeros((capacity, width), device=q.device, dtype=torch.int32)
-        state[2] = torch.empty(capacity, device=q.device, dtype=torch.int32)
-        state[3] = capacity
-    compact, mapped, new_lengths, _, _ = state
-    mapped = mapped[:rows]
-    new_lengths = new_lengths[:rows]
+
+    if (
+        state["page_capacity"] < required_pages
+        or state["row_capacity"] < rows
+    ):
+        # Earlier CUDA graphs may still reference the old buffers. Keep them
+        # alive after replacement so graph replay never observes freed storage.
+        if state["compact"] is not None:
+            state["old"].append(
+                (state["compact"], state["mapped"], state["new_lengths"])
+            )
+        if state["page_capacity"] < required_pages:
+            page_capacity = (
+                required_pages
+                if use_physical
+                else triton.next_power_of_2(required_pages)
+            )
+            state["compact"] = torch.empty(
+                (page_capacity + 1, page_size, 1, dim + 4),
+                device=q.device,
+                dtype=torch.uint8,
+            )
+            state["compact"][-1].zero_()  # invalid-page sentinel
+            state["page_capacity"] = page_capacity
+        if state["row_capacity"] < rows:
+            row_capacity = triton.next_power_of_2(rows)
+            state["mapped"] = torch.empty(
+                (row_capacity, width), device=q.device, dtype=torch.int32
+            )
+            state["new_lengths"] = torch.empty(
+                row_capacity, device=q.device, dtype=torch.int32
+            )
+            state["row_capacity"] = row_capacity
+
+    compact = state["compact"]
+    mapped = state["mapped"][:rows]
+    new_lengths = state["new_lengths"][:rows]
+    compact_pages = state["page_capacity"]
     span = (pages - 1) * cache.stride(0) + page_size * (dim + 4)
     cache_arg = _FlatAddressCache(cache) if span >= (1 << 31) else cache
     words = page_size * (dim + 4) // 4
     _stage_pages[(rows, 32)](
         cache_arg, compact, lengths, table, new_lengths, mapped,
         lengths.stride(0), lengths.stride(1) if lengths.ndim == 2 else 0,
-        *table.stride(), next_n, width, page_size, cache.stride(0) // 4, pages, max_len,
+        *table.stride(), next_n, width, page_size, cache.stride(0) // 4,
+        pages, compact_pages, use_physical, max_len,
         lengths.ndim == 2, 32, words, triton.next_power_of_2(words), num_warps=4,
     )
     result = _get_lightop_attention().paged_mqa_logits(
