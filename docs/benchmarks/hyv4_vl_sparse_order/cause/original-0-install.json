@@ -1,0 +1,52 @@
+{
+  "results": [
+    {
+      "rank": 0,
+      "selector": "original",
+      "wrapper_version": 2,
+      "canonical_branch_installed": true
+    },
+    {
+      "rank": 1,
+      "selector": "original",
+      "wrapper_version": 2,
+      "canonical_branch_installed": true
+    },
+    {
+      "rank": 2,
+      "selector": "original",
+      "wrapper_version": 2,
+      "canonical_branch_installed": true
+    },
+    {
+      "rank": 3,
+      "selector": "original",
+      "wrapper_version": 2,
+      "canonical_branch_installed": true
+    },
+    {
+      "rank": 4,
+      "selector": "original",
+      "wrapper_version": 2,
+      "canonical_branch_installed": true
+    },
+    {
+      "rank": 5,
+      "selector": "original",
+      "wrapper_version": 2,
+      "canonical_branch_installed": true
+    },
+    {
+      "rank": 6,
+      "selector": "original",
+      "wrapper_version": 2,
+      "canonical_branch_installed": true
+    },
+    {
+      "rank": 7,
+      "selector": "original",
+      "wrapper_version": 2,
+      "canonical_branch_installed": true
+    }
+  ]
+}

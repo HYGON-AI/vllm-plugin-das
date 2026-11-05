@@ -1,0 +1,21 @@
+{
+  "reference": "CPU float64 softmax(Q K^T * scale, with attention sink), V=first512 KV components",
+  "same_order_repeat_exact": [
+    true,
+    true
+  ],
+  "permuted_output_changed_elements": 160,
+  "permuted_output_max_abs": 0.001953125,
+  "reference_errors": [
+    {
+      "max_abs": 0.0032826380880299766,
+      "relative_l2": 0.0016360615662231878,
+      "cosine": 0.9999986883763543
+    },
+    {
+      "max_abs": 0.0032826380880299766,
+      "relative_l2": 0.001633851317686979,
+      "cosine": 0.9999986882221268
+    }
+  ]
+}

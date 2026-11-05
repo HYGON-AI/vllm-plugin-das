@@ -1,0 +1,45 @@
+caption32-0-full_piecewise-112-507 'The first image depicts a daytime street scene under overcast, rainy conditions. The road is wet, reflecting the gray sky and surrounding elements. Multiple vehicles, including'
+caption32-0-full_piecewise-422-204 'Image 1:\nThe first image shows two glass seasoning grinders placed side by side on a light-colored wooden cutting board or countertop. The gr'
+caption32-0-full_piecewise-287-719 'Here is a detailed description of both images in their original order:\n\n**Image 1: Urban Intersection**\nThis image captures a daytime view of a quiet,'
+caption32-0-full_piecewise-478-618 'Here is a detailed description of both images, in their original order:\n\n### Image 1\n\nThis image captures a daytime street scene from the perspective of a driver'
+caption32-0-padded_eager-112-507 'The first image depicts a daytime street scene under overcast, rainy conditions. The road is wet, reflecting the gray sky and surrounding elements. Multiple vehicles, including'
+caption32-0-padded_eager-422-204 'Image 1:\nThe first image shows two glass seasoning grinders placed side by side on a light-colored wooden cutting board or countertop. The gr'
+caption32-0-padded_eager-287-719 'Here is a detailed description of both images in their original order:\n\n**Image 1: Urban Intersection**\nThis image captures a daytime view of a quiet,'
+caption32-0-padded_eager-478-618 'Here is a detailed description of both images, in their original order:\n\n### Image 1\n\nThis image captures a daytime street scene from the perspective of a driver'
+caption32-0-decode_only-112-507 'The first image depicts a daytime street scene under overcast, rainy conditions. The road is wet, reflecting the gray sky and surrounding elements. Multiple vehicles, including'
+caption32-0-decode_only-422-204 'Image 1:\nThe first image shows two glass seasoning grinders placed side by side on a light-colored wooden cutting board or countertop. The gr'
+caption32-0-decode_only-287-719 'Here is a detailed description of both images in their original order:\n\n**Image 1: Urban Intersection**\nThis image captures a daytime view of a quiet,'
+caption32-0-decode_only-478-618 'Here is a detailed description of both images, in their original order:\n\n### Image 1\n\nThis image captures a daytime street scene from the perspective of a driver'
+caption32-0-eager-112-507 'The first image depicts a daytime street scene under overcast, rainy conditions. The road is wet, reflecting the gray sky and surrounding elements. Multiple vehicles, including'
+caption32-0-eager-422-204 'Image 1:\nThe first image shows two glass seasoning grinders placed side by side on a light-colored wooden cutting board or countertop. The gr'
+caption32-0-eager-287-719 'Here is a detailed description of both images in their original order:\n\n**Image 1: Urban Intersection**\nThis image captures a daytime view of a quiet,'
+caption32-0-eager-478-618 'Here is a detailed description of both images, in their original order:\n\n### Image 1\n\nThis image captures a daytime street scene from the perspective of a driver'
+caption32-1-full_piecewise-112-507 'The first image depicts a daytime street scene under overcast, rainy conditions. The road is wet, reflecting the gray sky and surrounding elements. Multiple vehicles, including'
+caption32-1-full_piecewise-422-204 'Image 1:\nThe first image shows two glass seasoning grinders placed side by side on a light-colored wooden cutting board or countertop. The gr'
+caption32-1-full_piecewise-287-719 'Here is a detailed description of both images in their original order:\n\n**Image 1: Urban Intersection**\nThis image captures a daytime view of a quiet,'
+caption32-1-full_piecewise-478-618 'Here is a detailed description of both images, in their original order:\n\n### Image 1\n\nThis image captures a daytime street scene from the perspective of a driver'
+caption32-1-padded_eager-112-507 'The first image depicts a daytime street scene under overcast, rainy conditions. The road is wet, reflecting the gray sky and surrounding elements. Multiple vehicles, including'
+caption32-1-padded_eager-422-204 'Image 1:\nThe first image shows two glass seasoning grinders placed side by side on a light-colored wooden cutting board or countertop. The gr'
+caption32-1-padded_eager-287-719 'Here is a detailed description of both images in their original order:\n\n**Image 1: Urban Intersection**\nThis image captures a daytime view of a quiet,'
+caption32-1-padded_eager-478-618 'Here is a detailed description of both images, in their original order:\n\n### Image 1\n\nThis image captures a daytime street scene from the perspective of a driver'
+caption32-1-decode_only-112-507 'The first image depicts a daytime street scene under overcast, rainy conditions. The road is wet, reflecting the gray sky and surrounding elements. Multiple vehicles, including'
+caption32-1-decode_only-422-204 'Image 1:\nThe first image shows two glass seasoning grinders placed side by side on a light-colored wooden cutting board or countertop. The gr'
+caption32-1-decode_only-287-719 'Here is a detailed description of both images in their original order:\n\n**Image 1: Urban Intersection**\nThis image captures a daytime view of a quiet,'
+caption32-1-decode_only-478-618 'Here is a detailed description of both images, in their original order:\n\n### Image 1\n\nThis image captures a daytime street scene from the perspective of a driver'
+caption32-1-eager-112-507 'The first image depicts a daytime street scene under overcast, rainy conditions. The road is wet, reflecting the gray sky and surrounding elements. Multiple vehicles, including'
+caption32-1-eager-422-204 'Image 1:\nThe first image shows two glass seasoning grinders placed side by side on a light-colored wooden cutting board or countertop. The gr'
+caption32-1-eager-287-719 'Here is a detailed description of both images in their original order:\n\n**Image 1: Urban Intersection**\nThis image captures a daytime view of a quiet,'
+caption32-1-eager-478-618 'Here is a detailed description of both images, in their original order:\n\n### Image 1\n\nThis image captures a daytime street scene from the perspective of a driver'
+caption128-0-full_piecewise-112-507 done
+caption128-0-full_piecewise-287-719 done
+caption128-0-full_piecewise-478-618 done
+caption128-0-eager-112-507 done
+caption128-0-eager-287-719 done
+caption128-0-eager-478-618 done
+caption128-1-full_piecewise-112-507 done
+caption128-1-full_piecewise-287-719 done
+caption128-1-full_piecewise-478-618 done
+caption128-1-eager-112-507 done
+caption128-1-eager-287-719 done
+caption128-1-eager-478-618 done
+DONE captions

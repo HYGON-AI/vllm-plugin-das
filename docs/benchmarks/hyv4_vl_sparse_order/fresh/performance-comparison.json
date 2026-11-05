@@ -1,0 +1,38 @@
+{
+  "qa_c1": {
+    "requests": 64,
+    "eager_p50_ms": 1129.1479749997961,
+    "graph_p50_ms": 812.4483624924324,
+    "eager_rps": 0.9119750430929465,
+    "graph_rps": 1.3063090734391833,
+    "throughput_gain_percent": 43.239563772366,
+    "raw_changes": []
+  },
+  "qa_c2": {
+    "requests": 64,
+    "eager_p50_ms": 1597.1535425051115,
+    "graph_p50_ms": 1417.196670998237,
+    "eager_rps": 1.2881395782153096,
+    "graph_rps": 1.503603992650504,
+    "throughput_gain_percent": 16.726790953331005,
+    "raw_changes": []
+  },
+  "caption32_c1": {
+    "requests": 4,
+    "eager_p50_ms": 7720.443906495348,
+    "graph_p50_ms": 2552.414203004446,
+    "eager_rps": 0.1306099513573372,
+    "graph_rps": 0.41522311052131394,
+    "throughput_gain_percent": 217.9107764808062,
+    "raw_changes": []
+  },
+  "two_images32_c1": {
+    "requests": 4,
+    "eager_p50_ms": 8119.729032005125,
+    "graph_p50_ms": 3334.95574099652,
+    "eager_rps": 0.1237741147379473,
+    "graph_rps": 0.3087172612293846,
+    "throughput_gain_percent": 149.41989032439952,
+    "raw_changes": []
+  }
+}

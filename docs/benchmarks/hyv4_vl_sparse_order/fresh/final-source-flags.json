@@ -1,0 +1,52 @@
+{
+  "results": [
+    {
+      "rank": 0,
+      "enabled_indexers": 21,
+      "indexers": 21,
+      "mode": "full_piecewise"
+    },
+    {
+      "rank": 1,
+      "enabled_indexers": 21,
+      "indexers": 21,
+      "mode": "full_piecewise"
+    },
+    {
+      "rank": 2,
+      "enabled_indexers": 21,
+      "indexers": 21,
+      "mode": "full_piecewise"
+    },
+    {
+      "rank": 3,
+      "enabled_indexers": 21,
+      "indexers": 21,
+      "mode": "full_piecewise"
+    },
+    {
+      "rank": 4,
+      "enabled_indexers": 21,
+      "indexers": 21,
+      "mode": "full_piecewise"
+    },
+    {
+      "rank": 5,
+      "enabled_indexers": 21,
+      "indexers": 21,
+      "mode": "full_piecewise"
+    },
+    {
+      "rank": 6,
+      "enabled_indexers": 21,
+      "indexers": 21,
+      "mode": "full_piecewise"
+    },
+    {
+      "rank": 7,
+      "enabled_indexers": 21,
+      "indexers": 21,
+      "mode": "full_piecewise"
+    }
+  ]
+}

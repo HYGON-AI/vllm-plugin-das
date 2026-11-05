@@ -8,12 +8,12 @@ serving commands; video and speculative decoding are unsupported.
 
 ## Server
 
-**Ready verification found unresolved long-context variation**, including in
-eager mode: three of four repeated real-image pairs change answers after
-crossing the sparse indexer's 2048-token boundary. The
-[verification report](hy4_vl_ready_validation.md) contains the repeated
-requests, logits and selector ablations. The commands below reproduce
-experimental serving; eager does not resolve that long-context issue.
+The [sparse-index order fix](hy4_vl_sparse_order_precision.md) resolves the
+reproduced long-context variation, including the eager-mode case. Restart the
+server from the updated checkout and capture new graphs. The fix is automatic
+for HYV4-VL on HCU; no additional flag is required. Full/piecewise retains the
+padding guard described below. The complete 765-question rerun matches the
+prior control's raw answers, and the extended image repeat checks pass.
 
 Choose one execution mode. `eager` is the default fallback. Graph configurations
 are experimental: see the [decode graph report](hy4_vl_graph_performance.md) and

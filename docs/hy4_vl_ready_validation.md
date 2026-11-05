@@ -1,6 +1,10 @@
 # HYV4VL ready-for-review verification
 
-**Result: keep PR #338 in draft.** Verification of head `125d5e5` found a
+**Historical result at `125d5e5`; superseded by the
+[sparse-index order fix and passing fresh verification](hy4_vl_sparse_order_precision.md)
+at `47bbdcd`.** The evidence below records the original blocker.
+
+**Original result: keep PR #338 in draft.** Verification of head `125d5e5` found a
 remaining long-context reproducibility problem. The earlier prefill-padding
 guard passes its single-image QA gate, but it does not resolve this issue.
 This round changes no inference implementation or serving configuration.

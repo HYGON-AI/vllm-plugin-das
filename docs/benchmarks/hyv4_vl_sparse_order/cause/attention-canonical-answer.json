@@ -1,0 +1,12 @@
+{
+  "ttft_seconds": 1.1205394220014568,
+  "latency_seconds": 8.135608894008328,
+  "decode_seconds_per_token": 0.22627791106436146,
+  "usage": {
+    "prompt_tokens": 2039,
+    "total_tokens": 2071,
+    "completion_tokens": 32
+  },
+  "answer": "Here is a detailed description of both images, in their original order:\n\n### Image 1\n\nThis image captures a daytime street scene from the perspective of a driver",
+  "finish_reason": "length"
+}

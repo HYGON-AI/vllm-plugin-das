@@ -1,0 +1,12 @@
+{
+  "ttft_seconds": 1.1214588199945865,
+  "latency_seconds": 8.0943827709998,
+  "decode_seconds_per_token": 0.2249187377742454,
+  "usage": {
+    "prompt_tokens": 2039,
+    "total_tokens": 2071,
+    "completion_tokens": 32
+  },
+  "answer": "Here is a detailed description of both images, in the order they were provided:\n\n### Image 1\nThis is a street-level photograph taken from inside a vehicle",
+  "finish_reason": "length"
+}

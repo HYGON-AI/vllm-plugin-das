@@ -1,0 +1,52 @@
+{
+  "results": [
+    {
+      "rank": 0,
+      "enabled": true,
+      "indexers": 21,
+      "note": "Python eager execution only; already captured FULL graphs retain canonical ordering"
+    },
+    {
+      "rank": 1,
+      "enabled": true,
+      "indexers": 21,
+      "note": "Python eager execution only; already captured FULL graphs retain canonical ordering"
+    },
+    {
+      "rank": 2,
+      "enabled": true,
+      "indexers": 21,
+      "note": "Python eager execution only; already captured FULL graphs retain canonical ordering"
+    },
+    {
+      "rank": 3,
+      "enabled": true,
+      "indexers": 21,
+      "note": "Python eager execution only; already captured FULL graphs retain canonical ordering"
+    },
+    {
+      "rank": 4,
+      "enabled": true,
+      "indexers": 21,
+      "note": "Python eager execution only; already captured FULL graphs retain canonical ordering"
+    },
+    {
+      "rank": 5,
+      "enabled": true,
+      "indexers": 21,
+      "note": "Python eager execution only; already captured FULL graphs retain canonical ordering"
+    },
+    {
+      "rank": 6,
+      "enabled": true,
+      "indexers": 21,
+      "note": "Python eager execution only; already captured FULL graphs retain canonical ordering"
+    },
+    {
+      "rank": 7,
+      "enabled": true,
+      "indexers": 21,
+      "note": "Python eager execution only; already captured FULL graphs retain canonical ordering"
+    }
+  ]
+}

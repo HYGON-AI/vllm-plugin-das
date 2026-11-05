@@ -1,0 +1,477 @@
+{
+  "requests": 32,
+  "groups": [
+    {
+      "index": 112,
+      "second_index": 507,
+      "answers_all_identical": true,
+      "requests": 8,
+      "prompt_tokens": [
+        2039
+      ],
+      "modes": [
+        "decode_only",
+        "eager",
+        "full_piecewise",
+        "padded_eager"
+      ]
+    },
+    {
+      "index": 422,
+      "second_index": 204,
+      "answers_all_identical": true,
+      "requests": 8,
+      "prompt_tokens": [
+        1585
+      ],
+      "modes": [
+        "decode_only",
+        "eager",
+        "full_piecewise",
+        "padded_eager"
+      ]
+    },
+    {
+      "index": 287,
+      "second_index": 719,
+      "answers_all_identical": true,
+      "requests": 8,
+      "prompt_tokens": [
+        2039
+      ],
+      "modes": [
+        "decode_only",
+        "eager",
+        "full_piecewise",
+        "padded_eager"
+      ]
+    },
+    {
+      "index": 478,
+      "second_index": 618,
+      "answers_all_identical": true,
+      "requests": 8,
+      "prompt_tokens": [
+        2039
+      ],
+      "modes": [
+        "decode_only",
+        "eager",
+        "full_piecewise",
+        "padded_eager"
+      ]
+    }
+  ],
+  "logit_comparisons": [
+    {
+      "file": "caption32-0-decode_only-478-618.logits.pt",
+      "records": 33,
+      "reference_records": 33,
+      "changed": [],
+      "actual_modes": {
+        "NONE": 2,
+        "FULL": 31,
+        "PIECEWISE": 0
+      }
+    },
+    {
+      "file": "caption32-0-eager-478-618.logits.pt",
+      "records": 33,
+      "reference_records": 33,
+      "changed": [],
+      "actual_modes": {
+        "NONE": 33,
+        "FULL": 0,
+        "PIECEWISE": 0
+      }
+    },
+    {
+      "file": "caption32-0-full_piecewise-478-618.logits.pt",
+      "records": 33,
+      "reference_records": 33,
+      "changed": [],
+      "actual_modes": {
+        "NONE": 2,
+        "FULL": 31,
+        "PIECEWISE": 0
+      }
+    },
+    {
+      "file": "caption32-0-padded_eager-478-618.logits.pt",
+      "records": 33,
+      "reference_records": 33,
+      "changed": [],
+      "actual_modes": {
+        "NONE": 2,
+        "FULL": 31,
+        "PIECEWISE": 0
+      }
+    },
+    {
+      "file": "caption32-1-decode_only-478-618.logits.pt",
+      "records": 33,
+      "reference_records": 33,
+      "changed": [],
+      "actual_modes": {
+        "NONE": 2,
+        "FULL": 31,
+        "PIECEWISE": 0
+      }
+    },
+    {
+      "file": "caption32-1-eager-478-618.logits.pt",
+      "records": 33,
+      "reference_records": 33,
+      "changed": [],
+      "actual_modes": {
+        "NONE": 33,
+        "FULL": 0,
+        "PIECEWISE": 0
+      }
+    },
+    {
+      "file": "caption32-1-full_piecewise-478-618.logits.pt",
+      "records": 33,
+      "reference_records": 33,
+      "changed": [],
+      "actual_modes": {
+        "NONE": 2,
+        "FULL": 31,
+        "PIECEWISE": 0
+      }
+    },
+    {
+      "file": "caption32-1-padded_eager-478-618.logits.pt",
+      "records": 33,
+      "reference_records": 33,
+      "changed": [],
+      "actual_modes": {
+        "NONE": 2,
+        "FULL": 31,
+        "PIECEWISE": 0
+      }
+    }
+  ],
+  "indices_validation": [
+    {
+      "file": "caption32-0-decode_only-478-618.indices.rank0.pt",
+      "records": 33,
+      "all_canonical": true
+    },
+    {
+      "file": "caption32-0-decode_only-478-618.indices.rank1.pt",
+      "records": 33,
+      "all_canonical": true
+    },
+    {
+      "file": "caption32-0-decode_only-478-618.indices.rank2.pt",
+      "records": 33,
+      "all_canonical": true
+    },
+    {
+      "file": "caption32-0-decode_only-478-618.indices.rank3.pt",
+      "records": 33,
+      "all_canonical": true
+    },
+    {
+      "file": "caption32-0-decode_only-478-618.indices.rank4.pt",
+      "records": 33,
+      "all_canonical": true
+    },
+    {
+      "file": "caption32-0-decode_only-478-618.indices.rank5.pt",
+      "records": 33,
+      "all_canonical": true
+    },
+    {
+      "file": "caption32-0-decode_only-478-618.indices.rank6.pt",
+      "records": 33,
+      "all_canonical": true
+    },
+    {
+      "file": "caption32-0-decode_only-478-618.indices.rank7.pt",
+      "records": 33,
+      "all_canonical": true
+    },
+    {
+      "file": "caption32-0-eager-478-618.indices.rank0.pt",
+      "records": 33,
+      "all_canonical": true
+    },
+    {
+      "file": "caption32-0-eager-478-618.indices.rank1.pt",
+      "records": 33,
+      "all_canonical": true
+    },
+    {
+      "file": "caption32-0-eager-478-618.indices.rank2.pt",
+      "records": 33,
+      "all_canonical": true
+    },
+    {
+      "file": "caption32-0-eager-478-618.indices.rank3.pt",
+      "records": 33,
+      "all_canonical": true
+    },
+    {
+      "file": "caption32-0-eager-478-618.indices.rank4.pt",
+      "records": 33,
+      "all_canonical": true
+    },
+    {
+      "file": "caption32-0-eager-478-618.indices.rank5.pt",
+      "records": 33,
+      "all_canonical": true
+    },
+    {
+      "file": "caption32-0-eager-478-618.indices.rank6.pt",
+      "records": 33,
+      "all_canonical": true
+    },
+    {
+      "file": "caption32-0-eager-478-618.indices.rank7.pt",
+      "records": 33,
+      "all_canonical": true
+    },
+    {
+      "file": "caption32-0-full_piecewise-478-618.indices.rank0.pt",
+      "records": 33,
+      "all_canonical": true
+    },
+    {
+      "file": "caption32-0-full_piecewise-478-618.indices.rank1.pt",
+      "records": 33,
+      "all_canonical": true
+    },
+    {
+      "file": "caption32-0-full_piecewise-478-618.indices.rank2.pt",
+      "records": 33,
+      "all_canonical": true
+    },
+    {
+      "file": "caption32-0-full_piecewise-478-618.indices.rank3.pt",
+      "records": 33,
+      "all_canonical": true
+    },
+    {
+      "file": "caption32-0-full_piecewise-478-618.indices.rank4.pt",
+      "records": 33,
+      "all_canonical": true
+    },
+    {
+      "file": "caption32-0-full_piecewise-478-618.indices.rank5.pt",
+      "records": 33,
+      "all_canonical": true
+    },
+    {
+      "file": "caption32-0-full_piecewise-478-618.indices.rank6.pt",
+      "records": 33,
+      "all_canonical": true
+    },
+    {
+      "file": "caption32-0-full_piecewise-478-618.indices.rank7.pt",
+      "records": 33,
+      "all_canonical": true
+    },
+    {
+      "file": "caption32-0-padded_eager-478-618.indices.rank0.pt",
+      "records": 33,
+      "all_canonical": true
+    },
+    {
+      "file": "caption32-0-padded_eager-478-618.indices.rank1.pt",
+      "records": 33,
+      "all_canonical": true
+    },
+    {
+      "file": "caption32-0-padded_eager-478-618.indices.rank2.pt",
+      "records": 33,
+      "all_canonical": true
+    },
+    {
+      "file": "caption32-0-padded_eager-478-618.indices.rank3.pt",
+      "records": 33,
+      "all_canonical": true
+    },
+    {
+      "file": "caption32-0-padded_eager-478-618.indices.rank4.pt",
+      "records": 33,
+      "all_canonical": true
+    },
+    {
+      "file": "caption32-0-padded_eager-478-618.indices.rank5.pt",
+      "records": 33,
+      "all_canonical": true
+    },
+    {
+      "file": "caption32-0-padded_eager-478-618.indices.rank6.pt",
+      "records": 33,
+      "all_canonical": true
+    },
+    {
+      "file": "caption32-0-padded_eager-478-618.indices.rank7.pt",
+      "records": 33,
+      "all_canonical": true
+    },
+    {
+      "file": "caption32-1-decode_only-478-618.indices.rank0.pt",
+      "records": 33,
+      "all_canonical": true
+    },
+    {
+      "file": "caption32-1-decode_only-478-618.indices.rank1.pt",
+      "records": 33,
+      "all_canonical": true
+    },
+    {
+      "file": "caption32-1-decode_only-478-618.indices.rank2.pt",
+      "records": 33,
+      "all_canonical": true
+    },
+    {
+      "file": "caption32-1-decode_only-478-618.indices.rank3.pt",
+      "records": 33,
+      "all_canonical": true
+    },
+    {
+      "file": "caption32-1-decode_only-478-618.indices.rank4.pt",
+      "records": 33,
+      "all_canonical": true
+    },
+    {
+      "file": "caption32-1-decode_only-478-618.indices.rank5.pt",
+      "records": 33,
+      "all_canonical": true
+    },
+    {
+      "file": "caption32-1-decode_only-478-618.indices.rank6.pt",
+      "records": 33,
+      "all_canonical": true
+    },
+    {
+      "file": "caption32-1-decode_only-478-618.indices.rank7.pt",
+      "records": 33,
+      "all_canonical": true
+    },
+    {
+      "file": "caption32-1-eager-478-618.indices.rank0.pt",
+      "records": 33,
+      "all_canonical": true
+    },
+    {
+      "file": "caption32-1-eager-478-618.indices.rank1.pt",
+      "records": 33,
+      "all_canonical": true
+    },
+    {
+      "file": "caption32-1-eager-478-618.indices.rank2.pt",
+      "records": 33,
+      "all_canonical": true
+    },
+    {
+      "file": "caption32-1-eager-478-618.indices.rank3.pt",
+      "records": 33,
+      "all_canonical": true
+    },
+    {
+      "file": "caption32-1-eager-478-618.indices.rank4.pt",
+      "records": 33,
+      "all_canonical": true
+    },
+    {
+      "file": "caption32-1-eager-478-618.indices.rank5.pt",
+      "records": 33,
+      "all_canonical": true
+    },
+    {
+      "file": "caption32-1-eager-478-618.indices.rank6.pt",
+      "records": 33,
+      "all_canonical": true
+    },
+    {
+      "file": "caption32-1-eager-478-618.indices.rank7.pt",
+      "records": 33,
+      "all_canonical": true
+    },
+    {
+      "file": "caption32-1-full_piecewise-478-618.indices.rank0.pt",
+      "records": 33,
+      "all_canonical": true
+    },
+    {
+      "file": "caption32-1-full_piecewise-478-618.indices.rank1.pt",
+      "records": 33,
+      "all_canonical": true
+    },
+    {
+      "file": "caption32-1-full_piecewise-478-618.indices.rank2.pt",
+      "records": 33,
+      "all_canonical": true
+    },
+    {
+      "file": "caption32-1-full_piecewise-478-618.indices.rank3.pt",
+      "records": 33,
+      "all_canonical": true
+    },
+    {
+      "file": "caption32-1-full_piecewise-478-618.indices.rank4.pt",
+      "records": 33,
+      "all_canonical": true
+    },
+    {
+      "file": "caption32-1-full_piecewise-478-618.indices.rank5.pt",
+      "records": 33,
+      "all_canonical": true
+    },
+    {
+      "file": "caption32-1-full_piecewise-478-618.indices.rank6.pt",
+      "records": 33,
+      "all_canonical": true
+    },
+    {
+      "file": "caption32-1-full_piecewise-478-618.indices.rank7.pt",
+      "records": 33,
+      "all_canonical": true
+    },
+    {
+      "file": "caption32-1-padded_eager-478-618.indices.rank0.pt",
+      "records": 33,
+      "all_canonical": true
+    },
+    {
+      "file": "caption32-1-padded_eager-478-618.indices.rank1.pt",
+      "records": 33,
+      "all_canonical": true
+    },
+    {
+      "file": "caption32-1-padded_eager-478-618.indices.rank2.pt",
+      "records": 33,
+      "all_canonical": true
+    },
+    {
+      "file": "caption32-1-padded_eager-478-618.indices.rank3.pt",
+      "records": 33,
+      "all_canonical": true
+    },
+    {
+      "file": "caption32-1-padded_eager-478-618.indices.rank4.pt",
+      "records": 33,
+      "all_canonical": true
+    },
+    {
+      "file": "caption32-1-padded_eager-478-618.indices.rank5.pt",
+      "records": 33,
+      "all_canonical": true
+    },
+    {
+      "file": "caption32-1-padded_eager-478-618.indices.rank6.pt",
+      "records": 33,
+      "all_canonical": true
+    },
+    {
+      "file": "caption32-1-padded_eager-478-618.indices.rank7.pt",
+      "records": 33,
+      "all_canonical": true
+    }
+  ]
+}

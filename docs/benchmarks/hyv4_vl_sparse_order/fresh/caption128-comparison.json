@@ -1,0 +1,252 @@
+{
+  "requests": 12,
+  "groups": [
+    {
+      "index": 112,
+      "second_index": 507,
+      "answers_all_identical": true,
+      "requests": 4,
+      "prompt_tokens": [
+        2039
+      ],
+      "modes": [
+        "eager",
+        "full_piecewise"
+      ]
+    },
+    {
+      "index": 287,
+      "second_index": 719,
+      "answers_all_identical": true,
+      "requests": 4,
+      "prompt_tokens": [
+        2039
+      ],
+      "modes": [
+        "eager",
+        "full_piecewise"
+      ]
+    },
+    {
+      "index": 478,
+      "second_index": 618,
+      "answers_all_identical": true,
+      "requests": 4,
+      "prompt_tokens": [
+        2039
+      ],
+      "modes": [
+        "eager",
+        "full_piecewise"
+      ]
+    }
+  ],
+  "logit_comparisons": [
+    {
+      "file": "caption128-0-eager-478-618.logits.pt",
+      "records": 129,
+      "reference_records": 129,
+      "changed": [],
+      "actual_modes": {
+        "NONE": 129,
+        "FULL": 0,
+        "PIECEWISE": 0
+      }
+    },
+    {
+      "file": "caption128-0-full_piecewise-478-618.logits.pt",
+      "records": 129,
+      "reference_records": 129,
+      "changed": [],
+      "actual_modes": {
+        "NONE": 2,
+        "FULL": 127,
+        "PIECEWISE": 0
+      }
+    },
+    {
+      "file": "caption128-1-eager-478-618.logits.pt",
+      "records": 129,
+      "reference_records": 129,
+      "changed": [],
+      "actual_modes": {
+        "NONE": 129,
+        "FULL": 0,
+        "PIECEWISE": 0
+      }
+    },
+    {
+      "file": "caption128-1-full_piecewise-478-618.logits.pt",
+      "records": 129,
+      "reference_records": 129,
+      "changed": [],
+      "actual_modes": {
+        "NONE": 2,
+        "FULL": 127,
+        "PIECEWISE": 0
+      }
+    }
+  ],
+  "indices_validation": [
+    {
+      "file": "caption128-0-eager-478-618.indices.rank0.pt",
+      "records": 129,
+      "all_canonical": true
+    },
+    {
+      "file": "caption128-0-eager-478-618.indices.rank1.pt",
+      "records": 129,
+      "all_canonical": true
+    },
+    {
+      "file": "caption128-0-eager-478-618.indices.rank2.pt",
+      "records": 129,
+      "all_canonical": true
+    },
+    {
+      "file": "caption128-0-eager-478-618.indices.rank3.pt",
+      "records": 129,
+      "all_canonical": true
+    },
+    {
+      "file": "caption128-0-eager-478-618.indices.rank4.pt",
+      "records": 129,
+      "all_canonical": true
+    },
+    {
+      "file": "caption128-0-eager-478-618.indices.rank5.pt",
+      "records": 129,
+      "all_canonical": true
+    },
+    {
+      "file": "caption128-0-eager-478-618.indices.rank6.pt",
+      "records": 129,
+      "all_canonical": true
+    },
+    {
+      "file": "caption128-0-eager-478-618.indices.rank7.pt",
+      "records": 129,
+      "all_canonical": true
+    },
+    {
+      "file": "caption128-0-full_piecewise-478-618.indices.rank0.pt",
+      "records": 129,
+      "all_canonical": true
+    },
+    {
+      "file": "caption128-0-full_piecewise-478-618.indices.rank1.pt",
+      "records": 129,
+      "all_canonical": true
+    },
+    {
+      "file": "caption128-0-full_piecewise-478-618.indices.rank2.pt",
+      "records": 129,
+      "all_canonical": true
+    },
+    {
+      "file": "caption128-0-full_piecewise-478-618.indices.rank3.pt",
+      "records": 129,
+      "all_canonical": true
+    },
+    {
+      "file": "caption128-0-full_piecewise-478-618.indices.rank4.pt",
+      "records": 129,
+      "all_canonical": true
+    },
+    {
+      "file": "caption128-0-full_piecewise-478-618.indices.rank5.pt",
+      "records": 129,
+      "all_canonical": true
+    },
+    {
+      "file": "caption128-0-full_piecewise-478-618.indices.rank6.pt",
+      "records": 129,
+      "all_canonical": true
+    },
+    {
+      "file": "caption128-0-full_piecewise-478-618.indices.rank7.pt",
+      "records": 129,
+      "all_canonical": true
+    },
+    {
+      "file": "caption128-1-eager-478-618.indices.rank0.pt",
+      "records": 129,
+      "all_canonical": true
+    },
+    {
+      "file": "caption128-1-eager-478-618.indices.rank1.pt",
+      "records": 129,
+      "all_canonical": true
+    },
+    {
+      "file": "caption128-1-eager-478-618.indices.rank2.pt",
+      "records": 129,
+      "all_canonical": true
+    },
+    {
+      "file": "caption128-1-eager-478-618.indices.rank3.pt",
+      "records": 129,
+      "all_canonical": true
+    },
+    {
+      "file": "caption128-1-eager-478-618.indices.rank4.pt",
+      "records": 129,
+      "all_canonical": true
+    },
+    {
+      "file": "caption128-1-eager-478-618.indices.rank5.pt",
+      "records": 129,
+      "all_canonical": true
+    },
+    {
+      "file": "caption128-1-eager-478-618.indices.rank6.pt",
+      "records": 129,
+      "all_canonical": true
+    },
+    {
+      "file": "caption128-1-eager-478-618.indices.rank7.pt",
+      "records": 129,
+      "all_canonical": true
+    },
+    {
+      "file": "caption128-1-full_piecewise-478-618.indices.rank0.pt",
+      "records": 129,
+      "all_canonical": true
+    },
+    {
+      "file": "caption128-1-full_piecewise-478-618.indices.rank1.pt",
+      "records": 129,
+      "all_canonical": true
+    },
+    {
+      "file": "caption128-1-full_piecewise-478-618.indices.rank2.pt",
+      "records": 129,
+      "all_canonical": true
+    },
+    {
+      "file": "caption128-1-full_piecewise-478-618.indices.rank3.pt",
+      "records": 129,
+      "all_canonical": true
+    },
+    {
+      "file": "caption128-1-full_piecewise-478-618.indices.rank4.pt",
+      "records": 129,
+      "all_canonical": true
+    },
+    {
+      "file": "caption128-1-full_piecewise-478-618.indices.rank5.pt",
+      "records": 129,
+      "all_canonical": true
+    },
+    {
+      "file": "caption128-1-full_piecewise-478-618.indices.rank6.pt",
+      "records": 129,
+      "all_canonical": true
+    },
+    {
+      "file": "caption128-1-full_piecewise-478-618.indices.rank7.pt",
+      "records": 129,
+      "all_canonical": true
+    }
+  ]
+}

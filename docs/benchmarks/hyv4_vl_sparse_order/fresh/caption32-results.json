@@ -1,0 +1,514 @@
+[
+  {
+    "ttft_seconds": 1.1533200330013642,
+    "latency_seconds": 3.388424049000605,
+    "decode_seconds_per_token": 0.07208610345156968,
+    "usage": {
+      "prompt_tokens": 2039,
+      "total_tokens": 2071,
+      "completion_tokens": 32
+    },
+    "answer": "The first image depicts a daytime street scene under overcast, rainy conditions. The road is wet, reflecting the gray sky and surrounding elements. Multiple vehicles, including",
+    "finish_reason": "length",
+    "repetition": 0,
+    "mode": "full_piecewise",
+    "index": 112,
+    "second_index": 507
+  },
+  {
+    "ttft_seconds": 0.9262629929871764,
+    "latency_seconds": 2.9620421009894926,
+    "decode_seconds_per_token": 0.06565725409675524,
+    "usage": {
+      "prompt_tokens": 1585,
+      "total_tokens": 1617,
+      "completion_tokens": 32
+    },
+    "answer": "Image 1:\nThe first image shows two glass seasoning grinders placed side by side on a light-colored wooden cutting board or countertop. The gr",
+    "finish_reason": "length",
+    "repetition": 0,
+    "mode": "full_piecewise",
+    "index": 422,
+    "second_index": 204
+  },
+  {
+    "ttft_seconds": 1.1220900569896912,
+    "latency_seconds": 3.3571884129924,
+    "decode_seconds_per_token": 0.07208655374227918,
+    "usage": {
+      "prompt_tokens": 2039,
+      "total_tokens": 2071,
+      "completion_tokens": 32
+    },
+    "answer": "Here is a detailed description of both images in their original order:\n\n**Image 1: Urban Intersection**\nThis image captures a daytime view of a quiet,",
+    "finish_reason": "length",
+    "repetition": 0,
+    "mode": "full_piecewise",
+    "index": 287,
+    "second_index": 719
+  },
+  {
+    "ttft_seconds": 1.1208945859980304,
+    "latency_seconds": 3.3941239200066775,
+    "decode_seconds_per_token": 0.07331674787095718,
+    "usage": {
+      "prompt_tokens": 2039,
+      "total_tokens": 2071,
+      "completion_tokens": 32
+    },
+    "answer": "Here is a detailed description of both images, in their original order:\n\n### Image 1\n\nThis image captures a daytime street scene from the perspective of a driver",
+    "finish_reason": "length",
+    "repetition": 0,
+    "mode": "full_piecewise",
+    "index": 478,
+    "second_index": 618
+  },
+  {
+    "ttft_seconds": 1.1291276249976363,
+    "latency_seconds": 3.364713060000213,
+    "decode_seconds_per_token": 0.07210072954823714,
+    "usage": {
+      "prompt_tokens": 2039,
+      "total_tokens": 2071,
+      "completion_tokens": 32
+    },
+    "answer": "The first image depicts a daytime street scene under overcast, rainy conditions. The road is wet, reflecting the gray sky and surrounding elements. Multiple vehicles, including",
+    "finish_reason": "length",
+    "repetition": 0,
+    "mode": "padded_eager",
+    "index": 112,
+    "second_index": 507
+  },
+  {
+    "ttft_seconds": 0.9242619519936852,
+    "latency_seconds": 2.9616259199974593,
+    "decode_seconds_per_token": 0.06570728416150931,
+    "usage": {
+      "prompt_tokens": 1585,
+      "total_tokens": 1617,
+      "completion_tokens": 32
+    },
+    "answer": "Image 1:\nThe first image shows two glass seasoning grinders placed side by side on a light-colored wooden cutting board or countertop. The gr",
+    "finish_reason": "length",
+    "repetition": 0,
+    "mode": "padded_eager",
+    "index": 422,
+    "second_index": 204
+  },
+  {
+    "ttft_seconds": 1.1213768440065905,
+    "latency_seconds": 3.3536519990011584,
+    "decode_seconds_per_token": 0.07199462987069462,
+    "usage": {
+      "prompt_tokens": 2039,
+      "total_tokens": 2071,
+      "completion_tokens": 32
+    },
+    "answer": "Here is a detailed description of both images in their original order:\n\n**Image 1: Urban Intersection**\nThis image captures a daytime view of a quiet,",
+    "finish_reason": "length",
+    "repetition": 0,
+    "mode": "padded_eager",
+    "index": 287,
+    "second_index": 719
+  },
+  {
+    "ttft_seconds": 1.1224222290038597,
+    "latency_seconds": 3.3911061540129595,
+    "decode_seconds_per_token": 0.07316576574193014,
+    "usage": {
+      "prompt_tokens": 2039,
+      "total_tokens": 2071,
+      "completion_tokens": 32
+    },
+    "answer": "Here is a detailed description of both images, in their original order:\n\n### Image 1\n\nThis image captures a daytime street scene from the perspective of a driver",
+    "finish_reason": "length",
+    "repetition": 0,
+    "mode": "padded_eager",
+    "index": 478,
+    "second_index": 618
+  },
+  {
+    "ttft_seconds": 1.1226270939951064,
+    "latency_seconds": 3.3572276920021977,
+    "decode_seconds_per_token": 0.0720695312582745,
+    "usage": {
+      "prompt_tokens": 2039,
+      "total_tokens": 2071,
+      "completion_tokens": 32
+    },
+    "answer": "The first image depicts a daytime street scene under overcast, rainy conditions. The road is wet, reflecting the gray sky and surrounding elements. Multiple vehicles, including",
+    "finish_reason": "length",
+    "repetition": 0,
+    "mode": "decode_only",
+    "index": 112,
+    "second_index": 507
+  },
+  {
+    "ttft_seconds": 0.9241765039914753,
+    "latency_seconds": 2.9543682279909262,
+    "decode_seconds_per_token": 0.06547614787104389,
+    "usage": {
+      "prompt_tokens": 1585,
+      "total_tokens": 1617,
+      "completion_tokens": 32
+    },
+    "answer": "Image 1:\nThe first image shows two glass seasoning grinders placed side by side on a light-colored wooden cutting board or countertop. The gr",
+    "finish_reason": "length",
+    "repetition": 0,
+    "mode": "decode_only",
+    "index": 422,
+    "second_index": 204
+  },
+  {
+    "ttft_seconds": 1.1209278850001283,
+    "latency_seconds": 3.3463876169989817,
+    "decode_seconds_per_token": 0.07177321883829145,
+    "usage": {
+      "prompt_tokens": 2039,
+      "total_tokens": 2071,
+      "completion_tokens": 32
+    },
+    "answer": "Here is a detailed description of both images in their original order:\n\n**Image 1: Urban Intersection**\nThis image captures a daytime view of a quiet,",
+    "finish_reason": "length",
+    "repetition": 0,
+    "mode": "decode_only",
+    "index": 287,
+    "second_index": 719
+  },
+  {
+    "ttft_seconds": 1.1188650760013843,
+    "latency_seconds": 3.38047715400171,
+    "decode_seconds_per_token": 0.0729382393868535,
+    "usage": {
+      "prompt_tokens": 2039,
+      "total_tokens": 2071,
+      "completion_tokens": 32
+    },
+    "answer": "Here is a detailed description of both images, in their original order:\n\n### Image 1\n\nThis image captures a daytime street scene from the perspective of a driver",
+    "finish_reason": "length",
+    "repetition": 0,
+    "mode": "decode_only",
+    "index": 478,
+    "second_index": 618
+  },
+  {
+    "ttft_seconds": 1.1200710270059062,
+    "latency_seconds": 8.160172461997718,
+    "decode_seconds_per_token": 0.22708504861258272,
+    "usage": {
+      "prompt_tokens": 2039,
+      "total_tokens": 2071,
+      "completion_tokens": 32
+    },
+    "answer": "The first image depicts a daytime street scene under overcast, rainy conditions. The road is wet, reflecting the gray sky and surrounding elements. Multiple vehicles, including",
+    "finish_reason": "length",
+    "repetition": 0,
+    "mode": "eager",
+    "index": 112,
+    "second_index": 507
+  },
+  {
+    "ttft_seconds": 0.9227504989976296,
+    "latency_seconds": 7.910971561999759,
+    "decode_seconds_per_token": 0.22540659864523238,
+    "usage": {
+      "prompt_tokens": 1585,
+      "total_tokens": 1617,
+      "completion_tokens": 32
+    },
+    "answer": "Image 1:\nThe first image shows two glass seasoning grinders placed side by side on a light-colored wooden cutting board or countertop. The gr",
+    "finish_reason": "length",
+    "repetition": 0,
+    "mode": "eager",
+    "index": 422,
+    "second_index": 204
+  },
+  {
+    "ttft_seconds": 1.1186037519946694,
+    "latency_seconds": 8.096495938996668,
+    "decode_seconds_per_token": 0.22507784800038808,
+    "usage": {
+      "prompt_tokens": 2039,
+      "total_tokens": 2071,
+      "completion_tokens": 32
+    },
+    "answer": "Here is a detailed description of both images in their original order:\n\n**Image 1: Urban Intersection**\nThis image captures a daytime view of a quiet,",
+    "finish_reason": "length",
+    "repetition": 0,
+    "mode": "eager",
+    "index": 287,
+    "second_index": 719
+  },
+  {
+    "ttft_seconds": 1.1180122270016,
+    "latency_seconds": 8.12303262000205,
+    "decode_seconds_per_token": 0.22595127503248683,
+    "usage": {
+      "prompt_tokens": 2039,
+      "total_tokens": 2071,
+      "completion_tokens": 32
+    },
+    "answer": "Here is a detailed description of both images, in their original order:\n\n### Image 1\n\nThis image captures a daytime street scene from the perspective of a driver",
+    "finish_reason": "length",
+    "repetition": 0,
+    "mode": "eager",
+    "index": 478,
+    "second_index": 618
+  },
+  {
+    "ttft_seconds": 1.1261551170027815,
+    "latency_seconds": 3.356563687993912,
+    "decode_seconds_per_token": 0.07193472070972465,
+    "usage": {
+      "prompt_tokens": 2039,
+      "total_tokens": 2071,
+      "completion_tokens": 32
+    },
+    "answer": "The first image depicts a daytime street scene under overcast, rainy conditions. The road is wet, reflecting the gray sky and surrounding elements. Multiple vehicles, including",
+    "finish_reason": "length",
+    "repetition": 1,
+    "mode": "full_piecewise",
+    "index": 112,
+    "second_index": 507
+  },
+  {
+    "ttft_seconds": 0.9258943219901994,
+    "latency_seconds": 2.956125274999067,
+    "decode_seconds_per_token": 0.06547764912923618,
+    "usage": {
+      "prompt_tokens": 1585,
+      "total_tokens": 1617,
+      "completion_tokens": 32
+    },
+    "answer": "Image 1:\nThe first image shows two glass seasoning grinders placed side by side on a light-colored wooden cutting board or countertop. The gr",
+    "finish_reason": "length",
+    "repetition": 1,
+    "mode": "full_piecewise",
+    "index": 422,
+    "second_index": 204
+  },
+  {
+    "ttft_seconds": 1.1192009280057391,
+    "latency_seconds": 3.347857291009859,
+    "decode_seconds_per_token": 0.07187781851614765,
+    "usage": {
+      "prompt_tokens": 2039,
+      "total_tokens": 2071,
+      "completion_tokens": 32
+    },
+    "answer": "Here is a detailed description of both images in their original order:\n\n**Image 1: Urban Intersection**\nThis image captures a daytime view of a quiet,",
+    "finish_reason": "length",
+    "repetition": 1,
+    "mode": "full_piecewise",
+    "index": 287,
+    "second_index": 719
+  },
+  {
+    "ttft_seconds": 1.1180190769955516,
+    "latency_seconds": 3.3777469109918457,
+    "decode_seconds_per_token": 0.07287977403217566,
+    "usage": {
+      "prompt_tokens": 2039,
+      "total_tokens": 2071,
+      "completion_tokens": 32
+    },
+    "answer": "Here is a detailed description of both images, in their original order:\n\n### Image 1\n\nThis image captures a daytime street scene from the perspective of a driver",
+    "finish_reason": "length",
+    "repetition": 1,
+    "mode": "full_piecewise",
+    "index": 478,
+    "second_index": 618
+  },
+  {
+    "ttft_seconds": 1.1189778929983731,
+    "latency_seconds": 3.3501670549885603,
+    "decode_seconds_per_token": 0.0719597774835664,
+    "usage": {
+      "prompt_tokens": 2039,
+      "total_tokens": 2071,
+      "completion_tokens": 32
+    },
+    "answer": "The first image depicts a daytime street scene under overcast, rainy conditions. The road is wet, reflecting the gray sky and surrounding elements. Multiple vehicles, including",
+    "finish_reason": "length",
+    "repetition": 1,
+    "mode": "padded_eager",
+    "index": 112,
+    "second_index": 507
+  },
+  {
+    "ttft_seconds": 0.9237444350001169,
+    "latency_seconds": 2.961634259991115,
+    "decode_seconds_per_token": 0.06572466922572799,
+    "usage": {
+      "prompt_tokens": 1585,
+      "total_tokens": 1617,
+      "completion_tokens": 32
+    },
+    "answer": "Image 1:\nThe first image shows two glass seasoning grinders placed side by side on a light-colored wooden cutting board or countertop. The gr",
+    "finish_reason": "length",
+    "repetition": 1,
+    "mode": "padded_eager",
+    "index": 422,
+    "second_index": 204
+  },
+  {
+    "ttft_seconds": 1.1204470270022284,
+    "latency_seconds": 3.3522850529989228,
+    "decode_seconds_per_token": 0.07198005538685398,
+    "usage": {
+      "prompt_tokens": 2039,
+      "total_tokens": 2071,
+      "completion_tokens": 32
+    },
+    "answer": "Here is a detailed description of both images in their original order:\n\n**Image 1: Urban Intersection**\nThis image captures a daytime view of a quiet,",
+    "finish_reason": "length",
+    "repetition": 1,
+    "mode": "padded_eager",
+    "index": 287,
+    "second_index": 719
+  },
+  {
+    "ttft_seconds": 1.1206378329952713,
+    "latency_seconds": 3.389584651988116,
+    "decode_seconds_per_token": 0.07317797932257471,
+    "usage": {
+      "prompt_tokens": 2039,
+      "total_tokens": 2071,
+      "completion_tokens": 32
+    },
+    "answer": "Here is a detailed description of both images, in their original order:\n\n### Image 1\n\nThis image captures a daytime street scene from the perspective of a driver",
+    "finish_reason": "length",
+    "repetition": 1,
+    "mode": "padded_eager",
+    "index": 478,
+    "second_index": 618
+  },
+  {
+    "ttft_seconds": 1.1172669749939814,
+    "latency_seconds": 3.3510532729997067,
+    "decode_seconds_per_token": 0.07204231290351375,
+    "usage": {
+      "prompt_tokens": 2039,
+      "total_tokens": 2071,
+      "completion_tokens": 32
+    },
+    "answer": "The first image depicts a daytime street scene under overcast, rainy conditions. The road is wet, reflecting the gray sky and surrounding elements. Multiple vehicles, including",
+    "finish_reason": "length",
+    "repetition": 1,
+    "mode": "decode_only",
+    "index": 112,
+    "second_index": 507
+  },
+  {
+    "ttft_seconds": 0.9234655110049061,
+    "latency_seconds": 2.957990228998824,
+    "decode_seconds_per_token": 0.06561466480648491,
+    "usage": {
+      "prompt_tokens": 1585,
+      "total_tokens": 1617,
+      "completion_tokens": 32
+    },
+    "answer": "Image 1:\nThe first image shows two glass seasoning grinders placed side by side on a light-colored wooden cutting board or countertop. The gr",
+    "finish_reason": "length",
+    "repetition": 1,
+    "mode": "decode_only",
+    "index": 422,
+    "second_index": 204
+  },
+  {
+    "ttft_seconds": 1.1207132900017314,
+    "latency_seconds": 3.354743582996889,
+    "decode_seconds_per_token": 0.07205163622594198,
+    "usage": {
+      "prompt_tokens": 2039,
+      "total_tokens": 2071,
+      "completion_tokens": 32
+    },
+    "answer": "Here is a detailed description of both images in their original order:\n\n**Image 1: Urban Intersection**\nThis image captures a daytime view of a quiet,",
+    "finish_reason": "length",
+    "repetition": 1,
+    "mode": "decode_only",
+    "index": 287,
+    "second_index": 719
+  },
+  {
+    "ttft_seconds": 1.1215041609975742,
+    "latency_seconds": 3.40964035099023,
+    "decode_seconds_per_token": 0.07379640970940536,
+    "usage": {
+      "prompt_tokens": 2039,
+      "total_tokens": 2071,
+      "completion_tokens": 32
+    },
+    "answer": "Here is a detailed description of both images, in their original order:\n\n### Image 1\n\nThis image captures a daytime street scene from the perspective of a driver",
+    "finish_reason": "length",
+    "repetition": 1,
+    "mode": "decode_only",
+    "index": 478,
+    "second_index": 618
+  },
+  {
+    "ttft_seconds": 1.117830621995381,
+    "latency_seconds": 8.210981690994231,
+    "decode_seconds_per_token": 0.2287946055162578,
+    "usage": {
+      "prompt_tokens": 2039,
+      "total_tokens": 2071,
+      "completion_tokens": 32
+    },
+    "answer": "The first image depicts a daytime street scene under overcast, rainy conditions. The road is wet, reflecting the gray sky and surrounding elements. Multiple vehicles, including",
+    "finish_reason": "length",
+    "repetition": 1,
+    "mode": "eager",
+    "index": 112,
+    "second_index": 507
+  },
+  {
+    "ttft_seconds": 0.92344196200429,
+    "latency_seconds": 7.999938378008665,
+    "decode_seconds_per_token": 0.22825824832233915,
+    "usage": {
+      "prompt_tokens": 1585,
+      "total_tokens": 1617,
+      "completion_tokens": 32
+    },
+    "answer": "Image 1:\nThe first image shows two glass seasoning grinders placed side by side on a light-colored wooden cutting board or countertop. The gr",
+    "finish_reason": "length",
+    "repetition": 1,
+    "mode": "eager",
+    "index": 422,
+    "second_index": 204
+  },
+  {
+    "ttft_seconds": 1.1196928260033019,
+    "latency_seconds": 8.194366096999147,
+    "decode_seconds_per_token": 0.2282007007095437,
+    "usage": {
+      "prompt_tokens": 2039,
+      "total_tokens": 2071,
+      "completion_tokens": 32
+    },
+    "answer": "Here is a detailed description of both images in their original order:\n\n**Image 1: Urban Intersection**\nThis image captures a daytime view of a quiet,",
+    "finish_reason": "length",
+    "repetition": 1,
+    "mode": "eager",
+    "index": 287,
+    "second_index": 719
+  },
+  {
+    "ttft_seconds": 1.1261993070074823,
+    "latency_seconds": 8.197464160999516,
+    "decode_seconds_per_token": 0.22808959954812552,
+    "usage": {
+      "prompt_tokens": 2039,
+      "total_tokens": 2071,
+      "completion_tokens": 32
+    },
+    "answer": "Here is a detailed description of both images, in their original order:\n\n### Image 1\n\nThis image captures a daytime street scene from the perspective of a driver",
+    "finish_reason": "length",
+    "repetition": 1,
+    "mode": "eager",
+    "index": 478,
+    "second_index": 618
+  }
+]

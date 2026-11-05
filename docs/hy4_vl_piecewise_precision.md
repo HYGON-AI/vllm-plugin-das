@@ -1,9 +1,10 @@
 # HYV4VL prefill padding precision investigation
 
-The subsequent [ready verification](hy4_vl_ready_validation.md) reproduces
-long-context variation in all four execution modes, including pure eager.
-It confirms that the remaining double-image issue needs a separate fix;
-the successful single-image padding guard below does not cover it.
+The subsequent [ready verification](hy4_vl_ready_validation.md) reproduced a
+separate long-context issue, including in pure eager mode. That issue is now
+resolved in the [sparse-index order fix](hy4_vl_sparse_order_precision.md), with
+fresh full-dataset and extended image validation. The padding guard below
+remains necessary for prefill shape precision.
 
 The earlier FULL_AND_PIECEWISE regression is reproducible without graph replay:
 keeping the padded prefill shapes while executing eagerly gives the same changed

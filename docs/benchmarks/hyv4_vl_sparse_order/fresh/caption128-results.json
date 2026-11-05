@@ -1,0 +1,194 @@
+[
+  {
+    "ttft_seconds": 1.1206524220033316,
+    "latency_seconds": 10.303158830007305,
+    "decode_seconds_per_token": 0.07229952463778433,
+    "usage": {
+      "prompt_tokens": 2039,
+      "total_tokens": 2167,
+      "completion_tokens": 128
+    },
+    "answer": "The first image depicts a daytime street scene under overcast, rainy conditions. The road is wet, reflecting the gray sky and surrounding elements. Multiple vehicles, including cars and SUVs, are driving along the multi - lane road, with their headlights or taillights illuminated due to the low - light, rainy weather. Lush green trees line both sides of the road, and there are also grassy areas adjacent to the roadway. A green street sign reading “Santiago” is visible, along with a speed limit sign indicating 30. Streetlights and traffic lights are present, and the overall atmosphere is gloomy and damp",
+    "finish_reason": "length",
+    "repetition": 0,
+    "mode": "full_piecewise",
+    "index": 112,
+    "second_index": 507
+  },
+  {
+    "ttft_seconds": 1.12521224100783,
+    "latency_seconds": 10.296675938006956,
+    "decode_seconds_per_token": 0.07221256959844219,
+    "usage": {
+      "prompt_tokens": 2039,
+      "total_tokens": 2167,
+      "completion_tokens": 128
+    },
+    "answer": "Here is a detailed description of both images in their original order:\n\n**Image 1: Urban Intersection**\nThis image captures a daytime view of a quiet, multi-lane urban intersection, likely in a hilly city such as San Francisco. The perspective is from a sidewalk corner, looking across the street. In the foreground, a marked crosswalk with thick white stripes spans the width of the road. The corner of the sidewalk on the right features a yellow, textured tactile paving panel for the visually impaired. The road surface is a light-colored concrete, showing some cracks and wear.\n\nOn the left side of the street, several",
+    "finish_reason": "length",
+    "repetition": 0,
+    "mode": "full_piecewise",
+    "index": 287,
+    "second_index": 719
+  },
+  {
+    "ttft_seconds": 1.1226706229936099,
+    "latency_seconds": 10.457713932002662,
+    "decode_seconds_per_token": 0.07350078291341289,
+    "usage": {
+      "prompt_tokens": 2039,
+      "total_tokens": 2167,
+      "completion_tokens": 128
+    },
+    "answer": "Here is a detailed description of both images, in their original order:\n\n### Image 1\n\nThis image captures a daytime street scene from the perspective of a driver, likely in San Francisco, under an overcast sky. The road is a wide, multi-lane boulevard with a somewhat worn appearance, featuring visible cracks and patches. In the foreground, the road is marked with a crosswalk composed of broad, faded yellow stripes.\n\nOn the left side of the street, there is a line of parked cars. A prominent white Volkswagen is in the process of pulling out from a parking space into the lane of traffic. Further down",
+    "finish_reason": "length",
+    "repetition": 0,
+    "mode": "full_piecewise",
+    "index": 478,
+    "second_index": 618
+  },
+  {
+    "ttft_seconds": 1.1243088129995158,
+    "latency_seconds": 29.99038524000207,
+    "decode_seconds_per_token": 0.2272879133071094,
+    "usage": {
+      "prompt_tokens": 2039,
+      "total_tokens": 2167,
+      "completion_tokens": 128
+    },
+    "answer": "The first image depicts a daytime street scene under overcast, rainy conditions. The road is wet, reflecting the gray sky and surrounding elements. Multiple vehicles, including cars and SUVs, are driving along the multi - lane road, with their headlights or taillights illuminated due to the low - light, rainy weather. Lush green trees line both sides of the road, and there are also grassy areas adjacent to the roadway. A green street sign reading “Santiago” is visible, along with a speed limit sign indicating 30. Streetlights and traffic lights are present, and the overall atmosphere is gloomy and damp",
+    "finish_reason": "length",
+    "repetition": 0,
+    "mode": "eager",
+    "index": 112,
+    "second_index": 507
+  },
+  {
+    "ttft_seconds": 1.1178511199977947,
+    "latency_seconds": 30.001068668992957,
+    "decode_seconds_per_token": 0.22742292780315002,
+    "usage": {
+      "prompt_tokens": 2039,
+      "total_tokens": 2167,
+      "completion_tokens": 128
+    },
+    "answer": "Here is a detailed description of both images in their original order:\n\n**Image 1: Urban Intersection**\nThis image captures a daytime view of a quiet, multi-lane urban intersection, likely in a hilly city such as San Francisco. The perspective is from a sidewalk corner, looking across the street. In the foreground, a marked crosswalk with thick white stripes spans the width of the road. The corner of the sidewalk on the right features a yellow, textured tactile paving panel for the visually impaired. The road surface is a light-colored concrete, showing some cracks and wear.\n\nOn the left side of the street, several",
+    "finish_reason": "length",
+    "repetition": 0,
+    "mode": "eager",
+    "index": 287,
+    "second_index": 719
+  },
+  {
+    "ttft_seconds": 1.119995247994666,
+    "latency_seconds": 29.866706492990488,
+    "decode_seconds_per_token": 0.2263477235275328,
+    "usage": {
+      "prompt_tokens": 2039,
+      "total_tokens": 2167,
+      "completion_tokens": 128
+    },
+    "answer": "Here is a detailed description of both images, in their original order:\n\n### Image 1\n\nThis image captures a daytime street scene from the perspective of a driver, likely in San Francisco, under an overcast sky. The road is a wide, multi-lane boulevard with a somewhat worn appearance, featuring visible cracks and patches. In the foreground, the road is marked with a crosswalk composed of broad, faded yellow stripes.\n\nOn the left side of the street, there is a line of parked cars. A prominent white Volkswagen is in the process of pulling out from a parking space into the lane of traffic. Further down",
+    "finish_reason": "length",
+    "repetition": 0,
+    "mode": "eager",
+    "index": 478,
+    "second_index": 618
+  },
+  {
+    "ttft_seconds": 1.1236145599978045,
+    "latency_seconds": 10.285046881996095,
+    "decode_seconds_per_token": 0.07213336215746373,
+    "usage": {
+      "prompt_tokens": 2039,
+      "total_tokens": 2167,
+      "completion_tokens": 128
+    },
+    "answer": "The first image depicts a daytime street scene under overcast, rainy conditions. The road is wet, reflecting the gray sky and surrounding elements. Multiple vehicles, including cars and SUVs, are driving along the multi - lane road, with their headlights or taillights illuminated due to the low - light, rainy weather. Lush green trees line both sides of the road, and there are also grassy areas adjacent to the roadway. A green street sign reading “Santiago” is visible, along with a speed limit sign indicating 30. Streetlights and traffic lights are present, and the overall atmosphere is gloomy and damp",
+    "finish_reason": "length",
+    "repetition": 1,
+    "mode": "full_piecewise",
+    "index": 112,
+    "second_index": 507
+  },
+  {
+    "ttft_seconds": 1.1295211560063763,
+    "latency_seconds": 10.297888638000586,
+    "decode_seconds_per_token": 0.07218833616533679,
+    "usage": {
+      "prompt_tokens": 2039,
+      "total_tokens": 2167,
+      "completion_tokens": 128
+    },
+    "answer": "Here is a detailed description of both images in their original order:\n\n**Image 1: Urban Intersection**\nThis image captures a daytime view of a quiet, multi-lane urban intersection, likely in a hilly city such as San Francisco. The perspective is from a sidewalk corner, looking across the street. In the foreground, a marked crosswalk with thick white stripes spans the width of the road. The corner of the sidewalk on the right features a yellow, textured tactile paving panel for the visually impaired. The road surface is a light-colored concrete, showing some cracks and wear.\n\nOn the left side of the street, several",
+    "finish_reason": "length",
+    "repetition": 1,
+    "mode": "full_piecewise",
+    "index": 287,
+    "second_index": 719
+  },
+  {
+    "ttft_seconds": 1.1230636339896591,
+    "latency_seconds": 10.437679311988177,
+    "decode_seconds_per_token": 0.07334010620469936,
+    "usage": {
+      "prompt_tokens": 2039,
+      "total_tokens": 2167,
+      "completion_tokens": 128
+    },
+    "answer": "Here is a detailed description of both images, in their original order:\n\n### Image 1\n\nThis image captures a daytime street scene from the perspective of a driver, likely in San Francisco, under an overcast sky. The road is a wide, multi-lane boulevard with a somewhat worn appearance, featuring visible cracks and patches. In the foreground, the road is marked with a crosswalk composed of broad, faded yellow stripes.\n\nOn the left side of the street, there is a line of parked cars. A prominent white Volkswagen is in the process of pulling out from a parking space into the lane of traffic. Further down",
+    "finish_reason": "length",
+    "repetition": 1,
+    "mode": "full_piecewise",
+    "index": 478,
+    "second_index": 618
+  },
+  {
+    "ttft_seconds": 1.120287386002019,
+    "latency_seconds": 29.8327258000063,
+    "decode_seconds_per_token": 0.22607838658271742,
+    "usage": {
+      "prompt_tokens": 2039,
+      "total_tokens": 2167,
+      "completion_tokens": 128
+    },
+    "answer": "The first image depicts a daytime street scene under overcast, rainy conditions. The road is wet, reflecting the gray sky and surrounding elements. Multiple vehicles, including cars and SUVs, are driving along the multi - lane road, with their headlights or taillights illuminated due to the low - light, rainy weather. Lush green trees line both sides of the road, and there are also grassy areas adjacent to the roadway. A green street sign reading “Santiago” is visible, along with a speed limit sign indicating 30. Streetlights and traffic lights are present, and the overall atmosphere is gloomy and damp",
+    "finish_reason": "length",
+    "repetition": 1,
+    "mode": "eager",
+    "index": 112,
+    "second_index": 507
+  },
+  {
+    "ttft_seconds": 1.124116012986633,
+    "latency_seconds": 29.769796045991825,
+    "decode_seconds_per_token": 0.22555254713387418,
+    "usage": {
+      "prompt_tokens": 2039,
+      "total_tokens": 2167,
+      "completion_tokens": 128
+    },
+    "answer": "Here is a detailed description of both images in their original order:\n\n**Image 1: Urban Intersection**\nThis image captures a daytime view of a quiet, multi-lane urban intersection, likely in a hilly city such as San Francisco. The perspective is from a sidewalk corner, looking across the street. In the foreground, a marked crosswalk with thick white stripes spans the width of the road. The corner of the sidewalk on the right features a yellow, textured tactile paving panel for the visually impaired. The road surface is a light-colored concrete, showing some cracks and wear.\n\nOn the left side of the street, several",
+    "finish_reason": "length",
+    "repetition": 1,
+    "mode": "eager",
+    "index": 287,
+    "second_index": 719
+  },
+  {
+    "ttft_seconds": 1.120120740000857,
+    "latency_seconds": 30.27020953799365,
+    "decode_seconds_per_token": 0.22952432401570413,
+    "usage": {
+      "prompt_tokens": 2039,
+      "total_tokens": 2167,
+      "completion_tokens": 128
+    },
+    "answer": "Here is a detailed description of both images, in their original order:\n\n### Image 1\n\nThis image captures a daytime street scene from the perspective of a driver, likely in San Francisco, under an overcast sky. The road is a wide, multi-lane boulevard with a somewhat worn appearance, featuring visible cracks and patches. In the foreground, the road is marked with a crosswalk composed of broad, faded yellow stripes.\n\nOn the left side of the street, there is a line of parked cars. A prominent white Volkswagen is in the process of pulling out from a parking space into the lane of traffic. Further down",
+    "finish_reason": "length",
+    "repetition": 1,
+    "mode": "eager",
+    "index": 478,
+    "second_index": 618
+  }
+]

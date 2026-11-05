@@ -1,0 +1,36 @@
+{
+  "results": [
+    {
+      "mode": "eager",
+      "runner": "GPUModelRunner"
+    },
+    {
+      "mode": "eager",
+      "runner": "GPUModelRunner"
+    },
+    {
+      "mode": "eager",
+      "runner": "GPUModelRunner"
+    },
+    {
+      "mode": "eager",
+      "runner": "GPUModelRunner"
+    },
+    {
+      "mode": "eager",
+      "runner": "GPUModelRunner"
+    },
+    {
+      "mode": "eager",
+      "runner": "GPUModelRunner"
+    },
+    {
+      "mode": "eager",
+      "runner": "GPUModelRunner"
+    },
+    {
+      "mode": "eager",
+      "runner": "GPUModelRunner"
+    }
+  ]
+}

@@ -1,0 +1,44 @@
+{
+  "case": "red",
+  "status": 200,
+  "seconds": 0.3671193070040317,
+  "response": {
+    "id": "chatcmpl-a1ed874ce3434cda",
+    "object": "chat.completion",
+    "created": 1793849229,
+    "model": "hy4-vl",
+    "choices": [
+      {
+        "index": 0,
+        "message": {
+          "role": "assistant",
+          "content": "红色",
+          "refusal": null,
+          "annotations": null,
+          "audio": null,
+          "function_call": null,
+          "reasoning": null
+        },
+        "logprobs": null,
+        "finish_reason": "stop",
+        "stop_reason": null,
+        "token_ids": null,
+        "routed_experts": null
+      }
+    ],
+    "service_tier": null,
+    "system_fingerprint": "vllm-0.25.1-tp8-b906b3bd",
+    "usage": {
+      "prompt_tokens": 139,
+      "total_tokens": 141,
+      "completion_tokens": 2,
+      "prompt_tokens_details": null
+    },
+    "prompt_logprobs": null,
+    "prompt_token_ids": null,
+    "prompt_text": null,
+    "kv_transfer_params": null,
+    "metrics": null
+  },
+  "correct": true
+}

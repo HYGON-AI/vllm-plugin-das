@@ -1,0 +1,122 @@
+[
+  {
+    "source": "/root/hy4-precision-fix/attention-probe.log",
+    "source_sha256": "73f9ad0dbd0694200c70b02cc1ac112153bcd5fe74842426a833343c50b2c476",
+    "copy": "cause/attention-probe.log",
+    "normalization": "splitlines, remove trailing whitespace, final newline"
+  },
+  {
+    "source": "/root/hy4-precision-fix/probe.log",
+    "source_sha256": "e1417cc835c063d2c2c1a4c595f28dff321b3becf996450c059411d0b9e61860",
+    "copy": "cause/probe.log",
+    "normalization": "splitlines, remove trailing whitespace, final newline"
+  },
+  {
+    "source": "/root/hy4-precision-fix/regression-tests.log",
+    "source_sha256": "97d293364cea367ad94f77b3ed8d311d112b7d49413f892c838b8788ecbce9e6",
+    "copy": "cause/regression-tests.log",
+    "normalization": "splitlines, remove trailing whitespace, final newline"
+  },
+  {
+    "source": "/root/hy4-precision-fix/serving.log",
+    "source_sha256": "fc222f2816ba7d20dc795ce45bec20c4c8c234488967f1403291810f84270780",
+    "copy": "cause/serving.log",
+    "normalization": "splitlines, remove trailing whitespace, final newline"
+  },
+  {
+    "source": "/root/hy4-precision-fix/source-probe.log",
+    "source_sha256": "064bdbabca32ec9cf6449d742dff6284df84e70aad56e34e51c7c76eca989ab0",
+    "copy": "cause/source-probe.log",
+    "normalization": "splitlines, remove trailing whitespace, final newline"
+  },
+  {
+    "source": "/root/hy4-precision-fix/sparse-index-tests.log",
+    "source_sha256": "f3d4485c98f64abafffe6530ba5cbcbc50ec6b3df6d2949536609195bf4f1dc5",
+    "copy": "cause/sparse-index-tests.log",
+    "normalization": "splitlines, remove trailing whitespace, final newline"
+  },
+  {
+    "source": "/root/hy4-precision-fix/fresh/accuracy.log",
+    "source_sha256": "c4eea29a890d4f77190007b4dfcd07d765686cda006157b035539e311c95d8e5",
+    "copy": "fresh/accuracy.log",
+    "normalization": "splitlines, remove trailing whitespace, final newline"
+  },
+  {
+    "source": "/root/hy4-precision-fix/fresh/captions.py.log",
+    "source_sha256": "95cf395843905223ea7341603a549718f3bc2b4d090be6eacfe81c369a5275bd",
+    "copy": "fresh/captions.py.log",
+    "normalization": "splitlines, remove trailing whitespace, final newline"
+  },
+  {
+    "source": "/root/hy4-precision-fix/fresh/compare_accuracy.py.log",
+    "source_sha256": "ed7078ad53011f19df2f96e6df35909039a67a9c0b87fb3144f3257405190e42",
+    "copy": "fresh/compare_accuracy.py.log",
+    "normalization": "splitlines, remove trailing whitespace, final newline"
+  },
+  {
+    "source": "/root/hy4-precision-fix/fresh/driver.log",
+    "source_sha256": "2d910b1173c26688326e59676664ca33db88c355a4d7eb0822ee6f88964750d1",
+    "copy": "fresh/driver.log",
+    "normalization": "splitlines, remove trailing whitespace, final newline"
+  },
+  {
+    "source": "/root/hy4-precision-fix/fresh/long_qa.py.log",
+    "source_sha256": "25dbe14cb14153687aead3b7e9d3ea53827466c0fe47cb107c7d41bbf429c578",
+    "copy": "fresh/long_qa.py.log",
+    "normalization": "splitlines, remove trailing whitespace, final newline"
+  },
+  {
+    "source": "/root/hy4-precision-fix/fresh/perf-eager.log",
+    "source_sha256": "b363e477f90e579da38bd7e2cc1ceaedf73d580bcc69c197ed8bed0ccec06e37",
+    "copy": "fresh/perf-eager.log",
+    "normalization": "splitlines, remove trailing whitespace, final newline"
+  },
+  {
+    "source": "/root/hy4-precision-fix/fresh/perf-full-piecewise.log",
+    "source_sha256": "208c221f0029d1bc3bde2cbabfef534bb8715d44b6b12cf3038f24540ccf1619",
+    "copy": "fresh/perf-full-piecewise.log",
+    "normalization": "splitlines, remove trailing whitespace, final newline"
+  },
+  {
+    "source": "/root/hy4-precision-fix/fresh/performance.py.log",
+    "source_sha256": "ee9e0420882c3390f6a80a6d66aea31bb17223fc40e0b83f68e3da62756fcaf7",
+    "copy": "fresh/performance.py.log",
+    "normalization": "splitlines, remove trailing whitespace, final newline"
+  },
+  {
+    "source": "/root/hy4-precision-fix/fresh/post-accuracy.log",
+    "source_sha256": "82e0dc8e0cabc799df32c17f155ff528755511c67ad952ece39cd67c8f67e75d",
+    "copy": "fresh/post-accuracy.log",
+    "normalization": "splitlines, remove trailing whitespace, final newline"
+  },
+  {
+    "source": "/root/hy4-precision-fix/fresh/post-captions.log",
+    "source_sha256": "08e404dd37882659ead75aeac14ac3d925e959716da0756a0e77b20fb9e95c3f",
+    "copy": "fresh/post-captions.log",
+    "normalization": "splitlines, remove trailing whitespace, final newline"
+  },
+  {
+    "source": "/root/hy4-precision-fix/fresh/post-long-qa.log",
+    "source_sha256": "f14969f8b82c95b4175229fe54e54246bab9513dde024a993593697f81ff0447",
+    "copy": "fresh/post-long-qa.log",
+    "normalization": "splitlines, remove trailing whitespace, final newline"
+  },
+  {
+    "source": "/root/hy4-precision-fix/fresh/post-performance.log",
+    "source_sha256": "b7cdcb9a4bde91944a2438c11c520a1138e618cb0848715d7e70f2a33bd23be3",
+    "copy": "fresh/post-performance.log",
+    "normalization": "splitlines, remove trailing whitespace, final newline"
+  },
+  {
+    "source": "/root/hy4-precision-fix/fresh/serving.log",
+    "source_sha256": "ee0d754b2f5b3c0d07b17e3bbac93ba4270bb056508890adde24db736596b169",
+    "copy": "fresh/serving.log",
+    "normalization": "splitlines, remove trailing whitespace, final newline"
+  },
+  {
+    "source": "/root/hy4-precision-fix/fresh/smoke.log",
+    "source_sha256": "60713a56db7a514a2641d310db6db3733f01613c6809e3badccbbe5a2949fa7b",
+    "copy": "fresh/smoke.log",
+    "normalization": "splitlines, remove trailing whitespace, final newline"
+  }
+]

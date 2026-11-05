@@ -1,0 +1,92 @@
+{
+  "results": [
+    {
+      "rank": 0,
+      "enabled_indexers": 21,
+      "architectures": [
+        "HYV4VLForConditionalGeneration"
+      ],
+      "source_sha256": {
+        "attention.py": "dd2a2c76a3c5ce3b4e6d116e0c9419561e96ceda07af29088de2dc78139571c8",
+        "sparse_indices.py": "4168d076d9b5689174a92c106d4f40854d9a309e74afa05095bc29a3620e37bd"
+      }
+    },
+    {
+      "rank": 1,
+      "enabled_indexers": 21,
+      "architectures": [
+        "HYV4VLForConditionalGeneration"
+      ],
+      "source_sha256": {
+        "attention.py": "dd2a2c76a3c5ce3b4e6d116e0c9419561e96ceda07af29088de2dc78139571c8",
+        "sparse_indices.py": "4168d076d9b5689174a92c106d4f40854d9a309e74afa05095bc29a3620e37bd"
+      }
+    },
+    {
+      "rank": 2,
+      "enabled_indexers": 21,
+      "architectures": [
+        "HYV4VLForConditionalGeneration"
+      ],
+      "source_sha256": {
+        "attention.py": "dd2a2c76a3c5ce3b4e6d116e0c9419561e96ceda07af29088de2dc78139571c8",
+        "sparse_indices.py": "4168d076d9b5689174a92c106d4f40854d9a309e74afa05095bc29a3620e37bd"
+      }
+    },
+    {
+      "rank": 3,
+      "enabled_indexers": 21,
+      "architectures": [
+        "HYV4VLForConditionalGeneration"
+      ],
+      "source_sha256": {
+        "attention.py": "dd2a2c76a3c5ce3b4e6d116e0c9419561e96ceda07af29088de2dc78139571c8",
+        "sparse_indices.py": "4168d076d9b5689174a92c106d4f40854d9a309e74afa05095bc29a3620e37bd"
+      }
+    },
+    {
+      "rank": 4,
+      "enabled_indexers": 21,
+      "architectures": [
+        "HYV4VLForConditionalGeneration"
+      ],
+      "source_sha256": {
+        "attention.py": "dd2a2c76a3c5ce3b4e6d116e0c9419561e96ceda07af29088de2dc78139571c8",
+        "sparse_indices.py": "4168d076d9b5689174a92c106d4f40854d9a309e74afa05095bc29a3620e37bd"
+      }
+    },
+    {
+      "rank": 5,
+      "enabled_indexers": 21,
+      "architectures": [
+        "HYV4VLForConditionalGeneration"
+      ],
+      "source_sha256": {
+        "attention.py": "dd2a2c76a3c5ce3b4e6d116e0c9419561e96ceda07af29088de2dc78139571c8",
+        "sparse_indices.py": "4168d076d9b5689174a92c106d4f40854d9a309e74afa05095bc29a3620e37bd"
+      }
+    },
+    {
+      "rank": 6,
+      "enabled_indexers": 21,
+      "architectures": [
+        "HYV4VLForConditionalGeneration"
+      ],
+      "source_sha256": {
+        "attention.py": "dd2a2c76a3c5ce3b4e6d116e0c9419561e96ceda07af29088de2dc78139571c8",
+        "sparse_indices.py": "4168d076d9b5689174a92c106d4f40854d9a309e74afa05095bc29a3620e37bd"
+      }
+    },
+    {
+      "rank": 7,
+      "enabled_indexers": 21,
+      "architectures": [
+        "HYV4VLForConditionalGeneration"
+      ],
+      "source_sha256": {
+        "attention.py": "dd2a2c76a3c5ce3b4e6d116e0c9419561e96ceda07af29088de2dc78139571c8",
+        "sparse_indices.py": "4168d076d9b5689174a92c106d4f40854d9a309e74afa05095bc29a3620e37bd"
+      }
+    }
+  ]
+}

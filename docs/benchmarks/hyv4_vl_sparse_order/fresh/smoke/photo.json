@@ -1,0 +1,44 @@
+{
+  "case": "photo",
+  "status": 200,
+  "seconds": 3.678039724007249,
+  "response": {
+    "id": "chatcmpl-b0b99e0c7d61a102",
+    "object": "chat.completion",
+    "created": 1793849232,
+    "model": "hy4-vl",
+    "choices": [
+      {
+        "index": 0,
+        "message": {
+          "role": "assistant",
+          "content": "这张春日图景里，粉嫩的樱花枝桠在前景舒展，湛蓝晴空下，中央电视塔在花簇间露出银白塔身，明媚的花与冷峻的建筑相映，满是春日的清新浪漫。",
+          "refusal": null,
+          "annotations": null,
+          "audio": null,
+          "function_call": null,
+          "reasoning": null
+        },
+        "logprobs": null,
+        "finish_reason": "stop",
+        "stop_reason": null,
+        "token_ids": null,
+        "routed_experts": null
+      }
+    ],
+    "service_tier": null,
+    "system_fingerprint": "vllm-0.25.1-tp8-b906b3bd",
+    "usage": {
+      "prompt_tokens": 1072,
+      "total_tokens": 1123,
+      "completion_tokens": 51,
+      "prompt_tokens_details": null
+    },
+    "prompt_logprobs": null,
+    "prompt_token_ids": null,
+    "prompt_text": null,
+    "kv_transfer_params": null,
+    "metrics": null
+  },
+  "correct": null
+}

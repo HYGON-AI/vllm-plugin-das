@@ -1,0 +1,12 @@
+{
+  "torch": "2.11.0",
+  "lightop": "0.6.0+dtk2604.torch2110.2610191712.gb42f45",
+  "vllm": "0.25.1+das185.dtk2604.torch2110.2608171710.g7b108a",
+  "transformers": "5.20.1",
+  "triton": "3.6.0+dtk2604.torch2110.2610171646.g46f0be",
+  "device_name": "BW1101",
+  "architecture": "gfx938:sramecc+:xnack-",
+  "warp_size": 64,
+  "devices": 8,
+  "environment_probe_note": "Post-workload worker RPC returned TorchVersion without str conversion; engine serialization failed. It was not part of any request result; server was stopped afterwards. This environment is read in a separate process after shutdown."
+}

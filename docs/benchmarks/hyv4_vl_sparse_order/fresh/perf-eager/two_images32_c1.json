@@ -1,0 +1,62 @@
+[
+  {
+    "ttft_seconds": 1.1129028060095152,
+    "latency_seconds": 8.110915377008496,
+    "decode_seconds_per_token": 0.22572769135454548,
+    "usage": {
+      "prompt_tokens": 2039,
+      "total_tokens": 2071,
+      "completion_tokens": 32
+    },
+    "answer": "The first image depicts a daytime street scene under overcast, rainy conditions. The road is wet, reflecting the gray sky and surrounding elements. Multiple vehicles, including",
+    "finish_reason": "length",
+    "index": 112,
+    "second_index": 507,
+    "reference": "A"
+  },
+  {
+    "ttft_seconds": 0.919482589000836,
+    "latency_seconds": 7.93376946200442,
+    "decode_seconds_per_token": 0.2262523301615147,
+    "usage": {
+      "prompt_tokens": 1585,
+      "total_tokens": 1617,
+      "completion_tokens": 32
+    },
+    "answer": "Image 1:\nThe first image shows two glass seasoning grinders placed side by side on a light-colored wooden cutting board or countertop. The gr",
+    "finish_reason": "length",
+    "index": 422,
+    "second_index": 204,
+    "reference": "B"
+  },
+  {
+    "ttft_seconds": 1.111162268993212,
+    "latency_seconds": 8.143111890996806,
+    "decode_seconds_per_token": 0.22682230300016537,
+    "usage": {
+      "prompt_tokens": 2039,
+      "total_tokens": 2071,
+      "completion_tokens": 32
+    },
+    "answer": "Here is a detailed description of both images in their original order:\n\n**Image 1: Urban Intersection**\nThis image captures a daytime view of a quiet,",
+    "finish_reason": "length",
+    "index": 287,
+    "second_index": 719,
+    "reference": "No"
+  },
+  {
+    "ttft_seconds": 1.109918148998986,
+    "latency_seconds": 8.128542687001755,
+    "decode_seconds_per_token": 0.2263924586774421,
+    "usage": {
+      "prompt_tokens": 2039,
+      "total_tokens": 2071,
+      "completion_tokens": 32
+    },
+    "answer": "Here is a detailed description of both images, in their original order:\n\n### Image 1\n\nThis image captures a daytime street scene from the perspective of a driver",
+    "finish_reason": "length",
+    "index": 478,
+    "second_index": 618,
+    "reference": "11"
+  }
+]
