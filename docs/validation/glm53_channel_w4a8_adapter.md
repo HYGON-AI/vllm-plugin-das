@@ -348,3 +348,48 @@ and MoE kernel boundaries with small tensor operations; they are not a new
 full-model accuracy or end-to-end kernel validation.
 
 Artifacts: `run/20261105_pr299_kernel_native_review/` in the validation project.
+
+## Inference-mode reload and complete fused matching review (2026-11-05)
+
+Derived scale copies created during inference-mode warmup are inference tensors.
+Reload may execute outside that mode. Both destination layouts are now validated
+before either copy, and the copies run inside `torch.inference_mode()` so both
+existing allocations can be refreshed safely without changing graph addresses.
+Tests cover checkpoint, V1/V2 kernel and selected target/draft transfer updates
+after inference-mode warmup, including normal-mode reload and direct replay.
+
+MTP fusion completeness is resolved with the complete ordered native rule table.
+The selected rule for each shard separately determines whether canonical
+matching depends on a decoder-specific target. Decoder and generic rules can
+therefore cooperate to cover a fused projection. Explicit MTP overrides can
+likewise cooperate with generic shard rules. Shadowed decoder rules do not
+activate canonical matching, and fully explicit fused MTP overrides retain
+their existing priority over generic fused-name rules.
+
+Code review covered all 13 PR files against base `eaa70319`, including loader
+class identity and aliases, bounded signed INT4 repack, scale domains, reload
+and transfer hooks, AllGatherv forwarding, MTP config isolation and rollback,
+callback signature/exception handling, and platform/plugin isolation. Besides
+the reported two issues, tests reproduced the mixed explicit-override fusion
+and shadowed-decoder cases above. Pair validation was also hardened to avoid
+partially changing a cached pair on a layout validation failure. No additional
+reproducible finding remained within that reviewed scope.
+
+Expanded same-process lifecycle testing also exposed a pre-existing test
+isolation gap: two tests could leave a stub-based V2 adapter in `sys.modules`
+when it was initially absent, causing eight downstream reload cases to fail.
+Both the module entry and parent-package attribute are now restored after each
+stub import. This is a test-fixture fix; no production runner change is needed.
+The expanded single-process CI-image suite then passed all 464 tests, with
+79 hardware/other cases deselected; patch coverage and environment gates passed.
+
+On nmz105 the prior implementation failed 22 regressions; the fix passed all
+132 affected CPU tests and 12 actual BW1101 graph cases. The graph tests retain
+the native loader, adapter, delegate and cache while substituting small tensor
+operations at the AITER shuffle and MoE kernel boundaries. They cover both
+normal and inference-mode warmup, three checkpoint generations, ten subsequent
+V1/V2 kernel updates, unchanged scale addresses and direct replay before eager
+forward. This is not a new full-model accuracy or end-to-end kernel result.
+
+Artifacts, including `code_review.json` and CI-image verification logs:
+`run/20261105_pr299_inference_fused_review/` in the validation project.
