@@ -68,13 +68,20 @@ class Step5AuxManager:
         self.pools: dict[int, _SnapshotPool] = {}
         self._sources: dict[str, list[list[int]]] = {}
         self._lock = threading.RLock()
-        registered: dict[int, int] = {}
+        # Transport and captured consumers retain these addresses. Keep the
+        # allocations alive, and reject rebinding until KV is registered again.
+        self._allocations: dict[int, tuple] = {}
+        registered: dict[int, Any] = {}
         capacity = 4 * worker.vllm_config.scheduler_config.max_num_seqs + 32
 
         for name, indexer in indexers.items():
             state = indexer.state
             cache = kv_caches[name]
             state.ensure_allocated(cache, cache.device)
+            allocation = (state.summary, state.pending_key, state.pending_z)
+            self._allocations[id(state)] = (
+                state, allocation, tuple(t.data_ptr() for t in allocation),
+            )
             if state.dtype not in _DTYPE_CODES:
                 raise ValueError(f"Unsupported Step5 indexer dtype: {state.dtype}")
             num_blocks = int(cache.shape[0] if cache.ndim == 4 else cache.shape[1])
@@ -90,9 +97,13 @@ class Step5AuxManager:
                 tensors += [state.pending_key, state.pending_z]
             for tensor in tensors:
                 storage = tensor.untyped_storage()
-                registered[storage.data_ptr()] = storage.nbytes()
+                registered[storage.data_ptr()] = storage
 
-        ptrs, sizes = list(registered), list(registered.values())
+        # Storage references also survive an in-place Tensor.set_(). Keeping
+        # only the Tensor object would not keep its old registered memory alive.
+        self._registered_storages = tuple(registered.values())
+        ptrs = list(registered)
+        sizes = [storage.nbytes() for storage in self._registered_storages]
         if worker.engine.batch_register_memory(ptrs, sizes) != 0:
             raise RuntimeError("Step5 DSA auxiliary memory registration failed")
         if hasattr(worker, "seen_base_addresses"):
@@ -100,6 +111,16 @@ class Step5AuxManager:
         first = next(iter(kv_caches[name] for name in indexers))
         if first.is_cuda:
             torch.cuda.synchronize(first.device)
+
+    def _validate_allocations(self) -> None:
+        for state, registered, pointers in self._allocations.values():
+            current = (state.summary, state.pending_key, state.pending_z)
+            if any(now is not old or old.data_ptr() != pointer
+                   for now, old, pointer in zip(current, registered, pointers)):
+                raise RuntimeError(
+                    "Step5 PD auxiliary buffers changed after registration; "
+                    "re-register KV caches before restoring or sending state"
+                )
 
     def capture(self, indexer: Any, md: Any, sched: Any,
                 index_k: torch.Tensor, index_z: torch.Tensor) -> None:
@@ -200,6 +221,10 @@ class Step5AuxManager:
         if not any(pull_meta.local_block_ids):
             pull_meta.dsa_aux = {}
             return
+        self._validate_allocations()
+        first = next(iter(self._allocations.values()))[1][0]
+        if first.is_cuda and torch.cuda.is_current_stream_capturing():
+            raise RuntimeError("Step5 PD auxiliary restoration must run before graph replay")
         groups = self.worker._logical_to_kernel_block_ids(pull_meta.local_block_ids)
         n = int(pull_meta.num_prompt_tokens)
         if n <= 0:
@@ -250,6 +275,7 @@ class Step5AuxManager:
         ratio = self.worker.transfer_topo.tp_ratio(agent_meta.remote_tp_size)
         if ratio > 0 and self.worker.tp_rank % ratio:
             return [], [], []
+        self._validate_allocations()
         peer = agent_meta.dsa_aux.get(request_id, {})
         missing = set(self.indexers) - set(peer)
         if missing:
@@ -298,7 +324,23 @@ def create_step5_aux_manager(worker: Any, kv_caches: dict[str, torch.Tensor]):
         raise NotImplementedError("Step5 DSA auxiliary transfer requires separate producer/consumer roles")
     config = worker.vllm_config
     if not config.model_config.enforce_eager:
-        raise NotImplementedError("Step5 DSA P/D auxiliary transfer currently requires --enforce-eager")
+        if worker.is_kv_producer:
+            raise NotImplementedError("Step5 DSA P/D producer snapshots require --enforce-eager")
+        # Only producers install the Python snapshot callback. Consumers import
+        # into fixed buffers before building/replaying the model's schedule.
+        # Their sparse KV readers must also be true views: the paged bridge
+        # performs eager-only materialization and cannot be captured.
+        for name in indexers:
+            cache = kv_caches[name]
+            affine = (
+                cache.ndim == 4 and cache.stride(0) == cache.shape[2] * cache.stride(2)
+                or cache.ndim == 5 and cache.stride(1) == cache.shape[2] * cache.stride(2)
+            )
+            if not affine or cache.stride(-1) != 1:
+                raise NotImplementedError(
+                    "Compiled Step5 PD consumers require affine sparse KV views; "
+                    "use --enforce-eager for this cache layout"
+                )
     if config.cache_config.enable_prefix_caching:
         raise NotImplementedError("Step5 DSA P/D auxiliary transfer requires --no-enable-prefix-caching")
     parallel = config.parallel_config

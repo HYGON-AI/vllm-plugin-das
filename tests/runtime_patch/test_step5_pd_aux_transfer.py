@@ -457,6 +457,60 @@ def test_other_models_and_ifb_never_import_indexers(aux, monkeypatch, model_type
     assert aux.create_step5_aux_manager(SimpleNamespace(vllm_config=config), {}) is None
 
 
+@pytest.mark.parametrize('heads,padding,split,allowed', [
+    (1, 0, False, True), (1, 32, False, False),
+    (4, 0, False, False), (1, 0, True, True),
+])
+def test_compiled_consumer_requires_affine_sparse_kv(aux, monkeypatch, heads, padding, split, allowed):
+    module = ModuleType('vllm_hcu.model_executor.layers.step4_dsa')
+    module._INDEXERS = {'layer': object()}
+    monkeypatch.setitem(sys.modules, module.__name__, module)
+    monkeypatch.setenv('HCU_DBO_MIN_TOKENS', '0')
+    sentinel = object()
+    monkeypatch.setattr(aux, 'Step5AuxManager', lambda *args: sentinel)
+    model = SimpleNamespace(hf_config=SimpleNamespace(model_type='step5'), enforce_eager=False)
+    config = SimpleNamespace(model_config=model, parallel_config=SimpleNamespace(enable_dbo=False),
+        cache_config=SimpleNamespace(enable_prefix_caching=False),
+        kv_transfer_config=SimpleNamespace(kv_connector='MooncakeConnector', kv_role='kv_consumer'))
+    worker = SimpleNamespace(vllm_config=config, is_kv_producer=False, is_kv_consumer=True)
+    if split:
+        cache = torch.empty((2, 3, 16, heads, 4), dtype=torch.uint8)
+    else:
+        stride = heads * 16 * 8 + padding
+        cache = torch.as_strided(torch.empty(3 * stride, dtype=torch.uint8),
+            (3, heads, 16, 8), (stride, 16 * 8, 8, 1))
+    if allowed:
+        assert aux.create_step5_aux_manager(worker, {'layer': cache}) is sentinel
+        config.cache_config.enable_prefix_caching = True
+        with pytest.raises(NotImplementedError, match='prefix'):
+            aux.create_step5_aux_manager(worker, {'layer': cache})
+    else:
+        with pytest.raises(NotImplementedError, match='affine'):
+            aux.create_step5_aux_manager(worker, {'layer': cache})
+
+
+@pytest.mark.parametrize('field', ['summary', 'pending_key', 'pending_z'])
+def test_rebound_auxiliary_allocations_reject_transfer_but_keep_cleanup_usable(aux, field):
+    manager, state, _, _ = make_manager(aux, False)
+    original = getattr(state, field)
+    setattr(state, field, original.clone())
+    with pytest.raises(RuntimeError, match='re-register'):
+        manager.prepare_pull(SimpleNamespace(local_block_ids=[[2]], num_prompt_tokens=5))
+    cleanup = SimpleNamespace(local_block_ids=[], num_prompt_tokens=0, dsa_aux={'old': ()})
+    manager.prepare_pull(cleanup)
+    assert cleanup.dsa_aux == {}
+    assert any(original is t for _, tensors, _ in manager._allocations.values() for t in tensors)
+
+
+def test_inplace_storage_rebinding_is_rejected(aux):
+    manager, state, _, _ = make_manager(aux, False)
+    registered_pointer = state.pending_key.data_ptr()
+    state.pending_key.set_(torch.zeros_like(state.pending_key))
+    with pytest.raises(RuntimeError, match='re-register'):
+        manager.prepare_pull(SimpleNamespace(local_block_ids=[[2]], num_prompt_tokens=5))
+    assert any(s.data_ptr() == registered_pointer for s in manager._registered_storages)
+
+
 @pytest.mark.parametrize("source_groups,target_groups", [([], [[2]]), ([[1]], [])])
 def test_missing_kv_group_is_reported_before_pointer_lookup(aux, source_groups, target_groups):
     producer, _, _, _ = make_manager(aux, True)
