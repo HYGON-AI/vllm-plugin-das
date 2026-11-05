@@ -90,12 +90,16 @@ def _mtp_quantization_config(vllm_config: VllmConfig, prefix: str) -> VllmConfig
             return prefix + target[len("model.decoder"):]
         return None
 
-    targets = dict(quant_config.target_scheme_map)
+    targets = {}
     ignore = list(quant_config.ignore)
     for target, scheme in quant_config.target_scheme_map.items():
+        targets[target] = scheme
         mapped = alias(target)
-        if mapped is not None:
-            targets.setdefault(mapped, scheme)
+        # Regex rules use first-match priority. Insert each alias beside its
+        # source, before later generic regexes, without moving or replacing an
+        # explicit rule for the actual MTP prefix.
+        if mapped is not None and mapped not in quant_config.target_scheme_map:
+            targets[mapped] = scheme
     for target in quant_config.ignore:
         mapped = alias(target)
         if mapped is not None and mapped not in ignore:

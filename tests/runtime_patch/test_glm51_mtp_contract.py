@@ -317,6 +317,43 @@ def test_mtp_explicit_actual_prefix_ignore_and_target_take_priority(mtp_module):
     ) is None
 
 
+@pytest.mark.parametrize("generic_first", [False, True])
+def test_mtp_alias_preserves_regex_first_match_priority(mtp_module, generic_first):
+    canonical = r"re:^model\.decoder\.mlp\.experts\.\d+\.down_proj$"
+    generic = r"re:^model\..*\.down_proj$"
+    qconfig = _mixed_quant_config(canonical)
+    specific_scheme = qconfig.target_scheme_map[canonical]
+    generic_scheme = qconfig.target_scheme_map["Linear"]
+    rules = [(canonical, specific_scheme), (generic, generic_scheme)]
+    if generic_first:
+        rules.reverse()
+    qconfig.target_scheme_map = dict(rules)
+    original_rules = list(qconfig.target_scheme_map.items())
+    linear = nn.Linear(8, 8, bias=False)
+    original_bits = qconfig.get_scheme_dict(
+        linear, "model.decoder.mlp.experts.0.down_proj",
+    )["weights"].num_bits
+    adapted = mtp_module._mtp_quantization_config(_glm_engine(qconfig), "model.layers.78")
+    assert adapted.quant_config.get_scheme_dict(
+        linear, "model.layers.78.mlp.experts.0.down_proj",
+    )["weights"].num_bits == original_bits
+    assert original_bits == (8 if generic_first else 4)
+    assert list(qconfig.target_scheme_map.items()) == original_rules
+
+
+def test_mtp_existing_alias_retains_its_position(mtp_module):
+    canonical = r"re:^model\.decoder\.mlp\.experts\.0\.down_proj$"
+    actual = r"re:^model\.layers\.78\.mlp\.experts\.0\.down_proj$"
+    generic = r"re:^model\..*\.down_proj$"
+    qconfig = _mixed_quant_config(canonical)
+    four = qconfig.target_scheme_map[canonical]
+    eight = qconfig.target_scheme_map["Linear"]
+    qconfig.target_scheme_map = {canonical: four, generic: eight, actual: eight}
+    adapted = mtp_module._mtp_quantization_config(_glm_engine(qconfig), "model.layers.78")
+    assert list(adapted.quant_config.target_scheme_map) == [canonical, generic, actual]
+    assert adapted.quant_config.target_scheme_map[actual] is eight
+
+
 @pytest.mark.parametrize("quant_config", [None, SimpleNamespace()])
 def test_non_compressed_tensors_mtp_config_is_unchanged(mtp_module, quant_config):
     engine = _glm_engine(quant_config)
