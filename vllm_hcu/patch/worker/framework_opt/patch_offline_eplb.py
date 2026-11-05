@@ -91,24 +91,6 @@ class _RecordOnlyPolicyProxy:
         return getattr(self._policy, name)
 
 
-def _capture_recording_started(state: object) -> bool:
-    """Agree on the warmup boundary before any EP rank enters EPLB collectives."""
-    start_file = os.environ.get("VLLM_HCU_EPLB_CAPTURE_START_FILE")
-    if not start_file or getattr(state, "_hcu_offline_capture_started", False):
-        return True
-    from vllm.distributed import get_ep_group
-
-    group = get_ep_group()
-    ready = Path(start_file).is_file() if group.rank_in_group == 0 else None
-    # A filesystem check on each rank can observe different values in one step
-    # and deadlock when only some ranks enter the subsequent EPLB all-reduce.
-    ready = group.broadcast_object(ready, src=0)
-    if ready:
-        state._hcu_offline_capture_started = True
-        logger.info("Offline EPLB capture started after benchmark warmup")
-    return bool(ready)
-
-
 def _ep_rank() -> int:
     if not torch.distributed.is_initialized():
         return 0
@@ -635,17 +617,6 @@ def apply_to_module(module) -> bool:
             # sequencing, because other EP ranks may have real requests.
             for model_state in self.model_states.values():
                 model_state.expert_load_pass.zero_()
-            self._update_layer_should_record(log_stats=log_stats)
-            return None
-        if not _capture_recording_started(self):
-            # step() runs after forward: discard this warmup pass, not the
-            # first real pass after the boundary. No proposal is computed yet.
-            for model_state in self.model_states.values():
-                model_state.expert_load_pass.zero_()
-                model_state.expert_load_window.zero_()
-            self.expert_load_window_step = 0
-            self.expert_rearrangement_step = 0
-            self._hcu_offline_cumulative_load = []
             self._update_layer_should_record(log_stats=log_stats)
             return None
         return original_step(

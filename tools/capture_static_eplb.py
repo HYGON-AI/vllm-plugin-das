@@ -1,16 +1,5 @@
 #!/usr/bin/env python3
-"""Capture a static EPLB proposal using an existing serve and benchmark script.
-
-With --start-after-warmup, the benchmark must run the following after warmup
-and before its first measurement request:
-
-    if [ -n "${EPLB_CAPTURE_START_FILE:-}" ]; then
-        touch -- "$EPLB_CAPTURE_START_FILE"
-    fi
-
-Workers discard warmup load until EP rank zero observes this signal. All EP
-ranks agree on the boundary before counting the first measurement pass.
-"""
+"""Capture a static EPLB proposal using an existing serve and benchmark script."""
 import argparse
 import json
 import os
@@ -34,19 +23,12 @@ def main():
     parser.add_argument('--redundant', type=int, default=16)
     parser.add_argument('--ready-timeout', type=int, default=3600)
     parser.add_argument('--prepare-only', action='store_true')
-    parser.add_argument(
-        '--start-after-warmup', action='store_true',
-        help='Ignore warmup load until the benchmark creates EPLB_CAPTURE_START_FILE',
-    )
     args = parser.parse_args()
     output = Path(args.output).resolve()
     if output.exists():
         parser.error('Output already exists; use a new filename to preserve earlier records')
     if args.window_size < 1:
         parser.error('window-size must be positive')
-    start_file = Path(str(output) + '.capture-start')
-    if args.start_after_warmup and start_file.exists():
-        parser.error('Capture start signal already exists; use a new output filename')
     source = Path(args.run_script).resolve()
     bench = Path(args.bench_script).resolve()
     if not bench.is_file():
@@ -69,13 +51,7 @@ def main():
         parser.error('Source must enable EPLB')
     output.parent.mkdir(parents=True, exist_ok=True)
     generated = Path(str(output)+'.capture.sh')
-    capture_env = 'unset VLLM_HCU_EPLB_CAPTURE_START_FILE\n'
-    if args.start_after_warmup:
-        capture_env = (
-            'export VLLM_HCU_EPLB_CAPTURE_START_FILE='
-            + shlex.quote(str(start_file)) + '\n'
-        )
-    generated.write_text('set -euo pipefail\n' + capture_env + text)
+    generated.write_text('set -euo pipefail\n'+text)
     subprocess.run(['bash','-n',str(generated)],check=True)
     print('Generated:', generated, flush=True)
     if args.prepare_only:
@@ -85,11 +61,6 @@ def main():
             parser.error('Port is occupied; stop the old server or select --port')
     env = dict(os.environ, MODEL_PATH=model, BENCH_PORT=str(args.port),
                OUTPUTS_DIR=str(output)+'.bench')
-    env.pop('EPLB_CAPTURE_START_FILE', None)
-    env.pop('VLLM_HCU_EPLB_CAPTURE_START_FILE', None)
-    if args.start_after_warmup:
-        env['EPLB_CAPTURE_START_FILE'] = str(start_file)
-        print('Waiting for benchmark warmup boundary:', start_file, flush=True)
     with open(str(output)+'.server.log','w') as log:
         proc = subprocess.Popen(['bash',str(generated)],cwd=source.parent,
                                 env=env,stdout=log,stderr=subprocess.STDOUT,
@@ -106,14 +77,9 @@ def main():
                     if time.monotonic()>deadline:
                         raise TimeoutError('Readiness timeout; inspect '+log.name)
                     time.sleep(3)
-            # The benchmark signals its explicit warmup boundary via this file.
-            # Workers discard warmup counters and begin a fresh window afterwards.
+            # Execute the actual workload, including its existing warmup, unchanged.
             subprocess.run(['bash',str(bench)],cwd=bench.parent,env=env,check=True)
-            if args.start_after_warmup and not start_file.is_file():
-                raise RuntimeError(
-                    'Benchmark did not signal warmup completion. Add '
-                    '\'touch "$EPLB_CAPTURE_START_FILE"\' after warmup.'
-                )
+            payload = json.loads(output.read_text())
             from vllm_hcu.model_executor.layers.fused_moe.static_eplb import load_static_eplb_plan
             cfg = json.loads((Path(model)/'config.json').read_text())
             plan = load_static_eplb_plan(output, model_key='DeepseekV4ForCausalLM',
