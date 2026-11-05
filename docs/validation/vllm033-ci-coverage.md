@@ -41,10 +41,26 @@ fail the result gate. JUnit reports preserve each tier separately. The shared
 HCU registration assertion recognizes only files actually executed by this
 release runner; all other HCU files still require the legacy registry.
 
-Set `HCU_CI_IMAGE_V033` to a prepared DTK image with compatible vLLM 0.33,
-Adapter, vendor libraries, pytest, packaging and build tooling. The workflow
-fails explicitly when it is absent. A configured image name is not evidence
-that the image or hardware tier passed. The runner must provide gfx936 devices
+Set `HARBOR_SITE` to the approved registry host (optionally with a port, without
+a scheme or path). Set `HCU_CI_IMAGE_V033` to an immutable
+`${HARBOR_SITE}/jenkins/model_test_env/vllm@sha256:<64 lowercase hex digits>`
+for a prepared DTK image with compatible vLLM 0.33, Adapter, vendor libraries,
+pytest, packaging and build tooling. Missing/whitespace values, mutable tags,
+malformed digests and other repositories fail before the hardware job starts;
+there is no legacy-image fallback or automatic pull to resolve a tag.
+The job container uses the existing `HARBOR_USERNAME`/`HARBOR_PASSWORD` secrets
+when the event permits them, for the initial private-image pull. Fork PRs
+normally cannot read repository secrets: a private-image pull therefore still
+requires reviewed pre-existing runner registry authentication or credentials
+available to that event. The credentials declaration does not prove pull success.
+Missing authorization or pull access remains a failure; do not switch to
+`pull_request_target`, expose secrets to PR code, or let a PR head authorize itself.
+The container mounts `/opt/hyhal` read-only and uses the existing
+`scripts/ci/hcu/hcu_ci_start_container.sh` default 32GiB shared-memory policy
+without privileged mode.
+The hosted selector/source jobs receive no Harbor secrets or HCU device mounts.
+A configured digest is not evidence that the image or hardware tier passed.
+The runner must provide the host `/opt/hyhal` runtime, gfx936 devices
 and the normal prepared DTK environment. This candidate does not create or
 validate such an image, allocate runner resources, or certify models and
 other HCU architectures. Image/wheel provenance, model quality, performance

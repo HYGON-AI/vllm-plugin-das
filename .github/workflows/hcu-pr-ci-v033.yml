@@ -127,12 +127,24 @@ jobs:
         id: image
         env:
           HCU_CI_IMAGE_V033: ${{ vars.HCU_CI_IMAGE_V033 }}
+          HARBOR_SITE: ${{ vars.HARBOR_SITE }}
         run: |
+          set -euo pipefail
+          if [[ -z "${HARBOR_SITE:-}" || "$HARBOR_SITE" =~ [[:space:]/@] ]]; then
+            echo 'HARBOR_SITE must name the approved registry host, without a scheme or path' >&2
+            exit 2
+          fi
           if [[ -z "${HCU_CI_IMAGE_V033//[[:space:]]/}" ]]; then
             echo 'HCU_CI_IMAGE_V033 must name a prepared v0.33 DTK/Core/Adapter/vendor image' >&2
             exit 2
           fi
-          echo "image=$HCU_CI_IMAGE_V033" >> "$GITHUB_OUTPUT"
+          allowed_repository="${HARBOR_SITE}/jenkins/model_test_env/vllm"
+          if [[ "${HCU_CI_IMAGE_V033%@*}" != "$allowed_repository" \
+              || ! "${HCU_CI_IMAGE_V033##*@}" =~ ^sha256:[0-9a-f]{64}$ ]]; then
+            echo 'HCU_CI_IMAGE_V033 must be an immutable sha256 digest in the approved vllm repository' >&2
+            exit 2
+          fi
+          printf 'image=%s\n' "$HCU_CI_IMAGE_V033" >> "$GITHUB_OUTPUT"
 
   v033-device-gfx936:
     needs: [select, authorize-device, resolve-device-image]
@@ -141,7 +153,12 @@ jobs:
     timeout-minutes: 45
     container:
       image: ${{ needs.resolve-device-image.outputs.image }}
-      options: --device=/dev/kfd --device=/dev/dri --group-add video
+      credentials:
+        username: ${{ secrets.HARBOR_USERNAME }}
+        password: ${{ secrets.HARBOR_PASSWORD }}
+      volumes:
+        - /opt/hyhal:/opt/hyhal:ro
+      options: --device=/dev/kfd --device=/dev/dri --group-add video --shm-size=32g
     steps:
       - uses: actions/checkout@v4
         with:
