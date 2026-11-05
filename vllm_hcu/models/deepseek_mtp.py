@@ -111,9 +111,22 @@ def _mtp_quantization_config(vllm_config: VllmConfig, prefix: str) -> VllmConfig
                 canonical_targets[target] = scheme
             if any(actual_matches) and not any(canonical_matches):
                 actual_targets[target] = scheme
-        # Without an applicable decoder rule, preserve native first-match
-        # behavior on the actual name, including broad backbone layer regexes.
-        if find_matched_target(canonical, layer, canonical_targets, mapping) is None:
+
+        def depends_on(name, targets, candidates):
+            # Use the full native rule table for fusion completeness and its
+            # first matching rule for each shard. A decoder rule can cooperate
+            # with a generic rule, or be shadowed by an earlier generic rule.
+            shards = find_matching_patterns(name, targets, mapping)
+            first_matches = [
+                next((target for target in targets if target in matches), None)
+                for matches in shards
+            ]
+            return all(first_matches) and any(
+                target in candidates for target in first_matches
+            )
+
+        # Configs without decoder-specific targets keep native runtime matching.
+        if not canonical_targets:
             return original_match(self, layer, layer_name)
 
         # Matching only the actual spelling does not make a rule MTP-specific:
@@ -131,11 +144,20 @@ def _mtp_quantization_config(vllm_config: VllmConfig, prefix: str) -> VllmConfig
                 for i in range(num_layers)
             )
         }
-        matched = find_matched_target(layer_name, layer, overrides, mapping)
-        if matched is not None:
+        # Fully explicit fused overrides retain priority over generic rules
+        # matching the fused name directly, as in the existing MTP contract.
+        targets = dict(overrides)
+        explicit_match = find_matched_target(layer_name, layer, targets, mapping)
+        if explicit_match is None:
+            # A partial explicit override can cooperate with generic shard
+            # rules; use the complete native table to resolve that combination.
+            targets.update(self.target_scheme_map)
+        if explicit_match is not None or depends_on(layer_name, targets, overrides):
             explicit = copy(self)
-            explicit.target_scheme_map = overrides
+            explicit.target_scheme_map = targets
             return original_match(explicit, layer, layer_name)
+        if not depends_on(canonical, self.target_scheme_map, canonical_targets):
+            return original_match(self, layer, layer_name)
         return original_match(self, layer, canonical)
 
     # Keep the target model and other MTP layers' quantization rules unchanged.

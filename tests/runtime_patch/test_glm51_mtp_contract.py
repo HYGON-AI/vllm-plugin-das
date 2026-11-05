@@ -435,6 +435,76 @@ def test_mtp_canonical_match_preserves_fused_projection_overrides(mtp_module):
     )["weights"].num_bits == 8
 
 
+@pytest.mark.parametrize("prefix", ["model.layers.78", "model.layers.79"])
+@pytest.mark.parametrize("specific", ["gate_proj", "up_proj"])
+def test_mtp_fusion_combines_decoder_and_generic_rules(mtp_module, prefix, specific):
+    canonical = "model.decoder.mlp.shared_experts." + specific
+    other = "up_proj" if specific == "gate_proj" else "gate_proj"
+    qconfig = _mixed_quant_config(canonical)
+    four, eight = qconfig.target_scheme_map[canonical], qconfig.target_scheme_map["Linear"]
+    qconfig.target_scheme_map = {canonical: eight, "re:.*[.]" + other + "$": eight,
+                                "Linear": four}
+    qconfig.packed_modules_mapping = {"gate_up_proj": ["gate_proj", "up_proj"]}
+    engine = _glm_engine(qconfig)
+    engine.model_config.hf_config.num_hidden_layers = 78
+    layer = nn.Linear(8, 8)
+    expected = qconfig.get_scheme_dict(layer, "model.decoder.mlp.shared_experts.gate_up_proj")
+    assert expected["weights"].num_bits == 8
+    assert qconfig.get_scheme_dict(
+        layer, prefix + ".mlp.shared_experts.gate_up_proj",
+    )["weights"].num_bits == 4
+    adapted = mtp_module._mtp_quantization_config(engine, prefix)
+    assert adapted.quant_config.get_scheme_dict(
+        layer, prefix + ".mlp.shared_experts.gate_up_proj",
+    ) == expected
+
+
+@pytest.mark.parametrize("prefix", ["model.layers.78", "model.layers.79"])
+@pytest.mark.parametrize("specific", ["gate_proj", "up_proj"])
+def test_mtp_fusion_combines_actual_override_and_generic_rules(mtp_module, prefix, specific):
+    canonical = r"re:^model[.]decoder[.]mlp[.]shared_experts[.](gate_proj|up_proj)$"
+    actual = prefix + ".mlp.shared_experts." + specific
+    other = "up_proj" if specific == "gate_proj" else "gate_proj"
+    qconfig = _mixed_quant_config(canonical)
+    four, eight = qconfig.target_scheme_map[canonical], qconfig.target_scheme_map["Linear"]
+    qconfig.target_scheme_map = {canonical: four, "re:.*[.]" + other + "$": eight,
+                                actual: eight, "Linear": four}
+    qconfig.packed_modules_mapping = {"gate_up_proj": ["gate_proj", "up_proj"]}
+    engine = _glm_engine(qconfig)
+    engine.model_config.hf_config.num_hidden_layers = 78
+    layer = nn.Linear(8, 8)
+    expected = qconfig.get_scheme_dict(layer, prefix + ".mlp.shared_experts.gate_up_proj")
+    assert expected["weights"].num_bits == 8
+    adapted = mtp_module._mtp_quantization_config(engine, prefix)
+    assert adapted.quant_config.get_scheme_dict(
+        layer, prefix + ".mlp.shared_experts.gate_up_proj",
+    ) == expected
+
+
+@pytest.mark.parametrize("prefix", ["model.layers.78", "model.layers.79"])
+def test_mtp_shadowed_decoder_rules_do_not_change_native_fusion(mtp_module, prefix):
+    canonical = r"re:^model[.]decoder[.]mlp[.]shared_experts[.](gate_proj|up_proj)$"
+    qconfig = _mixed_quant_config(canonical)
+    four, eight = qconfig.target_scheme_map[canonical], qconfig.target_scheme_map["Linear"]
+    qconfig.target_scheme_map = {
+        r"re:.*[.](gate_proj|up_proj)$": four, canonical: eight,
+        r"re:^model[.]layers[.]\d+[.].*[.]gate_up_proj$": eight, "Linear": four,
+    }
+    qconfig.packed_modules_mapping = {"gate_up_proj": ["gate_proj", "up_proj"]}
+    engine = _glm_engine(qconfig)
+    engine.model_config.hf_config.num_hidden_layers = 78
+    layer = nn.Linear(8, 8)
+    expected = qconfig.get_scheme_dict(layer, prefix + ".mlp.shared_experts.gate_up_proj")
+    assert expected["weights"].num_bits == 8
+    assert qconfig.get_scheme_dict(
+        layer, "model.decoder.mlp.shared_experts.gate_up_proj",
+    )["weights"].num_bits == 4
+    adapted = mtp_module._mtp_quantization_config(engine, prefix)
+    assert adapted.quant_config.get_scheme_dict(
+        layer, prefix + ".mlp.shared_experts.gate_up_proj",
+    ) == expected
+
+
 @pytest.mark.parametrize("ignore", [
     r"re:^model[.]decoder[.]self_attn[.]kv_b_proj$",
     r"re:^(model)[.](decoder)[.]self_attn[.]kv_b_proj$",
