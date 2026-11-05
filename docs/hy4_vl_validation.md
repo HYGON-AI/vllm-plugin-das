@@ -61,14 +61,16 @@ float64 parity or universal determinism for arbitrary Top-K ties.
 ## Final correctness validation
 
 Fresh-process inference source: `47bbdcda999e2ca8c6099da72423fec2f6adc7b9`,
-validated 2026-11-05. Later review cleanup changes documentation/artifacts only.
+validated 2026-11-05. The same full-split and long-context gates were
+independently rerun at
+`a5b2eda`. The review follow-up below has separate focused validation.
 The process loads committed source normally and captures new graphs. A Stage4
 diagnostic worker and development RPC supply counters, mode controls and
 traces; they are not required by the normal serving commands.
 
 | Check | Result |
 | --- | --- |
-| Local model/runner regression tests | 287 passed |
+| Local model/runner regression tests | 296 passed after review fixes; originally 287 |
 | Original RealWorldQA, concurrency 1 | 561/765 (73.33%); strict 546 |
 | Raw answers versus preceding independent decode-only control | 765/765 identical |
 | HTTP failures / empty answers / truncations | 0 / 0 / 0 |
@@ -138,6 +140,25 @@ Transformers 5.20.1 and Triton 3.6.0/DTK2604.
 Graph modes use the breakable-cudagraph implementation with compilation mode
 0; ViT remains eager. Restart the service and capture new graphs after upgrading.
 Other checkpoints, parallel configurations and context limits are not validated
-by these measurements. Video, precomputed image embeddings and speculative
-decoding are unsupported. The adapter remains experimental; this score is not
+by these measurements. Video, encoder-only mode, precomputed image embeddings
+and speculative decoding are unsupported. The adapter remains experimental;
+this score is not
 an independent reference-model accuracy-parity result.
+
+## Review follow-up
+
+VL configuration now inherits HYV4's post-init normalization, so missing/null
+layer lists follow the final layer count and explicit lists remain intact.
+The real checkpoint's language/vision configuration is preserved; its
+`use_cache=True` setting is now retained instead of being dropped by the generic
+configuration constructor. The actual vLLM ModelConfig resolves the checkpoint
+with 78 layer entries. Encoder-only mode is rejected before backbone allocation.
+
+The performance client reports content-chunk intervals rather than dividing
+visible-text timing by completion-token counts that may include EOS. Single
+content events yield null; TTFT, latency and throughput calculations retain
+their prior definitions. This changes the JSON metric names documented in the
+serving guide. Nine added cases cover missing/null/explicit configuration,
+round-trip serialization, early rejection and single/batched streaming deltas.
+All 296 related regression tests pass. The full-model measurements above
+precede these review fixes; this follow-up does not claim another full-model run.

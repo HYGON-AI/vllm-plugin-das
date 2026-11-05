@@ -3,13 +3,13 @@
 
 from typing import ClassVar
 
-from transformers import AutoConfig, PretrainedConfig
+from transformers import AutoConfig
 from vllm.transformers_utils.configs.hunyuan_vl import HunYuanVLVisionConfig
 
 from .config import HYV4Config
 
 
-class HYV4VLConfig(PretrainedConfig):
+class HYV4VLConfig(HYV4Config):
     model_type = "hy_v4_vl"
     ignore_keys_at_rope_validation: ClassVar[set[str]] = {
         "mrope_section",
@@ -18,17 +18,12 @@ class HYV4VLConfig(PretrainedConfig):
     attribute_map: ClassVar[dict[str, str]] = {"num_local_experts": "n_routed_experts"}
 
     def __init__(self, vision_config=None, **kwargs):
-        defaults = HYV4Config().to_dict()
-        defaults.pop("model_type", None)
-        defaults.update(kwargs)
-        super().__init__(**defaults)
+        super().__init__(**kwargs)
         self.vision_config = (
             HunYuanVLVisionConfig(**(vision_config or {}))
             if isinstance(vision_config, (dict, type(None)))
             else vision_config
         )
-        self.qk_head_dim = self.qk_nope_head_dim + self.qk_rope_head_dim
-        self.head_dim = self.qk_rope_head_dim
 
 
 def register_hy_v4_vl_config():

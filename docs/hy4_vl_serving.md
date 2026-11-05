@@ -4,7 +4,8 @@ Run these commands from the PR checkout in the tested DAS vLLM 0.25.1 / DTK2604
 image, after installing plugin dependencies and building its native extension
 (`MAX_JOBS=8 python setup.py build_ext --inplace`). The tested checkpoint is
 `/module/Hy4-testing-Channel-FP8-w8a8` on eight idle BW1101 HCUs. These are image
-serving commands; video and speculative decoding are unsupported.
+serving commands; video, encoder-only mode and speculative decoding are
+unsupported.
 
 ## Server
 
@@ -137,6 +138,10 @@ For `decode` or `full-piecewise`, restart the server in that mode and change the
 output directory accordingly. The client uses seed 338, two warmups, 64 QA
 requests at concurrency 1 and 2, and four single/two-image 32-token captions.
 It writes per-request answers/usage/TTFT/latency, a manifest and summaries.
+`content_chunk_interval_seconds` measures nonempty text-delta intervals, not
+time per token; it is null for a single content delta. The summary reports
+`content_chunk_interval_median_seconds`. These replace the earlier misleading
+`decode_seconds_per_token` / `decode_median_seconds_per_token` fields.
 Images are encoded before timing. Keep model limits, resolution, cache flags,
 prompts and generation budgets identical across runs. This is a fixed
 repeated-image workload, not a maximum-capacity or forced-cold encoder test.

@@ -46,6 +46,94 @@ def test_flat_config_round_trip():
     assert copy.kv_lora_rank == 512
 
 
+@pytest.mark.parametrize("layers", [1, 78])
+@pytest.mark.parametrize("null_lists", [False, True])
+def test_language_defaults_follow_final_layer_count(layers, null_lists):
+    from vllm_hcu.models.hy_v4.attention import compute_skip_topk_layers
+    from vllm_hcu.models.hy_v4.config import HYV4Config
+
+    kwargs = {"num_hidden_layers": layers}
+    if null_lists:
+        kwargs.update(mlp_layer_types=None, indexer_types=None)
+    config = HYV4VLConfig(**kwargs)
+    reference = HYV4Config(**kwargs)
+    assert config.mlp_layer_types == reference.mlp_layer_types
+    assert config.indexer_types == reference.indexer_types
+    assert len(config.mlp_layer_types) == len(config.indexer_types) == layers
+    assert compute_skip_topk_layers(config) == compute_skip_topk_layers(reference)
+    copy = HYV4VLConfig.from_dict(config.to_dict())
+    assert copy.mlp_layer_types == config.mlp_layer_types
+    assert copy.indexer_types == config.indexer_types
+
+
+def test_explicit_language_lists_and_rotary_dimensions_are_preserved():
+    config = HYV4VLConfig(
+        num_hidden_layers=2,
+        mlp_layer_types=["sparse", "dense"],
+        indexer_types=["full", "full"],
+        qk_nope_head_dim=80,
+        qk_rope_head_dim=32,
+    )
+    assert config.mlp_layer_types == ["sparse", "dense"]
+    assert config.indexer_types == ["full", "full"]
+    assert config.qk_head_dim == 112
+    assert config.head_dim == 32
+
+
+def test_encoder_only_is_rejected_before_backbone_allocation(monkeypatch):
+    from vllm_hcu.models.hy_v4.model import HYV4ForCausalLM
+
+    def unexpected_allocation(*args, **kwargs):
+        pytest.fail("encoder-only must be rejected before allocating the backbone")
+
+    monkeypatch.setattr(HYV4ForCausalLM, "__init__", unexpected_allocation)
+    config = SimpleNamespace(
+        model_config=SimpleNamespace(
+            multimodal_config=SimpleNamespace(mm_encoder_only=True)
+        )
+    )
+    with pytest.raises(ValueError, match="encoder-only"):
+        HYV4VLForConditionalGeneration(vllm_config=config)
+
+
+@pytest.mark.parametrize(
+    "deltas,completion_tokens,expected_interval",
+    [
+        (["A"], 2, None),
+        (["multiple tokens in one delta"], 7, None),
+        (["a", "b", "c"], 9, 1.0),
+    ],
+)
+def test_streaming_metric_measures_content_chunks(
+    monkeypatch, deltas, completion_tokens, expected_interval
+):
+    import json
+    from unittest.mock import MagicMock
+
+    from tools import hyv4_vl_perf
+
+    chunks = [{"choices": [{"delta": {"content": ""}}]}]
+    chunks.extend({"choices": [{"delta": {"content": s}}]} for s in deltas)
+    chunks.append({"choices": [{"delta": {}, "finish_reason": "stop"}]})
+    chunks.append({"choices": [], "usage": {"completion_tokens": completion_tokens}})
+    response = MagicMock()
+    response.__enter__.return_value = response
+    response.iter_lines.return_value = [
+        b"data: " + json.dumps(chunk).encode() for chunk in chunks
+    ] + [b"data: [DONE]"]
+    monkeypatch.setattr(hyv4_vl_perf.requests, "post", lambda *a, **k: response)
+    ticks = iter(range(10))
+    monkeypatch.setattr(hyv4_vl_perf.time, "perf_counter", lambda: next(ticks))
+    result = hyv4_vl_perf.request({}, "http://example.invalid")
+    assert result["content_chunks"] == len(deltas)
+    assert result["content_chunk_interval_seconds"] == expected_interval
+    assert result["ttft_seconds"] == 1
+    assert result["latency_seconds"] == len(deltas) + 1
+    assert result["answer"] == "".join(deltas)
+    assert result["usage"]["completion_tokens"] == completion_tokens
+    assert "decode_seconds_per_token" not in result
+
+
 def test_text_only_cached_prompt_preserves_image_placeholders():
     def tokenize(texts, **kwargs):
         assert texts == ["before<image>after"]

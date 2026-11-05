@@ -61,12 +61,14 @@ def request(body, base_url):
     ended = time.perf_counter()
     if first is None or usage is None:
         raise RuntimeError("Missing streamed answer or token usage")
-    generated = usage["completion_tokens"]
     return {
         "ttft_seconds": first - started,
         "latency_seconds": ended - started,
-        "decode_seconds_per_token": (last - first) / (generated - 1)
-        if generated > 1
+        # Text deltas can contain multiple tokens, and usage can include EOS.
+        # Report the observed content-event interval rather than token latency.
+        "content_chunks": len(content),
+        "content_chunk_interval_seconds": (last - first) / (len(content) - 1)
+        if len(content) > 1
         else None,
         "usage": usage,
         "answer": "".join(content),
@@ -134,6 +136,7 @@ def main():
         "mm_processor_cache_gb": 0,
         "encoder_embedding_cache": "default vLLM LRU; embeddings may be reused",
         "timing": "streaming HTTP; payload prepared before timing",
+        "content_chunk_interval": "nonempty text deltas; not time per token",
     }
     (args.output_dir / "manifest.json").write_text(json.dumps(manifest, indent=2))
     for index in indices[:2]:
@@ -155,10 +158,10 @@ def main():
         elapsed = time.perf_counter() - start
         for result, (i, j, _) in zip(results, cases):
             result.update(index=i, second_index=j, reference=rows[i]["answer"])
-        decode = [
-            r["decode_seconds_per_token"]
+        intervals = [
+            r["content_chunk_interval_seconds"]
             for r in results
-            if r["decode_seconds_per_token"] is not None
+            if r["content_chunk_interval_seconds"] is not None
         ]
         report = {
             "requests": len(results),
@@ -177,8 +180,8 @@ def main():
             "latency_p95_seconds": percentile(
                 [r["latency_seconds"] for r in results], 0.95
             ),
-            "decode_median_seconds_per_token": statistics.median(decode)
-            if decode
+            "content_chunk_interval_median_seconds": statistics.median(intervals)
+            if intervals
             else None,
         }
         reports[name] = report

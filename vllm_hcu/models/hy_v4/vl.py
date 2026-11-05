@@ -265,6 +265,9 @@ class HYV4VLForConditionalGeneration(
     HYV4ForCausalLM, SupportsMultiModal, SupportsMRoPE
 ):
     def __init__(self, *, vllm_config, prefix=""):
+        mm_config = vllm_config.model_config.multimodal_config
+        if mm_config is not None and mm_config.mm_encoder_only:
+            raise ValueError("HYV4VL encoder-only mode is not implemented")
         vision = vllm_config.model_config.hf_config.vision_config
         if (
             getattr(vision, "projector_type", None) != "rmsnorm_mlp_adapter"
