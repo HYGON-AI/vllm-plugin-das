@@ -132,7 +132,7 @@ jobs:
   report:
     needs: [prepare, smoke]
     if: ${{ always() && needs.prepare.result == 'success' && needs.prepare.outputs.enabled == 'true' }}
-    runs-on: [self-hosted, nmz4]
+    runs-on: bw1100
     timeout-minutes: 60
     permissions:
       contents: read
@@ -147,7 +147,6 @@ jobs:
       - name: Publish one report and one DashHub submission
         uses: ./model-ci-tools/.github/actions/deployment-smoke-aggregate
         with:
-          archive-root: /home/github/gcy/ci-model-test/model-ci-reports
           framework: vllm
           framework-version: '0.25.1'
           pypi-url: ${{ vars.PYPI_URL }}
