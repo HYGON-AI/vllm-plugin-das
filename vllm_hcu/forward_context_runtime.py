@@ -4,6 +4,7 @@
 
 from __future__ import annotations
 
+import os
 import time
 from contextlib import contextmanager
 from contextvars import ContextVar
@@ -117,6 +118,16 @@ def choose_deepep_auto_low_latency(
         if cudagraph_runtime_mode == CUDAGraphMode.FULL:
             return True
         if cudagraph_runtime_mode == CUDAGraphMode.PIECEWISE:
+            if os.environ.get("VLLM_HCU_DEEPEP_AUTO_GRAPH_USE_LL", "0").lower() in {
+                "1",
+                "true",
+                "yes",
+                "on",
+            }:
+                # HT's asynchronous DeepEP dispatch cannot be captured on HCU;
+                # keep the mixed graph mode enabled while using the graph-safe
+                # DeepGEMM LL delegate for its piecewise regions.
+                return True
             return False
         if cudagraph_runtime_mode != CUDAGraphMode.NONE:
             raise ValueError(

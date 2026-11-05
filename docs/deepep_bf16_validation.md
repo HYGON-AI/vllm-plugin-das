@@ -63,7 +63,14 @@ Weight updates refresh the packed copy while retaining its storage address.
 - AITER configuration (Triton fallback) HumanEval32: pass@1=32/32,
   benchmark elapsed 236.2 seconds, request latency sum 163.539 seconds,
   4654 output tokens (28.46 output tokens/request-second).
-- Graphs remain unverified. All model evaluations used eager mode.
+- `/home/vllm_1102_zb.sh` now requests `VLLM_COMPILE` with
+  `FULL_AND_PIECEWISE` CUDA graphs (`[1,2,4,8,16,32,64]`, max capture size 64)
+  and explicitly opts DeepEP auto out of the historical HCU downgrade. The
+  engine log confirms the requested mode and `enforce_eager=False`.
+- Full startup capture is not yet validated on this host: HT capture stalls in
+  `Capturing CUDA graphs (PIECEWISE)`, while forcing the graph-safe LL delegate
+  reaches warmup but exhausts the available per-device memory. The default
+  safety policy therefore remains unchanged unless the explicit opt-in is set.
 
 | Configuration | HumanEval pass@1 | Sum API latency (s) | Output tokens | Output tokens / API second |
 | --- | --- | ---: | ---: | ---: |

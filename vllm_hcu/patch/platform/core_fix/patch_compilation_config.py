@@ -6,6 +6,7 @@ from __future__ import annotations
 
 import functools
 import inspect
+import os
 import threading
 import weakref
 from collections.abc import Mapping
@@ -142,6 +143,18 @@ def _normalize_deepep_auto_cudagraph_mode(
         return current_mode, None
 
     none, full, piecewise, full_and_piecewise, full_decode_only = modes
+    # DeepEP auto normally downgrades to decode-only on HCU because the
+    # historical quantized HT path was not graph-safe. BF16 DeepGEMM owns a
+    # graph-safe HT implementation; make the requested mixed mode available
+    # behind an explicit opt-in so existing deployments retain the safe
+    # default.
+    if os.environ.get("VLLM_HCU_DEEPEP_AUTO_ALLOW_CUDAGRAPH", "0").lower() in {
+        "1",
+        "true",
+        "yes",
+        "on",
+    }:
+        return current_mode, "explicit"
     if fixed_use_low_latency is False and current_mode is not none:
         return none, "fixed_ht"
     if current_mode is full or current_mode is full_and_piecewise:
@@ -168,6 +181,10 @@ def _log_deepep_auto_graph_policy(reason: str | None) -> None:
         "decode_only": (
             "DeepEP auto uses FULL_DECODE_ONLY so only LL decode execution "
             "is captured on HCU."
+        ),
+        "explicit": (
+            "DeepEP auto preserves the explicitly requested CUDA Graph mode "
+            "for experimental HT/LL graph capture."
         ),
     }
     init_logger(__name__).info_once(messages[reason])
