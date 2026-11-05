@@ -1,6 +1,6 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright (c) 2026 Hygon Information Technology Co., Ltd.
-"""Forward prequantized activations through compressed-tensors linear methods."""
+"""Adapt compressed-tensors linear inputs and channel W4A8 MoE dispatch."""
 
 from __future__ import annotations
 
@@ -23,6 +23,7 @@ PATCH_ID = "worker.op_opt.compressed_tensors.prequantized_linear"
 TARGETS = (
     f"{TARGET_MODULE}.CompressedTensorsLinearMethod.apply",
     f"{TARGET_MODULE}.CompressedTensorsLinearMethod.supports_quanted_inputs",
+    f"{TARGET_MODULE}.CompressedTensorsConfig.get_quant_method",
 )
 _CLASS_MARKER = "_vllm_hcu_prequantized_linear_applied"
 _WRAPPER_MARKER = "_vllm_hcu_prequantized_linear_wrapper"
@@ -35,10 +36,18 @@ def apply_to_module(module: ModuleType) -> bool:
         "CompressedTensorsLinearMethod",
         f"{TARGET_MODULE}.CompressedTensorsLinearMethod",
     )
+    config_class = require_class(
+        compressed,
+        "CompressedTensorsConfig",
+        f"{TARGET_MODULE}.CompressedTensorsConfig",
+    )
     if already_applied(
         method_class,
         _CLASS_MARKER,
-        ((method_class, "apply", TARGETS[0], _WRAPPER_MARKER),),
+        (
+            (method_class, "apply", TARGETS[0], _WRAPPER_MARKER),
+            (config_class, "get_quant_method", TARGETS[2], _WRAPPER_MARKER),
+        ),
     ):
         return False
 
@@ -77,15 +86,10 @@ def apply_to_module(module: ModuleType) -> bool:
     def supports_quanted_inputs(self) -> bool:
         return True
 
-    config_class = require_class(
-        compressed,
-        "CompressedTensorsConfig",
-        TARGET_MODULE + ".CompressedTensorsConfig",
-    )
     get_method = require_callable(
         config_class,
         "get_quant_method",
-        TARGET_MODULE + ".CompressedTensorsConfig.get_quant_method",
+        TARGETS[2],
     )
 
     @functools.wraps(get_method)
@@ -104,9 +108,10 @@ def apply_to_module(module: ModuleType) -> bool:
 
     require_exact_signature(
         get_method,
-        TARGET_MODULE + ".CompressedTensorsConfig.get_quant_method",
+        TARGETS[2],
         positional=("self", "layer", "prefix"),
     )
+    setattr(hcu_get_quant_method, _WRAPPER_MARKER, True)
     config_class.get_quant_method = hcu_get_quant_method
 
     setattr(hcu_apply, _WRAPPER_MARKER, True)

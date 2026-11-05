@@ -9640,3 +9640,38 @@ def test_transform_sf_identity_fallback_and_backend_delegation():
     module._transform_sf_into_required_layout_impl = object()
     assert module.transform_sf_into_required_layout(sf, 128, 128) == "backend"
     assert calls[-2:] == ["lazy", ("backend", (sf, 128, 128), {})]
+
+def test_compressed_quant_dispatch_tracks_stale_patch_and_native_fallback(monkeypatch):
+    from vllm.model_executor.layers.fused_moe import RoutedExperts
+    from vllm_hcu.model_executor.layers.quantization import compressed_tensors_w4a8
+    from vllm_hcu.patch.worker.op_opt._common import PatchCompatibilityError
+
+    class LinearMethod:
+        def apply(self, layer, x, bias=None):
+            return x
+
+    class Config:
+        def get_quant_method(self, layer, prefix):
+            return ("native", prefix)
+
+    module = _module(
+        patch_compressed_tensors.TARGET_MODULE,
+        CompressedTensorsLinearMethod=LinearMethod,
+        CompressedTensorsConfig=Config,
+    )
+    assert patch_compressed_tensors.apply_to_module(module)
+    assert not patch_compressed_tensors.apply_to_module(module)
+    layer = RoutedExperts.__new__(RoutedExperts)
+    torch.nn.Module.__init__(layer)
+    marker = object()
+    monkeypatch.setattr(compressed_tensors_w4a8, "select_method", lambda *a: marker)
+    assert Config().get_quant_method(layer, "experts") is marker
+    assert Config().get_quant_method(torch.nn.Identity(), "linear") == (
+        "native",
+        "linear",
+    )
+    monkeypatch.setattr(compressed_tensors_w4a8, "select_method", lambda *a: None)
+    assert Config().get_quant_method(layer, "experts") == ("native", "experts")
+    Config.get_quant_method = lambda self, layer, prefix: None
+    with pytest.raises(PatchCompatibilityError, match="stale"):
+        patch_compressed_tensors.apply_to_module(module)

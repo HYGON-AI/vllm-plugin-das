@@ -166,11 +166,12 @@ def test_native_expert_loader_tp_shards(tp_size):
             tp_rank=rank,
             is_act_and_mul=True,
         )
-        method = adapter.HcuCompressedW4A8(None, moe)
+        quant_config = CompressedTensorsConfig.from_config(recipe())
+        method = adapter.HcuCompressedW4A8(quant_config, moe)
         layer = RoutedExperts.__new__(RoutedExperts)
         torch.nn.Module.__init__(layer)
         layer.moe_config = moe
-        layer.quant_config = None
+        layer.quant_config = quant_config
         layer.quant_method = method
         layer.expert_map_manager = SimpleNamespace(
             map_global_to_local=lambda index: index
@@ -225,3 +226,119 @@ def test_native_expert_loader_tp_shards(tp_size):
                         expert, start : start + intermediate // tp_size
                     ]
                 assert torch.equal(actual_scale, expected_scale)
+
+
+def test_output_activation_quantization_is_not_silently_dropped():
+    data = recipe()
+    data["config_groups"]["int4"]["output_activations"] = {
+        "num_bits": 8,
+        "type": "int",
+        "strategy": "tensor",
+        "dynamic": False,
+        "symmetric": True,
+    }
+    config = CompressedTensorsConfig.from_config(data)
+    layer = SimpleNamespace(moe_config=SimpleNamespace(num_logical_experts=2))
+    with pytest.raises(ValueError, match="output activation"):
+        adapter.select_method(config, layer, "model.layers.3.mlp.experts")
+
+
+@pytest.mark.parametrize(
+    "target",
+    [
+        r"re:^model\.decoder\.mlp\.experts\..*",
+        "model.decoder.mlp.experts.0.up_proj",
+    ],
+)
+def test_mtp_quant_alias_keeps_physical_rules_and_ignore(target):
+    data = recipe(target)
+    config = CompressedTensorsConfig.from_config(data)
+    config._add_fused_moe_to_target_scheme_map()
+    layer = torch.nn.Identity()
+    physical = "model.layers.78.mlp.experts.0.up_proj"
+    first = adapter.mtp_quant_config(config, "model.layers.78")
+    second = adapter.mtp_quant_config(config, "model.layers.79")
+    assert first is not config and second is not first
+    assert first.get_scheme_dict(layer, physical)["weights"].num_bits == 4
+    assert second.get_scheme_dict(layer, physical) is None
+    assert config.get_scheme_dict(layer, physical) is None
+    assert first.get_scheme_dict(layer, physical.replace("78", "780")) is None
+    # A physical checkpoint rule takes priority over the canonical alias.
+    explicit = {**config.target_scheme_map[target], "weights": object()}
+    first.target_scheme_map = {**first.target_scheme_map, physical: explicit}
+    assert first.get_scheme_dict(layer, physical) is explicit
+    first.ignore = [physical]
+    assert first.get_scheme_dict(layer, physical) is None
+    # Canonical ignore entries still apply when selecting canonical rules.
+    second.ignore = ["model.decoder.mlp.experts.0.up_proj"]
+    assert second.get_scheme_dict(layer, physical.replace("78", "79")) is None
+    assert adapter.mtp_quant_config(None, "model.layers.78") is None
+
+
+def test_actual_mtp_and_decoder_constructors_keep_numeric_runtime_prefix():
+    # Execute both production __init__ bodies. The installed v0.25 wheel cannot
+    # import this v0.28 model (V32SparseAttnIndexer is missing), so stub only
+    # the expensive attention/MoE/normalization leaves, not constructor logic.
+    import ast
+    from pathlib import Path
+
+    class Leaf(torch.nn.Module):
+        def __init__(self, *args, **kwargs):
+            super().__init__()
+            self.prefix = kwargs.get("prefix")
+            self.quant_config = kwargs.get("quant_config")
+
+    root = Path(__file__).resolve().parents[2]
+    env = {
+        "nn": torch.nn,
+        "torch": torch,
+        "copy": __import__("copy").copy,
+        "RMSNorm": Leaf,
+        "SharedHead": Leaf,
+        "DeepseekV2MLAAttention": Leaf,
+        "DeepseekV2Attention": Leaf,
+        "DeepseekAttention": Leaf,
+        "DeepseekV2MoE": Leaf,
+        "DeepseekV2MLP": Leaf,
+        "current_platform": SimpleNamespace(device_type="cpu"),
+        "henvs": SimpleNamespace(VLLM_HCU_DISABLE_DSA=False),
+    }
+    for file, name in [
+        ("deepseek_v2.py", "DeepseekV2DecoderLayer"),
+        ("deepseek_mtp.py", "DeepSeekMultiTokenPredictorLayer"),
+    ]:
+        tree = ast.parse((root / "vllm_hcu/models" / file).read_text())
+        cls = next(
+            n for n in tree.body if isinstance(n, ast.ClassDef) and n.name == name
+        )
+        cls.body = [
+            n
+            for n in cls.body
+            if isinstance(n, ast.FunctionDef) and n.name == "__init__"
+        ]
+        code = "from __future__ import annotations\n" + ast.unparse(cls)
+        exec(compile(code, file, "exec"), env)  # noqa: S102 - trusted repo constructors
+    hf = SimpleNamespace(
+        model_type="glm_moe_dsa",
+        hidden_size=8,
+        rms_norm_eps=1e-6,
+        n_routed_experts=2,
+        first_k_dense_replace=3,
+        num_attention_heads=1,
+    )
+    quant = CompressedTensorsConfig.from_config(recipe())
+    config = SimpleNamespace(
+        speculative_config=SimpleNamespace(
+            draft_model_config=SimpleNamespace(hf_config=hf)
+        ),
+        quant_config=quant,
+        model_config=SimpleNamespace(use_mla=False),
+        cache_config=None,
+        parallel_config=None,
+    )
+    layer = env["DeepSeekMultiTokenPredictorLayer"](config, "model.layers.78")
+    assert layer.mtp_block.layer_idx == 78
+    assert layer.mtp_block.self_attn.prefix == "model.layers.78.self_attn"
+    assert layer.mtp_block.mlp.prefix == "model.layers.78.mlp"
+    assert layer.mtp_block.mlp.quant_config is not quant
+    assert config.quant_config is quant

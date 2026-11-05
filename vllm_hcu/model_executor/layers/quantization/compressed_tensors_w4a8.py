@@ -1,6 +1,8 @@
 # SPDX-License-Identifier: Apache-2.0
 """HCU execution adapter for compressed-tensors channel INT4 / token INT8."""
 
+from copy import copy
+
 import torch
 
 from vllm_hcu.model_executor.layers.quantization.slimquant_w4a8 import (
@@ -37,6 +39,42 @@ def checkpoint_weights(model, weights):
         yield name, weight
 
 
+def mtp_quant_config(config, layer_prefix):
+    """Alias GLM decoder rules without changing attention/layer identities."""
+    from vllm.model_executor.layers.quantization.compressed_tensors.compressed_tensors import (
+        CompressedTensorsConfig,
+    )
+    from vllm.model_executor.layers.quantization.compressed_tensors.utils import (
+        find_matched_target,
+        should_ignore_layer,
+    )
+
+    if not isinstance(config, CompressedTensorsConfig):
+        return config
+    result = copy(config)
+    original = result.get_scheme_dict
+
+    def get_scheme_dict(layer, layer_name=None):
+        if layer_name is not None and layer_name.startswith(layer_prefix + "."):
+            if should_ignore_layer(
+                layer_name, result.ignore, result.packed_modules_mapping
+            ):
+                return None
+            targets = result.target_scheme_map.keys()
+            physical = find_matched_target(
+                layer_name, layer, targets, result.packed_modules_mapping
+            )
+            class_default = find_matched_target(None, layer, targets)
+            # Explicit physical rules take priority over the decoder alias;
+            # a generic class fallback must not hide canonical INT4 rules.
+            if physical == class_default:
+                layer_name = "model.decoder" + layer_name[len(layer_prefix) :]
+        return original(layer, layer_name)
+
+    result.get_scheme_dict = get_scheme_dict
+    return result
+
+
 def select_method(config, layer, prefix):
     """Use native parsed schemes, priority, formats and ignore rules."""
     config._add_fused_moe_to_target_scheme_map()
@@ -65,7 +103,7 @@ def select_method(config, layer, prefix):
             and a.type == "int"
             and a.strategy == "token"
             and a.symmetric
-            and a.dynamic
+            and a.dynamic is True
         )
 
     selected = [supported(s) for s in schemes]
@@ -75,6 +113,8 @@ def select_method(config, layer, prefix):
         raise ValueError(
             "HCU W4A8 requires the same scheme for every expert projection"
         )
+    if schemes[0].get("output_activations") is not None:
+        raise ValueError("HCU W4A8 does not support output activation quantization")
     return HcuCompressedW4A8(config, layer.moe_config)
 
 
