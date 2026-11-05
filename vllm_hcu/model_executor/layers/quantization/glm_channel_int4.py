@@ -469,33 +469,6 @@ def routed_expert_owner_is_ignored(config: Any, prefix: str) -> bool:
     )
 
 
-def require_unfused_shared_experts(layer: Any, prefix: str) -> None:
-    """Reject a layer that fuses shared experts into the routed expert tensors.
-
-    ``VLLM_ROCM_USE_AITER_FUSION_SHARED_EXPERTS`` appends the shared experts as
-    extra slots of this layer's expert tensors, and the loader renames their
-    checkpoint tensors to ``mlp.experts.<n_routed + i>``. Selection only sees
-    the routed experts (``num_logical_experts`` excludes those slots), while the
-    checkpoint stores the shared experts as INT8 or unquantized linears, which
-    cannot be loaded into the packed INT4 storage. Even INT4 shared experts
-    would not load: the loader renames them after
-    ``normalize_routed_expert_checkpoint_name`` has run, so their
-    ``weight_packed`` names never reach the ``weight`` parameters. Fail before
-    the weights are allocated instead.
-    """
-    fused = getattr(
-        getattr(layer, "expert_map_manager", None), "num_fused_shared_experts", 0
-    )
-    if isinstance(fused, int) and not isinstance(fused, bool) and fused > 0:
-        raise NotImplementedError(
-            "GLM channel INT4 W4A8 does not support fused shared experts: "
-            f"{prefix!r} would fuse {fused} shared expert(s) into its packed "
-            "INT4 routed-expert tensors, but the checkpoint stores them as "
-            "INT8 or unquantized linears. Disable the fusion with "
-            "VLLM_ROCM_USE_AITER_FUSION_SHARED_EXPERTS=0."
-        )
-
-
 def _expert_projection_schemes(
     config: Any, layer: Any, prefix: str, expert_id: int
 ) -> list[Any]:
