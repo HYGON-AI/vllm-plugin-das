@@ -89,16 +89,7 @@ def repack_and_shuffle_w4a8_gemm2(
 
 
 def is_glm_moe_dsa_model(hf_config: Any) -> bool:
-    """Return whether the config is a GLM MoE DSA model.
-
-    This covers ``model_type == "glm_moe_dsa"`` and the ``GlmMoeDsaForCausalLM``
-    architecture, which the plugin registers as a ``DeepseekV2ForCausalLM``
-    subclass. The expert checkpoint-name handling below is wired into that
-    model's loader and the DeepSeek MTP loader. ``Glm5Next*`` checkpoints are
-    loaded by ``vllm.models.glm5next`` instead, which goes through neither
-    loader, so they are intentionally not selected here even though they are
-    also called GLM-5.3.
-    """
+    """Return whether the config is a GLM MoE DSA model."""
     if getattr(hf_config, "model_type", None) == "glm_moe_dsa":
         return True
     architectures = getattr(hf_config, "architectures", None) or ()
@@ -109,33 +100,9 @@ def is_glm_moe_dsa_model(hf_config: Any) -> bool:
 # from the model depth and from literal indexes written in the targets.
 _MTP_BLOCK_MARKER = ".mtp_block."
 _LAYER_INDEX_IN_TARGET = re.compile(r"layers\\*\.(\d+)")
-# Class name of the fused expert module that class-name targets are tried on.
-_ROUTED_EXPERTS_CLASS = "RoutedExperts"
-# MRO entries that never select the GLM method: Linear targets stay on the
-# parent method, and Module/object are only ancestors of every layer.
+# Class-name targets such as Linear stay on the parent method. RoutedExperts
+# is the fused expert module and is matched the same way as the facade.
 _GENERIC_CLASS_TARGETS = frozenset({"Linear", "Module", "object"})
-
-
-def _parse_quant_args(value: Any) -> Any:
-    """Parse a raw ``weights`` / ``input_activations`` dict like native does.
-
-    ``CompressedTensorsConfig`` builds every scheme with
-    ``QuantizationArgs.model_validate``: it fills field defaults, infers
-    ``strategy`` from ``group_size``, lower-cases enum strings and rejects
-    unsupported combinations. Auto-detection reads the raw HF dict before that
-    parse, so it uses the same parser instead of keeping a copy of those rules.
-    A dict the schema rejects cannot be loaded natively either, so it selects
-    nothing here and the parent reports the error. Arguments that are already
-    parsed pass through unchanged.
-    """
-    if not isinstance(value, dict):
-        return value
-    from compressed_tensors.quantization import QuantizationArgs
-
-    try:
-        return QuantizationArgs.model_validate(value)
-    except (TypeError, ValueError):
-        return None
 
 
 def _quant_field(value: Any, name: str, default: Any = None) -> Any:
@@ -154,8 +121,7 @@ def _is_channel_int4_w4a8_scheme(
     activations: Any,
     group_format: Any,
 ) -> bool:
-    # Parsed arguments already carry every default; the fallbacks below also
-    # cover argument objects built by hand. An explicit false/null is rejected.
+    # Match QuantizationArgs' default without accepting explicit false/null.
     return (
         _quant_field(weights, "num_bits") == 4
         and _quant_field(weights, "strategy") == "channel"
@@ -171,11 +137,8 @@ def _is_channel_int4_w4a8_scheme(
 
 
 def _is_channel_int8_scheme(weights: Any, activations: Any) -> bool:
-    # Native dynamic-token W8A8 only supports symmetric weights (input
-    # quantization may be either), so such a group cannot serve the linears.
     return (
         _quant_field(weights, "num_bits", 8) == 8
-        and _quant_field(weights, "symmetric", True) is True
         and _quant_field(weights, "strategy") == "channel"
         and _quant_field(weights, "type", "int") == "int"
         and _quant_field(activations, "num_bits", 8) == 8
@@ -235,20 +198,6 @@ def _routed_expert_probes(
                 yield prefix, f"{prefix}.{expert_id}.{proj_name}", expert_id
 
 
-def _class_name_matches_target(class_name: str, target: str) -> bool:
-    """Match a module class name against one target the way native does.
-
-    ``find_matched_target`` compares the class name with ``re:`` targets using
-    ``re.match`` and with plain targets by case-insensitive containment, so
-    ``RoutedExperts`` and ``re:^RoutedExperts$`` select the same module.
-    """
-    from vllm.model_executor.layers.quantization.utils.config_utils import (
-        is_equal_or_regex_match,
-    )
-
-    return is_equal_or_regex_match(class_name, target, check_contains=True)
-
-
 def _targets_cover_routed_experts(
     targets: list[str],
     ignore: Any = None,
@@ -258,30 +207,18 @@ def _targets_cover_routed_experts(
 
     Early dense layers may be ignored or absent from the INT4 regex. One later
     expert layer is enough. Shared experts and attention projections do not
-    match these probes. A class-name target covers every routed expert that
-    ``ignore`` leaves in place.
+    match these probes.
     """
     from vllm.model_executor.layers.quantization.utils.config_utils import (
         is_equal_or_regex_match,
     )
 
-    # A class-name target covers every expert that ``ignore`` leaves in place,
-    # whatever the probe is, so it is decided once outside the probe loop.
-    covers_by_class = any(
-        _class_name_matches_target(_ROUTED_EXPERTS_CLASS, target)
-        for target in targets
-    )
     for module_prefix, probe, expert_id in _routed_expert_probes(targets, hf_config):
-        # Target matching is cheap and usually fails for non-expert targets,
-        # while the ignore check runs several regexes per probe. Test targets
-        # first so only matching probes pay for the ignore check.
-        if not (
-            covers_by_class
-            or any(is_equal_or_regex_match(probe, target) for target in targets)
-        ):
+        if _ignore_covers_expert(None, module_prefix, ignore, {}, expert_id):
             continue
-        if not _ignore_covers_expert(None, module_prefix, ignore, {}, expert_id):
-            return True
+        for target in targets:
+            if target == "RoutedExperts" or is_equal_or_regex_match(probe, target):
+                return True
     return False
 
 
@@ -322,9 +259,8 @@ def is_glm_channel_int4_w4a8(
     for group in groups.values():
         if not isinstance(group, dict):
             continue
-        # Parse each entry the way native does before comparing its fields.
-        weights = _parse_quant_args(group.get("weights") or {})
-        activations = _parse_quant_args(group.get("input_activations") or {})
+        weights = group.get("weights") or {}
+        activations = group.get("input_activations") or {}
         group_format = group.get("format") or hf_quant_cfg.get("format")
         if _is_channel_int4_w4a8_scheme(weights, activations, group_format):
             int4_targets.extend(_group_targets(group))
@@ -393,21 +329,20 @@ def _match_target_by_name(
 
 
 def _match_target_by_class(layer: Any, targets: Any) -> str | None:
-    """Match ``RoutedExperts`` and other non-generic class targets in target order.
-
-    Class names use the same rule as detection and as native matching, so a
-    literal class name, a substring and a ``re:`` pattern all resolve alike.
-    """
+    """Match ``RoutedExperts`` and other non-generic class targets."""
     if layer is None:
         return None
-    target_list = [target for target in targets if isinstance(target, str)]
+    target_list = [
+        target
+        for target in targets
+        if isinstance(target, str) and not target.startswith("re:")
+    ]
     for cls in type(layer).__mro__:
         name = cls.__name__
         if name in _GENERIC_CLASS_TARGETS:
             continue
-        for target in target_list:
-            if _class_name_matches_target(name, target):
-                return target
+        if name in target_list:
+            return name
     return None
 
 
