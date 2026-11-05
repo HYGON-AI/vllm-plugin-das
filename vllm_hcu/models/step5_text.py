@@ -1450,6 +1450,17 @@ class Step5Model(nn.Module):
         self.make_empty_intermediate_tensors = make_empty_intermediate_tensors_factory(
             ["hidden_states"], config.hidden_size
         )
+        from vllm_hcu.ops.step5.prefill_workspace import create_pd_prefill_workspace
+
+        workspace = create_pd_prefill_workspace(self.dsa_state, vllm_config)
+        if workspace is not None:
+            self.dsa_state._pd_prefill_workspace = workspace
+            logger.info(
+                "step5: reserved %.2f GiB prefill scores before KV profiling "
+                "(%d rows, %d regions)",
+                workspace.buffer.numel() * workspace.buffer.element_size() / 2**30,
+                workspace.max_rows, workspace.max_regions,
+            )
 
     def embed_input_ids(self, input_ids: torch.Tensor) -> torch.Tensor:
         return self.embed_tokens(input_ids)

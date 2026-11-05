@@ -4649,11 +4649,14 @@ class Step4Indexer:
                 if PREFILL_FP8_INDEXER and not DENSE_EQUIV and INDEXER_Q_CHUNK == 0
                 else torch.zeros
             )
-            prefill_logits = alloc(
-                (groups * num_prefill_tokens, max(width_prefill, 1)),
-                dtype=torch.float32,
-                device=device,
-            )
+            shape = (groups * num_prefill_tokens, max(width_prefill, 1))
+            workspace = getattr(state, "_pd_prefill_workspace", None)
+            if workspace is None:
+                prefill_logits = alloc(shape, dtype=torch.float32, device=device)
+            else:
+                prefill_logits = workspace.get(
+                    *shape, device=device, zero=alloc is torch.zeros,
+                )
         if DENSE_EQUIV:
             # All-zero scores plus topk >= every row's region count selects
             # every visible region, which makes DSA exactly full causal
