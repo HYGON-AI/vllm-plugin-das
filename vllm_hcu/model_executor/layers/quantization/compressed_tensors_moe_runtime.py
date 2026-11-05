@@ -1087,6 +1087,9 @@ def apply_aiter_w4a8_moe(
                 cache_owner=w1,
                 solution_type="moe_c",
             )
+        prepare_config = getattr(method, "prepare_aiter_w4a8_config", None)
+        if callable(prepare_config):
+            aiter_config = prepare_config(layer, aiter_config)
     else:
         installed_solution = None
     global_num_experts = getattr(

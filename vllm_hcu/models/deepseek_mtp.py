@@ -4,6 +4,7 @@
 # Modified by Hygon Information Technology Co., Ltd., 2026.
 import typing
 from collections.abc import Callable, Iterable
+from copy import copy
 
 import torch
 import torch.nn as nn
@@ -79,6 +80,14 @@ class DeepSeekMultiTokenPredictorLayer(nn.Module):
         config = vllm_config.speculative_config.draft_model_config.hf_config
         self.config = config
         quant_config = vllm_config.quant_config
+        if config.model_type == "glm_moe_dsa" and quant_config is not None:
+            from vllm_hcu.model_executor.layers.quantization.compressed_tensors_w4a8 import (
+                mtp_quant_config,
+            )
+
+            vllm_config = copy(vllm_config)
+            quant_config = mtp_quant_config(quant_config, prefix)
+            vllm_config.quant_config = quant_config
 
         self.enorm = RMSNorm(config.hidden_size, eps=config.rms_norm_eps)
         self.hnorm = RMSNorm(config.hidden_size, eps=config.rms_norm_eps)
@@ -312,6 +321,11 @@ class DeepSeekMTP(nn.Module, DeepseekV2MixtureOfExperts, SupportsPP):
         return self.model.compute_logits(hidden_states, spec_step_idx)
 
     def load_weights(self, weights: Iterable[tuple[str, torch.Tensor]]) -> set[str]:
+        from vllm_hcu.model_executor.layers.quantization.compressed_tensors_w4a8 import (
+            checkpoint_weights,
+        )
+
+        weights = checkpoint_weights(self, weights)
         rocm_aiter_moe_shared_expert_enabled = (
             rocm_aiter_ops.is_fusion_moe_shared_experts_enabled()
         )
