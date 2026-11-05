@@ -277,5 +277,27 @@ def test_ineligible_workers_keep_native_path_without_group_lookup(monkeypatch, s
     )) is False
 
 
+@pytest.mark.parametrize("attribute, value, message", [
+    ("draft_sample_method", "probabilistic", "greedy draft sampling only"),
+    ("enable_adaptive_verification", True, "does not cover adaptive verification"),
+])
+def test_worker_rechecks_sampling_contract_before_group_lookup(monkeypatch, attribute, value, message):
+    from vllm import distributed
+    from test_platform_hcu_config import _glm53_head_hash_config
+    from vllm_hcu.patch.config import get_hcu_config, set_hcu_config
+
+    config = _glm53_head_hash_config(pcp=2, speculative=True)
+    set_hcu_config(config, get_hcu_config(config).with_updates(glm53_pcp_mtp_sync=True))
+    setattr(config.speculative_config, attribute, value)
+
+    def unexpected_group():
+        raise AssertionError("unsupported sampling must fail before group acquisition")
+
+    monkeypatch.setattr(distributed, "get_pcp_group", unexpected_group)
+    runner = SimpleNamespace(vllm_config=config, speculator=SimpleNamespace(sample_draft=lambda: None))
+    with pytest.raises(ValueError, match=message):
+        sync.install_glm53_pcp_mtp_sync(runner)
+
+
 if __name__=="__main__":
     unittest.main()

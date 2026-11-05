@@ -128,6 +128,19 @@ def validate_glm53_pcp_topology(vllm_config: object) -> int:
     return size
 
 
+def validate_glm53_mtp_sync_contract(vllm_config: object, enabled: bool) -> None:
+    """Engine preflight and worker defense for the same decision-sync contract."""
+    if not enabled:
+        return
+    if not vllm_config.model_config.enforce_eager:
+        raise ValueError("GLM53 PCP MTP sync v1 requires enforce_eager=True")
+    spec = vllm_config.speculative_config
+    if getattr(spec, "draft_sample_method", "greedy") != "greedy":
+        raise ValueError("GLM53 PCP MTP sync v1 supports greedy draft sampling only")
+    if getattr(spec, "enable_adaptive_verification", False):
+        raise ValueError("GLM53 PCP MTP sync v1 does not cover adaptive verification")
+
+
 def kda_cp_head_size(vllm_config: object) -> int | None:
     """Legacy accessor using the shared PCP topology validation.
 

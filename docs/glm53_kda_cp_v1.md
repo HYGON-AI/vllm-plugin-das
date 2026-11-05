@@ -60,10 +60,20 @@ rather than falling back to its local environment. Change the launch setting
 only with a fresh engine config and a complete service restart.
 
 PCP1, unrelated models and non-MTP configurations resolve to `False` and keep
-their original paths. The built-in MTP draft config also resolves to `False`
+their original paths, including explicit `True` requests in a shared
+`--additional-config`. EngineArgs checks retention against this same effective
+scope, while still rejecting dropped explicit flags in an applicable GLM PCP
+config. The built-in MTP draft config also resolves to `False`
 without changing the target's frozen policy; sync is installed on the target
-runner's speculator. Enabled sync still requires eager execution, greedy draft
-sampling and non-adaptive verification. This change adds no new per-token
+runner's speculator. Re-scoping any frozen GLM policy (for example a shared
+PCP1, non-MTP or other-model config clone) also isolates the outer sidecar
+mapping before persisting the new effective values, preserving the source
+target's mode, hash contribution and state-sizing decision.
+Enabled sync still requires eager execution, greedy draft
+sampling and non-adaptive verification. An enabled policy checks these
+constraints during engine configuration, before model/KV allocation; worker
+installation repeats the same checks defensively. A frozen `True` policy is
+also rechecked if speculative settings change. This change adds no new per-token
 collectives and does not establish multi-HCU accuracy or prefix-cache parity.
 
 With PCP>1, the head group size comes from `prefill_context_parallel_size`.

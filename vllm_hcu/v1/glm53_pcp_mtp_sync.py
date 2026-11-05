@@ -51,6 +51,7 @@ def _install_draft_sync(speculator, group):
 def install_glm53_pcp_mtp_sync(runner) -> bool:
     from vllm_hcu.patch.config import get_hcu_config
     from vllm_hcu.patch.platform.core_fix.patch_vllm_config import is_glm53_pcp
+    from vllm_hcu.v1.glm53_kda_cp_config import validate_glm53_mtp_sync_contract
 
     config = runner.vllm_config
     speculator = getattr(runner, "speculator", None)
@@ -72,12 +73,7 @@ def install_glm53_pcp_mtp_sync(runner) -> bool:
     # Keep this first fix within the diagnosed execution contract. In
     # particular, greedy-token broadcast alone is insufficient when each rank
     # also caches a potentially different probabilistic draft distribution.
-    if not config.model_config.enforce_eager:
-        raise ValueError("GLM53 PCP MTP sync v1 requires enforce_eager=True")
-    if getattr(spec, "draft_sample_method", "greedy") != "greedy":
-        raise ValueError("GLM53 PCP MTP sync v1 supports greedy draft sampling only")
-    if getattr(spec, "enable_adaptive_verification", False):
-        raise ValueError("GLM53 PCP MTP sync v1 does not cover adaptive verification")
+    validate_glm53_mtp_sync_contract(config, flag)
 
     from vllm.distributed import get_pcp_group
 

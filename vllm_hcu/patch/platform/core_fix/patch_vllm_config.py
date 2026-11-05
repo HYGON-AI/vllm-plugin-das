@@ -577,6 +577,28 @@ def _validate_dspark_pd_scope(vllm_config: object) -> None:
     )
 
 
+def normalize_glm53_feature_scope(
+    vllm_config: object, feature_config: HcuFeatureConfig,
+) -> HcuFeatureConfig:
+    """Apply the same effective scope to validation and EngineArgs retention.
+
+    Shared launch configs may explicitly request these GLM-only policies for
+    another model or PCP1. They are no-ops there, not lost user requests.
+    Keep None unresolved only when the policy can actually be used.
+    """
+    target_pcp = is_glm53_pcp(vllm_config)
+    spec = getattr(vllm_config, "speculative_config", None)
+    return feature_config.with_updates(
+        glm53_kda_cp_head_shard=(
+            feature_config.glm53_kda_cp_head_shard if target_pcp else False
+        ),
+        glm53_pcp_mtp_sync=(
+            feature_config.glm53_pcp_mtp_sync
+            if target_pcp and getattr(spec, "method", None) == "mtp" else False
+        ),
+    )
+
+
 def _resolve_glm53_pcp_mtp_sync(
     vllm_config: object, feature_config: HcuFeatureConfig,
 ) -> bool:
@@ -584,12 +606,18 @@ def _resolve_glm53_pcp_mtp_sync(
     spec = getattr(vllm_config, "speculative_config", None)
     if not is_glm53_pcp(vllm_config) or getattr(spec, "method", None) != "mtp":
         return False
-    if feature_config.glm53_pcp_mtp_sync is not None:
-        return feature_config.glm53_pcp_mtp_sync
-    value = os.environ.get("VLLM_HCU_GLM53_PCP_MTP_SYNC", "1")
-    if value not in ("0", "1"):
-        raise ValueError("VLLM_HCU_GLM53_PCP_MTP_SYNC must be 0 or 1")
-    return value == "1"
+    enabled = feature_config.glm53_pcp_mtp_sync
+    if enabled is None:
+        value = os.environ.get("VLLM_HCU_GLM53_PCP_MTP_SYNC", "1")
+        if value not in ("0", "1"):
+            raise ValueError("VLLM_HCU_GLM53_PCP_MTP_SYNC must be 0 or 1")
+        enabled = value == "1"
+    from vllm_hcu.v1.glm53_kda_cp_config import validate_glm53_mtp_sync_contract
+
+    # Reject unsupported sampling before engine startup allocates model/KV
+    # memory. Revalidate frozen True policies as well as initial env requests.
+    validate_glm53_mtp_sync_contract(vllm_config, enabled)
+    return enabled
 
 
 def validate_and_update_hcu_config(vllm_config: object) -> HcuFeatureConfig:
@@ -604,9 +632,11 @@ def validate_and_update_hcu_config(vllm_config: object) -> HcuFeatureConfig:
     validate_hy4_dcp_config(vllm_config)
     _validate_dspark_pd_scope(vllm_config)
     feature_config = get_hcu_config(vllm_config)
+    incoming_feature_config = feature_config
     feature_config = _normalize_dspark_draft_deepep_topology(
         vllm_config, feature_config
     )
+    feature_config = normalize_glm53_feature_scope(vllm_config, feature_config)
     from vllm_hcu.platforms import envs as hcu_envs
     from vllm_hcu.v1.glm53_kda_cp_config import (
         glm53_kda_cp_head_shard_enabled,
@@ -644,15 +674,21 @@ def validate_and_update_hcu_config(vllm_config: object) -> HcuFeatureConfig:
         # hashes. Classic, CUTLASS, and CUSTOM do not share a KV-cache ABI.
         updates["hcu_flash_attn_mode"] = hcu_envs.resolve_hcu_flash_attn_mode(None)
     feature_config = feature_config.with_updates(**updates)
-    if getattr(
+    glm53_policy_changed = any(
+        getattr(incoming_feature_config, name) is not None
+        and getattr(incoming_feature_config, name) != getattr(feature_config, name)
+        for name in ("glm53_kda_cp_head_shard", "glm53_pcp_mtp_sync")
+    )
+    if glm53_policy_changed or getattr(
         getattr(vllm_config, "model_config", None), "architectures", None,
     ) == ["Glm5NextMTPModel"]:
         # Native with_hf_config()/replace() shares the target's additional_config.
-        # The draft's effective Head/sampler-sync modes are False; do not write
-        # them back into the target after its mode/hash and shapes are frozen.
+        # A PCP1/non-MTP/other-model clone can change effective policy too, not
+        # just the built-in draft. Never write a re-scoped frozen policy back
+        # into its source config after the source's mode/hash/shapes are frozen.
         # Copy the outer mapping only: set_hcu_config replaces the whole HCU
         # payload, while unrelated values retain their existing identities.
-        # This also applies if the draft uses PCP1 and the target uses PCP>1.
+        # Always isolate MTP clones, including unresolved-policy payloads.
         additional_config = getattr(vllm_config, "additional_config", None)
         if additional_config is not None:
             vllm_config.additional_config = dict(additional_config)
