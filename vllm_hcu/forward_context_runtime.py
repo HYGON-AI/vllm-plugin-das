@@ -127,7 +127,22 @@ def choose_deepep_auto_low_latency(
                 # HT's asynchronous DeepEP dispatch cannot be captured on HCU;
                 # keep the mixed graph mode enabled while using the graph-safe
                 # DeepGEMM LL delegate for its piecewise regions.
-                return True
+                compilation_config = getattr(vllm_config, "compilation_config", None)
+                graph_limit = int(
+                    getattr(compilation_config, "max_cudagraph_capture_size", 0)
+                    or 0
+                )
+                requested_tokens = getattr(batch_descriptor, "num_tokens", None)
+                if requested_tokens is None:
+                    requested_tokens = num_tokens
+                # The runner also uses PIECEWISE while profiling a large
+                # prefill. Keep those forwards on HT: the LL buffer is sized
+                # for graph buckets and DeepEP rejects larger dispatches.
+                return bool(
+                    graph_limit > 0
+                    and requested_tokens is not None
+                    and int(requested_tokens) <= graph_limit
+                )
             return False
         if cudagraph_runtime_mode != CUDAGraphMode.NONE:
             raise ValueError(

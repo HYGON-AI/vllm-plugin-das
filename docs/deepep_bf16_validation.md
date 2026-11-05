@@ -38,8 +38,11 @@ Weight updates refresh the packed copy while retaining its storage address.
   The earlier BF16 intermediate reference had one outlier (absolute difference
   0.00531) at hidden=3072, tokens=17, motivating the FP32 reference check.
 - DP4/EP4 full model startup passed on physical GPUs 4-7, with BF16 DeepGEMM,
-  DeepEP auto, FP8 KV cache, MTP=3, eager mode, 8192 batched tokens, 64 sequences,
-  and max-model-len=180000. Worker logs confirmed both HT and LL selection.
+  DeepEP auto, FP8 KV cache, max-model-len=180000, and non-eager
+  `FULL_AND_PIECEWISE` CUDA graphs. The validated graph-safe host settings are
+  `max-num-batched-tokens=2048`, `max-num-seqs=24`, and capture buckets
+  `[1,2,4,8,16,24]`. Both PIECEWISE and FULL reached 100%; PIECEWISE uses the
+  masked LL delegate for graph buckets while large/profile forwards stay on HT.
 - Default gpu-memory-utilization=0.90 failed KV capacity (0.16 GiB available).
   Setting 0.95 succeeded: model loading 129.92 GiB/rank, available KV cache
   4.48 GiB, reported cache capacity 265263 tokens per rank.
@@ -63,14 +66,16 @@ Weight updates refresh the packed copy while retaining its storage address.
 - AITER configuration (Triton fallback) HumanEval32: pass@1=32/32,
   benchmark elapsed 236.2 seconds, request latency sum 163.539 seconds,
   4654 output tokens (28.46 output tokens/request-second).
-- `/home/vllm_1102_zb.sh` now requests `VLLM_COMPILE` with
-  `FULL_AND_PIECEWISE` CUDA graphs (`[1,2,4,8,16,32,64]`, max capture size 64)
-  and explicitly opts DeepEP auto out of the historical HCU downgrade. The
-  engine log confirms the requested mode and `enforce_eager=False`.
-- Full startup capture is not yet validated on this host: HT capture stalls in
-  `Capturing CUDA graphs (PIECEWISE)`, while forcing the graph-safe LL delegate
-  reaches warmup but exhausts the available per-device memory. The default
-  safety policy therefore remains unchanged unless the explicit opt-in is set.
+- `/home/vllm_1102_zb.sh` requests `VLLM_COMPILE` with `FULL_AND_PIECEWISE`
+  CUDA graphs (`[1,2,4,8,16,24]`, max capture size 24), enables the explicit
+  DeepEP auto graph opt-ins, and uses the validated 180k-context memory budget.
+  The exact run completed graph capture and served a BF16 DeepGEMM request.
+- A direct 180k-context attempt with 8192 batched tokens and 64 sequences
+  failed during warmup: FlashAttention needed another 488 MiB after 133.06 GiB
+  had already been allocated. A separate 8192-context attempt also hit vLLM's
+  Mamba-cache limit (`max_num_seqs=64`, only 24 blocks). The 2048/24 settings
+  are therefore required for graph mode on this host; this is a memory limit,
+  not a DeepGEMM or DeepEP correctness failure.
 
 | Configuration | HumanEval pass@1 | Sum API latency (s) | Output tokens | Output tokens / API second |
 | --- | --- | ---: | ---: | ---: |
@@ -89,6 +94,7 @@ Host artifacts:
 - `/home/bf16-deepep-validation/comparison.json`
 - `/home/bf16-deepep-validation/server-fixed.log`
 - `/home/bf16-deepep-validation/server-aiter.log`
+- `/home/bf16-deepep-validation/server-main-graph24-180k.log`
 
 The main host script `/home/vllm_1102_zb.sh` now uses the validated DeepGEMM
 configuration. The original eager Triton baseline script is preserved at
