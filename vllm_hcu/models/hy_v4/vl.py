@@ -137,7 +137,7 @@ class HYV4PatchProjection(nn.Conv2d):
 
     def forward(self, patches):
         flat = patches.flatten(1)
-        weight = self.weight.flatten(1)[:, :, None, None]
+        weight = self.weight.flatten(1)
         if not (
             patches.is_cuda
             and patches.dtype == torch.bfloat16
@@ -146,12 +146,13 @@ class HYV4PatchProjection(nn.Conv2d):
         ):
             # Small spatial convolutions select a different MIOpen reduction
             # order. Retain the original path outside the validated range.
-            return F.conv2d(flat[:, :, None, None], weight, self.bias)
-        # A single channels-last image avoids a convolution batch per patch.
+            return F.conv2d(flat[:, :, None, None], weight[:, :, None, None], self.bias)
+        # Canonical channels-last views include strides for singleton axes,
+        # without the allocations introduced by .to(memory_format=...).
         # Keep MIOpen's accumulation/bias rounding and the checkpoint layout.
         projected = F.conv2d(
-            flat.T[None, :, None, :],
-            weight,
+            flat[None, None, :, :].permute(0, 3, 1, 2),
+            weight[:, None, None, :].permute(0, 3, 1, 2),
             self.bias,
         )
         return projected.permute(3, 1, 0, 2).contiguous()
