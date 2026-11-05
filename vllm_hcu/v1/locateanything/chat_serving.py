@@ -1123,7 +1123,11 @@ class OpenAIServingChat(GenerateBaseServing):
             ):
                 last_msg_content = conversation[-1]["content"] or ""
             if isinstance(last_msg_content, list):
-                last_msg_content = "\n".join(msg["text"] for msg in last_msg_content)
+                last_msg_content = "\n".join(
+                    part["text"]
+                    for part in last_msg_content
+                    if part.get("type") == "text" and "text" in part
+                )
 
             for choice in choices:
                 full_message = last_msg_content + (choice.message.content or "")

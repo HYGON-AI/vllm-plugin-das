@@ -199,3 +199,57 @@ def test_fast_chat_rejects_unsupported_session_and_processor_fields(flags,key):
     from vllm_hcu.v1.locateanything.request_contract import validate_request
     req=ChatCompletionRequest(model='test',messages=[],**flags)
     assert key in validate_request(req)
+
+
+@pytest.mark.parametrize(
+    ("content", "add_generation_prompt", "expected"),
+    [
+        ([{"type": "text", "text": "first"}, {"type": "image"},
+          {"type": "text", "text": "second"}], False, "first\nseconddetected"),
+        ([{"type": "image"}], False, "detected"),
+        ("plain text", False, "plain textdetected"),
+        ([{"type": "image"}, {"type": "text", "text": "prompt"}], True, "detected"),
+    ],
+)
+def test_fast_full_chat_echo_only_includes_text(content, add_generation_prompt, expected):
+    import asyncio
+
+    from vllm.entrypoints.generate.base.protocol import RequestResponseMetadata
+    from vllm.entrypoints.openai.chat_completion.protocol import ChatCompletionRequest
+    from vllm.outputs import CompletionOutput, RequestOutput
+    from vllm_hcu.v1.locateanything.chat_serving import OpenAIServingChat
+
+    serving = OpenAIServingChat.__new__(OpenAIServingChat)
+    serving.response_role = "assistant"
+    serving.parser_cls = None
+    serving.enable_auto_tools = False
+    serving._include_reasoning_tokens_details = False
+    serving.enable_prompt_tokens_details = False
+    serving.enable_per_request_metrics = False
+    serving.enable_log_outputs = False
+    serving.system_fingerprint = None
+    request = ChatCompletionRequest(
+        model="test",
+        messages=[{"role": "user", "content": "prompt"}],
+        add_generation_prompt=add_generation_prompt,
+        echo=True,
+    )
+
+    async def results():
+        yield RequestOutput(
+            request_id="echo",
+            prompt=None,
+            prompt_token_ids=[9],
+            prompt_logprobs=None,
+            outputs=[CompletionOutput(
+                index=0, text="detected", token_ids=[10], cumulative_logprob=None,
+                logprobs=None, finish_reason="stop",
+            )],
+            finished=True,
+        )
+
+    response = asyncio.run(serving.chat_completion_full_generator(
+        request, results(), "echo", "test", [{"role": "user", "content": content}],
+        tokenizer=None, request_metadata=RequestResponseMetadata(request_id="echo"),
+    ))
+    assert response.choices[0].message.content == expected
