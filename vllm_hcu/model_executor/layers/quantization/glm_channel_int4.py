@@ -469,6 +469,24 @@ def routed_expert_owner_is_ignored(config: Any, prefix: str) -> bool:
     )
 
 
+def require_unfused_shared_experts(layer: Any, prefix: str) -> None:
+    """Fail before weights are allocated if shared experts were fused into ``layer``.
+
+    The model keeps them separate for this config (``supports_fused_shared_experts``
+    is False), so this only catches a path that fuses them anyway. The checkpoint
+    stores them as INT8 or unquantized linears, which cannot share the routed
+    experts' tensors, and selection never sees those extra slots.
+    """
+    manager = getattr(layer, "expert_map_manager", None)
+    fused = int(getattr(manager, "num_fused_shared_experts", 0) or 0)
+    if fused > 0:
+        raise NotImplementedError(
+            "GLM channel INT4 W4A8 does not support fused shared experts, but "
+            f"{prefix!r} fuses {fused} of them into its routed expert tensors. "
+            "Keep them separate (VLLM_ROCM_USE_AITER_FUSION_SHARED_EXPERTS=0)."
+        )
+
+
 def _expert_projection_schemes(
     config: Any, layer: Any, prefix: str, expert_id: int
 ) -> list[Any]:

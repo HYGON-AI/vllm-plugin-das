@@ -129,6 +129,26 @@ from vllm_hcu.ops.fuse_silu_mul_quant import FusedSiluAndMulAndQuant
 logger = init_logger(__name__)
 
 
+def is_fused_shared_experts_enabled(quant_config: QuantizationConfig | None) -> bool:
+    """Whether AITER fused shared experts apply under this quantization config.
+
+    Every consumer must use this instead of reading the AITER flag directly, so
+    the model, its loader and the MTP loader agree. Like native vLLM, keep the
+    shared experts separate (with a warning) when the config cannot hold them
+    in the routed expert tensors.
+    """
+    if not rocm_aiter_ops.is_fusion_moe_shared_experts_enabled():
+        return False
+    if getattr(quant_config, "supports_fused_shared_experts", True):
+        return True
+    logger.warning_once(
+        "VLLM_ROCM_USE_AITER_FUSION_SHARED_EXPERTS is enabled but %s does not "
+        "support fused shared experts; keeping the shared experts separate.",
+        type(quant_config).__name__,
+    )
+    return False
+
+
 def fused_silu_mul_quant_supported(weight: object) -> bool:
     """Return whether LightOP can produce the linear's activation dtype."""
 
@@ -418,8 +438,8 @@ class DeepseekV2MoE(nn.Module):
         )
 
         self.is_rocm_aiter_moe_enabled = rocm_aiter_ops.is_fused_moe_enabled()
-        self.is_fusion_moe_shared_experts_enabled = (
-            rocm_aiter_ops.is_fusion_moe_shared_experts_enabled()
+        self.is_fusion_moe_shared_experts_enabled = is_fused_shared_experts_enabled(
+            quant_config
         )
         if (
             self.is_rocm_aiter_moe_enabled
@@ -1489,6 +1509,7 @@ class DeepseekV2Model(nn.Module):
         config = vllm_config.model_config.hf_config
         quant_config = vllm_config.quant_config
         self.config = config
+        self.quant_config = quant_config
         self.device = current_platform.device_type
 
         self.vocab_size = config.vocab_size
@@ -1638,8 +1659,8 @@ class DeepseekV2Model(nn.Module):
         return hidden_states
 
     def load_weights(self, weights: Iterable[tuple[str, torch.Tensor]]) -> set[str]:
-        rocm_aiter_moe_shared_expert_enabled = (
-            rocm_aiter_ops.is_fusion_moe_shared_experts_enabled()
+        rocm_aiter_moe_shared_expert_enabled = is_fused_shared_experts_enabled(
+            self.quant_config
         )
         stacked_params_mapping = [
             # (param_name, shard_name, shard_id)

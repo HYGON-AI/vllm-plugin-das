@@ -9,7 +9,6 @@ import torch
 import torch.nn as nn
 from transformers import PretrainedConfig
 
-from vllm._aiter_ops import rocm_aiter_ops
 from vllm.compilation.decorators import support_torch_compile
 from vllm.config import VllmConfig
 from vllm.distributed import (
@@ -50,6 +49,7 @@ from .deepseek_v2 import (
     DeepseekV2MoE,
     _try_load_quantized_indexer_wk,
     get_spec_layer_idx_from_weight_name,
+    is_fused_shared_experts_enabled,
 )
 
 logger = init_logger(__name__)
@@ -315,8 +315,8 @@ class DeepSeekMTP(nn.Module, DeepseekV2MixtureOfExperts, SupportsPP):
         return self.model.compute_logits(hidden_states, spec_step_idx)
 
     def load_weights(self, weights: Iterable[tuple[str, torch.Tensor]]) -> set[str]:
-        rocm_aiter_moe_shared_expert_enabled = (
-            rocm_aiter_ops.is_fusion_moe_shared_experts_enabled()
+        rocm_aiter_moe_shared_expert_enabled = is_fused_shared_experts_enabled(
+            self.quant_config
         )
         stacked_params_mapping = [
             ("gate_up_proj", "gate_proj", 0),

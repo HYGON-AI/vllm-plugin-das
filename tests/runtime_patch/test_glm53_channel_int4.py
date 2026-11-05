@@ -1492,6 +1492,214 @@ def test_last_logical_expert_is_checked_without_ep_locality(projection) -> None:
         routed_expert_uses_glm_channel_int4(config, layer, prefix)
 
 
+def _routed_experts_layer(fused_shared_experts):
+    """RoutedExperts as native leaves it before quant selection.
+
+    ``num_logical_experts`` counts routed experts only. Fused shared experts are
+    extra slots tracked by the expert map manager, or absent when None.
+    """
+    from vllm.model_executor.layers.fused_moe import RoutedExperts
+
+    layer = RoutedExperts.__new__(RoutedExperts)
+    layer.moe_config = SimpleNamespace(num_logical_experts=2)
+    if fused_shared_experts is not None:
+        layer.expert_map_manager = SimpleNamespace(
+            num_fused_shared_experts=fused_shared_experts
+        )
+    return layer
+
+
+def _fused_shared_scenario(glm_module, scenario):
+    """(config, prefix, label) for each way get_quant_method can resolve a layer."""
+    quant = _quant_config()
+    prefix, label = "model.layers.4.mlp.experts", "int4"
+    if scenario == "ignored-owner":
+        quant["ignore"] = [prefix]
+        label = "unquantized"
+    elif scenario == "int8-experts":
+        projections = ("gate_proj", "up_proj", "down_proj")
+        prefix, label = "model.layers.3.mlp.experts", "int8"
+        quant["config_groups"] = {
+            "int4": dict(
+                _int4_scheme(), targets=[r"re:^model\.layers\.4\.mlp\.experts.*"]
+            ),
+            "int8_layer": dict(
+                _int8_scheme(),
+                targets=[f"{prefix}.{e}.{p}" for e in range(2) for p in projections],
+            ),
+            "linears": dict(_int8_scheme(), targets=["Linear"]),
+        }
+    config = glm_module.GlmMoeDsaChannelW4A8Config.from_config(quant)
+    config.packed_modules_mapping = {}
+    return config, prefix, label
+
+
+@pytest.mark.parametrize("scenario", ["int4", "ignored-owner", "int8-experts"])
+def test_layers_that_fused_shared_experts_are_rejected_on_every_branch(
+    glm_quant_method_labels, scenario
+) -> None:
+    config, prefix, label = _fused_shared_scenario(glm_quant_method_labels, scenario)
+    # Not fused (no manager at all, or none fused): selection is unchanged.
+    for fused in (None, 0):
+        assert config.get_quant_method(_routed_experts_layer(fused), prefix) == label
+    for fused in (1, 2):
+        with pytest.raises(NotImplementedError, match="fused shared experts") as error:
+            config.get_quant_method(_routed_experts_layer(fused), prefix)
+        message = str(error.value)
+        assert repr(prefix) in message
+        assert f"fuses {fused} of them" in message
+        assert "VLLM_ROCM_USE_AITER_FUSION_SHARED_EXPERTS=0" in message
+
+
+def test_fused_shared_experts_are_rejected_for_mtp_prefixes(
+    glm_quant_method_labels,
+) -> None:
+    config, _, _ = _fused_shared_scenario(glm_quant_method_labels, "int4")
+    prefix = "model.layers.4.mtp_block.mlp.experts"
+    assert config.get_quant_method(_routed_experts_layer(0), prefix) == "int4"
+    with pytest.raises(NotImplementedError, match="fused shared experts"):
+        config.get_quant_method(_routed_experts_layer(1), prefix)
+
+
+_MODELS = Path(__file__).parents[2] / "vllm_hcu/models"
+
+
+def _load_fused_shared_experts_gate(flag):
+    """The production gate, extracted so the full model module is not imported."""
+    path = _MODELS / "deepseek_v2.py"
+    func = next(
+        node
+        for node in ast.parse(path.read_text(encoding="utf-8")).body
+        if isinstance(node, ast.FunctionDef)
+        and node.name == "is_fused_shared_experts_enabled"
+    )
+    warnings = []
+    namespace = {
+        "QuantizationConfig": object,
+        "rocm_aiter_ops": SimpleNamespace(
+            is_fusion_moe_shared_experts_enabled=lambda: flag
+        ),
+        "logger": SimpleNamespace(
+            warning_once=lambda message, *args: warnings.append(message % args)
+        ),
+    }
+    module = ast.Module(
+        body=[
+            ast.ImportFrom(
+                module="__future__", names=[ast.alias(name="annotations")], level=0
+            ),
+            func,
+        ],
+        type_ignores=[],
+    )
+    exec(compile(ast.fix_missing_locations(module), str(path), "exec"), namespace)
+    return namespace["is_fused_shared_experts_enabled"], warnings
+
+
+def test_glm_config_does_not_support_fused_shared_experts() -> None:
+    from vllm.model_executor.layers.quantization.compressed_tensors.compressed_tensors import (
+        CompressedTensorsConfig,
+    )
+    from vllm_hcu.model_executor.layers.quantization.glm_moe_dsa_w4a8 import (
+        GlmMoeDsaChannelW4A8Config,
+    )
+
+    assert GlmMoeDsaChannelW4A8Config.supports_fused_shared_experts is False
+    # Every other config keeps today's behaviour: the gate defaults to True.
+    assert getattr(CompressedTensorsConfig, "supports_fused_shared_experts", True)
+
+
+@pytest.mark.parametrize("flag", [False, True])
+def test_fused_shared_experts_gate_follows_the_quant_config(flag) -> None:
+    from vllm_hcu.model_executor.layers.quantization.glm_moe_dsa_w4a8 import (
+        GlmMoeDsaChannelW4A8Config,
+    )
+
+    gate, warnings = _load_fused_shared_experts_gate(flag)
+    glm_config = GlmMoeDsaChannelW4A8Config.__new__(GlmMoeDsaChannelW4A8Config)
+    assert gate(None) is flag
+    assert gate(SimpleNamespace()) is flag
+    assert warnings == []
+    # Only this config keeps its shared experts separate, and says so.
+    assert gate(glm_config) is False
+    if flag:
+        assert len(warnings) == 1 and "GlmMoeDsaChannelW4A8Config" in warnings[0]
+    else:
+        assert warnings == []
+
+
+class _FusionFlagUses(ast.NodeVisitor):
+    """Where model code reads the AITER fusion flag or calls the gate."""
+
+    def __init__(self):
+        self.scope, self.raw, self.gated = [], [], []
+
+    def _enter(self, node):
+        self.scope.append(node.name)
+        self.generic_visit(node)
+        self.scope.pop()
+
+    visit_ClassDef = visit_FunctionDef = _enter
+
+    def visit_Call(self, node):
+        func = node.func
+        where = ".".join(self.scope)
+        if (
+            isinstance(func, ast.Attribute)
+            and func.attr == "is_fusion_moe_shared_experts_enabled"
+        ):
+            self.raw.append(where)
+        elif isinstance(func, ast.Name) and func.id == "is_fused_shared_experts_enabled":
+            self.gated.append(where)
+        self.generic_visit(node)
+
+
+def _fusion_flag_uses(filename):
+    visitor = _FusionFlagUses()
+    visitor.visit(ast.parse((_MODELS / filename).read_text(encoding="utf-8")))
+    return visitor
+
+
+def test_model_code_decides_shared_expert_fusion_only_through_the_gate() -> None:
+    """The model, its loader and the MTP loader must agree on one decision."""
+    v2, mtp = _fusion_flag_uses("deepseek_v2.py"), _fusion_flag_uses("deepseek_mtp.py")
+    assert v2.raw == ["is_fused_shared_experts_enabled"]
+    assert sorted(v2.gated) == [
+        "DeepseekV2MoE.__init__",
+        "DeepseekV2Model.load_weights",
+    ]
+    assert mtp.raw == []
+    assert mtp.gated == ["DeepSeekMTP.load_weights"]
+
+
+@pytest.mark.parametrize(
+    "filename,class_name",
+    [("deepseek_v2.py", "DeepseekV2Model"), ("deepseek_mtp.py", "DeepSeekMTP")],
+)
+def test_loaders_that_use_the_gate_keep_the_quant_config(filename, class_name) -> None:
+    """load_weights reads self.quant_config, so __init__ must have stored it."""
+    tree = ast.parse((_MODELS / filename).read_text(encoding="utf-8"))
+    model = next(
+        node
+        for node in tree.body
+        if isinstance(node, ast.ClassDef) and node.name == class_name
+    )
+    init = next(
+        node
+        for node in model.body
+        if isinstance(node, ast.FunctionDef) and node.name == "__init__"
+    )
+    assert any(
+        isinstance(target, ast.Attribute)
+        and target.attr == "quant_config"
+        and isinstance(target.value, ast.Name)
+        and target.value.id == "self"
+        for node in ast.walk(init)
+        if isinstance(node, ast.Assign)
+        for target in node.targets
+    )
+
+
 def test_expert_loaders_convert_weights_and_scales() -> None:
     import inspect
 
