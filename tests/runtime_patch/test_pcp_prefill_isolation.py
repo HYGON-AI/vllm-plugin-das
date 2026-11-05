@@ -6,6 +6,7 @@ from types import SimpleNamespace
 
 import pytest
 
+from vllm.v1.core.sched.interface import PauseState
 from vllm.v1.core.sched.request_queue import FCFSRequestQueue
 
 from vllm_hcu.patch.platform.framework_opt import patch_scheduler
@@ -25,6 +26,8 @@ class _FakeScheduler:
 
     def __init__(self, running, waiting, kv_room=True, max_running=64):
         self.current_step = 0
+        self._pause_state = PauseState.UNPAUSED
+        self.num_waiting_for_streaming_input = 0
         self.max_num_running_reqs = max_running
         self.running = running
         self.waiting = FCFSRequestQueue(waiting)
@@ -35,16 +38,24 @@ class _FakeScheduler:
 
     def schedule(self):
         self.current_step += 1
+        if self._pause_state == PauseState.PAUSED_ALL:
+            return SimpleNamespace(num_scheduled_tokens={})
         scheduled = {
             r.request_id: 1
             for r in self.running
             if self.current_step >= r.next_decode_eligible_step
         }
-        if self.kv_room:
+        if (
+            self.kv_room
+            and self._pause_state == PauseState.UNPAUSED
+            and len(self.running) + self.num_waiting_for_streaming_input
+            < self.max_num_running_reqs
+        ):
             for r in self.waiting:
                 scheduled[r.request_id] = r.num_prompt_tokens
         if self.preempt_on_next_step is not None:
-            self.waiting.prepend_request(self.preempt_on_next_step)
+            for request in self.preempt_on_next_step:
+                self.waiting.prepend_request(request)
             self.preempt_on_next_step = None
         return SimpleNamespace(num_scheduled_tokens=scheduled)
 
@@ -141,15 +152,21 @@ def test_prefill_burst_inserts_decode_only_step(monkeypatch):
     assert seen[3:] == [{"new2"}, {"new3"}, {"decode"}]
 
 
-def test_decode_only_step_keeps_requests_preempted_meanwhile(monkeypatch):
+@pytest.mark.parametrize("num_preemptions", [1, 2])
+def test_decode_only_step_keeps_requests_preempted_meanwhile(monkeypatch, num_preemptions):
     sched, _ = _prefill_burst(monkeypatch, 1)
     setattr(sched, patch_scheduler._ISOLATE_STREAK, 1)
-    victim = _request("victim", 500, 0)
-    sched.preempt_on_next_step = victim
+    victims = [_request(f"victim{i}", 500, 0) for i in range(num_preemptions)]
+    expected = FCFSRequestQueue(sched.waiting)
+    for victim in victims:
+        expected.prepend_request(victim)
+    original_waiting = sched.waiting
+    sched.preempt_on_next_step = victims
     out = sched.schedule()
     assert set(out.num_scheduled_tokens) == {"decode"}
     queued = [r.request_id for r in sched.waiting]
-    assert queued[0] == "victim" and len(queued) == 9
+    assert sched.waiting is original_waiting
+    assert queued == [r.request_id for r in expected]
 
 
 def test_unlimited_streak_never_forces_decode_step(monkeypatch):
@@ -174,3 +191,49 @@ def test_custom_ops_master_controls_isolation(monkeypatch, enabled):
     expected = {"new"} if enabled else {"decode", "new"}
     assert set(sched.schedule().num_scheduled_tokens) == expected
     assert getattr(sched, patch_scheduler._ISOLATE_PREFILL) is enabled
+
+
+@pytest.mark.parametrize("queue_name", ["waiting", "skipped_waiting"])
+def test_paused_new_drains_decodes_without_empty_steps(queue_name):
+    decode = _request("decode", 100, 120)
+    waiting = _request("new", 4096, 0)
+    sched = _FakeScheduler([decode], [])
+    getattr(sched, queue_name).add_request(waiting)
+    sched._pause_state = PauseState.PAUSED_NEW
+
+    for _ in range(4):
+        assert set(sched.schedule().num_scheduled_tokens) == {"decode"}
+        assert decode.next_decode_eligible_step == 0
+    assert list(getattr(sched, queue_name)) == [waiting]
+    # Resuming admission must immediately allow prefill isolation again.
+    sched._pause_state = PauseState.UNPAUSED
+    # The fake scheduler only implements admission from the waiting queue.
+    if queue_name == "skipped_waiting":
+        sched.waiting.add_request(sched.skipped_waiting.pop_request())
+    assert set(sched.schedule().num_scheduled_tokens) == {"new"}
+
+
+def test_paused_new_still_isolates_running_chunked_prefill():
+    sched = _FakeScheduler(
+        [_request("chunk", 8192, 0), _request("decode", 100, 120)],
+        [_request("new", 4096, 0)],
+    )
+    sched._pause_state = PauseState.PAUSED_NEW
+    assert set(sched.schedule().num_scheduled_tokens) == {"chunk"}
+
+
+def test_paused_all_does_not_defer_or_count_prefills():
+    decode = _request("decode", 100, 120)
+    sched = _FakeScheduler([decode], [_request("new", 4096, 0)])
+    sched._pause_state = PauseState.PAUSED_ALL
+    assert patch_scheduler._pending_prefill_tokens(sched, 1024) == 0
+    assert sched.schedule().num_scheduled_tokens == {}
+    assert decode.next_decode_eligible_step == 0
+
+
+def test_streaming_sessions_filling_running_slots_do_not_defer_decodes():
+    sched = _FakeScheduler(
+        [_request("decode", 100, 120)], [_request("new", 4096, 0)], max_running=2
+    )
+    sched.num_waiting_for_streaming_input = 1
+    assert "decode" in sched.schedule().num_scheduled_tokens

@@ -125,11 +125,20 @@ def _install_hybrid_mamba_split_block_size(
 
 
 def _pending_prefill_tokens(scheduler, limit: int) -> int:
-    """Prompt tokens still to prefill, counted until ``limit`` is reached."""
+    """Count pending prefills only in queues this step is allowed to schedule."""
+    from vllm.v1.core.sched.interface import PauseState
+
+    if scheduler._pause_state == PauseState.PAUSED_ALL:
+        return 0
     pending = 0
-    # Waiting requests cannot start while the running set is full.
     queues = [scheduler.running]
-    if len(scheduler.running) < scheduler.max_num_running_reqs:
+    # Match upstream admission: PAUSED_NEW drains running requests only;
+    # streaming sessions waiting for input still occupy running slots.
+    num_running = len(scheduler.running) + scheduler.num_waiting_for_streaming_input
+    if (
+        scheduler._pause_state == PauseState.UNPAUSED
+        and num_running < scheduler.max_num_running_reqs
+    ):
         queues += [scheduler.waiting, scheduler.skipped_waiting]
     for queue in queues:
         for request in queue:
@@ -196,8 +205,10 @@ def _install_pcp_prefill_isolation(scheduler: type) -> None:
                 # Requests preempted during the step were queued on the
                 # stand-ins; put them back in front of the real queues.
                 for real, stand_in in zip(queues, (self.waiting, self.skipped_waiting)):
-                    if stand_in:
-                        real.prepend_requests(stand_in)
+                    # FCFS prepend_requests uses extendleft and would reverse
+                    # the already ordered temporary queue a second time.
+                    for request in reversed(list(stand_in)):
+                        real.prepend_request(request)
                 self.waiting, self.skipped_waiting = queues
 
     @functools.wraps(original)

@@ -117,3 +117,38 @@ def test_disabled_staging_keeps_direct_reader(monkeypatch):
     ends = _causal_ends([513, 514], 6)
     args, expected = _token_major_case(64, ends, True)
     _check(_decode(args), expected, ends)
+
+
+def test_large_physical_pool_small_batch_has_bounded_graph_workspace(monkeypatch):
+    from vllm_hcu.v1.attention.ops import dsv4_compact_indexer as compact
+
+    monkeypatch.setenv("VLLM_HCU_USE_CUSTOM_OPS", "1")
+    monkeypatch.setenv("VLLM_HCU_DSV4_INDEXER_COMPACT_DECODE", "1")
+    monkeypatch.setattr(compact, "_WORKSPACES", {})
+    ends = torch.full((1, 6), 64, dtype=torch.int32, device="cuda")
+    args, expected = _token_major_case(64, ends, True)
+    q, cache, weights, lengths, _, max_len = args
+    pages = 131072
+    # Alias one real page to model a large physical pool without allocating
+    # the 1056 MiB pool itself. High physical IDs must map to local row slots.
+    physical = cache.expand(pages, -1, -1, -1)
+    table = torch.full((1, 1), pages - 1, dtype=torch.int32, device="cuda")
+    args = (q, physical, weights, lengths, table, max_len)
+    stream = torch.cuda.Stream()
+    stream.wait_stream(torch.cuda.current_stream())
+    with torch.cuda.stream(stream):
+        _check(_decode(args), expected, ends)
+    torch.cuda.current_stream().wait_stream(stream)
+    state, = compact._WORKSPACES.values()
+    assert 6 <= state["page_capacity"] <= 8
+    assert state["compact"].numel() < 1024 * 1024
+    torch.testing.assert_close(
+        state["mapped"][:6, 0], torch.arange(6, dtype=torch.int32, device="cuda")
+    )
+    workspace = state["compact"]
+    graph = torch.cuda.CUDAGraph()
+    with torch.cuda.graph(graph, stream=stream):
+        actual = _decode(args)
+    graph.replay()
+    _check(actual, expected, ends)
+    assert state["compact"] is workspace

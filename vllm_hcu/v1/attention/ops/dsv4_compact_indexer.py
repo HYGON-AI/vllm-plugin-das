@@ -130,7 +130,7 @@ def compact_indexer_logits(q, cache, weights, lengths, table, max_len):
             page_capacity = (
                 required_pages
                 if use_physical
-                else triton.next_power_of_2(required_pages)
+                else min(pages, triton.next_power_of_2(required_pages))
             )
             state["compact"] = torch.empty(
                 (page_capacity + 1, page_size, 1, dim + 4),
