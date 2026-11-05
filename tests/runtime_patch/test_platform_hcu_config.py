@@ -3257,6 +3257,80 @@ def test_glm53_kda_cp_head_mode_partitions_compilation_hash(monkeypatch):
     assert keys[0] == keys[2]
 
 
+@pytest.mark.parametrize("architecture", [
+    "Glm5NextForCausalLM", "Glm5NextForConditionalGeneration",
+])
+@pytest.mark.parametrize("enabled", [False, True])
+@pytest.mark.parametrize("draft_pcp", [1, 2, 8])
+@pytest.mark.parametrize("worker_env", [None, "0", "invalid"])
+def test_glm53_mtp_validation_does_not_mutate_target_head_mode(
+    monkeypatch, architecture, enabled, draft_pcp, worker_env,
+):
+    from vllm_hcu.v1.glm53_kda_cp_config import (
+        KDA_CP_HEAD_ENV, kda_cp_head_size,
+    )
+
+    monkeypatch.setenv(KDA_CP_HEAD_ENV, str(int(enabled)))
+    target = _glm53_head_hash_config()
+    target.model_config.architectures = [architecture]
+    unrelated = {"keep": True}
+    target.additional_config["unrelated"] = unrelated
+    target_additional = target.additional_config
+    patch_vllm_config.validate_and_update_hcu_config(target)
+    assert target.additional_config is target_additional
+    target_payload = copy.deepcopy(target_additional)
+    target_hcu_payload = target_additional["hcu"]
+    target_hash = _vllm_hash(target_additional)
+    target_head_size = kda_cp_head_size(target)
+    assert target_head_size == (8 if enabled else None)
+
+    # Native with_hf_config()/replace() carries additional_config by reference.
+    # The draft may use a different PCP width; ownership cannot depend on it.
+    draft = copy.copy(target)
+    draft.model_config = copy.copy(target.model_config)
+    draft.model_config.architectures = ["Glm5NextMTPModel"]
+    draft.parallel_config = copy.copy(target.parallel_config)
+    draft.parallel_config.prefill_context_parallel_size = draft_pcp
+    draft.compilation_config = _ValidationCompilation()
+    assert draft.additional_config is target_additional
+    if worker_env is None:
+        monkeypatch.delenv(KDA_CP_HEAD_ENV)
+    else:
+        monkeypatch.setenv(KDA_CP_HEAD_ENV, worker_env)
+
+    for _ in range(2):
+        feature = patch_vllm_config.validate_and_update_hcu_config(draft)
+        assert feature.glm53_kda_cp_head_shard is False
+        assert get_hcu_config(target).glm53_kda_cp_head_shard is enabled
+        assert target.additional_config is target_additional
+        assert target_additional["hcu"] is target_hcu_payload
+        assert target_additional == target_payload
+        assert _vllm_hash(target_additional) == target_hash
+        assert kda_cp_head_size(target) == target_head_size
+        assert draft.additional_config is not target_additional
+        assert draft.additional_config["unrelated"] is unrelated
+        assert target.additional_config["unrelated"] is unrelated
+
+    # A later target validation must still consume its frozen policy, not the
+    # draft's effective False or a missing/opposite/invalid worker env value.
+    patch_vllm_config.validate_and_update_hcu_config(target)
+    assert get_hcu_config(target).glm53_kda_cp_head_shard is enabled
+    assert _vllm_hash(target.additional_config) == target_hash
+    assert kda_cp_head_size(target) == target_head_size
+    assert get_hcu_config(draft).glm53_kda_cp_head_shard is False
+
+
+@pytest.mark.parametrize("pcp", [1, 8])
+def test_glm53_mtp_without_additional_config_keeps_head_mode_off(monkeypatch, pcp):
+    monkeypatch.setenv("VLLM_HCU_GLM53_KDA_CP_HEAD_SHARD", "1")
+    draft = _glm53_head_hash_config(pcp=pcp)
+    draft.model_config.architectures = ["Glm5NextMTPModel"]
+    draft.additional_config = None
+    feature = patch_vllm_config.validate_and_update_hcu_config(draft)
+    assert feature.glm53_kda_cp_head_shard is False
+    assert get_hcu_config(draft).glm53_kda_cp_head_shard is False
+
+
 @pytest.mark.parametrize("scope", ["pcp1", "unrelated"])
 def test_glm53_kda_cp_head_hash_uses_effective_mode(monkeypatch, scope):
     keys = []

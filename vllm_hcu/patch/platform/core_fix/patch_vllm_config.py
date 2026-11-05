@@ -624,6 +624,18 @@ def validate_and_update_hcu_config(vllm_config: object) -> HcuFeatureConfig:
         # hashes. Classic, CUTLASS, and CUSTOM do not share a KV-cache ABI.
         updates["hcu_flash_attn_mode"] = hcu_envs.resolve_hcu_flash_attn_mode(None)
     feature_config = feature_config.with_updates(**updates)
+    if getattr(
+        getattr(vllm_config, "model_config", None), "architectures", None,
+    ) == ["Glm5NextMTPModel"]:
+        # Native with_hf_config()/replace() shares the target's additional_config.
+        # The draft's effective Head mode is False; do not write it back into
+        # the target after its mode/hash and KDA shapes have been finalized.
+        # Copy the outer mapping only: set_hcu_config replaces the whole HCU
+        # payload, while unrelated values retain their existing identities.
+        # This also applies if the draft uses PCP1 and the target uses PCP>1.
+        additional_config = getattr(vllm_config, "additional_config", None)
+        if additional_config is not None:
+            vllm_config.additional_config = dict(additional_config)
     # Persist every resolved graph policy so it enters vLLM's compilation hash.
     set_hcu_config(vllm_config, feature_config)
 
