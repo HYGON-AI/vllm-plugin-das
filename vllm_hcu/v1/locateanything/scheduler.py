@@ -54,7 +54,7 @@ from vllm.v1.core.sched.request_queue import (
     SchedulingPolicy,
     create_request_queue,
 )
-from vllm.v1.core.sched.utils import check_stop, remove_all
+from vllm.v1.core.sched.utils import remove_all
 from vllm.v1.engine import EngineCoreEventType, EngineCoreOutput, EngineCoreOutputs
 from vllm.v1.kv_cache_interface import (
     KVCacheConfig,
@@ -74,7 +74,7 @@ from vllm.v1.spec_decode.dynamic.utils import build_dynamic_sd_schedule_lookup
 from vllm.v1.spec_decode.metrics import SpecDecodingStats
 from vllm.v1.structured_output import StructuredOutputGrammar, StructuredOutputManager
 from vllm.v1.utils import record_function_or_nullcontext
-from vllm_hcu.v1.locateanything.limits import context_error, logical_context_limit, reject_pipeline_parallelism, reject_speculative_decoding
+from vllm_hcu.v1.locateanything.limits import context_error, logical_context_limit, validate_fast_config
 from vllm_hcu.v1.locateanything.request_contract import FAST_SESSION_ERROR, validate_sampling_params, validate_session_input
 
 logger = init_logger(__name__)
@@ -92,12 +92,7 @@ class Scheduler(SchedulerInterface):
         include_finished_set: bool = False,
         log_stats: bool = False,
     ) -> None:
-        reject_speculative_decoding(vllm_config.speculative_config)
-        reject_pipeline_parallelism(vllm_config.parallel_config.pipeline_parallel_size)
-        if getattr(vllm_config.model_config.hf_config, "model_type", None) != "locateanything":
-            raise ValueError("LocateAnything Fast mode is process-wide and requires a LocateAnything checkpoint")
-        if vllm_config.scheduler_config.async_scheduling or vllm_config.scheduler_config.enable_chunked_prefill:
-            raise ValueError("LocateAnything Fast requires synchronous scheduling without chunked prefill")
+        validate_fast_config(vllm_config)
         self.vllm_config = vllm_config
         self.scheduler_config = vllm_config.scheduler_config
         self.cache_config = vllm_config.cache_config
@@ -2346,22 +2341,6 @@ class Scheduler(SchedulerInterface):
                 request.status = RequestStatus.FINISHED_LENGTH_CAPPED
                 return new_token_ids, True
         return new_token_ids, False
-
-        # is_stale is only used by the AsyncScheduler override.
-        # Append generated tokens and check for stop. Note that if
-        # a request is still being prefilled, we expect the model runner
-        # to return empty token ids for the request.
-        stopped = False
-        for num_new, output_token_id in enumerate(new_token_ids, 1):
-            request.append_output_token_ids(output_token_id)
-
-            # Check for stop and update request state.
-            # This must be called before we make the EngineCoreOutput.
-            stopped = check_stop(request, self.max_model_len)
-            if stopped:
-                del new_token_ids[num_new:]  # Trim new tokens if needed.
-                break
-        return new_token_ids, stopped
 
     def _free_encoder_inputs(self, request: Request) -> None:
         cached_encoder_input_ids = self.encoder_cache_manager.get_cached_input_ids(

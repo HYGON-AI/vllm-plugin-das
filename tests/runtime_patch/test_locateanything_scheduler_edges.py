@@ -204,7 +204,7 @@ def test_missing_generation_sampling_params_are_rejected_clearly():
     assert 'requires generation sampling parameters' in validate_sampling_params(None)
 
 
-@pytest.mark.parametrize('mode,expected', [('slow',2), ('fast',4)])
+@pytest.mark.parametrize('mode,expected', [('slow',3), ('fast',4)])
 def test_offline_sampling_callback_registration_is_fast_only(monkeypatch, mode, expected):
     from vllm_hcu.patch.locateanything import register_locateanything_api_callbacks
     monkeypatch.setenv('VLLM_HCU_LOCATEANYTHING_MODE', mode)
@@ -212,7 +212,8 @@ def test_offline_sampling_callback_registration_is_fast_only(monkeypatch, mode, 
     register_locateanything_api_callbacks(SimpleNamespace(register_callback=lambda *args,**kwargs:calls.append((args,kwargs))))
     assert len(calls) == expected
     targets = [args[1] for args,_ in calls]
-    assert ('vllm.v1.engine.input_processor' in targets) == (mode=='fast')
+    assert 'vllm.v1.engine.input_processor' in targets
+    assert any(args[0]=='locateanything.input.sampling' for args,_ in calls) == (mode=='fast')
 
 
 @pytest.mark.parametrize('family', ['locateanything','qwen2'])

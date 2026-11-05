@@ -25,8 +25,15 @@ def build_command(mode: str, model: str, max_num_seqs: int, extra: list[str]) ->
         from vllm_hcu.v1.locateanything.limits import reject_pipeline_parallelism
         parallel_parser = argparse.ArgumentParser(add_help=False, allow_abbrev=False, exit_on_error=False)
         parallel_parser.add_argument("--pipeline-parallel-size", "--pipeline_parallel_size", "-pp", type=int, default=1)
+        parallel_parser.add_argument("--tensor-parallel-size", "--tensor_parallel_size", "-tp", type=int, default=1)
+        parallel_parser.add_argument("--data-parallel-size", "--data_parallel_size", "-dp", type=int, default=1)
+        parallel_parser.add_argument("--prefill-context-parallel-size", type=int, default=1)
+        parallel_parser.add_argument("--decode-context-parallel-size", type=int, default=1)
         parallel_args, _ = parallel_parser.parse_known_args(extra)
         reject_pipeline_parallelism(parallel_args.pipeline_parallel_size)
+        for name in ('tensor_parallel_size','data_parallel_size','prefill_context_parallel_size','decode_context_parallel_size'):
+            if getattr(parallel_args,name) != 1:
+                raise ValueError(f'LocateAnything Fast requires {name}=1')
     sizes = []; size = 1
     while size < max_num_seqs:
         sizes.append(size); size *= 2

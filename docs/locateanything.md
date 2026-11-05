@@ -90,6 +90,15 @@ tokens beyond the requested budget. It disables async scheduling/chunked
 prefill and rejects unsupported streaming, multi-output and grammar requests.
 The validated target is one BF16 HCU, TP=1 and one image per request.
 
+The Fast startup contract enforces this profile in both Scheduler and worker:
+TP/PP/DP/PCP/DCP are all 1, Model Runner V2, TRITON_ATTN, unquantized BF16
+weights/KV, FULL decode graphs, no prefix caching, no LoRA, and no KV/encoder
+transfer or DBO/microbatching. Chunked/async scheduling, positive long-prefill
+thresholds and token budgets too small for a complete query are rejected.
+Global logits processors, replay/thinking/routed-expert debugging and prompt
+embeddings are not implemented by Fast. These restrictions apply to Fast;
+Slow keeps the upstream execution and sampling paths.
+
 Startup checks exercise request reordering and shrinking batches while checking
 physical token IDs, shifted RoPE positions and committed KV progress. Synthetic
 prompt lengths are bounded by the runner token budget; KV blocks cover each
@@ -123,7 +132,9 @@ python3 tools/check_patch_test_coverage.py --json
 python3 -m pytest tests/runtime_patch/test_locateanything.py \
   tests/runtime_patch/test_locateanything_warmup_budget.py \
   tests/runtime_patch/test_locateanything_limits_loading.py \
-  tests/runtime_patch/test_locateanything_scheduler_edges.py -q
+  tests/runtime_patch/test_locateanything_scheduler_edges.py \
+  tests/runtime_patch/test_locateanything_input_boundaries.py \
+  tests/runtime_patch/test_locateanything_contract_matrix.py -q
 python3 examples/locateanything/validate_fast_rules.py --model-dir /path/to/trusted/checkpoint
 ```
 
@@ -164,6 +175,28 @@ Custom per-request logits processors are unsupported. The qualified vLLM
 constructor already rejects the removed `logits_processors` field; the Fast
 contract additionally rejects nonempty fields supplied by older layouts or
 SamplingParams subclasses, instead of silently ignoring their constraints.
+
+The finalized InputProcessor request also retains detection special tokens
+with no added special-token spacing for both Slow and Fast, including ordinary
+offline `LLM.generate` calls. Normalization owns a separate SamplingParams
+struct even with `skip_clone=True`; the caller's format flags are not changed.
+Fast validates again after generation-config processing and image expansion,
+before the request reaches detokenization or EngineCore IPC. An unset output
+budget is capped to the logical context; explicit overflows are rejected in
+the client. Explicit `detokenize=False` remains a supported token-only request.
+Thinking budgets, repetition detection, trace replay, selected-token logprobs
+and custom extra args are rejected instead of being silently ignored.
+
+| Interface / option | Slow | Fast |
+| --- | --- | --- |
+| HTTP Chat and offline generation | Detection tokens retained | Detection tokens retained |
+| Dynamic batch and graph | Native vLLM | Qualified single-HCU FULL decode graph |
+| Seeded sampling, temperature, top-p/top-k, repetition penalty | Native vLLM | Original Fast six-position rules |
+| Unseeded requests | Native vLLM | Supported on the enforced single device |
+| `max_tokens=None` | Native model limit | Physical context minus six probes |
+| Streaming/session, custom processors, grammar/logprobs | Native capabilities | Rejected before IPC/admission |
+| TP/PP/DP/context parallelism, LoRA, quantized KV, prefix cache | Native capabilities where supported | Rejected at startup |
+| Direct internal EngineCore injection | Internal vLLM API | Caller must use the validated preprocessing contract |
 
 The three inline `nosemgrep: rules.hygon.python.dynamic-eval` exceptions are
 limited to these oracle calls. They do not suppress dynamic execution in the

@@ -76,6 +76,7 @@ def _patch_detection_endpoint(module, class_name, method_name):
     from vllm_hcu.patch.platform.framework_opt._common import (
         require_callable, require_class, require_signature_prefix,
     )
+    from vllm_hcu.v1.locateanything.request_contract import DETECTION_FORMAT_FLAGS
 
     target_name = f"{module.__name__}.{class_name}.{method_name}"
     cls = require_class(module, class_name, target_name)
@@ -90,10 +91,7 @@ def _patch_detection_endpoint(module, class_name, method_name):
             # BOX/REF and all coordinate tokens are special tokens. Dropping
             # them destroys detections; these flags describe the model format,
             # including when a client explicitly requests the generic defaults.
-            request = request.model_copy(update={
-                "skip_special_tokens": False,
-                "spaces_between_special_tokens": False,
-            })
+            request = request.model_copy(update={name: False for name in DETECTION_FORMAT_FLAGS})
         return await original(self, request, *args, **kwargs)
 
     preserve_detection_tokens._locateanything_detection_tokens = True
@@ -158,39 +156,69 @@ def register_locateanything_api_callbacks(coordinator):
             _patch_fast_input_sampling,
             targets=("vllm.v1.engine.input_processor.InputProcessor._validate_params",),
         )
-        coordinator.register_callback(
-            "locateanything.input.sessions", "vllm.v1.engine.input_processor",
-            _patch_fast_session_inputs,
-            targets=("vllm.v1.engine.input_processor.InputProcessor.process_inputs",),
-        )
+    coordinator.register_callback(
+        "locateanything.input.contract", "vllm.v1.engine.input_processor",
+        _patch_fast_session_inputs if locateanything_mode() == "fast" else _patch_slow_input_contract,
+        targets=("vllm.v1.engine.input_processor.InputProcessor.process_inputs",),
+    )
 
 
 def _patch_fast_session_inputs(module):
-    """Reject unsupported session flags before rendering, validation or IPC."""
+    return _patch_input_contract(module, fast=True)
+
+
+def _patch_slow_input_contract(module):
+    return _patch_input_contract(module, fast=False)
+
+
+def _patch_input_contract(module, *, fast):
+    """Finalize model-format and Fast request contracts before detokenizer/IPC."""
+    from vllm import SamplingParams
     from vllm.exceptions import VLLMValidationError
     from vllm_hcu.patch.platform.framework_opt._common import (
         PatchCompatibilityError, require_callable, require_class, require_signature_prefix,
     )
-    from vllm_hcu.v1.locateanything.request_contract import validate_session_input
+    from vllm_hcu.v1.locateanything.request_contract import (
+        finalize_input_request, validate_sampling_params, validate_session_input,
+    )
 
     target = f"{module.__name__}.InputProcessor.process_inputs"
     cls = require_class(module, "InputProcessor", target)
     original = require_callable(cls, "process_inputs", target)
-    if getattr(original, "_locateanything_fast_sessions", False):
+    mode = 'fast' if fast else 'slow'
+    previous_mode = getattr(original, "_locateanything_input_contract_mode", None)
+    if previous_mode is not None:
+        if previous_mode != mode:
+            raise PatchCompatibilityError('LocateAnything execution mode cannot change inside one process')
         return False
     signature = require_signature_prefix(original, target, ("self", "request_id", "prompt", "params", "supported_tasks"))
     if not {'resumable', 'session_id'} <= signature.parameters.keys():
         raise PatchCompatibilityError(f"required HCU patch target {target} lacks session flags")
 
     @wraps(original)
-    def reject_fast_sessions(self, *args, **kwargs):
-        if self.model_config.hf_config.model_type == "locateanything":
-            values = signature.bind(self, *args, **kwargs).arguments
+    def apply_input_contract(self, *args, **kwargs):
+        if self.model_config.hf_config.model_type != "locateanything":
+            return original(self, *args, **kwargs)
+        values = signature.bind(self, *args, **kwargs).arguments
+        params = values.get('params')
+        if fast:
             error = validate_session_input(values.get('resumable', False), values.get('session_id'))
             if error is not None:
                 raise VLLMValidationError(error)
-        return original(self, *args, **kwargs)
+            if isinstance(params, SamplingParams):
+                error = validate_sampling_params(params)
+                if error is not None:
+                    raise VLLMValidationError(error)
+        default_budget = isinstance(params, SamplingParams) and params.max_tokens is None
+        result = original(self, *args, **kwargs)
+        if isinstance(params, SamplingParams):
+            try:
+                finalize_input_request(result, self.model_config, fast=fast,
+                                       default_max_tokens=default_budget)
+            except ValueError as exc:
+                raise VLLMValidationError(str(exc)) from exc
+        return result
 
-    reject_fast_sessions._locateanything_fast_sessions = True
-    cls.process_inputs = reject_fast_sessions
+    apply_input_contract._locateanything_input_contract_mode = mode
+    cls.process_inputs = apply_input_contract
     return True
