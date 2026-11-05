@@ -4875,8 +4875,8 @@ def test_slimquant_w4a8_contiguous_experts_apply_swiglu_clamp(
         block_shape=None,
         gemm1_clamp_limit=10.0,
     )
-    experts._deepgemm_w13 = torch.empty((1, 1), dtype=torch.int8)
-    experts._deepgemm_w2 = torch.empty((1, 1), dtype=torch.int8)
+    experts._deepgemm_w13 = torch.empty((1, 8, 2), dtype=torch.int8)
+    experts._deepgemm_w2 = torch.empty((1, 4, 2), dtype=torch.int8)
     experts.moe_problem_size = lambda *_args: (1, 2, 8, 4, 1)
 
     monkeypatch.setattr(runtime, "compute_aligned_M", lambda **_kwargs: 2)
@@ -4969,8 +4969,8 @@ def test_slimquant_w4a8_batched_experts_apply_swiglu_clamp(
         use_int8_w8a8=False,
         use_fp8_w8a8=False,
     )
-    experts._deepgemm_w13 = torch.empty((1, 1), dtype=torch.int8)
-    experts._deepgemm_w2 = torch.empty((1, 1), dtype=torch.int8)
+    experts._deepgemm_w13 = torch.empty((1, 8, 2), dtype=torch.int8)
+    experts._deepgemm_w2 = torch.empty((1, 4, 2), dtype=torch.int8)
     experts._hcu_logical_n = 8
     experts._hcu_logical_k = 4
     experts.moe_problem_size = lambda *_args: (1, 2, 8, 4, 1)

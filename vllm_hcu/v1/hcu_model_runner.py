@@ -5349,6 +5349,12 @@ class GPUModelRunner(
 
         commit_installed_glm_w4a8_gemm2_generations(model)
 
+        from vllm_hcu.patch.worker.core_fix.patch_deepseek_v4_rocm_wo_a_layout import (
+            refresh_wo_a_bf16_caches,
+        )
+
+        refresh_wo_a_bf16_caches(model)
+
         # logging and validation
         counter_after_reloading = time.perf_counter()
         diff_seconds = counter_after_reloading - counter_before_reloading

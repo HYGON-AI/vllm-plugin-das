@@ -46,6 +46,11 @@ register_hcu_ci(
 )
 register_hcu_ci(
     job="accuracy-gfx938",
+    target="tests/kernels/test_gfx938_indexer_normal_layout.py",
+    est_time=60,
+)
+register_hcu_ci(
+    job="accuracy-gfx938",
     target="tests/model_executor/test_step5_upstream_delta.py::test_causal_fp8_prefill_scores_preserve_group_major_strided_output",
     est_time=60,
 )
@@ -182,6 +187,11 @@ register_hcu_ci(
 )
 register_hcu_ci(
     job="contract-hcu-gfx936",
+    target="tests/runtime_patch/test_deepseek_v4_wo_a_reload.py",
+    est_time=60,
+)
+register_hcu_ci(
+    job="contract-hcu-gfx936",
     target="tests/runtime_patch/test_glm53_native_mhc.py",
     est_time=60,
 )
@@ -213,6 +223,11 @@ register_hcu_ci(
 register_hcu_ci(
     job="contract-hcu-gfx936",
     target="tests/runtime_patch/test_kimi_k3_slimquant_ht.py",
+    est_time=60,
+)
+register_hcu_ci(
+    job="contract-hcu-gfx936",
+    target="tests/runtime_patch/test_slimquant_w4a8_fixed_deepep.py",
     est_time=60,
 )
 register_hcu_ci(
