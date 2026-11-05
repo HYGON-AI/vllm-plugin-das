@@ -601,6 +601,34 @@ def test_invalid_import_destination_does_not_reserve_a_pending_row(aux,block):
     assert state.pending._reservations=={}
 
 
+@pytest.mark.parametrize('source,destination', [([3, 4, 5], [7, 8, 9]),
+                                             ([5, 4, 3], [9, 8, 7])])
+def test_coalesced_summary_transfer_keeps_tail_and_neighbor_bytes(aux, source, destination):
+    producer, pstate, _, pworker = make_manager(aux, True)
+    consumer, dstate, _, dworker = make_manager(aux, False)
+    producer.track_source('x', [source])
+    pool = producer.pools[id(pstate)]
+    slot = pool.acquire((0, source[0]))
+    pool.tensor[:, slot].fill_(17)
+    pstate.summary.copy_((torch.arange(pstate.summary.numel()).reshape(pstate.summary.shape) % 31).to(pstate.summary.dtype))
+    dstate.summary.view(torch.uint8).fill_(211)
+    pull = SimpleNamespace(local_block_ids=[destination], num_prompt_tokens=47)
+    consumer.prepare_pull(pull)
+    plan = producer.transfer_parameters('d', SimpleNamespace(remote_tp_size=4, dsa_aux={'d': pull.dsa_aux}), [source], [destination])
+    assert len(plan[0]) == 6  # One summary run and two tail tensors per layer.
+    assert plan[2][0] == 3 * 2 * 4
+    copy_registered(pworker, dworker, plan)
+    for layer in range(2):
+        for src, dst in zip(source, destination):
+            assert torch.equal(pstate.summary[layer, src*2:(src+1)*2].view(torch.uint8),
+                               dstate.summary[layer, dst*2:(dst+1)*2].view(torch.uint8))
+        for block in set(range(13)) - set(destination):
+            assert bool((dstate.summary[layer, block*2:(block+1)*2].view(torch.uint8) == 211).all())
+        row = dstate.pending.rows[destination[-1]*2 + 1]
+        assert bool((dstate.pending_key[layer, row] == 17).all())
+        assert bool((dstate.pending_z[layer, row] == 17).all())
+
+
 def test_receiver_waits_for_prior_compute_before_submitting_rdma():
     _,worker_type=connector_lifecycle_methods()
     events=[]

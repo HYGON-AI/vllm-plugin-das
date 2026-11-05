@@ -23,6 +23,28 @@ _DTYPE_CODES = {torch.bfloat16: 1, torch.float16: 2, torch.float32: 3}
 _logger = logging.getLogger("vllm.step5.pd")
 
 
+def _coalesced_block_runs(source: list[int], target: list[int]) -> list[tuple[int, int, int]]:
+    """Merge paired adjacent blocks, preserving each source-to-target mapping."""
+    runs = []
+    direction = count = 0
+    for src, dst in zip(source, target):
+        step = src - previous_src if count else 0
+        if (count and step in (-1, 1) and dst - previous_dst == step
+                and direction in (0, step)):
+            count += 1
+            direction = step
+            if step < 0:
+                start_src, start_dst = src, dst
+        else:
+            if count:
+                runs.append((start_src, start_dst, count))
+            start_src, start_dst, count, direction = src, dst, 1, 0
+        previous_src, previous_dst = src, dst
+    if count:
+        runs.append((start_src, start_dst, count))
+    return runs
+
+
 class _ImportLease:
     def __init__(self):
         self.owner = object()
@@ -338,6 +360,8 @@ class Step5AuxManager:
         if missing:
             raise ValueError("Step5 P/D peer did not provide compatible DSA auxiliary state")
         sources, targets, sizes = [], [], []
+        groups = {}
+        summary_blocks = summary_runs = 0
         for name, indexer in self.indexers.items():
             state = indexer.state
             group = self.worker._layer_group_indices[name]
@@ -355,18 +379,32 @@ class Step5AuxManager:
             src, dst = source_groups[group], target_groups[group]
             if len(src) != len(dst) or not src:
                 raise ValueError("Step5 DSA auxiliary KV block mapping is incomplete")
+            if group not in groups:
+                groups[group] = (
+                    _coalesced_block_runs(src, dst),
+                    min(src), max(src), min(dst), max(dst),
+                )
+            runs, source_min, source_max, target_min, target_max = groups[group]
             source_capacity = summary.shape[0] // state.regions_per_page
-            if min(src + dst) < 0 or max(src) >= source_capacity or max(dst) >= capacity:
+            if (min(source_min, target_min) < 0
+                    or source_max >= source_capacity or target_max >= capacity):
                 raise ValueError("Step5 DSA auxiliary block ID exceeds its registered pool")
-            for source_block, target_block in zip(src, dst):
+            summary_blocks += len(src)
+            summary_runs += len(runs)
+            for source_block, target_block, count in runs:
                 sources.append(summary.data_ptr() + source_block * stride)
                 targets.append(remote_base + target_block * stride)
-                sizes.append(stride)
+                sizes.append(count * stride)
             row = self.pools[id(state)].get((group, src[0]))
             snapshot = self.pools[id(state)].tensor[indexer.slot, row]
             sources += [snapshot[0].data_ptr(), snapshot[1].data_ptr()]
             targets += [tail_k, tail_z]
             sizes += [tail_bytes, tail_bytes]
+        if _logger.isEnabledFor(logging.DEBUG):
+            _logger.debug(
+                "Step5 PD auxiliary transfer: request=%s blocks=%d runs=%d descriptors=%d bytes=%d",
+                request_id, summary_blocks, summary_runs, len(sizes), sum(sizes),
+            )
         return sources, targets, sizes
 
 
