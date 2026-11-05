@@ -1,6 +1,10 @@
 # SPDX-License-Identifier: Apache-2.0
 """Bitwise compatibility with vLLM's packed FP8 DS-MLA gather operator."""
 
+import os
+import subprocess
+import sys
+from pathlib import Path
 from types import FunctionType, SimpleNamespace
 
 import pytest
@@ -78,6 +82,44 @@ def test_cp_gather_bitwise(monkeypatch, block_size, lengths, strided):
         assert torch.equal(dst.view(torch.int16), expected.view(torch.int16))
         if strided:
             assert (dst_storage[:, 576:] == -123).all()
+
+
+def test_cp_gather_large_table_stride():
+    # Triton's interpreter mode must be selected before importing its JIT helpers.
+    result = subprocess.run(
+        [sys.executable, "-c",
+         "import runpy, sys; runpy.run_path(sys.argv[1])['_check_large_table_stride']()",
+         str(Path(__file__).resolve())],
+        env=dict(os.environ, TRITON_INTERPRET="1"),
+        capture_output=True, text=True, timeout=60, check=False,
+    )
+    assert result.returncode == 0, result.stdout + result.stderr
+
+
+def _check_large_table_stride():
+    from vllm_hcu.v1.attention.ops.cp_gather_fp8 import _cp_gather_fp8_flat
+
+    # Execute the real kernel with sparse CPU virtual storage, avoiding an 8 GiB
+    # GPU allocation. The int32 stride fits, but request 2's offset does not.
+    table = torch.empty_strided((3, 1), (1 << 30, 1), dtype=torch.int32)
+    table[:, 0] = torch.tensor([2, 0, 1], dtype=torch.int32)
+    cache = torch.zeros((3, 32, 656), dtype=torch.uint8)
+    cache[:, :, :512] = 0x38  # FP8 E4M3 1.0
+    cache[:, :, 512:528].view(torch.float32).copy_(
+        torch.arange(1, 4, dtype=torch.float32)[:, None, None].expand(3, 32, 4))
+    cache[:, :, 528:].view(torch.int16).copy_(
+        torch.arange(3 * 32 * 64, dtype=torch.int16).view(3, 32, 64))
+    starts = torch.arange(3, dtype=torch.int32)
+    output = torch.empty((3, 576), dtype=torch.bfloat16)
+    _cp_gather_fp8_flat[(1,)](
+        cache, output, table, starts, 3, 3, 32,
+        table.stride(0), cache.stride(0), cache.stride(1), output.stride(0), 8,
+        num_warps=2, enable_fp_fusion=False,
+    )
+    expected_nope = torch.tensor([3., 1., 2.])[:, None].expand(3, 512)
+    assert torch.equal(output[:, :512], expected_nope)
+    assert torch.equal(output[:, 512:].view(torch.int16),
+                       cache[[2, 0, 1], 0, 528:].view(torch.int16))
 
 
 @pytest.mark.multi_hcu
@@ -162,7 +204,9 @@ def test_hyv4_binding_keeps_upstream_operators():
 
     assert (HYV4FlashMLASparseImpl._forward_fp8_kv_separate_prefill_decode
             is HcuFlashMLASparseImpl._forward_fp8_kv_separate_prefill_decode)
-    proxy = HcuFlashMLASparseImpl._forward_fp8_kv_no_dedup.__globals__["ops"]
+    proxy = _with_plugin_cp_gather(
+        FlashMLASparseImpl._forward_fp8_kv_separate_prefill_decode
+    ).__globals__["ops"]
     assert proxy is not ops
     assert proxy.cp_gather_and_upconvert_fp8_kv_cache is cp_gather_and_upconvert_fp8_kv_cache
     assert (FlashMLASparseImpl._forward_fp8_kv_separate_prefill_decode
@@ -170,10 +214,12 @@ def test_hyv4_binding_keeps_upstream_operators():
 
 
 def test_existing_dedup_dispatch_is_preserved(monkeypatch):
+    from vllm.v1.attention.backends.mla.flashmla_sparse import FlashMLASparseImpl
     from vllm_hcu.v1.attention.backends.mla import workspace_dedup
     from vllm_hcu.v1.attention.backends.mla.flashmla_sparse import HcuFlashMLASparseImpl
 
-    monkeypatch.setattr(HcuFlashMLASparseImpl, "_forward_fp8_kv_no_dedup",
+    monkeypatch.setenv("VLLM_HCU_ENABLE_TRITON_CP_GATHER", "0")
+    monkeypatch.setattr(FlashMLASparseImpl, "_forward_fp8_kv_separate_prefill_decode",
                         lambda *args: "flat")
     monkeypatch.setattr(workspace_dedup, "forward_workspace_dedup",
                         lambda *args: "dedup")

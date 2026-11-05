@@ -262,6 +262,7 @@ def test_cp_gather_regressions_have_suitable_hardware_jobs() -> None:
     prefix = "tests/accuracy/test_cp_gather_fp8.py::"
     single = {
         "test_cp_gather_bitwise",
+        "test_cp_gather_large_table_stride",
         "test_prefill_binding_is_local_and_delegates_other_ops",
         "test_disabled_kernel_retains_upstream_call",
         "test_hyv4_binding_keeps_upstream_operators",

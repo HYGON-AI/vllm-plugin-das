@@ -13,7 +13,6 @@ from vllm_hcu.models.hy_v4 import attention, hcu_sparse
 from vllm_hcu.v1.attention.backends.mla import workspace_dedup, workspace_indices
 from vllm_hcu.v1.attention.backends.mla.flashmla_sparse import (
     HcuFlashMLASparseBackend,
-    HcuFlashMLASparseImpl,
 )
 
 
@@ -172,6 +171,33 @@ def _map_indices(
     return (mapped, counts) if return_valid_counts else mapped
 
 
+@pytest.mark.parametrize("triton_gather", [None, "0", "1"])
+def test_prefill_dispatch_uses_current_upstream_mapper(monkeypatch, triton_gather):
+    from vllm_hcu.v1.attention.backends.mla import flashmla_sparse as sparse
+
+    if triton_gather is None:
+        monkeypatch.delenv("VLLM_HCU_ENABLE_TRITON_CP_GATHER", raising=False)
+    else:
+        monkeypatch.setenv("VLLM_HCU_ENABLE_TRITON_CP_GATHER", triton_gather)
+    if triton_gather != "1":
+        monkeypatch.setattr(
+            sparse, "_with_plugin_cp_gather",
+            lambda *args: pytest.fail("disabled gather must call upstream directly"),
+        )
+    impl = sparse.HcuFlashMLASparseImpl.__new__(sparse.HcuFlashMLASparseImpl)
+    _, metadata, _ = _inputs(False, 2)
+    indices = torch.zeros((3, 1), dtype=torch.int32)
+    # Replace the upstream global after importing the plugin, and again between calls.
+    for version in ("first mapper", "replacement mapper"):
+        def mapper(*args, **kwargs):
+            assert args[0] is metadata.req_id_per_token
+            raise LookupError(version)
+
+        monkeypatch.setattr(core, "triton_convert_req_index_to_global_index", mapper)
+        with pytest.raises(LookupError, match=version):
+            impl._forward_fp8_kv_separate_prefill_decode(None, None, indices, metadata)
+
+
 def _attention_reference(q, kv, indices, scale, attn_sink=None, topk_length=None):
     indices = indices.view(q.shape[0], -1)
     selected = kv.view(-1, kv.shape[-1])[indices.clamp_min(0)]
@@ -189,19 +215,17 @@ def _attention_reference(q, kv, indices, scale, attn_sink=None, topk_length=None
 
 @pytest.mark.parametrize("decode", [False, True])
 @pytest.mark.parametrize("factor", [1, 2])
+@pytest.mark.parametrize("triton_gather", [False, True])
 def test_selected_hyv4_dedup_forward_preserves_sinks_and_decode(
-    monkeypatch, sink_backend, decode, factor
+    monkeypatch, sink_backend, decode, factor, triton_gather
 ):
+    monkeypatch.setenv("VLLM_HCU_ENABLE_TRITON_CP_GATHER", str(int(triton_gather)))
     monkeypatch.setattr(core, "triton_convert_req_index_to_global_index", _map_indices)
-    monkeypatch.setitem(
-        HcuFlashMLASparseImpl._forward_fp8_kv_no_dedup.__globals__,
-        "triton_convert_req_index_to_global_index", _map_indices,
-    )
     monkeypatch.setattr(
         workspace_indices, "triton_convert_req_index_to_global_index", _map_indices
     )
     monkeypatch.setattr(hcu_sparse, "flash_mla_sparse_fwd", _attention_reference)
-    monkeypatch.setenv("VLLM_HCU_HYV4_FP8_KV_DEQUANT", "1")
+    monkeypatch.setattr(hcu_sparse.henvs, "VLLM_HCU_HYV4_FP8_KV_DEQUANT", True)
     gathers, decode_widths = [], []
 
     def legacy_gather(cache, workspace, table, lengths, starts, num_reqs):

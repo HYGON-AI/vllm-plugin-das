@@ -14,7 +14,11 @@ from types import ModuleType, SimpleNamespace
 import pytest
 import torch
 
-from vllm.v1.attention.backends.mla.flashmla_sparse import FlashMLASparseBackend
+from vllm.v1.attention.backends.mla.flashmla_sparse import (
+    FlashMLASparseBackend,
+    FlashMLASparseImpl,
+    FlashMLASparseMetadataBuilder,
+)
 from vllm.v1.kv_cache_interface import KVQuantMode, MLAAttentionSpec
 from vllm_hcu.model_executor.layers import mla_runtime
 
@@ -1037,6 +1041,32 @@ def test_flashmla_impl_owns_quant_query_capability(
     assert impl.supports_quant_query_input is expected
 
 
+class _SparseMLAImplStub(FlashMLASparseImpl):
+    supports_pcp = False
+    can_return_lse_for_decode = False
+
+    def __init__(self):
+        pass
+
+    def forward_mqa(self, q, kv_cache, attn_metadata, layer):
+        return "upstream-output", None
+
+
+def _install_sparse_mla_stub(monkeypatch, impl):
+    class Backend:
+        @staticmethod
+        def get_impl_cls():
+            return impl
+
+    _install_stub(
+        monkeypatch,
+        "vllm.v1.attention.backends.mla.flashmla_sparse",
+        FlashMLASparseBackend=Backend,
+        FlashMLASparseImpl=impl,
+        FlashMLASparseMetadataBuilder=FlashMLASparseMetadataBuilder,
+    )
+
+
 def test_only_hcu_dense_and_sparse_mla_impls_advertise_pcp(
     monkeypatch,
     cpu_flashmla,
@@ -1046,25 +1076,7 @@ def test_only_hcu_dense_and_sparse_mla_impls_advertise_pcp(
     assert dense_impl.supports_pcp is True
     assert _MLACommonImplStub.supports_pcp is False
 
-    class UpstreamFlashMLASparseImpl:
-        supports_pcp = False
-        can_return_lse_for_decode = False
-
-        def forward_mqa(self, q, kv_cache, attn_metadata, layer):
-            del self, q, kv_cache, attn_metadata, layer
-            return "upstream-output", None
-
-    class UpstreamFlashMLASparseBackend:
-        @staticmethod
-        def get_impl_cls():
-            return UpstreamFlashMLASparseImpl
-
-    _install_stub(
-        monkeypatch,
-        "vllm.v1.attention.backends.mla.flashmla_sparse",
-        FlashMLASparseBackend=UpstreamFlashMLASparseBackend,
-        FlashMLASparseImpl=UpstreamFlashMLASparseImpl,
-    )
+    _install_sparse_mla_stub(monkeypatch, _SparseMLAImplStub)
     module_name = "_vllm_hcu_cpu_test_flashmla_sparse_backend"
     source = (
         Path(__file__).resolve().parents[2]
@@ -1080,8 +1092,8 @@ def test_only_hcu_dense_and_sparse_mla_impls_advertise_pcp(
     assert sparse_impl is sparse.HcuFlashMLASparseImpl
     assert sparse_impl.supports_pcp is True
     assert sparse_impl.can_return_lse_for_decode is True
-    assert UpstreamFlashMLASparseImpl.supports_pcp is False
-    assert UpstreamFlashMLASparseImpl.can_return_lse_for_decode is False
+    assert _SparseMLAImplStub.supports_pcp is False
+    assert _SparseMLAImplStub.can_return_lse_for_decode is False
 
 
 def test_hcu_sparse_mla_dcp_localizes_owned_indices_and_masks_empty_rows(
@@ -1089,18 +1101,10 @@ def test_hcu_sparse_mla_dcp_localizes_owned_indices_and_masks_empty_rows(
 ):
     calls: list[tuple[object, ...]] = []
 
-    class UpstreamFlashMLASparseImpl:
-        supports_pcp = False
-        can_return_lse_for_decode = False
-
+    class UpstreamFlashMLASparseImpl(_SparseMLAImplStub):
         def forward_mqa(self, q, kv_cache, attn_metadata, layer):
             calls.append(("upstream", q, kv_cache, attn_metadata, layer))
             return "upstream-output", None
-
-    class UpstreamFlashMLASparseBackend:
-        @staticmethod
-        def get_impl_cls():
-            return UpstreamFlashMLASparseImpl
 
     def concat_mla_q(q_nope, q_pe, output):
         output.copy_(torch.cat((q_nope, q_pe), dim=-1))
@@ -1168,12 +1172,7 @@ def test_hcu_sparse_mla_dcp_localizes_owned_indices_and_masks_empty_rows(
         calls.append(("kernel", q.clone(), cache, indices, scale, topk_length))
         return kernel_output.clone(), torch.empty(0), kernel_lse.clone()
 
-    _install_stub(
-        monkeypatch,
-        "vllm.v1.attention.backends.mla.flashmla_sparse",
-        FlashMLASparseBackend=UpstreamFlashMLASparseBackend,
-        FlashMLASparseImpl=UpstreamFlashMLASparseImpl,
-    )
+    _install_sparse_mla_stub(monkeypatch, UpstreamFlashMLASparseImpl)
     _install_stub(monkeypatch, "vllm._custom_ops", concat_mla_q=concat_mla_q)
     _install_stub(
         monkeypatch,

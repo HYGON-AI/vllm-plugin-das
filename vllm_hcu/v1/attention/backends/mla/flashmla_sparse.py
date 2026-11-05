@@ -6,6 +6,7 @@
 from __future__ import annotations
 
 import functools
+import os
 from types import FunctionType, ModuleType
 
 import torch
@@ -57,16 +58,17 @@ class HcuFlashMLASparseMetadataBuilder(FlashMLASparseMetadataBuilder):
 class HcuFlashMLASparseImpl(FlashMLASparseImpl):
     supports_pcp: bool = True
     can_return_lse_for_decode: bool = True
-    _forward_fp8_kv_no_dedup = _with_plugin_cp_gather(
-        FlashMLASparseImpl._forward_fp8_kv_separate_prefill_decode
-    )
 
     def _forward_fp8_kv_separate_prefill_decode(
         self, q, kv_c_and_k_pe_cache, topk_indices, attn_metadata
     ):
         if getattr(attn_metadata, "hcu_workspace_dedup", None) is None:
-            return self._forward_fp8_kv_no_dedup(
-                q, kv_c_and_k_pe_cache, topk_indices, attn_metadata
+            forward = super()._forward_fp8_kv_separate_prefill_decode
+            if os.environ.get("VLLM_HCU_ENABLE_TRITON_CP_GATHER", "0") != "1":
+                return forward(q, kv_c_and_k_pe_cache, topk_indices, attn_metadata)
+            # Bind at dispatch time so upstream mapper replacements remain visible.
+            return _with_plugin_cp_gather(forward.__func__)(
+                self, q, kv_c_and_k_pe_cache, topk_indices, attn_metadata
             )
         from .workspace_dedup import forward_workspace_dedup
 

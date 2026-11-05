@@ -178,6 +178,11 @@ register_hcu_ci(
 )
 register_hcu_ci(
     job="accuracy-gfx938",
+    target="tests/accuracy/test_cp_gather_fp8.py::test_cp_gather_large_table_stride",
+    est_time=30,
+)
+register_hcu_ci(
+    job="accuracy-gfx938",
     target="tests/accuracy/test_cp_gather_fp8.py::test_prefill_binding_is_local_and_delegates_other_ops",
     est_time=1,
 )

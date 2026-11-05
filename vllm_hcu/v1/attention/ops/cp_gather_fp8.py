@@ -48,7 +48,7 @@ def _cp_gather_fp8_flat(
         req = row_lo
     offset = row - tl.load(Starts + req)
     valid = row < TOTAL
-    physical = tl.load(Table + req * TABLE_STRIDE + offset // BLOCK_SIZE,
+    physical = tl.load(Table + req.to(tl.int64) * TABLE_STRIDE + offset // BLOCK_SIZE,
                        valid, other=0)
     src = (Cache + physical.to(tl.int64) * CACHE_BLOCK_STRIDE
            + (offset % BLOCK_SIZE).to(tl.int64) * CACHE_ENTRY_STRIDE)
