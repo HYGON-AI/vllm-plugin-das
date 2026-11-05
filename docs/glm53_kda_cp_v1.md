@@ -44,8 +44,16 @@ switch is set to `1`; this does not assert that every native TP configuration
 has been qualified on the current runtime.
 
 With PCP>1, the head group size comes from `prefill_context_parallel_size`.
-It must divide the positive KDA head count. Configuration admission no longer
-requires TP1/PP1/DP1/DCP1 or EP when DP=1. The runtime still requires
+It must divide the positive KDA head count. PCP execution currently requires
+**PP1 and DCP1**, with either Head switch value. PP stages need separate
+KDA/K-pool ownership handling before PP>1 can be enabled: a valid native
+partition can leave a stage with only one attention type, while the current
+worker installer requires both. DCP>1 is also rejected: `KpoolTailSpec` is a
+`SlidingWindowSpec`, not a DCP-supported full-attention/Mamba cache group.
+The replicated PCP cache adapter does not implement DCP ownership for it and
+rechecks the actual DCP size at coordinator initialization.
+
+Admission does not require TP1/DP1 or EP when DP=1. The runtime still requires
 `--enforce-eager` for GLM5Next PCP, with either Head switch value and with or
 without MTP. Current breakable graph capture records local dummy rows, while
 real PCP prefill supplies global KDA metadata; disabling torch compilation
@@ -55,8 +63,9 @@ DP>1 together with PCP>1 is rejected unless EP is enabled. The non-EP MoE
 dispatch path does not yet reconcile post-PCP-gather rows with native DP split
 sizes. These are execution-safety guards, not a hardcoded PCP8 restriction.
 Positive integer sizes and existing GLM5Next language-only/MLA/KDA checks
-remain. Joint TP*PCP ownership/reductions and additional PP/DP/DCP execution
-paths are not qualified merely by admission. Do not treat this relaxation as
+remain. Joint TP*PCP ownership/reductions and additional DP execution paths
+are not qualified merely by admission. PP>1 and DCP>1 are blocked, not merely
+unqualified. Do not treat parameterized head ownership as
 production support for new topologies; graph support remains deferred.
 
 The width parameter is exercised by CPU regressions at PCP2/4/8. Full-model
@@ -77,12 +86,14 @@ also means preserving the existing replicated-KDA PCP baseline; it does not
 turn off PCP for the rest of the model.
 
 Head ownership arithmetic itself does not require EP, eager, PP1, DP1 or DCP1.
-The runtime scope separately requires eager execution and EP for DP>1+PCP>1.
+The runtime scope separately requires PP1/DCP1, eager execution and EP for
+DP>1+PCP>1. These PCP-only restrictions do not apply when PCP=1.
 Passing either level is not full-model execution qualification.
-`validate_glm53_pcp_topology` now checks configuration sizes, and the platform
-scope validator retains other model-specific checks. Worker construction and
-engine state sizing use this same relaxed rule. The legacy `kda_cp_head_size`
-API follows the relaxed validation; head count, actual group size and rank
+`validate_glm53_pcp_topology` checks configuration sizes and rejects PP>1/DCP>1;
+the platform scope validator calls it for both target and MTP configurations,
+regardless of the Head switch. Worker CP-head construction and engine state
+sizing use the same guard through the legacy `kda_cp_head_size` API.
+Head count, actual group size and rank
 checks remain. Neither a head plan nor admitted config proves mixed-parallel
 correctness.
 

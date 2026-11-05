@@ -64,6 +64,13 @@ def apply_to_module(module: ModuleType) -> bool:
         width = bound.arguments["pcp_world_size"]
         cache_config = bound.arguments["kv_cache_config"]
         owner_width = getattr(cache_config, _OWNERSHIP, None)
+        if owner_width is not None and bound.arguments.get("dcp_world_size", 1) != 1:
+            # Recheck the actual coordinator arguments: a previously stamped
+            # cache must not bypass admission when reused with another DCP size.
+            raise ValueError(
+                "GLM5Next PCP requires DCP1: replicated KDA/K-pool cache "
+                "ownership does not support DCP for KpoolTailSpec"
+            )
         if width > 1 and owner_width is not None:
             if width != owner_width:
                 raise ValueError("GLM5Next cache ownership/PCP width mismatch")

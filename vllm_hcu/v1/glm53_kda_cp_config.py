@@ -80,8 +80,8 @@ def resolve_kda_head_parallel(vllm_config: object) -> KdaHeadParallelPlan:
     """Select native TP or opt-in PCP head ownership, independent of admission.
 
     A valid head plan alone must never be interpreted as support for mixed
-    TP/PCP. Topology admission is deliberately relaxed; execution capability
-    still depends on the model, metadata, communication and graph paths.
+    TP/PCP. Execution admission separately enforces the supported PP/DCP
+    layout and the model, metadata, communication and graph contracts.
     """
     enabled = glm53_kda_cp_head_shard_enabled(vllm_config)
     parallel = vllm_config.parallel_config
@@ -97,11 +97,12 @@ def resolve_kda_head_parallel(vllm_config: object) -> KdaHeadParallelPlan:
 
 
 def validate_glm53_pcp_topology(vllm_config: object) -> int:
-    """Validate configuration sizes, without initializing rank groups.
+    """Validate PCP sizes and reject unimplemented PP/DCP execution paths.
 
-    Do not require TP/PP/DP/DCP=1, EP or eager mode at this admission point.
-    Removing those guards does not implement or qualify the corresponding
-    ownership, communication or CUDA graph paths. Keep arithmetic validity.
+    Every current worker needs both KDA and K-pool layers, and the replicated
+    hybrid-cache adapter does not provide DCP ownership for KpoolTailSpec.
+    These constraints apply with either Head switch value. Platform scope
+    validation separately checks EP, eager execution and model capabilities.
     """
     parallel = vllm_config.parallel_config
     size = _positive_size(parallel.prefill_context_parallel_size, "PCP size")
@@ -114,11 +115,21 @@ def validate_glm53_pcp_topology(vllm_config: object) -> int:
         ("decode_context_parallel_size", "DCP"),
     ):
         _positive_size(getattr(parallel, field), f"{label} size")
+    if parallel.pipeline_parallel_size != 1:
+        raise ValueError(
+            "GLM5Next PCP requires PP1: per-stage KDA/K-pool ownership "
+            "is not implemented"
+        )
+    if parallel.decode_context_parallel_size != 1:
+        raise ValueError(
+            "GLM5Next PCP requires DCP1: the KDA/K-pool hybrid cache "
+            "does not support DCP ownership for KpoolTailSpec"
+        )
     return size
 
 
 def kda_cp_head_size(vllm_config: object) -> int | None:
-    """Legacy accessor using the relaxed configuration-size validation.
+    """Legacy accessor using the shared PCP topology validation.
 
     Engine-side state sizing and worker-side construction must use the same
     decision. Set the environment variable before launching any processes.

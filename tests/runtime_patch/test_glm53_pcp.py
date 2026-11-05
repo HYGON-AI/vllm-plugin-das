@@ -84,7 +84,7 @@ def test_glm53_rejects_unsupported_speculation(overrides):
 
 
 @pytest.mark.parametrize("overrides", [
-    {"tp": 2}, {"tp": 8}, {"pp": 2}, {"dp": 2}, {"dcp": 2},
+    {"tp": 2}, {"tp": 8}, {"dp": 2},
     {"enable_expert_parallel": False},
 ])
 @pytest.mark.parametrize("speculative", [False, True])
@@ -100,10 +100,67 @@ def test_glm53_relaxed_topology_admission(overrides, speculative):
 ])
 def test_glm53_combined_relaxed_admission_is_not_execution_qualification(architecture):
     assert _validate_hcu_pcp_scope(_config(
-        architecture=architecture, tp=2, pp=2, dp=2, dcp=2,
+        architecture=architecture, tp=2, pp=1, dp=2, dcp=1,
         enforce_eager=True, enable_expert_parallel=True,
         multimodal=False, speculative=True,
     )) is True
+
+
+@pytest.mark.parametrize("architecture", [
+    "Glm5NextForConditionalGeneration", "Glm5NextForCausalLM", "Glm5NextMTPModel",
+])
+@pytest.mark.parametrize("cp_size", [2, 4, 8])
+@pytest.mark.parametrize("head_switch", ["0", "1"])
+@pytest.mark.parametrize("speculative", [False, True])
+@pytest.mark.parametrize("overrides, message", [
+    ({"pp": 2}, "GLM5Next PCP requires PP1"),
+    ({"dcp": 2}, "GLM5Next PCP requires DCP1"),
+])
+def test_glm53_rejects_unimplemented_pp_and_dcp_paths(
+    monkeypatch, architecture, cp_size, head_switch, speculative, overrides, message,
+):
+    monkeypatch.setenv("VLLM_HCU_GLM53_KDA_CP_HEAD_SHARD", head_switch)
+    cfg = _config(
+        architecture=architecture, pcp=cp_size, speculative=speculative,
+        enforce_eager=True, multimodal=False, **overrides,
+    )
+    with pytest.raises(ValueError, match=message):
+        _validate_hcu_pcp_scope(cfg)
+
+
+@pytest.mark.parametrize("head_switch", ["0", "1"])
+def test_native_pp_partition_can_leave_only_one_attention_type(monkeypatch, head_switch):
+    from vllm.distributed import parallel_state
+    from vllm.model_executor.models.utils import make_layers
+
+    # Exercise the real partitioner with CPU-only attention markers: no weights
+    # or distributed group is needed to demonstrate the per-stage contract gap.
+    class KdaLayer(torch.nn.Module):
+        pass
+
+    class KpoolLayer(torch.nn.Module):
+        pass
+
+    def layer_fn(prefix):
+        index = int(prefix.rsplit(".", 1)[1])
+        return (KdaLayer if index == 0 else KpoolLayer)()
+
+    monkeypatch.setenv("VLLM_PP_LAYER_PARTITION", "1,1")
+    monkeypatch.setenv("VLLM_HCU_GLM53_KDA_CP_HEAD_SHARD", head_switch)
+    stage_counts = []
+    for rank in range(2):
+        monkeypatch.setattr(parallel_state, "get_pp_group", lambda: SimpleNamespace(
+            world_size=2, rank_in_group=rank,
+        ))
+        start, end, layers = make_layers(2, layer_fn, "model.layers")
+        assert (start, end) == (rank, rank + 1)
+        counts = [sum(isinstance(layer, kind) for layer in layers)
+                  for kind in (KdaLayer, KpoolLayer)]
+        stage_counts.append(counts)
+        assert not all(counts)  # install_glm53_pcp currently requires both.
+        with pytest.raises(ValueError, match="GLM5Next PCP requires PP1"):
+            _validate_hcu_pcp_scope(_config(pp=2))
+    assert stage_counts == [[1, 0], [0, 1]]
 
 
 @pytest.mark.parametrize("architecture", [
@@ -162,9 +219,11 @@ def test_glm53_guarded_eager_admission_does_not_hardcode_pcp8(
 
 
 @pytest.mark.parametrize("tp_size", [1, 2, 4, 8])
-def test_glm53_pcp1_does_not_apply_pcp_restrictions(tp_size):
+@pytest.mark.parametrize("overrides", [{}, {"pp": 2}, {"dcp": 2}])
+def test_glm53_pcp1_does_not_apply_pcp_restrictions(tp_size, overrides):
     assert _validate_hcu_pcp_scope(_config(
         tp=tp_size, pcp=1, enforce_eager=False, enable_expert_parallel=False,
+        **overrides,
     )) is False
 
 
@@ -408,3 +467,84 @@ def test_non_glm_block_size_resolution_does_not_require_model_fields(hybrid_cach
     coordinator, cache, _, _ = hybrid_cache_patch
     patch_glm53_pcp_kv_cache.mark_glm53_cache_ownership(cache, SimpleNamespace())
     assert coordinator(cache, 4).pcp_world_size == 4
+
+
+def _real_glm53_hybrid_cache():
+    """Use native specs/registry/managers, not the name-only fixture above."""
+    return kv_cache_interface.KVCacheConfig(
+        num_blocks=16, kv_cache_tensors=[], kv_cache_groups=[
+            kv_cache_interface.KVCacheGroupSpec(
+                layer_names=["model.layers.0.linear_attn"],
+                kv_cache_spec=kv_cache_interface.MambaSpec(
+                    block_size=16, shapes=((2, 2),), dtypes=(torch.float32,),
+                ),
+            ),
+            kv_cache_interface.KVCacheGroupSpec(
+                layer_names=["model.layers.1.self_attn.indexer.tail_cache"],
+                kv_cache_spec=kv_cache_interface.KpoolTailSpec(
+                    block_size=16, num_kv_heads=1, head_size=2,
+                    dtype=torch.float32, sliding_window=16,
+                ),
+            ),
+        ],
+    )
+
+
+@pytest.fixture
+def real_hybrid_coordinator(monkeypatch):
+    from vllm.v1.core import kv_cache_coordinator
+
+    cls = kv_cache_coordinator.HybridKVCacheCoordinator
+    # Restore the class's original attribute after the test, including when
+    # another test or platform initialization had already installed the patch.
+    monkeypatch.setattr(cls, "__init__", cls.__init__)
+    patch_glm53_pcp_kv_cache.apply_to_module(kv_cache_coordinator)
+
+    def initialize(cache, pcp=2, dcp=1):
+        return cls(
+            kv_cache_config=cache, max_model_len=128, max_in_flight_tokens=32,
+            use_eagle=False, enable_caching=True, enable_kv_cache_events=False,
+            dcp_world_size=dcp, pcp_world_size=pcp,
+            scheduler_block_size=16, hash_block_size=16,
+        )
+
+    return initialize
+
+
+@pytest.mark.parametrize("head_switch", ["0", "1"])
+@pytest.mark.parametrize("cp_size", [2, 4, 8])
+def test_real_glm53_cache_initializes_only_with_dcp1(
+    monkeypatch, real_hybrid_coordinator, head_switch, cp_size,
+):
+    monkeypatch.setenv("VLLM_HCU_GLM53_KDA_CP_HEAD_SHARD", head_switch)
+    cache = _real_glm53_hybrid_cache()
+    tail = cache.kv_cache_groups[1].kv_cache_spec
+    assert isinstance(tail, kv_cache_interface.SlidingWindowSpec)
+    assert not isinstance(tail, kv_cache_interface.FullAttentionSpec)
+    patch_glm53_pcp_kv_cache.mark_glm53_cache_ownership(cache, _config(pcp=cp_size))
+    coordinator = real_hybrid_coordinator(cache, pcp=cp_size)
+    assert coordinator.dcp_world_size == 1
+    assert len(coordinator.single_type_managers) == 2
+    assert all(manager.pcp_world_size == 1 for manager in coordinator.single_type_managers)
+    with pytest.raises(ValueError, match="GLM5Next PCP requires DCP1"):
+        real_hybrid_coordinator(cache, pcp=cp_size, dcp=2)
+
+
+@pytest.mark.parametrize("head_switch", ["0", "1"])
+def test_real_glm53_dcp_cache_rejected_before_ownership_stamp(monkeypatch, head_switch):
+    monkeypatch.setenv("VLLM_HCU_GLM53_KDA_CP_HEAD_SHARD", head_switch)
+    cache = _real_glm53_hybrid_cache()
+    with pytest.raises(ValueError, match="GLM5Next PCP requires DCP1"):
+        patch_glm53_pcp_kv_cache.mark_glm53_cache_ownership(cache, _config(pcp=2, dcp=2))
+    assert not hasattr(cache, patch_glm53_pcp_kv_cache._OWNERSHIP)
+
+
+def test_unmarked_full_attention_mamba_dcp_keeps_native_coordinator(real_hybrid_coordinator):
+    cache = _real_glm53_hybrid_cache()
+    cache.kv_cache_groups[1].kv_cache_spec = kv_cache_interface.FullAttentionSpec(
+        block_size=16, num_kv_heads=1, head_size=2, dtype=torch.float32,
+    )
+    # This is not our GLM PCP ownership contract. The native DCP-capable layout
+    # must still initialize; do not turn the model-specific guard into a ban.
+    coordinator = real_hybrid_coordinator(cache, pcp=1, dcp=2)
+    assert coordinator.dcp_world_size == 2

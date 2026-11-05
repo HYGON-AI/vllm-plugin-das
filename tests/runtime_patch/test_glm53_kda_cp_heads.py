@@ -100,8 +100,7 @@ def test_cp_plan_selects_one_head_group_not_tp_times_cp(monkeypatch, tp_size, cp
 
 
 @pytest.mark.parametrize("override", [
-    {"tensor_parallel_size": 2}, {"pipeline_parallel_size": 2},
-    {"data_parallel_size": 2}, {"decode_context_parallel_size": 2},
+    {"tensor_parallel_size": 2}, {"data_parallel_size": 2},
     {"enable_expert_parallel": False},
 ])
 def test_relaxed_topology_admission_keeps_pcp_head_plan(monkeypatch, override):
@@ -119,6 +118,20 @@ def test_head_plan_does_not_depend_on_graph_admission(monkeypatch):
     cfg.model_config.enforce_eager = False
     assert resolve_kda_head_parallel(cfg) == KdaHeadParallelPlan("pcp", 8)
     assert kda_cp_head_size(cfg) == 8
+
+
+@pytest.mark.parametrize("override, message", [
+    ({"pipeline_parallel_size": 2}, "requires PP1"),
+    ({"decode_context_parallel_size": 2}, "requires DCP1"),
+])
+def test_head_plan_does_not_admit_unimplemented_pp_or_dcp(monkeypatch, override, message):
+    monkeypatch.setenv(KDA_CP_HEAD_ENV, "1")
+    cfg = _config(**override)
+    assert resolve_kda_head_parallel(cfg) == KdaHeadParallelPlan("pcp", 8)
+    with pytest.raises(ValueError, match=message):
+        validate_glm53_pcp_topology(cfg)
+    with pytest.raises(ValueError, match=message):
+        kda_cp_head_size(cfg)
 
 
 @pytest.mark.parametrize("tp_size", [1, 2, 4, 8])
@@ -354,12 +367,15 @@ def test_engine_state_shape_uses_cp_without_initialized_groups(monkeypatch, cp_s
     )) == "original"
 
 
-@pytest.mark.parametrize("override", [
-    {"tensor_parallel_size": 2}, {"pipeline_parallel_size": 2},
-    {"data_parallel_size": 2}, {"decode_context_parallel_size": 2},
-    {"enable_expert_parallel": False}, {"enforce_eager": False},
+@pytest.mark.parametrize("override, error", [
+    ({"tensor_parallel_size": 2}, None),
+    ({"data_parallel_size": 2}, None),
+    ({"enable_expert_parallel": False}, None),
+    ({"enforce_eager": False}, None),
+    ({"pipeline_parallel_size": 2}, "requires PP1"),
+    ({"decode_context_parallel_size": 2}, "requires DCP1"),
 ])
-def test_engine_and_worker_use_relaxed_admission(monkeypatch, override):
+def test_engine_and_worker_use_shared_topology_guard(monkeypatch, override, error):
     from vllm_hcu.patch.platform.framework_opt import patch_glm53_kda_cp_state as engine
     from vllm_hcu.patch.worker.core_fix import patch_glm53_kda_cp as worker
     from vllm_hcu.model_executor.layers import glm53_kda_cp as cp
@@ -390,6 +406,12 @@ def test_engine_and_worker_use_relaxed_admission(monkeypatch, override):
     monkeypatch.setenv(KDA_CP_HEAD_ENV, "1")
     cfg = _config(**{k: v for k, v in override.items() if k != "enforce_eager"})
     cfg.model_config.enforce_eager = override.get("enforce_eager", True)
+    if error is not None:
+        with pytest.raises(ValueError, match=error):
+            Model.get_mamba_state_shape_from_config(cfg)
+        with pytest.raises(ValueError, match=error):
+            Layer(None, cfg)
+        return
     from vllm.model_executor.layers.mamba.mamba_utils import MambaStateShapeCalculator
 
     expected = MambaStateShapeCalculator.kda_state_shape(
