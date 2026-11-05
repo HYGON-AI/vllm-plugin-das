@@ -232,16 +232,14 @@ class HYV4VisionTransformer(HunYuanVisionTransformer):
                 )
                 for length in lengths
             ]
+            image_states = hidden_states.split(lengths, dim=1)
+            del hidden_states
             for layer in self.layers:
-                hidden_states = torch.cat(
-                    [
-                        layer(item, *meta)
-                        for item, meta in zip(
-                            hidden_states.split(lengths, dim=1), metadata
-                        )
-                    ],
-                    dim=1,
-                )
+                # Keep image tensors separate between layers. Repacking them
+                # copies the whole activation without changing any computation.
+                image_states = [
+                    layer(item, *meta) for item, meta in zip(image_states, metadata)
+                ]
         else:
             cu_seqlens = torch.tensor(
                 [0, *accumulate(lengths)], dtype=torch.int32, device=self.device
@@ -250,9 +248,10 @@ class HYV4VisionTransformer(HunYuanVisionTransformer):
             max_seqlen = torch.tensor(max(lengths), dtype=torch.int32)
             for layer in self.layers:
                 hidden_states = layer(hidden_states, cu_seqlens, max_seqlen)
+            image_states = hidden_states.split(lengths, dim=1)
         return [
             self.perceive(item.contiguous(), size=grid[1:]).squeeze(0)
-            for grid, item in zip(grid_thw, hidden_states.split(lengths, dim=1))
+            for grid, item in zip(grid_thw, image_states)
         ]
 
 
