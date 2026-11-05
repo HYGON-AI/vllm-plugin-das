@@ -109,11 +109,11 @@ def is_glm_moe_dsa_model(hf_config: Any) -> bool:
 # from the model depth and from literal indexes written in the targets.
 _MTP_BLOCK_MARKER = ".mtp_block."
 _LAYER_INDEX_IN_TARGET = re.compile(r"layers\\*\.(\d+)")
-# Class name of the fused expert module that class-name targets are tried on.
+# Class name of the fused expert module that detection tries class-name targets on.
 _ROUTED_EXPERTS_CLASS = "RoutedExperts"
-# MRO entries that never select the GLM method: Linear targets stay on the
-# parent method, and Module/object are only ancestors of every layer.
-_GENERIC_CLASS_TARGETS = frozenset({"Linear", "Module", "object"})
+# Class names skipped while walking a layer's MRO at selection time: Linear
+# targets stay on the parent method, and Module/object are ancestors of every layer.
+_GENERIC_CLASS_NAMES = frozenset({"Linear", "Module", "object"})
 
 
 def _parse_quant_args(value: Any) -> Any:
@@ -124,18 +124,23 @@ def _parse_quant_args(value: Any) -> Any:
     ``strategy`` from ``group_size``, lower-cases enum strings and rejects
     unsupported combinations. Auto-detection reads the raw HF dict before that
     parse, so it uses the same parser instead of keeping a copy of those rules.
-    A dict the schema rejects cannot be loaded natively either, so it selects
-    nothing here and the parent reports the error. Arguments that are already
-    parsed pass through unchanged.
+    Anything native cannot parse either (a dict the schema rejects, or any other
+    JSON value) selects nothing here and the parent reports the error. ``None``
+    and arguments that are already parsed pass through unchanged.
     """
-    if not isinstance(value, dict):
-        return value
-    from compressed_tensors.quantization import QuantizationArgs
+    if isinstance(value, dict):
+        from compressed_tensors.quantization import QuantizationArgs
 
-    try:
-        return QuantizationArgs.model_validate(value)
-    except (TypeError, ValueError):
+        try:
+            return QuantizationArgs.model_validate(value)
+        except (TypeError, ValueError, NotImplementedError):
+            # compressed-tensors validators raise TypeError on odd value types
+            # and NotImplementedError for unsupported float widths, besides the
+            # ValueError that pydantic turns into a ValidationError.
+            return None
+    if isinstance(value, (list, tuple, str, bytes, int, float)):
         return None
+    return value
 
 
 def _quant_field(value: Any, name: str, default: Any = None) -> Any:
@@ -170,11 +175,17 @@ def _is_channel_int4_w4a8_scheme(
     )
 
 
-def _is_channel_int8_scheme(weights: Any, activations: Any) -> bool:
-    # Native dynamic-token W8A8 only supports symmetric weights (input
-    # quantization may be either), so such a group cannot serve the linears.
+def _is_channel_int8_scheme(weights: Any, activations: Any, group_format: Any) -> bool:
+    from vllm.model_executor.layers.quantization.compressed_tensors.utils import (
+        is_activation_quantization_format,
+    )
+
+    # Native only builds dynamic-token W8A8 for an activation-quantization
+    # format and for symmetric weights (input quantization may be either), so
+    # a group failing either cannot serve the linears.
     return (
-        _quant_field(weights, "num_bits", 8) == 8
+        is_activation_quantization_format(getattr(group_format, "value", group_format))
+        and _quant_field(weights, "num_bits", 8) == 8
         and _quant_field(weights, "symmetric", True) is True
         and _quant_field(weights, "strategy") == "channel"
         and _quant_field(weights, "type", "int") == "int"
@@ -328,7 +339,7 @@ def is_glm_channel_int4_w4a8(
         group_format = group.get("format") or hf_quant_cfg.get("format")
         if _is_channel_int4_w4a8_scheme(weights, activations, group_format):
             int4_targets.extend(_group_targets(group))
-        if _is_channel_int8_scheme(weights, activations):
+        if _is_channel_int8_scheme(weights, activations, group_format):
             has_int8 = True
     if not has_int8 or not int4_targets:
         return False
@@ -395,15 +406,17 @@ def _match_target_by_name(
 def _match_target_by_class(layer: Any, targets: Any) -> str | None:
     """Match ``RoutedExperts`` and other non-generic class targets in target order.
 
-    Class names use the same rule as detection and as native matching, so a
-    literal class name, a substring and a ``re:`` pattern all resolve alike.
+    Each class name is compared with a target by the rule detection and native
+    matching share, so a literal name, a substring and a ``re:`` pattern all
+    resolve alike. Native only tries the concrete class; this also tries the
+    ancestors, so a renamed ``RoutedExperts`` subclass still resolves.
     """
     if layer is None:
         return None
     target_list = [target for target in targets if isinstance(target, str)]
     for cls in type(layer).__mro__:
         name = cls.__name__
-        if name in _GENERIC_CLASS_TARGETS:
+        if name in _GENERIC_CLASS_NAMES:
             continue
         for target in target_list:
             if _class_name_matches_target(name, target):
@@ -473,17 +486,18 @@ def require_unfused_shared_experts(layer: Any, prefix: str) -> None:
     """Fail before weights are allocated if shared experts were fused into ``layer``.
 
     The model keeps them separate for this config (``supports_fused_shared_experts``
-    is False), so this only catches a path that fuses them anyway. The checkpoint
-    stores them as INT8 or unquantized linears, which cannot share the routed
-    experts' tensors, and selection never sees those extra slots.
+    is False), so this only fires when another path fuses them anyway. The
+    checkpoint stores them as INT8 or unquantized linears, which cannot share the
+    routed experts' tensors, and selection never sees those extra slots.
     """
     manager = getattr(layer, "expert_map_manager", None)
     fused = int(getattr(manager, "num_fused_shared_experts", 0) or 0)
     if fused > 0:
         raise NotImplementedError(
-            "GLM channel INT4 W4A8 does not support fused shared experts, but "
+            "GLM channel INT4 W4A8 cannot hold fused shared experts, but "
             f"{prefix!r} fuses {fused} of them into its routed expert tensors. "
-            "Keep them separate (VLLM_ROCM_USE_AITER_FUSION_SHARED_EXPERTS=0)."
+            "The model should have kept them separate "
+            "(supports_fused_shared_experts is False for this config)."
         )
 
 
@@ -522,8 +536,11 @@ def _expert_projection_schemes(
             return [scheme_map.get(matched)] * 3
 
     # Parent dispatch can add RoutedExperts -> Linear to this shared config.
-    # Match projection names first and use the class only for missing names.
-    class_target = _match_target_by_class(layer, scheme_map)
+    # Match projection names first and use the class only for missing names,
+    # so the class match is only computed when some projection needs it.
+    class_target = (
+        _match_target_by_class(layer, scheme_map) if None in proj_targets else None
+    )
     return [
         scheme_map.get(target if target is not None else class_target)
         for target in proj_targets

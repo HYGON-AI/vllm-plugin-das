@@ -264,9 +264,10 @@ class GlmMoeDsaW4A8MoEMethod(SlimQuantW4A8Int8AiterMoEMethod):
 class GlmMoeDsaChannelW4A8Config(CompressedTensorsConfig):
     """GLM MoE DSA mixed quant: INT4 experts, original INT8 for other linears."""
 
-    # Read by the DeepSeek-family model code when it decides whether
-    # VLLM_ROCM_USE_AITER_FUSION_SHARED_EXPERTS applies, as native vLLM does
-    # per quantization config. False keeps the shared experts separate.
+    # Plugin-only switch, read by the DeepSeek-family model code when it decides
+    # whether VLLM_ROCM_USE_AITER_FUSION_SHARED_EXPERTS applies. Native vLLM makes
+    # the same per-config decision by config type, in
+    # is_shared_expert_quant_fse_compatible. False keeps the shared experts separate.
     supports_fused_shared_experts = False
 
     @classmethod

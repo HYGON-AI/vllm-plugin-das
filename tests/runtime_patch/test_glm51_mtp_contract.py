@@ -34,6 +34,7 @@ def mtp_module(monkeypatch: pytest.MonkeyPatch) -> ModuleType:
     deepseek_v2.DeepseekV2MoE = type("DeepseekV2MoE", (), {})
     deepseek_v2._try_load_quantized_indexer_wk = lambda *args, **kwargs: False
     deepseek_v2.get_spec_layer_idx_from_weight_name = lambda *args, **kwargs: None
+    deepseek_v2.is_fused_shared_experts_enabled = lambda *args, **kwargs: False
     monkeypatch.setitem(sys.modules, deepseek_v2.__name__, deepseek_v2)
 
     lightly_cp_utils = ModuleType("vllm_hcu.v1.attention.lightly_cp_utils")

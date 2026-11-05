@@ -454,6 +454,67 @@ def test_int8_linear_weights_must_be_symmetric_like_native(symmetric) -> None:
 
 
 @pytest.mark.parametrize(
+    "group_format",
+    ["int-quantized", "naive-quantized", "float-quantized", "pack-quantized", _OMIT],
+)
+@pytest.mark.parametrize("top_format", ["int-quantized", "pack-quantized", _OMIT])
+def test_int8_linear_group_needs_an_activation_quantization_format(
+    group_format, top_format
+) -> None:
+    """Native builds dynamic-token W8A8 only for activation-quantization formats."""
+    from vllm.model_executor.layers.quantization.compressed_tensors.utils import (
+        is_activation_quantization_format,
+    )
+
+    quant = _quant_config()
+    group = quant["config_groups"]["group_int8"]
+    for owner, value, key in ((group, group_format, "format"), (quant, top_format, "format")):
+        if value is _OMIT:
+            owner.pop(key, None)
+        else:
+            owner[key] = value
+    effective = top_format if group_format is _OMIT else group_format
+    expected = is_activation_quantization_format(None if effective is _OMIT else effective)
+    assert is_glm_channel_int4_w4a8(quant, _glm_hf_config()) is expected
+    assert GlmMoeDsaW4A8Facade.override_quantization_method(
+        quant, None, _glm_hf_config()
+    ) == ("glm_moe_dsa_w4a8" if expected else None)
+
+
+@pytest.mark.parametrize("value", [["token"], "channel", 4, 1.5, True, b"channel"])
+def test_non_dict_json_values_are_rejected_not_passed_through(value) -> None:
+    from vllm_hcu.model_executor.layers.quantization.glm_channel_int4 import (
+        _parse_quant_args,
+    )
+
+    assert _parse_quant_args(value) is None
+
+
+def test_none_and_already_parsed_arguments_pass_through_the_parser() -> None:
+    from vllm_hcu.model_executor.layers.quantization.glm_channel_int4 import (
+        _parse_quant_args,
+    )
+
+    parsed = SimpleNamespace(num_bits=4)
+    assert _parse_quant_args(parsed) is parsed
+    assert _parse_quant_args(None) is None
+
+
+@pytest.mark.parametrize(
+    "error", [TypeError("odd value"), NotImplementedError("float width")]
+)
+def test_schema_errors_beyond_value_error_select_nothing(monkeypatch, error) -> None:
+    """compressed-tensors validators can raise these as well as ValueError."""
+    from compressed_tensors.quantization import QuantizationArgs
+
+    def fail(value):
+        raise error
+
+    monkeypatch.setattr(QuantizationArgs, "model_validate", staticmethod(fail))
+    assert is_glm_channel_int4_w4a8(_quant_config(), _glm_hf_config()) is False
+
+
+@pytest.mark.parametrize(
     "architecture",
     ["Glm5NextForCausalLM", "Glm5NextForConditionalGeneration", "Glm5NextMTPModel"],
 )
@@ -1278,6 +1339,37 @@ def test_class_targets_also_match_ancestor_class_names() -> None:
     assert _match_target_by_class(layer, {"Linear": None, "re:^Other$": None}) is None
 
 
+def test_class_target_is_only_resolved_for_projections_without_a_path_target(
+    monkeypatch,
+) -> None:
+    from vllm.model_executor.layers.fused_moe import RoutedExperts
+    from vllm_hcu.model_executor.layers.quantization import glm_channel_int4
+
+    calls = []
+    real = glm_channel_int4._match_target_by_class
+
+    def record(*args):
+        calls.append(args)
+        return real(*args)
+
+    monkeypatch.setattr(glm_channel_int4, "_match_target_by_class", record)
+    layer = RoutedExperts.__new__(RoutedExperts)
+    prefix = "model.layers.3.mlp.experts"
+    # Every projection matches a path target, so the class is never consulted.
+    assert glm_channel_int4.routed_expert_uses_glm_channel_int4(
+        _selection_config(), layer, prefix
+    ) is True
+    assert calls == []
+    # No path target matches, so the class target decides, once.
+    config = _selection_config(
+        target_scheme_map={"RoutedExperts": _int4_scheme(), "Linear": _int8_scheme()}
+    )
+    assert glm_channel_int4.routed_expert_uses_glm_channel_int4(
+        config, layer, prefix
+    ) is True
+    assert len(calls) == 1
+
+
 @pytest.mark.parametrize("kind", ["target", "ignore"])
 @pytest.mark.parametrize("expert_id", [0, 1])
 @pytest.mark.parametrize("projection_regex", [False, True])
@@ -1548,7 +1640,7 @@ def test_layers_that_fused_shared_experts_are_rejected_on_every_branch(
         message = str(error.value)
         assert repr(prefix) in message
         assert f"fuses {fused} of them" in message
-        assert "VLLM_ROCM_USE_AITER_FUSION_SHARED_EXPERTS=0" in message
+        assert "supports_fused_shared_experts" in message
 
 
 def test_fused_shared_experts_are_rejected_for_mtp_prefixes(
@@ -1605,8 +1697,9 @@ def test_glm_config_does_not_support_fused_shared_experts() -> None:
     )
 
     assert GlmMoeDsaChannelW4A8Config.supports_fused_shared_experts is False
-    # Every other config keeps today's behaviour: the gate defaults to True.
-    assert getattr(CompressedTensorsConfig, "supports_fused_shared_experts", True)
+    # Every other config keeps today's behaviour: the plain config still fuses.
+    gate, _ = _load_fused_shared_experts_gate(True)
+    assert gate(CompressedTensorsConfig.__new__(CompressedTensorsConfig)) is True
 
 
 @pytest.mark.parametrize("flag", [False, True])
@@ -1663,13 +1756,12 @@ def _fusion_flag_uses(filename):
 def test_model_code_decides_shared_expert_fusion_only_through_the_gate() -> None:
     """The model, its loader and the MTP loader must agree on one decision."""
     v2, mtp = _fusion_flag_uses("deepseek_v2.py"), _fusion_flag_uses("deepseek_mtp.py")
+    # The invariant: the AITER flag is read in the gate and nowhere else here.
     assert v2.raw == ["is_fused_shared_experts_enabled"]
-    assert sorted(v2.gated) == [
-        "DeepseekV2MoE.__init__",
-        "DeepseekV2Model.load_weights",
-    ]
     assert mtp.raw == []
-    assert mtp.gated == ["DeepSeekMTP.load_weights"]
+    # Each decision point goes through the gate (a new consumer may be added).
+    assert {"DeepseekV2MoE.__init__", "DeepseekV2Model.load_weights"} <= set(v2.gated)
+    assert "DeepSeekMTP.load_weights" in mtp.gated
 
 
 @pytest.mark.parametrize(
