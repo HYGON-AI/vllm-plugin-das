@@ -1635,6 +1635,11 @@ class DeepseekV2Model(nn.Module):
         return hidden_states
 
     def load_weights(self, weights: Iterable[tuple[str, torch.Tensor]]) -> set[str]:
+        from vllm_hcu.model_executor.layers.quantization.compressed_tensors_w4a8 import (
+            checkpoint_weights,
+        )
+
+        weights = checkpoint_weights(self, weights)
         rocm_aiter_moe_shared_expert_enabled = (
             rocm_aiter_ops.is_fusion_moe_shared_experts_enabled()
         )

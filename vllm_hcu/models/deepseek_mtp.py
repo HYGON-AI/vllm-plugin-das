@@ -101,9 +101,10 @@ class DeepSeekMultiTokenPredictorLayer(nn.Module):
         self.shared_head = SharedHead(
             config=config, prefix=prefix, quant_config=quant_config
         )
+        decoder_prefix = "model.decoder" if config.model_type == "glm_moe_dsa" else prefix
         self.mtp_block = DeepseekV2DecoderLayer(
             vllm_config,
-            prefix,
+            decoder_prefix,
             config=self.config,
             topk_indices_buffer=topk_indices_buffer,
         )
@@ -312,6 +313,11 @@ class DeepSeekMTP(nn.Module, DeepseekV2MixtureOfExperts, SupportsPP):
         return self.model.compute_logits(hidden_states, spec_step_idx)
 
     def load_weights(self, weights: Iterable[tuple[str, torch.Tensor]]) -> set[str]:
+        from vllm_hcu.model_executor.layers.quantization.compressed_tensors_w4a8 import (
+            checkpoint_weights,
+        )
+
+        weights = checkpoint_weights(self, weights)
         rocm_aiter_moe_shared_expert_enabled = (
             rocm_aiter_ops.is_fusion_moe_shared_experts_enabled()
         )

@@ -77,6 +77,38 @@ def apply_to_module(module: ModuleType) -> bool:
     def supports_quanted_inputs(self) -> bool:
         return True
 
+    config_class = require_class(
+        compressed,
+        "CompressedTensorsConfig",
+        TARGET_MODULE + ".CompressedTensorsConfig",
+    )
+    get_method = require_callable(
+        config_class,
+        "get_quant_method",
+        TARGET_MODULE + ".CompressedTensorsConfig.get_quant_method",
+    )
+
+    @functools.wraps(get_method)
+    def hcu_get_quant_method(self, layer, prefix):
+        from vllm.model_executor.layers.fused_moe import RoutedExperts
+
+        if isinstance(layer, RoutedExperts):
+            from vllm_hcu.model_executor.layers.quantization.compressed_tensors_w4a8 import (
+                select_method,
+            )
+
+            method = select_method(self, layer, prefix)
+            if method is not None:
+                return method
+        return get_method(self, layer, prefix)
+
+    require_exact_signature(
+        get_method,
+        TARGET_MODULE + ".CompressedTensorsConfig.get_quant_method",
+        positional=("self", "layer", "prefix"),
+    )
+    config_class.get_quant_method = hcu_get_quant_method
+
     setattr(hcu_apply, _WRAPPER_MARKER, True)
     setattr(method_class, "_vllm_hcu_original_apply", original)
     setattr(method_class, "apply", hcu_apply)

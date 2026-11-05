@@ -4166,9 +4166,14 @@ def test_compressed_linear_only_forwards_supported_prequantized_input():
         def apply(self, layer, x, bias=None):
             return layer.scheme.apply_weights(layer, x, bias=bias)
 
+    class CompressedTensorsConfig:
+        def get_quant_method(self, layer, prefix):
+            return None
+
     module = _module(
         patch_compressed_tensors.TARGET_MODULE,
         CompressedTensorsLinearMethod=CompressedTensorsLinearMethod,
+        CompressedTensorsConfig=CompressedTensorsConfig,
     )
     patch_compressed_tensors.apply_to_module(module)
     calls: list[dict[str, object]] = []
