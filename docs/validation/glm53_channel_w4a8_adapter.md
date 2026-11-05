@@ -252,8 +252,10 @@ Run: `run/20261105_160550/20261105_161204`, report:
 MTP matches runtime layer names against canonical checkpoint names using
 vLLM's original scheme matcher. This preserves first-match ordering without
 rewriting user regexes, including equivalent expressions using `[.]`, groups,
-or hexadecimal escapes. Rules that match only the actual MTP name retain
-override priority; both canonical and actual-prefix ignore rules are honored.
+or hexadecimal escapes. Rules specific to the MTP layers, excluding target
+backbone layers, retain override priority; both canonical and actual-prefix
+ignore rules are honored. Without an applicable decoder rule, matching uses
+the original runtime name and preserves native first-match ordering.
 The target model's config and other MTP layers remain unchanged.
 
 CT W4A8 post-load refreshes cached shuffled scales on the previous persistent
@@ -317,3 +319,32 @@ Validation on nmz105:
 Artifacts: `run/20261105_pr299_graph_regex_review/` in the validation project.
 These checks establish reload/reference and matching behavior, not a new
 full-model accuracy result or an end-to-end AITER kernel validation.
+
+## Kernel-format reload and native matching compatibility (2026-11-05)
+
+Captured derived scales are now also refreshed after V1/V2 runner reloads and
+after a target/draft weight transfer completes. These paths can update kernel
+Parameters directly without quantization post-load. Refresh happens after all
+parameter writes and before graph replay. Source version changes reuse the
+existing derived allocation; they no longer create successive cache entries
+that could displace graph-owned scales. Writes through `.data` are refreshed
+as well, without relying on `_version` advancing. Cold and unrelated methods
+remain lazy, and modular wrappers are unwrapped to the CT W4A8 loader.
+
+Canonical MTP matching is used only when a decoder-specific rule applies.
+Configs containing generic expert rules and `model.layers` backbone patterns
+retain the native result and rule order when no such decoder rule exists.
+An actual-name rule must exclude the target-model backbone to act as an MTP
+override; simply failing to match `model.decoder` is insufficient.
+
+Validation on nmz105 reproduced 12 behavioral failures on the prior commit.
+After the fix, 110 affected CPU tests and 365 CI-image portable tests passed,
+including existing reload contracts for other models, and the static patch,
+dependency and registration gates passed. Six actual BW1101 graph cases cover
+both channel group-size spellings, native checkpoint reload, V1/V2 kernel
+reload, ten consecutive kernel updates, direct replay before eager forward,
+and stable scale addresses. The graph tests replace only the AITER shuffle
+and MoE kernel boundaries with small tensor operations; they are not a new
+full-model accuracy or end-to-end kernel validation.
+
+Artifacts: `run/20261105_pr299_kernel_native_review/` in the validation project.

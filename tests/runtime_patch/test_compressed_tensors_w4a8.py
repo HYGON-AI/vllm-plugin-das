@@ -417,9 +417,72 @@ def test_aiter_forward_uses_final_scales_after_checkpoint_reload(
     assert len(captured) == 6
 
 
+def _kernel_reload_runner(kind, model):
+    """Run the real reload bodies without constructing an accelerator runner."""
+    import ast
+    import importlib.util
+    import time
+    from pathlib import Path
+
+    root = Path(__file__).resolve().parents[2]
+    vllm_root = Path(importlib.util.find_spec("vllm").origin).parent
+
+    def function_node(path):
+        tree = ast.parse(path.read_text())
+        cls = next(n for n in tree.body if isinstance(n, ast.ClassDef)
+                   and n.name == "GPUModelRunner")
+        return next(n for n in cls.body if isinstance(n, ast.FunctionDef)
+                    and n.name == "reload_weights")
+
+    scope = dict(torch=torch, time=time,
+                 logger=SimpleNamespace(info_once=lambda *a: None,
+                                        warning_once=lambda *a: None, warning=lambda *a: None),
+                 _get_parameter_for_reload=lambda model, name: model.get_parameter(name))
+    path = (root / "vllm_hcu/v1/hcu_model_runner.py" if kind == "v1"
+            else vllm_root / "v1/worker/gpu_model_runner.py")
+    future = ast.ImportFrom(module="__future__", names=[ast.alias(name="annotations")], level=0)
+    module = ast.Module(body=[future, function_node(path)], type_ignores=[])
+    exec(compile(ast.fix_missing_locations(module), str(path), "exec"), scope)
+    native_reload = scope["reload_weights"]
+    runner = SimpleNamespace(get_model=lambda: model,
+                             model_config=SimpleNamespace(quantization="compressed-tensors"))
+    if kind == "v1":
+        return runner, native_reload
+
+    class BaseRunner:
+        reload_weights = native_reload
+
+        def get_model(self):
+            return model
+
+    # Compile the real V2 override inside a class so zero-argument super()
+    # follows its native delegation before the HCU refresh executes.
+    path = root / "vllm_hcu/v1/hcu_model_runner_v2.py"
+    tree = ast.parse(path.read_text())
+    cls = next(n for n in tree.body if isinstance(n, ast.ClassDef)
+               and n.name == "HcuGPUModelRunnerV2")
+    node = next(n for n in cls.body if isinstance(n, ast.FunctionDef)
+                and n.name == "reload_weights")
+    wrapper = ast.ClassDef(name="ReloadRunner", bases=[ast.Name(id="BaseRunner", ctx=ast.Load())],
+                           keywords=[], body=[node], decorator_list=[])
+    scope["BaseRunner"] = BaseRunner
+    module = ast.Module(body=[future, wrapper], type_ignores=[])
+    exec(compile(ast.fix_missing_locations(module), str(path), "exec"), scope)
+    runner = scope["ReloadRunner"]()
+    runner.model_config = SimpleNamespace(quantization="compressed-tensors")
+    runner.lora_config = None
+    runner.reset_lora_state = lambda: None
+    runner.reset_encoder_cache = lambda: None
+    runner.reset_mm_cache = lambda: None
+    return runner, type(runner).reload_weights
+
+
 @pytest.mark.parametrize("group_size", [None, -1])
+@pytest.mark.parametrize("runner_kind", [None, "v1", "v2"])
 @pytest.mark.parametrize("device", ["cpu", pytest.param("cuda", marks=pytest.mark.hcu)])
-def test_checkpoint_reload_refreshes_captured_scale_cache(monkeypatch, native_wna16, group_size, device):
+def test_checkpoint_reload_refreshes_captured_scale_cache(
+    monkeypatch, native_wna16, group_size, device, runner_kind,
+):
     if device == "cuda" and not torch.cuda.is_available():
         pytest.skip("requires a DCU for graph replay")
     from compressed_tensors.compressors.pack_quantized.helpers import pack_to_int32
@@ -523,6 +586,89 @@ def test_checkpoint_reload_refreshes_captured_scale_cache(monkeypatch, native_wn
             assert consumed[-1][0] is captured[0]
             assert consumed[-1][1] is captured[1]
         assert len(calls) == generation + 1  # Reuse within a generation only.
+
+    if runner_kind is not None:
+        runner, reload = _kernel_reload_runner(runner_kind, layer)
+        for update in range(10):
+            # More updates than the cache's entry limit: no old graph allocation
+            # may be evicted by source-version churn.
+            sources = [
+                (name, torch.arange(getattr(layer, name).numel(), device=device)
+                 .reshape_as(getattr(layer, name)).float() + 100 * (update + 1))
+                for name in ("w13_weight_scale", "w2_weight_scale")
+            ]
+            with torch.no_grad():
+                reload(runner, weights_iterator=iter(sources), is_checkpoint_format=False)
+            expected = x * (layer.w13_weight_scale.flip(1).flatten()[0]
+                            + layer.w2_weight_scale.flip(1).flatten()[0])
+            before = len(consumed)
+            if graph is not None:
+                graph.replay()
+                replayed = graph_output
+            else:
+                replayed = x * (captured[0].flatten()[0] + captured[1].flatten()[0])
+            assert len(consumed) == before
+            torch.testing.assert_close(replayed, expected)
+            eager = method.apply(layer, x, weights, ids)
+            torch.testing.assert_close(eager, replayed)
+            assert consumed[-1][0] is captured[0]
+            assert consumed[-1][1] is captured[1]
+            assert tuple(s.data_ptr() for s in captured) == captured_pointers
+            assert len(calls) == 4 + update
+
+
+@pytest.mark.parametrize("draft", [False, True])
+@pytest.mark.parametrize("modular", [False, True])
+def test_weight_update_refreshes_selected_w4a8_model(monkeypatch, draft, modular):
+    from vllm.v1.worker.gpu_worker import Worker
+    from vllm_hcu.v1.worker import HcuGPUWorker
+    from vllm_hcu.model_executor.layers.fused_moe.aiter_moe_dispatch import (
+        prepare_aiter_moe_scales,
+    )
+
+    aiter = ModuleType("aiter.moe")
+    aiter.aiter_moe_shfl_scale = lambda s1, s2, config: (s1.flip(1), s2.flip(1))
+    monkeypatch.setitem(sys.modules, "aiter.moe", aiter)
+    selected_config = SimpleNamespace(need_shuffle_scale=True, quant_type="w4a8",
+                                      solution_type="moe_c")
+    models, captured = [], []
+    for _ in range(2):
+        layer = torch.nn.Module()
+        for name in ("w13_weight_scale", "w2_weight_scale"):
+            layer.register_parameter(name, torch.nn.Parameter(
+                torch.tensor([[[1.], [2.]]]), requires_grad=False,
+            ))
+        method = SimpleNamespace(_hcu_ct_w4a8_delegate=SimpleNamespace(moe_quant_config=None),
+                                 _hcu_ct_w4a8_loaded=True, moe_quant_config=None)
+        layer.quant_method = SimpleNamespace(old_quant_method=method) if modular else method
+        models.append(layer)
+        captured.append(prepare_aiter_moe_scales(
+            layer.w13_weight_scale, layer.w2_weight_scale, selected_config,
+            cache_owner=layer.w13_weight_scale,
+        ))
+    selected = models[int(draft)]
+    pointers = [tuple(s.data_ptr() for s in pair) for pair in captured]
+
+    def update(self):
+        # Transfer backends may write through .data without advancing _version.
+        for name in ("w13_weight_scale", "w2_weight_scale"):
+            getattr(selected, name).data.copy_(torch.tensor([[[3.], [4.]]]))
+
+    monkeypatch.setattr(Worker, "finish_weight_update", update)
+    worker = object.__new__(HcuGPUWorker)
+    worker.model_runner = SimpleNamespace(model=models[0], get_draft_model=lambda: models[1])
+    worker._weight_update_is_draft = draft
+    worker.finish_weight_update()
+    for layer, pair, addresses in zip(models, captured, pointers):
+        assert tuple(s.data_ptr() for s in pair) == addresses
+        torch.testing.assert_close(pair[0], layer.w13_weight_scale.flip(1))
+        torch.testing.assert_close(pair[1], layer.w2_weight_scale.flip(1))
+        # The first eager lookup also keeps the allocation used by captured graphs.
+        prepared = prepare_aiter_moe_scales(
+            layer.w13_weight_scale, layer.w2_weight_scale, selected_config,
+            cache_owner=layer.w13_weight_scale,
+        )
+        assert prepared[0] is pair[0] and prepared[1] is pair[1]
 
 
 @pytest.mark.parametrize("available", [False, True])

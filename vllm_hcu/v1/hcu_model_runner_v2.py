@@ -290,6 +290,11 @@ class HcuGPUModelRunnerV2(GPUModelRunner):
         )
 
         refresh_wo_a_bf16_caches(self.get_model())
+        from vllm_hcu.model_executor.layers.quantization.compressed_tensors_w4a8_runtime import (
+            refresh_hcu_w4a8_scale_caches,
+        )
+
+        refresh_hcu_w4a8_scale_caches(self.get_model())
 
     @property
     def pcp_manager_cls(self):

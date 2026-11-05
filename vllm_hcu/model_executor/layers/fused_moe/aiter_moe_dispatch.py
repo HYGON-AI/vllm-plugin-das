@@ -399,12 +399,27 @@ def prepare_aiter_moe_weights(
 class _PreparedScales:
     config: object
     tensors: tuple[torch.Tensor | None, torch.Tensor | None]
+    generation: tuple[Any, ...]
+
+
+def _copy_prepared_scales(entry: _PreparedScales, fresh) -> None:
+    for old, new in zip(entry.tensors, fresh):
+        if old is None or new is None:
+            if old is not new:
+                raise HcuAiterMoeDispatchError("AITER scale presence changed on reload")
+            continue
+        if (old.shape, old.dtype, old.device) != (new.shape, new.dtype, new.device):
+            raise HcuAiterMoeDispatchError("AITER scale layout changed on reload")
+        with torch.no_grad():
+            old.copy_(new)
 
 
 def refresh_aiter_moe_scale_cache(
     owner: object,
     scale1: torch.Tensor,
     scale2: torch.Tensor,
+    *,
+    update_generation: bool = False,
 ) -> None:
     """Refresh existing allocations before a checkpoint reload can replay graphs."""
     cache = getattr(owner, _SCALE_CACHE_ATTR, None)
@@ -414,15 +429,9 @@ def refresh_aiter_moe_scale_cache(
         fresh = prepare_aiter_moe_scales(
             scale1, scale2, entry.config, cache_owner=object(),
         )
-        for old, new in zip(entry.tensors, fresh):
-            if old is None or new is None:
-                if old is not new:
-                    raise HcuAiterMoeDispatchError("AITER scale presence changed on reload")
-                continue
-            if (old.shape, old.dtype, old.device) != (new.shape, new.dtype, new.device):
-                raise HcuAiterMoeDispatchError("AITER scale layout changed on reload")
-            with torch.no_grad():
-                old.copy_(new)
+        _copy_prepared_scales(entry, fresh)
+        if update_generation:
+            entry.generation = (_tensor_generation(scale1), _tensor_generation(scale2))
 
 
 def prepare_aiter_moe_scales(
@@ -437,12 +446,15 @@ def prepare_aiter_moe_scales(
         return scale1, scale2
 
     cache = _owner_cache(cache_owner, _SCALE_CACHE_ATTR)
+    generation = (_tensor_generation(scale1), _tensor_generation(scale2))
+    # A source version change refreshes the allocation rather than allocating
+    # another scale generation that could evict a captured graph's storage.
     cache_key = (
-        _tensor_generation(scale1),
-        _tensor_generation(scale2),
+        tuple(g[:2] + g[3:] if g is not None else () for g in generation),
         _scale_layout_generation(config),
     )
-    if cache_key in cache:
+    entry = cache.get(cache_key)
+    if entry is not None and entry.generation == generation:
         cache.move_to_end(cache_key)
         return cache[cache_key].tensors
 
@@ -469,8 +481,13 @@ def prepare_aiter_moe_scales(
             config=config,
         ),
     )
-    _cache_put(cache, cache_key, _PreparedScales(config, result), limit=_DERIVED_CACHE_LIMIT)
-    return result
+    if entry is None:
+        entry = _PreparedScales(config, result, generation)
+    else:
+        _copy_prepared_scales(entry, result)
+        entry.generation = generation
+    _cache_put(cache, cache_key, entry, limit=_DERIVED_CACHE_LIMIT)
+    return entry.tensors
 
 
 def _validate_expert_mapping_tensor(

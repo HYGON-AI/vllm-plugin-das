@@ -166,6 +166,36 @@ def _process_weights_after_loading(self, layer) -> None:
     self._hcu_ct_w4a8_loaded = True
 
 
+def refresh_hcu_w4a8_scale_caches(model) -> None:
+    """Refresh captured CT W4A8 scales after all kernel-format writes finish."""
+    if model is None:
+        return
+    from vllm_hcu.model_executor.layers.fused_moe.aiter_moe_dispatch import (
+        refresh_aiter_moe_scale_cache,
+    )
+
+    for layer in model.modules():
+        method = getattr(layer, "quant_method", None)
+        # Modular MoE wrappers retain the loader method under old_quant_method.
+        seen = set()
+        while method is not None and id(method) not in seen:
+            seen.add(id(method))
+            if hasattr(method, "_hcu_ct_w4a8_delegate"):
+                break
+            method = getattr(method, "old_quant_method", None)
+        delegate = getattr(method, "_hcu_ct_w4a8_delegate", None)
+        if delegate is None or not getattr(method, "_hcu_ct_w4a8_loaded", False):
+            continue
+        scales = layer.w13_weight_scale, layer.w2_weight_scale
+        owners = (*scales, getattr(delegate, "moe_quant_config", None),
+                  getattr(method, "moe_quant_config", None))
+        seen.clear()
+        for owner in owners:
+            if owner is not None and id(owner) not in seen:
+                seen.add(id(owner))
+                refresh_aiter_moe_scale_cache(owner, *scales, update_generation=True)
+
+
 def _get_fused_moe_quant_config(self, layer):
     return self._hcu_ct_w4a8_delegate.get_fused_moe_quant_config(layer)
 
