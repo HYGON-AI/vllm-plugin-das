@@ -10,6 +10,7 @@ acknowledges its transfer. No model prefill is repeated on the consumer.
 from __future__ import annotations
 
 import os
+import logging
 import threading
 from collections.abc import Hashable
 from typing import Any
@@ -19,6 +20,15 @@ from vllm_hcu.runtime_compat.step5 import is_step5_pd_config
 
 
 _DTYPE_CODES = {torch.bfloat16: 1, torch.float16: 2, torch.float32: 3}
+_logger = logging.getLogger("vllm.step5.pd")
+
+
+class _ImportLease:
+    def __init__(self):
+        self.owner = object()
+        self.rows: list[tuple[Any, int]] = []
+        self.received = False
+        self.finished = False
 
 
 class _SnapshotPool:
@@ -68,6 +78,9 @@ class Step5AuxManager:
         self.pools: dict[int, _SnapshotPool] = {}
         self._sources: dict[str, list[list[int]]] = {}
         self._lock = threading.RLock()
+        self._compiled_consumer = not worker.is_kv_producer and not getattr(
+            getattr(worker.vllm_config, "model_config", None), "enforce_eager", True)
+        self._imports: dict[str, _ImportLease] = {}
         # Transport and captured consumers retain these addresses. Keep the
         # allocations alive, and reject rebinding until KV is registered again.
         self._allocations: dict[int, tuple] = {}
@@ -121,6 +134,39 @@ class Step5AuxManager:
                     "Step5 PD auxiliary buffers changed after registration; "
                     "re-register KV caches before restoring or sending state"
                 )
+
+    def prepare_pulls(self, pulls: list[Any]):
+        readiness = None
+        if self._compiled_consumer and any(any(p.local_block_ids) for p in pulls):
+            self._validate_allocations()
+            first = next(iter(self._allocations.values()))[1][0]
+            if first.is_cuda:
+                if torch.cuda.is_current_stream_capturing():
+                    raise RuntimeError("Step5 PD restoration must run before graph replay")
+                # Do not block the model worker: the receiver waits for this
+                # event before RDMA can overwrite a recycled pending row.
+                readiness = torch.cuda.Event()
+                readiness.record(torch.cuda.current_stream(first.device))
+        for pull in pulls:
+            self.prepare_pull(pull)
+        return readiness
+
+    def finish_pulls(self, received: set[str], finished: set[str]) -> None:
+        # Called on the model worker, not the receiver thread. Pending-table
+        # mutations stay ordered with metadata construction and graph replay.
+        for request_id, lease in list(self._imports.items()):
+            lease.received |= request_id in received
+            lease.finished |= request_id in finished
+            if not lease.received:
+                continue
+            if lease.finished:
+                for state, slot in lease.rows:
+                    state.pending.release_reservation(slot, lease.owner)
+            if lease.finished or all(not state.pending.is_reserved(slot, lease.owner)
+                                     for state, slot in lease.rows):
+                self._imports.pop(request_id)
+                _logger.debug("Step5 PD import lease released: request=%s finished=%s pending=%d",
+                              request_id, lease.finished, len(self._imports))
 
     def capture(self, indexer: Any, md: Any, sched: Any,
                 index_k: torch.Tensor, index_z: torch.Tensor) -> None:
@@ -231,6 +277,9 @@ class Step5AuxManager:
             raise ValueError("Step5 DSA P/D requires the prompt token count")
         descriptors = {}
         rows: dict[tuple[int, int], int] = {}
+        lease = None
+        if self._compiled_consumer:
+            lease = self._imports.setdefault(pull_meta.d_req_id, _ImportLease())
         for name, indexer in self.indexers.items():
             state = indexer.state
             group = self.worker._layer_group_indices[name]
@@ -242,6 +291,8 @@ class Step5AuxManager:
                 raise ValueError("Step5 DSA destination has too few prompt KV blocks")
             slot = (blocks[last] * state.regions_per_page
                     + ((n - 1) % state.block_size) // state.geometry.region_size)
+            if not 0 <= slot < state.summary.shape[1]:
+                raise ValueError("Step5 DSA destination block ID exceeds its registered pool")
             key = (id(state), slot)
             if key not in rows:
                 # A just-finished request can leave a builder-owned cleanup
@@ -253,7 +304,13 @@ class Step5AuxManager:
                         old_slot for old_slot in previous.completed_slots
                         if old_slot != slot
                     ]
-                rows[key] = state.pending.acquire(slot)
+                if lease is None:
+                    rows[key] = state.pending.acquire(slot)
+                else:
+                    rows[key] = state.pending.reserve(slot, lease.owner)
+                    if not any(old_state is state and old_slot == slot
+                               for old_state, old_slot in lease.rows):
+                        lease.rows.append((state, slot))
             row = rows[key]
             summary = state.summary[indexer.slot]
             tail_k = state.pending_key[indexer.slot, row]

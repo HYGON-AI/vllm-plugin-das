@@ -1020,7 +1020,11 @@ class MooncakeConnector(KVConnectorBase_V1, SupportsHMA):
     ) -> tuple[set[str] | None, set[str] | None]:
         """Get the finished recving and sending requests."""
         assert self.connector_worker is not None
-        return self.connector_worker.get_finished()
+        result = self.connector_worker.get_finished()
+        auxiliary = getattr(self.connector_worker, "_step5_aux", None)
+        if auxiliary is not None:
+            auxiliary.finish_pulls(result[1] or set(), finished_req_ids)
+        return result
 
     def bind_connector_metadata(self, connector_metadata: KVConnectorMetadata) -> None:
         super().bind_connector_metadata(connector_metadata)
@@ -2870,8 +2874,10 @@ class MooncakeConnectorWorker:
         self.receive_kv(remote_engine_id, pull_metas)
 
     async def _start_load_kv(
-        self, reqs_to_recv: dict[EngineId, dict[ReqId, PullReqMeta]]
+        self, reqs_to_recv: dict[EngineId, dict[ReqId, PullReqMeta]], readiness=None
     ):
+        if readiness is not None:
+            await asyncio.get_running_loop().run_in_executor(None, readiness.synchronize)
         for remote_engine_id, pull_metas in reqs_to_recv.items():
             if remote_engine_id not in self._remote_agents:
                 asyncio.create_task(
@@ -2923,13 +2929,14 @@ class MooncakeConnectorWorker:
 
     def start_load_kv(self, metadata: MooncakeConnectorMetadata):
         auxiliary = getattr(self, "_step5_aux", None)
+        readiness = None
         if auxiliary is not None:
-            for pulls in metadata.reqs_to_recv.values():
-                for pull in pulls.values():
-                    auxiliary.prepare_pull(pull)
+            readiness = auxiliary.prepare_pulls([
+                pull for pulls in metadata.reqs_to_recv.values() for pull in pulls.values()
+            ])
         if not self.is_kv_producer and metadata.reqs_to_recv:
             asyncio.run_coroutine_threadsafe(
-                self._start_load_kv(metadata.reqs_to_recv), self.receiver_loop
+                self._start_load_kv(metadata.reqs_to_recv, readiness), self.receiver_loop
             )
 
         if not self.is_kv_consumer and (

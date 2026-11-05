@@ -2504,6 +2504,10 @@ class Step4PendingTable:
         self._row_of_slot: dict[int, int] = {}
         self._slot_of_row: list[int] = [-1] * capacity
         self._touched: list[int] = [-1] * capacity
+        # An asynchronous PD import may wait across many decode iterations.
+        # Its destination cannot be recycled until the request consumes it,
+        # or a cancelled import's DMA has completed.
+        self._reservations: dict[int, object] = {}
         self.step = 0
 
     def begin_step(self) -> None:
@@ -2520,6 +2524,7 @@ class Step4PendingTable:
                 f"so this fails loudly rather than silently attending to noise."
             )
         self._touched[row] = self.step
+        self._reservations.pop(slot, None)
         return row
 
     def acquire(self, slot: int) -> int:
@@ -2530,9 +2535,28 @@ class Step4PendingTable:
             self._row_of_slot[slot] = row
             self._slot_of_row[row] = slot
         self._touched[row] = self.step
+        self._reservations.pop(slot, None)
         return row
 
+    def reserve(self, slot: int, owner: object) -> int:
+        previous = self._reservations.get(slot)
+        if previous is not None and previous is not owner:
+            raise RuntimeError("Step5 PD pending slot is reserved by another import")
+        row = self.acquire(slot)
+        self._reservations[slot] = owner
+        return row
+
+    def is_reserved(self, slot: int, owner: object) -> bool:
+        return self._reservations.get(slot) is owner
+
+    def release_reservation(self, slot: int, owner: object) -> None:
+        if self.is_reserved(slot, owner):
+            self._reservations.pop(slot)
+            self.release(slot)
+
     def release(self, slot: int) -> None:
+        if slot in self._reservations:
+            return
         row = self._row_of_slot.pop(slot, None)
         if row is not None:
             self._slot_of_row[row] = -1
@@ -2549,6 +2573,8 @@ class Step4PendingTable:
         Rows retired in the previous step retain their normal age until the
         next schedule has had a chance to protect a speculative rollback.
         """
+        if slot in self._reservations:
+            return
         row = self._row_of_slot.get(slot)
         if row is not None:
             self._touched[row] = self.step - (1 << 40)
@@ -2561,6 +2587,8 @@ class Step4PendingTable:
         fresh_retired = self.step - 1 - (1 << 40)
         oldest_row, oldest_step = -1, self.step
         for row in range(self.capacity):
+            if self._slot_of_row[row] in self._reservations:
+                continue
             if self._slot_of_row[row] < 0:
                 return row
             touched = self._touched[row]

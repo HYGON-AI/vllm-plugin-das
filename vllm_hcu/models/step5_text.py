@@ -91,6 +91,7 @@ from vllm.model_executor.layers.logits_processor import LogitsProcessor
 from vllm.model_executor.layers.quantization.base_config import QuantizationConfig
 from vllm.model_executor.layers.rotary_embedding import get_rope
 from vllm_hcu.platforms.step5_envs import is_dsa_disabled
+from vllm_hcu.runtime_compat.step5 import is_step5_pd_config
 from vllm_hcu.platforms import envs as henvs
 from vllm_hcu.model_executor.layers.step4_dsa import (
     Step4DSAGeometry,
@@ -1383,6 +1384,13 @@ class Step5Model(nn.Module):
         self.dsa_slots = {idx: slot for slot, idx in enumerate(sparse_layers)}
         self.dsa_state: Step4DSAState | None = None
         if sparse_layers:
+            pending_per_request = 2
+            if (is_step5_pd_config(vllm_config)
+                    and vllm_config.kv_transfer_config.kv_role == "kv_consumer"
+                    and not vllm_config.model_config.enforce_eager):
+                # Imported tails are pinned until their first scheduled use.
+                # Keep their budget separate from active/rollback regions.
+                pending_per_request += 1
             self.dsa_state = Step4DSAState(
                 num_layers=len(sparse_layers),
                 geometry=Step4DSAGeometry.from_config(config.sparse_config),
@@ -1390,7 +1398,7 @@ class Step5Model(nn.Module):
                 # max_num_seqs would do; the slack absorbs rows left behind by
                 # requests that finished mid-region, which are only reclaimed
                 # least-recently-touched.
-                max_pending=2 * vllm_config.scheduler_config.max_num_seqs + 16,
+                max_pending=pending_per_request * vllm_config.scheduler_config.max_num_seqs + 16,
                 dtype=self.compute_dtype,
                 # Capture bounds: the decode schedule lives in [max_num_reqs]
                 # buffers at a score width covering max_model_len, so that both

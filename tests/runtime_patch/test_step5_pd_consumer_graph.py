@@ -22,7 +22,8 @@ def test_graph_replay_reads_new_imports_and_reused_pending_rows():
     state.num_kv_groups = state.heads_per_group = 1
     cache = torch.zeros((13, 1, 16, 64), dtype=torch.uint8, device='cuda')
     worker = SimpleNamespace(is_kv_producer=False, seen_base_addresses=[],
-        vllm_config=SimpleNamespace(scheduler_config=SimpleNamespace(max_num_seqs=1)),
+        vllm_config=SimpleNamespace(scheduler_config=SimpleNamespace(max_num_seqs=1),
+                                   model_config=SimpleNamespace(enforce_eager=False)),
         _layer_group_indices={'layer': 0},
         _logical_to_kernel_block_ids=lambda groups: groups,
         engine=SimpleNamespace(batch_register_memory=lambda ptrs, sizes: 0))
@@ -36,15 +37,17 @@ def test_graph_replay_reads_new_imports_and_reused_pending_rows():
         blocks = [first_block, first_block + 1, first_block + 2, first_block + 3]
         slot = blocks[(tokens - 1)//16]*2 + ((tokens - 1)%16)//8
         state._schedule = SimpleNamespace(completed_slots=[slot])
-        pull = SimpleNamespace(local_block_ids=[blocks[:(tokens + 15)//16]], num_prompt_tokens=tokens, dsa_aux={})
+        request_id = f'case-{i}'
+        pull = SimpleNamespace(d_req_id=request_id, local_block_ids=[blocks[:(tokens + 15)//16]], num_prompt_tokens=tokens, dsa_aux={})
         manager.prepare_pull(pull)
-        row = state.pending.get(slot);rows_seen.add(row)
+        row = state.pending._row_of_slot[slot];rows_seen.add(row)
         assert pull.dsa_aux['layer'][4] == state.pending_key[0, row].data_ptr()
         state.pending_key[:, row].zero_();state.pending_z[:, row].zero_()
         length = (tokens - 1)%8 + 1
         state.pending_key[:, row, :length].fill_(i + 1)
         state.pending_z[:, row, :length].fill_(i + 11)
         state.summary[0, slot].copy_(torch.full((1,32), i + 1, device='cuda').to(torch.float8_e4m3fn))
+        manager.finish_pulls({request_id}, set())
         summary_ids.fill_(slot)
         table_cpu = torch.tensor([blocks], dtype=torch.int32)
         starts = torch.tensor([0,4], dtype=torch.int32)
@@ -73,4 +76,6 @@ def test_graph_replay_reads_new_imports_and_reused_pending_rows():
         assert state._spec_raw.data_ptr() == schedule_pointer
         assert tuple(t.data_ptr() for t in (state.summary,state.pending_key,state.pending_z)) == pointers
         manager._validate_allocations()
+        manager.finish_pulls(set(), {request_id})
+        assert not manager._imports
     assert len(rows_seen) > 1

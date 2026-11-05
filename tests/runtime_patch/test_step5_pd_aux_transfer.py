@@ -68,8 +68,8 @@ def connector_lifecycle_methods():
     source = Path(__file__).resolve().parents[2] / "vllm_hcu/distributed/kv_transfer/kv_connector/v1/mooncake/mooncake_connector.py"
     tree = ast.parse(source.read_text())
     classes = {node.name: node for node in tree.body if isinstance(node, ast.ClassDef)}
-    methods = {"MooncakeConnector": ["bind_connector_metadata"],
-               "MooncakeConnectorWorker": ["start_load_kv", "_start_load_kv"]}
+    methods = {"MooncakeConnector": ["bind_connector_metadata", "get_finished"],
+               "MooncakeConnectorWorker": ["start_load_kv", "_start_load_kv", "get_finished"]}
     body = [ast.ImportFrom(module="__future__", names=[ast.alias(name="annotations")], level=0)]
     for name, wanted in methods.items():
         node = classes[name]
@@ -83,7 +83,8 @@ def connector_lifecycle_methods():
             self._connector_metadata = metadata
 
     namespace = {"KVConnectorBase_V1": Base, "MooncakeConnectorMetadata": SimpleNamespace,
-                 "SupportsHMA": type("SupportsHMA", (), {}), "asyncio": asyncio}
+                 "SupportsHMA": type("SupportsHMA", (), {}), "asyncio": asyncio,
+                 "logger": logging.getLogger('step5-aux-tests')}
     exec(compile(ast.fix_missing_locations(ast.Module(body=body, type_ignores=[])),
                  str(source), "exec"), namespace)
     return namespace["MooncakeConnector"], namespace["MooncakeConnectorWorker"]
@@ -509,6 +510,92 @@ def test_inplace_storage_rebinding_is_rejected(aux):
     with pytest.raises(RuntimeError, match='re-register'):
         manager.prepare_pull(SimpleNamespace(local_block_ids=[[2]], num_prompt_tokens=5))
     assert any(s.data_ptr() == registered_pointer for s in manager._registered_storages)
+
+
+def real_pending(capacity):
+    path = Path(__file__).resolve().parents[2] / 'vllm_hcu/model_executor/layers/step4_dsa.py'
+    node = next(n for n in ast.parse(path.read_text(encoding='utf-8')).body
+                if isinstance(n, ast.ClassDef) and n.name == 'Step4PendingTable')
+    module = ast.Module(body=[ast.ImportFrom(module='__future__', names=[ast.alias(name='annotations')],level=0),node],type_ignores=[])
+    scope={};exec(compile(ast.fix_missing_locations(module),str(path),'exec'),scope)
+    return scope['Step4PendingTable'](capacity)
+
+
+def test_cancelled_import_stays_reserved_until_dma_finishes(aux):
+    manager,state,_,_=make_manager(aux,False)
+    state.pending=real_pending(2);manager._compiled_consumer=True
+    manager.prepare_pull(SimpleNamespace(d_req_id='request',local_block_ids=[[2]],num_prompt_tokens=5))
+    owner=manager._imports['request'].owner;slot=4
+    for i in range(8):
+        state.pending.begin_step();state.pending.acquire(10+i)
+        state.pending.retire(slot);state.pending.release(slot)
+        assert state.pending.is_reserved(slot,owner)
+    manager.finish_pulls(set(),{'request'})
+    assert state.pending.is_reserved(slot,owner)
+    manager.finish_pulls({'request'},set())
+    assert slot not in state.pending._row_of_slot and not manager._imports
+
+
+def test_ready_import_waits_for_consumption_and_stale_cleanup_cannot_release_reuse(aux):
+    manager,state,_,_=make_manager(aux,False)
+    state.pending=real_pending(2);manager._compiled_consumer=True
+    manager.prepare_pull(SimpleNamespace(d_req_id='request',local_block_ids=[[2]],num_prompt_tokens=5))
+    old=manager._imports['request'].owner;slot=4
+    manager.finish_pulls({'request'},set())
+    assert state.pending.is_reserved(slot,old)
+    for i in range(4):state.pending.begin_step();state.pending.acquire(20+i)
+    state.pending.get(slot)
+    manager.finish_pulls(set(),set())
+    assert not manager._imports
+    new=object();state.pending.reserve(slot,new)
+    state.pending.release_reservation(slot,old)
+    assert state.pending.is_reserved(slot,new)
+    with pytest.raises(RuntimeError,match='another import'):
+        state.pending.reserve(slot,object())
+
+
+def test_all_reserved_rows_fail_instead_of_overwriting_live_dma():
+    pending=real_pending(1);owner=object();pending.reserve(7,owner)
+    pending.begin_step()
+    with pytest.raises(RuntimeError,match='in use'):
+        pending.acquire(8)
+    assert pending.is_reserved(7,owner)
+    pending.release_reservation(7,owner)
+    assert pending.acquire(8)==0
+
+
+@pytest.mark.parametrize('block',[-1,13])
+def test_invalid_import_destination_does_not_reserve_a_pending_row(aux,block):
+    manager,state,_,_=make_manager(aux,False)
+    state.pending=real_pending(2);manager._compiled_consumer=True
+    with pytest.raises(ValueError,match='registered pool'):
+        manager.prepare_pull(SimpleNamespace(d_req_id='request',local_block_ids=[[block]],num_prompt_tokens=5))
+    assert state.pending._reservations=={}
+
+
+def test_receiver_waits_for_prior_compute_before_submitting_rdma():
+    _,worker_type=connector_lifecycle_methods()
+    events=[]
+    event=SimpleNamespace(synchronize=lambda:events.append('compute-complete'))
+    worker=SimpleNamespace(_remote_agents={'producer':object()},
+        receive_kv=lambda *args:events.append('receive'))
+    asyncio.run(worker_type._start_load_kv(worker,{'producer':{}},event))
+    assert events==['compute-complete','receive']
+
+
+def test_connector_reports_transfer_and_request_completion_to_import_leases(monkeypatch):
+    connector_type,worker_type=connector_lifecycle_methods()
+    calls=[]
+    async def received():return {'received'}
+    monkeypatch.setattr(asyncio,'run_coroutine_threadsafe',
+        lambda coro,loop:SimpleNamespace(result=lambda:asyncio.run(coro)))
+    worker=SimpleNamespace(is_kv_producer=False,is_kv_consumer=True,tp_rank=0,receiver_loop=object(),
+        fetch_finished_recving_reqs=received,
+        _step5_aux=SimpleNamespace(finish_pulls=lambda *args:calls.append(args)))
+    worker.get_finished=worker_type.get_finished.__get__(worker)
+    connector=object.__new__(connector_type);connector.connector_worker=worker
+    assert connector.get_finished({'cancelled'})==(None,{'received'})
+    assert calls==[({'received'},{'cancelled'})]
 
 
 @pytest.mark.parametrize("source_groups,target_groups", [([], [[2]]), ([[1]], [])])
