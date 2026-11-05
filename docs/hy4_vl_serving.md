@@ -196,3 +196,54 @@ PY
 An equal score alone does not establish prediction or numerical equivalence.
 This public-command comparison uses separate processes; the validation summary
 distinguishes it from diagnostic same-weight runtime controls.
+
+## Standalone TP8 ViT comparison
+
+Stop the inference server first so all eight HCUs are idle. Run from the updated
+PR checkout. Prepare the pinned dataset above, then create a detached checkout
+of the version immediately before the activation-copy reduction:
+
+```bash
+git worktree add --detach /tmp/hy4-vit-before-copy \
+  94810016cb414f5b117d88bce8958541842152f4
+python - <<'PY'
+import io
+from pathlib import Path
+import pyarrow.parquet as pq
+from PIL import Image, ImageDraw
+
+root = Path("/tmp/hy4-vit-inputs")
+root.mkdir(parents=True, exist_ok=True)
+small = Image.new("RGB", (384, 256), "white")
+ImageDraw.Draw(small).rectangle((80, 40, 304, 216), fill="red")
+small.save(root / "small.png")
+rows = [row for p in sorted(Path("/tmp/realworldqa/data").glob("test-*.parquet"))
+        for row in pq.read_table(p).to_pylist()]
+assert len(rows) == 765
+for index in (552, 571):
+    image = Image.open(io.BytesIO(rows[index]["image"]["bytes"])).convert("RGB")
+    image.save(root / f"realworldqa-{index}.png")
+PY
+export PYTHONPATH="$PWD${PYTHONPATH:+:$PYTHONPATH}"
+torchrun --standalone --nproc-per-node=8 tools/hyv4_vit_bench.py \
+  --model /module/Hy4-testing-Channel-FP8-w8a8 \
+  --reference-checkout /tmp/hy4-vit-before-copy --tp-size 8 \
+  --case small /tmp/hy4-vit-inputs/small.png \
+  --case large /tmp/hy4-vit-inputs/realworldqa-552.png \
+  --case two /tmp/hy4-vit-inputs/realworldqa-552.png /tmp/hy4-vit-inputs/realworldqa-571.png \
+  --case mixed /tmp/hy4-vit-inputs/small.png /tmp/hy4-vit-inputs/realworldqa-552.png \
+  --output-dir /tmp/hy4-vit-copy-comparison
+```
+
+This repository tool loads actual vision weights into both towers, uses five
+warmups and 15 CUDA-event samples per version/case, and writes
+`vit-comparison.json` with medians, complete-output error metrics and joint vs
+individual image checks. For this copy-only change, check that `relative_l2`
+and `max_abs` are zero. It measures the encoder without language decoding or
+HTTP overhead. Use a new output directory on each run.
+
+The published activation-copy table used a separate host-side validation script
+with 30 samples per version/case and alternating execution order. That script
+also asserts exact complete outputs on every rank for all 765 dataset image
+rows. The command above is the reusable shorter comparison; it does not rerun
+that full-split gate or the 765-question HTTP evaluation.
