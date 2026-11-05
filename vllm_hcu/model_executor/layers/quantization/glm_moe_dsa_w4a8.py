@@ -47,7 +47,7 @@ def _replace_glm_scale_references(
     method: object,
     layer: torch.nn.Module,
 ) -> bool:
-    """Rebind GLM method and DeepEP auto configs to final scale owners."""
+    """Rebind GLM/DeepEP scales and installed HIPC weight owners."""
     if not isinstance(method, GlmMoeDsaW4A8MoEMethod):
         return False
     kernel = getattr(method, "moe_kernel", None)
@@ -57,6 +57,9 @@ def _replace_glm_scale_references(
         or getattr(experts, "ll_experts", None) is not None
     ):
         return False
+    commit_weights = getattr(experts, "commit_installed_weights", None)
+    if callable(commit_weights):
+        commit_weights(layer)
     configs = []
     for owner in (
         method,
@@ -116,34 +119,49 @@ def commit_installed_glm_w4a8_gemm2_generation(layer: torch.nn.Module) -> None:
     Parameter. Kernel-format reload copies into that same Parameter and
     bumps its version. Rebind the existing quant config to the installed
     scale owners as well, preserving references held by the execution path.
-    The native fallback also needs its scale owners rebound after reload,
-    although its unpacked weights have no gemm2 marker. Neither path may
-    run gemm2 repack again.
+    Online replacement also restores native tensor metadata and DeepEP
+    packed-weight views. These paths only rebind installed storage; they
+    must not repack or unpack its bytes again.
     """
+    method = getattr(layer, "quant_method", None)
+    if not isinstance(method, GlmMoeDsaW4A8MoEMethod):
+        return
+    native_shapes = getattr(layer, "_hcu_vllm_w4a8_unpacked_shapes", None)
     if getattr(layer, _GLM_W4A8_GEMM2_GENERATION, None):
         generation = _expert_weight_generation(layer)
         if not generation:
             return
         setattr(layer, _GLM_W4A8_GEMM2_GENERATION, generation)
         layer._glm_w4a8_gemm2_shuffled = True
-    elif not all(
+    elif native_shapes is not None or all(
         getattr(getattr(layer, name, None), "_hcu_vllm_w4a8_unpacked", False)
         for name in _GLM_EXPERT_WEIGHTS
     ):
-        if not _replace_glm_scale_references(
-            getattr(layer, "quant_method", None), layer
+        weights = tuple(getattr(layer, name, None) for name in _GLM_EXPERT_WEIGHTS)
+        if native_shapes is not None and any(
+            not isinstance(weight, torch.Tensor)
+            or weight.dtype != torch.int8
+            or tuple(weight.shape) != shape
+            for weight, shape in zip(weights, native_shapes)
         ):
-            return
-    method = getattr(layer, "quant_method", None)
-    if isinstance(method, GlmMoeDsaW4A8MoEMethod):
-        quant_config = getattr(method, "moe_quant_config", None)
-        if quant_config is not None:
-            from vllm_hcu.model_executor.layers.quantization.compressed_tensors_moe_runtime import (
-                _replace_tensor_reference,
-            )
+            raise RuntimeError("GLM W4A8 native replacement has incompatible weights")
+        from vllm_hcu.model_executor.layers.quantization.compressed_tensors_moe_runtime import (
+            mark_aiter_moe_native_layout,
+        )
 
-            _replace_tensor_reference(quant_config, "w1_scale", layer.w13_weight_scale)
-            _replace_tensor_reference(quant_config, "w2_scale", layer.w2_weight_scale)
+        for weight in weights:
+            weight._hcu_vllm_w4a8_unpacked = True
+        mark_aiter_moe_native_layout(layer)
+    elif not _replace_glm_scale_references(method, layer):
+        return
+    quant_config = getattr(method, "moe_quant_config", None)
+    if quant_config is not None:
+        from vllm_hcu.model_executor.layers.quantization.compressed_tensors_moe_runtime import (
+            _replace_tensor_reference,
+        )
+
+        _replace_tensor_reference(quant_config, "w1_scale", layer.w13_weight_scale)
+        _replace_tensor_reference(quant_config, "w2_scale", layer.w2_weight_scale)
 
 
 def commit_installed_glm_w4a8_gemm2_generations(model: torch.nn.Module) -> None:

@@ -2729,8 +2729,9 @@ def _weight_update_worker(monkeypatch, finish_update):
 
 @pytest.mark.parametrize("draft", [False, True])
 @pytest.mark.parametrize("replace_parameters", [False, True])
+@pytest.mark.parametrize("installed_layout", ["gemm2", "native"])
 def test_finish_weight_update_keeps_glm_layout_and_scale_owners(
-    monkeypatch, draft, replace_parameters
+    monkeypatch, draft, replace_parameters, installed_layout
 ) -> None:
     from vllm_hcu.model_executor.layers.quantization import (
         compressed_tensors_moe_runtime,
@@ -2761,21 +2762,26 @@ def test_finish_weight_update_keeps_glm_layout_and_scale_owners(
         layer._expert_map = None
         layer.expert_mask = None
         method.get_fused_moe_quant_config(layer)
-        compressed_tensors_moe_runtime.install_aiter_moe_weight_layout(
-            layer,
-            SimpleNamespace(
-                quant_type="w4a8", solution_type="moe_c",
-                need_shuffle=False, need_shuffle_scale=False,
-            ),
-            logical_shape=(2, 16, 8, 8),
-        )
-        layer._glm_w4a8_gemm2_generation = _expert_weight_generation(layer)
+        if installed_layout == "gemm2":
+            compressed_tensors_moe_runtime.install_aiter_moe_weight_layout(
+                layer,
+                SimpleNamespace(
+                    quant_type="w4a8", solution_type="moe_c",
+                    need_shuffle=False, need_shuffle_scale=False,
+                ),
+                logical_shape=(2, 16, 8, 8),
+            )
+            layer._glm_w4a8_gemm2_generation = _expert_weight_generation(layer)
+        else:
+            compressed_tensors_moe_runtime.prepare_vllm_w4a8_moe(method, layer)
+            compressed_tensors_moe_runtime.mark_aiter_moe_native_layout(layer)
         return layer
 
     target, draft_model = make_model(), make_model()
     selected = draft_model if draft else target
     untouched = target if draft else draft_model
-    untouched_generation = untouched._glm_w4a8_gemm2_generation
+    untouched_generation = getattr(untouched, "_glm_w4a8_gemm2_generation", None)
+    untouched_weights = (untouched.w13_weight.clone(), untouched.w2_weight.clone())
     installed_config = selected.quant_method.moe_quant_config
 
     def finish_update():
@@ -2798,21 +2804,28 @@ def test_finish_weight_update_keeps_glm_layout_and_scale_owners(
     worker._weight_update_is_draft = draft
     worker.finish_weight_update()
 
-    assert glm_expert_weights_use_gemm2_layout(selected)
-    assert untouched._glm_w4a8_gemm2_generation is untouched_generation
+    assert glm_expert_weights_use_gemm2_layout(selected) is (installed_layout == "gemm2")
+    assert getattr(untouched, "_glm_w4a8_gemm2_generation", None) is untouched_generation
     assert selected.quant_method.moe_quant_config is installed_config
     assert installed_config.w1_scale is selected.w13_weight_scale
     assert installed_config.w2_scale is selected.w2_weight_scale
     assert torch.all(selected.w13_weight == 5)
     assert torch.all(selected.w2_weight == 6)
-    assert torch.all(untouched.w13_weight == 1)
-    assert torch.all(untouched.w2_weight == 1)
+    assert torch.equal(untouched.w13_weight, untouched_weights[0])
+    assert torch.equal(untouched.w2_weight, untouched_weights[1])
     # A previously uncached token count requests shuffle, but the installed
     # gemm2 bytes must be accepted and passed to the kernel without repacking.
     forward = _forward_reloaded_weights(monkeypatch, selected, num_tokens=7)
     assert not forward["execute"].get("use_weight_shuffle", False)
-    assert forward["execute"]["w1_scale"] is selected.w13_weight_scale
-    assert forward["execute"]["w2_scale"] is selected.w2_weight_scale
+    compensation = 1 if installed_layout == "gemm2" else 16
+    assert torch.all(forward["execute"]["w1_scale"] == 7 * compensation)
+    assert torch.all(forward["execute"]["w2_scale"] == 11 * compensation)
+    # A second replacement must keep the same policy and quant-config owner.
+    worker.finish_weight_update()
+    assert selected.quant_method.moe_quant_config is installed_config
+    forward = _forward_reloaded_weights(monkeypatch, selected, num_tokens=11)
+    assert torch.all(forward["execute"]["w1_scale"] == 7 * compensation)
+    assert torch.all(forward["execute"]["w2_scale"] == 11 * compensation)
 
 
 @pytest.mark.parametrize("has_getter", [False, True])
@@ -2823,6 +2836,152 @@ def test_finish_weight_update_without_draft_model(monkeypatch, has_getter) -> No
         worker.model_runner.get_draft_model = lambda: None
     worker._weight_update_is_draft = True
     worker.finish_weight_update()
+
+
+@pytest.mark.parametrize("draft", [False, True])
+@pytest.mark.parametrize("replace_parameters", [False, True])
+@pytest.mark.parametrize("fixed_ll", [None, False, True], ids=["auto", "HT", "LL"])
+def test_finish_weight_update_rebinds_deepep_packed_owners(
+    monkeypatch, draft, replace_parameters, fixed_ll
+) -> None:
+    from vllm.model_executor.model_loader.reload.layerwise import (
+        _copy_and_restore_kernel_tensors,
+    )
+    from vllm.model_executor.model_loader.reload.types import LayerReloadingInfo
+    from vllm_hcu.model_executor.layers.fused_moe.experts.dpsk_v4_deep_gemm_moe import (
+        DeepEPAutoW4A8Experts,
+    )
+    from vllm_hcu.model_executor.layers.quantization import (
+        slimquant_w4a8_deepgemm_runtime as runtime,
+    )
+    from vllm_hcu.model_executor.layers.quantization.glm_moe_dsa_w4a8 import (
+        commit_installed_glm_w4a8_gemm2_generations,
+    )
+
+    pack_calls = []
+
+    def pack(weight):
+        pack_calls.append(weight)
+        weight.fill_(40 + len(pack_calls))
+        return weight
+
+    def n32_view(weight):
+        e, n, k_half = weight.shape
+        return weight.view(e, k_half // 32, n // 32, 4, 32, 8)
+
+    monkeypatch.setattr(runtime, "pack_w4a8_moe_hipc_weight", pack)
+    monkeypatch.setattr(runtime, "view_w4a8_moe_hipc_weight_n32_layout", n32_view)
+    method, layer = _glm_aiter_method("auto")
+    layer.quant_method = method
+    for name, shape, dtype in (
+        ("w13_weight", (1, 512, 32), torch.int8),
+        ("w2_weight", (1, 64, 128), torch.int8),
+        ("w13_weight_scale", (1, 512, 1), torch.float32),
+        ("w2_weight_scale", (1, 64, 1), torch.float32),
+    ):
+        setattr(layer, name, torch.nn.Parameter(
+            torch.ones(shape, dtype=dtype), requires_grad=False
+        ))
+    layer.w13_input_scale = layer.w2_input_scale = None
+    config = method.get_fused_moe_quant_config(layer)
+    experts = object.__new__(DeepEPAutoW4A8Experts)
+    experts._fixed_use_low_latency = fixed_ll
+    experts.quant_config = config
+    experts.ht_experts = object.__new__(runtime.DeepEPDeepGemmW4A8ContiguousExperts)
+    experts.ll_experts = object.__new__(runtime.DeepEPDeepGemmW4A8MaskedExperts)
+    if fixed_ll is True:
+        experts.ht_experts = experts.ll_experts
+    elif fixed_ll is False:
+        experts.ll_experts = experts.ht_experts
+    for child in (experts.ht_experts, experts.ll_experts):
+        child.quant_config = config
+    method.moe_kernel = SimpleNamespace(fused_experts=experts)
+    experts.process_weights_after_loading(layer)
+    assert len(pack_calls) == 2
+
+    def assert_owners(values):
+        for child in (experts.ht_experts, experts.ll_experts):
+            for cached, installed, value in (
+                (child._deepgemm_w13, layer.w13_weight, values[0]),
+                (child._deepgemm_w2, layer.w2_weight, values[1]),
+            ):
+                assert cached.data_ptr() == installed.data_ptr()
+                assert torch.all(cached == value)
+            assert child.quant_config.w1_scale is layer.w13_weight_scale
+            assert child.quant_config.w2_scale is layer.w2_weight_scale
+        for name, param in (
+            (experts._PACKED_W13, layer.w13_weight),
+            (experts._PACKED_W2, layer.w2_weight),
+            (experts._PACKED_W13_SCALE, layer.w13_weight_scale),
+        ):
+            assert getattr(layer, name).data_ptr() == param.data_ptr()
+
+    def finish_update():
+        for name, value in (
+            ("w13_weight", 5), ("w2_weight", 6),
+            ("w13_weight_scale", 7), ("w2_weight_scale", 11),
+        ):
+            param = getattr(layer, name)
+            updated = torch.full_like(param, value)
+            if replace_parameters:
+                setattr(layer, name, torch.nn.Parameter(updated, requires_grad=False))
+            else:
+                param.copy_(updated)
+
+    unrelated = torch.nn.Module()
+    worker = _weight_update_worker(monkeypatch, finish_update)
+    worker.model_runner = SimpleNamespace(
+        model=unrelated if draft else layer,
+        get_draft_model=lambda: layer if draft else unrelated,
+    )
+    worker._weight_update_is_draft = draft
+    for _ in range(2):
+        worker.finish_weight_update()
+        assert_owners((5, 6))
+        assert len(pack_calls) == 2
+        assert method.moe_quant_config is config
+
+    # A later checkpoint reload must reuse the newly installed owners.
+    kernel_parameters = dict(layer.named_parameters(recurse=False))
+    for name, param in kernel_parameters.items():
+        setattr(layer, name, torch.nn.Parameter(
+            torch.full_like(param, 3), requires_grad=False
+        ))
+    experts.process_weights_after_loading(layer)
+    _copy_and_restore_kernel_tensors(
+        layer,
+        LayerReloadingInfo(
+            restore_metadata=({}, {}), restore_device=torch.device("cpu"),
+            kernel_tensors=(kernel_parameters, {}),
+        ),
+    )
+    commit_installed_glm_w4a8_gemm2_generations(layer)
+    assert len(pack_calls) == 4
+    assert layer.w13_weight is kernel_parameters["w13_weight"]
+    assert layer.w2_weight is kernel_parameters["w2_weight"]
+    assert_owners((43, 44))
+
+
+@pytest.mark.parametrize("bad_dtype", [False, True])
+def test_native_online_replacement_rejects_incompatible_storage(bad_dtype) -> None:
+    from vllm_hcu.model_executor.layers.quantization import (
+        compressed_tensors_moe_runtime as runtime,
+    )
+    from vllm_hcu.model_executor.layers.quantization.glm_moe_dsa_w4a8 import (
+        commit_installed_glm_w4a8_gemm2_generations,
+    )
+
+    method, layer = _glm_aiter_method("auto")
+    layer.quant_method = method
+    layer.w13_weight = torch.nn.Parameter(
+        torch.zeros((1, 8, 2), dtype=torch.int8), requires_grad=False
+    )
+    runtime.prepare_vllm_w4a8_moe(method, layer)
+    replacement = layer.w13_weight.float() if bad_dtype else layer.w13_weight[..., :2]
+    layer.w13_weight = torch.nn.Parameter(replacement, requires_grad=False)
+    with pytest.raises(RuntimeError, match="native replacement has incompatible weights"):
+        commit_installed_glm_w4a8_gemm2_generations(layer)
+    assert not getattr(layer.w13_weight, "_hcu_vllm_w4a8_unpacked", False)
 
 
 @pytest.mark.parametrize("runner_kind", ["legacy", "v2"])

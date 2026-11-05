@@ -979,6 +979,10 @@ def prepare_vllm_w4a8_moe(
     replace_parameter(layer, "w2_weight", fallback_weights[1])
     layer.w13_weight._hcu_vllm_w4a8_unpacked = True
     layer.w2_weight._hcu_vllm_w4a8_unpacked = True
+    # Tensor attributes disappear when an online update installs new Parameters.
+    layer._hcu_vllm_w4a8_unpacked_shapes = (
+        tuple(layer.w13_weight.shape), tuple(layer.w2_weight.shape)
+    )
     return layer.w13_weight, layer.w2_weight
 
 

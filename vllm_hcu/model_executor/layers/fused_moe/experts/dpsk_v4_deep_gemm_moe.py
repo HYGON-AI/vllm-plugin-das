@@ -1266,6 +1266,42 @@ class DeepEPAutoW4A8Experts(DeepEPAutoDeepGemmExperts):
         self._restore_scale_and_bind(layer, runtime, *owners)
         setattr(layer, self._LAYOUT_MARKER, expected_layout)
 
+    def commit_installed_weights(self, layer: torch.nn.Module) -> None:
+        """Rebind final kernel-format Parameters without packing them again."""
+        from vllm_hcu.model_executor.layers.quantization import (
+            slimquant_w4a8_deepgemm_runtime as runtime,
+        )
+
+        expected_layout = {
+            None: "shared_hipc_auto",
+            False: "shared_hipc_contiguous",
+            True: "shared_hipc_n32",
+        }[self._fixed_use_low_latency]
+        if getattr(layer, self._LAYOUT_MARKER, None) != expected_layout:
+            self._invalid_marker()
+        runtime._validate_w4a8_channel_weights(layer)
+        current = (layer.w13_weight, layer.w2_weight, layer.w13_weight_scale)
+        owners = (
+            getattr(layer, self._PACKED_W13, None),
+            getattr(layer, self._PACKED_W2, None),
+            getattr(layer, self._PACKED_W13_SCALE, None),
+        )
+        if any(
+            not isinstance(owner, torch.Tensor)
+            or owner.shape != value.shape
+            or owner.dtype != value.dtype
+            or owner.device != value.device
+            or owner.stride() != value.stride()
+            for owner, value in zip(owners, current)
+        ):
+            self._invalid_marker()
+        owners = tuple(value.detach() for value in current)
+        self._restore_scale_and_bind(layer, runtime, *owners)
+        for name, owner in zip(
+            (self._PACKED_W13, self._PACKED_W2, self._PACKED_W13_SCALE), owners
+        ):
+            setattr(layer, name, owner)
+
     @staticmethod
     def _same_storage(left: torch.Tensor, right: torch.Tensor) -> bool:
         return (
