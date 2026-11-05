@@ -2729,6 +2729,11 @@ class MooncakeConnectorWorker:
             # No race because we are in async loop.
             pull_meta.pull_tasks_count -= 1
             if pull_meta.pull_tasks_count == 0:
+                # Empty destinations only acknowledge producer-block release
+                # after an abort before allocation. The scheduler has already
+                # retired that request; no decoder KV became ready.
+                if not any(pull_meta.local_block_ids):
+                    continue
                 self.finished_recving_reqs.add(pull_meta.d_req_id)
                 log_ttft_event(
                     "d_kv_ready",

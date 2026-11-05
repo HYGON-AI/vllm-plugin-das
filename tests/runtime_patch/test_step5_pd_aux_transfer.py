@@ -69,7 +69,7 @@ def connector_lifecycle_methods():
     tree = ast.parse(source.read_text())
     classes = {node.name: node for node in tree.body if isinstance(node, ast.ClassDef)}
     methods = {"MooncakeConnector": ["bind_connector_metadata", "get_finished"],
-               "MooncakeConnectorWorker": ["start_load_kv", "_start_load_kv", "get_finished"]}
+               "MooncakeConnectorWorker": ["start_load_kv", "_start_load_kv", "get_finished", "process_pulling_result"]}
     body = [ast.ImportFrom(module="__future__", names=[ast.alias(name="annotations")], level=0)]
     for name, wanted in methods.items():
         node = classes[name]
@@ -88,6 +88,34 @@ def connector_lifecycle_methods():
     exec(compile(ast.fix_missing_locations(ast.Module(body=body, type_ignores=[])),
                  str(source), "exec"), namespace)
     return namespace["MooncakeConnector"], namespace["MooncakeConnectorWorker"]
+
+
+@pytest.mark.parametrize("empty_groups", [[], [[]], [[], []]])
+@pytest.mark.parametrize("real_groups", [[[0]], [[], [0]]])
+def test_cleanup_ack_does_not_publish_a_retired_request(monkeypatch, empty_groups, real_groups):
+    _, worker_type = connector_lifecycle_methods()
+    events = []
+    monkeypatch.setitem(worker_type.process_pulling_result.__globals__, "log_ttft_event",
+                        lambda event, **data: events.append((event, data["req_id"])))
+    worker = SimpleNamespace(finished_recving_reqs=set())
+    pulls = {
+        "aborted": SimpleNamespace(local_block_ids=empty_groups, pull_tasks_count=2,
+                                   d_req_id="retired", transfer_id="cleanup"),
+        "live": SimpleNamespace(local_block_ids=real_groups, pull_tasks_count=2,
+                                d_req_id="allocated", transfer_id="data"),
+    }
+    response = SimpleNamespace(ok_reqs=["aborted", "live", "aborted"], err_reqs=[])
+    worker_type.process_pulling_result(worker, response, pulls)
+    assert worker.finished_recving_reqs == set()
+    assert all(p.pull_tasks_count == 1 for p in pulls.values())
+    worker_type.process_pulling_result(worker, response, pulls)
+    assert all(p.pull_tasks_count == 0 for p in pulls.values())
+    assert worker.finished_recving_reqs == {"allocated"}
+    assert events == [("d_kv_ready", "allocated")]
+    # Mirror the scheduler's invariant: the preallocation abort was removed,
+    # while the allocated request remains tracked until receive completion.
+    scheduler_requests = {"allocated": object()}
+    assert worker.finished_recving_reqs <= scheduler_requests.keys()
 
 
 def test_model_runner_v2_binding_captures_before_deferred_start_load(aux):
