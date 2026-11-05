@@ -249,18 +249,20 @@ Run: `run/20261105_160550/20261105_161204`, report:
 
 ## Rule order, shuffled reloads, and dispatch follow-up (2026-11-05)
 
-MTP aliases are inserted next to their source rules, preserving first-match
-priority against later generic regexes. Existing rules for the actual MTP
-prefix keep their values and original positions. The target model's config
-remains unchanged.
+MTP matches runtime layer names against canonical checkpoint names using
+vLLM's original scheme matcher. This preserves first-match ordering without
+rewriting user regexes, including equivalent expressions using `[.]`, groups,
+or hexadecimal escapes. Rules that match only the actual MTP name retain
+override priority; both canonical and actual-prefix ignore rules are honored.
+The target model's config and other MTP layers remain unchanged.
 
-Every successful CT W4A8 post-load advances a reload generation. On the first
-forward after native reload has restored the persistent kernel Parameters,
-the adapter invalidates derived scale caches on their final owners and the
-quant config. This covers `.data.copy_()` updates that leave addresses and
-`_version` unchanged; repeated forwards within a generation still reuse the
-shuffle cache. Regression tests execute three native checkpoint generations
-and two forwards per generation with scale shuffle enabled.
+CT W4A8 post-load refreshes cached shuffled scales on the previous persistent
+kernel owners before native reload restores those owners. The selected AITER
+config is retained with each cache entry, and fresh shuffle results are copied
+into the existing allocations. This covers native `.data.copy_()` writes that
+leave addresses and `_version` unchanged and also updates pointers already
+captured by decode graphs. Correctness does not depend on an eager forward
+after reload. Warm forwards continue to reuse the same derived allocations.
 
 The outer CT loader now exposes the delegate's INT8 AllGatherv capability
 after successful prewarm. It starts disabled and is revoked before post-load,
@@ -289,3 +291,29 @@ Artifacts: `run/20261105_pr299_review_followup/` in the validation project.
 The prior 100/100 HumanEval run predates this follow-up; these new checks cover
 rule selection, dispatch, native reloads, and packing rather than a new full-model
 accuracy evaluation.
+
+## Captured scales and equivalent MTP regexes (2026-11-05)
+
+The follow-up above originally invalidated the scale cache at Python apply.
+That was sufficient for eager reloads but could leave an already-captured
+decode graph pointing at old derived storage. Post-load now refreshes those
+allocations in place, before the native loader restores persistent Parameters.
+MTP matching now canonicalizes layer names rather than rewriting regex text.
+
+Validation on nmz105:
+
+- Added CPU regressions reproduced nine failures on the previous implementation.
+- Both affected CPU contract files passed: 96 tests, with two DCU cases excluded.
+- The current CI image passed 331 related portable contract tests, including
+  shared AITER scale handling and the actual MoERunner capability query. The
+  patch coverage, dependency lock and HCU registry checks also passed.
+- Two actual BW1101 graph tests passed, covering channel group sizes None and
+  -1, prewarm, graph capture, three native checkpoint generations, direct replay
+  before any new Python apply, and comparison with the new eager result. Scale
+  addresses remain stable. The native loader, delegate and cache run normally;
+  reverse-order scales and small scale-consuming tensor operations substitute
+  for the hardware AITER shuffle and MoE kernel boundaries.
+
+Artifacts: `run/20261105_pr299_graph_regex_review/` in the validation project.
+These checks establish reload/reference and matching behavior, not a new
+full-model accuracy result or an end-to-end AITER kernel validation.

@@ -395,12 +395,34 @@ def prepare_aiter_moe_weights(
     return result
 
 
-def invalidate_aiter_moe_scale_cache(owner: object) -> None:
-    """Discard derived scales after a loader writes through Parameter.data."""
+@dataclass
+class _PreparedScales:
+    config: object
+    tensors: tuple[torch.Tensor | None, torch.Tensor | None]
 
+
+def refresh_aiter_moe_scale_cache(
+    owner: object,
+    scale1: torch.Tensor,
+    scale2: torch.Tensor,
+) -> None:
+    """Refresh existing allocations before a checkpoint reload can replay graphs."""
     cache = getattr(owner, _SCALE_CACHE_ATTR, None)
-    if isinstance(cache, OrderedDict):
-        cache.clear()
+    if not isinstance(cache, OrderedDict):
+        return
+    for entry in cache.values():
+        fresh = prepare_aiter_moe_scales(
+            scale1, scale2, entry.config, cache_owner=object(),
+        )
+        for old, new in zip(entry.tensors, fresh):
+            if old is None or new is None:
+                if old is not new:
+                    raise HcuAiterMoeDispatchError("AITER scale presence changed on reload")
+                continue
+            if (old.shape, old.dtype, old.device) != (new.shape, new.dtype, new.device):
+                raise HcuAiterMoeDispatchError("AITER scale layout changed on reload")
+            with torch.no_grad():
+                old.copy_(new)
 
 
 def prepare_aiter_moe_scales(
@@ -422,7 +444,7 @@ def prepare_aiter_moe_scales(
     )
     if cache_key in cache:
         cache.move_to_end(cache_key)
-        return cache[cache_key]
+        return cache[cache_key].tensors
 
     moe_module = import_module("aiter.moe")
     shuffle = getattr(moe_module, "aiter_moe_shfl_scale", None)
@@ -447,7 +469,7 @@ def prepare_aiter_moe_scales(
             config=config,
         ),
     )
-    _cache_put(cache, cache_key, result, limit=_DERIVED_CACHE_LIMIT)
+    _cache_put(cache, cache_key, _PreparedScales(config, result), limit=_DERIVED_CACHE_LIMIT)
     return result
 
 

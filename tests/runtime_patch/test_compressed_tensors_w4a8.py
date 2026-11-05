@@ -418,10 +418,14 @@ def test_aiter_forward_uses_final_scales_after_checkpoint_reload(
 
 
 @pytest.mark.parametrize("group_size", [None, -1])
-def test_checkpoint_reload_invalidates_shuffled_scale_cache(monkeypatch, native_wna16, group_size):
+@pytest.mark.parametrize("device", ["cpu", pytest.param("cuda", marks=pytest.mark.hcu)])
+def test_checkpoint_reload_refreshes_captured_scale_cache(monkeypatch, native_wna16, group_size, device):
+    if device == "cuda" and not torch.cuda.is_available():
+        pytest.skip("requires a DCU for graph replay")
     from compressed_tensors.compressors.pack_quantized.helpers import pack_to_int32
     from vllm.model_executor.model_loader.reload.layerwise import (
         record_metadata_for_reloading, initialize_layerwise_reload, finalize_layerwise_reload,
+        get_layerwise_info,
     )
     from vllm_hcu.model_executor.layers.quantization import compressed_tensors_moe_runtime as kernels
 
@@ -444,24 +448,35 @@ def test_checkpoint_reload_invalidates_shuffled_scale_cache(monkeypatch, native_
     aiter.aiter_moe_shfl_scale = shuffle
     monkeypatch.setitem(sys.modules, "aiter.moe", aiter)
     _, method, layer = _native_layer(group_size, "aiter")
+    layer.to(device)
     record_metadata_for_reloading(layer)
+    get_layerwise_info(layer).restore_device = torch.device(device)
     checkpoint = {name: torch.zeros_like(param) for name, param in layer.named_parameters()}
 
+    consumed = []
+
     def execute(config, **kwargs):
-        torch.testing.assert_close(kwargs["w1_scale"], layer.w13_weight_scale.flip(1))
-        torch.testing.assert_close(kwargs["w2_scale"], layer.w2_weight_scale.flip(1))
-        return kwargs["hidden_states"]
+        scales = kwargs["w1_scale"], kwargs["w2_scale"]
+        consumed.append(scales)
+        # A tiny stand-in for the two scale-consuming GEMMs. The actual adapter,
+        # delegate, cache and native checkpoint loader remain in the call chain.
+        return kwargs["hidden_states"] * (scales[0].flatten()[0] + scales[1].flatten()[0])
 
     monkeypatch.setattr(kernels, "execute_aiter_moe", execute)
     persistent = None
+    captured = None
+    graph = None
+    x = torch.ones(2, 32, dtype=torch.bfloat16, device=device)
+    weights = torch.ones(2, 1, device=device)
+    ids = torch.zeros(2, 1, dtype=torch.int32, device=device)
     for generation in range(3):
         if generation:
             initialize_layerwise_reload(layer)
         for prefix, shape in (("w13", (2, 32, 32)), ("w2", (2, 32, 16))):
-            q = torch.full(shape, generation, dtype=torch.int8)
+            q = torch.full(shape, generation, dtype=torch.int8, device=device)
             checkpoint[prefix + "_weight_packed"] = pack_to_int32(q, 4).transpose(1, 2).contiguous()
             checkpoint[prefix + "_weight_scale"] = (
-                torch.arange(32, dtype=torch.bfloat16).reshape(1, 1, 32).expand(2, 1, 32)
+                torch.arange(32, dtype=torch.bfloat16, device=device).reshape(1, 1, 32).expand(2, 1, 32)
                 + 32 * generation + 1
             ).contiguous()
         for name, tensor in checkpoint.items():
@@ -480,9 +495,33 @@ def test_checkpoint_reload_invalidates_shuffled_scale_cache(monkeypatch, native_
         if persistent is None:
             persistent = owners
         assert owners == persistent  # Native .data.copy_ does not bump _version.
+        expected = x * (layer.w13_weight_scale.flip(1).flatten()[0]
+                        + layer.w2_weight_scale.flip(1).flatten()[0])
+        if captured is not None:
+            before = len(consumed)
+            if graph is not None:
+                graph.replay()
+                replayed = graph_output
+            else:
+                replayed = x * (captured[0].flatten()[0] + captured[1].flatten()[0])
+            # Replay must work BEFORE another Python apply/eager forward.
+            assert len(consumed) == before
+            torch.testing.assert_close(replayed, expected)
+            assert tuple(s.data_ptr() for s in captured) == captured_pointers
         for _ in range(2):
-            method.apply(layer, torch.ones(2, 32, dtype=torch.bfloat16),
-                         torch.ones(2, 1), torch.zeros(2, 1, dtype=torch.int32))
+            eager = method.apply(layer, x, weights, ids)
+            torch.testing.assert_close(eager, expected)
+        if captured is None:
+            captured = consumed[-1]
+            captured_pointers = tuple(s.data_ptr() for s in captured)
+            if device == "cuda":
+                torch.cuda.synchronize()
+                graph = torch.cuda.CUDAGraph()
+                with torch.cuda.graph(graph):
+                    graph_output = method.apply(layer, x, weights, ids)
+        else:
+            assert consumed[-1][0] is captured[0]
+            assert consumed[-1][1] is captured[1]
         assert len(calls) == generation + 1  # Reuse within a generation only.
 
 

@@ -132,7 +132,26 @@ def _process_weights_after_loading(self, layer) -> None:
         setattr(layer, prefix + "_input_scale", None)
 
     delegate = self._hcu_ct_w4a8_delegate
+    source_scales = (layer.w13_weight_scale, layer.w2_weight_scale)
+    previous_config = getattr(delegate, "moe_quant_config", None)
     delegate.process_weights_after_loading(layer)
+    from vllm.model_executor.model_loader.reload.layerwise import get_layerwise_info
+    from vllm_hcu.model_executor.layers.fused_moe.aiter_moe_dispatch import (
+        refresh_aiter_moe_scale_cache,
+    )
+
+    kernel_tensors = get_layerwise_info(layer).kernel_tensors
+    if kernel_tensors is not None:
+        # Native reload will restore these same Parameters after post-load.
+        # Captured graphs may already point at their cached shuffled copies:
+        # update those allocations now, before any Python-free graph replay.
+        parameters, _ = kernel_tensors
+        for owner in (
+            parameters.get("w13_weight_scale"),
+            parameters.get("w2_weight_scale"),
+            previous_config,
+        ):
+            refresh_aiter_moe_scale_cache(owner, *source_scales)
     # AITER can repack and Triton can expand weights during post-load. Keep
     # loader-name aliases on that final storage, without retaining old buffers.
     for prefix in ("w13", "w2"):
@@ -144,7 +163,6 @@ def _process_weights_after_loading(self, layer) -> None:
     self.supports_int8_allgatherv_input = bool(
         getattr(delegate, "supports_int8_allgatherv_input", False)
     )
-    self._hcu_ct_w4a8_reload_generation = getattr(self, "_hcu_ct_w4a8_reload_generation", 0) + 1
     self._hcu_ct_w4a8_loaded = True
 
 
@@ -174,18 +192,6 @@ def _apply(
     # Retain the config/descriptors also held by modular kernel consumers.
     delegate = self._hcu_ct_w4a8_delegate
     config = delegate.moe_quant_config
-    generation = getattr(self, "_hcu_ct_w4a8_reload_generation", 0)
-    if getattr(self, "_hcu_ct_w4a8_bound_generation", None) != generation:
-        from vllm_hcu.model_executor.layers.fused_moe.aiter_moe_dispatch import (
-            invalidate_aiter_moe_scale_cache,
-        )
-
-        # Native reload restores persistent Parameters after post-load using
-        # .data.copy_(), which leaves their _version and addresses unchanged.
-        # Invalidate after that restoration, once for each successful reload.
-        for owner in (layer.w13_weight_scale, layer.w2_weight_scale, config):
-            invalidate_aiter_moe_scale_cache(owner)
-        self._hcu_ct_w4a8_bound_generation = generation
     _replace_tensor_reference(config, "w1_scale", layer.w13_weight_scale)
     _replace_tensor_reference(config, "w2_scale", layer.w2_weight_scale)
     self.moe_quant_config = config
