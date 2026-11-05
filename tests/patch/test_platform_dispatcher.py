@@ -420,6 +420,7 @@ def test_apply_platform_patches_is_idempotent_narrow_and_reported():
 
 
 def test_platform_framework_registration_is_lazy_on_clean_vllm():
+    # The current upstream GDN adapters keep FLA providers lazy.
     result = _run_fresh(
         "import builtins,json,sys; "
         "old=builtins.__import__; "

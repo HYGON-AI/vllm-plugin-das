@@ -30,7 +30,9 @@ def apply_to_module(module: ModuleType) -> bool:
         return False
     require_signatures(target, SIGNATURES, REVIEWED_SOURCES)
     import functools
+    import os
     import numpy as np
+    from vllm_hcu.platforms import envs as henvs
 
     cls = getattr(target, "BlockTables", None)
     original = require_callable(cls, "append_block_ids", TARGETS[0])
@@ -44,15 +46,37 @@ def apply_to_module(module: ModuleType) -> bool:
             self._vllm_hcu_block_tables_np = [
                 np.zeros(tuple(b.gpu.shape), dtype=np.int32) for b in self.block_tables
             ]
+            self._vllm_hcu_compact_block_tables = henvs.optional_custom_op_enabled(
+                os.environ.get("HCU_STEP5_COMPACT_HOST_BLOCK_TABLES", "0") == "1"
+            )
+            if self._vllm_hcu_compact_block_tables:
+                print(
+                    "[step5_host_tables] compact host snapshots enabled; "
+                    "full context backing retained",
+                    flush=True,
+                )
 
     def gather_block_tables_np(self, idx_mapping_np, num_reqs_padded):
         tables = getattr(self, "_vllm_hcu_block_tables_np", None)
         if tables is None:
             raise RuntimeError("The HCU host block mirror is not enabled")
         out = []
-        for table in tables:
-            gathered = np.zeros((num_reqs_padded, table.shape[1]), dtype=table.dtype)
-            np.take(table, idx_mapping_np, axis=0, out=gathered[: len(idx_mapping_np)])
+        for group, table in enumerate(tables):
+            width = table.shape[1]
+            if self._vllm_hcu_compact_block_tables:
+                # Counts already include newly scheduled pages and kernel-block
+                # expansion. Keep the full backing mirror for 1M contexts; only
+                # compact this batch's independent host snapshot. Padded rows
+                # may read column zero even when no request has any pages.
+                counts = self.num_blocks.np[group, idx_mapping_np]
+                width = min(width, max(1, int(counts.max(initial=0))))
+                gathered = np.zeros((num_reqs_padded, width), dtype=table.dtype)
+                # np.take on a sliced noncontiguous source can first copy all
+                # request rows. Advanced indexing copies only selected rows.
+                gathered[: len(idx_mapping_np)] = table[idx_mapping_np, :width]
+            else:
+                gathered = np.zeros((num_reqs_padded, width), dtype=table.dtype)
+                np.take(table, idx_mapping_np, axis=0, out=gathered[: len(idx_mapping_np)])
             out.append(gathered)
         return tuple(out)
 

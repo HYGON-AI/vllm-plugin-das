@@ -136,6 +136,10 @@ class Step5Config(PretrainedConfig):
         self.num_experts_per_tok = moe_top_k
         self.moe_top_k = moe_top_k
 
+        self.max_position_embeddings = (
+            max_seq_len if max_position_embeddings is None else max_position_embeddings
+        )
+
         self.rope_theta = rope_theta
         self.rope_scaling = rope_scaling
         self.head_dim = head_dim
@@ -147,9 +151,6 @@ class Step5Config(PretrainedConfig):
         self.norm_dtype = norm_dtype
         self.norm_expert_weight = norm_expert_weight
 
-        self.max_position_embeddings = (
-            max_seq_len if max_position_embeddings is None else max_position_embeddings
-        )
         self.moe_router_activation = moe_router_activation
         self.moe_router_scaling_factor = moe_router_scaling_factor
         self.use_moe_router_bias = use_moe_router_bias

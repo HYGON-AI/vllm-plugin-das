@@ -1580,7 +1580,17 @@ def _lightop_topk_indices_decode(
     topk_tokens: int,
 ) -> None:
     row_ends = _decode_row_ends_from_seq_lens(seq_lens, next_n, logits.shape[0])
-    _get_lightop_attention().top_k_per_row_decode(
+    attention = _get_lightop_attention()
+    if topk_tokens == 2048:
+        row_ends = row_ends.to(device=logits.device, dtype=torch.int32).contiguous()
+        row_starts = torch.zeros_like(row_ends)
+        selected = attention.fast_topk_transform_ragged_fused(
+            logits.contiguous(), row_ends, row_starts, topk_tokens,
+            row_starts=row_starts,
+        )
+        topk_indices.copy_(selected)
+        return
+    attention.top_k_per_row_decode(
         logits,
         1,
         row_ends.to(device=logits.device, dtype=torch.int32),
@@ -1635,6 +1645,12 @@ def rocm_aiter_sparse_attn_indexer_fake(
         dtype=scratch_dtype,
         device=scratch_device,
     )
+    if topk_tokens == 2048 and _use_lightop_sparse_mla_topk():
+        _selected_topk = torch.empty(
+            (hidden_states.shape[0], topk_tokens),
+            dtype=torch.int32,
+            device=scratch_device,
+        )
     return topk_indices_buffer
 
 
@@ -1987,7 +2003,14 @@ def rocm_aiter_sparse_attn_indexer_native(
             # merge gathers scores only at those selected indices, so no
             # decode consumer reads the unwritten tail.
             clean_logits=False,
-            token_major=indexer_cache_token_major(),
+            # V4 compressor pages use the branch's direct/compact reader.
+            # Caches owned by the native custom-op writer use upstream's
+            # explicit layout contract instead.
+            **(
+                {"token_major": True}
+                if indexer_cache_token_major()
+                else {"kcache_layout": "normal" if on_gfx938() else "preshuffle"}
+            ),
         )
 
         # A padded decode batch has more kernel rows than actual decode
