@@ -162,18 +162,19 @@ service startup and accuracy were not run because six cards were already using
 about 132 GiB each for existing workloads. Probe processes exited and released
 their device allocations. No existing model service was stopped.
 
-The fix is disabled by default through the registered boolean environment
-variable `VLLM_HCU_GLM_MTP_QUANT_PREFIX_FIX`. It also requires the target HF
-`model_type` to be `glm_moe_dsa`; even with opt-in, other architectures return
-the original engine config. Additional regressions cover an unset/disabled flag
-and representative non-GLM model types with matching decoder rules.
+The fix is enabled by default through the registered boolean environment
+variable `VLLM_HCU_GLM_MTP_QUANT_PREFIX_FIX` as of 2026-11-05. Set it to `0`
+to disable the compatibility mapping. It requires the target HF `model_type`
+to be `glm_moe_dsa` and a compressed-tensors quantization config; other
+architectures retain the original engine config. Regressions cover an unset
+flag, explicit enable/disable, and non-GLM models with matching decoder rules.
 
 The project `test.sh` explicitly exports
 `VLLM_HCU_GLM_MTP_QUANT_PREFIX_FIX=1` and prepends this source tree to
 `PYTHONPATH`, so its next launch enables the fix without rebuilding a wheel or
 changing model config. Its pre-change backup is
 `test.sh.bak.mtp-prefix-optin.20261030_170721` beside the script. Other launch
-scripts that do not enable the variable retain the original MTP prefix behavior.
+scripts using this source tree now get the GLM mapping without an explicit export.
 
 ## Original target identity under Eagle loading (2026-11-02)
 
@@ -224,3 +225,24 @@ Result: 58 passed. This includes checkpoint reload lifecycle, channel group-size
 normalization, opt-in MTP prefix matching, and converted draft target identity
 regressions. These CPU tests do not establish full-model service readiness,
 DCU kernel numerical accuracy, IPC transport correctness, or benchmark scores.
+
+## Final scale ownership and default MTP aliases (2026-11-05)
+
+Native layerwise reload restores persistent kernel Parameters after quantization
+post-load. The W4A8 adapter now refreshes both AITER scale references before
+execution, retaining the quantization config and its descriptors so consumers
+observe the final layer-owned scales. CPU regressions cover repeated reloads,
+in-place and replacement updates, and full-graph tracing.
+
+GLM DSA compressed-tensors MTP decoder target aliases are enabled by default.
+`VLLM_HCU_GLM_MTP_QUANT_PREFIX_FIX=0` remains an explicit rollback; the original
+model-type and quantization-config checks still isolate unrelated models.
+
+A user-run TP8/EP evaluation with AITER, MTP3, `reasoning_effort=low`, BF16 KV,
+seed 42, batch size 8 and `max_tokens=30000` passed 100/100 on the first 100
+HumanEval tasks (accuracy and pass@1 both 1.0). This is one first-100 evaluation,
+not a result for all 164 tasks. The run used regular compilation and graph
+capture without forcing `VLLM_USE_AOT_COMPILE=0`.
+
+Run: `run/20261105_160550/20261105_161204`, report:
+`reports/default_model/humaneval.json` in the GLM-5.3 validation project.

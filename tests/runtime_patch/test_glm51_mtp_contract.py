@@ -20,7 +20,7 @@ REPO = Path(__file__).resolve().parents[2]
 @pytest.fixture
 def mtp_module(monkeypatch: pytest.MonkeyPatch) -> ModuleType:
     """Load deepseek_mtp with only its HCU-owned dependencies stubbed."""
-    monkeypatch.setenv("VLLM_HCU_GLM_MTP_QUANT_PREFIX_FIX", "1")
+    monkeypatch.delenv("VLLM_HCU_GLM_MTP_QUANT_PREFIX_FIX", raising=False)
 
     deepseek_v2 = ModuleType("vllm_hcu.models.deepseek_v2")
 
@@ -446,12 +446,26 @@ def test_eagle_loader_uses_original_target_for_glm_quant_aliases(mtp_module, mon
     assert engine.quant_config is qconfig
 
 
-@pytest.mark.parametrize("value", [None, "0", "false", "unexpected"])
-def test_mtp_prefix_fix_is_opt_in(mtp_module, monkeypatch, value):
+@pytest.mark.parametrize("value", [None, "1", "true", "TRUE"])
+def test_mtp_prefix_fix_is_enabled_by_default(mtp_module, monkeypatch, value):
     if value is None:
         monkeypatch.delenv("VLLM_HCU_GLM_MTP_QUANT_PREFIX_FIX", raising=False)
     else:
         monkeypatch.setenv("VLLM_HCU_GLM_MTP_QUANT_PREFIX_FIX", value)
+    assert mtp_module.henvs.VLLM_HCU_GLM_MTP_QUANT_PREFIX_FIX
+    qconfig = _mixed_quant_config(r"re:^model\.decoder\.mlp\.experts\.\d+\.down_proj$")
+    engine = _glm_engine(qconfig)
+    adapted = mtp_module._mtp_quantization_config(engine, "model.layers.78")
+    assert adapted is not engine
+    linear = nn.Linear(8, 8, bias=False)
+    name = "model.layers.78.mlp.experts.0.down_proj"
+    assert adapted.quant_config.get_scheme_dict(linear, name)["weights"].num_bits == 4
+    assert qconfig.get_scheme_dict(linear, name)["weights"].num_bits == 8
+
+
+@pytest.mark.parametrize("value", ["0", "false", "unexpected"])
+def test_mtp_prefix_fix_can_be_disabled(mtp_module, monkeypatch, value):
+    monkeypatch.setenv("VLLM_HCU_GLM_MTP_QUANT_PREFIX_FIX", value)
     qconfig = _mixed_quant_config(r"re:^model\.decoder\.mlp\.experts\.\d+\.down_proj$")
     engine = _glm_engine(qconfig)
     assert mtp_module._mtp_quantization_config(engine, "model.layers.78") is engine
@@ -464,12 +478,13 @@ def test_mtp_prefix_fix_is_opt_in(mtp_module, monkeypatch, value):
     "deepseek_v2", "deepseek_v3", "deepseek_v32", "mimo_v2_flash",
     "qwen3_moe", "glm4_moe", None,
 ])
-def test_non_glm_dsa_model_keeps_original_config_even_with_opt_in(
+def test_non_glm_dsa_model_keeps_original_config_with_default_enabled(
     mtp_module, model_type,
 ):
     qconfig = _mixed_quant_config(r"re:^model\.decoder\.mlp\.experts\.\d+\.down_proj$")
     engine = _glm_engine(qconfig)
     engine.model_config.hf_config.model_type = model_type
+    assert mtp_module.henvs.VLLM_HCU_GLM_MTP_QUANT_PREFIX_FIX
     original_targets = dict(qconfig.target_scheme_map)
     original_ignore = list(qconfig.ignore)
     assert mtp_module._mtp_quantization_config(engine, "model.layers.78") is engine
