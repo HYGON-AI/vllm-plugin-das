@@ -142,7 +142,7 @@ def test_mtp_owner_before_loader_name_rewrite():
     )
 
 
-@pytest.mark.parametrize("backend,ep", [("aiter", 1), ("triton", 2)])
+@pytest.mark.parametrize("backend,ep", [("unsupported", 1), ("triton", 2)])
 def test_unsupported_execution_fails_at_construction(backend, ep):
     moe = SimpleNamespace(
         moe_backend=backend,
@@ -153,7 +153,7 @@ def test_unsupported_execution_fails_at_construction(backend, ep):
         adapter.HcuCompressedW4A8(None, moe)
 
 
-@pytest.mark.parametrize("tp_size", [1, 2, 4])
+@pytest.mark.parametrize("tp_size", [1, 2, 4, 8])
 def test_native_expert_loader_tp_shards(tp_size):
     from vllm.model_executor.layers.fused_moe import RoutedExperts
 
@@ -342,3 +342,104 @@ def test_actual_mtp_and_decoder_constructors_keep_numeric_runtime_prefix():
     assert layer.mtp_block.mlp.prefix == "model.layers.78.mlp"
     assert layer.mtp_block.mlp.quant_config is not quant
     assert config.quant_config is quant
+
+
+def test_aiter_gemm2_nibble_regroup(monkeypatch):
+    from aiter.ops import shuffle
+
+    seen = []
+    monkeypatch.setattr(
+        shuffle,
+        "w4a8_moe_layout_shuffle_gemm2",
+        lambda value: seen.append(value.clone()) or value,
+    )
+    # Logical nibbles 0..7 regroup into high [0..3], low [4..7].
+    packed = torch.tensor([0x01, 0x23, 0x45, 0x67], dtype=torch.uint8).view(torch.int8)
+    result = adapter.repack_aiter_gemm2(packed.reshape(1, 1, 4))
+    assert torch.equal(
+        result.view(torch.uint8).flatten(),
+        torch.tensor([0x04, 0x15, 0x26, 0x37], dtype=torch.uint8),
+    )
+    assert len(seen) == 1
+
+
+@pytest.mark.parametrize("backend", ["auto", "aiter"])
+def test_pd_aiter_prefill_decode_layout_selection_is_local(monkeypatch, backend):
+    from vllm.model_executor.layers.fused_moe.activation import MoEActivation
+
+    from vllm_hcu.model_executor.layers.quantization import (
+        compressed_tensors_moe_runtime as runtime,
+    )
+
+    config = SimpleNamespace(
+        quant_type="W4A8",
+        solution_type="moe_c",
+        need_shuffle=True,
+        need_shuffle_scale=True,
+        config={},
+    )
+    moe = SimpleNamespace(
+        moe_backend=backend,
+        moe_parallel_config=SimpleNamespace(ep_size=1),
+        has_bias=False,
+        activation=MoEActivation.SILU,
+        num_experts=2,
+    )
+    method = adapter.HcuCompressedW4A8(None, moe)
+    layer = torch.nn.Module()
+    method.create_weights(
+        layer, 2, 16, 8, torch.bfloat16, weight_loader=lambda *args: None
+    )
+    for param in layer.parameters():
+        param.data.zero_()
+    calls = []
+    monkeypatch.setattr(
+        adapter, "repack_aiter_gemm2", lambda w: calls.append(w.data_ptr()) or w.clone()
+    )
+    monkeypatch.setattr(runtime, "prewarm_aiter_w4a8_moe", lambda *a: config)
+    method.process_weights_after_loading(layer)
+    method.process_weights_after_loading(layer)
+    assert len(calls) == 2
+    assert config.need_shuffle and config.need_shuffle_scale
+    selected = []
+
+    def select(problem, **kwargs):
+        selected.append(problem.M)
+        return config
+
+    monkeypatch.setattr(runtime, "select_aiter_moe_config", select)
+    executions = []
+
+    def execute(local, **kwargs):
+        assert local is not config
+        assert not local.need_shuffle and not local.need_shuffle_scale
+        assert kwargs["w1"] is layer.w13_weight and kwargs["w2"] is layer.w2_weight
+        executions.append(kwargs)
+        return kwargs["hidden_states"]
+
+    monkeypatch.setattr(runtime, "execute_aiter_moe", execute)
+    # Alternate prefill and decode token counts without changing installed data.
+    for batch in [32, 1, 7, 1]:
+        x = torch.ones(batch, 16, dtype=torch.bfloat16)
+        actual = runtime.apply_aiter_w4a8_moe(
+            method,
+            layer,
+            x,
+            torch.ones(batch, 2),
+            torch.zeros(batch, 2, dtype=torch.int32),
+        )
+        assert actual is x
+        assert config.need_shuffle and config.need_shuffle_scale
+    assert selected == [32, 1, 7, 1] and len(executions) == 4
+    assert len(calls) == 2
+    with pytest.raises(RuntimeError, match="no solution"):
+        method.prepare_aiter_w4a8_config(layer, None)
+    with pytest.raises(RuntimeError, match="fresh model"):
+        layer.w13_weight.weight_loader(
+            layer.w13_weight, torch.zeros(1, dtype=torch.int32)
+        )
+    layer.w13_weight_scale = torch.nn.Parameter(
+        layer.w13_weight_scale.detach().clone(), requires_grad=False
+    )
+    with pytest.raises(RuntimeError, match="weights/scales changed"):
+        method.prepare_aiter_w4a8_config(layer, config)

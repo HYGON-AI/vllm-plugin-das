@@ -1,48 +1,108 @@
-# compressed-tensors channel W4A8: minimal HCU adapter
+# Channel W4A8 for GLM Mooncake PD
 
-This proposal replaces the model-specific quantization entry in #308 with a
-worker-side adapter under the existing `compressed-tensors` configuration.
-It does not register `glm_moe_dsa_w4a8` or change `-q` names.
+The target is the scenario reported in #308: two-node 1P1D Mooncake, P TP8 and
+D TP8, with GLM-5.3 channel INT4 experts and INT8 linears. D-side DP8+EP was
+not validated in that report. This adapter keeps `quant_method: compressed-tensors`
+and uses native parsed schemes; Mooncake does not require a model-specific
+`glm_moe_dsa_w4a8` registry name. The connector transfers KV caches, not model
+weights, and does not call the weight-reload APIs.
 
-Native `get_scheme_dict` parses targets, class-name regexes, format inheritance
-and projection ignore rules. The adapter checks all logical experts and three
-projections, rather than probing a fixed number of layers or expert 0 only.
-Unsupported mixed expert formats are rejected before constructing a backend.
-W8A8 linears and W4A16 owners retain their existing dispatch.
+## Implementation
 
-The only checkpoint conversion is uint4b8 int32 packing to signed, high-nibble
-first SlimQuant bytes, plus FP32 channel scales divided by 16. Existing
-SlimQuant Triton execution supplies the inverse scale compensation. Main and
-MTP loaders rename packed tensors only for owners using this adapter; native
-packed owners keep their names. GLM MTP keeps its numeric runtime layer
-prefix. A local configuration copy resolves `model.decoder` quantization rules
-through the native matcher when a physical path has no explicit rule. Physical
-path rules and ignore entries retain priority; the main config is not replaced.
+- Native matching covers all logical experts and gate/up/down projections.
+  Mixed expert schemes and unsupported output-activation quantization fail.
+- Checkpoint uint4b8 int32 weights become signed SlimQuant bytes; channel scales
+  become FP32 divided by 16. Packed-name normalization is owner-local.
+- `auto` and `aiter` install the eight-nibble regroup plus AITER gemm2 layout
+  once at load time. P/D token counts can choose different MOE_C configs. The
+  adapter copies each selected config and disables generic weight/scale shuffle
+  locally, preserving the selection cache and other quantization methods.
+  Existing runtime checks still reject an incompatible physical layout.
+- Explicit `triton` retains canonical packing and existing scale compensation.
+- GLM MTP keeps numeric runtime/attention layer names. A local quantization
+  config resolves canonical `model.decoder` rules without replacing the main
+  config; explicit physical rules and ignore entries have priority. This also
+  preserves the layer identities used by KV registration.
 
-## Deliberately limited first proposal
+Initial scope: EP=1, symmetric channel INT4 weights and dynamic symmetric token
+INT8 activations, no expert bias or fused shared experts. Set the shared-expert
+fusion flag below on both P and D. DeepEP, EPLB, online weight replacement and
+AITER checkpoint reload are outside this MR; an AITER checkpoint reload is
+rejected before loading into converted storage. No runner/worker reload hook or
+common EP fallback is added. Mooncake KV transfer does not invoke those APIs.
 
-- `--moe-backend triton`, EP=1, symmetric channel INT4 weights and dynamic,
-  symmetric per-token INT8 activations; no expert bias or fused shared experts.
-- TP slicing is covered by CPU native-loader tests at TP 1/2/4, all ranks.
-  This is not a multi-HCU numerical validation.
-- AITER gemm2, DeepEP, EPLB, online weight replacement/reload and Mooncake PD
-  equivalence to #308 are not claimed. No common runtime/reload code is changed.
-- The new PR stays draft pending v0.28.1-dev service and accuracy validation.
-  This host has DAS v0.25.1 installed; its CPU parser/loader tests do not establish
-  wheel compatibility with the target version.
+## P/D reproduction commands
 
-Example for the target DAS v0.28.1-dev image, after building the plugin there:
+These are target-image commands, **not a successfully executed two-node PD run**.
+Use the same DAS v0.28.1-dev image, plugin commit, checkpoint, tokenizer, dtype,
+block size and KV dtype on both nodes. The image must provide the matching
+vLLM/Mooncake APIs and AITER `w4a8_moe_layout_shuffle_gemm2` plus W4A8 MOE_C configs.
+No `-q` override is needed. These commands do not enable MTP.
+
+Prefill node (set P_HOST to this node's reachable address):
 
 ```bash
-export PYTHONPATH="$PWD${PYTHONPATH:+:$PYTHONPATH}"
+export P_HOST='<prefill-address>'
+export VLLM_HOST_IP="$P_HOST"
+export VLLM_MOONCAKE_BOOTSTRAP_PORT=8998
+export MC_ENABLE_DEST_DEVICE_AFFINITY=1
 export VLLM_ROCM_USE_AITER_FUSION_SHARED_EXPERTS=0
 vllm serve /module/GLM-5.3-Channel-INT4-w4a8 \
-  --tensor-parallel-size 8 --moe-backend triton \
-  --kv-cache-dtype fp8_ds_mla --block-size 64
+  --served-model-name glm53-w4a8 --host 0.0.0.0 --port 8010 \
+  --tensor-parallel-size 8 --moe-backend aiter \
+  --kv-cache-dtype fp8_ds_mla --block-size 64 \
+  --kv-transfer-config '{"kv_connector":"MooncakeConnector","kv_role":"kv_producer"}'
 ```
 
-No `-q` override is required. This command is a validation starting point,
-not a successfully executed service run on this host.
+Decode node (set D_HOST to this node's reachable address):
+
+```bash
+export D_HOST='<decode-address>'
+export VLLM_HOST_IP="$D_HOST"
+export MC_ENABLE_DEST_DEVICE_AFFINITY=1
+export VLLM_ROCM_USE_AITER_FUSION_SHARED_EXPERTS=0
+vllm serve /module/GLM-5.3-Channel-INT4-w4a8 \
+  --served-model-name glm53-w4a8 --host 0.0.0.0 --port 8020 \
+  --tensor-parallel-size 8 --moe-backend aiter \
+  --kv-cache-dtype fp8_ds_mla --block-size 64 \
+  --kv-transfer-config '{"kv_connector":"MooncakeConnector","kv_role":"kv_consumer"}'
+```
+
+Proxy: set P_HOST/D_HOST to the addresses above and VLLM_SOURCE_ROOT to a full
+checkout matching the target image. vLLM versions place this example in either
+of the paths below; require an existing script instead of assuming a wheel
+contains examples. The `--prefill URL BOOTSTRAP_PORT` arguments were checked
+against the locally available proxy source.
+
+```bash
+export P_HOST='<prefill-address>' D_HOST='<decode-address>'
+export VLLM_SOURCE_ROOT='<matching-vllm-source-checkout>'
+PD_PROXY="$VLLM_SOURCE_ROOT/examples/disaggregated/mooncake_connector/mooncake_connector_proxy.py"
+if [ ! -f "$PD_PROXY" ]; then
+  PD_PROXY="$VLLM_SOURCE_ROOT/examples/online_serving/disaggregated_serving/mooncake_connector/mooncake_connector_proxy.py"
+fi
+test -f "$PD_PROXY"
+python "$PD_PROXY" --host 0.0.0.0 --port 8000 \
+  --prefill "http://$P_HOST:8010" 8998 --decode "http://$D_HOST:8020"
+```
+
+Client on the proxy host:
+
+```bash
+curl --fail-with-body http://127.0.0.1:8000/v1/chat/completions \
+  -H 'Content-Type: application/json' \
+  -d '{"model":"glm53-w4a8","messages":[{"role":"user","content":"请解释为什么天空是蓝色的。"}],"temperature":0,"max_tokens":128,"stream":false}'
+```
+
+Acceptance still required: verify actual KV transmission/receipt, compare fixed
+prompts and accuracy evaluation against a single-service TP8 AITER baseline,
+and exercise short/long prefill, decode and concurrency. A successful HTTP
+response alone is insufficient. MTP+PD and D DP8+EP need separate validation.
+For transfer tracing, enable `VLLM_HCU_MOONCAKE_TTFT_TRACE=1` and
+`VLLM_LOGGING_LEVEL=DEBUG` on both servers, then inspect `p_send_kv_done`,
+`d_kv_ready` and `d_first_token` events.
+
+## Local evidence and remaining blockers
 
 ```bash
 VLLM_PLUGINS=__disabled__ PYTHONPATH="$PWD" python -m pytest -q \
@@ -50,24 +110,22 @@ VLLM_PLUGINS=__disabled__ PYTHONPATH="$PWD" python -m pytest -q \
   tests/runtime_patch/test_quant_gemm_aiter.py -k 'compressed or prequantized'
 ```
 
-Local validation: 36 targeted CPU tests pass, covering all packed byte patterns,
-native scheme selection, owner-local naming (including MTP), and native expert
-weight/scale TP loading. The actual checkpoint config selects this adapter for
-layers 3, 60, 77 and the physical MTP prefix `model.layers.78` using native
-matching plus the decoder alias; this config probe stubs the execution-method
-constructor and does not run inference. Constructor regression coverage executes
-the production MTP and decoder `__init__` bodies with attention/MoE leaves
-stubbed; importing the complete target model needs the target wheel.
+40 targeted CPU tests pass, including native TP=1/2/4/8 loading on every rank,
+MTP constructors/aliases, gemm2 regroup and alternating P/D token counts without
+repacking or mutating cached AITER configs. A wider two-file run passed 307 tests
+and failed the same 15 IDs as unchanged upstream (before adding the TP8 case).
+The actual checkpoint config selects layers 3/60/77 and MTP 78 through native
+matching; this config-only probe stubs method construction.
 
-Self-review also ran the complete two-file suite: 304 passed, 15 failed. An
-unchanged upstream checkout produced the exact same 15 failure IDs (277 passed),
-including missing v0.28 APIs and the installed BoltOps contract mismatch.
+On one BW1101 HCU, the actual TP8 rank shape E=256, hidden=6144, intermediate=256,
+top-k=8 passed adapter post-load and BF16 AITER forwards at M=1/32/512. The M=512
+config differs from M=1/32. Relative L2 differences against the same quantized
+weights through BoltOps W8A8 were 0.00627/0.00670/0.00643. These are kernel
+comparisons, not model-accuracy results. The gemm2 conversion is also compared
+byte-for-byte with #308 at representative w13/w2 TP8 shapes.
 
-On one BW1101 HCU, converted tensors were compared directly through BoltOps
-W4A8 and W8A8 MoE kernels at E=4, H=I=128, top-k=2, BF16/FP16 and
-batch 1/7/32. Maximum relative L2 difference was 5.51e-5; maximum absolute
-difference was 6.11e-5. This validates the tested packing/scale convention, not
-model accuracy. The full adapter probe stops at the existing BoltOps signature
-guard: this host lacks `use_mxfp4_w4a8`, `use_ue8m0`, `use_mxfp8`, and
-`gemm1_beta` required by the target branch's audited API. No production guard
-was relaxed; the direct kernel comparison is separate from integration testing.
+The host has a DAS v0.25.1 wheel. Full model import needs the target
+`V32SparseAttnIndexer`; Mooncake contract tests stop at missing `KpoolTailSpec`.
+Explicit Triton integration also encounters a pre-existing BoltOps API mismatch.
+No successful full-model/MTP/two-node PD result is claimed. Keep the MR draft
+until the target-image PD and accuracy checks above complete.
