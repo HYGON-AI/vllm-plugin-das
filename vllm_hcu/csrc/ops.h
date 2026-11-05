@@ -65,3 +65,12 @@ at::Tensor step5_fp8_dense_gemm(const at::Tensor& x, const at::Tensor& xs,
                               int64_t algorithm_id, bool allow_initialize);
 std::string step5_fp8_dense_backend_library();
 #endif
+
+#ifdef VLLM_HCU_BUILD_STEP5_W4A8
+void step5_w4a8_gemm(const torch::Tensor& input, const torch::Tensor& weight,
+                       torch::Tensor& output, const torch::Tensor& a_scale,
+                       const torch::Tensor& w_scale, const torch::Tensor& ids);
+void step5_w4a8_gemm_meta(const torch::Tensor& input, const torch::Tensor& weight,
+                            torch::Tensor& output, const torch::Tensor& a_scale,
+                            const torch::Tensor& w_scale, const torch::Tensor& ids);
+#endif

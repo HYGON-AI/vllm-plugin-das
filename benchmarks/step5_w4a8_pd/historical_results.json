@@ -1,0 +1,50 @@
+{
+  "date": "2026-11-05",
+  "platform": "gfx938, single node,8devices,144GiB/device",
+  "service_budget_gib_per_device": 96,
+  "historical_fixed_reservation_gib_per_device": 48,
+  "packaged_launcher_fixed_reservation_gib_per_device": 0,
+  "fresh_full_model_gpu_retest_after_packaging": false,
+  "workload": {
+    "input_tokens": 64000,
+    "concurrency": 32,
+    "warmup_rounds": 1,
+    "formal_screening_rounds": 1,
+    "synthetic_mtp_rates": [
+      0.838992,
+      0.598322,
+      0.362686
+    ],
+    "num_speculative_tokens": 3
+  },
+  "prefill": {
+    "tp": 1,
+    "dp": 8,
+    "ep": 8,
+    "output_tokens": 1,
+    "max_num_batched_tokens": 16384,
+    "w4a8_tps": 25595.692310895596,
+    "historical_fp8_tps": 24940.796630496985,
+    "improvement_pct": 2.6258009722023967,
+    "mean_ttft_ms": 50187.366145156375,
+    "formal_requests": 32
+  },
+  "decode": {
+    "tp": 4,
+    "dp": 2,
+    "ep": 8,
+    "output_tokens": 4096,
+    "max_num_batched_tokens": 4096,
+    "throughput_definition": "Original900/1500common-window protocol; not whole-request output throughput",
+    "w4a8_common_window_tps": 1660.724683097473,
+    "historical_fp8_common_window_tps": 1534.3380706,
+    "improvement_pct": 8.237207621919307,
+    "mean_common_chunk_itl_ms": 53.96082490053318,
+    "formal_requests": 32
+  },
+  "limits": [
+    "HistoricalFP8 was measured on another single-node environment; this is not a strict quantization-only comparison.",
+    "SyntheticMTP is for performance and does not establish model accuracy.",
+    "Rebuilt native binaries and changed environments require their ownGPU validation."
+  ]
+}

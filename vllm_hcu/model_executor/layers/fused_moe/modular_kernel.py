@@ -1172,6 +1172,7 @@ class FusedMoEKernelModularImpl:
         from vllm_hcu.runtime_compat.step5 import is_step5_owner
 
         self._hcu_step5_owner = is_step5_owner(fused_experts.moe_config)
+        self._hcu_step5_owner |= bool(getattr(fused_experts, "_hcu_step5_w4a8_native", False))
         self.prepare_finalize = prepare_finalize
         self.fused_experts = fused_experts
         self.shared_experts: SharedExperts | None = None
@@ -1619,6 +1620,9 @@ class FusedMoEKernelModularImpl:
         expert_map: torch.Tensor | None,
     ) -> torch.Tensor | None:
         """See _DP_MOE_PIPE_MIN_TOKENS.  None: not applicable, nothing done."""
+        if (getattr(self.fused_experts, "_hcu_step5_w4a8_native", False)
+                and torch.cuda.is_current_stream_capturing()):
+            return None
         if not henvs.custom_ops_enabled():
             return None
         global _dp_pipe_stream, _dp_pipe_pending

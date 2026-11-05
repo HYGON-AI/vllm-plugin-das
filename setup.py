@@ -135,6 +135,7 @@ def get_version() -> str:
 # =========================================================
 # 建议将生成的 .so 放到包名路径下，例如 vllm_hcu.cache_ops
 _BUILD_STEP5_DENSE = os.getenv("VLLM_HCU_BUILD_STEP5_DENSE", "0") == "1"
+_BUILD_STEP5_W4A8 = os.getenv("VLLM_HCU_BUILD_STEP5_W4A8", "0") == "1"
 
 ext_modules = [
     CUDAExtension(
@@ -143,13 +144,16 @@ ext_modules = [
                  'vllm_hcu/csrc/torch_bindings.cpp',
                  'vllm_hcu/csrc/custom_all_reduce.cu',
                  'vllm_hcu/csrc/fused_deepseek_v4_inv_rope_kernel.cu',
-                 ] + (['vllm_hcu/csrc/step5_fp8_dense.cpp'] if _BUILD_STEP5_DENSE else []),
+                 ] + (['vllm_hcu/csrc/step5_fp8_dense.cpp'] if _BUILD_STEP5_DENSE else [])
+                   + (['vllm_hcu/csrc/step5_w4a8_gemm.cu'] if _BUILD_STEP5_W4A8 else []),
         libraries=['hipblaslt', 'dl'] if _BUILD_STEP5_DENSE else [],
         define_macros=[('TORCH_EXTENSION_NAME', 'hcu_ops')] + (
-            [('VLLM_HCU_BUILD_STEP5_DENSE', '1')] if _BUILD_STEP5_DENSE else []),
+            [('VLLM_HCU_BUILD_STEP5_DENSE', '1')] if _BUILD_STEP5_DENSE else []) + (
+            [('VLLM_HCU_BUILD_STEP5_W4A8', '1')] if _BUILD_STEP5_W4A8 else []),
         extra_compile_args={
             'cxx': ['-O3'],
-            'nvcc': ['-O3', '-fno-gpu-rdc']
+            'nvcc': ['-O3', '-fno-gpu-rdc'] + (
+                ['-mcode-object-version=5'] if _BUILD_STEP5_W4A8 else [])
         }
     )
 ]
@@ -205,6 +209,7 @@ setup(
             "csrc/*.cuh",
             "csrc/*.cu",
             "csrc/*.cpp",
+            "csrc/*_LICENSE",
         ]
     },
     ext_modules=ext_modules,

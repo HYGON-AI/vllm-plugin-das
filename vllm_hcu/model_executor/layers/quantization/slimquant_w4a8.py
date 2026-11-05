@@ -2,6 +2,7 @@
 # SPDX-FileCopyrightText: Copyright (c) 2026 Hygon Information Technology Co., Ltd.
 
 from typing import TYPE_CHECKING, Any
+import os
 
 import torch
 import vllm.model_executor.layers.fused_moe.modular_kernel as mk
@@ -235,6 +236,12 @@ class SlimQuantW4A8Int8AiterMoEMethod(FusedMoEMethodBase):
         self.moe_kernel: mk.FusedMoEKernel | None = None
         self._supports_int8_allgatherv_input = False
 
+        self._step5_w4a8_profile = None
+        if os.environ.get("VLLM_HCU_STEP5_W4A8_PROFILE"):
+            from vllm_hcu.model_executor.layers.fused_moe.step5_w4a8_policy import resolve_profile
+
+            self._step5_w4a8_profile = resolve_profile(moe)
+
     def get_fused_moe_quant_config(
         self, layer: torch.nn.Module
     ) -> FusedMoEQuantConfig:
@@ -406,6 +413,13 @@ class SlimQuantW4A8Int8AiterMoEMethod(FusedMoEMethodBase):
 
     def process_weights_after_loading(self, layer: torch.nn.Module) -> None:
         # Keep SlimQuant W4A8 weights in the raw packed checkpoint layout.
+        profile = getattr(self, "_step5_w4a8_profile", None)
+        if profile is not None:
+            from vllm_hcu.model_executor.layers.fused_moe.step5_w4a8 import prepare_step5_w4a8
+
+            prepare_step5_w4a8(self, layer, profile)
+            return
+
         # AITER's channel-wise W4A8 Triton path consumes the raw [E, N, K // 2]
         # / [E, K, N // 2] tensors directly.  Pre-shuffling here routes the
         # weights into the MOE_C/Marlin layout and produces incorrect values

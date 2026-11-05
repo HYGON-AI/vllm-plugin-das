@@ -30,6 +30,12 @@
   }
 
 TORCH_LIBRARY_EXPAND(TORCH_EXTENSION_NAME, ops) {
+#ifdef VLLM_HCU_BUILD_STEP5_W4A8
+  ops.def("step5_w4a8_gemm(Tensor input, Tensor weight, Tensor(a!) output, "
+          "Tensor a_scale, Tensor w_scale, Tensor expert_ids) -> ()");
+  ops.impl("step5_w4a8_gemm", torch::kCUDA, &step5_w4a8_gemm);
+  ops.impl("step5_w4a8_gemm", torch::kMeta, &step5_w4a8_gemm_meta);
+#endif
 #ifdef VLLM_HCU_BUILD_STEP5_DENSE
   ops.def("step5_fp8_dense_gemm(Tensor x, Tensor xs, Tensor w, Tensor ws, "
           "int algorithm_id, bool allow_initialize=False) -> Tensor");

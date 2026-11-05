@@ -125,7 +125,20 @@ class HcuGPUWorker(Worker):
     def load_model(self, *, load_dummy_weights: bool = False) -> None:
         """Load the model, then require every enabled patch chain to be live."""
 
+        step5_native_profile = None
+        if os.environ.get("VLLM_HCU_STEP5_W4A8_PROFILE"):
+            from vllm_hcu.model_executor.layers.fused_moe.step5_w4a8_policy import profile_for_model
+
+            step5_native_profile = profile_for_model(self.vllm_config)
+        if step5_native_profile is not None:
+            from vllm_hcu.ops.step5.w4a8 import require_native_op
+
+            require_native_op()
         super().load_model(load_dummy_weights=load_dummy_weights)
+        if step5_native_profile is not None:
+            from vllm_hcu.model_executor.layers.fused_moe.step5_w4a8 import validate_loaded_model
+
+            validate_loaded_model(self.model_runner.get_model())
         from vllm_hcu.patch.worker import validate_worker_patches
         model_runner = getattr(self, "model_runner", None)
         from vllm_hcu.model_executor.layers.kimi_k3_mixed_precision import record_kimi_kda_offload_ownership
@@ -256,6 +269,11 @@ class HcuGPUWorker(Worker):
 
             self.device = torch.device(f"cuda:{self.local_rank}")
             torch.accelerator.set_device_index(self.device)
+
+            if os.environ.get("VLLM_HCU_ALLOCATOR_LIMIT_GIB") is not None:
+                from vllm_hcu.runtime_compat.allocator_limit import apply_allocator_limit
+
+                apply_allocator_limit(self.device, torch)
 
             current_platform.check_if_supports_dtype(self.model_config.dtype)
 
