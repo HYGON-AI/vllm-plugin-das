@@ -102,15 +102,35 @@ def _mtp_quantization_config(vllm_config: VllmConfig, prefix: str) -> VllmConfig
         ):
             return None
 
-        # An actual-prefix override matches the runtime name but not its
-        # canonical counterpart. Determine that by matching, not by parsing or
-        # rewriting the user's regex. Generic rules retain canonical priority.
-        overrides = {}
+        canonical_targets = {}
+        actual_targets = {}
         for target, scheme in self.target_scheme_map.items():
             actual_matches = find_matching_patterns(layer_name, [target], mapping)
             canonical_matches = find_matching_patterns(canonical, [target], mapping)
+            if any(canonical_matches) and not any(actual_matches):
+                canonical_targets[target] = scheme
             if any(actual_matches) and not any(canonical_matches):
-                overrides[target] = scheme
+                actual_targets[target] = scheme
+        # Without an applicable decoder rule, preserve native first-match
+        # behavior on the actual name, including broad backbone layer regexes.
+        if find_matched_target(canonical, layer, canonical_targets, mapping) is None:
+            return original_match(self, layer, layer_name)
+
+        # Matching only the actual spelling does not make a rule MTP-specific:
+        # model.layers.\d+ also targets the backbone. Only rules excluding all
+        # target-model backbone layers can override a canonical decoder rule.
+        parent, index = prefix.rsplit(".", 1)
+        num_layers = getattr(hf_config, "num_hidden_layers", None)
+        if num_layers is None:
+            num_layers = int(index) if index.isdecimal() else 0
+        suffix = layer_name[len(prefix):]
+        overrides = {
+            target: scheme for target, scheme in actual_targets.items()
+            if not any(
+                any(find_matching_patterns(f"{parent}.{i}{suffix}", [target], mapping))
+                for i in range(num_layers)
+            )
+        }
         matched = find_matched_target(layer_name, layer, overrides, mapping)
         if matched is not None:
             explicit = copy(self)

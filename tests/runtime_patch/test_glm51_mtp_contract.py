@@ -361,6 +361,46 @@ def test_mtp_existing_alias_retains_its_position(mtp_module):
     assert adapted.quant_config.target_scheme_map[actual] is eight
 
 
+@pytest.mark.parametrize("generic_first", [False, True])
+@pytest.mark.parametrize("backbone", [
+    r"re:^model\.layers\.\d+\..*proj$",
+    r"re:^model[.]layers[.]\d+[.].*proj$",
+])
+def test_mtp_without_decoder_rules_preserves_native_priority(mtp_module, generic_first, backbone):
+    generic = r"re:.*\.experts\.\d+\.down_proj$"
+    qconfig = _mixed_quant_config(generic)
+    four = qconfig.target_scheme_map[generic]
+    eight = qconfig.target_scheme_map["Linear"]
+    rules = [(generic, four), (backbone, eight)]
+    if not generic_first:
+        rules.reverse()
+    qconfig.target_scheme_map = dict(rules)
+    before = list(qconfig.target_scheme_map.items())
+    layer = nn.Linear(8, 8)
+    name = "model.layers.78.mlp.experts.0.down_proj"
+    expected = qconfig.get_scheme_dict(layer, name)
+    adapted = mtp_module._mtp_quantization_config(_glm_engine(qconfig), "model.layers.78")
+    assert adapted.quant_config.get_scheme_dict(layer, name) == expected
+    assert expected["weights"].num_bits == (4 if generic_first else 8)
+    assert list(qconfig.target_scheme_map.items()) == before
+
+
+@pytest.mark.parametrize("prefix", ["model.layers.78", "model.layers.79"])
+def test_mtp_backbone_regex_does_not_override_decoder_rule(mtp_module, prefix):
+    canonical = r"re:^model[.]decoder[.]mlp[.]experts[.]\d+[.]down_proj$"
+    backbone = r"re:^model[.]layers[.]\d+[.].*proj$"
+    qconfig = _mixed_quant_config(canonical)
+    four = qconfig.target_scheme_map[canonical]
+    eight = qconfig.target_scheme_map["Linear"]
+    qconfig.target_scheme_map = {canonical: four, backbone: eight}
+    engine = _glm_engine(qconfig)
+    engine.model_config.hf_config.num_hidden_layers = 78
+    adapted = mtp_module._mtp_quantization_config(engine, prefix)
+    assert adapted.quant_config.get_scheme_dict(
+        nn.Linear(8, 8), prefix + ".mlp.experts.0.down_proj",
+    )["weights"].num_bits == 4
+
+
 @pytest.mark.parametrize("actual", [
     "model.layers.78.mlp.experts.0.down_proj",
     r"re:^model[.]layers[.]78[.]mlp[.]experts[.]0[.]down_proj$",
