@@ -2544,6 +2544,7 @@ def test_reload_scale_refresh_is_scoped_to_glm_installed_layout(
     glm_method, installed_layout
 ):
     from vllm_hcu.model_executor.layers.quantization.glm_moe_dsa_w4a8 import (
+        _expert_weight_generation,
         commit_installed_glm_w4a8_gemm2_generations,
     )
     from vllm_hcu.model_executor.layers.quantization.slimquant_w4a8 import (
@@ -2566,7 +2567,11 @@ def test_reload_scale_refresh_is_scoped_to_glm_installed_layout(
     layer.w13_weight_scale = torch.nn.Parameter(torch.full((1,), 7.0), requires_grad=False)
     layer.w2_weight_scale = torch.nn.Parameter(torch.full((1,), 11.0), requires_grad=False)
     if installed_layout == "gemm2":
-        layer._glm_w4a8_gemm2_generation = ("previous owners",)
+        layer._glm_w4a8_gemm2_generation = _expert_weight_generation(layer)
+        layer._hcu_slimquant_post_load_aiter_config = SimpleNamespace(
+            quant_type="w4a8", solution_type="moe_c",
+            need_shuffle=False, need_shuffle_scale=False,
+        )
     elif installed_layout == "native":
         layer.w13_weight._hcu_vllm_w4a8_unpacked = True
         layer.w2_weight._hcu_vllm_w4a8_unpacked = True
@@ -2763,14 +2768,16 @@ def test_finish_weight_update_keeps_glm_layout_and_scale_owners(
         layer.expert_mask = None
         method.get_fused_moe_quant_config(layer)
         if installed_layout == "gemm2":
+            config = SimpleNamespace(
+                quant_type="w4a8", solution_type="moe_c",
+                need_shuffle=False, need_shuffle_scale=False,
+            )
             compressed_tensors_moe_runtime.install_aiter_moe_weight_layout(
                 layer,
-                SimpleNamespace(
-                    quant_type="w4a8", solution_type="moe_c",
-                    need_shuffle=False, need_shuffle_scale=False,
-                ),
+                config,
                 logical_shape=(2, 16, 8, 8),
             )
+            layer._hcu_slimquant_post_load_aiter_config = config
             layer._glm_w4a8_gemm2_generation = _expert_weight_generation(layer)
         else:
             compressed_tensors_moe_runtime.prepare_vllm_w4a8_moe(method, layer)
@@ -2836,6 +2843,154 @@ def test_finish_weight_update_without_draft_model(monkeypatch, has_getter) -> No
         worker.model_runner.get_draft_model = lambda: None
     worker._weight_update_is_draft = True
     worker.finish_weight_update()
+
+
+def _loaded_glm_gemm2_model(monkeypatch):
+    from vllm_hcu.model_executor.layers.fused_moe import deepep_runtime
+    from vllm_hcu.model_executor.layers.quantization import (
+        compressed_tensors_moe_runtime as runtime,
+    )
+
+    config = SimpleNamespace(
+        quant_type="w4a8", solution_type="moe_c",
+        need_shuffle=True, need_shuffle_scale=True,
+    )
+    shuffled = []
+
+    def vendor_shuffle(weight):
+        shuffled.append(weight.shape)
+        return weight
+
+    monkeypatch.setitem(
+        sys.modules, "aiter.ops.shuffle",
+        _module("aiter.ops.shuffle", w4a8_moe_layout_shuffle_gemm2=vendor_shuffle),
+    )
+    monkeypatch.setattr(runtime, "prewarm_aiter_w4a8_moe", lambda *args: config)
+    monkeypatch.setattr(
+        deepep_runtime, "slimquant_w4a8_uses_deepep_auto", lambda moe: False
+    )
+    method, layer = _glm_aiter_method("auto")
+    method.moe.activation = "silu"
+    method.moe.num_experts = 2
+    layer.quant_method = method
+    for name, shape in (("w13_weight", (2, 16, 4)), ("w2_weight", (2, 8, 4))):
+        layer.register_parameter(name, torch.nn.Parameter(
+            torch.tensor([0x12, 0x34, 0x56, 0x78], dtype=torch.int8).repeat(
+                shape[0], shape[1], 1
+            ), requires_grad=False,
+        ))
+    for name, shape in (
+        ("w13_weight_scale", (2, 16, 1)), ("w2_weight_scale", (2, 8, 1)),
+    ):
+        layer.register_parameter(name, torch.nn.Parameter(
+            torch.ones(shape), requires_grad=False,
+        ))
+    layer.register_parameter("w13_input_scale", None)
+    layer.register_parameter("w2_input_scale", None)
+    layer.global_num_experts = 2
+    layer.swiglu_limit = layer._expert_map = layer.expert_mask = None
+    # Keep the real GLM and SlimQuant post-load bodies. Only the vendor shuffle
+    # and device-dependent prewarm are isolated.
+    method.process_weights_after_loading(layer)
+    assert len(shuffled) == 4
+    return layer, shuffled
+
+
+@pytest.mark.parametrize("draft", [False, True])
+@pytest.mark.parametrize("replacement", ["inplace", "w13_weight", "w2_weight", "all"])
+@pytest.mark.parametrize("route", ["supported", "missing", "incompatible"])
+def test_finish_weight_update_preserves_gemm2_routing_contract(
+    monkeypatch, draft, replacement, route
+) -> None:
+    from vllm_hcu.model_executor.layers.quantization import (
+        compressed_tensors_moe_runtime as runtime,
+    )
+    from vllm_hcu.model_executor.layers.quantization.glm_moe_dsa_w4a8 import (
+        glm_expert_weights_use_gemm2_layout,
+    )
+
+    layer, shuffled = _loaded_glm_gemm2_model(monkeypatch)
+    original_bytes = (layer.w13_weight.clone(), layer.w2_weight.clone())
+    expected_layout = getattr(layer.w13_weight, runtime._WEIGHT_LAYOUT_ATTR)
+    untouched = torch.nn.Module()
+
+    def finish_update():
+        for name, parameter in list(layer.named_parameters()):
+            updated = parameter.detach().clone()
+            if replacement in (name, "all"):
+                setattr(layer, name, torch.nn.Parameter(updated, requires_grad=False))
+            else:
+                parameter.copy_(updated)
+
+    worker = _weight_update_worker(monkeypatch, finish_update)
+    worker.model_runner = SimpleNamespace(
+        model=untouched if draft else layer,
+        get_draft_model=lambda: layer if draft else untouched,
+    )
+    worker._weight_update_is_draft = draft
+
+    def select_config(**kwargs):
+        if route == "missing":
+            return False, None
+        return True, SimpleNamespace(
+            quant_type="w4a8", solution_type="moe_c",
+            need_shuffle=True, need_shuffle_scale=True,
+            config={"PADDED_K": 16} if route == "incompatible" else {},
+        )
+
+    for num_tokens in (7, 11):
+        worker.finish_weight_update()
+        assert glm_expert_weights_use_gemm2_layout(layer)
+        if route == "supported":
+            calls = _forward_reloaded_weights(
+                monkeypatch, layer, num_tokens, select_config=select_config
+            )
+            assert calls["execute"]["w1"] is layer.w13_weight
+            assert calls["execute"]["w2"] is layer.w2_weight
+            assert calls["execute"]["use_weight_shuffle"] is False
+        else:
+            message = (
+                "no MOE_C solution for installed W4A8 weights"
+                if route == "missing" else "physical layout does not match"
+            )
+            with pytest.raises(runtime.HcuCompressedTensorsMoeError, match=message):
+                _forward_reloaded_weights(
+                    monkeypatch, layer, num_tokens, select_config=select_config
+                )
+        for weight, expected in zip(
+            (layer.w13_weight, layer.w2_weight), original_bytes
+        ):
+            assert torch.equal(weight, expected)
+            assert getattr(weight, runtime._WEIGHT_SOLUTION_ATTR) == "moe_c"
+            assert getattr(weight, runtime._WEIGHT_LAYOUT_ATTR) == expected_layout
+            assert getattr(weight, runtime._WEIGHT_LOGICAL_SHAPE_ATTR) == (2, 16, 8, 8)
+            assert weight.is_shuffled is False
+        assert len(shuffled) == 4
+        assert not hasattr(untouched, "_glm_w4a8_gemm2_generation")
+
+
+@pytest.mark.parametrize("invalid", ["dtype", "shape", "stride"])
+def test_gemm2_online_replacement_rejects_incompatible_storage(monkeypatch, invalid):
+    from vllm_hcu.model_executor.layers.quantization.glm_moe_dsa_w4a8 import (
+        commit_installed_glm_w4a8_gemm2_generations,
+        glm_expert_weights_use_gemm2_layout,
+    )
+
+    layer, shuffled = _loaded_glm_gemm2_model(monkeypatch)
+    generation = layer._glm_w4a8_gemm2_generation
+    if invalid == "dtype":
+        replacement = layer.w13_weight.float()
+    elif invalid == "shape":
+        replacement = layer.w13_weight[..., :2]
+    else:
+        replacement = layer.w13_weight.transpose(1, 2).contiguous().transpose(1, 2)
+    layer.w13_weight = torch.nn.Parameter(replacement, requires_grad=False)
+
+    with pytest.raises(RuntimeError, match="GEMM2 replacement has incompatible weights"):
+        commit_installed_glm_w4a8_gemm2_generations(layer)
+    assert layer._glm_w4a8_gemm2_generation is generation
+    assert not glm_expert_weights_use_gemm2_layout(layer)
+    assert len(shuffled) == 4
 
 
 @pytest.mark.parametrize("draft", [False, True])
@@ -3201,7 +3356,7 @@ def test_v2_reload_preserves_non_glm_parameter_owners() -> None:
     assert not hasattr(model, "_glm_w4a8_gemm2_generation")
 
 
-def _forward_reloaded_weights(monkeypatch, layer, num_tokens=3):
+def _forward_reloaded_weights(monkeypatch, layer, num_tokens=3, *, select_config=None):
     from vllm_hcu.model_executor.layers.quantization import (
         compressed_tensors_moe_runtime,
     )
@@ -3242,7 +3397,7 @@ def _forward_reloaded_weights(monkeypatch, layer, num_tokens=3):
         _module(
             "aiter.moe",
             MoeQuantType=MoeQuantType,
-            get_aiter_moe_config=get_config,
+            get_aiter_moe_config=select_config or get_config,
             aiter_moe=aiter_moe,
         ),
     )

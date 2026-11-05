@@ -119,7 +119,7 @@ def commit_installed_glm_w4a8_gemm2_generation(layer: torch.nn.Module) -> None:
     Parameter. Kernel-format reload copies into that same Parameter and
     bumps its version. Rebind the existing quant config to the installed
     scale owners as well, preserving references held by the execution path.
-    Online replacement also restores native tensor metadata and DeepEP
+    Online replacement also restores AITER tensor metadata and DeepEP
     packed-weight views. These paths only rebind installed storage; they
     must not repack or unpack its bytes again.
     """
@@ -127,10 +127,47 @@ def commit_installed_glm_w4a8_gemm2_generation(layer: torch.nn.Module) -> None:
     if not isinstance(method, GlmMoeDsaW4A8MoEMethod):
         return
     native_shapes = getattr(layer, "_hcu_vllm_w4a8_unpacked_shapes", None)
-    if getattr(layer, _GLM_W4A8_GEMM2_GENERATION, None):
+    installed_generation = getattr(layer, _GLM_W4A8_GEMM2_GENERATION, None)
+    if installed_generation:
         generation = _expert_weight_generation(layer)
         if not generation:
             return
+        if any(
+            getattr(layer, name).dtype != torch.int8 or current[3:] != installed[3:]
+            for name, current, installed in zip(
+                _GLM_EXPERT_WEIGHTS, generation, installed_generation
+            )
+        ):
+            raise RuntimeError("GLM W4A8 GEMM2 replacement has incompatible weights")
+        config = getattr(layer, "_hcu_slimquant_post_load_aiter_config", None)
+        if config is None:
+            raise RuntimeError("GLM W4A8 GEMM2 installed layout config is missing")
+        from vllm_hcu.model_executor.layers.fused_moe.aiter_moe_dispatch import (
+            aiter_moe_weight_layout_signature,
+        )
+        from vllm_hcu.model_executor.layers.quantization.compressed_tensors_moe_runtime import (
+            _WEIGHT_LAYOUT_ATTR,
+            _WEIGHT_LOGICAL_SHAPE_ATTR,
+            _WEIGHT_SOLUTION_ATTR,
+        )
+
+        # New Parameters lose their solution/layout attributes. Restore the
+        # same installed contract so an unsupported M cannot fall back to
+        # interpreting gemm2 bytes as canonical packed weights.
+        _disable_generic_w4a8_shuffle(config)
+        layout = aiter_moe_weight_layout_signature(config)
+        logical_shape = (
+            int(layer.w13_weight.shape[0]),
+            int(layer.w13_weight.shape[1]),
+            int(layer.w2_weight.shape[1]),
+            int(layer.w13_weight.shape[2]) * 2,
+        )
+        for name in _GLM_EXPERT_WEIGHTS:
+            weight = getattr(layer, name)
+            setattr(weight, _WEIGHT_SOLUTION_ATTR, "moe_c")
+            setattr(weight, _WEIGHT_LAYOUT_ATTR, layout)
+            setattr(weight, _WEIGHT_LOGICAL_SHAPE_ATTR, logical_shape)
+            weight.is_shuffled = False
         setattr(layer, _GLM_W4A8_GEMM2_GENERATION, generation)
         layer._glm_w4a8_gemm2_shuffled = True
     elif native_shapes is not None or all(
