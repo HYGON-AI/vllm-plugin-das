@@ -131,10 +131,11 @@ def _parse_quant_args(value: Any) -> Any:
 
         try:
             return QuantizationArgs.model_validate(value)
-        except (TypeError, ValueError, NotImplementedError):
-            # compressed-tensors validators raise TypeError on odd value types
-            # and NotImplementedError for unsupported float widths, besides the
-            # ValueError that pydantic turns into a ValidationError.
+        except Exception:
+            # Whatever the validator raises (pydantic's ValidationError, or a
+            # TypeError / NotImplementedError from a compressed-tensors check),
+            # native cannot load this group either, and the parent reports it
+            # with its own error. Detection must not abort config resolution.
             return None
     if isinstance(value, (list, tuple, str, bytes, int, float)):
         return None
@@ -258,6 +259,28 @@ def _class_name_matches_target(class_name: str, target: str) -> bool:
     return is_equal_or_regex_match(class_name, target, check_contains=True)
 
 
+def _probe_matcher(targets: list[str]):
+    """Return ``matches(probe)`` for path targets, as native matches layer names.
+
+    A plain target matches by equality and a ``re:`` target by ``re.match``.
+    Plain targets go in a set, so a config that lists every expert projection
+    by name costs one lookup per probe instead of one comparison per target.
+    """
+    from vllm.model_executor.layers.quantization.utils.config_utils import (
+        is_equal_or_regex_match,
+    )
+
+    exact = {target for target in targets if not target.startswith("re:")}
+    patterns = [target for target in targets if target.startswith("re:")]
+
+    def matches(probe: str) -> bool:
+        return probe in exact or any(
+            is_equal_or_regex_match(probe, pattern) for pattern in patterns
+        )
+
+    return matches
+
+
 def _targets_cover_routed_experts(
     targets: list[str],
     ignore: Any = None,
@@ -270,16 +293,13 @@ def _targets_cover_routed_experts(
     match these probes. A class-name target covers every routed expert that
     ``ignore`` leaves in place.
     """
-    from vllm.model_executor.layers.quantization.utils.config_utils import (
-        is_equal_or_regex_match,
-    )
-
     # A class-name target covers every expert that ``ignore`` leaves in place,
     # whatever the probe is, so it is decided once outside the probe loop.
     covers_by_class = any(
         _class_name_matches_target(_ROUTED_EXPERTS_CLASS, target)
         for target in targets
     )
+    matches = _probe_matcher(targets)
     # The ignore rules depend on the expert, not on which of its four probes
     # matched, so each expert is checked once.
     ignored: dict[tuple[str, int], bool] = {}
@@ -287,10 +307,7 @@ def _targets_cover_routed_experts(
         # Target matching is cheap and usually fails for non-expert targets,
         # while the ignore check runs several regexes. Test targets first so
         # only matching probes pay for the ignore check.
-        if not (
-            covers_by_class
-            or any(is_equal_or_regex_match(probe, target) for target in targets)
-        ):
+        if not (covers_by_class or matches(probe)):
             continue
         key = (module_prefix, expert_id)
         if key not in ignored:

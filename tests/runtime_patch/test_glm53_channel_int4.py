@@ -504,10 +504,16 @@ def test_none_and_already_parsed_arguments_pass_through_the_parser() -> None:
 
 
 @pytest.mark.parametrize(
-    "error", [TypeError("odd value"), NotImplementedError("float width")]
+    "error",
+    [
+        TypeError("odd value"),
+        NotImplementedError("float width"),
+        AttributeError("other compressed-tensors version"),
+        KeyError("missing key"),
+    ],
 )
 def test_schema_errors_beyond_value_error_select_nothing(monkeypatch, error) -> None:
-    """compressed-tensors validators can raise these as well as ValueError."""
+    """Whatever a compressed-tensors validator raises, detection selects nothing."""
     from compressed_tensors.quantization import QuantizationArgs
 
     def fail(value):
@@ -515,6 +521,9 @@ def test_schema_errors_beyond_value_error_select_nothing(monkeypatch, error) -> 
 
     monkeypatch.setattr(QuantizationArgs, "model_validate", staticmethod(fail))
     assert is_glm_channel_int4_w4a8(_quant_config(), _glm_hf_config()) is False
+    assert GlmMoeDsaW4A8Facade.override_quantization_method(
+        _quant_config(), None, _glm_hf_config()
+    ) is None
 
 
 @pytest.mark.parametrize(
@@ -1410,6 +1419,73 @@ def test_ignore_rules_are_checked_once_per_expert_during_detection(monkeypatch) 
     assert len(calls) == 6 and len(set(calls)) == 6
 
 
+@pytest.mark.parametrize(
+    "targets",
+    [
+        [],
+        ["model.layers.4.mlp.experts.0.gate_proj"],
+        [r"re:^model\.layers\.4\.mlp\.experts\.\d+\.(gate_proj|up_proj)$"],
+        [
+            "model.layers.4.mlp.experts.1.up_proj",
+            r"re:.*\.down_proj$",
+            "Linear",
+            "model.layers.9.mlp.experts.0.gate_proj",
+        ],
+        ["re:.*", "model.layers.4.mlp.experts.0.gate_proj"],
+    ],
+)
+def test_probe_matcher_agrees_with_native_name_matching(targets) -> None:
+    from vllm.model_executor.layers.quantization.utils.config_utils import (
+        is_equal_or_regex_match,
+    )
+    from vllm_hcu.model_executor.layers.quantization.glm_channel_int4 import (
+        _probe_matcher,
+    )
+
+    matches = _probe_matcher(targets)
+    probes = [
+        f"model.layers.{layer}.mlp.experts.{expert}.{proj}"
+        for layer in (4, 9)
+        for expert in (0, 1)
+        for proj in ("gate_proj", "up_proj", "down_proj")
+    ] + ["model.layers.4.mlp.experts", "Linear", ""]
+    for probe in probes:
+        assert matches(probe) is any(
+            is_equal_or_regex_match(probe, target) for target in targets
+        ), probe
+
+
+def test_path_targets_are_not_compared_one_by_one_during_detection(monkeypatch) -> None:
+    """A config naming every expert projection must not cost probes x targets."""
+    from vllm.model_executor.layers.quantization.utils import config_utils
+
+    real = config_utils.is_equal_or_regex_match
+    calls = []
+
+    def counting(*args, **kwargs):
+        calls.append(args)
+        return real(*args, **kwargs)
+
+    monkeypatch.setattr(config_utils, "is_equal_or_regex_match", counting)
+    hf_config = _glm_hf_config()
+    hf_config.num_hidden_layers = 5
+    hf_config.n_routed_experts = 4
+    targets = [
+        f"model.layers.{layer}.mlp.experts.{expert}.{proj}"
+        for layer in range(40, 60)
+        for expert in range(8)
+        for proj in ("gate_proj", "up_proj", "down_proj")
+    ]
+    quant = _quant_config()
+    quant["config_groups"]["group_int4"]["targets"] = targets
+    # The model has 5 layers, so the first probes (layers 0-4) match no target
+    # before the literal layers 40-59 named by the targets are reached.
+    assert is_glm_channel_int4_w4a8(quant, hf_config) is True
+    # One check per target for the class-name rule and none per probe. Comparing
+    # every probe with every target would take over 38,000 comparisons here.
+    assert len(calls) <= 2 * len(targets) + 10
+
+
 def test_class_target_is_only_resolved_for_projections_without_a_path_target(
     monkeypatch,
 ) -> None:
@@ -2052,8 +2128,6 @@ def test_loaders_that_use_the_gate_keep_the_quant_config(filename, class_name) -
         if isinstance(node, ast.Assign)
         for target in node.targets
     )
-
-
 
 
 def test_expert_loaders_convert_weights_and_scales() -> None:
