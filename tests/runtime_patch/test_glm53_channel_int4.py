@@ -1285,6 +1285,22 @@ def test_projection_path_targets_precede_class_name_targets(
         ) == ("int8" if index == 3 else "int4")
 
 
+def _native_class_target(layer, targets):
+    """What native ``find_matched_target`` resolves from the class name alone."""
+    try:
+        from vllm.model_executor.layers.quantization.compressed_tensors.utils import (
+            find_matched_target,
+        )
+    except ImportError:
+        pytest.skip("native find_matched_target is unavailable")
+    try:
+        return find_matched_target(
+            "model.layers.4.mlp.experts.0.gate_proj", layer, list(targets)
+        )
+    except ValueError:
+        return None
+
+
 @pytest.mark.parametrize(
     "targets",
     [
@@ -1304,29 +1320,42 @@ def test_projection_path_targets_precede_class_name_targets(
 )
 def test_class_target_matching_agrees_with_native_find_matched_target(targets) -> None:
     """Differential check on the concrete class name, including target order."""
-    try:
-        from vllm.model_executor.layers.quantization.compressed_tensors.utils import (
-            find_matched_target,
-        )
-    except ImportError:
-        pytest.skip("native find_matched_target is unavailable")
     from vllm.model_executor.layers.fused_moe import RoutedExperts
     from vllm_hcu.model_executor.layers.quantization.glm_channel_int4 import (
         _match_target_by_class,
     )
 
     layer = RoutedExperts.__new__(RoutedExperts)
-    try:
-        expected = find_matched_target(
-            "model.layers.4.mlp.experts.0.gate_proj", layer, targets
-        )
-    except ValueError:
-        expected = None
+    expected = _native_class_target(layer, targets)
     assert _match_target_by_class(layer, dict.fromkeys(targets)) == expected
 
 
-def test_class_targets_also_match_ancestor_class_names() -> None:
-    """A renamed RoutedExperts subclass still resolves its base-class targets."""
+def test_class_targets_do_not_match_ancestor_class_names_either() -> None:
+    """Native compares the concrete class only, so ancestors must not select a scheme."""
+    from vllm.model_executor.layers.fused_moe import RoutedExperts
+    from vllm_hcu.model_executor.layers.quantization.glm_channel_int4 import (
+        _match_target_by_class,
+    )
+
+    # Named ancestors regardless of how vLLM lays out its own layer hierarchy.
+    base = type("PluggableLayerBase", (RoutedExperts,), {})
+    layer_class = type("ConcreteExperts", (base,), {})
+    layer = layer_class.__new__(layer_class)
+    own = layer_class.__name__.lower()
+    ancestors = {
+        cls.__name__ for cls in layer_class.__mro__[1:] if cls.__name__ != "object"
+    }
+    assert {"PluggableLayerBase", "RoutedExperts"} <= ancestors
+    for name in ancestors:
+        # Literal, substring and regex spellings of an ancestor's name.
+        for target in (name, name[: max(3, len(name) // 2)], f"re:^{name}$"):
+            if target.lower() in own:
+                continue  # also a substring of the concrete name, which matches
+            assert _match_target_by_class(layer, {target: None}) is None, target
+            assert _native_class_target(layer, [target]) is None, target
+
+
+def test_subclass_is_matched_by_its_own_class_name_like_native() -> None:
     from vllm.model_executor.layers.fused_moe import RoutedExperts
     from vllm_hcu.model_executor.layers.quantization.glm_channel_int4 import (
         _match_target_by_class,
@@ -1334,9 +1363,48 @@ def test_class_targets_also_match_ancestor_class_names() -> None:
 
     layer_class = type("RenamedExperts", (RoutedExperts,), {})
     layer = layer_class.__new__(layer_class)
-    for target in ("RoutedExperts", "re:^RoutedExperts$"):
-        assert _match_target_by_class(layer, {"Linear": None, target: None}) == target
-    assert _match_target_by_class(layer, {"Linear": None, "re:^Other$": None}) is None
+    for targets in (
+        ["RoutedExperts"],
+        ["re:^RoutedExperts$"],
+        ["Renamed"],
+        ["re:^RenamedExperts$"],
+        ["Linear", "Experts"],
+    ):
+        assert _match_target_by_class(layer, dict.fromkeys(targets)) == (
+            _native_class_target(layer, targets)
+        ), targets
+
+
+def test_detection_class_name_is_the_routed_experts_class_name() -> None:
+    from vllm.model_executor.layers.fused_moe import RoutedExperts
+    from vllm_hcu.model_executor.layers.quantization.glm_channel_int4 import (
+        _ROUTED_EXPERTS_CLASS,
+    )
+
+    assert _ROUTED_EXPERTS_CLASS == RoutedExperts.__name__
+
+
+def test_ignore_rules_are_checked_once_per_expert_during_detection(monkeypatch) -> None:
+    from vllm_hcu.model_executor.layers.quantization import glm_channel_int4
+
+    calls = []
+    real = glm_channel_int4._ignore_covers_expert
+
+    def counting(layer, prefix, ignore, fused_mapping, expert_id=0):
+        calls.append((prefix, expert_id))
+        return real(layer, prefix, ignore, fused_mapping, expert_id)
+
+    monkeypatch.setattr(glm_channel_int4, "_ignore_covers_expert", counting)
+    quant = _quant_config()
+    quant["config_groups"]["group_int4"]["targets"] = ["RoutedExperts"]
+    quant["ignore"] = [r"re:.*\.mlp\.experts.*"]
+    hf_config = _glm_hf_config()
+    hf_config.num_hidden_layers = 2
+    hf_config.n_routed_experts = 3
+    # Every expert is ignored, so all of them are inspected and nothing is selected.
+    assert is_glm_channel_int4_w4a8(quant, hf_config) is False
+    # Two layers x three experts, each checked exactly once (not once per probe).
+    assert len(calls) == 6 and len(set(calls)) == 6
 
 
 def test_class_target_is_only_resolved_for_projections_without_a_path_target(
@@ -1584,86 +1652,30 @@ def test_last_logical_expert_is_checked_without_ep_locality(projection) -> None:
         routed_expert_uses_glm_channel_int4(config, layer, prefix)
 
 
-def _routed_experts_layer(fused_shared_experts):
-    """RoutedExperts as native leaves it before quant selection.
-
-    ``num_logical_experts`` counts routed experts only. Fused shared experts are
-    extra slots tracked by the expert map manager, or absent when None.
-    """
-    from vllm.model_executor.layers.fused_moe import RoutedExperts
-
-    layer = RoutedExperts.__new__(RoutedExperts)
-    layer.moe_config = SimpleNamespace(num_logical_experts=2)
-    if fused_shared_experts is not None:
-        layer.expert_map_manager = SimpleNamespace(
-            num_fused_shared_experts=fused_shared_experts
-        )
-    return layer
-
-
-def _fused_shared_scenario(glm_module, scenario):
-    """(config, prefix, label) for each way get_quant_method can resolve a layer."""
-    quant = _quant_config()
-    prefix, label = "model.layers.4.mlp.experts", "int4"
-    if scenario == "ignored-owner":
-        quant["ignore"] = [prefix]
-        label = "unquantized"
-    elif scenario == "int8-experts":
-        projections = ("gate_proj", "up_proj", "down_proj")
-        prefix, label = "model.layers.3.mlp.experts", "int8"
-        quant["config_groups"] = {
-            "int4": dict(
-                _int4_scheme(), targets=[r"re:^model\.layers\.4\.mlp\.experts.*"]
-            ),
-            "int8_layer": dict(
-                _int8_scheme(),
-                targets=[f"{prefix}.{e}.{p}" for e in range(2) for p in projections],
-            ),
-            "linears": dict(_int8_scheme(), targets=["Linear"]),
-        }
-    config = glm_module.GlmMoeDsaChannelW4A8Config.from_config(quant)
-    config.packed_modules_mapping = {}
-    return config, prefix, label
-
-
-@pytest.mark.parametrize("scenario", ["int4", "ignored-owner", "int8-experts"])
-def test_layers_that_fused_shared_experts_are_rejected_on_every_branch(
-    glm_quant_method_labels, scenario
-) -> None:
-    config, prefix, label = _fused_shared_scenario(glm_quant_method_labels, scenario)
-    # Not fused (no manager at all, or none fused): selection is unchanged.
-    for fused in (None, 0):
-        assert config.get_quant_method(_routed_experts_layer(fused), prefix) == label
-    for fused in (1, 2):
-        with pytest.raises(NotImplementedError, match="fused shared experts") as error:
-            config.get_quant_method(_routed_experts_layer(fused), prefix)
-        message = str(error.value)
-        assert repr(prefix) in message
-        assert f"fuses {fused} of them" in message
-        assert "supports_fused_shared_experts" in message
-
-
-def test_fused_shared_experts_are_rejected_for_mtp_prefixes(
-    glm_quant_method_labels,
-) -> None:
-    config, _, _ = _fused_shared_scenario(glm_quant_method_labels, "int4")
-    prefix = "model.layers.4.mtp_block.mlp.experts"
-    assert config.get_quant_method(_routed_experts_layer(0), prefix) == "int4"
-    with pytest.raises(NotImplementedError, match="fused shared experts"):
-        config.get_quant_method(_routed_experts_layer(1), prefix)
-
-
 _MODELS = Path(__file__).parents[2] / "vllm_hcu/models"
+
+
+def _extract_functions(path, class_name=None, names=()):
+    """Production ``def`` nodes, optionally the methods of one class."""
+    body = ast.parse(path.read_text(encoding="utf-8")).body
+    if class_name is not None:
+        body = next(
+            node.body
+            for node in body
+            if isinstance(node, ast.ClassDef) and node.name == class_name
+        )
+    return [
+        node
+        for node in body
+        if isinstance(node, ast.FunctionDef) and node.name in names
+    ]
 
 
 def _load_fused_shared_experts_gate(flag):
     """The production gate, extracted so the full model module is not imported."""
     path = _MODELS / "deepseek_v2.py"
-    func = next(
-        node
-        for node in ast.parse(path.read_text(encoding="utf-8")).body
-        if isinstance(node, ast.FunctionDef)
-        and node.name == "is_fused_shared_experts_enabled"
+    (func,) = _extract_functions(
+        path, names=("is_fused_shared_experts_enabled",)
     )
     warnings = []
     namespace = {
@@ -1721,6 +1733,110 @@ def test_fused_shared_experts_gate_follows_the_quant_config(flag) -> None:
         assert warnings == []
 
 
+def _build_moe(flag, quant_config):
+    """Run the production ``DeepseekV2MoE.__init__`` with its collaborators stubbed.
+
+    Returns the module, the FusedMoE call kwargs and the shared-MLP constructions.
+    """
+    path = _MODELS / "deepseek_v2.py"
+    gate, _ = _load_fused_shared_experts_gate(flag)
+    (init,) = _extract_functions(path, "DeepseekV2MoE", ("__init__",))
+    cls = ast.ClassDef(
+        name="DeepseekV2MoE",
+        bases=[
+            ast.Attribute(
+                value=ast.Name(id="nn", ctx=ast.Load()),
+                attr="Module",
+                ctx=ast.Load(),
+            )
+        ],
+        keywords=[],
+        body=[init],
+        decorator_list=[],
+    )
+    module = ast.Module(
+        body=[
+            ast.ImportFrom(
+                module="__future__", names=[ast.alias(name="annotations")], level=0
+            ),
+            cls,
+        ],
+        type_ignores=[],
+    )
+    experts, shared = [], []
+
+    def fused_moe(**kwargs):
+        experts.append(kwargs)
+        return "experts"
+
+    def shared_mlp(**kwargs):
+        shared.append(kwargs)
+        return SimpleNamespace(kind="shared-mlp")
+
+    namespace = {
+        "nn": torch.nn,
+        "torch": torch,
+        "is_fused_shared_experts_enabled": gate,
+        "get_tensor_model_parallel_world_size": lambda: 1,
+        "get_tensor_model_parallel_rank": lambda: 0,
+        "get_ep_group": lambda: SimpleNamespace(
+            device_group=SimpleNamespace(size=lambda: 1), rank_in_group=0
+        ),
+        "GateLinear": lambda *args, **kwargs: SimpleNamespace(out_dtype=torch.float32),
+        "rocm_aiter_ops": SimpleNamespace(is_fused_moe_enabled=lambda: False),
+        "DeepseekV2SharedMLP": shared_mlp,
+        "FusedMoE": fused_moe,
+    }
+    exec(compile(ast.fix_missing_locations(module), str(path), "exec"), namespace)
+    config = SimpleNamespace(
+        hidden_act="silu",
+        hidden_size=16,
+        n_routed_experts=4,
+        n_shared_experts=1,
+        moe_intermediate_size=8,
+        num_experts_per_tok=2,
+        norm_topk_prob=True,
+        routed_scaling_factor=2.5,
+        topk_method="greedy",
+    )
+    parallel = SimpleNamespace(
+        use_sequence_parallel_moe=False,
+        enable_eplb=False,
+        eplb_config=SimpleNamespace(num_redundant_experts=0),
+    )
+    moe = namespace["DeepseekV2MoE"](config, parallel, quant_config, "model.layers.4.mlp")
+    return moe, experts, shared
+
+
+@pytest.mark.parametrize("flag", [False, True])
+def test_moe_constructor_follows_the_fusion_gate(flag) -> None:
+    """The gate result decides the shared-expert module and what FusedMoE is told."""
+    from vllm_hcu.model_executor.layers.quantization.glm_moe_dsa_w4a8 import (
+        GlmMoeDsaChannelW4A8Config,
+    )
+
+    glm_config = GlmMoeDsaChannelW4A8Config.__new__(GlmMoeDsaChannelW4A8Config)
+    # GLM INT4 keeps separate shared experts whatever the AITER flag says.
+    moe, experts, shared = _build_moe(flag, glm_config)
+    assert moe.is_fusion_moe_shared_experts_enabled is False
+    assert len(shared) == 1 and shared[0]["intermediate_size"] == 8
+    assert moe.shared_experts is not None
+    assert experts[0]["shared_experts"] is moe.shared_experts
+    assert experts[0]["n_shared_experts"] is None
+
+    # Any config that declares nothing keeps following the flag alone.
+    for quant_config in (None, SimpleNamespace()):
+        moe, experts, shared = _build_moe(flag, quant_config)
+        assert moe.is_fusion_moe_shared_experts_enabled is flag
+        if flag:
+            assert moe.shared_experts is None and shared == []
+            assert experts[0]["shared_experts"] is None
+            assert experts[0]["n_shared_experts"] == 1
+        else:
+            assert moe.shared_experts is not None and len(shared) == 1
+            assert experts[0]["n_shared_experts"] is None
+
+
 class _FusionFlagUses(ast.NodeVisitor):
     """Where model code reads the AITER fusion flag or calls the gate."""
 
@@ -1753,15 +1869,21 @@ def _fusion_flag_uses(filename):
     return visitor
 
 
-def test_model_code_decides_shared_expert_fusion_only_through_the_gate() -> None:
-    """The model, its loader and the MTP loader must agree on one decision."""
-    v2, mtp = _fusion_flag_uses("deepseek_v2.py"), _fusion_flag_uses("deepseek_mtp.py")
-    # The invariant: the AITER flag is read in the gate and nowhere else here.
-    assert v2.raw == ["is_fused_shared_experts_enabled"]
-    assert mtp.raw == []
-    # Each decision point goes through the gate (a new consumer may be added).
-    assert {"DeepseekV2MoE.__init__", "DeepseekV2Model.load_weights"} <= set(v2.gated)
-    assert "DeepSeekMTP.load_weights" in mtp.gated
+@pytest.mark.parametrize(
+    "filename,decision_point",
+    [
+        ("deepseek_v2.py", "DeepseekV2MoE.__init__"),
+        ("deepseek_v2.py", "DeepseekV2Model.load_weights"),
+        ("deepseek_mtp.py", "DeepSeekMTP.load_weights"),
+    ],
+)
+def test_shared_expert_fusion_decision_points_use_only_the_gate(
+    filename, decision_point
+) -> None:
+    """The constructor and both loaders must agree, so none reads the raw flag."""
+    uses = _fusion_flag_uses(filename)
+    assert decision_point in uses.gated
+    assert decision_point not in uses.raw
 
 
 @pytest.mark.parametrize(

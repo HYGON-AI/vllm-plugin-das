@@ -130,13 +130,15 @@ logger = init_logger(__name__)
 
 
 def is_fused_shared_experts_enabled(quant_config: QuantizationConfig | None) -> bool:
-    """Whether this model fuses its shared experts into the routed expert tensors.
+    """Whether the model asks for fused shared experts under this quant config.
 
-    The model, its loader and the MTP loader must all decide this through here
-    rather than from the AITER flag alone, so they agree. Like native vLLM, keep
-    the shared experts separate (with a warning) when the quantization config
-    cannot hold them there. Code that only reads the global flag, such as kernel
-    support checks, is unaffected.
+    The model constructor, its loader and the MTP loader all decide this through
+    here, so they agree on whether the shared experts are built as a module or
+    renamed into extra routed-expert slots. A quantization config opts out with
+    ``supports_fused_shared_experts = False``: the shared experts then stay
+    separate, with a warning. A config that declares nothing keeps the existing
+    behavior, which follows the AITER flag alone. Code that reads the global flag
+    directly, such as kernel support checks, does not go through here.
     """
     if not rocm_aiter_ops.is_fusion_moe_shared_experts_enabled():
         return False

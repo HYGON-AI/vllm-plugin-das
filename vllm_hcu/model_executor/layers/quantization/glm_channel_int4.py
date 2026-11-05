@@ -109,11 +109,9 @@ def is_glm_moe_dsa_model(hf_config: Any) -> bool:
 # from the model depth and from literal indexes written in the targets.
 _MTP_BLOCK_MARKER = ".mtp_block."
 _LAYER_INDEX_IN_TARGET = re.compile(r"layers\\*\.(\d+)")
-# Class name of the fused expert module that detection tries class-name targets on.
+# Class name that class-name targets are tried on during detection; a test ties
+# it to the class so the two cannot drift apart.
 _ROUTED_EXPERTS_CLASS = "RoutedExperts"
-# Class names skipped while walking a layer's MRO at selection time: Linear
-# targets stay on the parent method, and Module/object are ancestors of every layer.
-_GENERIC_CLASS_NAMES = frozenset({"Linear", "Module", "object"})
 
 
 def _parse_quant_args(value: Any) -> Any:
@@ -282,16 +280,24 @@ def _targets_cover_routed_experts(
         _class_name_matches_target(_ROUTED_EXPERTS_CLASS, target)
         for target in targets
     )
+    # The ignore rules depend on the expert, not on which of its four probes
+    # matched, so each expert is checked once.
+    ignored: dict[tuple[str, int], bool] = {}
     for module_prefix, probe, expert_id in _routed_expert_probes(targets, hf_config):
         # Target matching is cheap and usually fails for non-expert targets,
-        # while the ignore check runs several regexes per probe. Test targets
-        # first so only matching probes pay for the ignore check.
+        # while the ignore check runs several regexes. Test targets first so
+        # only matching probes pay for the ignore check.
         if not (
             covers_by_class
             or any(is_equal_or_regex_match(probe, target) for target in targets)
         ):
             continue
-        if not _ignore_covers_expert(None, module_prefix, ignore, {}, expert_id):
+        key = (module_prefix, expert_id)
+        if key not in ignored:
+            ignored[key] = _ignore_covers_expert(
+                None, module_prefix, ignore, {}, expert_id
+            )
+        if not ignored[key]:
             return True
     return False
 
@@ -404,23 +410,18 @@ def _match_target_by_name(
 
 
 def _match_target_by_class(layer: Any, targets: Any) -> str | None:
-    """Match ``RoutedExperts`` and other non-generic class targets in target order.
+    """Match the layer's own class name against class-name targets, as native does.
 
-    Each class name is compared with a target by the rule detection and native
-    matching share, so a literal name, a substring and a ``re:`` pattern all
-    resolve alike. Native only tries the concrete class; this also tries the
-    ancestors, so a renamed ``RoutedExperts`` subclass still resolves.
+    Targets are tried in order with the rule shared with detection, so a literal
+    name, a substring and a ``re:`` pattern all resolve alike. Only the concrete
+    class is compared: native does not look at its ancestors either.
     """
     if layer is None:
         return None
-    target_list = [target for target in targets if isinstance(target, str)]
-    for cls in type(layer).__mro__:
-        name = cls.__name__
-        if name in _GENERIC_CLASS_NAMES:
-            continue
-        for target in target_list:
-            if _class_name_matches_target(name, target):
-                return target
+    class_name = type(layer).__name__
+    for target in targets:
+        if isinstance(target, str) and _class_name_matches_target(class_name, target):
+            return target
     return None
 
 
@@ -480,25 +481,6 @@ def routed_expert_owner_is_ignored(config: Any, prefix: str) -> bool:
         _ignore_covers_prefix(candidate, ignore, fused_mapping)
         for candidate in prefixes
     )
-
-
-def require_unfused_shared_experts(layer: Any, prefix: str) -> None:
-    """Fail before weights are allocated if shared experts were fused into ``layer``.
-
-    The model keeps them separate for this config (``supports_fused_shared_experts``
-    is False), so this only fires when another path fuses them anyway. The
-    checkpoint stores them as INT8 or unquantized linears, which cannot share the
-    routed experts' tensors, and selection never sees those extra slots.
-    """
-    manager = getattr(layer, "expert_map_manager", None)
-    fused = int(getattr(manager, "num_fused_shared_experts", 0) or 0)
-    if fused > 0:
-        raise NotImplementedError(
-            "GLM channel INT4 W4A8 cannot hold fused shared experts, but "
-            f"{prefix!r} fuses {fused} of them into its routed expert tensors. "
-            "The model should have kept them separate "
-            "(supports_fused_shared_experts is False for this config)."
-        )
 
 
 def _expert_projection_schemes(

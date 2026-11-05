@@ -31,7 +31,6 @@ from vllm_hcu.model_executor.layers.quantization.glm_channel_int4 import (
     is_glm_channel_int4_w4a8,
     is_glm_moe_dsa_model,
     repack_and_shuffle_w4a8_gemm2,
-    require_unfused_shared_experts,
     routed_expert_owner_is_ignored,
     routed_expert_uses_glm_channel_int4,
 )
@@ -301,7 +300,6 @@ class GlmMoeDsaChannelW4A8Config(CompressedTensorsConfig):
 
     def get_quant_method(self, layer: torch.nn.Module, prefix: str):
         if isinstance(layer, RoutedExperts):
-            require_unfused_shared_experts(layer, prefix)
             # The parent matcher only sees expert-0 projection names. An
             # owner-level ignore therefore must bypass it explicitly, or the
             # ignored owner can fall back to native CPU-only W4A8.
