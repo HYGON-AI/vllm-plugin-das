@@ -16,7 +16,10 @@ from tests.accuracy.test_deepseek_v41_flashmla_decode_accuracy import (
     reference,
 )
 from vllm_hcu.v1.attention.ops import deepseek_v41_flashmla_decode as runtime
-from vllm_hcu.v1.attention.ops.deepseek_v41_flashmla_metadata import SCHEDULERS_ATTR
+from vllm_hcu.v1.attention.ops.deepseek_v41_flashmla_metadata import (
+    SCHEDULERS_ATTR,
+    decode_metadata_build_scope,
+)
 
 pytestmark = pytest.mark.hcu
 
@@ -158,7 +161,8 @@ def _run_real_builder_and_model_wrapper(monkeypatch, ratio, mode="eager"):
         )
 
     common = make_common()
-    metadata = builder.build(0, common)
+    with decode_metadata_build_scope():
+        metadata = builder.build(0, common)
     leases = getattr(metadata, SCHEDULERS_ATTR)
     assert set(leases) == set(names)
     assert metadata.decode_swa_ragged_indices is not None
@@ -232,7 +236,8 @@ def _run_real_builder_and_model_wrapper(monkeypatch, ratio, mode="eager"):
                     qstart_cpu.copy_(torch.tensor([0] + query_lens).cumsum(0).int())
                 lens_cpu.add_(3 if step == 1 else -4)
                 common = make_common()
-                updated = builder.build(0, common)
+                with decode_metadata_build_scope():
+                    updated = builder.build(0, common)
                 assert pointers == tuple(getattr(updated, key).data_ptr() for key in (
                     "decode_swa_indices", "decode_swa_lens", "token_to_req_indices", "is_valid_token",
                 ))

@@ -80,6 +80,10 @@ def apply_to_module(module: ModuleType) -> bool:
 
     original = require_callable(utils, "build_attn_metadata", TARGETS[0])
 
+    from vllm_hcu.v1.attention.ops.deepseek_v41_flashmla_metadata import (
+        decode_metadata_build_scope,
+    )
+
     @functools.wraps(original)
     def build_attn_metadata(*args, **kwargs):
         from vllm_hcu.v1.attention.ops.deepseek_v41_swa_metadata import (
@@ -88,7 +92,7 @@ def apply_to_module(module: ModuleType) -> bool:
 
         attn_groups = args[0] if args else kwargs.get("attn_groups")
         _wrap_builders(attn_groups)
-        with swa_meta_launch_batch():
+        with decode_metadata_build_scope(), swa_meta_launch_batch():
             return original(*args, **kwargs)
 
     setattr(build_attn_metadata, _WRAPPER, True)

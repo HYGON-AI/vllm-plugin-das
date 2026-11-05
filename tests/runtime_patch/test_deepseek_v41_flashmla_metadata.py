@@ -14,12 +14,16 @@ from tests.runtime_patch.test_deepseek_v41_flashmla_decode import cpu_decode_ind
 from vllm_hcu.patch.worker.op_opt import (
     patch_deepseek_v41_rocm_flashmla_decode as decode_patch,
     patch_deepseek_v41_rocm_flashmla_metadata as patch,
+    patch_deepseek_v41_swa_meta_batch as batch_patch,
 )
 from vllm_hcu.patch.worker.op_opt._common import PatchCompatibilityError
+from vllm_hcu.platforms import envs as henvs
 from vllm_hcu.v1.attention.ops import deepseek_v41_flashmla_decode as runtime
 from vllm_hcu.v1.attention.ops.deepseek_v41_flashmla_metadata import (
     SCHEDULERS_ATTR,
     DecodeScheduler,
+    decode_build_policy,
+    decode_metadata_build_scope,
 )
 
 
@@ -311,3 +315,139 @@ def test_real_builder_boundary_and_registration():
     names = worker_callback_names()
     assert (patch.PATCH_ID, patch.TARGET_MODULE) in names
     assert names.index((patch.PATCH_ID, patch.TARGET_MODULE)) < names.index((decode_patch.PATCH_ID, decode_patch.TARGET_MODULE))
+
+
+def test_builder_resolves_policy_once_per_build_and_keeps_fresh_plans(enabled, monkeypatch):
+    module, instance, metadata, _ = builder()
+    instance.layer_names = [f"target.layer{index}.swa_cache" for index in range(40)]
+    policy_reads = []
+    plans = []
+
+    def graph_enabled():
+        policy_reads.append(None)
+        return len(policy_reads) == 1
+
+    def factory():
+        plan = object()
+        plans.append(plan)
+        return plan, None
+
+    monkeypatch.setattr(henvs, "dsv41_flashmla_decode_graph_enabled", graph_enabled)
+    monkeypatch.setattr(runtime, "_decode_bindings", lambda: (forbidden, forbidden, factory))
+    patch.apply_to_module(module)
+    instance.build(0, metadata)
+    first_leases = getattr(metadata, SCHEDULERS_ATTR)
+    assert len(policy_reads) == 1
+    assert all(lease.allow_graph for lease in first_leases.values())
+    assert len({id(lease.take()) for lease in first_leases.values()}) == 40
+    instance.build(0, metadata)
+    second_leases = getattr(metadata, SCHEDULERS_ATTR)
+    assert len(policy_reads) == 2
+    assert all(not lease.allow_graph for lease in second_leases.values())
+    assert len({id(lease.take()) for lease in second_leases.values()}) == 40
+    assert len(plans) == 80
+
+
+@pytest.mark.parametrize("speculative", [False, True])
+def test_batch_wrapper_shares_policy_but_not_layer_plans(enabled, monkeypatch, speculative):
+    module, instance, metadata, _ = builder()
+    config = instance.vllm_config
+    if speculative:
+        config.speculative_config = SimpleNamespace(
+            method="dspark", num_speculative_tokens=5, parallel_drafting=False,
+        )
+    instance.layer_names = [f"target.layer{index}.swa_cache" for index in range(7)]
+    instances = [instance]
+    for group_index in range(1, 9):
+        sibling = type(instance)()
+        sibling.vllm_config = config
+        sibling.layer_names = [
+            f"group{group_index}.layer{index}.swa_cache" for index in range(4)
+        ]
+        instances.append(sibling)
+    plans = []
+    graph_reads = []
+    dspark_reads = []
+    original_dspark = henvs.dsv41_flashmla_dspark_enabled
+
+    def factory():
+        plan = object()
+        plans.append(plan)
+        return plan, None
+
+    def graph_enabled():
+        graph_reads.append(None)
+        return len(graph_reads) == 1
+
+    def dspark_enabled():
+        dspark_reads.append(None)
+        return original_dspark()
+
+    monkeypatch.setattr(henvs, "dsv41_flashmla_decode_graph_enabled", graph_enabled)
+    monkeypatch.setattr(henvs, "dsv41_flashmla_dspark_enabled", dspark_enabled)
+    monkeypatch.setattr(runtime, "_decode_bindings", lambda: (forbidden, forbidden, factory))
+    patch.apply_to_module(module)
+    groups = [[SimpleNamespace(metadata_builders=[item])] for item in instances]
+    utils = ModuleType(batch_patch.TARGET_MODULE)
+
+    def build_attn_metadata(attn_groups):
+        return [
+            group[0].metadata_builders[0].build(
+                0, SimpleNamespace(**vars(metadata)),
+            )
+            for group in attn_groups
+        ]
+
+    utils.build_attn_metadata = build_attn_metadata
+    monkeypatch.setattr(batch_patch, "_rebind", lambda *args: None)
+    assert batch_patch.apply_to_module(utils)
+    assert not batch_patch.apply_to_module(utils)
+    first = utils.build_attn_metadata(groups)
+    assert len(graph_reads) == 1
+    assert len(dspark_reads) == int(speculative)
+    first_leases = [
+        lease for item in first for lease in getattr(item, SCHEDULERS_ATTR).values()
+    ]
+    assert len(first_leases) == 39
+    assert all(lease.allow_graph for lease in first_leases)
+    first_plans = [lease.take() for lease in first_leases]
+    assert len({id(plan) for plan in first_plans}) == 39
+    second = utils.build_attn_metadata(attn_groups=groups)
+    assert len(graph_reads) == 2
+    assert len(dspark_reads) == 2 * int(speculative)
+    second_leases = [
+        lease for item in second for lease in getattr(item, SCHEDULERS_ATTR).values()
+    ]
+    assert all(not lease.allow_graph for lease in second_leases)
+    second_plans = [lease.take() for lease in second_leases]
+    assert len({id(plan) for plan in first_plans + second_plans}) == 78
+    assert len(plans) == 78
+
+
+def test_build_policy_scope_refreshes_config_and_restores_after_failure(enabled, monkeypatch):
+    _, instance, _, _ = builder()
+    config = instance.vllm_config
+    with decode_metadata_build_scope():
+        outer = decode_build_policy(config)
+        assert outer.query_limit == 1
+        with pytest.raises(RuntimeError, match="build failed"):
+            with decode_metadata_build_scope():
+                monkeypatch.setenv("VLLM_HCU_DSV41_FLASHMLA_DECODE", "0")
+                assert decode_build_policy(config) is None
+                raise RuntimeError("build failed")
+        assert decode_build_policy(config) is outer
+    assert decode_build_policy(config) is None
+    monkeypatch.setenv("VLLM_HCU_DSV41_FLASHMLA_DECODE", "1")
+    config.speculative_config = SimpleNamespace(
+        method="dspark", num_speculative_tokens=5, parallel_drafting=False,
+    )
+    with decode_metadata_build_scope():
+        policy = decode_build_policy(config)
+        assert policy.query_limit == 6
+        assert policy.speculative
+        other = SimpleNamespace(
+            parallel_config=config.parallel_config, speculative_config=None,
+        )
+        assert decode_build_policy(other).query_limit == 1
+    config.speculative_config.parallel_drafting = True
+    assert decode_build_policy(config).query_limit == 11

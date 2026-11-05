@@ -27,13 +27,11 @@ from ._common import (
     require_unpatched,
     PatchCompatibilityError,
 )
-from vllm_hcu.platforms import envs as henvs
 from vllm_hcu.v1.attention.ops import deepseek_v41_flashmla_decode as runtime
 from vllm_hcu.v1.attention.ops.deepseek_v41_flashmla_metadata import (
     SCHEDULERS_ATTR,
     DecodeScheduler,
-    decode_context_supported,
-    decode_query_limit,
+    decode_build_policy,
 )
 
 TARGET_MODULE = "vllm.models.deepseek_v41.amd.rocm"
@@ -194,12 +192,12 @@ def apply_to_module(module: ModuleType) -> bool:
         # Always clear on build, even if the original builder returns a reused
         # Python object. Disabled/unsupported builds must retain no old leases.
         setattr(metadata, SCHEDULERS_ATTR, None)
+        if metadata.num_decode_tokens == 0 or metadata.decode_swa_indices is None:
+            return metadata
+        policy = decode_build_policy(self.vllm_config)
         if (
-            not henvs.dsv41_flashmla_decode_enabled()
-            or not decode_context_supported(self.vllm_config)
-            or metadata.num_decode_tokens == 0
-            or not 1 <= metadata.max_decode_query_len <= decode_query_limit(self.vllm_config)
-            or metadata.decode_swa_indices is None
+            policy is None
+            or not 1 <= metadata.max_decode_query_len <= policy.query_limit
             or not runtime._supported_device(metadata.decode_swa_indices)
         ):
             return metadata
@@ -211,9 +209,9 @@ def apply_to_module(module: ModuleType) -> bool:
         # sharing; the existing per-type holders remain untouched for fallback.
         schedulers = {
             name: DecodeScheduler(
-                bindings[2], allow_graph=henvs.dsv41_flashmla_decode_graph_enabled(),
-                query_limit=decode_query_limit(self.vllm_config),
-                speculative=self.vllm_config.speculative_config is not None,
+                bindings[2], allow_graph=policy.allow_graph,
+                query_limit=policy.query_limit,
+                speculative=policy.speculative,
             )
             for name in self.layer_names
         }

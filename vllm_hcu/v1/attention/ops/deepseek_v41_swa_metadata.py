@@ -386,6 +386,8 @@ def _ptr_scratch(device: torch.device, n: int) -> dict[str, object]:
             # Graph-stable buffers keep the same data_ptr; skip HtoD when unchanged.
             "sig": None,
         }
+        bufs["views"] = dict(zip(_I64_ROWS, bufs["dev_i64"].unbind(0)))
+        bufs["views"].update(zip(_I32_ROWS, bufs["dev_i32"].unbind(0)))
         _PTR_SCRATCH[key] = bufs
     return bufs
 
@@ -414,8 +416,7 @@ def _bunch_ptr_sig(bunch: list[SwaMetaJob]) -> tuple:
 
 def _fill_ptr_scratch(bunch: list[SwaMetaJob]) -> dict[str, torch.Tensor]:
     device = bunch[0].slot_mapping.device
-    g = len(bunch)
-    bufs = _ptr_scratch(device, g)
+    bufs = _ptr_scratch(device, len(bunch))
     host64_pool = bufs["host_i64"]
     host32_pool = bufs["host_i32"]
     host_events = bufs["host_events"]
@@ -434,29 +435,15 @@ def _fill_ptr_scratch(bunch: list[SwaMetaJob]) -> dict[str, torch.Tensor]:
         host32 = host32_pool[slot]
         assert isinstance(host64, torch.Tensor) and isinstance(host32, torch.Tensor)
         # One packed host write (no per-row torch.as_tensor) then a single HtoD.
-        vals64 = [
-            [j.replay_start.data_ptr() for j in bunch],
-            [j.slot_mapping.data_ptr() for j in bunch],
-            [j.block_table.data_ptr() for j in bunch],
-            [j.block_table.stride(0) for j in bunch],
-            [j.token_to_req.data_ptr() for j in bunch],
-            [j.is_valid.data_ptr() for j in bunch],
-            [j.indices.data_ptr() for j in bunch],
-            [j.indices.stride(0) for j in bunch],
-            [j.lens.data_ptr() for j in bunch],
-            [j.ragged.data_ptr() for j in bunch],
-            [j.indptr.data_ptr() for j in bunch],
-        ]
-        vals32 = [
-            [j.lens.shape[0] for j in bunch],
-            [j.num_slots for j in bunch],
-        ]
-        host64[:, :g].copy_(torch.tensor(vals64, dtype=torch.int64))
-        host32[:, :g].copy_(torch.tensor(vals32, dtype=torch.int32))
+        columns = tuple(zip(*sig))
+        vals64 = columns[:9] + columns[10:12]
+        vals32 = (columns[9], columns[12])
+        host64.copy_(torch.tensor(vals64, dtype=torch.int64))
+        host32.copy_(torch.tensor(vals32, dtype=torch.int32))
         assert isinstance(bufs["dev_i64"], torch.Tensor)
         assert isinstance(bufs["dev_i32"], torch.Tensor)
-        bufs["dev_i64"][:, :g].copy_(host64[:, :g], non_blocking=True)
-        bufs["dev_i32"][:, :g].copy_(host32[:, :g], non_blocking=True)
+        bufs["dev_i64"].copy_(host64, non_blocking=True)
+        bufs["dev_i32"].copy_(host32, non_blocking=True)
         event = host_events[slot]
         if event is None:
             event = torch.cuda.Event()
@@ -464,17 +451,7 @@ def _fill_ptr_scratch(bunch: list[SwaMetaJob]) -> dict[str, torch.Tensor]:
         event.record()
         bufs["host_slot"] = slot
         bufs["sig"] = sig
-    out = {
-        name: bufs["dev_i64"][i, :g]  # type: ignore[index]
-        for i, name in enumerate(_I64_ROWS)
-    }
-    out.update(
-        {
-            name: bufs["dev_i32"][i, :g]  # type: ignore[index]
-            for i, name in enumerate(_I32_ROWS)
-        }
-    )
-    return out
+    return bufs["views"]
 
 
 def _launch_one(
