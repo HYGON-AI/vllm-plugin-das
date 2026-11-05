@@ -200,6 +200,6 @@ def test_native_propose_receives_global_target_states(
             assert model.get_mtp_target_hidden_states() is persistent_buffer
             assert runner.pcp_manager is manager
             assert runner.execute_model_state is None
-            expected_calls = ([] if manager._hidden_restore_idx is None
+            expected_calls = ([] if manager._hidden_restore_idx is None or layout == "decode"
                               else ([6, 10, 2] if draft_method == "dspark" else [4, 2]))
             assert calls == expected_calls  # no duplicate restore by native sampler

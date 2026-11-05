@@ -345,6 +345,24 @@ class HcuPCPManager:
             local_offset += segment.num_tokens
         return result
 
+    @staticmethod
+    def _split_prefill_rows(input_batch: InputBatch) -> np.ndarray:
+        split = input_batch.is_prefilling_np.copy()
+        drafts = input_batch.num_draft_tokens_per_req
+        if drafts is not None:
+            # The scheduler may pad a one-token admission to a full verify
+            # row even while MRV2's prompt-progress flag still says prefill.
+            # Replicate that complete row, including all logits and draft
+            # positions, exactly as for existing decode requests.
+            logits = np.diff(input_batch.cu_num_logits_np)
+            padded_verify = (
+                (drafts > 0)
+                & (logits == drafts + 1)
+                & (input_batch.num_scheduled_tokens == logits)
+            )
+            split &= ~padded_verify
+        return split
+
     def _segments_for_rank(
         self,
         rank: int,
@@ -352,6 +370,7 @@ class HcuPCPManager:
     ) -> list[_BatchSegment]:
         segments: list[_BatchSegment] = []
         local_offset = 0
+        split_prefill = self._split_prefill_rows(input_batch)
         for req_idx, query_len_value in enumerate(
             input_batch.num_scheduled_tokens
         ):
@@ -359,7 +378,7 @@ class HcuPCPManager:
             if query_len == 0:
                 continue
             global_start = int(input_batch.query_start_loc_np[req_idx])
-            if bool(input_batch.is_prefilling_np[req_idx]):
+            if bool(split_prefill[req_idx]):
                 rank_segments = self.rank_segments(
                     query_len, pcp_rank=rank, pcp_size=self.pcp_size
                 )
@@ -383,7 +402,7 @@ class HcuPCPManager:
         return self._reorder_segments(
             segments,
             input_batch.num_computed_tokens_np,
-            input_batch.is_prefilling_np,
+            split_prefill,
             input_batch.query_start_loc_np,
         )
 
@@ -392,6 +411,7 @@ class HcuPCPManager:
         input_batch: InputBatch,
         padded_num_tokens: int | None = None,
     ) -> tuple[list[list[_BatchSegment]], list[int]]:
+        split_prefill = self._split_prefill_rows(input_batch)
         segments_by_rank = [
             self._segments_for_rank(rank, input_batch)
             for rank in range(self.pcp_size)
@@ -409,7 +429,7 @@ class HcuPCPManager:
             if (
                 not self._use_mla
                 or int(query_len_value) == 0
-                or not bool(input_batch.is_prefilling_np[req_idx])
+                or not bool(split_prefill[req_idx])
             ):
                 continue
             req_segments_by_rank = [
@@ -453,7 +473,7 @@ class HcuPCPManager:
             self._reorder_segments(
                 rank_segments,
                 input_batch.num_computed_tokens_np,
-                input_batch.is_prefilling_np,
+                split_prefill,
                 input_batch.query_start_loc_np,
             )
             for rank_segments in segments_by_rank
@@ -492,7 +512,7 @@ class HcuPCPManager:
                     dtype=np.int64,
                 )
                 is_decode = not bool(
-                    input_batch.is_prefilling_np[segment.global_req_idx]
+                    split_prefill[segment.global_req_idx]
                 )
                 if not is_decode or rank == 0:
                     kv_write_mask[gathered_slice] = True
@@ -523,6 +543,7 @@ class HcuPCPManager:
             raise PatchCompatibilityError(
                 "PCP spec decode requires per-request draft-token counts"
             )
+        split_prefill = self._split_prefill_rows(input_batch)
         self._global_batch = input_batch
         self._global_has_prefill = bool(input_batch.is_prefilling_np.any())
         self._global_attn_ready = False
@@ -603,7 +624,7 @@ class HcuPCPManager:
         for segment in segments_by_rank[0]:
             if (
                 segment.num_actual_tokens == 0
-                or bool(input_batch.is_prefilling_np[segment.global_req_idx])
+                or bool(split_prefill[segment.global_req_idx])
             ):
                 continue
             rank0_decode_position[segment.global_slice] = np.arange(
@@ -631,7 +652,7 @@ class HcuPCPManager:
             )
             is_padding[actual_slice] = False
             if not bool(
-                input_batch.is_prefilling_np[segment.global_req_idx]
+                split_prefill[segment.global_req_idx]
             ):
                 replicated_token_mask[actual_slice] = True
                 owner_positions = rank0_decode_position[segment.global_slice]
@@ -776,7 +797,7 @@ class HcuPCPManager:
         local_is_prefilling = self._is_prefilling_np[:num_local_reqs]
         local_is_prefilling[:] = (
             local_num_computed_prefill < local_prefill_len
-        ) & input_batch.is_prefilling_np[global_req_indices]
+        ) & split_prefill[global_req_indices]
         local_num_draft_tokens_per_req = None
         local_num_draft_tokens = 0
         if input_batch.num_draft_tokens_per_req is not None:
@@ -1017,6 +1038,11 @@ class HcuPCPManager:
 
         if self._hidden_restore_idx is None:
             return hidden_states
+        if not self._global_has_prefill:
+            # Pure decode rows (including graph padding) are replicated in
+            # identical local order on every rank. The restore indices already
+            # address rank 0's local prefix, so any rank can select locally.
+            return hidden_states[self._hidden_restore_idx]
         gathered = self._pcp_group.all_gather(hidden_states, dim=0)
         return gathered[self._hidden_restore_idx]
 

@@ -1045,3 +1045,19 @@ def test_cpu_metadata_transfer_never_pins_memory(monkeypatch):
     array = np.arange(8, dtype=np.int32)
     torch.testing.assert_close(manager._pinned(array), torch.from_numpy(array))
     torch.testing.assert_close(manager._to_device(array), torch.from_numpy(array))
+
+
+def test_replicated_decode_restore_skips_all_gather_on_every_rank():
+    batch = _make_batch([
+        (f"decode-{i}", list(range(i * 6, (i + 1) * 6)), 80, False)
+        for i in range(3)
+    ], pad_to=24)
+    batch.num_reqs_after_padding = 4
+    managers, groups = _make_managers(8)
+    for manager, group in zip(managers, groups):
+        local = manager.partition_batch(batch, padded_num_tokens=24)
+        hidden = local.input_ids[:, None].float()
+        # A gather would fail because no remote payload is configured.
+        actual = manager.restore_hidden_states(hidden)
+        torch.testing.assert_close(actual, batch.input_ids[:18, None].float())
+        assert group.collective_calls == 0

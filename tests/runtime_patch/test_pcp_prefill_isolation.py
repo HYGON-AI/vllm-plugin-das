@@ -7,7 +7,8 @@ from types import SimpleNamespace
 import pytest
 
 from vllm.v1.core.sched.interface import PauseState
-from vllm.v1.core.sched.request_queue import FCFSRequestQueue
+from vllm.v1.core.sched.request_queue import FCFSRequestQueue, SchedulingPolicy
+from vllm.v1.request import RequestStatus
 
 from vllm_hcu.patch.platform.framework_opt import patch_scheduler
 
@@ -16,6 +17,10 @@ def _request(name, prompt, computed, eligible=0):
     return SimpleNamespace(
         request_id=name,
         num_prompt_tokens=prompt,
+        num_tokens=max(prompt, computed + 1),
+        status=RequestStatus.WAITING,
+        num_stale_output_tokens=0,
+        drop_stale_output=False,
         num_computed_tokens=computed,
         next_decode_eligible_step=eligible,
     )
@@ -25,6 +30,7 @@ class _FakeScheduler:
     """Mimics the upstream eligibility gate and a KV-limited waiting queue."""
 
     def __init__(self, running, waiting, kv_room=True, max_running=64):
+        self.policy = SchedulingPolicy.FCFS
         self.current_step = 0
         self._pause_state = PauseState.UNPAUSED
         self.num_waiting_for_streaming_input = 0

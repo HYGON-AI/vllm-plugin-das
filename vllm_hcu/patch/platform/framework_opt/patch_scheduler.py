@@ -124,27 +124,54 @@ def _install_hybrid_mamba_split_block_size(
     scheduler._mamba_block_aligned_split = _mamba_block_aligned_split
 
 
+def _prefill_remaining(request) -> int:
+    # A preempted request must recompute generated history as well as its
+    # original prompt. The last known token is its next decode input.
+    prefill_end = max(request.num_prompt_tokens, request.num_tokens - 1)
+    return max(0, prefill_end - request.num_computed_tokens)
+
+
+def _waiting_prefill_ready(scheduler, request) -> bool:
+    from vllm.v1.request import RequestStatus
+
+    status = request.status
+    if status == RequestStatus.WAITING_FOR_STRUCTURED_OUTPUT_GRAMMAR:
+        structured = request.structured_output_request
+        grammar = None if structured is None else structured.grammar
+        if grammar is None or isinstance(grammar, Exception):
+            return False
+    elif status == RequestStatus.WAITING_FOR_REMOTE_KVS:
+        if request.request_id not in scheduler.finished_recving_kv_req_ids:
+            return False
+    elif status not in (RequestStatus.WAITING, RequestStatus.PREEMPTED):
+        return False
+    return not (request.num_stale_output_tokens > 0 and not request.drop_stale_output)
+
+
 def _pending_prefill_tokens(scheduler, limit: int) -> int:
-    """Count pending prefills only in queues this step is allowed to schedule."""
+    """Count prefills eligible under this step's admission and request state."""
     from vllm.v1.core.sched.interface import PauseState
 
     if scheduler._pause_state == PauseState.PAUSED_ALL:
         return 0
     pending = 0
-    queues = [scheduler.running]
-    # Match upstream admission: PAUSED_NEW drains running requests only;
-    # streaming sessions waiting for input still occupy running slots.
+    step = scheduler.current_step + 1
+    for request in scheduler.running:
+        if request.next_decode_eligible_step <= step:
+            pending += _prefill_remaining(request)
+        if pending >= limit:
+            return pending
     num_running = len(scheduler.running) + scheduler.num_waiting_for_streaming_input
     if (
         scheduler._pause_state == PauseState.UNPAUSED
         and num_running < scheduler.max_num_running_reqs
     ):
-        queues += [scheduler.waiting, scheduler.skipped_waiting]
-    for queue in queues:
-        for request in queue:
-            pending += max(0, request.num_prompt_tokens - request.num_computed_tokens)
-            if pending >= limit:
-                return pending
+        for queue in (scheduler.waiting, scheduler.skipped_waiting):
+            for request in queue:
+                if _waiting_prefill_ready(scheduler, request):
+                    pending += _prefill_remaining(request)
+                if pending >= limit:
+                    return pending
     return pending
 
 
@@ -213,7 +240,15 @@ def _install_pcp_prefill_isolation(scheduler: type) -> None:
 
     @functools.wraps(original)
     def schedule(self, *args, **kwargs):
-        if not isolation_enabled(self) or getattr(self, _ISOLATE_BACKOFF, False):
+        from vllm.v1.core.sched.request_queue import SchedulingPolicy
+
+        # Phase isolation is an FCFS optimization. Explicit priorities must
+        # retain the upstream ordering and token-budget allocation.
+        if (
+            self.policy != SchedulingPolicy.FCFS
+            or not isolation_enabled(self)
+            or getattr(self, _ISOLATE_BACKOFF, False)
+        ):
             setattr(self, _ISOLATE_BACKOFF, False)
             return original(self, *args, **kwargs)
 
@@ -223,7 +258,7 @@ def _install_pcp_prefill_isolation(scheduler: type) -> None:
         step = self.current_step + 1
         decodes = [
             r for r in self.running
-            if r.num_computed_tokens >= r.num_prompt_tokens
+            if _prefill_remaining(r) == 0
             and r.next_decode_eligible_step <= step
         ]
         if not decodes or _pending_prefill_tokens(self, min_tokens) < min_tokens:
@@ -236,7 +271,7 @@ def _install_pcp_prefill_isolation(scheduler: type) -> None:
             setattr(self, _ISOLATE_STREAK, 0)
             prefills = [
                 r for r in self.running
-                if r.num_computed_tokens < r.num_prompt_tokens
+                if _prefill_remaining(r) > 0
             ]
             return run_deferring(self, prefills, args, kwargs, hide_waiting=True)
 
