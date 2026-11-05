@@ -5,6 +5,9 @@
 
 from __future__ import annotations
 
+import functools
+from types import FunctionType, ModuleType
+
 import torch
 
 from vllm.v1.attention.backends.mla.flashmla_sparse import (
@@ -12,6 +15,26 @@ from vllm.v1.attention.backends.mla.flashmla_sparse import (
     FlashMLASparseImpl,
     FlashMLASparseMetadataBuilder,
 )
+from vllm_hcu.v1.attention.ops.cp_gather_fp8 import (
+    cp_gather_and_upconvert_fp8_kv_cache,
+)
+
+
+def _with_plugin_cp_gather(forward):
+    # Keep vLLM's prefill/decode control flow and rebind only this method's
+    # cache operator. Other backends and vllm._custom_ops remain unchanged.
+    namespace = dict(forward.__globals__)
+    upstream_ops = namespace["ops"]
+    cache_ops = ModuleType("hcu_sparse_cache_ops")
+    cache_ops.cp_gather_and_upconvert_fp8_kv_cache = (
+        cp_gather_and_upconvert_fp8_kv_cache
+    )
+    cache_ops.__getattr__ = lambda name: getattr(upstream_ops, name)
+    namespace["ops"] = cache_ops
+    bound = FunctionType(forward.__code__, namespace, forward.__name__,
+                         forward.__defaults__, forward.__closure__)
+    bound.__kwdefaults__ = forward.__kwdefaults__
+    return functools.update_wrapper(bound, forward)
 
 
 class HcuFlashMLASparseMetadataBuilder(FlashMLASparseMetadataBuilder):
@@ -34,12 +57,15 @@ class HcuFlashMLASparseMetadataBuilder(FlashMLASparseMetadataBuilder):
 class HcuFlashMLASparseImpl(FlashMLASparseImpl):
     supports_pcp: bool = True
     can_return_lse_for_decode: bool = True
+    _forward_fp8_kv_no_dedup = _with_plugin_cp_gather(
+        FlashMLASparseImpl._forward_fp8_kv_separate_prefill_decode
+    )
 
     def _forward_fp8_kv_separate_prefill_decode(
         self, q, kv_c_and_k_pe_cache, topk_indices, attn_metadata
     ):
         if getattr(attn_metadata, "hcu_workspace_dedup", None) is None:
-            return super()._forward_fp8_kv_separate_prefill_decode(
+            return self._forward_fp8_kv_no_dedup(
                 q, kv_c_and_k_pe_cache, topk_indices, attn_metadata
             )
         from .workspace_dedup import forward_workspace_dedup
