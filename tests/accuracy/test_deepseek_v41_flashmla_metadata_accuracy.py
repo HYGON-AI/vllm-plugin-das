@@ -16,7 +16,10 @@ from tests.accuracy.test_deepseek_v41_flashmla_decode_accuracy import (
     reference,
 )
 from vllm_hcu.v1.attention.ops import deepseek_v41_flashmla_decode as runtime
-from vllm_hcu.v1.attention.ops.deepseek_v41_flashmla_metadata import SCHEDULERS_ATTR
+from vllm_hcu.v1.attention.ops.deepseek_v41_flashmla_metadata import (
+    SCHEDULERS_ATTR,
+    decode_metadata_build_scope,
+)
 
 pytestmark = pytest.mark.hcu
 
@@ -29,6 +32,10 @@ def test_real_builder_and_model_wrapper(ratio):
     # Do not initialize a HIP context in the parent before launching the child.
     code = f"""
 import pytest
+from vllm_hcu.patch.module_exchange import register_deepseek_v4_exchanges
+from vllm_hcu.patch.worker import prepare_worker_patches
+register_deepseek_v4_exchanges()
+prepare_worker_patches()
 from tests.accuracy.test_deepseek_v41_flashmla_metadata_accuracy import _run_real_builder_and_model_wrapper
 with pytest.MonkeyPatch.context() as monkeypatch:
     _run_real_builder_and_model_wrapper(monkeypatch, {ratio})
@@ -47,10 +54,17 @@ with pytest.MonkeyPatch.context() as monkeypatch:
     assert "real-builder-wrapper-native-ok" in result.stdout
 
 
-@pytest.mark.parametrize("mode", ["graph", "verify", "draft", "verify_graph", "draft_graph"])
+@pytest.mark.parametrize("mode", [
+    "graph", "verify", "draft", "verify_graph", "draft_graph",
+    "verify_padded_graph", "draft_padded_graph",
+])
 def test_real_builder_execution_modes(mode):
     code = f"""
 import pytest
+from vllm_hcu.patch.module_exchange import register_deepseek_v4_exchanges
+from vllm_hcu.patch.worker import prepare_worker_patches
+register_deepseek_v4_exchanges()
+prepare_worker_patches()
 from tests.accuracy.test_deepseek_v41_flashmla_metadata_accuracy import _run_real_builder_and_model_wrapper
 for ratio in {(0,) if mode.startswith('draft') else (0, 1, 2)}:
     with pytest.MonkeyPatch.context() as monkeypatch:
@@ -136,6 +150,8 @@ def _run_real_builder_and_model_wrapper(monkeypatch, ratio, mode="eager"):
         ]).cuda()
         if speculative:
             slots[-1] = -1  # padded row must not gather stale SWA or history
+        if "padded" in mode:
+            slots = torch.nn.functional.pad(slots, (0, 16 - rows), value=-1)
         return CommonAttentionMetadata(
             query_start_loc=qstart_cpu.cuda(), query_start_loc_cpu=qstart_cpu,
             seq_lens=lens_cpu.cuda(), seq_lens_cpu_upper_bound=lens_cpu,
@@ -145,12 +161,18 @@ def _run_real_builder_and_model_wrapper(monkeypatch, ratio, mode="eager"):
         )
 
     common = make_common()
-    metadata = builder.build(0, common)
+    with decode_metadata_build_scope():
+        metadata = builder.build(0, common)
     leases = getattr(metadata, SCHEDULERS_ATTR)
     assert set(leases) == set(names)
     assert metadata.decode_swa_ragged_indices is not None
     assert metadata.decode_swa_ragged_indptr is not None
     assert metadata.max_decode_query_len == max(query_lens)
+    if "padded" in mode:
+        assert common.slot_mapping.numel() > rows
+        assert metadata.is_valid_token.shape == common.slot_mapping.shape
+        assert not metadata.is_valid_token[rows:].any()
+        assert builder._vllm_hcu_swa_decode_views
     if noncausal:
         assert metadata.decode_swa_width > 128
         assert metadata.decode_swa_lens[0].item() == 131
@@ -214,7 +236,8 @@ def _run_real_builder_and_model_wrapper(monkeypatch, ratio, mode="eager"):
                     qstart_cpu.copy_(torch.tensor([0] + query_lens).cumsum(0).int())
                 lens_cpu.add_(3 if step == 1 else -4)
                 common = make_common()
-                updated = builder.build(0, common)
+                with decode_metadata_build_scope():
+                    updated = builder.build(0, common)
                 assert pointers == tuple(getattr(updated, key).data_ptr() for key in (
                     "decode_swa_indices", "decode_swa_lens", "token_to_req_indices", "is_valid_token",
                 ))
@@ -259,7 +282,7 @@ def _run_real_builder_and_model_wrapper(monkeypatch, ratio, mode="eager"):
                 req = torch.repeat_interleave(torch.arange(3,device="cuda"),torch.tensor(query_lens,device="cuda"))
                 page = 64//ratio
                 extra = table[req].gather(1,local.clamp_min(0).long()//page)*page+local.clamp_min(0)%page
-                extra = torch.where((local>=0)&(common.slot_mapping>=0)[:,None],extra+swa_values.shape[0],-1)
+                extra = torch.where((local>=0)&(common.slot_mapping[:rows]>=0)[:,None],extra+swa_values.shape[0],-1)
                 indices = torch.cat((indices,extra),-1)
                 decoded = torch.cat((swa_values,values))
             torch.cuda.synchronize()

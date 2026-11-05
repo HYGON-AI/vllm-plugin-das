@@ -16,6 +16,7 @@ import numpy as np
 import torch
 
 from vllm.distributed.parallel_state import get_dcp_group, get_pcp_group
+from vllm.utils.torch_utils import async_tensor_h2d
 from vllm.v1.attention.backends.utils import get_dcp_local_seq_lens
 from vllm.v1.worker.gpu.input_batch import InputBatch
 from vllm.v1.worker.gpu.pcp_manager import PCPManager
@@ -606,13 +607,13 @@ class HcuPCPManager(PCPManager):
         local_idx_mapping_np = self._idx_mapping_np[:num_local_reqs]
         local_idx_mapping_np[:] = input_batch.idx_mapping_np[global_req_indices]
         local_idx_mapping = self._idx_mapping[:num_local_reqs]
-        local_idx_mapping.copy_(torch.from_numpy(local_idx_mapping_np).to(self.device))
+        async_tensor_h2d(local_idx_mapping_np, out=local_idx_mapping)
 
         query_start_np = self._query_start_loc_np[: num_local_reqs + 1]
         query_start_np[0] = 0
         np.cumsum(local_lengths, out=query_start_np[1:])
         query_start = self._query_start_loc[: num_local_reqs + 1]
-        query_start.copy_(torch.from_numpy(query_start_np).to(self.device))
+        async_tensor_h2d(query_start_np, out=query_start)
 
         local_start_pos_np = np.fromiter(
             (
@@ -679,9 +680,7 @@ class HcuPCPManager(PCPManager):
         replicated_slot_indices = self._replicated_slot_indices[
             :num_padded_tokens
         ]
-        replicated_slot_indices.copy_(
-            torch.from_numpy(replicated_slot_indices_np).to(self.device)
-        )
+        async_tensor_h2d(replicated_slot_indices_np, out=replicated_slot_indices)
 
         # A full request row can reuse MRV2's rejection-corrected device
         # seq_len directly. This is the common decode path and keeps the
@@ -698,7 +697,7 @@ class HcuPCPManager(PCPManager):
         seq_index = self._logits_indices[:num_local_reqs]
         if full_request_rows:
             seq_scratch_np[:] = global_req_indices
-            seq_index.copy_(torch.from_numpy(seq_scratch_np).to(self.device))
+            async_tensor_h2d(seq_scratch_np, out=seq_index)
             torch.index_select(
                 input_batch.seq_lens,
                 0,
@@ -709,7 +708,7 @@ class HcuPCPManager(PCPManager):
             # Split prefill rows use the last preserved position as their local
             # sequence end. Padding-only rows retain their virtual row width.
             seq_scratch_np[:] = [segment.padding_tokens for segment in segments]
-            seq_lens.copy_(torch.from_numpy(seq_scratch_np).to(self.device))
+            async_tensor_h2d(seq_scratch_np, out=seq_lens)
             actual_rows = [
                 row
                 for row, segment in enumerate(segments)
@@ -724,10 +723,8 @@ class HcuPCPManager(PCPManager):
                     for row in actual_rows
                 ]
                 actual_last_index = self._logits_indices[:num_actual_rows]
-                actual_last_index.copy_(
-                    torch.from_numpy(seq_scratch_np[:num_actual_rows]).to(
-                        self.device
-                    )
+                async_tensor_h2d(
+                    seq_scratch_np[:num_actual_rows], out=actual_last_index
                 )
                 actual_seq_lens_i64 = self._seq_lens_i64[:num_actual_rows]
                 torch.index_select(
@@ -739,10 +736,8 @@ class HcuPCPManager(PCPManager):
                 actual_seq_lens_i64.add_(1)
                 seq_scratch_np[:num_actual_rows] = actual_rows
                 actual_row_index = self._logits_indices[:num_actual_rows]
-                actual_row_index.copy_(
-                    torch.from_numpy(seq_scratch_np[:num_actual_rows]).to(
-                        self.device
-                    )
+                async_tensor_h2d(
+                    seq_scratch_np[:num_actual_rows], out=actual_row_index
                 )
                 seq_lens.index_copy_(
                     0,
@@ -776,16 +771,16 @@ class HcuPCPManager(PCPManager):
                 dtype=np.int64,
             )
             logits_offset += count
-        logits_indices.copy_(torch.from_numpy(logits_indices_np).to(self.device))
+        async_tensor_h2d(logits_indices_np, out=logits_indices)
         cu_num_logits_np = self._cu_num_logits_np[: num_local_reqs + 1]
         cu_num_logits_np[0] = 0
         np.cumsum(local_num_logits, out=cu_num_logits_np[1:])
         cu_num_logits = self._cu_num_logits[: num_local_reqs + 1]
-        cu_num_logits.copy_(torch.from_numpy(cu_num_logits_np).to(self.device))
+        async_tensor_h2d(cu_num_logits_np, out=cu_num_logits)
 
         if num_logits:
-            local_num_logits_tensor = torch.from_numpy(local_num_logits).to(
-                self.device
+            local_num_logits_tensor = async_tensor_h2d(
+                local_num_logits, device=self.device
             )
             expanded_idx_mapping = torch.repeat_interleave(
                 local_idx_mapping,

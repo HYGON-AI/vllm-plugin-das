@@ -67,6 +67,9 @@ class HcuGPUModelRunnerV2(GPUModelRunner):
     """HCU compatibility adapter around upstream v0.25.1 Model Runner V2."""
 
     def __init__(self, vllm_config, device):
+        self._hcu_output_copy_on_main_stream = os.environ.get(
+            "VLLM_HCU_MRV2_OUTPUT_COPY_ON_MAIN_STREAM", "1"
+        ).lower() in ("1", "true")
         self._hcu_pcp_manager_cls = None
         super().__init__(vllm_config, device)
         # Upstream creates the selected manager during KV-cache
@@ -74,6 +77,16 @@ class HcuGPUModelRunnerV2(GPUModelRunner):
         # lifecycle point without allocating a second manager.
         if not hasattr(self, "pcp_manager"):
             self.pcp_manager = None
+
+    @property
+    def output_copy_stream(self):
+        if self._hcu_output_copy_on_main_stream:
+            return self.main_stream
+        return self._hcu_output_copy_stream
+
+    @output_copy_stream.setter
+    def output_copy_stream(self, stream):
+        self._hcu_output_copy_stream = stream
 
     @property
     def pcp_manager_cls(self):

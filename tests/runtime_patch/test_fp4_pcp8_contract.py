@@ -10,7 +10,7 @@ from vllm_hcu.patch.worker.core_fix import patch_deepseek_v41_indexer_k_layout a
 
 _PCP_REASON = "FP4 PCP requires experimental eager MRV2 V4.1"
 _PARALLEL_REASON = "FP4 requires TP1/PP1/DCP1"
-_SPEC_REASON = "only non-adaptive DSpark(5) speculative decode is admitted"
+_SPEC_REASON = "only non-adaptive DSpark speculative decode is admitted"
 
 
 def _config():
@@ -82,8 +82,8 @@ def test_admits_pcp8_ep_dspark_contract():
                      _PCP_REASON, id="pcp8-wrong-model"),
         pytest.param("speculative_config", "method", None,
                      _PCP_REASON, id="pcp8-without-dspark"),
-        pytest.param("speculative_config", "num_speculative_tokens", 4,
-                     _SPEC_REASON, id="pcp8-dspark4"),
+        pytest.param("speculative_config", "num_speculative_tokens", 0,
+                     _SPEC_REASON, id="pcp8-dspark0"),
         pytest.param("speculative_config", "enable_adaptive_verification", True,
                      _SPEC_REASON, id="pcp8-adaptive-verification"),
     ],
@@ -116,6 +116,15 @@ def test_existing_pcp1_dp1_dp8_remain_admitted(dp):
     config = _config()
     config.parallel_config.prefill_context_parallel_size = 1
     config.parallel_config.data_parallel_size = dp
+    assert patch._fp4_domain_blockers(SimpleNamespace(), config) == ()
+
+
+@pytest.mark.parametrize("n", [1, 3, 5], ids=["dspark1", "dspark3", "dspark5"])
+def test_admits_non_adaptive_dspark_any_depth(n):
+    config = _config()
+    config.parallel_config.prefill_context_parallel_size = 1
+    config.parallel_config.data_parallel_size = 8
+    config.speculative_config.num_speculative_tokens = n
     assert patch._fp4_domain_blockers(SimpleNamespace(), config) == ()
 
 

@@ -10,6 +10,9 @@ successive forwards, even when shapes and compression ratios match.
 from __future__ import annotations
 
 from collections.abc import Callable
+from contextlib import contextmanager
+from contextvars import ContextVar
+from dataclasses import dataclass
 
 from vllm_hcu.platforms import envs as henvs
 
@@ -39,6 +42,57 @@ def decode_query_limit(config) -> int:
     # Match AttentionMetadataBuilder's spec-as-decode threshold. Actual rows
     # still use explicit per-token indices; no causal mask is synthesized here.
     return 1 + (2 if getattr(spec, "parallel_drafting", False) else 1) * count
+
+
+@dataclass(frozen=True)
+class DecodeBuildPolicy:
+    query_limit: int
+    allow_graph: bool
+    speculative: bool
+
+
+_BUILD_POLICIES: ContextVar[dict | None] = ContextVar(
+    "dsv41_decode_build_policies", default=None,
+)
+
+
+@contextmanager
+def decode_metadata_build_scope():
+    """Resolve decode policy once per config and attention-metadata pass."""
+    token = _BUILD_POLICIES.set({})
+    try:
+        yield
+    finally:
+        _BUILD_POLICIES.reset(token)
+
+
+def _resolve_decode_build_policy(config) -> DecodeBuildPolicy | None:
+    if not henvs.dsv41_flashmla_decode_enabled():
+        return None
+    parallel = config.parallel_config
+    if (
+        parallel.decode_context_parallel_size != 1
+        or parallel.prefill_context_parallel_size != 1
+    ):
+        return None
+    query_limit = decode_query_limit(config)
+    if query_limit < 1:
+        return None
+    return DecodeBuildPolicy(
+        query_limit=query_limit,
+        allow_graph=henvs.dsv41_flashmla_decode_graph_enabled(),
+        speculative=config.speculative_config is not None,
+    )
+
+
+def decode_build_policy(config) -> DecodeBuildPolicy | None:
+    policies = _BUILD_POLICIES.get()
+    if policies is None:
+        return _resolve_decode_build_policy(config)
+    key = id(config)
+    if key not in policies:
+        policies[key] = (config, _resolve_decode_build_policy(config))
+    return policies[key][1]
 
 
 class DecodeScheduler:

@@ -241,6 +241,7 @@ _CORE_CALLBACKS: tuple[_CallbackSpec, ...] = (
     # model_state prepare_attn / capture_inner after model decoder_replay.
     _CallbackSpec(_adapter("core_fix", "patch_deepseek_v41_decoder_replay_state")),
     _CallbackSpec(_adapter("core_fix", "patch_hcu_uva_buffer")),
+    _CallbackSpec(_adapter("core_fix", "patch_async_tensor_h2d")),
     _CallbackSpec(_adapter("core_fix", "patch_hcu_uva_offloader")),
     _CallbackSpec(_adapter("core_fix", "patch_deepseek_v4_attention")),
     _CallbackSpec(_adapter("core_fix", "patch_deepseek_v41_pcp")),
@@ -285,7 +286,10 @@ _OP_CALLBACKS: tuple[_CallbackSpec, ...] = (
     _CallbackSpec(_adapter("op_opt", "patch_flashmla_sparse")),
     _CallbackSpec(_adapter("op_opt", "patch_deepseek_v41_rocm_flashmla_sparse")),
     _CallbackSpec(_adapter("op_opt", "patch_deepseek_v41_rocm_flashmla_metadata")),
+    # After fused SWA meta build: collect per-group launches into one grid.
+    _CallbackSpec(_adapter("op_opt", "patch_deepseek_v41_swa_meta_batch")),
     _CallbackSpec(_adapter("op_opt", "patch_deepseek_v41_rocm_flashmla_decode")),
+    _CallbackSpec(_adapter("op_opt", "patch_dspark_greedy_markov")),
     _CallbackSpec(_adapter("op_opt", "patch_qwen4_exp_qsa_flash_attn")),
     _CallbackSpec(_adapter("op_opt", "patch_qwen3_attention")),
     _CallbackSpec(_adapter("op_opt", "patch_fla_chunk_delta_h")),

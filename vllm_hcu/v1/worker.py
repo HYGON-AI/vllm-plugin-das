@@ -4,6 +4,7 @@
 # Modified by Hygon Information Technology Co., Ltd., 2026.
 import os
 import gc
+from contextlib import nullcontext
 import torch
 import math
 from typing import TYPE_CHECKING, Dict, List, Optional, Set, Tuple, Type, Union
@@ -83,6 +84,16 @@ class HcuGPUWorker(Worker):
         from vllm_hcu.patch.worker import validate_worker_patches
 
         validate_worker_patches(require_applied=True)
+
+    def annotate_profile(self, scheduler_output):
+        if scheduler_output.total_num_scheduled_tokens == 0:
+            return nullcontext()
+        return super().annotate_profile(scheduler_output)
+
+    def execute_dummy_batch(self) -> None:
+        if self.profiler is not None:
+            self.profiler.step()
+        super().execute_dummy_batch()
 
     def compile_or_warm_up_model(self):
         if (

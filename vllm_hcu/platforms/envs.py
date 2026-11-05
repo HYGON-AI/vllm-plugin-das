@@ -56,7 +56,7 @@ if TYPE_CHECKING:
     VLLM_HCU_USE_TILELANG_MHC_PRENORM: bool = True
     VLLM_HCU_DEEPSEEK_V4_ROCM_DECODE_FALLBACK: bool = False
     VLLM_HCU_DEEPSEEK_V4_ROCM_FAST_WOA: bool = True
-    VLLM_HCU_ENABLE_DEEPSEEK_V4_MULTI_STREAM: bool = True
+    VLLM_HCU_ENABLE_DEEPSEEK_V4_MULTI_STREAM: bool = False
     VLLM_HCU_DEEPSEEK_V4_MULTI_STREAM_GEMM_TOKEN_THRESHOLD: int = 16384
     VLLM_HCU_DEEPSEEK_V4_MULTI_STREAM_COMPRESSOR_TOKEN_THRESHOLD: int = 16384
     VLLM_HCU_ENABLE_DEEPSEEK_V4_C128_COMPRESSOR: bool = True
@@ -470,7 +470,7 @@ hcu_vllm_environment_variables: dict[str, Callable[[], Any]] = {
 
     # Whether to create aux streams for DeepSeek V4 attention input GEMM overlap.
     "VLLM_HCU_ENABLE_DEEPSEEK_V4_MULTI_STREAM":
-        lambda: (os.environ.get("VLLM_HCU_ENABLE_DEEPSEEK_V4_MULTI_STREAM", "True").lower() in
+        lambda: (os.environ.get("VLLM_HCU_ENABLE_DEEPSEEK_V4_MULTI_STREAM", "False").lower() in
                     ("true", "1")),
 
     # Token-count cutoff for DeepSeek V4 multi-stream attention input GEMM overlap.

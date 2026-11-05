@@ -41,12 +41,38 @@ def inputs(heads=64, page=None, swa_page=64):
     return args
 
 
+def cpu_decode_indices(swa_indices, swa_lens, topk_indices=None, token_to_req_indices=None,
+                       block_table=None, page_size=1, is_valid_token=None):
+    columns = torch.arange(swa_indices.shape[-1])
+    main = torch.where(columns < swa_lens[:, None], swa_indices, -1).unsqueeze(1)
+    if topk_indices is None:
+        return main, None, None
+    requests = token_to_req_indices.long()
+    blocks = topk_indices.clamp_min(0).long() // page_size
+    mapped = block_table[requests.clamp(0, block_table.shape[0] - 1)].gather(
+        1, blocks.clamp_max(block_table.shape[1] - 1),
+    )
+    valid = (topk_indices >= 0) & is_valid_token[:, None] & (mapped >= 0)
+    valid &= (blocks < block_table.shape[1]) & (requests[:, None] >= 0)
+    valid &= requests[:, None] < block_table.shape[0]
+    physical = mapped * page_size + topk_indices % page_size
+    extra = torch.full_like(topk_indices, -1)
+    counts = valid.sum(-1).to(torch.int32)
+    for row, count in enumerate(counts.tolist()):
+        extra[row, :count] = physical[row, valid[row]]
+    return main, extra.unsqueeze(1), counts
+
+
 @pytest.fixture
 def enabled(monkeypatch):
     monkeypatch.setenv("VLLM_HCU_USE_CUSTOM_OPS", "1")
     monkeypatch.setenv("VLLM_HCU_DSV41_FLASHMLA_DECODE", "1")
     monkeypatch.setattr(runtime, "_supported_device", lambda q: True)
     monkeypatch.setattr(torch.cuda, "is_current_stream_capturing", lambda: False)
+    monkeypatch.setitem(
+        sys.modules, "vllm_hcu.v1.attention.ops.deepseek_v41_decode_indices",
+        SimpleNamespace(prepare_decode_indices=cpu_decode_indices),
+    )
 
 
 @pytest.mark.parametrize("child,master,expected", [
@@ -116,12 +142,10 @@ def test_dispatch_compacts_holes_preserves_buffers_and_uses_fresh_plan(enabled, 
     calls = []
     plan = object()
 
-    def map_indices(topk, requests, table, block_size, valid):
-        assert block_size == page
-        mapped = topk.clone()
-        mapped[:, 1::2] = -1  # Valid entries exist beyond the valid-count prefix.
-        mapped[0] = -1
-        return mapped, torch.tensor([0, 64, 64], dtype=torch.int32)
+    if page is not None:
+        args["topk_indices"][:, 1::2] = -1
+        args["is_valid_token"][0] = False
+        args["block_table"][:] = torch.arange(4, dtype=torch.int32)
 
     def kernel(**kwargs):
         calls.append(kwargs)
@@ -140,7 +164,7 @@ def test_dispatch_compacts_holes_preserves_buffers_and_uses_fresh_plan(enabled, 
         kwargs["indices"].fill_(-1)
         return torch.full_like(kwargs["q"], 2), None
 
-    monkeypatch.setattr(runtime, "_decode_bindings", lambda: (kernel, map_indices, lambda: (plan, None)))
+    monkeypatch.setattr(runtime, "_decode_bindings", lambda: (kernel, forbidden, lambda: (plan, None)))
     storage = torch.full((6, heads, 512), 7, dtype=torch.bfloat16)
     args["output"] = storage[::2]
     history_before = None if page is None else args["topk_indices"].clone()

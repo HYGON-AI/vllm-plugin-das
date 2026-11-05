@@ -1,9 +1,10 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright (c) 2026 Hygon Information Technology Co., Ltd.
-"""Attach isolated native decode schedulers to V4.1 ROCm SWA metadata.
+"""Build V4.1 ROCm SWA metadata and attach isolated native decode schedulers.
 
-Wrap the final ROCm builder, retaining V4.1/PCP indices and original ragged
-fallback buffers. Do not bypass the inheritance chain or change V4 builders.
+Wrap the final ROCm builder, with an optional fused decode path writing its
+persistent dense and ragged buffers. Other batches retain the V4.1/PCP builder
+inheritance chain and original ragged post-process.
 
 Installed ROCm ``DeepseekV4ROCMAiterSparseSWAMetadataBuilder.build`` may omit
 ``replay_start`` while its parent (plugin ``DeepseekSparseSWAMetadataBuilder`` /
@@ -26,13 +27,11 @@ from ._common import (
     require_unpatched,
     PatchCompatibilityError,
 )
-from vllm_hcu.platforms import envs as henvs
 from vllm_hcu.v1.attention.ops import deepseek_v41_flashmla_decode as runtime
 from vllm_hcu.v1.attention.ops.deepseek_v41_flashmla_metadata import (
     SCHEDULERS_ATTR,
     DecodeScheduler,
-    decode_context_supported,
-    decode_query_limit,
+    decode_build_policy,
 )
 
 TARGET_MODULE = "vllm.models.deepseek_v41.amd.rocm"
@@ -148,7 +147,19 @@ def apply_to_module(module: ModuleType) -> bool:
         fast_build=False,
         replay_start=None,
     ):
-        if supports_replay_start:
+        metadata = None
+        if hasattr(self, "no_replay_start"):
+            from vllm_hcu.v1.attention.ops.deepseek_v41_swa_metadata import (
+                build_fused_decode_metadata,
+            )
+
+            metadata = build_fused_decode_metadata(
+                self,
+                common_attn_metadata,
+                replay_start,
+                target.DeepseekV4ROCMAiterSparseSWAMetadata,
+            )
+        if metadata is None and supports_replay_start:
             metadata = original(
                 self,
                 common_prefix_len,
@@ -156,14 +167,14 @@ def apply_to_module(module: ModuleType) -> bool:
                 fast_build,
                 replay_start=replay_start,
             )
-        elif replay_start is None:
+        elif metadata is None and replay_start is None:
             metadata = original(
                 self,
                 common_prefix_len,
                 common_attn_metadata,
                 fast_build,
             )
-        else:
+        elif metadata is None:
             # Installed ROCm build drops replay_start; parent already has it.
             if parent_with_replay is None:
                 raise TypeError(
@@ -181,12 +192,12 @@ def apply_to_module(module: ModuleType) -> bool:
         # Always clear on build, even if the original builder returns a reused
         # Python object. Disabled/unsupported builds must retain no old leases.
         setattr(metadata, SCHEDULERS_ATTR, None)
+        if metadata.num_decode_tokens == 0 or metadata.decode_swa_indices is None:
+            return metadata
+        policy = decode_build_policy(self.vllm_config)
         if (
-            not henvs.dsv41_flashmla_decode_enabled()
-            or not decode_context_supported(self.vllm_config)
-            or metadata.num_decode_tokens == 0
-            or not 1 <= metadata.max_decode_query_len <= decode_query_limit(self.vllm_config)
-            or metadata.decode_swa_indices is None
+            policy is None
+            or not 1 <= metadata.max_decode_query_len <= policy.query_limit
             or not runtime._supported_device(metadata.decode_swa_indices)
         ):
             return metadata
@@ -198,9 +209,9 @@ def apply_to_module(module: ModuleType) -> bool:
         # sharing; the existing per-type holders remain untouched for fallback.
         schedulers = {
             name: DecodeScheduler(
-                bindings[2], allow_graph=henvs.dsv41_flashmla_decode_graph_enabled(),
-                query_limit=decode_query_limit(self.vllm_config),
-                speculative=self.vllm_config.speculative_config is not None,
+                bindings[2], allow_graph=policy.allow_graph,
+                query_limit=policy.query_limit,
+                speculative=policy.speculative,
             )
             for name in self.layer_names
         }
