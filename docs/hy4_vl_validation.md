@@ -160,5 +160,36 @@ content events yield null; TTFT, latency and throughput calculations retain
 their prior definitions. This changes the JSON metric names documented in the
 serving guide. Nine added cases cover missing/null/explicit configuration,
 round-trip serialization, early rejection and single/batched streaming deltas.
-All 296 related regression tests pass. The full-model measurements above
-precede these review fixes; this follow-up does not claim another full-model run.
+All 296 related regression tests pass. The full-split accuracy measurements
+above precede these review fixes; subsequent public HTTP checks are below.
+
+## ViT activation copies
+
+At `00a5fa0`, the TP vision path splits image activations once and keeps each
+image separate across all 40 layers. It removes the per-layer concatenation
+and repeated splitting while retaining per-image GEMM shapes, image order,
+collective order, parameters and BF16 computation. TP1 execution is unchanged.
+
+Real checkpoint weights on TP8 are compared with `9481001`, using five warmups
+per tower followed by 30 CUDA-event samples per case and version, alternating
+which version executes first. Median encoder times:
+
+| Input | Before ms | After ms | Latency reduction |
+| --- | ---: | ---: | ---: |
+| Small image, grid 16×24 | 19.160 | 18.051 | 5.8% |
+| Large image, grid 50×78 | 64.377 | 63.503 | 1.4% |
+| Two large images | 130.837 | 126.675 | 3.2% |
+
+Six initial cases cover single/multiple images, mixed sizes and prior sensitive
+inputs. A further check pairs all 765 original dataset image rows (762 unique
+images) and compares complete encoder tensors bitwise on all eight ranks;
+all comparisons pass. All 296 related regression tests pass.
+
+A fresh normal server at `00a5fa0` captures full/piecewise graphs without a
+diagnostic worker extension or development RPC. All 136 fixed real-image
+performance requests match the preceding `a5b2eda` graph control's raw answers,
+and seven constrained HTTP smoke checks pass. QA latency p50 is 812.0 ms at
+concurrency 1 and 1415.4 ms at concurrency 2. These cross-run HTTP measurements
+are a compatibility check, not an isolated end-to-end speedup measurement.
+The encoder timing gains above do not establish a comparable end-to-end gain;
+the full 765-question QA evaluation was not rerun for this copy-only change.
