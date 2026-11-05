@@ -1,0 +1,827 @@
+[
+  {
+    "index": 0,
+    "question": "Which of the 3 objects is the smallest?\nA. The object on the right is the smallest object.\nB. The object on the left is the smallest object.\nC. The object in the middle is the smallest object.\nPlease answer directly with only the letter of the correct option and nothing else.",
+    "answer": "C",
+    "image_size": [
+      625,
+      833
+    ],
+    "image_sha256": "f88fe2bcb68af91ca621b095c1b62ce845dcaf4869d405bdf180a1cf62a87ec6",
+    "status": 200,
+    "response": {
+      "id": "chatcmpl-87b9880dcd363dc8",
+      "object": "chat.completion",
+      "created": 1793840805,
+      "model": "hy4-vl",
+      "choices": [
+        {
+          "index": 0,
+          "message": {
+            "role": "assistant",
+            "content": "C",
+            "refusal": null,
+            "annotations": null,
+            "audio": null,
+            "function_call": null,
+            "reasoning": null
+          },
+          "logprobs": null,
+          "finish_reason": "stop",
+          "stop_reason": null,
+          "token_ids": null,
+          "routed_experts": null
+        }
+      ],
+      "service_tier": null,
+      "system_fingerprint": "vllm-0.25.1-tp8-b906b3bd",
+      "usage": {
+        "prompt_tokens": 633,
+        "total_tokens": 635,
+        "completion_tokens": 2,
+        "prompt_tokens_details": null
+      },
+      "prompt_logprobs": null,
+      "prompt_token_ids": null,
+      "prompt_text": null,
+      "kv_transfer_params": null,
+      "metrics": null
+    },
+    "prediction": "C",
+    "finish_reason": "stop",
+    "normalized_prediction": "C",
+    "correct": true,
+    "strict_correct": true,
+    "seconds": 0.5350733420054894
+  },
+  {
+    "index": 45,
+    "question": "Is the road we are on a one way?\nPlease answer directly with a single word or number.",
+    "answer": "No",
+    "image_size": [
+      1448,
+      938
+    ],
+    "image_sha256": "282877313d3ccac28208827ad5e1869e885b3f1b3edc6371a2a6bd78d1f44b7d",
+    "status": 200,
+    "response": {
+      "id": "chatcmpl-91a995061e929a94",
+      "object": "chat.completion",
+      "created": 1793840806,
+      "model": "hy4-vl",
+      "choices": [
+        {
+          "index": 0,
+          "message": {
+            "role": "assistant",
+            "content": "No.",
+            "refusal": null,
+            "annotations": null,
+            "audio": null,
+            "function_call": null,
+            "reasoning": null
+          },
+          "logprobs": null,
+          "finish_reason": "stop",
+          "stop_reason": null,
+          "token_ids": null,
+          "routed_experts": null
+        }
+      ],
+      "service_tier": null,
+      "system_fingerprint": "vllm-0.25.1-tp8-b906b3bd",
+      "usage": {
+        "prompt_tokens": 1046,
+        "total_tokens": 1049,
+        "completion_tokens": 3,
+        "prompt_tokens_details": null
+      },
+      "prompt_logprobs": null,
+      "prompt_token_ids": null,
+      "prompt_text": null,
+      "kv_transfer_params": null,
+      "metrics": null
+    },
+    "prediction": "No.",
+    "finish_reason": "stop",
+    "normalized_prediction": "no",
+    "correct": true,
+    "strict_correct": false,
+    "seconds": 1.1793807020003442
+  },
+  {
+    "index": 94,
+    "question": "Which side of the black truck is open?\n\nA. The right side\nB. The left side\nC. Both sides\nPlease answer directly with only the letter of the correct option and nothing else.",
+    "answer": "A",
+    "image_size": [
+      1448,
+      938
+    ],
+    "image_sha256": "78786bbc4029cc1256e6f218eb155bc0d3aa239ffe40cf698f780f362477f559",
+    "status": 200,
+    "response": {
+      "id": "chatcmpl-85d8aafb492654e8",
+      "object": "chat.completion",
+      "created": 1793840807,
+      "model": "hy4-vl",
+      "choices": [
+        {
+          "index": 0,
+          "message": {
+            "role": "assistant",
+            "content": "B",
+            "refusal": null,
+            "annotations": null,
+            "audio": null,
+            "function_call": null,
+            "reasoning": null
+          },
+          "logprobs": null,
+          "finish_reason": "stop",
+          "stop_reason": null,
+          "token_ids": null,
+          "routed_experts": null
+        }
+      ],
+      "service_tier": null,
+      "system_fingerprint": "vllm-0.25.1-tp8-b906b3bd",
+      "usage": {
+        "prompt_tokens": 1067,
+        "total_tokens": 1069,
+        "completion_tokens": 2,
+        "prompt_tokens_details": null
+      },
+      "prompt_logprobs": null,
+      "prompt_token_ids": null,
+      "prompt_text": null,
+      "kv_transfer_params": null,
+      "metrics": null
+    },
+    "prediction": "B",
+    "finish_reason": "stop",
+    "normalized_prediction": "B",
+    "correct": false,
+    "strict_correct": false,
+    "seconds": 1.0341805679927347
+  },
+  {
+    "index": 119,
+    "question": "How many pedestrians are there within 30 meters?\nPlease answer directly with a single word or number.",
+    "answer": "0",
+    "image_size": [
+      1448,
+      938
+    ],
+    "image_sha256": "232487b47c8c2a01d87f36429f93a68d7ef26e28d0f74f6b8dc069749c96f4fe",
+    "status": 200,
+    "response": {
+      "id": "chatcmpl-865775b0b346d773",
+      "object": "chat.completion",
+      "created": 1793840808,
+      "model": "hy4-vl",
+      "choices": [
+        {
+          "index": 0,
+          "message": {
+            "role": "assistant",
+            "content": "2",
+            "refusal": null,
+            "annotations": null,
+            "audio": null,
+            "function_call": null,
+            "reasoning": null
+          },
+          "logprobs": null,
+          "finish_reason": "stop",
+          "stop_reason": null,
+          "token_ids": null,
+          "routed_experts": null
+        }
+      ],
+      "service_tier": null,
+      "system_fingerprint": "vllm-0.25.1-tp8-b906b3bd",
+      "usage": {
+        "prompt_tokens": 1046,
+        "total_tokens": 1048,
+        "completion_tokens": 2,
+        "prompt_tokens_details": null
+      },
+      "prompt_logprobs": null,
+      "prompt_token_ids": null,
+      "prompt_text": null,
+      "kv_transfer_params": null,
+      "metrics": null
+    },
+    "prediction": "2",
+    "finish_reason": "stop",
+    "normalized_prediction": "2",
+    "correct": false,
+    "strict_correct": false,
+    "seconds": 1.0130857680051122
+  },
+  {
+    "index": 126,
+    "question": "How many pedestrians are there within 30 meters?\nPlease answer directly with a single word or number.",
+    "answer": "2",
+    "image_size": [
+      1448,
+      938
+    ],
+    "image_sha256": "355991b8930204eb453f7b21a3097ac835b2efc9d4569e604cd240f9a903cd0d",
+    "status": 200,
+    "response": {
+      "id": "chatcmpl-9b948ab24a3832a7",
+      "object": "chat.completion",
+      "created": 1793840809,
+      "model": "hy4-vl",
+      "choices": [
+        {
+          "index": 0,
+          "message": {
+            "role": "assistant",
+            "content": "3",
+            "refusal": null,
+            "annotations": null,
+            "audio": null,
+            "function_call": null,
+            "reasoning": null
+          },
+          "logprobs": null,
+          "finish_reason": "stop",
+          "stop_reason": null,
+          "token_ids": null,
+          "routed_experts": null
+        }
+      ],
+      "service_tier": null,
+      "system_fingerprint": "vllm-0.25.1-tp8-b906b3bd",
+      "usage": {
+        "prompt_tokens": 1046,
+        "total_tokens": 1048,
+        "completion_tokens": 2,
+        "prompt_tokens_details": null
+      },
+      "prompt_logprobs": null,
+      "prompt_token_ids": null,
+      "prompt_text": null,
+      "kv_transfer_params": null,
+      "metrics": null
+    },
+    "prediction": "3",
+    "finish_reason": "stop",
+    "normalized_prediction": "3",
+    "correct": false,
+    "strict_correct": false,
+    "seconds": 1.0133452309964923
+  },
+  {
+    "index": 143,
+    "question": "Can I turn right here?\nPlease answer directly with a single word or number.",
+    "answer": "No",
+    "image_size": [
+      1448,
+      938
+    ],
+    "image_sha256": "87a47836ba93de446b3d96828b1709eb7cdf7fd880308a3e6986938171c035d1",
+    "status": 200,
+    "response": {
+      "id": "chatcmpl-9d5bb656be807c4d",
+      "object": "chat.completion",
+      "created": 1793840810,
+      "model": "hy4-vl",
+      "choices": [
+        {
+          "index": 0,
+          "message": {
+            "role": "assistant",
+            "content": "Yes",
+            "refusal": null,
+            "annotations": null,
+            "audio": null,
+            "function_call": null,
+            "reasoning": null
+          },
+          "logprobs": null,
+          "finish_reason": "stop",
+          "stop_reason": null,
+          "token_ids": null,
+          "routed_experts": null
+        }
+      ],
+      "service_tier": null,
+      "system_fingerprint": "vllm-0.25.1-tp8-b906b3bd",
+      "usage": {
+        "prompt_tokens": 1042,
+        "total_tokens": 1044,
+        "completion_tokens": 2,
+        "prompt_tokens_details": null
+      },
+      "prompt_logprobs": null,
+      "prompt_token_ids": null,
+      "prompt_text": null,
+      "kv_transfer_params": null,
+      "metrics": null
+    },
+    "prediction": "Yes",
+    "finish_reason": "stop",
+    "normalized_prediction": "yes",
+    "correct": false,
+    "strict_correct": false,
+    "seconds": 1.0398649350099731
+  },
+  {
+    "index": 155,
+    "question": "How many cars are moving in the opposite direction?\n\nA. 1 car\nB. 0 car \nC. 2 cars\nPlease answer directly with only the letter of the correct option and nothing else.",
+    "answer": "C",
+    "image_size": [
+      1448,
+      938
+    ],
+    "image_sha256": "53e68754b931127ae6b1b97f88cfeab211f59fbc0e573d7b735d0c8a3518e5fd",
+    "status": 200,
+    "response": {
+      "id": "chatcmpl-a92f9095c66a631b",
+      "object": "chat.completion",
+      "created": 1793840811,
+      "model": "hy4-vl",
+      "choices": [
+        {
+          "index": 0,
+          "message": {
+            "role": "assistant",
+            "content": "A",
+            "refusal": null,
+            "annotations": null,
+            "audio": null,
+            "function_call": null,
+            "reasoning": null
+          },
+          "logprobs": null,
+          "finish_reason": "stop",
+          "stop_reason": null,
+          "token_ids": null,
+          "routed_experts": null
+        }
+      ],
+      "service_tier": null,
+      "system_fingerprint": "vllm-0.25.1-tp8-b906b3bd",
+      "usage": {
+        "prompt_tokens": 1070,
+        "total_tokens": 1072,
+        "completion_tokens": 2,
+        "prompt_tokens_details": null
+      },
+      "prompt_logprobs": null,
+      "prompt_token_ids": null,
+      "prompt_text": null,
+      "kv_transfer_params": null,
+      "metrics": null
+    },
+    "prediction": "A",
+    "finish_reason": "stop",
+    "normalized_prediction": "A",
+    "correct": false,
+    "strict_correct": false,
+    "seconds": 1.0438805549929384
+  },
+  {
+    "index": 170,
+    "question": "Are there any stop signs?\nPlease answer directly with a single word or number.",
+    "answer": "Yes",
+    "image_size": [
+      1448,
+      938
+    ],
+    "image_sha256": "81ef19f7bd509402a98c91ea7a896e25a35ebbee1e457f66451e69208ad08aec",
+    "status": 200,
+    "response": {
+      "id": "chatcmpl-85ccbc7f21cc9825",
+      "object": "chat.completion",
+      "created": 1793840812,
+      "model": "hy4-vl",
+      "choices": [
+        {
+          "index": 0,
+          "message": {
+            "role": "assistant",
+            "content": "1",
+            "refusal": null,
+            "annotations": null,
+            "audio": null,
+            "function_call": null,
+            "reasoning": null
+          },
+          "logprobs": null,
+          "finish_reason": "stop",
+          "stop_reason": null,
+          "token_ids": null,
+          "routed_experts": null
+        }
+      ],
+      "service_tier": null,
+      "system_fingerprint": "vllm-0.25.1-tp8-b906b3bd",
+      "usage": {
+        "prompt_tokens": 1042,
+        "total_tokens": 1044,
+        "completion_tokens": 2,
+        "prompt_tokens_details": null
+      },
+      "prompt_logprobs": null,
+      "prompt_token_ids": null,
+      "prompt_text": null,
+      "kv_transfer_params": null,
+      "metrics": null
+    },
+    "prediction": "1",
+    "finish_reason": "stop",
+    "normalized_prediction": "1",
+    "correct": false,
+    "strict_correct": false,
+    "seconds": 1.0607738999970024
+  },
+  {
+    "index": 214,
+    "question": "How many lanes of traffic are going in my direction?\nPlease answer directly with a single word or number.",
+    "answer": "3",
+    "image_size": [
+      1448,
+      938
+    ],
+    "image_sha256": "31975e2b55a73c86bf6646ceba243239cfe6b4d98b1e97d5afcfc8e0e5787383",
+    "status": 200,
+    "response": {
+      "id": "chatcmpl-a5d4f1db4ce92b0b",
+      "object": "chat.completion",
+      "created": 1793840813,
+      "model": "hy4-vl",
+      "choices": [
+        {
+          "index": 0,
+          "message": {
+            "role": "assistant",
+            "content": "2",
+            "refusal": null,
+            "annotations": null,
+            "audio": null,
+            "function_call": null,
+            "reasoning": null
+          },
+          "logprobs": null,
+          "finish_reason": "stop",
+          "stop_reason": null,
+          "token_ids": null,
+          "routed_experts": null
+        }
+      ],
+      "service_tier": null,
+      "system_fingerprint": "vllm-0.25.1-tp8-b906b3bd",
+      "usage": {
+        "prompt_tokens": 1047,
+        "total_tokens": 1049,
+        "completion_tokens": 2,
+        "prompt_tokens_details": null
+      },
+      "prompt_logprobs": null,
+      "prompt_token_ids": null,
+      "prompt_text": null,
+      "kv_transfer_params": null,
+      "metrics": null
+    },
+    "prediction": "2",
+    "finish_reason": "stop",
+    "normalized_prediction": "2",
+    "correct": false,
+    "strict_correct": false,
+    "seconds": 1.0159305569977732
+  },
+  {
+    "index": 305,
+    "question": "What's the horizontal distance between the pickup truck and the nearest curb to it?\n\nA. 5.5 meters\nB. 9.5 meters\nC. 13.5 meters\nPlease answer directly with only the letter of the correct option and nothing else.",
+    "answer": "A",
+    "image_size": [
+      1448,
+      938
+    ],
+    "image_sha256": "e7ef7e46f36f77a1c54d80fb284ab2a5e5240742dd47586ad638aacdff64c65a",
+    "status": 200,
+    "response": {
+      "id": "chatcmpl-a342cdd71c2726b5",
+      "object": "chat.completion",
+      "created": 1793840814,
+      "model": "hy4-vl",
+      "choices": [
+        {
+          "index": 0,
+          "message": {
+            "role": "assistant",
+            "content": "B",
+            "refusal": null,
+            "annotations": null,
+            "audio": null,
+            "function_call": null,
+            "reasoning": null
+          },
+          "logprobs": null,
+          "finish_reason": "stop",
+          "stop_reason": null,
+          "token_ids": null,
+          "routed_experts": null
+        }
+      ],
+      "service_tier": null,
+      "system_fingerprint": "vllm-0.25.1-tp8-b906b3bd",
+      "usage": {
+        "prompt_tokens": 1081,
+        "total_tokens": 1083,
+        "completion_tokens": 2,
+        "prompt_tokens_details": null
+      },
+      "prompt_logprobs": null,
+      "prompt_token_ids": null,
+      "prompt_text": null,
+      "kv_transfer_params": null,
+      "metrics": null
+    },
+    "prediction": "B",
+    "finish_reason": "stop",
+    "normalized_prediction": "B",
+    "correct": false,
+    "strict_correct": false,
+    "seconds": 1.0268738019949524
+  },
+  {
+    "index": 313,
+    "question": "Which direction should I travel in this roundabout?\n\nA. To the left\nB. To the right\nPlease answer directly with only the letter of the correct option and nothing else.",
+    "answer": "B",
+    "image_size": [
+      1448,
+      938
+    ],
+    "image_sha256": "74820b7dd59dbec4ac56e9044b90e088c7924ffb37dca47f85f90a12b4a45384",
+    "status": 200,
+    "response": {
+      "id": "chatcmpl-ba80a25d9178dd40",
+      "object": "chat.completion",
+      "created": 1793840815,
+      "model": "hy4-vl",
+      "choices": [
+        {
+          "index": 0,
+          "message": {
+            "role": "assistant",
+            "content": "A",
+            "refusal": null,
+            "annotations": null,
+            "audio": null,
+            "function_call": null,
+            "reasoning": null
+          },
+          "logprobs": null,
+          "finish_reason": "stop",
+          "stop_reason": null,
+          "token_ids": null,
+          "routed_experts": null
+        }
+      ],
+      "service_tier": null,
+      "system_fingerprint": "vllm-0.25.1-tp8-b906b3bd",
+      "usage": {
+        "prompt_tokens": 1063,
+        "total_tokens": 1065,
+        "completion_tokens": 2,
+        "prompt_tokens_details": null
+      },
+      "prompt_logprobs": null,
+      "prompt_token_ids": null,
+      "prompt_text": null,
+      "kv_transfer_params": null,
+      "metrics": null
+    },
+    "prediction": "A",
+    "finish_reason": "stop",
+    "normalized_prediction": "A",
+    "correct": false,
+    "strict_correct": false,
+    "seconds": 1.0551619809994008
+  },
+  {
+    "index": 374,
+    "question": "Which is further, the pickup truck or the pedestrian?\nPlease answer directly with a single word or number.",
+    "answer": "Pedestrian",
+    "image_size": [
+      1448,
+      938
+    ],
+    "image_sha256": "11f453ba8125a8fbb832ec422fcac3156270152d95c17fdafb0081418679df69",
+    "status": 200,
+    "response": {
+      "id": "chatcmpl-a3083b2c017dc45a",
+      "object": "chat.completion",
+      "created": 1793840816,
+      "model": "hy4-vl",
+      "choices": [
+        {
+          "index": 0,
+          "message": {
+            "role": "assistant",
+            "content": "The pedestrian",
+            "refusal": null,
+            "annotations": null,
+            "audio": null,
+            "function_call": null,
+            "reasoning": null
+          },
+          "logprobs": null,
+          "finish_reason": "stop",
+          "stop_reason": null,
+          "token_ids": null,
+          "routed_experts": null
+        }
+      ],
+      "service_tier": null,
+      "system_fingerprint": "vllm-0.25.1-tp8-b906b3bd",
+      "usage": {
+        "prompt_tokens": 1047,
+        "total_tokens": 1050,
+        "completion_tokens": 3,
+        "prompt_tokens_details": null
+      },
+      "prompt_logprobs": null,
+      "prompt_token_ids": null,
+      "prompt_text": null,
+      "kv_transfer_params": null,
+      "metrics": null
+    },
+    "prediction": "The pedestrian",
+    "finish_reason": "stop",
+    "normalized_prediction": "the pedestrian",
+    "correct": false,
+    "strict_correct": false,
+    "seconds": 1.1196458409976913
+  },
+  {
+    "index": 401,
+    "question": "In which direction is the pedestrian in this scene crossing?\n\nA. Left to right\nB. Right to left\nPlease answer directly with only the letter of the correct option and nothing else.",
+    "answer": "A",
+    "image_size": [
+      1448,
+      938
+    ],
+    "image_sha256": "363e8728addefc2d46d3386dfcb40ed6b3349b3ad57afc5002b5141efd26866c",
+    "status": 200,
+    "response": {
+      "id": "chatcmpl-9b6cb44641b769de",
+      "object": "chat.completion",
+      "created": 1793840817,
+      "model": "hy4-vl",
+      "choices": [
+        {
+          "index": 0,
+          "message": {
+            "role": "assistant",
+            "content": "B",
+            "refusal": null,
+            "annotations": null,
+            "audio": null,
+            "function_call": null,
+            "reasoning": null
+          },
+          "logprobs": null,
+          "finish_reason": "stop",
+          "stop_reason": null,
+          "token_ids": null,
+          "routed_experts": null
+        }
+      ],
+      "service_tier": null,
+      "system_fingerprint": "vllm-0.25.1-tp8-b906b3bd",
+      "usage": {
+        "prompt_tokens": 1064,
+        "total_tokens": 1066,
+        "completion_tokens": 2,
+        "prompt_tokens_details": null
+      },
+      "prompt_logprobs": null,
+      "prompt_token_ids": null,
+      "prompt_text": null,
+      "kv_transfer_params": null,
+      "metrics": null
+    },
+    "prediction": "B",
+    "finish_reason": "stop",
+    "normalized_prediction": "B",
+    "correct": false,
+    "strict_correct": false,
+    "seconds": 1.0311232849926455
+  },
+  {
+    "index": 506,
+    "question": "Within 20 meters of us, how many vehicles are there?\nPlease answer directly with a single word or number.",
+    "answer": "1",
+    "image_size": [
+      1448,
+      938
+    ],
+    "image_sha256": "ccd6c68dfdd53dd323a79456eace46f263e8bc9173bd9c0bf9873cd7a5d8831f",
+    "status": 200,
+    "response": {
+      "id": "chatcmpl-80a9e2fd86f37d5c",
+      "object": "chat.completion",
+      "created": 1793840818,
+      "model": "hy4-vl",
+      "choices": [
+        {
+          "index": 0,
+          "message": {
+            "role": "assistant",
+            "content": "2",
+            "refusal": null,
+            "annotations": null,
+            "audio": null,
+            "function_call": null,
+            "reasoning": null
+          },
+          "logprobs": null,
+          "finish_reason": "stop",
+          "stop_reason": null,
+          "token_ids": null,
+          "routed_experts": null
+        }
+      ],
+      "service_tier": null,
+      "system_fingerprint": "vllm-0.25.1-tp8-b906b3bd",
+      "usage": {
+        "prompt_tokens": 1049,
+        "total_tokens": 1051,
+        "completion_tokens": 2,
+        "prompt_tokens_details": null
+      },
+      "prompt_logprobs": null,
+      "prompt_token_ids": null,
+      "prompt_text": null,
+      "kv_transfer_params": null,
+      "metrics": null
+    },
+    "prediction": "2",
+    "finish_reason": "stop",
+    "normalized_prediction": "2",
+    "correct": false,
+    "strict_correct": false,
+    "seconds": 1.0938185900013195
+  },
+  {
+    "index": 598,
+    "question": "Are there any cars in the nearest intersection?\nPlease answer directly with a single word or number.",
+    "answer": "No",
+    "image_size": [
+      1448,
+      938
+    ],
+    "image_sha256": "78743718c44298c187ad6bc2d1b004d8be3ebc2d79e5168e17348072708e033e",
+    "status": 200,
+    "response": {
+      "id": "chatcmpl-91513288fa0f1ac8",
+      "object": "chat.completion",
+      "created": 1793840820,
+      "model": "hy4-vl",
+      "choices": [
+        {
+          "index": 0,
+          "message": {
+            "role": "assistant",
+            "content": "0",
+            "refusal": null,
+            "annotations": null,
+            "audio": null,
+            "function_call": null,
+            "reasoning": null
+          },
+          "logprobs": null,
+          "finish_reason": "stop",
+          "stop_reason": null,
+          "token_ids": null,
+          "routed_experts": null
+        }
+      ],
+      "service_tier": null,
+      "system_fingerprint": "vllm-0.25.1-tp8-b906b3bd",
+      "usage": {
+        "prompt_tokens": 1045,
+        "total_tokens": 1047,
+        "completion_tokens": 2,
+        "prompt_tokens_details": null
+      },
+      "prompt_logprobs": null,
+      "prompt_token_ids": null,
+      "prompt_text": null,
+      "kv_transfer_params": null,
+      "metrics": null
+    },
+    "prediction": "0",
+    "finish_reason": "stop",
+    "normalized_prediction": "0",
+    "correct": false,
+    "strict_correct": false,
+    "seconds": 1.0286881959909806
+  }
+]

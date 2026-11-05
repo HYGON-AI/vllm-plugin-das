@@ -1,0 +1,50 @@
+[
+  {
+    "index": 112,
+    "prompt_tokens": 2039,
+    "guard_encoded_tokens": 32,
+    "decode_only_encoded_tokens": 32,
+    "identical": true,
+    "first_changed_zero_based_token": null,
+    "context_at_first_changed_token": null,
+    "common_prefix": "The first image depicts a daytime street scene under overcast, rainy conditions. The road is wet, reflecting the gray sky and surrounding elements. Multiple vehicles, including",
+    "guard": "The first image depicts a daytime street scene under overcast, rainy conditions. The road is wet, reflecting the gray sky and surrounding elements. Multiple vehicles, including",
+    "decode_only": "The first image depicts a daytime street scene under overcast, rainy conditions. The road is wet, reflecting the gray sky and surrounding elements. Multiple vehicles, including"
+  },
+  {
+    "index": 422,
+    "prompt_tokens": 1585,
+    "guard_encoded_tokens": 31,
+    "decode_only_encoded_tokens": 31,
+    "identical": true,
+    "first_changed_zero_based_token": null,
+    "context_at_first_changed_token": null,
+    "common_prefix": "Image 1:\nThe first image shows two glass seasoning grinders placed side by side on a light-colored wooden cutting board or countertop. The gr",
+    "guard": "Image 1:\nThe first image shows two glass seasoning grinders placed side by side on a light-colored wooden cutting board or countertop. The gr",
+    "decode_only": "Image 1:\nThe first image shows two glass seasoning grinders placed side by side on a light-colored wooden cutting board or countertop. The gr"
+  },
+  {
+    "index": 287,
+    "prompt_tokens": 2039,
+    "guard_encoded_tokens": 31,
+    "decode_only_encoded_tokens": 31,
+    "identical": false,
+    "first_changed_zero_based_token": 26,
+    "context_at_first_changed_token": 2065,
+    "common_prefix": "Here is a detailed description of both images in their original order:\n\n**Image 1: Urban Intersection**\nThis image captures a daytime",
+    "guard": "Here is a detailed description of both images in their original order:\n\n**Image 1: Urban Intersection**\nThis image captures a daytime view of a multi-l",
+    "decode_only": "Here is a detailed description of both images in their original order:\n\n**Image 1: Urban Intersection**\nThis image captures a daytime street scene at a multi"
+  },
+  {
+    "index": 478,
+    "prompt_tokens": 2039,
+    "guard_encoded_tokens": 32,
+    "decode_only_encoded_tokens": 32,
+    "identical": false,
+    "first_changed_zero_based_token": 10,
+    "context_at_first_changed_token": 2049,
+    "common_prefix": "Here is a detailed description of both images, in",
+    "guard": "Here is a detailed description of both images, in the order they were provided:\n\n### Image 1\n\nThis image captures a daytime street scene from the perspective of",
+    "decode_only": "Here is a detailed description of both images, in their original order:\n\n### Image 1\nThis is a street-level photograph taken from inside a vehicle, looking"
+  }
+]

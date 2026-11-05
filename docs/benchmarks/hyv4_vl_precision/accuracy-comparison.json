@@ -1,0 +1,21 @@
+{
+  "items": 765,
+  "guard_correct": 561,
+  "decode_only_correct": 561,
+  "guard_strict_correct": 546,
+  "decode_only_strict_correct": 546,
+  "raw_changed": 0,
+  "errors": {
+    "accuracy-guard": {
+      "http_errors": 0,
+      "empty_answers": 0,
+      "truncated": 0
+    },
+    "accuracy-decode_only": {
+      "http_errors": 0,
+      "empty_answers": 0,
+      "truncated": 0
+    }
+  },
+  "strict_acceptance_pass": true
+}

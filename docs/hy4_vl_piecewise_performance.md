@@ -1,5 +1,11 @@
 # HYV4VL full/piecewise evaluation and optimization space
 
+This is the historical **unguarded** experiment at `c17d77c`. The later
+[precision investigation and fix](hy4_vl_piecewise_precision.md) isolates prefill
+padding as the trigger and tests guarded FULL_AND_PIECEWISE. The current serving
+commands include that fix; check out `ba44dc2` to reproduce the original behavior.
+The results below retain the original measurements.
+
 This follows the [decode-only evaluation](hy4_vl_graph_performance.md) on the
 same checkpoint, eight BW1101 HCUs and TP8. The explicitly requested
 `FULL_AND_PIECEWISE` mode is tested with breakable CUDA graphs and the vLLM

@@ -1,0 +1,36 @@
+{
+  "results": [
+    {
+      "mode": "padded_eager",
+      "runner": "GPUModelRunner"
+    },
+    {
+      "mode": "padded_eager",
+      "runner": "GPUModelRunner"
+    },
+    {
+      "mode": "padded_eager",
+      "runner": "GPUModelRunner"
+    },
+    {
+      "mode": "padded_eager",
+      "runner": "GPUModelRunner"
+    },
+    {
+      "mode": "padded_eager",
+      "runner": "GPUModelRunner"
+    },
+    {
+      "mode": "padded_eager",
+      "runner": "GPUModelRunner"
+    },
+    {
+      "mode": "padded_eager",
+      "runner": "GPUModelRunner"
+    },
+    {
+      "mode": "padded_eager",
+      "runner": "GPUModelRunner"
+    }
+  ]
+}

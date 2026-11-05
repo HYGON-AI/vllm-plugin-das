@@ -1,0 +1,412 @@
+{
+  "results": [
+    {
+      "rank": 0,
+      "layers": {
+        "0": {
+          "same_input_shape_comparison": {
+            "exact": true,
+            "nonzero": 0,
+            "numel": 135168,
+            "max_abs": 0.0,
+            "relative_l2": 0.0
+          },
+          "repeat_same_shape": {
+            "exact": true,
+            "nonzero": 0,
+            "numel": 135168,
+            "max_abs": 0.0,
+            "relative_l2": 0.0
+          }
+        },
+        "1": {
+          "same_input_shape_comparison": {
+            "exact": true,
+            "nonzero": 0,
+            "numel": 135168,
+            "max_abs": 0.0,
+            "relative_l2": 0.0
+          },
+          "repeat_same_shape": {
+            "exact": true,
+            "nonzero": 0,
+            "numel": 135168,
+            "max_abs": 0.0,
+            "relative_l2": 0.0
+          },
+          "gate_logits": {
+            "exact": true,
+            "nonzero": 0,
+            "numel": 5632,
+            "max_abs": 0.0,
+            "relative_l2": 0.0
+          },
+          "changed_expert_sets": 0
+        }
+      },
+      "ihc_configs": {
+        "22": "PreConfig(token_block=32, hidden_block=64, split_k=64, separate_x_fn_smem=True, est_occupancy=8)",
+        "43": "PreConfig(token_block=32, hidden_block=64, split_k=32, separate_x_fn_smem=True, est_occupancy=8)",
+        "128": "PreConfig(token_block=64, hidden_block=64, split_k=128, separate_x_fn_smem=True, est_occupancy=5)",
+        "1024": "PreConfig(token_block=64, hidden_block=64, split_k=16, separate_x_fn_smem=True, est_occupancy=5)"
+      }
+    },
+    {
+      "rank": 1,
+      "layers": {
+        "0": {
+          "same_input_shape_comparison": {
+            "exact": true,
+            "nonzero": 0,
+            "numel": 135168,
+            "max_abs": 0.0,
+            "relative_l2": 0.0
+          },
+          "repeat_same_shape": {
+            "exact": true,
+            "nonzero": 0,
+            "numel": 135168,
+            "max_abs": 0.0,
+            "relative_l2": 0.0
+          }
+        },
+        "1": {
+          "same_input_shape_comparison": {
+            "exact": true,
+            "nonzero": 0,
+            "numel": 135168,
+            "max_abs": 0.0,
+            "relative_l2": 0.0
+          },
+          "repeat_same_shape": {
+            "exact": true,
+            "nonzero": 0,
+            "numel": 135168,
+            "max_abs": 0.0,
+            "relative_l2": 0.0
+          },
+          "gate_logits": {
+            "exact": true,
+            "nonzero": 0,
+            "numel": 5632,
+            "max_abs": 0.0,
+            "relative_l2": 0.0
+          },
+          "changed_expert_sets": 0
+        }
+      },
+      "ihc_configs": {
+        "22": "PreConfig(token_block=32, hidden_block=64, split_k=64, separate_x_fn_smem=True, est_occupancy=8)",
+        "43": "PreConfig(token_block=32, hidden_block=64, split_k=32, separate_x_fn_smem=True, est_occupancy=8)",
+        "128": "PreConfig(token_block=64, hidden_block=64, split_k=128, separate_x_fn_smem=True, est_occupancy=5)",
+        "1024": "PreConfig(token_block=64, hidden_block=64, split_k=16, separate_x_fn_smem=True, est_occupancy=5)"
+      }
+    },
+    {
+      "rank": 2,
+      "layers": {
+        "0": {
+          "same_input_shape_comparison": {
+            "exact": true,
+            "nonzero": 0,
+            "numel": 135168,
+            "max_abs": 0.0,
+            "relative_l2": 0.0
+          },
+          "repeat_same_shape": {
+            "exact": true,
+            "nonzero": 0,
+            "numel": 135168,
+            "max_abs": 0.0,
+            "relative_l2": 0.0
+          }
+        },
+        "1": {
+          "same_input_shape_comparison": {
+            "exact": true,
+            "nonzero": 0,
+            "numel": 135168,
+            "max_abs": 0.0,
+            "relative_l2": 0.0
+          },
+          "repeat_same_shape": {
+            "exact": true,
+            "nonzero": 0,
+            "numel": 135168,
+            "max_abs": 0.0,
+            "relative_l2": 0.0
+          },
+          "gate_logits": {
+            "exact": true,
+            "nonzero": 0,
+            "numel": 5632,
+            "max_abs": 0.0,
+            "relative_l2": 0.0
+          },
+          "changed_expert_sets": 0
+        }
+      },
+      "ihc_configs": {
+        "22": "PreConfig(token_block=32, hidden_block=64, split_k=64, separate_x_fn_smem=True, est_occupancy=8)",
+        "43": "PreConfig(token_block=32, hidden_block=64, split_k=32, separate_x_fn_smem=True, est_occupancy=8)",
+        "128": "PreConfig(token_block=64, hidden_block=64, split_k=128, separate_x_fn_smem=True, est_occupancy=5)",
+        "1024": "PreConfig(token_block=64, hidden_block=64, split_k=16, separate_x_fn_smem=True, est_occupancy=5)"
+      }
+    },
+    {
+      "rank": 3,
+      "layers": {
+        "0": {
+          "same_input_shape_comparison": {
+            "exact": true,
+            "nonzero": 0,
+            "numel": 135168,
+            "max_abs": 0.0,
+            "relative_l2": 0.0
+          },
+          "repeat_same_shape": {
+            "exact": true,
+            "nonzero": 0,
+            "numel": 135168,
+            "max_abs": 0.0,
+            "relative_l2": 0.0
+          }
+        },
+        "1": {
+          "same_input_shape_comparison": {
+            "exact": true,
+            "nonzero": 0,
+            "numel": 135168,
+            "max_abs": 0.0,
+            "relative_l2": 0.0
+          },
+          "repeat_same_shape": {
+            "exact": true,
+            "nonzero": 0,
+            "numel": 135168,
+            "max_abs": 0.0,
+            "relative_l2": 0.0
+          },
+          "gate_logits": {
+            "exact": true,
+            "nonzero": 0,
+            "numel": 5632,
+            "max_abs": 0.0,
+            "relative_l2": 0.0
+          },
+          "changed_expert_sets": 0
+        }
+      },
+      "ihc_configs": {
+        "22": "PreConfig(token_block=32, hidden_block=64, split_k=64, separate_x_fn_smem=True, est_occupancy=8)",
+        "43": "PreConfig(token_block=32, hidden_block=64, split_k=32, separate_x_fn_smem=True, est_occupancy=8)",
+        "128": "PreConfig(token_block=64, hidden_block=64, split_k=128, separate_x_fn_smem=True, est_occupancy=5)",
+        "1024": "PreConfig(token_block=64, hidden_block=64, split_k=16, separate_x_fn_smem=True, est_occupancy=5)"
+      }
+    },
+    {
+      "rank": 4,
+      "layers": {
+        "0": {
+          "same_input_shape_comparison": {
+            "exact": true,
+            "nonzero": 0,
+            "numel": 135168,
+            "max_abs": 0.0,
+            "relative_l2": 0.0
+          },
+          "repeat_same_shape": {
+            "exact": true,
+            "nonzero": 0,
+            "numel": 135168,
+            "max_abs": 0.0,
+            "relative_l2": 0.0
+          }
+        },
+        "1": {
+          "same_input_shape_comparison": {
+            "exact": true,
+            "nonzero": 0,
+            "numel": 135168,
+            "max_abs": 0.0,
+            "relative_l2": 0.0
+          },
+          "repeat_same_shape": {
+            "exact": true,
+            "nonzero": 0,
+            "numel": 135168,
+            "max_abs": 0.0,
+            "relative_l2": 0.0
+          },
+          "gate_logits": {
+            "exact": true,
+            "nonzero": 0,
+            "numel": 5632,
+            "max_abs": 0.0,
+            "relative_l2": 0.0
+          },
+          "changed_expert_sets": 0
+        }
+      },
+      "ihc_configs": {
+        "22": "PreConfig(token_block=32, hidden_block=64, split_k=64, separate_x_fn_smem=True, est_occupancy=8)",
+        "43": "PreConfig(token_block=32, hidden_block=64, split_k=32, separate_x_fn_smem=True, est_occupancy=8)",
+        "128": "PreConfig(token_block=64, hidden_block=64, split_k=128, separate_x_fn_smem=True, est_occupancy=5)",
+        "1024": "PreConfig(token_block=64, hidden_block=64, split_k=16, separate_x_fn_smem=True, est_occupancy=5)"
+      }
+    },
+    {
+      "rank": 5,
+      "layers": {
+        "0": {
+          "same_input_shape_comparison": {
+            "exact": true,
+            "nonzero": 0,
+            "numel": 135168,
+            "max_abs": 0.0,
+            "relative_l2": 0.0
+          },
+          "repeat_same_shape": {
+            "exact": true,
+            "nonzero": 0,
+            "numel": 135168,
+            "max_abs": 0.0,
+            "relative_l2": 0.0
+          }
+        },
+        "1": {
+          "same_input_shape_comparison": {
+            "exact": true,
+            "nonzero": 0,
+            "numel": 135168,
+            "max_abs": 0.0,
+            "relative_l2": 0.0
+          },
+          "repeat_same_shape": {
+            "exact": true,
+            "nonzero": 0,
+            "numel": 135168,
+            "max_abs": 0.0,
+            "relative_l2": 0.0
+          },
+          "gate_logits": {
+            "exact": true,
+            "nonzero": 0,
+            "numel": 5632,
+            "max_abs": 0.0,
+            "relative_l2": 0.0
+          },
+          "changed_expert_sets": 0
+        }
+      },
+      "ihc_configs": {
+        "22": "PreConfig(token_block=32, hidden_block=64, split_k=64, separate_x_fn_smem=True, est_occupancy=8)",
+        "43": "PreConfig(token_block=32, hidden_block=64, split_k=32, separate_x_fn_smem=True, est_occupancy=8)",
+        "128": "PreConfig(token_block=64, hidden_block=64, split_k=128, separate_x_fn_smem=True, est_occupancy=5)",
+        "1024": "PreConfig(token_block=64, hidden_block=64, split_k=16, separate_x_fn_smem=True, est_occupancy=5)"
+      }
+    },
+    {
+      "rank": 6,
+      "layers": {
+        "0": {
+          "same_input_shape_comparison": {
+            "exact": true,
+            "nonzero": 0,
+            "numel": 135168,
+            "max_abs": 0.0,
+            "relative_l2": 0.0
+          },
+          "repeat_same_shape": {
+            "exact": true,
+            "nonzero": 0,
+            "numel": 135168,
+            "max_abs": 0.0,
+            "relative_l2": 0.0
+          }
+        },
+        "1": {
+          "same_input_shape_comparison": {
+            "exact": true,
+            "nonzero": 0,
+            "numel": 135168,
+            "max_abs": 0.0,
+            "relative_l2": 0.0
+          },
+          "repeat_same_shape": {
+            "exact": true,
+            "nonzero": 0,
+            "numel": 135168,
+            "max_abs": 0.0,
+            "relative_l2": 0.0
+          },
+          "gate_logits": {
+            "exact": true,
+            "nonzero": 0,
+            "numel": 5632,
+            "max_abs": 0.0,
+            "relative_l2": 0.0
+          },
+          "changed_expert_sets": 0
+        }
+      },
+      "ihc_configs": {
+        "22": "PreConfig(token_block=32, hidden_block=64, split_k=64, separate_x_fn_smem=True, est_occupancy=8)",
+        "43": "PreConfig(token_block=32, hidden_block=64, split_k=32, separate_x_fn_smem=True, est_occupancy=8)",
+        "128": "PreConfig(token_block=64, hidden_block=64, split_k=128, separate_x_fn_smem=True, est_occupancy=5)",
+        "1024": "PreConfig(token_block=64, hidden_block=64, split_k=16, separate_x_fn_smem=True, est_occupancy=5)"
+      }
+    },
+    {
+      "rank": 7,
+      "layers": {
+        "0": {
+          "same_input_shape_comparison": {
+            "exact": true,
+            "nonzero": 0,
+            "numel": 135168,
+            "max_abs": 0.0,
+            "relative_l2": 0.0
+          },
+          "repeat_same_shape": {
+            "exact": true,
+            "nonzero": 0,
+            "numel": 135168,
+            "max_abs": 0.0,
+            "relative_l2": 0.0
+          }
+        },
+        "1": {
+          "same_input_shape_comparison": {
+            "exact": true,
+            "nonzero": 0,
+            "numel": 135168,
+            "max_abs": 0.0,
+            "relative_l2": 0.0
+          },
+          "repeat_same_shape": {
+            "exact": true,
+            "nonzero": 0,
+            "numel": 135168,
+            "max_abs": 0.0,
+            "relative_l2": 0.0
+          },
+          "gate_logits": {
+            "exact": true,
+            "nonzero": 0,
+            "numel": 5632,
+            "max_abs": 0.0,
+            "relative_l2": 0.0
+          },
+          "changed_expert_sets": 0
+        }
+      },
+      "ihc_configs": {
+        "22": "PreConfig(token_block=32, hidden_block=64, split_k=64, separate_x_fn_smem=True, est_occupancy=8)",
+        "43": "PreConfig(token_block=32, hidden_block=64, split_k=32, separate_x_fn_smem=True, est_occupancy=8)",
+        "128": "PreConfig(token_block=64, hidden_block=64, split_k=128, separate_x_fn_smem=True, est_occupancy=5)",
+        "1024": "PreConfig(token_block=64, hidden_block=64, split_k=16, separate_x_fn_smem=True, est_occupancy=5)"
+      }
+    }
+  ]
+}

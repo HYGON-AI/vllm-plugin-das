@@ -1,5 +1,9 @@
 # HYV4VL decode graph evaluation (2026-11-05)
 
+The later [prefill padding investigation](hy4_vl_piecewise_precision.md) diagnoses
+and guards the FULL_AND_PIECEWISE regression; the decode-only results below
+remain the reference.
+
 For the later FULL_AND_PIECEWISE comparison and remaining optimization probes,
 see the [full/piecewise report](hy4_vl_piecewise_performance.md). Complete
 [server/client commands](hy4_vl_serving.md) cover all three execution modes.

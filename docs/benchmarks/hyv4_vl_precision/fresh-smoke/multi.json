@@ -1,0 +1,44 @@
+{
+  "case": "multi",
+  "status": 200,
+  "seconds": 1.0762067629984813,
+  "response": {
+    "id": "chatcmpl-babe4bb8b0b33904",
+    "object": "chat.completion",
+    "created": 1793843342,
+    "model": "hy4-vl",
+    "choices": [
+      {
+        "index": 0,
+        "message": {
+          "role": "assistant",
+          "content": "第一张图片中的矩形是红色，第二张图片中的矩形是蓝色。",
+          "refusal": null,
+          "annotations": null,
+          "audio": null,
+          "function_call": null,
+          "reasoning": null
+        },
+        "logprobs": null,
+        "finish_reason": "stop",
+        "stop_reason": null,
+        "token_ids": null,
+        "routed_experts": null
+      }
+    ],
+    "service_tier": null,
+    "system_fingerprint": "vllm-0.25.1-tp8-b906b3bd",
+    "usage": {
+      "prompt_tokens": 248,
+      "total_tokens": 265,
+      "completion_tokens": 17,
+      "prompt_tokens_details": null
+    },
+    "prompt_logprobs": null,
+    "prompt_token_ids": null,
+    "prompt_text": null,
+    "kv_transfer_params": null,
+    "metrics": null
+  },
+  "correct": true
+}

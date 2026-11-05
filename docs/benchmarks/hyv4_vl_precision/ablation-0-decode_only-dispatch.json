@@ -1,0 +1,188 @@
+{
+  "results": [
+    {
+      "mode": "decode_only",
+      "counts": {
+        "NONE": 29,
+        "FULL": 32
+      },
+      "shapes": {
+        "((), {'num_tokens': 633, 'has_lora': False, 'uniform_decode': False, 'num_active_loras': 0, 'valid_modes': {<CUDAGraphMode.NONE: 0>, <CUDAGraphMode.FULL: 2>}, 'invalid_modes': None}, (<CUDAGraphMode.NONE: 0>, BatchDescriptor(num_tokens=633, num_reqs=None, uniform=False, has_lora=False, num_active_loras=0)))": 1,
+        "((), {'num_tokens': 1, 'has_lora': False, 'uniform_decode': True, 'num_active_loras': 0, 'valid_modes': {<CUDAGraphMode.NONE: 0>, <CUDAGraphMode.FULL: 2>}, 'invalid_modes': None}, (<CUDAGraphMode.FULL: 2>, BatchDescriptor(num_tokens=1, num_reqs=1, uniform=True, has_lora=False, num_active_loras=0)))": 32,
+        "((), {'num_tokens': 1024, 'has_lora': False, 'uniform_decode': False, 'num_active_loras': 0, 'valid_modes': {<CUDAGraphMode.NONE: 0>, <CUDAGraphMode.FULL: 2>}, 'invalid_modes': None}, (<CUDAGraphMode.NONE: 0>, BatchDescriptor(num_tokens=1024, num_reqs=None, uniform=False, has_lora=False, num_active_loras=0)))": 14,
+        "((), {'num_tokens': 22, 'has_lora': False, 'uniform_decode': False, 'num_active_loras': 0, 'valid_modes': {<CUDAGraphMode.NONE: 0>, <CUDAGraphMode.FULL: 2>}, 'invalid_modes': None}, (<CUDAGraphMode.NONE: 0>, BatchDescriptor(num_tokens=22, num_reqs=None, uniform=False, has_lora=False, num_active_loras=0)))": 3,
+        "((), {'num_tokens': 43, 'has_lora': False, 'uniform_decode': False, 'num_active_loras': 0, 'valid_modes': {<CUDAGraphMode.NONE: 0>, <CUDAGraphMode.FULL: 2>}, 'invalid_modes': None}, (<CUDAGraphMode.NONE: 0>, BatchDescriptor(num_tokens=43, num_reqs=None, uniform=False, has_lora=False, num_active_loras=0)))": 1,
+        "((), {'num_tokens': 18, 'has_lora': False, 'uniform_decode': False, 'num_active_loras': 0, 'valid_modes': {<CUDAGraphMode.NONE: 0>, <CUDAGraphMode.FULL: 2>}, 'invalid_modes': None}, (<CUDAGraphMode.NONE: 0>, BatchDescriptor(num_tokens=18, num_reqs=None, uniform=False, has_lora=False, num_active_loras=0)))": 2,
+        "((), {'num_tokens': 46, 'has_lora': False, 'uniform_decode': False, 'num_active_loras': 0, 'valid_modes': {<CUDAGraphMode.NONE: 0>, <CUDAGraphMode.FULL: 2>}, 'invalid_modes': None}, (<CUDAGraphMode.NONE: 0>, BatchDescriptor(num_tokens=46, num_reqs=None, uniform=False, has_lora=False, num_active_loras=0)))": 1,
+        "((), {'num_tokens': 23, 'has_lora': False, 'uniform_decode': False, 'num_active_loras': 0, 'valid_modes': {<CUDAGraphMode.NONE: 0>, <CUDAGraphMode.FULL: 2>}, 'invalid_modes': None}, (<CUDAGraphMode.NONE: 0>, BatchDescriptor(num_tokens=23, num_reqs=None, uniform=False, has_lora=False, num_active_loras=0)))": 2,
+        "((), {'num_tokens': 57, 'has_lora': False, 'uniform_decode': False, 'num_active_loras': 0, 'valid_modes': {<CUDAGraphMode.NONE: 0>, <CUDAGraphMode.FULL: 2>}, 'invalid_modes': None}, (<CUDAGraphMode.NONE: 0>, BatchDescriptor(num_tokens=57, num_reqs=None, uniform=False, has_lora=False, num_active_loras=0)))": 1,
+        "((), {'num_tokens': 39, 'has_lora': False, 'uniform_decode': False, 'num_active_loras': 0, 'valid_modes': {<CUDAGraphMode.NONE: 0>, <CUDAGraphMode.FULL: 2>}, 'invalid_modes': None}, (<CUDAGraphMode.NONE: 0>, BatchDescriptor(num_tokens=39, num_reqs=None, uniform=False, has_lora=False, num_active_loras=0)))": 1,
+        "((), {'num_tokens': 40, 'has_lora': False, 'uniform_decode': False, 'num_active_loras': 0, 'valid_modes': {<CUDAGraphMode.NONE: 0>, <CUDAGraphMode.FULL: 2>}, 'invalid_modes': None}, (<CUDAGraphMode.NONE: 0>, BatchDescriptor(num_tokens=40, num_reqs=None, uniform=False, has_lora=False, num_active_loras=0)))": 1,
+        "((), {'num_tokens': 25, 'has_lora': False, 'uniform_decode': False, 'num_active_loras': 0, 'valid_modes': {<CUDAGraphMode.NONE: 0>, <CUDAGraphMode.FULL: 2>}, 'invalid_modes': None}, (<CUDAGraphMode.NONE: 0>, BatchDescriptor(num_tokens=25, num_reqs=None, uniform=False, has_lora=False, num_active_loras=0)))": 1,
+        "((), {'num_tokens': 21, 'has_lora': False, 'uniform_decode': False, 'num_active_loras': 0, 'valid_modes': {<CUDAGraphMode.NONE: 0>, <CUDAGraphMode.FULL: 2>}, 'invalid_modes': None}, (<CUDAGraphMode.NONE: 0>, BatchDescriptor(num_tokens=21, num_reqs=None, uniform=False, has_lora=False, num_active_loras=0)))": 1
+      },
+      "bypass": 0
+    },
+    {
+      "mode": "decode_only",
+      "counts": {
+        "NONE": 29,
+        "FULL": 32
+      },
+      "shapes": {
+        "((), {'num_tokens': 633, 'has_lora': False, 'uniform_decode': False, 'num_active_loras': 0, 'valid_modes': {<CUDAGraphMode.NONE: 0>, <CUDAGraphMode.FULL: 2>}, 'invalid_modes': None}, (<CUDAGraphMode.NONE: 0>, BatchDescriptor(num_tokens=633, num_reqs=None, uniform=False, has_lora=False, num_active_loras=0)))": 1,
+        "((), {'num_tokens': 1, 'has_lora': False, 'uniform_decode': True, 'num_active_loras': 0, 'valid_modes': {<CUDAGraphMode.NONE: 0>, <CUDAGraphMode.FULL: 2>}, 'invalid_modes': None}, (<CUDAGraphMode.FULL: 2>, BatchDescriptor(num_tokens=1, num_reqs=1, uniform=True, has_lora=False, num_active_loras=0)))": 32,
+        "((), {'num_tokens': 1024, 'has_lora': False, 'uniform_decode': False, 'num_active_loras': 0, 'valid_modes': {<CUDAGraphMode.NONE: 0>, <CUDAGraphMode.FULL: 2>}, 'invalid_modes': None}, (<CUDAGraphMode.NONE: 0>, BatchDescriptor(num_tokens=1024, num_reqs=None, uniform=False, has_lora=False, num_active_loras=0)))": 14,
+        "((), {'num_tokens': 22, 'has_lora': False, 'uniform_decode': False, 'num_active_loras': 0, 'valid_modes': {<CUDAGraphMode.NONE: 0>, <CUDAGraphMode.FULL: 2>}, 'invalid_modes': None}, (<CUDAGraphMode.NONE: 0>, BatchDescriptor(num_tokens=22, num_reqs=None, uniform=False, has_lora=False, num_active_loras=0)))": 3,
+        "((), {'num_tokens': 43, 'has_lora': False, 'uniform_decode': False, 'num_active_loras': 0, 'valid_modes': {<CUDAGraphMode.NONE: 0>, <CUDAGraphMode.FULL: 2>}, 'invalid_modes': None}, (<CUDAGraphMode.NONE: 0>, BatchDescriptor(num_tokens=43, num_reqs=None, uniform=False, has_lora=False, num_active_loras=0)))": 1,
+        "((), {'num_tokens': 18, 'has_lora': False, 'uniform_decode': False, 'num_active_loras': 0, 'valid_modes': {<CUDAGraphMode.NONE: 0>, <CUDAGraphMode.FULL: 2>}, 'invalid_modes': None}, (<CUDAGraphMode.NONE: 0>, BatchDescriptor(num_tokens=18, num_reqs=None, uniform=False, has_lora=False, num_active_loras=0)))": 2,
+        "((), {'num_tokens': 46, 'has_lora': False, 'uniform_decode': False, 'num_active_loras': 0, 'valid_modes': {<CUDAGraphMode.NONE: 0>, <CUDAGraphMode.FULL: 2>}, 'invalid_modes': None}, (<CUDAGraphMode.NONE: 0>, BatchDescriptor(num_tokens=46, num_reqs=None, uniform=False, has_lora=False, num_active_loras=0)))": 1,
+        "((), {'num_tokens': 23, 'has_lora': False, 'uniform_decode': False, 'num_active_loras': 0, 'valid_modes': {<CUDAGraphMode.NONE: 0>, <CUDAGraphMode.FULL: 2>}, 'invalid_modes': None}, (<CUDAGraphMode.NONE: 0>, BatchDescriptor(num_tokens=23, num_reqs=None, uniform=False, has_lora=False, num_active_loras=0)))": 2,
+        "((), {'num_tokens': 57, 'has_lora': False, 'uniform_decode': False, 'num_active_loras': 0, 'valid_modes': {<CUDAGraphMode.NONE: 0>, <CUDAGraphMode.FULL: 2>}, 'invalid_modes': None}, (<CUDAGraphMode.NONE: 0>, BatchDescriptor(num_tokens=57, num_reqs=None, uniform=False, has_lora=False, num_active_loras=0)))": 1,
+        "((), {'num_tokens': 39, 'has_lora': False, 'uniform_decode': False, 'num_active_loras': 0, 'valid_modes': {<CUDAGraphMode.NONE: 0>, <CUDAGraphMode.FULL: 2>}, 'invalid_modes': None}, (<CUDAGraphMode.NONE: 0>, BatchDescriptor(num_tokens=39, num_reqs=None, uniform=False, has_lora=False, num_active_loras=0)))": 1,
+        "((), {'num_tokens': 40, 'has_lora': False, 'uniform_decode': False, 'num_active_loras': 0, 'valid_modes': {<CUDAGraphMode.NONE: 0>, <CUDAGraphMode.FULL: 2>}, 'invalid_modes': None}, (<CUDAGraphMode.NONE: 0>, BatchDescriptor(num_tokens=40, num_reqs=None, uniform=False, has_lora=False, num_active_loras=0)))": 1,
+        "((), {'num_tokens': 25, 'has_lora': False, 'uniform_decode': False, 'num_active_loras': 0, 'valid_modes': {<CUDAGraphMode.NONE: 0>, <CUDAGraphMode.FULL: 2>}, 'invalid_modes': None}, (<CUDAGraphMode.NONE: 0>, BatchDescriptor(num_tokens=25, num_reqs=None, uniform=False, has_lora=False, num_active_loras=0)))": 1,
+        "((), {'num_tokens': 21, 'has_lora': False, 'uniform_decode': False, 'num_active_loras': 0, 'valid_modes': {<CUDAGraphMode.NONE: 0>, <CUDAGraphMode.FULL: 2>}, 'invalid_modes': None}, (<CUDAGraphMode.NONE: 0>, BatchDescriptor(num_tokens=21, num_reqs=None, uniform=False, has_lora=False, num_active_loras=0)))": 1
+      },
+      "bypass": 0
+    },
+    {
+      "mode": "decode_only",
+      "counts": {
+        "NONE": 29,
+        "FULL": 32
+      },
+      "shapes": {
+        "((), {'num_tokens': 633, 'has_lora': False, 'uniform_decode': False, 'num_active_loras': 0, 'valid_modes': {<CUDAGraphMode.FULL: 2>, <CUDAGraphMode.NONE: 0>}, 'invalid_modes': None}, (<CUDAGraphMode.NONE: 0>, BatchDescriptor(num_tokens=633, num_reqs=None, uniform=False, has_lora=False, num_active_loras=0)))": 1,
+        "((), {'num_tokens': 1, 'has_lora': False, 'uniform_decode': True, 'num_active_loras': 0, 'valid_modes': {<CUDAGraphMode.FULL: 2>, <CUDAGraphMode.NONE: 0>}, 'invalid_modes': None}, (<CUDAGraphMode.FULL: 2>, BatchDescriptor(num_tokens=1, num_reqs=1, uniform=True, has_lora=False, num_active_loras=0)))": 32,
+        "((), {'num_tokens': 1024, 'has_lora': False, 'uniform_decode': False, 'num_active_loras': 0, 'valid_modes': {<CUDAGraphMode.FULL: 2>, <CUDAGraphMode.NONE: 0>}, 'invalid_modes': None}, (<CUDAGraphMode.NONE: 0>, BatchDescriptor(num_tokens=1024, num_reqs=None, uniform=False, has_lora=False, num_active_loras=0)))": 14,
+        "((), {'num_tokens': 22, 'has_lora': False, 'uniform_decode': False, 'num_active_loras': 0, 'valid_modes': {<CUDAGraphMode.FULL: 2>, <CUDAGraphMode.NONE: 0>}, 'invalid_modes': None}, (<CUDAGraphMode.NONE: 0>, BatchDescriptor(num_tokens=22, num_reqs=None, uniform=False, has_lora=False, num_active_loras=0)))": 3,
+        "((), {'num_tokens': 43, 'has_lora': False, 'uniform_decode': False, 'num_active_loras': 0, 'valid_modes': {<CUDAGraphMode.FULL: 2>, <CUDAGraphMode.NONE: 0>}, 'invalid_modes': None}, (<CUDAGraphMode.NONE: 0>, BatchDescriptor(num_tokens=43, num_reqs=None, uniform=False, has_lora=False, num_active_loras=0)))": 1,
+        "((), {'num_tokens': 18, 'has_lora': False, 'uniform_decode': False, 'num_active_loras': 0, 'valid_modes': {<CUDAGraphMode.FULL: 2>, <CUDAGraphMode.NONE: 0>}, 'invalid_modes': None}, (<CUDAGraphMode.NONE: 0>, BatchDescriptor(num_tokens=18, num_reqs=None, uniform=False, has_lora=False, num_active_loras=0)))": 2,
+        "((), {'num_tokens': 46, 'has_lora': False, 'uniform_decode': False, 'num_active_loras': 0, 'valid_modes': {<CUDAGraphMode.FULL: 2>, <CUDAGraphMode.NONE: 0>}, 'invalid_modes': None}, (<CUDAGraphMode.NONE: 0>, BatchDescriptor(num_tokens=46, num_reqs=None, uniform=False, has_lora=False, num_active_loras=0)))": 1,
+        "((), {'num_tokens': 23, 'has_lora': False, 'uniform_decode': False, 'num_active_loras': 0, 'valid_modes': {<CUDAGraphMode.FULL: 2>, <CUDAGraphMode.NONE: 0>}, 'invalid_modes': None}, (<CUDAGraphMode.NONE: 0>, BatchDescriptor(num_tokens=23, num_reqs=None, uniform=False, has_lora=False, num_active_loras=0)))": 2,
+        "((), {'num_tokens': 57, 'has_lora': False, 'uniform_decode': False, 'num_active_loras': 0, 'valid_modes': {<CUDAGraphMode.FULL: 2>, <CUDAGraphMode.NONE: 0>}, 'invalid_modes': None}, (<CUDAGraphMode.NONE: 0>, BatchDescriptor(num_tokens=57, num_reqs=None, uniform=False, has_lora=False, num_active_loras=0)))": 1,
+        "((), {'num_tokens': 39, 'has_lora': False, 'uniform_decode': False, 'num_active_loras': 0, 'valid_modes': {<CUDAGraphMode.FULL: 2>, <CUDAGraphMode.NONE: 0>}, 'invalid_modes': None}, (<CUDAGraphMode.NONE: 0>, BatchDescriptor(num_tokens=39, num_reqs=None, uniform=False, has_lora=False, num_active_loras=0)))": 1,
+        "((), {'num_tokens': 40, 'has_lora': False, 'uniform_decode': False, 'num_active_loras': 0, 'valid_modes': {<CUDAGraphMode.FULL: 2>, <CUDAGraphMode.NONE: 0>}, 'invalid_modes': None}, (<CUDAGraphMode.NONE: 0>, BatchDescriptor(num_tokens=40, num_reqs=None, uniform=False, has_lora=False, num_active_loras=0)))": 1,
+        "((), {'num_tokens': 25, 'has_lora': False, 'uniform_decode': False, 'num_active_loras': 0, 'valid_modes': {<CUDAGraphMode.FULL: 2>, <CUDAGraphMode.NONE: 0>}, 'invalid_modes': None}, (<CUDAGraphMode.NONE: 0>, BatchDescriptor(num_tokens=25, num_reqs=None, uniform=False, has_lora=False, num_active_loras=0)))": 1,
+        "((), {'num_tokens': 21, 'has_lora': False, 'uniform_decode': False, 'num_active_loras': 0, 'valid_modes': {<CUDAGraphMode.FULL: 2>, <CUDAGraphMode.NONE: 0>}, 'invalid_modes': None}, (<CUDAGraphMode.NONE: 0>, BatchDescriptor(num_tokens=21, num_reqs=None, uniform=False, has_lora=False, num_active_loras=0)))": 1
+      },
+      "bypass": 0
+    },
+    {
+      "mode": "decode_only",
+      "counts": {
+        "NONE": 29,
+        "FULL": 32
+      },
+      "shapes": {
+        "((), {'num_tokens': 633, 'has_lora': False, 'uniform_decode': False, 'num_active_loras': 0, 'valid_modes': {<CUDAGraphMode.FULL: 2>, <CUDAGraphMode.NONE: 0>}, 'invalid_modes': None}, (<CUDAGraphMode.NONE: 0>, BatchDescriptor(num_tokens=633, num_reqs=None, uniform=False, has_lora=False, num_active_loras=0)))": 1,
+        "((), {'num_tokens': 1, 'has_lora': False, 'uniform_decode': True, 'num_active_loras': 0, 'valid_modes': {<CUDAGraphMode.FULL: 2>, <CUDAGraphMode.NONE: 0>}, 'invalid_modes': None}, (<CUDAGraphMode.FULL: 2>, BatchDescriptor(num_tokens=1, num_reqs=1, uniform=True, has_lora=False, num_active_loras=0)))": 32,
+        "((), {'num_tokens': 1024, 'has_lora': False, 'uniform_decode': False, 'num_active_loras': 0, 'valid_modes': {<CUDAGraphMode.FULL: 2>, <CUDAGraphMode.NONE: 0>}, 'invalid_modes': None}, (<CUDAGraphMode.NONE: 0>, BatchDescriptor(num_tokens=1024, num_reqs=None, uniform=False, has_lora=False, num_active_loras=0)))": 14,
+        "((), {'num_tokens': 22, 'has_lora': False, 'uniform_decode': False, 'num_active_loras': 0, 'valid_modes': {<CUDAGraphMode.FULL: 2>, <CUDAGraphMode.NONE: 0>}, 'invalid_modes': None}, (<CUDAGraphMode.NONE: 0>, BatchDescriptor(num_tokens=22, num_reqs=None, uniform=False, has_lora=False, num_active_loras=0)))": 3,
+        "((), {'num_tokens': 43, 'has_lora': False, 'uniform_decode': False, 'num_active_loras': 0, 'valid_modes': {<CUDAGraphMode.FULL: 2>, <CUDAGraphMode.NONE: 0>}, 'invalid_modes': None}, (<CUDAGraphMode.NONE: 0>, BatchDescriptor(num_tokens=43, num_reqs=None, uniform=False, has_lora=False, num_active_loras=0)))": 1,
+        "((), {'num_tokens': 18, 'has_lora': False, 'uniform_decode': False, 'num_active_loras': 0, 'valid_modes': {<CUDAGraphMode.FULL: 2>, <CUDAGraphMode.NONE: 0>}, 'invalid_modes': None}, (<CUDAGraphMode.NONE: 0>, BatchDescriptor(num_tokens=18, num_reqs=None, uniform=False, has_lora=False, num_active_loras=0)))": 2,
+        "((), {'num_tokens': 46, 'has_lora': False, 'uniform_decode': False, 'num_active_loras': 0, 'valid_modes': {<CUDAGraphMode.FULL: 2>, <CUDAGraphMode.NONE: 0>}, 'invalid_modes': None}, (<CUDAGraphMode.NONE: 0>, BatchDescriptor(num_tokens=46, num_reqs=None, uniform=False, has_lora=False, num_active_loras=0)))": 1,
+        "((), {'num_tokens': 23, 'has_lora': False, 'uniform_decode': False, 'num_active_loras': 0, 'valid_modes': {<CUDAGraphMode.FULL: 2>, <CUDAGraphMode.NONE: 0>}, 'invalid_modes': None}, (<CUDAGraphMode.NONE: 0>, BatchDescriptor(num_tokens=23, num_reqs=None, uniform=False, has_lora=False, num_active_loras=0)))": 2,
+        "((), {'num_tokens': 57, 'has_lora': False, 'uniform_decode': False, 'num_active_loras': 0, 'valid_modes': {<CUDAGraphMode.FULL: 2>, <CUDAGraphMode.NONE: 0>}, 'invalid_modes': None}, (<CUDAGraphMode.NONE: 0>, BatchDescriptor(num_tokens=57, num_reqs=None, uniform=False, has_lora=False, num_active_loras=0)))": 1,
+        "((), {'num_tokens': 39, 'has_lora': False, 'uniform_decode': False, 'num_active_loras': 0, 'valid_modes': {<CUDAGraphMode.FULL: 2>, <CUDAGraphMode.NONE: 0>}, 'invalid_modes': None}, (<CUDAGraphMode.NONE: 0>, BatchDescriptor(num_tokens=39, num_reqs=None, uniform=False, has_lora=False, num_active_loras=0)))": 1,
+        "((), {'num_tokens': 40, 'has_lora': False, 'uniform_decode': False, 'num_active_loras': 0, 'valid_modes': {<CUDAGraphMode.FULL: 2>, <CUDAGraphMode.NONE: 0>}, 'invalid_modes': None}, (<CUDAGraphMode.NONE: 0>, BatchDescriptor(num_tokens=40, num_reqs=None, uniform=False, has_lora=False, num_active_loras=0)))": 1,
+        "((), {'num_tokens': 25, 'has_lora': False, 'uniform_decode': False, 'num_active_loras': 0, 'valid_modes': {<CUDAGraphMode.FULL: 2>, <CUDAGraphMode.NONE: 0>}, 'invalid_modes': None}, (<CUDAGraphMode.NONE: 0>, BatchDescriptor(num_tokens=25, num_reqs=None, uniform=False, has_lora=False, num_active_loras=0)))": 1,
+        "((), {'num_tokens': 21, 'has_lora': False, 'uniform_decode': False, 'num_active_loras': 0, 'valid_modes': {<CUDAGraphMode.FULL: 2>, <CUDAGraphMode.NONE: 0>}, 'invalid_modes': None}, (<CUDAGraphMode.NONE: 0>, BatchDescriptor(num_tokens=21, num_reqs=None, uniform=False, has_lora=False, num_active_loras=0)))": 1
+      },
+      "bypass": 0
+    },
+    {
+      "mode": "decode_only",
+      "counts": {
+        "NONE": 29,
+        "FULL": 32
+      },
+      "shapes": {
+        "((), {'num_tokens': 633, 'has_lora': False, 'uniform_decode': False, 'num_active_loras': 0, 'valid_modes': {<CUDAGraphMode.NONE: 0>, <CUDAGraphMode.FULL: 2>}, 'invalid_modes': None}, (<CUDAGraphMode.NONE: 0>, BatchDescriptor(num_tokens=633, num_reqs=None, uniform=False, has_lora=False, num_active_loras=0)))": 1,
+        "((), {'num_tokens': 1, 'has_lora': False, 'uniform_decode': True, 'num_active_loras': 0, 'valid_modes': {<CUDAGraphMode.NONE: 0>, <CUDAGraphMode.FULL: 2>}, 'invalid_modes': None}, (<CUDAGraphMode.FULL: 2>, BatchDescriptor(num_tokens=1, num_reqs=1, uniform=True, has_lora=False, num_active_loras=0)))": 32,
+        "((), {'num_tokens': 1024, 'has_lora': False, 'uniform_decode': False, 'num_active_loras': 0, 'valid_modes': {<CUDAGraphMode.NONE: 0>, <CUDAGraphMode.FULL: 2>}, 'invalid_modes': None}, (<CUDAGraphMode.NONE: 0>, BatchDescriptor(num_tokens=1024, num_reqs=None, uniform=False, has_lora=False, num_active_loras=0)))": 14,
+        "((), {'num_tokens': 22, 'has_lora': False, 'uniform_decode': False, 'num_active_loras': 0, 'valid_modes': {<CUDAGraphMode.NONE: 0>, <CUDAGraphMode.FULL: 2>}, 'invalid_modes': None}, (<CUDAGraphMode.NONE: 0>, BatchDescriptor(num_tokens=22, num_reqs=None, uniform=False, has_lora=False, num_active_loras=0)))": 3,
+        "((), {'num_tokens': 43, 'has_lora': False, 'uniform_decode': False, 'num_active_loras': 0, 'valid_modes': {<CUDAGraphMode.NONE: 0>, <CUDAGraphMode.FULL: 2>}, 'invalid_modes': None}, (<CUDAGraphMode.NONE: 0>, BatchDescriptor(num_tokens=43, num_reqs=None, uniform=False, has_lora=False, num_active_loras=0)))": 1,
+        "((), {'num_tokens': 18, 'has_lora': False, 'uniform_decode': False, 'num_active_loras': 0, 'valid_modes': {<CUDAGraphMode.NONE: 0>, <CUDAGraphMode.FULL: 2>}, 'invalid_modes': None}, (<CUDAGraphMode.NONE: 0>, BatchDescriptor(num_tokens=18, num_reqs=None, uniform=False, has_lora=False, num_active_loras=0)))": 2,
+        "((), {'num_tokens': 46, 'has_lora': False, 'uniform_decode': False, 'num_active_loras': 0, 'valid_modes': {<CUDAGraphMode.NONE: 0>, <CUDAGraphMode.FULL: 2>}, 'invalid_modes': None}, (<CUDAGraphMode.NONE: 0>, BatchDescriptor(num_tokens=46, num_reqs=None, uniform=False, has_lora=False, num_active_loras=0)))": 1,
+        "((), {'num_tokens': 23, 'has_lora': False, 'uniform_decode': False, 'num_active_loras': 0, 'valid_modes': {<CUDAGraphMode.NONE: 0>, <CUDAGraphMode.FULL: 2>}, 'invalid_modes': None}, (<CUDAGraphMode.NONE: 0>, BatchDescriptor(num_tokens=23, num_reqs=None, uniform=False, has_lora=False, num_active_loras=0)))": 2,
+        "((), {'num_tokens': 57, 'has_lora': False, 'uniform_decode': False, 'num_active_loras': 0, 'valid_modes': {<CUDAGraphMode.NONE: 0>, <CUDAGraphMode.FULL: 2>}, 'invalid_modes': None}, (<CUDAGraphMode.NONE: 0>, BatchDescriptor(num_tokens=57, num_reqs=None, uniform=False, has_lora=False, num_active_loras=0)))": 1,
+        "((), {'num_tokens': 39, 'has_lora': False, 'uniform_decode': False, 'num_active_loras': 0, 'valid_modes': {<CUDAGraphMode.NONE: 0>, <CUDAGraphMode.FULL: 2>}, 'invalid_modes': None}, (<CUDAGraphMode.NONE: 0>, BatchDescriptor(num_tokens=39, num_reqs=None, uniform=False, has_lora=False, num_active_loras=0)))": 1,
+        "((), {'num_tokens': 40, 'has_lora': False, 'uniform_decode': False, 'num_active_loras': 0, 'valid_modes': {<CUDAGraphMode.NONE: 0>, <CUDAGraphMode.FULL: 2>}, 'invalid_modes': None}, (<CUDAGraphMode.NONE: 0>, BatchDescriptor(num_tokens=40, num_reqs=None, uniform=False, has_lora=False, num_active_loras=0)))": 1,
+        "((), {'num_tokens': 25, 'has_lora': False, 'uniform_decode': False, 'num_active_loras': 0, 'valid_modes': {<CUDAGraphMode.NONE: 0>, <CUDAGraphMode.FULL: 2>}, 'invalid_modes': None}, (<CUDAGraphMode.NONE: 0>, BatchDescriptor(num_tokens=25, num_reqs=None, uniform=False, has_lora=False, num_active_loras=0)))": 1,
+        "((), {'num_tokens': 21, 'has_lora': False, 'uniform_decode': False, 'num_active_loras': 0, 'valid_modes': {<CUDAGraphMode.NONE: 0>, <CUDAGraphMode.FULL: 2>}, 'invalid_modes': None}, (<CUDAGraphMode.NONE: 0>, BatchDescriptor(num_tokens=21, num_reqs=None, uniform=False, has_lora=False, num_active_loras=0)))": 1
+      },
+      "bypass": 0
+    },
+    {
+      "mode": "decode_only",
+      "counts": {
+        "NONE": 29,
+        "FULL": 32
+      },
+      "shapes": {
+        "((), {'num_tokens': 633, 'has_lora': False, 'uniform_decode': False, 'num_active_loras': 0, 'valid_modes': {<CUDAGraphMode.FULL: 2>, <CUDAGraphMode.NONE: 0>}, 'invalid_modes': None}, (<CUDAGraphMode.NONE: 0>, BatchDescriptor(num_tokens=633, num_reqs=None, uniform=False, has_lora=False, num_active_loras=0)))": 1,
+        "((), {'num_tokens': 1, 'has_lora': False, 'uniform_decode': True, 'num_active_loras': 0, 'valid_modes': {<CUDAGraphMode.FULL: 2>, <CUDAGraphMode.NONE: 0>}, 'invalid_modes': None}, (<CUDAGraphMode.FULL: 2>, BatchDescriptor(num_tokens=1, num_reqs=1, uniform=True, has_lora=False, num_active_loras=0)))": 32,
+        "((), {'num_tokens': 1024, 'has_lora': False, 'uniform_decode': False, 'num_active_loras': 0, 'valid_modes': {<CUDAGraphMode.FULL: 2>, <CUDAGraphMode.NONE: 0>}, 'invalid_modes': None}, (<CUDAGraphMode.NONE: 0>, BatchDescriptor(num_tokens=1024, num_reqs=None, uniform=False, has_lora=False, num_active_loras=0)))": 14,
+        "((), {'num_tokens': 22, 'has_lora': False, 'uniform_decode': False, 'num_active_loras': 0, 'valid_modes': {<CUDAGraphMode.FULL: 2>, <CUDAGraphMode.NONE: 0>}, 'invalid_modes': None}, (<CUDAGraphMode.NONE: 0>, BatchDescriptor(num_tokens=22, num_reqs=None, uniform=False, has_lora=False, num_active_loras=0)))": 3,
+        "((), {'num_tokens': 43, 'has_lora': False, 'uniform_decode': False, 'num_active_loras': 0, 'valid_modes': {<CUDAGraphMode.FULL: 2>, <CUDAGraphMode.NONE: 0>}, 'invalid_modes': None}, (<CUDAGraphMode.NONE: 0>, BatchDescriptor(num_tokens=43, num_reqs=None, uniform=False, has_lora=False, num_active_loras=0)))": 1,
+        "((), {'num_tokens': 18, 'has_lora': False, 'uniform_decode': False, 'num_active_loras': 0, 'valid_modes': {<CUDAGraphMode.FULL: 2>, <CUDAGraphMode.NONE: 0>}, 'invalid_modes': None}, (<CUDAGraphMode.NONE: 0>, BatchDescriptor(num_tokens=18, num_reqs=None, uniform=False, has_lora=False, num_active_loras=0)))": 2,
+        "((), {'num_tokens': 46, 'has_lora': False, 'uniform_decode': False, 'num_active_loras': 0, 'valid_modes': {<CUDAGraphMode.FULL: 2>, <CUDAGraphMode.NONE: 0>}, 'invalid_modes': None}, (<CUDAGraphMode.NONE: 0>, BatchDescriptor(num_tokens=46, num_reqs=None, uniform=False, has_lora=False, num_active_loras=0)))": 1,
+        "((), {'num_tokens': 23, 'has_lora': False, 'uniform_decode': False, 'num_active_loras': 0, 'valid_modes': {<CUDAGraphMode.FULL: 2>, <CUDAGraphMode.NONE: 0>}, 'invalid_modes': None}, (<CUDAGraphMode.NONE: 0>, BatchDescriptor(num_tokens=23, num_reqs=None, uniform=False, has_lora=False, num_active_loras=0)))": 2,
+        "((), {'num_tokens': 57, 'has_lora': False, 'uniform_decode': False, 'num_active_loras': 0, 'valid_modes': {<CUDAGraphMode.FULL: 2>, <CUDAGraphMode.NONE: 0>}, 'invalid_modes': None}, (<CUDAGraphMode.NONE: 0>, BatchDescriptor(num_tokens=57, num_reqs=None, uniform=False, has_lora=False, num_active_loras=0)))": 1,
+        "((), {'num_tokens': 39, 'has_lora': False, 'uniform_decode': False, 'num_active_loras': 0, 'valid_modes': {<CUDAGraphMode.FULL: 2>, <CUDAGraphMode.NONE: 0>}, 'invalid_modes': None}, (<CUDAGraphMode.NONE: 0>, BatchDescriptor(num_tokens=39, num_reqs=None, uniform=False, has_lora=False, num_active_loras=0)))": 1,
+        "((), {'num_tokens': 40, 'has_lora': False, 'uniform_decode': False, 'num_active_loras': 0, 'valid_modes': {<CUDAGraphMode.FULL: 2>, <CUDAGraphMode.NONE: 0>}, 'invalid_modes': None}, (<CUDAGraphMode.NONE: 0>, BatchDescriptor(num_tokens=40, num_reqs=None, uniform=False, has_lora=False, num_active_loras=0)))": 1,
+        "((), {'num_tokens': 25, 'has_lora': False, 'uniform_decode': False, 'num_active_loras': 0, 'valid_modes': {<CUDAGraphMode.FULL: 2>, <CUDAGraphMode.NONE: 0>}, 'invalid_modes': None}, (<CUDAGraphMode.NONE: 0>, BatchDescriptor(num_tokens=25, num_reqs=None, uniform=False, has_lora=False, num_active_loras=0)))": 1,
+        "((), {'num_tokens': 21, 'has_lora': False, 'uniform_decode': False, 'num_active_loras': 0, 'valid_modes': {<CUDAGraphMode.FULL: 2>, <CUDAGraphMode.NONE: 0>}, 'invalid_modes': None}, (<CUDAGraphMode.NONE: 0>, BatchDescriptor(num_tokens=21, num_reqs=None, uniform=False, has_lora=False, num_active_loras=0)))": 1
+      },
+      "bypass": 0
+    },
+    {
+      "mode": "decode_only",
+      "counts": {
+        "NONE": 29,
+        "FULL": 32
+      },
+      "shapes": {
+        "((), {'num_tokens': 633, 'has_lora': False, 'uniform_decode': False, 'num_active_loras': 0, 'valid_modes': {<CUDAGraphMode.NONE: 0>, <CUDAGraphMode.FULL: 2>}, 'invalid_modes': None}, (<CUDAGraphMode.NONE: 0>, BatchDescriptor(num_tokens=633, num_reqs=None, uniform=False, has_lora=False, num_active_loras=0)))": 1,
+        "((), {'num_tokens': 1, 'has_lora': False, 'uniform_decode': True, 'num_active_loras': 0, 'valid_modes': {<CUDAGraphMode.NONE: 0>, <CUDAGraphMode.FULL: 2>}, 'invalid_modes': None}, (<CUDAGraphMode.FULL: 2>, BatchDescriptor(num_tokens=1, num_reqs=1, uniform=True, has_lora=False, num_active_loras=0)))": 32,
+        "((), {'num_tokens': 1024, 'has_lora': False, 'uniform_decode': False, 'num_active_loras': 0, 'valid_modes': {<CUDAGraphMode.NONE: 0>, <CUDAGraphMode.FULL: 2>}, 'invalid_modes': None}, (<CUDAGraphMode.NONE: 0>, BatchDescriptor(num_tokens=1024, num_reqs=None, uniform=False, has_lora=False, num_active_loras=0)))": 14,
+        "((), {'num_tokens': 22, 'has_lora': False, 'uniform_decode': False, 'num_active_loras': 0, 'valid_modes': {<CUDAGraphMode.NONE: 0>, <CUDAGraphMode.FULL: 2>}, 'invalid_modes': None}, (<CUDAGraphMode.NONE: 0>, BatchDescriptor(num_tokens=22, num_reqs=None, uniform=False, has_lora=False, num_active_loras=0)))": 3,
+        "((), {'num_tokens': 43, 'has_lora': False, 'uniform_decode': False, 'num_active_loras': 0, 'valid_modes': {<CUDAGraphMode.NONE: 0>, <CUDAGraphMode.FULL: 2>}, 'invalid_modes': None}, (<CUDAGraphMode.NONE: 0>, BatchDescriptor(num_tokens=43, num_reqs=None, uniform=False, has_lora=False, num_active_loras=0)))": 1,
+        "((), {'num_tokens': 18, 'has_lora': False, 'uniform_decode': False, 'num_active_loras': 0, 'valid_modes': {<CUDAGraphMode.NONE: 0>, <CUDAGraphMode.FULL: 2>}, 'invalid_modes': None}, (<CUDAGraphMode.NONE: 0>, BatchDescriptor(num_tokens=18, num_reqs=None, uniform=False, has_lora=False, num_active_loras=0)))": 2,
+        "((), {'num_tokens': 46, 'has_lora': False, 'uniform_decode': False, 'num_active_loras': 0, 'valid_modes': {<CUDAGraphMode.NONE: 0>, <CUDAGraphMode.FULL: 2>}, 'invalid_modes': None}, (<CUDAGraphMode.NONE: 0>, BatchDescriptor(num_tokens=46, num_reqs=None, uniform=False, has_lora=False, num_active_loras=0)))": 1,
+        "((), {'num_tokens': 23, 'has_lora': False, 'uniform_decode': False, 'num_active_loras': 0, 'valid_modes': {<CUDAGraphMode.NONE: 0>, <CUDAGraphMode.FULL: 2>}, 'invalid_modes': None}, (<CUDAGraphMode.NONE: 0>, BatchDescriptor(num_tokens=23, num_reqs=None, uniform=False, has_lora=False, num_active_loras=0)))": 2,
+        "((), {'num_tokens': 57, 'has_lora': False, 'uniform_decode': False, 'num_active_loras': 0, 'valid_modes': {<CUDAGraphMode.NONE: 0>, <CUDAGraphMode.FULL: 2>}, 'invalid_modes': None}, (<CUDAGraphMode.NONE: 0>, BatchDescriptor(num_tokens=57, num_reqs=None, uniform=False, has_lora=False, num_active_loras=0)))": 1,
+        "((), {'num_tokens': 39, 'has_lora': False, 'uniform_decode': False, 'num_active_loras': 0, 'valid_modes': {<CUDAGraphMode.NONE: 0>, <CUDAGraphMode.FULL: 2>}, 'invalid_modes': None}, (<CUDAGraphMode.NONE: 0>, BatchDescriptor(num_tokens=39, num_reqs=None, uniform=False, has_lora=False, num_active_loras=0)))": 1,
+        "((), {'num_tokens': 40, 'has_lora': False, 'uniform_decode': False, 'num_active_loras': 0, 'valid_modes': {<CUDAGraphMode.NONE: 0>, <CUDAGraphMode.FULL: 2>}, 'invalid_modes': None}, (<CUDAGraphMode.NONE: 0>, BatchDescriptor(num_tokens=40, num_reqs=None, uniform=False, has_lora=False, num_active_loras=0)))": 1,
+        "((), {'num_tokens': 25, 'has_lora': False, 'uniform_decode': False, 'num_active_loras': 0, 'valid_modes': {<CUDAGraphMode.NONE: 0>, <CUDAGraphMode.FULL: 2>}, 'invalid_modes': None}, (<CUDAGraphMode.NONE: 0>, BatchDescriptor(num_tokens=25, num_reqs=None, uniform=False, has_lora=False, num_active_loras=0)))": 1,
+        "((), {'num_tokens': 21, 'has_lora': False, 'uniform_decode': False, 'num_active_loras': 0, 'valid_modes': {<CUDAGraphMode.NONE: 0>, <CUDAGraphMode.FULL: 2>}, 'invalid_modes': None}, (<CUDAGraphMode.NONE: 0>, BatchDescriptor(num_tokens=21, num_reqs=None, uniform=False, has_lora=False, num_active_loras=0)))": 1
+      },
+      "bypass": 0
+    },
+    {
+      "mode": "decode_only",
+      "counts": {
+        "NONE": 29,
+        "FULL": 32
+      },
+      "shapes": {
+        "((), {'num_tokens': 633, 'has_lora': False, 'uniform_decode': False, 'num_active_loras': 0, 'valid_modes': {<CUDAGraphMode.FULL: 2>, <CUDAGraphMode.NONE: 0>}, 'invalid_modes': None}, (<CUDAGraphMode.NONE: 0>, BatchDescriptor(num_tokens=633, num_reqs=None, uniform=False, has_lora=False, num_active_loras=0)))": 1,
+        "((), {'num_tokens': 1, 'has_lora': False, 'uniform_decode': True, 'num_active_loras': 0, 'valid_modes': {<CUDAGraphMode.FULL: 2>, <CUDAGraphMode.NONE: 0>}, 'invalid_modes': None}, (<CUDAGraphMode.FULL: 2>, BatchDescriptor(num_tokens=1, num_reqs=1, uniform=True, has_lora=False, num_active_loras=0)))": 32,
+        "((), {'num_tokens': 1024, 'has_lora': False, 'uniform_decode': False, 'num_active_loras': 0, 'valid_modes': {<CUDAGraphMode.FULL: 2>, <CUDAGraphMode.NONE: 0>}, 'invalid_modes': None}, (<CUDAGraphMode.NONE: 0>, BatchDescriptor(num_tokens=1024, num_reqs=None, uniform=False, has_lora=False, num_active_loras=0)))": 14,
+        "((), {'num_tokens': 22, 'has_lora': False, 'uniform_decode': False, 'num_active_loras': 0, 'valid_modes': {<CUDAGraphMode.FULL: 2>, <CUDAGraphMode.NONE: 0>}, 'invalid_modes': None}, (<CUDAGraphMode.NONE: 0>, BatchDescriptor(num_tokens=22, num_reqs=None, uniform=False, has_lora=False, num_active_loras=0)))": 3,
+        "((), {'num_tokens': 43, 'has_lora': False, 'uniform_decode': False, 'num_active_loras': 0, 'valid_modes': {<CUDAGraphMode.FULL: 2>, <CUDAGraphMode.NONE: 0>}, 'invalid_modes': None}, (<CUDAGraphMode.NONE: 0>, BatchDescriptor(num_tokens=43, num_reqs=None, uniform=False, has_lora=False, num_active_loras=0)))": 1,
+        "((), {'num_tokens': 18, 'has_lora': False, 'uniform_decode': False, 'num_active_loras': 0, 'valid_modes': {<CUDAGraphMode.FULL: 2>, <CUDAGraphMode.NONE: 0>}, 'invalid_modes': None}, (<CUDAGraphMode.NONE: 0>, BatchDescriptor(num_tokens=18, num_reqs=None, uniform=False, has_lora=False, num_active_loras=0)))": 2,
+        "((), {'num_tokens': 46, 'has_lora': False, 'uniform_decode': False, 'num_active_loras': 0, 'valid_modes': {<CUDAGraphMode.FULL: 2>, <CUDAGraphMode.NONE: 0>}, 'invalid_modes': None}, (<CUDAGraphMode.NONE: 0>, BatchDescriptor(num_tokens=46, num_reqs=None, uniform=False, has_lora=False, num_active_loras=0)))": 1,
+        "((), {'num_tokens': 23, 'has_lora': False, 'uniform_decode': False, 'num_active_loras': 0, 'valid_modes': {<CUDAGraphMode.FULL: 2>, <CUDAGraphMode.NONE: 0>}, 'invalid_modes': None}, (<CUDAGraphMode.NONE: 0>, BatchDescriptor(num_tokens=23, num_reqs=None, uniform=False, has_lora=False, num_active_loras=0)))": 2,
+        "((), {'num_tokens': 57, 'has_lora': False, 'uniform_decode': False, 'num_active_loras': 0, 'valid_modes': {<CUDAGraphMode.FULL: 2>, <CUDAGraphMode.NONE: 0>}, 'invalid_modes': None}, (<CUDAGraphMode.NONE: 0>, BatchDescriptor(num_tokens=57, num_reqs=None, uniform=False, has_lora=False, num_active_loras=0)))": 1,
+        "((), {'num_tokens': 39, 'has_lora': False, 'uniform_decode': False, 'num_active_loras': 0, 'valid_modes': {<CUDAGraphMode.FULL: 2>, <CUDAGraphMode.NONE: 0>}, 'invalid_modes': None}, (<CUDAGraphMode.NONE: 0>, BatchDescriptor(num_tokens=39, num_reqs=None, uniform=False, has_lora=False, num_active_loras=0)))": 1,
+        "((), {'num_tokens': 40, 'has_lora': False, 'uniform_decode': False, 'num_active_loras': 0, 'valid_modes': {<CUDAGraphMode.FULL: 2>, <CUDAGraphMode.NONE: 0>}, 'invalid_modes': None}, (<CUDAGraphMode.NONE: 0>, BatchDescriptor(num_tokens=40, num_reqs=None, uniform=False, has_lora=False, num_active_loras=0)))": 1,
+        "((), {'num_tokens': 25, 'has_lora': False, 'uniform_decode': False, 'num_active_loras': 0, 'valid_modes': {<CUDAGraphMode.FULL: 2>, <CUDAGraphMode.NONE: 0>}, 'invalid_modes': None}, (<CUDAGraphMode.NONE: 0>, BatchDescriptor(num_tokens=25, num_reqs=None, uniform=False, has_lora=False, num_active_loras=0)))": 1,
+        "((), {'num_tokens': 21, 'has_lora': False, 'uniform_decode': False, 'num_active_loras': 0, 'valid_modes': {<CUDAGraphMode.FULL: 2>, <CUDAGraphMode.NONE: 0>}, 'invalid_modes': None}, (<CUDAGraphMode.NONE: 0>, BatchDescriptor(num_tokens=21, num_reqs=None, uniform=False, has_lora=False, num_active_loras=0)))": 1
+      },
+      "bypass": 0
+    }
+  ]
+}

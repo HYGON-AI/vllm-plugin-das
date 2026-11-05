@@ -1,0 +1,168 @@
+[
+  {
+    "index": 119,
+    "repeats": [
+      {
+        "mode": "decode_only",
+        "tensors": 1592,
+        "all_exact": true
+      },
+      {
+        "mode": "padded_eager",
+        "tensors": 1592,
+        "all_exact": true
+      }
+    ],
+    "layer_errors": [
+      {
+        "module": "model.layers.0:1",
+        "sampled_shape": [
+          3,
+          4,
+          6144
+        ],
+        "max_abs": 3.0517578125e-05,
+        "relative_l2": 3.022367081939592e-06,
+        "nonzero": 13
+      },
+      {
+        "module": "model.layers.1:1",
+        "sampled_shape": [
+          3,
+          4,
+          6144
+        ],
+        "max_abs": 0.00390625,
+        "relative_l2": 0.004892552737146616,
+        "nonzero": 19133
+      },
+      {
+        "module": "model.layers.10:1",
+        "sampled_shape": [
+          3,
+          4,
+          6144
+        ],
+        "max_abs": 0.0302734375,
+        "relative_l2": 0.03363507613539696,
+        "nonzero": 69334
+      },
+      {
+        "module": "model.layers.40:1",
+        "sampled_shape": [
+          3,
+          4,
+          6144
+        ],
+        "max_abs": 0.100006103515625,
+        "relative_l2": 0.0631045401096344,
+        "nonzero": 71535
+      },
+      {
+        "module": "model.layers.77:1",
+        "sampled_shape": [
+          3,
+          4,
+          6144
+        ],
+        "max_abs": 30.75,
+        "relative_l2": 0.3020020127296448,
+        "nonzero": 73385
+      },
+      {
+        "module": "model.norm:1",
+        "sampled_shape": [
+          3,
+          6144
+        ],
+        "max_abs": 1.669921875,
+        "relative_l2": 0.44083303213119507,
+        "nonzero": 18356
+      }
+    ],
+    "sampled_1024_token_chunk_all_layers_exact": true
+  },
+  {
+    "index": 94,
+    "repeats": [
+      {
+        "mode": "decode_only",
+        "tensors": 1592,
+        "all_exact": true
+      },
+      {
+        "mode": "padded_eager",
+        "tensors": 1592,
+        "all_exact": true
+      }
+    ],
+    "layer_errors": [
+      {
+        "module": "model.layers.0:1",
+        "sampled_shape": [
+          3,
+          4,
+          6144
+        ],
+        "max_abs": 0.0,
+        "relative_l2": 0.0,
+        "nonzero": 0
+      },
+      {
+        "module": "model.layers.1:1",
+        "sampled_shape": [
+          3,
+          4,
+          6144
+        ],
+        "max_abs": 0.008148193359375,
+        "relative_l2": 0.011471216566860676,
+        "nonzero": 32028
+      },
+      {
+        "module": "model.layers.10:1",
+        "sampled_shape": [
+          3,
+          4,
+          6144
+        ],
+        "max_abs": 0.027587890625,
+        "relative_l2": 0.028396856039762497,
+        "nonzero": 69308
+      },
+      {
+        "module": "model.layers.40:1",
+        "sampled_shape": [
+          3,
+          4,
+          6144
+        ],
+        "max_abs": 0.09375,
+        "relative_l2": 0.054935235530138016,
+        "nonzero": 71262
+      },
+      {
+        "module": "model.layers.77:1",
+        "sampled_shape": [
+          3,
+          4,
+          6144
+        ],
+        "max_abs": 30.0,
+        "relative_l2": 0.157777801156044,
+        "nonzero": 73267
+      },
+      {
+        "module": "model.norm:1",
+        "sampled_shape": [
+          3,
+          6144
+        ],
+        "max_abs": 1.064453125,
+        "relative_l2": 0.3080519735813141,
+        "nonzero": 18295
+      }
+    ],
+    "sampled_1024_token_chunk_all_layers_exact": true
+  }
+]

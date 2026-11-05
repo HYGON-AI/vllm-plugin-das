@@ -1,0 +1,1116 @@
+{
+  "results": [
+    {
+      "rank": 0,
+      "cases": [
+        {
+          "index": 119,
+          "module": "model.layers.0.hc_attn_layer.hc_pre:1",
+          "valid_tokens": 22,
+          "padded_tokens": 128,
+          "outputs": [
+            {
+              "component": 0,
+              "shape_change": {
+                "exact": true,
+                "nonzero": 0,
+                "numel": 135168,
+                "max_abs": 0.0,
+                "relative_l2": 0.0
+              },
+              "repeat_same_shape": {
+                "exact": true,
+                "nonzero": 0,
+                "numel": 135168,
+                "max_abs": 0.0,
+                "relative_l2": 0.0
+              }
+            },
+            {
+              "component": 1,
+              "shape_change": {
+                "exact": false,
+                "nonzero": 8,
+                "numel": 88,
+                "max_abs": 8.940696716308594e-08,
+                "relative_l2": 5.921259926822131e-08
+              },
+              "repeat_same_shape": {
+                "exact": true,
+                "nonzero": 0,
+                "numel": 88,
+                "max_abs": 0.0,
+                "relative_l2": 0.0
+              }
+            }
+          ]
+        },
+        {
+          "index": 119,
+          "module": "model.layers.0.self_attn.linear_gate:1",
+          "valid_tokens": 22,
+          "padded_tokens": 128,
+          "outputs": [
+            {
+              "component": 0,
+              "shape_change": {
+                "exact": false,
+                "nonzero": 14,
+                "numel": 45056,
+                "max_abs": 0.00390625,
+                "relative_l2": 6.144256622064859e-05
+              },
+              "repeat_same_shape": {
+                "exact": true,
+                "nonzero": 0,
+                "numel": 45056,
+                "max_abs": 0.0,
+                "relative_l2": 0.0
+              }
+            }
+          ]
+        },
+        {
+          "index": 94,
+          "module": "model.layers.0.hc_attn_layer.hc_pre:1",
+          "valid_tokens": 43,
+          "padded_tokens": 128,
+          "outputs": [
+            {
+              "component": 0,
+              "shape_change": {
+                "exact": true,
+                "nonzero": 0,
+                "numel": 264192,
+                "max_abs": 0.0,
+                "relative_l2": 0.0
+              },
+              "repeat_same_shape": {
+                "exact": true,
+                "nonzero": 0,
+                "numel": 264192,
+                "max_abs": 0.0,
+                "relative_l2": 0.0
+              }
+            },
+            {
+              "component": 1,
+              "shape_change": {
+                "exact": false,
+                "nonzero": 14,
+                "numel": 172,
+                "max_abs": 5.960464477539063e-08,
+                "relative_l2": 3.008720383945729e-08
+              },
+              "repeat_same_shape": {
+                "exact": true,
+                "nonzero": 0,
+                "numel": 172,
+                "max_abs": 0.0,
+                "relative_l2": 0.0
+              }
+            }
+          ]
+        },
+        {
+          "index": 94,
+          "module": "model.layers.0.self_attn.linear_gate:1",
+          "valid_tokens": 43,
+          "padded_tokens": 128,
+          "outputs": [
+            {
+              "component": 0,
+              "shape_change": {
+                "exact": true,
+                "nonzero": 0,
+                "numel": 88064,
+                "max_abs": 0.0,
+                "relative_l2": 0.0
+              },
+              "repeat_same_shape": {
+                "exact": true,
+                "nonzero": 0,
+                "numel": 88064,
+                "max_abs": 0.0,
+                "relative_l2": 0.0
+              }
+            }
+          ]
+        }
+      ]
+    },
+    {
+      "rank": 1,
+      "cases": [
+        {
+          "index": 119,
+          "module": "model.layers.0.hc_attn_layer.hc_pre:1",
+          "valid_tokens": 22,
+          "padded_tokens": 128,
+          "outputs": [
+            {
+              "component": 0,
+              "shape_change": {
+                "exact": true,
+                "nonzero": 0,
+                "numel": 135168,
+                "max_abs": 0.0,
+                "relative_l2": 0.0
+              },
+              "repeat_same_shape": {
+                "exact": true,
+                "nonzero": 0,
+                "numel": 135168,
+                "max_abs": 0.0,
+                "relative_l2": 0.0
+              }
+            },
+            {
+              "component": 1,
+              "shape_change": {
+                "exact": false,
+                "nonzero": 8,
+                "numel": 88,
+                "max_abs": 8.940696716308594e-08,
+                "relative_l2": 5.921259926822131e-08
+              },
+              "repeat_same_shape": {
+                "exact": true,
+                "nonzero": 0,
+                "numel": 88,
+                "max_abs": 0.0,
+                "relative_l2": 0.0
+              }
+            }
+          ]
+        },
+        {
+          "index": 119,
+          "module": "model.layers.0.self_attn.linear_gate:1",
+          "valid_tokens": 22,
+          "padded_tokens": 128,
+          "outputs": [
+            {
+              "component": 0,
+              "shape_change": {
+                "exact": false,
+                "nonzero": 8,
+                "numel": 45056,
+                "max_abs": 1.1920928955078125e-07,
+                "relative_l2": 2.1699277930053995e-09
+              },
+              "repeat_same_shape": {
+                "exact": true,
+                "nonzero": 0,
+                "numel": 45056,
+                "max_abs": 0.0,
+                "relative_l2": 0.0
+              }
+            }
+          ]
+        },
+        {
+          "index": 94,
+          "module": "model.layers.0.hc_attn_layer.hc_pre:1",
+          "valid_tokens": 43,
+          "padded_tokens": 128,
+          "outputs": [
+            {
+              "component": 0,
+              "shape_change": {
+                "exact": true,
+                "nonzero": 0,
+                "numel": 264192,
+                "max_abs": 0.0,
+                "relative_l2": 0.0
+              },
+              "repeat_same_shape": {
+                "exact": true,
+                "nonzero": 0,
+                "numel": 264192,
+                "max_abs": 0.0,
+                "relative_l2": 0.0
+              }
+            },
+            {
+              "component": 1,
+              "shape_change": {
+                "exact": false,
+                "nonzero": 14,
+                "numel": 172,
+                "max_abs": 5.960464477539063e-08,
+                "relative_l2": 3.008720383945729e-08
+              },
+              "repeat_same_shape": {
+                "exact": true,
+                "nonzero": 0,
+                "numel": 172,
+                "max_abs": 0.0,
+                "relative_l2": 0.0
+              }
+            }
+          ]
+        },
+        {
+          "index": 94,
+          "module": "model.layers.0.self_attn.linear_gate:1",
+          "valid_tokens": 43,
+          "padded_tokens": 128,
+          "outputs": [
+            {
+              "component": 0,
+              "shape_change": {
+                "exact": true,
+                "nonzero": 0,
+                "numel": 88064,
+                "max_abs": 0.0,
+                "relative_l2": 0.0
+              },
+              "repeat_same_shape": {
+                "exact": true,
+                "nonzero": 0,
+                "numel": 88064,
+                "max_abs": 0.0,
+                "relative_l2": 0.0
+              }
+            }
+          ]
+        }
+      ]
+    },
+    {
+      "rank": 2,
+      "cases": [
+        {
+          "index": 119,
+          "module": "model.layers.0.hc_attn_layer.hc_pre:1",
+          "valid_tokens": 22,
+          "padded_tokens": 128,
+          "outputs": [
+            {
+              "component": 0,
+              "shape_change": {
+                "exact": true,
+                "nonzero": 0,
+                "numel": 135168,
+                "max_abs": 0.0,
+                "relative_l2": 0.0
+              },
+              "repeat_same_shape": {
+                "exact": true,
+                "nonzero": 0,
+                "numel": 135168,
+                "max_abs": 0.0,
+                "relative_l2": 0.0
+              }
+            },
+            {
+              "component": 1,
+              "shape_change": {
+                "exact": false,
+                "nonzero": 8,
+                "numel": 88,
+                "max_abs": 8.940696716308594e-08,
+                "relative_l2": 5.921259926822131e-08
+              },
+              "repeat_same_shape": {
+                "exact": true,
+                "nonzero": 0,
+                "numel": 88,
+                "max_abs": 0.0,
+                "relative_l2": 0.0
+              }
+            }
+          ]
+        },
+        {
+          "index": 119,
+          "module": "model.layers.0.self_attn.linear_gate:1",
+          "valid_tokens": 22,
+          "padded_tokens": 128,
+          "outputs": [
+            {
+              "component": 0,
+              "shape_change": {
+                "exact": false,
+                "nonzero": 7,
+                "numel": 45056,
+                "max_abs": 7.62939453125e-06,
+                "relative_l2": 1.314923423478831e-07
+              },
+              "repeat_same_shape": {
+                "exact": true,
+                "nonzero": 0,
+                "numel": 45056,
+                "max_abs": 0.0,
+                "relative_l2": 0.0
+              }
+            }
+          ]
+        },
+        {
+          "index": 94,
+          "module": "model.layers.0.hc_attn_layer.hc_pre:1",
+          "valid_tokens": 43,
+          "padded_tokens": 128,
+          "outputs": [
+            {
+              "component": 0,
+              "shape_change": {
+                "exact": true,
+                "nonzero": 0,
+                "numel": 264192,
+                "max_abs": 0.0,
+                "relative_l2": 0.0
+              },
+              "repeat_same_shape": {
+                "exact": true,
+                "nonzero": 0,
+                "numel": 264192,
+                "max_abs": 0.0,
+                "relative_l2": 0.0
+              }
+            },
+            {
+              "component": 1,
+              "shape_change": {
+                "exact": false,
+                "nonzero": 14,
+                "numel": 172,
+                "max_abs": 5.960464477539063e-08,
+                "relative_l2": 3.008720383945729e-08
+              },
+              "repeat_same_shape": {
+                "exact": true,
+                "nonzero": 0,
+                "numel": 172,
+                "max_abs": 0.0,
+                "relative_l2": 0.0
+              }
+            }
+          ]
+        },
+        {
+          "index": 94,
+          "module": "model.layers.0.self_attn.linear_gate:1",
+          "valid_tokens": 43,
+          "padded_tokens": 128,
+          "outputs": [
+            {
+              "component": 0,
+              "shape_change": {
+                "exact": true,
+                "nonzero": 0,
+                "numel": 88064,
+                "max_abs": 0.0,
+                "relative_l2": 0.0
+              },
+              "repeat_same_shape": {
+                "exact": true,
+                "nonzero": 0,
+                "numel": 88064,
+                "max_abs": 0.0,
+                "relative_l2": 0.0
+              }
+            }
+          ]
+        }
+      ]
+    },
+    {
+      "rank": 3,
+      "cases": [
+        {
+          "index": 119,
+          "module": "model.layers.0.hc_attn_layer.hc_pre:1",
+          "valid_tokens": 22,
+          "padded_tokens": 128,
+          "outputs": [
+            {
+              "component": 0,
+              "shape_change": {
+                "exact": true,
+                "nonzero": 0,
+                "numel": 135168,
+                "max_abs": 0.0,
+                "relative_l2": 0.0
+              },
+              "repeat_same_shape": {
+                "exact": true,
+                "nonzero": 0,
+                "numel": 135168,
+                "max_abs": 0.0,
+                "relative_l2": 0.0
+              }
+            },
+            {
+              "component": 1,
+              "shape_change": {
+                "exact": false,
+                "nonzero": 8,
+                "numel": 88,
+                "max_abs": 8.940696716308594e-08,
+                "relative_l2": 5.921259926822131e-08
+              },
+              "repeat_same_shape": {
+                "exact": true,
+                "nonzero": 0,
+                "numel": 88,
+                "max_abs": 0.0,
+                "relative_l2": 0.0
+              }
+            }
+          ]
+        },
+        {
+          "index": 119,
+          "module": "model.layers.0.self_attn.linear_gate:1",
+          "valid_tokens": 22,
+          "padded_tokens": 128,
+          "outputs": [
+            {
+              "component": 0,
+              "shape_change": {
+                "exact": false,
+                "nonzero": 8,
+                "numel": 45056,
+                "max_abs": 0.0078125,
+                "relative_l2": 0.00012601641356013715
+              },
+              "repeat_same_shape": {
+                "exact": true,
+                "nonzero": 0,
+                "numel": 45056,
+                "max_abs": 0.0,
+                "relative_l2": 0.0
+              }
+            }
+          ]
+        },
+        {
+          "index": 94,
+          "module": "model.layers.0.hc_attn_layer.hc_pre:1",
+          "valid_tokens": 43,
+          "padded_tokens": 128,
+          "outputs": [
+            {
+              "component": 0,
+              "shape_change": {
+                "exact": true,
+                "nonzero": 0,
+                "numel": 264192,
+                "max_abs": 0.0,
+                "relative_l2": 0.0
+              },
+              "repeat_same_shape": {
+                "exact": true,
+                "nonzero": 0,
+                "numel": 264192,
+                "max_abs": 0.0,
+                "relative_l2": 0.0
+              }
+            },
+            {
+              "component": 1,
+              "shape_change": {
+                "exact": false,
+                "nonzero": 14,
+                "numel": 172,
+                "max_abs": 5.960464477539063e-08,
+                "relative_l2": 3.008720383945729e-08
+              },
+              "repeat_same_shape": {
+                "exact": true,
+                "nonzero": 0,
+                "numel": 172,
+                "max_abs": 0.0,
+                "relative_l2": 0.0
+              }
+            }
+          ]
+        },
+        {
+          "index": 94,
+          "module": "model.layers.0.self_attn.linear_gate:1",
+          "valid_tokens": 43,
+          "padded_tokens": 128,
+          "outputs": [
+            {
+              "component": 0,
+              "shape_change": {
+                "exact": true,
+                "nonzero": 0,
+                "numel": 88064,
+                "max_abs": 0.0,
+                "relative_l2": 0.0
+              },
+              "repeat_same_shape": {
+                "exact": true,
+                "nonzero": 0,
+                "numel": 88064,
+                "max_abs": 0.0,
+                "relative_l2": 0.0
+              }
+            }
+          ]
+        }
+      ]
+    },
+    {
+      "rank": 4,
+      "cases": [
+        {
+          "index": 119,
+          "module": "model.layers.0.hc_attn_layer.hc_pre:1",
+          "valid_tokens": 22,
+          "padded_tokens": 128,
+          "outputs": [
+            {
+              "component": 0,
+              "shape_change": {
+                "exact": true,
+                "nonzero": 0,
+                "numel": 135168,
+                "max_abs": 0.0,
+                "relative_l2": 0.0
+              },
+              "repeat_same_shape": {
+                "exact": true,
+                "nonzero": 0,
+                "numel": 135168,
+                "max_abs": 0.0,
+                "relative_l2": 0.0
+              }
+            },
+            {
+              "component": 1,
+              "shape_change": {
+                "exact": false,
+                "nonzero": 8,
+                "numel": 88,
+                "max_abs": 8.940696716308594e-08,
+                "relative_l2": 5.921259926822131e-08
+              },
+              "repeat_same_shape": {
+                "exact": true,
+                "nonzero": 0,
+                "numel": 88,
+                "max_abs": 0.0,
+                "relative_l2": 0.0
+              }
+            }
+          ]
+        },
+        {
+          "index": 119,
+          "module": "model.layers.0.self_attn.linear_gate:1",
+          "valid_tokens": 22,
+          "padded_tokens": 128,
+          "outputs": [
+            {
+              "component": 0,
+              "shape_change": {
+                "exact": true,
+                "nonzero": 0,
+                "numel": 45056,
+                "max_abs": 0.0,
+                "relative_l2": 0.0
+              },
+              "repeat_same_shape": {
+                "exact": true,
+                "nonzero": 0,
+                "numel": 45056,
+                "max_abs": 0.0,
+                "relative_l2": 0.0
+              }
+            }
+          ]
+        },
+        {
+          "index": 94,
+          "module": "model.layers.0.hc_attn_layer.hc_pre:1",
+          "valid_tokens": 43,
+          "padded_tokens": 128,
+          "outputs": [
+            {
+              "component": 0,
+              "shape_change": {
+                "exact": true,
+                "nonzero": 0,
+                "numel": 264192,
+                "max_abs": 0.0,
+                "relative_l2": 0.0
+              },
+              "repeat_same_shape": {
+                "exact": true,
+                "nonzero": 0,
+                "numel": 264192,
+                "max_abs": 0.0,
+                "relative_l2": 0.0
+              }
+            },
+            {
+              "component": 1,
+              "shape_change": {
+                "exact": false,
+                "nonzero": 14,
+                "numel": 172,
+                "max_abs": 5.960464477539063e-08,
+                "relative_l2": 3.008720383945729e-08
+              },
+              "repeat_same_shape": {
+                "exact": true,
+                "nonzero": 0,
+                "numel": 172,
+                "max_abs": 0.0,
+                "relative_l2": 0.0
+              }
+            }
+          ]
+        },
+        {
+          "index": 94,
+          "module": "model.layers.0.self_attn.linear_gate:1",
+          "valid_tokens": 43,
+          "padded_tokens": 128,
+          "outputs": [
+            {
+              "component": 0,
+              "shape_change": {
+                "exact": true,
+                "nonzero": 0,
+                "numel": 88064,
+                "max_abs": 0.0,
+                "relative_l2": 0.0
+              },
+              "repeat_same_shape": {
+                "exact": true,
+                "nonzero": 0,
+                "numel": 88064,
+                "max_abs": 0.0,
+                "relative_l2": 0.0
+              }
+            }
+          ]
+        }
+      ]
+    },
+    {
+      "rank": 5,
+      "cases": [
+        {
+          "index": 119,
+          "module": "model.layers.0.hc_attn_layer.hc_pre:1",
+          "valid_tokens": 22,
+          "padded_tokens": 128,
+          "outputs": [
+            {
+              "component": 0,
+              "shape_change": {
+                "exact": true,
+                "nonzero": 0,
+                "numel": 135168,
+                "max_abs": 0.0,
+                "relative_l2": 0.0
+              },
+              "repeat_same_shape": {
+                "exact": true,
+                "nonzero": 0,
+                "numel": 135168,
+                "max_abs": 0.0,
+                "relative_l2": 0.0
+              }
+            },
+            {
+              "component": 1,
+              "shape_change": {
+                "exact": false,
+                "nonzero": 8,
+                "numel": 88,
+                "max_abs": 8.940696716308594e-08,
+                "relative_l2": 5.921259926822131e-08
+              },
+              "repeat_same_shape": {
+                "exact": true,
+                "nonzero": 0,
+                "numel": 88,
+                "max_abs": 0.0,
+                "relative_l2": 0.0
+              }
+            }
+          ]
+        },
+        {
+          "index": 119,
+          "module": "model.layers.0.self_attn.linear_gate:1",
+          "valid_tokens": 22,
+          "padded_tokens": 128,
+          "outputs": [
+            {
+              "component": 0,
+              "shape_change": {
+                "exact": true,
+                "nonzero": 0,
+                "numel": 45056,
+                "max_abs": 0.0,
+                "relative_l2": 0.0
+              },
+              "repeat_same_shape": {
+                "exact": true,
+                "nonzero": 0,
+                "numel": 45056,
+                "max_abs": 0.0,
+                "relative_l2": 0.0
+              }
+            }
+          ]
+        },
+        {
+          "index": 94,
+          "module": "model.layers.0.hc_attn_layer.hc_pre:1",
+          "valid_tokens": 43,
+          "padded_tokens": 128,
+          "outputs": [
+            {
+              "component": 0,
+              "shape_change": {
+                "exact": true,
+                "nonzero": 0,
+                "numel": 264192,
+                "max_abs": 0.0,
+                "relative_l2": 0.0
+              },
+              "repeat_same_shape": {
+                "exact": true,
+                "nonzero": 0,
+                "numel": 264192,
+                "max_abs": 0.0,
+                "relative_l2": 0.0
+              }
+            },
+            {
+              "component": 1,
+              "shape_change": {
+                "exact": false,
+                "nonzero": 14,
+                "numel": 172,
+                "max_abs": 5.960464477539063e-08,
+                "relative_l2": 3.008720383945729e-08
+              },
+              "repeat_same_shape": {
+                "exact": true,
+                "nonzero": 0,
+                "numel": 172,
+                "max_abs": 0.0,
+                "relative_l2": 0.0
+              }
+            }
+          ]
+        },
+        {
+          "index": 94,
+          "module": "model.layers.0.self_attn.linear_gate:1",
+          "valid_tokens": 43,
+          "padded_tokens": 128,
+          "outputs": [
+            {
+              "component": 0,
+              "shape_change": {
+                "exact": true,
+                "nonzero": 0,
+                "numel": 88064,
+                "max_abs": 0.0,
+                "relative_l2": 0.0
+              },
+              "repeat_same_shape": {
+                "exact": true,
+                "nonzero": 0,
+                "numel": 88064,
+                "max_abs": 0.0,
+                "relative_l2": 0.0
+              }
+            }
+          ]
+        }
+      ]
+    },
+    {
+      "rank": 6,
+      "cases": [
+        {
+          "index": 119,
+          "module": "model.layers.0.hc_attn_layer.hc_pre:1",
+          "valid_tokens": 22,
+          "padded_tokens": 128,
+          "outputs": [
+            {
+              "component": 0,
+              "shape_change": {
+                "exact": true,
+                "nonzero": 0,
+                "numel": 135168,
+                "max_abs": 0.0,
+                "relative_l2": 0.0
+              },
+              "repeat_same_shape": {
+                "exact": true,
+                "nonzero": 0,
+                "numel": 135168,
+                "max_abs": 0.0,
+                "relative_l2": 0.0
+              }
+            },
+            {
+              "component": 1,
+              "shape_change": {
+                "exact": false,
+                "nonzero": 8,
+                "numel": 88,
+                "max_abs": 8.940696716308594e-08,
+                "relative_l2": 5.921259926822131e-08
+              },
+              "repeat_same_shape": {
+                "exact": true,
+                "nonzero": 0,
+                "numel": 88,
+                "max_abs": 0.0,
+                "relative_l2": 0.0
+              }
+            }
+          ]
+        },
+        {
+          "index": 119,
+          "module": "model.layers.0.self_attn.linear_gate:1",
+          "valid_tokens": 22,
+          "padded_tokens": 128,
+          "outputs": [
+            {
+              "component": 0,
+              "shape_change": {
+                "exact": true,
+                "nonzero": 0,
+                "numel": 45056,
+                "max_abs": 0.0,
+                "relative_l2": 0.0
+              },
+              "repeat_same_shape": {
+                "exact": true,
+                "nonzero": 0,
+                "numel": 45056,
+                "max_abs": 0.0,
+                "relative_l2": 0.0
+              }
+            }
+          ]
+        },
+        {
+          "index": 94,
+          "module": "model.layers.0.hc_attn_layer.hc_pre:1",
+          "valid_tokens": 43,
+          "padded_tokens": 128,
+          "outputs": [
+            {
+              "component": 0,
+              "shape_change": {
+                "exact": true,
+                "nonzero": 0,
+                "numel": 264192,
+                "max_abs": 0.0,
+                "relative_l2": 0.0
+              },
+              "repeat_same_shape": {
+                "exact": true,
+                "nonzero": 0,
+                "numel": 264192,
+                "max_abs": 0.0,
+                "relative_l2": 0.0
+              }
+            },
+            {
+              "component": 1,
+              "shape_change": {
+                "exact": false,
+                "nonzero": 14,
+                "numel": 172,
+                "max_abs": 5.960464477539063e-08,
+                "relative_l2": 3.008720383945729e-08
+              },
+              "repeat_same_shape": {
+                "exact": true,
+                "nonzero": 0,
+                "numel": 172,
+                "max_abs": 0.0,
+                "relative_l2": 0.0
+              }
+            }
+          ]
+        },
+        {
+          "index": 94,
+          "module": "model.layers.0.self_attn.linear_gate:1",
+          "valid_tokens": 43,
+          "padded_tokens": 128,
+          "outputs": [
+            {
+              "component": 0,
+              "shape_change": {
+                "exact": true,
+                "nonzero": 0,
+                "numel": 88064,
+                "max_abs": 0.0,
+                "relative_l2": 0.0
+              },
+              "repeat_same_shape": {
+                "exact": true,
+                "nonzero": 0,
+                "numel": 88064,
+                "max_abs": 0.0,
+                "relative_l2": 0.0
+              }
+            }
+          ]
+        }
+      ]
+    },
+    {
+      "rank": 7,
+      "cases": [
+        {
+          "index": 119,
+          "module": "model.layers.0.hc_attn_layer.hc_pre:1",
+          "valid_tokens": 22,
+          "padded_tokens": 128,
+          "outputs": [
+            {
+              "component": 0,
+              "shape_change": {
+                "exact": true,
+                "nonzero": 0,
+                "numel": 135168,
+                "max_abs": 0.0,
+                "relative_l2": 0.0
+              },
+              "repeat_same_shape": {
+                "exact": true,
+                "nonzero": 0,
+                "numel": 135168,
+                "max_abs": 0.0,
+                "relative_l2": 0.0
+              }
+            },
+            {
+              "component": 1,
+              "shape_change": {
+                "exact": false,
+                "nonzero": 8,
+                "numel": 88,
+                "max_abs": 8.940696716308594e-08,
+                "relative_l2": 5.921259926822131e-08
+              },
+              "repeat_same_shape": {
+                "exact": true,
+                "nonzero": 0,
+                "numel": 88,
+                "max_abs": 0.0,
+                "relative_l2": 0.0
+              }
+            }
+          ]
+        },
+        {
+          "index": 119,
+          "module": "model.layers.0.self_attn.linear_gate:1",
+          "valid_tokens": 22,
+          "padded_tokens": 128,
+          "outputs": [
+            {
+              "component": 0,
+              "shape_change": {
+                "exact": false,
+                "nonzero": 22,
+                "numel": 45056,
+                "max_abs": 0.001953125,
+                "relative_l2": 3.4515618608566e-05
+              },
+              "repeat_same_shape": {
+                "exact": true,
+                "nonzero": 0,
+                "numel": 45056,
+                "max_abs": 0.0,
+                "relative_l2": 0.0
+              }
+            }
+          ]
+        },
+        {
+          "index": 94,
+          "module": "model.layers.0.hc_attn_layer.hc_pre:1",
+          "valid_tokens": 43,
+          "padded_tokens": 128,
+          "outputs": [
+            {
+              "component": 0,
+              "shape_change": {
+                "exact": true,
+                "nonzero": 0,
+                "numel": 264192,
+                "max_abs": 0.0,
+                "relative_l2": 0.0
+              },
+              "repeat_same_shape": {
+                "exact": true,
+                "nonzero": 0,
+                "numel": 264192,
+                "max_abs": 0.0,
+                "relative_l2": 0.0
+              }
+            },
+            {
+              "component": 1,
+              "shape_change": {
+                "exact": false,
+                "nonzero": 14,
+                "numel": 172,
+                "max_abs": 5.960464477539063e-08,
+                "relative_l2": 3.008720383945729e-08
+              },
+              "repeat_same_shape": {
+                "exact": true,
+                "nonzero": 0,
+                "numel": 172,
+                "max_abs": 0.0,
+                "relative_l2": 0.0
+              }
+            }
+          ]
+        },
+        {
+          "index": 94,
+          "module": "model.layers.0.self_attn.linear_gate:1",
+          "valid_tokens": 43,
+          "padded_tokens": 128,
+          "outputs": [
+            {
+              "component": 0,
+              "shape_change": {
+                "exact": true,
+                "nonzero": 0,
+                "numel": 88064,
+                "max_abs": 0.0,
+                "relative_l2": 0.0
+              },
+              "repeat_same_shape": {
+                "exact": true,
+                "nonzero": 0,
+                "numel": 88064,
+                "max_abs": 0.0,
+                "relative_l2": 0.0
+              }
+            }
+          ]
+        }
+      ]
+    }
+  ]
+}

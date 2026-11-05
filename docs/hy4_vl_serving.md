@@ -11,15 +11,18 @@ serving commands; video and speculative decoding are unsupported.
 Choose one execution mode. `eager` is the default fallback. Graph configurations
 are experimental: see the [decode graph report](hy4_vl_graph_performance.md) and
 [full/piecewise report](hy4_vl_piecewise_performance.md) for precision, stability
-and performance limits. Full/piecewise fails this checkpoint's documented
-accuracy gate; its commands reproduce that experiment. Stop the previous server
-before starting another mode.
+and performance limits. The [padding precision investigation](hy4_vl_piecewise_precision.md)
+explains the original full/piecewise regression and the current guard: at DP=1,
+the tested v1 HYV4-VL runner uses PIECEWISE only when its token descriptor exactly matches the input
+count. Other prefill chunks run at their original eager size. Stop the previous
+server before starting another mode.
 
 ```bash
 # Run in the plugin checkout. Choose: eager, decode, or full-piecewise.
 HY4_EXECUTION=eager
 export PYTHONPATH="$PWD${PYTHONPATH:+:$PYTHONPATH}"
 export VLLM_WORKER_MULTIPROC_METHOD=spawn
+export VLLM_USE_V2_MODEL_RUNNER=0
 export VLLM_USE_BREAKABLE_CUDAGRAPH=1
 case "$HY4_EXECUTION" in
   eager)
@@ -53,7 +56,10 @@ In this DAS build, `VLLM_USE_BREAKABLE_CUDAGRAPH=1` disables the vLLM
 are not an Inductor-compiled experiment. Decode-only leaves prefill eager.
 Full/piecewise additionally dispatches eligible prefill/mixed batches to
 PIECEWISE. Capturing only `[1,2]` would cover very little image prefill, so the
-latter configuration includes larger token buckets. ViT remains eager in both.
+latter configuration includes larger token buckets. With the precision guard,
+1024-token chunks can replay while short tails that would be padded fall back to
+NONE. This guard covers DP=1; DP/SP/CP precision is not established by this test.
+ViT remains eager in both.
 
 The benchmark disables prefix and CPU processor caches. The default GPU encoder
 embedding LRU remains enabled; repeated images can reuse embeddings. Start a
