@@ -293,6 +293,7 @@ _OP_CALLBACKS: tuple[_CallbackSpec, ...] = (
     _CallbackSpec(_adapter("op_opt", "patch_glm5next_kda_strided_recurrent")),
     _CallbackSpec(_adapter("op_opt", "patch_gate_linear")),
     _CallbackSpec(_adapter("op_opt", "patch_activation")),
+    _CallbackSpec(_adapter("op_opt", "patch_topk_topp_sampler")),
     _CallbackSpec(_adapter("op_opt", "patch_layers_utils")),
     _CallbackSpec(_adapter("op_opt", "patch_deep_gemm")),
     _CallbackSpec(_adapter("op_opt", "patch_deep_gemm_transform")),
