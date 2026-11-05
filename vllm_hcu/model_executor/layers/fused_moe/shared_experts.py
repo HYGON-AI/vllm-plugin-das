@@ -174,13 +174,13 @@ class SharedExperts(torch.nn.Module):
             henvs.optional_custom_op_enabled(
                 henvs.VLLM_HCU_SHARED_EXPERTS_DEEPEP_EPLB_OVERLAP
             )
-            and not torch.cuda.is_current_stream_capturing()
             and parallel.enable_eplb
             and parallel.all2all_backend in ("deepep_auto", "deepep_high_throughput")
             and not parallel.use_fi_nvl_two_sided_kernels
             and not self.enable_dbo
             and self._stream is not None
             and self._is_multistream_safe()
+            and not torch.cuda.is_current_stream_capturing()
         )
 
     @property

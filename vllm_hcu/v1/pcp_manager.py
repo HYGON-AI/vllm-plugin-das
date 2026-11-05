@@ -297,13 +297,15 @@ class HcuPCPManager:
             largest = max(largest, local_tokens)
         return largest
 
-    @staticmethod
-    def _pinned(array: np.ndarray) -> torch.Tensor:
+    def _pinned(self, array: np.ndarray) -> torch.Tensor:
         # A pinned snapshot lets the H2D copy run without a host sync; a
         # pageable copy waits for all queued GPU work (the previous step's
         # drafter), which exposed ~4 ms of metadata building per decode step.
         # The snapshot also keeps reused numpy scratch buffers safe to edit.
-        return torch.from_numpy(array).pin_memory()
+        tensor = torch.from_numpy(array)
+        if self.device.type == "cpu":
+            return tensor
+        return tensor.pin_memory()
 
     def _to_device(self, array: np.ndarray) -> torch.Tensor:
         return self._pinned(array).to(self.device, non_blocking=True)

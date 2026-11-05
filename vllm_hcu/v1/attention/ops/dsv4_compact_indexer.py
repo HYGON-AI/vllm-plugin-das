@@ -113,6 +113,7 @@ def compact_indexer_logits(q, cache, weights, lengths, table, max_len):
             "page_capacity": 0,
             "row_capacity": 0,
             "old": [],
+            "captured": False,
         }
         _WORKSPACES[key] = state
 
@@ -120,12 +121,14 @@ def compact_indexer_logits(q, cache, weights, lengths, table, max_len):
         state["page_capacity"] < required_pages
         or state["row_capacity"] < rows
     ):
-        # Earlier CUDA graphs may still reference the old buffers. Keep them
-        # alive after replacement so graph replay never observes freed storage.
-        if state["compact"] is not None:
+        # Only captured buffers need stable addresses after replacement.
+        # Pure eager growth must release retired storage instead of retaining
+        # every smaller allocation for the lifetime of the worker.
+        if state["captured"]:
             state["old"].append(
                 (state["compact"], state["mapped"], state["new_lengths"])
             )
+        state["captured"] = False
         if state["page_capacity"] < required_pages:
             page_capacity = (
                 required_pages
@@ -149,6 +152,10 @@ def compact_indexer_logits(q, cache, weights, lengths, table, max_len):
             )
             state["row_capacity"] = row_capacity
 
+    # Capture can reuse an eager warmup allocation without growing it.
+    # Remember that use before a later eager call replaces these buffers.
+    if torch.cuda.is_current_stream_capturing():
+        state["captured"] = True
     compact = state["compact"]
     mapped = state["mapped"][:rows]
     new_lengths = state["new_lengths"][:rows]

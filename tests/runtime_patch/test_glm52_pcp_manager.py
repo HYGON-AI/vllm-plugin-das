@@ -1033,3 +1033,15 @@ def test_build_helper_enforces_the_approved_runtime_contract() -> None:
         maybe_build_pcp_manager(
             _make_config(2, pp=2), torch.device("cpu"), SimpleNamespace(), []
         )
+
+
+def test_cpu_metadata_transfer_never_pins_memory(monkeypatch):
+    def device_call(*args, **kwargs):
+        pytest.fail("CPU metadata transfer must not access an accelerator")
+
+    monkeypatch.setattr(torch.Tensor, "pin_memory", device_call)
+    manager = object.__new__(HcuPCPManager)
+    manager.device = torch.device("cpu")
+    array = np.arange(8, dtype=np.int32)
+    torch.testing.assert_close(manager._pinned(array), torch.from_numpy(array))
+    torch.testing.assert_close(manager._to_device(array), torch.from_numpy(array))

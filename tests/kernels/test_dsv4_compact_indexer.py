@@ -2,6 +2,8 @@
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 """Real LightOp decode from staged V4 pages, including graph buffer reuse."""
 
+import weakref
+
 import pytest
 import torch
 from tests.kernels.test_gfx938_indexer_normal_layout import (
@@ -152,3 +154,43 @@ def test_large_physical_pool_small_batch_has_bounded_graph_workspace(monkeypatch
     graph.replay()
     _check(actual, expected, ends)
     assert state["compact"] is workspace
+
+
+@pytest.mark.parametrize("capture", [False, True])
+def test_growth_releases_eager_buffers_and_preserves_old_graph(monkeypatch, capture):
+    from vllm_hcu.v1.attention.ops import dsv4_compact_indexer as compact
+
+    monkeypatch.setenv("VLLM_HCU_USE_CUSTOM_OPS", "1")
+    monkeypatch.setenv("VLLM_HCU_DSV4_INDEXER_COMPACT_DECODE", "1")
+    monkeypatch.setattr(compact, "_WORKSPACES", {})
+    ends = torch.full((1, 6), 64, dtype=torch.int32, device="cuda")
+    args, expected = _token_major_case(64, ends, True)
+    q, cache, weights, lengths, _, max_len = args
+    cache = cache.expand(131072, -1, -1, -1)
+    table = torch.full((1, 1), 131071, dtype=torch.int32, device="cuda")
+    args = (q, cache, weights, lengths, table, max_len)
+    stream = torch.cuda.Stream()
+    stream.wait_stream(torch.cuda.current_stream())
+    with torch.cuda.stream(stream):
+        _decode(args)
+    torch.cuda.current_stream().wait_stream(stream)
+    state, = compact._WORKSPACES.values()
+    retired = weakref.ref(state["compact"])
+    if capture:
+        graph = torch.cuda.CUDAGraph()
+        with torch.cuda.graph(graph, stream=stream):
+            actual = _decode(args)
+    for repeats in (4, 8):
+        with torch.cuda.stream(stream):
+            _decode((q.repeat(repeats, 1, 1, 1), cache,
+                     weights.repeat(repeats, 1), lengths.repeat(repeats, 1),
+                     table.repeat(repeats, 1), max_len))
+        torch.cuda.current_stream().wait_stream(stream)
+    assert len(state["old"]) == int(capture)
+    assert (retired() is not None) is capture
+    if capture:
+        graph.replay()
+        _check(actual, expected, ends)
+        cache.zero_()
+        graph.replay()
+        _check(actual, torch.zeros_like(expected), ends)
