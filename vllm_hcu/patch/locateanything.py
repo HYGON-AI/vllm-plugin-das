@@ -158,3 +158,39 @@ def register_locateanything_api_callbacks(coordinator):
             _patch_fast_input_sampling,
             targets=("vllm.v1.engine.input_processor.InputProcessor._validate_params",),
         )
+        coordinator.register_callback(
+            "locateanything.input.sessions", "vllm.v1.engine.input_processor",
+            _patch_fast_session_inputs,
+            targets=("vllm.v1.engine.input_processor.InputProcessor.process_inputs",),
+        )
+
+
+def _patch_fast_session_inputs(module):
+    """Reject unsupported session flags before rendering, validation or IPC."""
+    from vllm.exceptions import VLLMValidationError
+    from vllm_hcu.patch.platform.framework_opt._common import (
+        PatchCompatibilityError, require_callable, require_class, require_signature_prefix,
+    )
+    from vllm_hcu.v1.locateanything.request_contract import validate_session_input
+
+    target = f"{module.__name__}.InputProcessor.process_inputs"
+    cls = require_class(module, "InputProcessor", target)
+    original = require_callable(cls, "process_inputs", target)
+    if getattr(original, "_locateanything_fast_sessions", False):
+        return False
+    signature = require_signature_prefix(original, target, ("self", "request_id", "prompt", "params", "supported_tasks"))
+    if not {'resumable', 'session_id'} <= signature.parameters.keys():
+        raise PatchCompatibilityError(f"required HCU patch target {target} lacks session flags")
+
+    @wraps(original)
+    def reject_fast_sessions(self, *args, **kwargs):
+        if self.model_config.hf_config.model_type == "locateanything":
+            values = signature.bind(self, *args, **kwargs).arguments
+            error = validate_session_input(values.get('resumable', False), values.get('session_id'))
+            if error is not None:
+                raise VLLMValidationError(error)
+        return original(self, *args, **kwargs)
+
+    reject_fast_sessions._locateanything_fast_sessions = True
+    cls.process_inputs = reject_fast_sessions
+    return True

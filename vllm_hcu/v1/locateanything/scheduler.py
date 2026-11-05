@@ -7,7 +7,6 @@ import itertools
 import time
 from collections import defaultdict, deque
 from collections.abc import Iterable
-from dataclasses import replace
 from typing import Any
 
 from vllm.compilation.cuda_graph import CUDAGraphStat
@@ -76,7 +75,7 @@ from vllm.v1.spec_decode.metrics import SpecDecodingStats
 from vllm.v1.structured_output import StructuredOutputGrammar, StructuredOutputManager
 from vllm.v1.utils import record_function_or_nullcontext
 from vllm_hcu.v1.locateanything.limits import context_error, logical_context_limit, reject_pipeline_parallelism, reject_speculative_decoding
-from vllm_hcu.v1.locateanything.request_contract import validate_sampling_params
+from vllm_hcu.v1.locateanything.request_contract import FAST_SESSION_ERROR, validate_sampling_params, validate_session_input
 
 logger = init_logger(__name__)
 
@@ -1598,45 +1597,8 @@ class Scheduler(SchedulerInterface):
     def _update_request_as_session(
         self, session: Request, update: StreamingUpdate
     ) -> None:
-        """
-        Updates the waiting session with the next streaming update.
-
-        Discards the last sampled output token from the prior input chunk.
-        """
-
-        # Current streaming input behaviour: Keep only computed output tokens
-        # (discard final sampled output token).
-        num_computed_tokens = session.num_computed_tokens
-        kept_output_tokens = session._all_token_ids[
-            session.num_prompt_tokens : num_computed_tokens
-        ]
-        del session._all_token_ids[num_computed_tokens:]
-        session._output_token_ids.clear()
-        assert session.prompt_token_ids is not None
-        # Extend prompt with kept output tokens.
-        session.prompt_token_ids.extend(kept_output_tokens)
-
-        if update.mm_features:
-            base = session.num_tokens
-            for mm_feature in update.mm_features:
-                mm_feature.mm_position = replace(
-                    mm_feature.mm_position, offset=mm_feature.mm_position.offset + base
-                )
-            session.mm_features.extend(update.mm_features)
-
-        session._all_token_ids.extend(update.prompt_token_ids or ())
-        session.prompt_token_ids.extend(update.prompt_token_ids or ())
-        # Update block hashes for the new tokens.
-        session.update_block_hashes()
-        session.num_prompt_tokens = len(session.prompt_token_ids)
-        session.arrival_time = update.arrival_time
-        session.sampling_params = update.sampling_params
-        if session.status == RequestStatus.WAITING_FOR_STREAMING_REQ:
-            self.num_waiting_for_streaming_input -= 1
-        session.status = RequestStatus.WAITING
-
-        if self.log_stats:
-            session.record_event(EngineCoreEventType.QUEUED)
+        """Fast never appends streaming chunks to retained request history."""
+        raise ValueError(FAST_SESSION_ERROR)
 
     def _make_cached_request_data(
         self,
@@ -2364,22 +2326,11 @@ class Scheduler(SchedulerInterface):
         return self.waiting or self.skipped_waiting or None
 
     def _handle_stopped_request(self, request: Request) -> bool:
-        """Return True if finished (can be False for resumable requests)."""
-        if not request.resumable:
-            return True
-
-        if request.streaming_queue:
-            update = request.streaming_queue.popleft()
-            if update is None:
-                # Streaming request finished.
-                return True
-            self._update_request_as_session(request, update)
-        else:
-            request.status = RequestStatus.WAITING_FOR_STREAMING_REQ
-            self.num_waiting_for_streaming_input += 1
-
-        self._enqueue_waiting_request(request)
-        return False
+        """Finish complete Fast requests; resumable input is unsupported."""
+        error = validate_session_input(request.resumable, request.session_id)
+        if error is not None:
+            raise ValueError(error)
+        return True
 
     def _update_request_with_output(
         self, request: Request, new_token_ids: list[int], is_stale: bool = False
@@ -2518,38 +2469,27 @@ class Scheduler(SchedulerInterface):
         return self.kv_cache_manager.usage
 
     def add_request(self, request: Request) -> None:
+        error = validate_session_input(request.resumable, request.session_id)
+        if error is not None:
+            raise ValueError(error)
         error = validate_sampling_params(request.sampling_params)
         if error is not None:
             raise ValueError(error)
         error = context_error(self.max_model_len, request.num_tokens, request.max_tokens)
         if error is not None:
             raise ValueError(error)
-        existing = self.requests.get(request.request_id)
-        if existing is not None:
-            update = StreamingUpdate.from_request(request)
-            if existing.status != RequestStatus.WAITING_FOR_STREAMING_REQ:
-                assert existing.streaming_queue is not None, "duplicate request id"
-                # Queue next input chunk (or finished sentinel).
-                existing.streaming_queue.append(update)
-            elif update is not None:
-                # Commence next input chunk.
-                self._update_request_as_session(existing, update)
-            else:
-                # Streaming-input session finished.
-                self.finish_requests(request.request_id, RequestStatus.FINISHED_ABORTED)
-        else:
-            if request.resumable:
-                request.streaming_queue = deque()
-            self._enqueue_waiting_request(request)
-            self.requests[request.request_id] = request
-            if self.spec_decode_metrics_level != "none":
-                request.spec_decode_metrics = RequestSpecDecodeMetrics.new(
-                    self.num_spec_tokens
-                )
-            if self.connector is not None:
-                self.connector.on_new_request(request)
-            if self.log_stats:
-                request.record_event(EngineCoreEventType.QUEUED)
+        if request.request_id in self.requests:
+            raise ValueError("LocateAnything Fast does not support active request ID reuse or session continuation")
+        self._enqueue_waiting_request(request)
+        self.requests[request.request_id] = request
+        if self.spec_decode_metrics_level != "none":
+            request.spec_decode_metrics = RequestSpecDecodeMetrics.new(
+                self.num_spec_tokens
+            )
+        if self.connector is not None:
+            self.connector.on_new_request(request)
+        if self.log_stats:
+            request.record_event(EngineCoreEventType.QUEUED)
 
     def finish_requests(
         self, request_ids: str | Iterable[str] | None, finished_status: RequestStatus

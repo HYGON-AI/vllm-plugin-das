@@ -103,6 +103,11 @@ six-position generation must not be combined with `--speculative-config`.
 Fast requires `pipeline_parallel_size=1`: the launcher, scheduler and worker
 reject pipeline parallelism before Fast warmup or device stream setup. Slow
 does not use this Fast restriction.
+Fast does not support resumable/session input. The client rejects both keyword
+and positional `resumable` / `session_id` arguments before rendering or IPC;
+the scheduler also rejects these flags and reuse of an active request ID.
+It never merges input chunks into retained token history. Completed request
+IDs can still be reused once the previous request has been removed.
 
 The seven substantial Fast modules retain the original upstream vLLM license
 headers. They are qualified against the exact base files listed in the packaged
@@ -155,6 +160,10 @@ client before EngineCore IPC, so ordinary invalid offline calls do not fail
 inside the engine process. InputProcessor, admission and the worker share one sampling contract,
 so unsupported stop strings/token IDs, penalties, logprobs and structured
 outputs fail before request, model or block-table state is inserted.
+Custom per-request logits processors are unsupported. The qualified vLLM
+constructor already rejects the removed `logits_processors` field; the Fast
+contract additionally rejects nonempty fields supplied by older layouts or
+SamplingParams subclasses, instead of silently ignoring their constraints.
 
 The three inline `nosemgrep: rules.hygon.python.dynamic-eval` exceptions are
 limited to these oracle calls. They do not suppress dynamic execution in the

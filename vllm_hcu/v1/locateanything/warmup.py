@@ -218,22 +218,9 @@ def warmup_kernels(
     worker_execute_model: Callable[[SchedulerOutput], Any],
     worker_sample_tokens: Callable[[GrammarOutput | None], Any],
 ) -> None:
-    """Run scheduler-realistic prefill and decode steps to JIT compile kernels.
-
-    We must call the provided worker's execute_model for pipeline parallel
-    coordination.
-    """
+    """Warm Fast prefill/decode with real KV progress and temporary probes."""
     from vllm_hcu.v1.locateanything.fast_warmup import warmup
-    return warmup(model_runner, worker_execute_model, worker_sample_tokens)
-
-    # Adaptive costs are calibrated during capture, after this warmup. Exercise
-    # fixed draft counts here, then restore the manager for capture and serving.
-    adaptive_verification = model_runner.adaptive_verification
-    model_runner.adaptive_verification = None
-    try:
-        _warmup_kernels(model_runner, worker_execute_model, worker_sample_tokens)
-    finally:
-        model_runner.adaptive_verification = adaptive_verification
+    warmup(model_runner, worker_execute_model, worker_sample_tokens)
 
 
 def _warmup_kernels(
