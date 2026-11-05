@@ -81,8 +81,15 @@ def cp_gather_and_upconvert_fp8_kv_cache(
     if (
         os.environ.get("VLLM_HCU_ENABLE_TRITON_CP_GATHER", "0") != "1"
         or not src_cache.is_cuda
+        or dst.device != src_cache.device
+        or block_table.device != src_cache.device
+        or seq_lens.device != src_cache.device
+        or workspace_starts.device != src_cache.device
         or src_cache.dtype != torch.uint8
         or dst.dtype != torch.bfloat16
+        or block_table.dtype != torch.int32
+        or seq_lens.dtype != torch.int32
+        or workspace_starts.dtype != torch.int32
         or src_cache.ndim != 3
         or src_cache.shape[2] != 656
         or dst.ndim != 2

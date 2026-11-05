@@ -11,7 +11,10 @@ import torch
 from vllm.v1.attention.backends.mla import flashmla_sparse as core
 from vllm_hcu.models.hy_v4 import attention, hcu_sparse
 from vllm_hcu.v1.attention.backends.mla import workspace_dedup, workspace_indices
-from vllm_hcu.v1.attention.backends.mla.flashmla_sparse import HcuFlashMLASparseBackend
+from vllm_hcu.v1.attention.backends.mla.flashmla_sparse import (
+    HcuFlashMLASparseBackend,
+    HcuFlashMLASparseImpl,
+)
 
 
 @pytest.fixture
@@ -190,6 +193,10 @@ def test_selected_hyv4_dedup_forward_preserves_sinks_and_decode(
     monkeypatch, sink_backend, decode, factor
 ):
     monkeypatch.setattr(core, "triton_convert_req_index_to_global_index", _map_indices)
+    monkeypatch.setitem(
+        HcuFlashMLASparseImpl._forward_fp8_kv_no_dedup.__globals__,
+        "triton_convert_req_index_to_global_index", _map_indices,
+    )
     monkeypatch.setattr(
         workspace_indices, "triton_convert_req_index_to_global_index", _map_indices
     )

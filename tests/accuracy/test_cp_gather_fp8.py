@@ -182,3 +182,60 @@ def test_existing_dedup_dispatch_is_preserved(monkeypatch):
         metadata = SimpleNamespace(hcu_workspace_dedup=plan)
         assert impl._forward_fp8_kv_separate_prefill_decode(
             None, None, None, metadata) == expected
+
+
+def _valid_gather_arguments():
+    return [
+        torch.zeros((1, 32, 656), dtype=torch.uint8, device="cuda:0"),
+        torch.empty((1, 576), dtype=torch.bfloat16, device="cuda:0"),
+        torch.zeros((1, 1), dtype=torch.int32, device="cuda:0"),
+        torch.ones((1,), dtype=torch.int32, device="cuda:0"),
+        torch.zeros((1,), dtype=torch.int32, device="cuda:0"),
+        1,
+    ]
+
+
+def _assert_native_rejection(monkeypatch, arguments):
+    import vllm_hcu.v1.attention.ops.cp_gather_fp8 as gather
+
+    monkeypatch.setenv("VLLM_HCU_ENABLE_TRITON_CP_GATHER", "1")
+    native = ops.cp_gather_and_upconvert_fp8_kv_cache
+    with pytest.raises(RuntimeError) as reference:
+        native(*arguments)
+    calls = []
+
+    def fallback(*values):
+        calls.append(values)
+        return native(*values)
+
+    class UnexpectedKernel:
+        def __getitem__(self, grid):
+            pytest.fail("invalid inputs reached the Triton kernel")
+
+    monkeypatch.setattr(ops, "cp_gather_and_upconvert_fp8_kv_cache", fallback)
+    monkeypatch.setattr(gather, "_cp_gather_fp8_flat", UnexpectedKernel())
+    with pytest.raises(type(reference.value)):
+        cp_gather_and_upconvert_fp8_kv_cache(*arguments)
+    assert len(calls) == 1
+    assert all(actual is expected
+               for actual, expected in zip(calls[0], arguments))
+
+
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="GPU required")
+@pytest.mark.parametrize("argument", [2, 3, 4],
+                         ids=["block_table", "seq_lens", "workspace_starts"])
+def test_cp_gather_invalid_metadata_dtype(monkeypatch, argument):
+    arguments = _valid_gather_arguments()
+    arguments[argument] = arguments[argument].to(torch.int64)
+    _assert_native_rejection(monkeypatch, arguments)
+
+
+@pytest.mark.multi_hcu
+@pytest.mark.hcu_count(2)
+@pytest.mark.skipif(torch.cuda.device_count() < 2, reason="two GPUs required")
+@pytest.mark.parametrize("argument", [1, 2, 3, 4],
+                         ids=["dst", "block_table", "seq_lens", "workspace_starts"])
+def test_cp_gather_rejects_mixed_devices(monkeypatch, argument):
+    arguments = _valid_gather_arguments()
+    arguments[argument] = arguments[argument].to("cuda:1")
+    _assert_native_rejection(monkeypatch, arguments)
