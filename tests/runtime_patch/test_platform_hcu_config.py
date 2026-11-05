@@ -882,6 +882,7 @@ def test_engine_args_preserves_platform_resolved_compile_factors() -> None:
                 fused_qwen3_rms_rope=False,
                 hcu_flash_attn_mode="varlen",
                 glm53_kda_cp_head_shard=True,
+                glm53_pcp_mtp_sync=True,
             ),
         )
         return config
@@ -894,6 +895,7 @@ def test_engine_args_preserves_platform_resolved_compile_factors() -> None:
     assert get_hcu_config(config).fused_qwen3_rms_rope is False
     assert get_hcu_config(config).hcu_flash_attn_mode == "varlen"
     assert get_hcu_config(config).glm53_kda_cp_head_shard is True
+    assert get_hcu_config(config).glm53_pcp_mtp_sync is True
 
 
 def test_engine_args_rejects_incompatible_target_signature() -> None:
@@ -1916,7 +1918,7 @@ def test_hcu_config_validation_binds_sidecar_without_upstream_fields() -> None:
     )
     config = _validation_config(feature_config)
     assert patch_vllm_config.validate_and_update_hcu_config(config) == (
-        feature_config.with_updates(glm53_kda_cp_head_shard=False)
+        feature_config.with_updates(glm53_kda_cp_head_shard=False, glm53_pcp_mtp_sync=False)
     )
     # CompilationConfig has no duplicate serialized sidecar; the process-local
     # binding is derived again from authoritative additional_config after IPC.
@@ -1945,7 +1947,7 @@ def test_compilation_binding_is_recreated_after_pickle(
     patch_vllm_config.validate_and_update_hcu_config(config)
     restored = pickle.loads(pickle.dumps(config))
     assert "_vllm_hcu_feature_config" not in vars(restored.compilation_config)
-    expected = feature_config.with_updates(glm53_kda_cp_head_shard=False)
+    expected = feature_config.with_updates(glm53_kda_cp_head_shard=False, glm53_pcp_mtp_sync=False)
     assert get_hcu_config(restored) == expected
     assert patch_vllm_config.validate_and_update_hcu_config(restored) == expected
 
@@ -3048,7 +3050,8 @@ def test_cutlass_block_first_mooncake_defers_to_worker_capability_gates() -> Non
     )
 
     assert patch_vllm_config.validate_and_update_hcu_config(config) == (
-        HcuFeatureConfig(hcu_flash_attn_mode="cutlass", glm53_kda_cp_head_shard=False)
+        HcuFeatureConfig(hcu_flash_attn_mode="cutlass", glm53_kda_cp_head_shard=False,
+                         glm53_pcp_mtp_sync=False)
     )
 
 
@@ -3188,7 +3191,7 @@ def test_engine_args_skip_list_covers_every_master_resolved_field():
     """The create-engine-config retainment check must skip exactly the
     fields the platform hook re-resolves from the environment
     (validate_and_update_hcu_config's updates dict, minus the env
-    hcu_flash_attn_mode and glm53_kda_cp_head_shard which are skipped
+    hcu_flash_attn_mode, glm53_kda_cp_head_shard and glm53_pcp_mtp_sync which are skipped
     conditionally while unresolved). A new
     master-gated field added to the updates dict without joining this
     skip list rejects every launch that flips it (f6399dc follow-up:
@@ -3217,16 +3220,18 @@ def test_engine_args_skip_list_covers_every_master_resolved_field():
         "qwen4_exp_hc_sp",
         "k3_sp_moe",
         "glm53_kda_cp_head_shard",
+        "glm53_pcp_mtp_sync",
         "dp_int8_allgather",
     }
-    assert skip_list == persisted - {"glm53_kda_cp_head_shard"}
+    assert skip_list == persisted - {"glm53_kda_cp_head_shard", "glm53_pcp_mtp_sync"}
 
 
-def _glm53_head_hash_config(pcp=8):
+def _glm53_head_hash_config(pcp=8, speculative=False):
     from tests.runtime_patch.test_glm52_pcp_config import _make_pcp_config
 
     config = _make_pcp_config(
         architecture="Glm5NextForCausalLM", pcp=pcp, tp=1, hybrid=True,
+        speculative=speculative,
     )
     config.additional_config = {"hcu": HcuFeatureConfig().to_dict()}
     config.compilation_config = _ValidationCompilation()
@@ -3261,17 +3266,19 @@ def test_glm53_kda_cp_head_mode_partitions_compilation_hash(monkeypatch):
     "Glm5NextForCausalLM", "Glm5NextForConditionalGeneration",
 ])
 @pytest.mark.parametrize("enabled", [False, True])
+@pytest.mark.parametrize("sync_enabled", [False, True])
 @pytest.mark.parametrize("draft_pcp", [1, 2, 8])
 @pytest.mark.parametrize("worker_env", [None, "0", "invalid"])
 def test_glm53_mtp_validation_does_not_mutate_target_head_mode(
-    monkeypatch, architecture, enabled, draft_pcp, worker_env,
+    monkeypatch, architecture, enabled, sync_enabled, draft_pcp, worker_env,
 ):
     from vllm_hcu.v1.glm53_kda_cp_config import (
         KDA_CP_HEAD_ENV, kda_cp_head_size,
     )
 
     monkeypatch.setenv(KDA_CP_HEAD_ENV, str(int(enabled)))
-    target = _glm53_head_hash_config()
+    monkeypatch.setenv("VLLM_HCU_GLM53_PCP_MTP_SYNC", str(int(sync_enabled)))
+    target = _glm53_head_hash_config(speculative=True)
     target.model_config.architectures = [architecture]
     unrelated = {"keep": True}
     target.additional_config["unrelated"] = unrelated
@@ -3295,12 +3302,16 @@ def test_glm53_mtp_validation_does_not_mutate_target_head_mode(
     assert draft.additional_config is target_additional
     if worker_env is None:
         monkeypatch.delenv(KDA_CP_HEAD_ENV)
+        monkeypatch.delenv("VLLM_HCU_GLM53_PCP_MTP_SYNC")
     else:
         monkeypatch.setenv(KDA_CP_HEAD_ENV, worker_env)
+        monkeypatch.setenv("VLLM_HCU_GLM53_PCP_MTP_SYNC", worker_env)
 
     for _ in range(2):
         feature = patch_vllm_config.validate_and_update_hcu_config(draft)
         assert feature.glm53_kda_cp_head_shard is False
+        assert feature.glm53_pcp_mtp_sync is False
+        assert get_hcu_config(target).glm53_pcp_mtp_sync is sync_enabled
         assert get_hcu_config(target).glm53_kda_cp_head_shard is enabled
         assert target.additional_config is target_additional
         assert target_additional["hcu"] is target_hcu_payload
@@ -3315,9 +3326,11 @@ def test_glm53_mtp_validation_does_not_mutate_target_head_mode(
     # draft's effective False or a missing/opposite/invalid worker env value.
     patch_vllm_config.validate_and_update_hcu_config(target)
     assert get_hcu_config(target).glm53_kda_cp_head_shard is enabled
+    assert get_hcu_config(target).glm53_pcp_mtp_sync is sync_enabled
     assert _vllm_hash(target.additional_config) == target_hash
     assert kda_cp_head_size(target) == target_head_size
     assert get_hcu_config(draft).glm53_kda_cp_head_shard is False
+    assert get_hcu_config(draft).glm53_pcp_mtp_sync is False
 
 
 @pytest.mark.parametrize("pcp", [1, 8])
@@ -3405,3 +3418,65 @@ def test_glm53_kda_cp_head_unresolved_config_rejects_invalid_env(monkeypatch):
     monkeypatch.setenv("VLLM_HCU_GLM53_KDA_CP_HEAD_SHARD", "true")
     with pytest.raises(ValueError, match="must be 0 or 1"):
         patch_vllm_config.validate_and_update_hcu_config(_glm53_head_hash_config())
+
+
+@pytest.mark.parametrize("head_enabled", ["0", "1"])
+@pytest.mark.parametrize("launch_value, expected", [(None, True), ("0", False), ("1", True)])
+def test_glm53_mtp_sync_resolves_once_independently_of_heads(
+    monkeypatch, head_enabled, launch_value, expected,
+):
+    variable = "VLLM_HCU_GLM53_PCP_MTP_SYNC"
+    monkeypatch.setenv("VLLM_HCU_GLM53_KDA_CP_HEAD_SHARD", head_enabled)
+    if launch_value is None:
+        monkeypatch.delenv(variable, raising=False)
+    else:
+        monkeypatch.setenv(variable, launch_value)
+    config = _glm53_head_hash_config(speculative=True)
+    feature = patch_vllm_config.validate_and_update_hcu_config(config)
+    assert feature.glm53_pcp_mtp_sync is expected
+    frozen_hash = _vllm_hash(config.additional_config)
+    for serialization in (json, pickle):
+        worker = copy.copy(config)
+        worker.additional_config = serialization.loads(serialization.dumps(config.additional_config))
+        for worker_value in (None, "0", "1", "invalid"):
+            if worker_value is None:
+                monkeypatch.delenv(variable, raising=False)
+            else:
+                monkeypatch.setenv(variable, worker_value)
+            assert patch_vllm_config.validate_and_update_hcu_config(worker).glm53_pcp_mtp_sync is expected
+            assert _vllm_hash(worker.additional_config) == frozen_hash
+
+
+@pytest.mark.parametrize("scope", ["pcp1", "unrelated", "no_mtp", "draft"])
+def test_glm53_mtp_sync_ineffective_scope_ignores_local_environment(monkeypatch, scope):
+    monkeypatch.setenv("VLLM_HCU_GLM53_PCP_MTP_SYNC", "invalid")
+    config = _glm53_head_hash_config(pcp=1 if scope == "pcp1" else 8,
+                                    speculative=(scope != "no_mtp"))
+    if scope == "unrelated":
+        config = _validation_config(HcuFeatureConfig())
+    elif scope == "draft":
+        config.model_config.architectures = ["Glm5NextMTPModel"]
+    assert patch_vllm_config.validate_and_update_hcu_config(config).glm53_pcp_mtp_sync is False
+
+
+@pytest.mark.parametrize("value", ["true", "", "2"])
+def test_glm53_mtp_sync_unresolved_config_rejects_invalid_launch_env(monkeypatch, value):
+    monkeypatch.setenv("VLLM_HCU_GLM53_PCP_MTP_SYNC", value)
+    with pytest.raises(ValueError, match="VLLM_HCU_GLM53_PCP_MTP_SYNC must be 0 or 1"):
+        patch_vllm_config.validate_and_update_hcu_config(_glm53_head_hash_config(speculative=True))
+
+
+@pytest.mark.parametrize("value", ["1", 1, "true", 0])
+def test_glm53_mtp_sync_sidecar_rejects_non_boolean(value):
+    with pytest.raises(TypeError, match="glm53_pcp_mtp_sync.*bool or None"):
+        HcuFeatureConfig.from_mapping({"glm53_pcp_mtp_sync": value})
+
+
+def test_glm53_mtp_sync_mode_partitions_compilation_hash(monkeypatch):
+    hashes = []
+    for mode in ("0", "1", "0"):
+        monkeypatch.setenv("VLLM_HCU_GLM53_PCP_MTP_SYNC", mode)
+        config = _glm53_head_hash_config(speculative=True)
+        patch_vllm_config.validate_and_update_hcu_config(config)
+        hashes.append(_vllm_hash(config.additional_config))
+    assert hashes[0] == hashes[2] != hashes[1]

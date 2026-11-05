@@ -2,6 +2,8 @@
 import ast
 import copy
 import importlib.util
+import json
+import pickle
 from pathlib import Path
 import sys
 from types import ModuleType, SimpleNamespace
@@ -22,10 +24,14 @@ class FakeGroup:
         self.wire = wire
         self.leader = leader
         self.calls = 0
+        self.world_size = 2
+        self.rank_in_group = 0 if leader else 1
+        self.sequence = []
 
     def broadcast(self, tensor, src):
         assert src == 0
         self.calls += 1
+        self.sequence.append((tuple(tensor.shape), tensor.dtype, src))
         if self.leader:
             self.wire.append(tensor.clone())
             return tensor
@@ -157,6 +163,118 @@ def test_runner_initialization_keeps_glm53_sync_and_step5_dbo_independent(
     if is_step5 and ubatch_state == "present":
         expected.append("step5_dbo")
     assert calls == expected
+
+
+@pytest.mark.parametrize("enabled", [False, True])
+@pytest.mark.parametrize("head_enabled", ["0", "1"])
+@pytest.mark.parametrize("serialization", [json, pickle], ids=["json", "pickle"])
+@pytest.mark.parametrize("worker_environments", [("0", "1"), (None, "0"), ("invalid", "1")])
+def test_serialized_policy_keeps_pcp_workers_collective_sequence_equal(
+    monkeypatch, enabled, head_enabled, serialization, worker_environments,
+):
+    from vllm import distributed
+    from test_platform_hcu_config import _glm53_head_hash_config
+    from vllm_hcu.patch.platform.core_fix.patch_vllm_config import validate_and_update_hcu_config
+
+    variable = "VLLM_HCU_GLM53_PCP_MTP_SYNC"
+    monkeypatch.setenv(variable, str(int(enabled)))
+    monkeypatch.setenv("VLLM_HCU_GLM53_KDA_CP_HEAD_SHARD", head_enabled)
+    engine = _glm53_head_hash_config(pcp=2, speculative=True)
+    validate_and_update_hcu_config(engine)
+    wire = []
+    groups = [FakeGroup(wire, rank == 0) for rank in range(2)]
+    runners = []
+    installed = []
+    group_lookups = []
+    monkeypatch.setattr(sync, "_in_replicated_mtp_batch", lambda: True)
+    for rank, worker_value in enumerate(worker_environments):
+        worker = copy.copy(engine)
+        worker.additional_config = serialization.loads(serialization.dumps(engine.additional_config))
+        if worker_value is None:
+            monkeypatch.delenv(variable, raising=False)
+        else:
+            monkeypatch.setenv(variable, worker_value)
+        validate_and_update_hcu_config(worker)
+        group = groups[rank]
+
+        def get_group():
+            group_lookups.append(rank)
+            return group
+
+        monkeypatch.setattr(distributed, "get_pcp_group", get_group)
+        increment = 1 if rank == 0 else 9
+        runner = SimpleNamespace(vllm_config=worker, speculator=SimpleNamespace(
+            sample_draft=lambda tokens, step=increment: tokens + step,
+        ))
+        installed.append(sync.install_glm53_pcp_mtp_sync(runner))
+        runners.append(runner)
+    assert installed == [enabled, enabled]
+    assert group_lookups == ([0, 1] if enabled else [])
+
+    drafts = [torch.tensor([10, 20], dtype=torch.int64) for _ in range(2)]
+    for _ in range(3):
+        for rank, runner in enumerate(runners):
+            drafts[rank] = runner.speculator.sample_draft(drafts[rank])
+        if enabled:
+            torch.testing.assert_close(drafts[0], drafts[1])
+    decisions = [output([[1, 2, 3]], [2], [1]), output([[9, 9, 9]], [3], [0])]
+    for runner, decision in zip(runners, decisions):
+        sync.sync_glm53_pcp_sampler_output(runner, decision)
+    assert [group.calls for group in groups] == ([4, 4] if enabled else [0, 0])
+    assert groups[0].sequence == groups[1].sequence
+    assert wire == []
+    if enabled:
+        for leader_tensor, follower_tensor in zip(
+            (decisions[0][0].sampled_token_ids, *decisions[0][1:]),
+            (decisions[1][0].sampled_token_ids, *decisions[1][1:]),
+        ):
+            torch.testing.assert_close(leader_tensor, follower_tensor)
+    else:
+        assert drafts[0].tolist() != drafts[1].tolist()
+
+
+@pytest.mark.parametrize("worker_value", [None, "0", "1", "invalid"])
+def test_eligible_worker_rejects_unresolved_sync_policy_before_group_lookup(monkeypatch, worker_value):
+    from vllm import distributed
+    from test_platform_hcu_config import _glm53_head_hash_config
+
+    variable = "VLLM_HCU_GLM53_PCP_MTP_SYNC"
+    if worker_value is None:
+        monkeypatch.delenv(variable, raising=False)
+    else:
+        monkeypatch.setenv(variable, worker_value)
+
+    def unexpected_group():
+        raise AssertionError("unresolved policy must fail before collective group lookup")
+
+    monkeypatch.setattr(distributed, "get_pcp_group", unexpected_group)
+    runner = SimpleNamespace(vllm_config=_glm53_head_hash_config(pcp=2, speculative=True),
+                             speculator=SimpleNamespace(sample_draft=lambda: None))
+    with pytest.raises(RuntimeError, match="sync policy is unresolved"):
+        sync.install_glm53_pcp_mtp_sync(runner)
+
+
+@pytest.mark.parametrize("scope", ["tp2_pcp1", "unrelated", "no_mtp", "no_speculator"])
+def test_ineligible_workers_keep_native_path_without_group_lookup(monkeypatch, scope):
+    from vllm import distributed
+    from test_platform_hcu_config import _glm53_head_hash_config
+
+    monkeypatch.setenv("VLLM_HCU_GLM53_PCP_MTP_SYNC", "invalid")
+    config = _glm53_head_hash_config(pcp=1 if scope == "tp2_pcp1" else 2,
+                                    speculative=(scope != "no_mtp"))
+    if scope == "tp2_pcp1":
+        config.parallel_config.tensor_parallel_size = 2
+    elif scope == "unrelated":
+        config.model_config.architectures = ["OtherModel"]
+
+    def unexpected_group():
+        raise AssertionError("ineligible path must not acquire the PCP group")
+
+    monkeypatch.setattr(distributed, "get_pcp_group", unexpected_group)
+    speculator = None if scope == "no_speculator" else SimpleNamespace(sample_draft=lambda: None)
+    assert sync.install_glm53_pcp_mtp_sync(SimpleNamespace(
+        vllm_config=config, speculator=speculator,
+    )) is False
 
 
 if __name__=="__main__":

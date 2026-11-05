@@ -7,7 +7,6 @@ GPU correctness and end-to-end acceptance must be tested before release.
 from __future__ import annotations
 
 import functools
-import os
 
 import torch
 
@@ -50,6 +49,7 @@ def _install_draft_sync(speculator, group):
 
 
 def install_glm53_pcp_mtp_sync(runner) -> bool:
+    from vllm_hcu.patch.config import get_hcu_config
     from vllm_hcu.patch.platform.core_fix.patch_vllm_config import is_glm53_pcp
 
     config = runner.vllm_config
@@ -60,10 +60,14 @@ def install_glm53_pcp_mtp_sync(runner) -> bool:
         return False
     if config.parallel_config.prefill_context_parallel_size <= 1:
         return False
-    flag = os.environ.get("VLLM_HCU_GLM53_PCP_MTP_SYNC", "1")
-    if flag not in ("0", "1"):
-        raise ValueError("VLLM_HCU_GLM53_PCP_MTP_SYNC must be 0 or 1")
-    if flag == "0":
+    flag = get_hcu_config(config).glm53_pcp_mtp_sync
+    if flag is None:
+        raise RuntimeError(
+            "GLM53 PCP MTP sync policy is unresolved; platform validation "
+            "must freeze additional_config['hcu']['glm53_pcp_mtp_sync'] "
+            "before worker initialization"
+        )
+    if not flag:
         return False
     # Keep this first fix within the diagnosed execution contract. In
     # particular, greedy-token broadcast alone is insufficient when each rank

@@ -43,6 +43,29 @@ With PCP1, native TP construction and state sizing are retained even if this
 switch is set to `1`; this does not assert that every native TP configuration
 has been qualified on the current runtime.
 
+### MTP decision-sync policy
+
+`VLLM_HCU_GLM53_PCP_MTP_SYNC` defaults to `1` for the GLM5Next target with
+PCP>1 and built-in MTP, independently of the Head switch. Set it in the engine
+launch environment before startup; `0` disables the diagnosed synchronization
+fix for controlled comparisons. Only `0` and `1` are accepted.
+
+Platform validation resolves it once into
+`additional_config["hcu"]["glm53_pcp_mtp_sync"]`. `None` means unresolved;
+the serialized boolean is authoritative on every worker, including after
+JSON/pickle transport and worker config revalidation. Missing, opposite or
+invalid worker-local environment values cannot change collective participation.
+An eligible worker with an unresolved policy fails before group acquisition,
+rather than falling back to its local environment. Change the launch setting
+only with a fresh engine config and a complete service restart.
+
+PCP1, unrelated models and non-MTP configurations resolve to `False` and keep
+their original paths. The built-in MTP draft config also resolves to `False`
+without changing the target's frozen policy; sync is installed on the target
+runner's speculator. Enabled sync still requires eager execution, greedy draft
+sampling and non-adaptive verification. This change adds no new per-token
+collectives and does not establish multi-HCU accuracy or prefix-cache parity.
+
 With PCP>1, the head group size comes from `prefill_context_parallel_size`.
 It must divide the positive KDA head count. PCP execution currently requires
 **PP1 and DCP1**, with either Head switch value. PP stages need separate

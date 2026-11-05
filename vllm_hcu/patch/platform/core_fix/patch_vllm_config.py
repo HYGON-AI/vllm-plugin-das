@@ -577,6 +577,21 @@ def _validate_dspark_pd_scope(vllm_config: object) -> None:
     )
 
 
+def _resolve_glm53_pcp_mtp_sync(
+    vllm_config: object, feature_config: HcuFeatureConfig,
+) -> bool:
+    """Resolve collective participation once, then retain the serialized policy."""
+    spec = getattr(vllm_config, "speculative_config", None)
+    if not is_glm53_pcp(vllm_config) or getattr(spec, "method", None) != "mtp":
+        return False
+    if feature_config.glm53_pcp_mtp_sync is not None:
+        return feature_config.glm53_pcp_mtp_sync
+    value = os.environ.get("VLLM_HCU_GLM53_PCP_MTP_SYNC", "1")
+    if value not in ("0", "1"):
+        raise ValueError("VLLM_HCU_GLM53_PCP_MTP_SYNC must be 0 or 1")
+    return value == "1"
+
+
 def validate_and_update_hcu_config(vllm_config: object) -> HcuFeatureConfig:
     """Validate cross-config invariants and bind the compilation adapter."""
 
@@ -617,6 +632,11 @@ def validate_and_update_hcu_config(vllm_config: object) -> HcuFeatureConfig:
             glm53_kda_cp_head_shard_enabled(vllm_config)
             if is_glm53_pcp(vllm_config) else False
         ),
+        # Collective participation must be identical on every PCP worker.
+        # Never resolve this policy again from a worker-local environment.
+        "glm53_pcp_mtp_sync": _resolve_glm53_pcp_mtp_sync(
+            vllm_config, feature_config,
+        ),
         "dp_int8_allgather": hcu_envs.dp_int8_allgather_enabled(),
     }
     if feature_config.hcu_flash_attn_mode is None:
@@ -628,8 +648,8 @@ def validate_and_update_hcu_config(vllm_config: object) -> HcuFeatureConfig:
         getattr(vllm_config, "model_config", None), "architectures", None,
     ) == ["Glm5NextMTPModel"]:
         # Native with_hf_config()/replace() shares the target's additional_config.
-        # The draft's effective Head mode is False; do not write it back into
-        # the target after its mode/hash and KDA shapes have been finalized.
+        # The draft's effective Head/sampler-sync modes are False; do not write
+        # them back into the target after its mode/hash and shapes are frozen.
         # Copy the outer mapping only: set_hcu_config replaces the whole HCU
         # payload, while unrelated values retain their existing identities.
         # This also applies if the draft uses PCP1 and the target uses PCP>1.

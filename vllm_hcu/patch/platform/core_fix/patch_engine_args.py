@@ -676,7 +676,10 @@ def apply_to_module(module: ModuleType) -> bool:
                 "k3_sp_moe",
                 "dp_int8_allgather",
             ) or (
-                name in ("hcu_flash_attn_mode", "glm53_kda_cp_head_shard")
+                name in (
+                    "hcu_flash_attn_mode", "glm53_kda_cp_head_shard",
+                    "glm53_pcp_mtp_sync",
+                )
                 and expected is None
             ):
                 continue
