@@ -174,3 +174,21 @@ def test_draft_graphs_cover_target_request_buckets_without_mutating_config(draft
     assert new.vllm_config is not config
     assert compilation.cudagraph_capture_sizes == [8, 16, 32, 64, 128]
     assert compilation.max_cudagraph_capture_size == 128
+
+
+@pytest.mark.parametrize("deepep_auto", [False, True])
+def test_pcp_piecewise_request_never_upgrades_to_full(deepep_auto):
+    from vllm_hcu.patch.config import HcuFeatureConfig
+    config = _make_pcp_config(
+        architecture="DeepseekV4ForCausalLM", tp=1, pcp=8,
+        speculative=True, speculative_method="dspark",
+        num_speculative_tokens=5, enforce_eager=False,
+        all2all_backend="deepep_low_latency",
+    )
+    config.additional_config = {"hcu": HcuFeatureConfig(deepep_auto=deepep_auto).to_dict()}
+    config.compilation_config = SimpleNamespace(
+        cudagraph_mode=CUDAGraphMode.PIECEWISE, mode=CompilationMode.VLLM_COMPILE,
+    )
+    with pytest.raises(ValueError, match="PIECEWISE"):
+        _validate_hcu_pcp_scope(config)
+    assert config.compilation_config.cudagraph_mode is CUDAGraphMode.PIECEWISE

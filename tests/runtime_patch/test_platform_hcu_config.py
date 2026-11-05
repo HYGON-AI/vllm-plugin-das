@@ -2498,6 +2498,7 @@ def test_sparse_cache_normalization_tolerates_missing_attention_config(
 
 
 @pytest.mark.parametrize("dspark", [False, True])
+@pytest.mark.parametrize("piecewise", [False, True])
 @pytest.mark.parametrize(
     "parallel_dimension",
     ["prefill_context_parallel_size", "decode_context_parallel_size"],
@@ -2506,6 +2507,7 @@ def test_deepep_auto_platform_final_graph_policy_scopes_pcp_dspark(
     monkeypatch: pytest.MonkeyPatch,
     parallel_dimension: str,
     dspark: bool,
+    piecewise: bool,
 ) -> None:
     from vllm.config.compilation import CUDAGraphMode
     from vllm_hcu.patch.import_coordinator import IMPORT_COORDINATOR
@@ -2551,7 +2553,9 @@ def test_deepep_auto_platform_final_graph_policy_scopes_pcp_dspark(
     config.parallel_config.worker_cls = "custom"
     config.parallel_config.distributed_executor_backend = "uni"
     setattr(config.parallel_config, parallel_dimension, 2)
-    config.compilation_config.cudagraph_mode = CUDAGraphMode.FULL_DECODE_ONLY
+    config.compilation_config.cudagraph_mode = (
+        CUDAGraphMode.PIECEWISE if piecewise else CUDAGraphMode.FULL_DECODE_ONLY
+    )
 
     monkeypatch.setattr(IMPORT_COORDINATOR, "drain_ready_callbacks", lambda: None)
     monkeypatch.setattr(
@@ -2560,6 +2564,11 @@ def test_deepep_auto_platform_final_graph_policy_scopes_pcp_dspark(
         lambda _vllm_config: None,
     )
 
+    if piecewise and dspark and parallel_dimension == "prefill_context_parallel_size":
+        with pytest.raises(ValueError, match="PIECEWISE"):
+            HCUPlatform.check_and_update_config(config)
+        assert config.compilation_config.cudagraph_mode is CUDAGraphMode.PIECEWISE
+        return
     HCUPlatform.check_and_update_config(config)
 
     expected = (CUDAGraphMode.FULL_DECODE_ONLY

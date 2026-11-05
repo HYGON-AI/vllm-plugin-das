@@ -425,7 +425,12 @@ def _require_mrv2_pcp_contract(vllm_config: object) -> None:
         from vllm.config.compilation import CompilationMode, CUDAGraphMode
 
         compilation = vllm_config.compilation_config
-        if compilation.cudagraph_mode != CUDAGraphMode.NONE:
+        if compilation.cudagraph_mode == CUDAGraphMode.PIECEWISE:
+            raise ValueError(
+                "DeepSeek V4 PCP+DSpark does not support PIECEWISE CUDA graphs; "
+                "use NONE or a mode that explicitly permits full decode graphs."
+            )
+        if compilation.cudagraph_mode.has_full_cudagraphs():
             compilation.cudagraph_mode = CUDAGraphMode.FULL_DECODE_ONLY
             compilation.mode = CompilationMode.NONE
     speculative_config = _require_hcu_pcp_attribute(
