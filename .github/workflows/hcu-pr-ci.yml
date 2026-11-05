@@ -16,8 +16,10 @@ concurrency:
   group: hcu-pr-${{ github.event.pull_request.number }}
   cancel-in-progress: true
 
+# Fork pull_request workflows cannot read repository variables.
+# Keep the fallback on the v0.28.1 release line.
 env:
-  HCU_CI_IMAGE: ${{ vars.HCU_CI_IMAGE_V0281 }}
+  HCU_CI_IMAGE: ${{ vars.HCU_CI_IMAGE_V0281 || '10.16.1.152:5000/jenkins/model_test_env/vllm:0.28.1rc1-latest' }}
 
 jobs:
   static-and-select:
@@ -112,7 +114,7 @@ jobs:
         id: release-environment
         env:
           BASE_REF: ${{ github.event.pull_request.base.ref }}
-          HCU_CI_IMAGE_V0281: ${{ vars.HCU_CI_IMAGE_V0281 }}
+          HCU_CI_IMAGE_V0281: ${{ vars.HCU_CI_IMAGE_V0281 || '10.16.1.152:5000/jenkins/model_test_env/vllm:0.28.1rc1-latest' }}
         run: |
           set -euo pipefail
           if [[ "$BASE_REF" != "v0.28.1-dev" ]]; then
@@ -158,6 +160,8 @@ jobs:
           bash "$RUNNER_TEMP/hcu-ci-scripts/hcu_ci_run_control_container.sh" -- bash -lc '
             set -euo pipefail
             python3 --version
+            export PATH="$HOME/.local/bin:$PATH"
+            python3 .github/scripts/hcu_ci/ensure_ci_dependencies.py --user
             git config --global --add safe.directory "$GITHUB_WORKSPACE"
             python3 .github/scripts/hcu_ci/hcu_ci_preflight.py \
               --environment-lock "${{ steps.release-environment.outputs.environment_lock }}" \

@@ -300,3 +300,14 @@ def test_custom_allreduce_finalizer_does_not_access_cleared_torch_global(
     communicator._ptr = 0
     communicator.meta_ptrs = []
     communicator.buffer_ptrs = []
+
+
+def test_gpu_worker_shutdown_releases_megamoe_before_distributed_teardown(monkeypatch):
+    module, worker_class = _fake_gpu_worker_module()
+    patch_gpu_worker_shutdown.apply_to_module(module)
+    worker = _worker(worker_class, raise_probe=False)
+    runtime = _module("vllm_hcu.model_executor.layers.fused_moe.megamoe_runtime",
+                      release_buffers=lambda: worker.events.append("megamoe-release"))
+    monkeypatch.setitem(sys.modules, runtime.__name__, runtime)
+    assert worker.shutdown() == "target-result"
+    assert worker.events == ["megamoe-release", "target-start"]

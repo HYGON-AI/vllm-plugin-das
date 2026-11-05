@@ -132,7 +132,7 @@ jobs:
               `Hardware: ${process.env.HARDWARE_RESULT}`,
               `Quarantine retest: ${process.env.QUARANTINE_RESULT}`,
               '',
-              'Logs remain on each self-hosted runner under /tmp/vllm-hcu-ci/<run-id>/<attempt>/<job-id>. See each job summary for the exact runner and path.',
+              'Logs and reports are uploaded as workflow artifacts on the linked run.',
             ].join('\n');
             const issues = await github.paginate(github.rest.issues.listForRepo, {
               owner: context.repo.owner,

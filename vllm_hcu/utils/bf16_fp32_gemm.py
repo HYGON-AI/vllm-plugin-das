@@ -15,9 +15,20 @@ import torch
 from vllm.logger import init_logger
 from vllm.utils.torch_utils import direct_register_custom_op
 
+from vllm_hcu.platforms import envs as henvs
+from vllm_hcu.utils import bf16_fp32_mmac
+
 logger = init_logger(__name__)
 
 _HIPBLASLT_DISABLED = False
+_MMAC_DISABLED = False
+
+
+def _mmac_enabled() -> bool:
+    return henvs.optional_custom_op_enabled(
+        os.environ.get("VLLM_HCU_BF16_FP32_MMAC", "1").lower()
+        in ("1", "true")
+    )
 
 
 @functools.lru_cache(maxsize=1)
@@ -143,7 +154,7 @@ def linear_bf16_fp32(x: torch.Tensor, weight: torch.Tensor) -> torch.Tensor:
     ``VLLM_USE_LINEAR_BF16_FP32_USE_BLASLT`` is enabled. Other cases fall back
     to PyTorch's native matmul.
     """
-    global _HIPBLASLT_DISABLED
+    global _HIPBLASLT_DISABLED, _MMAC_DISABLED
 
     # HCU VLLM_USE_NN stores non-quantized linear weights as [in_features,
     # out_features]. The upstream helper assumes [out_features, in_features].
@@ -178,6 +189,20 @@ def linear_bf16_fp32(x: torch.Tensor, weight: torch.Tensor) -> torch.Tensor:
 
     if fallback_reason is not None:
         return torch.mm(x, weight.T, out_dtype=torch.float32)
+
+    if not _MMAC_DISABLED and _mmac_enabled() and bf16_fp32_mmac.supported(
+        x, weight
+    ):
+        # Decode-sized M: hipBLASLt picks a 256x256 tile here (~135us/call).
+        try:
+            return bf16_fp32_mmac.linear_bf16_fp32_mmac(x, weight)
+        except Exception as e:
+            _MMAC_DISABLED = True
+            logger.warning_once(
+                "Failed to use HCU MMAC BF16->FP32 GEMM; falling back to "
+                "hipblasLt: %s",
+                e,
+            )
 
     try:
         return _jit_hipblaslt_bf16_fp32().linear_bf16_fp32(x, weight)

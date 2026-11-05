@@ -2,8 +2,8 @@
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 # SPDX-FileCopyrightText: Copyright (c) 2026 Hygon Information Technology Co., Ltd.
 # Step-4 DSA Triton kernels from the generated reference release.
-# The migration keeps numerical function bodies unchanged. Imports are
-# plugin-owned where needed, and duplicate top-level imports were removed.
+# The base migration preserves the reference bodies; subsequent Step5 indexer
+# and resident-selection optimizations are tracked in step5_runtime_integration.md.
 # Review changes to numerical kernels against the reference parity harness.
 
 """Generated Step-4 minimal inference kernel.py; do not edit by hand.
@@ -47,6 +47,7 @@ layouts. Producer and consumer are both in this file, so the layout is ours to p
 import torch
 import triton
 import triton.language as tl
+from vllm_hcu.platforms import envs as henvs
 
 # Step-4 compresses every 8 consecutive tokens into one summary vector. The CuTe kernels
 # hard-specialize on this; we keep it a parameter but never exercise anything else.
@@ -811,6 +812,143 @@ def indexer_logits(
     return out
 
 
+@triton.jit
+def _prefill_indexer_logits_kernel(
+    index_q_ptr,
+    index_k_ptr,
+    weights_ptr,
+    out_ptr,
+    seq_q,
+    seq_k,
+    first_position,
+    stride_q_token,
+    stride_q_group,
+    stride_q_head,
+    stride_k_token,
+    stride_w_token,
+    stride_w_group,
+    stride_out_row,
+    rows_per_group,
+    region_size: tl.constexpr,
+    heads_per_group: tl.constexpr,
+    proxy_dim: tl.constexpr,
+    BLOCK_Q: tl.constexpr,
+    BLOCK_K: tl.constexpr,
+) -> None:
+    """``_indexer_logits_kernel`` for one prefill request, causal and in fp8.
+
+    Two differences, both only on the prefill path:
+
+    * Causal tile skip. Query ``i`` sits at ``first_position + i`` and can only see
+      regions ``< (first_position + i) // region_size``, so key tiles past the
+      block's last visible region are never read by the selector and are not
+      computed (or written). On a fresh 32K chunk that is half the rectangle.
+    * fp8 x fp8 MFMA. ``index_q`` is already e4m3-valued (``q_prerounded``) and the
+      keys come straight from the e4m3 summary pool, so feeding them to ``tl.dot``
+      as fp8 is lossless on the inputs; only the fp32 accumulation order inside
+      the dot differs from the bf16 path (~1e-5 relative), as in the decode
+      scorer. The per-head ReLU-weighted sum keeps the same order.
+    """
+    q_block = tl.program_id(0)
+    k_block = tl.program_id(1)
+    group = tl.program_id(2)
+    # Causal: the block's last query sees regions [0, (pos_last) // region_size).
+    last = tl.minimum(q_block * BLOCK_Q + BLOCK_Q, seq_q) - 1
+    widest = tl.minimum((first_position + last) // region_size, seq_k)
+    if k_block * BLOCK_K >= widest:
+        return
+
+    queries = q_block * BLOCK_Q + tl.arange(0, BLOCK_Q)
+    keys = k_block * BLOCK_K + tl.arange(0, BLOCK_K)
+    dims = tl.arange(0, proxy_dim)
+    query_ok = queries < seq_q
+    key_ok = keys < widest
+
+    key_tile = tl.load(
+        index_k_ptr + dims[:, None] + keys[None, :] * stride_k_token,
+        mask=key_ok[None, :],
+        other=0.0,
+    )
+    accumulator = tl.zeros((BLOCK_Q, BLOCK_K), dtype=tl.float32)
+    for head in tl.static_range(heads_per_group):
+        query_tile = tl.load(
+            index_q_ptr + queries[:, None] * stride_q_token + group * stride_q_group
+            + head * stride_q_head + dims[None, :],
+            mask=query_ok[:, None],
+            other=0.0,
+        )
+        head_weight = tl.load(
+            weights_ptr + queries * stride_w_token + group * stride_w_group + head,
+            mask=query_ok,
+            other=0.0,
+        ).to(tl.float32)
+        scores = tl.dot(query_tile, key_tile, out_dtype=tl.float32)
+        accumulator += tl.maximum(scores, 0.0) * head_weight[:, None]
+
+    rows = group * rows_per_group + queries
+    tl.store(
+        out_ptr + rows[:, None] * stride_out_row + keys[None, :],
+        accumulator,
+        mask=query_ok[:, None] & key_ok[None, :],
+    )
+
+
+def prefill_indexer_logits(
+    index_q: torch.Tensor,
+    weights: torch.Tensor,
+    index_k: torch.Tensor,
+    *,
+    first_position: int,
+    region_size: int = REGION_BLOCK_SIZE,
+    out: torch.Tensor,
+    out_row_base: int = 0,
+    out_group_stride: int | None = None,
+    block_q: int = 128,
+    block_k: int = 128,
+    num_warps: int = 4,
+    num_stages: int = 1,
+) -> torch.Tensor:
+    """Causal fp8 indexer scores for one prefill request; see the kernel docstring.
+
+    ``index_q`` ``[seq_q, groups, heads, proxy_dim]`` and ``index_k``
+    ``[seq_k, 1, proxy_dim]`` must both be ``float8_e4m3fn``. Row/column layout of
+    ``out`` is as in :func:`indexer_logits`, except that columns at or past a row's
+    causal horizon may be left unwritten (32K chunk: 6.95 -> 0.86 ms fresh,
+    13.7 -> 2.4 ms with a 32K prefix).
+    """
+    if index_q.dtype != torch.float8_e4m3fn or index_k.dtype != torch.float8_e4m3fn:
+        raise ValueError(f"expected e4m3 q/k, got {index_q.dtype}/{index_k.dtype}")
+    if index_q.ndim != 4 or index_k.ndim != 3 or index_k.shape[1] != 1:
+        raise ValueError("expected q [tokens, groups, heads, dim] and MQA keys [regions, 1, dim]")
+    seq_q, groups, heads, proxy_dim = index_q.shape
+    seq_k = index_k.shape[0]
+    if index_k.shape[2] != proxy_dim or weights.shape != index_q.shape[:3]:
+        raise ValueError("prefill indexer proxy/weight shape mismatch")
+    if first_position < 0 or region_size != REGION_BLOCK_SIZE:
+        raise ValueError("prefill indexer requires nonnegative positions and 8-token regions")
+    if out.ndim != 2 or out.dtype != torch.float32 or out.stride(1) != 1:
+        raise ValueError("prefill indexer out must be row-contiguous float32")
+    if index_q.stride(3) != 1 or index_k.stride(2) != 1 or weights.stride(2) != 1:
+        raise ValueError("prefill indexer innermost dimensions must be contiguous")
+    rows_per_group = seq_q if out_group_stride is None else out_group_stride
+    needed = out_row_base + (groups - 1) * rows_per_group + seq_q
+    if out_row_base < 0 or rows_per_group < seq_q or out.shape[0] < needed or out.shape[1] < seq_k:
+        raise ValueError("prefill indexer destination is too small or groups overlap")
+    if seq_q == 0 or seq_k == 0:
+        return out
+    target = out[out_row_base:] if out_row_base else out
+    _prefill_indexer_logits_kernel[
+        (triton.cdiv(seq_q, block_q), triton.cdiv(seq_k, block_k), groups)
+    ](
+        index_q, index_k, weights, target, seq_q, seq_k, first_position,
+        index_q.stride(0), index_q.stride(1), index_q.stride(2), index_k.stride(0),
+        weights.stride(0), weights.stride(1), target.stride(0), rows_per_group,
+        region_size=region_size, heads_per_group=heads, proxy_dim=proxy_dim,
+        BLOCK_Q=block_q, BLOCK_K=block_k, num_warps=num_warps, num_stages=num_stages,
+    )
+    return out
+
+
 # Prefill selection packs one entry as ``phys_region | (valid_tokens << 24)``.
 # These are ``tl.constexpr`` because Triton kernels cannot read plain module globals.
 PREFILL_REGION_VALID_SHIFT = tl.constexpr(24)
@@ -1106,12 +1244,16 @@ def _region_topk_ids_resident_kernel(
     visible = tl.load(lengths_ptr + row).to(tl.int32)
     visible = tl.minimum(tl.maximum(visible, 0), seq_regions)
 
+    # Padding goes only to slots [budget, topk): the emit below fills [0, budget)
+    # from other threads, and two threads storing to one address are not ordered.
+    budget = tl.minimum(topk, visible)
     slots = tl.arange(0, BLOCK_TOPK)
-    tl.store(out_ptr + row * stride_out_row + slots, -1, mask=slots < topk)
+    tl.store(
+        out_ptr + row * stride_out_row + slots, -1, mask=(slots >= budget) & (slots < topk)
+    )
     if visible <= 0:
         return
 
-    budget = tl.minimum(topk, visible)
     regions = tl.arange(0, BLOCK_R)
     live = regions < visible
     scores = tl.load(
@@ -1153,6 +1295,123 @@ def _region_topk_ids_resident_kernel(
         regions,
         mask=selected & (positions < topk),
     )
+
+
+@triton.jit
+def _region_topk_pack_resident_kernel(
+    logits_ptr,
+    lengths_ptr,
+    q_positions_ptr,
+    block_table_ptr,
+    request_ptr,
+    out_ptr,
+    logical_out_ptr,
+    seq_regions,
+    stride_logits_row,
+    stride_table_row,
+    stride_out_row,
+    stride_logical_row,
+    topk: tl.constexpr,
+    region_size: tl.constexpr,
+    regions_per_page: tl.constexpr,
+    WRITE_LOGICAL_IDS: tl.constexpr,
+    BLOCK_R: tl.constexpr,
+    BLOCK_TOPK: tl.constexpr,
+) -> None:
+    """Register-resident ``_region_topk_pack_kernel`` for prefill rows.
+
+    Same selection as the radix kernel (bisect on the order-preserving int key, ties
+    taken as a prefix in ascending region order -- see
+    ``_region_topk_ids_resident_kernel``) and the same packing, but the row is read
+    once instead of once per radix pass. At a 32K-token prefill chunk that is
+    10.0 -> 2.9 ms per layer with 4K regions and 19.4 -> 6.7 ms with 8K.
+    Rows with ``visible <= topk`` take every visible region without reading scores.
+    """
+    row = tl.program_id(0)
+    visible = tl.load(lengths_ptr + row).to(tl.int32)
+    visible = tl.minimum(tl.maximum(visible, 0), seq_regions)
+    q_position = tl.load(q_positions_ptr + row).to(tl.int32)
+    request = tl.load(request_ptr + row).to(tl.int32)
+
+    # Padding only for [budget, topk), disjoint from the emit -- see
+    # ``_region_topk_ids_resident_kernel``.
+    budget = tl.minimum(topk, visible)
+    slots = tl.arange(0, BLOCK_TOPK)
+    pad = (slots >= budget) & (slots < topk)
+    tl.store(out_ptr + row * stride_out_row + slots, -1, mask=pad)
+    if WRITE_LOGICAL_IDS:
+        tl.store(logical_out_ptr + row * stride_logical_row + slots, -1, mask=pad)
+    if visible <= 0:
+        return
+
+    regions = tl.arange(0, BLOCK_R)
+    live = regions < visible
+    if visible <= topk:
+        selected = live
+        positions = regions
+    else:
+        scores = tl.load(logits_ptr + row * stride_logits_row + regions, mask=live, other=0.0)
+        bits = scores.to(tl.int32, bitcast=True)
+        keys = tl.where(scores < 0.0, bits ^ 0x7FFFFFFF, bits & 0x7FFFFFFF)
+        keys = tl.where(live, keys, -2147483648)
+        lo = tl.min(tl.where(live, keys, 2147483647)).to(tl.int64)
+        hi = tl.max(keys).to(tl.int64) + 1
+        # Interpolate the threshold from the two bracket counts. The score key
+        # distribution is continuous for indexer logits, so this usually skips
+        # several of the ~32 fixed-width bisection passes. Keep bisection as a
+        # fallback when interpolation stops shrinking the bracket.
+        c_lo = visible.to(tl.float32)
+        c_hi = 0.0
+        target = budget.to(tl.float32) + 0.5
+        bisect = budget * 0
+        done = budget * 0
+        while (hi - lo > 1) & (done == 0):
+            span = hi - lo
+            if bisect != 0:
+                mid = lo + span // 2
+            else:
+                frac = (c_lo - target) / (c_lo - c_hi)
+                off = (span.to(tl.float32) * frac).to(tl.int64)
+                off = tl.minimum(tl.maximum(off, 1), span - 1)
+                mid = lo + off
+            above = keys >= mid.to(tl.int32)
+            count = tl.sum(above.to(tl.int32))
+            if count == budget:
+                lo = tl.min(tl.where(above, keys, 2147483647)).to(tl.int64)
+                done = 1
+            elif count > budget:
+                lo = mid
+                c_lo = count.to(tl.float32)
+            else:
+                hi = mid
+                c_hi = count.to(tl.float32)
+            bisect = ((hi - lo) * 2 > span).to(tl.int32)
+        threshold = lo.to(tl.int32)
+        greater = live & (keys > threshold)
+        tied = live & (keys == threshold)
+        prefix = tl.cumsum(greater.to(tl.int32) | (tied.to(tl.int32) << 16), axis=0)
+        greater_incl = prefix & 0xFFFF
+        tied_incl = prefix >> 16
+        remaining = budget - tl.max(greater_incl)
+        selected = greater | (tied & (tied_incl <= remaining))
+        positions = greater_incl + tl.minimum(tied_incl, remaining) - 1
+
+    safe_regions = tl.where(selected, regions, 0)
+    pages = tl.load(
+        block_table_ptr + request * stride_table_row + safe_regions // regions_per_page,
+        mask=selected,
+        other=0,
+    )
+    physical = pages * regions_per_page + safe_regions % regions_per_page
+    valid_tokens = tl.minimum(
+        tl.maximum(q_position + 1 - safe_regions * region_size, 0), region_size
+    )
+    packed = physical | (valid_tokens << PREFILL_REGION_VALID_SHIFT)
+    packed = tl.where(pages >= 0, packed, -1)
+    keep = selected & (positions < topk)
+    tl.store(out_ptr + row * stride_out_row + positions, packed, mask=keep)
+    if WRITE_LOGICAL_IDS:
+        tl.store(logical_out_ptr + row * stride_logical_row + positions, regions, mask=keep)
 
 
 # Widest row the register-resident selector takes; wider rows use the tiled radix one.
@@ -1264,6 +1523,35 @@ def region_topk_pack(
     if request_indices is None:
         request_indices = torch.zeros((rows,), device=logits.device, dtype=torch.int32)
     out = torch.empty((rows, int(topk)), device=logits.device, dtype=torch.int32)
+    if (
+        henvs.optional_custom_op_enabled()
+        and seq_regions <= _RESIDENT_TOPK_MAX_REGIONS
+    ):
+        block_r = max(2, triton.next_power_of_2(seq_regions))
+        _region_topk_pack_resident_kernel[(rows,)](
+            logits,
+            lengths,
+            q_positions,
+            block_table,
+            request_indices,
+            out,
+            out if _logical_out is None else _logical_out,
+            seq_regions,
+            logits.stride(0),
+            shared_table_stride(block_table),
+            out.stride(0),
+            out.stride(0) if _logical_out is None else _logical_out.stride(0),
+            topk=int(topk),
+            region_size=int(region_size),
+            regions_per_page=int(regions_per_page),
+            WRITE_LOGICAL_IDS=_logical_out is not None,
+            BLOCK_R=block_r,
+            BLOCK_TOPK=triton.next_power_of_2(int(topk)),
+            # Many rows at prefill: fewer warps per row keeps more rows in flight
+            # (8K regions: w2 8.3, w4 6.7, w8 8.6 ms; 4K: w2 2.9, w4 3.1 ms).
+            num_warps=2 if block_r <= 4096 else 4,
+        )
+        return (out, _logical_out) if _logical_out is not None else out
     _region_topk_pack_kernel[(rows,)](
         logits,
         lengths,

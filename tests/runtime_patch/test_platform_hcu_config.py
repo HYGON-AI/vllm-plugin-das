@@ -13,6 +13,7 @@ import math
 import multiprocessing
 import os
 import pickle
+import re
 import subprocess
 import sys
 from dataclasses import dataclass, field, fields
@@ -84,6 +85,95 @@ def test_hcu_accepts_gptq_alias_selected_by_current_vllm() -> None:
     HCUPlatform.verify_quantization(resolved)
 
 
+def test_hcu_accepts_awq_alias_selected_by_current_vllm(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    from vllm.model_executor.layers.quantization import get_quantization_config
+    from vllm_hcu.platforms.hcu import HCUPlatform
+
+    monkeypatch.delenv("VLLM_USE_TRITON_AWQ", raising=False)
+    awq_config = {
+        "quant_method": "awq",
+        "bits": 4,
+        "group_size": 128,
+        "zero_point": True,
+    }
+    resolved = get_quantization_config("awq").override_quantization_method(
+        awq_config,
+        user_quant=None,
+    )
+
+    assert resolved == "auto_awq"
+    HCUPlatform.verify_quantization(resolved)
+    assert os.environ.get("VLLM_USE_TRITON_AWQ") == "1"
+
+
+@pytest.mark.parametrize(("num_tokens", "expected"), ((1, 3.0), (256, 128.0)))
+def test_hcu_auto_awq_dense_linear_uses_triton_when_lightop_is_disabled(
+    monkeypatch: pytest.MonkeyPatch,
+    num_tokens: int,
+    expected: float,
+) -> None:
+    import vllm.model_executor.parameter as parameter
+    from vllm.model_executor.layers.linear import ReplicatedLinear
+    from vllm.model_executor.layers.quantization import awq_triton
+    from vllm.model_executor.layers.quantization.auto_awq import (
+        AutoAWQConfig,
+        AutoAWQLinearMethod,
+    )
+    from vllm_hcu.platforms.hcu import HCUPlatform
+
+    monkeypatch.delenv("VLLM_USE_TRITON_AWQ", raising=False)
+    monkeypatch.setenv("VLLM_HCU_USE_LIGHTOP_AWQ", "0")
+    monkeypatch.setattr(parameter, "get_tensor_model_parallel_rank", lambda: 0)
+    monkeypatch.setattr(
+        parameter, "get_tensor_model_parallel_world_size", lambda: 1
+    )
+
+    def triton_gemm(input, qweight, scales, qzeros, split_k_iters):
+        return torch.full(
+            (input.shape[0], qweight.shape[1] * 8),
+            3.0,
+            dtype=input.dtype,
+            device=input.device,
+        )
+
+    def triton_dequantize(qweight, scales, qzeros):
+        return torch.ones(
+            (qweight.shape[0], qweight.shape[1] * 8),
+            dtype=scales.dtype,
+            device=scales.device,
+        )
+
+    monkeypatch.setattr(awq_triton, "awq_gemm_triton", triton_gemm)
+    monkeypatch.setattr(awq_triton, "awq_dequantize_triton", triton_dequantize)
+
+    HCUPlatform.verify_quantization("auto_awq")
+    assert os.environ.get("VLLM_USE_TRITON_AWQ") == "1"
+
+    config = AutoAWQConfig(4, 128, True, False)
+    layer = ReplicatedLinear(
+        128,
+        8,
+        bias=False,
+        params_dtype=torch.float16,
+        quant_config=config,
+        return_bias=False,
+        disable_tp=True,
+    )
+    assert isinstance(layer.quant_method, AutoAWQLinearMethod)
+
+    inputs = torch.ones((num_tokens, 128), dtype=torch.float16)
+    output = layer(inputs)
+
+    torch.testing.assert_close(
+        output,
+        torch.full_like(output, expected),
+        rtol=0,
+        atol=0,
+    )
+
+
 def _run_fresh_target(code: str) -> subprocess.CompletedProcess[str]:
     env = dict(os.environ)
     for name in (
@@ -96,7 +186,7 @@ def _run_fresh_target(code: str) -> subprocess.CompletedProcess[str]:
         env.pop(name, None)
     env["VLLM_PLUGINS"] = "__disabled__"
     env["VLLM_HCU_TARGET_ROOT"] = str(TARGET_VLLM_ROOT)
-    env["PYTHONPATH"] = os.pathsep.join((str(TARGET_VLLM_ROOT), str(REPO)))
+    env["PYTHONPATH"] = os.pathsep.join((str(REPO), str(TARGET_VLLM_ROOT)))
     return subprocess.run(
         [sys.executable, "-c", _TARGET_SOURCE_ASSERTION + code],
         check=False,
@@ -373,7 +463,8 @@ def test_engine_args_rejects_conflicting_gdn_prefill_backend() -> None:
         )
 
 
-def test_engine_args_extracts_nested_offline_eplb_fields() -> None:
+@pytest.mark.parametrize("policy", ["locality_fair", "token_hash"])
+def test_engine_args_extracts_nested_offline_eplb_fields(policy) -> None:
     module = _make_arg_utils_module()
     patch_engine_args.apply_to_module(module)
     eplb_config = {
@@ -381,7 +472,7 @@ def test_engine_args_extracts_nested_offline_eplb_fields() -> None:
         "step_interval": 100,
         "expert_map_path": "/maps/hy4.json",
         "disable_rearrange": True,
-        "static_dispatch_policy": "locality_fair",
+        "static_dispatch_policy": policy,
     }
 
     args = module.EngineArgs(eplb_config=eplb_config)
@@ -391,7 +482,7 @@ def test_engine_args_extracts_nested_offline_eplb_fields() -> None:
     assert get_hcu_config(args) == HcuFeatureConfig(
         expert_map_path="/maps/hy4.json",
         eplb_disable_rearrange=True,
-        eplb_static_dispatch_policy="locality_fair",
+        eplb_static_dispatch_policy=policy,
     )
 
     config = args.create_engine_config()
@@ -401,8 +492,14 @@ def test_engine_args_extracts_nested_offline_eplb_fields() -> None:
     assert config.parallel_config._vllm_hcu_eplb_disable_rearrange is True
     assert (
         config.parallel_config._vllm_hcu_eplb_static_dispatch_policy
-        == "locality_fair"
+        == policy
     )
+
+
+@pytest.mark.parametrize("policy", ["hash", "tokenhash", "round_robin", ""])
+def test_unknown_static_eplb_dispatch_policy_is_rejected(policy) -> None:
+    with pytest.raises(ValueError, match="eplb_static_dispatch_policy"):
+        HcuFeatureConfig(eplb_static_dispatch_policy=policy)
 
 
 def test_engine_args_extracts_nested_offline_eplb_record_path() -> None:
@@ -668,10 +765,30 @@ def test_engine_args_normalizes_legacy_deep_gemm_backend_on_existing_object(
     assert config.kernel_config.moe_backend == "deep_gemm"
 
 
-def test_real_v0251_engine_args_normalizes_legacy_deep_gemm_backend() -> None:
+def test_real_v0251_engine_args_normalizes_legacy_deep_gemm_backend(
+    tmp_path: Path,
+) -> None:
+    from transformers import Qwen3Config
+
+    # This CPU configuration contract needs metadata, not a Hub connection.
+    model_path = tmp_path / "qwen3-config"
+    Qwen3Config(
+        architectures=["Qwen3ForCausalLM"],
+        vocab_size=128,
+        hidden_size=64,
+        intermediate_size=128,
+        num_hidden_layers=1,
+        num_attention_heads=2,
+        num_key_value_heads=1,
+        head_dim=32,
+        max_position_embeddings=64,
+    ).save_pretrained(model_path)
     result = _run_fresh_target(
-        r'''
+        f"MODEL_PATH = {str(model_path)!r}\n" + r'''
 import os
+import json
+import tempfile
+from pathlib import Path
 os.environ["VLLM_USE_V2_MODEL_RUNNER"] = "0"
 from vllm.engine import arg_utils
 from vllm_hcu.patch.platform.core_fix import patch_engine_args
@@ -683,11 +800,11 @@ for kwargs in (
     {"moe_backend": "dpsk_deep_gemm"},
     {"kernel_config": {"moe_backend": "dpsk_deep_gemm"}},
 ):
-    args = arg_utils.EngineArgs(**kwargs)
+    args = arg_utils.EngineArgs(model=MODEL_PATH, skip_tokenizer_init=True, **kwargs)
     assert args.moe_backend == "deep_gemm" or args.kernel_config.moe_backend == "deep_gemm"
     assert args.create_engine_config().kernel_config.moe_backend == "deep_gemm"
 
-args = arg_utils.EngineArgs()
+args = arg_utils.EngineArgs(model=MODEL_PATH, skip_tokenizer_init=True)
 args.moe_backend = "dpsk_deep_gemm"
 assert args.create_engine_config().kernel_config.moe_backend == "deep_gemm"
 
@@ -1653,6 +1770,38 @@ def test_deepseek_v4_dspark_draft_clone_reuses_target_deepep_topology() -> None:
     assert get_hcu_config(target_additional).deepep_auto is True
 
 
+def test_deepseek_v4_dspark_megamoe_reuses_target_dp_ep_topology() -> None:
+    from vllm.config.speculative import SpeculativeConfig
+    from vllm.config import ParallelConfig
+
+    target_parallel = ParallelConfig(
+        tensor_parallel_size=1,
+        data_parallel_size=8,
+        enable_expert_parallel=True,
+    )
+    draft_parallel = SpeculativeConfig.create_draft_parallel_config(
+        target_parallel, speculative_draft_tensor_parallel_size=1
+    )
+    assert draft_parallel.data_parallel_size == 1
+    assert draft_parallel.enable_expert_parallel is False
+
+    config = _validation_config(HcuFeatureConfig())
+    config.kernel_config.moe_backend = "deep_gemm_mega_moe"
+    config.model_config.architectures = ["DeepseekV4ForCausalLM"]
+    config.parallel_config = draft_parallel
+    config.speculative_config = SimpleNamespace(
+        method="dspark",
+        target_parallel_config=target_parallel,
+        draft_parallel_config=draft_parallel,
+    )
+
+    patch_vllm_config.validate_and_update_hcu_config(config)
+
+    assert config.parallel_config is target_parallel
+    assert config.parallel_config.data_parallel_size == 8
+    assert config.parallel_config.enable_expert_parallel is True
+
+
 def test_deepseek_v4_dspark_deepep_rejects_mismatched_draft_tp() -> None:
     target_parallel = SimpleNamespace(
         all2all_backend="deepep_low_latency",
@@ -1883,10 +2032,10 @@ def test_slimquant_marlin_inherits_v0251_compressed_tensors_constructor() -> Non
 
     # v0.25.1's FusedMoE public symbol is a factory and may be wrapped by HCU;
     # quantization dispatch must use the target-owned RoutedExperts type.
-    source = Path(
+    source = (REPO / Path(
         "vllm_hcu/model_executor/layers/quantization/compressed_tensors/"
         "compressed_tensors_marlin.py"
-    ).read_text(encoding="utf-8-sig")
+    )).read_text(encoding="utf-8-sig")
     assert "isinstance(layer, RoutedExperts)" in source
     assert "isinstance(layer, FusedMoE)" not in source
     assert config.get_quant_method(torch.nn.Embedding(4, 4), "embed") is None
@@ -2177,22 +2326,108 @@ def test_fused_qwen3_rms_rope_effective_policy_partitions_persistent_cache(
     )
 
 
+@pytest.mark.parametrize(
+    ("master", "feature", "expected"),
+    [
+        ("0", "0", False),
+        ("0", "1", False),
+        ("1", "0", False),
+        ("1", "1", True),
+    ],
+)
+def test_k3_sp_moe_policy_is_finalized_before_config_hash(
+    monkeypatch: pytest.MonkeyPatch,
+    master: str,
+    feature: str,
+    expected: bool,
+) -> None:
+    monkeypatch.setenv("VLLM_HCU_USE_CUSTOM_OPS", master)
+    monkeypatch.setenv("VLLM_HCU_K3_SP_MOE", feature)
+
+    config = _validation_config(HcuFeatureConfig())
+    feature_config = patch_vllm_config.validate_and_update_hcu_config(config)
+
+    assert feature_config.k3_sp_moe is expected
+    assert get_hcu_config(config) == feature_config
+
+
+def test_k3_sp_moe_effective_policy_partitions_persistent_cache(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    """A 0 -> 1 restart must not load the graph persisted for SP-off.
+
+    Review scenario: SP-on mutates o_proj.reduce_results and registers the
+    hcu_k3_sp_* collectives, neither of which participates in the vLLM
+    config hash by itself -- so the effective switch must be persisted.
+
+    The master also gates Qwen3 fusion and Qwen4Exp HC SP; hold both off so
+    only the K3 SP policy varies across the master here (otherwise the
+    master-off "collapse" equality would be broken by those siblings, as in
+    the Qwen3 test above). Pin the remaining master-gated sibling too so the
+    assertion never depends on the CI environment.
+    """
+    monkeypatch.setenv("VLLM_HCU_USE_FUSED_RMS_ROPE", "0")
+    monkeypatch.setenv("VLLM_HCU_QWEN4_EXP_HC_SP", "0")
+    monkeypatch.setenv("VLLM_HCU_DP_INT8_ALLGATHER", "0")
+
+    def cache_key(master: str, feature: str) -> str:
+        monkeypatch.setenv("VLLM_HCU_USE_CUSTOM_OPS", master)
+        monkeypatch.setenv("VLLM_HCU_K3_SP_MOE", feature)
+        config = _validation_config(HcuFeatureConfig())
+        patch_vllm_config.validate_and_update_hcu_config(config)
+        return _vllm_hash(config.additional_config)
+
+    disabled_key = cache_key("1", "0")
+    disabled_graph = tmp_path / disabled_key / "graph.py"
+    disabled_graph.parent.mkdir()
+    disabled_graph.write_text("torch.ops.aten.reduce_scatter\n", encoding="utf-8")
+
+    enabled_key = cache_key("1", "1")
+    assert enabled_key != disabled_key
+    enabled_graph = tmp_path / enabled_key / "graph.py"
+    if not enabled_graph.exists():
+        enabled_graph.parent.mkdir()
+        enabled_graph.write_text(
+            "torch.ops.vllm.hcu_k3_sp_reduce_scatter\n", encoding="utf-8"
+        )
+    assert "hcu_k3_sp_reduce_scatter" in enabled_graph.read_text(encoding="utf-8")
+
+    # Master off collapse: SP is refused, so it cannot change any graph.
+    assert cache_key("0", "0") == cache_key("0", "1")
+    assert cache_key("0", "1") == disabled_key
+
+
+def test_hcu_feature_config_field_registries_stay_in_sync():
+    """A new HcuFeatureConfig field must hit every registry.
+
+    from_mapping rejects fields missing from _FEATURE_FIELDS (persisted
+    payloads become unloadable), and _BOOLEAN_FIELDS misses silently skip
+    type validation. This pins the trio: dataclass fields == field
+    registries, and every bool field is declared bool.
+    """
+    from dataclasses import fields
+
+    from vllm_hcu.patch import config as config_module
+
+    dataclass_names = {f.name for f in fields(HcuFeatureConfig)}
+    assert dataclass_names == set(config_module._FEATURE_FIELDS)
+    for field in fields(HcuFeatureConfig):
+        if field.type is bool:
+            assert field.name in config_module._BOOLEAN_FIELDS, field.name
+
+
 def test_varlen_flash_attention_uses_64_token_cache_blocks(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    # Source-only test worktrees do not contain the compiled extension. This
-    # contract only exercises backend block-size metadata, not HCU kernels.
-    monkeypatch.setitem(
-        sys.modules,
-        "vllm_hcu.hcu_ops",
-        ModuleType("vllm_hcu.hcu_ops"),
-    )
+    from tests.fixtures.flash_attention import load_hcu_flash_attention_module
     from vllm.v1.attention.backends.registry import AttentionBackendEnum
-    from vllm_hcu.v1.attention.backends.flash_attn import (
-        HcuFlashAttentionBackend,
-    )
     from vllm_hcu.platforms import envs as hcu_envs
     from vllm_hcu.platforms.hcu import HCUPlatform
+
+    HcuFlashAttentionBackend = load_hcu_flash_attention_module(
+        monkeypatch
+    ).HcuFlashAttentionBackend
 
     class _NoFullGraphs:
         @staticmethod
@@ -2942,3 +3177,39 @@ def test_deepep_auto_keeps_glm_dp_ep_without_pcp():
     config.parallel_config.enable_expert_parallel = True
     config.parallel_config.all2all_backend = "deepep_low_latency"
     assert patch_vllm_config.validate_and_update_hcu_config(config).deepep_auto
+
+
+def test_engine_args_skip_list_covers_every_master_resolved_field():
+    """The create-engine-config retainment check must skip exactly the
+    fields the platform hook re-resolves from the environment
+    (validate_and_update_hcu_config's updates dict, minus the env
+    hcu_flash_attn_mode which is skipped conditionally). A new
+    master-gated field added to the updates dict without joining this
+    skip list rejects every launch that flips it (f6399dc follow-up:
+    k3_sp_moe launch failure).
+    """
+    source = (
+        Path(patch_engine_args.__file__).read_text(encoding="utf-8")
+    )
+    match = re.search(
+        r"if name in \((.*?)\) or", source, re.DOTALL
+    )
+    assert match is not None, "retainment skip list not found"
+    skip_list = set(re.findall(r'"([a-z0-9_]+)"', match.group(1)))
+    vllm_config_source = (
+        Path(patch_vllm_config.__file__).read_text(encoding="utf-8")
+    )
+    updates_match = re.search(
+        r"updates(?::[^=]+)? = \{(.*?)\n    \}", vllm_config_source, re.DOTALL
+    )
+    assert updates_match is not None, "updates dict not found"
+    persisted = set(
+        re.findall(r'"([a-z0-9_]+)":', updates_match.group(1))
+    )
+    assert persisted == {
+        "fused_qwen3_rms_rope",
+        "qwen4_exp_hc_sp",
+        "k3_sp_moe",
+        "dp_int8_allgather",
+    }
+    assert skip_list == persisted

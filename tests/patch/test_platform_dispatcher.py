@@ -410,9 +410,9 @@ def test_apply_platform_patches_is_idempotent_narrow_and_reported():
     assert result.returncode == 0, result.stderr
     payload = json.loads(result.stdout.strip().splitlines()[-1])
     assert payload == {
-        "count": 65,
+        "count": 68,
         "replacements": 20,
-        "callbacks": 45,
+        "callbacks": 48,
         "failed": [],
         "builtins_same": True,
         "role": "Main",
@@ -420,6 +420,7 @@ def test_apply_platform_patches_is_idempotent_narrow_and_reported():
 
 
 def test_platform_framework_registration_is_lazy_on_clean_vllm():
+    # The current upstream GDN adapters keep FLA providers lazy.
     result = _run_fresh(
         "import builtins,json,sys; "
         "old=builtins.__import__; "

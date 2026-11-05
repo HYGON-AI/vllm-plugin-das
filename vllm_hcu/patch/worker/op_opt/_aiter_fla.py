@@ -4,7 +4,9 @@
 
 ``hcu-aiter`` uses the HIP kernels in ``aiter.ops.fla``; they replace the
 vLLM FLA functions one-to-one and accept the framework's precomputed
-``chunk_indices``/``chunk_offsets``.  aiter has no ``recompute_w_u_fwd``.
+``chunk_indices``/``chunk_offsets``.  aiter has no standalone
+vLLM-compatible ``recompute_w_u_fwd`` entry point; its recompute kernel is
+internal to the fused CK prefill pipeline.
 
 The HIP decode kernels treat only negative state indices as invalid, unlike
 vLLM's NULL_BLOCK_ID=0 convention; callers must remap padding indices.

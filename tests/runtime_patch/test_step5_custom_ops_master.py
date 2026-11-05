@@ -19,6 +19,8 @@ _MODEL_CHILDREN = (
     "VLLM_HCU_STEP5_FUSED_GATE",
     "STEP5_SKINNY_LM_HEAD",
     "VLLM_HCU_TRITON_TOKEN_FP8_QUANT",
+    "VLLM_HCU_STEP5_QKV_INDEXER",
+    "VLLM_STEP4_DSA_PREFILL_FP8_INDEXER",
 )
 
 _RUNTIME_CHILDREN = (
@@ -32,13 +34,13 @@ _RUNTIME_CHILDREN = (
 @pytest.mark.parametrize(
     ("master", "child", "expected"),
     [
-        ("0", "1", (False,) * 9),
-        ("1", "1", (True,) * 9),
-        ("1", "0", (False,) * 9),
+        ("0", "1", (False,) * 11),
+        ("1", "1", (True,) * 11),
+        ("1", "0", (False,) * 11),
         (
             "1",
             None,
-            (True, True, True, False, False, False, False, True, False),
+            (True, True, True, False, False, False, False, True, False, False, True),
         ),
     ],
 )
@@ -61,6 +63,7 @@ from vllm_hcu.models import step5_text
 from vllm_hcu.models import step5_swa_fused
 from vllm_hcu.model_executor.layers import skinny_lm_head
 from vllm_hcu.ops import token_fp8_quant
+from vllm_hcu.model_executor.layers import step4_dsa
 
 actual = (
     step5_text.FUSE_QKVG,
@@ -72,6 +75,8 @@ actual = (
     step5_swa_fused.FUSED_GATE,
     skinny_lm_head._ENABLED,
     token_fp8_quant.ENABLED,
+    step5_text.QKV_INDEXER,
+    step4_dsa.PREFILL_FP8_INDEXER,
 )
 assert actual == {expected!r}, actual
 """
@@ -106,6 +111,14 @@ def test_step5_runtime_features_obey_custom_ops_master(master, child, expected):
             env[name] = child
     script = f"""
 import importlib
+import sys
+from types import ModuleType
+import pytest
+from tests.fixtures.flash_attention import stub_flash_attn_extensions
+stub_flash_attn_extensions(pytest.MonkeyPatch())
+# This matrix checks policy flags, not the optional GPU provider's kernels.
+provider = "vllm_hcu.model_executor.layers.fused_moe.ep_fused_moe"
+sys.modules[provider] = ModuleType(provider)
 import vllm
 from vllm_hcu import hcu_platform_register_model
 hcu_platform_register_model()
@@ -438,6 +451,9 @@ def test_flash_attention_does_not_import_swa_provider_when_master_is_off():
     )
     script = """
 import builtins
+import pytest
+from tests.fixtures.flash_attention import stub_flash_attn_extensions
+stub_flash_attn_extensions(pytest.MonkeyPatch())
 
 native_import = builtins.__import__
 def guarded_import(name, *args, **kwargs):

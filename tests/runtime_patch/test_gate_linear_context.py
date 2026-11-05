@@ -49,4 +49,4 @@ def test_real_gate_routing_eager_and_graph(hidden_size, experts, scale, tmp_path
     rows = json.loads(output.read_text())['comparisons']
     assert len(rows) == 8  # Two layouts, two token counts, eager and graph.
     assert {r['mode'] for r in rows} == {'eager', 'graph'}
-    assert all(r['eager_graph_logits_exact'] for r in rows)
+    assert all(r['head_eager_graph_logits_exact'] for r in rows)
