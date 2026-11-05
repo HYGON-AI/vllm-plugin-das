@@ -3045,3 +3045,49 @@ def test_deepep_auto_reuses_target_buffer_for_smaller_fixed_draft(monkeypatch):
     other = manager.get_handle(dict(draft, token_hidden_size=8192))
     assert other is not handle
     assert len(allocations) == 2
+
+@pytest.mark.parametrize("spec", [
+    None, SimpleNamespace(method="dspark", draft_model_config=None),
+])
+def test_fixed_draft_layout_ignores_missing_speculation(spec):
+    assert not patch_eagle_utils._use_fixed_v4_draft_layout(
+        SimpleNamespace(speculative_config=spec)
+    )
+
+
+@pytest.mark.parametrize("destroy_fails", [False, True])
+def test_deepep_auto_destroy_drops_shared_handle(monkeypatch, destroy_fails):
+    monkeypatch.setitem(sys.modules, "deep_ep", SimpleNamespace(
+        Buffer=SimpleNamespace(set_num_sms=lambda value: None)))
+    module = _fake_all2all_module()
+    allocations = []
+    destroyed = []
+    def get_handle(self, kwargs):
+        handle = object()
+        allocations.append(handle)
+        return handle
+    def destroy(self):
+        destroyed.append(allocations[-1])
+        if destroy_fails:
+            raise RuntimeError("teardown failed")
+    monkeypatch.setattr(
+        module.DeepEPLLAll2AllManager, "get_handle", get_handle, raising=False,
+    )
+    monkeypatch.setattr(
+        module.DeepEPLLAll2AllManager, "destroy", destroy, raising=False,
+    )
+    patch_all2all.apply_to_module(module)
+    manager = module.DeepEPAutoAll2AllManager("group")
+    kwargs = dict(max_num_tokens_per_dp_rank=256, token_hidden_size=4096,
+                  num_ep_ranks=8, num_global_experts=272, num_local_experts=34)
+    first = manager.get_handle(kwargs)
+    if destroy_fails:
+        with pytest.raises(RuntimeError, match="teardown failed"):
+            manager.destroy()
+    else:
+        manager.destroy()
+    assert destroyed == [first]
+    assert getattr(manager, "_hcu_shared_auto_handle", None) is None
+    second = manager.get_handle(kwargs)
+    assert second is not first
+    assert len(allocations) == 2

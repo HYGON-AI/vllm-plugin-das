@@ -32,16 +32,18 @@ def _draft_uses_target_model_geometry(draft_model_config: object) -> bool:
 
 def _use_fixed_v4_draft_layout(config: object) -> bool:
     """Isolate native V4 MTP/DSpark from the target's static placement contract."""
-    spec = config.speculative_config
-    draft = spec.draft_model_config
-    architectures = getattr(draft, "architectures", None) or getattr(
-        getattr(draft, "hf_config", None), "architectures", ()
-    ) or ()
+    from vllm_hcu.deepseek_v4_runtime import config_field, model_architectures
+
+    spec = config_field(config, "speculative_config")
+    draft = config_field(spec, "draft_model_config")
+    if draft is None:
+        return False
+    architectures = model_architectures(config, model_config=draft)
     feature = get_hcu_config(config)
     architecture = {
         "mtp": "DeepSeekV4MTPModel",
         "dspark": "DSparkDraftModel",
-    }.get(getattr(spec, "method", None))
+    }.get(config_field(spec, "method"))
     if (
         architecture is None
         or architecture not in architectures

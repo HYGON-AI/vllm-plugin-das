@@ -241,6 +241,14 @@ def install_deep_ep_auto_manager(module: object) -> type:
             self._hcu_shared_auto_handle = (dict(kwargs), handle)
             return handle
 
+        def destroy(self):
+            try:
+                return super().destroy()
+            finally:
+                # The inherited teardown clears its owner cache. Drop this
+                # additional capacity shortcut as well, including error exits.
+                self._hcu_shared_auto_handle = None
+
         def max_sms_used(self) -> int | None:
             return self.num_sms
 

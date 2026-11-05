@@ -104,7 +104,9 @@ def apply_to_module(module: ModuleType) -> bool:
         from copy import copy
         from .patch_eagle_utils import _use_fixed_v4_draft_layout
 
-        architectures = getattr(model_config, "architectures", ()) or ()
+        from vllm_hcu.deepseek_v4_runtime import model_architectures
+
+        architectures = model_architectures(vllm_config, model_config=model_config)
         fixed_draft = False
         if {"DSparkDraftModel", "DeepSeekV4MTPModel"}.intersection(architectures):
             candidate = copy(vllm_config)
