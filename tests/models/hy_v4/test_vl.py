@@ -202,11 +202,13 @@ def test_patch_projection_matches_checkpoint_convolution(bias):
 
 
 @pytest.mark.hcu
-@pytest.mark.parametrize("patches", [384, 3900, 7788])
-def test_patch_projection_preserves_hcu_bf16_rounding(patches):
+@pytest.mark.parametrize("patches", [384, 1024, 2048, 3900, 7788, 8192, 8196])
+@pytest.mark.parametrize("seed", [0, 338])
+def test_patch_projection_preserves_hcu_bf16_rounding(patches, seed):
     if not torch.cuda.is_available():
         pytest.skip("a live HCU/ROCm device is required")
     with torch.device("cuda"), torch.inference_mode():
+        torch.manual_seed(seed)
         projection = HYV4PatchProjection(3, 1536, 16, stride=16).bfloat16()
         inputs = torch.randn(patches, 3, 16, 16, dtype=torch.bfloat16)
         reference = torch.nn.functional.conv2d(

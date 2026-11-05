@@ -133,15 +133,28 @@ class HYV4VLMultiModalProcessor(HunYuanVLMultiModalProcessor):
 
 
 class HYV4PatchProjection(nn.Conv2d):
-    """Collapse extracted patches into channels for an efficient 1x1 convolution."""
+    """Project extracted patches as spatial positions in one 1x1 convolution."""
 
     def forward(self, patches):
-        # Keep MIOpen's accumulation and bias rounding, and the checkpoint layout.
-        return F.conv2d(
-            patches.flatten(1)[:, :, None, None],
-            self.weight.flatten(1)[:, :, None, None],
+        flat = patches.flatten(1)
+        weight = self.weight.flatten(1)[:, :, None, None]
+        if not (
+            patches.is_cuda
+            and patches.dtype == torch.bfloat16
+            and self.weight.shape == (1536, 3, 16, 16)
+            and 2048 <= flat.shape[0] <= 8192
+        ):
+            # Small spatial convolutions select a different MIOpen reduction
+            # order. Retain the original path outside the validated range.
+            return F.conv2d(flat[:, :, None, None], weight, self.bias)
+        # A single channels-last image avoids a convolution batch per patch.
+        # Keep MIOpen's accumulation/bias rounding and the checkpoint layout.
+        projected = F.conv2d(
+            flat.T[None, :, None, :],
+            weight,
             self.bias,
         )
+        return projected.permute(3, 1, 0, 2).contiguous()
 
 
 class HYV4VisionPatchEmbed(HunYuanVisionPatchEmbed):
