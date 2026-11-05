@@ -176,6 +176,12 @@ class HcuGPUWorker(Worker):
             model = get_draft_model() if callable(get_draft_model) else None
         else:
             model = self.model_runner.model
+        from vllm_hcu.model_executor.layers.quantization.glm_moe_dsa_w4a8 import (
+            commit_installed_glm_w4a8_gemm2_generations,
+        )
+
+        if model is not None:
+            commit_installed_glm_w4a8_gemm2_generations(model)
         from vllm_hcu.patch.worker.core_fix.patch_deepseek_v4_attention import (
             refresh_compressor_nt_weights,
         )

@@ -2688,6 +2688,143 @@ def _legacy_reload_method():
     return namespace["reload_weights"]
 
 
+def _weight_update_worker(monkeypatch, finish_update):
+    # Keep the production finish body and real GLM hook; isolate the parent
+    # weight transport and refresh hooks for unrelated model architectures.
+    class ParentWorker:
+        def finish_weight_update(self):
+            finish_update()
+
+    for module_name, refresh_name in (
+        (
+            "vllm_hcu.patch.worker.core_fix.patch_deepseek_v4_attention",
+            "refresh_compressor_nt_weights",
+        ),
+        (
+            "vllm_hcu.patch.worker.core_fix.patch_deepseek_v4_rocm_wo_a_layout",
+            "refresh_wo_a_bf16_caches",
+        ),
+        (
+            "vllm_hcu.model_executor.layers.kimi_k3_mixed_precision",
+            "refresh_kimi_kda_fused_qkv",
+        ),
+        (
+            "vllm_hcu.model_executor.layers.fused_moe.glm53_router_gemv",
+            "refresh_glm53_router_gates",
+        ),
+    ):
+        monkeypatch.setitem(
+            sys.modules,
+            module_name,
+            _module(module_name, **{refresh_name: lambda model: None}),
+        )
+    namespace = _exec_production(
+        Path(__file__).parents[2] / "vllm_hcu/v1/worker.py",
+        class_name="HcuGPUWorker",
+        methods=("finish_weight_update",),
+        stubs={"nn": SimpleNamespace(Module=ParentWorker)},
+    )
+    return namespace["HcuGPUWorker"]()
+
+
+@pytest.mark.parametrize("draft", [False, True])
+@pytest.mark.parametrize("replace_parameters", [False, True])
+def test_finish_weight_update_keeps_glm_layout_and_scale_owners(
+    monkeypatch, draft, replace_parameters
+) -> None:
+    from vllm_hcu.model_executor.layers.quantization import (
+        compressed_tensors_moe_runtime,
+    )
+    from vllm_hcu.model_executor.layers.quantization.glm_moe_dsa_w4a8 import (
+        _expert_weight_generation,
+        glm_expert_weights_use_gemm2_layout,
+    )
+
+    def make_model():
+        method, layer = _glm_aiter_method("auto")
+        method.moe.activation = "silu"
+        method.moe.num_experts = 2
+        layer.quant_method = method
+        for name, shape, dtype, value in (
+            ("w13_weight", (2, 16, 4), torch.int8, 1),
+            ("w2_weight", (2, 8, 4), torch.int8, 1),
+            ("w13_weight_scale", (2, 16, 1), torch.float32, 2),
+            ("w2_weight_scale", (2, 8, 1), torch.float32, 3),
+        ):
+            setattr(layer, name, torch.nn.Parameter(
+                torch.full(shape, value, dtype=dtype), requires_grad=False
+            ))
+        layer.w13_input_scale = None
+        layer.w2_input_scale = None
+        layer.global_num_experts = 2
+        layer.swiglu_limit = None
+        layer._expert_map = None
+        layer.expert_mask = None
+        method.get_fused_moe_quant_config(layer)
+        compressed_tensors_moe_runtime.install_aiter_moe_weight_layout(
+            layer,
+            SimpleNamespace(
+                quant_type="w4a8", solution_type="moe_c",
+                need_shuffle=False, need_shuffle_scale=False,
+            ),
+            logical_shape=(2, 16, 8, 8),
+        )
+        layer._glm_w4a8_gemm2_generation = _expert_weight_generation(layer)
+        return layer
+
+    target, draft_model = make_model(), make_model()
+    selected = draft_model if draft else target
+    untouched = target if draft else draft_model
+    untouched_generation = untouched._glm_w4a8_gemm2_generation
+    installed_config = selected.quant_method.moe_quant_config
+
+    def finish_update():
+        for name, value in (
+            ("w13_weight", 5), ("w2_weight", 6),
+            ("w13_weight_scale", 7), ("w2_weight_scale", 11),
+        ):
+            param = getattr(selected, name)
+            updated = torch.full_like(param, value)
+            if replace_parameters:
+                setattr(selected, name, torch.nn.Parameter(updated, requires_grad=False))
+            else:
+                param.copy_(updated)
+        assert not glm_expert_weights_use_gemm2_layout(selected)
+
+    worker = _weight_update_worker(monkeypatch, finish_update)
+    worker.model_runner = SimpleNamespace(
+        model=target, get_draft_model=lambda: draft_model
+    )
+    worker._weight_update_is_draft = draft
+    worker.finish_weight_update()
+
+    assert glm_expert_weights_use_gemm2_layout(selected)
+    assert untouched._glm_w4a8_gemm2_generation is untouched_generation
+    assert selected.quant_method.moe_quant_config is installed_config
+    assert installed_config.w1_scale is selected.w13_weight_scale
+    assert installed_config.w2_scale is selected.w2_weight_scale
+    assert torch.all(selected.w13_weight == 5)
+    assert torch.all(selected.w2_weight == 6)
+    assert torch.all(untouched.w13_weight == 1)
+    assert torch.all(untouched.w2_weight == 1)
+    # A previously uncached token count requests shuffle, but the installed
+    # gemm2 bytes must be accepted and passed to the kernel without repacking.
+    forward = _forward_reloaded_weights(monkeypatch, selected, num_tokens=7)
+    assert not forward["execute"].get("use_weight_shuffle", False)
+    assert forward["execute"]["w1_scale"] is selected.w13_weight_scale
+    assert forward["execute"]["w2_scale"] is selected.w2_weight_scale
+
+
+@pytest.mark.parametrize("has_getter", [False, True])
+def test_finish_weight_update_without_draft_model(monkeypatch, has_getter) -> None:
+    worker = _weight_update_worker(monkeypatch, lambda: None)
+    worker.model_runner = SimpleNamespace(model=torch.nn.Module())
+    if has_getter:
+        worker.model_runner.get_draft_model = lambda: None
+    worker._weight_update_is_draft = True
+    worker.finish_weight_update()
+
+
 @pytest.mark.parametrize("runner_kind", ["legacy", "v2"])
 @pytest.mark.parametrize("installed_layout", ["gemm2", "native"])
 def test_reload_weights_keeps_scale_owners_for_later_forward(
