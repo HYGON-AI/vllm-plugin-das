@@ -9,6 +9,8 @@ retry only when ``.mtp_block.`` hides the same expert's published name; they do
 not inherit a scheme from another layer. Ignored prefixes and non-expert INT4
 groups stay on the parent method; an ignored fused owner uses the unquantized
 MoE method so the parent cannot reinterpret the ignore through expert 0.
+Fused shared experts (VLLM_ROCM_USE_AITER_FUSION_SHARED_EXPERTS=1) are
+rejected for INT4 experts: they would share the packed INT4 expert tensors.
 """
 
 from __future__ import annotations
@@ -29,6 +31,7 @@ from vllm_hcu.model_executor.layers.quantization.glm_channel_int4 import (
     is_glm_channel_int4_w4a8,
     is_glm_moe_dsa_model,
     repack_and_shuffle_w4a8_gemm2,
+    require_unfused_shared_experts,
     routed_expert_owner_is_ignored,
     routed_expert_uses_glm_channel_int4,
 )
@@ -298,5 +301,8 @@ class GlmMoeDsaChannelW4A8Config(CompressedTensorsConfig):
             if routed_expert_owner_is_ignored(self, prefix):
                 return UnquantizedFusedMoEMethod(layer.moe_config)
             if routed_expert_uses_glm_channel_int4(self, layer, prefix):
+                # Fused shared experts would be loaded into the packed INT4
+                # slots below; fail before create_weights allocates them.
+                require_unfused_shared_experts(layer, prefix)
                 return GlmMoeDsaW4A8MoEMethod(self, layer.moe_config)
         return super().get_quant_method(layer, prefix)
