@@ -195,6 +195,11 @@ class Step5AuxManager:
                 self._release_groups(groups)
 
     def prepare_pull(self, pull_meta: Any) -> None:
+        # Aborted-before-allocation requests still notify P to release its KV.
+        # They have no destination pages or prompt length to restore.
+        if not any(pull_meta.local_block_ids):
+            pull_meta.dsa_aux = {}
+            return
         groups = self.worker._logical_to_kernel_block_ids(pull_meta.local_block_ids)
         n = int(pull_meta.num_prompt_tokens)
         if n <= 0:

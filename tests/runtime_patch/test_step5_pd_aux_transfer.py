@@ -4,8 +4,10 @@
 from __future__ import annotations
 
 import ast
+import asyncio
 import ctypes
 import importlib.util
+import logging
 import sys
 from pathlib import Path
 from types import ModuleType, SimpleNamespace
@@ -66,13 +68,14 @@ def connector_lifecycle_methods():
     source = Path(__file__).resolve().parents[2] / "vllm_hcu/distributed/kv_transfer/kv_connector/v1/mooncake/mooncake_connector.py"
     tree = ast.parse(source.read_text())
     classes = {node.name: node for node in tree.body if isinstance(node, ast.ClassDef)}
-    methods = {"MooncakeConnector": "bind_connector_metadata",
-               "MooncakeConnectorWorker": "start_load_kv"}
+    methods = {"MooncakeConnector": ["bind_connector_metadata"],
+               "MooncakeConnectorWorker": ["start_load_kv", "_start_load_kv"]}
     body = [ast.ImportFrom(module="__future__", names=[ast.alias(name="annotations")], level=0)]
-    for name, method in methods.items():
+    for name, wanted in methods.items():
         node = classes[name]
-        node.body = [next(item for item in node.body
-                          if isinstance(item, ast.FunctionDef) and item.name == method)]
+        node.body = [item for item in node.body
+                     if isinstance(item, (ast.FunctionDef, ast.AsyncFunctionDef))
+                     and item.name in wanted]
         body.append(node)
 
     class Base:
@@ -80,7 +83,7 @@ def connector_lifecycle_methods():
             self._connector_metadata = metadata
 
     namespace = {"KVConnectorBase_V1": Base, "MooncakeConnectorMetadata": SimpleNamespace,
-                 "SupportsHMA": type("SupportsHMA", (), {})}
+                 "SupportsHMA": type("SupportsHMA", (), {}), "asyncio": asyncio}
     exec(compile(ast.fix_missing_locations(ast.Module(body=body, type_ignores=[])),
                  str(source), "exec"), namespace)
     return namespace["MooncakeConnector"], namespace["MooncakeConnectorWorker"]
@@ -135,6 +138,65 @@ def test_binding_without_step5_preserves_base_contract():
     metadata = object()
     connector.bind_connector_metadata(metadata)
     assert connector._connector_metadata is metadata
+
+
+@pytest.mark.parametrize("blocks", [[], [[]], [[], []]])
+def test_notification_only_pull_skips_all_auxiliary_restoration(aux, blocks):
+    manager = object.__new__(aux.Step5AuxManager)
+    pull = SimpleNamespace(local_block_ids=blocks, num_prompt_tokens=0,
+                           dsa_aux={"stale": object()})
+    # No worker/mapper exists: notification handling must return before either
+    # translating blocks or accessing any summary/pending-region storage.
+    manager.prepare_pull(pull)
+    assert pull.dsa_aux == {}
+
+
+def test_allocated_pull_still_requires_prompt_length(aux):
+    manager, state, _, _ = make_manager(aux, False)
+    with pytest.raises(ValueError, match="prompt token count"):
+        manager.prepare_pull(SimpleNamespace(local_block_ids=[[2]], num_prompt_tokens=0))
+    assert not state.pending.rows
+
+
+@pytest.mark.parametrize("cancelled_first", [True, False])
+def test_preallocation_abort_notification_survives_mixed_worker_batch(aux, monkeypatch, cancelled_first):
+    source = Path(__file__).resolve().parents[2] / "vllm_hcu/distributed/kv_transfer/kv_connector/v1/mooncake/mooncake_connector.py"
+    tree = ast.parse(source.read_text())
+    scheduler = next(n for n in tree.body if isinstance(n, ast.ClassDef)
+                     and n.name == "MooncakeConnectorScheduler")
+    finish = next(n for n in scheduler.body if isinstance(n, ast.FunctionDef)
+                  and n.name == "request_finished")
+    namespace = {"logger": logging.getLogger(__name__)}
+    body = [ast.ImportFrom(module="__future__", names=[ast.alias(name="annotations")], level=0), finish]
+    exec(compile(ast.fix_missing_locations(ast.Module(body=body, type_ignores=[])),
+                 str(source), "exec"), namespace)
+    scheduler_state = SimpleNamespace(is_kv_producer=False, _reqs_need_recv={})
+    request = SimpleNamespace(request_id="cancelled", status="aborted",
+        kv_transfer_params={"transfer_id": "x", "do_remote_prefill": True})
+    assert namespace['request_finished'](scheduler_state, request, ()) == (False, None)
+    _, blocks = scheduler_state._reqs_need_recv['cancelled']
+    assert blocks == []
+
+    _, worker_type = connector_lifecycle_methods()
+    manager, state, _, worker = make_manager(aux, False)
+    worker._step5_aux = manager
+    worker.is_kv_consumer = True
+    worker._remote_agents = {"producer": object()}
+    worker.receiver_loop = object()
+    cancelled = SimpleNamespace(local_block_ids=blocks, num_prompt_tokens=0, dsa_aux={})
+    active = SimpleNamespace(local_block_ids=[[2]], num_prompt_tokens=8, dsa_aux={})
+    pulls = dict([("cancelled", cancelled), ("active", active)] if cancelled_first
+                 else [("active", active), ("cancelled", cancelled)])
+    dispatched = []
+    worker.receive_kv = lambda engine, batch: dispatched.append((engine, batch))
+    worker._start_load_kv = worker_type._start_load_kv.__get__(worker)
+    monkeypatch.setattr(asyncio, "run_coroutine_threadsafe", lambda coro, loop: asyncio.run(coro))
+    worker_type.start_load_kv(worker, SimpleNamespace(reqs_to_recv={"producer": pulls},
+        reqs_to_send={}, reqs_not_processed=set()))
+    assert dispatched == [("producer", pulls)]
+    assert cancelled.dsa_aux == {}
+    assert active.dsa_aux
+    assert len(state.pending.rows) == 1
 
 
 def copy_registered(source_worker, destination_worker, pointers):
