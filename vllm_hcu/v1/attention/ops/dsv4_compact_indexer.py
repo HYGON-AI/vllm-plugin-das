@@ -130,6 +130,8 @@ def compact_indexer_logits(q, cache, weights, lengths, table, max_len):
             )
         state["captured"] = False
         if state["page_capacity"] < required_pages:
+            state["compact"] = None
+            state["page_capacity"] = 0
             page_capacity = (
                 required_pages
                 if use_physical
@@ -143,6 +145,8 @@ def compact_indexer_logits(q, cache, weights, lengths, table, max_len):
             state["compact"][-1].zero_()  # invalid-page sentinel
             state["page_capacity"] = page_capacity
         if state["row_capacity"] < rows:
+            state["mapped"] = state["new_lengths"] = None
+            state["row_capacity"] = 0
             row_capacity = triton.next_power_of_2(rows)
             state["mapped"] = torch.empty(
                 (row_capacity, width), device=q.device, dtype=torch.int32

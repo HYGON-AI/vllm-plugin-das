@@ -117,3 +117,17 @@ def test_growth_retains_only_captured_workspaces(workspace_runtime):
     assert all(ref() is None for ref in eager)
     assert all(ref() is not None for ref in captured)
     assert len(state["old"]) == 1
+
+
+def test_eager_growth_releases_old_storage_before_allocating(workspace_runtime, monkeypatch):
+    state = workspace_runtime.run(24)
+    old = weakref.ref(state["compact"])
+    empty = torch.empty
+
+    def allocate(*args, **kwargs):
+        if args and args[0] == (131073, 64, 1, 132):
+            assert old() is None, "old compact still live when allocating its replacement"
+        return empty(*args, **kwargs)
+
+    monkeypatch.setattr(torch, "empty", allocate)
+    workspace_runtime.run(48)
