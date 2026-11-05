@@ -403,6 +403,7 @@ class _PreparedScales:
 
 
 def _copy_prepared_scales(entry: _PreparedScales, fresh) -> None:
+    # Validate the complete pair before touching either graph-owned allocation.
     for old, new in zip(entry.tensors, fresh):
         if old is None or new is None:
             if old is not new:
@@ -410,8 +411,12 @@ def _copy_prepared_scales(entry: _PreparedScales, fresh) -> None:
             continue
         if (old.shape, old.dtype, old.device) != (new.shape, new.dtype, new.device):
             raise HcuAiterMoeDispatchError("AITER scale layout changed on reload")
-        with torch.no_grad():
-            old.copy_(new)
+    # Warmup runs under inference_mode, so derived tensors may be inference
+    # tensors. no_grad alone cannot update them during an out-of-mode reload.
+    with torch.inference_mode():
+        for old, new in zip(entry.tensors, fresh):
+            if old is not None:
+                old.copy_(new)
 
 
 def refresh_aiter_moe_scale_cache(

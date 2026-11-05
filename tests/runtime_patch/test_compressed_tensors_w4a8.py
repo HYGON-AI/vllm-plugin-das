@@ -479,9 +479,10 @@ def _kernel_reload_runner(kind, model):
 
 @pytest.mark.parametrize("group_size", [None, -1])
 @pytest.mark.parametrize("runner_kind", [None, "v1", "v2"])
+@pytest.mark.parametrize("inference_warmup", [False, True])
 @pytest.mark.parametrize("device", ["cpu", pytest.param("cuda", marks=pytest.mark.hcu)])
 def test_checkpoint_reload_refreshes_captured_scale_cache(
-    monkeypatch, native_wna16, group_size, device, runner_kind,
+    monkeypatch, native_wna16, group_size, device, runner_kind, inference_warmup,
 ):
     if device == "cuda" and not torch.cuda.is_available():
         pytest.skip("requires a DCU for graph replay")
@@ -572,15 +573,17 @@ def test_checkpoint_reload_refreshes_captured_scale_cache(
             torch.testing.assert_close(replayed, expected)
             assert tuple(s.data_ptr() for s in captured) == captured_pointers
         for _ in range(2):
-            eager = method.apply(layer, x, weights, ids)
+            with torch.inference_mode(inference_warmup):
+                eager = method.apply(layer, x, weights, ids)
             torch.testing.assert_close(eager, expected)
         if captured is None:
             captured = consumed[-1]
+            assert all(s.is_inference() == inference_warmup for s in captured)
             captured_pointers = tuple(s.data_ptr() for s in captured)
             if device == "cuda":
                 torch.cuda.synchronize()
                 graph = torch.cuda.CUDAGraph()
-                with torch.cuda.graph(graph):
+                with torch.inference_mode(inference_warmup), torch.cuda.graph(graph):
                     graph_output = method.apply(layer, x, weights, ids)
         else:
             assert consumed[-1][0] is captured[0]
@@ -609,7 +612,8 @@ def test_checkpoint_reload_refreshes_captured_scale_cache(
                 replayed = x * (captured[0].flatten()[0] + captured[1].flatten()[0])
             assert len(consumed) == before
             torch.testing.assert_close(replayed, expected)
-            eager = method.apply(layer, x, weights, ids)
+            with torch.inference_mode(inference_warmup):
+                eager = method.apply(layer, x, weights, ids)
             torch.testing.assert_close(eager, replayed)
             assert consumed[-1][0] is captured[0]
             assert consumed[-1][1] is captured[1]
@@ -619,7 +623,8 @@ def test_checkpoint_reload_refreshes_captured_scale_cache(
 
 @pytest.mark.parametrize("draft", [False, True])
 @pytest.mark.parametrize("modular", [False, True])
-def test_weight_update_refreshes_selected_w4a8_model(monkeypatch, draft, modular):
+@pytest.mark.parametrize("inference_warmup", [False, True])
+def test_weight_update_refreshes_selected_w4a8_model(monkeypatch, draft, modular, inference_warmup):
     from vllm.v1.worker.gpu_worker import Worker
     from vllm_hcu.v1.worker import HcuGPUWorker
     from vllm_hcu.model_executor.layers.fused_moe.aiter_moe_dispatch import (
@@ -642,10 +647,11 @@ def test_weight_update_refreshes_selected_w4a8_model(monkeypatch, draft, modular
                                  _hcu_ct_w4a8_loaded=True, moe_quant_config=None)
         layer.quant_method = SimpleNamespace(old_quant_method=method) if modular else method
         models.append(layer)
-        captured.append(prepare_aiter_moe_scales(
-            layer.w13_weight_scale, layer.w2_weight_scale, selected_config,
-            cache_owner=layer.w13_weight_scale,
-        ))
+        with torch.inference_mode(inference_warmup):
+            captured.append(prepare_aiter_moe_scales(
+                layer.w13_weight_scale, layer.w2_weight_scale, selected_config,
+                cache_owner=layer.w13_weight_scale,
+            ))
     selected = models[int(draft)]
     pointers = [tuple(s.data_ptr() for s in pair) for pair in captured]
 
@@ -669,6 +675,24 @@ def test_weight_update_refreshes_selected_w4a8_model(monkeypatch, draft, modular
             cache_owner=layer.w13_weight_scale,
         )
         assert prepared[0] is pair[0] and prepared[1] is pair[1]
+
+
+@pytest.mark.parametrize("inference_warmup", [False, True])
+def test_scale_pair_validation_precedes_any_copy(inference_warmup):
+    from vllm_hcu.model_executor.layers.fused_moe.aiter_moe_dispatch import (
+        HcuAiterMoeDispatchError, _PreparedScales, _copy_prepared_scales,
+    )
+
+    with torch.inference_mode(inference_warmup):
+        old = (torch.ones(1, 2), torch.ones(1, 2))
+    before = tuple(s.clone() for s in old)
+    pointers = tuple(s.data_ptr() for s in old)
+    entry = _PreparedScales(object(), old, ())
+    with pytest.raises(HcuAiterMoeDispatchError, match="layout changed"):
+        _copy_prepared_scales(entry, (torch.full((1, 2), 3.), torch.full((1, 3), 4.)))
+    for actual, expected in zip(old, before):
+        torch.testing.assert_close(actual, expected)
+    assert tuple(s.data_ptr() for s in old) == pointers
 
 
 @pytest.mark.parametrize("available", [False, True])
