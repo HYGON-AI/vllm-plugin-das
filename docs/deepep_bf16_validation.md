@@ -53,6 +53,9 @@ Weight updates refresh the packed copy while retaining its storage address.
   EvalScope benchmark elapsed 393.0 seconds; API request latency sum
   314.455 seconds; 4501 output tokens (14.31 output tokens/request-second,
   including prompt processing). This is a serial end-to-end sample measurement.
+- The graph-safe production script was rerun with the same HumanEval32 client:
+  accuracy and pass@1 were both 32/32 (100%). EvalScope elapsed time was
+  269.74 seconds for 32 serial requests; no request errors occurred.
 - Earlier Triton HT baseline: pass@1=32/32, latency sum 211.488 seconds,
   4601 output tokens (21.75 output tokens/request-second). This baseline ran
   the previous day; outputs and hardware activity differ, so this is not a
@@ -80,6 +83,7 @@ Weight updates refresh the packed copy while retaining its storage address.
 | Configuration | HumanEval pass@1 | Sum API latency (s) | Output tokens | Output tokens / API second |
 | --- | --- | ---: | ---: | ---: |
 | DeepGEMM + DeepEP auto | 32/32 | 314.455 | 4501 | 14.31 |
+| DeepGEMM + DeepEP auto + FULL_AND_PIECEWISE (graph-safe 2048/24) | 32/32 | 269.74* | — | — |
 | AITER config, native Triton fallback + allgather/reducescatter | 32/32 | 163.539 | 4654 | 28.46 |
 | Earlier Triton + DeepEP HT | 32/32 | 211.488 | 4601 | 21.76 |
 
@@ -87,6 +91,8 @@ These serial API measurements include prefill and decode. Communication
 backends, memory budgets, model outputs, run dates and other-device activity
 differ; they are not isolated kernel benchmarks. This BF16 DeepGEMM
 implementation demonstrates correctness for the sampled tasks, not a speedup.
+\* EvalScope wall time; this run disabled performance collection, so request
+latency and output-token counters are unavailable.
 
 Host artifacts:
 - `/home/evalscope-qwen35-das-deepgemm-32/reports/report.html`
@@ -95,6 +101,7 @@ Host artifacts:
 - `/home/bf16-deepep-validation/server-fixed.log`
 - `/home/bf16-deepep-validation/server-aiter.log`
 - `/home/bf16-deepep-validation/server-main-graph24-180k.log`
+- `/home/bf16-deepep-validation/server-final-graph.log`
 
 The main host script `/home/vllm_1102_zb.sh` now uses the validated DeepGEMM
 configuration. The original eager Triton baseline script is preserved at
