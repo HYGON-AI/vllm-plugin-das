@@ -193,3 +193,50 @@ concurrency 1 and 1415.4 ms at concurrency 2. These cross-run HTTP measurements
 are a compatibility check, not an isolated end-to-end speedup measurement.
 The encoder timing gains above do not establish a comparable end-to-end gain;
 the full 765-question QA evaluation was not rerun for this copy-only change.
+
+## Spatial patch projection
+
+At `b8a11b0`, large patch batches are laid out as spatial positions in one
+channels-last 1×1 convolution, then viewed back in patch order. This avoids
+launching the convolution as one batch item per patch while keeping the
+checkpoint's parameter layout and convolution/bias operations.
+
+The fast path is restricted to CUDA BF16, a 1536×3×16×16 weight tensor and
+2048–8192 total patches. Small spatial convolutions select a different MIOpen
+reduction order: randomized 384-patch inputs exposed nonzero differences even
+without bias. The final dispatch therefore retains the original path outside
+the validated range instead of weakening the precision checks.
+
+A TP8 real-weight comparison against `93e3272` uses ten warmups per tower and
+30 alternating CUDA-event samples per case/version, with Python GC disabled
+during timing. Medians from this separate timing repeat, with no samples
+removed:
+
+| Input | Before ms | After ms | Latency reduction |
+| --- | ---: | ---: | ---: |
+| Small image, original path | 17.887 | 17.868 | 0.1% |
+| Large image | 63.408 | 53.783 | 15.2% |
+| Two large images | 126.531 | 107.337 | 15.2% |
+| Small and large image | 78.052 | 67.388 | 13.7% |
+| Small and two large images | 141.217 | 121.071 | 14.3% |
+
+The small-image difference is timing noise; its convolution path is unchanged.
+These are additional encoder latency reductions relative to the preceding
+activation-copy optimization. They do not establish an additional 50% gain or
+an end-to-end serving speedup.
+
+All 307 related model/runner tests pass, including fixed-seed native-convolution
+comparisons below, at and above the fast-path boundaries. A separate 120-case
+randomized shape sweep in the fast range has zero output differences. Complete
+encoder outputs for all 765 original RealWorldQA image rows (762 unique images),
+processed in pairs, match exactly on all eight TP ranks. Five standalone cases
+also cover small/large, mixed-size and up to three-image inputs. The complete
+765-question HTTP evaluation was not rerun for this change.
+
+A fresh normal FULL_AND_PIECEWISE server at `b8a11b0` loads the complete
+checkpoint and captures new graphs, without a diagnostic worker extension or
+development RPC. All 136 fixed performance requests match the preceding
+`00a5fa0` normal-server control's raw answers; seven constrained smoke checks
+pass. HTTP QA p50 is 802.9 ms at concurrency 1 and 1398.1 ms at concurrency 2.
+These cross-run, repeated-image HTTP checks do not isolate an end-to-end gain
+from this change; default encoder-cache reuse can hide encoder improvements.
