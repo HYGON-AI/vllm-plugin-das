@@ -10,6 +10,14 @@ import torch
 from vllm_hcu.v1.attention.ops.fp8_paged_mqa_gfx938 import (
     gfx938_fp8_paged_mqa_logits,
 )
+from vllm_hcu.platforms.hcu import on_gfx938
+
+pytestmark = [
+    pytest.mark.hcu,
+    pytest.mark.skipif(
+        not torch.cuda.is_available() or not on_gfx938(), reason="requires gfx938",
+    ),
+]
 
 
 def _case(

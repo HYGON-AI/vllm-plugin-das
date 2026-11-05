@@ -10,16 +10,19 @@ from tests.kernels.test_gfx938_indexer_normal_layout import (
 from vllm_hcu.platforms.hcu import on_gfx938
 from vllm_hcu.v1.attention.ops.rocm_aiter_mla_sparse import rocm_fp8_paged_mqa_logits
 
-pytestmark = pytest.mark.skipif(
-    not torch.cuda.is_available() or not on_gfx938(), reason="requires gfx938",
-)
+pytestmark = [
+    pytest.mark.hcu,
+    pytest.mark.skipif(
+        not torch.cuda.is_available() or not on_gfx938(), reason="requires gfx938",
+    ),
+]
 
 
 def _decode(args):
     q, cache, weights, lengths, table, max_len = args
     return rocm_fp8_paged_mqa_logits(
         q, cache, weights, lengths, table, None, max_len,
-        token_major=True, clean_logits=False,
+        kcache_layout="normal", prefer_direct=True, clean_logits=False,
     )
 
 

@@ -4,6 +4,8 @@
 
 from types import SimpleNamespace
 
+import pytest
+
 from vllm.v1.core.sched.request_queue import FCFSRequestQueue
 
 from vllm_hcu.patch.platform.framework_opt import patch_scheduler
@@ -154,3 +156,21 @@ def test_unlimited_streak_never_forces_decode_step(monkeypatch):
     sched, _ = _prefill_burst(monkeypatch, 0)
     setattr(sched, patch_scheduler._ISOLATE_STREAK, 100)
     assert "decode" not in sched.schedule().num_scheduled_tokens
+
+@pytest.mark.parametrize("enabled", [False, True])
+def test_custom_ops_master_controls_isolation(monkeypatch, enabled):
+    from vllm_hcu.platforms import envs as henvs
+    monkeypatch.setenv("VLLM_HCU_USE_CUSTOM_OPS", str(int(enabled)))
+    monkeypatch.setattr(henvs, "VLLM_HCU_PCP_ISOLATE_PREFILL", True)
+    monkeypatch.setattr(henvs, "VLLM_HCU_DEEPSEEK_V4_PCP_LOCAL_QUERIES", True)
+    sched = _FakeScheduler(
+        [_request("decode", 100, 120)], [_request("new", 12288, 0)]
+    )
+    delattr(sched, patch_scheduler._ISOLATE_PREFILL)
+    sched.vllm_config = SimpleNamespace(
+        model_config=SimpleNamespace(architectures=["DeepseekV4ForCausalLM"]),
+        parallel_config=SimpleNamespace(prefill_context_parallel_size=8),
+    )
+    expected = {"new"} if enabled else {"decode", "new"}
+    assert set(sched.schedule().num_scheduled_tokens) == expected
+    assert getattr(sched, patch_scheduler._ISOLATE_PREFILL) is enabled

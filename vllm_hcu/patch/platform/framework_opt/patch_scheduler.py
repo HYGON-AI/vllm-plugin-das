@@ -165,7 +165,9 @@ def _install_pcp_prefill_isolation(scheduler: type) -> None:
 
             enabled = bool(
                 henvs.VLLM_HCU_PCP_ISOLATE_PREFILL
-                and henvs.VLLM_HCU_DEEPSEEK_V4_PCP_LOCAL_QUERIES
+                and henvs.optional_custom_op_enabled(
+                    henvs.VLLM_HCU_DEEPSEEK_V4_PCP_LOCAL_QUERIES
+                )
                 and self.vllm_config.parallel_config.prefill_context_parallel_size > 1
                 and is_deepseek_v4(self.vllm_config)
             )

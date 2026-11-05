@@ -27,6 +27,55 @@ class _FlatAddressCache:
 
 
 @triton.jit
+def _load_indexer_tile(
+    Cache, Tables, tokens, dims, batch, end,
+    T_BATCH: tl.constexpr, T_PAGE: tl.constexpr,
+    PAGE_SIZE: tl.constexpr, DIM: tl.constexpr,
+    CACHE_PAGE_STRIDE: tl.constexpr, NUM_PAGES: tl.constexpr,
+    TABLE_WIDTH: tl.constexpr, MAX_LEN: tl.constexpr, TOKEN_MAJOR: tl.constexpr,
+):
+    # Keep physical addresses in int64 and clamp masked OOB pages on HCU.
+    logical_page = tokens // PAGE_SIZE
+    valid = (tokens < MAX_LEN) & (tokens < end) & (logical_page < TABLE_WIDTH)
+    page = tl.load(
+        Tables + batch * T_BATCH + logical_page * T_PAGE, valid, other=-1
+    ).to(tl.int64)
+    valid = valid & (page >= 0) & (page < NUM_PAGES)
+    page = tl.where(valid, page, 0)
+    slot = tokens % PAGE_SIZE
+    page_base = page.to(tl.int64) * CACHE_PAGE_STRIDE
+    if TOKEN_MAJOR:
+        in_page_offset = slot[None, :] * DIM + dims[:, None]
+    else:
+        in_page_offset = (
+            (slot[None, :] // 16) * (16 * DIM)
+            + (dims[:, None] // 16) * 256
+            + (slot[None, :] % 16) * 16
+            + dims[:, None] % 16
+        )
+    offset = page_base[None, :] + in_page_offset.to(tl.int64)
+    keys = tl.load(Cache + offset, (dims[:, None] < DIM) & valid[None, :], 0.0)
+    return keys, valid, page_base, slot
+
+
+@triton.jit
+def _store_indexer_tile(
+    Cache, Out, dots, weights, valid, page_base, slot, row, tokens,
+    PAGE_SIZE: tl.constexpr, DIM: tl.constexpr, MAX_LEN: tl.constexpr,
+):
+    scale_ptr = (Cache + page_base + PAGE_SIZE * DIM + slot * 4).to(
+        tl.pointer_type(tl.float32)
+    )
+    scales = tl.load(scale_ptr, valid, 0)
+    scores = tl.sum(tl.maximum(dots, 0) * weights[:, None], axis=0) * scales
+    tl.store(
+        Out + row * MAX_LEN + tokens,
+        tl.where(valid, scores, -float("inf")),
+        tokens < MAX_LEN,
+    )
+
+
+@triton.jit
 def _paged_logits(
     Q,
     Cache,
@@ -81,30 +130,11 @@ def _paged_logits(
                 tokens < MAX_LEN,
             )
         return
-    logical_page = tokens // PAGE_SIZE
-    valid = (tokens < MAX_LEN) & (tokens < end) & (logical_page < TABLE_WIDTH)
-    page = tl.load(
-        Tables + batch * T_BATCH + logical_page * T_PAGE, valid, other=-1
-    ).to(tl.int64)
-    valid = valid & (page >= 0) & (page < NUM_PAGES)
-    # HCU still faults on masked OOB pointers; clamp before forming addresses.
-    page = tl.where(valid, page, 0)
-    slot = tokens % PAGE_SIZE
-    # Keep the full physical-page address in int64. Layer-split caches can
-    # exceed the signed-int32 offset range because pages retain their packed
-    # cross-layer stride.
-    page_base = page.to(tl.int64) * CACHE_PAGE_STRIDE
-    if TOKEN_MAJOR:
-        in_page_offset = slot[None, :] * DIM + dims[:, None]
-    else:
-        in_page_offset = (
-            (slot[None, :] // 16) * (16 * DIM)
-            + (dims[:, None] // 16) * 256
-            + (slot[None, :] % 16) * 16
-            + dims[:, None] % 16
-        )
-    offset = page_base[None, :] + in_page_offset.to(tl.int64)
-    keys = tl.load(Cache + offset, (dims[:, None] < DIM) & valid[None, :], 0.0)
+    keys, valid, page_base, slot = _load_indexer_tile(
+        Cache, Tables, tokens, dims, batch, end,
+        T_BATCH, T_PAGE, PAGE_SIZE, DIM, CACHE_PAGE_STRIDE,
+        NUM_PAGES, TABLE_WIDTH, MAX_LEN, TOKEN_MAJOR,
+    )
     query_values = tl.load(
         Q + batch * Q_BATCH + query * Q_NEXT + heads[:, None] * Q_HEAD + dims[None, :],
         (heads[:, None] < HEADS) & (dims[None, :] < DIM),
@@ -112,15 +142,9 @@ def _paged_logits(
     )
     dots = tl.dot(query_values, keys)
     weights = tl.load(Weights + row * W_ROW + heads * W_HEAD, heads < HEADS, 0)
-    scale_ptr = (Cache + page_base + PAGE_SIZE * DIM + slot * 4).to(
-        tl.pointer_type(tl.float32)
-    )
-    scales = tl.load(scale_ptr, valid, 0)
-    scores = tl.sum(tl.maximum(dots, 0) * weights[:, None], axis=0) * scales
-    tl.store(
-        Out + row * MAX_LEN + tokens,
-        tl.where(valid, scores, -float("inf")),
-        tokens < MAX_LEN,
+    _store_indexer_tile(
+        Cache, Out, dots, weights, valid, page_base, slot, row, tokens,
+        PAGE_SIZE, DIM, MAX_LEN,
     )
 
 
@@ -180,37 +204,15 @@ def _paged_logits_live_tiles(
     weights = tl.load(Weights + row * W_ROW + heads * W_HEAD, heads < HEADS, 0)
     for tile in range(tl.program_id(1), tl.cdiv(end, BLOCK_T), TILE_PROGRAMS):
         tokens = tile * BLOCK_T + tl.arange(0, BLOCK_T)
-        logical_page = tokens // PAGE_SIZE
-        valid = (tokens < MAX_LEN) & (tokens < end) & (logical_page < TABLE_WIDTH)
-        page = tl.load(
-            Tables + batch * T_BATCH + logical_page * T_PAGE, valid, other=-1
-        ).to(tl.int64)
-        valid = valid & (page >= 0) & (page < NUM_PAGES)
-        # HCU still faults on masked OOB pointers; clamp before forming addresses.
-        page = tl.where(valid, page, 0)
-        slot = tokens % PAGE_SIZE
-        page_base = page.to(tl.int64) * CACHE_PAGE_STRIDE
-        if TOKEN_MAJOR:
-            in_page_offset = slot[None, :] * DIM + dims[:, None]
-        else:
-            in_page_offset = (
-                (slot[None, :] // 16) * (16 * DIM)
-                + (dims[:, None] // 16) * 256
-                + (slot[None, :] % 16) * 16
-                + dims[:, None] % 16
-            )
-        offset = page_base[None, :] + in_page_offset.to(tl.int64)
-        keys = tl.load(Cache + offset, (dims[:, None] < DIM) & valid[None, :], 0.0)
-        dots = tl.dot(query_values, keys)
-        scale_ptr = (Cache + page_base + PAGE_SIZE * DIM + slot * 4).to(
-            tl.pointer_type(tl.float32)
+        keys, valid, page_base, slot = _load_indexer_tile(
+            Cache, Tables, tokens, dims, batch, end,
+            T_BATCH, T_PAGE, PAGE_SIZE, DIM, CACHE_PAGE_STRIDE,
+            NUM_PAGES, TABLE_WIDTH, MAX_LEN, TOKEN_MAJOR,
         )
-        scales = tl.load(scale_ptr, valid, 0)
-        scores = tl.sum(tl.maximum(dots, 0) * weights[:, None], axis=0) * scales
-        tl.store(
-            Out + row * MAX_LEN + tokens,
-            tl.where(valid, scores, -float("inf")),
-            tokens < MAX_LEN,
+        dots = tl.dot(query_values, keys)
+        _store_indexer_tile(
+            Cache, Out, dots, weights, valid, page_base, slot, row, tokens,
+            PAGE_SIZE, DIM, MAX_LEN,
         )
 
 

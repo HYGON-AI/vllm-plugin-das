@@ -422,14 +422,8 @@ def apply_to_module(module: ModuleType) -> bool:
             # must contain raw BF16 keys rather than FP8 bytes plus scales.
             if on_gfx938():
                 if not self.use_fp4_kv:
-                    # Native V4 constructs vllm.models.deepseek_v4.compressor,
-                    # not the legacy HCU compressor. Register its token-major
-                    # FP8 pages here, on the indexer that actually owns them.
-                    from vllm_hcu.v1.attention.ops.rocm_aiter_mla_sparse import (
-                        set_indexer_cache_token_major,
-                    )
-
-                    set_indexer_cache_token_major(True)
+                    # Keep V4's optimized backend local to its owning cache.
+                    self.k_cache._hcu_indexer_direct_decode = True
             else:
                 self.k_cache.dtype = torch.bfloat16
                 self.k_cache.head_dim = self.head_dim

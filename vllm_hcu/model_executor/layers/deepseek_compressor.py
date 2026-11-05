@@ -294,11 +294,9 @@ class DeepseekCompressor(nn.Module):
                 self._scale_dim = 4  # single float32 scale
                 # These kernels write token-major pages; tell the decode
                 # indexer reader not to assume 16x16 preshuffled tiles.
-                from vllm_hcu.v1.attention.ops.rocm_aiter_mla_sparse import (
-                    set_indexer_cache_token_major,
-                )
-
-                set_indexer_cache_token_major(True)
+                cache_layer = self._static_forward_context.get(self.k_cache_prefix)
+                if cache_layer is not None:
+                    cache_layer._hcu_indexer_direct_decode = True
             self._num_warps = 1
         else:
             raise ValueError(

@@ -135,10 +135,10 @@ def test_bf16_gather_passes_logical_4d_cache_as_nhd_to_kernel(monkeypatch):
 
 
 @pytest.mark.parametrize(
-    ("gfx938", "token_major"), [(False, False), (True, False), (True, True)]
+    ("gfx938", "direct_decode"), [(False, False), (True, False), (True, True)]
 )
-def test_native_decode_matches_custom_op_writer_layout(
-    monkeypatch, gfx938, token_major
+def test_native_decode_uses_cache_local_backend(
+    monkeypatch, gfx938, direct_decode
 ):
     from vllm import _custom_ops as ops
 
@@ -161,10 +161,15 @@ def test_native_decode_matches_custom_op_writer_layout(
     monkeypatch.setattr(sparse, "DeepseekV32IndexerMetadata", SimpleNamespace)
     monkeypatch.setattr(
         sparse, "get_forward_context",
-        lambda: SimpleNamespace(attn_metadata={prefix: metadata}),
+        lambda: SimpleNamespace(
+            attn_metadata={prefix: metadata},
+            no_compile_layers={
+                prefix: SimpleNamespace(_hcu_indexer_direct_decode=direct_decode),
+                "other": SimpleNamespace(_hcu_indexer_direct_decode=not direct_decode),
+            },
+        ),
     )
     monkeypatch.setattr(sparse, "on_gfx938", lambda: gfx938)
-    monkeypatch.setattr(sparse, "_INDEXER_CACHE_TOKEN_MAJOR", token_major)
     monkeypatch.setattr(sparse, "_use_lightop_sparse_mla_topk", lambda: False)
     monkeypatch.setattr(ops, "indexer_k_quant_and_cache", lambda *args: None)
     monkeypatch.setattr(sparse, "indexer_k_bf16_cache_triton", lambda *args: None)
@@ -187,11 +192,8 @@ def test_native_decode_matches_custom_op_writer_layout(
     assert calls == [{
         "max_model_len": 6,
         "clean_logits": False,
-        **(
-            {"token_major": True}
-            if token_major
-            else {"kcache_layout": "normal" if gfx938 else "preshuffle"}
-        ),
+        "kcache_layout": "normal" if gfx938 else "preshuffle",
+        "prefer_direct": direct_decode if gfx938 else False,
     }]
     assert set(result[0].tolist()) == {1, 2}
 

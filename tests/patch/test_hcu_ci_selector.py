@@ -1250,10 +1250,14 @@ def test_unified_aiter_moe_accuracy_test_selects_gfx938() -> None:
 
 @pytest.mark.parametrize("full", [False, True])
 @pytest.mark.parametrize("include_related_paths", [False, True])
+@pytest.mark.parametrize("target", [
+    "tests/kernels/test_gfx938_indexer_normal_layout.py",
+    "tests/kernels/test_gfx938_fp8_indexer_reader.py",
+    "tests/kernels/test_dsv4_compact_indexer.py",
+])
 def test_gfx938_indexer_regression_is_selected_and_partitioned(
-    full: bool, include_related_paths: bool,
+    full: bool, include_related_paths: bool, target: str,
 ) -> None:
-    target = "tests/kernels/test_gfx938_indexer_normal_layout.py"
     changed_paths = [target]
     if include_related_paths:
         changed_paths.extend([

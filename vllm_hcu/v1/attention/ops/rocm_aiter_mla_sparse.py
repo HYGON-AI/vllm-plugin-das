@@ -48,20 +48,6 @@ def _get_lightop_attention():
 
 _GLOBAL_LOGITS_BUFFERS = {}
 
-# DeepSeek-V4's compressor writes the sparse-indexer K cache token-major
-# (slot * D + d), unlike the 16x16 tiles of indexer_k_quant_and_cache.  Its
-# prefill gather already reads token-major; the gfx938 decode reader must too.
-_INDEXER_CACHE_TOKEN_MAJOR = False
-
-
-def set_indexer_cache_token_major(value: bool = True) -> None:
-    global _INDEXER_CACHE_TOKEN_MAJOR
-    _INDEXER_CACHE_TOKEN_MAJOR = value
-
-
-def indexer_cache_token_major() -> bool:
-    return _INDEXER_CACHE_TOKEN_MAJOR
-
 # mqa_logits分块全局缓存大小，避免大输入打开pc时OOM
 MAX_ELEMENTS = 16384 * 16384
 
@@ -923,7 +909,7 @@ def rocm_fp8_paged_mqa_logits(
     force_aiter_triton: bool = False,
     kcache_layout: str = "preshuffle",
     clean_logits: bool = True,
-    token_major: bool = False,
+    prefer_direct: bool = False,
 ) -> torch.Tensor:
     """Compute FP8 MQA logits using paged KV-cache.
 
@@ -945,6 +931,8 @@ def rocm_fp8_paged_mqa_logits(
         kcache_layout: Page layout of gfx938 caches with block_size > 1:
             "preshuffle" (16x16 tiles) or "normal" (token-major). "normal"
             is rejected on other platforms.
+        prefer_direct: Prefer V4's direct/compact backend for normal pages.
+            This selects a backend without introducing another cache layout.
         clean_logits: Whether positions past each row's context end must be
             -inf.  Only the gfx938 direct reader honors False.
 
@@ -1030,7 +1018,7 @@ def rocm_fp8_paged_mqa_logits(
             raise RuntimeError(
                 "AITER paged-MQA does not support gfx938 preshuffled KPool pages"
             )
-        if kcache_layout == "normal":
+        if kcache_layout == "normal" and not prefer_direct:
             # LightOp paged_mqa_logits reads token-major pages only. It
             # rejects next_n > 2 and ignores per-query [B, next_n] lengths,
             # so each MTP verify token becomes its own batch row.
@@ -1054,7 +1042,8 @@ def rocm_fp8_paged_mqa_logits(
         # Keep the packed LightOp workspace below its 2 GiB offset limit.
         # Native MTP verification may flatten all queries to next_n == 1.
         if (
-            token_major and not clean_logits and block_size == 64
+            kcache_layout == "normal" and prefer_direct
+            and not clean_logits and block_size == 64
             and q_fp8.shape[2:] == (64, 128) and batch_size * next_n >= 6
             and (kv_cache_fp8.shape[0] + 1) * block_size * 132 < (1 << 31)
             and kv_cache_fp8.stride(0) % 4 == 0
@@ -1078,7 +1067,7 @@ def rocm_fp8_paged_mqa_logits(
             block_tables,
             max_model_len,
             fill_tail=clean_logits,
-            token_major=token_major,
+            token_major=kcache_layout == "normal",
         )
 
     aiter_paged_mqa_logits_module = None
@@ -1732,7 +1721,8 @@ def rocm_aiter_sparse_attn_indexer_native(
     cp_kv_cache_interleave_size: int = 1,
 ) -> torch.Tensor:
     # careful! this will be None in dummy run
-    attn_metadata = get_forward_context().attn_metadata
+    forward_context = get_forward_context()
+    attn_metadata = forward_context.attn_metadata
     fp8_dtype = (
         current_platform.fp8_dtype()
         if not current_platform.is_rocm() or on_gfx938()
@@ -2003,14 +1993,12 @@ def rocm_aiter_sparse_attn_indexer_native(
             # merge gathers scores only at those selected indices, so no
             # decode consumer reads the unwritten tail.
             clean_logits=False,
-            # V4 compressor pages use the branch's direct/compact reader.
-            # Caches owned by the native custom-op writer use upstream's
-            # explicit layout contract instead.
-            **(
-                {"token_major": True}
-                if indexer_cache_token_major()
-                else {"kcache_layout": "normal" if on_gfx938() else "preshuffle"}
-            ),
+            kcache_layout="normal" if on_gfx938() else "preshuffle",
+            # Bind the backend preference to this cache, not the whole process.
+            prefer_direct=bool(getattr(
+                forward_context.no_compile_layers.get(k_cache_prefix),
+                "_hcu_indexer_direct_decode", False,
+            )) if on_gfx938() else False,
         )
 
         # A padded decode batch has more kernel rows than actual decode
