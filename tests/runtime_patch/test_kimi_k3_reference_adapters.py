@@ -427,3 +427,46 @@ def test_situ_fallback_matches_native_dynamic_range(
     assert actual.dtype == dtype
     assert actual.shape == expected.shape
     torch.testing.assert_close(actual, expected, rtol=0, atol=0)
+
+
+@pytest.mark.parametrize("batch", [1, 4, 32])
+def test_conv_update_packs_strided_state_indices(monkeypatch, batch):
+    patch = patch_kimi_k3_kda_reference_paths
+    target = ModuleType(patch.TARGET_MODULE)
+    target.causal_conv1d_fn = lambda *args, **kwargs: None
+    target.causal_conv1d_update = lambda *args, **kwargs: "native"
+    target.chunk_kda_with_fused_gate = lambda **kwargs: None
+    target.KimiK3DeltaAttention = type("Attention", (), {"_forward": lambda *args, **kwargs: None})
+    monkeypatch.setenv("VLLM_HCU_USE_CUSTOM_OPS", "1")
+    monkeypatch.setenv("VLLM_KIMI_CONV1D_BACKEND", "auto")
+    monkeypatch.setattr(torch.cuda, "is_current_stream_capturing", lambda: False)
+    external = ModuleType("causal_conv1d")
+    seen = []
+
+    def update(x, state, weight, bias, **kwargs):
+        indices = kwargs["conv_state_indices"]
+        assert indices.stride(0) == 1
+        seen.append(indices)
+        return x
+
+    external.causal_conv1d_update = update
+    monkeypatch.setitem(sys.modules, "causal_conv1d", external)
+    assert patch.apply_to_module(target)
+    indices = torch.arange(batch * 5, dtype=torch.int32).view(batch, 5)[:, 0]
+    assert indices.stride(0) == 5
+    if batch == 1:
+        assert indices.is_contiguous()
+    original = indices.clone()
+    x = torch.ones(batch, 8)
+    output = target.causal_conv1d_update(x, torch.zeros(batch * 5, 8, 3),
+                                       torch.ones(8, 4), conv_state_indices=indices)
+    assert output is x
+    torch.testing.assert_close(seen[0], original)
+    assert seen[0].dtype == indices.dtype and seen[0].device == indices.device
+    assert indices.stride(0) == 5
+
+    assert target.causal_conv1d_update(
+        x, torch.zeros(batch * 5, 8, 3), torch.ones(8, 4),
+        conv_state_indices=indices, num_accepted_tokens=torch.ones(batch),
+    ) == "native"
+    assert len(seen) == 1
