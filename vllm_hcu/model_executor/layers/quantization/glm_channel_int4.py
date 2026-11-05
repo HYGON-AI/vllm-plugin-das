@@ -18,6 +18,9 @@ from collections.abc import Callable, Iterable, Mapping
 from typing import Any
 
 import torch
+from vllm.logger import init_logger
+
+logger = init_logger(__name__)
 
 _INT4_PACK_FACTOR = 8
 
@@ -131,11 +134,17 @@ def _parse_quant_args(value: Any) -> Any:
 
         try:
             return QuantizationArgs.model_validate(value)
-        except Exception:
+        except Exception as error:
             # Whatever the validator raises (pydantic's ValidationError, or a
             # TypeError / NotImplementedError from a compressed-tensors check),
             # native cannot load this group either, and the parent reports it
-            # with its own error. Detection must not abort config resolution.
+            # with its own error. Detection must not abort config resolution,
+            # but say why this method was not selected.
+            logger.warning_once(
+                "GLM channel INT4 W4A8 was not selected: compressed-tensors "
+                "cannot parse a quantization group (%s).",
+                f"{type(error).__name__}: {error}",
+            )
             return None
     if isinstance(value, (list, tuple, str, bytes, int, float)):
         return None

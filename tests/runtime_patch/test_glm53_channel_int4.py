@@ -515,15 +515,24 @@ def test_none_and_already_parsed_arguments_pass_through_the_parser() -> None:
 def test_schema_errors_beyond_value_error_select_nothing(monkeypatch, error) -> None:
     """Whatever a compressed-tensors validator raises, detection selects nothing."""
     from compressed_tensors.quantization import QuantizationArgs
+    from vllm_hcu.model_executor.layers.quantization import glm_channel_int4
 
     def fail(value):
         raise error
 
+    warnings = []
     monkeypatch.setattr(QuantizationArgs, "model_validate", staticmethod(fail))
+    monkeypatch.setattr(
+        glm_channel_int4,
+        "logger",
+        SimpleNamespace(warning_once=lambda message, *args: warnings.append(message % args)),
+    )
     assert is_glm_channel_int4_w4a8(_quant_config(), _glm_hf_config()) is False
     assert GlmMoeDsaW4A8Facade.override_quantization_method(
         _quant_config(), None, _glm_hf_config()
     ) is None
+    # The reason is logged, so a skipped group does not look like a silent miss.
+    assert warnings and all(type(error).__name__ in message for message in warnings)
 
 
 @pytest.mark.parametrize(
@@ -1432,6 +1441,10 @@ def test_ignore_rules_are_checked_once_per_expert_during_detection(monkeypatch) 
             "model.layers.9.mlp.experts.0.gate_proj",
         ],
         ["re:.*", "model.layers.4.mlp.experts.0.gate_proj"],
+        # An empty pattern matches everything, and a plain target is a literal
+        # even where it contains regex metacharacters such as ".".
+        ["re:"],
+        ["model.layers.4.mlp.experts.0.gate_proj", "re:^$"],
     ],
 )
 def test_probe_matcher_agrees_with_native_name_matching(targets) -> None:
@@ -1448,7 +1461,14 @@ def test_probe_matcher_agrees_with_native_name_matching(targets) -> None:
         for layer in (4, 9)
         for expert in (0, 1)
         for proj in ("gate_proj", "up_proj", "down_proj")
-    ] + ["model.layers.4.mlp.experts", "Linear", ""]
+    ] + [
+        "model.layers.4.mlp.experts",
+        "Linear",
+        "",
+        # Differs from the plain target only where "." would match any character.
+        "model-layers-4-mlp-experts-0-gate_proj",
+        "model.layers.4.mlp.experts.0.gate_proj.extra",
+    ]
     for probe in probes:
         assert matches(probe) is any(
             is_equal_or_regex_match(probe, target) for target in targets
@@ -1481,9 +1501,10 @@ def test_path_targets_are_not_compared_one_by_one_during_detection(monkeypatch) 
     # The model has 5 layers, so the first probes (layers 0-4) match no target
     # before the literal layers 40-59 named by the targets are reached.
     assert is_glm_channel_int4_w4a8(quant, hf_config) is True
-    # One check per target for the class-name rule and none per probe. Comparing
-    # every probe with every target would take over 38,000 comparisons here.
-    assert len(calls) <= 2 * len(targets) + 10
+    # One native comparison per target for the class-name rule, plus a handful
+    # for the ignore list. Comparing every probe with every target would take
+    # over 38,000 comparisons here, so the bound leaves no room for it.
+    assert len(targets) <= len(calls) <= len(targets) + 20
 
 
 def test_class_target_is_only_resolved_for_projections_without_a_path_target(
