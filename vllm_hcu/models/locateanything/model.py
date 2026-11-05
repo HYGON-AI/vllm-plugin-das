@@ -52,9 +52,13 @@ class LocateAnythingProcessingInfo(KimiVLProcessingInfo):
         if settings:
             return LocateAnythingImageProcessor.from_config(settings, **overrides)
         # Some providers do not expose an image-processor config on the context.
+        model_config = self.ctx.model_config
         load_kwargs = dict(overrides)
-        load_kwargs.setdefault("revision", self.ctx.model_config.revision)
-        load_kwargs.setdefault("token", self.ctx.model_config.hf_token)
+        load_kwargs.setdefault("revision", model_config.revision)
+        load_kwargs.setdefault("token", model_config.hf_token)
+        load_kwargs.setdefault(
+            "cache_dir", getattr(model_config, "_vllm_hcu_locateanything_cache_dir", None)
+        )
         return LocateAnythingImageProcessor.from_pretrained(self.model_id, **load_kwargs)
 
     @cached_property

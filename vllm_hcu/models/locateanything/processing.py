@@ -170,7 +170,27 @@ class LocateAnythingImageProcessor:
     @classmethod
     def from_pretrained(cls, model_path, *, revision=None, token=None, cache_dir=None,
                         local_files_only=False, subfolder="", **overrides):
-        config_path = cached_file(model_path, "preprocessor_config.json", revision=revision,
+        filename = "preprocessor_config.json"
+        snapshot = Path(model_path)
+        if (
+            cache_dir is not None
+            and snapshot.parent.name == "snapshots"
+            and snapshot.parent.parent.name.startswith("models--")
+            and snapshot.is_dir()
+        ):
+            # Offline EngineArgs resolves Hub IDs to local snapshots before
+            # LoadConfig is available. Look in the configured cache at that
+            # same pinned revision if the original snapshot lacks this file.
+            relative_file = Path(subfolder or "") / filename
+            cached_snapshot = (
+                Path(cache_dir) / snapshot.parent.parent.name / "snapshots" / snapshot.name
+            )
+            if (
+                not (snapshot / relative_file).is_file()
+                and (cached_snapshot / relative_file).is_file()
+            ):
+                model_path = cached_snapshot
+        config_path = cached_file(model_path, filename, revision=revision,
                                   token=token, cache_dir=cache_dir,
                                   local_files_only=local_files_only, subfolder=subfolder)
         if config_path is None:

@@ -178,7 +178,58 @@ def test_processing_info_fallback_keeps_model_revision_and_auth(monkeypatch):
     token=object()
     info=processing_info({},token)
     info.get_hf_processor()
-    assert seen == [('private/model',dict(revision='pinned-revision',token=token))]
+    assert seen == [('private/model',dict(revision='pinned-revision',token=token,cache_dir=None))]
+
+
+@pytest.mark.parametrize("use_snapshot_path", [False, True])
+def test_processing_info_fallback_uses_offline_download_cache(monkeypatch, tmp_path, use_snapshot_path):
+    import torch
+
+    monkeypatch.setattr(
+        torch.cuda, "get_device_properties",
+        lambda device: SimpleNamespace(gcnArchName="gfx936"),
+    )
+    from vllm.config import LoadConfig
+    from vllm.config.compilation import CompilationConfig, CUDAGraphMode
+    from vllm_hcu.patch.platform.core_fix import patch_vllm_config
+    from vllm_hcu.patch.platform.framework_opt import patch_multiproc_executor
+    from vllm_hcu.platforms.hcu import HCUPlatform
+
+    info = processing_info({})
+    model = info.ctx.model_config
+    model.hf_config = SimpleNamespace(model_type="locateanything")
+    model.revision = "d" * 40
+    if use_snapshot_path:
+        default_snapshot = tmp_path / "default" / "models--private--model" / "snapshots" / model.revision
+        default_snapshot.mkdir(parents=True)
+        model.model = str(default_snapshot)
+    for name, limit in (("download", 64), ("explicit", 128)):
+        snapshot = tmp_path / name / "models--private--model" / "snapshots" / model.revision
+        snapshot.mkdir(parents=True)
+        (snapshot / "preprocessor_config.json").write_text(
+            json.dumps({"in_token_limit": limit}), encoding="utf-8",
+        )
+    monkeypatch.setattr(patch_vllm_config, "validate_and_update_hcu_config", lambda config: None)
+    monkeypatch.setattr(patch_multiproc_executor, "select_hcu_multiproc_executor", lambda config: False)
+    HCUPlatform.check_and_update_config(SimpleNamespace(
+        additional_config={},
+        model_config=model,
+        load_config=LoadConfig(download_dir=str(tmp_path / "download")),
+        cache_config=None,
+        attention_config=SimpleNamespace(backend=None),
+        compilation_config=CompilationConfig(cudagraph_mode=CUDAGraphMode.PIECEWISE),
+        parallel_config=SimpleNamespace(worker_cls="auto"),
+    ))
+
+    assert info._image_processor(local_files_only=True).in_token_limit == 64
+    assert info._image_processor(
+        local_files_only=True, cache_dir=tmp_path / "explicit",
+    ).in_token_limit == 128
+    if use_snapshot_path:
+        (default_snapshot / "preprocessor_config.json").write_text(
+            json.dumps({"in_token_limit": 256}), encoding="utf-8",
+        )
+        assert info._image_processor(local_files_only=True).in_token_limit == 256
 
 
 def real_block_counter():
