@@ -313,9 +313,45 @@ class DSparkDeepseekV4ForCausalLM(_dspark.DSparkDeepseekV4ForCausalLM):
             original = _dspark.DSparkDeepseekV4ForCausalLM.load_weights
             mapping = original.__globals__["fused_moe_make_expert_params_mapping"]
 
+            expert_mapping = []
+
             def make_mapping(*args, **kwargs):
                 kwargs["num_redundant_experts"] = self.num_redundant_experts
-                return mapping(*args, **kwargs)
+                result = mapping(*args, **kwargs)
+                expert_mapping.extend(result)
+                return result
+
+            loaded_experts = set()
+
+            def load_all_expert_replicas():
+                # The upstream expert loop stops at its first local success.
+                # Intercept only expert tensors and visit every physical
+                # mapping; all other checkpoint handling stays upstream.
+                parameters = dict(self.named_parameters())
+                for name, weight in weights:
+                    mapped = self._remap_dspark_name(name)
+                    if mapped is None or ".experts." not in mapped:
+                        yield name, weight
+                        continue
+                    if mapped.endswith(".scale"):
+                        suffix = (
+                            ".weight_scale"
+                            if getattr(self.config, "expert_dtype", "fp4") == "fp4"
+                            else ".weight_scale_inv"
+                        )
+                        mapped = mapped.removesuffix(".scale") + suffix
+                    if "weight_scale" in mapped and weight.dtype == torch.float8_e8m0fnu:
+                        weight = weight.view(torch.uint8)
+                    for param_name, weight_name, expert_id, shard_id in expert_mapping:
+                        if weight_name not in mapped:
+                            continue
+                        target = mapped.replace(weight_name, param_name)
+                        param = parameters[target]
+                        if param.weight_loader(
+                            param, weight, target, shard_id=shard_id,
+                            expert_id=expert_id, return_success=True,
+                        ):
+                            loaded_experts.add(target)
 
             namespace = dict(original.__globals__)
             namespace["fused_moe_make_expert_params_mapping"] = make_mapping
@@ -323,6 +359,6 @@ class DSparkDeepseekV4ForCausalLM(_dspark.DSparkDeepseekV4ForCausalLM):
                 original.__code__, namespace, original.__name__,
                 original.__defaults__, original.__closure__,
             )
-            return loader(self, weights)
+            return loader(self, load_all_expert_replicas()) | loaded_experts
         finally:
             self._loading_dspark_weights = False
