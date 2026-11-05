@@ -3,13 +3,16 @@
 """Packing conversion, AITER gemm2 layout, and quant detection for GLM-5.3 channel INT4."""
 
 import ast
+import builtins
 import sys
 import time
-from collections.abc import Iterable
+import typing
+from collections.abc import Callable, Iterable
 from functools import partial
 from pathlib import Path
 from types import ModuleType, SimpleNamespace
 from typing import cast
+from unittest.mock import MagicMock
 
 import pytest
 import torch
@@ -1653,51 +1656,105 @@ def test_last_logical_expert_is_checked_without_ep_locality(projection) -> None:
 
 
 _MODELS = Path(__file__).parents[2] / "vllm_hcu/models"
+_GATE = "is_fused_shared_experts_enabled"
 
 
-def _extract_functions(path, class_name=None, names=()):
-    """Production ``def`` nodes, optionally the methods of one class."""
-    body = ast.parse(path.read_text(encoding="utf-8")).body
+def _free_names(nodes):
+    """Names the given definitions read from their module."""
+    loaded, bound = set(), set()
+    for node in nodes:
+        for sub in ast.walk(node):
+            if isinstance(sub, ast.Name):
+                (loaded if isinstance(sub.ctx, ast.Load) else bound).add(sub.id)
+            elif isinstance(sub, ast.arg):
+                bound.add(sub.arg)
+            elif isinstance(sub, (ast.FunctionDef, ast.ClassDef)):
+                bound.add(sub.name)
+            elif isinstance(sub, (ast.Import, ast.ImportFrom)):
+                bound.update(
+                    (alias.asname or alias.name).split(".")[0] for alias in sub.names
+                )
+    return {name for name in loaded - bound if not hasattr(builtins, name)}
+
+
+def _exec_production(path, *, class_name=None, methods=(), functions=(), stubs=None):
+    """Run production code without importing the module that holds it.
+
+    The named module-level functions and the named methods of ``class_name``
+    (rebuilt as an ``nn.Module`` subclass) are compiled from the real source.
+    Collaborators come from ``stubs``; any other free name is a ``MagicMock``,
+    so an unrelated edit to these bodies does not break the test, while the
+    behaviour under test still comes from the real code.
+    """
+    tree = ast.parse(path.read_text(encoding="utf-8"))
+    func_nodes = [
+        node
+        for node in tree.body
+        if isinstance(node, ast.FunctionDef) and node.name in functions
+    ]
+    body, method_nodes = list(func_nodes), []
     if class_name is not None:
-        body = next(
-            node.body
-            for node in body
+        owner = next(
+            node
+            for node in tree.body
             if isinstance(node, ast.ClassDef) and node.name == class_name
         )
-    return [
-        node
-        for node in body
-        if isinstance(node, ast.FunctionDef) and node.name in names
-    ]
-
-
-def _load_fused_shared_experts_gate(flag):
-    """The production gate, extracted so the full model module is not imported."""
-    path = _MODELS / "deepseek_v2.py"
-    (func,) = _extract_functions(
-        path, names=("is_fused_shared_experts_enabled",)
-    )
-    warnings = []
-    namespace = {
-        "QuantizationConfig": object,
-        "rocm_aiter_ops": SimpleNamespace(
-            is_fusion_moe_shared_experts_enabled=lambda: flag
-        ),
-        "logger": SimpleNamespace(
-            warning_once=lambda message, *args: warnings.append(message % args)
-        ),
+        method_nodes = [
+            node
+            for node in owner.body
+            if isinstance(node, ast.FunctionDef) and node.name in methods
+        ]
+        base = ast.Attribute(
+            value=ast.Name(id="nn", ctx=ast.Load()), attr="Module", ctx=ast.Load()
+        )
+        body.append(
+            ast.ClassDef(
+                name=class_name,
+                bases=[base],
+                keywords=[],
+                body=method_nodes,
+                decorator_list=[],
+            )
+        )
+    assert {node.name for node in (*func_nodes, *method_nodes)} == {
+        *functions,
+        *methods,
     }
     module = ast.Module(
         body=[
             ast.ImportFrom(
                 module="__future__", names=[ast.alias(name="annotations")], level=0
             ),
-            func,
+            *body,
         ],
         type_ignores=[],
     )
+    namespace = {
+        name: MagicMock(name=name)
+        for name in _free_names([*func_nodes, *method_nodes])
+    }
+    namespace.update(nn=torch.nn, torch=torch, typing=typing, Callable=Callable)
+    namespace.update(stubs or {})
     exec(compile(ast.fix_missing_locations(module), str(path), "exec"), namespace)
-    return namespace["is_fused_shared_experts_enabled"], warnings
+    return namespace
+
+
+def _load_fused_shared_experts_gate(flag):
+    """The production gate, with the AITER flag fixed to ``flag``."""
+    warnings = []
+    namespace = _exec_production(
+        _MODELS / "deepseek_v2.py",
+        functions=(_GATE,),
+        stubs=dict(
+            rocm_aiter_ops=SimpleNamespace(
+                is_fusion_moe_shared_experts_enabled=lambda: flag
+            ),
+            logger=SimpleNamespace(
+                warning_once=lambda message, *args: warnings.append(message % args)
+            ),
+        ),
+    )
+    return namespace[_GATE], warnings
 
 
 def test_glm_config_does_not_support_fused_shared_experts() -> None:
@@ -1738,31 +1795,6 @@ def _build_moe(flag, quant_config):
 
     Returns the module, the FusedMoE call kwargs and the shared-MLP constructions.
     """
-    path = _MODELS / "deepseek_v2.py"
-    gate, _ = _load_fused_shared_experts_gate(flag)
-    (init,) = _extract_functions(path, "DeepseekV2MoE", ("__init__",))
-    cls = ast.ClassDef(
-        name="DeepseekV2MoE",
-        bases=[
-            ast.Attribute(
-                value=ast.Name(id="nn", ctx=ast.Load()),
-                attr="Module",
-                ctx=ast.Load(),
-            )
-        ],
-        keywords=[],
-        body=[init],
-        decorator_list=[],
-    )
-    module = ast.Module(
-        body=[
-            ast.ImportFrom(
-                module="__future__", names=[ast.alias(name="annotations")], level=0
-            ),
-            cls,
-        ],
-        type_ignores=[],
-    )
     experts, shared = [], []
 
     def fused_moe(**kwargs):
@@ -1773,21 +1805,25 @@ def _build_moe(flag, quant_config):
         shared.append(kwargs)
         return SimpleNamespace(kind="shared-mlp")
 
-    namespace = {
-        "nn": torch.nn,
-        "torch": torch,
-        "is_fused_shared_experts_enabled": gate,
-        "get_tensor_model_parallel_world_size": lambda: 1,
-        "get_tensor_model_parallel_rank": lambda: 0,
-        "get_ep_group": lambda: SimpleNamespace(
-            device_group=SimpleNamespace(size=lambda: 1), rank_in_group=0
+    namespace = _exec_production(
+        _MODELS / "deepseek_v2.py",
+        class_name="DeepseekV2MoE",
+        methods=("__init__",),
+        stubs=dict(
+            is_fused_shared_experts_enabled=_load_fused_shared_experts_gate(flag)[0],
+            rocm_aiter_ops=SimpleNamespace(is_fused_moe_enabled=lambda: False),
+            get_tensor_model_parallel_world_size=lambda: 1,
+            get_tensor_model_parallel_rank=lambda: 0,
+            get_ep_group=lambda: SimpleNamespace(
+                device_group=SimpleNamespace(size=lambda: 1), rank_in_group=0
+            ),
+            GateLinear=lambda *args, **kwargs: SimpleNamespace(
+                out_dtype=torch.float32
+            ),
+            DeepseekV2SharedMLP=shared_mlp,
+            FusedMoE=fused_moe,
         ),
-        "GateLinear": lambda *args, **kwargs: SimpleNamespace(out_dtype=torch.float32),
-        "rocm_aiter_ops": SimpleNamespace(is_fused_moe_enabled=lambda: False),
-        "DeepseekV2SharedMLP": shared_mlp,
-        "FusedMoE": fused_moe,
-    }
-    exec(compile(ast.fix_missing_locations(module), str(path), "exec"), namespace)
+    )
     config = SimpleNamespace(
         hidden_act="silu",
         hidden_size=16,
@@ -1804,13 +1840,15 @@ def _build_moe(flag, quant_config):
         enable_eplb=False,
         eplb_config=SimpleNamespace(num_redundant_experts=0),
     )
-    moe = namespace["DeepseekV2MoE"](config, parallel, quant_config, "model.layers.4.mlp")
+    moe = namespace["DeepseekV2MoE"](
+        config, parallel, quant_config, "model.layers.4.mlp"
+    )
     return moe, experts, shared
 
 
 @pytest.mark.parametrize("flag", [False, True])
 def test_moe_constructor_follows_the_fusion_gate(flag) -> None:
-    """The gate result decides the shared-expert module and what FusedMoE is told."""
+    """The gate result decides whether the shared experts are built as a module."""
     from vllm_hcu.model_executor.layers.quantization.glm_moe_dsa_w4a8 import (
         GlmMoeDsaChannelW4A8Config,
     )
@@ -1828,62 +1866,164 @@ def test_moe_constructor_follows_the_fusion_gate(flag) -> None:
     for quant_config in (None, SimpleNamespace()):
         moe, experts, shared = _build_moe(flag, quant_config)
         assert moe.is_fusion_moe_shared_experts_enabled is flag
-        if flag:
-            assert moe.shared_experts is None and shared == []
-            assert experts[0]["shared_experts"] is None
-            assert experts[0]["n_shared_experts"] == 1
-        else:
-            assert moe.shared_experts is not None and len(shared) == 1
-            assert experts[0]["n_shared_experts"] is None
+        assert (moe.shared_experts is None) is flag
+        assert (shared == []) is flag
 
 
-class _FusionFlagUses(ast.NodeVisitor):
-    """Where model code reads the AITER fusion flag or calls the gate."""
+class _RecordingParams:
+    """Parameters whose weight loaders record where each checkpoint tensor lands."""
 
-    def __init__(self):
-        self.scope, self.raw, self.gated = [], [], []
-
-    def _enter(self, node):
-        self.scope.append(node.name)
-        self.generic_visit(node)
-        self.scope.pop()
-
-    visit_ClassDef = visit_FunctionDef = _enter
-
-    def visit_Call(self, node):
-        func = node.func
-        where = ".".join(self.scope)
-        if (
-            isinstance(func, ast.Attribute)
-            and func.attr == "is_fusion_moe_shared_experts_enabled"
+    def __init__(self, prefix):
+        self.prefix, self.calls, self.params = prefix, [], {}
+        for name, kind in (
+            ("shared_experts.gate_up_proj.weight", "stacked"),
+            ("shared_experts.down_proj.weight", "plain"),
+            ("experts.w13_weight", "expert"),
+            ("experts.w2_weight", "expert"),
         ):
-            self.raw.append(where)
-        elif isinstance(func, ast.Name) and func.id == "is_fused_shared_experts_enabled":
-            self.gated.append(where)
-        self.generic_visit(node)
+            self.params[f"{prefix}.{name}"] = self._parameter(name, kind)
+
+    def _parameter(self, name, kind):
+        param = torch.nn.Parameter(torch.zeros(1), requires_grad=False)
+
+        def loader(param, loaded_weight, *args, **kwargs):
+            if kind == "expert":
+                self.calls.append((name, kwargs["expert_id"], kwargs["shard_id"]))
+                return True
+            self.calls.append((name, args[0] if args else None, None))
+
+        param.weight_loader = loader
+        return param
 
 
-def _fusion_flag_uses(filename):
-    visitor = _FusionFlagUses()
-    visitor.visit(ast.parse((_MODELS / filename).read_text(encoding="utf-8")))
-    return visitor
+def _expert_params_mapping(
+    model, *, ckpt_gate_proj_name, ckpt_down_proj_name, ckpt_up_proj_name,
+    num_experts, num_redundant_experts=0, **_,
+):
+    """The tuples native ``build_expert_params_mapping`` returns (no prefix)."""
+    return [
+        (
+            "experts.w13_" if shard in ("w1", "w3") else "experts.w2_",
+            f"experts.{expert_id}.{checkpoint_name}.",
+            expert_id,
+            shard,
+        )
+        for expert_id in range(num_experts + num_redundant_experts)
+        for checkpoint_name, shard in (
+            (ckpt_gate_proj_name, "w1"),
+            (ckpt_down_proj_name, "w2"),
+            (ckpt_up_proj_name, "w3"),
+        )
+    ]
 
 
-@pytest.mark.parametrize(
-    "filename,decision_point",
-    [
-        ("deepseek_v2.py", "DeepseekV2MoE.__init__"),
-        ("deepseek_v2.py", "DeepseekV2Model.load_weights"),
-        ("deepseek_mtp.py", "DeepSeekMTP.load_weights"),
-    ],
-)
-def test_shared_expert_fusion_decision_points_use_only_the_gate(
-    filename, decision_point
+def _loader_destinations(loader, flag, quant_config):
+    """Run a production ``load_weights`` over shared and routed expert tensors.
+
+    Returns where the tensors landed as ``(parameter, expert id or shard, shard)``.
+    """
+    v2 = _MODELS / "deepseek_v2.py"
+    gate = _load_fused_shared_experts_gate(flag)[0]
+    spec_layer = _exec_production(
+        v2, functions=("get_spec_layer_idx_from_weight_name",)
+    )["get_spec_layer_idx_from_weight_name"]
+    stubs = dict(
+        is_fused_shared_experts_enabled=gate,
+        fused_moe_make_expert_params_mapping=_expert_params_mapping,
+        normalize_routed_expert_checkpoint_name=normalize_routed_expert_checkpoint_name,
+        get_spec_layer_idx_from_weight_name=spec_layer,
+        get_pp_missing_layer_names=lambda model: [],
+        is_pp_missing_parameter=lambda name, model: False,
+        maybe_remap_kv_scale_name=lambda name, params: name,
+        _is_local_indexer_weight=lambda name, prefixes: True,
+        _try_load_quantized_indexer_wk=lambda *args, **kwargs: False,
+    )
+    if loader == "main":
+        stubs["_rewrite_stacked_param_name"] = _exec_production(
+            v2, functions=("_rewrite_stacked_param_name",)
+        )["_rewrite_stacked_param_name"]
+        namespace = _exec_production(
+            v2, class_name="DeepseekV2Model", methods=("load_weights",), stubs=stubs
+        )
+        model = namespace["DeepseekV2Model"]()
+        params = _RecordingParams("layers.4.mlp")
+        prefix = "layers.4.mlp"
+        model.use_mha = False
+        model.num_redundant_experts = 0
+    else:
+        namespace = _exec_production(
+            _MODELS / "deepseek_mtp.py",
+            class_name="DeepSeekMTP",
+            methods=("load_weights", "_rewrite_spec_layer_name"),
+            stubs=stubs,
+        )
+        model = namespace["DeepSeekMTP"]()
+        # The MTP block sits under ``mtp_block`` in the model, not in the checkpoint.
+        params = _RecordingParams("model.layers.78.mtp_block.mlp")
+        prefix = "model.layers.78.mlp"
+        model.use_pp = False
+        model.model = SimpleNamespace(mtp_start_layer_idx=78, num_mtp_layers=1)
+    model.named_parameters = lambda *args, **kwargs: iter(params.params.items())
+    model.quant_config = quant_config
+    model.config = SimpleNamespace(
+        n_routed_experts=4,
+        n_shared_experts=1,
+        num_hidden_layers=5 if loader == "main" else 78,
+        num_nextn_predict_layers=1,
+    )
+    packed = torch.zeros(8, 2, dtype=torch.int32)
+    model.load_weights(
+        iter(
+            [
+                (f"{prefix}.shared_experts.gate_proj.weight", torch.zeros(8, 16)),
+                (f"{prefix}.shared_experts.up_proj.weight", torch.zeros(8, 16)),
+                (f"{prefix}.shared_experts.down_proj.weight", torch.zeros(16, 8)),
+                (f"{prefix}.experts.0.gate_proj.weight_packed", packed),
+                (f"{prefix}.experts.0.down_proj.weight_packed", packed),
+            ]
+        )
+    )
+    return set(params.calls)
+
+
+_ROUTED_EXPERT = {("experts.w13_weight", 0, "w1"), ("experts.w2_weight", 0, "w2")}
+_SHARED_MODULE = {
+    ("shared_experts.gate_up_proj.weight", 0, None),
+    ("shared_experts.gate_up_proj.weight", 1, None),
+    ("shared_experts.down_proj.weight", None, None),
+}
+_SHARED_IN_EXPERT_SLOTS = {
+    ("experts.w13_weight", 4, "w1"),
+    ("experts.w13_weight", 4, "w3"),
+    ("experts.w2_weight", 4, "w2"),
+}
+
+
+@pytest.mark.parametrize("loader", ["main", "mtp"])
+@pytest.mark.parametrize("flag", [False, True])
+def test_glm_int4_shared_experts_load_into_their_own_module(loader, flag) -> None:
+    """Shared-expert tensors must not be renamed into packed INT4 expert slots."""
+    from vllm_hcu.model_executor.layers.quantization.glm_moe_dsa_w4a8 import (
+        GlmMoeDsaChannelW4A8Config,
+    )
+
+    glm_config = GlmMoeDsaChannelW4A8Config.__new__(GlmMoeDsaChannelW4A8Config)
+    assert _loader_destinations(loader, flag, glm_config) == (
+        _ROUTED_EXPERT | _SHARED_MODULE
+    )
+
+
+@pytest.mark.parametrize("loader", ["main", "mtp"])
+@pytest.mark.parametrize("quant_config", [None, SimpleNamespace()])
+def test_other_configs_keep_following_the_fusion_flag_in_the_loaders(
+    loader, quant_config
 ) -> None:
-    """The constructor and both loaders must agree, so none reads the raw flag."""
-    uses = _fusion_flag_uses(filename)
-    assert decision_point in uses.gated
-    assert decision_point not in uses.raw
+    assert _loader_destinations(loader, False, quant_config) == (
+        _ROUTED_EXPERT | _SHARED_MODULE
+    )
+    assert _loader_destinations(loader, True, quant_config) == (
+        _ROUTED_EXPERT | _SHARED_IN_EXPERT_SLOTS
+    )
 
 
 @pytest.mark.parametrize(
@@ -1912,6 +2052,8 @@ def test_loaders_that_use_the_gate_keep_the_quant_config(filename, class_name) -
         if isinstance(node, ast.Assign)
         for target in node.targets
     )
+
+
 
 
 def test_expert_loaders_convert_weights_and_scales() -> None:
