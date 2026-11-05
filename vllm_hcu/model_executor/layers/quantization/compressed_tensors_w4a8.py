@@ -36,7 +36,9 @@ def repack_aiter_gemm2(weight):
 def checkpoint_weights(model, weights):
     """Rename packed tensors only for owners using this adapter."""
     owners = {
-        name: module
+        # MoERunner owns the RoutedExperts child; checkpoint names address
+        # the enclosing .experts owner instead of .experts.routed_experts.
+        name.removesuffix(".routed_experts"): module
         for name, module in model.named_modules()
         if isinstance(getattr(module, "quant_method", None), HcuCompressedW4A8)
     }
@@ -70,11 +72,18 @@ def mtp_quant_config(config, layer_prefix):
     result = copy(config)
     original = result.get_scheme_dict
 
+    def ignored(name):
+        candidates = [name]
+        if name is not None and ".experts." in name:
+            candidates.append(name.split(".experts.", 1)[0] + ".experts")
+        return any(
+            should_ignore_layer(n, result.ignore, result.packed_modules_mapping)
+            for n in candidates
+        )
+
     def get_scheme_dict(layer, layer_name=None):
         if layer_name is not None and layer_name.startswith(layer_prefix + "."):
-            if should_ignore_layer(
-                layer_name, result.ignore, result.packed_modules_mapping
-            ):
+            if ignored(layer_name):
                 return None
             targets = result.target_scheme_map.keys()
             physical = find_matched_target(
@@ -85,6 +94,8 @@ def mtp_quant_config(config, layer_prefix):
             # a generic class fallback must not hide canonical INT4 rules.
             if physical == class_default:
                 layer_name = "model.decoder" + layer_name[len(layer_prefix) :]
+        if ignored(layer_name):
+            return None
         return original(layer, layer_name)
 
     result.get_scheme_dict = get_scheme_dict
@@ -93,6 +104,10 @@ def mtp_quant_config(config, layer_prefix):
 
 def select_method(config, layer, prefix):
     """Use native parsed schemes, priority, formats and ignore rules."""
+    from vllm.model_executor.layers.quantization.compressed_tensors.utils import (
+        should_ignore_layer,
+    )
+
     config._add_fused_moe_to_target_scheme_map()
     count = layer.moe_config.num_logical_experts
     schemes = [
@@ -125,6 +140,12 @@ def select_method(config, layer, prefix):
     selected = [supported(s) for s in schemes]
     if not any(selected):
         return None
+    if should_ignore_layer(prefix, config.ignore, config.packed_modules_mapping):
+        from vllm.model_executor.layers.fused_moe import UnquantizedFusedMoEMethod
+
+        # Native MoE selection only checks projection names. Returning None
+        # here would let it quantize an explicitly ignored fused owner.
+        return UnquantizedFusedMoEMethod(layer.moe_config)
     if not all(selected) or any(s != schemes[0] for s in schemes):
         raise ValueError(
             "HCU W4A8 requires the same scheme for every expert projection"

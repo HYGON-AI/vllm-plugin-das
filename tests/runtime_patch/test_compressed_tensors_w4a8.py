@@ -91,6 +91,24 @@ def test_ignored_projection_cannot_fall_into_quantized_adapter():
         adapter.select_method(config, layer, "model.layers.3.mlp.experts")
 
 
+def test_ignored_w4a8_owner_does_not_fall_back_to_quantized_dispatch(monkeypatch):
+    from vllm.model_executor.layers import fused_moe
+
+    prefix = "model.layers.3.mlp.experts"
+    data = recipe()
+    data["ignore"] = [prefix]
+    config = CompressedTensorsConfig.from_config(data)
+    layer = SimpleNamespace(moe_config=SimpleNamespace(num_logical_experts=2))
+    unquantized = object()
+    monkeypatch.setattr(fused_moe, "UnquantizedFusedMoEMethod", lambda moe: unquantized)
+    monkeypatch.setattr(adapter, "HcuCompressedW4A8", lambda *a: object())
+    assert adapter.select_method(config, layer, prefix) is unquantized
+    # Keep unrelated quantization on native dispatch.
+    config = CompressedTensorsConfig.from_config(recipe(num_bits=8))
+    config.ignore = [prefix]
+    assert adapter.select_method(config, layer, prefix) is None
+
+
 @pytest.mark.parametrize(
     "weight_changes",
     [{"num_bits": 8}, {"strategy": "group", "group_size": 128}, {"symmetric": False}],
@@ -140,6 +158,123 @@ def test_mtp_owner_before_loader_name_rewrite():
     assert next(adapter.checkpoint_weights(parent, rows))[0] == (
         "model.layers.78.mlp.experts.0.up_proj.weight"
     )
+
+
+@pytest.mark.parametrize("mtp", [False, True])
+def test_model_loader_with_native_moe_runner(monkeypatch, mtp):
+    """Run production loaders with the real runner/expert module hierarchy."""
+    import ast
+    import typing
+    from pathlib import Path
+
+    from vllm.model_executor.layers.fused_moe import (
+        RoutedExperts,
+        fused_moe_make_expert_params_mapping,
+    )
+    from vllm.model_executor.layers.fused_moe.runner import moe_runner
+
+    # No distributed worker/custom-op registry is needed for checkpoint loading.
+    monkeypatch.setattr(moe_runner, "get_current_vllm_config", lambda: None)
+    monkeypatch.setattr(
+        moe_runner, "register_layer_for_moe_forward_op", lambda *a: None
+    )
+    moe = SimpleNamespace(
+        moe_backend="triton",
+        moe_parallel_config=SimpleNamespace(ep_size=1, tp_size=1),
+        has_bias=False,
+        tp_rank=0,
+        is_act_and_mul=True,
+    )
+    quant = CompressedTensorsConfig.from_config(recipe())
+    experts = RoutedExperts.__new__(RoutedExperts)
+    torch.nn.Module.__init__(experts)
+    experts.moe_config = moe
+    experts.quant_config = quant
+    experts.quant_method = adapter.HcuCompressedW4A8(quant, moe)
+    experts.expert_map_manager = SimpleNamespace(map_global_to_local=lambda i: i)
+    experts.quant_method.create_weights(
+        experts, 1, 32, 32, torch.bfloat16, weight_loader=experts.weight_loader
+    )
+    runner = moe_runner.MoERunner("model.layers.78.mlp.experts", moe, None, experts)
+    parent = torch.nn.Module()
+    container = torch.nn.Module()
+    parent.model = container
+    container.mtp_start_layer_idx = 78
+    container.num_mtp_layers = 1
+    container.layers = torch.nn.ModuleDict({"78" if mtp else "3": torch.nn.Module()})
+    block = container.layers["78" if mtp else "3"]
+    if mtp:
+        block.mtp_block = torch.nn.Module()
+        block = block.mtp_block
+    block.mlp = torch.nn.Module()
+    block.mlp.experts = runner
+
+    env = {
+        "typing": typing,
+        "Callable": typing.Callable,
+        "rocm_aiter_ops": SimpleNamespace(
+            is_fusion_moe_shared_experts_enabled=lambda: False
+        ),
+        "fused_moe_make_expert_params_mapping": fused_moe_make_expert_params_mapping,
+        "get_pp_missing_layer_names": lambda model: set(),
+        "is_pp_missing_parameter": lambda name, model: False,
+        "_is_local_indexer_weight": lambda *a: True,
+        "_try_load_quantized_indexer_wk": lambda *a: False,
+    }
+    root = Path(__file__).resolve().parents[2] / "vllm_hcu/models"
+    for file in ["deepseek_v2.py", "deepseek_mtp.py"]:
+        tree = ast.parse((root / file).read_text())
+        for node in tree.body:
+            if isinstance(node, ast.ClassDef):
+                wanted = {"DeepseekV2Model", "DeepSeekMTP"}
+                if node.name not in wanted:
+                    continue
+                for method in node.body:
+                    if isinstance(method, ast.FunctionDef) and method.name in {
+                        "load_weights",
+                        "_rewrite_spec_layer_name",
+                    }:
+                        method.name = node.name + "_" + method.name
+                        code = "from __future__ import annotations\n" + ast.unparse(
+                            method
+                        )
+                        exec(compile(code, file, "exec"), env)  # noqa: S102
+            elif (
+                isinstance(node, ast.FunctionDef)
+                and node.name == "get_spec_layer_idx_from_weight_name"
+            ):
+                code = "from __future__ import annotations\n" + ast.unparse(node)
+                exec(compile(code, file, "exec"), env)  # noqa: S102
+    model = parent if mtp else container
+    model.config = SimpleNamespace(
+        n_routed_experts=1, num_hidden_layers=78, num_nextn_predict_layers=1
+    )
+    model.num_redundant_experts = 0
+    model.use_mha = False
+    model.use_pp = False
+    model._rewrite_spec_layer_name = env[
+        "DeepSeekMTP__rewrite_spec_layer_name"
+    ].__get__(model)
+    prefix = "model.layers.78" if mtp else "layers.3"
+    packed = torch.arange(128, dtype=torch.int32).reshape(32, 4)
+    rows = []
+    for projection in ["gate", "up", "down"]:
+        name = f"{prefix}.mlp.experts.0.{projection}_proj"
+        rows.extend(
+            [
+                (name + ".weight_packed", packed),
+                (name + ".weight_shape", torch.tensor([32, 32])),
+                (name + ".weight_scale", torch.full((32, 1), 16.0)),
+            ]
+        )
+    loader = env[("DeepSeekMTP" if mtp else "DeepseekV2Model") + "_load_weights"]
+    loaded = loader(model, iter(rows))
+    assert loaded == set(dict(model.named_parameters()))
+    expected = adapter.convert_packed_int4(packed)
+    assert torch.equal(experts.w13_weight[0], torch.cat([expected, expected]))
+    assert torch.equal(experts.w2_weight[0], expected)
+    assert torch.all(experts.w13_weight_scale == 1)
+    assert torch.all(experts.w2_weight_scale == 1)
 
 
 @pytest.mark.parametrize("backend,ep", [("unsupported", 1), ("triton", 2)])
@@ -271,6 +406,11 @@ def test_mtp_quant_alias_keeps_physical_rules_and_ignore(target):
     assert first.get_scheme_dict(layer, physical) is None
     # Canonical ignore entries still apply when selecting canonical rules.
     second.ignore = ["model.decoder.mlp.experts.0.up_proj"]
+    assert second.get_scheme_dict(layer, physical.replace("78", "79")) is None
+    # Whole-owner ignores must survive both physical and canonical naming.
+    first.ignore = ["model.layers.78.mlp.experts"]
+    assert first.get_scheme_dict(layer, physical) is None
+    second.ignore = ["model.decoder.mlp.experts"]
     assert second.get_scheme_dict(layer, physical.replace("78", "79")) is None
     assert adapter.mtp_quant_config(None, "model.layers.78") is None
 

@@ -11,8 +11,10 @@ weights, and does not call the weight-reload APIs.
 
 - Native matching covers all logical experts and gate/up/down projections.
   Mixed expert schemes and unsupported output-activation quantization fail.
+  Whole-owner ignore rules bypass quantized selection, including MTP aliases.
 - Checkpoint uint4b8 int32 weights become signed SlimQuant bytes; channel scales
-  become FP32 divided by 16. Packed-name normalization is owner-local.
+  become FP32 divided by 16. Packed-name normalization resolves the native
+  `MoERunner.routed_experts` hierarchy and remains owner-local.
 - `auto` and `aiter` install the eight-nibble regroup plus AITER gemm2 layout
   once at load time. P/D token counts can choose different MOE_C configs. The
   adapter copies each selected config and disables generic weight/scale shuffle
@@ -110,9 +112,10 @@ VLLM_PLUGINS=__disabled__ PYTHONPATH="$PWD" python -m pytest -q \
   tests/runtime_patch/test_quant_gemm_aiter.py -k 'compressed or prequantized'
 ```
 
-40 targeted CPU tests pass, including native TP=1/2/4/8 loading on every rank,
-MTP constructors/aliases, gemm2 regroup and alternating P/D token counts without
-repacking or mutating cached AITER configs. A wider two-file run passed 307 tests
+43 targeted CPU tests pass, including native TP=1/2/4/8 loading on every rank,
+production main/MTP loader bodies with the real MoERunner hierarchy, owner
+ignore rules, MTP constructors/aliases, gemm2 regroup and alternating P/D token counts without
+repacking or mutating cached AITER configs. An earlier wider two-file run passed 307 tests
 and failed the same 15 IDs as unchanged upstream (before adding the TP8 case).
 The actual checkpoint config selects layers 3/60/77 and MTP 78 through native
 matching; this config-only probe stubs method construction.
