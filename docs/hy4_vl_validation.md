@@ -240,3 +240,35 @@ development RPC. All 136 fixed performance requests match the preceding
 pass. HTTP QA p50 is 802.9 ms at concurrency 1 and 1398.1 ms at concurrency 2.
 These cross-run, repeated-image HTTP checks do not isolate an end-to-end gain
 from this change; default encoder-cache reuse can hide encoder improvements.
+
+## Canonical channels-last views
+
+At `b669d47`, both fast-path patch inputs and weights use canonical
+channels-last strides through permuted views, with no input or weight copies.
+The original fast-path range, parameter layout and small-input fallback are
+retained. Singleton axes can make `is_contiguous(channels_last)` true even when
+strides are not canonical; explicitly calling `.to(memory_format=channels_last)`
+on these earlier views allocates and copies. The final path constructs the
+canonical view directly.
+
+TP8 real-weight comparison against `9ee4c46`, ten warmups and 30 alternating
+CUDA-event samples per case/version, GC disabled and no samples removed:
+
+| Input | Before ms | After ms | Saved ms |
+| --- | ---: | ---: | ---: |
+| Large image | 53.862 | 53.792 | 0.070 |
+| Two large images | 107.297 | 107.140 | 0.157 |
+| Small and large image | 67.411 | 67.361 | 0.050 |
+| Small and two large images | 121.036 | 120.887 | 0.150 |
+
+This is a small additional encoder improvement, about 0.1%, not a material
+end-to-end speedup. The small-input fallback is unchanged; its timing
+difference is noise. Forcing channels-last on either merger convolution
+produced nonzero BF16 output differences with real weights and was excluded.
+
+All 307 related regression tests pass. All 120 randomized fast-range shape/seed
+comparisons have zero differences. Complete encoder outputs for the 765
+original dataset image rows (762 unique images), processed in pairs, match
+exactly on all eight ranks. No new HTTP serving run or full 765-question QA
+evaluation was performed for this view-only follow-up; the preceding normal
+HTTP server results above identify their tested revision.

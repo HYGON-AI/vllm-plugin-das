@@ -201,11 +201,14 @@ distinguishes it from diagnostic same-weight runtime controls.
 
 Stop the inference server first so all eight HCUs are idle. Run from the updated
 PR checkout. Prepare the pinned dataset above, then create a detached checkout
-of the version immediately before the spatial patch-projection change:
+of the reference version for the comparison:
 
 ```bash
-git worktree add --detach /tmp/hy4-vit-before-projection \
-  93e32720287a6b90b1938cf730d792e484fb726d
+# Canonical channels-last stride comparison (latest incremental change):
+HY4_VIT_BASELINE=9ee4c46cce0c34fd8ad4bc19d687c3263f984e33
+# Earlier spatial projection: 93e32720287a6b90b1938cf730d792e484fb726d
+# Earlier activation copies: 94810016cb414f5b117d88bce8958541842152f4
+git worktree add --detach /tmp/hy4-vit-reference "$HY4_VIT_BASELINE"
 python - <<'PY'
 import io
 from pathlib import Path
@@ -227,12 +230,12 @@ PY
 export PYTHONPATH="$PWD${PYTHONPATH:+:$PYTHONPATH}"
 torchrun --standalone --nproc-per-node=8 tools/hyv4_vit_bench.py \
   --model /module/Hy4-testing-Channel-FP8-w8a8 \
-  --reference-checkout /tmp/hy4-vit-before-projection --tp-size 8 \
+  --reference-checkout /tmp/hy4-vit-reference --tp-size 8 \
   --case small /tmp/hy4-vit-inputs/small.png \
   --case large /tmp/hy4-vit-inputs/realworldqa-552.png \
   --case two /tmp/hy4-vit-inputs/realworldqa-552.png /tmp/hy4-vit-inputs/realworldqa-571.png \
   --case mixed /tmp/hy4-vit-inputs/small.png /tmp/hy4-vit-inputs/realworldqa-552.png \
-  --output-dir /tmp/hy4-vit-projection-comparison
+  --output-dir /tmp/hy4-vit-comparison
 ```
 
 This repository tool loads actual vision weights into both towers, uses five
@@ -246,5 +249,8 @@ The published ViT tables use separate host-side validation scripts with 30
 samples per version/case and alternating execution order. The encoder gate
 asserts exact complete outputs on every rank for all 765 dataset image rows.
 The preceding activation-copy comparison used baseline `9481001`; the command
-above compares the subsequent spatial projection against `93e3272`. The command above is the reusable shorter comparison; it does not rerun
-that full-split gate or the 765-question HTTP evaluation.
+above compares canonical channels-last strides against `9ee4c46`. Select the
+commented baseline for either earlier optimization. All serving flags remain
+the same; the guarded layout choice is automatic. The command above is the
+reusable shorter comparison; it does not rerun that full-split gate or the
+765-question HTTP evaluation.
