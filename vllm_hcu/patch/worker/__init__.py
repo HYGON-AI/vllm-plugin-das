@@ -243,6 +243,10 @@ _CORE_CALLBACKS: tuple[_CallbackSpec, ...] = (
     _CallbackSpec(_adapter("core_fix", "patch_qwen4_exp_ple_prefetch")),
     _CallbackSpec(_adapter("core_fix", "patch_qwen4_exp_ple_cudagraph")),
     _CallbackSpec(_adapter("core_fix", "patch_rocm_mla_sparse_metadata")),
+    # R94/A' stage-1: MLA-prefill FA varlen -> fp8 dispatch (own callback
+    # so its refusal is logged once, not silently swallowed by a host
+    # patch's tail). Independent of patch_mla_attention success.
+    _CallbackSpec(_adapter("core_fix", "patch_mla_prefill_fp8_a1")),
 )
 
 
