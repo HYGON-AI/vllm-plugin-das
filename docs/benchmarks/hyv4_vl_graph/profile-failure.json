@@ -1,9 +1,0 @@
-{
-  "phase": "first request after max_iterations=3 profiler stop",
-  "status": 500,
-  "error": "HSA_STATUS_ERROR_EXCEPTION; KERNEL VMFault; EngineDeadError",
-  "traces_emitted": 8,
-  "accuracy_pair_started": false,
-  "source_changed": false,
-  "next_step": "fresh graph server without profiler for paired precision validation"
-}

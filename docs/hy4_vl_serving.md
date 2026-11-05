@@ -8,20 +8,18 @@ serving commands; video and speculative decoding are unsupported.
 
 ## Server
 
-The [sparse-index order fix](hy4_vl_sparse_order_precision.md) resolves the
+The [sparse-index order fix](hy4_vl_validation.md#precision-fixes) resolves the
 reproduced long-context variation, including the eager-mode case. Restart the
 server from the updated checkout and capture new graphs. The fix is automatic
 for HYV4-VL on HCU; no additional flag is required. Full/piecewise retains the
 padding guard described below. The complete 765-question rerun matches the
 prior control's raw answers, and the extended image repeat checks pass.
 
-Choose one execution mode. `eager` is the default fallback. Graph configurations
-are experimental: see the [decode graph report](hy4_vl_graph_performance.md) and
-[full/piecewise report](hy4_vl_piecewise_performance.md) for precision, stability
-and performance limits. The [padding precision investigation](hy4_vl_piecewise_precision.md)
-explains the original full/piecewise regression and the current guard: at DP=1,
-the tested v1 HYV4-VL runner uses PIECEWISE only when its token descriptor exactly matches the input
-count. Other prefill chunks run at their original eager size. Stop the previous
+Choose one execution mode. `eager` is the default fallback. The
+[validation summary](hy4_vl_validation.md) records the tested graph modes,
+precision guards, accuracy, performance and configuration limits. At DP=1,
+PIECEWISE replays only when its token descriptor exactly matches the input
+count; other prefill chunks run at their original eager size. Stop the previous
 server before starting another mode.
 
 ```bash
@@ -105,7 +103,7 @@ curl --fail --location \
 
 The dataset is CC BY-ND 4.0. These commands download it locally; the PR does not
 redistribute the images. The dataset/scorer protocol is described in the
-[RealWorldQA report](hy4_realworldqa_validation.md).
+[validation summary](hy4_vl_validation.md#dataset-and-scoring).
 
 ## Client: image smoke checks
 
@@ -191,5 +189,5 @@ PY
 ```
 
 An equal score alone does not establish prediction or numerical equivalence.
-This public-command comparison uses separate processes; the reports distinguish
-it from diagnostic same-weight runtime controls and retain observed differences.
+This public-command comparison uses separate processes; the validation summary
+distinguishes it from diagnostic same-weight runtime controls.
