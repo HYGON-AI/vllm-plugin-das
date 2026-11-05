@@ -98,10 +98,11 @@ def cp_gather_and_upconvert_fp8_kv_cache(
         return
     if dst.shape[0] == 0 or batch_size == 0:
         return
-    _cp_gather_fp8_flat[(triton.cdiv(dst.shape[0], 8),)](
-        src_cache, dst, block_table, workspace_starts,
-        dst.shape[0], batch_size, src_cache.shape[1], block_table.stride(0),
-        src_cache.stride(0), src_cache.stride(1), dst.stride(0),
-        8, num_warps=2,
-        enable_fp_fusion=False,
-    )
+    with torch.cuda.device(src_cache.device):
+        _cp_gather_fp8_flat[(triton.cdiv(dst.shape[0], 8),)](
+            src_cache, dst, block_table, workspace_starts,
+            dst.shape[0], batch_size, src_cache.shape[1], block_table.stride(0),
+            src_cache.stride(0), src_cache.stride(1), dst.stride(0),
+            8, num_warps=2,
+            enable_fp_fusion=False,
+        )

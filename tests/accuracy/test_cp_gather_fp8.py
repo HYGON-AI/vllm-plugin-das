@@ -17,6 +17,24 @@ from vllm_hcu.v1.attention.ops.cp_gather_fp8 import (
 pytestmark = pytest.mark.hcu
 
 
+def _fill_cache(cache):
+    device = cache.device
+    generator = torch.Generator(device=device).manual_seed(42)
+    cache[:, :, :512].random_(0, 256, generator=generator)
+    cache[0, 0, :256].copy_(
+        torch.arange(256, device=device).to(torch.uint8))
+    token = torch.arange(cache.shape[0] * cache.shape[1], device=device,
+                         dtype=torch.float32).view(*cache.shape[:2], 1)
+    base = torch.tensor([0.0, -0.125, 1.0, 19.75], device=device,
+                        dtype=torch.float32)
+    step = torch.tensor([1.0, -2.0, 3.0, -4.0], device=device,
+                        dtype=torch.float32)
+    cache[:, :, 512:528].view(torch.float32).copy_(base + token * step / 4096)
+    rope = cache[:, :, 528:].view(torch.int16)
+    rope.copy_(torch.arange(rope.numel(), device=device).to(torch.int16)
+               .reshape_as(rope))
+
+
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="GPU required")
 @pytest.mark.parametrize("block_size", [32, 64, 128])
 @pytest.mark.parametrize("lengths", [
@@ -36,11 +54,7 @@ def test_cp_gather_bitwise(monkeypatch, block_size, lengths, strided):
                               672 if strided else 656,
                               dtype=torch.uint8, device="cuda")
         cache = storage[:, :, :656]
-        cache[:, :, :512].copy_(torch.arange(512, device="cuda").to(torch.uint8))
-        scales = cache[:, :, 512:528].view(torch.float32)
-        scales.copy_(torch.tensor([0.0, -0.125, 1.0, 19.75], device="cuda"))
-        rope = cache[:, :, 528:].view(torch.int16)
-        rope.copy_(torch.arange(rope.numel(), device="cuda").to(torch.int16).reshape_as(rope))
+        _fill_cache(cache)
         table_storage = torch.zeros(count, blocks + 5,
                                     dtype=torch.int32, device="cuda")
         table = table_storage[:, :blocks]
@@ -64,6 +78,53 @@ def test_cp_gather_bitwise(monkeypatch, block_size, lengths, strided):
         assert torch.equal(dst.view(torch.int16), expected.view(torch.int16))
         if strided:
             assert (dst_storage[:, 576:] == -123).all()
+
+
+@pytest.mark.multi_hcu
+@pytest.mark.hcu_count(2)
+@pytest.mark.skipif(torch.cuda.device_count() < 2, reason="two GPUs required")
+@pytest.mark.parametrize("current_device,cache_device", [(0, 1), (1, 0)])
+def test_cp_gather_uses_cache_device_stream(monkeypatch, current_device,
+                                          cache_device):
+    import vllm_hcu.v1.attention.ops.cp_gather_fp8 as gather
+
+    device = torch.device("cuda", cache_device)
+    if not _supports_fp8_e4m3(device):
+        pytest.skip("the plugin kernel targets gfx938 FP8 E4M3")
+    monkeypatch.setenv("VLLM_HCU_ENABLE_TRITON_CP_GATHER", "1")
+    stream = torch.cuda.Stream(device=device)
+    original_kernel = gather._cp_gather_fp8_flat
+    launches = []
+
+    class CheckedKernel:
+        def __getitem__(self, grid):
+            assert torch.cuda.current_device() == cache_device
+            assert torch.cuda.current_stream(device).cuda_stream == stream.cuda_stream
+            launches.append(grid)
+            return original_kernel[grid]
+
+    with torch.cuda.stream(stream):
+        cache = torch.empty((3, 64, 656), dtype=torch.uint8, device=device)
+        _fill_cache(cache)
+        table = torch.tensor([[2, 0], [0, 1]], dtype=torch.int32, device=device)
+        lengths = torch.tensor([7, 70], dtype=torch.int32, device=device)
+        starts = torch.tensor([0, 7], dtype=torch.int32, device=device)
+        output = torch.full((77, 576), -123, dtype=torch.bfloat16, device=device)
+        expected = torch.empty_like(output)
+        ops.cp_gather_and_upconvert_fp8_kv_cache(
+            cache, expected, table, lengths, starts, 2)
+        monkeypatch.setattr(
+            ops, "cp_gather_and_upconvert_fp8_kv_cache",
+            lambda *args: pytest.fail("candidate unexpectedly used native fallback"),
+        )
+        monkeypatch.setattr(gather, "_cp_gather_fp8_flat", CheckedKernel())
+        with torch.cuda.device(current_device):
+            cp_gather_and_upconvert_fp8_kv_cache(
+                cache, output, table, lengths, starts, 2)
+            assert torch.cuda.current_device() == current_device
+    stream.synchronize()
+    assert len(launches) == 1
+    assert torch.equal(output.view(torch.int16), expected.view(torch.int16))
 
 
 def test_prefill_binding_is_local_and_delegates_other_ops(monkeypatch):
