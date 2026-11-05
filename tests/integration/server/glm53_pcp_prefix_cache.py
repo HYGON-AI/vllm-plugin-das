@@ -3,13 +3,14 @@
 
 CPU-safe to import; this client never starts/stops a server or resets caches.
 Run only against a dedicated, caller-owned GLM5Next PCP8 eager server with
-Head sharding, MTP3, prefix caching and --enable-prompt-tokens-details enabled.
+Head mode 0 or 1, MTP3, prefix caching and --enable-prompt-tokens-details enabled.
 Exact greedy token replay is a conservative regression check, not a proof of
 floating-point identity or a diagnosis of the cause of any observed mismatch.
 """
 from __future__ import annotations
 
 import argparse
+import hashlib
 import json
 import math
 import re
@@ -26,6 +27,9 @@ COUNTERS = (
     "vllm:spec_decode_num_accepted_tokens_total",
 )
 _SAMPLE = re.compile(r'^([a-zA-Z_:][a-zA-Z0-9_:]*)(?:\{[^}]*\})?\s+([-+0-9.eE]+)(?:\s+\d+)?$')
+DEFAULT_PREFIX_TOKENS = 10240
+DEFAULT_OUTPUT_TOKENS = 256
+CASES = ("A_cold", "A_warm", "B_shared", "B_warm", "B_cold")
 
 
 def counters(text: str) -> dict[str, float]:
@@ -44,12 +48,18 @@ def counters(text: str) -> dict[str, float]:
     return result
 
 
-def completion_payload(model: str, prompt: list[int], output_tokens: int) -> dict:
+def completion_payload(model: str, prompt: list[int], output_tokens: int,
+                       *, cache_salt: str | None = None) -> dict:
     if not model or not prompt or output_tokens < 16:
         raise ValueError("model, tokenized prompt and at least 16 output tokens required")
-    return {"model": model, "prompt": prompt, "max_tokens": output_tokens,
-            "temperature": 0, "seed": 42, "ignore_eos": True,
-            "return_token_ids": True, "add_special_tokens": False, "stream": False}
+    payload = {"model": model, "prompt": list(prompt), "max_tokens": output_tokens,
+               "temperature": 0, "seed": 42, "ignore_eos": True,
+               "return_token_ids": True, "add_special_tokens": False, "stream": False}
+    if cache_salt is not None:
+        if not isinstance(cache_salt, str) or not cache_salt:
+            raise ValueError("cache_salt must be a non-empty string")
+        payload["cache_salt"] = cache_salt
+    return payload
 
 
 def check_completion(body: dict, prompt_length: int, output_tokens: int) -> dict:
@@ -77,16 +87,43 @@ def check_completion(body: dict, prompt_length: int, output_tokens: int) -> dict
 
 
 def check_replays(rows: list[dict], minimum_hit: int) -> None:
-    if len(rows) != 4 or minimum_hit <= 0:
-        raise ValueError("four sequential A-cold/A-warm/B-shared/B-warm results required")
-    if rows[0]["cached_tokens"] != 0:
-        raise AssertionError("cold request unexpectedly hit cache; use a fresh unique prefix")
-    if any(r["cached_tokens"] < minimum_hit for r in rows[1:]):
+    if (len(rows) != len(CASES) or minimum_hit <= 0
+            or tuple(row.get("label") for row in rows) != CASES):
+        raise ValueError("five sequential A-cold/A-warm/B-shared/B-warm/B-cold results required")
+    shared_salt = rows[0].get("cache_salt")
+    cold_salt = rows[4].get("cache_salt")
+    if (not isinstance(shared_salt, str) or not shared_salt
+            or any(row.get("cache_salt") != shared_salt for row in rows[:4])
+            or not isinstance(cold_salt, str) or not cold_salt or cold_salt == shared_salt):
+        raise AssertionError("cold B must use an independent cache_salt; A and cached B must share one")
+    if any(rows[index]["cached_tokens"] != 0 for index in (0, 4)):
+        raise AssertionError("cold request unexpectedly hit cache; use fresh independent cache salts")
+    if any(rows[index]["cached_tokens"] < minimum_hit for index in (1, 2, 3)):
         raise AssertionError("warm/shared-prefix requests did not actually reuse enough cached tokens")
     if rows[0]["token_ids"] != rows[1]["token_ids"]:
         raise AssertionError("cold/warm A token IDs differ; investigate numerics/cache state before accepting")
-    if rows[2]["token_ids"] != rows[3]["token_ids"]:
-        raise AssertionError("shared/warm B token IDs differ; investigate numerics/cache state before accepting")
+    for index, mode in ((2, "shared"), (3, "warm")):
+        if rows[4]["token_ids"] != rows[index]["token_ids"]:
+            raise AssertionError(f"cold/{mode} B token IDs differ; investigate numerics/cache state before accepting")
+
+
+def validate_prompts(data: Any) -> dict:
+    """Validate the exact token IDs and output length shared across Head modes."""
+    fields = {"version", "prefix_tokens", "output_tokens", "prompt_a", "prompt_b"}
+    if not isinstance(data, dict) or set(data) != fields or type(data["version"]) is not int or data["version"] != 1:
+        raise ValueError("prompts file must be a version=1 token-ID manifest")
+    prefix = data["prefix_tokens"]
+    output = data["output_tokens"]
+    if type(prefix) is not int or prefix <= 0 or type(output) is not int or output < 16:
+        raise ValueError("invalid prefix/output lengths in prompts file")
+    for name in ("prompt_a", "prompt_b"):
+        tokens = data[name]
+        if (not isinstance(tokens, list) or len(tokens) <= prefix
+                or any(type(token) is not int or token < 0 for token in tokens)):
+            raise ValueError("prompts file must contain nonnegative integer token IDs and branch suffixes")
+    if data["prompt_a"][:prefix] != data["prompt_b"][:prefix] or data["prompt_a"] == data["prompt_b"]:
+        raise ValueError("branch prompts must share the declared prefix and have different suffixes")
+    return data
 
 
 def counter_delta(before: dict, after: dict) -> dict:
@@ -116,64 +153,95 @@ def http(base_url: str, path: str, payload: dict | None, timeout: int) -> Any:
     return raw if path == "/metrics" else json.loads(raw)
 
 
-def run_probe(base_url: str, model: str, output_dir: Path, *, prefix_tokens: int = 4352,
-              output_tokens: int = 256, minimum_hit: int = 1280,
+def run_probe(base_url: str, model: str, output_dir: Path, *, prefix_tokens: int | None = None,
+              output_tokens: int | None = None, minimum_hit: int = 1280,
+              prompts_file: Path | None = None,
               timeout: int = 600, metrics_timeout: int = 30) -> dict:
-    if minimum_hit <= 0 or prefix_tokens <= minimum_hit or output_tokens < 16:
+    if (type(minimum_hit) is not int or minimum_hit <= 0
+            or (prefix_tokens is not None and (type(prefix_tokens) is not int or prefix_tokens <= minimum_hit))
+            or (output_tokens is not None and (type(output_tokens) is not int or output_tokens < 16))):
         raise ValueError("prefix must exceed minimum_hit; output must be >=16")
     output_dir.mkdir(parents=True, exist_ok=False)
     nonce = uuid.uuid4().hex
-    note = "Reference note: keep the records in their original order. "
-    text = f"Unique test prefix {nonce}.\n" + note * (prefix_tokens // 4 + 64)
-    def tokenize(value: str) -> list[int]:
-        body = http(base_url, "/tokenize", {"model": model, "prompt": value,
-                    "add_special_tokens": False}, timeout)
-        tokens = body.get("tokens")
-        if not isinstance(tokens, list) or not tokens or any(type(t) is not int for t in tokens):
-            raise AssertionError("/tokenize did not return integer token IDs")
-        return tokens
-    tokens = tokenize(text)
-    if len(tokens) < prefix_tokens:
-        raise AssertionError("generated reference text is shorter than requested prefix")
-    prefix = tokens[:prefix_tokens]
-    prompt_a = prefix + tokenize("\nTask A: Continue the reference notes in order.\n")
-    prompt_b = prefix + tokenize("\nTask B: Summarize the reference notes in numbered sentences.\n")
-    if prompt_a == prompt_b:
-        raise AssertionError("branch prompts must differ after their shared prefix")
     manifest = {"base_url": base_url, "model": model, "nonce": nonce,
-                "prefix_tokens": prefix_tokens, "output_tokens": output_tokens,
-                "minimum_hit": minimum_hit, "scope": "dedicated-server replay/MTP smoke, not accuracy or performance benchmark"}
-    (output_dir / "manifest.json").write_text(json.dumps(manifest, indent=2))
-    before = counters(http(base_url, "/metrics", None, timeout))
+                "minimum_hit": minimum_hit,
+                "scope": "dedicated-server replay/MTP smoke, not accuracy or performance benchmark"}
     rows = []
-    for i, (label, prompt) in enumerate(zip(
-            ("A_cold", "A_warm", "B_shared", "B_warm"), (prompt_a, prompt_a, prompt_b, prompt_b))):
-        payload = completion_payload(model, prompt, output_tokens)
-        started = time.monotonic()
-        body = http(base_url, "/v1/completions", payload, timeout)
-        (output_dir / f"{i}_{label}.json").write_text(json.dumps(
-            {"request": payload, "response": body, "elapsed_s": time.monotonic()-started}, indent=2))
-        row = check_completion(body, len(prompt), output_tokens)
-        rows.append(row)
-        print(label, "prompt=", len(prompt), "cached=", row["cached_tokens"], flush=True)
-    check_replays(rows, minimum_hit)
-    deadline = time.monotonic() + metrics_timeout
-    while True:
-        after = counters(http(base_url, "/metrics", None, timeout))
-        delta = counter_delta(before, after)
-        try:
-            check_activity(delta)
-            break
-        except AssertionError:
-            if time.monotonic() >= deadline:
-                (output_dir / "metrics_failed.json").write_text(json.dumps(
-                    {"before": before, "after": after, "delta": delta}, indent=2))
-                raise
-            time.sleep(1)
-    result = {"passed": True, "requests": rows, "metrics_before": before,
-              "metrics_after": after, "metrics_delta": delta, **manifest}
-    (output_dir / "result.json").write_text(json.dumps(result, indent=2))
-    return result
+    try:
+        if prompts_file is not None:
+            prompts = validate_prompts(json.loads(prompts_file.read_text()))
+            for name, requested in (("prefix_tokens", prefix_tokens), ("output_tokens", output_tokens)):
+                if requested is not None and requested != prompts[name]:
+                    raise ValueError(f"{name} differs from saved prompts; do not change paired-run inputs")
+            manifest["prompts_source"] = str(prompts_file.resolve())
+        else:
+            prefix_tokens = DEFAULT_PREFIX_TOKENS if prefix_tokens is None else prefix_tokens
+            output_tokens = DEFAULT_OUTPUT_TOKENS if output_tokens is None else output_tokens
+            note = "Reference note: keep the records in their original order. "
+            # Cache salts isolate runs; no per-run UUID is inserted into model input.
+            text = "Prefix-cache replay reference.\n" + note * (prefix_tokens // 4 + 64)
+
+            def tokenize(value: str) -> list[int]:
+                body = http(base_url, "/tokenize", {"model": model, "prompt": value,
+                            "add_special_tokens": False}, timeout)
+                tokens = body.get("tokens")
+                if not isinstance(tokens, list) or not tokens or any(type(t) is not int for t in tokens):
+                    raise AssertionError("/tokenize did not return integer token IDs")
+                return tokens
+
+            tokens = tokenize(text)
+            if len(tokens) < prefix_tokens:
+                raise AssertionError("generated reference text is shorter than requested prefix")
+            prefix = tokens[:prefix_tokens]
+            prompts = validate_prompts({"version": 1, "prefix_tokens": prefix_tokens,
+                "output_tokens": output_tokens,
+                "prompt_a": prefix + tokenize("\nTask A: Continue the reference notes in order.\n"),
+                "prompt_b": prefix + tokenize("\nTask B: Summarize the reference notes in numbered sentences.\n")})
+            manifest["prompts_source"] = "generated"
+        prefix_tokens, output_tokens = prompts["prefix_tokens"], prompts["output_tokens"]
+        if prefix_tokens <= minimum_hit:
+            raise ValueError("saved prefix must exceed minimum_hit")
+        (output_dir / "prompts.json").write_text(json.dumps(prompts, indent=2))
+        shared_salt, cold_salt = f"glm53-{nonce}-shared", f"glm53-{nonce}-b-cold"
+        manifest.update(prefix_tokens=prefix_tokens, output_tokens=output_tokens,
+            prompts_sha256=hashlib.sha256(json.dumps(prompts, sort_keys=True, separators=(",", ":")).encode()).hexdigest(),
+            shared_cache_salt=shared_salt, b_cold_cache_salt=cold_salt)
+        (output_dir / "manifest.json").write_text(json.dumps(manifest, indent=2))
+        before = counters(http(base_url, "/metrics", None, timeout))
+        (output_dir / "metrics_before.json").write_text(json.dumps(before, indent=2))
+        prompt_a, prompt_b = prompts["prompt_a"], prompts["prompt_b"]
+        for i, (label, prompt) in enumerate(zip(CASES, (prompt_a, prompt_a, prompt_b, prompt_b, prompt_b))):
+            salt = cold_salt if label == "B_cold" else shared_salt
+            payload = completion_payload(model, prompt, output_tokens, cache_salt=salt)
+            started = time.monotonic()
+            body = http(base_url, "/v1/completions", payload, timeout)
+            (output_dir / f"{i}_{label}.json").write_text(json.dumps(
+                {"request": payload, "response": body, "elapsed_s": time.monotonic()-started}, indent=2))
+            row = {"label": label, "cache_salt": salt, **check_completion(body, len(prompt), output_tokens)}
+            rows.append(row)
+            print(label, "prompt=", len(prompt), "cached=", row["cached_tokens"], flush=True)
+        check_replays(rows, minimum_hit)
+        deadline = time.monotonic() + metrics_timeout
+        while True:
+            after = counters(http(base_url, "/metrics", None, timeout))
+            delta = counter_delta(before, after)
+            try:
+                check_activity(delta)
+                break
+            except AssertionError:
+                if time.monotonic() >= deadline:
+                    (output_dir / "metrics_failed.json").write_text(json.dumps(
+                        {"before": before, "after": after, "delta": delta}, indent=2))
+                    raise
+                time.sleep(1)
+        result = {"passed": True, "requests": rows, "metrics_before": before,
+                  "metrics_after": after, "metrics_delta": delta, **manifest}
+        (output_dir / "result.json").write_text(json.dumps(result, indent=2))
+        return result
+    except Exception as exc:
+        (output_dir / "result.json").write_text(json.dumps({"passed": False, "requests": rows,
+            "error_type": type(exc).__name__, "error": str(exc), **manifest}, indent=2))
+        raise
 
 
 def main() -> None:
@@ -181,8 +249,14 @@ def main() -> None:
     parser.add_argument("--base-url", required=True, help="root URL, without /v1; dedicated caller-owned server only")
     parser.add_argument("--model", required=True)
     parser.add_argument("--output-dir", required=True, type=Path, help="fresh directory; existing paths are never overwritten")
+    parser.add_argument("--prefix-tokens", type=int, help=f"shared prefix length; default {DEFAULT_PREFIX_TOKENS}, or saved value with --prompts-file")
+    parser.add_argument("--output-tokens", type=int, help=f"decode length; default {DEFAULT_OUTPUT_TOKENS}, or saved value with --prompts-file")
+    parser.add_argument("--minimum-hit", type=int, default=1280, help="required cached tokens on A-warm/B-shared/B-warm; never waived")
+    parser.add_argument("--prompts-file", type=Path, help="reuse a previous run's prompts.json verbatim, without tokenizing or adding a UUID")
     args = parser.parse_args()
-    result = run_probe(args.base_url, args.model, args.output_dir)
+    result = run_probe(args.base_url, args.model, args.output_dir,
+        prefix_tokens=args.prefix_tokens, output_tokens=args.output_tokens,
+        minimum_hit=args.minimum_hit, prompts_file=args.prompts_file)
     print(json.dumps({"passed": result["passed"], "metrics_delta": result["metrics_delta"]}, indent=2))
 
 

@@ -141,7 +141,7 @@ HumanEval's short prompts can all be smaller than the hybrid cache block
 passing HumanEval does not prove that a cache hit occurred.
 
 Use the opt-in client against a **dedicated, caller-owned** TP1/PCP8/EP8 eager
-server with Head sharding, MTP3 and prefix caching enabled. Add
+server with Head mode 0 or 1, MTP3 and prefix caching enabled. Add
 `--enable-prompt-tokens-details` so each response reports `cached_tokens`.
 The client never launches/stops a service or resets the shared cache:
 
@@ -149,22 +149,58 @@ The client never launches/stops a service or resets the shared cache:
 python -m tests.integration.server.glm53_pcp_prefix_cache \
   --base-url http://127.0.0.1:8202 \
   --model default_model \
-  --output-dir /tmp/glm53-prefix-hit-smoke-unique-run
+  --prefix-tokens 10240 \
+  --output-tokens 256 \
+  --output-dir /tmp/glm53-prefix-head-on-unique-run
 ```
 
-The output directory must not exist. Four requests execute sequentially:
-unique-prefix A cold, A warm, a different suffix B sharing the prefix, and B
-warm. They share exactly 4352 input token IDs and generate 256 tokens each.
-For the inspected 640-token blocks, this also crosses a block boundary during
-generation. A fresh unique nonce avoids needing a global cache reset.
+The output directory must not exist. Five requests execute sequentially:
+`A_cold`, `A_warm`, `B_shared`, `B_warm`, then the independent `B_cold` control.
+The first four use one fresh `cache_salt`, so B can reuse A's prefix. `B_cold`
+uses another salt, but exactly the same prompt token IDs and sampling fields
+as the other B requests. Both cold requests must report zero cached tokens;
+each warm/shared request must report at least `--minimum-hit` tokens (default
+1280). A warm must match A cold; **both** cached B outputs must match B cold.
+Two cached B outputs matching each other is not sufficient: the same bad
+restored state could produce the same wrong output twice.
 
-Checks require zero hits on A cold, at least 1280 cached tokens on each later
-request, complete multi-step generation, exact greedy replay token IDs for
-each repeated prompt, and positive cache-hit/drafted/accepted metric deltas.
-Requests, responses and metric snapshots are saved. Replay differences fail
-the smoke and require numerical/cache-state investigation; they are not by
-themselves proof of a cache bug. Passing is not strict multi-rank numerical
-alignment, a full accuracy evaluation, or a performance measurement.
+The default shared prefix is now 10240 tokens, configurable with
+`--prefix-tokens`. This exceeds the previously observed Head-off 4480-token
+cache block; the former 4352-token prefix could not establish a hit there.
+Always inspect actual `cached_tokens` in both modes. If the resolved cache
+block is larger, regenerate both runs' inputs with a longer prefix; do not
+lower the hit threshold to make a no-hit run pass. The default 256-token
+output is configurable with `--output-tokens` and must complete in full.
+
+For a paired Head-on/off experiment, run the command above with Head=1, then
+restart **only the caller-owned server** with Head=0, keeping checkpoint,
+MTP3, `VLLM_HCU_GLM53_PCP_MTP_SYNC=1` and all other serving settings unchanged.
+Reuse the first run's saved token IDs instead of tokenizing a new input:
+
+```bash
+python -m tests.integration.server.glm53_pcp_prefix_cache \
+  --base-url http://127.0.0.1:8202 \
+  --model default_model \
+  --prompts-file /tmp/glm53-prefix-head-on-unique-run/prompts.json \
+  --output-dir /tmp/glm53-prefix-head-off-unique-run
+```
+
+`prompts.json` is saved before requests, including on a subsequent replay
+failure. It contains the two full token-ID prompts, declared prefix length
+and output length. Loading it does not call `/tokenize`, append a UUID, or
+change the prompts. Inconsistent explicit length overrides are rejected.
+The manifest's `prompts_sha256` must match between modes. Sampling remains
+greedy with seed 42 and `ignore_eos=True`; fresh salts isolate each run's
+cache without changing the model input. Both modes must independently pass
+their real-hit and cold-control checks before comparing their outputs.
+
+Requests, responses, inputs and metric snapshots are saved; failures also
+write `result.json` with `passed=false`. Positive cache-hit/drafted/accepted
+metric deltas and complete multi-step generation remain required. Replay
+differences fail the smoke and require numerical/cache-state investigation;
+they are not by themselves proof of a cache bug. Passing is not strict
+multi-rank numerical alignment, full accuracy evaluation or a performance
+measurement.
 
 CPU/mock contracts are separate and never load a model or reserve HCUs:
 
@@ -176,24 +212,15 @@ The live client is intentionally not a default PR hardware job: it needs an
 explicitly prepared eight-card server and the exact checkpoint. CPU checks
 must not be described as a completed live cache-hit validation.
 
-### Observed replay limitations
+### Existing observations are not a passing matched control
 
-The inspected PCP8/MTP3 smoke is **not a passing cache-correctness result**.
-With Head enabled, the resolved block size was 640 tokens: A cold had zero
-cached tokens and the next three requests each reused 3200 tokens. The A
-replay matched, but B differed from its third generated token. With the exact
-same request payloads and Head disabled, A still matched and B differed from
-its thirteenth generated token. Both runs completed all four 256-token
-outputs, so output variability is not unique to the head-sharded path; its
-numerical or state-related cause has not been established.
-
-Head-off selected 4480-token blocks, larger than these 4363/4366-token
-prompts, and therefore had no cache hits. It is not a matched cache-hit
-control or evidence that cached KDA state is correct. A follow-up should use
-identical longer prefixes, confirm nonzero reuse in both modes, and preserve
-the strict replay failures rather than treating them as successful tests.
-Fixed-seed greedy token replay is a diagnostic contract, not a substitute
-for task accuracy or strict multi-rank numerical alignment.
+The historical Head-on run reused cache but B differed from its third output
+token. Head-off B differed from its thirteenth token with zero cache hits:
+its 4480-token blocks exceeded the 4352-token shared prefix. Neither run had
+an independent cold B reference. Those observations cannot attribute the
+difference to Head sharding or certify cached KDA state. The revised five-
+request, shared-input procedure still needs a fresh multi-HCU live run;
+its CPU/mock tests alone do not establish model correctness.
 
 Run CPU regressions without starting a model service:
 
