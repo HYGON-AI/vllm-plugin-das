@@ -30,6 +30,7 @@ INVENTORY_TESTS = (
     "tests/patch/test_worker_dispatcher.py",
 )
 CONTRACT_TESTS = (
+    "tests/kv_connector",
     "tests/patch",
     "tests/runtime_patch",
     "tests/accuracy",

@@ -103,6 +103,26 @@ def test_kv_factory_registers_hcu_connectors_lazily(monkeypatch):
     assert patch_kv_connector_factory.apply_to_module(module) is False
 
 
+def test_kv_factory_decode_bench_uses_hcu_backport(monkeypatch):
+    class DecodeBenchConnector:
+        pass
+
+    imports = []
+
+    def fake_import(name):
+        imports.append(name)
+        return SimpleNamespace(DecodeBenchConnector=DecodeBenchConnector)
+
+    monkeypatch.setattr(patch_kv_connector_factory.importlib, "import_module", fake_import)
+    module = _fake_factory_module()
+    patch_kv_connector_factory.apply_to_module(module)
+    assert not imports
+    assert module.KVConnectorFactory._registry["DecodeBenchConnector"]() is DecodeBenchConnector
+    assert imports == [
+        "vllm_hcu.distributed.kv_transfer.kv_connector.v1.decode_bench_connector"
+    ]
+
+
 def test_kv_factory_dp_rank_is_optional_and_compatible(monkeypatch):
     module = _fake_factory_module()
     patch_kv_connector_factory.apply_to_module(module)

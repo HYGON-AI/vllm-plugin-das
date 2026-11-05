@@ -21,6 +21,7 @@ TARGET_MODULE = "vllm.distributed.kv_transfer.kv_connector.factory"
 PATCH_ID = "platform.framework_opt.kv_connector_factory"
 TARGETS = (
     f"{TARGET_MODULE}.KVConnectorFactory.create_connector",
+    f"{TARGET_MODULE}.KVConnectorFactory._registry[DecodeBenchConnector]",
     f"{TARGET_MODULE}.KVConnectorFactory._registry[MooncakeConnector]",
     f"{TARGET_MODULE}.KVConnectorFactory._registry[DuSwiftConnector]",
     f"{TARGET_MODULE}.KVConnectorFactory._registry[DuSwiftConnectorDp]",
@@ -28,6 +29,10 @@ TARGETS = (
 _MARKER = "_vllm_hcu_kv_connector_factory_applied"
 _WRAPPER = "_vllm_hcu_kv_connector_factory_wrapper"
 _HCU_CONNECTORS = {
+    "DecodeBenchConnector": (
+        "vllm_hcu.distributed.kv_transfer.kv_connector.v1.decode_bench_connector",
+        "DecodeBenchConnector",
+    ),
     "MooncakeConnector": (
         "vllm_hcu.distributed.kv_transfer.kv_connector.v1.mooncake.mooncake_connector",
         "MooncakeConnector",
