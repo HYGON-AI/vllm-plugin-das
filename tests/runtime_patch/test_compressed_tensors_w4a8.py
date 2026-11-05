@@ -1,6 +1,7 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright (c) 2026 Hygon Information Technology Co., Ltd.
 
+import sys
 from types import ModuleType, SimpleNamespace
 
 import pytest
@@ -282,6 +283,121 @@ def test_checkpoint_reloads_use_native_layerwise_lifecycle(
                 checkpoint[prefix + "_weight_packed"], transposed=True)
             assert torch.equal(packed, expected_weight)
             assert torch.equal(getattr(layer, prefix + "_weight_scale"), scale)
+
+
+@pytest.mark.parametrize("group_size", [None, -1])
+@pytest.mark.parametrize("update", ["inplace", "replacement"])
+def test_aiter_forward_uses_final_scales_after_checkpoint_reload(
+    monkeypatch, native_wna16, group_size, update,
+):
+    from compressed_tensors.compressors.pack_quantized.helpers import pack_to_int32
+    from vllm.model_executor.model_loader.reload.layerwise import (
+        record_metadata_for_reloading, initialize_layerwise_reload,
+        finalize_layerwise_reload,
+    )
+    from vllm_hcu.model_executor.layers.quantization import compressed_tensors_moe_runtime as kernels
+
+    selected = SimpleNamespace(need_shuffle=False)
+    monkeypatch.setattr(kernels, "prewarm_aiter_w4a8_moe", lambda *_: selected)
+    monkeypatch.setattr(kernels, "install_aiter_moe_weight_layout", lambda *_, **__: None)
+    monkeypatch.setattr(kernels, "install_aiter_moe_scale_layout", lambda *_, **__: None)
+    monkeypatch.setattr(kernels, "select_aiter_moe_config", lambda *_, **__: selected)
+    monkeypatch.setattr(kernels, "prepare_aiter_moe_weights", lambda w1, w2, *_, **__: (w1, w2))
+    monkeypatch.setattr(kernels, "prepare_aiter_moe_scales", lambda s1, s2, *_, **__: (s1, s2))
+    monkeypatch.setattr(kernels, "aiter_expert_map_for_solution", lambda *_, **__: None)
+    aiter = ModuleType("aiter.moe")
+    aiter.MoeQuantType = SimpleNamespace(W4A8="w4a8")
+    monkeypatch.setitem(sys.modules, "aiter.moe", aiter)
+
+    _, method, layer = _native_layer(group_size, "aiter")
+    record_metadata_for_reloading(layer)
+    checkpoint = {name: torch.zeros_like(param) for name, param in layer.named_parameters()}
+    captured = []
+
+    def execute(config, **kwargs):
+        # Keep real adapter/delegate/runtime dispatch. Replace only the HCU
+        # kernel boundary, where both GEMMs must see the current Parameters.
+        assert kwargs["w1_scale"] is layer.w13_weight_scale
+        assert kwargs["w2_scale"] is layer.w2_weight_scale
+        captured.append((kwargs["w1_scale"].clone(), kwargs["w2_scale"].clone()))
+        return kwargs["hidden_states"]
+
+    monkeypatch.setattr(kernels, "execute_aiter_moe", execute)
+    for generation in range(3):
+        if generation:
+            initialize_layerwise_reload(layer)
+        for prefix, shape in (("w13", (2, 32, 32)), ("w2", (2, 32, 16))):
+            q = torch.full(shape, generation, dtype=torch.int8)
+            checkpoint[prefix + "_weight_packed"] = pack_to_int32(q, 4).transpose(1, 2).contiguous()
+            checkpoint[prefix + "_weight_scale"] = torch.full(
+                (shape[0], 1, shape[1]), generation + 1.0, dtype=torch.bfloat16,
+            )
+        for name, tensor in checkpoint.items():
+            param = getattr(layer, name)
+            loader = getattr(param, "weight_loader", None)
+            if loader is None:
+                param.data.copy_(tensor)
+            else:
+                loader(param, tensor)
+        if generation:
+            finalize_layerwise_reload(layer, None)
+        else:
+            method.process_weights_after_loading(layer)
+
+        delegate = method._hcu_ct_w4a8_delegate
+        config = delegate.moe_quant_config
+        # A modular consumer may retain this config; rebinding must preserve
+        # the config and descriptors, rather than replace them with new ones.
+        descriptors = (config._w1, config._w2)
+        x = torch.ones(2, 32, dtype=torch.bfloat16)
+        ids = torch.zeros(2, 1, dtype=torch.int32)
+        weights = torch.ones(2, 1)
+        for multiplier in (2.0, 3.0):
+            for prefix in ("w13", "w2"):
+                scale = getattr(layer, prefix + "_weight_scale")
+                if update == "inplace":
+                    with torch.no_grad():
+                        scale.mul_(multiplier)
+                else:
+                    setattr(layer, prefix + "_weight_scale", torch.nn.Parameter(
+                        scale.detach() * multiplier, requires_grad=False,
+                    ))
+            method.apply(layer, x, weights, ids)
+            assert method.moe_quant_config is delegate.moe_quant_config is config
+            assert config._w1 is descriptors[0] and config._w2 is descriptors[1]
+            torch.testing.assert_close(captured[-1][0], layer.w13_weight_scale)
+            torch.testing.assert_close(captured[-1][1], layer.w2_weight_scale)
+    assert len(captured) == 6
+
+
+def test_scale_rebinding_supports_fullgraph_compile():
+    from vllm.model_executor.layers.fused_moe.config import FusedMoEQuantConfig
+
+    layer = torch.nn.Module()
+    layer.w13_weight_scale = torch.nn.Parameter(torch.tensor([.25]), requires_grad=False)
+    layer.w2_weight_scale = torch.nn.Parameter(torch.tensor([.5]), requires_grad=False)
+    config = FusedMoEQuantConfig.make(
+        torch.int8, w1_scale=torch.tensor([.125]), w2_scale=torch.tensor([.25]),
+        per_act_token_quant=True, weight_dtype="int4",
+    )
+
+    class Delegate:
+        moe_quant_config = config
+
+        def apply(self, layer, x, *args, **kwargs):
+            return x * self.moe_quant_config.w1_scale * self.moe_quant_config.w2_scale
+
+    method = SimpleNamespace(_hcu_ct_w4a8_loaded=True, _hcu_ct_w4a8_delegate=Delegate())
+    compiled = torch.compile(
+        lambda x: runtime._apply(method, layer, x, None, None),
+        backend="eager", fullgraph=True,
+    )
+    x = torch.ones(2)
+    torch.testing.assert_close(compiled(x), x * .125)
+    with torch.no_grad():
+        layer.w13_weight_scale.mul_(2)
+        layer.w2_weight_scale.mul_(2)
+    torch.testing.assert_close(compiled(x), x * .5)
 
 
 def test_mixed_checkpoint_storage_fails_before_conversion():

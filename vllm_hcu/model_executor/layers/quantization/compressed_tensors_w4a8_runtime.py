@@ -141,7 +141,20 @@ def _apply(
 ):
     if not getattr(self, "_hcu_ct_w4a8_loaded", False):
         raise RuntimeError("HCU CT W4A8 execution requires completed weight post-load")
-    return self._hcu_ct_w4a8_delegate.apply(
+    from vllm_hcu.model_executor.layers.quantization.compressed_tensors_moe_runtime import (
+        _replace_tensor_reference,
+    )
+
+    # Native checkpoint reload restores persistent kernel Parameters *after*
+    # post-load. Bind here so eager execution and subsequent graph capture use
+    # those final owners, including later in-place kernel-format updates.
+    # Retain the config/descriptors also held by modular kernel consumers.
+    delegate = self._hcu_ct_w4a8_delegate
+    config = delegate.moe_quant_config
+    _replace_tensor_reference(config, "w1_scale", layer.w13_weight_scale)
+    _replace_tensor_reference(config, "w2_scale", layer.w2_weight_scale)
+    self.moe_quant_config = config
+    return delegate.apply(
         layer,
         x,
         topk_weights,
