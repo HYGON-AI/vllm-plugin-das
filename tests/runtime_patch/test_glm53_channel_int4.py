@@ -330,6 +330,82 @@ def test_quant_type_defaults_and_explicit_overrides(
             ) is expected
 
 
+_OMIT = object()
+
+
+@pytest.mark.parametrize("group_name", ["group_int4", "group_int8"])
+@pytest.mark.parametrize(
+    "strategy,group_size,expected",
+    [
+        # QuantizationArgs infers CHANNEL from group_size=-1 when strategy is
+        # omitted or null, and parses enum strings case-insensitively.
+        (_OMIT, -1, True),
+        (None, -1, True),
+        ("channel", -1, True),
+        ("CHANNEL", _OMIT, True),
+        ("Channel", -1, True),
+        # Every other combination is either another strategy or rejected by
+        # the schema, which native parsing would also refuse to load.
+        (_OMIT, _OMIT, False),
+        (None, _OMIT, False),
+        (_OMIT, 128, False),
+        ("channel", 128, False),
+        (_OMIT, -2, False),
+        ("tensor", _OMIT, False),
+        ("token", _OMIT, False),
+        ("not-a-strategy", _OMIT, False),
+    ],
+)
+def test_channel_strategy_follows_the_quantization_schema(
+    glm_quant_method_labels, group_name, strategy, group_size, expected
+) -> None:
+    from vllm.model_executor.layers.fused_moe import RoutedExperts
+
+    glm_moe_dsa_w4a8 = glm_quant_method_labels
+    quant = _quant_config()
+    weights = quant["config_groups"][group_name]["weights"]
+    for key, value in (("strategy", strategy), ("group_size", group_size)):
+        if value is _OMIT:
+            weights.pop(key, None)
+        else:
+            weights[key] = value
+    hf_config = _glm_hf_config()
+    assert is_glm_channel_int4_w4a8(quant, hf_config) is expected
+    for config_cls in (
+        GlmMoeDsaW4A8Facade,
+        glm_moe_dsa_w4a8.GlmMoeDsaChannelW4A8Config,
+    ):
+        assert config_cls.override_quantization_method(
+            quant, None, hf_config
+        ) == ("glm_moe_dsa_w4a8" if expected else None)
+    if expected and group_name == "group_int4":
+        # The parsed config must reach the same decision during layer selection.
+        config = glm_moe_dsa_w4a8.GlmMoeDsaChannelW4A8Config.from_config(quant)
+        config.packed_modules_mapping = {}
+        layer = RoutedExperts.__new__(RoutedExperts)
+        layer.moe_config = SimpleNamespace(num_logical_experts=2)
+        assert config.get_quant_method(layer, "model.layers.4.mlp.experts") == "int4"
+
+
+@pytest.mark.parametrize("field", ["weights", "input_activations"])
+@pytest.mark.parametrize("group_name", ["group_int4", "group_int8"])
+@pytest.mark.parametrize("quant_type", ["INT", "Int", "int"])
+def test_quant_type_is_parsed_case_insensitively(group_name, field, quant_type) -> None:
+    quant = _quant_config()
+    quant["config_groups"][group_name][field]["type"] = quant_type
+    assert is_glm_channel_int4_w4a8(quant, _glm_hf_config()) is True
+
+
+def test_schema_rejected_group_selects_nothing() -> None:
+    """A group native parsing cannot load must not select the GLM method."""
+    quant = _quant_config()
+    quant["config_groups"]["group_int4"]["weights"]["num_bits"] = "four"
+    assert is_glm_channel_int4_w4a8(quant, _glm_hf_config()) is False
+    quant = _quant_config()
+    quant["config_groups"]["group_int8"]["input_activations"] = ["token"]
+    assert is_glm_channel_int4_w4a8(quant, _glm_hf_config()) is False
+
+
 @pytest.mark.parametrize("symmetric", [None, True, False])
 @pytest.mark.parametrize("args_as_objects", [False, True])
 def test_int4_activation_symmetry_is_respected(symmetric, args_as_objects) -> None:
@@ -359,6 +435,41 @@ def test_int8_linear_symmetry_stays_on_compressed_tensors() -> None:
     quant = _quant_config()
     quant["config_groups"]["group_int8"]["input_activations"]["symmetric"] = False
     assert is_glm_channel_int4_w4a8(quant, _glm_hf_config())
+
+
+@pytest.mark.parametrize("symmetric", [_OMIT, True, False, None])
+def test_int8_linear_weights_must_be_symmetric_like_native(symmetric) -> None:
+    """Native dynamic-token W8A8 rejects asymmetric weights, as does detection."""
+    quant = _quant_config()
+    weights = quant["config_groups"]["group_int8"]["weights"]
+    if symmetric is _OMIT:
+        weights.pop("symmetric", None)
+    else:
+        weights["symmetric"] = symmetric
+    expected = symmetric is _OMIT or symmetric is True
+    assert is_glm_channel_int4_w4a8(quant, _glm_hf_config()) is expected
+    assert GlmMoeDsaW4A8Facade.override_quantization_method(
+        quant, None, _glm_hf_config()
+    ) == ("glm_moe_dsa_w4a8" if expected else None)
+
+
+@pytest.mark.parametrize(
+    "architecture",
+    ["Glm5NextForCausalLM", "Glm5NextForConditionalGeneration", "Glm5NextMTPModel"],
+)
+def test_glm5next_checkpoints_are_not_auto_selected(architecture) -> None:
+    """Glm5Next loads through vllm.models.glm5next, not the patched DeepSeek loaders."""
+    from vllm_hcu.model_executor.layers.quantization.glm_moe_dsa_w4a8 import (
+        GlmMoeDsaChannelW4A8Config,
+    )
+
+    hf_config = SimpleNamespace(
+        model_type="glm5next", architectures=[architecture], num_hidden_layers=61
+    )
+    quant = _quant_config()
+    assert is_glm_channel_int4_w4a8(quant, hf_config) is True
+    for config_cls in (GlmMoeDsaW4A8Facade, GlmMoeDsaChannelW4A8Config):
+        assert config_cls.override_quantization_method(quant, None, hf_config) is None
 
 
 @pytest.mark.parametrize("target", ["re:.*\\.mlp\\.experts.*", "RoutedExperts"])
@@ -1033,6 +1144,138 @@ def test_expert_projection_targets_and_class_fallback_agree(
     assert routed_expert_uses_glm_channel_int4(config, layer, runtime_prefix) is expected
     config.ignore = [f"{checkpoint_prefix}.0.down_proj"]
     assert routed_expert_uses_glm_channel_int4(config, layer, runtime_prefix) is False
+
+
+# Native matches the module class name with ``re:`` targets through re.match and
+# with plain targets by case-insensitive containment.
+_CLASS_TARGETS_SELECTING_ROUTED_EXPERTS = [
+    "RoutedExperts",
+    "re:^RoutedExperts$",
+    "re:Routed.*",
+    "re:.*Experts$",
+    "Experts",
+    "routedexperts",
+]
+
+
+@pytest.mark.parametrize("target", _CLASS_TARGETS_SELECTING_ROUTED_EXPERTS)
+def test_class_name_targets_select_routed_experts_like_native(
+    glm_quant_method_labels, target
+) -> None:
+    from vllm.model_executor.layers.fused_moe import RoutedExperts
+
+    glm_moe_dsa_w4a8 = glm_quant_method_labels
+    quant = _quant_config()
+    quant["config_groups"]["group_int4"]["targets"] = [target]
+    hf_config = _glm_hf_config()
+    assert is_glm_channel_int4_w4a8(quant, hf_config) is True
+    assert GlmMoeDsaW4A8Facade.override_quantization_method(
+        quant, None, hf_config
+    ) == "glm_moe_dsa_w4a8"
+    config = glm_moe_dsa_w4a8.GlmMoeDsaChannelW4A8Config.from_config(quant)
+    config.packed_modules_mapping = {}
+    # Native resolves experts through the class name here, and the parent adds
+    # a RoutedExperts -> Linear alias behind the INT4 target. The first target
+    # in config order must keep winning on every layer.
+    for index in (3, 4, 3):
+        layer = RoutedExperts.__new__(RoutedExperts)
+        layer.moe_config = SimpleNamespace(num_logical_experts=2)
+        assert config.get_quant_method(
+            layer, f"model.layers.{index}.mlp.experts"
+        ) == "int4"
+
+
+@pytest.mark.parametrize(
+    "target",
+    ["re:^Other$", "re:^routedexperts$", "SharedExperts", "Linear"],
+)
+def test_class_name_targets_that_miss_routed_experts_select_nothing(target) -> None:
+    quant = _quant_config()
+    quant["config_groups"]["group_int4"]["targets"] = [target]
+    assert is_glm_channel_int4_w4a8(quant, _glm_hf_config()) is False
+
+
+@pytest.mark.parametrize("layer_order", [(3, 4), (4, 3)])
+@pytest.mark.parametrize("class_target", ["RoutedExperts", "re:^RoutedExperts$"])
+def test_projection_path_targets_precede_class_name_targets(
+    glm_quant_method_labels, class_target, layer_order
+) -> None:
+    """Native tries the layer path before the class name, for either spelling."""
+    from vllm.model_executor.layers.fused_moe import RoutedExperts
+
+    prefix = "model.layers.3.mlp.experts"
+    projections = ("gate_proj", "up_proj", "down_proj")
+    quant = _quant_config()
+    quant["config_groups"] = {
+        "classes": dict(_int4_scheme(), targets=[class_target]),
+        "layer3": dict(
+            _int8_scheme(),
+            targets=[f"{prefix}.{e}.{p}" for e in range(2) for p in projections],
+        ),
+        "linears": dict(_int8_scheme(), targets=["Linear"]),
+    }
+    config = glm_quant_method_labels.GlmMoeDsaChannelW4A8Config.from_config(quant)
+    config.packed_modules_mapping = {}
+    for index in layer_order:
+        layer = RoutedExperts.__new__(RoutedExperts)
+        layer.moe_config = SimpleNamespace(num_logical_experts=2)
+        assert config.get_quant_method(
+            layer, f"model.layers.{index}.mlp.experts"
+        ) == ("int8" if index == 3 else "int4")
+
+
+@pytest.mark.parametrize(
+    "targets",
+    [
+        [],
+        ["Linear"],
+        ["RoutedExperts"],
+        ["re:^RoutedExperts$"],
+        ["Linear", "RoutedExperts"],
+        ["RoutedExperts", "re:^RoutedExperts$"],
+        ["re:^RoutedExperts$", "Linear", "RoutedExperts"],
+        ["Linear", "re:^Routed.*"],
+        ["re:^Other$", "Experts"],
+        ["experts", "RoutedExperts"],
+        ["Linear", "re:^routedexperts$"],
+        ["re:.*Experts$", "re:^Routed"],
+    ],
+)
+def test_class_target_matching_agrees_with_native_find_matched_target(targets) -> None:
+    """Differential check on the concrete class name, including target order."""
+    try:
+        from vllm.model_executor.layers.quantization.compressed_tensors.utils import (
+            find_matched_target,
+        )
+    except ImportError:
+        pytest.skip("native find_matched_target is unavailable")
+    from vllm.model_executor.layers.fused_moe import RoutedExperts
+    from vllm_hcu.model_executor.layers.quantization.glm_channel_int4 import (
+        _match_target_by_class,
+    )
+
+    layer = RoutedExperts.__new__(RoutedExperts)
+    try:
+        expected = find_matched_target(
+            "model.layers.4.mlp.experts.0.gate_proj", layer, targets
+        )
+    except ValueError:
+        expected = None
+    assert _match_target_by_class(layer, dict.fromkeys(targets)) == expected
+
+
+def test_class_targets_also_match_ancestor_class_names() -> None:
+    """A renamed RoutedExperts subclass still resolves its base-class targets."""
+    from vllm.model_executor.layers.fused_moe import RoutedExperts
+    from vllm_hcu.model_executor.layers.quantization.glm_channel_int4 import (
+        _match_target_by_class,
+    )
+
+    layer_class = type("RenamedExperts", (RoutedExperts,), {})
+    layer = layer_class.__new__(layer_class)
+    for target in ("RoutedExperts", "re:^RoutedExperts$"):
+        assert _match_target_by_class(layer, {"Linear": None, target: None}) == target
+    assert _match_target_by_class(layer, {"Linear": None, "re:^Other$": None}) is None
 
 
 @pytest.mark.parametrize("kind", ["target", "ignore"])
