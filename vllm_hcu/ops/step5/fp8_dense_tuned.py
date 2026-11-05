@@ -61,7 +61,7 @@ def tuned_fp8_gemm(x, xs, w, ws):
     algorithm = _CHOICES.get((m, n, k))
     # In particular M16/M64 can occur before the profile. They must retain
     # their ordinary fallback without attempting to initialize these plans.
-    if algorithm is None and m != _UNSPLIT_PROFILE_ROWS:
+    if algorithm is None and m < _UNSPLIT_PROFILE_ROWS:
         return None
     device = x.device.index
     warm_key = (device, n, k)
@@ -77,10 +77,14 @@ def tuned_fp8_gemm(x, xs, w, ws):
                 # This is a runtime context predicate, not the configuration
                 # enable_dbo flag (the profile deliberately runs unsplit).
                 from vllm.v1.worker.ubatching import dbo_enabled
-                if m != _UNSPLIT_PROFILE_ROWS or dbo_enabled() or torch.cuda.is_current_stream_capturing():
+                profile_rows = max(
+                    _UNSPLIT_PROFILE_ROWS, max(rows for rows, _ in relevant)
+                )
+                if m < profile_rows or dbo_enabled() or torch.cuda.is_current_stream_capturing():
                     raise RuntimeError(
-                        "Step5 tuned Dense plans require the unsplit 8192-row "
-                        f"startup profile before DBO/graphs; got M={m},N={n},K={k}"
+                        "Step5 tuned Dense plans require an unsplit startup "
+                        f"profile with at least {profile_rows} rows "
+                        f"before DBO/graphs; got M={m},N={n},K={k}"
                     )
                 op = _native_gemm()
                 for rows, selected in relevant:
