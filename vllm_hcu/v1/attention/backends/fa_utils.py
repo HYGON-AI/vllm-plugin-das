@@ -145,8 +145,15 @@ def can_use_paged_fp8_d192_fwd(
     alibi_slopes: Tensor | None,
     softcap: float,
     s_aux: Tensor | None,
+    *,
+    allow_hnd: bool = False,
 ) -> bool:
-    """Whether the paged FP8 head_dim-192 HG prefix kernel can serve a call."""
+    """Accept logical [B,N,H,D] FP8 views with NHD or HND backing storage.
+
+    The HG prefix entry point consumes the actual block/token/head strides.
+    HND is explicitly enabled by Step5 PD callers for heterogeneous-TP
+    transfers; other callers retain the original NHD-only selection.
+    """
     return (
         key_cache.dtype == torch.float8_e4m3fn
         and value_cache.dtype == torch.float8_e4m3fn
@@ -158,7 +165,8 @@ def can_use_paged_fp8_d192_fwd(
         and alibi_slopes is None
         and not softcap
         and (s_aux is None or s_aux.dtype == out.dtype)
-        and get_kv_cache_layout() == "NHD"
+        and (get_kv_cache_layout() == "NHD"
+             or (allow_hnd and get_kv_cache_layout() == "HND"))
     )
 
 
