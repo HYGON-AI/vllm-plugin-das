@@ -241,6 +241,16 @@ def make_hcu_w4a8_method(weight_quant, input_quant, moe, layer_name=None):
     """Reuse the audited CT loader, but execute dynamic INT8 HCU MoE."""
     if not supports_channel_w4a8(weight_quant, input_quant, moe):
         raise ValueError("Unsupported HCU compressed-tensors W4A8 quantization scheme")
+    parallel = getattr(moe, "moe_parallel_config", None)
+    if getattr(parallel, "enable_eplb", False):
+        raise NotImplementedError("HCU CT W4A8 does not support EPLB")
+    if getattr(parallel, "all2all_backend", None) in (
+        "deepep_auto", "deepep_high_throughput", "deepep_low_latency",
+    ) or getattr(parallel, "use_deepep_auto_kernels", False):
+        raise NotImplementedError(
+            "HCU CT W4A8 does not support DeepEP; use the AITER expert path "
+            "with allgather_reducescatter for DP+EP"
+        )
     from vllm.model_executor.layers.quantization.compressed_tensors.compressed_tensors_moe.compressed_tensors_moe_wna16 import (
         CompressedTensorsWNA16MoEMethod,
     )

@@ -81,7 +81,6 @@ def _mtp_quantization_config(vllm_config: VllmConfig, prefix: str) -> VllmConfig
 
     from vllm.model_executor.layers.quantization.compressed_tensors.utils import (
         find_matched_target,
-        should_ignore_layer,
     )
     from vllm.model_executor.layers.quantization.utils.config_utils import (
         find_matching_patterns,
@@ -94,12 +93,19 @@ def _mtp_quantization_config(vllm_config: VllmConfig, prefix: str) -> VllmConfig
             return original_match(self, layer, layer_name)
         canonical = "model.decoder" + layer_name[len(prefix):]
         mapping = self.packed_modules_mapping
-        # Either spelling can explicitly exclude a layer, including fused
-        # projections whose shards must agree under the native ignore matcher.
-        if any(
-            should_ignore_layer(name, self.ignore, mapping)
-            for name in (layer_name, canonical)
-        ):
+        # Resolve both spellings before validating fused shards. A complete
+        # fused-name ignore takes precedence over redundant partial ignores.
+        ignores = [find_matching_patterns(name, self.ignore, mapping)
+                   for name in (layer_name, canonical)]
+        if any(all(shards) for shards in ignores):
+            return None
+        ignored_shards = [any(matches) for matches in zip(*ignores)]
+        if any(ignored_shards):
+            if not all(ignored_shards):
+                raise ValueError(
+                    "Found different quantization schemes for the shards of "
+                    f"{layer_name}. vLLM requires all to use the same scheme."
+                )
             return None
 
         canonical_targets = {}

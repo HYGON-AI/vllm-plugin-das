@@ -18,6 +18,12 @@ Supported scheme: symmetric static INT4 channel weights, dynamic symmetric
 INT8 token activations, SiLU, no bias or input-side router weighting. Existing
 WNA16 and HCU runtime restrictions still apply.
 
+The CT adapter supports the AITER expert path, including DP+EP with
+`allgather_reducescatter`. DeepEP HT/LL/auto and EPLB are rejected before
+checkpoint storage is constructed. The reused WNA16 storage class does not
+grant its Triton EPLB capability to CT W4A8 execution; regular WNA16 keeps
+its original capability.
+
 ## Files
 
 - `vllm_hcu/patch/worker/op_opt/patch_compressed_tensors_moe_w4a8_int8.py`:
@@ -393,3 +399,32 @@ forward. This is not a new full-model accuracy or end-to-end kernel result.
 
 Artifacts, including `code_review.json` and CI-image verification logs:
 `run/20261105_pr299_inference_fused_review/` in the validation project.
+
+## Parallel backend boundaries and combined MTP ignores (2026-11-05)
+
+Review of `93eb386` reproduced a stale DeepEP kernel-local down-projection
+scale after checkpoint reload followed by a kernel-format update: the layer
+held 0.25 while the inner kernel still held 0.125. The delegate and inner
+kernel use different quantization configs. DeepEP execution is outside this
+CT adapter's AITER scope, so DeepEP HT/LL/auto backends and auto-kernel metadata
+now fail explicitly before any checkpoint weight allocation. EPLB is also
+rejected at this boundary, and the adapter reports `supports_eplb=False` while
+retaining the exact WNA16 loader class. Ordinary WNA16 capability queries still
+delegate to the original getter. This change does not add DeepEP hot-reload
+support to SlimQuant.
+
+MTP ignore matching now combines actual and canonical names before checking
+fused-shard consistency. A complete ignore from either spelling takes
+precedence over a redundant partial ignore. Complementary shard ignores across
+the two spellings also exclude the complete fused layer. A genuinely partial
+ignore still raises the native mixed-scheme error. The caller's ignore list and
+quantization target ordering are preserved.
+
+Before the fix, the new CPU regressions reproduced twelve failures on
+`93eb386`. On nmz105, the current CI image passed all 480 related portable
+tests (79 hardware/other cases deselected), including ordinary WNA16, callback
+idempotency, MTP rule ordering, both complete and incomplete fused ignores,
+reload and INT8 AllGatherv contracts. The patch coverage, dependency lock and
+HCU registration gates also passed. Validation artifacts are in
+`run/20261105_pr299_parallel_ignore_fix/` in the validation project. This
+follow-up does not include a new full-model accuracy evaluation.

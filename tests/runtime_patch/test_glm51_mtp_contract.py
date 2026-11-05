@@ -519,6 +519,43 @@ def test_mtp_canonical_ignore_accepts_equivalent_regex(mtp_module, ignore):
     assert qconfig.ignore == [ignore]
 
 
+@pytest.mark.parametrize("prefix", ["model.layers.78", "model.layers.79"])
+@pytest.mark.parametrize("ignored", [
+    ("canonical.gate_up_proj", "actual.gate_proj"),
+    ("canonical.gate_proj", "canonical.up_proj", "actual.gate_proj"),
+    ("canonical.gate_proj", "actual.up_proj"),
+    ("actual.gate_up_proj", "canonical.gate_proj"),
+])
+def test_mtp_fused_ignores_combine_both_prefixes(mtp_module, prefix, ignored):
+    names = {
+        "canonical": "model.decoder.mlp.shared_experts",
+        "actual": prefix + ".mlp.shared_experts",
+    }
+    qconfig = _mixed_quant_config("Linear")
+    qconfig.ignore = [names[side] + "." + projection
+                      for side, projection in (value.split(".") for value in ignored)]
+    original_ignore = list(qconfig.ignore)
+    qconfig.packed_modules_mapping = {"gate_up_proj": ["gate_proj", "up_proj"]}
+    adapted = mtp_module._mtp_quantization_config(_glm_engine(qconfig), prefix)
+    assert adapted.quant_config.get_scheme_dict(
+        nn.Linear(8, 8), names["actual"] + ".gate_up_proj",
+    ) is None
+    assert qconfig.ignore == original_ignore
+    assert adapted.quant_config.ignore == original_ignore
+
+
+@pytest.mark.parametrize("side", ["model.decoder", "model.layers.78"])
+def test_mtp_fused_partial_ignore_still_rejects_mixed_schemes(mtp_module, side):
+    qconfig = _mixed_quant_config("Linear")
+    qconfig.ignore = [side + ".mlp.shared_experts.gate_proj"]
+    qconfig.packed_modules_mapping = {"gate_up_proj": ["gate_proj", "up_proj"]}
+    adapted = mtp_module._mtp_quantization_config(_glm_engine(qconfig), "model.layers.78")
+    with pytest.raises(ValueError, match="different quantization schemes"):
+        adapted.quant_config.get_scheme_dict(
+            nn.Linear(8, 8), "model.layers.78.mlp.shared_experts.gate_up_proj",
+        )
+
+
 @pytest.mark.parametrize("quant_config", [None, SimpleNamespace()])
 def test_non_compressed_tensors_mtp_config_is_unchanged(mtp_module, quant_config):
     engine = _glm_engine(quant_config)

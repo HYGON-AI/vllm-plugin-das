@@ -8462,6 +8462,10 @@ def _fake_moe_wna16_module():
         def get_fused_moe_quant_config(self, layer):
             return ("upstream-config", layer)
 
+        @property
+        def supports_eplb(self):
+            return True
+
     module = _module(
         patch_compressed_tensors_moe_wna16.TARGET_MODULE,
         CompressedTensorsWNA16MoEMethod=CompressedTensorsWNA16MoEMethod,

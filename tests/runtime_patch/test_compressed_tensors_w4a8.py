@@ -194,6 +194,42 @@ def test_postload_preserves_scale_domain_and_releases_original_buffers(monkeypat
         runtime._process_weights_after_loading(method,layer)
 
 
+@pytest.mark.parametrize("parallel", [
+    {"all2all_backend": "deepep_auto"},
+    {"all2all_backend": "deepep_high_throughput"},
+    {"all2all_backend": "deepep_low_latency"},
+    {"all2all_backend": "allgather_reducescatter", "use_deepep_auto_kernels": True},
+    {"all2all_backend": "allgather_reducescatter", "enable_eplb": True},
+])
+def test_unsupported_parallel_route_fails_before_storage_creation(
+    monkeypatch, native_wna16, parallel,
+):
+    weight, activation, moe = _scheme()
+    moe.moe_parallel_config = SimpleNamespace(**parallel)
+    constructed = []
+    monkeypatch.setattr(
+        native_wna16.CompressedTensorsWNA16MoEMethod, "__init__",
+        lambda *args, **kwargs: constructed.append(True),
+    )
+    with pytest.raises(NotImplementedError, match="HCU CT W4A8.*(DeepEP|EPLB)"):
+        runtime.make_hcu_w4a8_method(weight, activation, moe, "experts")
+    assert not constructed
+
+
+def test_ct_w4a8_does_not_inherit_storage_eplb_capability(native_wna16):
+    native = native_wna16
+    _, method, _ = _native_layer(-1, "aiter")
+    assert type(method) is native.CompressedTensorsWNA16MoEMethod
+    assert method.wna16_backend == native.WNA16MoEBackend.TRITON
+    assert not method.supports_eplb
+    # A regular WNA16 method retains its native capability and class identity.
+    storage = native.CompressedTensorsWNA16MoEMethod.__new__(
+        native.CompressedTensorsWNA16MoEMethod
+    )
+    storage.wna16_backend = native.WNA16MoEBackend.TRITON
+    assert storage.supports_eplb
+
+
 @pytest.fixture
 def native_wna16(monkeypatch):
     """Use the real CT loader; replace only accelerator backend selection."""
