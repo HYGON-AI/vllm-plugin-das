@@ -2,10 +2,10 @@
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 # SPDX-FileCopyrightText: Copyright (c) 2026 Hygon Information Technology Co., Ltd.
 # Modified by Hygon Information Technology Co., Ltd., 2026.
-import re
 import typing
 from collections.abc import Callable, Iterable
 from copy import copy
+from types import MethodType
 
 import torch
 import torch.nn as nn
@@ -55,7 +55,7 @@ logger = init_logger(__name__)
 
 
 def _mtp_quantization_config(vllm_config: VllmConfig, prefix: str) -> VllmConfig:
-    """Alias canonical decoder targets to this HCU MTP layer's quant prefix."""
+    """Match this MTP layer against canonical checkpoint quantization rules."""
     if not henvs.VLLM_HCU_GLM_MTP_QUANT_PREFIX_FIX:
         return vllm_config
     # Eagle replaces model_config with the converted draft config, whose type
@@ -79,43 +79,55 @@ def _mtp_quantization_config(vllm_config: VllmConfig, prefix: str) -> VllmConfig
     if not isinstance(quant_config, CompressedTensorsConfig):
         return vllm_config
 
-    def alias(target: str) -> str | None:
-        if target.startswith("re:"):
-            expression = target[3:]
-            anchor = "^" if expression.startswith("^") else ""
-            source = anchor + re.escape("model.decoder")
-            if expression.startswith(source + r"\."):
-                return "re:" + anchor + re.escape(prefix) + expression[len(source):]
-        elif target.startswith("model.decoder."):
-            return prefix + target[len("model.decoder"):]
-        return None
+    from vllm.model_executor.layers.quantization.compressed_tensors.utils import (
+        find_matched_target,
+        should_ignore_layer,
+    )
+    from vllm.model_executor.layers.quantization.utils.config_utils import (
+        find_matching_patterns,
+    )
 
-    targets = {}
-    ignore = list(quant_config.ignore)
-    for target, scheme in quant_config.target_scheme_map.items():
-        targets[target] = scheme
-        mapped = alias(target)
-        # Regex rules use first-match priority. Insert each alias beside its
-        # source, before later generic regexes, without moving or replacing an
-        # explicit rule for the actual MTP prefix.
-        if mapped is not None and mapped not in quant_config.target_scheme_map:
-            targets[mapped] = scheme
-    for target in quant_config.ignore:
-        mapped = alias(target)
-        if mapped is not None and mapped not in ignore:
-            ignore.append(mapped)
-    if targets == quant_config.target_scheme_map and ignore == quant_config.ignore:
-        return vllm_config
+    original_match = type(quant_config).get_scheme_dict
+
+    def get_scheme_dict(self, layer, layer_name=None):
+        if layer_name is None or not layer_name.startswith(prefix + "."):
+            return original_match(self, layer, layer_name)
+        canonical = "model.decoder" + layer_name[len(prefix):]
+        mapping = self.packed_modules_mapping
+        # Either spelling can explicitly exclude a layer, including fused
+        # projections whose shards must agree under the native ignore matcher.
+        if any(
+            should_ignore_layer(name, self.ignore, mapping)
+            for name in (layer_name, canonical)
+        ):
+            return None
+
+        # An actual-prefix override matches the runtime name but not its
+        # canonical counterpart. Determine that by matching, not by parsing or
+        # rewriting the user's regex. Generic rules retain canonical priority.
+        overrides = {}
+        for target, scheme in self.target_scheme_map.items():
+            actual_matches = find_matching_patterns(layer_name, [target], mapping)
+            canonical_matches = find_matching_patterns(canonical, [target], mapping)
+            if any(actual_matches) and not any(canonical_matches):
+                overrides[target] = scheme
+        matched = find_matched_target(layer_name, layer, overrides, mapping)
+        if matched is not None:
+            explicit = copy(self)
+            explicit.target_scheme_map = overrides
+            return original_match(explicit, layer, layer_name)
+        return original_match(self, layer, canonical)
 
     # Keep the target model and other MTP layers' quantization rules unchanged.
     # copy(), unlike dataclasses.replace(), does not rerun engine validation.
     mtp_quant_config = copy(quant_config)
-    mtp_quant_config.target_scheme_map = targets
-    mtp_quant_config.ignore = ignore
+    mtp_quant_config.target_scheme_map = dict(quant_config.target_scheme_map)
+    mtp_quant_config.ignore = list(quant_config.ignore)
+    mtp_quant_config.get_scheme_dict = MethodType(get_scheme_dict, mtp_quant_config)
     mtp_vllm_config = copy(vllm_config)
     mtp_vllm_config.quant_config = mtp_quant_config
     logger.info_once(
-        "Aliasing compressed-tensors MTP targets from model.decoder to %s", prefix
+        "Matching compressed-tensors MTP prefix %s as model.decoder", prefix
     )
     return mtp_vllm_config
 

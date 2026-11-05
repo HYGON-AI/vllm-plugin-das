@@ -263,6 +263,9 @@ def _mixed_quant_config(target: str):
 @pytest.mark.parametrize("target", [
     r"re:^model\.decoder\.mlp\.experts\.\d+\.(?:gate_proj|up_proj|down_proj)$",
     r"re:model\.decoder\.mlp\.experts\.\d+\.(?:gate_proj|up_proj|down_proj)$",
+    r"re:^model[.]decoder[.]mlp\.experts\.\d+\.(?:gate_proj|up_proj|down_proj)$",
+    r"re:^(?:model)[.](?:decoder)[.]mlp\.experts\.\d+\.(?:gate_proj|up_proj|down_proj)$",
+    r"re:^model\x2edecoder\x2emlp\.experts\.\d+\.(?:gate_proj|up_proj|down_proj)$",
     "model.decoder.mlp.experts.0.down_proj",
 ])
 def test_mtp_decoder_quant_targets_select_int4_without_mutating_target_config(
@@ -318,8 +321,12 @@ def test_mtp_explicit_actual_prefix_ignore_and_target_take_priority(mtp_module):
 
 
 @pytest.mark.parametrize("generic_first", [False, True])
-def test_mtp_alias_preserves_regex_first_match_priority(mtp_module, generic_first):
-    canonical = r"re:^model\.decoder\.mlp\.experts\.\d+\.down_proj$"
+@pytest.mark.parametrize("canonical", [
+    r"re:^model\.decoder\.mlp\.experts\.\d+\.down_proj$",
+    r"re:^model[.]decoder[.]mlp\.experts\.\d+\.down_proj$",
+    r"re:^(model)[.](decoder)[.]mlp\.experts\.\d+\.down_proj$",
+])
+def test_mtp_alias_preserves_regex_first_match_priority(mtp_module, generic_first, canonical):
     generic = r"re:^model\..*\.down_proj$"
     qconfig = _mixed_quant_config(canonical)
     specific_scheme = qconfig.target_scheme_map[canonical]
@@ -354,6 +361,54 @@ def test_mtp_existing_alias_retains_its_position(mtp_module):
     assert adapted.quant_config.target_scheme_map[actual] is eight
 
 
+@pytest.mark.parametrize("actual", [
+    "model.layers.78.mlp.experts.0.down_proj",
+    r"re:^model[.]layers[.]78[.]mlp[.]experts[.]0[.]down_proj$",
+])
+def test_mtp_actual_override_precedes_canonical_and_generic_rules(mtp_module, actual):
+    canonical = r"re:^model[.]decoder[.]mlp[.]experts[.]\d+[.]down_proj$"
+    qconfig = _mixed_quant_config(canonical)
+    four = qconfig.target_scheme_map[canonical]
+    eight = qconfig.target_scheme_map["Linear"]
+    qconfig.target_scheme_map = {canonical: four, r"re:.*down_proj$": four, actual: eight}
+    adapted = mtp_module._mtp_quantization_config(_glm_engine(qconfig), "model.layers.78")
+    assert adapted.quant_config.get_scheme_dict(
+        nn.Linear(8, 8), "model.layers.78.mlp.experts.0.down_proj",
+    )["weights"].num_bits == 8
+    assert qconfig.get_scheme_dict(
+        nn.Linear(8, 8), "model.decoder.mlp.experts.0.down_proj",
+    )["weights"].num_bits == 4
+
+
+def test_mtp_canonical_match_preserves_fused_projection_overrides(mtp_module):
+    canonical = r"re:^model[.]decoder[.]self_attn[.](q_proj|k_proj|v_proj)$"
+    qconfig = _mixed_quant_config(canonical)
+    qconfig.packed_modules_mapping = {"qkv_proj": ["q_proj", "k_proj", "v_proj"]}
+    four = qconfig.target_scheme_map[canonical]
+    eight = qconfig.target_scheme_map["Linear"]
+    qconfig.target_scheme_map = {canonical: four, r"re:.*proj$": four}
+    for name in ("q_proj", "k_proj", "v_proj"):
+        qconfig.target_scheme_map["model.layers.78.self_attn." + name] = eight
+    adapted = mtp_module._mtp_quantization_config(_glm_engine(qconfig), "model.layers.78")
+    assert adapted.quant_config.get_scheme_dict(
+        nn.Linear(8, 8), "model.layers.78.self_attn.qkv_proj",
+    )["weights"].num_bits == 8
+
+
+@pytest.mark.parametrize("ignore", [
+    r"re:^model[.]decoder[.]self_attn[.]kv_b_proj$",
+    r"re:^(model)[.](decoder)[.]self_attn[.]kv_b_proj$",
+])
+def test_mtp_canonical_ignore_accepts_equivalent_regex(mtp_module, ignore):
+    qconfig = _mixed_quant_config("Linear")
+    qconfig.ignore = [ignore]
+    adapted = mtp_module._mtp_quantization_config(_glm_engine(qconfig), "model.layers.78")
+    assert adapted.quant_config.get_scheme_dict(
+        nn.Linear(8, 8), "model.layers.78.self_attn.kv_b_proj",
+    ) is None
+    assert qconfig.ignore == [ignore]
+
+
 @pytest.mark.parametrize("quant_config", [None, SimpleNamespace()])
 def test_non_compressed_tensors_mtp_config_is_unchanged(mtp_module, quant_config):
     engine = _glm_engine(quant_config)
@@ -364,8 +419,9 @@ def test_legacy_mtp_quantization_ignore_remains_unchanged(mtp_module):
     qconfig = _mixed_quant_config("Linear")
     qconfig.ignore = [r"re:^model\.layers\.78(?:\..*)?$"]
     engine = _glm_engine(qconfig)
-    assert mtp_module._mtp_quantization_config(engine, "model.layers.78") is engine
-    assert qconfig.get_scheme_dict(
+    adapted = mtp_module._mtp_quantization_config(engine, "model.layers.78")
+    assert adapted.quant_config.ignore == qconfig.ignore
+    assert adapted.quant_config.get_scheme_dict(
         nn.Linear(8, 8, bias=False), "model.layers.78.mlp.experts.0.down_proj",
     ) is None
 
