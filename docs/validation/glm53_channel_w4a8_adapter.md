@@ -246,3 +246,46 @@ capture without forcing `VLLM_USE_AOT_COMPILE=0`.
 
 Run: `run/20261105_160550/20261105_161204`, report:
 `reports/default_model/humaneval.json` in the GLM-5.3 validation project.
+
+## Rule order, shuffled reloads, and dispatch follow-up (2026-11-05)
+
+MTP aliases are inserted next to their source rules, preserving first-match
+priority against later generic regexes. Existing rules for the actual MTP
+prefix keep their values and original positions. The target model's config
+remains unchanged.
+
+Every successful CT W4A8 post-load advances a reload generation. On the first
+forward after native reload has restored the persistent kernel Parameters,
+the adapter invalidates derived scale caches on their final owners and the
+quant config. This covers `.data.copy_()` updates that leave addresses and
+`_version` unchanged; repeated forwards within a generation still reuse the
+shuffle cache. Regression tests execute three native checkpoint generations
+and two forwards per generation with scale shuffle enabled.
+
+The outer CT loader now exposes the delegate's INT8 AllGatherv capability
+after successful prewarm. It starts disabled and is revoked before post-load,
+including failed reloads. The loader's exact WNA16 class identity is retained.
+Tests cover successful prewarm and fallback, and the actual MoERunner DP4
+dispatch query through both direct and modular wrappers.
+
+INT4 repacking converts each input word directly into four signed packed
+bytes in bounded blocks of at most 1,048,576 words. It uses a strided view of
+transposed input, avoiding both a full transpose copy and full unpacked INT4
+intermediates. CPU tests check bitwise equivalence and bound temporary storage
+for contiguous and strided inputs in both orientations.
+
+Validation was run on nmz105. The two affected CPU contract files passed all
+81 tests. A single BW1101 DCU converted a random signed-INT32 tensor of shape
+`[32, 768, 4096]`, corresponding to 32 experts with H=6144 and I=2048. Old and
+new outputs were bitwise identical. Peak allocated-memory increments, excluding
+the already-allocated input, were:
+
+| Implementation | Peak increment | Final output | Temporary overhead |
+| --- | ---: | ---: | ---: |
+| Previous unpack-and-stack | 3840 MiB | 384 MiB | 3456 MiB |
+| Bounded direct repack | approximately 400 MiB | 384 MiB | approximately 16 MiB |
+
+Artifacts: `run/20261105_pr299_review_followup/` in the validation project.
+The prior 100/100 HumanEval run predates this follow-up; these new checks cover
+rule selection, dispatch, native reloads, and packing rather than a new full-model
+accuracy evaluation.

@@ -395,6 +395,14 @@ def prepare_aiter_moe_weights(
     return result
 
 
+def invalidate_aiter_moe_scale_cache(owner: object) -> None:
+    """Discard derived scales after a loader writes through Parameter.data."""
+
+    cache = getattr(owner, _SCALE_CACHE_ATTR, None)
+    if isinstance(cache, OrderedDict):
+        cache.clear()
+
+
 def prepare_aiter_moe_scales(
     scale1: torch.Tensor | None,
     scale2: torch.Tensor | None,

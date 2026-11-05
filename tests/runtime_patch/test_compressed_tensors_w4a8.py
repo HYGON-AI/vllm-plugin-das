@@ -114,6 +114,53 @@ def test_bad_packed_storage_is_rejected():
         runtime.repack_ct_int4(torch.zeros(2,4,dtype=torch.int32),transposed=False)
 
 
+@pytest.mark.parametrize("transposed", [False, True])
+@pytest.mark.parametrize("strided", [False, True])
+@pytest.mark.parametrize("word_limit", [5, 17])
+def test_repack_bounds_temporary_storage(monkeypatch, transposed, strided, word_limit):
+    from torch.utils._python_dispatch import TorchDispatchMode
+    from torch.utils._pytree import tree_flatten
+
+    generator = torch.Generator().manual_seed(81)
+    packed = torch.randint(-(2**31), 2**31, (2, 7, 22), dtype=torch.int32, generator=generator)
+    packed = packed[..., ::2] if strided else packed[..., :11].contiguous()
+    words = packed.transpose(1, 2).contiguous() if transposed else packed
+    signed = torch.stack(
+        [(((words >> (4 * i)) & 15) - 8).to(torch.int8) for i in range(8)], dim=-1,
+    ).flatten(-2)
+    expected = (((signed[..., ::2].to(torch.int16) & 15) << 4)
+                | (signed[..., 1::2].to(torch.int16) & 15)).to(torch.uint8).view(torch.int8)
+    monkeypatch.setattr(runtime, "_REPACK_MAX_WORDS", word_limit, raising=False)
+
+    class BoundedStorage(TorchDispatchMode):
+        def __init__(self):
+            super().__init__()
+            self.allowed = {packed.untyped_storage().data_ptr()}
+            self.outputs = 0
+
+        def __torch_dispatch__(self, func, types, args=(), kwargs=None):
+            result = func(*args, **(kwargs or {}))
+            for tensor in tree_flatten(result)[0]:
+                if not isinstance(tensor, torch.Tensor):
+                    continue
+                storage = tensor.untyped_storage()
+                if storage.data_ptr() in self.allowed:
+                    continue
+                if (str(func).startswith("aten.empty") and tensor.dtype == torch.int8
+                        and tensor.shape == expected.shape):
+                    self.outputs += 1
+                    assert self.outputs == 1
+                    self.allowed.add(storage.data_ptr())
+                else:
+                    assert storage.nbytes() <= word_limit * 4, "unbounded repack temporary"
+            return result
+
+    with BoundedStorage():
+        actual = runtime.repack_ct_int4(packed, transposed=transposed)
+    assert actual.is_contiguous()
+    torch.testing.assert_close(actual, expected)
+
+
 def test_patch_rejects_incompatible_upstream_signature():
     module=_module(lambda x: x)
     with pytest.raises(PatchCompatibilityError,match="signature"):
@@ -368,6 +415,98 @@ def test_aiter_forward_uses_final_scales_after_checkpoint_reload(
             torch.testing.assert_close(captured[-1][0], layer.w13_weight_scale)
             torch.testing.assert_close(captured[-1][1], layer.w2_weight_scale)
     assert len(captured) == 6
+
+
+@pytest.mark.parametrize("group_size", [None, -1])
+def test_checkpoint_reload_invalidates_shuffled_scale_cache(monkeypatch, native_wna16, group_size):
+    from compressed_tensors.compressors.pack_quantized.helpers import pack_to_int32
+    from vllm.model_executor.model_loader.reload.layerwise import (
+        record_metadata_for_reloading, initialize_layerwise_reload, finalize_layerwise_reload,
+    )
+    from vllm_hcu.model_executor.layers.quantization import compressed_tensors_moe_runtime as kernels
+
+    selected = SimpleNamespace(need_shuffle=False, need_shuffle_scale=True,
+                               quant_type="w4a8", solution_type="moe_c")
+    monkeypatch.setattr(kernels, "prewarm_aiter_w4a8_moe", lambda *_: selected)
+    monkeypatch.setattr(kernels, "install_aiter_moe_weight_layout", lambda *_, **__: None)
+    monkeypatch.setattr(kernels, "install_aiter_moe_scale_layout", lambda *_, **__: None)
+    monkeypatch.setattr(kernels, "select_aiter_moe_config", lambda *_, **__: selected)
+    monkeypatch.setattr(kernels, "prepare_aiter_moe_weights", lambda w1, w2, *_, **__: (w1, w2))
+    monkeypatch.setattr(kernels, "aiter_expert_map_for_solution", lambda *_, **__: None)
+    calls = []
+    aiter = ModuleType("aiter.moe")
+    aiter.MoeQuantType = SimpleNamespace(W4A8="w4a8")
+
+    def shuffle(s1, s2, config):
+        calls.append((s1.clone(), s2.clone()))
+        return s1.flip(1), s2.flip(1)
+
+    aiter.aiter_moe_shfl_scale = shuffle
+    monkeypatch.setitem(sys.modules, "aiter.moe", aiter)
+    _, method, layer = _native_layer(group_size, "aiter")
+    record_metadata_for_reloading(layer)
+    checkpoint = {name: torch.zeros_like(param) for name, param in layer.named_parameters()}
+
+    def execute(config, **kwargs):
+        torch.testing.assert_close(kwargs["w1_scale"], layer.w13_weight_scale.flip(1))
+        torch.testing.assert_close(kwargs["w2_scale"], layer.w2_weight_scale.flip(1))
+        return kwargs["hidden_states"]
+
+    monkeypatch.setattr(kernels, "execute_aiter_moe", execute)
+    persistent = None
+    for generation in range(3):
+        if generation:
+            initialize_layerwise_reload(layer)
+        for prefix, shape in (("w13", (2, 32, 32)), ("w2", (2, 32, 16))):
+            q = torch.full(shape, generation, dtype=torch.int8)
+            checkpoint[prefix + "_weight_packed"] = pack_to_int32(q, 4).transpose(1, 2).contiguous()
+            checkpoint[prefix + "_weight_scale"] = (
+                torch.arange(32, dtype=torch.bfloat16).reshape(1, 1, 32).expand(2, 1, 32)
+                + 32 * generation + 1
+            ).contiguous()
+        for name, tensor in checkpoint.items():
+            param = getattr(layer, name)
+            loader = getattr(param, "weight_loader", None)
+            if loader is None:
+                param.data.copy_(tensor)
+            else:
+                loader(param, tensor)
+        if generation:
+            finalize_layerwise_reload(layer, None)
+        else:
+            method.process_weights_after_loading(layer)
+        owners = [(id(s), s.data_ptr(), s._version)
+                  for s in (layer.w13_weight_scale, layer.w2_weight_scale)]
+        if persistent is None:
+            persistent = owners
+        assert owners == persistent  # Native .data.copy_ does not bump _version.
+        for _ in range(2):
+            method.apply(layer, torch.ones(2, 32, dtype=torch.bfloat16),
+                         torch.ones(2, 1), torch.zeros(2, 1, dtype=torch.int32))
+        assert len(calls) == generation + 1  # Reuse within a generation only.
+
+
+@pytest.mark.parametrize("available", [False, True])
+def test_adapter_forwards_int8_allgatherv_after_prewarm(monkeypatch, native_wna16, available):
+    from vllm_hcu.model_executor.layers.quantization import compressed_tensors_moe_runtime as kernels
+
+    config = SimpleNamespace(need_shuffle=False)
+    monkeypatch.setattr(kernels, "prewarm_aiter_w4a8_moe", lambda *_: config if available else None)
+    monkeypatch.setattr(kernels, "install_aiter_moe_weight_layout", lambda *_, **__: None)
+    monkeypatch.setattr(kernels, "install_aiter_moe_scale_layout", lambda *_, **__: None)
+    monkeypatch.setattr(kernels, "prepare_vllm_w4a8_moe", lambda *_, **__: None)
+    monkeypatch.setattr(kernels, "mark_aiter_moe_native_layout", lambda *_, **__: None)
+    _, method, layer = _native_layer(-1, "aiter")
+    assert not getattr(method, "supports_int8_allgatherv_input", False)
+    method.process_weights_after_loading(layer)
+    assert method._hcu_ct_w4a8_delegate.supports_int8_allgatherv_input is available
+    assert getattr(method, "supports_int8_allgatherv_input", False) is available
+    assert not method.supports_internal_mk
+    assert type(method) is native_wna16.CompressedTensorsWNA16MoEMethod
+    # Invalid storage must also revoke an earlier successful capability.
+    with pytest.raises(RuntimeError, match="fresh rank-3 packed INT32"):
+        method.process_weights_after_loading(layer)
+    assert not method.supports_int8_allgatherv_input
 
 
 def test_scale_rebinding_supports_fullgraph_compile():

@@ -37,20 +37,38 @@ def supports_channel_w4a8(weight: object, activation: object, moe: object) -> bo
     )
 
 
+_REPACK_MAX_WORDS = 1 << 20
+
+
 def repack_ct_int4(packed, *, transposed: bool):
     """Convert CT offset-binary INT32 to HCU signed, high-nibble-first INT8."""
     import torch
 
     if packed.dtype != torch.int32 or packed.ndim != 3:
         raise ValueError("HCU CT W4A8 expects rank-3 packed INT32 weights")
-    words = packed.transpose(1, 2).contiguous() if transposed else packed
-    signed = torch.stack(
-        [(((words >> (4 * i)) & 15) - 8).to(torch.int8) for i in range(8)],
-        dim=-1,
-    ).flatten(-2)
-    high = (signed[..., 0::2].to(torch.int16) & 15) << 4
-    low = signed[..., 1::2].to(torch.int16) & 15
-    return (high | low).to(torch.uint8).view(torch.int8).contiguous()
+    words = packed.transpose(1, 2) if transposed else packed
+    experts, rows, columns = words.shape
+    result = torch.empty((experts, rows, columns * 4), dtype=torch.int8, device=packed.device)
+    if not packed.numel():
+        return result
+    column_step = min(columns, _REPACK_MAX_WORDS)
+    row_step = max(1, _REPACK_MAX_WORDS // column_step)
+    for expert in range(experts):
+        for row in range(0, rows, row_step):
+            stop_row = min(row + row_step, rows)
+            for column in range(0, columns, column_step):
+                stop_column = min(column + column_step, columns)
+                block = words[expert, row:stop_row, column:stop_column]
+                output = result[expert, row:stop_row, column * 4:stop_column * 4].view(
+                    stop_row - row, stop_column - column, 4,
+                )
+                for byte in range(4):
+                    # CT stores offset-binary low nibble first. Swap the pair
+                    # and flip each sign bit directly, without unpacking INT4.
+                    high = ((block >> (byte * 8)) & 15) << 4
+                    low = (block >> (byte * 8 + 4)) & 15
+                    output[..., byte].copy_(((high | low) ^ 0x88).to(torch.uint8).view(torch.int8))
+    return result
 
 
 def _create_weights(
@@ -84,6 +102,7 @@ def _process_weights_after_loading(self, layer) -> None:
     # Validate both projections before mutation: runtime INT8 aliases must never
     # be repacked or have their scales divided by 16 a second time.
     self._hcu_ct_w4a8_loaded = False
+    self.supports_int8_allgatherv_input = False
     for prefix in ("w13", "w2"):
         packed = getattr(layer, prefix + "_weight_packed", None)
         if (
@@ -122,6 +141,10 @@ def _process_weights_after_loading(self, layer) -> None:
         )
     self.moe_quant_config = delegate.moe_quant_config
     self.moe_kernel = delegate.moe_kernel
+    self.supports_int8_allgatherv_input = bool(
+        getattr(delegate, "supports_int8_allgatherv_input", False)
+    )
+    self._hcu_ct_w4a8_reload_generation = getattr(self, "_hcu_ct_w4a8_reload_generation", 0) + 1
     self._hcu_ct_w4a8_loaded = True
 
 
@@ -151,6 +174,18 @@ def _apply(
     # Retain the config/descriptors also held by modular kernel consumers.
     delegate = self._hcu_ct_w4a8_delegate
     config = delegate.moe_quant_config
+    generation = getattr(self, "_hcu_ct_w4a8_reload_generation", 0)
+    if getattr(self, "_hcu_ct_w4a8_bound_generation", None) != generation:
+        from vllm_hcu.model_executor.layers.fused_moe.aiter_moe_dispatch import (
+            invalidate_aiter_moe_scale_cache,
+        )
+
+        # Native reload restores persistent Parameters after post-load using
+        # .data.copy_(), which leaves their _version and addresses unchanged.
+        # Invalidate after that restoration, once for each successful reload.
+        for owner in (layer.w13_weight_scale, layer.w2_weight_scale, config):
+            invalidate_aiter_moe_scale_cache(owner)
+        self._hcu_ct_w4a8_bound_generation = generation
     _replace_tensor_reference(config, "w1_scale", layer.w13_weight_scale)
     _replace_tensor_reference(config, "w2_scale", layer.w2_weight_scale)
     self.moe_quant_config = config
@@ -190,6 +225,7 @@ def make_hcu_w4a8_method(weight_quant, input_quant, moe, layer_name=None):
     method = CompressedTensorsWNA16MoEMethod(weight_quant, None, moe, layer_name)
     method.input_quant = input_quant
     method._hcu_ct_w4a8_delegate = SlimQuantW4A8Int8AiterMoEMethod(None, moe)
+    method.supports_int8_allgatherv_input = False
     method._hcu_ct_w4a8_create_weights = method.create_weights
     method.create_weights = MethodType(_create_weights, method)
     method.process_weights_after_loading = MethodType(
