@@ -1,0 +1,132 @@
+[
+  {
+    "path": "/root/hy4-pr-ready-validation/0-decode_only-478-618.pt",
+    "bytes": 16379341,
+    "sha256": "b92245fadf794bfe3a0aad2bd829314de55f754e112cfe5ce8d01a21c7be70f5"
+  },
+  {
+    "path": "/root/hy4-pr-ready-validation/0-eager-478-618.pt",
+    "bytes": 16378973,
+    "sha256": "d77cce4b2a1f27b10407340fb26c5f1bdd443736d1010a8648ad81c74427fbd6"
+  },
+  {
+    "path": "/root/hy4-pr-ready-validation/0-full_piecewise-478-618.pt",
+    "bytes": 16379621,
+    "sha256": "64e729e81243edc060d276c39cecca64132ebedbca951aa296adec61f86d7bbf"
+  },
+  {
+    "path": "/root/hy4-pr-ready-validation/0-padded_eager-478-618.pt",
+    "bytes": 16379477,
+    "sha256": "ff97bba8a5dc9e433f5585469898d0e46cecc93e2641cadf850147e1c5a63bf9"
+  },
+  {
+    "path": "/root/hy4-pr-ready-validation/1-decode_only-478-618.pt",
+    "bytes": 16379341,
+    "sha256": "a2d2586be0d0ea1ecc38905836a84689f268a2d2e602970fbb99604df93c9081"
+  },
+  {
+    "path": "/root/hy4-pr-ready-validation/1-eager-478-618.pt",
+    "bytes": 16378973,
+    "sha256": "a150e17db3d1f84ab04662c0dbf229b4293e0bfcb9ae331a33e231d6c333b388"
+  },
+  {
+    "path": "/root/hy4-pr-ready-validation/1-full_piecewise-478-618.pt",
+    "bytes": 16379621,
+    "sha256": "38fb8e4c5a551d4e08c32af102eab34fccd92f17973a0af4c72c11750fc3a5f9"
+  },
+  {
+    "path": "/root/hy4-pr-ready-validation/1-padded_eager-478-618.pt",
+    "bytes": 16379477,
+    "sha256": "2011a69653f73d41294118f5f3370039ab66acd3e6e54419a1b8807ee5471170"
+  },
+  {
+    "path": "/root/hy4-pr-ready-validation/topk-canonical-0-selection.pt",
+    "bytes": 51867,
+    "sha256": "2688d55cd390d37de2f5a22d24fee71474c58693a1b9dc481e17339dded93f21"
+  },
+  {
+    "path": "/root/hy4-pr-ready-validation/topk-canonical-0.pt",
+    "bytes": 16379045,
+    "sha256": "b3a347f4e43828956748394b8b0d0ebaa59c85f4f2fb0ccd4d6835591c4c50d7"
+  },
+  {
+    "path": "/root/hy4-pr-ready-validation/topk-canonical-1-selection.pt",
+    "bytes": 51867,
+    "sha256": "e1013d28c9e17f4c99cddf5a36ab6c2b4522a6fe0c686846c0ad44bbaf4fcfa2"
+  },
+  {
+    "path": "/root/hy4-pr-ready-validation/topk-canonical-1.pt",
+    "bytes": 16379045,
+    "sha256": "0602819fcf1179ba7aa4b1ca6517ad27cd9d016849e892b474b61a4b429381e4"
+  },
+  {
+    "path": "/root/hy4-pr-ready-validation/topk-canonical-2-selection.pt",
+    "bytes": 51867,
+    "sha256": "ae46def1d613fccd6fb0eb3c114b6669f7993ac5ed44de1ab9b3f08f1aae09ff"
+  },
+  {
+    "path": "/root/hy4-pr-ready-validation/topk-canonical-2.pt",
+    "bytes": 16379045,
+    "sha256": "b4524583fa9224e7c90a81124d3630eae62e4e7cfd64c0546b992b522ea39e70"
+  },
+  {
+    "path": "/root/hy4-pr-ready-validation/topk-legacy-0-selection.pt",
+    "bytes": 51837,
+    "sha256": "061c5c2241ae51a517052792a9b5d585c479cc3c23d4787fda93975b9b882469"
+  },
+  {
+    "path": "/root/hy4-pr-ready-validation/topk-legacy-0.pt",
+    "bytes": 16378829,
+    "sha256": "5e996227f6f3df8d02332bfa983a9d09ef26ece5f262051c0b421c41f02afb75"
+  },
+  {
+    "path": "/root/hy4-pr-ready-validation/topk-legacy-1-selection.pt",
+    "bytes": 51837,
+    "sha256": "b6ae43df56cca6c784e9759a1a18ec3332477c6af4700e85e084d2833818428b"
+  },
+  {
+    "path": "/root/hy4-pr-ready-validation/topk-legacy-1.pt",
+    "bytes": 16378829,
+    "sha256": "92abaa2517935f9606a6fb9704a2a8004641f223d3a7421d944976ae8effd042"
+  },
+  {
+    "path": "/root/hy4-pr-ready-validation/topk-original-0-selection.pt",
+    "bytes": 51857,
+    "sha256": "d13fea049e2844a2b40de5c7e29033f97caad111abe8b2cb5d8e29d1de75067a"
+  },
+  {
+    "path": "/root/hy4-pr-ready-validation/topk-original-0.pt",
+    "bytes": 16378973,
+    "sha256": "058d73bf6c29fe77d74f2e7974f21570798121d80ccbbcc167e08f5d5795d346"
+  },
+  {
+    "path": "/root/hy4-pr-ready-validation/topk-original-1-selection.pt",
+    "bytes": 51857,
+    "sha256": "06893e254803bea88edd7e7f7ecac17447e0dbae3f6dd1ce0ab83afb8a207ca4"
+  },
+  {
+    "path": "/root/hy4-pr-ready-validation/topk-original-1.pt",
+    "bytes": 16378973,
+    "sha256": "cd74cd82427e1bb361216951018cdae4342eebe8b05a6694f813449886f5b94d"
+  },
+  {
+    "path": "/root/hy4-pr-ready-validation/topk-torch-0-selection.pt",
+    "bytes": 51827,
+    "sha256": "85b857744bb3e724a17e71a3fae1ee9df603591e580ac879c102164243bfb6f1"
+  },
+  {
+    "path": "/root/hy4-pr-ready-validation/topk-torch-0.pt",
+    "bytes": 16378757,
+    "sha256": "f7b68409405decb37e89c5421656f86404090ccd92ea8299c89723033506f078"
+  },
+  {
+    "path": "/root/hy4-pr-ready-validation/topk-torch-1-selection.pt",
+    "bytes": 51827,
+    "sha256": "fb8cffc3b345ff9c55f505fabe740d21933cf005c663b756d3a9ff33d77a06ed"
+  },
+  {
+    "path": "/root/hy4-pr-ready-validation/topk-torch-1.pt",
+    "bytes": 16378757,
+    "sha256": "c3617dc52476b172828c8f146395bfd8a6049977618f380a4650722ca6eddb04"
+  }
+]

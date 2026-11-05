@@ -8,6 +8,13 @@ serving commands; video and speculative decoding are unsupported.
 
 ## Server
 
+**Ready verification found unresolved long-context variation**, including in
+eager mode: three of four repeated real-image pairs change answers after
+crossing the sparse indexer's 2048-token boundary. The
+[verification report](hy4_vl_ready_validation.md) contains the repeated
+requests, logits and selector ablations. The commands below reproduce
+experimental serving; eager does not resolve that long-context issue.
+
 Choose one execution mode. `eager` is the default fallback. Graph configurations
 are experimental: see the [decode graph report](hy4_vl_graph_performance.md) and
 [full/piecewise report](hy4_vl_piecewise_performance.md) for precision, stability

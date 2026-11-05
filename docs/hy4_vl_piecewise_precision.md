@@ -1,5 +1,10 @@
 # HYV4VL prefill padding precision investigation
 
+The subsequent [ready verification](hy4_vl_ready_validation.md) reproduces
+long-context variation in all four execution modes, including pure eager.
+It confirms that the remaining double-image issue needs a separate fix;
+the successful single-image padding guard below does not cover it.
+
 The earlier FULL_AND_PIECEWISE regression is reproducible without graph replay:
 keeping the padded prefill shapes while executing eagerly gives the same changed
 answers. Removing that padding restores the decode-only answers. The fix keeps

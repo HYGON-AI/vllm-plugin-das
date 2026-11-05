@@ -1,0 +1,20 @@
+{
+  "tested_head": "125d5e5a63c20d2e61563e572140398bd8313419",
+  "date": "2026-11-05",
+  "ready": false,
+  "reason": "Unresolved repeated-answer and logit variation at long context, including pure eager",
+  "main_requests": 32,
+  "selector_ablation_requests": 6,
+  "model_tests_passed": 193,
+  "runner_tests_passed": 10,
+  "runner_sha256": "3223616b747375a1b5ca206342351dfce8a469b78e0013d7fb507499c77906d8",
+  "dataset_revision": "17e7f75e092e47169732462ea3cdfebe911105dd",
+  "dataset": "xai-org/RealworldQA",
+  "tensor_files_distributed": false,
+  "diagnostic_working_directory": "/root/hy4-pr-ready-validation",
+  "excluded_intervention_requests": 3,
+  "excluded_intervention": "canonical sorting was not applied to the already-installed closure",
+  "server_log_original_sha256": "c8b7eb2d773f56f0e45f4861d6d039f4e00cafc2d04bf7ccff882fafa79af107",
+  "server_log_original_path": "/root/hy4-pr-ready-validation/serving.log",
+  "committed_server_log_normalization": "line endings and trailing whitespace only"
+}

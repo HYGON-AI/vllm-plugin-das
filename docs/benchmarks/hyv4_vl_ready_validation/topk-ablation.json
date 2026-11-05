@@ -1,0 +1,86 @@
+[
+  {
+    "ttft_seconds": 1.1360029589995975,
+    "latency_seconds": 7.9684175529982895,
+    "decode_seconds_per_token": 0.22038405567769997,
+    "usage": {
+      "prompt_tokens": 2039,
+      "total_tokens": 2071,
+      "completion_tokens": 32
+    },
+    "answer": "Here is a detailed description of both images, in the order they were provided:\n\n### Image 1\n\nThis image captures a daytime street scene from the perspective of",
+    "finish_reason": "length",
+    "selector": "original",
+    "repetition": 0
+  },
+  {
+    "ttft_seconds": 1.1283208079985343,
+    "latency_seconds": 7.970201988995541,
+    "decode_seconds_per_token": 0.22069195551645657,
+    "usage": {
+      "prompt_tokens": 2039,
+      "total_tokens": 2071,
+      "completion_tokens": 32
+    },
+    "answer": "Here is a detailed description of both images, in their original order:\n\n### Image 1\nThis is a street-level photograph taken from inside a vehicle, looking",
+    "finish_reason": "length",
+    "selector": "original",
+    "repetition": 1
+  },
+  {
+    "ttft_seconds": 1.1386167849996127,
+    "latency_seconds": 8.00241382799868,
+    "decode_seconds_per_token": 0.2213985798063673,
+    "usage": {
+      "prompt_tokens": 2039,
+      "total_tokens": 2071,
+      "completion_tokens": 32
+    },
+    "answer": "Here is a detailed description of both images, in the order they were provided:\n\n### Image 1\n\nThis image captures a daytime street scene from the perspective of",
+    "finish_reason": "length",
+    "selector": "legacy",
+    "repetition": 0
+  },
+  {
+    "ttft_seconds": 1.1353658650041325,
+    "latency_seconds": 7.997808011001325,
+    "decode_seconds_per_token": 0.221354681515931,
+    "usage": {
+      "prompt_tokens": 2039,
+      "total_tokens": 2071,
+      "completion_tokens": 32
+    },
+    "answer": "Here is a detailed description of both images, in the order they were provided:\n\n### Image 1\n\nThis image captures a daytime street scene from the perspective of",
+    "finish_reason": "length",
+    "selector": "legacy",
+    "repetition": 1
+  },
+  {
+    "ttft_seconds": 1.122462572006043,
+    "latency_seconds": 8.223089895996964,
+    "decode_seconds_per_token": 0.22903925529023964,
+    "usage": {
+      "prompt_tokens": 2039,
+      "total_tokens": 2071,
+      "completion_tokens": 32
+    },
+    "answer": "Here is a detailed description of both images, in order:\n\n### First Image\nThis is a street-level view of a wide, multi-lane road at",
+    "finish_reason": "length",
+    "selector": "torch",
+    "repetition": 0
+  },
+  {
+    "ttft_seconds": 1.12455794098787,
+    "latency_seconds": 8.22951105798711,
+    "decode_seconds_per_token": 0.22917700093568139,
+    "usage": {
+      "prompt_tokens": 2039,
+      "total_tokens": 2071,
+      "completion_tokens": 32
+    },
+    "answer": "Here is a detailed description of both images, in order:\n\n### First Image\nThis is a street-level view of a wide, multi-lane road at",
+    "finish_reason": "length",
+    "selector": "torch",
+    "repetition": 1
+  }
+]
