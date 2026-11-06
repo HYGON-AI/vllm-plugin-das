@@ -157,6 +157,18 @@ class Step5AuxManager:
                     "re-register KV caches before restoring or sending state"
                 )
 
+    def prepare_send(self):
+        """Fence completed producer writes before the next forward is enqueued."""
+        self._validate_allocations()
+        first = next(iter(self._allocations.values()))[1][0]
+        if first.is_cuda:
+            if torch.cuda.is_current_stream_capturing():
+                raise RuntimeError("Step5 PD send readiness must run outside CUDA graphs")
+            readiness = torch.cuda.Event()
+            readiness.record(torch.cuda.current_stream(first.device))
+            return readiness
+        return None
+
     def prepare_pulls(self, pulls: list[Any]):
         readiness = None
         if self._compiled_consumer and any(any(p.local_block_ids) for p in pulls):

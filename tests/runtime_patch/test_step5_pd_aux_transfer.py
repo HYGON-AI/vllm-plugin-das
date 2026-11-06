@@ -69,7 +69,8 @@ def connector_lifecycle_methods():
     tree = ast.parse(source.read_text())
     classes = {node.name: node for node in tree.body if isinstance(node, ast.ClassDef)}
     methods = {"MooncakeConnector": ["bind_connector_metadata", "get_finished"],
-               "MooncakeConnectorWorker": ["start_load_kv", "_start_load_kv", "get_finished", "process_pulling_result"]}
+               "MooncakeConnectorWorker": ["start_load_kv", "_start_load_kv", "record_send_reqs",
+                                          "get_finished", "process_pulling_result"]}
     body = [ast.ImportFrom(module="__future__", names=[ast.alias(name="annotations")], level=0)]
     for name, wanted in methods.items():
         node = classes[name]
@@ -154,7 +155,7 @@ def test_binding_releases_aborted_source_before_forward(aux):
     connector = connector_type()
     connector.connector_worker = worker
     connector.bind_connector_metadata(SimpleNamespace(dsa_source_blocks={},
-                                                      reqs_not_processed={"x"}))
+                                                      reqs_not_processed={"x"}, reqs_to_send={}))
     assert not manager._sources
     with pytest.raises(RuntimeError, match="no indexer tail"):
         manager.pools[id(state)].get((0, 7))
@@ -167,6 +168,86 @@ def test_binding_without_step5_preserves_base_contract():
     metadata = object()
     connector.bind_connector_metadata(metadata)
     assert connector._connector_metadata is metadata
+
+
+def _send_worker(worker_type, monkeypatch):
+    monkeypatch.setitem(worker_type.record_send_reqs.__globals__, "envs",
+                        SimpleNamespace(VLLM_MOONCAKE_ABORT_REQUEST_TIMEOUT=60))
+    monkeypatch.setitem(worker_type.record_send_reqs.__globals__, "time", __import__('time'))
+    monkeypatch.setitem(worker_type.record_send_reqs.__globals__, "log_ttft_event",
+                        lambda *args, **kwargs: None)
+    send = SimpleNamespace(p_req_id="done", local_block_ids=[], ready=asyncio.Event())
+    worker = SimpleNamespace(reqs_need_send={"x": send}, _pcp_dummy_sender=False)
+    worker.record_send_reqs = worker_type.record_send_reqs.__get__(worker)
+    return worker, send
+
+
+def test_completed_step5_send_is_published_before_forward_only_once(aux, monkeypatch):
+    connector_type, worker_type = connector_lifecycle_methods()
+    worker, send = _send_worker(worker_type, monkeypatch)
+    manager, _, _, _ = make_manager(aux, True)
+    worker._step5_aux = manager
+    worker.is_kv_producer = True
+    worker.is_kv_consumer = False
+    worker.sender_loop = object()
+    worker.start_load_kv = worker_type.start_load_kv.__get__(worker)
+    pending = []
+    monkeypatch.setattr(asyncio, 'run_coroutine_threadsafe',
+                        lambda coro, loop: pending.append(coro))
+    connector = connector_type()
+    connector.connector_worker = worker
+    metadata = SimpleNamespace(dsa_source_blocks={"x": [[7]]}, reqs_not_processed=set(),
+                               reqs_to_recv={}, reqs_to_send={"done": ("x", [[7]])})
+    connector.bind_connector_metadata(metadata)
+    assert len(pending) == 1  # Before model forward.
+    worker.start_load_kv(metadata)  # Runner V2's later post-forward hook.
+    assert len(pending) == 1
+    asyncio.run(pending.pop())
+    assert send.ready.is_set() and send.local_block_ids == [[7]]
+    assert send.p_req_id == "done"
+
+
+def test_producer_readiness_fence_does_not_publish_or_block_event_loop(monkeypatch):
+    import threading
+    _, worker_type = connector_lifecycle_methods()
+    worker, send = _send_worker(worker_type, monkeypatch)
+    started, completed = threading.Event(), threading.Event()
+    def synchronize():
+        started.set()
+        assert completed.wait(5)
+    metadata = SimpleNamespace(reqs_to_send={"done": ("x", [[7]])}, reqs_not_processed=set())
+    async def run():
+        task = asyncio.create_task(worker.record_send_reqs(
+            metadata, SimpleNamespace(synchronize=synchronize)))
+        try:
+            assert await asyncio.to_thread(started.wait, 5)
+            assert not send.ready.is_set()
+        finally:
+            completed.set()
+        await task
+        assert send.ready.is_set()
+    asyncio.run(run())
+
+
+@pytest.mark.parametrize('capturing', [False, True])
+def test_producer_fence_records_the_worker_stream_before_next_forward(aux, monkeypatch, capturing):
+    manager = object.__new__(aux.Step5AuxManager)
+    first = SimpleNamespace(is_cuda=True, device='producer-device')
+    manager._allocations = {0: (None, [first], None)}
+    manager._validate_allocations = lambda: None
+    stream = object()
+    event = SimpleNamespace(record=lambda s: recorded.append(s))
+    recorded = []
+    monkeypatch.setattr(torch.cuda, 'is_current_stream_capturing', lambda: capturing)
+    monkeypatch.setattr(torch.cuda, 'current_stream', lambda device: stream if device == first.device else None)
+    monkeypatch.setattr(torch.cuda, 'Event', lambda: event)
+    if capturing:
+        with pytest.raises(RuntimeError, match='outside CUDA graphs'):
+            manager.prepare_send()
+        assert not recorded
+    else:
+        assert manager.prepare_send() is event
+        assert recorded == [stream]
 
 
 @pytest.mark.parametrize("blocks", [[], [[]], [[], []]])

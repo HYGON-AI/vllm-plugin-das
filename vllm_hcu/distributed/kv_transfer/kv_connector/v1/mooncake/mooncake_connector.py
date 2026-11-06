@@ -1038,6 +1038,11 @@ class MooncakeConnector(KVConnectorBase_V1, SupportsHMA):
                 auxiliary.track_source(transfer_id, groups)
             for transfer_id in connector_metadata.reqs_not_processed:
                 auxiliary.release(transfer_id)
+            # These blocks belong to requests completed by the previous step.
+            # Publish them before the next long prefill, rather than waiting
+            # for Runner V2's deferred post-forward load hook.
+            if any(any(groups) for _, groups in connector_metadata.reqs_to_send.values()):
+                worker.start_load_kv(connector_metadata)
 
     def start_load_kv(self, forward_context: "ForwardContext", **kwargs) -> None:
         assert self.connector_worker is not None
@@ -2891,7 +2896,9 @@ class MooncakeConnectorWorker:
             else:
                 self.receive_kv(remote_engine_id, pull_metas)
 
-    async def record_send_reqs(self, metadata: MooncakeConnectorMetadata):
+    async def record_send_reqs(self, metadata: MooncakeConnectorMetadata, readiness=None):
+        if readiness is not None:
+            await asyncio.get_running_loop().run_in_executor(None, readiness.synchronize)
         for p_req_id, (transfer_id, block_ids) in metadata.reqs_to_send.items():
             if block_ids:
                 if self._pcp_dummy_sender:
@@ -2947,8 +2954,16 @@ class MooncakeConnectorWorker:
         if not self.is_kv_consumer and (
             metadata.reqs_to_send or metadata.reqs_not_processed
         ):
+            early_producer = auxiliary is not None and self.is_kv_producer
+            if early_producer and getattr(self, "_step5_send_metadata", None) is metadata:
+                return
+            send_readiness = None
+            if early_producer:
+                if any(any(groups) for _, groups in metadata.reqs_to_send.values()):
+                    send_readiness = auxiliary.prepare_send()
+                self._step5_send_metadata = metadata
             asyncio.run_coroutine_threadsafe(
-                self.record_send_reqs(metadata), self.sender_loop
+                self.record_send_reqs(metadata, send_readiness), self.sender_loop
             )
 
     def _producer_cache_is_replicated(self) -> bool:
