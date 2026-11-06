@@ -20,6 +20,10 @@ from hcu_adapter.extensions import (
 )
 from packaging.version import InvalidVersion, Version
 from hcu_vllm_das.version import TARGET_VLLM_RELEASE
+from hcu_vllm_das.environment import (
+    owns_prefill_compile_factor, prefill_gather_enabled,
+    register_prefill_compile_factor, validate_prefill_compile_factor,
+)
 
 
 CAPABILITY = "hcu-flash-attention"
@@ -86,7 +90,8 @@ def _owned(registry, publication):
     enum = registry.AttentionBackendEnum.FLASH_ATTN
     return (enum is publication.enum and registry.register_backend is publication.register
             and enum.is_overridden() and enum.get_path() == BACKEND
-            and enum.get_class() is publication.backend)
+            and enum.get_class() is publication.backend
+            and owns_prefill_compile_factor(import_module("vllm.envs")))
 
 
 def require_published(backend):
@@ -159,6 +164,10 @@ def activate(context: ExtensionContext) -> None:
             backend = import_module("hcu_vllm_das.attention.flash_attn")
             cls = backend.HcuFlashAttentionBackend
             vendor = backend._vendor_varlen_func()
+            envs = import_module("vllm.envs")
+            validate_prefill_compile_factor(envs)
+            if prefill_gather_enabled():
+                import_module("hcu_vllm_das.attention.prefill_gather").prepare()
             if not isinstance(cls, type) or not callable(cls.validate_configuration) or not callable(vendor):
                 raise TypeError("invalid backend class/validation/vendor callable")
             # Import-time Triton/native dependencies must fail before publishing.
@@ -182,6 +191,7 @@ def activate(context: ExtensionContext) -> None:
             raise FlashActivationError("FLASH_ATTN foreign override appeared during preparation")
         publication = _Publication(os.getpid(), enum, registry.register_backend, cls, vendor)
         try:
+            register_prefill_compile_factor(envs)
             registry.register_backend(enum, BACKEND)
             # Once publication was attempted, an exception has uncertain shared
             # effects. Signal publicly and latch; never advertise clean optional.

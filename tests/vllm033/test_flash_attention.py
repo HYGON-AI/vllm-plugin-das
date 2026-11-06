@@ -836,6 +836,34 @@ def test_varlen_boundary_avoids_vendor_short_prefill_mtp_misclassification(
     assert calls[0]["max_seqlen_q"] == 6
 
 
+@pytest.mark.parametrize('mode',('eligible','decode','fp8','capacity'))
+def test_opt_in_prefill_composition_keeps_decode_fp8_and_capacity_fallbacks(monkeypatch,mode):
+    flash=load_flash_attention(monkeypatch)
+    from hcu_vllm_das.attention import prefill_gather
+    impl=make_impl(flash)
+    impl._prefill_gather_enabled=True
+    calls=[]
+    monkeypatch.setattr(flash,'_vendor_varlen_func',lambda:lambda **kw:calls.append(('vendor',kw)))
+    monkeypatch.setattr(prefill_gather,'run',lambda vendor,kw,layout:calls.append(('gather',kw)))
+    nq=1 if mode=='decode' else 4
+    if mode=='fp8':
+        impl.kv_cache_dtype='fp8_e5m2'
+        scales=ModuleType('hcu_vllm_das.attention.e5m2_scales')
+        scales.run_e5m2_attention=lambda vendor,kw:calls.append(('fp8',kw))
+        monkeypatch.setitem(sys.modules,scales.__name__,scales)
+    cache_dtype=torch.uint8 if mode=='fp8' else torch.bfloat16
+    impl._run_flash_attention(q=torch.empty(nq,4,64,dtype=torch.bfloat16),
+        out=torch.empty(nq,4,64,dtype=torch.bfloat16),
+        k=torch.empty(1,2,64,64,dtype=cache_dtype),v=torch.empty(1,2,64,64,dtype=cache_dtype),
+        cu_seqlens_q=torch.tensor([0,nq],dtype=torch.int32),
+        seqused_k=torch.tensor([64],dtype=torch.int32),max_seqlen_q=nq,
+        max_seqlen_k=262145 if mode=='capacity' else 64,
+        block_table=torch.zeros((1,1),dtype=torch.int32))
+    assert len(calls)==1
+    assert calls[0][0]==('gather' if mode=='eligible' else 'fp8' if mode=='fp8' else 'vendor')
+    assert calls[0][1]['max_seqlen_q']==(5 if mode in ('capacity','fp8') else nq)
+
+
 @pytest.mark.parametrize("query_len", (1, 3, 16))
 def test_e5m2_paged_descale_adapter_handles_decode_and_prefill(monkeypatch, query_len):
     flash = load_flash_attention(monkeypatch)

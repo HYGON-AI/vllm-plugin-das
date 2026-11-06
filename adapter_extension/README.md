@@ -140,10 +140,29 @@ internally; rectangular short prefill uses that path by passing a conservative
 `max_seqlen_q` upper bound, avoiding the vendor wrapper's incompatible MTP tile
 selection.
 
+An additional prefill composition is available as an explicit candidate:
+`VLLM_HCU_FLASH_PREFILL_GATHER=1`. It reuses vLLM's existing C++
+`cp_gather_cache` per head, then the public contiguous vendor varlen call.
+It applies to BF16/FP16 paged queries with more than one query token and
+static batch-times-maximum-context capacity at most 262144 tokens. It retains
+device cumulative lengths, actual HND/NHD strides and caller output ownership.
+Single-token decode, FP8 KV and larger capacities use their existing paths.
+No new gather kernel or Core/Adapter source change is introduced.
+
+The default is OFF; unset the variable or set it to `0` and restart to roll
+back. This Flash-specific switch is independent of the RMSNorm switches.
+Its effective boolean is registered through vLLM's official environment
+compile factors before backend publication, covering ordinary and AOT caches.
+Conflicting factor ownership is rejected. Scoped component, installed-device
+and full Qwen3.5-4B quality/performance results are recorded in
+[the bounded-prefill validation](../docs/validation/vllm033-bounded-prefill.md).
+Other model, topology and architecture gates remain separate.
+
 FA4-only `dynamic_causal`, `mask_mod`, and `aux_tensors` are accepted only
 when inactive (`None`). An active feature fails closed instead of silently
-changing its mask. FP8 KV, DCP, hybrid caches, and layouts other than LBHNC and
-LBNHC remain unvalidated and are not claimed by this release.
+changing its mask. The bounded-prefill path does not implement FP8 KV or DCP;
+FP8 retains the existing path. Hybrid-cache validation is limited to the
+recorded models and recipes. Layouts other than LBHNC and LBNHC are not claimed.
 
 ## RMSNorm eligibility
 
@@ -183,7 +202,7 @@ implementation without uninstalling the plugin:
 export VLLM_HCU_USE_CUSTOM_OPS=1
 export VLLM_HCU_USE_CUSTOM_RMS_NORM=1
 
-# Roll back all optional DAS custom operators.
+# Roll back the optional RMSNorm custom operators.
 export VLLM_HCU_USE_CUSTOM_OPS=0
 
 # Or roll back only the LightOp RMSNorm path.
