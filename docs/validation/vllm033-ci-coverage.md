@@ -16,6 +16,9 @@ reported in `unmapped_paths` with `fallback=true`. Deleted paths are included
 in release diff selection. Documentation alone selects no jobs; `--full` and
 `--accuracy` expand to the full declared v0.33 scope even for empty/doc diffs.
 The CI selector/map/workflow and test tooling themselves select both jobs.
+An explicit `--config` is passed to the selected release's parser; the default
+map is chosen by release only when no override is provided. Invalid overrides
+fail selection rather than silently using the built-in map.
 
 PR hardware execution reuses the existing author/`ready-hcu` authorization
 helper from the PR's trusted base commit on a hosted CPU runner. A trusted
@@ -59,12 +62,22 @@ The container mounts `/opt/hyhal` read-only and uses the existing
 `scripts/ci/hcu/hcu_ci_start_container.sh` default 32GiB shared-memory policy
 without privileged mode.
 The hosted selector/source jobs receive no Harbor secrets or HCU device mounts.
+PR-code jobs use read-only contents permissions and every checkout disables
+persisted git credentials, including the source job's separate official checkout.
 A configured digest is not evidence that the image or hardware tier passed.
 The runner must provide the host `/opt/hyhal` runtime, gfx936 devices
 and the normal prepared DTK environment. This candidate does not create or
 validate such an image, allocate runner resources, or certify models and
 other HCU architectures. Image/wheel provenance, model quality, performance
 and the remaining release matrix remain separate acceptance gates.
+
+Installed tiers use the existing `packaging` dependency to parse PEP 440 epoch
+and release tuples, preserving the runtime activation policy for rc/dev/post/local
+builds and explicit epoch zero. The import is lazy so source/selection bootstrap
+still works on a stdlib-only interpreter. Script-only public-selector contracts
+run as eleven explicit isolated cases; they are not counted as collected pytest
+tests. Installed tiers default to `TORCHINDUCTOR_COMPILE_THREADS=1`, while keeping
+explicit overrides, torch.compile and changed-input Graph contracts enabled.
 
 CPU verification commands:
 

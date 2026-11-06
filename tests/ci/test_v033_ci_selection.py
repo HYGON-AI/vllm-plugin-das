@@ -70,6 +70,25 @@ class SelectionTests(unittest.TestCase):
             self.assertEqual({j['id'] for j in json.loads(result.stdout)['jobs']}, EXPECTED)
             self.assertIn('has_jobs=true', output.read_text())
 
+    def test_cli_uses_explicit_release_config_and_rejects_invalid_config(self):
+        with tempfile.TemporaryDirectory() as directory:
+            config = Path(directory) / 'config.json'
+            paths = Path(directory) / 'paths'
+            paths.write_text('custom-note.txt\n')
+            original = json.loads((ROOT / '.github/configs/hcu-test-map-v033.json').read_text())
+            original['docs_only_patterns'] = ['custom-note.txt']
+            config.write_text(json.dumps(original))
+            command = [sys.executable, '-B', str(ROOT / '.github/scripts/hcu_ci/select_hcu_tests.py'),
+                       '--release', 'v0.33.0', '--config', str(config), '--paths-from', str(paths)]
+            result = subprocess.run(command, capture_output=True, text=True, check=True)
+            self.assertTrue(json.loads(result.stdout)['docs_only'])
+            self.assertEqual(json.loads(result.stdout)['jobs'], [])
+            config.write_text('{}')
+            result = subprocess.run(command, capture_output=True, text=True)
+            self.assertEqual(result.returncode, 2)
+            self.assertIn('invalid v0.33 release job/fallback contract', result.stderr)
+            self.assertEqual(result.stdout, '')
+
     def test_release_diff_includes_deleted_paths_without_changing_legacy(self):
         with patch('select_hcu_tests.subprocess.run') as run:
             run.return_value = subprocess.CompletedProcess([], 0, 'removed.py\n', '')

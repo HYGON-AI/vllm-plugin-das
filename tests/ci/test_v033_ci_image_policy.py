@@ -99,6 +99,17 @@ class ImagePolicyTests(unittest.TestCase):
                     self.assertNotIn(forbidden, block)
         self.assertIn('needs: select\n', job_block(self.source, 'v033-source-contract'))
 
+    def test_pr_code_jobs_do_not_persist_checkout_credentials(self):
+        for name in ['select', 'v033-source-contract', 'v033-device-gfx936']:
+            with self.subTest(job=name):
+                block = job_block(self.source, name)
+                self.assertIn('    permissions:\n      contents: read\n', block)
+                for checkout in block.split('uses: actions/checkout@v4')[1:]:
+                    # Stop at the next step so another checkout cannot satisfy
+                    # the guard for this one (source checks out two repos).
+                    step = checkout.split('\n      - ', 1)[0]
+                    self.assertIn('persist-credentials: false', step)
+
 
 if __name__ == '__main__':
     unittest.main()

@@ -33,14 +33,14 @@ def test_files(tier):
 
 
 def _vllm_release(raw_version):
-    """Parse the release tuple without requiring a third-party package."""
-    if '!' in raw_version:
+    """Use the installed Plugin's PEP 440 dependency for installed tiers."""
+    # Keep source-tier and stdlib-only selection imports dependency-free.
+    from packaging.version import Version
+
+    version = Version(raw_version)
+    if version.epoch != 0:
         raise ValueError('vLLM version must have an epoch of zero')
-    release = raw_version.split('+', 1)[0].split('-', 1)[0]
-    parts = release.split('.')
-    if len(parts) < 2 or any(not part.isdigit() for part in parts):
-        raise ValueError(f'invalid vLLM release: {raw_version!r}')
-    return tuple(int(part) for part in parts)
+    return version.release
 
 
 def _run_public_selector_cases(environment):

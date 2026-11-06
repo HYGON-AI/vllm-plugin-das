@@ -336,7 +336,8 @@ def _write_github_outputs(path: Path, payload: dict[str, Any]) -> None:
 
 def _parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(description=__doc__)
-    parser.add_argument("--config", type=Path, default=DEFAULT_CONFIG)
+    parser.add_argument("--config", type=Path,
+                        help="selector configuration (defaults to the selected release)")
     parser.add_argument("--release", choices=("v0.28.1-dev", "v0.33.0"), default="v0.28.1-dev")
     parser.add_argument("--base")
     parser.add_argument("--head")
@@ -354,7 +355,7 @@ def _parser() -> argparse.ArgumentParser:
 def main(argv: Sequence[str] | None = None) -> int:
     args = _parser().parse_args(argv)
     try:
-        config = _load_config(args.config) if args.release == "v0.28.1-dev" else None
+        config = _load_config(args.config or DEFAULT_CONFIG) if args.release == "v0.28.1-dev" else None
         if args.paths_from is not None:
             if str(args.paths_from) == "-":
                 changed_paths = sys.stdin.read().splitlines()
@@ -370,7 +371,9 @@ def main(argv: Sequence[str] | None = None) -> int:
             )
         if args.release == "v0.33.0":
             from select_v033_tests import select_jobs as select_v033
-            payload = select_v033(changed_paths, full=args.full, accuracy=args.accuracy)
+            overrides = {"config_path": args.config} if args.config is not None else {}
+            payload = select_v033(changed_paths, full=args.full, accuracy=args.accuracy,
+                                  **overrides)
         else:
             jobs, groups, fallback = select_jobs(
                 config, changed_paths, full=args.full, accuracy=args.accuracy,
