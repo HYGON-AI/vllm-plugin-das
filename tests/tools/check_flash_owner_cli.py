@@ -23,7 +23,9 @@ try:
   name=current_platform.get_attn_backend_cls(AttentionBackendEnum.FLASH_ATTN,config)
   assert name=='hcu_vllm_das.attention.flash_attn.HcuFlashAttentionBackend',name
   selected.append({'kv_dtype':dtype,'class':name})
- config=AttentionSelectorConfig(head_size=128,dtype=torch.bfloat16,kv_cache_dtype='auto',block_size=128)
+ # v0.33 allows framework pages that are multiples of the 64-token kernel
+ # block; reject a non-multiple instead of incorrectly rejecting 128.
+ config=AttentionSelectorConfig(head_size=128,dtype=torch.bfloat16,kv_cache_dtype='auto',block_size=65)
  try:current_platform.get_attn_backend_cls(AttentionBackendEnum.FLASH_ATTN,config)
  except ValueError as exc:result['invalid_block_size_refused']=str(exc)
  else:raise AssertionError('invalid Flash block size accepted')
