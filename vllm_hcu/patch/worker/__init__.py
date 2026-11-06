@@ -295,6 +295,7 @@ _OP_CALLBACKS: tuple[_CallbackSpec, ...] = (
     _CallbackSpec(_adapter("op_opt", "patch_activation")),
     _CallbackSpec(_adapter("op_opt", "patch_layers_utils")),
     _CallbackSpec(_adapter("op_opt", "patch_deep_gemm")),
+    _CallbackSpec(_adapter("op_opt", "patch_rocm_fp8_gfx938")),
     _CallbackSpec(_adapter("op_opt", "patch_deep_gemm_transform")),
     _CallbackSpec(_adapter("op_opt", "patch_scaled_mm_linear_kernel")),
     _CallbackSpec(_adapter("op_opt", "patch_input_quant_fp8")),
