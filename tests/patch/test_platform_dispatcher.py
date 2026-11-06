@@ -104,6 +104,10 @@ def test_platform_core_inventory_is_explicit_and_ordered():
             "platform.core_fix.hy_v3_tool_parser",
             "vllm.tool_parsers.hy_v3_tool_parser",
         ),
+        (
+            "platform.core_fix.minimax_m3.video_processor_rgb",
+            "vllm.transformers_utils.processors.minimax_m3",
+        ),
         ("platform.core_fix.step5_envs", "vllm.envs"),
         ("platform.core_fix.step5_config_exports", "vllm.transformers_utils.configs"),
         ("platform.core_fix.step5_config_registry", "vllm.transformers_utils.config"),
