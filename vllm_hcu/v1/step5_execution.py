@@ -108,7 +108,12 @@ def execute_model(
         if self.observability_config.cudagraph_metrics:
             cudagraph_stats = make_cudagraph_stats(batch_desc, num_toks)
         assert batch_req_state is not None
-        input_batch = self.prepare_inputs(scheduler_output, batch_req_state, batch_desc)
+        input_batch = self.prepare_inputs(
+            scheduler_output,
+            batch_req_state,
+            batch_desc,
+            num_active_loras,
+        )
         block_tables, slot_mappings = self.prepare_attn(input_batch)
         # Mamba "align" pre-copy: migrate recurrent state across block
         # boundaries before the forward. Runs only on real batches, and
