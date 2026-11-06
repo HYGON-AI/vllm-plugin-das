@@ -418,9 +418,9 @@ def test_apply_platform_patches_is_idempotent_narrow_and_reported():
     assert result.returncode == 0, result.stderr
     payload = json.loads(result.stdout.strip().splitlines()[-1])
     assert payload == {
-        "count": 69,
+        "count": 70,
         "replacements": 20,
-        "callbacks": 49,
+        "callbacks": 50,
         "failed": [],
         "builtins_same": True,
         "role": "Main",
