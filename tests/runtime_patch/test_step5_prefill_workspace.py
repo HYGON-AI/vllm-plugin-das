@@ -81,26 +81,29 @@ def test_stream_change_waits_for_prior_readers_and_capture_is_rejected(monkeypat
     active[0] = second;arena.get(2, 2)
     assert calls == [('record', first), ('wait', arena._fence)]
     monkeypatch.setattr(torch.cuda, 'is_current_stream_capturing', lambda: True)
-    with pytest.raises(RuntimeError, match='eager'):
+    with pytest.raises(RuntimeError, match='captured'):
         arena.get(1, 1)
 
 
-@pytest.mark.parametrize('case', ['producer', 'consumer', 'small', 'compiled', 'other_model', 'no_groups', 'cpu'])
-def test_reservation_scope_is_only_large_eager_pd_producers(monkeypatch, case):
+@pytest.mark.parametrize('case', ['producer', 'consumer', 'small', 'compiled', 'compiled_none', 'compiled_small', 'empty', 'other_model', 'no_groups', 'cpu'])
+def test_reservation_scope_is_only_pd_producers_without_cuda_graphs(monkeypatch, case):
     monkeypatch.setattr(workspace, 'is_step5_pd_config', lambda config: case != 'other_model')
     state = SimpleNamespace(num_kv_groups=0 if case == 'no_groups' else 4,
                             geometry=SimpleNamespace(region_size=8))
     config = SimpleNamespace(
         kv_transfer_config=SimpleNamespace(kv_role='kv_consumer' if case == 'consumer' else 'kv_producer'),
-        scheduler_config=SimpleNamespace(max_num_batched_tokens=8192 if case == 'small' else 16384),
-        model_config=SimpleNamespace(enforce_eager=case != 'compiled', max_model_len=140000),
+        scheduler_config=SimpleNamespace(max_num_batched_tokens=0 if case == 'empty' else 8192 if case in ('small', 'compiled_small') else 16384),
+        model_config=SimpleNamespace(enforce_eager=case not in ('compiled', 'compiled_none', 'compiled_small'), max_model_len=140000),
+        compilation_config=SimpleNamespace(cudagraph_mode=SimpleNamespace(name='NONE' if case in ('compiled_none', 'compiled_small') else 'FULL')),
         device_config=SimpleNamespace(device='cpu' if case == 'cpu' else 'cuda:0'),
     )
     calls = [];marker = object()
     monkeypatch.setattr(workspace, 'PrefillScoreWorkspace', lambda *args: calls.append(args) or marker)
     result = workspace.create_pd_prefill_workspace(state, config)
-    assert result is (marker if case == 'producer' else None)
-    assert calls == ([(65536, 17500, 'cuda:0')] if case == 'producer' else [])
+    enabled = case in ('producer', 'small', 'compiled_none', 'compiled_small')
+    assert result is (marker if enabled else None)
+    rows = 32768 if case in ('small', 'compiled_small') else 65536
+    assert calls == ([(rows, 17500, 'cuda:0')] if enabled else [])
 
 
 @pytest.mark.parametrize('dense_equiv', [False, True])

@@ -10,9 +10,9 @@ from vllm_hcu.runtime_compat.step5 import is_step5_pd_config
 class PrefillScoreWorkspace:
     """Shared by DSA layers after each selector has consumed its score matrix.
 
-    Producer execution is eager. HCU DBO hands off at MoE, after Top-k has
-    enqueued its last read. A stream change also fences all prior users before
-    another score kernel can overwrite this allocation.
+    Producers execute without CUDA Graphs. The opaque indexer consumes scores
+    before HCU DBO hands off at MoE. A stream change also fences prior readers
+    before another score kernel can overwrite this allocation.
     """
 
     def __init__(self, max_rows: int, max_regions: int, device):
@@ -33,7 +33,7 @@ class PrefillScoreWorkspace:
             raise ValueError("Prefill score workspace belongs to another device")
         if self.buffer.is_cuda:
             if torch.cuda.is_current_stream_capturing():
-                raise RuntimeError("PD prefill score workspace requires eager execution")
+                raise RuntimeError("PD prefill score workspace cannot be captured")
             stream = torch.cuda.current_stream(self.buffer.device)
             if self._stream is not None and stream != self._stream:
                 fence = torch.cuda.Event()
@@ -50,13 +50,15 @@ class PrefillScoreWorkspace:
 
 
 def create_pd_prefill_workspace(state, config):
-    """Reserve only for large, eager Step5 Mooncake producer batches."""
+    """Account for producer scores even at small batch sizes and in compiled mode."""
     if state is None or not is_step5_pd_config(config):
         return None
     if (config.kv_transfer_config.kv_role != "kv_producer"
-            or not config.model_config.enforce_eager
-            or config.scheduler_config.max_num_batched_tokens <= 8192
+            or config.scheduler_config.max_num_batched_tokens <= 0
             or state.num_kv_groups <= 0):
+        return None
+    mode = getattr(getattr(config, "compilation_config", None), "cudagraph_mode", None)
+    if not config.model_config.enforce_eager and getattr(mode, "name", None) != "NONE":
         return None
     device = getattr(getattr(config, "device_config", None), "device", None)
     if device is None or torch.device(device).type != "cuda":
