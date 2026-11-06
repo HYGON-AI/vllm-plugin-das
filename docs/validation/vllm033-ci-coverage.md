@@ -44,6 +44,12 @@ fail the result gate. JUnit reports preserve each tier separately. The shared
 HCU registration assertion recognizes only files actually executed by this
 release runner; all other HCU files still require the legacy registry.
 
+Installed-version and source-root discovery use a separate process with the
+same interpreter, sanitized environment and working directory as the tests.
+The probe queries metadata and the module spec without importing vLLM; both
+the release gate and portable AST root use that child's result. A controller's
+different `sys.path` or inherited `PYTHONPATH` cannot choose the tested Core.
+
 Set `HARBOR_SITE` to the approved registry host (optionally with a port, without
 a scheme or path). Set `HCU_CI_IMAGE_V033` to an immutable
 `${HARBOR_SITE}/jenkins/model_test_env/vllm@sha256:<64 lowercase hex digits>`

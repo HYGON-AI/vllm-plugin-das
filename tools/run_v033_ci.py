@@ -49,6 +49,35 @@ def _run_public_selector_cases(environment):
                        env=environment, cwd=ROOT, check=True)
 
 
+def _installed_vllm(environment):
+    """Resolve metadata and source in the same interpreter/env/cwd as pytest.
+
+    Querying a spec does not import the framework. A tagged record tolerates
+    unrelated startup logging without accepting ambiguous probe output.
+    """
+    marker = 'HCU_V033_INSTALLED_PROBE='
+    script = '''\
+import importlib.metadata
+import importlib.util
+import json
+spec = importlib.util.find_spec('vllm')
+print('HCU_V033_INSTALLED_PROBE=' + json.dumps({
+    'version': importlib.metadata.version('vllm'),
+    'origin': None if spec is None else spec.origin,
+}))
+'''
+    result = subprocess.run([sys.executable, '-B', '-c', script], env=environment,
+                            cwd=ROOT, check=True, stdout=subprocess.PIPE, text=True)
+    records = [line[len(marker):] for line in result.stdout.splitlines()
+               if line.startswith(marker)]
+    if len(records) != 1:
+        raise ValueError('installed vLLM probe must return exactly one identity')
+    identity = json.loads(records[0])
+    if not identity['origin']:
+        raise ValueError('installed image must provide an importable vLLM package')
+    return identity['version'], str(Path(identity['origin']).resolve().parent.parent)
+
+
 def validate_result(path):
     cases = list(ET.parse(path).getroot().iter('testcase'))
     if not cases or any(c.find(tag) is not None for c in cases
@@ -83,22 +112,18 @@ def main():
         environment.setdefault('TORCHINDUCTOR_COMPILE_THREADS', '1')
         # Image must already contain ABI-matched Core, Adapter and vendor wheels.
         # Install only this independent Plugin project, not repository-root setup.py.
-        from importlib.metadata import version
-        if _vllm_release(version('vllm'))[:2] != (0, 33):
-            raise ValueError('device image must provide epoch-zero vLLM 0.33')
         if args.tier == 'device':
             environment.update(HCU_ADAPTER_HOST='vllm', VLLM_PLUGINS='hcu_adapter',
                            VLLM033_HCU_TEST='1', HCU_VLLM033_RMSNORM_LIVE='1',
                            HCU_VLLM033_GRAPH_LIVE='1', HCU_VLLM033_AITER_INT8_LIVE='1')
+        installed_version, installed_root = _installed_vllm(environment)
+        if _vllm_release(installed_version)[:2] != (0, 33):
+            raise ValueError('installed image must provide epoch-zero vLLM 0.33')
         subprocess.run([sys.executable, '-m', 'pip', 'install', '--no-deps',
                         '--no-build-isolation', '--force-reinstall',
                         str(ROOT / 'adapter_extension')], env=environment, cwd=ROOT, check=True)
         if args.tier == 'portable':
-            from importlib.util import find_spec
-            spec = find_spec('vllm')
-            if spec is None or not spec.origin:
-                raise ValueError('portable image must provide an importable vLLM package')
-            environment['VLLM_TARGET_ROOT'] = str(Path(spec.origin).parent.parent)
+            environment['VLLM_TARGET_ROOT'] = installed_root
             _run_public_selector_cases(environment)
     result = subprocess.run([sys.executable, '-m', 'pytest', '-q', *files,
         '--strict-markers', '--junitxml', str(args.junit.resolve()),
