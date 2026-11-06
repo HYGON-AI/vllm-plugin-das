@@ -474,11 +474,14 @@ class HcuGPUModelRunnerV2(GPUModelRunner):
             self._hsl_record(input_batch, out[2])
         return out
 
-    def prepare_inputs(self, scheduler_output, batch_req_state, batch_desc):
+    def prepare_inputs(
+        self, scheduler_output, batch_req_state, batch_desc, num_active_loras
+    ):
         input_batch = super().prepare_inputs(
             scheduler_output,
             batch_req_state,
             batch_desc,
+            num_active_loras,
         )
         if self._hsl_enabled:
             # The mirror is resolved lazily in model_state.prepare_attn (see
