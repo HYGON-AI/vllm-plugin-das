@@ -1,0 +1,590 @@
+{
+  "target": "v0.33.0",
+  "checked_utc": "2026-11-06T21:10:14.500100+00:00",
+  "scope": "Optional Flash BF16/FP16 bounded prefill composition; scoped gfx936 acceptance, default OFF.",
+  "model": "/model/Qwen3.5-4B",
+  "total_parameter_scope": "4B",
+  "architecture": "gfx936",
+  "core_version": "0.33.0+das.da8b48faa.dtk2610",
+  "core_source_sha": "da8b48faa58bf4adfb9ba6ed2eee634e6d88ede2",
+  "adapter_source_sha": "84c9783e75b1171512cca34efce333ede9d6b887",
+  "plugin_runtime_commit": "65493627ac2c6b34f3e747c5490bd3a039d3c1d9",
+  "plugin_runtime_files": {
+    "adapter_extension/src/hcu_vllm_das/__init__.py": "71b746268fa5a31439aa6511d8d79f60a90d7ff3f7a6913ed558e74ca82bd84b",
+    "adapter_extension/src/hcu_vllm_das/attention/__init__.py": "8d5108ef92b53f9ba457042d1c10724f70bab75caef6c737f309399b6f8dcf46",
+    "adapter_extension/src/hcu_vllm_das/attention/e5m2_cache.py": "57f9e1f6e2b9091a8c46ed732a850fba49b306d1d771aad1e95cd748b9eba56c",
+    "adapter_extension/src/hcu_vllm_das/attention/e5m2_scales.py": "1fa6dae52b64f601ba17b47d5a0210b74f452c5c5e7954b93d8f5f88e5ac75f6",
+    "adapter_extension/src/hcu_vllm_das/attention/flash_attn.py": "05d5dc40d8613f8969025f9c497a1fe8cf2bd17fe014c89e487f4d7242692fa2",
+    "adapter_extension/src/hcu_vllm_das/attention/prefill_gather.py": "f0578e3370d130272eb9e56a88ac388d8a0c4454df55b81e554ed5646d23d8fb",
+    "adapter_extension/src/hcu_vllm_das/environment.py": "8efede7902cc115b4ba4dc460440b46475c0cb342bd8b37bd412eaf36c5bb65a",
+    "adapter_extension/src/hcu_vllm_das/extension.py": "7938aeb236c6f1c2003d97c88743e6227924d85931054f4d081c44d3e648138a",
+    "adapter_extension/src/hcu_vllm_das/flash_activation.py": "a3d17fe087e1cdff65e819ef284dd5bddf2b9008de1dbee0baf1e63e0f7de2f8",
+    "adapter_extension/src/hcu_vllm_das/moe/__init__.py": "07ef819fcc489a7c711f0d707c25b9ff7a2fc107b994f515b4c9e6a54f1b2d6a",
+    "adapter_extension/src/hcu_vllm_das/moe/fused_moe_aiter.py": "598b8ac6b0febd22ff6293a6c1c31f772c320bae5b58f57e0bcabcfa3c17501a",
+    "adapter_extension/src/hcu_vllm_das/moe/int8_asm.py": "f1a9ad90aa174d81de0747e2d151d3da65bfce3817dc9fe22760d478d0aa4304",
+    "adapter_extension/src/hcu_vllm_das/moe/int8_oracle.py": "6538934872ff6929c6af9c3774ae82141fa367aa27b2b113447a5a5ba69a7dc3",
+    "adapter_extension/src/hcu_vllm_das/rms_norm.py": "a51593a859ff7a24fa2313b45890c2af0c5ef1f6a66eb4689d047d772e0708b0",
+    "adapter_extension/src/hcu_vllm_das/version.py": "0433fc8fc76eeb871e411bdfcef0e8d1fe34710322663c29d985242065ff1351"
+  },
+  "artifacts": {
+    "core": {
+      "wheel_sha256": "ba8b951b45ade4cf1d9bbddace084ac985f370a687eef17d9db92aedde7099b2",
+      "installed_payload_files_checked": 3656
+    },
+    "adapter": {
+      "wheel_sha256": "d36417e7c186b80b94cdbe31dde2bf124537402448554a9cd2cd2342bee916aa",
+      "installed_payload_files_checked": 213
+    },
+    "plugin": {
+      "wheel_sha256": "fe833cfd60057eba8ff3a4424c5faf4ea4d510417fe93bf1455af9348c97efb2",
+      "installed_payload_files_checked": 15
+    }
+  },
+  "new_core_or_adapter_source_changes": false,
+  "device": {
+    "passed": 70,
+    "failed": 0,
+    "skipped": 0,
+    "junit_sha256": "f329ff04aad2c44f4ca2b208f46a7c1c4f127c4fadcdbedae8000d73e23520d2",
+    "new_ragged_writer_reader_graph_cases_included": 4
+  },
+  "cpu": {
+    "preceding_five_file_suite_passed": 133,
+    "latest_affected_two_file_suite_passed": 85,
+    "overlapping_counts_do_not_sum": true,
+    "latest_junit_sha256": "6b2fc4bb3c3192a1203f1a5ecb5108ffafc657f7adc43133f9df58f8b0933c67"
+  },
+  "independent_review_sha256": "403ae3662416f3fdb94f99f78cb94d45f1124c90338eafc80a9d9c928a7c59dc",
+  "checkpoint": {
+    "chat_template.jinja": {
+      "size": 7756,
+      "sha256": "a4aee8afcf2e0711942cf848899be66016f8d14a889ff9ede07bca099c28f715"
+    },
+    "config.json": {
+      "size": 3161,
+      "sha256": "ddc63e1c717afa86c865bb5e01313d89d72bb53b97ad4a8a03ba8510c0621670"
+    },
+    "configuration.json": {
+      "size": 73,
+      "sha256": "f888421726665e8a84b738eed42a64875aed79de8be7daade851ac8bf4c0cef9"
+    },
+    "model.safetensors-00001-of-00002.safetensors": {
+      "size": 5329398688,
+      "sha256": "26a93f066e1916adb13453dae5a0c707c0fbc71299ed98779571a907b8e74c61"
+    },
+    "model.safetensors-00002-of-00002.safetensors": {
+      "size": 3990429408,
+      "sha256": "cb544bd9bfae93dc59b0f22b292f5933573854a7f9b97835c67060d7d910e188"
+    },
+    "model.safetensors.index.json": {
+      "size": 76196,
+      "sha256": "cf3f798ee02ba45f9622aa8892a47369ab667d0afbf154ee7c2212de42e6302d"
+    },
+    "preprocessor_config.json": {
+      "size": 390,
+      "sha256": "27225450ac9c6529872ee1924fcb0962ff5634834f817040f444118116f4e516"
+    },
+    "tokenizer.json": {
+      "size": 12807982,
+      "sha256": "5f9e4d4901a92b997e463c1f46055088b6cca5ca61a6522d1b9f64c4bb81cb42"
+    },
+    "tokenizer_config.json": {
+      "size": 16710,
+      "sha256": "316230d6a809701f4db5ea8f8fc862bc3a6f3229c937c174e674ff3ca0a64ac8"
+    },
+    "video_preprocessor_config.json": {
+      "size": 385,
+      "sha256": "7768af27c1fafa9cc9011c1dc20067e03f8915e03b63504550e11d5066986d13"
+    },
+    "vocab.json": {
+      "size": 6722759,
+      "sha256": "ce99b4cb2983d118806ce0a8b777a35b093e2000a503ebde25853284c9dfa003"
+    }
+  },
+  "protocol": {
+    "model": "/model/Qwen3.5-4B",
+    "arms": [
+      {
+        "name": "flash-on",
+        "backend": "FLASH_ATTN",
+        "flag": "on",
+        "port": 18751
+      },
+      {
+        "name": "flash-off",
+        "backend": "FLASH_ATTN",
+        "flag": "off",
+        "port": 18752
+      },
+      {
+        "name": "triton",
+        "backend": "TRITON_ATTN",
+        "flag": "off",
+        "port": 18753
+      }
+    ],
+    "gpu": 7,
+    "sequential": true,
+    "protected_gpus": [
+      5,
+      6
+    ],
+    "driver_sha256": "f7521136e10ba60d3d90c229f0f589f661c162e8b910206f2d83726399df0871",
+    "parent_driver_sha256": "919bea6eb50a9086c4b054ae8c65aed59ce8aaab1a0037f4394475a8ce54e01e",
+    "client_sha256": "b20c3e288cae113eed1087c0dbc57f92fa1750b9373f398a9f894e0238f5f4eb",
+    "inputs_sha256": "bbeb8279ee65ddc0f5c3767f8b95b8a2ce5422a1556e44c79ff093a39956d59c",
+    "protocol_sha256": "3dcbd347956646d1d06bef4a04fc29464a3ee68ac9f0a4bbc6c175c5b660fa77",
+    "same_input_and_protocol_bytes": true,
+    "inference": "BF16 KV,TP1,MTP3,combo/default autoGraph,maxseq16,batch4096,block64,prefix64/sharedMamba,text-only",
+    "gates": "actual target/draft policy and normal/AOT factor; smoke+two4-concurrency waves+14 proof-aware prefix requests; original HumanEval32 scorer; 288 measured+96 warmup fixed-token requests; actual post-timing profiler",
+    "cache": "Fresh ordinary/AOT/Triton caches in each new output; warmup included in original protocol."
+  },
+  "arms": {
+    "flash-on": {
+      "status": "COMPLETE",
+      "server_exit": 0,
+      "quality": {
+        "raw": {
+          "passed": 12,
+          "failed": [
+            "HumanEval/2",
+            "HumanEval/3",
+            "HumanEval/4",
+            "HumanEval/8",
+            "HumanEval/9",
+            "HumanEval/10",
+            "HumanEval/12",
+            "HumanEval/13",
+            "HumanEval/14",
+            "HumanEval/15",
+            "HumanEval/16",
+            "HumanEval/18",
+            "HumanEval/20",
+            "HumanEval/21",
+            "HumanEval/23",
+            "HumanEval/24",
+            "HumanEval/25",
+            "HumanEval/27",
+            "HumanEval/30",
+            "HumanEval/31"
+          ]
+        },
+        "normalized": {
+          "passed": 32,
+          "failed": []
+        }
+      },
+      "buckets": [
+        {
+          "output": 64,
+          "concurrency": 1,
+          "throughput_median": 122.76908624603058,
+          "throughput_rounds": [
+            122.6296233009346,
+            122.76908624603058,
+            122.90301386674102
+          ],
+          "ttft_ms": 200.08835138287395,
+          "tpot_ms": 5.102969238549353
+        },
+        {
+          "output": 64,
+          "concurrency": 4,
+          "throughput_median": 387.19931730724403,
+          "throughput_rounds": [
+            387.19931730724403,
+            383.3839220273929,
+            391.44536206099355
+          ],
+          "ttft_ms": 330.05638560280204,
+          "tpot_ms": 5.246834103239789
+        },
+        {
+          "output": 64,
+          "concurrency": 16,
+          "throughput_median": 1028.5719290311622,
+          "throughput_rounds": [
+            1027.906712581314,
+            1028.5719290311622,
+            1031.7192718715849
+          ],
+          "ttft_ms": 605.4513155249879,
+          "tpot_ms": 5.855030548344884
+        },
+        {
+          "output": 128,
+          "concurrency": 1,
+          "throughput_median": 151.16379989902032,
+          "throughput_rounds": [
+            151.16903937132415,
+            151.16379989902032,
+            150.67757544011474
+          ],
+          "ttft_ms": 193.81261186208576,
+          "tpot_ms": 5.142316357855956
+        },
+        {
+          "output": 128,
+          "concurrency": 4,
+          "throughput_median": 516.3534566902683,
+          "throughput_rounds": [
+            517.1974860209575,
+            514.2492224758804,
+            516.3534566902683
+          ],
+          "ttft_ms": 319.389421492815,
+          "tpot_ms": 5.2852341804404075
+        },
+        {
+          "output": 128,
+          "concurrency": 16,
+          "throughput_median": 1553.6358811123753,
+          "throughput_rounds": [
+            1553.6358811123753,
+            1490.5926764794133,
+            1556.0519835247205
+          ],
+          "ttft_ms": 543.6761574819684,
+          "tpot_ms": 5.947105803776268
+        }
+      ],
+      "logged_graph_dispatch_windows": {
+        "FULL": 5608,
+        "PIECEWISE": 221,
+        "NONE": 268
+      },
+      "lifecycle_markers": {
+        "EngineDeadError": 0,
+        "resource_tracker": 3,
+        "force-kill": 0,
+        "workers still running after grace period": 0
+      },
+      "official_cpp_gather_kernels": 144,
+      "artifacts_sha256": {
+        "result.json": "0c41ffdc449366df3d16949007a4dc129b781773b077960c1ba12007a64efdd0",
+        "server.log": "bfbd26f584bcd2a87dd48b3265394a2c948f6390080b2f17492e1d0d3cf70e21",
+        "hybrid-cache.json": "0875da0cdafd79244494e60a369b52f5c40f56987f6e0e450338ca01197b6c40",
+        "prefill-gather-policy.json": "ffc839759c8fd94e07ffebac7a40b597c7dff170c7f653727ff9bf49025feea8",
+        "semantic-prefix-responses.json": "ce77183656867ba9a16ed7e0f77057576879089e66c6a8b355498a3f55383635",
+        "performance/result.json": "60752b7e6f77a2585805b973c17af9fcfffe1fb58f5db1a0d9f4628f3ce02f97"
+      }
+    },
+    "flash-off": {
+      "status": "COMPLETE",
+      "server_exit": 0,
+      "quality": {
+        "raw": {
+          "passed": 12,
+          "failed": [
+            "HumanEval/2",
+            "HumanEval/3",
+            "HumanEval/4",
+            "HumanEval/8",
+            "HumanEval/9",
+            "HumanEval/10",
+            "HumanEval/12",
+            "HumanEval/13",
+            "HumanEval/14",
+            "HumanEval/15",
+            "HumanEval/16",
+            "HumanEval/18",
+            "HumanEval/20",
+            "HumanEval/21",
+            "HumanEval/23",
+            "HumanEval/24",
+            "HumanEval/25",
+            "HumanEval/27",
+            "HumanEval/30",
+            "HumanEval/31"
+          ]
+        },
+        "normalized": {
+          "passed": 32,
+          "failed": []
+        }
+      },
+      "buckets": [
+        {
+          "output": 64,
+          "concurrency": 1,
+          "throughput_median": 98.35383818141382,
+          "throughput_rounds": [
+            98.5897546067577,
+            98.35383818141382,
+            97.90774100563213
+          ],
+          "ttft_ms": 197.91039999108762,
+          "tpot_ms": 7.16895411079306
+        },
+        {
+          "output": 64,
+          "concurrency": 4,
+          "throughput_median": 317.1849082062664,
+          "throughput_rounds": [
+            317.1849082062664,
+            315.92162069147304,
+            318.9900914093612
+          ],
+          "ttft_ms": 351.7101975157857,
+          "tpot_ms": 7.273998396057222
+        },
+        {
+          "output": 64,
+          "concurrency": 16,
+          "throughput_median": 915.9150880195889,
+          "throughput_rounds": [
+            915.9150880195889,
+            918.9315383971152,
+            907.3126721810406
+          ],
+          "ttft_ms": 617.7511860150844,
+          "tpot_ms": 7.5551217610371255
+        },
+        {
+          "output": 128,
+          "concurrency": 1,
+          "throughput_median": 115.12597100694451,
+          "throughput_rounds": [
+            115.12597100694451,
+            115.29716562576483,
+            115.08301847998045
+          ],
+          "ttft_ms": 200.78854798339307,
+          "tpot_ms": 7.180993881545902
+        },
+        {
+          "output": 128,
+          "concurrency": 4,
+          "throughput_median": 404.21391276430427,
+          "throughput_rounds": [
+            403.2716097760851,
+            404.21391276430427,
+            404.4231974405165
+          ],
+          "ttft_ms": 343.55510608293116,
+          "tpot_ms": 7.298805495159422
+        },
+        {
+          "output": 128,
+          "concurrency": 16,
+          "throughput_median": 1272.1933413462818,
+          "throughput_rounds": [
+            1271.0650575687491,
+            1272.1933413462818,
+            1272.874228108546
+          ],
+          "ttft_ms": 610.6214431347325,
+          "tpot_ms": 7.6930969724372975
+        }
+      ],
+      "logged_graph_dispatch_windows": {
+        "FULL": 5600,
+        "NONE": 267,
+        "PIECEWISE": 220
+      },
+      "lifecycle_markers": {
+        "EngineDeadError": 0,
+        "resource_tracker": 3,
+        "force-kill": 0,
+        "workers still running after grace period": 0
+      },
+      "official_cpp_gather_kernels": 0,
+      "artifacts_sha256": {
+        "result.json": "5b2366eac5fc651135f69b8e849ab342684d6cb1ec7dfa443e6641d6efb6b4ae",
+        "server.log": "2a5fd25bb2866cc18feb45407bc66eefd48baa91190f85ee2feb3d29a9fb7486",
+        "hybrid-cache.json": "3f89c99817c3e13e388a2d538a9e933e384987b66a3542da4a94a71c1862c6e1",
+        "prefill-gather-policy.json": "5ac4b0adb514999045963eff4dfbfce1716e0a65277834172bc0272b14d867f8",
+        "semantic-prefix-responses.json": "940cb1fa1f03a1b137ad142df2cedaa3f2ad414a0bac8141c94aa3c53fe4ba2d",
+        "performance/result.json": "6c022b0833523293e6da7adddcdd89e56d129ab12f9db88cb8bf897a87088422"
+      }
+    },
+    "triton": {
+      "status": "COMPLETE",
+      "server_exit": 0,
+      "quality": {
+        "raw": {
+          "passed": 12,
+          "failed": [
+            "HumanEval/0",
+            "HumanEval/2",
+            "HumanEval/3",
+            "HumanEval/4",
+            "HumanEval/8",
+            "HumanEval/9",
+            "HumanEval/12",
+            "HumanEval/13",
+            "HumanEval/14",
+            "HumanEval/15",
+            "HumanEval/16",
+            "HumanEval/18",
+            "HumanEval/20",
+            "HumanEval/21",
+            "HumanEval/23",
+            "HumanEval/24",
+            "HumanEval/25",
+            "HumanEval/27",
+            "HumanEval/30",
+            "HumanEval/31"
+          ]
+        },
+        "normalized": {
+          "passed": 32,
+          "failed": []
+        }
+      },
+      "buckets": [
+        {
+          "output": 64,
+          "concurrency": 1,
+          "throughput_median": 125.57289653997454,
+          "throughput_rounds": [
+            125.85038104222001,
+            125.57289653997454,
+            125.26413221922414
+          ],
+          "ttft_ms": 201.6948879463598,
+          "tpot_ms": 4.915881427078848
+        },
+        {
+          "output": 64,
+          "concurrency": 4,
+          "throughput_median": 390.77174868421315,
+          "throughput_rounds": [
+            387.5573295963224,
+            390.8804543865309,
+            390.77174868421315
+          ],
+          "ttft_ms": 340.43155843392015,
+          "tpot_ms": 5.051029951400346
+        },
+        {
+          "output": 64,
+          "concurrency": 16,
+          "throughput_median": 1028.1769832045245,
+          "throughput_rounds": [
+            1026.812008854371,
+            1028.1769832045245,
+            1031.0000771750954
+          ],
+          "ttft_ms": 632.4292318895459,
+          "tpot_ms": 5.453788991352277
+        },
+        {
+          "output": 128,
+          "concurrency": 1,
+          "throughput_median": 154.12771080764279,
+          "throughput_rounds": [
+            154.1210318899732,
+            154.12771080764279,
+            154.25597055620503
+          ],
+          "ttft_ms": 203.33084056619555,
+          "tpot_ms": 4.942821016109834
+        },
+        {
+          "output": 128,
+          "concurrency": 4,
+          "throughput_median": 520.2373021535449,
+          "throughput_rounds": [
+            518.513496684652,
+            532.3658679034863,
+            520.2373021535449
+          ],
+          "ttft_ms": 337.1990695595741,
+          "tpot_ms": 5.041093402358842
+        },
+        {
+          "output": 128,
+          "concurrency": 16,
+          "throughput_median": 1590.1916112155366,
+          "throughput_rounds": [
+            1592.1194762082882,
+            1518.579727159224,
+            1590.1916112155366
+          ],
+          "ttft_ms": 565.7051603775471,
+          "tpot_ms": 5.541781936112175
+        }
+      ],
+      "logged_graph_dispatch_windows": {
+        "FULL": 5615,
+        "PIECEWISE": 225,
+        "NONE": 264
+      },
+      "lifecycle_markers": {
+        "EngineDeadError": 0,
+        "resource_tracker": 3,
+        "force-kill": 0,
+        "workers still running after grace period": 0
+      },
+      "official_cpp_gather_kernels": 0,
+      "artifacts_sha256": {
+        "result.json": "11c51165c55ad48f2f30a7ff42dad0fc85f9d5385cb6b2d34dd158586583b688",
+        "server.log": "170f850dc35b5bc064799e2dab91324620b3321636a6cb84e11c2619ef0c3f59",
+        "hybrid-cache.json": "df2a81e200a459f1c4d65b60d42c7ac3f0b5f7d8a53295d986f3c318967fd1b9",
+        "prefill-gather-policy.json": "c90453e435c1419ac21d65bc3f3e029c25df21925183ee8fc590e1175ce34c60",
+        "semantic-prefix-responses.json": "bd9bc54bfe3b84a65a56478f58f61e9547e55cc8215d76a07bb950a2b529a3af",
+        "performance/result.json": "0bef0bb6ef4deb5fa3a34b03fee15f3366d5dbe0984aaa0386b334d9b9bcd47c"
+      }
+    }
+  },
+  "comparison": {
+    "buckets": [
+      {
+        "output": 64,
+        "concurrency": 1,
+        "on_over_off_throughput": 1.2482388945470821,
+        "on_over_triton_throughput": 0.9776718514010593
+      },
+      {
+        "output": 64,
+        "concurrency": 4,
+        "on_over_off_throughput": 1.2207368865590762,
+        "on_over_triton_throughput": 0.9908580101069281
+      },
+      {
+        "output": 64,
+        "concurrency": 16,
+        "on_over_off_throughput": 1.1229992195621128,
+        "on_over_triton_throughput": 1.00038412241578
+      },
+      {
+        "output": 128,
+        "concurrency": 1,
+        "on_over_off_throughput": 1.3130295325795946,
+        "on_over_triton_throughput": 0.9807697727223008
+      },
+      {
+        "output": 128,
+        "concurrency": 4,
+        "on_over_off_throughput": 1.2774262349335617,
+        "on_over_triton_throughput": 0.9925344733120843
+      },
+      {
+        "output": 128,
+        "concurrency": 16,
+        "on_over_off_throughput": 1.22122623238089,
+        "on_over_triton_throughput": 0.9770117450970464
+      }
+    ],
+    "retained_token_comparisons": {
+      "flash-off_equal": 384,
+      "flash-off_different": 0,
+      "triton_equal": 384,
+      "triton_different": 0
+    }
+  },
+  "limits": [
+    "gfx936/single4B model only; total goal148 features and larger-model quality remain open.",
+    "Three warm measured rounds within each sequential server, not three independent server restarts or proven saturation.",
+    "Sampled/profiled route proof is after timing; no profiler latency used for throughput acceptance.",
+    "All raw HumanEval scores retained separately from the existing formatting normalization.",
+    "One server per arm, fixed 512 input tokens and 64/128 output tokens; no startup or saturation claim.",
+    "OFF reuses hashed terminal-ON Triton compiler kernels only; ordinary/AOT caches are fresh. No cold-start comparison.",
+    "Original failed test invocations retained locally: missing explicit Core test path and absent pending-MR CI runner.",
+    "Leaked semaphore warnings retained; exit0 and released resources do not prove clean lifecycle.",
+    "No cross-model, FP8 gather, DCP, additional architecture or complete migration acceptance.35B TP2 quality separately in progress.",
+    "Official Triton remains the official default; this opt-in composition does not replace its selection."
+  ],
+  "last_good": false
+}

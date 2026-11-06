@@ -153,14 +153,16 @@ The default is OFF; unset the variable or set it to `0` and restart to roll
 back. This Flash-specific switch is independent of the RMSNorm switches.
 Its effective boolean is registered through vLLM's official environment
 compile factors before backend publication, covering ordinary and AOT caches.
-Conflicting factor ownership is rejected. Actual-serving component probes
-motivate the candidate; full-model quality, Graph and performance validation
-must be assessed separately before deployment.
+Conflicting factor ownership is rejected. Scoped component, installed-device
+and full Qwen3.5-4B quality/performance results are recorded in
+[the bounded-prefill validation](../docs/validation/vllm033-bounded-prefill.md).
+Other model, topology and architecture gates remain separate.
 
 FA4-only `dynamic_causal`, `mask_mod`, and `aux_tensors` are accepted only
 when inactive (`None`). An active feature fails closed instead of silently
-changing its mask. FP8 KV, DCP, hybrid caches, and layouts other than LBHNC and
-LBNHC remain unvalidated and are not claimed by this release.
+changing its mask. The bounded-prefill path does not implement FP8 KV or DCP;
+FP8 retains the existing path. Hybrid-cache validation is limited to the
+recorded models and recipes. Layouts other than LBHNC and LBNHC are not claimed.
 
 ## RMSNorm eligibility
 
