@@ -2,6 +2,8 @@
 
 The source tier is intentionally limited to AST/packaging, not the entire
 portable/lifecycle matrix. Device results must contain no skips or xfails.
+Installed tiers default to one Inductor compiler thread; explicit overrides
+remain available, and torch.compile and Graph coverage are unchanged.
 """
 from __future__ import annotations
 import argparse
@@ -76,6 +78,9 @@ def main():
         if args.tier == 'source' and not environment.get('VLLM_TARGET_ROOT'):
             raise ValueError('source tier requires VLLM_TARGET_ROOT')
     if args.tier in {'portable', 'device'}:
+        # Small CI suites do not need the default compiler sidecar pool. Its
+        # interpreter startup can still run Adapter bootstrap during pytest exit.
+        environment.setdefault('TORCHINDUCTOR_COMPILE_THREADS', '1')
         # Image must already contain ABI-matched Core, Adapter and vendor wheels.
         # Install only this independent Plugin project, not repository-root setup.py.
         from importlib.metadata import version
