@@ -13,6 +13,77 @@ pytestmark = pytest.mark.skipif(
 )
 
 
+@pytest.mark.parametrize('layout_name',('LBHNC','LBNHC'))
+@pytest.mark.parametrize('dtype',(torch.bfloat16,torch.float16))
+@torch.inference_mode()
+def test_bounded_prefill_gather_ragged_writer_reader_graph(layout_name,dtype):
+    import vllm._C_stable_libtorch  # noqa: F401
+    from hcu_vllm_das.attention.prefill_gather import prepare
+
+    prepare()
+    torch.manual_seed(713)
+    batch,capacity,page,heads,kvheads,dim=4,192,64,16,4,256
+    query=torch.randn(7,heads,dim,device='cuda',dtype=dtype)
+    keys=torch.randn(batch*capacity,kvheads,dim,device='cuda',dtype=dtype)
+    values=torch.randn_like(keys)
+    packed=_make_packed_cache(layout_name=layout_name,num_blocks=15,num_heads=kvheads,
+        block_size=page,head_size=dim,device=query.device,dtype=dtype,block_padding=128)
+    impl=_make_impl(layout_name,dim)
+    impl._prefill_gather_enabled=True
+    kc,vc=impl._get_kv_cache_views(packed)
+    table=torch.arange(12,device='cuda',dtype=torch.int32).reshape(batch,3)
+    initial_table=table.clone()
+    cuq=torch.zeros(batch+1,device='cuda',dtype=torch.int32)
+    lens=torch.zeros(batch,device='cuda',dtype=torch.int32)
+    slots=torch.empty(batch*capacity,device='cuda',dtype=torch.long)
+    output_backing=torch.full((9,heads,dim),99,device='cuda',dtype=dtype)
+    output=output_backing[1:-1]
+    scale=torch.ones((),device='cuda',dtype=torch.float32)
+    def produce(wave):
+        qlens=([1,2,0,4],[2,1,0,4],[1,0,3,3],[0,2,1,4])[wave]
+        lengths=([63,129,0,65],[64,128,0,66],[65,0,127,67],[0,129,64,68])[wave]
+        offsets=[0]
+        for length in qlens:offsets.append(offsets[-1]+length)
+        cuq.copy_(torch.tensor(offsets,device='cuda',dtype=torch.int32))
+        lens.copy_(torch.tensor(lengths,device='cuda',dtype=torch.int32))
+        table.copy_(initial_table.roll(wave,1))
+        positions=torch.arange(capacity,device='cuda')
+        slots.copy_((table[:,positions//page].long()*page+positions%page).flatten())
+        if wave:
+            query.copy_(torch.randn_like(query));keys.copy_(torch.randn_like(keys));values.copy_(torch.randn_like(values))
+        expected=[];at=0
+        for b,(nq,nk) in enumerate(zip(qlens,lengths,strict=True)):
+            if nq:
+                expected.append(_reference_attention(query[at:at+nq],keys.reshape(batch,capacity,kvheads,dim)[b,:nk],values.reshape(batch,capacity,kvheads,dim)[b,:nk]))
+                at+=nq
+        assert at==len(query)
+        return torch.cat(expected)
+    def run():
+        impl.do_kv_cache_update(SimpleNamespace(_k_scale=scale,_v_scale=scale),keys,values,packed,slots)
+        result=impl._run_flash_attention(q=query,k=kc,v=vc,out=output,cu_seqlens_q=cuq,
+            seqused_k=lens,max_seqlen_q=4,max_seqlen_k=capacity,softmax_scale=dim**-.5,
+            causal=True,block_table=table)
+        assert result.data_ptr()==output.data_ptr()
+    expected=produce(0)
+    for _ in range(3):run()
+    torch.cuda.synchronize()
+    torch.testing.assert_close(output,expected,atol=1.6e-2,rtol=1.6e-2)
+    graph=torch.cuda.CUDAGraph()
+    with torch.cuda.graph(graph):run()
+    addresses=[x.data_ptr() for x in (query,keys,values,packed,cuq,lens,table,slots,output)]
+    previous=output.clone()
+    for wave in (1,2,3):
+        expected=produce(wave)
+        graph.replay();torch.cuda.synchronize();observed=output.clone()
+        run();torch.cuda.synchronize()
+        assert torch.equal(observed,output)
+        assert not torch.equal(observed,previous)
+        torch.testing.assert_close(output,expected,atol=1.6e-2,rtol=1.6e-2)
+        assert bool(torch.all(output_backing[[0,-1]]==99))
+        assert addresses==[x.data_ptr() for x in (query,keys,values,packed,cuq,lens,table,slots,output)]
+        previous=observed
+
+
 def _reference_attention(
     query: torch.Tensor,
     key: torch.Tensor,

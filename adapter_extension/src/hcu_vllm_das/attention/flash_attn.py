@@ -172,6 +172,9 @@ class HcuFlashAttentionImpl(AttentionImpl[FlashAttentionMetadata]):
         # base's fusion support disabled: native fused writers use another ABI.
         self.supports_quant_query_input = False
         self.vllm_flash_attn_version = 2
+        from hcu_vllm_das.environment import prefill_gather_enabled
+
+        self._prefill_gather_enabled = prefill_gather_enabled()
         vllm_config = get_current_vllm_config_or_none()
         self.cache_config = (
             vllm_config.cache_config if vllm_config is not None else None
@@ -300,6 +303,13 @@ class HcuFlashAttentionImpl(AttentionImpl[FlashAttentionMetadata]):
                 raise NotImplementedError(
                     f"HCU FlashAttention FA2 does not support {name}"
                 )
+        if (getattr(self, "_prefill_gather_enabled", False)
+                and self.kv_cache_dtype != _E5M2_KV_CACHE_DTYPE):
+            from hcu_vllm_das.attention import prefill_gather
+
+            layout = _layout_name(self.kv_cache_layout)
+            if prefill_gather.can_run(kwargs, layout):
+                return prefill_gather.run(_vendor_varlen_func(), kwargs, layout)
         max_query_len = kwargs.get("max_seqlen_q")
         query = kwargs.get("q")
         cu_query_lens = kwargs.get("cu_seqlens_q")

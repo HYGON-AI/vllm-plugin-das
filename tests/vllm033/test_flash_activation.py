@@ -40,11 +40,12 @@ def provider(monkeypatch):
         member.path=path
         if failure.get("commit"):raise RuntimeError("post-publication synthetic failure")
     registry=SimpleNamespace(AttentionBackendEnum=SimpleNamespace(FLASH_ATTN=enum),register_backend=register)
+    envs=SimpleNamespace(environment_variables={},compile_factors=lambda:{})
     monkeypatch.setattr(activation,"_published",None)
     monkeypatch.setattr(activation,"_failure",None)
     monkeypatch.setattr(activation,"_publishing",False)
     monkeypatch.setattr(activation,"_lock",RLock())
-    failure.update(enum=enum,registry=registry,backend=Backend)
+    failure.update(enum=enum,registry=registry,backend=Backend,envs=envs)
 
     def varlen():
         calls.append("vendor-callable-preflight")
@@ -55,6 +56,12 @@ def provider(monkeypatch):
     def load(name):
         calls.append(name)
         if name == activation.REGISTRY:return registry
+        if name == "vllm.envs":return envs
+        if name.endswith("prefill_gather"):
+            def prepare():
+                calls.append('gather-preflight')
+                if failure.get('gather'):raise ImportError('official gather absent')
+            return SimpleNamespace(prepare=prepare)
         if name == "hcu_vllm_das.attention.flash_attn":
             if failure.get("seam"):
                 raise RuntimeError("missing official attention seam")
@@ -74,13 +81,33 @@ def context(version="0.33.0", required=False):
 
 
 def test_real_entry_point_factory_and_public_host_register_independent_owner(provider):
-    calls, _ = provider
+    calls, flags = provider
     assert activation.extension_spec().check_health is activation.check_health
     result, = activate_extensions(context(required=True), (POINT,))
     assert result.status is ExtensionStatus.ACTIVE
     assert result.capabilities == frozenset({activation.CAPABILITY})
-    assert calls[-1] == "publish"
+    assert calls.count("publish") == 1
+    assert activation.owns_prefill_compile_factor(flags['envs'])
     assert "hcu_adapter.bridges.vllm" not in calls
+
+
+def test_gather_preflight_is_opt_in_and_fails_before_any_publication(provider,monkeypatch):
+    calls,flags=provider
+    monkeypatch.setenv('VLLM_HCU_FLASH_PREFILL_GATHER','1')
+    flags['gather']=True
+    with pytest.raises(activation.FlashActivationError,match='official gather absent'):
+        activation.activate(context())
+    assert 'publish' not in calls
+    assert flags['envs'].environment_variables=={}
+    assert activation._failure is None
+
+
+def test_disabled_gather_does_not_import_native_dependency(provider,monkeypatch):
+    calls,flags=provider
+    monkeypatch.setenv('VLLM_HCU_FLASH_PREFILL_GATHER','0')
+    flags['gather']=True
+    activation.activate(context())
+    assert 'gather-preflight' not in calls
 
 
 @pytest.mark.parametrize("failure", ["dependency", "vendor", "seam"])
@@ -129,11 +156,12 @@ def test_idempotent_exact_publication_uses_public_getters_without_republishing(p
     assert calls.count('publish')==1
 
 
-@pytest.mark.parametrize('drift',['path','class','vendor','version'])
+@pytest.mark.parametrize('drift',['path','class','vendor','version','compile-factor'])
 def test_published_drift_is_fatal_sticky_and_never_repairs(provider,drift):
     calls,flags=provider;activation.activate(context())
     if drift=='path':flags['enum'].path='foreign.Backend'
     if drift=='class':flags['enum'].get_class=lambda:object
+    if drift=='compile-factor':flags['envs'].environment_variables['VLLM_HCU_FLASH_PREFILL_GATHER_ENABLED']=lambda:False
     if drift=='vendor':flags['vendor']=True
     if drift=='vendor':
         original=activation.import_module

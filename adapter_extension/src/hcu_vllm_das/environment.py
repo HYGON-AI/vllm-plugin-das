@@ -10,6 +10,8 @@ _FALSE_VALUES = frozenset({"0", "false", "no", "off"})
 _MASTER_SWITCH = "VLLM_HCU_USE_CUSTOM_OPS"
 _RMS_NORM_SWITCH = "VLLM_HCU_USE_CUSTOM_RMS_NORM"
 _RMS_NORM_COMPILE_FACTOR = "VLLM_HCU_DAS_RMS_NORM_ENABLED"
+_PREFILL_GATHER_SWITCH = "VLLM_HCU_FLASH_PREFILL_GATHER"
+_PREFILL_GATHER_FACTOR = "VLLM_HCU_FLASH_PREFILL_GATHER_ENABLED"
 
 
 def _flag(name: str, *, default: bool) -> bool:
@@ -38,6 +40,35 @@ def rms_norm_enabled() -> bool:
     master_enabled = custom_ops_enabled()
     child_enabled = _flag(_RMS_NORM_SWITCH, default=False)
     return master_enabled and child_enabled
+
+
+def prefill_gather_enabled() -> bool:
+    """Explicit opt-in; restart the server to change attention policy."""
+    return _flag(_PREFILL_GATHER_SWITCH, default=False)
+
+
+def validate_prefill_compile_factor(vllm_envs: object) -> None:
+    registry = getattr(vllm_envs, "environment_variables", None)
+    if not isinstance(registry, dict) or not callable(
+        getattr(vllm_envs, "compile_factors", None)
+    ):
+        raise RuntimeError("vLLM environment compile-factor registry is unavailable")
+    existing = registry.get(_PREFILL_GATHER_FACTOR)
+    if existing is not None and existing is not prefill_gather_enabled:
+        raise RuntimeError("HCU Flash prefill compile factor already has another owner")
+
+
+def register_prefill_compile_factor(vllm_envs: object) -> None:
+    """Publish policy through official normal/AOT factors before model loading."""
+    validate_prefill_compile_factor(vllm_envs)
+    vllm_envs.environment_variables[_PREFILL_GATHER_FACTOR] = prefill_gather_enabled
+
+
+def owns_prefill_compile_factor(vllm_envs: object) -> bool:
+    registry = getattr(vllm_envs, "environment_variables", None)
+    return isinstance(registry, dict) and registry.get(
+        _PREFILL_GATHER_FACTOR
+    ) is prefill_gather_enabled
 
 
 def register_compile_factors(vllm_envs: object) -> None:
