@@ -15,8 +15,13 @@ the follow-up documentation commit does not change its 15 Python files.
 
 ## Functionality and precision
 
-The preceding CPU suite passed 133 tests; the latest affected two-file suite
-passed 85 (overlapping counts). The installed device tier passed 70, zero skips,
+The preceding CPU suite passed 133 tests; an affected two-file suite passed 85
+(overlapping counts). After the source-only collection review, the full
+non-device suite passed 281 tests with zero skips, and all 11 separate
+public-selector lifecycle cases passed. A regression subprocess rejects all real vLLM imports while
+collecting the gather contracts; AOT checks explicitly load the target source.
+All 15 production Python files remain byte-identical to the measured runtime.
+The installed device tier passed 70, zero skips,
 including four new BF16/FP16 x HND/NHD cases. These cover ragged/empty query
 rows, 63/64/65/129-token contexts, page padding, independent FP32 reference,
 sentinel output boundaries and three changed-input/page/length Graph replays
@@ -29,8 +34,10 @@ arms complete two four-request concurrency waves, 14 semantic prefix requests
 (hits640/1216 with the real576-token manager) and the original isolated
 HumanEval32 protocol (temperature0, seed0, thinking off, max2048).
 
-flash-on: raw 12/32, normalized 32/32; flash-off: raw 12/32, normalized 32/32; triton: raw 12/32, normalized 32/32. Normalization is the existing think/fence removal only;
-raw results are not replaced. No small-model waiver is needed to equate the
+flash-on: raw 12/32, normalized 32/32; flash-off: raw 12/32, normalized 32/32; triton: raw 12/32, normalized 32/32. The frozen normalization removes leading think,
+extracts a single code fence and prepends a newline to an already parseable
+full function; it does not repair syntax or logic. Raw results are retained.
+No small-model waiver is needed to equate the
 normalized 32/32 results, and no larger-model acceptance follows from them.
 
 ## Performance

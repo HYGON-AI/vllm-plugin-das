@@ -50,9 +50,11 @@
   },
   "cpu": {
     "preceding_five_file_suite_passed": 133,
-    "latest_affected_two_file_suite_passed": 85,
     "overlapping_counts_do_not_sum": true,
-    "latest_junit_sha256": "6b2fc4bb3c3192a1203f1a5ecb5108ffafc657f7adc43133f9df58f8b0933c67"
+    "prior_affected_two_file_suite_passed": 85,
+    "prior_affected_junit_sha256": "6b2fc4bb3c3192a1203f1a5ecb5108ffafc657f7adc43133f9df58f8b0933c67",
+    "review_followup_full_non_device_passed": 281,
+    "review_followup_public_selector_cases": 11
   },
   "independent_review_sha256": "403ae3662416f3fdb94f99f78cb94d45f1124c90338eafc80a9d9c928a7c59dc",
   "checkpoint": {
@@ -586,5 +588,26 @@
     "No cross-model, FP8 gather, DCP, additional architecture or complete migration acceptance.35B TP2 quality separately in progress.",
     "Official Triton remains the official default; this opt-in composition does not replace its selection."
   ],
-  "last_good": false
+  "last_good": false,
+  "source_collection_review": {
+    "generated_utc": "2026-11-06T21:36:36.673859+00:00",
+    "automated_review_url": "https://github.com/HYGON-AI/vllm-plugin-das/pull/359#discussion_r4497698932",
+    "reviewed_commit": "d94175502909fd3fa66589c0c01ebd9e64edf2ca",
+    "scope": "Test collection and target-source pinning only; all15 production Python files unchanged.",
+    "source_only_collection_before_exit": 1,
+    "source_only_collection_after_exit": 0,
+    "regression_test": "test_source_only_collection_does_not_import_flash_backend",
+    "full_non_device_suite": {
+      "passed": 281,
+      "failed": 0,
+      "skipped": 0,
+      "junit_sha256": "078d1fee193fcf59c04c388bce8e91d46448dbde185451478fb583b3c9d40135",
+      "log_sha256": "5b1902c0f3106d403a32d11d3c7fa54da66c8370b296ef75762417361ae993b0"
+    },
+    "public_selector_cases": 11,
+    "selector_receipt_sha256": "9f3a1252d4e92628d3c5f13ecfe067227ce6882414e54d36d550e207ea566fb9",
+    "test_file_sha256": "8f874d1bebb325f7ee56505a5dd1ddf9bb7802eab45d0627f6d2a93736f676b0",
+    "model_and_device_results_reused_by_byte_identity": true,
+    "reviewer_approval_implied": false
+  }
 }

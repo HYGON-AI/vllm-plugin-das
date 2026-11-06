@@ -1,5 +1,6 @@
 """CPU contracts for public gather composition; device/Graph checks are separate."""
 from types import ModuleType, SimpleNamespace
+import importlib.util
 import os
 from pathlib import Path
 import subprocess
@@ -8,11 +9,44 @@ import sys
 import pytest
 import torch
 
-from hcu_vllm_das.attention import prefill_gather as gather
+PLUGIN_SOURCE_ROOT = Path(__file__).resolve().parents[2] / 'adapter_extension/src'
+sys.path.insert(0, os.fspath(PLUGIN_SOURCE_ROOT))
+# Import this CPU helper independently of attention/__init__.py, which publishes
+# the actual Flash backend and requires the framework at module import time.
+_gather_spec = importlib.util.spec_from_file_location(
+    '_hcu_v033_prefill_gather_contract',
+    PLUGIN_SOURCE_ROOT / 'hcu_vllm_das/attention/prefill_gather.py',
+)
+gather = importlib.util.module_from_spec(_gather_spec)
+sys.modules[_gather_spec.name] = gather
+_gather_spec.loader.exec_module(gather)
 from hcu_vllm_das.environment import (
     owns_prefill_compile_factor, prefill_gather_enabled,
     register_prefill_compile_factor,
 )
+
+
+def test_source_only_collection_does_not_import_flash_backend():
+    code = f'''
+import sys, importlib.abc, importlib.util
+import torch
+assert 'vllm' not in sys.modules
+class MissingCore(importlib.abc.MetaPathFinder):
+    def find_spec(self, fullname, path=None, target=None):
+        if fullname == 'vllm' or fullname.startswith('vllm.'):
+            raise ModuleNotFoundError('vllm is not installed', name=fullname)
+sys.meta_path.insert(0, MissingCore())
+spec = importlib.util.spec_from_file_location(
+    '_hcu_prefill_source_only_collection_probe', {str(Path(__file__).resolve())!r})
+module = importlib.util.module_from_spec(spec)
+sys.modules[spec.name] = module
+spec.loader.exec_module(module)
+assert 'hcu_vllm_das.attention.flash_attn' not in sys.modules
+assert not torch.cuda.is_initialized()
+'''
+    run = subprocess.run([sys.executable, '-c', code], env=dict(os.environ),
+                         capture_output=True, text=True, timeout=120)
+    assert run.returncode == 0, run.stdout + run.stderr
 
 
 def test_policy_defaults_off_and_rejects_invalid_values(monkeypatch):
@@ -41,10 +75,14 @@ def test_factor_ownership_and_disabled_values(monkeypatch):
 
 
 def test_actual_aot_factors_distinguish_prefill_policy():
-    source=Path(__file__).resolve().parents[2]/'adapter_extension/src'
+    target=Path(os.environ['VLLM_TARGET_ROOT']).resolve()
     code=f'''
 import os,sys
-sys.path.insert(0,{str(source)!r})
+from pathlib import Path
+sys.path.insert(0,{str(target)!r})
+sys.path.insert(0,{str(PLUGIN_SOURCE_ROOT)!r})
+import vllm
+assert Path(vllm.__file__).resolve().is_relative_to({str(target)!r}), vllm.__file__
 import vllm.envs as envs
 from types import SimpleNamespace
 from vllm.compilation.caching import aot_compile_hash_factors
