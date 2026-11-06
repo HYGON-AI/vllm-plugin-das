@@ -36,3 +36,40 @@ def is_step5_pd_config(config):
         in ("MooncakeConnector", "Step5MooncakeConnector")
         and getattr(transfer, "kv_role", None) in ("kv_producer", "kv_consumer")
     )
+
+
+def configure_step5_pd_producer_compilation(config):
+    """Keep fused producer execution free of runtime autotuning device syncs."""
+    if (not is_step5_pd_config(config)
+            or config.kv_transfer_config.kv_role != "kv_producer"
+            or config.model_config.enforce_eager):
+        return False
+    compilation = config.compilation_config
+    if getattr(compilation.cudagraph_mode, "name", None) != "NONE":
+        raise ValueError("Compiled Step5 Mooncake producers require cudagraph_mode=NONE")
+    from vllm import envs
+
+    # vLLM overwrites these two Inductor options for single-size ranges from
+    # its environment getters. Setting only inductor_compile_config is not
+    # sufficient, including for the MTP model sharing this configuration.
+    if (envs.VLLM_ENABLE_INDUCTOR_MAX_AUTOTUNE
+            or envs.VLLM_ENABLE_INDUCTOR_COORDINATE_DESCENT_TUNING):
+        raise ValueError(
+            "Compiled Step5 Mooncake producers require "
+            "VLLM_ENABLE_INDUCTOR_MAX_AUTOTUNE=0 and "
+            "VLLM_ENABLE_INDUCTOR_COORDINATE_DESCENT_TUNING=0"
+        )
+    options = compilation.inductor_compile_config
+    required = {
+        "triton.autotune_at_compile_time": True,
+        "coordinate_descent_tuning": False,
+        "triton.autotune_pointwise": False,
+        "max_autotune": False,
+        "max_autotune_pointwise": False,
+        "max_autotune_gemm": False,
+        "combo_kernels": False,
+        "benchmark_combo_kernel": False,
+    }
+    changed = any(options.get(key) is not value for key, value in required.items())
+    options.update(required)
+    return changed

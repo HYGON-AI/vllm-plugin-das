@@ -197,7 +197,7 @@ class Step5AuxManager:
             if not self._sources:
                 return
         if index_k.is_cuda and torch.cuda.is_current_stream_capturing():
-            raise RuntimeError("Step5 DSA P/D auxiliary capture requires eager execution")
+            raise RuntimeError("Step5 DSA P/D auxiliary snapshots cannot run inside CUDA graphs")
         state = indexer.state
         key = ("step5_pd_rows", id(md), id(sched))
         rows = state.step_cache.get(key)
@@ -420,22 +420,26 @@ def create_step5_aux_manager(worker: Any, kv_caches: dict[str, torch.Tensor]):
     config = worker.vllm_config
     if not config.model_config.enforce_eager:
         if worker.is_kv_producer:
-            raise NotImplementedError("Step5 DSA P/D producer snapshots require --enforce-eager")
-        # Only producers install the Python snapshot callback. Consumers import
-        # into fixed buffers before building/replaying the model's schedule.
-        # Their sparse KV readers must also be true views: the paged bridge
-        # performs eager-only materialization and cannot be captured.
-        for name in indexers:
-            cache = kv_caches[name]
-            affine = (
-                cache.ndim == 4 and cache.stride(0) == cache.shape[2] * cache.stride(2)
-                or cache.ndim == 5 and cache.stride(1) == cache.shape[2] * cache.stride(2)
-            )
-            if not affine or cache.stride(-1) != 1:
+            mode = getattr(getattr(config, "compilation_config", None), "cudagraph_mode", None)
+            if getattr(mode, "name", None) != "NONE":
                 raise NotImplementedError(
-                    "Compiled Step5 PD consumers require affine sparse KV views; "
-                    "use --enforce-eager for this cache layout"
+                    "Step5 DSA P/D producer snapshots require --enforce-eager "
+                    "or cudagraph_mode=NONE"
                 )
+        else:
+            # Consumers replay fixed buffers. Producers run their opaque
+            # indexer and Python snapshot callback on every uncaptured step.
+            for name in indexers:
+                cache = kv_caches[name]
+                affine = (
+                    cache.ndim == 4 and cache.stride(0) == cache.shape[2] * cache.stride(2)
+                    or cache.ndim == 5 and cache.stride(1) == cache.shape[2] * cache.stride(2)
+                )
+                if not affine or cache.stride(-1) != 1:
+                    raise NotImplementedError(
+                        "Compiled Step5 PD consumers require affine sparse KV views; "
+                        "use --enforce-eager for this cache layout"
+                    )
     if config.cache_config.enable_prefix_caching:
         raise NotImplementedError("Step5 DSA P/D auxiliary transfer requires --no-enable-prefix-caching")
     parallel = config.parallel_config
@@ -448,7 +452,7 @@ def create_step5_aux_manager(worker: Any, kv_caches: dict[str, torch.Tensor]):
     ):
         raise NotImplementedError(
             "Step5 DSA auxiliary transfer supports DBO only with the HCU "
-            "eager producer runtime"
+            "producer runtime"
         )
     if (getattr(parallel, "pipeline_parallel_size", 1) != 1
             or getattr(parallel, "prefill_context_parallel_size", 1) != 1

@@ -439,16 +439,20 @@ def test_interleaved_dbo_microbatches_keep_the_final_raw_region(aux, total, cut)
     assert len(manager.pools[id(state)]._rows) == 1
 
 
-@pytest.mark.parametrize("producer,enabled,owned,eager,threshold,allowed", [
-    (True, True, True, True, 4096, True),
-    (True, True, False, True, 4096, False),
-    (False, True, True, True, 4096, False),
-    (True, True, True, False, 4096, False),
-    (True, False, False, True, 0, True),
-    (True, False, False, True, 4096, False),
+@pytest.mark.parametrize("producer,enabled,owned,eager,threshold,graph,allowed", [
+    (True, True, True, True, 4096, None, True),
+    (True, True, False, True, 4096, None, False),
+    (False, True, True, True, 4096, None, False),
+    (True, True, True, False, 4096, None, False),
+    (True, True, True, False, 4096, "NONE", True),
+    (True, False, False, False, 0, "NONE", True),
+    (True, True, False, False, 4096, "NONE", False),
+    (True, True, True, False, 4096, "FULL_AND_PIECEWISE", False),
+    (True, False, False, True, 0, None, True),
+    (True, False, False, True, 4096, None, False),
 ])
-def test_dbo_requires_owned_eager_producer_runtime(
-    aux, monkeypatch, producer, enabled, owned, eager, threshold, allowed,
+def test_dbo_requires_owned_uncaptured_producer_runtime(
+    aux, monkeypatch, producer, enabled, owned, eager, threshold, graph, allowed,
 ):
     module = ModuleType("vllm_hcu.model_executor.layers.step4_dsa")
     module._INDEXERS = {"layer": object()}
@@ -463,6 +467,7 @@ def test_dbo_requires_owned_eager_producer_runtime(
         model_config=model, is_kv_producer=producer, is_kv_consumer=not producer,
         vllm_config=SimpleNamespace(
             model_config=model, parallel_config=parallel,
+            compilation_config=SimpleNamespace(cudagraph_mode=SimpleNamespace(name=graph)),
             kv_transfer_config=SimpleNamespace(kv_connector="MooncakeConnector",
                 kv_role="kv_producer" if producer else "kv_consumer"),
             cache_config=SimpleNamespace(enable_prefix_caching=False)),

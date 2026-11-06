@@ -633,6 +633,16 @@ class HCUPlatform(Platform):
         IMPORT_COORDINATOR.drain_ready_callbacks()
         feature_config = validate_and_update_hcu_config(vllm_config)
 
+        from vllm_hcu.runtime_compat.step5 import (
+            configure_step5_pd_producer_compilation,
+        )
+
+        if configure_step5_pd_producer_compilation(vllm_config):
+            logger.info_once(
+                "Step5 Mooncake producer: preparing compiler kernels before "
+                "serving; runtime Inductor autotuning is disabled."
+            )
+
         # Use vLLM's public qualified-class configuration hook for the HCU
         # executor. Scheduling remains fully owned by upstream vLLM.
         from vllm_hcu.patch.platform.framework_opt.patch_multiproc_executor import (
