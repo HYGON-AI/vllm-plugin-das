@@ -228,6 +228,7 @@ def make_hcu_grouped_topk_router(base_class):
                 get_forward_context,
                 is_forward_context_available,
             )
+            from vllm_hcu.platforms import envs as henvs
 
             if envs.VLLM_MOE_SKIP_PADDING and is_forward_context_available():
                 is_padding = get_forward_context().is_padding
@@ -247,8 +248,18 @@ def make_hcu_grouped_topk_router(base_class):
                     and is_padding.shape[0] >= topk_ids.shape[0]
                 ):
                     padding = is_padding[: topk_ids.shape[0], None]
-                    topk_ids = topk_ids.masked_fill(padding, -1)
-                    topk_weights = topk_weights.masked_fill(padding, 0.0)
+                    if henvs.VLLM_HCU_MOE_PAD_MASK_INPLACE and henvs.VLLM_HCU_USE_CUSTOM_OPS:
+                        # topk_weights/topk_ids are freshly allocated by the
+                        # LightOp gate (or by .to() above), so nothing else
+                        # aliases them. In-place fill skips the clone that
+                        # out-of-place masked_fill does — in traces that
+                        # clone shows up as a Memcpy DtoD per tensor right
+                        # after moe_fused_gate (sglang fills in place too).
+                        topk_ids.masked_fill_(padding, -1)
+                        topk_weights.masked_fill_(padding, 0.0)
+                    else:
+                        topk_ids = topk_ids.masked_fill(padding, -1)
+                        topk_weights = topk_weights.masked_fill(padding, 0.0)
             return topk_weights, topk_ids
 
     HcuGroupedTopKRouter.__name__ = "HcuGroupedTopKRouter"
