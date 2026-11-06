@@ -90,9 +90,65 @@ after execution. This is limited to those provider files, not every system DSO.
 All APIs exit0 and release owned groups/ports/GPUs, but each logs one leaked
 shared-memory object. Clean lifecycle remains open. These parallel runs on
 different cards prove scoped functional/quality behavior; same-card35B
-ON/OFF/Triton performance is a separate run in progress. Frozen ON policy is
-not proof of actual35B gather kernels; its post-timing profile remains pending.
+ON/OFF/Triton performance is recorded separately below. Those later traces
+prove sampled gather dispatch; they do not retroactively profile these parallel
+quality runs.
 E5M2 retains the existing path and does not execute this BF16/FP16 gather.
+
+## Full35B TP2 performance follow-up: acceptance remains open
+
+The [same-card35B receipt](../../validation/v0.33.0/bounded-prefill-35b-performance-gfx936-candidate.json)
+records sequential Flash gatherON/OFF/official Triton on physicalGPU0/4, using
+Core `0.33.0+das.da8b48faa.dtk2610` and the merged Plugin's same15 runtime files.
+BF16 weights/KV, MTP3, defaultcombo/autoGraph, maxseq4, batch1024, maxlen8192
+and qwen3 parsing are retained. C16 queues behind maxseq4; this is not saturation.
+Each arm retains384 strict-valid requests:96 warmup and288 measured, using16
+exact512-token inputs,64/128 output tokens, C1/4/16 and three measured rounds.
+Fresh TCP per POST includes connection setup; every round records16 created
+and0 reused connections, with no retries. Timing and sources differ from the
+failed pooled attempt and the4B run; compare only these matched arms.
+
+| Output tokens | Concurrency | Flash ON | Flash OFF | Official Triton | ON/OFF | ON/Triton |
+| --- | --- | --- | --- | --- | --- | --- |
+| 64 | 1 | 87.24 | 80.37 | 87.88 | 1.0855 | 0.9928 |
+| 64 | 4 | 180.53 | 189.48 | 179.76 | 0.9528 | 1.0043 |
+| 64 | 16 | 125.87 | 145.55 | 216.32 | 0.8648 | 0.5819 |
+| 128 | 1 | 125.00 | 112.38 | 128.13 | 1.1123 | 0.9756 |
+| 128 | 4 | 267.22 | 219.50 | 229.68 | 1.2174 | 1.1634 |
+| 128 | 16 | 207.65 | 299.08 | 246.25 | 0.6943 | 0.8433 |
+
+These are median output tokens/s across all three retained measured rounds.
+Performance remains **HOLD**: at C16, ON/OFF is0.8648/0.6943 and ON/Triton
+is0.5819/0.8433 for64/128 outputs. C4 rounds also vary; the receipt keeps all
+round values and min/max ratios. The OFF64/C1 warmup and approximately0.537s
+of measurement round0 overlap a source-CI wall window. That window does not
+prove instantaneous CPU causality; the samples were neither dropped nor
+retried, and fully isolated speedup for this bucket needs a matched repeat.
+
+Request bodies match384/384. Full returned token sequences match251/384
+ON/OFF and248/384 ON/Triton; differing MoE/MTP token paths and round variation
+prevent treating this table as a token-identical gather-kernel causal estimate.
+The original isolated HumanEval32 remains a separate quality gate: raw29/28/28,
+existing normalized32/32/32, all stop, with no under7B waiver. All three arms
+also complete14 semantic prefix and8 concurrent requests, sampledFULL and
+PIECEWISE dispatch, and positive accepted tokens at all three MTP positions.
+
+Post-timing profiling verifies both actual TP ranks through official
+`distributedInfo`, Core version, Worker_TP startup PID, process name and physical
+GPU. ON contains88 official gather kernels across the two worker traces;
+OFF/Triton contain0. The first reader incorrectly required filenames beginning
+with `rank`; the official topology-prefixed traces existed. Its failure is
+preserved, and the corrected reader passes six real-trace and nine negative
+identity controls before reviewing the original retained data without model
+reruns. CPU AsyncLLM traces do not substitute for a worker rank.
+
+Core3656/Adapter213/Plugin15 payloads and the full checkpoint are independently
+rechecked;195 previously observed provider files remain byte-identical.
+Every API exits0 and releases owned groups, ports and GPUs, while each retains
+one shared-memory leak warning. Clean lifecycle, performance acceptance and
+independent restarted-server repeats remain open. Official Triton stays the
+default; the optional gather policy stays defaultOFF. Prior4B gains are not
+full35B performance acceptance.
 
 ## Operational limits and reproduction
 
@@ -116,5 +172,5 @@ The four new cases are `test_bounded_prefill_gather_ragged_writer_reader_graph`.
 Enable with `VLLM_HCU_FLASH_PREFILL_GATHER=1`; unset or set0 and restart for
 rollback. It is independent of RMSNorm and requires the existing Flash
 extension/provider. No FP8 gather, DCP or additional-architecture support is
-implied. The scoped35B quality follow-up above does not close its lifecycle,
-performance or remaining migration feature gates.
+implied. The scoped35B results above do not close lifecycle, performance or the remaining
+migration feature gates.
