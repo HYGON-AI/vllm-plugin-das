@@ -9,7 +9,7 @@ from dataclasses import dataclass
 import pytest
 import torch
 
-from vllm.v1.core.kv_cache_utils import unify_kv_cache_spec_page_size
+from vllm.v1.core.kv_cache_planning import unify_kv_cache_spec_page_size
 from vllm.v1.kv_cache_interface import (
     AttentionSpec,
     KVCacheTensor,
