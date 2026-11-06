@@ -172,6 +172,11 @@ register_hcu_ci(
 )
 register_hcu_ci(
     job="contract-hcu-gfx936",
+    target="tests/runtime_patch/test_compressed_tensors_w4a8.py",
+    est_time=60,
+)
+register_hcu_ci(
+    job="contract-hcu-gfx936",
     target="tests/runtime_patch/test_worker_framework_opt.py",
     est_time=180,
 )

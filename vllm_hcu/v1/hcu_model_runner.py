@@ -5345,6 +5345,11 @@ class GPUModelRunner(
         )
 
         refresh_wo_a_bf16_caches(model)
+        from vllm_hcu.model_executor.layers.quantization.compressed_tensors_w4a8_runtime import (
+            refresh_hcu_w4a8_scale_caches,
+        )
+
+        refresh_hcu_w4a8_scale_caches(model)
 
         # logging and validation
         counter_after_reloading = time.perf_counter()
