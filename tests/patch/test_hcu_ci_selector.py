@@ -258,6 +258,39 @@ def test_every_hcu_marked_test_file_is_registered() -> None:
     assert hcu_test_files <= registered_files
 
 
+def test_cp_gather_regressions_have_suitable_hardware_jobs() -> None:
+    prefix = "tests/accuracy/test_cp_gather_fp8.py::"
+    single = {
+        "test_cp_gather_bitwise",
+        "test_cp_gather_large_table_stride",
+        "test_prefill_binding_is_local_and_delegates_other_ops",
+        "test_disabled_kernel_retains_upstream_call",
+        "test_hyv4_binding_keeps_upstream_operators",
+        "test_existing_dedup_dispatch_is_preserved",
+        "test_cp_gather_invalid_metadata_dtype",
+    }
+    multi = {
+        "test_cp_gather_uses_cache_device_stream",
+        "test_cp_gather_rejects_mixed_devices",
+    }
+    registrations = [item for item in parse_registry()
+                     if item.test_file == prefix.split("::")[0]
+                     and item.disabled is None]
+    assert {(item.job, item.target) for item in registrations} == (
+        {("accuracy-gfx938", prefix + name) for name in single}
+        | {("accuracy-multigpu-gfx938", prefix + name) for name in multi}
+    )
+    jobs = validate_config(_config())
+    assert jobs["accuracy-gfx938"]["cards"] == 1
+    assert jobs["accuracy-multigpu-gfx938"]["cards"] >= 2
+    assert jobs["accuracy-multigpu-gfx938"]["arch"] == "gfx938"
+    assert jobs["accuracy-multigpu-gfx938"]["suite"] == "accuracy-hcu"
+    for path in [prefix.split("::")[0],
+                 "vllm_hcu/v1/attention/ops/cp_gather_fp8.py",
+                 "vllm_hcu/v1/attention/backends/mla/flashmla_sparse.py"]:
+        assert {"accuracy-gfx938", "accuracy-multigpu-gfx938"} <= _selected_job_ids(path)
+
+
 def test_qwen35_mtp3_graph_has_exact_registration_on_multicard_job() -> None:
     target = (
         "tests/integration/graph/test_qwen35_35b_a3b_mtp3_graph_parity.py::"

@@ -59,6 +59,15 @@
       "timeout_minutes": 30,
       "requirements": []
     },
+    "accuracy-multigpu-gfx938": {
+      "runner": "bw1100",
+      "arch": "gfx938",
+      "cards": 2,
+      "suite": "accuracy-hcu",
+      "pytest_args": [],
+      "timeout_minutes": 30,
+      "requirements": []
+    },
     "contract-hcu-gfx936": {
       "runner": "bw1000",
       "arch": "gfx936",
@@ -462,6 +471,7 @@
     {"job": "hy4-contract", "timeout_minutes": 30},
     {"job": "accuracy-gfx936", "timeout_minutes": 45},
     {"job": "accuracy-gfx938", "timeout_minutes": 45},
+    {"job": "accuracy-multigpu-gfx938", "timeout_minutes": 30},
     {"job": "contract-hcu-gfx936", "timeout_minutes": 60},
     {"job": "integration-smoke-gfx938", "timeout_minutes": 60},
     {"job": "qwen35-smoke", "timeout_minutes": 90},
@@ -484,6 +494,14 @@
     {"job": "single-node-topology", "timeout_minutes": 30}
   ],
   "groups": {
+    "cp-gather-fp8": {
+      "patterns": [
+        "vllm_hcu/v1/attention/ops/cp_gather_fp8.py",
+        "vllm_hcu/v1/attention/backends/mla/flashmla_sparse.py",
+        "tests/accuracy/test_cp_gather_fp8.py"
+      ],
+      "jobs": ["accuracy-gfx938", "accuracy-multigpu-gfx938"]
+    },
     "hy4-contract": {
       "patterns": [
         "vllm_hcu/**hy_v4*",

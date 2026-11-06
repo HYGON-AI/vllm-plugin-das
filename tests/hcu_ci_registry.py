@@ -30,6 +30,21 @@ register_hcu_ci(
     target="tests/accuracy/test_hyv4_w4a8_kernels.py",
     est_time=60,
 )
+register_hcu_ci(
+    job="hy4-contract",
+    target="tests/models/hy_v4/test_compressed_w4a8_layerwise_reload.py",
+    est_time=30,
+)
+register_hcu_ci(
+    job="hy4-contract",
+    target="tests/models/hy_v4/test_compressed_w4a8_static_eplb.py",
+    est_time=30,
+)
+register_hcu_ci(
+    job="hy4-contract",
+    target="tests/models/hy_v4/test_workspace_dedup.py",
+    est_time=30,
+)
 
 register_hcu_ci(
     job="hy4-contract",
@@ -150,6 +165,56 @@ register_hcu_ci(
     job="accuracy-gfx938",
     target="tests/accuracy/test_hcu_kernel_accuracy.py",
     est_time=900,
+)
+register_hcu_ci(
+    job="accuracy-gfx938",
+    target="tests/accuracy/test_sparse_mla_workspace_dedup.py",
+    est_time=30,
+)
+register_hcu_ci(
+    job="accuracy-gfx938",
+    target="tests/accuracy/test_cp_gather_fp8.py::test_cp_gather_bitwise",
+    est_time=30,
+)
+register_hcu_ci(
+    job="accuracy-gfx938",
+    target="tests/accuracy/test_cp_gather_fp8.py::test_cp_gather_large_table_stride",
+    est_time=30,
+)
+register_hcu_ci(
+    job="accuracy-gfx938",
+    target="tests/accuracy/test_cp_gather_fp8.py::test_prefill_binding_is_local_and_delegates_other_ops",
+    est_time=1,
+)
+register_hcu_ci(
+    job="accuracy-gfx938",
+    target="tests/accuracy/test_cp_gather_fp8.py::test_disabled_kernel_retains_upstream_call",
+    est_time=1,
+)
+register_hcu_ci(
+    job="accuracy-gfx938",
+    target="tests/accuracy/test_cp_gather_fp8.py::test_hyv4_binding_keeps_upstream_operators",
+    est_time=1,
+)
+register_hcu_ci(
+    job="accuracy-gfx938",
+    target="tests/accuracy/test_cp_gather_fp8.py::test_existing_dedup_dispatch_is_preserved",
+    est_time=1,
+)
+register_hcu_ci(
+    job="accuracy-gfx938",
+    target="tests/accuracy/test_cp_gather_fp8.py::test_cp_gather_invalid_metadata_dtype",
+    est_time=2,
+)
+register_hcu_ci(
+    job="accuracy-multigpu-gfx938",
+    target="tests/accuracy/test_cp_gather_fp8.py::test_cp_gather_uses_cache_device_stream",
+    est_time=15,
+)
+register_hcu_ci(
+    job="accuracy-multigpu-gfx938",
+    target="tests/accuracy/test_cp_gather_fp8.py::test_cp_gather_rejects_mixed_devices",
+    est_time=5,
 )
 register_hcu_ci(
     job="accuracy-gfx938",
