@@ -31,6 +31,33 @@ operator, so the plugin neither registers nor ships a `SiluAndMul` override.
 No model, topology, FP8-KV, or broad performance support is implied by these
 operator-level capabilities.
 
+## DSV4.1 Channel-FP8 configuration routing
+
+The independent `das_hcu_dsv41` Adapter extension advertises only
+`dsv41-channel-fp8-routing` and registers the distinct public quantization name
+`hcu_dsv41_channel_fp8`. It does not replace the official `fp8`,
+`deepseek_v4_fp8`, or `compressed-tensors` entries or their methods, and does
+not depend on the RMS/Flash extensions or vendor optimizations for discovery.
+
+Automatic selection requires the HCU platform, a V4.1 model configuration,
+`quant_method=fp8` (or `deepseek_v4_fp8`), `is_per_channel=true`, no weight block
+size, dynamic activations, and a compatible user quantization choice. Other
+models and schemes preserve their official selection. The configuration reuses
+the official V4.1 FP8 policy, checks native exclusions before delegating to the
+official CT channel-weight/token-activation scheme, and leaves BF16 `wo_a`
+unquantized. At normal serialized startup, an existing foreign owner of the
+new name is rejected; partial registration failure refuses further activation
+in that process. The Core registry has no atomic reservation API: this extension
+does not guarantee inter-owner atomicity against concurrent external writes or
+roll back arbitrary Core registrations. Its health check detects a later lost
+owner without repairing it.
+
+This increment is configuration/routing infrastructure. It does **not** certify
+checkpoint or target/draft scale loading, HCU kernel support, model inference,
+W4A8, PCP, DSpark, Graph, accuracy or performance. Those are separate migration
+gates. Requiring `dsv41-channel-fp8-routing` at startup proves activation only,
+not those execution properties. See the [routing contract and evidence](../docs/validation/dsv41-channel-fp8-routing.md).
+
 ## Compatibility
 
 - vLLM release line: `>=0.33.0,<0.34.0`; prerelease, postrelease,
