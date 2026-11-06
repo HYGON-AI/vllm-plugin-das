@@ -428,3 +428,27 @@ reload and INT8 AllGatherv contracts. The patch coverage, dependency lock and
 HCU registration gates also passed. Validation artifacts are in
 `run/20261105_pr299_parallel_ignore_fix/` in the validation project. This
 follow-up does not include a new full-model accuracy evaluation.
+
+## Complete contract gate registration (2026-11-06)
+
+The HCU PR CI `Verify patch contracts` step runs the complete portable contract
+suite, beyond the earlier 480-test affected-module selection. Replaying that
+entry point on nmz105 reproduced
+`test_every_hcu_marked_test_file_is_registered`: this PR added HCU-marked graph
+cases in `test_compressed_tensors_w4a8.py` without registering that test file.
+
+The file is now registered under the existing `contract-hcu-gfx936` job with
+a 60-second estimate. The existing registration invariant passes, and the
+hardware contract entry point collects all 12 checkpoint/kernel-reload graph
+cases, including ordinary and inference-mode warmup. No quantization execution
+code or gate condition was changed.
+
+On nmz105, the same CI image and full `run_patch_tests.py --suite contract`
+entry point passed: 4878 passed, 69 skipped, 264 deselected, and 32 subtests
+passed in 726.71 seconds. The environment lock, Python syntax, registry and
+nightly/quarantine matrix checks also passed. The registry now contains 83
+registrations across the existing 26 jobs. Hardware execution still requires
+the workflow's normal trusted `ready-hcu` authorization.
+
+Artifacts: `run/20261106_pr299_ci_fix/` in the validation project, including
+the failing registration probe, its passing result and full contract logs.
