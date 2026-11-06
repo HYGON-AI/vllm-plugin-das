@@ -15,6 +15,10 @@ import xml.etree.ElementTree as ET
 ROOT = Path(__file__).resolve().parents[1]
 SOURCE_TESTS = ['tests/vllm033/test_vllm_033_contract.py',
                 'tests/vllm033/test_package_boundary.py']
+PUBLIC_SELECTOR_TEST = 'tests/vllm033/test_flash_public_selector.py'
+PUBLIC_SELECTOR_CASES = ('normal', 'optional', 'required', 'commit',
+                         'foreign-before', 'duplicate', 'clear', 'foreign',
+                         'config', 'fork', 'spawn')
 
 
 def test_files(tier):
@@ -22,7 +26,25 @@ def test_files(tier):
         return SOURCE_TESTS
     return [p.relative_to(ROOT).as_posix()
             for p in sorted((ROOT / 'tests/vllm033').glob('test_*.py'))
-            if p.name.endswith('_hcu.py') == (tier == 'device')]
+            if p.name.endswith('_hcu.py') == (tier == 'device')
+            and p.relative_to(ROOT).as_posix() != PUBLIC_SELECTOR_TEST]
+
+
+def _vllm_release(raw_version):
+    """Parse the release tuple without requiring a third-party package."""
+    if '!' in raw_version:
+        raise ValueError('vLLM version must have an epoch of zero')
+    release = raw_version.split('+', 1)[0].split('-', 1)[0]
+    parts = release.split('.')
+    if len(parts) < 2 or any(not part.isdigit() for part in parts):
+        raise ValueError(f'invalid vLLM release: {raw_version!r}')
+    return tuple(int(part) for part in parts)
+
+
+def _run_public_selector_cases(environment):
+    for case in PUBLIC_SELECTOR_CASES:
+        subprocess.run([sys.executable, '-B', str(ROOT / PUBLIC_SELECTOR_TEST), case],
+                       env=environment, cwd=ROOT, check=True)
 
 
 def validate_result(path):
@@ -57,8 +79,7 @@ def main():
         # Image must already contain ABI-matched Core, Adapter and vendor wheels.
         # Install only this independent Plugin project, not repository-root setup.py.
         from importlib.metadata import version
-        from packaging.version import Version
-        if Version(version('vllm')).release[:2] != (0, 33) or Version(version('vllm')).epoch:
+        if _vllm_release(version('vllm'))[:2] != (0, 33):
             raise ValueError('device image must provide epoch-zero vLLM 0.33')
         if args.tier == 'device':
             environment.update(HCU_ADAPTER_HOST='vllm', VLLM_PLUGINS='hcu_adapter',
@@ -69,7 +90,11 @@ def main():
                         str(ROOT / 'adapter_extension')], env=environment, cwd=ROOT, check=True)
         if args.tier == 'portable':
             from importlib.util import find_spec
-            environment['VLLM_TARGET_ROOT'] = str(Path(find_spec('vllm').origin).parent.parent)
+            spec = find_spec('vllm')
+            if spec is None or not spec.origin:
+                raise ValueError('portable image must provide an importable vLLM package')
+            environment['VLLM_TARGET_ROOT'] = str(Path(spec.origin).parent.parent)
+            _run_public_selector_cases(environment)
     result = subprocess.run([sys.executable, '-m', 'pytest', '-q', *files,
         '--strict-markers', '--junitxml', str(args.junit.resolve()),
         '-o', 'xfail_strict=true', '-o', 'cache_dir=.pytest_cache/v033'], cwd=ROOT, env=environment)

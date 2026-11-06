@@ -75,8 +75,10 @@ class SelectionTests(unittest.TestCase):
             run.return_value = subprocess.CompletedProcess([], 0, 'removed.py\n', '')
             _git_changed_paths('base', 'head', include_deleted=True)
             self.assertIn('--diff-filter=ACDMRTUXB', run.call_args.args[0])
+            self.assertIn('--no-renames', run.call_args.args[0])
             _git_changed_paths('base', 'head')
             self.assertIn('--diff-filter=ACMRTUXB', run.call_args.args[0])
+            self.assertNotIn('--no-renames', run.call_args.args[0])
 
     def test_result_gate_rejects_skip_xfail_empty_failure_and_error(self):
         sys.path.insert(0, str(ROOT / 'tools'))
@@ -122,6 +124,17 @@ class SelectionTests(unittest.TestCase):
                 self.assertEqual(call.kwargs['env']['HCU_ADAPTER_HOST'], 'none')
                 self.assertNotIn('PYTHONPATH', call.kwargs['env'])
                 self.assertEqual(call.kwargs['env']['PYTHONNOUSERSITE'], '1')
+
+    def test_docs_under_mapped_directory_are_docs_only(self):
+        result = select_jobs(['adapter_extension/README.md'])
+        self.assertTrue(result['docs_only'])
+        self.assertEqual(result['jobs'], [])
+
+    def test_public_selector_is_run_as_explicit_portable_cases(self):
+        sys.path.insert(0, str(ROOT / 'tools'))
+        from run_v033_ci import PUBLIC_SELECTOR_CASES, PUBLIC_SELECTOR_TEST, test_files
+        self.assertEqual(len(PUBLIC_SELECTOR_CASES), 11)
+        self.assertNotIn(PUBLIC_SELECTOR_TEST, test_files('portable'))
 
 
 if __name__ == '__main__':

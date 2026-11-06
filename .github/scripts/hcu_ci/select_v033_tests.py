@@ -25,12 +25,12 @@ def select_jobs(changed_paths, *, full=False, accuracy=False, config_path=DEFAUL
     unmapped = []
     executable = []
     for path in paths:
-        matched = [name for name, patterns in config['groups'].items()
-                   if any(fnmatch.fnmatchcase(path, pat) for pat in patterns)]
-        document = not matched and any(fnmatch.fnmatchcase(path, pat)
-                                      for pat in config['docs_only_patterns'])
+        document = any(fnmatch.fnmatchcase(path, pat)
+                       for pat in config['docs_only_patterns'])
         if document:
             continue
+        matched = [name for name, patterns in config['groups'].items()
+                   if any(fnmatch.fnmatchcase(path, pat) for pat in patterns)]
         executable.append(path)
         if matched:
             groups.extend(matched)

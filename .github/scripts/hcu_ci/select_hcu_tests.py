@@ -300,9 +300,13 @@ def select_jobs(
 
 
 def _git_changed_paths(base: str, head: str, *, include_deleted: bool = False) -> list[str]:
+    command = ["git", "diff", "--name-only",
+               "--diff-filter=ACDMRTUXB" if include_deleted else "--diff-filter=ACMRTUXB"]
+    if include_deleted:
+        command.append("--no-renames")
+    command.extend([base, head])
     result = subprocess.run(
-        ["git", "diff", "--name-only",
-         "--diff-filter=ACDMRTUXB" if include_deleted else "--diff-filter=ACMRTUXB", base, head],
+        command,
         cwd=REPOSITORY,
         text=True,
         stdout=subprocess.PIPE,
