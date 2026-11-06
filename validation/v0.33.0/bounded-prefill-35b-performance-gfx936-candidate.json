@@ -1,0 +1,916 @@
+{
+  "target": "v0.33.0",
+  "checked_utc": "2026-11-06T23:15:19.387521+00:00",
+  "status": "SCOPED_QUALITY_AND_DISPATCH_VERIFIED_PERFORMANCE_AND_LIFECYCLE_HOLD",
+  "last_good": false,
+  "model": "/model/Qwen3.5-35B-A3B",
+  "total_parameter_scope": "Total35B, no under7B quality waiver",
+  "core_version": "0.33.0+das.da8b48faa.dtk2610",
+  "core_commit": "da8b48faa58bf4adfb9ba6ed2eee634e6d88ede2",
+  "adapter_commit": "84c9783e75b1171512cca34efce333ede9d6b887",
+  "plugin_merged_commit": "297538c9232f17e4d98ed11417b3041414ed1f5f",
+  "measured_runtime_commit": "65493627ac2c6b34f3e747c5490bd3a039d3c1d9",
+  "payload_files_checked": {
+    "core": 3656,
+    "adapter": 213,
+    "plugin": 15
+  },
+  "scope": "Sequential same physicalGPU0/4 TP2 BF16weights/KV,MTP3,defaultcombo/autoGraph,maxseq4,batch1024,maxlen8192,block/prefix64,qwen3 reasoning parser. C16 queues behind maxseq4.",
+  "protocol_sha256": "98c8831e007af1e2d20b98d95738273cc7414b31b5e5b4f6475ac22db207669b",
+  "inputs_sha256": "9134c1898c3889e84425dc89f679ef01c8532083871e99a297469fb1ab053134",
+  "driver_sha256": "70977abf381c32738ea3d5813d081e3539a19eac27979de5705ca12a0201d7ad",
+  "client_sha256": "d724614548d8ac65b2cdac1bcf9a34de20e0312b7283298a7c73b80c3fd9deaa",
+  "protocol": {
+    "schema": 1,
+    "model": "/model/Qwen3.5-35B-A3B",
+    "input_len": 512,
+    "output_lens": [
+      64,
+      128
+    ],
+    "concurrency": [
+      1,
+      4,
+      16
+    ],
+    "rounds": 3,
+    "requests_each_round": 16,
+    "warmup_each_group": 16,
+    "measured_requests_each_arm": 288,
+    "warmup_requests_each_arm": 96,
+    "ignore_eos": true,
+    "temperature": 0,
+    "seed": 0,
+    "repetition_penalty": 1.0,
+    "add_special_tokens": false,
+    "return_token_ids": true,
+    "prefix_policy": "Keep server prefix caching enabled; unique deterministic cache_salt per group/phase/round/request prevents cache hits and isolates decode throughput. Same salts/protocol across arms.",
+    "inputs_sha256": "9134c1898c3889e84425dc89f679ef01c8532083871e99a297469fb1ab053134",
+    "timing": "Actual official async_request_openai_completions and calculate_metrics(selected_percentiles=[50,95]); E2EL excludes trailing usage/DONE as official. HTTP stream-complete wall duration additionally recorded.",
+    "itl_scope": "Official per-choice SSE interval, possibly multi-token under MTP; not exact hardware per-token latency.",
+    "throughput": "Total successful output usage tokens divided by full measured-round wall duration, including all completion streams; warmups excluded.",
+    "timeouts": {
+      "request_s": 180,
+      "client_total_s": 1500
+    },
+    "quality": "Performance-only forced-length ignore_eos window; no HE score or algorithmic correctness claim.",
+    "http_transport": {
+      "connections": "fresh TCP per POST, force_close=True, traced create/reuse counts",
+      "request_retries": 0,
+      "scope": "Transport differs from failed initial attempt and prior4B; compare only arms in this attempt2, include connection establishment in timing."
+    }
+  },
+  "independent_review_sha256": "a9ab25f43dd60c25ab0a9bb9ca72ef8be193eeee2d4d597c324773bfb3766f9f",
+  "corrected_review_sha256": "796105427a625478f977549462e996b1d3db6f70a4db04284ab6f5f2b96a1bf4",
+  "reviewer_sha256": "8530a3563cd01704aecc78aedd08cc5016f5c57eb1d3f927f15fa05cc1c7d6e7",
+  "original_failed_review": {
+    "status": "HOLD",
+    "sha256": "2b0da458f16ff1bea7c193c8faa88eabb97b923d064c30982c8fb80f05ab8b71",
+    "reason": "Reader required rank-prefixed basename; actual official names include distributed topology prefix. Original six worker traces retained and verified by corrected metadata/PID/GPU-aware reader."
+  },
+  "trace_identity_controls_sha256": "1612c23257f8e1a3353e5a13d7fa6de67fc5504b1b32055392c502c1c1e97574",
+  "comparison": {
+    "quality": {
+      "flash-on": {
+        "normalized_same_failed_set_as_current_official": true,
+        "normalized_passed": 32,
+        "raw_passed": 29
+      },
+      "flash-off": {
+        "normalized_same_failed_set_as_current_official": true,
+        "normalized_passed": 32,
+        "raw_passed": 28
+      },
+      "official-triton": {
+        "normalized_same_failed_set_as_current_official": true,
+        "normalized_passed": 32,
+        "raw_passed": 28
+      }
+    },
+    "buckets": [
+      {
+        "output": 64,
+        "concurrency": 1,
+        "on_over_off_throughput": 1.085491795761654,
+        "on_over_off_round_minmax": [
+          1.0584102517864042,
+          1.1201441256925309
+        ],
+        "on_over_triton_throughput": 0.992808201116428
+      },
+      {
+        "output": 64,
+        "concurrency": 4,
+        "on_over_off_throughput": 0.952794710526806,
+        "on_over_off_round_minmax": [
+          0.9022272902964222,
+          1.239650859249116
+        ],
+        "on_over_triton_throughput": 1.004291129300626
+      },
+      {
+        "output": 64,
+        "concurrency": 16,
+        "on_over_off_throughput": 0.8647748831736175,
+        "on_over_off_round_minmax": [
+          0.6457826588536207,
+          0.893209211208869
+        ],
+        "on_over_triton_throughput": 0.5818741309945455
+      },
+      {
+        "output": 128,
+        "concurrency": 1,
+        "on_over_off_throughput": 1.1122739414770115,
+        "on_over_off_round_minmax": [
+          1.1067852139086174,
+          1.1166451788847367
+        ],
+        "on_over_triton_throughput": 0.9755689134416604
+      },
+      {
+        "output": 128,
+        "concurrency": 4,
+        "on_over_off_throughput": 1.2173646140664813,
+        "on_over_off_round_minmax": [
+          0.7982709633316073,
+          1.2283674685912669
+        ],
+        "on_over_triton_throughput": 1.1634220236289026
+      },
+      {
+        "output": 128,
+        "concurrency": 16,
+        "on_over_off_throughput": 0.6943125611006589,
+        "on_over_off_round_minmax": [
+          0.685979030958088,
+          1.0500689932303124
+        ],
+        "on_over_triton_throughput": 0.8432624690376538
+      }
+    ],
+    "retained_token_comparisons": {
+      "flash-off_equal": 251,
+      "flash-off_different": 133,
+      "official-triton_equal": 248,
+      "official-triton_different": 136
+    }
+  },
+  "arms": {
+    "flash-on": {
+      "status": "COMPLETE",
+      "server_exit": 0,
+      "process_group_empty": true,
+      "port_closed": true,
+      "quality": {
+        "raw": {
+          "passed": 29,
+          "failed": [
+            "HumanEval/2",
+            "HumanEval/16",
+            "HumanEval/24"
+          ]
+        },
+        "normalized": {
+          "passed": 32,
+          "failed": []
+        }
+      },
+      "humaneval_finish_reasons": {
+        "stop": 32
+      },
+      "buckets": [
+        {
+          "output": 64,
+          "concurrency": 1,
+          "throughput_median": 87.24472686335251,
+          "throughput_rounds": [
+            87.24472686335251,
+            87.69167104148403,
+            85.49712777497405
+          ],
+          "ttft_ms": 447.09436397533864,
+          "tpot_ms": 4.453019562384321
+        },
+        {
+          "output": 64,
+          "concurrency": 4,
+          "throughput_median": 180.5338847262488,
+          "throughput_rounds": [
+            180.5338847262488,
+            175.9841129657294,
+            180.90123604153112
+          ],
+          "ttft_ms": 924.2638191208243,
+          "tpot_ms": 9.221265118362176
+        },
+        {
+          "output": 64,
+          "concurrency": 16,
+          "throughput_median": 125.87106393415036,
+          "throughput_rounds": [
+            124.72309012053118,
+            127.4709887530973,
+            125.87106393415036
+          ],
+          "ttft_ms": 3811.488183448091,
+          "tpot_ms": 25.269901167438732
+        },
+        {
+          "output": 128,
+          "concurrency": 1,
+          "throughput_median": 124.99639083606317,
+          "throughput_rounds": [
+            124.99639083606317,
+            124.88315357631899,
+            125.18437752544968
+          ],
+          "ttft_ms": 451.6312739579007,
+          "tpot_ms": 4.438989247584084
+        },
+        {
+          "output": 128,
+          "concurrency": 4,
+          "throughput_median": 267.216694129814,
+          "throughput_rounds": [
+            241.70420887809436,
+            269.1044563963579,
+            267.216694129814
+          ],
+          "ttft_ms": 726.2742380844429,
+          "tpot_ms": 9.211307220109628
+        },
+        {
+          "output": 128,
+          "concurrency": 16,
+          "throughput_median": 207.65480027523873,
+          "throughput_rounds": [
+            206.61621197827185,
+            236.3163332705857,
+            207.65480027523873
+          ],
+          "ttft_ms": 4476.577722467482,
+          "tpot_ms": 15.806213948934333
+        }
+      ],
+      "sampled_graph_dispatch_windows": {
+        "FULL": 6069,
+        "PIECEWISE": 40,
+        "NONE": 711
+      },
+      "speculative_metrics": {
+        "num_draft_tokens": 32283.0,
+        "num_accepted_tokens": 31164.0
+      },
+      "actual_worker_trace_ranks": [
+        0,
+        1
+      ],
+      "profile_traces": [
+        {
+          "file": "profiler/dp0_pp0_tp0_dcp0_ep0_rank0.1794003720667076816.pt.trace.json.gz",
+          "sha256": "87b3ae3444ada53a4dc1a85e5a0f83d296c2a96a64c41bf2d7be2d5eedd81a35",
+          "official_cpp_gather_kernels": 44,
+          "rank_identity": {
+            "rank": 0,
+            "worker_pid": 679723,
+            "world_size": 2,
+            "physical_gpu": 0,
+            "vllm_version": "0.33.0+das.da8b48faa.dtk2610",
+            "scope": "Official topology suffix cross-checked with actual distributedInfo, startup PID and GPU kernel device."
+          }
+        },
+        {
+          "file": "profiler/dp0_pp0_tp1_dcp0_ep1_rank1.1794003720656588470.pt.trace.json.gz",
+          "sha256": "ba5f77f646d4c4522dd41dcc8b420444773161e61522275b25eb5cc8fe214fde",
+          "official_cpp_gather_kernels": 44,
+          "rank_identity": {
+            "rank": 1,
+            "worker_pid": 679724,
+            "world_size": 2,
+            "physical_gpu": 4,
+            "vllm_version": "0.33.0+das.da8b48faa.dtk2610",
+            "scope": "Official topology suffix cross-checked with actual distributedInfo, startup PID and GPU kernel device."
+          }
+        },
+        {
+          "file": "profiler/m09r2n14_678093.async_llm.1794003720433919736.pt.trace.json.gz",
+          "sha256": "3038c359b9b6bfd9027180b7458b3875e7b5fc055709836df31797e5a7d633cc",
+          "official_cpp_gather_kernels": 0,
+          "rank_identity": null
+        }
+      ],
+      "official_cpp_gather_kernels": 88,
+      "lifecycle_markers": {
+        "EngineDeadError": 0,
+        "resource_tracker": 3,
+        "force-kill": 0,
+        "workers still running after grace period": 0
+      },
+      "clean_lifecycle": false,
+      "artifact_sha256": {
+        "result.json": "2ed38a5c0038ab8ed48f217a8e78c871bc073d081cfa65a8c8c039de4ea824fb",
+        "server.log": "0aeadd7c44a9e3a1272040131289a93ce9a7ceae1c0e8d1b55b23e3d751f15fd",
+        "hybrid-cache.json": "3ee90b7f3403570430be906508cec349410c684b388184f86b7cc44d4149259c",
+        "prefill-gather-policy.json": "65b762063eac664c22489e98b134a66c55c9a52617adb66ad1c812368b114a12",
+        "semantic-prefix-responses.json": "6e97bd81f319510186f1d3f70b2f7174885f9e61250f19c8e361bfb83c0120e2",
+        "humaneval32/complete.json": "f7c7aa8711baf0132f1e840a39dc8343357e78e00312bbd04e8baa1dcf1da981",
+        "performance/result.json": "6c192fd8cfb954009b03752ed6a237a711fd715e53d57c0962e4a6c1257bbd39",
+        "profile-request.json": "0a18483dbb581626dba6b477e1f9500afac26c63f80da41f6ce806fa23747ad3"
+      },
+      "native_postrun_sha256": "f9ebc4ecf3d8b5cdc6fba59d5aeb8f78febf4cd5e3f9a094a0034c2449748728",
+      "accepted_tokens_per_position": {
+        "0": 10505.0,
+        "1": 10379.0,
+        "2": 10280.0
+      },
+      "model_command": [
+        "/data/models/vllm033-upgrade-20261103/.venv-v033-bounded-prefill-20261107/bin/vllm",
+        "serve",
+        "/model/Qwen3.5-35B-A3B",
+        "--host",
+        "127.0.0.1",
+        "--port",
+        "18781",
+        "--dtype",
+        "bfloat16",
+        "--attention-config",
+        "{\"backend\": \"FLASH_ATTN\"}",
+        "--kv-cache-dtype",
+        "auto",
+        "--max-model-len",
+        "8192",
+        "--max-num-batched-tokens",
+        "1024",
+        "--max-num-seqs",
+        "4",
+        "--gpu-memory-utilization",
+        "0.7",
+        "--enable-prefix-caching",
+        "--seed",
+        "0",
+        "--shutdown-timeout",
+        "30",
+        "--cudagraph-metrics",
+        "--tensor-parallel-size",
+        "2",
+        "--distributed-executor-backend",
+        "mp",
+        "--reasoning-parser",
+        "qwen3",
+        "--speculative-config",
+        "{\"method\": \"mtp\", \"num_speculative_tokens\": 3}",
+        "--profiler-config",
+        "{\"profiler\": \"torch\", \"torch_profiler_dir\": \"/data/models/vllm033-upgrade-20261103/evidence/qwen35-35b-bounded-prefill-performance-20261107-attempt2/flash-on/profiler\", \"torch_profiler_with_stack\": false}",
+        "--block-size",
+        "64",
+        "--prefix-match-unit",
+        "64",
+        "--enable-mamba-shared-prefix-checkpoint",
+        "--enable-prompt-tokens-details",
+        "--worker-extension-cls",
+        "bounded_gather_observer.BoundedGatherObserver",
+        "--language-model-only"
+      ],
+      "manager_page": 1088,
+      "semantic_prefix_requests": 14,
+      "concurrent_requests": 8,
+      "strict_timing_requests": 384,
+      "warmup_requests": 96,
+      "measured_requests": 288,
+      "returned_all_required_lengths": true,
+      "native_postrun": {
+        "status": "ALL_195_NATIVE_PROVIDER_FILES_BYTE_IDENTICAL",
+        "generated_utc": "2026-11-06T22:22:47.181215+00:00",
+        "label": "flash-on",
+        "baseline_sha256": "1c71a0e994600b6c01ce12de5e9284f739aca36d63bbdc333e8928032caf9f98",
+        "file_count": 195,
+        "scope": "Matches files whose actual mapped DSOs were checked before quality requests; loading is not dispatch proof."
+      }
+    },
+    "flash-off": {
+      "status": "COMPLETE",
+      "server_exit": 0,
+      "process_group_empty": true,
+      "port_closed": true,
+      "quality": {
+        "raw": {
+          "passed": 28,
+          "failed": [
+            "HumanEval/2",
+            "HumanEval/13",
+            "HumanEval/16",
+            "HumanEval/24"
+          ]
+        },
+        "normalized": {
+          "passed": 32,
+          "failed": []
+        }
+      },
+      "humaneval_finish_reasons": {
+        "stop": 32
+      },
+      "buckets": [
+        {
+          "output": 64,
+          "concurrency": 1,
+          "throughput_median": 80.37345579579967,
+          "throughput_rounds": [
+            80.37345579579967,
+            80.77881674962089,
+            78.28606072211335
+          ],
+          "ttft_ms": 454.14750603958964,
+          "tpot_ms": 5.322337985807469
+        },
+        {
+          "output": 64,
+          "concurrency": 4,
+          "throughput_median": 189.47826087996492,
+          "throughput_rounds": [
+            189.47826087996492,
+            195.0551871556786,
+            145.9291821498087
+          ],
+          "ttft_ms": 719.6162369800732,
+          "tpot_ms": 8.348039246075563
+        },
+        {
+          "output": 64,
+          "concurrency": 16,
+          "throughput_median": 145.55356126003454,
+          "throughput_rounds": [
+            193.13477748370772,
+            145.55356126003454,
+            142.71123400146996
+          ],
+          "ttft_ms": 3287.9533865489066,
+          "tpot_ms": 17.238655650529953
+        },
+        {
+          "output": 128,
+          "concurrency": 1,
+          "throughput_median": 112.37914166188041,
+          "throughput_rounds": [
+            112.10756997176054,
+            112.37914166188041,
+            112.83413620542825
+          ],
+          "ttft_ms": 457.19465205911547,
+          "tpot_ms": 5.289402094625641
+        },
+        {
+          "output": 128,
+          "concurrency": 4,
+          "throughput_median": 219.50423976692088,
+          "throughput_rounds": [
+            219.0748805037762,
+            302.7846683403524,
+            219.50423976692088
+          ],
+          "ttft_ms": 697.1202554414049,
+          "tpot_ms": 12.975010845817508
+        },
+        {
+          "output": 128,
+          "concurrency": 16,
+          "throughput_median": 299.0797112269638,
+          "throughput_rounds": [
+            225.04838710036478,
+            301.19902016494103,
+            299.0797112269638
+          ],
+          "ttft_ms": 3341.6445940965787,
+          "tpot_ms": 8.190848540118713
+        }
+      ],
+      "sampled_graph_dispatch_windows": {
+        "FULL": 6101,
+        "NONE": 655,
+        "PIECEWISE": 38
+      },
+      "speculative_metrics": {
+        "num_draft_tokens": 32097.0,
+        "num_accepted_tokens": 31276.0
+      },
+      "actual_worker_trace_ranks": [
+        0,
+        1
+      ],
+      "profile_traces": [
+        {
+          "file": "profiler/dp0_pp0_tp0_dcp0_ep0_rank0.1794005042520334335.pt.trace.json.gz",
+          "sha256": "d4ce34aa47d3db8880b78b995061a77cf26e1c03f2f97aa927c8ed9e010663d6",
+          "official_cpp_gather_kernels": 0,
+          "rank_identity": {
+            "rank": 0,
+            "worker_pid": 699399,
+            "world_size": 2,
+            "physical_gpu": 0,
+            "vllm_version": "0.33.0+das.da8b48faa.dtk2610",
+            "scope": "Official topology suffix cross-checked with actual distributedInfo, startup PID and GPU kernel device."
+          }
+        },
+        {
+          "file": "profiler/dp0_pp0_tp1_dcp0_ep1_rank1.1794005042525834147.pt.trace.json.gz",
+          "sha256": "7d5aa6b4387dcd31bcfd7fb082cb76ecfa7715f5fcaeb4edb4ca3f85f3233da3",
+          "official_cpp_gather_kernels": 0,
+          "rank_identity": {
+            "rank": 1,
+            "worker_pid": 699400,
+            "world_size": 2,
+            "physical_gpu": 4,
+            "vllm_version": "0.33.0+das.da8b48faa.dtk2610",
+            "scope": "Official topology suffix cross-checked with actual distributedInfo, startup PID and GPU kernel device."
+          }
+        },
+        {
+          "file": "profiler/m09r2n14_697216.async_llm.1794005042294478597.pt.trace.json.gz",
+          "sha256": "d3ef5a8c67b32b02e2cd3bc2181d322e3e1b73c3204cd7dd6e7ab7b8c9f042ae",
+          "official_cpp_gather_kernels": 0,
+          "rank_identity": null
+        }
+      ],
+      "official_cpp_gather_kernels": 0,
+      "lifecycle_markers": {
+        "EngineDeadError": 0,
+        "resource_tracker": 3,
+        "force-kill": 0,
+        "workers still running after grace period": 0
+      },
+      "clean_lifecycle": false,
+      "artifact_sha256": {
+        "result.json": "3115488fff2c0434c5f3affff38d7c5bc8f71a6f9ca27f32f6311d87ff6bfd4b",
+        "server.log": "1431ad035ac883dce50fe8b08d4ada05950f06b1d00c7160944fa3b8517b7103",
+        "hybrid-cache.json": "77548f8d30de19ce92c2bb1889ac35fb024be6022a70cc95e977ac5aca054d49",
+        "prefill-gather-policy.json": "8c1b91ca763eeac4827606b6d466c8e8561f6f4c301eeb29fd5bef9b60945d46",
+        "semantic-prefix-responses.json": "04bd394af581a0a060d7c4cec97ab3902bd61f465e46dda0e28c8eb09e543294",
+        "humaneval32/complete.json": "5c42fd178bb235825a9974d2dc979b9c0bd88b2730c9ace0d5845045a8ed829c",
+        "performance/result.json": "0c02ce7d78f6ffd97aef8d818b7af4bc4d6fcd181ae92b9897f08b34afacec6b",
+        "profile-request.json": "53cf835de9119354566d0d7a22e68da914878d4f7662ad4b6438e603ce0b1164"
+      },
+      "native_postrun_sha256": "fb888fe3c3eb4d7c99e2e803cd93810e57bc1e42ff4cb59154b891317eb4ed8e",
+      "accepted_tokens_per_position": {
+        "0": 10552.0,
+        "1": 10415.0,
+        "2": 10309.0
+      },
+      "model_command": [
+        "/data/models/vllm033-upgrade-20261103/.venv-v033-bounded-prefill-20261107/bin/vllm",
+        "serve",
+        "/model/Qwen3.5-35B-A3B",
+        "--host",
+        "127.0.0.1",
+        "--port",
+        "18782",
+        "--dtype",
+        "bfloat16",
+        "--attention-config",
+        "{\"backend\": \"FLASH_ATTN\"}",
+        "--kv-cache-dtype",
+        "auto",
+        "--max-model-len",
+        "8192",
+        "--max-num-batched-tokens",
+        "1024",
+        "--max-num-seqs",
+        "4",
+        "--gpu-memory-utilization",
+        "0.7",
+        "--enable-prefix-caching",
+        "--seed",
+        "0",
+        "--shutdown-timeout",
+        "30",
+        "--cudagraph-metrics",
+        "--tensor-parallel-size",
+        "2",
+        "--distributed-executor-backend",
+        "mp",
+        "--reasoning-parser",
+        "qwen3",
+        "--speculative-config",
+        "{\"method\": \"mtp\", \"num_speculative_tokens\": 3}",
+        "--profiler-config",
+        "{\"profiler\": \"torch\", \"torch_profiler_dir\": \"/data/models/vllm033-upgrade-20261103/evidence/qwen35-35b-bounded-prefill-performance-20261107-attempt2/flash-off/profiler\", \"torch_profiler_with_stack\": false}",
+        "--block-size",
+        "64",
+        "--prefix-match-unit",
+        "64",
+        "--enable-mamba-shared-prefix-checkpoint",
+        "--enable-prompt-tokens-details",
+        "--worker-extension-cls",
+        "bounded_gather_observer.BoundedGatherObserver",
+        "--language-model-only"
+      ],
+      "manager_page": 1088,
+      "semantic_prefix_requests": 14,
+      "concurrent_requests": 8,
+      "strict_timing_requests": 384,
+      "warmup_requests": 96,
+      "measured_requests": 288,
+      "returned_all_required_lengths": true,
+      "native_postrun": {
+        "status": "ALL_195_NATIVE_PROVIDER_FILES_BYTE_IDENTICAL",
+        "generated_utc": "2026-11-06T22:44:48.862735+00:00",
+        "label": "flash-off",
+        "baseline_sha256": "1c71a0e994600b6c01ce12de5e9284f739aca36d63bbdc333e8928032caf9f98",
+        "file_count": 195,
+        "scope": "Matches files whose actual mapped DSOs were checked before quality requests; loading is not dispatch proof."
+      }
+    },
+    "official-triton": {
+      "status": "COMPLETE",
+      "server_exit": 0,
+      "process_group_empty": true,
+      "port_closed": true,
+      "quality": {
+        "raw": {
+          "passed": 28,
+          "failed": [
+            "HumanEval/2",
+            "HumanEval/13",
+            "HumanEval/16",
+            "HumanEval/24"
+          ]
+        },
+        "normalized": {
+          "passed": 32,
+          "failed": []
+        }
+      },
+      "humaneval_finish_reasons": {
+        "stop": 32
+      },
+      "buckets": [
+        {
+          "output": 64,
+          "concurrency": 1,
+          "throughput_median": 87.87671854971029,
+          "throughput_rounds": [
+            88.61256939158388,
+            87.87671854971029,
+            86.09132485453598
+          ],
+          "ttft_ms": 449.314244906418,
+          "tpot_ms": 4.231676263439041
+        },
+        {
+          "output": 64,
+          "concurrency": 4,
+          "throughput_median": 179.76250059280125,
+          "throughput_rounds": [
+            224.34507754277615,
+            136.45578956362922,
+            179.76250059280125
+          ],
+          "ttft_ms": 674.5443328982219,
+          "tpot_ms": 12.2822725014495
+        },
+        {
+          "output": 64,
+          "concurrency": 16,
+          "throughput_median": 216.32008922446883,
+          "throughput_rounds": [
+            216.32008922446883,
+            222.29118405549286,
+            154.48602848027133
+          ],
+          "ttft_ms": 2680.950677487999,
+          "tpot_ms": 8.876093293702791
+        },
+        {
+          "output": 128,
+          "concurrency": 1,
+          "throughput_median": 128.12666446606494,
+          "throughput_rounds": [
+            128.02823503508026,
+            128.27469869660948,
+            128.12666446606494
+          ],
+          "ttft_ms": 451.7651814967394,
+          "tpot_ms": 4.201301610038623
+        },
+        {
+          "output": 128,
+          "concurrency": 4,
+          "throughput_median": 229.6816535209826,
+          "throughput_rounds": [
+            230.49471230657196,
+            229.6816535209826,
+            226.43235391116565
+          ],
+          "ttft_ms": 955.5175815476105,
+          "tpot_ms": 10.54773661839651
+        },
+        {
+          "output": 128,
+          "concurrency": 16,
+          "throughput_median": 246.2516807041325,
+          "throughput_rounds": [
+            246.34174936665593,
+            245.87098632824592,
+            246.2516807041325
+          ],
+          "ttft_ms": 4001.5155255096033,
+          "tpot_ms": 12.22117303679954
+        }
+      ],
+      "sampled_graph_dispatch_windows": {
+        "FULL": 6180,
+        "NONE": 674,
+        "PIECEWISE": 39
+      },
+      "speculative_metrics": {
+        "num_draft_tokens": 32454.0,
+        "num_accepted_tokens": 31137.0
+      },
+      "actual_worker_trace_ranks": [
+        0,
+        1
+      ],
+      "profile_traces": [
+        {
+          "file": "profiler/dp0_pp0_tp0_dcp0_ep0_rank0.1794006387412306180.pt.trace.json.gz",
+          "sha256": "aabec73084b48c304eaee2fc3f0313e54c62bb3c12f18496319f62a866142a0d",
+          "official_cpp_gather_kernels": 0,
+          "rank_identity": {
+            "rank": 0,
+            "worker_pid": 718163,
+            "world_size": 2,
+            "physical_gpu": 0,
+            "vllm_version": "0.33.0+das.da8b48faa.dtk2610",
+            "scope": "Official topology suffix cross-checked with actual distributedInfo, startup PID and GPU kernel device."
+          }
+        },
+        {
+          "file": "profiler/dp0_pp0_tp1_dcp0_ep1_rank1.1794006387420582749.pt.trace.json.gz",
+          "sha256": "7471ebd33abe4868d3f5f3ce7e17e430137ff59f49f3141b516ef263aa60bb25",
+          "official_cpp_gather_kernels": 0,
+          "rank_identity": {
+            "rank": 1,
+            "worker_pid": 718164,
+            "world_size": 2,
+            "physical_gpu": 4,
+            "vllm_version": "0.33.0+das.da8b48faa.dtk2610",
+            "scope": "Official topology suffix cross-checked with actual distributedInfo, startup PID and GPU kernel device."
+          }
+        },
+        {
+          "file": "profiler/m09r2n14_716698.async_llm.1794006387183040975.pt.trace.json.gz",
+          "sha256": "46a13524d3254fe938081068a306db9c53334d84826eea7c55e47216acbd02bc",
+          "official_cpp_gather_kernels": 0,
+          "rank_identity": null
+        }
+      ],
+      "official_cpp_gather_kernels": 0,
+      "lifecycle_markers": {
+        "EngineDeadError": 0,
+        "resource_tracker": 3,
+        "force-kill": 0,
+        "workers still running after grace period": 0
+      },
+      "clean_lifecycle": false,
+      "artifact_sha256": {
+        "result.json": "84e86b3c640e5183063ff20459b5ba95027fd7df6bb8ba14fa9e99bad706fe18",
+        "server.log": "836493eaf6774512ba01cc4470dc55381fed44335cee0deff018a2ab17f33075",
+        "hybrid-cache.json": "933c719681deef609ba1efe571ceb52914a47d3df4d302896f1a5a12a3f1d2d9",
+        "prefill-gather-policy.json": "9651699cea4cfaad6899dc66cabc94a9a094405baafe33397723096985941930",
+        "semantic-prefix-responses.json": "727949e7800f36d08f3dac72d984247deff76140f453aed01978036b013d1eb3",
+        "humaneval32/complete.json": "dafdeecd3b5edea75b7127ee75972f259d3098c06e973b7757d002085d54c2fd",
+        "performance/result.json": "51fde5d0b00d83d127c58803b0b18b3492d7b2a5b605ebddece251d9aa47986d",
+        "profile-request.json": "fe40b2dfcd919530eebc99e26ef9865c8f338c178e70016bf60f3e84b619f8d6"
+      },
+      "native_postrun_sha256": "36c8b6622545dcdd91bcb10e367d32578db4f437d2b5f4c4d83471928abca327",
+      "accepted_tokens_per_position": {
+        "0": 10547.0,
+        "1": 10358.0,
+        "2": 10232.0
+      },
+      "model_command": [
+        "/data/models/vllm033-upgrade-20261103/.venv-v033-bounded-prefill-20261107/bin/vllm",
+        "serve",
+        "/model/Qwen3.5-35B-A3B",
+        "--host",
+        "127.0.0.1",
+        "--port",
+        "18783",
+        "--dtype",
+        "bfloat16",
+        "--attention-config",
+        "{\"backend\": \"TRITON_ATTN\"}",
+        "--kv-cache-dtype",
+        "auto",
+        "--max-model-len",
+        "8192",
+        "--max-num-batched-tokens",
+        "1024",
+        "--max-num-seqs",
+        "4",
+        "--gpu-memory-utilization",
+        "0.7",
+        "--enable-prefix-caching",
+        "--seed",
+        "0",
+        "--shutdown-timeout",
+        "30",
+        "--cudagraph-metrics",
+        "--tensor-parallel-size",
+        "2",
+        "--distributed-executor-backend",
+        "mp",
+        "--reasoning-parser",
+        "qwen3",
+        "--speculative-config",
+        "{\"method\": \"mtp\", \"num_speculative_tokens\": 3}",
+        "--profiler-config",
+        "{\"profiler\": \"torch\", \"torch_profiler_dir\": \"/data/models/vllm033-upgrade-20261103/evidence/qwen35-35b-bounded-prefill-performance-20261107-attempt2/official-triton/profiler\", \"torch_profiler_with_stack\": false}",
+        "--block-size",
+        "64",
+        "--prefix-match-unit",
+        "64",
+        "--enable-mamba-shared-prefix-checkpoint",
+        "--enable-prompt-tokens-details",
+        "--worker-extension-cls",
+        "bounded_gather_observer.BoundedGatherObserver",
+        "--language-model-only"
+      ],
+      "manager_page": 1088,
+      "semantic_prefix_requests": 14,
+      "concurrent_requests": 8,
+      "strict_timing_requests": 384,
+      "warmup_requests": 96,
+      "measured_requests": 288,
+      "returned_all_required_lengths": true,
+      "native_postrun": {
+        "status": "ALL_195_NATIVE_PROVIDER_FILES_BYTE_IDENTICAL",
+        "generated_utc": "2026-11-06T23:07:15.084880+00:00",
+        "label": "official-triton",
+        "baseline_sha256": "1c71a0e994600b6c01ce12de5e9284f739aca36d63bbdc333e8928032caf9f98",
+        "file_count": 195,
+        "scope": "Matches files whose actual mapped DSOs were checked before quality requests; loading is not dispatch proof."
+      }
+    }
+  },
+  "source_ci_wall_overlap": {
+    "status": "SOURCE_CI_WALL_WINDOW_OVERLAP_RECORDED_NO_CPU_CAUSAL_ATTRIBUTION",
+    "generated_utc": "2026-11-06T22:42:23.137595+00:00",
+    "source_command": [
+      "/data/models/vllm033-upgrade-20261103/.venv-v033-merged-main-clean-20261107/bin/python",
+      "-I",
+      "/data/models/vllm033-upgrade-20261103/plugin-v033-compiler-exit-review/tools/run_v033_ci.py",
+      "--tier",
+      "source",
+      "--junit",
+      "/data/models/vllm033-upgrade-20261103/evidence/v033-ci-child-environment-review-20261107/source.xml"
+    ],
+    "source_elapsed_s": 31.70672270306386,
+    "source_result_sha256": "601bf20849a10c5f05b3991f79d384153d324a2edb4bfb087aaa53e56cf1b8fd",
+    "source_wall_window_estimate_utc": [
+      "2026-11-06T22:39:08.445083+00:00",
+      "2026-11-06T22:39:40.151805+00:00"
+    ],
+    "overlaps": [
+      {
+        "output": 64,
+        "concurrency": 1,
+        "phase": "warmup",
+        "round": 0,
+        "wall_window_overlap_estimate_s": 14.196032047271729
+      },
+      {
+        "output": 64,
+        "concurrency": 1,
+        "phase": "measure",
+        "round": 0,
+        "wall_window_overlap_estimate_s": 0.5367813110351562
+      }
+    ],
+    "scope": "Wall bounds reconstructed from unchanged elapsed time and terminal receipt mtime; does not prove instantaneous CPU activity or timing impact.",
+    "decision": "Retain every original warmup and measured round. Do not claim exclusive-host or fully isolated OFF64/C1 speedup; review this bucket and require matched independent repeat before strong performance acceptance for it.",
+    "other_arms_not_restarted": true,
+    "metrics_or_thresholds_changed": false,
+    "samples_dropped_or_retried": false
+  },
+  "source_ci_wall_overlap_sha256": "14c259ebe40b819b003a797bf8c4aa35ceab5d36d314be3adb6a7fdd376afb35",
+  "decisions": {
+    "quality": "Original frozen protocol: normalized32/32 all arms; retain raw29/28/28 and failed tasks.",
+    "dispatch": "Actual two-rank post-timing traces: official C++ gather in ON, zero OFF/Triton.",
+    "performance": "HOLD: ON regresses at both C16 buckets versus OFF and Triton; some C4 rounds vary substantially and output token streams differ. OFF64/C1 also has a recorded CPU wall overlap. No universal speedup or exclusive-host acceptance.",
+    "lifecycle": "HOLD: all APIs exit0 and owned groups/ports/GPUs released, but each logs a leaked shared_memory warning.",
+    "default": "Keep optional gather default OFF and official Triton default. No production change from this receipt."
+  },
+  "limitations": [
+    "Total35B, not active-parameter count: no under7B score waiver. Retain raw and normalized32 original task results.",
+    "Same physicalGPU0/4 TP2 sequential arms, defaultcombo/autoGraph,maxseq4,batch1024. C16 queues behind maxseq4; not saturation.",
+    "Three measured warm rounds per bucket within one server per arm; no independent restarted-server replicate or cold-start latency claim.",
+    "Fresh TCP per POST with traced16created/0reused per round and no retries; not comparable to failed pooled attempt or4B transports.",
+    "Post-timing profiler proves the sampled route only; its latency is excluded from throughput.",
+    "Native195 postrun identities bind previously observed quality-worker providers, not a new snapshot of every performance-worker/system DSO.",
+    "Sampled Graph windows are not exhaustive per-request dispatch coverage; lifecycle and other models/topologies remain separate gates.",
+    "Fresh requests use matched bodies, but returned token streams are equal in only251/384 ON-vs-OFF and248/384 ON-vs-Triton; these are not token-identical workloads or a pure gather-kernel causal estimate.",
+    "OFF64/C1 original measurement round0 wall-window overlap estimate0.536781311 seconds retained without retry/drop; do not claim fully isolated speedup.",
+    "Observed C16 regression and broad round variation require further profiling/matched repeats; prior4B improvements do not establish full35B speedup."
+  ]
+}
