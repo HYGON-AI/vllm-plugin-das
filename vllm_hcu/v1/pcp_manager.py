@@ -242,12 +242,57 @@ class HcuPCPManager:
 
         return segment(pcp_rank), segment(chunk_count - 1 - pcp_rank)
 
-    def get_num_tokens_for_dispatch(
-        self,
+    @staticmethod
+    def _split_prefill_rows_from_metadata(
         num_scheduled_tokens: np.ndarray,
         is_prefilling: np.ndarray,
+        num_draft_tokens_per_req: np.ndarray | None = None,
+        cu_num_logits_np: np.ndarray | None = None,
+    ) -> np.ndarray:
+        """Return the prefill rows that PCP must split across ranks.
+
+        A scheduler-padded verification row is still marked as prefill by
+        MRV2, but it has the same complete token/logit shape as a decode row.
+        Partitioning replicates such a row on every rank, so dispatch must use
+        the same classification when it computes the runner padding.
+        """
+        split = np.asarray(is_prefilling, dtype=np.bool_).copy()
+        if num_draft_tokens_per_req is None or cu_num_logits_np is None:
+            return split
+        drafts = np.asarray(num_draft_tokens_per_req)
+        logits = np.diff(np.asarray(cu_num_logits_np))
+        padded_verify = (
+            (drafts > 0)
+            & (logits == drafts + 1)
+            & (np.asarray(num_scheduled_tokens) == logits)
+        )
+        return split & ~padded_verify
+
+    def get_num_tokens_for_dispatch(
+        self,
+        num_scheduled_tokens: np.ndarray | InputBatch,
+        is_prefilling: np.ndarray | None = None,
+        *,
+        num_draft_tokens_per_req: np.ndarray | None = None,
+        cu_num_logits_np: np.ndarray | None = None,
     ) -> int:
         """Return the largest real rank-local batch before runner padding."""
+
+        if isinstance(num_scheduled_tokens, InputBatch):
+            input_batch = num_scheduled_tokens
+            num_scheduled_tokens = input_batch.num_scheduled_tokens
+            is_prefilling = input_batch.is_prefilling_np
+            num_draft_tokens_per_req = input_batch.num_draft_tokens_per_req
+            cu_num_logits_np = input_batch.cu_num_logits_np
+        if is_prefilling is None:
+            raise TypeError("is_prefilling is required for array dispatch inputs")
+
+        split_prefill = self._split_prefill_rows_from_metadata(
+            num_scheduled_tokens,
+            is_prefilling,
+            num_draft_tokens_per_req,
+            cu_num_logits_np,
+        )
 
         if self._use_mla:
             # MLA/EP collectives require each request to contribute the same
@@ -257,7 +302,7 @@ class HcuPCPManager:
             # have different widest ranks.
             num_tokens = 0
             for length_value, is_prefill_value in zip(
-                num_scheduled_tokens, is_prefilling
+                num_scheduled_tokens, split_prefill
             ):
                 length = int(length_value)
                 if not bool(is_prefill_value):
@@ -280,7 +325,7 @@ class HcuPCPManager:
         for rank in range(self.pcp_size):
             local_tokens = 0
             for length_value, is_prefill_value in zip(
-                num_scheduled_tokens, is_prefilling
+                num_scheduled_tokens, split_prefill
             ):
                 length = int(length_value)
                 if bool(is_prefill_value):
@@ -347,21 +392,12 @@ class HcuPCPManager:
 
     @staticmethod
     def _split_prefill_rows(input_batch: InputBatch) -> np.ndarray:
-        split = input_batch.is_prefilling_np.copy()
-        drafts = input_batch.num_draft_tokens_per_req
-        if drafts is not None:
-            # The scheduler may pad a one-token admission to a full verify
-            # row even while MRV2's prompt-progress flag still says prefill.
-            # Replicate that complete row, including all logits and draft
-            # positions, exactly as for existing decode requests.
-            logits = np.diff(input_batch.cu_num_logits_np)
-            padded_verify = (
-                (drafts > 0)
-                & (logits == drafts + 1)
-                & (input_batch.num_scheduled_tokens == logits)
-            )
-            split &= ~padded_verify
-        return split
+        return HcuPCPManager._split_prefill_rows_from_metadata(
+            input_batch.num_scheduled_tokens,
+            input_batch.is_prefilling_np,
+            input_batch.num_draft_tokens_per_req,
+            input_batch.cu_num_logits_np,
+        )
 
     def _segments_for_rank(
         self,

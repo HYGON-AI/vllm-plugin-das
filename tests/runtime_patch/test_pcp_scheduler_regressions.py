@@ -99,7 +99,7 @@ def _scheduler(running, waiting=(), *, spec_tokens=0, policy=SchedulingPolicy.FC
 
 
 @pytest.mark.parametrize("spec_tokens", [1, 5, 7])
-@pytest.mark.parametrize("pcp_size", [2, 8])
+@pytest.mark.parametrize("pcp_size", [2, 4, 8])
 def test_scheduler_single_token_prompt_partitions_on_all_pcp_ranks(spec_tokens, pcp_size):
     decode = _request("decode", total=80, computed=79)
     width = spec_tokens + 1
@@ -143,7 +143,12 @@ def test_scheduler_single_token_prompt_partitions_on_all_pcp_ranks(spec_tokens, 
     batch.cu_num_logits = torch.from_numpy(batch.cu_num_logits_np.copy())
     batch.logits_indices = torch.arange(int(batch.cu_num_logits_np[-1]))
     managers, groups = _make_managers(pcp_size, block_tables=_InMemoryBlockTables())
-    local = [m.partition_batch(batch) for m in managers]
+    dispatch_padding = managers[0].get_num_tokens_for_dispatch(batch)
+    assert dispatch_padding == 2 * width
+    local = [
+        m.partition_batch(batch, padded_num_tokens=dispatch_padding)
+        for m in managers
+    ]
     for manager, item in zip(managers, local):
         assert item.num_scheduled_tokens.tolist() == [width, width]
         assert item.cu_num_logits_np.tolist() == [0, width, 2 * width]
