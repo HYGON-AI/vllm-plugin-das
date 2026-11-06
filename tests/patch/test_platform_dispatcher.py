@@ -372,6 +372,11 @@ def test_platform_publishes_worker_and_platform_replacements_in_one_batch(
     )
     monkeypatch.setattr(
         platform_dispatcher,
+        "register_locateanything_api_callbacks",
+        after_batch("locateanything-api"),
+    )
+    monkeypatch.setattr(
+        platform_dispatcher,
         "register_runtime_method_callbacks",
         after_batch("runtime"),
     )
@@ -389,6 +394,7 @@ def test_platform_publishes_worker_and_platform_replacements_in_one_batch(
         "platform-exchanges",
         "batch-exit",
         "platform-core",
+        "locateanything-api",
         "tokenizer",
         "runtime",
         "platform-framework",
@@ -414,9 +420,9 @@ def test_apply_platform_patches_is_idempotent_narrow_and_reported():
     assert result.returncode == 0, result.stderr
     payload = json.loads(result.stdout.strip().splitlines()[-1])
     assert payload == {
-        "count": 68,
+        "count": 71,
         "replacements": 20,
-        "callbacks": 48,
+        "callbacks": 51,
         "failed": [],
         "builtins_same": True,
         "role": "Main",

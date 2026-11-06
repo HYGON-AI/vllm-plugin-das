@@ -633,6 +633,14 @@ class HCUPlatform(Platform):
         IMPORT_COORDINATOR.drain_ready_callbacks()
         feature_config = validate_and_update_hcu_config(vllm_config)
 
+        model_config = getattr(vllm_config, "model_config", None)
+        hf_config = getattr(model_config, "hf_config", None)
+        if getattr(hf_config, "model_type", None) == "locateanything":
+            # InputProcessingContext receives ModelConfig without LoadConfig.
+            model_config._vllm_hcu_locateanything_cache_dir = (
+                vllm_config.load_config.download_dir
+            )
+
         # Use vLLM's public qualified-class configuration hook for the HCU
         # executor. Scheduling remains fully owned by upstream vLLM.
         from vllm_hcu.patch.platform.framework_opt.patch_multiproc_executor import (

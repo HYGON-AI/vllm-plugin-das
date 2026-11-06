@@ -197,6 +197,8 @@ setup(
     python_requires=">=3.10",
     packages=find_namespace_packages(include=["vllm_hcu", "vllm_hcu.*"]),
     package_data={
+        "vllm_hcu.models.locateanything": ["*.jinja"],
+        "vllm_hcu.v1.locateanything": ["source_contract.json"],
         "vllm_hcu": [
             "*.so",
             "so/*.so",
