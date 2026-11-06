@@ -65,6 +65,35 @@ and none in OFF. Profiler latency is excluded from the table. Actual worker
 target/draft frozen policies and both compile hash factors are inspected;
 FULL and PIECEWISE log windows are sampled evidence, not exhaustive coverage.
 
+## Full35B TP2 quality follow-up
+
+The separate [35B quality receipt](../../validation/v0.33.0/bounded-prefill-35b-quality-gfx936-candidate.json)
+binds full `/model/Qwen3.5-35B-A3B` (total35B, no under7B waiver) to the same
+15-file runtime. Three disjoint TP2 arms use BF16 weights, MTP3, default combo
+and automatic Graph planning, maxseq4, batch1024, maxlen8192 and the `qwen3`
+reasoning parser. Each completes two four-request waves,14 semantic prefix
+requests and the original isolated HumanEval32; all32 finish with stop.
+
+| Arm | KV dtype | Raw HumanEval | Existing normalized HumanEval | Manager page | Prefix hits |
+| --- | --- | --- | --- | --- | --- |
+| Flash flag ON | BF16 | 30/32 | 32/32 | 1088 | 1152,2240 |
+| Official Triton | BF16 | 29/32 | 32/32 | 1088 | 1152,2240 |
+| Flash flag ON, gather bypass | E5M2 | 30/32 | 32/32 | 2176 | 2240,4416 |
+
+Both actual workers' source identities and frozen normal/AOT policies are
+checked; all three MTP positions have accepted tokens. Independent review
+rechecks full checkpoint bytes, Core3656/Adapter213/Plugin15 payload files and
+original request/scoring artifacts. A supplemental pre-request live-worker
+snapshot binds actual mapped Flash/Lightop DSO bytes;195 provider files match
+after execution. This is limited to those provider files, not every system DSO.
+
+All APIs exit0 and release owned groups/ports/GPUs, but each logs one leaked
+shared-memory object. Clean lifecycle remains open. These parallel runs on
+different cards prove scoped functional/quality behavior; same-card35B
+ON/OFF/Triton performance is a separate run in progress. Frozen ON policy is
+not proof of actual35B gather kernels; its post-timing profile remains pending.
+E5M2 retains the existing path and does not execute this BF16/FP16 gather.
+
 ## Operational limits and reproduction
 
 All three APIs exit0, owned process groups are empty and ports closed. Any
@@ -87,5 +116,5 @@ The four new cases are `test_bounded_prefill_gather_ragged_writer_reader_graph`.
 Enable with `VLLM_HCU_FLASH_PREFILL_GATHER=1`; unset or set0 and restart for
 rollback. It is independent of RMSNorm and requires the existing Flash
 extension/provider. No FP8 gather, DCP or additional-architecture support is
-implied. Full35B TP2 BF16/E5M2 quality and the remaining migration feature
-matrix stay separate and open.
+implied. The scoped35B quality follow-up above does not close its lifecycle,
+performance or remaining migration feature gates.

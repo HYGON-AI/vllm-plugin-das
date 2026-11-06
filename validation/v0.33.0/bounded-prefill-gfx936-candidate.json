@@ -585,7 +585,7 @@
     "OFF reuses hashed terminal-ON Triton compiler kernels only; ordinary/AOT caches are fresh. No cold-start comparison.",
     "Original failed test invocations retained locally: missing explicit Core test path and absent pending-MR CI runner.",
     "Leaked semaphore warnings retained; exit0 and released resources do not prove clean lifecycle.",
-    "No cross-model, FP8 gather, DCP, additional architecture or complete migration acceptance.35B TP2 quality separately in progress.",
+    "No cross-model, FP8 gather, DCP, additional architecture or complete migration acceptance.35B TP2 quality independently reviewed separately; shared-memory lifecycle warnings remain and matched performance is in progress.",
     "Official Triton remains the official default; this opt-in composition does not replace its selection."
   ],
   "last_good": false,
@@ -609,5 +609,6 @@
     "test_file_sha256": "8f874d1bebb325f7ee56505a5dd1ddf9bb7802eab45d0627f6d2a93736f676b0",
     "model_and_device_results_reused_by_byte_identity": true,
     "reviewer_approval_implied": false
-  }
+  },
+  "related35b_quality_report": "bounded-prefill-35b-quality-gfx936-candidate.json"
 }
