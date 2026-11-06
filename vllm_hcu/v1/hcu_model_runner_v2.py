@@ -25,7 +25,11 @@ from vllm_hcu.forward_context_runtime import (
     set_deepep_auto_request_phase,
 )
 from vllm_hcu.patch.config import get_hcu_config
-from vllm_hcu.v1.pcp_manager import make_hcu_pcp_manager_cls
+from vllm_hcu.v1.pcp_manager import (
+    make_hcu_pcp_manager_cls,
+    pcp_dispatch_metadata_scope,
+    set_pcp_dispatch_metadata,
+)
 from vllm_hcu.patch.platform.core_fix.patch_vllm_config import is_glm53_pcp
 from vllm_hcu.deepseek_v4_runtime import is_deepseek_v4, is_dspark_enabled
 
@@ -530,7 +534,12 @@ class HcuGPUModelRunnerV2(GPUModelRunner):
             scope = glm53_pcp_step_scope()
             if kwargs.get("dummy_run", False) and is_glm53_pcp(self.vllm_config):
                 dummy_scope = replicated_mtp_batch_scope()
-        with deepep_auto_request_phase_scope(), scope, dummy_scope:
+        with (
+            pcp_dispatch_metadata_scope(),
+            deepep_auto_request_phase_scope(),
+            scope,
+            dummy_scope,
+        ):
             dummy_phase = _DEEPEP_AUTO_DUMMY_PHASE.get()
             if (
                 dummy_phase is not None
@@ -699,6 +708,12 @@ class HcuGPUModelRunnerV2(GPUModelRunner):
 
     def gather_batch_req_state(self, scheduler_output, dummy_run=False):
         result = super().gather_batch_req_state(scheduler_output, dummy_run)
+        if self.pcp_manager is not None and is_deepseek_v4(self.vllm_config):
+            set_pcp_dispatch_metadata(
+                result[0],
+                scheduler_output,
+                self.model_state.num_new_sampled_tokens_per_step,
+            )
         if _uses_global_pcp_batch(self.vllm_config) and is_dspark_enabled(self.vllm_config):
             state = result[0]
             # Dispatch precedes partition_batch(): use request-level global

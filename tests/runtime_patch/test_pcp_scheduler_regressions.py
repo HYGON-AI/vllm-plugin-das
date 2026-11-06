@@ -123,6 +123,17 @@ def test_scheduler_single_token_prompt_partitions_on_all_pcp_ranks(spec_tokens, 
     assert gathered.req_ids == ["decode", "new"]
     assert gathered.is_prefilling_np.tolist() == [False, True]
     assert uniform is None
+    from tests.runtime_patch.test_pcp_pre_dispatch import dispatch_before_prepare
+    managers, groups = _make_managers(pcp_size, block_tables=_InMemoryBlockTables())
+    runner.pcp_manager = managers[0]
+    dispatch_padding, actual_state, actual_uniform = dispatch_before_prepare(runner, output)
+    assert dispatch_padding == 2 * width
+    assert actual_state.is_prefilling_np.tolist() == [False, True]
+    assert actual_uniform is None
+    # The execute scope must not leak metadata to later two-array calls.
+    assert managers[0].get_num_tokens_for_dispatch(
+        actual_state.num_scheduled_tokens, actual_state.is_prefilling_np
+    ) < dispatch_padding
     requests = []
     offset = 0
     for index, req_id in enumerate(gathered.req_ids):
@@ -142,8 +153,7 @@ def test_scheduler_single_token_prompt_partitions_on_all_pcp_ranks(spec_tokens, 
     batch.cu_num_logits_np = np.concatenate(([0], np.cumsum(batch.num_draft_tokens_per_req + 1))).astype(np.int32)
     batch.cu_num_logits = torch.from_numpy(batch.cu_num_logits_np.copy())
     batch.logits_indices = torch.arange(int(batch.cu_num_logits_np[-1]))
-    managers, groups = _make_managers(pcp_size, block_tables=_InMemoryBlockTables())
-    dispatch_padding = managers[0].get_num_tokens_for_dispatch(batch)
+    assert managers[0].get_num_tokens_for_dispatch(batch) == dispatch_padding
     assert dispatch_padding == 2 * width
     local = [
         m.partition_batch(batch, padded_num_tokens=dispatch_padding)

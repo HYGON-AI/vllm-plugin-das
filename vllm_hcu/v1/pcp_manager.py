@@ -9,6 +9,8 @@ GQA FlashAttention plan from upstream PR #49564 to the HCU v0.25.1 sidecar.
 
 from __future__ import annotations
 
+from contextlib import contextmanager
+from contextvars import ContextVar
 from dataclasses import dataclass, replace
 from typing import NamedTuple
 
@@ -23,6 +25,33 @@ from vllm_hcu.patch.platform.core_fix.patch_vllm_config import (
     _validate_hcu_pcp_scope,
     is_glm53_pcp,
 )
+
+
+_DISPATCH_METADATA = ContextVar("hcu_pcp_dispatch_metadata", default=None)
+
+
+@contextmanager
+def pcp_dispatch_metadata_scope():
+    """Keep pre-dispatch metadata local to one runner execution."""
+    token = _DISPATCH_METADATA.set(None)
+    try:
+        yield
+    finally:
+        _DISPATCH_METADATA.reset(token)
+
+
+def set_pcp_dispatch_metadata(batch_req_state, scheduler_output, num_bonus_tokens):
+    """Mirror prepare_inputs' logit widths in the actual gathered request order."""
+    if batch_req_state is None:
+        return
+    drafts = np.fromiter(
+        (len(scheduler_output.scheduled_spec_decode_tokens.get(req_id, ()))
+         for req_id in batch_req_state.req_ids),
+        dtype=np.int32,
+        count=len(batch_req_state.req_ids),
+    )
+    cu_logits = np.concatenate(([0], np.cumsum(drafts + num_bonus_tokens)))
+    _DISPATCH_METADATA.set((batch_req_state.num_scheduled_tokens, drafts, cu_logits))
 
 
 @dataclass(frozen=True)
@@ -286,6 +315,17 @@ class HcuPCPManager:
             cu_num_logits_np = input_batch.cu_num_logits_np
         if is_prefilling is None:
             raise TypeError("is_prefilling is required for array dispatch inputs")
+
+        # The upstream two-array call uses this exact gathered token array.
+        # Do not apply another batch's metadata or override explicit metadata.
+        metadata = _DISPATCH_METADATA.get()
+        if (
+            metadata is not None
+            and metadata[0] is num_scheduled_tokens
+            and num_draft_tokens_per_req is None
+            and cu_num_logits_np is None
+        ):
+            _, num_draft_tokens_per_req, cu_num_logits_np = metadata
 
         split_prefill = self._split_prefill_rows_from_metadata(
             num_scheduled_tokens,

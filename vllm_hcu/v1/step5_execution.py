@@ -63,7 +63,8 @@ def execute_model(
         num_toks = batch_req_state.num_tokens
         if self.pcp_manager is not None:
             num_toks = self.pcp_manager.get_num_tokens_for_dispatch(
-                batch_req_state
+                batch_req_state.num_scheduled_tokens,
+                batch_req_state.is_prefilling_np,
             )
 
     num_active_loras = 0
