@@ -17,7 +17,21 @@ REPOSITORY = Path(__file__).resolve().parents[1]
 if str(REPOSITORY) not in sys.path:
     sys.path.insert(0, str(REPOSITORY))
 
-from tools.check_patch_test_coverage import audit_repository
+
+def _load_repository_tool(name: str):
+    """Load a plugin tool without colliding with vLLM's ``tools`` package."""
+
+    path = REPOSITORY / "tools" / f"{name}.py"
+    spec = importlib.util.spec_from_file_location(f"plugin_tools_{name}", path)
+    if spec is None or spec.loader is None:
+        raise ImportError(f"cannot load plugin tool: {path}")
+    module = importlib.util.module_from_spec(spec)
+    sys.modules[spec.name] = module
+    spec.loader.exec_module(module)
+    return module
+
+
+audit_repository = _load_repository_tool("check_patch_test_coverage").audit_repository
 
 
 INVENTORY_TESTS = (
