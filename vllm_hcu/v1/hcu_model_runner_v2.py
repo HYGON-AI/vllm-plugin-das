@@ -722,7 +722,9 @@ class HcuGPUModelRunnerV2(GPUModelRunner):
 
     def gather_batch_req_state(self, scheduler_output, dummy_run=False):
         result = super().gather_batch_req_state(scheduler_output, dummy_run)
-        if self.pcp_manager is not None and is_deepseek_v4(self.vllm_config):
+        if self.pcp_manager is not None:
+            # Every PCP model can replicate scheduler-padded speculative rows.
+            # Dispatch must use the same token/logit widths as partition_batch.
             set_pcp_dispatch_metadata(
                 result[0],
                 scheduler_output,
