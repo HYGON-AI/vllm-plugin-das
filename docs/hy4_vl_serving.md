@@ -7,6 +7,10 @@ image, after installing plugin dependencies and building its native extension
 serving commands; video, encoder-only mode and speculative decoding are
 unsupported.
 
+Vision tower/connector LoRA (`enable_tower_connector_lora=True`) is rejected
+before model allocation because the multimodal LoRA token-count interfaces
+are not implemented. This restriction does not disable language-only LoRA.
+
 ## Server
 
 The [sparse-index order fix](hy4_vl_validation.md#precision-fixes) resolves the
@@ -125,6 +129,8 @@ Use a new output directory for each mode/run. For an independent comparison,
 restart the server immediately before each measured client; do not run the
 smoke, performance and accuracy commands as one implicit warmup sequence. This
 starts with an empty encoder cache without enabling diagnostic reset RPCs.
+`--samples` must be at least 8 for the four two-image pairs; smaller values
+are rejected before data loading or warmup requests.
 
 ```bash
 python tools/hyv4_vl_perf.py \

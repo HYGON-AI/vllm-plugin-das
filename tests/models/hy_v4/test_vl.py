@@ -96,6 +96,122 @@ def test_encoder_only_is_rejected_before_backbone_allocation(monkeypatch):
         HYV4VLForConditionalGeneration(vllm_config=config)
 
 
+@pytest.mark.parametrize("tower_lora", [True, False, None])
+def test_tower_lora_is_rejected_but_language_lora_reaches_backbone(
+    monkeypatch, tower_lora
+):
+    from vllm_hcu.models.hy_v4.model import HYV4ForCausalLM
+
+    class BackboneReached(Exception):
+        pass
+
+    def backbone(*args, **kwargs):
+        raise BackboneReached
+
+    monkeypatch.setattr(HYV4ForCausalLM, "__init__", backbone)
+    config = SimpleNamespace(
+        lora_config=None
+        if tower_lora is None
+        else SimpleNamespace(enable_tower_connector_lora=tower_lora),
+        speculative_config=None,
+        model_config=SimpleNamespace(
+            multimodal_config=None,
+            hf_config=SimpleNamespace(
+                vision_config=SimpleNamespace(projector_type="rmsnorm_mlp_adapter")
+            ),
+        ),
+    )
+    if tower_lora:
+        with pytest.raises(ValueError, match="vision tower/connector LoRA"):
+            HYV4VLForConditionalGeneration(vllm_config=config)
+    else:
+        with pytest.raises(BackboneReached):
+            HYV4VLForConditionalGeneration(vllm_config=config)
+
+
+@pytest.mark.parametrize("samples", [1, 4, 7])
+def test_perf_rejects_small_samples_before_io_or_warmup(
+    monkeypatch, tmp_path, capsys, samples
+):
+    from tools import hyv4_vl_perf
+
+    monkeypatch.setattr(
+        "sys.argv",
+        [
+            "hyv4_vl_perf",
+            "--data-dir",
+            str(tmp_path / "missing"),
+            "--output-dir",
+            str(tmp_path / "output"),
+            "--samples",
+            str(samples),
+        ],
+    )
+
+    def unexpected(*args, **kwargs):
+        pytest.fail("invalid sample count must fail before data loading or HTTP")
+
+    monkeypatch.setattr(hyv4_vl_perf.pq, "read_table", unexpected)
+    monkeypatch.setattr(hyv4_vl_perf, "request", unexpected)
+    with pytest.raises(SystemExit) as error:
+        hyv4_vl_perf.main()
+    assert error.value.code == 2
+    assert "--samples must be at least 8" in capsys.readouterr().err
+    assert not (tmp_path / "output").exists()
+
+
+def test_perf_eight_samples_completes_all_suites(monkeypatch, tmp_path):
+    import io
+    import json
+
+    from PIL import Image
+
+    from tools import hyv4_vl_perf
+
+    buffer = io.BytesIO()
+    Image.new("RGB", (2, 2)).save(buffer, format="PNG")
+    rows = [
+        {"image": {"bytes": buffer.getvalue()}, "question": "Q?", "answer": "A"}
+    ] * 8
+    (tmp_path / "test-0.parquet").touch()
+    monkeypatch.setattr(
+        hyv4_vl_perf.pq, "read_table", lambda p: SimpleNamespace(to_pylist=lambda: rows)
+    )
+    monkeypatch.setattr(
+        "sys.argv",
+        [
+            "hyv4_vl_perf",
+            "--data-dir",
+            str(tmp_path),
+            "--output-dir",
+            str(tmp_path / "output"),
+            "--samples",
+            "8",
+            "--rounds",
+            "1",
+        ],
+    )
+    calls = []
+
+    def request(body, url):
+        calls.append(body)
+        return {
+            "ttft_seconds": 1.0,
+            "latency_seconds": 2.0,
+            "content_chunk_interval_seconds": None,
+            "usage": {"completion_tokens": 2},
+        }
+
+    monkeypatch.setattr(hyv4_vl_perf, "request", request)
+    hyv4_vl_perf.main()
+    expected = {"qa_c1": 8, "qa_c2": 8, "caption32_c1": 4, "two_images32_c1": 4}
+    for suite, count in expected.items():
+        results = json.loads((tmp_path / "output" / f"{suite}.json").read_text())
+        assert len(results) == count
+    assert len(calls) == 26  # two warmups plus all measured requests
+    assert sum(len(b["messages"][0]["content"]) == 3 for b in calls) == 4
+
+
 @pytest.mark.parametrize(
     "deltas,completion_tokens,expected_interval",
     [

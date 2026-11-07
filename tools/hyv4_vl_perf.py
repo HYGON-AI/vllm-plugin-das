@@ -85,6 +85,8 @@ def main():
     parser.add_argument("--samples", type=int, default=32)
     parser.add_argument("--rounds", type=int, default=2)
     args = parser.parse_args()
+    if args.samples < 8:
+        parser.error("--samples must be at least 8 for the two-image suite")
     args.output_dir.mkdir(parents=True, exist_ok=True)
     rows = [
         row

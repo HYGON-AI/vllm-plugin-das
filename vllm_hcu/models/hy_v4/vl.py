@@ -281,6 +281,12 @@ class HYV4VLForConditionalGeneration(
         mm_config = vllm_config.model_config.multimodal_config
         if mm_config is not None and mm_config.mm_encoder_only:
             raise ValueError("HYV4VL encoder-only mode is not implemented")
+        lora_config = vllm_config.lora_config
+        if lora_config is not None and lora_config.enable_tower_connector_lora:
+            raise ValueError(
+                "HYV4VL vision tower/connector LoRA is not implemented; "
+                "disable enable_tower_connector_lora to use language-only LoRA"
+            )
         vision = vllm_config.model_config.hf_config.vision_config
         if (
             getattr(vision, "projector_type", None) != "rmsnorm_mlp_adapter"

@@ -99,6 +99,24 @@ register_hcu_ci(
 
 register_hcu_ci(
     job="hy4-contract",
+    target="tests/models/hy_v4/test_mrope.py",
+    est_time=60,
+)
+
+register_hcu_ci(
+    job="hy4-contract",
+    target="tests/models/hy_v4/test_sparse_indices.py",
+    est_time=60,
+)
+
+register_hcu_ci(
+    job="hy4-contract",
+    target="tests/models/hy_v4/test_vl.py",
+    est_time=60,
+)
+
+register_hcu_ci(
+    job="hy4-contract",
     target="tests/models/hy_v4/test_mtp_config.py",
     est_time=60,
 )
