@@ -37,6 +37,9 @@ REVIEWED_SOURCES = (
         (
             "88f8e6d38c898e68992d42e986a07bc7bd3277915224566399d00e93780abb78",
             "bdc143884da197f298dd2ba15c34427bda111ba12f8377e26752a03631f2a689",
+            # step5.8454f1e.20261012: identical code to 88f8e6d3 plus two
+            # trailing comments captured by inspect.getsource().
+            "dcabfd6fe030337921106b7d409d26d44db3b152458c341b062c1c92c4a82e50",
         ),
     ),
 )
