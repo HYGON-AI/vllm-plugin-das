@@ -153,9 +153,17 @@ def _prepare_attn(
         getattr(input_batch, "_vllm_hcu_pcp_replicated_slot_indices", None),
     )
     global_tables, global_slots = manager.prepare_global_attn()
+    global_batch = batch.global_batch
+    from vllm.config.compilation import CUDAGraphMode
+    if replicate_all and cudagraph_mode == CUDAGraphMode.FULL:
+        from vllm_hcu.v1.deepseek_v4_pcp_graph import prepare_decode_graph_metadata
+
+        global_batch, global_slots = prepare_decode_graph_metadata(
+            manager, global_batch,
+        )
     with replicated_mtp_batch_scope(), logical_pcp_metadata_scope(1):
         global_metadata = original(
-            batch.global_batch, cudagraph_mode, global_tables, global_slots,
+            global_batch, cudagraph_mode, global_tables, global_slots,
             global_groups, kv_cache_config, for_capture, ubatch_idx,
         )
     _attach_pcp_cache_ownership(global_metadata, False)

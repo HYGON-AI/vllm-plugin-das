@@ -25,13 +25,17 @@ from vllm_hcu.forward_context_runtime import (
     set_deepep_auto_request_phase,
 )
 from vllm_hcu.patch.config import get_hcu_config
-from vllm_hcu.v1.pcp_manager import make_hcu_pcp_manager_cls
+from vllm_hcu.v1.pcp_manager import (
+    make_hcu_pcp_manager_cls,
+    pcp_dispatch_metadata_scope,
+    set_pcp_dispatch_metadata,
+)
 from vllm_hcu.v1.glm53_pcp_mtp_sync import (
     install_glm53_pcp_mtp_sync,
     sync_glm53_pcp_sampler_output,
 )
 from vllm_hcu.patch.platform.core_fix.patch_vllm_config import is_glm53_pcp
-from vllm_hcu.deepseek_v4_runtime import is_deepseek_v4
+from vllm_hcu.deepseek_v4_runtime import is_deepseek_v4, is_dspark_enabled
 
 
 def _uses_global_pcp_batch(vllm_config) -> bool:
@@ -365,6 +369,11 @@ class HcuGPUModelRunnerV2(GPUModelRunner):
             raise RuntimeError(
                 "official MRV2 did not initialize the selected HCU PCP manager"
             )
+        if (_uses_global_pcp_batch(self.vllm_config)
+                and is_dspark_enabled(self.vllm_config)):
+            from vllm_hcu.v1.deepseek_v4_pcp_graph import install_decode_dispatch
+
+            install_decode_dispatch(self)
         self._init_host_seq_lens()
         if not is_profiling:
             install_glm53_pcp_mtp_sync(self)
@@ -539,7 +548,12 @@ class HcuGPUModelRunnerV2(GPUModelRunner):
             scope = glm53_pcp_step_scope()
             if kwargs.get("dummy_run", False) and is_glm53_pcp(self.vllm_config):
                 dummy_scope = replicated_mtp_batch_scope()
-        with deepep_auto_request_phase_scope(), scope, dummy_scope:
+        with (
+            pcp_dispatch_metadata_scope(),
+            deepep_auto_request_phase_scope(),
+            scope,
+            dummy_scope,
+        ):
             dummy_phase = _DEEPEP_AUTO_DUMMY_PHASE.get()
             if (
                 dummy_phase is not None
@@ -706,6 +720,40 @@ class HcuGPUModelRunnerV2(GPUModelRunner):
         slot_mappings = self.pcp_manager.get_dummy_slot_mappings(input_batch.num_tokens)
         return block_tables, slot_mappings
 
+    def gather_batch_req_state(self, scheduler_output, dummy_run=False):
+        result = super().gather_batch_req_state(scheduler_output, dummy_run)
+        if self.pcp_manager is not None:
+            # Every PCP model can replicate scheduler-padded speculative rows.
+            # Dispatch must use the same token/logit widths as partition_batch.
+            set_pcp_dispatch_metadata(
+                result[0],
+                scheduler_output,
+                self.model_state.num_new_sampled_tokens_per_step,
+            )
+        if _uses_global_pcp_batch(self.vllm_config) and is_dspark_enabled(self.vllm_config):
+            state = result[0]
+            # Dispatch precedes partition_batch(): use request-level global
+            # phase, including short prefills matching a decode graph shape.
+            self._hcu_pcp_graph_has_prefill = (
+                state is not None and bool(state.is_prefilling_np.any())
+            )
+        return result
+
+    def capture_model(self, *, profile_only=False):
+        if not (_uses_global_pcp_batch(self.vllm_config)
+                and is_dspark_enabled(self.vllm_config)):
+            return super().capture_model(profile_only=profile_only)
+        # Decode replicas consume the runner's original global input buffers.
+        # Capturing through PCP's local dummy buffers/expanded slots would bake
+        # different addresses from the metadata rebuilt for real decode.
+        manager = self.pcp_manager
+        self.pcp_manager = None
+        try:
+            with replicated_mtp_batch_scope():
+                return super().capture_model(profile_only=profile_only)
+        finally:
+            self.pcp_manager = manager
+
     def sample_tokens(self, grammar_output):
         execute_model_state = self.execute_model_state
         use_replicated_mtp_batch = (
@@ -718,9 +766,22 @@ class HcuGPUModelRunnerV2(GPUModelRunner):
             and execute_model_state is not None
             and not getattr(self, "is_last_pp_rank", True)
         )
+        if use_replicated_mtp_batch and is_dspark_enabled(self.vllm_config):
+            # DSpark conditions on intermediate target layers. These rows use
+            # the same PCP layout as the final hidden states; restore each
+            # layer before the drafter combines them in global request order.
+            aux_hidden_states = execute_model_state.aux_hidden_states
+            if aux_hidden_states:
+                execute_model_state = execute_model_state._replace(
+                    aux_hidden_states=[
+                        self.pcp_manager.restore_hidden_states(hidden)
+                        for hidden in aux_hidden_states
+                    ],
+                )
         if (
             use_replicated_mtp_batch
             and is_deepseek_v4(self.vllm_config)
+            and not is_dspark_enabled(self.vllm_config)
             and execute_model_state.hidden_states is not None
         ):
             # Native V4 MTP reads the pre-hc residual through the model getter,

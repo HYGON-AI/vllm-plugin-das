@@ -10,6 +10,14 @@ import torch
 from vllm_hcu.v1.attention.ops.fp8_paged_mqa_gfx938 import (
     gfx938_fp8_paged_mqa_logits,
 )
+from vllm_hcu.platforms.hcu import on_gfx938
+
+pytestmark = [
+    pytest.mark.hcu,
+    pytest.mark.skipif(
+        not torch.cuda.is_available() or not on_gfx938(), reason="requires gfx938",
+    ),
+]
 
 
 def _case(
@@ -120,6 +128,30 @@ def test_direct_reader_matches_token_order_oracle(
 def test_skip_tail_preserves_every_valid_row_prefix(per_query):
     """Dirty tails are safe only when every row prefix remains exact."""
     args, expected = _case(32, 73, 2, 3, per_query)
+    actual = gfx938_fp8_paged_mqa_logits(*args, fill_tail=False)
+    q, _, _, context, _, max_len = args
+    next_n = q.shape[1]
+    if per_query:
+        row_ends = context.reshape(-1)
+    else:
+        offsets = torch.arange(next_n, device=context.device)
+        row_ends = (context[:, None] - next_n + 1 + offsets).reshape(-1)
+    valid = torch.arange(max_len, device=actual.device)[None, :] < row_ends[:, None]
+    assert torch.equal(
+        torch.isneginf(actual[valid]), torch.isneginf(expected[valid])
+    )
+    finite = valid & torch.isfinite(expected)
+    torch.testing.assert_close(actual[finite], expected[finite], rtol=1e-3, atol=1e-2)
+
+
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="requires HCU GPU")
+@pytest.mark.parametrize("per_query", [False, True])
+def test_skip_tail_strides_live_tiles_past_decode_grid(per_query):
+    """Rows with more live tiles than decode-grid programs loop over them."""
+    from vllm_hcu.v1.attention.ops import fp8_paged_mqa_gfx938
+
+    tile_programs = fp8_paged_mqa_gfx938._LIVE_TILE_PROGRAMS
+    args, expected = _case(64, 64 * (2 * tile_programs + 5) + 7, 2, 3, per_query)
     actual = gfx938_fp8_paged_mqa_logits(*args, fill_tail=False)
     q, _, _, context, _, max_len = args
     next_n = q.shape[1]
@@ -464,4 +496,87 @@ def test_layer_split_sized_stride_with_high_page_ids_matches_oracle():
     actual = gfx938_fp8_paged_mqa_logits(
         q, strided, weights, lengths, table, max_len
     )
+    _check(actual, expected)
+
+
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="requires HCU GPU")
+@pytest.mark.parametrize("fill_tail", [False, True])
+@pytest.mark.parametrize("per_query", [False, True])
+@pytest.mark.parametrize("page_size", [16, 32, 64])
+@pytest.mark.parametrize("flatten_rows", [False, True])
+def test_token_major_compressor_layout_matches_oracle(
+    page_size, per_query, fill_tail, flatten_rows,
+):
+    # Convert independently packed HIPC tiles back to the compressor's rows;
+    # preserve the scale region and permuted block table from the oracle case.
+    args, expected = _case(page_size, 4359, 2, 6, per_query)
+    q, cache, weights, context, table, max_len = args
+    dim = q.shape[-1]
+    raw = cache.reshape(cache.shape[0], -1)
+    values = raw[:, : page_size * dim].clone()
+    raw[:, : page_size * dim] = (
+        values.reshape(-1, page_size // 16, dim // 16, 16, 16)
+        .permute(0, 1, 3, 2, 4)
+        .reshape(-1, page_size * dim)
+    )
+    if flatten_rows:
+        ends = (context if per_query else
+                context[:, None] - q.shape[1] + 1
+                + torch.arange(q.shape[1], device=context.device))
+        args = (
+            q.reshape(-1, 1, *q.shape[2:]), cache, weights,
+            ends.reshape(-1, 1), table.repeat_interleave(q.shape[1], dim=0), max_len,
+        )
+    actual = gfx938_fp8_paged_mqa_logits(
+        *args, fill_tail=fill_tail, token_major=True
+    )
+    if fill_tail:
+        _check(actual, expected)
+    else:
+        ends = (
+            context if per_query else
+            context[:, None] - q.shape[1] + 1
+            + torch.arange(q.shape[1], device=context.device)
+        ).reshape(-1)
+        valid = torch.arange(max_len, device=q.device)[None, :] < ends[:, None]
+        assert torch.equal(
+            torch.isneginf(actual[valid]), torch.isneginf(expected[valid])
+        )
+        finite = valid & torch.isfinite(expected)
+        torch.testing.assert_close(
+            actual[finite], expected[finite], rtol=1e-3, atol=1e-2
+        )
+
+
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="requires HCU GPU")
+@pytest.mark.parametrize("fill_tail", [False, True])
+def test_token_major_mtp_reads_pages_past_signed_int32_range(fill_tail):
+    args, expected = _case(64, 513, 2, 6, True)
+    q, cache, weights, lengths, table, max_len = args
+    page_size, dim = cache.shape[1], q.shape[-1]
+    raw = cache.reshape(cache.shape[0], -1)
+    values = raw[:, : page_size * dim].clone()
+    raw[:, : page_size * dim] = (
+        values.reshape(-1, page_size // 16, dim // 16, 16, 16)
+        .permute(0, 1, 3, 2, 4).reshape(-1, page_size * dim)
+    )
+    stride, first_page = 554496, 4000
+    backing = torch.empty(
+        (first_page + cache.shape[0]) * stride,
+        dtype=torch.uint8, device=q.device,
+    )
+    physical = torch.as_strided(
+        backing, (first_page + cache.shape[0], page_size, 1, dim + 4),
+        (stride, dim + 4, dim + 4, 1),
+    )
+    for page in range(cache.shape[0]):
+        physical[first_page + page].copy_(cache[page])
+    table = torch.where(table >= 0, table + first_page, table)
+    actual = gfx938_fp8_paged_mqa_logits(
+        q, physical, weights, lengths, table, max_len,
+        fill_tail=fill_tail, token_major=True,
+    )
+    if not fill_tail:
+        tail = torch.arange(max_len, device=q.device)[None] >= lengths.reshape(-1, 1)
+        actual = actual.masked_fill(tail, -torch.inf)
     _check(actual, expected)

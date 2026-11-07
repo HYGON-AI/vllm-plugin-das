@@ -42,7 +42,7 @@ def test_v4_pcp_config_accepts_full_kv_and_native_mtp(
 @pytest.mark.parametrize("overrides", [
     {"dcp": 2}, {"dp": 2}, {"pp": 2}, {"enforce_eager": False},
     {"enable_expert_parallel": False}, {"use_mla": False},
-    {"speculative": True, "speculative_method": "dspark"},
+    {"speculative": True, "speculative_method": "eagle3"},
     {"speculative": True, "num_speculative_tokens": 0},
     {"speculative": True, "num_speculative_tokens": 4},
 ])

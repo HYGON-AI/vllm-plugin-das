@@ -334,3 +334,143 @@ def test_dspark_context_insert_normalizes_non_uint8_cache_before_upstream(
     assert passed_kv is normalized_kv
     assert passed_positions is positions
     assert passed_slots is slot_mapping
+
+
+def test_dspark_eplb_registers_all_draft_layers(dspark_module, monkeypatch):
+    from vllm.model_executor.models.interfaces import get_mixture_of_experts_model
+    events = []
+
+    class MoE:
+        n_logical_experts = n_routed_experts = 256
+        n_physical_experts = 320
+        n_local_physical_experts = 40
+        n_shared_experts = 1
+        n_redundant_experts = 64
+        def __init__(self, index):
+            self.experts = SimpleNamespace(
+                get_expert_weights=lambda: [index],
+                set_eplb_state=lambda **kw: events.append((index, kw)),
+                update_expert_map=lambda: events.append(("update", index)),
+            )
+
+    amd = ModuleType("vllm.models.deepseek_v4.amd.model")
+    amd.DeepseekV4MoE = MoE
+    monkeypatch.setitem(sys.modules, amd.__name__, amd)
+    cls = dspark_module.DSparkDeepseekV4ForCausalLM
+    model = cls.__new__(cls)
+    nn.Module.__init__(model)
+    model.config = SimpleNamespace(n_group=8)
+    model.model = SimpleNamespace(layers=[
+        SimpleNamespace(ffn=MoE(i)) for i in range(3)
+    ])
+    model.set_moe_parameters()
+    assert get_mixture_of_experts_model(model) is model
+    assert model.num_moe_layers == 3
+    assert model.num_physical_experts == 320
+    load, mapping, replicas = object(), object(), object()
+    model.set_eplb_state(load, mapping, replicas)
+    assert model.expert_weights == [[0], [1], [2]]
+    for i, (index, kw) in enumerate(events):
+        assert index == kw["moe_layer_idx"] == i
+        assert kw["expert_load_view"] is load
+        assert kw["logical_to_physical_map"] is mapping
+        assert kw["logical_replica_count"] is replicas
+    model.update_physical_experts_metadata(320, 40)
+    assert events[-3:] == [("update", i) for i in range(3)]
+
+
+@pytest.mark.parametrize("fail", [False, True])
+def test_dspark_eplb_loader_uses_private_redundant_mapping(
+    dspark_module, monkeypatch, fail,
+):
+    seen = []
+    def mapping(*args, **kwargs):
+        seen.append(kwargs)
+        return []
+    namespace = {"fused_moe_make_expert_params_mapping": mapping}
+    exec("def load_weights(self, weights):\n"
+         "    result = fused_moe_make_expert_params_mapping(self, num_experts=256)\n"
+         "    if self.fail: raise RuntimeError('load failed')\n"
+         "    return set()\n", namespace)
+    upstream = dspark_module._dspark.DSparkDeepseekV4ForCausalLM
+    monkeypatch.setattr(upstream, "load_weights", namespace["load_weights"], raising=False)
+    cls = dspark_module.DSparkDeepseekV4ForCausalLM
+    model = cls.__new__(cls)
+    nn.Module.__init__(model)
+    model._hcu_enable_eplb = True
+    model.num_redundant_experts = 64
+    model.fail = fail
+    if fail:
+        with pytest.raises(RuntimeError, match="load failed"):
+            model.load_weights([1])
+    else:
+        assert model.load_weights([]) == set()
+    assert seen == [{"num_experts": 256, "num_redundant_experts": 64}]
+    assert namespace["load_weights"].__globals__["fused_moe_make_expert_params_mapping"] is mapping
+    assert not model._loading_dspark_weights
+
+
+@pytest.mark.parametrize("redundant", [16, 258])
+@pytest.mark.parametrize("rank", [0, 1])
+def test_dspark_loader_populates_every_local_expert_replica(
+    dspark_module, monkeypatch, redundant, rank,
+):
+    import ast
+    import re
+    import __future__
+    import vllm
+    from vllm.model_executor.layers.fused_moe.layer import fused_moe_make_expert_params_mapping
+
+    # Execute the installed upstream loader, rather than reproducing its loop.
+    source = Path(vllm.__file__).parent / "models/deepseek_v4/nvidia/dspark.py"
+    tree = ast.parse(source.read_text())
+    owner = next(n for n in tree.body if isinstance(n, ast.ClassDef)
+                 and n.name == "DSparkDeepseekV4ForCausalLM")
+    selected = [n for n in owner.body if isinstance(n, ast.FunctionDef)
+                and n.name in ("load_weights", "_remap_dspark_name")]
+    namespace = dict(torch=torch, re=re, _EXPERT_SCALE_RE=re.compile(r"\.experts\.\d+\."),
+                     fused_moe_make_expert_params_mapping=fused_moe_make_expert_params_mapping,
+                     get_tensor_model_parallel_world_size=lambda: 1,
+                     get_tensor_model_parallel_rank=lambda: 0,
+                     logger=SimpleNamespace(info_once=lambda *args: None))
+    exec(compile(ast.Module(body=selected, type_ignores=[]), str(source), "exec",
+                 flags=__future__.annotations.compiler_flag), namespace)
+    upstream = dspark_module._dspark.DSparkDeepseekV4ForCausalLM
+    monkeypatch.setattr(upstream, "load_weights", namespace["load_weights"], raising=False)
+    monkeypatch.setattr(upstream, "_remap_dspark_name", namespace["_remap_dspark_name"], raising=False)
+    cls = dspark_module.DSparkDeepseekV4ForCausalLM
+    model = cls.__new__(cls)
+    nn.Module.__init__(model)
+    model._hcu_enable_eplb = True
+    model.num_redundant_experts = redundant
+    model.config = SimpleNamespace(n_routed_experts=256, num_attention_heads=64,
+                                   expert_dtype="fp8")
+    model.model = SimpleNamespace(layers=[SimpleNamespace(ffn=SimpleNamespace(use_mega_moe=False))],
+                                  confidence_head=None)
+    model.pad_shared_expert = False
+    model.process_weights_after_loading = lambda: None
+    local = (256 + redundant) // 2
+    first = rank * local
+    loaded = {(shard, kind): torch.full((local,), -1.)
+              for shard in ("w1", "w2", "w3") for kind in ("weight", "scale")}
+
+    def weight_loader(param, weight, name, *, expert_id, shard_id, return_success):
+        if first <= expert_id < first + local:
+            kind = "scale" if "scale" in name else "weight"
+            loaded[shard_id, kind][expert_id - first] = weight
+            return True
+        return False
+
+    params = {}
+    for name in ("w13_weight", "w2_weight", "w13_weight_scale_inv", "w2_weight_scale_inv"):
+        param = nn.Parameter(torch.zeros(1), requires_grad=False)
+        param.weight_loader = weight_loader
+        params[f"model.layers.0.ffn.experts.routed_experts.{name}"] = param
+    model.named_parameters = lambda *args, **kwargs: iter(params.items())
+    weights = [(f"mtp.0.ffn.experts.{expert}.{shard}.{kind}", torch.tensor(float(expert)))
+               for expert in range(256) for shard, kind in loaded]
+    result = model.load_weights(iter(weights))
+    assert set(params) <= result
+    expected = torch.arange(first, first + local).remainder(256).float()
+    for shard, actual in loaded.items():
+        torch.testing.assert_close(actual, expected, msg=f"rank={rank}, shard={shard}")

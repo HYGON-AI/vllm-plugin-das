@@ -40,6 +40,12 @@ if missing:
 print(f"python={sys.version}")
 PY
 
+# Repair the exact known gfx938 kernel-map packaging defect before GPU tests.
+# Only the disposable container is modified; the source image stays unchanged.
+docker exec --workdir /vllm-plugin-das "$container_name" \
+  bash -lc \
+  'source /opt/dtk/env.sh && exec /usr/local/bin/hcu-ci-python .github/scripts/hcu_ci/ensure_hipblaslt_kernel_map.py'
+
 # Evaluation jobs may bootstrap their declared evaluator in the ephemeral container.
 docker exec --workdir /vllm-plugin-das "$container_name" \
   bash -lc \

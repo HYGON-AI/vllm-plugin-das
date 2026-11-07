@@ -1152,3 +1152,13 @@ def test_step5_rejects_installation_over_existing_offline_policy():
     with pytest.raises(RuntimeError, match="before offline EPLB policy"):
         step5.apply_to_module(target)
     assert wrappers == tuple(getattr(owner, name) for owner, name in _offline_hooks(target))
+
+
+def test_fixed_draft_does_not_register_or_read_target_map(tmp_path, monkeypatch):
+    fixture = _setup_state(tmp_path, monkeypatch, mode="static")
+    fixture.model._vllm_hcu_fixed_draft_layout = True
+    del fixture.model._vllm_hcu_static_eplb_plan
+    before = dict(fixture.state.model_states)
+    fixture.state.add_model(fixture.model, fixture.model_config)
+    assert fixture.state.model_states == before
+    assert not hasattr(fixture.model, "_vllm_hcu_static_eplb_plan")
