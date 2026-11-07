@@ -7,6 +7,7 @@ import importlib.util
 from pathlib import Path
 
 import pytest
+import yaml
 
 
 ROOT = Path(__file__).resolve().parents[2]
@@ -82,3 +83,21 @@ def test_missing_library_is_untouched(tmp_path):
 def test_ci_installs_repair_before_hardware_tests():
     script = (ROOT / "scripts/ci/hcu/hcu_ci_install_dependency.sh").read_text()
     assert "ensure_hipblaslt_kernel_map.py" in script
+
+    workflow = yaml.safe_load(
+        (ROOT / ".github/workflows/_selected-hcu-tests.yml").read_text()
+    )
+    steps = workflow["jobs"]["hcu"]["steps"]
+    install_indices = [
+        index for index, step in enumerate(steps)
+        if "scripts/ci/hcu/hcu_ci_install_dependency.sh" in step.get("run", "")
+    ]
+    hardware_indices = [
+        index for index, step in enumerate(steps)
+        if ".github/scripts/hcu_ci/run_hcu_ci_job.py" in step.get("run", "")
+    ]
+    assert install_indices, "CI must invoke the dependency installation script"
+    assert hardware_indices, "CI must invoke the hardware test runner"
+    assert max(install_indices) < min(hardware_indices), (
+        "Dependency installation and kernel-map repair must precede hardware tests"
+    )
