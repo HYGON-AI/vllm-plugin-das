@@ -251,9 +251,13 @@ def test_pcp_kv_cache_callbacks_precede_mtp_coordinator_deterministically():
             "vllm.v1.core.kv_cache_coordinator",
         )
     )
-    assert inventory[mtp_index - 4 : mtp_index] == (
+    assert inventory[mtp_index - 5 : mtp_index] == (
         (
             "platform.framework_opt.pcp_kv_cache_utils",
+            "vllm.v1.core.kv_cache_utils",
+        ),
+        (
+            "platform.framework_opt.dsa_layer_split_kv_config",
             "vllm.v1.core.kv_cache_utils",
         ),
         (

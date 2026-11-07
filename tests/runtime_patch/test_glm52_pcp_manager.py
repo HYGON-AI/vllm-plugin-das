@@ -110,6 +110,7 @@ def _make_config(pcp_size: int = 2, **overrides: object) -> object:
         model_config=SimpleNamespace(
             architectures=[values["architecture"]],
             use_mla=values["use_mla"],
+            hf_config=SimpleNamespace(index_topk=64),
             enforce_eager=values["enforce_eager"],
             is_multimodal_model=False,
         ),

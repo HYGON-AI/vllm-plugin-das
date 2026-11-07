@@ -1171,6 +1171,13 @@ class DeepseekV4DecoderLayer(nn.Module):
 
         config = vllm_config.model_config.hf_config
         self.hidden_size = config.hidden_size
+        self.prefix = prefix
+        try:
+            from vllm.model_executor.models.utils import extract_layer_index
+
+            self.layer_idx = int(extract_layer_index(prefix))
+        except Exception:
+            self.layer_idx = -1
 
         self.rms_norm_eps = config.rms_norm_eps
         self.attn = DeepseekV4Attention(
@@ -1300,6 +1307,20 @@ class DeepseekV4DecoderLayer(nn.Module):
 
         x = self.attn_norm(x)
         x = self.attn(positions, x, None)
+
+        # SGLang maybe_prefetch_next_full_attention_kv: after attention has
+        # consumed the remote buffer, kick the next layer's MLA-latent
+        # owner-broadcast so it overlaps with FFN/MoE. MLA only: the indexer
+        # buffer is invalidated and rewritten at the start of every prefill
+        # forward, so prefetching it would be discarded. Collective on every
+        # PCP rank; no-op when layer split is off or the batch is
+        # replicated MTP.
+        if self.layer_idx >= 0:
+            from vllm_hcu.v1.dsa_cache_layer_split import (
+                maybe_prefetch_next_dsa_cache,
+            )
+
+            maybe_prefetch_next_dsa_cache(self.layer_idx, kind="mla")
 
         residual, post_mix, res_mix, x = self.mhc_fused_post_pre(
             x,

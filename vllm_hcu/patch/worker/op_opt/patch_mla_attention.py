@@ -244,7 +244,19 @@ def apply_to_module(module: ModuleType) -> bool:
             from vllm_hcu.model_executor.layers.attention.pcp import (
                 maybe_gather_mla_latent_cache_inputs,
             )
+            from vllm_hcu.v1.dsa_cache_layer_split import (
+                begin_mla_dsa_cache_write,
+                should_commit_durable_dsa_cache,
+            )
 
+            # PCP gather is a collective: every rank must participate.
+            # SGLang #29421 only restricts the durable *owned* write; when
+            # remote_kv_updatable, non-owners also patch the scratch/remote
+            # in place (set_mla_kv_buffer) so the post-write broadcast can
+            # be skipped via remote_layer_id.
+            remote_updatable = begin_mla_dsa_cache_write(
+                self.kv_cache, self.layer_name
+            )
             kv_for_cache, kpe_for_cache, layer_slot_mapping = (
                 maybe_gather_mla_latent_cache_inputs(
                     kv_c_normed,
@@ -253,14 +265,26 @@ def apply_to_module(module: ModuleType) -> bool:
                     attn_metadata,
                 )
             )
-            self.impl.do_kv_cache_update(
-                kv_for_cache,
-                kpe_for_cache,
-                self.kv_cache,
-                layer_slot_mapping,
-                self.kv_cache_dtype,
-                self._k_scale,
-            )
+            owned = should_commit_durable_dsa_cache(self.layer_name)
+            if owned or remote_updatable:
+                self.impl.do_kv_cache_update(
+                    kv_for_cache,
+                    kpe_for_cache,
+                    self.kv_cache,
+                    layer_slot_mapping,
+                    self.kv_cache_dtype,
+                    self._k_scale,
+                )
+        # Owner broadcast is a PCP collective: every rank must enter for
+        # every backbone layer, including profile forwards where
+        # attn_metadata is None (cache update skipped above). Placing this
+        # inside the metadata block deadlocks when one rank has metadata
+        # and another does not. MTP already early-returned above.
+        from vllm_hcu.v1.dsa_cache_layer_split import (
+            broadcast_dsa_cache_from_owner,
+        )
+
+        broadcast_dsa_cache_from_owner(self.kv_cache, self.layer_name)
         output = torch_module.empty(output_shape, dtype=q.dtype, device=q.device)
         self.forward_impl(
             q,

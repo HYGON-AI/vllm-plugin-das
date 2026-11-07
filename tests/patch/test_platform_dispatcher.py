@@ -138,6 +138,10 @@ def test_platform_framework_inventory_is_explicit_and_dependency_ordered():
             "vllm.v1.core.kv_cache_utils",
         ),
         (
+            "platform.framework_opt.dsa_layer_split_kv_config",
+            "vllm.v1.core.kv_cache_utils",
+        ),
+        (
             "platform.framework_opt.pcp_kv_cache_interface",
             "vllm.v1.kv_cache_interface",
         ),

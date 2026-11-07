@@ -593,6 +593,37 @@ class HCUPlatform(Platform):
         IMPORT_COORDINATOR.drain_ready_callbacks()
         feature_config = validate_and_update_hcu_config(vllm_config)
 
+        from vllm_hcu.v1.dsa_cache_layer_split import (
+            is_dsa_cache_layer_split_requested,
+            validate_dsa_cache_layer_split,
+        )
+        from vllm_hcu.patch.config import get_hcu_config, set_hcu_config
+
+        # Workers may not inherit process env under multiproc spawn. Persist
+        # the request into the HCU sidecar so every rank sees the same flag.
+        if is_dsa_cache_layer_split_requested(vllm_config):
+            feature_config = get_hcu_config(vllm_config)
+            if not feature_config.enable_dsa_cache_layer_split:
+                feature_config = feature_config.with_updates(
+                    enable_dsa_cache_layer_split=True
+                )
+                set_hcu_config(vllm_config, feature_config)
+            logger.warning(
+                "DSA cache layer-split enabled "
+                "(prefill_context_parallel_size=%d). "
+                "SGLang-aligned owner-only durable writes + "
+                "broadcast-on-read are active.",
+                int(
+                    getattr(
+                        vllm_config.parallel_config,
+                        "prefill_context_parallel_size",
+                        1,
+                    )
+                    or 1
+                ),
+            )
+        validate_dsa_cache_layer_split(vllm_config)
+
         # Use vLLM's public qualified-class configuration hooks.  Both
         # selectors only assign strings and therefore keep the official and
         # HCU Scheduler/Executor implementations lazy until engine startup.
