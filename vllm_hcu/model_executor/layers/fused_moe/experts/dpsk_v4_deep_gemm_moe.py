@@ -1266,6 +1266,7 @@ def make_deepep_ht_deepgemm_w4a8_moe_kernel(
     moe_quant_config: FusedMoEQuantConfig,
     moe_config: FusedMoEConfig,
     routing_tables: tuple[torch.Tensor, torch.Tensor, torch.Tensor] | None = None,
+    static_owner=None,
 ) -> mk.FusedMoEKernel:
     """Use the PCP HT communicator and one in-place contiguous W4A8 layout."""
     from vllm.model_executor.layers.fused_moe.all2all_utils import (
@@ -1284,6 +1285,13 @@ def make_deepep_ht_deepgemm_w4a8_moe_kernel(
         raise RuntimeError(
             "SlimQuant W4A8 PCP HT prepare/finalize was not constructed"
         )
+    if static_owner is not None:
+        import weakref
+        from vllm.model_executor.layers.fused_moe.prepare_finalize.deepep_ht import (
+            DeepEPHTPrepareAndFinalize,
+        )
+        if type(prepare_finalize) is DeepEPHTPrepareAndFinalize:
+            prepare_finalize._hcu_static_ht_owner = weakref.ref(static_owner)
     experts = DeepEPAutoW4A8Experts(
         moe_config=moe_config,
         quant_config=moe_quant_config,

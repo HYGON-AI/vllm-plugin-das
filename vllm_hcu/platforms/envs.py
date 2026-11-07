@@ -65,6 +65,8 @@ if TYPE_CHECKING:
     VLLM_HCU_ENABLE_DEEPSEEK_V4_CACHE_WINDOW: bool = False
     VLLM_HCU_USE_AITER_W8A8_FP8_MOE: bool = False
     VLLM_HCU_USE_LIGHTOP_MOE_ALIGN: bool = False
+    VLLM_HCU_STATIC_HT_W4A8_COUNT_SCRATCH: bool = False
+    VLLM_HCU_STATIC_HT_W4A8_COUNT_DIAGNOSTIC: bool = False
     VLLM_HCU_USE_LIGHTOP_EP_SCATTER: bool = True
     VLLM_HCU_USE_LIGHTOP_PER_TOKEN_QUANT_FP8: bool = True
     VLLM_HCU_FUSED_MOE_CHUNK_SIZE: Optional[int] = None
@@ -175,6 +177,10 @@ def resolve_hcu_flash_attn_mode(explicit_mode: Optional[str]) -> str:
     return "varlen"
 
 hcu_vllm_environment_variables: dict[str, Callable[[], Any]] = {
+    "VLLM_HCU_STATIC_HT_W4A8_COUNT_SCRATCH": lambda: os.environ.get(
+        "VLLM_HCU_STATIC_HT_W4A8_COUNT_SCRATCH", "0") == "1",
+    "VLLM_HCU_STATIC_HT_W4A8_COUNT_DIAGNOSTIC": lambda: os.environ.get(
+        "VLLM_HCU_STATIC_HT_W4A8_COUNT_DIAGNOSTIC", "0") == "1",
     "VLLM_HCU_SPARSE_MLA_PREFILL_WORKSPACE_DEDUP":
     lambda: _environment_flag(os.getenv("VLLM_HCU_SPARSE_MLA_PREFILL_WORKSPACE_DEDUP", "0")),
     "VLLM_HCU_ENABLE_BYTELEVEL_DETOKENIZER_TAIL":
