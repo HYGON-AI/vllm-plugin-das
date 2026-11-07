@@ -30,6 +30,10 @@ from vllm_hcu.v1.pcp_manager import (
     pcp_dispatch_metadata_scope,
     set_pcp_dispatch_metadata,
 )
+from vllm_hcu.v1.glm53_pcp_mtp_sync import (
+    install_glm53_pcp_mtp_sync,
+    sync_glm53_pcp_sampler_output,
+)
 from vllm_hcu.patch.platform.core_fix.patch_vllm_config import is_glm53_pcp
 from vllm_hcu.deepseek_v4_runtime import is_deepseek_v4, is_dspark_enabled
 
@@ -371,6 +375,8 @@ class HcuGPUModelRunnerV2(GPUModelRunner):
 
             install_decode_dispatch(self)
         self._init_host_seq_lens()
+        if not is_profiling:
+            install_glm53_pcp_mtp_sync(self)
         if is_step5_config(self.vllm_config) and getattr(self, "ubatch_runner", None) is not None:
             from vllm_hcu.v1.hcu_dbo import install_runner
 
@@ -499,6 +505,9 @@ class HcuGPUModelRunnerV2(GPUModelRunner):
 
     def sample(self, hidden_states, input_batch, grammar_output):
         out = super().sample(hidden_states, input_batch, grammar_output)
+        # Commit identical PCP decisions before post_update() and KDA state
+        # advancement. The manager can be hidden by sample_tokens() here.
+        out = sync_glm53_pcp_sampler_output(self, out)
         if self._hsl_enabled and input_batch is self._hsl_batch:
             self._hsl_batch = None
             self._hsl_record(input_batch, out[2])
