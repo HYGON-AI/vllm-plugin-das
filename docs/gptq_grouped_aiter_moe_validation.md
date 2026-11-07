@@ -34,6 +34,15 @@ retains vLLM's modular WNA16 prepare/finalize and replaces expert execution.
   Both failures are in SlimQuant W4A8 BoltOps public-signature checks; the
   installed BoltOps API differs from that separately audited contract.
 - `python setup.py bdist_wheel`: passed on the prepared HCU stack.
+- Full QGPT checkpoint on one gfx936, V2 runner, MTP=3, FP8 E5M2 KV,
+  HND, prefix caching and fine-grained Mamba cache: service started with
+  `--skip-mm-profiling`; piecewise and full HIP graph capture completed.
+  Three chat smoke requests and ten repeated-prefix requests (including
+  eight concurrent requests) returned HTTP 200. All arithmetic requests
+  returned `42`. Prometheus reported 8,192 prefix-cache hit tokens and
+  38 accepted speculative tokens out of 108 draft tokens during this small
+  smoke workload. These counters demonstrate execution, not model accuracy
+  or throughput benchmarks.
 
 Run the GPU accuracy check in its own process:
 
