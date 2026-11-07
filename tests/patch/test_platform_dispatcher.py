@@ -115,6 +115,8 @@ def test_platform_core_inventory_is_explicit_and_ordered():
         ("platform.core_fix.step5_splitting_ops", "vllm.config.compilation"),
         ("platform.core_fix.step5_compile_prefix", "vllm.compilation.decorators"),
         ("platform.core_fix.step5_ep_graph_capture", "vllm.distributed.parallel_state"),
+        ("platform.core_fix.step5_reasoning_parser", "vllm.reasoning"),
+        ("platform.core_fix.step5_tool_parser", "vllm.tool_parsers"),
     )
 
 
