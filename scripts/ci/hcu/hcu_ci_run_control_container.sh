@@ -17,6 +17,21 @@ if [[ $# -eq 0 ]]; then
   exit 2
 fi
 
+# ARC K8s pools (HCU_CI_IN_K8S=1): the job already runs inside the HCU CI
+# image without a docker daemon, so run the command in place with the same
+# environment the control container would get.
+if [[ "${HCU_CI_IN_K8S:-0}" == "1" ]]; then
+  workspace="$(realpath "${GITHUB_WORKSPACE:-$workdir}")"
+  workdir="$(realpath "$workdir")"
+  export CI=1 HOME=/tmp/hcu-ci-home PYTHONDONTWRITEBYTECODE=1 PYTHONPATH="$workspace" \
+    TORCHINDUCTOR_CACHE_DIR=/tmp/hcu-ci-torchinductor XDG_CACHE_HOME=/tmp/hcu-ci-cache \
+    LOGNAME="$(id -un)" USER="$(id -un)"
+  echo "using HCU CI control environment: current K8s job container" >&2
+  mkdir -p "$HOME" "$TORCHINDUCTOR_CACHE_DIR" "$XDG_CACHE_HOME"
+  cd "$workdir"
+  exec bash -lc 'set -e; exec "$@"' -- "$@"
+fi
+
 script_dir="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)"
 image="$("$script_dir/hcu_ci_resolve_image.sh")"
 echo "using HCU CI control image: $image" >&2

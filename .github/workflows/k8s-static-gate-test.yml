@@ -1,0 +1,128 @@
+name: HCU K8s static gate comparison (test branch only)
+
+# Runs the "Static gate and test selection" commands of hcu-pr-ci.yml on two
+# environments with the same scripts and the same diff (PR #316 merge on v0.28.1-dev):
+#   k8s    : ARC K8s pool hygon-build, job container = HCU CI image (HCU_CI_IN_K8S=1)
+#   legacy : existing [self-hosted, ci, bw1100] runners with the docker control container
+# Triggered only by changes to .github/k8s-test/trigger on the test branch.
+
+on:
+  push:
+    branches: [test/k8s-runner-20261108]
+    paths: [.github/k8s-test/trigger]
+
+permissions:
+  contents: read
+
+concurrency:
+  group: hcu-k8s-static-gate
+  cancel-in-progress: false
+
+env:
+  BASE_SHA: 5f301751a64003b6e1824b26962e39aeb3607b2d
+  HEAD_SHA: 5f181a36c0e5b97498cc59aa16f3c19fdbded89a
+  HCU_CI_IMAGE: 10.16.1.152:5000/jenkins/model_test_env/vllm:0.28.1rc1-latest
+  FULL_HCU: 'false'
+  ACCURACY_HCU: 'false'
+  ENVIRONMENT_LOCK: .github/workflows/configs/hcu-runner-environment.json
+
+jobs:
+  k8s:
+    if: github.repository == 'HYGON-AI/vllm-plugin-das' && github.ref == 'refs/heads/test/k8s-runner-20261108'
+    name: Static gate (K8s hygon-build)
+    runs-on: hygon-build
+    timeout-minutes: 60
+    container:
+      image: 10.16.1.152:5000/jenkins/model_test_env/vllm:0.28.1rc1-latest
+    defaults: {run: {shell: bash}}
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262
+        with: {fetch-depth: 0, persist-credentials: false}
+      - name: Show environment
+        run: |
+          echo "runner=${RUNNER_NAME} node=${NODE_NAME:-host} HCU_CI_IN_K8S=${HCU_CI_IN_K8S:-unset} nproc=$(nproc)"
+          git cat-file -e "${BASE_SHA}^{commit}" && git cat-file -e "${HEAD_SHA}^{commit}"
+      - name: Verify patch contracts
+        run: |
+          start=$(date +%s)
+          bash scripts/ci/hcu/hcu_ci_run_control_container.sh -- bash -lc '
+            set -euo pipefail
+            python3 --version
+            export PATH="$HOME/.local/bin:$PATH"
+            python3 .github/scripts/hcu_ci/ensure_ci_dependencies.py --user
+            git config --global --add safe.directory "$GITHUB_WORKSPACE"
+            python3 .github/scripts/hcu_ci/hcu_ci_preflight.py --environment-lock "$ENVIRONMENT_LOCK" --check-lock-only
+            python3 .github/scripts/hcu_ci/compile_changed_python.py --base "$BASE_SHA" --head "$HEAD_SHA"
+            python3 .github/scripts/hcu_ci/verify_hcu_registration.py
+            python3 .github/scripts/hcu_ci/build_hcu_matrix.py --profile nightly >/dev/null
+            python3 .github/scripts/hcu_ci/build_hcu_matrix.py --profile quarantine >/dev/null
+            source /opt/dtk/env.sh
+            python3 tools/run_patch_tests.py --suite contract -- -o cache_dir=/tmp/hcu-ci-pytest-cache
+          '
+          echo "contract_seconds=$(( $(date +%s) - start ))"
+      - name: Select HCU matrix
+        id: select
+        run: |
+          bash scripts/ci/hcu/hcu_ci_run_control_container.sh -- bash -lc '
+            set -euo pipefail
+            git config --global --add safe.directory "$GITHUB_WORKSPACE"
+            python3 .github/scripts/hcu_ci/select_hcu_tests.py --base "$BASE_SHA" --head "$HEAD_SHA" --github-output "$GITHUB_OUTPUT"
+          '
+      - name: Print selection
+        env:
+          MATRIX: ${{ steps.select.outputs.matrix }}
+          HAS_JOBS: ${{ steps.select.outputs.has_jobs }}
+          GROUPS: ${{ steps.select.outputs.groups }}
+        run: |
+          echo "has_jobs=${HAS_JOBS} groups=${GROUPS}"
+          echo "SELECTION_SHA256=$(printf '%s' "${MATRIX}" | sha256sum | cut -c1-16)"
+          printf '%s\n' "${MATRIX}" | head -c 3000; echo
+
+  legacy:
+    if: github.repository == 'HYGON-AI/vllm-plugin-das' && github.ref == 'refs/heads/test/k8s-runner-20261108'
+    name: Static gate (legacy ci bw1100)
+    runs-on: [self-hosted, ci, bw1100]
+    timeout-minutes: 60
+    defaults: {run: {shell: bash}}
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262
+        with: {fetch-depth: 0, persist-credentials: false}
+      - name: Show environment
+        run: |
+          echo "runner=${RUNNER_NAME} node=${NODE_NAME:-host} HCU_CI_IN_K8S=${HCU_CI_IN_K8S:-unset} nproc=$(nproc)"
+          git cat-file -e "${BASE_SHA}^{commit}" && git cat-file -e "${HEAD_SHA}^{commit}"
+      - name: Verify patch contracts
+        run: |
+          start=$(date +%s)
+          bash scripts/ci/hcu/hcu_ci_run_control_container.sh -- bash -lc '
+            set -euo pipefail
+            python3 --version
+            export PATH="$HOME/.local/bin:$PATH"
+            python3 .github/scripts/hcu_ci/ensure_ci_dependencies.py --user
+            git config --global --add safe.directory "$GITHUB_WORKSPACE"
+            python3 .github/scripts/hcu_ci/hcu_ci_preflight.py --environment-lock "$ENVIRONMENT_LOCK" --check-lock-only
+            python3 .github/scripts/hcu_ci/compile_changed_python.py --base "$BASE_SHA" --head "$HEAD_SHA"
+            python3 .github/scripts/hcu_ci/verify_hcu_registration.py
+            python3 .github/scripts/hcu_ci/build_hcu_matrix.py --profile nightly >/dev/null
+            python3 .github/scripts/hcu_ci/build_hcu_matrix.py --profile quarantine >/dev/null
+            source /opt/dtk/env.sh
+            python3 tools/run_patch_tests.py --suite contract -- -o cache_dir=/tmp/hcu-ci-pytest-cache
+          '
+          echo "contract_seconds=$(( $(date +%s) - start ))"
+      - name: Select HCU matrix
+        id: select
+        run: |
+          bash scripts/ci/hcu/hcu_ci_run_control_container.sh -- bash -lc '
+            set -euo pipefail
+            git config --global --add safe.directory "$GITHUB_WORKSPACE"
+            python3 .github/scripts/hcu_ci/select_hcu_tests.py --base "$BASE_SHA" --head "$HEAD_SHA" --github-output "$GITHUB_OUTPUT"
+          '
+      - name: Print selection
+        env:
+          MATRIX: ${{ steps.select.outputs.matrix }}
+          HAS_JOBS: ${{ steps.select.outputs.has_jobs }}
+          GROUPS: ${{ steps.select.outputs.groups }}
+        run: |
+          echo "has_jobs=${HAS_JOBS} groups=${GROUPS}"
+          echo "SELECTION_SHA256=$(printf '%s' "${MATRIX}" | sha256sum | cut -c1-16)"
+          printf '%s\n' "${MATRIX}" | head -c 3000; echo
