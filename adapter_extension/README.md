@@ -99,6 +99,24 @@ results are frozen historical evidence; they do not make AITER selectable in
 the corrected candidate. Preserving official ownership does not certify that
 unavailable capability. See [ownership correction](../docs/validation/vllm033-official-ownership.md).
 
+## Experimental SlimQuant checkpoint format
+
+The isolated candidate adds the distinct `slimquant_w4a8` format through the
+public quantization registry. Request capability `hcu-slimquant-w4a8` explicitly.
+It requires the public per-row PLE method in the associated Core candidate;
+activation fails before publication when that API is absent.
+
+Packed expert bytes decode high nibble first to signed INT4 values. The decoded
+INT8 weights and expert scales converted from the serialized high-nibble units
+(times16) enter the official CT expert loader,
+backend selection and kernels. Dense INT8 layers also use official CT methods.
+Declared n-gram tables use the public per-row INT8 PLE method with FP32 scales.
+This consumes more weight memory than a packed native W4A8 kernel. It neither
+registers AITER as an official INT8 backend nor replaces `compressed-tensors`.
+The current parser requires the three explicit mixed-precision groups used by
+the Qwen3.8 checkpoint. Verify loader numerics, changed-input Graph and model
+accuracy for the selected Core/provider/checkpoint combination before deployment.
+
 ## HCU FlashAttention varlen backend
 
 The supported path is BF16/FP16 dense MHA/GQA with head size 64, 128, 192, or
