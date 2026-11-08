@@ -85,6 +85,8 @@ class SlimQuantConfig(CompressedTensorsConfig):
     """Distinct format; official CT quantization and MoE kernel selection remain owners."""
 
     def __init__(self, config):
+        if config.get("activation_scheme", "dynamic") != "dynamic":
+            raise ValueError("SlimQuant requires dynamic per-token activations")
         self.weight_quant = QuantizationArgs(
             num_bits=8, type="int", strategy="channel", symmetric=True, dynamic=False
         )
@@ -113,13 +115,20 @@ class SlimQuantConfig(CompressedTensorsConfig):
                 "SlimQuant requires declared per-channel packed INT4 experts"
             )
         self.expert_modules = list(experts.get("modules") or [])
+        if (
+            experts.get("activation_bits", 8) != 8
+            or experts.get("activation_scheme", "dynamic_per_token")
+            != "dynamic_per_token"
+        ):
+            raise ValueError("SlimQuant requires dynamic-token INT8 expert activations")
         dense = mixed.get("w8a8_include") or {}
         if (
             dense.get("format"),
             dense.get("weight_bits"),
             dense.get("activation_bits"),
             dense.get("activation_scheme"),
-        ) != ("int8-per-channel", 8, 8, "dynamic_per_token"):
+            dense.get("scope", "per_channel"),
+        ) != ("int8-per-channel", 8, 8, "dynamic_per_token", "per_channel"):
             raise ValueError(
                 "SlimQuant requires declared dynamic-token INT8 dense modules"
             )

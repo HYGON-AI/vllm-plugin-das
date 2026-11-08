@@ -87,6 +87,46 @@ def test_parser_maps_all_declared_module_lists_without_mutating_checkpoint():
     assert raw == original
 
 
+@pytest.mark.parametrize(
+    "path,value",
+    [
+        (("activation_scheme",), "static"),
+        (("mixed_precision", "experts", "activation_bits"), 4),
+        (("mixed_precision", "experts", "activation_scheme"), "static"),
+        (("mixed_precision", "w8a8_include", "scope"), "per_group"),
+    ],
+)
+def test_parser_rejects_declarations_incompatible_with_fixed_ct_method(path, value):
+    from hcu_vllm_das.slimquant import SlimQuantConfig
+
+    raw = checkpoint_config()
+    group = raw
+    for part in path[:-1]:
+        group = group[part]
+    group[path[-1]] = value
+    with pytest.raises(ValueError, match="SlimQuant requires"):
+        SlimQuantConfig.from_config(raw)
+
+
+@pytest.mark.parametrize("explicit", [False, True])
+def test_parser_preserves_supported_activation_and_scope_defaults(explicit):
+    from hcu_vllm_das.slimquant import SlimQuantConfig
+
+    raw = checkpoint_config()
+    if explicit:
+        raw["activation_scheme"] = "dynamic"
+        raw["mixed_precision"]["experts"].update(
+            activation_bits=8, activation_scheme="dynamic_per_token"
+        )
+        raw["mixed_precision"]["w8a8_include"]["scope"] = "per_channel"
+    original = copy.deepcopy(raw)
+    config = SlimQuantConfig.from_config(raw)
+    assert config.input_quant.num_bits == 8
+    assert config.input_quant.dynamic is True
+    assert config.weight_quant.strategy == "channel"
+    assert raw == original
+
+
 @pytest.fixture
 def native_parallel(tmp_path, monkeypatch):
     from types import SimpleNamespace
