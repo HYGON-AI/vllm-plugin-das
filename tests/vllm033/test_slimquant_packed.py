@@ -14,6 +14,43 @@ def api():
     return importlib.import_module(name)
 
 
+@pytest.mark.parametrize("dtype_name", ["bfloat16", "float16"])
+@pytest.mark.parametrize("padding", ["none", "mixed", "all"])
+def test_provider_inputs_preserve_valid_routes_and_zero_padding(dtype_name, padding):
+    import torch
+
+    x = torch.arange(24, dtype=getattr(torch, dtype_name)).reshape(3, 8)
+    ids = torch.tensor([[0, 1], [1, 2], [2, 3]], dtype=torch.int32)
+    routes = torch.tensor([[0.25, 0.75]] * 3)
+    if padding == "mixed":
+        ids[0, 1] = -1
+        ids[2].fill_(-1)
+        x[2, ::2] = float("nan")
+        x[2, 1::2] = float("inf")
+    elif padding == "all":
+        ids.fill_(-1)
+        x.fill_(float("nan"))
+    original = [t.clone() for t in (x, routes, ids)]
+    clean_x, clean_routes, clean_ids = api().prepare_packed_provider_inputs(
+        x, routes, ids
+    )
+    valid = ids >= 0
+    torch.testing.assert_close(clean_x[valid.any(-1)], x[valid.any(-1)], rtol=0, atol=0)
+    torch.testing.assert_close(clean_ids[valid], ids[valid], rtol=0, atol=0)
+    torch.testing.assert_close(clean_routes[valid], routes[valid], rtol=0, atol=0)
+    assert ((clean_ids[~valid] >= 0) & (clean_ids[~valid] < ids.shape[-1])).all()
+    for row in clean_ids.tolist():
+        assert len(set(row)) == len(row), "vendor routes require distinct experts per token"
+    assert not clean_routes[~valid].count_nonzero()
+    assert not clean_x[~valid.any(-1)].count_nonzero()
+    assert torch.isfinite(clean_x).all()
+    for before, after in zip(original, (x, routes, ids)):
+        torch.testing.assert_close(before, after, rtol=0, atol=0, equal_nan=True)
+    for before, after in zip((x, routes, ids), (clean_x, clean_routes, clean_ids)):
+        assert before.shape == after.shape and before.dtype == after.dtype
+        assert after.is_contiguous()
+
+
 def moe(**updates):
     import torch
 

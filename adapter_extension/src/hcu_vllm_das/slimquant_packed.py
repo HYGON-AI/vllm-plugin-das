@@ -30,6 +30,30 @@ def select_moe_provider(context):
     return provider
 
 
+def prepare_packed_provider_inputs(x, topk_weights, topk_ids):
+    """Translate Core's padding slots to safe, zero-contribution vendor routes.
+
+    Core uses -1 expert ids for padded tokens. The packed vendor sorter indexes
+    expert counters directly and stores one slot per expert/token pair. Give
+    padding slots distinct unused ids instead of duplicating an active expert.
+    Unused hidden rows may contain NaNs; zero them before zero-weight routes
+    are evaluated. Tensor predicates remain dynamic during Graph replay.
+    """
+    valid = topk_ids >= 0
+    # Core guarantees top-k <= expert count. Among the first top-k experts,
+    # at least as many ids are unused as there are padding slots in this row.
+    candidates = torch.arange(topk_ids.shape[-1], device=topk_ids.device)
+    occupied = (topk_ids.unsqueeze(-1) == candidates).any(dim=1)
+    unused_first = occupied.to(torch.int32).argsort(dim=-1)
+    padding_position = ((~valid).cumsum(-1) - 1).clamp_min(0)
+    padding_ids = unused_first.gather(-1, padding_position).to(topk_ids.dtype)
+    return (
+        torch.where(valid.any(-1, keepdim=True), x, 0),
+        torch.where(valid, topk_weights, 0),
+        torch.where(valid, topk_ids, padding_ids),
+    )
+
+
 class SlimQuantPackedExperts(FusedMoEMethodBase):
     """Keep raw bytes/scales; Core retains loading, routing and final reductions.
 
@@ -274,6 +298,9 @@ class SlimQuantPackedExperts(FusedMoEMethodBase):
             raise ValueError("packed SlimQuant route metadata is incompatible")
         # Core has already scheduled shared experts and merges/reduces its
         # output after this routed-only return. Do not execute them twice.
+        x, topk_weights, topk_ids = prepare_packed_provider_inputs(
+            x, topk_weights, topk_ids
+        )
         return self._provider(
             x,
             layer.w13_weight,

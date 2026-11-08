@@ -127,6 +127,12 @@ it keeps signed INT4 bytes and canonical FP32 checkpoint scales, with separate
 stable scale-times16 buffers for kernel execution. Core still owns checkpoint
 sharding, routing, shared-expert scheduling and final TP reduction. Dense INT8,
 ignored BF16/FP16 modules and per-row PLE retain their existing methods.
+Core's `-1` padding routes are translated to distinct unused expert IDs with
+zero routing weights at the packed provider boundary, preserving the vendor
+sorter's one-slot-per-expert/token contract. Fully padded hidden rows are zeroed
+before vendor execution, including unused nonfinite values. This uses device
+tensor predicates so padding changes remain visible during Graph replay;
+the caller's routing tensors and shared-expert inputs are unchanged.
 
 The initial native method accepts plain TP SiLU with BF16/FP16 activations and
 even, unpadded K/intermediate sizes. It refuses EP/DP/PCP/SP/EPLB, LoRA,

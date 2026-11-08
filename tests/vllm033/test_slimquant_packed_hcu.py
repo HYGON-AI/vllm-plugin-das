@@ -44,7 +44,7 @@ def _quantized_reference(x, ids, routes, weights, dtype, **decode):
     scale13, scale2, raw13, raw2 = [value for _, value in weights]
     xq, xs = quantize(x.cpu())
     ids, routes = ids.cpu(), routes.cpu()
-    slots = torch.empty((*ids.shape, x.shape[1]), dtype=dtype)
+    slots = torch.zeros((*ids.shape, x.shape[1]), dtype=dtype)
     for expert in range(raw13.shape[0]):
         rows, positions = torch.where(ids == expert)
         if not rows.numel():
@@ -106,8 +106,9 @@ def actual_parallel(tmp_path):
 
 
 @pytest.mark.parametrize("dtype_name", ["bfloat16", "float16"])
+@pytest.mark.parametrize("padding", [False, True])
 def test_actual_packed_constructor_loader_two_generations_and_graph(
-    actual_parallel, dtype_name, tmp_path
+    actual_parallel, dtype_name, padding, tmp_path
 ):
     import torch
     import vllm
@@ -122,6 +123,7 @@ def test_actual_packed_constructor_loader_two_generations_and_graph(
     out = Path(os.environ.get("HCU_PACKED_RESULT_DIRECTORY", tmp_path))
     out.mkdir(parents=True, exist_ok=True)
     dtype = getattr(torch, dtype_name)
+    record_name = dtype_name + ("-padding" if padding else "")
     with torch.device("cuda:0"):
         runner = FusedMoEFactory(
             num_experts=4,
@@ -140,6 +142,7 @@ def test_actual_packed_constructor_loader_two_generations_and_graph(
         record_metadata_for_reloading(layer)
     record = dict(
         dtype=dtype_name,
+        padding=padding,
         method_type=type(method).__name__,
         module_origin=implementation.__file__,
         core_version=str(vllm.__version__),
@@ -147,7 +150,7 @@ def test_actual_packed_constructor_loader_two_generations_and_graph(
         stage="SELECTED",
         full_model_accepted=False,
     )
-    (out / f"{dtype_name}.json").write_text(json.dumps(record, indent=2) + "\n")
+    (out / f"{record_name}.json").write_text(json.dumps(record, indent=2) + "\n")
     assert type(method).__name__ == "SlimQuantPackedExperts", (
         "Native raw packed selector missing"
     )
@@ -161,6 +164,9 @@ def test_actual_packed_constructor_loader_two_generations_and_graph(
     rejected = dict(swapped=False, unsigned=False)
     ids = torch.tensor([[0, 1], [1, 2], [2, 3]], dtype=torch.int32, device="cuda")
     routes = torch.tensor([[0.25, 0.75]] * 3, device="cuda")
+    if padding:
+        ids[0, 1] = -1
+        ids[1].fill_(-1)
     pointers = [
         getattr(layer, n).data_ptr()
         for n in [
@@ -242,6 +248,12 @@ def test_actual_packed_constructor_loader_two_generations_and_graph(
             if state:
                 ids.copy_(ids.roll(1, 0))
                 routes.copy_(routes.flip(1))
+            if padding:
+                ids.copy_(torch.tensor(
+                    [[0, -1], [-1, -1], [2, 3]] if not state else
+                    [[-1, -1], [1, 2], [-1, 3]], dtype=torch.int32, device="cuda"
+                ))
+                x.masked_fill_(~(ids >= 0).any(-1, keepdim=True), float("nan"))
             graph.replay()
             torch.cuda.synchronize()
             reference = _quantized_reference(x, ids, routes, weights, dtype).double()
@@ -279,4 +291,4 @@ def test_actual_packed_constructor_loader_two_generations_and_graph(
         graph_output_pointer_stable=True,
         scope="Actual TP1,4experts,signed/nonuniform quantized CPU references; not actualTP2/4 or fullcheckpoint/provider/performance acceptance",
     )
-    (out / f"{dtype_name}.json").write_text(json.dumps(record, indent=2) + "\n")
+    (out / f"{record_name}.json").write_text(json.dumps(record, indent=2) + "\n")
