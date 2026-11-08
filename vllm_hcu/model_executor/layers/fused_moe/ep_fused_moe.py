@@ -37,7 +37,8 @@ _announced = False
 STEP5_EXPERT_GRID = henvs.optional_custom_op_enabled(
     os.environ.get("HCU_STEP5_EXPERT_GRID", "0") == "1"
 )
-_step5_grid_announced = False
+STEP5_EXPERT_GRID_DP4_SHAPES = os.environ.get("HCU_STEP5_EXPERT_GRID_DP4_SHAPES", "0") == "1"
+_step5_grid_announced = set()
 STEP5_PREFILL_G2 = henvs.optional_custom_op_enabled(
     os.environ.get("HCU_STEP5_PREFILL_G2", "0") == "1"
 )
@@ -620,7 +621,8 @@ def _ep_fused_experts(hidden_states, w1, w2, topk_weights, topk_ids, expert_map,
         a_q, a_s = hidden_states, a1_scale.view(-1, 1) if a1_scale.numel() > 1 else a1_scale
 
     expert_layout = None
-    if (M == 256 and configs is None and STEP5_EXPERT_GRID
+    if ((M == 256 or (STEP5_EXPERT_GRID_DP4_SHAPES and M in (160, 192, 224)))
+            and configs is None and STEP5_EXPERT_GRID
             and EP_SORT_MAX_ROUTES >= M * topk):
         from .step5_expert_grid import can_use_expert_grid, expert_grid_configs
 
@@ -630,10 +632,9 @@ def _ep_fused_experts(hidden_states, w1, w2, topk_weights, topk_ids, expert_map,
             cfg1, cfg2 = expert_grid_configs()
             bm, presort, use_mls = 16, False, False
             expert_layout = torch.empty((E, 2), dtype=torch.int32, device=a_q.device)
-            global _step5_grid_announced
-            if not _step5_grid_announced:
-                _step5_grid_announced = True
-                print("[step5_expert_grid] active: E22 M256 BM16 workers4", flush=True)
+            if M not in _step5_grid_announced:
+                _step5_grid_announced.add(M)
+                print(f"[step5_expert_grid] active: E22 M{M} BM16 workers4", flush=True)
     sorting_args = (topk_ids, topk_weights, expert_mask, G, E, bm, expert_map)
     if expert_layout is None:
         sorted_ids, sorted_w, expert_ids, nvalid, rows = ep_sorting(*sorting_args)
