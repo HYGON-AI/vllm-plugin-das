@@ -51,7 +51,7 @@ jobs:
             export PATH="$HOME/.local/bin:$PATH"
             python3 .github/scripts/hcu_ci/ensure_ci_dependencies.py --user
             git config --global --add safe.directory "$GITHUB_WORKSPACE"
-            python3 .github/scripts/hcu_ci/hcu_ci_preflight.py --environment-lock "$ENVIRONMENT_LOCK" --check-lock-only
+            python3 .github/scripts/hcu_ci/hcu_ci_preflight.py --environment-lock .github/workflows/configs/hcu-runner-environment.json --check-lock-only
             python3 .github/scripts/hcu_ci/compile_changed_python.py --base "$BASE_SHA" --head "$HEAD_SHA"
             python3 .github/scripts/hcu_ci/verify_hcu_registration.py
             python3 .github/scripts/hcu_ci/build_hcu_matrix.py --profile nightly >/dev/null
@@ -100,7 +100,7 @@ jobs:
             export PATH="$HOME/.local/bin:$PATH"
             python3 .github/scripts/hcu_ci/ensure_ci_dependencies.py --user
             git config --global --add safe.directory "$GITHUB_WORKSPACE"
-            python3 .github/scripts/hcu_ci/hcu_ci_preflight.py --environment-lock "$ENVIRONMENT_LOCK" --check-lock-only
+            python3 .github/scripts/hcu_ci/hcu_ci_preflight.py --environment-lock .github/workflows/configs/hcu-runner-environment.json --check-lock-only
             python3 .github/scripts/hcu_ci/compile_changed_python.py --base "$BASE_SHA" --head "$HEAD_SHA"
             python3 .github/scripts/hcu_ci/verify_hcu_registration.py
             python3 .github/scripts/hcu_ci/build_hcu_matrix.py --profile nightly >/dev/null
