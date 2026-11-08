@@ -510,6 +510,8 @@
         "vllm_hcu/v1/pcp_manager.py",
         "tests/**hy_v4*",
         "tests/**hyv4*",
+        "tools/hyv4_realworldqa_eval.py",
+        "tools/hy_v4/vl_pd_validation/**",
         "tests/integration/model_runtime.py",
         "tests/integration/test_model_runtime_cli.py"
       ],

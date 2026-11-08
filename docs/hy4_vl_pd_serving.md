@@ -31,6 +31,8 @@ nodes (run only the relevant copy for each node):
 ```bash
 mkdir -p /workspace/hy4_mm_20261108/probe
 cp tools/hy_v4/vl_pd_validation/{build_vl_maps,vl_calibration_probe,vl_calibration_client_v2,vl_diagnostic_probe,vl_inspection_probe,vl_arrival_bench}.py /workspace/hy4_mm_20261108/probe/
+# Corrected proxy entry point for future runs, kept beside its frozen dependency:
+cp tools/hy_v4/vl_pd_validation/{managed_proxy_ka1,proxy_task_lifecycle,mooncake_connector_proxy_ka1}.py /workspace/hy4_mm_20261108/probe/
 # D node, to reproduce the original measured proxy path:
 mkdir -p /workspace/hy4_mm_20261108/pd-r16-inspect-v1
 cp tools/hy_v4/vl_pd_validation/{measured_proxy_ka1,mooncake_connector_proxy_ka1}.py /workspace/hy4_mm_20261108/pd-r16-inspect-v1/
@@ -158,6 +160,10 @@ exec /usr/bin/python -m vllm.entrypoints.cli.main serve /data_hy4_w4a8/Hy4-testi
 
 ## Proxy (126 container)
 
+The following is the historical measured command. Its frozen task ownership
+and timing wrapper are retained solely to identify that measurement; use the
+corrected entry point below for new runs.
+
 ```bash
 #!/bin/bash
 set -eu
@@ -167,6 +173,26 @@ exec /usr/bin/python /workspace/hy4_mm_20261108/pd-r16-inspect-v1/measured_proxy
 ```
 
 The proxy sends P and D concurrently. D can wait for remote P/KV before first scheduling. P/D engine TTFTs and D queue time therefore overlap; do not sum the two TTFTs or call all D queue time compute contention. The proxy first-byte observation may include a role/empty chunk; client TTFT uses first nonempty content.
+
+### Corrected proxy for new runs (not rebenchmarked)
+
+```bash
+export NO_PROXY='*' no_proxy='*' VLLM_PLUGINS=__disabled__
+export HY4_PD_PROXY_TIMEOUT_SECONDS=300
+unset http_proxy https_proxy all_proxy HTTP_PROXY HTTPS_PROXY ALL_PROXY
+/usr/bin/python /workspace/hy4_mm_20261108/probe/managed_proxy_ka1.py \
+  --host 0.0.0.0 --port 8002 \
+  --prefill http://10.41.101.127:8000 18998 \
+  --decode http://10.41.101.126:8000
+```
+
+This entry point still starts P and D concurrently and uses the frozen
+KA1/retries0 client pools. It supervises P failures, cancels and joins pending
+upstreams on D failure or downstream disconnect, and bounds upstream waits to
+the configured finite positive deadline. It does not append to the historical
+phase logs. Restart it when P changes engine_id. Use fresh client output paths.
+No new HCU, accuracy or throughput measurement is claimed for this entry point;
+all result tables below remain tied to the historical measured proxy.
 
 ## Full accuracy evaluation client (126 container)
 

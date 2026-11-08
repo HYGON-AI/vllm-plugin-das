@@ -34,7 +34,7 @@ The scope label is **executed real top-k including PCP padding; -1 slots exclude
 Run on the native CPU environment with torch and numpy available. The native policy source is read and SHA checked, then its `DefaultEplbPolicy` class body executes verbatim with CPU torch/numpy and a neutral abstract base. No native GPU/platform import is needed in `--policy-source` mode. Alternatively omit that flag to use the installed native policy on D's CPU. Accelerator visibility and plugins are disabled before policy loading.
 
 ```bash
-python /workspace/hy4_mm_20261108/build_vl_maps.py \
+python /workspace/hy4_mm_20261108/probe/build_vl_maps.py \
   --fit-manifest /workspace/hy4_mm_20261108/fit-stop.json \
   --heldout-manifest /workspace/hy4_mm_20261108/heldout-stop.json \
   --provenance /workspace/hy4_mm_20261108/provenance.json \
@@ -87,7 +87,7 @@ The example placeholders are not accepted hashes. Save every selected item and e
 After a fresh candidate heldout capture, run:
 
 ```bash
-python /workspace/hy4_mm_20261108/build_vl_maps.py \
+python /workspace/hy4_mm_20261108/probe/build_vl_maps.py \
   --analyze-manifest /workspace/hy4_mm_20261108/r16-heldout-stop.json
 ```
 
