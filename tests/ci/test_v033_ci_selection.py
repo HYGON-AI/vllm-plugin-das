@@ -104,7 +104,8 @@ class SelectionTests(unittest.TestCase):
         from run_v033_ci import validate_result, test_files
         self.assertTrue(test_files('source'))
         self.assertEqual(set(test_files('device')), {
-            p.relative_to(ROOT).as_posix() for p in (ROOT / 'tests/vllm033').glob('*_hcu.py')})
+            p.relative_to(ROOT).as_posix() for p in (ROOT / 'tests/vllm033').glob('*_hcu.py')
+        } | {'tests/vllm033/test_slimquant.py'})
         with tempfile.TemporaryDirectory() as directory:
             report = Path(directory) / 'junit.xml'
             for text in ['<testsuites/>', '<testsuite><testcase><skipped/></testcase></testsuite>',

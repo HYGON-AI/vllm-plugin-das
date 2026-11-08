@@ -7,10 +7,10 @@ from types import SimpleNamespace
 import pytest
 import torch
 
-pytestmark = pytest.mark.skipif(
+pytestmark = [pytest.mark.hcu, pytest.mark.skipif(
     os.getenv("VLLM033_HCU_TEST") != "1",
     reason="set VLLM033_HCU_TEST=1 on a prepared HCU node",
-)
+)]
 
 
 @pytest.mark.parametrize('layout_name',('LBHNC','LBNHC'))

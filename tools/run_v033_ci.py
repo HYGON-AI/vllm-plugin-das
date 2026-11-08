@@ -7,6 +7,7 @@ remain available, and torch.compile and Graph coverage are unchanged.
 """
 from __future__ import annotations
 import argparse
+import ast
 import json
 import os
 from pathlib import Path
@@ -23,13 +24,33 @@ PUBLIC_SELECTOR_CASES = ('normal', 'optional', 'required', 'commit',
                          'config', 'fork', 'spawn')
 
 
+def _has_hcu_contracts(path):
+    """Read marker declarations without importing portable test modules."""
+    tree = ast.parse(path.read_text(), filename=str(path))
+    def marked(value):
+        return any(isinstance(node, ast.Attribute)
+                   and ast.unparse(node) == 'pytest.mark.hcu'
+                   for node in ast.walk(value))
+    for owner in [tree, *(node for node in ast.walk(tree) if isinstance(node, ast.ClassDef))]:
+        for node in owner.body:
+            if isinstance(node, ast.Assign) and any(
+                isinstance(target, ast.Name) and target.id == 'pytestmark'
+                for target in node.targets
+            ) and marked(node.value):
+                return True
+    return any(any(marked(decorator) for decorator in node.decorator_list)
+               for node in ast.walk(tree)
+               if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef, ast.ClassDef)))
+
+
 def test_files(tier):
     if tier == 'source':
         return SOURCE_TESTS
     return [p.relative_to(ROOT).as_posix()
             for p in sorted((ROOT / 'tests/vllm033').glob('test_*.py'))
-            if p.name.endswith('_hcu.py') == (tier == 'device')
-            and p.relative_to(ROOT).as_posix() != PUBLIC_SELECTOR_TEST]
+            if p.relative_to(ROOT).as_posix() != PUBLIC_SELECTOR_TEST
+            and (_has_hcu_contracts(p) if tier == 'device'
+                 else not p.name.endswith('_hcu.py'))]
 
 
 def _vllm_release(raw_version):
@@ -101,12 +122,15 @@ def main():
     environment['VLLM_PLUGINS'] = 'hcu_adapter'
     environment.pop('PYTHONPATH', None)
     environment['PYTHONNOUSERSITE'] = '1'
+    if args.tier == 'source':
+        environment['HCU_V033_VERIFY_INSTALLED'] = '0'
     if args.tier in {'source', 'portable'}:
         environment.update(HCU_ADAPTER_HOST='none', HIP_VISIBLE_DEVICES='-1',
                            ROCR_VISIBLE_DEVICES='-1', CUDA_VISIBLE_DEVICES='-1')
         if args.tier == 'source' and not environment.get('VLLM_TARGET_ROOT'):
             raise ValueError('source tier requires VLLM_TARGET_ROOT')
     if args.tier in {'portable', 'device'}:
+        environment['HCU_V033_VERIFY_INSTALLED'] = '1'
         # Small CI suites do not need the default compiler sidecar pool. Its
         # interpreter startup can still run Adapter bootstrap during pytest exit.
         environment.setdefault('TORCHINDUCTOR_COMPILE_THREADS', '1')
@@ -115,7 +139,8 @@ def main():
         if args.tier == 'device':
             environment.update(HCU_ADAPTER_HOST='vllm', VLLM_PLUGINS='hcu_adapter',
                            VLLM033_HCU_TEST='1', HCU_VLLM033_RMSNORM_LIVE='1',
-                           HCU_VLLM033_GRAPH_LIVE='1', HCU_VLLM033_AITER_INT8_LIVE='1')
+                           HCU_VLLM033_GRAPH_LIVE='1', HCU_VLLM033_AITER_INT8_LIVE='1',
+                           HCU_SLIMQUANT_LIVE='1')
         installed_version, installed_root = _installed_vllm(environment)
         if _vllm_release(installed_version)[:2] != (0, 33):
             raise ValueError('installed image must provide epoch-zero vLLM 0.33')
@@ -125,7 +150,11 @@ def main():
         if args.tier == 'portable':
             environment['VLLM_TARGET_ROOT'] = installed_root
             _run_public_selector_cases(environment)
-    result = subprocess.run([sys.executable, '-m', 'pytest', '-q', *files,
+    # A file may contain portable contracts and marked HCU numerics together.
+    # Select actual pytest markers rather than inferring hardware from its name.
+    marker_args = [] if args.tier == 'source' else [
+        '-m', 'hcu' if args.tier == 'device' else 'not hcu']
+    result = subprocess.run([sys.executable, '-m', 'pytest', '-q', *files, *marker_args,
         '--strict-markers', '--junitxml', str(args.junit.resolve()),
         '-o', 'xfail_strict=true', '-o', 'cache_dir=.pytest_cache/v033'], cwd=ROOT, env=environment)
     if result.returncode:

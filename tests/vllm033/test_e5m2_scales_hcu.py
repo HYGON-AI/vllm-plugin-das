@@ -8,10 +8,10 @@ import torch
 
 from test_flash_attention_hcu import _make_impl, _make_packed_cache
 
-pytestmark = pytest.mark.skipif(
+pytestmark = [pytest.mark.hcu, pytest.mark.skipif(
     os.getenv("VLLM033_HCU_TEST") != "1" or not torch.cuda.is_available(),
     reason="set VLLM033_HCU_TEST=1 on a prepared HCU node",
-)
+)]
 
 
 def _reference(q, k, v):
