@@ -79,7 +79,7 @@ jobs:
           printf '%s\n' "${MATRIX}" | head -c 3000; echo
 
   legacy:
-    if: github.repository == 'HYGON-AI/vllm-plugin-das' && github.ref == 'refs/heads/test/k8s-runner-20261108'
+    if: github.repository == 'HYGON-AI/vllm-plugin-das' && github.ref == 'refs/heads/test/k8s-runner-20261108' && !contains(github.event.head_commit.message, '[k8s-only]')
     name: Static gate (legacy ci bw1100)
     runs-on: [self-hosted, ci, bw1100]
     timeout-minutes: 60
