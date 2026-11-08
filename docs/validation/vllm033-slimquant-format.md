@@ -28,6 +28,11 @@ Expert scales convert from the checkpoint's high-nibble units by multiplying
 by 16 before the official INT8 loader. Dense and PLE scales retain their units.
 The expanded expert weights consume more memory than packed W4A8 kernels.
 
+The decoder supports dynamic per-token INT8 activations and per-channel
+dense weights. Explicit incompatible top-level/expert activation declarations
+or dense weight scope fail during configuration parsing. Omitted top-level
+activation, expert activation and dense scope retain those format defaults.
+
 Ignore patterns use Core's existing glob/regex matcher. Expert gate/up and down
 projections share one method: all ignored selects BF16; partial ignores refuse.
 PLE shards also share one storage method. Their actual count comes from the
