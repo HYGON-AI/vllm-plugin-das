@@ -86,12 +86,12 @@ def step5_ht_launch_config(prepare, original, *, combine=False):
     recv_tokens = getattr(prepare, "_hcu_step5_recv_tokens", 512)
     if not hasattr(prepare, "_hcu_step5_num_sms"):
         return original
-    if prepare.num_dispatchers_ != 16 or original is None:
-        raise ValueError("Step5 custom NVL chunks require EP16 high-throughput configuration")
+    if prepare.num_dispatchers_ not in (8, 16) or original is None:
+        raise ValueError("Step5 custom NVL chunks require EP8/EP16 high-throughput configuration")
     config = type(original)(prepare._hcu_step5_num_sms, send, recv_tokens, 16, 128)
     # A smaller receive queue lets more channels fit the startup allocation.
     # Enforce the conservative BF16-width hint even for FP8 dispatch.
-    if config.get_nvl_buffer_size_hint(4096 * 2, 16) > prepare.buffer.num_nvl_bytes:
+    if config.get_nvl_buffer_size_hint(4096 * 2, prepare.num_dispatchers_) > prepare.buffer.num_nvl_bytes:
         raise ValueError("Step5 DeepEP runtime config exceeds its reserved NVL buffer")
     return config
 
@@ -119,8 +119,8 @@ def configure_step5_ht_kernel(kernel, moe_quant_config, moe_config):
         prepare._hcu_step5_profile_dbo_output_requested = bool(owner and configured_dbo)
         prepare._hcu_step5_runtime_tuning_allowed = bool(owner)
         if owner and configured_dbo and os.environ.get("HCU_STEP5_DEEPEP_DBO_BUFFER_PAIR", "0") == "1":
-            if prepare.num_dispatchers_ != 16 or os.environ.get("DEEP_EP_NORMAL_MNVL") != "1":
-                raise ValueError("Step5 DeepEP buffer-pair overlap requires EP16 NORMAL MNVL")
+            if prepare.num_dispatchers_ not in (8, 16) or os.environ.get("DEEP_EP_NORMAL_MNVL") != "1":
+                raise ValueError("Step5 DeepEP buffer-pair overlap requires EP8/EP16 NORMAL MNVL")
             fused_scatter_requested = os.environ.get("HCU_STEP5_DEEPEP_FUSED_SCATTER", "0") == "1"
             if fused_scatter_requested:
                 if not (
@@ -464,6 +464,12 @@ def _uses_post_dispatch_channel_fp8_quant(quant_config) -> bool:
     )
 
 
+def _step5_fused_scatter_alignment(num_dispatchers, num_experts):
+    if num_dispatchers == 8 and num_experts == 352 and os.environ.get("HCU_STEP5_EP8_WASP128_LIBRARY"):
+        return 128
+    return 256
+
+
 def ht_do_dispatch(
     module,
     self,
@@ -553,8 +559,10 @@ def ht_do_dispatch(
     fused_scatter = bool(getattr(self, "_hcu_step5_fused_scatter_enabled", False))
     scatter_kwargs = {}
     if fused_scatter:
-        if not (has_scales and expert_alignment == 256 and num_experts in (352, 368)):
-            raise ValueError("Step5 fused scatter requires E22/E23 with EP16 per-token FP8 scales")
+        valid_experts = {8: (352,), 16: (352, 368)}.get(self.num_dispatchers_, ())
+        if not (has_scales and expert_alignment == 256 and num_experts in valid_experts):
+            raise ValueError("Step5 fused scatter requires E44 with EP8 or E22/E23 with EP16 per-token FP8 scales")
+        expert_alignment = _step5_fused_scatter_alignment(self.num_dispatchers_, num_experts)
         data, scales = token_data
         if data.dtype != module.torch.float8_e4m3fn or scales.shape != (data.size(0), 1):
             raise ValueError("Step5 fused scatter requires FP8 [M,4096] and float32 [M,1]")
@@ -686,10 +694,12 @@ def ht_receiver(
     ubatch_id = module.dbo_current_ubatch_id()
     if getattr(self, "_hcu_step5_fused_scatter_enabled", False):
         counts = tuple(expert_num_tokens_per_expert_list)
-        if len(counts) not in (22, 23) or any(
-            type(c) is not int or c < 0 or c % 256 for c in counts
+        alignment = _step5_fused_scatter_alignment(self.num_dispatchers_, num_experts)
+        expert_tokens_meta._hcu_step5_fused_scatter_alignment = alignment
+        if len(counts) != num_experts // self.num_dispatchers_ or any(
+            type(c) is not int or c < 0 or c % alignment for c in counts
         ):
-            raise ValueError("Step5 fused scatter requires aligned E22/E23 dispatch counts")
+            raise ValueError("Step5 fused scatter requires aligned counts for every local expert")
         rows = sum(counts)
         sx, ss, si, sm = self._hcu_step5_scatter_buffers[(id(self.buffer), ubatch_id)]
         for tensor in (sx, ss, si, sm):

@@ -1,5 +1,5 @@
 # SPDX-License-Identifier: Apache-2.0
-"""Byte-exact Step5 DP dispatch packing for the uniform M=64 decode path.
+"""Byte-exact Step5 DP dispatch packing for uniform decode shapes.
 
 All peers must supply the same tensor count, dtypes, trailing dimensions and
 uniform row sizes, as required by the underlying NCCL all-gather. Local strides
@@ -11,6 +11,8 @@ from __future__ import annotations
 import torch
 
 from vllm.triton_utils import tl, triton
+
+DP4_EXTRA_ROWS = (40, 48, 56)
 
 
 @triton.jit
@@ -52,15 +54,19 @@ def packed_step5_all_gatherv(comm, inputs, original, dim=0, sizes=None):
         return None
     x, weights, ids, scale = inputs
     world = comm.world_size
-    if not 2 <= world <= 16 or x.ndim != 2 or x.shape != (64, 4096):
+    if x.ndim != 2:
+        return None
+    rows, width = x.shape
+    supported_rows = rows == 64 or (world == 4 and rows in DP4_EXTRA_ROWS)
+    if width != 4096 or not supported_rows or not 2 <= world <= 16:
         return None
     if x.element_size() != 1 or weights.dtype != torch.float32:
         return None
     if ids.dtype not in (torch.int32, torch.int64) or scale.dtype != torch.float32:
         return None
-    if weights.shape != (64, 8) or ids.shape != (64, 8) or scale.shape != (64, 1):
+    if weights.shape != (rows, 8) or ids.shape != (rows, 8) or scale.shape != (rows, 1):
         return None
-    if sizes is not None and (len(sizes) != world or any(s != 64 for s in sizes)):
+    if sizes is not None and (len(sizes) != world or any(s != rows for s in sizes)):
         return None
     if not x.is_cuda or any(t.device != x.device for t in inputs):
         raise ValueError("packed Step5 all-gather requires one GPU device per rank")
@@ -76,7 +82,7 @@ def packed_step5_all_gatherv(comm, inputs, original, dim=0, sizes=None):
     if gathered.dtype != torch.uint8 or gathered.numel() != world * total:
         raise RuntimeError("packed Step5 all-gather returned an invalid byte buffer")
     outputs = [
-        torch.empty((world * 64, *t.shape[1:]), dtype=t.dtype, device=t.device)
+        torch.empty((world * rows, *t.shape[1:]), dtype=t.dtype, device=t.device)
         for t in inputs
     ]
     _unpack4[(triton.cdiv(world * total, 4096),)](

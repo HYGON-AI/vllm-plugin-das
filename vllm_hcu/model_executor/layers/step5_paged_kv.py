@@ -10,6 +10,7 @@ and orders attention on its compute stream before the next MoE handoff.
 """
 from __future__ import annotations
 
+import os
 from typing import Any
 
 import torch
@@ -91,6 +92,20 @@ def write_paged_kv_and_get_flat(
         )
     flat_k, flat_v = _FLAT_BUFFERS[workspace_key]
     used = _read_blocks(metadata, blocks, page, base.device)
+    if (
+        os.environ.get("HCU_STEP5_EP8_SPARSE_GROUP_MAJOR") == "1"
+        and base.is_cuda and base.dtype == torch.float8_e4m3fn
+        and heads == 4 and dim == 192
+        and getattr(metadata, "num_prefills", 0) > 0
+        and getattr(metadata, "num_decodes", 0) == 0
+    ):
+        from vllm.logger import init_logger
+        from .ep8_sparse_group_major import copy
+
+        init_logger("vllm.hcu.step5_paged_kv").info_once(
+            "Step5 EP8 group-major sparse KV workspace active", scope="process"
+        )
+        return copy(base, used, (flat_k.view(torch.uint8), flat_v.view(torch.uint8)))
     k_pages = base[..., :dim].transpose(1, 2)
     v_pages = base[..., dim:].transpose(1, 2)
     # Copy bytes so FP8 representations are preserved exactly and the path
