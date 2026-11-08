@@ -121,7 +121,7 @@ def make_state(monkeypatch):
     monkeypatch.setattr(default, "get_rope_state", lambda *a, **k: _CPURope())
     monkeypatch.setattr(default, "maybe_create_mm_pruner", lambda *a: None)
 
-    def make(pcp=16):
+    def make(pcp=16, *, with_encoder_cache=True):
         config = SimpleNamespace(
             model_config=SimpleNamespace(
                 max_model_len=128,
@@ -133,7 +133,11 @@ def make_state(monkeypatch):
             ),
             parallel_config=SimpleNamespace(prefill_context_parallel_size=pcp),
         )
-        cache = SimpleNamespace(mm_features={}, encoder_outputs={})
+        cache = (
+            SimpleNamespace(mm_features={}, encoder_outputs={})
+            if with_encoder_cache
+            else None
+        )
         state = HYV4VLModelState(config, _Model(), cache, torch.device("cpu"))
         return state, cache
 
@@ -379,6 +383,22 @@ def test_pcp1_capture_and_dummy_use_native_storage(make_state):
         "local" in name and isinstance(value, torch.Tensor)
         for name, value in vars(state).items()
     )
+
+
+def test_pcp1_disabled_images_prepare_positions_without_encoder(make_state):
+    state, cache = make_state(1, with_encoder_cache=False)
+    assert cache is None
+    assert not state.supports_mm_inputs
+    assert not hasattr(state, "encoder_runner")
+    positions = state.rope_state.get_positions(5)
+    positions.fill_(31)
+
+    capture = state.prepare_dummy_inputs(2, 5)
+
+    assert set(capture) == {"positions"}
+    assert capture["positions"].shape == (3, 5)
+    assert capture["positions"].data_ptr() == positions.data_ptr()
+    assert not capture["positions"].any()
 
 
 def test_native_request_and_attention_lifecycle_remains_inherited():

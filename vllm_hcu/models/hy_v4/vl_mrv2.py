@@ -113,7 +113,8 @@ class HYV4VLModelState(DefaultModelState):
         return model_inputs
 
     def prepare_dummy_inputs(self, num_reqs, num_tokens):
-        return {
-            "inputs_embeds": self.dummy_inputs_embeds(num_tokens),
-            "positions": self._dummy_positions(num_tokens),
-        }
+        model_inputs = {}
+        if self.supports_mm_inputs:
+            model_inputs["inputs_embeds"] = self.dummy_inputs_embeds(num_tokens)
+        model_inputs["positions"] = self._dummy_positions(num_tokens)
+        return model_inputs
