@@ -89,8 +89,17 @@ def slimquant_w4a8_uses_deepep_ht(moe_config: object) -> bool:
     config = get_current_vllm_config_or_none()
     if config is None:
         config = getattr(moe_config, "_hcu_vllm_config", None)
-    if model_architectures(config) != ("HYV4ForCausalLM",):
-        raise ValueError("SlimQuant W4A8 PCP HT requires HYV4ForCausalLM")
+    architectures = model_architectures(config)
+    if architectures not in (("HYV4ForCausalLM",), ("HYV4VLForConditionalGeneration",)):
+        raise ValueError(
+            "SlimQuant W4A8 PCP HT requires HYV4ForCausalLM "
+            "or HYV4VLForConditionalGeneration"
+        )
+    if (
+        architectures == ("HYV4VLForConditionalGeneration",)
+        and getattr(config, "speculative_config", None) is not None
+    ):
+        raise ValueError("SlimQuant W4A8 HYV4-VL does not support MTP")
     if getattr(moe_config, "moe_backend", "auto") not in ("auto", "deep_gemm"):
         raise ValueError(
             "SlimQuant W4A8 PCP HT requires moe_backend='auto' or 'deep_gemm'"
@@ -127,8 +136,41 @@ def slimquant_w4a8_uses_deepep_ll(moe_config: object) -> bool:
     config = get_current_vllm_config_or_none()
     if config is None:
         config = getattr(moe_config, "_hcu_vllm_config", None)
-    if model_architectures(config) != ("HYV4ForCausalLM",):
-        raise ValueError("SlimQuant W4A8 DeepEP LL requires HYV4ForCausalLM")
+    architectures = model_architectures(config)
+    if architectures not in (("HYV4ForCausalLM",), ("HYV4VLForConditionalGeneration",)):
+        raise ValueError(
+            "SlimQuant W4A8 DeepEP LL requires HYV4ForCausalLM "
+            "or HYV4VLForConditionalGeneration"
+        )
+    if architectures == ("HYV4VLForConditionalGeneration",):
+        outer_parallel = getattr(config, "parallel_config", None)
+        expected_outer = {
+            "pipeline_parallel_size": 1,
+            "tensor_parallel_size": 1,
+            "prefill_context_parallel_size": 1,
+            "data_parallel_size": 16,
+            "decode_context_parallel_size": 1,
+        }
+        expected_moe = {"pcp_size": 1, "dp_size": 16, "ep_size": 16, "tp_size": 1}
+        if (
+            any(
+                getattr(outer_parallel, name, None) != value
+                for name, value in expected_outer.items()
+            )
+            or any(
+                getattr(parallel, name, None) != value
+                for name, value in expected_moe.items()
+            )
+        ):
+            raise ValueError(
+                "SlimQuant W4A8 HYV4-VL DeepEP LL requires "
+                "PP1/TP1/PCP1/DP16/DCP1/EP16"
+            )
+    if (
+        architectures == ("HYV4VLForConditionalGeneration",)
+        and getattr(config, "speculative_config", None) is not None
+    ):
+        raise ValueError("SlimQuant W4A8 HYV4-VL does not support MTP")
     if getattr(moe_config, "moe_backend", "auto") not in ("auto", "deep_gemm"):
         raise ValueError(
             "SlimQuant W4A8 DeepEP LL requires moe_backend='auto' or 'deep_gemm'"

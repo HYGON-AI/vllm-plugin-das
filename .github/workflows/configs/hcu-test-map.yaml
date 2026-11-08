@@ -506,6 +506,8 @@
       "patterns": [
         "vllm_hcu/**hy_v4*",
         "vllm_hcu/**hyv4*",
+        "vllm_hcu/v1/hcu_model_runner_v2.py",
+        "vllm_hcu/v1/pcp_manager.py",
         "tests/**hy_v4*",
         "tests/**hyv4*",
         "tests/integration/model_runtime.py",

@@ -558,8 +558,12 @@ def test_receiver_preserves_native_list_for_later_validation():
     [(True, True), (False, False), (None, False)],
     ids=["eager", "not-eager", "missing-eager"],
 )
+@pytest.mark.parametrize("model_type", ["hy_v4", "hy_v4_mtp", "hy_v4_vl", "unknown"])
+@pytest.mark.parametrize("scratch_enabled", [True, False])
+@pytest.mark.parametrize("static_eplb", [True, False])
+@pytest.mark.parametrize("route", ["ht", "ll", "auto"])
 def test_post_load_caller_requires_explicit_eager_for_static_owner(
-    monkeypatch, eager, expects_owner
+    monkeypatch, eager, expects_owner, model_type, scratch_enabled, static_eplb, route
 ):
     import sys
     import types
@@ -570,9 +574,9 @@ def test_post_load_caller_requires_explicit_eager_for_static_owner(
         "vllm_hcu.model_executor.layers.fused_moe.experts.dpsk_v4_deep_gemm_moe"
     )
     runtime = types.ModuleType(runtime_name)
-    runtime.slimquant_w4a8_uses_deepep_ht = lambda moe: True
-    runtime.slimquant_w4a8_uses_deepep_ll = lambda moe: False
-    runtime.slimquant_w4a8_uses_deepep_auto = lambda moe: False
+    runtime.slimquant_w4a8_uses_deepep_ht = lambda moe: route == "ht"
+    runtime.slimquant_w4a8_uses_deepep_ll = lambda moe: route == "ll"
+    runtime.slimquant_w4a8_uses_deepep_auto = lambda moe: route == "auto"
     monkeypatch.setitem(sys.modules, runtime_name, runtime)
     observed = []
 
@@ -589,7 +593,7 @@ def test_post_load_caller_requires_explicit_eager_for_static_owner(
     factories.make_deepep_ll_deepgemm_w4a8_moe_kernel = factory
     factories.make_deepep_auto_deepgemm_w4a8_moe_kernel = factory
     monkeypatch.setitem(sys.modules, factory_name, factories)
-    model_config = SimpleNamespace(hf_config=SimpleNamespace(model_type="hy_v4"))
+    model_config = SimpleNamespace(hf_config=SimpleNamespace(model_type=model_type))
     if eager is not None:
         model_config.enforce_eager = eager
     vllm_config = types.ModuleType("vllm.config")
@@ -603,7 +607,7 @@ def test_post_load_caller_requires_explicit_eager_for_static_owner(
         "_SLIMQUANT_MOE_LAYOUT_TENSORS": ("weight",),
         "_SLIMQUANT_MOE_WEIGHT_TENSORS": ("weight",),
         "_slimquant_moe_tensor_generation": lambda layer, names: 1,
-        "henvs": SimpleNamespace(VLLM_HCU_STATIC_HT_W4A8_COUNT_SCRATCH=True),
+        "henvs": SimpleNamespace(VLLM_HCU_STATIC_HT_W4A8_COUNT_SCRATCH=scratch_enabled),
     }
     import __future__
 
@@ -634,12 +638,13 @@ def test_post_load_caller_requires_explicit_eager_for_static_owner(
     )
     owner = SimpleNamespace(
         moe=object(),
-        _hcu_static_eplb=True,
+        _hcu_static_eplb=static_eplb,
         get_fused_moe_quant_config=lambda layer: object(),
     )
     ns["process_weights_after_loading"](owner, layer)
     assert len(observed) == 1
-    if expects_owner:
+    if (expects_owner and model_type != "unknown" and scratch_enabled
+            and static_eplb and route == "ht"):
         assert observed[0]["static_owner"] is layer
     else:
         assert "static_owner" not in observed[0]

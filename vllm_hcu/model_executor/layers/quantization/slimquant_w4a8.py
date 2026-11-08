@@ -385,7 +385,8 @@ class SlimQuantW4A8Int8AiterMoEMethod(FusedMoEMethodBase):
                 if (getattr(self, "_hcu_static_eplb", False)
                         and getattr(getattr(config, "model_config", None),
                                     "enforce_eager", False) is True
-                        and getattr(hf_config, "model_type", None) in ("hy_v4", "hy_v4_mtp")):
+                        and getattr(hf_config, "model_type", None) in (
+                            "hy_v4", "hy_v4_mtp", "hy_v4_vl")):
                     factory_kwargs["static_owner"] = layer
             self.moe_kernel = factory(
                 moe_quant_config=self.moe_quant_config,
