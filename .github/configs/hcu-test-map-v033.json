@@ -1,0 +1,39 @@
+{
+  "version": 1,
+  "release": "v0.33.0",
+  "jobs": {
+    "v033-source-contract": {
+      "scope": "CPU source and packaging contracts"
+    },
+    "v033-device-gfx936": {
+      "scope": "installed-wheel HCU operator and Graph contracts"
+    }
+  },
+  "groups": {
+    "v033-package": [
+      "adapter_extension/**"
+    ],
+    "v033-tests": [
+      "tests/vllm033/**",
+      "tests/ci/**"
+    ],
+    "ci": [
+      ".github/**",
+      "tools/**",
+      "pytest.ini",
+      "requirements*.txt"
+    ]
+  },
+  "docs_only_patterns": [
+    "**/*.md",
+    "*.md",
+    "**/*.rst",
+    "*.rst",
+    "LICENSE",
+    "NOTICE"
+  ],
+  "fallback_jobs": [
+    "v033-source-contract",
+    "v033-device-gfx936"
+  ]
+}
