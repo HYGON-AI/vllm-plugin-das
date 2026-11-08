@@ -82,6 +82,7 @@ def evaluate(index, row, args, extract_mcq):
     }
     result = {
         "index": index,
+        "base_url": args.base_url.rstrip("/"),
         "question": row["question"],
         "answer": row["answer"],
         "image_size": list(image.size),
@@ -182,6 +183,7 @@ def main():
     )
     parser.add_argument("--timeout", type=int, default=300)
     args = parser.parse_args()
+    args.base_url = args.base_url.rstrip("/")
     args.output_dir.mkdir(parents=True, exist_ok=True)
     spec = importlib.util.spec_from_file_location("mcq_extract", args.mcq_extractor)
     extractor = importlib.util.module_from_spec(spec)
@@ -204,6 +206,7 @@ def main():
         "scorer_revision": SCORER_REVISION,
         "extractor_sha256": sha256(args.mcq_extractor),
         "model": args.model,
+        "base_url": args.base_url,
         "temperature": 0,
         "top_p": 1.0,
         "seed": 0,

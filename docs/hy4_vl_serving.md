@@ -7,6 +7,13 @@ image, after installing plugin dependencies and building its native extension
 serving commands; video, encoder-only mode and speculative decoding are
 unsupported.
 
+The vision patch embedding refreshes its derived FP32 position table in place
+before reuse. This keeps image inference consistent with changed position
+weights after reload, including kernel-format updates that bypass the model
+loader, while preserving references held by captured work. The review fix has
+focused CPU reload/cache regressions; its HCU graph regression is included for
+native CI, and no new HCU timing result is claimed for this follow-up.
+
 Vision tower/connector LoRA (`enable_tower_connector_lora=True`) is rejected
 before model allocation because the multimodal LoRA token-count interfaces
 are not implemented. This restriction does not disable language-only LoRA.
@@ -171,7 +178,12 @@ Use the same value on both sides. The evaluator requires all 765 original items,
 preserves original prompts, uses temperature 0 / top-p 1 / seed 0 / no_think,
 and reports HTTP failures, empty answers and truncations without dropping them.
 Use a new output directory for each mode. Resuming requires matching code,
-dataset, scorer and settings; do not mix modes in one results directory.
+dataset, scorer, normalized endpoint and settings; do not mix modes in one
+results directory. The endpoint is recorded in the manifest and each result.
+Older manifests without an endpoint are rejected; start a new output directory
+instead of combining them with a new run. An unchanged URL does not prove that
+the deployed weights/configuration are unchanged, so retain the server revision
+and launch settings with each run.
 
 Compare original predictions as well as the aggregate score. For two completed
 runs, after changing the paths to the directories of interest:

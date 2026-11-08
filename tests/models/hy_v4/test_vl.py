@@ -8,6 +8,7 @@ from vllm_hcu.models.hy_v4.vl import (
     HYV4PatchProjection,
     HYV4VisionBlock,
     HYV4VisionMerger,
+    HYV4VisionPatchEmbed,
     HYV4VLForConditionalGeneration,
     HYV4VLProcessor,
 )
@@ -425,3 +426,100 @@ def test_multiaxis_rope_matches_interleaved_pair_rotation():
 
     torch.testing.assert_close(actual_q, rotate(query))
     torch.testing.assert_close(actual_k, rotate(key))
+
+
+def _position_reload_fixture(dtype, device="cpu"):
+    config = SimpleNamespace(
+        hidden_size=4,
+        patch_size=2,
+        num_channels=1,
+        spatial_merge_size=2,
+        interpolate_mode="bicubic",
+        max_image_size=4,
+    )
+    embed = HYV4VisionPatchEmbed(config).to(device=device, dtype=dtype)
+    with torch.no_grad():
+        for parameter in embed.parameters():
+            parameter.zero_()
+        embed.position_embedding.weight.fill_(1)
+    return embed, torch.zeros(4, 4, device=device, dtype=dtype), [[1, 2, 2]]
+
+
+@pytest.mark.parametrize("dtype", [torch.bfloat16, torch.float16, torch.float32])
+@pytest.mark.parametrize("update", ["copy", "replace", "kernel_reload"])
+def test_vision_position_cache_follows_weight_updates(dtype, update):
+    embed, pixels, grids = _position_reload_fixture(dtype)
+    with torch.inference_mode():
+        before = embed(pixels, grids)
+        torch.testing.assert_close(
+            before, torch.ones_like(before), rtol=1e-6, atol=1e-6
+        )
+        # Existing consumers, including captured work, retain this storage.
+        retained_positions = embed.patch_pos_embed
+        if update == "copy":
+            embed.position_embedding.weight.fill_(7)
+        elif update == "replace":
+            embed.position_embedding.weight = torch.nn.Parameter(
+                torch.full_like(embed.position_embedding.weight, 7),
+                requires_grad=False,
+            )
+        else:
+            from vllm_hcu.v1.hcu_model_runner import GPUModelRunner
+
+            model = torch.nn.Module()
+            model.embeddings = embed
+            runner = SimpleNamespace(
+                get_model=lambda: model,
+                model_config=SimpleNamespace(quantization=None),
+            )
+            weights = [
+                (
+                    name,
+                    torch.full_like(parameter, 7)
+                    if name.endswith("position_embedding.weight")
+                    else parameter.clone(),
+                )
+                for name, parameter in model.named_parameters()
+            ]
+            # This actual runner path bypasses model.load_weights entirely.
+            GPUModelRunner.reload_weights(
+                runner, weights_iterator=weights, is_checkpoint_format=False
+            )
+        after = embed(pixels, grids)
+        torch.testing.assert_close(
+            after, torch.full_like(after, 7), rtol=1e-6, atol=1e-6
+        )
+        torch.testing.assert_close(
+            retained_positions, torch.full_like(retained_positions, 7), rtol=0, atol=0
+        )
+
+
+@pytest.mark.parametrize("dtype", [torch.bfloat16, torch.float16, torch.float32])
+def test_vision_position_refresh_preserves_unchanged_weight_outputs(dtype):
+    embed, pixels, grids = _position_reload_fixture(dtype)
+    with torch.inference_mode():
+        generator = torch.Generator().manual_seed(338)
+        for parameter in embed.parameters():
+            parameter.normal_(generator=generator)
+        pixels.copy_(torch.randn(pixels.shape, dtype=dtype, generator=generator))
+        reference = embed(pixels, grids).clone()
+        for _ in range(3):
+            torch.testing.assert_close(embed(pixels, grids), reference, rtol=0, atol=0)
+
+
+@pytest.mark.hcu
+def test_captured_vision_positions_follow_updated_weights():
+    if not torch.cuda.is_available():
+        pytest.skip("a live HCU/ROCm device is required")
+    embed, pixels, grids = _position_reload_fixture(torch.bfloat16, "cuda")
+    with torch.inference_mode():
+        for _ in range(3):
+            embed(pixels, grids)
+        torch.cuda.synchronize()
+        graph = torch.cuda.CUDAGraph()
+        with torch.cuda.graph(graph):
+            output = embed(pixels, grids)
+        embed.position_embedding.weight.fill_(7)
+        graph.replay()
+        torch.cuda.synchronize()
+        torch.testing.assert_close(output, torch.full_like(output, 7), rtol=0, atol=0)

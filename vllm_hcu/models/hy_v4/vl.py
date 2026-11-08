@@ -169,6 +169,20 @@ class HYV4VisionPatchEmbed(HunYuanVisionPatchEmbed):
             bias=True,
         )
 
+    def forward(self, pixel_values, grid_thw):
+        if self.patch_pos_embed is not None:
+            # Native caches an FP32 copy of BF16/FP16 positions. Kernel-format
+            # reload bypasses model.load_weights, so refresh from the parameter
+            # at the consumer. Keep storage stable for already captured work;
+            # copy_ casts directly without allocating another FP32 position table.
+            positions = (
+                self.position_embedding.weight[1:]
+                .reshape(1, self.position_edge, self.position_edge, self.embed_dim)
+                .permute(0, 3, 1, 2)
+            )
+            self.patch_pos_embed.copy_(positions)
+        return super().forward(pixel_values, grid_thw)
+
 
 class HYV4VisionBlock(HunYuanVisionBlock):
     def forward(self, x, cu_seqlens, max_seqlen):
