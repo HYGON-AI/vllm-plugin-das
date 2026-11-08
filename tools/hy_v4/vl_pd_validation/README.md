@@ -34,6 +34,14 @@ this entry point has local CPU/ASGI tests and has not been rebenchmarked on HCU.
 The old measured wrapper remains an unchanged historical snapshot, including
 its cancelled-request phase-log limitations.
 
+The corrected entry point also owns its startup initializer. It retries both
+P health and bootstrap queries after transient HTTP/connection/JSON failures,
+using five-second request timeouts and a one-second retry interval. It stays
+unready until bootstrap supplies nonempty engine IDs on contiguous DP ranks.
+Shutdown cancels and joins initialization before closing the HTTP clients.
+This does not retry model inference requests or refresh engine IDs after a
+ready producer restarts; restart the proxy when replacing P.
+
 Diagnostics are enabled explicitly by worker extension/middleware CLI options;
 their HTTP controls are loopback-only. Counts include executed PCP padding.
 Stop every capture and check all workers before a timed benchmark. They are

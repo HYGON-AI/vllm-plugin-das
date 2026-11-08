@@ -189,8 +189,12 @@ unset http_proxy https_proxy all_proxy HTTP_PROXY HTTPS_PROXY ALL_PROXY
 This entry point still starts P and D concurrently and uses the frozen
 KA1/retries0 client pools. It supervises P failures, cancels and joins pending
 upstreams on D failure or downstream disconnect, and bounds upstream waits to
-the configured finite positive deadline. It does not append to the historical
-phase logs. Restart it when P changes engine_id. Use fresh client output paths.
+the configured finite positive deadline. Startup health/bootstrap queries retry
+transient failures with five-second request timeouts and a one-second interval;
+readiness requires a nonempty contiguous DP engine map. Shutdown joins the
+initializer before closing its clients. Model inference requests are not retried.
+It does not append to the historical phase logs. Restart it when P changes
+engine_id. Use fresh client output paths.
 No new HCU, accuracy or throughput measurement is claimed for this entry point;
 all result tables below remain tied to the historical measured proxy.
 

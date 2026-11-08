@@ -6,10 +6,14 @@ P/D concurrently, adds bounded upstream waits and cancels/joins unfinished work
 on a failed or disconnected stream. It does not write historical timing files.
 """
 
+import asyncio
 import importlib.util
+import itertools
+import logging
 import math
 import os
 import uuid
+from contextlib import AsyncExitStack, asynccontextmanager
 from pathlib import Path
 
 import anyio
@@ -27,6 +31,100 @@ spec.loader.exec_module(proxy)
 UPSTREAM_TIMEOUT = float(os.environ.get("HY4_PD_PROXY_TIMEOUT_SECONDS", "300"))
 if not math.isfinite(UPSTREAM_TIMEOUT) or UPSTREAM_TIMEOUT <= 0:
     raise ValueError("HY4_PD_PROXY_TIMEOUT_SECONDS must be finite and positive")
+logger = logging.getLogger(__name__)
+
+
+async def initialize_prefillers(app):
+    for info in app.state.prefill_clients:
+        while True:
+            try:
+                response = await info["client"].get("/health", timeout=5)
+                response.raise_for_status()
+                response = await info["client"].get(
+                    info["bootstrap_addr"] + "/query", timeout=5
+                )
+                response.raise_for_status()
+                payload = response.json()
+                if not isinstance(payload, dict) or not payload:
+                    raise ValueError("bootstrap must return a nonempty engine map")
+                engines = {
+                    int(rank): item["engine_id"] for rank, item in payload.items()
+                }
+                if (
+                    len(engines) != len(payload)
+                    or set(engines) != set(range(len(engines)))
+                    or any(
+                        not isinstance(value, str) or not value
+                        for value in engines.values()
+                    )
+                ):
+                    raise ValueError(
+                        "bootstrap requires contiguous ranks and engine IDs"
+                    )
+            except (httpx.HTTPError, KeyError, TypeError, ValueError) as error:
+                logger.warning("Waiting for prefiller %s: %s", info["url"], error)
+                await asyncio.sleep(1)
+                continue
+            info["dp_engine_id"] = engines
+            info["dp_size"] = len(engines)
+            break
+    app.state.ready.set()
+
+
+@asynccontextmanager
+async def managed_lifespan(app):
+    app.state.ready = asyncio.Event()
+    app.state.prefill_clients = []
+    app.state.decode_clients = []
+    clients = AsyncExitStack()
+    initializer = None
+
+    async def client(url):
+        return await clients.enter_async_context(
+            httpx.AsyncClient(
+                timeout=None,
+                base_url=url,
+                limits=httpx.Limits(
+                    max_connections=None,
+                    max_keepalive_connections=None,
+                    keepalive_expiry=1.0,
+                ),
+            )
+        )
+
+    try:
+        if not proxy.global_args.prefill or not proxy.global_args.decode:
+            raise ValueError("at least one prefiller and decoder are required")
+        for url, port in proxy.global_args.prefill:
+            host = proxy.maybe_wrap_ipv6_address(
+                proxy.urllib.parse.urlparse(url).hostname
+            )
+            app.state.prefill_clients.append(
+                {
+                    "client": await client(url),
+                    "url": url,
+                    "bootstrap_addr": proxy.make_http_path(host, port or 8998),
+                    "dp_engine_id": {},
+                }
+            )
+        for url in proxy.global_args.decode:
+            app.state.decode_clients.append({"client": await client(url)})
+        app.state.prefill_iterator = proxy.prefiller_cycle(app.state.prefill_clients)
+        app.state.decode_iterator = itertools.cycle(
+            range(len(app.state.decode_clients))
+        )
+        initializer = asyncio.create_task(initialize_prefillers(app))
+        yield
+    finally:
+        with anyio.CancelScope(shield=True):
+            app.state.ready.clear()
+            if initializer is not None:
+                initializer.cancel()
+                await asyncio.gather(initializer, return_exceptions=True)
+            await clients.aclose()
+
+
+proxy.app.router.lifespan_context = managed_lifespan
 
 
 class OwnedStreamingResponse(StreamingResponse):

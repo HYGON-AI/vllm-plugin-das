@@ -109,3 +109,124 @@ class ManagedProxyASGITests(unittest.IsolatedAsyncioTestCase):
                         spec.loader.exec_module(candidate)
                 finally:
                     sys.path.pop(0)
+
+    async def _bootstrap_recovers(self, failure):
+        import httpx
+
+        original_client = httpx.AsyncClient
+        queries = 0
+        clients = []
+
+        async def upstream(request):
+            nonlocal queries
+            if request.url.path == "/query":
+                queries += 1
+                if queries == 1:
+                    if failure == "503":
+                        return httpx.Response(503)
+                    if failure == "connect":
+                        raise httpx.ConnectError("bootstrap starting", request=request)
+                    if failure == "json":
+                        return httpx.Response(200, content=b"not json")
+                    if failure == "ranks":
+                        return httpx.Response(
+                            200, json={"1": {"engine_id": "producer-1"}}
+                        )
+                    if failure == "id":
+                        return httpx.Response(200, json={"0": {"engine_id": ""}})
+                    return httpx.Response(200, json={})
+                return httpx.Response(200, json={"0": {"engine_id": "producer-1"}})
+            return httpx.Response(200)
+
+        def client_factory(**kwargs):
+            client = original_client(**kwargs, transport=httpx.MockTransport(upstream))
+            clients.append(client)
+            return client
+
+        self.module.proxy.global_args = SimpleNamespace(
+            prefill=[("http://prefill:8000", 8998)], decode=["http://decode:8000"]
+        )
+        loop = asyncio.get_running_loop()
+        old_handler = loop.get_exception_handler()
+        errors = []
+        loop.set_exception_handler(lambda loop, context: errors.append(context))
+        try:
+            with patch.object(httpx, "AsyncClient", client_factory):
+                async with self.module.proxy.app.router.lifespan_context(
+                    self.module.proxy.app
+                ):
+                    try:
+                        await asyncio.wait_for(
+                            self.module.proxy.app.state.ready.wait(), timeout=2
+                        )
+                    except asyncio.TimeoutError:  # noqa: UP041 - distinct on Python 3.10
+                        self.fail(
+                            "proxy never recovered after bootstrap became healthy"
+                        )
+                    info = self.module.proxy.app.state.prefill_clients[0]
+                    self.assertEqual(info["dp_engine_id"], {0: "producer-1"})
+                    self.assertEqual(info["dp_size"], 1)
+                    async with original_client(
+                        transport=httpx.ASGITransport(app=self.module.proxy.app),
+                        base_url="http://proxy",
+                    ) as caller:
+                        self.assertEqual((await caller.get("/health")).status_code, 200)
+            self.assertFalse(errors, "initializer must not fail as an unowned task")
+            self.assertTrue(all(client.is_closed for client in clients))
+        finally:
+            loop.set_exception_handler(old_handler)
+
+    async def test_bootstrap_recovers_after_http503(self):
+        await self._bootstrap_recovers("503")
+
+    async def test_bootstrap_recovers_after_connect_failure(self):
+        await self._bootstrap_recovers("connect")
+
+    async def test_bootstrap_recovers_after_invalid_json(self):
+        await self._bootstrap_recovers("json")
+
+    async def test_bootstrap_waits_for_nonempty_engine_map(self):
+        await self._bootstrap_recovers("empty")
+
+    async def test_bootstrap_waits_for_contiguous_rank_map(self):
+        await self._bootstrap_recovers("ranks")
+
+    async def test_bootstrap_waits_for_engine_id(self):
+        await self._bootstrap_recovers("id")
+
+    async def test_shutdown_cancels_and_joins_pending_bootstrap(self):
+        import httpx
+
+        original_client = httpx.AsyncClient
+        started, closed = asyncio.Event(), asyncio.Event()
+
+        async def upstream(request):
+            started.set()
+            try:
+                await asyncio.Event().wait()
+            finally:
+                closed.set()
+
+        def client_factory(**kwargs):
+            return original_client(**kwargs, transport=httpx.MockTransport(upstream))
+
+        self.module.proxy.global_args = SimpleNamespace(
+            prefill=[("http://prefill:8000", 8998)], decode=["http://decode:8000"]
+        )
+        existing = asyncio.all_tasks()
+        try:
+            with patch.object(httpx, "AsyncClient", client_factory):
+                async with self.module.proxy.app.router.lifespan_context(
+                    self.module.proxy.app
+                ):
+                    await asyncio.wait_for(started.wait(), timeout=1)
+            self.assertTrue(
+                closed.is_set(), "bootstrap request survived proxy shutdown"
+            )
+            self.assertFalse(self.module.proxy.app.state.ready.is_set())
+            self.assertFalse(asyncio.all_tasks() - existing)
+        finally:
+            leaked = asyncio.all_tasks() - existing
+            for task in leaked:
+                task.cancel()
+            await asyncio.gather(*leaked, return_exceptions=True)
