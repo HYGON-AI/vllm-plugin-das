@@ -32,11 +32,24 @@ skipped, failed or cancelled stage, so a skipped hardware job is not a pass.
 The source job runs existing official API AST and package-boundary tests using
 the immutable official target `4ba787ec9959e566d3b587a796dff07673324da5`.
 It does not certify the whole portable suite, native ABI, or model quality.
-The prepared-image job runs all non-`*_hcu.py` files in `tests/vllm033` with
-devices hidden, then all `*_hcu.py` files with the actual live flags. It
+Portable collects ordinary contract files and uses `-m 'not hcu'` with devices
+hidden. Device uses AST marker discovery without importing pure portable modules,
+then `-m hcu` with the live flags. Module/class marks and decorated cases also
+cover a file containing
+portable format contracts and native numerical cases together, including
+SlimQuant's six marked cases in `test_slimquant.py`. Device enables the existing
+`HCU_SLIMQUANT_LIVE=1` opt-in. Deselected cases belong to the other tier; executed
+cases must still contain no skips or xfails. Script-only selector cases retain
+their eleven explicit subprocess invocations outside pytest. The job
 installs only the independent `adapter_extension` project, never root
 `setup.py`, and explicitly selects the Adapter platform entry point in every
 tier so an image's legacy platform entry point cannot be discovered. The
+installed tiers pin Core, Adapter and Plugin packages before test imports and
+verify loaded module origins against their snapshotted non-editable RECORDs
+after collection and at session end. A pure portable module's source-path
+fixture is never imported just to select device cases. These are file-ownership
+checks, not a replacement for wheel integrity, provider or numerical validation.
+The
 workflow isolates parent Python discovery and clears inherited `PYTHONPATH`
 and user site packages from child environments. Empty
 results, failures, errors, skips/xfails and unexpected passes
@@ -102,3 +115,8 @@ three existing v0.33 HCU-marked files. The candidate accounts for them via the
 actual release runner rather than weakening registration for other files.
 No GPU job, remote CI, image publication, push or PR is claimed by these local
 CPU results.
+
+The integration follow-up incorporates the merged optional SlimQuant format
+from MR363. Its generic public Core PLE interface remains an enablement and
+deployment dependency; the CI wrapper does not invent that API, override its
+capability guard, or count a missing interface/skip as positive device evidence.
