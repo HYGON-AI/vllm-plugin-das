@@ -70,16 +70,27 @@ and worker exit codes were not fully observed. This is a functional result,
 not clean-lifecycle or performance acceptance. The prior wrong-scale runtime's
 0/32 result is retained.
 
-The new r4 selector's full HumanEval32 run is pending at draft publication.
-Historical r3 scores do not certify this selector change. Its separate run uses
-the same checkpoint, original request budget and generation settings, the safe
-namespace/chroot scorer, and GPU0–1 rather than historical GPU4–5. No same-device
-causal performance comparison is claimed.
+The corrected r4 selector completed a separate full model run: raw 0/32 (all
+code-fenced responses), normalized 32/32, all 32 `stop`; prefix 14/14 with 20800
+cache hits and concurrent 8/8. Both actual workers reported 128 PLE shards,
+48 SlimQuant expert methods, 144 official CT dense methods, 423 BF16 linear
+methods and one public per-row PLE method each. All 32 request bodies and wire
+bodies match historical r3; all 32 archived r3 normalizations are identical
+under the old v2 and current resource-safe v3 policies. The new run uses the
+original budget and safe namespace/chroot scorer, on GPU0–1 rather than
+historical GPU4–5. No same-device causal performance comparison is claimed.
+
+API exit was 0, the owned group emptied, port 18714 was released and VRAM
+returned from 4 MiB to 4 MiB on both devices. The log still contains four
+vendor cleanup unpack exceptions and a two-worker SIGTERM escalation. It has
+no two-worker SIGKILL or EngineDeadError entry. Full worker exit codes remain
+unobserved; clean teardown is not accepted. Local terminal receipt:
+`qwen38-flash-slimquant-tp2-public-r4/quality-review-r1.json`.
 
 ## Open gates
 
-Core API publication/review, prepared-image CI, the corrected selector's full
-model result, and clean model teardown remain open. Native packed W4A8,
+Core API publication/review, prepared-image CI and clean model teardown remain
+open. Native packed W4A8,
 Marlin/LightOp/AITER model integration, heterogeneous shard methods, EP/DP,
 multi-node, other checkpoints and performance remain unvalidated. This bridge
 does not close those migration features.
