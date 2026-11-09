@@ -277,15 +277,11 @@ def _is_glm53_mtp_pcp(vllm_config: object) -> bool:
 
 
 def _require_glm53_pcp_contract(vllm_config: object) -> None:
+    from vllm_hcu.v1.glm53_kda_cp_config import validate_glm53_pcp_topology
+
     model = vllm_config.model_config
     parallel = vllm_config.parallel_config
-    topology = (
-        parallel.tensor_parallel_size,
-        parallel.prefill_context_parallel_size,
-        parallel.pipeline_parallel_size,
-    )
-    if topology != (1, 8, 1):
-        raise ValueError("GLM-5.3 PCP baseline requires TP1/PCP8/PP1.")
+    validate_glm53_pcp_topology(vllm_config)
     mm = getattr(model, "multimodal_config", None)
     if model.is_multimodal_model and not getattr(mm, "language_model_only", False):
         raise ValueError("GLM-5.3 PCP baseline requires --language-model-only.")
@@ -298,15 +294,11 @@ def _require_glm53_pcp_contract(vllm_config: object) -> None:
 
 
 def _require_glm53_mtp_pcp_contract(vllm_config: object) -> None:
+    from vllm_hcu.v1.glm53_kda_cp_config import validate_glm53_pcp_topology
+
     model = vllm_config.model_config
     parallel = vllm_config.parallel_config
-    topology = (
-        parallel.tensor_parallel_size,
-        parallel.prefill_context_parallel_size,
-        parallel.pipeline_parallel_size,
-    )
-    if topology != (1, 8, 1):
-        raise ValueError("GLM-5.3 MTP PCP requires TP1/PCP8/PP1.")
+    validate_glm53_pcp_topology(vllm_config)
     if not model.use_mla:
         raise ValueError("GLM-5.3 MTP PCP requires the built-in MLA draft layer.")
     if getattr(parallel, "enable_eplb", False):
@@ -347,6 +339,9 @@ def _require_mrv2_pcp_contract(vllm_config: object) -> None:
     )
     is_glm53 = is_glm53_pcp(vllm_config)
     is_glm53_mtp = _is_glm53_mtp_pcp(vllm_config)
+    # Arithmetic admission is relaxed for GLM5Next, not every runtime path.
+    # Keep graph capture and combined DP/PCP dispatch behind their own guards.
+    relaxed_glm53_topology = is_glm53 or is_glm53_mtp
     if is_glm53:
         _require_glm53_pcp_contract(vllm_config)
     if is_glm53_mtp:
@@ -394,14 +389,14 @@ def _require_mrv2_pcp_contract(vllm_config: object) -> None:
         _require_hy4_pcp8_contract(vllm_config)
     if _require_hcu_pcp_attribute(
         parallel_config, "pipeline_parallel_size", "ParallelConfig"
-    ) != 1 and hy4_topology != (1, 4, 2):
+    ) != 1 and hy4_topology != (1, 4, 2) and not relaxed_glm53_topology:
         raise ValueError("HCU PCP does not support pipeline parallelism.")
     dcp_size = int(
         _require_hcu_pcp_attribute(
             parallel_config, "decode_context_parallel_size", "ParallelConfig"
         )
     )
-    if use_mla and dcp_size != 1:
+    if use_mla and dcp_size != 1 and not relaxed_glm53_topology:
         raise ValueError("GLM-5.2 PCP does not support decode context parallelism.")
     if not use_mla and dcp_size != 1:
         raise ValueError(
@@ -409,16 +404,37 @@ def _require_mrv2_pcp_contract(vllm_config: object) -> None:
         )
     if _require_hcu_pcp_attribute(
         parallel_config, "data_parallel_size", "ParallelConfig"
-    ) != 1:
+    ) != 1 and not relaxed_glm53_topology:
         raise ValueError("HCU PCP does not support data parallelism.")
-    if use_mla and not _require_hcu_pcp_attribute(
+    if relaxed_glm53_topology and _require_hcu_pcp_attribute(
+        parallel_config, "data_parallel_size", "ParallelConfig"
+    ) > 1 and not _require_hcu_pcp_attribute(
+        parallel_config, "enable_expert_parallel", "ParallelConfig"
+    ):
+        # PCP gathers expand token rows before MoE dispatch. Without EP, the
+        # native DP split sizes still describe the pre-gather local rows.
+        raise ValueError(
+            "GLM-5.3 DP+PCP without expert parallelism is not supported; "
+            "enable expert parallelism or use DP1."
+        )
+    if use_mla and not relaxed_glm53_topology and not _require_hcu_pcp_attribute(
         parallel_config, "enable_expert_parallel", "ParallelConfig"
     ):
         raise ValueError("GLM-5.2 PCP requires expert parallelism.")
-    if use_mla and not _require_hcu_pcp_attribute(
+    if use_mla and not relaxed_glm53_topology and not _require_hcu_pcp_attribute(
         model_config, "enforce_eager", "ModelConfig"
     ):
         raise ValueError("GLM-5.2 PCP requires eager execution without graphs.")
+    if relaxed_glm53_topology and not _require_hcu_pcp_attribute(
+        model_config, "enforce_eager", "ModelConfig"
+    ):
+        # Breakable graph capture uses local dummy rows, while real PCP
+        # prefill supplies global KDA metadata. CompilationMode.NONE alone
+        # does not disable that PIECEWISE capture/replay path.
+        raise ValueError(
+            "GLM-5.3 PCP requires eager execution without graphs; "
+            "use --enforce-eager until PCP graph capture/replay is adapted."
+        )
     speculative_config = _require_hcu_pcp_attribute(
         vllm_config, "speculative_config", "VllmConfig"
     )
@@ -561,6 +577,49 @@ def _validate_dspark_pd_scope(vllm_config: object) -> None:
     )
 
 
+def normalize_glm53_feature_scope(
+    vllm_config: object, feature_config: HcuFeatureConfig,
+) -> HcuFeatureConfig:
+    """Apply the same effective scope to validation and EngineArgs retention.
+
+    Shared launch configs may explicitly request these GLM-only policies for
+    another model or PCP1. They are no-ops there, not lost user requests.
+    Keep None unresolved only when the policy can actually be used.
+    """
+    target_pcp = is_glm53_pcp(vllm_config)
+    spec = getattr(vllm_config, "speculative_config", None)
+    return feature_config.with_updates(
+        glm53_kda_cp_head_shard=(
+            feature_config.glm53_kda_cp_head_shard if target_pcp else False
+        ),
+        glm53_pcp_mtp_sync=(
+            feature_config.glm53_pcp_mtp_sync
+            if target_pcp and getattr(spec, "method", None) == "mtp" else False
+        ),
+    )
+
+
+def _resolve_glm53_pcp_mtp_sync(
+    vllm_config: object, feature_config: HcuFeatureConfig,
+) -> bool:
+    """Resolve collective participation once, then retain the serialized policy."""
+    spec = getattr(vllm_config, "speculative_config", None)
+    if not is_glm53_pcp(vllm_config) or getattr(spec, "method", None) != "mtp":
+        return False
+    enabled = feature_config.glm53_pcp_mtp_sync
+    if enabled is None:
+        value = os.environ.get("VLLM_HCU_GLM53_PCP_MTP_SYNC", "1")
+        if value not in ("0", "1"):
+            raise ValueError("VLLM_HCU_GLM53_PCP_MTP_SYNC must be 0 or 1")
+        enabled = value == "1"
+    from vllm_hcu.v1.glm53_kda_cp_config import validate_glm53_mtp_sync_contract
+
+    # Reject unsupported sampling before engine startup allocates model/KV
+    # memory. Revalidate frozen True policies as well as initial env requests.
+    validate_glm53_mtp_sync_contract(vllm_config, enabled)
+    return enabled
+
+
 def validate_and_update_hcu_config(vllm_config: object) -> HcuFeatureConfig:
     """Validate cross-config invariants and bind the compilation adapter."""
 
@@ -573,10 +632,15 @@ def validate_and_update_hcu_config(vllm_config: object) -> HcuFeatureConfig:
     validate_hy4_dcp_config(vllm_config)
     _validate_dspark_pd_scope(vllm_config)
     feature_config = get_hcu_config(vllm_config)
+    incoming_feature_config = feature_config
     feature_config = _normalize_dspark_draft_deepep_topology(
         vllm_config, feature_config
     )
+    feature_config = normalize_glm53_feature_scope(vllm_config, feature_config)
     from vllm_hcu.platforms import envs as hcu_envs
+    from vllm_hcu.v1.glm53_kda_cp_config import (
+        glm53_kda_cp_head_shard_enabled,
+    )
 
     updates: dict[str, str | bool] = {
         # The Qwen3 forward wrapper closes over this effective policy. Persist
@@ -591,6 +655,18 @@ def validate_and_update_hcu_config(vllm_config: object) -> HcuFeatureConfig:
         # across restarts cannot load the opposite mode's AOT graph (on mode
         # rewires o_proj.reduce_results and registers the hcu_k3_sp_* ops).
         "k3_sp_moe": hcu_envs.k3_sp_moe_enabled(),
+        # This changes KDA parameter/state shapes and adds PCP reductions.
+        # Freeze the effective mode before hashing, including feature-off.
+        # Revalidation of a serialized worker config keeps its frozen value.
+        "glm53_kda_cp_head_shard": (
+            glm53_kda_cp_head_shard_enabled(vllm_config)
+            if is_glm53_pcp(vllm_config) else False
+        ),
+        # Collective participation must be identical on every PCP worker.
+        # Never resolve this policy again from a worker-local environment.
+        "glm53_pcp_mtp_sync": _resolve_glm53_pcp_mtp_sync(
+            vllm_config, feature_config,
+        ),
         "dp_int8_allgather": hcu_envs.dp_int8_allgather_enabled(),
     }
     if feature_config.hcu_flash_attn_mode is None:
@@ -598,6 +674,24 @@ def validate_and_update_hcu_config(vllm_config: object) -> HcuFeatureConfig:
         # hashes. Classic, CUTLASS, and CUSTOM do not share a KV-cache ABI.
         updates["hcu_flash_attn_mode"] = hcu_envs.resolve_hcu_flash_attn_mode(None)
     feature_config = feature_config.with_updates(**updates)
+    glm53_policy_changed = any(
+        getattr(incoming_feature_config, name) is not None
+        and getattr(incoming_feature_config, name) != getattr(feature_config, name)
+        for name in ("glm53_kda_cp_head_shard", "glm53_pcp_mtp_sync")
+    )
+    if glm53_policy_changed or getattr(
+        getattr(vllm_config, "model_config", None), "architectures", None,
+    ) == ["Glm5NextMTPModel"]:
+        # Native with_hf_config()/replace() shares the target's additional_config.
+        # A PCP1/non-MTP/other-model clone can change effective policy too, not
+        # just the built-in draft. Never write a re-scoped frozen policy back
+        # into its source config after the source's mode/hash/shapes are frozen.
+        # Copy the outer mapping only: set_hcu_config replaces the whole HCU
+        # payload, while unrelated values retain their existing identities.
+        # Always isolate MTP clones, including unresolved-policy payloads.
+        additional_config = getattr(vllm_config, "additional_config", None)
+        if additional_config is not None:
+            vllm_config.additional_config = dict(additional_config)
     # Persist every resolved graph policy so it enters vLLM's compilation hash.
     set_hcu_config(vllm_config, feature_config)
 
