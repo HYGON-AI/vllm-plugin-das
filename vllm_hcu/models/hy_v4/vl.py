@@ -291,6 +291,12 @@ class HYV4VisionTransformer(HunYuanVisionTransformer):
 class HYV4VLForConditionalGeneration(
     HYV4ForCausalLM, SupportsMultiModal, SupportsMRoPE
 ):
+    @classmethod
+    def get_model_state_cls(cls):
+        from .vl_mrv2 import HYV4VLModelState
+
+        return HYV4VLModelState
+
     def __init__(self, *, vllm_config, prefix=""):
         mm_config = vllm_config.model_config.multimodal_config
         if mm_config is not None and mm_config.mm_encoder_only:
@@ -313,6 +319,11 @@ class HYV4VLForConditionalGeneration(
         if vllm_config.speculative_config is not None:
             raise ValueError("HYV4VL speculative decoding is not validated")
         super().__init__(vllm_config=vllm_config, prefix=prefix)
+        from vllm_hcu.patch.platform.core_fix.patch_vllm_config import (
+            validate_hyv4_vl_pcp_quantization,
+        )
+
+        validate_hyv4_vl_pcp_quantization(vllm_config, self)
         with self._mark_tower_model(vllm_config, {"image"}):
             self.vit = HYV4VisionTransformer(self.config.vision_config, prefix="vit")
         # The generic HCU RoPE kernel only supports a single position axis.

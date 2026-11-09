@@ -118,6 +118,8 @@ class HcuPCPManager:
         self._global_attn_ready = False
         self._hidden_restore_idx: torch.Tensor | None = None
         self._padded_gather_idx: torch.Tensor | None = None
+        self._gather_index_bounds: tuple[int, int] | None = None
+        self._global_token_extent = 0
         self._gathered_kv_write_mask: torch.Tensor | None = None
         self._hidden_restore_idx_np: np.ndarray | None = None
         self._padded_num_tokens = 0
@@ -417,6 +419,18 @@ class HcuPCPManager:
         self._padded_gather_idx = torch.from_numpy(padded_gather_idx).to(
             self.device
         )
+        # Validate bounds while the trusted layout is still on CPU. Model-input
+        # gathers must not synchronize device indices back to the host per step.
+        self._gather_index_bounds = (
+            (int(padded_gather_idx.min()), int(padded_gather_idx.max()))
+            if expanded_num_tokens
+            else None
+        )
+        self._global_token_extent = input_batch.num_tokens
+        if self._gather_index_bounds is not None:
+            low, high = self._gather_index_bounds
+            if low < 0 or high >= self._global_token_extent:
+                raise ValueError("PCP gather layout exceeds global token extent")
         self._gathered_kv_write_mask = torch.from_numpy(kv_write_mask).to(
             self.device
         )
@@ -433,6 +447,7 @@ class HcuPCPManager:
                 "PCP spec decode requires per-request draft-token counts"
             )
         self._global_batch = input_batch
+        self._local_batch = None
         self.draft_prefill_batch = None
         self.draft_target_hidden_states = None
         self._global_has_prefill = bool(input_batch.is_prefilling_np.any())
@@ -702,6 +717,132 @@ class HcuPCPManager:
             prompt_lens=None,
         )
         return self._local_batch
+
+    def get_global_batch(self, local_batch: InputBatch) -> InputBatch:
+        """Return the global step corresponding to this exact local batch."""
+        if (
+            self._local_batch is None
+            or local_batch is not self._local_batch
+            or self._global_batch is None
+        ):
+            raise ValueError("PCP model inputs require the current local batch")
+        if self._global_batch.num_tokens != self._global_token_extent:
+            raise ValueError("PCP current global token extent changed")
+        return self._global_batch
+
+    def get_local_token_mapping(
+        self, local_batch: InputBatch
+    ) -> tuple[torch.Tensor, torch.Tensor]:
+        """Return global indices and model-input validity for the current rank.
+
+        Decode inputs are replicated even where KV writes are disabled. Only
+        local padding, including collective tails, is invalid for model inputs.
+        """
+        self.get_global_batch(local_batch)
+        width = self._padded_num_tokens
+        if local_batch.num_tokens_after_padding != width:
+            raise ValueError("PCP current local token extent changed")
+        indices = self._padded_gather_idx
+        if (
+            indices is None
+            or indices.shape != (self.pcp_size * width,)
+            or indices.dtype != torch.int64
+            or indices.device != self.device
+        ):
+            raise ValueError("PCP gather index shape, dtype or device mismatch")
+        padding = local_batch.is_padding
+        if (
+            padding.shape != (width,)
+            or padding.dtype != torch.bool
+            or padding.device != self.device
+        ):
+            raise ValueError("PCP padding shape, dtype or device mismatch")
+        if width and self._gather_index_bounds is None:
+            raise ValueError("PCP gather layout has no trusted bounds")
+        start = self.pcp_rank * width
+        return indices[start : start + width], ~padding
+
+    def gather_global_token_tensor(
+        self,
+        tensor: torch.Tensor,
+        local_batch: InputBatch,
+        *,
+        token_dim: int,
+        out: torch.Tensor,
+    ) -> torch.Tensor:
+        """Select model inputs into exact caller-owned storage and zero padding.
+
+        The source may have scheduler padding or persistent-buffer capacity
+        beyond the current global tokens. Neither its storage nor canonical
+        batch metadata may alias the output. All checks use host metadata.
+        """
+        global_batch = self.get_global_batch(local_batch)
+        indices, valid_tokens = self.get_local_token_mapping(local_batch)
+        if not isinstance(tensor, torch.Tensor) or not isinstance(out, torch.Tensor):
+            raise TypeError("PCP gather requires tensor source and output")
+        if (
+            not isinstance(token_dim, int)
+            or not -tensor.ndim <= token_dim < tensor.ndim
+        ):
+            raise ValueError("PCP token dimension is outside the source tensor")
+        token_dim %= tensor.ndim
+        if tensor.layout != torch.strided or out.layout != torch.strided:
+            raise ValueError("PCP gather requires strided tensor storage")
+        if tensor.device != self.device or out.device != tensor.device:
+            raise ValueError("PCP gather source and output device mismatch")
+        if out.dtype != tensor.dtype:
+            raise ValueError("PCP gather source and output dtype mismatch")
+        if tensor.shape[token_dim] < global_batch.num_tokens:
+            raise ValueError("PCP gather source has too few global tokens")
+        bounds = self._gather_index_bounds
+        if bounds is not None and (
+            bounds[0] < 0 or bounds[1] >= tensor.shape[token_dim]
+        ):
+            raise ValueError("PCP gather indices exceed source token extent")
+        expected_shape = list(tensor.shape)
+        expected_shape[token_dim] = self._padded_num_tokens
+        if tuple(out.shape) != tuple(expected_shape):
+            raise ValueError("PCP gather output must have the exact local shape")
+        overlap = torch._debug_has_internal_overlap(out)
+        if overlap == 1:
+            raise ValueError("PCP gather output has overlapping elements")
+        if overlap != 0 and out.numel():
+            # An inconclusive Torch result also includes unsafe as_strided
+            # views. Prove disjoint address spans from host shape/stride
+            # metadata, accepting transposes and ordinary capacity-gap slices.
+            # Each next axis must start beyond the span of all smaller axes.
+            span = 1
+            for stride, size in sorted(
+                (stride, size)
+                for size, stride in zip(out.shape, out.stride())
+                if size > 1
+            ):
+                if stride < span:
+                    raise ValueError("PCP gather output nonoverlap is unproven")
+                span += (size - 1) * stride
+        # Reject even disjoint views of shared storage: the native global
+        # buffers and canonical batch metadata must remain intact for reuse.
+        protected = [tensor, self._padded_gather_idx]
+        for batch in (global_batch, local_batch):
+            protected.extend(
+                value
+                for value in vars(batch).values()
+                if isinstance(value, torch.Tensor)
+            )
+        output_storage = out.untyped_storage().data_ptr()
+        if out.numel() and any(
+            value is not None
+            and value.numel()
+            and value.device == out.device
+            and value.untyped_storage().data_ptr() == output_storage
+            for value in protected
+        ):
+            raise ValueError("PCP gather output storage must not alias its inputs")
+        torch.index_select(tensor, token_dim, indices, out=out)
+        mask_shape = [1] * tensor.ndim
+        mask_shape[token_dim] = self._padded_num_tokens
+        out.masked_fill_((~valid_tokens).reshape(mask_shape), 0)
+        return out
 
     def prepare_draft_prefill(
         self, input_batch: InputBatch, input_ids: torch.Tensor

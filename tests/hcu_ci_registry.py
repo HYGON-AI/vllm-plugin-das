@@ -132,7 +132,43 @@ register_hcu_ci(
 
 register_hcu_ci(
     job="hy4-contract",
+    target="tests/models/hy_v4/test_pcp_multimodal_inputs.py",
+    est_time=60,
+)
+
+register_hcu_ci(
+    job="hy4-contract",
+    target="tests/models/hy_v4/test_vl_mrv2.py",
+    est_time=60,
+)
+
+register_hcu_ci(
+    job="hy4-contract",
+    target="tests/models/hy_v4/test_vl_mrv2_profile.py",
+    est_time=60,
+)
+
+register_hcu_ci(
+    job="hy4-contract",
+    target="tests/runtime_patch/test_hyv4_vl_route_gates.py",
+    est_time=60,
+)
+
+register_hcu_ci(
+    job="hy4-contract",
     target="tests/models/hy_v4/test_vl_qa_resume.py",
+    est_time=60,
+)
+
+register_hcu_ci(
+    job="hy4-contract",
+    target="tests/models/hy_v4/test_vl_proxy_lifecycle.py",
+    est_time=60,
+)
+
+register_hcu_ci(
+    job="hy4-contract",
+    target="tests/models/hy_v4/test_vl_proxy_asgi.py",
     est_time=60,
 )
 
