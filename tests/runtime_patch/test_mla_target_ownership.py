@@ -92,6 +92,16 @@ def cpu_flashmla(monkeypatch):
         UNIFORM = "uniform"
 
     class MLACommonMetadataBuilder(_GenericStub):
+        def __init__(
+            self, kv_cache_spec, layer_names, vllm_config, device, meta_cls
+        ):
+            del meta_cls
+            self.kv_cache_spec = kv_cache_spec
+            self.layer_names = layer_names
+            self.vllm_config = vllm_config
+            self.compilation_config = vllm_config.compilation_config
+            self.device = device
+
         @classmethod
         def get_cudagraph_support(cls, vllm_config, kv_cache_spec):
             del vllm_config, kv_cache_spec
@@ -1450,6 +1460,63 @@ def test_flashmla_fp8_graph_metadata_grows_and_keeps_only_valid_rows(
         result.scheduler_metadata.num_splits,
         valid_num_splits,
     )
+
+
+def _make_nc_builder(flashmla, cache_dtype):
+    """Construct the real builder under the cpu_flashmla stub chain."""
+    vllm_config = SimpleNamespace(
+        model_config=SimpleNamespace(
+            get_num_attention_heads=lambda pc: 16,
+            max_model_len=2048,
+        ),
+        parallel_config=SimpleNamespace(),
+        scheduler_config=SimpleNamespace(max_num_seqs=4),
+        cache_config=SimpleNamespace(cache_dtype=cache_dtype),
+        compilation_config=SimpleNamespace(
+            cudagraph_mode=SimpleNamespace(has_full_cudagraphs=lambda: False)
+        ),
+    )
+    spec = SimpleNamespace(
+        non_causal_multi_token_decode=True, block_size=64
+    )
+    return flashmla.FlashMLAMetadataBuilder(
+        spec, ["k3.self_attn"], vllm_config, torch.device("cpu")
+    )
+
+
+@pytest.mark.parametrize("cache_dtype", ["auto", "bfloat16", "fp8_e5m2"])
+def test_flashmla_builder_refuses_nc_flatten_on_non_nc_caches(
+    cpu_flashmla, cache_dtype
+):
+    """Non-NC caches must refuse the flatten at build, not mis-compute.
+
+    The backend selector's supports_non_causal() has no dtype context, so
+    for these caches it stays True and the backend may be chosen; the
+    builder must flip the per-instance flatten gate, otherwise the
+    non-causal group falls through to the stock decode calls (causal=
+    True hard-coded) and silently computes wrong causality.
+    """
+    builder = _make_nc_builder(cpu_flashmla, cache_dtype)
+    assert builder.supports_non_causal_multi_token_decode is False
+    assert builder._nc_ready is False
+    assert "supports_non_causal_multi_token_decode" in vars(builder)
+    assert not hasattr(builder, "_nc_bt_buf")
+    # The class default must stay True for conforming builders.
+    assert (
+        cpu_flashmla.FlashMLAMetadataBuilder
+        .supports_non_causal_multi_token_decode
+        is True
+    )
+
+
+def test_flashmla_builder_keeps_nc_flatten_on_e4m3_cache(cpu_flashmla):
+    builder = _make_nc_builder(cpu_flashmla, "fp8_e4m3")
+    assert builder._nc_ready is True
+    # No instance override: the ClassVar True remains authoritative.
+    assert "supports_non_causal_multi_token_decode" not in vars(builder)
+    assert builder.supports_non_causal_multi_token_decode is True
+    # Expanded block table: [max_num_seqs+1 rows, (max_len/page)+1 cols].
+    assert builder._nc_bt_buf.shape == (5, 33)
 
 
 @pytest.mark.parametrize("local_lse", [0.1, float("-inf")])

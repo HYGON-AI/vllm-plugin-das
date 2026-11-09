@@ -126,8 +126,11 @@ class HcuFlashMLABackend(MLACommonBackend):
 
     @classmethod
     def supports_non_causal(cls) -> bool:
-        # Non-causal multi-token decode rides the vendor kernel with
-        # causal=False over the committed-prefix expanded block table.
+        # Kernel geometry supports non-causal multi-token decode; the
+        # per-cache-dtype gate lives on the builder: non-e4m3 caches are
+        # refused the flatten there (this classmethod has no dtype
+        # context), otherwise a non-causal group would silently ride the
+        # stock decode calls below, which hard-code causal=True.
         return True
 
     @classmethod
@@ -207,8 +210,21 @@ class FlashMLAMetadataBuilder(MLACommonMetadataBuilder[FlashMLAMetadata]):
             if isinstance(page, int) and page > 0 and page % _NC_PAGE_BLOCK == 0
             else None
         )
-        if spec_nc and subpage and is_quantized_kv_cache(
-            vllm_config.cache_config.cache_dtype
+        cache_dtype = vllm_config.cache_config.cache_dtype
+        if spec_nc and subpage and not _is_flash_nc_kv_dtype(cache_dtype):
+            # Mirror the kernel-side dtype guard at build time -- OUTSIDE
+            # the quantized-cache branch, so it also covers auto/bf16
+            # caches: the backend stays selected but the flatten is
+            # refused (the upstream gate reads this instance attr), so a
+            # non-causal group fails loudly at build instead of silently
+            # riding the stock decode calls below, which hard-code
+            # causal=True.
+            self.supports_non_causal_multi_token_decode = False
+        elif (
+            spec_nc
+            and subpage
+            and _is_flash_nc_kv_dtype(cache_dtype)
+            and is_quantized_kv_cache(cache_dtype)
         ):
             nc_max_seqs = vllm_config.scheduler_config.max_num_seqs + 1
             nc_cols = -(-vllm_config.model_config.max_model_len // page) + 1
@@ -248,7 +264,14 @@ class FlashMLAMetadataBuilder(MLACommonMetadataBuilder[FlashMLAMetadata]):
                 dtype=torch.int32,
             )
             self.cg_buf_num_splits = torch.empty(
-                (vllm_config.scheduler_config.max_num_seqs + 1),
+                # +2 -- the dense-fp8 planner hands back B_pad+1 split rows
+                # and a FULL-graph capture at the service max reaches
+                # exactly max_num_seqs+1 of capacity max_num_seqs+1, with
+                # zero headroom. The sibling Triton builder registers
+                # max_seqs+1 = max_num_seqs+2 for the same B+1 vendor
+                # contract; keep one spare row so the largest padded
+                # capture shape stays satisfiable (4 bytes).
+                (vllm_config.scheduler_config.max_num_seqs + 2),
                 device=self.device,
                 dtype=torch.int32,
             )
@@ -710,13 +733,21 @@ class FlashMLAImpl(MLACommonImpl[FlashMLAMetadata]):
         if k_cache.dtype != _FP8_E4M3:
             k_cache = k_cache.view(_FP8_E4M3)
         # gfx938 fp8 kernel consumes the pre-quantized query (same
-        # contract as the plugin's dense fp8 path): static per-tensor
-        # quant with the layer's q scale, descale fused via descale_q.
-        q_fp8 = (
-            (q_spec.to(torch.float32) / layer._q_scale.to(torch.float32))
-            .clamp(-448.0, 448.0)
-            .to(_FP8_E4M3)
-        )
+        # contract as the plugin's dense fp8 path): with CAT_MLA off,
+        # mla_runtime has already quantized the concatenated query by
+        # _q_scale (supports_quant_query_input) -- feed it as-is and let
+        # descale_q undo the scale. Quantize only raw tuple/BF16 inputs
+        # (CAT_MLA on): double-scaling a pre-quantized tensor would skew
+        # the logits by 1/_q_scale.
+        if q_spec.dtype == _FP8_E4M3:
+            q_fp8 = q_spec
+        else:
+            q_fp8 = (
+                (q_spec.to(torch.float32)
+                 / layer._q_scale.to(torch.float32))
+                .clamp(-448.0, 448.0)
+                .to(_FP8_E4M3)
+            )
         o, lse = flash_mla_with_kvcache_fp8(
             q=q_fp8,
             k_cache=k_cache,
