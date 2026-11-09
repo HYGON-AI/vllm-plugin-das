@@ -74,11 +74,19 @@ def apply_to_module(module: ModuleType) -> bool:
                     # replaces it with the gathered scale (or falls back to a local quant).
                     import torch
 
-                    if not A.is_contiguous():
-                        A = A.contiguous()
-                    dummy = torch.empty((A.shape[0], 1), dtype=torch.float32, device=A.device)
-                    A._hcu_up02_quant_pending = True
-                    return A, dummy
+                    # The all-gather consumer only accepts a bfloat16 activation
+                    # (`_up02_prepare_dispatch` in patch_cuda_communicator.py).  `tq.can_use`
+                    # also admits float16, so gate the dtype here: deferring a dtype the
+                    # consumer rejects would hand the caller an unquantized activation next
+                    # to a scale placeholder that nothing ever writes.
+                    if A.dtype is torch.bfloat16:
+                        if not A.is_contiguous():
+                            A = A.contiguous()
+                        dummy = torch.empty(
+                            (A.shape[0], 1), dtype=torch.float32, device=A.device
+                        )
+                        A._hcu_up02_quant_pending = True
+                        return A, dummy
                 return tq.token_fp8_quant(A)
         return original(A, A_scale, per_act_token, block_shape)
 

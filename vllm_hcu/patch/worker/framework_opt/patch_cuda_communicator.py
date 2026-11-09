@@ -131,6 +131,56 @@ def _maybe_init_dp_ipc_all_gather(communicator, unique_name: str) -> None:
     )
 
 
+_UP02_MARKER = "_hcu_up02_quant_pending"
+
+
+def _up02_marked(tensor) -> bool:
+    """True when `tensor` carries a deferred per-token FP8 quantization."""
+    return torch.is_tensor(tensor) and bool(getattr(tensor, _UP02_MARKER, False))
+
+
+def _up02_clear(tensor) -> None:
+    """Retire the marker once the deferred quantization has been honoured."""
+    if torch.is_tensor(tensor):
+        tensor._hcu_up02_quant_pending = False
+
+
+def _up02_guard_unconsumable(input_, ag, dim) -> None:
+    """Fail fast when a deferred-quant activation reaches a gather that cannot honour it.
+
+    The deferral contract is narrow: the marked activation must arrive at the DP IPC
+    all-gather as the first of the four production dispatch tensors.  Any other shape of
+    call (single tensor, a different tensor count, dim != 0, no IPC all-gather) would gather
+    an unquantized activation alongside a scale placeholder that nothing has written, and the
+    caller would consume uninitialized memory as a per-token scale.  That must not happen
+    quietly, so raise instead of proceeding.
+    """
+    first = input_ if torch.is_tensor(input_) else (
+        input_[0] if isinstance(input_, (list, tuple)) and input_ else None
+    )
+    if not _up02_marked(first):
+        return
+    if (
+        ag is not None
+        and dim == 0
+        and isinstance(input_, (list, tuple))
+        and len(input_) == 4
+    ):
+        return
+    raise RuntimeError(
+        "UP-02: a deferred per-token FP8 quantization reached an all-gather that cannot "
+        "consume it (ag=%s, dim=%s, payload=%s). The activation is still unquantized and "
+        "its scale is an unwritten placeholder; refusing to gather uninitialized scales."
+        % (
+            "none" if ag is None else type(ag).__name__,
+            dim,
+            "tensor" if torch.is_tensor(input_) else
+            "%d tensors" % len(input_) if isinstance(input_, (list, tuple)) else
+            type(input_).__name__,
+        )
+    )
+
+
 def _up02_prepare_dispatch(ag, tensors, sizes):
     """UP-02 opt-in: marked deferred-quant dispatch -> (gathered outs | None, tensors).
 
@@ -138,32 +188,44 @@ def _up02_prepare_dispatch(ag, tensors, sizes):
     activation (plus a scale placeholder) so the gather can quantize in the IPC prologue.
     Returns the gathered [q, w, ids, s] when the fused path runs, else None with the tensor
     list rewritten to the quantized [q, w, ids, s] so the standard gather path stays correct.
+
+    Once the marker is seen, every exit either runs the fused gather or rewrites the pair with
+    a real quantization, and the marker is retired.  Returning a marked tensor unchanged would
+    leave the standard gather with an unquantized activation and an uninitialized scale.
     """
     if len(tensors) != 4 or not sizes:
         return None, tensors
     t0, t1, t2, t3 = tensors
-    if not torch.is_tensor(t0) or not getattr(t0, "_hcu_up02_quant_pending", False):
+    if not _up02_marked(t0):
         return None, tensors
-    if not (torch.is_tensor(t1) and torch.is_tensor(t2) and torch.is_tensor(t3)):
-        return None, tensors
-    if (t0.dtype is not torch.bfloat16 or t1.dtype is not torch.float32
-            or t2.dtype is not torch.int32 or t3.dtype is not torch.float32):
-        return None, tensors
-    if t1.shape != t2.shape or t1.shape[0] != t0.shape[0] or t3.shape != (t0.shape[0], 1):
-        return None, tensors
-    if not (t0.is_contiguous() and t1.is_contiguous() and t2.is_contiguous()):
-        return None, tensors
-    can = getattr(ag, "can_quant_gather", None)
-    if can is not None:
-        try:
-            if can(t0, t1, t2, sizes):
-                return ag.gather_quant_prod(t0, t1, t2, t3, sizes), tensors
-        except Exception:
-            pass
+    fused_ready = (
+        torch.is_tensor(t1) and torch.is_tensor(t2) and torch.is_tensor(t3)
+        and t0.dtype is torch.bfloat16 and t1.dtype is torch.float32
+        and t2.dtype is torch.int32 and t3.dtype is torch.float32
+        and t1.shape == t2.shape and t1.shape[0] == t0.shape[0]
+        and t3.shape == (t0.shape[0], 1)
+        and t0.is_contiguous() and t1.is_contiguous() and t2.is_contiguous()
+    )
+    if fused_ready:
+        can = getattr(ag, "can_quant_gather", None)
+        if can is not None:
+            try:
+                if can(t0, t1, t2, sizes):
+                    outs = ag.gather_quant_prod(t0, t1, t2, t3, sizes)
+                    _up02_clear(t0)
+                    return outs, tensors
+            except Exception:
+                pass
+    if not (torch.is_tensor(t1) and torch.is_tensor(t2)):
+        raise RuntimeError(
+            "UP-02: deferred-quant activation paired with a non-tensor dispatch payload; "
+            "refusing to gather an unwritten scale placeholder"
+        )
     from vllm_hcu.ops import token_fp8_quant as tq
 
     q, s = tq.token_fp8_quant(t0)
     raw = [q, t1, t2, s]
+    _up02_clear(t0)
     if ag.can_gather(raw, sizes):
         return ag.gather(raw, sizes), raw
     return None, raw
@@ -302,6 +364,7 @@ def apply_to_module(module: ModuleType) -> bool:
     @functools.wraps(all_gatherv)
     def hcu_all_gatherv(self, input_, dim=0, sizes=None):
         ag = getattr(self, "_hcu_ipc_ag", None)
+        _up02_guard_unconsumable(input_, ag, dim)
         if getattr(self, "_hcu_dp_packed_ag", False) and ag is None:
             from vllm_hcu.distributed.device_communicators.packed_all_gather import (
                 packed_step5_all_gatherv,
