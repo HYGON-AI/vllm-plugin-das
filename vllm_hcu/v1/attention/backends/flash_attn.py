@@ -964,6 +964,9 @@ class FlashAttentionImpl(AttentionImpl):
             and vllm_config.parallel_config.decode_context_parallel_size > 1
             and vllm_config.parallel_config.dcp_comm_backend == "a2a"
         )
+        from vllm_hcu.runtime_compat.step5 import is_step5_pd_config
+
+        self._step5_pd = is_step5_pd_config(vllm_config)
         self.use_pcp = self.pcp_world_size > 1
         if dcp_a2a:
             self.dcp_combine = dcp_a2a_lse_reduce
@@ -1155,6 +1158,7 @@ class FlashAttentionImpl(AttentionImpl):
                             self.alibi_slopes,
                             self.logits_soft_cap,
                             self.sinks,
+                            allow_hnd=getattr(self, "_step5_pd", False),
                         )
                     ):
                         if (
@@ -1434,6 +1438,7 @@ class FlashAttentionImpl(AttentionImpl):
                 self.alibi_slopes,
                 self.logits_soft_cap,
                 self.sinks,
+                allow_hnd=getattr(self, "_step5_pd", False),
             )
             and can_use_swa_decode_fp8_d192(
                 query,

@@ -24,3 +24,15 @@ def is_step5_owner(owner=None):
 
         config = get_current_vllm_config_or_none()
     return config is not None and is_step5_config(config)
+
+
+def is_step5_pd_config(config):
+    """Opt in only separate Step5 Mooncake producers and consumers."""
+    transfer = getattr(config, "kv_transfer_config", None)
+    return (
+        config is not None
+        and is_step5_config(config)
+        and getattr(transfer, "kv_connector", None)
+        in ("MooncakeConnector", "Step5MooncakeConnector")
+        and getattr(transfer, "kv_role", None) in ("kv_producer", "kv_consumer")
+    )

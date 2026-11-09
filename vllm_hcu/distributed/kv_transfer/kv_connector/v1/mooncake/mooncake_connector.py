@@ -9,7 +9,7 @@ import threading
 import time
 from collections import defaultdict
 from concurrent.futures import ThreadPoolExecutor
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from enum import IntEnum
 from typing import TYPE_CHECKING, Any
 
@@ -72,6 +72,11 @@ from vllm.v1.kv_cache_interface import (
 from vllm.v1.request import RequestStatus
 from vllm.v1.worker.block_table import BlockTable
 from vllm.v1.worker.utils import select_common_block_size
+
+from vllm_hcu.distributed.kv_transfer.kv_connector.v1.mooncake.step5_aux import (
+    create_step5_aux_manager,
+)
+from vllm_hcu.runtime_compat.step5 import is_step5_pd_config
 
 logger = init_logger(__name__)
 
@@ -798,6 +803,10 @@ class MooncakeXferMetadata(
     registered_layer_indices: list[int] = msgspec.field(default_factory=list)
     registered_group_indices: list[int] = msgspec.field(default_factory=list)
     num_blocks_per_layer: list[int] = msgspec.field(default_factory=list)
+    # Per-request replicated DSA summaries and pending K/Z destinations.
+    dsa_aux: dict[str, dict[str, tuple[int, int, int, int, int, int, int, int]]] = (
+        msgspec.field(default_factory=dict)
+    )
 
 
 class MooncakeXferResponseStatus(IntEnum):
@@ -830,6 +839,10 @@ class PullReqMeta:
     expire_time: float = float("inf")
     # Designed for one D pairing to multiple P
     pull_tasks_count: int = 0
+    num_prompt_tokens: int = 0
+    dsa_aux: dict[str, tuple[int, int, int, int, int, int, int, int]] = field(
+        default_factory=dict
+    )
 
 
 @dataclass
@@ -852,6 +865,7 @@ class MooncakeConnectorMetadata(KVConnectorMetadata):
         self.reqs_to_recv: dict[EngineId, dict[ReqId, PullReqMeta]] = defaultdict(dict)
         self.reqs_to_send: dict[ReqId, tuple[TransferId, list[list[int]]]] = {}
         self.reqs_not_processed: set[TransferId] = set()
+        self.dsa_source_blocks: dict[TransferId, list[list[int]]] = {}
 
     def add_new_req(
         self,
@@ -869,9 +883,13 @@ class MooncakeConnectorMetadata(KVConnectorMetadata):
                 remote_engine_id=remote_engine_id,
                 remote_bootstrap_addr=kv_transfer_params["remote_bootstrap_addr"],
                 transfer_id=transfer_id,
+                num_prompt_tokens=int(kv_transfer_params.get("_hcu_dsa_prompt_tokens", 0)),
             )
         else:
             self.reqs_to_send[request_id] = (transfer_id, local_block_ids)
+            source = kv_transfer_params.get("_hcu_dsa_source_blocks")
+            if source is not None:
+                self.dsa_source_blocks[transfer_id] = source
 
 
 class MooncakeConnector(KVConnectorBase_V1, SupportsHMA):
@@ -974,6 +992,19 @@ class MooncakeConnector(KVConnectorBase_V1, SupportsHMA):
         assert self.connector_worker is not None
         return self.connector_worker.get_finished()
 
+    def bind_connector_metadata(self, connector_metadata: KVConnectorMetadata) -> None:
+        super().bind_connector_metadata(connector_metadata)
+        # Model Runner V2 may defer producer start_load_kv until post-forward.
+        # Snapshot capture must know the source blocks before indexer forward.
+        worker = self.connector_worker
+        auxiliary = getattr(worker, "_step5_aux", None)
+        if auxiliary is not None and worker.is_kv_producer:
+            assert isinstance(connector_metadata, MooncakeConnectorMetadata)
+            for transfer_id, groups in connector_metadata.dsa_source_blocks.items():
+                auxiliary.track_source(transfer_id, groups)
+            for transfer_id in connector_metadata.reqs_not_processed:
+                auxiliary.release(transfer_id)
+
     def start_load_kv(self, forward_context: "ForwardContext", **kwargs) -> None:
         assert self.connector_worker is not None
         assert isinstance(self._connector_metadata, MooncakeConnectorMetadata)
@@ -1026,6 +1057,7 @@ class MooncakeConnectorScheduler:
         kv_cache_config: "KVCacheConfig",
     ):
         self.vllm_config = vllm_config
+        self._needs_step5_aux = is_step5_pd_config(vllm_config)
         self.block_size = vllm_config.cache_config.block_size
 
         assert vllm_config.kv_transfer_config
@@ -1175,6 +1207,13 @@ class MooncakeConnectorScheduler:
         if not params:
             return
 
+        if getattr(self, "_needs_step5_aux", False):
+            params["_hcu_dsa_prompt_tokens"] = int(request.num_prompt_tokens)
+            if params.get("do_remote_decode"):
+                params["_hcu_dsa_source_blocks"] = [
+                    list(group) for group in blocks.get_unhashed_block_ids_all_groups()
+                ]
+
         if params.get("do_remote_prefill"):
             assert not self.is_kv_producer
             if all(
@@ -1298,6 +1337,41 @@ class MooncakeConnectorScheduler:
         return delay_free_blocks, None
 
 
+def _attention_transfer_page_views(
+    cache: torch.Tensor, *, allow_explicit_kv: bool = False,
+) -> list[torch.Tensor]:
+    """Return head-contiguous, zero-copy KV transfer views.
+
+    Modern packed backends may provide [B,H,N,C], while HCU FlashAttention
+    retains logical [B,2,N,H,D] over physical [B,2,H,N,D] storage. Split the
+    latter's explicit K/V axis before applying heterogeneous-TP head offsets.
+    Never flatten or copy a non-contiguous view: RDMA must address the storage
+    consumed by attention, including its original per-block padding.
+    """
+    if not isinstance(cache, torch.Tensor):
+        raise ValueError("Mooncake requires a KV page tensor")
+    if cache.ndim == 4:
+        views = [cache]
+    elif allow_explicit_kv and cache.ndim == 5 and cache.shape[1] == 2:
+        views = [cache.select(1, index).transpose(1, 2) for index in (0, 1)]
+    else:
+        raise ValueError(
+            "HCU Mooncake requires [B,H,N,C] or [B,2,N,H,D] KV cache views; "
+            f"got shape={tuple(cache.shape)}, stride={cache.stride()}"
+        )
+    for view in views:
+        if view.shape[0] <= 0:
+            raise ValueError("Mooncake KV cache must contain at least one block")
+        if not view[0].is_contiguous():
+            raise ValueError(
+                "HCU Mooncake requires canonical contiguous, head-contiguous "
+                "[H,N,C] page contents; "
+                f"got shape={tuple(cache.shape)}, stride={cache.stride()}. "
+                "Use KV cache layout LBHNC."
+            )
+    return views
+
+
 class MooncakeConnectorWorker:
     """Implementation of Worker side methods"""
 
@@ -1318,6 +1392,7 @@ class MooncakeConnectorWorker:
         self.vllm_config = vllm_config
         self.block_size = vllm_config.cache_config.block_size
         self.model_config = vllm_config.model_config
+        self._step5_pd = is_step5_pd_config(vllm_config)
         self.cache_config = vllm_config.cache_config
         self.kv_cache_config = kv_cache_config
         self.use_mla = self.model_config.use_mla
@@ -1900,6 +1975,9 @@ class MooncakeConnectorWorker:
                     send_meta.sent == send_meta.need_send
                     and self.reqs_need_send.pop(send_meta.transfer_id, None) is not None
                 ):
+                    auxiliary = getattr(self, "_step5_aux", None)
+                    if auxiliary is not None:
+                        auxiliary.release(send_meta.transfer_id)
                     self.finished_sending_reqs.add(send_meta.p_req_id)
 
             response = MooncakeXferResponse(
@@ -2087,6 +2165,27 @@ class MooncakeConnectorWorker:
                 if err_msg is None:
                     err_msg = bounds_error
                 continue
+
+            auxiliary = getattr(self, "_step5_aux", None)
+            if auxiliary is not None:
+                try:
+                    aux_src, aux_dst, aux_sizes = auxiliary.transfer_parameters(
+                        d_req_id, agent_meta,
+                        local_block_ids_by_group, remote_block_ids_by_group,
+                    )
+                except (ValueError, RuntimeError) as error:
+                    err_reqs.append(d_req_id)
+                    if err_msg is None:
+                        err_msg = str(error)
+                    logger.error("Step5 DSA auxiliary transfer rejected: %s", error)
+                    continue
+                src_ptrs.extend(aux_src)
+                dst_ptrs.extend(aux_dst)
+                lengths.extend(aux_sizes)
+                logger.debug(
+                    "Step5 DSA auxiliary descriptors req=%s count=%d bytes=%d",
+                    d_req_id, len(aux_sizes), sum(aux_sizes),
+                )
 
             for local_region, remote_region in zip(local_regions, remote_regions):
                 assert local_region.group_index == remote_region.group_index, (
@@ -2277,25 +2376,10 @@ class MooncakeConnectorWorker:
                     self.pcp_size,
                 )
                 continue
-            # v0.28 allocates logical [B, H, N, C] page views. K and V
-            # are part of C, not an extra axis that can be split in half.
-            # LBHNC keeps whole heads contiguous for heterogeneous TP copies.
-            if not isinstance(cache, torch.Tensor) or cache.ndim != 4:
-                raise ValueError(
-                    "HCU Mooncake on vLLM 0.28 requires a [B, H, N, C] "
-                    f"KV page tensor for {layer_name}."
-                )
+            transfer_views = _attention_transfer_page_views(
+                cache, allow_explicit_kv=getattr(self, "_step5_pd", False),
+            )
             self._log_debug_cache_registration(layer_name, cache)
-            if cache.shape[0] <= 0:
-                raise ValueError(
-                    f"KV cache {layer_name} must contain at least one block."
-                )
-            if not cache[0].is_contiguous():
-                raise ValueError(
-                    "HCU Mooncake requires canonical contiguous [H, N, C] "
-                    f"page contents; layer={layer_name}. Use KV cache layout LBHNC."
-                )
-            base_addr = cache.data_ptr()
             block_len = cache.stride(0) * cache.element_size()
             if isinstance(layer_spec, KpoolTailSpec):
                 # Match v0.28 Mooncake's raw-tail transfer payload.
@@ -2328,33 +2412,51 @@ class MooncakeConnectorWorker:
                     "HCU Mooncake supports attention KV pages only; "
                     f"layer={layer_name}, spec={type(layer_spec).__name__}."
                 )
-            # Keep padded page strides separate from head payload lengths.
-            # MLA copies its complete aligned page; sharded attention copies
-            # only content, so TP offsets never include trailing page padding.
-            if kv_block_len <= 0 or kv_block_len > block_len:
-                raise ValueError(
-                    "Mooncake KV payload exceeds its physical block stride: "
-                    f"layer={layer_name}, stride={block_len}, "
-                    f"payload_span={kv_block_len}."
-                )
-            region_base_addresses.append(base_addr)
-            self.block_len_per_layer.append(block_len)
-            self.kv_block_len_per_layer.append(kv_block_len)
-            self.registered_layer_names.append(layer_name)
-            self.registered_layer_indices.append(layer_index)
-            self.registered_group_indices.append(self._layer_group_indices[layer_name])
-            self.num_blocks_per_layer.append(cache.shape[0])
+            # Keep the actual block stride and backing allocation. For the
+            # five-dimensional FlashAttention cache, K and V are separate,
+            # head-contiguous regions sharing the same padded block stride.
+            if len(transfer_views) == 2:
+                if not isinstance(layer_spec, AttentionSpec) or isinstance(
+                    layer_spec, (MLAAttentionSpec, SlidingWindowMLASpec)
+                ):
+                    raise ValueError("Explicit K/V cache requires a non-MLA attention spec")
+                if kv_block_len % 2:
+                    raise ValueError("Explicit K/V payload must divide into two equal regions")
+            region_payload = kv_block_len // len(transfer_views)
             storage = cache.untyped_storage()
             storage_addr = storage.data_ptr()
             storage_len = storage.nbytes()
-            view_offset = base_addr - storage_addr
-            view_end = view_offset + (cache.shape[0] - 1) * block_len + kv_block_len
-            if view_offset < 0 or view_end > storage_len:
-                raise ValueError(
-                    "KV cache view exceeds its registered storage: "
-                    f"layer={layer_name}, view_offset={view_offset}, "
-                    f"view_end={view_end}, storage_length={storage_len}."
-                )
+            for view in transfer_views:
+                base_addr = view.data_ptr()
+                view_stride = view.stride(0) * view.element_size()
+                if view_stride != block_len:
+                    raise ValueError("KV transfer view changed its physical block stride")
+                if region_payload <= 0 or region_payload > block_len:
+                    raise ValueError(
+                        "Mooncake KV payload exceeds its physical block stride: "
+                        f"layer={layer_name}, stride={block_len}, payload={region_payload}"
+                    )
+                if len(transfer_views) == 2 and (
+                    region_payload != view[0].numel() * view.element_size()
+                ):
+                    raise ValueError("Explicit K/V page contents do not match their spec")
+                view_offset = base_addr - storage_addr
+                view_end = view_offset + (view.shape[0] - 1) * block_len + region_payload
+                if view_offset < 0 or view_end > storage_len:
+                    raise ValueError(
+                        "KV cache view exceeds its registered storage: "
+                        f"layer={layer_name}, view_offset={view_offset}, "
+                        f"view_end={view_end}, storage_length={storage_len}."
+                    )
+                region_base_addresses.append(base_addr)
+                self.block_len_per_layer.append(block_len)
+                self.kv_block_len_per_layer.append(region_payload)
+                # Existing wire metadata supports repeated layer occurrences;
+                # preserve K-then-V order and the original KV-group identity.
+                self.registered_layer_names.append(layer_name)
+                self.registered_layer_indices.append(layer_index)
+                self.registered_group_indices.append(self._layer_group_indices[layer_name])
+                self.num_blocks_per_layer.append(view.shape[0])
             if storage_addr not in seen_storage_ptrs:
                 seen_storage_ptrs.add(storage_addr)
                 kv_data_ptrs.append(storage_addr)
@@ -2371,6 +2473,7 @@ class MooncakeConnectorWorker:
             raise RuntimeError("Mooncake batch memory registration failed.")
 
         self.device_kv_caches = kv_caches
+        self._step5_aux = create_step5_aux_manager(self, kv_caches)
         logger.debug(
             "registered block_lens=%s kv_block_lens=%s",
             self.block_len_per_layer,
@@ -2418,6 +2521,9 @@ class MooncakeConnectorWorker:
                     envs.VLLM_MOONCAKE_ABORT_REQUEST_TIMEOUT,
                 )
                 self.xfer_stats.record_kv_expired_req()
+                auxiliary = getattr(self, "_step5_aux", None)
+                if auxiliary is not None:
+                    auxiliary.release(transfer_id)
                 finished_sending_reqs.add(send_meta.p_req_id)
                 expired_transfer_id.append(transfer_id)
 
@@ -2487,6 +2593,10 @@ class MooncakeConnectorWorker:
             registered_layer_indices=self.registered_layer_indices,
             registered_group_indices=self.registered_group_indices,
             num_blocks_per_layer=self.num_blocks_per_layer,
+            dsa_aux={
+                req_id: pull.dsa_aux for req_id, pull in pull_metas.items()
+                if pull.dsa_aux
+            },
         )
 
         encoded_data = self._encoder.encode(metadata)
@@ -2753,6 +2863,11 @@ class MooncakeConnectorWorker:
                 assert not send_meta.ready.is_set()
 
     def start_load_kv(self, metadata: MooncakeConnectorMetadata):
+        auxiliary = getattr(self, "_step5_aux", None)
+        if auxiliary is not None:
+            for pulls in metadata.reqs_to_recv.values():
+                for pull in pulls.values():
+                    auxiliary.prepare_pull(pull)
         if not self.is_kv_producer and metadata.reqs_to_recv:
             asyncio.run_coroutine_threadsafe(
                 self._start_load_kv(metadata.reqs_to_recv), self.receiver_loop
@@ -2789,7 +2904,7 @@ class MooncakeConnectorWorker:
             kv_block_lens=kv_block_lens,
             layer_names=layer_names,
             layer_indices=layer_indices,
-            # One transfer region per v0.28 page, including both K and V.
+            # One region per registered view: a packed page or an explicit K/V half.
             is_kv_layout_blocks_first=False,
             group_indices=group_indices,
             num_blocks_per_layer=num_blocks_per_layer,
