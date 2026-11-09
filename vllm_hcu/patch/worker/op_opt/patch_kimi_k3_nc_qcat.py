@@ -53,61 +53,6 @@ _ROPE = 64
 # Set by apply_to_module: (original, patched).  Consumers imported later are
 # re-bound by the registered post-import callback.
 _INSTALLED: tuple | None = None
-_DEBUG = os.environ.get("VLLM_HCU_K3_NCQ_DEBUG", "0") == "1"
-_DBG_BUDGET = [24]
-
-
-def _debug_dump(original, out, ql_nope, q_pe, kv_c_normed, k_pe, kv_cache,
-                slot_mapping, q_scale_inv, cache_scale_inv, positions,
-                cos_sin_cache) -> None:
-    """Eager-only, budgeted parity dump (never runs inside graph capture)."""
-    import json
-
-    try:
-        import torch
-    except Exception:  # noqa: BLE001
-        return
-    if torch.cuda.is_current_stream_capturing() or _DBG_BUDGET[0] <= 0:
-        return
-    _DBG_BUDGET[0] -= 1
-    try:
-        rec = {
-            "b": int(out.shape[0]),
-            "q_scale_inv": float(q_scale_inv),
-            "cache_scale_inv": float(cache_scale_inv),
-            "q_in_absmax": float(ql_nope.float().abs().max()),
-            "pe_in_absmax": float(q_pe.float().abs().max()),
-            "kvc_absmax": float(kv_c_normed.float().abs().max()),
-            "kpe_absmax": float(k_pe.float().abs().max()),
-            "slot_min": int(slot_mapping.min()),
-            "slot_max": int(slot_mapping.max()),
-            "pos_min": int(positions.min()) if positions is not None else -1,
-            "pos_max": int(positions.max()) if positions is not None else -1,
-            "out_absmax": float(out.float().abs().max()),
-            "out_zero_frac": float((out.float() == 0).float().mean()),
-            "out_sat_frac": float((out.float().abs() >= 440).float().mean()),
-        }
-        # same inputs through the vendor op on a scratch cache copy
-        scratch = kv_cache.clone()
-        ref = original(
-            ql_nope, q_pe, kv_c_normed, k_pe, scratch, slot_mapping,
-            ds_mla=False, q_scale_inv=q_scale_inv,
-            cache_scale_inv=cache_scale_inv, positions=positions,
-            cos_sin_cache=cos_sin_cache,
-        )
-        bits = (ref.view(torch.uint8).int() - out.view(torch.uint8).int())
-        rec["ref_absmax"] = float(ref.float().abs().max())
-        rec["diff_bytes"] = int((bits != 0).sum())
-        rec["diff_max_step"] = int(bits.abs().max())
-        rec["bytes"] = int(bits.numel())
-        with open("/tmp/nc_dbg.log", "a") as f:
-            f.write(json.dumps(rec) + "\n")
-    except Exception as exc:  # noqa: BLE001
-        try:
-            with open("/tmp/nc_dbg.log", "a") as f:
-                f.write(json.dumps({"dbg_err": repr(exc)}) + "\n")
-        except Exception:  # noqa: BLE001
-            pass
 
 
 def _enabled() -> bool:
@@ -381,12 +326,6 @@ def _build(original):
             ql_nope, q_pe, kv_c_normed, k_pe, kv_cache, slot_mapping,
             q_scale_inv, cache_scale_inv, positions, cos_sin_cache,
         )
-        if _DEBUG:
-            _debug_dump(
-                original, out, ql_nope, q_pe, kv_c_normed, k_pe, kv_cache,
-                slot_mapping, q_scale_inv, cache_scale_inv, positions,
-                cos_sin_cache,
-            )
         return out
 
     return fused_mla_decode_q_concat_kv_cache_insert
