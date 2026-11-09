@@ -20,12 +20,23 @@ _FEATURE_FIELDS = (
     "enable_lightly_cplb",
     "enable_custom_sp",
     "enable_multi_layers_mtp",
+    "enable_dsa_cache_layer_split",
     "deepep_auto",
     "fused_qwen3_rms_rope",
     "moe_backend",
     "hcu_flash_attn_mode",
 )
-_BOOLEAN_FIELDS = _FEATURE_FIELDS[:6]
+# Enumerate booleans explicitly so inserting a non-bool feature field cannot
+# silently pull enable_dsa_cache_layer_split out of (or into) the wrong set.
+_BOOLEAN_FIELDS = (
+    "enable_lightly_cp",
+    "enable_lightly_cplb",
+    "enable_custom_sp",
+    "enable_multi_layers_mtp",
+    "enable_dsa_cache_layer_split",
+    "deepep_auto",
+    "fused_qwen3_rms_rope",
+)
 _SUPPORTED_MOE_BACKENDS = frozenset({"auto", "deep_gemm"})
 _LEGACY_DEEP_GEMM_BACKEND = "dpsk_deep_gemm"
 _DEEP_GEMM_BACKEND = "deep_gemm"
@@ -67,6 +78,7 @@ class HcuFeatureConfig:
     enable_lightly_cplb: bool = False
     enable_custom_sp: bool = False
     enable_multi_layers_mtp: bool = False
+    enable_dsa_cache_layer_split: bool = False
     deepep_auto: bool = False
     # Effective (master AND child) runtime policy persisted for compilation
     # cache partitioning. Platform validation refreshes it from the process

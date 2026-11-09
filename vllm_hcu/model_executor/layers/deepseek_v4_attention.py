@@ -600,6 +600,21 @@ class DeepseekV4MultiHeadLatentAttentionWrapper(PluggableLayer):
         swa_slot_mapping_i32 = swa_metadata.slot_mapping.to(
             dtype=torch.int32
         ).contiguous()
+        swa_layer_name = self.swa_cache_layer.prefix
+
+        # Layer-split SWA (decoder late-tail + encoder/APC prefix rebuild):
+        # finalize any pending SWA prefetch, write (owner→durable / non-owner
+        # →scratch; fused also transforms Q which every rank needs), then
+        # owner-broadcast so every PCP rank reads the durable SWA window.
+        # SGLang cp-cache-layer-split does the same via should_skip_swa_write
+        # + prefetch_swa_layer; HCU also covers encoder SWA (SGLang forbids it).
+        from vllm_hcu.v1.dsa_cache_layer_split import (
+            begin_mla_dsa_cache_write,
+            broadcast_dsa_cache_from_owner,
+        )
+
+        # Finalize pending SWA prefetch before writing (MLA remote_kv_updatable).
+        begin_mla_dsa_cache_write(swa_kv_cache, swa_layer_name)
 
         # Horizontally fused:
         #   Q side:  q_head_norm (per-head RMSNorm, no weight) + GPT-J RoPE
@@ -627,6 +642,7 @@ class DeepseekV4MultiHeadLatentAttentionWrapper(PluggableLayer):
             self.eps,
             swa_metadata.block_size,
         )
+        broadcast_dsa_cache_from_owner(swa_kv_cache, swa_layer_name)
 
 
 def deepseek_v4_attention(

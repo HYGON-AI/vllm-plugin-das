@@ -101,6 +101,18 @@ class HcuGPUModelRunnerV2(GPUModelRunner):
             raise ValueError(
                 "HCU PCP requires exactly one KV cache group."
             )
+        from copy import deepcopy
+
+        from vllm_hcu.v1.dsa_cache_layer_split import (
+            install_runtime_layer_split_state,
+            maybe_log_runtime_layer_shard_plan,
+            remap_packed_kv_tensor_offsets,
+        )
+
+        install_runtime_layer_split_state(self.vllm_config)
+        kv_cache_config = deepcopy(kv_cache_config)
+        remap_packed_kv_tensor_offsets(kv_cache_config, self.vllm_config)
+        maybe_log_runtime_layer_shard_plan(self.vllm_config)
         from vllm_hcu.v1.kv_cache import use_hcu_flash_kv_cache_allocator
 
         with use_hcu_flash_kv_cache_allocator(self):

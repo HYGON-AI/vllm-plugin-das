@@ -184,9 +184,14 @@ def apply_to_module(module: ModuleType) -> bool:
         backend = backend or "triton"
         # Override both config owners on a draft-only copy. HCU 'auto'
         # delegates explicit official backends such as Triton to vLLM.
+        # DSpark draft does not own PCP layer-split KV. Clearing the flag
+        # avoids VllmConfig re-validation during replace() reporting
+        # prefill_context_parallel_size==1 while the flag is still on
+        # (replace rebuild must not keep target layer-split on the draft).
         sidecar = get_hcu_config(vllm_config).with_updates(
             moe_backend="deep_gemm" if backend == "deep_gemm" else "auto",
             deepep_auto=False,
+            enable_dsa_cache_layer_split=False,
         )
         additional = dict(vllm_config.additional_config or {})
         additional["hcu"] = sidecar.to_dict()

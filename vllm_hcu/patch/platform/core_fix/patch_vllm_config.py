@@ -290,11 +290,21 @@ def _require_mrv2_pcp_contract(vllm_config: object) -> None:
     use_mla = bool(
         _require_hcu_pcp_attribute(model_config, "use_mla", "ModelConfig")
     )
+    from vllm_hcu.v1.dsa_cache_layer_split import is_hcu_dsa_mla_model
+
+    is_dsa_mla = is_hcu_dsa_mla_model(model_config)
     is_glm52 = architectures == ["GlmMoeDsaForCausalLM"]
     is_hy4 = architectures == ["HYV4ForCausalLM"]
     is_dsv4 = bool(
         set(architectures) & _DSV4_ARCHITECTURES
     ) and _dsv4_pcp_experimental()
+    if use_mla and not (is_dsa_mla or is_glm52 or is_hy4 or is_dsv4):
+        raise ValueError(
+            "HCU MLA PCP supports a registered DSA MLA family, GLM-5.2, "
+            "HY V4, or DeepSeek-V4/V4.1 with "
+            "VLLM_HCU_DSV4_PCP_EXPERIMENTAL=1. "
+            f"Got architectures={architectures!r}."
+        )
     mla_model_name = None
     if is_glm52:
         mla_model_name = "GLM-5.2"
@@ -302,13 +312,8 @@ def _require_mrv2_pcp_contract(vllm_config: object) -> None:
         mla_model_name = "HY V4"
     elif is_dsv4:
         mla_model_name = "DeepSeek-V4/V4.1"
-    if use_mla and mla_model_name is None:
-        raise ValueError(
-            "HCU MLA PCP supports GLM-5.2, HY V4 and DeepSeek-V4/V4.1; "
-            "DeepSeek-V4/V4.1 requires "
-            "VLLM_HCU_DSV4_PCP_EXPERIMENTAL=1. "
-            f"Got architectures={architectures!r}."
-        )
+    elif is_dsa_mla:
+        mla_model_name = "DSA MLA"
     if mla_model_name is not None and not use_mla:
         raise ValueError(f"{mla_model_name} PCP requires MLA or sparse MLA.")
     if not use_mla:
@@ -415,11 +420,29 @@ def _require_mrv2_pcp_contract(vllm_config: object) -> None:
     kv_transfer_config = _require_hcu_pcp_attribute(
         vllm_config, "kv_transfer_config", "VllmConfig"
     )
-    if kv_transfer_config is not None and _require_hcu_pcp_attribute(
-        kv_transfer_config, "kv_connector", "KVTransferConfig"
-    ) is not None:
-        if not _dsv41_pcp_mooncake_producer(vllm_config):
-            raise ValueError("HCU PCP does not support P/D disaggregation.")
+    kv_connector = None
+    if kv_transfer_config is not None:
+        kv_connector = _require_hcu_pcp_attribute(
+            kv_transfer_config, "kv_connector", "KVTransferConfig"
+        )
+    if kv_transfer_config is not None and kv_connector is not None:
+        dsa_layer_split_mooncake_producer = (
+            is_dsa_mla
+            and kv_connector == "MooncakeConnector"
+            and getattr(kv_transfer_config, "kv_role", None) == "kv_producer"
+            and getattr(kv_transfer_config, "kv_connector_module_path", None)
+            is None
+        )
+        if not (
+            _dsv41_pcp_mooncake_producer(vllm_config)
+            or dsa_layer_split_mooncake_producer
+        ):
+            raise ValueError(
+                "HCU PCP P/D disaggregation requires the V4.1 DSpark "
+                "Mooncake producer or a supported DSA MLA producer with "
+                "MooncakeConnector, kv_role='kv_producer', and no custom "
+                "connector module."
+            )
 
     feature_config = get_hcu_config(vllm_config)
     if feature_config.enable_lightly_cp:
@@ -473,6 +496,9 @@ def validate_and_update_hcu_config(vllm_config: object) -> HcuFeatureConfig:
     _normalize_hcu_model_runner(vllm_config.model_config)
 
     _validate_hcu_pcp_scope(vllm_config)
+    from vllm_hcu.v1.dsa_cache_layer_split import validate_dsa_cache_layer_split
+
+    validate_dsa_cache_layer_split(vllm_config)
     from vllm_hcu.models.hy_v4.dcp_config import validate_hy4_dcp_config
 
     validate_hy4_dcp_config(vllm_config)

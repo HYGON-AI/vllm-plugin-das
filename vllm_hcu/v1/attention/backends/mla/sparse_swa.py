@@ -85,6 +85,11 @@ def resolve_swa_bounded_replay(vllm_config: VllmConfig) -> bool:
     PCP late-tail gather works with or without APC (sglang CP late-tail
     gather is the same idea). Do not couple ``--swa-bounded-replay`` to
     ``--enable-prefix-caching``.
+
+    Compatible with ``--enable-dsa-cache-layer-split``: SWA is its own
+    broadcast family (owner commit + prefetch). Unlike SGLang's
+    ``cp-cache-layer-split`` (decoder-only), HCU also keeps encoder/APC
+    prefix rebuild on the same path.
     """
     cache_config = getattr(vllm_config, "cache_config", None)
     if cache_config is None or not bool(

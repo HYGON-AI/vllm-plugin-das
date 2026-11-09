@@ -90,18 +90,31 @@ def apply_to_module(module: ModuleType) -> bool:
                     # Replay pad / trim can leave a longer mapping; keep the
                     # leading rows that align with positions.
                     slot_mapping = slot_mapping.reshape(-1)[: positions.numel()]
-            torch.ops._C.fused_deepseek_v4_kv_rope_insert(
-                cache_kv,
-                cache,
-                slot_mapping,
-                cache_positions,
-                self.rotary_emb.cos_sin_cache,
-                self.swa_cache_layer.block_size,
-                getattr(self, "_flashinfer_fp8_kv_scale", None)
-                if cache.dtype == torch.float8_e4m3fn
-                else None,
-                getattr(self, "kv_mxfp8", False),
+            from vllm_hcu.v1.dsa_cache_layer_split import (
+                begin_mla_dsa_cache_write,
+                broadcast_dsa_cache_from_owner,
+                should_commit_durable_dsa_cache,
             )
+
+            swa_name = self.swa_cache_layer.prefix
+            # Decoder late-tail / encoder APC both write SWA through forward_kv.
+            # Owner commits durable rows; remote_updatable patches scratch in
+            # place; every PCP rank then syncs via owner broadcast.
+            remote_updatable = begin_mla_dsa_cache_write(cache, swa_name)
+            if should_commit_durable_dsa_cache(swa_name) or remote_updatable:
+                torch.ops._C.fused_deepseek_v4_kv_rope_insert(
+                    cache_kv,
+                    cache,
+                    slot_mapping,
+                    cache_positions,
+                    self.rotary_emb.cos_sin_cache,
+                    self.swa_cache_layer.block_size,
+                    getattr(self, "_flashinfer_fp8_kv_scale", None)
+                    if cache.dtype == torch.float8_e4m3fn
+                    else None,
+                    getattr(self, "kv_mxfp8", False),
+                )
+            broadcast_dsa_cache_from_owner(cache, swa_name)
         if self.compressor is not None:
             latent = self.compressor(kv_score, positions)
             self.compressor.insert_cache(latent, positions, self.rotary_emb)
