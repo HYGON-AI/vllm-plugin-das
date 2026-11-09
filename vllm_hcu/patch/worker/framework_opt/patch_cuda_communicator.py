@@ -110,14 +110,63 @@ def _maybe_init_dp_ipc_all_gather(communicator, unique_name: str) -> None:
         IpcAllGather,
     )
 
-    communicator._hcu_ipc_ag = IpcAllGather(
-        communicator.cpu_group, communicator.device
-    )
+    # UP-02 opt-in: the fused subclass adds can_quant_gather/gather_quant_prod on top of the
+    # production communicator; the env gate matches the deferred-quant patch.
+    if os.environ.get("VLLM_HCU_UP02_FUSED_DISPATCH", "0") == "1":
+        from vllm_hcu.distributed.device_communicators.ipc_fused_dispatch import (
+            IpcQuantAllGather,
+        )
+
+        communicator._hcu_ipc_ag = IpcQuantAllGather(
+            communicator.cpu_group, communicator.device
+        )
+    else:
+        communicator._hcu_ipc_ag = IpcAllGather(
+            communicator.cpu_group, communicator.device
+        )
     from vllm.logger import init_logger
 
     init_logger(__name__).info_once(
         "DP group '%s' uses the IPC all-gather for MoE dispatch", unique_name
     )
+
+
+def _up02_prepare_dispatch(ag, tensors, sizes):
+    """UP-02 opt-in: marked deferred-quant dispatch -> (gathered outs | None, tensors).
+
+    A marked first tensor means prepare() skipped the local quant and passed the bf16
+    activation (plus a scale placeholder) so the gather can quantize in the IPC prologue.
+    Returns the gathered [q, w, ids, s] when the fused path runs, else None with the tensor
+    list rewritten to the quantized [q, w, ids, s] so the standard gather path stays correct.
+    """
+    if len(tensors) != 4 or not sizes:
+        return None, tensors
+    t0, t1, t2, t3 = tensors
+    if not torch.is_tensor(t0) or not getattr(t0, "_hcu_up02_quant_pending", False):
+        return None, tensors
+    if not (torch.is_tensor(t1) and torch.is_tensor(t2) and torch.is_tensor(t3)):
+        return None, tensors
+    if (t0.dtype is not torch.bfloat16 or t1.dtype is not torch.float32
+            or t2.dtype is not torch.int32 or t3.dtype is not torch.float32):
+        return None, tensors
+    if t1.shape != t2.shape or t1.shape[0] != t0.shape[0] or t3.shape != (t0.shape[0], 1):
+        return None, tensors
+    if not (t0.is_contiguous() and t1.is_contiguous() and t2.is_contiguous()):
+        return None, tensors
+    can = getattr(ag, "can_quant_gather", None)
+    if can is not None:
+        try:
+            if can(t0, t1, t2, sizes):
+                return ag.gather_quant_prod(t0, t1, t2, t3, sizes), tensors
+        except Exception:
+            pass
+    from vllm_hcu.ops import token_fp8_quant as tq
+
+    q, s = tq.token_fp8_quant(t0)
+    raw = [q, t1, t2, s]
+    if ag.can_gather(raw, sizes):
+        return ag.gather(raw, sizes), raw
+    return None, raw
 
 
 def _close_ipc_all_gather(communicator) -> None:
@@ -271,6 +320,10 @@ def apply_to_module(module: ModuleType) -> bool:
                     if tensors[0].dim() == 0:
                         raise ValueError("all-gather inputs must have a row dimension")
                     sizes = [tensors[0].shape[0]] * self.world_size
+                if not single and len(tensors) == 4:
+                    outs, tensors = _up02_prepare_dispatch(ag, tensors, sizes)
+                    if outs is not None:
+                        return outs
                 use_ipc = ag.can_gather(tensors, sizes)
                 # Normalize both paths. Local contiguity must not decide which
                 # collective peers enter, and NCCL also expects packed storage.
