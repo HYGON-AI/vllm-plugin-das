@@ -51,9 +51,9 @@ def _load_aiter_api() -> _AiterApi:
         from .int8_asm import execute as execute_asm, unsupported_reason
 
         native = import_module("aiter")
-        native_arguments = dict(
-            arguments, expert_map=_aiter_expert_mask(arguments["expert_map"])
-        )
+        # ASM sorts actual local IDs; retain the canonical map until that
+        # device-side conversion. Only CK consumes a binary ownership mask.
+        native_arguments = dict(arguments)
         reason = unsupported_reason(native_arguments, native)
         if reason is None:
             return execute_asm(native=native, **native_arguments)

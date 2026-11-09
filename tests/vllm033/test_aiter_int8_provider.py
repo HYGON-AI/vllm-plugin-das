@@ -266,19 +266,13 @@ def test_unsupported_aiter_layout_uses_official_int8_triton_fallback(
 
 
 @pytest.mark.parametrize(
-    ("expert_map", "expected_mask"),
-    (
-        ([0, 1, -1, -1], [1, 1, 0, 0, 0]),
-        ([-1, -1, 0, 1], [0, 0, 1, 1, 0]),
-        ([0, -1, 1, -1], [1, 0, 1, 0, 0]),
-        ([-1, 0, -1, 1], [0, 1, 0, 1, 0]),
-    ),
+    "expert_map",
+    ([0, 1, -1, -1], [-1, -1, 0, 1], [0, -1, 1, -1], [-1, 0, -1, 1]),
     ids=("linear-rank0", "linear-rank1", "round-robin-rank0", "round-robin-rank1"),
 )
-def test_native_aiter_receives_mask_derived_from_canonical_expert_map(
+def test_native_asm_receives_unchanged_canonical_expert_map(
     monkeypatch: pytest.MonkeyPatch,
     expert_map: list[int],
-    expected_mask: list[int],
 ) -> None:
     arguments = inputs()
     arguments["expert_map"] = torch.tensor(expert_map, dtype=torch.int32)
@@ -308,11 +302,8 @@ def test_native_aiter_receives_mask_derived_from_canonical_expert_map(
     provider.apply_aiter_int8_moe(**arguments)
 
     assert len(calls) == 1
-    actual_mask = calls[0]["expert_map"]
-    assert torch.equal(
-        actual_mask,
-        torch.tensor(expected_mask, dtype=torch.int32),
-    )
+    assert calls[0]["expert_map"] is arguments["expert_map"]
+    assert torch.equal(calls[0]["expert_map"], torch.tensor(expert_map, dtype=torch.int32))
 
 
 def test_vendor_failure_after_config_selection_does_not_change_provider(
@@ -393,3 +384,18 @@ def test_unknown_ep_solution_uses_official_fallback_before_vendor(monkeypatch):
     )
     assert provider.apply_aiter_int8_moe(**arguments) is expected
     assert len(calls) == 1 and calls[0]["expert_map"] is canonical
+
+
+def test_ck_keeps_binary_ownership_mask_abi(monkeypatch):
+    canonical = torch.tensor([1, -1, 0, -1], dtype=torch.int32)
+    seen = []
+    vendor = SimpleNamespace(
+        MoeQuantType=SimpleNamespace(W8A8="int8_w8a8"),
+        get_aiter_moe_config=lambda *a, **kw: None,
+        aiter_moe=lambda **kw: seen.append(kw) or object(),
+    )
+    original_import = provider.import_module
+    monkeypatch.setattr(provider, "import_module", lambda n: vendor if n == "aiter.moe" else original_import(n))
+    provider._load_aiter_api().aiter_moe(moe_config=SimpleNamespace(solution_type="ck"), expert_map=canonical)
+    assert torch.equal(seen[0]["expert_map"], torch.tensor([1, 0, 1, 0, 0], dtype=torch.int32))
+    assert torch.equal(canonical, torch.tensor([1, -1, 0, -1], dtype=torch.int32))

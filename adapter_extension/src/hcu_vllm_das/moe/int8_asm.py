@@ -69,6 +69,13 @@ def unsupported_reason(arguments: dict[str, object], native: object) -> str | No
         or mask.numel() < arguments["global_num_experts"]
     ):
         return "unsupported-stage-mask"
+    local_experts = arguments["w1"].shape[0]
+    global_experts = arguments["global_num_experts"]
+    top_k = arguments["topk_ids"].shape[1]
+    if global_experts <= 0 or (mask is None and local_experts != global_experts):
+        return "expert-domain"
+    if top_k <= 0 or local_experts < top_k or local_experts <= 0:
+        return "local-expert-domain"
     # Native ASM uses 32-bit buffer descriptors. Do not launch a stage whose
     # route workspace reaches that byte bound; official fallback owns it.
     routes = arguments["topk_ids"].numel()
@@ -76,6 +83,20 @@ def unsupported_reason(arguments: dict[str, object], native: object) -> str | No
     if routes * width * hidden.element_size() >= 2**31:
         return "stage-buffer-bound"
     return None
+
+
+def _prepare_sorting_routes(topk_ids, expert_map, global_num_experts, local_num_experts):
+    """Preserve canonical local slots and keep padding out of native sorting."""
+    if expert_map is None and topk_ids.dtype == torch.int32:
+        return topk_ids, global_num_experts
+    valid = (topk_ids >= 0) & (topk_ids < global_num_experts)
+    if expert_map is None:
+        return torch.where(valid, topk_ids, -1).to(torch.int32), global_num_experts
+    # Check original IDs before narrowing: int64 overflow and negative padding
+    # must not wrap or index an unrelated (including trailing) map entry.
+    indices = topk_ids.clamp(0, global_num_experts - 1).to(torch.int64)
+    mapped = expert_map.index_select(0, indices.reshape(-1)).reshape_as(topk_ids)
+    return torch.where(valid, mapped, -1).to(torch.int32), local_num_experts
 
 
 def execute(
@@ -104,7 +125,9 @@ def execute(
     top_k = topk_ids.shape[1]
     routes = m * top_k
     block = config["BLOCK_SIZE_M"]
-    domain = global_num_experts if expert_map is None else expert_map.numel()
+    sorting_routes, domain = _prepare_sorting_routes(
+        topk_ids, expert_map, global_num_experts, w1.shape[0]
+    )
     # At most block-1 padding entries per expert; one extra block per expert
     # gives a conservative upper bound without reading device route counts.
     capacity = routes + domain * block
@@ -117,7 +140,7 @@ def execute(
     positions = torch.empty(2 * domain, device=device, dtype=torch.int32)
     count = torch.empty(1, device=device, dtype=torch.int32)
     native.moe_sorting_fwd(
-        topk_ids.to(torch.int32),
+        sorting_routes,
         topk_weights,
         ids,
         weights,
@@ -127,7 +150,7 @@ def execute(
         None,
         domain,
         block,
-        expert_map,
+        None,
     )
 
     # Zero remote routes before activation and reduction. Each stage writes
