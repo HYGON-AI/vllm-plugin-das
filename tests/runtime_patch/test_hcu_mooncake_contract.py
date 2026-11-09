@@ -1292,8 +1292,14 @@ def _mamba_spec(mooncake, *, padded=False):
     return spec
 
 
-def _mamba_worker(mooncake, name, spec, *, tp_size=1, raw=None, num_blocks=4):
-    from vllm.v1.kv_cache_interface import KVCacheTensor, create_kv_cache_views
+def _mamba_worker(
+    mooncake, name, spec, *, tp_size=1, num_blocks=4, wrapped=False, kernel_ratio=1
+):
+    from vllm.v1.kv_cache_interface import (
+        KVCacheTensor,
+        UniformTypeKVCacheSpecs,
+        create_kv_cache_views,
+    )
     from vllm.v1.kv_cache_layout import KVCacheLayout
 
     worker = _worker(mooncake, blocks_first=False, tp_size=tp_size, tp_rank=0)
@@ -1306,10 +1312,17 @@ def _mamba_worker(mooncake, name, spec, *, tp_size=1, raw=None, num_blocks=4):
     cache = create_kv_cache_views(
         raw, spec, num_blocks, KVCacheLayout.LBHNC, placement,
     )[0]
+    # Hybrid/MTP groups wrap per-layer specs; the worker unwraps per layer.
+    group_spec = (
+        UniformTypeKVCacheSpecs(block_size=spec.block_size, kv_cache_specs={name: spec})
+        if wrapped
+        else spec
+    )
     worker._layer_specs[name] = spec
     worker._layer_group_indices[name] = 0
+    worker._physical_blocks_per_logical_kv_block = kernel_ratio
     worker.kv_cache_config = SimpleNamespace(
-        kv_cache_groups=[SimpleNamespace(kv_cache_spec=spec)]
+        kv_cache_groups=[SimpleNamespace(kv_cache_spec=group_spec)]
     )
     worker.register_kv_caches({name: cache})
     return worker, cache
@@ -1332,18 +1345,28 @@ def test_mamba_registration_uses_state_page_as_one_region(mooncake, padded):
     assert len(regions) == 1 and regions[0].num_blocks == 4
 
 
+@pytest.mark.parametrize("kernel_ratio", [1, 2])
+@pytest.mark.parametrize("wrapped", [False, True])
 @pytest.mark.parametrize("padded", [False, True])
-def test_mamba_state_pages_transfer_exact_bytes(mooncake, padded):
-    """Copy GDN state pages through the real planner, skipping null blocks."""
+def test_mamba_state_pages_transfer_exact_bytes(mooncake, padded, wrapped, kernel_ratio):
+    """Copy GDN state pages through the real planner, skipping null blocks.
+
+    Enough capacity is registered that a misclassified group (state ids
+    expanded as attention kernel blocks) stays in bounds and would silently
+    copy the wrong pages instead of being rejected.
+    """
     import ctypes
 
     name = "model.layers.0.linear_attn"
+    num_blocks = 16
     spec = _mamba_spec(mooncake, padded=padded)
-    producer, p_cache = _mamba_worker(mooncake, name, spec)
-    consumer, d_cache = _mamba_worker(mooncake, name, spec)
+    kwargs = dict(num_blocks=num_blocks, wrapped=wrapped, kernel_ratio=kernel_ratio)
+    producer, p_cache = _mamba_worker(mooncake, name, spec, **kwargs)
+    consumer, d_cache = _mamba_worker(mooncake, name, spec, **kwargs)
     payload = spec.state_content_size_bytes
-    p_bytes = p_cache.view(torch.int8).reshape(4, -1)
-    p_bytes[:, :payload] = torch.arange(1, 4 * payload + 1).reshape(4, payload).to(torch.int8)
+    p_bytes = p_cache.view(torch.int8).reshape(num_blocks, -1)
+    for page in range(num_blocks):
+        p_bytes[page, :payload] = page + 1
     # Bytes past the payload are page padding and must not travel.
     p_bytes[:, payload:] = 99
 
@@ -1374,10 +1397,49 @@ def test_mamba_state_pages_transfer_exact_bytes(mooncake, padded):
     assert lengths == [payload]
     for src_ptr, dst_ptr, length in zip(src, dst, lengths):
         ctypes.memmove(dst_ptr, src_ptr, length)
-    d_bytes = d_cache.view(torch.int8).reshape(4, -1)
+    d_bytes = d_cache.view(torch.int8).reshape(num_blocks, -1)
     torch.testing.assert_close(d_bytes[3, :payload], p_bytes[2, :payload])
     assert torch.count_nonzero(d_bytes[3, payload:]) == 0
-    assert all(torch.count_nonzero(d_bytes[i]) == 0 for i in (0, 1, 2))
+    assert all(
+        torch.count_nonzero(d_bytes[i]) == 0 for i in range(num_blocks) if i != 3
+    )
+
+
+@pytest.mark.parametrize("wrapped", [False, True])
+def test_mamba_group_block_ids_stay_in_logical_space(mooncake, wrapped):
+    from vllm.v1.kv_cache_interface import UniformTypeKVCacheSpecs
+
+    attn = "model.layers.1.self_attn"
+    gdn = "model.layers.0.linear_attn"
+    attn_spec = mooncake.FullAttentionSpec(
+        block_size=16, num_kv_heads=2, head_size=8, dtype=torch.float16
+    )
+    mamba_spec = _mamba_spec(mooncake)
+    if wrapped:
+        attn_spec = UniformTypeKVCacheSpecs(block_size=16, kv_cache_specs={attn: attn_spec})
+        mamba_spec = UniformTypeKVCacheSpecs(block_size=16, kv_cache_specs={gdn: mamba_spec})
+    worker = _worker(mooncake, blocks_first=False)
+    worker._physical_blocks_per_logical_kv_block = 2
+    worker.kv_cache_config = SimpleNamespace(
+        kv_cache_groups=[
+            SimpleNamespace(kv_cache_spec=attn_spec),
+            SimpleNamespace(kv_cache_spec=mamba_spec),
+        ]
+    )
+    assert worker._logical_to_kernel_block_ids([[1, 3], [2]]) == [[2, 3, 6, 7], [2]]
+
+
+def test_mamba_group_classification_rejects_mixed_wrapper(mooncake):
+    from vllm.v1.kv_cache_interface import UniformTypeKVCacheSpecs
+
+    attn_spec = mooncake.FullAttentionSpec(
+        block_size=16, num_kv_heads=2, head_size=8, dtype=torch.float16
+    )
+    mixed = UniformTypeKVCacheSpecs(
+        block_size=16, kv_cache_specs={"a": attn_spec, "m": _mamba_spec(mooncake)}
+    )
+    with pytest.raises(ValueError, match="mixes Mamba"):
+        mooncake._is_mamba_group_spec(mixed)
 
 
 def test_mamba_guard_premise_tp_ratio_detects_heterogeneous_tp(mooncake):

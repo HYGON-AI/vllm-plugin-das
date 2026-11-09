@@ -68,6 +68,7 @@ from vllm.v1.kv_cache_interface import (
     MLAAttentionSpec,
     SlidingWindowMLASpec,
     SlidingWindowSpec,
+    UniformTypeKVCacheSpecs,
 )
 from vllm.v1.request import RequestStatus
 from vllm.v1.worker.block_table import BlockTable
@@ -78,6 +79,20 @@ logger = init_logger(__name__)
 _CMPL_UUID_RE = re.compile(
     r"cmpl-([0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12})"
 )
+
+
+def _is_mamba_group_spec(spec: KVCacheSpec) -> bool:
+    # Hybrid/MTP groups may wrap per-layer specs in UniformTypeKVCacheSpecs,
+    # so classify a group by its layers, matching worker registration.
+    if not isinstance(spec, UniformTypeKVCacheSpecs):
+        return isinstance(spec, MambaSpec)
+    kinds = {isinstance(s, MambaSpec) for s in spec.kv_cache_specs.values()}
+    if len(kinds) != 1:
+        raise ValueError(
+            "Mooncake KV cache group mixes Mamba/GDN and non-Mamba layers: "
+            f"{sorted(spec.kv_cache_specs)}."
+        )
+    return kinds.pop()
 
 
 def ttft_trace_enabled() -> bool:
@@ -1951,7 +1966,7 @@ class MooncakeConnectorWorker:
                 self._physical_blocks_per_logical_kv_block,
                 block_arange,
             ).tolist()
-            if not isinstance(group_specs[i].kv_cache_spec, MambaSpec)
+            if not _is_mamba_group_spec(group_specs[i].kv_cache_spec)
             else group
             for i, group in enumerate(block_ids)
         ]
@@ -2000,9 +2015,8 @@ class MooncakeConnectorWorker:
             for group_index, (local_group, remote_group) in enumerate(
                 zip(send_meta.local_block_ids, remote_block_ids_per_group)
             ):
-                is_mamba_group = isinstance(
-                    group_specs[group_index].kv_cache_spec,
-                    MambaSpec,
+                is_mamba_group = _is_mamba_group_spec(
+                    group_specs[group_index].kv_cache_spec
                 )
                 if is_mamba_group:
                     # Mamba/GDN prefix caching can use null blocks only as
@@ -2333,14 +2347,15 @@ class MooncakeConnectorWorker:
                 # v0.28 gives a Mamba/GDN layer the same [B, H, N, C] byte view
                 # as attention: conv and SSM state are packed inside one page,
                 # and mamba blocks are never split into kernel blocks. One
-                # page is therefore one region whose payload is the whole page
+                # page is therefore one region whose payload is the packed state
                 # content (stride(0) may exceed it when page_size_padded is set).
-                kv_block_len = cache[0].numel() * cache.element_size()
-                if kv_block_len < layer_spec.state_content_size_bytes:
+                kv_block_len = layer_spec.state_content_size_bytes
+                page_view_len = cache[0].numel() * cache.element_size()
+                if page_view_len < kv_block_len:
                     raise ValueError(
                         "Mooncake Mamba/GDN page is smaller than its state "
-                        f"content: layer={layer_name}, payload={kv_block_len}, "
-                        f"state={layer_spec.state_content_size_bytes}."
+                        f"content: layer={layer_name}, page={page_view_len}, "
+                        f"state={kv_block_len}."
                     )
             else:
                 raise NotImplementedError(
