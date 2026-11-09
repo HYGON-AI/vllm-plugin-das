@@ -103,9 +103,11 @@ dynamic per-token INT8 activations, BF16/FP16 inputs, gated SiLU and ordinary TP
 The isolated EP2 candidate additionally admits static TP-only expert parallelism
 with BF16 inputs, global256/local128 experts, hidden2048/intermediate512/top8.
 The public factory/CT loader/runner component has passed a controlled two-rank
-fixture, including shared output, reload and changed-input Graph replay. Full
-checkpoint/model qualification remains pending; see the
-[scoped component record](../docs/validation/vllm033-int8-ep2-component.md).
+fixture, including shared output, reload and changed-input Graph replay. The real
+Qwen3.5 INT8 checkpoint also completes original HumanEval32 with both AITER and
+official Triton scoring raw30/normalized32 under default Graph. See the
+[component record](../docs/validation/vllm033-int8-ep2-component.md) and
+[full-checkpoint evidence and limits](../docs/validation/vllm033-int8-ep2-he32.md).
 DP/PCP/sequence parallelism, EPLB, elastic topology, unsupported EP geometries,
 bias, LoRA, padded layouts, router-weight-on-input and non-neutral activation
 parameters refuse explicitly. `passthrough` refuses because this expert delegates
@@ -143,8 +145,11 @@ ASM config selections and native code-object loads corroborate execution;
 these are not an all-kernel trace. Both arms release the GPU but retain a worker
 grace-period SIGTERM warning, so clean lifecycle remains unaccepted.
 
-Warmed performance, TP>1, public checkpoint reload and remote device CI remain
-pending. Core public registry: [MR83](https://developer.sourcefind.cn/codes/OpenDAS/vllm/-/merge_requests/83).
+The EP2 model pair retains internal worker-grace SIGTERM and EngineCore forced
+termination logs despite API exit0 and released resources. Clean lifecycle,
+warmed EP2 performance, full-model checkpoint reload and remote device CI remain
+pending. Earlier TP1 warmed-serving evidence belongs to its older frozen Core
+combination. Core public registry: [MR83](https://developer.sourcefind.cn/codes/OpenDAS/vllm/-/merge_requests/83).
 Historical private integration results do not certify this public path. The
 general RMS installation verifier checks official INT8 symbol ownership but
 does not validate this capability.

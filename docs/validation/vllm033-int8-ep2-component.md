@@ -34,6 +34,8 @@ lifetime defect is established, but no saved failing pair proves which side
 changed or identifies a unique retrospective cause. R8 corrects that fixture
 contract without changing the production algorithms or numerical thresholds.
 
-This is synthetic component loading and manual Graph capture. Full checkpoint
-shards, model HumanEval32, default engine Graph, serving lifecycle, performance,
-broader profiles/topologies and remote device CI require separate acceptance.
+This is synthetic component loading and manual Graph capture. The later
+[real-checkpoint HumanEval32 pair](vllm033-int8-ep2-he32.md) separately covers
+checkpoint loading and default engine Graph on the stated model. Full-model
+reload, clean serving lifecycle, performance, broader profiles/topologies and
+remote device CI remain separate gates.
