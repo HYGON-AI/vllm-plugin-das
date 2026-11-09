@@ -11,6 +11,16 @@ is a different binary whose tail loop is not the faulting one (verified
 on the sglang rank0 trace: 20 FlashAttnVarlenFunc calls, all fp8_e4m3,
 zero bf16 flash_fwd).
 
+Scope: the rewrite fires only for the Kimi-K3 model family
+(``_A1_ARCHITECTURES``: the deployed main-serve architecture
+``KimiK3ForConditionalGeneration`` -- the serving checkpoint's
+config.json declares it -- plus the K3 linear/MTP variant
+``KimiLinearForCausalLM``; resolved from the engine config's
+``model_config.architectures``.  Geometry qk=192/v=128 is the ABI
+filter, never the model identity: DeepSeek-family MLA shares the same
+shape but carries no K3 validation for unit descales / e4m3 noise).
+Unresolved configs stay stock.
+
 Capture-safety contract (cudagraph-capture-safety checklist):
 - FULL graphs never contain this path (uniform-decode batches dispatch to
   the FlashMLA MQA backend, not the MLA prefill backend); PIECEWISE runs
@@ -75,6 +85,44 @@ _A1_CAPABLE = True
 _FP8 = torch.float8_e4m3fn
 _SUPPORTED_QDTYPES = (torch.bfloat16, torch.float16)
 
+# Model-scope allowlist (review P1): this rewrite carries K3-only
+# validation -- unit descales on a scale-free latent store (R94 SS2) and
+# e4m3 quantization noise accepted only against the K3 accuracy record.
+# Geometry alone is NOT a model identity: DeepSeek-family MLA shares the
+# qk=192/v=128 shape, so scope by the served model's architectures
+# instead. Resolved once at the first configured call; unresolved
+# contexts (engine not configured yet) stay stock for that call and
+# retry -- fail-closed, never guessed.
+_A1_ARCHITECTURES = (
+    "KimiK3ForConditionalGeneration",   # deployed K3 config.json (main serve)
+    "KimiLinearForCausalLM",            # K3 linear/MTP variant registry name
+)
+_A1_SCOPE: dict = {"resolved": False, "ok": False}
+
+
+def _model_in_scope() -> bool:
+    """True only when the current engine config is the K3 model family."""
+    if not _A1_SCOPE["resolved"]:
+        try:
+            from vllm.config import get_current_vllm_config
+
+            config = get_current_vllm_config()
+            architectures = tuple(
+                getattr(getattr(config, "model_config", None),
+                        "architectures", ())
+                or ()
+            )
+            _A1_SCOPE["ok"] = any(
+                str(name) in _A1_ARCHITECTURES for name in architectures
+            )
+            # Latch only on a successful resolution: architectures never
+            # change within a process, but early eager calls may run
+            # before the config context exists.
+            _A1_SCOPE["resolved"] = True
+        except Exception:
+            return False
+    return _A1_SCOPE["ok"]
+
 
 def _descale_bucket(q: torch.Tensor, k: torch.Tensor,
                     kwargs: dict) -> torch.Tensor | None:
@@ -118,13 +166,18 @@ def _a1_rewrites_call(backend, q: torch.Tensor, k: torch.Tensor,
                       v: torch.Tensor) -> bool:
     """Decide whether the fp8 rewrite applies to this call.
 
-    Scope gate uses the backend's own audited head dims (trunk
-    ``MLAPrefillBackend.__init__`` stores qk_nope/qk_rope/v_head_dim), so
-    the rewrite only fires for MLA-prefill shapes -- K3: qk=192, v=128 --
-    and never leaks onto other models' backends that happen to share the
-    class.
+    Model scope first (``_model_in_scope``): the rewrite is validated for
+    the K3 model family only, so any other architecture -- including MLA
+    models that happen to share the qk=192/v=128 geometry -- stays stock.
+
+    Geometry gate uses the backend's own audited head dims (trunk
+    ``MLAPrefillBackend.__init__`` stores qk_nope/qk_rope/v_head_dim) as
+    the ABI-form filter: K3: qk=192, v=128.  Geometry narrows the wheel
+    ABI surface; it never widens the model scope.
     """
     if _A1_DISABLE or not _A1_CAPABLE:
+        return False
+    if not _model_in_scope():
         return False
     if q.dtype not in _SUPPORTED_QDTYPES or k.dtype not in _SUPPORTED_QDTYPES:
         return False
@@ -138,7 +191,8 @@ def _a1_rewrites_call(backend, q: torch.Tensor, k: torch.Tensor,
     # path accepts headdim_v == 128 exclusively ("fa fp8 only support
     # dim=128"), and the causal-tail fix targets qk=192/v=128.  Any other
     # geometry stays stock rather than risking an unrecognized ABI fault
-    # (review R94-C S2).
+    # (review R94-C S2).  Model identity is decided by _model_in_scope,
+    # not here (review P1: geometry is not a model identity).
     if qk_total != 192 or int(v_dim) != 128:
         return False
     if k.shape[-1] != qk_total or q.shape[-1] != qk_total:
