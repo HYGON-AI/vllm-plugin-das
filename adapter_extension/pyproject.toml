@@ -11,7 +11,7 @@ license = "Apache-2.0"
 license-files = ["LICENSE", "NOTICE"]
 requires-python = ">=3.11,<3.15"
 dependencies = [
-  "hcu-adapter>=0.1.0",
+  "hcu-adapter>=0.5.22",
   "packaging>=23",
 ]
 
@@ -19,6 +19,7 @@ dependencies = [
 das_hcu = "hcu_vllm_das.extension:extension_spec"
 das_hcu_flash = "hcu_vllm_das.flash_activation:extension_spec"
 das_hcu_slimquant = "hcu_vllm_das.slimquant_activation:extension_spec"
+das_hcu_aiter_int8 = "hcu_vllm_das.int8_activation:extension_spec"
 
 [tool.setuptools.packages.find]
 where = ["src"]

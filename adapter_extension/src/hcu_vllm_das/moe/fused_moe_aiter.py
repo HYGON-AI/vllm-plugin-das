@@ -219,6 +219,7 @@ def apply_aiter_int8_moe(
     activation: object,
     expert_map: object,
     output_dtype: object,
+    asm_only: bool = False,
 ) -> object:
     """Execute a native-layout AITER W8A8 config or official Triton fallback."""
 
@@ -254,6 +255,7 @@ def apply_aiter_int8_moe(
         api.quant_type_w8a8,
         activation=activation_name,
         use_shuffle=0,
+        **({"spec_sol_type": "asm"} if asm_only else {}),
     )
     solution = getattr(selected, "solution_type", None)
     unsupported_layout = bool(
@@ -266,12 +268,15 @@ def apply_aiter_int8_moe(
         "triton",
         "moe_c",
     )
-    if not found or unsupported_layout or unsupported_expert_map:
+    unsupported_provider = asm_only and solution != "asm"
+    if not found or unsupported_layout or unsupported_expert_map or unsupported_provider:
         reason = (
             "config-miss"
             if not found
             else "unsupported-layout"
             if unsupported_layout
+            else "unsupported-provider"
+            if unsupported_provider
             else "unsupported-expert-map"
         )
         _record_once(logging.WARNING, f"fallback:{reason}", problem, solution, selected)

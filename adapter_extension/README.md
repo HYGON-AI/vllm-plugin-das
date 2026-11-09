@@ -12,9 +12,9 @@ optimizations through the adapter extension API.
 Version `0.3.0.dev0` targets the `v0.33.0` branch. Migration status and current
 evidence are recorded in [v0.33 validation](../docs/validation/vllm033-upgrade.md);
 the v0.32 documents below are historical evidence and do not certify v0.33.
-The operator extension currently advertises only the default-OFF LightOp
-ordinary and fused-add `RMSNorm` candidate. INT8 model selection, weight
-conversion, quantization and kernel construction remain official vLLM owners.
+Separate extensions provide default-OFF RMSNorm, HCU FlashAttention, SlimQuant
+and the explicit INT8 ASM candidate below. Core retains CT scheme selection,
+weight loading, generic quantization and kernel construction.
 
 It also provides an explicit HCU FlashAttention backend selected by
 `--attention-backend FLASH_ATTN`. The backend keeps vLLM's official metadata,
@@ -37,8 +37,8 @@ operator-level capabilities.
   development, patch, and local version suffixes are accepted when the
   required operator APIs and LightOp capabilities are present. FLASH_ATTN uses
   the official public backend registry and AttentionImpl contract.
-- Adapter host distribution: `hcu-adapter>=0.1.0`, extension API v1 from
-  `hcu_adapter.extensions`.
+- Adapter host distribution: `hcu-adapter>=0.5.22`, extension API v1 with
+  process health checks from `hcu_adapter.extensions`.
 - Runtime: a prepared HCU PyTorch/DTK/LightOp/AITER stack. LightOp and AITER
   are intentionally not fetched by pip because production deployments must
   use ABI-matched local builds.
@@ -89,26 +89,50 @@ Schema4 additionally verifies that the seven official INT8 oracle symbols
 remain identical across activation, the module is owned by the Core wheel,
 and explicit Triton selection resolves to an official expert.
 
-## INT8 ownership and unavailable AITER model integration
+## Explicit INT8 ASM candidate
 
-Use official `--moe-backend auto` or `--moe-backend triton` for INT8 models.
-The retired Plugin installer extended/rebound the official oracle enum and
-functions; that private integration conflicts with the upstream-first skill
-and has been removed. No `aiter-int8-moe` capability is advertised. Calling
-its old `install()` entry point explicitly rejects before importing or
-modifying Core. An Adapter request requiring that capability must fail.
+Request `HCU_ADAPTER_VLLM_REQUIRED_CAPABILITIES=hcu-aiter-int8-moe` and
+`--moe-backend aiter`. This requires the associated Core public
+`register_int8_moe_backend` API; stock v0.33 without that API refuses activation.
+The retired `int8_oracle.install()` remains unavailable and no oracle functions,
+already-imported aliases, CT classes or builtin enum members are replaced.
+Builtin auto/triton behavior stays unchanged.
 
-The official v0.33 INT8 oracle provides Triton/Humming/CPU and has no public
-expert registry for adding AITER. The general public quantization-config
-registry is not equivalent: a future distinct quantization method would need
-its own loader/lifecycle/full-dataflow evidence. It must not overwrite the
-official `compressed-tensors` entry or rebind oracle globals.
+The initial scope is gfx936, raw symmetric per-channel INT8 expert weights,
+dynamic per-token INT8 activations, BF16/FP16 inputs, gated SiLU and ordinary TP.
+Bias, LoRA, expert/data/context/sequence parallelism, EPLB, padded layouts,
+router-weight-on-input and non-neutral activation parameters refuse explicitly.
+Core retains CT scheme selection, parameter metadata, weight loading, generic
+quant config, prepare/finalize and reductions. Preprocessed weights retain the
+official method's default refusal.
 
-The standalone INT8 provider, ASM composition and unregistered expert factory
-are retained for operator experiments. Their prior native/Graph and full-model
-results are frozen historical evidence; they do not make AITER selectable in
-the corrected candidate. Preserving official ownership does not certify that
-unavailable capability. See [ownership correction](../docs/validation/vllm033-official-ownership.md).
+Plugin composes native ASM GEMMs with Core quantization/activation semantics.
+A shape/config miss uses the official whole-call Triton fallback, including its
+own quantization and scratch allocation. Native launch failures propagate.
+The extension publishes a content fingerprint for normal/AOT compile factors,
+binding its source, loaded native modules, ASM objects and channel config before
+model construction; later file drift refuses cache reuse. Activation must precede
+any vendor ASM configuration consumer in the process; an already imported vendor
+ASM module (including one inherited by fork) refuses and requires a fresh spawned
+process. This avoids binding stale vendor plan caches to new config bytes.
+Activation occurs exclusively at Adapter startup before model consumers. No exact wheel string
+is required for compatible builds.
+
+Public-path validation on gfx936 covers ten installed CT factory/expert/full
+forward cases and thirty changed-input Graph replays against official Triton.
+Single-card Qwen3.5-35B-A3B-Channel-INT8-w8a8, TP1/MTP0, BF16 activations and
+TRITON_ATTN passes original HumanEval tasks0–31: AITER raw32/32, Triton raw31/32;
+both normalize to32/32 (Triton task24 contains a code fence). The actual forty
+CT INT8 experts and default FULL_AND_PIECEWISE Graph dispatch were verified.
+ASM config selections and native code-object loads corroborate execution;
+these are not an all-kernel trace. Both arms release the GPU but retain a worker
+grace-period SIGTERM warning, so clean lifecycle remains unaccepted.
+
+Warmed performance, TP>1, public checkpoint reload and remote device CI remain
+pending. Core public registry: [MR83](https://developer.sourcefind.cn/codes/OpenDAS/vllm/-/merge_requests/83).
+Historical private integration results do not certify this public path. The
+general RMS installation verifier checks official INT8 symbol ownership but
+does not validate this capability.
 
 ## Experimental SlimQuant checkpoint format
 
