@@ -2,7 +2,42 @@
 
 These are the actual image2/eager/no-MTP commands used on 2026-11-08. P is127, D is126, each16cards; model `/data_hy4_w4a8/Hy4-testing-Channel-INT4-w4a8`. Both roles use FP8E4M3 KV, prefix caching OFF and MM processor cache0. P leaves max-num-seqs unspecified; D uses8/32. Max model length4096, image limit2, maxpixels1048576.
 
-Runtime source: v0.25.1 `21065784` + MR338 `c758f415` + adaptation `65c2b496`. Reviewed local head `5ee59b2` additionally fixes disabled-image PCP1 dummy preparation; that compatibility fix has23 native CPU contract tests, but was not hot-patched into the measured image2 services. The image-enabled method order is unchanged. The source evidence and raw runs are retained in the original experiment archive. This branch depends on [MR338](https://github.com/HYGON-AI/vllm-plugin-das/pull/338), which was still open when these instructions were prepared.
+Historical runtime source: v0.25.1 `21065784` + MR338 `c758f415` + adaptation `65c2b496`. Reviewed local head `5ee59b2` additionally fixes disabled-image PCP1 dummy preparation; that compatibility fix has23 native CPU contract tests, but was not hot-patched into those measured image2 services. The source evidence and raw runs are retained in the original experiment archive. [MR338](https://github.com/HYGON-AI/vllm-plugin-das/pull/338) is now merged into `v0.25.1` as `7e316fa`; MR366 incorporates that target commit and contains only the additional PD/EPLB adaptation and its validation tools.
+
+### Current-head hardware validation (2026-11-09)
+
+The complete plugin at `dd0fdf4` and its corrected managed proxy were tested
+on P16+D16 with the same W4A8 checkpoint, real routing, static R16 nearest,
+eager execution and no MTP. Each FlashMLA version served the same 512 request
+bodies on the same frozen arrival schedule. Both groups completed 512/512,
+with no HTTP errors, empty answers, missing usage or output truncation.
+
+| Metric | FlashMLA `gf192f5` | FlashMLA `gd38941` |
+| --- | ---: | ---: |
+| Client mean TTFT (ms) | 4028.65 | 4135.81 |
+| Client p95 TTFT (ms) | 5582.99 | 5845.60 |
+| Completed RPS | 2.40998 | 2.40780 |
+| P prefill mean (ms) | 1325.40 | 1377.90 |
+| Heldout weighted layer max/mean | 1.056672 | 1.056672 |
+| Official score on the timed 512 requests | 376/512 | 380/512 |
+
+This is a wheel comparison with R16 in both groups, not another R0/R16
+comparison. The new wheel's mean TTFT was 2.66% higher in this single paired
+run; no stable gain or regression is established. There were 34 raw answer
+changes (12 incorrect-to-correct, eight correct-to-incorrect). These scores
+do not establish full-dataset accuracy or kernel numerical equivalence.
+Nominal arrival rate was 2.55 RPS; the finite schedule actually delivered
+about 2.44002 RPS. Completion throughput does not measure saturation capacity.
+
+Prefix caching was disabled and MM processor cache was zero. Seven synthetic
+functional checks and 32 heldout routing requests preceded timing, with the
+heldout samples and raw-image aliases excluded from the timed cohort; timed
+requests received no KV priming. The native encoder LRU remained enabled.
+All 16 ranks stopped capture before timing. Loaded native extension paths
+and hashes were verified in both groups. Both nodes were released afterward.
+This validates the pre-merge `dd0fdf4` runtime; synchronizing `7e316fa` preserves
+that runtime source tree. Graphs, video, speculative execution, other layouts
+and pure-text HYV4 hardware A/B remain outside this hardware validation.
 
 The original launch operator also clears inherited CUDA_VISIBLE_DEVICES/ROCR_VISIBLE_DEVICES and proxy/observer variables, creates a fresh TMPDIR and records PID/SID/start ticks. Use a new run/output directory for another run; existing capture and client output files deliberately refuse overwrite. All calibration/diagnostic callbacks were stopped before timing. The worker extension/middleware below belongs to the external validation harness; it is idle unless its explicit loopback control endpoints are called.
 
@@ -23,7 +58,9 @@ dependencies. In the original deployment the importable `vllm_hcu` tree and
 replace that PYTHONPATH component and the evaluator path with your installed
 branch paths. The measured services used `65c2b496`; this published branch also
 contains the CPU-tested image-limit-zero guard at `5ee59b2` and these docs.
-It has not been rerun on HCU after the compatibility-only guard.
+Those historical commands and results remain tied to their original source.
+The later `dd0fdf4` hardware validation is documented above; it used a fresh
+staged package and the corrected managed proxy.
 
 From the plugin checkout, stage the unchanged helpers on the corresponding
 nodes (run only the relevant copy for each node):
@@ -174,7 +211,7 @@ exec /usr/bin/python /workspace/hy4_mm_20261108/pd-r16-inspect-v1/measured_proxy
 
 The proxy sends P and D concurrently. D can wait for remote P/KV before first scheduling. P/D engine TTFTs and D queue time therefore overlap; do not sum the two TTFTs or call all D queue time compute contention. The proxy first-byte observation may include a role/empty chunk; client TTFT uses first nonempty content.
 
-### Corrected proxy for new runs (not rebenchmarked)
+### Corrected proxy for new runs
 
 ```bash
 export NO_PROXY='*' no_proxy='*' VLLM_PLUGINS=__disabled__
@@ -195,8 +232,8 @@ readiness requires a nonempty contiguous DP engine map. Shutdown joins the
 initializer before closing its clients. Model inference requests are not retried.
 It does not append to the historical phase logs. Restart it when P changes
 engine_id. Use fresh client output paths.
-No new HCU, accuracy or throughput measurement is claimed for this entry point;
-all result tables below remain tied to the historical measured proxy.
+The `dd0fdf4` hardware validation above uses this entry point. The historical
+R0/R16 result table below remains tied to the original measured proxy.
 
 ## Full accuracy evaluation client (126 container)
 
