@@ -1,8 +1,9 @@
 # GPTQ group-wise W4A16 AITER MoE
 
-`--moe-backend aiter` previously mapped GPTQ experts to the WNA16 Triton
-oracle but only redirected channel-wise compressed-tensors INT4 execution
-through AITER. Group-wise GPTQ still executed vLLM's WNA16 expert kernels.
+`--moe-backend aiter` now routes symmetric group-wise GPTQ W4A16 experts
+through the shared AITER selector and executor. TP=2 QGPT shapes select the
+AITER MOE_C kernel, which is backed by the HIPC C interface in the installed
+AITER wheel.
 
 The grouped route now calls the shared AITER selector and executor using the
 loaded canonical uint8 weights and their actual group size. It preserves those
@@ -13,23 +14,20 @@ back; ABI/kernel errors propagate.
 
 ## Observed backend
 
-On gfx936 with AITER 0.1.8, BF16, E=256, K=2048, intermediate=512,
-top-k=8, group=128, the selector chooses **Triton** for M=1,4,32,64,256,2048,8192.
-Explicit MOE_C and ASM probes report no solution for these shapes. This AITER
-build dispatches `aiter.moe.aiter_moe` to
-`boltops.fused_moe.triton.fused_moe.fused_experts_impl`. It uses untuned default
-configs because the matching tuning files are absent; this is functional
-integration, with no throughput improvement claim.
-
-The runtime logs `HCU grouped W4A16 MoE executes AITER solution=triton` after
-an actual call. The oracle can still report `TRITON` because the integration
-retains vLLM's modular WNA16 prepare/finalize and replaces expert execution.
+On gfx936 with AITER 0.1.8, BF16, E=256, K=2048, TP=2 local
+`N1=512,N2=2048,K=2048,top-k=8,group=128` selects **MOE_C** for M=1,4,32.
+The returned config uses `MODE=11001301` or `11001303`, `BLOCK_SIZE_M=16`,
+`need_shuffle=False`, and `need_shuffle_scale=True`. TP=1 keeps the Triton
+selection for the corresponding shape. The grouped runtime passes GPTQ's
+packed symmetric qzeros to MOE_C; Triton receives the canonical scale path.
 
 ## Checks
 
 - GPU independent unpack/dequantize + PyTorch MoE reference: M=1,4,32,256;
   4 passed, maximum absolute error 0.00023540.
 - Grouped routing/unsupported semantics: 11 passed.
+- TP=2 group-128 MOE_C/HIPC execution: M=1,4 passed; output shape and BF16
+  finiteness checks passed.
 - Existing MoE/quantization runtime patch suites: 425 passed, 2 failed.
   Both failures are in SlimQuant W4A8 BoltOps public-signature checks; the
   installed BoltOps API differs from that separately audited contract.

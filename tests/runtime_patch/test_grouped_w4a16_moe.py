@@ -10,7 +10,11 @@ from vllm_hcu.model_executor.layers.quantization import grouped_w4a16_moe_runtim
 
 
 def _case():
-    quant = SimpleNamespace(use_int4_w4a16=True, w1_zp=None, w2_zp=None)
+    quant = SimpleNamespace(
+        use_int4_w4a16=True,
+        w1_zp=torch.full((2, 128, 2), 0x88, dtype=torch.uint8),
+        w2_zp=torch.full((2, 128, 1), 0x88, dtype=torch.uint8),
+    )
     experts = SimpleNamespace(
         quant_config=quant, block_shape=[0, 128],
         moe_config=SimpleNamespace(moe_backend="aiter"),
@@ -49,7 +53,8 @@ def test_grouped_dispatch_preserves_group_and_packed_weights(monkeypatch, soluti
     assert selected[0].use_shuffle is False
     if solution is not None:
         assert executed[0]["w1"] is call["w1"]
-        assert executed[0]["w1_zp"] is None
+        assert executed[0]["w1_zp"] is (call["experts"].quant_config.w1_zp
+                                           if solution == "moe_c" else None)
         assert executed[0]["block_shape"] == [0, 128]
         assert torch.all(call["output"] == 7)
     else:
@@ -78,3 +83,27 @@ def test_unsupported_semantics_keep_original_wna16(monkeypatch, unsupported):
         pytest.fail("Unsupported semantics must not reach AITER selector")
     monkeypatch.setattr(runtime, "select_aiter_moe_config", unexpected)
     assert runtime.apply_grouped_w4a16_moe(**call) is False
+
+
+def test_moe_c_synthesizes_symmetric_gptq_zero_points(monkeypatch):
+    call = _case()
+    call["experts"].quant_config.w1_zp = None
+    call["experts"].quant_config.w2_zp = None
+    monkeypatch.setitem(sys.modules, "aiter.moe", SimpleNamespace(
+        MoeQuantType=SimpleNamespace(W4A16="w4a16")))
+    monkeypatch.setattr(
+        runtime, "select_aiter_moe_config",
+        lambda problem, cache_owner: SimpleNamespace(
+            solution_type="moe_c", need_shuffle=False,
+        ),
+    )
+    captured = {}
+    monkeypatch.setattr(
+        runtime, "execute_aiter_moe",
+        lambda config, **kwargs: captured.update(kwargs) or kwargs["hidden_states"],
+    )
+    assert runtime.apply_grouped_w4a16_moe(**call) is True
+    assert captured["w1_zp"].shape == (2, 128, 2)
+    assert captured["w2_zp"].shape == (2, 128, 1)
+    assert torch.all(captured["w1_zp"] == 0x88)
+    assert torch.all(captured["w2_zp"] == 0x88)

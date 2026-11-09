@@ -5,6 +5,7 @@
 from __future__ import annotations
 
 import functools
+import inspect
 from types import ModuleType
 
 from ._common import (
@@ -23,6 +24,7 @@ TARGETS = (
 )
 _MARKER = "_vllm_hcu_wna16_aiter_oracle_applied"
 _WRAPPER_MARKER = "_vllm_hcu_wna16_aiter_mapper"
+_GROUPED_WRAPPER_MARKER = "_vllm_hcu_grouped_w4a16_applied"
 
 
 def apply_to_module(module: ModuleType) -> bool:
@@ -54,8 +56,75 @@ def apply_to_module(module: ModuleType) -> bool:
     setattr(hcu_map_wna16_backend, _WRAPPER_MARKER, True)
     target._vllm_hcu_original_map_wna16_backend = original
     target.map_wna16_backend = hcu_map_wna16_backend
+    _patch_grouped_w4a16_experts(target)
     setattr(target, _MARKER, True)
     return True
+
+
+def _patch_grouped_w4a16_experts(target: ModuleType) -> None:
+    """Route AutoGPTQ's WNA16 expert object through AITER when requested.
+
+    QGPT checkpoints select ``oracle.int_wna16`` directly, so patching only
+    ``experts.triton_moe`` is insufficient when that module was imported
+    before the worker import coordinator armed its callback.
+    """
+    experts_cls = getattr(target, "TritonWNA16Experts", None)
+    # The small oracle adapter test double only exposes the backend enum and
+    # mapper; real vLLM int_wna16 always exports the experts class.
+    if experts_cls is None:
+        return
+    if not isinstance(experts_cls, type):
+        raise PatchCompatibilityError(
+            f"required HCU patch target {TARGET_MODULE}.TritonWNA16Experts is missing"
+        )
+    if getattr(experts_cls, _GROUPED_WRAPPER_MARKER, False):
+        return
+    original = require_callable(experts_cls, "apply", f"{TARGET_MODULE}.TritonWNA16Experts.apply")
+    signature = inspect.signature(original)
+    expected = (
+        "self", "output", "hidden_states", "w1", "w2", "topk_weights",
+        "topk_ids", "activation", "global_num_experts", "expert_map",
+        "a1q_scale", "a2_scale", "workspace13", "workspace2",
+        "expert_tokens_meta", "apply_router_weight_on_input",
+    )
+    if tuple(signature.parameters) != expected:
+        raise PatchCompatibilityError(
+            "unexpected TritonWNA16Experts.apply signature: "
+            f"{tuple(signature.parameters)}"
+        )
+
+    @functools.wraps(original)
+    def hcu_grouped_apply(
+        self, output, hidden_states, w1, w2, topk_weights, topk_ids,
+        activation, global_num_experts, expert_map, a1q_scale, a2_scale,
+        workspace13, workspace2, expert_tokens_meta, apply_router_weight_on_input,
+    ):
+        quant_config = getattr(self, "quant_config", None)
+        moe_config = getattr(self, "moe_config", None)
+        if (
+            getattr(quant_config, "use_int4_w4a16", False)
+            and not getattr(quant_config, "_hcu_channel_w4a16", False)
+            and getattr(moe_config, "moe_backend", None) == "aiter"
+        ):
+            from vllm_hcu.model_executor.layers.quantization.grouped_w4a16_moe_runtime import (
+                apply_grouped_w4a16_moe,
+            )
+
+            if apply_grouped_w4a16_moe(
+                self, output, hidden_states, w1, w2, topk_weights, topk_ids,
+                activation, global_num_experts, expert_map, a1q_scale, a2_scale,
+                expert_tokens_meta, apply_router_weight_on_input,
+            ):
+                return None
+        return original(
+            self, output, hidden_states, w1, w2, topk_weights, topk_ids,
+            activation, global_num_experts, expert_map, a1q_scale, a2_scale,
+            workspace13, workspace2, expert_tokens_meta, apply_router_weight_on_input,
+        )
+
+    experts_cls._vllm_hcu_original_grouped_apply = original
+    experts_cls.apply = hcu_grouped_apply
+    setattr(experts_cls, _GROUPED_WRAPPER_MARKER, True)
 
 
 def apply(module: ModuleType | None = None) -> bool:
