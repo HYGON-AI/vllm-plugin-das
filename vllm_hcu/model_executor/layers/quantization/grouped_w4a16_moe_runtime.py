@@ -160,6 +160,13 @@ def apply_grouped_w4a16_moe(
     if config is None:
         return False
     is_moe_c = str(getattr(config, "solution_type", "")).lower() == "moe_c"
+    if is_moe_c and getattr(config, "need_shuffle_scale", False):
+        # Older AITER releases have no group-size field on the selected
+        # config and shuffle W4A16 scales as fixed group-32 blocks. They can
+        # select group-128 MOE_C but cannot prepare its scale layout safely.
+        selected_group = getattr(config, "block_size", None)
+        if (selected_group or 32) != block[1]:
+            return False
     w1_zp = w2_zp = None
     if is_moe_c:
         w1_zp = _symmetric_qzeros(

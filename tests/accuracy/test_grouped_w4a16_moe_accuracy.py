@@ -28,6 +28,7 @@ def test_grouped_w4a16_matches_dequantized_reference(num_tokens, intermediate_si
 
     torch.manual_seed(42)
     e, h, n, top_k = 256, 2048, intermediate_size, 8
+    legacy_group128_moec = False
     if n == 256:
         from aiter.moe import MoeQuantType, get_aiter_moe_config
 
@@ -37,6 +38,7 @@ def test_grouped_w4a16_matches_dequantized_reference(num_tokens, intermediate_si
             quant_type=MoeQuantType.W4A16, activation="silu", use_shuffle=0,
         )
         assert supported and config.solution_type == "moe_c"
+        legacy_group128_moec = getattr(config, "block_size", None) is None
     w1 = torch.randint(0, 256, (e, 2*n, h//2), dtype=torch.uint8, device="cuda")
     w2 = torch.randint(0, 256, (e, h, n//2), dtype=torch.uint8, device="cuda")
     s1 = torch.full((e, 2*n, h//128), 0.01, dtype=torch.bfloat16, device="cuda")
@@ -52,10 +54,14 @@ def test_grouped_w4a16_matches_dequantized_reference(num_tokens, intermediate_si
     ids = ids.int()
     out = torch.empty_like(x)
     with torch.inference_mode():
-        assert apply_grouped_w4a16_moe(
+        routed = apply_grouped_w4a16_moe(
             experts, out, x, w1, w2, weights, ids, "silu", e,
             None, None, None, None, False,
-        ), "No AITER solution available for QGPT group-128 shape"
+        )
+        if legacy_group128_moec:
+            assert not routed, "Legacy AITER group-32 shuffle must not run group-128"
+            return
+        assert routed, "No AITER solution available for QGPT group-128 shape"
         reference = torch.zeros_like(x, dtype=torch.float32)
         for expert in range(e):
             rows, slots = torch.where(ids == expert)

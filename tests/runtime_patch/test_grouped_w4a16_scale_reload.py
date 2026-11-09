@@ -34,7 +34,7 @@ def _captured_grouped_model(monkeypatch, device="cpu"):
     monkeypatch.setitem(sys.modules, "aiter.moe", aiter)
     config = SimpleNamespace(
         solution_type="moe_c", quant_type="w4a16", need_shuffle=False,
-        need_shuffle_scale=True, config={},
+        need_shuffle_scale=True, block_size=128, config={},
     )
     monkeypatch.setattr(
         grouped_w4a16_moe_runtime, "select_aiter_moe_config",

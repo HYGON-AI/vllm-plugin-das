@@ -24,6 +24,14 @@ The returned config uses `MODE=11001301` or `11001303`, `BLOCK_SIZE_M=16`,
 selection for the corresponding shape. The grouped runtime passes GPTQ's
 packed symmetric qzeros to MOE_C; Triton receives the canonical scale path.
 
+The immutable gfx936 CI image has an older AITER scale shuffler whose MOE_C
+config does not expose `block_size` and assumes group 32. It may still select
+MOE_C for the TP=2 group-128 shape, but its scale shuffle cannot handle the
+two groups in the second GEMM. The adapter falls back to WNA16 on that image;
+the direct MOE_C group-128 test is skipped there. The independent adapter
+accuracy test checks this fallback and still compares against the dequantized
+reference when the installed AITER supports group 128.
+
 ## Weight updates and captured scales
 
 MOE_C may require shuffled scale copies. The grouped route caches those copies

@@ -111,6 +111,23 @@ def test_moe_c_synthesizes_symmetric_gptq_zero_points(monkeypatch):
     assert torch.all(captured["w2_zp"] == 0x88)
 
 
+def test_legacy_moe_c_group128_scale_shuffle_falls_back(monkeypatch):
+    call = _case()
+    monkeypatch.setitem(sys.modules, "aiter.moe", SimpleNamespace(
+        MoeQuantType=SimpleNamespace(W4A16="w4a16")))
+    monkeypatch.setattr(
+        runtime, "select_aiter_moe_config",
+        lambda problem, cache_owner: SimpleNamespace(
+            solution_type="moe_c", need_shuffle_scale=True,
+        ),
+    )
+    monkeypatch.setattr(
+        runtime, "prepare_aiter_moe_scales",
+        lambda *args, **kwargs: pytest.fail("legacy scale shuffle was reached"),
+    )
+    assert runtime.apply_grouped_w4a16_moe(**call) is False
+
+
 @pytest.mark.parametrize("w1_zp,w2_zp", [(0x77, 0x66), (0x88, 0x88)])
 def test_explicit_grouped_zero_points_fall_back_before_aiter_selection(
     monkeypatch, w1_zp, w2_zp,

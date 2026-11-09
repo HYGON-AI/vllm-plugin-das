@@ -43,6 +43,8 @@ def test_tp2_group128_moec_hipc(num_tokens):
             f"need_shuffle_scale={config.need_shuffle_scale}"
         )
         assert ok and config.solution_type == "moe_c"
+        if getattr(config, "block_size", None) is None:
+            pytest.skip("Installed AITER lacks group-128 MOE_C scale shuffle")
         assert config.block_size == 128
         c_s1, c_s2 = aiter_moe_shfl_scale(s1, s2, config)
         out = aiter_moe(
