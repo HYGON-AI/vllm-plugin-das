@@ -433,6 +433,65 @@ def test_non_contiguous_view_written_in_place_real_chain():
     assert base[1].sum().item() == 0 and base[3].sum().item() == 0
 
 
+# --------------------------------------------------- scalar fp8_e5m2 (P2) ---
+
+
+def test_uniform_scalar_e5m2_group_encodes_e5m2_bytes_real_chain():
+    """e5m2 scalar caches are fillable: bytes follow e5m2, not e4m3."""
+    connector, _ = _load_patched_connector()
+    layers = ["l_e5"]
+    groups = _groups_from([[_LayerSpec("fp8_e5m2")]], [layers])
+    cache = torch.zeros((10, 2, 16), dtype=torch.uint8)
+    w = _make_worker(connector, "fp8_e5m2", groups, {layers[0]: cache})
+    w._fill_blocks(0, [2, 5], 32)
+    E5 = torch.float8_e5m2
+    ref_byte = int(
+        torch.tensor([0.015], dtype=torch.float32).to(E5).view(torch.uint8)[0]
+    )
+    # e5m2 bit layout (0.015 -> 0.015625), NOT the e4m3 byte (0x08).
+    assert ref_byte != 0x08
+    assert set(cache[2].flatten().tolist()) == {ref_byte}
+    assert set(cache[5].flatten().tolist()) == {ref_byte}
+    assert cache.view(E5)[2, 0, 0].item() == pytest.approx(0.015625)
+    assert cache[0].sum().item() == 0 and cache[7].sum().item() == 0
+
+
+def test_flavourless_layers_inherit_global_e5m2_kind():
+    connector, _ = _load_patched_connector()
+    layers = ["l_g"]
+    groups = _groups_from([[_LayerSpec()]], [layers])
+    cache = torch.zeros((4, 4), dtype=torch.uint8)
+    w = _make_worker(connector, "fp8_e5m2", groups, {layers[0]: cache})
+    w._fill_blocks(0, [1], 4)
+    E5 = torch.float8_e5m2
+    assert cache.view(E5)[1].float()[0].item() == pytest.approx(0.015625)
+
+
+def test_e4m3_e5m2_clash_group_refused_mixed():
+    """One fill cannot be bit-correct under both layouts: refuse."""
+    connector, _ = _load_patched_connector()
+    layers = ["l4", "l5"]
+    groups = _groups_from(
+        [[_LayerSpec("fp8_e4m3"), _LayerSpec("fp8_e5m2")]], [layers])
+    c4 = torch.zeros((2, 4), dtype=torch.uint8)
+    c5 = torch.zeros((2, 4), dtype=torch.uint8)
+    w = _make_worker(connector, "fp8_e4m3", groups, {"l4": c4, "l5": c5})
+    with pytest.raises(PatchCompatibilityError, match="mixed"):
+        w._fill_blocks(0, [0], 4)
+    assert c4.max().item() == 0 and c5.max().item() == 0
+
+
+def test_e5m2_upstream_dtype_consumed_by_gather_contract():
+    """Round-trip contract: the bytes this patch writes are exactly what
+    the platform E5M2 gather interprets (scalar float8_e5m2 storage)."""
+    connector, patch = _load_patched_connector()
+    import torch as _t
+
+    assert patch._fill_fp8_dtype("e5m2") is _t.float8_e5m2
+    assert patch._fill_fp8_dtype("e4m3") is _t.float8_e4m3fn
+    assert patch._fill_fp8_dtype(None) is _t.float8_e4m3fn  # legacy default
+
+
 # ------------------------------------------------------------ registration ---
 
 

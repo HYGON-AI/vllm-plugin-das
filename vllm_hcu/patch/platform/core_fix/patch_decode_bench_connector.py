@@ -72,11 +72,23 @@ _WRAPPER_FLAG = "_hcu_fp8_fill_wrapper"
 _PATCHED_FLAG = "_hcu_fp8_fill_patched"
 _CURRENT_MODE_ATTR = "_hcu_current_fill_mode"
 _GROUP_MODES_ATTR = "_hcu_group_fill_modes"
+_CURRENT_KIND_ATTR = "_hcu_current_fill_kind"
+_GROUP_KINDS_ATTR = "_hcu_group_fill_kinds"
 
-# Scalar per-tensor FP8 flavours whose byte storage is exactly e4m3fn
-# (upstream ``get_kv_quant_mode`` treats the bare "fp8"/"fp8_e4m3" family as
-# plain per-tensor FP8; everything fp8-flavoured beyond that is packed).
-_SCALAR_FP8_FLAVOURS = frozenset({"fp8", "fp8_e4m3"})
+# Scalar per-tensor FP8 flavours and their fill-encoding byte semantics:
+# "fp8"/"fp8_e4m3" quantize under e4m3fn (upstream get_kv_quant_mode
+# treats the bare "fp8" family as plain per-tensor FP8); "fp8_e5m2" is
+# the same scalar uint8-storage form under the e5m2 bit layout (the
+# platform gathers it as scalar float8_e5m2 storage -- worker.op_opt
+# patch_custom_ops._torch_gather_e5m2_cache).  Both kinds share the byte
+# storage form but NOT the bit layout, so one group carrying both must
+# refuse rather than encode one fill under two byte meanings.
+_SCALAR_FP8_KINDS = {
+    "fp8": "e4m3",
+    "fp8_e4m3": "e4m3",
+    "fp8_e5m2": "e5m2",
+}
+_SCALAR_FP8_FLAVOURS = frozenset(_SCALAR_FP8_KINDS)
 # Known quantised/packed flavour markers this patch refuses to byte-encode.
 _PACKED_FLAVOUR_PREFIXES = (
     "fp8_",       # fp8_ds_mla, fp8_per_token_head, ...
@@ -91,6 +103,9 @@ _GROUP_MODE_PACKED = "packed"
 _GROUP_MODE_MIXED = "mixed"
 _GROUP_MODE_UNKNOWN = "unknown"
 _GROUP_MODE_FLOAT = "float"
+
+_KIND_E4M3 = "e4m3"
+_KIND_E5M2 = "e5m2"
 
 _LOG = logging.getLogger("vllm_hcu.patch.decode_bench_fp8_fill")
 
@@ -110,6 +125,11 @@ def _iter_layer_specs(kv_cache_spec: Any):
         except TypeError:
             pass
     return (kv_cache_spec,)
+
+
+def _scalar_fp8_kind(flavour: str) -> str | None:
+    """Fill-encoding byte semantics ("e4m3"/"e5m2") for one flavour."""
+    return _SCALAR_FP8_KINDS.get(flavour)
 
 
 def _flavour_mode(flavour: str) -> str | None:
@@ -139,41 +159,75 @@ def _global_fill_mode(vllm_config) -> str:
     return _GROUP_MODE_FLOAT
 
 
-def _group_fill_mode(group, global_mode: str) -> str:
-    """Resolve one group's fill mode from its per-layer specs."""
+def _classify_group(group, global_mode: str, global_kind: str | None):
+    """Resolve one group's (fill mode, fill fp8 kind) from per-layer specs.
+
+    The kind is the byte semantics a synthetic fill must be quantized
+    under; scalar-flavourless layers inherit ``global_kind``.  A group
+    mixing the e4m3 and e5m2 kinds classifies as mixed: one constant
+    fill cannot be bit-correct under both layouts.
+    """
     layer_flavours = [
         str(getattr(spec, "cache_dtype_str", "") or "")
         for spec in _iter_layer_specs(getattr(group, "kv_cache_spec", None))
     ]
     modes = [_flavour_mode(flavour) for flavour in layer_flavours]
     resolved = [mode if mode is not None else global_mode for mode in modes]
+    kinds = [
+        _scalar_fp8_kind(flavour) if _scalar_fp8_kind(flavour) is not None
+        else global_kind
+        for flavour in layer_flavours
+    ]
     if not resolved:
-        return _GROUP_MODE_UNKNOWN
+        return _GROUP_MODE_UNKNOWN, None
     if any(mode == _GROUP_MODE_PACKED for mode in resolved):
-        return _GROUP_MODE_PACKED
+        return _GROUP_MODE_PACKED, None
     if any(mode == _GROUP_MODE_UNKNOWN for mode in resolved):
-        return _GROUP_MODE_UNKNOWN
+        return _GROUP_MODE_UNKNOWN, None
     if all(mode == _GROUP_MODE_PLAIN for mode in resolved):
-        return _GROUP_MODE_PLAIN
+        if len(set(kinds)) > 1 or None in kinds:
+            # e4m3+e5m2 clash inside one group (or a plain layer without
+            # resolvable semantics): refuse rather than guess bytes.
+            return _GROUP_MODE_MIXED, None
+        return _GROUP_MODE_PLAIN, kinds[0]
     if any(mode == _GROUP_MODE_PLAIN for mode in resolved):
         # scalar-FP8 layers mixed with float/non-quantised layers: encoding
         # would split one synthetic fill into two incompatible semantics, and
         # the legacy path would silently truncate the byte layers.
-        return _GROUP_MODE_MIXED
+        return _GROUP_MODE_MIXED, None
     # Only float modes remain; a scalar-byte fill never applies.
-    return _GROUP_MODE_FLOAT
+    return _GROUP_MODE_FLOAT, None
 
 
-def _encode_scalar(fill_mean: float) -> int:
-    """Quantize one constant to e4m3fn and return its byte (unsigned form)."""
+def _group_fill_mode(group, global_mode: str) -> str:
+    """Resolve one group's fill mode from its per-layer specs."""
+    return _classify_group(group, global_mode, _KIND_E4M3)[0]
+
+
+def _fill_fp8_dtype(kind: str | None):
+    """Map a scalar kind to the torch dtype fills are quantized under.
+
+    Flavour-less/plain globals historically encoded e4m3fn; the default
+    keeps that contract for any caller that did not resolve a kind.
+    """
     import torch
 
-    value = torch.tensor([fill_mean], dtype=torch.float32).to(torch.float8_e4m3fn)
+    return torch.float8_e5m2 if kind == _KIND_E5M2 else torch.float8_e4m3fn
+
+
+def _encode_scalar(fill_mean: float, kind: str | None) -> int:
+    """Quantize one constant under the kind's fp8 layout -> its byte."""
+    import torch
+
+    value = torch.tensor([fill_mean], dtype=torch.float32).to(
+        _fill_fp8_dtype(kind)
+    )
     return int(value.view(torch.uint8).item())
 
 
-def _encode_random(fill_mean: float, fill_std: float, shape, device):
-    """Sample float normals, quantize to e4m3fn, and return byte storage."""
+def _encode_random(fill_mean: float, fill_std: float, shape, device,
+                   kind: str | None):
+    """Sample float normals, quantize under the kind, return byte storage."""
     import torch
 
     samples = torch.normal(
@@ -183,7 +237,7 @@ def _encode_random(fill_mean: float, fill_std: float, shape, device):
         dtype=torch.float32,
         device=device,
     )
-    return samples.to(torch.float8_e4m3fn).view(torch.uint8)
+    return samples.to(_fill_fp8_dtype(kind)).view(torch.uint8)
 
 
 def _encode_like(fill_values_uint8, storage_dtype):
@@ -282,13 +336,21 @@ def _apply(module: ModuleType) -> bool:
     def init(self, vllm_config, kv_cache_config):
         self._hcu_vllm_config = vllm_config
         global_mode = _global_fill_mode(vllm_config)
-        modes = {
-            group_idx: _group_fill_mode(group, global_mode)
-            for group_idx, group in enumerate(
-                getattr(kv_cache_config, "kv_cache_groups", None) or []
-            )
-        }
-        setattr(self, _GROUP_MODES_ATTR, modes)
+        cache_config = getattr(vllm_config, "cache_config", None)
+        global_kind = _scalar_fp8_kind(
+            str(getattr(cache_config, "cache_dtype", "auto") or "auto")
+        )
+        groups = list(
+            getattr(kv_cache_config, "kv_cache_groups", None) or []
+        )
+        classified = [
+            _classify_group(group, global_mode, global_kind or _KIND_E4M3)
+            for group in groups
+        ]
+        setattr(self, _GROUP_MODES_ATTR,
+                dict(enumerate(mode for mode, _ in classified)))
+        setattr(self, _GROUP_KINDS_ATTR,
+                dict(enumerate(kind for _, kind in classified)))
         return original_init(self, vllm_config, kv_cache_config)
 
     @functools.wraps(original_fill_blocks)
@@ -300,12 +362,17 @@ def _apply(module: ModuleType) -> bool:
             # refusal guarantees zero writes for byte, float and state caches
             # alike, regardless of layer iteration order.
             _raise_for_mode(mode)
-        previous = getattr(self, _CURRENT_MODE_ATTR, None)
+        kinds = getattr(self, _GROUP_KINDS_ATTR, {})
+        kind = kinds.get(group_idx) or _KIND_E4M3
+        previous_mode = getattr(self, _CURRENT_MODE_ATTR, None)
+        previous_kind = getattr(self, _CURRENT_KIND_ATTR, None)
         setattr(self, _CURRENT_MODE_ATTR, mode)
+        setattr(self, _CURRENT_KIND_ATTR, kind)
         try:
             return original_fill_blocks(self, group_idx, block_ids, num_tokens)
         finally:
-            setattr(self, _CURRENT_MODE_ATTR, previous)
+            setattr(self, _CURRENT_MODE_ATTR, previous_mode)
+            setattr(self, _CURRENT_KIND_ATTR, previous_kind)
 
     @functools.wraps(original_fill_block)
     def _fill_block_tensor(self, kv_cache, block_ids, fill_mean, fill_std):
@@ -335,14 +402,15 @@ def _apply(module: ModuleType) -> bool:
         if len(valid_block_ids) == 0:
             return None
         target_shape = (len(valid_block_ids),) + tuple(kv_cache.shape[1:])
+        kind = getattr(self, _CURRENT_KIND_ATTR, _KIND_E4M3)
         if fill_std > 0:
             fill_bytes = _encode_random(
-                fill_mean, fill_std, target_shape, kv_cache.device
+                fill_mean, fill_std, target_shape, kv_cache.device, kind
             )
         else:
             fill_bytes = torch.full(
                 target_shape,
-                _encode_scalar(fill_mean),
+                _encode_scalar(fill_mean, kind),
                 dtype=torch.uint8,
                 device=kv_cache.device,
             )
@@ -375,10 +443,11 @@ def _apply(module: ModuleType) -> bool:
     setattr(worker_cls, _PATCHED_FLAG, True)
 
     _LOG.info(
-        "[decode-bench-fp8-fill] armed: e4m3fn byte encoding for groups whose "
-        "layers are all scalar per-tensor FP8 (0.015 -> byte 0x08 / value "
-        "0.015625); mixed/packed groups refuse clearly; float, state and "
-        "zero-fill paths keep upstream semantics."
+        "[decode-bench-fp8-fill] armed: e4m3fn/e5m2 byte encoding for groups "
+        "whose layers are all scalar per-tensor FP8 of one kind (0.015 -> e4m3 "
+        "byte 0x08 / value 0.015625); e4m3+e5m2 clashes and mixed/packed "
+        "groups refuse clearly; float, state and zero-fill paths keep "
+        "upstream semantics."
     )
     return True
 
