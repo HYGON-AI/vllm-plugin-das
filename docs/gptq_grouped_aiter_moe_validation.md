@@ -24,6 +24,22 @@ The returned config uses `MODE=11001301` or `11001303`, `BLOCK_SIZE_M=16`,
 selection for the corresponding shape. The grouped runtime passes GPTQ's
 packed symmetric qzeros to MOE_C; Triton receives the canonical scale path.
 
+## Weight updates and captured scales
+
+MOE_C may require shuffled scale copies. The grouped route caches those copies
+on a scale owner that survives kernel rebuilds. The worker snapshots that owner
+at `start_weight_update`; both model-runner reload paths snapshot it before
+writing weights. They refresh its scale tensors in place from the new source
+scales before graph replay and rebind cache keys when source parameters change.
+Clearing a cache would leave captured HIP graph addresses stale.
+
+The reload regression covers source `copy_()` and `.data.copy_()` updates,
+rebuilding the quant config during transfer, repeated parameter replacement
+with eager forwards, and direct replay without an intervening eager forward.
+A small HIP graph test checks both update APIs against the
+captured shuffled scale addresses on HCU; it does not measure full-model
+reload accuracy or serving performance.
+
 ## Checks
 
 - GPU independent unpack/dequantize + PyTorch MoE reference: M=1,4,32,256;

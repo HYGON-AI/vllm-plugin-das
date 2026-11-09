@@ -16,6 +16,54 @@ from vllm_hcu.model_executor.layers.fused_moe.aiter_moe_dispatch import (
 )
 
 logger = init_logger("vllm.hcu.grouped_w4a16_moe")
+_SCALE_OWNER_ATTR = "_hcu_grouped_w4a16_scale_owner"
+
+
+def _grouped_experts(model):
+    if model is None:
+        return
+    for layer in model.modules():
+        method = getattr(layer, "quant_method", None)
+        seen = set()
+        while method is not None and id(method) not in seen:
+            seen.add(id(method))
+            kernel = getattr(method, "moe_kernel", None)
+            experts = getattr(kernel, "fused_experts", None)
+            quant = getattr(experts, "quant_config", None)
+            if (
+                getattr(quant, "use_int4_w4a16", False)
+                and not getattr(quant, "_hcu_channel_w4a16", False)
+            ):
+                yield layer, experts
+            method = getattr(method, "old_quant_method", None)
+
+
+def snapshot_grouped_w4a16_scale_owners(model) -> dict[object, object]:
+    """Keep captured owners reachable if checkpoint reload rebuilds the kernel."""
+    return {
+        layer: getattr(experts, _SCALE_OWNER_ATTR, experts.quant_config)
+        for layer, experts in _grouped_experts(model)
+    }
+
+
+def refresh_grouped_w4a16_scale_caches(
+    model, previous_owners: dict[object, object] | None = None,
+) -> None:
+    """Refresh graph-owned scale allocations before weight updates can replay."""
+    from vllm_hcu.model_executor.layers.fused_moe.aiter_moe_dispatch import (
+        refresh_aiter_moe_scale_cache,
+    )
+
+    for layer, experts in _grouped_experts(model):
+        current_owner = getattr(experts, _SCALE_OWNER_ATTR, experts.quant_config)
+        owner = (previous_owners or {}).get(layer, current_owner)
+        scales = experts.w1_scale, experts.w2_scale
+        refresh_aiter_moe_scale_cache(owner, *scales, update_generation=True)
+        if current_owner is not owner:
+            refresh_aiter_moe_scale_cache(
+                current_owner, *scales, update_generation=True,
+            )
+            setattr(experts, _SCALE_OWNER_ATTR, owner)
 
 
 def _symmetric_qzeros(
@@ -127,8 +175,9 @@ def apply_grouped_w4a16_moe(
     prepared_w1, prepared_w2 = prepare_aiter_moe_weights(
         w1, w2, config, cache_owner=w1, block_shape=block, preserve_inputs=True,
     )
+    scale_owner = getattr(experts, _SCALE_OWNER_ATTR, quant)
     s1, s2 = prepare_aiter_moe_scales(
-        experts.w1_scale, experts.w2_scale, config, cache_owner=quant,
+        experts.w1_scale, experts.w2_scale, config, cache_owner=scale_owner,
     )
     result = execute_aiter_moe(
         config, hidden_states=hidden_states, w1=prepared_w1, w2=prepared_w2,

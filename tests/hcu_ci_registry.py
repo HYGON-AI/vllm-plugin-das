@@ -167,6 +167,11 @@ register_hcu_ci(
 )
 register_hcu_ci(
     job="contract-hcu-gfx936",
+    target="tests/runtime_patch/test_grouped_w4a16_scale_reload.py",
+    est_time=180,
+)
+register_hcu_ci(
+    job="contract-hcu-gfx936",
     target="tests/patch/test_clean_process_bootstrap.py",
     est_time=300,
 )
