@@ -115,6 +115,18 @@ def test_platform_core_inventory_is_explicit_and_ordered():
         ("platform.core_fix.step5_splitting_ops", "vllm.config.compilation"),
         ("platform.core_fix.step5_compile_prefix", "vllm.compilation.decorators"),
         ("platform.core_fix.step5_ep_graph_capture", "vllm.distributed.parallel_state"),
+        (
+            "platform.core.kimi_k3_smoke_layer_filter",
+            "vllm.model_executor.model_loader.default_loader",
+        ),
+        (
+            "platform.core.gdn_conv_tp_packing",
+            "vllm.model_executor.layers.mamba.gdn.kimi_gdn_linear_attn",
+        ),
+        (
+            "platform.core.decode_bench_fp8_fill",
+            "vllm.distributed.kv_transfer.kv_connector.v1.decode_bench_connector",
+        ),
     )
 
 
@@ -418,9 +430,9 @@ def test_apply_platform_patches_is_idempotent_narrow_and_reported():
     assert result.returncode == 0, result.stderr
     payload = json.loads(result.stdout.strip().splitlines()[-1])
     assert payload == {
-        "count": 70,
+        "count": 73,
         "replacements": 20,
-        "callbacks": 50,
+        "callbacks": 53,
         "failed": [],
         "builtins_same": True,
         "role": "Main",
