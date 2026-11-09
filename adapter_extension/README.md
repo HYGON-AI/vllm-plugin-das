@@ -37,7 +37,7 @@ operator-level capabilities.
   development, patch, and local version suffixes are accepted when the
   required operator APIs and LightOp capabilities are present. FLASH_ATTN uses
   the official public backend registry and AttentionImpl contract.
-- Adapter distribution: `sgl-kernel>=0.1.0`, extension API v1 from
+- Adapter host distribution: `hcu-adapter>=0.1.0`, extension API v1 from
   `hcu_adapter.extensions`.
 - Runtime: a prepared HCU PyTorch/DTK/LightOp/AITER stack. LightOp and AITER
   are intentionally not fetched by pip because production deployments must
@@ -59,9 +59,20 @@ dependency resolution, in this order:
 
 ```bash
 python3 -m pip install --no-deps /wheels/vllm-0.33.0+*.whl
-python3 -m pip install --no-deps /wheels/sgl_kernel-*.whl
+python3 -m pip install --no-deps /wheels/sgl_kernel-*.whl /wheels/hcu_adapter-*.whl
 python3 -m pip install --no-deps /wheels/hcu_vllm_das_plugin-*.whl
 ```
+
+Current Adapter releases split the pure `sgl-kernel` package from the
+`hcu-adapter` startup/bridge package. Install both audited wheels; the Adapter
+metadata owns their kernel version pairing. When migrating an existing legacy
+combined `sgl-kernel` installation, uninstall that old wheel before installing
+the pair, as required by Adapter upstream, or use a fresh environment. Do not
+install the host over a legacy combined RECORD: both can claim `hcu_adapter/`
+and a later uninstall can remove the other distribution's files. The verifier
+also accepts an existing genuine legacy combined owner for ABI-compatible
+manual validation, but rejects duplicate host owners and pure-kernel-only
+installs. No framework or model implementation is moved into this plugin.
 
 If the shell exports `PYTHONPATH`, clear it or invoke Python with `-E` during
 verification so an older system vLLM cannot precede the environment's wheel:
