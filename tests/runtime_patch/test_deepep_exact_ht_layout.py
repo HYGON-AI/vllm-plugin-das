@@ -79,6 +79,7 @@ def test_ht_receiver_preserves_physical_ids_and_binds_counts(monkeypatch, enable
     counts = [2, 2]
     module = SimpleNamespace(
         torch=torch,
+        dbo_current_ubatch_id=lambda: 0,
         mk=SimpleNamespace(ExpertTokensMetadata=SimpleNamespace(
             make_from_list=lambda counts, device: SimpleNamespace(
                 expert_num_tokens_cpu=torch.tensor(counts),

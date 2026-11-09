@@ -885,6 +885,11 @@ def test_hcu_model_runner_v2_scopes_request_phase_around_upstream_execute(
 
     upstream_module.GPUModelRunner = UpstreamGPUModelRunner
     monkeypatch.setitem(sys.modules, upstream_name, upstream_module)
+    # Register undo even when the adapter was absent before this stub import.
+    import vllm_hcu.v1 as hcu_v1
+
+    monkeypatch.setattr(hcu_v1, "hcu_model_runner_v2", None, raising=False)
+    monkeypatch.setitem(sys.modules, adapter_name, None)
     monkeypatch.delitem(sys.modules, adapter_name, raising=False)
 
     adapter_module = importlib.import_module(adapter_name)
@@ -918,7 +923,8 @@ def test_hcu_model_runner_v2_binds_router_while_worker_weight_pool_is_active(
 
     class UpstreamGPUModelRunner:
         def __init__(self, vllm_config, device):
-            del vllm_config, device
+            self.vllm_config = vllm_config
+            del device
             self.model = None
 
         def load_model(self, load_dummy_weights=False):
@@ -934,6 +940,11 @@ def test_hcu_model_runner_v2_binds_router_while_worker_weight_pool_is_active(
 
     upstream_module.GPUModelRunner = UpstreamGPUModelRunner
     monkeypatch.setitem(sys.modules, upstream_name, upstream_module)
+    # Restore the package attribute as well as sys.modules after the test.
+    import vllm_hcu.v1 as hcu_v1
+
+    monkeypatch.setattr(hcu_v1, "hcu_model_runner_v2", None, raising=False)
+    monkeypatch.setitem(sys.modules, adapter_name, None)
     monkeypatch.delitem(sys.modules, adapter_name, raising=False)
 
     from vllm_hcu.model_executor.layers.fused_moe import (

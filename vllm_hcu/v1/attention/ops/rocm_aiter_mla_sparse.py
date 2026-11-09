@@ -908,6 +908,7 @@ def rocm_fp8_paged_mqa_logits(
     *,
     force_aiter_triton: bool = False,
     kcache_layout: str = "preshuffle",
+    clean_logits: bool = True,
 ) -> torch.Tensor:
     """Compute FP8 MQA logits using paged KV-cache.
 
@@ -929,6 +930,8 @@ def rocm_fp8_paged_mqa_logits(
         kcache_layout: Page layout of gfx938 caches with block_size > 1:
             "preshuffle" (16x16 tiles) or "normal" (token-major). "normal"
             is rejected on other platforms.
+        clean_logits: Whether positions past each row's context end must be
+            -inf.  Only the gfx938 direct reader honors False.
 
     Returns:
         Logits tensor of shape [B * next_n, max_model_len], dtype
@@ -1040,6 +1043,7 @@ def rocm_fp8_paged_mqa_logits(
             context_lens,
             block_tables,
             max_model_len,
+            fill_tail=clean_logits,
         )
 
     aiter_paged_mqa_logits_module = None
@@ -1541,7 +1545,17 @@ def _lightop_topk_indices_decode(
     topk_tokens: int,
 ) -> None:
     row_ends = _decode_row_ends_from_seq_lens(seq_lens, next_n, logits.shape[0])
-    _get_lightop_attention().top_k_per_row_decode(
+    attention = _get_lightop_attention()
+    if topk_tokens == 2048:
+        row_ends = row_ends.to(device=logits.device, dtype=torch.int32).contiguous()
+        row_starts = torch.zeros_like(row_ends)
+        selected = attention.fast_topk_transform_ragged_fused(
+            logits.contiguous(), row_ends, row_starts, topk_tokens,
+            row_starts=row_starts,
+        )
+        topk_indices.copy_(selected)
+        return
+    attention.top_k_per_row_decode(
         logits,
         1,
         row_ends.to(device=logits.device, dtype=torch.int32),
@@ -1596,6 +1610,12 @@ def rocm_aiter_sparse_attn_indexer_fake(
         dtype=scratch_dtype,
         device=scratch_device,
     )
+    if topk_tokens == 2048 and _use_lightop_sparse_mla_topk():
+        _selected_topk = torch.empty(
+            (hidden_states.shape[0], topk_tokens),
+            dtype=torch.int32,
+            device=scratch_device,
+        )
     return topk_indices_buffer
 
 
@@ -1944,6 +1964,11 @@ def rocm_aiter_sparse_attn_indexer_native(
             decode_metadata.block_table,
             decode_metadata.schedule_metadata,
             max_model_len=max_model_len,
+            # Both decode top-k selectors bound each row by its end.  The DCP
+            # merge gathers scores only at those selected indices, so no
+            # decode consumer reads the unwritten tail.
+            clean_logits=False,
+            kcache_layout="normal" if on_gfx938() else "preshuffle",
         )
 
         # A padded decode batch has more kernel rows than actual decode

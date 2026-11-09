@@ -497,6 +497,13 @@ class HcuMegaMoEMethod(FusedMoEMethodBase):
             and getattr(mode, "name", "NONE") != "NONE"
         )
         metadata = context.dp_metadata
+        # PCP has already split the prefill batch before MoE.  The DP
+        # scheduler metadata can still describe the unsplit/global batch, so
+        # using it here would over-size the MegaMoE launch and make the local
+        # token-count check fail.  PCP+MegaMoE owns dispatch for the rank-local
+        # shard; DP+PCP is rejected by validate_config above.
+        if self.moe.pcp_size > 1:
+            metadata = None
         if graph:
             capacity = self._graph_tokens
             if capacity <= 0 or n > capacity:

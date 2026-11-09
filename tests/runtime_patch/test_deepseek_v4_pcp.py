@@ -850,25 +850,43 @@ def test_local_prefill_runs_write_local_output_in_place(
     assert calls == ([2, 1] if custom_ops and enabled and contiguous else [3])
 
 
-@pytest.mark.parametrize("available", [False, True])
-def test_pcp_insert_op_uses_optional_public_attention_api(monkeypatch, available):
+@pytest.mark.parametrize("public,legacy,expected", [
+    (True, True, "public"),
+    (True, False, "public"),
+    (False, True, "legacy"),
+    (False, False, None),
+])
+@pytest.mark.parametrize("shadow_getattr", [False, True])
+def test_pcp_insert_op_prefers_public_api_with_dtk_legacy_fallback(
+    monkeypatch, public, legacy, expected, shadow_getattr,
+):
+    if shadow_getattr:
+        # The audited resolver must not dispatch through this mutable name.
+        monkeypatch.setattr(
+            patch, "getattr", lambda *args: lambda: "private", raising=False,
+        )
     lightop = ModuleType("lightop")
     lightop.__path__ = []
     attention = ModuleType("lightop.attention")
-    native = lambda *args, **kwargs: None
-    if available:
-        attention.fused_deepseek_v4_qnorm_rope_kv_rope_quant_insert_pcp = native
-    lightop.attention = attention
-    # An available private dispatcher must never satisfy the public contract.
-    lightop.op = SimpleNamespace(
-        fused_deepseek_v4_qnorm_rope_kv_rope_quant_insert_pcp=lambda: pytest.fail(
-            "private LightOp dispatcher selected"
+    public_native = lambda *args, **kwargs: "public"
+    legacy_native = lambda *args, **kwargs: "legacy"
+    if public:
+        attention.fused_deepseek_v4_qnorm_rope_kv_rope_quant_insert_pcp = (
+            public_native
         )
-    )
+    lightop.attention = attention
+    lightop.op = SimpleNamespace()
+    if legacy:
+        lightop.op.fused_deepseek_v4_qnorm_rope_kv_rope_quant_insert_pcp = (
+            legacy_native
+        )
     monkeypatch.setitem(sys.modules, "lightop", lightop)
     monkeypatch.setitem(sys.modules, "lightop.attention", attention)
     patch._pcp_insert_op.cache_clear()
     try:
-        assert patch._pcp_insert_op() is (native if available else None)
+        selected = patch._pcp_insert_op()
+        assert selected is ({"public": public_native, "legacy": legacy_native}.get(
+            expected
+        ))
     finally:
         patch._pcp_insert_op.cache_clear()

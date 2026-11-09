@@ -85,6 +85,95 @@ def test_hcu_accepts_gptq_alias_selected_by_current_vllm() -> None:
     HCUPlatform.verify_quantization(resolved)
 
 
+def test_hcu_accepts_awq_alias_selected_by_current_vllm(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    from vllm.model_executor.layers.quantization import get_quantization_config
+    from vllm_hcu.platforms.hcu import HCUPlatform
+
+    monkeypatch.delenv("VLLM_USE_TRITON_AWQ", raising=False)
+    awq_config = {
+        "quant_method": "awq",
+        "bits": 4,
+        "group_size": 128,
+        "zero_point": True,
+    }
+    resolved = get_quantization_config("awq").override_quantization_method(
+        awq_config,
+        user_quant=None,
+    )
+
+    assert resolved == "auto_awq"
+    HCUPlatform.verify_quantization(resolved)
+    assert os.environ.get("VLLM_USE_TRITON_AWQ") == "1"
+
+
+@pytest.mark.parametrize(("num_tokens", "expected"), ((1, 3.0), (256, 128.0)))
+def test_hcu_auto_awq_dense_linear_uses_triton_when_lightop_is_disabled(
+    monkeypatch: pytest.MonkeyPatch,
+    num_tokens: int,
+    expected: float,
+) -> None:
+    import vllm.model_executor.parameter as parameter
+    from vllm.model_executor.layers.linear import ReplicatedLinear
+    from vllm.model_executor.layers.quantization import awq_triton
+    from vllm.model_executor.layers.quantization.auto_awq import (
+        AutoAWQConfig,
+        AutoAWQLinearMethod,
+    )
+    from vllm_hcu.platforms.hcu import HCUPlatform
+
+    monkeypatch.delenv("VLLM_USE_TRITON_AWQ", raising=False)
+    monkeypatch.setenv("VLLM_HCU_USE_LIGHTOP_AWQ", "0")
+    monkeypatch.setattr(parameter, "get_tensor_model_parallel_rank", lambda: 0)
+    monkeypatch.setattr(
+        parameter, "get_tensor_model_parallel_world_size", lambda: 1
+    )
+
+    def triton_gemm(input, qweight, scales, qzeros, split_k_iters):
+        return torch.full(
+            (input.shape[0], qweight.shape[1] * 8),
+            3.0,
+            dtype=input.dtype,
+            device=input.device,
+        )
+
+    def triton_dequantize(qweight, scales, qzeros):
+        return torch.ones(
+            (qweight.shape[0], qweight.shape[1] * 8),
+            dtype=scales.dtype,
+            device=scales.device,
+        )
+
+    monkeypatch.setattr(awq_triton, "awq_gemm_triton", triton_gemm)
+    monkeypatch.setattr(awq_triton, "awq_dequantize_triton", triton_dequantize)
+
+    HCUPlatform.verify_quantization("auto_awq")
+    assert os.environ.get("VLLM_USE_TRITON_AWQ") == "1"
+
+    config = AutoAWQConfig(4, 128, True, False)
+    layer = ReplicatedLinear(
+        128,
+        8,
+        bias=False,
+        params_dtype=torch.float16,
+        quant_config=config,
+        return_bias=False,
+        disable_tp=True,
+    )
+    assert isinstance(layer.quant_method, AutoAWQLinearMethod)
+
+    inputs = torch.ones((num_tokens, 128), dtype=torch.float16)
+    output = layer(inputs)
+
+    torch.testing.assert_close(
+        output,
+        torch.full_like(output, expected),
+        rtol=0,
+        atol=0,
+    )
+
+
 def _run_fresh_target(code: str) -> subprocess.CompletedProcess[str]:
     env = dict(os.environ)
     for name in (
@@ -97,7 +186,7 @@ def _run_fresh_target(code: str) -> subprocess.CompletedProcess[str]:
         env.pop(name, None)
     env["VLLM_PLUGINS"] = "__disabled__"
     env["VLLM_HCU_TARGET_ROOT"] = str(TARGET_VLLM_ROOT)
-    env["PYTHONPATH"] = os.pathsep.join((str(TARGET_VLLM_ROOT), str(REPO)))
+    env["PYTHONPATH"] = os.pathsep.join((str(REPO), str(TARGET_VLLM_ROOT)))
     return subprocess.run(
         [sys.executable, "-c", _TARGET_SOURCE_ASSERTION + code],
         check=False,
@@ -374,7 +463,8 @@ def test_engine_args_rejects_conflicting_gdn_prefill_backend() -> None:
         )
 
 
-def test_engine_args_extracts_nested_offline_eplb_fields() -> None:
+@pytest.mark.parametrize("policy", ["locality_fair", "token_hash"])
+def test_engine_args_extracts_nested_offline_eplb_fields(policy) -> None:
     module = _make_arg_utils_module()
     patch_engine_args.apply_to_module(module)
     eplb_config = {
@@ -382,7 +472,7 @@ def test_engine_args_extracts_nested_offline_eplb_fields() -> None:
         "step_interval": 100,
         "expert_map_path": "/maps/hy4.json",
         "disable_rearrange": True,
-        "static_dispatch_policy": "locality_fair",
+        "static_dispatch_policy": policy,
     }
 
     args = module.EngineArgs(eplb_config=eplb_config)
@@ -392,7 +482,7 @@ def test_engine_args_extracts_nested_offline_eplb_fields() -> None:
     assert get_hcu_config(args) == HcuFeatureConfig(
         expert_map_path="/maps/hy4.json",
         eplb_disable_rearrange=True,
-        eplb_static_dispatch_policy="locality_fair",
+        eplb_static_dispatch_policy=policy,
     )
 
     config = args.create_engine_config()
@@ -402,8 +492,14 @@ def test_engine_args_extracts_nested_offline_eplb_fields() -> None:
     assert config.parallel_config._vllm_hcu_eplb_disable_rearrange is True
     assert (
         config.parallel_config._vllm_hcu_eplb_static_dispatch_policy
-        == "locality_fair"
+        == policy
     )
+
+
+@pytest.mark.parametrize("policy", ["hash", "tokenhash", "round_robin", ""])
+def test_unknown_static_eplb_dispatch_policy_is_rejected(policy) -> None:
+    with pytest.raises(ValueError, match="eplb_static_dispatch_policy"):
+        HcuFeatureConfig(eplb_static_dispatch_policy=policy)
 
 
 def test_engine_args_extracts_nested_offline_eplb_record_path() -> None:
@@ -690,6 +786,9 @@ def test_real_v0251_engine_args_normalizes_legacy_deep_gemm_backend(
     result = _run_fresh_target(
         f"MODEL_PATH = {str(model_path)!r}\n" + r'''
 import os
+import json
+import tempfile
+from pathlib import Path
 os.environ["VLLM_USE_V2_MODEL_RUNNER"] = "0"
 from vllm.engine import arg_utils
 from vllm_hcu.patch.platform.core_fix import patch_engine_args
@@ -777,11 +876,16 @@ def test_engine_args_preserves_platform_resolved_compile_factors() -> None:
         headless: bool = False,
     ) -> object:
         config = original_create(self, usage_context, headless)
+        config.model_config = SimpleNamespace(architectures=["Glm5NextForCausalLM"])
+        config.parallel_config.prefill_context_parallel_size = 2
+        config.speculative_config = SimpleNamespace(method="mtp")
         set_hcu_config(
             config,
             get_hcu_config(config).with_updates(
                 fused_qwen3_rms_rope=False,
                 hcu_flash_attn_mode="varlen",
+                glm53_kda_cp_head_shard=True,
+                glm53_pcp_mtp_sync=True,
             ),
         )
         return config
@@ -793,6 +897,8 @@ def test_engine_args_preserves_platform_resolved_compile_factors() -> None:
 
     assert get_hcu_config(config).fused_qwen3_rms_rope is False
     assert get_hcu_config(config).hcu_flash_attn_mode == "varlen"
+    assert get_hcu_config(config).glm53_kda_cp_head_shard is True
+    assert get_hcu_config(config).glm53_pcp_mtp_sync is True
 
 
 def test_engine_args_rejects_incompatible_target_signature() -> None:
@@ -1814,7 +1920,9 @@ def test_hcu_config_validation_binds_sidecar_without_upstream_fields() -> None:
         hcu_flash_attn_mode="cutlass",
     )
     config = _validation_config(feature_config)
-    assert patch_vllm_config.validate_and_update_hcu_config(config) == feature_config
+    assert patch_vllm_config.validate_and_update_hcu_config(config) == (
+        feature_config.with_updates(glm53_kda_cp_head_shard=False, glm53_pcp_mtp_sync=False)
+    )
     # CompilationConfig has no duplicate serialized sidecar; the process-local
     # binding is derived again from authoritative additional_config after IPC.
     assert "_vllm_hcu_feature_config" not in vars(config.compilation_config)
@@ -1842,8 +1950,9 @@ def test_compilation_binding_is_recreated_after_pickle(
     patch_vllm_config.validate_and_update_hcu_config(config)
     restored = pickle.loads(pickle.dumps(config))
     assert "_vllm_hcu_feature_config" not in vars(restored.compilation_config)
-    assert get_hcu_config(restored) == feature_config
-    assert patch_vllm_config.validate_and_update_hcu_config(restored) == feature_config
+    expected = feature_config.with_updates(glm53_kda_cp_head_shard=False, glm53_pcp_mtp_sync=False)
+    assert get_hcu_config(restored) == expected
+    assert patch_vllm_config.validate_and_update_hcu_config(restored) == expected
 
 
 def _make_quantization_module() -> ModuleType:
@@ -1933,10 +2042,10 @@ def test_slimquant_marlin_inherits_v0251_compressed_tensors_constructor() -> Non
 
     # v0.25.1's FusedMoE public symbol is a factory and may be wrapped by HCU;
     # quantization dispatch must use the target-owned RoutedExperts type.
-    source = Path(
+    source = (REPO / Path(
         "vllm_hcu/model_executor/layers/quantization/compressed_tensors/"
         "compressed_tensors_marlin.py"
-    ).read_text(encoding="utf-8-sig")
+    )).read_text(encoding="utf-8-sig")
     assert "isinstance(layer, RoutedExperts)" in source
     assert "isinstance(layer, FusedMoE)" not in source
     assert config.get_quant_method(torch.nn.Embedding(4, 4), "embed") is None
@@ -2944,7 +3053,8 @@ def test_cutlass_block_first_mooncake_defers_to_worker_capability_gates() -> Non
     )
 
     assert patch_vllm_config.validate_and_update_hcu_config(config) == (
-        HcuFeatureConfig(hcu_flash_attn_mode="cutlass")
+        HcuFeatureConfig(hcu_flash_attn_mode="cutlass", glm53_kda_cp_head_shard=False,
+                         glm53_pcp_mtp_sync=False)
     )
 
 
@@ -3084,7 +3194,8 @@ def test_engine_args_skip_list_covers_every_master_resolved_field():
     """The create-engine-config retainment check must skip exactly the
     fields the platform hook re-resolves from the environment
     (validate_and_update_hcu_config's updates dict, minus the env
-    hcu_flash_attn_mode which is skipped conditionally). A new
+    hcu_flash_attn_mode, glm53_kda_cp_head_shard and glm53_pcp_mtp_sync which are skipped
+    conditionally while unresolved). A new
     master-gated field added to the updates dict without joining this
     skip list rejects every launch that flips it (f6399dc follow-up:
     k3_sp_moe launch failure).
@@ -3111,6 +3222,389 @@ def test_engine_args_skip_list_covers_every_master_resolved_field():
         "fused_qwen3_rms_rope",
         "qwen4_exp_hc_sp",
         "k3_sp_moe",
+        "glm53_kda_cp_head_shard",
+        "glm53_pcp_mtp_sync",
         "dp_int8_allgather",
     }
-    assert skip_list == persisted
+    assert skip_list == persisted - {"glm53_kda_cp_head_shard", "glm53_pcp_mtp_sync"}
+
+
+def _glm53_head_hash_config(pcp=8, speculative=False):
+    from tests.runtime_patch.test_glm52_pcp_config import _make_pcp_config
+
+    config = _make_pcp_config(
+        architecture="Glm5NextForCausalLM", pcp=pcp, tp=1, hybrid=True,
+        speculative=speculative,
+    )
+    config.additional_config = {"hcu": HcuFeatureConfig().to_dict()}
+    config.compilation_config = _ValidationCompilation()
+    # Cache-key policy is tested without admitting the unsupported PCP graph
+    # capture path; hashing itself does not require compiling a model.
+    config.model_config.enforce_eager = True
+    config.model_config.hf_text_config = SimpleNamespace(linear_num_heads=64)
+    config.scheduler_config = SimpleNamespace(max_num_batched_tokens=32768)
+    return config
+
+
+def test_glm53_kda_cp_head_mode_partitions_compilation_hash(monkeypatch):
+    from vllm_hcu.v1.glm53_kda_cp_config import (
+        KDA_CP_HEAD_ENV, KdaHeadParallelPlan, resolve_kda_head_parallel,
+    )
+
+    keys = []
+    for value in ("0", "1", "0"):
+        monkeypatch.setenv(KDA_CP_HEAD_ENV, value)
+        config = _glm53_head_hash_config()
+        feature = patch_vllm_config.validate_and_update_hcu_config(config)
+        assert feature.glm53_kda_cp_head_shard is (value == "1")
+        assert resolve_kda_head_parallel(config) == KdaHeadParallelPlan(
+            "pcp" if value == "1" else "tp", 8 if value == "1" else 1,
+        )
+        keys.append(_vllm_hash(config.additional_config))
+    assert keys[0] != keys[1]
+    assert keys[0] == keys[2]
+
+
+@pytest.mark.parametrize("architecture", [
+    "Glm5NextForCausalLM", "Glm5NextForConditionalGeneration",
+])
+@pytest.mark.parametrize("enabled", [False, True])
+@pytest.mark.parametrize("sync_enabled", [False, True])
+@pytest.mark.parametrize("draft_pcp", [1, 2, 8])
+@pytest.mark.parametrize("worker_env", [None, "0", "invalid"])
+def test_glm53_mtp_validation_does_not_mutate_target_head_mode(
+    monkeypatch, architecture, enabled, sync_enabled, draft_pcp, worker_env,
+):
+    from vllm_hcu.v1.glm53_kda_cp_config import (
+        KDA_CP_HEAD_ENV, kda_cp_head_size,
+    )
+
+    monkeypatch.setenv(KDA_CP_HEAD_ENV, str(int(enabled)))
+    monkeypatch.setenv("VLLM_HCU_GLM53_PCP_MTP_SYNC", str(int(sync_enabled)))
+    target = _glm53_head_hash_config(speculative=True)
+    target.model_config.architectures = [architecture]
+    unrelated = {"keep": True}
+    target.additional_config["unrelated"] = unrelated
+    target_additional = target.additional_config
+    patch_vllm_config.validate_and_update_hcu_config(target)
+    assert target.additional_config is target_additional
+    target_payload = copy.deepcopy(target_additional)
+    target_hcu_payload = target_additional["hcu"]
+    target_hash = _vllm_hash(target_additional)
+    target_head_size = kda_cp_head_size(target)
+    assert target_head_size == (8 if enabled else None)
+
+    # Native with_hf_config()/replace() carries additional_config by reference.
+    # The draft may use a different PCP width; ownership cannot depend on it.
+    draft = copy.copy(target)
+    draft.model_config = copy.copy(target.model_config)
+    draft.model_config.architectures = ["Glm5NextMTPModel"]
+    draft.parallel_config = copy.copy(target.parallel_config)
+    draft.parallel_config.prefill_context_parallel_size = draft_pcp
+    draft.compilation_config = _ValidationCompilation()
+    assert draft.additional_config is target_additional
+    if worker_env is None:
+        monkeypatch.delenv(KDA_CP_HEAD_ENV)
+        monkeypatch.delenv("VLLM_HCU_GLM53_PCP_MTP_SYNC")
+    else:
+        monkeypatch.setenv(KDA_CP_HEAD_ENV, worker_env)
+        monkeypatch.setenv("VLLM_HCU_GLM53_PCP_MTP_SYNC", worker_env)
+
+    for _ in range(2):
+        feature = patch_vllm_config.validate_and_update_hcu_config(draft)
+        assert feature.glm53_kda_cp_head_shard is False
+        assert feature.glm53_pcp_mtp_sync is False
+        assert get_hcu_config(target).glm53_pcp_mtp_sync is sync_enabled
+        assert get_hcu_config(target).glm53_kda_cp_head_shard is enabled
+        assert target.additional_config is target_additional
+        assert target_additional["hcu"] is target_hcu_payload
+        assert target_additional == target_payload
+        assert _vllm_hash(target_additional) == target_hash
+        assert kda_cp_head_size(target) == target_head_size
+        assert draft.additional_config is not target_additional
+        assert draft.additional_config["unrelated"] is unrelated
+        assert target.additional_config["unrelated"] is unrelated
+
+    # A later target validation must still consume its frozen policy, not the
+    # draft's effective False or a missing/opposite/invalid worker env value.
+    patch_vllm_config.validate_and_update_hcu_config(target)
+    assert get_hcu_config(target).glm53_kda_cp_head_shard is enabled
+    assert get_hcu_config(target).glm53_pcp_mtp_sync is sync_enabled
+    assert _vllm_hash(target.additional_config) == target_hash
+    assert kda_cp_head_size(target) == target_head_size
+    assert get_hcu_config(draft).glm53_kda_cp_head_shard is False
+    assert get_hcu_config(draft).glm53_pcp_mtp_sync is False
+
+
+@pytest.mark.parametrize("pcp", [1, 8])
+def test_glm53_mtp_without_additional_config_keeps_head_mode_off(monkeypatch, pcp):
+    monkeypatch.setenv("VLLM_HCU_GLM53_KDA_CP_HEAD_SHARD", "1")
+    draft = _glm53_head_hash_config(pcp=pcp)
+    draft.model_config.architectures = ["Glm5NextMTPModel"]
+    draft.additional_config = None
+    feature = patch_vllm_config.validate_and_update_hcu_config(draft)
+    assert feature.glm53_kda_cp_head_shard is False
+    assert get_hcu_config(draft).glm53_kda_cp_head_shard is False
+
+
+@pytest.mark.parametrize("scope", ["pcp1", "unrelated"])
+def test_glm53_kda_cp_head_hash_uses_effective_mode(monkeypatch, scope):
+    keys = []
+    for value in ("0", "1"):
+        monkeypatch.setenv("VLLM_HCU_GLM53_KDA_CP_HEAD_SHARD", value)
+        config = (_glm53_head_hash_config(pcp=1) if scope == "pcp1"
+                  else _validation_config(HcuFeatureConfig()))
+        feature = patch_vllm_config.validate_and_update_hcu_config(config)
+        assert feature.glm53_kda_cp_head_shard is False
+        keys.append(_vllm_hash(config.additional_config))
+    assert keys[0] == keys[1]
+
+
+@pytest.mark.parametrize("enabled", [False, True])
+@pytest.mark.parametrize("serialization", ["json", "pickle"])
+def test_glm53_kda_cp_head_workers_keep_serialized_mode(
+    monkeypatch, enabled, serialization,
+):
+    from vllm_hcu.v1.glm53_kda_cp_config import (
+        KDA_CP_HEAD_ENV, kda_cp_head_size,
+    )
+
+    monkeypatch.setenv(KDA_CP_HEAD_ENV, str(int(enabled)))
+    config = _glm53_head_hash_config()
+    patch_vllm_config.validate_and_update_hcu_config(config)
+    expected_hash = _vllm_hash(config.additional_config)
+    if serialization == "json":
+        config.additional_config = json.loads(json.dumps(config.additional_config))
+    else:
+        config.additional_config = pickle.loads(pickle.dumps(config.additional_config))
+    # Workers may have no launch flag, an opposite flag, or even an invalid
+    # unrelated local value. None may override the serialized graph policy.
+    for worker_value in (None, str(int(not enabled)), "invalid"):
+        if worker_value is None:
+            monkeypatch.delenv(KDA_CP_HEAD_ENV, raising=False)
+        else:
+            monkeypatch.setenv(KDA_CP_HEAD_ENV, worker_value)
+        assert kda_cp_head_size(config) == (8 if enabled else None)
+        feature = patch_vllm_config.validate_and_update_hcu_config(config)
+        assert feature.glm53_kda_cp_head_shard is enabled
+        assert _vllm_hash(config.additional_config) == expected_hash
+
+
+@pytest.mark.parametrize("enabled", [False, True])
+def test_glm53_kda_cp_head_fresh_worker_without_launch_flag(monkeypatch, enabled):
+    monkeypatch.setenv("VLLM_HCU_GLM53_KDA_CP_HEAD_SHARD", str(int(enabled)))
+    config = _glm53_head_hash_config()
+    patch_vllm_config.validate_and_update_hcu_config(config)
+    payload = repr(json.dumps(config.additional_config))
+    result = _run_fresh_target(
+        "import json, os; from types import SimpleNamespace; "
+        "from vllm_hcu.v1.glm53_kda_cp_config import kda_cp_head_size; "
+        "os.environ.pop('VLLM_HCU_GLM53_KDA_CP_HEAD_SHARD', None); "
+        "config=SimpleNamespace("
+        f"additional_config=json.loads({payload}), "
+        "parallel_config=SimpleNamespace(tensor_parallel_size=1, "
+        "prefill_context_parallel_size=8, pipeline_parallel_size=1, "
+        "data_parallel_size=1, decode_context_parallel_size=1), "
+        "model_config=SimpleNamespace(hf_config=SimpleNamespace(linear_num_heads=64))); "
+        f"assert kda_cp_head_size(config) == {8 if enabled else None!r}"
+    )
+    assert result.returncode == 0, result.stdout + result.stderr
+
+
+@pytest.mark.parametrize("value", ["1", 1, "true", 0])
+def test_glm53_kda_cp_head_sidecar_rejects_non_boolean(value):
+    with pytest.raises(TypeError, match="glm53_kda_cp_head_shard.*bool or None"):
+        HcuFeatureConfig.from_mapping({"glm53_kda_cp_head_shard": value})
+
+
+def test_glm53_kda_cp_head_unresolved_config_rejects_invalid_env(monkeypatch):
+    monkeypatch.setenv("VLLM_HCU_GLM53_KDA_CP_HEAD_SHARD", "true")
+    with pytest.raises(ValueError, match="must be 0 or 1"):
+        patch_vllm_config.validate_and_update_hcu_config(_glm53_head_hash_config())
+
+
+@pytest.mark.parametrize("head_enabled", ["0", "1"])
+@pytest.mark.parametrize("launch_value, expected", [(None, True), ("0", False), ("1", True)])
+def test_glm53_mtp_sync_resolves_once_independently_of_heads(
+    monkeypatch, head_enabled, launch_value, expected,
+):
+    variable = "VLLM_HCU_GLM53_PCP_MTP_SYNC"
+    monkeypatch.setenv("VLLM_HCU_GLM53_KDA_CP_HEAD_SHARD", head_enabled)
+    if launch_value is None:
+        monkeypatch.delenv(variable, raising=False)
+    else:
+        monkeypatch.setenv(variable, launch_value)
+    config = _glm53_head_hash_config(speculative=True)
+    feature = patch_vllm_config.validate_and_update_hcu_config(config)
+    assert feature.glm53_pcp_mtp_sync is expected
+    frozen_hash = _vllm_hash(config.additional_config)
+    for serialization in (json, pickle):
+        worker = copy.copy(config)
+        worker.additional_config = serialization.loads(serialization.dumps(config.additional_config))
+        for worker_value in (None, "0", "1", "invalid"):
+            if worker_value is None:
+                monkeypatch.delenv(variable, raising=False)
+            else:
+                monkeypatch.setenv(variable, worker_value)
+            assert patch_vllm_config.validate_and_update_hcu_config(worker).glm53_pcp_mtp_sync is expected
+            assert _vllm_hash(worker.additional_config) == frozen_hash
+
+
+@pytest.mark.parametrize("scope", ["pcp1", "unrelated", "no_mtp", "draft"])
+def test_glm53_mtp_sync_ineffective_scope_ignores_local_environment(monkeypatch, scope):
+    monkeypatch.setenv("VLLM_HCU_GLM53_PCP_MTP_SYNC", "invalid")
+    config = _glm53_head_hash_config(pcp=1 if scope == "pcp1" else 8,
+                                    speculative=(scope != "no_mtp"))
+    if scope == "unrelated":
+        config = _validation_config(HcuFeatureConfig())
+    elif scope == "draft":
+        config.model_config.architectures = ["Glm5NextMTPModel"]
+    assert patch_vllm_config.validate_and_update_hcu_config(config).glm53_pcp_mtp_sync is False
+
+
+@pytest.mark.parametrize("value", ["true", "", "2"])
+def test_glm53_mtp_sync_unresolved_config_rejects_invalid_launch_env(monkeypatch, value):
+    monkeypatch.setenv("VLLM_HCU_GLM53_PCP_MTP_SYNC", value)
+    with pytest.raises(ValueError, match="VLLM_HCU_GLM53_PCP_MTP_SYNC must be 0 or 1"):
+        patch_vllm_config.validate_and_update_hcu_config(_glm53_head_hash_config(speculative=True))
+
+
+@pytest.mark.parametrize("value", ["1", 1, "true", 0])
+def test_glm53_mtp_sync_sidecar_rejects_non_boolean(value):
+    with pytest.raises(TypeError, match="glm53_pcp_mtp_sync.*bool or None"):
+        HcuFeatureConfig.from_mapping({"glm53_pcp_mtp_sync": value})
+
+
+def test_glm53_mtp_sync_mode_partitions_compilation_hash(monkeypatch):
+    hashes = []
+    for mode in ("0", "1", "0"):
+        monkeypatch.setenv("VLLM_HCU_GLM53_PCP_MTP_SYNC", mode)
+        config = _glm53_head_hash_config(speculative=True)
+        patch_vllm_config.validate_and_update_hcu_config(config)
+        hashes.append(_vllm_hash(config.additional_config))
+    assert hashes[0] == hashes[2] != hashes[1]
+
+
+@pytest.mark.parametrize("name", ["glm53_kda_cp_head_shard", "glm53_pcp_mtp_sync"])
+@pytest.mark.parametrize("requested", [None, False, True])
+@pytest.mark.parametrize("scope", ["qwen3", "glm_pcp1", "glm_no_mtp", "glm_mtp"])
+@pytest.mark.parametrize("tp_size", [1, 2])
+def test_engine_args_explicit_glm_flags_follow_effective_scope(
+    monkeypatch, name, requested, scope, tp_size,
+):
+    monkeypatch.setenv("VLLM_HCU_GLM53_KDA_CP_HEAD_SHARD", "1")
+    monkeypatch.setenv("VLLM_HCU_GLM53_PCP_MTP_SYNC", "1")
+    module = _make_arg_utils_module()
+
+    def create_engine_config(self, usage_context=None, headless=False):
+        if scope == "qwen3":
+            config = _validation_config(HcuFeatureConfig())
+            config.model_config.architectures = ["Qwen3ForCausalLM"]
+        else:
+            config = _glm53_head_hash_config(
+                pcp=1 if scope == "glm_pcp1" else 2,
+                speculative=(scope == "glm_mtp"),
+            )
+        config.parallel_config.tensor_parallel_size = tp_size
+        config.additional_config = copy.deepcopy(self.additional_config)
+        patch_vllm_config.validate_and_update_hcu_config(config)
+        return config
+
+    module.EngineArgs.create_engine_config = create_engine_config
+    patch_engine_args.apply_to_module(module)
+    config = module.EngineArgs(additional_config={"hcu": {name: requested}}).create_engine_config()
+    applicable = scope in ("glm_no_mtp", "glm_mtp") if name == "glm53_kda_cp_head_shard" else scope == "glm_mtp"
+    expected = (True if requested is None else requested) if applicable else False
+    assert getattr(get_hcu_config(config), name) is expected
+
+
+@pytest.mark.parametrize("name", ["glm53_kda_cp_head_shard", "glm53_pcp_mtp_sync"])
+def test_engine_args_still_rejects_dropped_applicable_glm_flag(name):
+    module = _make_arg_utils_module()
+
+    def create_engine_config(self, usage_context=None, headless=False):
+        config = _glm53_head_hash_config(pcp=2, speculative=True)
+        config.additional_config = copy.deepcopy(self.additional_config)
+        patch_vllm_config.validate_and_update_hcu_config(config)
+        set_hcu_config(config, get_hcu_config(config).with_updates(**{name: False}))
+        return config
+
+    module.EngineArgs.create_engine_config = create_engine_config
+    patch_engine_args.apply_to_module(module)
+    with pytest.raises(PatchCompatibilityError, match=f"did not retain.*{name}"):
+        module.EngineArgs(additional_config={"hcu": {name: True}}).create_engine_config()
+
+
+@pytest.mark.parametrize("head", ["0", "1"])
+@pytest.mark.parametrize("enabled", [False, True])
+@pytest.mark.parametrize("source", ["env", "sidecar"])
+@pytest.mark.parametrize("attribute, value, message", [
+    ("draft_sample_method", "probabilistic", "greedy draft sampling only"),
+    ("enable_adaptive_verification", True, "does not cover adaptive verification"),
+])
+def test_glm53_mtp_sampling_contract_is_checked_during_engine_config(
+    monkeypatch, head, enabled, source, attribute, value, message,
+):
+    monkeypatch.setenv("VLLM_HCU_GLM53_KDA_CP_HEAD_SHARD", head)
+    monkeypatch.setenv("VLLM_HCU_GLM53_PCP_MTP_SYNC", str(int(enabled)))
+    config = _glm53_head_hash_config(pcp=2, speculative=True)
+    setattr(config.speculative_config, attribute, value)
+    if source == "sidecar":
+        set_hcu_config(config, get_hcu_config(config).with_updates(glm53_pcp_mtp_sync=enabled))
+        monkeypatch.setenv("VLLM_HCU_GLM53_PCP_MTP_SYNC", "invalid")
+    if enabled:
+        with pytest.raises(ValueError, match=message):
+            patch_vllm_config.validate_and_update_hcu_config(config)
+    else:
+        assert patch_vllm_config.validate_and_update_hcu_config(config).glm53_pcp_mtp_sync is False
+
+
+@pytest.mark.parametrize("scope", ["pcp1", "no_mtp", "other_model", "mtp_draft"])
+@pytest.mark.parametrize("head", [False, True])
+@pytest.mark.parametrize("sync_enabled", [False, True])
+@pytest.mark.parametrize("worker_env", [None, "0", "invalid"])
+def test_rescoped_config_clone_preserves_frozen_glm53_target(
+    monkeypatch, scope, head, sync_enabled, worker_env,
+):
+    from vllm_hcu.v1.glm53_kda_cp_config import kda_cp_head_size
+
+    monkeypatch.setenv("VLLM_HCU_GLM53_KDA_CP_HEAD_SHARD", str(int(head)))
+    monkeypatch.setenv("VLLM_HCU_GLM53_PCP_MTP_SYNC", str(int(sync_enabled)))
+    target = _glm53_head_hash_config(pcp=2, speculative=True)
+    unrelated = {"keep": True}
+    target.additional_config["unrelated"] = unrelated
+    patch_vllm_config.validate_and_update_hcu_config(target)
+    original = target.additional_config
+    payload = copy.deepcopy(original)
+    target_hash = _vllm_hash(original)
+    target_heads = kda_cp_head_size(target)
+    clone = copy.copy(target)
+    clone.model_config = copy.copy(target.model_config)
+    clone.parallel_config = copy.copy(target.parallel_config)
+    clone.compilation_config = _ValidationCompilation()
+    if scope in ("pcp1", "other_model"):
+        clone.parallel_config.prefill_context_parallel_size = 1
+    if scope == "other_model":
+        clone.model_config.architectures = ["Qwen3ForCausalLM"]
+    elif scope == "mtp_draft":
+        clone.model_config.architectures = ["Glm5NextMTPModel"]
+    elif scope == "no_mtp":
+        clone.speculative_config = None
+    for name in ("VLLM_HCU_GLM53_KDA_CP_HEAD_SHARD", "VLLM_HCU_GLM53_PCP_MTP_SYNC"):
+        if worker_env is None:
+            monkeypatch.delenv(name, raising=False)
+        else:
+            monkeypatch.setenv(name, worker_env)
+    assert clone.additional_config is original
+    expected_head = head if scope == "no_mtp" else False
+    for _ in range(2):
+        feature = patch_vllm_config.validate_and_update_hcu_config(clone)
+        assert feature.glm53_kda_cp_head_shard is expected_head
+        assert feature.glm53_pcp_mtp_sync is False
+        assert target.additional_config is original
+        assert original == payload
+        assert get_hcu_config(target).glm53_kda_cp_head_shard is head
+        assert get_hcu_config(target).glm53_pcp_mtp_sync is sync_enabled
+        assert _vllm_hash(original) == target_hash
+        assert kda_cp_head_size(target) == target_heads
+        assert clone.additional_config["unrelated"] is unrelated

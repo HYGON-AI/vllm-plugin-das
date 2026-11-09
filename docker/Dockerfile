@@ -21,7 +21,11 @@ SHELL ["/bin/bash", "-c"]
 ARG PYPI_URL
 ARG RESOURCE_SERVER_URL
 
-# pip 配置 (nightly 归档按基础镜像的 DTK_VERSION token 拼接) + das-install
+# das-install: 按 torch tag 从归档筛选版本并安装 (脚本由资源服务器下发)
+RUN wget -q "${RESOURCE_SERVER_URL}/Jenkins/CI_scripts/das-install.sh" -O /usr/local/bin/das-install && \
+    chmod +x /usr/local/bin/das-install
+
+# pip 配置 (nightly 归档按基础镜像的 DTK_VERSION token 拼接)
 RUN TRUSTED_HOST="${PYPI_URL#*://}" && TRUSTED_HOST="${TRUSTED_HOST%%/*}" && \
     mkdir -p ~/.pip && \
     printf '%s\n' \
@@ -29,17 +33,7 @@ RUN TRUSTED_HOST="${PYPI_URL#*://}" && TRUSTED_HOST="${TRUSTED_HOST%%/*}" && \
     "index-url = ${PYPI_URL}/nightly/${DTK_VERSION}/+simple/" \
     "trusted-host = ${TRUSTED_HOST}" \
     > ~/.pip/pip.conf && \
-    pip install --ignore-installed --no-cache-dir blinker && \
-    printf '%s\n' \
-    '#!/bin/bash' \
-    '# usage: das-install <pkg>[==<ver>] <torch_tag>' \
-    'pkg=$1 tag=$2 prefix=' \
-    'if [[ "$pkg" == *==* ]]; then prefix="${pkg#*==}"; pkg="${pkg%%==*}"; fi' \
-    'ver=$(pip index versions "$pkg" 2>/dev/null | grep -oP "${prefix}[^ ()]*${tag}[^ ()]*" | head -1)' \
-    '[ -z "$ver" ] && echo "Error: No version for $pkg matching $tag" && exit 1' \
-    'echo "Installing $pkg==$ver"' \
-    'pip install --no-cache-dir --extra-index-url https://mirrors.cloud.tencent.com/pypi/simple/ --trusted-host mirrors.cloud.tencent.com "$pkg==$ver"' \
-    > /usr/local/bin/das-install && chmod +x /usr/local/bin/das-install
+    pip install --ignore-installed --no-cache-dir blinker
 
 # AICC 编译器安装 (安装脚本安装成功后会在 $DTK_DIR/hcu_llvm.info 写入本次完整版本/commit 等记录);
 # AICC 大版本由 CI 按矩阵的 aicc_major 字段 --build-arg 传入, 脚本 --major 装该版本中日期最新的包
@@ -60,16 +54,19 @@ RUN wget -q "${RESOURCE_SERVER_URL}/Jenkins/CI_scripts/dtk_blas_cut_installer.sh
 
 # ---layer--- vLLM 框架依赖
 ARG VLLM_VERSION
-RUN pip install --no-cache-dir ninja wheel setuptools \
+ARG TORCH_VERSION
+# vllm / vllm-hcu 也按 torch 线出多个构建, 用 das-install 按 torch tag 筛选(同下方组件);
+# 两者都带 --pre: 只有 rc 预发布线时(如 0.28.1 的 vllm-hcu)也能取到
+RUN TORCH_TAG="torch${TORCH_VERSION//./}" \
+    && pip install --no-cache-dir ninja wheel setuptools \
     && pip install --no-cache-dir ray[data,train,tune,serve] -i https://mirrors.cloud.tencent.com/pypi/simple/ --trusted-host mirrors.cloud.tencent.com \
     && pip install --no-cache-dir amdsmi==1.0.0+630c16a6.dirty \
     && pip install --no-cache-dir cupy \
-    && pip install --no-cache-dir vllm==0.28.1 \
-    && pip install --no-cache-dir --pre "vllm-hcu>0.28.0,<=0.28.1" \
+    && das-install --pre vllm==${VLLM_VERSION} ${TORCH_TAG} \
+    && das-install --pre vllm-hcu==${VLLM_VERSION} ${TORCH_TAG} \
     && pip cache purge
 
 # ---layer--- torch + das 加速库
-ARG TORCH_VERSION
 # flash_attn 包名按 DTK 版本编译, 归档里的版本串是 dtk<DTK_VERSION>.torch<TORCH_TAG>.<时间戳>.<commit>;
 # 用 das-install 按 torch_tag 前缀匹配, 避免硬编码完整包名 (换 dtk/torch 版本不用改这里)
 RUN TORCH_TAG="torch${TORCH_VERSION//./}" \

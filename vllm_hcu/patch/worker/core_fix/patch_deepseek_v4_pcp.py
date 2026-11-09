@@ -52,17 +52,23 @@ def local_queries_enabled(batch) -> bool:
     return batch is not None and _LOCAL_QUERIES.get() is batch
 
 
+# Prefer the public category; DTK 26.04 and some 26.10 wheels expose this
+# versioned entry only through the legacy dispatcher. Direct attribute access
+# keeps this audited fallback independent of a rebound builtin getattr.
 @functools.cache
 def _pcp_insert_op():
-    # LightOp's PCP entry has separate Q/KV lengths and position vectors.
-    # KVNorm remains the caller's responsibility, unlike the combined op.
+    # Separate Q/KV lengths and positions; the caller handles KVNorm.
     try:
         from lightop import attention as native
-    except ImportError:
-        return None
+        op = native.fused_deepseek_v4_qnorm_rope_kv_rope_quant_insert_pcp
+    except (ImportError, AttributeError):
+        op = None
+    if callable(op):
+        return op
     try:
-        op = getattr(native, "fused_deepseek_v4_qnorm_rope_kv_rope_quant_insert_pcp")
-    except AttributeError:
+        from lightop import op as legacy_native
+        op = legacy_native.fused_deepseek_v4_qnorm_rope_kv_rope_quant_insert_pcp
+    except (ImportError, AttributeError):
         return None
     return op if callable(op) else None
 
