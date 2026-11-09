@@ -12,8 +12,8 @@ from vllm_hcu.model_executor.layers.quantization import grouped_w4a16_moe_runtim
 def _case():
     quant = SimpleNamespace(
         use_int4_w4a16=True,
-        w1_zp=torch.full((2, 128, 2), 0x88, dtype=torch.uint8),
-        w2_zp=torch.full((2, 128, 1), 0x88, dtype=torch.uint8),
+        w1_zp=None,
+        w2_zp=None,
     )
     experts = SimpleNamespace(
         quant_config=quant, block_shape=[0, 128],
@@ -53,8 +53,12 @@ def test_grouped_dispatch_preserves_group_and_packed_weights(monkeypatch, soluti
     assert selected[0].use_shuffle is False
     if solution is not None:
         assert executed[0]["w1"] is call["w1"]
-        assert executed[0]["w1_zp"] is (call["experts"].quant_config.w1_zp
-                                           if solution == "moe_c" else None)
+        if solution == "moe_c":
+            assert torch.all(executed[0]["w1_zp"] == 0x88)
+            assert torch.all(executed[0]["w2_zp"] == 0x88)
+        else:
+            assert executed[0]["w1_zp"] is None
+            assert executed[0]["w2_zp"] is None
         assert executed[0]["block_shape"] == [0, 128]
         assert torch.all(call["output"] == 7)
     else:
@@ -87,8 +91,6 @@ def test_unsupported_semantics_keep_original_wna16(monkeypatch, unsupported):
 
 def test_moe_c_synthesizes_symmetric_gptq_zero_points(monkeypatch):
     call = _case()
-    call["experts"].quant_config.w1_zp = None
-    call["experts"].quant_config.w2_zp = None
     monkeypatch.setitem(sys.modules, "aiter.moe", SimpleNamespace(
         MoeQuantType=SimpleNamespace(W4A16="w4a16")))
     monkeypatch.setattr(
@@ -107,3 +109,60 @@ def test_moe_c_synthesizes_symmetric_gptq_zero_points(monkeypatch):
     assert captured["w2_zp"].shape == (2, 128, 1)
     assert torch.all(captured["w1_zp"] == 0x88)
     assert torch.all(captured["w2_zp"] == 0x88)
+
+
+@pytest.mark.parametrize("w1_zp,w2_zp", [(0x77, 0x66), (0x88, 0x88)])
+def test_explicit_grouped_zero_points_fall_back_before_aiter_selection(
+    monkeypatch, w1_zp, w2_zp,
+):
+    call = _case()
+    quant = call["experts"].quant_config
+    quant.w1_zp = torch.full((2, 128, 2), w1_zp, dtype=torch.uint8)
+    quant.w2_zp = torch.full((2, 128, 1), w2_zp, dtype=torch.uint8)
+    monkeypatch.setattr(
+        runtime, "select_aiter_moe_config",
+        lambda *args, **kwargs: pytest.fail("explicit zero points reached AITER"),
+    )
+    assert runtime.apply_grouped_w4a16_moe(**call) is False
+
+
+@pytest.mark.parametrize("source", ["quant", "moe"])
+def test_clamped_swiglu_falls_back_before_aiter_selection(monkeypatch, source):
+    from vllm.model_executor.layers.fused_moe.activation import (
+        ApplyMoEActivationConfig,
+    )
+
+    call = _case()
+    experts = call["experts"]
+    quant = experts.quant_config
+    moe = experts.moe_config
+    quant.gemm1_clamp_limit = 1.0 if source == "quant" else None
+    quant.gemm1_alpha = None
+    quant.gemm1_beta = None
+    moe.swiglu_limit = 1.0 if source == "moe" else None
+    moe.swiglu_alpha = None
+    moe.swiglu_beta = None
+    moe.activation_situ_beta = None
+    moe.activation_situ_linear_beta = None
+    experts.activation_config = ApplyMoEActivationConfig.from_configs(moe, quant)
+    assert experts.activation_config.clamp_limit == 1.0
+    monkeypatch.setattr(
+        runtime, "select_aiter_moe_config",
+        lambda *args, **kwargs: pytest.fail("clamped SwiGLU reached AITER"),
+    )
+    assert runtime.apply_grouped_w4a16_moe(**call) is False
+
+
+@pytest.mark.parametrize("field,value", [("alpha", 1.2), ("beta", 0.2)])
+def test_modified_silu_falls_back_before_aiter_selection(monkeypatch, field, value):
+    from vllm.model_executor.layers.fused_moe.activation import (
+        ApplyMoEActivationConfig,
+    )
+
+    call = _case()
+    call["experts"].activation_config = ApplyMoEActivationConfig(**{field: value})
+    monkeypatch.setattr(
+        runtime, "select_aiter_moe_config",
+        lambda *args, **kwargs: pytest.fail("modified SiLU reached AITER"),
+    )
+    assert runtime.apply_grouped_w4a16_moe(**call) is False

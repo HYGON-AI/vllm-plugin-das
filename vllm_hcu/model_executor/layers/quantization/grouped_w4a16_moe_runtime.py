@@ -23,16 +23,13 @@ def _symmetric_qzeros(
     name: str,
     shape: tuple[int, int, int],
     device: torch.device,
-) -> torch.Tensor | None:
+) -> torch.Tensor:
     """Return GPTQ's implicit packed zero point for an AITER C kernel.
 
     AutoGPTQ stores symmetric GPTQ zero points implicitly and therefore leaves
     ``FusedMoEQuantConfig.w*_zp`` unset.  AITER's MOE_C ABI requires the
     packed byte tensor even for symmetric weights, where every nibble is 8.
     """
-    value = getattr(quant, name, None)
-    if value is not None:
-        return value
     cache_name = f"_hcu_aiter_{name}"
     cached = getattr(quant, cache_name, None)
     if (
@@ -63,6 +60,7 @@ def apply_grouped_w4a16_moe(
     """
     quant = experts.quant_config
     block = getattr(experts, "block_shape", None)
+    activation_config = getattr(experts, "activation_config", None)
     activation_name = str(getattr(activation, "value", activation))
     if (
         getattr(getattr(experts, "moe_config", None), "moe_backend", None) != "aiter"
@@ -71,8 +69,15 @@ def apply_grouped_w4a16_moe(
         or getattr(quant, "_hcu_channel_w4a16", False)
         or block is None or len(block) != 2 or block[0] != 0 or block[1] <= 0
         or activation_name != "silu"
+        or getattr(activation_config, "clamp_limit", None) is not None
+        or getattr(activation_config, "alpha", 1.0) != 1.0
+        or getattr(activation_config, "beta", 0.0) != 0.0
+        or getattr(activation_config, "activation_situ_beta", None) is not None
+        or getattr(activation_config, "activation_situ_linear_beta", None) is not None
         or hidden_states.dtype not in (torch.float16, torch.bfloat16)
         or w1.dtype != torch.uint8 or w2.dtype != torch.uint8
+        or getattr(quant, "w1_zp", None) is not None
+        or getattr(quant, "w2_zp", None) is not None
         or expert_map is not None
         or global_num_experts not in (-1, w1.shape[0])
         or a1q_scale is not None or a2_scale is not None
@@ -94,23 +99,6 @@ def apply_grouped_w4a16_moe(
         or topk_ids.shape[0] != hidden_states.shape[0]
     ):
         return False
-    w1_zp = getattr(quant, "w1_zp", None)
-    w2_zp = getattr(quant, "w2_zp", None)
-    if (w1_zp is None) != (w2_zp is None):
-        return False
-    if w1_zp is not None and (
-        not isinstance(w1_zp, torch.Tensor)
-        or not isinstance(w2_zp, torch.Tensor)
-        or w1_zp.dtype != torch.uint8
-        or w2_zp.dtype != torch.uint8
-        or w1_zp.shape != (
-            w1.shape[0], w1.shape[1] // 2, hidden_states.shape[1] // block[1]
-        )
-        or w2_zp.shape != (
-            w2.shape[0], w2.shape[1] // 2, w2.shape[2] * 2 // block[1]
-        )
-    ):
-        return False
     from aiter.moe import MoeQuantType
 
     problem = AiterMoeProblem(
@@ -124,6 +112,7 @@ def apply_grouped_w4a16_moe(
     if config is None:
         return False
     is_moe_c = str(getattr(config, "solution_type", "")).lower() == "moe_c"
+    w1_zp = w2_zp = None
     if is_moe_c:
         w1_zp = _symmetric_qzeros(
             quant, "w1_zp",
@@ -135,8 +124,6 @@ def apply_grouped_w4a16_moe(
             (w2.shape[0], w2.shape[1] // 2, w2.shape[2] * 2 // block[1]),
             w2.device,
         )
-        if w1_zp is None or w2_zp is None:
-            return False
     prepared_w1, prepared_w2 = prepare_aiter_moe_weights(
         w1, w2, config, cache_owner=w1, block_shape=block, preserve_inputs=True,
     )

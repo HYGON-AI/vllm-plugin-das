@@ -8,9 +8,12 @@ AITER wheel.
 The grouped route now calls the shared AITER selector and executor using the
 loaded canonical uint8 weights and their actual group size. It preserves those
 weights for batch-dependent solution selection and vLLM fallback. Explicit
-`triton`, asymmetric weights, expert parallelism, LoRA, router weights on input,
-and unsupported activations retain the existing path. AITER no-solution falls
-back; ABI/kernel errors propagate.
+`triton`, weights with explicit zero points, expert parallelism, LoRA, router
+weights on input, clamped SwiGLU, non-default SiLU parameters, and unsupported
+activations retain the existing path. Explicit zero points fall back even when
+their packed values are `0x88`; the adapter only synthesizes implicit symmetric
+zero points for MOE_C.
+AITER no-solution falls back; ABI/kernel errors propagate.
 
 ## Observed backend
 
@@ -27,7 +30,9 @@ packed symmetric qzeros to MOE_C; Triton receives the canonical scale path.
   4 passed, maximum absolute error 0.00023540.
 - Grouped routing/unsupported semantics: 11 passed.
 - TP=2 group-128 MOE_C/HIPC execution: M=1,4 passed; output shape and BF16
-  finiteness checks passed.
+  finiteness checks passed. The production adapter also passed an independent
+  unpack/dequantized MoE reference at M=1,4 on gfx936; maximum absolute error
+  was 0.00024158. All four HCU test files are registered for gfx936 CI.
 - Existing MoE/quantization runtime patch suites: 425 passed, 2 failed.
   Both failures are in SlimQuant W4A8 BoltOps public-signature checks; the
   installed BoltOps API differs from that separately audited contract.
