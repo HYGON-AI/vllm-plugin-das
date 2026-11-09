@@ -28,6 +28,11 @@ to a communicator-local quant plus the standard gather (identical outputs).
   byte-identical.
 - The generated kernel keeps the existing CTA ordering barrier between the quant stores and the
   aliased int32 push reads; the production flag/slot/counter protocol is copied verbatim.
+- Fused path confirmed active at runtime (not inferred): a profiled server run on the frozen
+  target base (16 × 128K, 6 s steady-state window, 119 decode steps) shows
+  `_ipc_quant_gather_prod_kernel` 10,545 calls (~88/step), with `_token_fp8_quant_kernel` and
+  `_ipc_all_gather_kernel` at 0 calls — the standalone quant and plain all-gather are replaced,
+  so there is no silent fallback.
 
 ## Local performance (2 ranks, production dispatch order, 200 graph replays)
 
@@ -37,7 +42,14 @@ to a communicator-local quant plus the standard gather (identical outputs).
 | 64 | 23.90 us | 17.69 us | +6.21 us |
 | 100 | 31.84 us | 24.30 us | +7.54 us |
 
-## Paired decode E2E (historical sessions; decode-window TPS)
+## E2E decode performance
+
+Target-base validation (frozen upstream base `5f181a36…`, matched pair, order BA, symmetric env):
+**R3 (128K ctx, BS50, MTP3): +1.71 % (Welch t=9.92, df=4.00, p=0.00058)**. ITL reduced from
+88.87 ms (baseline) to 87.38 ms (candidate). All formal rounds (3/3 per leg) audit-clean, 50/50
+complete requests, 0 preemptions.
+
+Historical sessions (Step5 lineage, reported as directional context):
 
 | workload | result | notes |
 |---|---|---|
@@ -46,16 +58,24 @@ to a communicator-local quant plus the standard gather (identical outputs).
 | R3 (128K BS50) | +1.60 % (Welch p=0.005341; seed-paired p=0.007792) | robust to Welch vs paired |
 | R4 (64K BS32) | +1.99 % (pooled 6-vs-6 Welch p=0.001990; seed-paired p=0.012568; BA p=0.052961; AB p=0.066873) | positive in both orders; p depends on the analysis unit; one anomalous A0 pair was excluded post-hoc and replaced |
 
-Prefill: dedicated TP1/DP8 128K contract 23032.2 +- 4.7 TPS vs certified 23050.6 (-0.08 %, inside
-the +-2 % non-regression gate). An earlier build deferred the quant at world 8 as well and
-regressed prefill by 3.13 %; the regression was traced to the deferred branch (not the fused
-kernel) and fixed by the world-2-only deferral in this change.
+Prefill non-regression: dedicated TP1/DP8 128K contract 23032.2 ± 4.7 TPS vs certified 23050.6
+(-0.08 %, inside the ±2 % non-regression gate). An earlier build deferred the quant at world 8
+as well and regressed prefill by 3.13 %; the regression was traced to the deferred branch (not
+the fused kernel) and fixed by the world-2-only deferral in this change.
 
 The DSASEL + fused-dispatch stack result is a separate optimization combination and is not
 reported here as the fused-dispatch gain.
 
 ## Compatibility
 
-The patch targets `v0.28.1-dev`. Runtime validation was performed on the Step5 branch lineage;
-the target-base runtime validation (model equivalence + paired decode on the frozen target SHA)
-is pending and must be completed before this change is marked ready for review.
+The patch targets `v0.28.1-dev` (frozen upstream base SHA `5f181a36c0e5b9749…`). Runtime
+validation was performed on both the Step5 development lineage and the frozen target base:
+
+- **Target-base model equivalence**: two vLLM servers, same session/config, 16 × 128K prompts,
+  greedy 64 tokens; both legs produced `outputs_sha256 85bc95cccc321744…`, 16/16
+  byte-identical.
+- **Target-base decode E2E** (R3 = 128K ctx, total BS50, MTP3; matched pair, order BA,
+  symmetric env, 2 warmups + 3 formal rounds per leg): A0 (frozen base) 1576.86 ± 3.30 TPS,
+  B1 (candidate) 1603.82 ± 3.36 TPS → +1.71 % (Welch t=9.92, df=4.00, p=0.00058).
+- **Prefill non-regression** (TP1/DP8 contract, 128K BS16): A0 23290.78 ± 3.56 TPS,
+  B1 23287.36 ± 11.50 TPS → −0.015 % (gate ±2 %).
