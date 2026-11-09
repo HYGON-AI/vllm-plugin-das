@@ -465,8 +465,11 @@ def _uses_post_dispatch_channel_fp8_quant(quant_config) -> bool:
 
 
 def _step5_fused_scatter_alignment(num_dispatchers, num_experts):
-    if num_dispatchers == 8 and num_experts == 352 and os.environ.get("HCU_STEP5_EP8_WASP128_LIBRARY"):
-        return 128
+    if num_dispatchers == 8 and num_experts == 352:
+        from .ep8_wasp128 import available
+
+        if available():
+            return 128
     return 256
 
 
