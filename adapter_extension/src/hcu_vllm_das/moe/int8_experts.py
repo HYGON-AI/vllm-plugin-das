@@ -10,6 +10,14 @@ from vllm.model_executor.layers.quantization.utils.quant_utils import (
 )
 
 
+def _parallel_supported(p):
+    # PassThrough declares output reduced; this expert delegates AR to Core.
+    if (p.use_passthrough_all2all or p.enable_eplb or p.dp_size != 1
+            or p.pcp_size != 1 or p.is_sequence_parallel):
+        return False
+    return not p.use_ep or (p.ep_size == 2 and p.tp_size == 1)
+
+
 def config_rejection(config):
     m = config
     if m.in_dtype not in (torch.bfloat16, torch.float16):
@@ -19,8 +27,15 @@ def config_rejection(config):
     if m.has_bias or m.is_lora_enabled or m.apply_router_weight_on_input:
         return 'INT8 ASM does not support bias, LoRA or router-weight-on-input'
     p = m.moe_parallel_config
-    if p.use_ep or p.enable_eplb or p.dp_size != 1 or p.pcp_size != 1 or p.is_sequence_parallel:
-        return 'INT8 ASM EP/EPLB/DP/PCP/sequence parallel is not validated'
+    if not _parallel_supported(p):
+        return 'INT8 ASM topology is not validated (static TP-only EP2 or ordinary TP)'
+    if p.use_ep and (
+        m.in_dtype != torch.bfloat16 or m.num_experts != 256
+        or m.num_logical_experts != 256 or m.num_local_experts != 128
+        or m.hidden_dim != 2048 or m.intermediate_size_per_partition != 512
+        or m.experts_per_token != 8 or m.elastic_ep_max_dp_size not in (None, 1)
+    ):
+        return 'INT8 ASM EP2 requires qualified BF16 E256/local128/H2048/N512/top8'
     if m.aiter_fmoe_shared_expert_enabled:
         return 'INT8 ASM shared expert fusion is not validated'
     if (m.hidden_dim != m.hidden_dim_unpadded
@@ -96,8 +111,7 @@ class HcuAiterInt8Experts(mk.FusedMoEExpertsModular):
 
     @staticmethod
     def _supports_parallel_config(p):
-        return (not p.use_ep and not p.enable_eplb and p.dp_size == p.pcp_size == 1
-                and not p.is_sequence_parallel)
+        return _parallel_supported(p)
 
     @staticmethod
     def activation_format():
@@ -119,14 +133,28 @@ class HcuAiterInt8Experts(mk.FusedMoEExpertsModular):
               workspace2, expert_tokens_meta, apply_router_weight_on_input):
         _require_active()
         if (expert_tokens_meta is not None or apply_router_weight_on_input
-                or a1q_scale is not None or a2_scale is not None or expert_map is not None
+                or a1q_scale is not None or a2_scale is not None
                 or global_num_experts != self.moe_config.num_experts):
             raise ValueError('INT8 ASM received an unsupported routing/quantization contract')
+        ep = self.moe_config.moe_parallel_config.use_ep
+        if ep:
+            if (not isinstance(expert_map, torch.Tensor) or expert_map.ndim != 1
+                    or expert_map.numel() != global_num_experts
+                    or expert_map.dtype != torch.int32 or not expert_map.is_contiguous()
+                    or expert_map.device != hidden_states.device
+                    or tuple(w1.shape) != (128, 1024, 2048)
+                    or tuple(w2.shape) != (128, 2048, 512)
+                    or hidden_states.ndim != 2 or hidden_states.shape[1] != 2048
+                    or hidden_states.dtype != torch.bfloat16 or output.dtype != torch.bfloat16
+                    or tuple(topk_ids.shape) != (hidden_states.shape[0], 8)):
+                raise ValueError('INT8 ASM received an unsupported EP routing contract')
+        elif expert_map is not None:
+            raise ValueError('INT8 ASM received an unexpected non-EP routing map')
         from .fused_moe_aiter import apply_aiter_int8_moe
         result = apply_aiter_int8_moe(
             hidden_states=hidden_states, w1=w1, w2=w2, topk_weights=topk_weights,
             topk_ids=topk_ids, moe_config=self.moe_config, quant_config=self.quant_config,
             activation=activation, expert_map=expert_map, output_dtype=output.dtype,
-            asm_only=True,
+            asm_only=True, allow_ep_global_profile=ep,
         )
         output.copy_(result)

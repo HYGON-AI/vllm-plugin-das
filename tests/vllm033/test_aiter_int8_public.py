@@ -144,3 +144,93 @@ def test_late_activation_refuses_vendor_config_cache_before_device_work(monkeypa
         int8_activation.activate(context)
     assert get_int8_moe_backend('aiter') is before
     assert int8_activation._published is None and not int8_activation._failure
+
+
+def ep_config(**changes):
+    parallel = FusedMoEParallelConfig(
+        tp_size=1, pcp_size=1, dp_size=1, ep_size=2,
+        tp_rank=0, pcp_rank=0, dp_rank=0, ep_rank=0, sp_size=1,
+        use_ep=True, all2all_backend='allgather_reducescatter', enable_eplb=False,
+    )
+    return config(num_experts=256, experts_per_token=8, hidden_dim=2048,
+                  intermediate_size=512, num_local_experts=128,
+                  num_logical_experts=256, moe_parallel_config=parallel, **changes)
+
+
+def test_static_ep2_config_is_admitted_for_qualified_bf16_geometry():
+    from hcu_vllm_das.moe.int8_experts import HcuAiterInt8Experts
+    actual = ep_config()
+    assert config_rejection(actual) is None
+    assert HcuAiterInt8Experts._supports_parallel_config(actual.moe_parallel_config)
+
+
+@pytest.mark.parametrize(('field', 'value'), [
+    ('ep_size', 4), ('tp_size', 2), ('dp_size', 2), ('pcp_size', 2),
+    ('sp_size', 2), ('enable_eplb', True),
+])
+def test_unqualified_ep_topologies_refuse_before_conversion(field, value):
+    actual = ep_config()
+    setattr(actual.moe_parallel_config, field, value)
+    assert config_rejection(actual) is not None
+
+
+@pytest.mark.parametrize(('field', 'value'), [
+    ('num_experts', 128), ('num_local_experts', 64), ('hidden_dim', 1024),
+    ('intermediate_size_per_partition', 256), ('experts_per_token', 4),
+    ('in_dtype', torch.float16), ('elastic_ep_max_dp_size', 2),
+])
+def test_unqualified_ep_geometry_refuses_before_conversion(field, value):
+    actual = ep_config()
+    setattr(actual, field, value)
+    assert config_rejection(actual) is not None
+
+
+def test_public_ep_apply_forwards_canonical_map_and_compatibility_optin(monkeypatch):
+    from hcu_vllm_das.moe import int8_experts, fused_moe_aiter
+    from vllm.model_executor.layers.fused_moe.config import int8_w8a8_moe_quant_config
+    monkeypatch.setattr(int8_experts, '_require_active', lambda: None)
+    cfg = ep_config()
+    s1 = torch.empty((128, 1024, 1), device='meta')
+    s2 = torch.empty((128, 2048, 1), device='meta')
+    quant = int8_w8a8_moe_quant_config(w1_scale=s1, w2_scale=s2,
+                                    a1_scale=None, a2_scale=None, per_act_token_quant=True)
+    expert = int8_experts.HcuAiterInt8Experts(cfg, quant)
+    x = torch.empty((1, 2048), dtype=torch.bfloat16, device='meta')
+    w1 = torch.empty((128, 1024, 2048), dtype=torch.int8, device='meta')
+    w2 = torch.empty((128, 2048, 512), dtype=torch.int8, device='meta')
+    ids = torch.empty((1, 8), dtype=torch.int32, device='meta')
+    weights = torch.empty((1, 8), dtype=torch.float32, device='meta')
+    mapping = torch.empty(256, dtype=torch.int32, device='meta')
+    empty = torch.empty(0, device='meta')
+    seen = []
+    monkeypatch.setattr(fused_moe_aiter, 'apply_aiter_int8_moe', lambda **kw: seen.append(kw) or x)
+    output = torch.empty_like(x)
+    expert.apply(output, x, w1, w2, weights, ids, MoEActivation.SILU,
+                 256, mapping, None, None, empty, empty, None, False)
+    assert seen[0]['expert_map'] is mapping and seen[0]['allow_ep_global_profile'] is True
+    with pytest.raises(ValueError, match='routing'):
+        expert.apply(output, x, w1, w2, weights, ids, MoEActivation.SILU,
+                     256, None, None, None, empty, empty, None, False)
+
+
+@pytest.mark.parametrize('ep', [False, True])
+def test_passthrough_pf_cannot_claim_local_asm_output_is_globally_reduced(ep):
+    from hcu_vllm_das.moe.int8_experts import HcuAiterInt8Experts
+    from vllm.model_executor.layers.fused_moe.all2all_utils import maybe_make_prepare_finalize
+    actual = ep_config() if ep else config()
+    actual.moe_parallel_config.all2all_backend = 'passthrough'
+    pf = maybe_make_prepare_finalize(actual, None, allow_new_interface=True)
+    assert type(pf).__name__ == 'PassThroughPrepareAndFinalize'
+    assert pf.output_is_reduced()
+    # ASM computes only local experts and delegates reduction to Core runner.
+    assert config_rejection(actual) is not None
+    assert not HcuAiterInt8Experts._supports_parallel_config(actual.moe_parallel_config)
+
+
+def test_static_ep_uses_actual_parallel_config_normalized_dp_capacity():
+    from vllm.config import ParallelConfig
+    parallel = ParallelConfig(tensor_parallel_size=2, enable_expert_parallel=True,
+                              disable_custom_all_reduce=True)
+    assert not parallel.enable_elastic_ep and parallel.elastic_ep_max_dp_size == 1
+    actual = ep_config(elastic_ep_max_dp_size=parallel.elastic_ep_max_dp_size)
+    assert config_rejection(actual) is None

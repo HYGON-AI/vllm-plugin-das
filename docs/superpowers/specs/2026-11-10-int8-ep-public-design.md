@@ -76,3 +76,23 @@ passed scoped strict limits relativeL2<=.005/maxabs<=.02/cos>=.9999. Their rever
 local-index negative exposed binary-mask information loss. They are evidence for
 this missing routing behavior, not public EP/model admission. No new MR until
 fresh remote actual code/open-diff audit, review and required tests; no CI bypass.
+
+## Task2 compatibility qualification bound
+
+The first public EP candidate opts into existing global-profile compatibility
+only after a real E128 local miss, for exact BF16 geometry above and M1/17/128.
+Qualified stage1 IDs are10010/10009/10011 respectively, stage2=20000/block16,
+raw/unpadded layout. All other M/profile metadata keeps whole-call official
+Triton; future tested shapes expand this set without claiming current broader
+native tuning/performance. A real local vendor profile wins over compatibility.
+This finite native-profile bound does not bound the overall upgrade objective.
+Actual public EP integration/model gates still must pass before publication.
+
+The EP candidate and ordinary TP path both reject Core passthrough PF before
+conversion: it declares output_is_reduced=True while this expert delegates
+collectives to the official runner. Real Core PF regression pins this contract.
+
+Core ParallelConfig normalizes a static DP1 deployment's elastic_ep_max_dp_size
+to1 even with enable_elastic_ep=False. Accept resolvedNone/1; reject expandable
+capacity>1. Do not mistake that normalized static field for elastic deployment.
+A real ParallelConfig regression covers the factory-forwarded value.

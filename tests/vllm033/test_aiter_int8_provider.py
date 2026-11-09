@@ -399,3 +399,76 @@ def test_ck_keeps_binary_ownership_mask_abi(monkeypatch):
     provider._load_aiter_api().aiter_moe(moe_config=SimpleNamespace(solution_type="ck"), expert_map=canonical)
     assert torch.equal(seen[0]["expert_map"], torch.tensor([1, 0, 1, 0, 0], dtype=torch.int32))
     assert torch.equal(canonical, torch.tensor([1, -1, 0, -1], dtype=torch.int32))
+
+
+def ep_inputs(tokens=1):
+    result = inputs()
+    result.update(hidden_states=FakeTensor((tokens, 2048), dtype=torch.bfloat16),
+                  w1=FakeTensor((128, 1024, 2048), dtype=torch.int8),
+                  w2=FakeTensor((128, 2048, 512), dtype=torch.int8),
+                  topk_weights=FakeTensor((tokens, 8), dtype=torch.float32),
+                  topk_ids=FakeTensor((tokens, 8), dtype=torch.int32),
+                  moe_config=SimpleNamespace(num_experts=256),
+                  expert_map=torch.cat((torch.arange(128, dtype=torch.int32),
+                                        torch.full((128,), -1, dtype=torch.int32))),
+                  output_dtype=torch.bfloat16, asm_only=True)
+    for name in ('w1_zp', 'w2_zp', 'a1_scale', 'a2_scale'):
+        setattr(result['quant_config'], name, None)
+    return result
+
+
+@pytest.mark.parametrize(('tokens', 'solution1'), [(1, 10010), (17, 10009), (128, 10011)])
+def test_ep_uses_explicit_qualified_global_profile_after_real_local_miss(monkeypatch, tokens, solution1):
+    args = ep_inputs(tokens)
+    profile = native_config(config=dict(SOL_ID1=solution1, SOL_ID2=20000, BLOCK_SIZE_M=16))
+    lookups, native_calls, events = [], [], []
+    def lookup(*values, **kwargs):
+        lookups.append((values, kwargs))
+        return (False, SimpleNamespace(solution_type=None, config=None)) if values[1] == 128 else (True, profile)
+    api = SimpleNamespace(quant_type_w8a8='int8_w8a8', get_config=lookup,
+                          aiter_moe=lambda **kw: native_calls.append(kw) or 'native')
+    monkeypatch.setattr(provider, '_load_aiter_api', lambda: api)
+    monkeypatch.setattr(provider, '_record_once', lambda level, event, *a: events.append(event))
+    monkeypatch.setattr(provider, '_load_triton_fallback', lambda: pytest.fail('qualified profile should execute'))
+    assert provider.apply_aiter_int8_moe(**args, allow_ep_global_profile=True) == 'native'
+    assert [values[0][1] for values in lookups] == [128, 256]
+    assert all(kwargs['spec_sol_type'] == 'asm' for _, kwargs in lookups)
+    assert native_calls[0]['moe_config'] is profile
+    assert native_calls[0]['expert_map'] is args['expert_map']
+    assert any('ep-global-profile' in event for event in events)
+
+
+@pytest.mark.parametrize('kind', ['not-opted-in', 'tokens2', 'fp16', 'unknown-sol', 'shuffle', 'padded'])
+def test_unqualified_ep_profile_uses_complete_official_fallback(monkeypatch, kind):
+    args = ep_inputs(2 if kind == 'tokens2' else 1)
+    if kind == 'fp16':
+        args['hidden_states'].dtype = torch.float16
+        args['output_dtype'] = torch.float16
+    profile = native_config()
+    if kind == 'unknown-sol':profile.config['SOL_ID1'] = 99999
+    if kind == 'shuffle':profile.need_shuffle = True
+    if kind == 'padded':profile.config['PADDED_K'] = 4096
+    lookups, fallbacks = [], []
+    def lookup(*values, **kwargs):
+        lookups.append(values[1])
+        return (False, SimpleNamespace(solution_type=None, config=None)) if values[1] == 128 else (True, profile)
+    api = SimpleNamespace(quant_type_w8a8='int8_w8a8', get_config=lookup,
+                          aiter_moe=lambda **kw: pytest.fail('unqualified native execution'))
+    monkeypatch.setattr(provider, '_load_aiter_api', lambda: api)
+    monkeypatch.setattr(provider, '_load_triton_fallback', lambda: lambda **kw: fallbacks.append(kw) or 'fallback')
+    assert provider.apply_aiter_int8_moe(**args, allow_ep_global_profile=kind != 'not-opted-in') == 'fallback'
+    assert lookups == ([128] if kind in ('not-opted-in', 'tokens2', 'fp16') else [128, 256])
+    assert fallbacks[0]['expert_map'] is args['expert_map']
+    assert fallbacks[0]['w1'] is args['w1'] and fallbacks[0]['hidden_states'] is args['hidden_states']
+
+
+def test_real_local_vendor_profile_takes_precedence_over_compatibility(monkeypatch):
+    args = ep_inputs()
+    profile = native_config()
+    lookups = []
+    api = SimpleNamespace(quant_type_w8a8='int8_w8a8',
+                          get_config=lambda *a, **kw: (lookups.append(a[1]) or True, profile),
+                          aiter_moe=lambda **kw: 'native')
+    monkeypatch.setattr(provider, '_load_aiter_api', lambda: api)
+    assert provider.apply_aiter_int8_moe(**args, allow_ep_global_profile=True) == 'native'
+    assert lookups == [128]

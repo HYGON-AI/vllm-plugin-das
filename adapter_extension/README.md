@@ -100,8 +100,23 @@ Builtin auto/triton behavior stays unchanged.
 
 The initial scope is gfx936, raw symmetric per-channel INT8 expert weights,
 dynamic per-token INT8 activations, BF16/FP16 inputs, gated SiLU and ordinary TP.
-Bias, LoRA, expert/data/context/sequence parallelism, EPLB, padded layouts,
-router-weight-on-input and non-neutral activation parameters refuse explicitly.
+The isolated EP2 candidate additionally admits static TP-only expert parallelism
+with BF16 inputs, global256/local128 experts, hidden2048/intermediate512/top8.
+The public factory/CT loader/runner component has passed a controlled two-rank
+fixture, including shared output, reload and changed-input Graph replay. Full
+checkpoint/model qualification remains pending; see the
+[scoped component record](../docs/validation/vllm033-int8-ep2-component.md).
+DP/PCP/sequence parallelism, EPLB, elastic topology, unsupported EP geometries,
+bias, LoRA, padded layouts, router-weight-on-input and non-neutral activation
+parameters refuse explicitly. `passthrough` refuses because this expert delegates
+cross-rank reduction to the official runner; it does not reduce internally.
+
+Canonical expert maps retain actual local-index permutations. An actual local
+vendor profile takes priority. After a local E128 lookup miss, the EP candidate
+can reuse only the qualified raw E256 global routing profiles for M1/17/128,
+recording that compatibility selection explicitly. Unknown profiles/token counts
+use complete official Triton fallback before native launch. This is not an E128
+CSV tuning or a broad native/performance claim.
 Core retains CT scheme selection, parameter metadata, weight loading, generic
 quant config, prepare/finalize and reductions. Preprocessed weights retain the
 official method's default refusal.

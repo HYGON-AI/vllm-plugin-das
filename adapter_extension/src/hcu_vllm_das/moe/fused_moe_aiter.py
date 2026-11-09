@@ -220,6 +220,7 @@ def apply_aiter_int8_moe(
     expert_map: object,
     output_dtype: object,
     asm_only: bool = False,
+    allow_ep_global_profile: bool = False,
 ) -> object:
     """Execute a native-layout AITER W8A8 config or official Triton fallback."""
 
@@ -257,6 +258,32 @@ def apply_aiter_int8_moe(
         use_shuffle=0,
         **({"spec_sol_type": "asm"} if asm_only else {}),
     )
+    # Actual local lookup remains authoritative. Reuse a global routing
+    # profile only for the exact installed-stage qualification, never label it
+    # a locally tuned config. Other token counts keep whole-call Core fallback.
+    qualified_solutions = {1: 10010, 17: 10009, 128: 10011}
+    if (not found and allow_ep_global_profile and asm_only
+            and expert_map is not None and global_num_experts == 256
+            and problem[1:] == (128, 1024, 2048, 2048, 8)
+            and getattr(hidden_states, "dtype", None) == torch.bfloat16
+            and output_dtype == torch.bfloat16 and activation_name == "silu"
+            and m in qualified_solutions):
+        profile_found, profile = api.get_config(
+            m, global_num_experts, n1, n2, k, top_k, 0,
+            getattr(hidden_states, "dtype", None), api.quant_type_w8a8,
+            activation=activation_name, use_shuffle=0, spec_sol_type="asm",
+        )
+        values = getattr(profile, "config", None)
+        if (profile_found and getattr(profile, "solution_type", None) == "asm"
+                and not getattr(profile, "need_shuffle", False)
+                and not getattr(profile, "need_shuffle_scale", False)
+                and isinstance(values, dict) and values.get("PADDED_K") is None
+                and not values.get("USE_SHUFFLE", 0)
+                and values.get("SOL_ID1") == qualified_solutions[m]
+                and values.get("SOL_ID2") == 20000 and values.get("BLOCK_SIZE_M") == 16):
+            found, selected = True, profile
+            _record_once(logging.INFO, "selected-ep-global-profile:E256-after-local-miss",
+                         problem, "asm", selected)
     solution = getattr(selected, "solution_type", None)
     unsupported_layout = bool(
         getattr(selected, "need_shuffle", False)
