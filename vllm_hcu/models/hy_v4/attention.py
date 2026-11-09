@@ -62,6 +62,7 @@ from vllm_hcu.platforms import envs as henvs
 from vllm_hcu.utils.multi_stream_utils import maybe_execute_in_parallel
 
 from .fp8_kv_dequant import LightOpKVReuseState
+from .sparse_indices import canonicalize_topk_indices
 
 logger = init_logger(__name__)
 
@@ -333,6 +334,12 @@ class Indexer(nn.Module):
         self.vllm_config = vllm_config
         self.config = config
         self.quant_config = quant_config
+        hf_config = getattr(vllm_config.model_config, "hf_config", None)
+        self.canonicalize_topk = (
+            current_platform.is_rocm()
+            and "HYV4VLForConditionalGeneration"
+            in (getattr(hf_config, "architectures", None) or ())
+        )
         self.topk_tokens = config.index_topk
         self.n_head = config.index_n_heads
         self.head_dim = config.index_head_dim
@@ -420,7 +427,10 @@ class Indexer(nn.Module):
                 rotary_emb,
                 qr_and_scale_quanted=qr_and_scale_quanted,
             )
-        return self.indexer_op(hidden_states, q_quant, k, weights)
+        indices = self.indexer_op(hidden_states, q_quant, k, weights)
+        if getattr(self, "canonicalize_topk", False):
+            canonicalize_topk_indices(indices, hidden_states.shape[0])
+        return indices
 
     def prepare_inputs(
         self,
