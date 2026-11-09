@@ -280,9 +280,10 @@ _OP_CALLBACKS: tuple[_CallbackSpec, ...] = (
     _CallbackSpec(_adapter("op_opt", "patch_kimi_k3_reference_paths")),
     _CallbackSpec(_adapter("op_opt", "patch_kimi_k3_pp_aux")),
     _CallbackSpec(_adapter("op_opt", "patch_kimi_k3_mla_gate")),
-    # fp8 decode epilogue: Triton q-concat + cache-rope route replacing the
-    # vendor fused op, which drops warp writes at large B under FULL
-    # cudagraph replay. Opt-out: VLLM_HCU_K3_QCAT_TRITON=0.
+    # fp8 decode epilogue: capture-safe Triton q-concat + cache-rope route
+    # for the vendor fused op's shape contract. Off by default (opt-in:
+    # VLLM_HCU_K3_QCAT_TRITON=1) -- the vendor op was cleared of blame for
+    # the DSpark poison, so the replacement stays dormant until asked for.
     _CallbackSpec(_adapter("op_opt", "patch_kimi_k3_nc_qcat")),
     # Must be applied after reference_paths: it wraps the
     # forward_attn_residual that adapter installs and captures it as the

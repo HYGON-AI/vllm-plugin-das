@@ -363,15 +363,10 @@ def _vllm_warn(msg: str, *args) -> None:
 
     _vllogger.warning(msg, *args)
 
-_ROLE_SEP_MODULE = "vllm.models.kimi_k3.role_separation"
 _MARKER = "_vllm_hcu_kimi_k3_sp_moe_applied"
 _INIT_WRAPPER = "_vllm_hcu_kimi_k3_sp_moe_init_wrapper"
 _FORWARD_WRAPPER = "_vllm_hcu_kimi_k3_sp_moe_forward_wrapper"
 _LAYER_STATE = "_vllm_hcu_kimi_k3_sp_moe_state"
-
-# Resolved once at apply time when the switch is on.
-_role_sep_enabled = None
-_role_sep_aux_comm = None
 
 # Latent-width admission for the DeepEP-LL path (Kimi-K3 latent MoE).
 #
