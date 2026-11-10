@@ -953,17 +953,8 @@ class FlashAttentionImpl(AttentionImpl):
         # The upstream query quantizer emits the platform E4M3 dtype. The
         # vendor E5M2 KV reader requires compute-dtype queries instead of
         # this mixed FP8 pair; keep native E5M2 K/V storage unchanged.
-        # K150 stores OCP E4M3 KV, but its vendor paged FP8 path does not
-        # preserve MTP causal masking and descales. Read those bytes through
-        # Triton with compute-dtype queries and BF16/FP16 dot products.
-        self._use_triton_e4m3 = (
-            kv_cache_dtype in {"fp8", "fp8_e4m3"}
-            and torch.cuda.get_device_properties("cuda").gcnArchName.split(":")[0]
-            == "gfx92a"
-        )
         self.supports_quant_query_input = (
             self.kv_cache_dtype != "fp8_e5m2"
-            and not self._use_triton_e4m3
             and flash_attn_supports_quant_query_input()
         )
 
@@ -1088,40 +1079,6 @@ class FlashAttentionImpl(AttentionImpl):
             )
             key_cache = key_cache.view(dtype)
             value_cache = value_cache.view(dtype)
-
-        if self._use_triton_e4m3:
-            if self.dcp_world_size > 1 or self.use_pcp:
-                raise NotImplementedError(
-                    "K150 E4M3 FlashAttention does not support context parallelism"
-                )
-            from vllm.v1.attention.ops.triton_unified_attention import unified_attention
-            from vllm.v1.kv_cache_interface import KVQuantMode
-
-            unified_attention(
-                q=query[:num_actual_tokens],
-                k=key_cache,
-                v=value_cache,
-                out=output[:num_actual_tokens],
-                cu_seqlens_q=attn_metadata.query_start_loc,
-                max_seqlen_q=attn_metadata.max_query_len,
-                seqused_k=attn_metadata.seq_lens,
-                max_seqlen_k=attn_metadata.max_seq_len,
-                softmax_scale=self.scale,
-                causal=attn_metadata.causal,
-                window_size=_get_native_sliding_window(
-                    attn_metadata.sliding_window, self.sliding_window,
-                    attn_metadata.causal,
-                ),
-                block_table=attn_metadata.block_table,
-                softcap=self.logits_soft_cap,
-                q_descale=None,
-                k_descale=layer._k_scale,
-                v_descale=layer._v_scale,
-                alibi_slopes=self.alibi_slopes,
-                sinks=self.sinks,
-                kv_quant_mode=KVQuantMode.FP8_PER_TENSOR,
-            )
-            return output
 
         if not attn_metadata.use_cascade:
             cu_seqlens_q = attn_metadata.query_start_loc

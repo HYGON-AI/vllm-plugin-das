@@ -1205,7 +1205,6 @@ def test_hcu_flash_attention_forward_uses_metadata_window_with_fallback(
 ) -> None:
     flash_attn = _load_hcu_flash_attention_module(monkeypatch)
     impl = object.__new__(flash_attn.FlashAttentionImpl)
-    impl._use_triton_e4m3 = False
     impl.vllm_flash_attn_version = 3
     impl.attn_type = flash_attn.AttentionType.DECODER
     impl.kv_cache_dtype = "auto"
@@ -1285,7 +1284,6 @@ def test_hcu_flash_attention_varlen_mode_routes_layout_to_native_interface(
         "vllm_hcu.v1.attention.backends.flash_attn"
     )
     impl = object.__new__(flash_attn.FlashAttentionImpl)
-    impl._use_triton_e4m3 = False
     impl.vllm_flash_attn_version = 3
     impl.attn_type = flash_attn.AttentionType.DECODER
     impl.kv_cache_dtype = "auto"
@@ -1529,7 +1527,6 @@ def test_hcu_varlen_dcp_requests_lse_from_paged_and_nonpaged_calls(
         lambda *args: merge_calls.append(args),
     )
     impl = object.__new__(flash_attn.FlashAttentionImpl)
-    impl._use_triton_e4m3 = False
     impl.vllm_flash_attn_version = 3
     impl.num_heads = 1
     impl.dcp_world_size = 1
@@ -1574,7 +1571,6 @@ def test_block_first_kv_update_passes_axis_one_views_to_hcu_writer(
 ) -> None:
     flash_attn = _load_hcu_flash_attention_module(monkeypatch)
     impl = object.__new__(flash_attn.FlashAttentionImpl)
-    impl._use_triton_e4m3 = False
     impl.attn_type = flash_attn.AttentionType.DECODER
     impl.kv_cache_dtype = "auto"
 
@@ -1616,7 +1612,6 @@ def test_pcp_kv_update_does_not_retain_gathered_tokens_without_dcp(
 
     flash_attn = _load_hcu_flash_attention_module(monkeypatch)
     impl = object.__new__(flash_attn.FlashAttentionImpl)
-    impl._use_triton_e4m3 = False
     impl.attn_type = flash_attn.AttentionType.DECODER
     impl.kv_cache_dtype = "auto"
     impl.use_pcp = True
@@ -1870,7 +1865,6 @@ def test_hcu_flash_attention_e5m2_keeps_compute_dtype_queries(
 ) -> None:
     from vllm_hcu.model_executor.layers.attention_forward_runtime import attention_forward
 
-    monkeypatch.setattr(torch.cuda, "get_device_properties", lambda device: SimpleNamespace(gcnArchName="gfx938"))
     flash_attn = _load_hcu_flash_attention_module(monkeypatch)
     monkeypatch.setattr(flash_attn, "get_flash_attn_version", lambda **kwargs: 3)
     monkeypatch.setattr(flash_attn, "get_current_vllm_config_or_none", lambda: None)

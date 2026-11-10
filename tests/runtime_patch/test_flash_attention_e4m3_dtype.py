@@ -31,12 +31,13 @@ def test_e4m3_cache_rejects_unverified_architecture(monkeypatch):
 
 
 @pytest.mark.parametrize("cache_dtype", ["fp8", "fp8_e4m3"])
-def test_k150_e4m3_preserves_compute_queries(monkeypatch, cache_dtype):
+@pytest.mark.parametrize("arch", ["gfx92a", "gfx938"])
+def test_e4m3_keeps_fa_quantized_queries(monkeypatch, cache_dtype, arch):
     module = load_hcu_flash_attention_module(monkeypatch)
-    monkeypatch.setattr(torch.cuda, "get_device_properties", lambda device: SimpleNamespace(gcnArchName="gfx92a"))
+    monkeypatch.setattr(torch.cuda, "get_device_properties", lambda device: SimpleNamespace(gcnArchName=arch))
     monkeypatch.setattr(module, "get_current_vllm_config_or_none", lambda: None)
     impl = module.FlashAttentionImpl(
         num_heads=24, head_size=256, scale=0.0625, num_kv_heads=4,
         alibi_slopes=None, sliding_window=None, kv_cache_dtype=cache_dtype,
     )
-    assert not impl.supports_quant_query_input
+    assert impl.supports_quant_query_input
