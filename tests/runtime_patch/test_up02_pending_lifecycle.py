@@ -84,6 +84,21 @@ def test_capacity_decline_rewrites_and_retires(local_quant):
     assert getattr(tensors[0], MARKER) is False
 
 
+def test_empty_sizes_rewrites_marked_payload(local_quant):
+    """An empty sizes list cannot reach the fused prologue; the pair must be rewritten."""
+    tensors, _ = _dispatch()
+
+    class _NoGather(_FakeAg):
+        def can_gather(self, tensors, sizes):
+            return False
+
+    outs, rewritten = adapter._up02_prepare_dispatch(_NoGather(), tensors, [])
+    assert outs is None, "no collective can run with an empty sizes list"
+    assert len(local_quant) == 1, "the placeholder must be replaced by a real scale"
+    assert rewritten[0] is not tensors[0] and rewritten[3] is not tensors[3]
+    assert getattr(tensors[0], MARKER) is False
+
+
 def test_float16_marker_never_reaches_the_plain_gather(local_quant):
     """tq.can_use admits float16; the fused consumer does not.  The pair must be rewritten."""
     tensors, sizes = _dispatch(dtype=torch.float16)

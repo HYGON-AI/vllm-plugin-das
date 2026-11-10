@@ -193,12 +193,15 @@ def _up02_prepare_dispatch(ag, tensors, sizes):
     a real quantization, and the marker is retired.  Returning a marked tensor unchanged would
     leave the standard gather with an unquantized activation and an uninitialized scale.
     """
-    if len(tensors) != 4 or not sizes:
+    if len(tensors) != 4:
         return None, tensors
     t0, t1, t2, t3 = tensors
     if not _up02_marked(t0):
         return None, tensors
-    fused_ready = (
+    # An empty sizes list cannot describe any collective, so the fused prologue must not
+    # run; fall through to the local quantization instead of returning the marked
+    # activation with its unwritten scale placeholder.
+    fused_ready = bool(sizes) and (
         torch.is_tensor(t1) and torch.is_tensor(t2) and torch.is_tensor(t3)
         and t0.dtype is torch.bfloat16 and t1.dtype is torch.float32
         and t2.dtype is torch.int32 and t3.dtype is torch.float32
