@@ -27,10 +27,10 @@ packed symmetric qzeros to MOE_C; Triton receives the canonical scale path.
 The immutable gfx936 CI image has an older AITER scale shuffler whose MOE_C
 config does not expose `block_size` and assumes group 32. It may still select
 MOE_C for the TP=2 group-128 shape, but its scale shuffle cannot handle the
-two groups in the second GEMM. The adapter falls back to WNA16 on that image;
-the direct MOE_C group-128 test is skipped there. The independent adapter
-accuracy test checks this fallback and still compares against the dequantized
-reference when the installed AITER supports group 128.
+two groups in the second GEMM. The adapter falls back to WNA16 on that image.
+The hardware tests check this fallback without skipping, and still execute
+MOE_C and compare against the dequantized reference when the installed AITER
+supports group 128.
 
 ## Weight updates and captured scales
 
@@ -40,6 +40,10 @@ at `start_weight_update`; both model-runner reload paths snapshot it before
 writing weights. They refresh its scale tensors in place from the new source
 scales before graph replay and rebind cache keys when source parameters change.
 Clearing a cache would leave captured HIP graph addresses stale.
+Checkpoint reload can restore the original layer Parameters after building a
+new MoE kernel. The refresh path binds the new experts' scale descriptors to
+those final layer Parameters before updating captured copies, so a subsequent
+kernel-format update reads the current values.
 
 The reload regression covers source `copy_()` and `.data.copy_()` updates,
 rebuilding the quant config during transfer, repeated parameter replacement

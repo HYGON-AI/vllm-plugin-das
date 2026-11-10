@@ -180,6 +180,103 @@ def test_v2_reload_refreshes_previous_owner_after_kernel_rebuild(monkeypatch):
         assert executions[-1][1] is captured[1]
 
 
+@pytest.mark.parametrize("update", ["copy", "data"])
+@pytest.mark.parametrize(
+    "device", ["cpu", pytest.param("cuda", marks=pytest.mark.hcu)],
+)
+def test_checkpoint_restore_then_kernel_update_uses_layer_scales(
+    monkeypatch, update, device,
+):
+    from vllm.v1.worker.gpu.model_runner import GPUModelRunner
+    from vllm.model_executor.layers.fused_moe.config import (
+        gptq_marlin_moe_quant_config,
+    )
+    from vllm.model_executor.model_loader.reload.layerwise import (
+        _copy_and_restore_kernel_tensors,
+    )
+    from vllm.model_executor.model_loader.reload.types import LayerReloadingInfo
+    from vllm_hcu.v1.hcu_model_runner_v2 import HcuGPUModelRunnerV2
+
+    if device == "cuda" and not torch.cuda.is_available():
+        pytest.skip("HCU is unavailable")
+    model, layer, method, captured, executions = _captured_grouped_model(
+        monkeypatch, device,
+    )
+    graph = None
+    if device == "cuda":
+        graph = torch.cuda.CUDAGraph()
+        with torch.inference_mode(), torch.cuda.graph(graph):
+            replayed = captured[0].flatten()[0] + captured[1].flatten()[0]
+        graph.replay()
+        torch.testing.assert_close(replayed, torch.tensor(2.0, device=device))
+    original = {name: getattr(layer, name) for name in ("w13_scales", "w2_scales")}
+    previous_owners = grouped_w4a16_moe_runtime.snapshot_grouped_w4a16_scale_owners(model)
+    for name, source in original.items():
+        setattr(layer, name, torch.nn.Parameter(
+            torch.full_like(source, 3), requires_grad=False,
+        ))
+
+    quant = gptq_marlin_moe_quant_config(
+        w1_scale=layer.w13_scales, w2_scale=layer.w2_scales,
+        weight_bits=4, group_size=128,
+    )
+
+    class ExpertView:
+        def __init__(self, quant_config):
+            self.quant_config = quant_config
+            self.block_shape = [0, 128]
+            self.moe_config = SimpleNamespace(moe_backend="aiter")
+
+        @property
+        def w1_scale(self):
+            return self.quant_config.w1_scale
+
+        @property
+        def w2_scale(self):
+            return self.quant_config.w2_scale
+
+    experts = ExpertView(quant)
+    method.moe_kernel = SimpleNamespace(fused_experts=experts)
+    _copy_and_restore_kernel_tensors(
+        layer,
+        LayerReloadingInfo(
+            restore_metadata=({}, {}), restore_device=torch.device(device),
+            kernel_tensors=(original, {}),
+        ),
+    )
+    assert layer.w13_scales is original["w13_scales"]
+    assert experts.w1_scale is not layer.w13_scales
+    grouped_w4a16_moe_runtime.refresh_grouped_w4a16_scale_caches(
+        model, previous_owners,
+    )
+    torch.testing.assert_close(captured[0], torch.full_like(captured[0], 3))
+
+    def load_kernel_format(self, *args, **kwargs):
+        for source in (layer.w13_scales, layer.w2_scales):
+            with torch.no_grad():
+                if update == "data":
+                    source.data.copy_(torch.full_like(source, 5))
+                else:
+                    source.copy_(torch.full_like(source, 5))
+
+    monkeypatch.setattr(GPUModelRunner, "reload_weights", load_kernel_format)
+    monkeypatch.setattr(HcuGPUModelRunnerV2, "get_model", lambda self: model)
+    runner = object.__new__(HcuGPUModelRunnerV2)
+    runner.reload_weights()
+    for scale in captured:
+        torch.testing.assert_close(scale, torch.full_like(scale, 5))
+    if graph is not None:
+        graph.replay()  # No grouped eager forward after the kernel-format update.
+        torch.cuda.synchronize()
+        torch.testing.assert_close(replayed, torch.tensor(10.0, device=device))
+    assert experts.w1_scale is layer.w13_scales
+    assert experts.w2_scale is layer.w2_scales
+    with torch.inference_mode():
+        assert _apply_grouped(experts)
+    assert executions[-1][0] is captured[0]
+    assert executions[-1][1] is captured[1]
+
+
 def test_v1_kernel_format_reload_refreshes_captured_grouped_scales(monkeypatch):
     import ast
     import time

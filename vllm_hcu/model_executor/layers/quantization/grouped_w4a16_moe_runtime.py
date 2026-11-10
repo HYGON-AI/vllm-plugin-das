@@ -46,6 +46,31 @@ def snapshot_grouped_w4a16_scale_owners(model) -> dict[object, object]:
     }
 
 
+def _bind_layer_scales(layer, experts) -> tuple[torch.Tensor, torch.Tensor]:
+    """Use the Parameters restored to the layer after checkpoint processing."""
+    quant = experts.quant_config
+    for layer_name, expert_name, desc_name in (
+        ("w13_scales", "w1_scale", "_w1"),
+        ("w2_scales", "w2_scale", "_w2"),
+    ):
+        source = getattr(layer, layer_name, None)
+        current = getattr(experts, expert_name)
+        if not isinstance(source, torch.Tensor):
+            continue
+        if (source.shape, source.dtype, source.device) != (
+            current.shape, current.dtype, current.device,
+        ):
+            raise RuntimeError(f"grouped W4A16 {layer_name} layout changed on reload")
+        if source is current:
+            continue
+        descriptor = getattr(quant, desc_name, None)
+        if descriptor is not None:
+            descriptor.scale = source
+        else:
+            setattr(experts, expert_name, source)
+    return experts.w1_scale, experts.w2_scale
+
+
 def refresh_grouped_w4a16_scale_caches(
     model, previous_owners: dict[object, object] | None = None,
 ) -> None:
@@ -57,7 +82,7 @@ def refresh_grouped_w4a16_scale_caches(
     for layer, experts in _grouped_experts(model):
         current_owner = getattr(experts, _SCALE_OWNER_ATTR, experts.quant_config)
         owner = (previous_owners or {}).get(layer, current_owner)
-        scales = experts.w1_scale, experts.w2_scale
+        scales = _bind_layer_scales(layer, experts)
         refresh_aiter_moe_scale_cache(owner, *scales, update_generation=True)
         if current_owner is not owner:
             refresh_aiter_moe_scale_cache(

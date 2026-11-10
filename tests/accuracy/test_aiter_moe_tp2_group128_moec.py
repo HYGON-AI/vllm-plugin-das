@@ -2,6 +2,8 @@
 # SPDX-FileCopyrightText: Copyright (c) 2026 Hygon Information Technology Co., Ltd.
 """Execute the real TP=2 group-128 AITER MOE_C/HIPC path."""
 
+from types import SimpleNamespace
+
 import pytest
 import torch
 
@@ -44,7 +46,23 @@ def test_tp2_group128_moec_hipc(num_tokens):
         )
         assert ok and config.solution_type == "moe_c"
         if getattr(config, "block_size", None) is None:
-            pytest.skip("Installed AITER lacks group-128 MOE_C scale shuffle")
+            from vllm_hcu.model_executor.layers.quantization.grouped_w4a16_moe_runtime import (
+                apply_grouped_w4a16_moe,
+            )
+
+            assert config.need_shuffle_scale and s2.shape[-1] == 2
+            experts = SimpleNamespace(
+                quant_config=SimpleNamespace(
+                    use_int4_w4a16=True, w1_zp=None, w2_zp=None,
+                ),
+                block_shape=[0, 128], w1_scale=s1, w2_scale=s2,
+                moe_config=SimpleNamespace(moe_backend="aiter"),
+            )
+            assert not apply_grouped_w4a16_moe(
+                experts, torch.empty_like(x), x, w1, w2, weights, ids,
+                "silu", e, None, None, None, None, False,
+            )
+            return
         assert config.block_size == 128
         c_s1, c_s2 = aiter_moe_shfl_scale(s1, s2, config)
         out = aiter_moe(
