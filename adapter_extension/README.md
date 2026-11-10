@@ -117,10 +117,16 @@ cross-rank reduction to the official runner; it does not reduce internally.
 
 Canonical expert maps retain actual local-index permutations. An actual local
 vendor profile takes priority. After a local E128 lookup miss, the EP candidate
-can reuse only the qualified raw E256 global routing profiles for M1/17/128,
-recording that compatibility selection explicitly. Unknown profiles/token counts
+can reuse only the stage-qualified raw E256 profiles for M1/2/3/4/8/16/17/32/64/
+128/256/512/1024, with the exact first-stage ID, second-stage ID and sorting
+block size checked together. Compatibility selection is recorded explicitly.
+Unknown profiles/token counts
 use complete official Triton fallback before native launch. This is not an E128
 CSV tuning or a broad native/performance claim.
+The additional shapes are a new isolated candidate: their public two-rank
+runner/reload, model and performance gates remain pending. The component and
+model records below belong to the earlier M1/17/128 policy at runtime7e088e9b.
+See the [native profile evidence and remaining gates](../docs/validation/vllm033-int8-ep2-native-batches.md).
 Core retains CT scheme selection, parameter metadata, weight loading, generic
 quant config, prepare/finalize and reductions. Preprocessed weights retain the
 official method's default refusal.

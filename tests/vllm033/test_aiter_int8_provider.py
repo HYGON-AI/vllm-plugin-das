@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import json
 import os
 from pathlib import Path
 import sys
@@ -417,10 +418,18 @@ def ep_inputs(tokens=1):
     return result
 
 
-@pytest.mark.parametrize(('tokens', 'solution1'), [(1, 10010), (17, 10009), (128, 10011)])
-def test_ep_uses_explicit_qualified_global_profile_after_real_local_miss(monkeypatch, tokens, solution1):
+# Expected plans come from the independently audited native stage.
+EP2_QUALIFIED_PROFILES = json.loads(
+    (Path(__file__).parent / 'data/int8_ep2_gfx936_qualified_profiles.json').read_text()
+)['profiles']
+
+
+@pytest.mark.parametrize(('tokens', 'config'), [
+    (int(m), config) for m, config in sorted(EP2_QUALIFIED_PROFILES.items(), key=lambda item: int(item[0]))
+])
+def test_ep_uses_explicit_qualified_global_profile_after_real_local_miss(monkeypatch, tokens, config):
     args = ep_inputs(tokens)
-    profile = native_config(config=dict(SOL_ID1=solution1, SOL_ID2=20000, BLOCK_SIZE_M=16))
+    profile = native_config(config=dict(config))
     lookups, native_calls, events = [], [], []
     def lookup(*values, **kwargs):
         lookups.append((values, kwargs))
@@ -438,9 +447,9 @@ def test_ep_uses_explicit_qualified_global_profile_after_real_local_miss(monkeyp
     assert any('ep-global-profile' in event for event in events)
 
 
-@pytest.mark.parametrize('kind', ['not-opted-in', 'tokens2', 'fp16', 'unknown-sol', 'shuffle', 'padded'])
+@pytest.mark.parametrize('kind', ['not-opted-in', 'tokens5', 'fp16', 'unknown-sol', 'shuffle', 'padded'])
 def test_unqualified_ep_profile_uses_complete_official_fallback(monkeypatch, kind):
-    args = ep_inputs(2 if kind == 'tokens2' else 1)
+    args = ep_inputs(5 if kind == 'tokens5' else 1)
     if kind == 'fp16':
         args['hidden_states'].dtype = torch.float16
         args['output_dtype'] = torch.float16
@@ -457,13 +466,14 @@ def test_unqualified_ep_profile_uses_complete_official_fallback(monkeypatch, kin
     monkeypatch.setattr(provider, '_load_aiter_api', lambda: api)
     monkeypatch.setattr(provider, '_load_triton_fallback', lambda: lambda **kw: fallbacks.append(kw) or 'fallback')
     assert provider.apply_aiter_int8_moe(**args, allow_ep_global_profile=kind != 'not-opted-in') == 'fallback'
-    assert lookups == ([128] if kind in ('not-opted-in', 'tokens2', 'fp16') else [128, 256])
+    assert lookups == ([128] if kind in ('not-opted-in', 'tokens5', 'fp16') else [128, 256])
     assert fallbacks[0]['expert_map'] is args['expert_map']
     assert fallbacks[0]['w1'] is args['w1'] and fallbacks[0]['hidden_states'] is args['hidden_states']
 
 
-def test_real_local_vendor_profile_takes_precedence_over_compatibility(monkeypatch):
-    args = ep_inputs()
+@pytest.mark.parametrize('tokens', [1, 5, 512, 1024])
+def test_real_local_vendor_profile_takes_precedence_over_compatibility(monkeypatch, tokens):
+    args = ep_inputs(tokens)
     profile = native_config()
     lookups = []
     api = SimpleNamespace(quant_type_w8a8='int8_w8a8',
@@ -472,3 +482,44 @@ def test_real_local_vendor_profile_takes_precedence_over_compatibility(monkeypat
     monkeypatch.setattr(provider, '_load_aiter_api', lambda: api)
     assert provider.apply_aiter_int8_moe(**args, allow_ep_global_profile=True) == 'native'
     assert lookups == [128]
+
+
+@pytest.mark.parametrize('tokens', [512, 1024])
+@pytest.mark.parametrize('field', ['SOL_ID1', 'SOL_ID2', 'BLOCK_SIZE_M'])
+def test_ep_compatibility_rejects_any_changed_stage_or_block(monkeypatch, tokens, field):
+    args = ep_inputs(tokens)
+    config = dict(EP2_QUALIFIED_PROFILES[str(tokens)])
+    config[field] += 1
+    profile = native_config(config=config)
+    lookups, fallbacks = [], []
+    def lookup(*values, **kwargs):
+        lookups.append(values[1])
+        return (False, SimpleNamespace(solution_type=None, config=None)) if values[1] == 128 else (True, profile)
+    monkeypatch.setattr(provider, '_load_aiter_api', lambda: SimpleNamespace(
+        quant_type_w8a8='int8_w8a8', get_config=lookup,
+        aiter_moe=lambda **kw: pytest.fail('unqualified stage/block launched'),
+    ))
+    monkeypatch.setattr(provider, '_load_triton_fallback', lambda: lambda **kw: fallbacks.append(kw) or 'fallback')
+    assert provider.apply_aiter_int8_moe(**args, allow_ep_global_profile=True) == 'fallback'
+    assert lookups == [128, 256]
+    assert fallbacks[0]['hidden_states'] is args['hidden_states']
+    assert fallbacks[0]['w1'] is args['w1'] and fallbacks[0]['expert_map'] is args['expert_map']
+
+
+@pytest.mark.parametrize('tokens', [5, 7, 15, 33, 63, 65, 127, 129, 255, 257, 511, 513, 1023, 1025])
+def test_untested_token_counts_do_not_borrow_a_global_profile(monkeypatch, tokens):
+    args = ep_inputs(tokens)
+    lookups, fallbacks = [], []
+    def lookup(*values, **kwargs):
+        lookups.append(values[1])
+        return False, SimpleNamespace(solution_type=None, config=None)
+    monkeypatch.setattr(provider, '_load_aiter_api', lambda: SimpleNamespace(
+        quant_type_w8a8='int8_w8a8', get_config=lookup,
+        aiter_moe=lambda **kw: pytest.fail('untested token count launched'),
+    ))
+    monkeypatch.setattr(provider, '_load_triton_fallback', lambda: lambda **kw: fallbacks.append(kw) or 'fallback')
+    assert provider.apply_aiter_int8_moe(**args, allow_ep_global_profile=True) == 'fallback'
+    assert lookups == [128]
+    assert fallbacks[0]['hidden_states'] is args['hidden_states']
+    assert fallbacks[0]['w1'] is args['w1'] and fallbacks[0]['expert_map'] is args['expert_map']
+    assert fallbacks[0]['use_int8_w8a8'] and fallbacks[0]['per_channel_quant']

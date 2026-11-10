@@ -261,13 +261,29 @@ def apply_aiter_int8_moe(
     # Actual local lookup remains authoritative. Reuse a global routing
     # profile only for the exact installed-stage qualification, never label it
     # a locally tuned config. Other token counts keep whole-call Core fallback.
-    qualified_solutions = {1: 10010, 17: 10009, 128: 10011}
+    # SOL_ID1, SOL_ID2 and sorting block are one qualified plan. Larger M
+    # changes both stages and the block; a matching first stage is insufficient.
+    qualified_profiles = {
+        1: (10010, 20000, 16),
+        2: (10013, 20000, 16),
+        3: (10013, 20000, 16),
+        4: (10013, 20000, 16),
+        8: (10013, 20000, 16),
+        16: (10013, 20000, 16),
+        17: (10009, 20000, 16),
+        32: (10011, 20000, 16),
+        64: (10008, 20000, 16),
+        128: (10011, 20000, 16),
+        256: (10011, 20000, 16),
+        512: (11005, 21000, 32),
+        1024: (12001, 22000, 64),
+    }
     if (not found and allow_ep_global_profile and asm_only
             and expert_map is not None and global_num_experts == 256
             and problem[1:] == (128, 1024, 2048, 2048, 8)
             and getattr(hidden_states, "dtype", None) == torch.bfloat16
             and output_dtype == torch.bfloat16 and activation_name == "silu"
-            and m in qualified_solutions):
+            and m in qualified_profiles):
         profile_found, profile = api.get_config(
             m, global_num_experts, n1, n2, k, top_k, 0,
             getattr(hidden_states, "dtype", None), api.quant_type_w8a8,
@@ -279,8 +295,9 @@ def apply_aiter_int8_moe(
                 and not getattr(profile, "need_shuffle_scale", False)
                 and isinstance(values, dict) and values.get("PADDED_K") is None
                 and not values.get("USE_SHUFFLE", 0)
-                and values.get("SOL_ID1") == qualified_solutions[m]
-                and values.get("SOL_ID2") == 20000 and values.get("BLOCK_SIZE_M") == 16):
+                and tuple(values.get(name) for name in (
+                    "SOL_ID1", "SOL_ID2", "BLOCK_SIZE_M",
+                )) == qualified_profiles[m]):
             found, selected = True, profile
             _record_once(logging.INFO, "selected-ep-global-profile:E256-after-local-miss",
                          problem, "asm", selected)
