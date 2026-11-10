@@ -119,6 +119,70 @@ def test_missing_architecture_field_refuses(patch_mod, monkeypatch):
     assert patch_mod._model_in_scope() is False
 
 
+def test_noted_engine_architectures_arm_the_scope_without_a_config_context(
+    patch_mod, monkeypatch
+):
+    """Review P1: the trunk config context is unavailable during
+    forward, so the builders must note the architectures at build time
+    (they hold the VllmConfig).  Simulate the serving case: no config
+    context at all -- the resolution would otherwise raise forever and
+    the detour would never arm, leaving K3 on the BF16 kernel."""
+    import vllm.config as vcfg
+
+    def _no_context():
+        raise AssertionError("no current vllm config during forward")
+
+    monkeypatch.setattr(
+        vcfg, "get_current_vllm_config", _no_context, raising=False
+    )
+    patch_mod.note_engine_architectures(
+        ("KimiK3ForConditionalGeneration",)
+    )
+    assert patch_mod._A1_SCOPE["resolved"] is True
+    assert patch_mod._model_in_scope() is True
+
+
+def test_noted_out_of_scope_architectures_stay_refused(patch_mod):
+    """A noted non-K3 engine (same geometry, wrong model) stays stock
+    even without any config context to probe."""
+    patch_mod.note_engine_architectures(("DeepseekV3ForCausalLM",))
+    assert patch_mod._model_in_scope() is False
+
+
+def test_builder_note_overrides_and_is_idempotent(patch_mod):
+    """Rebuilds re-note the same engine: latest write wins, both visits
+    agree, and a real K3 note cannot be poisoned by an earlier
+    unresolved probe (and vice versa)."""
+    patch_mod.note_engine_architectures(())
+    assert patch_mod._model_in_scope() is False
+    patch_mod.note_engine_architectures(
+        ("KimiK3ForConditionalGeneration", "KimiLinearForCausalLM")
+    )
+    assert patch_mod._model_in_scope() is True
+    patch_mod.note_engine_architectures(
+        ("KimiK3ForConditionalGeneration",)
+    )
+    assert patch_mod._model_in_scope() is True
+
+
+def test_both_mla_builders_note_the_engine_scope():
+    """The two HCU MLA builders must forward their VllmConfig's
+    architectures into the A1 scope note at __init__ (the capture point
+    review P1 requires)."""
+    flash = pytest.importorskip(
+        "vllm_hcu.v1.attention.backends.mla.flashmla"
+    )
+    triton = pytest.importorskip(
+        "vllm_hcu.v1.attention.backends.mla.triton_mla"
+    )
+    assert "note_engine_architectures" in inspect.getsource(
+        flash.FlashMLAMetadataBuilder.__init__
+    )
+    assert "note_engine_architectures" in inspect.getsource(
+        triton.HcuTritonMLAMetadataBuilder.__init__
+    )
+
+
 def test_scope_is_the_first_semantic_gate_in_execution_order(patch_mod):
     """AST check on the REAL call order (docstrings stripped).
 

@@ -19,7 +19,12 @@ config.json declares it -- plus the K3 linear/MTP variant
 ``model_config.architectures``.  Geometry qk=192/v=128 is the ABI
 filter, never the model identity: DeepSeek-family MLA shares the same
 shape but carries no K3 validation for unit descales / e4m3 noise).
-Unresolved configs stay stock.
+Unresolved configs stay stock.  Known limitation (claude review
+batch-3): the verdict is a process-wide latest-wins latch keyed to one
+engine -- heterogeneous multi-model co-hosting (builders of another
+non-K3 engine constructing later) would overwrite it; the K3+DSpark
+serving pair is homogeneous (both architectures are allowlisted), and
+no other co-hosting is deployed.
 
 Capture-safety contract (cudagraph-capture-safety checklist):
 - FULL graphs never contain this path (uniform-decode batches dispatch to
@@ -100,9 +105,34 @@ _A1_ARCHITECTURES = (
 _A1_SCOPE: dict = {"resolved": False, "ok": False}
 
 
+def note_engine_architectures(architectures) -> None:
+    """Record the engine's architectures at construction time.
+
+    The MLA metadata builders (backends/mla/{flashmla,triton_mla}.py)
+    hand the VllmConfig in directly, so this resolves the scope while
+    the backend is built.  It must not be deferred to the first wrapped
+    call: the trunk makes ``get_current_vllm_config`` unavailable during
+    forward (deepseek_compressor documents it; vllm/config/vllm.py
+    raises outside the setup context), so a first-forward resolution
+    would either raise forever (detour never armed, K3 stays on the
+    BF16 causal-tail kernel this patch exists to avoid) or resolve too
+    late.  Engine rebuilds simply overwrite with the same value --
+    architectures never change within a process.
+    """
+    archs = tuple(str(name) for name in (architectures or ()))
+    _A1_SCOPE["ok"] = any(
+        name in _A1_ARCHITECTURES for name in archs
+    )
+    _A1_SCOPE["resolved"] = True
+
+
 def _model_in_scope() -> bool:
-    """True only when the current engine config is the K3 model family."""
+    """True only when the engine config is the K3 model family."""
     if not _A1_SCOPE["resolved"]:
+        # Setup-time note (note_engine_architectures) is the primary
+        # channel; this config-context probe remains as a fallback for
+        # callers that legitimately run inside a config context (CPU
+        # tests, setup-phase calls before any builder existed).
         try:
             from vllm.config import get_current_vllm_config
 

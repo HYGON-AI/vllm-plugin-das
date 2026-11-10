@@ -201,6 +201,19 @@ class FlashMLAMetadataBuilder(MLACommonMetadataBuilder[FlashMLAMetadata]):
         self.is_fp8_kvcache = is_quantized_kv_cache(
             vllm_config.cache_config.cache_dtype
         )
+        try:
+            from vllm_hcu.patch.worker.core_fix import (
+                patch_mla_prefill_fp8_a1 as _a1_patch,
+            )
+
+            # Build-time scope capture for the A1 prefill detour: the
+            # current-config context is unavailable during forward, so
+            # the patch must learn the architectures here (review P1).
+            _a1_patch.note_engine_architectures(
+                getattr(vllm_config.model_config, "architectures", ())
+            )
+        except Exception:
+            pass
 
         num_sms = num_compute_units(self.device.index)
 
