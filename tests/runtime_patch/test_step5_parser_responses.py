@@ -10,6 +10,10 @@ P2-2: Responses ``FunctionTool`` entries are flat (``name``/``parameters`` on
 the tool), while the inherited XML parser reads ``tool.function.parameters``.
 Without normalization every argument was typed as a string.
 
+P2-3: the inherited streaming parser converts the partial value on every chunk
+and emits only the new suffix, so a chunked boolean or scientific-notation
+number streamed a different, still valid, value than the non-streaming path.
+
 The tokenizer is a stub: the Step5 parsers only read ``get_vocab()`` for the
 ``<think>`` markers. Chat Completions cases stay in this file as guards so a
 future change cannot fix Responses by regressing the existing schema.
@@ -33,6 +37,10 @@ from vllm.entrypoints.openai.responses.protocol import (  # noqa: E402
     ResponsesRequest,
 )
 from vllm.parser.parser_manager import ParserManager  # noqa: E402
+from vllm.tool_parsers.step3p5_tool_parser import (  # noqa: E402
+    Step3p5ToolParser,
+    StreamingXMLToolCallParser,
+)
 
 from vllm_hcu.patch.platform.core_fix import (  # noqa: E402
     patch_step5_reasoning_parser,
@@ -222,6 +230,122 @@ def test_responses_streaming_keeps_schema_types() -> None:
     assert delta is not None
     assert [call.function.name for call in delta.tool_calls] == ["get_weather"]
     assert json.loads(delta.tool_calls[0].function.arguments) == TYPED_ARGUMENTS
+
+
+# --- P2-3: chunked scalars stream the non-streaming value ---------------------
+
+
+def _scalar_tools(value_type: str) -> list[FunctionTool]:
+    return [
+        FunctionTool(
+            type="function",
+            name="set_value",
+            parameters={
+                "type": "object",
+                "properties": {"value": {"type": value_type}},
+            },
+        )
+    ]
+
+
+def _scalar_chat_tools(value_type: str) -> list[dict]:
+    return [
+        {
+            "type": "function",
+            "function": {
+                "name": "set_value",
+                "parameters": {
+                    "type": "object",
+                    "properties": {"value": {"type": value_type}},
+                },
+            },
+        }
+    ]
+
+
+SCALAR_OPEN = "<tool_call>\n<function=set_value>\n<parameter=value>\n"
+SCALAR_CLOSE = "\n</parameter>\n</function>\n</tool_call>"
+
+SCALAR_CASES = [
+    pytest.param("boolean", ["t", "rue"], True, id="boolean-chunked"),
+    pytest.param("boolean", ["true"], True, id="boolean-whole"),
+    pytest.param("boolean", ["fal", "se"], False, id="boolean-false-chunked"),
+    pytest.param("number", ["1", "e", "-", "3"], 0.001, id="number-exponent"),
+    pytest.param("number", ["1.23"], 1.23, id="number-decimal-whole"),
+    pytest.param("number", ["1", ".", "2", "3"], 1.23, id="number-decimal-chunked"),
+    pytest.param("integer", ["1", "2", "3"], 123, id="integer-chunked"),
+]
+
+SCALAR_TOOL_CHOICES = [
+    pytest.param("auto", id="auto"),
+    pytest.param("required", id="required"),
+    pytest.param(ToolChoiceFunction(type="function", name="set_value"), id="named"),
+]
+
+
+def _stream_arguments(parser, request, chunks: list[str]) -> str:
+    """Drive ``parse_delta`` the way the serving layer does, one chunk at a time."""
+    deltas = [("thinking", [2]), ("</think>", [THINK_END_ID])]
+    deltas += [(chunk, [1000 + i]) for i, chunk in enumerate(chunks)]
+    arguments = {}
+    for position, (text, token_ids) in enumerate(deltas, start=1):
+        message = parser.parse_delta(
+            text,
+            token_ids,
+            request,
+            prompt_token_ids=[1, THINK_START_ID],
+            finished=position == len(deltas),
+        )
+        for call in (message.tool_calls if message else None) or []:
+            if call.function and call.function.arguments:
+                arguments[call.index] = (
+                    arguments.get(call.index, "") + call.function.arguments
+                )
+    assert list(arguments) == [0]
+    return arguments[0]
+
+
+@pytest.mark.parametrize("tool_choice", SCALAR_TOOL_CHOICES)
+@pytest.mark.parametrize(("value_type", "chunks", "expected"), SCALAR_CASES)
+def test_responses_chunked_scalar_matches_non_streaming(
+    value_type, chunks, expected, tool_choice
+) -> None:
+    tools = _scalar_tools(value_type)
+    parser, request = _build(tools, tool_choice, ResponsesRequest)
+    reference, reference_request = _build(tools, tool_choice, ResponsesRequest)
+    value = "".join(chunks)
+
+    streamed = _stream_arguments(
+        parser, request, [SCALAR_OPEN, *chunks, SCALAR_CLOSE]
+    )
+    call = _single_call(
+        _parse(
+            reference,
+            reference_request,
+            f"thinking</think>{SCALAR_OPEN}{value}{SCALAR_CLOSE}",
+        )
+    )
+
+    assert streamed == call.arguments
+    assert json.loads(streamed) == {"value": expected}
+    assert type(json.loads(streamed)["value"]) is type(expected)
+
+
+def test_chat_completions_chunked_boolean_matches_non_streaming() -> None:
+    tools = _scalar_chat_tools("boolean")
+    parser, request = _build(tools, "auto", ChatCompletionRequest)
+
+    streamed = _stream_arguments(
+        parser, request, [SCALAR_OPEN, "t", "rue", SCALAR_CLOSE]
+    )
+
+    assert json.loads(streamed) == {"value": True}
+
+
+def test_native_step3p5_keeps_the_inherited_streaming_parser() -> None:
+    parser = Step3p5ToolParser(_tokenizer(), [])
+
+    assert type(parser.parser) is StreamingXMLToolCallParser
 
 
 # --- Chat Completions compatibility ------------------------------------------

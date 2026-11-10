@@ -16,6 +16,9 @@ from typing import TYPE_CHECKING
 from openai.types.responses import FunctionTool
 from openai.types.responses.response import ToolChoiceFunction
 from vllm.entrypoints.generate.base.protocol import (
+    DeltaFunctionCall,
+    DeltaMessage,
+    DeltaToolCall,
     ExtractedToolCallInformation,
     FunctionDefinition,
 )
@@ -26,7 +29,10 @@ from vllm.entrypoints.openai.chat_completion.protocol import (
 )
 from vllm.logger import init_logger
 from vllm.tokenizers import TokenizerLike
-from vllm.tool_parsers.step3p5_tool_parser import Step3p5ToolParser
+from vllm.tool_parsers.step3p5_tool_parser import (
+    Step3p5ToolParser,
+    StreamingXMLToolCallParser,
+)
 
 if TYPE_CHECKING:
     from vllm.entrypoints.openai.responses.protocol import ResponsesRequest
@@ -47,6 +53,22 @@ for _method_name in ("extract_tool_calls", "extract_tool_calls_streaming"):
             f"Step3p5ToolParser.{_method_name} is missing; "
             "re-review the Step5 parser contract"
         )
+for _method_name in (
+    "_char_data",
+    "_end_element",
+    "_emit_delta",
+    "_get_param_type",
+    "_convert_param_value",
+    "_convert_for_json_streaming",
+):
+    if not callable(getattr(StreamingXMLToolCallParser, _method_name, None)):
+        raise RuntimeError(
+            f"StreamingXMLToolCallParser.{_method_name} is missing; "
+            "re-review the Step5 streaming scalar handling"
+        )
+
+_UNSTABLE_SCALAR_PREFIXES = ("int", "uint", "long", "short", "unsigned", "num", "float")
+_UNSTABLE_SCALAR_TYPES = ("boolean", "bool", "binary")
 
 
 def _named_tool_choice_function(
@@ -98,11 +120,94 @@ def _chat_completion_tools(
     return normalized
 
 
+class _Step5StreamingXMLToolCallParser(StreamingXMLToolCallParser):
+    """Hold boolean and numeric values back until their parameter closes.
+
+    The inherited ``_char_data`` converts the value accumulated so far and
+    emits ``output[len(previous_output):]``, which assumes each conversion
+    extends the previous one. ``t`` converts to ``false`` and never becomes
+    ``true``; ``1e-3`` converts to ``0.001``, which does not extend the ``1e-``
+    already sent. Sent text cannot be retracted, so the concatenated arguments
+    are valid JSON holding the wrong value. These values are short, so they are
+    emitted whole from ``_end_element``.
+
+    Only active for streaming extraction: the non-streaming path keeps the
+    inherited code, including what it returns for truncated output.
+    """
+
+    defer_unstable_scalars = False
+
+    def reset_streaming_state(self):
+        super().reset_streaming_state()
+        self._scalar_pending = False
+
+    def _is_deferred_scalar(self, param_name: str) -> bool:
+        if not self.defer_unstable_scalars or self.defer_current_parameter:
+            return False
+        param_type = self._get_param_type(param_name)
+        return (
+            param_type.startswith(_UNSTABLE_SCALAR_PREFIXES)
+            or param_type in _UNSTABLE_SCALAR_TYPES
+        )
+
+    def _char_data(self, data: str):
+        if not (
+            data
+            and self.current_param_name
+            and self._is_deferred_scalar(self.current_param_name)
+        ):
+            super()._char_data(data)
+            return
+
+        # Same newline bookkeeping as the inherited method, minus the emit.
+        if not self.current_param_value and data.startswith("\n"):
+            data = data[1:]
+        if not data:
+            return
+        if self.should_emit_end_newline:
+            data = "\n" + data
+            self.should_emit_end_newline = False
+        if data.endswith("\n"):
+            self.should_emit_end_newline = True
+            data = data[:-1]
+        self.current_param_value += data
+        self._scalar_pending = True
+
+    def _end_element(self, name: str):
+        if (
+            name.startswith("parameter")
+            and self.current_param_name
+            and self._scalar_pending
+        ):
+            self._scalar_pending = False
+            param_type = self._get_param_type(self.current_param_name)
+            arguments = self._convert_for_json_streaming(
+                self._convert_param_value(self.current_param_value, param_type),
+                param_type,
+            )
+            if arguments:
+                self._emit_delta(
+                    DeltaMessage(
+                        tool_calls=[
+                            DeltaToolCall(
+                                index=self.tool_call_index - 1,
+                                id=self.current_call_id,
+                                type="function",
+                                function=DeltaFunctionCall(
+                                    name=None, arguments=arguments
+                                ),
+                            )
+                        ]
+                    )
+                )
+        super()._end_element(name)
+
+
 class Step5ToolParser(Step3p5ToolParser):
     """Tool parser for Step5.
 
     Step5 answers with the same XML tool-call format as Step3.5, so extraction is
-    inherited unchanged. Three inherited behaviours do have to change.
+    inherited unchanged. Four inherited behaviours do have to change.
 
     ``supports_required_and_named`` is False: the generic serving path reads a
     True value as "this model satisfies required/named tool choice through the
@@ -116,6 +221,9 @@ class Step5ToolParser(Step3p5ToolParser):
     ``__init__`` maps Responses ``FunctionTool`` entries onto the Chat
     Completions shape the inherited XML parser reads; ``extract_tool_calls``
     reads the named tool choice from either request schema.
+
+    ``extract_tool_calls_streaming`` holds boolean and numeric values back until
+    the parameter closes; see ``_Step5StreamingXMLToolCallParser``.
     """
 
     supports_required_and_named = False
@@ -126,6 +234,7 @@ class Step5ToolParser(Step3p5ToolParser):
         tools: list[ChatCompletionToolsParam | FunctionTool] | None = None,
     ) -> None:
         super().__init__(tokenizer, _chat_completion_tools(tools))
+        self.parser = _Step5StreamingXMLToolCallParser()
 
     def adjust_request(
         self, request: ChatCompletionRequest | ResponsesRequest
@@ -144,6 +253,7 @@ class Step5ToolParser(Step3p5ToolParser):
     def extract_tool_calls(
         self, model_output: str, request: ChatCompletionRequest | ResponsesRequest
     ) -> ExtractedToolCallInformation:
+        self.parser.defer_unstable_scalars = False
         info = super().extract_tool_calls(model_output, request)
 
         requested = _named_tool_choice_function(request)
@@ -167,6 +277,10 @@ class Step5ToolParser(Step3p5ToolParser):
                 "tool_choice='required' but the model produced no tool call."
             )
         return info
+
+    def extract_tool_calls_streaming(self, *args, **kwargs) -> DeltaMessage | None:
+        self.parser.defer_unstable_scalars = True
+        return super().extract_tool_calls_streaming(*args, **kwargs)
 
 
 __all__ = ["Step5ToolParser"]
