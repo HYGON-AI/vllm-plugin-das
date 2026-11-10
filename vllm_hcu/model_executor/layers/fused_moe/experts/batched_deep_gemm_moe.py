@@ -273,6 +273,20 @@ def persistent_masked_m_silu_mul_quant(
     return y_q, y_s
 
 
+def _w4a8_masked_kernel_weight(weight: torch.Tensor) -> torch.Tensor:
+    """Expose packed N32 storage through the HIPC kernel's rank-3 ABI.
+
+    Packing already reordered the bytes. Only change metadata here; do not
+    transpose or repack the N32 storage.
+    """
+    if weight.ndim == 3:
+        return weight
+    if weight.ndim != 6 or tuple(weight.shape[-3:]) != (4, 32, 8):
+        raise ValueError("Expected rank-3 packed W4A8 weight or rank-6 N32 view")
+    experts, k_blocks, n_blocks = weight.shape[:3]
+    return weight.view(experts, n_blocks * 32, k_blocks * 32)
+
+
 class BatchedDeepGemmExperts(mk.FusedMoEExpertsModular):
     def __init__(
         self,
@@ -529,7 +543,7 @@ class BatchedDeepGemmExperts(mk.FusedMoEExpertsModular):
 
             m_grouped_w4a8_gemm_nt_masked_hipc(
                 (a1q, a1q_scale),
-                (self._deepgemm_w13, self.w1_scale),
+                (_w4a8_masked_kernel_weight(self._deepgemm_w13), self.w1_scale),
                 workspace1,
                 expert_num_tokens,
                 expected_m,
@@ -562,7 +576,7 @@ class BatchedDeepGemmExperts(mk.FusedMoEExpertsModular):
                 )
             m_grouped_w4a8_gemm_nt_masked_hipc(
                 (a2q, a2q_scale),
-                (self._deepgemm_w2, self.w2_scale),
+                (_w4a8_masked_kernel_weight(self._deepgemm_w2), self.w2_scale),
                 output,
                 expert_num_tokens,
                 expected_m,

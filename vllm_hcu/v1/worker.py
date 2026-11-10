@@ -169,7 +169,36 @@ class HcuGPUWorker(Worker):
         from vllm_hcu.model_executor.layers.kimi_k3_mixed_precision import refresh_kimi_kda_fused_qkv
         refresh_kimi_kda_fused_qkv(self.model_runner.model)
 
+    def _start_weight_update(self, is_draft: bool = False) -> None:
+        from vllm_hcu.model_executor.layers.quantization.grouped_w4a16_moe_runtime import (
+            snapshot_grouped_w4a16_scale_owners,
+        )
+
+        if is_draft:
+            get_draft_model = getattr(self.model_runner, "get_draft_model", None)
+            model = get_draft_model() if callable(get_draft_model) else None
+        else:
+            model = self.model_runner.model
+        previous_owners = snapshot_grouped_w4a16_scale_owners(model)
+        super()._start_weight_update(is_draft=is_draft)
+        self._grouped_w4a16_scale_owners = previous_owners
+
     def finish_weight_update(self) -> None:
+        from vllm_hcu.model_executor.layers.quantization.grouped_w4a16_moe_runtime import (
+            snapshot_grouped_w4a16_scale_owners,
+            refresh_grouped_w4a16_scale_caches,
+        )
+
+        if self._weight_update_is_draft:
+            get_draft_model = getattr(self.model_runner, "get_draft_model", None)
+            prior_model = get_draft_model() if callable(get_draft_model) else None
+        else:
+            prior_model = self.model_runner.model
+        previous_grouped_owners = getattr(
+            self, "_grouped_w4a16_scale_owners", None,
+        )
+        if previous_grouped_owners is None:
+            previous_grouped_owners = snapshot_grouped_w4a16_scale_owners(prior_model)
         super().finish_weight_update()
         if self._weight_update_is_draft:
             get_draft_model = getattr(self.model_runner, "get_draft_model", None)
@@ -181,6 +210,18 @@ class HcuGPUWorker(Worker):
         )
 
         refresh_compressor_nt_weights(model)
+        from vllm_hcu.patch.worker.core_fix.patch_deepseek_v4_rocm_wo_a_layout import (
+            refresh_wo_a_bf16_caches,
+        )
+
+        refresh_wo_a_bf16_caches(model)
+        from vllm_hcu.model_executor.layers.quantization.compressed_tensors_w4a8_runtime import (
+            refresh_hcu_w4a8_scale_caches,
+        )
+
+        refresh_hcu_w4a8_scale_caches(model)
+        refresh_grouped_w4a16_scale_caches(model, previous_grouped_owners)
+        self._grouped_w4a16_scale_owners = None
         from vllm_hcu.model_executor.layers.kimi_k3_mixed_precision import refresh_kimi_kda_fused_qkv
         refresh_kimi_kda_fused_qkv(model)
         if not self._weight_update_is_draft:

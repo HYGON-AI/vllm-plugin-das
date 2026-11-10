@@ -26,6 +26,10 @@ from vllm_hcu.forward_context_runtime import (
 )
 from vllm_hcu.patch.config import get_hcu_config
 from vllm_hcu.v1.pcp_manager import make_hcu_pcp_manager_cls
+from vllm_hcu.v1.glm53_pcp_mtp_sync import (
+    install_glm53_pcp_mtp_sync,
+    sync_glm53_pcp_sampler_output,
+)
 from vllm_hcu.patch.platform.core_fix.patch_vllm_config import is_glm53_pcp
 from vllm_hcu.deepseek_v4_runtime import is_deepseek_v4
 
@@ -283,6 +287,26 @@ class HcuGPUModelRunnerV2(GPUModelRunner):
             for model in (self.model, self.get_draft_model()):
                 skinny_lm_head.enable_for_model(model)
 
+    def reload_weights(self, *args, **kwargs) -> None:
+        from vllm_hcu.model_executor.layers.quantization.grouped_w4a16_moe_runtime import (
+            snapshot_grouped_w4a16_scale_owners,
+            refresh_grouped_w4a16_scale_caches,
+        )
+
+        previous_grouped_owners = snapshot_grouped_w4a16_scale_owners(self.get_model())
+        super().reload_weights(*args, **kwargs)
+        from vllm_hcu.patch.worker.core_fix.patch_deepseek_v4_rocm_wo_a_layout import (
+            refresh_wo_a_bf16_caches,
+        )
+
+        refresh_wo_a_bf16_caches(self.get_model())
+        from vllm_hcu.model_executor.layers.quantization.compressed_tensors_w4a8_runtime import (
+            refresh_hcu_w4a8_scale_caches,
+        )
+
+        refresh_hcu_w4a8_scale_caches(self.get_model())
+        refresh_grouped_w4a16_scale_caches(self.get_model(), previous_grouped_owners)
+
     @property
     def pcp_manager_cls(self):
         if self._hcu_pcp_manager_cls is None:
@@ -349,6 +373,8 @@ class HcuGPUModelRunnerV2(GPUModelRunner):
                 "official MRV2 did not initialize the selected HCU PCP manager"
             )
         self._init_host_seq_lens()
+        if not is_profiling:
+            install_glm53_pcp_mtp_sync(self)
         if is_step5_config(self.vllm_config) and getattr(self, "ubatch_runner", None) is not None:
             from vllm_hcu.v1.hcu_dbo import install_runner
 
@@ -477,6 +503,9 @@ class HcuGPUModelRunnerV2(GPUModelRunner):
 
     def sample(self, hidden_states, input_batch, grammar_output):
         out = super().sample(hidden_states, input_batch, grammar_output)
+        # Commit identical PCP decisions before post_update() and KDA state
+        # advancement. The manager can be hidden by sample_tokens() here.
+        out = sync_glm53_pcp_sampler_output(self, out)
         if self._hsl_enabled and input_batch is self._hsl_batch:
             self._hsl_batch = None
             self._hsl_record(input_batch, out[2])

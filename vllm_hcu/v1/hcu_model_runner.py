@@ -5302,6 +5302,12 @@ class GPUModelRunner(
             )
 
         model = self.get_model()
+        from vllm_hcu.model_executor.layers.quantization.grouped_w4a16_moe_runtime import (
+            snapshot_grouped_w4a16_scale_owners,
+            refresh_grouped_w4a16_scale_caches,
+        )
+
+        previous_grouped_owners = snapshot_grouped_w4a16_scale_owners(model)
         weights_to_load = {name for name, _ in model.named_parameters()}
         counter_before_reloading = time.perf_counter()
 
@@ -5339,6 +5345,18 @@ class GPUModelRunner(
                 param = model.get_parameter(name)  # TODO: buffers?
                 param.copy_(loaded_weight)
                 loaded_weights.add(name)
+
+        from vllm_hcu.patch.worker.core_fix.patch_deepseek_v4_rocm_wo_a_layout import (
+            refresh_wo_a_bf16_caches,
+        )
+
+        refresh_wo_a_bf16_caches(model)
+        from vllm_hcu.model_executor.layers.quantization.compressed_tensors_w4a8_runtime import (
+            refresh_hcu_w4a8_scale_caches,
+        )
+
+        refresh_hcu_w4a8_scale_caches(model)
+        refresh_grouped_w4a16_scale_caches(model, previous_grouped_owners)
 
         # logging and validation
         counter_after_reloading = time.perf_counter()
