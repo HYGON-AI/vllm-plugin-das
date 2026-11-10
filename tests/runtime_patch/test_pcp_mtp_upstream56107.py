@@ -129,6 +129,7 @@ def test_mtp_first_forward_is_local_then_feedback_is_global(monkeypatch):
     manager.prepare_draft_prefill(batch, shifted)
     draft = object.__new__(module.HcuPCPMTPSpeculator)
     draft.pcp_manager = manager
+    draft.target_model_state = None
     draft.input_buffers = SimpleNamespace(
         input_ids=shifted.clone(), positions=torch.arange(8)
     )
@@ -305,8 +306,10 @@ def test_runner_binds_local_first_speculator_to_the_real_manager(
     monkeypatch.setattr(module, "maybe_build_pcp_manager", lambda *args: manager)
     runner = module.HcuGPUModelRunnerV2(_config(2), "cpu")
     runner.speculator = SimpleNamespace(pcp_local_prefill=True)
+    runner.model_state = SimpleNamespace()
     runner.initialize_kv_cache(SimpleNamespace(kv_cache_groups=[object()]))
     assert runner.speculator.pcp_manager is manager
+    assert runner.speculator.target_model_state is runner.model_state
 
 
 def test_runner_keeps_pre_hc_residual_local_until_the_first_draft(

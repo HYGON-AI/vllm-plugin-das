@@ -115,6 +115,21 @@ def test_full_per_rank_encoder_and_exact_cache_reserve_survive_decoder(fixture, 
     assert len(f.syncs) >= 2
 
 
+@pytest.mark.parametrize("method,pcp", [("mtp", 16), ("mtp", 1), ("eagle", 16)])
+def test_native_pcp16_mtp_keeps_vision_profile_accounting(fixture, method, pcp):
+    f = fixture
+    f.runner.vllm_config.speculative_config = NS(method=method)
+    f.runner.vllm_config.parallel_config = NS(prefill_context_parallel_size=pcp)
+    if (method, pcp) == ("mtp", 16):
+        with load_profile()(f.runner):
+            assert f.events == [32]
+            assert all(ref() is not None for ref in f.output_refs)
+    else:
+        with pytest.raises(ValueError, match="PCP16 MTP"):
+            with load_profile()(f.runner):
+                pass
+
+
 def test_preprofile_live_cache_does_not_reduce_measured_increment(fixture):
     f = fixture
     live = torch.ones(2, 4)

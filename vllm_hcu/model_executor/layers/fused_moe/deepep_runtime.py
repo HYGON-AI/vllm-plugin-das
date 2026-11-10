@@ -95,11 +95,10 @@ def slimquant_w4a8_uses_deepep_ht(moe_config: object) -> bool:
             "SlimQuant W4A8 PCP HT requires HYV4ForCausalLM "
             "or HYV4VLForConditionalGeneration"
         )
-    if (
-        architectures == ("HYV4VLForConditionalGeneration",)
-        and getattr(config, "speculative_config", None) is not None
-    ):
-        raise ValueError("SlimQuant W4A8 HYV4-VL does not support MTP")
+    speculative = getattr(config, "speculative_config", None)
+    if (architectures == ("HYV4VLForConditionalGeneration",)
+            and speculative is not None and speculative.method != "mtp"):
+        raise ValueError("SlimQuant W4A8 HYV4-VL PCP supports only native MTP")
     if getattr(moe_config, "moe_backend", "auto") not in ("auto", "deep_gemm"):
         raise ValueError(
             "SlimQuant W4A8 PCP HT requires moe_backend='auto' or 'deep_gemm'"

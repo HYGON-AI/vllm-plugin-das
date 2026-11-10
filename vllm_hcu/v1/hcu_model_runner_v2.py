@@ -242,6 +242,7 @@ class HcuGPUModelRunnerV2(GPUModelRunner):
             )
             if getattr(getattr(self, "speculator", None), "pcp_local_prefill", False):
                 self.speculator.pcp_manager = self.pcp_manager
+                self.speculator.target_model_state = self.model_state
         bind_manager = getattr(
             getattr(self, "model_state", None), "bind_pcp_manager", None
         )

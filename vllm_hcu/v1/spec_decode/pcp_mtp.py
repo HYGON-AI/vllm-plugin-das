@@ -30,6 +30,8 @@ class HcuPCPMTPSpeculator(MTPSpeculator):
     def __init__(self, vllm_config, device):
         super().__init__(vllm_config, device)
         self.pcp_manager = None
+        self.target_model_state = None
+        self._draft_idx_mapping = None
         self.draft_is_prefilling = torch.zeros(
             self.max_num_reqs, dtype=torch.bool, device="cpu"
         )
@@ -128,6 +130,7 @@ class HcuPCPMTPSpeculator(MTPSpeculator):
             )
         if manager.draft_target_hidden_states is None:
             raise RuntimeError("PCP MTP requires target-local hidden states")
+        self._draft_idx_mapping = input_batch.idx_mapping[:input_batch.num_reqs]
         last_hidden_states = manager.draft_target_hidden_states
         num_tokens = input_batch.num_tokens_after_padding
         num_reqs = input_batch.num_reqs
@@ -257,6 +260,23 @@ class HcuPCPMTPSpeculator(MTPSpeculator):
 
         return self.draft_tokens[:num_reqs]
 
+    def _draft_positions(self, input_buffers, local, num_tokens):
+        state = self.target_model_state
+        if state is None or getattr(state, "rope_state", None) is None:
+            return input_buffers.positions[:num_tokens]
+        if local is not None:
+            # The target has already prepared and gathered all three axes.
+            return state._local_positions[:, :num_tokens]
+        if self._draft_idx_mapping is None:
+            return input_buffers.positions[:num_tokens]
+        # Subsequent drafts are replicated one-token decode rows. Preserve
+        # each request's image-dependent M-RoPE delta while advancing tokens.
+        count = min(num_tokens, self._draft_idx_mapping.numel())
+        delta = state.rope_state.prefill_delta.gpu[self._draft_idx_mapping[:count]]
+        positions = input_buffers.positions[:num_tokens].clone()
+        positions[:count].add_(delta)
+        return positions.unsqueeze(0).expand(3, -1)
+
     @torch.inference_mode()
     def _run_model(
         self,
@@ -301,7 +321,7 @@ class HcuPCPMTPSpeculator(MTPSpeculator):
 
             model_inputs = dict(
                 input_ids=input_buffers.input_ids[:num_tokens],
-                positions=input_buffers.positions[:num_tokens],
+                positions=self._draft_positions(input_buffers, local, num_tokens),
                 hidden_states=self.hidden_states[:num_tokens],
                 inputs_embeds=inputs_embeds,
             )

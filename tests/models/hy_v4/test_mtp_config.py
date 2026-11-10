@@ -91,20 +91,22 @@ def test_mtp_rejects_non_single_layer_extension(layer_idx, length):
         mtp._make_mtp_layer_config(config, layer_idx)
 
 
-def test_mtp_config_adapter_uses_current_speculative_owner_and_registers_callback():
+@pytest.mark.parametrize("model_type", ["hy_v4", "hy_v4_vl"])
+def test_mtp_config_adapter_uses_current_speculative_owner_and_registers_callback(model_type):
     adapter = _module("vllm_hcu.patch.platform.core_fix.patch_hy_v4_mtp_config")
     import vllm.config.speculative as speculative
     from vllm_hcu.patch.platform.core_fix import platform_core_callback_names
 
     adapter.apply_to_module(speculative)
     target = HYV4Config(num_hidden_layers=2, architectures=["HYV4ForCausalLM"])
+    target.model_type = model_type
     target.quantization_config = {"activation_scheme": "static"}
     draft = speculative.SpeculativeConfig.hf_config_override(copy.deepcopy(target))
     assert draft.model_type == "hy_v4_mtp"
     assert draft.architectures == ["HYV4MTPModel"]
     assert draft.n_predict == 1 and draft.hc_mult == 1
     assert draft.quantization_config == target.quantization_config
-    assert target.hc_mult == 4 and target.model_type == "hy_v4"
+    assert target.hc_mult == 4 and target.model_type == model_type
     assert "hy_v4_mtp" in get_args(speculative.MTPModelTypes)
     assert (adapter.PATCH_ID, adapter.TARGET_MODULE) in platform_core_callback_names()
     assert adapter.apply_to_module(speculative) is False

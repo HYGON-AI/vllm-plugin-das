@@ -291,6 +291,11 @@ class HYV4VisionTransformer(HunYuanVisionTransformer):
 class HYV4VLForConditionalGeneration(
     HYV4ForCausalLM, SupportsMultiModal, SupportsMRoPE
 ):
+    def get_language_model(self):
+        # This class directly owns the causal-LM interface. Native MTP shares
+        # embeddings through get_language_model().model, not the bare backbone.
+        return self
+
     @classmethod
     def get_model_state_cls(cls):
         from .vl_mrv2 import HYV4VLModelState
@@ -316,8 +321,9 @@ class HYV4VLForConditionalGeneration(
             raise ValueError(
                 "HYV4VL requires rmsnorm_mlp_adapter without extra tokens or post norm"
             )
-        if vllm_config.speculative_config is not None:
-            raise ValueError("HYV4VL speculative decoding is not validated")
+        if (vllm_config.speculative_config is not None
+                and vllm_config.parallel_config.prefill_context_parallel_size != 16):
+            raise ValueError("HYV4VL MTP requires the standalone PCP16 path")
         super().__init__(vllm_config=vllm_config, prefix=prefix)
         from vllm_hcu.patch.platform.core_fix.patch_vllm_config import (
             validate_hyv4_vl_pcp_quantization,
