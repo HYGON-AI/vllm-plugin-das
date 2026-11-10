@@ -146,6 +146,55 @@ def test_mooncake_uses_v028_page_layout(mooncake):
 
 
 @pytest.mark.parametrize(
+    ("indexer_n_heads", "disable_qsa", "expected"),
+    [(8, None, "BLHNC"), (8, "0", "BLHNC"), (8, "1", "LBHNC"), (None, None, "LBHNC")],
+)
+def test_mooncake_layout_follows_qwen4_exp_qsa(
+    mooncake, monkeypatch, indexer_n_heads, disable_qsa, expected
+):
+    """QSA supports only block-first layouts; BLHNC keeps heads contiguous."""
+    if disable_qsa is None:
+        monkeypatch.delenv("VLLM_HCU_DISABLE_QSA", raising=False)
+    else:
+        monkeypatch.setenv("VLLM_HCU_DISABLE_QSA", disable_qsa)
+    hf_config = SimpleNamespace(indexer_n_heads=indexer_n_heads)
+    config = SimpleNamespace(
+        model_config=SimpleNamespace(use_mla=False, hf_text_config=hf_config)
+    )
+    assert mooncake.MooncakeConnector.get_required_kvcache_layout(config) == expected
+
+
+def test_qsa_layout_is_resolved_and_registrable(mooncake):
+    from vllm.models.qwen4_exp.common.qsa_cache import QSAStateBackend
+    from vllm.v1.kv_cache_interface import KVCacheTensor, create_kv_cache_views
+    from vllm.v1.kv_cache_layout import KVCacheLayout
+
+    assert KVCacheLayout.BLHNC in QSAStateBackend.supported_kv_cache_layouts()
+    assert KVCacheLayout.LBHNC not in QSAStateBackend.supported_kv_cache_layouts()
+
+    name = "model.layers.0.self_attn"
+    spec = mooncake.FullAttentionSpec(
+        block_size=16, num_kv_heads=2, head_size=8, dtype=torch.float16
+    )
+    raw = torch.zeros(4 * spec.page_size_bytes, dtype=torch.int8)
+    placement = KVCacheTensor(
+        size=raw.numel(), layers=[name],
+        layer_stride=raw.numel(), block_stride=spec.page_size_bytes,
+    )
+    for layout, ok in ((KVCacheLayout.BLHNC, True), (KVCacheLayout.BLNHC, False)):
+        cache = create_kv_cache_views(raw, spec, 4, layout, placement)[0]
+        worker = _worker(mooncake, blocks_first=False, tp_size=1)
+        worker._layer_specs[name] = spec
+        worker._layer_group_indices[name] = 0
+        if ok:
+            worker.register_kv_caches({name: cache})
+            assert worker.kv_block_len_per_layer == [spec.page_size_bytes]
+        else:
+            with pytest.raises(ValueError, match="BLHNC when Qwen4Exp QSA"):
+                worker.register_kv_caches({name: cache})
+
+
+@pytest.mark.parametrize(
     ("overrides", "message"),
     [
         ({"remote_block_lens": [64, 64]}, "inconsistent cache-entry counts"),

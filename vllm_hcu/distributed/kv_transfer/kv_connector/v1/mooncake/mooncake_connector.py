@@ -4,6 +4,7 @@
 # Modified by Hygon Information Technology Co., Ltd., 2026.
 import asyncio
 import logging
+import os
 import re
 import threading
 import time
@@ -93,6 +94,16 @@ def _is_mamba_group_spec(spec: KVCacheSpec) -> bool:
             f"{sorted(spec.kv_cache_specs)}."
         )
     return kinds.pop()
+
+
+def _uses_qwen4_exp_qsa(model_config) -> bool:
+    # Mirrors Qwen4Exp's own switch; VLLM_HCU_DISABLE_QSA=1 builds dense layers.
+    if os.environ.get("VLLM_HCU_DISABLE_QSA", "0") == "1":
+        return False
+    hf_config = getattr(model_config, "hf_text_config", None) or getattr(
+        model_config, "hf_config", None
+    )
+    return getattr(hf_config, "indexer_n_heads", None) is not None
 
 
 def ttft_trace_enabled() -> bool:
@@ -918,11 +929,16 @@ class MooncakeConnector(KVConnectorBase_V1, SupportsHMA):
             or vllm_config.model_config.use_mla
         ):
             return None
+        # Both layouts keep whole heads contiguous in each per-layer page. QSA
+        # packs its side pages beside the main KV inside each block and only
+        # supports block-first layouts, so LBHNC would fall back to BLNHC.
+        layout = "BLHNC" if _uses_qwen4_exp_qsa(vllm_config.model_config) else "LBHNC"
         logger.info_once(
-            "HCU MooncakeConnector setting KV cache layout to LBHNC for "
-            "heterogeneous TP-safe KV transfer."
+            "HCU MooncakeConnector setting KV cache layout to %s for "
+            "heterogeneous TP-safe KV transfer.",
+            layout,
         )
-        return "LBHNC"
+        return layout
 
     ############################################################
     # Scheduler Side Methods
@@ -2322,7 +2338,8 @@ class MooncakeConnectorWorker:
             if not cache[0].is_contiguous():
                 raise ValueError(
                     "HCU Mooncake requires canonical contiguous [H, N, C] "
-                    f"page contents; layer={layer_name}. Use KV cache layout LBHNC."
+                    f"page contents; layer={layer_name}. Use KV cache layout "
+                    "LBHNC, or BLHNC when Qwen4Exp QSA is enabled."
                 )
             base_addr = cache.data_ptr()
             block_len = cache.stride(0) * cache.element_size()
