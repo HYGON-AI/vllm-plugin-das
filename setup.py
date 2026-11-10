@@ -134,19 +134,14 @@ def get_version() -> str:
 # --- 2. 定义 C++ 扩展模块 ---
 # =========================================================
 # 建议将生成的 .so 放到包名路径下，例如 vllm_hcu.cache_ops
-_BUILD_STEP5_DENSE = os.getenv("VLLM_HCU_BUILD_STEP5_DENSE", "0") == "1"
-
 ext_modules = [
     CUDAExtension(
         name='vllm_hcu.hcu_ops',
         sources=['vllm_hcu/csrc/hcu_cache_kernel.cu',
                  'vllm_hcu/csrc/torch_bindings.cpp',
                  'vllm_hcu/csrc/custom_all_reduce.cu',
-                 'vllm_hcu/csrc/fused_deepseek_v4_inv_rope_kernel.cu',
-                 ] + (['vllm_hcu/csrc/step5_fp8_dense.cpp'] if _BUILD_STEP5_DENSE else []),
-        libraries=['hipblaslt', 'dl'] if _BUILD_STEP5_DENSE else [],
-        define_macros=[('TORCH_EXTENSION_NAME', 'hcu_ops')] + (
-            [('VLLM_HCU_BUILD_STEP5_DENSE', '1')] if _BUILD_STEP5_DENSE else []),
+                 'vllm_hcu/csrc/fused_deepseek_v4_inv_rope_kernel.cu'],
+        define_macros=[('TORCH_EXTENSION_NAME', 'hcu_ops')],
         extra_compile_args={
             'cxx': ['-O3'],
             'nvcc': ['-O3', '-fno-gpu-rdc']

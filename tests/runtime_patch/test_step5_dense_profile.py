@@ -31,9 +31,9 @@ def runtime(monkeypatch):
     monkeypatch.setitem(sys.modules, module.__name__, module)
     calls = []
 
-    def op(x, xs, w, ws, selected, create):
+    def op(x, xs, w, ws, selected):
         assert xs.shape[0] == x.shape[0]
-        calls.append((x.shape[0], selected, create))
+        calls.append((x.shape[0], selected))
         return 'output'
 
     scope = {
@@ -44,10 +44,10 @@ def runtime(monkeypatch):
         '_BY_NK': {(14080, 4096): [(1536, 1), (4096, 2), (8192, 3)]},
         '_CHOICES': {(m, 14080, 4096): i for m, i in [(1536, 1), (4096, 2), (8192, 3)]},
         '_UNSPLIT_PROFILE_ROWS': 8192, '_warmed': set(), '_unsupported_devices': set(),
-        '_lock': threading.RLock(), '_native_gemm': lambda: op,
+        '_lock': threading.RLock(), '_aiter_gemm': lambda device: op,
         'logger': SimpleNamespace(info=lambda *a, **k: None),
     }
-    exec(compile(ast.fix_missing_locations(ast.Module(body=[fn], type_ignores=[])), str(path), 'exec'), scope)
+    exec(compile(ast.Module(body=[fn], type_ignores=[]), str(path), 'exec'), scope)
 
     def run(rows):
         return scope['tuned_fp8_gemm'](Tensor(rows, 4096), Tensor(rows, 1), Tensor(14080, 4096), Tensor(14080, 1))
@@ -59,12 +59,12 @@ def runtime(monkeypatch):
 def test_larger_startup_prepares_every_tuned_shape_before_serving(runtime, rows):
     run, scope, phase, calls = runtime
     result = run(rows)
-    assert calls[:3] == [(1536, 1, True), (4096, 2, True), (8192, 3, True)]
+    assert calls[:3] == [(1536, 1), (4096, 2), (8192, 3)]
     assert scope['_warmed'] == {(0, 14080, 4096)}
     assert result == ('output' if rows == 8192 else None)
     calls.clear();phase.dbo = True
     assert run(4096) == 'output'
-    assert calls == [(4096, 2, False)]
+    assert calls == [(4096, 2)]
 
 
 @pytest.mark.parametrize('rows', [1536, 4096])
@@ -92,7 +92,7 @@ def test_profile_must_cover_the_largest_external_recipe(runtime):
         run(8192)
     assert not calls
     assert run(32768) is None
-    assert calls == [(1536, 1, True), (4096, 2, True), (8192, 3, True), (16384, 4, True)]
+    assert calls == [(1536, 1), (4096, 2), (8192, 3), (16384, 4)]
 
 
 def test_small_untuned_batch_keeps_the_original_fallback(runtime):
