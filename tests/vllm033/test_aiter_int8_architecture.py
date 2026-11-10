@@ -87,16 +87,10 @@ def _scenario_supported(architecture, drift="value"):
                     torch.empty((128,1024,1),device='meta'),
                     torch.empty((128,2048,1),device='meta'),None,None,
                     per_act_token_quant=True)
-                if architecture == 'gfx936':
-                    assert oracle.select_int8_moe_backend(ep)[1] is HcuAiterInt8Experts
-                    assert isinstance(HcuAiterInt8Experts(ep,quant),HcuAiterInt8Experts)
-                else:
-                    with pytest.raises(ValueError,match='gfx936'):
-                        oracle.select_int8_moe_backend(ep)
-                    with pytest.raises(ValueError,match='gfx936'):
-                        HcuAiterInt8Experts(ep,quant)
+                assert oracle.select_int8_moe_backend(ep)[1] is HcuAiterInt8Experts
+                assert isinstance(HcuAiterInt8Experts(ep,quant),HcuAiterInt8Experts)
                 return dict(architecture=architecture,tp1=selected.value,
-                    ep2='admitted' if architecture == 'gfx936' else 'refused')
+                    ep2='admitted')
             if drift == 'value':
                 provider_architecture[0] = 'gfx936' if architecture == 'gfx938' else 'gfx938'
             else:
@@ -239,7 +233,7 @@ def test_route_program_source_changes_invalidate_prepared_content_identity():
     assert _run_scenario('_scenario_route_source_drift')['route_source_drift_refused']
 
 
-@pytest.mark.parametrize('architecture,ep2', [('gfx936','admitted'),('gfx938','refused')])
+@pytest.mark.parametrize('architecture,ep2', [('gfx936','admitted'),('gfx938','admitted')])
 def test_public_selection_and_constructor_preserve_qualified_ep2_scope(architecture,ep2):
     assert _run_scenario('_scenario_supported',architecture,'ep-scope') == dict(
         architecture=architecture,tp1='aiter',ep2=ep2)

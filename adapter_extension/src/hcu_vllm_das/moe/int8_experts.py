@@ -39,8 +39,8 @@ def config_rejection(config):
     if p.use_ep:
         from hcu_adapter.bridges.vllm import detect_hcu
         detection = detect_hcu()
-        if not detection.detected or detection.architecture != 'gfx936':
-            return 'INT8 ASM EP2 is qualified only on gfx936'
+        if not detection.detected or detection.architecture not in ('gfx936', 'gfx938'):
+            return 'INT8 ASM EP2 is qualified only on gfx936/gfx938'
     if m.aiter_fmoe_shared_expert_enabled:
         return 'INT8 ASM shared expert fusion is not validated'
     if (m.hidden_dim != m.hidden_dim_unpadded
