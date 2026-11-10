@@ -118,6 +118,20 @@ class HcuTritonMLAMetadataBuilder(TritonMLAMetadataBuilder):
 
     def __init__(self, kv_cache_spec, layer_names, vllm_config, device):
         super().__init__(kv_cache_spec, layer_names, vllm_config, device)
+        try:
+            from vllm_hcu.patch.worker.core_fix import (
+                patch_mla_prefill_fp8_a1 as _a1_patch,
+            )
+
+            # Build-time scope capture for the A1 prefill detour (review
+            # P1): the builder owns the VllmConfig -- the current-config
+            # context is unavailable during forward, so the patch cannot
+            # resolve scope on its first wrapped call.
+            _a1_patch.note_engine_architectures(
+                getattr(vllm_config.model_config, "architectures", ())
+            )
+        except Exception:
+            pass
         cache_dtype = vllm_config.cache_config.cache_dtype
         page = getattr(kv_cache_spec, "block_size", None)
         group_non_causal = getattr(
@@ -221,26 +235,47 @@ class HcuTritonMLAMetadataBuilder(TritonMLAMetadataBuilder):
             # LEDGER-only snapshot of the pool bound at construction
             # time: zero in the V1 profiling epoch (num_gpu_blocks is
             # assigned only after initialize_kv_cache). The authoritative
-            # bound is read per fill in _fill_flash_sched.
-            n_gpu_blocks = getattr(
-                vllm_config.cache_config, "num_gpu_blocks", 0
-            ) or 0
-            self._hcu_pool_pages = int(n_gpu_blocks) * subpage
+            # bound is read per fill in _fill_flash_sched. Same
+            # manager/kernel ratio as the authoritative clamp, so the
+            # ledger number is comparable with what actually guards the
+            # expanded ids (claude review batch-3: the old subpage
+            # scaling here pointed triage at a wrong bound).
+            _ledger_mgr = int(
+                getattr(vllm_config.cache_config, "block_size", 0) or 0
+            )
+            _ledger_ratio = (
+                _ledger_mgr // _FLASH_PAGE_BLOCK
+                if _ledger_mgr >= _FLASH_PAGE_BLOCK
+                and _ledger_mgr % _FLASH_PAGE_BLOCK == 0
+                else 1
+            )
+            n_gpu_blocks = int(
+                getattr(vllm_config.cache_config, "num_gpu_blocks", 0) or 0
+            )
+            self._hcu_pool_pages = n_gpu_blocks * _ledger_ratio
             # Faulthunt VA ledger (2026-10-27): one line per rank mapping
             # every persistent tensor address+extent, so a fault VA can be
             # placed against (or between) tensor bounds without a rerun.
             # fix13 adds reuse=/gen=: acceptance = every address pair
             # logged once per rebuild wave with reuse=yes gen=N/N+1.
+            # Extents are read from the tensors themselves (review P3):
+            # the hardcoded "+64 rows x8" was only true at num_sms=16 and
+            # "max_seqs" under-reported the nsplits allocation by its
+            # spare row, so a fault there read as out-of-bounds (KV-pool
+            # suspicion) -- exactly the misattribution this ledger exists
+            # to prevent.
             _vllogger.info(
                 "HcuTritonMLA VA-LEDGER dev=%s reuse=%s gen=%d "
-                "sched=[0x%x +64 rows x8] nsplits=[0x%x +%d] "
+                "sched=[0x%x +%d rows x%d] nsplits=[0x%x +%d] "
                 "bt=[0x%x +%d B (%dx%d i32)] pool_pages=%d",
                 device,
                 "yes" if self._hcu_buf_reused else "no",
                 self._hcu_buf_gen,
                 self._hcu_sched_buf.data_ptr(),
+                self._hcu_sched_buf.shape[0],
+                self._hcu_sched_buf.shape[1],
                 self._hcu_nsplits_buf.data_ptr(),
-                max_seqs,
+                self._hcu_nsplits_buf.numel(),
                 self._hcu_bt_buf.data_ptr(),
                 self._hcu_bt_buf.numel() * 4,
                 max_seqs, self._hcu_bt_width,
@@ -383,10 +418,28 @@ class HcuTritonMLAMetadataBuilder(TritonMLAMetadataBuilder):
         # constructor snapshot can be zero -- read it per fill and refuse
         # to fill without a pool (else the clamp silently no-ops and
         # out-of-pool null ids reach the kernel).
+        # The kernel walks the cache in 64-token pages while
+        # num_gpu_blocks counts MANAGER blocks (review P1: e.g. the Kimi
+        # 1536-token manager over a 64-token layer page).  Clamp against
+        # the manager/kernel-page ratio -- the same formula (and the same
+        # junk-page incident) the FlashMLA builder's _pages_per_block
+        # fixed; scaling by the layer-spec subpage count clamps valid
+        # kernel-page ids down to the manager-block count and makes
+        # draft attention read unrelated pages.
+        _mgr_block = int(
+            getattr(self.vllm_config.cache_config,
+                    "block_size", 0) or 0
+        )
+        _pages_per_block = (
+            _mgr_block // _FLASH_PAGE_BLOCK
+            if _mgr_block >= _FLASH_PAGE_BLOCK
+            and _mgr_block % _FLASH_PAGE_BLOCK == 0
+            else 1
+        )
         pool_pages = int(
             getattr(self.vllm_config.cache_config,
                     "num_gpu_blocks", 0) or 0
-        ) * subpage
+        ) * _pages_per_block
         if pool_pages <= 0:
             raise RuntimeError(
                 "hcu flash fill refused: KV pool size not yet assigned "
