@@ -21,6 +21,8 @@ from vllm.v1.attention.backends.utils import (
     reshape_attn_output_for_spec_decode,
     reshape_query_for_spec_decode,
 )
+from vllm_hcu.platforms import envs as henvs
+from vllm_hcu.platforms.hcu import on_gfx938
 
 logger = init_logger(__name__)
 
@@ -74,11 +76,20 @@ _FLASH_BUF_REGISTRY: dict = {}
 
 
 def _flash_gate_enabled() -> bool:
-    # FIX13: always on wherever the buffers can exist; the guard chain in
+    # FIX13: wherever the buffers can exist the guard chain in
     # forward_mqa/_fill_flash_sched retains every correctness gate
     # (non-causal group, multi-row query, fp8 kv, page geometry, vendor
     # ops import).
-    return True
+    # Review P2: the fast path ends in the vendor FlashMLA ops, so it
+    # also sits under the custom-op master. With
+    # VLLM_HCU_USE_CUSTOM_OPS=0 the platform deliberately selects this
+    # backend to AVOID the FlashMLA provider (hcu.py
+    # _use_triton_mla_master_fallback); honoring the same switch here
+    # keeps the native Triton kernels serving every group and preserves
+    # the rollback switch plus master-off comparisons. The env master
+    # is read per call (envs.optional_custom_op_enabled), so a master
+    # flip is visible without re-importing the module.
+    return henvs.optional_custom_op_enabled()
 
 
 def _dense_flash_ok() -> bool:
@@ -125,6 +136,12 @@ class HcuTritonMLAMetadataBuilder(TritonMLAMetadataBuilder):
             and _dense_flash_ok()
             and _is_flash_kv_dtype(cache_dtype)
             and subpage is not None
+            # Review P2: the fast path ends in flash_mla_with_kvcache_fp8,
+            # whose off-gfx938 branch (fwd_kvcache_quantization_mla)
+            # receives an unquantized bf16 query and no descale_q -- the
+            # quantized-query contract below is gfx938-only, so keep the
+            # whole fast path on gfx938 hardware.
+            and on_gfx938()
         )
         _vllogger.debug(
             "HcuTritonMLA: non-causal group %s flash_ready=%s "
@@ -440,6 +457,11 @@ class HcuTritonMLAImpl(TritonMLAImpl):
             # capture-context exclusion); the registry keeps the bound
             # buffers alive across any builder rebuild.
             and _is_flash_kv_dtype(self.kv_cache_dtype)
+            # Review P2: quantized-query fast path is a gfx938 kernel
+            # contract (see the builder gate); re-checked here so a
+            # stale builder cannot route off-gfx938 hardware into the
+            # quantization-mla branch.
+            and on_gfx938()
             # The vendor kernel walks 64-token pages. A manager block of
             # any whole multiple works through an expanded block table;
             # anything else is a device-side abort, so gate before launch.
