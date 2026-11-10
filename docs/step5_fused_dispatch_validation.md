@@ -44,6 +44,10 @@ to a communicator-local quant plus the standard gather (identical outputs).
 
 ## E2E decode performance
 
+The R3 result below is measured on the frozen target base with the DSA resident-selector
+change **not applied**: it is the **UP-02 on DSASEL-OFF** configuration. It must not be
+presented as the increment on the formal DSASEL-ON baseline.
+
 Target-base validation (frozen upstream base `5f181a36…`, matched pair, order BA, symmetric env):
 **R3 (128K ctx, BS50, MTP3): +1.71 % (Welch t=9.92, df=4.00, p=0.00058)**. ITL reduced from
 88.87 ms (baseline) to 87.38 ms (candidate). All formal rounds (3/3 per leg) audit-clean, 50/50
@@ -66,10 +70,25 @@ the fused kernel) and fixed by the world-2-only deferral in this change.
 The DSASEL + fused-dispatch stack result is a separate optimization combination and is not
 reported here as the fused-dispatch gain.
 
+### UP-02 on the formal DSASEL-ON baseline
+
+The standalone DSASEL-ON measurements available at delivery time are:
+
+| workload | throughput delta | Welch p | conclusion |
+|---|---:|---:|---|
+| R2 (128K BS32) | +1.06 % | 0.24 | not significant |
+| R1 (128K BS16) | +0.79 % | ≈0.54 | not significant |
+
+Neither result establishes a DSASEL-ON gain; this change claims no statistically significant
+increment on that baseline. A powered DSASEL-ON A/B remains a GPU-window action, not a
+correctness claim.
+
 ## Compatibility
 
-The patch targets `v0.28.1-dev` (frozen upstream base SHA `5f181a36c0e5b9749…`). Runtime
-validation was performed on both the Step5 development lineage and the frozen target base:
+The patch targets `v0.28.1-dev` (runtime validation used the frozen upstream base SHA
+`5f181a36c0e5b9749…`; the delivery branch was later synced to `061d8bd` and no functional
+overlap exists between that base delta and the six files changed here). Runtime validation was
+performed on both the Step5 development lineage and the frozen target base:
 
 - **Target-base model equivalence**: two vLLM servers, same session/config, 16 × 128K prompts,
   greedy 64 tokens; both legs produced `outputs_sha256 85bc95cccc321744…`, 16/16
