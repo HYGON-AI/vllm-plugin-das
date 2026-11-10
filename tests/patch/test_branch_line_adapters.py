@@ -60,13 +60,28 @@ def test_branch_line_adapter_is_importable_with_contract(module_name):
     assert Path(module.__file__).stem in module_name
 
 
-def test_nc_qcat_is_opt_in_by_default():
+def test_nc_qcat_is_opt_in_by_default(monkeypatch):
     from vllm_hcu.patch.worker.op_opt import patch_kimi_k3_nc_qcat as qcat
 
     assert getattr(qcat, "_ENV", "VLLM_HCU_K3_QCAT_TRITON") == (
         "VLLM_HCU_K3_QCAT_TRITON"
     )
     # Opt-in: vendor op was cleared of blame for the DSpark poison.
+    monkeypatch.delenv("VLLM_HCU_K3_QCAT_TRITON", raising=False)
+    monkeypatch.delenv("VLLM_HCU_USE_CUSTOM_OPS", raising=False)
+    assert qcat._enabled() is False
+
+
+def test_nc_qcat_child_opt_in_resolves_under_the_master(monkeypatch):
+    """Review P2: the child opt-in routes into a custom Triton op, so it
+    only arms under the custom-op master -- VLLM_HCU_USE_CUSTOM_OPS=0
+    keeps the vendor op even with the child flag set."""
+    from vllm_hcu.patch.worker.op_opt import patch_kimi_k3_nc_qcat as qcat
+
+    monkeypatch.setenv("VLLM_HCU_K3_QCAT_TRITON", "1")
+    monkeypatch.setenv("VLLM_HCU_USE_CUSTOM_OPS", "1")
+    assert qcat._enabled() is True
+    monkeypatch.setenv("VLLM_HCU_USE_CUSTOM_OPS", "0")
     assert qcat._enabled() is False
 
 

@@ -58,8 +58,17 @@ _INSTALLED: tuple | None = None
 def _enabled() -> bool:
     # Opt-in: the vendor op was cleared of blame (the DSpark poison traced to
     # the NC fast path instead), so this capture-safe replacement stays off
-    # unless an operator asks for it.
-    return os.environ.get(_ENV, "0").strip().lower() in ("1", "true", "yes")
+    # unless an operator asks for it.  And because the child flag routes
+    # into a custom Triton replacement, it only resolves under the
+    # repository custom-op master (review P2): with
+    # VLLM_HCU_USE_CUSTOM_OPS=0 every optional custom path -- this one
+    # included -- stays on the vendor op.
+    requested = os.environ.get(_ENV, "0").strip().lower() in (
+        "1", "true", "yes",
+    )
+    from vllm_hcu.platforms.envs import optional_custom_op_enabled
+
+    return optional_custom_op_enabled(requested)
 
 
 def _rebind_consumers(original, patched) -> int:
