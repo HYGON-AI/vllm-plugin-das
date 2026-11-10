@@ -105,6 +105,7 @@ def _prepare_identity(native, moe, architecture):
     modules = [native, moe, asm, jit, chip_info, import_module('hcu_vllm_das.moe.int8_experts'),
                import_module('hcu_vllm_das.moe.fused_moe_aiter'),
                import_module('hcu_vllm_das.moe.int8_asm'),
+               import_module('hcu_vllm_das.moe.int8_routes'),
                import_module('hcu_vllm_das.moe.int8_identity'),
                import_module(__name__)]
     modules += [jit.get_module(name) for name in ('module_cpp_api', 'module_moe_asm')]

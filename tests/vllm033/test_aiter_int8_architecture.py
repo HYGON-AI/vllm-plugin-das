@@ -196,6 +196,49 @@ def test_replaced_provider_architecture_module_refuses_later_public_selection():
     assert _run_scenario('_scenario_supported', 'gfx938', 'module')['provider_drift_refused'] == 'module'
 
 
+def _scenario_route_source_drift():
+    """A changed integer route program must invalidate the real content factor."""
+    import importlib
+    from types import SimpleNamespace
+    from hcu_vllm_das import int8_activation as owner
+    assert 'aiter.fused_moe_asm_wna16' not in sys.modules
+    with tempfile.TemporaryDirectory() as folder:
+        root=Path(folder)
+        def fixture(name):
+            module=ModuleType(name);path=root/(name.replace('.','_')+'.fixture')
+            path.write_text('CPU identity fixture; never loaded as native code')
+            module.__file__=str(path);return module
+        native=fixture('aiter');moe=fixture('aiter.moe')
+        chip=fixture('aiter.jit.utils.chip_info');chip.get_gfx=lambda:'gfx936'
+        asm=fixture('aiter.fused_moe_asm_wna16');jit=fixture('aiter.jit.core')
+        route=fixture('hcu_vllm_das.moe.int8_routes')
+        native.moe_sorting_fwd=lambda:None;native.asm_fmoe_a8=lambda:None
+        moe.get_aiter_moe_config=lambda:None;asm.get_moe_asm_solution=lambda:None
+        config=root/'channel.csv';config.write_text('CPU fixture,not a vendor config')
+        asm.get_csv_path=lambda *_:str(config)
+        asm.MoeQuantType=SimpleNamespace(INT8_W8A8_C=object())
+        asm.load_and_cache_csv_for_quant=lambda *_:True
+        codeobjects=root/'objects';codeobjects.mkdir()
+        (codeobjects/'cpu.fixture.co').write_text('CPU identity fixture,not a GPU binary')
+        jit.get_asm_dir=lambda:str(codeobjects)
+        modules={name:fixture(name)for name in('module_cpp_api','module_moe_asm')}
+        jit.get_module=lambda name:modules[name]
+        external={m.__name__:m for m in(native,moe,chip,asm,jit,route)}
+        def acquire(name):
+            return external[name] if name in external else importlib.import_module(name)
+        with patch.object(owner,'import_module',side_effect=acquire):
+            identity,_,_=owner._prepare_identity(native,moe,'gfx936')
+            identity.validate()
+            Path(route.__file__).write_text('Changed CPU route source fixture')
+            with pytest.raises(RuntimeError,match='files changed'):
+                identity.validate()
+    return dict(route_source_drift_refused=True)
+
+
+def test_route_program_source_changes_invalidate_prepared_content_identity():
+    assert _run_scenario('_scenario_route_source_drift')['route_source_drift_refused']
+
+
 @pytest.mark.parametrize('architecture,ep2', [('gfx936','admitted'),('gfx938','refused')])
 def test_public_selection_and_constructor_preserve_qualified_ep2_scope(architecture,ep2):
     assert _run_scenario('_scenario_supported',architecture,'ep-scope') == dict(

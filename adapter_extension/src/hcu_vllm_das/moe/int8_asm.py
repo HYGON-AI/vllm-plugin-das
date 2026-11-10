@@ -87,6 +87,9 @@ def unsupported_reason(arguments: dict[str, object], native: object) -> str | No
 
 def _prepare_sorting_routes(topk_ids, expert_map, global_num_experts, local_num_experts):
     """Preserve canonical local slots and keep padding out of native sorting."""
+    if expert_map is not None and topk_ids.is_cuda:
+        from .int8_routes import prepare
+        return prepare(topk_ids, expert_map, global_num_experts, local_num_experts)
     if expert_map is None and topk_ids.dtype == torch.int32:
         return topk_ids, global_num_experts
     valid = (topk_ids >= 0) & (topk_ids < global_num_experts)
