@@ -36,6 +36,11 @@ def config_rejection(config):
         or m.experts_per_token != 8 or m.elastic_ep_max_dp_size not in (None, 1)
     ):
         return 'INT8 ASM EP2 requires qualified BF16 E256/local128/H2048/N512/top8'
+    if p.use_ep:
+        from hcu_adapter.bridges.vllm import detect_hcu
+        detection = detect_hcu()
+        if not detection.detected or detection.architecture != 'gfx936':
+            return 'INT8 ASM EP2 is qualified only on gfx936'
     if m.aiter_fmoe_shared_expert_enabled:
         return 'INT8 ASM shared expert fusion is not validated'
     if (m.hidden_dim != m.hidden_dim_unpadded
@@ -94,8 +99,9 @@ class HcuAiterInt8Experts(mk.FusedMoEExpertsModular):
     def _supports_current_device():
         _require_active()
         from hcu_adapter.bridges.vllm import detect_hcu
+        from hcu_vllm_das.int8_activation import _SUPPORTED_ARCHITECTURES
         detection = detect_hcu()
-        return detection.detected and detection.architecture == 'gfx936'
+        return detection.detected and detection.architecture in _SUPPORTED_ARCHITECTURES
 
     @staticmethod
     def _supports_no_act_and_mul():

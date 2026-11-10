@@ -1,7 +1,8 @@
 """Installed public activation/CT/expert regression, isolated from warm caches.
 
 The existing operator tests exercise ASM arithmetic. This test exercises the
-new production owner, real CT constructor and complete raw-input fallback.
+production owner and expert-entry fallback. Complete CT loading/forward/Graph
+is covered separately by test_aiter_int8_ct_graph_hcu.py.
 """
 
 import json
@@ -39,6 +40,7 @@ def test_installed_public_int8_owner_and_changed_input_graph():
     records = [json.loads(line[len(TAG):]) for line in stdout.splitlines() if line.startswith(TAG)]
     assert len(records) == 1 and records[0]['changed_replays'] == 3, stdout
     assert records[0]['backend'] == 'aiter' and records[0]['expert'] == 'HcuAiterInt8Experts'
+    assert records[0]['observed_initial_fallback_calls'] == 1
 
 
 def _component():
@@ -99,8 +101,18 @@ def _component():
                 use_int8_w8a8=True, per_channel_quant=True, w1_scale=s1, w2_scale=s2,
                 global_num_experts=8)
 
+        fallback_calls = 0
+        def observe(frame, event, argument):
+            nonlocal fallback_calls
+            if event == 'call' and frame.f_code is fused_experts_impl.__code__:
+                fallback_calls += 1
         with torch.inference_mode():
-            execute()
+            sys.setprofile(observe)
+            try:
+                execute()
+            finally:
+                sys.setprofile(None)
+            assert fallback_calls == 1
             assert torch.equal(output, reference())
             torch.cuda.synchronize()
             graph = torch.cuda.CUDAGraph()
@@ -118,7 +130,7 @@ def _component():
                 assert addresses == (x.data_ptr(), output.data_ptr(), weights.data_ptr(), ids.data_ptr())
         print(TAG + json.dumps(dict(backend=method.int8_backend.value,
               expert=type(expert).__name__, changed_replays=3,
-              fallback='official whole-call Triton on missing E8 ASM config')))
+              fallback='observed official whole-call Triton', observed_initial_fallback_calls=fallback_calls)))
 
 
 if __name__ == '__main__':

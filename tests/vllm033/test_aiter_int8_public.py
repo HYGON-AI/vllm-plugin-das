@@ -157,7 +157,14 @@ def ep_config(**changes):
                   num_logical_experts=256, moe_parallel_config=parallel, **changes)
 
 
-def test_static_ep2_config_is_admitted_for_qualified_bf16_geometry():
+@pytest.fixture
+def qualified_ep2_device(monkeypatch):
+    from hcu_adapter.bridges import vllm as host
+    monkeypatch.setattr(host, 'detect_hcu',
+        lambda: host.HcuDetection(True, 'gfx936', 'CPU external-device fixture'))
+
+
+def test_static_ep2_config_is_admitted_for_qualified_bf16_geometry(qualified_ep2_device):
     from hcu_vllm_das.moe.int8_experts import HcuAiterInt8Experts
     actual = ep_config()
     assert config_rejection(actual) is None
@@ -185,7 +192,7 @@ def test_unqualified_ep_geometry_refuses_before_conversion(field, value):
     assert config_rejection(actual) is not None
 
 
-def test_public_ep_apply_forwards_canonical_map_and_compatibility_optin(monkeypatch):
+def test_public_ep_apply_forwards_canonical_map_and_compatibility_optin(monkeypatch,qualified_ep2_device):
     from hcu_vllm_das.moe import int8_experts, fused_moe_aiter
     from vllm.model_executor.layers.fused_moe.config import int8_w8a8_moe_quant_config
     monkeypatch.setattr(int8_experts, '_require_active', lambda: None)
@@ -227,7 +234,7 @@ def test_passthrough_pf_cannot_claim_local_asm_output_is_globally_reduced(ep):
     assert not HcuAiterInt8Experts._supports_parallel_config(actual.moe_parallel_config)
 
 
-def test_static_ep_uses_actual_parallel_config_normalized_dp_capacity():
+def test_static_ep_uses_actual_parallel_config_normalized_dp_capacity(qualified_ep2_device):
     from vllm.config import ParallelConfig
     parallel = ParallelConfig(tensor_parallel_size=2, enable_expert_parallel=True,
                               disable_custom_all_reduce=True)

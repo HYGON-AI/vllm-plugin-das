@@ -98,11 +98,13 @@ The retired `int8_oracle.install()` remains unavailable and no oracle functions,
 already-imported aliases, CT classes or builtin enum members are replaced.
 Builtin auto/triton behavior stays unchanged.
 
-The initial scope is gfx936, raw symmetric per-channel INT8 expert weights,
+The architecture candidate admits exact gfx936 and gfx938 identities, with
+raw symmetric per-channel INT8 expert weights,
 dynamic per-token INT8 activations, BF16/FP16 inputs, gated SiLU and ordinary TP.
-The isolated EP2 candidate additionally admits static TP-only expert parallelism
+The gfx938 component/model gates are separate from the existing gfx936 results.
+On gfx936 only, the isolated EP2 candidate additionally admits static TP-only expert parallelism
 with BF16 inputs, global256/local128 experts, hidden2048/intermediate512/top8.
-The public factory/CT loader/runner component has passed a controlled two-rank
+On gfx936, the public factory/CT loader/runner component has passed a controlled two-rank
 fixture, including shared output, reload and changed-input Graph replay. The real
 Qwen3.5 INT8 checkpoint also completes original HumanEval32 with both AITER and
 official Triton scoring raw30/normalized32 under default Graph. See the
@@ -128,7 +130,11 @@ A shape/config miss uses the official whole-call Triton fallback, including its
 own quantization and scratch allocation. Native launch failures propagate.
 The extension publishes a content fingerprint for normal/AOT compile factors,
 binding its source, loaded native modules, ASM objects and channel config before
-model construction; later file drift refuses cache reuse. Activation must precede
+model construction; later file drift refuses cache reuse. The vendor's resolved
+plan architecture must match the detected HCU before native acquisition. The
+published architecture, provider getter and module identity remain bound to
+process health and the compile factor; later provider drift refuses selection.
+Activation must precede
 any vendor ASM configuration consumer in the process; an already imported vendor
 ASM module (including one inherited by fork) refuses and requires a fresh spawned
 process. This avoids binding stale vendor plan caches to new config bytes.

@@ -14,6 +14,8 @@ from .extension import _require_vllm_033_release_line
 CAPABILITY = 'hcu-aiter-int8-moe'
 FACTOR = 'VLLM_HCU_DAS_INT8_ASM_IDENTITY'
 REGISTRY = 'vllm.model_executor.layers.fused_moe.oracle.int8_backend_registry'
+_CHIP_INFO = 'aiter.jit.utils.chip_info'
+_SUPPORTED_ARCHITECTURES = frozenset({'gfx936', 'gfx938'})
 _lock = RLock()
 _published = None
 _failure = False
@@ -26,6 +28,8 @@ class _Publication:
     backend: object
     identity: object
     bindings: tuple
+    architecture: str
+    chip_info: object
 
 
 def _after_fork():
@@ -59,6 +63,9 @@ def require_published():
             if any(getattr(module, name) is not function
                    for module, name, function in _published.bindings):
                 _fatal()
+            if (sys.modules.get(_CHIP_INFO) is not _published.chip_info
+                    or _published.chip_info.get_gfx() != _published.architecture):
+                _fatal()
         except BaseException as error:
             _fatal(error)
 
@@ -74,19 +81,28 @@ def compile_factor():
         _published.identity.validate()
     except BaseException as error:
         _fatal(error)
-    return 'int8-asm-v1:gfx936:' + _published.identity.digest
+    return 'int8-asm-v1:' + _published.architecture + ':' + _published.identity.digest
 
 
-def _prepare_identity(native, moe):
+def _prepare_identity(native, moe, architecture):
     from .moe.int8_identity import FrozenFiles
     module = "aiter.fused_moe_asm_wna16"
     if module in sys.modules:
         raise RuntimeError("INT8 ASM must activate before vendor MoE config consumers; restart with a fresh spawned process")
+    chip_info = import_module(_CHIP_INFO)
+    read_architecture = getattr(chip_info, 'get_gfx', None)
+    if not callable(read_architecture):
+        raise RuntimeError('INT8 ASM plan architecture API is unavailable')
+    provider_architecture = read_architecture()
+    if provider_architecture != architecture:
+        raise RuntimeError(
+            f'INT8 ASM plan architecture {provider_architecture!r} differs from real HCU {architecture!r}'
+        )
     asm = import_module(module)
     jit = import_module('aiter.jit.core')
     # Prepare actual existing native modules before model capture and bind their
     # contents plus ASM objects/configs; missing ABI refuses before publication.
-    modules = [native, moe, asm, jit, import_module('hcu_vllm_das.moe.int8_experts'),
+    modules = [native, moe, asm, jit, chip_info, import_module('hcu_vllm_das.moe.int8_experts'),
                import_module('hcu_vllm_das.moe.fused_moe_aiter'),
                import_module('hcu_vllm_das.moe.int8_asm'),
                import_module('hcu_vllm_das.moe.int8_identity'),
@@ -104,6 +120,7 @@ def _prepare_identity(native, moe):
         (native, 'moe_sorting_fwd'), (native, 'asm_fmoe_a8'),
         (moe, 'get_aiter_moe_config'), (asm, 'get_moe_asm_solution'),
         (asm, 'get_csv_path'), (jit, 'get_module'),
+        (chip_info, 'get_gfx'),
     ))
     if not all(callable(function) for _, _, function in bindings):
         raise RuntimeError('INT8 ASM native API is unavailable')
@@ -111,7 +128,7 @@ def _prepare_identity(native, moe):
     if not asm.load_and_cache_csv_for_quant(asm.MoeQuantType.INT8_W8A8_C, 0):
         raise RuntimeError("INT8 ASM channel config is unavailable")
     identity.validate()
-    return identity, bindings
+    return identity, bindings, chip_info
 
 
 def activate(context):
@@ -129,8 +146,8 @@ def activate(context):
             raise RuntimeError("INT8 ASM must activate before vendor MoE config consumers; restart with a fresh spawned process")
     from hcu_adapter.bridges.vllm import detect_hcu
     detection = detect_hcu()
-    if not detection.detected or detection.architecture != 'gfx936':
-        raise RuntimeError('INT8 ASM is currently validated for real gfx936 HCU only')
+    if not detection.detected or detection.architecture not in _SUPPORTED_ARCHITECTURES:
+        raise RuntimeError('INT8 ASM requires real gfx936 or gfx938 HCU')
     with _lock:
         if _failure or _publishing:
             _fatal()
@@ -149,10 +166,10 @@ def activate(context):
             from .moe.int8_experts import HcuAiterInt8Experts, convert_weights
             native = import_module('aiter')
             moe = import_module('aiter.moe')
-            identity, bindings = _prepare_identity(native, moe)
+            identity, bindings, chip_info = _prepare_identity(native, moe, detection.architecture)
             backend = registry.register_int8_moe_backend('aiter', HcuAiterInt8Experts, convert_weights)
             envs.environment_variables[FACTOR] = compile_factor
-            _published = _Publication(os.getpid(), backend, identity, bindings)
+            _published = _Publication(os.getpid(), backend, identity, bindings, detection.architecture, chip_info)
             check_health()
         except BaseException as error:
             _fatal(error)
