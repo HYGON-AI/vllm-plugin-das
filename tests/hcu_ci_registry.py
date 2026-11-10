@@ -26,6 +26,26 @@ register_hcu_ci(
 )
 register_hcu_ci(
     job="accuracy-gfx936",
+    target="tests/accuracy/test_grouped_w4a16_moe_accuracy.py",
+    est_time=300,
+)
+register_hcu_ci(
+    job="accuracy-gfx936",
+    target="tests/accuracy/test_aiter_moe_config_selection.py",
+    est_time=120,
+)
+register_hcu_ci(
+    job="accuracy-gfx936",
+    target="tests/accuracy/test_aiter_moe_tp2_group128_moec.py",
+    est_time=180,
+)
+register_hcu_ci(
+    job="accuracy-gfx936",
+    target="tests/accuracy/test_aiter_moe_tp2_group32.py",
+    est_time=300,
+)
+register_hcu_ci(
+    job="accuracy-gfx936",
     target="tests/kernels/test_kimi_k3_kda_checkpoints_numeric.py",
     est_time=180,
 )
@@ -43,6 +63,11 @@ register_hcu_ci(
     job="accuracy-gfx938",
     target="tests/accuracy/test_hcu_kernel_accuracy.py",
     est_time=900,
+)
+register_hcu_ci(
+    job="accuracy-gfx938",
+    target="tests/kernels/test_gfx938_indexer_normal_layout.py",
+    est_time=60,
 )
 register_hcu_ci(
     job="accuracy-gfx938",
@@ -142,6 +167,11 @@ register_hcu_ci(
 )
 register_hcu_ci(
     job="contract-hcu-gfx936",
+    target="tests/runtime_patch/test_grouped_w4a16_scale_reload.py",
+    est_time=180,
+)
+register_hcu_ci(
+    job="contract-hcu-gfx936",
     target="tests/patch/test_clean_process_bootstrap.py",
     est_time=300,
 )
@@ -167,6 +197,11 @@ register_hcu_ci(
 )
 register_hcu_ci(
     job="contract-hcu-gfx936",
+    target="tests/runtime_patch/test_compressed_tensors_w4a8.py",
+    est_time=60,
+)
+register_hcu_ci(
+    job="contract-hcu-gfx936",
     target="tests/runtime_patch/test_worker_framework_opt.py",
     est_time=180,
 )
@@ -178,6 +213,11 @@ register_hcu_ci(
 register_hcu_ci(
     job="contract-hcu-gfx936",
     target="tests/runtime_patch/test_deepseek_v4_dspark_patches.py",
+    est_time=60,
+)
+register_hcu_ci(
+    job="contract-hcu-gfx936",
+    target="tests/runtime_patch/test_deepseek_v4_wo_a_reload.py",
     est_time=60,
 )
 register_hcu_ci(
