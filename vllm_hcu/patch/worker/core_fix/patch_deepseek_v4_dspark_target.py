@@ -5,7 +5,9 @@
 from __future__ import annotations
 
 import functools
-from types import ModuleType
+from types import ModuleType, SimpleNamespace
+
+from vllm_hcu.platforms.hcu import on_gfx938
 
 from ._common import (
     PatchCompatibilityError,
@@ -128,6 +130,20 @@ def _bind_deepseek_v4_boltops_mhc(layer, mhc, backend) -> None:
     )
 
 
+def _bind_deepseek_v4_native_mhc(layer, mhc) -> None:
+    """Use vLLM's PyTorch kernels while retaining its separate RMS norm."""
+
+    _bind_deepseek_v4_boltops_mhc(
+        layer,
+        mhc,
+        SimpleNamespace(
+            mhc_pre=layer.mhc_pre.forward_native,
+            mhc_post=layer.mhc_post.forward_native,
+            mhc_fused_post_pre=layer.mhc_fused_post_pre.forward_native,
+        ),
+    )
+
+
 def apply_to_module(module: ModuleType) -> bool:
     amd_model = load_exact_module(TARGET_MODULE, module)
     model_cls = require_class(amd_model, "DeepseekV4Model", TARGET_SYMBOL)
@@ -208,6 +224,14 @@ def apply_to_module(module: ModuleType) -> bool:
             fuse_heterogeneous_shared_expert,
         )
         from vllm.model_executor.layers import mhc
+
+        # DeepGEMM MHC prenorm is gfx938-only. Use vLLM's original PyTorch
+        # kernels elsewhere: its automatic HIP dispatch can select TileLang
+        # kernels that also fail to compile on gfx936 in the audited stack.
+        if not on_gfx938():
+            _bind_deepseek_v4_native_mhc(self, mhc)
+            return
+
         from vllm_hcu.model_executor.layers import mhc as boltops_mhc
 
         _bind_deepseek_v4_boltops_mhc(self, mhc, boltops_mhc)

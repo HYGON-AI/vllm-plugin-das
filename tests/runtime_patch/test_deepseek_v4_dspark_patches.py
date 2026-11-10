@@ -1012,7 +1012,8 @@ def test_dspark_target_keeps_original_forward_without_aux_layers() -> None:
     assert causal.supports_eagle3 is True
 
 
-def test_dspark_target_binds_boltops_mhc_and_preserves_official_norm() -> None:
+@pytest.mark.parametrize("use_native", [False, True])
+def test_dspark_target_binds_mhc_and_preserves_official_norm(use_native: bool) -> None:
     bind = getattr(
         patch_deepseek_v4_dspark_target,
         "_bind_deepseek_v4_boltops_mhc",
@@ -1054,7 +1055,13 @@ def test_dspark_target_binds_boltops_mhc_and_preserves_official_norm() -> None:
     mhc = SimpleNamespace(
         _apply_mhc_norm=lambda value, weight, eps: value + weight + eps
     )
-    bind(layer, mhc, Backend)
+    if use_native:
+        layer.mhc_pre.forward_native = Backend.mhc_pre
+        layer.mhc_post.forward_native = Backend.mhc_post
+        layer.mhc_fused_post_pre.forward_native = Backend.mhc_fused_post_pre
+        patch_deepseek_v4_dspark_target._bind_deepseek_v4_native_mhc(layer, mhc)
+    else:
+        bind(layer, mhc, Backend)
 
     pre = layer.mhc_pre._forward_method(
         one,
@@ -1098,12 +1105,21 @@ def test_dspark_target_binds_boltops_mhc_and_preserves_official_norm() -> None:
 
 
 @pytest.mark.hcu
-def test_dspark_target_binds_every_constructed_decoder_mhc_instance() -> None:
+@pytest.mark.parametrize("is_gfx938", [False, True], ids=["gfx936", "gfx938"])
+def test_dspark_target_preserves_native_mhc_except_on_gfx938(
+    monkeypatch: pytest.MonkeyPatch, is_gfx938: bool
+) -> None:
+    monkeypatch.setattr(
+        patch_deepseek_v4_dspark_target, "on_gfx938", lambda: is_gfx938
+    )
     original_forward_method = lambda *args, **kwargs: None
 
     class Op:
         def __init__(self) -> None:
             self._forward_method = original_forward_method
+
+        def forward_native(self, *args, **kwargs):
+            return original_forward_method(*args, **kwargs)
 
     class DeepseekV4DecoderLayer:
         def __init__(
@@ -1147,11 +1163,18 @@ def test_dspark_target_binds_every_constructed_decoder_mhc_instance() -> None:
     )
     patch_deepseek_v4_dspark_target.apply_to_module(module)
 
-    layer = DeepseekV4DecoderLayer(object(), "model.layers.0")
-
-    assert layer.mhc_pre._forward_method is not original_forward_method
-    assert layer.mhc_post._forward_method is not original_forward_method
-    assert layer.mhc_fused_post_pre._forward_method is not original_forward_method
+    # Both target and MTP construct this decoder class. Preserve each
+    # original op on gfx936 while retaining the gfx938 provider binding.
+    for prefix in ("model.layers.0", "model.mtp.layers.0"):
+        layer = DeepseekV4DecoderLayer(object(), prefix)
+        for name in ("mhc_pre", "mhc_post", "mhc_fused_post_pre"):
+            op = getattr(layer, name)
+            assert op._forward_method is not original_forward_method
+            backend = op._forward_method.args[0]
+            if is_gfx938:
+                assert backend.__name__ == "vllm_hcu.model_executor.layers.mhc"
+            else:
+                assert getattr(backend, name) == op.forward_native
 
 
 def test_dspark_ragged_copy_grows_to_real_nnz_without_overflow() -> None:
