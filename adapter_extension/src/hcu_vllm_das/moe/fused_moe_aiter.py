@@ -43,6 +43,7 @@ def _load_aiter_api() -> _AiterApi:
     module = import_module("aiter.moe")
 
     def execute(**arguments):
+        output = arguments.pop("output", None)
         solution = arguments["moe_config"].solution_type
         if solution != "asm":
             if solution == "ck":
@@ -56,7 +57,10 @@ def _load_aiter_api() -> _AiterApi:
         native_arguments = dict(arguments)
         reason = unsupported_reason(native_arguments, native)
         if reason is None:
-            return execute_asm(native=native, **native_arguments)
+            return execute_asm(
+                native=native, **native_arguments,
+                **({"output": output} if output is not None else {}),
+            )
         hidden, w1, w2, topk = (
             arguments[name] for name in ("hidden_states", "w1", "w2", "topk_ids")
         )
@@ -221,6 +225,7 @@ def apply_aiter_int8_moe(
     output_dtype: object,
     asm_only: bool = False,
     allow_ep_global_profile: bool = False,
+    output: object | None = None,
 ) -> object:
     """Execute a native-layout AITER W8A8 config or official Triton fallback."""
 
@@ -359,6 +364,7 @@ def apply_aiter_int8_moe(
         routed_scaling_factor=1.0,
         use_weight_shuffle=False,
         output_dtype=output_dtype,
+        **({"output": output} if output is not None else {}),
     )
 
 

@@ -116,8 +116,10 @@ def execute(
     expert_map,
     global_num_experts,
     output_dtype,
+    output=None,
     **unused,
 ):
+    """Run ASM stages; reuse a compatible hint for the final reduction only."""
     from vllm import _custom_ops as ops
     from vllm.model_executor.layers.quantization.utils.int8_utils import (
         per_token_quant_int8,
@@ -125,6 +127,14 @@ def execute(
 
     config = moe_config.config
     m = hidden_states.shape[0]
+    reuse_output = (
+        isinstance(output, torch.Tensor)
+        and tuple(output.shape) == (m, w2.shape[1])
+        and output.dtype == output_dtype
+        and output.device == hidden_states.device
+        and output.is_contiguous()
+        and output.data_ptr() % 16 == 0
+    )
     top_k = topk_ids.shape[1]
     routes = m * top_k
     block = config["BLOCK_SIZE_M"]
@@ -203,6 +213,8 @@ def execute(
         0,
         0,
     )
-    result = torch.empty((m, w2.shape[1]), dtype=output_dtype, device=device)
+    result = output if reuse_output else torch.empty(
+        (m, w2.shape[1]), dtype=output_dtype, device=device
+    )
     ops.moe_sum(second, result)
     return result

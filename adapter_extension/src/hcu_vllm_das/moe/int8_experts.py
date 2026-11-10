@@ -162,5 +162,7 @@ class HcuAiterInt8Experts(mk.FusedMoEExpertsModular):
             topk_ids=topk_ids, moe_config=self.moe_config, quant_config=self.quant_config,
             activation=activation, expert_map=expert_map, output_dtype=output.dtype,
             asm_only=True, allow_ep_global_profile=ep,
+            output=output,
         )
-        output.copy_(result)
+        if result is not output:
+            output.copy_(result)
