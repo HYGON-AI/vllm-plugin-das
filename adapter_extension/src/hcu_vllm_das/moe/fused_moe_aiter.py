@@ -211,6 +211,26 @@ def _triton_fallback(
     )
 
 
+def _qualified_tp1_device(device: object) -> bool:
+    if not isinstance(device, torch.device) or device.type != "cuda" or device.index is None:
+        return False
+    from hcu_adapter.bridges.vllm import detect_hcu
+
+    # Torch is already active; avoid a PCI sysfs scan on every expert call.
+    detection = detect_hcu(torch)
+    if not detection.detected or detection.architecture != "gfx936":
+        return False
+    # Adapter reads visible ordinal zero. TP1 alone does not guarantee that
+    # the actual tensor uses that ordinal, especially on mixed HCU hosts.
+    if device.index == 0:
+        return True
+    try:
+        properties = torch.cuda.get_device_properties(device)
+    except Exception:
+        return False  # Device identity unavailable; keep the official path.
+    return str(getattr(properties, "gcnArchName", "")).strip().split(":", 1)[0] == "gfx936"
+
+
 def apply_aiter_int8_moe(
     *,
     hidden_states: object,
@@ -305,6 +325,42 @@ def apply_aiter_int8_moe(
                 )) == qualified_profiles[m]):
             found, selected = True, profile
             _record_once(logging.INFO, "selected-ep-global-profile:E256-after-local-miss",
+                         problem, "asm", selected)
+    # E128/N768 has no local vendor profile in the qualified build. These
+    # exact donor stage/block plans passed independent TP1 BF16/FP16 numeric
+    # and changed-input Graph checks on this raw geometry. Keep other shapes,
+    # token counts and parallel modes on the original whole-call fallback.
+    parallel = getattr(moe_config, "moe_parallel_config", None)
+    if (not found and asm_only and expert_map is None
+            and global_num_experts == 128
+            and problem[1:] == (128, 1536, 2048, 2048, 8)
+            and getattr(hidden_states, "dtype", None) in (torch.bfloat16, torch.float16)
+            and output_dtype == hidden_states.dtype
+            and getattr(quant_config, "per_act_token_quant", False)
+            and all(getattr(quant_config, name, None) is None
+                    for name in ("w1_zp", "w2_zp", "a1_scale", "a2_scale"))
+            and activation_name == "silu" and m in qualified_profiles
+            and all(getattr(parallel, name, None) == 1
+                    for name in ("tp_size", "ep_size", "dp_size", "pcp_size"))
+            and getattr(parallel, "ep_rank", None) == 0
+            and all(getattr(parallel, name, None) is False for name in (
+                "use_ep", "is_sequence_parallel", "enable_eplb", "use_passthrough_all2all",
+            )) and _qualified_tp1_device(getattr(hidden_states, "device", None))):
+        profile_found, profile = api.get_config(
+            m, 256, 1024, 2048, 2048, 8, 0, hidden_states.dtype,
+            api.quant_type_w8a8, activation="silu", use_shuffle=0, spec_sol_type="asm",
+        )
+        values = getattr(profile, "config", None)
+        if (profile_found and getattr(profile, "solution_type", None) == "asm"
+                and not getattr(profile, "need_shuffle", False)
+                and not getattr(profile, "need_shuffle_scale", False)
+                and isinstance(values, dict) and values.get("PADDED_K") is None
+                and not values.get("USE_SHUFFLE", 0)
+                and tuple(values.get(name) for name in (
+                    "SOL_ID1", "SOL_ID2", "BLOCK_SIZE_M",
+                )) == qualified_profiles[m]):
+            found, selected = True, profile
+            _record_once(logging.INFO, "selected-tp1-qualified:E256-N512-after-local-miss",
                          problem, "asm", selected)
     solution = getattr(selected, "solution_type", None)
     unsupported_layout = bool(

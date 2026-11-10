@@ -1,0 +1,88 @@
+{
+  "provenance": "Independent direct-native component e190fabfe62667f87f9318919dc348aaca41ad8e30bc0b65c0fdd824347f2edb; exact donor tuples read from original numeric cases, not runtime implementation",
+  "scope": "gfx936 TP1/noEP synthetic BF16/FP16 E128/H2048/N768/top8; production policy/model/performance are separate gates",
+  "baseline": {
+    "core": "0914dbb657922a7e450bb6fb2baafd70edd6d2a0",
+    "adapter": "2536f546550bf447cd302194d49c15610b973555",
+    "plugin": "d532b18226ca160dc84bf33db5801ff89ab2f45a"
+  },
+  "target": {
+    "E": 128,
+    "H": 2048,
+    "N": 768,
+    "top_k": 8
+  },
+  "donor": {
+    "E": 256,
+    "H": 2048,
+    "N": 512,
+    "top_k": 8
+  },
+  "profiles": {
+    "1": {
+      "SOL_ID1": 10010,
+      "SOL_ID2": 20000,
+      "BLOCK_SIZE_M": 16
+    },
+    "2": {
+      "SOL_ID1": 10013,
+      "SOL_ID2": 20000,
+      "BLOCK_SIZE_M": 16
+    },
+    "3": {
+      "SOL_ID1": 10013,
+      "SOL_ID2": 20000,
+      "BLOCK_SIZE_M": 16
+    },
+    "4": {
+      "SOL_ID1": 10013,
+      "SOL_ID2": 20000,
+      "BLOCK_SIZE_M": 16
+    },
+    "8": {
+      "SOL_ID1": 10013,
+      "SOL_ID2": 20000,
+      "BLOCK_SIZE_M": 16
+    },
+    "16": {
+      "SOL_ID1": 10013,
+      "SOL_ID2": 20000,
+      "BLOCK_SIZE_M": 16
+    },
+    "17": {
+      "SOL_ID1": 10009,
+      "SOL_ID2": 20000,
+      "BLOCK_SIZE_M": 16
+    },
+    "32": {
+      "SOL_ID1": 10011,
+      "SOL_ID2": 20000,
+      "BLOCK_SIZE_M": 16
+    },
+    "64": {
+      "SOL_ID1": 10008,
+      "SOL_ID2": 20000,
+      "BLOCK_SIZE_M": 16
+    },
+    "128": {
+      "SOL_ID1": 10011,
+      "SOL_ID2": 20000,
+      "BLOCK_SIZE_M": 16
+    },
+    "256": {
+      "SOL_ID1": 10011,
+      "SOL_ID2": 20000,
+      "BLOCK_SIZE_M": 16
+    },
+    "512": {
+      "SOL_ID1": 11005,
+      "SOL_ID2": 21000,
+      "BLOCK_SIZE_M": 32
+    },
+    "1024": {
+      "SOL_ID1": 12001,
+      "SOL_ID2": 22000,
+      "BLOCK_SIZE_M": 64
+    }
+  }
+}
