@@ -116,6 +116,28 @@ def test_glm52_mrv2_mla_pcp2_eager_is_allowed(make_pcp_config) -> None:
     assert patch_vllm_config._validate_hcu_pcp_scope(config) is True
 
 
+def test_hy4_pcp_mooncake_producer_rejects_bidirectional_kv(make_pcp_config) -> None:
+    """P-side PCP sends one KV replica, so bidirectional transfer stays rejected."""
+    config = make_pcp_config(
+        architecture="HYV4ForCausalLM",
+        use_mla=True,
+        pcp=2,
+        tp=4,
+        kv_transfer=True,
+    )
+    config.model_config.hf_config = SimpleNamespace(index_topk=2048)
+    config.kv_transfer_config.kv_role = "kv_producer"
+    config.kv_transfer_config.kv_connector_module_path = None
+    config.kv_transfer_config.kv_connector_extra_config = {}
+    assert patch_vllm_config._validate_hcu_pcp_scope(config) is True
+
+    config.kv_transfer_config.kv_connector_extra_config = {
+        "bidirectional_kv_xfer": True
+    }
+    with pytest.raises(ValueError, match="bidirectional"):
+        patch_vllm_config._validate_hcu_pcp_scope(config)
+
+
 def test_gqa_mrv2_flash_pcp_is_allowed(make_pcp_config) -> None:
     """GQA PCP must not remain trapped behind the former MLA-only gate."""
 

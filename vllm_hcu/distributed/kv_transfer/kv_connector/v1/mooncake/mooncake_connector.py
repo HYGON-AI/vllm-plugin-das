@@ -347,6 +347,43 @@ def _get_pp_stage_layer_range(
     return get_pp_indices(num_layers, pp_rank, pp_size)
 
 
+def _validate_mooncake_pcp_pd(vllm_config: VllmConfig) -> None:
+    """Allow PCP only for a kv_producer replica. Reject D-side PCP, DCP, and bidirectional KV."""
+    parallel_config = vllm_config.parallel_config
+    kv_transfer_config = vllm_config.kv_transfer_config
+    if parallel_config is None or kv_transfer_config is None:
+        return
+    pcp_size = int(getattr(parallel_config, "prefill_context_parallel_size", 1) or 1)
+    if pcp_size <= 1:
+        return
+    kv_role = getattr(kv_transfer_config, "kv_role", None)
+    dcp_size = int(getattr(parallel_config, "decode_context_parallel_size", 1) or 1)
+    extra = getattr(kv_transfer_config, "kv_connector_extra_config", None) or {}
+    if kv_role in ("kv_consumer", "kv_both"):
+        raise NotImplementedError(
+            "MooncakeConnector PCP currently supports kv_producer only. "
+            "Consumers and kv_both require prefill_context_parallel_size=1."
+        )
+    if dcp_size > 1:
+        raise NotImplementedError(
+            "MooncakeConnector PCP producers currently require "
+            "decode_context_parallel_size=1."
+        )
+    if extra.get("bidirectional_kv_xfer"):
+        raise NotImplementedError(
+            "MooncakeConnector PCP producers do not support bidirectional KV transfer."
+        )
+    pp_size = int(getattr(parallel_config, "pipeline_parallel_size", 1) or 1)
+    if pp_size > 1:
+        # v0.25.1 rejects Hy4 PP together with PCP and P/D. Layer-split
+        # already requires producer PP=1, so this is unconditional.
+        raise NotImplementedError(
+            "MooncakeConnector PCP does not support "
+            "pipeline_parallel_size>1 with P/D disaggregation. "
+            "HYV4 PP + PCP + P/D disaggregation is not supported."
+        )
+
+
 def _valid_block_capacities(counts: list[int], region_count: int) -> bool:
     return len(counts) == region_count and all(
         type(count) is int and count > 0 for count in counts
@@ -658,6 +695,10 @@ def _align_transfer_regions(
         aligned_local.append(local_region)
         aligned_remote.append(remote_region)
 
+    # Extra consumer layers are not an error. A PCP shard or a PP stage is a
+    # subset of the peer that owns the whole model; requiring the reverse
+    # match rejects those legal transfers. A producer layer missing above
+    # still fails.
     return aligned_local, aligned_remote, None
 
 
@@ -886,6 +927,7 @@ class MooncakeConnector(KVConnectorBase_V1, SupportsHMA):
         assert vllm_config.kv_transfer_config is not None
         assert vllm_config.kv_transfer_config.engine_id is not None
         self.engine_id: EngineId = vllm_config.kv_transfer_config.engine_id
+        _validate_mooncake_pcp_pd(vllm_config)
 
         if role == KVConnectorRole.SCHEDULER:
             assert kv_cache_config is not None, (
@@ -1580,16 +1622,6 @@ class MooncakeConnectorWorker:
             self._mooncake_receiver_t.join()
 
     async def register_worker_with_bootstrap(self):
-        if self._pcp_dummy_sender:
-            # Replicated PCP keeps only rank 0 in the bootstrap topology.
-            # Nonzero ranks still run the sender loop so finished-sending
-            # aggregation can complete locally.
-            logger.debug(
-                "Skipping Mooncake bootstrap registration for replicated "
-                "PCP dummy rank %d",
-                self.pcp_rank,
-            )
-            return
         host, port = get_mooncake_bootstrap_addr(self.vllm_config)
         url = make_zmq_path("http", host, port) + "/register"
         worker_addr = make_zmq_path("tcp", self.hostname, self.side_channel_port)
@@ -1730,14 +1762,23 @@ class MooncakeConnectorWorker:
             if metadata_err is not None:
                 await reject_metadata(metadata_err)
                 return
+        # Send the whole registered set. Numeric layer windows disagree with
+        # PCP shards and draft indices, so alignment is by layer name only.
+        local_base_addrs = self.kv_caches_base_addr
+        local_block_lens = self.block_len_per_layer
+        local_kv_block_lens = self.kv_block_len_per_layer
+        local_layer_names = self.registered_layer_names
+        local_layer_indices = self.registered_layer_indices
+        local_group_indices = self.registered_group_indices
+        local_num_blocks = self.num_blocks_per_layer
         local_regions = self._get_transfer_regions(
-            self.kv_caches_base_addr,
-            self.block_len_per_layer,
-            self.kv_block_len_per_layer,
-            self.registered_layer_names,
-            self.registered_layer_indices,
-            self.registered_group_indices,
-            num_blocks_per_layer=self.num_blocks_per_layer,
+            local_base_addrs,
+            local_block_lens,
+            local_kv_block_lens,
+            local_layer_names,
+            local_layer_indices,
+            local_group_indices,
+            num_blocks_per_layer=local_num_blocks,
         )
         remote_regions = self._get_transfer_regions(
             meta.kv_caches_base_addr,
@@ -1902,9 +1943,10 @@ class MooncakeConnectorWorker:
                 ):
                     self.finished_sending_reqs.add(send_meta.p_req_id)
 
+            ok_reqs = [d_req_id for d_req_id, _ in ok_ready_reqs]
             response = MooncakeXferResponse(
                 status=response_status,
-                ok_reqs=[d_req_id for d_req_id, _ in ok_ready_reqs] or None,
+                ok_reqs=ok_reqs or None,
                 err_reqs=err_reqs or None,
                 err_msg=err_msg,
             )
@@ -1914,11 +1956,15 @@ class MooncakeConnectorWorker:
         self,
         send_meta: SendBlockMeta,
         remote_tp_ranks: list[int],
+        pp_contacts: int = 1,
     ):
-        # Prepare for heterogeneous TP (one P pairs to multiple D)
+        # One completion per paired consumer TP rank. PP does not multiply
+        # this. pp_contacts is ignored so older callers stay safe.
+        del pp_contacts
         send_meta.need_send = len(remote_tp_ranks)
         logger.debug(
-            "Mooncake request %s will be served by %d consumer TP workers: TP ranks=%s",
+            "Mooncake request %s will be served by %d consumer TP workers: "
+            "TP ranks=%s",
             send_meta.transfer_id,
             send_meta.need_send,
             remote_tp_ranks,
@@ -2188,6 +2234,13 @@ class MooncakeConnectorWorker:
         start, end = self._dsa_owned_layer_range
         return start <= layer_index < end
 
+    def _layer_split_shard_is_empty(self) -> bool:
+        """True when this layer-split rank registers no backbone layers."""
+        if not self.dsa_layer_split_enabled:
+            return False
+        start, end = self._dsa_owned_layer_range
+        return start >= end
+
     def _bind_sender_thread_device(self) -> None:
         """ThreadPoolExecutor initializer — binds each pool thread to the
         correct CUDA device.  CUDA device selection is thread-local, so
@@ -2366,11 +2419,22 @@ class MooncakeConnectorWorker:
         if not kv_data_ptrs:
             raise RuntimeError("No KV cache tensors were registered with Mooncake.")
 
+        self.device_kv_caches = kv_caches
+        # Replicated PCP sends only from rank 0, so dummy ranks neither register
+        # transfer memory nor listen. Layer-split ranks still send their layers.
+        if self._pcp_dummy_sender:
+            logger.info(
+                "Mooncake PCP replica skip memory registration and listen: "
+                "pcp_rank=%s pcp_size=%s (rank0 sends the KV replica)",
+                self.pcp_rank,
+                self.pcp_size,
+            )
+            return
+
         ret_value = self.engine.batch_register_memory(kv_data_ptrs, kv_data_lens)
         if ret_value != 0:
             raise RuntimeError("Mooncake batch memory registration failed.")
 
-        self.device_kv_caches = kv_caches
         logger.debug(
             "registered block_lens=%s kv_block_lens=%s",
             self.block_len_per_layer,
@@ -2652,14 +2716,27 @@ class MooncakeConnectorWorker:
             virtual_ranks = remote_tp_ranks
         worker_addrs: list[str] = []
         selected_remote_pp: dict[int, list[int]] = {}
-        for remote_tp_rank in virtual_ranks:
-            pp_to_addr = self._remote_agents[remote_engine_id][remote_tp_rank]
-            if self.pp_size == len(pp_to_addr) and self.pp_rank in pp_to_addr:
-                pp_ranks = [self.pp_rank]
-            else:
-                pp_ranks = sorted(pp_to_addr)
-            selected_remote_pp[remote_tp_rank] = pp_ranks
-            worker_addrs.extend(pp_to_addr[pp_rank] for pp_rank in pp_ranks)
+        try:
+            for remote_tp_rank in virtual_ranks:
+                pp_to_addr = self._remote_agents[remote_engine_id][remote_tp_rank]
+                remote_pp_size = len(pp_to_addr)
+                if (
+                    self.pp_size == remote_pp_size
+                    and self.pp_rank in pp_to_addr
+                ):
+                    pp_ranks = [self.pp_rank]
+                else:
+                    # Each producer stage sends every layer it registered.
+                    # Name alignment fails if this consumer does not own them.
+                    pp_ranks = sorted(pp_to_addr)
+                selected_remote_pp[remote_tp_rank] = pp_ranks
+                worker_addrs.extend(pp_to_addr[pp_rank] for pp_rank in pp_ranks)
+        except Exception as exc:
+            # Any failure on this background path must finish the pull; an
+            # unobserved task exception would leave the request waiting forever.
+            logger.error("Mooncake receive_kv planning failed: %s", exc, exc_info=True)
+            self._fail_pull_metas(pull_metas, f"{type(exc).__name__}: {exc}")
+            return
 
         count = len(worker_addrs)
         logger.debug(
@@ -2671,6 +2748,12 @@ class MooncakeConnectorWorker:
             remote_layer_split,
             selected_remote_pp,
         )
+        if count == 0:
+            self._fail_pull_metas(
+                pull_metas,
+                f"asymmetric PP has zero overlap tasks for engine {remote_engine_id}",
+            )
+            return
         for pull_meta in pull_metas.values():
             pull_meta.pull_tasks_count = count
         for worker_addr in worker_addrs:
@@ -2714,11 +2797,11 @@ class MooncakeConnectorWorker:
     async def record_send_reqs(self, metadata: MooncakeConnectorMetadata):
         for p_req_id, (transfer_id, block_ids) in metadata.reqs_to_send.items():
             if block_ids:
-                if self._pcp_dummy_sender:
-                    # Plain PCP replicates the gathered cache: only CP rank 0
-                    # transfers. Dummy CP ranks complete immediately so the
-                    # executor-side finished-sending aggregation does not wait
-                    # on them.
+                if self._pcp_dummy_sender or self._layer_split_shard_is_empty():
+                    # Nothing on this rank is transferred: a replicated PCP
+                    # dummy, or a layer-split rank whose shard is empty. Mark
+                    # the send finished so the scheduler does not wait for a
+                    # pull that will never arrive.
                     self.reqs_need_send.pop(transfer_id, None)
                     self.finished_sending_reqs.add(p_req_id)
                     continue
@@ -2767,6 +2850,7 @@ class MooncakeConnectorWorker:
 
     def _producer_cache_is_replicated(self) -> bool:
         return self.transfer_topo.local_replicates_kv_cache
+
 
     def _get_transfer_regions(
         self,

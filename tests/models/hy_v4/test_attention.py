@@ -200,6 +200,7 @@ def test_hy4_pp2_stage_41_starts_with_local_sparse_indexer_producer() -> None:
     )
 
     require_local_indexer_producer(config, start_layer=41, end_layer=78)
+    # Top-k is not transferred, so a stage cannot start on a shared indexer.
     with pytest.raises(ValueError, match="preceding local 'full'"):
         require_local_indexer_producer(config, start_layer=40, end_layer=78)
 
@@ -604,3 +605,47 @@ def test_hyv4_uses_target_sparse_mqa_implementation():
         HYV4FlashMLASparseImpl.forward_mqa
         is not HcuFlashMLASparseImpl.forward_mqa
     )
+
+
+def test_first_pp_stage_still_rejects_a_shared_indexer_start() -> None:
+    from vllm_hcu.models.hy_v4.attention import require_local_indexer_producer
+
+    config = SimpleNamespace(
+        index_topk=64,
+        num_hidden_layers=4,
+        index_topk_pattern="SFFF",
+    )
+    with pytest.raises(ValueError, match="not transferred between"):
+        require_local_indexer_producer(config, start_layer=0, end_layer=4)
+    require_local_indexer_producer(config, start_layer=1, end_layer=4)
+
+
+def test_pattern_only_later_stage_requires_an_earlier_full_indexer() -> None:
+    from vllm_hcu.models.hy_v4.attention import require_local_indexer_producer
+
+    # No layer_types: skip_topk_layers still classifies full versus shared.
+    config = SimpleNamespace(
+        index_topk=64,
+        num_hidden_layers=4,
+        index_topk_pattern="SSFF",
+    )
+    with pytest.raises(ValueError, match="not transferred between"):
+        require_local_indexer_producer(config, start_layer=1, end_layer=4)
+    require_local_indexer_producer(config, start_layer=2, end_layer=4)
+
+
+def test_later_pp_stage_needs_an_earlier_full_indexer_producer() -> None:
+    from vllm_hcu.models.hy_v4.attention import require_local_indexer_producer
+
+    # Layer 0 declares a full indexer but is dense, so it builds none.
+    config = SimpleNamespace(
+        index_topk=64,
+        num_hidden_layers=4,
+        indexer_types=["full", "shared", "shared", "full"],
+        layer_types=["full_attention"] + ["deepseek_sparse_attention"] * 3,
+    )
+    for start_layer in (0, 1, 2):
+        # The previous stage would send a top-k buffer nothing has written.
+        with pytest.raises(ValueError, match="preceding local 'full'"):
+            require_local_indexer_producer(config, start_layer=start_layer, end_layer=4)
+    require_local_indexer_producer(config, start_layer=3, end_layer=4)

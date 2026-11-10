@@ -477,6 +477,11 @@ def _require_mrv2_pcp_contract(vllm_config: object) -> None:
                 "producer with the registered MooncakeConnector, "
                 "kv_role='kv_producer', and no custom connector module."
             )
+        extra = getattr(kv_transfer_config, "kv_connector_extra_config", None) or {}
+        if extra.get("bidirectional_kv_xfer"):
+            raise ValueError(
+                "HCU PCP producers do not support bidirectional KV transfer."
+            )
 
     feature_config = get_hcu_config(vllm_config)
     if feature_config.enable_lightly_cp:

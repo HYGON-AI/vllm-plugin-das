@@ -77,6 +77,7 @@ from vllm.model_executor.models.utils import (
 from vllm.platforms import current_platform
 from vllm.sequence import IntermediateTensors
 
+
 from .attention import (
     HYV4MLAAttention,
     compute_skip_topk_layers,
@@ -609,7 +610,6 @@ class HYV4Model(nn.Module, MixtureOfExperts):
                     ["hidden_states", "residual"], config.hidden_size
                 )
             )
-
         # MoE hyperparameters (consumed by EPLB).
         self.expert_weights: MutableSequence[Sequence[torch.Tensor]] = []
         self.num_expert_groups = 1
@@ -725,10 +725,12 @@ class HYV4Model(nn.Module, MixtureOfExperts):
             if self.enable_ihc:
                 # hidden_states is [num_tokens, hc, h]; flatten the channel dim
                 # for PP transfer (matches the 2D receive buffer).
-                return IntermediateTensors({"hidden_states": hidden_states.flatten(1)})
-            return IntermediateTensors(
-                {"hidden_states": hidden_states, "residual": residual}
-            )
+                output = IntermediateTensors({"hidden_states": hidden_states.flatten(1)})
+            else:
+                output = IntermediateTensors(
+                    {"hidden_states": hidden_states, "residual": residual}
+                )
+            return output
         if self.enable_ihc:
             hidden_states = self.hc_head(hidden_states)
         else:

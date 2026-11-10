@@ -236,6 +236,8 @@ def require_local_indexer_producer(
         )
     skip_topk_layers = compute_skip_topk_layers(config)
     layer_types = getattr(config, "layer_types", None)
+    # Top-k is not sent between PP stages. A stage that starts on a shared
+    # indexer has no local producer and no incoming indices.
     if layer_types is not None:
         has_local_producer = False
         for layer_idx in range(start_layer, end_layer):
@@ -256,8 +258,6 @@ def require_local_indexer_producer(
                 )
         return
 
-    # Retain the conservative declared-pattern check for callers that do not
-    # supply attention layer types.
     if start_layer in skip_topk_layers:
         raise ValueError(
             "HY V4 pipeline stage starts at shared indexer layer "

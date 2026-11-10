@@ -60,9 +60,12 @@ def _worker(
     worker.tp_rank = tp_rank
     worker.tp_size = tp_size
     worker.finished_recving_reqs = set()
+    worker.finished_sending_reqs = set()
+    worker.reqs_need_send = {}
     worker._kv_load_error = None
     # object.__new__ skips MooncakeConnectorWorker.__init__.
     worker.dsa_layer_split_enabled = False
+    worker._pcp_dummy_sender = False
     worker._remote_pcp_info = {}
     return worker
 
@@ -224,6 +227,21 @@ def test_region_alignment_matches_occurrences_independent_of_order(mooncake):
     assert error is None
     assert aligned_local == local
     assert [region.base_addr for region in aligned_remote] == [202, 201, 203]
+
+
+def test_region_alignment_rejects_consumer_only_layer(mooncake):
+    local = [mooncake.TransferRegion("layer.0", 0, 101, 32, 16, 0)]
+    remote = [
+        mooncake.TransferRegion("layer.0", 0, 201, 32, 16, 0),
+        mooncake.TransferRegion("model.layers.8.mtp", 8, 202, 32, 16, 0),
+    ]
+
+    _aligned_local, _aligned_remote, error = mooncake._align_transfer_regions(
+        local, remote
+    )
+
+    assert error is None
+    assert len(_aligned_local) == 1
 
 
 def test_region_alignment_rejects_missing_repeated_occurrence(mooncake):
@@ -877,8 +895,14 @@ def test_receive_kv_selects_matching_remote_pp_workers(mooncake):
     worker.transfer_topo.handshake_target_ranks = lambda remote_tp_size: [0, 1]
     calls = []
 
-    async def receive(worker_addr, pull_metas):
-        calls.append((worker_addr, pull_metas))
+    async def receive(
+        worker_addr,
+        pull_metas,
+        *,
+        model_layer_start=-1,
+        model_layer_end=-1,
+    ):
+        calls.append((worker_addr, pull_metas, model_layer_start, model_layer_end))
 
     worker.receive_kv_from_single_worker = receive
     pull_meta = SimpleNamespace(pull_tasks_count=0)
@@ -890,9 +914,10 @@ def test_receive_kv_selects_matching_remote_pp_workers(mooncake):
 
     asyncio.run(run())
 
-    assert [address for address, _ in calls] == ["tp0-pp1", "tp1-pp1"]
-    assert all(metadata is pull_metas for _, metadata in calls)
+    assert [item[0] for item in calls] == ["tp0-pp1", "tp1-pp1"]
+    assert all(item[1] is pull_metas for item in calls)
     assert pull_meta.pull_tasks_count == 2
+    assert all(item[2] == -1 and item[3] == -1 for item in calls)
 
 
 def test_target_first_patch_contract_is_idempotent(
@@ -1276,3 +1301,304 @@ def test_final_pp_stage_registers_backbone_and_only_declared_draft_cache(mooncak
     assert worker.registered_layer_names == names
     assert worker.registered_layer_indices == [77, 78]
     assert len(worker.engine.calls) == 1
+
+
+def test_registration_keeps_registration_order(mooncake):
+    """Regions pair by layer name, so registration must not reorder them."""
+    worker = _worker(mooncake, blocks_first=False)
+    names = [
+        "model.layers.0.self_attn.mla_attn",
+        "model.layers.0.self_attn.indexer",
+        "model.layers.1.self_attn.mla_attn",
+    ]
+    caches = {}
+    for name in names:
+        worker._layer_specs[name] = _attention_spec(mooncake)
+        worker._layer_group_indices[name] = 0
+        caches[name] = torch.zeros((2, 1, 2, 4), dtype=torch.float16)
+    worker.register_kv_caches(caches)
+    assert worker.registered_layer_names == names
+    assert worker.registered_layer_indices == [0, 0, 1]
+
+
+def test_validate_mooncake_pcp_pd_rejects_consumer_dcp_and_bidirectional(mooncake):
+    consumer = SimpleNamespace(
+        parallel_config=SimpleNamespace(
+            prefill_context_parallel_size=2,
+            decode_context_parallel_size=1,
+        ),
+        kv_transfer_config=SimpleNamespace(
+            kv_role="kv_consumer",
+            kv_connector_extra_config={},
+        ),
+    )
+    with pytest.raises(NotImplementedError, match="kv_producer only"):
+        mooncake._validate_mooncake_pcp_pd(consumer)
+
+    bidirectional = SimpleNamespace(
+        parallel_config=SimpleNamespace(
+            prefill_context_parallel_size=2,
+            decode_context_parallel_size=1,
+        ),
+        kv_transfer_config=SimpleNamespace(
+            kv_role="kv_producer",
+            kv_connector_extra_config={"bidirectional_kv_xfer": True},
+        ),
+    )
+    with pytest.raises(NotImplementedError, match="bidirectional"):
+        mooncake._validate_mooncake_pcp_pd(bidirectional)
+
+
+def test_receive_kv_layer_split_producer_contacts_only_overlapping_shards(
+    mooncake, monkeypatch
+):
+    """Each consumer stage skips PCP ranks whose layer shard it does not cover."""
+    monkeypatch.setattr(mooncake.envs, "VLLM_PP_LAYER_PARTITION", None)
+    worker = _worker(mooncake, blocks_first=False)
+    worker.model_config = SimpleNamespace(get_total_num_hidden_layers=lambda: 8)
+    worker._fail_pull_metas = lambda *args, **kwargs: (_ for _ in ()).throw(
+        AssertionError("a covered layer-split shard must not fail the pull")
+    )
+    worker._tp_size = {"engine": 1}
+    # TP1 x PCP3 layer split on a pp1 producer owns [0, 3), [3, 6), [6, 8).
+    worker._remote_agents = {"engine": {rank: {0: f"pcp{rank}"} for rank in range(3)}}
+    worker._remote_pcp_info = {"engine": (3, True)}
+    worker.transfer_topo.handshake_target_ranks = lambda remote_tp_size: [0]
+    calls = []
+
+    async def receive(worker_addr, pull_metas, *, model_layer_start=-1, model_layer_end=-1):
+        calls.append((worker_addr, model_layer_start, model_layer_end))
+
+    worker.receive_kv_from_single_worker = receive
+
+    def plan(pp_rank):
+        calls.clear()
+        worker.pp_size, worker.pp_rank = 2, pp_rank
+        pull_meta = SimpleNamespace(pull_tasks_count=0)
+
+        async def run():
+            worker.receive_kv("engine", {"request": pull_meta})
+            await asyncio.sleep(0)
+
+        asyncio.run(run())
+        return list(calls), pull_meta.pull_tasks_count
+
+    full = [("pcp0", -1, -1), ("pcp1", -1, -1), ("pcp2", -1, -1)]
+    assert plan(0) == (full, 3)
+    assert plan(1) == (full, 3)
+
+
+def test_receive_kv_layer_split_same_pp_filters_each_remote_shard(
+    mooncake, monkeypatch
+):
+    """pp1/pp1 still filters layers: each PCP rank registers only its shard."""
+    monkeypatch.setattr(mooncake.envs, "VLLM_PP_LAYER_PARTITION", None)
+    worker = _worker(mooncake, blocks_first=False)
+    worker.pp_size = 1
+    worker.pp_rank = 0
+    worker.model_config = SimpleNamespace(get_total_num_hidden_layers=lambda: 8)
+    worker._tp_size = {"engine": 1}
+    # Layer split requires a pp1 producer; TP1 x PCP3 owns [0, 3), [3, 6), [6, 8).
+    worker._remote_pcp_info = {"engine": (3, True)}
+    worker._remote_agents = {"engine": {rank: {0: f"pcp{rank}"} for rank in range(3)}}
+    worker.transfer_topo.handshake_target_ranks = lambda remote_tp_size: [0]
+    calls = []
+
+    async def receive(
+        worker_addr,
+        pull_metas,
+        *,
+        model_layer_start=-1,
+        model_layer_end=-1,
+    ):
+        calls.append((worker_addr, model_layer_start, model_layer_end))
+
+    worker.receive_kv_from_single_worker = receive
+
+    def plan():
+        calls.clear()
+        pull_meta = SimpleNamespace(pull_tasks_count=0)
+
+        async def run():
+            worker.receive_kv("engine", {"request": pull_meta})
+            await asyncio.sleep(0)
+
+        asyncio.run(run())
+        return list(calls), pull_meta.pull_tasks_count
+
+    assert plan() == ([("pcp0", -1, -1), ("pcp1", -1, -1), ("pcp2", -1, -1)], 3)
+
+
+def test_empty_layer_split_shard_counts_zero_and_completes_send(mooncake, monkeypatch):
+    monkeypatch.setattr(mooncake.envs, "VLLM_PP_LAYER_PARTITION", None)
+    worker = _worker(mooncake, blocks_first=False)
+    worker.pp_size = 1
+    worker.pp_rank = 0
+    worker.model_config = SimpleNamespace(get_total_num_hidden_layers=lambda: 8)
+    worker.dsa_layer_split_enabled = True
+    worker._dsa_owned_layer_range = (8, 8)
+    worker._pcp_dummy_sender = False
+
+    metadata = mooncake.MooncakeConnectorMetadata()
+    metadata.reqs_to_send["req"] = ("xfer", [[1]])
+    asyncio.run(worker.record_send_reqs(metadata))
+    assert "req" in worker.finished_sending_reqs
+    assert "xfer" not in worker.reqs_need_send
+
+
+def test_replicated_pcp_dummy_rank_skips_memory_registration(mooncake):
+    worker = _worker(mooncake, blocks_first=False)
+    worker.is_kv_consumer = False
+    worker._pcp_dummy_sender = True
+    worker.pcp_rank, worker.pcp_size = 1, 2
+    name = "model.layers.0.self_attn"
+    worker._layer_specs[name] = _attention_spec(mooncake)
+    worker._layer_group_indices[name] = 0
+    # Returning before the listener matters too: this worker has no sender loop.
+    worker.register_kv_caches({name: torch.zeros((2, 1, 2, 4), dtype=torch.float16)})
+    assert worker.engine.calls == []
+    assert worker.registered_layer_names == [name]
+
+
+def test_receive_kv_uses_layer_overlap_for_heterogeneous_pp(mooncake, monkeypatch):
+    worker = _worker(mooncake, blocks_first=False)
+    worker.pp_size = 1
+    worker.pp_rank = 0
+    worker.model_config = SimpleNamespace(get_total_num_hidden_layers=lambda: 8)
+    worker._fail_pull_metas = lambda *args, **kwargs: None
+    worker._tp_size = {"engine": 1}
+    worker._remote_agents = {"engine": {0: {0: "tp0-pp0", 1: "tp0-pp1"}}}
+    worker.transfer_topo.handshake_target_ranks = lambda remote_tp_size: [0]
+    monkeypatch.setattr(mooncake.envs, "VLLM_PP_LAYER_PARTITION", None)
+    calls = []
+
+    async def receive(worker_addr, pull_metas, *, model_layer_start=-1, model_layer_end=-1):
+        calls.append((worker_addr, model_layer_start, model_layer_end))
+
+    worker.receive_kv_from_single_worker = receive
+    pull_meta = SimpleNamespace(pull_tasks_count=0)
+
+    async def run():
+        worker.receive_kv("engine", {"request": pull_meta})
+        await asyncio.sleep(0)
+
+    asyncio.run(run())
+    assert calls == [("tp0-pp0", -1, -1), ("tp0-pp1", -1, -1)]
+    assert pull_meta.pull_tasks_count == 2
+
+
+def test_same_pp_custom_partition_still_rank_pairs(mooncake, monkeypatch):
+    worker = _worker(mooncake, blocks_first=False)
+    worker.pp_size = 2
+    worker.pp_rank = 0
+    worker._fail_pull_metas = lambda *args, **kwargs: (_ for _ in ()).throw(
+        AssertionError("same-PP custom partition must not fail the pull")
+    )
+    worker._tp_size = {"engine": 1}
+    worker._remote_agents = {"engine": {0: {0: "tp0-pp0", 1: "tp0-pp1"}}}
+    worker.transfer_topo.handshake_target_ranks = lambda remote_tp_size: [0]
+    monkeypatch.setattr(mooncake.envs, "VLLM_PP_LAYER_PARTITION", "3,5")
+    calls = []
+
+    async def receive(worker_addr, pull_metas, *, model_layer_start=-1, model_layer_end=-1):
+        calls.append((worker_addr, model_layer_start, model_layer_end))
+
+    worker.receive_kv_from_single_worker = receive
+
+    async def run():
+        worker.receive_kv("engine", {"request": SimpleNamespace(pull_tasks_count=0)})
+        await asyncio.sleep(0)
+
+    asyncio.run(run())
+    assert calls == [("tp0-pp0", -1, -1)]
+
+
+def test_receive_kv_different_pp_pulls_every_producer_stage(mooncake, monkeypatch):
+    worker = _worker(mooncake, blocks_first=False)
+    worker.pp_size = 2
+    worker.pp_rank = 0
+    failures = []
+    worker._fail_pull_metas = lambda pull_metas, err_msg: failures.append(err_msg)
+    worker._tp_size = {"engine": 1}
+    worker._remote_agents = {
+        "engine": {0: {0: "a", 1: "b", 2: "c", 3: "d"}}
+    }
+    worker.transfer_topo.handshake_target_ranks = lambda remote_tp_size: [0]
+    monkeypatch.setattr(mooncake.envs, "VLLM_PP_LAYER_PARTITION", "3,5")
+    calls = []
+
+    async def receive(worker_addr, pull_metas, *, model_layer_start=-1, model_layer_end=-1):
+        calls.append((worker_addr, model_layer_start, model_layer_end))
+
+    worker.receive_kv_from_single_worker = receive
+    pull_meta = SimpleNamespace(pull_tasks_count=0)
+
+    async def run():
+        worker.receive_kv("engine", {"request": pull_meta})
+        await asyncio.sleep(0)
+
+    asyncio.run(run())
+    assert failures == []
+    assert calls == [("a", -1, -1), ("b", -1, -1), ("c", -1, -1), ("d", -1, -1)]
+    assert pull_meta.pull_tasks_count == 4
+
+
+def test_receive_kv_unexpected_planning_error_fails_closed(mooncake, monkeypatch):
+    """A non-config error while planning must finish the pull, not hang it."""
+    worker = _worker(mooncake, blocks_first=False)
+    worker.pp_size = 1
+    worker.pp_rank = 0
+    failures = []
+    worker._fail_pull_metas = lambda pull_metas, err_msg: failures.append(err_msg)
+    worker._tp_size = {"engine": 1}
+    worker._remote_agents = {"engine": {}}  # tp rank 0 is missing -> KeyError
+    worker.transfer_topo.handshake_target_ranks = lambda remote_tp_size: [0]
+    monkeypatch.setattr(mooncake.envs, "VLLM_PP_LAYER_PARTITION", None)
+
+    worker.receive_kv("engine", {"request": SimpleNamespace(pull_tasks_count=0)})
+
+    assert len(failures) == 1
+    assert failures[0].startswith("KeyError")
+
+
+def _pcp_pd_config(*, kv_role, dcp=1, pcp=2, pp=1, extra=None):
+    return SimpleNamespace(
+        parallel_config=SimpleNamespace(
+            prefill_context_parallel_size=pcp,
+            decode_context_parallel_size=dcp,
+            pipeline_parallel_size=pp,
+        ),
+        kv_transfer_config=SimpleNamespace(
+            kv_role=kv_role,
+            kv_connector_extra_config=extra or {},
+        ),
+    )
+
+
+def test_validate_mooncake_pcp_pd_rejects_kv_both_and_dcp(mooncake):
+    with pytest.raises(NotImplementedError, match="kv_producer only"):
+        mooncake._validate_mooncake_pcp_pd(_pcp_pd_config(kv_role="kv_both"))
+    with pytest.raises(NotImplementedError, match="decode_context_parallel_size"):
+        mooncake._validate_mooncake_pcp_pd(
+            _pcp_pd_config(kv_role="kv_producer", dcp=2)
+        )
+
+
+def test_validate_mooncake_pcp_pd_rejects_replicated_pcp_with_pp(mooncake):
+    with pytest.raises(NotImplementedError, match="PP \\+ PCP \\+ P/D"):
+        mooncake._validate_mooncake_pcp_pd(
+            _pcp_pd_config(kv_role="kv_producer", pp=2)
+        )
+
+
+def test_validate_mooncake_pcp_pd_accepts_plain_producer_and_non_pcp(mooncake):
+    mooncake._validate_mooncake_pcp_pd(_pcp_pd_config(kv_role="kv_producer"))
+    # Without PCP no PCP rule applies, whatever the role or extras.
+    mooncake._validate_mooncake_pcp_pd(
+        _pcp_pd_config(
+            kv_role="kv_both",
+            pcp=1,
+            dcp=2,
+            extra={"bidirectional_kv_xfer": True},
+        )
+    )
