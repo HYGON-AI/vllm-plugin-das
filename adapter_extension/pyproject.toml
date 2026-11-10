@@ -11,7 +11,7 @@ license = "Apache-2.0"
 license-files = ["LICENSE", "NOTICE"]
 requires-python = ">=3.11,<3.15"
 dependencies = [
-  "sgl-kernel>=0.1.0",
+  "hcu-adapter>=0.1.0",
   "packaging>=23",
 ]
 

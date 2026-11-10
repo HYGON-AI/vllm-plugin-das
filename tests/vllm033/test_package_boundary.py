@@ -21,7 +21,7 @@ def test_project_metadata_has_only_the_adapter_extension_entry_point() -> None:
     assert metadata["version"] == "0.3.0.dev0"
     assert metadata["requires-python"] == ">=3.11,<3.15"
     assert metadata["dependencies"] == [
-        "sgl-kernel>=0.1.0",
+        "hcu-adapter>=0.1.0",
         "packaging>=23",
     ]
     assert metadata["entry-points"] == {
@@ -100,7 +100,7 @@ def test_built_wheel_contains_only_the_new_plugin_namespace(tmp_path: Path) -> N
     entry_point_lines = entry_points.splitlines()
     assert "Name: hcu-vllm-das-plugin" in metadata_lines
     assert "Version: 0.3.0.dev0" in metadata_lines
-    assert "Requires-Dist: sgl-kernel>=0.1.0" in metadata_lines
+    assert "Requires-Dist: hcu-adapter>=0.1.0" in metadata_lines
     assert "[hcu_adapter.extensions]" in entry_point_lines
     assert "das_hcu = hcu_vllm_das.extension:extension_spec" in entry_point_lines
     assert "[vllm.platform_plugins]" not in entry_point_lines

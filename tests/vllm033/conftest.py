@@ -27,7 +27,13 @@ def pytest_sessionstart(session):
     _OWNERS.clear()
     if os.environ.get('HCU_V033_VERIFY_INSTALLED') != '1':
         return
-    for distribution, prefix in [('vllm', 'vllm'), ('sgl-kernel', 'hcu_adapter'),
+    from importlib.util import spec_from_file_location,module_from_spec
+    spec=spec_from_file_location('_hcu_plugin_installed_guard_owner',
+        Path(__file__).resolve().parents[2]/'adapter_extension/tools/installed_adapter_owner.py')
+    helper=module_from_spec(spec)
+    spec.loader.exec_module(helper)
+    adapter_name=helper.adapter_distribution_name()
+    for distribution, prefix in [('vllm', 'vllm'), (adapter_name, 'hcu_adapter'),
                                  ('hcu-vllm-das-plugin', 'hcu_vllm_das')]:
         import_module(prefix)  # Pin package __path__ before test-module imports.
         installed = metadata.distribution(distribution)
