@@ -419,6 +419,13 @@ def _copy_prepared_scales(entry: _PreparedScales, fresh) -> None:
                 old.copy_(new)
 
 
+def _scale_cache_key(generation, config) -> tuple[Any, ...]:
+    return (
+        tuple(g[:2] + g[3:] if g is not None else () for g in generation),
+        _scale_layout_generation(config),
+    )
+
+
 def refresh_aiter_moe_scale_cache(
     owner: object,
     scale1: torch.Tensor,
@@ -430,13 +437,19 @@ def refresh_aiter_moe_scale_cache(
     cache = getattr(owner, _SCALE_CACHE_ATTR, None)
     if not isinstance(cache, OrderedDict):
         return
-    for entry in cache.values():
+    for old_key, entry in list(cache.items()):
         fresh = prepare_aiter_moe_scales(
             scale1, scale2, entry.config, cache_owner=object(),
         )
         _copy_prepared_scales(entry, fresh)
         if update_generation:
             entry.generation = (_tensor_generation(scale1), _tensor_generation(scale2))
+            new_key = _scale_cache_key(entry.generation, entry.config)
+            # Keep the graph-owned pair reachable through the cache after a
+            # source Parameter is replaced. Another captured pair may already
+            # occupy this key; the loop refreshes that allocation too.
+            if new_key != old_key and new_key not in cache:
+                cache[new_key] = cache.pop(old_key)
 
 
 def prepare_aiter_moe_scales(
@@ -454,10 +467,7 @@ def prepare_aiter_moe_scales(
     generation = (_tensor_generation(scale1), _tensor_generation(scale2))
     # A source version change refreshes the allocation rather than allocating
     # another scale generation that could evict a captured graph's storage.
-    cache_key = (
-        tuple(g[:2] + g[3:] if g is not None else () for g in generation),
-        _scale_layout_generation(config),
-    )
+    cache_key = _scale_cache_key(generation, config)
     entry = cache.get(cache_key)
     if entry is not None and entry.generation == generation:
         cache.move_to_end(cache_key)
