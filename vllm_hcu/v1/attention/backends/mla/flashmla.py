@@ -82,8 +82,11 @@ def _is_flash_nc_kv_dtype(kv_cache_dtype) -> bool:
 class HcuFlashMLABackend(MLACommonBackend):
     # TASK2: flattened non-causal DSpark draft groups (uniform query_len>1)
     # are served on the vendor fp8 kernel through registry-stable expanded
-    # block tables -- the same FIX13 buffer contract as the Triton fast path
-    # this backend replaces as the managed dense-MLA selection winner.
+    # block tables -- the same FIX13 buffer contract as the Triton fast
+    # path this backend replaces as the managed dense-MLA selection
+    # winner. gfx938 only: builder + runtime gate both scope the fast
+    # path to on_gfx938 -- ops/fwd_kvcache_quantization_mla receives no
+    # descale_q and is unvalidated for this group.
     supports_non_causal_multi_token_decode: ClassVar[bool] = True
 
     supported_dtypes: ClassVar[list[torch.dtype]] = [torch.float16, torch.bfloat16]
@@ -127,10 +130,12 @@ class HcuFlashMLABackend(MLACommonBackend):
     @classmethod
     def supports_non_causal(cls) -> bool:
         # Kernel geometry supports non-causal multi-token decode; the
-        # per-cache-dtype gate lives on the builder: non-e4m3 caches are
-        # refused the flatten there (this classmethod has no dtype
-        # context), otherwise a non-causal group would silently ride the
-        # stock decode calls below, which hard-code causal=True.
+        # gating lives on the builder (this classmethod has neither dtype
+        # nor device context): non-e4m3 caches AND non-gfx938 hardware
+        # (review P2: the off-gfx938 quantization kernel takes no
+        # descale_q) are refused the flatten there, otherwise a
+        # non-causal group would silently ride the stock decode calls
+        # below, which hard-code causal=True.
         return True
 
     @classmethod
@@ -211,7 +216,16 @@ class FlashMLAMetadataBuilder(MLACommonMetadataBuilder[FlashMLAMetadata]):
             else None
         )
         cache_dtype = vllm_config.cache_config.cache_dtype
-        if spec_nc and subpage and not _is_flash_nc_kv_dtype(cache_dtype):
+        if spec_nc and subpage and not on_gfx938():
+            # Review P2: the NC flash fast path is validated on gfx938
+            # only (dense-fp8 kernel with fused descale_q). Other HCU
+            # devices reach fwd_kvcache_quantization_mla, which receives
+            # no descale_q and expects an unquantized bf16 query -- a
+            # q-scale skew plus an unvalidated kernel/interface for this
+            # group. Refuse the flatten loudly instead of serving skewed
+            # draft logits.
+            self.supports_non_causal_multi_token_decode = False
+        elif spec_nc and subpage and not _is_flash_nc_kv_dtype(cache_dtype):
             # Mirror the kernel-side dtype guard at build time -- OUTSIDE
             # the quantized-cache branch, so it also covers auto/bf16
             # caches: the backend stays selected but the flatten is
@@ -590,6 +604,7 @@ class FlashMLAImpl(MLACommonImpl[FlashMLAMetadata]):
         # this path just quantizes the query and launches.
         if (
             not attn_metadata.causal
+            and on_gfx938()
             and attn_metadata.decode is not None
             and _is_flash_nc_kv_dtype(self.kv_cache_dtype)
         ):

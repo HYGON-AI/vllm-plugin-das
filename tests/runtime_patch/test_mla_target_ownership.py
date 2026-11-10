@@ -1462,8 +1462,10 @@ def test_flashmla_fp8_graph_metadata_grows_and_keeps_only_valid_rows(
     )
 
 
-def _make_nc_builder(flashmla, cache_dtype):
+def _make_nc_builder(flashmla, cache_dtype, on_gfx938=True, monkeypatch=None):
     """Construct the real builder under the cpu_flashmla stub chain."""
+    if monkeypatch is not None:
+        monkeypatch.setattr(flashmla, "on_gfx938", lambda: on_gfx938)
     vllm_config = SimpleNamespace(
         model_config=SimpleNamespace(
             get_num_attention_heads=lambda pc: 16,
@@ -1486,7 +1488,7 @@ def _make_nc_builder(flashmla, cache_dtype):
 
 @pytest.mark.parametrize("cache_dtype", ["auto", "bfloat16", "fp8_e5m2"])
 def test_flashmla_builder_refuses_nc_flatten_on_non_nc_caches(
-    cpu_flashmla, cache_dtype
+    cpu_flashmla, monkeypatch, cache_dtype
 ):
     """Non-NC caches must refuse the flatten at build, not mis-compute.
 
@@ -1496,7 +1498,9 @@ def test_flashmla_builder_refuses_nc_flatten_on_non_nc_caches(
     non-causal group falls through to the stock decode calls (causal=
     True hard-coded) and silently computes wrong causality.
     """
-    builder = _make_nc_builder(cpu_flashmla, cache_dtype)
+    builder = _make_nc_builder(
+        cpu_flashmla, cache_dtype, on_gfx938=True, monkeypatch=monkeypatch
+    )
     assert builder.supports_non_causal_multi_token_decode is False
     assert builder._nc_ready is False
     assert "supports_non_causal_multi_token_decode" in vars(builder)
@@ -1509,8 +1513,44 @@ def test_flashmla_builder_refuses_nc_flatten_on_non_nc_caches(
     )
 
 
-def test_flashmla_builder_keeps_nc_flatten_on_e4m3_cache(cpu_flashmla):
-    builder = _make_nc_builder(cpu_flashmla, "fp8_e4m3")
+def test_flashmla_builder_refuses_nc_flatten_off_gfx938(
+    cpu_flashmla, monkeypatch
+):
+    """Review P2: the flash NC fast path is a gfx938-validated kernel
+    contract -- the vendor op off gfx938 (fwd_kvcache_quantization_mla)
+    receives no descale_q and expects an unquantized bf16 query, so an
+    e4m3 NC group off gfx938 must refuse the flatten at build instead of
+    serving q-scale-skewed logits."""
+    builder = _make_nc_builder(
+        cpu_flashmla, "fp8_e4m3", on_gfx938=False, monkeypatch=monkeypatch
+    )
+    assert builder.supports_non_causal_multi_token_decode is False
+    assert builder._nc_ready is False
+    assert not hasattr(builder, "_nc_bt_buf")
+    assert (
+        cpu_flashmla.FlashMLAMetadataBuilder
+        .supports_non_causal_multi_token_decode
+        is True
+    )
+
+
+def test_flashmla_runtime_nc_entry_gated_on_gfx938(cpu_flashmla):
+    """Defense in depth: forward_mqa's NC branch checks on_gfx938 ahead
+    of the dtype predicate (flat source-order assertion on the gate)."""
+    import inspect
+
+    source = inspect.getsource(cpu_flashmla.FlashMLAImpl.forward_mqa)
+    device_pos = source.index("on_gfx938()")
+    dtype_pos = source.index("_is_flash_nc_kv_dtype(self.kv_cache_dtype)")
+    assert device_pos < dtype_pos
+
+
+def test_flashmla_builder_keeps_nc_flatten_on_e4m3_cache(
+    cpu_flashmla, monkeypatch
+):
+    builder = _make_nc_builder(
+        cpu_flashmla, "fp8_e4m3", on_gfx938=True, monkeypatch=monkeypatch
+    )
     assert builder._nc_ready is True
     # No instance override: the ClassVar True remains authoritative.
     assert "supports_non_causal_multi_token_decode" not in vars(builder)
