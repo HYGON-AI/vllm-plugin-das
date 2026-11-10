@@ -3851,7 +3851,7 @@ class GPUModelRunner(
         num_tokens_padded = self._pad_for_sequence_parallelism(num_tokens)
 
         def dispatch_cudagraph(num_tokens, disable_full=False, valid_modes=None):
-            return self.cudagraph_dispatcher.dispatch(
+            mode, descriptor = self.cudagraph_dispatcher.dispatch(
                 num_tokens=num_tokens,
                 has_lora=has_lora,
                 uniform_decode=uniform_decode,
@@ -3859,6 +3859,21 @@ class GPUModelRunner(
                 valid_modes={CUDAGraphMode.NONE} if force_eager else valid_modes,
                 invalid_modes={CUDAGraphMode.FULL} if disable_full else None,
             )
+
+            # HYV4 Channel-FP8 prefill is sensitive to the padded GEMM/iHC
+            # shapes. Keep exact-size piecewise graphs, but preserve eager
+            # shapes for tails that would otherwise be rounded to a bucket.
+            # DP synchronizes graph modes separately; this guard covers the
+            # single-DP serving path validated for HYV4-VL.
+            if (
+                mode == CUDAGraphMode.PIECEWISE
+                and descriptor.num_tokens != num_tokens
+                and self.parallel_config.data_parallel_size == 1
+                and "HYV4VLForConditionalGeneration"
+                in (getattr(self.model_config.hf_config, "architectures", None) or ())
+            ):
+                return CUDAGraphMode.NONE, BatchDescriptor(num_tokens)
+            return mode, descriptor
 
         cudagraph_mode, batch_descriptor = dispatch_cudagraph(
             num_tokens_padded, disable_full=use_cascade_attn or has_encoder_output

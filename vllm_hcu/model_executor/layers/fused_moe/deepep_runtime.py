@@ -15,6 +15,8 @@ import inspect
 
 from vllm.platforms import current_platform
 
+import vllm_hcu.platforms.envs as henvs
+
 
 @functools.lru_cache(maxsize=None)
 def _require_slimquant_w4a8_hipc_runtime(
@@ -87,8 +89,17 @@ def slimquant_w4a8_uses_deepep_ht(moe_config: object) -> bool:
     config = get_current_vllm_config_or_none()
     if config is None:
         config = getattr(moe_config, "_hcu_vllm_config", None)
-    if model_architectures(config) != ("HYV4ForCausalLM",):
-        raise ValueError("SlimQuant W4A8 PCP HT requires HYV4ForCausalLM")
+    architectures = model_architectures(config)
+    if architectures not in (("HYV4ForCausalLM",), ("HYV4VLForConditionalGeneration",)):
+        raise ValueError(
+            "SlimQuant W4A8 PCP HT requires HYV4ForCausalLM "
+            "or HYV4VLForConditionalGeneration"
+        )
+    if (
+        architectures == ("HYV4VLForConditionalGeneration",)
+        and getattr(config, "speculative_config", None) is not None
+    ):
+        raise ValueError("SlimQuant W4A8 HYV4-VL does not support MTP")
     if getattr(moe_config, "moe_backend", "auto") not in ("auto", "deep_gemm"):
         raise ValueError(
             "SlimQuant W4A8 PCP HT requires moe_backend='auto' or 'deep_gemm'"
@@ -125,8 +136,41 @@ def slimquant_w4a8_uses_deepep_ll(moe_config: object) -> bool:
     config = get_current_vllm_config_or_none()
     if config is None:
         config = getattr(moe_config, "_hcu_vllm_config", None)
-    if model_architectures(config) != ("HYV4ForCausalLM",):
-        raise ValueError("SlimQuant W4A8 DeepEP LL requires HYV4ForCausalLM")
+    architectures = model_architectures(config)
+    if architectures not in (("HYV4ForCausalLM",), ("HYV4VLForConditionalGeneration",)):
+        raise ValueError(
+            "SlimQuant W4A8 DeepEP LL requires HYV4ForCausalLM "
+            "or HYV4VLForConditionalGeneration"
+        )
+    if architectures == ("HYV4VLForConditionalGeneration",):
+        outer_parallel = getattr(config, "parallel_config", None)
+        expected_outer = {
+            "pipeline_parallel_size": 1,
+            "tensor_parallel_size": 1,
+            "prefill_context_parallel_size": 1,
+            "data_parallel_size": 16,
+            "decode_context_parallel_size": 1,
+        }
+        expected_moe = {"pcp_size": 1, "dp_size": 16, "ep_size": 16, "tp_size": 1}
+        if (
+            any(
+                getattr(outer_parallel, name, None) != value
+                for name, value in expected_outer.items()
+            )
+            or any(
+                getattr(parallel, name, None) != value
+                for name, value in expected_moe.items()
+            )
+        ):
+            raise ValueError(
+                "SlimQuant W4A8 HYV4-VL DeepEP LL requires "
+                "PP1/TP1/PCP1/DP16/DCP1/EP16"
+            )
+    if (
+        architectures == ("HYV4VLForConditionalGeneration",)
+        and getattr(config, "speculative_config", None) is not None
+    ):
+        raise ValueError("SlimQuant W4A8 HYV4-VL does not support MTP")
     if getattr(moe_config, "moe_backend", "auto") not in ("auto", "deep_gemm"):
         raise ValueError(
             "SlimQuant W4A8 DeepEP LL requires moe_backend='auto' or 'deep_gemm'"
@@ -403,6 +447,11 @@ def ht_receiver(
         expert_num_tokens_per_expert_list,
         device=expert_x.device,
     )
+    # Preserve the native Python list before tensor conversion can coerce a
+    # malformed value; it is not trusted for sizing until prepare validates
+    # the selected owner and the actual physical map.
+    if getattr(self, "_hcu_static_ht_owner", None) is not None:
+        expert_tokens_meta._hcu_static_ht_native_counts = expert_num_tokens_per_expert_list
     post_dispatch_channel_fp8 = _uses_post_dispatch_channel_fp8_quant(
         quant_config
     )
@@ -480,7 +529,7 @@ def ht_prepare_async(
             if quant_config.quant_dtype == "nvfp4"
             else quant_config.a1_scale
         )
-    return self._do_dispatch(
+    receiver = self._do_dispatch(
         tokens=a1q,
         token_scales=a1q_scale,
         rank_topk_ids=topk_ids,
@@ -490,6 +539,63 @@ def ht_prepare_async(
         quant_config=quant_config,
         defer_input_quant=defer_input_quant,
     )
+    owner_ref = getattr(self, "_hcu_static_ht_owner", None)
+    owner = owner_ref() if owner_ref is not None else None
+    if not (owner is not None and current_platform.is_rocm()
+            and getattr(owner, "_vllm_hcu_static_eplb_row", None) is not None
+            and getattr(getattr(owner, "quant_method", None), "_hcu_static_eplb", False)
+            and henvs.VLLM_HCU_STATIC_HT_W4A8_COUNT_SCRATCH
+            and num_experts > 0 and num_experts % 16 == 0):
+        return receiver
+    local_experts = num_experts // 16
+    offset = self.rank_expert_offset
+    if offset % local_experts or not (0 <= offset < num_experts):
+        return receiver
+    from vllm_hcu.model_executor.layers.fused_moe.static_ht_scratch import (
+        attach_plan, is_linear_map, map_signature,
+    )
+    if expert_map is None:
+        return receiver
+    try:
+        signature = map_signature(expert_map)
+    except (AttributeError, RuntimeError):
+        return receiver
+    version = signature[-1]
+    # The static manager owns inference tensors without version counters.
+    # Its only supported topology update replaces the physical map object.
+    inference_owner_ref = None
+    if version is None:
+        manager = getattr(owner, "expert_map_manager", None)
+        if getattr(manager, "expert_map", None) is not expert_map:
+            return receiver
+        inference_owner_ref = owner_ref
+    cache = getattr(self, "_hcu_static_ht_map_cache", None)
+    if (cache is None or cache[0] is not expert_map or cache[1] != signature
+            or cache[2] != (num_experts, local_experts, offset)):
+        valid = is_linear_map(expert_map, num_experts, local_experts, offset)
+        self._hcu_static_ht_map_cache = (
+            expert_map, signature, (num_experts, local_experts, offset), valid
+        )
+    else:
+        valid = cache[3]
+    if not valid:
+        return receiver
+
+    def receive_with_plan():
+        result = receiver()
+        metadata = result[2]
+        manager = getattr(owner, "expert_map_manager", None)
+        if (metadata is not None and map_signature(expert_map) == signature
+                and (inference_owner_ref is None
+                     or getattr(manager, "expert_map", None) is expert_map)):
+            attach_plan(metadata,
+                getattr(metadata, "_hcu_static_ht_native_counts", None),
+                local_experts, result[0].shape[0],
+                henvs.VLLM_HCU_STATIC_HT_W4A8_COUNT_DIAGNOSTIC,
+                expert_map, version, inference_owner_ref)
+        return result
+
+    return receive_with_plan
 
 
 def ll_init(

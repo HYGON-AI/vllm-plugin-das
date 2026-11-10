@@ -145,10 +145,100 @@ def _require_hyv4_pcp_mtp_contract(vllm_config: object) -> None:
             and getattr(parallel, "data_parallel_size", None) == 1
             and getattr(parallel, "decode_context_parallel_size", None) == 1
             and getattr(getattr(parallel, "eplb_config", None),
-                        "num_redundant_experts", None) == 0
+                        "num_redundant_experts", None) in (
+                            (0, 16) if __import__("os").environ.get(
+                                "HY4_EXPERIMENTAL_STATIC_R16") == "1" else (0,))
         )
         if not static_pcp:
             raise ValueError("HYV4 PCP MTP does not support EPLB outside static W4A8 PCP16.")
+
+
+def _require_hyv4_vl_pcp_contract(vllm_config: object) -> None:
+    """Admit only the initial no-MTP image producer with static W4A8 EPLB."""
+    parallel = vllm_config.parallel_config
+    model = vllm_config.model_config
+    feature = get_hcu_config(vllm_config)
+    raw_quantization = getattr(
+        getattr(model, "hf_config", None), "quantization_config", None
+    )
+    expected = {
+        "pipeline_parallel_size": 1,
+        "tensor_parallel_size": 1,
+        "prefill_context_parallel_size": 16,
+        "data_parallel_size": 1,
+        "decode_context_parallel_size": 1,
+        "enable_expert_parallel": True,
+        "all2all_backend": "deepep_high_throughput",
+        "enable_eplb": True,
+    }
+    if (
+        any(
+            _require_hcu_pcp_attribute(parallel, name, "ParallelConfig") != value
+            for name, value in expected.items()
+        )
+        or getattr(getattr(model, "hf_config", None), "model_type", None)
+        != "hy_v4_vl"
+        or getattr(model, "quantization", None) != "compressed-tensors"
+        or not isinstance(raw_quantization, dict)
+        or raw_quantization.get("format") != "pack-quantized"
+        or getattr(getattr(vllm_config, "kernel_config", None), "moe_backend", None)
+        != "deep_gemm"
+        or vllm_config.speculative_config is not None
+        or vllm_config.kv_transfer_config is None
+        or not feature.expert_map_path
+        or feature.expert_map_record_path
+        or feature.eplb_disable_rearrange
+        or getattr(
+            getattr(parallel, "eplb_config", None), "num_redundant_experts", None
+        ) not in (
+            (0, 16) if os.environ.get("HY4_EXPERIMENTAL_STATIC_R16") == "1" else (0,)
+        )
+    ):
+        raise ValueError(
+            "HYV4-VL PCP requires no MTP, PP1/TP1/PCP16/DP1/DCP1/EP16, "
+            "fixed DeepEP HT/DeepGEMM, compressed-tensors static W4A8 EPLB "
+            "R0 (or experimental R16), and a Mooncake producer."
+        )
+
+
+def validate_hyv4_vl_pcp_quantization(vllm_config: object, model: object) -> None:
+    """Check native-resolved expert methods before allocating the VL tower.
+
+    The raw packed-format check is only an early filter. Native compressed-tensors
+    resolution owns targets, ignored modules and mixed groups; inspect every
+    resulting expert method rather than reproducing that parser here.
+    """
+    model_config = getattr(vllm_config, "model_config", None)
+    parallel = getattr(vllm_config, "parallel_config", None)
+    if (
+        getattr(model_config, "architectures", None)
+        != ["HYV4VLForConditionalGeneration"]
+        or getattr(parallel, "prefill_context_parallel_size", 1) <= 1
+    ):
+        return
+
+    try:
+        layers = tuple(getattr(model, "moe_layers", ()))
+    except TypeError as exc:
+        raise ValueError("HYV4-VL PCP requires resolved static W4A8 MoE layers") from exc
+    if not layers:
+        raise ValueError("HYV4-VL PCP requires resolved static W4A8 MoE layers")
+
+    from vllm_hcu.model_executor.layers.quantization.compressed_tensors_w4a8_moe import (
+        HCU_COMPRESSED_W4A8_METHOD_MARKER,
+    )
+
+    for index, layer in enumerate(layers):
+        method = getattr(getattr(layer, "routed_experts", None), "quant_method", None)
+        if (
+            getattr(method, HCU_COMPRESSED_W4A8_METHOD_MARKER, False) is not True
+            or getattr(method, "_hcu_static_eplb", False) is not True
+            or getattr(method, "supports_eplb", False) is not True
+        ):
+            raise ValueError(
+                f"HYV4-VL PCP MoE layer {index} requires resolved compressed-tensors "
+                "W4A8 with static EPLB capability"
+            )
 
 
 def _require_mrv2_pcp_contract(vllm_config: object) -> None:
@@ -177,17 +267,20 @@ def _require_mrv2_pcp_contract(vllm_config: object) -> None:
     )
     is_glm52 = architectures == ["GlmMoeDsaForCausalLM"]
     is_hyv4 = architectures == ["HYV4ForCausalLM"]
+    is_hyv4_vl = architectures == ["HYV4VLForConditionalGeneration"]
+    if is_hyv4_vl:
+        _require_hyv4_vl_pcp_contract(vllm_config)
     if "HYV4MTPModel" in architectures:
         raise ValueError("HYV4 PCP does not support HYV4MTPModel.")
     if "HYV4ForCausalLM" in architectures and not is_hyv4:
         raise ValueError("HYV4 PCP requires exactly architecture HYV4ForCausalLM.")
-    if use_mla and not (is_glm52 or is_hyv4):
+    if use_mla and not (is_glm52 or is_hyv4 or is_hyv4_vl):
         raise ValueError(
             "HCU MLA PCP only supports GLM-5.2 architecture "
-            "GlmMoeDsaForCausalLM or HYV4ForCausalLM."
+            "GlmMoeDsaForCausalLM, HYV4ForCausalLM or HYV4VLForConditionalGeneration."
         )
-    mla_model = "HYV4" if is_hyv4 else "GLM-5.2"
-    if (is_glm52 or is_hyv4) and not use_mla:
+    mla_model = "HYV4" if is_hyv4 or is_hyv4_vl else "GLM-5.2"
+    if (is_glm52 or is_hyv4 or is_hyv4_vl) and not use_mla:
         raise ValueError(f"{mla_model} PCP requires MLA or sparse MLA.")
     if not use_mla:
         from vllm.v1.attention.backends.registry import AttentionBackendEnum
@@ -286,7 +379,7 @@ def _require_mrv2_pcp_contract(vllm_config: object) -> None:
                 raise ValueError("GLM-5.2 PCP only supports built-in MTP.")
     if _require_hcu_pcp_attribute(vllm_config, "lora_config", "VllmConfig") is not None:
         raise ValueError("HCU PCP does not support LoRA.")
-    if _require_hcu_pcp_attribute(
+    if not is_hyv4_vl and _require_hcu_pcp_attribute(
         model_config, "is_multimodal_model", "ModelConfig"
     ):
         raise ValueError("HCU PCP does not support multimodal models.")
@@ -297,6 +390,7 @@ def _require_mrv2_pcp_contract(vllm_config: object) -> None:
 
     if kv_transfer_config is not None and (
         is_hyv4
+        or is_hyv4_vl
         or _require_hcu_pcp_attribute(
             kv_transfer_config, "kv_connector", "KVTransferConfig"
         )
@@ -305,7 +399,7 @@ def _require_mrv2_pcp_contract(vllm_config: object) -> None:
         # kv_role is the validated KVTransferConfig role, not kv_rank or a
         # connector-name heuristic. kv_both includes a consumer and is excluded.
         if not (
-            is_hyv4
+            (is_hyv4 or is_hyv4_vl)
             and getattr(kv_transfer_config, "kv_connector", None) == "MooncakeConnector"
             and getattr(kv_transfer_config, "kv_role", None) == "kv_producer"
             and getattr(kv_transfer_config, "kv_connector_module_path", "") is None

@@ -376,10 +376,23 @@ class SlimQuantW4A8Int8AiterMoEMethod(FusedMoEMethodBase):
                     else make_deepep_auto_deepgemm_w4a8_moe_kernel
                 )
             )
+            factory_kwargs = {}
+            if uses_deepep_ht and henvs.VLLM_HCU_STATIC_HT_W4A8_COUNT_SCRATCH:
+                from vllm.config import get_current_vllm_config_or_none
+
+                config = get_current_vllm_config_or_none()
+                hf_config = getattr(getattr(config, "model_config", None), "hf_config", None)
+                if (getattr(self, "_hcu_static_eplb", False)
+                        and getattr(getattr(config, "model_config", None),
+                                    "enforce_eager", False) is True
+                        and getattr(hf_config, "model_type", None) in (
+                            "hy_v4", "hy_v4_mtp", "hy_v4_vl")):
+                    factory_kwargs["static_owner"] = layer
             self.moe_kernel = factory(
                 moe_quant_config=self.moe_quant_config,
                 moe_config=self.moe,
                 routing_tables=layer._expert_routing_tables(),
+                **factory_kwargs,
             )
             fused_experts = getattr(self.moe_kernel, "fused_experts", None)
             experts = getattr(fused_experts, "experts", fused_experts)

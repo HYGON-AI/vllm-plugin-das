@@ -202,6 +202,17 @@ class HcuGPUModelRunnerV2(GPUModelRunner):
         super().__init__(vllm_config, device)
         self.pcp_manager = None
 
+    def load_model(self, *args, **kwargs):
+        result = super().load_model(*args, **kwargs)
+        architectures = getattr(
+            getattr(self.vllm_config, "model_config", None), "architectures", ()
+        )
+        if tuple(architectures) == ("HYV4VLForConditionalGeneration",):
+            from vllm_hcu.v1.hyv4_vl_profile import account_hyv4_vl_state_memory
+
+            account_hyv4_vl_state_memory(self)
+        return result
+
     def initialize_kv_cache(self, kv_cache_config):
         pcp_size = int(
             self.vllm_config.parallel_config.prefill_context_parallel_size
@@ -231,6 +242,11 @@ class HcuGPUModelRunnerV2(GPUModelRunner):
             )
             if getattr(getattr(self, "speculator", None), "pcp_local_prefill", False):
                 self.speculator.pcp_manager = self.pcp_manager
+        bind_manager = getattr(
+            getattr(self, "model_state", None), "bind_pcp_manager", None
+        )
+        if bind_manager is not None:
+            bind_manager(self.pcp_manager)
 
     def prepare_inputs(self, scheduler_output, batch_desc):
         input_batch = super().prepare_inputs(scheduler_output, batch_desc)
@@ -245,10 +261,30 @@ class HcuGPUModelRunnerV2(GPUModelRunner):
 
     @functools.wraps(GPUModelRunner.execute_model)
     def execute_model(self, *args, **kwargs):
-        with deepep_auto_request_phase_scope():
+        dummy_run = kwargs.get("dummy_run", args[2] if len(args) > 2 else False)
+        dummy_scope = getattr(
+            getattr(self, "model_state", None), "dummy_run_scope", None
+        )
+        scope = dummy_scope(dummy_run) if dummy_scope is not None else nullcontext()
+        with deepep_auto_request_phase_scope(), scope:
             return super().execute_model(*args, **kwargs)
 
     def profile_run(self) -> None:
+        architectures = getattr(
+            getattr(self.vllm_config, "model_config", None), "architectures", ()
+        )
+        scope = nullcontext()
+        if tuple(architectures) == ("HYV4VLForConditionalGeneration",):
+            from vllm_hcu.v1.hyv4_vl_profile import profile_hyv4_vl_vision
+
+            scope = profile_hyv4_vl_vision(self)
+
+        # Encoder peak/cache budget uses the global scheduler limit. Only the
+        # decoder dummy path below shrinks its token count for PCP.
+        with scope:
+            return self._profile_decoder_run()
+
+    def _profile_decoder_run(self) -> None:
         """PCP-aware profile: dummy tokens per rank = max_num_batched_tokens / pcp_size.
 
         Upstream ``GPUModelRunner.profile_run`` sends ``self.max_num_tokens``

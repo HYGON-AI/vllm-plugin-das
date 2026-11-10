@@ -105,6 +105,23 @@ def test_hyv4_changes_route_to_complete_portable_contract_job(path):
     assert "hy4-contract" in _selected_job_ids(path)
 
 
+@pytest.mark.parametrize("path", [
+    "vllm_hcu/v1/hyv4_vl_profile.py",
+    "vllm_hcu/v1/hcu_model_runner_v2.py",
+    "vllm_hcu/v1/pcp_manager.py",
+    "vllm_hcu/models/hy_v4/vl_mrv2.py",
+    "tests/models/hy_v4/test_pcp_multimodal_inputs.py",
+    "tests/models/hy_v4/test_vl_mrv2.py",
+    "tests/models/hy_v4/test_vl_mrv2_profile.py",
+    "tests/runtime_patch/test_hyv4_vl_route_gates.py",
+])
+def test_hyv4_vl_isolated_changes_select_contract_without_fallback(path):
+    jobs, groups, fallback = select_jobs(_config(), [path])
+    assert "hy4-contract" in {job["registry_job"] for job in jobs}
+    assert "hy4-contract" in groups
+    assert fallback is False
+
+
 def test_hyv4_registry_runs_complete_modules_without_hardware_claims():
     jobs = validate_config(_config())
     assert "hy4-contract" in jobs
@@ -122,6 +139,7 @@ def test_hyv4_registry_runs_complete_modules_without_hardware_claims():
         "tests/accuracy/test_hyv4_w4a8_kernels.py",
         "tests/integration/models/test_hy_v4_smoke.py",
         "tests/integration/test_model_runtime_cli.py",
+        "tests/runtime_patch/test_hyv4_vl_route_gates.py",
     })
     assert required <= targets
     assert all("::" not in target for target in targets)
