@@ -8,6 +8,13 @@ This document reports the **frozen-base revalidation**. The historical
 `+1.007%` / `-0.989%` / `+0.085%` result on the earlier lineage remains a
 historical reference only; it is not an acceptance threshold for this round.
 
+**No current-mainline decode speedup is claimed.** The latest paired E2E
+decode A/B measures a median of **-0.73%** (the two groups are **-0.44%** and
+**-1.02%**) with **0/2 paired wins**. The earlier frozen-baseline `+0.56%`
+reported below is superseded by that measurement and is retained as a
+historical reference only. The delivery rests on the correctness and
+ownership-boundary work, not on a demonstrated decode gain.
+
 ## Target correction (supersedes the original C1 commit narrative)
 
 The original C1 commit `67b757d` and earlier drafts described the target as
@@ -135,7 +142,23 @@ C1 (final head):                plugin points VLLM_TUNED_CONFIG_FOLDER at
 FALLBACK: E=352 miss; dtype=fp8 miss; device-name miss -> vLLM bundled/default;
           user VLLM_TUNED_CONFIG_FOLDER is preserved and wins.
 BW1100 / BW1101 alias smoke: PASS
+PROVENANCE: an armed value is recorded in
+          VLLM_HCU_TUNED_CONFIG_FOLDER_AUTOSET, so a Ray worker that inherits
+          the driver's environment re-discovers and re-checks the folder
+          against its own AITER install instead of trusting the driver's
+          conclusion; an explicitly user-set folder is still left untouched.
 ```
+
+The provenance record closes a multi-node hole in the contract guard: vLLM's
+Ray executors copy the driver's environment into each worker before the worker
+loads this plugin, so an auto-armed folder arrives at the worker looking
+exactly like a user override.  Without provenance a worker whose AITER is the
+older `!406` table at the same install path would skip the guard and re-arm
+it (the native selector then returns the decode tile `BM16 BN64 BK128 w2 s1`
+at `M=300` instead of the native default `BM64 BN128 BK64 w8 s2`), and a
+worker whose install prefix differs would be pointed at a driver path that
+does not exist locally.  Both shapes are covered by
+`tests/patch/test_moe_tuned_config.py`.
 
 The validated `67b757d` run used the 19-key plugin-owned table.  The final
 AITER table adds only the four `M>256` boundary rows; the `M<=256` rows are
@@ -176,7 +199,24 @@ MEDIAN_DELTA_ROWS=-27.19%    (12/12 negative)
 
 The historical −25.79% is reference only.
 
-## Paired E2E (frozen base)
+## Latest paired E2E decode A/B — current delivery result
+
+```
+E2E_DECODE_MEDIAN_DELTA_PERCENT=-0.73
+E2E_DECODE_GROUP_DELTAS_PERCENT=-0.44, -1.02
+E2E_PAIRED_WINS=0/2
+CURRENT_DELIVERY_SPEEDUP_CLAIMED=NONE
+```
+
+This is the current delivery result for decode. It is a small negative median
+with no paired win, so the PR claims **no decode speedup on current
+mainline**; the `+0.56%` below belongs to an earlier frozen-baseline round and
+must not be quoted as the current result.
+
+## Paired E2E (frozen base) — historical reference only
+
+Superseded by the section above. Retained for traceability of the
+frozen-baseline round.
 
 3 interleaved clean-restart pairs on nmz106; TP4 × DP2 × EP8, MTP3, bs 32,
 input 65536, output 4096, seed 42. A0 arm = `8b7fae2` (56d23cd + mandatory
@@ -189,11 +229,11 @@ pin fix); C1 arm = `67b757d` (+ C1 diff only).
 | 3 | 1388.873 | 1399.747 | +0.783% |
 
 ```
-CURRENT_MAINLINE_E2E_DIRECTION=POSITIVE_WEAK
-CURRENT_MAINLINE_E2E_MEDIAN=+0.56%
-CURRENT_MAINLINE_PAIRED_WINS=2/3
-CURRENT_MAINLINE_ITL_DELTA=-0.28%
-CURRENT_MAINLINE_PREFILL_DELTA=+0.22%
+HISTORICAL_FROZEN_BASE_E2E_DIRECTION=POSITIVE_WEAK
+HISTORICAL_FROZEN_BASE_E2E_MEDIAN=+0.56%
+HISTORICAL_FROZEN_BASE_PAIRED_WINS=2/3
+HISTORICAL_FROZEN_BASE_ITL_DELTA=-0.28%
+HISTORICAL_FROZEN_BASE_PREFILL_DELTA=+0.22%
 
 E2E_VALID_PAIRS=3
 PAIRED_WINS=2/3
@@ -218,15 +258,17 @@ Aggregation: the decode median is the ratio of the three life medians; the
 mean and the ITL/prefill deltas are means of the three life means (the frozen
 convention). `evidence/e2e_frozen_base_summary.json` also records a
 ratio-of-medians `itl_delta_percent` (-0.575%); that field is a different
-aggregation and is **not** the current-mainline ITL delta reported here.
+aggregation and is **not** the frozen-base ITL delta reported here.
 
 The frozen extension rule (3/3 positive and stable) was **not** met:
 PAIR2 is −0.001%, a statistical tie. The run therefore stopped at the
-required 3 pairs and was **not** extended to 5. The current-mainline result
-is classified **POSITIVE_WEAK** (median decode +0.56%, 2/3 paired wins,
-ITL -0.28%); it is reported on its own merits. The historical `+1.007%` is
-**not** current-mainline performance and was not used as an acceptance
-threshold.
+required 3 pairs and was **not** extended to 5. The frozen-base result was
+classified **POSITIVE_WEAK** (median decode +0.56%, 2/3 paired wins,
+ITL -0.28%) at the time of that round; it has since been superseded by the
+latest paired E2E decode A/B (median -0.73%, 0/2 paired wins) and is no
+longer a statement about current-mainline performance. The historical
+`+1.007%` is **not** current-mainline performance either, and was not used as
+an acceptance threshold.
 
 ## Historical C1 result — reference only
 

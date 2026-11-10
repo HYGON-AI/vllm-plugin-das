@@ -25,6 +25,7 @@ import pytest
 
 from vllm_hcu.moe_config_env import (
     TUNED_CONFIG_FOLDER_ENV,
+    TUNED_CONFIG_FOLDER_ORIGIN_ENV,
     configure_tuned_moe_config_folder,
     get_tuned_moe_config_folder,
 )
@@ -99,7 +100,7 @@ def _write_target_tables(
     """Create a test-only AITER package with the target Step5 aliases."""
 
     config_dir = root / "aiter" / "configs" / "vllm_moe"
-    config_dir.mkdir(parents=True)
+    config_dir.mkdir(parents=True, exist_ok=True)
     for alias in aliases:
         path = config_dir / (
             f"E={DRAFT_MOE_E},N={DRAFT_MOE_N},device_name={alias}.json"
@@ -454,6 +455,185 @@ def test_empty_selection_with_old_table_is_not_armed(
 
     assert environ[TUNED_CONFIG_FOLDER_ENV] == ""
     assert "selector-boundary contract" in caplog.text
+
+
+def _ray_worker_env(driver_environ: dict[str, str]) -> dict[str, str]:
+    """Mimic how a Ray worker inherits the driver's environment.
+
+    Both of vLLM's Ray executors copy driver variables into the worker
+    process (``initialize_worker`` applies them with ``setdefault``, the older
+    executor via its env-copy path) before the worker loads this plugin, and
+    the ``VLLM_`` prefix means the provenance marker travels with the folder.
+    A fresh worker has neither variable of its own, so the copy is a plain
+    inheritance of both.
+    """
+
+    worker_environ: dict[str, str] = {}
+    for key, value in driver_environ.items():
+        worker_environ.setdefault(key, value)
+    return worker_environ
+
+
+def test_ray_worker_with_an_old_table_rejects_the_driver_value(
+    monkeypatch, tmp_path, caplog
+):
+    """Driver new table / worker old table at the same install path.
+
+    The inherited value must not be mistaken for a user override: the worker
+    re-checks the contract locally and falls back to vLLM's own configs.
+    """
+
+    module, config_dir = _fake_aiter_package(
+        monkeypatch, tmp_path, FIXED_AITER_TABLE_KEYS
+    )
+    driver_environ: dict[str, str] = {}
+    module.configure_tuned_moe_config_folder(driver_environ)
+    assert driver_environ[TUNED_CONFIG_FOLDER_ENV] == str(config_dir)
+
+    # Same absolute package path on the worker node, older !406-only table.
+    _write_target_tables(tmp_path, OLD_AITER_TABLE_KEYS)
+    worker_environ = _ray_worker_env(driver_environ)
+
+    with caplog.at_level(
+        logging.WARNING, logger="vllm_hcu.moe_config_env"
+    ):
+        module.configure_tuned_moe_config_folder(worker_environ)
+
+    assert TUNED_CONFIG_FOLDER_ENV not in worker_environ
+    assert TUNED_CONFIG_FOLDER_ORIGIN_ENV not in worker_environ
+    assert "selector-boundary contract" in caplog.text
+
+
+def test_ray_worker_without_the_marker_still_rejects_an_old_table(
+    monkeypatch, tmp_path, caplog
+):
+    """The guard must not depend on the marker surviving the env copy.
+
+    A user can blacklist it via ``RAY_NON_CARRY_OVER_ENV_VARS``; the value is
+    still recognised as automatic because it is exactly what local discovery
+    would arm.
+    """
+
+    module, config_dir = _fake_aiter_package(
+        monkeypatch, tmp_path, FIXED_AITER_TABLE_KEYS
+    )
+    driver_environ: dict[str, str] = {}
+    module.configure_tuned_moe_config_folder(driver_environ)
+
+    _write_target_tables(tmp_path, OLD_AITER_TABLE_KEYS)
+    worker_environ = {TUNED_CONFIG_FOLDER_ENV: str(config_dir)}
+
+    with caplog.at_level(
+        logging.WARNING, logger="vllm_hcu.moe_config_env"
+    ):
+        module.configure_tuned_moe_config_folder(worker_environ)
+
+    assert TUNED_CONFIG_FOLDER_ENV not in worker_environ
+    assert "selector-boundary contract" in caplog.text
+
+
+def test_ray_worker_with_a_different_install_path_rearms_its_own(
+    monkeypatch, tmp_path
+):
+    """Differing install prefixes: the worker must use its own local folder."""
+
+    module, driver_dir = _fake_aiter_package(
+        monkeypatch, tmp_path / "driver", FIXED_AITER_TABLE_KEYS
+    )
+    driver_environ: dict[str, str] = {}
+    module.configure_tuned_moe_config_folder(driver_environ)
+    assert driver_environ[TUNED_CONFIG_FOLDER_ENV] == str(driver_dir)
+
+    worker_root = tmp_path / "worker"
+    worker_dir = _write_target_tables(worker_root, FIXED_AITER_TABLE_KEYS)
+    monkeypatch.setattr(
+        module, "_aiter_package_dir", lambda: str(worker_root / "aiter")
+    )
+    worker_environ = _ray_worker_env(driver_environ)
+
+    module.configure_tuned_moe_config_folder(worker_environ)
+
+    assert worker_environ[TUNED_CONFIG_FOLDER_ENV] == str(worker_dir)
+    assert worker_environ[TUNED_CONFIG_FOLDER_ORIGIN_ENV] == str(worker_dir)
+    assert worker_environ[TUNED_CONFIG_FOLDER_ENV] != str(driver_dir)
+
+
+def test_ray_worker_without_aiter_drops_the_driver_value(
+    monkeypatch, tmp_path, caplog
+):
+    """A node with no AITER at all must not keep the driver's path."""
+
+    module, _ = _fake_aiter_package(
+        monkeypatch, tmp_path, FIXED_AITER_TABLE_KEYS
+    )
+    driver_environ: dict[str, str] = {}
+    module.configure_tuned_moe_config_folder(driver_environ)
+
+    monkeypatch.setattr(module, "_aiter_package_dir", lambda: None)
+    worker_environ = _ray_worker_env(driver_environ)
+
+    with caplog.at_level(
+        logging.WARNING, logger="vllm_hcu.moe_config_env"
+    ):
+        module.configure_tuned_moe_config_folder(worker_environ)
+
+    assert TUNED_CONFIG_FOLDER_ENV not in worker_environ
+    assert TUNED_CONFIG_FOLDER_ORIGIN_ENV not in worker_environ
+    assert "was not found" in caplog.text
+
+
+def test_explicit_user_folder_survives_the_ray_env_copy(monkeypatch, tmp_path):
+    """A genuine user override still wins on the worker, old table or not."""
+
+    module, _ = _fake_aiter_package(
+        monkeypatch, tmp_path, FIXED_AITER_TABLE_KEYS
+    )
+    driver_environ = {TUNED_CONFIG_FOLDER_ENV: "/opt/user-tuned"}
+
+    module.configure_tuned_moe_config_folder(driver_environ)
+
+    assert driver_environ[TUNED_CONFIG_FOLDER_ENV] == "/opt/user-tuned"
+    # Nothing was armed, so no provenance is claimed over the user's value.
+    assert TUNED_CONFIG_FOLDER_ORIGIN_ENV not in driver_environ
+
+    _write_target_tables(tmp_path, OLD_AITER_TABLE_KEYS)
+    worker_environ = _ray_worker_env(driver_environ)
+
+    module.configure_tuned_moe_config_folder(worker_environ)
+
+    assert worker_environ[TUNED_CONFIG_FOLDER_ENV] == "/opt/user-tuned"
+
+
+def test_a_user_folder_outranks_a_stale_marker(monkeypatch, tmp_path):
+    """A marker left over from an earlier value must not claim a new one."""
+
+    module, config_dir = _fake_aiter_package(
+        monkeypatch, tmp_path, FIXED_AITER_TABLE_KEYS
+    )
+    environ = {
+        TUNED_CONFIG_FOLDER_ENV: "/opt/user-tuned",
+        TUNED_CONFIG_FOLDER_ORIGIN_ENV: str(config_dir),
+    }
+
+    module.configure_tuned_moe_config_folder(environ)
+
+    assert environ[TUNED_CONFIG_FOLDER_ENV] == "/opt/user-tuned"
+
+
+def test_a_still_valid_auto_set_value_stays_armed(monkeypatch, tmp_path):
+    """Re-running discovery on a healthy node is idempotent."""
+
+    module, config_dir = _fake_aiter_package(
+        monkeypatch, tmp_path, FIXED_AITER_TABLE_KEYS
+    )
+    driver_environ: dict[str, str] = {}
+    module.configure_tuned_moe_config_folder(driver_environ)
+    worker_environ = _ray_worker_env(driver_environ)
+
+    module.configure_tuned_moe_config_folder(worker_environ)
+
+    assert worker_environ[TUNED_CONFIG_FOLDER_ENV] == str(config_dir)
+    assert worker_environ[TUNED_CONFIG_FOLDER_ORIGIN_ENV] == str(config_dir)
 
 
 def test_package_import_arms_the_folder_before_vllm_reads_it():
