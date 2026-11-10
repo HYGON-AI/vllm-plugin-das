@@ -936,6 +936,10 @@ class MooncakeConnector(KVConnectorBase_V1, SupportsHMA):
             request, num_computed_tokens
         )
 
+    def on_new_request(self, request: "Request") -> None:
+        assert self.connector_scheduler is not None
+        self.connector_scheduler.on_new_request(request)
+
     def update_state_after_alloc(
         self, request: "Request", blocks: "KVCacheBlocks", num_external_tokens: int
     ):
@@ -1125,6 +1129,14 @@ class MooncakeConnectorScheduler:
             request.max_tokens = 1
             params["_p_side_truncated"] = True
 
+    def on_new_request(self, request: "Request") -> None:
+        # Truncate before the scheduler's local prefix-cache lookup: a later
+        # truncation would leave a full-length cache hit against the shorter
+        # prompt and nothing left to schedule.
+        params = request.kv_transfer_params
+        if params is not None and params.get("do_remote_decode") and self._has_mamba:
+            self._truncate_mamba_request_for_prefill(request)
+
     def get_num_new_matched_tokens(
         self, request: "Request", num_computed_tokens: int
     ) -> tuple[int, bool]:
@@ -1163,9 +1175,6 @@ class MooncakeConnectorScheduler:
             )
             if count > 0:
                 return count, True
-
-        if params.get("do_remote_decode") and self._has_mamba:
-            self._truncate_mamba_request_for_prefill(request)
 
         # No remote prefill for this request.
         return 0, False
