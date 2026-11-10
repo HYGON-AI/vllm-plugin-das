@@ -206,5 +206,6 @@ Receipts: `int8-main-performance-abba-r2/terminal.json`,
 `int8-performance-driver-terminal-red-green-r2.json`. Reproduce from the frozen
 run scripts `run_qwen35_int8_performance_abba_r2.py`,
 `run_qwen35_int8_performance_arm_r2.py`, `model_case_int8_performance_r2.py` and
-`int8_serving_performance_client_r1.py`; controller manifest binds their bytes.
+`int8_serving_performance_client_r1.py`; the controller manifest binds the arm,
+model-driver and client bytes.
 No gfx938 EP2, MTP, reload, clean lifecycle or broad performance acceptance.
