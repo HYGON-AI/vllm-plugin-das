@@ -14,7 +14,40 @@ second plugin callback cannot retry a partially registered custom op.
 from __future__ import annotations
 
 import importlib
+import logging
 import threading
+
+
+def _attach_vllm_log_handler() -> None:
+    """Make ``vllm_hcu`` log records reach vLLM's handler.
+
+    vLLM's logging config declares only the ``vllm`` logger and installs no
+    root handler, so records from ``vllm_hcu.*`` propagate to a handler-less
+    root and Python's ``lastResort`` drops everything below WARNING: every
+    ``logger.info`` in this package was being discarded in every process.
+    Mirror vLLM's handler and level onto the package logger. A
+    ``VLLM_LOGGING_CONFIG_PATH`` that already configures ``vllm_hcu``, or any
+    other pre-installed handler, is left untouched.
+    """
+
+    package_logger = logging.getLogger("vllm_hcu")
+    if package_logger.handlers:
+        return
+    try:
+        import vllm.logger  # noqa: F401  - importing configures "vllm"
+    except Exception:
+        # Logging is never worth failing plugin discovery over.
+        return
+    vllm_logger = logging.getLogger("vllm")
+    if not vllm_logger.handlers:
+        return
+    for handler in vllm_logger.handlers:
+        package_logger.addHandler(handler)
+    package_logger.setLevel(vllm_logger.level)
+    package_logger.propagate = False
+
+
+_attach_vllm_log_handler()
 
 from vllm_hcu.lightop_env import configure_lightop_environment
 
