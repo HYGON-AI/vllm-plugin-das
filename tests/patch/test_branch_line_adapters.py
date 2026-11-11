@@ -47,17 +47,55 @@ ADAPTERS = (
 )
 
 
+def _adapter_itself_missing(
+    exc: ModuleNotFoundError, module_name: str
+) -> bool:
+    """True when the import failure is the pinned adapter (or one of its
+    vllm_hcu package parents) being gone -- a structural-gate failure.
+    False for external heavyweight deps (torch, fbgemm, ...), which stay
+    skippable on lean machines."""
+    missing = exc.name or ""
+    return missing == module_name or module_name.startswith(missing + ".")
+
+
 @pytest.mark.parametrize("module_name", [row[0] for row in ADAPTERS])
 def test_branch_line_adapter_is_importable_with_contract(module_name):
     try:
         module = importlib.import_module(module_name)
     except ModuleNotFoundError as exc:
-        pytest.skip(f"torch-dependent environment required: {exc}")
+        # Review P3: only EXTERNAL heavyweight deps may turn this into a
+        # skip. A missing adapter is exactly what this structural gate
+        # exists to catch -- skipping would silently drop the
+        # module-presence contract from CI.
+        if _adapter_itself_missing(exc, module_name):
+            raise
+        pytest.skip(
+            f"optional runtime dependency missing ({exc.name}): {exc}"
+        )
     assert module.PATCH_ID
     assert module.TARGET_MODULE
     assert callable(module.apply_to_module)
     # The gate token: this file literally names every adapter stem.
     assert Path(module.__file__).stem in module_name
+
+
+def test_adapter_missing_gate_distinguishes_external_from_own():
+    """The skip/raise decision pin: external dep -> skippable; the
+    adapter itself or its package path -> structural failure."""
+    assert _adapter_itself_missing(
+        ModuleNotFoundError(name="torch"), "vllm_hcu.patch.adapter_x"
+    ) is False
+    assert _adapter_itself_missing(
+        ModuleNotFoundError(name="vllm_hcu.patch.adapter_x"),
+        "vllm_hcu.patch.adapter_x",
+    ) is True
+    assert _adapter_itself_missing(
+        ModuleNotFoundError(name="vllm_hcu.patch"),
+        "vllm_hcu.patch.adapter_x",
+    ) is True
+    assert _adapter_itself_missing(
+        ModuleNotFoundError(name=None), "vllm_hcu.patch.adapter_x"
+    ) is False
 
 
 def test_nc_qcat_is_opt_in_by_default(monkeypatch):

@@ -1397,12 +1397,23 @@ def test_flashmla_cat_route_consumes_split_query(
     assert calls[0]["cache_seqlens"] is seq_lens
 
 
-@pytest.mark.parametrize("initial_rows", [40, 160])
-def test_flashmla_fp8_graph_metadata_grows_and_keeps_only_valid_rows(
+@pytest.mark.parametrize(
+    "initial_rows,expect_overflow",
+    [(160, False), (40, True)],
+    ids=["within-bound-keeps-valid-rows", "under-bound-refuses-growth"],
+)
+def test_flashmla_fp8_graph_metadata_fixed_upper_bound(
     monkeypatch,
     cpu_flashmla,
     initial_rows,
+    expect_overflow,
 ):
+    """Graph metadata buffers have a fixed startup upper bound: a step
+    whose planner output fits keeps only its valid rows (never exposing
+    the zero/-1-padded tail), and a step that would need MORE rows must
+    raise instead of growing -- a reallocated buffer would dangle inside
+    already-captured graphs (review P2: the growth precedent this test
+    encoded predated the fixed-bound contract)."""
     flashmla = cpu_flashmla
     valid_tile_metadata = torch.arange(80 * 8, dtype=torch.int32).reshape(80, 8)
     valid_num_splits = torch.tensor([0, 3], dtype=torch.int32)
@@ -1428,20 +1439,18 @@ def test_flashmla_fp8_graph_metadata_grows_and_keeps_only_valid_rows(
     builder.num_q_heads = 10
     builder.dcp_world_size = 1
     builder.is_fp8_kvcache = True
-    # A one-token decode needs 160 rows, while a later multi-token MTP
-    # verification needs only 80. Reusing the larger persistent buffer must
-    # not expose its zero-padded tail to the native kernel.
-    builder.cg_buf_tile_scheduler_metadata = torch.full(
-        (initial_rows, 8),
-        -1,
-        dtype=torch.int32,
-    )
-    builder.cg_buf_num_splits = torch.full((9,), -1, dtype=torch.int32)
+    # Upper-bound buffer vs. an 80-row demand: within bound the copy
+    # keeps only the valid rows; under bound the step aborts BEFORE any
+    # write, so the buffer must come out untouched.
+    tile_buf = torch.full((initial_rows, 8), -1, dtype=torch.int32)
+    splits_buf = torch.full((9,), -1, dtype=torch.int32)
+    builder.cg_buf_tile_scheduler_metadata = tile_buf
+    builder.cg_buf_num_splits = splits_buf
     builder.compilation_config = SimpleNamespace(
         cudagraph_mode=SimpleNamespace(has_full_cudagraphs=lambda: True)
     )
 
-    result = builder._build_decode(
+    kwargs = dict(
         block_table_tensor=torch.zeros(1, 3, dtype=torch.int32),
         seq_lens_device=torch.tensor([139], dtype=torch.int32),
         max_seq_len=139,
@@ -1450,6 +1459,15 @@ def test_flashmla_fp8_graph_metadata_grows_and_keeps_only_valid_rows(
         num_decode_tokens=2,
         dcp_tot_seq_lens_device=None,
     )
+    if expect_overflow:
+        with pytest.raises(AssertionError, match="exceed graph buffer"):
+            builder._build_decode(**kwargs)
+        # No partial copy: the refusal precedes every buffer write.
+        assert bool((tile_buf == -1).all())
+        assert bool((splits_buf == -1).all())
+        return
+
+    result = builder._build_decode(**kwargs)
 
     assert result.scheduler_metadata.tile_scheduler_metadata.shape == (80, 8)
     torch.testing.assert_close(
