@@ -142,8 +142,8 @@ _HOST_OUTER_INIT = _constructor(_OUTER_NATIVE, _REVIEWED[2],
 
 class HcuV41PcpForCausalLM(native_vl.DeepseekV41ForCausalLM):
     def __init__(self, *, vllm_config, prefix=''):
-        from hcu_adapter.fp4_indexer import selected as fp4_selected
-        if fp4_selected():
+        from hcu_adapter.fp4_indexer import applicable as fp4_applicable
+        if fp4_applicable(vllm_config):
             from ..fp4_indexer import preflight
             preflight(vllm_config)
             from ..v41_pcp_activation import check_health
