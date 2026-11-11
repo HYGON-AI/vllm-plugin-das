@@ -19,7 +19,7 @@ from hcu_vllm_das import v41_indexer_activation as activation
 from hcu_vllm_das import fp4_packer
 from vllm.v1.attention.backends.mla.indexer import DeepseekV32IndexerMetadata
 
-from test_fp4_full_admission import config
+from test_fp4_full_admission import attention_config, config
 
 
 class Linear(torch.nn.Module):
@@ -71,6 +71,10 @@ def chain(monkeypatch):
     monkeypatch.setenv('HCU_VLLM_FP4_PACKER_IMPL', 'triton')
     monkeypatch.setenv('HCU_VLLM_SPARSE_INDEXER_IMPL', 'stock')
     monkeypatch.delenv('HCU_DISABLE_OPS', raising=False)
+    # This chain exercises the FP4 path, so the deployment has to declare the
+    # MXFP4 indexer cache: `fp4_indexer.applicable()` now asks core whether the
+    # model actually uses one, and core resolves `auto` to `fp8`.
+    cfg.attention_config = attention_config('mxfp4')
     monkeypatch.setattr(activation, 'check_health', lambda: None)
     monkeypatch.setattr(fp4_packer, 'check_health', lambda: None)
     monkeypatch.setattr(fp4_packer, '_state', dict(mode='triton'))

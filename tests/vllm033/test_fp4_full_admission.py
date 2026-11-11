@@ -7,8 +7,31 @@ import pytest
 import torch
 from hcu_adapter import hcu_env
 from hcu_adapter.extensions import ExtensionContext, ExtensionCommitError
-from hcu_adapter.fp4_indexer import selected, validate_config
+from hcu_adapter.fp4_indexer import applicable, selected, validate_config
 from hcu_vllm_das import v41_indexer_activation as activation
+
+
+def attention_config(indexer_kv_dtype='auto'):
+    """Stand-in for core's AttentionConfig on the one method admission reads.
+
+    ``fp4_indexer.applicable()`` asks core's
+    ``resolve_indexer_kv_dtype('fp8')`` whether this deployment actually uses an
+    MXFP4 indexer cache. Core resolves ``auto`` to ``fp8``, so the fake has to
+    reproduce that resolution instead of only carrying the raw attribute.
+    """
+    return NS(indexer_kv_dtype=indexer_kv_dtype, indexer_sparse_logits=False,
+              resolve_indexer_kv_dtype=lambda default: (
+                  default if indexer_kv_dtype == 'auto' else indexer_kv_dtype))
+
+
+def config_with(**overrides):
+    """Same fake config with one field replaced (attention config included)."""
+    cfg = config()
+    if 'indexer_kv_dtype' in overrides:
+        cfg.attention_config = attention_config(overrides.pop('indexer_kv_dtype'))
+    for key, value in overrides.items():
+        setattr(cfg, key, value)
+    return cfg
 
 
 def config(ratio=1):
@@ -20,8 +43,7 @@ def config(ratio=1):
               parallel_config=NS(tensor_parallel_size=1, pipeline_parallel_size=1,
                                  prefill_context_parallel_size=1, decode_context_parallel_size=1,
                                  data_parallel_size=1, enable_dbo=False, enable_eplb=False),
-              cache_config=NS(block_size=64*ratio), attention_config=NS(
-                  indexer_kv_dtype='auto', indexer_sparse_logits=False),
+              cache_config=NS(block_size=64*ratio), attention_config=attention_config(),
               kernel_config=NS(monokernel=False, enable_jit_warmup=False),
               speculative_config=None, lora_config=None, kv_transfer_config=None,
               use_v2_model_runner=True)
@@ -37,10 +59,21 @@ def optin(monkeypatch):
 
 
 def test_off_preserves_default_fp8(monkeypatch):
+    """`selected()` stays on by default; what keeps FP8 off the FP4 path is
+    `applicable()`, which asks core for the actual indexer cache dtype.
+
+    `validate_config` deliberately keeps validating the FP4 plan whenever the
+    knob is on: it is the admission of the FP4 deployment itself, and the
+    callers (`v41_indexer`, `models/v41_pcp`) are the ones that ask
+    `applicable()` first.
+    """
     monkeypatch.delenv('HCU_VLLM_FP4_INDEXER_IMPL', raising=False)
     monkeypatch.delenv('HCU_DISABLE_OPS', raising=False)
-    assert not selected()
-    assert validate_config(config()) is None
+    assert selected()
+    assert not applicable(config())
+    assert not applicable(config_with(indexer_kv_dtype='fp8'))
+    assert applicable(config_with(indexer_kv_dtype='mxfp4'))
+    assert validate_config(config_with(indexer_kv_dtype='mxfp4')).ratios == (1,)
 
 
 def test_config_file_optin_uses_real_resolver(monkeypatch):
@@ -113,11 +146,41 @@ def test_mixed_ratio_and_variable_physical_pages_admitted(optin, ratios, block):
     assert validate_config(optin).ratios == tuple(sorted(set(ratios) - {0}))
 
 
-@pytest.mark.parametrize('field,value', [('lora_config', object()), ('kv_transfer_config', object()),
+@pytest.mark.parametrize('field,value', [('lora_config', object()),
                                        ('use_v2_model_runner', False)])
 def test_unsupported_deployment_refused(optin, field, value):
     setattr(optin, field, value)
     with pytest.raises(ValueError, match='before allocation'):
+        validate_config(optin)
+
+
+def test_pd_connector_is_admitted(optin):
+    """PD/KV-transfer is no longer rejected: the FP4 page format travels as
+    opaque block bytes, so an identically configured prefill/decode pair is
+    expected to transfer unchanged. Still unmeasured, so this asserts admission
+    only, not that the transfer works."""
+    optin.kv_transfer_config = object()
+    assert validate_config(optin).ratios == (1,)
+
+
+def test_lora_still_refused(optin):
+    optin.lora_config = object()
+    with pytest.raises(ValueError, match='LoRA'):
+        validate_config(optin)
+
+
+@pytest.mark.parametrize('warmup', [True, False])
+def test_jit_warmup_does_not_block_admission(optin, warmup):
+    """`register_warmup()` only queues a compile key, so the owner kernels are
+    still unhashed when the packer rebinds them; `_require_cold()` is the
+    runtime judge. Admission must therefore accept either value."""
+    optin.kernel_config.enable_jit_warmup = warmup
+    assert validate_config(optin).ratios == (1,)
+
+
+def test_monokernel_still_refused(optin):
+    optin.kernel_config.monokernel = True
+    with pytest.raises(ValueError, match='monokernel'):
         validate_config(optin)
 
 
