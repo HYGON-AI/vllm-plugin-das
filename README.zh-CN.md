@@ -17,9 +17,10 @@
 - Adapter（宿主分发名 `hcu-adapter`、内核分发名 `sgl-kernel`，
   包名 `hcu_adapter`）负责真实 HCU 身份、
   runtime 准入、平台/通用插件入口和进程健康。
-- 本 Plugin 经 `hcu_adapter.extensions` 注册可选 RMSNorm 和显式
-  FlashAttention provider。INT8 模型路由沿用官方实现，历史 AITER INT8
-  原型不作为已注册的模型能力；各有效能力独立检查前置条件与验收门槛。
+- 本 Plugin 经 `hcu_adapter.extensions` 接入可选 RMSNorm、FlashAttention、
+  SlimQuant 与 AITER INT8 专家 provider。AITER INT8 使用 Core 公开后端注册接口；
+  量化选择、权重加载、模型路由与 MoE runner/归约仍归 Core 所有。
+  各 provider 独立检查前置条件与验收门槛；历史私有覆盖路径保持退休。
 
 Plugin 分发版本统一为 `0.33.0`，与 vLLM 发布线对应。仓库根目录的
 `vllm_hcu` 源码保留为 vLLM 0.28.1 历史开发参考；根目录 `setup.py`

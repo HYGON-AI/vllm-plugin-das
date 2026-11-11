@@ -19,10 +19,11 @@ Passing release admission does not validate the native ABI or a model.
 - Adapter (host `hcu-adapter`, kernel `sgl-kernel`, package `hcu_adapter`) owns
   real HCU identity,
   runtime admission, platform/general entry points and process health.
-- This Plugin uses `hcu_adapter.extensions` to register optional RMSNorm and
-  explicit FlashAttention providers. Official vLLM retains INT8 model routing;
-  the historical AITER INT8 prototype is not an advertised model capability.
-  Each active provider has separate prerequisites and acceptance gates.
+- This Plugin uses `hcu_adapter.extensions` for optional RMSNorm,
+  FlashAttention, SlimQuant and AITER INT8 expert providers. AITER INT8 uses
+  Core's public backend registry; Core retains quantization selection, weight
+  loading, model routing and MoE runner/reductions. Each provider has separate
+  prerequisites and acceptance gates; historical private overrides remain retired.
 
 The Plugin distribution version is `0.33.0`, aligned with the vLLM release
 line. The retained repository-root `vllm_hcu` source is the legacy vLLM 0.28.1

@@ -23,7 +23,7 @@ def test_project_metadata_has_only_the_adapter_extension_entry_point() -> None:
     assert metadata["version"] == "0.33.0"
     assert metadata["requires-python"] == ">=3.11,<3.15"
     assert metadata["dependencies"] == [
-        "hcu-adapter>=0.1.0",
+        "hcu-adapter>=0.5.22",
         "packaging>=23",
     ]
     assert metadata["entry-points"] == {
@@ -31,6 +31,7 @@ def test_project_metadata_has_only_the_adapter_extension_entry_point() -> None:
             "das_hcu": "hcu_vllm_das.extension:extension_spec",
             "das_hcu_flash": "hcu_vllm_das.flash_activation:extension_spec",
             "das_hcu_slimquant": "hcu_vllm_das.slimquant_activation:extension_spec",
+            "das_hcu_aiter_int8": "hcu_vllm_das.int8_activation:extension_spec",
         }
     }
     assert "vllm.platform_plugins" not in metadata["entry-points"]
@@ -102,7 +103,7 @@ def test_built_wheel_contains_only_the_new_plugin_namespace(tmp_path: Path) -> N
     entry_point_lines = entry_points.splitlines()
     assert "Name: hcu-vllm-das-plugin" in metadata_lines
     assert "Version: 0.33.0" in metadata_lines
-    assert "Requires-Dist: hcu-adapter>=0.1.0" in metadata_lines
+    assert "Requires-Dist: hcu-adapter>=0.5.22" in metadata_lines
     assert "[hcu_adapter.extensions]" in entry_point_lines
     assert "das_hcu = hcu_vllm_das.extension:extension_spec" in entry_point_lines
     assert "[vllm.platform_plugins]" not in entry_point_lines
