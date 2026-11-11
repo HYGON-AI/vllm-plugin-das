@@ -1367,18 +1367,22 @@ def test_profile_run_restores_max_num_tokens_on_exception(
 
 
 @pytest.mark.parametrize("fail", [False, True])
+@pytest.mark.parametrize("depth", [1, 2])
 @pytest.mark.parametrize("chunk", [None, "256", "768", "1024"])
 @pytest.mark.parametrize("architecture,pcp,max_reqs", [
     ("HYV4ForCausalLM", 8, 16),
+    ("HYV4ForCausalLM", 16, 1024),
     ("HYV4VLForConditionalGeneration", 16, 1024),
 ])
-def test_hyv4_profile_chunks_only_draft_and_restores_propose(
-    pcp_runner_module, monkeypatch, fail, chunk, architecture, pcp, max_reqs,
+def test_hyv4_profile_covers_replicated_requests_without_expanding_local_prefill(
+    pcp_runner_module, monkeypatch, fail, depth, chunk, architecture, pcp, max_reqs,
 ):
     from contextlib import contextmanager
 
     from vllm_hcu.models.hy_v4 import moe
-    from vllm_hcu.model_executor.layers.attention.pcp import in_replicated_mtp_batch
+    from vllm_hcu.model_executor.layers.attention.pcp import (
+        in_replicated_mtp_batch, replicated_mtp_batch_scope,
+    )
     from vllm_hcu.v1 import hyv4_vl_profile
 
     vision_active = []
@@ -1424,6 +1428,8 @@ def test_hyv4_profile_chunks_only_draft_and_restores_propose(
     layer.experts = Experts()
     local_tokens = (8192 // pcp) * 9 // 8
     inputs = torch.zeros((local_tokens, 4))
+    needs_probe = depth > 1 and max_reqs > local_tokens
+    proposal_batches = []
 
     from vllm.v1.worker.gpu.input_batch import InputBatch
 
@@ -1433,18 +1439,32 @@ def test_hyv4_profile_chunks_only_draft_and_restores_propose(
     monkeypatch.setattr(InputBatch, "make_dummy", staticmethod(make_dummy))
 
     class Speculator:
+        pcp_local_prefill = True
+        num_speculative_steps = depth
+        supports_mm_inputs = architecture == "HYV4VLForConditionalGeneration"
+
         def propose(self, **kwargs):
             assert bool(vision_active) == (architecture == "HYV4VLForConditionalGeneration")
             hidden = kwargs["last_hidden_states"]
-            expected = 8192 if chunk else local_tokens
+            probe = in_replicated_mtp_batch()
+            expected = max_reqs if probe else local_tokens
+            proposal_batches.append((probe, kwargs["input_batch"].num_reqs, expected))
             assert kwargs["input_batch"].num_tokens == expected
             assert hidden.shape == (expected, 4)
             assert len(kwargs["num_sampled"]) == kwargs["input_batch"].num_reqs
+            if self.supports_mm_inputs:
+                embeds, mask = kwargs["mm_inputs"]
+                assert embeds == []
+                assert mask.shape == (expected,)
+            else:
+                assert kwargs["mm_inputs"] is None
             torch.testing.assert_close(layer(hidden), hidden + 1)
-            # A second MTP step has one replicated row per global request.
             rows = kwargs["input_batch"].num_reqs
-            torch.testing.assert_close(layer(hidden[:rows]), hidden[:rows] + 1)
-            if fail:
+            if depth > 1:
+                # CPU stand-in for later native replicated one-row/request steps.
+                with replicated_mtp_batch_scope():
+                    torch.testing.assert_close(layer(hidden[:rows]), hidden[:rows] + 1)
+            if fail and (not needs_probe or probe):
                 raise RuntimeError("draft profile failed")
 
     def dummy_run(self, num_tokens):
@@ -1457,6 +1477,8 @@ def test_hyv4_profile_chunks_only_draft_and_restores_propose(
             last_hidden_states=inputs, aux_hidden_states=None,
             num_sampled=torch.ones(min(max_reqs, num_tokens)),
             num_rejected=torch.zeros(min(max_reqs, num_tokens)),
+            mm_inputs=([], torch.zeros(num_tokens, dtype=torch.bool))
+            if self.speculator.supports_mm_inputs else None,
         )
 
     def profile_run(self):
@@ -1476,16 +1498,21 @@ def test_hyv4_profile_chunks_only_draft_and_restores_propose(
             runner.profile_run()
     else:
         runner.profile_run()
-    if chunk:
-        size = int(chunk)
-        expected_rows = [min(size, 8192 - i) for i in range(0, 8192, size)]
-        expected_rows += [min(size, max_reqs - i) for i in range(0, max_reqs, size)]
-        assert calls == [(False, local_tokens)] + [(True, n) for n in expected_rows]
-        assert allocations == [(8192, 4)] + ([(max_reqs, 4)] if max_reqs > size else [])
-    else:
-        assert calls == [(False, local_tokens), (False, local_tokens),
-                         (False, min(max_reqs, local_tokens))]
-        assert allocations == []
+    expected_batches = [(False, min(max_reqs, local_tokens), local_tokens)]
+    replicated_rows = [min(max_reqs, local_tokens)] if depth > 1 else []
+    if needs_probe:
+        expected_batches.append((True, max_reqs, max_reqs))
+        replicated_rows += [max_reqs, max_reqs]
+    assert proposal_batches == expected_batches
+    expected_calls = [(False, local_tokens)] * 2  # Target and first draft stay local.
+    expected_allocations = []
+    for rows in replicated_rows:
+        size = int(chunk) if chunk else rows
+        expected_calls += [(True, min(size, rows - i)) for i in range(0, rows, size)]
+        if rows > size:
+            expected_allocations.append((rows, 4))
+    assert calls == expected_calls
+    assert allocations == expected_allocations
     assert runner.max_num_tokens == 8192
     assert not in_replicated_mtp_batch()
     assert "propose" not in vars(runner.speculator)
