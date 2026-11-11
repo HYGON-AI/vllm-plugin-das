@@ -138,6 +138,10 @@ class HcuGPUWorker(Worker):
             from vllm_hcu.model_executor.layers import gemma4_lm_head
 
             gemma4_lm_head.load_head_table()
+            # The softcap lookup wraps logits_processor.forward and the row
+            # bucket wraps logits_processor._get_logits, so they compose:
+            # forward applies the table to what _get_logits returns.
+            gemma4_lm_head.install_softcap_lut(self.model_runner)
             gemma4_lm_head.install_head_bucket(self.model_runner)
         from vllm_hcu.patch.worker import validate_worker_patches
         model_runner = getattr(self, "model_runner", None)
