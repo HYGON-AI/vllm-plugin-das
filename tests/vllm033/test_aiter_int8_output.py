@@ -113,7 +113,8 @@ def test_zero_remote_routes_overwrite_poisoned_destination(monkeypatch):
 
 @pytest.mark.parametrize('returns_destination', [True, False])
 def test_expert_forwards_destination_and_copies_only_allocated_fallback(monkeypatch, returns_destination):
-    monkeypatch.setattr(int8_experts, '_require_active', lambda: None)
+    monkeypatch.setattr(int8_experts, '_require_active', lambda: 'gfx936')
+    monkeypatch.setattr(int8_experts, '_device_architecture', lambda _=None: 'gfx936')
     cfg = FusedMoEConfig(num_experts=4, experts_per_token=2, hidden_dim=8,
         intermediate_size=6, num_local_experts=4, num_logical_experts=4,
         activation=MoEActivation.SILU, device='cuda', in_dtype=torch.bfloat16,
@@ -146,6 +147,11 @@ def test_expert_forwards_destination_and_copies_only_allocated_fallback(monkeypa
     assert seen[0].get('output') is output
     assert output.copies == (0 if returns_destination else 1)
     assert torch.equal(output, torch.full_like(output, 7))
+    monkeypatch.setattr(int8_experts, '_device_architecture', lambda _=None: 'gfx938')
+    with pytest.raises(ValueError, match='tensor device'):
+        expert.apply(output, a['hidden_states'], a['w1'], a['w2'], a['topk_weights'],
+            a['topk_ids'], MoEActivation.SILU, 4, None, None, None, empty, empty, None, False)
+    assert len(seen) == 1
 
 
 def test_public_provider_forwards_hint_to_native_api(monkeypatch):

@@ -3,6 +3,7 @@
 from pathlib import Path
 import subprocess
 import sys
+from types import SimpleNamespace
 
 import pytest
 import torch
@@ -132,6 +133,30 @@ def test_frozen_identity_hashes_content_and_refuses_drift(tmp_path):
     assert first.digest != second.digest
 
 
+@pytest.mark.parametrize('directory_alias', [True, False])
+def test_frozen_identity_reopens_the_path_used_by_the_loader(tmp_path, directory_alias):
+    from hcu_vllm_das.moe.int8_identity import FrozenFiles
+    original, replacement = tmp_path / 'original', tmp_path / 'replacement'
+    for directory, data in ((original, b'first object'), (replacement, b'other object')):
+        directory.mkdir()
+        (directory / 'kernel.co').write_bytes(data)
+    alias = tmp_path / 'alias'
+    if directory_alias:
+        alias.symlink_to(original, target_is_directory=True)
+        filename, new_target = alias / 'kernel.co', replacement
+    else:
+        alias.symlink_to(original / 'kernel.co')
+        filename, new_target = alias, replacement / 'kernel.co'
+    identity = FrozenFiles.capture({'asm/kernel.co': filename})
+    identity.validate()
+    alias.unlink()
+    alias.symlink_to(new_target, target_is_directory=directory_alias)
+    with pytest.raises(RuntimeError, match='path changed'):
+        identity.validate_paths()
+    with pytest.raises(RuntimeError, match='changed'):
+        identity.validate()
+
+
 def test_late_activation_refuses_vendor_config_cache_before_device_work(monkeypatch):
     from types import ModuleType
     from vllm.model_executor.layers.fused_moe.oracle.int8_backend_registry import get_int8_moe_backend
@@ -157,11 +182,12 @@ def ep_config(**changes):
                   num_logical_experts=256, moe_parallel_config=parallel, **changes)
 
 
-@pytest.fixture
-def qualified_ep2_device(monkeypatch):
-    from hcu_adapter.bridges import vllm as host
-    monkeypatch.setattr(host, 'detect_hcu',
-        lambda: host.HcuDetection(True, 'gfx936', 'CPU external-device fixture'))
+@pytest.fixture(params=['gfx936', 'gfx938'])
+def qualified_ep2_device(monkeypatch, request):
+    monkeypatch.setattr(torch.cuda, 'current_device', lambda: 0)
+    monkeypatch.setattr(torch.cuda, 'get_device_properties', lambda _:
+        SimpleNamespace(gcnArchName=request.param))
+    return request.param
 
 
 def test_static_ep2_config_is_admitted_for_qualified_bf16_geometry(qualified_ep2_device):
@@ -169,6 +195,15 @@ def test_static_ep2_config_is_admitted_for_qualified_bf16_geometry(qualified_ep2
     actual = ep_config()
     assert config_rejection(actual) is None
     assert HcuAiterInt8Experts._supports_parallel_config(actual.moe_parallel_config)
+
+
+@pytest.mark.parametrize('assigned_arch', ['gfx936', 'gfx938', 'gfx942'])
+def test_ep2_checks_actual_nonzero_worker_arch(monkeypatch, qualified_ep2_device, assigned_arch):
+    monkeypatch.setattr(torch.cuda, 'current_device', lambda: 1)
+    monkeypatch.setattr(torch.cuda, 'get_device_properties', lambda index: SimpleNamespace(
+        gcnArchName='gfx936' if index == 0 else assigned_arch + ':sramecc+',
+    ))
+    assert (config_rejection(ep_config()) is None) == (assigned_arch in ('gfx936', 'gfx938'))
 
 
 @pytest.mark.parametrize(('field', 'value'), [
@@ -195,7 +230,7 @@ def test_unqualified_ep_geometry_refuses_before_conversion(field, value):
 def test_public_ep_apply_forwards_canonical_map_and_compatibility_optin(monkeypatch,qualified_ep2_device):
     from hcu_vllm_das.moe import int8_experts, fused_moe_aiter
     from vllm.model_executor.layers.fused_moe.config import int8_w8a8_moe_quant_config
-    monkeypatch.setattr(int8_experts, '_require_active', lambda: None)
+    monkeypatch.setattr(int8_experts, '_require_active', lambda: qualified_ep2_device)
     cfg = ep_config()
     s1 = torch.empty((128, 1024, 1), device='meta')
     s2 = torch.empty((128, 2048, 1), device='meta')

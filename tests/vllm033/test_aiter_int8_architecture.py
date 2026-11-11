@@ -10,7 +10,7 @@ import os
 import subprocess
 import sys
 import tempfile
-from types import ModuleType
+from types import ModuleType, SimpleNamespace
 from unittest.mock import patch
 
 import pytest
@@ -47,10 +47,14 @@ def _scenario_supported(architecture, drift="value"):
         chip.get_gfx = lambda: provider_architecture[0]
         # Native acquisition would load JIT modules/configs. Only that external
         # acquisition is replaced; publication and its official consumers run.
-        with patch.dict(sys.modules, {'aiter': ModuleType('aiter'), 'aiter.moe': ModuleType('aiter.moe'), chip.__name__: chip}), \
+        asm_dir = folder + '/'
+        with patch.dict(os.environ, {'AITER_ASM_DIR': asm_dir}), \
+             patch.dict(sys.modules, {'aiter': ModuleType('aiter'), 'aiter.moe': ModuleType('aiter.moe'), chip.__name__: chip}), \
              patch.object(host, 'detect_hcu', return_value=host.HcuDetection(True, architecture, '')) as detect, \
              patch.object(host, 'require_extension_healthy', return_value=None), \
-             patch.object(owner, '_prepare_identity', return_value=(identity, ((chip, 'get_gfx', chip.get_gfx),), chip)):
+             patch.object(torch.cuda, 'current_device', return_value=1), \
+             patch.object(torch.cuda, 'get_device_properties', return_value=SimpleNamespace(gcnArchName=architecture)) as properties, \
+             patch.object(owner, '_prepare_identity', return_value=(identity, ((chip, 'get_gfx', chip.get_gfx),), chip, os.fsencode(asm_dir))):
             context = ExtensionContext(adapter_version='0.5.22', vllm_version='0.33.0',
                 requested_capabilities={'hcu-aiter-int8-moe'})
             owner.activate(context)
@@ -71,6 +75,18 @@ def _scenario_supported(architecture, drift="value"):
             assert oracle.map_int8_backend('triton') is oracle.Int8MoeBackend.TRITON
             owner.check_health()
             detect.return_value = host.HcuDetection(True, architecture, '')
+            if drift == 'mixed-worker':
+                properties.return_value = SimpleNamespace(
+                    gcnArchName='gfx938' if architecture == 'gfx936' else 'gfx936')
+                with pytest.raises(ValueError):
+                    oracle.select_int8_moe_backend(config)
+                from vllm.model_executor.layers.fused_moe.config import int8_w8a8_moe_quant_config
+                quant = int8_w8a8_moe_quant_config(
+                    torch.ones((8,256,1)), torch.ones((8,256,1)), None, None,
+                    per_act_token_quant=True)
+                with pytest.raises(ValueError, match='worker device'):
+                    HcuAiterInt8Experts(config, quant)
+                return dict(architecture=architecture, mixed_worker_refused=True)
             if drift == 'ep-scope':
                 from vllm.model_executor.layers.fused_moe.config import int8_w8a8_moe_quant_config
                 parallel = FusedMoEParallelConfig(tp_size=1, pcp_size=1, dp_size=1,
@@ -91,7 +107,10 @@ def _scenario_supported(architecture, drift="value"):
                 assert isinstance(HcuAiterInt8Experts(ep,quant),HcuAiterInt8Experts)
                 return dict(architecture=architecture,tp1=selected.value,
                     ep2='admitted')
-            if drift == 'value':
+            if drift == 'asm-dir':
+                # This changes what C getenv sees without changing os.environ.
+                os.putenv('AITER_ASM_DIR', folder)
+            elif drift == 'value':
                 provider_architecture[0] = 'gfx936' if architecture == 'gfx938' else 'gfx938'
             else:
                 replacement = ModuleType(chip.__name__)
@@ -190,10 +209,34 @@ def test_replaced_provider_architecture_module_refuses_later_public_selection():
     assert _run_scenario('_scenario_supported', 'gfx938', 'module')['provider_drift_refused'] == 'module'
 
 
+def test_native_loader_directory_drift_refuses_later_public_selection():
+    assert _run_scenario('_scenario_supported', 'gfx936', 'asm-dir')['provider_drift_refused'] == 'asm-dir'
+
+
+@pytest.mark.parametrize('architecture', ['gfx936', 'gfx938'])
+def test_worker_architecture_must_match_the_published_native_provider(architecture):
+    assert _run_scenario('_scenario_supported', architecture, 'mixed-worker')['mixed_worker_refused']
+
+
+def test_asm_walk_keeps_loader_paths_and_rejects_directory_cycles(tmp_path):
+    from hcu_vllm_das.int8_activation import _asm_objects
+
+    root = tmp_path / 'objects'
+    root.mkdir()
+    target = tmp_path / 'objects-outside'
+    target.mkdir()
+    (target / 'kernel.co').write_bytes(b'fixture')
+    alias = root / 'w8a8'
+    alias.symlink_to(target, target_is_directory=True)
+    assert list(_asm_objects(root)) == [alias / 'kernel.co']
+    (target / 'cycle').symlink_to(root, target_is_directory=True)
+    with pytest.raises(RuntimeError, match='directory cycle'):
+        list(_asm_objects(root))
+
+
 def _scenario_route_source_drift():
     """A changed integer route program must invalidate the real content factor."""
     import importlib
-    from types import SimpleNamespace
     from hcu_vllm_das import int8_activation as owner
     assert 'aiter.fused_moe_asm_wna16' not in sys.modules
     with tempfile.TemporaryDirectory() as folder:
@@ -214,14 +257,18 @@ def _scenario_route_source_drift():
         asm.load_and_cache_csv_for_quant=lambda *_:True
         codeobjects=root/'objects';codeobjects.mkdir()
         (codeobjects/'cpu.fixture.co').write_text('CPU identity fixture,not a GPU binary')
-        jit.get_asm_dir=lambda:str(codeobjects)
+        jit.get_asm_dir=lambda:str(codeobjects)+'/'
         modules={name:fixture(name)for name in('module_cpp_api','module_moe_asm')}
         jit.get_module=lambda name:modules[name]
         external={m.__name__:m for m in(native,moe,chip,asm,jit,route)}
         def acquire(name):
             return external[name] if name in external else importlib.import_module(name)
         with patch.object(owner,'import_module',side_effect=acquire):
-            identity,_,_=owner._prepare_identity(native,moe,'gfx936')
+            with patch.dict(os.environ, {'AITER_ASM_DIR': str(codeobjects)}):
+                with pytest.raises(RuntimeError, match='native loader directory'):
+                    owner._prepare_identity(native,moe,'gfx936')
+            with patch.dict(os.environ, {'AITER_ASM_DIR': jit.get_asm_dir()}):
+                identity,_,_,_=owner._prepare_identity(native,moe,'gfx936')
             identity.validate()
             Path(route.__file__).write_text('Changed CPU route source fixture')
             with pytest.raises(RuntimeError,match='files changed'):

@@ -10,6 +10,16 @@ from vllm.model_executor.layers.quantization.utils.quant_utils import (
 )
 
 
+def _device_architecture(device=None):
+    try:
+        if device is None:
+            device = torch.cuda.current_device()
+        properties = torch.cuda.get_device_properties(device)
+        return properties.gcnArchName.strip().split(':', 1)[0]
+    except (AttributeError, AssertionError, RuntimeError, ValueError):
+        return None
+
+
 def _parallel_supported(p):
     # PassThrough declares output reduced; this expert delegates AR to Core.
     if (p.use_passthrough_all2all or p.enable_eplb or p.dp_size != 1
@@ -36,11 +46,8 @@ def config_rejection(config):
         or m.experts_per_token != 8 or m.elastic_ep_max_dp_size not in (None, 1)
     ):
         return 'INT8 ASM EP2 requires qualified BF16 E256/local128/H2048/N512/top8'
-    if p.use_ep:
-        from hcu_adapter.bridges.vllm import detect_hcu
-        detection = detect_hcu()
-        if not detection.detected or detection.architecture not in ('gfx936', 'gfx938'):
-            return 'INT8 ASM EP2 is qualified only on gfx936/gfx938'
+    if p.use_ep and _device_architecture() not in ('gfx936', 'gfx938'):
+        return 'INT8 ASM EP2 requires a gfx936 or gfx938 worker device'
     if m.aiter_fmoe_shared_expert_enabled:
         return 'INT8 ASM shared expert fusion is not validated'
     if (m.hidden_dim != m.hidden_dim_unpadded
@@ -59,7 +66,7 @@ def _require_active():
     from hcu_adapter.bridges.vllm import require_extension_healthy
     from hcu_vllm_das.int8_activation import CAPABILITY, require_published
     require_extension_healthy(CAPABILITY)
-    require_published()
+    return require_published()
 
 
 def convert_weights(*, w13, w2, layer=None, w13_scale=None):
@@ -76,7 +83,9 @@ class HcuAiterInt8Experts(mk.FusedMoEExpertsModular):
     consumes_expert_mask = False
 
     def __init__(self, moe_config, quant_config):
-        _require_active()
+        published_architecture = _require_active()
+        if _device_architecture() != published_architecture:
+            raise ValueError('INT8 ASM worker device differs from the published provider architecture')
         reason = config_rejection(moe_config)
         if reason or not quant_config.use_int8_w8a8 or not quant_config.per_act_token_quant:
             raise ValueError(reason or 'INT8 ASM requires dynamic token INT8 W8A8')
@@ -97,11 +106,8 @@ class HcuAiterInt8Experts(mk.FusedMoEExpertsModular):
 
     @staticmethod
     def _supports_current_device():
-        _require_active()
-        from hcu_adapter.bridges.vllm import detect_hcu
-        from hcu_vllm_das.int8_activation import _SUPPORTED_ARCHITECTURES
-        detection = detect_hcu()
-        return detection.detected and detection.architecture in _SUPPORTED_ARCHITECTURES
+        published_architecture = _require_active()
+        return _device_architecture() == published_architecture
 
     @staticmethod
     def _supports_no_act_and_mul():
@@ -137,14 +143,18 @@ class HcuAiterInt8Experts(mk.FusedMoEExpertsModular):
     def apply(self, output, hidden_states, w1, w2, topk_weights, topk_ids, activation,
               global_num_experts, expert_map, a1q_scale, a2_scale, workspace13,
               workspace2, expert_tokens_meta, apply_router_weight_on_input):
-        _require_active()
+        published_architecture = _require_active()
+        tensor_architecture = _device_architecture(hidden_states.device)
+        if tensor_architecture is None or tensor_architecture != published_architecture:
+            raise ValueError('INT8 ASM tensor device differs from the published provider architecture')
         if (expert_tokens_meta is not None or apply_router_weight_on_input
                 or a1q_scale is not None or a2_scale is not None
                 or global_num_experts != self.moe_config.num_experts):
             raise ValueError('INT8 ASM received an unsupported routing/quantization contract')
         ep = self.moe_config.moe_parallel_config.use_ep
         if ep:
-            if (not isinstance(expert_map, torch.Tensor) or expert_map.ndim != 1
+            if (tensor_architecture not in ('gfx936', 'gfx938')
+                    or not isinstance(expert_map, torch.Tensor) or expert_map.ndim != 1
                     or expert_map.numel() != global_num_experts
                     or expert_map.dtype != torch.int32 or not expert_map.is_contiguous()
                     or expert_map.device != hidden_states.device

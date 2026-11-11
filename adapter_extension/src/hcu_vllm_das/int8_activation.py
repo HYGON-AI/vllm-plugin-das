@@ -1,5 +1,6 @@
 """Explicit independent publication through the public INT8 backend registry."""
 
+import ctypes
 from dataclasses import dataclass
 from importlib import import_module
 import os
@@ -20,6 +21,9 @@ _lock = RLock()
 _published = None
 _failure = False
 _publishing = False
+_getenv = ctypes.PyDLL(None).getenv
+_getenv.argtypes = (ctypes.c_char_p,)
+_getenv.restype = ctypes.c_char_p
 
 
 @dataclass(frozen=True)
@@ -30,6 +34,7 @@ class _Publication:
     bindings: tuple
     architecture: str
     chip_info: object
+    asm_dir: bytes
 
 
 def _after_fork():
@@ -66,8 +71,14 @@ def require_published():
             if (sys.modules.get(_CHIP_INFO) is not _published.chip_info
                     or _published.chip_info.get_gfx() != _published.architecture):
                 _fatal()
+            # The C++ loader reads getenv during lazy module loading, including
+            # the trailing separator. Python's os.environ can be out of date.
+            if _getenv(b'AITER_ASM_DIR') != _published.asm_dir:
+                _fatal()
+            _published.identity.validate_paths()
         except BaseException as error:
             _fatal(error)
+        return _published.architecture
 
 
 def check_health():
@@ -82,6 +93,22 @@ def compile_factor():
     except BaseException as error:
         _fatal(error)
     return 'int8-asm-v1:' + _published.architecture + ':' + _published.identity.digest
+
+
+def _asm_objects(root):
+    def fail(error):
+        raise error
+
+    ancestors = {}
+    for directory_name, _, files in os.walk(root, onerror=fail, followlinks=True):
+        directory = Path(directory_name)
+        stat = directory.stat()
+        target = stat.st_dev, stat.st_ino
+        lineage = ancestors.get(directory.parent, ())
+        if target in lineage:
+            raise RuntimeError('INT8 ASM object tree contains a directory cycle')
+        ancestors[directory] = (*lineage, target)
+        yield from (directory / name for name in files if name.endswith(('.co', '.hsaco')))
 
 
 def _prepare_identity(native, moe, architecture):
@@ -110,8 +137,12 @@ def _prepare_identity(native, moe, architecture):
                import_module(__name__)]
     modules += [jit.get_module(name) for name in ('module_cpp_api', 'module_moe_asm')]
     files = {module.__name__: module.__file__ for module in modules}
-    root = Path(jit.get_asm_dir())
-    objects = sorted(root.rglob('*.co')) + sorted(root.rglob('*.hsaco'))
+    asm_dir = _getenv(b'AITER_ASM_DIR')
+    if (not asm_dir or not os.path.isabs(asm_dir) or not asm_dir.endswith(b'/')
+            or asm_dir != os.fsencode(jit.get_asm_dir())):
+        raise RuntimeError('INT8 ASM native loader directory differs from the vendor object root')
+    root = Path(os.fsdecode(asm_dir))
+    objects = sorted(_asm_objects(root))
     if not objects:
         raise RuntimeError('INT8 ASM native objects are unavailable')
     files.update({'asm/' + str(path.relative_to(root)): path for path in objects})
@@ -125,11 +156,11 @@ def _prepare_identity(native, moe, architecture):
     ))
     if not all(callable(function) for _, _, function in bindings):
         raise RuntimeError('INT8 ASM native API is unavailable')
-    identity = FrozenFiles.capture(files)
+    identity = FrozenFiles.capture(files, watch_paths=(root,))
     if not asm.load_and_cache_csv_for_quant(asm.MoeQuantType.INT8_W8A8_C, 0):
         raise RuntimeError("INT8 ASM channel config is unavailable")
     identity.validate()
-    return identity, bindings, chip_info
+    return identity, bindings, chip_info, asm_dir
 
 
 def activate(context):
@@ -167,10 +198,10 @@ def activate(context):
             from .moe.int8_experts import HcuAiterInt8Experts, convert_weights
             native = import_module('aiter')
             moe = import_module('aiter.moe')
-            identity, bindings, chip_info = _prepare_identity(native, moe, detection.architecture)
+            identity, bindings, chip_info, asm_dir = _prepare_identity(native, moe, detection.architecture)
             backend = registry.register_int8_moe_backend('aiter', HcuAiterInt8Experts, convert_weights)
             envs.environment_variables[FACTOR] = compile_factor
-            _published = _Publication(os.getpid(), backend, identity, bindings, detection.architecture, chip_info)
+            _published = _Publication(os.getpid(), backend, identity, bindings, detection.architecture, chip_info, asm_dir)
             check_health()
         except BaseException as error:
             _fatal(error)
