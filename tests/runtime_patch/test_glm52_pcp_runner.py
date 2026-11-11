@@ -1367,12 +1367,35 @@ def test_profile_run_restores_max_num_tokens_on_exception(
 
 
 @pytest.mark.parametrize("fail", [False, True])
-@pytest.mark.parametrize("chunk", [None, "1024"])
-def test_hyv4_profile_chunks_only_draft_and_restores_propose(
-    pcp_runner_module, monkeypatch, fail, chunk,
+@pytest.mark.parametrize("depth", [1, 2])
+@pytest.mark.parametrize("chunk", [None, "256", "768", "1024"])
+@pytest.mark.parametrize("architecture,pcp,max_reqs", [
+    ("HYV4ForCausalLM", 8, 16),
+    ("HYV4ForCausalLM", 16, 1024),
+    ("HYV4VLForConditionalGeneration", 16, 1024),
+])
+def test_hyv4_profile_covers_replicated_requests_without_expanding_local_prefill(
+    pcp_runner_module, monkeypatch, fail, depth, chunk, architecture, pcp, max_reqs,
 ):
+    from contextlib import contextmanager
+
     from vllm_hcu.models.hy_v4 import moe
-    from vllm_hcu.model_executor.layers.attention.pcp import in_replicated_mtp_batch
+    from vllm_hcu.model_executor.layers.attention.pcp import (
+        in_replicated_mtp_batch, replicated_mtp_batch_scope,
+    )
+    from vllm_hcu.v1 import hyv4_vl_profile
+
+    vision_active = []
+
+    @contextmanager
+    def vision_profile(runner):
+        vision_active.append(True)
+        try:
+            yield
+        finally:
+            vision_active.pop()
+
+    monkeypatch.setattr(hyv4_vl_profile, "profile_hyv4_vl_vision", vision_profile)
 
     runner_module, _ = pcp_runner_module
     monkeypatch.delenv("VLLM_HCU_HYV4_MOE_CHUNK_SIZE", raising=False)
@@ -1380,6 +1403,14 @@ def test_hyv4_profile_chunks_only_draft_and_restores_propose(
         monkeypatch.setenv("VLLM_HCU_HYV4_MOE_CHUNK_SIZE", chunk)
     monkeypatch.delenv("VLLM_HCU_ENABLE_LINEAR_GATE_PCP_SHARD", raising=False)
     calls = []
+    allocations = []
+    empty_like = torch.empty_like
+
+    def record_output_allocation(tensor, *args, **kwargs):
+        allocations.append(tuple(tensor.shape))
+        return empty_like(tensor, *args, **kwargs)
+
+    monkeypatch.setattr(torch, "empty_like", record_output_allocation)
     layer = object.__new__(moe.HYV4MoEFused)
     torch.nn.Module.__init__(layer)
 
@@ -1395,7 +1426,10 @@ def test_hyv4_profile_chunks_only_draft_and_restores_propose(
             return hidden_states + 1
 
     layer.experts = Experts()
-    inputs = torch.zeros((1152, 4))
+    local_tokens = (8192 // pcp) * 9 // 8
+    inputs = torch.zeros((local_tokens, 4))
+    needs_probe = depth > 1 and max_reqs > local_tokens
+    proposal_batches = []
 
     from vllm.v1.worker.gpu.input_batch import InputBatch
 
@@ -1405,24 +1439,46 @@ def test_hyv4_profile_chunks_only_draft_and_restores_propose(
     monkeypatch.setattr(InputBatch, "make_dummy", staticmethod(make_dummy))
 
     class Speculator:
+        pcp_local_prefill = True
+        num_speculative_steps = depth
+        supports_mm_inputs = architecture == "HYV4VLForConditionalGeneration"
+
         def propose(self, **kwargs):
+            assert bool(vision_active) == (architecture == "HYV4VLForConditionalGeneration")
             hidden = kwargs["last_hidden_states"]
-            expected = 8192 if chunk else 1152
+            probe = in_replicated_mtp_batch()
+            expected = max_reqs if probe else local_tokens
+            proposal_batches.append((probe, kwargs["input_batch"].num_reqs, expected))
             assert kwargs["input_batch"].num_tokens == expected
             assert hidden.shape == (expected, 4)
             assert len(kwargs["num_sampled"]) == kwargs["input_batch"].num_reqs
+            if self.supports_mm_inputs:
+                embeds, mask = kwargs["mm_inputs"]
+                assert embeds == []
+                assert mask.shape == (expected,)
+            else:
+                assert kwargs["mm_inputs"] is None
             torch.testing.assert_close(layer(hidden), hidden + 1)
-            if fail:
+            rows = kwargs["input_batch"].num_reqs
+            if depth > 1:
+                # CPU stand-in for later native replicated one-row/request steps.
+                with replicated_mtp_batch_scope():
+                    torch.testing.assert_close(layer(hidden[:rows]), hidden[:rows] + 1)
+            if fail and (not needs_probe or probe):
                 raise RuntimeError("draft profile failed")
 
     def dummy_run(self, num_tokens):
-        assert num_tokens == 1152
+        assert bool(vision_active) == (architecture == "HYV4VLForConditionalGeneration")
+        assert num_tokens == local_tokens
         layer(inputs)  # Target remains outside replicated draft scope.
         self.speculator.propose(
             dummy_run=True, is_profile=True, skip_attn_for_dummy_run=True,
-            input_batch=make_dummy(16, num_tokens, None),
+            input_batch=make_dummy(min(max_reqs, num_tokens), num_tokens, None),
             last_hidden_states=inputs, aux_hidden_states=None,
-            num_sampled=torch.ones(16), num_rejected=torch.zeros(16),
+            num_sampled=torch.ones(min(max_reqs, num_tokens)),
+            num_rejected=torch.zeros(min(max_reqs, num_tokens)),
+            mm_inputs=([], torch.zeros(num_tokens, dtype=torch.bool))
+            if self.speculator.supports_mm_inputs else None,
         )
 
     def profile_run(self):
@@ -1430,11 +1486,11 @@ def test_hyv4_profile_chunks_only_draft_and_restores_propose(
 
     monkeypatch.setattr(runner_module.GPUModelRunner, "profile_run", profile_run, raising=False)
     monkeypatch.setattr(runner_module.GPUModelRunner, "_dummy_run", dummy_run, raising=False)
-    config = _config(8)
-    config.model_config = SimpleNamespace(architectures=["HYV4ForCausalLM"])
+    config = _config(pcp)
+    config.model_config = SimpleNamespace(architectures=[architecture])
     runner = runner_module.HcuGPUModelRunnerV2(config, "hcu:0")
     runner.max_num_tokens = 8192
-    runner.max_num_reqs = 16
+    runner.max_num_reqs = max_reqs
     runner.input_buffers = object()
     runner.speculator = Speculator()
     if fail:
@@ -1442,13 +1498,25 @@ def test_hyv4_profile_chunks_only_draft_and_restores_propose(
             runner.profile_run()
     else:
         runner.profile_run()
-    assert calls == (
-        [(False, 1152)] + [(True, 1024)] * 8
-        if chunk else [(False, 1152), (False, 1152)]
-    )
+    expected_batches = [(False, min(max_reqs, local_tokens), local_tokens)]
+    replicated_rows = [min(max_reqs, local_tokens)] if depth > 1 else []
+    if needs_probe:
+        expected_batches.append((True, max_reqs, max_reqs))
+        replicated_rows += [max_reqs, max_reqs]
+    assert proposal_batches == expected_batches
+    expected_calls = [(False, local_tokens)] * 2  # Target and first draft stay local.
+    expected_allocations = []
+    for rows in replicated_rows:
+        size = int(chunk) if chunk else rows
+        expected_calls += [(True, min(size, rows - i)) for i in range(0, rows, size)]
+        if rows > size:
+            expected_allocations.append((rows, 4))
+    assert calls == expected_calls
+    assert allocations == expected_allocations
     assert runner.max_num_tokens == 8192
     assert not in_replicated_mtp_batch()
     assert "propose" not in vars(runner.speculator)
+    assert not vision_active
 
 
 def test_workspace_dedup_runner_preserves_virtual_request_rows(

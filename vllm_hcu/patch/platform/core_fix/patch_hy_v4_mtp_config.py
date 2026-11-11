@@ -52,7 +52,7 @@ def apply_to_module(module: ModuleType) -> bool:
     @functools.wraps(original)
     def hcu_hf_config_override(hf_config):
         hf_config = original(hf_config)
-        if getattr(hf_config, "model_type", None) != "hy_v4":
+        if getattr(hf_config, "model_type", None) not in ("hy_v4", "hy_v4_vl"):
             return hf_config
         n_predict = getattr(hf_config, "num_nextn_predict_layers", 1)
         if n_predict != 1:

@@ -2,6 +2,7 @@
 
 from types import SimpleNamespace
 
+import pytest
 import torch
 
 from tests.runtime_patch.test_glm52_pcp_manager import (
@@ -129,6 +130,7 @@ def test_mtp_first_forward_is_local_then_feedback_is_global(monkeypatch):
     manager.prepare_draft_prefill(batch, shifted)
     draft = object.__new__(module.HcuPCPMTPSpeculator)
     draft.pcp_manager = manager
+    draft.target_model_state = None
     draft.input_buffers = SimpleNamespace(
         input_ids=shifted.clone(), positions=torch.arange(8)
     )
@@ -305,8 +307,75 @@ def test_runner_binds_local_first_speculator_to_the_real_manager(
     monkeypatch.setattr(module, "maybe_build_pcp_manager", lambda *args: manager)
     runner = module.HcuGPUModelRunnerV2(_config(2), "cpu")
     runner.speculator = SimpleNamespace(pcp_local_prefill=True)
+    runner.model_state = SimpleNamespace()
     runner.initialize_kv_cache(SimpleNamespace(kv_cache_groups=[object()]))
     assert runner.speculator.pcp_manager is manager
+    assert runner.speculator.target_model_state is runner.model_state
+    assert runner.speculator.target_req_states is runner.req_states
+
+
+@pytest.mark.parametrize("chunk_end", [64, 128, 217])
+@pytest.mark.parametrize("depth", [2, 3, 8])
+def test_multistep_mtp_keeps_prompt_coordinates_in_mixed_batch(
+    monkeypatch, chunk_end, depth
+):
+    from contextlib import nullcontext
+
+    from tests.runtime_patch.test_hyv4_vl_mtp_positions import _image_prompt_state
+    from vllm_hcu.v1.spec_decode import pcp_mtp as module
+
+    state = _image_prompt_state()
+    draft = object.__new__(module.HcuPCPMTPSpeculator)
+    draft.target_model_state = state.target_model_state
+    draft.target_req_states = state.target_req_states
+    draft._draft_idx_mapping = state._draft_idx_mapping
+    draft.pcp_manager = SimpleNamespace(draft_prefill_batch=None)
+    draft.input_buffers = SimpleNamespace(
+        positions=torch.tensor([chunk_end, 218, 16, 0]),
+        input_ids=torch.ones(4, dtype=torch.int32),
+        query_start_loc=torch.arange(4, dtype=torch.int32),
+    )
+    draft.idx_mapping = state._draft_idx_mapping
+    draft.current_draft_step = torch.tensor(0)
+    draft.num_speculative_steps = depth
+    draft.max_model_len = 2048
+    draft.kv_cache_config = draft.vllm_config = None
+    draft.hidden_states = torch.ones(4, 2)
+    draft.supports_mm_inputs = False
+    draft.temperature = draft.seeds = draft.draft_logits = None
+    draft.draft_tokens = torch.zeros(3, depth, dtype=torch.int64)
+    draft.block_tables = SimpleNamespace(compute_slot_mappings=lambda *a: None)
+    draft._build_draft_attn_metadata = lambda **kw: None
+    draft._prepare_eplb_forward = lambda *a: None
+    draft.sample_draft = lambda *a: torch.ones(3, dtype=torch.int64)
+    seen = []
+
+    def model(**inputs):
+        seen.append(inputs["positions"].clone())
+        return draft.hidden_states
+
+    def update_inputs(*args, **kwargs):
+        # CPU equivalent of the native kernel's canonical-position advance.
+        draft.input_buffers.positions[:3] += 1
+
+    draft.model = model
+    monkeypatch.setattr(module.ar, "set_forward_context", lambda *a, **kw: nullcontext())
+    monkeypatch.setattr(module.ar, "build_slot_mappings_by_layer", lambda *a: None)
+    monkeypatch.setattr(module.ar, "update_draft_inputs", update_inputs)
+    desc = SimpleNamespace(num_tokens=4, num_reqs=4, cg_mode=module.CUDAGraphMode.NONE)
+    # Execute native multi-step scheduling, _generate_draft and _run_model.
+    draft._multi_step_decode(3, False, desc, None)
+    assert len(seen) == depth - 1
+    for step, positions in enumerate(seen):
+        canonical = chunk_end + step
+        prompt = state.target_model_state.rope_state.prefill_positions.gpu
+        expected = (prompt[6:9, canonical].long() if canonical < 218
+                    else torch.tensor([canonical - 195] * 3))
+        assert torch.equal(positions[:, 0], expected)
+        assert positions[:, 1].tolist() == [23 + step] * 3
+        assert positions[:, 2].tolist() == [16 + step] * 3
+        assert positions[:, 3].tolist() == [0] * 3
+        assert (positions >= 0).all()
 
 
 def test_runner_keeps_pre_hc_residual_local_until_the_first_draft(

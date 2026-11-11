@@ -102,6 +102,25 @@ class VLConfigGateTests(unittest.TestCase):
     def test_vl_static_r0_producer_is_admitted(self):
         self.assertIs(self.validate(config()), True)
 
+    def test_standalone_vl_pcp16_native_mtp(self):
+        current = config()
+        current.kv_transfer_config = None
+        current.parallel_config.enable_eplb = False
+        current.additional_config = {"hcu": {}}
+        self.assertIs(self.validate(current), True)
+        current.model_config.model = "native-vl"
+        current.model_config.hf_config.num_nextn_predict_layers = 1
+        current.cache_config.cache_dtype = "fp8_e4m3"
+        current.speculative_config = NS(
+            method="mtp", num_speculative_tokens=3,
+            draft_model_config=NS(
+                architectures=["HYV4MTPModel"], model="native-vl",
+                hf_config=NS(num_nextn_predict_layers=1, n_predict=1)))
+        self.assertIs(self.validate(current), True)
+        current.speculative_config.draft_model_config.model = "other-checkpoint"
+        with self.assertRaises(ValueError):
+            self.validate(current)
+
     def test_vl_compressed_container_does_not_admit_ordinary_fp8_or_int8(self):
         for raw in (None, {}, "pack-quantized", NS(format="pack-quantized"),
                     {"format": "float-quantized", "quant_method": "compressed-tensors",
@@ -260,7 +279,7 @@ class VLFixedRouteTests(unittest.TestCase):
     def test_vl_speculative_and_mixed_architecture_routes_rejected(self):
         for route in ("ht", "ll"):
             for path, value in [
-                ("_hcu_vllm_config.speculative_config", NS(method="mtp")),
+                ("_hcu_vllm_config.speculative_config", NS(method="eagle")),
                 ("_hcu_vllm_config.model_config.architectures", [VL, TEXT]),
                 ("_hcu_vllm_config.model_config.architectures", ["UnknownMultimodal"]),
                 ("moe_backend", "triton"), ("activation", "gelu"),

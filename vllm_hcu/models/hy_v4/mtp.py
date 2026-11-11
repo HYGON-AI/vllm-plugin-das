@@ -6,6 +6,7 @@
 
 import copy
 from collections.abc import Iterable
+from types import MethodType
 
 import torch
 from torch import nn
@@ -389,7 +390,8 @@ class HYV4MultiTokenPredictor(nn.Module, MixtureOfExperts):
     ) -> torch.Tensor:
         if inputs_embeds is None:
             inputs_embeds = self.embed_input_ids(input_ids)
-        inputs_embeds = torch.where((positions == 0).unsqueeze(-1), 0, inputs_embeds)
+        token_positions = positions[0] if positions.ndim == 2 else positions
+        inputs_embeds = torch.where((token_positions == 0).unsqueeze(-1), 0, inputs_embeds)
         return self.layers[str(self.mtp_start_layer_idx)](
             input_ids, positions, previous_hidden_states, inputs_embeds,
         )
@@ -411,6 +413,9 @@ class HYV4MultiTokenPredictor(nn.Module, MixtureOfExperts):
 class HYV4MTP(nn.Module, MixtureOfExperts, SupportsPP):
     """Native HYV4 draft, loaded and sampled through the pinned owners."""
 
+    # The draft consumes cached target embeddings; it has no vision encoder.
+    supports_target_mm_embeddings = True
+
     packed_modules_mapping = {
         "gate_up_proj": ["gate_proj", "up_proj"],
         "wk_weights_proj": ["wk", "weights_proj"],
@@ -422,6 +427,15 @@ class HYV4MTP(nn.Module, MixtureOfExperts, SupportsPP):
             vllm_config=vllm_config, prefix=maybe_prefix(prefix, "model"),
         )
         self.config = self.model.config
+        if getattr(self.config, "vision_config", None) is not None:
+            from .mrope import forward_hcu_mrope
+
+            for layer in self.model.layers.values():
+                attention = layer.mtp_block.self_attn
+                for name in ("rotary_emb", "indexer_rope_emb"):
+                    rope = getattr(attention, name, None)
+                    if rope is not None:
+                        rope._forward_method = MethodType(forward_hcu_mrope, rope)
         self.quant_config = self.model.quant_config
         self.checkpoint_quant_config = self.model.checkpoint_quant_config
         self.sampler = Sampler()
@@ -440,8 +454,18 @@ class HYV4MTP(nn.Module, MixtureOfExperts, SupportsPP):
     def set_topk_indices_buffer(self, topk_indices_buffer: torch.Tensor) -> None:
         self.model.topk_indices_buffer = topk_indices_buffer
 
-    def embed_input_ids(self, input_ids: torch.Tensor) -> torch.Tensor:
-        return self.model.embed_input_ids(input_ids)
+    def embed_input_ids(
+        self, input_ids: torch.Tensor, multimodal_embeddings=None,
+        *, is_multimodal: torch.Tensor | None = None,
+    ) -> torch.Tensor:
+        from vllm.model_executor.models.utils import _merge_multimodal_embeddings
+
+        embeds = self.model.embed_input_ids(input_ids)
+        if multimodal_embeddings is not None:
+            embeds = _merge_multimodal_embeddings(
+                embeds, multimodal_embeddings, is_multimodal=is_multimodal,
+            )
+        return embeds
 
     def forward(
         self, input_ids: torch.Tensor, positions: torch.Tensor,

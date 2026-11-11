@@ -13,6 +13,7 @@ from typing import Any
 
 import torch
 from vllm.config.compilation import CUDAGraphMode
+from vllm.multimodal import MULTIMODAL_REGISTRY
 from vllm.v1.worker.gpu.input_batch import InputBatch
 from vllm.v1.worker.gpu.spec_decode import speculator as spec
 from vllm.v1.worker.gpu.spec_decode.autoregressive import speculator as ar
@@ -30,9 +31,29 @@ class HcuPCPMTPSpeculator(MTPSpeculator):
     def __init__(self, vllm_config, device):
         super().__init__(vllm_config, device)
         self.pcp_manager = None
+        self.target_model_state = None
+        self.target_req_states = None
+        self._draft_idx_mapping = None
         self.draft_is_prefilling = torch.zeros(
             self.max_num_reqs, dtype=torch.bool, device="cpu"
         )
+
+    def load_model(self, target_model: torch.nn.Module) -> None:
+        super().load_model(target_model)
+        # Upstream checks the draft's processor registry. HYV4 MTP only
+        # consumes the target's cached image vectors, so use the target's
+        # modality limits without registering a second vision encoder.
+        if (
+            not self.supports_mm_inputs
+            and getattr(self.model, "supports_target_mm_embeddings", False)
+            and MULTIMODAL_REGISTRY.supports_multimodal_inputs(
+                self.vllm_config.model_config
+            )
+        ):
+            self.supports_mm_inputs = True
+            self.inputs_embeds = torch.zeros_like(self.hidden_states)
+        if self.supports_mm_inputs:
+            self._pcp_inputs_embeds = torch.empty_like(self.inputs_embeds)
 
     def _build_draft_attn_metadata(
         self,
@@ -128,6 +149,7 @@ class HcuPCPMTPSpeculator(MTPSpeculator):
             )
         if manager.draft_target_hidden_states is None:
             raise RuntimeError("PCP MTP requires target-local hidden states")
+        self._draft_idx_mapping = input_batch.idx_mapping[:input_batch.num_reqs]
         last_hidden_states = manager.draft_target_hidden_states
         num_tokens = input_batch.num_tokens_after_padding
         num_reqs = input_batch.num_reqs
@@ -257,6 +279,40 @@ class HcuPCPMTPSpeculator(MTPSpeculator):
 
         return self.draft_tokens[:num_reqs]
 
+    def _draft_positions(self, input_buffers, local, num_tokens):
+        state = self.target_model_state
+        if state is None or getattr(state, "rope_state", None) is None:
+            return input_buffers.positions[:num_tokens]
+        if local is not None:
+            # The target has already prepared and gathered all three axes.
+            return state._local_positions[:, :num_tokens]
+        if self._draft_idx_mapping is None:
+            return input_buffers.positions[:num_tokens]
+        # Replicated draft rows can still be inside a chunked prompt. Use
+        # cached prompt coordinates there; the full-prompt delta only applies
+        # once the canonical position reaches that request's decode region.
+        count = min(num_tokens, self._draft_idx_mapping.numel())
+        req_indices = self._draft_idx_mapping[:count]
+        canonical = input_buffers.positions[:count]
+        rope = state.rope_state
+        prefill_lens = self.target_req_states.prefill_len.gpu[req_indices]
+        is_prefill = canonical < prefill_lens
+        # Decode positions may exceed prompt storage. Only read column zero
+        # for those rows, whose gathered value is discarded by torch.where.
+        prompt_columns = torch.where(is_prefill, canonical, 0)
+        axes = torch.arange(3, device=canonical.device).unsqueeze(1)
+        prompt_positions = rope.prefill_positions.gpu[
+            req_indices.unsqueeze(0) * 3 + axes, prompt_columns.unsqueeze(0)
+        ]
+        delta = rope.prefill_delta.gpu[req_indices]
+        positions = (
+            input_buffers.positions[:num_tokens].unsqueeze(0).expand(3, -1).clone()
+        )
+        positions[:, :count] = torch.where(
+            is_prefill.unsqueeze(0), prompt_positions, canonical + delta
+        )
+        return positions
+
     @torch.inference_mode()
     def _run_model(
         self,
@@ -292,16 +348,30 @@ class HcuPCPMTPSpeculator(MTPSpeculator):
                 num_input_tokens = (
                     is_mm_embed.shape[0] if is_mm_embed is not None else num_tokens
                 )
+                embed_buffers = input_buffers
+                if local is not None:
+                    # mm_inputs comes from the canonical target cache with
+                    # draft_lookahead=1. Merge before PCP selection: an image
+                    # can cross ranks, request boundaries and prefill chunks.
+                    num_input_tokens = manager.get_global_batch(local).num_tokens
+                    embed_buffers = self.input_buffers
                 self.inputs_embeds[:num_input_tokens] = self.model.embed_input_ids(
-                    input_buffers.input_ids[:num_input_tokens],
+                    embed_buffers.input_ids[:num_input_tokens],
                     multimodal_embeddings=mm_embeds,
                     is_multimodal=is_mm_embed,
                 )
                 inputs_embeds = self.inputs_embeds[:num_tokens]
+                if local is not None:
+                    inputs_embeds = manager.gather_global_token_tensor(
+                        self.inputs_embeds[:num_input_tokens],
+                        local,
+                        token_dim=0,
+                        out=self._pcp_inputs_embeds[:num_tokens],
+                    )
 
             model_inputs = dict(
                 input_ids=input_buffers.input_ids[:num_tokens],
-                positions=input_buffers.positions[:num_tokens],
+                positions=self._draft_positions(input_buffers, local, num_tokens),
                 hidden_states=self.hidden_states[:num_tokens],
                 inputs_embeds=inputs_embeds,
             )
