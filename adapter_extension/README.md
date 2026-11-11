@@ -24,12 +24,82 @@ and retains a Plugin E5M2 writer and descale adapter. The kernel page is 64
 tokens. It neither copies nor replaces the official Flash forward method and
 does not require private HCU hooks in the Core.
 
+## E2M1 packer lowering (opt-in, default stock)
+
+`das_hcu_fp4_packer` rebinds Core's `_fp32x2_to_fp4x2` E2M1 packer at startup.
+The audited upstream body emits PTX `cvt.rn.satfinite.e2m1x2.f32` with the
+`=r,f,f` constraint, which DTK clang cannot lower (029 `BLOCKED_TOOLCHAIN`).
+The replacement is Plugin-owned arithmetic: `min(|x|, 6)` saturation, seven
+thresholds, tie-to-even on the magnitude code, and the IEEE sign bit (so `-0`
+stays `0x8`). The first argument keeps the low nibble.
+
+Activation requires real HCU `gfx938`, vLLM `0.33.*`, an exact AST match with
+the audited definition plus identical aliases in six namespaces, an unhashed
+and uncompiled caller set, no foreign compile factor, and no existing runtime
+record. Stock (`HCU_VLLM_FP4_PACKER_IMPL=stock`, the default) or
+`HCU_DISABLE_OPS=vllm_fp4_packer` leaves every original object in place; a
+policy change needs a fresh process because JIT and Graph caches may already
+refer to the published kernel. A failure after publication is commit-fatal and
+is never presented as a rollback.
+
+Upstreaming position: the arithmetic body is a workaround for a toolchain gap,
+so the intended end state is deleting it once DTK lowers the PTX instruction or
+Core ships a lowering it can compile. This module therefore declares no
+upstream-format contribution; it carries no cache format, scale recipe or
+roofline claim of its own.
+
+Evidence level: **spec-consistent, hardware-unverified**. CPU/mock contracts
+only (83 tests): explicit E2M1 code literals, FP32 tie neighbours, saturation
+including `2**28`/`FLT_MAX`, NaN/Inf policy, nibble order, the audit gate, and
+policy/rollback refusals. The Triton kernel was neither compiled nor executed;
+native compilation, kernel hit, Graph replay, accuracy and performance remain
+separate gates.
+
 vLLM's native `SiluAndMul` remains the selected implementation. Warmed
 compiled A/B measurements on `gfx936` did not justify replacing the upstream
 operator, so the plugin neither registers nor ships a `SiluAndMul` override.
 
 No model, topology, FP8-KV, or broad performance support is implied by these
 operator-level capabilities.
+
+## DSV4.1 Channel-FP8 configuration routing
+
+The independent `das_hcu_dsv41` Adapter extension advertises only
+`dsv41-channel-fp8-routing` and registers the distinct public quantization name
+`hcu_dsv41_channel_fp8`. It does not replace the official `fp8`,
+`deepseek_v4_fp8`, or `compressed-tensors` entries or their methods, and does
+not depend on the RMS/Flash extensions or vendor optimizations for discovery.
+
+Automatic selection requires the HCU platform, a V4.1 model configuration,
+`quant_method=fp8` (or `deepseek_v4_fp8`), `is_per_channel=true`, no weight block
+size, dynamic activations, and a compatible user quantization choice. Other
+models and schemes preserve their official selection. The configuration reuses
+the official V4.1 FP8 policy, checks native exclusions before delegating to the
+official CT channel-weight/token-activation scheme, and leaves BF16 `wo_a`
+unquantized. At normal serialized startup, an existing foreign owner of the
+new name is rejected; partial registration failure refuses further activation
+in that process. The Core registry has no atomic reservation API: this extension
+does not guarantee inter-owner atomicity against concurrent external writes or
+roll back arbitrary Core registrations. Its health check detects a later lost
+owner without repairing it.
+
+This increment is configuration/routing infrastructure. It does **not** certify
+checkpoint or target/draft scale loading, HCU kernel support, model inference,
+W4A8, PCP, DSpark, Graph, accuracy or performance. Those are separate migration
+gates. Requiring `dsv41-channel-fp8-routing` at startup proves activation only,
+not those execution properties. See the [routing contract and evidence](../docs/validation/dsv41-channel-fp8-routing.md).
+
+For the selected Channel-FP8 W8A8 Linear scheme, a Plugin-owned CT LinearMethod
+returns correctly shaped empty outputs before local quantization/GEMM. It
+retains CT weight creation/finalization and native nonempty execution, registers
+through the public weight-loader-v2 API, and leaves the surrounding Linear
+forward and collectives intact. Native `QuantizedActivation` is reused.
+The pinned v0.33 V41 target already resolves direct/inverse scale spellings;
+small CPU source replay verifies ordinary and fused projection loading without
+adding parameter aliases or changing that loader. Hardware admission,
+quantization and GEMM are doubled in that replay. DSpark draft scale aliases,
+actual checkpoint loading, distributed execution and GPU correctness remain
+unverified. See [target loading and empty-row validation](../docs/validation/dsv41-channel-fp8-loading.md).
 
 ## Compatibility
 

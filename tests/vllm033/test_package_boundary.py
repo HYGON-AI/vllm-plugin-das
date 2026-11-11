@@ -32,6 +32,11 @@ def test_project_metadata_has_only_the_adapter_extension_entry_point() -> None:
             "das_hcu_flash": "hcu_vllm_das.flash_activation:extension_spec",
             "das_hcu_slimquant": "hcu_vllm_das.slimquant_activation:extension_spec",
             "das_hcu_aiter_int8": "hcu_vllm_das.int8_activation:extension_spec",
+            "das_hcu_dsv41": "hcu_vllm_das.dsv41_activation:extension_spec",
+            "das_hcu_ct_w4a8": "hcu_vllm_das.ct_w4a8_activation:extension_spec",
+            "das_hcu_v41_indexer": "hcu_vllm_das.v41_indexer_activation:extension_spec",
+            "das_hcu_v41_pcp": "hcu_vllm_das.v41_pcp_activation:extension_spec",
+            "das_hcu_fp4_packer": "hcu_vllm_das.fp4_packer:extension_spec",
         }
     }
     assert "vllm.platform_plugins" not in metadata["entry-points"]
@@ -106,6 +111,9 @@ def test_built_wheel_contains_only_the_new_plugin_namespace(tmp_path: Path) -> N
     assert "Requires-Dist: hcu-adapter>=0.5.22" in metadata_lines
     assert "[hcu_adapter.extensions]" in entry_point_lines
     assert "das_hcu = hcu_vllm_das.extension:extension_spec" in entry_point_lines
+    assert "das_hcu_dsv41 = hcu_vllm_das.dsv41_activation:extension_spec" in entry_point_lines
+    assert "hcu_vllm_das/dsv41_activation.py" in names
+    assert "hcu_vllm_das/quantization/dsv41_channel_fp8.py" in names
     assert "[vllm.platform_plugins]" not in entry_point_lines
     assert "[vllm.general_plugins]" not in entry_point_lines
     assert any(name == "hcu_vllm_das/__init__.py" for name in names)
