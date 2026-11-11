@@ -25,6 +25,24 @@ logger = init_logger(__name__)
 
 _state = threading.local()
 _installed = False
+def _max_tuned_seqs() -> int:
+    """Upper bound on running sequences for the *launch-parameter* tuning.
+
+    The tiling and warp/stage choices below were measured at 9..64 sequences.
+    Raising this applies them to shapes they were not measured on, which can be
+    slower rather than faster, so it is opt-in and defaults to the measured
+    bound. It does not affect the unit-scale KV cast, whose correctness does not
+    depend on the sequence count.
+    """
+    import os
+
+    raw = os.environ.get("VLLM_HCU_GEMMA4_BW1000_MAX_SEQS", "64").strip()
+    value = int(raw)
+    if value < 9:
+        raise ValueError("VLLM_HCU_GEMMA4_BW1000_MAX_SEQS must be >= 9")
+    return value
+
+
 _unit_pairs: set[tuple[int, int]] = set()
 _unit_checked: set[int] = set()
 _unit_logged = False
@@ -40,7 +58,7 @@ def _global_tiling_eligible(kw: dict) -> bool:
         and q.shape[1] == 16
         and k.shape[2] == 2
         and 2 <= kw["max_seqlen_q"] <= 1100
-        and 9 <= len(kw["seqused_k"]) <= 64
+        and 9 <= len(kw["seqused_k"]) <= _max_tuned_seqs()
         and q.dtype == torch.bfloat16
         and kw.get("kv_quant_mode") == KVQuantMode.FP8_PER_TENSOR
         and kw.get("output_scale") is None
@@ -139,7 +157,6 @@ def install() -> None:
                     and kw.get("num_queries_per_kv") == 2
                     and kw.get("SLIDING_WINDOW") == 1024
                     and not kw.get("IS_3D", True)
-                    and 32 <= kw.get("num_seqs", 0) <= 64
                     and kw["query_ptr"].dtype == torch.bfloat16
                     and kw["key_cache_ptr"].dtype == torch.float8_e4m3fn
                     and kw.get("k_scale") is not None
@@ -147,16 +164,26 @@ def install() -> None:
                     and (kw["k_scale"].data_ptr(), kw["v_scale"].data_ptr())
                     in _unit_pairs
                 ):
-                    # FP8 values are exactly representable in BF16 and the
-                    # scales are verified to be 1.
+                    # Reading FP8 as BF16 is exact: every e4m3 value is
+                    # representable in bfloat16, and with both scales verified
+                    # to be 1 the FP32 dequantization step is the identity.
+                    # That argument does not involve the sequence count, so the
+                    # cast is not bounded by it.
                     kw["KV_QUANT_MODE"] = 0
-                    kw["num_stages"] = 1
-                    kw.setdefault("num_warps", 4)
+                    # The warp/stage choice, unlike the cast, was measured at
+                    # 32..64 sequences only; leave other shapes on the stock
+                    # launch parameters.
+                    tuned = 32 <= kw.get("num_seqs", 0) <= _max_tuned_seqs()
+                    if tuned:
+                        kw["num_stages"] = 1
+                        kw.setdefault("num_warps", 4)
                     if not _unit_logged:
                         _unit_logged = True
                         logger.info(
-                            "Gemma4 BW1000 SWA unit-KV path active "
-                            "(head256 Q16/KV8 window1024 N32..64)"
+                            "Gemma4 BW1000 SWA unit-KV cast active "
+                            "(head256 Q16/KV8 window1024, any N); "
+                            "launch tuning applies at 32..%d",
+                            _max_tuned_seqs(),
                         )
                 return call(*args, **kw)
 
