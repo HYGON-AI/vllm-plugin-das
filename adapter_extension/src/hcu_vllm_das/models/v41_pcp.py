@@ -1,8 +1,8 @@
 # SPDX-License-Identifier: Apache-2.0
 """Reuse Core constructors with private HCU attention/MoE class bindings.
 
-Core owns PCP scheduling, collectives, cache preparation, Engram and loading.
-Only the ROCm attention eligibility and EP-local expert count need bridging.
+Core owns scheduling, caches, Engram storage/lookup and weight loading.
+Bridge ROCm attention, EP-local expert counts and Engram head sharding over PCP.
 """
 from __future__ import annotations
 
@@ -10,6 +10,10 @@ import hashlib
 import inspect
 from types import FunctionType
 
+import torch
+from vllm.distributed import get_pcp_group
+from vllm.model_executor.layers import mhc as native_mhc
+from vllm.models.deepseek_v41.common import engram as native_engram
 from vllm.models.deepseek_v41.amd import model as native
 from vllm.models.deepseek_v41.amd import vl_model as native_vl
 from ..v41_pcp import HcuV41PcpAttention, validate_config
@@ -53,6 +57,70 @@ def select_attention(cfg):
 
 
 
+class HcuV41PcpMHCPostOp(native_mhc.MHCPostOp):
+    forward_hip = native_mhc.MHCPostOp.forward_native
+
+
+class HcuV41PcpMHCPreDelayedOp(native_mhc.MHCPreDelayedOp):
+    # Core's Torch path avoids the unsupported HCU TileLang delayed seam.
+    __init__ = _constructor(
+        native_mhc.MHCPreDelayedOp.__init__,
+        '82cd4838e10ee5ea00ed884145d38903350dbdff35129d745c0440a892ea3552',
+        {'MHCPostOp': HcuV41PcpMHCPostOp})
+    forward_hip = native_mhc.MHCPreDelayedOp.forward_native
+
+
+class HcuV41PcpEngramEmbedding(native_engram.ParallelEngramEmbedding):
+    def _get_shard_info(self):
+        if self.dp_size != 1 or self.tp_size != 1:
+            raise ValueError('HCU V41 PCP Engram requires TP1/DP1')
+        group = get_pcp_group()
+        return group.world_size, group.rank_in_group
+
+
+_PCP_GATHER_ROWS = _constructor(
+    native_engram._gather_engram_rows,
+    '039948803a336294f00683bd5708409441d5d538390a5f1fdf5514026c61cc1f',
+    {'get_engram_dp_group': get_pcp_group})
+
+
+class HcuV41PcpEngram(native_engram.Engram):
+    _create_embedding = _constructor(
+        native_engram.Engram._create_embedding,
+        'ef2909d6afcc990d4a36677768da25e46f8f88bf779830469a143c436f42ae5c',
+        {'ParallelEngramEmbedding': HcuV41PcpEngramEmbedding})
+
+    def _init_staging(self, max_tokens, head_dim):
+        super()._init_staging(max_tokens * get_pcp_group().world_size, head_dim)
+        self._pcp_prepared = None
+
+    def prepare_embeddings(self, hash_ids):
+        self._pcp_prepared = None
+        group = get_pcp_group()
+        count = hash_ids.shape[0]
+        counts = group.all_gather(hash_ids.new_tensor([count], dtype=torch.int64), dim=0)
+        slot = int(counts.max().item())
+        if slot * group.world_size > self.staged_rows.shape[0]:
+            raise ValueError('HCU V41 PCP Engram staging capacity exceeded')
+        if slot:
+            padded = hash_ids.new_full((slot, hash_ids.shape[1]), native_engram.DEAD_ID)
+            padded[:count].copy_(hash_ids)
+            super().prepare_embeddings(group.all_gather(padded, dim=0))
+        self._pcp_prepared = (count, slot)
+
+    def _ready_rows(self, num_tokens):
+        state, self._pcp_prepared = self._pcp_prepared, None
+        if state is None or state[0] != num_tokens:
+            raise RuntimeError('HCU V41 PCP Engram lookup requires matching prepare')
+        _, slot = state
+        if not slot:
+            table = self.embed_tokens
+            return self.staged_rows.new_empty((0, table.n_hash_cols, table.dim))
+        # Core fences prefetch, exchanges heads and selects this rank's tokens.
+        staged = super()._ready_rows(slot * get_pcp_group().world_size)
+        return _PCP_GATHER_ROWS(staged, num_tokens)
+
+
 class HcuV41PcpMoE(native.DeepseekV4MoE):
     def __init__(self, *args, **kwargs):
         super().__init__(*args, **kwargs)
@@ -62,7 +130,10 @@ class HcuV41PcpMoE(native.DeepseekV4MoE):
 
 _DECODER_INIT = _constructor(_DECODER_NATIVE, _REVIEWED[0],
                              {'_select_dsv4_attn_cls': select_attention,
-                              'DeepseekV4MoE': HcuV41PcpMoE})
+                              'DeepseekV4MoE': HcuV41PcpMoE,
+                              'Engram': HcuV41PcpEngram,
+                              'MHCPreDelayedOp': HcuV41PcpMHCPreDelayedOp,
+                              'MHCPostOp': HcuV41PcpMHCPostOp})
 
 
 class HcuV41PcpDecoderLayer(native.DeepseekV4DecoderLayer):
@@ -70,7 +141,8 @@ class HcuV41PcpDecoderLayer(native.DeepseekV4DecoderLayer):
 
 
 _BACKBONE_INIT = _constructor(_BACKBONE_NATIVE, _REVIEWED[1],
-                              {'DeepseekV4DecoderLayer': HcuV41PcpDecoderLayer})
+                              {'DeepseekV4DecoderLayer': HcuV41PcpDecoderLayer,
+                               'MHCPostOp': HcuV41PcpMHCPostOp})
 
 
 class HcuV41PcpBackbone(native.DeepseekV4Model):

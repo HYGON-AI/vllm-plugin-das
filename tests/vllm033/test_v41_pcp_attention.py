@@ -43,7 +43,16 @@ def test_native_constructors_preparation_and_engram_are_reused():
         (model._OUTER_INIT, vl_model.DeepseekV41ForCausalLM.__init__)]:
         assert owned.__code__ is core.__code__
         assert inspect.signature(owned) == inspect.signature(core)
-    assert model._DECODER_INIT.__globals__["Engram"] is native.Engram
+    assert model._DECODER_INIT.__globals__["Engram"] is model.HcuV41PcpEngram
+    assert model.HcuV41PcpEngram._create_embedding.__code__ is native.Engram._create_embedding.__code__
+    assert model.HcuV41PcpEngramEmbedding._allocate_weights is model.native_engram.ParallelEngramEmbedding._allocate_weights
+    assert model.HcuV41PcpEngramEmbedding.lookup is model.native_engram.ParallelEngramEmbedding.lookup
+    assert model._PCP_GATHER_ROWS.__code__ is model.native_engram._gather_engram_rows.__code__
+    assert model._DECODER_INIT.__globals__['MHCPreDelayedOp'] is model.HcuV41PcpMHCPreDelayedOp
+    assert model._BACKBONE_INIT.__globals__['MHCPostOp'] is model.HcuV41PcpMHCPostOp
+    assert model.HcuV41PcpMHCPreDelayedOp.__init__.__code__ is model.native_mhc.MHCPreDelayedOp.__init__.__code__
+    assert model.HcuV41PcpMHCPreDelayedOp.forward_hip is model.native_mhc.MHCPreDelayedOp.forward_native
+    assert model.HcuV41PcpMHCPostOp.forward_hip is model.native_mhc.MHCPostOp.forward_native
     assert bridge.HcuV41PcpAttention._prepare_and_attn is DeepseekV4Attention._prepare_and_attn
     assert bridge.HcuV41PcpAttention.forward is rocm.DeepseekV41ROCMAiterMLAAttention.forward
     assert bridge.HcuV41PcpAttention._alloc_attn_out is rocm.DeepseekV41ROCMAiterMLAAttention._alloc_attn_out
@@ -90,3 +99,97 @@ def test_native_rocm_serial_forward_and_bf16_allocation(monkeypatch):
     assert calls == [None]
     out = obj._alloc_attn_out(5, hidden)
     assert out.shape == (5, 2, 4) and out.dtype == torch.bfloat16
+
+
+@pytest.mark.parametrize('rank', range(8))
+def test_pcp_engram_shards_cover_all_hash_heads(monkeypatch, rank):
+    obj = object.__new__(model.HcuV41PcpEngramEmbedding)
+    torch.nn.Module.__init__(obj)
+    obj.dp_size = obj.tp_size = 1
+    monkeypatch.setattr(model, 'get_pcp_group', lambda: NS(world_size=8, rank_in_group=rank))
+    assert obj._get_shard_info() == (8, rank)
+
+
+@pytest.mark.parametrize('counts,rank', [([0]*8, 0), ([0,2,1,0,3,0,1,2], 0), ([0,2,1,0,3,0,1,2], 4)])
+def test_pcp_engram_stages_uneven_and_empty_ranks(monkeypatch, counts, rank):
+    heads, local_heads, dim = 24, 3, 2
+    hashes = [torch.arange(n * heads, dtype=torch.int32).reshape(n, heads) + 1000*r for r,n in enumerate(counts)]
+    slot = max(counts)
+    def gather(value, dim=0):
+        if value.dtype == torch.int64:
+            return torch.tensor(counts, dtype=torch.int64)
+        expected = torch.full((slot,heads), model.native_engram.DEAD_ID, dtype=torch.int32)
+        expected[:counts[rank]] = hashes[rank]
+        assert torch.equal(value, expected)
+        padded = []
+        for h in hashes:
+            p = torch.full((slot,heads), model.native_engram.DEAD_ID, dtype=torch.int32)
+            p[:len(h)] = h
+            padded.append(p)
+        return torch.cat(padded)
+    monkeypatch.setattr(model, 'get_pcp_group', lambda: NS(world_size=8, rank_in_group=rank, all_gather=gather))
+    obj = object.__new__(model.HcuV41PcpEngram)
+    torch.nn.Module.__init__(obj)
+    obj.embed_tokens = NS(n_hash_cols=heads, dim=dim)
+    obj.staged_rows = torch.empty(8*8, local_heads, dim)
+    obj._pcp_prepared = None
+    staged = []
+    monkeypatch.setattr(model.native_engram.Engram, 'prepare_embeddings', lambda self,h: staged.append(h.clone()))
+    monkeypatch.setattr(model.native_engram.Engram, '_ready_rows', lambda self,n: self.staged_rows[:n])
+    selected = torch.zeros(counts[rank], heads, dim)
+    calls = []
+    def rows(value,n):
+        calls.append((value.shape,n))
+        return selected
+    monkeypatch.setattr(model, '_PCP_GATHER_ROWS', rows)
+    obj.prepare_embeddings(hashes[rank])
+    actual = obj._ready_rows(counts[rank])
+    assert actual.shape == (counts[rank],heads,dim)
+    assert len(staged) == bool(slot)
+    assert calls == ([(torch.Size([slot*8,local_heads,dim]),counts[rank])] if slot else [])
+    with pytest.raises(RuntimeError, match='matching prepare'):
+        obj._ready_rows(counts[rank])
+
+
+@pytest.mark.parametrize('rank', range(8))
+def test_native_engram_constructor_and_loader_preserve_pcp_head_buckets(monkeypatch, rank):
+    core = model.native_engram
+    monkeypatch.setattr(model, 'get_pcp_group', lambda: NS(world_size=8, rank_in_group=rank))
+    monkeypatch.setattr(core, 'get_engram_dp_size', lambda: 1)
+    monkeypatch.setattr(core, 'get_tensor_model_parallel_world_size', lambda: 1)
+    monkeypatch.setattr(core, 'is_uva_available', lambda: True)
+    monkeypatch.setattr(torch.cuda, 'get_device_properties', lambda _: NS(multi_processor_count=1))
+    monkeypatch.setattr(torch.accelerator, 'current_device_index', lambda: 0)
+    heads = tuple(range(1,25))
+    with torch.device('meta'):
+        obj = model.HcuV41PcpEngramEmbedding(sum(heads), 256, heads, cpu_offload=True)
+    start = sum(heads[:3*rank])
+    stop = sum(heads[:3*(rank+1)])
+    assert obj.head_start == rank*3 and obj.part_n_hash_cols == 3
+    assert obj.vocab_start_idx == start and obj.vocab_end_idx == stop
+    assert obj.weight.shape == (stop-start,256)
+    assert obj.weight_scale_inv.shape == (stop-start,8)
+    assert obj.dp_size == obj.tp_size == 1
+    param = torch.nn.Parameter(torch.empty(stop-start,4), requires_grad=False)
+    param.engram_vocab_start = start
+    loaded = torch.arange(sum(heads)*4).reshape(sum(heads),4).float()
+    obj._weight_loader(param, loaded)
+    assert torch.equal(param, loaded[start:stop])
+
+
+@pytest.mark.parametrize('rank', range(8))
+@pytest.mark.parametrize('slot,count', [(3,3),(3,0),(3,1)])
+def test_core_head_exchange_selects_pcp_local_tokens(monkeypatch, rank, slot, count):
+    size, local_heads, dim = 8,3,2
+    complete = torch.arange(size*slot*size*local_heads*dim).reshape(size,slot*size,local_heads,dim).float()
+    group = NS(world_size=size,rank_in_group=rank,all_gather=lambda staged,dim: complete.flatten(0,1))
+    monkeypatch.setitem(model._PCP_GATHER_ROWS.__globals__, 'get_engram_dp_group', lambda: group)
+    def select(gathered,out,group_tokens,start,width):
+        # Independent logical reference: concatenate the rank-owned heads.
+        logical = gathered.reshape(size,group_tokens,local_heads,dim).permute(1,0,2,3).reshape(group_tokens,size*local_heads,dim)
+        out.copy_(logical[start:start+len(out)])
+    monkeypatch.setitem(model._PCP_GATHER_ROWS.__globals__, '_engram_select_rows', select)
+    staged = complete[rank]
+    actual = model._PCP_GATHER_ROWS(staged,count)
+    expected = torch.cat([complete[r,rank*slot:rank*slot+count] for r in range(size)],dim=1)
+    assert torch.equal(actual,expected)
