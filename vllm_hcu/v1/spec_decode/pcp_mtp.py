@@ -32,6 +32,7 @@ class HcuPCPMTPSpeculator(MTPSpeculator):
         super().__init__(vllm_config, device)
         self.pcp_manager = None
         self.target_model_state = None
+        self.target_req_states = None
         self._draft_idx_mapping = None
         self.draft_is_prefilling = torch.zeros(
             self.max_num_reqs, dtype=torch.bool, device="cpu"
@@ -287,13 +288,30 @@ class HcuPCPMTPSpeculator(MTPSpeculator):
             return state._local_positions[:, :num_tokens]
         if self._draft_idx_mapping is None:
             return input_buffers.positions[:num_tokens]
-        # Subsequent drafts are replicated one-token decode rows. Preserve
-        # each request's image-dependent M-RoPE delta while advancing tokens.
+        # Replicated draft rows can still be inside a chunked prompt. Use
+        # cached prompt coordinates there; the full-prompt delta only applies
+        # once the canonical position reaches that request's decode region.
         count = min(num_tokens, self._draft_idx_mapping.numel())
-        delta = state.rope_state.prefill_delta.gpu[self._draft_idx_mapping[:count]]
-        positions = input_buffers.positions[:num_tokens].clone()
-        positions[:count].add_(delta)
-        return positions.unsqueeze(0).expand(3, -1)
+        req_indices = self._draft_idx_mapping[:count]
+        canonical = input_buffers.positions[:count]
+        rope = state.rope_state
+        prefill_lens = self.target_req_states.prefill_len.gpu[req_indices]
+        is_prefill = canonical < prefill_lens
+        # Decode positions may exceed prompt storage. Only read column zero
+        # for those rows, whose gathered value is discarded by torch.where.
+        prompt_columns = torch.where(is_prefill, canonical, 0)
+        axes = torch.arange(3, device=canonical.device).unsqueeze(1)
+        prompt_positions = rope.prefill_positions.gpu[
+            req_indices.unsqueeze(0) * 3 + axes, prompt_columns.unsqueeze(0)
+        ]
+        delta = rope.prefill_delta.gpu[req_indices]
+        positions = (
+            input_buffers.positions[:num_tokens].unsqueeze(0).expand(3, -1).clone()
+        )
+        positions[:, :count] = torch.where(
+            is_prefill.unsqueeze(0), prompt_positions, canonical + delta
+        )
+        return positions
 
     @torch.inference_mode()
     def _run_model(
