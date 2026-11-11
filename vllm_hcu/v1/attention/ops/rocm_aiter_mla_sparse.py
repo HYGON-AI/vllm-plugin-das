@@ -34,6 +34,8 @@ from vllm_hcu.v1.attention.ops.fp8_paged_mqa_gfx938 import (
 )
 
 lightop_attention = None
+aiter_paged_mqa_logits_fn = None
+deepgemm_paged_mqa_logits_fn = None
 logger = init_logger(__name__)
 
 
@@ -44,6 +46,32 @@ def _get_lightop_attention():
 
         lightop_attention = attention
     return lightop_attention
+
+
+def _get_deepgemm_paged_mqa_logits():
+    """Lazily resolve deepgemm's paged-MQA scorer (block-padded pages OK)."""
+    global deepgemm_paged_mqa_logits_fn
+    if deepgemm_paged_mqa_logits_fn is None:
+        try:
+            from deepgemm import paged_mqa_logits as deepgemm_pml
+
+            deepgemm_paged_mqa_logits_fn = deepgemm_pml
+        except ImportError:
+            return None
+    return deepgemm_paged_mqa_logits_fn
+
+
+def _get_aiter_paged_mqa_logits():
+    """Lazily resolve aiter's token-major paged-MQA scorer (gfx938)."""
+    global aiter_paged_mqa_logits_fn
+    if aiter_paged_mqa_logits_fn is None:
+        try:
+            from aiter import paged_mqa_logits
+
+            aiter_paged_mqa_logits_fn = paged_mqa_logits
+        except ImportError:
+            return None
+    return aiter_paged_mqa_logits_fn
 
 
 _GLOBAL_LOGITS_BUFFERS = {}
@@ -227,6 +255,7 @@ def indexer_k_quant_and_cache_triton(
     scale_fmt,
     block_tile_size=16,
     head_tile_size=16,
+    layout: str = "SHUFFLE",
 ):
     num_blocks = kv_cache.shape[0]
     head_dim = k.shape[-1]
@@ -250,7 +279,7 @@ def indexer_k_quant_and_cache_triton(
         block_size,
         num_tokens,
         head_dim,
-        "SHUFFLE",
+        layout,
         block_tile_size,
         head_tile_size,
         IS_FNUZ=current_platform.fp8_dtype() == torch.float8_e4m3fnuz,
@@ -326,6 +355,7 @@ def cp_gather_indexer_k_quant_cache_triton(
     token_to_seq: torch.Tensor,
     block_tile_size: int = 16,
     head_tile_size: int = 16,
+    layout: str = "SHUFFLE",
 ):
     num_tokens = k_fp8.size(0)
     block_size = k_cache.size(1)
@@ -351,7 +381,7 @@ def cp_gather_indexer_k_quant_cache_triton(
         block_table_stride,
         k_cache_value.stride(0),
         k_cache_scale.stride(0),
-        "SHUFFLE",
+        layout,
         head_dim,
         block_tile_size,
         head_tile_size,
@@ -1008,13 +1038,9 @@ def rocm_fp8_paged_mqa_logits(
         custom_ops_enabled and rocm_aiter_ops.is_enabled()
     )
     if is_gfx938 and block_size != 1:
-        if effective_force_aiter:
-            raise RuntimeError(
-                "AITER paged-MQA does not support gfx938 preshuffled KPool pages"
-            )
         if kcache_layout == "normal":
-            # LightOp paged_mqa_logits reads token-major pages only. It
-            # rejects next_n > 2 and ignores per-query [B, next_n] lengths,
+            # Token-major pages: LightOp or aiter paged_mqa_logits both read
+            # them directly. Neither accepts per-query [B, next_n] lengths,
             # so each MTP verify token becomes its own batch row.
             q_fp8, context_lens, block_tables = _lightop_paged_mqa_inputs(
                 q_fp8,
@@ -1023,6 +1049,71 @@ def rocm_fp8_paged_mqa_logits(
                 batch_size,
                 next_n,
             )
+            if henvs.indexer_scorer() == "deepgemm":
+                deepgemm_paged_mqa_logits = _get_deepgemm_paged_mqa_logits()
+                # deepgemm's paged MQA requires only page-internal
+                # contiguity: the shared K-cache backing's block-interleaved
+                # as_strided views (strides like (L*page, 132, 132, 1)) are
+                # accepted as-is, no copy or block-table remap.
+                if (
+                    deepgemm_paged_mqa_logits is not None
+                    and q_fp8.is_contiguous()
+                    and kv_cache_fp8.stride()[-1] == 1
+                ):
+                    logger.info_once(
+                        "gfx938 normal-layout sparse-indexer decode "
+                        "scoring: using deepgemm paged_mqa_logits"
+                    )
+                    return deepgemm_paged_mqa_logits(
+                        q_fp8,
+                        kv_cache_fp8,
+                        weights.float().contiguous(),
+                        context_lens,
+                        block_tables,
+                        max_model_len,
+                        clean_logits=True,
+                    )
+                logger.warning_once(
+                    "VLLM_HCU_INDEXER_SCORER=deepgemm: deepgemm "
+                    "paged_mqa_logits is unavailable; using LightOp"
+                )
+            if effective_force_aiter or henvs.indexer_scorer() == "aiter":
+                aiter_paged_mqa_logits = _get_aiter_paged_mqa_logits()
+                kv_uint8 = (
+                    kv_cache_fp8
+                    if kv_cache_fp8.dtype is torch.uint8
+                    else kv_cache_fp8.view(torch.uint8)
+                )
+                # aiter's eager entry validates full contiguity
+                # (paged_mqa_logits.cu:131). The shared K-cache backing yields
+                # per-layer as_strided views whose block stride carries other
+                # layers' pages (strides like (X, 132, 132, 1) with
+                # X > block_size * 132), so aiter only engages when the
+                # resolved layout exposes dense, unpadded pages.
+                if (
+                    aiter_paged_mqa_logits is not None
+                    and kv_uint8.is_contiguous()
+                    and q_fp8.is_contiguous()
+                ):
+                    logger.info_once(
+                        "gfx938 normal-layout sparse-indexer decode "
+                        "scoring: using aiter paged_mqa_logits (fp8 MMAC)"
+                    )
+                    return aiter_paged_mqa_logits(
+                        q_fp8,
+                        kv_uint8,
+                        weights.float().contiguous(),
+                        context_lens,
+                        block_tables,
+                        max_model_len,
+                        clean_logits=True,
+                    )
+                logger.warning_once(
+                    "VLLM_HCU_INDEXER_SCORER=aiter: aiter paged_mqa_logits "
+                    "requires a fully contiguous K-cache view "
+                    f"(got strides {kv_uint8.stride()} for shape "
+                    f"{tuple(kv_uint8.shape)}); using LightOp"
+                )
             return _get_lightop_attention().paged_mqa_logits(
                 q_fp8,
                 kv_cache_fp8,
@@ -1032,6 +1123,10 @@ def rocm_fp8_paged_mqa_logits(
                 schedule_meta=None,
                 max_context_len=max_model_len,
                 clean_logits=False,
+            )
+        if effective_force_aiter:
+            raise RuntimeError(
+                "AITER paged-MQA does not support gfx938 preshuffled KPool pages"
             )
         return gfx938_fp8_paged_mqa_logits(
             q_fp8,
@@ -1657,6 +1752,18 @@ def _indexer_cache_as_bf16_nhd_view(
     return kv_cache
 
 
+def _indexer_kcache_layout_normal() -> bool:
+    """True when gfx938 selects the token-major decode scorer path.
+
+    Gated by VLLM_HCU_INDEXER_KCACHE_LAYOUT=normal. The gfx938 C++ insert
+    and prefill gather always read/write token-major pages, so this env
+    only routes the decode scorer to the LightOp normal-layout kernel.
+    All DP ranks must set the same env: a mixed scorer layout silently
+    degrades accuracy.
+    """
+    return on_gfx938() and henvs.indexer_kcache_layout() == "normal"
+
+
 def rocm_aiter_sparse_attn_indexer_native(
     hidden_states: torch.Tensor,
     k_cache_prefix: LayerNameType,
@@ -1732,8 +1839,18 @@ def rocm_aiter_sparse_attn_indexer_native(
     elif not skip_k_cache_insert:
         raise ValueError("k must be provided when skip_k_cache_insert is False")
 
+    normal_layout = _indexer_kcache_layout_normal()
+    if normal_layout:
+        logger.info_once(
+            "gfx938 sparse-indexer decode scorer: LightOp normal-layout "
+            "path (VLLM_HCU_INDEXER_KCACHE_LAYOUT=normal). All DP ranks "
+            "must set the same env; a mixed scorer layout silently "
+            "degrades accuracy."
+        )
     if not skip_k_cache_insert:
         if not current_platform.is_rocm() or on_gfx938():
+            # gfx938 C++ op writes token-major (normal) pages; the layout
+            # env only selects the decode scorer below.
             ops.indexer_k_quant_and_cache(
                 k,
                 hipc_kv_cache,
@@ -1806,6 +1923,9 @@ def rocm_aiter_sparse_attn_indexer_native(
             k_scale = k_scale_full[:chunk_max_local_seq_lens]
             if not skip_kv_gather and local_total_seq_lens > 0:
                 if not current_platform.is_rocm() or on_gfx938():
+                    # C++ gather reads the token-major pages the C++ insert
+                    # wrote; the Triton gather stays layout-parameterized
+                    # for unit tests only.
                     ops.cp_gather_indexer_k_quant_cache(
                         hipc_kv_cache,
                         k_fp8,
@@ -1944,6 +2064,7 @@ def rocm_aiter_sparse_attn_indexer_native(
             decode_metadata.block_table,
             decode_metadata.schedule_metadata,
             max_model_len=max_model_len,
+            kcache_layout="normal" if normal_layout else "preshuffle",
         )
 
         # A padded decode batch has more kernel rows than actual decode

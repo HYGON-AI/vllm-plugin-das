@@ -252,6 +252,25 @@ def apply_to_module(module: ModuleType) -> bool:
     def hcu_fp8(self, q, kv_c_and_k_pe_cache, topk_indices, kernel_metadata):
         if not flash.current_platform.is_rocm():
             return fp8(self, q, kv_c_and_k_pe_cache, topk_indices, kernel_metadata)
+        # K3.1 at TP4 leaves 96/4=24 q heads per rank, but the FP8 sparse
+        # decode kernel only accepts h_q in {64, 128}.  Upstream
+        # _fp8_flash_mla_kernel zero-pads q for this reason; restore that
+        # step here (Softmax is per-head, so padded heads only produce
+        # discarded outputs and slicing back is lossless).
+        actual_num_heads = q.size(-2)
+        padded_num_heads = getattr(
+            self, "fp8_decode_padded_heads", None
+        ) or (64 if actual_num_heads < 64 else 128)
+        if actual_num_heads != padded_num_heads:
+            q_padded = flash.torch.zeros(
+                *q.shape[:-2],
+                padded_num_heads,
+                q.shape[-1],
+                dtype=q.dtype,
+                device=q.device,
+            )
+            q_padded[..., :actual_num_heads, :] = q
+            q = q_padded
         out, lse = flash.flash_mla_with_kvcache(
             q=q,
             k_cache=kv_c_and_k_pe_cache.view(flash.torch.uint8).unsqueeze(-2),
@@ -263,6 +282,10 @@ def apply_to_module(module: ModuleType) -> bool:
             indices=topk_indices,
             softmax_scale=self.softmax_scale,
         )
+        if out is not None:
+            out = out[..., :actual_num_heads, :]
+        if lse is not None:
+            lse = lse[..., :actual_num_heads, :]
         return out, lse
 
     @functools.wraps(bf16)

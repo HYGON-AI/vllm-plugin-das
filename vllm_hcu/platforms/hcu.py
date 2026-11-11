@@ -227,6 +227,24 @@ def _use_triton_mla_master_fallback(
     )
 
 
+def _dense_sparse_only_kv_hint(
+    attn_selector_config: "AttentionSelectorConfig",
+) -> str:
+    """Point dense-MLA requests for the sparse-only KV record at the fix."""
+
+    if (
+        attn_selector_config.use_mla
+        and not attn_selector_config.use_sparse
+        and attn_selector_config.kv_cache_dtype == "fp8_ds_mla"
+    ):
+        return (
+            " fp8_ds_mla is a sparse-MLA-only KV record; a dense MLA layer "
+            "(e.g. a Kimi-K3/K3.1 DSpark draft) needs a dense KV dtype -- see "
+            "VLLM_HCU_K3_DSPARK_DRAFT_KV_DTYPE."
+        )
+    return ""
+
+
 class HCUPlatform(Platform):
     #这个地方会管理custom_ops
     _enum = PlatformEnum.ROCM
@@ -396,6 +414,7 @@ class HCUPlatform(Platform):
             raise ValueError(
                 f"No valid attention backend found for {cls.device_name} "
                 f"with {config_str}. Reasons: {reasons_str}."
+                + _dense_sparse_only_kv_hint(attn_selector_config)
             )
 
         # We have found some valid backends. Select the one with the
@@ -470,7 +489,7 @@ class HCUPlatform(Platform):
 
         model_config = getattr(vllm_config, "model_config", None)
         hf_config = getattr(model_config, "hf_config", None)
-        if getattr(hf_config, "model_type", None) not in ("kimi_k3", "kimi_linear"):
+        if getattr(hf_config, "model_type", None) not in ("kimi_k3", "kimi_linear", "kimi_k31"):
             return super().get_default_ir_op_priority(vllm_config)
 
         # HCU Kimi runs may request torch.compile but fall back at runtime.
@@ -569,6 +588,13 @@ class HCUPlatform(Platform):
         )
 
         IMPORT_COORDINATOR.drain_ready_callbacks()
+        # Kimi-K3.1: resolve AutoConfig to the built-in KimiK3Config
+        # subclass before ModelConfig loads the checkpoint config.
+        from vllm_hcu.models.kimi_k31_config import (
+            register_kimi_k31_config,
+        )
+
+        register_kimi_k31_config()
         pre_register_and_update(parser)
 
     @classmethod
@@ -611,6 +637,64 @@ class HCUPlatform(Platform):
 
     @classmethod
     def check_and_update_config(cls, vllm_config: "VllmConfig") -> None:
+        # Kimi-K3.1: normalize the sparse KV layout before any runner
+        # snapshot or KV-cache group is built; also covers PP stages
+        # whose ranks construct no local DSA layer. The per-layer
+        # in-constructor normalize stays as belt and suspenders.
+        if (
+            getattr(vllm_config.model_config.hf_config,
+                    "model_type", None) == "kimi_k31"
+            and getattr(vllm_config.cache_config, "cache_dtype", None)
+            == "fp8_e4m3"
+        ):
+            vllm_config.cache_config.cache_dtype = "fp8_ds_mla"
+            logger.info_once(
+                "Kimi-K3.1: KV cache dtype normalized to fp8_ds_mla"
+            )
+        # Kimi-K3.1: the W4A8 checkpoint expresses FP keep-outs through the
+        # HF ``modules_to_not_convert`` keyword while SlimQuant honors only
+        # ``ignore``, and it stores the MLA A-projection / MLP gate-up tensors
+        # UNfused while the stock model builds fused modules. Synthesize both
+        # knobs onto the quant config once per engine config so the auto
+        # weight loader expands checkpoint names and keeps the right layers
+        # in floating point.
+        if (
+            getattr(vllm_config.model_config.hf_config,
+                    "model_type", None) == "kimi_k31"
+            and getattr(vllm_config.model_config, "quant_config", None)
+            is not None
+            and getattr(vllm_config.model_config.quant_config,
+                        "get_name", lambda: "")() == "slimquant_w4a8"
+        ):
+            _qcfg = vllm_config.model_config.quant_config
+            if not getattr(_qcfg, "ignore", None):
+                _keep_fp = list(
+                    (getattr(
+                        vllm_config.model_config.hf_config,
+                        "quantization_config",
+                        None,
+                    ) or {}).get("modules_to_not_convert") or []
+                )
+                if _keep_fp:
+                    _qcfg.ignore = [
+                        _e if "*" in _e else f"*{_e}" for _e in _keep_fp
+                    ]
+                    logger.info_once(
+                        "Kimi-K3.1: synthesized %d SlimQuant ignore entries"
+                        " from modules_to_not_convert" % len(_qcfg.ignore)
+                    )
+            _mapping = getattr(_qcfg, "packed_modules_mapping", None) or {}
+            if "fused_qkv_a_proj" not in _mapping:
+                _qcfg.packed_modules_mapping = {
+                    **_mapping,
+                    "fused_qkv_a_proj": ["q_a_proj", "kv_a_proj_with_mqa"],
+                    "gate_up_proj": ["gate_proj", "up_proj"],
+                }
+                logger.info_once(
+                    "Kimi-K3.1: added fused-module name mappings for "
+                    "weight loading"
+                )
+
         from vllm.config.compilation import CUDAGraphMode
         from vllm_hcu.patch.import_coordinator import IMPORT_COORDINATOR
         from vllm_hcu.patch.platform.core_fix.patch_vllm_config import (
@@ -818,11 +902,26 @@ class HCUPlatform(Platform):
                 backend.name,
             )
 
-        # Different attention layers may use different kernel block sizes.
-        # A manager block can contain multiple kernel blocks: preserve an
-        # upstream hybrid/heterogeneous page alignment whenever a common
-        # kernel block divides it, rather than replacing it with a small page.
-        if cache_config is not None and not cache_config.user_specified_block_size:
+        # Kimi-K3.1 packs mixed page sizes (sparse-MLA latent records, the
+        # per-layer DSA indexer cache, KDA state pools) under the BLHNC
+        # block-outermost layout, where pages sit side by side in a block and
+        # a manager block therefore cannot be split into kernel blocks.  Pin
+        # the manager block to the 64-token kernel block instead of
+        # preserving an upstream multi-kernel hybrid alignment.
+        if (
+            cache_config is not None
+            and not cache_config.user_specified_block_size
+            and getattr(hf_config, "model_type", None) == "kimi_k31"
+        ):
+            if cache_config.block_size != 64:
+                logger.warning(
+                    "Kimi-K3.1: mixed-page BLHNC packing requires the "
+                    "manager block to equal the 64-token kernel block; "
+                    "overriding kv cache block size %d with 64.",
+                    cache_config.block_size,
+                )
+                cache_config.block_size = 64
+        elif cache_config is not None and not cache_config.user_specified_block_size:
             from vllm.config.vllm import (
                 get_layers_from_vllm_config,
                 set_current_vllm_config,

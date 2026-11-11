@@ -157,6 +157,36 @@ def flash_mla_sparse_fwd(
     """Dispatch sparse MLA to native FlashMLA or the BoltOPs fallback."""
     kernel = _resolve_sparse_mla_fwd(backend)
     if kernel is _native_flash_mla_sparse_fwd:
+        h_q = q.shape[-2]
+        if h_q not in (64, 128):
+            # The native FP8 sparse kernel whitelists 64 or 128 query heads,
+            # and the fp8 prefill path reaches it without the decode-path
+            # head padding (TP4 of a 96-head model leaves 24).  Softmax is
+            # per-head, so zero-padding q and slicing the outputs back is
+            # exact; padded attn_sink entries use +inf so their gate factor
+            # exp(lse)/(exp(lse)+inf) collapses to zero.
+            target = 64 if h_q < 64 else 128
+            pad = (0, 0, 0, target - h_q)
+            padded_q = torch.nn.functional.pad(q, pad)
+            padded_sink = None
+            if attn_sink is not None:
+                padded_sink = torch.full(
+                    (target,),
+                    float("inf"),
+                    dtype=attn_sink.dtype,
+                    device=attn_sink.device,
+                )
+                padded_sink[:h_q] = attn_sink
+            out, lse, max_logits = kernel(
+                padded_q,
+                kv,
+                indices,
+                sm_scale,
+                d_v,
+                padded_sink,
+                topk_length,
+            )
+            return out[..., :h_q, :], lse[..., :h_q, :], max_logits
         return kernel(
             q,
             kv,

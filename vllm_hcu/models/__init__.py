@@ -45,6 +45,12 @@ def register_model():
         "Glm4MoeMTPModel", "vllm_hcu.models.glm4_moe_mtp:Glm4MoeMTP"
     )
 
+    # Kimi-K3.1 Pro keeps the Kimi-K3 language model stack; the DSA full
+    # attention layers are routed by worker patches (kimi_k31 model_type).
+    ModelRegistry.register_model(
+        "KimiK31ForConditionalGeneration",
+        "vllm.models.kimi_k3:KimiK3ForConditionalGeneration",
+    )
     ModelRegistry.register_model(
         "HYV3ForCausalLM", "vllm_hcu.models.hy_v3:HYV3ForCausalLM"
     )

@@ -11,6 +11,7 @@ from vllm.v1.attention.backends.mla.flashmla_sparse import (
     FlashMLASparseImpl,
     FlashMLASparseMetadataBuilder,
 )
+from vllm.v1.kv_cache_interface import KVCacheLayout
 from vllm.v1.worker.workspace import current_workspace_manager
 
 
@@ -142,6 +143,16 @@ class HcuFlashMLASparseImpl(FlashMLASparseImpl):
 
 
 class HcuFlashMLASparseBackend(FlashMLASparseBackend):
+    @classmethod
+    def supported_kv_cache_layouts(cls) -> tuple[KVCacheLayout, ...]:
+        # K3.1 packs the per-DSA-layer indexer pages (132 B/token) beside
+        # the sparse-MLA latent pages (656 B/token): mixed page sizes are
+        # only representable when the layer dim sits inside the block dim
+        # (upstream Dots3NotePaddedSparseBackend declares BLHNC for the
+        # same reason).  Both records carry a single kv head, so the HND
+        # view under BLHNC is byte-identical to the NHD one.
+        return (KVCacheLayout.BLHNC,)
+
     @staticmethod
     def get_builder_cls() -> type[HcuFlashMLASparseMetadataBuilder]:
         return HcuFlashMLASparseMetadataBuilder

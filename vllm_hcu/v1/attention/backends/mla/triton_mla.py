@@ -21,6 +21,9 @@ from vllm.v1.attention.backends.utils import (
     reshape_attn_output_for_spec_decode,
     reshape_query_for_spec_decode,
 )
+from vllm_hcu.v1.attention.backends.mla.kv_dtype import (
+    effective_group_kv_cache_dtype,
+)
 
 logger = init_logger(__name__)
 
@@ -107,7 +110,11 @@ class HcuTritonMLAMetadataBuilder(TritonMLAMetadataBuilder):
 
     def __init__(self, kv_cache_spec, layer_names, vllm_config, device):
         super().__init__(kv_cache_spec, layer_names, vllm_config, device)
-        cache_dtype = vllm_config.cache_config.cache_dtype
+        # The fast path walks FP8 pages: gate on the dtype THIS group stores
+        # (a DSpark draft keeps BF16 pages under an fp8_ds_mla run dtype).
+        cache_dtype = effective_group_kv_cache_dtype(
+            kv_cache_spec, vllm_config.cache_config.cache_dtype
+        )
         page = getattr(kv_cache_spec, "block_size", None)
         group_non_causal = getattr(
             self, "non_causal_multi_token_decode", False

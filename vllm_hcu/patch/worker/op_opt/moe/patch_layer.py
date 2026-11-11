@@ -231,7 +231,7 @@ def apply_to_module(module: ModuleType) -> bool:
         # init_vllm_registered_model installs the inner text config while
         # constructing Kimi-K3's language model (model_type="kimi_linear").
         is_kimi_k3 = getattr(hf_config, "model_type", None) in (
-            "kimi_k3", "kimi_linear"
+            "kimi_k3", "kimi_linear", "kimi_k31"
         )
         parallel_config = getattr(vllm_config, "parallel_config", None)
         if is_kimi_k3 and bool(getattr(parallel_config, "enable_eplb", False)):

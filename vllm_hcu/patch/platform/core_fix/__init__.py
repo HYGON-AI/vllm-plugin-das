@@ -32,6 +32,8 @@ from . import (
     patch_hy_v3_reasoning_parser,
     patch_hy_v3_tool_parser,
     patch_import_utils,
+    patch_kv_connector_fallback,
+    patch_kimi_k31_kv_groups,
     patch_gdn_conv_probe,
     patch_smoke_layer_filter,
     patch_decode_bench_connector,
@@ -70,6 +72,7 @@ _ORDERED_ADAPTERS = (
     patch_smoke_layer_filter,
     patch_gdn_conv_probe,
     patch_decode_bench_connector,
+    patch_kimi_k31_kv_groups,
 )
 
 

@@ -92,8 +92,38 @@ class SlimQuantW4A8Int8Config(QuantizationConfig):
             ngram_entry = mixed_precision.get("ngram_embedding")
             if not isinstance(ngram_entry, dict):
                 ngram_entry = None
+        ignore = config.get("ignore")
+        derive_include = False
+        if not ignore:
+            # Checkpoints in the slimquant dialect store BF16 exemptions
+            # under the HF-style ``modules_to_not_convert`` key (Kimi K3.1
+            # exempts the whole attention/KDA family there). Honor both.
+            ignore = config.get("modules_to_not_convert")
+            # The same dialect drops ``mixed_precision.w8a8_include``; its
+            # semantics are "quantize everything not exempted". Mirror the
+            # K3 Channel mixed-attention contract so the plugin's mixed-KDA
+            # pipeline (INT8 q/k/v + floating g/f_a/b gate) activates
+            # instead of fusing BF16 shards into an INT8 module.
+            derive_include = bool(ignore)
+        if ignore:
+            # HF stores suffix-style entries (``self_attn.o_proj``) while the
+            # matcher is fnmatch over the full module prefix; wildcard-wrap
+            # plain entries so they match at any depth.
+            ignore = [
+                entry if any(ch in entry for ch in "*?[") else f"*{entry}"
+                for entry in ignore
+            ]
+            # Kimi-style checkpoints name the merged column-parallel weights
+            # by their split inputs (``mlp.gate_proj``/``mlp.up_proj``, which
+            # the engine materializes as ``mlp.gate_up_proj``). The slimquant
+            # config ships an empty packed_modules_mapping, so expand the
+            # alias here or the fused module would be built quantized and its
+            # BF16 checkpoint data would silently fail to load.
+            ignore += ["*mlp.gate_up_proj", "*mlp.down_proj"]
+        if derive_include and w8a8_include is None:
+            w8a8_include = ["re:.*"]
         return cls(
-            ignore=config.get("ignore"),
+            ignore=list(ignore) if ignore else None,
             w8a8_include=w8a8_include,
             ngram_embedding_mixed_precision=ngram_entry,
         )

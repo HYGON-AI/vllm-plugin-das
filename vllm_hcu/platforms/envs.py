@@ -36,6 +36,7 @@ if TYPE_CHECKING:
     VLLM_HCU_USE_LIGHTOP_W16A16_MOE: bool = False
     VLLM_HCU_USE_LIGHTOP_AWQ: bool = False
     VLLM_HCU_INDEXER_KCACHE_LAYOUT: str = "preshuffle"
+    VLLM_HCU_INDEXER_SCORER: str = "lightop"
     VLLM_HCU_USE_LIGHTOP_MLA_DECODE_CAT: bool = True
     VLLM_HCU_USE_CUSTOM_CAUSAL_CONV1D : bool = False
     VLLM_HCU_USE_DP_CONNECTOR : bool = False
@@ -95,6 +96,8 @@ if TYPE_CHECKING:
     VLLM_HCU_DP_INT8_ALLGATHER: bool = False
     VLLM_HCU_MHC_FUSED_RMSNORM: bool = True
     VLLM_HCU_GLM5NEXT_KDA_STRIDED_INPUTS: bool = True
+    VLLM_HCU_K3_DSPARK_DRAFT_KV_DTYPE: str = "auto"
+    VLLM_HCU_K3_DSPARK_DRAFT_MLA_BACKEND: str = "auto"
 
 def maybe_convert_int(value: Optional[str]) -> Optional[int]:
     """
@@ -239,6 +242,89 @@ def indexer_kcache_layout() -> str:
     if not custom_ops_enabled():
         return "preshuffle"
     return raw
+
+
+INDEXER_SCORER_ENV = "VLLM_HCU_INDEXER_SCORER"
+INDEXER_SCORERS = ("lightop", "aiter", "deepgemm")
+
+
+def indexer_scorer() -> str:
+    """Select the gfx938 normal-layout sparse-indexer decode scorer.
+
+    ``lightop`` (default) keeps LightOp ``paged_mqa_logits``; ``deepgemm``
+    routes decode scoring to ``deepgemm.paged_mqa_logits`` (native paged
+    MQA accepting block-padded pages); ``aiter`` routes
+    decode scoring to ``aiter.paged_mqa_logits`` (native fp8 MMAC on gfx938).
+    Both scorers read the same token-major pages, so this is a rank-local
+    compute choice (unlike the layout, which is part of the cache contents)
+    and only takes effect when the K-cache layout is ``normal``; with
+    ``preshuffle`` pages it is ignored with a warning. Falls back to LightOp
+    when aiter is unavailable.
+    """
+
+    raw = os.environ.get(INDEXER_SCORER_ENV, "lightop").strip().lower()
+    if raw not in INDEXER_SCORERS:
+        raise ValueError(
+            f"{INDEXER_SCORER_ENV} must be one of "
+            f"{INDEXER_SCORERS}, got {raw!r}"
+        )
+    return raw
+
+
+K3_DSPARK_DRAFT_KV_DTYPE_ENV = "VLLM_HCU_K3_DSPARK_DRAFT_KV_DTYPE"
+K3_DSPARK_DRAFT_KV_DTYPES = ("auto", "bfloat16", "fp8_e4m3", "inherit")
+K3_DSPARK_DRAFT_MLA_BACKEND_ENV = "VLLM_HCU_K3_DSPARK_DRAFT_MLA_BACKEND"
+K3_DSPARK_DRAFT_MLA_BACKENDS = ("auto", "FLASHMLA", "TRITON_MLA")
+_K3_DSPARK_DRAFT_MLA_BACKEND_ALIASES = {
+    "auto": "auto",
+    "flashmla": "FLASHMLA",
+    "flash_mla": "FLASHMLA",
+    "triton": "TRITON_MLA",
+    "triton_mla": "TRITON_MLA",
+}
+
+
+def k3_dspark_draft_kv_dtype() -> str:
+    """Resolve the KV dtype requested for Kimi-K3/K3.1 DSpark draft layers.
+
+    The draft's dense MLA layers inherit the run-level KV dtype. When that is
+    the sparse-only ``fp8_ds_mla`` record (Kimi-K3.1 normalizes fp8_e4m3 to
+    it), no HCU dense MLA backend can serve the draft, so the draft layers
+    are built with this dtype instead: ``auto`` (model dtype, BF16 latent;
+    default), ``bfloat16``, or ``fp8_e4m3`` (per-tensor FP8; needs the K3 MLA
+    fp8 prefill-query contract). ``inherit`` keeps the run-level dtype, i.e.
+    the pre-adapter behavior. Run-level dtypes other than ``fp8_ds_mla`` are
+    never rewritten.
+    """
+
+    raw = os.environ.get(K3_DSPARK_DRAFT_KV_DTYPE_ENV, "auto").strip().lower()
+    if raw not in K3_DSPARK_DRAFT_KV_DTYPES:
+        raise ValueError(
+            f"{K3_DSPARK_DRAFT_KV_DTYPE_ENV} must be one of "
+            f"{K3_DSPARK_DRAFT_KV_DTYPES}, got {raw!r}"
+        )
+    return raw
+
+
+def k3_dspark_draft_mla_backend() -> str:
+    """Resolve the dense MLA backend pinned for Kimi-K3/K3.1 DSpark drafts.
+
+    ``auto`` (default) keeps the platform priority (FLASHMLA, then
+    TRITON_MLA; TRITON_MLA first when VLLM_HCU_USE_CUSTOM_OPS=0).
+    ``FLASHMLA`` / ``TRITON_MLA`` pin the draft layers only; the target
+    model's backend selection is untouched. The platform's custom-op master
+    fallback still rewrites a FLASHMLA pin to TRITON_MLA when the master
+    switch is off.
+    """
+
+    raw = os.environ.get(K3_DSPARK_DRAFT_MLA_BACKEND_ENV, "auto").strip()
+    resolved = _K3_DSPARK_DRAFT_MLA_BACKEND_ALIASES.get(raw.lower())
+    if resolved is None:
+        raise ValueError(
+            f"{K3_DSPARK_DRAFT_MLA_BACKEND_ENV} must be one of "
+            f"{K3_DSPARK_DRAFT_MLA_BACKENDS}, got {raw!r}"
+        )
+    return resolved
 
 
 def ple_prefetch_enabled() -> bool:
@@ -744,6 +830,12 @@ hcu_vllm_environment_variables: dict[str, Callable[[], Any]] = {
     "VLLM_HCU_INDEXER_KCACHE_LAYOUT":
         indexer_kcache_layout,
 
+    # gfx938 sparse-indexer decode scorer inside the "normal" K-cache
+    # layout: "lightop" (default), "deepgemm" (paged MQA accepting
+    # block-padded pages), or "aiter" (fp8 MMAC, dense pages only).
+    "VLLM_HCU_INDEXER_SCORER":
+        indexer_scorer,
+
     # Route the RMSNorm applied after the mHC pre/fused-post-pre kernels
     # through aten's single fused rms_norm kernel instead of
     # vllm.ir.ops.rms_norm's native implementation (8 elementwise/reduce
@@ -766,6 +858,18 @@ hcu_vllm_environment_variables: dict[str, Callable[[], Any]] = {
     "VLLM_HCU_GLM5NEXT_KDA_STRIDED_INPUTS":
         lambda: (os.environ.get("VLLM_HCU_GLM5NEXT_KDA_STRIDED_INPUTS", "True").lower() in
                     ("true", "1")),
+
+    # Kimi-K3/K3.1 DSpark draft KV dtype when the run-level KV dtype is the
+    # sparse-only fp8_ds_mla record: auto (BF16, default) | bfloat16 |
+    # fp8_e4m3 | inherit (keep fp8_ds_mla; no dense HCU backend accepts it).
+    # See patch_kimi_k3_dspark_draft_attention.py.
+    "VLLM_HCU_K3_DSPARK_DRAFT_KV_DTYPE":
+        k3_dspark_draft_kv_dtype,
+
+    # Kimi-K3/K3.1 DSpark draft dense MLA backend: auto (platform priority,
+    # default) | FLASHMLA | TRITON_MLA. Draft layers only.
+    "VLLM_HCU_K3_DSPARK_DRAFT_MLA_BACKEND":
+        k3_dspark_draft_mla_backend,
 }
 
 # end-env-vars-definition

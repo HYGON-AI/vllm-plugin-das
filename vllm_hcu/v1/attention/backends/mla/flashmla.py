@@ -48,6 +48,9 @@ from vllm_hcu.v1.attention.ops.flashmla import (
 )
 import vllm_hcu.platforms.envs as henvs
 from vllm_hcu.platforms.hcu import on_gfx938
+from vllm_hcu.v1.attention.backends.mla.kv_dtype import (
+    effective_group_kv_cache_dtype,
+)
 
 logger = init_logger(__name__)
 
@@ -190,9 +193,12 @@ class FlashMLAMetadataBuilder(MLACommonMetadataBuilder[FlashMLAMetadata]):
 
         self.cg_buf_tile_scheduler_metadata = None
         self.cg_buf_num_splits = None
-        self.is_fp8_kvcache = is_quantized_kv_cache(
-            vllm_config.cache_config.cache_dtype
+        # Plan from the dtype THIS group's pages hold: a DSpark draft group
+        # keeps BF16 latent pages under a quantized (fp8_ds_mla) run dtype.
+        group_cache_dtype = effective_group_kv_cache_dtype(
+            kv_cache_spec, vllm_config.cache_config.cache_dtype
         )
+        self.is_fp8_kvcache = is_quantized_kv_cache(group_cache_dtype)
 
         num_sms = num_compute_units(self.device.index)
 
@@ -207,9 +213,7 @@ class FlashMLAMetadataBuilder(MLACommonMetadataBuilder[FlashMLAMetadata]):
             if isinstance(page, int) and page > 0 and page % _NC_PAGE_BLOCK == 0
             else None
         )
-        if spec_nc and subpage and is_quantized_kv_cache(
-            vllm_config.cache_config.cache_dtype
-        ):
+        if spec_nc and subpage and self.is_fp8_kvcache:
             nc_max_seqs = vllm_config.scheduler_config.max_num_seqs + 1
             nc_cols = -(-vllm_config.model_config.max_model_len // page) + 1
             nc_key = (

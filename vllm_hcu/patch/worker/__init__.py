@@ -281,6 +281,15 @@ _OP_CALLBACKS: tuple[_CallbackSpec, ...] = (
     # vendor fused op, which drops warp writes at large B under FULL
     # cudagraph replay. Opt-out: VLLM_HCU_K3_QCAT_TRITON=0.
     _CallbackSpec(_adapter("op_opt", "patch_kimi_k3_nc_qcat")),
+    # Kimi-K3.1 DSA layers -> sparse MultiHeadLatentAttentionWrapper.
+    # Registered AFTER mla_gate so the outermost
+    # KimiMLAAttention.__init__ wrapper short-circuits DSA layers before
+    # the merged-gate rebind can touch them.
+    _CallbackSpec(_adapter("op_opt", "patch_kimi_k31_dsa")),
+    # Kimi-K3/K3.1 DSpark draft dense MLA: draft-scoped KV dtype (fp8_ds_mla
+    # run -> BF16 draft pages) and FLASHMLA/TRITON_MLA pin. Exact hook on
+    # nvidia.dspark_mla; the target model's layers are not touched.
+    _CallbackSpec(_adapter("op_opt", "patch_kimi_k3_dspark_draft_attention")),
     # Must be applied after reference_paths: it wraps the
     # forward_attn_residual that adapter installs and captures it as the
     # non-SP chain. Opt-in: armed only with VLLM_HCU_K3_SP_MOE=1.
