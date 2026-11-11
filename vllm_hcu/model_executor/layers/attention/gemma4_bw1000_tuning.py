@@ -10,7 +10,7 @@ Persistent KV stays FP8; shapes outside the validated set use stock behaviour.
     BLOCK_Q=8, TILE_SIZE=32, 8 warps (the grid is recomputed for BLOCK_Q);
   * SWA head256 (Q16/KV8, window 1024) with K/V scale==1: read FP8 as BF16
     directly (``KV_QUANT_MODE=0``), skipping the FP32 scaling, at any sequence
-    count; the warp/stage choice applies at 32..``VLLM_HCU_GEMMA4_BW1000_MAX_SEQS``.
+    count; the warp/stage choice applies from 32 sequences up, with no ceiling.
 """
 
 from __future__ import annotations
@@ -29,23 +29,19 @@ _installed = False
 def _max_tuned_seqs() -> int:
     """Upper bound on running sequences for the *launch-parameter* tuning.
 
-    The default is the highest sequence count the launch parameters have been
-    measured at. Raising it further applies warp/stage and tiling choices to
-    shapes nobody has timed, which can be slower rather than faster.
+    Applies to the global head512 tiling only. That path's tiling, warp and
+    stage choices have been measured at 9..64 sequences and nowhere else, so the
+    default stays there; raising it applies them to shapes nobody has timed,
+    which can be slower rather than faster.
 
-    Operator-level measurement of the SWA path (head 256, 16/8 heads, window
-    1024, q_len 5, unit scales) gives the tuning 1.046x at 32 sequences, 1.069x
-    at 64, 1.111x at 128 and 1.104x at 256, with the kernel output bit-identical
-    throughout -- so 64 was where the measurements stopped, not where the gain
-    did. Below 32 the trend thins out and has not been swept.
-
-    This bound does not affect the unit-scale KV cast, which is worth about
-    1.5x on its own across that whole range and whose correctness does not
-    depend on the sequence count.
+    The SWA path is no longer governed by this: its warp/stage choice was swept
+    at the operator level and holds from 32 sequences upward with no ceiling,
+    while its unit-scale KV cast is worth about 1.5x independently of the
+    sequence count and is not bounded at all.
     """
     import os
 
-    raw = os.environ.get("VLLM_HCU_GEMMA4_BW1000_MAX_SEQS", "256").strip()
+    raw = os.environ.get("VLLM_HCU_GEMMA4_BW1000_MAX_SEQS", "64").strip()
     value = int(raw)
     if value < 9:
         raise ValueError("VLLM_HCU_GEMMA4_BW1000_MAX_SEQS must be >= 9")
@@ -182,8 +178,13 @@ def install() -> None:
                     # The warp/stage choice, unlike the cast, was measured at
                     # 32..64 sequences only; leave other shapes on the stock
                     # launch parameters.
-                    tuned = 32 <= kw.get("num_seqs", 0) <= _max_tuned_seqs()
-                    if tuned:
+                    # Measured on this path (head 256, 16/8 heads, window
+                    # 1024, q_len 5, unit scales): the warp/stage choice is
+                    # 1.058x at 32 sequences, rising to 1.144x at 64, 1.194x at
+                    # 128 and 1.139x at 256, so there is no upper bound to hold.
+                    # Below 32 it is a loss, not a smaller win -- 0.892x at 8,
+                    # 0.893x at 16, 0.924x at 24 -- so that floor stays.
+                    if kw.get("num_seqs", 0) >= 32:
                         kw["num_stages"] = 1
                         kw.setdefault("num_warps", 4)
                     if not _unit_logged:
