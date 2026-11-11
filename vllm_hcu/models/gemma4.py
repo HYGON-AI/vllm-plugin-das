@@ -265,6 +265,7 @@ class Gemma4FAAttentionImpl(TritonAttentionImpl):
             "all",
         )
         self._logged_routes: set[tuple] = set()
+        self._logged_failures: set[tuple] = set()
 
     def _log_fa_failures(
         self,
@@ -279,6 +280,18 @@ class Gemma4FAAttentionImpl(TritonAttentionImpl):
         if not self._debug_routes:
             return
         q_len = getattr(metadata, "max_query_len", None)
+        # One line per distinct rejection, as the route log does. Every layer
+        # of every decode step reaches this, so logging each occurrence floods
+        # the hot path and depresses throughput for as long as the switch is on.
+        log_key = (
+            layer_name or getattr(self, "layer_name", "unknown"),
+            tuple(failures),
+            q_len,
+            tuple(query.shape),
+        )
+        if log_key in self._logged_failures:
+            return
+        self._logged_failures.add(log_key)
         logger.info(
             ("[GEMMA4_FA_FALSE] layer=%s q_len=%s failures=%s "
             "q_shape=%s q_dtype=%s kv_shape=%s kv_dtype=%s "
