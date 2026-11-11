@@ -41,6 +41,15 @@ def _num_workspace_lanes(
     )
 
 
+def _gemma4_bw1000_enabled() -> bool:
+    """Opt-in Gemma4 BW1000 tuning (TP1, BF16, FP8 KV, MTP, 64 seqs only)."""
+
+    value = os.environ.get("VLLM_HCU_GEMMA4_BW1000_OPT", "0").strip().lower()
+    if value not in {"", "0", "false", "1", "true"}:
+        raise ValueError("VLLM_HCU_GEMMA4_BW1000_OPT must be 0/1 or false/true")
+    return value in {"1", "true"}
+
+
 def _create_model_runner(
     vllm_config: VllmConfig,
     device: torch.device,
@@ -71,6 +80,10 @@ def _create_model_runner(
     from vllm_hcu.v1.hcu_model_runner_v2 import HcuGPUModelRunnerV2
 
     runner = HcuGPUModelRunnerV2(vllm_config, device)
+    if _gemma4_bw1000_enabled():
+        from vllm_hcu.model_executor.layers.attention import gemma4_bw1000_tuning
+
+        gemma4_bw1000_tuning.install()
     runner_logger.info("HCU model runner constructed: %s", type(runner).__name__)
     return runner
 
@@ -121,6 +134,11 @@ class HcuGPUWorker(Worker):
         """Load the model, then require every enabled patch chain to be live."""
 
         super().load_model(load_dummy_weights=load_dummy_weights)
+        if _gemma4_bw1000_enabled():
+            from vllm_hcu.model_executor.layers import gemma4_lm_head
+
+            gemma4_lm_head.load_head_table()
+            gemma4_lm_head.install_head_bucket(self.model_runner)
         from vllm_hcu.patch.worker import validate_worker_patches
         model_runner = getattr(self, "model_runner", None)
         num_compressor_weights = getattr(
