@@ -15,9 +15,9 @@ on:
         type: string
         default: ''
       hardware:
-        description: all, BW1100 or BW1000
+        description: BW1100 only during ARC migration; legacy all selects BW1100
         type: string
-        default: all
+        default: BW1100
       mode:
         description: preflight or execute
         type: string
@@ -37,10 +37,10 @@ on:
   workflow_dispatch:
     inputs:
       hardware:
-        description: all runs both hardware suites in parallel
+        description: BW1100 only; BW1000 is paused during ARC migration
         type: choice
-        options: [all, BW1100, BW1000]
-        default: all
+        options: [BW1100]
+        default: BW1100
       mode:
         description: First run preflight; then execute
         type: choice
@@ -64,16 +64,27 @@ concurrency:
 
 jobs:
   prepare:
-    runs-on: bw1100
+    runs-on: hygon-cpu
     timeout-minutes: 45
     outputs:
       enabled: ${{ steps.prepare.outputs.enabled }}
       image: ${{ steps.prepare.outputs.image_ref }}
+      container-image: ${{ steps.prepare.outputs.container_image }}
       image-id: ${{ steps.prepare.outputs.image_id }}
       cookbook-ref: ${{ steps.prepare.outputs.cookbook_ref }}
       controller-ref: ${{ steps.prepare.outputs.controller_ref }}
       matrix: ${{ steps.prepare.outputs.matrix }}
     steps:
+      - name: Validate ARC hardware selection
+        env:
+          REQUESTED_HARDWARE: ${{ inputs.hardware || 'BW1100' }}
+        shell: bash
+        run: |
+          set -euo pipefail
+          case "$REQUESTED_HARDWARE" in
+            BW1100|all) ;;
+            *) echo "::error::Only BW1100 is enabled; BW1000 model tests are paused during ARC migration."; exit 2 ;;
+          esac
       - uses: actions/checkout@v4
         with:
           repository: guochenyang99/ci-model-test
@@ -88,7 +99,9 @@ jobs:
           framework-version: '0.28.1'
           image: ${{ inputs.image || '' }}
           image-id: ${{ inputs.image-id || '' }}
-          hardware: ${{ inputs.hardware || 'all' }}
+          backend: arc
+          # Do not generate BW1000 cases even for callers still passing all.
+          hardware: BW1100
 
   smoke:
     needs: prepare
@@ -97,8 +110,11 @@ jobs:
       fail-fast: false
       matrix: ${{ fromJSON(needs.prepare.outputs.matrix) }}
     name: Smoke (${{ matrix.hardware }})
-    runs-on: ${{ matrix.runner }}
+    runs-on: hygon-bw1100-8card
     timeout-minutes: 840
+    container:
+      # ARC creates the job Pod and allocates all eight HCU devices.
+      image: ${{ needs.prepare.outputs.container-image }}
     steps:
       - name: Checkout pinned private test controller
         uses: actions/checkout@v4
@@ -109,11 +125,12 @@ jobs:
           persist-credentials: false
           path: model-ci-tools
       - name: Test this hardware and transfer evidence
-        uses: ./model-ci-tools/.github/actions/deployment-smoke
+        uses: ./model-ci-tools/.github/actions/deployment-smoke-arc
         with:
           framework: vllm
           framework-version: '0.28.1'
           image: ${{ needs.prepare.outputs.image }}
+          container-image: ${{ needs.prepare.outputs.container-image }}
           expected-image-id: ${{ needs.prepare.outputs.image-id }}
           cookbook-ref: ${{ needs.prepare.outputs.cookbook-ref }}
           controller-ref: ${{ needs.prepare.outputs.controller-ref }}
@@ -125,8 +142,10 @@ jobs:
   report:
     needs: [prepare, smoke]
     if: ${{ always() && needs.prepare.result == 'success' && needs.prepare.outputs.enabled == 'true' }}
-    runs-on: bw1100
+    runs-on: hygon-build
     timeout-minutes: 60
+    container:
+      image: ${{ needs.prepare.outputs.container-image }}
     permissions:
       contents: read
     steps:
@@ -142,6 +161,7 @@ jobs:
         with:
           framework: vllm
           framework-version: '0.28.1'
+          backend: arc
           pypi-url: ${{ vars.PYPI_URL }}
           cases: ${{ inputs.cases || '' }}
           matrix: ${{ needs.prepare.outputs.matrix }}
