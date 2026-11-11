@@ -5,7 +5,8 @@
 Ported from the validated stage1 bundle:
   * load the fixed rocBLAS algorithm table (TunableOp, tuning disabled);
   * pad 128..319 hidden rows to the tuned 320-row GEMM;
-  * softcap the logits by table lookup instead of recomputing tanh.
+  * softcap the logits by table lookup instead of recomputing tanh;
+  * fuse the 33..64-row greedy draft projection with its argmax.
 """
 
 from __future__ import annotations
@@ -19,6 +20,7 @@ import torch
 
 from vllm.logger import init_logger
 
+from .gemma4_dense_head import dense_argmax
 from .gemma4_softcap_lut import apply_lut, build_lut
 
 logger = init_logger(__name__)
@@ -29,10 +31,14 @@ VOCAB = 262144
 SOFTCAP = 30.0
 BUCKET = 320
 BUCKET_ROWS = tuple(range(128, BUCKET))
+DRAFT_HIDDEN = 1024
+DENSE_ROWS = tuple(range(33, 65))
+DENSE_CONFIG = {"BM": 32, "BN": 256, "BK": 64, "num_warps": 8, "num_stages": 1}
 
 _table_loaded = False
 _bucket_installed = False
 _softcap_installed = False
+_dense_draft_installed = False
 
 
 def load_head_table() -> dict | None:
@@ -167,4 +173,69 @@ def install_head_bucket(runner, rows=BUCKET_ROWS) -> None:
     logger.info(
         "Gemma4 BW1000 head bucket active: rows=%d..%d bucket=%d",
         min(rows), max(rows), BUCKET,
+    )
+
+
+def install_dense_draft(runner, config=None, rows=DENSE_ROWS) -> None:
+    """Fuse the greedy draft projection with its argmax for 33..64 rows.
+
+    Idempotent: a second call in the same process is a no-op. The stock step
+    materialises the whole [rows, vocab] logits tensor only to reduce it, which
+    at 64 rows over this vocabulary writes and reads back 32 MiB to produce 64
+    indices.
+
+    Unlike the softcap table this is not a bit-identical substitution: the
+    GEMM's accumulation order differs from the library's, so a logit on a
+    rounding boundary can fall either way and change which of several tied
+    columns wins. The tie rule itself matches torch.argmax -- lowest index,
+    NaN outranking everything -- and over 209 rows of random and
+    small-magnitude input the indices agreed with the stock path exactly, with
+    explicit ties, a suppressed tied winner and NaN rows all resolving the same
+    way. A residual tie difference stays a legitimate greedy pick.
+    """
+    global _dense_draft_installed
+    if _dense_draft_installed:
+        return
+    config = config or DENSE_CONFIG
+    spec = getattr(runner, "speculator", None)
+    model = runner.get_draft_model()
+    if spec is None or model is None:
+        return
+    assert spec.draft_logits is None, "fused argmax returns indices, not logits"
+    assert runner.vllm_config.parallel_config.tensor_parallel_size == 1
+    w = model.lm_head.weight
+    assert w.shape == (VOCAB, DRAFT_HIDDEN) and w.dtype == torch.bfloat16
+    assert model.logits_processor.soft_cap is None
+    assert model.logits_processor.scale == 1
+    assert getattr(model, "masked_embedding", None) is None
+    rows = frozenset(rows)
+    assert rows and all(32 <= n <= 64 for n in rows)
+
+    original = spec._greedy_sample_draft
+    # Captured after load_weights, which is where gemma4_mtp fills it in; the
+    # stock path suppresses the same ids inside compute_logits.
+    suppress = getattr(model, "_suppress_idx", None)
+
+    def greedy(hidden):
+        if (
+            hidden.dtype != torch.bfloat16
+            or hidden.ndim != 2
+            or hidden.shape[1] != DRAFT_HIDDEN
+            or hidden.shape[0] not in rows
+        ):
+            return original(hidden)
+        return dense_argmax(hidden, w, suppress, config)
+
+    # Compile every gated row count now: a first compile inside CUDA graph
+    # capture would be fatal.
+    dummy = torch.zeros((max(rows), DRAFT_HIDDEN), dtype=torch.bfloat16, device=w.device)
+    for n in sorted(rows):
+        dense_argmax(dummy[:n], w, suppress, config)
+    torch.cuda.synchronize()
+
+    spec._greedy_sample_draft = greedy
+    _dense_draft_installed = True
+    logger.info(
+        "Gemma4 BW1000 fused draft argmax active: rows=%d..%d vocab=%d",
+        min(rows), max(rows), VOCAB,
     )
