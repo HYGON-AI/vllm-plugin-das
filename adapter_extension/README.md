@@ -9,7 +9,7 @@ activation dependencies are independent of the optional RMS provider.
 lifecycle; this wheel contributes optional, independently removable operator
 optimizations through the adapter extension API.
 
-Version `0.3.0.dev0` targets the `v0.33.0` branch. Migration status and current
+Version `0.33.0` targets the `v0.33.0` branch. Migration status and current
 evidence are recorded in [v0.33 validation](../docs/validation/vllm033-upgrade.md);
 the v0.32 documents below are historical evidence and do not certify v0.33.
 Separate extensions provide default-OFF RMSNorm, HCU FlashAttention, SlimQuant
@@ -44,7 +44,7 @@ operator-level capabilities.
   use ABI-matched local builds.
 - The plugin does not own `vllm.platform_plugins` or `vllm.general_plugins`.
 
-The repository root remains the vLLM 0.28.1 development reference. Build only
+The repository-root legacy build is disabled on this branch. Build only
 this directory for vLLM 0.33:
 
 ```bash
@@ -102,8 +102,10 @@ The architecture candidate admits exact gfx936 and gfx938 identities, with
 raw symmetric per-channel INT8 expert weights,
 dynamic per-token INT8 activations, BF16/FP16 inputs, gated SiLU and ordinary TP.
 The gfx938 component/model gates are separate from the existing gfx936 results.
-On gfx936 only, the isolated EP2 candidate additionally admits static TP-only expert parallelism
+Static TP-only EP2 is admitted on homogeneous gfx936 or gfx938 worker groups,
 with BF16 inputs, global256/local128 experts, hidden2048/intermediate512/top8.
+Architecture-specific validation remains separate; the gfx936 records below
+do not certify gfx938.
 On gfx936, the public factory/CT loader/runner component has passed a controlled two-rank
 fixture, including shared output, reload and changed-input Graph replay. The real
 Qwen3.5 INT8 checkpoint also completes original HumanEval32 with both AITER and
