@@ -151,6 +151,136 @@ def test_other_errors_are_not_retried():
     assert len(kernel.calls) == 1
 
 
+def _cdiv(value: int, block: int) -> int:
+    return (value + block - 1) // block
+
+
+def _blank(batch: int, rows: int, cols: int, fill: object = None) -> list:
+    return [[[fill for _ in range(cols)] for _ in range(rows)] for _ in range(batch)]
+
+
+class _TileKernel:
+    """One program writes one tile, matching upstream ``bmm_kernel``."""
+
+    def __init__(self, fits=lambda block_n, stages: True) -> None:
+        self.fits = fits
+        self.grids: list[object] = []
+
+    def __getitem__(self, grid):
+        def launch(a, b, out, batch, rows, cols, k, **kwargs):
+            del a, b, k
+            self.grids.append(grid)
+            block_m = kwargs["BLOCK_SIZE_M"]
+            block_n = kwargs["BLOCK_SIZE_N"]
+            if not self.fits(block_n, kwargs["num_stages"]):
+                raise OutOfResources(98304, 65536, "shared memory")
+            num_pid_n = _cdiv(cols, block_n)
+            num_pid_m = _cdiv(rows, block_m)
+            for pid_b in range(grid[0]):
+                for pid in range(grid[1]):
+                    pid_m = pid // num_pid_n
+                    pid_n = pid % num_pid_n
+                    if pid_m >= num_pid_m or pid_n >= num_pid_n:
+                        continue
+                    for row in range(pid_m * block_m, min((pid_m + 1) * block_m, rows)):
+                        for col in range(pid_n * block_n, min((pid_n + 1) * block_n, cols)):
+                            out[pid_b][row][col] = 1
+            return out
+
+        return launch
+
+
+def _launch_bmm(module, out, *, batch, rows, cols, block_n=128, stages=3):
+    # Upstream freezes this from the requested tile, before any fallback.
+    grid = (batch, _cdiv(rows, 128) * _cdiv(cols, block_n))
+    return module.bmm_kernel[grid](
+        _Tensor("float32"),
+        None,
+        out,
+        batch,
+        rows,
+        cols,
+        128,
+        BLOCK_SIZE_M=128,
+        BLOCK_SIZE_N=block_n,
+        BLOCK_SIZE_K=32,
+        num_stages=stages,
+        num_warps=8,
+    )
+
+
+def _written(out) -> bool:
+    return all(value == 1 for batch in out for row in batch for value in row)
+
+
+def test_bmm_narrow_tile_covers_output_on_retry_and_cache_hit():
+    module = _module(fits=lambda block_n, stages: block_n <= 64)
+    module.bmm_kernel = _TileKernel(fits=lambda block_n, stages: block_n <= 64)
+    patch_batch_invariant_stages.apply_to_module(module)
+
+    out = _blank(1, 128, 65, fill="old")
+    _launch_bmm(module, out, batch=1, rows=128, cols=65)
+    assert _written(out)
+    assert module.bmm_kernel._kernel.grids[-1] == (1, 2)
+
+    cached = _blank(1, 256, 65, fill="old")
+    _launch_bmm(module, cached, batch=1, rows=256, cols=65)
+    assert _written(cached)
+    assert module.bmm_kernel._kernel.grids[-1] == (1, 4)
+
+    wider = _blank(2, 128, 129, fill="old")
+    _launch_bmm(module, wider, batch=2, rows=128, cols=129)
+    assert _written(wider)
+    assert module.bmm_kernel._kernel.grids[-1] == (2, 3)
+
+
+def test_bmm_stage_drop_keeps_the_original_grid():
+    module = _module(fits=lambda block_n, stages: stages <= 2)
+    module.bmm_kernel = _TileKernel(fits=lambda block_n, stages: stages <= 2)
+    patch_batch_invariant_stages.apply_to_module(module)
+
+    out = _blank(1, 128, 128, fill="old")
+    _launch_bmm(module, out, batch=1, rows=128, cols=128)
+    assert _written(out)
+    assert module.bmm_kernel._kernel.grids[-1] == (1, 1)
+
+    narrow_n = _blank(1, 128, 4, fill="old")
+    module.bmm_kernel._kernel.fits = lambda block_n, stages: block_n <= 64
+    _launch_bmm(module, narrow_n, batch=1, rows=128, cols=4)
+    assert _written(narrow_n)
+    assert module.bmm_kernel._kernel.grids[-1] == (1, 1)
+
+
+def test_persistent_matmul_keeps_callable_grid():
+    module = _module(fits=lambda block_n, stages: stages <= 2)
+
+    def grid(meta):
+        return (meta["BLOCK_SIZE_N"],)
+
+    patch_batch_invariant_stages.apply_to_module(module)
+    assert (
+        module.matmul_kernel_persistent[grid](
+            _Tensor("float32"),
+            None,
+            None,
+            None,
+            128,
+            65,
+            128,
+            BLOCK_SIZE_M=128,
+            BLOCK_SIZE_N=128,
+            BLOCK_SIZE_K=32,
+            num_stages=3,
+            num_warps=8,
+        )
+        == "launched"
+    )
+    assert [item[0] for item in module.matmul_kernel_persistent._kernel.calls] == [
+        grid,
+        grid,
+    ]
+
+
 def test_stale_marker_is_rejected():
     module = _module()
     setattr(module, "_vllm_hcu_batch_invariant_lds_stages_applied", True)

@@ -15,6 +15,12 @@ stage.  One stage is about 4x slower, so it is the last resort.
 ``BLOCK_SIZE_N`` and ``num_stages`` do not change the K reduction order, so
 the fallback keeps results batch invariant.  The chosen config is cached by
 dtype, N, K and the requested config, never by M.
+
+``bmm_batch_invariant`` freezes ``grid`` from the original ``BLOCK_SIZE_N``
+before this wrapper runs.  Narrowing that tile adds output tiles, and each
+program writes only one tile, so every BMM launch rebuilds ``grid`` from the
+tile actually used.  ``matmul_kernel_persistent`` keeps the callable grid,
+which Triton evaluates from the launch meta.
 """
 
 from __future__ import annotations
@@ -38,9 +44,16 @@ _MARKER = "_vllm_hcu_batch_invariant_lds_stages_applied"
 _PROXY_MARKER = "_vllm_hcu_batch_invariant_lds_stage_proxy"
 _KERNEL_NAMES = ("matmul_kernel_persistent", "bmm_kernel")
 # Both kernels take (a, b, c, bias_or_B, M, N, K, ...) positionally.
+# For bmm_kernel the fourth value is the batch count, not a bias.
+_B_ARG = 3
+_M_ARG = 4
 _N_ARG = 5
 _K_ARG = 6
 _MIN_BLOCK_N = 32
+
+
+def _cdiv(value: int, block: int) -> int:
+    return (value + block - 1) // block
 
 
 def fallback_configs(block_n: int, num_stages: int) -> list[tuple[int, int]]:
@@ -76,36 +89,37 @@ class _LdsFallbackKernel:
         return getattr(self._kernel, name)
 
     def __getitem__(self, grid: Any) -> Any:
-        launch = self._kernel[grid]
-
         def launch_within_lds(*args: Any, **kwargs: Any) -> Any:
-            return self._launch(launch, args, kwargs)
+            return self._launch(grid, args, kwargs)
 
         return launch_within_lds
 
     def _launch(
-        self, launch: Any, args: tuple[Any, ...], kwargs: dict[str, Any]
+        self, grid: Any, args: tuple[Any, ...], kwargs: dict[str, Any]
     ) -> Any:
+        def invoke() -> Any:
+            return self._kernel[self._grid(grid, args, kwargs)](*args, **kwargs)
+
         block_n = kwargs.get("BLOCK_SIZE_N")
         num_stages = kwargs.get("num_stages", 3)
         if not isinstance(block_n, int) or not isinstance(num_stages, int):
-            return launch(*args, **kwargs)
+            return invoke()
 
         key = self._cache_key(args, kwargs, block_n, num_stages)
         chosen = self._chosen.get(key)
         if chosen is not None:
             kwargs["BLOCK_SIZE_N"], kwargs["num_stages"] = chosen
-            return launch(*args, **kwargs)
+            return invoke()
 
         out_of_resources = _out_of_resources()
         try:
-            return launch(*args, **kwargs)
+            return invoke()
         except out_of_resources as exc:
             error = exc
         for candidate in fallback_configs(block_n, num_stages):
             kwargs["BLOCK_SIZE_N"], kwargs["num_stages"] = candidate
             try:
-                result = launch(*args, **kwargs)
+                result = invoke()
             except out_of_resources as exc:
                 error = exc
                 continue
@@ -120,6 +134,33 @@ class _LdsFallbackKernel:
             )
             return result
         raise error
+
+    def _grid(
+        self, grid: Any, args: tuple[Any, ...], kwargs: dict[str, Any]
+    ) -> Any:
+        """Rebuild a frozen BMM tile grid from the tile about to be launched.
+
+        Persistent matmul passes a callable of the launch meta, so Triton
+        already grows that grid when ``BLOCK_SIZE_N`` shrinks.
+        """
+
+        if self._name != "bmm_kernel" or not isinstance(grid, tuple):
+            return grid
+        block_m = kwargs.get("BLOCK_SIZE_M")
+        block_n = kwargs.get("BLOCK_SIZE_N")
+        if (
+            not isinstance(block_m, int)
+            or not isinstance(block_n, int)
+            or block_m <= 0
+            or block_n <= 0
+            or len(args) <= _N_ARG
+        ):
+            return grid
+        batch, rows, cols = args[_B_ARG], args[_M_ARG], args[_N_ARG]
+        if not all(isinstance(value, int) for value in (batch, rows, cols)):
+            return grid
+        tiles = _cdiv(rows, block_m) * _cdiv(cols, block_n)
+        return (batch, tiles)
 
     @staticmethod
     def _cache_key(
