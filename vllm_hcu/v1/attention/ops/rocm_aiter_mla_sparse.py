@@ -527,6 +527,8 @@ def _cp_gather_indexer_k_bf16_cache_kernel(
     num_tokens: tl.constexpr,
     BLOCK_TILE_SIZE: tl.constexpr,
     HEAD_TILE_SIZE: tl.constexpr,
+    block_table_stride0: tl.constexpr,
+    block_table_stride1: tl.constexpr,
 ):
     """
     Triton 核函数 BF16 K Cache 收集
@@ -572,7 +574,9 @@ def _cp_gather_indexer_k_bf16_cache_kernel(
         return
     
     # 计算 block_table 中的内存偏移并加载 block ID
-    block_table_offset = batch_idx * num_blocks_per_seq + block_table_id
+    block_table_offset = (
+        batch_idx * block_table_stride0 + block_table_id * block_table_stride1
+    )
     block_id = tl.load(block_table_ptr + block_table_offset)
     
     # 计算 token 在 block 内的偏移
@@ -582,7 +586,9 @@ def _cp_gather_indexer_k_bf16_cache_kernel(
     # 计算内存偏移
     # --------------------------
     # KV Cache 源偏移：block_id * 块步长 + 块内偏移 * head_dim
-    src_block_offset = block_id * kv_cache_stride
+    # Physical cache pages may be separated by all layers in a shared
+    # allocation. Promote before multiplying to avoid int32 address overflow.
+    src_block_offset = block_id.to(tl.int64) * kv_cache_stride
     src_inblock_offset = src_block_offset + block_offset * head_dim
     
     # 输出张量目标偏移
@@ -644,6 +650,8 @@ def cp_gather_indexer_k_bf16_cache_triton(
         num_tokens,
         block_tile_size,
         head_tile_size,
+        block_table.stride(0),
+        block_table.stride(1),
     )
     
 # Taken from https://github.com/deepseek-ai/DeepGEMM/blob/main/tests/test_attention.py#L156

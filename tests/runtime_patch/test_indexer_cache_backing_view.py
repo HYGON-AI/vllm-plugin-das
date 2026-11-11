@@ -134,6 +134,20 @@ def test_bf16_gather_passes_logical_4d_cache_as_nhd_to_kernel(monkeypatch):
     assert kernel.args[4:10] == (64, 1, 2, 64 * 128, 128, 2)
 
 
+def test_bf16_gather_preserves_strided_block_table(monkeypatch):
+    kernel = _FakeTritonKernel()
+    monkeypatch.setattr(sparse, "_cp_gather_indexer_k_bf16_cache_kernel", kernel)
+    table = torch.zeros(4, 8, dtype=torch.int32)[1::2, ::2]
+    sparse.cp_gather_indexer_k_bf16_cache_triton(
+        torch.empty(8, 64, 128, dtype=torch.bfloat16),
+        torch.empty(128, 128, dtype=torch.bfloat16),
+        table,
+        torch.tensor([0, 64, 128], dtype=torch.int32),
+    )
+    assert kernel.args[2] is table
+    assert kernel.args[-2:] == table.stride()
+
+
 @pytest.mark.parametrize(
     ("gfx938", "direct_decode"), [(False, False), (True, False), (True, True)]
 )
