@@ -186,6 +186,7 @@ def apply_to_module(module: ModuleType) -> bool:
         GELU=gelu_tanh,
         SWIGLUOAI=moe_activation.SWIGLUOAI,
         SWIGLUOAI_UNINTERLEAVE=moe_activation.SWIGLUOAI_UNINTERLEAVE,
+        SITU=moe_activation.SITU,
     )
     special_globals["ActivationMethod"] = SimpleNamespace(
         SILU=hcu_activation_method.SILU,
