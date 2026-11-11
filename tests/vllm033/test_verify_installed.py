@@ -105,7 +105,7 @@ def installed_fixture(monkeypatch: pytest.MonkeyPatch, tmp_path: Path):
         ),
         "hcu-vllm-das-plugin": FakeDistribution(
             "hcu-vllm-das-plugin",
-            "0.3.0.dev0",
+            "0.33.0",
             site,
             [
                 "hcu_vllm_das/extension.py",
@@ -113,7 +113,7 @@ def installed_fixture(monkeypatch: pytest.MonkeyPatch, tmp_path: Path):
                 "hcu_vllm_das/moe/__init__.py",
                 "hcu_vllm_das/moe/fused_moe_aiter.py",
                 "hcu_vllm_das/moe/int8_oracle.py",
-                "hcu_vllm_das_plugin-0.3.0.dist-info/RECORD",
+                "hcu_vllm_das_plugin-0.33.0.dist-info/RECORD",
             ],
         ),
     }
@@ -225,7 +225,7 @@ def test_attestation_accepts_owned_wheels_and_active_extension(
     assert report["schema_version"] == 4
     assert report["vllm"]["version"] == "0.33.0+rocm723"
     assert report["adapter"]["version"] == "0.1.0"
-    assert report["plugin"]["version"] == "0.3.0.dev0"
+    assert report["plugin"]["version"] == "0.33.0"
     assert report["extension"] == {
         "capabilities": ["lightop-rms-norm"],
         "entry_point": "das_hcu",
