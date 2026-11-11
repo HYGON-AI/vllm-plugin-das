@@ -214,7 +214,9 @@ def _install_pcp_prefill_isolation(scheduler: type) -> None:
             setattr(self, _ISOLATE_PREFILL, enabled)
         return enabled
 
-    def run_deferring(self, rows, args, kwargs, hide_waiting=False):
+    def run_deferring(
+        self, rows, args, kwargs, hide_prefill_waiting=False, hide_decode_waiting=False,
+    ):
         """Run ``schedule`` with ``rows`` held out of this step."""
         # schedule() increments current_step before checking eligibility.
         step = self.current_step + 1
@@ -222,9 +224,30 @@ def _install_pcp_prefill_isolation(scheduler: type) -> None:
         for request, _ in deferred:
             request.next_decode_eligible_step = step + 1
         queues = (self.waiting, self.skipped_waiting)
-        if hide_waiting:
-            self.waiting = type(queues[0])()
-            self.skipped_waiting = type(queues[1])()
+        filtered = hide_prefill_waiting or hide_decode_waiting
+        snapshots = [list(queue) for queue in queues] if filtered else []
+        hidden = []
+        if filtered:
+            temporary = []
+            for queue, requests in zip(queues, snapshots):
+                held = {
+                    r.request_id for r in requests
+                    if (
+                        hide_prefill_waiting and not (
+                            _waiting_prefill_ready(self, r) and _prefill_remaining(r) == 0
+                        )
+                    ) or (
+                        hide_decode_waiting
+                        and _waiting_prefill_ready(self, r) and _prefill_remaining(r) == 0
+                    )
+                }
+                hidden.append(held)
+                visible = type(queue)()
+                for request in requests:
+                    if request.request_id not in held:
+                        visible.add_request(request)
+                temporary.append(visible)
+            self.waiting, self.skipped_waiting = temporary
         try:
             return original(self, *args, **kwargs)
         finally:
@@ -232,14 +255,22 @@ def _install_pcp_prefill_isolation(scheduler: type) -> None:
                 # A deferred row was not scheduled, so nothing else moved it.
                 if request.next_decode_eligible_step == step + 1:
                     request.next_decode_eligible_step = eligible_step
-            if hide_waiting:
-                # Requests preempted during the step were queued on the
-                # stand-ins; put them back in front of the real queues.
-                for real, stand_in in zip(queues, (self.waiting, self.skipped_waiting)):
-                    # FCFS prepend_requests uses extendleft and would reverse
-                    # the already ordered temporary queue a second time.
-                    for request in reversed(list(stand_in)):
-                        real.prepend_request(request)
+            if filtered:
+                for real, temporary, before, held in zip(
+                    queues, (self.waiting, self.skipped_waiting), snapshots, hidden,
+                ):
+                    remaining = {r.request_id for r in temporary}
+                    original_ids = {r.request_id for r in before}
+                    # Keep hidden rows in their original queue positions, but
+                    # remove visible rows admitted or moved by upstream.
+                    real.remove_requests([
+                        r for r in before
+                        if r.request_id not in held and r.request_id not in remaining
+                    ])
+                    # Preserve upstream preemptions and cross-queue moves.
+                    for request in reversed(list(temporary)):
+                        if request.request_id not in original_ids:
+                            real.prepend_request(request)
                 self.waiting, self.skipped_waiting = queues
 
     @functools.wraps(original)
@@ -265,7 +296,14 @@ def _install_pcp_prefill_isolation(scheduler: type) -> None:
             if _prefill_remaining(r) == 0
             and r.next_decode_eligible_step <= step
         ]
-        if not decodes or _pending_prefill_tokens(self, min_tokens) < min_tokens:
+        waiting_decodes = any(
+            _waiting_prefill_ready(self, r) and _prefill_remaining(r) == 0
+            for queue in (self.skipped_waiting, self.waiting) for r in queue
+        )
+        if (
+            not (decodes or waiting_decodes)
+            or _pending_prefill_tokens(self, min_tokens) < min_tokens
+        ):
             setattr(self, _ISOLATE_STREAK, 0)
             return original(self, *args, **kwargs)
 
@@ -277,9 +315,11 @@ def _install_pcp_prefill_isolation(scheduler: type) -> None:
                 r for r in self.running
                 if _prefill_remaining(r) > 0
             ]
-            return run_deferring(self, prefills, args, kwargs, hide_waiting=True)
+            return run_deferring(self, prefills, args, kwargs, hide_prefill_waiting=True)
 
-        output = run_deferring(self, decodes, args, kwargs)
+        output = run_deferring(
+            self, decodes, args, kwargs, hide_decode_waiting=True,
+        )
         if output.num_scheduled_tokens:
             setattr(self, _ISOLATE_STREAK, streak + 1)
         else:

@@ -267,3 +267,74 @@ def test_blocked_waiter_does_not_consume_admission_slot():
                                        _request("long", prompt=4096)])
     scheduler.max_num_running_reqs = 2
     assert patch._pending_prefill_tokens(scheduler, 128) == 16
+
+
+@pytest.mark.parametrize("queue_name", ["waiting", "skipped_waiting"])
+@pytest.mark.parametrize("running_decode", [False, True])
+@pytest.mark.parametrize("remote_kv", [False, True])
+def test_prefill_only_step_holds_decode_ready_waiters(
+    monkeypatch, queue_name, running_decode, remote_kv,
+):
+    monkeypatch.setenv("VLLM_HCU_PCP_ISOLATE_PREFILL_MIN_TOKENS", "128")
+    monkeypatch.setenv("VLLM_HCU_PCP_ISOLATE_PREFILL_MAX_STEPS", "1")
+    running = [_request("decode", total=80, computed=79)] if running_decode else []
+    resumed = _request("resumed", total=80, computed=79)
+    long = _request("long", prompt=4096)
+    scheduler = _scheduler(running, [resumed, long])
+    if queue_name == "skipped_waiting":
+        scheduler.waiting.remove_request(resumed)
+        scheduler.skipped_waiting.add_request(resumed)
+    if remote_kv:
+        resumed.status = RequestStatus.WAITING_FOR_REMOTE_KVS
+        scheduler.finished_recving_kv_req_ids.add(resumed.request_id)
+
+        def promote(request):
+            assert request.request_id in scheduler.finished_recving_kv_req_ids
+            request.status = RequestStatus.WAITING
+            return True
+
+        scheduler._try_promote_blocked_waiting_request = promote
+    original_status = resumed.status
+    original_queues = scheduler.waiting, scheduler.skipped_waiting
+    scheduler.max_num_running_reqs = len(running) + 2
+    output = scheduler.schedule()
+    assert output.num_scheduled_tokens == {"long": 2048}
+    assert getattr(scheduler, patch._ISOLATE_STREAK) == 1
+    assert (scheduler.waiting, scheduler.skipped_waiting) == original_queues
+    assert list(getattr(scheduler, queue_name)) == [resumed]
+    assert resumed.status == original_status
+    # The reserved decode-only step admits the held waiter next time.
+    output = scheduler.schedule()
+    assert output.num_scheduled_tokens["resumed"] == 1
+    assert "long" not in output.num_scheduled_tokens
+
+
+@pytest.mark.parametrize("fail", [False, True])
+def test_filtered_waiting_queues_restore_order_and_upstream_changes(monkeypatch, fail):
+    monkeypatch.setenv("VLLM_HCU_PCP_ISOLATE_PREFILL_MIN_TOKENS", "128")
+    first = _request("first", total=80, computed=79)
+    last = _request("last", total=80, computed=79)
+    prefill = _request("prefill", prompt=4096)
+    preempted = _request("preempted", prompt=64)
+    scheduler = _scheduler([], [first, prefill, last])
+    queues = scheduler.waiting, scheduler.skipped_waiting
+
+    class ControlledScheduler:
+        def schedule(self):
+            assert list(self.waiting) == [prefill]
+            self.waiting.pop_request()
+            self.waiting.prepend_request(preempted)
+            if fail:
+                raise RuntimeError("schedule failed")
+            return SimpleNamespace(num_scheduled_tokens={"prefill": 1})
+
+    patch._install_pcp_prefill_isolation(ControlledScheduler)
+    schedule = ControlledScheduler.schedule.__get__(scheduler)
+    if fail:
+        with pytest.raises(RuntimeError, match="schedule failed"):
+            schedule()
+    else:
+        schedule()
+    assert scheduler.waiting is queues[0]
+    assert scheduler.skipped_waiting is queues[1]
+    assert list(scheduler.waiting) == [preempted, first, last]
