@@ -407,25 +407,22 @@ _LL_ADMIT_MODULES = (
 # to some switch sites but not others is caught. Census on the deployed
 # das wheel: dispatch 265 hits, combine 26+26 (LogFMT on/off), sbo 26,
 # dispatch_ll_layered family absent (auto-skipped).
-_LL_NEEDLE_REQUIREMENTS: tuple[tuple[tuple[bytes, ...], tuple[bytes, ...]], ...] = (
+#
+# Review P1: each family lists its legacy 2048-width variants; every
+# PRESENT variant must have its OWN 3584 twin (the same mangled name
+# with the width token swapped), because a partial specialization set
+# (e.g. both combine variants at 2048 but only the LogFMT-off twin at
+# 3584) would otherwise pass family-level any() and the missing LogFMT
+# selection would reach the extension's unsupported-hidden host assert
+# instead of the safe 4096 fallback.
+_LL_NEEDLE_REQUIREMENTS: tuple[tuple[bytes, ...], ...] = (
+    (b"internode_ll8dispatchILi2048E",),
     (
-        (b"internode_ll8dispatchILi2048E",),
-        (b"internode_ll8dispatchILi3584E",),
+        b"internode_ll7combineILb0ELi2048E",
+        b"internode_ll7combineILb1ELi2048E",
     ),
-    (
-        (b"internode_ll7combineILb0ELi2048E",
-         b"internode_ll7combineILb1ELi2048E"),
-        (b"internode_ll7combineILb0ELi3584E",
-         b"internode_ll7combineILb1ELi3584E"),
-    ),
-    (
-        (b"internode_ll11combine_sboILi2048E",),
-        (b"internode_ll11combine_sboILi3584E",),
-    ),
-    (
-        (b"internode_ll19dispatch_ll_layeredILi2048E",),
-        (b"internode_ll19dispatch_ll_layeredILi3584E",),
-    ),
+    (b"internode_ll11combine_sboILi2048E",),
+    (b"internode_ll19dispatch_ll_layeredILi2048E",),
 )
 
 
@@ -436,16 +433,19 @@ def _scan_ll_needles(data: bytes) -> list[bytes] | None:
     ([] = fully provisioned), or ``None`` when the bytes match no legacy
     probe at all -- meaning the binary is unverifiable (stripped symbols,
     compressed device code, different mangling) and no claim about 3584
-    support can be made from it either way.
+    support can be made from it either way.  Admission is per VARIANT:
+    every legacy probe found in the binary pins its own 3584 twin.
     """
     missing: list[bytes] = []
     active = False
-    for family_probes, targets in _LL_NEEDLE_REQUIREMENTS:
-        if not any(probe in data for probe in family_probes):
-            continue
-        active = True
-        if not any(target in data for target in targets):
-            missing.extend(targets[:1])
+    for family_probes in _LL_NEEDLE_REQUIREMENTS:
+        for probe in family_probes:
+            if probe not in data:
+                continue
+            active = True
+            target = probe.replace(b"2048", b"3584")
+            if target not in data:
+                missing.append(target)
     if not active:
         return None
     return missing
