@@ -138,6 +138,7 @@ def test_prefill_chunking_preserves_core_scores_and_masks(monkeypatch, scale_col
         calls.append(q_slice.shape[0])
         return rocm.fp8_mqa_logits_torch(q_slice, kv, w_slice, lo, hi)
     monkeypatch.setattr(candidate.native, "rocm_fp8_mqa_logits", core)
+    monkeypatch.setattr(candidate, "_PREFILL_SCORER", None)
     monkeypatch.setattr(candidate, "_PREFILL_SCORE_WORKSPACE_BYTES", 2 * heads * keys * 4)
     actual = candidate.prefill_logits(q, (k, scales), weights, starts, ends)
     assert calls == [2, 2, 2, 1]
@@ -146,3 +147,31 @@ def test_prefill_chunking_preserves_core_scores_and_masks(monkeypatch, scale_col
     monkeypatch.setattr(candidate, "_PREFILL_SCORE_WORKSPACE_BYTES", rows * heads * keys * 4)
     torch.testing.assert_close(candidate.prefill_logits(q, (k, scales), weights, starts, ends), expected)
     assert calls == [rows]
+
+
+def test_prefill_uses_triton_scorer_without_torch_chunks(monkeypatch):
+    rows, heads, keys, dim = 5, 4, 9, 16
+    q = torch.zeros((rows, heads, dim), dtype=rocm.FP8_DTYPE)
+    k = torch.zeros((keys, dim), dtype=rocm.FP8_DTYPE)
+    scales = torch.ones((keys, 1))
+    weights = torch.ones((rows, heads))
+    starts = torch.zeros(rows, dtype=torch.int32)
+    ends = torch.arange(1, rows + 1, dtype=torch.int32)
+    sentinel = torch.empty((rows, keys))
+    calls = []
+
+    def scorer(*args):
+        calls.append(args)
+        return sentinel
+
+    def core(*args):
+        raise AssertionError("Torch fallback must not run when the scorer applies")
+
+    monkeypatch.setattr(candidate, "_PREFILL_SCORER", scorer)
+    monkeypatch.setattr(candidate.native, "rocm_fp8_mqa_logits", core)
+    monkeypatch.setattr(candidate, "_PREFILL_SCORE_WORKSPACE_BYTES", 1)
+    assert candidate.prefill_logits(q, (k, scales), weights, starts, ends) is sentinel
+    (args,) = calls
+    assert args[0] is q and args[1] is k and args[3] is weights
+    assert args[2].shape == (keys,) and args[2].data_ptr() == scales.data_ptr()
+    assert args[4] is starts and args[5] is ends

@@ -43,7 +43,16 @@ def decode_logits(q, cache, weights, context_lens, block_tables, schedule_metada
 _PREFILL_SCORE_WORKSPACE_BYTES = 256 * 1024 * 1024
 
 
-def prefill_logits(q, kv, weights, cu_seqlen_ks, cu_seqlen_ke):
+def _triton_prefill_scorer():
+    # Core reaches this AITER Triton scorer only with VLLM_ROCM_USE_AITER=1,
+    # which this deployment disables for other HCU-unsupported AITER paths.
+    # Reuse Core's module lookup; the installed wrapper has no clean_logits.
+    module = native.mqa_logits_module()
+    function = getattr(module, 'fp8_mqa_logits', None)
+    return function if callable(function) else None
+
+
+def _torch_prefill_logits(q, kv, weights, cu_seqlen_ks, cu_seqlen_ke):
     rows, heads = q.shape[:2]
     keys = kv[0].shape[0]
     chunk_rows = max(1, _PREFILL_SCORE_WORKSPACE_BYTES // max(1, heads * keys * 4))
@@ -56,6 +65,20 @@ def prefill_logits(q, kv, weights, cu_seqlen_ks, cu_seqlen_ke):
             q[start:end], kv, weights[start:end],
             cu_seqlen_ks[start:end], cu_seqlen_ke[start:end]))
     return logits
+
+
+def prefill_logits(q, kv, weights, cu_seqlen_ks, cu_seqlen_ke):
+    # Like Core's AITER path, values outside [ks, ke) are unspecified; Core's
+    # candidate selection and prefill top-k read only that range.
+    scorer = _PREFILL_SCORER
+    heads, dim = q.shape[1:]
+    if scorer is None or heads & (heads - 1) or dim & (dim - 1):
+        return _torch_prefill_logits(q, kv, weights, cu_seqlen_ks, cu_seqlen_ke)
+    k_fp8, scale = kv
+    return scorer(q, k_fp8, scale.reshape(-1), weights, cu_seqlen_ks, cu_seqlen_ke)
+
+
+_PREFILL_SCORER = _triton_prefill_scorer()
 
 
 def _native_indexer():
