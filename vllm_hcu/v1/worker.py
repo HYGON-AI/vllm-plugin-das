@@ -148,6 +148,7 @@ class HcuGPUWorker(Worker):
             # forward applies the table to what _get_logits returns.
             gemma4_lm_head.install_softcap_lut(self.model_runner)
             gemma4_lm_head.install_head_bucket(self.model_runner)
+            gemma4_lm_head.install_dense_draft(self.model_runner)
         from vllm_hcu.patch.worker import validate_worker_patches
         model_runner = getattr(self, "model_runner", None)
         from vllm_hcu.model_executor.layers.kimi_k3_mixed_precision import record_kimi_kda_offload_ownership
