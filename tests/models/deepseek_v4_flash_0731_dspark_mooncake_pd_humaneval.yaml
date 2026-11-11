@@ -36,6 +36,8 @@ pd:
     - --speculative-config
     - '{"method":"dspark","num_speculative_tokens":7,"draft_sample_method":"probabilistic"}'
   environment:
+    VLLM_USE_V2_MODEL_RUNNER: "1"
+    VLLM_HCU_USE_FLASH_ATTN_UNIFIED: "1"
     VLLM_LOGGING_LEVEL: DEBUG
   prefill:
     port: 10141

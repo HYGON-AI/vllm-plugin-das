@@ -2,6 +2,7 @@
 # SPDX-FileCopyrightText: Copyright (c) 2026 Hygon Information Technology Co., Ltd.
 import contextlib
 import importlib
+import os
 from functools import cache, lru_cache
 from math import lcm
 from types import ModuleType
@@ -245,8 +246,10 @@ class HCUPlatform(Platform):
     supported_quantization: list[str] = [
         "awq",
         "awq_marlin",  # will be overwritten with awq
+        "auto_awq",  # current vLLM resolves compatible AWQ checkpoints here
         "gptq",
         "gptq_marlin",  # will be overwritten with gptq
+        "auto_gptq",  # current vLLM resolves compatible GPTQ checkpoints here
         "fp8",
         "deepseek_v4_fp8",
         "compressed-tensors",
@@ -269,6 +272,17 @@ class HCUPlatform(Platform):
         "slimquant_w4a8_marlin", 
         "slimquant_compressed_tensors_marlin",
     ]
+
+    @classmethod
+    def verify_quantization(cls, quant: str) -> None:
+        super().verify_quantization(quant)
+        if quant in ("awq", "auto_awq"):
+            if not envs.VLLM_USE_TRITON_AWQ:
+                logger.warning(
+                    "Using AWQ quantization with HCU, but VLLM_USE_TRITON_AWQ "
+                    "is not set, enabling VLLM_USE_TRITON_AWQ."
+                )
+            os.environ["VLLM_USE_TRITON_AWQ"] = "1"
     
     @classmethod
     def import_kernels(cls) -> None:
@@ -666,6 +680,16 @@ class HCUPlatform(Platform):
                     "Overriding cudagraph_mode to PIECEWISE."
                 )
                 compilation_config.cudagraph_mode = CUDAGraphMode.PIECEWISE
+
+        # PCP/DCP normalization above runs after CompilationConfig's splitting
+        # callback. Reapply the same bound DeepEP-auto policy so PIECEWISE
+        # cannot reintroduce HT capture or route mixed/prefill FULL graphs to
+        # the capacity-limited LL delegate.
+        from vllm_hcu.patch.platform.core_fix.patch_compilation_config import (
+            normalize_bound_deepep_auto_cudagraph_mode,
+        )
+
+        normalize_bound_deepep_auto_cudagraph_mode(vllm_config)
 
         if cache_config and not cache_config.user_specified_block_size:
             backend = vllm_config.attention_config.backend

@@ -52,10 +52,10 @@ must match the chosen model/backend and runtime ABI; a generic PyPI stack is
 not a substitute for those HCU builds.
 
 The [CI environment lock](.github/workflows/configs/hcu-runner-environment.json)
-checks DTK using `match: release_line` against its configured major/minor
-release. Numeric patch releases and `-`/`+` build suffixes within that line are
-accepted; other release lines and malformed versions are rejected. Preflight
-reports the full installed version.
+accepts Python 3.10.12 or 3.12.12 and checks DTK using `match: release_line` against
+the configured 26.04 and 26.10 major/minor releases. Numeric patch releases and
+`-`/`+` build suffixes within those lines are accepted; other release lines and
+malformed versions are rejected. Preflight reports the full installed version.
 Custom locks without `rocm.match` retain exact matching. Other dependency
 checks remain independent, and this CI policy does not prove binary ABI
 compatibility for every build in the series.

@@ -18,61 +18,13 @@ from vllm_hcu.patch.worker.op_opt import patch_triton_unified_attention
 from vllm_hcu.platforms import envs as hcu_envs
 
 
-_TEST_FLASH_ATTN_VERSION = "2.8.4+dtk2604.torch2110.2609241509.g624d7b"
-
-
-def _stub_flash_attn_distribution(
-    monkeypatch: pytest.MonkeyPatch,
-    flash_attn_extension: ModuleType,
-    version: str = _TEST_FLASH_ATTN_VERSION,
-) -> None:
-    """Keep CPU kernel doubles independent of the installed vendor wheel."""
-
-    flash_attn_extension.__version__ = version
-    distribution_version = importlib.metadata.version
-
-    def version_for_test(distribution_name: str) -> str:
-        if distribution_name == "flash_attn":
-            return version
-        return distribution_version(distribution_name)
-
-    monkeypatch.setattr(importlib.metadata, "version", version_for_test)
-
-
-def _load_hcu_flash_attention_module(monkeypatch: pytest.MonkeyPatch):
-    hcu_ops = ModuleType("vllm_hcu.hcu_ops")
-    hcu_ops.__spec__ = ModuleSpec(hcu_ops.__name__, loader=None)
-    monkeypatch.setitem(sys.modules, hcu_ops.__name__, hcu_ops)
-
-    flash_attn_extension = ModuleType("flash_attn")
-    flash_attn_extension.__spec__ = ModuleSpec(
-        flash_attn_extension.__name__,
-        loader=None,
-    )
-    _stub_flash_attn_distribution(monkeypatch, flash_attn_extension)
-
-    def layout_entrypoint(
-        q=None,
-        k=None,
-        v=None,
-        *,
-        layout="bshd",
-        **kwargs,
-    ):
-        del q, k, v, layout, kwargs
-
-    for symbol in (
-        "flash_attn_varlen_func",
-        "hg_flash_attn_varlen_func",
-        "varlen_fwd_unified",
-    ):
-        setattr(flash_attn_extension, symbol, layout_entrypoint)
-    flash_attn_extension.vllm_flash_attn_varlen_func = (
-        lambda *args, **kwargs: None
-    )
-    monkeypatch.setitem(sys.modules, flash_attn_extension.__name__, flash_attn_extension)
-
-    return importlib.import_module("vllm_hcu.v1.attention.backends.flash_attn")
+from tests.fixtures.flash_attention import (
+    load_hcu_flash_attention_module as _load_hcu_flash_attention_module,
+    isolate_flash_attn_backend_imports,
+    stub_flash_attn_extensions,
+    stub_flash_attn_version_check,
+    stub_flash_attn_native_extension,
+)
 
 
 def _load_hcu_fa_utils_module(
@@ -81,9 +33,12 @@ def _load_hcu_fa_utils_module(
     kv_cache_layout: str,
     missing_layout_on: str | None = None,
     flash_attn_varlen_override=None,
-    flash_attn_version: str = _TEST_FLASH_ATTN_VERSION,
 ):
     """Load the real HCU FA boundary against observable kernel doubles."""
+
+    isolate_flash_attn_backend_imports(monkeypatch)
+    stub_flash_attn_version_check(monkeypatch)
+    stub_flash_attn_native_extension(monkeypatch)
 
     from vllm_hcu.v1.attention import kv_cache_layout as hcu_kv_cache_layout
 
@@ -102,11 +57,6 @@ def _load_hcu_fa_utils_module(
     flash_attn_extension.__spec__ = ModuleSpec(
         flash_attn_extension.__name__,
         loader=None,
-    )
-    _stub_flash_attn_distribution(
-        monkeypatch,
-        flash_attn_extension,
-        flash_attn_version,
     )
 
     def make_entrypoint(name: str):
@@ -145,17 +95,33 @@ def _load_hcu_fa_utils_module(
         else:
             setattr(flash_attn_extension, symbol, make_entrypoint(symbol))
     monkeypatch.setitem(sys.modules, flash_attn_extension.__name__, flash_attn_extension)
-    monkeypatch.delitem(
-        sys.modules,
-        "vllm_hcu.v1.attention.backends.fa_utils",
-        raising=False,
-    )
-
     module = importlib.import_module("vllm_hcu.v1.attention.backends.fa_utils")
     return module, calls
 
+@pytest.mark.parametrize("loader", ["backend", "fa_utils"])
+def test_cpu_attention_loaders_restore_module_cache(monkeypatch, loader):
+    names = (
+        "vllm_hcu.v1.attention.backends.flash_attn",
+        "vllm_hcu.v1.attention.backends.fa_utils",
+    )
+    package = importlib.import_module("vllm_hcu.v1.attention.backends")
+    for name in names:
+        monkeypatch.setitem(sys.modules, name, None)
+        monkeypatch.delitem(sys.modules, name)
+        monkeypatch.delattr(package, name.rsplit(".", 1)[1], raising=False)
 
-def test_hcu_flash_attention_loader_stubs_vendor_distribution_metadata(
+    with pytest.MonkeyPatch.context() as patch:
+        if loader == "backend":
+            _load_hcu_flash_attention_module(patch)
+        else:
+            _load_hcu_fa_utils_module(patch, kv_cache_layout="NHD")
+
+    for name in names:
+        assert name not in sys.modules
+        assert not hasattr(package, name.rsplit(".", 1)[1])
+
+
+def test_cpu_flash_attention_loader_does_not_query_distribution_metadata(
     monkeypatch: pytest.MonkeyPatch,
 ):
     """The CPU contract loader must not require an installed vendor wheel."""
@@ -164,7 +130,7 @@ def test_hcu_flash_attention_loader_stubs_vendor_distribution_metadata(
 
     def missing_distribution(distribution_name: str):
         if distribution_name == "flash_attn":
-            raise importlib.metadata.PackageNotFoundError(distribution_name)
+            raise AssertionError("CPU kernel doubles must not read vendor distribution metadata")
         return real_version(distribution_name)
 
     monkeypatch.setattr(importlib.metadata, "version", missing_distribution)
@@ -182,6 +148,32 @@ def test_hcu_flash_attention_loader_stubs_vendor_distribution_metadata(
     module = _load_hcu_flash_attention_module(monkeypatch)
 
     assert module.__name__ == "vllm_hcu.v1.attention.backends.flash_attn"
+
+
+@pytest.mark.parametrize("load_backend", [False, True])
+def test_cpu_attention_loaders_never_import_native_extension(monkeypatch, load_backend):
+    class RejectNativeImport:
+        def find_spec(self, fullname, path=None, target=None):
+            if fullname == "flash_attn_2_cuda":
+                raise AssertionError("Attempted to import the real FlashAttention binary")
+            return None
+
+    # Force a fresh boundary import even if another test already loaded it.
+    for name in ("flash_attn_2_cuda", "vllm_hcu.v1.attention.backends.fa_utils",
+                 "vllm_hcu.v1.attention.backends.flash_attn"):
+        monkeypatch.setitem(sys.modules, name, sys.modules.get(name))
+        monkeypatch.delitem(sys.modules, name)
+    monkeypatch.setattr(sys, "meta_path", [RejectNativeImport(), *sys.meta_path])
+    if load_backend:
+        _load_hcu_flash_attention_module(monkeypatch)
+        fa_utils = sys.modules["vllm_hcu.v1.attention.backends.fa_utils"]
+    else:
+        fa_utils, _ = _load_hcu_fa_utils_module(monkeypatch, kv_cache_layout="NHD")
+    native = sys.modules["flash_attn_2_cuda"]
+    assert fa_utils.flash_attn_2_cuda is native
+    assert native.__spec__.loader is None
+    with pytest.raises(AssertionError, match="must not execute native FlashAttention"):
+        native.varlen_fwd()
 
 
 @pytest.mark.parametrize(
@@ -223,13 +215,42 @@ def test_hcu_fa_boundary_rejects_interface_without_layout(
         )
 
 
+def _require_flash_attn_version(monkeypatch, version):
+    from vllm_hcu.v1.attention import _flash_attn_compat
+
+    real_version = importlib.metadata.version
+    monkeypatch.setattr(
+        importlib.metadata, "version",
+        lambda name: version if name == "flash_attn" else real_version(name),
+    )
+    _flash_attn_compat.require_compatible_flash_attn()
+
+
+def test_fa_utils_keeps_the_distribution_guard(monkeypatch):
+    from vllm_hcu.v1.attention import _flash_attn_compat
+
+    real_check = _flash_attn_compat.require_compatible_flash_attn
+    stub_flash_attn_extensions(monkeypatch)
+    monkeypatch.setattr(_flash_attn_compat, "require_compatible_flash_attn", real_check)
+    real_version = importlib.metadata.version
+
+    def missing_distribution(name):
+        if name == "flash_attn":
+            raise importlib.metadata.PackageNotFoundError(name)
+        return real_version(name)
+
+    monkeypatch.setattr(importlib.metadata, "version", missing_distribution)
+    with pytest.raises(RuntimeError, match="compatible flash_attn release"):
+        importlib.import_module("vllm_hcu.v1.attention.backends.fa_utils")
+
+
 @pytest.mark.parametrize(
     "compatible_version",
     [
         "2.8.4",
-        "2.8.4+dtk2604.torch2110.2610091222.g130fd4",
-        "2.8.4.post1+dtk2605.torch2110.2609010000.g999999",
-        "2.8.5+dtk2605.torch2110.2609010000.g999999",
+        "2.8.4+dtk2604",
+        "2.8.4.post1+dtk2610",
+        "2.8.5+dtk2610",
         "2.8.40",
     ],
 )
@@ -237,17 +258,13 @@ def test_hcu_fa_boundary_accepts_compatible_2_8_release(
     monkeypatch: pytest.MonkeyPatch,
     compatible_version: str,
 ) -> None:
-    _load_hcu_fa_utils_module(
-        monkeypatch,
-        kv_cache_layout="HND",
-        flash_attn_version=compatible_version,
-    )
+    _require_flash_attn_version(monkeypatch, compatible_version)
 
 
 @pytest.mark.parametrize(
     "incompatible_version",
     [
-        "2.8.3+dtk2604.torch2110.2609241509.g624d7b",
+        "2.8.3+dtk2604",
         "2.8.4rc1",
         "2.8.4.dev1+dtk2604",
         "2.8.4.post1.dev1",
@@ -261,21 +278,15 @@ def test_hcu_fa_boundary_rejects_incompatible_release(
     incompatible_version: str,
 ) -> None:
     with pytest.raises(RuntimeError, match="compatible flash_attn release"):
-        _load_hcu_fa_utils_module(
-            monkeypatch,
-            kv_cache_layout="HND",
-            flash_attn_version=incompatible_version,
-        )
+        _require_flash_attn_version(monkeypatch, incompatible_version)
 
 
 def test_hcu_fa_boundary_rejects_invalid_distribution_version(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     with pytest.raises(RuntimeError, match="Invalid flash_attn distribution version"):
-        _load_hcu_fa_utils_module(
-            monkeypatch,
-            kv_cache_layout="HND",
-            flash_attn_version="vendor-build-without-pep440-version",
+        _require_flash_attn_version(
+            monkeypatch, "vendor-build-without-pep440-version"
         )
 
 
@@ -579,21 +590,27 @@ def test_flash_attention_prefers_vendor_kernel_page_size(
     assert backend.get_preferred_block_size(16) == expected_block_size
 
 
+@pytest.mark.parametrize("mode", ["varlen", "cutlass", "classic"])
 def test_flash_attention_kernel_block_sizes_do_not_require_current_config(
     monkeypatch: pytest.MonkeyPatch,
+    mode: str,
 ) -> None:
     """KV-cache planning queries this outside model-construction context."""
 
     flash_attn = _load_hcu_flash_attention_module(monkeypatch)
     backend = flash_attn.HcuFlashAttentionBackend
 
+    monkeypatch.setattr(flash_attn, "_get_flash_attn_mode", lambda: mode)
     monkeypatch.setattr(flash_attn, "get_current_vllm_config_or_none", lambda: None)
 
     sizes = backend.get_supported_kernel_block_sizes()
 
     assert len(sizes) == 1
-    assert isinstance(sizes[0], flash_attn.MultipleOf)
-    assert sizes[0].base == 16
+    if mode in ("varlen", "cutlass"):
+        assert sizes == [64]
+    else:
+        assert isinstance(sizes[0], flash_attn.MultipleOf)
+        assert sizes[0].base == 16
 
 
 @pytest.mark.parametrize(
@@ -687,9 +704,8 @@ def test_flash_cache_writer_dispatches_by_physical_layout(
     monkeypatch: pytest.MonkeyPatch,
     layout: str,
 ) -> None:
-    fa_utils = importlib.import_module(
-        "vllm_hcu.v1.attention.backends.fa_utils"
-    )
+    fa_utils, _ = _load_hcu_fa_utils_module(monkeypatch, kv_cache_layout=layout)
+    monkeypatch.setenv("VLLM_HCU_USE_CUSTOM_OPS", "1")
     calls: list[tuple[str, tuple[object, ...]]] = []
     aiter_cache_module = ModuleType("aiter.ops.cache")
     aiter_cache_module.reshape_and_cache_flash = (
@@ -1030,6 +1046,7 @@ def _common_attention_metadata(*, causal: bool | torch.Tensor):
         max_query_len=2,
         max_seq_len=4,
         query_start_loc=torch.tensor([0, 2], dtype=torch.int32),
+        query_start_loc_cpu=torch.tensor([0, 2], dtype=torch.int32),
         seq_lens=torch.tensor([4], dtype=torch.int32),
         block_table_tensor=torch.tensor([[0]], dtype=torch.int32),
         slot_mapping=torch.tensor([0, 1], dtype=torch.int64),
@@ -1877,3 +1894,272 @@ def test_hcu_flash_attention_e5m2_keeps_compute_dtype_queries(
     query = torch.full((2, 64), 1.25, dtype=torch.bfloat16)
     output = attention_forward(upstream, layer, query, query, query)
     torch.testing.assert_close(output, query)
+
+
+def _split_pd_impl(monkeypatch: pytest.MonkeyPatch, flash_attn):
+    monkeypatch.setattr(flash_attn, "get_flash_attn_version", lambda **kwargs: 3)
+    monkeypatch.setattr(flash_attn, "get_current_vllm_config_or_none", lambda: None)
+    monkeypatch.setattr(flash_attn, "flash_attn_supports_fp8", lambda: True)
+    monkeypatch.setattr(flash_attn, "flash_attn_supports_quant_query_input", lambda: True)
+    return flash_attn.FlashAttentionImpl(
+        num_heads=1, head_size=64, scale=0.125, num_kv_heads=1,
+        alibi_slopes=None, sliding_window=None, kv_cache_dtype="auto",
+    )
+
+
+def _split_pd_inputs(num_actual_tokens: int, num_decode_tokens: int):
+    metadata = SimpleNamespace(
+        num_actual_tokens=num_actual_tokens,
+        num_decode_tokens=num_decode_tokens,
+        num_decodes=2,
+        decode_query_len=2,
+        prefill_max_query_len=3,
+        max_query_len=3,
+        max_seq_len=100,
+        sliding_window=None,
+        causal=True,
+    )
+    query = torch.arange(8, dtype=torch.float32).reshape(8, 1).expand(8, 4).clone()
+    return (
+        metadata,
+        query,
+        torch.zeros_like(query),
+        torch.tensor([0, 2, 4, 7], dtype=torch.int32),
+        torch.tensor([10, 11, 12], dtype=torch.int32),
+        torch.arange(12, dtype=torch.int32).reshape(3, 4),
+        torch.ones(3, 1),
+        torch.ones(3, 1),
+    )
+
+
+def _run_split_pd(monkeypatch: pytest.MonkeyPatch, num_actual_tokens, num_decode_tokens):
+    flash_attn = _load_hcu_flash_attention_module(monkeypatch)
+    impl = _split_pd_impl(monkeypatch, flash_attn)
+    calls: list[dict[str, object]] = []
+    monkeypatch.setattr(
+        flash_attn,
+        "_select_flash_attn_varlen_func",
+        lambda: lambda **kwargs: calls.append(kwargs),
+    )
+    metadata, query, output, cu, seqused, table, k_descale, v_descale = (
+        _split_pd_inputs(num_actual_tokens, num_decode_tokens)
+    )
+    impl._forward_split_pd(
+        query, object(), object(), output, metadata, cu, seqused, table,
+        None, k_descale, v_descale,
+    )
+    return calls, query, cu, seqused, table
+
+
+def test_split_pd_mixed_batch_runs_decode_then_prefill_with_own_query_len(
+    monkeypatch: pytest.MonkeyPatch,
+):
+    calls, query, cu, seqused, table = _run_split_pd(monkeypatch, 7, 4)
+
+    decode, prefill = calls
+    assert decode["max_seqlen_q"] == 2
+    assert decode["q"].shape[0] == 4
+    torch.testing.assert_close(decode["cu_seqlens_q"], cu[:3])
+    torch.testing.assert_close(decode["seqused_k"], seqused[:2])
+    torch.testing.assert_close(decode["block_table"], table[:2])
+    assert decode["k_descale"].shape[0] == 2
+
+    assert prefill["max_seqlen_q"] == 3
+    assert prefill["q"].shape[0] == 3
+    torch.testing.assert_close(prefill["q"], query[4:7])
+    torch.testing.assert_close(
+        prefill["cu_seqlens_q"], torch.tensor([0, 3], dtype=torch.int32)
+    )
+    torch.testing.assert_close(prefill["seqused_k"], seqused[2:])
+    torch.testing.assert_close(prefill["block_table"], table[2:])
+    assert prefill["k_descale"].shape[0] == 1
+
+
+@pytest.mark.parametrize(
+    ("num_actual_tokens", "num_decode_tokens"),
+    [
+        (4, 4),  # uniform decode batch: nothing to split off
+        (4, 5),  # DP-padded metadata: decode count exceeds the clamped total
+        (7, 0),  # pure prefill
+    ],
+)
+def test_split_pd_without_a_mixed_boundary_issues_one_call(
+    monkeypatch: pytest.MonkeyPatch,
+    num_actual_tokens: int,
+    num_decode_tokens: int,
+):
+    calls, query, cu, seqused, table = _run_split_pd(
+        monkeypatch, num_actual_tokens, num_decode_tokens
+    )
+
+    (call,) = calls
+    assert call["q"].shape[0] == num_actual_tokens
+    assert call["max_seqlen_q"] == 3
+    torch.testing.assert_close(call["cu_seqlens_q"], cu)
+    torch.testing.assert_close(call["seqused_k"], seqused)
+    torch.testing.assert_close(call["block_table"], table)
+
+
+@pytest.mark.parametrize(
+    ("switch", "mode", "pcp", "uniform_only"),
+    [
+        (False, "varlen", 1, False),
+        (True, "varlen", 1, True),
+        (True, "cutlass", 1, False),
+        (True, "classic", 1, False),
+        (True, "varlen", 2, None),
+    ],
+)
+def test_split_pd_only_restricts_graphs_when_it_actually_splits(
+    monkeypatch: pytest.MonkeyPatch,
+    switch: bool,
+    mode: str,
+    pcp: int,
+    uniform_only: bool | None,
+):
+    from vllm.v1.attention.backend import AttentionCGSupport
+    from vllm_hcu.platforms import hcu as hcu_platform
+
+    flash_attn = _load_hcu_flash_attention_module(monkeypatch)
+    builder = flash_attn.FlashAttentionMetadataBuilder
+    monkeypatch.setattr(flash_attn, "_SPLIT_PD", switch)
+    monkeypatch.setattr(hcu_platform, "get_hcu_flash_attn_mode", lambda config=None: mode)
+    vllm_config = SimpleNamespace(
+        parallel_config=SimpleNamespace(prefill_context_parallel_size=pcp)
+    )
+
+    support = builder.get_cudagraph_support(vllm_config, None)
+
+    if uniform_only is None:
+        assert support is AttentionCGSupport.NEVER
+    elif uniform_only:
+        assert support is AttentionCGSupport.UNIFORM_BATCH
+    else:
+        assert support is builder._cudagraph_support
+
+
+def _padded_draft_metadata(*, num_actual_tokens: int, query_start_loc: list[int]):
+    """Draft-decode metadata whose token count was DP-padded past the batch."""
+
+    num_reqs = len(query_start_loc) - 1
+    qsl = torch.tensor(query_start_loc, dtype=torch.int32)
+    return SimpleNamespace(
+        num_reqs=num_reqs,
+        num_actual_tokens=num_actual_tokens,
+        max_query_len=max(
+            (b - a for a, b in zip(query_start_loc, query_start_loc[1:])), default=1
+        ),
+        max_seq_len=64,
+        query_start_loc=qsl,
+        query_start_loc_cpu=qsl,
+        seq_lens=torch.full((num_reqs,), 8, dtype=torch.int32),
+        block_table_tensor=torch.zeros((num_reqs, 1), dtype=torch.int32),
+        slot_mapping=torch.arange(num_actual_tokens, dtype=torch.int64),
+        causal=True,
+    )
+
+
+@pytest.mark.parametrize(
+    ("num_actual_tokens", "query_start_loc", "expected"),
+    [
+        (4, [0, 1, 2, 3], 3),  # DP padding row: 4 tokens for 3 real ones
+        (3, [0, 1, 2, 3], 3),  # already consistent: untouched
+        (6, [0, 2, 4, 6], 6),  # uniform MTP verify batch: untouched
+    ],
+)
+def test_build_drops_dp_padding_tokens_beyond_query_start_loc(
+    monkeypatch: pytest.MonkeyPatch,
+    num_actual_tokens: int,
+    query_start_loc: list[int],
+    expected: int,
+) -> None:
+    flash_attn = _load_hcu_flash_attention_module(monkeypatch)
+    builder = _bare_flash_attention_builder(flash_attn)
+    monkeypatch.setattr(flash_attn, "_SPLIT_PD", False)
+    monkeypatch.setattr(flash_attn, "get_scheduler_metadata", lambda **kwargs: None)
+
+    metadata = builder.build(
+        0,
+        _padded_draft_metadata(
+            num_actual_tokens=num_actual_tokens, query_start_loc=query_start_loc
+        ),
+    )
+
+    assert metadata.num_actual_tokens == expected
+
+
+def test_build_keeps_padded_token_count_when_pcp_plan_is_present(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    flash_attn = _load_hcu_flash_attention_module(monkeypatch)
+    builder = _bare_flash_attention_builder(flash_attn)
+    monkeypatch.setattr(flash_attn, "_SPLIT_PD", False)
+    monkeypatch.setattr(flash_attn, "get_scheduler_metadata", lambda **kwargs: None)
+
+    metadata = builder.build(
+        0,
+        _padded_draft_metadata(num_actual_tokens=4, query_start_loc=[0, 1, 2, 3]),
+        pcp_plan=object(),
+    )
+
+    assert metadata.num_actual_tokens == 4
+
+
+@pytest.mark.parametrize(
+    ("threshold", "query_start_loc", "expected"),
+    [
+        # MTP=3: two verify rows of 4 tokens, then one 3-token extend.
+        (4, [0, 4, 8, 11], (2, 8, 4, 3)),
+        # No spec decode: a single-token decode row ahead of a prefill.
+        (1, [0, 1, 6], (1, 1, 1, 5)),
+        # Uniform decode batch: nothing is left for the prefill segment.
+        (4, [0, 4, 8], (2, 8, 4, 0)),
+        # Pure prefill: no decode prefix.
+        (1, [0, 5, 9], (0, 0, 0, 5)),
+    ],
+)
+def test_build_populates_decode_prefill_split_metadata(
+    monkeypatch: pytest.MonkeyPatch,
+    threshold: int,
+    query_start_loc: list[int],
+    expected: tuple[int, int, int, int],
+) -> None:
+    flash_attn = _load_hcu_flash_attention_module(monkeypatch)
+    builder = _bare_flash_attention_builder(flash_attn)
+    builder.reorder_batch_threshold = threshold
+    monkeypatch.setattr(flash_attn, "_SPLIT_PD", True)
+    monkeypatch.setattr(flash_attn, "get_scheduler_metadata", lambda **kwargs: None)
+
+    metadata = builder.build(
+        0,
+        _padded_draft_metadata(
+            num_actual_tokens=query_start_loc[-1], query_start_loc=query_start_loc
+        ),
+    )
+
+    assert (
+        metadata.num_decodes,
+        metadata.num_decode_tokens,
+        metadata.decode_query_len,
+        metadata.prefill_max_query_len,
+    ) == expected
+
+
+def test_build_leaves_split_metadata_empty_when_the_switch_is_off(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    flash_attn = _load_hcu_flash_attention_module(monkeypatch)
+    builder = _bare_flash_attention_builder(flash_attn)
+    monkeypatch.setattr(flash_attn, "_SPLIT_PD", False)
+    monkeypatch.setattr(flash_attn, "get_scheduler_metadata", lambda **kwargs: None)
+
+    metadata = builder.build(
+        0, _padded_draft_metadata(num_actual_tokens=11, query_start_loc=[0, 4, 8, 11])
+    )
+
+    assert (
+        metadata.num_decodes,
+        metadata.num_decode_tokens,
+        metadata.decode_query_len,
+        metadata.prefill_max_query_len,
+    ) == (0, 0, 0, 0)

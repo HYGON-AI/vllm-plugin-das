@@ -246,10 +246,12 @@ def pd_commands(config: dict[str, Any], *, model_env: str) -> PDCommands:
         raise TypeError("pd.environment must be a mapping")
     base_env.update({str(name): str(value) for name, value in environment.items()})
 
-    source_root_value = os.environ.get("VLLM_V0251_SOURCE_ROOT")
+    source_root_value = os.environ.get("VLLM_SOURCE_ROOT") or os.environ.get(
+        "VLLM_V0251_SOURCE_ROOT"
+    )
     if source_root_value is None:
         raise FileNotFoundError(
-            "VLLM_V0251_SOURCE_ROOT must identify the vLLM v0.25.1 source tree"
+            "VLLM_SOURCE_ROOT must identify the vLLM source tree containing the proxy"
         )
     proxy_script = (
         Path(source_root_value)
@@ -257,6 +259,7 @@ def pd_commands(config: dict[str, Any], *, model_env: str) -> PDCommands:
     )
     if not proxy_script.is_file():
         raise FileNotFoundError(f"Mooncake connector proxy is absent: {proxy_script}")
+    base_env.pop("VLLM_SOURCE_ROOT", None)
     base_env.pop("VLLM_V0251_SOURCE_ROOT", None)
 
     proxy_port = int(pd["proxy_port"])

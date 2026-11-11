@@ -12,6 +12,7 @@ only by tests that need them.
 from __future__ import annotations
 
 import os
+import sys
 from pathlib import Path
 
 # Test modules import vLLM targets during collection.  Keep entry-point plugin
@@ -96,3 +97,20 @@ def pytest_report_header(config):
         return f"deepgemm: {_deepgemm_version()}"
     except Exception:
         return None
+@pytest.fixture(autouse=True)
+def _restore_lazy_hcu_environment_attributes():
+    """Do not let setattr monkeypatches materialize lazy env values across tests."""
+    module = sys.modules.get("vllm_hcu.platforms.envs")
+    saved = {}
+    if module is not None:
+        saved = {
+            name: module.__dict__[name]
+            for name in module.hcu_vllm_environment_variables
+            if name in module.__dict__
+        }
+    yield
+    module = sys.modules.get("vllm_hcu.platforms.envs")
+    if module is not None:
+        for name in module.hcu_vllm_environment_variables:
+            module.__dict__.pop(name, None)
+        module.__dict__.update(saved)

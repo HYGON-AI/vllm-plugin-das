@@ -68,7 +68,8 @@ def mooncake_proxy_source_root(
     )
     proxy_script.parent.mkdir(parents=True)
     proxy_script.write_text("# test Mooncake proxy\n", encoding="utf-8")
-    monkeypatch.setenv("VLLM_V0251_SOURCE_ROOT", str(source_root))
+    monkeypatch.delenv("VLLM_V0251_SOURCE_ROOT", raising=False)
+    monkeypatch.setenv("VLLM_SOURCE_ROOT", str(source_root))
     return source_root
 
 
@@ -109,6 +110,11 @@ def test_deepseek_v4_dspark_mooncake_pd_command_contract(
     assert "VLLM_V0251_SOURCE_ROOT" not in commands.prefill_env
     assert "VLLM_V0251_SOURCE_ROOT" not in commands.decode_env
     assert "VLLM_V0251_SOURCE_ROOT" not in commands.proxy_env
+    for env in (commands.prefill_env, commands.decode_env):
+        assert env["VLLM_USE_V2_MODEL_RUNNER"] == "1"
+        assert env["VLLM_HCU_USE_FLASH_ATTN_UNIFIED"] == "1"
+        assert "VLLM_SOURCE_ROOT" not in env
+    assert "VLLM_SOURCE_ROOT" not in commands.proxy_env
     assert commands.proxy[1] == str(
         mooncake_proxy_source_root
         / "examples/disaggregated/mooncake_connector/mooncake_connector_proxy.py"

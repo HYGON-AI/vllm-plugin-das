@@ -6,6 +6,7 @@ from __future__ import annotations
 import ast
 import copy
 import importlib
+import inspect
 import sys
 from pathlib import Path
 from types import ModuleType, SimpleNamespace
@@ -350,6 +351,463 @@ def test_sparse_mla_boltops_prefill_rejects_public_abi_drift(
     )
     try:
         with pytest.raises(RuntimeError, match="triton_mqa_logits signature"):
+            resolver()
+    finally:
+        resolver.cache_clear()
+
+
+@pytest.mark.parametrize(
+    ("aiter_enabled", "force_aiter_triton"),
+    ((False, False), (True, False), (False, True)),
+)
+def test_sparse_mla_master_off_decode_uses_boltops_paged_mqa(
+    monkeypatch: pytest.MonkeyPatch,
+    aiter_enabled: bool,
+    force_aiter_triton: bool,
+) -> None:
+    """Master-off decode must use packed row-major BoltOps, never AITER/LightOp."""
+    runtime = _runtime()
+    monkeypatch.setenv("VLLM_HCU_USE_CUSTOM_OPS", "0")
+    monkeypatch.setattr(runtime, "on_gfx938", lambda: False)
+    from vllm._aiter_ops import rocm_aiter_ops
+
+    monkeypatch.setattr(rocm_aiter_ops, "is_enabled", lambda: aiter_enabled)
+    monkeypatch.setattr(
+        runtime,
+        "paged_mqa_logits_module",
+        lambda: pytest.fail("master-off decode queried AITER paged MQA"),
+    )
+    monkeypatch.setattr(
+        runtime,
+        "_get_lightop_attention",
+        lambda: pytest.fail("master-off decode queried LightOp paged MQA"),
+    )
+
+    calls: list[tuple[tuple[object, ...], dict[str, object]]] = []
+
+    def boltops_paged(*args, **kwargs):
+        calls.append((args, kwargs))
+        return args[3]
+
+    monkeypatch.setattr(
+        runtime,
+        "_load_boltops_paged_mqa_logits",
+        lambda: boltops_paged,
+        raising=False,
+    )
+    q = torch.empty((2, 1, 8, 128), dtype=torch.float8_e4m3fn)
+    cache = torch.empty((3, 64, 1, 132), dtype=torch.uint8)
+    weights = torch.arange(16, dtype=torch.float16).reshape(8, 2).transpose(0, 1)
+    context_lens = torch.tensor([63, 65], dtype=torch.int32)
+    block_tables = torch.tensor([[0, -1], [1, 2]], dtype=torch.int32)
+
+    result = runtime.rocm_fp8_paged_mqa_logits(
+        q,
+        cache,
+        weights,
+        context_lens,
+        block_tables,
+        torch.empty(0),
+        128,
+        force_aiter_triton=force_aiter_triton,
+    )
+
+    assert len(calls) == 1
+    args, kwargs = calls[0]
+    assert args[0] is q
+    assert args[1] is cache
+    assert args[2].dtype is torch.float32
+    assert args[2].is_contiguous()
+    assert torch.equal(args[2], weights.float().contiguous())
+    assert args[3] is result
+    assert result.shape == (2, 128)
+    assert result.dtype is torch.float32
+    assert args[4] is context_lens
+    assert args[5] is block_tables
+    assert args[6] == 128
+    assert kwargs == {
+        "kv_block_size": 64,
+        "preshuffle": False,
+        "fuse_output_init": True,
+    }
+
+
+@pytest.mark.parametrize("block_size", (1, 64))
+def test_sparse_mla_boltops_decode_preserves_exact_mtp_pool_ends(
+    monkeypatch: pytest.MonkeyPatch,
+    block_size: int,
+) -> None:
+    """Exact KPool ends must remain distinct for every MTP query row."""
+    runtime = _runtime()
+    monkeypatch.setenv("VLLM_HCU_USE_CUSTOM_OPS", "0")
+    monkeypatch.setattr(runtime, "on_gfx938", lambda: False)
+    calls: list[tuple[tuple[object, ...], dict[str, object]]] = []
+
+    def boltops_paged(*args, **kwargs):
+        calls.append((args, kwargs))
+        return args[3]
+
+    monkeypatch.setattr(
+        runtime,
+        "_load_boltops_paged_mqa_logits",
+        lambda: boltops_paged,
+    )
+    q = (
+        torch.arange(6, dtype=torch.float32)
+        .reshape(2, 3, 1, 1)
+        .expand(2, 3, 8, 128)
+        .contiguous()
+        .to(torch.float8_e4m3fn)
+    )
+    cache = torch.empty((10, block_size, 1, 132), dtype=torch.uint8)
+    weights = torch.ones((6, 8), dtype=torch.float32)
+    context_lens = torch.tensor(
+        [[300, 300, 301], [1, 1, 2]],
+        dtype=torch.int32,
+    )
+    block_tables = torch.tensor(
+        [[0, 1, 2, 3, 4], [5, 6, 7, 8, 9]],
+        dtype=torch.int32,
+    )
+
+    result = runtime.rocm_fp8_paged_mqa_logits(
+        q,
+        cache,
+        weights,
+        context_lens,
+        block_tables,
+        torch.empty(0),
+        320,
+    )
+
+    assert len(calls) == 1
+    args, kwargs = calls[0]
+    assert args[0].shape == (6, 1, 8, 128)
+    assert torch.equal(args[0].float().reshape_as(q), q.float())
+    assert args[1] is cache
+    assert args[2] is weights
+    assert args[3] is result
+    assert result.shape == (6, 320)
+    assert torch.equal(args[4], context_lens.reshape(-1))
+    assert torch.equal(args[5], block_tables.repeat_interleave(3, dim=0))
+    assert args[6] == 320
+    assert kwargs == {
+        "kv_block_size": block_size,
+        "preshuffle": False,
+        "fuse_output_init": block_size == 64,
+    }
+
+
+def test_sparse_mla_master_off_bf16_decode_skips_boltops_paged_mqa(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """BoltOps packed paged-MQA must not receive the gfx936 BF16 K-cache."""
+    runtime = _runtime()
+    monkeypatch.setenv("VLLM_HCU_USE_CUSTOM_OPS", "0")
+    monkeypatch.setattr(runtime, "on_gfx938", lambda: False)
+    monkeypatch.setattr(runtime.current_platform, "is_rocm", lambda: True)
+    from vllm._aiter_ops import rocm_aiter_ops
+
+    monkeypatch.setattr(rocm_aiter_ops, "is_enabled", lambda: False)
+    monkeypatch.setattr(
+        runtime,
+        "_load_boltops_paged_mqa_logits",
+        lambda: pytest.fail("BF16 K-cache was routed to packed BoltOps paged-MQA"),
+    )
+    calls: list[tuple[object, ...]] = []
+    output = object()
+
+    def paged_mqa_logits(*args):
+        calls.append(args)
+        return output
+
+    monkeypatch.setattr(
+        runtime,
+        "_get_lightop_attention",
+        lambda: SimpleNamespace(paged_mqa_logits=paged_mqa_logits),
+    )
+    q = torch.empty((2, 1, 8, 128), dtype=torch.bfloat16)
+    cache = torch.empty((3, 64, 1, 128), dtype=torch.bfloat16)
+    weights = torch.ones((2, 8), dtype=torch.float32)
+    context_lens = torch.tensor([63, 65], dtype=torch.int32)
+    block_tables = torch.tensor([[0, -1], [1, 2]], dtype=torch.int32)
+
+    result = runtime.rocm_fp8_paged_mqa_logits(
+        q,
+        cache,
+        weights,
+        context_lens,
+        block_tables,
+        torch.empty(0),
+        128,
+    )
+
+    assert result is output
+    assert len(calls) == 1
+    assert calls[0][0] is q
+    assert calls[0][1] is cache
+
+
+@pytest.mark.parametrize("block_size", (16, 32))
+def test_sparse_mla_master_off_unsupported_boltops_page_uses_existing_backend(
+    monkeypatch: pytest.MonkeyPatch,
+    block_size: int,
+) -> None:
+    """Unsupported BoltOps pages must retain the gfx938 normal-layout backend."""
+    runtime = _runtime()
+    monkeypatch.setenv("VLLM_HCU_USE_CUSTOM_OPS", "0")
+    monkeypatch.setattr(runtime, "on_gfx938", lambda: True)
+    from vllm._aiter_ops import rocm_aiter_ops
+
+    monkeypatch.setattr(rocm_aiter_ops, "is_enabled", lambda: False)
+    monkeypatch.setattr(
+        runtime,
+        "_load_boltops_paged_mqa_logits",
+        lambda: pytest.fail("unsupported page size queried BoltOps paged-MQA"),
+    )
+    calls: list[tuple[object, ...]] = []
+    output = object()
+
+    def paged_mqa_logits(*args, **kwargs):
+        calls.append((*args, kwargs))
+        return output
+
+    monkeypatch.setattr(
+        runtime,
+        "_get_lightop_attention",
+        lambda: SimpleNamespace(paged_mqa_logits=paged_mqa_logits),
+    )
+    q = torch.empty((1, 1, 8, 128), dtype=torch.float8_e4m3fn)
+    cache = torch.empty((3, block_size, 1, 132), dtype=torch.uint8)
+
+    result = runtime.rocm_fp8_paged_mqa_logits(
+        q,
+        cache,
+        torch.ones((1, 8), dtype=torch.float32),
+        torch.tensor([block_size], dtype=torch.int32),
+        torch.tensor([[0, -1]], dtype=torch.int32),
+        torch.empty(0),
+        block_size * 2,
+        kcache_layout="normal",
+    )
+
+    assert result is output
+    assert len(calls) == 1
+    assert calls[0][0] is q
+    assert calls[0][1] is cache
+
+
+def test_sparse_mla_boltops_decode_rejects_public_abi_drift(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A present but incompatible public paged-MQA API must fail visibly."""
+    runtime = _runtime()
+    assert hasattr(runtime, "_load_boltops_paged_mqa_logits"), (
+        "the sparse-indexer runtime must own a lazy BoltOps paged-MQA resolver"
+    )
+    resolver = runtime._load_boltops_paged_mqa_logits
+    resolver.cache_clear()
+    incompatible = SimpleNamespace(triton_fp8_paged_mqa_logits=lambda q: q)
+    monkeypatch.setattr(runtime.importlib, "import_module", lambda name: incompatible)
+    try:
+        with pytest.raises(RuntimeError, match="paged_mqa_logits signature"):
+            resolver()
+    finally:
+        resolver.cache_clear()
+
+
+def test_sparse_mla_boltops_decode_resolver_allows_missing_optional_package(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """An absent BoltOps install is a backend miss, not a startup failure."""
+    runtime = _runtime()
+    resolver = runtime._load_boltops_paged_mqa_logits
+    resolver.cache_clear()
+
+    def missing_module(name: str):
+        raise ModuleNotFoundError(
+            f"No module named {name!r}",
+            name=name,
+        )
+
+    monkeypatch.setattr(runtime.importlib, "import_module", missing_module)
+    try:
+        assert resolver() is None
+    finally:
+        resolver.cache_clear()
+
+
+def test_sparse_mla_master_off_missing_boltops_decode_uses_existing_backend(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Master-off decode falls back without re-entering the AITER route."""
+    runtime = _runtime()
+    monkeypatch.setenv("VLLM_HCU_USE_CUSTOM_OPS", "0")
+    monkeypatch.setattr(runtime, "on_gfx938", lambda: False)
+    monkeypatch.setattr(runtime.current_platform, "is_rocm", lambda: True)
+    monkeypatch.setattr(runtime, "_load_boltops_paged_mqa_logits", lambda: None)
+    from vllm._aiter_ops import rocm_aiter_ops
+
+    monkeypatch.setattr(rocm_aiter_ops, "is_enabled", lambda: True)
+    monkeypatch.setattr(
+        runtime,
+        "paged_mqa_logits_module",
+        lambda: pytest.fail("master-off BoltOps fallback queried AITER"),
+    )
+    calls: list[tuple[object, ...]] = []
+    output = object()
+
+    def paged_mqa_logits(*args):
+        calls.append(args)
+        return output
+
+    monkeypatch.setattr(
+        runtime,
+        "_get_lightop_attention",
+        lambda: SimpleNamespace(paged_mqa_logits=paged_mqa_logits),
+    )
+    q = (
+        torch.arange(6, dtype=torch.float32)
+        .reshape(2, 3, 1, 1)
+        .expand(2, 3, 8, 128)
+        .contiguous()
+        .to(torch.float8_e4m3fn)
+    )
+    cache = torch.empty((10, 64, 1, 132), dtype=torch.uint8)
+    context_lens = torch.tensor(
+        [[300, 300, 301], [1, 1, 2]],
+        dtype=torch.int32,
+    )
+    block_tables = torch.tensor(
+        [[0, 1, 2, 3, 4], [5, 6, 7, 8, 9]],
+        dtype=torch.int32,
+    )
+
+    result = runtime.rocm_fp8_paged_mqa_logits(
+        q,
+        cache,
+        torch.ones((6, 8), dtype=torch.float32),
+        context_lens,
+        block_tables,
+        torch.empty(0),
+        320,
+        force_aiter_triton=True,
+    )
+
+    assert result is output
+    assert len(calls) == 1
+    assert calls[0][0].shape == (6, 1, 8, 128)
+    assert torch.equal(calls[0][0].float().reshape_as(q), q.float())
+    assert calls[0][1] is cache
+    assert torch.equal(calls[0][3], context_lens.reshape(-1))
+    assert torch.equal(calls[0][4], block_tables.repeat_interleave(3, dim=0))
+
+
+@pytest.mark.parametrize(
+    ("block_size", "kcache_layout", "expected_backend"),
+    ((1, "preshuffle", "torch"), (64, "normal", "lightop")),
+)
+def test_sparse_mla_master_off_ignores_forced_aiter_on_gfx938_fallback(
+    monkeypatch: pytest.MonkeyPatch,
+    block_size: int,
+    kcache_layout: str,
+    expected_backend: str,
+) -> None:
+    """The GLM5Next force flag cannot bypass the disabled master switch."""
+    runtime = _runtime()
+    monkeypatch.setenv("VLLM_HCU_USE_CUSTOM_OPS", "0")
+    monkeypatch.setattr(runtime, "on_gfx938", lambda: True)
+    monkeypatch.setattr(runtime.current_platform, "is_rocm", lambda: True)
+    monkeypatch.setattr(runtime, "_load_boltops_paged_mqa_logits", lambda: None)
+    monkeypatch.setattr(
+        runtime,
+        "paged_mqa_logits_module",
+        lambda: pytest.fail("master-off gfx938 fallback queried AITER"),
+    )
+    outputs = {"torch": object(), "lightop": object()}
+    calls: list[str] = []
+
+    def torch_reference(*_args):
+        calls.append("torch")
+        return outputs["torch"]
+
+    def lightop_reference(*_args, **_kwargs):
+        calls.append("lightop")
+        return outputs["lightop"]
+
+    monkeypatch.setattr(runtime, "fp8_paged_mqa_logits_torch", torch_reference)
+    monkeypatch.setattr(
+        runtime,
+        "_get_lightop_attention",
+        lambda: SimpleNamespace(paged_mqa_logits=lightop_reference),
+    )
+    q = torch.zeros((1, 1, 8, 128), dtype=torch.float8_e4m3fn)
+    cache = torch.empty((2, block_size, 1, 132), dtype=torch.uint8)
+
+    result = runtime.rocm_fp8_paged_mqa_logits(
+        q,
+        cache,
+        torch.ones((1, 8), dtype=torch.float32),
+        torch.tensor([block_size], dtype=torch.int32),
+        torch.tensor([[0]], dtype=torch.int32),
+        torch.empty(0),
+        block_size,
+        force_aiter_triton=True,
+        kcache_layout=kcache_layout,
+    )
+
+    assert result is outputs[expected_backend]
+    assert calls == [expected_backend]
+
+
+@pytest.mark.parametrize("abi_change", ("kind", "default", "uninspectable"))
+def test_sparse_mla_boltops_decode_rejects_subtle_public_abi_drift(
+    monkeypatch: pytest.MonkeyPatch,
+    abi_change: str,
+) -> None:
+    """Every part of the audited paged-MQA call contract must fail closed."""
+    runtime = _runtime()
+    resolver = runtime._load_boltops_paged_mqa_logits
+    resolver.cache_clear()
+    from boltops.mqa_logits import triton_fp8_paged_mqa_logits
+
+    if abi_change == "uninspectable":
+
+        class Kernel:
+            @property
+            def __signature__(self):
+                raise ValueError("opaque callable")
+
+            def __call__(self, *args, **kwargs):
+                return args, kwargs
+
+        kernel = Kernel()
+    else:
+        expected = inspect.signature(triton_fp8_paged_mqa_logits)
+        parameters = list(expected.parameters.values())
+        index = next(
+            index
+            for index, parameter in enumerate(parameters)
+            if parameter.name == ("q_fp8" if abi_change == "kind" else "bucket_tokens")
+        )
+        parameters[index] = parameters[index].replace(
+            kind=(
+                inspect.Parameter.POSITIONAL_ONLY
+                if abi_change == "kind"
+                else parameters[index].kind
+            ),
+            default=(4096 if abi_change == "default" else parameters[index].default),
+        )
+
+        def kernel(*args, **kwargs):
+            return args, kwargs
+
+        kernel.__signature__ = expected.replace(parameters=parameters)
+
+    incompatible = SimpleNamespace(triton_fp8_paged_mqa_logits=kernel)
+    monkeypatch.setattr(runtime.importlib, "import_module", lambda name: incompatible)
+    try:
+        with pytest.raises(RuntimeError, match="paged_mqa_logits signature"):
             resolver()
     finally:
         resolver.cache_clear()

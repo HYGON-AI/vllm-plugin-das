@@ -4,6 +4,8 @@
 
 from __future__ import annotations
 
+import importlib.metadata as metadata
+import json
 import os
 import sys
 
@@ -16,6 +18,19 @@ def _run_evalscope_command() -> int:
     # EvalScope is optional for report/command contract tests. Import it only
     # in the subprocess that actually executes an evaluation so unrelated
     # test collection remains available in minimal HCU runtime images.
+    versions = {}
+    for name in (
+        "evalscope", "modelscope", "datasets", "pyarrow", "numpy", "pandas", "torch",
+    ):
+        try:
+            versions[name] = metadata.version(name)
+        except metadata.PackageNotFoundError:
+            versions[name] = None
+    print(
+        "EvalScope runtime versions: " + json.dumps(versions, sort_keys=True),
+        file=sys.stderr,
+        flush=True,
+    )
     from evalscope.cli.cli import run_cmd
 
     return int(run_cmd() or 0)

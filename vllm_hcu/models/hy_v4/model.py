@@ -477,6 +477,7 @@ class HYV4DecoderLayer(nn.Module):
             positions=positions,
             hidden_states=hidden_states,
         )
+        self._maybe_prefetch_next_layer_dsa_cache()
 
         hidden_states = hidden_states + residual
         residual = hidden_states
@@ -485,6 +486,14 @@ class HYV4DecoderLayer(nn.Module):
         hidden_states = self.mlp(hidden_states)
 
         return hidden_states, residual
+
+    def _maybe_prefetch_next_layer_dsa_cache(self) -> None:
+        """Prefetch next-layer MLA cache while this layer runs its FFN."""
+        from vllm_hcu.v1.dsa_cache_layer_split import (
+            maybe_prefetch_next_dsa_cache,
+        )
+
+        maybe_prefetch_next_dsa_cache(self.layer_idx, kind="mla")
 
     def _forward_ihc(
         self,
@@ -499,6 +508,7 @@ class HYV4DecoderLayer(nn.Module):
             positions=positions,
             hidden_states=hidden_states,
         )
+        self._maybe_prefetch_next_layer_dsa_cache()
         hidden_states = self.hc_attn_layer.post(hidden_states, residual, post_gates)
 
         hidden_states = self.hc_mlp_layer.prepare_input(hidden_states)

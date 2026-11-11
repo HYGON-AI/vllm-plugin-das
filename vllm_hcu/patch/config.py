@@ -20,9 +20,14 @@ _FEATURE_FIELDS = (
     "enable_lightly_cplb",
     "enable_custom_sp",
     "enable_multi_layers_mtp",
+    "enable_dsa_cache_layer_split",
     "deepep_auto",
     "fused_qwen3_rms_rope",
     "qwen4_exp_hc_sp",
+    "k3_sp_moe",
+    "glm53_kda_cp_head_shard",
+    "glm53_pcp_mtp_sync",
+    "dp_int8_allgather",
     "moe_backend",
     "hcu_flash_attn_mode",
     "hcu_gdn_prefill_backend",
@@ -31,7 +36,20 @@ _FEATURE_FIELDS = (
     "eplb_disable_rearrange",
     "eplb_static_dispatch_policy",
 )
-_BOOLEAN_FIELDS = _FEATURE_FIELDS[:7]
+# Enumerate booleans explicitly so inserting a feature field cannot silently
+# drop qwen4_exp_hc_sp, enable_dsa_cache_layer_split, or dp_int8_allgather.
+_BOOLEAN_FIELDS = (
+    "enable_lightly_cp",
+    "enable_lightly_cplb",
+    "enable_custom_sp",
+    "enable_multi_layers_mtp",
+    "enable_dsa_cache_layer_split",
+    "deepep_auto",
+    "fused_qwen3_rms_rope",
+    "qwen4_exp_hc_sp",
+    "k3_sp_moe",
+    "dp_int8_allgather",
+)
 _SUPPORTED_MOE_BACKENDS = frozenset({"auto", "deep_gemm"})
 _LEGACY_DEEP_GEMM_BACKEND = "dpsk_deep_gemm"
 _DEEP_GEMM_BACKEND = "deep_gemm"
@@ -43,7 +61,7 @@ _SUPPORTED_FLASH_ATTN_MODES = frozenset(
 # HCU-only --gdn-prefill-backend values. vLLM itself only sees "triton".
 HCU_GDN_PREFILL_BACKENDS = ("hcu-boltops", "hcu-aiter")
 _SUPPORTED_EPLB_STATIC_DISPATCH_POLICIES = frozenset(
-    {"nearest", "locality_fair"}
+    {"nearest", "locality_fair", "token_hash"}
 )
 _EPLB_SIDECAR_FIELDS = (
     "expert_map_path",
@@ -84,6 +102,7 @@ class HcuFeatureConfig:
     enable_lightly_cplb: bool = False
     enable_custom_sp: bool = False
     enable_multi_layers_mtp: bool = False
+    enable_dsa_cache_layer_split: bool = False
     deepep_auto: bool = False
     # Effective (master AND child) runtime policy persisted for compilation
     # cache partitioning. Platform validation refreshes it from the process
@@ -92,6 +111,23 @@ class HcuFeatureConfig:
     # Qwen4Exp HC sequence parallelism (VLLM_HCU_QWEN4_EXP_HC_SP), resolved
     # the same way: it changes the traced graph, so it must partition caches.
     qwen4_exp_hc_sp: bool = True
+    # Effective opt-in policy for Kimi-K3 SP-MoE row sharding
+    # (VLLM_HCU_K3_SP_MOE). Persisted because the SP forward mutates the
+    # traced decoder layer (o_proj reduce_results plus the hcu_k3_sp_*
+    # collectives): opposite-mode restarts sharing a persistent compilation
+    # cache would load the other mode's no-guard AOT graph.
+    k3_sp_moe: bool = False
+    # None means unresolved at the EngineArgs boundary. Platform validation
+    # freezes the effective CP-head mode to bool before compilation hashing;
+    # workers consume that serialized value instead of their local environment.
+    glm53_kda_cp_head_shard: bool | None = None
+    # Freeze PCP MTP collective participation in the engine. A worker-local
+    # environment switch must not change the group's collective sequence.
+    glm53_pcp_mtp_sync: bool | None = None
+    # Effective opt-in policy for INT8 hidden-state transport in the naive
+    # DP/EP AllGatherv dispatch path. Persisted because spawned workers do not
+    # inherit arbitrary VLLM_HCU_* variables from the API process.
+    dp_int8_allgather: bool = False
     moe_backend: str = "auto"
     hcu_flash_attn_mode: str | None = None
     # HCU provider requested through --gdn-prefill-backend (hcu-boltops or
@@ -104,6 +140,10 @@ class HcuFeatureConfig:
     eplb_static_dispatch_policy: str = "nearest"
 
     def __post_init__(self) -> None:
+        for name in ("glm53_kda_cp_head_shard", "glm53_pcp_mtp_sync"):
+            value = getattr(self, name)
+            if value is not None and not isinstance(value, bool):
+                raise TypeError(f"HCU config field {name!r} must be bool or None")
         for name in _BOOLEAN_FIELDS:
             value = getattr(self, name)
             if not isinstance(value, bool):

@@ -113,15 +113,21 @@ class LightopW16A16Experts(mk.FusedMoEExpertsModular):
             intermediate,
             topk,
         )
-        if problem != (256, 2048, 512, 8):
+        supported_problem_limits = {
+            (256, 2048, 512, 8): 16,
+            (256, 2048, 256, 8): 8192,
+        }
+        max_supported_tokens = supported_problem_limits.get(problem)
+        if max_supported_tokens is None:
             return False, (
                 "kernel performance is validated only for "
-                "E=256,K=2048,N=512,top-k=8"
+                "E=256,K=2048,N in {256,512},top-k=8"
             )
         max_num_tokens = int(getattr(moe_config, "max_num_tokens", -1))
-        if max_num_tokens <= 0 or max_num_tokens > 16:
+        if max_num_tokens <= 0 or max_num_tokens > max_supported_tokens:
             return False, (
-                "kernel performance requires 1 <= max_num_tokens <= 16"
+                "kernel performance requires 1 <= max_num_tokens <= "
+                f"{max_supported_tokens} for this shape"
             )
         if not is_lightop_w16a16_available():
             return False, "required categorized LightOp W16A16 exports are unavailable"
@@ -160,8 +166,8 @@ class LightopW16A16Experts(mk.FusedMoEExpertsModular):
             raise RuntimeError("LightOp W16A16 supports standard TP SiLU MoE only")
         intermediate = N // 2
         return (
-            (M * topk, max(N, K)),
             (M * topk, intermediate),
+            (M * topk, max(N, K)),
             (M, K),
         )
 

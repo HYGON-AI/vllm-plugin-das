@@ -47,6 +47,11 @@ def apply_to_module(module: ModuleType) -> bool:
             return
 
         linear = getattr(self, "in_proj_qkvgfab", None)
+        if getattr(linear, "_hcu_mixed_kda", False):
+            # This cold BF16 probe precedes checkpoint loading and INT8
+            # post-processing. A mixed projection must warm up with the normal
+            # model profiling pass after all W8A8 parameters have loaded.
+            return
         weight = getattr(linear, "weight", None)
         if weight is None or weight.device.type != "cuda":
             # Model construction can be inspected on CPU. The actual HCU worker

@@ -10,12 +10,12 @@ import json
 import os
 import tempfile
 from collections.abc import Mapping
-from contextvars import ContextVar
 from pathlib import Path
 from typing import Any, Literal
 
 import torch
 from vllm.logger import init_logger
+from vllm_hcu.distributed.eplb_control import RECORD_ONLY as _RECORD_ONLY
 
 from vllm_hcu.model_executor.layers.fused_moe.static_eplb import (
     StaticEplbPlan,
@@ -46,7 +46,6 @@ TARGETS += (
 )
 _MARKER = "_vllm_hcu_offline_eplb"
 _OFFLINE_EPLB_FORMAT = "vllm_offline_eplb_physical_to_logical_by_model"
-_RECORD_ONLY = ContextVar("hcu_eplb_record_only", default=False)
 logger = init_logger("vllm.hcu.offline_eplb")
 
 
@@ -364,6 +363,16 @@ def apply_to_module(module) -> bool:
             )
         return False
 
+    # The runtime replacement must be installed before this outer policy.
+    # Verify its exact identities before updating its ownership snapshot below;
+    # an unknown replacement must continue to fail closed.
+    from . import patch_step5_eplb_state as step5
+    from vllm_hcu.runtime_compat.step5_patch_contract import (
+        already_applied as step5_applied,
+        remember_targets,
+    )
+    owns_step5 = step5_applied(target, step5._MARKER, step5.TARGETS)
+
     (
         original_add,
         original_step,
@@ -519,19 +528,20 @@ def apply_to_module(module) -> bool:
                 "_vllm_hcu_eplb_static_dispatch_policy",
                 "nearest",
             )
-            order = {
-                "nearest": build_nearest_replica_order,
-                "locality_fair": build_locality_fair_replica_order,
-            }[policy]
             group = target.get_ep_group().device_group
-            ordered = order(
-                model_state.logical_to_physical_map,
-                ep_rank=group.rank(),
-                ep_size=group.size(),
-                num_nodes=target.get_node_count(),
-                num_physical_experts=plan.num_physical_experts,
-            )
-            model_state.logical_to_physical_map.copy_(ordered)
+            if policy != "token_hash":
+                order = {
+                    "nearest": build_nearest_replica_order,
+                    "locality_fair": build_locality_fair_replica_order,
+                }[policy]
+                ordered = order(
+                    model_state.logical_to_physical_map,
+                    ep_rank=group.rank(),
+                    ep_size=group.size(),
+                    num_nodes=target.get_node_count(),
+                    num_physical_experts=plan.num_physical_experts,
+                )
+                model_state.logical_to_physical_map.copy_(ordered)
             for layer in model.moe_layers:
                 layer_state = layer.eplb_state
                 replica_count = layer_state.logical_replica_count
@@ -539,11 +549,18 @@ def apply_to_module(module) -> bool:
                     raise ValueError(
                         "Static EPLB layer has no logical replica counts"
                     )
-                setattr(
-                    layer_state,
-                    STATIC_PRIMARY_REPLICA_COUNT,
-                    torch.ones_like(replica_count),
-                )
+                if policy == "token_hash":
+                    # Preserve the native single-replica token hash and the
+                    # complete candidate map/count. Placement is still fixed;
+                    # no recording, transfer, or rearrangement is enabled.
+                    if hasattr(layer_state, STATIC_PRIMARY_REPLICA_COUNT):
+                        delattr(layer_state, STATIC_PRIMARY_REPLICA_COUNT)
+                else:
+                    setattr(
+                        layer_state,
+                        STATIC_PRIMARY_REPLICA_COUNT,
+                        torch.ones_like(replica_count),
+                    )
             self._vllm_hcu_static_source_sha256 = plan.source_sha256
             logger.info(
                 "Committed static EPLB runtime map: model=%s "
@@ -689,6 +706,10 @@ def apply_to_module(module) -> bool:
     target._commit_eplb_maps = commit_eplb_maps
     target.rearrange_expert_weights_inplace = rearrange_expert_weights_inplace
     setattr(target, _MARKER, wrappers)
+    if owns_step5:
+        # Approved outer wrappers retain __wrapped__ and call the verified
+        # Step5 functions. Re-entry of either adapter must see the composition.
+        remember_targets(target, step5._MARKER, step5.TARGETS)
     return True
 
 

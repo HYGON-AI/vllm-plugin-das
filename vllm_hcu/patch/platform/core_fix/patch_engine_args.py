@@ -47,6 +47,7 @@ _HCU_BOOLEAN_KWARGS = (
     "enable_lightly_cplb",
     "enable_custom_sp",
     "enable_multi_layers_mtp",
+    "enable_dsa_cache_layer_split",
 )
 _HCU_EPLB_FIELDS = {
     "expert_map_path": "expert_map_path",
@@ -589,9 +590,11 @@ def apply_to_module(module: ModuleType) -> bool:
     def hcu_from_cli_args(cls, args):
         engine_args_instance = from_cli_args(cls, args)
         feature_config = get_hcu_config(engine_args_instance)
+        # Include every registered HCU boolean (not just the lightly-CP trio)
+        # so flags like --enable-dsa-cache-layer-split reach the sidecar.
         updates = {
             name: getattr(args, name)
-            for name in _HCU_BOOLEAN_KWARGS[:3]
+            for name in _HCU_BOOLEAN_KWARGS
             if hasattr(args, name)
         }
         if updates:
@@ -664,11 +667,29 @@ def apply_to_module(module: ModuleType) -> bool:
         # effective Qwen3 fusion policy and FlashAttention sub-mode). Keep its
         # serialized result authoritative instead of replacing it with the
         # pre-validation EngineArgs sidecar.
+        from .patch_vllm_config import normalize_glm53_feature_scope
+
+        # Compare effective requests, not GLM-only flags that are no-ops for
+        # this model/topology. Do not broadly skip retention of explicit flags
+        # in supported GLM PCP configurations.
+        effective_request = normalize_glm53_feature_scope(config, feature_config)
         requested = feature_config.to_dict()
+        for name in ("glm53_kda_cp_head_shard", "glm53_pcp_mtp_sync"):
+            if requested[name] is not None:
+                requested[name] = getattr(effective_request, name)
         resolved = resolved_config.to_dict()
         for name, expected in requested.items():
-            if name in ("fused_qwen3_rms_rope", "qwen4_exp_hc_sp") or (
-                name == "hcu_flash_attn_mode" and expected is None
+            if name in (
+                "fused_qwen3_rms_rope",
+                "qwen4_exp_hc_sp",
+                "k3_sp_moe",
+                "dp_int8_allgather",
+            ) or (
+                name in (
+                    "hcu_flash_attn_mode", "glm53_kda_cp_head_shard",
+                    "glm53_pcp_mtp_sync",
+                )
+                and expected is None
             ):
                 continue
             if resolved[name] != expected:

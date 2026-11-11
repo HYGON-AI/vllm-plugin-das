@@ -233,6 +233,7 @@ class SlimQuantW4A8Int8AiterMoEMethod(FusedMoEMethodBase):
         self.quant_config = quant_config
         self.moe_quant_config: FusedMoEQuantConfig | None = None
         self.moe_kernel: mk.FusedMoEKernel | None = None
+        self._supports_int8_allgatherv_input = False
 
     def get_fused_moe_quant_config(
         self, layer: torch.nn.Module
@@ -331,6 +332,20 @@ class SlimQuantW4A8Int8AiterMoEMethod(FusedMoEMethodBase):
             and getattr(parallel, "enable_eplb", False)
         )
 
+    @property
+    def supports_int8_allgatherv_input(self) -> bool:
+        """Whether naive DP/EP dispatch may pass INT8 activations directly."""
+
+        from vllm_hcu.model_executor.layers.fused_moe.deepep_runtime import (
+            slimquant_w4a8_uses_deepep_auto,
+        )
+
+        return bool(
+            getattr(self, "_supports_int8_allgatherv_input", False)
+            and getattr(self.moe, "moe_backend", "auto") != "triton"
+            and not slimquant_w4a8_uses_deepep_auto(self.moe)
+        )
+
     def create_weights(
         self,
         layer: torch.nn.Module,
@@ -413,18 +428,23 @@ class SlimQuantW4A8Int8AiterMoEMethod(FusedMoEMethodBase):
             == generation
         ):
             return
+        self._supports_int8_allgatherv_input = False
         is_kimi_ht = self._is_kimi_ht()
         is_kimi_ll = self._is_kimi_ll()
         if is_kimi_ht or is_kimi_ll:
             uses_deepep_auto = False
+            fixed_use_low_latency = None
         else:
             from vllm_hcu.model_executor.layers.fused_moe.deepep_runtime import (
+                slimquant_w4a8_fixed_deepep_use_low_latency,
                 slimquant_w4a8_uses_deepep_auto,
             )
 
-            uses_deepep_auto = slimquant_w4a8_uses_deepep_auto(
-                getattr(self, "moe", None)
+            moe = getattr(self, "moe", None)
+            fixed_use_low_latency = slimquant_w4a8_fixed_deepep_use_low_latency(
+                moe
             )
+            uses_deepep_auto = slimquant_w4a8_uses_deepep_auto(moe)
         weight_generation = _slimquant_moe_tensor_generation(
             layer,
             _SLIMQUANT_MOE_WEIGHT_TENSORS,
@@ -434,9 +454,20 @@ class SlimQuantW4A8Int8AiterMoEMethod(FusedMoEMethodBase):
             "_hcu_slimquant_post_load_weight_generation",
             None,
         )
-        if not uses_deepep_auto and installed_weight_generation == weight_generation:
+        if (
+            not uses_deepep_auto
+            and fixed_use_low_latency is None
+            and installed_weight_generation == weight_generation
+        ):
             self.moe_quant_config = self.get_fused_moe_quant_config(layer)
+            if getattr(self.moe, "moe_backend", "auto") == "triton":
+                from vllm_hcu.model_executor.layers.quantization.compressed_tensors_moe_runtime import (
+                    prepare_boltops_w4a8_moe,
+                )
+
+                prepare_boltops_w4a8_moe(self, layer)
             config = getattr(layer, "_hcu_slimquant_post_load_aiter_config", None)
+            self._supports_int8_allgatherv_input = config is not None
             if config is not None:
                 from vllm_hcu.model_executor.layers.quantization.compressed_tensors_moe_runtime import (
                     install_aiter_moe_scale_layout,
@@ -526,17 +557,26 @@ class SlimQuantW4A8Int8AiterMoEMethod(FusedMoEMethodBase):
             )
             return
 
-        if uses_deepep_auto:
+        if uses_deepep_auto or fixed_use_low_latency is not None:
             from vllm_hcu.model_executor.layers.fused_moe.experts.dpsk_v4_deep_gemm_moe import (
                 make_deepep_auto_deepgemm_w4a8_moe_kernel,
+                make_fixed_deepep_deepgemm_w4a8_moe_kernel,
             )
 
             deepgemm_quant_config = self._get_deepgemm_moe_quant_config(layer)
-            self.moe_kernel = make_deepep_auto_deepgemm_w4a8_moe_kernel(
-                moe_quant_config=deepgemm_quant_config,
-                moe_config=self.moe,
-                routing_tables=layer._expert_routing_tables(),
-            )
+            if fixed_use_low_latency is None:
+                self.moe_kernel = make_deepep_auto_deepgemm_w4a8_moe_kernel(
+                    moe_quant_config=deepgemm_quant_config,
+                    moe_config=self.moe,
+                    routing_tables=layer._expert_routing_tables(),
+                )
+            else:
+                self.moe_kernel = make_fixed_deepep_deepgemm_w4a8_moe_kernel(
+                    moe_quant_config=deepgemm_quant_config,
+                    moe_config=self.moe,
+                    routing_tables=layer._expert_routing_tables(),
+                    use_low_latency=fixed_use_low_latency,
+                )
             fused_experts = getattr(self.moe_kernel, "fused_experts", None)
             experts = getattr(fused_experts, "experts", fused_experts)
             process = getattr(experts, "process_weights_after_loading", None)
@@ -546,6 +586,10 @@ class SlimQuantW4A8Int8AiterMoEMethod(FusedMoEMethodBase):
                     "experts before weight postprocessing"
                 )
             process(layer)
+            # The HIPC backend may replace Qwen's unaligned gate/up scale with
+            # a zero-preserving padded owner. Keep the method-level config on
+            # that registered Parameter as well as the kernel-local config.
+            self.moe_quant_config = self.get_fused_moe_quant_config(layer)
             layer._hcu_slimquant_post_load_weight_generation = (
                 _slimquant_moe_tensor_generation(
                     layer,
@@ -561,10 +605,10 @@ class SlimQuantW4A8Int8AiterMoEMethod(FusedMoEMethodBase):
             return
         if getattr(self.moe, "moe_backend", "auto") == "triton":
             from vllm_hcu.model_executor.layers.quantization.compressed_tensors_moe_runtime import (
-                prepare_vllm_w4a8_moe,
+                prepare_boltops_w4a8_moe,
             )
 
-            prepare_vllm_w4a8_moe(self, layer)
+            prepare_boltops_w4a8_moe(self, layer)
             layer._hcu_slimquant_post_load_aiter_config = None
         else:
             from vllm_hcu.model_executor.layers.quantization.compressed_tensors_moe_runtime import (
@@ -594,6 +638,7 @@ class SlimQuantW4A8Int8AiterMoEMethod(FusedMoEMethodBase):
                     prefer_quant_config=True,
                 )
                 layer._hcu_slimquant_post_load_aiter_config = config
+                self._supports_int8_allgatherv_input = True
             else:
                 prepare_vllm_w4a8_moe(self, layer)
                 mark_aiter_moe_native_layout(layer)
@@ -619,13 +664,22 @@ class SlimQuantW4A8Int8AiterMoEMethod(FusedMoEMethodBase):
         topk_ids: torch.Tensor,
         shared_experts: object | None,
         shared_experts_input: torch.Tensor | None,
+        i_q: torch.Tensor | None = None,
+        i_s: torch.Tensor | None = None,
+        output_dtype: torch.dtype | None = None,
         **_,
     ) -> torch.Tensor | tuple[torch.Tensor, torch.Tensor]:
 
-        if x.dim() != 2:
+        if (i_q is None) != (i_s is None):
+            raise ValueError(
+                "SlimQuant W4A8 prequantized input requires i_q and i_s together"
+            )
+        expert_input = x if i_q is None else i_q
+
+        if expert_input.dim() != 2:
             raise ValueError(
                 "SlimQuant W4A8 AITER Triton MoE expects rank-2 hidden states, "
-                f"got shape {tuple(x.shape)}"
+                f"got shape {tuple(expert_input.shape)}"
             )
         if topk_weights.shape != topk_ids.shape:
             raise ValueError(
@@ -633,10 +687,10 @@ class SlimQuantW4A8Int8AiterMoEMethod(FusedMoEMethodBase):
                 f"same shape, got {tuple(topk_weights.shape)} and "
                 f"{tuple(topk_ids.shape)}"
             )
-        if topk_ids.dim() != 2 or topk_ids.shape[0] != x.shape[0]:
+        if topk_ids.dim() != 2 or topk_ids.shape[0] != expert_input.shape[0]:
             raise ValueError(
                 "SlimQuant W4A8 requires rank-2 top-k tensors with the same "
-                f"token count as x, got x={tuple(x.shape)}, "
+                f"token count as x, got x={tuple(expert_input.shape)}, "
                 f"topk_ids={tuple(topk_ids.shape)}"
             )
         from vllm_hcu.model_executor.layers.fused_moe.deepep_runtime import (
@@ -650,6 +704,11 @@ class SlimQuantW4A8Int8AiterMoEMethod(FusedMoEMethodBase):
                 getattr(self, "moe", None)
             )
         if uses_deepep_auto:
+            if i_q is not None:
+                raise RuntimeError(
+                    "SlimQuant W4A8 DeepEP auto does not consume naive "
+                    "AllGatherv prequantized activations"
+                )
             if moe_kernel is None:
                 raise RuntimeError(
                     "SlimQuant W4A8 deepep_auto kernel was not initialized; "
@@ -669,7 +728,7 @@ class SlimQuantW4A8Int8AiterMoEMethod(FusedMoEMethodBase):
                 global_num_experts,
             )
             return moe_kernel.apply(
-                hidden_states=x,
+                hidden_states=expert_input,
                 w1=layer.w13_weight,
                 w2=layer.w2_weight,
                 topk_weights=topk_weights,
@@ -702,10 +761,24 @@ class SlimQuantW4A8Int8AiterMoEMethod(FusedMoEMethodBase):
             == "triton"
             else moe_runtime.apply_aiter_w4a8_moe
         )
+        if i_q is None:
+            return operation(
+                self,
+                layer,
+                expert_input,
+                topk_weights,
+                topk_ids,
+            )
+        if operation is not moe_runtime.apply_aiter_w4a8_moe:
+            raise RuntimeError(
+                "SlimQuant W4A8 prequantized AllGatherv requires the AITER backend"
+            )
         return operation(
             self,
             layer,
-            x,
+            expert_input,
             topk_weights,
             topk_ids,
+            activation_scale=i_s,
+            output_dtype=output_dtype,
         )

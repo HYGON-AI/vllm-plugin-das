@@ -581,6 +581,9 @@ def test_v32_pcp_gathers_k_and_slots_before_hcu_cache_insertion():
         use_pcp=True,
         pcp_world_size=2,
         skip_k_cache_insert=False,
+        dcp_rank=0,
+        dcp_world_size=1,
+        cp_kv_cache_interleave_size=1,
         k_cache=SimpleNamespace(prefix="indexer", kv_cache=cache),
         quant_block_size=128,
         scale_fmt="e8m0",
@@ -653,6 +656,9 @@ def test_v32_replicated_mtp_batch_bypasses_static_pcp_indexer_state():
         use_pcp=True,
         pcp_world_size=2,
         skip_k_cache_insert=False,
+        dcp_rank=0,
+        dcp_world_size=1,
+        cp_kv_cache_interleave_size=1,
         k_cache=SimpleNamespace(prefix="indexer", kv_cache=object()),
         quant_block_size=128,
         scale_fmt="e8m0",
@@ -716,6 +722,9 @@ def test_v32_decode_only_target_bypasses_pcp_indexer_gather():
         use_pcp=True,
         pcp_world_size=2,
         skip_k_cache_insert=False,
+        dcp_rank=0,
+        dcp_world_size=1,
+        cp_kv_cache_interleave_size=1,
         k_cache=SimpleNamespace(prefix="indexer", kv_cache=object()),
         quant_block_size=128,
         scale_fmt="e8m0",
@@ -888,11 +897,11 @@ def test_rocm_lightop_paged_mqa_keeps_clean_logits_disabled(
     monkeypatch: pytest.MonkeyPatch,
     kv_cache_shape: tuple[int, ...],
 ) -> None:
-    """Master-off leaves paged MQA unchanged and skips metadata precompute."""
+    """The enabled custom-op fallback keeps LightOp metadata disabled."""
 
     calls: list[tuple[object, ...]] = []
     output = object()
-    monkeypatch.setenv("VLLM_HCU_USE_CUSTOM_OPS", "0")
+    monkeypatch.setenv("VLLM_HCU_USE_CUSTOM_OPS", "1")
 
     def paged_mqa_logits(
         q,
@@ -970,8 +979,12 @@ def test_rocm_lightop_paged_mqa_keeps_clean_logits_disabled(
 
 @pytest.mark.parametrize("block_size", [16, 32, 64])
 @pytest.mark.parametrize("collapsed_cache", [False, True])
+@pytest.mark.parametrize("clean_logits", [False, True])
 def test_gfx938_dispatch_reads_original_physical_pages_and_table(
-    monkeypatch: pytest.MonkeyPatch, block_size: int, collapsed_cache: bool
+    monkeypatch: pytest.MonkeyPatch,
+    block_size: int,
+    collapsed_cache: bool,
+    clean_logits: bool,
 ) -> None:
     """Decode must pass the original page backing and mapping to the reader."""
     runtime = importlib.import_module("vllm_hcu.v1.attention.ops.rocm_aiter_mla_sparse")
@@ -996,8 +1009,8 @@ def test_gfx938_dispatch_reads_original_physical_pages_and_table(
     output = torch.ones((1, block_size * 3))
     calls = []
 
-    def direct_reader(q, physical, weights, lengths, pages, max_len):
-        calls.append((physical, pages, max_len))
+    def direct_reader(q, physical, weights, lengths, pages, max_len, *, fill_tail):
+        calls.append((physical, pages, max_len, fill_tail))
         assert physical.shape == cache.shape
         assert physical.data_ptr() == cache.data_ptr()
         assert physical.stride() == cache.stride()
@@ -1015,9 +1028,11 @@ def test_gfx938_dispatch_reads_original_physical_pages_and_table(
         table,
         torch.empty(0),
         block_size * 3,
+        clean_logits=clean_logits,
     )
     assert actual is output
     assert len(calls) == 1
+    assert calls[0][3] is clean_logits
 
 
 @pytest.mark.parametrize("use_aiter", [False, True])
@@ -1275,6 +1290,9 @@ def test_v32_pcp_one_preserves_existing_hcu_custom_op_ownership():
         use_pcp=False,
         pcp_world_size=1,
         skip_k_cache_insert=False,
+        dcp_rank=0,
+        dcp_world_size=1,
+        cp_kv_cache_interleave_size=1,
         k_cache=SimpleNamespace(prefix="indexer", kv_cache=object()),
         quant_block_size=128,
         scale_fmt="e8m0",

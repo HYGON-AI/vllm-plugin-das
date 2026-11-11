@@ -24,6 +24,8 @@ from vllm.v1.worker.gpu.model_runner import (
 )
 
 from vllm.v1.worker.gpu.dp_utils import dispatch_cg_and_sync_dp
+from vllm_hcu.v1.hcu_dbo import dbo_batch_scope
+from vllm_hcu.v1.step5_hot_context import needs_context_eager, record_context_graph_mode
 
 
 @torch.inference_mode()
@@ -79,22 +81,25 @@ def execute_model(
         # cross-attention cache with dynamic encoder outputs.
         skip_compiled = True
 
-    batch_desc, dp_sync = dispatch_cg_and_sync_dp(
-        self.cudagraph_manager,
-        num_reqs,
-        num_toks,
-        uniform_tok_count,
-        self.dp_size,
-        self.dp_rank,
-        max_query_len=max_query_len,
-        need_eager=is_profile or skip_compiled,
-        num_active_loras=num_active_loras,
-        parallel_config=self.parallel_config,
-        allow_ubatching=(
-            self.ubatch_runner is not None and not skip_attn_for_dummy_run
-        ),
-        uniform_decode=uniform_tok_count == self.decode_query_len,
-    )
+    with dbo_batch_scope(self, batch_req_state):
+        batch_desc, dp_sync = dispatch_cg_and_sync_dp(
+            self.cudagraph_manager,
+            num_reqs,
+            num_toks,
+            uniform_tok_count,
+            self.dp_size,
+            self.dp_rank,
+            max_query_len=max_query_len,
+            need_eager=is_profile or skip_compiled or needs_context_eager(self, batch_req_state, dummy_run),
+            num_active_loras=num_active_loras,
+            parallel_config=self.parallel_config,
+            allow_ubatching=(
+                self.ubatch_runner is not None and not skip_attn_for_dummy_run
+            ),
+            uniform_decode=uniform_tok_count == self.decode_query_len,
+        )
+
+    record_context_graph_mode(self, batch_desc)
 
     if batch_desc.num_tokens == 0:
         # All DP ranks have zero tokens to run.

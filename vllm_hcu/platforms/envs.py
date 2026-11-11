@@ -17,6 +17,7 @@ if TYPE_CHECKING:
     VLLM_USE_OPT_CAT: bool = False
     VLLM_HCU_USE_CAT_MLA: bool = True
     VLLM_HCU_DISABLE_DSA: bool = False
+    VLLM_HCU_GLM_MTP_QUANT_PREFIX_FIX: bool = True
     VLLM_HCU_USE_FP8_MIXED_BATCH: bool = False
     VLLM_HCU_USE_CUSTOM_QUANTIZATION_GEMM : bool = False
     VLLM_HCU_USE_CUSTOM_OPS : bool = False
@@ -88,11 +89,22 @@ if TYPE_CHECKING:
     VLLM_HCU_DPSK_V4_DEEPEP_LL_USE_HCU_DISPATCH_API: bool = False
     VLLM_HCU_SHARED_EXPERTS_STREAM_FORCE: bool = False
     VLLM_HCU_DEEPSEEK_V4_PCP_LOCAL_QUERIES: bool = True
+    VLLM_HCU_KV_ZERO_BY_GROUP: bool = True
+    VLLM_HCU_DEEPSEEK_V4_PCP_LOCAL_SLICES: bool = True
+    VLLM_HCU_COMPRESSOR_GEMM_BACKEND: str = "blaslt"
+    VLLM_HCU_BF16_FP32_MMAC: bool = True
+    VLLM_HCU_C128_HEAD_SPLITS: int = 4
+    VLLM_HCU_INVERSE_ROPE_SUFFIX: bool = True
     VLLM_HCU_SHARED_EXPERTS_EARLY_LAUNCH: bool = False
+    VLLM_HCU_DEEPEP_AUTO_SHARED_WEIGHTS: bool = True
+    VLLM_HCU_MOE_WORKSPACE_GROWTH_MB: int = 512
+    VLLM_HCU_DEEPEP_HT_EXACT_LAYOUT: bool = True
+    VLLM_HCU_SHARED_EXPERTS_DEEPEP_EPLB_OVERLAP: bool = True
     VLLM_HCU_ENABLE_REQUEST_CUDAGRAPH_BUCKETS: bool = False
     VLLM_HCU_PLE_CPU_OFFLOAD: bool = False
     VLLM_HCU_PLE_PREFETCH_STREAM: bool = False
     VLLM_HCU_QWEN4_EXP_HC_SP: bool = True
+    VLLM_HCU_DP_INT8_ALLGATHER: bool = False
     VLLM_HCU_MHC_FUSED_RMSNORM: bool = True
     VLLM_HCU_GLM5NEXT_KDA_STRIDED_INPUTS: bool = True
 
@@ -149,6 +161,42 @@ def qwen4_exp_hc_sp_enabled() -> bool:
     return optional_custom_op_enabled(
         _environment_flag(os.environ.get("VLLM_HCU_QWEN4_EXP_HC_SP", "True"))
     )
+
+
+def dp_int8_allgather_enabled() -> bool:
+    """Resolve INT8 MoE AllGatherv transport under the custom-op master."""
+
+    return optional_custom_op_enabled(
+        _environment_flag(
+            os.environ.get("VLLM_HCU_DP_INT8_ALLGATHER", "False")
+        )
+    )
+
+
+def k3_sp_moe_requested() -> bool:
+    """Raw Kimi-K3 SP-MoE opt-in parse (child switch only).
+
+    Keep this the ONLY parser of ``VLLM_HCU_K3_SP_MOE`` spelling: it feeds
+    :func:`k3_sp_moe_enabled` (master AND child), which the platform
+    persists into the compilation-cache partition and the SP patch's
+    ``_switch_enabled`` delegates to, so neither can disagree on spelling.
+    """
+    return os.environ.get("VLLM_HCU_K3_SP_MOE", "0").strip().lower() in (
+        "1",
+        "true",
+    )
+
+
+def k3_sp_moe_enabled() -> bool:
+    """Effective Kimi-K3 SP-MoE opt-in under the custom-op master.
+
+    The row-sharded forward rewires KimiDecoderLayer at patch-apply time
+    (``o_proj.reduce_results`` plus the ``hcu_k3_sp_*`` collectives), so the
+    resolved master-and-child result must be persisted before VllmConfig
+    computes its compilation-cache hash: opposite-mode AOT graphs cannot
+    share an entry.
+    """
+    return optional_custom_op_enabled(k3_sp_moe_requested())
 
 
 def glm53_router_gemv_enabled() -> bool:
@@ -357,6 +405,10 @@ hcu_vllm_environment_variables: dict[str, Callable[[], Any]] = {
     "VLLM_HCU_DISABLE_DSA":
         lambda: (os.environ.get("VLLM_HCU_DISABLE_DSA", "False").lower() in
                     ("true", "1")),  
+    # GLM DSA MTP decoder target compatibility is enabled by default; set 0 to disable.
+    "VLLM_HCU_GLM_MTP_QUANT_PREFIX_FIX":
+        lambda: (os.environ.get("VLLM_HCU_GLM_MTP_QUANT_PREFIX_FIX", "True").lower()
+                 in ("true", "1")),
     # If set, vllm will use mixed P/D batch for fp8 (num_attention_heads / tp < 32)
     "VLLM_HCU_USE_FP8_MIXED_BATCH":
         lambda: (os.getenv('VLLM_HCU_USE_FP8_MIXED_BATCH', 'True').lower() in
@@ -640,11 +692,61 @@ hcu_vllm_environment_variables: dict[str, Callable[[], Any]] = {
         lambda: os.getenv("VLLM_HCU_DEEPSEEK_V4_PCP_LOCAL_QUERIES", "True").lower()
         in ("1", "true"),
 
+    # Zero a new KV block only in its owning cache group's layer pages.
+    "VLLM_HCU_KV_ZERO_BY_GROUP":
+        lambda: _environment_flag(os.getenv("VLLM_HCU_KV_ZERO_BY_GROUP", "1")),
+
+    # DeepSeek V4 PCP local queries: run sparse prefill on contiguous local
+    # Q/output slices instead of gathering Q and scattering the output.
+    "VLLM_HCU_DEEPSEEK_V4_PCP_LOCAL_SLICES":
+        lambda: _environment_flag(
+            os.getenv("VLLM_HCU_DEEPSEEK_V4_PCP_LOCAL_SLICES", "1")),
+
+    # DeepSeek V4 compressor KV/score projection GEMM: blaslt (cached NT
+    # weight + shared BF16->FP32 BLASLt GEMM) or torch (original torch.mm).
+    "VLLM_HCU_COMPRESSOR_GEMM_BACKEND":
+        lambda: os.getenv("VLLM_HCU_COMPRESSOR_GEMM_BACKEND", "blaslt"),
+
+    # Small-M (<=64) BF16->FP32 NT GEMM on HCU MMAC for the compressor
+    # projections; 0 keeps hipBLASLt for every shape.
+    "VLLM_HCU_BF16_FP32_MMAC":
+        lambda: _environment_flag(os.getenv("VLLM_HCU_BF16_FP32_MMAC", "1")),
+
+    # C128 prefill head tiles on HCU; 0 restores the upstream CU heuristic.
+    "VLLM_HCU_C128_HEAD_SPLITS":
+        lambda: int(os.getenv("VLLM_HCU_C128_HEAD_SPLITS", "4")),
+
+    # DeepSeek V4 o_proj: rotate only the 64-dim RoPE suffix of the private
+    # attention output in place, instead of an out-of-place 512-dim copy.
+    "VLLM_HCU_INVERSE_ROPE_SUFFIX":
+        lambda: _environment_flag(os.getenv("VLLM_HCU_INVERSE_ROPE_SUFFIX", "1")),
+
     # Launch shared_experts on the auxiliary stream before routed MoE/DeepEP,
     # and wait only when the shared output is consumed.
     "VLLM_HCU_SHARED_EXPERTS_EARLY_LAUNCH":
         lambda: (os.environ.get("VLLM_HCU_SHARED_EXPERTS_EARLY_LAUNCH", "False").lower() in
                     ("true", "1")),
+
+    # DeepEP auto DeepGEMM: keep one routed-expert weight copy for both the
+    # HT (contiguous) and LL (masked) experts when their packers agree.
+    "VLLM_HCU_DEEPEP_AUTO_SHARED_WEIGHTS":
+        lambda: _environment_flag(
+            os.getenv("VLLM_HCU_DEEPEP_AUTO_SHARED_WEIGHTS", "1")),
+
+    # Round HT MoE scratch capacity to bounded buckets; 0 restores exact sizing.
+    "VLLM_HCU_MOE_WORKSPACE_GROWTH_MB":
+        lambda: int(os.getenv("VLLM_HCU_MOE_WORKSPACE_GROWTH_MB", "512")),
+
+    # Size DeepEP HT expert workspaces from the physical per-expert counts
+    # DeepEP returns for the received batch, instead of the M*topk upper bound.
+    "VLLM_HCU_DEEPEP_HT_EXACT_LAYOUT":
+        lambda: _environment_flag(os.getenv("VLLM_HCU_DEEPEP_HT_EXACT_LAYOUT", "1")),
+
+    # Quantized DeepEP + EPLB: launch shared experts on the auxiliary stream
+    # before routing and join only when the shared output is consumed.
+    "VLLM_HCU_SHARED_EXPERTS_DEEPEP_EPLB_OVERLAP":
+        lambda: _environment_flag(
+            os.getenv("VLLM_HCU_SHARED_EXPERTS_DEEPEP_EPLB_OVERLAP", "1")),
 
     # Enable request-count-oriented cudagraph capture buckets up to request size 256.
     "VLLM_HCU_ENABLE_REQUEST_CUDAGRAPH_BUCKETS":
@@ -664,12 +766,26 @@ hcu_vllm_environment_variables: dict[str, Callable[[], Any]] = {
     "VLLM_HCU_PLE_PREFETCH_STREAM":
         ple_prefetch_enabled,
 
+    # Quantize naive DP/EP MoE hidden-state dispatch to INT8 before
+    # AllGatherv. ReduceScatterv remains in the model activation dtype.
+    "VLLM_HCU_DP_INT8_ALLGATHER":
+        dp_int8_allgather_enabled,
+
     # Run Qwen4Exp hyper-connection layers sequence-parallel (attention
     # all-gather/reduce-scatter instead of all-reduce) when sequence-parallel
     # MoE is active (DP>1, TP>1, EP). On by default, gated by
     # VLLM_HCU_USE_CUSTOM_OPS.
     "VLLM_HCU_QWEN4_EXP_HC_SP":
         qwen4_exp_hc_sp_enabled,
+
+    # Kimi-K3 SP-MoE row-sharded forward (opt-in). The SP patch's
+    # _switch_enabled delegates to this k3_sp_moe_enabled() (master AND
+    # child) and the same effective result is persisted into
+    # HcuFeatureConfig before VllmConfig.compute_hash, so 0->1 restarts
+    # cannot reuse AOT graphs and a master-off rollback skips the SP
+    # install instead of failing at model construction.
+    "VLLM_HCU_K3_SP_MOE":
+        k3_sp_moe_enabled,
 
     # gfx938 GLM5Next sparse-indexer K-cache page layout: "preshuffle"
     # (official 16x16 tiles, HCU Triton decode reader) or "normal"

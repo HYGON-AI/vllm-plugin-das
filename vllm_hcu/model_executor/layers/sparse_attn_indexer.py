@@ -1088,12 +1088,21 @@ class V32SparseAttnIndexer(SparseAttnIndexer):
         assert isinstance(q_quant, torch.Tensor), (
             "HCU sparse_attn_indexer expects a single FP8 q_quant tensor"
         )
+        dcp_rank = self.dcp_rank
+        dcp_world_size = self.dcp_world_size
+        cp_kv_cache_interleave_size = self.cp_kv_cache_interleave_size
         skip_k_cache_insert = self.skip_k_cache_insert
         pcp_world_size = effective_pcp_world_size(self.pcp_world_size)
+        layer_name = self.k_cache.prefix
         if pcp_world_size > 1 and not skip_k_cache_insert:
+            from vllm_hcu.v1.dsa_cache_layer_split import (
+                invalidate_dsa_cache_broadcast,
+                should_commit_durable_dsa_cache,
+            )
+
             attn_metadata = get_forward_context().attn_metadata
             if isinstance(attn_metadata, dict):
-                layer_metadata = attn_metadata[self.k_cache.prefix]
+                layer_metadata = attn_metadata[layer_name]
                 metadata_world_size = int(
                     getattr(layer_metadata, "pcp_world_size", 1)
                 )
@@ -1101,36 +1110,60 @@ class V32SparseAttnIndexer(SparseAttnIndexer):
                     getattr(layer_metadata, "pcp_has_global_prefill", True)
                 ):
                     pcp_world_size = 1
-            if pcp_world_size > 1 and isinstance(attn_metadata, dict):
-                if metadata_world_size != pcp_world_size:
-                    raise RuntimeError(
-                        "PCP sparse-indexer metadata world size mismatch: "
-                        f"indexer={pcp_world_size}, "
-                        f"metadata={metadata_world_size}"
+                if pcp_world_size > 1:
+                    if metadata_world_size != pcp_world_size:
+                        raise RuntimeError(
+                            "PCP sparse-indexer metadata world size mismatch: "
+                            f"indexer={pcp_world_size}, "
+                            f"metadata={metadata_world_size}"
+                        )
+                    # PCP gather is collective on every rank; only the owner
+                    # commits the durable layer cache.
+                    invalidate_dsa_cache_broadcast(
+                        self.k_cache.kv_cache, layer_name
                     )
-                cache_k, cache_slots = maybe_gather_indexer_k(
-                    k,
-                    layer_metadata.slot_mapping,
-                    layer_metadata,
-                )
-                assert self.scale_fmt is not None
-                if on_gfx938():
-                    ops.indexer_k_quant_and_cache(
-                        cache_k,
-                        _indexer_cache_as_hipc_view(self.k_cache.kv_cache),
-                        cache_slots,
-                        self.quant_block_size,
-                        self.scale_fmt,
+                    cache_k, cache_slots = maybe_gather_indexer_k(
+                        k,
+                        layer_metadata.slot_mapping,
+                        layer_metadata,
                     )
-                else:
-                    indexer_k_bf16_cache_triton(
-                        cache_k,
-                        self.k_cache.kv_cache,
-                        cache_slots,
-                    )
-                # The complete cache write is explicit above.  Keep the
-                # existing HCU custom op for local Q/top-k work only.
-                skip_k_cache_insert = True
+                    if should_commit_durable_dsa_cache(layer_name):
+                        assert self.scale_fmt is not None
+                        if on_gfx938():
+                            ops.indexer_k_quant_and_cache(
+                                cache_k,
+                                _indexer_cache_as_hipc_view(
+                                    self.k_cache.kv_cache
+                                ),
+                                cache_slots,
+                                self.quant_block_size,
+                                self.scale_fmt,
+                            )
+                        else:
+                            indexer_k_bf16_cache_triton(
+                                cache_k,
+                                self.k_cache.kv_cache,
+                                cache_slots,
+                            )
+                    # Keep the existing custom op for local Q/top-k work only.
+                    skip_k_cache_insert = True
+        # Broadcast only with effective PCP active. Replicated MTP uses a
+        # single effective rank and must not enter the PCP collective.
+        if pcp_world_size > 1:
+            from vllm_hcu.v1.dsa_cache_layer_split import (
+                broadcast_dsa_cache_from_owner,
+                maybe_prefetch_same_layer_mla_cache,
+                parse_layer_index,
+            )
+
+            broadcast_dsa_cache_from_owner(self.k_cache.kv_cache, layer_name)
+            try:
+                layer_idx = parse_layer_index(layer_name)
+            except (AssertionError, ValueError):
+                layer_idx = None
+            if layer_idx is not None:
+                maybe_prefetch_same_layer_mla_cache(layer_idx)
+        # Mutation-only custom op: return the top-k buffer, not the op result.
         torch.ops.vllm.hcu_sparse_attn_indexer(
             hidden_states,
             _encode_layer_name(self.k_cache.prefix),

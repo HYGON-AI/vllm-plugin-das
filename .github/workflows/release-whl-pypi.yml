@@ -11,9 +11,7 @@ on:
 
 permissions:
   contents: read
-  # CIUpload 上传前需查询关联 PR (只读)
   pull-requests: read
-  # CIUpload 上报需读取 check-run 统计 (只读)
   checks: read
 
 concurrency:
@@ -26,11 +24,6 @@ env:
 jobs:
   compile:
     name: compile (dtk${{ matrix.dtk_tag }}-py${{ matrix.python_version }}-torch${{ matrix.torch_version }})
-    # 直接使用预装 DTK 的基础镜像, CI 内不再安装 DTK; 换/加编译目标 = 改下面矩阵
-    # image 按镜像总表固定格式拼接:
-    #   ${{ vars.HARBOR_SITE }}/hcu/base/dtk:<dtk_tag>-rockylinux8.6-py<python_version>
-    # (container.image 不允许 env 上下文, 变量直接用 vars.HARBOR_SITE 内联)
-    # pip 源按 dtk_tag 走对应 nightly 归档: ${PYPI_URL}/nightly/dtk<dtk_tag去点>/+simple/
     runs-on:
       - ci
       - self-hosted
@@ -56,28 +49,22 @@ jobs:
         --cap-add=SYS_PTRACE
         --privileged
     steps:
-      - name: 准备构建工具
-        env:
-          PYPI_URL: ${{ vars.PYPI_URL }}
-          # 内网 pip 源按 dtk_tag 拼接并去掉点 (26.04 -> dtk2604), bash 里做替换
-          DTK_VER: ${{ matrix.dtk_tag }}
-        run: |
-          DTK_VER="${DTK_VER//./}"
-          PIP_INDEX="${PYPI_URL}/nightly/dtk${DTK_VER}/+simple/"
-          echo "PIP_INDEX=${PIP_INDEX}"
-          TRUSTED_HOST="${PIP_INDEX#*://}"; TRUSTED_HOST="${TRUSTED_HOST%%/*}"
-          mkdir -p ~/.pip && printf '%s\n' \
-            '[global]' \
-            "index-url = ${PIP_INDEX}" \
-            "trusted-host = ${TRUSTED_HOST}" \
-            > ~/.pip/pip.conf
-
       - name: Checkout
         uses: actions/checkout@v4
 
       - name: install deps
+        env:
+          PYPI_URL: ${{ vars.PYPI_URL }}
+          DTK_VER: ${{ matrix.dtk_tag }}
         run: |
-          pip install --no-cache-dir torch==${{ matrix.torch_version }} ninja wheel setuptools ciupload
+          DTK_VER="${DTK_VER//./}"
+          PIP_INDEX="${PYPI_URL}/nightly/dtk${DTK_VER}/+simple/"
+          TRUSTED_HOST="${PIP_INDEX#*://}"; TRUSTED_HOST="${TRUSTED_HOST%%/*}"
+          echo "PIP_INDEX=${PIP_INDEX}"
+          pip install --no-cache-dir \
+            -i "${PIP_INDEX}" \
+            --trusted-host "${TRUSTED_HOST}" \
+            torch==${{ matrix.torch_version }} ninja wheel setuptools ciupload
 
       - name: build wheel
         run: |
@@ -86,10 +73,8 @@ jobs:
 
       - name: Apply DAS local version to wheels
         env:
-            # CIUpload 需查关联 PR, 注入自动 token
-            GITHUB_TOKEN: ${{ github.token }}
+          GITHUB_TOKEN: ${{ github.token }}
         run: |
-          # DTK 大版本号取自 matrix.dtk_tag (26.04 -> 2604)
           DTK_VER="$(echo '${{ matrix.dtk_tag }}' | tr -d '.')"
           WHEEL_COMMIT_SHA="$(git rev-parse HEAD)"
           CIUpload REPAIR \
@@ -98,11 +83,8 @@ jobs:
             --git_commit "${WHEEL_COMMIT_SHA}" \
             --outputdir output \
             -f dist/*.whl
-          # 新版大版本流程: 按 --dtk_version 归档到 das_nightly/dtk${DTK_VER}, 不再传 --dtk_pkg_name
           CIUpload NIGHTLY --devpi_url ${{ vars.PYPI_URL }} --password ${{ secrets.PYPI_PASSWORD }} --dtk_version "${DTK_VER}" -f output/*.whl --record
 
-      # 容器内以 root 运行, workspace 里的文件会归 root 所有,
-      # 宿主机 job (release-docker-image) 的 checkout 无法清理, 退出前清空
       - name: 清理 workspace
         if: always()
         run: rm -rf "${GITHUB_WORKSPACE}"/* "${GITHUB_WORKSPACE}"/.[!.]* || true

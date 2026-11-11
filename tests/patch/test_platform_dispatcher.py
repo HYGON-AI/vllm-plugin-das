@@ -104,6 +104,10 @@ def test_platform_core_inventory_is_explicit_and_ordered():
             "platform.core_fix.hy_v3_tool_parser",
             "vllm.tool_parsers.hy_v3_tool_parser",
         ),
+        (
+            "platform.core_fix.minimax_m3.video_processor_rgb",
+            "vllm.transformers_utils.processors.minimax_m3",
+        ),
         ("platform.core_fix.step5_envs", "vllm.envs"),
         ("platform.core_fix.step5_config_exports", "vllm.transformers_utils.configs"),
         ("platform.core_fix.step5_config_registry", "vllm.transformers_utils.config"),
@@ -125,6 +129,10 @@ def test_platform_framework_inventory_is_explicit_and_dependency_ordered():
             "vllm.distributed.utils",
         ),
         (
+            "platform.framework_opt.transfer_topology_kv_layout",
+            "vllm.distributed.kv_transfer.kv_connector.utils",
+        ),
+        (
             "platform.framework_opt.hcu_mooncake_connector",
             "vllm_hcu.distributed.kv_transfer.kv_connector.v1.mooncake."
             "mooncake_connector",
@@ -140,6 +148,14 @@ def test_platform_framework_inventory_is_explicit_and_dependency_ordered():
         (
             "platform.framework_opt.pcp_kv_cache_utils",
             "vllm.v1.core.kv_cache_utils",
+        ),
+        (
+            "platform.framework_opt.dsa_layer_split_kv_config",
+            "vllm.v1.core.kv_cache_utils",
+        ),
+        (
+            "platform.framework_opt.packed_kv_offload",
+            "vllm.v1.simple_kv_offload.manager",
         ),
         (
             "platform.framework_opt.qwen4_exp_mtp_kv_cache_groups",
@@ -160,6 +176,10 @@ def test_platform_framework_inventory_is_explicit_and_dependency_ordered():
         (
             "platform.framework_opt.glm53_pcp_hybrid_kv_cache",
             "vllm.v1.core.kv_cache_coordinator",
+        ),
+        (
+            "platform.framework_opt.glm53.kda_cp_state",
+            "vllm.models.glm5next.nvidia.model",
         ),
         (
             "platform.framework_opt.mtp_indexer_kv_cache_coordinator",
@@ -398,9 +418,9 @@ def test_apply_platform_patches_is_idempotent_narrow_and_reported():
     assert result.returncode == 0, result.stderr
     payload = json.loads(result.stdout.strip().splitlines()[-1])
     assert payload == {
-        "count": 65,
+        "count": 70,
         "replacements": 20,
-        "callbacks": 45,
+        "callbacks": 50,
         "failed": [],
         "builtins_same": True,
         "role": "Main",
@@ -408,6 +428,7 @@ def test_apply_platform_patches_is_idempotent_narrow_and_reported():
 
 
 def test_platform_framework_registration_is_lazy_on_clean_vllm():
+    # The current upstream GDN adapters keep FLA providers lazy.
     result = _run_fresh(
         "import builtins,json,sys; "
         "old=builtins.__import__; "

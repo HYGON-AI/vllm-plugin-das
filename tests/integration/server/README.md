@@ -15,14 +15,14 @@ Current coverage:
   with the pooling runner, and verifies `/v1/embeddings`, `/score`, and
   `/rerank` responses.
 - `test_evalscope_qwen3_8b_gsm8k.py` starts a single-HCU, eager-mode
-  `Qwen3-8B` server and runs a 10-sample EvalScope GSM8K smoke test.
+  `Qwen3-8B` server and runs a 100-sample EvalScope GSM8K accuracy test.
 - `test_evalscope_qwen35_9b_gsm8k.py` starts a single-HCU, eager-mode
-  `Qwen3.5-9B` server and checks EvalScope GSM8K Pass@1.
+  `Qwen3.5-9B` server and checks EvalScope GSM8K Pass@1 on 100 samples.
 - `test_evalscope_qwen3_vl_8b_mmmu.py` starts a single-HCU, eager-mode
   `Qwen3-VL-8B-Instruct` server and checks EvalScope MMMU multimodal accuracy.
 - `test_evalscope_deepseek_r1_gsm8k.py` starts `vllm serve` for
   DeepSeek-R1 Channel-FP8 W8A8 with TP=8, waits for `/health`, then runs
-  EvalScope on GSM8K through the OpenAI API.
+  EvalScope on 100 GSM8K samples through the OpenAI API.
 - `test_evalscope_glm52_pcp_humaneval.py` checks the collection-safe
   GLM-5.2 model-runner-v2 TP=4, PCP=2, EP, eager, Triton-MoE launch contract,
   then runs 32 deterministic HumanEval samples through the OpenAI API and
@@ -40,7 +40,10 @@ Current coverage:
   runs HumanEval-32 through the proxy, and requires positive Mooncake transfer,
   DeepEP/DeepGEMM HT+LL, and DSpark metrics evidence.
 
-The Qwen3-8B smoke test needs one local HCU device, the checkpoint at
+All GSM8K cases use the first 100 samples without shuffling and require
+`mean_acc >= 0.95`, with exactly 100 predictions, reviews, and reported samples.
+
+The Qwen3-8B accuracy test needs one local HCU device, the checkpoint at
 `/models/llm-models/qwen3/Qwen3-8B`, `vllm`, and `evalscope`. Select it with
 `-k qwen3_8b_gsm8k_evalscope_server`.
 

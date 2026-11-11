@@ -19,6 +19,11 @@ from typing import Any, Iterator
 from urllib.error import HTTPError
 from urllib.request import Request, urlopen
 
+from tests.integration.gpu_memory import (
+    gpu_memory_utilization_from_args,
+    wait_for_gpu_memory,
+)
+
 
 ROOT = Path(__file__).resolve().parents[3]
 DEFAULT_LOG_DIR = Path("/tmp/vllm-hcu-integration/logs")
@@ -280,7 +285,9 @@ def serve_openai_protocol_model(
     startup_timeout_s: int = 1800,
     enable_qwen3_parsers: bool = False,
     extra_args: list[str] | None = None,
+    required_hcu_count: int = 1,
 ) -> Iterator[OpenAIServer]:
+    """Use the caller's explicit card budget when waiting before startup."""
     if enable_qwen3_parsers:
         _require_structured_output_dependencies()
     port = _available_port()
@@ -342,6 +349,17 @@ def serve_openai_protocol_model(
         log.write(("server command: " + " ".join(command) + "\n").encode())
         log.write(b"server environment: VLLM_HCU_USE_FLASH_ATTN_UNIFIED=1\n")
         log.flush()
+
+        def report_memory(message: str) -> None:
+            log.write((message + "\n").encode())
+            log.flush()
+
+        wait_for_gpu_memory(
+            required_cards=required_hcu_count,
+            gpu_memory_utilization=gpu_memory_utilization_from_args(command),
+            env=env,
+            report=report_memory,
+        )
         proc = subprocess.Popen(
             command,
             cwd=server_cwd,

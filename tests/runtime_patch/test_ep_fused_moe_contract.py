@@ -4,21 +4,26 @@
 from __future__ import annotations
 
 import ast
+import math
+import os
 import sys
 from pathlib import Path
 from types import ModuleType, SimpleNamespace
 
 import pytest
 import torch
+from vllm.model_executor.layers.fused_moe.activation import MoEActivation
 
 from vllm_hcu.model_executor.layers.fused_moe.ep_fused_moe_support import (
     supports_channel_ep_fused,
 )
+from vllm_hcu.platforms import envs as henvs
 
 ROOT = Path(__file__).parents[2]
 
 
 def load_function(path, name, namespace):
+    namespace.setdefault("henvs", henvs)
     tree = ast.parse((ROOT / path).read_text())
     function = next(n for n in ast.walk(tree)
                     if isinstance(n, ast.FunctionDef) and n.name == name)
@@ -75,12 +80,14 @@ class NativePathReached(Exception):
     pass
 
 
-def test_block_fp8_uses_original_deepgemm_path_with_opt_in_enabled():
+def test_block_fp8_uses_original_deepgemm_path_with_opt_in_enabled(monkeypatch):
+    monkeypatch.setenv("VLLM_HCU_USE_CUSTOM_OPS", "1")
     def native(**kwargs):
         raise NativePathReached
 
     ns = {
         "torch": torch, "_EP_FUSED_MOE": True,
+        "MoEActivation": MoEActivation, "_STEP5_BACKEND_AUDIT": False,
         "current_platform": SimpleNamespace(is_rocm=lambda: True),
         "_HCU_HT_EP_TOKEN_ALIGNMENT": 256,
         "compute_aligned_M_and_alignment": native,
@@ -90,6 +97,7 @@ def test_block_fp8_uses_original_deepgemm_path_with_opt_in_enabled():
     )
     w1, w2, s1, s2 = tensors(block=True)
     expert = SimpleNamespace(
+        _hcu_step5_owner=True,
         quant_config=SimpleNamespace(use_fp8_w8a8=True, use_int8_w8a8=False),
         block_shape=[128, 128], w1_scale=s1, w2_scale=s2,
         _hcu_logical_n=3072, _hcu_logical_k=4096,
@@ -101,7 +109,7 @@ def test_block_fp8_uses_original_deepgemm_path_with_opt_in_enabled():
             torch.empty(4,4096,dtype=w1.dtype,device="meta"), w1,w2,
             torch.empty(4,2,device="meta"),
             torch.empty(4,2,dtype=torch.int32,device="meta"),
-            "swiglustep",4,metadata()["expert_map"],
+            MoEActivation.SWIGLUSTEP,4,metadata()["expert_map"],
             torch.empty(4,32,device="meta"),None,
             torch.empty(1,device="meta"),torch.empty(1,device="meta"),None,False,
         )
@@ -116,7 +124,7 @@ def test_ep_execution_validates_channel_scale_semantics(monkeypatch, case):
     w1,w2,s1,s2 = tensors(block=case == "block_scales")
     cfg = SimpleNamespace(use_fp8_w8a8=True, per_out_ch_quant=True,
                           per_act_token_quant=case != "not_per_token")
-    expert = SimpleNamespace(quant_config=cfg, block_shape=None,
+    expert = SimpleNamespace(_hcu_step5_owner=True, quant_config=cfg, block_shape=None,
                              w1_scale=s1,w2_scale=s2,gemm1_clamp_limit=7.0)
     seen=[]
     vendor=ModuleType("vllm_hcu.model_executor.layers.fused_moe.ep_fused_moe")
@@ -171,6 +179,7 @@ def test_weight_preparation_agrees_with_execution_capability(monkeypatch, case):
         "hcu_convert_to_fp8_moe_kernel_format",ns,
     )
     layer=SimpleNamespace(
+        _hcu_step5_owner=True,
         weight_block_size=[128,128] if case=="block" else None,
         activation="silu" if case=="silu" else "swiglustep",
         expert_map=None if case=="no_ep" else metadata()["expert_map"],
@@ -212,9 +221,12 @@ def test_gathered_route_reduction_does_not_alias_output(output_offset):
         "torch": torch,
         "tl": SimpleNamespace(bfloat16=None, float16=None, float32=None),
         "FP8": torch.float8_e4m3fn,
+        "STEP5_PREFILL_ASM_G1": False,
         "ep_sorting": lambda *a: (None, None, None, None, rows),
         "_gemm": gemm,
         "ep_swiglustep_quant": lambda *a, q: (q, None),
+        "DIRECT_MIN": 0,
+        "direct_scratch": None,
         "ep_masked_moe_sum": reduce,
         "shared_add_provider": None,
     }
@@ -235,6 +247,89 @@ def test_gathered_route_reduction_does_not_alias_output(output_offset):
     torch.testing.assert_close(result, torch.full_like(result, 8))
 
 
+@pytest.mark.parametrize("chunk,full", [(2, 8), (8, 8)])
+def test_modular_chunk_scratch_has_independent_full_output(chunk, full):
+    requests = []
+
+    def allocate(*specs):
+        requests.extend(specs)
+        sizes=[(math.prod(shape)*dtype.itemsize+255)//256*256 for shape,dtype in specs]
+        storage=torch.empty(sum(sizes),dtype=torch.uint8)
+        offset=0;views=[]
+        for (shape,dtype),size in zip(specs,sizes):
+            views.append(storage[offset:offset+math.prod(shape)*dtype.itemsize].view(dtype).view(shape))
+            offset+=size
+        return tuple(views)
+
+    ns = {
+        "torch": torch, "prod": math.prod,
+        "current_workspace_manager": lambda: SimpleNamespace(get_simultaneous=allocate),
+        "_resize_cache": lambda tensor, shape: tensor.flatten()[:math.prod(shape)].view(shape),
+        "_step5_ep_workspace_announced": False,
+        "henvs": SimpleNamespace(VLLM_HCU_USE_CUSTOM_OPS=False),
+        "get_moe_workspaces": lambda manager, specs, growth: manager.get_simultaneous(*specs),
+    }
+    fn = load_function(
+        "vllm_hcu/model_executor/layers/fused_moe/modular_kernel.py",
+        "_allocate_buffers", ns,
+    )
+    expert = SimpleNamespace(
+        _hcu_step5_owner=True,
+        workspace_dtype=lambda dtype: dtype,
+        workspace_shapes=lambda m,n,k,topk,*a: ((m*topk,k),(m*topk,n),(m,k)),
+    )
+    w13, w2, output = fn(SimpleNamespace(fused_experts=expert),
+        torch.bfloat16, "cpu", chunk, full, 16, 8, 2, 352, 22, None, "swiglustep")
+    assert w13.shape == (chunk*2, 8) and w2.shape == (chunk*2, 16)
+    assert output.shape == (full, 8)
+    if chunk < full:
+        assert len(requests) == 3
+        intervals=sorted((t.data_ptr(),t.data_ptr()+t.numel()*t.element_size()) for t in (w13,w2,output))
+        assert all(a[1]<=b[0] for a,b in zip(intervals,intervals[1:]))
+    else:
+        assert len(requests) == 2
+        assert w13.untyped_storage().data_ptr() == output.untyped_storage().data_ptr()
+
+
+@pytest.mark.parametrize("case", [
+    "enabled", "disabled", "master_disabled", "backend_disabled", "not_rocm",
+    "block", "not_per_token", "not_per_channel", "other_experts", "other_global",
+    "other_topk", "silu", "no_map", "router_on_input", "lora", "bad_scale",
+])
+@pytest.mark.parametrize("local_experts", [22, 23, 44])
+def test_bounded_step5_scratch_requires_the_actual_channel_ep_backend(monkeypatch, case, local_experts):
+    w1 = torch.empty(local_experts*2 if case=="other_experts" else local_experts,3072,4096,
+                     device="meta",dtype=torch.float8_e4m3fn)
+    w2 = torch.empty(local_experts,4096,1536,device="meta",dtype=w1.dtype)
+    s1 = torch.empty(local_experts,3072,1,device="meta")
+    s2 = torch.empty(local_experts,4096,1,device="meta")
+    if case=="bad_scale":s1=torch.empty(1,device="meta")
+    expert = SimpleNamespace(
+        _hcu_step5_owner=True,
+        quant_config=SimpleNamespace(use_fp8_w8a8=True,
+            per_out_ch_quant=case!="not_per_channel",per_act_token_quant=case!="not_per_token"),
+        block_shape=[128,128] if case=="block" else None,
+        w1_scale=s1,w2_scale=s2,_lora_context=object() if case=="lora" else None,
+    )
+    monkeypatch.setenv("HCU_STEP5_BOUNDED_EP_WORKSPACE", "0" if case=="disabled" else "1")
+    vendor=ModuleType("vllm_hcu.model_executor.layers.fused_moe.ep_fused_moe")
+    vendor.CHUNK=32768;monkeypatch.setitem(sys.modules,vendor.__name__,vendor)
+    fn=load_function(
+        "vllm_hcu/model_executor/layers/fused_moe/experts/deep_gemm_moe.py",
+        "_hcu_step5_ep_chunk_size", {
+            "os":os,"_EP_FUSED_MOE":case!="backend_disabled",
+            "current_platform":SimpleNamespace(is_rocm=lambda:case!="not_rocm"),
+            "henvs":SimpleNamespace(optional_custom_op_enabled=lambda enabled:enabled and case!="master_disabled"),
+        },
+    )
+    global_experts = 368 if local_experts == 23 else 352
+    result=fn(expert,w1,w2,"silu" if case=="silu" else "swiglustep",
+        704 if case=="other_global" else global_experts,
+        None if case=="no_map" else torch.empty(global_experts,dtype=torch.int32,device="meta"),
+        4 if case=="other_topk" else 8,case=="router_on_input")
+    assert result==(32768 if case=="enabled" else None)
+
+
 def test_route_workspace_is_reused_when_output_has_separate_storage():
     ns = {"torch": torch}
     carve = load_function(
@@ -244,3 +339,92 @@ def test_route_workspace_is_reused_when_output_has_separate_storage():
     out = torch.empty(8, 4)
     routes = carve(workspace, (8, 4, 4), torch.float32, "cpu", avoid=out)
     assert routes.untyped_storage().data_ptr() == workspace.untyped_storage().data_ptr()
+
+
+@pytest.mark.parametrize("tokens", [8, 9, 25, 32])
+@pytest.mark.parametrize("output_offset", [0, 4096])
+def test_later_chunk_gate_up_preserves_earlier_chunk_output(tokens, output_offset):
+    """Exercise the real chunk loop with output in the modular scratch storage."""
+    topk, hidden, intermediate = 8, 4096, 1536
+    workspace = torch.empty(tokens * topk * hidden + output_offset)
+    out = workspace[output_offset:output_offset + tokens * hidden].view(tokens, hidden)
+
+    def gemm(a, b, result, *args, **kwargs):
+        # GEMM1 reuses the beginning of workspace13 on every chunk.
+        result.fill_(13 if result.ndim == 2 else 1)
+
+    ns = {
+        "torch": torch,
+        "tl": SimpleNamespace(bfloat16=None, float16=None, float32=None),
+        "FP8": torch.float8_e4m3fn, "CHUNK": 2, "_announced": True,
+        "STEP5_PREFILL_ASM_G1": False,
+        "ep_sorting": lambda ids, *a: (None, None, None, None, ids.numel()),
+        "_gemm": gemm,
+        "ep_swiglustep_quant": lambda *a, q: (q, None),
+        "DIRECT_MIN": 0, "shared_add_provider": None,
+        "ep_masked_moe_sum": lambda routes, output, *a: output.copy_(routes.sum(1)),
+    }
+    path = "vllm_hcu/model_executor/layers/fused_moe/ep_fused_moe.py"
+    load_function(path, "_carve", ns)
+    load_function(path, "_ep_fused_experts", ns)
+    run = load_function(path, "ep_fused_experts", ns)
+    result = run(
+        torch.zeros(tokens, hidden),
+        SimpleNamespace(shape=(22, 2 * intermediate, hidden)),
+        SimpleNamespace(shape=(22, hidden, intermediate)),
+        torch.ones(tokens, topk), torch.zeros(tokens, topk, dtype=torch.int32),
+        torch.arange(352), None, None,
+        a1_scale=torch.ones(tokens, 1), out=out, workspace13=workspace,
+        configs=({"BLOCK_SIZE_M": 1}, {"BLOCK_SIZE_M": 1}),
+    )
+    assert result is out
+    torch.testing.assert_close(result, torch.full_like(result, 8))
+
+
+def test_carve_reuses_disjoint_views_of_one_backing_allocation():
+    ns={"torch":torch}
+    carve=load_function("vllm_hcu/model_executor/layers/fused_moe/ep_fused_moe.py","_carve",ns)
+    backing=torch.empty(256)
+    scratch=backing[:128];output=backing[128:].view(8,16)
+    result=carve(scratch,(8,4,4),torch.float32,"cpu",avoid=output)
+    assert result.data_ptr()==scratch.data_ptr()
+
+
+@pytest.mark.parametrize("mode", ["main", "fallback", "unknown", "flag_off", "sp", "dbo"])
+def test_runtime_selected_wrapper_uses_bounded_workspace(monkeypatch, mode):
+    """Exercise the same outer expert class returned by the installed FP8 oracle."""
+    monkeypatch.setenv("VLLM_HCU_USE_CUSTOM_OPS", "1")
+    from vllm.model_executor.layers.fused_moe.experts import triton_deep_gemm_moe as selector
+    from vllm.model_executor.layers.fused_moe.prepare_finalize import naive_dp_ep
+    from vllm.model_executor.layers.fused_moe.oracle.fp8 import (
+        Fp8MoeBackend, backend_to_kernel_cls,
+    )
+    cls=backend_to_kernel_cls(Fp8MoeBackend.DEEPGEMM)[0]
+    assert cls is selector.TritonOrDeepGemmExperts
+    if mode=="unknown":cls=type("UnreviewedSelector",(cls,),{})
+    outer=object.__new__(cls)
+    outer.experts=SimpleNamespace(_hcu_step5_owner=True,_hcu_step5_ep_chunk_size=lambda *a:32768)
+    outer.fallback_experts=SimpleNamespace()
+    monkeypatch.setattr(selector,"_valid_deep_gemm",lambda *a:mode!="fallback")
+    monkeypatch.setattr(selector,"is_deep_gemm_e8m0_used",lambda:False)
+    monkeypatch.setenv("HCU_STEP5_BOUNDED_EP_WORKSPACE","0" if mode=="flag_off" else "1")
+    allocations=[]
+    class Allocated(Exception):pass
+    def allocate(dtype,device,chunk,full,*args):
+        allocations.append((chunk,full));raise Allocated
+    pf=naive_dp_ep.MoEPrepareAndFinalizeNaiveDPEPModular(is_sequence_parallel=mode=="sp")
+    runner=SimpleNamespace(fused_experts=outer,prepare_finalize=pf,N=-1,K=-1,_allocate_buffers=allocate)
+    ns={"torch":torch,"os":os,"dbo_enabled":lambda:mode=="dbo"}
+    path="vllm_hcu/model_executor/layers/fused_moe/modular_kernel.py"
+    tree=ast.parse((ROOT/path).read_text())
+    if any(isinstance(n,ast.FunctionDef) and n.name=="_step5_ep_chunk_provider" for n in tree.body):
+        load_function(path,"_step5_ep_chunk_provider",ns)
+    fn=load_function(path,"_fused_experts",ns)
+    with pytest.raises(Allocated):
+        fn(runner,torch.bfloat16,torch.empty(65536,4096,device="meta",dtype=torch.float8_e4m3fn),
+           torch.empty(65536,1,device="meta"),
+           torch.empty(22,3072,4096,device="meta",dtype=torch.float8_e4m3fn),
+           torch.empty(22,4096,1536,device="meta",dtype=torch.float8_e4m3fn),
+           torch.empty(65536,8,device="meta"),torch.empty(65536,8,device="meta",dtype=torch.int32),
+           "swiglustep",352,22,torch.empty(352,device="meta",dtype=torch.int32),False,None)
+    assert allocations==[(32768 if mode=="main" else 65536,65536)]

@@ -10,7 +10,10 @@ from collections import defaultdict
 import datetime as dt
 import json
 import os
+import shutil
+import subprocess
 import sys
+import venv
 from pathlib import Path
 from types import SimpleNamespace
 
@@ -32,8 +35,12 @@ from hcu_ci_preflight import PreflightError, run_preflight  # noqa: E402
 from hcu_ci_preflight import (  # noqa: E402
     _check_environment_lock,
     _check_requirements,
+    _version_specification,
 )
-from run_hcu_ci_job import _export_resolved_resource_environment  # noqa: E402
+from run_hcu_ci_job import (  # noqa: E402
+    _export_resolved_resource_environment,
+    _pid_cgroup_snapshot,
+)
 from build_hcu_matrix import MatrixError, build_matrix  # noqa: E402
 from compile_changed_python import _compile as compile_python_file  # noqa: E402
 from compile_changed_python import main as compile_changed_python_main  # noqa: E402
@@ -186,7 +193,7 @@ def test_nightly_matrix_explicitly_covers_extended_models_and_topology() -> None
     }.issubset(registry_jobs)
 
 
-def test_kimi_k25_humaneval_routes_to_eight_card_evalscope_job() -> None:
+def test_kimi_k25_keeps_configuration_but_is_not_scheduled() -> None:
     config = _config()
     job = config["jobs"]["kimi-k25-humaneval"]
     assert job == {
@@ -208,7 +215,13 @@ def test_kimi_k25_humaneval_routes_to_eight_card_evalscope_job() -> None:
                 "env": "VLLM_HCU_KIMI_K25_MODEL",
                 "relative": "Kimi-K2.5",
             },
+            {
+                "kind": "dataset",
+                "env": "VLLM_HCU_HUMANEVAL_DATASET",
+                "relative": "humaneval",
+            },
         ],
+        "isolate_generated_code": True,
     }
 
     target = (
@@ -219,10 +232,11 @@ def test_kimi_k25_humaneval_routes_to_eight_card_evalscope_job() -> None:
         registration.job == "kimi-k25-humaneval"
         and registration.target == target
         and registration.est_time == 14400
-        and registration.disabled is None
+        and registration.disabled is not None
+        and "startup" in registration.disabled
         for registration in parse_registry()
     )
-    assert "kimi-k25-humaneval" in {
+    assert "kimi-k25-humaneval" not in {
         item["registry_job"] for item in build_matrix(config, profile="nightly")
     }
 
@@ -230,7 +244,7 @@ def test_kimi_k25_humaneval_routes_to_eight_card_evalscope_job() -> None:
         config,
         ["tests/models/kimi_k25_humaneval_evalscope.yaml"],
     )
-    assert {item["registry_job"] for item in jobs} == {"kimi-k25-humaneval"}
+    assert jobs == []
     assert groups == ["kimi-k25-evalscope"]
     assert fallback is False
 
@@ -442,6 +456,21 @@ def test_environment_lock_allows_compatible_hip_prefix(
         )
 
 
+@pytest.mark.parametrize(
+    "specification",
+    (
+        {"match": "exact", "version": "3.10.12", "versions": []},
+        {"match": "exact", "version": "3.10.12", "versions": [3, 10]},
+        {"match": "exact", "version": 31012, "versions": ["3.12.12"]},
+    ),
+)
+def test_version_specification_rejects_conflicting_or_malformed_secondary_field(
+    specification: dict,
+) -> None:
+    with pytest.raises(PreflightError, match="exactly one"):
+        _version_specification(specification, name="test version")
+
+
 def test_v0281_runner_lock_matches_audited_runtime(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
@@ -450,13 +479,19 @@ def test_v0281_runner_lock_matches_audited_runtime(
         REPOSITORY / ".github/workflows/configs/hcu-runner-environment.json"
     )
     lock = json.loads(lock_path.read_text(encoding="utf-8"))
-    assert lock["python"] == "3.10.12"
-    assert lock["torch_hip"] == {"match": "prefix", "version": "6.3."}
+    assert lock["python"] == {
+        "match": "exact",
+        "versions": ["3.10.12", "3.12.12"],
+    }
+    assert lock["torch_hip"] == {
+        "match": "prefix",
+        "versions": ["6.3.", "7.2."],
+    }
     assert lock["rocm"] == {
         "environment": "ROCM_PATH",
         "version_file": ".info/rocm_version",
         "match": "release_line",
-        "version": "26.04",
+        "versions": ["26.04", "26.10"],
     }
     assert lock["distributions"] == {
         "torch": {"match": "prefix", "version": "2.11.0+"},
@@ -486,6 +521,22 @@ def test_v0281_runner_lock_matches_audited_runtime(
         torch_hip="6.3.26113",
     )
     assert report["rocm"] == "26.04.1"
+
+    version_file.write_text("26.10\n", encoding="utf-8")
+    report = _check_environment_lock(
+        lock_path,
+        versions=versions,
+        torch_hip="7.2.26365",
+    )
+    assert report["rocm"] == "26.10"
+    monkeypatch.setattr("hcu_ci_preflight.platform.python_version", lambda: "3.12.12")
+    _check_environment_lock(
+        lock_path,
+        versions=versions,
+        torch_hip="7.2.26365",
+    )
+    monkeypatch.setattr("hcu_ci_preflight.platform.python_version", lambda: "3.10.12")
+    version_file.write_text("26.04.1\n", encoding="utf-8")
 
     for distribution, compatible_version in (
         ("vllm", "0.28.1"),
@@ -525,6 +576,24 @@ def test_v0281_runner_lock_matches_audited_runtime(
                 torch_hip="6.3.26113",
             )
 
+    with monkeypatch.context() as unsupported_python:
+        unsupported_python.setattr(
+            "hcu_ci_preflight.platform.python_version", lambda: "3.11.12"
+        )
+        with pytest.raises(PreflightError, match="runner Python drift"):
+            _check_environment_lock(
+                lock_path, versions=versions, torch_hip="6.3.26113"
+            )
+    with pytest.raises(PreflightError, match="runner torch HIP drift"):
+        _check_environment_lock(
+            lock_path, versions=versions, torch_hip="6.4.0"
+        )
+    version_file.write_text("27.01\n", encoding="utf-8")
+    with pytest.raises(PreflightError, match="DTK/ROCm drift"):
+        _check_environment_lock(
+            lock_path, versions=versions, torch_hip="6.3.26113"
+        )
+
 
 @pytest.fixture
 def dtk_environment_lock(
@@ -537,7 +606,10 @@ def dtk_environment_lock(
     )
     # Exercise the generic release-line matcher independently of the branch's
     # exact audited DTK patch release.
+    lock["rocm"].pop("versions", None)
     lock["rocm"].update({"match": "release_line", "version": "26.04"})
+    lock["python"] = "3.10.12"
+    lock["torch_hip"] = {"match": "prefix", "version": "6.3."}
     runtime_root = tmp_path / "dtk"
     version_file = runtime_root / lock["rocm"]["version_file"]
     version_file.parent.mkdir(parents=True)
@@ -633,6 +705,10 @@ def test_environment_lock_preserves_exact_dtk_matching(
     (
         {"match": "prefix"},
         {"match": []},
+        {"version": "26.04", "versions": ["26.04", "26.10"]},
+        {"version": None, "versions": []},
+        {"version": None, "versions": ["26.04", 26.10]},
+        {"version": None, "versions": ["26.04", "26.04"]},
         {"match": "release_line", "version": "26"},
         {"match": "release_line", "version": "26.04.1"},
         {"match": "release_line", "version": "26.04|27.01"},
@@ -813,6 +889,202 @@ def test_hcu_container_uses_checked_out_environment_lock() -> None:
     assert ":/models/llm-models:ro" not in source
 
 
+def test_selected_hcu_path_uses_resolved_supported_python() -> None:
+    paths = (
+        "scripts/ci/hcu/hcu_ci_start_container.sh",
+        "scripts/ci/hcu/hcu_ci_install_dependency.sh",
+        "scripts/ci/hcu/hcu_ci_resolve_image.sh",
+        ".github/workflows/_selected-hcu-tests.yml",
+    )
+    sources = {
+        path: (REPOSITORY / path).read_text(encoding="utf-8") for path in paths
+    }
+
+    assert 'command -v python3' in sources[paths[0]]
+    assert "for python_name in" not in sources[paths[0]]
+    assert "hcu_ci_create_python_wrapper.sh" in sources[paths[0]]
+    assert "ln -sf" not in sources[paths[0]]
+    assert "/usr/local/bin/hcu-ci-python" in sources[paths[0]]
+    assert "/usr/local/bin/hcu-ci-python" in sources[paths[1]]
+    assert "/usr/local/bin/hcu-ci-python" in sources[paths[3]]
+    assert "command -v python3" in sources[paths[2]]
+    assert "for name in python3.10 python3.12" not in sources[paths[2]]
+    assert "without the default python3" in sources[paths[2]]
+    assert "github.workflow_sha" in sources[paths[3]]
+    assert "Preserve caller HCU CI bootstrap" in sources[paths[3]]
+    assert "docker cp" in sources[paths[3]]
+    assert "hcu_ci_create_python_wrapper.sh" in sources[paths[3]]
+    assert "hcu_ci_bootstrap_python.sh" in sources[paths[3]]
+    bootstrap = (
+        REPOSITORY / "scripts/ci/hcu/hcu_ci_bootstrap_python.sh"
+    ).read_text(encoding="utf-8")
+    assert "/usr/local/bin/python3.10" in bootstrap
+
+    for path in paths[:3]:
+        assert "/usr/local/bin/python3.10" not in sources[path]
+
+
+def test_hcu_control_workflows_use_image_python_without_fixed_minor() -> None:
+    paths = (
+        ".github/workflows/hcu-pr-ci.yml",
+        ".github/workflows/nightly-hcu.yml",
+        ".github/workflows/patch-coverage.yml",
+        ".github/workflows/full-enabled-hcu.yml",
+    )
+    for path in paths:
+        source = (REPOSITORY / path).read_text(encoding="utf-8")
+        assert "python3.10" not in source, path
+        assert "python3 " in source or "python3\n" in source, path
+
+    for path in (
+        ".github/workflows/hcu-pr-ci.yml",
+        ".github/workflows/nightly-hcu.yml",
+        ".github/workflows/patch-coverage.yml",
+        ".github/workflows/full-enabled-hcu.yml",
+    ):
+        source = (REPOSITORY / path).read_text(encoding="utf-8")
+        assert "hcu_ci_preflight.py" in source, path
+        assert "--check-lock-only" in source, path
+
+    weekly = (
+        REPOSITORY / ".github/workflows/weekly-multi-node.yml"
+    ).read_text(encoding="utf-8")
+    assert "run: python3.10 .github/scripts/hcu_ci/run_hcu_ci_job.py" in weekly
+
+
+def test_control_preflight_runs_with_python312_only(tmp_path: Path) -> None:
+    bin_dir = tmp_path / "bin"
+    bin_dir.mkdir()
+    shutil.copy2(sys.executable, bin_dir / "python3")
+    isolated_path = str(bin_dir)
+
+    assert shutil.which("python3", path=isolated_path) == str(bin_dir / "python3")
+    assert shutil.which("python3.10", path=isolated_path) is None
+    completed = subprocess.run(
+        [
+            str(bin_dir / "python3"),
+            str(CI_SCRIPTS / "hcu_ci_preflight.py"),
+            "--environment-lock",
+            str(
+                REPOSITORY
+                / ".github/workflows/configs/hcu-runner-environment.json"
+            ),
+            "--check-lock-only",
+        ],
+        check=False,
+        capture_output=True,
+        env={"PATH": isolated_path},
+        text=True,
+    )
+    assert completed.returncode == 0, completed.stderr
+    assert '"versions": [' in completed.stdout
+    assert '"3.12.12"' in completed.stdout
+
+
+def test_default_python312_wins_over_invalid_python310(tmp_path: Path) -> None:
+    bin_dir = tmp_path / "bin"
+    bin_dir.mkdir()
+    default_python = bin_dir / "python3"
+    invalid_python = bin_dir / "python3.10"
+    shutil.copy2(sys.executable, default_python)
+    invalid_python.write_text("#!/bin/sh\nexit 97\n", encoding="utf-8")
+    invalid_python.chmod(0o755)
+    isolated_path = str(bin_dir)
+
+    selected = shutil.which("python3", path=isolated_path)
+    assert selected == str(default_python)
+    assert shutil.which("python3.10", path=isolated_path) == str(invalid_python)
+    completed = subprocess.run(
+        [
+            selected,
+            str(CI_SCRIPTS / "hcu_ci_preflight.py"),
+            "--environment-lock",
+            str(
+                REPOSITORY
+                / ".github/workflows/configs/hcu-runner-environment.json"
+            ),
+            "--check-lock-only",
+        ],
+        check=False,
+        capture_output=True,
+        env={"PATH": isolated_path},
+        text=True,
+    )
+    assert completed.returncode == 0, completed.stderr
+
+
+@pytest.mark.skipif(os.name == "nt", reason="HCU CI wrapper is a Bash entrypoint")
+def test_hcu_python_wrapper_preserves_venv_context(tmp_path: Path) -> None:
+    venv_root = tmp_path / "runtime-venv"
+    venv.EnvBuilder(with_pip=False, symlinks=False).create(venv_root)
+    venv_python = venv_root / "bin" / "python3"
+    purelib = Path(
+        subprocess.check_output(
+            [
+                str(venv_python),
+                "-c",
+                "import sysconfig; print(sysconfig.get_paths()['purelib'])",
+            ],
+            text=True,
+        ).strip()
+    )
+    (purelib / "hcu_ci_venv_marker.py").write_text(
+        "VALUE = 'venv-only'\n",
+        encoding="utf-8",
+    )
+    wrapper = tmp_path / "external-bin" / "hcu-ci-python"
+    helper = REPOSITORY / "scripts/ci/hcu/hcu_ci_create_python_wrapper.sh"
+
+    subprocess.run(
+        ["bash", str(helper), str(venv_python), str(wrapper)],
+        check=True,
+    )
+    completed = subprocess.run(
+        [
+            str(wrapper),
+            "-c",
+            (
+                "import hcu_ci_venv_marker, sys; "
+                "print(sys.prefix); print(hcu_ci_venv_marker.VALUE)"
+            ),
+        ],
+        check=False,
+        capture_output=True,
+        text=True,
+    )
+    assert completed.returncode == 0, completed.stderr
+    assert completed.stdout.splitlines() == [str(venv_root), "venv-only"]
+
+
+@pytest.mark.skipif(os.name == "nt", reason="HCU CI bootstrap is a Bash entrypoint")
+def test_caller_bootstrap_supports_legacy_tested_revision(tmp_path: Path) -> None:
+    legacy_python = tmp_path / "usr/local/bin/python3.10"
+    legacy_python.parent.mkdir(parents=True)
+    shutil.copy2(sys.executable, legacy_python)
+    wrapper = tmp_path / "usr/local/bin/hcu-ci-python"
+    bootstrap = REPOSITORY / "scripts/ci/hcu/hcu_ci_bootstrap_python.sh"
+    creator = REPOSITORY / "scripts/ci/hcu/hcu_ci_create_python_wrapper.sh"
+
+    subprocess.run(
+        [
+            "bash",
+            str(bootstrap),
+            str(wrapper),
+            str(legacy_python),
+            str(creator),
+        ],
+        check=True,
+    )
+    completed = subprocess.run(
+        [str(wrapper), "-c", "import sys; print(sys.version_info[:2])"],
+        check=False,
+        capture_output=True,
+        text=True,
+    )
+    assert completed.returncode == 0, completed.stderr
+    assert completed.stdout.strip() == str(sys.version_info[:2])
+
+
 def test_hcu_control_container_uses_runner_identity() -> None:
     source = (
         REPOSITORY / "scripts/ci/hcu/hcu_ci_run_control_container.sh"
@@ -976,6 +1248,40 @@ def test_unified_aiter_moe_accuracy_test_selects_gfx938() -> None:
     assert groups == ["kernel-accuracy-tests"]
 
 
+@pytest.mark.parametrize("full", [False, True])
+@pytest.mark.parametrize("include_related_paths", [False, True])
+def test_gfx938_indexer_regression_is_selected_and_partitioned(
+    full: bool, include_related_paths: bool,
+) -> None:
+    target = "tests/kernels/test_gfx938_indexer_normal_layout.py"
+    changed_paths = [target]
+    if include_related_paths:
+        changed_paths.extend([
+            "vllm_hcu/v1/attention/ops/rocm_aiter_mla_sparse.py",
+            "tests/runtime_patch/test_indexer_cache_backing_view.py",
+            "tests/runtime_patch/test_lightop_categorized_api.py",
+        ])
+    jobs, _, _ = select_jobs(_config(), changed_paths, full=full)
+    selected_jobs = [
+        job for job in jobs if job["registry_job"] == "accuracy-gfx938"
+    ]
+    assert selected_jobs
+    registrations = [
+        registration for registration in parse_registry()
+        if registration.job == "accuracy-gfx938"
+        and registration.disabled is None
+    ]
+    assigned_targets = [
+        registration.target
+        for job in selected_jobs
+        for registration in partition_registrations(
+            registrations, job["partition_id"], job["partition_size"],
+        )
+    ]
+    assert assigned_targets.count(target) == 1
+    assert _contains_pytest_hcu_marker(REPOSITORY / target)
+
+
 def test_deepseek_runtime_change_selects_deepseek_jobs() -> None:
     jobs, groups, fallback = select_jobs(
         _config(),
@@ -987,6 +1293,28 @@ def test_deepseek_runtime_change_selects_deepseek_jobs() -> None:
     }
     assert "deepseek-runtime" in groups
     assert fallback is False
+
+
+def test_gpu_memory_helper_selects_all_enabled_model_jobs() -> None:
+    config = _config()
+    selected, groups, fallback = select_jobs(
+        config, ["tests/integration/gpu_memory.py"],
+    )
+    selected_jobs = {job["registry_job"] for job in selected}
+    expected = {
+        job_id for job_id, job in config["jobs"].items()
+        if (job["suite"] == "model" or job_id == "integration-smoke-gfx938")
+        and job_id in _enabled_registry_jobs()
+    }
+    assert selected_jobs == expected
+    assert groups == ["gpu-memory-helper"]
+    assert fallback is False
+    assert selected_jobs.isdisjoint({
+        "qwen38-flash-next-humaneval",
+        "qwen38-flash-next-int8-pp2-tp4-humaneval",
+        "glm53-flash-channel-fp8-humaneval",
+        "kimi-k25-humaneval",
+    })
 
 
 def test_model_runtime_change_selects_text_vl_and_pooling_models() -> None:
@@ -1053,10 +1381,17 @@ def test_kernel_accuracy_change_runs_both_supported_architectures() -> None:
     assert fallback is False
 
 
-def test_hcu_container_script_change_selects_ci_smoke() -> None:
+@pytest.mark.parametrize(
+    "changed_path",
+    [
+        "scripts/ci/hcu/hcu_ci_start_container.sh",
+        ".github/configs/hcu-test-map.json",
+    ],
+)
+def test_ci_preparation_change_selects_ci_smoke(changed_path: str) -> None:
     jobs, groups, fallback = select_jobs(
         _config(),
-        ["scripts/ci/hcu/hcu_ci_start_container.sh"],
+        [changed_path],
     )
     assert {job["registry_job"] for job in jobs} == {
         "accuracy-gfx936",
@@ -1234,3 +1569,105 @@ def test_preflight_hides_device_inspection_details(
 
     assert error.value.__suppress_context__ is True
     assert private_link_name not in str(error.value)
+
+
+def test_dataset_preflight_searches_dataset_roots(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    roots = [tmp_path / "public", tmp_path / "parastor"]
+    source = roots[1] / "gsm8k/main"
+    source.mkdir(parents=True)
+    (source / "test-00000-of-00001.parquet").write_bytes(b"parquet")
+    monkeypatch.setenv("VLLM_HCU_TEST_DATASET_ROOTS", os.pathsep.join(map(str, roots)))
+    monkeypatch.delenv("VLLM_HCU_GSM8K_DATASET", raising=False)
+    requirement = {"kind": "dataset", "env": "VLLM_HCU_GSM8K_DATASET", "relative": "gsm8k"}
+    assert _check_requirements([requirement], tmp_path / "models") == [
+        {"env": requirement["env"], "kind": "dataset", "path": str(source.parent)}
+    ]
+
+
+def test_dataset_preflight_rejects_empty_directory(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    source = tmp_path / "gsm8k"
+    source.mkdir()
+    monkeypatch.setenv("VLLM_HCU_TEST_DATASET_ROOT", str(tmp_path))
+    monkeypatch.delenv("VLLM_HCU_TEST_DATASET_ROOTS", raising=False)
+    monkeypatch.delenv("VLLM_HCU_GSM8K_DATASET", raising=False)
+    with pytest.raises(PreflightError, match="local dataset is unavailable"):
+        _check_requirements(
+            [{"kind": "dataset", "env": "VLLM_HCU_GSM8K_DATASET", "relative": "gsm8k"}], None
+        )
+
+
+def test_humaneval_jobs_request_isolated_containers() -> None:
+    human_jobs = [
+        job for name, job in _config()["jobs"].items() if "humaneval" in name
+    ]
+    assert human_jobs
+    assert all(job["isolate_generated_code"] is True for job in human_jobs)
+    assert all(
+        any(item.get("env") == "VLLM_HCU_HUMANEVAL_DATASET" for item in job["requirements"])
+        for job in human_jobs
+    )
+
+
+def test_temporarily_disabled_model_jobs_are_not_scheduled() -> None:
+    disabled_jobs = {
+        "kimi-k25-humaneval",
+        "qwen38-flash-next-humaneval",
+        "qwen38-flash-next-int8-pp2-tp4-humaneval",
+        "glm53-flash-channel-fp8-humaneval",
+    }
+    config = _config()
+    registrations = parse_registry()
+    for job in disabled_jobs:
+        entries = [entry for entry in registrations if entry.job == job]
+        assert entries
+        assert all(entry.disabled and "temporarily disabled" in entry.disabled for entry in entries)
+    nightly = build_matrix(config, profile="nightly")
+    assert disabled_jobs.isdisjoint({job["registry_job"] for job in nightly})
+    selected, _, _ = select_jobs(config, ["tests/integration/server/evalscope_server.py"])
+    assert disabled_jobs.isdisjoint({job["registry_job"] for job in selected})
+    assert "kimi-k25-humaneval" not in {job["registry_job"] for job in selected}
+
+
+@pytest.mark.parametrize("version", ["v1", "v2"])
+def test_pid_controller_snapshot_records_thread_limits_and_events(tmp_path: Path, version: str) -> None:
+    missing = tmp_path / "unavailable"
+    root = tmp_path / version
+    root.mkdir()
+    for name, value in {
+        "pids.max": "8192", "pids.current": "2305", "pids.events": "max 0"
+    }.items():
+        (root / name).write_text(value + "\n")
+    if version == "v2":
+        (root / "pids.peak").write_text("2306\n")
+    actual = _pid_cgroup_snapshot((missing, root))
+    assert actual == {
+        "path": str(root), "pids.max": "8192", "pids.current": "2305",
+        "pids.events": "max 0", "pids.peak": "2306" if version == "v2" else None,
+    }
+
+
+def test_pid_controller_snapshot_handles_missing_controller(tmp_path: Path) -> None:
+    assert _pid_cgroup_snapshot((tmp_path,)) == {"path": None}
+
+
+@pytest.mark.parametrize("value", ["0", "-1", "not-a-number", "8192; echo invalid"])
+def test_ci_container_rejects_invalid_pid_limit_before_docker(
+    tmp_path: Path, value: str
+) -> None:
+    env = os.environ.copy()
+    env.update(
+        HCU_CI_IMAGE="example.invalid/vllm@sha256:" + "0" * 64,
+        HCU_CI_CONTAINER_NAME="ci-pids-validation",
+        GITHUB_WORKSPACE=str(tmp_path),
+        HCU_CI_PIDS_LIMIT=value,
+    )
+    result = subprocess.run(
+        ["bash", str(REPOSITORY / "scripts/ci/hcu/hcu_ci_start_container.sh")],
+        env=env, text=True, capture_output=True,
+    )
+    assert result.returncode == 2
+    assert "HCU_CI_PIDS_LIMIT must be a positive integer" in result.stderr

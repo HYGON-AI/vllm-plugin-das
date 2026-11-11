@@ -527,6 +527,8 @@ def _cp_gather_indexer_k_bf16_cache_kernel(
     num_tokens: tl.constexpr,
     BLOCK_TILE_SIZE: tl.constexpr,
     HEAD_TILE_SIZE: tl.constexpr,
+    block_table_stride0: tl.constexpr,
+    block_table_stride1: tl.constexpr,
 ):
     """
     Triton 核函数 BF16 K Cache 收集
@@ -572,7 +574,9 @@ def _cp_gather_indexer_k_bf16_cache_kernel(
         return
     
     # 计算 block_table 中的内存偏移并加载 block ID
-    block_table_offset = batch_idx * num_blocks_per_seq + block_table_id
+    block_table_offset = (
+        batch_idx * block_table_stride0 + block_table_id * block_table_stride1
+    )
     block_id = tl.load(block_table_ptr + block_table_offset)
     
     # 计算 token 在 block 内的偏移
@@ -582,7 +586,9 @@ def _cp_gather_indexer_k_bf16_cache_kernel(
     # 计算内存偏移
     # --------------------------
     # KV Cache 源偏移：block_id * 块步长 + 块内偏移 * head_dim
-    src_block_offset = block_id * kv_cache_stride
+    # Physical cache pages may be separated by all layers in a shared
+    # allocation. Promote before multiplying to avoid int32 address overflow.
+    src_block_offset = block_id.to(tl.int64) * kv_cache_stride
     src_inblock_offset = src_block_offset + block_offset * head_dim
     
     # 输出张量目标偏移
@@ -644,6 +650,8 @@ def cp_gather_indexer_k_bf16_cache_triton(
         num_tokens,
         block_tile_size,
         head_tile_size,
+        block_table.stride(0),
+        block_table.stride(1),
     )
     
 # Taken from https://github.com/deepseek-ai/DeepGEMM/blob/main/tests/test_attention.py#L156
@@ -763,6 +771,140 @@ def _paged_mqa_cache_kernel_view(kv_cache_fp8: torch.Tensor) -> torch.Tensor:
     return kv_cache_fp8
 
 
+_BOLTOPS_PAGED_MQA_CONTRACT = (
+    ("q_fp8", Parameter.POSITIONAL_OR_KEYWORD, Parameter.empty),
+    ("kv_cache", Parameter.POSITIONAL_OR_KEYWORD, Parameter.empty),
+    ("weights", Parameter.POSITIONAL_OR_KEYWORD, Parameter.empty),
+    ("out_logits", Parameter.POSITIONAL_OR_KEYWORD, Parameter.empty),
+    ("context_lens", Parameter.POSITIONAL_OR_KEYWORD, Parameter.empty),
+    ("kv_indices", Parameter.POSITIONAL_OR_KEYWORD, Parameter.empty),
+    ("max_model_len", Parameter.POSITIONAL_OR_KEYWORD, Parameter.empty),
+    ("kv_block_size", Parameter.KEYWORD_ONLY, 1),
+    ("preshuffle", Parameter.KEYWORD_ONLY, False),
+    ("chunk_k", Parameter.KEYWORD_ONLY, None),
+    ("total_cu_count", Parameter.KEYWORD_ONLY, None),
+    ("split_kv", Parameter.KEYWORD_ONLY, None),
+    ("waves_per_eu", Parameter.KEYWORD_ONLY, None),
+    ("num_warps", Parameter.KEYWORD_ONLY, None),
+    ("num_stages", Parameter.KEYWORD_ONLY, None),
+    ("use_bucket", Parameter.KEYWORD_ONLY, False),
+    ("bucket_tokens", Parameter.KEYWORD_ONLY, 2048),
+    ("bucket_schedule", Parameter.KEYWORD_ONLY, None),
+    ("batch_info", Parameter.KEYWORD_ONLY, None),
+    ("fuse_output_init", Parameter.KEYWORD_ONLY, False),
+)
+
+
+@functools.lru_cache
+def _load_boltops_paged_mqa_logits():
+    """Resolve the audited public BoltOps sparse-indexer decode entry point."""
+    try:
+        module = importlib.import_module("boltops.mqa_logits")
+    except ModuleNotFoundError as exc:
+        if exc.name in {"boltops", "boltops.mqa_logits"}:
+            return None
+        raise
+    except (ImportError, OSError) as exc:
+        raise RuntimeError(
+            "Failed to import the installed BoltOps sparse decode backend"
+        ) from exc
+
+    kernel = getattr(module, "triton_fp8_paged_mqa_logits", None)
+    if not callable(kernel):
+        raise RuntimeError(
+            "boltops.mqa_logits.triton_fp8_paged_mqa_logits is unavailable "
+            "in the installed BoltOps package"
+        )
+    try:
+        parameters = signature(kernel).parameters
+    except (TypeError, ValueError) as exc:
+        raise RuntimeError(
+            "boltops.mqa_logits.triton_fp8_paged_mqa_logits signature "
+            "drifted from the audited BoltOps 0.1.0 contract"
+        ) from exc
+    actual_contract = tuple(
+        (name, parameter.kind, parameter.default)
+        for name, parameter in parameters.items()
+    )
+    if actual_contract != _BOLTOPS_PAGED_MQA_CONTRACT:
+        raise RuntimeError(
+            "boltops.mqa_logits.triton_fp8_paged_mqa_logits signature "
+            "drifted from the audited BoltOps 0.1.0 contract"
+        )
+    return kernel
+
+
+def _boltops_paged_mqa_inputs(
+    q_fp8: torch.Tensor,
+    context_lens: torch.Tensor,
+    block_tables: torch.Tensor,
+    batch_size: int,
+    next_n: int,
+) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+    """Adapt exact per-query KPool ends without losing MTP row semantics."""
+    if context_lens.shape == (batch_size,):
+        return q_fp8, context_lens, block_tables
+    if context_lens.shape == (batch_size, next_n):
+        return (
+            q_fp8.reshape(batch_size * next_n, 1, *q_fp8.shape[2:]),
+            context_lens.reshape(batch_size * next_n).contiguous(),
+            block_tables.repeat_interleave(next_n, dim=0),
+        )
+    raise ValueError(
+        "BoltOps paged-MQA requires context_lens shaped [batch] or "
+        f"[batch, next_n], got {tuple(context_lens.shape)}"
+    )
+
+
+def _lightop_paged_mqa_inputs(
+    q_fp8: torch.Tensor,
+    context_lens: torch.Tensor,
+    block_tables: torch.Tensor,
+    batch_size: int,
+    next_n: int,
+) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+    """Give each LightOp MTP query its exact causal KPool end."""
+    if next_n == 1:
+        if context_lens.shape not in {(batch_size,), (batch_size, 1)}:
+            raise ValueError(
+                "LightOp paged-MQA requires context_lens shaped [batch] or "
+                f"[batch, next_n], got {tuple(context_lens.shape)}"
+            )
+        return q_fp8, context_lens.reshape(batch_size).contiguous(), block_tables
+    if context_lens.shape == (batch_size,):
+        offsets = torch.arange(
+            next_n,
+            dtype=context_lens.dtype,
+            device=context_lens.device,
+        )
+        context_lens = (
+            context_lens[:, None] - next_n + 1 + offsets
+        ).clamp_min(0)
+    elif context_lens.shape != (batch_size, next_n):
+        raise ValueError(
+            "LightOp paged-MQA requires context_lens shaped [batch] or "
+            f"[batch, next_n], got {tuple(context_lens.shape)}"
+        )
+    return (
+        q_fp8.reshape(batch_size * next_n, 1, *q_fp8.shape[2:]),
+        context_lens.reshape(batch_size * next_n).contiguous(),
+        block_tables.repeat_interleave(next_n, dim=0),
+    )
+
+
+def _is_boltops_packed_paged_mqa_layout(
+    q: torch.Tensor,
+    kv_cache: torch.Tensor,
+) -> bool:
+    """Return whether BoltOps can interpret the query and packed K-cache."""
+    return (
+        q.dtype.is_floating_point
+        and q.element_size() == 1
+        and kv_cache.element_size() == 1
+        and kv_cache.shape[-1] == q.shape[-1] + 4
+    )
+
+
 def rocm_fp8_paged_mqa_logits(
     q_fp8: torch.Tensor,
     kv_cache_fp8: torch.Tensor,
@@ -774,6 +916,7 @@ def rocm_fp8_paged_mqa_logits(
     *,
     force_aiter_triton: bool = False,
     kcache_layout: str = "preshuffle",
+    clean_logits: bool = True,
 ) -> torch.Tensor:
     """Compute FP8 MQA logits using paged KV-cache.
 
@@ -795,6 +938,8 @@ def rocm_fp8_paged_mqa_logits(
         kcache_layout: Page layout of gfx938 caches with block_size > 1:
             "preshuffle" (16x16 tiles) or "normal" (token-major). "normal"
             is rejected on other platforms.
+        clean_logits: Whether positions past each row's context end must be
+            -inf.  Only the gfx938 direct reader honors False.
 
     Returns:
         Logits tensor of shape [B * next_n, max_model_len], dtype
@@ -815,9 +960,66 @@ def rocm_fp8_paged_mqa_logits(
 
     if is_gfx938 and block_size not in (1, 16, 32, 64):
         raise ValueError(f"Unsupported preshuffled KPool page size: {block_size}")
-    use_aiter = force_aiter_triton or rocm_aiter_ops.is_enabled()
+    boltops_row_major = not (
+        is_gfx938 and block_size != 1 and kcache_layout == "preshuffle"
+    )
+    boltops_packed_layout = _is_boltops_packed_paged_mqa_layout(
+        q_fp8, kv_cache_fp8
+    )
+    if (
+        not henvs.custom_ops_enabled()
+        and boltops_row_major
+        and boltops_packed_layout
+        and block_size in (1, 64)
+    ):
+        boltops_paged_mqa_logits = _load_boltops_paged_mqa_logits()
+        if boltops_paged_mqa_logits is not None:
+            (
+                kernel_q_fp8,
+                kernel_context_lens,
+                kernel_block_tables,
+            ) = _boltops_paged_mqa_inputs(
+                q_fp8, context_lens, block_tables, batch_size, next_n
+            )
+            fuse_output_init = block_size == 64
+            output_factory = torch.empty if fuse_output_init else torch.full
+            output_args = (
+                ((batch_size * next_n, max_model_len),)
+                if fuse_output_init
+                else ((batch_size * next_n, max_model_len), float("-inf"))
+            )
+            out_logits = output_factory(
+                *output_args,
+                device=q_fp8.device,
+                dtype=torch.float32,
+            )
+            logger.info_once(
+                "VLLM_HCU_USE_CUSTOM_OPS=0: using BoltOps Triton "
+                "sparse-indexer decode paged-MQA"
+            )
+            return boltops_paged_mqa_logits(
+                kernel_q_fp8,
+                kv_cache_fp8,
+                weights.float().contiguous(),
+                out_logits,
+                kernel_context_lens,
+                kernel_block_tables,
+                max_model_len,
+                kv_block_size=block_size,
+                preshuffle=False,
+                fuse_output_init=fuse_output_init,
+            )
+        logger.warning_once(
+            "VLLM_HCU_USE_CUSTOM_OPS=0: BoltOps paged MQA is unavailable; "
+            "using the existing sparse-indexer decode backend"
+        )
+    custom_ops_enabled = henvs.custom_ops_enabled()
+    effective_force_aiter = custom_ops_enabled and force_aiter_triton
+    use_aiter = effective_force_aiter or (
+        custom_ops_enabled and rocm_aiter_ops.is_enabled()
+    )
     if is_gfx938 and block_size != 1:
-        if force_aiter_triton:
+        if effective_force_aiter:
             raise RuntimeError(
                 "AITER paged-MQA does not support gfx938 preshuffled KPool pages"
             )
@@ -825,17 +1027,13 @@ def rocm_fp8_paged_mqa_logits(
             # LightOp paged_mqa_logits reads token-major pages only. It
             # rejects next_n > 2 and ignores per-query [B, next_n] lengths,
             # so each MTP verify token becomes its own batch row.
-            if next_n > 1:
-                if context_lens.ndim == 1:
-                    offsets = torch.arange(
-                        next_n, dtype=context_lens.dtype, device=context_lens.device
-                    )
-                    context_lens = (
-                        context_lens[:, None] - next_n + 1 + offsets
-                    ).clamp_min(0)
-                q_fp8 = q_fp8.reshape(batch_size * next_n, 1, *q_fp8.shape[2:])
-                block_tables = block_tables.repeat_interleave(next_n, dim=0)
-            context_lens = context_lens.reshape(batch_size * next_n).contiguous()
+            q_fp8, context_lens, block_tables = _lightop_paged_mqa_inputs(
+                q_fp8,
+                context_lens,
+                block_tables,
+                batch_size,
+                next_n,
+            )
             return _get_lightop_attention().paged_mqa_logits(
                 q_fp8,
                 kv_cache_fp8,
@@ -853,12 +1051,13 @@ def rocm_fp8_paged_mqa_logits(
             context_lens,
             block_tables,
             max_model_len,
+            fill_tail=clean_logits,
         )
 
     aiter_paged_mqa_logits_module = None
     if use_aiter:
         aiter_paged_mqa_logits_module = paged_mqa_logits_module()
-    if force_aiter_triton and aiter_paged_mqa_logits_module is None:
+    if effective_force_aiter and aiter_paged_mqa_logits_module is None:
         raise RuntimeError(
             "HCU GLM5Next sparse decode requires the packaged AITER "
             "pa_mqa_logits Triton module"
@@ -917,6 +1116,13 @@ def rocm_fp8_paged_mqa_logits(
             q_fp8, kv_cache_fp8, weights, context_lens, block_tables, max_model_len
         )
     elif current_platform.is_rocm():
+        q_fp8, context_lens, block_tables = _lightop_paged_mqa_inputs(
+            q_fp8,
+            context_lens,
+            block_tables,
+            batch_size,
+            next_n,
+        )
         return _get_lightop_attention().paged_mqa_logits(
             q_fp8, 
             kv_cache_fp8, 
@@ -1347,7 +1553,17 @@ def _lightop_topk_indices_decode(
     topk_tokens: int,
 ) -> None:
     row_ends = _decode_row_ends_from_seq_lens(seq_lens, next_n, logits.shape[0])
-    _get_lightop_attention().top_k_per_row_decode(
+    attention = _get_lightop_attention()
+    if topk_tokens == 2048:
+        row_ends = row_ends.to(device=logits.device, dtype=torch.int32).contiguous()
+        row_starts = torch.zeros_like(row_ends)
+        selected = attention.fast_topk_transform_ragged_fused(
+            logits.contiguous(), row_ends, row_starts, topk_tokens,
+            row_starts=row_starts,
+        )
+        topk_indices.copy_(selected)
+        return
+    attention.top_k_per_row_decode(
         logits,
         1,
         row_ends.to(device=logits.device, dtype=torch.int32),
@@ -1402,6 +1618,12 @@ def rocm_aiter_sparse_attn_indexer_fake(
         dtype=scratch_dtype,
         device=scratch_device,
     )
+    if topk_tokens == 2048 and _use_lightop_sparse_mla_topk():
+        _selected_topk = torch.empty(
+            (hidden_states.shape[0], topk_tokens),
+            dtype=torch.int32,
+            device=scratch_device,
+        )
     return topk_indices_buffer
 
 
@@ -1750,6 +1972,11 @@ def rocm_aiter_sparse_attn_indexer_native(
             decode_metadata.block_table,
             decode_metadata.schedule_metadata,
             max_model_len=max_model_len,
+            # Both decode top-k selectors bound each row by its end.  The DCP
+            # merge gathers scores only at those selected indices, so no
+            # decode consumer reads the unwritten tail.
+            clean_logits=False,
+            kcache_layout="normal" if on_gfx938() else "preshuffle",
         )
 
         # A padded decode batch has more kernel rows than actual decode

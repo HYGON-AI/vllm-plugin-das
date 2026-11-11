@@ -59,3 +59,10 @@ void deepseek_v4_inv_rope(torch::Tensor& rope,
                           torch::Tensor const& cos_sin_cache);
 
 torch::Tensor sigmoid_mul_hcu(torch::Tensor gate, torch::Tensor value);
+// Measured Step5 FP8 choices, built into the normal hcu_ops extension.
+#ifdef VLLM_HCU_BUILD_STEP5_DENSE
+at::Tensor step5_fp8_dense_gemm(const at::Tensor& x, const at::Tensor& xs,
+                              const at::Tensor& w, const at::Tensor& ws,
+                              int64_t algorithm_id, bool allow_initialize);
+std::string step5_fp8_dense_backend_library();
+#endif
