@@ -22,6 +22,7 @@ das_hcu_slimquant = "hcu_vllm_das.slimquant_activation:extension_spec"
 das_hcu_aiter_int8 = "hcu_vllm_das.int8_activation:extension_spec"
 das_hcu_dsv41 = "hcu_vllm_das.dsv41_activation:extension_spec"
 das_hcu_ct_w4a8 = "hcu_vllm_das.ct_w4a8_activation:extension_spec"
+das_hcu_v41_pcp = "hcu_vllm_das.v41_pcp_activation:extension_spec"
 
 [tool.setuptools.packages.find]
 where = ["src"]
