@@ -27,8 +27,8 @@ def validate_config(cfg):
                 p.prefill_context_parallel_size, p.decode_context_parallel_size) != (1, 1, 1, 8, 1)
             or not p.enable_expert_parallel):
         raise ValueError("V4.1 PCP MegaMoE requires TP1/DP1/PP1/PCP8/DCP1/EP8")
-    if cfg.kernel_config.moe_backend != "deep_gemm_mega_moe":
-        raise ValueError("V4.1 PCP requires deep_gemm_mega_moe in this adapter")
+    if cfg.kernel_config.moe_backend not in ("deep_gemm_mega_moe", "deep_gemm"):
+        raise ValueError("V4.1 PCP requires deep_gemm_mega_moe or deep_gemm in this adapter")
     if not cfg.model_config.enforce_eager or not cfg.use_v2_model_runner:
         raise ValueError("V4.1 PCP MegaMoE requires eager model runner V2")
     if (cfg.speculative_config is not None or p.enable_eplb or p.enable_dbo

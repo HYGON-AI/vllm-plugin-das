@@ -1,5 +1,5 @@
 # SPDX-License-Identifier: Apache-2.0
-"""Reuse Core's ROCm indexer with a SHUFFLE-aware HCU decode callback."""
+"""Reuse Core ROCm scoring with bounded prefill scratch and HCU SHUFFLE decode."""
 import inspect
 from types import FunctionType
 
@@ -38,9 +38,30 @@ def decode_logits(q, cache, weights, context_lens, block_tables, schedule_metada
 
 
 
+# Core's Torch fallback materializes [heads, queries, keys] intermediates;
+# its outer logits budget only accounts for the reduced [queries, keys] result.
+_PREFILL_SCORE_WORKSPACE_BYTES = 256 * 1024 * 1024
+
+
+def prefill_logits(q, kv, weights, cu_seqlen_ks, cu_seqlen_ke):
+    rows, heads = q.shape[:2]
+    keys = kv[0].shape[0]
+    chunk_rows = max(1, _PREFILL_SCORE_WORKSPACE_BYTES // max(1, heads * keys * 4))
+    if rows <= chunk_rows:
+        return native.rocm_fp8_mqa_logits(q, kv, weights, cu_seqlen_ks, cu_seqlen_ke)
+    logits = torch.empty((rows, keys), dtype=torch.float32, device=q.device)
+    for start in range(0, rows, chunk_rows):
+        end = min(start + chunk_rows, rows)
+        logits[start:end].copy_(native.rocm_fp8_mqa_logits(
+            q[start:end], kv, weights[start:end],
+            cu_seqlen_ks[start:end], cu_seqlen_ke[start:end]))
+    return logits
+
+
 def _native_indexer():
     function = inspect.unwrap(native.rocm_aiter_sparse_attn_indexer)
-    namespace = dict(function.__globals__, rocm_fp8_paged_mqa_logits=decode_logits)
+    namespace = dict(function.__globals__, rocm_fp8_paged_mqa_logits=decode_logits,
+                     rocm_fp8_mqa_logits=prefill_logits)
     return FunctionType(function.__code__, namespace, function.__name__,
                         function.__defaults__, function.__closure__)
 

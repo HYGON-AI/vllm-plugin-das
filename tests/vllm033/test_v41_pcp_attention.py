@@ -26,10 +26,13 @@ def config():
 def test_only_target_combination_is_admitted():
     cfg = config()
     assert bridge.validate_config(cfg)
+    cfg.kernel_config.moe_backend = "deep_gemm"
+    assert bridge.validate_config(cfg)
+    cfg.kernel_config.moe_backend = "deep_gemm_mega_moe"
     for owner, field, value in [(cfg, "speculative_config", object()),
         (cfg.parallel_config, "prefill_context_parallel_size", 1),
         (cfg.parallel_config, "enable_eplb", True),
-        (cfg.kernel_config, "moe_backend", "deep_gemm")]:
+        (cfg.kernel_config, "moe_backend", "triton")]:
         previous = getattr(owner, field)
         setattr(owner, field, value)
         with pytest.raises(ValueError):

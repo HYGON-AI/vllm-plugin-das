@@ -76,7 +76,9 @@ def test_reuse_native_indexer_without_changing_core_globals():
     assert candidate._indexer.__code__ is core.__code__
     assert candidate._indexer.__globals__["rocm_fp8_paged_mqa_logits"] is candidate.decode_logits
     assert core.__globals__["rocm_fp8_paged_mqa_logits"] is candidate.native.rocm_fp8_paged_mqa_logits
-    for name in ["rocm_fp8_mqa_logits", "cp_gather_indexer_k_quant_cache_triton",
+    assert candidate._indexer.__globals__["rocm_fp8_mqa_logits"] is candidate.prefill_logits
+    assert core.__globals__["rocm_fp8_mqa_logits"] is candidate.native.rocm_fp8_mqa_logits
+    for name in ["cp_gather_indexer_k_quant_cache_triton",
                  "current_workspace_manager"]:
         assert candidate._indexer.__globals__[name] is core.__globals__[name]
 
@@ -116,3 +118,31 @@ def test_execute_core_decode_with_owned_score_callback(monkeypatch):
     torch.testing.assert_close(calls[0], expected, atol=0, rtol=0)
     assert torch.equal(cache, before) and (output == 7).all()
     assert not torch.cuda.is_initialized()
+
+
+@pytest.mark.parametrize("scale_column", [False, True])
+def test_prefill_chunking_preserves_core_scores_and_masks(monkeypatch, scale_column):
+    generator = torch.Generator().manual_seed(42)
+    rows, heads, keys, dim = 7, 3, 11, 16
+    q = torch.randint(-3, 4, (rows, heads, dim), generator=generator).to(rocm.FP8_DTYPE)
+    k = torch.randint(-3, 4, (keys, dim), generator=generator).to(rocm.FP8_DTYPE)
+    scales = torch.rand(keys, generator=generator) + .1
+    if scale_column:
+        scales = scales[:, None]
+    weights = torch.rand(rows, heads, generator=generator)
+    starts = torch.tensor([0, 1, 2, 0, 4, 3, 8], dtype=torch.int32)
+    ends = torch.tensor([1, 4, 7, 9, 11, 6, 8], dtype=torch.int32)
+    expected = rocm.fp8_mqa_logits_torch(q, (k, scales), weights, starts, ends)
+    calls = []
+    def core(q_slice, kv, w_slice, lo, hi):
+        calls.append(q_slice.shape[0])
+        return rocm.fp8_mqa_logits_torch(q_slice, kv, w_slice, lo, hi)
+    monkeypatch.setattr(candidate.native, "rocm_fp8_mqa_logits", core)
+    monkeypatch.setattr(candidate, "_PREFILL_SCORE_WORKSPACE_BYTES", 2 * heads * keys * 4)
+    actual = candidate.prefill_logits(q, (k, scales), weights, starts, ends)
+    assert calls == [2, 2, 2, 1]
+    torch.testing.assert_close(actual, expected, rtol=0, atol=0)
+    calls.clear()
+    monkeypatch.setattr(candidate, "_PREFILL_SCORE_WORKSPACE_BYTES", rows * heads * keys * 4)
+    torch.testing.assert_close(candidate.prefill_logits(q, (k, scales), weights, starts, ends), expected)
+    assert calls == [rows]

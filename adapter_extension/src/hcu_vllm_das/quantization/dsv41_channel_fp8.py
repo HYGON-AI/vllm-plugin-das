@@ -155,10 +155,15 @@ class HcuDSV41ChannelFP8Config(DeepseekV4FP8Config):
                 return HcuDSV41ChannelFP8LinearMethod(channel_config)
             return method
         if isinstance(layer, RoutedExperts):
-            if layer.moe_config.moe_backend != "deep_gemm_mega_moe":
-                raise ValueError("HCU V4.1 PCP requires deep_gemm_mega_moe")
+            if layer.moe_config.moe_backend not in ("deep_gemm_mega_moe", "deep_gemm"):
+                raise ValueError("HCU V4.1 PCP requires deep_gemm_mega_moe or deep_gemm")
             from ..moe.v41_megamoe import HcuV41MegaMoEMethod
+            if layer.moe_config.moe_backend == "deep_gemm":
+                from ..moe.v41_deepgemm import HcuV41DeepGemmMethod
+                method_cls = HcuV41DeepGemmMethod
+            else:
+                method_cls = HcuV41MegaMoEMethod
             scheme = self._channel_config().target_scheme_map["Linear"]
-            return HcuV41MegaMoEMethod(scheme["weights"], scheme["input_activations"],
+            return method_cls(scheme["weights"], scheme["input_activations"],
                                      layer.moe_config, prefix)
         return super().get_quant_method(layer, prefix)

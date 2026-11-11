@@ -64,7 +64,7 @@ def test_channel_schema_is_scoped_to_hcu_v41_pcp(registered, monkeypatch):
 
 
 def test_native_policy_and_mega_dispatch(registered, monkeypatch):
-    from hcu_vllm_das.moe import v41_megamoe
+    from hcu_vllm_das.moe import v41_megamoe, v41_deepgemm
     from vllm.model_executor.layers.fused_moe import RoutedExperts
     before = dict(SCHEMA)
     config = quant.HcuDSV41ChannelFP8Config.from_config(SCHEMA)
@@ -83,6 +83,9 @@ def test_native_policy_and_mega_dispatch(registered, monkeypatch):
     assert calls[0][1].strategy == "token"
     assert calls[0][2] is obj.moe_config
     obj.moe_config.moe_backend = "deep_gemm"
+    monkeypatch.setattr(v41_deepgemm, "HcuV41DeepGemmMethod", lambda *args: "deepgemm")
+    assert config.get_quant_method(obj, "model.layers.0.ffn.experts") == "deepgemm"
+    obj.moe_config.moe_backend = "triton"
     with pytest.raises(ValueError, match="requires deep_gemm_mega_moe"):
         config.get_quant_method(obj, "model.layers.0.ffn.experts")
 
