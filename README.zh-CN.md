@@ -14,14 +14,18 @@
 不等于 native ABI、算子或模型验收通过。
 
 - vLLM 负责官方模型、调度、分配与执行接口。
-- Adapter（分发名 `sgl-kernel`，包名 `hcu_adapter`）负责真实 HCU 身份、
+- Adapter（宿主分发名 `hcu-adapter`、内核分发名 `sgl-kernel`，
+  包名 `hcu_adapter`）负责真实 HCU 身份、
   runtime 准入、平台/通用插件入口和进程健康。
-- 本 Plugin 经 `hcu_adapter.extensions` 注册可选 RMSNorm 和显式
-  FlashAttention provider。INT8 模型路由沿用官方实现，历史 AITER INT8
-  原型不作为已注册的模型能力；各有效能力独立检查前置条件与验收门槛。
+- 本 Plugin 经 `hcu_adapter.extensions` 提供可选 RMSNorm、显式
+  FlashAttention、SlimQuant 和显式 INT8 ASM 候选。模型路由、CT 权重加载
+  和通用后端构造沿用官方实现；各能力分别检查前置条件与验收门槛，
+  INT8 候选不代表通用模型或拓扑支持。
 
-仓库根目录的 `vllm_hcu` 和 `setup.py` 保留为 vLLM 0.28.1 历史开发参考。
-部署本发布线时，不要在仓库根目录执行 `pip install .`。
+Plugin 分发版本统一为 `0.33.0`，与 vLLM 发布线对应。仓库根目录的
+`vllm_hcu` 源码保留为 vLLM 0.28.1 历史开发参考；根目录 `setup.py`
+会在导入 Torch 前拒绝构建并提示使用 `./adapter_extension`，避免本分支
+误产出旧 wheel。历史构建应使用对应的原发布分支。
 
 ## 构建与安装
 
@@ -32,7 +36,7 @@
 python3 -m pip wheel --no-deps --no-build-isolation \
   --wheel-dir ./dist ./adapter_extension
 python3 -m pip install --no-deps /wheels/vllm-0.33.0+*.whl
-python3 -m pip install --no-deps /wheels/sgl_kernel-*.whl
+python3 -m pip install --no-deps /wheels/sgl_kernel-*.whl /wheels/hcu_adapter-*.whl
 python3 -m pip install --no-deps ./dist/hcu_vllm_das_plugin-*.whl
 ```
 

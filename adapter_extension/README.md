@@ -9,7 +9,7 @@ activation dependencies are independent of the optional RMS provider.
 lifecycle; this wheel contributes optional, independently removable operator
 optimizations through the adapter extension API.
 
-Version `0.3.0.dev0` targets the `v0.33.0` branch. Migration status and current
+Version `0.33.0` targets the `v0.33.0` branch. Migration status and current
 evidence are recorded in [v0.33 validation](../docs/validation/vllm033-upgrade.md);
 the v0.32 documents below are historical evidence and do not certify v0.33.
 Separate extensions provide default-OFF RMSNorm, HCU FlashAttention, SlimQuant
@@ -37,14 +37,14 @@ operator-level capabilities.
   development, patch, and local version suffixes are accepted when the
   required operator APIs and LightOp capabilities are present. FLASH_ATTN uses
   the official public backend registry and AttentionImpl contract.
-- Adapter host distribution: `hcu-adapter>=0.5.22`, extension API v1 with
+- Adapter host distribution: `hcu-adapter>=0.1.0`, extension API v1 with
   process health checks from `hcu_adapter.extensions`.
 - Runtime: a prepared HCU PyTorch/DTK/LightOp/AITER stack. LightOp and AITER
   are intentionally not fetched by pip because production deployments must
   use ABI-matched local builds.
 - The plugin does not own `vllm.platform_plugins` or `vllm.general_plugins`.
 
-The repository root remains the vLLM 0.28.1 development reference. Build only
+The repository-root legacy build is disabled on this branch. Build only
 this directory for vLLM 0.33:
 
 ```bash
@@ -102,7 +102,7 @@ The architecture candidate admits exact gfx936 and gfx938 identities, with
 raw symmetric per-channel INT8 expert weights,
 dynamic per-token INT8 activations, BF16/FP16 inputs, gated SiLU and ordinary TP.
 The gfx938 component/model gates are separate from the existing gfx936 results.
-On gfx936 only, the isolated EP2 candidate additionally admits static TP-only expert parallelism
+On gfx936 and gfx938, the isolated EP2 candidate additionally admits static TP-only expert parallelism
 with BF16 inputs, global256/local128 experts, hidden2048/intermediate512/top8.
 On gfx936, the public factory/CT loader/runner component has passed a controlled two-rank
 fixture, including shared output, reload and changed-input Graph replay. The real
