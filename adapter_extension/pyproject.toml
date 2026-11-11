@@ -24,6 +24,7 @@ das_hcu_dsv41 = "hcu_vllm_das.dsv41_activation:extension_spec"
 das_hcu_ct_w4a8 = "hcu_vllm_das.ct_w4a8_activation:extension_spec"
 das_hcu_v41_indexer = "hcu_vllm_das.v41_indexer_activation:extension_spec"
 das_hcu_v41_pcp = "hcu_vllm_das.v41_pcp_activation:extension_spec"
+das_hcu_fp4_packer = "hcu_vllm_das.fp4_packer:extension_spec"
 
 [tool.setuptools.packages.find]
 where = ["src"]
