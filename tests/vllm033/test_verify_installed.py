@@ -158,7 +158,7 @@ def installed_fixture(monkeypatch: pytest.MonkeyPatch, tmp_path: Path):
             self.vllm_version = vllm_version
 
     def activate_extensions(context, points):
-        assert context.adapter_version == "0.1.0"
+        assert context.adapter_version == (distributions.get("hcu-adapter") or distributions["sgl-kernel"]).version
         assert context.vllm_version == distributions["vllm"].version
         assert points == entry_points["hcu_adapter.extensions"]
         return tuple(reports)
@@ -197,11 +197,12 @@ def installed_fixture(monkeypatch: pytest.MonkeyPatch, tmp_path: Path):
         "vllm.platforms": SimpleNamespace(current_platform=HcuPlatform()),
     }
 
-    monkeypatch.setattr(
-        verify_installed.metadata,
-        "distribution",
-        lambda name: distributions[name],
-    )
+    def find_distribution(name):
+        try:
+            return distributions[name]
+        except KeyError:
+            raise verify_installed.metadata.PackageNotFoundError(name)
+    monkeypatch.setattr(verify_installed.metadata,"distribution",find_distribution)
     monkeypatch.setattr(
         verify_installed.metadata,
         "entry_points",
@@ -428,4 +429,27 @@ def test_attestation_detects_int8_rebinding_during_activation(monkeypatch, tmp_p
         return reports
     host.activate_extensions = mutate
     with pytest.raises(verify_installed.InstalledVerificationError, match="modified official INT8"):
+        verify_installed.collect_attestation()
+
+
+def test_attestation_accepts_split_host_distribution(monkeypatch,tmp_path):
+    distributions,points,_,_=installed_fixture(monkeypatch,tmp_path)
+    kernel=distributions['sgl-kernel']
+    host=FakeDistribution('hcu-adapter','0.5.22+hcu.1',kernel.root,
+        ['hcu_adapter/extensions.py','hcu_adapter/bridges/vllm.py','hcu_adapter-0.5.22.dist-info/RECORD'])
+    distributions['hcu-adapter']=host
+    kernel.files=[PurePosixPath('sgl_kernel/__init__.py'),PurePosixPath('sgl_kernel-0.0.dist-info/RECORD')]
+    kernel.version='0.0.0+hcu.dev0'
+    for group in ['vllm.platform_plugins','vllm.general_plugins']:
+        for point in points[group]:point.dist=host
+    report=verify_installed.collect_attestation()
+    assert report['adapter']['distribution']=='hcu-adapter'
+
+
+def test_attestation_refuses_duplicate_host_record_owners(monkeypatch,tmp_path):
+    distributions,_,_,_=installed_fixture(monkeypatch,tmp_path)
+    kernel=distributions['sgl-kernel']
+    distributions['hcu-adapter']=FakeDistribution('hcu-adapter','0.5.22+hcu.1',kernel.root,
+        ['hcu_adapter/extensions.py','hcu_adapter/bridges/vllm.py'])
+    with pytest.raises(verify_installed.InstalledVerificationError,match='unique|multiple|ambig'):
         verify_installed.collect_attestation()

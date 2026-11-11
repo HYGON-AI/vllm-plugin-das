@@ -14,7 +14,8 @@
 不等于 native ABI、算子或模型验收通过。
 
 - vLLM 负责官方模型、调度、分配与执行接口。
-- Adapter（分发名 `sgl-kernel`，包名 `hcu_adapter`）负责真实 HCU 身份、
+- Adapter（宿主分发名 `hcu-adapter`、内核分发名 `sgl-kernel`，
+  包名 `hcu_adapter`）负责真实 HCU 身份、
   runtime 准入、平台/通用插件入口和进程健康。
 - 本 Plugin 经 `hcu_adapter.extensions` 注册可选 RMSNorm 和显式
   FlashAttention provider。INT8 模型路由沿用官方实现，历史 AITER INT8
@@ -34,7 +35,7 @@ Plugin 分发版本统一为 `0.33.0`，与 vLLM 发布线对应。仓库根目�
 python3 -m pip wheel --no-deps --no-build-isolation \
   --wheel-dir ./dist ./adapter_extension
 python3 -m pip install --no-deps /wheels/vllm-0.33.0+*.whl
-python3 -m pip install --no-deps /wheels/sgl_kernel-*.whl
+python3 -m pip install --no-deps /wheels/sgl_kernel-*.whl /wheels/hcu_adapter-*.whl
 python3 -m pip install --no-deps ./dist/hcu_vllm_das_plugin-*.whl
 ```
 

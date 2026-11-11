@@ -130,11 +130,24 @@ def _distribution_report(distribution: object, record_sha256: str) -> dict[str, 
     }
 
 
+def _adapter_owner_name():
+    from importlib.util import spec_from_file_location,module_from_spec
+    spec=spec_from_file_location('_hcu_plugin_installed_adapter_owner',
+        Path(__file__).with_name('installed_adapter_owner.py'))
+    helper=module_from_spec(spec)
+    spec.loader.exec_module(helper)
+    try:
+        return helper.adapter_distribution_name()
+    except RuntimeError as error:
+        raise InstalledVerificationError(str(error)) from error
+
+
 def collect_attestation() -> dict[str, object]:
     """Return a fail-closed installed-state attestation."""
 
     vllm_dist, vllm_owned, vllm_record = _distribution("vllm")
-    adapter_dist, adapter_owned, adapter_record = _distribution("sgl-kernel")
+    adapter_name = _adapter_owner_name()
+    adapter_dist, adapter_owned, adapter_record = _distribution(adapter_name)
     plugin_dist, plugin_owned, plugin_record = _distribution(
         "hcu-vllm-das-plugin"
     )
@@ -154,13 +167,13 @@ def collect_attestation() -> dict[str, object]:
         "vllm.platform_plugins",
         name="hcu_adapter",
         value="hcu_adapter.bridges.vllm:hcu_platform_plugin",
-        distribution="sgl-kernel",
+        distribution=adapter_name,
     )
     _require_entry_point(
         "vllm.general_plugins",
         name="hcu_adapter",
         value="hcu_adapter.bridges.vllm:hcu_runtime_plugin",
-        distribution="sgl-kernel",
+        distribution=adapter_name,
     )
     extension_point = _require_entry_point(
         "hcu_adapter.extensions",
@@ -175,10 +188,10 @@ def collect_attestation() -> dict[str, object]:
     plugin_extension = _import_module("hcu_vllm_das.extension")
     vllm_origin = _module_origin(vllm_module, vllm_owned, "vllm")
     adapter_origin = _module_origin(
-        adapter_extensions, adapter_owned, "sgl-kernel"
+        adapter_extensions, adapter_owned, adapter_name
     )
     adapter_bridge_origin = _module_origin(
-        adapter_bridge, adapter_owned, "sgl-kernel"
+        adapter_bridge, adapter_owned, adapter_name
     )
     plugin_origin = _module_origin(
         plugin_extension, plugin_owned, "hcu-vllm-das-plugin"
@@ -267,6 +280,7 @@ def collect_attestation() -> dict[str, object]:
             "module_origin": vllm_origin,
         },
         "adapter": {
+            "distribution": adapter_name,
             **_distribution_report(adapter_dist, adapter_record),
             "module_origin": adapter_origin,
             "bridge_origin": adapter_bridge_origin,

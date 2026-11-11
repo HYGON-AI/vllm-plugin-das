@@ -16,7 +16,8 @@ upstream metadata live in
 Passing release admission does not validate the native ABI or a model.
 
 - vLLM owns models, scheduling, allocation and official execution interfaces.
-- Adapter (`sgl-kernel`, package `hcu_adapter`) owns real HCU identity,
+- Adapter (host `hcu-adapter`, kernel `sgl-kernel`, package `hcu_adapter`) owns
+  real HCU identity,
   runtime admission, platform/general entry points and process health.
 - This Plugin uses `hcu_adapter.extensions` to register optional RMSNorm and
   explicit FlashAttention providers. Official vLLM retains INT8 model routing;
@@ -38,7 +39,7 @@ an isolated environment. From the repository root:
 python3 -m pip wheel --no-deps --no-build-isolation \
   --wheel-dir ./dist ./adapter_extension
 python3 -m pip install --no-deps /wheels/vllm-0.33.0+*.whl
-python3 -m pip install --no-deps /wheels/sgl_kernel-*.whl
+python3 -m pip install --no-deps /wheels/sgl_kernel-*.whl /wheels/hcu_adapter-*.whl
 python3 -m pip install --no-deps ./dist/hcu_vllm_das_plugin-*.whl
 ```
 
