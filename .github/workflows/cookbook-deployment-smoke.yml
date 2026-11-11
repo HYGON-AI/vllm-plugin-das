@@ -115,8 +115,21 @@ jobs:
     container:
       # ARC creates the job Pod and allocates all eight HCU devices.
       image: ${{ needs.prepare.outputs.container-image }}
+    env:
+      FRAMEWORK: vllm
+      FRAMEWORK_VERSION: '0.28.1'
+      HARDWARE: ${{ matrix.hardware }}
+      IMAGE_REF: ${{ needs.prepare.outputs.image }}
+      IMAGE_ID: ${{ needs.prepare.outputs.image-id }}
+      CONTAINER_IMAGE: ${{ needs.prepare.outputs.container-image }}
+      COOKBOOK_REF: ${{ needs.prepare.outputs.cookbook-ref }}
+      CONTROLLER_REF: ${{ needs.prepare.outputs.controller-ref }}
+      MODE: ${{ inputs.mode || 'execute' }}
+      SMOKE_SCOPE: ${{ github.run_id }}-${{ github.run_attempt }}-vllm-bw1100
+      PYTHONDONTWRITEBYTECODE: '1'
     steps:
       - name: Checkout pinned private test controller
+        id: controller
         uses: actions/checkout@v4
         with:
           repository: guochenyang99/ci-model-test
@@ -124,28 +137,65 @@ jobs:
           token: ${{ secrets.MODEL_SMOKE_REPO_TOKEN }}
           persist-credentials: false
           path: model-ci-tools
-      - name: Test this hardware and transfer evidence
-        uses: ./model-ci-tools/.github/actions/deployment-smoke-arc
+      # ARC checks out files inside the job Pod. A relative uses: action is
+      # resolved in the Runner workspace before any step runs in the Pod.
+      - name: Run model services in the job Pod
+        id: execute
+        shell: bash
+        env:
+          SMOKE_CASES: ${{ inputs.cases || '' }}
+        run: |
+          set -eo pipefail
+          if [[ -f /opt/dtk/env.sh ]]; then source /opt/dtk/env.sh; fi
+          set -u
+          [[ "${HCU_CI_IN_K8S:-}" == 1 && "$HARDWARE" == BW1100 ]]
+          [[ "$MODE" == execute || "$MODE" == preflight ]]
+          cd "$GITHUB_WORKSPACE/model-ci-tools"
+          [[ "$(git rev-parse HEAD)" == "$CONTROLLER_REF" ]]
+          args=(--backend arc --output "$RUNNER_TEMP/model-ci-reports/runner-$SMOKE_SCOPE"
+            --framework "$FRAMEWORK" --framework-version "$FRAMEWORK_VERSION"
+            --hardware "$HARDWARE" --image-ref "$IMAGE_REF" --pinned-image-id "$IMAGE_ID"
+            --container-image "$CONTAINER_IMAGE" --cookbook-ref "$COOKBOOK_REF"
+            --host-config configs/smoke/host.arc.yaml --collect-image-environment)
+          [[ "$MODE" != preflight ]] || args+=(--preflight)
+          while IFS= read -r section; do
+            [[ -z "$section" ]] || args+=(--case "$section")
+          done <<< "$SMOKE_CASES"
+          exec python3 -m deployment_smoke.run "${args[@]}"
+      - name: Bundle hardware evidence
+        id: bundle
+        if: ${{ always() && steps.controller.outcome == 'success' }}
+        shell: bash
+        env:
+          EXECUTION_OUTCOME: ${{ steps.execute.outcome }}
+        run: |
+          set -euo pipefail
+          cd "$GITHUB_WORKSPACE/model-ci-tools"
+          output="$RUNNER_TEMP/model-ci-bundle-$SMOKE_SCOPE"
+          args=()
+          if [[ "$EXECUTION_OUTCOME" != success ]]; then
+            args+=(--job-error "Hardware execution ended with status: $EXECUTION_OUTCOME; inspect the hardware job log")
+          fi
+          python3 -m deployment_smoke.aggregate bundle \
+            --source "$RUNNER_TEMP/model-ci-reports/runner-$SMOKE_SCOPE" --output "$output" \
+            --hardware "$HARDWARE" --framework "$FRAMEWORK" --framework-version "$FRAMEWORK_VERSION" \
+            --mode "$MODE" --image-ref "$IMAGE_REF" --image-id "$IMAGE_ID" \
+            --cookbook-ref "$COOKBOOK_REF" --controller-ref "$CONTROLLER_REF" "${args[@]}"
+      - name: Upload hardware evidence
+        if: ${{ always() && steps.bundle.outcome == 'success' }}
+        uses: actions/upload-artifact@v4
         with:
-          framework: vllm
-          framework-version: '0.28.1'
-          image: ${{ needs.prepare.outputs.image }}
-          container-image: ${{ needs.prepare.outputs.container-image }}
-          expected-image-id: ${{ needs.prepare.outputs.image-id }}
-          cookbook-ref: ${{ needs.prepare.outputs.cookbook-ref }}
-          controller-ref: ${{ needs.prepare.outputs.controller-ref }}
-          hardware: ${{ matrix.hardware }}
-          cases: ${{ inputs.cases || '' }}
-          mode: ${{ inputs.mode || 'execute' }}
-          collect-only: 'true'
+          name: model-ci-raw-vllm-${{ github.run_id }}-${{ github.run_attempt }}-${{ matrix.hardware }}
+          path: ${{ runner.temp }}/model-ci-bundle-${{ env.SMOKE_SCOPE }}
+          retention-days: 1
+          if-no-files-found: error
 
   report:
     needs: [prepare, smoke]
     if: ${{ always() && needs.prepare.result == 'success' && needs.prepare.outputs.enabled == 'true' }}
-    runs-on: hygon-build
+    # Resolve the report composite actions in the same workspace as checkout.
+    runs-on: hygon-cpu
     timeout-minutes: 60
-    container:
-      image: ${{ needs.prepare.outputs.container-image }}
     permissions:
       contents: read
     steps:
