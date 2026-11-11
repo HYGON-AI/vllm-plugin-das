@@ -6,10 +6,11 @@ Ported from the validated stage1 bundle. No new kernel is introduced: the
 existing ``kernel_unified_attention`` is launched with different parameters.
 Persistent KV stays FP8; shapes outside the validated set use stock behaviour.
 
-  * global head512 (Q16/KV2), q_len 2..1100, 9..64 sequences: BLOCK_M=64,
+  * global head512 (Q16/KV2), q_len 2..1100, 9..MAX_SEQS sequences: BLOCK_M=64,
     BLOCK_Q=8, TILE_SIZE=32, 8 warps (the grid is recomputed for BLOCK_Q);
-  * SWA head256 (Q16/KV8, window 1024, 32..64 sequences) with K/V scale==1:
-    read FP8 as BF16 directly (``KV_QUANT_MODE=0``), skipping the FP32 scaling.
+  * SWA head256 (Q16/KV8, window 1024) with K/V scale==1: read FP8 as BF16
+    directly (``KV_QUANT_MODE=0``), skipping the FP32 scaling, at any sequence
+    count; the warp/stage choice applies at 32..``VLLM_HCU_GEMMA4_BW1000_MAX_SEQS``.
 """
 
 from __future__ import annotations
@@ -28,15 +29,23 @@ _installed = False
 def _max_tuned_seqs() -> int:
     """Upper bound on running sequences for the *launch-parameter* tuning.
 
-    The tiling and warp/stage choices below were measured at 9..64 sequences.
-    Raising this applies them to shapes they were not measured on, which can be
-    slower rather than faster, so it is opt-in and defaults to the measured
-    bound. It does not affect the unit-scale KV cast, whose correctness does not
+    The default is the highest sequence count the launch parameters have been
+    measured at. Raising it further applies warp/stage and tiling choices to
+    shapes nobody has timed, which can be slower rather than faster.
+
+    Operator-level measurement of the SWA path (head 256, 16/8 heads, window
+    1024, q_len 5, unit scales) gives the tuning 1.046x at 32 sequences, 1.069x
+    at 64, 1.111x at 128 and 1.104x at 256, with the kernel output bit-identical
+    throughout -- so 64 was where the measurements stopped, not where the gain
+    did. Below 32 the trend thins out and has not been swept.
+
+    This bound does not affect the unit-scale KV cast, which is worth about
+    1.5x on its own across that whole range and whose correctness does not
     depend on the sequence count.
     """
     import os
 
-    raw = os.environ.get("VLLM_HCU_GEMMA4_BW1000_MAX_SEQS", "64").strip()
+    raw = os.environ.get("VLLM_HCU_GEMMA4_BW1000_MAX_SEQS", "256").strip()
     value = int(raw)
     if value < 9:
         raise ValueError("VLLM_HCU_GEMMA4_BW1000_MAX_SEQS must be >= 9")
