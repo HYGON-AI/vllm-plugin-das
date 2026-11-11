@@ -30,6 +30,31 @@ _NATIVE_LAYOUT_NHD = 2  # [num_blocks, block_size, num_kv_heads, head_dim]
 _GEMMA4_SEQ_LENS_BOUND = "_vllm_hcu_seq_lens_cpu_upper_bound"
 
 
+def _gemma4_paged_view(cache: torch.Tensor) -> tuple[torch.Tensor, int] | None:
+    """Describe the pool to the gather in the order it is actually stored in.
+
+    The per-layer view is always [blocks, kv_heads, block_size, head_dim]
+    whatever the resolved KV cache layout is; only the strides differ. LBNHC
+    keeps tokens before heads in memory, so the view transposed back to
+    [blocks, block_size, kv_heads, head_dim] is the contiguous one and NHD
+    describes it; LBHNC stores heads first, so the view itself is contiguous
+    and HND describes it.
+
+    Read this off the strides rather than the config: the strides are what the
+    kernel dereferences, and it takes a bare pointer, so a layout it was not
+    given yields wrong values with no error. Padded pages leave neither form
+    contiguous; return None so the caller can fall back.
+
+    Both branches are metadata only -- one tensor object, no copy, no kernel.
+    """
+    transposed = cache.transpose(1, 2)
+    if transposed.is_contiguous():
+        return transposed, _NATIVE_LAYOUT_NHD
+    if cache.is_contiguous():
+        return cache, _NATIVE_LAYOUT_HND
+    return None
+
+
 def _gemma4_kv_to_query_dtype(
     cache: torch.Tensor, query_dtype: torch.dtype
 ) -> torch.Tensor:
@@ -93,21 +118,19 @@ def _gemma4_flash_attention(
     if cache.dtype == torch.uint8:
         cache = cache.view(torch.float8_e4m3fn)
 
-    # The logical view is [blocks, kv_heads, block_size, 2*head_size], but the
-    # physical order is [blocks, block_size, kv_heads, 2*head_size]: at block 64
-    # with 2 heads and head_size 512 the strides are (131072, 1024, 2048, 1),
-    # so tokens come before heads in memory. Transposing back is what makes the
-    # tensor contiguous, and native layout NHD is what describes it. The gather
-    # kernel takes a bare pointer: handed any other layout it returns wrong
-    # values with no error at all, so contiguity is checked, never assumed.
-    paged = cache.transpose(1, 2)
-    if not paged.is_contiguous():
+    view = _gemma4_paged_view(cache)
+    if view is None:
         raise RuntimeError(
-            "Gemma4 FA expects a paged KV pool that is contiguous as "
-            f"[blocks, block_size, kv_heads, 2*head_size]; got shape "
+            "Gemma4 FA needs a paged KV pool contiguous as either "
+            "[blocks, block_size, kv_heads, 2*head_size] or "
+            f"[blocks, kv_heads, block_size, 2*head_size]; got shape "
             f"{tuple(kv_cache.shape)} stride {kv_cache.stride()}. "
             "_can_use_fa should have rejected this layout."
         )
+    paged, native_layout = view
+    # Heads and the K|V row width come from the logical view, whose dimension
+    # order is fixed; paged's own axes move with the layout.
+    num_kv_heads, row_width = cache.shape[1], cache.shape[3]
 
     total_k = _gemma4_gathered_kv_rows(
         cu_seqlens_q=cu_seqlens_q,
@@ -115,7 +138,7 @@ def _gemma4_flash_attention(
         seq_lens_bound=seq_lens_bound,
     )
     gathered = torch.empty(
-        (total_k, paged.shape[2], paged.shape[3]),
+        (total_k, num_kv_heads, row_width),
         device=paged.device,
         dtype=paged.dtype,
     )
@@ -131,7 +154,7 @@ def _gemma4_flash_attention(
         seqused_k,
         cu_seqlens_k,
         max_seqlen_k,
-        _NATIVE_LAYOUT_NHD,
+        native_layout,
     )
     kv = _gemma4_kv_to_query_dtype(gathered, q.dtype)
     # varlen_fwd reads K/V strides, so the halves go in as views. Rows past
@@ -358,19 +381,14 @@ class Gemma4FAAttentionImpl(TritonAttentionImpl):
             "kv_shape": kv_cache.ndim == 4
             and kv_cache.shape[3] != 2 * self.head_size,
             "kv_stride_last": kv_cache.ndim < 1 or kv_cache.stride(-1) != 1,
-            "kv_stride_head": kv_cache.ndim == 4
-            and kv_cache.stride(1) != 2 * self.head_size,
-            "kv_stride_token": kv_cache.ndim == 4
-            and kv_cache.stride(2) != self.num_kv_heads * 2 * self.head_size,
-            "kv_stride_block": kv_cache.ndim == 4
-            and kv_cache.stride(0)
-            != kv_cache.shape[2] * self.num_kv_heads * 2 * self.head_size,
             # The gather kernel reads a bare pointer and silently produces
-            # wrong values for any layout other than the one it is told, so
-            # require the layout it is given: a pool that is contiguous once
-            # transposed to [blocks, block_size, kv_heads, 2*head_size].
-            "kv_layout_not_nhd": kv_cache.ndim == 4
-            and not kv_cache.transpose(1, 2).is_contiguous(),
+            # wrong values for a layout other than the one it is told, so
+            # require a pool whose strides name one of the two it accepts.
+            # Given the shape, contiguity of either form pins every stride,
+            # which is why no individual stride needs its own check; padded
+            # pages satisfy neither and route to Triton.
+            "kv_layout_unsupported": kv_cache.ndim == 4
+            and _gemma4_paged_view(kv_cache) is None,
         }
         failures.extend(name for name, failed in checks.items() if failed)
         self._log_fa_failures(failures, query, kv_cache, metadata, layer_name)
