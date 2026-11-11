@@ -22,7 +22,8 @@ def config(pcp=8, *, worker="auto", quantization="hcu_dsv41_channel_fp8"):
     )
 
 
-def test_pcp_expert_protocol_matches_real_expert_partition(monkeypatch):
+@pytest.mark.parametrize('decoder_init', ['_DECODER_INIT', '_FP4_PCP_DECODER_INIT'])
+def test_pcp_expert_protocol_matches_real_expert_partition(monkeypatch, decoder_init):
     from hcu_vllm_das.models import v41_pcp as model
 
     def native_init(self, *args, **kwargs):
@@ -31,10 +32,11 @@ def test_pcp_expert_protocol_matches_real_expert_partition(monkeypatch):
         self.experts = NS(moe_config=NS(num_local_experts=48))
 
     monkeypatch.setattr(model.native.DeepseekV4MoE, "__init__", native_init)
-    owned = model.HcuV41PcpMoE(config())
+    constructor = getattr(model, decoder_init)
+    owned = constructor.__globals__['DeepseekV4MoE'](config())
     assert owned.n_local_physical_experts == 48
     assert owned.n_local_experts == 384
-    assert model._DECODER_INIT.__globals__["DeepseekV4MoE"] is type(owned)
+    assert constructor.__globals__["DeepseekV4MoE"] is type(owned)
     assert model.native.DeepseekV4DecoderLayer.__init__.__globals__["DeepseekV4MoE"] is model.native.DeepseekV4MoE
 
 

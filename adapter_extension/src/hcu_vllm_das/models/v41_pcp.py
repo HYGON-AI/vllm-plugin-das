@@ -166,6 +166,11 @@ class HcuV41PcpForCausalLM(native_vl.DeepseekV41ForCausalLM):
         if fp4_applicable(vllm_config):
             from ..fp4_indexer import preflight
             preflight(vllm_config)
+            if vllm_config.parallel_config.prefill_context_parallel_size > 1:
+                from ..v41_pcp_activation import pcp_enabled
+                if not pcp_enabled():
+                    raise ValueError('FP4 PCP attention requires VLLM_HCU_DSV41_PCP_ATTENTION=1')
+                validate_config(vllm_config)
             from ..v41_pcp_activation import check_health
             check_health()
             check_native_contract()
@@ -188,8 +193,10 @@ class HcuV41PcpForCausalLM(native_vl.DeepseekV41ForCausalLM):
 
 
 def _fp4_attention(cfg):
-    from ..fp4_indexer import Fp4Attention, preflight
+    from ..fp4_indexer import Fp4Attention, Fp4PcpAttention, preflight
     preflight(cfg)
+    if validate_config(cfg):
+        return Fp4PcpAttention
     return Fp4Attention
 
 
@@ -198,12 +205,19 @@ _FP4_DECODER_INIT = _constructor(_DECODER_NATIVE, _REVIEWED[0],
 _FP4_HOST_DECODER_INIT = _constructor(_DECODER_NATIVE, _REVIEWED[0],
                                      {'_select_dsv4_attn_cls': _fp4_attention,
                                       'Engram': HcuV41HostEngram})
+_FP4_PCP_DECODER_INIT = _constructor(_DECODER_NATIVE, _REVIEWED[0],
+                                    {'_select_dsv4_attn_cls': _fp4_attention,
+                                     'DeepseekV4MoE': HcuV41PcpMoE,
+                                     'Engram': HcuV41PcpEngram})
 
 
 class HcuV41Fp4DecoderLayer(native.DeepseekV4DecoderLayer):
     def __init__(self, *args, **kwargs):
         cfg = args[0] if args else kwargs['vllm_config']
-        init = _FP4_HOST_DECODER_INIT if use_host_target(cfg) else _FP4_DECODER_INIT
+        if validate_config(cfg):
+            init = _FP4_PCP_DECODER_INIT
+        else:
+            init = _FP4_HOST_DECODER_INIT if use_host_target(cfg) else _FP4_DECODER_INIT
         init(self, *args, **kwargs)
 
 
