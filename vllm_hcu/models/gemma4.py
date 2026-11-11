@@ -62,6 +62,88 @@ def _gemma4_gathered_kv_rows(
     return batch_size * max_seqlen_k
 
 
+_FA_SELFCHECK = os.environ.get("VLLM_HCU_GEMMA4_FA_SELFCHECK", "0").strip().lower() in {
+    "1",
+    "true",
+}
+_selfcheck_state = {"calls": 0, "mismatched_calls": 0, "max_abs_diff": 0.0}
+
+
+def _gemma4_flash_attention_legacy(
+    *,
+    q: torch.Tensor,
+    kv_cache: torch.Tensor,
+    head_size: int,
+    out: torch.Tensor,
+    cu_seqlens_q: torch.Tensor,
+    max_seqlen_q: int,
+    seqused_k: torch.Tensor,
+    max_seqlen_k: int,
+    softmax_scale: float,
+    block_table: torch.Tensor,
+) -> torch.Tensor:
+    """Cast the whole pool, then gather. Reference for the self-check only.
+
+    Set VLLM_HCU_GEMMA4_FA_SELFCHECK=1 to run this beside the live path on the
+    same inputs and compare element-wise. Nothing else can establish that:
+    comparing generated text across two server processes cannot separate a
+    real numerical difference from per-process effects, and a wrong paged
+    layout still yields fluent text, correct-looking answers and zero errors.
+    A layout bug shipped exactly that way and only this comparison caught it.
+    """
+    from flash_attn.flash_attn_interface import flash_attn_cuda
+
+    k, v = kv_cache.transpose(1, 2).split(head_size, dim=-1)
+    k = _gemma4_kv_to_query_dtype(k, q.dtype).contiguous()
+    v = _gemma4_kv_to_query_dtype(v, q.dtype).contiguous()
+    used_tokens = int(seqused_k.sum().item())
+    total_k = max(262144, used_tokens)
+    contiguous_k = torch.empty(
+        (total_k, k.shape[-2], k.shape[-1]), device=k.device, dtype=k.dtype
+    )
+    contiguous_v = torch.empty_like(contiguous_k)
+    cu_seqlens_k = torch.empty_like(cu_seqlens_q)
+    flash_attn_cuda.pagedkv_to_contiguouskv(
+        contiguous_k,
+        contiguous_v,
+        k,
+        v,
+        block_table,
+        seqused_k,
+        cu_seqlens_k,
+        max_seqlen_k,
+        _NATIVE_LAYOUT_NHD,
+    )
+    flash_attn_cuda.varlen_fwd(
+        q,
+        contiguous_k,
+        contiguous_v,
+        out,
+        cu_seqlens_q,
+        cu_seqlens_k,
+        None,
+        None,
+        None,
+        None,
+        max_seqlen_q,
+        max_seqlen_k,
+        0.0,
+        softmax_scale,
+        False,
+        True,
+        -1,
+        -1,
+        0.0,
+        False,
+        None,
+        None,
+        None,
+        None,
+        None,
+    )
+    return out
+
+
 def _gemma4_flash_attention(
     *,
     q: torch.Tensor,
@@ -98,15 +180,31 @@ def _gemma4_flash_attention(
     if cache.dtype == torch.uint8:
         cache = cache.view(torch.float8_e4m3fn)
 
+    # The logical view is [blocks, kv_heads, block_size, 2*head_size], but the
+    # physical order is [blocks, block_size, kv_heads, 2*head_size]: at block 64
+    # with 2 heads and head_size 512 the strides are (131072, 1024, 2048, 1),
+    # so tokens come before heads in memory. Transposing back is what makes the
+    # tensor contiguous, and native layout NHD is what describes it. The gather
+    # kernel takes a bare pointer: handed any other layout it returns wrong
+    # values with no error at all, so contiguity is checked, never assumed.
+    paged = cache.transpose(1, 2)
+    if not paged.is_contiguous():
+        raise RuntimeError(
+            "Gemma4 FA expects a paged KV pool that is contiguous as "
+            f"[blocks, block_size, kv_heads, 2*head_size]; got shape "
+            f"{tuple(kv_cache.shape)} stride {kv_cache.stride()}. "
+            "_can_use_fa should have rejected this layout."
+        )
+
     total_k = _gemma4_gathered_kv_rows(
         cu_seqlens_q=cu_seqlens_q,
         max_seqlen_k=max_seqlen_k,
         seq_lens_bound=seq_lens_bound,
     )
     gathered = torch.empty(
-        (total_k, cache.shape[1], cache.shape[3]),
-        device=cache.device,
-        dtype=cache.dtype,
+        (total_k, paged.shape[2], paged.shape[3]),
+        device=paged.device,
+        dtype=paged.dtype,
     )
     cu_seqlens_k = torch.empty_like(cu_seqlens_q)
     # Both destinations receive the same interleaved K|V rows; aliasing them
@@ -114,13 +212,13 @@ def _gemma4_flash_attention(
     flash_attn_cuda.pagedkv_to_contiguouskv(
         gathered,
         gathered,
-        cache,
-        cache,
+        paged,
+        paged,
         block_table,
         seqused_k,
         cu_seqlens_k,
         max_seqlen_k,
-        _NATIVE_LAYOUT_HND,
+        _NATIVE_LAYOUT_NHD,
     )
     kv = _gemma4_kv_to_query_dtype(gathered, q.dtype)
     # varlen_fwd reads K/V strides, so the halves go in as views. Rows past
@@ -154,6 +252,38 @@ def _gemma4_flash_attention(
         None,
         None,
     )
+    if _FA_SELFCHECK:
+        reference = torch.empty_like(out)
+        _gemma4_flash_attention_legacy(
+            q=q,
+            kv_cache=kv_cache,
+            head_size=head_size,
+            out=reference,
+            cu_seqlens_q=cu_seqlens_q,
+            max_seqlen_q=max_seqlen_q,
+            seqused_k=seqused_k,
+            max_seqlen_k=max_seqlen_k,
+            softmax_scale=softmax_scale,
+            block_table=block_table,
+        )
+        diff = (out.float() - reference.float()).abs().max().item()
+        state = _selfcheck_state
+        state["calls"] += 1
+        state["max_abs_diff"] = max(state["max_abs_diff"], diff)
+        if diff != 0.0:
+            state["mismatched_calls"] += 1
+        logger.info(
+            "[GEMMA4_FA_SELFCHECK] call=%d max_abs_diff=%.6g mismatched_calls=%d "
+            "worst=%.6g q=%s kv_shape=%s kv_stride=%s total_k=%d",
+            state["calls"],
+            diff,
+            state["mismatched_calls"],
+            state["max_abs_diff"],
+            tuple(q.shape),
+            tuple(kv_cache.shape),
+            kv_cache.stride(),
+            total_k,
+        )
     return out
 
 
@@ -355,6 +485,13 @@ class Gemma4FAAttentionImpl(TritonAttentionImpl):
             "kv_stride_block": kv_cache.ndim == 4
             and kv_cache.stride(0)
             != kv_cache.shape[2] * self.num_kv_heads * 2 * self.head_size,
+            # The gather kernel reads a bare pointer and silently produces
+            # wrong values for any layout other than the one it is told. The
+            # stride checks above already describe a pool that is contiguous
+            # once transposed to [blocks, block_size, kv_heads, 2*head_size];
+            # state that requirement directly so it cannot regress.
+            "kv_layout_not_nhd": kv_cache.ndim == 4
+            and not kv_cache.transpose(1, 2).is_contiguous(),
         }
         failures.extend(name for name, failed in checks.items() if failed)
         self._log_fa_failures(failures, query, kv_cache, metadata, layer_name)
