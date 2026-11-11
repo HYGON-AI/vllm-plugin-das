@@ -34,6 +34,7 @@ BUCKET_ROWS = tuple(range(128, BUCKET))
 DRAFT_HIDDEN = 1024
 DENSE_ROWS = tuple(range(33, 65))
 DENSE_CONFIG = {"BM": 32, "BN": 256, "BK": 64, "num_warps": 8, "num_stages": 1}
+_BLOCK_ALIGN = 2048  # one lookup block, enough to trigger the compile
 
 _table_loaded = False
 _bucket_installed = False
@@ -114,6 +115,12 @@ def install_softcap_lut(runner) -> None:
         if logits.dtype != torch.bfloat16 or not logits.is_contiguous():
             return original(lm_head, hidden_states, embedding_bias, skip_gather)
         return apply_lut(logits, lut)
+
+    # Compile the lookup kernel now. A first compile inside CUDA graph capture
+    # would be fatal, and whether logits processing falls inside the captured
+    # region depends on the graph mode, so do not rely on it being outside.
+    apply_lut(torch.zeros(_BLOCK_ALIGN, dtype=torch.bfloat16, device=lut.device), lut)
+    torch.cuda.synchronize()
 
     proc.forward = forward
     proc._gemma4_softcap_lut = lut
