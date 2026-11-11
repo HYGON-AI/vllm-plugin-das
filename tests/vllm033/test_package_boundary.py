@@ -7,6 +7,8 @@ import tomllib
 from pathlib import Path
 from zipfile import ZipFile
 
+import pytest
+
 REPO_ROOT = Path(__file__).resolve().parents[2]
 PROJECT_ROOT = REPO_ROOT / "adapter_extension"
 SOURCE_ROOT = PROJECT_ROOT / "src"
@@ -18,7 +20,7 @@ def test_project_metadata_has_only_the_adapter_extension_entry_point() -> None:
     )["project"]
 
     assert metadata["name"] == "hcu-vllm-das-plugin"
-    assert metadata["version"] == "0.3.0.dev0"
+    assert metadata["version"] == "0.33.0"
     assert metadata["requires-python"] == ">=3.11,<3.15"
     assert metadata["dependencies"] == [
         "hcu-adapter>=0.1.0",
@@ -42,7 +44,7 @@ sys.path.insert(0, {os.fspath(SOURCE_ROOT)!r})
 blocked = {{"torch", "vllm", "lightop", "vllm_hcu"}}
 before = set(sys.modules)
 import hcu_vllm_das
-assert hcu_vllm_das.__version__ == "0.3.0.dev0"
+assert hcu_vllm_das.__version__ == "0.33.0"
 assert hcu_vllm_das.TARGET_VLLM_RELEASE == (0, 33, 0)
 assert hcu_vllm_das.VLLM_UPSTREAM_COMMIT == "4ba787ec9959e566d3b587a796dff07673324da5"
 introduced = (set(sys.modules) - before).intersection(blocked)
@@ -99,7 +101,7 @@ def test_built_wheel_contains_only_the_new_plugin_namespace(tmp_path: Path) -> N
     metadata_lines = wheel_metadata.splitlines()
     entry_point_lines = entry_points.splitlines()
     assert "Name: hcu-vllm-das-plugin" in metadata_lines
-    assert "Version: 0.3.0.dev0" in metadata_lines
+    assert "Version: 0.33.0" in metadata_lines
     assert "Requires-Dist: hcu-adapter>=0.1.0" in metadata_lines
     assert "[hcu_adapter.extensions]" in entry_point_lines
     assert "das_hcu = hcu_vllm_das.extension:extension_spec" in entry_point_lines
@@ -120,3 +122,26 @@ def test_built_wheel_contains_only_the_new_plugin_namespace(tmp_path: Path) -> N
     assert license_names == {"LICENSE", "NOTICE"}
     assert not any(name.startswith("vllm_hcu/") for name in names)
     assert not any(name.startswith("tests/") for name in names)
+
+
+@pytest.mark.parametrize("frontend", ["setup", "pip"])
+def test_root_build_refuses_legacy_package_before_loading_torch(
+    frontend: str, tmp_path: Path
+) -> None:
+    if frontend == "setup":
+        command = [sys.executable, "-I", "-S", "setup.py", "--version"]
+    else:
+        command = [
+            sys.executable, "-m", "pip", "wheel", "--no-deps",
+            "--no-build-isolation", "--wheel-dir", str(tmp_path), ".",
+        ]
+    result = subprocess.run(
+        command, cwd=REPO_ROOT, capture_output=True, text=True,
+        check=False, timeout=120,
+    )
+    output = result.stdout + result.stderr
+    assert result.returncode != 0, output
+    assert "legacy vllm_hcu build is disabled" in output, output
+    assert "./adapter_extension" in output, output
+    assert "ModuleNotFoundError" not in output, output
+    assert not list(tmp_path.glob("*.whl"))

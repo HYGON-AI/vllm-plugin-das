@@ -16,16 +16,19 @@ upstream metadata live in
 Passing release admission does not validate the native ABI or a model.
 
 - vLLM owns models, scheduling, allocation and official execution interfaces.
-- Adapter (`sgl-kernel`, package `hcu_adapter`) owns real HCU identity,
+- Adapter (host `hcu-adapter`, kernel `sgl-kernel`, package `hcu_adapter`) owns
+  real HCU identity,
   runtime admission, platform/general entry points and process health.
 - This Plugin uses `hcu_adapter.extensions` to register optional RMSNorm and
   explicit FlashAttention providers. Official vLLM retains INT8 model routing;
   the historical AITER INT8 prototype is not an advertised model capability.
   Each active provider has separate prerequisites and acceptance gates.
 
-The retained repository-root `vllm_hcu` package and `setup.py` are the legacy
-vLLM 0.28.1 development reference. They are not the package for this release.
-Do not run `pip install .` at the repository root for a vLLM 0.33 deployment.
+The Plugin distribution version is `0.33.0`, aligned with the vLLM release
+line. The retained repository-root `vllm_hcu` source is the legacy vLLM 0.28.1
+development reference. Root `setup.py` rejects builds before importing Torch
+and points to `./adapter_extension`; it must not produce a legacy wheel on
+this branch. Use the original release branch for historical builds.
 
 ## Build and install
 
@@ -36,7 +39,7 @@ an isolated environment. From the repository root:
 python3 -m pip wheel --no-deps --no-build-isolation \
   --wheel-dir ./dist ./adapter_extension
 python3 -m pip install --no-deps /wheels/vllm-0.33.0+*.whl
-python3 -m pip install --no-deps /wheels/sgl_kernel-*.whl
+python3 -m pip install --no-deps /wheels/sgl_kernel-*.whl /wheels/hcu_adapter-*.whl
 python3 -m pip install --no-deps ./dist/hcu_vllm_das_plugin-*.whl
 ```
 
