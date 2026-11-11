@@ -20,8 +20,10 @@
   FlashAttention provider。INT8 模型路由沿用官方实现，历史 AITER INT8
   原型不作为已注册的模型能力；各有效能力独立检查前置条件与验收门槛。
 
-仓库根目录的 `vllm_hcu` 和 `setup.py` 保留为 vLLM 0.28.1 历史开发参考。
-部署本发布线时，不要在仓库根目录执行 `pip install .`。
+Plugin 分发版本统一为 `0.33.0`，与 vLLM 发布线对应。仓库根目录的
+`vllm_hcu` 源码保留为 vLLM 0.28.1 历史开发参考；根目录 `setup.py`
+会在导入 Torch 前拒绝构建并提示使用 `./adapter_extension`，避免本分支
+误产出旧 wheel。历史构建应使用对应的原发布分支。
 
 ## 构建与安装
 

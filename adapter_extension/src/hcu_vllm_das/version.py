@@ -1,6 +1,6 @@
 """Immutable package and target-version metadata."""
 
-__version__ = "0.3.0.dev0"
+__version__ = "0.33.0"
 TARGET_VLLM_RELEASE = (0, 33, 0)
 VLLM_UPSTREAM_COMMIT = "4ba787ec9959e566d3b587a796dff07673324da5"
 

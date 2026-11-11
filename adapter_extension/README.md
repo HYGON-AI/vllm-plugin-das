@@ -9,7 +9,7 @@ activation dependencies are independent of the optional RMS provider.
 lifecycle; this wheel contributes optional, independently removable operator
 optimizations through the adapter extension API.
 
-Version `0.3.0.dev0` targets the `v0.33.0` branch. Migration status and current
+Version `0.33.0` targets the `v0.33.0` branch. Migration status and current
 evidence are recorded in [v0.33 validation](../docs/validation/vllm033-upgrade.md);
 the v0.32 documents below are historical evidence and do not certify v0.33.
 The operator extension currently advertises only the default-OFF LightOp
@@ -44,7 +44,7 @@ operator-level capabilities.
   use ABI-matched local builds.
 - The plugin does not own `vllm.platform_plugins` or `vllm.general_plugins`.
 
-The repository root remains the vLLM 0.28.1 development reference. Build only
+The repository-root legacy build is disabled on this branch. Build only
 this directory for vLLM 0.33:
 
 ```bash
