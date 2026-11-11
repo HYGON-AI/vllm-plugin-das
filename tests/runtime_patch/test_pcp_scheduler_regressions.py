@@ -233,3 +233,37 @@ def test_recompute_isolation_counts_generated_history_before_decode():
     scheduler = _scheduler([recompute, decode])
     assert scheduler.schedule().num_scheduled_tokens == {"recompute": 2048}
     assert decode.num_computed_tokens == 79
+
+
+@pytest.mark.parametrize("short_in_skipped", [False, True])
+@pytest.mark.parametrize("free_slots", [1, 2])
+def test_waiting_prefill_isolation_respects_admission_slots(
+    monkeypatch, short_in_skipped, free_slots,
+):
+    monkeypatch.setenv("VLLM_HCU_PCP_ISOLATE_PREFILL_MIN_TOKENS", "128")
+    decode = _request("decode", total=80, computed=79)
+    short = _request("short", prompt=16)
+    long = _request("long", prompt=4096)
+    scheduler = _scheduler([decode], [short, long])
+    scheduler.max_num_running_reqs = 1 + free_slots
+    if short_in_skipped:
+        scheduler.waiting.remove_request(short)
+        scheduler.skipped_waiting.add_request(short)
+    assert patch._pending_prefill_tokens(scheduler, 128) == (
+        16 if free_slots == 1 else 4112
+    )
+    output = scheduler.schedule()
+    assert ("decode" in output.num_scheduled_tokens) == (free_slots == 1)
+    assert output.num_scheduled_tokens["short"] == 16
+    assert ("long" in output.num_scheduled_tokens) == (free_slots == 2)
+
+
+def test_blocked_waiter_does_not_consume_admission_slot():
+    decode = _request("decode", total=80, computed=79)
+    blocked = _request("blocked", prompt=4096)
+    blocked.status = RequestStatus.WAITING_FOR_STRUCTURED_OUTPUT_GRAMMAR
+    blocked.structured_output_request = SimpleNamespace(grammar=None)
+    scheduler = _scheduler([decode], [blocked, _request("short", prompt=16),
+                                       _request("long", prompt=4096)])
+    scheduler.max_num_running_reqs = 2
+    assert patch._pending_prefill_tokens(scheduler, 128) == 16

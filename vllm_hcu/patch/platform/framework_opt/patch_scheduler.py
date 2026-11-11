@@ -166,12 +166,16 @@ def _pending_prefill_tokens(scheduler, limit: int) -> int:
         scheduler._pause_state == PauseState.UNPAUSED
         and num_running < scheduler.max_num_running_reqs
     ):
-        for queue in (scheduler.waiting, scheduler.skipped_waiting):
+        free_slots = scheduler.max_num_running_reqs - num_running
+        # FCFS resumes skipped requests before admitting new waiting rows.
+        # Even a ready row with no remaining prefill occupies a request slot.
+        for queue in (scheduler.skipped_waiting, scheduler.waiting):
             for request in queue:
                 if _waiting_prefill_ready(scheduler, request):
                     pending += _prefill_remaining(request)
-                if pending >= limit:
-                    return pending
+                    free_slots -= 1
+                    if pending >= limit or free_slots == 0:
+                        return pending
     return pending
 
 
