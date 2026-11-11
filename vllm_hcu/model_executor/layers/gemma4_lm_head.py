@@ -2,9 +2,10 @@
 # SPDX-FileCopyrightText: Copyright (c) 2026 Hygon Information Technology Co., Ltd.
 """Gemma4 BW1000 LM-head GEMM tuning (TP1, BF16, full 262144 vocabulary).
 
-Ported from the validated stage1 bundle; no new kernel:
+Ported from the validated stage1 bundle:
   * load the fixed rocBLAS algorithm table (TunableOp, tuning disabled);
-  * pad 128..319 hidden rows to the tuned 320-row GEMM.
+  * pad 128..319 hidden rows to the tuned 320-row GEMM;
+  * softcap the logits by table lookup instead of recomputing tanh.
 """
 
 from __future__ import annotations
@@ -18,6 +19,8 @@ import torch
 
 from vllm.logger import init_logger
 
+from .gemma4_softcap_lut import apply_lut, build_lut
+
 logger = init_logger(__name__)
 
 TABLE_PATH = Path(__file__).resolve().parent / "gemma4_head_results0.csv"
@@ -29,6 +32,7 @@ BUCKET_ROWS = tuple(range(128, BUCKET))
 
 _table_loaded = False
 _bucket_installed = False
+_softcap_installed = False
 
 
 def load_head_table() -> dict | None:
@@ -70,6 +74,48 @@ def load_head_table() -> dict | None:
     _table_loaded = True
     logger.info("Gemma4 BW1000 head table loaded: %s", report)
     return report
+
+
+def install_softcap_lut(runner) -> None:
+    """Replace the logits softcap with a lookup over all bfloat16 patterns.
+
+    Idempotent: a second call in the same process is a no-op. The table is
+    built from the stock expression, so this is a bit-identical substitution
+    and not an approximation -- but only for the soft_cap it was built with,
+    and only when nothing scales the logits afterwards, both asserted here.
+    """
+    global _softcap_installed
+    if _softcap_installed:
+        return
+    model = runner.model
+    while not hasattr(model, "lm_head"):
+        model = model.language_model
+    proc = model.logits_processor
+    assert proc.soft_cap == SOFTCAP and proc.scale == 1
+    assert proc.head_dtype in (None, torch.bfloat16)
+    assert not proc.logits_as_input
+    assert runner.vllm_config.parallel_config.tensor_parallel_size == 1
+
+    lut = build_lut(model.lm_head.weight.device, SOFTCAP)
+    original = proc.forward
+
+    def forward(lm_head, hidden_states, embedding_bias=None, skip_gather=False):
+        if hidden_states.dtype != torch.bfloat16 or proc.logits_as_input:
+            return original(lm_head, hidden_states, embedding_bias, skip_gather)
+        logits = proc._get_logits(hidden_states, lm_head, embedding_bias, skip_gather)
+        if logits is None:
+            return logits
+        if logits.dtype != torch.bfloat16 or not logits.is_contiguous():
+            return original(lm_head, hidden_states, embedding_bias, skip_gather)
+        return apply_lut(logits, lut)
+
+    proc.forward = forward
+    proc._gemma4_softcap_lut = lut
+    _softcap_installed = True
+    logger.info(
+        "Gemma4 BW1000 softcap lookup active: soft_cap=%s, 65536-entry BF16 table",
+        SOFTCAP,
+    )
 
 
 def install_head_bucket(runner, rows=BUCKET_ROWS) -> None:
