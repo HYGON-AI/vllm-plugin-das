@@ -314,7 +314,10 @@ class HcuGPUModelRunnerV2(GPUModelRunner):
         if (
             pcp_size > 1
             and speculator is not None
-            and "HYV4ForCausalLM" in architectures
+            and (
+                "HYV4ForCausalLM" in architectures
+                or "HYV4VLForConditionalGeneration" in architectures
+            )
         ):
             from vllm_hcu.models.hy_v4.moe import _hyv4_moe_chunk_size
 
