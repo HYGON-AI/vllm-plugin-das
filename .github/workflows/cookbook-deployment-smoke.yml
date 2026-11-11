@@ -138,37 +138,3 @@ jobs:
           cases: ${{ inputs.cases || '' }}
           mode: ${{ inputs.mode || 'execute' }}
           collect-only: 'true'
-
-  report:
-    needs: [prepare, smoke]
-    if: ${{ always() && needs.prepare.result == 'success' && needs.prepare.outputs.enabled == 'true' }}
-    runs-on: hygon-build
-    timeout-minutes: 60
-    container:
-      image: ${{ needs.prepare.outputs.container-image }}
-    permissions:
-      contents: read
-    steps:
-      - uses: actions/checkout@v4
-        with:
-          repository: guochenyang99/ci-model-test
-          ref: ${{ needs.prepare.outputs.controller-ref }}
-          token: ${{ secrets.MODEL_SMOKE_REPO_TOKEN }}
-          persist-credentials: false
-          path: model-ci-tools
-      - name: Publish one report and one DashHub submission
-        uses: ./model-ci-tools/.github/actions/deployment-smoke-aggregate
-        with:
-          framework: vllm
-          framework-version: '0.28.1'
-          backend: arc
-          pypi-url: ${{ vars.PYPI_URL }}
-          cases: ${{ inputs.cases || '' }}
-          matrix: ${{ needs.prepare.outputs.matrix }}
-          image: ${{ needs.prepare.outputs.image }}
-          image-id: ${{ needs.prepare.outputs.image-id }}
-          cookbook-ref: ${{ needs.prepare.outputs.cookbook-ref }}
-          controller-ref: ${{ needs.prepare.outputs.controller-ref }}
-          dashhub-token: ${{ secrets.DASHHUB_CI_TOKEN }}
-          history-token: ${{ secrets.MODEL_REPORT_HISTORY_TOKEN }}
-          mode: ${{ inputs.mode || 'execute' }}
