@@ -107,12 +107,14 @@ def pre_register_and_update(parser: object | None = None) -> None:
     from . import (
         patch_compilation_config,
         patch_engine_args,
+        patch_parallel_config,
         patch_slimquant_registry,
         patch_vllm_config,
     )
 
     patch_engine_args.apply()
     patch_compilation_config.apply()
+    patch_parallel_config.apply()
     patch_vllm_config.apply()
     patch_slimquant_registry.apply()
     if parser is not None:
