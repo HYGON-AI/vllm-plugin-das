@@ -181,10 +181,10 @@ def k3_sp_moe_enabled() -> bool:
     """Effective Kimi-K3 SP-MoE opt-in under the custom-op master.
 
     The row-sharded forward rewires KimiDecoderLayer at patch-apply time
-    (``o_proj.reduce_results`` plus the ``hcu_k3_sp_*`` collectives), so the
-    resolved master-and-child result must be persisted before VllmConfig
-    computes its compilation-cache hash: opposite-mode AOT graphs cannot
-    share an entry.
+    (``o_proj.reduce_results`` plus the ``hcu_k3_sp_*`` collectives and the
+    replicated full-width shared-expert rebuild), so the resolved
+    master-and-child result must be persisted before VllmConfig computes its
+    compilation-cache hash: opposite-mode AOT graphs cannot share an entry.
     """
     return optional_custom_op_enabled(k3_sp_moe_requested())
 

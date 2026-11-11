@@ -32,6 +32,9 @@ from . import (
     patch_hy_v3_reasoning_parser,
     patch_hy_v3_tool_parser,
     patch_import_utils,
+    patch_gdn_conv_probe,
+    patch_smoke_layer_filter,
+    patch_decode_bench_connector,
     patch_layer_name,
     patch_minimax_m3_video_processor,
     patch_nixl_utils,
@@ -66,6 +69,9 @@ _ORDERED_ADAPTERS = (
     patch_step5_splitting_ops,
     patch_step5_compile_prefix,
     patch_step5_ep_graph_capture,
+    patch_smoke_layer_filter,
+    patch_gdn_conv_probe,
+    patch_decode_bench_connector,
 )
 
 

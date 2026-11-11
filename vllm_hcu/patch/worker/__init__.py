@@ -245,6 +245,10 @@ _CORE_CALLBACKS: tuple[_CallbackSpec, ...] = (
     _CallbackSpec(_adapter("core_fix", "patch_qwen4_exp_ple_prefetch")),
     _CallbackSpec(_adapter("core_fix", "patch_qwen4_exp_ple_cudagraph")),
     _CallbackSpec(_adapter("core_fix", "patch_rocm_mla_sparse_metadata")),
+    # R94/A' stage-1: MLA-prefill FA varlen -> fp8 dispatch (own callback
+    # so its refusal is logged once, not silently swallowed by a host
+    # patch's tail). Independent of patch_mla_attention success.
+    _CallbackSpec(_adapter("core_fix", "patch_mla_prefill_fp8_a1")),
 )
 
 
@@ -276,9 +280,18 @@ _OP_CALLBACKS: tuple[_CallbackSpec, ...] = (
     _CallbackSpec(_adapter("op_opt", "patch_kimi_k3_reference_paths")),
     _CallbackSpec(_adapter("op_opt", "patch_kimi_k3_pp_aux")),
     _CallbackSpec(_adapter("op_opt", "patch_kimi_k3_mla_gate")),
+    # fp8 decode epilogue: capture-safe Triton q-concat + cache-rope route
+    # for the vendor fused op's shape contract. Off by default (opt-in:
+    # VLLM_HCU_K3_QCAT_TRITON=1) -- the vendor op was cleared of blame for
+    # the DSpark poison, so the replacement stays dormant until asked for.
+    _CallbackSpec(_adapter("op_opt", "patch_kimi_k3_nc_qcat")),
     # Must be applied after reference_paths: it wraps the
     # forward_attn_residual that adapter installs and captures it as the
     # non-SP chain. Opt-in: armed only with VLLM_HCU_K3_SP_MOE=1.
+    # The 3584 whitelist admission is process-wide at patch-apply time:
+    # if the draft build is ever enabled, its routed layers also resolve
+    # widths through the same body lists and will size at 3584 like the
+    # target.
     _CallbackSpec(_adapter("op_opt", "patch_kimi_k3_sp_moe")),
     _CallbackSpec(_adapter("op_opt", "patch_kimi_k3_mixed_kda")),
     _CallbackSpec(_adapter("op_opt", "patch_kimi_k3_mixed_linear")),
@@ -402,6 +415,13 @@ _FRAMEWORK_CALLBACKS: tuple[_CallbackSpec, ...] = (
     ),
     _CallbackSpec(
         _adapter("framework_opt", "patch_draft_speculator_inputs"),
+    ),
+    # Wraps whatever DSpark draft loader adapter installed at callback time
+    # by object identity, not by rebinding module globals (role-separation
+    # adapters do not exist on this line; ordering after
+    # patch_draft_speculator_inputs is still required).
+    _CallbackSpec(
+        _adapter("framework_opt", "patch_smoke_draft_guard"),
     ),
     _CallbackSpec(
         _adapter("framework_opt", "patch_mtp_prefill_tail"),

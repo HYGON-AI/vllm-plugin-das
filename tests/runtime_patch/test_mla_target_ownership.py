@@ -92,6 +92,16 @@ def cpu_flashmla(monkeypatch):
         UNIFORM = "uniform"
 
     class MLACommonMetadataBuilder(_GenericStub):
+        def __init__(
+            self, kv_cache_spec, layer_names, vllm_config, device, meta_cls
+        ):
+            del meta_cls
+            self.kv_cache_spec = kv_cache_spec
+            self.layer_names = layer_names
+            self.vllm_config = vllm_config
+            self.compilation_config = vllm_config.compilation_config
+            self.device = device
+
         @classmethod
         def get_cudagraph_support(cls, vllm_config, kv_cache_spec):
             del vllm_config, kv_cache_spec
@@ -1387,12 +1397,23 @@ def test_flashmla_cat_route_consumes_split_query(
     assert calls[0]["cache_seqlens"] is seq_lens
 
 
-@pytest.mark.parametrize("initial_rows", [40, 160])
-def test_flashmla_fp8_graph_metadata_grows_and_keeps_only_valid_rows(
+@pytest.mark.parametrize(
+    "initial_rows,expect_overflow",
+    [(160, False), (40, True)],
+    ids=["within-bound-keeps-valid-rows", "under-bound-refuses-growth"],
+)
+def test_flashmla_fp8_graph_metadata_fixed_upper_bound(
     monkeypatch,
     cpu_flashmla,
     initial_rows,
+    expect_overflow,
 ):
+    """Graph metadata buffers have a fixed startup upper bound: a step
+    whose planner output fits keeps only its valid rows (never exposing
+    the zero/-1-padded tail), and a step that would need MORE rows must
+    raise instead of growing -- a reallocated buffer would dangle inside
+    already-captured graphs (review P2: the growth precedent this test
+    encoded predated the fixed-bound contract)."""
     flashmla = cpu_flashmla
     valid_tile_metadata = torch.arange(80 * 8, dtype=torch.int32).reshape(80, 8)
     valid_num_splits = torch.tensor([0, 3], dtype=torch.int32)
@@ -1418,20 +1439,18 @@ def test_flashmla_fp8_graph_metadata_grows_and_keeps_only_valid_rows(
     builder.num_q_heads = 10
     builder.dcp_world_size = 1
     builder.is_fp8_kvcache = True
-    # A one-token decode needs 160 rows, while a later multi-token MTP
-    # verification needs only 80. Reusing the larger persistent buffer must
-    # not expose its zero-padded tail to the native kernel.
-    builder.cg_buf_tile_scheduler_metadata = torch.full(
-        (initial_rows, 8),
-        -1,
-        dtype=torch.int32,
-    )
-    builder.cg_buf_num_splits = torch.full((9,), -1, dtype=torch.int32)
+    # Upper-bound buffer vs. an 80-row demand: within bound the copy
+    # keeps only the valid rows; under bound the step aborts BEFORE any
+    # write, so the buffer must come out untouched.
+    tile_buf = torch.full((initial_rows, 8), -1, dtype=torch.int32)
+    splits_buf = torch.full((9,), -1, dtype=torch.int32)
+    builder.cg_buf_tile_scheduler_metadata = tile_buf
+    builder.cg_buf_num_splits = splits_buf
     builder.compilation_config = SimpleNamespace(
         cudagraph_mode=SimpleNamespace(has_full_cudagraphs=lambda: True)
     )
 
-    result = builder._build_decode(
+    kwargs = dict(
         block_table_tensor=torch.zeros(1, 3, dtype=torch.int32),
         seq_lens_device=torch.tensor([139], dtype=torch.int32),
         max_seq_len=139,
@@ -1440,6 +1459,15 @@ def test_flashmla_fp8_graph_metadata_grows_and_keeps_only_valid_rows(
         num_decode_tokens=2,
         dcp_tot_seq_lens_device=None,
     )
+    if expect_overflow:
+        with pytest.raises(AssertionError, match="exceed graph buffer"):
+            builder._build_decode(**kwargs)
+        # No partial copy: the refusal precedes every buffer write.
+        assert bool((tile_buf == -1).all())
+        assert bool((splits_buf == -1).all())
+        return
+
+    result = builder._build_decode(**kwargs)
 
     assert result.scheduler_metadata.tile_scheduler_metadata.shape == (80, 8)
     torch.testing.assert_close(
@@ -1450,6 +1478,103 @@ def test_flashmla_fp8_graph_metadata_grows_and_keeps_only_valid_rows(
         result.scheduler_metadata.num_splits,
         valid_num_splits,
     )
+
+
+def _make_nc_builder(flashmla, cache_dtype, on_gfx938=True, monkeypatch=None):
+    """Construct the real builder under the cpu_flashmla stub chain."""
+    if monkeypatch is not None:
+        monkeypatch.setattr(flashmla, "on_gfx938", lambda: on_gfx938)
+    vllm_config = SimpleNamespace(
+        model_config=SimpleNamespace(
+            get_num_attention_heads=lambda pc: 16,
+            max_model_len=2048,
+        ),
+        parallel_config=SimpleNamespace(),
+        scheduler_config=SimpleNamespace(max_num_seqs=4),
+        cache_config=SimpleNamespace(cache_dtype=cache_dtype),
+        compilation_config=SimpleNamespace(
+            cudagraph_mode=SimpleNamespace(has_full_cudagraphs=lambda: False)
+        ),
+    )
+    spec = SimpleNamespace(
+        non_causal_multi_token_decode=True, block_size=64
+    )
+    return flashmla.FlashMLAMetadataBuilder(
+        spec, ["k3.self_attn"], vllm_config, torch.device("cpu")
+    )
+
+
+@pytest.mark.parametrize("cache_dtype", ["auto", "bfloat16", "fp8_e5m2"])
+def test_flashmla_builder_refuses_nc_flatten_on_non_nc_caches(
+    cpu_flashmla, monkeypatch, cache_dtype
+):
+    """Non-NC caches must refuse the flatten at build, not mis-compute.
+
+    The backend selector's supports_non_causal() has no dtype context, so
+    for these caches it stays True and the backend may be chosen; the
+    builder must flip the per-instance flatten gate, otherwise the
+    non-causal group falls through to the stock decode calls (causal=
+    True hard-coded) and silently computes wrong causality.
+    """
+    builder = _make_nc_builder(
+        cpu_flashmla, cache_dtype, on_gfx938=True, monkeypatch=monkeypatch
+    )
+    assert builder.supports_non_causal_multi_token_decode is False
+    assert builder._nc_ready is False
+    assert "supports_non_causal_multi_token_decode" in vars(builder)
+    assert not hasattr(builder, "_nc_bt_buf")
+    # The class default must stay True for conforming builders.
+    assert (
+        cpu_flashmla.FlashMLAMetadataBuilder
+        .supports_non_causal_multi_token_decode
+        is True
+    )
+
+
+def test_flashmla_builder_refuses_nc_flatten_off_gfx938(
+    cpu_flashmla, monkeypatch
+):
+    """Review P2: the flash NC fast path is a gfx938-validated kernel
+    contract -- the vendor op off gfx938 (fwd_kvcache_quantization_mla)
+    receives no descale_q and expects an unquantized bf16 query, so an
+    e4m3 NC group off gfx938 must refuse the flatten at build instead of
+    serving q-scale-skewed logits."""
+    builder = _make_nc_builder(
+        cpu_flashmla, "fp8_e4m3", on_gfx938=False, monkeypatch=monkeypatch
+    )
+    assert builder.supports_non_causal_multi_token_decode is False
+    assert builder._nc_ready is False
+    assert not hasattr(builder, "_nc_bt_buf")
+    assert (
+        cpu_flashmla.FlashMLAMetadataBuilder
+        .supports_non_causal_multi_token_decode
+        is True
+    )
+
+
+def test_flashmla_runtime_nc_entry_gated_on_gfx938(cpu_flashmla):
+    """Defense in depth: forward_mqa's NC branch checks on_gfx938 ahead
+    of the dtype predicate (flat source-order assertion on the gate)."""
+    import inspect
+
+    source = inspect.getsource(cpu_flashmla.FlashMLAImpl.forward_mqa)
+    device_pos = source.index("on_gfx938()")
+    dtype_pos = source.index("_is_flash_nc_kv_dtype(self.kv_cache_dtype)")
+    assert device_pos < dtype_pos
+
+
+def test_flashmla_builder_keeps_nc_flatten_on_e4m3_cache(
+    cpu_flashmla, monkeypatch
+):
+    builder = _make_nc_builder(
+        cpu_flashmla, "fp8_e4m3", on_gfx938=True, monkeypatch=monkeypatch
+    )
+    assert builder._nc_ready is True
+    # No instance override: the ClassVar True remains authoritative.
+    assert "supports_non_causal_multi_token_decode" not in vars(builder)
+    assert builder.supports_non_causal_multi_token_decode is True
+    # Expanded block table: [max_num_seqs+1 rows, (max_len/page)+1 cols].
+    assert builder._nc_bt_buf.shape == (5, 33)
 
 
 @pytest.mark.parametrize("local_lse", [0.1, float("-inf")])
