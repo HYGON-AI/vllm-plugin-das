@@ -62,88 +62,6 @@ def _gemma4_gathered_kv_rows(
     return batch_size * max_seqlen_k
 
 
-_FA_SELFCHECK = os.environ.get("VLLM_HCU_GEMMA4_FA_SELFCHECK", "0").strip().lower() in {
-    "1",
-    "true",
-}
-_selfcheck_state = {"calls": 0, "mismatched_calls": 0, "max_abs_diff": 0.0}
-
-
-def _gemma4_flash_attention_legacy(
-    *,
-    q: torch.Tensor,
-    kv_cache: torch.Tensor,
-    head_size: int,
-    out: torch.Tensor,
-    cu_seqlens_q: torch.Tensor,
-    max_seqlen_q: int,
-    seqused_k: torch.Tensor,
-    max_seqlen_k: int,
-    softmax_scale: float,
-    block_table: torch.Tensor,
-) -> torch.Tensor:
-    """Cast the whole pool, then gather. Reference for the self-check only.
-
-    Set VLLM_HCU_GEMMA4_FA_SELFCHECK=1 to run this beside the live path on the
-    same inputs and compare element-wise. Nothing else can establish that:
-    comparing generated text across two server processes cannot separate a
-    real numerical difference from per-process effects, and a wrong paged
-    layout still yields fluent text, correct-looking answers and zero errors.
-    A layout bug shipped exactly that way and only this comparison caught it.
-    """
-    from flash_attn.flash_attn_interface import flash_attn_cuda
-
-    k, v = kv_cache.transpose(1, 2).split(head_size, dim=-1)
-    k = _gemma4_kv_to_query_dtype(k, q.dtype).contiguous()
-    v = _gemma4_kv_to_query_dtype(v, q.dtype).contiguous()
-    used_tokens = int(seqused_k.sum().item())
-    total_k = max(262144, used_tokens)
-    contiguous_k = torch.empty(
-        (total_k, k.shape[-2], k.shape[-1]), device=k.device, dtype=k.dtype
-    )
-    contiguous_v = torch.empty_like(contiguous_k)
-    cu_seqlens_k = torch.empty_like(cu_seqlens_q)
-    flash_attn_cuda.pagedkv_to_contiguouskv(
-        contiguous_k,
-        contiguous_v,
-        k,
-        v,
-        block_table,
-        seqused_k,
-        cu_seqlens_k,
-        max_seqlen_k,
-        _NATIVE_LAYOUT_NHD,
-    )
-    flash_attn_cuda.varlen_fwd(
-        q,
-        contiguous_k,
-        contiguous_v,
-        out,
-        cu_seqlens_q,
-        cu_seqlens_k,
-        None,
-        None,
-        None,
-        None,
-        max_seqlen_q,
-        max_seqlen_k,
-        0.0,
-        softmax_scale,
-        False,
-        True,
-        -1,
-        -1,
-        0.0,
-        False,
-        None,
-        None,
-        None,
-        None,
-        None,
-    )
-    return out
-
-
 def _gemma4_flash_attention(
     *,
     q: torch.Tensor,
@@ -160,16 +78,11 @@ def _gemma4_flash_attention(
 ) -> torch.Tensor:
     """Run the admitted BF16 D512 causal path over the layer's paged KV pool.
 
-    The pool arrives as [num_blocks, num_kv_heads, block_size, 2*head_size]
-    with K and V interleaved in the last dim. pagedkv_to_contiguouskv accepts
-    that shape directly under native layout HND and is agnostic to the row
-    dtype and width, so the batch's rows are gathered straight out of FP8
-    storage and only those rows are cast to BF16. Casting the pool first and
-    gathering afterwards costs two orders of magnitude more -- measured
-    30.1 ms vs 0.3 ms per call at the live pool size -- because it rewrites
-    every slot in the layer, including other requests' and free blocks, to
-    feed a gather that keeps ~1% of them. Both paths were verified
-    bit-identical, gathered rows and varlen_fwd output alike.
+    The pool holds every block of the layer, this batch's and everyone else's,
+    so work on the batch's own rows only: gather them out of FP8 storage, then
+    cast just those rows to BF16. pagedkv_to_contiguouskv is agnostic to the
+    row dtype and width, so the 2*head_size row carrying K and V interleaved
+    goes through as a single head dim and never needs splitting.
 
     The caller checks attention semantics, layout and that FA is not running
     under graph capture.
@@ -252,38 +165,6 @@ def _gemma4_flash_attention(
         None,
         None,
     )
-    if _FA_SELFCHECK:
-        reference = torch.empty_like(out)
-        _gemma4_flash_attention_legacy(
-            q=q,
-            kv_cache=kv_cache,
-            head_size=head_size,
-            out=reference,
-            cu_seqlens_q=cu_seqlens_q,
-            max_seqlen_q=max_seqlen_q,
-            seqused_k=seqused_k,
-            max_seqlen_k=max_seqlen_k,
-            softmax_scale=softmax_scale,
-            block_table=block_table,
-        )
-        diff = (out.float() - reference.float()).abs().max().item()
-        state = _selfcheck_state
-        state["calls"] += 1
-        state["max_abs_diff"] = max(state["max_abs_diff"], diff)
-        if diff != 0.0:
-            state["mismatched_calls"] += 1
-        logger.info(
-            "[GEMMA4_FA_SELFCHECK] call=%d max_abs_diff=%.6g mismatched_calls=%d "
-            "worst=%.6g q=%s kv_shape=%s kv_stride=%s total_k=%d",
-            state["calls"],
-            diff,
-            state["mismatched_calls"],
-            state["max_abs_diff"],
-            tuple(q.shape),
-            tuple(kv_cache.shape),
-            kv_cache.stride(),
-            total_k,
-        )
     return out
 
 
@@ -422,12 +303,11 @@ class Gemma4FAAttentionImpl(TritonAttentionImpl):
         failures.extend(getattr(self, "_fa_static_failures", ()))
         if torch.cuda.is_current_stream_capturing():
             # A captured graph bakes in both the gather buffer's address and
-            # its size, while the rows actually needed at replay are
-            # sum(seq_lens), bounded only by max_num_seqs * max_model_len.
-            # No reservation that fits in memory is a safe bound, so leave
-            # captured batches to Triton. This costs nothing today: the
-            # vendor kernel rejects paged decode above head_dim 256, so the
-            # FA path only ever served eager prefill and mixed batches.
+            # its size, while the rows needed at replay are sum(seq_lens),
+            # bounded only by max_num_seqs * max_model_len. No reservation
+            # that size fits in memory, so captured batches belong to Triton.
+            # FA serves eager prefill and mixed batches; the vendor kernel
+            # rejects paged decode above head_dim 256 regardless.
             failures.append("cudagraph_capturing")
         if metadata is None:
             failures.append("metadata_none")
@@ -486,10 +366,9 @@ class Gemma4FAAttentionImpl(TritonAttentionImpl):
             and kv_cache.stride(0)
             != kv_cache.shape[2] * self.num_kv_heads * 2 * self.head_size,
             # The gather kernel reads a bare pointer and silently produces
-            # wrong values for any layout other than the one it is told. The
-            # stride checks above already describe a pool that is contiguous
-            # once transposed to [blocks, block_size, kv_heads, 2*head_size];
-            # state that requirement directly so it cannot regress.
+            # wrong values for any layout other than the one it is told, so
+            # require the layout it is given: a pool that is contiguous once
+            # transposed to [blocks, block_size, kv_heads, 2*head_size].
             "kv_layout_not_nhd": kv_cache.ndim == 4
             and not kv_cache.transpose(1, 2).is_contiguous(),
         }
