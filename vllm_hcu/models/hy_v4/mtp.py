@@ -413,6 +413,9 @@ class HYV4MultiTokenPredictor(nn.Module, MixtureOfExperts):
 class HYV4MTP(nn.Module, MixtureOfExperts, SupportsPP):
     """Native HYV4 draft, loaded and sampled through the pinned owners."""
 
+    # The draft consumes cached target embeddings; it has no vision encoder.
+    supports_target_mm_embeddings = True
+
     packed_modules_mapping = {
         "gate_up_proj": ["gate_proj", "up_proj"],
         "wk_weights_proj": ["wk", "weights_proj"],
@@ -451,8 +454,18 @@ class HYV4MTP(nn.Module, MixtureOfExperts, SupportsPP):
     def set_topk_indices_buffer(self, topk_indices_buffer: torch.Tensor) -> None:
         self.model.topk_indices_buffer = topk_indices_buffer
 
-    def embed_input_ids(self, input_ids: torch.Tensor) -> torch.Tensor:
-        return self.model.embed_input_ids(input_ids)
+    def embed_input_ids(
+        self, input_ids: torch.Tensor, multimodal_embeddings=None,
+        *, is_multimodal: torch.Tensor | None = None,
+    ) -> torch.Tensor:
+        from vllm.model_executor.models.utils import _merge_multimodal_embeddings
+
+        embeds = self.model.embed_input_ids(input_ids)
+        if multimodal_embeddings is not None:
+            embeds = _merge_multimodal_embeddings(
+                embeds, multimodal_embeddings, is_multimodal=is_multimodal,
+            )
+        return embeds
 
     def forward(
         self, input_ids: torch.Tensor, positions: torch.Tensor,

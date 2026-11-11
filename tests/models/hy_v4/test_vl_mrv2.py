@@ -164,6 +164,141 @@ def _req_states(batch):
     )
 
 
+@pytest.mark.parametrize("computed,count", [(0, 70), (3, 45), (33, 21), (56, 9)])
+def test_mtp_shifted_images_reach_predictor_across_pcp16_chunks(
+    make_state, monkeypatch, computed, count
+):
+    from vllm_hcu.models.hy_v4.mtp import HYV4MTP, HYV4MultiTokenPredictor
+    from vllm_hcu.v1.spec_decode import pcp_mtp
+
+    monkeypatch.setattr(
+        pcp_mtp.ar, "set_forward_context", lambda *a, **k: nullcontext()
+    )
+    batch = _make_batch(
+        [
+            ("text", [91], 20, False),
+            (
+                "images",
+                list(range(computed + 1, computed + count + 1)),
+                computed + count,
+                True,
+            ),
+            ("text-prefill", [81, 82, 83], 13, True),
+        ]
+    )
+    shifted = batch.input_ids.clone()
+    shifted[0] = 92
+    shifted[1 : count + 1] += 1
+    shifted[count + 1 :] += 1
+    managers, _ = _make_managers(16)
+    for manager in managers:
+        state, cache = make_state()
+        cache.mm_features.update(
+            text=[],
+            images=[
+                _feature("a", 2, 36),
+                _feature("b", 42, 19),
+            ],
+            **{"text-prefill": []},
+        )
+        predictor = HYV4MultiTokenPredictor.__new__(HYV4MultiTokenPredictor)
+        torch.nn.Module.__init__(predictor)
+        predictor.embed_tokens = lambda ids: ids.float()[:, None].repeat(1, 2)
+        predictor.requires_topk_indices_buffer = False
+        predictor.mtp_start_layer_idx = 78
+        predictor.layers = {"78": lambda ids, pos, hidden, embeds: embeds}
+        model = HYV4MTP.__new__(HYV4MTP)
+        torch.nn.Module.__init__(model)
+        model.model = predictor
+        local = manager.partition_batch(batch)
+        manager.prepare_draft_prefill(batch, shifted)
+        draft = object.__new__(pcp_mtp.HcuPCPMTPSpeculator)
+        draft.pcp_manager = manager
+        draft.target_model_state = None
+        draft.input_buffers = SimpleNamespace(input_ids=shifted)
+        draft.vllm_config = None
+        draft.model = model
+        draft.supports_mm_inputs = True
+        draft.inputs_embeds = torch.full((128, 2), -77.0)
+        draft._pcp_inputs_embeds = torch.full((128, 2), -88.0)
+        draft.hidden_states = torch.ones(128, 2)
+        for change in (0, 500):
+            cache.encoder_outputs.update(
+                a=(torch.arange(2, 38) + 1000 + change)[:, None].repeat(1, 2),
+                b=(torch.arange(42, 61) + 1000 + change)[:, None].repeat(1, 2),
+            )
+            # Execute native cache slicing, including +1 at chunk boundaries.
+            mm_inputs = state.gather_mm_embeddings(batch, draft_lookahead=1)
+            actual, _ = draft._run_model(
+                local.num_tokens_after_padding,
+                {},
+                {},
+                None,
+                mm_inputs=mm_inputs,
+            )
+            for row, req in enumerate(local.req_ids):
+                lo, hi = local.query_start_loc_np[row : row + 2]
+                for j in range(int(lo), int(hi)):
+                    pos = int(local.positions[j])
+                    if local.is_padding[j] or pos == 0:
+                        expected = 0
+                    elif req == "images":
+                        next_pos = pos + 1
+                        expected = (
+                            1000 + change + next_pos
+                            if 2 <= next_pos < 38 or 42 <= next_pos < 61
+                            else next_pos + 1
+                        )
+                    elif req == "text":
+                        expected = 92
+                    else:
+                        expected = 82 + pos - 10
+                    assert actual[j].tolist() == [expected, expected]
+
+        # Later draft steps are replicated text-only rows. They must overwrite
+        # the image-bearing global scratch rather than reuse stale embeddings.
+        manager.draft_prefill_batch = None
+        draft.input_buffers = SimpleNamespace(
+            input_ids=torch.tensor([9]),
+            positions=torch.tensor([72]),
+        )
+        for mm_inputs in (None, ([], torch.zeros(1, dtype=torch.bool))):
+            actual, _ = draft._run_model(1, {}, {}, None, mm_inputs=mm_inputs)
+            assert actual.tolist() == [[9, 9]]
+        draft.supports_mm_inputs = False
+        actual, _ = draft._run_model(1, {}, {}, None)
+        assert actual.tolist() == [[9, 9]]
+
+
+@pytest.mark.parametrize(
+    "capable,target_mm", [(True, True), (True, False), (False, True)]
+)
+def test_mtp_target_embedding_capability_respects_target_modalities(
+    monkeypatch, capable, target_mm
+):
+    from vllm.multimodal import MULTIMODAL_REGISTRY
+
+    from vllm_hcu.models.hy_v4.mtp import HYV4MTP
+    from vllm_hcu.v1.spec_decode import pcp_mtp
+
+    monkeypatch.setattr(pcp_mtp.MTPSpeculator, "load_model", lambda *a: None)
+    monkeypatch.setattr(
+        MULTIMODAL_REGISTRY,
+        "supports_multimodal_inputs",
+        lambda config: target_mm,
+    )
+    draft = object.__new__(pcp_mtp.HcuPCPMTPSpeculator)
+    draft.model = HYV4MTP if capable else SimpleNamespace()
+    draft.vllm_config = SimpleNamespace(model_config=object())
+    draft.supports_mm_inputs = False
+    draft.hidden_states = torch.zeros(128, 2)
+    draft.load_model(object())
+    assert draft.supports_mm_inputs == (capable and target_mm)
+    if draft.supports_mm_inputs:
+        assert draft.inputs_embeds.shape == draft.hidden_states.shape
+        assert draft.inputs_embeds.data_ptr() != draft._pcp_inputs_embeds.data_ptr()
+
+
 @pytest.mark.parametrize("computed,count", [(0, 16), (3, 10), (6, 8), (11, 5)])
 def test_native_multi_image_partial_windows_and_both_pcp_segments(
     make_state, computed, count

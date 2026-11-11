@@ -13,6 +13,7 @@ from typing import Any
 
 import torch
 from vllm.config.compilation import CUDAGraphMode
+from vllm.multimodal import MULTIMODAL_REGISTRY
 from vllm.v1.worker.gpu.input_batch import InputBatch
 from vllm.v1.worker.gpu.spec_decode import speculator as spec
 from vllm.v1.worker.gpu.spec_decode.autoregressive import speculator as ar
@@ -35,6 +36,23 @@ class HcuPCPMTPSpeculator(MTPSpeculator):
         self.draft_is_prefilling = torch.zeros(
             self.max_num_reqs, dtype=torch.bool, device="cpu"
         )
+
+    def load_model(self, target_model: torch.nn.Module) -> None:
+        super().load_model(target_model)
+        # Upstream checks the draft's processor registry. HYV4 MTP only
+        # consumes the target's cached image vectors, so use the target's
+        # modality limits without registering a second vision encoder.
+        if (
+            not self.supports_mm_inputs
+            and getattr(self.model, "supports_target_mm_embeddings", False)
+            and MULTIMODAL_REGISTRY.supports_multimodal_inputs(
+                self.vllm_config.model_config
+            )
+        ):
+            self.supports_mm_inputs = True
+            self.inputs_embeds = torch.zeros_like(self.hidden_states)
+        if self.supports_mm_inputs:
+            self._pcp_inputs_embeds = torch.empty_like(self.inputs_embeds)
 
     def _build_draft_attn_metadata(
         self,
@@ -312,12 +330,26 @@ class HcuPCPMTPSpeculator(MTPSpeculator):
                 num_input_tokens = (
                     is_mm_embed.shape[0] if is_mm_embed is not None else num_tokens
                 )
+                embed_buffers = input_buffers
+                if local is not None:
+                    # mm_inputs comes from the canonical target cache with
+                    # draft_lookahead=1. Merge before PCP selection: an image
+                    # can cross ranks, request boundaries and prefill chunks.
+                    num_input_tokens = manager.get_global_batch(local).num_tokens
+                    embed_buffers = self.input_buffers
                 self.inputs_embeds[:num_input_tokens] = self.model.embed_input_ids(
-                    input_buffers.input_ids[:num_input_tokens],
+                    embed_buffers.input_ids[:num_input_tokens],
                     multimodal_embeddings=mm_embeds,
                     is_multimodal=is_mm_embed,
                 )
                 inputs_embeds = self.inputs_embeds[:num_tokens]
+                if local is not None:
+                    inputs_embeds = manager.gather_global_token_tensor(
+                        self.inputs_embeds[:num_input_tokens],
+                        local,
+                        token_dim=0,
+                        out=self._pcp_inputs_embeds[:num_tokens],
+                    )
 
             model_inputs = dict(
                 input_ids=input_buffers.input_ids[:num_tokens],
