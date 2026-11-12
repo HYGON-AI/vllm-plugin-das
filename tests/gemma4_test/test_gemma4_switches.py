@@ -23,11 +23,12 @@ from vllm_hcu.utils.gemma4_switches import (
 )
 
 RETIRED = ("VLLM_HCU_GEMMA4_USE_FA", "VLLM_HCU_GEMMA4_BW1000_OPT")
+MASTER = "VLLM_HCU_USE_CUSTOM_OPS"
 
 
 @pytest.fixture(autouse=True)
 def _clean_env(monkeypatch):
-    for name in (SWITCH, *RETIRED):
+    for name in (SWITCH, *RETIRED, MASTER):
         monkeypatch.delenv(name, raising=False)
 
 
@@ -105,3 +106,38 @@ def test_check_tolerates_a_config_without_model_config():
 def test_check_tolerates_a_bare_config_with_retired_name(monkeypatch, retired):
     monkeypatch.setenv(retired, "1")
     check_retired_switches(SimpleNamespace())  # model unknown -> do not refuse
+
+
+@pytest.mark.parametrize("master", ["0", "false", "False"])
+def test_custom_op_master_off_disables_the_bundle(monkeypatch, master):
+    """The bundle is subordinate to the plugin-wide custom-op master.
+
+    Otherwise turning the master off would still install the FA registration,
+    the attention tuning, the TunableOp table and the LM-head work, so it
+    would no longer describe a baseline with no custom ops.
+    """
+    monkeypatch.setenv(SWITCH, "1")
+    monkeypatch.setenv(MASTER, master)
+    assert gemma4_bw1000_enabled() is False
+
+
+@pytest.mark.parametrize("master", ["1", "true", "True"])
+def test_custom_op_master_on_leaves_the_switch_in_charge(monkeypatch, master):
+    monkeypatch.setenv(MASTER, master)
+    monkeypatch.setenv(SWITCH, "1")
+    assert gemma4_bw1000_enabled() is True
+    monkeypatch.setenv(SWITCH, "0")
+    assert gemma4_bw1000_enabled() is False
+
+
+@pytest.mark.parametrize("retired", RETIRED)
+def test_retired_check_follows_intent_not_the_master(monkeypatch, retired):
+    """Refusal is about what the operator asked for.
+
+    With the new switch set, a leftover retired name is harmless whether or
+    not the master happens to disable the bundle, so this must not refuse.
+    """
+    monkeypatch.setenv(retired, "1")
+    monkeypatch.setenv(SWITCH, "1")
+    monkeypatch.setenv(MASTER, "0")
+    check_retired_switches(config("gemma4"))  # must not raise

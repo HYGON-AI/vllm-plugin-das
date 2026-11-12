@@ -30,6 +30,35 @@ _NATIVE_LAYOUT_NHD = 2  # [num_blocks, block_size, num_kv_heads, head_dim]
 _GEMMA4_SEQ_LENS_BOUND = "_vllm_hcu_seq_lens_cpu_upper_bound"
 
 
+_NATIVE_WARP_SIZE = 64  # paged_attention.h; gfx936 wave size
+
+
+def _gemma4_bshd_stride_is_zero(row_width: int, itemsize: int) -> bool:
+    """Would ``write_one_block_bshd`` advance by zero for this row width?
+
+    The NHD selector routes to ``write_one_block_bshd``, whose loop reads
+
+        vec_size      = 16 / sizeof(cache_t)
+        thread_per_dim = head_size / vec_size
+        i += WARP_SIZE / thread_per_dim * num_head * head_size
+
+    with integer division. ``head_size`` here is the gather's row width, and
+    this model's pool interleaves K and V, so it is ``2 * head_size`` = 1024.
+    At one byte per element that gives thread_per_dim 64 and a stride of one
+    row group; at two bytes it gives 128, and ``WARP_SIZE / 128`` truncates to
+    zero -- the loop then never advances and the worker hangs on a non-empty
+    page. ``write_one_block_bhsd``, which HND uses, strides by
+    ``WARP_SIZE * vec_size`` and cannot reach zero, so this applies to NHD
+    only.
+    """
+
+    vec_size = 16 // itemsize
+    if vec_size <= 0:
+        return True
+    thread_per_dim = row_width // vec_size
+    return thread_per_dim > _NATIVE_WARP_SIZE
+
+
 def _gemma4_paged_view(cache: torch.Tensor) -> tuple[torch.Tensor, int] | None:
     """Describe the pool to the gather in the order it is actually stored in.
 
@@ -402,6 +431,16 @@ class Gemma4FAAttentionImpl(TritonAttentionImpl):
             # pages satisfy neither and route to Triton.
             "kv_layout_unsupported": kv_cache.ndim == 4
             and _gemma4_paged_view(kv_cache) is None,
+            # The NHD gather's loop stride truncates to zero once an element
+            # is wide enough, which hangs the worker rather than returning a
+            # wrong answer. BF16 KV at this model's 1024-wide interleaved row
+            # hits exactly that; see _gemma4_bshd_stride_is_zero.
+            "kv_bshd_zero_stride": kv_cache.ndim == 4
+            and (view := _gemma4_paged_view(kv_cache)) is not None
+            and view[1] == _NATIVE_LAYOUT_NHD
+            and _gemma4_bshd_stride_is_zero(
+                kv_cache.shape[3], kv_cache.element_size()
+            ),
         }
         failures.extend(name for name, failed in checks.items() if failed)
         self._log_fa_failures(failures, query, kv_cache, metadata, layer_name)

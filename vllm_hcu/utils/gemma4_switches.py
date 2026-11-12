@@ -46,8 +46,8 @@ _TRUE = {"1", "true"}
 _FALSE = {"", "0", "false"}
 
 
-def gemma4_bw1000_enabled() -> bool:
-    """Is the Gemma4 BW1000 optimization bundle switched on?"""
+def _switch_requested() -> bool:
+    """Did the operator ask for the bundle, ignoring the custom-op master?"""
     raw = os.environ.get(SWITCH)
     if raw is None:
         return False
@@ -59,6 +59,21 @@ def gemma4_bw1000_enabled() -> bool:
     # A typo must not read as "off": that would turn an intended optimization
     # into a no-op with nothing in the log to show it.
     raise ValueError(f"{SWITCH} must be 0/1 or false/true, got {raw!r}")
+
+
+def gemma4_bw1000_enabled() -> bool:
+    """Is the Gemma4 BW1000 optimization bundle switched on?
+
+    Subordinate to ``VLLM_HCU_USE_CUSTOM_OPS``, like every other optional
+    optimized path in this plugin. Without that, turning the master off would
+    still leave the FA registration, the attention tuning, the TunableOp table
+    and the LM-head work installed, so the master would no longer describe a
+    clean baseline -- and a table whose environment validation fails would
+    still refuse to start a server that asked for no custom ops at all.
+    """
+    from vllm_hcu.platforms.envs import optional_custom_op_enabled
+
+    return optional_custom_op_enabled(_switch_requested())
 
 
 def _retired_in_environment() -> tuple[str, ...]:
@@ -97,7 +112,7 @@ def check_retired_switches(vllm_config) -> None:
     it stays a warning.
     """
     retired = _retired_in_environment()
-    if not retired or gemma4_bw1000_enabled():
+    if not retired or _switch_requested():
         return
     hf_config = getattr(getattr(vllm_config, "model_config", None), "hf_config", None)
     if getattr(hf_config, "model_type", None) != "gemma4":
