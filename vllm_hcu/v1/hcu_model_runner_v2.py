@@ -288,6 +288,12 @@ class HcuGPUModelRunnerV2(GPUModelRunner):
                 skinny_lm_head.enable_for_model(model)
 
     def reload_weights(self, *args, **kwargs) -> None:
+        from vllm_hcu.model_executor.layers.quantization.grouped_w4a16_moe_runtime import (
+            snapshot_grouped_w4a16_scale_owners,
+            refresh_grouped_w4a16_scale_caches,
+        )
+
+        previous_grouped_owners = snapshot_grouped_w4a16_scale_owners(self.get_model())
         super().reload_weights(*args, **kwargs)
         from vllm_hcu.patch.worker.core_fix.patch_deepseek_v4_rocm_wo_a_layout import (
             refresh_wo_a_bf16_caches,
@@ -299,6 +305,7 @@ class HcuGPUModelRunnerV2(GPUModelRunner):
         )
 
         refresh_hcu_w4a8_scale_caches(self.get_model())
+        refresh_grouped_w4a16_scale_caches(self.get_model(), previous_grouped_owners)
 
     @property
     def pcp_manager_cls(self):
