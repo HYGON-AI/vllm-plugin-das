@@ -338,3 +338,48 @@ def test_filtered_waiting_queues_restore_order_and_upstream_changes(monkeypatch,
     assert scheduler.waiting is queues[0]
     assert scheduler.skipped_waiting is queues[1]
     assert list(scheduler.waiting) == [preempted, first, last]
+
+
+@pytest.mark.parametrize("queue_name", ["waiting", "skipped_waiting"])
+@pytest.mark.parametrize("streaming_slots", [0, 1])
+@pytest.mark.parametrize("remote_kv", [False, True])
+def test_full_request_slots_do_not_reserve_waiting_decode_steps(
+    monkeypatch, queue_name, streaming_slots, remote_kv,
+):
+    monkeypatch.setenv("VLLM_HCU_PCP_ISOLATE_PREFILL_MIN_TOKENS", "128")
+    monkeypatch.setenv("VLLM_HCU_PCP_ISOLATE_PREFILL_MAX_STEPS", "1")
+    chunk = _request("chunk", prompt=8192, computed=2048)
+    resumed = _request("resumed", total=80, computed=79)
+    scheduler = _scheduler([chunk], [resumed])
+    scheduler.num_waiting_for_streaming_input = streaming_slots
+    scheduler.max_num_running_reqs = 1 + streaming_slots
+    if queue_name == "skipped_waiting":
+        scheduler.waiting.remove_request(resumed)
+        scheduler.skipped_waiting.add_request(resumed)
+    if remote_kv:
+        resumed.status = RequestStatus.WAITING_FOR_REMOTE_KVS
+        scheduler.finished_recving_kv_req_ids.add(resumed.request_id)
+
+        def promote(request):
+            assert request.request_id in scheduler.finished_recving_kv_req_ids
+            request.status = RequestStatus.WAITING
+            return True
+
+        scheduler._try_promote_blocked_waiting_request = promote
+
+    # Even a streak inherited from a previous mixed phase must not reserve an
+    # empty decode step while the waiting request cannot be admitted.
+    setattr(scheduler, patch._ISOLATE_STREAK, 1)
+    for _ in range(4):
+        # Keep the fixture in the chunked-prefill phase across repeated calls.
+        chunk.num_computed_tokens = 2048
+        output = scheduler.schedule()
+        assert output.num_scheduled_tokens == {"chunk": 2048}
+        assert getattr(scheduler, patch._ISOLATE_STREAK) == 0
+        assert list(getattr(scheduler, queue_name)) == [resumed]
+
+    # Once a slot opens, isolation and its reserved decode step work again.
+    scheduler.max_num_running_reqs += 1
+    chunk.num_computed_tokens = 2048
+    assert scheduler.schedule().num_scheduled_tokens == {"chunk": 2048}
+    assert scheduler.schedule().num_scheduled_tokens == {"resumed": 1}

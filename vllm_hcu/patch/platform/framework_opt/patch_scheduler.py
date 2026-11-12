@@ -296,9 +296,18 @@ def _install_pcp_prefill_isolation(scheduler: type) -> None:
             if _prefill_remaining(r) == 0
             and r.next_decode_eligible_step <= step
         ]
-        waiting_decodes = any(
-            _waiting_prefill_ready(self, r) and _prefill_remaining(r) == 0
-            for queue in (self.skipped_waiting, self.waiting) for r in queue
+        from vllm.v1.core.sched.interface import PauseState
+
+        # Waiting decodes can reserve a step only if upstream can admit them.
+        # Paused streaming sessions also retain model-runner request slots.
+        num_running = len(self.running) + self.num_waiting_for_streaming_input
+        waiting_decodes = (
+            self._pause_state == PauseState.UNPAUSED
+            and num_running < self.max_num_running_reqs
+            and any(
+                _waiting_prefill_ready(self, r) and _prefill_remaining(r) == 0
+                for queue in (self.skipped_waiting, self.waiting) for r in queue
+            )
         )
         if (
             not (decodes or waiting_decodes)
