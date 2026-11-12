@@ -106,6 +106,103 @@ def physical_page_records(cache):
     return cache.shape[1]
 
 
+# One canonical decode page is 64 records of 68 bytes (64 payload + 4 scale).
+STAGING_PAGE_BYTES = 4352
+_STAGING_KEY = ('fp4_indexer_decode_staging',)
+# The persistent pool reserved during the startup profile, if one was reserved.
+_reserved_pool = None
+
+
+def decode_rows(cfg):
+    """Decode rows one step can carry, including speculative tokens."""
+    spec = cfg.speculative_config
+    extra = spec.num_speculative_tokens if spec else 0
+    return cfg.scheduler_config.max_num_seqs * (1 + extra)
+
+
+def staging_plan(cfg, max_model_len, compress_ratio):
+    """Shapes the decode staging needs at the configured maximum.
+
+    Returns ``None`` when the allocator already uses 64-record pages, because
+    ``stage_decode_pages`` then returns the cache zero-copy and allocates
+    nothing. Otherwise returns the persistent pool shape plus the byte count of
+    the transient gather/index scratch that coexists with it.
+    """
+    block = cfg.cache_config.block_size
+    if compress_ratio <= 0 or block % compress_ratio:
+        return None
+    page_records = block // compress_ratio
+    if page_records == 64:
+        return None
+    requests = decode_rows(cfg)
+    pages_per_row = (max_model_len + 63) // 64
+    width = pages_per_row * 64
+    slots = requests * width
+    # Conservative sum of everything stage_decode_pages allocates besides the
+    # pool itself: offsets/valid/logical/physical/slots index tensors, the
+    # gather payload and scale returns, and their contiguous byte views.
+    transient = slots * (8 * 5 + 1 + 64 * 2 + 4 * 2) + width * 8
+    return dict(requests=requests, pages_per_row=pages_per_row,
+                page_records=page_records, transient=transient,
+                shape=(requests, pages_per_row, STAGING_PAGE_BYTES))
+
+
+def _staging_pool(plan, device):
+    """Return the persistent staging pool, workspace-backed when available.
+
+    Reserving this during the startup profile is what keeps the decode staging
+    inside the memory budget: the profile peak then covers it, instead of the
+    first long-context decode step allocating it outside the planned peak.
+    """
+    from vllm.v1.worker.workspace import (current_workspace_manager,
+                                          is_workspace_manager_initialized)
+    if is_workspace_manager_initialized():
+        return current_workspace_manager().get_persistent(
+            _STAGING_KEY, plan['shape'], torch.uint8)
+    return torch.empty(plan['shape'], dtype=torch.uint8, device=device)
+
+
+def reserve_decode_staging(cfg, max_model_len, compress_ratio, device):
+    """Account for the decode staging during the startup profile pass.
+
+    Two separate costs are covered, because they behave differently:
+
+    * the staging pool is a persistent workspace buffer that decode reuses, so
+      it is created here and stays allocated for the life of the process;
+    * the gather return buffers and index temporaries are allocated and freed
+      per step by ``stage_decode_pages``, so a same-size transient allocation
+      is made here purely to raise the measured profile peak. It is released
+      immediately, which is what makes the peak honest without permanently
+      holding the bytes.
+    """
+    plan = staging_plan(cfg, max_model_len, compress_ratio)
+    if plan is None:
+        return None
+    pool = _staging_pool(plan, device)
+    probe = torch.empty(plan['transient'], dtype=torch.uint8, device=device)
+    del probe
+    global _reserved_pool
+    _reserved_pool = pool
+    return pool
+
+
+def _staging_target(cache, requests, pages_per_row):
+    """Return the staging pages buffer for this step.
+
+    The buffer is the persistent workspace pool reserved during the startup
+    profile whenever it fits, so the decode hot path stops allocating a new
+    staging pool outside the planned peak. A request set larger than the
+    reserved maximum (only reachable when the scheduler exceeds the configured
+    bound) still gets a correct, unplanned allocation rather than a wrong
+    answer.
+    """
+    shape = (requests, pages_per_row, STAGING_PAGE_BYTES)
+    pool = _reserved_pool
+    if pool is not None and pool.shape == shape and pool.device == cache.device:
+        return pool
+    return torch.empty(shape, dtype=torch.uint8, device=cache.device)
+
+
 def stage_decode_pages(cache, block_table, row_ends, max_context_len, gather):
     """Stage non-64 allocator pages into LightOp's canonical decode pages.
 
@@ -144,8 +241,7 @@ def stage_decode_pages(cache, block_table, row_ends, max_context_len, gather):
         requests, pages_per_row, 4096)
     scale_bytes = scales.contiguous().view(torch.uint8).reshape(
         requests, pages_per_row, 256)
-    pages = torch.empty((requests, pages_per_row, 4352),
-                        dtype=torch.uint8, device=cache.device)
+    pages = _staging_target(cache, requests, pages_per_row)
     pages[..., :4096].copy_(payload_bytes)
     pages[..., 4096:].copy_(scale_bytes)
     flat_pool = pages.reshape(requests * pages_per_row, 4352)
@@ -232,11 +328,15 @@ def execute(layer, hidden, query, weights):
         # Profile the real dense logits bound without reading the empty cache.
         from vllm.v1.worker.workspace import current_workspace_manager
         cfg = get_current_vllm_config()
-        decode_rows = cfg.scheduler_config.max_num_seqs * (
-            1 + (cfg.speculative_config.num_speculative_tokens if cfg.speculative_config else 0))
-        rows = max(hidden.shape[0], decode_rows)
+        rows = max(hidden.shape[0], decode_rows(cfg))
         current_workspace_manager().get_simultaneous(
             ((rows, (layer.max_model_len + 3) // 4 * 4), torch.float32))
+        # The decode staging pool and its per-step scratch are allocated here,
+        # during the profile pass, so the measured peak covers them. Reserving
+        # only the FP32 logits above is what let a long-context decode allocate
+        # up to ~272 MiB (131k context, 32 concurrent) outside the budget.
+        reserve_decode_staging(cfg, layer.max_model_len, layer.compress_ratio,
+                               hidden.device)
         return layer.topk_indices_buffer
     from .v41_indexer import _select
     cache = cache_view(layer.k_cache.kv_cache)
