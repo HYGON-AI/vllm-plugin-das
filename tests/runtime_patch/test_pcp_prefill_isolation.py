@@ -8,22 +8,20 @@ import pytest
 
 from vllm.v1.core.sched.interface import PauseState
 from vllm.v1.core.sched.request_queue import FCFSRequestQueue, SchedulingPolicy
-from vllm.v1.request import RequestStatus
+from vllm import SamplingParams
+from vllm.v1.request import Request
 
 from vllm_hcu.patch.platform.framework_opt import patch_scheduler
 
 
 def _request(name, prompt, computed, eligible=0):
-    return SimpleNamespace(
-        request_id=name,
-        num_prompt_tokens=prompt,
-        num_tokens=max(prompt, computed + 1),
-        status=RequestStatus.WAITING,
-        num_stale_output_tokens=0,
-        drop_stale_output=False,
-        num_computed_tokens=computed,
-        next_decode_eligible_step=eligible,
-    )
+    # Use the real identity/hash semantics required by upstream request queues.
+    request = Request(name, [1] * prompt, SamplingParams(max_tokens=8192), None)
+    if computed + 1 > prompt:
+        request.append_output_token_ids([7] * (computed + 1 - prompt))
+    request.num_computed_tokens = computed
+    request.next_decode_eligible_step = eligible
+    return request
 
 
 class _FakeScheduler:
