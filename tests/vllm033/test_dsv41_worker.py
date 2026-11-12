@@ -112,14 +112,19 @@ def platform(monkeypatch):
     (True, 8, "deep_gemm_mega_moe", "deepseek_v41", "hcu_vllm_das.dsv41.worker.HcuDSV41PcpWorker"),
     (True, 8, "deep_gemm", "deepseek_v41", "hcu_vllm_das.dsv41.worker.HcuDSV41PcpWorker"),
     (False, 8, "deep_gemm_mega_moe", "deepseek_v41", "hcu_adapter.bridges.vllm_worker.Worker"),
+    (None, 8, "deep_gemm_mega_moe", "deepseek_v41", "hcu_vllm_das.dsv41.worker.HcuDSV41PcpWorker"),
+    (None, 8, "deep_gemm", "deepseek_v41", "hcu_vllm_das.dsv41.worker.HcuDSV41PcpWorker"),
+    (None, 1, "deep_gemm_mega_moe", "deepseek_v41", "hcu_adapter.bridges.vllm_worker.Worker"),
+    (None, 8, "triton", "deepseek_v41", "hcu_adapter.bridges.vllm_worker.Worker"),
+    (None, 8, "deep_gemm_mega_moe", "other", "hcu_adapter.bridges.vllm_worker.Worker"),
     (True, 1, "deep_gemm_mega_moe", "deepseek_v41", "hcu_adapter.bridges.vllm_worker.Worker"),
     (True, 8, "triton", "deepseek_v41", "hcu_adapter.bridges.vllm_worker.Worker"),
     (True, 8, "deep_gemm_mega_moe", "other", "hcu_adapter.bridges.vllm_worker.Worker"),
 ])
 def test_switch_selects_worker_only_for_pcp_channel_fp8(platform, monkeypatch,
                                                        enabled, pcp, backend, model, expected):
-    if enabled:
-        monkeypatch.setenv("VLLM_HCU_DSV41_PCP_PROFILE_WORKER", "1")
+    if enabled is not None:
+        monkeypatch.setenv("VLLM_HCU_DSV41_PCP_PROFILE_WORKER", "1" if enabled else "0")
     host, module = platform
     assert module.install(host)
     config = _profile_config(None, pcp, backend, model)
@@ -149,10 +154,10 @@ def test_install_is_idempotent_and_keeps_core_behavior(platform):
     assert wrapped.__wrapped__ is core
 
 
-def test_switch_defaults_off_and_rejects_non_boolean(platform, monkeypatch):
+def test_switch_defaults_on_and_rejects_non_boolean(platform, monkeypatch):
     from hcu_vllm_das.environment import dsv41_profile_worker_enabled
 
-    assert dsv41_profile_worker_enabled() is False
+    assert dsv41_profile_worker_enabled() is True
     monkeypatch.setenv("VLLM_HCU_DSV41_PCP_PROFILE_WORKER", "maybe")
     with pytest.raises(ValueError, match="must be a boolean"):
         dsv41_profile_worker_enabled()

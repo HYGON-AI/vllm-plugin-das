@@ -44,12 +44,12 @@ def rms_norm_enabled() -> bool:
 
 
 def dsv41_profile_worker_enabled() -> bool:
-    """Opt in to the rank-local PCP memory-profile worker.
+    """Use rank-local PCP memory profiling by default; allow explicit rollback.
 
     Without it Core profiles every rank with the full global batch of dummy
     tokens, so PCP8 reserves K/V memory for tokens one rank never sees.
     """
-    return _flag(_DSV41_PROFILE_WORKER_SWITCH, default=False)
+    return _flag(_DSV41_PROFILE_WORKER_SWITCH, default=True)
 
 
 def prefill_gather_enabled() -> bool:
