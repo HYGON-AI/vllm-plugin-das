@@ -12,7 +12,8 @@ FROM ${BASE_IMAGE}
 
 ENV ROCM_PATH=/opt/dtk
 
-RUN echo "source /opt/dtk/env.sh" >> ~/.bashrc
+RUN echo "source /opt/dtk/env.sh" >> ~/.bashrc && \
+    echo 'export LD_LIBRARY_PATH=/usr/local/lib/python3.10/dist-packages/amdsmi:$LD_LIBRARY_PATH' >> ~/.bashrc
 
 SHELL ["/bin/bash", "-c"]
 
@@ -59,22 +60,15 @@ RUN wget -q "${RESOURCE_SERVER_URL}/Jenkins/CI_scripts/dtk_blas_cut_installer.sh
     rm -f /tmp/dtk_blas_cut_installer.sh
 
 # ---layer--- vLLM 框架依赖
-# SMI 库用 hcusmi 替代 amdsmi (同 pytorch 2.11 镜像做法): hcusmi 所需的新版
-# libhcu_smi.so 驱动系统路径下是旧版, 由下方归档提供, LD_LIBRARY_PATH 已固化
 ARG VLLM_VERSION
 RUN pip install --no-cache-dir ninja wheel setuptools \
     && pip install --no-cache-dir ray[data,train,tune,serve] -i https://mirrors.aliyun.com/pypi/simple/ --trusted-host mirrors.aliyun.com \
-    && pip install --no-cache-dir hcusmi==1.0.0+a788f784 \
+    && pip install --no-cache-dir amdsmi==1.0.0+630c16a6.dirty \
     && pip install --no-cache-dir cupy \
     && pip install --no-cache-dir apache-tvm-ffi==0.1.11 -i https://mirrors.aliyun.com/pypi/simple/ --trusted-host mirrors.aliyun.com \
     && pip install --no-cache-dir vllm==${VLLM_VERSION} \
     && pip install --no-cache-dir vllm-hcu==${VLLM_VERSION} \
     && pip cache purge
-
-# hcusmi 所需的新版 libhcu_smi.so 等驱动系统路径下是旧版, 随归档提供 (走 RESOURCE_SERVER_URL)
-RUN mkdir -p /opt/hcusmi && \
-    wget -q -O - "${RESOURCE_SERVER_URL}/customized/hcusmi/lib64.tar.gz" | tar -xzf - -C /opt/hcusmi && \
-    echo 'export LD_LIBRARY_PATH=/opt/hcusmi/lib64:$LD_LIBRARY_PATH' >> ~/.bashrc
 
 # ---layer--- torch + das 加速库
 ARG TORCH_VERSION
