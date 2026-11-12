@@ -196,11 +196,24 @@ def apply_to_module(module: ModuleType) -> bool:
         return False
 
     for name, kernel in zip(_KERNEL_NAMES, kernels):
-        if kernel is None or not callable(getattr(kernel, "__getitem__", None)):
+        if kernel is None:
             raise PatchCompatibilityError(
                 f"required HCU patch target {TARGET_MODULE}.{name} "
                 "is missing Triton launch semantics"
             )
+    launchable = [
+        callable(getattr(kernel, "__getitem__", None)) for kernel in kernels
+    ]
+    if not any(launchable):
+        # No GPU driver: vLLM replaces @triton.jit with the plain function.
+        # CPU contract tests import this module, and there is no kernel to wrap.
+        return False
+    if not all(launchable):
+        missing = _KERNEL_NAMES[launchable.index(False)]
+        raise PatchCompatibilityError(
+            f"required HCU patch target {TARGET_MODULE}.{missing} "
+            "is missing Triton launch semantics"
+        )
 
     for name, kernel in zip(_KERNEL_NAMES, kernels):
         setattr(batch_invariant, f"_vllm_hcu_original_{name}", kernel)

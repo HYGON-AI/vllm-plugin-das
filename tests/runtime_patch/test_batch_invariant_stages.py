@@ -281,6 +281,30 @@ def test_persistent_matmul_keeps_callable_grid():
     ]
 
 
+def test_plain_functions_are_skipped_when_triton_is_disabled():
+    module = ModuleType(patch_batch_invariant_stages.TARGET_MODULE)
+
+    def matmul(*args, **kwargs):
+        del args, kwargs
+
+    def bmm(*args, **kwargs):
+        del args, kwargs
+
+    module.matmul_kernel_persistent = matmul
+    module.bmm_kernel = bmm
+    assert patch_batch_invariant_stages.apply_to_module(module) is False
+    assert patch_batch_invariant_stages.apply_to_module(module) is False
+    assert module.matmul_kernel_persistent is matmul
+    assert module.bmm_kernel is bmm
+
+
+def test_missing_kernel_is_rejected():
+    module = ModuleType(patch_batch_invariant_stages.TARGET_MODULE)
+    module.matmul_kernel_persistent = _Kernel()
+    with pytest.raises(patch_batch_invariant_stages.PatchCompatibilityError):
+        patch_batch_invariant_stages.apply_to_module(module)
+
+
 def test_stale_marker_is_rejected():
     module = _module()
     setattr(module, "_vllm_hcu_batch_invariant_lds_stages_applied", True)
