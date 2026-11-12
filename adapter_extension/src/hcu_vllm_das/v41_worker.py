@@ -3,6 +3,8 @@
 from vllm.logger import init_logger
 from vllm.v1.worker.gpu_worker import Worker
 
+from .quantization.dsv41_channel_fp8 import _is_v41
+
 logger = init_logger(__name__)
 
 
@@ -18,7 +20,7 @@ class HcuV41PcpWorker(Worker):
         return (
             cfg.parallel_config.prefill_context_parallel_size > 1
             and cfg.kernel_config.moe_backend in ("deep_gemm_mega_moe", "deep_gemm")
-            and getattr(cfg.model_config.hf_config, "model_type", None) == "deepseek_v41"
+            and _is_v41(cfg.model_config.hf_config)
         )
 
     @property

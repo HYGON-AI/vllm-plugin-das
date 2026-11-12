@@ -128,7 +128,7 @@ class HcuDSV41ChannelFP8Config(DeepseekV4FP8Config):
             fused_mapping=self.packed_modules_mapping,
         ):
             return super().get_quant_method(layer, prefix)
-        if isinstance(layer, (LinearBase, RoutedExperts)) and is_layer_skipped(
+        if isinstance(layer, LinearBase) and is_layer_skipped(
             prefix=prefix,
             ignored_layers=self.ignored_layers,
             fused_mapping=self.packed_modules_mapping,

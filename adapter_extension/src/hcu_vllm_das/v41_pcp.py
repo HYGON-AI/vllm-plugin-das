@@ -79,8 +79,7 @@ class HcuV41PcpAttention(DeepseekV41ROCMAiterMLAAttention):
     swa_backend_cls = HcuV41PcpSwaBackend
 
     def __init__(self, *args, **kwargs):
-        cfg = args[0] if args else kwargs['vllm_config']
-        validate_config(cfg)
+        # select_attention() validated the configuration for this layer.
         super().__init__(*args, **kwargs)
         # Common preparation serializes PCP gathers. AMD's fast compressor
         # chain publishes local latent against global slots and cannot run here.
