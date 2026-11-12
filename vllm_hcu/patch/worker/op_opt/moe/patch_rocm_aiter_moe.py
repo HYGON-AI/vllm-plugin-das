@@ -181,13 +181,21 @@ def apply_to_module(module: ModuleType) -> bool:
     # import. HCU AITER has no FlyDSL package or gate_mode ABI.
     normal_impl = _build_workspace_aiter_fused_experts(fused_experts)
     special_globals = dict(fused_experts.__globals__)
-    special_globals["MoEActivation"] = SimpleNamespace(
+    # SITU is optional, unlike GELU_TANH above: AITER builds without it exist,
+    # and this repository already reads it as
+    # getattr(MoEActivation, "SITU", None) elsewhere. The rebuilt upstream body
+    # can only reference what the installed AITER defines, so mirror whatever
+    # is there instead of requiring it.
+    situ = getattr(moe_activation, "SITU", None)
+    activation_members = dict(
         SILU=moe_activation.SILU,
         GELU=gelu_tanh,
         SWIGLUOAI=moe_activation.SWIGLUOAI,
         SWIGLUOAI_UNINTERLEAVE=moe_activation.SWIGLUOAI_UNINTERLEAVE,
-        SITU=moe_activation.SITU,
     )
+    if situ is not None:
+        activation_members["SITU"] = situ
+    special_globals["MoEActivation"] = SimpleNamespace(**activation_members)
     special_globals["ActivationMethod"] = SimpleNamespace(
         SILU=hcu_activation_method.SILU,
         GELU=hcu_activation_method.GELU_TANH,
