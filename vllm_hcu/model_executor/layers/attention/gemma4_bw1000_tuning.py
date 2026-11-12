@@ -29,10 +29,19 @@ _installed = False
 def _max_tuned_seqs() -> int:
     """Upper bound on running sequences for the *launch-parameter* tuning.
 
-    Applies to the global head512 tiling only. That path's tiling, warp and
-    stage choices have been measured at 9..64 sequences and nowhere else, so the
-    default stays there; raising it applies them to shapes nobody has timed,
-    which can be slower rather than faster.
+    Applies to the global head512 tiling only, and now sits at the top of the
+    range that path has actually been swept over.
+
+    Operator-level sweep (head 512, 16 query heads, 2 KV heads, no window,
+    q_len 5, FP8 paged KV, contexts 1024/2048/4096) gives the tiling 2.75x at
+    16 sequences, 4.34x at 64, 3.67x at 80, 4.02x at 128 and 4.51x at 256 at a
+    2048-token context, with the same shape of curve at 1024 and 4096. It does
+    not decay past the old bound of 64 -- that was where the measurements
+    stopped, not where the gain did. Kernel output is bit-identical at every
+    point (max_abs_err 0.0), as it must be for a pure tiling and launch change.
+
+    Above 256 is still unmeasured, so the ceiling stays rather than going away:
+    raising it further applies these choices to shapes nobody has timed.
 
     The SWA path is no longer governed by this: its warp/stage choice was swept
     at the operator level and holds from 32 sequences upward with no ceiling,
@@ -41,7 +50,7 @@ def _max_tuned_seqs() -> int:
     """
     import os
 
-    raw = os.environ.get("VLLM_HCU_GEMMA4_BW1000_MAX_SEQS", "64").strip()
+    raw = os.environ.get("VLLM_HCU_GEMMA4_BW1000_MAX_SEQS", "256").strip()
     value = int(raw)
     if value < 9:
         raise ValueError("VLLM_HCU_GEMMA4_BW1000_MAX_SEQS must be >= 9")
