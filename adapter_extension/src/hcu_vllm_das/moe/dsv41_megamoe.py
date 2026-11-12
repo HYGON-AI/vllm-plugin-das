@@ -313,12 +313,13 @@ class HcuDSV41MegaMoEMethod(CompressedTensorsW8A8Fp8MoEMethod):
         self.moe_kernel = MegaKernel(
             MegaPrepare(), MegaExperts(self.moe, quant, cache[key], l1, l2, mega))
         self._processed = True
+        # Once per process: every layer shares these packed shapes and buffer.
         if ep.rank_in_group == 0:
             from vllm.logger import init_logger
-            init_logger(__name__).info(
-                "HCU V41 MegaMoE ready: layer=%s provider=%s physical=%d "
+            init_logger(f"vllm.{__name__}").info_once(
+                "HCU V41 MegaMoE ready: provider=%s physical=%d "
                 "local=%d topk=%d capacity=%d",
-                self._prefix, mega.__file__, self.moe.num_experts,
+                mega.__file__, self.moe.num_experts,
                 self.moe.num_local_experts, self.moe.experts_per_token,
                 cache[key].num_max_tokens_per_rank)
 

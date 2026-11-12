@@ -5,7 +5,8 @@ from vllm.v1.worker.gpu_worker import Worker
 
 from ..quantization.dsv41_channel_fp8 import _is_v41
 
-logger = init_logger(__name__)
+# vLLM configures a non-propagating handler on the ``vllm`` namespace only.
+logger = init_logger(f"vllm.{__name__}")
 
 
 def uses_pcp_channel_fp8(config):
