@@ -414,7 +414,7 @@ def kernel_unified_attention(
         SLIDING_WINDOW,
         USE_MM_PREFIX,
         IS_3D,
-        USE_CAUSAL and not LOCATE_FAST,
+        USE_CAUSAL,
         USE_PER_SEQ_CAUSAL,
         CHUNK_LOOKBACK,
         CHUNK_SIZE,
@@ -424,6 +424,17 @@ def kernel_unified_attention(
         mm_prefix_range_ptr,
         seq_idx,
     )
+
+    if LOCATE_FAST:
+        last_query_pos = (
+            q_block_local_idx * BLOCK_Q + (BLOCK_M - 1) // num_queries_per_kv
+        )
+        if (cur_batch_query_len >= 7) & (last_query_pos >= cur_batch_query_len - 6):
+            # Only blocks containing probe rows need the full KV sequence.
+            max_seq_prefix_len = seq_len
+            loop_hi = cdiv_fn(seq_len, TILE_SIZE)
+            if IS_3D:
+                loop_hi = tl.minimum(loop_hi, (segm_idx + 1) * tiles_per_segment)
 
     # iterate through tiles (now limited to the sliding window range)
     for j in range(loop_lo, loop_hi):

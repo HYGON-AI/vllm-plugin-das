@@ -15,9 +15,9 @@ on:
         type: string
         default: ''
       hardware:
-        description: all, BW1100 or BW1000
+        description: BW1100 only during ARC migration; legacy all selects BW1100
         type: string
-        default: all
+        default: BW1100
       mode:
         description: preflight or execute
         type: string
@@ -27,6 +27,9 @@ on:
         type: string
         default: ''
     secrets:
+      MODEL_REPORT_HISTORY_TOKEN:
+        description: Read Actions artifacts in both HYGON-AI framework repositories
+        required: true
       MODEL_SMOKE_REPO_TOKEN:
         required: true
       DASHHUB_CI_TOKEN:
@@ -34,10 +37,10 @@ on:
   workflow_dispatch:
     inputs:
       hardware:
-        description: all runs both hardware suites in parallel
+        description: BW1100 only; BW1000 is paused during ARC migration
         type: choice
-        options: [all, BW1100, BW1000]
-        default: all
+        options: [BW1100]
+        default: BW1100
       mode:
         description: First run preflight; then execute
         type: choice
@@ -61,16 +64,27 @@ concurrency:
 
 jobs:
   prepare:
-    runs-on: bw1100
+    runs-on: hygon-cpu
     timeout-minutes: 45
     outputs:
       enabled: ${{ steps.prepare.outputs.enabled }}
       image: ${{ steps.prepare.outputs.image_ref }}
+      container-image: ${{ steps.prepare.outputs.container_image }}
       image-id: ${{ steps.prepare.outputs.image_id }}
       cookbook-ref: ${{ steps.prepare.outputs.cookbook_ref }}
       controller-ref: ${{ steps.prepare.outputs.controller_ref }}
       matrix: ${{ steps.prepare.outputs.matrix }}
     steps:
+      - name: Validate ARC hardware selection
+        env:
+          REQUESTED_HARDWARE: ${{ inputs.hardware || 'BW1100' }}
+        shell: bash
+        run: |
+          set -euo pipefail
+          case "$REQUESTED_HARDWARE" in
+            BW1100|all) ;;
+            *) echo "::error::Only BW1100 is enabled; BW1000 model tests are paused during ARC migration."; exit 2 ;;
+          esac
       - uses: actions/checkout@v4
         with:
           repository: guochenyang99/ci-model-test
@@ -85,7 +99,9 @@ jobs:
           framework-version: '0.28.1'
           image: ${{ inputs.image || '' }}
           image-id: ${{ inputs.image-id || '' }}
-          hardware: ${{ inputs.hardware || 'all' }}
+          backend: arc
+          # Do not generate BW1000 cases even for callers still passing all.
+          hardware: BW1100
 
   smoke:
     needs: prepare
@@ -94,10 +110,26 @@ jobs:
       fail-fast: false
       matrix: ${{ fromJSON(needs.prepare.outputs.matrix) }}
     name: Smoke (${{ matrix.hardware }})
-    runs-on: ${{ matrix.runner }}
+    runs-on: hygon-bw1100-8card
     timeout-minutes: 840
+    container:
+      # ARC creates the job Pod and allocates all eight HCU devices.
+      image: ${{ needs.prepare.outputs.container-image }}
+    env:
+      FRAMEWORK: vllm
+      FRAMEWORK_VERSION: '0.28.1'
+      HARDWARE: ${{ matrix.hardware }}
+      IMAGE_REF: ${{ needs.prepare.outputs.image }}
+      IMAGE_ID: ${{ needs.prepare.outputs.image-id }}
+      CONTAINER_IMAGE: ${{ needs.prepare.outputs.container-image }}
+      COOKBOOK_REF: ${{ needs.prepare.outputs.cookbook-ref }}
+      CONTROLLER_REF: ${{ needs.prepare.outputs.controller-ref }}
+      MODE: ${{ inputs.mode || 'execute' }}
+      SMOKE_SCOPE: ${{ github.run_id }}-${{ github.run_attempt }}-vllm-bw1100
+      PYTHONDONTWRITEBYTECODE: '1'
     steps:
       - name: Checkout pinned private test controller
+        id: controller
         uses: actions/checkout@v4
         with:
           repository: guochenyang99/ci-model-test
@@ -105,24 +137,64 @@ jobs:
           token: ${{ secrets.MODEL_SMOKE_REPO_TOKEN }}
           persist-credentials: false
           path: model-ci-tools
-      - name: Test this hardware and transfer evidence
-        uses: ./model-ci-tools/.github/actions/deployment-smoke
+      # ARC checks out files inside the job Pod. A relative uses: action is
+      # resolved in the Runner workspace before any step runs in the Pod.
+      - name: Run model services in the job Pod
+        id: execute
+        shell: bash
+        env:
+          SMOKE_CASES: ${{ inputs.cases || '' }}
+        run: |
+          set -eo pipefail
+          if [[ -f /opt/dtk/env.sh ]]; then source /opt/dtk/env.sh; fi
+          set -u
+          [[ "${HCU_CI_IN_K8S:-}" == 1 && "$HARDWARE" == BW1100 ]]
+          [[ "$MODE" == execute || "$MODE" == preflight ]]
+          cd "$GITHUB_WORKSPACE/model-ci-tools"
+          [[ "$(git rev-parse HEAD)" == "$CONTROLLER_REF" ]]
+          args=(--backend arc --output "$RUNNER_TEMP/model-ci-reports/runner-$SMOKE_SCOPE"
+            --framework "$FRAMEWORK" --framework-version "$FRAMEWORK_VERSION"
+            --hardware "$HARDWARE" --image-ref "$IMAGE_REF" --pinned-image-id "$IMAGE_ID"
+            --container-image "$CONTAINER_IMAGE" --cookbook-ref "$COOKBOOK_REF"
+            --host-config configs/smoke/host.arc.yaml --collect-image-environment)
+          [[ "$MODE" != preflight ]] || args+=(--preflight)
+          while IFS= read -r section; do
+            [[ -z "$section" ]] || args+=(--case "$section")
+          done <<< "$SMOKE_CASES"
+          exec python3 -m deployment_smoke.run "${args[@]}"
+      - name: Bundle hardware evidence
+        id: bundle
+        if: ${{ always() && steps.controller.outcome == 'success' }}
+        shell: bash
+        env:
+          EXECUTION_OUTCOME: ${{ steps.execute.outcome }}
+        run: |
+          set -euo pipefail
+          cd "$GITHUB_WORKSPACE/model-ci-tools"
+          output="$RUNNER_TEMP/model-ci-bundle-$SMOKE_SCOPE"
+          args=()
+          if [[ "$EXECUTION_OUTCOME" != success ]]; then
+            args+=(--job-error "Hardware execution ended with status: $EXECUTION_OUTCOME; inspect the hardware job log")
+          fi
+          python3 -m deployment_smoke.aggregate bundle \
+            --source "$RUNNER_TEMP/model-ci-reports/runner-$SMOKE_SCOPE" --output "$output" \
+            --hardware "$HARDWARE" --framework "$FRAMEWORK" --framework-version "$FRAMEWORK_VERSION" \
+            --mode "$MODE" --image-ref "$IMAGE_REF" --image-id "$IMAGE_ID" \
+            --cookbook-ref "$COOKBOOK_REF" --controller-ref "$CONTROLLER_REF" "${args[@]}"
+      - name: Upload hardware evidence
+        if: ${{ always() && steps.bundle.outcome == 'success' }}
+        uses: actions/upload-artifact@v4
         with:
-          framework: vllm
-          framework-version: '0.28.1'
-          image: ${{ needs.prepare.outputs.image }}
-          expected-image-id: ${{ needs.prepare.outputs.image-id }}
-          cookbook-ref: ${{ needs.prepare.outputs.cookbook-ref }}
-          controller-ref: ${{ needs.prepare.outputs.controller-ref }}
-          hardware: ${{ matrix.hardware }}
-          cases: ${{ inputs.cases || '' }}
-          mode: ${{ inputs.mode || 'execute' }}
-          collect-only: 'true'
+          name: model-ci-raw-vllm-${{ github.run_id }}-${{ github.run_attempt }}-${{ matrix.hardware }}
+          path: ${{ runner.temp }}/model-ci-bundle-${{ env.SMOKE_SCOPE }}
+          retention-days: 1
+          if-no-files-found: error
 
   report:
     needs: [prepare, smoke]
     if: ${{ always() && needs.prepare.result == 'success' && needs.prepare.outputs.enabled == 'true' }}
-    runs-on: bw1100
+    # Resolve the report composite actions in the same workspace as checkout.
+    runs-on: hygon-cpu
     timeout-minutes: 60
     permissions:
       contents: read
@@ -139,6 +211,7 @@ jobs:
         with:
           framework: vllm
           framework-version: '0.28.1'
+          backend: arc
           pypi-url: ${{ vars.PYPI_URL }}
           cases: ${{ inputs.cases || '' }}
           matrix: ${{ needs.prepare.outputs.matrix }}
@@ -147,5 +220,5 @@ jobs:
           cookbook-ref: ${{ needs.prepare.outputs.cookbook-ref }}
           controller-ref: ${{ needs.prepare.outputs.controller-ref }}
           dashhub-token: ${{ secrets.DASHHUB_CI_TOKEN }}
-          history-token: ${{ secrets.MODEL_SMOKE_REPO_TOKEN }}
+          history-token: ${{ secrets.MODEL_REPORT_HISTORY_TOKEN }}
           mode: ${{ inputs.mode || 'execute' }}

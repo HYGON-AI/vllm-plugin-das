@@ -6372,7 +6372,9 @@ def test_moe_runner_and_shared_experts_cold_replacement_contract():
         raise RuntimeError(
             f"VLLM_HCU_TARGET_ROOT does not contain vllm: {target_vllm}"
         )
-    python_path = [str(target_vllm), str(repository)]
+    # A wheel target root can also contain an installed vllm_hcu. Test this
+    # checkout's adapters while still resolving vllm from the requested root.
+    python_path = [str(repository), str(target_vllm)]
     existing = os.environ.get("PYTHONPATH")
     if existing:
         python_path.append(existing)
@@ -6703,6 +6705,39 @@ def test_moe_runner_and_shared_experts_cold_replacement_contract():
         direct_runner.gate = None
         direct_runner._sequence_parallel_context = lambda: runner_module.nullcontext()
         runner_module._int8_allgatherv_enabled = lambda: True
+        # Exercise the CT adapter's real post-load capability propagation
+        # through the production runner, including its modular unwrap path.
+        from vllm_hcu.model_executor.layers.quantization import compressed_tensors_w4a8_runtime as ct_w4a8
+
+        saved_quant_method = direct_runner.routed_experts.quant_method
+        for support in (False, True):
+            delegate = SimpleNamespace(
+                supports_int8_allgatherv_input=support,
+                moe_quant_config=None,
+                moe_kernel=None,
+                process_weights_after_loading=lambda layer: None,
+            )
+            adapter = SimpleNamespace(
+                is_transposed=False,
+                supports_internal_mk=False,
+                _hcu_ct_w4a8_delegate=delegate,
+            )
+            storage = torch.nn.Module()
+            for prefix in ("w13", "w2"):
+                storage.register_parameter(prefix + "_weight_packed", torch.nn.Parameter(
+                    torch.zeros(1, 1, 1, dtype=torch.int32), requires_grad=False,
+                ))
+                storage.register_parameter(prefix + "_weight_scale", torch.nn.Parameter(
+                    torch.ones(1, 1, 1), requires_grad=False,
+                ))
+            ct_w4a8._process_weights_after_loading(adapter, storage)
+            for wrapped in (False, True):
+                direct_runner.routed_experts.quant_method = (
+                    SimpleNamespace(old_quant_method=adapter, supports_internal_mk=False)
+                    if wrapped else adapter
+                )
+                assert direct_runner.do_int8_allgatherv_dispatch is support
+        direct_runner.routed_experts.quant_method = saved_quant_method
         from vllm_hcu.patch.worker.framework_opt import patch_agrs_int8
 
         patch_agrs_int8._quantize_hidden_states = lambda value: (
