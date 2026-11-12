@@ -32,6 +32,11 @@ def activate_extension(context):
         quantization.register_quantization_config(QUANTIZATION_METHOD)(HcuDSV41ChannelFP8Config)
     if owner != MODEL:
         ModelRegistry.register_model(ARCH, ":".join(MODEL))
+    # Must precede VllmConfig construction in this process: the wrapper only
+    # takes effect through the platform hook that runs while config is built.
+    from .dsv41.profile_worker import install as install_profile_worker
+
+    install_profile_worker(current_platform)
 
 
 def extension_spec():

@@ -74,3 +74,85 @@ def test_profile_bound_covers_core_pcp_mixed_and_rounded_batches():
                     actual = manager.get_num_tokens_for_dispatch(lens, is_prefill)
                     bound = _local_profile_token_bound(budget, max_reqs, 8)
                     assert actual <= bound, (lens, is_prefill, actual, bound)
+
+
+def _profile_config(tmp_path, pcp=8, backend="deep_gemm_mega_moe", model="deepseek_v41"):
+    return NS(parallel_config=NS(prefill_context_parallel_size=pcp, worker_cls="auto"),
+              kernel_config=NS(moe_backend=backend),
+              model_config=NS(hf_config=NS(model_type=model)))
+
+
+@pytest.fixture
+def platform(monkeypatch):
+    """A throwaway Platform subclass so the real one is never patched."""
+    from vllm.platforms.interface import Platform
+    from hcu_vllm_das.dsv41 import profile_worker
+
+    class Host(Platform):
+        seen = []
+
+        @classmethod
+        def check_and_update_config(cls, vllm_config):
+            # Mirrors Core (auto -> official) then HcuPlatform (official ->
+            # Adapter) so an explicit operator choice survives both steps.
+            parallel = vllm_config.parallel_config
+            cls.seen.append(parallel.worker_cls)
+            if parallel.worker_cls == "auto":
+                parallel.worker_cls = "vllm.v1.worker.gpu_worker.Worker"
+            if parallel.worker_cls == "vllm.v1.worker.gpu_worker.Worker":
+                parallel.worker_cls = "hcu_adapter.bridges.vllm_worker.Worker"
+
+    Host.device_name = "hcu"
+    monkeypatch.setattr(profile_worker, "_installed", {})
+    monkeypatch.delenv("VLLM_HCU_DSV41_PCP_PROFILE_WORKER", raising=False)
+    return Host, profile_worker
+
+
+@pytest.mark.parametrize("enabled,pcp,backend,model,expected", [
+    (True, 8, "deep_gemm_mega_moe", "deepseek_v41", "hcu_vllm_das.dsv41.worker.HcuDSV41PcpWorker"),
+    (True, 8, "deep_gemm", "deepseek_v41", "hcu_vllm_das.dsv41.worker.HcuDSV41PcpWorker"),
+    (False, 8, "deep_gemm_mega_moe", "deepseek_v41", "hcu_adapter.bridges.vllm_worker.Worker"),
+    (True, 1, "deep_gemm_mega_moe", "deepseek_v41", "hcu_adapter.bridges.vllm_worker.Worker"),
+    (True, 8, "triton", "deepseek_v41", "hcu_adapter.bridges.vllm_worker.Worker"),
+    (True, 8, "deep_gemm_mega_moe", "other", "hcu_adapter.bridges.vllm_worker.Worker"),
+])
+def test_switch_selects_worker_only_for_pcp_channel_fp8(platform, monkeypatch,
+                                                       enabled, pcp, backend, model, expected):
+    if enabled:
+        monkeypatch.setenv("VLLM_HCU_DSV41_PCP_PROFILE_WORKER", "1")
+    host, module = platform
+    assert module.install(host)
+    config = _profile_config(None, pcp, backend, model)
+    host.check_and_update_config(config)
+    assert config.parallel_config.worker_cls == expected
+    # Core's own hook still ran first and its default was what we replaced.
+    assert host.seen == ["auto"]
+
+
+def test_explicit_worker_choice_is_never_overridden(platform, monkeypatch):
+    monkeypatch.setenv("VLLM_HCU_DSV41_PCP_PROFILE_WORKER", "1")
+    host, module = platform
+    module.install(host)
+    config = _profile_config(None)
+    config.parallel_config.worker_cls = "user.module.CustomWorker"
+    host.check_and_update_config(config)
+    assert config.parallel_config.worker_cls == "user.module.CustomWorker"
+
+
+def test_install_is_idempotent_and_keeps_core_behavior(platform):
+    host, module = platform
+    core = host.check_and_update_config.__func__
+    assert module.install(host)
+    wrapped = host.check_and_update_config.__func__
+    assert module.install(host)
+    assert host.check_and_update_config.__func__ is wrapped
+    assert wrapped.__wrapped__ is core
+
+
+def test_switch_defaults_off_and_rejects_non_boolean(platform, monkeypatch):
+    from hcu_vllm_das.environment import dsv41_profile_worker_enabled
+
+    assert dsv41_profile_worker_enabled() is False
+    monkeypatch.setenv("VLLM_HCU_DSV41_PCP_PROFILE_WORKER", "maybe")
+    with pytest.raises(ValueError, match="must be a boolean"):
+        dsv41_profile_worker_enabled()

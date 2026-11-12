@@ -8,6 +8,16 @@ from ..quantization.dsv41_channel_fp8 import _is_v41
 logger = init_logger(__name__)
 
 
+def uses_pcp_channel_fp8(config):
+    """Whether this resolved config profiles rank-local PCP Channel-FP8 batches."""
+    cfg = config
+    return (
+        cfg.parallel_config.prefill_context_parallel_size > 1
+        and cfg.kernel_config.moe_backend in ("deep_gemm_mega_moe", "deep_gemm")
+        and _is_v41(cfg.model_config.hf_config)
+    )
+
+
 def _local_profile_token_bound(global_tokens, max_reqs, pcp_size):
     # Core gives a prefill rank two ceil(query_len / (2 * PCP)) chunks.
     # Two extra rows per request cover their rounding and replicated decodes.
@@ -16,12 +26,7 @@ def _local_profile_token_bound(global_tokens, max_reqs, pcp_size):
 
 class HcuDSV41PcpWorker(Worker):
     def _uses_pcp_channel_fp8(self):
-        cfg = self.vllm_config
-        return (
-            cfg.parallel_config.prefill_context_parallel_size > 1
-            and cfg.kernel_config.moe_backend in ("deep_gemm_mega_moe", "deep_gemm")
-            and _is_v41(cfg.model_config.hf_config)
-        )
+        return uses_pcp_channel_fp8(self.vllm_config)
 
     @property
     def randomize_dummy_inputs(self) -> bool:
