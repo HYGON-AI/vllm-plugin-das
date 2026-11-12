@@ -41,14 +41,18 @@ def _num_workspace_lanes(
     )
 
 
-def _gemma4_bw1000_enabled() -> bool:
+def _gemma4_bw1000_enabled(vllm_config) -> bool:
     """Gemma4 BW1000 optimization bundle, behind VLLM_HCU_GEMMA_BW1000.
 
     See vllm_hcu.utils.gemma4_switches for why this is one switch and why it
     stays opt-in.
     """
-    from vllm_hcu.utils.gemma4_switches import gemma4_bw1000_enabled
+    from vllm_hcu.utils.gemma4_switches import (
+        check_retired_switches,
+        gemma4_bw1000_enabled,
+    )
 
+    check_retired_switches(vllm_config)
     return gemma4_bw1000_enabled()
 
 
@@ -82,7 +86,7 @@ def _create_model_runner(
     from vllm_hcu.v1.hcu_model_runner_v2 import HcuGPUModelRunnerV2
 
     runner = HcuGPUModelRunnerV2(vllm_config, device)
-    if _gemma4_bw1000_enabled():
+    if _gemma4_bw1000_enabled(vllm_config):
         from vllm_hcu.model_executor.layers.attention import gemma4_bw1000_tuning
 
         gemma4_bw1000_tuning.install()
@@ -141,7 +145,7 @@ class HcuGPUWorker(Worker):
         """Load the model, then require every enabled patch chain to be live."""
 
         super().load_model(load_dummy_weights=load_dummy_weights)
-        if _gemma4_bw1000_enabled():
+        if _gemma4_bw1000_enabled(self.vllm_config):
             from vllm_hcu.model_executor.layers import gemma4_lm_head
 
             gemma4_lm_head.load_head_table()

@@ -28,22 +28,30 @@ def _attach_vllm_log_handler() -> None:
     Mirror vLLM's handler and level onto the package logger. A
     ``VLLM_LOGGING_CONFIG_PATH`` that already configures ``vllm_hcu``, or any
     other pre-installed handler, is left untouched.
+
+    Deliberately does not import vLLM. Importing it from this module's body
+    runs vLLM's plugin discovery while ``vllm_hcu`` is still half-initialized,
+    so discovery cannot resolve ``vllm_hcu:hcu_platform_plugin`` and vLLM
+    drops the HCU platform plugin with nothing but an error line -- the engine
+    then runs on the wrong platform. ``logging.getLogger`` touches no module,
+    so when vLLM has not configured its logger yet there is simply nothing to
+    mirror; this is idempotent and the plugin entry points call it again once
+    vLLM is up.
     """
 
     package_logger = logging.getLogger("vllm_hcu")
     if package_logger.handlers:
-        return
-    try:
-        import vllm.logger  # noqa: F401  - importing configures "vllm"
-    except Exception:
-        # Logging is never worth failing plugin discovery over.
         return
     vllm_logger = logging.getLogger("vllm")
     if not vllm_logger.handlers:
         return
     for handler in vllm_logger.handlers:
         package_logger.addHandler(handler)
-    package_logger.setLevel(vllm_logger.level)
+    # getEffectiveLevel, not .level: a custom VLLM_LOGGING_CONFIG_PATH may
+    # attach a handler to "vllm" without setting a level, and copying that
+    # NOTSET while propagate is off would resolve through the root logger to
+    # WARNING and drop every info record again -- the exact bug this fixes.
+    package_logger.setLevel(vllm_logger.getEffectiveLevel())
     package_logger.propagate = False
 
 
@@ -114,6 +122,7 @@ def _ensure_platform_plugin_ready() -> None:
 def hcu_platform_plugin() -> str:
     """Arm platform patches and return the public vLLM platform class path."""
 
+    _attach_vllm_log_handler()
     global _PLATFORM_INIT_FAILURE
     with _PLATFORM_PLUGIN_LOCK:
         _ensure_platform_plugin_ready()
@@ -134,6 +143,7 @@ def hcu_platform_plugin() -> str:
 def hcu_platform_register_model() -> None:
     """Register HCU model classes once in the current process."""
 
+    _attach_vllm_log_handler()
     ensure_vllm_compatible()
     _prepare_general_plugin()
     from vllm_hcu.patch.runtime_state import run_patch

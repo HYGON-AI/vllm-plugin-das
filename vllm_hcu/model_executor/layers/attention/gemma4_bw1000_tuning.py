@@ -26,6 +26,13 @@ logger = init_logger(__name__)
 
 _state = threading.local()
 _installed = False
+
+# Follows the switch's prefix (VLLM_HCU_GEMMA_BW1000). The "GEMMA4" spelling
+# was the original one; it is checked for in install() rather than left to be
+# silently ignored, which would set the bound back to its default without
+# anything in the log saying so.
+MAX_SEQS_KNOB = "VLLM_HCU_GEMMA_BW1000_MAX_SEQS"
+_RETIRED_MAX_SEQS_KNOB = "VLLM_HCU_GEMMA4_BW1000_MAX_SEQS"
 def _max_tuned_seqs() -> int:
     """Upper bound on running sequences for the *launch-parameter* tuning.
 
@@ -50,10 +57,10 @@ def _max_tuned_seqs() -> int:
     """
     import os
 
-    raw = os.environ.get("VLLM_HCU_GEMMA4_BW1000_MAX_SEQS", "256").strip()
+    raw = os.environ.get(MAX_SEQS_KNOB, "256").strip()
     value = int(raw)
     if value < 9:
-        raise ValueError("VLLM_HCU_GEMMA4_BW1000_MAX_SEQS must be >= 9")
+        raise ValueError(f"{MAX_SEQS_KNOB} must be >= 9")
     return value
 
 
@@ -87,6 +94,14 @@ def install() -> None:
     global _installed
     if _installed:
         return
+    import os
+
+    if os.environ.get(_RETIRED_MAX_SEQS_KNOB) is not None:
+        raise ValueError(
+            f"{_RETIRED_MAX_SEQS_KNOB} has been renamed to {MAX_SEQS_KNOB} to "
+            "follow the switch's prefix; the old name is not read, so the "
+            "bound would silently stay at its default."
+        )
     import vllm.v1.attention.backends.triton_attn as backend
     import vllm.v1.attention.ops.triton_unified_attention as ops
 
