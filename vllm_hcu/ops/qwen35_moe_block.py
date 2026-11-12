@@ -34,14 +34,17 @@ _W8A16_BLOCK_M = 16
 @triton.jit
 def _strided_silu_mul_kernel(y_ptr, ldy, out_ptr, D: tl.constexpr,
                              BLOCK: tl.constexpr):
+    # BLOCK must stay a power of two (tl.arange); columns past D are masked,
+    # so the launch grid can simply be cdiv(D, BLOCK).
     m = tl.program_id(0)
     offs = tl.program_id(1) * BLOCK + tl.arange(0, BLOCK)
+    mask = offs < D
     row = y_ptr + m.to(tl.int64) * ldy
-    g = tl.load(row + offs).to(tl.float32)
-    u = tl.load(row + D + offs).to(tl.float32)
+    g = tl.load(row + offs, mask=mask).to(tl.float32)
+    u = tl.load(row + D + offs, mask=mask).to(tl.float32)
     o = g / (1.0 + tl.exp(-g)) * u
     tl.store(out_ptr + m.to(tl.int64) * D + offs,
-             o.to(out_ptr.dtype.element_ty))
+             o.to(out_ptr.dtype.element_ty), mask=mask)
 
 
 @triton.jit
@@ -215,6 +218,14 @@ def _build_state(block) -> _FusedState | None:
         return None
     inter2, hidden = gu.shape
     num_experts = rt.shape[0]
+    # The router row count keys the expert weights; a mismatch would size
+    # every expert buffer from the router and index w13/w2 out of range.
+    if int(routed.w13_weight.shape[0]) != num_experts:
+        logger.warning_once(
+            "Qwen3.5 fused MoE block disabled (router has %d experts, "
+            "expert weights have %d).",
+            num_experts, int(routed.w13_weight.shape[0]))
+        return None
     n = inter2 + num_experts + 1
     # rocBLAS picks a split-K kernel for odd N at decode sizes (e.g. 1288 ->
     # 23 us at M=1); a 256-aligned N (1536) stays on the ~7 us GEMV tile.
@@ -327,12 +338,11 @@ def fused_moe_block_pending(block, st: _FusedState,
     y = torch.nn.functional.linear(x, st.w_cat)  # [m, ldy]
 
     act = torch.empty(m, inter, dtype=dtype, device=x.device)
-    # Grid must cover every column of `act`: a plain `inter // blk` truncates
-    # (inter=1536, blk=1024 -> 1 block -> columns 1024..1535 keep stale
-    # `torch.empty` memory and reach down_proj). The kernel is exact-width, so
-    # also fall back to a single whole-row block when 1024 does not divide.
-    blk = 1024 if inter % 1024 == 0 else inter
-    blk = min(blk, inter)
+    # BLOCK must be a power of two (tl.arange), so tile with 1024 when it
+    # divides and 512 otherwise; the kernel masks the tail. Integer division
+    # of inter by blk truncated before: inter=1536 left columns 1024..1535
+    # holding stale `torch.empty` memory that reached down_proj.
+    blk = 1024 if inter % 1024 == 0 else 512
     _strided_silu_mul_kernel[(m, triton.cdiv(inter, blk))](
         y, ldy, act, D=inter, BLOCK=blk, num_warps=4)
     shared_out, _ = block.shared_expert.down_proj(act)
