@@ -15,6 +15,9 @@ TARGETS = (
     f"{TARGET_MODULE}.DeepEPHTPrepareAndFinalize._do_dispatch",
     f"{TARGET_MODULE}.DeepEPHTPrepareAndFinalize._receiver",
     f"{TARGET_MODULE}.DeepEPHTPrepareAndFinalize.prepare_async",
+    f"{TARGET_MODULE}.DeepEPHTPrepareAndFinalize._get_dispatch_config",
+    f"{TARGET_MODULE}.DeepEPHTPrepareAndFinalize._get_combine_config",
+    f"{TARGET_MODULE}.DeepEPHTPrepareAndFinalize._finalize",
 )
 _MARKER = "_vllm_hcu_deepep_ht_applied"
 
@@ -29,6 +32,15 @@ def apply_to_module(module: ModuleType) -> bool:
     do_dispatch = require_callable(cls, "_do_dispatch", TARGETS[0])
     receiver = require_callable(cls, "_receiver", TARGETS[1])
     prepare = require_callable(cls, "prepare_async", TARGETS[2])
+    dispatch_config = require_callable(cls, "_get_dispatch_config", TARGETS[3])
+    combine_config = require_callable(cls, "_get_combine_config", TARGETS[4])
+    finalize = require_callable(cls, "_finalize", TARGETS[5])
+    require_parameter_names(dispatch_config, TARGETS[3], ("self",))
+    require_parameter_names(combine_config, TARGETS[4], ("self",))
+    require_parameter_names(finalize, TARGETS[5], (
+        "self", "output", "fused_expert_output", "topk_weights", "topk_ids",
+        "apply_router_weight_on_input", "weight_and_reduce_impl", "do_async",
+    ))
     require_parameter_names(
         do_dispatch,
         TARGETS[0],
@@ -156,6 +168,25 @@ def apply_to_module(module: ModuleType) -> bool:
             defer_input_quant,
         )
 
+    @functools.wraps(dispatch_config)
+    def hcu_dispatch_config(self):
+        return deepep_runtime.step5_ht_launch_config(self, dispatch_config(self))
+
+    @functools.wraps(combine_config)
+    def hcu_combine_config(self):
+        return deepep_runtime.step5_ht_launch_config(self, combine_config(self), combine=True)
+
+    @functools.wraps(finalize)
+    def hcu_finalize(self, output, fused_expert_output, topk_weights, topk_ids,
+                     apply_router_weight_on_input, weight_and_reduce_impl, do_async):
+        return deepep_runtime.ht_finalize_with_buffer_pair(
+            target, self, output, fused_expert_output, topk_weights, topk_ids,
+            apply_router_weight_on_input, weight_and_reduce_impl, do_async, finalize,
+        )
+
+    cls._get_dispatch_config = hcu_dispatch_config
+    cls._get_combine_config = hcu_combine_config
+    cls._finalize = hcu_finalize
     cls._vllm_hcu_original_do_dispatch = do_dispatch
     cls._do_dispatch = hcu_do_dispatch
     cls._vllm_hcu_original_receiver = receiver

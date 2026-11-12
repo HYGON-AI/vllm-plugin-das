@@ -743,7 +743,8 @@ def test_ll_selection_respects_native_scratch_and_stride(runtime, monkeypatch, b
 
 
 @pytest.mark.parametrize("owns_dispatch,expected", [(True, False), (False, True)])
-def test_ep_fused_combine_excludes_backend_owned_dispatch(owns_dispatch, expected):
+@pytest.mark.parametrize("step5_owner", [False, True])
+def test_ep_fused_combine_excludes_backend_owned_dispatch(owns_dispatch, expected, step5_owner):
     import ast
     path = REPO / "vllm_hcu/model_executor/layers/fused_moe/moe_runner.py"
     tree = ast.parse(path.read_text())
@@ -753,7 +754,8 @@ def test_ep_fused_combine_excludes_backend_owned_dispatch(owns_dispatch, expecte
             isinstance(target, ast.Attribute) and target.attr == "_ep_fused_combine"
             for target in node.targets)
     )
-    runner = NS(_quant_method=NS(hcu_owns_dispatch=owns_dispatch))
+    runner = NS(_quant_method=NS(hcu_owns_dispatch=owns_dispatch),
+                _hcu_step5_owner=step5_owner)
     namespace = dict(
         self=runner, _EP_FUSED_COMBINE=True, shared_experts=object(),
         moe_config=NS(dp_size=8, pcp_size=1, is_sequence_parallel=False,
@@ -763,7 +765,7 @@ def test_ep_fused_combine_excludes_backend_owned_dispatch(owns_dispatch, expecte
     )
     exec(compile(ast.fix_missing_locations(ast.Module(body=[assignment], type_ignores=[])),
                  str(path), "exec"), namespace)
-    assert runner._ep_fused_combine is expected
+    assert runner._ep_fused_combine is (expected and step5_owner)
 
 
 @pytest.mark.parametrize("mode,match", [("normal", "stride"), ("ll", "LL scratch")])
@@ -1097,4 +1099,55 @@ def test_pcp_metadata_from_actual_context_builders(runtime, monkeypatch, builder
             # Control for the actual creation branch; DP2/PCP8 is not a
             # supported MegaMoE configuration and must not be sent to apply.
             assert context.dp_metadata.num_tokens_across_dp_cpu.tolist() == [2, 7]
+    assert contexts == []
+
+
+def test_hcu_context_preserves_supplied_metadata_for_deepep_low_latency(
+    monkeypatch,
+):
+    from contextlib import contextmanager
+
+    module, sp_property = _native_context_symbols()
+    parallel = NS(
+        tensor_parallel_size=1,
+        data_parallel_size=2,
+        data_parallel_rank=0,
+        prefill_context_parallel_size=1,
+        enable_expert_parallel=True,
+        is_moe_model=True,
+        all2all_backend="deepep_low_latency",
+    )
+    parallel.use_sequence_parallel_moe = sp_property.fget(parallel)
+    config = NS(parallel_config=parallel)
+    contexts = []
+
+    @contextmanager
+    def override(context):
+        contexts.append(context)
+        try:
+            yield
+        finally:
+            contexts.pop()
+
+    module.track_batchsize = False
+    module.current_platform = NS(set_additional_forward_context=lambda **kw: {})
+    module.create_forward_context = lambda *args, **kw: NS(dp_metadata=args[2])
+    module.override_forward_context = override
+    hcu = load_file(
+        monkeypatch,
+        "test_hcu_context_low_latency",
+        "vllm_hcu/forward_context_runtime.py",
+    )
+    supplied = torch.tensor([2, 7], dtype=torch.int32)
+
+    with hcu.set_forward_context(
+        module,
+        None,
+        config,
+        num_tokens=2,
+        num_tokens_across_dp=supplied,
+    ):
+        metadata = contexts[-1].dp_metadata
+
+    assert metadata.num_tokens_across_dp_cpu.tolist() == [2, 7]
     assert contexts == []

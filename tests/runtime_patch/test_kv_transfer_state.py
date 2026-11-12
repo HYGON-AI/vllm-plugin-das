@@ -178,3 +178,80 @@ def test_mooncake_decode_abort_records_not_processed_transfer_id(
     assert metadata.reqs_to_send == {}
     assert metadata.reqs_not_processed == {"xfer-abort"}
     assert scheduler._reqs_not_processed == set()
+
+
+def _mamba_prefill_request(num_prompt_tokens: int):
+    from vllm import SamplingParams
+    from vllm.v1.request import Request
+
+    request = Request(
+        request_id="p",
+        prompt_token_ids=list(range(num_prompt_tokens)),
+        sampling_params=SamplingParams(max_tokens=8),
+        pooling_params=None,
+    )
+    request.kv_transfer_params = {"do_remote_decode": True}
+    return request
+
+
+def _local_prefix_hit(request, block_size: int) -> int:
+    # KVCacheManager.get_computed_blocks keeps at least one token to compute.
+    return (request.num_tokens - 1) // block_size * block_size
+
+
+@pytest.mark.parametrize(("block_size", "expected_new"), [(16, 16), (128, 128)])
+def test_mooncake_mamba_prefill_truncates_before_prefix_cache_lookup(
+    mooncake_module, block_size: int, expected_new: int
+) -> None:
+    scheduler = _scheduler(mooncake_module, role="producer")
+    scheduler._has_mamba = True
+    request = _mamba_prefill_request(2 * block_size + 1)
+
+    # Scheduler.add_request -> connector.on_new_request, then schedule().
+    scheduler.on_new_request(request)
+    assert request.num_prompt_tokens == request.num_tokens == 2 * block_size
+    assert request.max_tokens == 1
+
+    num_computed = _local_prefix_hit(request, block_size)
+    assert scheduler.get_num_new_matched_tokens(request, num_computed) == (0, False)
+    assert request.num_tokens == 2 * block_size
+    assert request.num_tokens - num_computed == expected_new
+
+
+def test_mooncake_mamba_prefill_truncation_is_idempotent(mooncake_module) -> None:
+    scheduler = _scheduler(mooncake_module, role="producer")
+    scheduler._has_mamba = True
+    request = _mamba_prefill_request(33)
+
+    # Re-enqueue / preemption must not drop another token.
+    scheduler.on_new_request(request)
+    scheduler.on_new_request(request)
+    scheduler.get_num_new_matched_tokens(request, 0)
+    assert request.num_prompt_tokens == request.num_tokens == 32
+    assert request.prompt_token_ids == list(range(32))
+
+
+@pytest.mark.parametrize(
+    ("has_mamba", "params"),
+    [(False, {"do_remote_decode": True}), (True, {}), (True, None)],
+)
+def test_mooncake_on_new_request_leaves_other_requests_untouched(
+    mooncake_module, has_mamba: bool, params
+) -> None:
+    scheduler = _scheduler(mooncake_module, role="producer")
+    scheduler._has_mamba = has_mamba
+    request = _mamba_prefill_request(33)
+    request.kv_transfer_params = params
+
+    scheduler.on_new_request(request)
+    assert request.num_tokens == 33
+
+
+def test_mooncake_connector_forwards_on_new_request(mooncake_module) -> None:
+    calls = []
+    connector = object.__new__(mooncake_module.MooncakeConnector)
+    connector.connector_scheduler = SimpleNamespace(on_new_request=calls.append)
+    request = object()
+
+    connector.on_new_request(request)
+    assert calls == [request]

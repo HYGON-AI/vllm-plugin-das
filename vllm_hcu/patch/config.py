@@ -25,6 +25,8 @@ _FEATURE_FIELDS = (
     "fused_qwen3_rms_rope",
     "qwen4_exp_hc_sp",
     "k3_sp_moe",
+    "glm53_kda_cp_head_shard",
+    "glm53_pcp_mtp_sync",
     "dp_int8_allgather",
     "moe_backend",
     "hcu_flash_attn_mode",
@@ -59,7 +61,7 @@ _SUPPORTED_FLASH_ATTN_MODES = frozenset(
 # HCU-only --gdn-prefill-backend values. vLLM itself only sees "triton".
 HCU_GDN_PREFILL_BACKENDS = ("hcu-boltops", "hcu-aiter")
 _SUPPORTED_EPLB_STATIC_DISPATCH_POLICIES = frozenset(
-    {"nearest", "locality_fair"}
+    {"nearest", "locality_fair", "token_hash"}
 )
 _EPLB_SIDECAR_FIELDS = (
     "expert_map_path",
@@ -115,6 +117,13 @@ class HcuFeatureConfig:
     # collectives): opposite-mode restarts sharing a persistent compilation
     # cache would load the other mode's no-guard AOT graph.
     k3_sp_moe: bool = False
+    # None means unresolved at the EngineArgs boundary. Platform validation
+    # freezes the effective CP-head mode to bool before compilation hashing;
+    # workers consume that serialized value instead of their local environment.
+    glm53_kda_cp_head_shard: bool | None = None
+    # Freeze PCP MTP collective participation in the engine. A worker-local
+    # environment switch must not change the group's collective sequence.
+    glm53_pcp_mtp_sync: bool | None = None
     # Effective opt-in policy for INT8 hidden-state transport in the naive
     # DP/EP AllGatherv dispatch path. Persisted because spawned workers do not
     # inherit arbitrary VLLM_HCU_* variables from the API process.
@@ -131,6 +140,10 @@ class HcuFeatureConfig:
     eplb_static_dispatch_policy: str = "nearest"
 
     def __post_init__(self) -> None:
+        for name in ("glm53_kda_cp_head_shard", "glm53_pcp_mtp_sync"):
+            value = getattr(self, name)
+            if value is not None and not isinstance(value, bool):
+                raise TypeError(f"HCU config field {name!r} must be bool or None")
         for name in _BOOLEAN_FIELDS:
             value = getattr(self, name)
             if not isinstance(value, bool):

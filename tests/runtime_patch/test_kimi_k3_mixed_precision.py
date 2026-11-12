@@ -13,6 +13,7 @@ from vllm.model_executor.layers.linear import (
 from vllm.model_executor.layers.mamba.gdn.kimi_gdn_linear_attn import (
     _KimiGDNMergedColumnParallelLinear,
 )
+from vllm_hcu.model_executor.layers import kimi_k3_mixed_precision as mixed
 from vllm_hcu.model_executor.layers.kimi_k3_mixed_precision import (
     KimiK3MixedKDAProjection,
 )
@@ -490,3 +491,239 @@ def test_mixed_and_fused_branches_compose_with_installed_kimi_model_loader():
         torch.testing.assert_close(proj.fp_gate.weight, torch.cat(gate_rows),
                                    rtol=0, atol=0)
         assert torch.all(model.direct.weight == 1)
+
+@pytest.mark.parametrize('transposed', [False, True])
+@pytest.mark.parametrize('entry', ['reload_weights', 'finish_target', 'finish_draft'])
+def test_opt_in_fused_qkv_reuses_quant_method_and_preserves_gate(monkeypatch, transposed, entry):
+    monkeypatch.setenv('VLLM_HCU_KIMI_KDA_FUSE_QKV', '1')
+    calls = []
+
+    class Method:
+        def apply(self, layer, x, bias=None):
+            calls.append(tuple(layer.weight.shape))
+            w = layer.weight.T if transposed else layer.weight
+            return x @ (w.float() * layer.weight_scale).T
+
+    class Column(nn.Module):
+        def __init__(self, input_size, output_size, **kwargs):
+            super().__init__()
+            w = torch.randint(-4, 5, (output_size, input_size), dtype=torch.int8)
+            self.weight = nn.Parameter(w.T.contiguous() if transposed else w, requires_grad=False)
+            self.weight_scale = nn.Parameter(torch.rand(output_size, 1), requires_grad=False)
+            self.scheme = SimpleNamespace(strategy='channel', is_static_input_scheme=False, input_symmetric=True)
+            self.quant_method = Method()
+            self.params_dtype = torch.float32
+            self.bias = None
+
+        def forward(self, x):
+            return self.quant_method.apply(self, x), None
+
+    class Gate(nn.Module):
+        def __init__(self, input_size, output_sizes, **kwargs):
+            super().__init__()
+            self.weight = nn.Parameter(torch.randn(sum(output_sizes), input_size))
+        def forward(self, x):
+            return x @ self.weight.T, None
+
+    projection = KimiK3MixedKDAProjection(5, [3, 3, 3, 3, 2, 3], 4, 1,
+        column_linear=Column, merged_linear=Gate, quant_config=None,
+        prefix='model.self_attn.in_proj_qkvgfab')
+    x = torch.randn(4, 5)
+    projection._fuse_qkv = False
+    expected = projection(x)[0]
+    calls.clear()
+    projection._fuse_qkv = True
+    with torch.inference_mode():
+        actual = projection(x)[0]
+    torch.testing.assert_close(actual, expected)
+    assert len(calls) == 1
+    cache = projection._fused_qkv
+    assert cache.weight.is_inference() and cache.weight_scale.is_inference()
+    from vllm.v1.worker.gpu_worker import Worker
+    from vllm_hcu.v1.worker import HcuGPUWorker
+    from vllm_hcu.patch.worker.core_fix import patch_deepseek_v4_attention
+    from vllm_hcu.model_executor.layers.fused_moe import glm53_router_gemv
+    monkeypatch.setattr(patch_deepseek_v4_attention, 'refresh_compressor_nt_weights', lambda model: None)
+    monkeypatch.setattr(glm53_router_gemv, 'refresh_glm53_router_gates', lambda model: None)
+    name = 'reload_weights' if entry == 'reload_weights' else 'finish_weight_update'
+    monkeypatch.setattr(Worker, name, lambda self, *args, **kwargs: None)
+    worker = object.__new__(HcuGPUWorker)
+    worker._weight_update_is_draft = entry == 'finish_draft'
+    other = nn.Module()
+    target = other if entry == 'finish_draft' else projection
+    draft = projection if entry == 'finish_draft' else other
+    worker.model_runner = SimpleNamespace(model=target, get_draft_model=lambda: draft)
+    weight_ptr, scale_ptr = cache.weight.data_ptr(), cache.weight_scale.data_ptr()
+    with torch.no_grad():
+        projection.q_proj.weight.fill_(2)
+        projection.k_proj.weight_scale.fill_(3)
+    getattr(worker, name)()
+    assert cache.weight.data_ptr() == weight_ptr and cache.weight_scale.data_ptr() == scale_ptr
+    assert cache.weight_scale[3:6].eq(3).all()
+    assert (cache.weight[:, :3] if transposed else cache.weight[:3]).eq(2).all()
+    projection(x)
+    assert projection._fused_qkv is cache
+    assert cache.weight.data_ptr() != projection.q_proj.weight.data_ptr()
+    projection.k_proj.scheme.is_static_input_scheme = True
+    with pytest.raises(ValueError, match='Incompatible'):
+        projection._make_fused_qkv(5)
+
+
+def test_fused_qkv_refresh_preserves_storage_and_updates_values():
+    projection = KimiK3MixedKDAProjection.__new__(KimiK3MixedKDAProjection)
+    nn.Module.__init__(projection)
+    for name, value in zip(('q_proj', 'k_proj', 'v_proj'), (1, 2, 3)):
+        layer = nn.Module()
+        layer.weight = nn.Parameter(torch.full((2, 4), value, dtype=torch.int8), requires_grad=False)
+        layer.weight_scale = nn.Parameter(torch.ones(2, 1), requires_grad=False)
+        setattr(projection, name, layer)
+    projection._fused_qkv = SimpleNamespace(weight=torch.zeros(6, 4, dtype=torch.int8), weight_scale=torch.zeros(6, 1))
+    weight_ptr = projection._fused_qkv.weight.data_ptr()
+    scale_ptr = projection._fused_qkv.weight_scale.data_ptr()
+    projection.refresh_fused_qkv()
+    assert projection._fused_qkv.weight.data_ptr() == weight_ptr
+    assert projection._fused_qkv.weight_scale.data_ptr() == scale_ptr
+    assert projection._fused_qkv.weight[:, 0].tolist() == [1, 1, 2, 2, 3, 3]
+    torch.testing.assert_close(projection._fused_qkv.weight_scale, torch.ones(6, 1))
+    def loader(param, tensor):
+        with torch.no_grad():
+            param.copy_(tensor)
+    projection.q_proj.weight.weight_loader = loader
+    projection.k_proj.weight_scale.weight_loader = loader
+    projection.load_branch('q_proj', 'weight', torch.full((2, 4), 7, dtype=torch.int8))
+    projection.load_branch('k_proj', 'weight_scale', torch.full((2, 1), 3.0))
+    assert projection._fused_qkv.weight.data_ptr() == weight_ptr
+    assert projection._fused_qkv.weight_scale.data_ptr() == scale_ptr
+    assert projection._fused_qkv.weight[:2].eq(7).all()
+    assert projection._fused_qkv.weight_scale[2:4].eq(3).all()
+
+
+def test_fused_qkv_defers_refresh_until_layerwise_reload_finishes():
+    projection = KimiK3MixedKDAProjection.__new__(KimiK3MixedKDAProjection)
+    nn.Module.__init__(projection)
+    projection._fused_refresh_deferred = False
+    projection._fused_qkv = SimpleNamespace(weight=torch.zeros(6, 4, dtype=torch.int8), weight_scale=torch.zeros(6, 1))
+    for name in ('q_proj', 'k_proj', 'v_proj'):
+        layer = nn.Module()
+        layer.weight = nn.Parameter(torch.empty((2, 4), dtype=torch.int8, device='meta'), requires_grad=False)
+        layer.weight_scale = nn.Parameter(torch.empty((2, 1), device='meta'), requires_grad=False)
+        setattr(projection, name, layer)
+    projection.q_proj.weight.weight_loader = lambda param, tensor: None
+    projection.load_branch('q_proj', 'weight', torch.ones((2, 4), dtype=torch.int8))
+    assert projection._fused_refresh_deferred
+    for layer in (projection.q_proj, projection.k_proj, projection.v_proj):
+        layer.weight = nn.Parameter(torch.ones((2, 4), dtype=torch.int8), requires_grad=False)
+        layer.weight_scale = nn.Parameter(torch.ones((2, 1)), requires_grad=False)
+    projection.q_proj.weight.weight_loader = lambda param, tensor: param.data.copy_(tensor)
+    projection.load_branch('q_proj', 'weight', torch.full((2, 4), 2, dtype=torch.int8))
+    assert projection._fused_qkv.weight.eq(0).all()
+    ptr = projection._fused_qkv.weight.data_ptr()
+    projection.refresh_fused_qkv()
+    assert projection._fused_qkv.weight.data_ptr() == ptr
+    assert projection._fused_qkv.weight[:2].eq(2).all()
+    assert not projection._fused_refresh_deferred
+
+
+def _fused_projection(monkeypatch, fuse=True):
+    monkeypatch.setenv('VLLM_HCU_KIMI_KDA_FUSE_QKV', '1' if fuse else '0')
+
+    class Method:
+        def apply(self, layer, x, bias=None):
+            return x @ (layer.weight.float() * layer.weight_scale).T
+
+    class Column(nn.Module):
+        def __init__(self, input_size, output_size, **kwargs):
+            super().__init__()
+            self.weight = nn.Parameter(
+                torch.randint(-4, 5, (output_size, input_size), dtype=torch.int8),
+                requires_grad=False)
+            self.weight_scale = nn.Parameter(torch.rand(output_size, 1), requires_grad=False)
+            self.scheme = SimpleNamespace(strategy='channel', is_static_input_scheme=False,
+                                          input_symmetric=True)
+            self.quant_method = Method()
+            self.params_dtype = torch.float32
+            self.bias = None
+
+        def forward(self, x):
+            return self.quant_method.apply(self, x), None
+
+    class Gate(nn.Module):
+        def __init__(self, input_size, output_sizes, **kwargs):
+            super().__init__()
+            self.weight = nn.Parameter(torch.randn(sum(output_sizes), input_size))
+
+        def forward(self, x):
+            return x @ self.weight.T, None
+
+    return KimiK3MixedKDAProjection(5, [3, 3, 3, 3, 2, 3], 4, 1,
+        column_linear=Column, merged_linear=Gate, quant_config=None,
+        prefix='model.self_attn.in_proj_qkvgfab')
+
+
+def test_fused_qkv_rejects_uva_offloaded_branches(monkeypatch):
+    projection = _fused_projection(monkeypatch)
+    projection.q_proj.weight._vllm_is_uva_offloaded = True
+    with pytest.raises(ValueError, match='incompatible with weight offloading'):
+        projection._make_fused_qkv(5)
+
+
+@pytest.mark.parametrize('sleep,fuse,rejected', [(True, True, True), (True, False, False), (False, True, False)])
+def test_fused_qkv_sleep_mode_contract(monkeypatch, sleep, fuse, rejected):
+    from vllm.config import set_current_vllm_config
+    config = SimpleNamespace(model_config=SimpleNamespace(enable_sleep_mode=sleep))
+    with set_current_vllm_config(config):
+        if rejected:
+            with pytest.raises(ValueError, match='incompatible with sleep mode'):
+                _fused_projection(monkeypatch, fuse)
+        else:
+            assert _fused_projection(monkeypatch, fuse)._fuse_qkv is fuse
+
+
+def test_fused_qkv_rejects_prefetch_offloaded_branches(monkeypatch):
+    projection = _fused_projection(monkeypatch)
+    param_offloader = SimpleNamespace(_param=projection.k_proj.weight_scale)
+    fake_offloader = SimpleNamespace(
+        module_offloaders=[SimpleNamespace(_param_offloaders={'weight_scale': param_offloader})])
+    monkeypatch.setattr(mixed, '_get_offloader', lambda: fake_offloader)
+    with pytest.raises(ValueError, match='incompatible with weight offloading'):
+        projection._make_fused_qkv(5)
+
+
+def test_fused_qkv_allows_parameters_outside_offload(monkeypatch):
+    projection = _fused_projection(monkeypatch)
+    other = nn.Parameter(torch.ones(2, 4, dtype=torch.int8), requires_grad=False)
+    param_offloader = SimpleNamespace(_param=other)
+    fake_offloader = SimpleNamespace(
+        module_offloaders=[SimpleNamespace(_param_offloaders={'weight': param_offloader})])
+    monkeypatch.setattr(mixed, '_get_offloader', lambda: fake_offloader)
+    fused = projection._make_fused_qkv(5)
+    assert fused.weight.shape == (9, 5)
+
+
+@pytest.mark.parametrize('fuse', [False, True])
+def test_cpu_offload_ownership_survives_functional_call_without_retaining_parameters(monkeypatch, fuse):
+    import gc
+    import weakref
+    projection = _fused_projection(monkeypatch)
+    projection._fuse_qkv = fuse
+    originals = [weakref.ref(getattr(layer, name))
+                 for layer in (projection.q_proj, projection.k_proj, projection.v_proj)
+                 for name in ('weight', 'weight_scale')]
+    for layer in (projection.q_proj, projection.k_proj, projection.v_proj):
+        for name in ('weight', 'weight_scale'):
+            param = getattr(layer, name)
+            setattr(layer, name, nn.Parameter(param.detach().clone(), requires_grad=False))
+    del param
+    gc.collect()
+    assert all(ref() is None for ref in originals)
+    monkeypatch.setattr(mixed, '_get_offloader', lambda: SimpleNamespace(uva_offloading=False))
+    mixed.record_kimi_kda_offload_ownership(projection)
+    assert projection._qkv_offloaded
+    replacements = {name: param.detach().clone() for name, param in projection.named_parameters()}
+    # During functional_call the offloader-visible CPU parameters are replaced.
+    monkeypatch.setattr(mixed, '_get_offloader', lambda: None)
+    if fuse:
+        with pytest.raises(ValueError, match='incompatible with weight offloading'):
+            torch.func.functional_call(projection, replacements, (torch.ones(1, 5),))
+    else:
+        torch.func.functional_call(projection, replacements, (torch.ones(1, 5),))

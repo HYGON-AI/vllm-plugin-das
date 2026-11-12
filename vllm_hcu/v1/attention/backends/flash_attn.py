@@ -322,10 +322,10 @@ class HcuFlashAttentionBackend(AttentionBackend):
     @staticmethod
     def get_fp8_dtype_for_flashattn(kv_cache_dtype: str) -> torch.dtype:
         if kv_cache_dtype in ("fp8", "fp8_e4m3"):
-            if torch.cuda.get_device_properties("cuda").gcnArchName.split(':')[0] == "gfx938":
+            arch = torch.cuda.get_device_properties("cuda").gcnArchName.split(":")[0]
+            if arch in {"gfx92a", "gfx938"}:
                 return torch.float8_e4m3fn
-            else:
-                raise ValueError(f"{kv_cache_dtype} only supported on nmz")
+            raise ValueError(f"{kv_cache_dtype} is not supported on {arch}")
         elif kv_cache_dtype in ("fp8_e5m2"):
             return torch.float8_e5m2
         else:

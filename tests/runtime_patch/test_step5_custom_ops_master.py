@@ -19,6 +19,8 @@ _MODEL_CHILDREN = (
     "VLLM_HCU_STEP5_FUSED_GATE",
     "STEP5_SKINNY_LM_HEAD",
     "VLLM_HCU_TRITON_TOKEN_FP8_QUANT",
+    "VLLM_HCU_STEP5_QKV_INDEXER",
+    "VLLM_STEP4_DSA_PREFILL_FP8_INDEXER",
 )
 
 _RUNTIME_CHILDREN = (
@@ -32,13 +34,13 @@ _RUNTIME_CHILDREN = (
 @pytest.mark.parametrize(
     ("master", "child", "expected"),
     [
-        ("0", "1", (False,) * 9),
-        ("1", "1", (True,) * 9),
-        ("1", "0", (False,) * 9),
+        ("0", "1", (False,) * 11),
+        ("1", "1", (True,) * 11),
+        ("1", "0", (False,) * 11),
         (
             "1",
             None,
-            (True, True, True, False, False, False, False, True, False),
+            (True, True, True, False, False, False, False, True, False, False, True),
         ),
     ],
 )
@@ -61,6 +63,7 @@ from vllm_hcu.models import step5_text
 from vllm_hcu.models import step5_swa_fused
 from vllm_hcu.model_executor.layers import skinny_lm_head
 from vllm_hcu.ops import token_fp8_quant
+from vllm_hcu.model_executor.layers import step4_dsa
 
 actual = (
     step5_text.FUSE_QKVG,
@@ -72,6 +75,8 @@ actual = (
     step5_swa_fused.FUSED_GATE,
     skinny_lm_head._ENABLED,
     token_fp8_quant.ENABLED,
+    step5_text.QKV_INDEXER,
+    step4_dsa.PREFILL_FP8_INDEXER,
 )
 assert actual == {expected!r}, actual
 """
