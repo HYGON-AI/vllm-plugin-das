@@ -41,7 +41,9 @@ if [ -z "$PY" ]; then
     exit 1
 fi
 if ! "$PY" -c 'import sys; raise SystemExit(not ((3, 11) <= sys.version_info[:2] < (3, 15)))'; then
-    echo "build_hcu_wheel.sh: Python >=3.11,<3.15 is required, got $("$PY" --version 2>&1)" >&2
+    echo "build_hcu_wheel.sh: Python >=3.11,<3.15 is required" \
+         "(adapter_extension/pyproject.toml), got $("$PY" --version 2>&1);" \
+         "set PYTHON=/path/to/python3.12 to choose another interpreter" >&2
     exit 1
 fi
 if ! "$PY" -m pip --version >/dev/null 2>&1; then
