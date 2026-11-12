@@ -85,9 +85,17 @@ torch::Tensor sigmoid_mul_hcu(torch::Tensor gate, torch::Tensor value) {
   TORCH_CHECK(gate.is_contiguous() && value.is_contiguous(),
               "sigmoid_mul inputs must be contiguous");
   TORCH_CHECK(gate.dim() == value.dim(), "sigmoid_mul input ranks must match");
-  TORCH_CHECK(gate.numel() == value.size(0),
-              "sigmoid_mul gate rows do not match value rows");
-  TORCH_CHECK(value.size(-1) % 2 == 0,
+  // The kernel broadcasts one gate scalar over each contiguous row of
+  // value.size(-1) elements, so the row count is numel / size(-1) -- not
+  // size(0).  Comparing against size(0) let a [B, 1, 1] gate through for a
+  // [B, S, H] value (all other checks pass: equal rank, equal numel/size(0))
+  // while the kernel read gate[B*S-1], past the end of the allocation.
+  const int64_t columns = value.size(-1);
+  TORCH_CHECK(columns > 0, "sigmoid_mul value must have a non-empty last dim");
+  TORCH_CHECK(gate.numel() == value.numel() / columns,
+              "sigmoid_mul gate must hold one scalar per value row "
+              "(gate.numel() == value.numel() / value.size(-1))");
+  TORCH_CHECK(columns % 2 == 0,
               "sigmoid_mul value columns must be even");
 
   auto output = torch::empty_like(value);
