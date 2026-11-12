@@ -29,25 +29,15 @@ jobs:
   compile:
     name: compile (py${{ matrix.python_version }})
     # 需要 docker 与内网 pip 源访问能力的自托管 runner
-    runs-on:
-      - ci
-      - self-hosted
+    runs-on: hygon-build
     strategy:
       fail-fast: false
       matrix:
         include:
           - python_version: "3.10"
             base_image: ${{ vars.BASE_COMPILE_IMAGE_ROCKY_PY310 }}
-          - python_version: "3.12"
-            base_image: ${{ vars.BASE_COMPILE_IMAGE_ROCKY_PY312 }}
     container:
       image: ${{ matrix.base_image }}
-      options: >-
-        --volume /opt/hyhal:/opt/hyhal:ro
-        --device /dev/kfd:/dev/kfd
-        --device /dev/dri:/dev/dri
-        --cap-add=SYS_PTRACE
-        --privileged
     steps:
       - name: 准备构建工具
         run: |

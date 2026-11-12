@@ -36,9 +36,7 @@ env:
 jobs:
   build:
     # 需要能访问内网 pip 源 / AICC 下载地址 / Harbor 的自托管构建节点
-    runs-on:
-      - ci
-      - bw1100
+    runs-on: hygon-image-build
     outputs:
       docker_image: ${{ steps.gen-tag.outputs.docker_image }}
     steps:
@@ -86,13 +84,41 @@ jobs:
           docker push "${HARBOR_SITE}/${HARBOR_NAMESPACE}/${IMAGE_TAG}"
           docker push "${HARBOR_SITE}/${HARBOR_NAMESPACE}/${LATEST_TAG}"
 
-      # 自托管构建机磁盘有限, 推送成功后删除本地镜像释放空间;
-      # 下游 validate-image 会自行从 Harbor 重新拉取, 不依赖本机镜像
-      - name: 删除本地镜像
+      # 登记镜像记录(DashHub, 同 ciimage 的 record 口径): docker run 用产物镜像本身起
+      # 临时容器(与 build 同一 runner, 天然主机亲和, 不用镜像不存在/多 runner 拉副本的
+      # 问题), 容器里补装 cinotificate 后执行 --record_image; 上报哪个镜像以 -e
+      # IMAGE_TAG 现配传入(镜像内没有烙该 ENV); 失败仅告警不阻断, 可稍后手动重试
+      - name: 登记镜像记录(record)
+        continue-on-error: true
+        timeout-minutes: 10
         run: |
-          docker rmi "${HARBOR_SITE}/${HARBOR_NAMESPACE}/${IMAGE_TAG}" \
-                    "${HARBOR_SITE}/${HARBOR_NAMESPACE}/${LATEST_TAG}" \
-          || echo "删除本地镜像失败(可能被其他容器 job 占用), 可稍后手动清理"
+          FULL_TAG="${HARBOR_SITE}/${HARBOR_NAMESPACE}/${IMAGE_TAG}"
+          # 0.25 镜像基于 DTK 26.04, cinotificate 走 dtk2604 nightly 归档
+          PYPI_HOST="${PYPI_URL#*://}"; PYPI_HOST="${PYPI_HOST%%/*}"; PYPI_HOST="${PYPI_HOST%%:*}"
+          docker run --rm --network=host \
+            -e "IMAGE_TAG=${FULL_TAG}" \
+            --entrypoint /bin/bash "${FULL_TAG}" -c "
+              set -e
+              pip install cinotificate \
+                -i '${PYPI_URL}/nightly/dtk2604/+simple/' \
+                --trusted-host '${PYPI_HOST}'
+              CInotificate --record_image
+            "
+
+      # 自托管构建机磁盘有限, record 完删除本地镜像释放空间;
+      # 下游 validate-image 会自行从 Harbor 重新拉取, 不依赖本机镜像。
+      # if: always(): job 被 concurrency 取消时(continue-on-error 不覆盖取消语义)
+      # 默认 success() 会跳过本步骤, 构建机将残留全部镜像层; 先杀掉可能存活的 record 容器再删镜像
+      - name: 删除本地镜像
+        if: always()
+        run: |
+          docker ps --filter "ancestor=${HARBOR_SITE}/${HARBOR_NAMESPACE}/${IMAGE_TAG}" -q \
+            | xargs -r docker rm -f \
+            || true
+          if ! docker rmi "${HARBOR_SITE}/${HARBOR_NAMESPACE}/${IMAGE_TAG}" \
+                         "${HARBOR_SITE}/${HARBOR_NAMESPACE}/${LATEST_TAG}"; then
+            echo "::warning::删除本地镜像失败(可能被其他容器 job 占用), 磁盘有限请稍后手动清理: ${HARBOR_SITE}/${HARBOR_NAMESPACE}/${IMAGE_TAG}"
+          fi
 
       # 其他容器 job 会以 root 在共享 workspace 留下文件, 导致下次 checkout 清理失败
       - name: 清理 workspace
