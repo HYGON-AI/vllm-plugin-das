@@ -13,6 +13,41 @@ REPO_ROOT = Path(__file__).resolve().parents[2]
 PROJECT_ROOT = REPO_ROOT / "adapter_extension"
 SOURCE_ROOT = PROJECT_ROOT / "src"
 
+# The single expected extension table. Both the source metadata and the built
+# wheel are checked against this, so the two cannot drift apart.
+EXPECTED_ENTRY_POINTS = {
+    "hcu_adapter.extensions": {
+        "das_hcu": "hcu_vllm_das.extension:extension_spec",
+        "das_hcu_flash": "hcu_vllm_das.flash_activation:extension_spec",
+        "das_hcu_slimquant": "hcu_vllm_das.slimquant_activation:extension_spec",
+        "das_hcu_aiter_int8": "hcu_vllm_das.int8_activation:extension_spec",
+        "das_hcu_dsv41": "hcu_vllm_das.dsv41_activation:extension_spec",
+        "das_hcu_ct_w4a8": "hcu_vllm_das.ct_w4a8_activation:extension_spec",
+        "das_hcu_v41_indexer": "hcu_vllm_das.v41_indexer_activation:extension_spec",
+        "das_hcu_v41_pcp": "hcu_vllm_das.v41_pcp_activation:extension_spec",
+        "das_hcu_fp4_packer": "hcu_vllm_das.fp4_packer:extension_spec",
+    }
+}
+
+
+def _parse_entry_points(text: str) -> dict[str, dict[str, str]]:
+    """Parse an entry_points.txt body into {group: {name: value}}."""
+    parsed: dict[str, dict[str, str]] = {}
+    group = None
+    for raw in text.splitlines():
+        line = raw.strip()
+        if not line or line.startswith("#"):
+            continue
+        if line.startswith("[") and line.endswith("]"):
+            group = line[1:-1]
+            parsed.setdefault(group, {})
+            continue
+        if group is None or "=" not in line:
+            continue
+        name, value = line.split("=", 1)
+        parsed[group][name.strip()] = value.strip()
+    return parsed
+
 
 def test_project_metadata_has_only_the_adapter_extension_entry_point() -> None:
     metadata = tomllib.loads(
@@ -26,19 +61,7 @@ def test_project_metadata_has_only_the_adapter_extension_entry_point() -> None:
         "hcu-adapter>=0.5.22",
         "packaging>=23",
     ]
-    assert metadata["entry-points"] == {
-        "hcu_adapter.extensions": {
-            "das_hcu": "hcu_vllm_das.extension:extension_spec",
-            "das_hcu_flash": "hcu_vllm_das.flash_activation:extension_spec",
-            "das_hcu_slimquant": "hcu_vllm_das.slimquant_activation:extension_spec",
-            "das_hcu_aiter_int8": "hcu_vllm_das.int8_activation:extension_spec",
-            "das_hcu_dsv41": "hcu_vllm_das.dsv41_activation:extension_spec",
-            "das_hcu_ct_w4a8": "hcu_vllm_das.ct_w4a8_activation:extension_spec",
-            "das_hcu_v41_indexer": "hcu_vllm_das.v41_indexer_activation:extension_spec",
-            "das_hcu_v41_pcp": "hcu_vllm_das.v41_pcp_activation:extension_spec",
-            "das_hcu_fp4_packer": "hcu_vllm_das.fp4_packer:extension_spec",
-        }
-    }
+    assert metadata["entry-points"] == EXPECTED_ENTRY_POINTS
     assert "vllm.platform_plugins" not in metadata["entry-points"]
     assert "vllm.general_plugins" not in metadata["entry-points"]
 
@@ -110,8 +133,17 @@ def test_built_wheel_contains_only_the_new_plugin_namespace(tmp_path: Path) -> N
     assert "Version: 0.33.0" in metadata_lines
     assert "Requires-Dist: hcu-adapter>=0.5.22" in metadata_lines
     assert "[hcu_adapter.extensions]" in entry_point_lines
-    assert "das_hcu = hcu_vllm_das.extension:extension_spec" in entry_point_lines
-    assert "das_hcu_dsv41 = hcu_vllm_das.dsv41_activation:extension_spec" in entry_point_lines
+    # Parse the wheel's own entry points and require the full expected table,
+    # not two spot checks: a build backend that drops or rewrites one extension
+    # entry point would otherwise still pass while the installed plugin silently
+    # loses an extension the adapter host looks for.
+    wheel_entry_points = _parse_entry_points(entry_points)
+    assert wheel_entry_points == {
+        "hcu_adapter.extensions": {
+            name: value
+            for name, value in EXPECTED_ENTRY_POINTS["hcu_adapter.extensions"].items()
+        }
+    }
     assert "hcu_vllm_das/dsv41_activation.py" in names
     assert "hcu_vllm_das/quantization/dsv41_channel_fp8.py" in names
     assert "[vllm.platform_plugins]" not in entry_point_lines

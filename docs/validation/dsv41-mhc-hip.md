@@ -1,5 +1,17 @@
 # HCU mHC HIP compatibility on vLLM 0.33
 
+> **ARCHIVED — this document describes code that no longer exists in this tree.**
+>
+> The plugin modules it routes through (`mhc_runtime.py`, `mhc_ops.py`,
+> `mhc_activation.py` — 641 lines) and the `das_hcu_mhc` entry point were deleted
+> in `b6ad80f`: the adapter already owns the mHC path
+> (`hcu_adapter/kernels/mhc_aiter.py`, TileLang stage2, selected through
+> `HCU_VLLM_MHC_IMPL`, default `aiter`). The CPU replay named at the end of this
+> file (`run_mhc_hip_cpu.sh`) was deleted in the same commit.
+>
+> Read this as the design record of the HIP routing study only. For current
+> owner and behaviour, read the adapter, not this document.
+
 ## Scope and anchors
 
 Start Plugin `479e8ab`, immutable Core `368701db06`, Adapter `3257a934`.
@@ -47,7 +59,8 @@ in compilation environment factors to avoid stale graph/AOT selection.
 
 ## Implementation and routing
 
-The independent `das_hcu_mhc` entry advertises `hcu-mhc-hip-routing`, not device
+The `das_hcu_mhc` entry (since deleted — see the archive notice above) advertised
+`hcu-mhc-hip-routing`, not device
 or model acceptance. Four owned OOT subclasses are published on HCU through
 `CustomOp.register_oot`. Their constructors check the frozen policy/ownership
 for V41 and delegate complete native construction, including delayed Pre's
@@ -122,11 +135,13 @@ container was reused; its observed metadata is `vllm0.33.0+rocm72`. The selected
 Core source path and revisions are recorded, not inferred from metadata.
 CUDA remained uninitialized. The `_C_AVX2` warning is retained as an ABI limit.
 
-Reproduce with existing Python3.12 and Core/Adapter sibling sources:
+Reproduce (the runner was deleted in `b6ad80f`; recover it from that commit's
+parent if the original evidence must be regenerated):
 
 ```bash
-VLLM_TEST_PYTHON=/path/to/python3.12 \
-  bash tests/vllm033/run_mhc_hip_cpu.sh /path/to/output
+# deleted in b6ad80f, kept here only to name the historical entry point
+# VLLM_TEST_PYTHON=/path/to/python3.12 \
+#   bash tests/vllm033/run_mhc_hip_cpu.sh /path/to/output
 ```
 
 Evidence root: `tests/vllm033/.cache/mhc-hip/`; final JSON/log in `final/`,
