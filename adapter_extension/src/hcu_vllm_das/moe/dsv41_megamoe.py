@@ -6,6 +6,7 @@ owns dispatch, the two GEMMs and combine. Each PCP rank submits only its rows.
 """
 from __future__ import annotations
 
+from contextlib import ExitStack, contextmanager
 import inspect
 import torch
 from vllm.config import get_current_vllm_config
@@ -82,6 +83,44 @@ def make_buffer(mega, group, num_experts, capacity, topk, hidden, intermediate):
         buf.destroy()
         raise RuntimeError("MegaMoE native pool capacity or ring is not HT aligned")
     return buf
+
+
+@contextmanager
+def _layer_buffer(ep, mega, device, moe):
+    """Publish a group's shared buffer only after its first layer loads."""
+    cache = getattr(ep, "_hcu_dsv41_mega_buffers", None)
+    if cache is None:
+        cache = {}
+        destroy_group = ep.destroy
+
+        def destroy():
+            # Core owns the process groups used by the vendor IPC handles.
+            # ExitStack also attempts the other releases if one raises.
+            with ExitStack() as cleanup:
+                cleanup.callback(destroy_group)
+                for buf in cache.values():
+                    cleanup.callback(buf.destroy)
+                cache.clear()
+
+        ep.destroy = destroy
+        ep._hcu_dsv41_mega_buffers = cache
+
+    # PCP already split the local batch. The native capacity is rank-local.
+    shape = (moe.num_experts, moe.max_num_tokens, moe.experts_per_token,
+             moe.hidden_dim, moe.intermediate_size_per_partition)
+    key = (device, *shape)
+    if key in cache:
+        yield cache[key]
+        return
+
+    buf = make_buffer(mega, ep.device_group, *shape)
+    try:
+        yield buf
+        cache[key] = buf
+    except BaseException:
+        buf.destroy()
+        raise
+
 
 _PREFLIGHT_KEYS = set()
 
@@ -287,19 +326,6 @@ class HcuDSV41MegaMoEMethod(CompressedTensorsW8A8Fp8MoEMethod):
         ep = get_ep_group()
         if ep.world_size != self.moe.ep_size:
             raise ValueError("MegaMoE EP group differs from expert placement")
-        cache = getattr(ep, "_hcu_dsv41_mega_buffers", None)
-        if cache is None:
-            cache = ep._hcu_dsv41_mega_buffers = {}
-        # PCP has already split the local batch. Do not multiply by EP/PCP.
-        capacity = self.moe.max_num_tokens
-        key = (w1.device, self.moe.num_experts, capacity,
-               self.moe.experts_per_token, self.moe.hidden_dim,
-               self.moe.intermediate_size_per_partition)
-        if key not in cache:
-            cache[key] = make_buffer(
-                mega, ep.device_group, self.moe.num_experts, capacity,
-                self.moe.experts_per_token, self.moe.hidden_dim,
-                self.moe.intermediate_size_per_partition)
         # Keep exactly one copy of expert weights. The native loader's shapes
         # and Parameter objects remain visible for model memory accounting.
         pairs = ((w1, l1[0]), (w2, l2[0]), (s1, l1[1]), (s2, l2[1]))
@@ -310,18 +336,19 @@ class HcuDSV41MegaMoEMethod(CompressedTensorsW8A8Fp8MoEMethod):
             param.data = packed.reshape(param.shape)
         quant = self.get_fused_moe_quant_config(layer)
         self.moe_quant_config = quant
-        self.moe_kernel = MegaKernel(
-            MegaPrepare(), MegaExperts(self.moe, quant, cache[key], l1, l2, mega))
-        self._processed = True
-        # Once per process: every layer shares these packed shapes and buffer.
-        if ep.rank_in_group == 0:
-            from vllm.logger import init_logger
-            init_logger(f"vllm.{__name__}").info_once(
-                "HCU V41 MegaMoE ready: provider=%s physical=%d "
-                "local=%d topk=%d capacity=%d",
-                mega.__file__, self.moe.num_experts,
-                self.moe.num_local_experts, self.moe.experts_per_token,
-                cache[key].num_max_tokens_per_rank)
+        with _layer_buffer(ep, mega, w1.device, self.moe) as buffer:
+            self.moe_kernel = MegaKernel(
+                MegaPrepare(), MegaExperts(self.moe, quant, buffer, l1, l2, mega))
+            self._processed = True
+            # Once per process: every layer shares these packed shapes and buffer.
+            if ep.rank_in_group == 0:
+                from vllm.logger import init_logger
+                init_logger(f"vllm.{__name__}").info_once(
+                    "HCU V41 MegaMoE ready: provider=%s physical=%d "
+                    "local=%d topk=%d capacity=%d",
+                    mega.__file__, self.moe.num_experts,
+                    self.moe.num_local_experts, self.moe.experts_per_token,
+                    buffer.num_max_tokens_per_rank)
 
     def apply(self, layer, x, topk_weights, topk_ids, shared_experts, shared_experts_input):
         if self._failure is not None:

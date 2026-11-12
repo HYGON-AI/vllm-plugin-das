@@ -210,3 +210,47 @@ def test_kernel_keeps_native_routes_and_empty_rank_collective(rows):
     assert torch.equal(out, torch.full_like(x, 3))
     with pytest.raises(ValueError, match="after GEMM2"):
         MegaKernel.apply(kernel, x, None, None, weights, ids, None, 384, None, True)
+
+
+def test_group_owns_successful_buffers_and_rolls_back_failed_loads(monkeypatch):
+    from vllm.distributed.parallel_state import GroupCoordinator
+    from hcu_vllm_das.moe import dsv41_megamoe as module
+
+    events = []
+    allocated = []
+
+    def allocate(*args):
+        index = len(allocated)
+        buf = NS(destroy=lambda: events.append(("buffer", index)))
+        allocated.append(buf)
+        return buf
+
+    monkeypatch.setattr(module, "make_buffer", allocate)
+    monkeypatch.setattr(torch.distributed, "destroy_process_group",
+                        lambda group: events.append(("group", group)))
+    _, moe = mega_config()
+    moe.max_num_tokens = 32768
+
+    for generation in range(2):
+        ep = object.__new__(GroupCoordinator)
+        ep.device_group = generation
+        ep.device_communicator = ep.mq_broadcaster = None
+        first = len(allocated)
+        with pytest.raises(ValueError, match="load failed"):
+            with module._layer_buffer(ep, None, "cpu", moe):
+                raise ValueError("load failed")
+        assert events[-1] == ("buffer", first)
+        with module._layer_buffer(ep, None, "cpu", moe) as shared:
+            pass
+        with pytest.raises(ValueError, match="later layer failed"):
+            with module._layer_buffer(ep, None, "cpu", moe) as reused:
+                assert reused is shared
+                raise ValueError("later layer failed")
+        with module._layer_buffer(ep, None, "cpu", moe) as reused:
+            assert reused is shared
+        assert len(allocated) == first + 2
+        ep.destroy()
+        ep.destroy()
+        assert events[-2:] == [("buffer", first + 1), ("group", generation)]
+        assert events.count(("buffer", first + 1)) == 1
+        assert not ep._hcu_dsv41_mega_buffers
