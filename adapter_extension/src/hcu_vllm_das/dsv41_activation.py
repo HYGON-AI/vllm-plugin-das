@@ -13,10 +13,10 @@ MODEL = ("hcu_vllm_das.models.dsv41_pcp", "HcuDSV41PcpForCausalLM")
 def activate_extension(context):
     _require_vllm_033_release_line(context.vllm_version)
     if not _flag("VLLM_HCU_DSV41_PCP_ATTENTION", default=False):
-        return
+        raise RuntimeError("VLLM_HCU_DSV41_PCP_ATTENTION is disabled")
     from vllm.platforms import current_platform
     if not (current_platform.is_rocm() and current_platform.device_name == "hcu"):
-        return
+        raise RuntimeError("DeepSeek V4.1 PCP requires the HCU platform")
     from vllm.model_executor.layers import quantization
     from vllm.model_executor.models import ModelRegistry
     from .quantization.dsv41_channel_fp8 import HcuDSV41ChannelFP8Config

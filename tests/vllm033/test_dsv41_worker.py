@@ -156,3 +156,28 @@ def test_switch_defaults_off_and_rejects_non_boolean(platform, monkeypatch):
     monkeypatch.setenv("VLLM_HCU_DSV41_PCP_PROFILE_WORKER", "maybe")
     with pytest.raises(ValueError, match="must be a boolean"):
         dsv41_profile_worker_enabled()
+
+
+def test_auto_worker_keeps_adapter_lifecycle(monkeypatch):
+    from hcu_adapter.bridges.vllm import HcuPlatform
+    from hcu_adapter.bridges.vllm_worker import Worker as AdapterWorker
+    from hcu_vllm_das.dsv41 import profile_worker
+    from vllm.config.compilation import CUDAGraphMode
+    from vllm.utils.import_utils import resolve_obj_by_qualname
+
+    class Host(HcuPlatform):
+        pass
+
+    config = _profile_config(None)
+    config.parallel_config.distributed_executor_backend = "mp"
+    config.compilation_config = NS(cudagraph_mode=CUDAGraphMode.NONE)
+    config.model_config.is_mm_prefix_lm = False
+    config.scheduler_config = NS()
+    monkeypatch.setenv("VLLM_HCU_DSV41_PCP_PROFILE_WORKER", "1")
+    profile_worker.install(Host)
+    Host.check_and_update_config(config)
+    worker = resolve_obj_by_qualname(config.parallel_config.worker_cls)
+    assert worker is HcuDSV41PcpWorker
+    assert issubclass(worker, AdapterWorker)
+    assert worker.load_model is AdapterWorker.load_model
+    assert worker.reload_weights is AdapterWorker.reload_weights

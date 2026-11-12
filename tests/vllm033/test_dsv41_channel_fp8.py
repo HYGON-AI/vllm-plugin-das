@@ -28,18 +28,51 @@ def registered(monkeypatch):
 
 
 def test_registration_is_opt_in_and_reuses_public_registries(registered, monkeypatch):
-    before = ModelRegistry.models[activation.ARCH]
-    monkeypatch.delenv("VLLM_HCU_DSV41_PCP_ATTENTION")
-    activation.activate_extension(registered)
-    assert ModelRegistry.models[activation.ARCH] is before
-    assert activation.QUANTIZATION_METHOD not in quantization.QUANTIZATION_METHODS
-    monkeypatch.setenv("VLLM_HCU_DSV41_PCP_ATTENTION", "1")
     activation.activate_extension(registered)
     entry = ModelRegistry.models[activation.ARCH]
     assert (entry.module_name, entry.class_name) == activation.MODEL
     assert quantization.get_quantization_config(activation.QUANTIZATION_METHOD) is quant.HcuDSV41ChannelFP8Config
     activation.activate_extension(registered)
     assert ModelRegistry.models[activation.ARCH] is entry
+
+
+@pytest.mark.parametrize("flag", [None, "0", "1"])
+@pytest.mark.parametrize("requirement", [None, "extension", "capability"])
+def test_adapter_activation_reports_only_registered_providers(registered, monkeypatch, flag, requirement):
+    from importlib.metadata import EntryPoint
+    from hcu_adapter.extensions import (
+        ExtensionContext, ExtensionStatus, RequiredExtensionError, activate_extensions,
+    )
+
+    switch = "VLLM_HCU_DSV41_PCP_ATTENTION"
+    if flag is None:
+        monkeypatch.delenv(switch)
+    else:
+        monkeypatch.setenv(switch, flag)
+    point = EntryPoint(name="das_hcu_dsv41", group="hcu_adapter.extensions",
+                       value="hcu_vllm_das.dsv41_activation:extension_spec")
+    context = ExtensionContext(
+        adapter_version="0.5.22+hcu.1", vllm_version=registered.vllm_version,
+        requested_extensions={point.name} if requirement == "extension" else set(),
+        requested_capabilities={"dsv41-pcp-megamoe"} if requirement == "capability" else set(),
+    )
+    before = ModelRegistry.models[activation.ARCH]
+    if flag != "1" and requirement:
+        with pytest.raises(RequiredExtensionError) as exc:
+            activate_extensions(context, [point])
+        report, = exc.value.reports
+    else:
+        report, = activate_extensions(context, [point])
+
+    if flag == "1":
+        assert report.status is ExtensionStatus.ACTIVE
+        assert ModelRegistry.models[activation.ARCH].module_name == activation.MODEL[0]
+        assert quantization.get_quantization_config(activation.QUANTIZATION_METHOD) is quant.HcuDSV41ChannelFP8Config
+    else:
+        assert report.status is ExtensionStatus.FAILED
+        assert switch in report.reason
+        assert ModelRegistry.models[activation.ARCH] is before
+        assert activation.QUANTIZATION_METHOD not in quantization.QUANTIZATION_METHODS
 
 
 def test_foreign_model_registration_is_preserved(registered):

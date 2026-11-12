@@ -1,7 +1,7 @@
 # SPDX-License-Identifier: Apache-2.0
 """Reuse Core profiling with rank-local HCU V4.1 PCP dummy inputs."""
 from vllm.logger import init_logger
-from vllm.v1.worker.gpu_worker import Worker
+from hcu_adapter.bridges.vllm_worker import Worker
 
 from ..quantization.dsv41_channel_fp8 import _is_v41
 
