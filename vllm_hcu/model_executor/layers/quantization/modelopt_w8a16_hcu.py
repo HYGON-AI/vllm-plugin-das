@@ -399,14 +399,20 @@ class ModelOptW8A16MoEMethod(FusedMoEMethodBase):
             #   * dp_size == 1: the DP-chunked runner reverses the order (apply
             #     first, shared second, default_moe_runner.py:525-535) and would
             #     read `x` after the inplace overwrite. This quant is single-card.
-            assert not current_platform.is_cuda(), (
-                "W8A16 AITER MoE inplace fast-path is HCU-only: on CUDA the "
-                "shared experts stream can race with the routed apply. Do not "
-                "reuse this code path on CUDA without restoring x.clone().")
-            assert layer.moe_config.dp_size == 1, (
-                "W8A16 AITER MoE inplace fast-path assumes single-card "
-                "(dp_size=1). With DP the chunked runner reverses shared/apply "
-                "order and would read x after inplace overwrite.")
+            # Raise rather than assert: these two guard the inplace overwrite of
+            # `x` against silently-wrong output, and `python -O` strips asserts.
+            if current_platform.is_cuda():
+                raise RuntimeError(
+                    "W8A16 AITER MoE inplace fast-path is HCU-only: on CUDA "
+                    "the shared experts stream can race with the routed "
+                    "apply. Do not reuse this code path on CUDA without "
+                    "restoring x.clone().")
+            if layer.moe_config.dp_size != 1:
+                raise RuntimeError(
+                    "W8A16 AITER MoE inplace fast-path assumes single-card "
+                    "(dp_size=1). With DP the chunked runner reverses "
+                    "shared/apply order and would read x after inplace "
+                    "overwrite.")
             if getattr(layer.moe_config, "swiglu_limit", None):
                 # Neither aiter_moe nor the legacy fused_experts fallback
                 # applies the SwiGLU clamp; running without it changes the
@@ -428,6 +434,15 @@ class ModelOptW8A16MoEMethod(FusedMoEMethodBase):
             e = layer.w13_weight.shape[0]
             topk = topk_ids.shape[1]
             dtype = x.dtype
+            # N1 = 2 * n only holds for gated experts (w13 = [E, 2I, H]).
+            # create_weights() already shards w13 by is_act_and_mul, so a
+            # non-gated checkpoint would request a kernel for a 2I-wide w1 and
+            # silently reinterpret w2 columns as w1/w3 halves. The nested
+            # getattr defaults to True so stubs/mocks that omit `moe` still run.
+            if not getattr(getattr(self, "moe", None), "is_act_and_mul", True):
+                raise RuntimeError(
+                    "W8A16 AITER MoE requires gated experts (is_act_and_mul); "
+                    "disable VLLM_ROCM_USE_AITER_MOE for this model.")
             N1 = 2 * n
             N2 = n
             status, moe_cfg = get_aiter_moe_config(

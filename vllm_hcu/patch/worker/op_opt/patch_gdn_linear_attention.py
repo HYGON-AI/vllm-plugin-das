@@ -188,6 +188,9 @@ def _single_token_packed_decode(arguments, select_recurrent):
         cu is None
         or idx is None
         or idx.dim() != 1
+        # Same index dtypes the packed kernel accepts via
+        # _aiter_recurrent_unsupported; this path does not go through it.
+        or idx.dtype not in (torch.int32, torch.int64)
         or arguments["num_accepted_tokens"] is not None
         or arguments["is_kda"]
         or not arguments["inplace_final_state"]

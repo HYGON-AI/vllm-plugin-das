@@ -327,8 +327,13 @@ def fused_moe_block_pending(block, st: _FusedState,
     y = torch.nn.functional.linear(x, st.w_cat)  # [m, ldy]
 
     act = torch.empty(m, inter, dtype=dtype, device=x.device)
-    blk = min(inter, 1024)
-    _strided_silu_mul_kernel[(m, inter // blk)](
+    # Grid must cover every column of `act`: a plain `inter // blk` truncates
+    # (inter=1536, blk=1024 -> 1 block -> columns 1024..1535 keep stale
+    # `torch.empty` memory and reach down_proj). The kernel is exact-width, so
+    # also fall back to a single whole-row block when 1024 does not divide.
+    blk = 1024 if inter % 1024 == 0 else inter
+    blk = min(blk, inter)
+    _strided_silu_mul_kernel[(m, triton.cdiv(inter, blk))](
         y, ldy, act, D=inter, BLOCK=blk, num_warps=4)
     shared_out, _ = block.shared_expert.down_proj(act)
 

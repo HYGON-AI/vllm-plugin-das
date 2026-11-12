@@ -1,3 +1,4 @@
+# SPDX-License-Identifier: Apache-2.0
 """
 Fused RMSNorm + MRoPE Triton kernel for Qwen3.5-35B-A3B on Hygon DCU.
 
