@@ -88,8 +88,11 @@ def test_master_switch_off_disables(monkeypatch):
     assert s.schedule() is False
 
 
+@pytest.mark.hcu
 @pytest.mark.parametrize("master,expected_none", [("0", True), ("1", False)])
 def test_cache_dequant_follows_master_switch(monkeypatch, master, expected_none):
+    # master="1" reaches torch.cuda.is_current_stream_capturing(), which needs
+    # a live HCU/ROCm runtime; the portable `contract` suite runs -m "not hcu".
     import torch
 
     import vllm_hcu.platforms.envs as henvs
