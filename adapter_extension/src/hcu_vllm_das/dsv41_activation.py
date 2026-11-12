@@ -24,7 +24,11 @@ def _bind_providers() -> None:
 
 
 from hcu_adapter import dsv41_activation as _impl  # noqa: E402
+from hcu_vllm_das._seams import require_adapter_seams  # noqa: E402
 
+# Import-time binding is the earliest point that touches an adapter seam, so the
+# contract check has to run here rather than inside `bind_dsv41()`.
+require_adapter_seams()
 _impl.set_provider_binder(_bind_providers)
 
 sys.modules[__name__] = _impl
