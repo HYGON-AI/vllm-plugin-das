@@ -75,8 +75,30 @@ def test_gemma4_fa_registration_is_opt_in(monkeypatch, enabled):
     assert register_attention.call_count == int(enabled == "1")
 
 
-@pytest.mark.parametrize("dcp_size", [1, 2])
-def test_gemma4_fa_backend_selection_rejects_dcp(monkeypatch, dcp_size):
+class _CustomBackend(gemma4.TritonAttentionBackend):
+    pass
+
+
+@pytest.mark.parametrize(
+    ("dcp_size", "requested_backend", "global_backend"),
+    [
+        (1, None, "TRITON_ATTN"),
+        (1, gemma4.TritonAttentionBackend, "TRITON_ATTN"),
+        (1, _CustomBackend, "TRITON_ATTN"),
+        (1, gemma4.TritonAttentionBackend, "FLASH_ATTN"),
+        (2, None, "TRITON_ATTN"),
+    ],
+    ids=[
+        "implicit-triton",
+        "explicit-triton",
+        "explicit-custom",
+        "nontriton-config",
+        "unsupported-dcp",
+    ],
+)
+def test_gemma4_fa_backend_selection(
+    monkeypatch, dcp_size, requested_backend, global_backend
+):
     from vllm import config
 
     monkeypatch.setattr(
@@ -84,7 +106,7 @@ def test_gemma4_fa_backend_selection_rejects_dcp(monkeypatch, dcp_size):
         "get_current_vllm_config",
         lambda: SimpleNamespace(
             parallel_config=SimpleNamespace(decode_context_parallel_size=dcp_size),
-            attention_config=SimpleNamespace(backend="TRITON_ATTN"),
+            attention_config=SimpleNamespace(backend=global_backend),
         ),
     )
 
@@ -100,12 +122,18 @@ def test_gemma4_fa_backend_selection_rejects_dcp(monkeypatch, dcp_size):
         with pytest.raises(ValueError, match="decode_context_parallel_size > 1"):
             model.Attention(NUM_HEADS, HEAD_SIZE, 1.0)
     else:
-        assert (
-            model.Attention(NUM_HEADS, HEAD_SIZE, 1.0).backend
-            is gemma4.Gemma4FAAttentionBackend
+        full = model.Attention(
+            NUM_HEADS, HEAD_SIZE, 1.0, attn_backend=requested_backend
         )
-        sliding = model.Attention(NUM_HEADS, 256, 1.0, per_layer_sliding_window=1024)
-        assert sliding.backend is None
+        assert full.backend is gemma4.Gemma4FAAttentionBackend
+        sliding = model.Attention(
+            NUM_HEADS,
+            HEAD_SIZE,
+            1.0,
+            per_layer_sliding_window=1024,
+            attn_backend=requested_backend,
+        )
+        assert sliding.backend is requested_backend
 
 
 @pytest.mark.parametrize("layout", ["NHD", "HND"])

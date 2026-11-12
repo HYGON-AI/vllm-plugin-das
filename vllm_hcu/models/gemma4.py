@@ -247,17 +247,7 @@ def _use_gemma4_fa(module: ModuleType) -> bool:
                     "decode_context_parallel_size > 1. Disable the Gemma4 FA "
                     "switch or use DCP=1."
                 )
-            if (
-                head_size == 512
-                and kwargs.get("per_layer_sliding_window") is None
-                and kwargs.get("attn_backend") is None
-            ):
-                backend = config.attention_config.backend
-                if getattr(backend, "name", backend) not in (None, "TRITON_ATTN"):
-                    raise ValueError(
-                        "VLLM_HCU_GEMMA4_USE_FA=1 conflicts with attention "
-                        f"backend {backend!r}; requires Triton-compatible metadata."
-                    )
+            if head_size == 512 and kwargs.get("per_layer_sliding_window") is None:
                 kwargs["attn_backend"] = Gemma4FAAttentionBackend
             super().__init__(num_heads, head_size, scale, **kwargs)
 
