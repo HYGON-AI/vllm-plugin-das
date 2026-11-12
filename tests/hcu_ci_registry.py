@@ -177,6 +177,11 @@ register_hcu_ci(
 )
 register_hcu_ci(
     job="contract-hcu-gfx936",
+    target="tests/gemma4_test/test_gemma4_switches.py",
+    est_time=60,
+)
+register_hcu_ci(
+    job="contract-hcu-gfx936",
     target="tests/patch/test_plugin_lifecycle.py",
     est_time=300,
 )
