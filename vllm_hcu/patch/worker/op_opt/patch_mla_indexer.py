@@ -27,6 +27,42 @@ _MARKER = "_vllm_hcu_mla_indexer_applied"
 _WRAPPER = "_vllm_hcu_mla_indexer_wrapper"
 
 
+def _split_nonempty_prefill_chunks(seq_lens_cpu, query_lens_cpu, workspace_size,
+                                   max_logits_bytes, request_offset=0):
+    """Replay the native planner, skipping zero-query chunks before range().
+
+    PCP ranks can contain rows with both Q and KV lengths zero. Keep their
+    request positions: dropping rows would change slices used by the builder.
+    Budget grouping and query sub-slices otherwise match the native planner.
+    """
+    chunks = []
+    max_logits_elems = max_logits_bytes // 4
+    end = 0
+    while end < len(seq_lens_cpu):
+        start, chunk_m, chunk_n = end, 0, 0
+        while end < len(seq_lens_cpu):
+            q = query_lens_cpu[end].item()
+            s = seq_lens_cpu[end].item()
+            new_m, new_n = chunk_m + q, chunk_n + s
+            if new_n <= workspace_size and new_m * new_n <= max_logits_elems:
+                chunk_m, chunk_n = new_m, new_n
+                end += 1
+            else:
+                break
+        if end == start:
+            chunk_m = query_lens_cpu[end].item()
+            chunk_n = seq_lens_cpu[end].item()
+            end += 1
+        if chunk_m == 0:
+            continue
+        req_slice = slice(start + request_offset, end + request_offset)
+        max_q = max(1, max_logits_elems // chunk_n) if chunk_n > 0 else chunk_m
+        for q_off in range(0, chunk_m, max_q):
+            sub_m = min(max_q, chunk_m - q_off)
+            chunks.append((req_slice, slice(q_off, q_off + sub_m)))
+    return chunks
+
+
 def _wrap_prefill_chunk_builder(build_prefill):
     @functools.wraps(build_prefill)
     def hcu_prefill_chunk(
@@ -113,8 +149,21 @@ def apply_to_module(module: ModuleType) -> bool:
     @functools.wraps(split_chunks)
     def hcu_split_chunks(seq_lens_cpu, query_lens_cpu, workspace_size,
                          max_logits_bytes, request_offset=0):
-        chunks = split_chunks(seq_lens_cpu, query_lens_cpu, workspace_size,
-                              max_logits_bytes, request_offset)
+        try:
+            chunks = split_chunks(seq_lens_cpu, query_lens_cpu, workspace_size,
+                                  max_logits_bytes, request_offset)
+        except ValueError as exc:
+            # Native 0.25.1 raises before returning any chunks when a PCP
+            # zero-Q/zero-KV chunk produces max_q=0. Leave other failures
+            # visible, and keep the native path unchanged on normal batches.
+            if (str(exc) != "range() arg 3 must not be zero"
+                    or not any(q.item() == 0 and s.item() == 0
+                               for q, s in zip(query_lens_cpu, seq_lens_cpu))):
+                raise
+            chunks = _split_nonempty_prefill_chunks(
+                seq_lens_cpu, query_lens_cpu, workspace_size,
+                max_logits_bytes, request_offset,
+            )
         return [
             (req_slice, query_slice)
             for req_slice, query_slice in chunks
