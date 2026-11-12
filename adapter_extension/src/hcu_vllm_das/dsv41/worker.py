@@ -3,6 +3,7 @@
 from vllm.logger import init_logger
 from hcu_adapter.bridges.vllm_worker import Worker
 
+from .profile_worker import local_token_bound
 from ..quantization.dsv41_channel_fp8 import _is_v41
 
 # vLLM configures a non-propagating handler on the ``vllm`` namespace only.
@@ -19,12 +20,6 @@ def uses_pcp_channel_fp8(config):
     )
 
 
-def _local_profile_token_bound(global_tokens, max_reqs, pcp_size):
-    # Core gives a prefill rank two ceil(query_len / (2 * PCP)) chunks.
-    # Two extra rows per request cover their rounding and replicated decodes.
-    return min(global_tokens, (global_tokens + pcp_size - 1) // pcp_size + 2 * max_reqs)
-
-
 class HcuDSV41PcpWorker(Worker):
     def _uses_pcp_channel_fp8(self):
         return uses_pcp_channel_fp8(self.vllm_config)
@@ -38,7 +33,7 @@ class HcuDSV41PcpWorker(Worker):
         if not self._uses_pcp_channel_fp8() or runner.pcp_manager is None:
             return super().determine_available_memory()
         global_tokens = runner.max_num_tokens
-        local_tokens = _local_profile_token_bound(
+        local_tokens = local_token_bound(
             global_tokens, runner.max_num_reqs,
             self.parallel_config.prefill_context_parallel_size)
         if self.rank == 0:

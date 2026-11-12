@@ -55,7 +55,7 @@ def test_memory_profile_uses_local_bound_and_restores_global_budget(monkeypatch,
 def test_profile_bound_covers_core_pcp_mixed_and_rounded_batches():
     import numpy as np
     from vllm.v1.worker.gpu.pcp_manager import PCPManager
-    from hcu_vllm_das.dsv41.worker import _local_profile_token_bound
+    from hcu_vllm_das.dsv41.profile_worker import local_token_bound
     rng = np.random.default_rng(42)
     manager = object.__new__(PCPManager)
     manager.pcp_world_size, manager.dcp_world_size = 8, 1
@@ -72,7 +72,7 @@ def test_profile_bound_covers_core_pcp_mixed_and_rounded_batches():
                     lens[is_prefill] += rng.multinomial(remaining,
                         np.full(is_prefill.sum(), 1 / is_prefill.sum()))
                     actual = manager.get_num_tokens_for_dispatch(lens, is_prefill)
-                    bound = _local_profile_token_bound(budget, max_reqs, 8)
+                    bound = local_token_bound(budget, max_reqs, 8)
                     assert actual <= bound, (lens, is_prefill, actual, bound)
 
 

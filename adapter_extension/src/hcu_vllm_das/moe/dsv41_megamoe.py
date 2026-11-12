@@ -20,6 +20,8 @@ from vllm.model_executor.layers.fused_moe.activation import MoEActivation
 from vllm.model_executor.layers.quantization.utils.quant_utils import kFp8DynamicTokenSym, kFp8StaticChannelSym
 from vllm.platforms import current_platform
 
+from ..dsv41.profile_worker import WORKER, local_token_bound
+
 
 def validate_config(config, moe):
     p = config.parallel_config
@@ -86,7 +88,7 @@ def make_buffer(mega, group, num_experts, capacity, topk, hidden, intermediate):
 
 
 @contextmanager
-def _layer_buffer(ep, mega, device, moe):
+def _layer_buffer(ep, mega, device, moe, capacity):
     """Publish a group's shared buffer only after its first layer loads."""
     cache = getattr(ep, "_hcu_dsv41_mega_buffers", None)
     if cache is None:
@@ -105,8 +107,7 @@ def _layer_buffer(ep, mega, device, moe):
         ep.destroy = destroy
         ep._hcu_dsv41_mega_buffers = cache
 
-    # PCP already split the local batch. The native capacity is rank-local.
-    shape = (moe.num_experts, moe.max_num_tokens, moe.experts_per_token,
+    shape = (moe.num_experts, capacity, moe.experts_per_token,
              moe.hidden_dim, moe.intermediate_size_per_partition)
     key = (device, *shape)
     if key in cache:
@@ -273,7 +274,16 @@ class MegaKernel(mk.FusedMoEKernel):
 class HcuDSV41MegaMoEMethod(CompressedTensorsW8A8Fp8MoEMethod):
     def __init__(self, weight_quant, input_quant, moe, prefix):
         FusedMoEMethodBase.__init__(self, moe)
-        validate_config(get_current_vllm_config(), moe)
+        config = get_current_vllm_config()
+        validate_config(config, moe)
+        # Stock and custom workers can profile with a full-size dummy batch.
+        self.buffer_capacity = moe.max_num_tokens
+        if config.parallel_config.worker_cls == WORKER:
+            self.buffer_capacity = local_token_bound(
+                config.scheduler_config.max_num_batched_tokens,
+                config.scheduler_config.max_num_seqs,
+                moe.pcp_size,
+            )
         self.weight_quant, self.input_quant = weight_quant, input_quant
         self.weight_block_size = None
         self.block_quant = self.static_input_scales = False
@@ -336,7 +346,7 @@ class HcuDSV41MegaMoEMethod(CompressedTensorsW8A8Fp8MoEMethod):
             param.data = packed.reshape(param.shape)
         quant = self.get_fused_moe_quant_config(layer)
         self.moe_quant_config = quant
-        with _layer_buffer(ep, mega, w1.device, self.moe) as buffer:
+        with _layer_buffer(ep, mega, w1.device, self.moe, self.buffer_capacity) as buffer:
             self.moe_kernel = MegaKernel(
                 MegaPrepare(), MegaExperts(self.moe, quant, buffer, l1, l2, mega))
             self._processed = True

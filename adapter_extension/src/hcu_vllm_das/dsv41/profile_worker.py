@@ -22,6 +22,12 @@ _UNSET = "auto"
 _installed: dict[int, object] = {}
 
 
+def local_token_bound(global_tokens, max_reqs, pcp_size):
+    # Core gives a prefill rank two ceil(query_len / (2 * PCP)) chunks.
+    # Two extra rows per request cover their rounding and replicated decodes.
+    return min(global_tokens, (global_tokens + pcp_size - 1) // pcp_size + 2 * max_reqs)
+
+
 def _select(worker_cls: str, config) -> str:
     """Replace only Core's own default; a deliberate choice stays untouched."""
     from .worker import uses_pcp_channel_fp8

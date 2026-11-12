@@ -237,16 +237,16 @@ def test_group_owns_successful_buffers_and_rolls_back_failed_loads(monkeypatch):
         ep.device_communicator = ep.mq_broadcaster = None
         first = len(allocated)
         with pytest.raises(ValueError, match="load failed"):
-            with module._layer_buffer(ep, None, "cpu", moe):
+            with module._layer_buffer(ep, None, "cpu", moe, moe.max_num_tokens):
                 raise ValueError("load failed")
         assert events[-1] == ("buffer", first)
-        with module._layer_buffer(ep, None, "cpu", moe) as shared:
+        with module._layer_buffer(ep, None, "cpu", moe, moe.max_num_tokens) as shared:
             pass
         with pytest.raises(ValueError, match="later layer failed"):
-            with module._layer_buffer(ep, None, "cpu", moe) as reused:
+            with module._layer_buffer(ep, None, "cpu", moe, moe.max_num_tokens) as reused:
                 assert reused is shared
                 raise ValueError("later layer failed")
-        with module._layer_buffer(ep, None, "cpu", moe) as reused:
+        with module._layer_buffer(ep, None, "cpu", moe, moe.max_num_tokens) as reused:
             assert reused is shared
         assert len(allocated) == first + 2
         ep.destroy()
@@ -254,3 +254,31 @@ def test_group_owns_successful_buffers_and_rolls_back_failed_loads(monkeypatch):
         assert events[-2:] == [("buffer", first + 1), ("group", generation)]
         assert events.count(("buffer", first + 1)) == 1
         assert not ep._hcu_dsv41_mega_buffers
+
+
+@pytest.mark.parametrize("worker_cls, budget, expected", [
+    ("hcu_vllm_das.dsv41.worker.HcuDSV41PcpWorker", 32768, 4352),
+    ("hcu_vllm_das.dsv41.worker.HcuDSV41PcpWorker", 32769, 4480),
+    ("hcu_adapter.bridges.vllm_worker.Worker", 32768, 32768),
+])
+def test_native_pool_capacity_matches_resolved_worker(monkeypatch, worker_cls, budget, expected):
+    from hcu_vllm_das.moe import dsv41_megamoe as module
+
+    config, moe = mega_config()
+    config.parallel_config.worker_cls = worker_cls
+    config.scheduler_config = NS(max_num_batched_tokens=budget, max_num_seqs=128)
+    moe.max_num_tokens = budget
+    monkeypatch.setattr(module, "get_current_vllm_config", lambda: config)
+    method = module.HcuDSV41MegaMoEMethod(None, None, moe, "experts")
+    calls = []
+
+    def allocate(group, experts, capacity, *args, **kwargs):
+        calls.append(capacity)
+        return NS(l1_acts=NS(shape=(128,)), l2_acts=NS(shape=(128,)), destroy=lambda: None)
+
+    vendor = NS(get_symm_buffer_for_mega_moe=allocate)
+    ep = NS(device_group=object(), destroy=lambda: None)
+    with module._layer_buffer(ep, vendor, "cpu", moe, method.buffer_capacity):
+        pass
+    ep.destroy()
+    assert calls == [expected]
