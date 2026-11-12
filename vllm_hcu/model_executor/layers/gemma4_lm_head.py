@@ -32,14 +32,36 @@ SOFTCAP = 30.0
 BUCKET = 320
 BUCKET_ROWS = tuple(range(128, BUCKET))
 DRAFT_HIDDEN = 1024
-DENSE_ROWS = tuple(range(33, 65))
+# Widened from 33..64 after the 11-12 gate probe measured the live draft row
+# count at 76..80 (C80, MTP4) -- the old ceiling sat just below production and
+# gated the fusion out entirely. 256 is where the sweep stops, not where the
+# gain does.
+DENSE_ROWS = tuple(range(33, 257))
 DENSE_CONFIG = {"BM": 32, "BN": 256, "BK": 64, "num_warps": 8, "num_stages": 1}
+# BM is the only field that wants to track the row count. Measured against the
+# stock matmul+argmax at 262144 vocab / 1024 hidden: BM=32 is best to 64 rows
+# (1.52x at 33, 1.67x at 64), BM=64 from 65 to 96 (2.20x at 76, 2.27x at 96)
+# and BM=128 above that (3.08x at 128, 3.19x at 160, 4.93x at 256). Keeping
+# BM=32 everywhere would leave most of that on the table at the row counts
+# production actually runs.
+DENSE_BM_STEPS = ((64, 32), (96, 64))
+DENSE_BM_ABOVE = 128
 _BLOCK_ALIGN = 2048  # one lookup block, enough to trigger the compile
 
 _table_loaded = False
 _bucket_installed = False
 _softcap_installed = False
 _dense_draft_installed = False
+
+
+
+def _dense_config(rows: int, base: dict) -> dict:
+    """Launch config for a given draft row count (see DENSE_BM_STEPS)."""
+
+    for upper, bm in DENSE_BM_STEPS:
+        if rows <= upper:
+            return dict(base, BM=bm)
+    return dict(base, BM=DENSE_BM_ABOVE)
 
 
 def load_head_table() -> dict | None:
@@ -184,12 +206,18 @@ def install_head_bucket(runner, rows=BUCKET_ROWS) -> None:
 
 
 def install_dense_draft(runner, config=None, rows=DENSE_ROWS) -> None:
-    """Fuse the greedy draft projection with its argmax for 33..64 rows.
+    """Fuse the greedy draft projection with its argmax for 33..256 rows.
 
     Idempotent: a second call in the same process is a no-op. The stock step
     materialises the whole [rows, vocab] logits tensor only to reduce it, which
-    at 64 rows over this vocabulary writes and reads back 32 MiB to produce 64
+    at 80 rows over this vocabulary writes and reads back 40 MiB to produce 80
     indices.
+
+    The range was 33..64 until the 11-12 gate probe measured the live draft row
+    count at 76..80 under C80 + MTP4, i.e. just above the ceiling, so the
+    fusion never ran in production. Re-swept to 256 rows it is worth 2.20x at
+    76, 3.08x at 128 and 4.93x at 256 against the stock path, with the
+    tie-aware check clean at every point.
 
     Unlike the softcap table this is not a bit-identical substitution: the
     GEMM's accumulation order differs from the library's, so a logit on a
@@ -216,7 +244,8 @@ def install_dense_draft(runner, config=None, rows=DENSE_ROWS) -> None:
     assert model.logits_processor.scale == 1
     assert getattr(model, "masked_embedding", None) is None
     rows = frozenset(rows)
-    assert rows and all(32 <= n <= 64 for n in rows)
+    assert rows and all(33 <= n <= 256 for n in rows)
+    configs = {n: _dense_config(n, config) for n in rows}
 
     original = spec._greedy_sample_draft
     # Captured after load_weights, which is where gemma4_mtp fills it in; the
@@ -231,18 +260,32 @@ def install_dense_draft(runner, config=None, rows=DENSE_ROWS) -> None:
             or hidden.shape[0] not in rows
         ):
             return original(hidden)
-        return dense_argmax(hidden, w, suppress, config)
+        return dense_argmax(hidden, w, suppress, configs[hidden.shape[0]])
 
-    # Compile every gated row count now: a first compile inside CUDA graph
-    # capture would be fatal.
+    # Compile before any CUDA graph capture: a first compile inside capture
+    # would be fatal. M is a runtime argument, so one compile per launch config
+    # serves every row count -- but Triton also specializes integer arguments
+    # on divisibility by 16, so each config is compiled at both a divisible and
+    # a non-divisible row count. That is a handful of compiles instead of one
+    # per gated row: pre-compiling all 224 individually measured 211 s, which
+    # lands inside load_model and would inflate the startup memory peak that
+    # sets the KV budget.
     dummy = torch.zeros((max(rows), DRAFT_HIDDEN), dtype=torch.bfloat16, device=w.device)
+    warmed = set()
     for n in sorted(rows):
-        dense_argmax(dummy[:n], w, suppress, config)
+        cfg = configs[n]
+        key = (cfg["BM"], n % 16 == 0)
+        if key in warmed:
+            continue
+        warmed.add(key)
+        dense_argmax(dummy[:n], w, suppress, cfg)
     torch.cuda.synchronize()
 
     spec._greedy_sample_draft = greedy
     _dense_draft_installed = True
     logger.info(
-        "Gemma4 BW1000 fused draft argmax active: rows=%d..%d vocab=%d",
+        "Gemma4 BW1000 fused draft argmax active: rows=%d..%d vocab=%d "
+        "BM schedule=%s (%d launch configs pre-compiled)",
         min(rows), max(rows), VOCAB,
+        sorted({c["BM"] for c in configs.values()}), len(warmed),
     )

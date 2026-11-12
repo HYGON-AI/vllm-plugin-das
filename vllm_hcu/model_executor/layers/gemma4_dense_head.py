@@ -7,6 +7,16 @@ and then reduces it: at 64 rows over a 262144 vocabulary that is 32 MiB written
 and read back to produce 64 indices. These kernels keep the per-column-block
 maximum and its index instead, so the logits tensor is never materialised.
 
+M is a runtime argument while N and K are compile-time constants. N and K
+really are fixed -- the vocabulary and the draft hidden size -- but M is the
+row count, which changes every step, and it is only used to build a row mask.
+Making it constexpr would compile a separate kernel per row count, which costs
+211 s of install time over the gated range (measured) because every row count
+has to be pre-compiled: a first compile inside CUDA graph capture is fatal.
+As a runtime argument it is bit-identical and the same speed (measured at
+33..256 rows), and Triton's integer specialization keeps the variants to a
+handful rather than one per row.
+
 No vocabulary pruning and no weight quantization: the GEMM runs over the full
 vocabulary in BF16. The accumulator is rounded to bfloat16 and back before the
 comparison, which reproduces the dtype of the stock logits, but the GEMM's
@@ -30,7 +40,7 @@ _INDEX_SENTINEL = tl.constexpr(2147483647)
 @triton.jit
 def _partial(
     X, W, SUPPRESS, VALS, IDXS,
-    M: tl.constexpr, N: tl.constexpr, K: tl.constexpr,
+    M, N: tl.constexpr, K: tl.constexpr,
     SX: tl.constexpr, SW: tl.constexpr, NS: tl.constexpr,
     BM: tl.constexpr, BN: tl.constexpr, BK: tl.constexpr,
 ):  # fmt: skip
