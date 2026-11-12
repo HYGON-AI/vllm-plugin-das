@@ -566,8 +566,10 @@ def _use_gemma4_fa(module: ModuleType) -> bool:
 
                 backend = get_current_vllm_config().attention_config.backend
                 if getattr(backend, "name", backend) not in (None, "TRITON_ATTN"):
+                    from vllm_hcu.utils.gemma4_switches import SWITCH
+
                     raise ValueError(
-                        "VLLM_HCU_GEMMA4_USE_FA=1 conflicts with attention "
+                        f"{SWITCH}=1 conflicts with attention "
                         f"backend {backend!r}; requires Triton-compatible metadata."
                     )
                 kwargs["attn_backend"] = Gemma4FAAttentionBackend

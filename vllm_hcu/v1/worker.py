@@ -42,12 +42,14 @@ def _num_workspace_lanes(
 
 
 def _gemma4_bw1000_enabled() -> bool:
-    """Opt-in Gemma4 BW1000 tuning (TP1, BF16, FP8 KV, MTP, 64 seqs only)."""
+    """Gemma4 BW1000 optimization bundle, behind VLLM_HCU_GEMMA_BW1000.
 
-    value = os.environ.get("VLLM_HCU_GEMMA4_BW1000_OPT", "0").strip().lower()
-    if value not in {"", "0", "false", "1", "true"}:
-        raise ValueError("VLLM_HCU_GEMMA4_BW1000_OPT must be 0/1 or false/true")
-    return value in {"1", "true"}
+    See vllm_hcu.utils.gemma4_switches for why this is one switch and why it
+    stays opt-in.
+    """
+    from vllm_hcu.utils.gemma4_switches import gemma4_bw1000_enabled
+
+    return gemma4_bw1000_enabled()
 
 
 def _create_model_runner(

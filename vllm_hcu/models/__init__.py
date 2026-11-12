@@ -3,16 +3,16 @@
 # SPDX-FileCopyrightText: Copyright (c) 2026 Hygon Information Technology Co., Ltd.
 # Modified by Hygon Information Technology Co., Ltd., 2026.
 
-import os
-
 from vllm import ModelRegistry
 
 
 def register_model():
-    gemma4_fa = os.environ.get("VLLM_HCU_GEMMA4_USE_FA", "0").strip().lower()
-    if gemma4_fa not in {"0", "1", "false", "true"}:
-        raise ValueError("VLLM_HCU_GEMMA4_USE_FA must be 0/1 or false/true")
-    if gemma4_fa in {"1", "true"}:
+    # This only arms a post-import patch on
+    # vllm.model_executor.models.gemma4, so it stays inert until a Gemma4
+    # model is actually loaded.
+    from vllm_hcu.utils.gemma4_switches import gemma4_bw1000_enabled
+
+    if gemma4_bw1000_enabled():
         from vllm_hcu.models.gemma4 import register_attention
 
         register_attention()
