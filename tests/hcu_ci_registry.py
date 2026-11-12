@@ -46,6 +46,14 @@ register_hcu_ci(
 )
 register_hcu_ci(
     job="accuracy-gfx938",
+    target=(
+        "tests/gemma4_test/test_flash_attention.py"
+        "::test_gemma4_native_packed_prefill_matches_fp32"
+    ),
+    est_time=30,
+)
+register_hcu_ci(
+    job="accuracy-gfx938",
     target="tests/kernels/test_gfx938_indexer_normal_layout.py",
     est_time=60,
 )
