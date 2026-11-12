@@ -175,9 +175,8 @@ def install() -> None:
                     # That argument does not involve the sequence count, so the
                     # cast is not bounded by it.
                     kw["KV_QUANT_MODE"] = 0
-                    # The warp/stage choice, unlike the cast, was measured at
-                    # 32..64 sequences only; leave other shapes on the stock
-                    # launch parameters.
+                    # The warp/stage choice, unlike the cast, does depend on
+                    # the sequence count, so it keeps a floor.
                     # Measured on this path (head 256, 16/8 heads, window
                     # 1024, q_len 5, unit scales): the warp/stage choice is
                     # 1.058x at 32 sequences, rising to 1.144x at 64, 1.194x at
@@ -192,8 +191,8 @@ def install() -> None:
                         logger.info(
                             "Gemma4 BW1000 SWA unit-KV cast active "
                             "(head256 Q16/KV8 window1024, any N); "
-                            "launch tuning applies at 32..%d",
-                            _max_tuned_seqs(),
+                            "launch tuning applies at num_seqs>=32, no upper "
+                            "bound",
                         )
                 return call(*args, **kw)
 
