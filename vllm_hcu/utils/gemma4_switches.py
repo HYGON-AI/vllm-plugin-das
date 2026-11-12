@@ -32,10 +32,14 @@ from __future__ import annotations
 
 import os
 
+from vllm.logger import init_logger
+
+logger = init_logger(__name__)
+
 SWITCH = "VLLM_HCU_GEMMA_BW1000"
 
-# Read together with SWITCH so that a launch script still carrying one of them
-# fails loudly instead of quietly serving an unoptimized engine.
+# Retired spellings. A launch script still carrying one of these would
+# otherwise serve an unoptimized engine while looking configured.
 _RETIRED = ("VLLM_HCU_GEMMA4_USE_FA", "VLLM_HCU_GEMMA4_BW1000_OPT")
 
 _TRUE = {"1", "true"}
@@ -44,13 +48,6 @@ _FALSE = {"", "0", "false"}
 
 def gemma4_bw1000_enabled() -> bool:
     """Is the Gemma4 BW1000 optimization bundle switched on?"""
-    for retired in _RETIRED:
-        if os.environ.get(retired) is not None:
-            raise ValueError(
-                f"{retired} has been replaced by {SWITCH}, which enables the "
-                "whole Gemma4 BW1000 bundle at once. Unset the old variable "
-                f"and set {SWITCH}=1."
-            )
     raw = os.environ.get(SWITCH)
     if raw is None:
         return False
@@ -62,3 +59,51 @@ def gemma4_bw1000_enabled() -> bool:
     # A typo must not read as "off": that would turn an intended optimization
     # into a no-op with nothing in the log to show it.
     raise ValueError(f"{SWITCH} must be 0/1 or false/true, got {raw!r}")
+
+
+def _retired_in_environment() -> tuple[str, ...]:
+    return tuple(name for name in _RETIRED if os.environ.get(name) is not None)
+
+
+def warn_retired_switches() -> None:
+    """Note any retired spelling, from a place that must not fail.
+
+    Called during model registration, which runs for every model this plugin
+    serves and from a ``vllm.general_plugins`` entry point whose invocation
+    vLLM does not wrap in ``try``/``except`` -- raising here would abort
+    startup for DeepSeek, GLM or Kimi over a variable that has nothing to do
+    with the model being served.  The case worth failing on is narrower and
+    is handled by ``check_retired_switches`` below.
+    """
+    retired = _retired_in_environment()
+    if retired:
+        logger.warning(
+            "%s %s retired; the Gemma4 BW1000 bundle is now enabled by %s=1. "
+            "The old name(s) are ignored.",
+            ", ".join(retired),
+            "is" if len(retired) == 1 else "are",
+            SWITCH,
+        )
+
+
+def check_retired_switches(vllm_config) -> None:
+    """Refuse to serve Gemma4 unoptimized while a retired switch says otherwise.
+
+    Only one combination is actually dangerous: a retired name is set, the new
+    switch is not, and the model being loaded is the one those names used to
+    optimize.  The operator believes the optimization is on and it is off, and
+    nothing in the log would say so.  Anything else -- a different model, or
+    the new switch also being set -- makes the leftover variable harmless, so
+    it stays a warning.
+    """
+    retired = _retired_in_environment()
+    if not retired or gemma4_bw1000_enabled():
+        return
+    hf_config = getattr(getattr(vllm_config, "model_config", None), "hf_config", None)
+    if getattr(hf_config, "model_type", None) != "gemma4":
+        return
+    raise ValueError(
+        f"{', '.join(retired)} no longer enables anything, so this Gemma4 "
+        f"engine would serve unoptimized. The whole BW1000 bundle is now one "
+        f"switch: unset the old name(s) and set {SWITCH}=1."
+    )
