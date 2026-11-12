@@ -38,7 +38,9 @@ def isolate_module_state(monkeypatch):
     # Only reset the pool when it exists: on the pre-fix tree it does not, and
     # raising here would turn every case into a collection error instead of the
     # individual failure that proves the fix is what makes them pass.
-    if hasattr(reader, '_reserved_pool'):
+    if hasattr(reader, '_reserved_pools'):
+        monkeypatch.setattr(reader, '_reserved_pools', {})
+    elif hasattr(reader, '_reserved_pool'):
         monkeypatch.setattr(reader, '_reserved_pool', None)
     original = dict(impl._resolvers)
     try:
@@ -160,33 +162,63 @@ def test_profile_pass_reserves_the_staging_pool(monkeypatch):
 
     layer = NS(max_model_len=8192, compress_ratio=2, topk_indices_buffer='out')
     reader.execute(layer, torch.zeros((4, 128)), None, None)
+    plan_records = reader.staging_plan(cfg, 8192, 2)['page_records']
 
     kinds = [entry[0] for entry in calls]
     assert 'persistent' in kinds, 'profile pass did not reserve the staging pool'
-    assert reader._reserved_pool is not None
-    assert reader._reserved_pool.shape[2] == reader.STAGING_PAGE_BYTES
+    pool = reader._reserved_pools[plan_records]
+    assert pool.shape[2] == reader.STAGING_PAGE_BYTES
 
 
 def test_staging_reuses_the_reserved_pool():
     """The decode step must write into the reserved pool, not allocate anew."""
     shape = (2, 2, reader.STAGING_PAGE_BYTES)
     reserved = torch.zeros(shape, dtype=torch.uint8)
-    reader._reserved_pool = reserved
-    got = reader._staging_target(NS(device=torch.device('cpu')), 2, 2)
+    reader._reserved_pools[32] = reserved
+    cache = NS(shape=(1, 32, 68), device=torch.device('cpu'))
+    got = reader._staging_target(cache, 2, 2)
     assert got is reserved
 
 
 def test_staging_falls_back_when_the_request_exceeds_the_reservation():
     """An oversized request stays correct instead of writing out of bounds."""
-    reader._reserved_pool = torch.zeros((1, 1, reader.STAGING_PAGE_BYTES),
-                                        dtype=torch.uint8)
-    got = reader._staging_target(NS(device=torch.device('cpu')), 4, 4)
+    reader._reserved_pools[32] = torch.zeros((1, 1, reader.STAGING_PAGE_BYTES),
+                                             dtype=torch.uint8)
+    cache = NS(shape=(1, 32, 68), device=torch.device('cpu'))
+    got = reader._staging_target(cache, 4, 4)
     assert got.shape == (4, 4, reader.STAGING_PAGE_BYTES)
-    assert got is not reader._reserved_pool
+    assert got is not reader._reserved_pools[32]
 
 
-# ---------------------------------------------------------------- D9
+def test_mixed_compress_ratios_get_separate_pools():
+    """ratio-1 and ratio-2 layers coexist, so one fixed key cannot serve both.
 
+    Measured on the real formula: at block_size 32 both ratios stage (32 and 16
+    records); at 256 both stage again (256 and 128). A single fixed workspace key
+    therefore made the second layer's request a shape mismatch, which the
+    manager rejects with ValueError during the profile pass -- a startup failure,
+    not a slow path.
+    """
+    cfg = staged_config()
+    cfg.cache_config.block_size = 32
+    ratio1 = reader.staging_plan(cfg, 8192, 1)
+    ratio2 = reader.staging_plan(cfg, 8192, 2)
+    assert ratio1 is not None and ratio2 is not None
+    assert ratio1['page_records'] == 32 and ratio2['page_records'] == 16
+    assert reader.staging_key(ratio1) != reader.staging_key(ratio2)
+
+    first = torch.zeros(ratio1['shape'], dtype=torch.uint8)
+    second = torch.zeros(ratio2['shape'], dtype=torch.uint8)
+    reader._reserved_pools[ratio1['page_records']] = first
+    reader._reserved_pools[ratio2['page_records']] = second
+
+    cache1 = NS(shape=(1, 32, 68), device=torch.device('cpu'))
+    cache2 = NS(shape=(1, 16, 68), device=torch.device('cpu'))
+    # Ask for exactly the reserved geometry; the pools were sized from the plan.
+    rows, per_row = ratio1['requests'], ratio1['pages_per_row']
+    assert reader._staging_target(cache1, rows, per_row) is first
+    rows, per_row = ratio2['requests'], ratio2['pages_per_row']
+    assert reader._staging_target(cache2, rows, per_row) is second
 
 def test_digest_covers_the_adapter_triton_implementation():
     """The GPU FP4 path runs the adapter Triton kernels; they must be pinned."""
@@ -319,3 +351,139 @@ def test_patched_mqa_logits_is_read_at_call_time(monkeypatch):
 
     assert impl._resolve('mqa_logits') is scorer.fp8_mqa_logits_torch
     assert calls == []
+
+
+# ---------------------------------------------------------------- review round 2
+# The second review found that two fixes landed on functions the production path
+# never calls, one guard was too weak, and one new startup failure was introduced.
+# These cases target the real entry points.
+
+
+def test_cpu_refusal_survives_a_wrapped_cuda_only_helper():
+    """A decorated/partial upstream helper must still be refused on CPU.
+
+    Object identity was too weak: a wrapper, decorator or functools.partial
+    around the upstream kernel slipped past it and let the bare
+    `assert logits.is_cuda` fire.
+    """
+    import functools
+
+    select = impl.build()['select']
+    upstream = impl.build()['select']
+    from vllm.model_executor.kernels.attention.dsa import candidate_blocks as cb
+
+    wrapped = functools.partial(cb.apply_candidate_mask)
+    _bind(candidate_mask=lambda: wrapped)
+
+    logits = torch.zeros((2, 8), dtype=torch.float32)
+    starts = torch.zeros(2, dtype=torch.int32)
+    ends = torch.full((2,), 8, dtype=torch.int32)
+    out = torch.zeros((2, 4), dtype=torch.int32)
+    candidates = torch.zeros((2, 2), dtype=torch.int32)
+    with pytest.raises(impl.V41IndexerError):
+        select(logits, starts, ends, out, candidates, 4, False)
+
+
+def test_cpu_assertion_from_an_unidentified_helper_becomes_the_named_error():
+    """A CUDA-only helper we cannot unwrap must not leak a bare AssertionError."""
+    select = impl.build()['select']
+
+    def disguised(*args):
+        raise AssertionError
+
+    _bind(candidate_mask=lambda: disguised)
+    logits = torch.zeros((2, 8), dtype=torch.float32)
+    with pytest.raises(impl.V41IndexerError):
+        select(logits, torch.zeros(2, dtype=torch.int32),
+               torch.full((2,), 8, dtype=torch.int32),
+               torch.zeros((2, 4), dtype=torch.int32),
+               torch.zeros((2, 2), dtype=torch.int32), 4, False)
+
+
+def _pcp_config(width=8):
+    """A PCP-looking config, shaped like the PCP replay's own fixture."""
+    return NS(
+        model_config=NS(enforce_eager=True,
+                        hf_config=NS(model_type='deepseek_v41',
+                                     engram_layer_ids=[], vision_n_layers=0)),
+        parallel_config=NS(prefill_context_parallel_size=width,
+                           decode_context_parallel_size=1,
+                           pipeline_parallel_size=1, data_parallel_size=1,
+                           tensor_parallel_size=1, enable_dbo=False,
+                           enable_eplb=False),
+        use_v2_model_runner=True, speculative_config=None, lora_config=None,
+        kv_transfer_config=None, kernel_config=NS(monokernel=False),
+        cache_config=NS(swa_bounded_replay=False),
+        attention_config=NS(backend=None, indexer_sparse_logits=False,
+                            resolve_indexer_kv_dtype=lambda _: 'fp8'))
+
+
+def test_plugin_pcp_selector_applies_the_mode_gate(monkeypatch):
+    """The decoder walks the plugin's local selector, not pcp_fork's.
+
+    `_DECODER_INIT` substitutes this function into the reviewed native
+    constructor, so a gate added only to `pcp_fork.select_attention()` never ran
+    on the production path. This is the regression that mattered: with stock,
+    the local selector must not return the owned class.
+    """
+    from hcu_vllm_das.models import v41_pcp as models
+    from hcu_adapter.kernels import pcp_fork
+
+    cfg = _pcp_config()
+    assert models.validate_config(cfg), 'fixture must look like PCP'
+
+    owned = []
+    monkeypatch.setattr(pcp_fork, 'selected_mode', lambda: 'native')
+    monkeypatch.setattr(models, 'attention_class',
+                        lambda: owned.append('owned') or 'OWNED')
+    assert models.select_attention(cfg) == 'OWNED'
+    assert owned == ['owned']
+
+    monkeypatch.setattr(pcp_fork, 'selected_mode', lambda: 'stock')
+    owned.clear()
+    # Under stock the selector delegates to core's native picker. On CPU that
+    # picker raises NotImplementedError (PCP is CUDA-only upstream), which is
+    # exactly the proof we want: it reached native code, not the owned class.
+    try:
+        result = models.select_attention(cfg)
+    except NotImplementedError:
+        result = None
+    assert result != 'OWNED', 'stock must not construct the owned class'
+    assert owned == [], 'stock must not even ask for the owned class'
+
+
+def test_seam_check_reports_a_missing_adapter_module(monkeypatch):
+    """A whole missing module must be a named contract error, not ModuleNotFound.
+
+    On a mixed revision pair `dsv41_dspark_registration` does not exist yet; a
+    module-scope import raised before the check could run, which is the very
+    failure the check was added to replace.
+    """
+    from hcu_vllm_das import _seams
+    import importlib
+
+    real = importlib.import_module
+
+    def fake(name, *args, **kwargs):
+        if name == 'hcu_adapter.dsv41_dspark_registration':
+            raise ModuleNotFoundError(
+                "No module named 'hcu_adapter.dsv41_dspark_registration'",
+                name=name)
+        return real(name, *args, **kwargs)
+
+    monkeypatch.setattr(importlib, 'import_module', fake)
+    with pytest.raises(_seams.AdapterContractError) as refusal:
+        _seams._seam_modules()
+    assert 'dsv41_dspark_registration' in str(refusal.value)
+
+
+def test_seam_table_covers_the_ct_activation_binder():
+    """CT activation calls set_provider_binder at import; the table must name it."""
+    from hcu_vllm_das import _seams
+
+    modules = _seams._seam_modules()
+    names = {(module.__name__, name) for module, name, _ in
+             _seams._required_seams(modules)}
+    assert ('hcu_adapter.dsv41_activation', 'set_provider_binder') in names
+    purposes = [purpose for _, _, purpose in _seams._required_seams(modules)]
+    assert any('CT W4A8' in purpose for purpose in purposes)

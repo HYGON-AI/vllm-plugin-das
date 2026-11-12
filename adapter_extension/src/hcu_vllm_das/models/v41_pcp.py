@@ -53,7 +53,19 @@ def check_native_contract():
 
 
 def select_attention(cfg):
-    if not validate_config(cfg):
+    """Pick the attention class for one decoder layer.
+
+    This local selector is what `_DECODER_INIT` substitutes into the reviewed
+    native constructor, so it -- not `pcp_fork.select_attention()` -- is the
+    real entry point the decoder walks. It therefore has to apply the same
+    two gates as the adapter: the deployment must look like PCP *and* the
+    operator must have selected the owned implementation. Reading the mode here
+    is what makes `HCU_VLLM_PCP_IMPL=stock` (the default) and
+    `HCU_DISABLE_OPS=vllm_pcp` actually mean something at construction time.
+    """
+    from hcu_adapter.kernels import pcp_fork
+
+    if pcp_fork.selected_mode() == 'stock' or not validate_config(cfg):
         return native._select_dsv4_attn_cls(cfg)
     return attention_class()
 

@@ -83,8 +83,28 @@ def constructors():
         assert native.__globals__[key] is not replacement
     assert issubclass(models.HcuV41PcpDecoderLayer,native_model.DeepseekV4DecoderLayer)
     assert models.HcuV41PcpLLM.model_cls is models.HcuV41PcpBackbone
-    assert models.select_attention(cfg(1)) is rocm.DeepseekV41ROCMAiterMLAAttention
-    assert models.select_attention(cfg()) is prod.HcuV41PcpAttention
+    # The local selector is the real construction entry: `_DECODER_INIT`
+    # substitutes it into the reviewed native constructor. It therefore has to
+    # honour the operator's mode, so both branches are asserted explicitly
+    # instead of only "a PCP config returns the owned class" -- that older
+    # assertion is what hid the missing gate. The mode is stubbed rather than
+    # set through the environment: mutating HCU_VLLM_PCP_IMPL here would leak
+    # into the later publication case, which asserts the stock default.
+    from unittest.mock import patch as _patch
+    from hcu_adapter.kernels import pcp_fork as _fork
+    with _patch.object(_fork, 'selected_mode', lambda: 'native'):
+        assert models.select_attention(cfg(1)) is rocm.DeepseekV41ROCMAiterMLAAttention
+        assert models.select_attention(cfg()) is prod.HcuV41PcpAttention
+    with _patch.object(_fork, 'selected_mode', lambda: 'stock'):
+        # Under stock the selector must hand the decision to core. Core's own
+        # picker refuses a PCP config on a non-CUDA host, so on this CPU replay
+        # reaching it means NotImplementedError -- which is exactly the proof
+        # that the owned class was not constructed.
+        try:
+            picked = models.select_attention(cfg())
+        except NotImplementedError:
+            picked = None
+        assert picked is not prod.HcuV41PcpAttention
     reject(lambda:models._constructor(native_model.DeepseekV4Model.__init__,'bad',{}))
 
 
