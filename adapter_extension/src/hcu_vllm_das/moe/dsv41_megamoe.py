@@ -20,7 +20,7 @@ from vllm.model_executor.layers.fused_moe.activation import MoEActivation
 from vllm.model_executor.layers.quantization.utils.quant_utils import kFp8DynamicTokenSym, kFp8StaticChannelSym
 from vllm.platforms import current_platform
 
-from ..dsv41.profile_worker import WORKER, local_token_bound
+from ..dsv41.profile_worker import profile_token_capacity
 
 
 def validate_config(config, moe):
@@ -276,14 +276,7 @@ class HcuDSV41MegaMoEMethod(CompressedTensorsW8A8Fp8MoEMethod):
         FusedMoEMethodBase.__init__(self, moe)
         config = get_current_vllm_config()
         validate_config(config, moe)
-        # Stock and custom workers can profile with a full-size dummy batch.
-        self.buffer_capacity = moe.max_num_tokens
-        if config.parallel_config.worker_cls == WORKER:
-            self.buffer_capacity = local_token_bound(
-                config.scheduler_config.max_num_batched_tokens,
-                config.scheduler_config.max_num_seqs,
-                moe.pcp_size,
-            )
+        self.buffer_capacity = profile_token_capacity(config, moe.pcp_size, moe.max_num_tokens)
         self.weight_quant, self.input_quant = weight_quant, input_quant
         self.weight_block_size = None
         self.block_quant = self.static_input_scales = False

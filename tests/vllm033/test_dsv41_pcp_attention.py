@@ -113,24 +113,37 @@ def test_pcp_engram_shards_cover_all_hash_heads(monkeypatch, rank):
     assert obj._get_shard_info() == (8, rank)
 
 
-@pytest.mark.parametrize("budget,max_reqs,slot", [
-    (32768, 128, 4352),
-    (32769, 128, 4353),
-    (7, 4, 7),
+@pytest.mark.parametrize("worker_cls,budget,max_reqs,slot", [
+    ("hcu_vllm_das.dsv41.worker.HcuDSV41PcpWorker", 32768, 128, 4352),
+    ("hcu_vllm_das.dsv41.worker.HcuDSV41PcpWorker", 32769, 128, 4353),
+    ("hcu_vllm_das.dsv41.worker.HcuDSV41PcpWorker", 7, 4, 7),
+    ("hcu_adapter.bridges.vllm_worker.Worker", 32768, 128, 32768),
+    ("example.CustomWorker", 32768, 128, 32768),
 ])
-def test_engram_staging_capacity_matches_padded_pcp_gather(monkeypatch, budget, max_reqs, slot):
+def test_engram_staging_capacity_matches_padded_pcp_gather(monkeypatch, worker_cls, budget, max_reqs, slot):
     obj = object.__new__(model.HcuDSV41PcpEngram)
     torch.nn.Module.__init__(obj)
-    obj.embed_tokens = NS(dp_size=1, part_n_hash_cols=3, cpu_offload=False)
-    counts = torch.tensor([slot] + [0] * 7)
-    group = NS(world_size=8, all_gather=lambda value, dim: counts)
+    lookups = []
+    obj.embed_tokens = NS(dp_size=1, part_n_hash_cols=3, cpu_offload=False,
+                          lookup=lambda ids, rows: lookups.append((len(ids), len(rows))))
+    counts = torch.tensor([slot] * 8)
+
+    def gather(value, dim):
+        if value.dtype == torch.int64:
+            return counts
+        return value.new_empty((len(value) * 8, value.shape[1]))
+
+    group = NS(world_size=8, all_gather=gather)
+    config = NS(parallel_config=NS(worker_cls=worker_cls),
+                scheduler_config=NS(max_num_seqs=max_reqs, max_num_batched_tokens=budget))
     monkeypatch.setattr(model, "get_pcp_group", lambda: group)
-    monkeypatch.setattr(model, "get_current_vllm_config",
-                        lambda: NS(scheduler_config=NS(max_num_seqs=max_reqs)))
+    monkeypatch.setattr(model, "get_current_vllm_config", lambda: config)
     with torch.device("meta"):
         obj._init_staging(budget, 256)
+        obj.prepare_embeddings(torch.empty(slot, 24, dtype=torch.int32))
     assert obj.staged_rows.shape == (slot * 8, 3, 256)
     assert obj.staged_rows.dtype == torch.bfloat16
+    assert lookups == [(slot * 8, slot * 8)]
 
     # Even an empty local rank must reject a peer that exceeds the slot.
     counts[0] += 1

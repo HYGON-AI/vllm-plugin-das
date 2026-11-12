@@ -18,7 +18,7 @@ from vllm.model_executor.layers import mhc as native_mhc
 from vllm.models.deepseek_v41.common import engram as native_engram
 from vllm.models.deepseek_v41.amd import model as native
 from vllm.models.deepseek_v41.amd import vl_model as native_vl
-from ..dsv41.profile_worker import local_token_bound
+from ..dsv41.profile_worker import profile_token_capacity
 from ..dsv41.mhc import mhc_post
 from ..dsv41.pcp_attention import HcuDSV41PcpAttention, validate_config
 
@@ -110,9 +110,8 @@ class HcuDSV41PcpEngram(native_engram.Engram):
 
     def _init_staging(self, max_tokens, head_dim):
         pcp_size = get_pcp_group().world_size
-        max_reqs = get_current_vllm_config().scheduler_config.max_num_seqs
         # The hash gather pads each rank to the largest rank-local token count.
-        slot = local_token_bound(max_tokens, max_reqs, pcp_size)
+        slot = profile_token_capacity(get_current_vllm_config(), pcp_size, max_tokens)
         super()._init_staging(slot * pcp_size, head_dim)
         self._pcp_prepared = None
 
