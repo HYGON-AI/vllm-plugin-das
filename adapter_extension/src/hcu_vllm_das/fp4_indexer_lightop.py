@@ -211,17 +211,23 @@ def _staging_target(cache, requests, pages_per_row):
     """Return the staging pages buffer for this step.
 
     The buffer is the persistent workspace pool reserved during the startup
-    profile whenever it fits, so the decode hot path stops allocating a new
-    staging pool outside the planned peak. Layers with different
-    ``compress_ratio`` values reserve separate pools and each gets its own
-    back. A request set larger than the reserved maximum (only reachable when
-    the scheduler exceeds the configured bound) still gets a correct, unplanned
-    allocation rather than a wrong answer.
+    profile, and it is a *maximum*: the pool was sized from ``max_num_seqs`` and
+    ``max_model_len``, while a real decode step carries fewer rows. Requiring an
+    exact shape match would therefore almost never hit and every step would fall
+    back to a fresh allocation -- which is the half of the original finding
+    about repeated hot-path allocation, not just about the profile peak. So the
+    reserved pool is reused whenever it can hold the request, and only an
+    oversized request allocates.
     """
-    shape = (requests, pages_per_row, STAGING_PAGE_BYTES)
     pool = _reserved_pools.get(physical_page_records(cache))
-    if pool is not None and pool.shape == shape and pool.device == cache.device:
-        return pool
+    if pool is not None and pool.device == cache.device:
+        reserved = pool.shape
+        if reserved[0] >= requests and reserved[1] >= pages_per_row:
+            # A prefix view over the reserved pages. The caller writes exactly
+            # the pages it needs, and the inner stride still spans a full
+            # canonical page, so the pool layout is unchanged.
+            return pool[:requests, :pages_per_row]
+    shape = (requests, pages_per_row, STAGING_PAGE_BYTES)
     return torch.empty(shape, dtype=torch.uint8, device=cache.device)
 
 

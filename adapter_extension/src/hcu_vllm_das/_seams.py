@@ -67,10 +67,11 @@ def _required_seams(modules):
          "draft model class hand-off (adapter seam)"),
         (modules["ct_w4a8_registration"], "set_config_provider",
          "CT W4A8 config provider injection (adapter seam)"),
-        # The CT activation module calls this directly at import time, before
-        # `bind_ct_w4a8()` runs, so a revision that lacks it fails as a bare
-        # AttributeError unless the table names it too.
-        (modules["dsv41_activation"], "set_provider_binder",
+        # `ct_w4a8_activation.py` calls this on *its own* adapter module at
+        # import time, before `bind_ct_w4a8()` runs. Naming the DSV4.1 module
+        # here would check the wrong object: the two modules each own a
+        # `set_provider_binder`, and only this one is on the CT path.
+        (modules["ct_w4a8_registration"], "set_provider_binder",
          "CT W4A8 activation binder (adapter seam, called at import time)"),
     )
 

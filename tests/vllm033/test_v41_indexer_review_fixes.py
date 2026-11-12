@@ -170,24 +170,33 @@ def test_profile_pass_reserves_the_staging_pool(monkeypatch):
     assert pool.shape[2] == reader.STAGING_PAGE_BYTES
 
 
-def test_staging_reuses_the_reserved_pool():
-    """The decode step must write into the reserved pool, not allocate anew."""
-    shape = (2, 2, reader.STAGING_PAGE_BYTES)
-    reserved = torch.zeros(shape, dtype=torch.uint8)
-    reader._reserved_pools[32] = reserved
-    cache = NS(shape=(1, 32, 68), device=torch.device('cpu'))
-    got = reader._staging_target(cache, 2, 2)
-    assert got is reserved
+def test_staging_reuses_the_reserved_pool_for_a_smaller_step():
+    """A real decode step carries fewer rows than the reserved maximum.
+
+    The pool is sized from max_num_seqs/max_model_len, so requiring an exact
+    shape match meant it was essentially never reused and every step allocated
+    again -- the half of the finding about repeated hot-path allocation.
+    """
+    plan = reader.staging_plan(staged_config(), 8192, 2)
+    reserved = torch.zeros(plan['shape'], dtype=torch.uint8)
+    reader._reserved_pools[plan['page_records']] = reserved
+    cache = NS(shape=(1, plan['page_records'], 68), device=torch.device('cpu'))
+
+    # One row, a short context: strictly smaller than the reservation.
+    got = reader._staging_target(cache, 1, 4)
+    assert got.shape == (1, 4, reader.STAGING_PAGE_BYTES)
+    assert got.data_ptr() == reserved.data_ptr(), \
+        'a smaller step must still land in the reserved pool'
 
 
 def test_staging_falls_back_when_the_request_exceeds_the_reservation():
     """An oversized request stays correct instead of writing out of bounds."""
-    reader._reserved_pools[32] = torch.zeros((1, 1, reader.STAGING_PAGE_BYTES),
-                                             dtype=torch.uint8)
-    cache = NS(shape=(1, 32, 68), device=torch.device('cpu'))
-    got = reader._staging_target(cache, 4, 4)
-    assert got.shape == (4, 4, reader.STAGING_PAGE_BYTES)
-    assert got is not reader._reserved_pools[32]
+    plan = reader.staging_plan(staged_config(), 8192, 2)
+    reader._reserved_pools[plan['page_records']] = torch.zeros(
+        plan['shape'], dtype=torch.uint8)
+    cache = NS(shape=(1, plan['page_records'], 68), device=torch.device('cpu'))
+    got = reader._staging_target(cache, plan['requests'] + 1, 4)
+    assert got.shape == (plan['requests'] + 1, 4, reader.STAGING_PAGE_BYTES)
 
 
 def test_mixed_compress_ratios_get_separate_pools():
@@ -216,9 +225,9 @@ def test_mixed_compress_ratios_get_separate_pools():
     cache2 = NS(shape=(1, 16, 68), device=torch.device('cpu'))
     # Ask for exactly the reserved geometry; the pools were sized from the plan.
     rows, per_row = ratio1['requests'], ratio1['pages_per_row']
-    assert reader._staging_target(cache1, rows, per_row) is first
+    assert reader._staging_target(cache1, rows, per_row).data_ptr() == first.data_ptr()
     rows, per_row = ratio2['requests'], ratio2['pages_per_row']
-    assert reader._staging_target(cache2, rows, per_row) is second
+    assert reader._staging_target(cache2, rows, per_row).data_ptr() == second.data_ptr()
 
 def test_digest_covers_the_adapter_triton_implementation():
     """The GPU FP4 path runs the adapter Triton kernels; they must be pinned."""
@@ -485,5 +494,9 @@ def test_seam_table_covers_the_ct_activation_binder():
     names = {(module.__name__, name) for module, name, _ in
              _seams._required_seams(modules)}
     assert ('hcu_adapter.dsv41_activation', 'set_provider_binder') in names
-    purposes = [purpose for _, _, purpose in _seams._required_seams(modules)]
-    assert any('CT W4A8' in purpose for purpose in purposes)
+    # The CT activation module calls set_provider_binder on its OWN adapter
+    # module; checking the DSV4.1 one would verify a different object.
+    assert ('hcu_adapter.ct_w4a8_registration', 'set_provider_binder') in names
+    ct_entries = [(module.__name__, name) for module, name, purpose in
+                  _seams._required_seams(modules) if 'CT W4A8' in purpose]
+    assert ('hcu_adapter.ct_w4a8_registration', 'set_provider_binder') in ct_entries
