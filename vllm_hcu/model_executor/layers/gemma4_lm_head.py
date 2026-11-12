@@ -29,8 +29,22 @@ TABLE_PATH = Path(__file__).resolve().parent / "gemma4_head_results0.csv"
 HIDDEN = 2816
 VOCAB = 262144
 SOFTCAP = 30.0
-BUCKET = 320
-BUCKET_ROWS = tuple(range(128, BUCKET))
+# Row counts are padded up to the nearest bucket so the head GEMM lands on a
+# shape the rocBLAS table has an entry for. The two halves are one mechanism:
+# a bucket without a table entry pads for nothing, and a table entry no row
+# count reaches is dead weight.
+#
+# 320 alone left production uncovered. The 11-12 probe measured the live row
+# count at 348..400 (num_seqs x MTP positions, 80 x 5 = 400 at the peak), i.e.
+# above the only bucket, so those GEMMs ran on the default algorithm -- which
+# measures 14.997 ms at 348 rows and 17.657 ms at 400 against 3.136 ms for the
+# tuned 400 shape, about 6x off. Adding 400 covers them.
+#
+# Above 400 is still uncovered: at C80 the row count cannot exceed 80 x 5, but
+# a higher concurrency would need its own bucket and its own tuned entry.
+HEAD_BUCKETS = (320, 400)
+BUCKET = HEAD_BUCKETS[-1]
+BUCKET_ROWS = tuple(range(128, BUCKET + 1))
 DRAFT_HIDDEN = 1024
 # Widened from 33..64 after the 11-12 gate probe measured the live draft row
 # count at 76..80 (C80, MTP4) -- the old ceiling sat just below production and
@@ -53,6 +67,15 @@ _bucket_installed = False
 _softcap_installed = False
 _dense_draft_installed = False
 
+
+
+def _head_bucket_for(rows: int) -> int:
+    """Smallest bucket that fits this row count."""
+
+    for bucket in HEAD_BUCKETS:
+        if rows <= bucket:
+            return bucket
+    raise ValueError("no head bucket covers %d rows" % rows)
 
 
 def _dense_config(rows: int, base: dict) -> dict:
@@ -153,8 +176,19 @@ def install_softcap_lut(runner) -> None:
     )
 
 
-def install_head_bucket(runner, rows=BUCKET_ROWS) -> None:
-    """Idempotent: a second call in the same process is a no-op."""
+def install_head_bucket(runner, rows=BUCKET_ROWS, buckets=HEAD_BUCKETS) -> None:
+    """Pad the head GEMM's row count up to the nearest tuned shape.
+
+    Idempotent: a second call in the same process is a no-op.
+
+    Padding costs real rows of compute -- 348 rows padded to 400 is 15% more
+    work -- so it only pays because the padded shape has a tuned rocBLAS entry
+    and the true shape does not. That makes the table a hard prerequisite, not
+    a nicety, so every bucket is checked against the loaded table here: a
+    bucket whose shape has no entry would pad for nothing and silently cost
+    throughput, which is exactly how the 320-only version came to look
+    installed while doing nothing for production.
+    """
     global _bucket_installed
     if _bucket_installed:
         return
@@ -168,13 +202,38 @@ def install_head_bucket(runner, rows=BUCKET_ROWS) -> None:
     assert proc.head_dtype in (None, torch.bfloat16)
     assert not proc.logits_as_input
     assert runner.vllm_config.parallel_config.tensor_parallel_size == 1
+    buckets = tuple(sorted(buckets))
     rows = frozenset(rows)
-    assert rows and min(rows) >= 128 and max(rows) < BUCKET
-    pads = {
-        torch.cuda.current_stream().cuda_stream: torch.zeros(
-            (BUCKET, HIDDEN), dtype=torch.bfloat16, device=w.device
-        )
-    }
+    assert rows and min(rows) >= 128 and max(rows) <= buckets[-1]
+
+    # Every bucket must be a shape the loaded table actually covers, or the
+    # padding is pure loss. load_head_table() runs before this, so the runtime
+    # database is already populated.
+    tuned = {r[1] for r in torch.cuda.tunable.get_results()}
+    missing = [
+        b for b in buckets
+        if "tn_%d_%d_%d_ld_%d_%d_%d" % (VOCAB, b, HIDDEN, HIDDEN, HIDDEN, VOCAB)
+        not in tuned
+    ]
+    assert not missing, (
+        "head buckets %s have no tuned entry in the rocBLAS table; padding to "
+        "them would add work for nothing" % missing
+    )
+
+    # One pad buffer per (stream, bucket). Keyed on the stream because CUDA
+    # graph capture runs on its own.
+    pads: dict = {}
+
+    def pad_for(stream, bucket, device):
+        buf = pads.get((stream, bucket))
+        if buf is None:
+            buf = torch.zeros((bucket, HIDDEN), dtype=torch.bfloat16, device=device)
+            pads[(stream, bucket)] = buf
+        return buf
+
+    for b in buckets:
+        pad_for(torch.cuda.current_stream().cuda_stream, b, w.device)
+
     original = proc._get_logits
 
     def get_logits(hidden, lm_head, bias, skip_gather):
@@ -186,12 +245,11 @@ def install_head_bucket(runner, rows=BUCKET_ROWS) -> None:
             or n not in rows
         ):
             return original(hidden, lm_head, bias, skip_gather)
-        stream = torch.cuda.current_stream().cuda_stream
-        if stream not in pads:
-            pads[stream] = torch.zeros(
-                (BUCKET, HIDDEN), dtype=torch.bfloat16, device=hidden.device
-            )
-        pad = pads[stream]
+        bucket = _head_bucket_for(n)
+        if n == bucket:
+            # already a tuned shape; padding would copy for nothing
+            return original(hidden, lm_head, bias, skip_gather)
+        pad = pad_for(torch.cuda.current_stream().cuda_stream, bucket, hidden.device)
         pad[:n].copy_(hidden)
         out = original(pad, lm_head, bias, skip_gather)
         return None if out is None else out[:n]
@@ -200,8 +258,9 @@ def install_head_bucket(runner, rows=BUCKET_ROWS) -> None:
     proc._gemma4_head_pads = pads
     _bucket_installed = True
     logger.info(
-        "Gemma4 BW1000 head bucket active: rows=%d..%d bucket=%d",
-        min(rows), max(rows), BUCKET,
+        "Gemma4 BW1000 head bucket active: rows=%d..%d buckets=%s "
+        "(all present in the rocBLAS table)",
+        min(rows), max(rows), list(buckets),
     )
 
 
