@@ -12,10 +12,12 @@ from types import FunctionType
 
 import torch
 from vllm.distributed import get_pcp_group
+from vllm.model_executor.kernels.mhc.triton import hc_collapse_triton
 from vllm.model_executor.layers import mhc as native_mhc
 from vllm.models.deepseek_v41.common import engram as native_engram
 from vllm.models.deepseek_v41.amd import model as native
 from vllm.models.deepseek_v41.amd import vl_model as native_vl
+from ..v41_mhc import mhc_post
 from ..v41_pcp import HcuV41PcpAttention, validate_config
 
 _DECODER_NATIVE = native.DeepseekV4DecoderLayer.__init__
@@ -58,16 +60,30 @@ def select_attention(cfg):
 
 
 class HcuV41PcpMHCPostOp(native_mhc.MHCPostOp):
-    forward_hip = native_mhc.MHCPostOp.forward_native
+    def forward_hip(self, x, residual, post_layer_mix, comb_res_mix):
+        return mhc_post(x, residual, post_layer_mix, comb_res_mix)
 
 
 class HcuV41PcpMHCPreDelayedOp(native_mhc.MHCPreDelayedOp):
-    # Core's Torch path avoids the unsupported HCU TileLang delayed seam.
+    # Core's Torch gates avoid the unsupported HCU TileLang delayed seam.
     __init__ = _constructor(
         native_mhc.MHCPreDelayedOp.__init__,
         '82cd4838e10ee5ea00ed884145d38903350dbdff35129d745c0440a892ea3552',
         {'MHCPostOp': HcuV41PcpMHCPostOp})
-    forward_hip = native_mhc.MHCPreDelayedOp.forward_native
+
+    def forward_hip(self, residual, fn, hc_scale, hc_base, rms_eps, hc_pre_eps,
+                    hc_sinkhorn_eps, hc_post_mult_value, sinkhorn_repeat,
+                    pre_mix=None, x=None, norm_weight=None, norm_eps=1e-6,
+                    sublayer_out=None, post_layer_mix=None, comb_res_mix=None):
+        residual = self._maybe_post(residual, sublayer_out, post_layer_mix, comb_res_mix)
+        # Without pre_mix Core returns a free view; collapse with Core's Triton op.
+        post_mix, comb_mix, layer_input, next_pre_mix = native_mhc.mhc_kernels.mhc_pre_delayed_torch(
+            residual, fn, hc_scale, hc_base, rms_eps, hc_pre_eps, hc_sinkhorn_eps,
+            hc_post_mult_value, sinkhorn_repeat, pre_mix=None, x=x)
+        if pre_mix is not None:
+            layer_input = hc_collapse_triton(residual, pre_mix)
+        return (residual, post_mix, comb_mix,
+                native_mhc._apply_mhc_norm(layer_input, norm_weight, norm_eps), next_pre_mix)
 
 
 class HcuV41PcpEngramEmbedding(native_engram.ParallelEngramEmbedding):

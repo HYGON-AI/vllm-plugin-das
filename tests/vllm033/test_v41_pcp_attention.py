@@ -54,8 +54,8 @@ def test_native_constructors_preparation_and_engram_are_reused():
     assert model._DECODER_INIT.__globals__['MHCPreDelayedOp'] is model.HcuV41PcpMHCPreDelayedOp
     assert model._BACKBONE_INIT.__globals__['MHCPostOp'] is model.HcuV41PcpMHCPostOp
     assert model.HcuV41PcpMHCPreDelayedOp.__init__.__code__ is model.native_mhc.MHCPreDelayedOp.__init__.__code__
-    assert model.HcuV41PcpMHCPreDelayedOp.forward_hip is model.native_mhc.MHCPreDelayedOp.forward_native
-    assert model.HcuV41PcpMHCPostOp.forward_hip is model.native_mhc.MHCPostOp.forward_native
+    assert model.HcuV41PcpMHCPreDelayedOp.forward_native is model.native_mhc.MHCPreDelayedOp.forward_native
+    assert model.HcuV41PcpMHCPostOp.forward_native is model.native_mhc.MHCPostOp.forward_native
     assert bridge.HcuV41PcpAttention._prepare_and_attn is DeepseekV4Attention._prepare_and_attn
     assert bridge.HcuV41PcpAttention.forward is rocm.DeepseekV41ROCMAiterMLAAttention.forward
     assert bridge.HcuV41PcpAttention._alloc_attn_out is rocm.DeepseekV41ROCMAiterMLAAttention._alloc_attn_out
