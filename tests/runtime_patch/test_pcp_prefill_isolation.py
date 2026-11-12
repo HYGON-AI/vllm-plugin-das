@@ -241,3 +241,33 @@ def test_streaming_sessions_filling_running_slots_do_not_defer_decodes():
     )
     sched.num_waiting_for_streaming_input = 1
     assert "decode" in sched.schedule().num_scheduled_tokens
+
+
+@pytest.mark.parametrize("with_waiter", [False, True])
+def test_zero_threshold_decode_only_never_inserts_empty_steps(monkeypatch, with_waiter):
+    monkeypatch.setenv("VLLM_HCU_PCP_ISOLATE_PREFILL_MIN_TOKENS", "0")
+    decode = _request("decode", 100, 120)
+    waiting = [_request("resumed", 100, 120)] if with_waiter else []
+    sched = _FakeScheduler([decode], waiting)
+    expected = {"decode", "resumed"} if with_waiter else {"decode"}
+    for _ in range(6):
+        assert patch_scheduler._pending_prefill_tokens(sched, 0) == 0
+        assert set(sched.schedule().num_scheduled_tokens) == expected
+        assert decode.next_decode_eligible_step == 0
+        assert getattr(sched, patch_scheduler._ISOLATE_STREAK) == 0
+        assert not getattr(sched, patch_scheduler._ISOLATE_BACKOFF, False)
+
+
+@pytest.mark.parametrize("running_prefill", [False, True])
+def test_zero_threshold_finds_prefill_after_decode_rows(monkeypatch, running_prefill):
+    monkeypatch.setenv("VLLM_HCU_PCP_ISOLATE_PREFILL_MIN_TOKENS", "0")
+    decode = _request("decode", 100, 120)
+    short = _request("short", 16, 0)
+    resumed = _request("resumed", 100, 120)
+    sched = _FakeScheduler(
+        [decode, short] if running_prefill else [decode],
+        [resumed] if running_prefill else [resumed, short],
+    )
+    assert patch_scheduler._pending_prefill_tokens(sched, 0) == 16
+    assert set(sched.schedule().num_scheduled_tokens) == {"short"}
+    assert list(sched.waiting)[0] is resumed

@@ -154,6 +154,9 @@ def _pending_prefill_tokens(scheduler, limit: int) -> int:
 
     if scheduler._pause_state == PauseState.PAUSED_ALL:
         return 0
+    # A zero threshold still needs evidence of at least one prefill token.
+    # Do not stop at a decode row before examining later eligible requests.
+    limit = max(1, limit)
     pending = 0
     step = scheduler.current_step + 1
     for request in scheduler.running:
@@ -309,9 +312,11 @@ def _install_pcp_prefill_isolation(scheduler: type) -> None:
                 for queue in (self.skipped_waiting, self.waiting) for r in queue
             )
         )
+        pending_prefill = _pending_prefill_tokens(self, min_tokens)
         if (
             not (decodes or waiting_decodes)
-            or _pending_prefill_tokens(self, min_tokens) < min_tokens
+            or pending_prefill == 0
+            or pending_prefill < min_tokens
         ):
             setattr(self, _ISOLATE_STREAK, 0)
             return original(self, *args, **kwargs)
