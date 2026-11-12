@@ -11,6 +11,7 @@ _MASTER_SWITCH = "VLLM_HCU_USE_CUSTOM_OPS"
 _RMS_NORM_SWITCH = "VLLM_HCU_USE_CUSTOM_RMS_NORM"
 _RMS_NORM_COMPILE_FACTOR = "VLLM_HCU_DAS_RMS_NORM_ENABLED"
 _PREFILL_GATHER_SWITCH = "VLLM_HCU_FLASH_PREFILL_GATHER"
+_DSV41_PROFILE_WORKER_SWITCH = "VLLM_HCU_DSV41_PCP_PROFILE_WORKER"
 _PREFILL_GATHER_FACTOR = "VLLM_HCU_FLASH_PREFILL_GATHER_ENABLED"
 
 
@@ -40,6 +41,15 @@ def rms_norm_enabled() -> bool:
     master_enabled = custom_ops_enabled()
     child_enabled = _flag(_RMS_NORM_SWITCH, default=False)
     return master_enabled and child_enabled
+
+
+def dsv41_profile_worker_enabled() -> bool:
+    """Use rank-local PCP memory profiling by default; allow explicit rollback.
+
+    Without it Core profiles every rank with the full global batch of dummy
+    tokens, so PCP8 reserves K/V memory for tokens one rank never sees.
+    """
+    return _flag(_DSV41_PROFILE_WORKER_SWITCH, default=True)
 
 
 def prefill_gather_enabled() -> bool:
@@ -90,4 +100,5 @@ def register_compile_factors(vllm_envs: object) -> None:
     registry[_RMS_NORM_COMPILE_FACTOR] = rms_norm_enabled
 
 
-__all__ = ["custom_ops_enabled", "rms_norm_enabled", "register_compile_factors"]
+__all__ = ["custom_ops_enabled", "dsv41_profile_worker_enabled",
+           "rms_norm_enabled", "register_compile_factors"]
