@@ -3,7 +3,7 @@
 # SPDX-FileCopyrightText: Copyright (c) 2026 Hygon Information Technology Co., Ltd.
 
 # 组件编译入口（v0.33 adapter extension），本地与 CI 共用。
-# 产物：dist/hcu_vllm_das_plugin-<version>[+hcu.<YYMMDDHHMM>.g<commit6>]-*.whl
+# 产物：dist/hcu_vllm_das_plugin-<version>[+hcu.<YYMMDDHHMM>.g<commit6>[.dirty]]-*.whl
 # 纯 Python wheel（py3-none-any），不依赖 DTK/torch/aicc，无需 manylinux 重打。
 set -euo pipefail
 
@@ -11,6 +11,7 @@ usage() {
     echo "usage: build_hcu_wheel.sh [--no-stamp]"
     echo "  --no-stamp  不追加 +hcu.<时间>.g<commit> 本地版本戳，构建原始版本号"
     echo "  DAS_BUILD_STAMP=<时间>.g<commit>  显式指定版本戳（优先于自动计算）"
+    echo "  自动戳在 adapter_extension 有未提交改动时追加 .dirty 后缀"
 }
 
 USE_STAMP=1
@@ -93,7 +94,13 @@ fi
 mkdir -p "$ROOT/dist"
 BUILD="$PROJECT"
 if [ "$USE_STAMP" = 1 ]; then
-    DAS_BUILD_STAMP="${DAS_BUILD_STAMP:-$(date +%y%m%d%H%M).g$(git -C "$ROOT" rev-parse --short=6 HEAD)}"
+    if [ -z "${DAS_BUILD_STAMP:-}" ]; then
+        DAS_BUILD_STAMP="$(date +%y%m%d%H%M).g$(git -C "$ROOT" rev-parse --short=6 HEAD)"
+        # 拷贝带的是工作区当前内容, 有未提交改动时 HEAD 无法还原代码, 追加 .dirty 区分
+        if [ -n "$(git -C "$PROJECT" status --porcelain -- .)" ]; then
+            DAS_BUILD_STAMP="${DAS_BUILD_STAMP}.dirty"
+        fi
+    fi
     BUILD_VERSION="${VERSION%%+*}+hcu.${DAS_BUILD_STAMP}"
     BUILD="$(mktemp -d)"
     trap 'rm -rf "$BUILD"' EXIT
@@ -102,7 +109,10 @@ if [ "$USE_STAMP" = 1 ]; then
         --exclude=__pycache__ --exclude='*.pyc' \
         -cf - . | tar -C "$BUILD" -xf -
     sed -i "s/^version = \".*\"$/version = \"${BUILD_VERSION}\"/" "$BUILD/pyproject.toml"
-    if ! grep -qxF "version = \"${BUILD_VERSION}\"" "$BUILD/pyproject.toml"; then
+    # 运行时 __version__ 与 distribution 元数据保持一致, 否则装好的包仍报告原始版本
+    sed -i "s/^__version__ = \".*\"$/__version__ = \"${BUILD_VERSION}\"/" "$BUILD/src/hcu_vllm_das/version.py"
+    if ! grep -qxF "version = \"${BUILD_VERSION}\"" "$BUILD/pyproject.toml" \
+        || ! grep -qxF "__version__ = \"${BUILD_VERSION}\"" "$BUILD/src/hcu_vllm_das/version.py"; then
         echo "build_hcu_wheel.sh: failed to stamp version in the build copy" >&2
         exit 1
     fi
