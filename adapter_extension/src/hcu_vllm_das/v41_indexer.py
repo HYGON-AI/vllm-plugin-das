@@ -83,6 +83,13 @@ _impl.bind_runtime_resolvers(
     enabled=lambda: globals()['enabled'](),
     health=_check_health,
     register_split=lambda: _register_split_hook,
+    # Three names the old module owned that a caller may still patch. The
+    # adapter reads them through these resolvers, so the patch keeps reaching
+    # the code that now lives there. Types and dtypes are deliberately NOT
+    # resolvers: patching a metadata class or a dtype is not a supported seam.
+    native_indexer=lambda: globals()['native_indexer'],
+    mqa_logits=lambda: globals()['fp8_mqa_logits_torch'],
+    layer_name=lambda: globals()['_resolve_layer_name'],
 )
 
 _api = _impl.build()
