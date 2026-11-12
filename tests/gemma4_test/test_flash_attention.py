@@ -59,20 +59,46 @@ def _metadata(query_lengths, kv_lengths, block_table):
     )
 
 
-@pytest.mark.parametrize("enabled", [None, "0", "1"])
-def test_gemma4_fa_registration_is_opt_in(monkeypatch, enabled):
-    if enabled is None:
-        monkeypatch.delenv("VLLM_HCU_GEMMA4_USE_FA", raising=False)
-    else:
-        monkeypatch.setenv("VLLM_HCU_GEMMA4_USE_FA", enabled)
+@pytest.mark.parametrize(
+    ("custom_ops", "gemma4_fa", "expected"),
+    [
+        (None, None, False),
+        ("1", "0", False),
+        (None, "1", True),
+        ("1", "1", True),
+        ("0", "1", False),
+        ("0", "invalid", False),
+    ],
+    ids=[
+        "default-off",
+        "explicit-off",
+        "default-master-on",
+        "both-on",
+        "master-off",
+        "master-off-ignores-feature-value",
+    ],
+)
+def test_gemma4_fa_registration_respects_custom_ops(
+    monkeypatch, custom_ops, gemma4_fa, expected
+):
+    for name, value in (
+        ("VLLM_HCU_USE_CUSTOM_OPS", custom_ops),
+        ("VLLM_HCU_GEMMA4_USE_FA", gemma4_fa),
+    ):
+        if value is None:
+            monkeypatch.delenv(name, raising=False)
+        else:
+            monkeypatch.setenv(name, value)
 
     register_attention = Mock()
+    register_other_models = Mock()
     monkeypatch.setattr(gemma4, "register_attention", register_attention)
-    monkeypatch.setattr(ModelRegistry, "register_model", Mock())
+    monkeypatch.setattr(ModelRegistry, "register_model", register_other_models)
 
     register_model()
 
-    assert register_attention.call_count == int(enabled == "1")
+    assert register_attention.call_count == int(expected)
+    assert register_other_models.called
 
 
 class _CustomBackend(gemma4.TritonAttentionBackend):
