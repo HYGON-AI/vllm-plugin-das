@@ -32,7 +32,7 @@ def decode_logits(q, cache, weights, context_lens, block_tables, schedule_metada
             or block_tables.ndim != 2 or block_tables.shape[0] != batch
             or context_lens.shape not in ((batch,), (batch, 1))):
         raise ValueError("FP8 indexer query/weight/table/context contract mismatch")
-    from .v41_indexer_gpu import paged_logits
+    from .indexer_gpu import paged_logits
     return paged_logits(q[:, 0], cache, weights, context_lens.reshape(-1),
                         block_tables, max_model_len)
 

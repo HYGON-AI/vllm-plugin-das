@@ -2,7 +2,7 @@
 from types import SimpleNamespace as NS
 import pytest
 import torch
-from hcu_vllm_das.moe.v41_megamoe import MegaExperts, MegaPrepare, validate_config, provider
+from hcu_vllm_das.moe.dsv41_megamoe import MegaExperts, MegaPrepare, validate_config, provider
 
 @pytest.mark.parametrize("rows",[0,1,7])
 def test_collective_empty_rank_and_no_weight_rescaling(monkeypatch,rows):
@@ -43,7 +43,7 @@ def test_native_provider_signature():
 
 @pytest.mark.parametrize("write_outputs",[False,True])
 def test_startup_probe_rejects_nonexecuting_vendor(write_outputs):
-    from hcu_vllm_das.moe.v41_megamoe import preflight_staging
+    from hcu_vllm_das.moe.dsv41_megamoe import preflight_staging
     class Vendor:
         def mega_moe_preprocess(self,x,ids,weights,buf,rows):
             if write_outputs:
@@ -59,8 +59,8 @@ def test_startup_probe_rejects_nonexecuting_vendor(write_outputs):
 
 
 def test_rejected_reload_latches_forward_failure():
-    from hcu_vllm_das.moe.v41_megamoe import HcuV41MegaMoEMethod
-    method=object.__new__(HcuV41MegaMoEMethod)
+    from hcu_vllm_das.moe.dsv41_megamoe import HcuDSV41MegaMoEMethod
+    method=object.__new__(HcuDSV41MegaMoEMethod)
     method._processed=True;method._failure=None
     with pytest.raises(RuntimeError,match="postprocessed twice"):
         method.process_weights_after_loading(None)
@@ -69,7 +69,7 @@ def test_rejected_reload_latches_forward_failure():
 
 
 def test_staging_routing_dtype_ignores_bf16_default():
-    from hcu_vllm_das.moe.v41_megamoe import preflight_staging
+    from hcu_vllm_das.moe.dsv41_megamoe import preflight_staging
     class Vendor:
         def mega_moe_preprocess(self,x,ids,weights,buf,rows):
             assert weights.dtype == buf.topk_weights.dtype == torch.float32
@@ -86,7 +86,7 @@ def test_staging_routing_dtype_ignores_bf16_default():
 
 
 def test_incompatible_native_pool_is_destroyed_before_rejection():
-    from hcu_vllm_das.moe.v41_megamoe import make_buffer
+    from hcu_vllm_das.moe.dsv41_megamoe import make_buffer
     destroyed=[]
     class Vendor:
         def get_symm_buffer_for_mega_moe(self,*args,**kwargs):
@@ -98,7 +98,7 @@ def test_incompatible_native_pool_is_destroyed_before_rejection():
 
 
 def test_staging_rejects_division_at_fp8_midpoint():
-    from hcu_vllm_das.moe.v41_megamoe import preflight_staging
+    from hcu_vllm_das.moe.dsv41_megamoe import preflight_staging
     class DividingVendor:
         def mega_moe_preprocess(self,x,ids,weights,buf,rows):
             scale=x.float().abs().amax(-1)/448
@@ -110,7 +110,7 @@ def test_staging_rejects_division_at_fp8_midpoint():
 
 
 def test_staging_checks_known_bf16_fp8_midpoint_bytes():
-    from hcu_vllm_das.moe.v41_megamoe import preflight_staging
+    from hcu_vllm_das.moe.dsv41_megamoe import preflight_staging
     class Vendor:
         def mega_moe_preprocess(self,x,ids,weights,buf,rows):
             scale=x.float().abs().amax(-1)*torch.tensor(1/448,dtype=torch.float32)
@@ -159,10 +159,10 @@ def test_target_contract_and_excluded_features():
 
 
 def test_identity_routes_and_no_redundant_factory():
-    from hcu_vllm_das.models import v41_pcp as model
+    from hcu_vllm_das.models import dsv41_pcp as model
     from vllm.models.deepseek_v41.amd import model as native
-    assert model._DECODER_INIT.__globals__["DeepseekV4MoE"] is model.HcuV41PcpMoE
-    assert model.HcuV41PcpMoE.__mro__[1] is native.DeepseekV4MoE
+    assert model._DECODER_INIT.__globals__["DeepseekV4MoE"] is model.HcuDSV41PcpMoE
+    assert model.HcuDSV41PcpMoE.__mro__[1] is native.DeepseekV4MoE
     ids = torch.tensor([[1, 5], [7, 2]])
     x = torch.ones(2, 8)
     weights = torch.full((2, 2), .25)
@@ -183,19 +183,19 @@ def test_mega_native_modular_instance():
 
 
 def test_pcp_reports_ep_local_expert_count(monkeypatch):
-    from hcu_vllm_das.models import v41_pcp as model
+    from hcu_vllm_das.models import dsv41_pcp as model
     from vllm.models.deepseek_v41.amd import model as native
     def initialize(self, *args, **kwargs):
         torch.nn.Module.__init__(self)
         self.n_local_physical_experts = 384
         self.experts = NS(moe_config=NS(num_local_experts=48))
     monkeypatch.setattr(native.DeepseekV4MoE, "__init__", initialize)
-    assert model.HcuV41PcpMoE().n_local_physical_experts == 48
+    assert model.HcuDSV41PcpMoE().n_local_physical_experts == 48
 
 
 @pytest.mark.parametrize("rows", [0, 2])
 def test_kernel_keeps_native_routes_and_empty_rank_collective(rows):
-    from hcu_vllm_das.moe.v41_megamoe import MegaKernel
+    from hcu_vllm_das.moe.dsv41_megamoe import MegaKernel
     calls = []
     def run(output, x, ids, weights):
         calls.append((x, ids, weights))

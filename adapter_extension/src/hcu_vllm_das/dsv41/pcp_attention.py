@@ -16,8 +16,8 @@ from vllm.models.deepseek_v41.amd.rocm import (
     DeepseekV41ROCMAiterSparseSWABackend,
 )
 from vllm.v1.attention.backends.registry import AttentionBackendEnum
-from . import v41_indexer as reference
-from .quantization.dsv41_channel_fp8 import _is_v41
+from . import indexer as reference
+from ..quantization.dsv41_channel_fp8 import _is_v41
 
 
 def validate_config(cfg):
@@ -44,19 +44,19 @@ def validate_config(cfg):
     return True
 
 
-class HcuV41PcpBackend(DeepseekV41ROCMAiterMLASparseBackend):
+class HcuDSV41PcpBackend(DeepseekV41ROCMAiterMLASparseBackend):
     @classmethod
     def supports_pcp(cls) -> bool:
         return True
 
 
-class HcuV41PcpSwaBackend(DeepseekV41ROCMAiterSparseSWABackend):
+class HcuDSV41PcpSwaBackend(DeepseekV41ROCMAiterSparseSWABackend):
     @classmethod
     def supports_pcp(cls) -> bool:
         return True
 
 
-class HcuV41PcpSparseIndexer(SparseAttnIndexer):
+class HcuDSV41PcpSparseIndexer(SparseAttnIndexer):
     """Local scoring over the full cache replicated by common V41 sources.
 
     This is an owned layer selected by an owned model, independent of the
@@ -70,13 +70,13 @@ class HcuV41PcpSparseIndexer(SparseAttnIndexer):
     forward_native = forward_hip
 
 
-class HcuV41PcpIndexer(DeepseekV4Indexer):
-    attn_cls = HcuV41PcpSparseIndexer
+class HcuDSV41PcpIndexer(DeepseekV4Indexer):
+    attn_cls = HcuDSV41PcpSparseIndexer
 
 
-class HcuV41PcpAttention(DeepseekV41ROCMAiterMLAAttention):
-    backend_cls = HcuV41PcpBackend
-    swa_backend_cls = HcuV41PcpSwaBackend
+class HcuDSV41PcpAttention(DeepseekV41ROCMAiterMLAAttention):
+    backend_cls = HcuDSV41PcpBackend
+    swa_backend_cls = HcuDSV41PcpSwaBackend
 
     def __init__(self, *args, **kwargs):
         # select_attention() validated the configuration for this layer.
@@ -88,7 +88,7 @@ class HcuV41PcpAttention(DeepseekV41ROCMAiterMLAAttention):
     def _indexer_cls(self, k_cache):
         if k_cache is not None and k_cache.rocm_mxfp4:
             raise ValueError('PCP adapter requires the FP8 SHUFFLE index K layout')
-        return HcuV41PcpIndexer
+        return HcuDSV41PcpIndexer
 
     def forward_mqa(self, q, kv, positions, output):
         if not isinstance(output, torch.Tensor):

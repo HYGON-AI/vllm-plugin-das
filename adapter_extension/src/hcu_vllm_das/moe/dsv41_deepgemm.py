@@ -6,7 +6,7 @@ import torch
 from vllm.model_executor.layers.fused_moe import modular_kernel as mk
 from vllm.model_executor.layers.fused_moe import deep_gemm_utils as core_layout
 from vllm.model_executor.layers.fused_moe.utils import _resize_cache
-from .v41_megamoe import HcuV41MegaMoEMethod, MegaExperts
+from .dsv41_megamoe import HcuDSV41MegaMoEMethod, MegaExperts
 
 # The HCU grouped GEMM requires 256-row expert tiles. Keep Core's scatter,
 # counting, expert mapping and inverse permutation; only bind the alignment.
@@ -65,7 +65,7 @@ class ChannelDeepGemmExperts(MegaExperts):
             second, topk_ids, topk_weights, inverse, expert_map, output)
 
 
-class HcuV41DeepGemmMethod(HcuV41MegaMoEMethod):
+class HcuDSV41DeepGemmMethod(HcuDSV41MegaMoEMethod):
     def __init__(self, *args, **kwargs):
         super().__init__(*args, **kwargs)
         self.experts_cls = ChannelDeepGemmExperts

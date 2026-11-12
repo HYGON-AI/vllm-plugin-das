@@ -231,7 +231,7 @@ class MegaKernel(mk.FusedMoEKernel):
         return output
 
 
-class HcuV41MegaMoEMethod(CompressedTensorsW8A8Fp8MoEMethod):
+class HcuDSV41MegaMoEMethod(CompressedTensorsW8A8Fp8MoEMethod):
     def __init__(self, weight_quant, input_quant, moe, prefix):
         FusedMoEMethodBase.__init__(self, moe)
         validate_config(get_current_vllm_config(), moe)
@@ -287,9 +287,9 @@ class HcuV41MegaMoEMethod(CompressedTensorsW8A8Fp8MoEMethod):
         ep = get_ep_group()
         if ep.world_size != self.moe.ep_size:
             raise ValueError("MegaMoE EP group differs from expert placement")
-        cache = getattr(ep, "_hcu_v41_mega_buffers", None)
+        cache = getattr(ep, "_hcu_dsv41_mega_buffers", None)
         if cache is None:
-            cache = ep._hcu_v41_mega_buffers = {}
+            cache = ep._hcu_dsv41_mega_buffers = {}
         # PCP has already split the local batch. Do not multiply by EP/PCP.
         capacity = self.moe.max_num_tokens
         key = (w1.device, self.moe.num_experts, capacity,

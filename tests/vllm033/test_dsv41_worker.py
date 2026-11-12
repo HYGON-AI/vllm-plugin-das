@@ -2,7 +2,7 @@
 from types import SimpleNamespace as NS
 import pytest
 import vllm.envs as envs
-from hcu_vllm_das.v41_worker import HcuV41PcpWorker
+from hcu_vllm_das.dsv41.worker import HcuDSV41PcpWorker
 from vllm.v1.worker.gpu_worker import Worker
 
 
@@ -18,18 +18,18 @@ from vllm.v1.worker.gpu_worker import Worker
 ])
 def test_dummy_policy_is_scoped_and_preserves_core(monkeypatch, pcp, dp, backend, model, flag, expected):
     monkeypatch.setattr(envs, "VLLM_RANDOMIZE_DP_DUMMY_INPUTS", flag)
-    worker = object.__new__(HcuV41PcpWorker)
+    worker = object.__new__(HcuDSV41PcpWorker)
     worker.parallel_config = NS(prefill_context_parallel_size=pcp, data_parallel_size=dp)
     worker.vllm_config = NS(parallel_config=worker.parallel_config,
         kernel_config=NS(moe_backend=backend), model_config=NS(hf_config=NS(model_type=model)))
     assert worker.randomize_dummy_inputs is expected
-    assert HcuV41PcpWorker.execute_model is Worker.execute_model
+    assert HcuDSV41PcpWorker.execute_model is Worker.execute_model
 
 
 @pytest.mark.parametrize("fail", [False, True])
 @pytest.mark.parametrize("backend", ["deep_gemm_mega_moe", "deep_gemm"])
 def test_memory_profile_uses_local_bound_and_restores_global_budget(monkeypatch, fail, backend):
-    worker = object.__new__(HcuV41PcpWorker)
+    worker = object.__new__(HcuDSV41PcpWorker)
     worker.rank = 0
     worker.parallel_config = NS(prefill_context_parallel_size=8, data_parallel_size=1)
     worker.vllm_config = NS(parallel_config=worker.parallel_config,
@@ -55,7 +55,7 @@ def test_memory_profile_uses_local_bound_and_restores_global_budget(monkeypatch,
 def test_profile_bound_covers_core_pcp_mixed_and_rounded_batches():
     import numpy as np
     from vllm.v1.worker.gpu.pcp_manager import PCPManager
-    from hcu_vllm_das.v41_worker import _local_profile_token_bound
+    from hcu_vllm_das.dsv41.worker import _local_profile_token_bound
     rng = np.random.default_rng(42)
     manager = object.__new__(PCPManager)
     manager.pcp_world_size, manager.dcp_world_size = 8, 1

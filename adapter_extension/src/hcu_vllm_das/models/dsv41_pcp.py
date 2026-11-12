@@ -17,8 +17,8 @@ from vllm.model_executor.layers import mhc as native_mhc
 from vllm.models.deepseek_v41.common import engram as native_engram
 from vllm.models.deepseek_v41.amd import model as native
 from vllm.models.deepseek_v41.amd import vl_model as native_vl
-from ..v41_mhc import mhc_post
-from ..v41_pcp import HcuV41PcpAttention, validate_config
+from ..dsv41.mhc import mhc_post
+from ..dsv41.pcp_attention import HcuDSV41PcpAttention, validate_config
 
 _DECODER_NATIVE = native.DeepseekV4DecoderLayer.__init__
 _BACKBONE_NATIVE = native.DeepseekV4Model.__init__
@@ -55,21 +55,21 @@ def check_native_contract():
 
 def select_attention(cfg):
     validate_config(cfg)
-    return HcuV41PcpAttention
+    return HcuDSV41PcpAttention
 
 
 
-class HcuV41PcpMHCPostOp(native_mhc.MHCPostOp):
+class HcuDSV41PcpMHCPostOp(native_mhc.MHCPostOp):
     def forward_hip(self, x, residual, post_layer_mix, comb_res_mix):
         return mhc_post(x, residual, post_layer_mix, comb_res_mix)
 
 
-class HcuV41PcpMHCPreDelayedOp(native_mhc.MHCPreDelayedOp):
+class HcuDSV41PcpMHCPreDelayedOp(native_mhc.MHCPreDelayedOp):
     # Core's Torch gates avoid the unsupported HCU TileLang delayed seam.
     __init__ = _constructor(
         native_mhc.MHCPreDelayedOp.__init__,
         '82cd4838e10ee5ea00ed884145d38903350dbdff35129d745c0440a892ea3552',
-        {'MHCPostOp': HcuV41PcpMHCPostOp})
+        {'MHCPostOp': HcuDSV41PcpMHCPostOp})
 
     def forward_hip(self, residual, fn, hc_scale, hc_base, rms_eps, hc_pre_eps,
                     hc_sinkhorn_eps, hc_post_mult_value, sinkhorn_repeat,
@@ -86,7 +86,7 @@ class HcuV41PcpMHCPreDelayedOp(native_mhc.MHCPreDelayedOp):
                 native_mhc._apply_mhc_norm(layer_input, norm_weight, norm_eps), next_pre_mix)
 
 
-class HcuV41PcpEngramEmbedding(native_engram.ParallelEngramEmbedding):
+class HcuDSV41PcpEngramEmbedding(native_engram.ParallelEngramEmbedding):
     def _get_shard_info(self):
         if self.dp_size != 1 or self.tp_size != 1:
             raise ValueError('HCU V41 PCP Engram requires TP1/DP1')
@@ -100,11 +100,11 @@ _PCP_GATHER_ROWS = _constructor(
     {'get_engram_dp_group': get_pcp_group})
 
 
-class HcuV41PcpEngram(native_engram.Engram):
+class HcuDSV41PcpEngram(native_engram.Engram):
     _create_embedding = _constructor(
         native_engram.Engram._create_embedding,
         'ef2909d6afcc990d4a36677768da25e46f8f88bf779830469a143c436f42ae5c',
-        {'ParallelEngramEmbedding': HcuV41PcpEngramEmbedding})
+        {'ParallelEngramEmbedding': HcuDSV41PcpEngramEmbedding})
 
     def _init_staging(self, max_tokens, head_dim):
         super()._init_staging(max_tokens * get_pcp_group().world_size, head_dim)
@@ -137,7 +137,7 @@ class HcuV41PcpEngram(native_engram.Engram):
         return _PCP_GATHER_ROWS(staged, num_tokens)
 
 
-class HcuV41PcpMoE(native.DeepseekV4MoE):
+class HcuDSV41PcpMoE(native.DeepseekV4MoE):
     def __init__(self, *args, **kwargs):
         super().__init__(*args, **kwargs)
         # Native ROCm reports TP-local counts; PCP also shards experts by EP.
@@ -146,34 +146,34 @@ class HcuV41PcpMoE(native.DeepseekV4MoE):
 
 _DECODER_INIT = _constructor(_DECODER_NATIVE, _REVIEWED[0],
                              {'_select_dsv4_attn_cls': select_attention,
-                              'DeepseekV4MoE': HcuV41PcpMoE,
-                              'Engram': HcuV41PcpEngram,
-                              'MHCPreDelayedOp': HcuV41PcpMHCPreDelayedOp,
-                              'MHCPostOp': HcuV41PcpMHCPostOp})
+                              'DeepseekV4MoE': HcuDSV41PcpMoE,
+                              'Engram': HcuDSV41PcpEngram,
+                              'MHCPreDelayedOp': HcuDSV41PcpMHCPreDelayedOp,
+                              'MHCPostOp': HcuDSV41PcpMHCPostOp})
 
 
-class HcuV41PcpDecoderLayer(native.DeepseekV4DecoderLayer):
+class HcuDSV41PcpDecoderLayer(native.DeepseekV4DecoderLayer):
     __init__ = _DECODER_INIT
 
 
 _BACKBONE_INIT = _constructor(_BACKBONE_NATIVE, _REVIEWED[1],
-                              {'DeepseekV4DecoderLayer': HcuV41PcpDecoderLayer,
-                               'MHCPostOp': HcuV41PcpMHCPostOp})
+                              {'DeepseekV4DecoderLayer': HcuDSV41PcpDecoderLayer,
+                               'MHCPostOp': HcuDSV41PcpMHCPostOp})
 
 
-class HcuV41PcpBackbone(native.DeepseekV4Model):
+class HcuDSV41PcpBackbone(native.DeepseekV4Model):
     __init__ = _BACKBONE_INIT
 
 
-class HcuV41PcpLLM(native.DeepseekV41LLMForCausalLM):
-    model_cls = HcuV41PcpBackbone
+class HcuDSV41PcpLLM(native.DeepseekV41LLMForCausalLM):
+    model_cls = HcuDSV41PcpBackbone
 
 
 _OUTER_INIT = _constructor(_OUTER_NATIVE, _REVIEWED[2],
-                           {'DeepseekV41LLMForCausalLM': HcuV41PcpLLM})
+                           {'DeepseekV41LLMForCausalLM': HcuDSV41PcpLLM})
 
 
-class HcuV41PcpForCausalLM(native_vl.DeepseekV41ForCausalLM):
+class HcuDSV41PcpForCausalLM(native_vl.DeepseekV41ForCausalLM):
     def __init__(self, *, vllm_config, prefix=''):
         validate_config(vllm_config)
         check_native_contract()

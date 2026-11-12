@@ -4,8 +4,8 @@ import inspect
 
 import pytest
 import torch
-from hcu_vllm_das import v41_pcp as bridge
-from hcu_vllm_das.models import v41_pcp as model
+from hcu_vllm_das.dsv41 import pcp_attention as bridge
+from hcu_vllm_das.models import dsv41_pcp as model
 from vllm.models.deepseek_v41.amd import model as native, rocm, vl_model
 from vllm.models.deepseek_v41.attention import DeepseekV4Attention
 
@@ -46,26 +46,26 @@ def test_native_constructors_preparation_and_engram_are_reused():
         (model._OUTER_INIT, vl_model.DeepseekV41ForCausalLM.__init__)]:
         assert owned.__code__ is core.__code__
         assert inspect.signature(owned) == inspect.signature(core)
-    assert model._DECODER_INIT.__globals__["Engram"] is model.HcuV41PcpEngram
-    assert model.HcuV41PcpEngram._create_embedding.__code__ is native.Engram._create_embedding.__code__
-    assert model.HcuV41PcpEngramEmbedding._allocate_weights is model.native_engram.ParallelEngramEmbedding._allocate_weights
-    assert model.HcuV41PcpEngramEmbedding.lookup is model.native_engram.ParallelEngramEmbedding.lookup
+    assert model._DECODER_INIT.__globals__["Engram"] is model.HcuDSV41PcpEngram
+    assert model.HcuDSV41PcpEngram._create_embedding.__code__ is native.Engram._create_embedding.__code__
+    assert model.HcuDSV41PcpEngramEmbedding._allocate_weights is model.native_engram.ParallelEngramEmbedding._allocate_weights
+    assert model.HcuDSV41PcpEngramEmbedding.lookup is model.native_engram.ParallelEngramEmbedding.lookup
     assert model._PCP_GATHER_ROWS.__code__ is model.native_engram._gather_engram_rows.__code__
-    assert model._DECODER_INIT.__globals__['MHCPreDelayedOp'] is model.HcuV41PcpMHCPreDelayedOp
-    assert model._BACKBONE_INIT.__globals__['MHCPostOp'] is model.HcuV41PcpMHCPostOp
-    assert model.HcuV41PcpMHCPreDelayedOp.__init__.__code__ is model.native_mhc.MHCPreDelayedOp.__init__.__code__
-    assert model.HcuV41PcpMHCPreDelayedOp.forward_native is model.native_mhc.MHCPreDelayedOp.forward_native
-    assert model.HcuV41PcpMHCPostOp.forward_native is model.native_mhc.MHCPostOp.forward_native
-    assert bridge.HcuV41PcpAttention._prepare_and_attn is DeepseekV4Attention._prepare_and_attn
-    assert bridge.HcuV41PcpAttention.forward is rocm.DeepseekV41ROCMAiterMLAAttention.forward
-    assert bridge.HcuV41PcpAttention._alloc_attn_out is rocm.DeepseekV41ROCMAiterMLAAttention._alloc_attn_out
-    assert bridge.HcuV41PcpBackend.get_builder_cls() is rocm.DeepseekV41ROCMAiterMLASparseMetadataBuilder
-    assert bridge.HcuV41PcpBackend.supports_pcp()
+    assert model._DECODER_INIT.__globals__['MHCPreDelayedOp'] is model.HcuDSV41PcpMHCPreDelayedOp
+    assert model._BACKBONE_INIT.__globals__['MHCPostOp'] is model.HcuDSV41PcpMHCPostOp
+    assert model.HcuDSV41PcpMHCPreDelayedOp.__init__.__code__ is model.native_mhc.MHCPreDelayedOp.__init__.__code__
+    assert model.HcuDSV41PcpMHCPreDelayedOp.forward_native is model.native_mhc.MHCPreDelayedOp.forward_native
+    assert model.HcuDSV41PcpMHCPostOp.forward_native is model.native_mhc.MHCPostOp.forward_native
+    assert bridge.HcuDSV41PcpAttention._prepare_and_attn is DeepseekV4Attention._prepare_and_attn
+    assert bridge.HcuDSV41PcpAttention.forward is rocm.DeepseekV41ROCMAiterMLAAttention.forward
+    assert bridge.HcuDSV41PcpAttention._alloc_attn_out is rocm.DeepseekV41ROCMAiterMLAAttention._alloc_attn_out
+    assert bridge.HcuDSV41PcpBackend.get_builder_cls() is rocm.DeepseekV41ROCMAiterMLASparseMetadataBuilder
+    assert bridge.HcuDSV41PcpBackend.supports_pcp()
 
 
 @pytest.mark.parametrize("actual", [0, 2, 5])
 def test_only_actual_local_queries_enter_native_attention(monkeypatch, actual):
-    obj = object.__new__(bridge.HcuV41PcpAttention)
+    obj = object.__new__(bridge.HcuDSV41PcpAttention)
     torch.nn.Module.__init__(obj)
     obj.swa_cache_layer = NS(prefix="swa")
     monkeypatch.setattr(bridge, "get_forward_context", lambda: NS(
@@ -83,7 +83,7 @@ def test_only_actual_local_queries_enter_native_attention(monkeypatch, actual):
 
 
 def test_native_rocm_serial_forward_and_bf16_allocation(monkeypatch):
-    obj = object.__new__(bridge.HcuV41PcpAttention)
+    obj = object.__new__(bridge.HcuDSV41PcpAttention)
     torch.nn.Module.__init__(obj)
     obj.indexer = object()
     obj._prepare_and_attn_fn = object()
@@ -106,7 +106,7 @@ def test_native_rocm_serial_forward_and_bf16_allocation(monkeypatch):
 
 @pytest.mark.parametrize('rank', range(8))
 def test_pcp_engram_shards_cover_all_hash_heads(monkeypatch, rank):
-    obj = object.__new__(model.HcuV41PcpEngramEmbedding)
+    obj = object.__new__(model.HcuDSV41PcpEngramEmbedding)
     torch.nn.Module.__init__(obj)
     obj.dp_size = obj.tp_size = 1
     monkeypatch.setattr(model, 'get_pcp_group', lambda: NS(world_size=8, rank_in_group=rank))
@@ -131,7 +131,7 @@ def test_pcp_engram_stages_uneven_and_empty_ranks(monkeypatch, counts, rank):
             padded.append(p)
         return torch.cat(padded)
     monkeypatch.setattr(model, 'get_pcp_group', lambda: NS(world_size=8, rank_in_group=rank, all_gather=gather))
-    obj = object.__new__(model.HcuV41PcpEngram)
+    obj = object.__new__(model.HcuDSV41PcpEngram)
     torch.nn.Module.__init__(obj)
     obj.embed_tokens = NS(n_hash_cols=heads, dim=dim)
     obj.staged_rows = torch.empty(8*8, local_heads, dim)
@@ -165,7 +165,7 @@ def test_native_engram_constructor_and_loader_preserve_pcp_head_buckets(monkeypa
     monkeypatch.setattr(torch.accelerator, 'current_device_index', lambda: 0)
     heads = tuple(range(1,25))
     with torch.device('meta'):
-        obj = model.HcuV41PcpEngramEmbedding(sum(heads), 256, heads, cpu_offload=True)
+        obj = model.HcuDSV41PcpEngramEmbedding(sum(heads), 256, heads, cpu_offload=True)
     start = sum(heads[:3*rank])
     stop = sum(heads[:3*(rank+1)])
     assert obj.head_start == rank*3 and obj.part_n_hash_cols == 3

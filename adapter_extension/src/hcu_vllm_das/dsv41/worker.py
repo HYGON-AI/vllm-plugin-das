@@ -3,7 +3,7 @@
 from vllm.logger import init_logger
 from vllm.v1.worker.gpu_worker import Worker
 
-from .quantization.dsv41_channel_fp8 import _is_v41
+from ..quantization.dsv41_channel_fp8 import _is_v41
 
 logger = init_logger(__name__)
 
@@ -14,7 +14,7 @@ def _local_profile_token_bound(global_tokens, max_reqs, pcp_size):
     return min(global_tokens, (global_tokens + pcp_size - 1) // pcp_size + 2 * max_reqs)
 
 
-class HcuV41PcpWorker(Worker):
+class HcuDSV41PcpWorker(Worker):
     def _uses_pcp_channel_fp8(self):
         cfg = self.vllm_config
         return (

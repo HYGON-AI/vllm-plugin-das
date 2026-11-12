@@ -8,7 +8,7 @@ def test_signed_experts_match_reference_with_clamp_and_remote_routes():
     from types import SimpleNamespace as NS
     import torch,json
     from deepgemm import marlin_fp8_contiguous_weight
-    from hcu_vllm_das.moe.v41_deepgemm import ChannelDeepGemmExperts
+    from hcu_vllm_das.moe.dsv41_deepgemm import ChannelDeepGemmExperts
     from vllm.model_executor.layers.fused_moe.config import FusedMoEQuantConfig
     from vllm.model_executor.layers.fused_moe.activation import MoEActivation,ApplyMoEActivationConfig
     import vllm._custom_ops

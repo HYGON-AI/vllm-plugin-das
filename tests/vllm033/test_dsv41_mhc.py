@@ -5,8 +5,8 @@ import pytest
 import torch
 from vllm.model_executor.kernels.mhc.torch import mhc_post_torch
 from vllm.model_executor.layers import mhc as native_mhc
-from hcu_vllm_das import v41_mhc
-from hcu_vllm_das.models import v41_pcp as model
+from hcu_vllm_das.dsv41 import mhc as v41_mhc
+from hcu_vllm_das.models import dsv41_pcp as model
 
 # The package re-exports the triton library name over this submodule attribute.
 core_triton = import_module("vllm.model_executor.kernels.mhc.triton")
@@ -39,7 +39,7 @@ def _post_inputs(tokens, hc, hidden, seed):
 @pytest.mark.parametrize("tokens,hc,hidden", [(0, 4, 64), (3, 4, 1100), (2, 3, 40)])
 def test_post_matches_core_torch_within_bf16_rounding(tokens, hc, hidden):
     args = _post_inputs(tokens, hc, hidden, tokens + hidden)
-    actual = model.HcuV41PcpMHCPostOp.forward_hip(None, *args)
+    actual = model.HcuDSV41PcpMHCPostOp.forward_hip(None, *args)
     expected = mhc_post_torch(*args)
     assert actual.shape == expected.shape and actual.dtype == expected.dtype
     torch.testing.assert_close(actual.float(), expected.float(), rtol=2 ** -7, atol=1e-6)
@@ -71,8 +71,8 @@ def test_pre_delayed_reuses_core_gates_and_collapse(tokens, with_pre_mix):
     scale, base = torch.rand(3, generator=g), torch.randn(2 * hc + hc * hc, generator=g)
     pre_mix = torch.sigmoid(torch.randn(tokens, hc, generator=g)) if with_pre_mix else None
     args = (residual, fn, scale, base, 1e-6, 1e-6, 1e-6, 2.0, 3)
-    op = object.__new__(model.HcuV41PcpMHCPreDelayedOp)
-    actual = model.HcuV41PcpMHCPreDelayedOp.forward_hip(op, *args, pre_mix=pre_mix)
+    op = object.__new__(model.HcuDSV41PcpMHCPreDelayedOp)
+    actual = model.HcuDSV41PcpMHCPreDelayedOp.forward_hip(op, *args, pre_mix=pre_mix)
     expected = native_mhc.MHCPreDelayedOp.forward_native(op, *args, pre_mix=pre_mix)
     for index in (0, 1, 2, 4):
         assert torch.equal(actual[index], expected[index])

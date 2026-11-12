@@ -7,7 +7,7 @@ from .extension import _require_vllm_033_release_line
 
 QUANTIZATION_METHOD = "hcu_dsv41_channel_fp8"
 ARCH = "DeepseekV41ForCausalLM"
-MODEL = ("hcu_vllm_das.models.v41_pcp", "HcuV41PcpForCausalLM")
+MODEL = ("hcu_vllm_das.models.dsv41_pcp", "HcuDSV41PcpForCausalLM")
 
 
 def activate_extension(context):

@@ -1,7 +1,7 @@
 """CPU oracle for the eager PCP FP8 cache scorer."""
 import pytest
 import torch
-from hcu_vllm_das import v41_indexer as candidate
+from hcu_vllm_das.dsv41 import indexer as candidate
 from vllm.v1.attention.ops import rocm_aiter_mla_sparse as rocm
 B, D, HEADS = 16, 128, 2
 
@@ -10,7 +10,7 @@ B, D, HEADS = 16, 128, 2
 def interpret_gpu_score_on_cpu(monkeypatch):
     from triton.runtime.interpreter import InterpretedFunction
     from triton.runtime.jit import JITFunction
-    from hcu_vllm_das import v41_indexer_gpu as gpu
+    from hcu_vllm_das.dsv41 import indexer_gpu as gpu
     # tl.sum and its nested helpers were imported before this fixture.
     monkeypatch.setattr(JITFunction, "__call__",
         lambda self, *args, **kwargs: InterpretedFunction(self.fn)(*args, **kwargs))
