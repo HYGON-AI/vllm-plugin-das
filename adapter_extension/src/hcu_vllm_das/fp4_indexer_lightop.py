@@ -108,9 +108,12 @@ def physical_page_records(cache):
 
 # One canonical decode page is 64 records of 68 bytes (64 payload + 4 scale).
 STAGING_PAGE_BYTES = 4352
-_STAGING_KEY = ('fp4_indexer_decode_staging',)
-# The persistent pool reserved during the startup profile, if one was reserved.
-_reserved_pool = None
+# The persistent pool reserved during the startup profile, keyed by page size.
+# V4.1 carries a per-layer compress_ratio, so ratio-1 and ratio-2 layers coexist
+# in one model and need pools of different page geometry. A single fixed key
+# would make the second layer's request a shape mismatch, which the workspace
+# manager rejects outright -- a startup failure, not a slow path.
+_reserved_pools: dict[int, object] = {}
 
 
 def decode_rows(cfg):
@@ -138,13 +141,32 @@ def staging_plan(cfg, max_model_len, compress_ratio):
     pages_per_row = (max_model_len + 63) // 64
     width = pages_per_row * 64
     slots = requests * width
-    # Conservative sum of everything stage_decode_pages allocates besides the
-    # pool itself: offsets/valid/logical/physical/slots index tensors, the
-    # gather payload and scale returns, and their contiguous byte views.
-    transient = slots * (8 * 5 + 1 + 64 * 2 + 4 * 2) + width * 8
+    # Every tensor `stage_decode_pages` holds at the same time as the pool.
+    # int64 index tensors are 8 bytes each and several of them coexist:
+    # offsets, the valid mask, logical_pages, its clamp_max result, the
+    # physical_pages gather, its int64 copy, slots, and the zeros_like used by
+    # torch.where. The gather returns int8 payload (64 bytes/slot) plus an
+    # int32 scale (4 bytes/slot), and both get a contiguous byte view. `table`
+    # is int32 over the staged page count. Counted per slot, then per row.
+    index_tensors = 8 * 9          # int64: offsets/valid/logical/clamp/phys/slots...
+    payload_bytes = 64 * 2         # int8 payload plus its uint8 view
+    scale_bytes = 4 * 2            # int32 scale plus its uint8 view
+    transient = slots * (index_tensors + payload_bytes + scale_bytes)
+    transient += slots * 4         # int32 staging block table
+    transient += width * 8         # per-row offsets before broadcasting
     return dict(requests=requests, pages_per_row=pages_per_row,
                 page_records=page_records, transient=transient,
                 shape=(requests, pages_per_row, STAGING_PAGE_BYTES))
+
+
+def staging_key(plan):
+    """Workspace key for one pool geometry.
+
+    Distinct page-record counts get distinct pools; the shape itself is also
+    part of the key so a changed max_model_len cannot silently reuse a buffer
+    with the wrong dimensions.
+    """
+    return ('fp4_indexer_decode_staging', plan['page_records'], plan['shape'])
 
 
 def _staging_pool(plan, device):
@@ -158,7 +180,7 @@ def _staging_pool(plan, device):
                                           is_workspace_manager_initialized)
     if is_workspace_manager_initialized():
         return current_workspace_manager().get_persistent(
-            _STAGING_KEY, plan['shape'], torch.uint8)
+            staging_key(plan), plan['shape'], torch.uint8)
     return torch.empty(plan['shape'], dtype=torch.uint8, device=device)
 
 
@@ -181,8 +203,7 @@ def reserve_decode_staging(cfg, max_model_len, compress_ratio, device):
     pool = _staging_pool(plan, device)
     probe = torch.empty(plan['transient'], dtype=torch.uint8, device=device)
     del probe
-    global _reserved_pool
-    _reserved_pool = pool
+    _reserved_pools[plan['page_records']] = pool
     return pool
 
 
@@ -191,13 +212,14 @@ def _staging_target(cache, requests, pages_per_row):
 
     The buffer is the persistent workspace pool reserved during the startup
     profile whenever it fits, so the decode hot path stops allocating a new
-    staging pool outside the planned peak. A request set larger than the
-    reserved maximum (only reachable when the scheduler exceeds the configured
-    bound) still gets a correct, unplanned allocation rather than a wrong
-    answer.
+    staging pool outside the planned peak. Layers with different
+    ``compress_ratio`` values reserve separate pools and each gets its own
+    back. A request set larger than the reserved maximum (only reachable when
+    the scheduler exceeds the configured bound) still gets a correct, unplanned
+    allocation rather than a wrong answer.
     """
     shape = (requests, pages_per_row, STAGING_PAGE_BYTES)
-    pool = _reserved_pool
+    pool = _reserved_pools.get(physical_page_records(cache))
     if pool is not None and pool.shape == shape and pool.device == cache.device:
         return pool
     return torch.empty(shape, dtype=torch.uint8, device=cache.device)
