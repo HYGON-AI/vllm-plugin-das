@@ -113,6 +113,31 @@ def test_pcp_engram_shards_cover_all_hash_heads(monkeypatch, rank):
     assert obj._get_shard_info() == (8, rank)
 
 
+@pytest.mark.parametrize("budget,max_reqs,slot", [
+    (32768, 128, 4352),
+    (32769, 128, 4353),
+    (7, 4, 7),
+])
+def test_engram_staging_capacity_matches_padded_pcp_gather(monkeypatch, budget, max_reqs, slot):
+    obj = object.__new__(model.HcuDSV41PcpEngram)
+    torch.nn.Module.__init__(obj)
+    obj.embed_tokens = NS(dp_size=1, part_n_hash_cols=3, cpu_offload=False)
+    counts = torch.tensor([slot] + [0] * 7)
+    group = NS(world_size=8, all_gather=lambda value, dim: counts)
+    monkeypatch.setattr(model, "get_pcp_group", lambda: group)
+    monkeypatch.setattr(model, "get_current_vllm_config",
+                        lambda: NS(scheduler_config=NS(max_num_seqs=max_reqs)))
+    with torch.device("meta"):
+        obj._init_staging(budget, 256)
+    assert obj.staged_rows.shape == (slot * 8, 3, 256)
+    assert obj.staged_rows.dtype == torch.bfloat16
+
+    # Even an empty local rank must reject a peer that exceeds the slot.
+    counts[0] += 1
+    with pytest.raises(ValueError, match="staging capacity exceeded"):
+        obj.prepare_embeddings(torch.empty(0, 24, dtype=torch.int32))
+
+
 @pytest.mark.parametrize('counts,rank', [([0]*8, 0), ([0,2,1,0,3,0,1,2], 0), ([0,2,1,0,3,0,1,2], 4)])
 def test_pcp_engram_stages_uneven_and_empty_ranks(monkeypatch, counts, rank):
     heads, local_heads, dim = 24, 3, 2
