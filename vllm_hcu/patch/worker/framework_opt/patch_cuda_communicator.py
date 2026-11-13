@@ -5,6 +5,8 @@
 from __future__ import annotations
 
 import functools
+from collections.abc import Iterator
+from contextlib import contextmanager
 from types import ModuleType
 
 from vllm_hcu.patch.config import get_hcu_config
@@ -33,6 +35,101 @@ TARGETS = (
 )
 _MARKER = "_vllm_hcu_cuda_communicator_validated"
 _WRAPPER = "_vllm_hcu_cuda_communicator_wrapper"
+
+
+def _aiter_custom_allreduce_enabled(aiter_ops: object) -> bool:
+    probe = getattr(aiter_ops, "is_custom_all_reduce_enabled", None)
+    if not callable(probe):
+        return False
+    return bool(probe())
+
+
+def _topology_decision(cpu_group, device) -> tuple[bool, bool]:
+    """Return ``(fully_connected, allowed)``. Fail closed on probe errors."""
+    if device is None:
+        return False, False
+    from vllm_hcu.distributed.device_communicators.custom_all_reduce import (
+        custom_allreduce_topology_decision,
+    )
+
+    return custom_allreduce_topology_decision(cpu_group, device)
+
+
+def _log_aiter_topology_decision(*, fully_connected: bool, allowed: bool) -> None:
+    from vllm.logger import init_logger
+    from vllm_hcu.distributed.device_communicators.custom_all_reduce import (
+        PCIE_CUSTOM_ALLREDUCE_ENV,
+    )
+
+    logger = init_logger(__name__)
+    if allowed and not fully_connected:
+        logger.warning(
+            "AITER custom allreduce is enabled on a PCIe topology because "
+            "%s=1. This path can be unstable on some HCU PCIe systems; "
+            "prefer HCCL (--disable-custom-all-reduce) if you observe "
+            "hangs.",
+            PCIE_CUSTOM_ALLREDUCE_ENV,
+        )
+        return
+    if not allowed:
+        logger.warning(
+            "AITER custom allreduce is disabled because the devices are not "
+            "fully connected (PCIe, no XGMI). HCCL will be used instead. "
+            "To enable the PCIe custom allreduce kernel anyway, set %s=1.",
+            PCIE_CUSTOM_ALLREDUCE_ENV,
+        )
+
+
+@contextmanager
+def suppress_aiter_custom_allreduce_unless_topology_allows(
+    cpu_group,
+    device,
+    unique_name: str,
+) -> Iterator[None]:
+    """Force AITER custom-AR off before CudaCommunicator backend selection.
+
+    Upstream ``CudaCommunicator.__init__`` constructs ``AiterCustomAllreduce``
+    whenever ``VLLM_ROCM_USE_AITER`` and ``VLLM_ROCM_USE_AITER_CUSTOM_AR`` are
+    enabled, without consulting HCU topology. That constructor allocates the
+    AITER IPC path and can hard-lock PCIe TP=2 hosts. Disable the AITER probe
+    for this call when the shared topology/opt-in policy forbids custom AR.
+    """
+    if "tp" not in unique_name:
+        yield
+        return
+
+    try:
+        from vllm._aiter_ops import rocm_aiter_ops
+    except Exception:
+        yield
+        return
+    if not _aiter_custom_allreduce_enabled(rocm_aiter_ops):
+        yield
+        return
+
+    try:
+        fully_connected, allowed = _topology_decision(cpu_group, device)
+    except Exception:
+        fully_connected, allowed = False, False
+    try:
+        _log_aiter_topology_decision(
+            fully_connected=fully_connected, allowed=allowed
+        )
+    except Exception:
+        pass
+    if allowed:
+        yield
+        return
+
+    def _disabled(*_args, **_kwargs):
+        return False
+
+    original_probe = rocm_aiter_ops.is_custom_all_reduce_enabled
+    rocm_aiter_ops.is_custom_all_reduce_enabled = _disabled
+    try:
+        yield
+    finally:
+        rocm_aiter_ops.is_custom_all_reduce_enabled = original_probe
 
 
 def register(
@@ -99,16 +196,19 @@ def apply_to_module(module: ModuleType) -> bool:
         global_world_size=None,
         tcp_store_group=None,
     ):
-        init(
-            self,
-            cpu_group,
-            device,
-            device_group,
-            unique_name,
-            global_ranks,
-            global_world_size,
-            tcp_store_group,
-        )
+        with suppress_aiter_custom_allreduce_unless_topology_allows(
+            cpu_group, device, unique_name
+        ):
+            init(
+                self,
+                cpu_group,
+                device,
+                device_group,
+                unique_name,
+                global_ranks,
+                global_world_size,
+                tcp_store_group,
+            )
         from vllm.config import get_current_vllm_config_or_none
 
         vllm_config = get_current_vllm_config_or_none()
@@ -152,4 +252,5 @@ __all__ = [
     "apply",
     "apply_to_module",
     "register",
+    "suppress_aiter_custom_allreduce_unless_topology_allows",
 ]
