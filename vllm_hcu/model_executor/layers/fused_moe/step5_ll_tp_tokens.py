@@ -8,7 +8,10 @@ No model weights, routing decisions, or speculative sampling are changed.
 """
 from __future__ import annotations
 
+import os
+
 import torch
+import torch.distributed as dist
 
 
 class Step5LLTPTokenBuffer:
@@ -19,6 +22,9 @@ class Step5LLTPTokenBuffer:
         self._tp = get_tp_group()
         self._size = self._tp.world_size
         self._rank = self._tp.rank_in_group
+        self._direct_tp_output = (
+            os.environ.get("HCU_STEP5_DEEPEP_TP_DIRECT_OUT") == "1"
+        )
         if self._size != 4:
             raise RuntimeError("Step5 LL token partition requires TP4")
         # Allocate before the first asynchronous transport. One buffer is
@@ -103,8 +109,13 @@ class Step5LLTPTokenBuffer:
         def gather():
             if recv_hook is not None:
                 recv_hook()
-            gathered = self._tp.all_gather(local, dim=0)
-            output.copy_(gathered)
+            if self._direct_tp_output and output.is_contiguous():
+                dist.all_gather_into_tensor(
+                    output, local, group=self._tp.device_group
+                )
+            else:
+                gathered = self._tp.all_gather(local, dim=0)
+                output.copy_(gathered)
 
         if kwargs.get("return_recv_hook", False):
             return output, event, gather

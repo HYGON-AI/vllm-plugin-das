@@ -975,6 +975,7 @@ def configure_step5_ll_tp_tokens(prepare, moe):
             and parallel.data_parallel_size == parallel.data_parallel_size_local == 2
             and parallel.all2all_backend == "deepep_low_latency"
             and not parallel.use_ubatching
+            and not config.compilation_config.pass_config.enable_sp
             and int(os.environ.get("HCU_DBO_MIN_TOKENS", "0")) == 0
             and not moe.is_sequence_parallel
             and moe.hidden_dim == 4096
