@@ -23,7 +23,9 @@
 # limitations under the License.
 """Inference-only HY V4 model for HCU with strict checkpoint loading."""
 
+import os
 import typing
+from contextlib import nullcontext
 from collections.abc import Callable, Iterable, MutableSequence, Sequence
 from itertools import islice
 
@@ -686,8 +688,14 @@ class HYV4Model(nn.Module, MixtureOfExperts):
             # prepare_input, and residual is unused.
             residual = None if self.enable_ihc else intermediate_tensors["residual"]
 
-        for layer in islice(self.layers, self.start_layer, self.end_layer):
-            hidden_states, residual = layer(positions, hidden_states, residual)
+        scope = nullcontext()
+        if os.environ.get("VLLM_HCU_HY4_FP8_MEGAMOE") == "1":
+            from .megamoe import mega_forward_batch
+
+            scope = mega_forward_batch(hidden_states.shape[0])
+        with scope:
+            for layer in islice(self.layers, self.start_layer, self.end_layer):
+                hidden_states, residual = layer(positions, hidden_states, residual)
 
         if not get_pp_group().is_last_rank:
             if self.enable_ihc:
