@@ -37,6 +37,20 @@ def test_registration_is_opt_in_and_reuses_public_registries(registered, monkeyp
     assert ModelRegistry.models[activation.ARCH] is entry
 
 
+@pytest.mark.parametrize("requested", [None, "fp8", "deepseek_v4_fp8", activation.QUANTIZATION_METHOD])
+def test_model_config_prefers_channel_fp8_override(registered, monkeypatch, requested):
+    from vllm.config import model
+
+    # Keep the competing native override in the registry before plugin activation.
+    monkeypatch.setattr(quantization, "QUANTIZATION_METHODS", ["deepseek_v4_fp8"])
+    activation.activate_extension(registered)
+    monkeypatch.setattr(model, "current_platform", NS(verify_quantization=lambda name: None))
+    config = NS(model_arch_config=NS(quantization_config=SCHEMA),
+                hf_config=NS(model_type="deepseek_v41"), quantization=requested)
+    model.ModelConfig._verify_quantization(config)
+    assert config.quantization == activation.QUANTIZATION_METHOD
+
+
 @pytest.mark.parametrize("flag", [None, "0", "1"])
 @pytest.mark.parametrize("requirement", [None, "extension", "capability"])
 def test_adapter_activation_reports_only_registered_providers(registered, monkeypatch, flag, requirement):
