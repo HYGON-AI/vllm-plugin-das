@@ -181,12 +181,12 @@ def apply_to_module(module: ModuleType) -> bool:
     # import. HCU AITER has no FlyDSL package or gate_mode ABI.
     normal_impl = _build_workspace_aiter_fused_experts(fused_experts)
     special_globals = dict(fused_experts.__globals__)
-    special_globals["MoEActivation"] = SimpleNamespace(
-        SILU=moe_activation.SILU,
-        GELU=gelu_tanh,
-        SWIGLUOAI=moe_activation.SWIGLUOAI,
-        SWIGLUOAI_UNINTERLEAVE=moe_activation.SWIGLUOAI_UNINTERLEAVE,
-    )
+    # Mirror every upstream member so the cloned body can still evaluate
+    # unconditional checks such as ``activation != MoEActivation.SITU``;
+    # only GELU is redirected to the tanh variant.
+    special_members = {member.name: member for member in moe_activation}
+    special_members["GELU"] = gelu_tanh
+    special_globals["MoEActivation"] = SimpleNamespace(**special_members)
     special_globals["ActivationMethod"] = SimpleNamespace(
         SILU=hcu_activation_method.SILU,
         GELU=hcu_activation_method.GELU_TANH,
