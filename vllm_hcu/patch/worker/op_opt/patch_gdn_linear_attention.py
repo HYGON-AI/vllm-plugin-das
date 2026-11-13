@@ -106,8 +106,12 @@ def _aiter_state_indices(ssm_state_indices):
             ctx = get_forward_context()
     except ImportError:
         pass
+    # _version is part of the key so a buffer rewritten in place within one
+    # forward context misses instead of returning the previous mapping; the
+    # other four fields are all unchanged by an in-place write.
     key = (
         ssm_state_indices.data_ptr(),
+        ssm_state_indices._version,
         tuple(ssm_state_indices.shape),
         tuple(ssm_state_indices.stride()),
         ssm_state_indices.dtype,
