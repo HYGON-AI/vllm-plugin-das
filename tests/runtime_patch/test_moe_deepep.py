@@ -3088,12 +3088,14 @@ def test_channel_quant_contiguous_experts_accept_v0251_permute_contract(
     )
     activation_kwargs: dict[str, object] = {}
 
-    def quantize_activation(output, **kwargs):
+    def quantize_activation(gateup, **kwargs):
         activation_kwargs.update(kwargs)
-        return (
-            output[..., :4].to(torch.int8),
-            torch.ones((output.shape[0], 1)),
-        )
+        quantized = kwargs.get("output")
+        if quantized is None:
+            quantized = gateup[..., :4].to(torch.int8)
+        else:
+            quantized.copy_(gateup[..., :4])
+        return quantized, torch.ones((gateup.shape[0], 1))
 
     quantizer_name = (
         "fuse_silu_mul_clamp_quant"
@@ -3107,6 +3109,7 @@ def test_channel_quant_contiguous_experts_accept_v0251_permute_contract(
         lambda a, output, **_kwargs: output.copy_(a),
     )
 
+    workspace13 = torch.empty(12, dtype=torch.int8)
     output = torch.empty((3, 4))
 
     class DeviceOnlyExpertCounts:
@@ -3125,7 +3128,7 @@ def test_channel_quant_contiguous_experts_accept_v0251_permute_contract(
         expert_map=None,
         a1q_scale=torch.ones((3, 1)),
         a2_scale=None,
-        workspace13=torch.empty(12, dtype=torch.int8),
+        workspace13=workspace13,
         workspace2=torch.empty(24),
         expert_tokens_meta=SimpleNamespace(
             expert_num_tokens=DeviceOnlyExpertCounts(),
@@ -3136,6 +3139,11 @@ def test_channel_quant_contiguous_experts_accept_v0251_permute_contract(
 
     assert torch.equal(output, torch.full_like(output, 2))
     assert activation_kwargs["limit"] == 10.0
+    if not use_int8:
+        quant_out = activation_kwargs["output"]
+        assert quant_out.data_ptr() == workspace13.data_ptr()
+        assert quant_out.dtype == torch.float8_e4m3fn
+        assert quant_out.shape == (3, 4)
 
 
 def test_channel_fp8_auto_experts_restore_layouts_after_kernel_recreation(
