@@ -281,6 +281,9 @@ def test_third_party_oot_owner_is_not_overwritten(isolated_owner):
 
 
 def test_postpublication_policy_change_latches_failure(isolated_owner, monkeypatch):
+    from vllm import config as core_config
+    cfg = config_with(indexer_kv_dtype='mxfp4')
+    monkeypatch.setattr(core_config, 'get_current_vllm_config_or_none', lambda: cfg)
     activation.activate_extension(ExtensionContext('0.1.0', '0.33.0'))
     monkeypatch.setenv('HCU_VLLM_FP4_INDEXER_IMPL', 'lightop')
     with pytest.raises(ExtensionCommitError):

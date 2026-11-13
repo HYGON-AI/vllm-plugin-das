@@ -115,6 +115,15 @@ class HcuV41SparseAttnIndexer(_api['base']):
     the adapter base, which is where the upstream behaviour belongs.
     """
 
+    def __init__(self, *args, **kwargs):
+        from hcu_adapter.dsv41_channel_fp8 import _is_v41
+        from .v41_indexer_activation import admit_config
+
+        cfg = current_config()
+        if _is_v41(cfg.model_config.hf_config):
+            admit_config(cfg)
+        super().__init__(*args, **kwargs)
+
     def _fp4_preflight(self, cfg):
         from .fp4_indexer import preflight
 

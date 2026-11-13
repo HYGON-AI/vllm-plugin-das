@@ -60,7 +60,8 @@ def preflight(cfg):
     plan = validate_config(cfg)
     if plan is None:
         raise ValueError('FP4 owned model requires explicit FP4 opt-in')
-    from .v41_indexer_activation import check_health
+    from .v41_indexer_activation import admit_config, check_health
+    admit_config(cfg)
     check_health()
     fp4_packer.check_health()
     if fp4_packer._state is None or fp4_packer._state['mode'] != 'triton':
