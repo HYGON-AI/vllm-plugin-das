@@ -100,6 +100,10 @@ RUN TORCH_TAG="torch${TORCH_VERSION//./}" \
 # 构建完成后移除内网 pip 源, 避免运行时意外拉取内网依赖
 RUN rm -rf ~/.pip/pip.conf
 
+# amdsmi 库路径固化到镜像 ENV: ~/.bashrc 只对交互/登录 shell 生效,
+# docker run 直接给命令或 k8s 启动时读不到, amdsmi 动态库会找不到
+ENV LD_LIBRARY_PATH=/usr/local/lib/python3.10/dist-packages/amdsmi:$LD_LIBRARY_PATH
+
 # /etc/image.info (口径同基础镜像 dtk 段: ASCII 大字 + 名称/构建时间, 容器启动时由
 # ENTRYPOINT /usr/local/bin/hcu_image_info 打印); 大字换成 vllm, 覆盖基础镜像的 DTK 记录;
 # figlet 字体与基础镜像同源 (资源服务器 pkg/slant.flf); BUILD_TIME 由 CI 传入, 与产物 tag 的时间段一致

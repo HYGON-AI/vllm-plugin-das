@@ -45,6 +45,8 @@ jobs:
             aicc_major: "1.0.0"
             # blas cut 版本, 安装脚本按版本+os 拉归档最新包覆盖到 /opt/dtk
             blas_cut_version: "26.04"
+    # 矩阵各分支写同名 output 只保留最后一个值; 当前矩阵仅一项,
+    # 增加镜像目标时需把下游 test-image/validate-image 改为按矩阵扇出
     outputs:
       docker_image: ${{ steps.gen-tag.outputs.docker_image }}
     env:
