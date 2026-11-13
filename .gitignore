@@ -202,6 +202,8 @@ cython_debug/
 
 # Results
 *.csv
+# tuned rocBLAS algorithm tables ship with the package
+!vllm_hcu/model_executor/layers/*.csv
 
 # Python pickle files
 *.pkl

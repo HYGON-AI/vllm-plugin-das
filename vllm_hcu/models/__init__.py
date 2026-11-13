@@ -7,6 +7,20 @@ from vllm import ModelRegistry
 
 
 def register_model():
+    # This only arms a post-import patch on
+    # vllm.model_executor.models.gemma4, so it stays inert until a Gemma4
+    # model is actually loaded.
+    from vllm_hcu.utils.gemma4_switches import (
+        gemma4_bw1000_enabled,
+        warn_retired_switches,
+    )
+
+    warn_retired_switches()
+    if gemma4_bw1000_enabled():
+        from vllm_hcu.models.gemma4 import register_attention
+
+        register_attention()
+
     ModelRegistry.register_model(
         "DeepseekV3ForCausalLM", "vllm_hcu.models.deepseek_v2:DeepseekV3ForCausalLM"
     )
