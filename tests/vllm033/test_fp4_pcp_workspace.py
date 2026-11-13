@@ -15,6 +15,11 @@ from hcu_vllm_das import fp4_indexer as impl, fp4_indexer_lightop as reader
 from hcu_vllm_das import v41_pcp, v41_indexer as scorer
 
 
+@pytest.fixture(autouse=True)
+def pcp_adapter_mode(monkeypatch):
+    monkeypatch.setenv('HCU_VLLM_PCP_IMPL', 'native')
+
+
 def pcp_config(cfg):
     cfg.parallel_config.prefill_context_parallel_size = 8
     cfg.parallel_config.enable_expert_parallel = True
@@ -282,3 +287,45 @@ def test_eight_rank_native_preparation_keeps_global_k_local_q(chain, monkeypatch
         assert args[2] is global_positions and args[8] is global_slots
         assert options['USE_FP4'] and options['COMPRESS_RATIO'] == ratio
         assert events == ['compress', 'gather', 'query', 'main_store', 'attention']
+
+
+@pytest.mark.parametrize('disable', ['stock', 'kill_switch'])
+def test_pcp_fp4_honors_adapter_admission(chain, monkeypatch, disable):
+    cfg = pcp_config(chain.cfg)
+    if disable == 'stock':
+        monkeypatch.setenv('HCU_VLLM_PCP_IMPL', 'stock')
+    else:
+        monkeypatch.setenv('HCU_DISABLE_OPS', 'vllm_pcp')
+    with pytest.raises(ValueError, match='HCU_VLLM_PCP_IMPL=native'):
+        validate_config(cfg)
+
+
+def test_noncanonical_profile_reuses_frozen_decode_pool(chain, monkeypatch):
+    chain.cfg.model_config.hf_config.compress_ratios = [2, 0]
+    layer = make_attention(chain).indexer.indexer_op
+    plan = dict(layer.fp4_staging_plan)
+    assert plan['page_records'] == 32 and plan['requests'] == 4
+    chain.cfg.scheduler_config.max_num_seqs = 99999
+    chain.context.attn_metadata = None
+    reserved = torch.empty(plan['shape'], dtype=torch.uint8)
+    hidden = torch.empty(16, 128)
+    calls, transient = [], []
+    original_empty = torch.empty
+
+    def pool(selected, device):
+        calls.append(selected)
+        return reserved
+
+    def allocate(*args, **kwargs):
+        result = original_empty(*args, **kwargs)
+        transient.append(weakref.ref(result))
+        return result
+
+    monkeypatch.setattr(reader, '_reserved_pools', {})
+    monkeypatch.setattr(reader, '_staging_pool', pool)
+    monkeypatch.setattr(torch, 'empty', allocate)
+    reader.execute(layer, hidden, None, None)
+    assert calls == [plan]
+    assert reader._reserved_pools[32] is reserved
+    assert len(transient) == 2 and all(ref() is None for ref in transient)
+    assert not torch.cuda.is_initialized()

@@ -37,3 +37,13 @@ def test_only_noncanonical_decode_pages_need_staging():
 def test_empty_and_decode_rows_are_bounded_by_actual_queries():
     assert budget(query_rows=0) == 0
     assert budget(query_rows=1, decode_rows=128) == budget(query_rows=1, decode_rows=1)
+
+
+def test_persistent_decode_pool_is_excluded_from_transient_budget():
+    args = dict(query_rows=128, decode_rows=128, max_model_len=65536,
+                total_seq_lens=0, topk_tokens=2048, num_query_heads=32,
+                max_logits_bytes=256 * 1024**2, physical_page_size=32)
+    transient = workspace_bytes(**args, persistent_staging=True)
+    combined = workspace_bytes(**args)
+    pool_bytes = 128 * 65536 * 68
+    assert combined - transient == pool_bytes
