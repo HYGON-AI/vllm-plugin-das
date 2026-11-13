@@ -14,7 +14,7 @@ DEFAULT_CONFIG = REPOSITORY / '.github/configs/hcu-test-map-v033.json'
 
 def select_jobs(changed_paths, *, full=False, accuracy=False, config_path=DEFAULT_CONFIG):
     config = json.loads(config_path.read_text())
-    expected = {'v033-source-contract', 'v033-device-gfx936'}
+    expected = {'v033-source-contract', 'v033-device-gfx936', 'v033-device-gfx938'}
     if (config.get('version') != 1 or config.get('release') != 'v0.33.0'
             or set(config.get('jobs', {})) != expected
             or set(config.get('fallback_jobs', [])) != expected):

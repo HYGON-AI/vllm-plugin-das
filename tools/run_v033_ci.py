@@ -24,6 +24,9 @@ PUBLIC_SELECTOR_CASES = ('normal', 'optional', 'required', 'commit',
                          'config', 'fork', 'spawn')
 
 
+DEVICE_TIERS = ('device', 'device-gfx938')
+
+
 def _has_hcu_contracts(path):
     """Read marker declarations without importing portable test modules."""
     tree = ast.parse(path.read_text(), filename=str(path))
@@ -46,10 +49,13 @@ def _has_hcu_contracts(path):
 def test_files(tier):
     if tier == 'source':
         return SOURCE_TESTS
+    directory = ROOT / 'tests/vllm033'
+    if tier == 'device-gfx938':
+        directory = directory / 'gfx938'
     return [p.relative_to(ROOT).as_posix()
-            for p in sorted((ROOT / 'tests/vllm033').glob('test_*.py'))
+            for p in sorted(directory.glob('test_*.py'))
             if p.relative_to(ROOT).as_posix() != PUBLIC_SELECTOR_TEST
-            and (_has_hcu_contracts(p) if tier == 'device'
+            and (_has_hcu_contracts(p) if tier in DEVICE_TIERS
                  else not p.name.endswith('_hcu.py'))]
 
 
@@ -108,7 +114,7 @@ def validate_result(path):
 
 def main():
     parser = argparse.ArgumentParser(description=__doc__)
-    parser.add_argument('--tier', choices=('source', 'portable', 'device'), required=True)
+    parser.add_argument('--tier', choices=('source', 'portable', 'device', 'device-gfx938'), required=True)
     parser.add_argument('--list', action='store_true')
     parser.add_argument('--junit', type=Path, default=Path('v033-results.xml'))
     args = parser.parse_args()
@@ -129,14 +135,14 @@ def main():
                            ROCR_VISIBLE_DEVICES='-1', CUDA_VISIBLE_DEVICES='-1')
         if args.tier == 'source' and not environment.get('VLLM_TARGET_ROOT'):
             raise ValueError('source tier requires VLLM_TARGET_ROOT')
-    if args.tier in {'portable', 'device'}:
+    if args.tier != 'source':
         environment['HCU_V033_VERIFY_INSTALLED'] = '1'
         # Small CI suites do not need the default compiler sidecar pool. Its
         # interpreter startup can still run Adapter bootstrap during pytest exit.
         environment.setdefault('TORCHINDUCTOR_COMPILE_THREADS', '1')
         # Image must already contain ABI-matched Core, Adapter and vendor wheels.
         # Install only this independent Plugin project, not repository-root setup.py.
-        if args.tier == 'device':
+        if args.tier in DEVICE_TIERS:
             environment.update(HCU_ADAPTER_HOST='vllm', VLLM_PLUGINS='hcu_adapter',
                            VLLM033_HCU_TEST='1', HCU_VLLM033_RMSNORM_LIVE='1',
                            HCU_VLLM033_GRAPH_LIVE='1', HCU_VLLM033_AITER_INT8_LIVE='1',
@@ -153,7 +159,7 @@ def main():
     # A file may contain portable contracts and marked HCU numerics together.
     # Select actual pytest markers rather than inferring hardware from its name.
     marker_args = [] if args.tier == 'source' else [
-        '-m', 'hcu' if args.tier == 'device' else 'not hcu']
+        '-m', 'hcu' if args.tier in DEVICE_TIERS else 'not hcu']
     result = subprocess.run([sys.executable, '-m', 'pytest', '-q', *files, *marker_args,
         '--strict-markers', '--junitxml', str(args.junit.resolve()),
         '-o', 'xfail_strict=true', '-o', 'cache_dir=.pytest_cache/v033'], cwd=ROOT, env=environment)

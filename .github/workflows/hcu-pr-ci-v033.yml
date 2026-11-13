@@ -189,9 +189,39 @@ jobs:
             v033-portable.xml
             v033-device.xml
 
+  v033-device-gfx938:
+    needs: [select, authorize-device, resolve-device-image]
+    if: needs.select.outputs.has_jobs == 'true' && needs.authorize-device.outputs.authorized == 'true'
+    runs-on: [self-hosted, ci, bw1100]
+    permissions:
+      contents: read
+    timeout-minutes: 45
+    container:
+      image: ${{ needs.resolve-device-image.outputs.image }}
+      credentials:
+        username: ${{ secrets.HARBOR_USERNAME }}
+        password: ${{ secrets.HARBOR_PASSWORD }}
+      volumes:
+        - /opt/hyhal:/opt/hyhal:ro
+      options: --device=/dev/kfd --device=/dev/dri --group-add video --shm-size=32g
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: ${{ github.event.pull_request.head.sha || github.sha }}
+          persist-credentials: false
+      - name: Installed Channel-FP8 DeepGEMM numerical contract
+        env:
+          PYTEST_DISABLE_PLUGIN_AUTOLOAD: '1'
+        run: python -I tools/run_v033_ci.py --tier device-gfx938 --junit v033-device.xml
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: v033-device-gfx938
+          path: v033-device.xml
+
   v033-ci-gate:
     if: always()
-    needs: [select, v033-source-contract, authorize-device, resolve-device-image, v033-device-gfx936]
+    needs: [select, v033-source-contract, authorize-device, resolve-device-image, v033-device-gfx936, v033-device-gfx938]
     runs-on: ubuntu-latest
     env:
       SELECT_RESULT: ${{ needs.select.result }}
@@ -200,6 +230,7 @@ jobs:
       AUTH_RESULT: ${{ needs.authorize-device.result }}
       AUTHORIZED: ${{ needs.authorize-device.outputs.authorized }}
       IMAGE_RESULT: ${{ needs.resolve-device-image.result }}
+      GFX938_RESULT: ${{ needs.v033-device-gfx938.result }}
       DEVICE_RESULT: ${{ needs.v033-device-gfx936.result }}
     steps:
       - name: Require each selected stage to pass
@@ -213,4 +244,4 @@ jobs:
             echo 'Selected HCU tests require a trusted author or trusted ready-hcu authorization' >&2
             exit 1
           fi
-          [[ "$IMAGE_RESULT" == success && "$DEVICE_RESULT" == success ]] || exit 1
+          [[ "$IMAGE_RESULT" == success && "$DEVICE_RESULT" == success && "$GFX938_RESULT" == success ]] || exit 1

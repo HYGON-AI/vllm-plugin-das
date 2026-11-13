@@ -1,19 +1,21 @@
-"""Opt-in gfx938 numerical regression for Channel-FP8 DeepGEMM experts."""
-import os
+"""Single-device gfx938 numerical regression for Channel-FP8 DeepGEMM experts."""
 import pytest
 
 
-@pytest.mark.skipif(os.environ.get("VLLM_HCU_RUN_GPU_TESTS") != "1", reason="requires dedicated HCU GPU")
+@pytest.mark.hcu
 def test_signed_experts_match_reference_with_clamp_and_remote_routes():
     from types import SimpleNamespace as NS
-    import torch,json
+    import torch
     from deepgemm import marlin_fp8_contiguous_weight
     from hcu_vllm_das.moe.dsv41_deepgemm import ChannelDeepGemmExperts
     from vllm.model_executor.layers.fused_moe.config import FusedMoEQuantConfig
     from vllm.model_executor.layers.fused_moe.activation import MoEActivation,ApplyMoEActivationConfig
     import vllm._custom_ops
 
-    torch.cuda.set_device(0);torch.manual_seed(42)
+    torch.cuda.set_device(0)
+    arch = torch.cuda.get_device_properties(0).gcnArchName.split(":")[0]
+    assert arch == "gfx938", f"DeepGEMM numerical contract requires gfx938, got {arch}"
+    torch.manual_seed(42)
     e,k,i,topk=2,5120,2304,2
     w1=torch.randint(-2,3,(e,2*i,k),device='cuda').to(torch.float8_e4m3fn)
     w2=torch.randint(-2,3,(e,k,i),device='cuda').to(torch.float8_e4m3fn)
