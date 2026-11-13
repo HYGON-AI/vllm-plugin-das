@@ -292,7 +292,7 @@ def _apply_decode_to_module(module: ModuleType) -> bool:
                 self, q, kv_cache, swa_metadata, attn_metadata, swa_only, output, **decode_kwargs
             )
         _require_flashmla_ready()
-        from vllm.models.deepseek_v4.common.ops import (
+        from vllm_hcu.v1.attention.ops.deepseek_v4_topk import (
             compute_global_topk_indices_and_lens,
         )
         from vllm_hcu.v1.attention.ops.flashmla import flash_mla_with_kvcache
