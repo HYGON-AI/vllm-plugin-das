@@ -72,8 +72,10 @@ def _restore_independent_edp() -> None:
         backend = torch.distributed.get_backend(dp_group.device_group)
     except Exception as error:  # pragma: no cover - defensive backend probe
         _fatal(f'cannot derive the DP communicator backend: {error}')
+    # Every world rank must create every partition in the same order, including
+    # partitions it does not belong to (e.g. both TP2 x DP2 groups).
     group = parallel_state.init_model_parallel_group(
-        [list(dp_group.ranks)],
+        dp_group.group_ranks,
         parallel_state.get_world_group().local_rank,
         backend,
         group_name='edp',

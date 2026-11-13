@@ -15,6 +15,8 @@ adapter may not import the plugin (direction rule: plugin -> adapter only).
 """
 from __future__ import annotations
 
+import sys
+
 from hcu_adapter.kernels import pcp_fork
 
 validate_config = pcp_fork.validate_config
@@ -78,7 +80,10 @@ def bind_adapter_classes() -> None:
     pcp_fork.set_engram_validator(validate_engram_config)
     # Resolve through this module so a patch on `v41_pcp.get_forward_context`
     # (the historical seam) still reaches the adapter-owned attention class.
-    pcp_fork.set_forward_context_resolver(lambda: globals()["get_forward_context"]())
+    # Attribute lookup must trigger __getattr__ on a cold module; direct globals
+    # lookup only worked after a replay had already materialized this export.
+    pcp_fork.set_forward_context_resolver(
+        lambda: getattr(sys.modules[__name__], "get_forward_context")())
     _bound = True
 
 
