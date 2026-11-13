@@ -76,6 +76,9 @@ def chain(monkeypatch):
     # model actually uses one, and core resolves `auto` to `fp8`.
     cfg.attention_config = attention_config('mxfp4')
     monkeypatch.setattr(activation, 'check_health', lambda: None)
+    # This reader/constructor suite doubles owner publication; real deferred
+    # admission and its ordering are covered by test_fp4_fp8_admission.
+    monkeypatch.setattr(activation, 'admit_config', lambda cfg: None)
     monkeypatch.setattr(fp4_packer, 'check_health', lambda: None)
     monkeypatch.setattr(fp4_packer, '_state', dict(mode='triton'))
     monkeypatch.setattr(impl, 'load_providers', lambda: reader.providers())

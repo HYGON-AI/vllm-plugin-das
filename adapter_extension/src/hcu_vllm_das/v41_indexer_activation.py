@@ -9,7 +9,7 @@ from hcu_adapter.extensions import ExtensionCommitError, ExtensionSpec
 
 from .dsv41_activation import _require_release
 from .environment import _flag
-from hcu_adapter.fp4_indexer import selected as fp4_selected
+from hcu_adapter.fp4_indexer import applicable as fp4_applicable, selected as fp4_selected
 
 _state = None
 _failure = None
@@ -90,6 +90,71 @@ def _fatal(message):
     raise ExtensionCommitError(_failure)
 
 
+def _uses_fp4_cache(cfg=None):
+    # General plugins load before EngineArgs creates a model config. None means
+    # deployment admission is pending, not that this process selected FP8.
+    if not fp4_selected():
+        return False
+    if cfg is None:
+        from vllm.config import get_current_vllm_config_or_none
+        cfg = get_current_vllm_config_or_none()
+    return None if cfg is None else fp4_applicable(cfg)
+
+
+def _prepare_fp4():
+    from . import fp4_packer
+    from .fp4_indexer_lightop import load_providers
+    from hcu_adapter import hcu_env
+    if hcu_env.resolve('HCU_VLLM_SPARSE_INDEXER_IMPL', host='vllm')[0] != 'stock':
+        raise RuntimeError('C4 and V41 FP4 cannot own the same OOT key')
+    fp4_packer.check_health()
+    if fp4_packer._state is None or fp4_packer._state['mode'] != 'triton':
+        raise RuntimeError('FP4 requires published triton lowering')
+    load_providers()
+    return _compute_digest(), _digest_signature()
+
+
+def _record_fp4():
+    from hcu_adapter import registry as adapter_registry
+    adapter_registry.register(
+        op='vllm_fp4_indexer', impl='lightop',
+        target='vllm.model_executor.layers.sparse_attn_indexer.SparseAttnIndexer',
+        mechanism=adapter_registry.MECH_SEAM, source=__name__,
+        detail='FP4 branch of existing V41 OOT; native/model gates pending')
+
+
+def admit_config(cfg):
+    """Resolve pending deployment admission before native model allocation."""
+    global _state, _publishing
+    with _lock:
+        check_health()
+        if _state is None:
+            raise RuntimeError('V41 reference indexer is not active')
+        if _state['fp4'] is not None:
+            if _uses_fp4_cache(cfg) != _state['fp4']:
+                _fatal('V41 indexer deployment changed; restart process')
+            return
+        if _publishing:
+            _fatal('recursive V41 indexer deployment admission')
+        _publishing = True
+        try:
+            fp4 = _uses_fp4_cache(cfg)
+            if fp4 is None:
+                raise RuntimeError('V41 indexer deployment config is required')
+            digest, signature = _prepare_fp4() if fp4 else (None, None)
+            if fp4:
+                _record_fp4()
+            _state = dict(_state, fp4=fp4, digest=digest, signature=signature)
+            check_health()
+        except BaseException as error:
+            try:
+                _fatal('V41 indexer deployment admission failed; restart process')
+            except ExtensionCommitError as refusal:
+                raise refusal from error
+        finally:
+            _publishing = False
+
+
 def check_health():
     with _lock:
         if _failure is not None:
@@ -101,9 +166,14 @@ def check_health():
         from vllm import envs
         from vllm.model_executor import custom_op
         try:
+            current_fp4 = _uses_fp4_cache()
             valid = (
                 _flag(_FLAG, default=True) == _state['enabled']
-                and fp4_selected() == _state.get('fp4', False)
+                # Same deployment question as activation: comparing the knob
+                # here would report drift on an FP8-cache process whose state
+                # correctly recorded fp4=False.
+                and (_state.get('fp4') is None or current_fp4 is None
+                     or current_fp4 == _state['fp4'])
                 and custom_op.op_registry_oot is _state['registry']
                 and custom_op.op_registry_oot.get('SparseAttnIndexer') is _state['class']
                 and envs.environment_variables.get(_FACTOR) is policy_factor
@@ -166,21 +236,15 @@ def activate_extension(context):
         if not _is_hcu():
             return
         selected = _flag(_FLAG, default=True)
-        fp4 = fp4_selected()
+        # ``selected()`` is only the implementation knob and defaults to lightop
+        # everywhere; ``applicable(cfg)`` asks whether this deployment actually
+        # uses the MXFP4 indexer cache. Reading the knob alone sent FP8-cache
+        # deployments into the FP4 branch and failed before any weight loaded.
+        fp4 = _uses_fp4_cache()
         digest = None
         signature = None
         if fp4:
-            from . import fp4_packer
-            from .fp4_indexer_lightop import load_providers
-            from hcu_adapter import hcu_env
-            if hcu_env.resolve('HCU_VLLM_SPARSE_INDEXER_IMPL', host='vllm')[0] != 'stock':
-                raise RuntimeError('C4 and V41 FP4 cannot own the same OOT key')
-            fp4_packer.check_health()
-            if fp4_packer._state is None or fp4_packer._state['mode'] != 'triton':
-                raise RuntimeError('FP4 requires published triton lowering')
-            load_providers()
-            digest = _compute_digest()
-            signature = _digest_signature()
+            digest, signature = _prepare_fp4()
         _publishing = True
         try:
             from vllm import envs
@@ -214,12 +278,7 @@ def activate_extension(context):
                 'class': HcuV41SparseAttnIndexer, 'native': SparseAttnIndexer,
                 'forward': SparseAttnIndexer.forward_hip})
             if fp4:
-                from hcu_adapter import registry as adapter_registry
-                adapter_registry.register(
-                    op='vllm_fp4_indexer', impl='lightop',
-                    target='vllm.model_executor.layers.sparse_attn_indexer.SparseAttnIndexer',
-                    mechanism=adapter_registry.MECH_SEAM, source=__name__,
-                    detail='FP4 branch of existing V41 OOT; native/model gates pending')
+                _record_fp4()
             check_health()
         except BaseException as error:
             try:
