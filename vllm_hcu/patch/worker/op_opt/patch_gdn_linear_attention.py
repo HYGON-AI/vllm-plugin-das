@@ -21,13 +21,16 @@ from ._aiter_fla import make_aiter_gdn_resolver
 from ._boltops_fla import make_boltops_gdn_resolver
 from ._gdn_backend import (
     AITER,
+    AITER_CK,
     BOLTOPS,
     TRITON,
     aiter_input_fallback,
+    check_ck_decode_supported,
     make_provider_selector,
     record_prefill_backend,
     requested_backend,
 )
+from ._ck_gdn_decode import ck_decode_step
 from ._gdn_common import (
     normalize_nn_conv_weight,
     require_parameter_names,
@@ -140,6 +143,69 @@ def _aiter_recurrent_unsupported(arguments) -> str | None:
     if not arguments["out"].is_contiguous():
         return "a non-contiguous output buffer"
     return None
+
+
+def _ck_sigmoid_update(arguments):
+    """hcu-aiter-ck decode for fused_sigmoid_gating_delta_rule_update."""
+    if arguments["num_accepted_tokens"] is not None:
+        raise RuntimeError(
+            "hcu-aiter-ck GDN decode does not support speculative decoding"
+        )
+    indices = arguments["ssm_state_indices"]
+    cu_seqlens = arguments["cu_seqlens"]
+    if indices is None or indices.dim() != 1 or cu_seqlens is None:
+        raise RuntimeError(
+            "hcu-aiter-ck GDN decode needs 1D ssm_state_indices and cu_seqlens"
+        )
+    if not arguments["inplace_final_state"] or arguments["is_kda"]:
+        raise RuntimeError(
+            "hcu-aiter-ck GDN decode supports only in-place, non-KDA updates"
+        )
+    q, k, v = arguments["q"], arguments["k"], arguments["v"]
+    num_seqs = cu_seqlens.shape[0] - 1
+    scale = arguments["scale"]
+    out = ck_decode_step(
+        q=q[0, :num_seqs],
+        k=k[0, :num_seqs],
+        v=v[0, :num_seqs],
+        a=arguments["a"][:num_seqs],
+        b=arguments["b"][:num_seqs],
+        A_log=arguments["A_log"],
+        dt_bias=arguments["dt_bias"],
+        scale=k.shape[-1] ** -0.5 if scale is None else scale,
+        state_pool=arguments["initial_state"],
+        state_indices=indices,
+        use_qk_l2norm=arguments["use_qk_l2norm_in_kernel"],
+        num_seqs=num_seqs,
+    )
+    result = torch.zeros_like(v)
+    result[0, :num_seqs] = out
+    return result, arguments["initial_state"]
+
+
+def _ck_recurrent_update(arguments):
+    """hcu-aiter-ck decode for fused_recurrent_gated_delta_rule_packed_decode."""
+    mixed = arguments["mixed_qkv"]
+    state = arguments["initial_state"]
+    out = arguments["out"]
+    num_seqs = mixed.shape[0]
+    hv, v_dim, k_dim = state.shape[-3:]
+    h = (mixed.shape[1] - hv * v_dim) // 2 // k_dim
+    q = mixed[:, : h * k_dim].reshape(num_seqs, h, k_dim)
+    k = mixed[:, h * k_dim : 2 * h * k_dim].reshape(num_seqs, h, k_dim)
+    v = mixed[:, 2 * h * k_dim :].reshape(num_seqs, hv, v_dim)
+    result = ck_decode_step(
+        q=q, k=k, v=v,
+        a=arguments["a"], b=arguments["b"],
+        A_log=arguments["A_log"], dt_bias=arguments["dt_bias"],
+        scale=arguments["scale"],
+        state_pool=state,
+        state_indices=arguments["ssm_state_indices"],
+        use_qk_l2norm=arguments["use_qk_l2norm_in_kernel"],
+        num_seqs=num_seqs,
+    )
+    out.copy_(result.view(out.shape))
+    return out, state
 
 
 def apply_to_module(module: ModuleType) -> bool:
@@ -286,6 +352,8 @@ def apply_to_module(module: ModuleType) -> bool:
     def hcu_sigmoid_update(*args, **kwargs):
         bound = sigmoid_signature.bind(*args, **kwargs)
         bound.apply_defaults()
+        if requested_backend("decode") == AITER_CK:
+            return _ck_sigmoid_update(bound.arguments)
         provider, kernel = select_sigmoid()
         if provider == AITER:
             reason = _aiter_sigmoid_unsupported(bound.arguments)
@@ -306,6 +374,8 @@ def apply_to_module(module: ModuleType) -> bool:
     def hcu_recurrent_update(*args, **kwargs):
         bound = recurrent_signature.bind(*args, **kwargs)
         bound.apply_defaults()
+        if requested_backend("decode") == AITER_CK:
+            return _ck_recurrent_update(bound.arguments)
         provider, kernel = select_recurrent()
         if provider == AITER:
             reason = _aiter_recurrent_unsupported(bound.arguments)
@@ -391,6 +461,7 @@ def apply_to_module(module: ModuleType) -> bool:
             # Capture --gdn-prefill-backend while layers are constructed so
             # the FLA kernel patches can select their provider later.
             record_prefill_backend(vllm_config)
+            check_ck_decode_supported(vllm_config)
             return official_resolver(vllm_config)
 
         setattr(hcu_resolve_gdn_prefill_backend, _PREFILL_WRAPPER, True)
