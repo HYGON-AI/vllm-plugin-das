@@ -225,7 +225,7 @@ _FP4_BACKBONE_INIT = _constructor(_BACKBONE_NATIVE, _REVIEWED[1],
                                  {'DeepseekV4DecoderLayer': HcuV41Fp4DecoderLayer})
 
 
-class HcuV41Fp4Backbone(native.DeepseekV4Model):
+class HcuV41Fp4Backbone(HcuV41PcpBackbone):
     __init__ = _FP4_BACKBONE_INIT
 
 

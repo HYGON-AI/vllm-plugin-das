@@ -23,6 +23,34 @@ def pcp_config(cfg):
     return cfg
 
 
+@pytest.mark.parametrize('pcp_width', [1, 8])
+def test_fp4_backbone_uses_supported_decoder_swa_replay_gate(chain, pcp_width):
+    from hcu_vllm_das.models import v41_pcp as models
+
+    cfg = pcp_config(chain.cfg)
+    cfg.parallel_config.prefill_context_parallel_size = pcp_width
+    cfg.parallel_config.use_ubatching = False
+    cfg.cache_config.swa_bounded_replay = True
+    backbone = NS(start_layer=0, end_layer=40, use_sequence_parallel=False,
+                  config=NS(num_hidden_layers=40, sliding_window=128,
+                            engram_layer_ids=[]))
+    assert models.HcuV41Fp4Backbone._decoder_replay_supported(backbone, cfg, 36)
+
+
+@pytest.mark.parametrize('unsupported', ['sequence_parallel', 'microbatch', 'late_engram'])
+def test_fp4_decoder_swa_replay_keeps_existing_restrictions(chain, unsupported):
+    from hcu_vllm_das.models import v41_pcp as models
+
+    cfg = pcp_config(chain.cfg)
+    cfg.parallel_config.use_ubatching = unsupported == 'microbatch'
+    cfg.cache_config.swa_bounded_replay = True
+    backbone = NS(start_layer=0, end_layer=40,
+                  use_sequence_parallel=unsupported == 'sequence_parallel',
+                  config=NS(num_hidden_layers=40, sliding_window=128,
+                            engram_layer_ids=[37] if unsupported == 'late_engram' else []))
+    assert not models.HcuV41Fp4Backbone._decoder_replay_supported(backbone, cfg, 36)
+
+
 def test_pcp8_without_speculation_and_fp8_route_unchanged(chain, monkeypatch):
     cfg = pcp_config(chain.cfg)
     assert validate_config(cfg) and v41_pcp.validate_config(cfg)
