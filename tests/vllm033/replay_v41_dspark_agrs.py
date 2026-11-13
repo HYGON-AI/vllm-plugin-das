@@ -20,7 +20,8 @@ from vllm.distributed import parallel_state
 from vllm.distributed.device_communicators import all2all as native_a2a
 from vllm.model_executor.layers.fused_moe.prepare_finalize import naive_dp_ep as naive
 from vllm.model_executor.layers.fused_moe.config import FusedMoEQuantConfig
-from hcu_vllm_das.models.dsv41_dspark import HcuDSparkDeepseekV41ForCausalLM,NativeDSpark
+from hcu_vllm_das.models.dsv41_dspark import HcuDSparkDeepseekV41ForCausalLM
+from vllm.models.deepseek_v41.amd.dspark import DSparkDeepseekV4ForCausalLM as NativeDSpark
 from hcu_vllm_das.quantization.ct_w4a8_method import HcuCTW4A8MoEMethod
 from hcu_adapter.extensions import ExtensionContext
 try:
