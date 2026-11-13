@@ -8,6 +8,7 @@ explicit ``apply(module=None)`` convenience entry point.
 """
 
 from . import (
+    patch_batch_invariant_stages,
     patch_deepseek_v32_config,
     patch_deepseek_v4_attention,
     patch_deepseek_v4_pcp,
@@ -47,6 +48,7 @@ from . import (
 )
 
 __all__ = [
+    "patch_batch_invariant_stages",
     "patch_deepseek_v32_config",
     "patch_deepseek_v4_attention",
     "patch_deepseek_v4_pcp",
