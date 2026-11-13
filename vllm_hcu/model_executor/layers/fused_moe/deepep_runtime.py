@@ -957,6 +957,60 @@ def ll_init(
     self._hcu_low_latency_cleanup_topk = _has_topk_low_latency_cleanup_abi(buffer)
 
 
+def configure_step5_ll_tp_tokens(prepare, moe):
+    """Install the TP adapter after the HCU FP8 dispatch decision."""
+    if henvs.optional_custom_op_enabled(
+        os.environ.get("HCU_STEP5_DEEPEP_TP_TOKENS") == "1"
+    ):
+        from vllm.config import get_current_vllm_config_or_none
+        from vllm_hcu.runtime_compat.step5 import is_step5_config
+
+        config = get_current_vllm_config_or_none()
+        if config is None or not is_step5_config(config):
+            return
+        parallel = config.parallel_config
+        if not (
+            prepare.num_dispatchers_ == 8
+            and parallel.tensor_parallel_size == 4
+            and parallel.data_parallel_size == parallel.data_parallel_size_local == 2
+            and parallel.all2all_backend == "deepep_low_latency"
+            and not parallel.use_ubatching
+            and int(os.environ.get("HCU_DBO_MIN_TOKENS", "0")) == 0
+            and not moe.is_sequence_parallel
+            and moe.hidden_dim == 4096
+            and moe.num_experts == 352
+            and prepare.use_fp8_dispatch
+            and prepare._hcu_low_latency_dispatch_abi
+            and os.environ.get("HCU_STEP5_DEEPEP_SWIGLUSTEP") == "1"
+        ):
+            raise ValueError(
+                "Step5 LL token partition requires single-node TP4/DP2/EP8, "
+                "FP8 SwiGLUStep, the HCU DeepEP ABI, and DBO disabled"
+            )
+        from .step5_ll_tp_tokens import Step5LLTPTokenBuffer
+
+        buffer = prepare.buffer
+        proxy = getattr(buffer, "_hcu_step5_tp_tokens_proxy", None)
+        if proxy is None:
+            proxy = Step5LLTPTokenBuffer(
+                buffer, prepare.max_tokens_per_rank, moe.hidden_dim
+            )
+            buffer._hcu_step5_tp_tokens_proxy = proxy
+        prepare.buffer = proxy
+        prepare._hcu_step5_tp_tokens = True
+    if henvs.optional_custom_op_enabled(
+        os.environ.get("HCU_STEP5_DEEPEP_TP_TOKENS") == "1"
+    ):
+        if num_dispatchers != 8 or os.environ.get("HCU_STEP5_DEEPEP_SWIGLUSTEP") != "1":
+            raise ValueError("Step5 LL token partition requires EP8 and Step5 activation")
+        from .step5_ll_tp_tokens import Step5LLTPTokenBuffer
+        proxy = getattr(buffer, "_hcu_step5_tp_tokens_proxy", None)
+        if proxy is None:
+            proxy = Step5LLTPTokenBuffer(buffer, max_tokens_per_rank, 4096)
+            buffer._hcu_step5_tp_tokens_proxy = proxy
+        self.buffer = proxy
+
+
 def ll_do_quant(module, self, x, a1_dtype, quant_config, expert_num_tokens=None):
     if self.use_fp8_dispatch:
         block_k = (
@@ -1049,6 +1103,8 @@ def ll_receiver(
         expert_num_tokens=expert_num_tokens,
         expert_num_tokens_cpu=None,
     )
+    if getattr(self, "_hcu_step5_tp_tokens", False):
+        expert_tokens_meta._hcu_step5_tp_tokens = True
     return expert_x, expert_x_scale, expert_tokens_meta, None, None
 
 

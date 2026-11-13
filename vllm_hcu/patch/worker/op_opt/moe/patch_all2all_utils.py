@@ -168,6 +168,11 @@ def apply_to_module(module: ModuleType) -> bool:
             raise RuntimeError("DeepEP LL cannot enable FP8 and INT8 dispatch together")
         prepare_finalize.use_fp8_dispatch = use_fp8
         prepare_finalize.use_int8_dispatch = use_int8
+        from vllm_hcu.model_executor.layers.fused_moe.deepep_runtime import (
+            configure_step5_ll_tp_tokens,
+        )
+
+        configure_step5_ll_tp_tokens(prepare_finalize, moe)
         return prepare_finalize
 
     @functools.wraps(roundup)

@@ -524,6 +524,12 @@ class BatchedDeepGemmExperts(mk.FusedMoEExpertsModular):
         # the module-exchange contract pins every public method's args AST
         # to the v0.25.1 surface (test_module_exchange signature gate).
         self._hcu_expected_m_local_tokens = topk_ids.size(0)
+        if (
+            getattr(expert_tokens_meta, "_hcu_step5_tp_tokens", False)
+            and self._hcu_expected_m_local_tokens > 0
+            and self._hcu_expected_m_local_tokens % 4 == 0
+        ):
+            self._hcu_expected_m_local_tokens //= 4
         expected_m = self.estimate_expected_m(
             global_num_experts=global_num_experts,
             max_tokens_per_expert=max_num_tokens,
