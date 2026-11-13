@@ -27,14 +27,14 @@ class AdapterContractError(RuntimeError):
     """The installed adapter does not provide a seam this plugin revision needs."""
 
 
-def _seam_modules():
-    """Import the adapter modules the seam table covers, naming any that is absent."""
+def _seam_modules(names=_SEAM_MODULES):
+    """Import only the requested adapter owners, naming any that is absent."""
     from importlib import import_module
 
     import hcu_adapter
 
     modules, missing = {}, []
-    for name in _SEAM_MODULES:
+    for name in names:
         try:
             modules[name] = import_module("hcu_adapter." + name)
         except ModuleNotFoundError as error:
@@ -50,6 +50,21 @@ def _seam_modules():
             + "; ".join(missing)
         )
     return modules
+
+
+def activation_owner(name):
+    """Check the discovery-time binder without importing framework providers.
+
+    The complete provider contract is checked by bind_dsv41/bind_ct_w4a8 at
+    activation. Discovery needs only the framework-free activation owner.
+    """
+    module = _seam_modules((name,))[name]
+    if not callable(getattr(module, "set_provider_binder", None)):
+        raise AdapterContractError(
+            "hcu_vllm_das plugin requires a newer hcu_adapter; missing: "
+            f"{module.__name__}.set_provider_binder -- activation binder"
+        )
+    return module
 
 
 def _required_seams(modules):

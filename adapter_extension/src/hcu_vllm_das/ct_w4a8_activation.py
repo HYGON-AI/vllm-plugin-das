@@ -22,15 +22,11 @@ def _bind_providers() -> None:
     _seams.bind_ct_w4a8()
 
 
-from hcu_vllm_das._seams import require_adapter_seams  # noqa: E402
+from hcu_vllm_das._seams import activation_owner  # noqa: E402
 
-# Import-time binding is the earliest point that touches an adapter seam, so the
-# contract check has to run here rather than inside `bind_ct_w4a8()`. The adapter
-# module is imported *after* the check: importing it first would raise
-# ModuleNotFoundError on a mixed revision pair, before this file could name the
-# missing module as a contract violation.
-require_adapter_seams()
-from hcu_adapter import ct_w4a8_registration as _impl  # noqa: E402
+# Check only the framework-free binder here. Full provider checks run when the
+# binder is invoked at activation, inside the framework.
+_impl = activation_owner("ct_w4a8_registration")
 
 _impl.set_provider_binder(_bind_providers)
 
