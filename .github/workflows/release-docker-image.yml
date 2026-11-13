@@ -32,7 +32,7 @@ jobs:
     # 需要能访问内网 pip 源 / AICC 下载地址 / Harbor 的自托管构建节点
     # 加镜像目标 = 改下面矩阵; image/DTK 版本号/输出 tag 全部按矩阵字段拼接,
     # 镜像总表格式: ${HARBOR_SITE}/hcu/base/dtk:<DTK版本>-<OS>-py<Python版本>
-    runs-on: bw1100
+    runs-on: hygon-image-build
     strategy:
       fail-fast: false
       matrix:
