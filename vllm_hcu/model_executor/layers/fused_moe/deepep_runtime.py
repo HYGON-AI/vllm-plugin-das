@@ -119,8 +119,18 @@ def configure_step5_ht_kernel(kernel, moe_quant_config, moe_config):
         prepare._hcu_step5_profile_dbo_output_requested = bool(owner and configured_dbo)
         prepare._hcu_step5_runtime_tuning_allowed = bool(owner)
         if owner and configured_dbo and os.environ.get("HCU_STEP5_DEEPEP_DBO_BUFFER_PAIR", "0") == "1":
-            if prepare.num_dispatchers_ not in (8, 16) or os.environ.get("DEEP_EP_NORMAL_MNVL") != "1":
-                raise ValueError("Step5 DeepEP buffer-pair overlap requires EP8/EP16 NORMAL MNVL")
+            single_node_ep8 = (
+                prepare.num_dispatchers_ == 8
+                and config is not None
+                and config.parallel_config.data_parallel_size == 8
+                and config.parallel_config.data_parallel_size_local == 8
+                and config.parallel_config.tensor_parallel_size == 1
+                and os.environ.get("VLLM_DEEPEP_HIGH_THROUGHPUT_FORCE_INTRA_NODE") == "1"
+            )
+            if prepare.num_dispatchers_ not in (8, 16) or (
+                os.environ.get("DEEP_EP_NORMAL_MNVL") != "1" and not single_node_ep8
+            ):
+                raise ValueError("Step5 DeepEP buffer-pair overlap requires EP8/EP16 NORMAL MNVL or local EP8 intranode")
             fused_scatter_requested = os.environ.get("HCU_STEP5_DEEPEP_FUSED_SCATTER", "0") == "1"
             if fused_scatter_requested:
                 if not (
@@ -585,8 +595,14 @@ def ht_do_dispatch(
             # final Gather use into DeepEP's own stream before any overwrite.
             module.torch.cuda.current_stream().wait_event(guard["last_use"])
             dispatch_previous_event = buffer.capture()
+        intranode_ep8 = (
+            self.num_dispatchers_ == 8
+            and os.environ.get("VLLM_DEEPEP_HIGH_THROUGHPUT_FORCE_INTRA_NODE") == "1"
+            and os.environ.get("DEEP_EP_NORMAL_MNVL") != "1"
+        )
         scatter_kwargs = dict(scatter_x=sx, scatter_x_scales=ss,
-                              scatter_output_index=si, scatter_m_indices=sm)
+                              scatter_output_index=si,
+                              scatter_m_indices=None if intranode_ep8 else sm)
     dispatch = buffer.dispatch_scatter if fused_scatter else buffer.dispatch
     (
         token_data,
@@ -705,6 +721,16 @@ def ht_receiver(
             raise ValueError("Step5 fused scatter requires aligned counts for every local expert")
         rows = sum(counts)
         sx, ss, si, sm = self._hcu_step5_scatter_buffers[(id(self.buffer), ubatch_id)]
+        if (
+            self.num_dispatchers_ == 8
+            and os.environ.get("VLLM_DEEPEP_HIGH_THROUGHPUT_FORCE_INTRA_NODE") == "1"
+            and os.environ.get("DEEP_EP_NORMAL_MNVL") != "1"
+        ):
+            local_expert_ids = module.torch.arange(len(counts), device=expert_x.device, dtype=module.torch.int32)
+            indices = module.torch.repeat_interleave(
+                local_expert_ids, expert_tokens_meta.expert_num_tokens, output_size=rows,
+            )
+            sm.resize_(rows).copy_(indices)
         for tensor in (sx, ss, si, sm):
             tensor.record_stream(module.torch.cuda.current_stream())
         expert_tokens_meta._hcu_step5_fused_scatter = (sx[:rows], ss[:rows], sm[:rows], si)
