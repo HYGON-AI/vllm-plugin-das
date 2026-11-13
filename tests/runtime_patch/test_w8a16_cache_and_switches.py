@@ -1,8 +1,7 @@
 # SPDX-License-Identifier: Apache-2.0
 """W8A16 dequant-cache keying, switch gating and lm_head memory headroom.
 
-Lives under tests/runtime_patch (not tests/ root, where the earlier
-test_review_round*.py files sit) because CONTRACT_TESTS in
+Lives under tests/runtime_patch because CONTRACT_TESTS in
 tools/run_patch_tests.py only selects tests/patch, tests/runtime_patch,
 tests/accuracy and tests/gemma4_test -- a file at the tests/ root is never
 run by the contract job.

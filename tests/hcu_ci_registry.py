@@ -620,3 +620,8 @@ register_hcu_ci(
     target="tests/runtime_patch/test_prefill_batching.py",
     est_time=60,
 )
+register_hcu_ci(
+    job="contract-hcu-gfx936",
+    target="tests/runtime_patch/test_modelopt_w8a16_marlin_preshuffle.py",
+    est_time=60,
+)

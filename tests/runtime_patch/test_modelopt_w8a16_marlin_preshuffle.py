@@ -9,6 +9,12 @@ the large-M dequant + rocBLAS path) must still match the raw-layout result.
 import pytest
 import torch
 
+# Marked hcu so the contract-hcu job (which has real hardware) selects these
+# cases.  Without the marker the module is deselected there by `-m hcu`, while
+# the plain contract job runs with no GPU and module-skips below -- so every
+# case here would run in no CI job at all.
+pytestmark = pytest.mark.hcu
+
 if not torch.cuda.is_available():
     pytest.skip("requires a GPU", allow_module_level=True)
 deepgemm = pytest.importorskip("deepgemm")
