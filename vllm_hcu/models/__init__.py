@@ -3,10 +3,23 @@
 # SPDX-FileCopyrightText: Copyright (c) 2026 Hygon Information Technology Co., Ltd.
 # Modified by Hygon Information Technology Co., Ltd., 2026.
 
+import os
+
 from vllm import ModelRegistry
+
+from vllm_hcu.platforms import envs as henvs
 
 
 def register_model():
+    if henvs.custom_ops_enabled():
+        gemma4_fa = os.environ.get("VLLM_HCU_GEMMA4_USE_FA", "0").strip().lower()
+        if gemma4_fa not in {"0", "1", "false", "true"}:
+            raise ValueError("VLLM_HCU_GEMMA4_USE_FA must be 0/1 or false/true")
+        if gemma4_fa in {"1", "true"}:
+            from vllm_hcu.models.gemma4 import register_attention
+
+            register_attention()
+
     ModelRegistry.register_model(
         "DeepseekV3ForCausalLM", "vllm_hcu.models.deepseek_v2:DeepseekV3ForCausalLM"
     )
