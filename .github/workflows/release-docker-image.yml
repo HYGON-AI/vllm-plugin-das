@@ -7,7 +7,7 @@ on:
   workflow_dispatch:
     inputs:
       run_test:
-        description: 构建完成并推送后, 自动调用 ci-model-test 对本次镜像跑 Cookbook 部署测试
+        description: 构建完成并推送后, 自动触发 test-docker-image-daily 对该镜像跑 CItest
         required: false
         default: true
         type: boolean
@@ -23,36 +23,53 @@ env:
   HARBOR_SITE: ${{ vars.HARBOR_SITE }}
   HARBOR_NAMESPACE: jenkins/model_test_env
   HCU_CI_IMAGE: ${{ vars.HCU_CI_IMAGE }}
-  # 从 dev 基础镜像内联安装 DTK (不再依赖预装 DTK 的基础镜像), 便于按次换 DTK 包;
-  # 归档站地址走 RESOURCE_SERVER_URL 变量, 不在文件里暴露内网 IP
-  BASE_IMAGE: ${{ vars.DEV_IMAGE_UBUNTU_PY310 || 'harbor.sourcefind.cn:5443/dcu/admin/base/dev:ubuntu22.04-mpi5.0-gcc11.4-cmake3.29-py3.10' }}
-  DTK_PKG_URL: ${{ vars.DTK_PKG_URL || format('{0}/dtk-pkg/dtk26.04.1/DTK-26.04.1-72cu-0911-ubuntu20.04-x86_64.tar.gz', vars.RESOURCE_SERVER_URL) }}
-  DTK_VERSION: "dtk26041-72cu-0911"
   PYPI_URL: ${{ vars.PYPI_URL }}
   RESOURCE_SERVER_URL: ${{ vars.RESOURCE_SERVER_URL }}
   VLLM_VERSION: "0.25.1"
-  TORCH_VERSION: "2.11.0"
 
 jobs:
   build:
     # 需要能访问内网 pip 源 / AICC 下载地址 / Harbor 的自托管构建节点
-    runs-on:
-      - ci
-      - bw1100
+    # 加镜像目标 = 改下面矩阵; image/DTK 版本号/输出 tag 全部按矩阵字段拼接,
+    # 镜像总表格式: ${HARBOR_SITE}/hcu/base/dtk:<DTK版本>-<OS>-py<Python版本>
+    runs-on: hygon-image-build
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - dtk_tag: "26.04.1"
+            os_tag: "ubuntu22.04"
+            python_version: "3.10"
+            torch_version: "2.11.0"
+            # AICC 大版本, 安装脚本 --major 装该版本中日期最新的包 (26.04 段为 1.0.0)
+            aicc_major: "1.0.0"
+            # blas cut 版本, 安装脚本按版本+os 拉归档最新包覆盖到 /opt/dtk
+            blas_cut_version: "26.04"
+    # 矩阵各分支写同名 output 只保留最后一个值; 当前矩阵仅一项,
+    # 增加镜像目标时需把下游 test-image/validate-image 改为按矩阵扇出
     outputs:
       docker_image: ${{ steps.gen-tag.outputs.docker_image }}
+    env:
+      # 直接基于预装 DTK 的基础镜像构建, CI 内不再安装 DTK
+      BASE_IMAGE: ${{ vars.DTK_BASE_IMAGE || format('{0}/hcu/base/dtk:{1}-{2}-py{3}', vars.HARBOR_SITE, matrix.dtk_tag, matrix.os_tag, matrix.python_version) }}
+      TORCH_VERSION: ${{ matrix.torch_version }}
     steps:
       - name: Checkout
         uses: actions/checkout@v4
 
       - name: 生成镜像 tag
         id: gen-tag
+        env:
+          DTK_TAG_NO_DOT: ${{ matrix.dtk_tag }}
         run: |
+          DTK_TAG_NO_DOT="${DTK_TAG_NO_DOT//./}"
           BUILD_TIME=$(date +"%Y%m%d-%H%M")
+          # BUILD_TIME: 传给 Dockerfile 生成 /etc/image.info 的 built 段, 与产物 tag 时间段一致
+          echo "BUILD_TIME=${BUILD_TIME}" >> "$GITHUB_ENV"
           BASE_VERSION=$(grep -oP '__version__ = "\K[^"]+' vllm_hcu/version.py)
-          echo "IMAGE_TAG=vllm:${BASE_VERSION}-ubuntu22.04-dtk26041-py3.10-${BUILD_TIME}" >> "$GITHUB_ENV"
+          echo "IMAGE_TAG=vllm:${BASE_VERSION}-${{ matrix.os_tag }}-dtk${DTK_TAG_NO_DOT}-py${{ matrix.python_version }}-${BUILD_TIME}" >> "$GITHUB_ENV"
           echo "LATEST_TAG=vllm:${BASE_VERSION}-latest" >> "$GITHUB_ENV"
-          echo "docker_image=${HARBOR_SITE}/${HARBOR_NAMESPACE}/vllm:${BASE_VERSION}-ubuntu22.04-dtk26041-py3.10-${BUILD_TIME}" >> "$GITHUB_OUTPUT"
+          echo "docker_image=${HARBOR_SITE}/${HARBOR_NAMESPACE}/vllm:${BASE_VERSION}-${{ matrix.os_tag }}-dtk${DTK_TAG_NO_DOT}-py${{ matrix.python_version }}-${BUILD_TIME}" >> "$GITHUB_OUTPUT"
 
       - name: 登录 Harbor
         uses: docker/login-action@v3
@@ -71,13 +88,13 @@ jobs:
             -t "${FULL_TAG}" \
             -t "${FULL_LATEST_TAG}" \
             --build-arg "BASE_IMAGE=${BASE_IMAGE}" \
-            --build-arg "DTK_PKG_URL=${DTK_PKG_URL}" \
-            --build-arg "DTK_VERSION=${DTK_VERSION}" \
+            --build-arg "AICC_MAJOR=${{ matrix.aicc_major }}" \
+            --build-arg "BLAS_CUT_VERSION=${{ matrix.blas_cut_version }}" \
             --build-arg "PYPI_URL=${PYPI_URL}" \
             --build-arg "RESOURCE_SERVER_URL=${RESOURCE_SERVER_URL}" \
             --build-arg "VLLM_VERSION=${VLLM_VERSION}" \
             --build-arg "TORCH_VERSION=${TORCH_VERSION}" \
-            --build-arg "IMAGE_TAG=${FULL_TAG}" \
+            --build-arg "BUILD_TIME=${BUILD_TIME}" \
             -f docker/Dockerfile \
             .
 
@@ -86,28 +103,55 @@ jobs:
           docker push "${HARBOR_SITE}/${HARBOR_NAMESPACE}/${IMAGE_TAG}"
           docker push "${HARBOR_SITE}/${HARBOR_NAMESPACE}/${LATEST_TAG}"
 
-      # 自托管构建机磁盘有限, 推送成功后删除本地镜像释放空间;
-      # 下游 validate-image 会自行从 Harbor 重新拉取, 不依赖本机镜像
-      - name: 删除本地镜像
+      # 登记镜像记录(DashHub, 同 ciimage 的 record 口径): docker run 用产物镜像本身起
+      # 临时容器(与 build 同一 runner, 天然主机亲和, 不用镜像不存在/多 runner 拉副本的
+      # 问题), 容器里补装 cinotificate 后执行 --record_image; 上报哪个镜像以 -e
+      # IMAGE_TAG 现配传入(镜像内没有烙该 ENV); 失败仅告警不阻断, 可稍后手动重试
+      - name: 登记镜像记录(record)
+        continue-on-error: true
+        timeout-minutes: 10
         run: |
-          docker rmi "${HARBOR_SITE}/${HARBOR_NAMESPACE}/${IMAGE_TAG}" \
-                    "${HARBOR_SITE}/${HARBOR_NAMESPACE}/${LATEST_TAG}" \
-          || echo "删除本地镜像失败(可能被其他容器 job 占用), 可稍后手动清理"
+          FULL_TAG="${HARBOR_SITE}/${HARBOR_NAMESPACE}/${IMAGE_TAG}"
+          # 0.25 镜像基于 DTK 26.04, cinotificate 走 dtk2604 nightly 归档
+          PYPI_HOST="${PYPI_URL#*://}"; PYPI_HOST="${PYPI_HOST%%/*}"; PYPI_HOST="${PYPI_HOST%%:*}"
+          docker run --rm --network=host \
+            -e "IMAGE_TAG=${FULL_TAG}" \
+            --entrypoint /bin/bash "${FULL_TAG}" -c "
+              set -e
+              pip install cinotificate \
+                -i '${PYPI_URL}/nightly/dtk2604/+simple/' \
+                --trusted-host '${PYPI_HOST}'
+              CInotificate --record_image
+            "
+
+      # 自托管构建机磁盘有限, record 完删除本地镜像释放空间;
+      # 下游 validate-image 会自行从 Harbor 重新拉取, 不依赖本机镜像。
+      # if: always(): job 被 concurrency 取消时(continue-on-error 不覆盖取消语义)
+      # 默认 success() 会跳过本步骤, 构建机将残留全部镜像层; 先杀掉可能存活的 record 容器再删镜像
+      - name: 删除本地镜像
+        if: always()
+        run: |
+          docker ps --filter "ancestor=${HARBOR_SITE}/${HARBOR_NAMESPACE}/${IMAGE_TAG}" -q \
+            | xargs -r docker rm -f \
+            || true
+          if ! docker rmi "${HARBOR_SITE}/${HARBOR_NAMESPACE}/${IMAGE_TAG}" \
+                         "${HARBOR_SITE}/${HARBOR_NAMESPACE}/${LATEST_TAG}"; then
+            echo "::warning::删除本地镜像失败(可能被其他容器 job 占用), 磁盘有限请稍后手动清理: ${HARBOR_SITE}/${HARBOR_NAMESPACE}/${IMAGE_TAG}"
+          fi
 
       # 其他容器 job 会以 root 在共享 workspace 留下文件, 导致下次 checkout 清理失败
       - name: 清理 workspace
         if: always()
         run: rm -rf "${GITHUB_WORKSPACE}"/* "${GITHUB_WORKSPACE}"/.[!.]* || true
 
-  # 镜像推送成功后, 对本次构建的具体镜像并行跑 Cookbook 模型测试与镜像校验,
-  # 两个测试 job 只依赖 build, 互不等待互不阻断
+  # 镜像推送成功后, 对本次构建的具体镜像并行跑 CItest 与冒烟校验,
+  # 两个测试 job 按 build 矩阵展开, 每个镜像独立校验, 互不等待互不阻断
   test-image:
     if: github.event.inputs.run_test != 'false'
     needs: build
-    uses: ./.github/workflows/cookbook-deployment-smoke.yml
+    uses: ./.github/workflows/daily-test-docker-image.yml
     with:
-      image: ${{ needs.build.outputs.docker_image }}
-      mode: execute
+      docker_image: ${{ needs.build.outputs.docker_image }}
     secrets: inherit
 
   validate-image:
