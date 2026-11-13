@@ -65,6 +65,10 @@ profiles:
         - triton
         - --speculative-config
         - '{"method":"dspark","num_speculative_tokens":7,"draft_sample_method":"probabilistic"}'
+        # DSpark's TP8 communication path is not FULL-capture safe on ROCm;
+        # retain PIECEWISE graph acceleration without entering FULL capture.
+        - --compilation-config
+        - '{"cudagraph_mode":"PIECEWISE"}'
     evalscope:
       work_dir: /tmp/vllm-hcu-evalscope/deepseek_v4_flash_0731_dspark_tp8
 
@@ -95,6 +99,10 @@ profiles:
         - aiter
         - --speculative-config
         - '{"method":"dspark","num_speculative_tokens":7,"draft_sample_method":"probabilistic"}'
+        # DSpark's TP8 communication path is not FULL-capture safe on ROCm;
+        # retain PIECEWISE graph acceleration without entering FULL capture.
+        - --compilation-config
+        - '{"cudagraph_mode":"PIECEWISE"}'
     evalscope:
       work_dir: /tmp/vllm-hcu-evalscope/deepseek_v4_flash_0731_dspark_tp8_aiter
 
