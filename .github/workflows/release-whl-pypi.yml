@@ -24,30 +24,16 @@ env:
 jobs:
   compile:
     name: compile (dtk${{ matrix.dtk_tag }}-py${{ matrix.python_version }}-torch${{ matrix.torch_version }})
-    runs-on:
-      - ci
-      - self-hosted
+    runs-on: hygon-build
     strategy:
       fail-fast: false
       matrix:
         include:
-          - dtk_tag: "26.04"
-            python_version: "3.10"
-            torch_version: "2.11.0"
-          - dtk_tag: "26.04"
-            python_version: "3.12"
-            torch_version: "2.11.0"
           - dtk_tag: "26.10"
             python_version: "3.12"
             torch_version: "2.11.0"
     container:
       image: ${{ vars.HARBOR_SITE }}/hcu/base/dtk:${{ matrix.dtk_tag }}-rockylinux8.6-py${{ matrix.python_version }}
-      options: >-
-        --volume /opt/hyhal:/opt/hyhal:ro
-        --device /dev/kfd:/dev/kfd
-        --device /dev/dri:/dev/dri
-        --cap-add=SYS_PTRACE
-        --privileged
     steps:
       - name: Checkout
         uses: actions/checkout@v4
