@@ -8,6 +8,31 @@ from weakref import ref
 import torch
 
 
+def validate_hyv4_vl_mtp(config):
+    speculative = config.speculative_config
+    if speculative is None:
+        return
+    parallel = config.parallel_config
+    if speculative.method == "mtp":
+        if parallel.prefill_context_parallel_size == 16:
+            return
+        model = config.model_config
+        raw = getattr(getattr(model, "hf_config", None), "quantization_config", None)
+        if (
+            isinstance(raw, dict) and raw.get("format") == "float-quantized"
+            and getattr(model, "quantization", None) == "compressed-tensors"
+            and parallel.prefill_context_parallel_size == 1
+            and parallel.data_parallel_size == 16 and parallel.enable_expert_parallel
+            and parallel.tensor_parallel_size == parallel.pipeline_parallel_size == 1
+            and parallel.decode_context_parallel_size == 1
+            and parallel.all2all_backend == "deepep_low_latency"
+            and config.kernel_config.moe_backend == "deep_gemm"
+        ):
+            return
+    raise ValueError("HYV4-VL requires native PCP16 MTP or FP8 DP16/EP16 "
+                     "DeepEP low-latency MTP")
+
+
 def account_hyv4_vl_state_memory(runner):
     """Add retained MM-state torch bytes before worker profiling snapshots.
 
@@ -65,12 +90,7 @@ def profile_hyv4_vl_vision(runner):
         raise ValueError("HYV4-VL MRV2 requires skip_mm_profiling=False")
     if mm_config.enable_mm_embeds:
         raise ValueError("HYV4-VL MRV2 profiling supports image inputs only")
-    speculative = runner.vllm_config.speculative_config
-    if speculative is not None and (
-        speculative.method != "mtp"
-        or runner.vllm_config.parallel_config.prefill_context_parallel_size != 16
-    ):
-        raise ValueError("HYV4-VL MRV2 profiling supports only native PCP16 MTP")
+    validate_hyv4_vl_mtp(runner.vllm_config)
     accounted = getattr(runner, "_hcu_vl_accounted_state", None)
     if accounted is None or accounted() is not runner.model_state:
         raise ValueError("HYV4-VL state memory must be accounted before worker profiling")
