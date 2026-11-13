@@ -959,3 +959,75 @@ def test_lightop_deepseek_v4_fused_insert_updates_q_and_cache() -> None:
         token_scales = raw_cache[scale_start : scale_start + 8]
         assert torch.all(token_data == sentinel)
         assert torch.all(token_scales == sentinel)
+
+
+@pytest.mark.parametrize(
+    ("rows", "columns", "dtype"),
+    [
+        (1, 256, torch.bfloat16),
+        (8, 512, torch.float16),
+        (4, 1024, torch.bfloat16),
+    ],
+)
+def test_hcu_sigmoid_mul_matches_float32_reference(
+    rows: int, columns: int, dtype: torch.dtype
+) -> None:
+    device = _hcu_device()
+    from vllm_hcu.ops.sigmoid_mul import sigmoid_mul_hcu
+
+    generator = torch.Generator(device=device).manual_seed(20250815)
+    gate = torch.randn(
+        (rows, 1), generator=generator, device=device, dtype=dtype
+    )
+    value = torch.randn(
+        (rows, columns), generator=generator, device=device, dtype=dtype
+    )
+
+    # The kernel rounds the sigmoid to the storage dtype before multiplying,
+    # so the reference must too: doing the sigmoid in fp32 and casting the
+    # product is off by up to one bf16 ulp (7.8e-3) per element.
+    reference = torch.sigmoid(gate) * value
+    torch.testing.assert_close(sigmoid_mul_hcu(gate, value), reference)
+
+
+def test_hcu_sigmoid_mul_accepts_one_gate_scalar_per_row_in_3d() -> None:
+    """Rank-3 value with gate.numel() == rows broadcasts per row, not per B."""
+    device = _hcu_device()
+    from vllm_hcu.ops.sigmoid_mul import sigmoid_mul_hcu
+
+    batch, seq, hidden = 2, 8, 512
+    generator = torch.Generator(device=device).manual_seed(20250816)
+    gate = torch.randn(
+        (batch * seq, 1, 1), generator=generator, device=device,
+        dtype=torch.float16,
+    )
+    value = torch.randn(
+        (batch, seq, hidden), generator=generator, device=device,
+        dtype=torch.float16,
+    )
+
+    actual = sigmoid_mul_hcu(gate, value)
+    reference = torch.sigmoid(gate.view(batch, seq, 1)) * value
+    assert actual.shape == value.shape
+    torch.testing.assert_close(actual, reference)
+
+
+def test_hcu_sigmoid_mul_rejects_gate_shorter_than_the_row_count() -> None:
+    """A [B, 1, 1] gate for a [B, S, H] value must not reach the kernel.
+
+    The check used to compare ``gate.numel()`` against ``value.size(0)``,
+    which this shape satisfies while the kernel reads gate[B*S-1], past the
+    end of the allocation.
+    """
+    device = _hcu_device()
+    from vllm_hcu.ops.sigmoid_mul import sigmoid_mul_hcu
+
+    gate = torch.randn(
+        (2, 1, 1), device=device, dtype=torch.float16
+    )
+    value = torch.randn(
+        (2, 8, 512), device=device, dtype=torch.float16
+    )
+
+    with pytest.raises(RuntimeError, match="one scalar per value row"):
+        sigmoid_mul_hcu(gate, value)

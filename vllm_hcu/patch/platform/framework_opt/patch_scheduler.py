@@ -6,6 +6,7 @@ from __future__ import annotations
 
 import functools
 import importlib
+import time
 from types import ModuleType
 
 from ._common import (
@@ -120,6 +121,52 @@ def _install_hybrid_mamba_split_block_size(
     scheduler._mamba_block_aligned_split = _mamba_block_aligned_split
 
 
+def _install_prefill_batching(scheduler: type) -> None:
+    """Batch new prefills: hold them while at least
+    VLLM_HCU_PREFILL_BATCH_MIN_RUNNING requests are decoding, until the oldest
+    waiting request has waited VLLM_HCU_PREFILL_BATCH_WAIT_MS or
+    VLLM_HCU_PREFILL_BATCH_MIN requests are waiting.
+
+    Reuses the upstream DP prefill-throttle path (``throttle_prefills``),
+    which defers prefill compute but still schedules every decode.  Off
+    whenever the VLLM_HCU_USE_CUSTOM_OPS master switch is off.
+    """
+    import inspect
+
+    import vllm_hcu.platforms.envs as henvs
+
+    original = getattr(scheduler, "schedule", None)
+    if not callable(original):
+        return
+    try:
+        params = inspect.signature(original).parameters
+    except (TypeError, ValueError):
+        return
+    if "throttle_prefills" not in params:
+        return
+
+    @functools.wraps(original)
+    def schedule(self, throttle_prefills: bool = False):
+        wait_ms = henvs.VLLM_HCU_PREFILL_BATCH_WAIT_MS
+        if (
+            henvs.optional_custom_op_enabled(wait_ms > 0)
+            and not throttle_prefills
+            and self.running
+            and len(self.running) >= henvs.VLLM_HCU_PREFILL_BATCH_MIN_RUNNING
+        ):
+            num_waiting = len(self.waiting) + len(self.skipped_waiting)
+            min_batch = henvs.VLLM_HCU_PREFILL_BATCH_MIN
+            if num_waiting and (min_batch <= 0 or num_waiting < min_batch):
+                oldest = min(
+                    q.peek_request().arrival_time
+                    for q in (self.waiting, self.skipped_waiting) if q
+                )
+                throttle_prefills = (time.time() - oldest) * 1000.0 < wait_ms
+        return original(self, throttle_prefills)
+
+    scheduler.schedule = schedule
+
+
 def apply_to_module(module: ModuleType) -> bool:
     target = load_exact_module(TARGET_MODULE, module)
     scheduler = require_class(target, "Scheduler", TARGETS[0])
@@ -175,6 +222,7 @@ def apply_to_module(module: ModuleType) -> bool:
     _install_hybrid_mamba_split_block_size(
         scheduler, mamba_spec_type, iter_layer_specs
     )
+    _install_prefill_batching(scheduler)
     setattr(target, _MARKER, True)
     return True
 

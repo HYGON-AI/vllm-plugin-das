@@ -89,6 +89,14 @@ def hcu_environment_fingerprint() -> EnvironmentFingerprint:
     return EnvironmentFingerprint.collect_base()
 
 
+def pytest_report_header(config):
+    # Kernel-level tests depend on the exact DeepGEMM build; record it.
+    try:
+        from vllm_hcu.model_executor.layers.quantization.w8a16_gemm import (
+            _deepgemm_version)
+        return f"deepgemm: {_deepgemm_version()}"
+    except Exception:
+        return None
 @pytest.fixture(autouse=True)
 def _restore_lazy_hcu_environment_attributes():
     """Do not let setattr monkeypatches materialize lazy env values across tests."""
