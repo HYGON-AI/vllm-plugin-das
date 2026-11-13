@@ -9,6 +9,7 @@ from __future__ import annotations
 
 import functools
 import os
+from collections import OrderedDict
 
 import torch
 
@@ -150,9 +151,40 @@ def _config_override(m: int, n: int, k: int, weight_layout: int):
     return None
 
 
-# data_ptr -> (int8 weight, dequantized weight).  Holding the int8 tensor
-# keeps its storage (and therefore the key) alive.
-_DEQUANT_CACHE: dict[int, tuple[torch.Tensor, torch.Tensor]] = {}
+# (weight ptr, weight version, scale ptr, scale version, dtype, layout)
+# -> W16 weight.  The key carries the storage versions because a weight can be
+# rewritten in place (reload, adapter swap) -- shape/dtype alone would then
+# return the previous model's tensor.  dtype and weight_layout are both inputs
+# to _w8a16_dequant, so they belong in the key too.  Entries are dropped
+# wholesale by clear_dequant_cache(), which HcuGPUWorker.reload_weights calls;
+# that, not the bound below, is what keeps the cache from growing reload over
+# reload.
+#
+# The bound is only a runaway guard and is deliberately far above any real
+# working set (35B reaches ~240 entries: one per dense W8A16 linear, the MoE
+# experts take the AITER path instead).  It must stay that way: a forward pass
+# touches weights cyclically in layer order, which is the pattern LRU handles
+# worst -- if the bound ever fell below the working set the hit rate would go
+# to zero and every call would re-dequantize.  Eviction therefore warns.
+_MAX_CACHED_WEIGHTS = 4096
+_WARNED_EVICTION = [False]
+_CacheKey = tuple  # (wptr, wver, sptr, sver, dtype, layout)
+_DEQUANT_CACHE: "OrderedDict[_CacheKey, torch.Tensor]" = OrderedDict()
+# Inputs per key, so the storage stays alive (and data_ptr cannot be reused
+# by an unrelated tensor) for as long as the entry exists.
+_DEQUANT_CACHE_SRC: dict[_CacheKey,
+                         tuple[torch.Tensor, torch.Tensor]] = {}
+
+
+def clear_dequant_cache() -> None:
+    """Drop every cached dequantized weight.
+
+    Call after weights change identity (sleep/wake, adapter swap, weight
+    reload): the int8/W16 pair can be ~2.6 GB on a 35B model, and a stale
+    entry would otherwise outlive the weights it was derived from.
+    """
+    _DEQUANT_CACHE.clear()
+    _DEQUANT_CACHE_SRC.clear()
 
 
 def _cached_dequant(w, scale, dtype, weight_layout):
@@ -163,16 +195,35 @@ def _cached_dequant(w, scale, dtype, weight_layout):
     only created outside CUDA-graph capture (the eager profile run reaches
     this path with max_num_batched_tokens, so every layer is cached before
     capture and the memory is accounted for before the KV cache is sized).
+
+    The key includes ``w._version`` and the scale's pointer/version: comparing
+    shape and dtype alone would hand back the previous model's weights when
+    the same storage is rewritten in place (reload, adapter swap), producing
+    stale logits without any error.
     """
     if not henvs.optional_custom_op_enabled(henvs.VLLM_HCU_W8A16_CACHE_DEQUANT):
         return None
-    hit = _DEQUANT_CACHE.get(w.data_ptr())
-    if hit is not None and hit[0].shape == w.shape and hit[1].dtype == dtype:
-        return hit[1]
+    key = (w.data_ptr(), w._version, scale.data_ptr(), scale._version,
+           dtype, weight_layout)
+    hit = _DEQUANT_CACHE.get(key)
+    if hit is not None:
+        _DEQUANT_CACHE.move_to_end(key)
+        return hit
     if torch.cuda.is_current_stream_capturing():
         return None
     w16 = _w8a16_dequant(w, scale, dtype, weight_layout)
-    _DEQUANT_CACHE[w.data_ptr()] = (w, w16)
+    _DEQUANT_CACHE[key] = w16
+    _DEQUANT_CACHE_SRC[key] = (w, scale)
+    while len(_DEQUANT_CACHE) > _MAX_CACHED_WEIGHTS:
+        if not _WARNED_EVICTION[0]:
+            _WARNED_EVICTION[0] = True
+            logger.warning(
+                "W8A16 dequant cache exceeded %d entries and is evicting. If "
+                "the working set is larger than the bound every call will "
+                "re-dequantize; set VLLM_HCU_W8A16_CACHE_DEQUANT=0 or raise "
+                "the bound.", _MAX_CACHED_WEIGHTS)
+        stale, _ = _DEQUANT_CACHE.popitem(last=False)
+        _DEQUANT_CACHE_SRC.pop(stale, None)
     return w16
 
 

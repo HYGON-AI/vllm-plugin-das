@@ -76,7 +76,8 @@ def apply_to_module(module: ModuleType) -> bool:
                                output_quant=None, format=None,
                                layer_name=None):
         fmt = format if format is not None else self.quant_format
-        if is_hcu_w8a16_int8_channel(weight_quant, input_quant, fmt):
+        if is_hcu_w8a16_int8_channel(weight_quant, input_quant, fmt,
+                                     output_quant):
             return CompressedTensorsW8A16Hcu(layer_name=layer_name)
         return original(self, weight_quant, input_quant,
                         output_quant, format, layer_name)

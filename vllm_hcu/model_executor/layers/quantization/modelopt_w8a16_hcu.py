@@ -55,6 +55,21 @@ except ImportError:
 logger = init_logger(__name__)
 
 
+def _aiter_moe_enabled() -> bool:
+    """AITER W8A16 MoE fast path, under the HCU custom-op master switch.
+
+    Both the weight shuffle in process_weights_after_loading and the inplace
+    apply must agree on this, and both must honour VLLM_HCU_USE_CUSTOM_OPS:
+    turning the master off has to fall back to the stock vLLM MoE path even
+    when VLLM_ROCM_USE_AITER_MOE is set (upstream default).
+    """
+    if not _HAS_AITER or not envs.VLLM_ROCM_USE_AITER_MOE:
+        return False
+    import vllm_hcu.platforms.envs as henvs
+
+    return henvs.custom_ops_enabled()
+
+
 class ModelOptW8A16LinearMethod(LinearMethodBase):
     """Linear method for ModelOpt W8A16 (int8 weight, fp16/bf16 activation).
 
@@ -348,7 +363,7 @@ class ModelOptW8A16MoEMethod(FusedMoEMethodBase):
         w13_scale = w13_scale.to(dtype)
         w2_scale = w2_scale.to(dtype)
 
-        if _HAS_AITER and envs.VLLM_ROCM_USE_AITER_MOE:
+        if _aiter_moe_enabled():
             w13 = w8a16_marlin_weight_1(layer.w13_weight)
             w2 = w8a16_marlin_weight_2(layer.w2_weight)
         else:
@@ -386,7 +401,7 @@ class ModelOptW8A16MoEMethod(FusedMoEMethodBase):
         act = getattr(layer, "activation", None)
         act = act.value if hasattr(act, "value") else act
 
-        if _HAS_AITER and envs.VLLM_ROCM_USE_AITER_MOE:
+        if _aiter_moe_enabled():
             from vllm.platforms import current_platform
 
             # The inplace fast-path below overwrites `x` in place, which is only

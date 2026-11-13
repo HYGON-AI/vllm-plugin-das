@@ -25,10 +25,21 @@ logger = init_logger(__name__)
 __all__ = ["CompressedTensorsW8A16Hcu", "is_hcu_w8a16_int8_channel"]
 
 
-def is_hcu_w8a16_int8_channel(weight_quant, input_quant, format: str | None) -> bool:
+def is_hcu_w8a16_int8_channel(
+    weight_quant,
+    input_quant,
+    format: str | None,
+    output_quant=None,
+) -> bool:
     """True for compressed-tensors config parts matching ModelOpt INT8 W8A16:
-    pack-quantized, static, per-channel symmetric int8 weights, no input
-    quantization."""
+    pack-quantized, static, per-channel symmetric int8 weights, no input or
+    output quantization.
+
+    ``output_quant`` must be checked: this scheme cannot honour an output
+    quantizer, and matching such a checkpoint would silently drop its output
+    scale and return full-precision logits where the checkpoint intended
+    quantized ones.
+    """
     try:
         from compressed_tensors.config import CompressionFormat
         from compressed_tensors.quantization import QuantizationStrategy
@@ -37,6 +48,7 @@ def is_hcu_w8a16_int8_channel(weight_quant, input_quant, format: str | None) -> 
     return (
         weight_quant is not None
         and input_quant is None
+        and output_quant is None
         and format == CompressionFormat.pack_quantized.value
         and weight_quant.num_bits == 8
         and not weight_quant.dynamic

@@ -15,7 +15,11 @@ from types import ModuleType
 
 import torch
 
+from vllm.logger import init_logger
+
 from ._common import load_exact_module, require_class, require_unpatched
+
+logger = init_logger(__name__)
 
 TARGET_MODULE = "vllm.model_executor.layers.logits_processor"
 PATCH_ID = "worker.op_opt.logits_processor.int8_lm_head"
@@ -60,6 +64,24 @@ def _config(m: int, n: int, k: int) -> dict:
     return {**deepgemm.get_w8a16_linear_config(m, n, k), "WEIGHT_LAYOUT": 1}
 
 
+# The int8 copy costs one byte per weight element (~250 MB for a 248k-vocab
+# head) on top of the 16-bit weight it mirrors.  Building it lazily on the
+# first eligible decode keeps it out of the profile run, but it lands after
+# the KV cache has been sized -- in a tight pool that allocation is an OOM.
+# Leave this much headroom before attempting it; below that the head simply
+# stays 16 bit for the life of the process.
+_BUILD_HEADROOM_BYTES = 512 << 20
+_LOGGED_SKIP = [False]
+
+
+def _has_headroom(nbytes: int) -> bool:
+    try:
+        free, _ = torch.cuda.mem_get_info()
+    except (RuntimeError, AssertionError):
+        return True
+    return free >= nbytes + _BUILD_HEADROOM_BYTES
+
+
 def _build_state(lm_head):
     weight = getattr(lm_head, "weight", None)
     if (
@@ -75,6 +97,14 @@ def _build_state(lm_head):
     try:
         import deepgemm
     except ImportError:
+        return None
+    # int8 copy + fp32 temporaries for the per-row amax pass.
+    if not _has_headroom(weight.numel() * 4):
+        if not _LOGGED_SKIP[0]:
+            _LOGGED_SKIP[0] = True
+            logger.warning(
+                "VLLM_HCU_INT8_LM_HEAD: not enough free device memory to build "
+                "the int8 lm_head copy; keeping the 16-bit weight.")
         return None
     w = weight.data
     scale = (w.float().abs().amax(dim=1) / 127.0).clamp_(min=1e-8)
