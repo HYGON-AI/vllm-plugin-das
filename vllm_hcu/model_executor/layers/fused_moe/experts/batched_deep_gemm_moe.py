@@ -4,6 +4,8 @@
 # Modified by Hygon Information Technology Co., Ltd., 2026.
 
 
+import os
+
 import torch
 
 import vllm.model_executor.layers.fused_moe.modular_kernel as mk
@@ -40,6 +42,8 @@ from vllm.utils.deep_gemm import (
     is_deep_gemm_supported,
 )
 from vllm.utils.math_utils import cdiv, round_up
+from vllm_hcu.platforms import envs as henvs
+from vllm_hcu.runtime_compat.step5 import is_step5_owner
 
 logger = init_logger(__name__)
 
@@ -355,7 +359,16 @@ class BatchedDeepGemmExperts(mk.FusedMoEExpertsModular):
 
     @staticmethod
     def _supports_activation(activation: MoEActivation) -> bool:
-        return activation == MoEActivation.SILU
+        if activation == MoEActivation.SILU:
+            return True
+        return (
+            activation == MoEActivation.SWIGLUSTEP
+            and current_platform.is_rocm()
+            and henvs.optional_custom_op_enabled(
+                os.environ.get("HCU_STEP5_DEEPEP_SWIGLUSTEP") == "1"
+            )
+            and is_step5_owner()
+        )
 
     @staticmethod
     def _supports_parallel_config(moe_parallel_config: FusedMoEParallelConfig) -> bool:
@@ -608,24 +621,54 @@ class BatchedDeepGemmExperts(mk.FusedMoEExpertsModular):
                 expected_m,
             )
         elif current_platform.is_rocm():
-            # HCU's low-latency masked kernel and fused activation are supplied
-            # by the proprietary DeepGEMM/LightOP wheels and imported lazily.
-            from deepgemm.m_group_gemm import m_grouped_fp8_gemm_nt_masked_ll
-            from lightop.activation import fuse_silu_mul_fp8_quant_ep
+            if activation == MoEActivation.SWIGLUSTEP:
+                from deepgemm import m_grouped_fp8_gemm_nt_masked as masked_gemm
 
-            m_grouped_fp8_gemm_nt_masked_ll(
+                if N != 3072 or K != 4096 or self.block_shape is not None:
+                    raise ValueError(
+                        "Step5 LL SwiGLUStep requires channel FP8 expert shapes"
+                    )
+            else:
+                from deepgemm.m_group_gemm import (
+                    m_grouped_fp8_gemm_nt_masked_ll as masked_gemm,
+                )
+
+            masked_gemm(
                 (a1q, a1q_scale),
                 (w1, self.w1_scale),
                 workspace1,
                 expert_num_tokens,
                 expected_m,
             )
-            a2q, a2q_scale = fuse_silu_mul_fp8_quant_ep(
-                input=workspace1,
-                fp8type=0,
-                tokens_per_expert=expert_num_tokens,
-            )
-            m_grouped_fp8_gemm_nt_masked_ll(
+            if activation == MoEActivation.SWIGLUSTEP:
+                from vllm_hcu.model_executor.layers.fused_moe.ep_fused_moe import (
+                    ep_masked_swiglustep_quant_deepgemm,
+                )
+                raw = workspace2.view(torch.uint8).view(-1)
+                q_bytes = E * max_num_tokens * 1536
+                s_bytes = E * max_num_tokens * 4
+                if raw.numel() < q_bytes + s_bytes:
+                    raise ValueError("Step5 LL activation workspace is too small")
+                q_out = raw[:q_bytes].view(torch.float8_e4m3fn).view(
+                    E, max_num_tokens, 1536
+                )
+                scale_out = raw[q_bytes : q_bytes + s_bytes].view(torch.float32).view(
+                    E, max_num_tokens, 1
+                )
+                a2q, a2q_scale = ep_masked_swiglustep_quant_deepgemm(
+                    workspace1, expert_num_tokens,
+                    limit=float(self.quant_config.gemm1_clamp_limit or 7.0),
+                    q=q_out, scale=scale_out,
+                )
+            else:
+                from lightop.activation import fuse_silu_mul_fp8_quant_ep
+
+                a2q, a2q_scale = fuse_silu_mul_fp8_quant_ep(
+                    input=workspace1,
+                    fp8type=0,
+                    tokens_per_expert=expert_num_tokens,
+                )
+            masked_gemm(
                 (a2q, a2q_scale),
                 (w2, self.w2_scale),
                 output,
