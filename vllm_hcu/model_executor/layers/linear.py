@@ -48,6 +48,7 @@ from vllm.model_executor.parameter import (
 )
 from vllm.model_executor.utils import set_weight_attrs
 from vllm.platforms import current_platform
+from vllm_hcu.runtime_compat.parallel_weight_loader import call_parallel_weight_loader
 
 logger = init_logger(__name__)
 
@@ -660,7 +661,11 @@ class ColumnParallelLinear(LinearBase):
         if len(loaded_weight.shape) == 0:
             assert loaded_weight.numel() == 1
             loaded_weight = loaded_weight.reshape(1)
-        param.load_column_parallel_weight(loaded_weight=loaded_weight, is_quantization=self.is_quantization)
+        call_parallel_weight_loader(
+            param.load_column_parallel_weight,
+            loaded_weight,
+            is_quantization=self.is_quantization,
+        )
 
     def _forward_with_hcu_quanted(
         self,
@@ -1973,7 +1978,11 @@ class RowParallelLinear(LinearBase):
             assert loaded_weight.numel() == 1
             loaded_weight = loaded_weight.reshape(1)
 
-        param.load_row_parallel_weight(loaded_weight=loaded_weight, is_quantization=self.is_quantization)
+        call_parallel_weight_loader(
+            param.load_row_parallel_weight,
+            loaded_weight,
+            is_quantization=self.is_quantization,
+        )
 
     def _forward_with_hcu_quanted(
         self,

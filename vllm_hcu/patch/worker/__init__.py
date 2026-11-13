@@ -200,6 +200,7 @@ _MOE_FOUNDATION_CALLBACKS: tuple[_CallbackSpec, ...] = (
 
 
 _CORE_CALLBACKS: tuple[_CallbackSpec, ...] = (
+    _CallbackSpec(_adapter("core_fix", "patch_batch_invariant_stages")),
     _CallbackSpec(_adapter("core_fix", "patch_mhc_backend")),
     _CallbackSpec(_adapter("core_fix", "patch_mhc_fused_rmsnorm")),
     _CallbackSpec(_adapter("core_fix", "patch_minimax_m3_aiter_cache")),
