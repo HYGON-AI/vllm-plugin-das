@@ -176,6 +176,13 @@ fail-closed compatibility gate using the source-defined release-line contract.
 Incompatible installations are rejected before patch registration. The
 corresponding doctor check is named `vllm_compatible`.
 
+The plugin defaults `HIP_GRAPH_USE_CMD_CACHE=0` before HIP initialization.
+This avoids DTK graph-command-cache VMFaults observed on K150 (`gfx92a`)
+with native FlashAttention and `FULL_AND_PIECEWISE`. Graph capture/replay,
+the attention backend, and asynchronous scheduling remain enabled. An
+explicit nonempty value is preserved; set overrides before initializing HIP
+and, for an existing Ray cluster, in the workers' runtime environment.
+
 For `FLASHMLA_SPARSE`, the platform maps public `--kv-cache-dtype fp8_e4m3`
 to the internal `fp8_ds_mla` format. This packed sparse-MLA layout is
 backend-specific, not a generic cache format shared by all attention backends.

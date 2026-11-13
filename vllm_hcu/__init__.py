@@ -14,7 +14,14 @@ second plugin callback cannot retry a partially registered custom op.
 from __future__ import annotations
 
 import importlib
+import os
 import threading
+
+# DTK's graph command cache can trigger VMFault during FULL graph replay.
+# Disable that submission optimization before HIP initializes, keeping CUDA
+# graph capture/replay enabled. Preserve an explicit runtime override.
+if not os.environ.get("HIP_GRAPH_USE_CMD_CACHE"):
+    os.environ["HIP_GRAPH_USE_CMD_CACHE"] = "0"
 
 from vllm_hcu.lightop_env import configure_lightop_environment
 
