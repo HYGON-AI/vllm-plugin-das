@@ -36,8 +36,9 @@ def _chunk_rounds(ep, capacity, local_rows):
 
 
 def pack_hy4_mega_weights(provider, gate_up, down, gate_up_scale, down_scale):
-    if gate_up.shape != (17, 4096, 6144) or down.shape != (17, 6144, 2048):
-        raise ValueError("HY4 EP16/R16 requires 17 gate/up and down experts per rank")
+    count = gate_up.size(0)
+    if count not in (16, 17) or gate_up.shape != (count, 4096, 6144) or down.shape != (count, 6144, 2048):
+        raise ValueError("HY4 EP16 requires 16 experts per rank, or 17 with R16")
     pairs = []
     for weight, scale in ((gate_up, gate_up_scale), (down, down_scale)):
         if weight.dtype != torch.float8_e4m3fn:
@@ -78,7 +79,8 @@ class Hy4MegaKernel:
     is_monolithic = False
     prepare_finalize = _RoutingFormat()
 
-    def __init__(self, provider, packed, buffer, ep, clamp):
+    def __init__(self, provider, packed, buffer, ep, clamp, *, decode=False):
+        self.decode = decode
         self.provider = provider
         self.packed = packed
         self.buffer = buffer
@@ -92,6 +94,15 @@ class Hy4MegaKernel:
     def apply(self, hidden_states, w1, w2, topk_weights, topk_ids, activation,
               global_num_experts, expert_map, apply_router_weight_on_input,
               shared_experts=None, shared_experts_input=None):
+        if self.decode:
+            if global_num_experts != 256 or apply_router_weight_on_input:
+                raise ValueError("HY4 decode MegaMoE requires 256 output-weighted experts")
+            # The scheduler and capture buckets fit the buffer on every DP rank.
+            # Launch exactly once even for idle ranks; no CPU collective in a graph.
+            return run_hy4_mega_experts(
+                self.provider, hidden_states, topk_ids, topk_weights, self.packed,
+                self.buffer, self.clamp,
+            )
         if global_num_experts != 272 or apply_router_weight_on_input:
             raise ValueError("HY4 MegaMoE requires output-weighted physical R16 routing")
         # Profiling and replicated MTP can supply a much larger batch than a
@@ -113,14 +124,16 @@ class Hy4MegaKernel:
         return torch.cat(outputs)
 
 
-def _group_buffer(provider, ep):
+def _group_buffer(provider, ep, experts, capacity):
     existing = getattr(ep, "_hy4_mega_buffer", None)
     if existing is not None:
+        if (existing.num_experts, existing.num_max_tokens_per_rank) != (experts, capacity):
+            raise ValueError("HY4 MegaMoE group buffer geometry changed")
         return existing
     # Keep the IPC allocation bounded independently of the global 40960
     # scheduler budget. A 2560-token shard fits a normal PCP16 prefill step.
     buf = provider.get_symm_buffer_for_mega_moe(
-        ep.device_group, 272, 2560, 8, 6144, 2048, use_fp8_dispatch=True,
+        ep.device_group, experts, capacity, 8, 6144, 2048, use_fp8_dispatch=True,
         activation="swiglu",
     )
     destroy_group = ep.destroy
@@ -149,17 +162,26 @@ def install_hy4_mega_kernel(method, layer):
         return False
     p = config.parallel_config
     ep = get_ep_group()
-    if not (
-        config.model_config.enforce_eager and p.tensor_parallel_size == 1
-        and p.prefill_context_parallel_size == 16 and p.data_parallel_size == 1
-        and p.enable_eplb and p.eplb_config.num_redundant_experts == 16
-        and ep.world_size == 16 and layer.global_num_experts == 272
+    decode = (
+        p.data_parallel_size == 16 and p.prefill_context_parallel_size == 1
+        and p.all2all_backend == "deepep_low_latency" and not p.enable_eplb
+        and layer.global_num_experts == 256 and p.decode_context_parallel_size == 1
+        and p.pipeline_parallel_size == 1 and not p.enable_dbo
+    )
+    prefill = (
+        config.model_config.enforce_eager and p.prefill_context_parallel_size == 16
+        and p.data_parallel_size == 1 and p.enable_eplb
+        and p.eplb_config.num_redundant_experts == 16 and layer.global_num_experts == 272
         and getattr(layer, "_vllm_hcu_static_eplb_row", None) is not None
+    )
+    if not (
+        (decode or prefill) and p.tensor_parallel_size == 1 and p.enable_expert_parallel
+        and ep.world_size == 16
         and method.fp8_backend.value == "HCU_DEEPGEMM"
         and method.weight_quant.strategy == "channel" and method.input_quant.strategy == "token"
         and method.input_quant.dynamic and not layer.apply_router_weight_on_input
     ):
-        raise ValueError("HY4 FP8 MegaMoE requires eager PCP16/EP16, R16 and channel/token FP8")
+        raise ValueError("HY4 FP8 MegaMoE requires PCP16/R16 or low-latency DP16/EP16 and channel/token FP8")
     import deepgemm.mega as mega
     from deepgemm.version import git_hash
 
@@ -171,12 +193,23 @@ def install_hy4_mega_kernel(method, layer):
     w1, w2 = layer.w13_weight, layer.w2_weight
     s1, s2 = layer.w13_weight_scale, layer.w2_weight_scale
     packed = pack_hy4_mega_weights(mega, w1, w2, s1, s2)
-    buffer = _group_buffer(mega, ep)
+    capacity = 2560
+    if decode:
+        capacity = max(config.scheduler_config.max_num_batched_tokens,
+                       config.compilation_config.max_cudagraph_capture_size or 0)
+    buffer = _group_buffer(mega, ep, layer.global_num_experts, capacity)
     for param, tensor in zip((w1, s1, w2, s2), (*packed[0], *packed[1])):
         if param.dtype != tensor.dtype or param.numel() != tensor.numel():
             raise ValueError("MegaMoE repacking changed checkpoint element count or dtype")
     for param, tensor in zip((w1, s1, w2, s2), (*packed[0], *packed[1])):
         param.data = tensor.view(param.shape)
     method.moe_quant_config = method.get_fused_moe_quant_config(layer)
-    method.moe_kernel = Hy4MegaKernel(mega, packed, buffer, ep, layer.swiglu_limit)
+    method.moe_kernel = Hy4MegaKernel(mega, packed, buffer, ep, layer.swiglu_limit, decode=decode)
+    if decode and ep.rank_in_group == 0:
+        from vllm.logger import init_logger
+
+        init_logger(__name__).info_once(
+            "HY4 FP8 decode MegaMoE enabled: DP16/EP16, 256 experts, capacity=%d",
+            capacity,
+        )
     return True
