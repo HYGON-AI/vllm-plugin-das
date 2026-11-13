@@ -180,6 +180,11 @@ For `FLASHMLA_SPARSE`, the platform maps public `--kv-cache-dtype fp8_e4m3`
 to the internal `fp8_ds_mla` format. This packed sparse-MLA layout is
 backend-specific, not a generic cache format shared by all attention backends.
 
+## LocateAnything
+
+The integrated Slow/Fast model and package-only launch profile are documented in
+[LocateAnything](docs/locateanything.md).
+
 ## Models and Validation
 
 Model registration or the presence of a YAML profile is not an accuracy pass.

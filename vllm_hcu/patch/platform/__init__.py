@@ -8,6 +8,7 @@ import threading
 
 from vllm_hcu.compatibility import ensure_vllm_compatible
 from vllm_hcu.patch.import_coordinator import IMPORT_COORDINATOR
+from vllm_hcu.patch.locateanything import register_locateanything_api_callbacks
 from vllm_hcu.patch.module_exchange import register_all_module_exchanges
 from vllm_hcu.patch.runtime_callbacks import register_runtime_method_callbacks
 from vllm_hcu.patch.runtime_state import detect_process_role, set_process_role
@@ -122,8 +123,11 @@ def apply_platform_patches() -> None:
             )
 
             _register_worker_cold_replacements(IMPORT_COORDINATOR)
+            from vllm_hcu.patch.locateanything import register_locateanything_exchanges
+            register_locateanything_exchanges(IMPORT_COORDINATOR)
             register_all_module_exchanges(IMPORT_COORDINATOR)
         register_platform_core_callbacks(IMPORT_COORDINATOR)
+        register_locateanything_api_callbacks(IMPORT_COORDINATOR)
         register_tokenizer_callbacks(IMPORT_COORDINATOR)
         register_runtime_method_callbacks(IMPORT_COORDINATOR)
         _register_platform_framework_callbacks()

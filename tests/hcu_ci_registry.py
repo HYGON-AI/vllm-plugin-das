@@ -606,6 +606,21 @@ register_hcu_ci(
 )
 
 register_hcu_ci(
+    job="contract-hcu-gfx936",
+    target="tests/runtime_patch/test_locateanything.py",
+    est_time=60,
+)
+register_hcu_ci(
+    job="contract-hcu-gfx936",
+    target="tests/runtime_patch/test_locateanything_warmup_budget.py",
+    est_time=60,
+)
+register_hcu_ci(
+    job="contract-hcu-gfx936",
+    target="tests/runtime_patch/test_locateanything_lifecycle.py",
+    est_time=60,
+)
+register_hcu_ci(
     job="accuracy-gfx936",
     target="tests/kernels/test_bf16_indexer_gather.py",
     est_time=30,
