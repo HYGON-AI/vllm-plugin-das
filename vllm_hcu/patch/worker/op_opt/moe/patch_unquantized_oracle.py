@@ -1,6 +1,6 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright (c) 2026 Hygon Information Technology Co., Ltd.
-"""Add an opt-in LightOp W16A16 backend to vLLM's unquantized MoE oracle."""
+"""Add HCU BF16 expert backends to vLLM's unquantized MoE oracle."""
 
 from __future__ import annotations
 
@@ -87,12 +87,19 @@ def apply_to_module(module: ModuleType) -> bool:
             "HCU LightOp W16A16 backend is already present outside the HCU adapter"
         )
     values["HCU_LIGHTOP_W16A16"] = "HCU LightOp W16A16"
+    values["HCU_DEEPEP_BF16"] = "HCU DeepEP BF16 DeepGEMM"
     hcu_enum = target.Enum("UnquantizedMoeBackend", values, module=target.__name__)
     target._vllm_hcu_original_unquantized_moe_backend = old_enum
     target.UnquantizedMoeBackend = hcu_enum
 
     @functools.wraps(backend_to_cls)
     def hcu_backend_to_kernel_cls(backend):
+        if backend == hcu_enum.HCU_DEEPEP_BF16:
+            from vllm_hcu.model_executor.layers.fused_moe.experts.deepep_bf16_moe import (
+                DeepEPAutoBF16Experts,
+            )
+
+            return [DeepEPAutoBF16Experts]
         if backend == hcu_enum.HCU_LIGHTOP_W16A16:
             from vllm_hcu.model_executor.layers.fused_moe.experts import (
                 lightop_w16a16_moe,
@@ -103,6 +110,8 @@ def apply_to_module(module: ModuleType) -> bool:
 
     @functools.wraps(map_backend)
     def hcu_map_unquantized_backend(runner_backend):
+        if runner_backend == "deep_gemm":
+            return hcu_enum.HCU_DEEPEP_BF16
         mapped = map_backend(runner_backend)
         return _normalize_backend(mapped, old_enum, hcu_enum)
 
@@ -115,6 +124,17 @@ def apply_to_module(module: ModuleType) -> bool:
             lightop_w16a16_moe,
         )
         from vllm_hcu.platforms import envs as henvs
+
+        if getattr(moe_config, "moe_backend", "auto") == "deep_gemm":
+            experts_cls = hcu_backend_to_kernel_cls(hcu_enum.HCU_DEEPEP_BF16)[0]
+            supported, reason = experts_cls.is_supported_config(
+                experts_cls, moe_config, None, None,
+                target.mk.FusedMoEActivationFormat.Standard,
+            )
+            if not supported:
+                raise ValueError(f"BF16 DeepGEMM configuration is unsupported: {reason}")
+            target.logger.info_once("Using HCU BF16 DeepGEMM with DeepEP auto HT/LL.")
+            return hcu_enum.HCU_DEEPEP_BF16, experts_cls
 
         if (
             getattr(moe_config, "moe_backend", "auto") == "auto"
@@ -179,6 +199,9 @@ def apply_to_module(module: ModuleType) -> bool:
         w13_weight,
         w2_weight,
     ):
+        if unquantized_backend == hcu_enum.HCU_DEEPEP_BF16:
+            # HT uses canonical weights; LL owns its packed copy in the kernel.
+            return w13_weight.contiguous(), w2_weight.contiguous()
         if unquantized_backend == hcu_enum.HCU_LIGHTOP_W16A16:
             from vllm_hcu.model_executor.layers.fused_moe import (
                 lightop_w16a16_runtime,
@@ -205,6 +228,14 @@ def apply_to_module(module: ModuleType) -> bool:
         experts_cls,
         routing_tables=None,
     ):
+        if backend == hcu_enum.HCU_DEEPEP_BF16:
+            from vllm_hcu.model_executor.layers.fused_moe.experts.deepep_bf16_moe import (
+                make_deepep_auto_bf16_moe_kernel,
+            )
+
+            return make_deepep_auto_bf16_moe_kernel(
+                quant_config, moe_config, routing_tables
+            )
         return make_kernel(
             quant_config,
             moe_config,
