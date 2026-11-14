@@ -64,10 +64,10 @@ def _raise_flashmla_unavailable(*_args, **_kwargs):
 if _is_flashmla_available()[0]:
     from flash_mla.flash_mla_interface import (  # noqa: F401
         FlashMLASchedMeta,
-        flash_mla_sparse_fwd,
         flash_mla_with_kvcache,
         get_mla_metadata,
     )
+    from vllm_hcu.v1.attention.ops.flashmla_qk_fp8 import flash_mla_sparse_fwd
 else:
 
     class FlashMLASchedMeta:  # type: ignore[no-redef]
