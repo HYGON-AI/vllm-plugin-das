@@ -338,6 +338,8 @@ vllm serve /model/Qwen2-0.5B-Instruct --attention-backend TRITON_ATTN
 
 Device acceptance for v0.33 is tracked separately in the
 [current validation record](../docs/validation/vllm033-upgrade.md).
+The [native packed integration record](../docs/validation/vllm033-packed-current-validation.md)
+separates current installed/Graph components from pending model and lifecycle gates.
 Historical gfx936 results do not certify this release or another architecture.
 Keep RMSNorm disabled until the intended stack has a live-device validation
 record:
