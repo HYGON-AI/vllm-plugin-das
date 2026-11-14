@@ -9,12 +9,12 @@ activation dependencies are independent of the optional RMS provider.
 lifecycle; this wheel contributes optional, independently removable operator
 optimizations through the adapter extension API.
 
-Version `0.3.0.dev0` targets the `v0.33.0` branch. Migration status and current
+Version `0.33.0` targets the `v0.33.0` branch. Migration status and current
 evidence are recorded in [v0.33 validation](../docs/validation/vllm033-upgrade.md);
 the v0.32 documents below are historical evidence and do not certify v0.33.
-The operator extension currently advertises only the default-OFF LightOp
-ordinary and fused-add `RMSNorm` candidate. INT8 model selection, weight
-conversion, quantization and kernel construction remain official vLLM owners.
+Separate extensions provide default-OFF RMSNorm, HCU FlashAttention, SlimQuant
+and the explicit INT8 ASM candidate below. Core retains CT scheme selection,
+weight loading, generic quantization and kernel construction.
 
 It also provides an explicit HCU FlashAttention backend selected by
 `--attention-backend FLASH_ATTN`. The backend keeps vLLM's official metadata,
@@ -37,14 +37,14 @@ operator-level capabilities.
   development, patch, and local version suffixes are accepted when the
   required operator APIs and LightOp capabilities are present. FLASH_ATTN uses
   the official public backend registry and AttentionImpl contract.
-- Adapter host distribution: `hcu-adapter>=0.1.0`, extension API v1 from
-  `hcu_adapter.extensions`.
+- Adapter host distribution: `hcu-adapter>=0.5.22`, extension API v1 with
+  process health checks from `hcu_adapter.extensions`.
 - Runtime: a prepared HCU PyTorch/DTK/LightOp/AITER stack. LightOp and AITER
   are intentionally not fetched by pip because production deployments must
   use ABI-matched local builds.
 - The plugin does not own `vllm.platform_plugins` or `vllm.general_plugins`.
 
-The repository root remains the vLLM 0.28.1 development reference. Build only
+The repository-root legacy build is disabled on this branch. Build only
 this directory for vLLM 0.33:
 
 ```bash
@@ -89,26 +89,84 @@ Schema4 additionally verifies that the seven official INT8 oracle symbols
 remain identical across activation, the module is owned by the Core wheel,
 and explicit Triton selection resolves to an official expert.
 
-## INT8 ownership and unavailable AITER model integration
+## Explicit INT8 ASM candidate
 
-Use official `--moe-backend auto` or `--moe-backend triton` for INT8 models.
-The retired Plugin installer extended/rebound the official oracle enum and
-functions; that private integration conflicts with the upstream-first skill
-and has been removed. No `aiter-int8-moe` capability is advertised. Calling
-its old `install()` entry point explicitly rejects before importing or
-modifying Core. An Adapter request requiring that capability must fail.
+Request `HCU_ADAPTER_VLLM_REQUIRED_CAPABILITIES=hcu-aiter-int8-moe` and
+`--moe-backend aiter`. This requires the associated Core public
+`register_int8_moe_backend` API; stock v0.33 without that API refuses activation.
+The retired `int8_oracle.install()` remains unavailable and no oracle functions,
+already-imported aliases, CT classes or builtin enum members are replaced.
+Builtin auto/triton behavior stays unchanged.
 
-The official v0.33 INT8 oracle provides Triton/Humming/CPU and has no public
-expert registry for adding AITER. The general public quantization-config
-registry is not equivalent: a future distinct quantization method would need
-its own loader/lifecycle/full-dataflow evidence. It must not overwrite the
-official `compressed-tensors` entry or rebind oracle globals.
+The architecture candidate admits exact gfx936 and gfx938 identities, with
+raw symmetric per-channel INT8 expert weights,
+dynamic per-token INT8 activations, BF16/FP16 inputs, gated SiLU and ordinary TP.
+The gfx938 component/model gates are separate from the existing gfx936 results.
+Static TP-only EP2 is admitted on homogeneous gfx936 or gfx938 worker groups,
+with BF16 inputs, global256/local128 experts, hidden2048/intermediate512/top8.
+Architecture-specific validation remains separate; the gfx936 records below
+do not certify gfx938.
+On gfx936, the public factory/CT loader/runner component has passed a controlled two-rank
+fixture, including shared output, reload and changed-input Graph replay. The real
+Qwen3.5 INT8 checkpoint also completes original HumanEval32 with both AITER and
+official Triton scoring raw30/normalized32 under default Graph. See the
+[component record](../docs/validation/vllm033-int8-ep2-component.md) and
+[full-checkpoint evidence and limits](../docs/validation/vllm033-int8-ep2-he32.md).
+DP/PCP/sequence parallelism, EPLB, elastic topology, unsupported EP geometries,
+bias, LoRA, padded layouts, router-weight-on-input and non-neutral activation
+parameters refuse explicitly. `passthrough` refuses because this expert delegates
+cross-rank reduction to the official runner; it does not reduce internally.
 
-The standalone INT8 provider, ASM composition and unregistered expert factory
-are retained for operator experiments. Their prior native/Graph and full-model
-results are frozen historical evidence; they do not make AITER selectable in
-the corrected candidate. Preserving official ownership does not certify that
-unavailable capability. See [ownership correction](../docs/validation/vllm033-official-ownership.md).
+Canonical expert maps retain actual local-index permutations. An actual local
+vendor profile takes priority. After a local E128 lookup miss, the EP candidate
+can reuse only the stage-qualified raw E256 profiles for M1/2/3/4/8/16/17/32/64/
+128/256/512/1024, with the exact first-stage ID, second-stage ID and sorting
+block size checked together. Compatibility selection is recorded explicitly.
+Unknown profiles/token counts
+use complete official Triton fallback before native launch. This is not an E128
+CSV tuning or a broad native/performance claim.
+The additional shapes are a new isolated candidate: their public two-rank
+runner/reload, model and performance gates remain pending. The component and
+model records below belong to the earlier M1/17/128 policy at runtime7e088e9b.
+See the [native profile evidence and remaining gates](../docs/validation/vllm033-int8-ep2-native-batches.md).
+Core retains CT scheme selection, parameter metadata, weight loading, generic
+quant config, prepare/finalize and reductions. Preprocessed weights retain the
+official method's default refusal.
+
+Plugin composes native ASM GEMMs with Core quantization/activation semantics.
+A shape/config miss uses the official whole-call Triton fallback, including its
+own quantization and scratch allocation. Native launch failures propagate.
+The extension publishes a content fingerprint for normal/AOT compile factors,
+binding its source, loaded native modules, ASM objects and channel config before
+model construction; later file drift refuses cache reuse. The vendor's resolved
+plan architecture must match the detected HCU before native acquisition. The
+published architecture, provider getter and module identity remain bound to
+process health and the compile factor; later provider drift refuses selection.
+Activation must precede
+any vendor ASM configuration consumer in the process; an already imported vendor
+ASM module (including one inherited by fork) refuses and requires a fresh spawned
+process. This avoids binding stale vendor plan caches to new config bytes.
+Activation occurs exclusively at Adapter startup before model consumers. No exact wheel string
+is required for compatible builds.
+
+Public-path validation on gfx936 covers ten installed CT factory/expert/full
+forward cases and thirty changed-input Graph replays against official Triton.
+Single-card Qwen3.5-35B-A3B-Channel-INT8-w8a8, TP1/MTP0, BF16 activations and
+TRITON_ATTN passes original HumanEval tasks0–31: AITER raw32/32, Triton raw31/32;
+both normalize to32/32 (Triton task24 contains a code fence). The actual forty
+CT INT8 experts and default FULL_AND_PIECEWISE Graph dispatch were verified.
+ASM config selections and native code-object loads corroborate execution;
+these are not an all-kernel trace. Both arms release the GPU but retain a worker
+grace-period SIGTERM warning, so clean lifecycle remains unaccepted.
+
+The EP2 model pair retains internal worker-grace SIGTERM and EngineCore forced
+termination logs despite API exit0 and released resources. Clean lifecycle,
+warmed EP2 performance, full-model checkpoint reload and remote device CI remain
+pending. Earlier TP1 warmed-serving evidence belongs to its older frozen Core
+combination. Core public registry: [MR83](https://developer.sourcefind.cn/codes/OpenDAS/vllm/-/merge_requests/83).
+Historical private integration results do not certify this public path. The
+general RMS installation verifier checks official INT8 symbol ownership but
+does not validate this capability.
 
 ## Experimental SlimQuant checkpoint format
 

@@ -1,0 +1,80 @@
+{
+  "scope": "Single-card native stage evidence only; new candidate public two-rank/model/performance integration remains required",
+  "evidence_cohort": "v033-int8-native-profile-expansion-r1-20261110",
+  "evidence_report_sha256": "a6c60be8ea33be0bdf533174795fcac0f16ba9f8de0aede79918850f78041c5f",
+  "geometry": {
+    "global_experts": 256,
+    "local_experts": 128,
+    "hidden": 2048,
+    "intermediate": 512,
+    "topk": 8,
+    "input_dtype": "bfloat16"
+  },
+  "profiles": {
+    "1024": {
+      "SOL_ID1": 12001,
+      "SOL_ID2": 22000,
+      "BLOCK_SIZE_M": 64
+    },
+    "512": {
+      "SOL_ID1": 11005,
+      "SOL_ID2": 21000,
+      "BLOCK_SIZE_M": 32
+    },
+    "256": {
+      "SOL_ID1": 10011,
+      "SOL_ID2": 20000,
+      "BLOCK_SIZE_M": 16
+    },
+    "128": {
+      "SOL_ID1": 10011,
+      "SOL_ID2": 20000,
+      "BLOCK_SIZE_M": 16
+    },
+    "64": {
+      "SOL_ID1": 10008,
+      "SOL_ID2": 20000,
+      "BLOCK_SIZE_M": 16
+    },
+    "32": {
+      "SOL_ID1": 10011,
+      "SOL_ID2": 20000,
+      "BLOCK_SIZE_M": 16
+    },
+    "17": {
+      "SOL_ID1": 10009,
+      "SOL_ID2": 20000,
+      "BLOCK_SIZE_M": 16
+    },
+    "16": {
+      "SOL_ID1": 10013,
+      "SOL_ID2": 20000,
+      "BLOCK_SIZE_M": 16
+    },
+    "8": {
+      "SOL_ID1": 10013,
+      "SOL_ID2": 20000,
+      "BLOCK_SIZE_M": 16
+    },
+    "4": {
+      "SOL_ID1": 10013,
+      "SOL_ID2": 20000,
+      "BLOCK_SIZE_M": 16
+    },
+    "3": {
+      "SOL_ID1": 10013,
+      "SOL_ID2": 20000,
+      "BLOCK_SIZE_M": 16
+    },
+    "2": {
+      "SOL_ID1": 10013,
+      "SOL_ID2": 20000,
+      "BLOCK_SIZE_M": 16
+    },
+    "1": {
+      "SOL_ID1": 10010,
+      "SOL_ID2": 20000,
+      "BLOCK_SIZE_M": 16
+    }
+  }
+}
