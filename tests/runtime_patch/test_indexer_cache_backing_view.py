@@ -148,8 +148,12 @@ def test_bf16_gather_preserves_strided_block_table(monkeypatch):
     assert kernel.args[-2:] == table.stride()
 
 
-@pytest.mark.parametrize("gfx938", [False, True])
-def test_native_decode_matches_custom_op_writer_layout(monkeypatch, gfx938):
+@pytest.mark.parametrize(
+    ("gfx938", "direct_decode"), [(False, False), (True, False), (True, True)]
+)
+def test_native_decode_uses_cache_local_backend(
+    monkeypatch, gfx938, direct_decode
+):
     from vllm import _custom_ops as ops
 
     prefix = "test.indexer"
@@ -171,7 +175,13 @@ def test_native_decode_matches_custom_op_writer_layout(monkeypatch, gfx938):
     monkeypatch.setattr(sparse, "DeepseekV32IndexerMetadata", SimpleNamespace)
     monkeypatch.setattr(
         sparse, "get_forward_context",
-        lambda: SimpleNamespace(attn_metadata={prefix: metadata}),
+        lambda: SimpleNamespace(
+            attn_metadata={prefix: metadata},
+            no_compile_layers={
+                prefix: SimpleNamespace(_hcu_indexer_direct_decode=direct_decode),
+                "other": SimpleNamespace(_hcu_indexer_direct_decode=not direct_decode),
+            },
+        ),
     )
     monkeypatch.setattr(sparse, "on_gfx938", lambda: gfx938)
     monkeypatch.setattr(sparse, "_use_lightop_sparse_mla_topk", lambda: False)
@@ -197,6 +207,7 @@ def test_native_decode_matches_custom_op_writer_layout(monkeypatch, gfx938):
         "max_model_len": 6,
         "clean_logits": False,
         "kcache_layout": "normal" if gfx938 else "preshuffle",
+        "prefer_direct": direct_decode if gfx938 else False,
     }]
     assert set(result[0].tolist()) == {1, 2}
 

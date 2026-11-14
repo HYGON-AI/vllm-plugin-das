@@ -71,6 +71,16 @@ register_hcu_ci(
 )
 register_hcu_ci(
     job="accuracy-gfx938",
+    target="tests/kernels/test_gfx938_fp8_indexer_reader.py",
+    est_time=120,
+)
+register_hcu_ci(
+    job="accuracy-gfx938",
+    target="tests/kernels/test_dsv4_compact_indexer.py",
+    est_time=120,
+)
+register_hcu_ci(
+    job="accuracy-gfx938",
     target="tests/model_executor/test_step5_upstream_delta.py::test_causal_fp8_prefill_scores_preserve_group_major_strided_output",
     est_time=60,
 )

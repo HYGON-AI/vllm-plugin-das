@@ -663,6 +663,8 @@ class HCUPlatform(Platform):
             )
         # if cache_config and cache_config.block_size is None:
         #     cache_config.block_size = 64
+        from vllm_hcu.deepseek_v4_runtime import is_deepseek_v4, is_dspark_enabled
+
         if compilation_config.cudagraph_mode.has_full_cudagraphs():
             # decode context parallel does not support full cudagraphs
             if parallel_config.decode_context_parallel_size > 1:
@@ -673,7 +675,9 @@ class HCUPlatform(Platform):
                 )
                 compilation_config.cudagraph_mode = CUDAGraphMode.PIECEWISE
             # prefill context parallel do not support full cudagraphs
-            elif parallel_config.prefill_context_parallel_size > 1:
+            elif parallel_config.prefill_context_parallel_size > 1 and not (
+                is_deepseek_v4(vllm_config) and is_dspark_enabled(vllm_config)
+            ):
                 logger.warning_once(
                     "Prefill context parallel (PCP) is enabled, which is "
                     "incompatible with full CUDA graphs. "

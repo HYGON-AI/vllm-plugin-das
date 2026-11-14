@@ -980,11 +980,13 @@ def test_rocm_lightop_paged_mqa_keeps_clean_logits_disabled(
 @pytest.mark.parametrize("block_size", [16, 32, 64])
 @pytest.mark.parametrize("collapsed_cache", [False, True])
 @pytest.mark.parametrize("clean_logits", [False, True])
+@pytest.mark.parametrize("kcache_layout", ["preshuffle", "normal"])
 def test_gfx938_dispatch_reads_original_physical_pages_and_table(
     monkeypatch: pytest.MonkeyPatch,
     block_size: int,
     collapsed_cache: bool,
     clean_logits: bool,
+    kcache_layout: str,
 ) -> None:
     """Decode must pass the original page backing and mapping to the reader."""
     runtime = importlib.import_module("vllm_hcu.v1.attention.ops.rocm_aiter_mla_sparse")
@@ -1009,8 +1011,11 @@ def test_gfx938_dispatch_reads_original_physical_pages_and_table(
     output = torch.ones((1, block_size * 3))
     calls = []
 
-    def direct_reader(q, physical, weights, lengths, pages, max_len, *, fill_tail):
+    def direct_reader(
+        q, physical, weights, lengths, pages, max_len, *, fill_tail, token_major,
+    ):
         calls.append((physical, pages, max_len, fill_tail))
+        assert token_major is (kcache_layout == "normal")
         assert physical.shape == cache.shape
         assert physical.data_ptr() == cache.data_ptr()
         assert physical.stride() == cache.stride()
@@ -1029,6 +1034,8 @@ def test_gfx938_dispatch_reads_original_physical_pages_and_table(
         torch.empty(0),
         block_size * 3,
         clean_logits=clean_logits,
+        kcache_layout=kcache_layout,
+        prefer_direct=True,
     )
     assert actual is output
     assert len(calls) == 1

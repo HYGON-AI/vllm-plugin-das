@@ -15,8 +15,12 @@ def config_field(owner: object | None, name: str, default: object = None) -> obj
     return getattr(owner, name, default)
 
 
-def model_architectures(vllm_config: object | None) -> tuple[str, ...]:
-    model_config = config_field(vllm_config, "model_config")
+def model_architectures(
+    vllm_config: object | None, *, model_config: object | None = None,
+) -> tuple[str, ...]:
+    """Resolve the selected model config, including initialize_model overrides."""
+    if model_config is None:
+        model_config = config_field(vllm_config, "model_config")
     architectures = config_field(model_config, "architectures")
     if architectures is None:
         hf_config = config_field(model_config, "hf_config")

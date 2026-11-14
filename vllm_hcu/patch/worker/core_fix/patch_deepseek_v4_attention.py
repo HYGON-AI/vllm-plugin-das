@@ -420,7 +420,11 @@ def apply_to_module(module: ModuleType) -> bool:
             # gfx938 has the quantized indexer cache reader. gfx936 selects
             # the BF16 HIPC writer/gather path, so its allocation contract
             # must contain raw BF16 keys rather than FP8 bytes plus scales.
-            if not on_gfx938():
+            if on_gfx938():
+                if not self.use_fp4_kv:
+                    # Keep V4's optimized backend local to its owning cache.
+                    self.k_cache._hcu_indexer_direct_decode = True
+            else:
                 self.k_cache.dtype = torch.bfloat16
                 self.k_cache.head_dim = self.head_dim
 

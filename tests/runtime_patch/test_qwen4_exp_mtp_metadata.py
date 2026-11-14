@@ -630,6 +630,9 @@ def test_scheduler_uses_hybrid_block_size_only_inside_upstream_mamba_split():
         def _update_after_schedule(self, scheduler_output):
             del self, scheduler_output
 
+        def schedule(self):
+            del self
+
     module.Scheduler = Scheduler
     module.MambaSpec = MambaSpec
     original_init = Scheduler.__init__

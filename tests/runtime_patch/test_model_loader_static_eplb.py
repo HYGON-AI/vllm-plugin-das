@@ -258,3 +258,44 @@ def test_worker_inventory_arms_static_preload_and_mapping_boundaries() -> None:
         "vllm_hcu.patch.worker.framework_opt.patch_static_expert_mapping"
         in adapters
     )
+
+
+@pytest.mark.parametrize("method,architecture", [
+    ("dspark", "DSparkDraftModel"), ("mtp", "DeepSeekV4MTPModel"),
+])
+@pytest.mark.parametrize("implicit_config", [False, True])
+@pytest.mark.parametrize("hf_only", [False, True])
+def test_real_draft_initializer_isolates_static_target_before_construction(
+    tmp_path, monkeypatch, method, architecture, implicit_config, hf_only,
+):
+    from vllm_hcu.patch.config import get_hcu_config
+    config, _ = config_and_map(tmp_path)
+    config.parallel_config.eplb_config = SimpleNamespace(num_redundant_experts=16)
+    draft_config = (
+        SimpleNamespace(hf_config=SimpleNamespace(architectures=[architecture]))
+        if hf_only else SimpleNamespace(architectures=[architecture])
+    )
+    if implicit_config:
+        config.model_config = draft_config
+    config.speculative_config = SimpleNamespace(method=method, draft_model_config=draft_config)
+    target_path = get_hcu_config(config).expert_map_path
+    module = ModuleType(patch_model_loader_static_eplb.TARGET_MODULE)
+    model = SimpleNamespace()
+    def initialize_model(vllm_config, *, prefix="", model_class=None, model_config=None):
+        assert not vllm_config.parallel_config.enable_eplb
+        assert vllm_config.parallel_config.eplb_config.num_redundant_experts == 0
+        assert get_hcu_config(vllm_config).expert_map_path is None
+        assert model_config is (None if implicit_config else draft_config)
+        return model
+    module.initialize_model = initialize_model
+    _remove_initializer_aliases(monkeypatch)
+    patch_model_loader_static_eplb.apply_to_module(module)
+    loaded = (
+        module.initialize_model(config) if implicit_config
+        else module.initialize_model(config, model_config=draft_config)
+    )
+    assert loaded._vllm_hcu_fixed_draft_layout
+    assert not hasattr(loaded, "_vllm_hcu_static_eplb_plan")
+    assert config.parallel_config.enable_eplb
+    assert config.parallel_config.eplb_config.num_redundant_experts == 16
+    assert get_hcu_config(config).expert_map_path == target_path

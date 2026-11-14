@@ -9,6 +9,8 @@ GQA FlashAttention plan from upstream PR #49564 to the HCU v0.25.1 sidecar.
 
 from __future__ import annotations
 
+from contextlib import contextmanager
+from contextvars import ContextVar
 from dataclasses import dataclass, replace
 from typing import NamedTuple
 
@@ -23,6 +25,33 @@ from vllm_hcu.patch.platform.core_fix.patch_vllm_config import (
     _validate_hcu_pcp_scope,
     is_glm53_pcp,
 )
+
+
+_DISPATCH_METADATA = ContextVar("hcu_pcp_dispatch_metadata", default=None)
+
+
+@contextmanager
+def pcp_dispatch_metadata_scope():
+    """Keep pre-dispatch metadata local to one runner execution."""
+    token = _DISPATCH_METADATA.set(None)
+    try:
+        yield
+    finally:
+        _DISPATCH_METADATA.reset(token)
+
+
+def set_pcp_dispatch_metadata(batch_req_state, scheduler_output, num_bonus_tokens):
+    """Mirror prepare_inputs' logit widths in the actual gathered request order."""
+    if batch_req_state is None:
+        return
+    drafts = np.fromiter(
+        (len(scheduler_output.scheduled_spec_decode_tokens.get(req_id, ()))
+         for req_id in batch_req_state.req_ids),
+        dtype=np.int32,
+        count=len(batch_req_state.req_ids),
+    )
+    cu_logits = np.concatenate(([0], np.cumsum(drafts + num_bonus_tokens)))
+    _DISPATCH_METADATA.set((batch_req_state.num_scheduled_tokens, drafts, cu_logits))
 
 
 @dataclass(frozen=True)
@@ -242,12 +271,68 @@ class HcuPCPManager:
 
         return segment(pcp_rank), segment(chunk_count - 1 - pcp_rank)
 
-    def get_num_tokens_for_dispatch(
-        self,
+    @staticmethod
+    def _split_prefill_rows_from_metadata(
         num_scheduled_tokens: np.ndarray,
         is_prefilling: np.ndarray,
+        num_draft_tokens_per_req: np.ndarray | None = None,
+        cu_num_logits_np: np.ndarray | None = None,
+    ) -> np.ndarray:
+        """Return the prefill rows that PCP must split across ranks.
+
+        A scheduler-padded verification row is still marked as prefill by
+        MRV2, but it has the same complete token/logit shape as a decode row.
+        Partitioning replicates such a row on every rank, so dispatch must use
+        the same classification when it computes the runner padding.
+        """
+        split = np.asarray(is_prefilling, dtype=np.bool_).copy()
+        if num_draft_tokens_per_req is None or cu_num_logits_np is None:
+            return split
+        drafts = np.asarray(num_draft_tokens_per_req)
+        logits = np.diff(np.asarray(cu_num_logits_np))
+        padded_verify = (
+            (drafts > 0)
+            & (logits == drafts + 1)
+            & (np.asarray(num_scheduled_tokens) == logits)
+        )
+        return split & ~padded_verify
+
+    def get_num_tokens_for_dispatch(
+        self,
+        num_scheduled_tokens: np.ndarray | InputBatch,
+        is_prefilling: np.ndarray | None = None,
+        *,
+        num_draft_tokens_per_req: np.ndarray | None = None,
+        cu_num_logits_np: np.ndarray | None = None,
     ) -> int:
         """Return the largest real rank-local batch before runner padding."""
+
+        if isinstance(num_scheduled_tokens, InputBatch):
+            input_batch = num_scheduled_tokens
+            num_scheduled_tokens = input_batch.num_scheduled_tokens
+            is_prefilling = input_batch.is_prefilling_np
+            num_draft_tokens_per_req = input_batch.num_draft_tokens_per_req
+            cu_num_logits_np = input_batch.cu_num_logits_np
+        if is_prefilling is None:
+            raise TypeError("is_prefilling is required for array dispatch inputs")
+
+        # The upstream two-array call uses this exact gathered token array.
+        # Do not apply another batch's metadata or override explicit metadata.
+        metadata = _DISPATCH_METADATA.get()
+        if (
+            metadata is not None
+            and metadata[0] is num_scheduled_tokens
+            and num_draft_tokens_per_req is None
+            and cu_num_logits_np is None
+        ):
+            _, num_draft_tokens_per_req, cu_num_logits_np = metadata
+
+        split_prefill = self._split_prefill_rows_from_metadata(
+            num_scheduled_tokens,
+            is_prefilling,
+            num_draft_tokens_per_req,
+            cu_num_logits_np,
+        )
 
         if self._use_mla:
             # MLA/EP collectives require each request to contribute the same
@@ -257,7 +342,7 @@ class HcuPCPManager:
             # have different widest ranks.
             num_tokens = 0
             for length_value, is_prefill_value in zip(
-                num_scheduled_tokens, is_prefilling
+                num_scheduled_tokens, split_prefill
             ):
                 length = int(length_value)
                 if not bool(is_prefill_value):
@@ -280,7 +365,7 @@ class HcuPCPManager:
         for rank in range(self.pcp_size):
             local_tokens = 0
             for length_value, is_prefill_value in zip(
-                num_scheduled_tokens, is_prefilling
+                num_scheduled_tokens, split_prefill
             ):
                 length = int(length_value)
                 if bool(is_prefill_value):
@@ -296,6 +381,19 @@ class HcuPCPManager:
                     local_tokens += length
             largest = max(largest, local_tokens)
         return largest
+
+    def _pinned(self, array: np.ndarray) -> torch.Tensor:
+        # A pinned snapshot lets the H2D copy run without a host sync; a
+        # pageable copy waits for all queued GPU work (the previous step's
+        # drafter), which exposed ~4 ms of metadata building per decode step.
+        # The snapshot also keeps reused numpy scratch buffers safe to edit.
+        tensor = torch.from_numpy(array)
+        if self.device.type == "cpu":
+            return tensor
+        return tensor.pin_memory()
+
+    def _to_device(self, array: np.ndarray) -> torch.Tensor:
+        return self._pinned(array).to(self.device, non_blocking=True)
 
     @property
     def input_buffers(self) -> InputBuffers:
@@ -332,6 +430,15 @@ class HcuPCPManager:
             local_offset += segment.num_tokens
         return result
 
+    @staticmethod
+    def _split_prefill_rows(input_batch: InputBatch) -> np.ndarray:
+        return HcuPCPManager._split_prefill_rows_from_metadata(
+            input_batch.num_scheduled_tokens,
+            input_batch.is_prefilling_np,
+            input_batch.num_draft_tokens_per_req,
+            input_batch.cu_num_logits_np,
+        )
+
     def _segments_for_rank(
         self,
         rank: int,
@@ -339,6 +446,7 @@ class HcuPCPManager:
     ) -> list[_BatchSegment]:
         segments: list[_BatchSegment] = []
         local_offset = 0
+        split_prefill = self._split_prefill_rows(input_batch)
         for req_idx, query_len_value in enumerate(
             input_batch.num_scheduled_tokens
         ):
@@ -346,7 +454,7 @@ class HcuPCPManager:
             if query_len == 0:
                 continue
             global_start = int(input_batch.query_start_loc_np[req_idx])
-            if bool(input_batch.is_prefilling_np[req_idx]):
+            if bool(split_prefill[req_idx]):
                 rank_segments = self.rank_segments(
                     query_len, pcp_rank=rank, pcp_size=self.pcp_size
                 )
@@ -370,7 +478,7 @@ class HcuPCPManager:
         return self._reorder_segments(
             segments,
             input_batch.num_computed_tokens_np,
-            input_batch.is_prefilling_np,
+            split_prefill,
             input_batch.query_start_loc_np,
         )
 
@@ -379,6 +487,7 @@ class HcuPCPManager:
         input_batch: InputBatch,
         padded_num_tokens: int | None = None,
     ) -> tuple[list[list[_BatchSegment]], list[int]]:
+        split_prefill = self._split_prefill_rows(input_batch)
         segments_by_rank = [
             self._segments_for_rank(rank, input_batch)
             for rank in range(self.pcp_size)
@@ -396,7 +505,7 @@ class HcuPCPManager:
             if (
                 not self._use_mla
                 or int(query_len_value) == 0
-                or not bool(input_batch.is_prefilling_np[req_idx])
+                or not bool(split_prefill[req_idx])
             ):
                 continue
             req_segments_by_rank = [
@@ -440,7 +549,7 @@ class HcuPCPManager:
             self._reorder_segments(
                 rank_segments,
                 input_batch.num_computed_tokens_np,
-                input_batch.is_prefilling_np,
+                split_prefill,
                 input_batch.query_start_loc_np,
             )
             for rank_segments in segments_by_rank
@@ -479,7 +588,7 @@ class HcuPCPManager:
                     dtype=np.int64,
                 )
                 is_decode = not bool(
-                    input_batch.is_prefilling_np[segment.global_req_idx]
+                    split_prefill[segment.global_req_idx]
                 )
                 if not is_decode or rank == 0:
                     kv_write_mask[gathered_slice] = True
@@ -489,17 +598,11 @@ class HcuPCPManager:
                         dtype=np.int64,
                     )
 
-        self._hidden_restore_idx = torch.from_numpy(hidden_restore_idx).to(
-            self.device
-        )
+        self._hidden_restore_idx = self._to_device(hidden_restore_idx)
         self._hidden_restore_idx_np = hidden_restore_idx
         self._padded_num_tokens = padded_num_tokens
-        self._padded_gather_idx = torch.from_numpy(padded_gather_idx).to(
-            self.device
-        )
-        self._gathered_kv_write_mask = torch.from_numpy(kv_write_mask).to(
-            self.device
-        )
+        self._padded_gather_idx = self._to_device(padded_gather_idx)
+        self._gathered_kv_write_mask = self._to_device(kv_write_mask)
         return segments_by_rank, per_rank_num_tokens
 
     def partition_batch(
@@ -516,6 +619,7 @@ class HcuPCPManager:
             raise PatchCompatibilityError(
                 "PCP spec decode requires per-request draft-token counts"
             )
+        split_prefill = self._split_prefill_rows(input_batch)
         self._global_batch = input_batch
         self._global_has_prefill = bool(input_batch.is_prefilling_np.any())
         self._global_attn_ready = False
@@ -554,13 +658,13 @@ class HcuPCPManager:
         local_idx_mapping_np = self._idx_mapping_np[:num_local_reqs]
         local_idx_mapping_np[:] = input_batch.idx_mapping_np[global_req_indices]
         local_idx_mapping = self._idx_mapping[:num_local_reqs]
-        local_idx_mapping.copy_(torch.from_numpy(local_idx_mapping_np).to(self.device))
+        local_idx_mapping.copy_(self._pinned(local_idx_mapping_np), non_blocking=True)
 
         query_start_np = self._query_start_loc_np[: num_local_reqs + 1]
         query_start_np[0] = 0
         np.cumsum(local_lengths, out=query_start_np[1:])
         query_start = self._query_start_loc[: num_local_reqs + 1]
-        query_start.copy_(torch.from_numpy(query_start_np).to(self.device))
+        query_start.copy_(self._pinned(query_start_np), non_blocking=True)
 
         local_start_pos_np = np.fromiter(
             (
@@ -596,7 +700,7 @@ class HcuPCPManager:
         for segment in segments_by_rank[0]:
             if (
                 segment.num_actual_tokens == 0
-                or bool(input_batch.is_prefilling_np[segment.global_req_idx])
+                or bool(split_prefill[segment.global_req_idx])
             ):
                 continue
             rank0_decode_position[segment.global_slice] = np.arange(
@@ -624,7 +728,7 @@ class HcuPCPManager:
             )
             is_padding[actual_slice] = False
             if not bool(
-                input_batch.is_prefilling_np[segment.global_req_idx]
+                split_prefill[segment.global_req_idx]
             ):
                 replicated_token_mask[actual_slice] = True
                 owner_positions = rank0_decode_position[segment.global_slice]
@@ -638,7 +742,7 @@ class HcuPCPManager:
             :num_padded_tokens
         ]
         replicated_slot_indices.copy_(
-            torch.from_numpy(replicated_slot_indices_np).to(self.device)
+            self._pinned(replicated_slot_indices_np), non_blocking=True
         )
 
         # A full request row can reuse MRV2's rejection-corrected device
@@ -656,7 +760,7 @@ class HcuPCPManager:
         seq_index = self._logits_indices[:num_local_reqs]
         if full_request_rows:
             seq_scratch_np[:] = global_req_indices
-            seq_index.copy_(torch.from_numpy(seq_scratch_np).to(self.device))
+            seq_index.copy_(self._pinned(seq_scratch_np), non_blocking=True)
             torch.index_select(
                 input_batch.seq_lens,
                 0,
@@ -667,7 +771,7 @@ class HcuPCPManager:
             # Split prefill rows use the last preserved position as their local
             # sequence end. Padding-only rows retain their virtual row width.
             seq_scratch_np[:] = [segment.padding_tokens for segment in segments]
-            seq_lens.copy_(torch.from_numpy(seq_scratch_np).to(self.device))
+            seq_lens.copy_(self._pinned(seq_scratch_np), non_blocking=True)
             actual_rows = [
                 row
                 for row, segment in enumerate(segments)
@@ -683,9 +787,7 @@ class HcuPCPManager:
                 ]
                 actual_last_index = self._logits_indices[:num_actual_rows]
                 actual_last_index.copy_(
-                    torch.from_numpy(seq_scratch_np[:num_actual_rows]).to(
-                        self.device
-                    )
+                    self._pinned(seq_scratch_np[:num_actual_rows]), non_blocking=True
                 )
                 actual_seq_lens_i64 = self._seq_lens_i64[:num_actual_rows]
                 torch.index_select(
@@ -698,9 +800,7 @@ class HcuPCPManager:
                 seq_scratch_np[:num_actual_rows] = actual_rows
                 actual_row_index = self._logits_indices[:num_actual_rows]
                 actual_row_index.copy_(
-                    torch.from_numpy(seq_scratch_np[:num_actual_rows]).to(
-                        self.device
-                    )
+                    self._pinned(seq_scratch_np[:num_actual_rows]), non_blocking=True
                 )
                 seq_lens.index_copy_(
                     0,
@@ -734,17 +834,15 @@ class HcuPCPManager:
                 dtype=np.int64,
             )
             logits_offset += count
-        logits_indices.copy_(torch.from_numpy(logits_indices_np).to(self.device))
+        logits_indices.copy_(self._pinned(logits_indices_np), non_blocking=True)
         cu_num_logits_np = self._cu_num_logits_np[: num_local_reqs + 1]
         cu_num_logits_np[0] = 0
         np.cumsum(local_num_logits, out=cu_num_logits_np[1:])
         cu_num_logits = self._cu_num_logits[: num_local_reqs + 1]
-        cu_num_logits.copy_(torch.from_numpy(cu_num_logits_np).to(self.device))
+        cu_num_logits.copy_(self._pinned(cu_num_logits_np), non_blocking=True)
 
         if num_logits:
-            local_num_logits_tensor = torch.from_numpy(local_num_logits).to(
-                self.device
-            )
+            local_num_logits_tensor = self._to_device(local_num_logits)
             expanded_idx_mapping = torch.repeat_interleave(
                 local_idx_mapping,
                 local_num_logits_tensor,
@@ -775,7 +873,7 @@ class HcuPCPManager:
         local_is_prefilling = self._is_prefilling_np[:num_local_reqs]
         local_is_prefilling[:] = (
             local_num_computed_prefill < local_prefill_len
-        ) & input_batch.is_prefilling_np[global_req_indices]
+        ) & split_prefill[global_req_indices]
         local_num_draft_tokens_per_req = None
         local_num_draft_tokens = 0
         if input_batch.num_draft_tokens_per_req is not None:
@@ -1016,6 +1114,11 @@ class HcuPCPManager:
 
         if self._hidden_restore_idx is None:
             return hidden_states
+        if not self._global_has_prefill:
+            # Pure decode rows (including graph padding) are replicated in
+            # identical local order on every rank. The restore indices already
+            # address rank 0's local prefix, so any rank can select locally.
+            return hidden_states[self._hidden_restore_idx]
         gathered = self._pcp_group.all_gather(hidden_states, dim=0)
         return gathered[self._hidden_restore_idx]
 
@@ -1069,10 +1172,10 @@ class HcuPCPManager:
         context_cu_np = np.zeros(len(local_context_lens_np) + 1, dtype=np.int32)
         np.cumsum(local_context_lens_np, out=context_cu_np[1:])
 
-        new_kv_idx = torch.from_numpy(new_kv_idx_np).to(self.device)
-        packed_int32 = torch.from_numpy(
+        new_kv_idx = self._to_device(new_kv_idx_np)
+        packed_int32 = self._to_device(
             np.concatenate((new_cu_np, local_context_lens_np, context_cu_np))
-        ).to(self.device)
+        )
         num_new_cu = len(new_cu_np)
         new_cu_kv = packed_int32[:num_new_cu]
 

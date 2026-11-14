@@ -292,6 +292,11 @@ class DeepseekCompressor(nn.Module):
                 self._quant_block = 128
                 self._token_stride = self.head_dim
                 self._scale_dim = 4  # single float32 scale
+                # These kernels write token-major pages; tell the decode
+                # indexer reader not to assume 16x16 preshuffled tiles.
+                cache_layer = self._static_forward_context.get(self.k_cache_prefix)
+                if cache_layer is not None:
+                    cache_layer._hcu_indexer_direct_decode = True
             self._num_warps = 1
         else:
             raise ValueError(
