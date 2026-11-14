@@ -14,6 +14,10 @@ import torch
 from vllm_hcu.patch.config import get_hcu_config
 from vllm_hcu.platforms import envs as henvs
 from vllm_hcu.runtime_compat.step5 import is_step5_config
+from vllm_hcu.distributed.device_communicators.pynccl_graph import (
+    close_graph_ownership,
+    install_graph_ownership,
+)
 
 from vllm_hcu.patch.import_coordinator import (
     IMPORT_COORDINATOR,
@@ -205,12 +209,20 @@ def apply_to_module(module: ModuleType) -> bool:
         from vllm.config import get_current_vllm_config_or_none
 
         self._hcu_dp_packed_ag = False
+        self._hcu_eager_pynccl_comm = None
         try:
             # Preserve the upstream opt-in collective and cleanup lifecycle.
             # Only the new packed/Fabric providers are Step5-specific.
             _maybe_init_ep_custom_allreduce(self, unique_name)
             _maybe_init_dp_ipc_all_gather(self, unique_name)
             vllm_config = get_current_vllm_config_or_none()
+            if unique_name.split(":")[0] == "tp" and vllm_config is not None:
+                from vllm.config.compilation import CUDAGraphMode
+
+                compilation = getattr(vllm_config, "compilation_config", None)
+                graph_mode = getattr(compilation, "cudagraph_mode", CUDAGraphMode.NONE)
+                if graph_mode != CUDAGraphMode.NONE:
+                    install_graph_ownership(self)
             step5_owner = vllm_config is not None and is_step5_config(vllm_config)
             self._hcu_dp_packed_ag = (
                 step5_owner
@@ -240,6 +252,8 @@ def apply_to_module(module: ModuleType) -> bool:
         except BaseException:
             with suppress(Exception):
                 _close_ipc_all_gather(self)
+            with suppress(Exception):
+                close_graph_ownership(self)
             raise
 
     @functools.wraps(destroy)
@@ -247,7 +261,10 @@ def apply_to_module(module: ModuleType) -> bool:
         try:
             _close_ipc_all_gather(self)
         finally:
-            result = destroy(self)
+            try:
+                close_graph_ownership(self)
+            finally:
+                result = destroy(self)
         return result
 
     @functools.wraps(all_gatherv)
