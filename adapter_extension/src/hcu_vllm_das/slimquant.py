@@ -23,6 +23,8 @@ from vllm.model_executor.layers.quantization.compressed_tensors.utils import (
     should_ignore_layer,
 )
 
+from .slimquant_activation import require_usable
+
 
 def unpack_signed_int4(packed: torch.Tensor) -> torch.Tensor:
     """Decode high nibble first, keeping canonical signed [-8, 7] values."""
@@ -175,6 +177,7 @@ class SlimQuantConfig(CompressedTensorsConfig):
         )
 
     def get_embedding_method(self, prefix, embedding_method_base):
+        require_usable()
         from vllm.models.qwen4_exp.common.ngram_embedding import (
             Qwen4ExpPLEPerRowEmbeddingMethod,
             Qwen4ExpPLEUnquantizedEmbeddingMethod,
@@ -208,6 +211,7 @@ class SlimQuantConfig(CompressedTensorsConfig):
         return Qwen4ExpPLEPerRowEmbeddingMethod(torch.int8)
 
     def get_quant_method(self, layer: nn.Module, prefix: str):
+        require_usable()
         ignored = self._matches(prefix, self.ignore)
         if isinstance(layer, RoutedExperts):
             if ignored:
@@ -225,6 +229,12 @@ class SlimQuantConfig(CompressedTensorsConfig):
                 self._matches(name, self.expert_modules) for name in projections
             ):
                 raise ValueError(f"Undeclared SlimQuant expert group {prefix!r}")
+            from .slimquant_packed import SlimQuantPackedExperts, select_moe_provider
+
+            if select_moe_provider(get_current_vllm_config_or_none()) == "boltops":
+                method = SlimQuantPackedExperts(layer.moe_config)
+                method.prepare()
+                return method
             return SlimQuantInt8Experts(
                 self.weight_quant, self.input_quant, layer.moe_config
             )

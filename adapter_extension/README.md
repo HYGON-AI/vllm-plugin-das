@@ -186,6 +186,43 @@ The current parser requires the three explicit mixed-precision groups used by
 the Qwen3.8 checkpoint. Verify loader numerics, changed-input Graph and model
 accuracy for the selected Core/provider/checkpoint combination before deployment.
 
+An experimental native packed provider can be selected explicitly with
+`--additional-config '{"hcu_slimquant":{"moe_provider":"boltops"}}'`.
+Omitting this namespace, or selecting `expanded-int8`, retains the expanded
+official CT path. The setting participates in vLLM's configuration hash.
+The native choice requires the optional public `boltops.fused_moe` provider and
+Core's derived-buffer APIs plus loaded-method weight-update preflight;
+it keeps signed INT4 bytes and canonical FP32 checkpoint scales, with separate
+stable scale-times16 buffers for kernel execution. Core still owns checkpoint
+sharding, routing, shared-expert scheduling and final TP reduction. Dense INT8,
+ignored BF16/FP16 modules and per-row PLE retain their existing methods.
+Core's `-1` padding routes are translated to distinct unused expert IDs with
+zero routing weights at the packed provider boundary, preserving the vendor
+sorter's one-slot-per-expert/token contract. Fully padded hidden rows are zeroed
+before vendor execution, including unused nonfinite values. This uses device
+tensor predicates so padding changes remain visible during Graph replay;
+the caller's routing tensors and shared-expert inputs are unchanged.
+
+The initial native method accepts plain TP SiLU with BF16/FP16 activations and
+even, unpadded K/intermediate sizes. It refuses EP/DP/PCP/SP/EPLB, LoRA,
+hash routing, bias/clamp variants, explicit MoE backends, and
+router-weight-on-input. Kernel-format reload and online weight transfer are
+explicitly refused through Core's preflight before update side effects. This
+is separate from the postprocessed-weight/IPC support flag.
+Raw reloads must supply every expert weight and scale before post-load refresh;
+partial generations refuse execution. A missing optional dependency refuses the
+explicit native choice; a partial vendor import failure is latched for the
+process, so restart after correcting the dependency.
+
+Local gfx936/Torch2.11 TP4 BF16 validation completed the full Qwen3.8 checkpoint
+with default FULL_AND_PIECEWISE Graph: HumanEval0–31 scores raw0/32 and32/32
+after fixed code-format normalization, with all32 outputs unchanged from the
+previous native candidate. Actual loaded target workers also refused16
+unsupported update attempts and continued generation. TP1 BF16/FP16 component
+tests cover official raw reload and changed-input Graph replay. Full-model raw
+and draft reload, cross-launch AOT reuse, performance and clean default teardown
+remain separate gates. The provider is experimental and opt-in.
+
 ## HCU FlashAttention varlen backend
 
 The supported path is BF16/FP16 dense MHA/GQA with head size 64, 128, 192, or
@@ -301,6 +338,8 @@ vllm serve /model/Qwen2-0.5B-Instruct --attention-backend TRITON_ATTN
 
 Device acceptance for v0.33 is tracked separately in the
 [current validation record](../docs/validation/vllm033-upgrade.md).
+The [native packed integration record](../docs/validation/vllm033-packed-current-validation.md)
+separates current installed/Graph components from pending model and lifecycle gates.
 Historical gfx936 results do not certify this release or another architecture.
 Keep RMSNorm disabled until the intended stack has a live-device validation
 record:
