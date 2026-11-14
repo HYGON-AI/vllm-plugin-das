@@ -414,6 +414,16 @@ def _has_hcu_low_latency_dispatch_abi(buffer) -> bool:
     )
 
 
+def _has_topk_low_latency_cleanup_abi(buffer) -> bool:
+    cleanup = getattr(buffer, "clean_low_latency_buffer", None)
+    if not callable(cleanup):
+        return False
+    try:
+        return "num_topk" in inspect.signature(cleanup).parameters
+    except (TypeError, ValueError):
+        return False
+
+
 def _claim_ll_buffer_cleanup(buffer) -> bool:
     """Return True for the first LL dispatch on ``buffer`` in this forward.
 
@@ -905,6 +915,7 @@ def ll_init(
     self.use_int8_dispatch = bool(use_int8_dispatch)
     self._vllm_hcu_clean_low_latency_buffer = False
     self._hcu_low_latency_dispatch_abi = _has_hcu_low_latency_dispatch_abi(buffer)
+    self._hcu_low_latency_cleanup_topk = _has_topk_low_latency_cleanup_abi(buffer)
 
 
 def ll_do_quant(module, self, x, a1_dtype, quant_config, expert_num_tokens=None):
@@ -1097,11 +1108,19 @@ def ll_prepare_async(
             raise RuntimeError(
                 "HCU DeepEP LL buffer does not expose clean_low_latency_buffer"
             )
+        # Layered LL cleanup must use the following dispatch's router width.
+        # Older DeepEP wheels have a four-argument cleanup without this layout.
+        cleanup_kwargs = (
+            {"num_topk": dispatch_topk_ids.size(1)}
+            if self._hcu_low_latency_cleanup_topk
+            else {}
+        )
         cleanup(
             self.max_tokens_per_rank,
             hidden_size,
             num_experts,
             quant_group_size,
+            **cleanup_kwargs,
         )
     try:
         if use_hcu_api:
