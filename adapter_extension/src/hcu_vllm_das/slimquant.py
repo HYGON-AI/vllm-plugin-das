@@ -104,6 +104,16 @@ class SlimQuantConfig(CompressedTensorsConfig):
             ignore=list(config.get("ignore") or []),
             quant_format="int-quantized",
         )
+        # Historical checkpoints declare only quant_method/activation_scheme.
+        # They quantize applicable Linear layers and all routed experts, with
+        # explicit ignores retained. A present but incomplete mixed_precision
+        # map must still fail the declared-format checks below.
+        self.legacy_format = "mixed_precision" not in config
+        if self.legacy_format:
+            self.expert_modules = []
+            self.dense_modules = []
+            self.ngram_modules = []
+            return
         mixed = config.get("mixed_precision") or {}
         experts = mixed.get("experts") or {}
         if (
@@ -182,6 +192,8 @@ class SlimQuantConfig(CompressedTensorsConfig):
 
         if self._matches(prefix, self.ignore):
             return Qwen4ExpPLEUnquantizedEmbeddingMethod()
+        if self.legacy_format:
+            raise ValueError("SlimQuant PLE requires explicit mixed_precision declarations")
         context = get_current_vllm_config_or_none()
         model_config = getattr(context, "model_config", None)
         text_config = getattr(model_config, "hf_text_config", None)
@@ -221,7 +233,7 @@ class SlimQuantConfig(CompressedTensorsConfig):
                     f"SlimQuant does not support partially ignored expert group {prefix!r}"
                 )
             # RoutedExperts groups the serialized gate_up_proj/down_proj modules.
-            if not all(
+            if not self.legacy_format and not all(
                 self._matches(name, self.expert_modules) for name in projections
             ):
                 raise ValueError(f"Undeclared SlimQuant expert group {prefix!r}")
@@ -229,6 +241,8 @@ class SlimQuantConfig(CompressedTensorsConfig):
                 self.weight_quant, self.input_quant, layer.moe_config
             )
         if isinstance(layer, LinearBase):
-            if ignored or not self._matches(prefix, self.dense_modules):
+            if ignored or (
+                not self.legacy_format and not self._matches(prefix, self.dense_modules)
+            ):
                 return UnquantizedLinearMethod()
         return super().get_quant_method(layer, prefix)
