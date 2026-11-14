@@ -54,6 +54,107 @@ def _enable(module, monkeypatch):
     monkeypatch.setenv("FLASH_MLA_DSA_FP8_QK", "1")
     monkeypatch.setattr(module, "_supports_qk_fp8", lambda *args: True)
     monkeypatch.setattr(torch.cuda, "is_current_stream_capturing", lambda: False)
+    monkeypatch.setattr(module, "_prefer_qk_fp8", lambda *args: True)
+
+
+@pytest.mark.parametrize(
+    "q_len,heads,kv_len,expected",
+    [
+        (16, 64, 2048, False),
+        (128, 64, 85000, False),
+        (378, 64, 85000, False),
+        (378, 128, 85000, True),
+        (6168, 64, 177280, True),
+        (512, 64, 24576, True),
+        (1024, 64, 177280, True),
+        (512, 128, 177280, True),
+        (256, 128, 85000, True),
+        (512, 64, 85000, True),
+    ],
+)
+def test_dispatch_accounts_for_full_kv_quantization(
+    adapter, q_len, heads, kv_len, expected
+):
+    module, _ = adapter
+    q = torch.empty(1, heads, 576).expand(q_len, -1, -1)
+    kv = torch.empty(1, 1, 576).expand(kv_len, -1, -1)
+    assert module._prefer_qk_fp8(q, kv) == expected
+
+
+def test_small_workload_avoids_validation_and_forces_masked_public_api(
+    adapter, monkeypatch
+):
+    module, calls = adapter
+    monkeypatch.setenv("FLASH_MLA_DSA_FP8_QK", "1")
+    monkeypatch.setattr(module, "_supports_qk_fp8", lambda *args: True)
+    monkeypatch.setattr(torch.cuda, "is_current_stream_capturing", lambda: False)
+    monkeypatch.setattr(
+        module, "_has_invalid_rows", lambda *args: pytest.fail("unnecessary scan")
+    )
+    q, kv, indices = _inputs()
+    result = module.flash_mla_sparse_fwd(q, kv, indices, 0.1)
+    assert result[0] == "bf16_out"
+    assert [c[0] for c in calls] == ["public"]
+    assert calls[0][1][-1].tolist() == [2048, 2048]
+
+
+def test_valid_sink_is_applied_after_native_without_changing_lse(adapter, monkeypatch):
+    module, calls = adapter
+    _enable(module, monkeypatch)
+    q, kv, indices = _inputs()
+    sink = torch.zeros(64, dtype=torch.float32)
+    applied = []
+
+    def apply(output, lse, value):
+        applied.append((output, lse, value))
+        return "scaled_fp8_out"
+
+    monkeypatch.setattr(module, "_apply_sink", apply, raising=False)
+    result = module.flash_mla_sparse_fwd(q, kv, indices, 0.1, attn_sink=sink)
+    assert result == ("scaled_fp8_out", None, "fp8_lse")
+    assert [name for name, _ in calls] == ["native"]
+    assert applied[0][:2] == ("fp8_out", "fp8_lse")
+    assert applied[0][2] is sink
+
+
+@pytest.mark.parametrize(
+    "q_len,kv_len,heads,expected",
+    [
+        (378, 85000, 64, False),
+        (378, 85000, 128, True),
+        (6168, 177280, 64, True),
+        (744, 170112, 64, True),
+        (1116, 255168, 64, True),
+        (512, 442880, 64, False),
+        (512, 442880, 128, False),
+        (1116, 442880, 64, False),
+    ],
+)
+def test_sink_dispatch_includes_scaling_and_long_workspace_cost(
+    adapter, q_len, kv_len, heads, expected
+):
+    module, _ = adapter
+    q = torch.empty(1, heads, 576).expand(q_len, -1, -1)
+    kv = torch.empty(1, 1, 576).expand(kv_len, -1, -1)
+    assert module._prefer_qk_fp8(q, kv, True) == expected
+
+
+@pytest.mark.parametrize(
+    "shape,dtype",
+    [((63,), torch.float32), ((1, 64), torch.float32), ((64,), torch.float16)],
+)
+def test_unsupported_sink_metadata_keeps_public_entry(
+    adapter, monkeypatch, shape, dtype
+):
+    module, calls = adapter
+    _enable(module, monkeypatch)
+    q, kv, indices = _inputs()
+    sink = torch.zeros(shape, dtype=dtype)
+    assert (
+        module.flash_mla_sparse_fwd(q, kv, indices, 0.1, attn_sink=sink)[0]
+        == "bf16_out"
+    )
+    assert [name for name, _ in calls] == ["public"]
 
 
 @pytest.mark.parametrize("flag", [None, "0", "true"])

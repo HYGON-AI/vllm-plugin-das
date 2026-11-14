@@ -85,20 +85,130 @@ def test_fused_validation_handles_strides_and_mutation(kernels):
     assert adapter._has_invalid_rows(indices, counts, 2048)
 
 
-def test_graph_capture_uses_bf16_without_host_read(kernels):
+@pytest.mark.parametrize("q_len", [5, 768])
+@pytest.mark.parametrize("has_sink", [False, True])
+def test_graph_capture_uses_bf16_without_host_read(
+    kernels, q_len, has_sink, monkeypatch
+):
     helper, adapter = kernels
-    q, kv, indices, counts = helper.inputs(5, 2048, 64)
+    q, kv, indices, counts = helper.inputs(q_len, 2048, 64)
+    sink = (
+        torch.linspace(4, 11, 64, device=q.device, dtype=torch.float32)
+        if has_sink
+        else None
+    )
     counts[0] = 17
     for _ in range(3):
-        adapter.flash_mla_sparse_fwd(q, kv, indices, 576**-0.5, topk_length=counts)
+        adapter.flash_mla_sparse_fwd(
+            q, kv, indices, 576**-0.5, attn_sink=sink, topk_length=counts
+        )
     torch.cuda.synchronize()
+    monkeypatch.setattr(
+        adapter,
+        "_has_invalid_rows",
+        lambda *args: pytest.fail("host validation during capture"),
+    )
     graph = torch.cuda.CUDAGraph()
     with torch.cuda.graph(graph):
         output, maximum, lse = adapter.flash_mla_sparse_fwd(
-            q, kv, indices, 576**-0.5, topk_length=counts
+            q, kv, indices, 576**-0.5, attn_sink=sink, topk_length=counts
         )
     assert maximum is not None
     graph.replay()
-    expected, expected_lse = helper.reference(q, kv, indices, counts)
-    torch.testing.assert_close(output.float(), expected, atol=0.006, rtol=0.01)
-    torch.testing.assert_close(lse, expected_lse, atol=2e-5, rtol=2e-5)
+    expected, expected_lse = helper.reference(
+        q[:4], kv, indices[:4], counts[:4], attn_sink=sink
+    )
+    torch.testing.assert_close(output[:4].float(), expected, atol=0.006, rtol=0.01)
+    torch.testing.assert_close(lse[:4], expected_lse, atol=2e-5, rtol=2e-5)
+
+
+@pytest.mark.parametrize(
+    "shape", [(16, 2048, 64), (128, 24576, 64), (256, 85000, 128), (512, 24576, 64)]
+)
+def test_adaptive_dispatch_output_and_skipped_scan(kernels, shape, monkeypatch):
+    helper, adapter = kernels
+    q, kv, indices, counts = helper.inputs(*shape)
+    expected, expected_lse = helper.reference(q[:4], kv, indices[:4], counts[:4])
+    prefer = adapter._prefer_qk_fp8(q, kv)
+    if not prefer:
+        monkeypatch.setattr(
+            adapter,
+            "_has_invalid_rows",
+            lambda *args: pytest.fail("unnecessary validation"),
+        )
+    out, maximum, lse = adapter.flash_mla_sparse_fwd(
+        q, kv, indices, 576**-0.5, topk_length=counts
+    )
+    assert (maximum is None) == prefer
+    error = helper.errors(out[:4], lse[:4], expected, expected_lse)
+    assert error["finite"] and error["relative_l2"] < 0.05, error
+    assert error["max_abs"] < 0.05 and error["lse_max_abs"] < 0.05, error
+
+
+@pytest.mark.parametrize("heads", [64, 128])
+def test_fp8_preserves_attention_sink_and_lse(kernels, heads):
+    helper, adapter = kernels
+    q, kv, indices, counts = helper.inputs(768, 24576, heads)
+    sink = torch.linspace(4, 11, heads, device="cuda", dtype=torch.float32)
+    sink[0], sink[1] = float("inf"), -float("inf")
+    expected, expected_lse = helper.reference(
+        q[:4], kv, indices[:4], counts[:4], attn_sink=sink
+    )
+    output, maximum, lse = adapter.flash_mla_sparse_fwd(
+        q, kv, indices, 576**-0.5, attn_sink=sink, topk_length=counts
+    )
+    assert maximum is None, "sink silently fell back to BF16"
+    assert not output[:, 0].count_nonzero()
+    error = helper.errors(output[:4], lse[:4], expected, expected_lse)
+    assert error["finite"] and error["relative_l2"] < 0.05, error
+    assert error["max_abs"] < 0.05 and error["lse_max_abs"] < 0.05, error
+
+
+def test_hyv4_sink_backend_reaches_native_fp8(kernels, monkeypatch):
+    helper, adapter = kernels
+    from vllm_hcu.models.hy_v4 import hcu_sparse
+
+    q, kv, indices, counts = helper.inputs(768, 24576, 64)
+    impl = hcu_sparse.HYV4FlashMLASparseImpl.__new__(hcu_sparse.HYV4FlashMLASparseImpl)
+    impl.num_heads = 64
+    impl.prefill_padding = 64
+    impl.softmax_scale = 576**-0.5
+    impl.sinks = torch.linspace(4, 11, 64, device="cuda", dtype=torch.float32)
+    impl._dcp_sinks = None
+    calls = []
+
+    def entry(*args, **kwargs):
+        result = adapter.flash_mla_sparse_fwd(*args, **kwargs)
+        calls.append(result[1])
+        return result
+
+    monkeypatch.setattr(hcu_sparse, "flash_mla_sparse_fwd", entry)
+    out, lse = impl._bf16_flash_mla_kernel_with_lse(q, kv, indices[:, 0], counts)
+    assert calls == [None], "actual HYV4 backend missed QK FP8"
+    expected, pre_lse = helper.reference(
+        q[:4], kv, indices[:4], counts[:4], attn_sink=impl.sinks
+    )
+    expected_lse = torch.logaddexp(pre_lse, impl.sinks[None, :])
+    error = helper.errors(out[:4], lse[:4], expected, expected_lse)
+    assert error["finite"] and error["relative_l2"] < 0.05, error
+    assert error["max_abs"] < 0.05 and error["lse_max_abs"] < 0.05, error
+
+
+@pytest.mark.parametrize("case", ["negative", "short_counts"])
+def test_sink_masked_fallback_applies_sink_once(kernels, case):
+    helper, adapter = kernels
+    q, kv, indices, counts = helper.inputs(768, 24576, 64)
+    sink = torch.linspace(4, 11, 64, device=q.device, dtype=torch.float32)
+    if case == "negative":
+        indices[0, 0, 7] = -1
+    else:
+        counts[0] = 17
+    expected, lse_ref = helper.reference(
+        q[:4], kv, indices[:4], counts[:4], attn_sink=sink
+    )
+    out, maximum, lse = adapter.flash_mla_sparse_fwd(
+        q, kv, indices, 576**-0.5, attn_sink=sink, topk_length=counts
+    )
+    assert maximum is not None
+    torch.testing.assert_close(out[:4].float(), expected, atol=0.006, rtol=0.01)
+    torch.testing.assert_close(lse[:4], lse_ref, atol=2e-5, rtol=2e-5)

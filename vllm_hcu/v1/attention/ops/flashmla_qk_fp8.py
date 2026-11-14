@@ -11,6 +11,8 @@ from contextlib import nullcontext
 
 import torch
 
+_dispatch_reported = False
+
 
 def _supports_qk_fp8(q, kv, indices, d_v, attn_sink):
     if (
@@ -50,6 +52,22 @@ class _UnsupportedQkFp8(ValueError):
     """An unsupported input, distinct from errors raised by native execution."""
 
 
+def _prefer_qk_fp8(q, kv, with_sink=False):
+    # Native QK-FP8 quantizes the full KV workspace, even though attention
+    # gathers only 2048 entries per query. Avoid paying that fixed cost when
+    # query/head work is too small to amortize it (gfx938 operator sweep).
+    if q.ndim != 3 or kv.ndim != 3:
+        return True  # Let the ordinary shape checks/fallback handle this input.
+    work = q.shape[0] * q.shape[1]
+    if with_sink:
+        # Sink correction adds an output pass. Keep the marginal workloads on
+        # BF16; this conservative bound includes the long-workspace sweep.
+        return work > 32768 and 8 * work > kv.shape[0] + 131072
+    # Bound the fallback to small query/head workloads: a KV/work ratio alone
+    # incorrectly rejects larger workloads that already amortize preprocessing.
+    return work >= 32768 or 2 * work > kv.shape[0]
+
+
 def _has_invalid_rows(indices, topk_length, kv_length):
     if indices.is_cuda:
         from vllm_hcu.v1.attention.ops.flashmla_qk_fp8_validation import invalid_rows
@@ -60,6 +78,36 @@ def _has_invalid_rows(indices, topk_length, kv_length):
     if topk_length is not None:
         invalid = invalid | (topk_length != 2048).any()
     return invalid.item()
+
+
+def _supports_sink(q, sink):
+    return (
+        isinstance(sink, torch.Tensor)
+        and q.ndim == 3
+        and sink.dtype == torch.float32
+        and sink.shape == (q.shape[1],)
+        and sink.device == q.device
+        and sink.stride(0) > 0
+    )
+
+
+def _apply_sink(output, lse, sink):
+    from vllm_hcu.v1.attention.ops.flashmla_qk_fp8_sink import apply_sink
+
+    apply_sink(output, lse, sink)
+    return output
+
+
+def _report_dispatch(q, kv, has_sink):
+    global _dispatch_reported
+    if q.is_cuda and not _dispatch_reported:
+        from vllm.logger import init_logger
+
+        init_logger(__name__).info(
+            "FlashMLA QK-FP8 sparse prefill selected: Q=%s, KV=%s, sink=%s",
+            tuple(q.shape), tuple(kv.shape), has_sink,
+        )
+        _dispatch_reported = True
 
 
 def sparse_prefill_qk_fp8(q, kv, indices, sm_scale, d_v=512, *, topk_length=None):
@@ -99,23 +147,30 @@ def flash_mla_sparse_fwd(
 ):
     from flash_mla.flash_mla_interface import flash_mla_sparse_fwd as public
 
-    if os.environ.get("FLASH_MLA_DSA_FP8_QK") != "1" or attn_sink is not None:
+    if os.environ.get("FLASH_MLA_DSA_FP8_QK") != "1":
         return public(q, kv, indices, sm_scale, d_v, attn_sink, topk_length)
-    try:
-        output, lse = sparse_prefill_qk_fp8(
-            q, kv, indices, sm_scale, d_v, topk_length=topk_length
-        )
-        # max_logits is uninitialized in the QK kernel. Existing MLA callers
-        # consume output/LSE only; never expose its uninitialized buffer.
-        return output, None, lse
-    except _UnsupportedQkFp8:
-        if topk_length is None:
-            # A non-None count prevents the public frontend selecting QK-FP8
-            # when padding, graph capture or another requirement forced fallback.
-            topk_length = torch.full(
-                (q.shape[0],),
-                indices.shape[-1],
-                dtype=torch.int32,
-                device=indices.device,
+    if _prefer_qk_fp8(q, kv, attn_sink is not None):
+        if attn_sink is not None and not _supports_sink(q, attn_sink):
+            return public(q, kv, indices, sm_scale, d_v, attn_sink, topk_length)
+        try:
+            output, lse = sparse_prefill_qk_fp8(
+                q, kv, indices, sm_scale, d_v, topk_length=topk_length
             )
+            if attn_sink is not None:
+                output = _apply_sink(output, lse, attn_sink)
+            _report_dispatch(q, kv, attn_sink is not None)
+            # max_logits is uninitialized in the QK kernel. Existing MLA callers
+            # consume output/LSE only; never expose its uninitialized buffer.
+            return output, None, lse
+        except _UnsupportedQkFp8:
+            pass
+    if topk_length is None:
+        # A non-None count prevents the public frontend selecting QK-FP8
+        # when shape cost, padding or graph capture forced fallback.
+        topk_length = torch.full(
+            (q.shape[0],),
+            indices.shape[-1],
+            dtype=torch.int32,
+            device=indices.device,
+        )
     return public(q, kv, indices, sm_scale, d_v, attn_sink, topk_length)
