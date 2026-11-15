@@ -161,12 +161,15 @@ def install_hy4_mega_kernel(method, layer):
     if config.model_config.architectures != ["HYV4VLForConditionalGeneration"]:
         return False
     p = config.parallel_config
+    if p.enable_dbo:
+        raise ValueError("HY4 FP8 MegaMoE does not support DBO: overlapping microbatches "
+                         "would share the EP group's mutable symmetric buffer")
     ep = get_ep_group()
     decode = (
         p.data_parallel_size == 16 and p.prefill_context_parallel_size == 1
         and p.all2all_backend == "deepep_low_latency" and not p.enable_eplb
         and layer.global_num_experts == 256 and p.decode_context_parallel_size == 1
-        and p.pipeline_parallel_size == 1 and not p.enable_dbo
+        and p.pipeline_parallel_size == 1
     )
     prefill = (
         config.model_config.enforce_eager and p.prefill_context_parallel_size == 16

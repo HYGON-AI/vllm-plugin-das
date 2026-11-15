@@ -5,14 +5,19 @@ import runpy
 from types import SimpleNamespace
 from unittest.mock import patch
 
+import pytest
 import torch
 import torch.distributed as dist
 import torch.multiprocessing as mp
 
 
-def _worker(rank, rendezvous):
-    impl = runpy.run_path(str(Path(__file__).resolve().parents[2]
+def _load_megamoe():
+    return runpy.run_path(str(Path(__file__).resolve().parents[2]
                               / "vllm_hcu/models/hy_v4/megamoe.py"))
+
+
+def _worker(rank, rendezvous):
+    impl = _load_megamoe()
     torch.set_num_threads(1)
     dist.init_process_group("gloo", init_method=rendezvous, rank=rank,
                             world_size=16, timeout=timedelta(seconds=60))
@@ -49,3 +54,19 @@ def _worker(rank, rendezvous):
 def test_ep16_rounds_once_per_backbone_forward(tmp_path):
     mp.start_processes(_worker, args=((tmp_path / "gloo").as_uri(),),
                        nprocs=16, join=True, start_method="fork")
+
+
+@pytest.mark.parametrize("pcp,dp", [(16, 1), (1, 16)])
+def test_megamoe_rejects_dbo_before_accessing_ep_group(monkeypatch, pcp, dp):
+    install_hy4_mega_kernel = _load_megamoe()["install_hy4_mega_kernel"]
+
+    config = SimpleNamespace(
+        model_config=SimpleNamespace(architectures=["HYV4VLForConditionalGeneration"]),
+        parallel_config=SimpleNamespace(enable_dbo=True, prefill_context_parallel_size=pcp,
+                                        data_parallel_size=dp),
+    )
+    monkeypatch.setattr("vllm.config.get_current_vllm_config", lambda: config)
+    with patch("vllm.distributed.get_ep_group") as get_group:
+        with pytest.raises(ValueError, match="MegaMoE does not support DBO"):
+            install_hy4_mega_kernel(None, None)
+        get_group.assert_not_called()
