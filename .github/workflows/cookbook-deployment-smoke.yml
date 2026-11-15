@@ -169,13 +169,18 @@ jobs:
           echo "=== ARC cgroup membership and mounts ==="
           cat /proc/self/cgroup
           grep -E ' - cgroup2? ' /proc/self/mountinfo || true
+          declare -A log_lines=()
           sample_memory() {
             printf '[ARC memory] %s\n' "$(date -u +'%FT%TZ')"
-            grep -E '^(MemAvailable|SwapFree):' /proc/meminfo || true
+            grep -E '^(MemTotal|MemAvailable|SwapTotal|SwapFree|Cached|Shmem|Active\(anon\)|Inactive\(anon\)|Unevictable|Mlocked):' /proc/meminfo || true
+            grep -E '^(oom_kill|pswpin|pswpout) ' /proc/vmstat || true
+            cat /proc/pressure/memory 2>/dev/null || true
+            echo '[ARC processes] RSS and VSZ in KiB'
+            ps -eo pid,ppid,pgid,stat,etime,rss,vsz,comm --sort=-rss | sed -n '1,16p' || true
             for dir in /sys/fs/cgroup "${v2_dir}" /sys/fs/cgroup/memory "${v1_dir}"; do
               [[ -n "$dir" && -d "$dir" ]] || continue
-              for name in memory.current memory.peak memory.max memory.events memory.oom.group \
-                          memory.usage_in_bytes memory.max_usage_in_bytes memory.limit_in_bytes memory.failcnt; do
+              for name in memory.current memory.peak memory.max memory.events memory.events.local memory.pressure memory.swap.current memory.swap.max memory.oom.group \
+                          memory.usage_in_bytes memory.max_usage_in_bytes memory.limit_in_bytes memory.failcnt memory.oom_control; do
                 if [[ -r "$dir/$name" ]]; then
                   printf '%s: ' "$dir/$name"
                   tr '\n' ' ' < "$dir/$name" || true
@@ -184,7 +189,22 @@ jobs:
               done
             done
             if [[ -d "$report_dir/cases" ]]; then
-              find "$report_dir/cases" -name server.log -printf 'model log: %P (%s bytes)\n' || true
+              while IFS= read -r -d '' log; do
+                local lines previous first
+                lines=$(wc -l < "$log") || continue
+                previous=${log_lines[$log]:-0}
+                printf '[ARC model log] %s: %s lines\n' "${log#"$report_dir/"}" "$lines"
+                if (( lines < previous )); then previous=0; fi
+                if (( lines > previous )); then
+                  first=$((previous + 1))
+                  if (( lines - previous > 100 )); then
+                    printf '[ARC model log] omitted %s older lines from this sample\n' "$((lines - previous - 100))"
+                    first=$((lines - 99))
+                  fi
+                  sed -n "${first},${lines}s/^/[model] /p" "$log" || true
+                  log_lines[$log]=$lines
+                fi
+              done < <(find "$report_dir/cases" -type f -name server.log -print0)
             fi
           }
           v2_path=$(awk -F: '$1 == 0 && $2 == "" {print $3; exit}' /proc/self/cgroup)
@@ -197,7 +217,7 @@ jobs:
             trap 'exit 0' TERM
             while true; do
               sample_memory
-              sleep 30 & wait $!
+              sleep 10 & wait $!
             done
           ) &
           sampler=$!
