@@ -105,6 +105,11 @@ an old score as a control. A quantization method can retain its class while
 an Adapter rebinds its execution callable; inspect actual operators/kernels
 and topology before attributing an accuracy change to the framework.
 
+An unchanged serial request has different scheduling and cache history from
+the original cohort. Retain both full-cohort and serial results, including
+baseline failures. Reproduction on the baseline does not establish numerical
+equivalence or erase an earlier candidate failure.
+
 ## Prepare a reviewable change
 
 Refresh the target branch, relevant open/merged requests, commits and review
@@ -112,6 +117,9 @@ threads before publishing. Compare full hunks and dependencies, including
 other release lines when related. Update an existing open request for the
 same fix; after it merges, prepare only a still-needed narrow follow-up on
 the new target. Old-head test results retain their original scope.
+When a new target enables an existing fused kernel, prepare its affected
+constructor, kernel and model checks. Preserve both sides of any shared CI
+selection file; a clean patch application does not qualify the new runtime.
 
 Include the problem, ownership decision, exact test commands/results,
 evaluation scope, remaining dependencies and AI assistance in the PR.
