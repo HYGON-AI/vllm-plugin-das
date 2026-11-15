@@ -37,6 +37,7 @@ jobs:
         run: |
           test "$RELEASE_REF" = v0.33.0
           python -B -m unittest discover -s tests/ci -v
+          python -I -B -m unittest discover -s skills/upgrading-vllm-hcu-upstream-first/scripts -v
       - name: Select this release without the legacy registry
         id: select
         env:
