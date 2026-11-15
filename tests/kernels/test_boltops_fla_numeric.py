@@ -306,3 +306,39 @@ def test_aiter_hip_decode_matches_official_with_null_block_padding():
     )
     torch.testing.assert_close(hip_state, ref_state, rtol=5e-2, atol=5e-3)
     torch.testing.assert_close(hip_state[0], state0[0], rtol=0, atol=0)
+
+
+@pytest.mark.parametrize("lengths", [(64,), (33, 129)])
+def test_boltops_dense_initial_state_keeps_first_row(monkeypatch, lengths):
+    """With zero updates and no gate, every initial state must be preserved."""
+    if not torch.cuda.is_available():
+        pytest.skip("HCU is required")
+    pytest.importorskip("boltops.fla.gdn")
+    from vllm.third_party.flash_linear_attention.ops import chunk
+    from vllm_hcu.patch.worker.op_opt import _gdn_backend, patch_fla_chunk_delta_h
+
+    patch_fla_chunk_delta_h.apply_to_module(chunk)
+    monkeypatch.setenv("VLLM_HCU_USE_CUSTOM_OPS", "1")
+    monkeypatch.setattr(_gdn_backend, "_prefill_requested", "hcu-boltops")
+    total = sum(lengths)
+    k = torch.zeros(1, total, 16, 128, device="cuda", dtype=torch.bfloat16)
+    w = torch.zeros(1, total, 48, 128, device="cuda", dtype=torch.bfloat16)
+    u = torch.zeros_like(w)
+    offsets = [0]
+    for length in lengths:
+        offsets.append(offsets[-1] + length)
+    cu = torch.tensor(offsets, device="cuda", dtype=torch.long)
+    initial = torch.full((len(lengths), 48, 128, 128), 0.125, device="cuda")
+    initial[-1] *= 2
+    expected = torch.cat([
+        initial[i:i + 1].to(k.dtype).repeat((length + 63) // 64, 1, 1, 1)
+        for i, length in enumerate(lengths)
+    ]).unsqueeze(0)
+    h, new_u, final = chunk.chunk_gated_delta_rule_fwd_h(
+        k, w, u, initial_state=initial.clone(), output_final_state=True,
+        cu_seqlens=cu,
+    )
+    torch.cuda.synchronize()
+    torch.testing.assert_close(h, expected, rtol=0, atol=0)
+    torch.testing.assert_close(new_u, u, rtol=0, atol=0)
+    torch.testing.assert_close(final, initial, rtol=0, atol=0)
