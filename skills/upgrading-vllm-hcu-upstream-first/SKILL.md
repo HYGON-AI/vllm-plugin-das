@@ -49,6 +49,9 @@ reported but excluded from analysis; commit or separately bind their bytes.
 For repositories with configured clean/process filters, working-tree inspection
 is reported as unavailable because `git status` can execute those filters.
 Committed-tree analysis still runs without invoking them.
+Working-tree status excludes submodule recursion so initialized partial-clone
+children cannot fetch through an older Git. Committed gitlink changes remain
+in the report; uncommitted changes inside submodule worktrees are excluded.
 When a regular package and sibling `.py` file share a name, module lookup
 prefers the package initializer, matching Python's import precedence.
 A regular parent module blocks namespace children; dotted parent components
@@ -119,6 +122,13 @@ different generated content. A checkpoint-weight numerical probe with synthetic
 activations helps locate a boundary, but does not prove model-level causality.
 Keep compile failures and missing process-tracking evidence visible; rerun a
 corrected diagnostic separately instead of treating missing results as passes.
+
+Platform API semantics do not establish a kernel's physical lane width. For
+warp reductions, check the active compiler target and generated reduction
+scope before choosing lane IDs or shared-memory partitions. Preserve the
+Adapter's platform identity. An exact projection and squared-sum regression
+with changed-input Graph replay can expose duplicate lane contributions;
+validate the real model separately before claiming its accuracy is restored.
 
 An unchanged serial request has different scheduling and cache history from
 the original cohort. Retain both full-cohort and serial results, including

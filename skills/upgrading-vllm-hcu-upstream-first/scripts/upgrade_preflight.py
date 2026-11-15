@@ -125,7 +125,7 @@ class Repo:
             entries, state = None, "unavailable_configured_filters"
         else:
             status = git(self.root, "status", "--porcelain=v1", "-z",
-                         "--untracked-files=normal")
+                         "--untracked-files=normal", "--ignore-submodules=all")
             entries, state = 0, "observed"
             records = iter(status.split(b"\0"))
             for record in records:
@@ -137,6 +137,7 @@ class Repo:
                     next(records)
         return {"root": str(self.root), "requested_ref": self.ref, "sha": self.sha,
                 "working_tree_entries": entries, "working_tree_status": state,
+                "submodule_worktrees": "excluded; committed gitlinks compared",
                 "input_mode": "committed_tree_only; uncommitted changes excluded"}
 
 

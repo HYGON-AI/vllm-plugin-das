@@ -388,6 +388,34 @@ raise RuntimeError("Repository code must never execute")
         self.assertFalse(out.exists())
         self.assertEqual(before, git(self.plugin, "count-objects", "-v"))
 
+    def test_old_git_does_not_fetch_initialized_partial_submodule(self):
+        git(self.up, "config", "uploadpack.allowFilter", "true")
+        child = self.plugin / "vendor"
+        subprocess.run(
+            ["git", "clone", "-q", "--filter=tree:0", "--no-checkout",
+             self.up.as_uri(), str(child)], check=True,
+        )
+        write(self.plugin, ".gitmodules",
+              f'[submodule "vendor"]\n\tpath = vendor\n\turl = {self.up.as_uri()}\n')
+        git(self.plugin, "add", ".gitmodules")
+        git(self.plugin, "update-index", "--add", "--cacheinfo", "160000",
+            git(child, "rev-parse", "HEAD"), "vendor")
+        commit_index(self.plugin)
+        packs = child / ".git/objects/pack"
+        before = {p.name: p.read_bytes() for p in packs.iterdir()}
+        env = self.old_git_environment()
+        wrapper = Path(env["PATH"].split(os.pathsep)[0]) / "git"
+        wrapper.write_text(wrapper.read_text().replace(
+            "exec ", "unset GIT_NO_LAZY_FETCH\nexec ", 1))
+        out = self.root / "report"
+        with patch.dict(os.environ, env):
+            run = self.invoke(out)
+        self.assertEqual(run.returncode, 0, run.stderr)
+        self.assertEqual(before, {p.name: p.read_bytes() for p in packs.iterdir()},
+                         "Git status fetched objects inside the submodule")
+        report = json.loads((out / "preflight.json").read_text())
+        self.assertEqual(report["sources"]["plugin"]["working_tree_status"], "observed")
+
     def test_link_and_submodule_deltas_are_not_dropped(self):
         def blob(text):
             return subprocess.check_output(
