@@ -50,6 +50,9 @@ is reported as unavailable because `git status` can execute those filters.
 Committed-tree analysis still runs without invoking them.
 When a regular package and sibling `.py` file share a name, module lookup
 prefers the package initializer, matching Python's import precedence.
+Direct classmethod guards distinguish bound access from `.__func__`; aliases
+or additional decorators with unresolved binding remain review candidates.
+Git paths retain arbitrary filename bytes in escaped JSON/Markdown output.
 
 This is **not a complete Plugin inventory**. Enumerate Adapter entry points,
 OOT registrations, backend/quantization registries, dynamic imports, native
@@ -95,6 +98,12 @@ head can test startup and communication, but cannot establish model quality.
 A shared-node memory preflight is an observation, not a reservation. Preserve
 the actual worker admission failure if free memory changes before startup;
 do not report a weight-loading failure or a model score for that attempt.
+
+Matching package entry-point hashes do not establish matching installations.
+Compare the complete owned package payloads and native libraries before using
+an old score as a control. A quantization method can retain its class while
+an Adapter rebinds its execution callable; inspect actual operators/kernels
+and topology before attributing an accuracy change to the framework.
 
 ## Prepare a reviewable change
 

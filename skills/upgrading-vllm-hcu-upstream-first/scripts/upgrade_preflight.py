@@ -43,7 +43,7 @@ class Repo:
             meta, path = record.split(b"\t", 1)
             mode, kind, oid = meta.decode().split()
             if kind in ("blob", "commit"):
-                self.files[path.decode("utf-8")] = (mode, oid)
+                self.files[path.decode("utf-8", errors="surrogateescape")] = (mode, oid)
         self.source_files = {p for p, (mode, _) in self.files.items()
                              if mode in ("100644", "100755")}
         self.cache = {}
@@ -152,6 +152,32 @@ def parameter_names(tree, symbol):
     ) + [a.arg for a in args.kwonlyargs] + ([args.kwarg.arg] if args.kwarg else [])
 
 
+def classmethod_binding(function, symbol, expression):
+    """Resolve a direct descriptor access; aliases/custom decorators stay unknown."""
+    if not any(isinstance(d, ast.Name) and d.id == "classmethod"
+               for d in function.decorator_list):
+        return None
+    if len(function.decorator_list) != 1:
+        return "unresolved"
+    unbound = isinstance(expression, ast.Attribute) and expression.attr == "__func__"
+    if unbound:
+        expression = expression.value
+    names = []
+    while isinstance(expression, ast.Attribute):
+        names.append(expression.attr)
+        expression = expression.value
+    if not isinstance(expression, ast.Name):
+        return "unresolved"
+    names.append(expression.id)
+    parts = symbol.split(".")
+    if list(reversed(names))[-len(parts):] != parts:
+        return "unresolved"
+    if not unbound and not (function.args.posonlyargs or function.args.args
+                            or function.args.vararg):
+        return "unresolved"
+    return "unbound" if unbound else "bound"
+
+
 def function_contract(node):
     if node is None:
         return None
@@ -223,10 +249,18 @@ def signature_checks(tree, values, target_tree, module):
                         expected += (name,)
             if not isinstance(symbol, str) or not symbol.startswith(module + "."):
                 continue
-            actual = parameter_names(target_tree, symbol[len(module) + 1:]) if target_tree else None
+            relative_symbol = symbol[len(module) + 1:]
+            function = find_function(target_tree, relative_symbol)
+            binding = classmethod_binding(function, relative_symbol, node.args[0]) if function else None
+            actual = parameter_names(target_tree, relative_symbol) if function else None
+            if binding == "bound" and (function.args.posonlyargs or function.args.args):
+                actual = actual[1:]
+            if binding == "unresolved":
+                actual = None
             checks.append({"symbol": symbol, "guard_line": node.lineno,
                            "expected_names": list(expected), "target_names": actual,
-                           "status": "symbol_unresolved" if actual is None else
+                           "status": "binding_unresolved" if binding == "unresolved" else
+                           "symbol_unresolved" if actual is None else
                            "names_match_only" if list(expected) == actual else
                            "parameter_names_changed"})
         except (ValueError, KeyError, TypeError, IndexError):
@@ -310,7 +344,9 @@ def fork_deltas(base, fork, target):
 
 def markdown(report):
     def cell(value):
-        return html.escape(str(value)).replace("|", "\\|").replace("\n", " ")
+        # Preserve Git's arbitrary path bytes as visible, reversible escapes.
+        value = str(value).encode("utf-8", errors="backslashreplace").decode("utf-8")
+        return html.escape(value).replace("|", "\\|").replace("\n", " ")
     lines = ["# 升级只读预检", "", "静态候选清单；所有处置待定。不是兼容性、优化等价或硬件验收报告。", "",
              "## 源码", "", "| 角色 | SHA | 工作区条目 |", "| --- | --- | --- |"]
     for role, source in report["sources"].items():
@@ -387,7 +423,7 @@ def main():
             except SyntaxError:
                 warnings.append("Plugin version metadata could not be parsed")
         output.mkdir(parents=True, exist_ok=False)
-        (output / "preflight.json").write_text(json.dumps(report, ensure_ascii=False, indent=2) + "\n", encoding="utf-8")
+        (output / "preflight.json").write_text(json.dumps(report, ensure_ascii=True, indent=2) + "\n", encoding="utf-8")
         (output / "preflight.md").write_text(markdown(report), encoding="utf-8")
         print(json.dumps({"status": "report_generated_not_acceptance", "output": str(output), "fork_deltas": len(report["fork_deltas"]),
                           "adapters": len(report["adapters"]), "warnings": len(warnings)}, ensure_ascii=False))

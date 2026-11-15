@@ -172,6 +172,53 @@ PATCH_ID = "old"
                 finally:
                     git(self.plugin, "config", scope, "--unset", key)
 
+    def test_classmethod_guards_preserve_bound_unbound_and_unknown_binding(self):
+        source = "class Ops:\n    @classmethod\n    def ready(cls): return True\n"
+        for root in (self.fork, self.up):
+            write(root, "vllm/router.py", source)
+            commit(root)
+        for index, (expression, expected, status) in enumerate([
+            ("Ops.ready", (), "names_match_only"),
+            ("Ops.ready.__func__", ("cls",), "names_match_only"),
+            ("fn", (), "binding_unresolved"),
+            ("Ops.ready", ("missing",), "parameter_names_changed"),
+        ]):
+            with self.subTest(expression=expression, expected=expected):
+                write(self.plugin, "vllm_hcu/patch/patch_router.py", f'''
+TARGET_MODULE = "vllm.router"
+PATCH_ID = "router"
+def apply():
+    require_exact_signature({expression}, "vllm.router.Ops.ready", positional={expected!r})
+raise RuntimeError("Repository code must never execute")
+''')
+                commit(self.plugin)
+                out = self.root / f"classmethod-{index}"
+                run = self.invoke(out)
+                self.assertEqual(run.returncode, 0, run.stderr)
+                report = json.loads((out / "preflight.json").read_text())
+                router = next(x for x in report["adapters"] if x["patch_id"] == "router")
+                check = router["signature_checks"][0]
+                self.assertEqual(check["status"], status)
+                self.assertEqual(check["contract_comparison"]["status"], "unchanged_static_only")
+
+    @unittest.skipUnless(os.name == "posix", "Git byte filenames require a POSIX filesystem")
+    def test_non_utf8_tree_paths_are_preserved_in_valid_reports(self):
+        name = os.fsdecode(b"vllm/odd-\xff.py")
+        write(self.fork, name, "def route(x): return x\n")
+        commit(self.fork)
+        patch_name = os.fsdecode(b"vllm_hcu/patch/patch_\xfe.py")
+        write(self.plugin, patch_name, 'TARGET_MODULE = "vllm.router"\n')
+        commit(self.plugin)
+        out = self.root / "byte-paths"
+        run = self.invoke(out)
+        self.assertEqual(run.returncode, 0, run.stderr)
+        report = json.loads((out / "preflight.json").read_text(encoding="utf-8"))
+        self.assertIn(name, [row["path"] for row in report["fork_deltas"]])
+        self.assertIn(patch_name, [row["adapter"] for row in report["adapters"]])
+        markdown = (out / "preflight.md").read_text(encoding="utf-8")
+        self.assertIn("odd-\\udcff.py", markdown)
+        self.assertIn("patch_\\udcfe.py", markdown)
+
     def test_does_not_overwrite_report(self):
         out = self.root / "report"
         out.mkdir()
