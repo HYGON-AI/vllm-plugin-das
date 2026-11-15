@@ -48,6 +48,8 @@ reported but excluded from analysis; commit or separately bind their bytes.
 For repositories with configured clean/process filters, working-tree inspection
 is reported as unavailable because `git status` can execute those filters.
 Committed-tree analysis still runs without invoking them.
+When a regular package and sibling `.py` file share a name, module lookup
+prefers the package initializer, matching Python's import precedence.
 
 This is **not a complete Plugin inventory**. Enumerate Adapter entry points,
 OOT registrations, backend/quantization registries, dynamic imports, native

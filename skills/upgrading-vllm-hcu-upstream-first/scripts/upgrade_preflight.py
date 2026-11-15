@@ -79,7 +79,7 @@ class Repo:
 
     def module_path(self, module):
         stem = module.replace(".", "/")
-        return next((p for p in (stem + ".py", stem + "/__init__.py")
+        return next((p for p in (stem + "/__init__.py", stem + ".py")
                      if p in self.source_files), None)
 
     def describe(self):

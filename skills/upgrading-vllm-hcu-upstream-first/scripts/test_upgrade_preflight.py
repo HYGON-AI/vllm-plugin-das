@@ -120,6 +120,27 @@ PATCH_ID = "old"
         self.assertNotEqual(run.returncode, 0)
         self.assertFalse(out.exists())
 
+    def test_package_initializer_takes_precedence_over_sibling_module(self):
+        for root in (self.fork, self.up):
+            write(root, "vllm/router.py", "def route(x): return x\n")
+        write(self.fork, "vllm/router/__init__.py", "def route(x): return x\n")
+        write(self.up, "vllm/router/__init__.py",
+              "def route(x, required): return x + required\n"
+              "raise RuntimeError('Repository code must never execute')\n")
+        commit(self.fork)
+        commit(self.up)
+        out = self.root / "package-precedence"
+        run = self.invoke(out)
+        self.assertEqual(run.returncode, 0, run.stderr)
+        report = json.loads((out / "preflight.json").read_text())
+        router = next(x for x in report["adapters"] if x["patch_id"] == "router")
+        self.assertEqual(router["fork_path"], "vllm/router/__init__.py")
+        self.assertEqual(router["official_path"], "vllm/router/__init__.py")
+        check = router["signature_checks"][0]
+        self.assertEqual(check["status"], "parameter_names_changed")
+        self.assertEqual(check["contract_comparison"]["status"], "changed_review_required")
+        self.assertIn("parameters", check["contract_comparison"]["changed_fields"])
+
     def test_configured_clean_or_process_filter_is_not_executed(self):
         marker = self.root / "filter-executed"
         helper = self.root / "filter.py"
