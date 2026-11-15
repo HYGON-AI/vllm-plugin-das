@@ -355,7 +355,8 @@ class VLResolvedQuantizationTests(unittest.TestCase):
         self.addCleanup(imports.stop)
         self.scope = functions(
             "vllm_hcu/patch/platform/core_fix/patch_vllm_config.py",
-            {"validate_hyv4_vl_pcp_quantization"})
+            {"validate_hyv4_vl_pcp_quantization"},
+            {"get_hcu_config": feature_config_module().get_hcu_config})
 
     def validate(self, current, model):
         self.assertIn("validate_hyv4_vl_pcp_quantization", self.scope)
@@ -377,6 +378,28 @@ class VLResolvedQuantizationTests(unittest.TestCase):
             with self.subTest(layers=layers):
                 with self.assertRaisesRegex(ValueError, "W4A8"):
                     self.validate(config(), NS(moe_layers=layers))
+
+    def test_megamoe_requires_every_resolved_expert_to_use_the_fp8_hook(self):
+        name = ("vllm.model_executor.layers.quantization.compressed_tensors."
+                "compressed_tensors_moe.compressed_tensors_moe_w8a8_fp8")
+        module = ModuleType(name)
+        method_type = type("CompressedTensorsW8A8Fp8MoEMethod", (), {})
+        module.CompressedTensorsW8A8Fp8MoEMethod = method_type
+        method = method_type()
+        method.weight_quant = NS(strategy="channel")
+        method.input_quant = NS(strategy="token", dynamic=True)
+        method.fp8_backend = NS(value="HCU_DEEPGEMM")
+        good = NS(routed_experts=NS(quant_method=method))
+        with patch.dict(sys.modules, {name: module}):
+            for pcp in (1, 16):
+                current = config()
+                current.model_config.hf_config.quantization_config["format"] = "float-quantized"
+                current.parallel_config.prefill_context_parallel_size = pcp
+                current.additional_config["hcu"]["hy4_fp8_megamoe"] = True
+                method.supports_eplb = pcp > 1
+                self.validate(current, NS(moe_layers=[good]))
+                with self.assertRaisesRegex(ValueError, "MegaMoE MoE layer 1 requires channel FP8"):
+                    self.validate(current, NS(moe_layers=[good, self.layer()]))
 
     def test_mixed_or_malformed_raw_groups_cannot_bypass_resolved_guard(self):
         for groups in ({}, {"experts": None},

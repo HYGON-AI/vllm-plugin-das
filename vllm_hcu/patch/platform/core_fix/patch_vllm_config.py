@@ -243,22 +243,24 @@ def validate_hyv4_vl_pcp_quantization(vllm_config: object, model: object) -> Non
     """
     model_config = getattr(vllm_config, "model_config", None)
     parallel = getattr(vllm_config, "parallel_config", None)
-    if (
-        getattr(model_config, "architectures", None)
-        != ["HYV4VLForConditionalGeneration"]
-        or getattr(parallel, "prefill_context_parallel_size", 1) <= 1
-    ):
+    if getattr(model_config, "architectures", None) != ["HYV4VLForConditionalGeneration"]:
+        return
+    pcp = getattr(parallel, "prefill_context_parallel_size", 1) > 1
+    mega = get_hcu_config(vllm_config).hy4_fp8_megamoe
+    if not (pcp or mega):
         return
 
+    route = "HYV4-VL MegaMoE" if mega else "HYV4-VL PCP"
+    required = "channel FP8" if mega else "static W4A8 or channel FP8"
     try:
         layers = tuple(getattr(model, "moe_layers", ()))
     except TypeError as exc:
-        raise ValueError("HYV4-VL PCP requires resolved static W4A8 MoE layers") from exc
+        raise ValueError(f"{route} requires resolved {required} MoE layers") from exc
     if not layers:
-        raise ValueError("HYV4-VL PCP requires resolved static W4A8 MoE layers")
+        raise ValueError(f"{route} requires resolved {required} MoE layers")
 
     raw_quantization = getattr(getattr(model_config, "hf_config", None), "quantization_config", None)
-    if isinstance(raw_quantization, dict) and raw_quantization.get("format") == "float-quantized":
+    if mega or (isinstance(raw_quantization, dict) and raw_quantization.get("format") == "float-quantized"):
         from vllm.model_executor.layers.quantization.compressed_tensors.compressed_tensors_moe.compressed_tensors_moe_w8a8_fp8 import (
             CompressedTensorsW8A8Fp8MoEMethod,
         )
@@ -271,11 +273,12 @@ def validate_hyv4_vl_pcp_quantization(vllm_config: object, model: object) -> Non
                 and method.input_quant.strategy == "token"
                 and method.input_quant.dynamic
                 and method.fp8_backend.value == "HCU_DEEPGEMM"
-                and method.supports_eplb
+                and (not pcp or method.supports_eplb)
             ):
                 raise ValueError(
-                    f"HYV4-VL PCP MoE layer {index} requires channel FP8 weights, "
-                    "dynamic per-token FP8 activations and HCU DeepGEMM with EPLB"
+                    f"{route} MoE layer {index} requires channel FP8 weights, "
+                    "dynamic per-token FP8 activations and HCU DeepGEMM"
+                    + (" with EPLB" if pcp else "")
                 )
         return
 

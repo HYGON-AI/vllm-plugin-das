@@ -592,6 +592,19 @@ def apply_to_module(module: ModuleType) -> bool:
     def hcu_create_engine_config(self, *args: Any, **kwargs: Any):
         feature_config = _normalise_existing_engine_args(self)
         config = create_engine_config(self, *args, **kwargs)
+        if feature_config.hy4_fp8_megamoe:
+            model = config.model_config
+            quant = getattr(model.hf_config, "quantization_config", None)
+            if not (
+                model.architectures == ["HYV4VLForConditionalGeneration"]
+                and model.quantization == "compressed-tensors"
+                and isinstance(quant, Mapping)
+                and quant.get("format") == "float-quantized"
+            ):
+                raise ValueError(
+                    f"--moe-backend {HY4_MEGAMOE_BACKEND} requires a HY4-VL "
+                    "compressed-tensors channel FP8 checkpoint"
+                )
         set_hcu_config(config, feature_config)
         for public, sidecar in _HCU_EPLB_FIELDS.items():
             attribute = f"_vllm_hcu_{sidecar}"

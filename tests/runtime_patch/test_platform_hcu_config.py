@@ -576,12 +576,30 @@ def test_hy4_megamoe_cli_survives_worker_config_round_trip() -> None:
     parser.set_defaults(additional_config={})
     patch_hcu_config.register_hcu_cli_args(parser)
     module = _make_arg_utils_module()
+    model = SimpleNamespace(
+        architectures=["HYV4VLForConditionalGeneration"], quantization="compressed-tensors",
+        hf_config=SimpleNamespace(quantization_config={"format": "float-quantized"}),
+    )
+    original = module.EngineArgs.create_engine_config
+
+    def create_engine_config(self, usage_context=None, headless=False):
+        config = original(self, usage_context, headless)
+        config.model_config = model
+        return config
+
+    module.EngineArgs.create_engine_config = create_engine_config
     patch_engine_args.apply_to_module(module)
     for backend, enabled in (("deep_gemm_meag_moe", True), ("deep_gemm", False)):
         args = module.EngineArgs.from_cli_args(parser.parse_args(["--moe-backend", backend]))
         config = args.create_engine_config()
         assert config.kernel_config.moe_backend == "deep_gemm"
         assert get_hcu_config(pickle.loads(pickle.dumps(config))).hy4_fp8_megamoe is enabled
+
+    model.hf_config.quantization_config["format"] = "pack-quantized"
+    args = module.EngineArgs.from_cli_args(parser.parse_args(["--moe-backend", "deep_gemm_meag_moe"]))
+    with pytest.raises(ValueError, match="deep_gemm_meag_moe requires.*channel FP8"):
+        args.create_engine_config()
+    module.EngineArgs(moe_backend="deep_gemm").create_engine_config()
 
 
 def test_cli_registration_accepts_legacy_deep_gemm_backend() -> None:
