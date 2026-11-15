@@ -9,8 +9,9 @@ from tests.vllm033.test_slimquant import (
     native_parallel,  # noqa: F401 -- imported pytest fixture
 )
 
+pytestmark = pytest.mark.hcu
 
-@pytest.mark.hcu
+
 @native
 @pytest.mark.parametrize("dense", [False, True])
 @pytest.mark.parametrize("ngram", [False, True])
