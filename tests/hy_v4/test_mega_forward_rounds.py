@@ -57,16 +57,18 @@ def test_ep16_rounds_once_per_backbone_forward(tmp_path):
 
 
 @pytest.mark.parametrize("pcp,dp", [(16, 1), (1, 16)])
-def test_megamoe_rejects_dbo_before_accessing_ep_group(monkeypatch, pcp, dp):
+@pytest.mark.parametrize("feature", ["DBO", "LoRA"])
+def test_megamoe_rejects_unsupported_features_before_accessing_ep_group(monkeypatch, pcp, dp, feature):
     install_hy4_mega_kernel = _load_megamoe()["install_hy4_mega_kernel"]
 
     config = SimpleNamespace(
         model_config=SimpleNamespace(architectures=["HYV4VLForConditionalGeneration"]),
-        parallel_config=SimpleNamespace(enable_dbo=True, prefill_context_parallel_size=pcp,
+        lora_config=SimpleNamespace() if feature == "LoRA" else None,
+        parallel_config=SimpleNamespace(enable_dbo=feature == "DBO", prefill_context_parallel_size=pcp,
                                         data_parallel_size=dp),
     )
     monkeypatch.setattr("vllm.config.get_current_vllm_config", lambda: config)
     with patch("vllm.distributed.get_ep_group") as get_group:
-        with pytest.raises(ValueError, match="MegaMoE does not support DBO"):
+        with pytest.raises(ValueError, match=f"MegaMoE does not support {feature}"):
             install_hy4_mega_kernel(None, None)
         get_group.assert_not_called()

@@ -164,6 +164,9 @@ def install_hy4_mega_kernel(method, layer):
     if p.enable_dbo:
         raise ValueError("HY4 FP8 MegaMoE does not support DBO: overlapping microbatches "
                          "would share the EP group's mutable symmetric buffer")
+    if config.lora_config is not None:
+        raise ValueError("HY4 FP8 MegaMoE does not support LoRA: its packed expert "
+                         "weights cannot apply routed-expert adapters")
     ep = get_ep_group()
     decode = (
         p.data_parallel_size == 16 and p.prefill_context_parallel_size == 1
