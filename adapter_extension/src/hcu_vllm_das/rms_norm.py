@@ -21,7 +21,11 @@ def _rms_norm_impl(
     variance_epsilon: float,
     training: bool,
 ) -> torch.Tensor:
-    return rmsnorm_forward_autograd(x, weight, variance_epsilon, training)
+    # vLLM's native IR rounds the normalized value before multiplying weight.
+    normalized = rmsnorm_forward_autograd(
+        x, torch.ones_like(weight), variance_epsilon, training
+    )
+    return normalized * weight
 
 
 def _rms_norm_fake(
@@ -40,7 +44,8 @@ def _fused_add_rms_norm_impl(
     weight: torch.Tensor,
     variance_epsilon: float,
 ) -> None:
-    fused_add_rms_norm(x, residual, weight, variance_epsilon)
+    fused_add_rms_norm(x, residual, torch.ones_like(weight), variance_epsilon)
+    x.mul_(weight)
 
 
 def _fused_add_rms_norm_fake(

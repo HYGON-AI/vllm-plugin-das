@@ -278,6 +278,16 @@ All other cases use vLLM's native RMSNorm implementation. `GemmaRMSNorm`,
 `RMSNormGated`, quantized fusion, model patches, and performance claims are out
 of scope for this release.
 
+The optional ordinary and fused RMSNorm paths retain the native IR's rounding
+order: normalize in FP32, cast to the input/weight dtype, then multiply by the
+weight. LightOp computes the unweighted normalization and PyTorch applies the
+weight after that cast. The residual still stores the rounded FP32 sum. This
+uses an extra dtype-preserving multiply; measure its serving cost independently
+of accuracy. A final-cast-only FP32 formula is insufficient as a regression
+oracle, especially before INT8 activation quantization.
+See the scoped [rounding validation](../docs/validation/vllm033-rms-rounding.md)
+for the regression, model results, and component cost.
+
 ## Opt in and rollback
 
 The optimized path defaults to OFF. Enable it explicitly; the master switch

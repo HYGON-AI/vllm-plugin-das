@@ -65,6 +65,14 @@ class Tensor:
     def is_contiguous(self):
         return self._contiguous
 
+    def __mul__(self, other):
+        events.append(["weight-multiply", self.tag, other.tag, self.dtype])
+        return Tensor(self.shape, dtype=self.dtype, tag=self.tag)
+
+    def mul_(self, other):
+        events.append(["weight-multiply-inplace", self.tag, other.tag, self.dtype])
+        return self
+
 def empty_like(value):
     events.append(["empty_like", value.tag])
     return Tensor(value.shape, dtype=value.dtype, tag="ordinary-fake")
@@ -73,6 +81,7 @@ torch = ModuleType("torch")
 torch.Tensor = Tensor
 torch.bfloat16 = "bf16"
 torch.empty_like = empty_like
+torch.ones_like = lambda value: Tensor(value.shape, dtype=value.dtype, tag="unit-weight")
 torch.float16 = "fp16"
 torch.ops = SimpleNamespace(vllm=SimpleNamespace())
 sys.modules["torch"] = torch

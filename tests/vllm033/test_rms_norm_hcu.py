@@ -196,3 +196,64 @@ def test_installed_fused_rmsnorm_compile_replay_has_no_alias_warning() -> None:
         updated_residual.float(), expected_sum, rtol=2e-2, atol=2e-2
     )
     torch.testing.assert_close(actual.float(), expected, rtol=4e-2, atol=4e-2)
+
+
+@pytest.mark.skipif(not _live_requested(), reason="explicit live RMSNorm validation")
+@pytest.mark.parametrize("dtype_name", ("bfloat16", "float16"))
+@pytest.mark.parametrize("fused", (False, True))
+@pytest.mark.parametrize("width", (128, 4096))
+def test_rmsnorm_preserves_official_round_before_weight_on_graph_replay(
+    monkeypatch: pytest.MonkeyPatch,
+    dtype_name: str,
+    fused: bool,
+    width: int,
+) -> None:
+    """A single final cast changes INT8 inputs even if a loose FP32 oracle passes."""
+    import torch
+
+    from vllm.config import VllmConfig, set_current_vllm_config
+    from vllm.model_executor.layers.layernorm import RMSNorm
+    from vllm.plugins import load_general_plugins
+
+    load_general_plugins()
+    monkeypatch.setenv("VLLM_HCU_USE_CUSTOM_OPS", "1")
+    monkeypatch.setenv("VLLM_HCU_USE_CUSTOM_RMS_NORM", "1")
+    torch.manual_seed(20261115)
+    dtype = getattr(torch, dtype_name)
+    with set_current_vllm_config(VllmConfig()):
+        layer = RMSNorm(width).to(device="cuda", dtype=dtype)
+        layer.weight.data.normal_(mean=1.0, std=0.2)
+        value = torch.randn((17, width), device="cuda", dtype=dtype)
+        residual = torch.randn_like(value) if fused else None
+        # Capture with persistent addresses; overwrite both inputs before replay.
+        stream = torch.cuda.Stream()
+        stream.wait_stream(torch.cuda.current_stream())
+        with torch.cuda.stream(stream):
+            for _ in range(3):
+                output = layer(value, residual)
+        torch.cuda.current_stream().wait_stream(stream)
+        graph = torch.cuda.CUDAGraph()
+        with torch.cuda.graph(graph):
+            output = layer(value, residual)
+        for shift in (0.125, -0.375):
+            source = torch.randn_like(value) + shift
+            source_residual = torch.randn_like(value) if fused else None
+            summed = source.float()
+            if fused:
+                summed = summed + source_residual.float()
+            # Independent formula preserves the target's intermediate dtype cast.
+            normalized = summed * torch.rsqrt(
+                summed.square().mean(-1, keepdim=True) + 1e-6
+            )
+            expected = normalized.to(dtype) * layer.weight
+            value.copy_(source)
+            if fused:
+                residual.copy_(source_residual)
+            graph.replay()
+            actual = output[0] if fused else output
+            torch.cuda.synchronize()
+            torch.testing.assert_close(actual, expected, rtol=2e-3, atol=2e-3)
+            # Reduction-order ties can differ; a missing cast changes ~25% of values.
+            assert (actual == expected).float().mean().item() >= 0.999
+            if fused:
+                torch.testing.assert_close(output[1], summed.to(dtype), rtol=0, atol=0)
