@@ -24,6 +24,10 @@ and retains a Plugin E5M2 writer and descale adapter. The kernel page is 64
 tokens. It neither copies nor replaces the official Flash forward method and
 does not require private HCU hooks in the Core.
 
+Positive `logits_soft_cap` uses Core's unchanged Triton attention over the same
+paged cache views, because the vendor paged path ignores softcap. See
+[softcap routing and validation](../docs/validation/vllm033-softcap.md).
+
 vLLM's native `SiluAndMul` remains the selected implementation. Warmed
 compiled A/B measurements on `gfx936` did not justify replacing the upstream
 operator, so the plugin neither registers nor ships a `SiluAndMul` override.

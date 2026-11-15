@@ -38,6 +38,36 @@ def _layout_name(layout: KVCacheLayout) -> str:
     return getattr(layout, "name", str(layout))
 
 
+def _triton_softcap_attention(**kwargs: Any) -> torch.Tensor:
+    """Use Core's softcap implementation over the existing paged cache views."""
+    if kwargs.get("return_softmax_lse") or kwargs.get("return_attn_probs"):
+        raise NotImplementedError("Core softcap path does not return attention statistics")
+    if any(kwargs.get(name) is not None for name in ("q_descale", "k_descale", "v_descale")):
+        raise ValueError("Core softcap path requires descales to be applied first")
+    from vllm.v1.attention.ops.triton_unified_attention import unified_attention
+
+    key, value = kwargs["k"], kwargs["v"]
+    if kwargs["layout"] == "bhsd":
+        key, value = key.transpose(1, 2), value.transpose(1, 2)
+    output = kwargs.get("out")
+    if output is None:
+        output = torch.empty_like(kwargs["q"])
+    scale = kwargs.get("softmax_scale")
+    unified_attention(
+        q=kwargs["q"], k=key, v=value, out=output,
+        cu_seqlens_q=kwargs["cu_seqlens_q"],
+        max_seqlen_q=kwargs["max_seqlen_q"],
+        seqused_k=kwargs["seqused_k"], max_seqlen_k=kwargs["max_seqlen_k"],
+        softmax_scale=kwargs["q"].shape[-1] ** -0.5 if scale is None else scale,
+        causal=kwargs.get("causal", False),
+        window_size=kwargs.get("window_size") or (-1, -1),
+        block_table=kwargs["block_table"], softcap=kwargs["softcap"],
+        q_descale=None, k_descale=None, v_descale=None,
+        alibi_slopes=kwargs.get("alibi_slopes"),
+    )
+    return output
+
+
 def _e5m2_byte_view(tensor: torch.Tensor) -> torch.Tensor:
     if tensor.element_size() != 1:
         raise ValueError("HCU E5M2 FlashAttention requires one-byte K/V storage")
@@ -303,6 +333,19 @@ class HcuFlashAttentionImpl(AttentionImpl[FlashAttentionMetadata]):
                 raise NotImplementedError(
                     f"HCU FlashAttention FA2 does not support {name}"
                 )
+        if kwargs.get("softcap", 0.0) > 0:
+            # Vendor direct-paged attention ignores softcap. Reuse Core's
+            # attention algorithm instead of maintaining another softcap kernel.
+            kwargs["layout"] = (
+                "bhsd" if self.kv_cache_layout == KVCacheLayout.LBHNC else "bshd"
+            )
+            if self.kv_cache_dtype == _E5M2_KV_CACHE_DTYPE:
+                from hcu_vllm_das.attention.e5m2_scales import run_e5m2_attention
+
+                kwargs["k"] = _e5m2_byte_view(kwargs["k"])
+                kwargs["v"] = _e5m2_byte_view(kwargs["v"])
+                return run_e5m2_attention(_triton_softcap_attention, kwargs)
+            return _triton_softcap_attention(**kwargs)
         if (getattr(self, "_prefill_gather_enabled", False)
                 and self.kv_cache_dtype != _E5M2_KV_CACHE_DTYPE):
             from hcu_vllm_das.attention import prefill_gather

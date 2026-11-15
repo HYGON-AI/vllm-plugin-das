@@ -14,12 +14,14 @@ pytestmark = [pytest.mark.hcu, pytest.mark.skipif(
 )]
 
 
-def _reference(q, k, v):
+def _reference(q, k, v, softcap=0.0):
     # Independent FP32 GQA with bottom-right causal alignment.
     groups = q.shape[1] // k.shape[1]
     k = k.float().repeat_interleave(groups, dim=1)
     v = v.float().repeat_interleave(groups, dim=1)
     scores = torch.einsum("qhd,khd->hqk", q.float(), k) / math.sqrt(q.shape[-1])
+    if softcap:
+        scores = softcap * torch.tanh(scores / softcap)
     positions = torch.arange(k.shape[0], device=q.device)
     q_positions = k.shape[0] - q.shape[0] + torch.arange(q.shape[0], device=q.device)
     scores.masked_fill_(positions[None, :] > q_positions[:, None], -float("inf"))
@@ -30,8 +32,9 @@ def _reference(q, k, v):
 @pytest.mark.parametrize("dtype", (torch.bfloat16, torch.float16))
 @pytest.mark.parametrize("nq", ((3, 11), (1, 1)))
 @pytest.mark.parametrize("scale_multiplier", (1.0, 0.001))
+@pytest.mark.parametrize("softcap", (0.0, 0.5))
 @torch.inference_mode()
-def test_nonunit_attention_changed_graph_inputs(layout, dtype, nq, scale_multiplier):
+def test_nonunit_attention_changed_graph_inputs(layout, dtype, nq, scale_multiplier, softcap):
     import vllm._C_stable_libtorch  # noqa: F401
     from hcu_vllm_das.attention.e5m2_cache import reshape_and_cache_e5m2
 
@@ -61,6 +64,8 @@ def test_nonunit_attention_changed_graph_inputs(layout, dtype, nq, scale_multipl
     out = torch.empty_like(query)
     slots = [torch.empty(n, device=device, dtype=torch.int64) for n in nk]
     lse = []
+    # Public AttentionImpl needs output only; Core fallback has no LSE output.
+    request_lse = max(nq) > 1 and softcap == 0.0
 
     def run():
         for b, n in enumerate(nk):
@@ -74,9 +79,9 @@ def test_nonunit_attention_changed_graph_inputs(layout, dtype, nq, scale_multipl
             cu_seqlens_q=cu_q, seqused_k=lengths,
             max_seqlen_q=max(nq), max_seqlen_k=max(nk),
             softmax_scale=d ** -0.5, causal=True, block_table=table,
-            k_descale=ks, v_descale=vs, return_softmax_lse=max(nq) > 1,
+            k_descale=ks, v_descale=vs, softcap=softcap, return_softmax_lse=request_lse,
         )
-        if max(nq) > 1:
+        if request_lse:
             assert isinstance(result, tuple) and result[0] is out
             lse[:] = [result[1]]
         else:
@@ -88,7 +93,7 @@ def test_nonunit_attention_changed_graph_inputs(layout, dtype, nq, scale_multipl
             k = (keys[b].float() / ks[b, :, None]).to(torch.float8_e5m2).float()
             v = (values[b].float() / vs[b, :, None]).to(torch.float8_e5m2).float()
             expected = _reference(
-                query[start:start+n], k * ks[b, :, None], v * vs[b, :, None]
+                query[start:start+n], k * ks[b, :, None], v * vs[b, :, None], softcap
             )
             torch.testing.assert_close(out[start:start+n].float(), expected, atol=0.025, rtol=0.025)
             start += n

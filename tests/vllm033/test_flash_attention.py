@@ -230,6 +230,44 @@ def test_forward_profiles_without_provider_and_leaves_empty_batch_untouched(
     assert torch.all(output == 3)
 
 
+@pytest.mark.parametrize("layout", ("LBHNC", "LBNHC"))
+@pytest.mark.parametrize("prefill_gather", (False, True))
+def test_softcap_forward_uses_core_attention_and_preserves_output(
+    monkeypatch, layout, prefill_gather
+):
+    flash = load_flash_attention(monkeypatch, kv_cache_layout=layout)
+    impl = make_impl(flash, logits_soft_cap=0.5)
+    impl._prefill_gather_enabled = prefill_gather
+    query = torch.randn(5, 4, 64)
+    output = torch.full_like(query, -99.0)
+    cache = torch.empty_strided(
+        (2, 4, 64, 128),
+        (32768, 8192, 128, 1) if layout == "LBHNC" else (32768, 128, 512, 1),
+    )
+
+    def core(**arguments):
+        assert arguments["softcap"] == 0.5
+        assert arguments["layout"] == ("bhsd" if layout == "LBHNC" else "bshd")
+        arguments["out"].fill_(7)
+        return arguments["out"]
+
+    monkeypatch.setattr(flash, "_triton_softcap_attention", core)
+    monkeypatch.setattr(
+        flash, "_vendor_varlen_func", lambda: pytest.fail("softcap reached vendor")
+    )
+    result = impl.forward(None, query, query, query, cache, metadata(), output)
+    assert result is output
+    assert torch.all(output[:2] == 7)
+    assert torch.all(output[2:] == -99)
+
+
+@pytest.mark.parametrize("option", ("return_softmax_lse", "return_attn_probs"))
+def test_core_softcap_path_refuses_unavailable_statistics(monkeypatch, option):
+    flash = load_flash_attention(monkeypatch)
+    with pytest.raises(NotImplementedError, match="attention statistics"):
+        flash._triton_softcap_attention(**{option: True})
+
+
 @pytest.mark.parametrize(
     "field,value",
     (
