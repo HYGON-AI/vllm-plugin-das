@@ -109,6 +109,15 @@ an old score as a control. A quantization method can retain its class while
 an Adapter rebinds its execution callable; inspect actual operators/kernels
 and topology before attributing an accuracy change to the framework.
 
+For a package-only precision difference, vary one existing provider switch per
+fresh process while preserving the full installation and original requests.
+Inspect actual worker bindings and probe kernels: changing scaled-MM does not
+also isolate mHC. Equal aggregate scores can hide different failed samples and
+different generated content. A checkpoint-weight numerical probe with synthetic
+activations helps locate a boundary, but does not prove model-level causality.
+Keep compile failures and missing process-tracking evidence visible; rerun a
+corrected diagnostic separately instead of treating missing results as passes.
+
 An unchanged serial request has different scheduling and cache history from
 the original cohort. Retain both full-cohort and serial results, including
 baseline failures. Reproduction on the baseline does not establish numerical
