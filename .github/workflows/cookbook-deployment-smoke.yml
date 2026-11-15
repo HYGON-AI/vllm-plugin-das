@@ -59,7 +59,7 @@ permissions:
   contents: read
 
 concurrency:
-  group: cookbook-deployment-smoke-vllm
+  group: cookbook-deployment-smoke-vllm-docker-glm51-baseline
   cancel-in-progress: false
 
 jobs:
@@ -77,7 +77,7 @@ jobs:
       - uses: actions/checkout@v4
         with:
           repository: guochenyang99/ci-model-test
-          ref: main
+          ref: 10121ae687211bd39babd9b8eca6a558431c381c
           token: ${{ secrets.MODEL_SMOKE_REPO_TOKEN }}
           persist-credentials: false
           path: model-ci-tools
@@ -98,7 +98,7 @@ jobs:
       matrix: ${{ fromJSON(needs.prepare.outputs.matrix) }}
     name: Smoke (${{ matrix.hardware }})
     runs-on: ${{ matrix.runner }}
-    timeout-minutes: 840
+    timeout-minutes: 65
     steps:
       - name: Checkout pinned private test controller
         uses: actions/checkout@v4
@@ -108,6 +108,27 @@ jobs:
           token: ${{ secrets.MODEL_SMOKE_REPO_TOKEN }}
           persist-credentials: false
           path: model-ci-tools
+      - name: Start Docker model memory sampling
+        shell: bash
+        run: |
+          sample="$RUNNER_TEMP/glm51-memory-${GITHUB_RUN_ID}-${GITHUB_RUN_ATTEMPT}"
+          mkdir -p "$sample"
+          (
+            while [[ ! -f "$sample/stop" ]]; do
+              printf '\n[Docker memory] %s\n' "$(date -u +'%FT%TZ')"
+              grep -E '^(MemAvailable|SwapFree):' /proc/meminfo || true
+              while IFS= read -r id; do
+                [[ -n "$id" ]] || continue
+                timeout 5s docker stats --no-stream --format '{{.Name}} memory={{.MemUsage}} percent={{.MemPerc}}' "$id" || true
+                timeout 5s docker exec "$id" bash -c '
+                  for file in /sys/fs/cgroup/memory.{current,peak,max,events} /sys/fs/cgroup/memory/memory.{usage_in_bytes,max_usage_in_bytes,limit_in_bytes,failcnt}; do
+                    if [ -r "$file" ]; then printf "%s: " "$file"; tr "\n" " " < "$file"; printf "\n"; fi
+                  done
+                ' || true
+              done < <(timeout 5s docker ps --filter label=deployment-smoke.run --filter "label=deployment-smoke.github-run=${GITHUB_RUN_ID}-${GITHUB_RUN_ATTEMPT}-vllm-bw1100" --format '{{.ID}}')
+              sleep 5
+            done
+          ) > "$sample/memory.log" 2>&1 < /dev/null &
       - name: Test this hardware and transfer evidence
         uses: ./model-ci-tools/.github/actions/deployment-smoke
         with:
@@ -115,40 +136,25 @@ jobs:
           framework-version: '0.28.1'
           image: ${{ needs.prepare.outputs.image }}
           expected-image-id: ${{ needs.prepare.outputs.image-id }}
-          cookbook-ref: ${{ needs.prepare.outputs.cookbook-ref }}
+          cookbook-ref: 12b4e51586c08dc299714875a946df8d0d8fb557
           controller-ref: ${{ needs.prepare.outputs.controller-ref }}
           hardware: ${{ matrix.hardware }}
           cases: ${{ inputs.cases || '' }}
           mode: ${{ inputs.mode || 'execute' }}
           collect-only: 'true'
-
-  report:
-    needs: [prepare, smoke]
-    if: ${{ always() && needs.prepare.result == 'success' && needs.prepare.outputs.enabled == 'true' }}
-    runs-on: bw1100
-    timeout-minutes: 60
-    permissions:
-      contents: read
-    steps:
-      - uses: actions/checkout@v4
+      - name: Print Docker memory samples
+        if: always()
+        shell: bash
+        run: |
+          sample="$RUNNER_TEMP/glm51-memory-${GITHUB_RUN_ID}-${GITHUB_RUN_ATTEMPT}"
+          if [[ -d "$sample" ]]; then
+            touch "$sample/stop"
+            cat "$sample/memory.log"
+          fi
+      - name: Upload Docker memory samples
+        if: always()
+        uses: actions/upload-artifact@v4
         with:
-          repository: guochenyang99/ci-model-test
-          ref: ${{ needs.prepare.outputs.controller-ref }}
-          token: ${{ secrets.MODEL_SMOKE_REPO_TOKEN }}
-          persist-credentials: false
-          path: model-ci-tools
-      - name: Publish one report and one DashHub submission
-        uses: ./model-ci-tools/.github/actions/deployment-smoke-aggregate
-        with:
-          framework: vllm
-          framework-version: '0.28.1'
-          pypi-url: ${{ vars.PYPI_URL }}
-          cases: ${{ inputs.cases || '' }}
-          matrix: ${{ needs.prepare.outputs.matrix }}
-          image: ${{ needs.prepare.outputs.image }}
-          image-id: ${{ needs.prepare.outputs.image-id }}
-          cookbook-ref: ${{ needs.prepare.outputs.cookbook-ref }}
-          controller-ref: ${{ needs.prepare.outputs.controller-ref }}
-          dashhub-token: ${{ secrets.DASHHUB_CI_TOKEN }}
-          history-token: ${{ secrets.MODEL_REPORT_HISTORY_TOKEN }}
-          mode: ${{ inputs.mode || 'execute' }}
+          name: docker-glm51-memory
+          path: ${{ runner.temp }}/glm51-memory-${{ github.run_id }}-${{ github.run_attempt }}/memory.log
+          if-no-files-found: warn
