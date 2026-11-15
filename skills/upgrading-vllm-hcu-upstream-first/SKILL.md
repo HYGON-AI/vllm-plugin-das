@@ -56,6 +56,8 @@ are checked before resolving a child file.
 Direct classmethod guards distinguish bound access from `.__func__`; aliases
 or additional decorators with unresolved binding remain review candidates.
 Git paths retain arbitrary filename bytes in escaped JSON/Markdown output.
+Python AST parsing retains original blob bytes, honoring source encodings and
+UTF-8 BOMs without collapsing distinct non-UTF-8 literals.
 Working-tree entry counts treat a rename/copy and its two paths as one record.
 
 This is **not a complete Plugin inventory**. Enumerate Adapter entry points,

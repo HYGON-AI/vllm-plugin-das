@@ -94,7 +94,9 @@ class Repo:
                 raise ValueError("Unexpected Git batch response")
             offset = end + 1
             content = data[offset:offset + int(size)]
-            self.cache[path] = content.decode("utf-8", errors="replace")
+            # ast.parse accepts bytes and honors Python encoding cookies/BOMs.
+            # Lossy UTF-8 decoding can collapse distinct valid literal values.
+            self.cache[path] = content
             offset += int(size) + 1
 
     def source(self, path):

@@ -91,6 +91,34 @@ PATCH_ID = "old"
             capture_output=True, text=True, encoding="utf-8",
         )
 
+    def test_committed_python_source_encodings_preserve_body_drift(self):
+        cases = [
+            (b"# coding: latin-1\ndef route(x): return '\xe9'\n",
+             b"# coding: latin-1\ndef route(x): return '\xf6'\n",
+             "changed_review_required"),
+            (b"# coding: latin-1\ndef route(x): return '\xe9'\n",
+             "def route(x): return 'é'\n".encode("utf-8"),
+             "unchanged_static_only"),
+            (b"\xef\xbb\xbfdef route(x): return x\n",
+             b"def route(x): return x\n", "unchanged_static_only"),
+        ]
+        for index, (old, new, expected) in enumerate(cases):
+            with self.subTest(index=index):
+                comment = f"# fixture {index}\n".encode("ascii")
+                (self.fork / "vllm/router.py").write_bytes(old + comment)
+                (self.up / "vllm/router.py").write_bytes(new + comment)
+                commit(self.fork)
+                commit(self.up)
+                out = self.root / f"encoding-{index}"
+                run = self.invoke(out)
+                self.assertEqual(run.returncode, 0, run.stderr)
+                report = json.loads((out / "preflight.json").read_text())
+                row = next(r for r in report["adapters"] if r["patch_id"] == "router")
+                comparison = row["signature_checks"][0]["contract_comparison"]
+                self.assertEqual(comparison["status"], expected)
+                self.assertEqual(comparison["changed_fields"],
+                                 ["body_sha256"] if expected == "changed_review_required" else [])
+
     def test_rename_counts_one_worktree_entry_with_other_changes(self):
         git(self.plugin, "mv", "vllm_hcu/patch/patch_old.py",
             "vllm_hcu/patch/renamed\nold.py")
