@@ -5,8 +5,9 @@
 from __future__ import annotations
 
 import functools
-import os
 from types import ModuleType
+
+from vllm_hcu.patch.config import get_hcu_config
 
 from ._common import (
     PatchCompatibilityError,
@@ -133,7 +134,9 @@ def apply_to_module(module: ModuleType) -> bool:
 
     @functools.wraps(original_process)
     def hcu_process_weights_after_loading(self, layer):
-        if os.environ.get("VLLM_HCU_HY4_FP8_MEGAMOE") == "1":
+        from vllm.config import get_current_vllm_config_or_none
+
+        if get_hcu_config(get_current_vllm_config_or_none()).hy4_fp8_megamoe:
             from vllm_hcu.models.hy_v4.megamoe import install_hy4_mega_kernel
 
             if install_hy4_mega_kernel(self, layer):

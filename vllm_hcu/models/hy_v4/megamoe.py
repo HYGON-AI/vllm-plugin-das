@@ -187,7 +187,7 @@ def install_hy4_mega_kernel(method, layer):
 
     if git_hash == "fcff57a":
         raise RuntimeError("DeepGEMM fcff57a has no HY4 (8,6144,2048) fused kernel; "
-                           "install a HY4-capable build or unset VLLM_HCU_HY4_FP8_MEGAMOE")
+                           "install a HY4-capable build or select --moe-backend deep_gemm")
     if isinstance(method.moe_kernel, Hy4MegaKernel):
         raise RuntimeError("Restart HY4 MegaMoE to reload canonical checkpoint weights")
     w1, w2 = layer.w13_weight, layer.w2_weight

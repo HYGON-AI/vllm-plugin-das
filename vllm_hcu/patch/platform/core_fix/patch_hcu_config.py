@@ -6,6 +6,8 @@ from __future__ import annotations
 
 import argparse
 
+from vllm_hcu.patch.config import HY4_MEGAMOE_BACKEND
+
 from ._common import PatchCompatibilityError
 
 _HCU_BOOLEAN_OPTIONS = {
@@ -95,8 +97,10 @@ def register_hcu_cli_args(parser: object) -> None:
             "audited vLLM --moe-backend choices do not contain the official "
             "'deep_gemm' backend"
         )
-    if _LEGACY_DEEP_GEMM_BACKEND not in choices:
-        moe_action.choices = tuple(choices) + (_LEGACY_DEEP_GEMM_BACKEND,)
+    moe_action.choices = tuple(choices) + tuple(
+        backend for backend in (_LEGACY_DEEP_GEMM_BACKEND, HY4_MEGAMOE_BACKEND)
+        if backend not in choices
+    )
 
 
 def pre_register_and_update(parser: object | None = None) -> None:

@@ -23,7 +23,6 @@
 # limitations under the License.
 """Inference-only HY V4 model for HCU with strict checkpoint loading."""
 
-import os
 import typing
 from contextlib import nullcontext
 from collections.abc import Callable, Iterable, MutableSequence, Sequence
@@ -80,6 +79,7 @@ from vllm.platforms import current_platform
 from vllm.sequence import IntermediateTensors
 
 import vllm_hcu.platforms.envs as henvs
+from vllm_hcu.patch.config import get_hcu_config
 from vllm_hcu.model_executor.layers.quantization.hyv4_ownership import (
     mark_hyv4_quant_config,
 )
@@ -495,6 +495,7 @@ class HYV4Model(nn.Module, MixtureOfExperts):
         super().__init__()
 
         config = _normalize_hyv4_config(vllm_config.model_config.hf_config)
+        self.use_mega_moe = get_hcu_config(vllm_config).hy4_fp8_megamoe
         cache_config = vllm_config.cache_config
         quant_config = vllm_config.quant_config
         parallel_config = vllm_config.parallel_config
@@ -689,7 +690,7 @@ class HYV4Model(nn.Module, MixtureOfExperts):
             residual = None if self.enable_ihc else intermediate_tensors["residual"]
 
         scope = nullcontext()
-        if os.environ.get("VLLM_HCU_HY4_FP8_MEGAMOE") == "1":
+        if self.use_mega_moe:
             from .megamoe import mega_forward_batch
 
             scope = mega_forward_batch(hidden_states.shape[0])
