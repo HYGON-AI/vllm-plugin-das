@@ -186,11 +186,12 @@ When `mixed_precision` is absent, the parser preserves the historical format:
 applicable Linear layers use per-channel INT8, routed experts use packed INT4,
 and `ignore` patterns remain authoritative. Ordinary embedding/lm-head and
 model-owned router construction keep their official unquantized behavior.
-An explicit `mixed_precision` map still requires all three declared groups
-(experts, dense INT8 and n-gram INT8), with complete module lists and matching
-formats. A malformed or incomplete map never falls back to the historical
-defaults. PLE needs explicit declarations; the legacy format does not infer
-quantized tables. Verify loader numerics, changed-input Graph and model accuracy
+An explicit `mixed_precision` map requires the packed-expert declaration.
+Dense INT8 and n-gram INT8 groups are optional; omitting either retains its
+unquantized weights. Every present group needs a complete module list and
+matching format. A malformed declaration never falls back to historical
+defaults. The legacy format does not infer quantized PLE tables. Verify loader
+numerics, changed-input Graph and model accuracy
 for the selected Core/provider/checkpoint combination before deployment.
 
 ## HCU FlashAttention varlen backend
