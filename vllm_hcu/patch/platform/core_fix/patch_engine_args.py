@@ -19,6 +19,7 @@ from types import ModuleType
 from typing import Any
 
 from vllm_hcu.patch.config import (
+    HY4_MEGAMOE_BACKEND,
     HcuFeatureConfig,
     get_hcu_config,
     normalize_hcu_moe_backend,
@@ -123,6 +124,10 @@ def _normalise_constructor_kwargs(
         for name in _HCU_BOOLEAN_KWARGS
         if name in kwargs
     }
+    if kwargs.get("moe_backend") == HY4_MEGAMOE_BACKEND:
+        # Keep the upstream FP8 oracle on DeepGEMM and serialize the HY4 kernel choice.
+        updates["hy4_fp8_megamoe"] = True
+        kwargs["moe_backend"] = _DEEP_GEMM_BACKEND
     eplb_payload = kwargs.get("eplb_config")
     if isinstance(eplb_payload, Mapping):
         official_eplb = dict(eplb_payload)
@@ -456,6 +461,9 @@ def _wrap_constructor(owner: type) -> None:
             kwargs,
         )
         original(self, *args, **kwargs)
+        # argparse may reuse its default mapping across parses of the same parser.
+        if self.additional_config is not None:
+            self.additional_config = dict(self.additional_config)
         # The upstream generated constructor has now initialized
         # additional_config.  Store a plain dict for hash/pickle/JSON support.
         set_hcu_config(self, feature_config)

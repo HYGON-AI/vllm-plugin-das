@@ -570,6 +570,20 @@ def test_cli_registration_preserves_official_deep_gemm_backend() -> None:
     assert args.create_engine_config().kernel_config.moe_backend == "deep_gemm"
 
 
+def test_hy4_megamoe_cli_survives_worker_config_round_trip() -> None:
+    parser = argparse.ArgumentParser()
+    parser.add_argument("--moe-backend", choices=["auto", "deep_gemm"])
+    parser.set_defaults(additional_config={})
+    patch_hcu_config.register_hcu_cli_args(parser)
+    module = _make_arg_utils_module()
+    patch_engine_args.apply_to_module(module)
+    for backend, enabled in (("deep_gemm_meag_moe", True), ("deep_gemm", False)):
+        args = module.EngineArgs.from_cli_args(parser.parse_args(["--moe-backend", backend]))
+        config = args.create_engine_config()
+        assert config.kernel_config.moe_backend == "deep_gemm"
+        assert get_hcu_config(pickle.loads(pickle.dumps(config))).hy4_fp8_megamoe is enabled
+
+
 def test_cli_registration_accepts_legacy_deep_gemm_backend() -> None:
     parser = argparse.ArgumentParser()
     parser.add_argument(
