@@ -83,6 +83,19 @@ receipts, not just a terminal-looking state string. Write final status only
 after the last check, using an atomic snapshot. Preserve consumer failures
 and restart only unexecuted work in new output directories.
 
+For pipeline parallelism, count workers and distinct GPU trace ranks as
+TP times PP. Hybrid cache projection can preserve globally indexed groups
+whose local layer list is empty: allocate only worker-owned layers and check
+model-runner setup on stages with no local recurrent layers. Keep global
+group indexing intact. Reuse the official planner implementation when it
+already handles this case, then validate any remaining stage-local fix with
+a serialized hybrid checkpoint and changing prompts/batches. A zero output
+head can test startup and communication, but cannot establish model quality.
+
+A shared-node memory preflight is an observation, not a reservation. Preserve
+the actual worker admission failure if free memory changes before startup;
+do not report a weight-loading failure or a model score for that attempt.
+
 ## Prepare a reviewable change
 
 Refresh the target branch, relevant open/merged requests, commits and review
