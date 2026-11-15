@@ -1,12 +1,14 @@
 # SPDX-License-Identifier: Apache-2.0
 """Portable end-to-end checks; all repository fixtures are temporary."""
 import json
+import os
 from pathlib import Path
 import shlex
 import subprocess
 import sys
 import tempfile
 import unittest
+from unittest.mock import patch
 
 SCRIPT = Path(__file__).with_name("upgrade_preflight.py")
 
@@ -39,6 +41,13 @@ class PreflightTests(unittest.TestCase):
         self.temp = tempfile.TemporaryDirectory(prefix="hcu-preflight-test-")
         self.addCleanup(self.temp.cleanup)
         self.root = Path(self.temp.name)
+        # Fixture repositories must not inherit runner filters or user settings.
+        self.git_config = patch.dict(os.environ, {
+            "GIT_CONFIG_GLOBAL": str(self.root / "global.gitconfig"),
+            "GIT_CONFIG_NOSYSTEM": "1",
+        })
+        self.git_config.start()
+        self.addCleanup(self.git_config.stop)
         self.up = self.root / "official"
         self.fork = self.root / "fork"
         self.plugin = self.root / "plugin"
@@ -123,12 +132,14 @@ PATCH_ID = "old"
         commit(self.plugin)
         path = self.plugin / "vllm_hcu/patch/patch_router.py"
         path.write_text(path.read_text() + "\n", encoding="utf-8")
-        for kind in ("clean", "process"):
-            with self.subTest(kind=kind):
+        for kind, scope in ((kind, scope) for kind in ("clean", "process")
+                            for scope in ("--local", "--global")):
+            with self.subTest(kind=kind, scope=scope):
                 key = "filter.probe." + kind
-                git(self.plugin, "config", key, shlex.join([sys.executable, str(helper), kind]))
+                git(self.plugin, "config", scope, key,
+                    shlex.join([sys.executable, str(helper), kind]))
                 try:
-                    out = self.root / ("report-filter-" + kind)
+                    out = self.root / ("report-filter-" + kind + scope)
                     run = self.invoke(out)
                     self.assertEqual(run.returncode, 0, run.stderr)
                     self.assertFalse(marker.exists(), "Git executed a repository filter")
@@ -138,7 +149,7 @@ PATCH_ID = "old"
                     self.assertEqual(source["working_tree_status"],
                                      "unavailable_configured_filters")
                 finally:
-                    git(self.plugin, "config", "--unset", key)
+                    git(self.plugin, "config", scope, "--unset", key)
 
     def test_does_not_overwrite_report(self):
         out = self.root / "report"
