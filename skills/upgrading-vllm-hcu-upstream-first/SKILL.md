@@ -28,9 +28,10 @@ does not establish equivalent behavior or performance.
 
 The companion script reads committed trees without checking out refs,
 fetching missing objects, importing repository code or using a device.
-It requires Python 3.10+ and Git supporting `--no-lazy-fetch`.
-Prepare the required local history separately; preserve that restriction
-when an older Git or partial clone cannot provide the inputs.
+It requires Python 3.10+. Git supporting `--no-lazy-fetch` can inspect partial
+clones without fetching. Older Git can inspect fully local repositories; it
+rejects partial/promisor configuration before reading objects. Prepare missing
+history separately; the preflight never retries by fetching objects.
 
 ```bash
 python -I -B skills/upgrading-vllm-hcu-upstream-first/scripts/upgrade_preflight.py \

@@ -2,7 +2,8 @@
 """Read committed Git trees without importing repository code or changing refs.
 
 Static findings are review candidates, never automatic removal/acceptance decisions.
-Requires Python 3.10+ and Git with --no-lazy-fetch support; no third-party dependencies.
+Requires Python 3.10+; partial clones require Git with --no-lazy-fetch support.
+Older Git can inspect fully local repositories; no third-party dependencies.
 """
 import argparse
 import ast
@@ -13,13 +14,38 @@ import os
 from pathlib import Path, PurePosixPath
 import subprocess
 import sys
+from functools import lru_cache
+
+
+@lru_cache(maxsize=1)
+def supports_no_lazy_fetch():
+    result = subprocess.run(
+        ["git", "--no-lazy-fetch", "--version"],
+        stdout=subprocess.PIPE, stderr=subprocess.PIPE, timeout=10,
+    )
+    return result.returncode == 0
 
 
 def git(root, *args, data=None):
     env = dict(os.environ, GIT_OPTIONAL_LOCKS="0", GIT_TERMINAL_PROMPT="0",
                GIT_NO_LAZY_FETCH="1")
+    offline_args = ["--no-lazy-fetch"] if supports_no_lazy_fetch() else []
+    if not offline_args:
+        # Old Git ignores GIT_NO_LAZY_FETCH. Refuse promisor repositories before
+        # reading objects rather than retrying an object read that could fetch.
+        config = subprocess.run(
+            ["git", "-C", str(root), "config", "--name-only", "--get-regexp",
+             r"^(extensions\.partialclone|remote\..*\.promisor)$"],
+            stdout=subprocess.PIPE, stderr=subprocess.PIPE, env=env, timeout=10,
+        )
+        if config.returncode == 0:
+            raise ValueError("This Git lacks --no-lazy-fetch; partial/promisor "
+                             "repositories require a newer Git or a fully local "
+                             "clone prepared outside this script")
+        if config.returncode != 1:
+            raise ValueError("Cannot verify repository lazy-fetch configuration")
     result = subprocess.run(
-        ["git", "--no-pager", "--no-replace-objects", "--no-lazy-fetch",
+        ["git", "--no-pager", "--no-replace-objects", *offline_args,
          "-c", "core.fsmonitor=false",
          "-C", str(root), *args], input=data, stdout=subprocess.PIPE,
         stderr=subprocess.PIPE, env=env, timeout=120,

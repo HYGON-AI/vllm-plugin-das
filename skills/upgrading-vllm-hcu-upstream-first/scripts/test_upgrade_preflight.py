@@ -4,6 +4,7 @@ import json
 import os
 from pathlib import Path
 import shlex
+import shutil
 import subprocess
 import sys
 import tempfile
@@ -84,7 +85,7 @@ PATCH_ID = "old"
     def invoke(self, output, base=None, target="HEAD"):
         target_args = ["--target-ref", target] if target is not None else []
         return subprocess.run(
-            [sys.executable, str(SCRIPT), "--plugin-root", str(self.plugin),
+            [sys.executable, "-I", "-S", "-B", str(SCRIPT), "--plugin-root", str(self.plugin),
              "--fork-root", str(self.fork), "--upstream-root", str(self.up),
              "--upstream-base", base or self.base, *target_args, "--output", str(output)],
             capture_output=True, text=True, encoding="utf-8",
@@ -326,6 +327,38 @@ raise RuntimeError("Repository code must never execute")
         self.assertNotEqual(run.returncode, 0)
         self.assertFalse(out.exists())
         self.assertEqual(before, {p.name: p.read_bytes() for p in packs.iterdir()})
+
+    def old_git_environment(self):
+        directory = self.root / "old-git-bin"
+        directory.mkdir()
+        wrapper = directory / "git"
+        wrapper.write_text(
+            '#!/bin/sh\n'
+            'if [ "$1" = "--no-lazy-fetch" ]; then exit 129; fi\n'
+            f'exec {shlex.quote(shutil.which("git"))} "$@"\n'
+        )
+        wrapper.chmod(0o755)
+        return {"PATH": str(directory) + os.pathsep + os.environ["PATH"]}
+
+    def test_old_git_reads_complete_local_trees(self):
+        out = self.root / "report"
+        with patch.dict(os.environ, self.old_git_environment()):
+            run = self.invoke(out)
+        self.assertEqual(run.returncode, 0, run.stderr)
+        self.assertTrue((out / "preflight.json").is_file())
+
+    def test_old_git_refuses_promisor_before_fetch_or_report(self):
+        git(self.plugin, "config", "remote.origin.promisor", "true")
+        # Even a fully hydrated promisor checkout must fail before any object
+        # access on old Git; an ignored environment switch is insufficient.
+        before = git(self.plugin, "count-objects", "-v")
+        out = self.root / "report"
+        with patch.dict(os.environ, self.old_git_environment()):
+            run = self.invoke(out)
+        self.assertNotEqual(run.returncode, 0)
+        self.assertIn("require a newer Git", run.stderr)
+        self.assertFalse(out.exists())
+        self.assertEqual(before, git(self.plugin, "count-objects", "-v"))
 
     def test_link_and_submodule_deltas_are_not_dropped(self):
         def blob(text):
