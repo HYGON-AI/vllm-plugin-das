@@ -285,10 +285,11 @@ def test_every_hcu_marked_test_file_is_registered() -> None:
     from tools.run_v033_ci import test_files as v033_test_files
     from select_v033_tests import select_jobs as select_v033
 
-    release_files = set(v033_test_files("device"))
-    for path in release_files:
-        selected = {job["id"] for job in select_v033([path])["jobs"]}
-        assert "v033-device-gfx936" in selected
+    release_files = set()
+    for tier, job_id in [("device", "v033-device-gfx936"), ("device-gfx938", "v033-device-gfx938")]:
+        for path in v033_test_files(tier):
+            assert job_id in {job["id"] for job in select_v033([path])["jobs"]}
+            release_files.add(path)
     assert hcu_test_files <= registered_files | release_files
 
 

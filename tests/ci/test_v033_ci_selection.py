@@ -12,7 +12,7 @@ sys.path.insert(0, str(ROOT / '.github/scripts/hcu_ci'))
 from select_v033_tests import select_jobs
 from select_hcu_tests import _load_config, _git_changed_paths, DEFAULT_CONFIG, select_jobs as legacy_select
 
-EXPECTED = {'v033-source-contract', 'v033-device-gfx936'}
+EXPECTED = {'v033-source-contract', 'v033-device-gfx936', 'v033-device-gfx938'}
 
 
 class SelectionTests(unittest.TestCase):
@@ -103,6 +103,10 @@ class SelectionTests(unittest.TestCase):
         sys.path.insert(0, str(ROOT / 'tools'))
         from run_v033_ci import validate_result, test_files
         self.assertTrue(test_files('source'))
+        deepgemm = 'tests/vllm033/gfx938/test_dsv41_deepgemm_hcu.py'
+        self.assertIn(deepgemm, test_files('device-gfx938'))
+        self.assertNotIn(deepgemm, test_files('device'))
+        self.assertNotIn(deepgemm, test_files('portable'))
         self.assertEqual(set(test_files('device')), {
             p.relative_to(ROOT).as_posix() for p in (ROOT / 'tests/vllm033').glob('*_hcu.py')
         } | {'tests/vllm033/test_slimquant.py'})

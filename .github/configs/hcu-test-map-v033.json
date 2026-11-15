@@ -5,6 +5,9 @@
     "v033-source-contract": {
       "scope": "CPU source and packaging contracts"
     },
+    "v033-device-gfx938": {
+      "scope": "installed-wheel Channel-FP8 DeepGEMM numerical contract"
+    },
     "v033-device-gfx936": {
       "scope": "installed-wheel HCU operator and Graph contracts"
     }
@@ -34,6 +37,7 @@
   ],
   "fallback_jobs": [
     "v033-source-contract",
-    "v033-device-gfx936"
+    "v033-device-gfx936",
+    "v033-device-gfx938"
   ]
 }

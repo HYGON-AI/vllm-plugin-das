@@ -104,6 +104,10 @@ def layer(kind):
     obj = cls.__new__(cls)
     torch.nn.Module.__init__(obj)
     obj.moe_config = SimpleNamespace()
+    if kind == "experts":
+        obj.ckpt_gate_proj_name = "gate_proj"
+        obj.ckpt_up_proj_name = "up_proj"
+        obj.ckpt_down_proj_name = "down_proj"
     return obj
 
 
@@ -287,8 +291,7 @@ def test_native_symbols_and_oracle_are_not_rebound(contracts):
     assert all(a is b for a, b in zip(before, after))
 
 
-@pytest.mark.parametrize("kind", ["linear", "experts"])
-def test_matching_layers_delegate_to_official_ct_channel_scheme(contracts, monkeypatch, kind):
+def test_matching_linear_delegates_to_official_ct_channel_scheme(contracts, monkeypatch):
     from vllm.model_executor.layers.quantization.compressed_tensors.compressed_tensors import CompressedTensorsConfig
     c = activate(contracts)
     calls = []
@@ -300,13 +303,35 @@ def test_matching_layers_delegate_to_official_ct_channel_scheme(contracts, monke
 
     monkeypatch.setattr(CompressedTensorsConfig, "get_quant_method", native_ct)
     config = c.cls.from_config(SCHEMA)
-    obj = layer(kind)
+    obj = layer("linear")
     assert config.get_quant_method(obj, "model.layers.0.proj") is sentinel
     delegated = calls[0][0]
     assert delegated.quant_format == "float-quantized"
     assert delegated.target_scheme_map["Linear"]["weights"].strategy == "channel"
     assert delegated.target_scheme_map["Linear"]["input_activations"].strategy == "token"
     assert delegated.target_scheme_map["Linear"]["input_activations"].dynamic is True
+
+
+def test_channel_experts_use_plugin_provider_with_official_ct_scheme(contracts, monkeypatch):
+    c = activate(contracts)
+    calls = []
+    sentinel = object()
+
+    def provider(weights, inputs, moe_config, prefix):
+        calls.append((weights, inputs, moe_config, prefix))
+        return sentinel
+
+    monkeypatch.setattr(c.candidate, "_moe_provider", lambda: provider)
+    config = c.cls.from_config(SCHEMA)
+    obj = layer("experts")
+    prefix = "model.layers.0.ffn.experts"
+    assert config.get_quant_method(obj, prefix) is sentinel
+    weights, inputs, moe_config, name = calls[0]
+    assert weights.strategy == "channel" and weights.type == "float"
+    assert weights.num_bits == 8 and weights.dynamic is False
+    assert inputs.strategy == "token" and inputs.type == "float"
+    assert inputs.num_bits == 8 and inputs.dynamic is True
+    assert moe_config is obj.moe_config and name == prefix
 
 
 def test_wo_a_stays_bf16_without_ct_selection(contracts, monkeypatch):

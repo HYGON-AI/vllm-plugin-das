@@ -3,15 +3,22 @@
 
 name: hcu-release-pypi
 
+# v0.33 line: the plugin is a pure python wheel built from adapter_extension.
+# .github/scripts/build_hcu_wheel.sh stamps the version at build time
+# (+hcu.<time>.g<commit6>), so the artifact is final and no CIUpload REPAIR
+# post-processing is needed.
+
 on:
   push:
     branches:
-      - v0.28.1-dev
+      - v0.33.0
   workflow_dispatch:
 
 permissions:
   contents: read
+  # CIUpload --record 上传前需查询关联 PR (只读)
   pull-requests: read
+  # CIUpload --record 上报需读取 check-run 统计 (只读)
   checks: read
 
 concurrency:
@@ -19,71 +26,45 @@ concurrency:
   cancel-in-progress: true
 
 env:
-  TORCH_VERSION: "2.11.0"
+  PYPI_URL: ${{ vars.PYPI_URL }}
+  # wheel 是纯 python，不按 DTK/torch 分版本；这个 token 只决定上传到
+  # nightly 归档的哪个目录（das_nightly/dtk<DTK_VER>）
+  DTK_VER: "2610"
 
 jobs:
   compile:
-    name: compile (dtk${{ matrix.dtk_tag }}-py${{ matrix.python_version }}-torch${{ matrix.torch_version }})
-    runs-on:
-      - ci
-      - self-hosted
-    strategy:
-      fail-fast: false
-      matrix:
-        include:
-          - dtk_tag: "26.04"
-            python_version: "3.10"
-            torch_version: "2.11.0"
-          - dtk_tag: "26.04"
-            python_version: "3.12"
-            torch_version: "2.11.0"
-          - dtk_tag: "26.10"
-            python_version: "3.12"
-            torch_version: "2.11.0"
+    name: build
+    # 内网 devpi 与镜像仓库只在自托管 runner 可达
+    runs-on: hygon-build
+    timeout-minutes: 30
+    # 纯 python 构建，不依赖 DTK/GPU；这里只用内网 registry 里现成的镜像固定工具链
     container:
-      image: ${{ vars.HARBOR_SITE }}/hcu/base/dtk:${{ matrix.dtk_tag }}-rockylinux8.6-py${{ matrix.python_version }}
-      options: >-
-        --volume /opt/hyhal:/opt/hyhal:ro
-        --device /dev/kfd:/dev/kfd
-        --device /dev/dri:/dev/dri
-        --cap-add=SYS_PTRACE
-        --privileged
+      image: ${{ vars.HARBOR_SITE }}/hcu/base/dtk:26.10-ubuntu22.04-py3.12
     steps:
       - name: Checkout
         uses: actions/checkout@v4
 
-      - name: install deps
-        env:
-          PYPI_URL: ${{ vars.PYPI_URL }}
-          DTK_VER: ${{ matrix.dtk_tag }}
-        run: |
-          DTK_VER="${DTK_VER//./}"
-          PIP_INDEX="${PYPI_URL}/nightly/dtk${DTK_VER}/+simple/"
-          TRUSTED_HOST="${PIP_INDEX#*://}"; TRUSTED_HOST="${TRUSTED_HOST%%/*}"
-          echo "PIP_INDEX=${PIP_INDEX}"
-          pip install --no-cache-dir \
-            -i "${PIP_INDEX}" \
-            --trusted-host "${TRUSTED_HOST}" \
-            torch==${{ matrix.torch_version }} ninja wheel setuptools ciupload
-
       - name: build wheel
         run: |
-          source /opt/dtk/env.sh
-          python3 setup.py bdist_wheel
+          bash .github/scripts/build_hcu_wheel.sh
+          ls -lh dist/*.whl
 
-      - name: Apply DAS local version to wheels
+      - name: publish nightly
         env:
           GITHUB_TOKEN: ${{ github.token }}
         run: |
-          DTK_VER="$(echo '${{ matrix.dtk_tag }}' | tr -d '.')"
-          WHEEL_COMMIT_SHA="$(git rev-parse HEAD)"
-          CIUpload REPAIR \
+          PIP_INDEX="${PYPI_URL}/nightly/dtk${DTK_VER}/+simple/"
+          TRUSTED_HOST="${PIP_INDEX#*://}"; TRUSTED_HOST="${TRUSTED_HOST%%/*}"
+          pip install --no-cache-dir \
+            -i "${PIP_INDEX}" \
+            --trusted-host "${TRUSTED_HOST}" \
+            ciupload
+          CIUpload NIGHTLY \
+            --devpi_url "${PYPI_URL}" \
+            --password "${{ secrets.PYPI_PASSWORD }}" \
             --dtk_version "${DTK_VER}" \
-            --torch_version "${{ matrix.torch_version }}" \
-            --git_commit "${WHEEL_COMMIT_SHA}" \
-            --outputdir output \
-            -f dist/*.whl
-          CIUpload NIGHTLY --devpi_url ${{ vars.PYPI_URL }} --password ${{ secrets.PYPI_PASSWORD }} --dtk_version "${DTK_VER}" -f output/*.whl --record
+            -f dist/*.whl \
+            --record
 
       - name: 清理 workspace
         if: always()

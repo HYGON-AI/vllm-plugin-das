@@ -92,7 +92,7 @@ class ReleaseGateTests(unittest.TestCase):
         cls.script = textwrap.dedent(block.split('run: |\n', 1)[1])
         cls.good = dict(SELECT_RESULT='success', HAS_JOBS='true', SOURCE_RESULT='success',
                         AUTH_RESULT='success', AUTHORIZED='true',
-                        IMAGE_RESULT='success', DEVICE_RESULT='success')
+                        IMAGE_RESULT='success', DEVICE_RESULT='success', GFX938_RESULT='success')
 
     def gate(self, **overrides):
         return subprocess.run(['bash', '--noprofile', '--norc', '-e', '-c', self.script],
@@ -103,11 +103,11 @@ class ReleaseGateTests(unittest.TestCase):
         self.assertEqual(self.gate(), 0)
         self.assertEqual(self.gate(HAS_JOBS='false', SOURCE_RESULT='skipped',
                                   AUTH_RESULT='skipped', AUTHORIZED='',
-                                  IMAGE_RESULT='skipped', DEVICE_RESULT='skipped'), 0)
+                                  IMAGE_RESULT='skipped', DEVICE_RESULT='skipped', GFX938_RESULT='skipped'), 0)
 
     def test_failed_cancelled_skipped_or_unauthorized_selected_stage_fails(self):
         for field in ['SELECT_RESULT', 'SOURCE_RESULT', 'AUTH_RESULT',
-                      'IMAGE_RESULT', 'DEVICE_RESULT']:
+                      'IMAGE_RESULT', 'DEVICE_RESULT', 'GFX938_RESULT']:
             for result in ['failure', 'cancelled', 'skipped', '']:
                 with self.subTest(field=field, result=result):
                     self.assertNotEqual(self.gate(**{field: result}), 0)
