@@ -5,7 +5,7 @@ import sys
 import unittest
 
 sys.dont_write_bytecode = True
-from upgrade_preflight import compare_contracts
+from upgrade_preflight import compare_contracts, signature_checks
 
 
 def compare(old, new, symbol="route"):
@@ -13,6 +13,25 @@ def compare(old, new, symbol="route"):
 
 
 class ContractTests(unittest.TestCase):
+    def test_zero_argument_guard_uses_default_empty_positional(self):
+        guard = ast.parse('require_exact_signature(fn, "vllm.ops.ready")')
+        target = ast.parse('def ready(): return 1')
+        checks = signature_checks(guard, {}, target, "vllm.ops")
+        self.assertEqual(len(checks), 1)
+        self.assertEqual(checks[0]["expected_names"], [])
+        self.assertEqual(checks[0]["status"], "names_match_only")
+
+    def test_variadic_guard_names_follow_signature_order(self):
+        guard = ast.parse('''require_exact_signature(
+            fn, "vllm.ops.route", positional=("self",),
+            var_positional="args", keyword_only=("enabled",),
+            var_keyword="kwargs")''')
+        target = ast.parse('def route(self, *args, enabled=True, **kwargs): pass')
+        checks = signature_checks(guard, {}, target, "vllm.ops")
+        self.assertEqual(checks[0]["expected_names"],
+                         ["self", "args", "enabled", "kwargs"])
+        self.assertEqual(checks[0]["status"], "names_match_only")
+
     def test_same_names_different_default(self):
         result = compare("def route(x, pad=False): return x",
                          "def route(x, pad=True): return x")

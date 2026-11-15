@@ -45,6 +45,9 @@ moves and statically parsed legacy `TARGET_MODULE` guards. Resolved functions
 are compared for parameter kinds/defaults, annotations, decorators, async
 status and body AST. Findings remain pending review. Uncommitted changes are
 reported but excluded from analysis; commit or separately bind their bytes.
+For repositories with configured clean/process filters, working-tree inspection
+is reported as unavailable because `git status` can execute those filters.
+Committed-tree analysis still runs without invoking them.
 
 This is **not a complete Plugin inventory**. Enumerate Adapter entry points,
 OOT registrations, backend/quantization registries, dynamic imports, native

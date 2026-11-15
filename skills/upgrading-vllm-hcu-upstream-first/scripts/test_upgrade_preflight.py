@@ -2,6 +2,7 @@
 """Portable end-to-end checks; all repository fixtures are temporary."""
 import json
 from pathlib import Path
+import shlex
 import subprocess
 import sys
 import tempfile
@@ -109,6 +110,35 @@ PATCH_ID = "old"
         run = self.invoke(out)
         self.assertNotEqual(run.returncode, 0)
         self.assertFalse(out.exists())
+
+    def test_configured_clean_or_process_filter_is_not_executed(self):
+        marker = self.root / "filter-executed"
+        helper = self.root / "filter.py"
+        helper.write_text(
+            "from pathlib import Path\nimport sys\n"
+            f"Path({str(marker)!r}).write_text('executed')\n"
+            "if sys.argv[1] == 'process': raise SystemExit(1)\n"
+            "sys.stdout.write(sys.stdin.read())\n", encoding="utf-8")
+        write(self.plugin, ".gitattributes", "vllm_hcu/patch/*.py filter=probe\n")
+        commit(self.plugin)
+        path = self.plugin / "vllm_hcu/patch/patch_router.py"
+        path.write_text(path.read_text() + "\n", encoding="utf-8")
+        for kind in ("clean", "process"):
+            with self.subTest(kind=kind):
+                key = "filter.probe." + kind
+                git(self.plugin, "config", key, shlex.join([sys.executable, str(helper), kind]))
+                try:
+                    out = self.root / ("report-filter-" + kind)
+                    run = self.invoke(out)
+                    self.assertEqual(run.returncode, 0, run.stderr)
+                    self.assertFalse(marker.exists(), "Git executed a repository filter")
+                    report = json.loads((out / "preflight.json").read_text())
+                    source = report["sources"]["plugin"]
+                    self.assertIsNone(source["working_tree_entries"])
+                    self.assertEqual(source["working_tree_status"],
+                                     "unavailable_configured_filters")
+                finally:
+                    git(self.plugin, "config", "--unset", key)
 
     def test_does_not_overwrite_report(self):
         out = self.root / "report"

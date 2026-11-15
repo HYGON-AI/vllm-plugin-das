@@ -83,10 +83,18 @@ class Repo:
                      if p in self.source_files), None)
 
     def describe(self):
-        status = git(self.root, "status", "--porcelain=v1", "-z",
-                     "--untracked-files=normal")
+        keys = git(self.root, "config", "--null", "--name-only", "--list").decode().split("\0")
+        has_filters = any(key.lower().startswith("filter.") and
+                          key.lower().endswith((".clean", ".process")) for key in keys)
+        # Status may execute a configured filter while refreshing tracked files.
+        if has_filters:
+            entries, state = None, "unavailable_configured_filters"
+        else:
+            status = git(self.root, "status", "--porcelain=v1", "-z",
+                         "--untracked-files=normal")
+            entries, state = sum(bool(x) for x in status.split(b"\0")), "observed"
         return {"root": str(self.root), "requested_ref": self.ref, "sha": self.sha,
-                "working_tree_entries": sum(bool(x) for x in status.split(b"\0")),
+                "working_tree_entries": entries, "working_tree_status": state,
                 "input_mode": "committed_tree_only; uncommitted changes excluded"}
 
 
@@ -202,9 +210,17 @@ def signature_checks(tree, values, target_tree, module):
                 expected = literal(node.args[2], values)
             else:
                 kw = {x.arg: x.value for x in node.keywords}
-                expected = literal(kw["positional"], values)
+                expected = literal(kw["positional"], values) if "positional" in kw else ()
+                if "var_positional" in kw:
+                    name = literal(kw["var_positional"], values)
+                    if name is not None:
+                        expected += (name,)
                 if "keyword_only" in kw:
                     expected += literal(kw["keyword_only"], values)
+                if "var_keyword" in kw:
+                    name = literal(kw["var_keyword"], values)
+                    if name is not None:
+                        expected += (name,)
             if not isinstance(symbol, str) or not symbol.startswith(module + "."):
                 continue
             actual = parameter_names(target_tree, symbol[len(module) + 1:]) if target_tree else None
@@ -298,7 +314,10 @@ def markdown(report):
     lines = ["# 升级只读预检", "", "静态候选清单；所有处置待定。不是兼容性、优化等价或硬件验收报告。", "",
              "## 源码", "", "| 角色 | SHA | 工作区条目 |", "| --- | --- | --- |"]
     for role, source in report["sources"].items():
-        lines.append(f"| {role} | {source['sha']} | {source['working_tree_entries']} |")
+        entries = source["working_tree_entries"]
+        if entries is None:
+            entries = "unavailable (configured filters)"
+        lines.append(f"| {role} | {source['sha']} | {entries} |")
     lines += ["", "输入仅为提交树；未提交改动不参与分析。", "", "## Fork 携带差异", "",
               "| 文件 | 变化 | 上游核验线索 | 处置 |", "| --- | --- | --- | --- |"]
     for row in report["fork_deltas"]:
@@ -359,6 +378,7 @@ def main():
                       "文件相同、符号存在或参数名匹配不证明 HCU 路径可达、优化等价或性能满足要求。",
                       "移除重复补丁须补官方源码/调用链证据及 HCU 正确性、性能和功能矩阵；所有自动处置均保持 pending。",
                       "未 fetch、checkout、安装依赖、导入仓库代码或运行硬件；禁用 lazy fetch，缺历史或对象请在外部准备后重跑。",
+                      "配置 clean/process filter 的仓库不执行 git status，工作区条目数记为不可用；提交树分析照常进行。",
                   ]}
         metadata = "vllm_hcu/version.py"
         if metadata in plugin.source_files:
