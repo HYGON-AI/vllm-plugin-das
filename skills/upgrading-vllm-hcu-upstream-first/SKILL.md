@@ -50,6 +50,8 @@ is reported as unavailable because `git status` can execute those filters.
 Committed-tree analysis still runs without invoking them.
 When a regular package and sibling `.py` file share a name, module lookup
 prefers the package initializer, matching Python's import precedence.
+A regular parent module blocks namespace children; dotted parent components
+are checked before resolving a child file.
 Direct classmethod guards distinguish bound access from `.__func__`; aliases
 or additional decorators with unresolved binding remain review candidates.
 Git paths retain arbitrary filename bytes in escaped JSON/Markdown output.

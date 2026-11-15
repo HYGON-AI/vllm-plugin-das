@@ -157,6 +157,41 @@ PATCH_ID = "old"
         self.assertEqual(check["contract_comparison"]["status"], "changed_review_required")
         self.assertIn("parameters", check["contract_comparison"]["changed_fields"])
 
+    def test_parent_module_blocks_namespace_children_but_package_wins(self):
+        for root in (self.fork, self.up):
+            (root / "vllm/router.py").unlink()
+            write(root, "vllm/router/ops.py", "def route(x): return x\n")
+            commit(root)
+        write(self.up, "vllm/router.py", "raise RuntimeError('Do not import')\n")
+        commit(self.up)
+        write(self.plugin, "vllm_hcu/patch/patch_router.py", '''
+TARGET_MODULE = "vllm.router.ops"
+PATCH_ID = "router"
+def apply():
+    require_exact_signature(fn, "vllm.router.ops.route", positional=("x",))
+''')
+        commit(self.plugin)
+        for package, expected in ((False, "missing"), (True, "unchanged")):
+            with self.subTest(package=package):
+                if package:
+                    write(self.up, "vllm/router/__init__.py",
+                          "raise RuntimeError('Do not import')\n")
+                    commit(self.up)
+                out = self.root / ("parent-package" if package else "parent-module")
+                run = self.invoke(out)
+                self.assertEqual(run.returncode, 0, run.stderr)
+                report = json.loads((out / "preflight.json").read_text())
+                router = next(x for x in report["adapters"] if x["patch_id"] == "router")
+                self.assertEqual(router["fork_path"], "vllm/router/ops.py")
+                self.assertEqual(router["module_status"], expected)
+                self.assertEqual(router["official_path"],
+                                 "vllm/router/ops.py" if package else None)
+                check = router["signature_checks"][0]
+                self.assertEqual(check["status"],
+                                 "names_match_only" if package else "symbol_unresolved")
+                self.assertEqual(check["contract_comparison"]["status"],
+                                 "unchanged_static_only" if package else "symbol_unresolved")
+
     def test_configured_clean_or_process_filter_is_not_executed(self):
         marker = self.root / "filter-executed"
         helper = self.root / "filter.py"

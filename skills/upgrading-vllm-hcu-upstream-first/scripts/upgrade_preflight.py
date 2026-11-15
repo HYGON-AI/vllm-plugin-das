@@ -78,6 +78,12 @@ class Repo:
         return self.cache[path]
 
     def module_path(self, module):
+        parts = module.split(".")
+        for depth in range(1, len(parts)):
+            parent = "/".join(parts[:depth])
+            if (parent + ".py" in self.source_files
+                    and parent + "/__init__.py" not in self.source_files):
+                return None
         stem = module.replace(".", "/")
         return next((p for p in (stem + "/__init__.py", stem + ".py")
                      if p in self.source_files), None)
