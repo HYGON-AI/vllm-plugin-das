@@ -90,6 +90,22 @@ PATCH_ID = "old"
             capture_output=True, text=True, encoding="utf-8",
         )
 
+    def test_rename_counts_one_worktree_entry_with_other_changes(self):
+        git(self.plugin, "mv", "vllm_hcu/patch/patch_old.py",
+            "vllm_hcu/patch/renamed\nold.py")
+        path = self.plugin / "vllm_hcu/patch/patch_router.py"
+        path.write_text(path.read_text() + "# uncommitted\n", encoding="utf-8")
+        write(self.plugin, "untracked.txt", "preserve\n")
+        index = (self.plugin / ".git/index").read_bytes()
+        head = git(self.plugin, "rev-parse", "HEAD")
+        out = self.root / "report"
+        run = self.invoke(out)
+        self.assertEqual(run.returncode, 0, run.stderr)
+        report = json.loads((out / "preflight.json").read_text(encoding="utf-8"))
+        self.assertEqual(report["sources"]["plugin"]["working_tree_entries"], 3)
+        self.assertEqual((self.plugin / ".git/index").read_bytes(), index)
+        self.assertEqual(git(self.plugin, "rev-parse", "HEAD"), head)
+
     def test_reports_candidates_and_drift_without_execution_or_mutation(self):
         write(self.plugin, "untracked.txt", "preserve\n")
         roots = [self.plugin, self.fork, self.up]

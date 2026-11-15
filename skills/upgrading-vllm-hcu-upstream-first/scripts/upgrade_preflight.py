@@ -92,7 +92,15 @@ class Repo:
         else:
             status = git(self.root, "status", "--porcelain=v1", "-z",
                          "--untracked-files=normal")
-            entries, state = sum(bool(x) for x in status.split(b"\0")), "observed"
+            entries, state = 0, "observed"
+            records = iter(status.split(b"\0"))
+            for record in records:
+                if not record:
+                    continue
+                entries += 1
+                # Porcelain -z emits a second path for renames and copies.
+                if b"R" in record[:2] or b"C" in record[:2]:
+                    next(records)
         return {"root": str(self.root), "requested_ref": self.ref, "sha": self.sha,
                 "working_tree_entries": entries, "working_tree_status": state,
                 "input_mode": "committed_tree_only; uncommitted changes excluded"}

@@ -53,6 +53,7 @@ prefers the package initializer, matching Python's import precedence.
 Direct classmethod guards distinguish bound access from `.__func__`; aliases
 or additional decorators with unresolved binding remain review candidates.
 Git paths retain arbitrary filename bytes in escaped JSON/Markdown output.
+Working-tree entry counts treat a rename/copy and its two paths as one record.
 
 This is **not a complete Plugin inventory**. Enumerate Adapter entry points,
 OOT registrations, backend/quantization registries, dynamic imports, native
