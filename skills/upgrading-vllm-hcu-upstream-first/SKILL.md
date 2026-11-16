@@ -190,6 +190,14 @@ the remaining package payload is unchanged. No JIT `.so` in a wheel does not
 mean it has no native assets: inventory source-controlled HSA code objects
 separately from newly compiled JIT modules and qualify their execution.
 
+Audit installation destinations independently of import isolation. On Python
+3.12, `-S` can leave a venv executable using the base `sys.prefix`; injecting
+its site-packages into `sys.path` changes package discovery, not pip's write
+location. Check `sys.executable`, `sys.prefix` and `sysconfig.get_path("purelib")`
+before installation. Use an explicit candidate `--prefix`/`--target`, or a
+normal venv interpreter whose prefix has been verified, then verify actual
+installed files and RECORD. Check build-backend child interpreters separately.
+
 Chained jobs must wait for completed cleanup, checkpoint post-seal and RECORD
 receipts, not just a terminal-looking state string. Write final status only
 after the last check, using an atomic snapshot. Preserve consumer failures
