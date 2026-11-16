@@ -12,10 +12,13 @@ from types import FunctionType, SimpleNamespace
 import pytest
 import torch
 
-pytestmark = pytest.mark.skipif(
-    os.environ.get("HCU_V033_TEST_GDN") != "1",
-    reason="explicit HCU GDN native component run required",
-)
+pytestmark = [
+    pytest.mark.hcu,
+    pytest.mark.skipif(
+        os.environ.get("HCU_V033_TEST_GDN") != "1",
+        reason="explicit HCU GDN native component run required",
+    ),
+]
 
 
 @pytest.fixture(scope="module")
