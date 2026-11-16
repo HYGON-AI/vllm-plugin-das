@@ -196,6 +196,11 @@ class HcuFlashAttentionBackend(AttentionBackend):
         # their own page size from this method instead of cache_config.block_size.
         if mode in ("varlen", "cutlass"):
             return [64]
+        # The classic paged prefix kernel only takes a 128-token page, whatever
+        # the mamba state dtype; hybrid models otherwise get a padded
+        # attention block (e.g. 640) passed straight to the kernel.
+        if mode == "classic":
+            return [128]
         # Sliding-window specs query this from get_kv_cache_spec, which runs
         # outside a set_current_vllm_config() context.
         vllm_config = get_current_vllm_config_or_none()
@@ -210,8 +215,6 @@ class HcuFlashAttentionBackend(AttentionBackend):
                 or cache_config.mamba_cache_dtype == "float32"
             )
         ):
-            if mode == "classic":
-                return [128]
             # NOTE(tdoublep): while in principle, FA supports
             # MultipleOf(16), these are the block sizes that do not
             # suffer from the NaN propagation problem described here:

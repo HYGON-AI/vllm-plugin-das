@@ -93,11 +93,42 @@ def _aiter_state_indices(ssm_state_indices):
     """
     if ssm_state_indices is None:
         return None
-    return torch.where(
-        ssm_state_indices > 0,
-        ssm_state_indices,
-        torch.full_like(ssm_state_indices, -1),
+    # Every GDN layer of a forward pass maps the same index view; compute it
+    # once per forward context instead of 2-3 tiny kernels per layer.
+    ctx = None
+    try:
+        from vllm.forward_context import (
+            get_forward_context,
+            is_forward_context_available,
+        )
+
+        if is_forward_context_available():
+            ctx = get_forward_context()
+    except ImportError:
+        pass
+    # _version is part of the key so a buffer rewritten in place within one
+    # forward context misses instead of returning the previous mapping; the
+    # other four fields are all unchanged by an in-place write.
+    key = (
+        ssm_state_indices.data_ptr(),
+        ssm_state_indices._version,
+        tuple(ssm_state_indices.shape),
+        tuple(ssm_state_indices.stride()),
+        ssm_state_indices.dtype,
     )
+    cache = getattr(ctx, "_vllm_hcu_aiter_state_indices", None) if ctx else None
+    if cache is not None:
+        hit = cache.get(key)
+        if hit is not None:
+            return hit[1]
+    mapped = torch.where(ssm_state_indices > 0, ssm_state_indices, -1)
+    if ctx is not None:
+        if cache is None:
+            cache = {}
+            setattr(ctx, "_vllm_hcu_aiter_state_indices", cache)
+        # Keep the source alive so its data_ptr cannot be recycled.
+        cache[key] = (ssm_state_indices, mapped)
+    return mapped
 
 
 _AITER_SIGMOID_HEAD_DIMS = (32, 64, 128, 256, 512)
@@ -140,6 +171,67 @@ def _aiter_recurrent_unsupported(arguments) -> str | None:
     if not arguments["out"].is_contiguous():
         return "a non-contiguous output buffer"
     return None
+
+
+def _single_token_packed_decode(arguments, select_recurrent):
+    """Run a single-token-per-sequence sigmoid update on the packed decode
+    kernel.
+
+    Mixed prefill+decode batches send their decode rows through the generic
+    varlen sigmoid kernel, which is ~2x slower than the packed decode kernel
+    used for pure-decode batches.  When every sequence has exactly one token
+    (cu_seqlens has T+1 entries for T tokens) the two are equivalent, so
+    re-pack q/k/v and use the packed kernel.  Returns None when ineligible.
+    """
+    q, k, v = arguments["q"], arguments["k"], arguments["v"]
+    a, b = arguments["a"], arguments["b"]
+    state = arguments["initial_state"]
+    cu = arguments["cu_seqlens"]
+    idx = arguments["ssm_state_indices"]
+    if (
+        cu is None
+        or idx is None
+        or idx.dim() != 1
+        # Same index dtypes the packed kernel accepts via
+        # _aiter_recurrent_unsupported; this path does not go through it.
+        or idx.dtype not in (torch.int32, torch.int64)
+        or arguments["num_accepted_tokens"] is not None
+        or arguments["is_kda"]
+        or not arguments["inplace_final_state"]
+        or arguments["beta"] != 1.0
+        or arguments["threshold"] != 20.0
+        or q.dim() != 4
+        or q.shape[0] != 1
+        or a.dim() != 2
+        or b.dim() != 2
+        or state is None
+        or state.dim() != 4
+    ):
+        return None
+    num_tokens = q.shape[1]
+    if num_tokens == 0 or cu.numel() != num_tokens + 1 or idx.numel() < num_tokens:
+        return None
+    provider, kernel = select_recurrent()
+    if provider != AITER or kernel is None:
+        return None
+    if state.stride(-1) != 1 or state.stride(-2) != state.shape[-1]:
+        return None
+    hv, vdim = v.shape[2], v.shape[3]
+    mixed = torch.cat(
+        [q.reshape(num_tokens, -1), k.reshape(num_tokens, -1),
+         v.reshape(num_tokens, -1)],
+        dim=1,
+    )
+    out = q.new_empty(num_tokens, 1, hv, vdim)
+    scale = arguments["scale"]
+    if scale is None:
+        scale = q.shape[-1] ** -0.5
+    kernel(
+        mixed, a, b, arguments["A_log"], arguments["dt_bias"], scale, state,
+        out, _aiter_state_indices(idx[:num_tokens]),
+        arguments["use_qk_l2norm_in_kernel"],
+    )
+    return out.view(1, num_tokens, hv, vdim), state
 
 
 def apply_to_module(module: ModuleType) -> bool:
@@ -288,6 +380,12 @@ def apply_to_module(module: ModuleType) -> bool:
         bound.apply_defaults()
         provider, kernel = select_sigmoid()
         if provider == AITER:
+            # The packed decode kernel also handles fp16 state, which the
+            # varlen sigmoid kernel rejects, so try it before the checks.
+            packed = _single_token_packed_decode(
+                bound.arguments, select_recurrent)
+            if packed is not None:
+                return packed
             reason = _aiter_sigmoid_unsupported(bound.arguments)
             if reason is not None:
                 provider, kernel = aiter_input_fallback(

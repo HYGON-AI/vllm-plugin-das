@@ -1316,7 +1316,7 @@ def test_fla_chunk_delta_h_unsupported_aiter_inputs_fall_back_to_boltops(
         return "boltops-h", "boltops-v", "boltops-final"
 
     boltops.__signature__ = inspect.signature(_boltops_chunk_h_contract)
-    aiter_hip = lambda *a, **k: pytest.fail("aiter HIP requires fp32 state")
+    aiter_hip = lambda *a, **k: pytest.fail("aiter HIP requires chunk_size 64")
     aiter_hip.__signature__ = inspect.signature(_aiter_hip_chunk_h_contract)
     module = _module(
         adapter.TARGET_MODULE,
@@ -1343,12 +1343,66 @@ def test_fla_chunk_delta_h_unsupported_aiter_inputs_fall_back_to_boltops(
         k,
         torch.empty_like(u),
         u,
-        initial_state=torch.empty(1, 4, 128, 128, dtype=torch.bfloat16),
+        initial_state=torch.empty(1, 4, 128, 128, dtype=torch.float32),
         output_final_state=True,
+        chunk_size=32,
     )
 
     assert result == ("boltops-h", "boltops-v", "boltops-final")
     assert calls[0]["null_state_index"] == 0
+
+
+@pytest.mark.parametrize("state_dtype", [torch.float16, torch.bfloat16])
+def test_fla_chunk_delta_h_upcasts_low_precision_state_for_aiter(
+    monkeypatch,
+    state_dtype,
+):
+    """A fp16/bf16 SSM state cache stays on aiter via an fp32 upcast.
+
+    The HIP kernel accumulates in fp32 and returns an fp32 final state, so
+    upcasting the gathered initial states is cheaper than falling back.
+    """
+    adapter = _adapter("patch_fla_chunk_delta_h")
+    seen = []
+
+    def aiter_hip(*args, **kwargs):
+        seen.append(args[5])
+        return "aiter-h", "aiter-v", "aiter-final"
+
+    aiter_hip.__signature__ = inspect.signature(_aiter_hip_chunk_h_contract)
+    boltops = lambda *a, **k: pytest.fail("fp16 state must not fall back")
+    boltops.__signature__ = inspect.signature(_boltops_chunk_h_contract)
+    module = _module(
+        adapter.TARGET_MODULE,
+        FLA_CHUNK_SIZE=64,
+        chunk_gated_delta_rule_fwd_h=_official_chunk_h,
+    )
+    _install_fake_module(
+        monkeypatch, "boltops.fla.gdn", chunk_gated_delta_rule_fwd_h=boltops
+    )
+    _install_fake_module(
+        monkeypatch,
+        "aiter.ops.fla",
+        chunk_gated_delta_rule_fwd_vllm_hip_blockdim64=aiter_hip,
+    )
+    adapter.apply_to_module(module)
+    monkeypatch.setenv("VLLM_HCU_USE_CUSTOM_OPS", "1")
+    monkeypatch.setattr(
+        _adapter("_gdn_backend"), "_prefill_requested", "hcu-aiter"
+    )
+
+    k = torch.empty(1, 64, 2, 128, dtype=torch.bfloat16)
+    u = torch.empty(1, 64, 4, 128, dtype=torch.bfloat16)
+    result = module.chunk_gated_delta_rule_fwd_h(
+        k,
+        torch.empty_like(u),
+        u,
+        initial_state=torch.empty(1, 4, 128, 128, dtype=state_dtype),
+        output_final_state=True,
+    )
+
+    assert result == ("aiter-h", "aiter-v", "aiter-final")
+    assert seen[0].dtype == torch.float32
 
 
 def test_fla_chunk_o_uses_aiter_hip_and_fills_output_buffer(monkeypatch):

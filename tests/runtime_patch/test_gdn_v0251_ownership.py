@@ -1108,3 +1108,75 @@ print(json.dumps({
     payload = json.loads(result.stdout.strip().splitlines()[-1])
     assert payload["sentinel"] == "GDN_V028_OWNERSHIP_OK"
     assert set(payload["statuses"].values()) == {"applied"}
+
+
+def _state_indices_fn():
+    from vllm_hcu.patch.worker.op_opt.patch_gdn_linear_attention import (
+        _aiter_state_indices,
+    )
+
+    return _aiter_state_indices
+
+
+def _with_forward_context(monkeypatch):
+    """Install a stand-in forward context the index cache can attach to."""
+    import vllm.forward_context as fc
+
+    ctx = SimpleNamespace()
+    monkeypatch.setattr(fc, "is_forward_context_available", lambda: True)
+    monkeypatch.setattr(fc, "get_forward_context", lambda: ctx)
+    return ctx
+
+
+def test_aiter_state_indices_caches_within_one_forward(monkeypatch):
+    """The NULL_BLOCK_ID remap is computed once per forward context."""
+    ctx = _with_forward_context(monkeypatch)
+    fn = _state_indices_fn()
+    indices = torch.tensor([3, 0, 5, 0], dtype=torch.int32)
+
+    first = fn(indices)
+    second = fn(indices)
+
+    assert first is second
+    assert first.tolist() == [3, -1, 5, -1]
+    assert len(ctx._vllm_hcu_aiter_state_indices) == 1
+
+
+def test_aiter_state_indices_misses_after_in_place_rewrite(monkeypatch):
+    """An in-place rewrite must not return the previous mapping.
+
+    data_ptr, shape, stride and dtype are all unchanged by an in-place
+    write, so without the storage version in the key the cache would hand
+    back the mapping of the superseded indices.
+    """
+    _with_forward_context(monkeypatch)
+    fn = _state_indices_fn()
+    indices = torch.tensor([3, 0, 5, 0], dtype=torch.int32)
+
+    first = fn(indices)
+    assert first.tolist() == [3, -1, 5, -1]
+
+    with torch.no_grad():
+        indices.copy_(torch.tensor([0, 7, 0, 9], dtype=torch.int32))
+    second = fn(indices)
+
+    assert second is not first
+    assert second.tolist() == [-1, 7, -1, 9]
+
+
+def test_aiter_state_indices_without_forward_context_does_not_cache(monkeypatch):
+    import vllm.forward_context as fc
+
+    monkeypatch.setattr(fc, "is_forward_context_available", lambda: False)
+    fn = _state_indices_fn()
+    indices = torch.tensor([3, 0], dtype=torch.int32)
+
+    first = fn(indices)
+    second = fn(indices)
+
+    assert first is not second
+    assert first.tolist() == second.tolist() == [3, -1]
+
+
+def test_aiter_state_indices_passes_none_through():
+    assert _state_indices_fn()(None) is None

@@ -164,10 +164,18 @@ class HcuGPUWorker(Worker):
             refresh_glm53_router_gates,
         )
 
+        from vllm_hcu.model_executor.layers.quantization.w8a16_gemm import (
+            clear_dequant_cache,
+        )
+
         refresh_glm53_router_gates(self.model_runner.model)
         refresh_compressor_nt_weights(self.model_runner.model)
         from vllm_hcu.model_executor.layers.kimi_k3_mixed_precision import refresh_kimi_kda_fused_qkv
         refresh_kimi_kda_fused_qkv(self.model_runner.model)
+        # The W8A16 dequant cache keys on storage pointer + version; a reload
+        # that lands new weights on fresh storage would otherwise leave the
+        # previous model's W16 copies resident for the life of the process.
+        clear_dequant_cache()
 
     def _start_weight_update(self, is_draft: bool = False) -> None:
         from vllm_hcu.model_executor.layers.quantization.grouped_w4a16_moe_runtime import (
@@ -224,6 +232,14 @@ class HcuGPUWorker(Worker):
         self._grouped_w4a16_scale_owners = None
         from vllm_hcu.model_executor.layers.kimi_k3_mixed_precision import refresh_kimi_kda_fused_qkv
         refresh_kimi_kda_fused_qkv(model)
+        from vllm_hcu.model_executor.layers.quantization.w8a16_gemm import (
+            clear_dequant_cache,
+        )
+
+        # Same reason as in reload_weights: the W8A16 dequant cache keys on
+        # storage pointer + version, so entries for the superseded weights can
+        # never be hit again and would stay resident for the process lifetime.
+        clear_dequant_cache()
         if not self._weight_update_is_draft:
             from vllm_hcu.model_executor.layers.fused_moe.glm53_router_gemv import (
                 refresh_glm53_router_gates,

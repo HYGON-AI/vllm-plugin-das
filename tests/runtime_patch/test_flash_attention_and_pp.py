@@ -609,8 +609,9 @@ def test_flash_attention_kernel_block_sizes_do_not_require_current_config(
     if mode in ("varlen", "cutlass"):
         assert sizes == [64]
     else:
-        assert isinstance(sizes[0], flash_attn.MultipleOf)
-        assert sizes[0].base == 16
+        # The classic prefix kernel indexes pages at a fixed 128 tokens, so it
+        # reports that one size rather than a MultipleOf(16) range.
+        assert sizes == [128]
 
 
 @pytest.mark.parametrize(

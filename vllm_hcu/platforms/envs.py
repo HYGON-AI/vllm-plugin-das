@@ -27,6 +27,23 @@ if TYPE_CHECKING:
     VLLM_HCU_USE_CUSTOM_GEMMA_RMS_NORM : bool = False
     VLLM_HCU_USE_SKIP_WEIGHT_DEBUG : bool = False
     VLLM_HCU_USE_CUSTOM_TOPK_TOPP_SAMPLER : bool = False
+    VLLM_HCU_USE_DEEPGEMM_W8A16_GEMM: bool = True
+    VLLM_HCU_DEEPGEMM_W8A16_PRESHUFFLE: bool = True
+    VLLM_HCU_USE_CUSTOM_REARRANGE_MIXED_QKV: bool = True
+    VLLM_HCU_USE_FUSED_RMSNORM_MROPE: bool = True
+    # KNOWN ISSUE (rare): the strided-z op runs inside FULL decode graphs
+    # where launch shapes freeze at capture time; a rare replay shape has
+    # deadlocked the stream once in ~5h of evals. Default on for the p1
+    # +11% it buys; set 0 to fall back if the serving loop lacks a
+    # restart-on-stall watchdog.
+    VLLM_HCU_USE_CUSTOM_STRIDED_Z: bool = True
+    VLLM_HCU_USE_FUSED_QWEN35_MOE_BLOCK: bool = True
+    VLLM_HCU_FUSED_QWEN35_MOE_NORM: bool = True
+    VLLM_HCU_W8A16_CACHE_DEQUANT: bool = True
+    VLLM_HCU_PREFILL_BATCH_WAIT_MS: int = 0
+    VLLM_HCU_PREFILL_BATCH_MIN: int = 0
+    VLLM_HCU_PREFILL_BATCH_MIN_RUNNING: int = 12
+    VLLM_HCU_INT8_LM_HEAD: bool = False
     VLLM_HCU_USE_CUSTOM_RMS_NORM : bool = False
     VLLM_HCU_USE_CUSTOM_AITER_FLA : bool = False
     VLLM_HCU_GDN_DECODE_BACKEND: str = "hcu-aiter"
@@ -328,6 +345,85 @@ def resolve_hcu_flash_attn_mode(explicit_mode: Optional[str]) -> str:
     return "varlen"
 
 hcu_vllm_environment_variables: dict[str, Callable[[], Any]] = {
+    # If set (default True), vLLM uses the DeepGEMM W8A16 GEMM kernel for
+    # int8 weight-only linear layers; otherwise the PyTorch fallback.
+    "VLLM_HCU_USE_DEEPGEMM_W8A16_GEMM":
+        lambda: (os.environ.get("VLLM_HCU_USE_DEEPGEMM_W8A16_GEMM", "True").lower() in
+                 ("true", "1")),
+
+    # If set (default True) and DeepGEMM is used, pre-shuffle W8A16 linear
+    # weights into the marlin layout (WEIGHT_LAYOUT=1) at load time for
+    # shapes whose tuned DeepGEMM configs pick that layout. Requires
+    # DeepGEMM with the bm32 kernel fix (a325158 "fix:bm32 kernel Bload").
+        # If set (default True), the Qwen3.5 full-attention layers use the
+    # fused RMSNorm+MRoPE Triton kernel (stride-safe, vllm-hcu 4e01bc8).
+    "VLLM_HCU_USE_FUSED_RMSNORM_MROPE":
+        lambda: (os.environ.get("VLLM_HCU_USE_FUSED_RMSNORM_MROPE", "True").lower() in
+                 ("true", "1")),
+
+    "VLLM_HCU_USE_CUSTOM_REARRANGE_MIXED_QKV":
+        lambda: (os.environ.get("VLLM_HCU_USE_CUSTOM_REARRANGE_MIXED_QKV", "True").lower() in
+                 ("true", "1")),
+
+    "VLLM_HCU_USE_CUSTOM_STRIDED_Z":
+        lambda: (os.environ.get("VLLM_HCU_USE_CUSTOM_STRIDED_Z", "True").lower() in
+                 ("true", "1")),
+
+    # Qwen3.5/Qwen3-Next W8A16 MoE block: one GEMM for router + shared-expert
+    # gate + shared gate_up, a strided top-k kernel, and one fused tail
+    # (routed sum + sigmoid-gated shared expert).
+    "VLLM_HCU_USE_FUSED_QWEN35_MOE_BLOCK":
+        lambda: (os.environ.get("VLLM_HCU_USE_FUSED_QWEN35_MOE_BLOCK", "True").lower() in
+                 ("true", "1")),
+
+    # With the fused MoE block: fold each MoE tail into the next layer's
+    # Gemma fused-add RMSNorm (one kernel less per layer).
+    "VLLM_HCU_FUSED_QWEN35_MOE_NORM":
+        lambda: (os.environ.get("VLLM_HCU_FUSED_QWEN35_MOE_NORM", "True").lower() in
+                 ("true", "1")),
+
+    # Keep a dequantized W16 copy of every W8A16 dense weight for the
+    # large-M (prefill) GEMM path instead of re-dequantizing per call.
+    # ~2x faster prefill dense GEMMs; costs 2 bytes/param of extra memory
+    # (+2.6 GB for Qwen3.5-35B-A3B).  On by default; set 0 to save memory.
+    # Requires VLLM_HCU_USE_CUSTOM_OPS.
+    "VLLM_HCU_W8A16_CACHE_DEQUANT":
+        lambda: (os.environ.get("VLLM_HCU_W8A16_CACHE_DEQUANT", "True").lower() in
+                 ("true", "1")),
+
+    # Hold new prefills (while decodes are running) until the oldest waiting
+    # request has waited this many ms, so several arrivals share one mixed
+    # step.  On weight-bandwidth-bound MoE models every mixed step reads all
+    # experts, so fewer, larger prefill batches raise throughput.  0 = off
+    # (default: it trades TTFT for throughput, so enable per model; 120 is
+    # the value tuned on Qwen3.5-35B-A3B translation).
+    # Requires VLLM_HCU_USE_CUSTOM_OPS.
+    "VLLM_HCU_PREFILL_BATCH_WAIT_MS":
+        lambda: int(os.environ.get("VLLM_HCU_PREFILL_BATCH_WAIT_MS", "0")),
+
+    # With VLLM_HCU_PREFILL_BATCH_WAIT_MS: release held prefills as soon as
+    # this many requests are waiting.  0 = only the wait time releases them.
+    "VLLM_HCU_PREFILL_BATCH_MIN":
+        lambda: int(os.environ.get("VLLM_HCU_PREFILL_BATCH_MIN", "0")),
+
+    # With VLLM_HCU_PREFILL_BATCH_WAIT_MS: only hold prefills while at least
+    # this many requests are running.  At low concurrency a mixed step is
+    # cheap and holding only adds latency.  Default 12 (only takes effect
+    # with WAIT_MS > 0); 0 = hold whenever decodes run.
+    "VLLM_HCU_PREFILL_BATCH_MIN_RUNNING":
+        lambda: int(os.environ.get("VLLM_HCU_PREFILL_BATCH_MIN_RUNNING", "12")),
+
+    # Per-channel int8 copy of a 16-bit lm_head for decode-sized batches
+    # (<= 32 rows), read by the DeepGEMM W8A16 GEMV.  Halves the lm_head
+    # read; changes logits numerics, so off by default.
+    "VLLM_HCU_INT8_LM_HEAD":
+        lambda: (os.environ.get("VLLM_HCU_INT8_LM_HEAD", "False").lower() in
+                 ("true", "1")),
+
+    "VLLM_HCU_DEEPGEMM_W8A16_PRESHUFFLE":
+        lambda: (os.environ.get("VLLM_HCU_DEEPGEMM_W8A16_PRESHUFFLE", "True").lower() in
+                 ("true", "1")),
+
     # path to the logs of redirect-output, abstrac of related are ok
 
     # If set, vLLM will transpose weight to use nn layout
