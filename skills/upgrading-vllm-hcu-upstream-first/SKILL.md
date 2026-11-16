@@ -396,3 +396,15 @@ when component numerics pass. If official IR covers the required behavior,
 consider official ownership of compiled execution and assess eager vendor
 dispatch separately. Revalidate the resulting model path before acceptance.
 
+Use the same compilation pipeline for the reference and candidate. A direct
+native implementation under ordinary `torch.compile` is not equivalent to an
+official IR wrapper compiled without vLLM's functionalization and lowering
+passes. Compare genuine Core and OOT layers through the target release's
+compiler passes, retain its default arithmetic policy, and record selected IR
+providers and generated kernels. Follow the target wrapper's dynamic-dimension
+and backend-lifetime contracts; a one-shot backend cannot survive a Dynamo
+analysis restart. Disable compile caches only in a diagnostic that needs to
+observe passes, and validate normal serving with its intended caches intact.
+If independent builds of identical kernel source differ, add a Core-vs-Core
+control and inspect selected launch configurations before assigning the cause
+to the Plugin. Preserve the failures and full-model gates.
