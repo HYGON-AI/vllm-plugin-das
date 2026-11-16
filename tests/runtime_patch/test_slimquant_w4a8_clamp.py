@@ -26,6 +26,16 @@ from vllm_hcu.model_executor.layers.quantization import (
 
 @pytest.fixture
 def cpu_ops(monkeypatch):
+    # CPU-only CI can disable Triton in vLLM's driver probe, leaving a
+    # language placeholder without floating dtypes. These tests use real
+    # dtype tokens but double every GPU quant/GEMM operation. Scope the real
+    # host-only language module to those consumers; keep global availability
+    # and production kernel admission unchanged.
+    import triton.language as tl
+
+    for module in (triton_moe, fused_moe):
+        monkeypatch.setattr(module, "tl", tl)
+
     quantized = []
     gemms = []
 
@@ -110,6 +120,10 @@ def _inputs(dtype, limit=10.0):
         activation=MoEActivation.SILU,
         num_experts=1,
         swiglu_limit=limit,
+        swiglu_alpha=None,
+        swiglu_beta=None,
+        activation_situ_beta=None,
+        activation_situ_linear_beta=None,
         moe_parallel_config=SimpleNamespace(use_all2all_kernels=False),
     )
     method = SimpleNamespace(
