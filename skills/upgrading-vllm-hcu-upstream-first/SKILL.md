@@ -191,6 +191,22 @@ update an explicit repository allowlist with executable positive and negative
 guard cases. Keep image configuration, source checks and actual device jobs
 as separate evidence. Registry provenance alone does not qualify the runtime.
 
+For three-way repair, resolve the live target Git ref: PR metadata `base.sha`
+can lag the branch. Preserve independent changes and compare interface owners
+when a conflict reveals a newer merged implementation. Check expected head and
+live base again before a normal non-forced publication.
+
+Inspect the actual fork job environment before relying on variables/secrets.
+An authorized published release digest can supply an explicit project baseline
+when variables are unavailable; preserve overrides and reject mutable/foreign
+images. On Actions runner v2.338.2, an empty container credentials object is
+valid while present empty username/password fields fail template validation.
+Omit unavailable fields for forks; never send secrets to them or relax gates.
+After checkout restores its temporary HOME, package metadata may still hit Git
+ownership refusal. Trust only the exact checkout path in the ephemeral job,
+never `safe.directory=*`, and verify another foreign checkout remains rejected.
+A successful container start still requires the actual selected tests to pass.
+
 The portable script tests use temporary Git repositories:
 
 ```bash
