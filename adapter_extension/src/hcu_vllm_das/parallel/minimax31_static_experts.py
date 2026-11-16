@@ -1,6 +1,6 @@
 # SPDX-License-Identifier: Apache-2.0
 """Static physical-capacity and checkpoint loader through public factory seams."""
-import json,os
+import json
 from pathlib import Path
 import torch
 from vllm.model_executor.layers.fused_moe.config import FusedMoEConfig
@@ -43,7 +43,8 @@ class StaticMoEMethod(MiniMax31W4A8MoEMethod):
         super().process_weights_after_loading(layer)
         layer._static_pack_count=1
         layer._static_loading_proof={'schema':'minimax31-static-loading-proof-v1','layer':layer._static_layer_id,'rank':layer.expert_map_manager.ep_rank,'map_sha256':layer._static_placement.map_sha256,'loader_abi':ABI,'physical_slots':list(range(layer.expert_map_manager.ep_rank*17,(layer.expert_map_manager.ep_rank+1)*17)),'logical_owners':list(layer._static_local_owners),'permanent_pack_count':1,'raw_full_copy_checks':len(expected),'independent_checkpoint_sample_checks':len(expected),'raw_loading_receipts':[layer._static_load_receipts[k] for k in sorted(expected)],'packed_samples':parameter_samples(layer)}
-        target=os.environ.get('HCU_MINIMAX_STATIC_RECEIPTS')
+        from .minimax31_config import artifacts
+        target=artifacts().require("loading_receipts")
         if not target:raise RuntimeError('static producer requires a loading-receipt directory')
         folder=Path(target);folder.mkdir(parents=True,exist_ok=True);path=folder/('rank%d_layer%02d.json'%(layer.expert_map_manager.ep_rank,layer._static_layer_id))
         with path.open('x') as f:json.dump(layer._static_loading_proof,f,sort_keys=True);f.write('\n')

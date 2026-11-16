@@ -7,7 +7,6 @@ Only MiniMax cache writes gather current K/V/index-K; queries remain rank-local.
 import hashlib
 import inspect
 import json
-import os
 import math
 from dataclasses import replace
 from pathlib import Path
@@ -33,9 +32,6 @@ _original_indexer = stock.MiniMaxM3Indexer
 _INDEXER_SHA = "318df992d4c216e7ae48655d879bbd8231d838eeca7567dab37f473b67a65d7b"
 _backends = {}
 _registration = None
-_EXPERIMENTAL_FP8_PCP = os.environ.get("HCU_MINIMAX_FP8_PCP") == "1"
-_EXPERIMENTAL_MSA = os.environ.get("HCU_MINIMAX_NATIVE_MSA") == "1"
-_EXPERIMENTAL_FP8_INDEX = os.environ.get("HCU_MINIMAX_FP8_INDEX") == "1"
 
 
 def is_target(config):
@@ -65,7 +61,7 @@ def validate_scope(config, *, allow_text_model=False):
         raise ValueError("MiniMax PCP requires linear placement without EPLB")
     if pc.all2all_backend != "allgather_reducescatter":
         raise ValueError("MiniMax PCP requires allgather_reducescatter")
-    allowed = ("auto", "bfloat16", "fp8") if _EXPERIMENTAL_FP8_PCP else ("auto", "bfloat16")
+    allowed = ("auto", "bfloat16", "fp8")
     if config.cache_config.cache_dtype not in allowed:
         raise ValueError("MiniMax PCP KV dtype is outside this experiment's scope")
 
@@ -107,8 +103,6 @@ def validate_fp8_sparse_cache(layer, slots):
     """
     if layer.kv_cache_dtype != "fp8" or layer.kv_cache.numel() == 0:
         return
-    if not _EXPERIMENTAL_FP8_PCP:
-        raise ValueError("FP8 MiniMax PCP requires HCU_MINIMAX_FP8_PCP=1")
     cache = layer.kv_cache
     expected_shape = (layer.num_kv_heads, 2 * layer.head_dim)
     if (cache.ndim != 4 or cache.shape[1] != expected_shape[0]
@@ -118,13 +112,13 @@ def validate_fp8_sparse_cache(layer, slots):
     if slots.ndim != 1 or slots.device != cache.device:
         raise ValueError("FP8 MiniMax PCP slot mapping layout/device mismatch")
     index_cache = layer.indexer.index_cache
-    index_dtype = torch.float8_e4m3fn if _EXPERIMENTAL_FP8_INDEX else torch.bfloat16
+    index_dtype = torch.float8_e4m3fn if getattr(layer, "_hcu_fp8_index", False) else torch.bfloat16
     if (index_cache.dtype != index_dtype
             or (index_cache.kv_cache.numel()
                 and index_cache.kv_cache.dtype != index_dtype)):
         raise ValueError("MiniMax PCP indexer cache dtype does not match index mode")
     index_storage = index_cache.kv_cache
-    if _EXPERIMENTAL_FP8_INDEX and index_storage.numel():
+    if index_dtype == torch.float8_e4m3fn and index_storage.numel():
         if (index_storage.ndim != 3 or tuple(index_storage.shape[1:]) != (128, 128)
                 or index_storage.device != cache.device or index_storage.stride(-1) != 1):
             raise ValueError("FP8 index side cache layout/device mismatch")
@@ -184,10 +178,13 @@ class MiniMax31NativeIndexCache(_original_indexer):
             self._hcu_native_index_only = False
             super().__init__(**kwargs)
             return
-        if not (_EXPERIMENTAL_FP8_INDEX and _EXPERIMENTAL_MSA and _EXPERIMENTAL_FP8_PCP):
-            raise ValueError("FP8 side cache requires the explicit native MSA index contract")
         from vllm.config import get_current_vllm_config
-        validate_scope(get_current_vllm_config(), allow_text_model=True)
+        config = get_current_vllm_config()
+        validate_scope(config, allow_text_model=True)
+        from .minimax31_config import artifacts
+        artifacts(config).require("msa_extension_dir")
+        if config.cache_config.cache_dtype != "fp8":
+            raise ValueError("FP8 index requires FP8 main cache")
         if (kwargs.get("topk_blocks") != 16 or kwargs.get("sparse_block_size") != 128
                 or kwargs.get("num_kv_heads") != 4 or kwargs.get("num_index_heads") != 4
                 or kwargs.get("index_head_dim") != 128 or kwargs.get("score_type") != "max"):
@@ -206,16 +203,18 @@ class MiniMax31NativeIndexCache(_original_indexer):
 class MiniMax31PCPSparseAttention(_original_sparse):
     def __init__(self, *args, **kwargs):
         super().__init__(*args, **kwargs)
-        if _EXPERIMENTAL_FP8_INDEX and not _EXPERIMENTAL_MSA:
-            raise ValueError("FP8 index requires native MSA")
-        if _EXPERIMENTAL_MSA and (not _EXPERIMENTAL_FP8_PCP or self.kv_cache_dtype != 'fp8' or self.use_aiter_sparse_pa):
-            raise ValueError('native MSA requires explicit FP8 PCP and the scoped non-AITER cache')
+        from .minimax31_config import artifacts
+        self._hcu_msa_extension_dir = artifacts().msa_extension_dir
+        self._hcu_native_msa = self._hcu_msa_extension_dir is not None
+        self._hcu_fp8_index = self.indexer.index_cache.dtype == torch.float8_e4m3fn
+        if self._hcu_fp8_index and not self._hcu_native_msa:
+            raise ValueError("FP8 index requires a matching native MSA artifact")
+        if self._hcu_native_msa and (self.kv_cache_dtype != "fp8" or self.use_aiter_sparse_pa):
+            raise ValueError("native MSA requires FP8 PCP and the scoped non-AITER cache")
         if getattr(self, "use_nvfp4_kv", False) or self.indexer_emits_table:
             raise ValueError("MiniMax PCP preserves the existing non-NVFP4 Triton indexer")
         self.attn_backend = pcp_backend(self.attn_backend)
         cache = self.indexer.index_cache
-        if _EXPERIMENTAL_FP8_INDEX and cache.dtype != torch.float8_e4m3fn:
-            raise ValueError('FP8 index requires indexer_kv_dtype=fp8_e4m3 at engine construction')
         cache.backend_cls = pcp_backend(cache.backend_cls)
 
     def forward(self, positions, hidden_states):
@@ -234,7 +233,7 @@ class MiniMax31PCPSparseAttention(_original_sparse):
         else:
             # The FP8 candidate converts the BF16 fused output explicitly.
             index_query = qkv.new_empty((n, self.index_q_size),
-                dtype=torch.bfloat16 if _EXPERIMENTAL_FP8_INDEX else self.indexer.index_cache.dtype)
+                dtype=torch.bfloat16 if self._hcu_fp8_index else self.indexer.index_cache.dtype)
             common.update(index_q_norm_weight=self.index_q_norm.weight,
                           index_k_norm_weight=self.index_k_norm.weight,
                           index_q_out=index_query)
@@ -265,7 +264,7 @@ class MiniMax31PCPSparseAttention(_original_sparse):
         elif self.kv_cache.numel():
             from vllm.v1.attention.ops.triton_reshape_and_cache_flash import (
                 triton_reshape_and_cache_flash)
-            if _EXPERIMENTAL_MSA:
+            if self._hcu_native_msa:
                 from .minimax31_msa import ensure_native_cache
                 binding = ensure_native_cache(self)
                 keys, values = binding.key_writer, binding.value_writer
@@ -277,7 +276,7 @@ class MiniMax31PCPSparseAttention(_original_sparse):
             if index_k is not None:
                 from vllm.models.minimax_m3.amd.ops.sparse_pa import (
                     minimax_m3_insert_index_cache)
-                if _EXPERIMENTAL_FP8_INDEX:
+                if self._hcu_fp8_index:
                     # Unit dequantization scale; saturate before the stock
                     # scatter converts BF16 to E4M3FN. Prefix and append use
                     # this same path, including PCP gathered rows.
@@ -285,9 +284,9 @@ class MiniMax31PCPSparseAttention(_original_sparse):
                 minimax_m3_insert_index_cache(
                     index_k, self.indexer.index_cache.kv_cache,
                     slots[self.indexer.index_cache.prefix])
-        if _EXPERIMENTAL_MSA:
+        if self._hcu_native_msa:
             from .minimax31_msa import run_native_attention
-            if _EXPERIMENTAL_FP8_INDEX and index_query is not None:
+            if self._hcu_fp8_index and index_query is not None:
                 index_query = index_query.clamp(-448.0, 448.0).to(torch.float8_e4m3fn)
             output = run_native_attention(self, query, index_query)
         else:
@@ -300,7 +299,9 @@ class MiniMax31PCPManager(PCPManager):
     def __init__(self, *args, **kwargs):
         # The explicit legacy EP runner gathers before routing. Its padding
         # view must therefore use the same rank-major global row layout.
-        kwargs["moe_gathers_tokens"] = os.environ.get("HCU_MINIMAX_DEEPEP_FIXEDCOUNTS") != "1"
+        kwargs["moe_gathers_tokens"] = False
+        self._hcu_native_msa = False
+        self._hcu_static = False
         super().__init__(*args, **kwargs)
 
     @staticmethod
@@ -311,31 +312,19 @@ class MiniMax31PCPManager(PCPManager):
 
     def prepare_inputs_for_capture_or_profile(self, input_batch):
         local = super().prepare_inputs_for_capture_or_profile(input_batch)
-        if os.environ.get("HCU_MINIMAX_STATIC_EPLB") == "1":
+        if self._hcu_static:
             from .minimax31_static_runtime import set_forward_layout
             set_forward_layout(local)
         return local
 
     def partition_batch(self, input_batch, batch_desc):
         local = super().partition_batch(input_batch, batch_desc)
-        if _EXPERIMENTAL_MSA:
+        if self._hcu_native_msa:
             from .minimax31_msa import set_forward_layout
             set_forward_layout(local)
-        if os.environ.get("HCU_MINIMAX_CAPTURE_CONFIG"):
-            import static_eplb_capture_hook
-            static_eplb_capture_hook.set_local_layout(local, self.pcp_rank)
-        if os.environ.get("HCU_MINIMAX_STATIC_EPLB") == "1":
+        if self._hcu_static:
             from .minimax31_static_runtime import set_forward_layout
             set_forward_layout(local)
-        count = getattr(self, "_hcu_observations", 0)
-        if count < 12 or os.environ.get("HCU_MINIMAX_LOG_ALL_PCP_LAYOUT") == "1":
-            print("MINIMAX_PCP_LAYOUT " + json.dumps({
-                "rank": self.pcp_rank, "global_tokens": input_batch.num_tokens,
-                "local_real_tokens": local.num_tokens,
-                "local_padded_tokens": local.num_tokens_after_padding,
-                "has_prefill": input_batch.has_prefill,
-                "query_lengths": local.num_scheduled_tokens.tolist()}), flush=True)
-        self._hcu_observations = count + 1
         return local
 
 
@@ -396,6 +385,14 @@ def profile_local_token_budget(global_tokens, max_num_reqs, world_size=8):
 
 
 class MiniMax31PCPModelRunner(GPUModelRunner):
+    def __init__(self, *args, **kwargs):
+        super().__init__(*args, **kwargs)
+        from .minimax31_config import artifacts
+        from .minimax31_static_contract import from_model_config
+        if self.pcp_manager is not None:
+            self.pcp_manager._hcu_native_msa = artifacts(self.vllm_config).msa_extension_dir is not None
+            self.pcp_manager._hcu_static = from_model_config(self.vllm_config.model_config) is not None
+
     @torch.inference_mode()
     def _dummy_run(self, num_tokens, *args, **kwargs):
         if kwargs.get("is_profile", False):
@@ -427,12 +424,10 @@ def install_minimax31_pcp():
     if _registration is not None:
         check_health()
         return
-    if _EXPERIMENTAL_FP8_INDEX:
-        from vllm.models.minimax_m3.common import indexer as indexer_module
-        if (not _EXPERIMENTAL_MSA or not _EXPERIMENTAL_FP8_PCP
-                or hashlib.sha256(Path(inspect.getfile(indexer_module)).read_bytes()).hexdigest() != _INDEXER_SHA
-                or stock.MiniMaxM3Indexer is not _original_indexer):
-            raise RuntimeError("FP8 index requires the reviewed native MSA indexer ABI")
+    from vllm.models.minimax_m3.common import indexer as indexer_module
+    if (hashlib.sha256(Path(inspect.getfile(indexer_module)).read_bytes()).hexdigest() != _INDEXER_SHA
+            or stock.MiniMaxM3Indexer is not _original_indexer):
+        raise RuntimeError("MiniMax indexer ABI changed")
     if (stock.Attention is not _original_attention
             or stock.MiniMaxM3Attention is not _original_dense
             or stock.MiniMaxM3SparseAttention is not _original_sparse):
@@ -444,8 +439,7 @@ def install_minimax31_pcp():
     stock.Attention = MiniMax31PCPAttentionLayer
     stock.MiniMaxM3Attention = MiniMax31PCPDenseAttention
     stock.MiniMaxM3SparseAttention = MiniMax31PCPSparseAttention
-    if _EXPERIMENTAL_FP8_INDEX:
-        stock.MiniMaxM3Indexer = MiniMax31NativeIndexCache
+    stock.MiniMaxM3Indexer = MiniMax31NativeIndexCache
     ModelRegistry.register_model(ARCH, MiniMax31PCPForConditionalGeneration)
     _registration = register_model_runner_factory(
         OWNER, matches=is_target, create=MiniMax31PCPModelRunner)
@@ -461,7 +455,7 @@ def check_health():
     from .minimax31_ep_runner import check_minimax31_ep_runner
     check_minimax31_ep_runner(stock)
     registered = ModelRegistry.models.get(ARCH)
-    if (_EXPERIMENTAL_FP8_INDEX and stock.MiniMaxM3Indexer is not MiniMax31NativeIndexCache):
+    if stock.MiniMaxM3Indexer is not MiniMax31NativeIndexCache:
         raise RuntimeError("MiniMax native index cache factory ownership changed")
     if (getattr(registered, "model_cls", None) is not MiniMax31PCPForConditionalGeneration
             or stock.Attention is not MiniMax31PCPAttentionLayer

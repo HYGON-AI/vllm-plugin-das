@@ -10,6 +10,7 @@ import queue
 import signal
 import sys
 import time
+import uuid
 
 from vllm.engine.arg_utils import EngineArgs
 from vllm.entrypoints.cli.preload import PreloadSubcommand, _HealthState, _start_health_server
@@ -21,12 +22,13 @@ from .minimax31_ipc import MiniMax31PcpEpDaemon, require_core_contract
 from .minimax31_preload import plan_ranks, validate_parallel_config, require_extensions
 
 
-def _worker(rank, config, address, socket_dir, ready_queue):
+def _worker(rank, config, address, socket_dir, ready_queue, generation):
     # Spawn starts a fresh interpreter: activate both explicitly required
     # extensions in every producer before resolving the model class.
     load_general_plugins()
     require_extensions()
     daemon = MiniMax31PcpEpDaemon(config, rank, rank, address, socket_dir)
+    daemon._static_generation = generation
     daemon.load_model()
     daemon.warmup()
     from .minimax31_static_ipc import freeze_publication, publication_identity
@@ -97,7 +99,8 @@ def main(argv=None):
     address=get_distributed_init_method("127.0.0.1", args.weight_cache_master_port or get_open_port())
     ctx=multiprocessing.get_context("spawn")
     ready=ctx.Queue()
-    procs=[ctx.Process(target=_worker,args=(row["global_rank"],config,address,str(root),ready),
+    generation=uuid.uuid4().hex
+    procs=[ctx.Process(target=_worker,args=(row["global_rank"],config,address,str(root),ready,generation),
                        name="minimax31-pcp-ep-%d" % row["global_rank"]) for row in placements]
     state=_HealthState(procs)
     server=thread=None

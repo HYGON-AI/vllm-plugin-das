@@ -24,7 +24,7 @@ def version(t):
 def freeze_publication(daemon):
     placement=from_model_config(daemon.model_config)
     if placement is None:return
-    generation=os.environ.get('HCU_MINIMAX_STATIC_GENERATION','')
+    generation=daemon._static_generation
     if not re.fullmatch('[0-9a-f]{32}',generation):raise ValueError('static producer requires a fresh32-hex generation')
     tensors,aliases,refs=model_inventory(daemon.model);proofs={}
     for module in daemon.model.modules():
@@ -41,7 +41,8 @@ def freeze_publication(daemon):
     manifest={'schema':'minimax31-static-publication-v1','generation':generation,'rank':daemon.global_rank,'gpu_uuid':daemon._partition.gpu_uuid,'map_sha256':placement.map_sha256,'weight_contract_sha256':daemon._partition.weight_contract_sha256,'loader_abi':ABI,'logical_experts':128,'physical_experts':136,'slots_per_rank':17,'tensors':tensors,'aliases':aliases,'layer_loading_proofs':proofs}
     daemon._static_manifest=manifest;daemon._static_manifest_sha256=sha(manifest)
     daemon._static_storage_snapshot={n:(id(t),t.data_ptr(),version(t)) for n,t in refs.items()}
-    path=Path(os.environ['HCU_MINIMAX_STATIC_RECEIPTS'])/('rank%d_publication.json'%daemon.global_rank)
+    from .minimax31_config import artifacts
+    path=Path(artifacts(daemon.vllm_config).require("loading_receipts"))/('rank%d_publication.json'%daemon.global_rank)
     with path.open('x') as f:json.dump({'manifest_sha256':daemon._static_manifest_sha256,'manifest':manifest},f,sort_keys=True);f.write('\n')
 
 def publication_identity(daemon):
@@ -87,8 +88,7 @@ def serve_static(daemon,conn,request):
     if response.get('status')=='ok':response['static_publication']={'identity':expected,'manifest':daemon._static_manifest,'response_sha256':response_digest(response)}
     send_msg(conn,response)
 
-def expected_publication(partition):
-    path=os.environ.get('HCU_MINIMAX_STATIC_READY_MANIFEST')
+def expected_publication(partition, path):
     if not path:raise ValueError('static consumer requires a matching READY observation')
     ready=json.loads(Path(path).read_text());rows=ready.get('ranks',[])
     if len(rows)!=8 or sorted(row['rank'] for row in rows)!=list(range(8)):raise ValueError('static READY lacks8 ranks')
@@ -111,7 +111,7 @@ def verify_response(response,expected,partition):
         if any(info.get(k)!=v for k,v in manifest['tensors'][name].items()):raise ValueError('static IPC tensor metadata differs: '+name)
     return manifest
 
-def verify_mapped_model(model,manifest):
+def verify_mapped_model(model,manifest,target):
     tensors,aliases,refs=model_inventory(model)
     for name,info in manifest['tensors'].items():
         if tensors.get(name)!=info:raise RuntimeError('mapped static tensor metadata differs: '+name)
@@ -126,7 +126,6 @@ def verify_mapped_model(model,manifest):
         if parameter_samples(module)!=proof['packed_samples']:raise RuntimeError('mapped static weight/scale samples differ from same-generation producer')
         if module._static_physical_to_logical.cpu().tolist()!=list(module._static_placement.row(module._static_layer_id)):raise RuntimeError('mapped physical-to-logical table differs')
     if seen!=set(manifest['layer_loading_proofs']):raise RuntimeError('mapped static layer coverage mismatch')
-    target=os.environ.get('HCU_MINIMAX_STATIC_CONSUMER_RECEIPTS')
     if not target:raise ValueError('static consumer requires a receipt directory')
     folder=Path(target);folder.mkdir(parents=True,exist_ok=True);path=folder/('rank%d_%d.json'%(manifest['rank'],os.getpid()))
     with path.open('x') as f:json.dump({'schema':'minimax31-static-consumer-map-proof-v1','generation':manifest['generation'],'map_sha256':manifest['map_sha256'],'manifest_sha256':sha(manifest),'rank':manifest['rank'],'gpu_uuid':manifest['gpu_uuid'],'layers':sorted(map(int,seen)),'slots_per_rank':17,'consumer_permanent_pack_count':0,'mapped_weight_scale_samples_match':True,'strict_native_and_partition_validation':True},f,sort_keys=True);f.write('\n')

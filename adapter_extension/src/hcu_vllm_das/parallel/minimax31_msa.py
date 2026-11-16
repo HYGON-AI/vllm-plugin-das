@@ -167,6 +167,7 @@ class TeacherMSAPrefill:
 _HOST = None
 _META = {}
 _ADAPTER = None
+_ADAPTER_ROOT = None
 _UNIT = {}
 _UNIT_VERSION = {}
 
@@ -195,12 +196,15 @@ def ensure_native_cache(layer):
     return binding
 
 
-def _get_adapter():
-    global _ADAPTER
-    if _ADAPTER is not None:return _ADAPTER
-    import hashlib,importlib,importlib.metadata,json,os,sys
+def _get_adapter(extension_dir):
+    global _ADAPTER, _ADAPTER_ROOT
+    import hashlib,importlib,importlib.metadata,json,sys
     from pathlib import Path
-    root=Path(os.environ['HCU_MINIMAX_MSA_EXTENSION_DIR']).resolve()
+    root=Path(extension_dir).resolve()
+    if _ADAPTER is not None:
+        if root != _ADAPTER_ROOT:
+            raise RuntimeError('native MSA artifact changed; restart the engine')
+        return _ADAPTER
     proof=json.loads((root.parent/'native_import_result.json').read_text())
     plan=json.loads((root.parent/'build_plan.json').read_text())
     so=root/'hcu_minimax_msa'/Path(proof['path']).name
@@ -214,6 +218,7 @@ def _get_adapter():
     if Path(native.__file__).resolve()!=so:
         raise RuntimeError('native MSA loaded from a foreign path')
     _ADAPTER=TeacherMSAPrefill(native)
+    _ADAPTER_ROOT=root
     return _ADAPTER
 
 
@@ -248,7 +253,7 @@ def run_native_attention(layer,query,index_query):
         if getattr(main,field)!=getattr(side,field):raise RuntimeError('native MSA main/index query split mismatch')
     if layer.skip_index_topk or index_query is None:
         raise RuntimeError('native MSA index sharing is outside current opt-in contract')
-    adapter=_get_adapter();cache=ensure_native_cache(layer)
+    adapter=_get_adapter(layer._hcu_msa_extension_dir);cache=ensure_native_cache(layer)
     n=query.shape[0];q=query.view(n,64,128);iq=index_query.view(n,4,128)
     unit=_UNIT.get(query.device)
     if unit is None:

@@ -1,10 +1,10 @@
 # MiniMax tiled local-route pack/restore
 
-The opt-in HCU_MINIMAX_HIPC_PACK_TILED=1 path tiles32 rows by256 columns in both pack and restore. It retains the existing DeepGEMM HIPC weight format, sort,128-row expert padding,32768-row GEMM chunks, native OAI and route-weight timing. Four-step upper-bound lookup handles duplicate expert starts from zero counts. Pointer products use64-bit indices. Restore keeps sequential FP32 top-k accumulation followed by one BF16 store. The existing row-wise pack remains the default fallback.
+The standalone tiled implementation tiles32 rows by256 columns in pack and restore. It retains the existing DeepGEMM HIPC weight format, sort,128-row expert padding,32768-row GEMM chunks, native OAI and route-weight timing. Four-step upper-bound lookup handles duplicate expert starts from zero counts. Pointer products use64-bit indices. Restore keeps sequential FP32 top-k accumulation followed by one BF16 store. The default HIPC runner uses the aligned core and tiled movement. Row-wise pack remains a numerical comparison tool, not an environment-selected branch.
 
 This is runtime activation movement. It does not repack weights, transpose scales or mutate received hidden states. Derive a real sidecar for changed runtime source guards. Reuse a producer only when the entire weight identity is naturally equal; never rewrite a key.
 
-The optional HCU_MINIMAX_ROUTE_COUNTS_ANNOTATION=1 adds CPU record_function labels containing the16 host counts already returned by DeepEP. It introduces no GPU tensor readback or file IO, but is diagnostic instrumentation and may affect timing. It was disabled in all formal unprofiled samples.
+Runtime route-count annotations have been removed. Use the public profiler separately from formal unprofiled performance runs.
 
 Validation on2026-11-13:
 - Synthetic and two real checkpoint expert seeds through both actual HIPC GEMMs/OAI were bit-exact against the old route path and met the unchanged independent FP64 gates.

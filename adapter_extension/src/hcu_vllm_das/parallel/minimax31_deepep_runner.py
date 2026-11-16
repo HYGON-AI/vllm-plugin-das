@@ -7,7 +7,6 @@ validating this wheel's received ID representation on all eight GPUs.
 """
 import torch
 import threading
-import os
 import json
 
 
@@ -56,7 +55,7 @@ def dispatch_routed(hidden, logits, select_experts, expert_fn, buffer,
         raise RuntimeError('unexpected DeepEP combine output')
     return combined
 
-# Explicit startup factory seam; the default runner remains the legacy path.
+# Model-scoped factory seam; fixed-count routing is the default.
 from .minimax31_ep_runner import MiniMax31PcpEpMoERunner
 from vllm.distributed.parallel_state import get_ep_group
 from vllm.model_executor.layers.fused_moe.runner.shared_experts import SharedExpertsOrder
@@ -211,15 +210,12 @@ class MiniMax31DeepEpRunner(MiniMax31PcpEpMoERunner):
 
     def _forward_locked(self, hidden_states, router_logits, shared_experts_input, input_ids=None):
         group = self._pcp_ep_group()
-        if os.environ.get("HCU_MINIMAX_DEEPEP_FIXEDCOUNTS") != "1":
-            raise RuntimeError("fixed-count DeepEP runner requires explicit opt-in")
         if self.gate is not None or input_ids is not None or self.routed_experts.quant_method.is_monolithic:
             raise RuntimeError('unsupported DeepEP MiniMax runner configuration')
         self.routed_experts._ensure_moe_quant_config_init()
         # Match stock lifecycle: short queries may choose the auxiliary stream.
         shared_overlapping = False
-        if (os.environ.get("HCU_MINIMAX_SHARED_OVERLAP") == "1"
-                and self._shared_experts is not None
+        if (self._shared_experts is not None
                 and shared_experts_input is not None
                 and shared_experts_input.shape[0] >= 2048):
             shared_overlapping = self._launch_long_shared(shared_experts_input)
@@ -230,55 +226,15 @@ class MiniMax31DeepEpRunner(MiniMax31PcpEpMoERunner):
         def select(hidden, logits):
             weights, ids = self.router.select_experts(hidden_states=hidden, router_logits=logits,
                     topk_indices_dtype=self._quant_method.topk_indices_dtype, input_ids=None)
-            if os.environ.get("HCU_MINIMAX_CAPTURE_CONFIG"):
-                import static_eplb_capture_hook
-                static_eplb_capture_hook.on_router(self.routed_experts.layer_name, ids)
             if hasattr(self.routed_experts,"_static_placement"):
                 from .minimax31_static_selector import select_physical
-                logical_ids = ids
                 ids = select_physical(self.routed_experts, ids)
-                if os.environ.get("HCU_MINIMAX_STATIC_ROUTE_CONTROL"):
-                    from .minimax31_static_diagnostics import selected
-                    selected(self.routed_experts,logical_ids,ids)
             return weights, ids
         def experts(hidden, weights, ids, counts):
             from triton_tmp_dir.minimax31_deepep_pack import run_received_local_routes
             from triton_tmp_dir.minimax31_w4a8_moe import apply_minimax31_w4a8
             layer = self.routed_experts
-            if hasattr(layer,"_static_placement") and os.environ.get("HCU_MINIMAX_STATIC_ROUTE_CONTROL"):
-                from .minimax31_static_diagnostics import received
-                received(layer,counts)
             backend = layer.quant_method.quant_config.routed_backend
-            if backend == "deepgemm_hipc_v1":
-                from triton_tmp_dir.minimax31_hipc_moe import run_received_hipc_routes, LAYOUT
-                tiled_pack = os.environ.get("HCU_MINIMAX_HIPC_PACK_TILED") == "1"
-                if tiled_pack:
-                    from triton_tmp_dir.minimax31_hipc_routes_tiled_v1 import run_received_hipc_routes
-                if getattr(layer, '_minimax31_expert_layout', None) != LAYOUT:
-                    raise RuntimeError("HIPC runner requires new processed HIPC weight identity")
-                moe = layer.quant_method.moe
-                if not getattr(layer, "_minimax31_hipc_logged", False):
-                    import deepgemm
-                    print("MINIMAX_ROUTED_BACKEND " + json.dumps({
-                        "backend":backend,"api":"m_grouped_w4a8_gemm_nt_contiguous_hipc",
-                        "mode":1006,"module":deepgemm.__file__,"layout":LAYOUT,
-                        "weight_shape":list(layer.w13_weight.shape),"raw_scale_factor":16,
-                        "route_pack":"tiled32x256-v1" if tiled_pack else "row1x256-v1",
-                        "weight_before_bf16_store":True,"chunk":32768}),flush=True)
-                    layer._minimax31_hipc_logged = True
-                if os.environ.get("HCU_MINIMAX_ROUTE_COUNTS_ANNOTATION") == "1":
-                    # Counts are already host ints from normal DeepEP. This
-                    # diagnostic adds a CPU annotation, never a GPU sync/IO.
-                    with torch.profiler.record_function(
-                            "MINIMAX_ROUTE_COUNTS:"+json.dumps(counts,separators=(",",":"))):
-                        return run_received_hipc_routes(
-                            hidden,ids,weights,counts,layer.w13_weight,layer.w2_weight,
-                            layer.w13_weight_scale,layer.w2_weight_scale,
-                            alpha=moe.swiglu_alpha,beta=moe.swiglu_beta,limit=moe.swiglu_limit)
-                return run_received_hipc_routes(
-                    hidden,ids,weights,counts,layer.w13_weight,layer.w2_weight,
-                    layer.w13_weight_scale,layer.w2_weight_scale,
-                    alpha=moe.swiglu_alpha,beta=moe.swiglu_beta,limit=moe.swiglu_limit)
             if backend != "bolt":
                 raise RuntimeError("unknown MiniMax routed backend")
             if getattr(layer, '_minimax31_expert_layout', None) != 'signed-high-nibble-first-interleaved-v1':
@@ -300,7 +256,7 @@ class MiniMax31DeepEpRunner(MiniMax31PcpEpMoERunner):
                 return result
             return run_received_local_routes(hidden, ids, weights, counts, local_expert,
                                              alignment=1)
-        if os.environ.get("HCU_MINIMAX_ALIGNED_MOE") == "1":
+        if self.routed_experts.quant_method.quant_config.routed_backend == "deepgemm_hipc_v1":
             if torch.cuda.is_current_stream_capturing():
                 raise RuntimeError("aligned MiniMax MoE currently requires eager execution")
             weights, ids = select(hidden_states, router_logits)

@@ -4,7 +4,7 @@ This model-specific candidate replaces only the scaled INT8 matrix multiplicatio
 
 ## Configuration and lifetime
 
-Set quantization_config.hcu_minimax_w8a8_backend to hipblaslt_v1. The default remains triton. hcu_minimax_w8a8_fallback defaults to error; setting triton explicitly permits a logged fallback for unsupported input dtype/layout/alignment. HCU_MINIMAX_W8A8_BACKEND, if supplied, must agree with the versioned configuration.
+quantization_config.hcu_minimax_w8a8_backend defaults to hipblaslt_v1; triton is an explicit comparison configuration. hcu_minimax_w8a8_fallback defaults to error; setting triton explicitly permits a logged fallback for unsupported input dtype/layout/alignment. There is no environment override; see [deployment configuration](minimax31_configuration.md).
 
 The task configuration builder accepts --w8a8-backend hipblaslt_v1 --w8a8-fallback error. The backend is part of the effective configuration identity, and the runtime contract fingerprints the actual LightOP wrapper/native extension. Generate a new derived identity rather than relabeling a live cache.
 

@@ -132,7 +132,11 @@ def test_w4_runtime_cache_restore_rebuilds_metadata_without_mutation():
     from hcu_vllm_das.quantization.minimax31 import MiniMax31W4A8MoEMethod
     moe = SimpleNamespace(hidden_dim=8, intermediate_size_per_partition=4,
                           activation=SimpleNamespace(value="swigluoai_uninterleave"))
-    method = MiniMax31W4A8MoEMethod(MiniMax31SlimQuantConfig.from_config(config()), moe)
+    # This tiny CPU fixture specifically checks retained Bolt storage; optimized
+    # HIPC defaults are checked separately with real supported dimensions.
+    cfg = config()
+    cfg["hcu_minimax_routed_backend"] = "bolt"
+    method = MiniMax31W4A8MoEMethod(MiniMax31SlimQuantConfig.from_config(cfg), moe)
     layer = torch.nn.Module()
     layer.swiglu_limit = 7.0
     method.create_weights(layer, 2, 8, 4, torch.bfloat16, weight_loader=lambda *a, **k: None)

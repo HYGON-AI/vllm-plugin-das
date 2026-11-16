@@ -103,10 +103,12 @@ class MiniMax31PcpEpIpcLoader(IpcModelLoader):
         from .minimax31_pcp import validate_scope
         require_extensions()
         validate_scope(vllm_config)
+        from .minimax31_config import artifacts
+        self._runtime_artifacts = artifacts(vllm_config)
         model = super().load_model(vllm_config, model_config, prefix=prefix)
         if hasattr(self, "_static_manifest"):
             from .minimax31_static_ipc import verify_mapped_model
-            verify_mapped_model(model, self._static_manifest)
+            verify_mapped_model(model, self._static_manifest, self._runtime_artifacts.require("consumer_receipts"))
         return model
 
     def _fetch_entries(self, model_config, cache_config, parallel_config,
@@ -126,7 +128,7 @@ class MiniMax31PcpEpIpcLoader(IpcModelLoader):
             static=hasattr(self._partition,"map_sha256")
             if static:
                 from .minimax31_static_ipc import COMMAND as STATIC_COMMAND, expected_publication
-                expected=expected_publication(self._partition)
+                expected=expected_publication(self._partition, self._runtime_artifacts.require("ready_manifest"))
                 request.update(cmd=STATIC_COMMAND,publication=expected)
             send_msg(conn, request)
             response = recv_msg(conn)

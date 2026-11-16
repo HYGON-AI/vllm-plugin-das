@@ -57,12 +57,8 @@ def install_minimax31_ep_runner(stock_module):
     def minimax31_ep_factory(*args, **kwargs):
         if kwargs.get("runner_cls") is not None:
             raise RuntimeError("foreign MiniMax MoE runner override")
-        import os
-        if os.environ.get("HCU_MINIMAX_DEEPEP_FIXEDCOUNTS") == "1":
-            from .minimax31_deepep_runner import MiniMax31DeepEpRunner
-            kwargs["runner_cls"] = MiniMax31DeepEpRunner
-        else:
-            kwargs["runner_cls"] = MiniMax31PcpEpMoERunner
+        from .minimax31_deepep_runner import MiniMax31DeepEpRunner
+        kwargs["runner_cls"] = MiniMax31DeepEpRunner
         from .minimax31_static_contract import from_current
         placement = from_current()
         if placement is not None:
@@ -71,10 +67,6 @@ def install_minimax31_ep_runner(stock_module):
             if (current.parallel_config.enable_dbo or current.speculative_config is not None
                     or not current.model_config.enforce_eager):
                 raise RuntimeError("static136 supports eager single-inflight execution without DBO/speculation")
-            if (os.environ.get("HCU_MINIMAX_STATIC_EPLB") != "1"
-                    or os.environ.get("HCU_MINIMAX_DEEPEP_FIXEDCOUNTS") != "1"
-                    or os.environ.get("HCU_MINIMAX_HIPC_PACK_TILED") != "1"):
-                raise RuntimeError("static136 requires explicit fixed-count tiled HIPC path")
             # Shared-stream launch and join are guarded by the DeepEP runner's
             # single-inflight lock. Static selection/completion stays on its
             # caller thread; shared TP1 MLP never reads the routing frame.
@@ -88,8 +80,6 @@ def install_minimax31_ep_runner(stock_module):
             install_identity_hooks()
             kwargs["moe_config_cls"] = StaticMoEConfig
             kwargs["routed_experts_cls"] = StaticRoutedExperts
-        elif os.environ.get("HCU_MINIMAX_STATIC_EPLB") == "1":
-            raise RuntimeError("static opt-in requires an immutable physical placement contract")
         return original(*args, **kwargs)
     _original_factory, _installed_factory = original, minimax31_ep_factory
     stock_module.FusedMoEFactory = minimax31_ep_factory

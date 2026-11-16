@@ -1,6 +1,6 @@
 # MiniMax31 aligned MoE full-model benchmark
 
-The opt-in `HCU_MINIMAX_ALIGNED_MOE=1` selects the standalone aligned core inside the existing MiniMax31 DeepEP runner. Default routing is unchanged. The model keeps static136/17, shared overlap, FP8 index, eager execution and PCP8/EP8.
+The HIPC MiniMax31 DeepEP runner selects the standalone aligned core by default. The environment opt-in has been removed; see [deployment configuration](minimax31_configuration.md). Historical results below predate that cleanup. The model keeps static136/17, shared overlap, FP8 index, eager execution and PCP8/EP8.
 
 One aligned executor, communication buffer and scratch workspace are shared across the 57 serial MoE layers in each rank. Every call binds that layer’s existing HIPC weights under the single-inflight lock. No permanent weight repack or IPC layout change is introduced. `bind_weights` rejects geometry/device/stream changes. The shared branch and outer routed scaling retain the existing runner lifecycle.
 

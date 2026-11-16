@@ -1,12 +1,12 @@
 # MiniMax M3.1 PCP / EP experimental path
 
-This opt-in path combines the same-ABI teacher MSA prefill kernels with fixed-count DeepEP routing and the existing Bolt local-expert computation. Defaults retain the legacy path.
+Within the admitted MiniMax PCP8/EP8 scope, fixed-count DeepEP and the HIPC aligned core are defaults. Native MSA activates when its matching artifact is configured. See [deployment configuration](minimax31_configuration.md); historical results below describe their original configurations.
 
 ## Activation and identity
 
-The tested v5 used HCU_MINIMAX_NATIVE_MSA=1, HCU_MINIMAX_DEEPEP_FIXEDCOUNTS=1 and HCU_MINIMAX_FP8_PCP=1. Set HCU_MINIMAX_MSA_EXTENSION_DIR to the private same-ABI build_lib directory. The tested prefill kernel was v2, with MSA128_FP8_PREFILL_SLOTS=2. The historical Python 3.10 / Torch 2.11 binary is not a compatible replacement for the private Python 3.12 / Torch 2.13 build.
+Historical v5 explicitly selected native MSA, fixed-count DeepEP and FP8 PCP. Those private switches have been removed. Configure the matching build_lib with `--additional-config` under `minimax31.msa_extension_dir`, and cache dtypes through public vLLM arguments. The tested prefill kernel was v2, with MSA128_FP8_PREFILL_SLOTS=2. The historical Python 3.10 / Torch 2.11 binary is not a compatible replacement for the private Python 3.12 / Torch 2.13 build.
 
-Create a fresh configuration and derive its real source/weight identity before loading this repository revision. Do not reuse a sidecar by rewriting its source key. The historical measured source remains in task_dir/support_minmax_31_pcp8_ep8/wheel_contract/isolated_plugin_sol_reuse_v5. The integration manifest proves equivalent runtime AST for the six integrated files; only comments/docstrings differ.
+Create a fresh configuration and derive its real source/weight identity before loading this repository revision. Do not reuse a sidecar by rewriting its source key. The historical measured source remains in task_dir/support_minmax_31_pcp8_ep8/wheel_contract/isolated_plugin_sol_reuse_v5. The original integration manifest recorded equivalent runtime AST for six files at that historical cutoff; it does not attest to current source after configuration/default changes. Derive a new identity for current code.
 
 ## Behavior and validation
 

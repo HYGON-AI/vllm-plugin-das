@@ -76,19 +76,14 @@ class MiniMax31SlimQuantConfig(SlimQuantW4A8Int8Config):
                                      "format": "int8-per-channel", "scope": "per_channel",
                                      "activation_scheme": "dynamic_per_token"})
         result = cls(ignore=list(ignores), w8a8_include=linears)
-        import os
-        backend = config.get("hcu_minimax_routed_backend", "bolt")
+        backend = config.get("hcu_minimax_routed_backend", "deepgemm_hipc_v1")
         if backend not in ("bolt", "deepgemm_hipc_v1"):
             raise ValueError("unknown MiniMax routed backend in weight configuration")
-        if os.environ.get("HCU_MINIMAX_ROUTED_BACKEND", backend) != backend:
-            raise ValueError("routed backend differs from versioned weight configuration")
         result.routed_backend = backend
-        w8_backend = config.get("hcu_minimax_w8a8_backend", "triton")
+        w8_backend = config.get("hcu_minimax_w8a8_backend", "hipblaslt_v1")
         w8_fallback = config.get("hcu_minimax_w8a8_fallback", "error")
         if w8_backend not in ("triton", "hipblaslt_v1") or w8_fallback not in ("error", "triton"):
             raise ValueError("unknown MiniMax W8A8 backend/fallback")
-        if os.environ.get("HCU_MINIMAX_W8A8_BACKEND", w8_backend) != w8_backend:
-            raise ValueError("W8A8 backend differs from versioned configuration")
         result.w8a8_backend, result.w8a8_fallback = w8_backend, w8_fallback
         result.expert_modules = tuple(experts)
         result.hcu_weight_cache_identity = deepcopy(config.get("hcu_weight_cache_identity"))

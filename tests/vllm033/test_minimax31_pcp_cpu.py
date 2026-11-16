@@ -35,13 +35,13 @@ def test_scope_rejects_fake_topology_and_media_capability():
         pcp.validate_scope(cfg)
 
 
-def test_legacy_ep_router_uses_rank_major_global_padding():
+def test_fixed_count_router_keeps_padding_rank_local_by_default():
     manager=pcp.MiniMax31PCPManager(pcp_world_size=8,pcp_rank=0,
         device=torch.device("cpu"),shard_decode_requests=True,
         max_num_reqs=2,max_num_tokens=16,moe_gathers_tokens=False)
-    assert manager._moe_is_padding is not None
+    assert manager._moe_is_padding is None
     actual=manager.moe_is_padding(torch.tensor([False,True]))
-    assert actual.tolist()==[False,True]*8
+    assert actual.tolist()==[False,True]
 
 
 def test_real_planner_covers_uneven_prefill_once_and_shards_decode():

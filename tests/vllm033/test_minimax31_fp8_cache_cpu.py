@@ -23,7 +23,6 @@ def layer():
 
 
 def test_fp8_cache_guard_and_scale_lifecycle(monkeypatch):
-    monkeypatch.setattr(pcp, "_EXPERIMENTAL_FP8_PCP", True)
     slots = torch.arange(4, dtype=torch.int64)
     cases = {}
     good = layer()

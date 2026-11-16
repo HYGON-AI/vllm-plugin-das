@@ -1,10 +1,11 @@
 # SPDX-License-Identifier: Apache-2.0
 """Content-derived request identity and PCP global positions for static routing."""
-import hashlib,json,os,threading
+import hashlib,json,threading
 from pathlib import Path
 import numpy as np
 import torch
 from .minimax31_static_contract import canonical,from_current,request_base
+_MANIFEST_PATH=None
 _REQUESTS={};_DUMMY={};_MANIFEST_KEYS=None;_LAYOUT=None;_HOOKS=None;_PLACEMENT=None;_FRAME_LOCK=threading.Lock();_LAST_LAYER=None
 
 def content_key(token_ids):
@@ -12,7 +13,7 @@ def content_key(token_ids):
     placement=_PLACEMENT
     if placement is None:raise RuntimeError('static runtime requires explicit placement')
     if _MANIFEST_KEYS is None:
-        path=os.environ.get('HCU_MINIMAX_STATIC_DATASET_MANIFEST')
+        path=_MANIFEST_PATH
         if not path:raise ValueError('static routing requires the frozen dataset manifest')
         raw=Path(path).read_bytes()
         if hashlib.sha256(raw).hexdigest()!=placement.dataset_manifest_sha256:raise ValueError('static dataset manifest SHA differs from placement')
@@ -28,16 +29,22 @@ def content_key(token_ids):
     return hashlib.sha256(canonical({'schema':'minimax31-request-key-v1','group_id':'runtime','slot':0,'token_ids_sha256':digest})).hexdigest()
 
 def install_identity_hooks():
-    global _HOOKS,_PLACEMENT,_LAST_LAYER
+    global _HOOKS,_PLACEMENT,_LAST_LAYER,_MANIFEST_PATH
     from vllm.v1.worker.gpu.states import RequestState
     from vllm.v1.worker.gpu.input_batch import InputBatch
     if _HOOKS is not None:
+        from .minimax31_config import artifacts
+        if from_current()!=_PLACEMENT or artifacts().require("dataset_manifest")!=_MANIFEST_PATH:
+            raise RuntimeError("static deployment identity changed; restart the engine")
         if RequestState.add_request is not _HOOKS[0] or RequestState.remove_request is not _HOOKS[1] or InputBatch.make_dummy.__func__ is not _HOOKS[2]:raise RuntimeError('static request identity hook ownership changed')
         return
     _PLACEMENT=from_current()
     if _PLACEMENT is None:raise RuntimeError("identity hooks require a static model")
     from vllm.config import get_current_vllm_config
-    hf=get_current_vllm_config().model_config.hf_config
+    config=get_current_vllm_config()
+    from .minimax31_config import artifacts
+    _MANIFEST_PATH=artifacts(config).require("dataset_manifest")
+    hf=config.model_config.hf_config
     _LAST_LAYER=int(getattr(hf,"text_config",hf).num_hidden_layers)-1
     add=RequestState.add_request;remove=RequestState.remove_request;dummy=InputBatch.make_dummy.__func__
     def add_request(self,req_id,prompt_len,all_token_ids,num_computed_tokens,max_tokens):

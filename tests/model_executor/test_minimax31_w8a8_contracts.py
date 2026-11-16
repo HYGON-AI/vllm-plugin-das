@@ -70,22 +70,20 @@ class W8A8Contracts(unittest.TestCase):
 
     def test_config_selects_w8_without_changing_routed_backend(self):
         body=method("MiniMax31SlimQuantConfig","from_config").body
-        start=next(i for i,n in enumerate(body) if isinstance(n,ast.Import) and n.names[0].name=="os")
+        start=next(i for i,n in enumerate(body) if isinstance(n,ast.Assign) and
+                   any(isinstance(t,ast.Name) and t.id=="backend" for t in n.targets))
         stop=next(i for i,n in enumerate(body) if isinstance(n,ast.Assign) and
                   any(isinstance(t,ast.Attribute) and t.attr=="expert_modules" for t in n.targets))
         code=compile(ast.Module(body=body[start:stop],type_ignores=[]),str(QUANT),"exec")
-        cfg={"hcu_minimax_routed_backend":"deepgemm_hipc_v1",
-             "hcu_minimax_w8a8_backend":"hipblaslt_v1"}
-        with patch.dict(os.environ,{"HCU_MINIMAX_ROUTED_BACKEND":"deepgemm_hipc_v1",
-                                   "HCU_MINIMAX_W8A8_BACKEND":"hipblaslt_v1"}):
+        for selected in ("hipblaslt_v1","triton"):
             result=types.SimpleNamespace()
-            exec(code,{"config":cfg,"result":result})
+            exec(code,{"config":{"hcu_minimax_routed_backend":"deepgemm_hipc_v1",
+                                  "hcu_minimax_w8a8_backend":selected},"result":result})
             self.assertEqual(result.routed_backend,"deepgemm_hipc_v1")
-            self.assertEqual(result.w8a8_backend,"hipblaslt_v1")
+            self.assertEqual(result.w8a8_backend,selected)
             self.assertEqual(result.w8a8_fallback,"error")
-            with self.assertRaises(ValueError):
-                exec(code,{"config":{"hcu_minimax_routed_backend":"deepgemm_hipc_v1"},
-                           "result":types.SimpleNamespace()})
+        with self.assertRaises(ValueError):
+            exec(code,{"config":{"hcu_minimax_w8a8_backend":"unknown"},"result":types.SimpleNamespace()})
 
     def test_unsupported_input_is_error_or_explicit_logged_fallback(self):
         class Stock:

@@ -70,20 +70,24 @@ class HIPCContracts(unittest.TestCase):
         method.quant_config.routed_backend="bolt"
         self.assertFalse(ns[node.name](method))
 
-    def test_environment_cannot_override_versioned_backend(self):
+    def test_versioned_backends_default_to_optimized_implementations(self):
         body=method_ast("MiniMax31SlimQuantConfig","from_config").body
-        start=next(i for i,n in enumerate(body) if isinstance(n,ast.Import) and n.names[0].name=="os")
+        start=next(i for i,n in enumerate(body) if isinstance(n,ast.Assign) and
+                   any(isinstance(t,ast.Name) and t.id=="backend" for t in n.targets))
         stop=next(i for i,n in enumerate(body) if isinstance(n,ast.Assign) and
                   any(isinstance(t,ast.Attribute) and t.attr=="expert_modules" for t in n.targets))
         code=compile(ast.Module(body=body[start:stop],type_ignores=[]),str(QUANT),"exec")
+        result=types.SimpleNamespace()
+        exec(code,{"config":{},"result":result})
+        self.assertEqual(result.routed_backend,"deepgemm_hipc_v1")
+        self.assertEqual(result.w8a8_backend,"hipblaslt_v1")
+        self.assertEqual(result.w8a8_fallback,"error")
         for backend in ("bolt","deepgemm_hipc_v1"):
-            with patch.dict(os.environ,{"HCU_MINIMAX_ROUTED_BACKEND":backend}):
-                result=types.SimpleNamespace()
-                exec(code,{"config":{"hcu_minimax_routed_backend":backend},"result":result})
-                self.assertEqual(result.routed_backend,backend)
-        with patch.dict(os.environ,{"HCU_MINIMAX_ROUTED_BACKEND":"deepgemm_hipc_v1"}):
-            with self.assertRaises(ValueError):
-                exec(code,{"config":{},"result":types.SimpleNamespace()})
+            result=types.SimpleNamespace()
+            exec(code,{"config":{"hcu_minimax_routed_backend":backend},"result":result})
+            self.assertEqual(result.routed_backend,backend)
+        with self.assertRaises(ValueError):
+            exec(code,{"config":{"hcu_minimax_routed_backend":"unknown"},"result":types.SimpleNamespace()})
 
     def test_padding_contract(self):
         path=ROOT/"triton_tmp_dir/minimax31_hipc_moe.py"
