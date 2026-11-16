@@ -113,6 +113,9 @@ Dynamo support: validate a dispatcher custom op with its FakeTensor rule,
 fullgraph compilation and changed-input replay separately. Hash the effective
 master/child policy, retain batch-invariant fallback, and keep operator tests
 separate from model and HumanEval qualification.
+Cover every admitted post-TP shape and each packing-tile branch before claiming
+the optimized shape set is qualified. Retain recovered allocator OOM warnings
+separately from unhandled OOM, numerical failures and performance qualification.
 
 For `torch.library` exit errors, inspect the actual provider's registration:
 a Library already owns its namespace, so qualified definition names can leave
@@ -157,6 +160,9 @@ its changed validation scope before launching.
 A shared-node memory preflight is an observation, not a reservation. Preserve
 the actual worker admission failure if free memory changes before startup;
 do not report a weight-loading failure or a model score for that attempt.
+Check when the target measures admission relative to distributed initialization:
+a standalone Torch probe omits communicator allocations. With explicit fixed KV,
+lowering the admission fraction does not lower that KV allocation or Graph demand.
 
 Matching package entry-point hashes do not establish matching installations.
 Compare the complete owned package payloads and native libraries before using
