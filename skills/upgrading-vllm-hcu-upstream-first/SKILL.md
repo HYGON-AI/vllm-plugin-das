@@ -159,6 +159,16 @@ and natural child-process exit alongside eager, fake and compile contracts.
 Source fixes and diagnostic repackaged wheels remain distinct from a rebuilt
 provider release and its device/model qualification.
 
+Resolve an installed provider's recorded commit against its actual source
+repository before rebuilding: similarly named mirrors can lack the wheel's
+newer ABI. Compare all relevant package files, not only the repaired module;
+publish against the maintained source without downgrading algorithms. Label
+a local PEP 517 source build separately from a released or CI-produced wheel.
+Validate its source/wheel/installed payload and raw RECORD, then rerun affected
+CPU, native/Graph and model gates. A new venv can change a registered console
+script's interpreter prefix; audit that exact generated script separately
+while preserving every payload check and the original RECORD verification.
+
 Chained jobs must wait for completed cleanup, checkpoint post-seal and RECORD
 receipts, not just a terminal-looking state string. Write final status only
 after the last check, using an atomic snapshot. Preserve consumer failures
