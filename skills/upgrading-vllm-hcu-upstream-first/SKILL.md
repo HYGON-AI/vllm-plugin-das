@@ -418,3 +418,8 @@ dependency matrix. An independently green compliance aggregate, successful
 wheel build or selected native subset does not qualify that correctness or
 performance job. Diagnose the compatibility limit and rerun its affected
 matrix after repair; do not bypass the pause to claim release qualification.
+
+Check each job's actual driver: direct benchmark scripts may execute even
+when another job's pytest session is paused. Count JUnit launcher cases,
+CSV measurement rows and numerical regression cases separately; selected
+benchmark timings do not qualify unrelated kernels or model accuracy.
