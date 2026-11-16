@@ -48,6 +48,12 @@ type parameters, async status and body AST. Findings remain pending review.
 An unevaluable constant reassignment invalidates its previous binding; an
 unresolved `TARGET_MODULE` produces a manual-review warning instead of a
 comparison against the old module. A bare annotation preserves its binding.
+Control-flow writes, container mutations and lexical shadowing cannot reuse a
+stale global constant. Unsupported guard arguments remain explicit unresolved
+rows; resolvable symbols still receive contract comparison. Constant starred
+sequences are expanded without executing source. Later target rebinding makes
+the callable unresolved. Inherited `GIT_CONFIG` is cleared so configuration
+probes and guarded Git operations inspect the same repository settings.
 Uncommitted changes are
 reported but excluded from analysis; commit or separately bind their bytes.
 Report destinations must also be outside each checkout's private Git directory

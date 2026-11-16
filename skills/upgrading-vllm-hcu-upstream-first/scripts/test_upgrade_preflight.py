@@ -91,6 +91,99 @@ PATCH_ID = "old"
             capture_output=True, text=True, encoding="utf-8",
         )
 
+    def report(self, suffix):
+        output = self.root / suffix
+        result = self.invoke(output)
+        self.assertEqual(result.returncode, 0, result.stderr)
+        return json.loads((output / 'preflight.json').read_text())
+
+    def test_config_override_cannot_hide_status_filters(self):
+        marker = self.root / 'filter-executed'
+        write(self.up, '.gitattributes', 'vllm/router.py filter=probe\n')
+        git(self.up, 'config', 'filter.probe.clean',
+            'touch ' + shlex.quote(str(marker)) + '; cat')
+        # No fixture commit invokes the configured filter after this point.
+        override = self.root / 'empty.gitconfig'
+        override.write_text('')
+        with patch.dict(os.environ, {'GIT_CONFIG': str(override)}):
+            report = self.report('config-override')
+        self.assertEqual(report['sources']['target']['working_tree_status'],
+                         'unavailable_configured_filters')
+        self.assertFalse(marker.exists())
+
+    def test_starred_guard_sequences_preserve_contract_comparison(self):
+        write(self.plugin, 'vllm_hcu/patch/patch_router.py', '''
+TARGET_MODULE = "vllm.router"
+COMMON = ("x",)
+def apply():
+    require_exact_signature(fn, "vllm.router.route", positional=(*COMMON,))
+''')
+        commit(self.plugin)
+        report = self.report('starred')
+        row = next(r for r in report['adapters'] if r['target_module'] == 'vllm.router')
+        self.assertEqual(row['signature_checks'][0]['status'], 'parameter_names_changed')
+        self.assertEqual(row['signature_checks'][0]['contract_comparison']['status'],
+                         'changed_review_required')
+
+    def test_unsupported_guard_arguments_are_reported_not_dropped(self):
+        write(self.plugin, 'vllm_hcu/patch/patch_router.py', '''
+TARGET_MODULE = "vllm.router"
+def apply():
+    require_exact_signature(fn, "vllm.router.route", positional=dynamic())
+''')
+        commit(self.plugin)
+        report = self.report('dynamic-guard')
+        row = next(r for r in report['adapters'] if r['target_module'] == 'vllm.router')
+        check = row['signature_checks'][0]
+        self.assertEqual(check['status'], 'guard_arguments_unresolved')
+        self.assertEqual(check['contract_comparison']['status'], 'changed_review_required')
+        self.assertTrue(report['warnings'])
+
+    def test_control_flow_and_item_writes_invalidate_cached_targets(self):
+        cases = [
+            'TARGET_MODULE = "vllm.router"\nif True:\n    TARGET_MODULE = "vllm.fast"\n',
+            'MODULES = ["vllm.router"]\nMODULES[0] = "vllm.fast"\nTARGET_MODULE = MODULES[0]\n',
+            'MODULES = ["vllm.router"]\nALIAS = MODULES\nALIAS[0] = "vllm.fast"\nTARGET_MODULE = MODULES[0]\n',
+        ]
+        for index, source in enumerate(cases):
+            with self.subTest(index=index):
+                write(self.plugin, 'vllm_hcu/patch/patch_router.py', source)
+                commit(self.plugin)
+                report = self.report('mutated-target-' + str(index))
+                self.assertFalse(any(r['target_module'] == 'vllm.router'
+                                     for r in report['adapters']))
+                self.assertTrue(any('Unresolved TARGET_MODULE' in w for w in report['warnings']))
+
+    def test_rebound_target_functions_are_unresolved(self):
+        for index, source in enumerate([
+            'def route(x): return x\nroute = replacement\n',
+            'def route(x): return x\nif True:\n    route = replacement\n',
+            'def route(x): return x\nfrom other import route\n',
+        ]):
+            with self.subTest(index=index):
+                write(self.up, 'vllm/router.py', source)
+                commit(self.up)
+                report = self.report('rebound-' + str(index))
+                row = next(r for r in report['adapters'] if r['target_module'] == 'vllm.router')
+                self.assertEqual(row['signature_checks'][0]['status'], 'symbol_unresolved')
+                self.assertEqual(row['signature_checks'][0]['contract_comparison']['status'],
+                                 'symbol_unresolved')
+
+    def test_lexical_bindings_do_not_resolve_to_unrelated_globals(self):
+        for index, source in enumerate([
+            'def apply():\n    TARGETS = ("vllm.router.fast",)\n    require_exact_signature(fn, TARGETS[0], positional=("x",))\n',
+            'def apply(TARGETS):\n    require_exact_signature(fn, TARGETS[0], positional=("x",))\n',
+            'def outer(TARGETS):\n    def apply():\n        require_exact_signature(fn, TARGETS[0], positional=("x",))\n',
+        ]):
+            with self.subTest(index=index):
+                write(self.plugin, 'vllm_hcu/patch/patch_router.py',
+                      'TARGET_MODULE = "vllm.router"\nTARGETS = ("vllm.router.route",)\n' + source)
+                commit(self.plugin)
+                report = self.report('lexical-' + str(index))
+                row = next(r for r in report['adapters'] if r['target_module'] == 'vllm.router')
+                self.assertEqual(row['signature_checks'][0]['status'], 'guard_arguments_unresolved')
+                self.assertTrue(report['warnings'])
+
     def test_inherited_repository_selectors_do_not_replace_requested_roots(self):
         expected = {name: git(root, "rev-parse", "HEAD") for name, root in
                     [("plugin", self.plugin), ("fork", self.fork), ("target", self.up)]}

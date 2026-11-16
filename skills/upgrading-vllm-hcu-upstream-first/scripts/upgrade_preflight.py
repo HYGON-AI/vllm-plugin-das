@@ -24,6 +24,7 @@ def git_environment():
         "GIT_DIR", "GIT_WORK_TREE", "GIT_COMMON_DIR", "GIT_INDEX_FILE",
         "GIT_OBJECT_DIRECTORY", "GIT_ALTERNATE_OBJECT_DIRECTORIES",
         "GIT_SHALLOW_FILE", "GIT_NAMESPACE", "GIT_PREFIX",
+        "GIT_CONFIG",
     }
     env = {key: value for key, value in os.environ.items() if key not in local_selectors}
     env.update(GIT_OPTIONAL_LOCKS="0", GIT_TERMINAL_PROMPT="0", GIT_NO_LAZY_FETCH="1")
@@ -166,7 +167,16 @@ def literal(node, values):
     if isinstance(node, ast.Name):
         return values[node.id]
     if isinstance(node, (ast.Tuple, ast.List)):
-        return tuple(literal(x, values) for x in node.elts)
+        result = []
+        for element in node.elts:
+            value = literal(element.value if isinstance(element, ast.Starred) else element, values)
+            if isinstance(element, ast.Starred):
+                if not isinstance(value, (tuple, list)):
+                    raise ValueError("Unsupported starred constant")
+                result.extend(value)
+            else:
+                result.append(value)
+        return tuple(result)
     if isinstance(node, ast.JoinedStr):
         # Dropping conversion/formatting can silently select a different module.
         if any(isinstance(x, ast.FormattedValue) and
@@ -180,19 +190,76 @@ def literal(node, values):
     raise ValueError("Not a supported literal expression")
 
 
+def assigned_names(node):
+    """Bindings/writes in this scope, without treating nested locals as globals."""
+    names = set()
+
+    class Bindings(ast.NodeVisitor):
+        def visit_Name(self, node):
+            if isinstance(node.ctx, (ast.Store, ast.Del)):
+                names.add(node.id)
+
+        def visit_FunctionDef(self, node):
+            names.add(node.name)
+
+        visit_AsyncFunctionDef = visit_FunctionDef
+        visit_ClassDef = visit_FunctionDef
+
+        def visit_Lambda(self, node):
+            pass
+
+        def visit_Import(self, node):
+            names.update(alias.asname or alias.name.split('.')[0] for alias in node.names)
+
+        def visit_ImportFrom(self, node):
+            names.update(alias.asname or alias.name for alias in node.names)
+
+        def visit_Subscript(self, node):
+            if isinstance(node.ctx, (ast.Store, ast.Del)):
+                root = node.value
+                while isinstance(root, (ast.Attribute, ast.Subscript)):
+                    root = root.value
+                if isinstance(root, ast.Name):
+                    names.add(root.id)
+            self.generic_visit(node)
+
+        visit_Attribute = visit_Subscript
+
+        def visit_ExceptHandler(self, node):
+            if node.name:
+                names.add(node.name)
+            self.generic_visit(node)
+
+        def visit_MatchAs(self, node):
+            if node.name:
+                names.add(node.name)
+            self.generic_visit(node)
+
+        visit_MatchStar = visit_MatchAs
+
+        def visit_MatchMapping(self, node):
+            if node.rest:
+                names.add(node.rest)
+            self.generic_visit(node)
+
+    Bindings().visit(node)
+    return names
+
+
 def constants(tree):
-    def assigned_names(target):
-        if isinstance(target, ast.Name):
-            return [target.id]
-        if isinstance(target, (ast.Tuple, ast.List)):
-            return [name for child in target.elts for name in assigned_names(child)]
-        if isinstance(target, ast.Starred):
-            return assigned_names(target.value)
-        return []
+    def invalidate(node):
+        names = assigned_names(node)
+        # Literal containers can have aliases. Do not keep an alias's stale
+        # snapshot when an item/attribute of the original has been written.
+        objects = {id(values[name]) for name in names if name in values}
+        for name in list(values):
+            if name in names or isinstance(values[name], tuple) and id(values[name]) in objects:
+                values.pop(name, None)
 
     values = {}
     for node in tree.body:
         if not isinstance(node, (ast.Assign, ast.AnnAssign, ast.AugAssign)):
+            invalidate(node)
             continue
         # A bare annotation does not assign a value at runtime.
         if isinstance(node, ast.AnnAssign) and node.value is None:
@@ -203,13 +270,10 @@ def constants(tree):
                 raise ValueError("Augmented assignments require manual review")
             value = literal(node.value, values)
         except (ValueError, KeyError, TypeError, IndexError):
-            for target in targets:
-                for name in assigned_names(target):
-                    values.pop(name, None)
+            invalidate(node)
             continue
         for target in targets:
-            for name in assigned_names(target):
-                values.pop(name, None)
+            invalidate(target)
             if isinstance(target, ast.Name):
                 values[target.id] = value
     return values
@@ -224,6 +288,9 @@ def find_function(tree, symbol):
                    if isinstance(n, (ast.ClassDef, ast.FunctionDef, ast.AsyncFunctionDef))
                    and n.name == name]
         if len(matches) != 1:
+            return None
+        if any(statement is not matches[0] and name in assigned_names(statement)
+               for statement in owner.body):
             return None
         owner = matches[0]
     return owner if isinstance(owner, (ast.FunctionDef, ast.AsyncFunctionDef)) else None
@@ -313,30 +380,54 @@ def compare_contracts(old_tree, new_tree, symbol):
 
 def signature_checks(tree, values, target_tree, module):
     checks = []
+    parents = {child: parent for parent in ast.walk(tree) for child in ast.iter_child_nodes(parent)}
     for node in ast.walk(tree):
         if not isinstance(node, ast.Call) or not isinstance(node.func, ast.Name):
             continue
         if node.func.id not in ("require_exact_signature", "require_parameter_names"):
             continue
+        scoped_values = dict(values)
+        parent = parents.get(node)
+        while parent is not None:
+            if isinstance(parent, (ast.FunctionDef, ast.AsyncFunctionDef, ast.Lambda, ast.ClassDef)):
+                body = parent.body if isinstance(parent.body, list) else [parent.body]
+                shadowed = set().union(*(assigned_names(statement) for statement in body))
+                if hasattr(parent, 'args'):
+                    args = parent.args
+                    shadowed.update(a.arg for a in args.posonlyargs + args.args + args.kwonlyargs)
+                    shadowed.update(a.arg for a in (args.vararg, args.kwarg) if a)
+                for name in shadowed:
+                    scoped_values.pop(name, None)
+            parent = parents.get(parent)
+        symbol = module + f".[unresolved_guard_{node.lineno}]"
+        expected = None
         try:
-            symbol = literal(node.args[1], values)
+            symbol = literal(node.args[1], scoped_values)
+            if not isinstance(symbol, str) or not symbol.startswith(module + "."):
+                continue
             if node.func.id == "require_parameter_names":
-                expected = literal(node.args[2], values)
+                expected = literal(node.args[2], scoped_values)
             else:
                 kw = {x.arg: x.value for x in node.keywords}
-                expected = literal(kw["positional"], values) if "positional" in kw else ()
+                expected = literal(kw["positional"], scoped_values) if "positional" in kw else ()
                 if "var_positional" in kw:
-                    name = literal(kw["var_positional"], values)
+                    name = literal(kw["var_positional"], scoped_values)
                     if name is not None:
                         expected += (name,)
                 if "keyword_only" in kw:
-                    expected += literal(kw["keyword_only"], values)
+                    expected += literal(kw["keyword_only"], scoped_values)
                 if "var_keyword" in kw:
-                    name = literal(kw["var_keyword"], values)
+                    name = literal(kw["var_keyword"], scoped_values)
                     if name is not None:
                         expected += (name,)
-            if not isinstance(symbol, str) or not symbol.startswith(module + "."):
-                continue
+            if not isinstance(expected, (tuple, list)):
+                raise ValueError("Guard names require a constant sequence")
+        except (ValueError, KeyError, TypeError, IndexError):
+            checks.append({"symbol": symbol, "guard_line": node.lineno,
+                           "expected_names": None, "target_names": None,
+                           "status": "guard_arguments_unresolved"})
+            continue
+        try:
             relative_symbol = symbol[len(module) + 1:]
             function = find_function(target_tree, relative_symbol)
             binding = classmethod_binding(function, relative_symbol, node.args[0]) if function else None
@@ -352,7 +443,9 @@ def signature_checks(tree, values, target_tree, module):
                            "names_match_only" if list(expected) == actual else
                            "parameter_names_changed"})
         except (ValueError, KeyError, TypeError, IndexError):
-            continue
+            checks.append({"symbol": symbol, "guard_line": node.lineno,
+                           "expected_names": list(expected), "target_names": None,
+                           "status": "symbol_unresolved"})
     return checks
 
 
@@ -398,6 +491,8 @@ def scan_adapters(plugin, fork, target, warnings):
                             and PurePosixPath(p).name == basename) if not new_path else []
         checks = signature_checks(tree, values, target_tree, module)
         for check in checks:
+            if check['status'] == 'guard_arguments_unresolved':
+                warnings.append(f"Unresolved guard arguments: {path}:{check['guard_line']}; manual review required")
             check["contract_comparison"] = compare_contracts(
                 fork_tree, target_tree, check["symbol"][len(module) + 1:])
         rows.append({"patch_id": values.get("PATCH_ID", path), "adapter": path,
