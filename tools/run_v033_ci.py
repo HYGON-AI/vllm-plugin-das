@@ -146,6 +146,7 @@ def main():
             environment.update(HCU_ADAPTER_HOST='vllm', VLLM_PLUGINS='hcu_adapter',
                            VLLM033_HCU_TEST='1', HCU_VLLM033_RMSNORM_LIVE='1',
                            HCU_VLLM033_GRAPH_LIVE='1', HCU_VLLM033_AITER_INT8_LIVE='1',
+                           HCU_VLLM033_AUTOAWQ_LIVE='1',
                            HCU_SLIMQUANT_LIVE='1')
         installed_version, installed_root = _installed_vllm(environment)
         if _vllm_release(installed_version)[:2] != (0, 33):

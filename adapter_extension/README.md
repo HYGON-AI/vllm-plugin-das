@@ -31,6 +31,35 @@ operator, so the plugin neither registers nor ships a `SiluAndMul` override.
 No model, topology, FP8-KV, or broad performance support is implied by these
 operator-level capabilities.
 
+## Explicit AutoAWQ candidate
+
+Request `HCU_ADAPTER_VLLM_REQUIRED_CAPABILITIES=lightop-autoawq` and set both
+`VLLM_HCU_USE_CUSTOM_OPS=1` and `VLLM_HCU_USE_LIGHTOP_AWQ=1`. The two switches
+default to OFF; changing the serving policy requires a process restart.
+The independent extension registers an official `AutoAWQConfig` subclass for
+the three existing AWQ aliases. It leaves the official class, loader,
+checkpoint format, MoE selection and excluded modules intact.
+
+Only FP16, four-bit zero-point, group-128 dense layers with a tuned post-TP
+shape use LightOp. BF16, untuned shapes, other configurations, batch-invariant
+mode and unavailable provider/repack retain the complete selected official
+method. All preparation and repack validation precede parameter replacement.
+Once LightOp layout is established, reload uses the official recorded loader
+metadata and rejects provider failure rather than falling back over the wrong
+layout. Canonical checkpoint weights are not retained twice.
+
+The provider calls only `lightop.gemm_ops` public functions. Its GEMM crosses
+an official dispatcher custom op with a non-aliasing output and FakeTensor
+rule so pybind code is not traced through Dynamo. The effective master/child
+policy enters the official compilation cache factors. Operator registration,
+Inductor/Graph and model qualification remain separate gates.
+
+The component test covers `(K,N)=(1024,8192)/(4096,8192)` with M=1/17/65/128,
+the official AWQ Triton and dequantized references, fullgraph Inductor, bias
+and fixed-address changed-input replay. It does not qualify every tuned
+shape, another architecture, a complete AutoAWQ model or HumanEval. Keep this
+candidate opt-in until those applicable gates are completed.
+
 ## Compatibility
 
 - vLLM release line: `>=0.33.0,<0.34.0`; prerelease, postrelease,
