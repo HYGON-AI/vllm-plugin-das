@@ -623,16 +623,16 @@ def is_aiter_found_and_supported(
     current_platform: object,
     is_aiter_found: bool,
 ) -> bool:
-    """Extend the upstream ROCm capability probe to HCU gfx93x devices."""
+    """Extend the upstream ROCm capability probe to supported HCU devices."""
 
     if bool(current_platform.is_rocm()) and bool(is_aiter_found):
         try:
-            from vllm_hcu.platforms.hcu import on_gfx93x
+            from vllm_hcu.platforms.hcu import _get_gcn_arch_name, on_gfx93x
         except Exception as exc:
             raise HcuAiterRuntimeError(
-                "HCU AITER capability check could not load on_gfx93x"
+                "HCU AITER capability check could not load architecture helpers"
             ) from exc
-        if on_gfx93x():
+        if on_gfx93x() or _get_gcn_arch_name() == "gfx92a":
             return True
     return bool(original())
 

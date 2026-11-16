@@ -143,6 +143,9 @@ def _normalize_deepep_auto_cudagraph_mode(
         return current_mode, None
 
     none, full, piecewise, full_and_piecewise, full_decode_only = modes
+    # Role-fixed HT cannot take the graph-safe LL override used by dynamic auto.
+    if fixed_use_low_latency is False and current_mode is not none:
+        return none, "fixed_ht"
     # DeepEP auto normally downgrades to decode-only on HCU because the
     # historical quantized HT path was not graph-safe. BF16 DeepGEMM owns a
     # graph-safe HT implementation; make the requested mixed mode available
@@ -155,8 +158,6 @@ def _normalize_deepep_auto_cudagraph_mode(
         "on",
     }:
         return current_mode, "explicit"
-    if fixed_use_low_latency is False and current_mode is not none:
-        return none, "fixed_ht"
     if current_mode is full or current_mode is full_and_piecewise:
         return full_decode_only, "decode_only"
     if current_mode is piecewise:

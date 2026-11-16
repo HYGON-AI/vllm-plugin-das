@@ -208,6 +208,9 @@ _CORE_CALLBACKS: tuple[_CallbackSpec, ...] = (
     _CallbackSpec(_adapter("core_fix", "patch_deepseek_v4_attention")),
     _CallbackSpec(_adapter("core_fix", "patch_deepseek_v4_bf16_compressor")),
     _CallbackSpec(_adapter("core_fix", "patch_deepseek_v4_c128_splits")),
+    _CallbackSpec(_adapter("core_fix", "patch_deepseek_v4_compressor_kv_offset")),
+    _CallbackSpec(_adapter("core_fix", "patch_deepseek_v4_gather_kv_offset")),
+    _CallbackSpec(_adapter("core_fix", "patch_deepseek_v4_state_cache_offset")),
     _CallbackSpec(_adapter("core_fix", "patch_deepseek_v4_load_weights")),
     _CallbackSpec(_adapter("core_fix", "patch_deepseek_v4_megamoe")),
     _CallbackSpec(_adapter("core_fix", "patch_deepseek_v4_eplb")),
@@ -226,6 +229,7 @@ _CORE_CALLBACKS: tuple[_CallbackSpec, ...] = (
     _CallbackSpec(_adapter("core_fix", "patch_gpt_oss_mlp_block")),
     _CallbackSpec(_adapter("core_fix", "patch_kimi_k25_vision_conv")),
     _CallbackSpec(_adapter("core_fix", "patch_glm5next_channel_fp8")),
+    _CallbackSpec(_adapter("core_fix", "patch_glm53_kda_cp")),
     _CallbackSpec(_adapter("core_fix", "patch_qwen3_5_mamba_state_dtype")),
     _CallbackSpec(_adapter("core_fix", "patch_qwen3_5_mtp_shared_gate")),
     _CallbackSpec(_adapter("core_fix", "patch_qwen3_dflash_nn_layout")),
@@ -307,6 +311,7 @@ _OP_CALLBACKS: tuple[_CallbackSpec, ...] = (
     _CallbackSpec(_adapter("op_opt", "patch_compressed_tensors_moe_w8a8_int8")),
     _CallbackSpec(_adapter("op_opt", "patch_compressed_tensors_moe_w8a8_fp8")),
     _CallbackSpec(_adapter("op_opt", "patch_compressed_tensors_moe_wna16")),
+    _CallbackSpec(_adapter("op_opt", "patch_compressed_tensors_moe_w4a8_int8")),
 )
 
 

@@ -14,7 +14,7 @@ use a valid expert index because this BF16 scheduler does not skip -1 tiles.
 The inverse permutation excludes these padded results from the output.
 
 Supported configurations currently require BF16, SiLU gate/up, dimensions
-that are multiples of 256, DeepEP auto, no bias/LoRA, and output router
+that are multiples of 256, DeepEP auto, no bias/LoRA/online EPLB, and output router
 weighting. Unsupported explicit requests fail during backend selection.
 
 LL needs a separate packed weight copy, created during weight loading and
@@ -135,3 +135,22 @@ vllm serve /data/model/Qwen3.5-122B-A10B \
   --gpu-memory-utilization 0.95 --max-model-len 180000 --enable-chunked-prefill \
   --enforce-eager --max-num-batched-tokens 8192 --max-num-seqs 64
 ```
+
+
+## Review repairs (2026-11-16)
+
+Public Worker `reload_weights` and `finish_weight_update` now refresh the LL
+packed copies after the official update, including target and draft models.
+They copy into existing buffers so captured addresses remain stable. Checkpoint
+loading retains the existing post-load path; kernel-format and IPC updates no
+longer leave stale LL weights. The BF16 backend refuses online EPLB before
+allocation because its secondary copies do not participate in expert transfers;
+other backends retain their EPLB behavior. Role-fixed HT producers keep their
+eager policy even with experimental Graph opt-ins. Dynamic HT/LL retains its
+explicit opt-in. No manual DeepSeek model validation was performed.
+
+CPU lifecycle tests use a non-native packing double and the actual submitted
+Worker method bodies, so they prove refresh selection/order, content and pointer
+preservation, not native GEMM or Graph replay. Historical native/model numbers
+above retain their original source and environment scope. Required current-head
+portable/native/model gates still apply after this conflict/review repair.

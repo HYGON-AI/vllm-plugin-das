@@ -84,3 +84,112 @@ def test_bf16_rejects_fixed_all2all_instead_of_building_auto(monkeypatch):
 def test_bf16_does_not_request_deferred_quantization():
     experts = object.__new__(DeepEPBF16ContiguousExperts)
     assert experts.expects_unquantized_inputs is False
+
+
+@pytest.mark.parametrize("entry,draft", [
+    ("reload_weights", False),
+    ("finish_weight_update", False),
+    ("finish_weight_update", True),
+])
+@pytest.mark.parametrize("replace", [False, True])
+def test_public_weight_update_refreshes_bf16_packed_copies_in_place(
+    monkeypatch, entry, draft, replace,
+):
+    """Exercise the submitted Worker method without constructing a device runner."""
+    import ast
+    from pathlib import Path
+    import sys
+    from types import ModuleType, SimpleNamespace
+    from vllm_hcu.model_executor.layers.fused_moe.experts import deepep_bf16_moe as impl
+
+    monkeypatch.setattr(impl, "_deepgemm_op", lambda name: lambda x: x.transpose(-1, -2).contiguous())
+    def model(value):
+        layer = torch.nn.Module()
+        layer.w13_weight = torch.nn.Parameter(torch.full((2, 4, 3), value), requires_grad=False)
+        layer.w2_weight = torch.nn.Parameter(torch.full((2, 3, 2), value), requires_grad=False)
+        packed = object.__new__(impl.DeepEPBF16MaskedExperts)
+        packed._packed_w13 = packed._packed_w2 = None
+        expert = object.__new__(impl.DeepEPAutoBF16Experts)
+        expert._fixed_use_low_latency = None
+        expert.ll_experts = packed
+        layer.quant_method = SimpleNamespace(moe_kernel=SimpleNamespace(fused_experts=expert))
+        expert.process_weights_after_loading(layer)
+        return layer, packed
+    target, target_packed = model(1.)
+    draft_model, draft_packed = model(2.)
+    chosen, packed = (draft_model, draft_packed) if draft else (target, target_packed)
+    pointers = packed._packed_w13.data_ptr(), packed._packed_w2.data_ptr()
+    def update(self, *args, **kwargs):
+        with torch.no_grad():
+            for name in ("w13_weight", "w2_weight"):
+                weight = getattr(chosen, name)
+                if replace:
+                    setattr(chosen, name, torch.nn.Parameter(torch.full_like(weight, 7.), requires_grad=False))
+                else:
+                    weight.fill_(7.)
+    base = type("Worker", (), {entry: update})
+    source = Path(__file__).resolve().parents[2] / "vllm_hcu/v1/worker.py"
+    node = next(n for n in ast.parse(source.read_text()).body
+                if isinstance(n, ast.ClassDef) and n.name == "HcuGPUWorker")
+    node.body = [n for n in node.body if isinstance(n, ast.FunctionDef) and n.name == entry]
+    namespace = {"Worker": base}
+    exec(compile(ast.Module(body=[node], type_ignores=[]), str(source), "exec"), namespace)
+    # Keep unrelated refresh providers out of this CPU lifecycle contract.
+    for name, function in [
+        ("vllm_hcu.patch.worker.core_fix.patch_deepseek_v4_attention", "refresh_compressor_nt_weights"),
+        ("vllm_hcu.model_executor.layers.fused_moe.glm53_router_gemv", "refresh_glm53_router_gates"),
+        ("vllm_hcu.model_executor.layers.kimi_k3_mixed_precision", "refresh_kimi_kda_fused_qkv"),
+        ("vllm_hcu.patch.worker.core_fix.patch_deepseek_v4_rocm_wo_a_layout", "refresh_wo_a_bf16_caches"),
+        ("vllm_hcu.model_executor.layers.quantization.compressed_tensors_w4a8_runtime", "refresh_hcu_w4a8_scale_caches"),
+    ]:
+        module = ModuleType(name)
+        setattr(module, function, lambda *args: None)
+        monkeypatch.setitem(sys.modules, name, module)
+    module = ModuleType("vllm_hcu.model_executor.layers.quantization.grouped_w4a16_moe_runtime")
+    module.snapshot_grouped_w4a16_scale_owners = lambda model: {}
+    module.refresh_grouped_w4a16_scale_caches = lambda *args: None
+    monkeypatch.setitem(sys.modules, module.__name__, module)
+    worker = namespace["HcuGPUWorker"]()
+    worker.model_runner = SimpleNamespace(model=target, get_draft_model=lambda: draft_model)
+    worker._weight_update_is_draft = draft
+    getattr(worker, entry)()
+    assert (packed._packed_w13.data_ptr(), packed._packed_w2.data_ptr()) == pointers
+    torch.testing.assert_close(packed._packed_w13, chosen.w13_weight.transpose(-1, -2))
+    torch.testing.assert_close(packed._packed_w2, chosen.w2_weight.transpose(-1, -2))
+    untouched = target_packed if draft else draft_packed
+    assert torch.all(untouched._packed_w13 == (1. if draft else 2.))
+
+
+@pytest.mark.parametrize("mode", ["NONE", "FULL", "PIECEWISE", "FULL_AND_PIECEWISE", "FULL_DECODE_ONLY"])
+@pytest.mark.parametrize("opt_in", [False, True])
+def test_fixed_ht_graph_policy_precedes_experimental_override(monkeypatch, mode, opt_in):
+    import ast
+    import enum
+    import os
+    from pathlib import Path
+    from types import SimpleNamespace
+    modes = enum.Enum("Mode", "NONE FULL PIECEWISE FULL_AND_PIECEWISE FULL_DECODE_ONLY")
+    path = Path(__file__).resolve().parents[2] / "vllm_hcu/patch/platform/core_fix/patch_compilation_config.py"
+    node = next(n for n in ast.parse(path.read_text()).body
+                if isinstance(n, ast.FunctionDef) and n.name == "_normalize_deepep_auto_cudagraph_mode")
+    namespace = {"os": os, "HcuFeatureConfig": object}
+    exec(compile(ast.Module(body=[node], type_ignores=[]), str(path), "exec"), namespace)
+    monkeypatch.setenv("VLLM_HCU_DEEPEP_AUTO_ALLOW_CUDAGRAPH", "1" if opt_in else "0")
+    result, reason = namespace[node.name](modes[mode], feature_config=SimpleNamespace(deepep_auto=True),
+        fixed_use_low_latency=False, parallel_size=4, modes=tuple(modes))
+    assert result is modes.NONE
+    # Explicit dynamic HT/LL remains available; the fixed producer is distinct.
+    if opt_in:
+        result, reason = namespace[node.name](modes[mode], feature_config=SimpleNamespace(deepep_auto=True),
+            fixed_use_low_latency=None, parallel_size=4, modes=tuple(modes))
+        assert result is modes[mode] and reason == "explicit"
+
+
+def test_online_eplb_is_refused_before_delegating_to_expert_selection(monkeypatch):
+    monkeypatch.setattr(DeepEPBF16ContiguousExperts, "is_supported_config",
+                        staticmethod(lambda *args: (True, None)))
+    config = _auto_config()
+    config.moe_parallel_config.enable_eplb = True
+    supported, reason = DeepEPAutoBF16Experts.is_supported_config(
+        DeepEPAutoBF16Experts, config, None, None, None)
+    assert not supported and "EPLB" in reason

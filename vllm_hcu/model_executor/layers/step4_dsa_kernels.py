@@ -1416,6 +1416,16 @@ def _region_topk_pack_resident_kernel(
 
 # Widest row the register-resident selector takes; wider rows use the tiled radix one.
 _RESIDENT_TOPK_MAX_REGIONS = 16384
+# RSI: the decode selector is launched at the certified graph width (17408 at
+# region 8, i.e. max_model_len capped by VLLM_STEP4_DSA_GRAPH_REGIONS), which is
+# just past the 16384 threshold, so every graph-replay decode step pays the
+# tiled radix selector (measured 187 us/layer at rows=32 in the 16x128K trace).
+# The register-resident selector with BLOCK_R=32768 selects bit-identically and
+# takes 79-90 us/layer at the same width (micro_dsa_selector_resident_wide.py,
+# bitwise_eq=True for widths 16384/17000/17408), so the ids path gets its own,
+# wider cap.  The prefill pack path keeps the original 16384 threshold: its rows
+# are many (one per query token) and were not measured.
+_RESIDENT_TOPK_IDS_MAX_REGIONS = 17408
 
 
 def region_topk_ids(
@@ -1442,7 +1452,11 @@ def region_topk_ids(
 
     rows, seq_regions = logits.shape
     out = torch.empty((rows, int(topk)), device=logits.device, dtype=torch.int32)
-    if seq_regions <= _RESIDENT_TOPK_MAX_REGIONS:
+    if seq_regions <= _RESIDENT_TOPK_IDS_MAX_REGIONS:
+        # RSI: BLOCK_R=32768 (widths 16385..17408) needs 16 warps; 8 warps spills
+        # and measured 89.6 vs 79.0 us at rows=32, width=17408.  Selection is
+        # bit-identical either way.
+        block_r = max(2, triton.next_power_of_2(seq_regions))
         _region_topk_ids_resident_kernel[(rows,)](
             logits,
             lengths,
@@ -1452,9 +1466,9 @@ def region_topk_ids(
             out.stride(0),
             topk=int(topk),
             # HCU: >= 2 for the same reason as below.
-            BLOCK_R=max(2, triton.next_power_of_2(seq_regions)),
+            BLOCK_R=block_r,
             BLOCK_TOPK=triton.next_power_of_2(int(topk)),
-            num_warps=8,
+            num_warps=16 if block_r >= 32768 else 8,
         )
         return out
     _region_topk_ids_kernel[(rows,)](

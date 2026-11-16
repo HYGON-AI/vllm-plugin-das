@@ -265,6 +265,8 @@ class DeepEPAutoBF16Experts(DeepEPAutoDeepGemmExperts):
             return False, "BF16 DeepGEMM requires bfloat16 activations and weights"
         if moe_config.has_bias:
             return False, "BF16 DeepGEMM does not support expert bias"
+        if getattr(moe_config.moe_parallel_config, "enable_eplb", False):
+            return False, "BF16 DeepGEMM packed LL weights do not support EPLB"
         if (
             moe_config.hidden_dim % 256
             or moe_config.intermediate_size_per_partition % 256
@@ -292,3 +294,18 @@ def make_deepep_auto_bf16_moe_kernel(quant_config, moe_config, routing_tables=No
     return _make_deepep_auto_deepgemm_moe_kernel(
         quant_config, moe_config, routing_tables, experts_cls=DeepEPAutoBF16Experts
     )
+
+
+def refresh_bf16_deepep_weights(model):
+    """Refresh LL copies after public kernel-format/IPC updates, before replay."""
+    if model is None:
+        return 0
+    refreshed = 0
+    for layer in model.modules():
+        method = getattr(layer, "quant_method", None)
+        kernel = getattr(method, "moe_kernel", None)
+        experts = getattr(kernel, "fused_experts", None)
+        if isinstance(experts, DeepEPAutoBF16Experts):
+            experts.process_weights_after_loading(layer)
+            refreshed += 1
+    return refreshed
