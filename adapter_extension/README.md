@@ -31,6 +31,23 @@ operator, so the plugin neither registers nor ships a `SiluAndMul` override.
 No model, topology, FP8-KV, or broad performance support is implied by these
 operator-level capabilities.
 
+## Experimental GDN/FLA leaf providers
+
+The independent `hcu-gdn-fla` capability preserves the official FLA algorithm
+and Qwen GDN model. Set `HCU_ADAPTER_VLLM_REQUIRED_CAPABILITIES=hcu-gdn-fla`,
+`VLLM_HCU_USE_CUSTOM_OPS=1`, and select `VLLM_HCU_GDN_PREFILL_BACKEND` and/or
+`VLLM_HCU_GDN_DECODE_BACKEND` from `triton`, `hcu-boltops`, `hcu-aiter`.
+Both stages default to `triton`; the master switch defaults to OFF.
+Change serving policy only by restarting the process.
+
+These switches select leaves only where the official model already executes
+FLA or the two Qwen decode functions. Core's `gdn_prefill_backend` setting,
+other fused decode branches and platform identity retain their official
+semantics. The legacy root's default AITER policy is not carried forward.
+See [the temporary seam, fallback policy and pending native/model gates](
+../docs/validation/vllm033-gdn-leaves.md). This candidate is not qualified for
+production serving.
+
 ## Compatibility
 
 - vLLM release line: `>=0.33.0,<0.34.0`; prerelease, postrelease,

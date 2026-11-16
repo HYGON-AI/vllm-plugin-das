@@ -33,6 +33,7 @@ def test_project_metadata_has_only_the_adapter_extension_entry_point() -> None:
             "das_hcu_slimquant": "hcu_vllm_das.slimquant_activation:extension_spec",
             "das_hcu_aiter_int8": "hcu_vllm_das.int8_activation:extension_spec",
             "das_hcu_dsv41": "hcu_vllm_das.dsv41_activation:extension_spec",
+            "das_hcu_gdn_fla": "hcu_vllm_das.gdn_activation:extension_spec",
         }
     }
     assert "vllm.platform_plugins" not in metadata["entry-points"]
