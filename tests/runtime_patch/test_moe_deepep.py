@@ -6099,17 +6099,14 @@ def test_deepep_ll_non_hcu_dispatch_signatures_delegate_to_upstream(
     )
 
 
-@pytest.mark.parametrize(
-    ("shared_with_high_throughput", "expected_clean_calls"),
-    [
-        (False, []),
-        (True, [(8, 2048, 1, 128), (8, 2048, 1, 128)]),
-    ],
-)
+@pytest.mark.parametrize("cleanup_accepts_topk", [False, True])
+@pytest.mark.parametrize("topk", [1, 6, 8])
+@pytest.mark.parametrize("shared_with_high_throughput", [False, True])
 def test_deepep_ll_fp8_cleans_only_when_buffer_is_shared_with_high_throughput(
     monkeypatch: pytest.MonkeyPatch,
     shared_with_high_throughput: bool,
-    expected_clean_calls: list[tuple[int, int, int, int]],
+    topk: int,
+    cleanup_accepts_topk: bool,
 ):
     module = _fake_deepep_ll_module()
     module.torch = torch
@@ -6124,11 +6121,15 @@ def test_deepep_ll_fp8_cleans_only_when_buffer_is_shared_with_high_throughput(
     from vllm_hcu.model_executor.layers.fused_moe import deepep_runtime
 
     signature_calls = 0
+    cleanup_signature_calls = 0
     original_signature = deepep_runtime.inspect.signature
 
     def counted_signature(callable_object):
-        nonlocal signature_calls
-        signature_calls += 1
+        nonlocal signature_calls, cleanup_signature_calls
+        if getattr(callable_object, "__func__", None) is Buffer.low_latency_dispatch:
+            signature_calls += 1
+        if getattr(callable_object, "__func__", None) is Buffer.clean_low_latency_buffer:
+            cleanup_signature_calls += 1
         return original_signature(callable_object)
 
     monkeypatch.setattr(deepep_runtime.inspect, "signature", counted_signature)
@@ -6142,9 +6143,10 @@ def test_deepep_ll_fp8_cleans_only_when_buffer_is_shared_with_high_throughput(
             hidden_size,
             num_experts,
             quant_group_size,
+            num_topk=8,
         ):
             calls.setdefault("clean", []).append(
-                (max_tokens, hidden_size, num_experts, quant_group_size)
+                (max_tokens, hidden_size, num_experts, quant_group_size, num_topk)
             )
 
         def low_latency_dispatch(
@@ -6178,6 +6180,15 @@ def test_deepep_ll_fp8_cleans_only_when_buffer_is_shared_with_high_throughput(
             )
             return expert_x, torch.ones(1, dtype=torch.int32), "handle", None, lambda: None
 
+    if not cleanup_accepts_topk:
+
+        def legacy_cleanup(self, max_tokens, hidden_size, num_experts, quant_group_size):
+            calls.setdefault("clean", []).append(
+                (max_tokens, hidden_size, num_experts, quant_group_size)
+            )
+
+        Buffer.clean_low_latency_buffer = legacy_cleanup
+
     instance = cls(Buffer(), 8, 1, use_fp8_dispatch=True)
     instance._vllm_hcu_clean_low_latency_buffer = shared_with_high_throughput
     instance.handles = [None]
@@ -6191,7 +6202,7 @@ def test_deepep_ll_fp8_cleans_only_when_buffer_is_shared_with_high_throughput(
         a2_scale=None,
         a1_gscale=None,
     )
-    topk_weights = torch.ones((1, 1))
+    topk_weights = torch.ones((1, topk))
     from vllm_hcu.platforms import envs as henvs
 
     monkeypatch.setattr(henvs, "VLLM_HCU_USE_CUSTOM_OPS", True)
@@ -6203,7 +6214,7 @@ def test_deepep_ll_fp8_cleans_only_when_buffer_is_shared_with_high_throughput(
     hook, _receiver = instance.prepare_async(
         torch.ones((1, 2048), dtype=torch.bfloat16),
         topk_weights,
-        torch.zeros((1, 1), dtype=torch.int64),
+        torch.zeros((1, topk), dtype=torch.int64),
         1,
         None,
         False,
@@ -6212,7 +6223,7 @@ def test_deepep_ll_fp8_cleans_only_when_buffer_is_shared_with_high_throughput(
     instance.prepare_async(
         torch.ones((1, 2048), dtype=torch.bfloat16),
         topk_weights,
-        torch.zeros((1, 1), dtype=torch.int64),
+        torch.zeros((1, topk), dtype=torch.int64),
         1,
         None,
         False,
@@ -6221,9 +6232,14 @@ def test_deepep_ll_fp8_cleans_only_when_buffer_is_shared_with_high_throughput(
 
     assert callable(hook)
     assert signature_calls == 1
+    assert cleanup_signature_calls == 1
     assert calls["topk_weight"] is topk_weights
     assert calls["quant_type"] == 2
     assert calls["quant_group_size"] == 128
+    expected_clean = (
+        (8, 2048, 1, 128, topk) if cleanup_accepts_topk else (8, 2048, 1, 128)
+    )
+    expected_clean_calls = [expected_clean] * 2 if shared_with_high_throughput else []
     assert calls.get("clean", []) == expected_clean_calls
 
 
