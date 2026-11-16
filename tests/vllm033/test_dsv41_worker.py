@@ -6,6 +6,12 @@ from hcu_vllm_das.dsv41.worker import HcuDSV41PcpWorker
 from vllm.v1.worker.gpu_worker import Worker
 
 
+def parallel_config(pcp=8, dp=1):
+    return NS(prefill_context_parallel_size=pcp, data_parallel_size=dp,
+              tensor_parallel_size=1, pipeline_parallel_size=1,
+              decode_context_parallel_size=1, enable_expert_parallel=True)
+
+
 @pytest.mark.parametrize("pcp,dp,backend,model,flag,expected", [
     (8, 1, "deep_gemm_mega_moe", "deepseek_v41", False, True),
     (8, 1, "deep_gemm_mega_moe", "deepseek_v41", True, True),
@@ -19,9 +25,10 @@ from vllm.v1.worker.gpu_worker import Worker
 def test_dummy_policy_is_scoped_and_preserves_core(monkeypatch, pcp, dp, backend, model, flag, expected):
     monkeypatch.setattr(envs, "VLLM_RANDOMIZE_DP_DUMMY_INPUTS", flag)
     worker = object.__new__(HcuDSV41PcpWorker)
-    worker.parallel_config = NS(prefill_context_parallel_size=pcp, data_parallel_size=dp)
+    worker.parallel_config = parallel_config(pcp, dp)
     worker.vllm_config = NS(parallel_config=worker.parallel_config,
-        kernel_config=NS(moe_backend=backend), model_config=NS(hf_config=NS(model_type=model)))
+        kernel_config=NS(moe_backend=backend), model_config=NS(
+            hf_config=NS(model_type=model), quantization="hcu_dsv41_channel_fp8"))
     assert worker.randomize_dummy_inputs is expected
     assert HcuDSV41PcpWorker.execute_model is Worker.execute_model
 
@@ -31,10 +38,11 @@ def test_dummy_policy_is_scoped_and_preserves_core(monkeypatch, pcp, dp, backend
 def test_memory_profile_uses_local_bound_and_restores_global_budget(monkeypatch, fail, backend):
     worker = object.__new__(HcuDSV41PcpWorker)
     worker.rank = 0
-    worker.parallel_config = NS(prefill_context_parallel_size=8, data_parallel_size=1)
+    worker.parallel_config = parallel_config()
     worker.vllm_config = NS(parallel_config=worker.parallel_config,
         kernel_config=NS(moe_backend=backend),
-        model_config=NS(hf_config=NS(model_type="deepseek_v41")),
+        model_config=NS(hf_config=NS(model_type="deepseek_v41"),
+                        quantization="hcu_dsv41_channel_fp8"),
         scheduler_config=NS(max_num_batched_tokens=32768))
     worker.model_runner = NS(max_num_tokens=32768, max_num_reqs=128, pcp_manager=object())
     def core_profile(self):
@@ -77,9 +85,11 @@ def test_profile_bound_covers_core_pcp_mixed_and_rounded_batches():
 
 
 def _profile_config(tmp_path, pcp=8, backend="deep_gemm_mega_moe", model="deepseek_v41"):
-    return NS(parallel_config=NS(prefill_context_parallel_size=pcp, worker_cls="auto"),
-              kernel_config=NS(moe_backend=backend),
-              model_config=NS(hf_config=NS(model_type=model)))
+    parallel = parallel_config(pcp)
+    parallel.worker_cls = "auto"
+    return NS(parallel_config=parallel, kernel_config=NS(moe_backend=backend),
+              model_config=NS(hf_config=NS(model_type=model),
+                              quantization="hcu_dsv41_channel_fp8"))
 
 
 @pytest.fixture
