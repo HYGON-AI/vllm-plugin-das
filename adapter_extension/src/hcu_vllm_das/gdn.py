@@ -185,7 +185,9 @@ def _call(name, provider, kernel, a):
         )
         if provider == "hcu-boltops":
             args.pop("chunk_offsets")  # Derived from cu_seqlens/chunk_size.
-            args.update(inplace_final_state=False, null_state_index=0)
+            # Core has already gathered dense per-sequence states here: row 0
+            # is real data, unlike decode's indexed cache NULL_BLOCK_ID=0.
+            args.update(inplace_final_state=False, null_state_index=-1)
         elif args["chunk_offsets"] is not None:
             import torch
 

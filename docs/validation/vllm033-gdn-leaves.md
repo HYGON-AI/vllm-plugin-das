@@ -49,9 +49,13 @@ does not assert `full_chunks=True`; different defaults or additional parameters
 still refuse before publication.
 
 Adapters retain the official metadata, `[N,H,V,K]` state layout, initial/final
-state, `save_new_value` and output backing. BoltOPs receives explicit
-`null_state_index=0`; AITER decode converts indices ≤0 to -1 without mutating
-the original index tensor. AITER chunk-H receives int64 offsets. AITER has no
+state, `save_new_value` and output backing. BoltOPs indexed decode receives explicit
+`null_state_index=0`. Prefill chunk-H receives dense gathered per-sequence state,
+where row 0 is real data and there are no state indices; it explicitly uses
+`null_state_index=-1`. Treating that dense row as the cache NULL slot discarded
+its initial state in the installed provider and failed native varlen final-state
+parity (max absolute error about 0.012). AITER decode converts indices ≤0 to -1
+without mutating the original index tensor. AITER chunk-H receives int64 offsets. AITER has no
 standalone recompute entry, so that leaf uses BoltOPs or official.
 
 Gated AITER chunk-O remains excluded because earlier device evidence showed
@@ -74,7 +78,7 @@ pin or a replacement for the providers' native/JIT cache ownership.
 ## Validation and remaining gates
 
 Source CPU qualification with real Core `98a0985` and Adapter `719e203`:
-**36 passed / 0 skipped** across `test_gdn_leaf_providers.py` and
+**39 passed / 0 skipped** across `test_gdn_leaf_providers.py` and
 `test_package_boundary.py`. This includes real Core aliases and constructor
 dispatch, strict provider call contracts, NULL and speculative metadata,
 output backing/padding, native-error propagation, publication failure,
@@ -86,11 +90,17 @@ evidence rather than being relabeled as device failures.
 legal WY intermediates, real gates, head ratios 4/8 and 4/12, nonaligned varlen,
 initial/final state, padded output backing and three changed-input Graph
 replays. Run each provider selection in a fresh process with
-`HCU_V033_TEST_GDN=1`. It requires at least 256 MiB actually free on the selected
-device and enforces a hard 64 MiB Torch allocator cap; the tensor matrix and
-numerical thresholds remain unchanged. It has not yet completed qualification
-for this candidate. Packed decode and sigmoid MTP tests additionally compare
-the official kernels and an independent CPU FP32 recurrence, with NULL state,
+`HCU_V033_TEST_GDN=1`. The explicit test-only `HCU_V033_TEST_GDN_ALLOCATOR_MIB` budget defaults
+to 512 MiB and requires that budget plus 16 MiB actually free. Cold official
+Triton autotuning itself allocates a 256 MiB benchmark cache; the earlier
+64 MiB cap failed there before native prefill execution. Shapes and official
+autotuning remain intact. Output absolute tolerance is tightened to 1e-4, with
+independent decode state checks at 5e-4. This candidate is still being qualified.
+`HCU_V033_TEST_GDN_PUBLIC_STARTUP=1` requires the real Adapter general-plugin
+activation before pytest; the fixture does not activate the extension itself.
+Its official reference always binds canonical Core leaves, even after public
+startup has replaced consumer aliases. Packed decode and sigmoid MTP tests
+additionally compare the official kernels and an independent CPU FP32 recurrence, with NULL state,
 accepted-token metadata and fixed-address changed-input Graph replay.
 
 Installed wheel qualification, native prefill/decode, provider performance,

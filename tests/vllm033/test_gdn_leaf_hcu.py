@@ -25,33 +25,53 @@ pytestmark = [
 def runtime():
     assert torch.cuda.is_available()
     free, total = torch.cuda.mem_get_info()
-    assert free >= 256 * 1024**2, (
+    budget_mib = int(os.environ.get("HCU_V033_TEST_GDN_ALLOCATOR_MIB", "512"))
+    assert budget_mib >= 64
+    assert free >= (budget_mib + 16) * 1024**2, (
         "insufficient free memory for the bounded native probe"
     )
     # Keep the full matrix while bounding this process's Torch allocator on
     # shared nodes. This does not reserve or release another process's memory.
-    torch.cuda.set_per_process_memory_fraction(64 * 1024**2 / total)
+    # Cold Triton autotuning alone needs a 256 MiB benchmark cache. A 64 MiB
+    # budget can run decode only; it cannot qualify the complete prefill path.
+    torch.cuda.set_per_process_memory_fraction(budget_mib * 1024**2 / total)
     from hcu_vllm_das import gdn
     from hcu_vllm_das import gdn_activation as activation
 
     chunk = import_module(activation.CHUNK)
     original = chunk.chunk_gated_delta_rule_fwd
+    from hcu_vllm_das.gdn_contracts import OWNERS
+
+    reference_globals = dict(original.__globals__)
+    for name in gdn.PREFILL:
+        reference_globals[name] = getattr(import_module(OWNERS[name]), name)
     # Test-only independent reference: identical official function code with
     # its ORIGINAL leaf aliases frozen before production activation. No copy
     # of this algorithm is shipped in the Plugin package.
     official = FunctionType(
         original.__code__,
-        dict(original.__globals__),
+        reference_globals,
         original.__name__,
         original.__defaults__,
         original.__closure__,
     )
-    activation.activate(
-        SimpleNamespace(
-            vllm_version=import_module("vllm").__version__,
-            requested_capabilities={activation.CAPABILITY},
+    if os.environ.get("HCU_V033_TEST_GDN_PUBLIC_STARTUP") == "1":
+        from hcu_adapter.bridges import vllm as adapter
+
+        adapter.require_extension_healthy(activation.CAPABILITY)
+        assert activation._published is not None
+        assert any(
+            report.entry_point_name == "das_hcu_gdn_fla"
+            and report.status.value == "active"
+            for report in adapter.extension_reports()
         )
-    )
+    else:
+        activation.activate(
+            SimpleNamespace(
+                vllm_version=import_module("vllm").__version__,
+                requested_capabilities={activation.CAPABILITY},
+            )
+        )
     assert activation._published.policy[0] in {"hcu-boltops", "hcu-aiter"}
     assert activation._published.providers
     activation.check_health()
@@ -97,6 +117,23 @@ def _decode_reference(
             if write_slot > 0:
                 final[write_slot].copy_(h)
     return output, final
+
+
+def _assert_decode_close(actual, reference, *, state=False):
+    actual, reference = actual.detach().float().cpu(), reference.detach().float().cpu()
+    difference = actual - reference
+    print(
+        "GDN_DECODE_ERROR",
+        "state" if state else "output",
+        "max_abs=",
+        difference.abs().max().item(),
+        "rms=",
+        difference.square().mean().sqrt().item(),
+        flush=True,
+    )
+    torch.testing.assert_close(
+        actual, reference, atol=5e-4 if state else 1e-4, rtol=1e-2
+    )
 
 
 @pytest.mark.parametrize("heads", [8, 12])
@@ -180,15 +217,14 @@ def test_packed_decode_null_slots_state_and_changed_input_graph(
             indices,
             cu,
         )
-        torch.testing.assert_close(result[0], official_result[0], atol=1e-2, rtol=1e-2)
-        torch.testing.assert_close(
+        _assert_decode_close(result[0], official_result[0])
+        _assert_decode_close(
             out.reshape(1, batch, heads, dim).float().cpu(),
             independent_out,
-            atol=1e-2,
-            rtol=1e-2,
         )
-        torch.testing.assert_close(state, ref_state, atol=1e-2, rtol=1e-2)
-        torch.testing.assert_close(state.cpu(), independent_state, atol=1e-2, rtol=1e-2)
+        _assert_decode_close(state, ref_state, state=True)
+        _assert_decode_close(state, independent_state, state=True)
+        assert torch.count_nonzero(out[indices <= 0]) == 0
         assert result[0].data_ptr() == out.data_ptr()
         assert result[1].data_ptr() == state.data_ptr()
         torch.testing.assert_close(state[0], initial[0], atol=0, rtol=0)
@@ -289,14 +325,10 @@ def test_sigmoid_spec_varlen_accepted_tokens_and_changed_input_graph(
         )
         # Official sigmoid returns without writing padded rows; their output
         # bytes are unspecified, unlike packed decode's explicit zeros.
-        torch.testing.assert_close(
-            result[0][:, :5], reference[0][:, :5], atol=1e-2, rtol=1e-2
-        )
-        torch.testing.assert_close(
-            result[0][:, :5].float().cpu(), independent_out[:, :5], atol=1e-2, rtol=1e-2
-        )
-        torch.testing.assert_close(state, ref_state, atol=1e-2, rtol=1e-2)
-        torch.testing.assert_close(state.cpu(), independent_state, atol=1e-2, rtol=1e-2)
+        _assert_decode_close(result[0][:, :5], reference[0][:, :5])
+        _assert_decode_close(result[0][:, :5], independent_out[:, :5])
+        _assert_decode_close(state, ref_state, state=True)
+        _assert_decode_close(state, independent_state, state=True)
         assert result[1].data_ptr() == state.data_ptr()
         torch.testing.assert_close(state[0], initial[0], atol=0, rtol=0)
         torch.testing.assert_close(state[6], initial[6], atol=0, rtol=0)
@@ -374,7 +406,7 @@ def test_complete_gated_fla_state_output_and_changed_input_graph(
 
     def compare(result):
         reference = official(*inputs, core_attn_out=ref_out)
-        torch.testing.assert_close(result[1], reference[1], atol=0.02, rtol=0.02)
+        torch.testing.assert_close(result[1], reference[1], atol=1e-4, rtol=0.02)
         torch.testing.assert_close(result[3], reference[3], atol=0.002, rtol=0.02)
         assert result[1].data_ptr() == out.data_ptr()
         assert torch.all(out[v.numel() :] == -99.0)

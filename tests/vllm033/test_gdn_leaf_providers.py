@@ -385,10 +385,22 @@ def test_chunk_h_preserves_metadata_state_layout_and_null(monkeypatch):
     k = torch.empty((1, 17, 4, 128), dtype=torch.bfloat16)
     u = torch.empty((1, 17, 8, 128), dtype=torch.bfloat16)
     offsets = torch.tensor([0, 1], dtype=torch.int32)
-    assert wrapped(k, k, u, chunk_offsets=offsets, output_final_state=True) == "native"
+    initial = torch.ones((1, 8, 128, 128), dtype=torch.float32)
+    assert (
+        wrapped(
+            k,
+            k,
+            u,
+            initial_state=initial,
+            chunk_offsets=offsets,
+            output_final_state=True,
+        )
+        == "native"
+    )
     a = calls[-1][2]
     assert a["k"] is k and a["u"] is u
-    assert a["null_state_index"] == 0 and a["transpose_state_layout"] is True
+    assert a["initial_state"] is initial and a["initial_state_indices"] is None
+    assert a["null_state_index"] == -1 and a["transpose_state_layout"] is True
     assert a["inplace_final_state"] is False and a["output_final_state"] is True
     assert "chunk_offsets" not in a
     # Exact earlier official-faster BF16 head ratio; no vendor launch.
