@@ -37,7 +37,7 @@ on:
   workflow_dispatch:
     inputs:
       hardware:
-        description: BW1100 only; BW1000 is paused during ARC migration
+        description: BW1100 (ARC 8-card runner)
         type: choice
         options: [BW1100]
         default: BW1100
@@ -47,11 +47,11 @@ on:
         options: [preflight, execute]
         default: preflight
       image:
-        description: Dated vllm 0.28.1 image; empty selects the newest dated image once
+        description: Dated vLLM 0.28.1 image (including patch builds); empty selects the newest standard build
         type: string
         default: ''
       cases:
-        description: Exact Cookbook sections; empty tests all single-host deployments per hardware
+        description: Exact Cookbook section names, one per line; empty uses the default test selection
         type: string
         default: ''
 
@@ -88,7 +88,7 @@ jobs:
       - uses: actions/checkout@v4
         with:
           repository: guochenyang99/ci-model-test
-          ref: cba438921cbc5955569d060847484e3b66760dfb
+          ref: main
           token: ${{ secrets.MODEL_SMOKE_REPO_TOKEN }}
           persist-credentials: false
           path: model-ci-tools
@@ -206,7 +206,7 @@ jobs:
           token: ${{ secrets.MODEL_SMOKE_REPO_TOKEN }}
           persist-credentials: false
           path: model-ci-tools
-      - name: Publish one report and one DashHub submission
+      - name: Publish model test report
         uses: ./model-ci-tools/.github/actions/deployment-smoke-aggregate
         with:
           framework: vllm
