@@ -75,18 +75,22 @@ def test_megamoe_rejects_unsupported_features_before_accessing_ep_group(monkeypa
 
 
 @pytest.mark.parametrize("pcp,dp", [(16, 1), (1, 16)])
-def test_megamoe_rejects_round_robin_placement(monkeypatch, pcp, dp):
+@pytest.mark.parametrize("placement,dtype,error", [
+    ("round_robin", torch.bfloat16, "requires linear expert placement"),
+    ("linear", torch.float16, "requires BF16 activations.*torch.float16"),
+])
+def test_megamoe_rejects_unsupported_expert_layout(monkeypatch, pcp, dp, placement, dtype, error):
     install = _load_megamoe()["install_hy4_mega_kernel"]
     config = SimpleNamespace(
-        model_config=SimpleNamespace(architectures=["HYV4VLForConditionalGeneration"]),
+        model_config=SimpleNamespace(architectures=["HYV4VLForConditionalGeneration"], dtype=dtype),
         lora_config=None,
         parallel_config=SimpleNamespace(
             enable_dbo=False, prefill_context_parallel_size=pcp, data_parallel_size=dp,
-            expert_placement_strategy="round_robin",
+            expert_placement_strategy=placement,
         ),
     )
     monkeypatch.setattr("vllm.config.get_current_vllm_config", lambda: config)
     with patch("vllm.distributed.get_ep_group") as get_group:
-        with pytest.raises(ValueError, match="requires linear expert placement"):
+        with pytest.raises(ValueError, match=error):
             install(None, None)
         get_group.assert_not_called()

@@ -170,6 +170,9 @@ def install_hy4_mega_kernel(method, layer):
     if p.expert_placement_strategy != "linear":
         raise ValueError("HY4 FP8 MegaMoE requires linear expert placement: "
                          "DeepGEMM expects contiguous physical expert IDs on each rank")
+    if config.model_config.dtype != torch.bfloat16:
+        raise ValueError("HY4 FP8 MegaMoE requires BF16 activations; "
+                         f"got model dtype {config.model_config.dtype}")
     ep = get_ep_group()
     decode = (
         p.data_parallel_size == 16 and p.prefill_context_parallel_size == 1
