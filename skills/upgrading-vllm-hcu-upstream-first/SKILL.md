@@ -184,6 +184,13 @@ Record unmerged requests with URL, base/head, state, dependency and remaining
 gate. Keep local validation, remote CI, review readiness and merge readiness
 distinct. Do not mark a whole upgrade complete from a partial feature matrix.
 
+Trace a prepared CI image to the current publisher's workflow and exact
+repository, then verify its manifest digest and runtime metadata. A valid
+release image can live outside the Plugin's historical image repository;
+update an explicit repository allowlist with executable positive and negative
+guard cases. Keep image configuration, source checks and actual device jobs
+as separate evidence. Registry provenance alone does not qualify the runtime.
+
 The portable script tests use temporary Git repositories:
 
 ```bash
