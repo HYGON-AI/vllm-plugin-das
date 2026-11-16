@@ -120,3 +120,11 @@ The integration follow-up incorporates the merged optional SlimQuant format
 from MR363. Its generic public Core PLE interface remains an enablement and
 deployment dependency; the CI wrapper does not invent that API, override its
 capability guard, or count a missing interface/skip as positive device evidence.
+
+Worker fixture ownership: a specialized Plugin worker inherits the Adapter
+worker's execution entry. Compare that inherited entry with the actual Adapter
+owner, and assert the specialization does not replace it. Comparing directly
+with Core's method incorrectly rejects an Adapter that checks required-owner
+health before delegating to Core (including FULL Graph replay). Retain the
+Core profiling delegates separately. The CPU inheritance checks do not certify
+a loaded model, device execution or the specialized model's accuracy.
