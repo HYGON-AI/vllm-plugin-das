@@ -308,3 +308,7 @@ coherent Core build, architecture and submitted source.
 不要为修复历史 CI 新建旧发布线请求，也不要直接改 base 夹带跨版本差异。
 较新开发版、较旧 wheel 或组件移植的结果只能定位问题；正式验收须在目标发布线的完整组合上重跑。
 
+静态目标解析只接受无转换、无格式参数的 f-string。`!s`/`!r`/`!a`、
+格式宽度/精度、嵌套或空格式参数均须保留为 unresolved 并触发人工复核；
+不能丢弃这些 AST 字段后检查另一个模块，再给出静态 unchanged 结论。
+

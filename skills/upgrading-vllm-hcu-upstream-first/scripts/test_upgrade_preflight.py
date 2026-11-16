@@ -108,6 +108,33 @@ def apply():
         self.assertTrue(any("TARGET_MODULE" in warning and "patch_router.py" in warning
                             for warning in report["warnings"]))
 
+    def test_formatted_fstring_does_not_inspect_a_different_committed_module(self):
+        # The real truncated target is router (changed); routers is unchanged.
+        for root in (self.fork, self.up):
+            write(root, "vllm/routers.py", "def route(x): return x\n")
+            commit(root)
+        for index, expression in enumerate(['f"vllm.{NAME:.6}"',
+                                             'f"vllm.{NAME!r}"',
+                                             'f"vllm.{NAME!a}"',
+                                             'f"vllm.{NAME:}"']):
+            with self.subTest(expression=expression):
+                write(self.plugin, "vllm_hcu/patch/patch_router.py",
+                      'NAME = "routers"\nTARGET_MODULE = ' + expression + '''
+PATCH_ID = "router"
+def apply():
+    require_exact_signature(fn, f"{TARGET_MODULE}.route", positional=("x",))
+''')
+                commit(self.plugin)
+                out = self.root / f"formatted-target-{index}"
+                run = self.invoke(out)
+                self.assertEqual(run.returncode, 0, run.stderr)
+                report = json.loads((out / "preflight.json").read_text())
+                self.assertFalse(any(row["patch_id"] == "router"
+                                     for row in report["adapters"]))
+                self.assertTrue(any("TARGET_MODULE" in warning and
+                                    "patch_router.py" in warning
+                                    for warning in report["warnings"]))
+
     @unittest.skipIf(sys.version_info < (3, 12), "PEP 695 requires Python 3.12")
     def test_generic_bound_drift_requires_review_end_to_end(self):
         write(self.fork, "vllm/router.py", "def route[T: int](): return T.__bound__\n")

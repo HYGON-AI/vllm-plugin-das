@@ -156,6 +156,11 @@ def literal(node, values):
     if isinstance(node, (ast.Tuple, ast.List)):
         return tuple(literal(x, values) for x in node.elts)
     if isinstance(node, ast.JoinedStr):
+        # Dropping conversion/formatting can silently select a different module.
+        if any(isinstance(x, ast.FormattedValue) and
+               (x.conversion != -1 or x.format_spec is not None)
+               for x in node.values):
+            raise ValueError("Unsupported f-string conversion or format specifier")
         return "".join(str(literal(x.value if isinstance(x, ast.FormattedValue) else x,
                                    values)) for x in node.values)
     if isinstance(node, ast.Subscript):

@@ -13,6 +13,20 @@ def compare(old, new, symbol="route"):
 
 
 class ContractTests(unittest.TestCase):
+    def test_formatted_fstring_targets_require_manual_review(self):
+        for expression in ['f"vllm.{NAME!s}"', 'f"vllm.{NAME!r}"',
+                           'f"vllm.{NAME!a}"', 'f"vllm.{NAME:.6}"',
+                           'f"vllm.{NAME:>{WIDTH}}"', 'f"vllm.{NAME:}"']:
+            with self.subTest(expression=expression):
+                values = constants(ast.parse(
+                    'NAME = "routers"\nWIDTH = 8\nTARGET_MODULE = ' + expression))
+                self.assertNotIn("TARGET_MODULE", values)
+
+    def test_unformatted_fstring_targets_remain_resolvable(self):
+        values = constants(ast.parse(
+            'NAME = "router"\nTARGET_MODULE = f"vllm.{NAME}"'))
+        self.assertEqual(values["TARGET_MODULE"], "vllm.router")
+
     @unittest.skipIf(sys.version_info < (3, 12), "PEP 695 requires Python 3.12")
     def test_generic_type_parameters_are_callable_contracts(self):
         for old, new in [
