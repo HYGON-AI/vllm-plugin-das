@@ -1117,8 +1117,13 @@ def test_boltops_chunk_o_current_abi(monkeypatch, extra):
     kernel.__signature__ = signature.replace(parameters=parameters)
     _install_fake_module(monkeypatch, "boltops.fla.gdn", chunk_fwd_o=kernel)
     resolve = make_boltops_gdn_resolver("chunk_fwd_o")
-    if extra in (None, "full_chunks"):
+    if extra is None:
         assert resolve() is kernel
+        assert resolve()() == ((), {})
+    elif extra == "full_chunks":
+        resolved = resolve()
+        assert resolved() == ((), {"full_chunks": False})
+        assert resolve() is resolved
     else:
         compatibility_error = _adapter("_common").PatchCompatibilityError
         with pytest.raises(compatibility_error, match="audited BoltOPs"):

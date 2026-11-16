@@ -6,6 +6,7 @@ from __future__ import annotations
 
 import importlib
 from collections.abc import Callable
+from functools import partial
 
 from ._common import PatchCompatibilityError, require_exact_signature
 
@@ -142,6 +143,9 @@ def make_boltops_gdn_resolver(name: str) -> Callable[[], Callable | None]:
                 positional=(*positional, "full_chunks"),
                 defaults={**defaults, "full_chunks": None},
             )
+            # Preserve the old masked behavior: the newer automatic full-chunk
+            # path can omit value-tail bounds checks when V is not BV-aligned.
+            candidate = partial(candidate, full_chunks=False)
         kernel = candidate
         resolved = True
         return kernel
