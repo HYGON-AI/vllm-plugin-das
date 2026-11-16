@@ -17,18 +17,30 @@ import sys
 from functools import lru_cache
 
 
+def git_environment():
+    # Git's repository-local selectors override -C, including object/index
+    # locations. Each requested root must select its own repository and storage.
+    local_selectors = {
+        "GIT_DIR", "GIT_WORK_TREE", "GIT_COMMON_DIR", "GIT_INDEX_FILE",
+        "GIT_OBJECT_DIRECTORY", "GIT_ALTERNATE_OBJECT_DIRECTORIES",
+        "GIT_SHALLOW_FILE", "GIT_NAMESPACE", "GIT_PREFIX",
+    }
+    env = {key: value for key, value in os.environ.items() if key not in local_selectors}
+    env.update(GIT_OPTIONAL_LOCKS="0", GIT_TERMINAL_PROMPT="0", GIT_NO_LAZY_FETCH="1")
+    return env
+
+
 @lru_cache(maxsize=1)
 def supports_no_lazy_fetch():
     result = subprocess.run(
         ["git", "--no-lazy-fetch", "--version"],
-        stdout=subprocess.PIPE, stderr=subprocess.PIPE, timeout=10,
+        stdout=subprocess.PIPE, stderr=subprocess.PIPE, env=git_environment(), timeout=10,
     )
     return result.returncode == 0
 
 
 def git(root, *args, data=None):
-    env = dict(os.environ, GIT_OPTIONAL_LOCKS="0", GIT_TERMINAL_PROMPT="0",
-               GIT_NO_LAZY_FETCH="1")
+    env = git_environment()
     offline_args = ["--no-lazy-fetch"] if supports_no_lazy_fetch() else []
     if not offline_args:
         # Old Git ignores GIT_NO_LAZY_FETCH. Refuse promisor repositories before

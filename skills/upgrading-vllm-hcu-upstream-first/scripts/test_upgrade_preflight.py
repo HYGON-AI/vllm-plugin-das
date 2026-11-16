@@ -91,6 +91,33 @@ PATCH_ID = "old"
             capture_output=True, text=True, encoding="utf-8",
         )
 
+    def test_inherited_repository_selectors_do_not_replace_requested_roots(self):
+        expected = {name: git(root, "rev-parse", "HEAD") for name, root in
+                    [("plugin", self.plugin), ("fork", self.fork), ("target", self.up)]}
+        overrides = {
+            "GIT_DIR": str(self.fork / ".git"),
+            "GIT_WORK_TREE": str(self.fork),
+            "GIT_COMMON_DIR": str(self.fork / ".git"),
+            "GIT_INDEX_FILE": str(self.fork / ".git/index"),
+        }
+        out = self.root / "inherited-selectors-report"
+        with patch.dict(os.environ, overrides):
+            run = self.invoke(out)
+        self.assertEqual(run.returncode, 0, run.stderr)
+        report = json.loads((out / "preflight.json").read_text())
+        for name, sha in expected.items():
+            self.assertEqual(report["sources"][name]["sha"], sha)
+        self.assertEqual({row["patch_id"] for row in report["adapters"]}, {"router", "old"})
+
+    def test_inherited_selectors_cannot_allow_output_in_plugin(self):
+        out = self.plugin / "must-not-write"
+        with patch.dict(os.environ, {
+            "GIT_DIR": str(self.fork / ".git"), "GIT_WORK_TREE": str(self.fork),
+        }):
+            run = self.invoke(out)
+        self.assertNotEqual(run.returncode, 0)
+        self.assertFalse(out.exists(), "The requested Plugin root must remain excluded")
+
     def test_dynamic_target_reassignment_requires_manual_review(self):
         write(self.plugin, "vllm_hcu/patch/patch_router.py", '''
 TARGET_MODULE = "vllm.router"
