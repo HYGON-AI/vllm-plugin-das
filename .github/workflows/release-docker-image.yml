@@ -148,7 +148,8 @@ jobs:
   # Run Cookbook model tests and image validation independently after publishing.
   # 两个测试 job 只依赖 build, 互不等待互不阻断
   test-image:
-    if: github.event.inputs.run_test != 'false'
+    # Model deployment testing is moving to inference-chef-das.
+    if: ${{ false }}
     needs: build
     uses: ./.github/workflows/cookbook-deployment-smoke.yml
     with:
