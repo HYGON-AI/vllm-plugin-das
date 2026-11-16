@@ -29,3 +29,26 @@ def test_finalize_kernel_preserves_cache_pointer_range():
                      if "tt.func public" in line)
     cache_arg = signature.split("%k_cache_ptr:", 1)[1].split("%kv_slot_mapping_ptr:", 1)[0]
     assert "tt.pointer_range" not in cache_arg
+
+
+@pytest.mark.hcu
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="requires HCU")
+def test_gather_kernel_preserves_cache_pointer_range():
+    from vllm.models.deepseek_v4.common.ops import cache_utils
+    from vllm_hcu.patch.worker.core_fix import patch_deepseek_v4_gather_kv_offset
+
+    patch_deepseek_v4_gather_kv_offset.apply(cache_utils)
+    assert not patch_deepseek_v4_gather_kv_offset.apply(cache_utils)
+    slot = torch.zeros(1, dtype=torch.int32, device="cuda")
+    output = torch.empty(512, dtype=torch.bfloat16, device="cuda")
+    cache = torch.empty(1200, dtype=torch.uint8, device="cuda")
+    compiled = cache_utils._dequantize_and_gather_k_kernel.warmup(
+        output, 512, 512, cache, slot, slot, 0, None, max_blocks_per_seq=1,
+        fp8_dim=448, bf16_dim=64, scale_dim=8, quant_block=64,
+        cache_block_size=2, token_data_size=576, block_stride=1677888,
+        output_dim=512, fp8_max=448., n_quant_blocks=7, grid=(1, 1),
+    )
+    signature = next(line for line in compiled.asm["ttir"].splitlines()
+                     if "tt.func public" in line)
+    cache_arg = signature.split("%k_cache_ptr:", 1)[1].split("%seq_lens_ptr:", 1)[0]
+    assert "tt.pointer_range" not in cache_arg
