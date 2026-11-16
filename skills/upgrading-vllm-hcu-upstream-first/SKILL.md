@@ -339,13 +339,21 @@ coherent Core build, architecture and submitted source.
 格式宽度/精度、嵌套或空格式参数均须保留为 unresolved 并触发人工复核；
 不能丢弃这些 AST 字段后检查另一个模块，再给出静态 unchanged 结论。
 
-For RMSNorm provider migration, read the exact target IR and preserve both
-intermediate rounding and FP32 epsilon. Compare small constant inputs near
-sqrt(epsilon) against an independent FP64 scalar oracle: random unit-scale
-inputs can hide an epsilon cast in an otherwise FP32 kernel. Check ordinary
-and fused exports separately, including changed-input Graph replay and input
-preservation. A public inference export may default to an in-place output,
-so pass a separate output for a non-mutating official op and validate its
-actual ABI before activation. Bind vendor behavior to the tested build. A
-component defect or repair alone does not prove a HumanEval failure's cause;
-retain per-task pass-set comparisons and exact-release model gates.
+For RMSNorm provider migration, inspect both exact-target IR and the actual
+compiled serving kernel. Eager native's intermediate low-precision cast may
+be elided by default Inductor; do not add an extra multiply solely to match
+an eager oracle. Compare official eager, official compiled and the provider
+under the same inference/autograd context and compiler configuration, with
+changed-input Graph replay. Saved-tensor precision policies can differ with
+gradients enabled. Bind generated code to runtime traces; vLLM AOT Inductor
+output may be nested under VLLM_CACHE_ROOT/torch_compile_cache rather than
+the top-level Inductor cache. Keep FP32 epsilon, residual precision and input
+preservation checks separate from intermediate-cast diagnosis. Small constant
+inputs near sqrt(epsilon) with an independent FP64 scalar oracle can expose
+epsilon narrowing hidden by random unit-scale inputs. Check ordinary and
+fused exports separately. A public inference API may default to an in-place
+output; provide a separate output for a non-mutating official op and validate
+its actual ABI before activation. Do not change compiler settings or force
+eager to make the comparison pass. Bind vendor behavior to the tested build;
+component repair alone does not prove a HumanEval failure's cause. Retain
+per-task pass-set comparisons and exact-release model gates.
