@@ -270,3 +270,11 @@ signatures at the actual target. Admission must follow all switches selecting
 the scatter/gather provider, whose tile limits may differ from GEMM alignment.
 Keep dispatch capacity guards and update positive decode fixtures to fit their
 allocated bound, with separate oversized refusals and retained RED evidence.
+
+
+Trace the complete inherited activation method chain: accepting keyword
+arguments does not prove forwarding. Keep that chain real in CPU regressions
+and double only its final provider. Verify native batched semantics separately;
+a binary may accept the same operator signature yet implement flat counts only.
+Retain a failing old-binary result and bind native/Graph successes to the actual
+coherent Core build, architecture and submitted source.
