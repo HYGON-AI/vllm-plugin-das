@@ -13,8 +13,12 @@ logger = init_logger(f"vllm.{__name__}")
 def uses_pcp_channel_fp8(config):
     """Whether this resolved config profiles rank-local PCP Channel-FP8 batches."""
     cfg = config
+    p = cfg.parallel_config
     return (
-        cfg.parallel_config.prefill_context_parallel_size > 1
+        (p.tensor_parallel_size, p.data_parallel_size, p.pipeline_parallel_size,
+         p.prefill_context_parallel_size, p.decode_context_parallel_size) == (1, 1, 1, 8, 1)
+        and p.enable_expert_parallel
+        and cfg.model_config.quantization == "hcu_dsv41_channel_fp8"
         and cfg.kernel_config.moe_backend in ("deep_gemm_mega_moe", "deep_gemm")
         and _is_v41(cfg.model_config.hf_config)
     )
