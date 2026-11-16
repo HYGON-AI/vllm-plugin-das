@@ -115,15 +115,21 @@ def run_case(adapter, shape, warmup, repeats, profile=False, with_sink=False):
     )
     # Explicit non-None counts force the same wheel's masked BF16 path.
     bf16 = lambda: flash_mla_sparse_fwd(q, kv, indices, scale, 512, sink, counts)
+    native_sink = adapter._frontend_qk_shape_ok(q, kv, indices, 512) is True
     direct = lambda: flash_mla_cuda.sparse_prefill_fwd(
-        q, kv, indices, scale, 512, None, None
+        q, kv, indices, scale, 512, sink if native_sink else None, None
     )
 
     def checked():
         out, lse = adapter.sparse_prefill_qk_fp8(
-            q, kv, indices, scale, topk_length=counts
+            q,
+            kv,
+            indices,
+            scale,
+            topk_length=counts,
+            attn_sink=sink if native_sink else None,
         )
-        if sink is not None:
+        if sink is not None and not native_sink:
             out = adapter._apply_sink(out, lse, sink)
         return out, lse
 
@@ -155,7 +161,8 @@ def run_case(adapter, shape, warmup, repeats, profile=False, with_sink=False):
         "topk_length_shape": list(counts.shape),
         "q_dtype": str(q.dtype),
         "has_sink": with_sink,
-        "raw_timing_excludes_sink_correction": with_sink,
+        "native_sink": native_sink and with_sink,
+        "raw_timing_excludes_sink_correction": with_sink and not native_sink,
         "kv_dtype": str(kv.dtype),
         "fp8_vs_fp32": error,
         "bf16_vs_fp32": errors(base_out[:4], base_lse[:4], expected, expected_lse),
@@ -209,6 +216,10 @@ def main():
     assert "gfx938" in props.gcnArchName
     adapter = load_adapter()
     shapes = [(16, 2048, 64), (378, 85000, 64), (6168, 177280, 64), (378, 85000, 128)]
+    from flash_mla import flash_mla_interface
+
+    if callable(getattr(flash_mla_interface, "_dsa_qk_fp8_shape_ok", None)):
+        shapes[0] = (16, 32768, 64)
     if args.sweep:
         shapes = [
             (q, kv, h)

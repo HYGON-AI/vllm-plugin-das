@@ -31,7 +31,7 @@ def kernels(monkeypatch):
     return helper, helper.load_adapter()
 
 
-@pytest.mark.parametrize("heads,kv_len", [(64, 2048), (64, 24576), (128, 24576)])
+@pytest.mark.parametrize("heads,kv_len", [(64, 32768), (64, 24576), (128, 24576)])
 @pytest.mark.parametrize("seed", [1, 42, 20261114])
 def test_native_output_and_lse_against_fp32(kernels, heads, kv_len, seed):
     helper, adapter = kernels
@@ -146,11 +146,17 @@ def test_adaptive_dispatch_output_and_skipped_scan(kernels, shape, monkeypatch):
 
 
 @pytest.mark.parametrize("heads", [64, 128])
-def test_fp8_preserves_attention_sink_and_lse(kernels, heads):
+def test_fp8_preserves_attention_sink_and_lse(kernels, heads, monkeypatch):
     helper, adapter = kernels
     q, kv, indices, counts = helper.inputs(768, 24576, heads)
     sink = torch.linspace(4, 11, heads, device="cuda", dtype=torch.float32)
     sink[0], sink[1] = float("inf"), -float("inf")
+    if adapter._frontend_qk_shape_ok(q, kv, indices, 512) is True:
+        monkeypatch.setattr(
+            adapter,
+            "_apply_sink",
+            lambda *args: pytest.fail("native sink applied twice"),
+        )
     expected, expected_lse = helper.reference(
         q[:4], kv, indices[:4], counts[:4], attn_sink=sink
     )

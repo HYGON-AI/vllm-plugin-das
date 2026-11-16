@@ -2,16 +2,26 @@
 # SPDX-FileCopyrightText: Copyright (c) 2026 Hygon Information Technology Co., Ltd.
 """Optional, checked QK-FP8 dispatch for BF16 sparse MLA prefill inputs.
 
-The native QK path does not implement padding/count masks or max_logits.
-Keep the public frontend for every other case, including graph capture.
+The unmasked native QK path cannot honor padding/count masks. Keep the public
+frontend for every other case, including graph capture.
 """
 
 import os
 from contextlib import nullcontext
+from importlib import import_module
 
 import torch
 
 _dispatch_reported = False
+
+
+def _frontend_qk_shape_ok(q, kv, indices, d_v):
+    flash_mla_interface = import_module("flash_mla.flash_mla_interface")
+
+    # New frontends publish their native QK eligibility check, including sink
+    # support. Older wheels retain the separate denominator correction below.
+    check = getattr(flash_mla_interface, "_dsa_qk_fp8_shape_ok", None)
+    return bool(check(q, kv, indices, d_v)) if callable(check) else None
 
 
 def _supports_qk_fp8(q, kv, indices, d_v, attn_sink):
@@ -105,12 +115,16 @@ def _report_dispatch(q, kv, has_sink):
 
         init_logger(__name__).info(
             "FlashMLA QK-FP8 sparse prefill selected: Q=%s, KV=%s, sink=%s",
-            tuple(q.shape), tuple(kv.shape), has_sink,
+            tuple(q.shape),
+            tuple(kv.shape),
+            has_sink,
         )
         _dispatch_reported = True
 
 
-def sparse_prefill_qk_fp8(q, kv, indices, sm_scale, d_v=512, *, topk_length=None):
+def sparse_prefill_qk_fp8(
+    q, kv, indices, sm_scale, d_v=512, *, topk_length=None, attn_sink=None
+):
     """The documented direct QK-FP8 entry, returning only output and LSE.
 
     vLLM may supply counts; they can be omitted at the native boundary only
@@ -120,6 +134,13 @@ def sparse_prefill_qk_fp8(q, kv, indices, sm_scale, d_v=512, *, topk_length=None
         raise _UnsupportedQkFp8("FLASH_MLA_DSA_FP8_QK must be '1'")
     if not _supports_qk_fp8(q, kv, indices, d_v, None):
         raise _UnsupportedQkFp8("unsupported QK-FP8 shape, dtype, device or layout")
+    native_shape = _frontend_qk_shape_ok(q, kv, indices, d_v)
+    if native_shape is False:
+        raise _UnsupportedQkFp8("the installed frontend rejects this QK-FP8 shape")
+    if attn_sink is not None and (
+        native_shape is not True or not _supports_sink(q, attn_sink)
+    ):
+        raise _UnsupportedQkFp8("native QK-FP8 sink is unavailable or unsupported")
     if topk_length is not None and (
         topk_length.shape != (q.shape[0],)
         or topk_length.dtype != torch.int32
@@ -137,7 +158,7 @@ def sparse_prefill_qk_fp8(q, kv, indices, sm_scale, d_v=512, *, topk_length=None
         from flash_mla.flash_mla_interface import flash_mla_cuda
 
         output, _unused_max, lse = flash_mla_cuda.sparse_prefill_fwd(
-            q, kv, indices, sm_scale, d_v, None, None
+            q, kv, indices, sm_scale, d_v, attn_sink, None
         )
         return output, lse
 
@@ -149,18 +170,26 @@ def flash_mla_sparse_fwd(
 
     if os.environ.get("FLASH_MLA_DSA_FP8_QK") != "1":
         return public(q, kv, indices, sm_scale, d_v, attn_sink, topk_length)
-    if _prefer_qk_fp8(q, kv, attn_sink is not None):
+    native_shape = _frontend_qk_shape_ok(q, kv, indices, d_v)
+    external_sink = attn_sink is not None and native_shape is None
+    if native_shape is not False and _prefer_qk_fp8(q, kv, attn_sink is not None):
         if attn_sink is not None and not _supports_sink(q, attn_sink):
             return public(q, kv, indices, sm_scale, d_v, attn_sink, topk_length)
         try:
             output, lse = sparse_prefill_qk_fp8(
-                q, kv, indices, sm_scale, d_v, topk_length=topk_length
+                q,
+                kv,
+                indices,
+                sm_scale,
+                d_v,
+                topk_length=topk_length,
+                attn_sink=attn_sink if native_shape is True else None,
             )
-            if attn_sink is not None:
+            if external_sink:
                 output = _apply_sink(output, lse, attn_sink)
             _report_dispatch(q, kv, attn_sink is not None)
-            # max_logits is uninitialized in the QK kernel. Existing MLA callers
-            # consume output/LSE only; never expose its uninitialized buffer.
+            # Preserve the adapter's output/LSE-only contract. Older native
+            # builds did not initialize max_logits; MLA callers do not use it.
             return output, None, lse
         except _UnsupportedQkFp8:
             pass

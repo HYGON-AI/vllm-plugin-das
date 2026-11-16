@@ -117,6 +117,56 @@ def test_valid_sink_is_applied_after_native_without_changing_lse(adapter, monkey
     assert applied[0][2] is sink
 
 
+def test_frontend_native_sink_is_forwarded_once(adapter, monkeypatch):
+    module, calls = adapter
+    _enable(module, monkeypatch)
+    interface = sys.modules["flash_mla.flash_mla_interface"]
+    monkeypatch.setattr(
+        interface, "_dsa_qk_fp8_shape_ok", lambda *args: True, raising=False
+    )
+    monkeypatch.setattr(
+        module, "_apply_sink", lambda *args: pytest.fail("native sink applied twice")
+    )
+    q, kv, indices = _inputs()
+    sink = torch.zeros(64, dtype=torch.float32)
+    counts = torch.full((2,), 2048, dtype=torch.int32)
+    result = module.flash_mla_sparse_fwd(
+        q, kv, indices, 0.1, attn_sink=sink, topk_length=counts
+    )
+    assert result == ("fp8_out", None, "fp8_lse")
+    assert [name for name, _ in calls] == ["native"]
+    assert calls[0][1][-2] is sink
+    assert calls[0][1][-1] is None
+
+
+def test_explicit_entry_supports_native_sink(adapter, monkeypatch):
+    module, calls = adapter
+    _enable(module, monkeypatch)
+    interface = sys.modules["flash_mla.flash_mla_interface"]
+    monkeypatch.setattr(
+        interface, "_dsa_qk_fp8_shape_ok", lambda *args: True, raising=False
+    )
+    q, kv, indices = _inputs()
+    sink = torch.zeros(64, dtype=torch.float32)
+    assert module.sparse_prefill_qk_fp8(q, kv, indices, 0.1, attn_sink=sink) == (
+        "fp8_out",
+        "fp8_lse",
+    )
+    assert calls[0][1][-2] is sink
+
+
+def test_frontend_shape_rejection_keeps_bf16(adapter, monkeypatch):
+    module, calls = adapter
+    _enable(module, monkeypatch)
+    interface = sys.modules["flash_mla.flash_mla_interface"]
+    monkeypatch.setattr(
+        interface, "_dsa_qk_fp8_shape_ok", lambda *args: False, raising=False
+    )
+    q, kv, indices = _inputs()
+    assert module.flash_mla_sparse_fwd(q, kv, indices, 0.1)[0] == "bf16_out"
+    assert [name for name, _ in calls] == ["public"]
+
+
 @pytest.mark.parametrize(
     "q_len,kv_len,heads,expected",
     [
