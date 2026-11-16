@@ -15,6 +15,8 @@ import torch
 import vllm
 from vllm.config import set_current_vllm_config
 
+from tests.fixtures.qwen4_ple import load_ple_layer_contract
+
 from vllm_hcu.patch.worker.core_fix import patch_qwen4_exp_ple_int8 as int8_patch
 from vllm_hcu.patch.worker.core_fix import (
     patch_qwen4_exp_ple_cudagraph as graph_patch,
@@ -35,7 +37,7 @@ TARGET_VLLM_ROOT = Path(
 
 @pytest.fixture(scope="module")
 def ple_layer():
-    return importlib.import_module("vllm_hcu.models.qwen4_exp.amd.ple_layer")
+    return load_ple_layer_contract()
 
 
 def _capable_method():

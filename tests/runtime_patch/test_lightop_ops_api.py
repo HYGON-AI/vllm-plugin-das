@@ -21,6 +21,7 @@ from vllm import logger as vllm_logger
 
 from vllm_hcu.model_executor.layers.quantization import lightop_fp8_runtime
 from vllm_hcu.ops import test_concat
+from vllm_hcu.platforms import envs as henvs
 
 REPO = Path(__file__).resolve().parents[2]
 
@@ -657,8 +658,9 @@ def test_silu_and_mul_rejects_same_named_legacy_operator_when_category_missing(
 
 def _deep_apply_namespace(logger: _WarningLogger) -> dict[str, object]:
     return {
+        "henvs": henvs,
         "torch": torch,
-        "MoEActivation": SimpleNamespace(SILU="silu"),
+        "MoEActivation": SimpleNamespace(SILU="silu", SWIGLUSTEP="swiglustep"),
         "current_platform": SimpleNamespace(is_rocm=lambda: True),
         "compute_aligned_M_and_alignment": lambda **_kwargs: (1, 256),
         "deepgemm_moe_permute": lambda **kwargs: (
@@ -675,6 +677,7 @@ def _deep_apply_namespace(logger: _WarningLogger) -> dict[str, object]:
             kwargs["a"]
         ),
         "_HCU_HT_EP_TOKEN_ALIGNMENT": 256,
+        "_EP_FUSED_MOE": False,
         "logger": logger,
     }
 
@@ -765,6 +768,7 @@ def test_contiguous_deep_gemm_pairs_deepgemm_gemm_with_lightop_activation(
 def test_contiguous_deep_gemm_rejects_top_level_activation_and_grouped_gemm(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
+    monkeypatch.setitem(sys.modules, "deepgemm", ModuleType("deepgemm"))
     legacy = ModuleType("lightop")
     legacy_calls: list[str] = []
     legacy.m_grouped_w8a8_gemm_nt_contig_asm = lambda *_args, **_kwargs: legacy_calls.append(
@@ -773,7 +777,11 @@ def test_contiguous_deep_gemm_rejects_top_level_activation_and_grouped_gemm(
     legacy.fuse_silu_mul_quant = lambda *_args, **_kwargs: legacy_calls.append(
         "activation"
     )
-    _install_lightop(monkeypatch, legacy=legacy)
+    _install_lightop(
+        monkeypatch,
+        legacy=legacy,
+        activation=ModuleType("lightop.activation"),
+    )
     apply = _method(
         "vllm_hcu/model_executor/layers/fused_moe/experts/deep_gemm_moe.py",
         "DeepGemmExperts",
@@ -857,6 +865,7 @@ def test_masked_deep_gemm_pairs_deepgemm_gemm_with_lightop_activation(
 def test_masked_deep_gemm_rejects_top_level_activation_and_grouped_gemm(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
+    monkeypatch.setitem(sys.modules, "deepgemm", ModuleType("deepgemm"))
     legacy = ModuleType("lightop")
     legacy_calls: list[str] = []
     legacy.m_grouped_w8a8_gemm_nt_masked = lambda *_args, **_kwargs: legacy_calls.append(
@@ -865,7 +874,11 @@ def test_masked_deep_gemm_rejects_top_level_activation_and_grouped_gemm(
     legacy.fuse_silu_mul_quant_ep = lambda *_args, **_kwargs: legacy_calls.append(
         "activation"
     )
-    _install_lightop(monkeypatch, legacy=legacy)
+    _install_lightop(
+        monkeypatch,
+        legacy=legacy,
+        activation=ModuleType("lightop.activation"),
+    )
     namespace = {
         "torch": torch,
         "MoEActivation": SimpleNamespace(SILU="silu"),
@@ -1132,6 +1145,7 @@ def _dpsk_namespace(logger: _WarningLogger, calls: list[tuple[str, tuple, dict]]
 
     return {
         "torch": torch,
+        "henvs": SimpleNamespace(VLLM_HCU_USE_CUSTOM_OPS=False),
         "MoEActivation": SimpleNamespace(SILU="silu"),
         "compute_aligned_M": lambda **_kwargs: 1,
         "deepgemm_moe_permute": lambda **kwargs: (

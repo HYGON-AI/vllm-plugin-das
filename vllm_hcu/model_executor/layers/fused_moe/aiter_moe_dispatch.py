@@ -119,6 +119,33 @@ def _solution_token(config: object) -> str:
     return str(solution).rsplit(".", 1)[-1].upper()
 
 
+def aiter_moe_config_supports_expert_map(config: object) -> bool:
+    """Return whether an AITER config routes global IDs through expert_map.
+
+    MOE_C encodes its sorting route in the millions digit of MODE.  A
+    value of one selects ``moe_align``, which consumes the expert map; zero
+    selects CK sorting, which leaves global expert IDs for the GEMM kernel.
+    Unknown MOE_C metadata is rejected so expert-parallel callers fail safe.
+    """
+
+    if _solution_token(config) != "MOE_C":
+        return True
+    config_values = getattr(config, "config", None)
+    if not isinstance(config_values, dict):
+        return False
+
+    mode_value = config_values.get("MODE")
+    try:
+        mode = int(mode_value)
+    except (TypeError, ValueError):
+        mode = None
+    if mode is not None and 10_000_000 <= mode < 30_000_000:
+        return (mode // 1_000_000) % 10 == 1
+
+    sorting_method = str(config_values.get("SORTING_METHOD", "")).lower()
+    return sorting_method == "moe_align"
+
+
 def aiter_moe_weight_layout_signature(config: object) -> tuple[Any, ...]:
     """Return the physical weight-layout contract selected by AITER."""
 
@@ -368,6 +395,63 @@ def prepare_aiter_moe_weights(
     return result
 
 
+@dataclass
+class _PreparedScales:
+    config: object
+    tensors: tuple[torch.Tensor | None, torch.Tensor | None]
+    generation: tuple[Any, ...]
+
+
+def _copy_prepared_scales(entry: _PreparedScales, fresh) -> None:
+    # Validate the complete pair before touching either graph-owned allocation.
+    for old, new in zip(entry.tensors, fresh):
+        if old is None or new is None:
+            if old is not new:
+                raise HcuAiterMoeDispatchError("AITER scale presence changed on reload")
+            continue
+        if (old.shape, old.dtype, old.device) != (new.shape, new.dtype, new.device):
+            raise HcuAiterMoeDispatchError("AITER scale layout changed on reload")
+    # Warmup runs under inference_mode, so derived tensors may be inference
+    # tensors. no_grad alone cannot update them during an out-of-mode reload.
+    with torch.inference_mode():
+        for old, new in zip(entry.tensors, fresh):
+            if old is not None:
+                old.copy_(new)
+
+
+def _scale_cache_key(generation, config) -> tuple[Any, ...]:
+    return (
+        tuple(g[:2] + g[3:] if g is not None else () for g in generation),
+        _scale_layout_generation(config),
+    )
+
+
+def refresh_aiter_moe_scale_cache(
+    owner: object,
+    scale1: torch.Tensor,
+    scale2: torch.Tensor,
+    *,
+    update_generation: bool = False,
+) -> None:
+    """Refresh existing allocations before a checkpoint reload can replay graphs."""
+    cache = getattr(owner, _SCALE_CACHE_ATTR, None)
+    if not isinstance(cache, OrderedDict):
+        return
+    for old_key, entry in list(cache.items()):
+        fresh = prepare_aiter_moe_scales(
+            scale1, scale2, entry.config, cache_owner=object(),
+        )
+        _copy_prepared_scales(entry, fresh)
+        if update_generation:
+            entry.generation = (_tensor_generation(scale1), _tensor_generation(scale2))
+            new_key = _scale_cache_key(entry.generation, entry.config)
+            # Keep the graph-owned pair reachable through the cache after a
+            # source Parameter is replaced. Another captured pair may already
+            # occupy this key; the loop refreshes that allocation too.
+            if new_key != old_key and new_key not in cache:
+                cache[new_key] = cache.pop(old_key)
+
+
 def prepare_aiter_moe_scales(
     scale1: torch.Tensor | None,
     scale2: torch.Tensor | None,
@@ -380,14 +464,14 @@ def prepare_aiter_moe_scales(
         return scale1, scale2
 
     cache = _owner_cache(cache_owner, _SCALE_CACHE_ATTR)
-    cache_key = (
-        _tensor_generation(scale1),
-        _tensor_generation(scale2),
-        _scale_layout_generation(config),
-    )
-    if cache_key in cache:
+    generation = (_tensor_generation(scale1), _tensor_generation(scale2))
+    # A source version change refreshes the allocation rather than allocating
+    # another scale generation that could evict a captured graph's storage.
+    cache_key = _scale_cache_key(generation, config)
+    entry = cache.get(cache_key)
+    if entry is not None and entry.generation == generation:
         cache.move_to_end(cache_key)
-        return cache[cache_key]
+        return cache[cache_key].tensors
 
     moe_module = import_module("aiter.moe")
     shuffle = getattr(moe_module, "aiter_moe_shfl_scale", None)
@@ -412,8 +496,13 @@ def prepare_aiter_moe_scales(
             config=config,
         ),
     )
-    _cache_put(cache, cache_key, result, limit=_DERIVED_CACHE_LIMIT)
-    return result
+    if entry is None:
+        entry = _PreparedScales(config, result, generation)
+    else:
+        _copy_prepared_scales(entry, result)
+        entry.generation = generation
+    _cache_put(cache, cache_key, entry, limit=_DERIVED_CACHE_LIMIT)
+    return entry.tensors
 
 
 def _validate_expert_mapping_tensor(

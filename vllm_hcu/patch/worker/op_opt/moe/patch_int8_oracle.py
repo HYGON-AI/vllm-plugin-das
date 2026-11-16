@@ -164,10 +164,13 @@ def apply_to_module(module: ModuleType) -> bool:
         sidecar = _sidecar_config(config)
         if sidecar.deepep_auto:
             architectures = _model_architectures(config)
-            if "DeepseekV4ForCausalLM" not in architectures:
+            if not any(architecture in architectures for architecture in (
+                "DeepseekV4ForCausalLM", "DeepSeekV4MTPModel",
+            )):
                 raise ValueError(
                     "HCU Channel-INT8 deepep_auto is validated only for "
-                    "DeepSeek-V4; use an explicit DeepEP high-throughput or "
+                    "DeepSeek-V4 and its native MTP draft; use an explicit "
+                    "DeepEP high-throughput or "
                     "low-latency backend for other models. "
                     f"Got architectures={architectures!r}."
                 )

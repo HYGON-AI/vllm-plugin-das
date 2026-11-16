@@ -123,6 +123,7 @@ class HcuPCPManager:
         self._block_tables = block_tables
         self._global_batch: InputBatch | None = None
         self._global_attn_ready = False
+        self._cached_global_block_tables: tuple[torch.Tensor, ...] | None = None
         self._hidden_restore_idx: torch.Tensor | None = None
         self._padded_gather_idx: torch.Tensor | None = None
         self._gathered_kv_write_mask: torch.Tensor | None = None
@@ -518,6 +519,7 @@ class HcuPCPManager:
         self._global_batch = input_batch
         self._global_has_prefill = bool(input_batch.is_prefilling_np.any())
         self._global_attn_ready = False
+        self._cached_global_block_tables = None
         segments_by_rank, per_rank_num_tokens = self._build_batch_layout(
             input_batch,
             padded_num_tokens=padded_num_tokens,
@@ -889,6 +891,7 @@ class HcuPCPManager:
         ]
         global_slots.copy_(computed_slots)
         self._global_attn_ready = True
+        self._install_dsa_sparse_broadcast_block_ids()
         slot_mappings = (
             self._convert_slot_mappings(global_slots)
             if self._global_has_prefill
@@ -914,6 +917,29 @@ class HcuPCPManager:
         )
         return local_tables, slot_mappings
 
+    def _install_dsa_sparse_broadcast_block_ids(self) -> None:
+        """Install the global block selection for sparse DSA broadcasts."""
+        try:
+            from vllm_hcu.v1.dsa_cache_layer_split import (
+                clear_active_dsa_broadcast_block_ids,
+                get_runtime_layer_split_state,
+                set_active_dsa_broadcast_block_ids_from_tables,
+            )
+        except Exception:
+            return
+        if get_runtime_layer_split_state() is None or self._global_batch is None:
+            return
+        try:
+            global_tables = self._block_tables.gather_block_tables(
+                self._global_batch.idx_mapping,
+                num_reqs_padded=self._global_batch.num_reqs_after_padding,
+            )
+        except Exception:
+            clear_active_dsa_broadcast_block_ids()
+            return
+        self._cached_global_block_tables = global_tables
+        set_active_dsa_broadcast_block_ids_from_tables(global_tables)
+
     def prepare_global_attn(
         self,
     ) -> tuple[tuple[torch.Tensor, ...], torch.Tensor]:
@@ -923,10 +949,32 @@ class HcuPCPManager:
             raise RuntimeError("PCP global attention slots are not prepared")
         assert self._global_batch is not None
         assert self._global_slot_mappings is not None
-        block_tables = self._block_tables.gather_block_tables(
-            self._global_batch.idx_mapping,
-            num_reqs_padded=self._global_batch.num_reqs_after_padding,
-        )
+        block_tables = self._cached_global_block_tables
+        if block_tables is None:
+            try:
+                block_tables = self._block_tables.gather_block_tables(
+                    self._global_batch.idx_mapping,
+                    num_reqs_padded=self._global_batch.num_reqs_after_padding,
+                )
+            except Exception:
+                try:
+                    from vllm_hcu.v1.dsa_cache_layer_split import (
+                        clear_active_dsa_broadcast_block_ids,
+                    )
+
+                    clear_active_dsa_broadcast_block_ids()
+                finally:
+                    raise
+        try:
+            from vllm_hcu.v1.dsa_cache_layer_split import (
+                set_active_dsa_broadcast_block_ids_from_tables,
+                get_runtime_layer_split_state,
+            )
+
+            if get_runtime_layer_split_state() is not None:
+                set_active_dsa_broadcast_block_ids_from_tables(block_tables)
+        except Exception:
+            pass
         global_slots = self._global_slot_mappings[
             :, : self._global_batch.num_tokens
         ]

@@ -36,6 +36,7 @@ import os as _vllm_hcu_os
 from pathlib import Path as _VllmHcuPath
 from packaging.version import Version as _VllmHcuVersion
 import vllm as _vllm_hcu_target
+import vllm_hcu as _vllm_hcu_plugin
 from vllm_hcu.version import __vllm_target_version__ as _vllm_hcu_target_version
 _vllm_hcu_root = _VllmHcuPath(
     _vllm_hcu_os.environ["VLLM_SOURCE_ROOT"]
@@ -54,6 +55,9 @@ assert _VllmHcuVersion(_vllm_hcu_target_version).release[:3] == (
     _vllm_hcu_expected_release
 ), (_vllm_hcu_target_version, _vllm_hcu_expected_release)
 assert "VLLM_V0251_SOURCE_ROOT" not in _vllm_hcu_os.environ
+assert _VllmHcuPath(_vllm_hcu_plugin.__file__).resolve().is_relative_to(
+    _VllmHcuPath(_vllm_hcu_os.environ["HCU_TEST_PLUGIN_ROOT"]).resolve()
+), "worker test imported an installed plugin instead of the checkout"
 '''
 
 
@@ -63,7 +67,8 @@ def _run_fresh(code: str, *, timeout: int = 120) -> subprocess.CompletedProcess[
     env.pop("VLLM_V0251_SOURCE_ROOT", None)
     env["VLLM_SOURCE_ROOT"] = str(TARGET_VLLM_ROOT)
     env["VLLM_TARGET_RELEASE"] = ".".join(map(str, TARGET_RELEASE))
-    env["PYTHONPATH"] = os.pathsep.join((str(TARGET_VLLM_ROOT), str(REPO)))
+    env["HCU_TEST_PLUGIN_ROOT"] = str(REPO)
+    env["PYTHONPATH"] = os.pathsep.join((str(REPO), str(TARGET_VLLM_ROOT)))
     return subprocess.run(
         [sys.executable, "-c", _TARGET_SOURCE_ASSERTION + code],
         check=False,
@@ -115,6 +120,10 @@ def test_worker_inventory_is_complete_explicit_and_dependency_ordered():
         ),
     )
     assert callbacks
+    assert (
+        "worker.core_fix.kimi_k25.vision_conv",
+        "vllm.model_executor.models.kimi_k25_vit",
+    ) in callbacks
     assert len({patch_id for patch_id, _ in callbacks}) == len(callbacks)
 
     positions = {patch_id: index for index, (patch_id, _) in enumerate(callbacks)}
@@ -144,10 +153,21 @@ def test_worker_inventory_is_complete_explicit_and_dependency_ordered():
         "worker.framework_opt.dbo.deep_gemm_sms_capability",
         "worker.framework_opt.dbo.ubatch_metadata",
         "worker.framework_opt.communicator.deep_ep_runtime",
+        "worker.framework_opt.step5_eplb_communicator",
+        "worker.framework_opt.step5_eplb_transfer",
+        "worker.framework_opt.step5_eplb_async_worker",
+        "worker.framework_opt.step5_eplb_state",
+        "worker.framework_opt.model_loader.static_eplb_preload",
+        "worker.framework_opt.model_loader.static_expert_mapping",
+        "worker.framework_opt.eplb.offline_expert_map",
+        "worker.framework_opt.eplb.gloo_profile_reservation",
     )
     assert tuple(positions[name] for name in framework_order) == tuple(
         sorted(positions[name] for name in framework_order)
     )
+    assert positions["worker.framework_opt.step5_eplb_state"] < positions[
+        "worker.framework_opt.eplb.offline_expert_map"
+    ]
 
     callback_specs = {
         spec.adapter
@@ -163,12 +183,12 @@ def test_worker_inventory_is_complete_explicit_and_dependency_ordered():
     }
     inventoried_adapters = callback_specs | replacement_specs
     adapter_files = {
-        ".".join(path.with_suffix("").parts)
+        ".".join(path.relative_to(REPO).with_suffix("").parts)
         for root in (
-            Path("vllm_hcu/patch/worker/core_fix"),
-            Path("vllm_hcu/patch/worker/op_opt"),
-            Path("vllm_hcu/patch/worker/op_opt/moe"),
-            Path("vllm_hcu/patch/worker/framework_opt"),
+            REPO / "vllm_hcu/patch/worker/core_fix",
+            REPO / "vllm_hcu/patch/worker/op_opt",
+            REPO / "vllm_hcu/patch/worker/op_opt/moe",
+            REPO / "vllm_hcu/patch/worker/framework_opt",
         )
         for path in root.glob("patch_*.py")
     }
@@ -188,6 +208,54 @@ def test_pcp_model_state_dispatcher_inventory_is_always_enabled():
         "vllm.v1.worker.gpu.model_states.default",
     ) in worker_dispatcher.worker_callback_names()
     assert worker_dispatcher._patch_features()[patch_id] == "always"
+
+
+def test_offline_eplb_and_eplb_control_features_are_independent():
+    offline_patch_ids = (
+        "worker.framework_opt.model_loader.static_eplb_preload",
+        "worker.framework_opt.model_loader.static_expert_mapping",
+        "worker.framework_opt.eplb.gloo_profile_reservation",
+    )
+    lifecycle_patch_id = "worker.framework_opt.eplb.offline_expert_map"
+    features = worker_dispatcher._patch_features()
+    assert all(
+        features[patch_id] == "offline_eplb"
+        for patch_id in offline_patch_ids
+    )
+    assert features[lifecycle_patch_id] == "eplb_control"
+
+    disabled = worker_dispatcher._feature_states(
+        None, worker_dispatcher.HcuFeatureConfig()
+    )
+    static = worker_dispatcher._feature_states(
+        None,
+        worker_dispatcher.HcuFeatureConfig(expert_map_path="/tmp/map.json"),
+    )
+    record = worker_dispatcher._feature_states(
+        None,
+        worker_dispatcher.HcuFeatureConfig(
+            expert_map_record_path="/tmp/record.json"
+        ),
+    )
+    standalone_disable = worker_dispatcher._feature_states(
+        None,
+        worker_dispatcher.HcuFeatureConfig(eplb_disable_rearrange=True),
+    )
+    assert disabled["offline_eplb"] is False
+    assert disabled["eplb_control"] is False
+    assert static["offline_eplb"] is True
+    assert static["eplb_control"] is True
+    assert record["offline_eplb"] is True
+    assert record["eplb_control"] is True
+    assert standalone_disable["offline_eplb"] is False
+    assert standalone_disable["eplb_control"] is True
+
+
+def test_gpu_dp_sync_is_not_in_worker_callback_inventory() -> None:
+    assert "worker.framework_opt.dp.gpu_deepep_low_latency" not in {
+        patch_id
+        for patch_id, _target in worker_dispatcher.worker_callback_names()
+    }
 
 
 def test_cold_replacement_metadata_matches_lazy_adapter_contracts():
@@ -266,7 +334,12 @@ def test_prepare_is_lazy_narrow_idempotent_and_keeps_main_role():
         "'vllm_hcu.model_executor.layers.fused_moe.aiter_ops'}; "
         "initial_targets=sorted(targets & sys.modules.keys()); "
         "assert initial_targets==["
-        "'vllm.distributed.device_communicators.base_device_communicator']; "
+        "'vllm.distributed.device_communicators.base_device_communicator',"
+        "'vllm.forward_context',"
+        "'vllm.utils.deep_gemm',"
+        "'vllm.v1.attention.backend',"
+        "'vllm.v1.worker.dp_utils',"
+        "'vllm.v1.worker.ubatch_utils'], initial_targets; "
         "assert not (business & sys.modules.keys()); "
         "first=prepare_worker_patches(); second=prepare_worker_patches(); "
         "print(json.dumps({'first':len(first),'second':len(second),"
@@ -284,18 +357,17 @@ def test_prepare_is_lazy_narrow_idempotent_and_keeps_main_role():
     )
     assert result.returncode == 0, result.stdout + result.stderr
     payload = json.loads(result.stdout.strip().splitlines()[-1])
+    # Target builds may preload different upstream modules. Preparation must
+    # add no target/business imports to that observed baseline.
+    initial_targets = payload["initial_targets_loaded"]
     assert payload == {
         "first": expected_total,
         "second": expected_total,
         "replacements": expected_replacements,
         "callbacks": expected_callbacks,
         "statuses": ["applied", "armed"],
-        "initial_targets_loaded": [
-            "vllm.distributed.device_communicators.base_device_communicator"
-        ],
-        "targets_loaded": [
-            "vllm.distributed.device_communicators.base_device_communicator"
-        ],
+        "initial_targets_loaded": initial_targets,
+        "targets_loaded": initial_targets,
         "business_loaded": [],
         "runner_loaded": False,
         "shared_loaded": False,

@@ -20,12 +20,36 @@ _FEATURE_FIELDS = (
     "enable_lightly_cplb",
     "enable_custom_sp",
     "enable_multi_layers_mtp",
+    "enable_dsa_cache_layer_split",
     "deepep_auto",
     "fused_qwen3_rms_rope",
+    "qwen4_exp_hc_sp",
+    "k3_sp_moe",
+    "glm53_kda_cp_head_shard",
+    "glm53_pcp_mtp_sync",
+    "dp_int8_allgather",
     "moe_backend",
     "hcu_flash_attn_mode",
+    "hcu_gdn_prefill_backend",
+    "expert_map_path",
+    "expert_map_record_path",
+    "eplb_disable_rearrange",
+    "eplb_static_dispatch_policy",
 )
-_BOOLEAN_FIELDS = _FEATURE_FIELDS[:6]
+# Enumerate booleans explicitly so inserting a feature field cannot silently
+# drop qwen4_exp_hc_sp, enable_dsa_cache_layer_split, or dp_int8_allgather.
+_BOOLEAN_FIELDS = (
+    "enable_lightly_cp",
+    "enable_lightly_cplb",
+    "enable_custom_sp",
+    "enable_multi_layers_mtp",
+    "enable_dsa_cache_layer_split",
+    "deepep_auto",
+    "fused_qwen3_rms_rope",
+    "qwen4_exp_hc_sp",
+    "k3_sp_moe",
+    "dp_int8_allgather",
+)
 _SUPPORTED_MOE_BACKENDS = frozenset({"auto", "deep_gemm"})
 _LEGACY_DEEP_GEMM_BACKEND = "dpsk_deep_gemm"
 _DEEP_GEMM_BACKEND = "deep_gemm"
@@ -33,6 +57,17 @@ _legacy_backend_warning_emitted = False
 _legacy_backend_warning_lock = threading.Lock()
 _SUPPORTED_FLASH_ATTN_MODES = frozenset(
     {"classic", "cutlass", "varlen"}
+)
+# HCU-only --gdn-prefill-backend values. vLLM itself only sees "triton".
+HCU_GDN_PREFILL_BACKENDS = ("hcu-boltops", "hcu-aiter")
+_SUPPORTED_EPLB_STATIC_DISPATCH_POLICIES = frozenset(
+    {"nearest", "locality_fair", "token_hash"}
+)
+_EPLB_SIDECAR_FIELDS = (
+    "expert_map_path",
+    "expert_map_record_path",
+    "eplb_disable_rearrange",
+    "eplb_static_dispatch_policy",
 )
 
 
@@ -67,15 +102,48 @@ class HcuFeatureConfig:
     enable_lightly_cplb: bool = False
     enable_custom_sp: bool = False
     enable_multi_layers_mtp: bool = False
+    enable_dsa_cache_layer_split: bool = False
     deepep_auto: bool = False
     # Effective (master AND child) runtime policy persisted for compilation
     # cache partitioning. Platform validation refreshes it from the process
     # environment before vLLM computes its config hash.
     fused_qwen3_rms_rope: bool = True
+    # Qwen4Exp HC sequence parallelism (VLLM_HCU_QWEN4_EXP_HC_SP), resolved
+    # the same way: it changes the traced graph, so it must partition caches.
+    qwen4_exp_hc_sp: bool = True
+    # Effective opt-in policy for Kimi-K3 SP-MoE row sharding
+    # (VLLM_HCU_K3_SP_MOE). Persisted because the SP forward mutates the
+    # traced decoder layer (o_proj reduce_results plus the hcu_k3_sp_*
+    # collectives): opposite-mode restarts sharing a persistent compilation
+    # cache would load the other mode's no-guard AOT graph.
+    k3_sp_moe: bool = False
+    # None means unresolved at the EngineArgs boundary. Platform validation
+    # freezes the effective CP-head mode to bool before compilation hashing;
+    # workers consume that serialized value instead of their local environment.
+    glm53_kda_cp_head_shard: bool | None = None
+    # Freeze PCP MTP collective participation in the engine. A worker-local
+    # environment switch must not change the group's collective sequence.
+    glm53_pcp_mtp_sync: bool | None = None
+    # Effective opt-in policy for INT8 hidden-state transport in the naive
+    # DP/EP AllGatherv dispatch path. Persisted because spawned workers do not
+    # inherit arbitrary VLLM_HCU_* variables from the API process.
+    dp_int8_allgather: bool = False
     moe_backend: str = "auto"
     hcu_flash_attn_mode: str | None = None
+    # HCU provider requested through --gdn-prefill-backend (hcu-boltops or
+    # hcu-aiter). None means the official value decides; see
+    # vllm_hcu.patch.worker.op_opt._gdn_backend.
+    hcu_gdn_prefill_backend: str | None = None
+    expert_map_path: str | None = None
+    expert_map_record_path: str | None = None
+    eplb_disable_rearrange: bool = False
+    eplb_static_dispatch_policy: str = "nearest"
 
     def __post_init__(self) -> None:
+        for name in ("glm53_kda_cp_head_shard", "glm53_pcp_mtp_sync"):
+            value = getattr(self, name)
+            if value is not None and not isinstance(value, bool):
+                raise TypeError(f"HCU config field {name!r} must be bool or None")
         for name in _BOOLEAN_FIELDS:
             value = getattr(self, name)
             if not isinstance(value, bool):
@@ -108,8 +176,52 @@ class HcuFeatureConfig:
                     "unsupported HCU hcu_flash_attn_mode "
                     f"{self.hcu_flash_attn_mode!r}; expected one of {supported}"
                 )
+        if (
+            self.hcu_gdn_prefill_backend is not None
+            and self.hcu_gdn_prefill_backend not in HCU_GDN_PREFILL_BACKENDS
+        ):
+            supported = ", ".join(HCU_GDN_PREFILL_BACKENDS)
+            raise ValueError(
+                "unsupported HCU hcu_gdn_prefill_backend "
+                f"{self.hcu_gdn_prefill_backend!r}; expected one of {supported}"
+            )
         if self.enable_lightly_cplb and not self.enable_lightly_cp:
             raise ValueError("enable_lightly_cplb requires enable_lightly_cp")
+        for name in ("expert_map_path", "expert_map_record_path"):
+            value = getattr(self, name)
+            if value is not None and not isinstance(value, str):
+                raise TypeError(
+                    f"HCU config field {name!r} must be str or None, "
+                    f"got {type(value).__name__}"
+                )
+            if isinstance(value, str) and not value.strip():
+                raise ValueError(f"HCU config field {name!r} must not be empty")
+        if (
+            self.expert_map_path is not None
+            and self.expert_map_record_path is not None
+        ):
+            raise ValueError(
+                "expert_map_path and expert_map_record_path are mutually exclusive"
+            )
+        if not isinstance(self.eplb_disable_rearrange, bool):
+            raise TypeError(
+                "HCU config field 'eplb_disable_rearrange' must be bool, "
+                f"got {type(self.eplb_disable_rearrange).__name__}"
+            )
+        if not isinstance(self.eplb_static_dispatch_policy, str):
+            raise TypeError(
+                "HCU config field 'eplb_static_dispatch_policy' must be str, "
+                f"got {type(self.eplb_static_dispatch_policy).__name__}"
+            )
+        if (
+            self.eplb_static_dispatch_policy
+            not in _SUPPORTED_EPLB_STATIC_DISPATCH_POLICIES
+        ):
+            supported = ", ".join(sorted(_SUPPORTED_EPLB_STATIC_DISPATCH_POLICIES))
+            raise ValueError(
+                "unsupported HCU eplb_static_dispatch_policy "
+                f"{self.eplb_static_dispatch_policy!r}; expected one of {supported}"
+            )
 
     @classmethod
     def from_mapping(cls, values: Mapping[str, Any] | None) -> "HcuFeatureConfig":
@@ -266,6 +378,31 @@ def set_hcu_config(
     return normalized
 
 
+def bind_hcu_eplb_config(vllm_config: object) -> None:
+    """Restore offline-EPLB sidecar fields on ``parallel_config``.
+
+    ``ParallelConfig`` cannot own plugin-specific schema fields, so consumers
+    read private runtime attributes populated from the serialized HCU sidecar.
+    Mapping forms are supported for config reconstruction in spawned workers.
+    """
+
+    if isinstance(vllm_config, Mapping):
+        parallel_config = vllm_config.get("parallel_config")
+    else:
+        parallel_config = getattr(vllm_config, "parallel_config", None)
+    if parallel_config is None:
+        return
+
+    feature_config = get_hcu_config(vllm_config)
+    for name in _EPLB_SIDECAR_FIELDS:
+        attribute = f"_vllm_hcu_{name}"
+        value = getattr(feature_config, name)
+        if isinstance(parallel_config, MutableMapping):
+            parallel_config[attribute] = value
+        else:
+            setattr(parallel_config, attribute, value)
+
+
 def pop_hcu_feature_kwargs(
     kwargs: MutableMapping[str, Any],
     *,
@@ -273,7 +410,7 @@ def pop_hcu_feature_kwargs(
 ) -> HcuFeatureConfig:
     """Extract legacy HCU keyword arguments before constructing VllmConfig.
 
-    Only the five owned fields are removed.  This helper is intentionally
+    Only HCU-owned fields are removed.  This helper is intentionally
     independent of vLLM's constructor and can be used by CLI and Python-entry
     wrappers without adding fields to upstream classes.
     """
@@ -292,6 +429,7 @@ def pop_hcu_feature_kwargs(
 
 __all__ = [
     "HcuFeatureConfig",
+    "bind_hcu_eplb_config",
     "get_hcu_config",
     "normalize_hcu_moe_backend",
     "pop_hcu_feature_kwargs",

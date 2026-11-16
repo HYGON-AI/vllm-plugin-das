@@ -6,15 +6,20 @@ from __future__ import annotations
 
 import functools
 import inspect
+import logging
 import os
 from types import ModuleType
 from typing import Any
 
-from vllm_hcu.deepseek_v4_runtime import is_deepseek_v4, is_dspark_enabled
+from vllm_hcu.deepseek_v4_runtime import (
+    is_deepseek_v4, is_dspark_enabled, model_architectures,
+)
 from vllm_hcu.patch.config import HcuFeatureConfig, get_hcu_config, set_hcu_config
 
 from ._common import PatchCompatibilityError, apply_once, load_exact_module
 from .patch_compilation_config import bind_hcu_config
+
+_LOGGER = logging.getLogger(__name__)
 
 TARGET_MODULE = "vllm.config.vllm"
 PATCH_ID = "platform.core_fix.hcu_config.vllm"
@@ -28,7 +33,6 @@ TARGETS = (
     f"{TARGET_MODULE}.VllmConfig._maybe_enable_breakable_cudagraph",
 )
 _MARKER = "_vllm_hcu_feature_config_patch_applied"
-_GLM_DSA_ARCHITECTURE = "GlmMoeDsaForCausalLM"
 _HCU_BREAKABLE_CUDAGRAPH_ARCHITECTURES = frozenset(
     {
         "HYV4ForCausalLM",
@@ -53,36 +57,33 @@ _REQUEST_CAPTURE_SIZES = (
 )
 
 
-def _normalize_hcu_model_runner(model_config: object) -> None:
-    """Keep HCU-supported GLM DSA on the plugin's MRV2-only worker."""
-    architectures = getattr(model_config, "architectures", ()) or ()
-    if (
-        _GLM_DSA_ARCHITECTURE in architectures
-        and "VLLM_USE_V2_MODEL_RUNNER" not in os.environ
-    ):
-        os.environ["VLLM_USE_V2_MODEL_RUNNER"] = "1"
-
-
 def _normalize_dspark_draft_deepep_topology(
     vllm_config: object,
     feature_config: HcuFeatureConfig,
 ) -> HcuFeatureConfig:
-    """Reuse the target's DeepEP topology for DeepSeek-V4 DSpark layers.
+    """Reuse the target's distributed-MoE topology for DSpark layers.
 
     Official DSpark constructs a draft ``VllmConfig`` with
     ``SpeculativeConfig.draft_parallel_config`` while retaining the target's
     ``additional_config`` object.  Its generic draft config intentionally drops
     DP and EP, but the DeepSeek-V4 DSpark head contains three real MoE decoder
-    layers.  Those layers must use the same EP group and DeepEP kernels as the
-    target; otherwise they enter naive dispatch against a DeepEP manager, whose
-    pre-routing interface is intentionally unsupported.
+    layers.  Those layers must use the same DP/EP group for DeepEP or MegaMoE;
+    otherwise DeepEP enters unsupported naive dispatch, while MegaMoE fails its
+    required EP8 topology validation.
 
     Object identity distinguishes this internal clone from the target config.
     Reusing the target config is safe only when both tensor-parallel sizes are
     equal, which is also the only topology validated here.
     """
 
-    if not feature_config.deepep_auto or not is_deepseek_v4(vllm_config):
+    kernel_config = getattr(vllm_config, "kernel_config", None)
+    uses_megamoe = (
+        getattr(kernel_config, "moe_backend", None) == "deep_gemm_mega_moe"
+    )
+    if (
+        not (feature_config.deepep_auto or uses_megamoe)
+        or not is_deepseek_v4(vllm_config)
+    ):
         return feature_config
     speculative_config = getattr(vllm_config, "speculative_config", None)
     if getattr(speculative_config, "method", None) != "dspark":
@@ -101,14 +102,14 @@ def _normalize_dspark_draft_deepep_topology(
         return feature_config
     if target_parallel_config is None:
         raise PatchCompatibilityError(
-            "DeepSeek-V4 DSpark deepep_auto requires "
+            "DeepSeek-V4 DSpark distributed MoE requires "
             "SpeculativeConfig.target_parallel_config"
         )
     draft_tp = int(getattr(draft_parallel_config, "tensor_parallel_size", 1))
     target_tp = int(getattr(target_parallel_config, "tensor_parallel_size", 1))
     if draft_tp != target_tp:
         raise ValueError(
-            "DeepSeek-V4 DSpark deepep_auto requires draft and target tensor "
+            "DeepSeek-V4 DSpark distributed MoE requires draft and target tensor "
             f"parallel sizes to match; got draft_tp={draft_tp}, "
             f"target_tp={target_tp}"
         )
@@ -236,11 +237,21 @@ def _require_hy4_pcp8_contract(vllm_config: object) -> None:
         raise ValueError(
             "HY V4 PCP8 requires the FLASHMLA_SPARSE attention backend."
         )
-    if os.environ.get(
-        "VLLM_HCU_ENABLE_LINEAR_GATE_PCP_SHARD", "0"
-    ).strip().lower() not in ("1", "true", "yes", "on"):
+    from vllm_hcu.platforms import envs as hcu_envs
+
+    gate_shard_enabled = hcu_envs.linear_gate_pcp_shard_enabled(
+        tp_size=int(parallel_config.tensor_parallel_size),
+        pcp_size=int(parallel_config.prefill_context_parallel_size),
+        pp_size=int(parallel_config.pipeline_parallel_size),
+    )
+    if not gate_shard_enabled:
+        if not hcu_envs.custom_ops_enabled():
+            raise ValueError(
+                "HY V4 PCP8 requires effective linear_gate PCP sharding, "
+                "but VLLM_HCU_USE_CUSTOM_OPS=0 disables it."
+            )
         raise ValueError(
-            "HY V4 PCP8 requires "
+            "HY V4 PCP8 requires effective linear_gate PCP sharding; set "
             "VLLM_HCU_ENABLE_LINEAR_GATE_PCP_SHARD=1 to avoid replicated "
             "linear_gate weights exhausting KV-cache memory."
         )
@@ -266,15 +277,11 @@ def _is_glm53_mtp_pcp(vllm_config: object) -> bool:
 
 
 def _require_glm53_pcp_contract(vllm_config: object) -> None:
+    from vllm_hcu.v1.glm53_kda_cp_config import validate_glm53_pcp_topology
+
     model = vllm_config.model_config
     parallel = vllm_config.parallel_config
-    topology = (
-        parallel.tensor_parallel_size,
-        parallel.prefill_context_parallel_size,
-        parallel.pipeline_parallel_size,
-    )
-    if topology != (1, 8, 1):
-        raise ValueError("GLM-5.3 PCP baseline requires TP1/PCP8/PP1.")
+    validate_glm53_pcp_topology(vllm_config)
     mm = getattr(model, "multimodal_config", None)
     if model.is_multimodal_model and not getattr(mm, "language_model_only", False):
         raise ValueError("GLM-5.3 PCP baseline requires --language-model-only.")
@@ -287,15 +294,11 @@ def _require_glm53_pcp_contract(vllm_config: object) -> None:
 
 
 def _require_glm53_mtp_pcp_contract(vllm_config: object) -> None:
+    from vllm_hcu.v1.glm53_kda_cp_config import validate_glm53_pcp_topology
+
     model = vllm_config.model_config
     parallel = vllm_config.parallel_config
-    topology = (
-        parallel.tensor_parallel_size,
-        parallel.prefill_context_parallel_size,
-        parallel.pipeline_parallel_size,
-    )
-    if topology != (1, 8, 1):
-        raise ValueError("GLM-5.3 MTP PCP requires TP1/PCP8/PP1.")
+    validate_glm53_pcp_topology(vllm_config)
     if not model.use_mla:
         raise ValueError("GLM-5.3 MTP PCP requires the built-in MLA draft layer.")
     if getattr(parallel, "enable_eplb", False):
@@ -326,19 +329,36 @@ def _require_mrv2_pcp_contract(vllm_config: object) -> None:
     use_mla = bool(
         _require_hcu_pcp_attribute(model_config, "use_mla", "ModelConfig")
     )
+    from vllm_hcu.v1.dsa_cache_layer_split import is_hcu_dsa_mla_model
+
+    is_dsa_mla = is_hcu_dsa_mla_model(model_config)
     is_glm52 = architectures == ["GlmMoeDsaForCausalLM"]
     is_hy4 = architectures == ["HYV4ForCausalLM"]
+    is_dsv4 = architectures in (
+        ["DeepseekV4ForCausalLM"], ["DeepSeekV4MTPModel"]
+    )
     is_glm53 = is_glm53_pcp(vllm_config)
     is_glm53_mtp = _is_glm53_mtp_pcp(vllm_config)
+    # Arithmetic admission is relaxed for GLM5Next, not every runtime path.
+    # Keep graph capture and combined DP/PCP dispatch behind their own guards.
+    relaxed_glm53_topology = is_glm53 or is_glm53_mtp
     if is_glm53:
         _require_glm53_pcp_contract(vllm_config)
     if is_glm53_mtp:
         _require_glm53_mtp_pcp_contract(vllm_config)
-    if use_mla and not (is_glm52 or is_hy4 or is_glm53 or is_glm53_mtp):
+    if use_mla and not (
+        is_dsa_mla or is_glm52 or is_hy4 or is_glm53 or is_glm53_mtp or is_dsv4
+    ):
         raise ValueError(
-            "GLM-5.2 and HY V4 MLA PCP only support "
-            "GlmMoeDsaForCausalLM or HYV4ForCausalLM."
+            "HCU MLA PCP only supports a registered DSA MLA family, "
+            "GlmMoeDsaForCausalLM, HYV4ForCausalLM, DeepseekV4ForCausalLM, "
+            "DeepSeekV4MTPModel, or the GLM-5.3 PCP contract."
         )
+    if is_dsv4:
+        if not use_mla:
+            raise ValueError("DeepSeek V4 PCP requires sparse MLA.")
+        if getattr(parallel_config, "cp_kv_cache_interleave_size", 1) != 1:
+            raise ValueError("DeepSeek V4 PCP requires Full KV without interleaving.")
     if is_glm52 and not use_mla:
         raise ValueError("GLM-5.2 PCP requires MLA or sparse MLA.")
     if is_hy4 and not use_mla:
@@ -369,14 +389,14 @@ def _require_mrv2_pcp_contract(vllm_config: object) -> None:
         _require_hy4_pcp8_contract(vllm_config)
     if _require_hcu_pcp_attribute(
         parallel_config, "pipeline_parallel_size", "ParallelConfig"
-    ) != 1 and hy4_topology != (1, 4, 2):
+    ) != 1 and hy4_topology != (1, 4, 2) and not relaxed_glm53_topology:
         raise ValueError("HCU PCP does not support pipeline parallelism.")
     dcp_size = int(
         _require_hcu_pcp_attribute(
             parallel_config, "decode_context_parallel_size", "ParallelConfig"
         )
     )
-    if use_mla and dcp_size != 1:
+    if use_mla and dcp_size != 1 and not relaxed_glm53_topology:
         raise ValueError("GLM-5.2 PCP does not support decode context parallelism.")
     if not use_mla and dcp_size != 1:
         raise ValueError(
@@ -384,16 +404,37 @@ def _require_mrv2_pcp_contract(vllm_config: object) -> None:
         )
     if _require_hcu_pcp_attribute(
         parallel_config, "data_parallel_size", "ParallelConfig"
-    ) != 1:
+    ) != 1 and not relaxed_glm53_topology:
         raise ValueError("HCU PCP does not support data parallelism.")
-    if use_mla and not _require_hcu_pcp_attribute(
+    if relaxed_glm53_topology and _require_hcu_pcp_attribute(
+        parallel_config, "data_parallel_size", "ParallelConfig"
+    ) > 1 and not _require_hcu_pcp_attribute(
+        parallel_config, "enable_expert_parallel", "ParallelConfig"
+    ):
+        # PCP gathers expand token rows before MoE dispatch. Without EP, the
+        # native DP split sizes still describe the pre-gather local rows.
+        raise ValueError(
+            "GLM-5.3 DP+PCP without expert parallelism is not supported; "
+            "enable expert parallelism or use DP1."
+        )
+    if use_mla and not relaxed_glm53_topology and not _require_hcu_pcp_attribute(
         parallel_config, "enable_expert_parallel", "ParallelConfig"
     ):
         raise ValueError("GLM-5.2 PCP requires expert parallelism.")
-    if use_mla and not _require_hcu_pcp_attribute(
+    if use_mla and not relaxed_glm53_topology and not _require_hcu_pcp_attribute(
         model_config, "enforce_eager", "ModelConfig"
     ):
         raise ValueError("GLM-5.2 PCP requires eager execution without graphs.")
+    if relaxed_glm53_topology and not _require_hcu_pcp_attribute(
+        model_config, "enforce_eager", "ModelConfig"
+    ):
+        # Breakable graph capture uses local dummy rows, while real PCP
+        # prefill supplies global KDA metadata. CompilationMode.NONE alone
+        # does not disable that PIECEWISE capture/replay path.
+        raise ValueError(
+            "GLM-5.3 PCP requires eager execution without graphs; "
+            "use --enforce-eager until PCP graph capture/replay is adapted."
+        )
     speculative_config = _require_hcu_pcp_attribute(
         vllm_config, "speculative_config", "VllmConfig"
     )
@@ -432,10 +473,26 @@ def _require_mrv2_pcp_contract(vllm_config: object) -> None:
     kv_transfer_config = _require_hcu_pcp_attribute(
         vllm_config, "kv_transfer_config", "VllmConfig"
     )
-    if kv_transfer_config is not None and _require_hcu_pcp_attribute(
-        kv_transfer_config, "kv_connector", "KVTransferConfig"
-    ) is not None:
-        raise ValueError("HCU PCP does not support P/D disaggregation.")
+    kv_connector = None
+    if kv_transfer_config is not None:
+        kv_connector = _require_hcu_pcp_attribute(
+            kv_transfer_config, "kv_connector", "KVTransferConfig"
+        )
+    if kv_transfer_config is not None and (
+        is_hy4 or is_dsa_mla or kv_connector is not None
+    ):
+        if not (
+            is_dsa_mla
+            and kv_connector == "MooncakeConnector"
+            and getattr(kv_transfer_config, "kv_role", None) == "kv_producer"
+            and getattr(kv_transfer_config, "kv_connector_module_path", None)
+            is None
+        ):
+            raise ValueError(
+                "HCU PCP P/D disaggregation requires a supported DSA MLA "
+                "producer with the registered MooncakeConnector, "
+                "kv_role='kv_producer', and no custom connector module."
+            )
 
     feature_config = get_hcu_config(vllm_config)
     if feature_config.enable_lightly_cp:
@@ -462,6 +519,35 @@ def _validate_hcu_pcp_scope(vllm_config: object) -> bool:
     return True
 
 
+def _resolve_qwen4_exp_hc_sp(vllm_config: object, requested: bool) -> bool:
+    """Fall back to the replicated HC layout where HC SP is unsupported.
+
+    LoRA's per-token adapter metadata covers the full batch, not the local HC
+    SP shard, and the compiler sequence-parallel pass rewrites the same TP
+    reduction boundaries. HC SP is on by default, so fall back instead of
+    rejecting the configuration.
+    """
+    if not requested:
+        return False
+    blockers = []
+    if getattr(vllm_config, "lora_config", None) is not None:
+        blockers.append("LoRA")
+    compilation_config = getattr(vllm_config, "compilation_config", None)
+    pass_config = getattr(compilation_config, "pass_config", None)
+    if getattr(pass_config, "enable_sp", False):
+        blockers.append("compilation pass_config.enable_sp")
+    if not blockers:
+        return True
+    parallel_config = getattr(vllm_config, "parallel_config", None)
+    if getattr(parallel_config, "use_sequence_parallel_moe", False):
+        _LOGGER.warning(
+            "Qwen4Exp HC sequence parallelism is incompatible with %s; "
+            "using the replicated HC layout",
+            " and ".join(blockers),
+        )
+    return False
+
+
 def _validate_dspark_pd_scope(vllm_config: object) -> None:
     """Allow only the validated DeepSeek-V4 Mooncake DSpark P/D path."""
 
@@ -471,6 +557,15 @@ def _validate_dspark_pd_scope(vllm_config: object) -> None:
         return
 
     if connector == "MooncakeConnector" and is_deepseek_v4(vllm_config):
+        return
+    # DecodeBenchConnector is an OFFLINE decode-bench connector: it only fills
+    # the local KV cache with synthetic values and never talks to a P/D peer,
+    # so it cannot break the validated disaggregation path. Opt-in via env to
+    # keep bench workflows reproducible outside the Mooncake setup.
+    if (
+        connector == "DecodeBenchConnector"
+        and os.environ.get("VLLM_HCU_DSPARK_ALLOW_DECODE_BENCH", "0") == "1"
+    ):
         return
     architectures = getattr(
         getattr(vllm_config, "model_config", None), "architectures", ()
@@ -482,33 +577,121 @@ def _validate_dspark_pd_scope(vllm_config: object) -> None:
     )
 
 
+def normalize_glm53_feature_scope(
+    vllm_config: object, feature_config: HcuFeatureConfig,
+) -> HcuFeatureConfig:
+    """Apply the same effective scope to validation and EngineArgs retention.
+
+    Shared launch configs may explicitly request these GLM-only policies for
+    another model or PCP1. They are no-ops there, not lost user requests.
+    Keep None unresolved only when the policy can actually be used.
+    """
+    target_pcp = is_glm53_pcp(vllm_config)
+    spec = getattr(vllm_config, "speculative_config", None)
+    return feature_config.with_updates(
+        glm53_kda_cp_head_shard=(
+            feature_config.glm53_kda_cp_head_shard if target_pcp else False
+        ),
+        glm53_pcp_mtp_sync=(
+            feature_config.glm53_pcp_mtp_sync
+            if target_pcp and getattr(spec, "method", None) == "mtp" else False
+        ),
+    )
+
+
+def _resolve_glm53_pcp_mtp_sync(
+    vllm_config: object, feature_config: HcuFeatureConfig,
+) -> bool:
+    """Resolve collective participation once, then retain the serialized policy."""
+    spec = getattr(vllm_config, "speculative_config", None)
+    if not is_glm53_pcp(vllm_config) or getattr(spec, "method", None) != "mtp":
+        return False
+    enabled = feature_config.glm53_pcp_mtp_sync
+    if enabled is None:
+        value = os.environ.get("VLLM_HCU_GLM53_PCP_MTP_SYNC", "1")
+        if value not in ("0", "1"):
+            raise ValueError("VLLM_HCU_GLM53_PCP_MTP_SYNC must be 0 or 1")
+        enabled = value == "1"
+    from vllm_hcu.v1.glm53_kda_cp_config import validate_glm53_mtp_sync_contract
+
+    # Reject unsupported sampling before engine startup allocates model/KV
+    # memory. Revalidate frozen True policies as well as initial env requests.
+    validate_glm53_mtp_sync_contract(vllm_config, enabled)
+    return enabled
+
+
 def validate_and_update_hcu_config(vllm_config: object) -> HcuFeatureConfig:
     """Validate cross-config invariants and bind the compilation adapter."""
 
-    _normalize_hcu_model_runner(vllm_config.model_config)
-
     _validate_hcu_pcp_scope(vllm_config)
+    from vllm_hcu.v1.dsa_cache_layer_split import validate_dsa_cache_layer_split
+
+    validate_dsa_cache_layer_split(vllm_config)
     from vllm_hcu.models.hy_v4.dcp_config import validate_hy4_dcp_config
 
     validate_hy4_dcp_config(vllm_config)
     _validate_dspark_pd_scope(vllm_config)
     feature_config = get_hcu_config(vllm_config)
+    incoming_feature_config = feature_config
     feature_config = _normalize_dspark_draft_deepep_topology(
         vllm_config, feature_config
     )
+    feature_config = normalize_glm53_feature_scope(vllm_config, feature_config)
     from vllm_hcu.platforms import envs as hcu_envs
+    from vllm_hcu.v1.glm53_kda_cp_config import (
+        glm53_kda_cp_head_shard_enabled,
+    )
 
     updates: dict[str, str | bool] = {
         # The Qwen3 forward wrapper closes over this effective policy. Persist
         # the exact same master-and-child result before VllmConfig.compute_hash
         # so feature-off and feature-on AOT graphs cannot share a cache entry.
         "fused_qwen3_rms_rope": hcu_envs.fused_qwen3_rms_rope_enabled(),
+        "qwen4_exp_hc_sp": _resolve_qwen4_exp_hc_sp(
+            vllm_config, hcu_envs.qwen4_exp_hc_sp_enabled()
+        ),
+        # Kimi-K3 SP row sharding: persist the same master-and-child result
+        # the SP patch enablement honors, so toggling VLLM_HCU_K3_SP_MOE
+        # across restarts cannot load the opposite mode's AOT graph (on mode
+        # rewires o_proj.reduce_results and registers the hcu_k3_sp_* ops).
+        "k3_sp_moe": hcu_envs.k3_sp_moe_enabled(),
+        # This changes KDA parameter/state shapes and adds PCP reductions.
+        # Freeze the effective mode before hashing, including feature-off.
+        # Revalidation of a serialized worker config keeps its frozen value.
+        "glm53_kda_cp_head_shard": (
+            glm53_kda_cp_head_shard_enabled(vllm_config)
+            if is_glm53_pcp(vllm_config) else False
+        ),
+        # Collective participation must be identical on every PCP worker.
+        # Never resolve this policy again from a worker-local environment.
+        "glm53_pcp_mtp_sync": _resolve_glm53_pcp_mtp_sync(
+            vllm_config, feature_config,
+        ),
+        "dp_int8_allgather": hcu_envs.dp_int8_allgather_enabled(),
     }
     if feature_config.hcu_flash_attn_mode is None:
         # Persist the resolved sub-mode before vLLM computes compilation cache
         # hashes. Classic, CUTLASS, and CUSTOM do not share a KV-cache ABI.
         updates["hcu_flash_attn_mode"] = hcu_envs.resolve_hcu_flash_attn_mode(None)
     feature_config = feature_config.with_updates(**updates)
+    glm53_policy_changed = any(
+        getattr(incoming_feature_config, name) is not None
+        and getattr(incoming_feature_config, name) != getattr(feature_config, name)
+        for name in ("glm53_kda_cp_head_shard", "glm53_pcp_mtp_sync")
+    )
+    if glm53_policy_changed or getattr(
+        getattr(vllm_config, "model_config", None), "architectures", None,
+    ) == ["Glm5NextMTPModel"]:
+        # Native with_hf_config()/replace() shares the target's additional_config.
+        # A PCP1/non-MTP/other-model clone can change effective policy too, not
+        # just the built-in draft. Never write a re-scoped frozen policy back
+        # into its source config after the source's mode/hash/shapes are frozen.
+        # Copy the outer mapping only: set_hcu_config replaces the whole HCU
+        # payload, while unrelated values retain their existing identities.
+        # Always isolate MTP clones, including unresolved-policy payloads.
+        additional_config = getattr(vllm_config, "additional_config", None)
+        if additional_config is not None:
+            vllm_config.additional_config = dict(additional_config)
     # Persist every resolved graph policy so it enters vLLM's compilation hash.
     set_hcu_config(vllm_config, feature_config)
 
@@ -559,13 +742,35 @@ def validate_and_update_hcu_config(vllm_config: object) -> HcuFeatureConfig:
                 "HCU deepep_auto must be normalized to the vLLM 0.25 "
                 "deepep_low_latency configuration contract"
             )
-        if getattr(parallel_config, "enable_eplb", False):
+        # Static EPLB loads every physical expert directly from the
+        # checkpoint before either layout is packed and never rearranges.
+        if (
+            getattr(parallel_config, "enable_eplb", False)
+            and feature_config.expert_map_path is None
+        ):
             raise ValueError(
                 "deepep_auto with EPLB is not supported because the HT and "
-                "LL expert weight layouts cannot be rebalanced atomically"
+                "LL expert weight layouts cannot be rebalanced atomically; "
+                "use a static expert_map_path instead"
             )
-        if int(getattr(parallel_config, "data_parallel_size", 1)) <= 1:
-            raise ValueError("HCU deepep_auto requires data_parallel_size > 1.")
+        # Only V4 restores global prefill phase evidence for PCP-only auto.
+        # Its native MTP draft runs against the restored global target batch.
+        # Other PCP models can disagree on HT/LL when a shard has no queries.
+        supports_pcp_only_auto = (
+            int(getattr(parallel_config, "prefill_context_parallel_size", 1)) > 1
+            and not {"DeepseekV4ForCausalLM", "DeepSeekV4MTPModel"}.isdisjoint(
+                model_architectures(vllm_config)
+            )
+        )
+        if (
+            int(getattr(parallel_config, "data_parallel_size", 1)) <= 1
+            and not supports_pcp_only_auto
+        ):
+            raise ValueError(
+                "HCU deepep_auto requires data_parallel_size > 1; "
+                "the PCP-only exception requires DeepSeek V4 or its native "
+                "MTP draft with prefill_context_parallel_size > 1."
+            )
         if not getattr(parallel_config, "enable_expert_parallel", False):
             raise ValueError(
                 "HCU deepep_auto requires enable_expert_parallel=True."

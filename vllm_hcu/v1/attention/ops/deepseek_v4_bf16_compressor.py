@@ -11,7 +11,7 @@ import torch
 from vllm.triton_utils import tl, triton
 
 
-@triton.jit
+@triton.jit(do_not_specialize=["state_cache_ptr", "k_cache_ptr"])
 def _compress_norm_rope_store_bf16_kernel(
     state_cache_ptr,
     state_cache_stride0,

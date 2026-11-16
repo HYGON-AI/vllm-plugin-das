@@ -30,6 +30,12 @@ Install the lightweight test dependency:
 python -m pip install -r requirements-test.txt
 ```
 
+CI installs the pinned runtime and test requirements after creating each
+disposable container. The static gate uses the container user's temporary
+home; hardware jobs install inside their temporary job container. EvalScope
+is installed only when the selected job declares it. CI dependency setup
+does not require rebuilding or updating the image.
+
 Run the standard suites from the repository root:
 
 ```bash
@@ -82,24 +88,25 @@ checks this lock before running tests. Update the lock in the same reviewed
 change as an intentional Runner image or package upgrade; an unreviewed Runner
 drift fails before pytest starts.
 
-The DTK/ROCm entry uses `"match": "release_line"` with `"version": "26.04"`.
-It accepts `26.04`, numeric patch releases, and `-`/`+` build suffixes (for
+The lock accepts Python 3.10.12 or 3.12.12. Its DTK/ROCm entry uses
+`"match": "release_line"` with `"versions": ["26.04", "26.10"]`. It accepts
+numeric patch releases and `-`/`+` build suffixes within either line (for
 example, `26.04.1-72cu-0911`), while rejecting other release lines and malformed
 versions such as `26.040` or `26.04foo`. Reports retain the full observed DTK
 version. Omitting `rocm.match`, or setting it to `exact`, preserves exact
-matching for custom locks; Python, HIP, and distribution checks are unchanged.
+matching for custom locks; HIP and distribution checks are unchanged.
 
 Available manual workflows:
 
 - `HCU full-enabled` accepts a branch, tag, or SHA and runs every job declared
-  in `hcu-test-map.yaml`.
+  in [hcu-test-map.json](../.github/configs/hcu-test-map.json).
 - `HCU release wheel` builds the requested checkout, installs the wheel in an
   isolated virtual environment, verifies the imported package and compiled
   extension originate from that wheel, then runs an OpenAI server smoke and a
   TP4/EP4 smoke.
 - `HCU nightly` accepts an optional ref for manual runs and uses `v0.25.1` for
   scheduled runs. Its matrix is generated from the `nightly_jobs` list in
-  `hcu-test-map.yaml`.
+  [hcu-test-map.json](../.github/configs/hcu-test-map.json).
 
 Nightly failures create or update one GitHub tracking issue and close it after
 recovery. Set the repository variable `HCU_CI_NIGHTLY_OWNER` to a GitHub login
@@ -159,10 +166,21 @@ Logs and reports:
 
 Accuracy gates are asserted from EvalScope JSON reports:
 
-- GSM8K uses `mean_acc`, displayed as `Pass@1`, and must be at least `0.95`.
+- All GSM8K model tests use the first 100 samples without shuffling and require
+  `mean_acc >= 0.95`. Predictions, reviews, and report sample counts must each
+  be exactly 100.
 - Qwen3-VL MMMU smoke uses the `Art` subset and requires `mean_acc >= 0.55`.
-- Qwen3.5 GSM8K disables thinking through chat-template kwargs so EvalScope
-  answer extraction stays deterministic.
+- Qwen3.5 GSM8K disables thinking through chat-template kwargs.
+
+CI model cases wait for their configured free GPU memory before the first model
+is created; evaluation servers wait before launch. The default is up to 600
+seconds per case, checking every 15 seconds. Configure
+HCU_CI_GPU_MEMORY_WAIT_TIMEOUT_S (0 disables waiting) and
+HCU_CI_GPU_MEMORY_POLL_INTERVAL_S to override these values. Missing explicit
+server utilization uses the installed vLLM default. Waiting does not reserve
+devices; a timeout remains a visible resource failure, and runtime OOM still
+fails the test. Each case keeps its original model-startup timeout in addition
+to the waiting allowance.
 
 ## Model configuration files
 

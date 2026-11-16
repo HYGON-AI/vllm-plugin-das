@@ -35,7 +35,6 @@ def apply_to_module(module: ModuleType) -> bool:
     helper_contracts = {
         "transfer_id_from_req": ("req_id", "kv_params"),
         "log_ttft_event": ("event",),
-        "_get_tp_ratio": ("local_tp_size", "remote_tp_size"),
         "_expand_transfer_regions": (
             "base_addrs",
             "block_lens",

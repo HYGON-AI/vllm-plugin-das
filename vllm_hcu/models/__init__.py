@@ -27,10 +27,7 @@ def register_model():
         "DeepseekV32MTPModel", "vllm_hcu.models.deepseek_mtp:DeepSeekMTP"
     )
 
-    # Native DeepSeek V4 MTP owns the execution contract. Route its
-    # architecture through a narrow loader adapter so compressed-tensors
-    # W8A8 ``weight_scale`` parameters also satisfy the native loader's
-    # ``weight_scale_inv`` lookup.
+    # W8A8 MTP checkpoints can use .scale for parameters named weight_scale.
     ModelRegistry.register_model(
         "DeepSeekV4MTPModel",
         "vllm_hcu.models.deepseek_v4_mtp_compat:DeepSeekV4MTP",
@@ -47,27 +44,32 @@ def register_model():
     ModelRegistry.register_model(
         "Glm4MoeMTPModel", "vllm_hcu.models.glm4_moe_mtp:Glm4MoeMTP"
     )
-    
+
     ModelRegistry.register_model(
         "HYV3ForCausalLM", "vllm_hcu.models.hy_v3:HYV3ForCausalLM"
     )
-    
-    ModelRegistry.register_model(
-        "HYV3MTPModel", "vllm_hcu.models.hy_v3_mtp:HYV3MTP"
-    )
+
+    ModelRegistry.register_model("HYV3MTPModel", "vllm_hcu.models.hy_v3_mtp:HYV3MTP")
 
     ModelRegistry.register_model(
         "HYV4ForCausalLM", "vllm_hcu.models.hy_v4:HYV4ForCausalLM"
     )
 
-    ModelRegistry.register_model(
-        "HYV4MTPModel", "vllm_hcu.models.hy_v4:HYV4MTP"
-    )
+    ModelRegistry.register_model("HYV4MTPModel", "vllm_hcu.models.hy_v4:HYV4MTP")
 
     ModelRegistry.register_model(
         "DSparkDraftModel",
         "vllm_hcu.models.deepseek_v4_dspark:DSparkDeepseekV4ForCausalLM",
     )
+
+    ModelRegistry.register_model(
+        "Step5ForCausalLM", "vllm_hcu.models.step5_text:Step5ForCausalLM"
+    )
+    ModelRegistry.register_model(
+        "Step5ForConditionalGeneration",
+        "vllm_hcu.models.step5_vl:Step5ForConditionalGeneration",
+    )
+    ModelRegistry.register_model("Step5MTP", "vllm_hcu.models.step5_mtp:Step5MTP")
 
 
 def register_quant_method():

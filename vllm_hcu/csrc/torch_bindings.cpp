@@ -30,6 +30,13 @@
   }
 
 TORCH_LIBRARY_EXPAND(TORCH_EXTENSION_NAME, ops) {
+#ifdef VLLM_HCU_BUILD_STEP5_DENSE
+  ops.def("step5_fp8_dense_gemm(Tensor x, Tensor xs, Tensor w, Tensor ws, "
+          "int algorithm_id, bool allow_initialize=False) -> Tensor");
+  ops.impl("step5_fp8_dense_gemm", torch::kCUDA, &step5_fp8_dense_gemm);
+  ops.def("step5_fp8_dense_backend_library() -> str", &step5_fp8_dense_backend_library);
+#endif
+
   ops.def("init_custom_ar(int[] ipc_tensors, Tensor rank_data, int rank, bool fully_connected) -> int");
   ops.impl("init_custom_ar", torch::kCUDA, &init_custom_ar);
   ops.def("all_reduce(int fa, Tensor inp, Tensor! out, int reg_buffer, int reg_buffer_sz_bytes) -> ()");
@@ -41,6 +48,7 @@ TORCH_LIBRARY_EXPAND(TORCH_EXTENSION_NAME, ops) {
   ops.def("register_graph_buffers", &register_graph_buffers);
   ops.def("allocate_shared_buffer_and_handle", &allocate_shared_buffer_and_handle);
   ops.def("open_mem_handle(Tensor mem_handle) -> int", &open_mem_handle);
+  ops.def("close_mem_handle(int buffer) -> ()", &close_mem_handle);
   ops.def("free_shared_buffer", &free_shared_buffer);
 
   ops.def(

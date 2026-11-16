@@ -490,15 +490,17 @@ def test_cpu_offload_selects_uva_method(monkeypatch):
     )
 
 
-def test_uva_create_weights_allocates_on_cpu():
+def test_uva_create_weights_allocates_on_cpu(monkeypatch: pytest.MonkeyPatch):
     import vllm.distributed.parallel_state as ps
     from vllm.config import VllmConfig, set_current_vllm_config
+    from vllm.config.device import DeviceConfig
     from vllm.distributed import (
         init_distributed_environment,
         initialize_model_parallel,
     )
 
-    with set_current_vllm_config(VllmConfig()):
+    config = VllmConfig(device_config=DeviceConfig(device="cpu"))
+    with set_current_vllm_config(config):
         if ps._TP is None:
             init_distributed_environment(
                 world_size=1,
@@ -510,6 +512,7 @@ def test_uva_create_weights_allocates_on_cpu():
             initialize_model_parallel(tensor_model_parallel_size=1)
 
         method = patch.HcuQwen4ExpPLEInt8UVAEmbeddingMethod()
+        monkeypatch.setattr(patch, "_is_pin_memory_available", lambda: False)
         layer = torch.nn.Module()
         method.create_weights(
             layer,

@@ -121,6 +121,77 @@ def apply_kimi_k25_tokenizer(module: ModuleType) -> bool:
     return True
 
 
+def _is_step_bytelevel(
+    path_or_repo_id: object,
+    *,
+    revision: str | None = None,
+    download_dir: str | None = None,
+    **kwargs,
+) -> bool:
+    """Identify Step4/Step5 from local or Hub checkpoint metadata.
+
+    These checkpoints declare LlamaTokenizerFast but ship a ByteLevel
+    tokenizer.json whose pre-tokenizer and decoder must be loaded as-is.
+    """
+    model_path = Path(str(path_or_repo_id))
+    subfolder = kwargs.get("subfolder") or ""
+    if model_path.is_dir():
+        config_file = model_path / subfolder / "config.json"
+        tokenizer_file = model_path / subfolder / "tokenizer.json"
+        if not tokenizer_file.is_file():
+            return False
+    else:
+        from transformers.utils.hub import cached_file
+
+        # Resolve only the metadata and tokenizer, never model weight shards.
+        # Preserve the caller's revision, auth, cache and offline semantics.
+        hub_kwargs = {
+            key: kwargs[key]
+            for key in (
+                "token",
+                "local_files_only",
+                "force_download",
+                "proxies",
+                "subfolder",
+                "repo_type",
+            )
+            if key in kwargs
+        }
+        hub_kwargs.update(
+            revision=revision,
+            cache_dir=kwargs.get("cache_dir", download_dir),
+            _raise_exceptions_for_gated_repo=False,
+            _raise_exceptions_for_missing_entries=False,
+            _raise_exceptions_for_connection_errors=False,
+        )
+        try:
+            resolved_config = cached_file(
+                str(path_or_repo_id), "config.json", **hub_kwargs
+            )
+        except (OSError, ValueError):
+            return False
+        if resolved_config is None:
+            return False
+        config_file = Path(resolved_config)
+
+    try:
+        with config_file.open("r", encoding="utf-8") as file:
+            model_type = json.load(file).get("model_type", "")
+    except (OSError, ValueError, AttributeError):
+        return False
+    if not isinstance(model_type, str) or not model_type.startswith(("step4", "step5")):
+        return False
+    if model_path.is_dir():
+        return True
+    try:
+        resolved_tokenizer = cached_file(
+            str(path_or_repo_id), "tokenizer.json", **hub_kwargs
+        )
+    except (OSError, ValueError):
+        return False
+    return resolved_tokenizer is not None and Path(resolved_tokenizer).is_file()
+
+
 def _is_deepseek_distill_llama_70b(path_or_repo_id: object) -> bool:
     return "deepseek-r1-distill-llama-70b" in str(path_or_repo_id).lower()
 
@@ -188,6 +259,22 @@ def apply_deepseek_distill_tokenizer(module: ModuleType) -> bool:
         download_dir: str | None = None,
         **kwargs,
     ):
+        if _is_step_bytelevel(
+            path_or_repo_id, revision=revision, download_dir=download_dir, **kwargs
+        ):
+            from transformers import TokenizersBackend
+
+            backend_kwargs = dict(kwargs)
+            backend_kwargs.setdefault("cache_dir", download_dir)
+            tokenizer = TokenizersBackend.from_pretrained(
+                path_or_repo_id,
+                *args,
+                trust_remote_code=trust_remote_code,
+                revision=revision,
+                **backend_kwargs,
+            )
+            return get_cached_tokenizer(tokenizer)
+
         if not _is_deepseek_distill_llama_70b(path_or_repo_id):
             return original(
                 cls,

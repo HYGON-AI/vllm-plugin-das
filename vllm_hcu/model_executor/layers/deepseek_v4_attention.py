@@ -21,12 +21,12 @@ import triton.language as tl
 import vllm.envs as envs
 import vllm_hcu.hcu_ops  # noqa: F401 - registers torch.ops.hcu_ops
 import vllm_hcu.platforms.envs as henvs
+from vllm_hcu.utils import bf16_fp32_gemm  # noqa: F401  # registers the dispatcher op
 from vllm.model_executor.layers.linear import (
     ReplicatedLinear,
 )
 from vllm.model_executor.layers.sparse_attn_indexer import SparseAttnIndexer
 # from vllm.model_executor.layers.utils import cublas_gemm_bf16_bf16_fp32
-from vllm_hcu.utils.bf16_fp32_gemm import linear_bf16_fp32
 from vllm.utils.deep_gemm import fp8_einsum
 from vllm.utils.torch_utils import direct_register_custom_op
 from vllm_hcu.v1.attention.ops.deepseek_v4_ops import (
@@ -404,8 +404,9 @@ class DeepseekV4MultiHeadLatentAttentionWrapper(PluggableLayer):
             compressor = self.compressor
 
             def compressor_kv_score() -> torch.Tensor:
-                return linear_bf16_fp32(
-                    hidden_states, compressor.fused_wkv_wgate.weight)
+                return torch.ops.vllm.hcu_linear_bf16_fp32(
+                    hidden_states, compressor.fused_wkv_wgate.weight
+                )
 
             aux_fns[0] = compressor_kv_score
 
@@ -418,8 +419,9 @@ class DeepseekV4MultiHeadLatentAttentionWrapper(PluggableLayer):
                 return weights
 
             def indexer_compressor_kv_score() -> torch.Tensor:
-                return linear_bf16_fp32(
-                    hidden_states, indexer.compressor.fused_wkv_wgate.weight)
+                return torch.ops.vllm.hcu_linear_bf16_fp32(
+                    hidden_states, indexer.compressor.fused_wkv_wgate.weight
+                )
 
             aux_fns[1] = indexer_weights_proj
             aux_fns[2] = indexer_compressor_kv_score

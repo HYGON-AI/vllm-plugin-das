@@ -51,6 +51,7 @@ from vllm.model_executor.layers.sparse_attn_indexer import SparseAttnIndexer
 from vllm.model_executor.models.deepseek_v2 import DeepseekV32IndexerCache
 from vllm.model_executor.utils import set_weight_attrs
 from vllm.platforms import current_platform
+from vllm_hcu.platforms.envs import linear_gate_pcp_shard_enabled
 from vllm.v1.attention.backend import (
     AttentionBackend,
     AttentionType,
@@ -624,11 +625,6 @@ def _env_flag(name: str, default: bool) -> bool:
     )
 
 
-def linear_gate_pcp_shard_enabled() -> bool:
-    """Return whether gated MLA linear_gate PCP sharding is enabled."""
-    return _env_flag(_LINEAR_GATE_PCP_SHARD_ENV, False)
-
-
 def linear_gate_pcp_chunking_enabled() -> bool:
     """Return whether large linear_gate PCP inputs should be chunked.
 
@@ -1064,7 +1060,13 @@ class HYV4MLAAttention(nn.Module):
                 self.gate_projection_size_per_head = self.v_head_dim
             else:
                 raise ValueError(f"Unknown gating type: {config.gating_type}")
-            if linear_gate_pcp_shard_enabled():
+            if linear_gate_pcp_shard_enabled(
+                tp_size=get_tensor_model_parallel_world_size(),
+                pcp_size=get_pcp_group().world_size,
+                pp_size=int(
+                    vllm_config.parallel_config.pipeline_parallel_size
+                ),
+            ):
                 self.linear_gate = PCPShardedGateLinear(
                     self.hidden_size,
                     self.num_heads * self.gate_projection_size_per_head,

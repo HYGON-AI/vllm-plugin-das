@@ -17,14 +17,25 @@ from vllm_hcu.patch.import_coordinator import (
 )
 
 from . import (
+    patch_deep_gemm_foundation,
+    patch_step5_envs,
+    patch_step5_config_exports,
+    patch_step5_config_registry,
+    patch_step5_speculative_config,
+    patch_step5_splitting_ops,
+    patch_step5_compile_prefix,
+    patch_step5_ep_graph_capture,
     patch_compilation_config,
     patch_engram_config,
     patch_engine_args,
     patch_envs,
     patch_hy_v3_reasoning_parser,
     patch_hy_v3_tool_parser,
+    patch_step5_reasoning_parser,
+    patch_step5_tool_parser,
     patch_import_utils,
     patch_layer_name,
+    patch_minimax_m3_video_processor,
     patch_nixl_utils,
     patch_qwen4_exp_pp,
     patch_slimquant_registry,
@@ -36,6 +47,7 @@ from . import (
 # directory discovery: ordering is part of the plugin contract and must remain
 # reviewable when vLLM is upgraded.
 _ORDERED_ADAPTERS = (
+    patch_deep_gemm_foundation,
     patch_envs,
     patch_engram_config,
     patch_import_utils,
@@ -48,6 +60,16 @@ _ORDERED_ADAPTERS = (
     patch_slimquant_registry,
     patch_hy_v3_reasoning_parser,
     patch_hy_v3_tool_parser,
+    patch_minimax_m3_video_processor,
+    patch_step5_envs,
+    patch_step5_config_exports,
+    patch_step5_config_registry,
+    patch_step5_speculative_config,
+    patch_step5_splitting_ops,
+    patch_step5_compile_prefix,
+    patch_step5_ep_graph_capture,
+    patch_step5_reasoning_parser,
+    patch_step5_tool_parser,
 )
 
 

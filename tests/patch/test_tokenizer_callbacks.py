@@ -94,8 +94,7 @@ def test_kimi_callback_retries_only_the_known_backend_tokenizer_error():
             cls.calls.append(dict(kwargs))
             if kwargs.get("fix_mistral_regex"):
                 raise AttributeError(
-                    "'tokenizers.Tokenizer' object has no attribute "
-                    "'backend_tokenizer'"
+                    "'tokenizers.Tokenizer' object has no attribute 'backend_tokenizer'"
                 )
             return "fallback-ok"
 
@@ -304,3 +303,161 @@ def test_callback_failure_is_latched_and_not_silently_retried(
             TARGET_MODULE,
             apply_kimi_k25_tokenizer,
         )
+
+
+@pytest.fixture(autouse=True)
+def no_tokenizer_hub_network(monkeypatch):
+    # Unit tests do not download metadata for fake non-Step repository IDs.
+    import transformers.utils.hub
+
+    original = transformers.utils.hub.cached_file
+    monkeypatch.setattr(transformers.utils.hub, "cached_file", lambda *a, **k: None)
+    return original
+
+
+@pytest.mark.parametrize("model_type", ["step4", "step5_vl"])
+@pytest.mark.parametrize("remote", [False, True])
+def test_step_bytelevel_local_and_hub_preserve_backend(
+    tmp_path, monkeypatch, model_type, remote
+):
+    import transformers
+    import transformers.utils.hub
+    from tokenizers import Tokenizer, decoders, models, pre_tokenizers, trainers
+
+    snapshot = tmp_path / "snapshots" / "revision-a" / "tokenizer"
+    snapshot.mkdir(parents=True)
+    (snapshot / "config.json").write_text(json.dumps({"model_type": model_type}))
+    tokenizer = Tokenizer(models.BPE())
+    tokenizer.pre_tokenizer = pre_tokenizers.ByteLevel(add_prefix_space=False)
+    tokenizer.decoder = decoders.ByteLevel()
+    trainer = trainers.BpeTrainer(
+        vocab_size=512, initial_alphabet=pre_tokenizers.ByteLevel.alphabet()
+    )
+    samples = ["hello world", "中文 有空格", " leading  spaces"]
+    tokenizer.train_from_iterator(samples, trainer=trainer)
+    tokenizer.save(str(snapshot / "tokenizer.json"))
+    real_backend = transformers.TokenizersBackend
+    hub_calls = []
+    backend_calls = []
+
+    def cached_file(repo_id, filename, **kwargs):
+        hub_calls.append((repo_id, filename, kwargs))
+        return str(snapshot / filename)
+
+    class Backend:
+        @classmethod
+        def from_pretrained(cls, model_id, *args, **kwargs):
+            backend_calls.append((model_id, args, kwargs))
+            return real_backend(tokenizer_file=str(snapshot / "tokenizer.json"))
+
+    monkeypatch.setattr(transformers.utils.hub, "cached_file", cached_file)
+    monkeypatch.setattr(transformers, "TokenizersBackend", Backend)
+    module, tokenizer_class, calls = _tokenizer_module()
+    apply_deepseek_distill_tokenizer(module)
+    model_id = "org/arbitrarily-named-checkpoint" if remote else snapshot.parent
+    result = tokenizer_class.from_pretrained(
+        model_id,
+        trust_remote_code=True,
+        revision="revision-a",
+        download_dir=str(tmp_path / "cache"),
+        token="test-token",
+        subfolder="tokenizer",
+        local_files_only=True,
+    )
+    assert result[0] == "cached"
+    assert calls == []
+    for sample in samples:
+        assert result[1].decode(result[1].encode(sample)) == sample
+    assert backend_calls == [
+        (
+            model_id,
+            (),
+            {
+                "trust_remote_code": True,
+                "revision": "revision-a",
+                "cache_dir": str(tmp_path / "cache"),
+                "token": "test-token",
+                "subfolder": "tokenizer",
+                "local_files_only": True,
+            },
+        )
+    ]
+    if remote:
+        assert [item[1] for item in hub_calls] == ["config.json", "tokenizer.json"]
+        for repo_id, _, options in hub_calls:
+            assert repo_id == model_id
+            assert options["revision"] == "revision-a"
+            assert options["cache_dir"] == str(tmp_path / "cache")
+            assert options["token"] == "test-token"
+            assert options["local_files_only"] is True
+            assert options["subfolder"] == "tokenizer"
+    else:
+        assert hub_calls == []
+
+
+@pytest.mark.parametrize(
+    "config_kind", ["missing", "other", "malformed", "no_tokenizer"]
+)
+def test_step_hub_detection_preserves_upstream_for_other_or_missing_metadata(
+    tmp_path, monkeypatch, config_kind
+):
+    import transformers.utils.hub
+
+    config_file = tmp_path / "config.json"
+    config_file.write_text(
+        "[]"
+        if config_kind == "malformed"
+        else json.dumps(
+            {"model_type": "qwen3" if config_kind == "other" else "step5_vl"}
+        )
+    )
+    filenames = []
+
+    def cached_file(repo_id, filename, **kwargs):
+        filenames.append(filename)
+        if config_kind == "missing" or filename == "tokenizer.json":
+            return None
+        return str(config_file)
+
+    monkeypatch.setattr(transformers.utils.hub, "cached_file", cached_file)
+    module, tokenizer_class, calls = _tokenizer_module()
+    apply_deepseek_distill_tokenizer(module)
+    result = tokenizer_class.from_pretrained("org/step5-lookalike", revision="v1")
+    assert result[0] == "upstream-tokenizer"
+    assert len(calls) == 1
+    assert calls[0][2]["revision"] == "v1"
+    assert filenames == (
+        ["config.json", "tokenizer.json"]
+        if config_kind == "no_tokenizer"
+        else ["config.json"]
+    )
+
+
+def test_step_repo_id_resolves_real_offline_hub_snapshot(
+    tmp_path, monkeypatch, no_tokenizer_hub_network
+):
+    import transformers.utils.hub
+
+    cache = tmp_path / "hub"
+    repo_cache = cache / "models--org--metadata-checkpoint"
+    sha = "a" * 40
+    snapshot = repo_cache / "snapshots" / sha
+    snapshot.mkdir(parents=True)
+    refs = repo_cache / "refs"
+    refs.mkdir()
+    (refs / "revision-a").write_text(sha)
+    (snapshot / "config.json").write_text(json.dumps({"model_type": "step5_vl"}))
+    (snapshot / "tokenizer.json").write_text("{}")
+    monkeypatch.setattr(transformers.utils.hub, "cached_file", no_tokenizer_hub_network)
+    assert tokenizer_callbacks._is_step_bytelevel(
+        "org/metadata-checkpoint",
+        revision="revision-a",
+        download_dir=str(cache),
+        local_files_only=True,
+    )
+    assert not tokenizer_callbacks._is_step_bytelevel(
+        "org/metadata-checkpoint",
+        revision="missing-revision",
+        download_dir=str(cache),
+        local_files_only=True,
+    )

@@ -10,6 +10,8 @@ import pytest
 import torch
 from vllm.model_executor.models.utils import WeightsMapper
 
+from tests.fixtures.qwen4_ple import load_ple_layer_contract
+
 from vllm_hcu.patch.worker.core_fix import patch_qwen4_exp_fused_ple as patch
 from vllm_hcu.patch.worker.core_fix._common import PatchCompatibilityError
 
@@ -66,7 +68,7 @@ def _target_module() -> tuple[ModuleType, type, type]:
 
 
 def test_fused_ple_uses_one_replicated_kv_projection() -> None:
-    ple_layer = importlib.import_module("vllm_hcu.models.qwen4_exp.amd.ple_layer")
+    ple_layer = load_ple_layer_contract()
     source = inspect.getsource(ple_layer.Qwen4ExpPLELayer.__init__)
 
     assert "self.kv_proj = MergedColumnParallelLinear(" in source

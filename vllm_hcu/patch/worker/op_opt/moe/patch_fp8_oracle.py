@@ -5,7 +5,10 @@
 from __future__ import annotations
 
 import functools
+import os
 from types import ModuleType
+
+from vllm_hcu.platforms import envs as henvs
 
 from vllm_hcu.deepseek_v4_runtime import model_architectures
 from vllm_hcu.patch.config import HcuFeatureConfig, get_hcu_config
@@ -171,10 +174,13 @@ def apply_to_module(module: ModuleType) -> bool:
         is_channel_fp8 = (weight_key, activation_key) == channel_fp8_scheme
         if sidecar.deepep_auto:
             architectures = _model_architectures(config)
-            if "DeepseekV4ForCausalLM" not in architectures:
+            if not any(architecture in architectures for architecture in (
+                "DeepseekV4ForCausalLM", "DeepSeekV4MTPModel",
+            )):
                 raise ValueError(
                     "HCU Channel-FP8 deepep_auto is validated only for "
-                    "DeepSeek-V4; use an explicit DeepEP high-throughput or "
+                    "DeepSeek-V4 and its native MTP draft; use an explicit "
+                    "DeepEP high-throughput or "
                     "low-latency backend for other models. "
                     f"Got architectures={architectures!r}."
                 )
@@ -265,6 +271,66 @@ def apply_to_module(module: ModuleType) -> bool:
         if fp8_backend in (hcu_enum.DEEPGEMM, hcu_enum.BATCHED_DEEPGEMM) and getattr(
             layer, "weight_block_size", None
         ) is None:
+            # Channel-FP8 on HCU DeepGemmExperts: the deepgemm FP8 grouped
+            # kernels consume the Marlin 6D layout [E, K/64, N/16, 4, 16, 16],
+            # mirroring hcu_convert_to_int8_moe_kernel_format.
+            if w13.dim() == 6 and w2.dim() == 6:
+                return w13, w2, w13_scale, w2_scale
+            import torch
+            from deepgemm import (
+                marlin_fp8_contiguous_weight,
+                marlin_fp8_masked_weight,
+            )
+
+            pack_weight = (
+                marlin_fp8_masked_weight
+                if fp8_backend == hcu_enum.BATCHED_DEEPGEMM
+                else marlin_fp8_contiguous_weight
+            )
+            # Effective VLLM_HCU_EP_FUSED_MOE=1: DeepGemmExperts runs
+            # ep_fused_moe, which reads plain [E, N, K] weights; keep them
+            # unpacked.  The custom-op master must participate in this choice:
+            # otherwise runtime falls back to DeepGEMM while conversion leaves
+            # weights in the incompatible EP-fused layout.
+            import os
+
+            from vllm_hcu.platforms import envs as henvs
+
+            from vllm_hcu.runtime_compat.step5 import is_step5_owner
+
+            ep_fused = False
+            if (
+                henvs.optional_custom_op_enabled(
+                    os.environ.get("VLLM_HCU_EP_FUSED_MOE", "0") == "1"
+                )
+                and is_step5_owner(layer)
+                and fp8_backend == hcu_enum.DEEPGEMM
+                and w13_input_scale is None
+                and w2_input_scale is None
+            ):
+                from vllm_hcu.model_executor.layers.fused_moe.ep_fused_moe_support import (
+                    supports_channel_ep_fused,
+                )
+
+                ep_fused = supports_channel_ep_fused(
+                    w13, w2, w13_scale, w2_scale,
+                    block_shape=getattr(layer, "weight_block_size", None),
+                    activation=getattr(layer, "activation", None),
+                    expert_map=getattr(layer, "expert_map", None),
+                    apply_router_weight_on_input=getattr(
+                        layer, "apply_router_weight_on_input", False
+                    ),
+                )
+            if not ep_fused:
+                with torch.no_grad():
+                    w13 = pack_weight(w13).detach()
+                    w2 = pack_weight(w2).detach()
+            # The kernels index channel scales as [E, N]; the trailing unit
+            # dim from CompressedTensors' [E, N, 1] layout corrupts output.
+            if w13_scale.ndim == 3 and w13_scale.size(-1) == 1:
+                w13_scale = w13_scale.squeeze(-1).contiguous()
+            if w2_scale.ndim == 3 and w2_scale.size(-1) == 1:
+                w2_scale = w2_scale.squeeze(-1).contiguous()
             return w13, w2, w13_scale, w2_scale
         return convert(
             fp8_backend,
@@ -318,13 +384,22 @@ def apply_to_module(module: ModuleType) -> bool:
                 moe_config=moe_config,
                 routing_tables=routing_tables,
             )
-        return make_kernel(
+        kernel = make_kernel(
             moe_quant_config,
             moe_config,
             experts_cls,
             fp8_backend,
             routing_tables,
         )
+        if henvs.custom_ops_enabled() and os.environ.get(
+            "HCU_STEP5_DEEPEP_PROFILE_DBO_OUTPUT", "0"
+        ) == "1":
+            from vllm_hcu.model_executor.layers.fused_moe.deepep_runtime import (
+                configure_step5_ht_kernel,
+            )
+
+            configure_step5_ht_kernel(kernel, moe_quant_config, moe_config)
+        return kernel
 
     target._vllm_hcu_original_backend_to_kernel_cls = backend_to_cls
     target.backend_to_kernel_cls = hcu_backend_to_kernel_cls

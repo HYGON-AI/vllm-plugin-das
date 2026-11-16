@@ -31,11 +31,9 @@ else:
         )
     TARGET_VLLM_ROOT = Path(_vllm_spec.origin).resolve().parents[1]
 if not (TARGET_VLLM_ROOT / "vllm" / "__init__.py").is_file():
-    raise RuntimeError(
-        f"VLLM_TARGET_ROOT does not contain vllm: {TARGET_VLLM_ROOT}"
-    )
+    raise RuntimeError(f"VLLM_TARGET_ROOT does not contain vllm: {TARGET_VLLM_ROOT}")
 
-_TARGET_SOURCE_ASSERTION = r'''
+_TARGET_SOURCE_ASSERTION = r"""
 import os as _vllm_hcu_os
 from pathlib import Path as _VllmHcuPath
 import vllm as _vllm_hcu_target
@@ -44,12 +42,10 @@ _vllm_hcu_file = _VllmHcuPath(_vllm_hcu_target.__file__).resolve()
 assert _vllm_hcu_file.is_relative_to(_vllm_hcu_root), (
     f"vllm resolved outside target root: {_vllm_hcu_file} not under {_vllm_hcu_root}"
 )
-'''
+"""
 
 
-def _run_fresh(
-    code: str, *, timeout: int = 120
-) -> subprocess.CompletedProcess[str]:
+def _run_fresh(code: str, *, timeout: int = 120) -> subprocess.CompletedProcess[str]:
     env = dict(os.environ)
     env["VLLM_PLUGINS"] = "__disabled__"
     env["VLLM_TARGET_ROOT"] = str(TARGET_VLLM_ROOT)
@@ -74,6 +70,7 @@ def test_target_root_is_installed_vllm():
 
 def test_platform_core_inventory_is_explicit_and_ordered():
     assert platform_core_callback_names() == (
+        ("platform.core_fix.deep_gemm_foundation", "vllm.utils.deep_gemm"),
         ("platform.core_fix.envs", "vllm.envs"),
         ("platform.core_fix.engram_config.hcu", "vllm.config.engram"),
         ("platform.core_fix.import_utils.deep_gemm", "vllm.utils.import_utils"),
@@ -107,6 +104,19 @@ def test_platform_core_inventory_is_explicit_and_ordered():
             "platform.core_fix.hy_v3_tool_parser",
             "vllm.tool_parsers.hy_v3_tool_parser",
         ),
+        (
+            "platform.core_fix.minimax_m3.video_processor_rgb",
+            "vllm.transformers_utils.processors.minimax_m3",
+        ),
+        ("platform.core_fix.step5_envs", "vllm.envs"),
+        ("platform.core_fix.step5_config_exports", "vllm.transformers_utils.configs"),
+        ("platform.core_fix.step5_config_registry", "vllm.transformers_utils.config"),
+        ("platform.core_fix.step5_speculative_config", "vllm.config.speculative"),
+        ("platform.core_fix.step5_splitting_ops", "vllm.config.compilation"),
+        ("platform.core_fix.step5_compile_prefix", "vllm.compilation.decorators"),
+        ("platform.core_fix.step5_ep_graph_capture", "vllm.distributed.parallel_state"),
+        ("platform.core_fix.step5_reasoning_parser", "vllm.reasoning"),
+        ("platform.core_fix.step5_tool_parser", "vllm.tool_parsers"),
     )
 
 
@@ -119,6 +129,10 @@ def test_platform_framework_inventory_is_explicit_and_dependency_ordered():
         (
             "platform.framework_opt.pp_single_rank_partition",
             "vllm.distributed.utils",
+        ),
+        (
+            "platform.framework_opt.transfer_topology_kv_layout",
+            "vllm.distributed.kv_transfer.kv_connector.utils",
         ),
         (
             "platform.framework_opt.hcu_mooncake_connector",
@@ -138,6 +152,14 @@ def test_platform_framework_inventory_is_explicit_and_dependency_ordered():
             "vllm.v1.core.kv_cache_utils",
         ),
         (
+            "platform.framework_opt.dsa_layer_split_kv_config",
+            "vllm.v1.core.kv_cache_utils",
+        ),
+        (
+            "platform.framework_opt.packed_kv_offload",
+            "vllm.v1.simple_kv_offload.manager",
+        ),
+        (
             "platform.framework_opt.qwen4_exp_mtp_kv_cache_groups",
             "vllm.v1.core.kv_cache_utils",
         ),
@@ -152,6 +174,14 @@ def test_platform_framework_inventory_is_explicit_and_dependency_ordered():
         (
             "platform.framework_opt.pcp_kv_cache_coordinator",
             "vllm.v1.core.kv_cache_coordinator",
+        ),
+        (
+            "platform.framework_opt.glm53_pcp_hybrid_kv_cache",
+            "vllm.v1.core.kv_cache_coordinator",
+        ),
+        (
+            "platform.framework_opt.glm53.kda_cp_state",
+            "vllm.models.glm5next.nvidia.model",
         ),
         (
             "platform.framework_opt.mtp_indexer_kv_cache_coordinator",
@@ -390,9 +420,9 @@ def test_apply_platform_patches_is_idempotent_narrow_and_reported():
     assert result.returncode == 0, result.stderr
     payload = json.loads(result.stdout.strip().splitlines()[-1])
     assert payload == {
-        "count": 48,
-        "replacements": 12,
-        "callbacks": 36,
+        "count": 72,
+        "replacements": 20,
+        "callbacks": 52,
         "failed": [],
         "builtins_same": True,
         "role": "Main",
@@ -400,22 +430,30 @@ def test_apply_platform_patches_is_idempotent_narrow_and_reported():
 
 
 def test_platform_framework_registration_is_lazy_on_clean_vllm():
+    # The current upstream GDN adapters keep FLA providers lazy.
     result = _run_fresh(
         "import builtins,json,sys; "
         "old=builtins.__import__; "
         "from vllm_hcu.patch import apply_platform_patches,IMPORT_COORDINATOR; "
         "from vllm_hcu.patch.platform import platform_framework_callback_names; "
         "targets={name for _,name in platform_framework_callback_names()}; "
-        "cold_adapters={"
+        "cold_replacement_adapters={"
         "'vllm_hcu.patch.worker.op_opt.moe.patch_shared_experts',"
         "'vllm_hcu.patch.worker.op_opt.moe.patch_moe_runner',"
-        "'vllm_hcu.patch.worker.op_opt.patch_aiter_ops',"
-        "'vllm_hcu.patch.worker.framework_opt.patch_cuda_communicator'}; "
+        "'vllm_hcu.patch.worker.op_opt.patch_aiter_ops'}; "
+        "business_modules={"
+        "'vllm_hcu.model_executor.layers.fused_moe.config_runtime',"
+        "'vllm_hcu.model_executor.layers.fused_moe.router_runtime',"
+        "'vllm_hcu.model_executor.layers.fused_moe.deepep_runtime',"
+        "'vllm_hcu.model_executor.layers.fused_moe.aiter_runtime',"
+        "'vllm_hcu.model_executor.layers.fused_moe.aiter_ops'}; "
         "assert not (targets & sys.modules.keys()); "
-        "assert not (cold_adapters & sys.modules.keys()); "
+        "assert not (cold_replacement_adapters & sys.modules.keys()); "
+        "assert not (business_modules & sys.modules.keys()); "
         "apply_platform_patches(); apply_platform_patches(); "
         "assert not (targets & sys.modules.keys()); "
-        "cold_adapters_loaded=sorted(cold_adapters & sys.modules.keys()); "
+        "cold_replacement_adapters_loaded=sorted("
+        "cold_replacement_adapters & sys.modules.keys()); "
         "from vllm_hcu.patch.worker import (worker_callback_names,"
         "worker_module_exchange_names); "
         "worker_replacements=worker_module_exchange_names(); "
@@ -424,8 +462,14 @@ def test_platform_framework_registration_is_lazy_on_clean_vllm():
         "assert not (replacement_modules & sys.modules.keys()); "
         "loaded_worker_callbacks={name for _,name in worker_callback_names()} "
         "& sys.modules.keys(); "
-        "assert loaded_worker_callbacks <= {"
-        "'vllm.distributed.device_communicators.base_device_communicator'}; "
+        "assert loaded_worker_callbacks == {"
+        "'vllm.distributed.device_communicators.base_device_communicator',"
+        "'vllm.forward_context',"
+        "'vllm.utils.deep_gemm',"
+        "'vllm.v1.attention.backend',"
+        "'vllm.v1.worker.dp_utils',"
+        "'vllm.v1.worker.ubatch_utils'}; "
+        "business_modules_loaded=sorted(business_modules & sys.modules.keys()); "
         "import vllm.v1.outputs; "
         "regs={r.patch_id:r for r in IMPORT_COORDINATOR.registrations()}; "
         "print(json.dumps({'output_status':regs["
@@ -434,7 +478,9 @@ def test_platform_framework_registration_is_lazy_on_clean_vllm():
         "patch_id,_,_ in worker_replacements},"
         "'worker_callbacks_registered':any(patch_id in regs for "
         "patch_id,_ in worker_callback_names()),"
-        "'cold_adapters_loaded':cold_adapters_loaded,"
+        "'cold_replacement_adapters_loaded':"
+        "cold_replacement_adapters_loaded,"
+        "'business_modules_loaded':business_modules_loaded,"
         "'mooncake_loaded':"
         "'vllm_hcu.distributed.kv_transfer.kv_connector.v1.mooncake."
         "mooncake_connector' in sys.modules,"
@@ -454,7 +500,8 @@ def test_platform_framework_registration_is_lazy_on_clean_vllm():
             ),
         },
         "worker_callbacks_registered": False,
-        "cold_adapters_loaded": [],
+        "cold_replacement_adapters_loaded": [],
+        "business_modules_loaded": [],
         "mooncake_loaded": False,
         "builtins_same": True,
     }

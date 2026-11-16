@@ -4,21 +4,15 @@
 name: validate-docker-image
 
 # 由 docker-image (release-docker-image.yml) 构建并推送成功后作为 reusable workflow 被调用,
-# 传入本次构建的镜像名; 也可手动触发, 留空 image 时回落 vars.HCU_CI_IMAGE / 0.25.1-latest
+# 传入本次构建的镜像名; 手动触发仅使用 v0.28.1 专用仓库变量。
 on:
   workflow_call:
     inputs:
       image:
-        description: 待校验镜像完整路径, 例如 <site>/<ns>/vllm:0.25.1-ubuntu22.04-dtk2604-py3.10-<时间戳>
+        description: 待校验的 v0.28.1 镜像完整路径
         required: true
         type: string
   workflow_dispatch:
-    inputs:
-      image:
-        description: Optional image override; defaults to 0.25.1-latest
-        required: false
-        default: ""
-        type: string
 
 permissions:
   contents: read
@@ -30,13 +24,22 @@ concurrency:
 env:
   HARBOR_SITE: ${{ vars.HARBOR_SITE }}
   HARBOR_NAMESPACE: jenkins/model_test_env
-  HCU_CI_IMAGE: ${{ vars.HCU_CI_IMAGE || '10.16.1.152:5000/jenkins/model_test_env/vllm:0.25.1-latest' }}
+  HCU_CI_IMAGE: ${{ vars.HCU_CI_IMAGE_V0281 }}
 
 jobs:
   validate:
     name: Validate published image
-    runs-on: bw18
+    runs-on:
+      - ci
+      - bw1000
     steps:
+      - name: Authorize release ref
+        run: |
+          if [[ "$GITHUB_REF" != "refs/heads/v0.28.1-dev" ]]; then
+            echo "HCU image validation only accepts v0.28.1-dev" >&2
+            exit 2
+          fi
+
       - name: Repair self-hosted workspace before checkout
         run: |
           set -euo pipefail
@@ -102,22 +105,31 @@ jobs:
       - name: Resolve latest image digest
         id: image
         env:
-          SOURCE_IMAGE: ${{ inputs.image || vars.HCU_CI_IMAGE || '10.16.1.152:5000/jenkins/model_test_env/vllm:0.25.1-latest' }}
+          SOURCE_IMAGE: ${{ inputs.image || vars.HCU_CI_IMAGE_V0281 }}
         run: |
           set -euo pipefail
+          if [[ -z "${SOURCE_IMAGE:-}" ]]; then
+            echo "HCU_CI_IMAGE_V0281 or an explicit image input is required" >&2
+            exit 2
+          fi
+          allowed_repository="${HARBOR_SITE}/${HARBOR_NAMESPACE}/vllm"
+          source_repository="${SOURCE_IMAGE%%@*}"
+          last_component="${source_repository##*/}"
+          if [[ "$last_component" == *:* ]]; then
+            source_repository="${source_repository%:*}"
+          fi
+          if [[ "$source_repository" != "$allowed_repository" ]]; then
+            echo "Refusing image outside approved repository: $SOURCE_IMAGE" >&2
+            exit 2
+          fi
           docker pull "$SOURCE_IMAGE"
           if [[ "$SOURCE_IMAGE" =~ @sha256:[0-9a-fA-F]{64}$ ]]; then
             digest_image="$SOURCE_IMAGE"
           else
-            repository="$SOURCE_IMAGE"
-            last_component="${repository##*/}"
-            if [[ "$last_component" == *:* ]]; then
-              repository="${repository%:*}"
-            fi
             digest_image="$(
               docker image inspect "$SOURCE_IMAGE" \
                 --format '{{range .RepoDigests}}{{println .}}{{end}}' \
-                | awk -v prefix="${repository}@" 'index($0, prefix) == 1 {print; exit}'
+                | awk -v prefix="${source_repository}@" 'index($0, prefix) == 1 {print; exit}'
             )"
           fi
           if [[ ! "$digest_image" =~ @sha256:[0-9a-fA-F]{64}$ ]]; then
@@ -133,17 +145,28 @@ jobs:
           DIGEST_IMAGE: ${{ steps.image.outputs.digest }}
         run: |
           docker run --rm \
+            --cap-add=SYS_PTRACE \
+            --device /dev/kfd:/dev/kfd \
+            --device /dev/dri:/dev/dri \
+            --ipc=host \
             --network=host \
             -v "$PWD:/vllm-plugin-das:ro" \
+            -v /opt/hyhal:/opt/hyhal:ro \
             -w /vllm-plugin-das \
             "$DIGEST_IMAGE" \
             bash -lc '
               set -euo pipefail
               source /opt/dtk/env.sh
-              /usr/local/bin/python3.10 --version
-              /usr/local/bin/python3.10 .github/scripts/hcu_ci/hcu_ci_preflight.py --check-environment-only
-              /usr/local/bin/python3.10 -c '\''import importlib.metadata; import torch; [print(f"{name}={importlib.metadata.version(name)}") for name in ("torch", "vllm", "vllm-hcu", "pytest")]; print(f"torch_hip={torch.version.hip}")'\''
-              /usr/local/bin/python3.10 tools/run_patch_tests.py --suite contract -- -o cache_dir=/tmp/hcu-ci-pytest-cache
+              python3 --version
+              python3 .github/scripts/hcu_ci/hcu_ci_preflight.py --check-environment-only
+              python3 -c '\''import importlib.metadata; import torch; [print(f"{name}={importlib.metadata.version(name)}") for name in ("torch", "vllm", "vllm-hcu", "pytest")]; print(f"torch_hip={torch.version.hip}")'\''
+              python3 tools/run_patch_tests.py --suite contract -- -o cache_dir=/tmp/hcu-ci-pytest-cache
+              # The checkout is mounted read-only and intentionally has no locally
+              # built hcu_ops extension. The source-build smoke remains covered by
+              # the selected HCU job, which builds the checkout before execution.
+              python3 tools/run_patch_tests.py --suite contract-hcu -- \
+                --deselect tests/patch/test_clean_process_bootstrap.py::test_clean_hcu_process_imports_every_enabled_patch_target \
+                -o cache_dir=/tmp/hcu-ci-pytest-cache-hcu
             '
 
       - name: Clean workspace

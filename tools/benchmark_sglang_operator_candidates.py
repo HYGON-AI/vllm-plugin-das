@@ -470,20 +470,30 @@ def _run_w16a16(args: argparse.Namespace) -> dict[str, object]:
             generator=generator,
         )
         topk_weights = weights / weights.sum(dim=-1, keepdim=True)
-        workspace13 = torch.empty(
-            (
-                tokens * args.top_k,
-                max(2 * args.intermediate_size, args.hidden_size),
-            ),
+        workspace13_shape, workspace2_shape, output_shape = (
+            production_experts.workspace_shapes(
+                M=tokens,
+                N=2 * args.intermediate_size,
+                K=args.hidden_size,
+                topk=args.top_k,
+                global_num_experts=args.experts,
+                local_num_experts=args.experts,
+                expert_tokens_meta=None,
+                activation=MoEActivation.SILU,
+            )
+        )
+        common = torch.empty(
+            max(math.prod(workspace13_shape), math.prod(output_shape)),
             dtype=torch.bfloat16,
             device="cuda",
+        )
+        workspace13 = common[: math.prod(workspace13_shape)].view(
+            workspace13_shape
         )
         workspace2 = torch.empty(
-            (tokens * args.top_k, args.intermediate_size),
-            dtype=torch.bfloat16,
-            device="cuda",
+            workspace2_shape, dtype=torch.bfloat16, device="cuda"
         )
-        output = torch.empty_like(hidden_states)
+        output = common[: math.prod(output_shape)].view(output_shape)
         aiter_problem = AiterMoeProblem(
             M=tokens,
             E=args.experts,

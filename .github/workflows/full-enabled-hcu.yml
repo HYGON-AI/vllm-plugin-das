@@ -28,7 +28,8 @@ jobs:
   prepare:
     runs-on:
       - self-hosted
-      - hcu-ci-pr
+      - ci
+      - bw1100
     container:
       image: ${{ vars.HCU_CI_IMAGE }}
     defaults:
@@ -51,19 +52,19 @@ jobs:
 
       - name: Validate patch contracts and Python sources
         run: |
-          /usr/local/bin/python3.10 --version
-          /usr/local/bin/python3.10 tools/check_patch_test_coverage.py
-          /usr/local/bin/python3.10 .github/scripts/hcu_ci/hcu_ci_preflight.py --check-lock-only
-          /usr/local/bin/python3.10 .github/scripts/hcu_ci/verify_hcu_registration.py
-          /usr/local/bin/python3.10 -m compileall -q .github/scripts/hcu_ci tools tests vllm_hcu
+          python3 --version
+          python3 .github/scripts/hcu_ci/hcu_ci_preflight.py --check-lock-only
+          python3 tools/check_patch_test_coverage.py
+          python3 .github/scripts/hcu_ci/verify_hcu_registration.py
+          python3 -m compileall -q .github/scripts/hcu_ci tools tests vllm_hcu
 
       - name: Validate quarantine governance
-        run: /usr/local/bin/python3.10 .github/scripts/hcu_ci/build_hcu_matrix.py --profile quarantine
+        run: python3 .github/scripts/hcu_ci/build_hcu_matrix.py --profile quarantine
 
       - name: Build full HCU matrix
         id: matrix
         run: >-
-          /usr/local/bin/python3.10 .github/scripts/hcu_ci/build_hcu_matrix.py
+          python3 .github/scripts/hcu_ci/build_hcu_matrix.py
           --profile full
           --github-output "$GITHUB_OUTPUT"
 
@@ -77,7 +78,7 @@ jobs:
     with:
       matrix: ${{ needs.prepare.outputs.matrix }}
       tested_ref: ${{ needs.prepare.outputs.tested_sha }}
-      image: ${{ inputs.image }}
+      image: ${{ inputs.image || vars.HCU_CI_IMAGE }}
     permissions:
       contents: read
 
@@ -88,7 +89,8 @@ jobs:
       - hardware
     runs-on:
       - self-hosted
-      - hcu-ci-pr
+      - ci
+      - bw1100
     env:
       PREPARE_RESULT: ${{ needs.prepare.result }}
       HARDWARE_RESULT: ${{ needs.hardware.result }}

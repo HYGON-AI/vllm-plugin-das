@@ -1441,6 +1441,13 @@ class DeepseekV2DecoderLayer(nn.Module):
             attn_kwargs["llama_4_scaling"] = llama_4_scaling
         hidden_states = self.self_attn(**attn_kwargs)
 
+        if not self.use_mha and self.layer_idx >= 0:
+            from vllm_hcu.v1.dsa_cache_layer_split import (
+                maybe_prefetch_next_dsa_cache,
+            )
+
+            maybe_prefetch_next_dsa_cache(self.layer_idx, kind="mla")
+
         if (
             not isinstance(self.self_attn, DeepseekAttention)
             and hidden_states.dtype == torch.float16

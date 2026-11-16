@@ -1,0 +1,2 @@
+ray[data,train,tune,serve]==2.58.0
+pandas==2.3.3

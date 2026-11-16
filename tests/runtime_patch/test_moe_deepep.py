@@ -3,9 +3,9 @@
 
 from __future__ import annotations
 
+from contextlib import nullcontext
 import importlib
 import linecache
-import logging
 import os
 import subprocess
 import sys
@@ -1622,9 +1622,15 @@ def test_eplb_torch_map_and_record_numeric_contract(monkeypatch: pytest.MonkeyPa
         calls.append(True)
         return topk_ids + 100
 
+    class BaseRouter:
+        def _apply_eplb_mapping(self, topk_ids):
+            return topk_ids
+
     module = _module(
         patch_base_router.TARGET_MODULE,
         torch=torch,
+        BaseRouter=BaseRouter,
+        dbo_current_ubatch_id=lambda: 0,
         eplb_map_to_physical_and_record=official,
     )
     patch_base_router.apply_to_module(module)
@@ -1671,6 +1677,91 @@ def test_eplb_torch_map_and_record_numeric_contract(monkeypatch: pytest.MonkeyPa
     )
     assert torch.equal(result, torch.tensor([[0, 2], [1, 2]], dtype=torch.int32))
     assert torch.equal(loads, torch.tensor([1, 0, 1]))
+
+
+@pytest.mark.parametrize("use_torch_fallback", [False, True])
+def test_static_primary_replica_is_selected_for_every_token(
+    monkeypatch: pytest.MonkeyPatch,
+    use_torch_fallback: bool,
+) -> None:
+    official_replica_counts = []
+
+    def official(
+        topk_ids,
+        expert_load_view,
+        logical_to_physical_map,
+        logical_replica_count,
+        record_enabled,
+        num_unpadded_tokens=None,
+    ):
+        del expert_load_view, record_enabled, num_unpadded_tokens
+        official_replica_counts.append(logical_replica_count.clone())
+        token_idx = torch.arange(topk_ids.numel(), dtype=torch.int64)
+        replica_idx = (
+            ((token_idx * 2654435769) % (1 << 32))
+            % logical_replica_count[topk_ids.reshape(-1)].long()
+        )
+        return logical_to_physical_map[
+            topk_ids.reshape(-1).long(), replica_idx
+        ].reshape_as(topk_ids)
+
+    class BaseRouter:
+        def __init__(self, eplb_state):
+            self.eplb_state = eplb_state
+
+        def _apply_eplb_mapping(self, topk_ids):
+            state = self.eplb_state
+            return module.eplb_map_to_physical_and_record(
+                topk_ids,
+                state.expert_load_view,
+                state.logical_to_physical_map,
+                state.logical_replica_count,
+                state.should_record_tensor,
+                state.num_unpadded_tokens_tensors[0],
+            )
+
+    module = _module(
+        patch_base_router.TARGET_MODULE,
+        torch=torch,
+        BaseRouter=BaseRouter,
+        dbo_current_ubatch_id=lambda: 0,
+        eplb_map_to_physical_and_record=official,
+    )
+    patch_base_router.apply_to_module(module)
+    from vllm_hcu.platforms import envs as henvs
+
+    monkeypatch.setattr(
+        henvs,
+        "VLLM_HCU_USE_TORCH_EPLB_MAP_RECORD",
+        use_torch_fallback,
+    )
+    state = SimpleNamespace(
+        expert_load_view=torch.zeros(264, dtype=torch.int64),
+        logical_to_physical_map=torch.tensor([[0, 132]], dtype=torch.int64),
+        logical_replica_count=torch.tensor([2], dtype=torch.int64),
+        should_record_tensor=torch.tensor(False),
+        num_unpadded_tokens_tensors=[torch.tensor(64)],
+    )
+    setattr(
+        state,
+        "_vllm_hcu_static_primary_replica_count",
+        torch.ones_like(state.logical_replica_count),
+    )
+    router = BaseRouter(state)
+    logical_ids = torch.zeros((64, 1), dtype=torch.int64)
+
+    static_ids = router._apply_eplb_mapping(logical_ids)
+    delattr(state, "_vllm_hcu_static_primary_replica_count")
+    online_ids = router._apply_eplb_mapping(logical_ids)
+
+    assert torch.equal(static_ids, torch.zeros_like(static_ids))
+    assert set(online_ids.reshape(-1).tolist()) == {0, 132}
+    assert state.logical_replica_count.tolist() == [2]
+    if not use_torch_fallback:
+        assert [counts.tolist() for counts in official_replica_counts] == [
+            [1],
+            [2],
+        ]
 
 
 def test_hash_router_normalizes_index_dtypes(
@@ -1748,8 +1839,16 @@ def test_moe_layer_forward_and_repacked_weight_contract(
             self.moe_quant_config = "official-config"
 
     class RoutedExperts:
-        def __init__(self, apply_router_weight_on_input=False):
-            self.moe_config = "moe-config"
+        def __init__(
+            self,
+            apply_router_weight_on_input=False,
+            activation=None,
+            pcp_size=1,
+        ):
+            self.moe_config = SimpleNamespace(
+                activation=activation,
+                pcp_size=pcp_size,
+            )
             self.quant_method = UnquantizedFusedMoEMethod()
             self.local_num_experts = 2
             self._dsv4_channel_deepgemm_repacked = False
@@ -1779,8 +1878,15 @@ def test_moe_layer_forward_and_repacked_weight_contract(
             yield "official-load"
 
     class Runner:
-        def __init__(self, apply_router_weight_on_input=False):
-            self.routed_experts = RoutedExperts(apply_router_weight_on_input)
+        def __init__(
+            self,
+            apply_router_weight_on_input=False,
+            activation=None,
+            pcp_size=1,
+        ):
+            self.routed_experts = RoutedExperts(
+                apply_router_weight_on_input, activation, pcp_size
+            )
             self.replaced = None
 
         def _replace_quant_method(self, method):
@@ -1795,8 +1901,10 @@ def test_moe_layer_forward_and_repacked_weight_contract(
     source = (
         "def FusedMoEFactory("
         + ", ".join(f"{name}=None" for name in factory_names)
-        + "):\n    return Runner(apply_router_weight_on_input)\n"
+        + "):\n    factory_calls.append((enable_eplb, num_redundant_experts))\n"
+        + "    return Runner(apply_router_weight_on_input, activation, pcp_size)\n"
     )
+    layer_module.factory_calls = []
     exec(source, layer_module.__dict__)
     fused_moe_package = _module(
         "vllm.model_executor.layers.fused_moe",
@@ -1855,6 +1963,85 @@ def test_moe_layer_forward_and_repacked_weight_contract(
     assert isinstance(experts.quant_method, HcuUnquantizedFusedMoEMethod)
     assert experts.quant_method.moe_quant_config == "official-config"
     assert runner.replaced is experts.quant_method
+    monkeypatch.setattr(
+        "vllm.config.get_current_vllm_config_or_none",
+        lambda: SimpleNamespace(
+            model_config=SimpleNamespace(
+                hf_config=SimpleNamespace(model_type="qwen3")
+            )
+        ),
+    )
+    non_kimi_runner = fused_moe_package.FusedMoE()
+    assert not hasattr(non_kimi_runner.routed_experts.moe_config, "_hcu_kimi_k3")
+    assert (
+        non_kimi_runner.routed_experts.moe_config._hcu_global_ht_token_bound
+        is False
+    )
+    for architecture in ("DeepseekV4ForCausalLM", "DeepSeekV4MTPModel"):
+        monkeypatch.setattr(
+            "vllm.config.get_current_vllm_config_or_none",
+            lambda architecture=architecture: SimpleNamespace(
+                model_config=SimpleNamespace(
+                    architectures=[architecture],
+                    hf_config=SimpleNamespace(model_type="deepseek_v4"),
+                )
+            ),
+        )
+        deepseek_v4_pcp_runner = fused_moe_package.FusedMoE(pcp_size=8)
+        assert (
+            deepseek_v4_pcp_runner.routed_experts.moe_config
+            ._hcu_global_ht_token_bound
+            is True
+        )
+        assert (
+            deepseek_v4_pcp_runner.routed_experts.moe_config
+            ._hcu_model_architectures
+            == (architecture,)
+        )
+    situ_runner = fused_moe_package.FusedMoE(activation="situ")
+    assert situ_runner.routed_experts.moe_config._hcu_kimi_k3 is True
+    kimi_runner_type = type(
+        "ROCmLatentMoERunner",
+        (),
+        {"__module__": "vllm.models.kimi_k3.amd.latent_moe_runner"},
+    )
+    legacy_kimi_runner = kimi_runner_type()
+    legacy_kimi_runner._forward_entry = lambda *args: args
+    patch_layer._adapt_kimi_runner_forward_entry(legacy_kimi_runner)
+    assert legacy_kimi_runner._forward_entry(1, 2, 3, 4, 5, 6) == (
+        1, 2, 3, 4, None, None, None, None, 5, 6
+    )
+    assert legacy_kimi_runner._vllm_hcu_kimi_moe_entry_adapted is True
+    monkeypatch.setattr(
+        "vllm.config.get_current_vllm_config_or_none",
+        lambda: SimpleNamespace(
+            model_config=SimpleNamespace(hf_config=SimpleNamespace(model_type="kimi_k3")),
+            parallel_config=SimpleNamespace(
+                enable_eplb=True,
+                eplb_config=SimpleNamespace(num_redundant_experts=16),
+            ),
+        ),
+    )
+    kimi_runner = fused_moe_package.FusedMoE()
+    assert kimi_runner.routed_experts.moe_config._hcu_kimi_k3 is True
+    assert layer_module.factory_calls[-1] == (True, 16)
+    # KimiK3ForConditionalGeneration initializes its language model with the
+    # real inner text config, not the outer multimodal config.
+    from vllm.transformers_utils.configs.kimi_linear import KimiLinearConfig
+
+    monkeypatch.setattr(
+        "vllm.config.get_current_vllm_config_or_none",
+        lambda: SimpleNamespace(
+            model_config=SimpleNamespace(hf_config=KimiLinearConfig()),
+            parallel_config=SimpleNamespace(
+                enable_eplb=True,
+                eplb_config=SimpleNamespace(num_redundant_experts=16),
+            ),
+        ),
+    )
+    nested_kimi_runner = fused_moe_package.FusedMoE()
+    assert nested_kimi_runner.routed_experts.moe_config._hcu_kimi_k3 is True
+    assert layer_module.factory_calls[-1] == (True, 16)
     router_weight_runner = fused_moe_package.FusedMoE(
         apply_router_weight_on_input=True
     )
@@ -1879,6 +2066,66 @@ def test_moe_layer_forward_and_repacked_weight_contract(
         (2, 3),
         (2, 2),
     ]
+
+    experts._dsv4_channel_deepgemm_layout = "contiguous+masked"
+    experts._dsv4_channel_deepgemm_masked_w13 = torch.tensor(
+        [[[101, 102]], [[201, 202]]]
+    )
+    experts._dsv4_channel_deepgemm_masked_w2 = torch.tensor(
+        [[[103, 104]], [[203, 204]]]
+    )
+    ll_delegate = SimpleNamespace(
+        _deepgemm_w13=experts._dsv4_channel_deepgemm_masked_w13,
+        _deepgemm_w2=experts._dsv4_channel_deepgemm_masked_w2,
+    )
+    weights = experts.get_expert_weights()
+    assert [tuple(weight.shape) for weight in weights] == [
+        (2, 12),
+        (2, 8),
+        (2, 3),
+        (2, 2),
+        (2, 2),
+        (2, 2),
+    ]
+
+    class LocalCommunicator:
+        needs_profile_buffer_reservation = False
+
+        def set_transfer_context(self, old_indices, layer_idx):
+            pass
+
+        def add_send(self, tensors, dst_rank, expert_id):
+            raise AssertionError("single-rank rearrange must not send")
+
+        def add_recv(self, tensors, src_rank, expert_id):
+            raise AssertionError("single-rank rearrange must not receive")
+
+        def execute(self):
+            pass
+
+    from vllm_hcu.distributed.eplb_transfer_runtime import (
+        rearrange_expert_weights_inplace,
+    )
+
+    old_map = torch.tensor([[0, 1]])
+    new_map = torch.tensor([[1, 0]])
+    monkeypatch.setattr(torch.cuda, "stream", lambda _stream: nullcontext())
+    rearrange_expert_weights_inplace(
+        old_map,
+        new_map,
+        [weights],
+        [torch.empty_like(weight) for weight in weights],
+        SimpleNamespace(size=lambda: 1, rank=lambda: 0),
+        LocalCommunicator(),
+    )
+    assert torch.equal(
+        ll_delegate._deepgemm_w13,
+        torch.tensor([[[201, 202]], [[101, 102]]]),
+    )
+    assert torch.equal(
+        ll_delegate._deepgemm_w2,
+        torch.tensor([[[203, 204]], [[103, 104]]]),
+    )
 
     loaded = []
 
@@ -2775,8 +3022,11 @@ def test_moe_align_ep_remap_rejects_uninitialized_buffer_ids(
     assert count.item() == 2
 
 
+@pytest.mark.parametrize("architecture", [
+    "DeepseekV4ForCausalLM", "DeepSeekV4MTPModel",
+])
 def test_fp8_oracle_sidecar_selection_and_format_contract(
-    monkeypatch: pytest.MonkeyPatch,
+    monkeypatch: pytest.MonkeyPatch, architecture: str,
 ):
     auto_kernel_calls: list[tuple[object, object, object]] = []
 
@@ -2919,7 +3169,7 @@ def test_fp8_oracle_sidecar_selection_and_format_contract(
         moe_parallel_config=SimpleNamespace(use_batched_activation_format=False),
         _hcu_vllm_config=SimpleNamespace(
             model_config=SimpleNamespace(
-                architectures=["DeepseekV4ForCausalLM"],
+                architectures=[architecture],
             ),
         ),
     )
@@ -2957,13 +3207,15 @@ def test_fp8_oracle_sidecar_selection_and_format_contract(
         None,
         None,
     ) == tensors
+    # Channel-FP8 DEEPGEMM weights already in the Marlin 6D layout pass through.
+    packed = tuple(SimpleNamespace(dim=lambda: 6) for _ in range(4))
     assert module.convert_to_fp8_moe_kernel_format(
         module.Fp8MoeBackend.DEEPGEMM,
         SimpleNamespace(weight_block_size=None),
-        *tensors,
+        *packed,
         None,
         None,
-    ) == tensors
+    ) == packed
     assert module.convert_to_fp8_moe_kernel_format(
         module.Fp8MoeBackend.AITER,
         SimpleNamespace(weight_block_size=None),
@@ -3179,6 +3431,46 @@ def test_channel_fp8_experts_repack_reloaded_weights_in_declared_layout(
     assert replacement._deepgemm_w2 is layer.w2_weight
 
 
+def test_channel_quant_experts_decode_gfx938_pair32_packed_shape():
+    from vllm_hcu.model_executor.layers.fused_moe.experts.dpsk_v4_deep_gemm_moe import (
+        DeepEPDeepGemmContiguousExperts,
+    )
+
+    # Shapes observed from the gfx938 pair32 packer for the Hy4 model.
+    w13 = torch.empty((33, 96, 128, 2, 4, 16, 16), device="meta")
+    w2 = torch.empty((33, 32, 192, 2, 4, 16, 16), device="meta")
+
+    assert DeepEPDeepGemmContiguousExperts._packed_deepgemm_problem_shape(
+        w13,
+        w2,
+    ) == (33, 4096, 6144)
+
+
+def test_channel_quant_experts_restore_gfx938_pair32_packed_weights():
+    from vllm_hcu.model_executor.layers.fused_moe.experts.dpsk_v4_deep_gemm_moe import (
+        DeepEPDeepGemmMaskedExperts,
+    )
+
+    experts = object.__new__(DeepEPDeepGemmMaskedExperts)
+    experts._deepgemm_w13 = None
+    experts._deepgemm_w2 = None
+    layer = torch.nn.Module()
+    layer.w13_weight = torch.nn.Parameter(
+        torch.empty((1, 96, 128, 2, 4, 16, 16), device="meta"),
+        requires_grad=False,
+    )
+    layer.w2_weight = torch.nn.Parameter(
+        torch.empty((1, 32, 192, 2, 4, 16, 16), device="meta"),
+        requires_grad=False,
+    )
+    layer._dsv4_channel_deepgemm_layout = "masked"
+
+    experts.process_weights_after_loading(layer)
+
+    assert experts._deepgemm_w13 is layer.w13_weight
+    assert experts._deepgemm_w2 is layer.w2_weight
+
+
 @pytest.mark.parametrize(
     ("experts_name", "packer_name"),
     (
@@ -3341,6 +3633,99 @@ def test_channel_quant_masked_experts_execute_matching_deepgemm_kernel(
         if use_int8 or not master_enabled
         else [enabled_expected_m, enabled_expected_m]
     )
+
+
+@pytest.mark.parametrize("use_int8", [False, True])
+def test_eplb_channel_quant_masked_experts_keep_redundant_physical_slots(
+    monkeypatch: pytest.MonkeyPatch,
+    use_int8: bool,
+):
+    from vllm.model_executor.layers.fused_moe.activation import MoEActivation
+    from vllm_hcu.model_executor.layers.fused_moe.experts import (
+        dpsk_v4_deep_gemm_moe as module,
+    )
+
+    experts = object.__new__(module.DeepEPDeepGemmMaskedExperts)
+    experts.num_dispatchers = 4
+    experts._deepgemm_w13 = torch.empty((1, 1, 1, 1, 1, 1))
+    experts._deepgemm_w2 = torch.empty((1, 1, 1, 1, 1, 1))
+    experts.quant_config = SimpleNamespace(
+        w1_scale=torch.ones((2, 8)),
+        w2_scale=torch.ones((2, 4)),
+        gemm1_clamp_limit=10.0,
+        use_int8_w8a8=use_int8,
+    )
+    experts.moe_problem_size = lambda *_args: (2, 3, 8, 4, 1)
+
+    call_number = 0
+
+    def public_masked_kernel(
+        _a,
+        _b,
+        destination: torch.Tensor,
+        _masked_m,
+        _expected_m_per_group,
+    ) -> torch.Tensor:
+        nonlocal call_number
+        call_number += 1
+        destination.fill_(call_number)
+        return destination
+
+    kernel_name = (
+        "m_grouped_i8_gemm_nt_masked"
+        if use_int8
+        else "m_grouped_fp8_gemm_nt_masked"
+    )
+    monkeypatch.setattr(module, kernel_name, public_masked_kernel, raising=False)
+    monkeypatch.setattr(
+        module,
+        (
+            "m_grouped_fp8_gemm_nt_masked"
+            if use_int8
+            else "m_grouped_i8_gemm_nt_masked"
+        ),
+        lambda *_args, **_kwargs: pytest.fail("wrong quantized masked GEMM used"),
+        raising=False,
+    )
+    activation_kwargs: dict[str, object] = {}
+
+    def quantize_activation(output, **kwargs):
+        activation_kwargs.update(kwargs)
+        return (
+            output[..., :4].to(torch.int8),
+            torch.ones(output.shape[:2]),
+        )
+
+    quantizer_name = (
+        "fuse_silu_mul_clamp_quant_ep"
+        if use_int8
+        else "fuse_silu_mul_fp8_quant_ep"
+    )
+    monkeypatch.setattr(module, quantizer_name, quantize_activation, raising=False)
+
+    output = torch.empty((2, 3, 4))
+    experts.apply(
+        output=output,
+        hidden_states=torch.ones((2, 3, 4), dtype=torch.int8),
+        w1=experts._deepgemm_w13,
+        w2=experts._deepgemm_w2,
+        topk_weights=torch.ones((3, 1)),
+        topk_ids=torch.zeros((3, 1), dtype=torch.int32),
+        activation=MoEActivation.SILU,
+        global_num_experts=4,
+        expert_map=torch.tensor([-1, -1, 0, 1], dtype=torch.int32),
+        a1q_scale=torch.ones((2, 3)),
+        a2_scale=None,
+        workspace13=torch.empty(0),
+        workspace2=torch.empty((2, 3, 8)),
+        expert_tokens_meta=SimpleNamespace(
+            expert_num_tokens=torch.tensor([2, 1], dtype=torch.int32)
+        ),
+        apply_router_weight_on_input=False,
+    )
+
+    assert torch.equal(output, torch.full_like(output, 2))
+    assert activation_kwargs["limit"] == 10.0
 
 
 @pytest.mark.parametrize("use_int8", [False, True])
@@ -3595,6 +3980,47 @@ def test_channel_fp8_auto_experts_isolate_in_place_marlin_layouts(
     assert ht_w13.untyped_storage().data_ptr() != ll_w13.untyped_storage().data_ptr()
 
 
+def test_channel_auto_experts_cache_equivalent_layout_probe_by_shape() -> None:
+    from vllm_hcu.model_executor.layers.fused_moe.experts import (
+        dpsk_v4_deep_gemm_moe as module,
+    )
+
+    calls: list[str] = []
+
+    class ContiguousExperts:
+        def _pack_channel_weights(self, w13, w2):
+            calls.append("ht")
+            return w13, w2
+
+    class MaskedExperts:
+        def _pack_channel_weights(self, w13, w2):
+            calls.append("ll")
+            return w13, w2
+
+    def make_experts():
+        experts = object.__new__(module.DeepEPAutoDeepGemmExperts)
+        experts.quant_config = SimpleNamespace(use_int8_w8a8=False)
+        experts.ht_experts = ContiguousExperts()
+        experts.ll_experts = MaskedExperts()
+        return experts
+
+    module._PACKED_LAYOUT_PROBE_CACHE.clear()
+    first = make_experts()
+    second = make_experts()
+    w13 = torch.empty((4, 32, 64), dtype=torch.int8)
+    w2 = torch.empty((4, 64, 16), dtype=torch.int8)
+
+    assert first._packers_share_layout(w13, w2)
+    assert second._packers_share_layout(w13, w2)
+    assert calls == ["ht", "ll"]
+
+    different_shape = torch.empty((4, 64, 64), dtype=torch.int8)
+    assert second._packers_share_layout(different_shape, w2)
+    assert calls == ["ht", "ll", "ht", "ll"]
+
+    module._PACKED_LAYOUT_PROBE_CACHE.clear()
+
+
 @pytest.mark.parametrize(
     ("fixed_use_low_latency", "layout", "selected_packer", "rejected_packer"),
     [
@@ -3714,6 +4140,165 @@ def test_channel_auto_experts_construct_only_mooncake_pd_role_layout(
     assert experts.ht_experts is experts.ll_experts
 
 
+def test_w4a8_auto_accepts_global_ht_token_bound(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    from vllm_hcu.model_executor.layers.fused_moe.experts import (
+        dpsk_v4_deep_gemm_moe as module,
+    )
+
+    class ContiguousExperts:
+        def __init__(self, **_kwargs):
+            pass
+
+    class MaskedExperts:
+        def __init__(self, **_kwargs):
+            pass
+
+    monkeypatch.setattr(
+        module,
+        "DeepEPDeepGemmW4A8ContiguousExperts",
+        ContiguousExperts,
+    )
+    monkeypatch.setattr(
+        module,
+        "DeepEPDeepGemmW4A8MaskedExperts",
+        MaskedExperts,
+    )
+
+    experts = module.DeepEPAutoW4A8Experts(
+        moe_config=SimpleNamespace(),
+        quant_config=SimpleNamespace(),
+        max_num_tokens=64,
+        num_dispatchers=8,
+        global_ht_token_bound=True,
+    )
+
+    assert experts._global_ht_token_bound is True
+
+
+@pytest.mark.parametrize(
+    ("num_dispatchers", "expected_aligned_rows"),
+    [
+        pytest.param(16, 18_432, id="dp16-receive-bound"),
+        pytest.param(4, 10_752, id="dp4-topk-applied-once"),
+    ],
+)
+def test_deepep_auto_ht_workspace_reserves_dispatcher_receive_bound(
+    num_dispatchers: int,
+    expected_aligned_rows: int,
+) -> None:
+    from vllm.model_executor.layers.fused_moe.activation import MoEActivation
+    from vllm_hcu.model_executor.layers.fused_moe.experts import (
+        dpsk_v4_deep_gemm_moe as module,
+    )
+
+    experts = object.__new__(module.DeepEPAutoDeepGemmExperts)
+    experts.moe_config = SimpleNamespace(
+        max_num_tokens=64,
+        experts_per_token=10,
+    )
+    experts.num_dispatchers = num_dispatchers
+    experts._fixed_use_low_latency = None
+    experts._use_low_latency_snapshot = False
+    experts.ht_experts = object.__new__(module.DeepEPDeepGemmContiguousExperts)
+    experts.ll_experts = object.__new__(module.DeepEPDeepGemmMaskedExperts)
+    experts.ll_experts.max_num_tokens = 64
+    experts.ll_experts.num_dispatchers = num_dispatchers
+
+    shapes = experts.workspace_shapes(
+        64,
+        1_536,
+        2_048,
+        10,
+        512,
+        32,
+        None,
+        MoEActivation.SILU,
+    )
+
+    assert shapes[0][0] == expected_aligned_rows
+    assert shapes[1][0] == expected_aligned_rows
+    assert shapes[2] == (64, 2_048)
+
+    experts._use_low_latency_snapshot = True
+    ll_shapes = experts.workspace_shapes(
+        64,
+        1_536,
+        2_048,
+        10,
+        512,
+        32,
+        None,
+        MoEActivation.SILU,
+    )
+
+    assert ll_shapes == experts.ll_experts.workspace_shapes(
+        64,
+        1_536,
+        2_048,
+        10,
+        512,
+        32,
+        None,
+        MoEActivation.SILU,
+    )
+
+
+def test_deepep_auto_ht_workspace_uses_global_bound_for_dsv4_pcp() -> None:
+    from vllm.model_executor.layers.fused_moe.activation import MoEActivation
+    from vllm_hcu.model_executor.layers.fused_moe.experts import (
+        dpsk_v4_deep_gemm_moe as module,
+    )
+
+    experts = object.__new__(module.DeepEPAutoDeepGemmExperts)
+    experts.moe_config = SimpleNamespace(
+        max_num_tokens=64,
+        experts_per_token=10,
+        dp_size=1,
+    )
+    experts.num_dispatchers = 8
+    experts._fixed_use_low_latency = None
+    experts._use_low_latency_snapshot = False
+    experts._global_ht_token_bound = True
+    experts.ht_experts = object.__new__(module.DeepEPDeepGemmContiguousExperts)
+    experts.ll_experts = object.__new__(module.DeepEPDeepGemmMaskedExperts)
+
+    args = (64, 1_536, 2_048, 10, 512, 32, None, MoEActivation.SILU)
+    shapes = experts.workspace_shapes(*args)
+    expected = experts.ht_experts.workspace_shapes(*args)
+
+    assert shapes == expected
+
+
+def test_deepep_auto_ht_workspace_keeps_dp_factor_for_dsv4_pcp() -> None:
+    from vllm.model_executor.layers.fused_moe.activation import MoEActivation
+    from vllm_hcu.model_executor.layers.fused_moe.experts import (
+        dpsk_v4_deep_gemm_moe as module,
+    )
+
+    experts = object.__new__(module.DeepEPAutoDeepGemmExperts)
+    experts.moe_config = SimpleNamespace(
+        max_num_tokens=64,
+        experts_per_token=10,
+        dp_size=2,
+    )
+    experts.num_dispatchers = 16
+    experts._fixed_use_low_latency = None
+    experts._use_low_latency_snapshot = False
+    experts._global_ht_token_bound = True
+    experts.ht_experts = object.__new__(module.DeepEPDeepGemmContiguousExperts)
+    experts.ll_experts = object.__new__(module.DeepEPDeepGemmMaskedExperts)
+
+    args = (64, 1_536, 2_048, 10, 512, 32, None, MoEActivation.SILU)
+    shapes = experts.workspace_shapes(*args)
+    reserve_args = (128, *args[1:])
+    reserve13, reserve2, _ = experts.ht_experts.workspace_shapes(*reserve_args)
+    _, _, output = experts.ht_experts.workspace_shapes(*args)
+
+    assert shapes == (reserve13, reserve2, output)
+
+
 def _slimquant_w4a8_auto_experts(fixed_use_low_latency: bool | None):
     from vllm_hcu.model_executor.layers.fused_moe.experts import (
         dpsk_v4_deep_gemm_moe as module,
@@ -3723,6 +4308,8 @@ def _slimquant_w4a8_auto_experts(fixed_use_low_latency: bool | None):
     )
 
     experts = object.__new__(module.DeepEPAutoW4A8Experts)
+    quant_config = SimpleNamespace(_w1=SimpleNamespace(scale=None))
+    experts.quant_config = quant_config
     experts._fixed_use_low_latency = fixed_use_low_latency
     experts._use_low_latency_snapshot = False
     if fixed_use_low_latency is True:
@@ -3741,6 +4328,7 @@ def _slimquant_w4a8_auto_experts(fixed_use_low_latency: bool | None):
             runtime.DeepEPDeepGemmW4A8MaskedExperts
         )
     for child in {experts.ht_experts, experts.ll_experts}:
+        child.quant_config = quant_config
         child._deepgemm_w13 = None
         child._deepgemm_w2 = None
     return experts
@@ -3749,15 +4337,15 @@ def _slimquant_w4a8_auto_experts(fixed_use_low_latency: bool | None):
 def _slimquant_w4a8_auto_layer() -> torch.nn.Module:
     layer = torch.nn.Module()
     layer.w13_weight = torch.nn.Parameter(
-        torch.zeros((1, 128, 32), dtype=torch.int8),
+        torch.zeros((1, 512, 32), dtype=torch.int8),
         requires_grad=False,
     )
     layer.w2_weight = torch.nn.Parameter(
-        torch.zeros((1, 64, 32), dtype=torch.int8),
+        torch.zeros((1, 64, 128), dtype=torch.int8),
         requires_grad=False,
     )
     layer.w13_weight_scale = torch.nn.Parameter(
-        torch.ones((1, 128, 1), dtype=torch.float32),
+        torch.ones((1, 512, 1), dtype=torch.float32),
         requires_grad=False,
     )
     layer.w2_weight_scale = torch.nn.Parameter(
@@ -3765,6 +4353,190 @@ def _slimquant_w4a8_auto_layer() -> torch.nn.Module:
         requires_grad=False,
     )
     return layer
+
+
+def _slimquant_qwen_w4a8_auto_layer() -> torch.nn.Module:
+    """Small-hidden replica of Qwen's logical intermediate size of 640."""
+
+    layer = torch.nn.Module()
+    layer.w13_weight = torch.nn.Parameter(
+        torch.arange(1280 * 32, dtype=torch.int64)
+        .remainder(251)
+        .to(torch.int8)
+        .reshape(1, 1280, 32),
+        requires_grad=False,
+    )
+    layer.w2_weight = torch.nn.Parameter(
+        torch.arange(64 * 320, dtype=torch.int64)
+        .remainder(241)
+        .to(torch.int8)
+        .reshape(1, 64, 320),
+        requires_grad=False,
+    )
+    layer.w13_weight_scale = torch.nn.Parameter(
+        torch.arange(1280, dtype=torch.float32).reshape(1, 1280, 1) + 1,
+        requires_grad=False,
+    )
+    layer.w2_weight_scale = torch.nn.Parameter(
+        torch.ones((1, 64, 1), dtype=torch.float32),
+        requires_grad=False,
+    )
+    return layer
+
+
+def test_slimquant_w4a8_auto_pads_qwen_intermediate_for_hipc(
+    monkeypatch: pytest.MonkeyPatch,
+):
+    """Qwen I=640 must use a zero-preserving physical I=768 layout."""
+
+    from vllm_hcu.model_executor.layers.quantization import (
+        slimquant_w4a8_deepgemm_runtime as runtime,
+    )
+
+    layer = _slimquant_qwen_w4a8_auto_layer()
+    raw_w13 = layer.w13_weight.detach().clone()
+    raw_w2 = layer.w2_weight.detach().clone()
+    raw_w13_scale = layer.w13_weight_scale.detach().clone()
+    experts = _slimquant_w4a8_auto_experts(None)
+    pack_calls: list[torch.Tensor] = []
+
+    def identity_pack(weight: torch.Tensor) -> torch.Tensor:
+        pack_calls.append(weight)
+        return weight
+
+    def n32_view(weight: torch.Tensor) -> torch.Tensor:
+        num_experts, output_size, packed_k = weight.shape
+        return weight.view(
+            num_experts,
+            packed_k // 32,
+            output_size // 32,
+            4,
+            32,
+            8,
+        )
+
+    monkeypatch.setattr(runtime, "pack_w4a8_moe_hipc_weight", identity_pack)
+    monkeypatch.setattr(
+        runtime,
+        "view_w4a8_moe_hipc_weight_n32_layout",
+        n32_view,
+    )
+
+    experts.process_weights_after_loading(layer)
+
+    assert [tuple(weight.shape) for weight in pack_calls] == [
+        (1, 1536, 32),
+        (1, 64, 384),
+    ]
+    assert tuple(layer.w13_weight.shape) == (1, 1536, 32)
+    assert tuple(layer.w2_weight.shape) == (1, 64, 384)
+    assert tuple(layer.w13_weight_scale.shape) == (1, 1536, 1)
+    torch.testing.assert_close(layer.w13_weight[:, :640], raw_w13[:, :640])
+    torch.testing.assert_close(
+        layer.w13_weight[:, 768:1408], raw_w13[:, 640:1280]
+    )
+    assert torch.count_nonzero(layer.w13_weight[:, 640:768]) == 0
+    assert torch.count_nonzero(layer.w13_weight[:, 1408:1536]) == 0
+    torch.testing.assert_close(layer.w2_weight[:, :, :320], raw_w2)
+    assert torch.count_nonzero(layer.w2_weight[:, :, 320:]) == 0
+    torch.testing.assert_close(
+        layer.w13_weight_scale[:, :640], raw_w13_scale[:, :640]
+    )
+    torch.testing.assert_close(
+        layer.w13_weight_scale[:, 768:1408], raw_w13_scale[:, 640:1280]
+    )
+    torch.testing.assert_close(
+        layer.w13_weight_scale[:, 640:768],
+        torch.ones_like(layer.w13_weight_scale[:, 640:768]),
+    )
+    torch.testing.assert_close(
+        layer.w13_weight_scale[:, 1408:1536],
+        torch.ones_like(layer.w13_weight_scale[:, 1408:1536]),
+    )
+    assert experts.quant_config._w1.scale is layer.w13_weight_scale
+    assert experts.ll_experts._hcu_logical_n == 1536
+    assert experts.ll_experts._hcu_logical_k == 64
+    assert experts.ht_experts._deepgemm_w13.untyped_storage().data_ptr() == (
+        experts.ll_experts._deepgemm_w13.untyped_storage().data_ptr()
+    )
+    assert experts.ht_experts._deepgemm_w2.untyped_storage().data_ptr() == (
+        experts.ll_experts._deepgemm_w2.untyped_storage().data_ptr()
+    )
+
+
+def test_slimquant_w4a8_auto_reloads_raw_qwen_weights_into_padded_owner(
+    monkeypatch: pytest.MonkeyPatch,
+):
+    """A raw checkpoint reload must retain the graph-stable padded storage."""
+
+    from vllm_hcu.model_executor.layers.quantization import (
+        slimquant_w4a8_deepgemm_runtime as runtime,
+    )
+
+    monkeypatch.setattr(
+        runtime,
+        "pack_w4a8_moe_hipc_weight",
+        lambda weight: weight,
+    )
+
+    def n32_view(weight: torch.Tensor) -> torch.Tensor:
+        num_experts, output_size, packed_k = weight.shape
+        return weight.view(
+            num_experts,
+            packed_k // 32,
+            output_size // 32,
+            4,
+            32,
+            8,
+        )
+
+    monkeypatch.setattr(
+        runtime,
+        "view_w4a8_moe_hipc_weight_n32_layout",
+        n32_view,
+    )
+    layer = _slimquant_qwen_w4a8_auto_layer()
+    _slimquant_w4a8_auto_experts(None).process_weights_after_loading(layer)
+    owner_ptrs = tuple(
+        value.untyped_storage().data_ptr()
+        for value in (
+            layer.w13_weight,
+            layer.w2_weight,
+            layer.w13_weight_scale,
+        )
+    )
+
+    raw_reload = _slimquant_qwen_w4a8_auto_layer()
+    raw_reload.w13_weight.data.fill_(7)
+    raw_reload.w2_weight.data.fill_(9)
+    raw_reload.w13_weight_scale.data.fill_(0.25)
+    layer.w13_weight = raw_reload.w13_weight
+    layer.w2_weight = raw_reload.w2_weight
+    layer.w13_weight_scale = raw_reload.w13_weight_scale
+    replacement = _slimquant_w4a8_auto_experts(None)
+    replacement.process_weights_after_loading(layer)
+
+    assert owner_ptrs == tuple(
+        value.untyped_storage().data_ptr()
+        for value in (
+            layer.w13_weight,
+            layer.w2_weight,
+            layer.w13_weight_scale,
+        )
+    )
+    assert torch.count_nonzero(layer.w13_weight[:, :640] != 7) == 0
+    assert torch.count_nonzero(layer.w13_weight[:, 768:1408] != 7) == 0
+    assert torch.count_nonzero(layer.w13_weight[:, 640:768]) == 0
+    assert torch.count_nonzero(layer.w13_weight[:, 1408:]) == 0
+    assert torch.count_nonzero(layer.w2_weight[:, :, :320] != 9) == 0
+    assert torch.count_nonzero(layer.w2_weight[:, :, 320:]) == 0
+    assert torch.count_nonzero(layer.w13_weight_scale[:, :640] != 0.25) == 0
+    assert (
+        torch.count_nonzero(layer.w13_weight_scale[:, 768:1408] != 0.25)
+        == 0
+    )
+    assert replacement.quant_config._w1.scale is layer.w13_weight_scale
+    assert layer._slimquant_w4a8_deepep_auto_layout == "shared_hipc_auto"
 
 
 def _install_in_place_w4a8_packers(
@@ -4103,8 +4875,8 @@ def test_slimquant_w4a8_contiguous_experts_apply_swiglu_clamp(
         block_shape=None,
         gemm1_clamp_limit=10.0,
     )
-    experts._deepgemm_w13 = torch.empty((1, 1), dtype=torch.int8)
-    experts._deepgemm_w2 = torch.empty((1, 1), dtype=torch.int8)
+    experts._deepgemm_w13 = torch.empty((1, 8, 2), dtype=torch.int8)
+    experts._deepgemm_w2 = torch.empty((1, 4, 2), dtype=torch.int8)
     experts.moe_problem_size = lambda *_args: (1, 2, 8, 4, 1)
 
     monkeypatch.setattr(runtime, "compute_aligned_M", lambda **_kwargs: 2)
@@ -4197,8 +4969,8 @@ def test_slimquant_w4a8_batched_experts_apply_swiglu_clamp(
         use_int8_w8a8=False,
         use_fp8_w8a8=False,
     )
-    experts._deepgemm_w13 = torch.empty((1, 1), dtype=torch.int8)
-    experts._deepgemm_w2 = torch.empty((1, 1), dtype=torch.int8)
+    experts._deepgemm_w13 = torch.empty((1, 8, 2), dtype=torch.int8)
+    experts._deepgemm_w2 = torch.empty((1, 4, 2), dtype=torch.int8)
     experts._hcu_logical_n = 8
     experts._hcu_logical_k = 4
     experts.moe_problem_size = lambda *_args: (1, 2, 8, 4, 1)
@@ -4341,12 +5113,14 @@ def test_channel_int8_auto_factory_builds_unified_ht_ll_kernel(
         "max_num_tokens": 64,
         "num_dispatchers": 8,
         "fixed_use_low_latency": None,
+        "global_ht_token_bound": False,
     }
 
 
 def test_slimquant_w4a8_auto_factory_reuses_unified_prepare_finalize(
     monkeypatch: pytest.MonkeyPatch,
 ):
+    import vllm.config as vllm_config_module
     import vllm.model_executor.layers.fused_moe.all2all_utils as all2all_utils
     from vllm.model_executor.layers.fused_moe.config import FusedMoEQuantConfig
     from vllm_hcu.model_executor.layers.fused_moe.experts import (
@@ -4378,6 +5152,11 @@ def test_slimquant_w4a8_auto_factory_reuses_unified_prepare_finalize(
         "maybe_make_prepare_finalize",
         maybe_make_prepare_finalize,
     )
+    monkeypatch.setattr(
+        vllm_config_module,
+        "get_current_vllm_config_or_none",
+        lambda: None,
+    )
     constructed: dict[str, object] = {}
 
     class AutoW4A8Experts:
@@ -4400,7 +5179,10 @@ def test_slimquant_w4a8_auto_factory_reuses_unified_prepare_finalize(
         weight_dtype="int4",
         gemm1_clamp_limit=10.0,
     )
-    moe_config = SimpleNamespace()
+    moe_config = SimpleNamespace(
+        pcp_size=8,
+        _hcu_global_ht_token_bound=True,
+    )
 
     kernel = module.make_deepep_auto_deepgemm_w4a8_moe_kernel(
         moe_quant_config=quant_config,
@@ -4417,7 +5199,105 @@ def test_slimquant_w4a8_auto_factory_reuses_unified_prepare_finalize(
         "max_num_tokens": 64,
         "num_dispatchers": 8,
         "fixed_use_low_latency": None,
+        "global_ht_token_bound": True,
     }
+
+
+@pytest.mark.parametrize(
+    "architecture", ["DeepseekV4ForCausalLM", "DeepSeekV4MTPModel"]
+)
+def test_slimquant_w4a8_post_load_uses_persisted_architecture_without_context(
+    monkeypatch: pytest.MonkeyPatch,
+    architecture: str,
+):
+    import vllm.config as vllm_config_module
+    from vllm_hcu.model_executor.layers.fused_moe.experts import (
+        dpsk_v4_deep_gemm_moe as experts_module,
+    )
+    from vllm_hcu.model_executor.layers.fused_moe import deepep_runtime
+    from vllm_hcu.model_executor.layers.quantization.slimquant_w4a8 import (
+        SlimQuantW4A8Int8AiterMoEMethod,
+    )
+
+    monkeypatch.setattr(
+        vllm_config_module,
+        "get_current_vllm_config_or_none",
+        lambda: None,
+    )
+    monkeypatch.setattr(deepep_runtime.current_platform, "is_rocm", lambda: True)
+    monkeypatch.setattr(
+        deepep_runtime,
+        "_require_slimquant_w4a8_hipc_runtime",
+        lambda: None,
+    )
+    moe_config = SimpleNamespace(
+        activation="silu",
+        moe_backend="deep_gemm",
+        pcp_size=8,
+        moe_parallel_config=SimpleNamespace(
+            all2all_backend="deepep_auto",
+            dp_size=1,
+            pcp_size=8,
+            use_ep=True,
+            use_deepep_auto_kernels=True,
+        ),
+        _hcu_global_ht_token_bound=True,
+        _hcu_model_architectures=(architecture,),
+    )
+    method = SlimQuantW4A8Int8AiterMoEMethod(None, moe_config)
+    layer = _slimquant_w4a8_auto_layer()
+    layer.w13_input_scale = None
+    layer.w2_input_scale = None
+    routing_tables = (object(), object(), object())
+    layer._expert_routing_tables = lambda: routing_tables
+
+    processed: list[torch.nn.Module] = []
+    captured: dict[str, object] = {}
+
+    class Experts:
+        def process_weights_after_loading(self, loaded_layer):
+            processed.append(loaded_layer)
+
+    def make_kernel(*, moe_quant_config, moe_config, routing_tables):
+        captured.update(
+            moe_quant_config=moe_quant_config,
+            moe_config=moe_config,
+            routing_tables=routing_tables,
+        )
+        return SimpleNamespace(
+            fused_experts=SimpleNamespace(experts=Experts()),
+        )
+
+    monkeypatch.setattr(
+        experts_module,
+        "make_deepep_auto_deepgemm_w4a8_moe_kernel",
+        make_kernel,
+    )
+
+    method.process_weights_after_loading(layer)
+
+    assert captured["moe_config"] is moe_config
+    assert captured["routing_tables"] is routing_tables
+    kernel_quant_config = captured["moe_quant_config"]
+    assert method.moe_quant_config is not None
+    for quant_config in (kernel_quant_config, method.moe_quant_config):
+        assert quant_config.quant_dtype == torch.int8
+        assert quant_config.weight_quant_dtype == "int4"
+        assert quant_config.per_act_token_quant is True
+        assert quant_config.per_out_ch_quant is False
+        assert quant_config.block_shape is None
+        assert quant_config.w1_scale is layer.w13_weight_scale
+        assert quant_config.w2_scale is layer.w2_weight_scale
+        assert quant_config.a1_scale is None
+        assert quant_config.a2_scale is None
+    assert processed == [layer]
+    assert method.moe_kernel is not None
+    assert len(layer._hcu_slimquant_post_load_weight_generation) == 2
+    assert len(layer._hcu_slimquant_post_load_generation) == 4
+    assert (
+        layer._hcu_slimquant_post_load_generation[:2]
+        == layer._hcu_slimquant_post_load_weight_generation
+    )
 
 
 def test_slimquant_w4a8_auto_factory_rejects_non_dynamic_token_scheme(
@@ -4530,6 +5410,19 @@ def test_slimquant_w4a8_auto_factory_rejects_auxiliary_quant_metadata(
 @pytest.mark.parametrize("use_fp8", [True, False])
 def test_deepep_ht_preserves_channel_quant_dispatch_contract(use_fp8: bool):
     class DeepEPHTPrepareAndFinalize:
+        def _sync_dbo_comm_if_needed(self):
+            pass
+
+        def _get_dispatch_config(self):
+            return "config"
+
+        def _get_combine_config(self):
+            return "combine-config"
+
+        def _finalize(self, output, fused_expert_output, topk_weights, topk_ids,
+                      apply_router_weight_on_input, weight_and_reduce_impl, do_async):
+            return "legacy-finalizer"
+
         def _do_dispatch(
             self,
             tokens,
@@ -4584,7 +5477,8 @@ def test_deepep_ht_preserves_channel_quant_dispatch_contract(use_fp8: bool):
     class ExpertTokensMetadata:
         @staticmethod
         def make_from_list(values, device=None):
-            return values, device
+            return SimpleNamespace(expert_num_tokens_cpu=torch.tensor(values),
+                                   expert_num_tokens=torch.tensor(values))
 
     dispatched = {}
 
@@ -4692,7 +5586,7 @@ def test_deepep_ht_preserves_channel_quant_dispatch_contract(use_fp8: bool):
     else:
         assert expert_x is captured["tokens"]
         assert expert_scale is captured["token_scales"]
-    assert metadata[0] == [1]
+    assert metadata.expert_num_tokens_cpu.tolist() == [1]
 
 
 def test_router_factory_feature_gated_hcu_subclass_contract(
@@ -5205,17 +6099,14 @@ def test_deepep_ll_non_hcu_dispatch_signatures_delegate_to_upstream(
     )
 
 
-@pytest.mark.parametrize(
-    ("shared_with_high_throughput", "expected_clean_calls"),
-    [
-        (False, []),
-        (True, [(8, 2048, 1, 128), (8, 2048, 1, 128)]),
-    ],
-)
+@pytest.mark.parametrize("cleanup_accepts_topk", [False, True])
+@pytest.mark.parametrize("topk", [1, 6, 8])
+@pytest.mark.parametrize("shared_with_high_throughput", [False, True])
 def test_deepep_ll_fp8_cleans_only_when_buffer_is_shared_with_high_throughput(
     monkeypatch: pytest.MonkeyPatch,
     shared_with_high_throughput: bool,
-    expected_clean_calls: list[tuple[int, int, int, int]],
+    topk: int,
+    cleanup_accepts_topk: bool,
 ):
     module = _fake_deepep_ll_module()
     module.torch = torch
@@ -5230,11 +6121,15 @@ def test_deepep_ll_fp8_cleans_only_when_buffer_is_shared_with_high_throughput(
     from vllm_hcu.model_executor.layers.fused_moe import deepep_runtime
 
     signature_calls = 0
+    cleanup_signature_calls = 0
     original_signature = deepep_runtime.inspect.signature
 
     def counted_signature(callable_object):
-        nonlocal signature_calls
-        signature_calls += 1
+        nonlocal signature_calls, cleanup_signature_calls
+        if getattr(callable_object, "__func__", None) is Buffer.low_latency_dispatch:
+            signature_calls += 1
+        if getattr(callable_object, "__func__", None) is Buffer.clean_low_latency_buffer:
+            cleanup_signature_calls += 1
         return original_signature(callable_object)
 
     monkeypatch.setattr(deepep_runtime.inspect, "signature", counted_signature)
@@ -5248,9 +6143,10 @@ def test_deepep_ll_fp8_cleans_only_when_buffer_is_shared_with_high_throughput(
             hidden_size,
             num_experts,
             quant_group_size,
+            num_topk=8,
         ):
             calls.setdefault("clean", []).append(
-                (max_tokens, hidden_size, num_experts, quant_group_size)
+                (max_tokens, hidden_size, num_experts, quant_group_size, num_topk)
             )
 
         def low_latency_dispatch(
@@ -5284,6 +6180,15 @@ def test_deepep_ll_fp8_cleans_only_when_buffer_is_shared_with_high_throughput(
             )
             return expert_x, torch.ones(1, dtype=torch.int32), "handle", None, lambda: None
 
+    if not cleanup_accepts_topk:
+
+        def legacy_cleanup(self, max_tokens, hidden_size, num_experts, quant_group_size):
+            calls.setdefault("clean", []).append(
+                (max_tokens, hidden_size, num_experts, quant_group_size)
+            )
+
+        Buffer.clean_low_latency_buffer = legacy_cleanup
+
     instance = cls(Buffer(), 8, 1, use_fp8_dispatch=True)
     instance._vllm_hcu_clean_low_latency_buffer = shared_with_high_throughput
     instance.handles = [None]
@@ -5297,7 +6202,7 @@ def test_deepep_ll_fp8_cleans_only_when_buffer_is_shared_with_high_throughput(
         a2_scale=None,
         a1_gscale=None,
     )
-    topk_weights = torch.ones((1, 1))
+    topk_weights = torch.ones((1, topk))
     from vllm_hcu.platforms import envs as henvs
 
     monkeypatch.setattr(henvs, "VLLM_HCU_USE_CUSTOM_OPS", True)
@@ -5309,7 +6214,7 @@ def test_deepep_ll_fp8_cleans_only_when_buffer_is_shared_with_high_throughput(
     hook, _receiver = instance.prepare_async(
         torch.ones((1, 2048), dtype=torch.bfloat16),
         topk_weights,
-        torch.zeros((1, 1), dtype=torch.int64),
+        torch.zeros((1, topk), dtype=torch.int64),
         1,
         None,
         False,
@@ -5318,7 +6223,7 @@ def test_deepep_ll_fp8_cleans_only_when_buffer_is_shared_with_high_throughput(
     instance.prepare_async(
         torch.ones((1, 2048), dtype=torch.bfloat16),
         topk_weights,
-        torch.zeros((1, 1), dtype=torch.int64),
+        torch.zeros((1, topk), dtype=torch.int64),
         1,
         None,
         False,
@@ -5327,9 +6232,14 @@ def test_deepep_ll_fp8_cleans_only_when_buffer_is_shared_with_high_throughput(
 
     assert callable(hook)
     assert signature_calls == 1
+    assert cleanup_signature_calls == 1
     assert calls["topk_weight"] is topk_weights
     assert calls["quant_type"] == 2
     assert calls["quant_group_size"] == 128
+    expected_clean = (
+        (8, 2048, 1, 128, topk) if cleanup_accepts_topk else (8, 2048, 1, 128)
+    )
+    expected_clean_calls = [expected_clean] * 2 if shared_with_high_throughput else []
     assert calls.get("clean", []) == expected_clean_calls
 
 
@@ -5478,7 +6388,9 @@ def test_moe_runner_and_shared_experts_cold_replacement_contract():
         raise RuntimeError(
             f"VLLM_HCU_TARGET_ROOT does not contain vllm: {target_vllm}"
         )
-    python_path = [str(target_vllm), str(repository)]
+    # A wheel target root can also contain an installed vllm_hcu. Test this
+    # checkout's adapters while still resolving vllm from the requested root.
+    python_path = [str(repository), str(target_vllm)]
     existing = os.environ.get("PYTHONPATH")
     if existing:
         python_path.append(existing)
@@ -5509,6 +6421,10 @@ def test_moe_runner_and_shared_experts_cold_replacement_contract():
 
         coordinator = ExactImportCoordinator(registry=PatchRegistry())
         coordinator.install()
+        # The runner imports join_dp_moe_pipe from the HCU modular kernel.
+        # Arm the same prerequisite as the production platform registration.
+        from vllm_hcu.patch.module_exchange import register_modular_kernel_exchange
+        register_modular_kernel_exchange(coordinator)
         coordinator.register_replacement(
             patch_shared_experts.PATCH_ID,
             patch_shared_experts.TARGET_MODULE,
@@ -5574,6 +6490,7 @@ def test_moe_runner_and_shared_experts_cold_replacement_contract():
                 raise AssertionError("preselected routing must bypass router")
 
         runner = object.__new__(runner_module.MoERunner)
+        runner._ep_fused_combine = False
         runner.routed_experts = SimpleNamespace(quant_method=QuantMethod())
         runner._shared_experts = None
         runner.router = Router()
@@ -5593,6 +6510,51 @@ def test_moe_runner_and_shared_experts_cold_replacement_contract():
         )
         assert shared is None
         assert torch.equal(output, hidden + 1)
+
+        # Pure-TP callers can supply prequantized activations without taking
+        # the DP AllGatherv branch. The quant method still needs the original
+        # floating output dtype for the expert GEMM result.
+        output_dtype_calls = []
+
+        class PrequantizedOutputDtypeMethod:
+            is_monolithic = False
+
+            def apply(
+                self,
+                layer,
+                x,
+                topk_weights,
+                topk_ids,
+                shared_experts,
+                shared_experts_input,
+                i_q=None,
+                i_s=None,
+                output_dtype=None,
+            ):
+                del (
+                    layer,
+                    topk_weights,
+                    topk_ids,
+                    shared_experts,
+                    shared_experts_input,
+                )
+                assert i_q is quanted and i_s is scale
+                output_dtype_calls.append(output_dtype)
+                return x
+
+        prequantized_hidden = hidden.to(torch.bfloat16)
+        runner.routed_experts.quant_method = PrequantizedOutputDtypeMethod()
+        runner.__dict__.pop("_supports_quanted_inputs", None)
+        runner._apply_quant_method(
+            prequantized_hidden,
+            None,
+            None,
+            quanted_hidden_states=quanted,
+            scale=scale,
+            topk_weights=topk_weights,
+            topk_ids=topk_ids,
+        )
+        assert output_dtype_calls == [torch.bfloat16]
 
         class UnsupportedQuantMethod:
             is_monolithic = False
@@ -5617,6 +6579,272 @@ def test_moe_runner_and_shared_experts_cold_replacement_contract():
             assert "does not accept i_q/i_s" in str(error)
         else:
             raise AssertionError("unsupported prequantized input did not fail")
+
+        direct_calls = {}
+        direct_hidden = torch.tensor([[1.0, -2.0]], dtype=torch.bfloat16)
+        direct_logits = torch.tensor([[0.25, 0.75]], dtype=torch.bfloat16)
+        direct_quanted = torch.tensor([[10, -20]], dtype=torch.int8)
+        direct_scale = torch.tensor([[0.1]], dtype=torch.float32)
+        direct_weights = torch.tensor([[0.75]], dtype=torch.float32)
+        direct_ids = torch.tensor([[1]], dtype=torch.int32)
+
+        class DirectQuantMethod:
+            supports_internal_mk = False
+            supports_int8_allgatherv_input = True
+            is_monolithic = False
+            topk_indices_dtype = torch.int32
+
+            def apply(
+                self,
+                layer,
+                x,
+                topk_weights,
+                topk_ids,
+                shared_experts,
+                shared_experts_input,
+                i_q=None,
+                i_s=None,
+                output_dtype=None,
+            ):
+                del layer, shared_experts, shared_experts_input
+                direct_calls["expert"] = (
+                    x, topk_weights, topk_ids, i_q, i_s, output_dtype
+                )
+                return torch.zeros_like(x, dtype=output_dtype)
+
+        class WrappedDirectQuantMethod:
+            supports_internal_mk = False
+            is_monolithic = False
+            topk_indices_dtype = torch.int32
+
+            def __init__(self):
+                self.old_quant_method = DirectQuantMethod()
+
+            def apply(
+                self,
+                layer,
+                x,
+                topk_weights,
+                topk_ids,
+                shared_experts,
+                shared_experts_input,
+                i_q=None,
+                i_s=None,
+            ):
+                return self.old_quant_method.apply(
+                    layer,
+                    x,
+                    topk_weights,
+                    topk_ids,
+                    shared_experts,
+                    shared_experts_input,
+                    i_q=i_q,
+                    i_s=i_s,
+                    output_dtype=x.dtype,
+                )
+
+        class DirectRouter:
+            def select_experts(self, **kwargs):
+                direct_calls["router_hidden"] = kwargs["hidden_states"]
+                direct_calls["router_logits"] = kwargs["router_logits"]
+                return direct_weights, direct_ids
+
+        class DirectGroup:
+            def dispatch_router_logits(self, *_args, **_kwargs):
+                raise AssertionError(
+                    "direct INT8 path must select top-k before AllGatherv"
+                )
+
+            def dispatch(
+                self,
+                dispatched_hidden,
+                dispatched_weights,
+                dispatched_ids,
+                is_sequence_parallel=False,
+            ):
+                assert dispatched_hidden is direct_hidden
+                assert dispatched_weights is direct_weights
+                assert dispatched_ids is direct_ids
+                assert is_sequence_parallel is False
+                return direct_quanted, direct_weights, direct_ids, direct_scale
+
+            def combine(self, output, is_sequence_parallel=False):
+                assert is_sequence_parallel is False
+                return output
+
+        class DirectSharedExperts:
+            def __init__(self):
+                self.output = direct_hidden
+                self.supports_quanted_input = True
+                self.expected_input = direct_hidden
+
+            def _layer_supports_x_and_scale_quanted(self):
+                return self.supports_quanted_input
+
+            def __call__(
+                self,
+                shared_input,
+                order,
+                x_and_scale_quanted=None,
+            ):
+                del order
+                assert shared_input is self.expected_input
+                direct_calls.setdefault("shared_quanted_inputs", []).append(
+                    x_and_scale_quanted
+                )
+
+            def maybe_sync_shared_experts_stream(
+                self,
+                shared_input,
+                x_and_scale_quanted=None,
+            ):
+                assert shared_input is self.expected_input
+                direct_calls.setdefault("shared_sync_quanted_inputs", []).append(
+                    x_and_scale_quanted
+                )
+
+        direct_runner = object.__new__(runner_module.MoERunner)
+        direct_runner._ep_fused_combine = False
+        direct_runner.moe_config = SimpleNamespace(
+            pcp_size=1,
+            dp_size=4,
+            tp_size=1,
+            is_sequence_parallel=False,
+            moe_parallel_config=SimpleNamespace(use_all2all_kernels=False),
+        )
+        direct_runner.routed_experts = SimpleNamespace(
+            quant_method=WrappedDirectQuantMethod(),
+            _ensure_moe_quant_config_init=lambda: None,
+        )
+        direct_runner._shared_experts = DirectSharedExperts()
+        direct_runner.router = DirectRouter()
+        direct_runner.gate = None
+        direct_runner._sequence_parallel_context = lambda: runner_module.nullcontext()
+        runner_module._int8_allgatherv_enabled = lambda: True
+        # Exercise the CT adapter's real post-load capability propagation
+        # through the production runner, including its modular unwrap path.
+        from vllm_hcu.model_executor.layers.quantization import compressed_tensors_w4a8_runtime as ct_w4a8
+
+        saved_quant_method = direct_runner.routed_experts.quant_method
+        for support in (False, True):
+            delegate = SimpleNamespace(
+                supports_int8_allgatherv_input=support,
+                moe_quant_config=None,
+                moe_kernel=None,
+                process_weights_after_loading=lambda layer: None,
+            )
+            adapter = SimpleNamespace(
+                is_transposed=False,
+                supports_internal_mk=False,
+                _hcu_ct_w4a8_delegate=delegate,
+            )
+            storage = torch.nn.Module()
+            for prefix in ("w13", "w2"):
+                storage.register_parameter(prefix + "_weight_packed", torch.nn.Parameter(
+                    torch.zeros(1, 1, 1, dtype=torch.int32), requires_grad=False,
+                ))
+                storage.register_parameter(prefix + "_weight_scale", torch.nn.Parameter(
+                    torch.ones(1, 1, 1), requires_grad=False,
+                ))
+            ct_w4a8._process_weights_after_loading(adapter, storage)
+            for wrapped in (False, True):
+                direct_runner.routed_experts.quant_method = (
+                    SimpleNamespace(old_quant_method=adapter, supports_internal_mk=False)
+                    if wrapped else adapter
+                )
+                assert direct_runner.do_int8_allgatherv_dispatch is support
+        direct_runner.routed_experts.quant_method = saved_quant_method
+        from vllm_hcu.patch.worker.framework_opt import patch_agrs_int8
+
+        patch_agrs_int8._quantize_hidden_states = lambda value: (
+            direct_quanted,
+            direct_scale,
+        )
+        runner_module.get_ep_group = lambda: DirectGroup()
+        assert direct_runner._use_int8_allgatherv_dispatch(direct_hidden)
+        assert not direct_runner._use_int8_allgatherv_dispatch(
+            direct_hidden.to(torch.float16)
+        )
+        direct_runner.moe_config.dp_size = 2
+        assert not direct_runner._use_int8_allgatherv_dispatch(direct_hidden)
+        direct_runner.moe_config.dp_size = 4
+        direct_runner.moe_config.tp_size = 2
+        assert not direct_runner._use_int8_allgatherv_dispatch(direct_hidden)
+        direct_runner.moe_config.tp_size = 1
+        direct_output = direct_runner._forward_impl(
+            direct_hidden, direct_logits, direct_hidden
+        )
+        assert direct_output[1].dtype is torch.bfloat16
+        assert direct_calls["shared_quanted_inputs"] == [
+            (direct_quanted, direct_scale),
+            (direct_quanted, direct_scale),
+        ]
+        assert direct_calls["shared_sync_quanted_inputs"] == [
+            (direct_quanted, direct_scale)
+        ]
+        assert direct_calls["router_hidden"] is direct_hidden
+        assert direct_calls["router_logits"] is direct_logits
+        expert_input, *expert_payload = direct_calls["expert"]
+        assert expert_input.dtype is torch.bfloat16
+        assert expert_input.shape == direct_quanted.shape
+        assert expert_payload == [
+            direct_weights,
+            direct_ids,
+            direct_quanted,
+            direct_scale,
+            torch.bfloat16,
+        ]
+
+        direct_runner._shared_experts.supports_quanted_input = False
+        direct_calls["shared_quanted_inputs"] = []
+        direct_calls["shared_sync_quanted_inputs"] = []
+        direct_output = direct_runner._forward_impl(
+            direct_hidden, direct_logits, direct_hidden
+        )
+        assert direct_output[1].dtype is torch.bfloat16
+        assert direct_calls["shared_quanted_inputs"] == [None, None]
+        assert direct_calls["shared_sync_quanted_inputs"] == [None]
+        assert direct_calls["expert"][3:5] == (direct_quanted, direct_scale)
+
+        # A routed-input transform may leave the shared branch on the original
+        # activation. Transport quantization belongs to the routed tensor and
+        # must not be reused for a distinct shared-expert input.
+        distinct_shared_input = direct_hidden.clone()
+        direct_runner._shared_experts.supports_quanted_input = True
+        direct_runner._shared_experts.expected_input = distinct_shared_input
+        direct_calls["shared_quanted_inputs"] = []
+        direct_calls["shared_sync_quanted_inputs"] = []
+        direct_output = direct_runner._forward_impl(
+            direct_hidden, direct_logits, distinct_shared_input
+        )
+        assert direct_output[1].dtype is torch.bfloat16
+        assert direct_calls["shared_quanted_inputs"] == [None, None]
+        assert direct_calls["shared_sync_quanted_inputs"] == [None]
+        assert direct_calls["expert"][3:5] == (direct_quanted, direct_scale)
+
+        class FallbackGroup:
+            def dispatch_router_logits(
+                self, fallback_hidden, fallback_logits, is_sequence_parallel=False
+            ):
+                assert fallback_hidden is direct_hidden
+                assert fallback_logits is direct_logits
+                assert is_sequence_parallel is False
+                return fallback_hidden, fallback_logits
+
+        fallback_runner = object.__new__(runner_module.MoERunner)
+        fallback_runner.moe_config = direct_runner.moe_config
+        fallback_runner.routed_experts = SimpleNamespace(
+            quant_method=SimpleNamespace(
+                supports_internal_mk=False,
+                supports_int8_allgatherv_input=False,
+            )
+        )
+        runner_module.get_ep_group = lambda: FallbackGroup()
+        fallback_hidden, fallback_logits = fallback_runner._maybe_dispatch(
+            direct_hidden, direct_logits
+        )
+        assert fallback_hidden is direct_hidden
+        assert fallback_logits is direct_logits
 
         class SharedLayer:
             def forward(self, value, x_and_scale_quanted=None):
@@ -5649,6 +6877,7 @@ def test_moe_runner_and_shared_experts_cold_replacement_contract():
 
         pcp_group = PCPGroup()
         runner = object.__new__(runner_module.MoERunner)
+        runner._ep_fused_combine = False
         runner.moe_config = SimpleNamespace(
             pcp_size=2,
             dp_size=1,
@@ -5797,3 +7026,123 @@ def test_importing_adapters_does_not_eager_import_optional_moe_stacks():
         importlib.reload(adapter)
     for name in optional:
         assert sys.modules.get(name) is before[name]
+
+
+@pytest.mark.parametrize("pcp", [2, 8])
+def test_deepep_auto_uses_internal_dispatch_for_pcp_without_dp(monkeypatch, pcp):
+    import vllm.config
+
+    monkeypatch.setattr(vllm.config, "get_current_vllm_config_or_none", lambda: None)
+    module = _fake_config_module()
+    patch_config.apply_to_module(module)
+    upstream = SimpleNamespace(
+        all2all_backend="deepep_low_latency", enable_expert_parallel=True,
+        _vllm_hcu_deepep_auto=True,
+    )
+    parallel = module.FusedMoEParallelConfig.make(1, pcp, 1, 1, upstream)
+    parallel.is_sequence_parallel = False
+    assert parallel.use_all2all_kernels
+    assert parallel.use_deepep_auto_kernels
+    assert parallel.use_batched_activation_format
+    parallel.use_ep = False
+    assert not parallel.use_all2all_kernels
+    assert not parallel.use_deepep_auto_kernels
+
+
+@pytest.mark.parametrize(
+    "mode", ["shared", "disabled", "master_disabled", "layouts_differ"]
+)
+def test_channel_fp8_auto_experts_share_identical_marlin_layouts(
+    monkeypatch: pytest.MonkeyPatch, mode: str,
+):
+    from vllm_hcu.model_executor.layers.fused_moe.experts import (
+        dpsk_v4_deep_gemm_moe as module,
+    )
+
+    monkeypatch.setenv("VLLM_HCU_DEEPEP_AUTO_SHARED_WEIGHTS",
+                       "0" if mode == "disabled" else "1")
+    monkeypatch.setenv(
+        "VLLM_HCU_USE_CUSTOM_OPS",
+        "0" if mode == "master_disabled" else "1",
+    )
+
+    def make_experts():
+        experts = object.__new__(module.DeepEPAutoDeepGemmExperts)
+        experts._fixed_use_low_latency = None
+        experts.ht_experts = object.__new__(module.DeepEPDeepGemmContiguousExperts)
+        experts.ll_experts = object.__new__(module.DeepEPDeepGemmMaskedExperts)
+        return experts
+
+    def raw_layer(layer):
+        layer.w13_weight = torch.nn.Parameter(w13.clone(), requires_grad=False)
+        layer.w2_weight = torch.nn.Parameter(w2.clone(), requires_grad=False)
+        return layer
+
+    w13 = torch.randint(-128, 128, (2, 32, 64), dtype=torch.int8)
+    w2 = torch.randint(-128, 128, (2, 64, 16), dtype=torch.int8)
+    layer = raw_layer(torch.nn.Module())
+    layer.w13_weight_scale = torch.nn.Parameter(torch.ones((2, 32)))
+    layer.w2_weight_scale = torch.nn.Parameter(torch.ones((2, 64)))
+    layer.weight_block_size = None
+
+    # gfx938 deepgemm applies the same permutation in both packers.
+    def pack(weight: torch.Tensor) -> torch.Tensor:
+        return weight.flip(-1).reshape(weight.shape[0], 1, 1, 1, *weight.shape[1:])
+
+    monkeypatch.setattr(module, "marlin_fp8_contiguous_weight", pack)
+    monkeypatch.setattr(
+        module, "marlin_fp8_masked_weight",
+        (lambda w: w.reshape(w.shape[0], 1, 1, 1, *w.shape[1:]))
+        if mode == "layouts_differ" else pack,
+    )
+
+    experts = make_experts()
+    experts.process_weights_after_loading(layer)
+    assert torch.equal(layer.w13_weight, pack(w13))
+    assert torch.equal(layer.w2_weight, pack(w2))
+    if mode != "shared":
+        assert layer._dsv4_channel_deepgemm_layout == "contiguous+masked"
+        assert experts.ll_experts._deepgemm_w13 is layer._dsv4_channel_deepgemm_masked_w13
+        assert experts.ll_experts._deepgemm_w13 is not layer.w13_weight
+        return
+
+    assert layer._dsv4_channel_deepgemm_layout == "contiguous=masked"
+    assert not hasattr(layer, "_dsv4_channel_deepgemm_masked_w13")
+    for child in (experts.ht_experts, experts.ll_experts):
+        assert child._deepgemm_w13 is layer.w13_weight
+        assert child._deepgemm_w2 is layer.w2_weight
+
+    # A rebuilt expert (e.g. after layerwise reload) rebinds without repacking.
+    replacement = make_experts()
+    replacement.process_weights_after_loading(layer)
+    assert replacement.ll_experts._deepgemm_w13 is layer.w13_weight
+    assert replacement.ht_experts._deepgemm_w2 is layer.w2_weight
+
+    # Raw reload of the shared layout repacks into one copy again.
+    reloaded = make_experts()
+    reloaded.process_weights_after_loading(raw_layer(layer))
+    assert reloaded.ll_experts._deepgemm_w13 is layer.w13_weight
+    assert torch.equal(layer.w13_weight, pack(w13))
+
+
+def test_deepep_ll_cleanup_runs_once_per_forward(monkeypatch: pytest.MonkeyPatch):
+    import vllm.forward_context as fc
+
+    from vllm_hcu.model_executor.layers.fused_moe import deepep_runtime
+
+    buffer_a, buffer_b = object(), object()
+    contexts = [SimpleNamespace(), SimpleNamespace()]
+    current = {"ctx": contexts[0]}
+    monkeypatch.setattr(fc, "is_forward_context_available", lambda: True)
+    monkeypatch.setattr(fc, "get_forward_context", lambda: current["ctx"])
+
+    claim = deepep_runtime._claim_ll_buffer_cleanup
+    assert claim(buffer_a) is True
+    assert claim(buffer_a) is False
+    assert claim(buffer_b) is True
+    current["ctx"] = contexts[1]
+    assert claim(buffer_a) is True
+
+    monkeypatch.setattr(fc, "is_forward_context_available", lambda: False)
+    assert claim(buffer_a) is True
+    assert claim(buffer_a) is True

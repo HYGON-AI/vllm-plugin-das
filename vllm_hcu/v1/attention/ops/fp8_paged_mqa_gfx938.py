@@ -35,6 +35,7 @@ def _paged_logits(
     BLOCK_H: tl.constexpr,
     BLOCK_D: tl.constexpr,
     BLOCK_T: tl.constexpr,
+    FILL_TAIL: tl.constexpr,
 ):
     row = tl.program_id(0)
     batch = row // NEXT_N
@@ -46,21 +47,39 @@ def _paged_logits(
         end = tl.load(Lengths + batch * L_BATCH + query * L_NEXT)
     else:
         end = tl.load(Lengths + batch * L_BATCH) - NEXT_N + 1 + query
+    if tl.program_id(1) * BLOCK_T >= end:
+        # Tiles past this query's context only need the -inf fill; skipping
+        # the page loads and dot keeps cost proportional to the context
+        # instead of max_model_len.  Callers whose top-k honors per-row ends
+        # skip the fill too: with a 1M max_model_len it alone writes
+        # rows * 4 MB per layer.
+        if FILL_TAIL:
+            tl.store(
+                Out + row * MAX_LEN + tokens,
+                tl.full((BLOCK_T,), -float("inf"), tl.float32),
+                tokens < MAX_LEN,
+            )
+        return
     logical_page = tokens // PAGE_SIZE
     valid = (tokens < MAX_LEN) & (tokens < end) & (logical_page < TABLE_WIDTH)
     page = tl.load(
         Tables + batch * T_BATCH + logical_page * T_PAGE, valid, other=-1
     ).to(tl.int64)
     valid = valid & (page >= 0) & (page < NUM_PAGES)
+    # HCU still faults on masked OOB pointers; clamp before forming addresses.
+    page = tl.where(valid, page, 0)
     slot = tokens % PAGE_SIZE
-    page_base = page * CACHE_PAGE_STRIDE
-    offset = (
-        page_base[None, :]
-        + (slot[None, :] // 16) * (16 * DIM)
+    # Keep the full physical-page address in int64. Layer-split caches can
+    # exceed the signed-int32 offset range because pages retain their packed
+    # cross-layer stride.
+    page_base = page.to(tl.int64) * CACHE_PAGE_STRIDE
+    in_page_offset = (
+        (slot[None, :] // 16) * (16 * DIM)
         + (dims[:, None] // 16) * 256
         + (slot[None, :] % 16) * 16
         + dims[:, None] % 16
     )
+    offset = page_base[None, :] + in_page_offset.to(tl.int64)
     keys = tl.load(Cache + offset, (dims[:, None] < DIM) & valid[None, :], 0.0)
     query_values = tl.load(
         Q + batch * Q_BATCH + query * Q_NEXT + heads[:, None] * Q_HEAD + dims[None, :],
@@ -80,7 +99,6 @@ def _paged_logits(
         tokens < MAX_LEN,
     )
 
-
 def gfx938_fp8_paged_mqa_logits(
     q_fp8: torch.Tensor,
     kv_cache_fp8: torch.Tensor,
@@ -88,6 +106,7 @@ def gfx938_fp8_paged_mqa_logits(
     context_lens: torch.Tensor,
     block_tables: torch.Tensor,
     max_model_len: int,
+    fill_tail: bool = True,
 ) -> torch.Tensor:
     """Compute weighted logits without materializing token-major K storage.
 
@@ -100,10 +119,14 @@ def gfx938_fp8_paged_mqa_logits(
         context_lens: Int32/int64 final lengths [batch] or exact ends [batch,next_n].
         block_tables: Int32/int64 logical-to-physical page IDs [batch, pages].
         max_model_len: Number of output token positions.
+        fill_tail: Write -inf past each row's context end.  When False those
+            positions are left unwritten and consumers must bound reads by the
+            per-row end, as the decode top-k selectors do.
 
     Returns:
         Float32 logits [batch * next_n, max_model_len], with invalid positions
-        set to negative infinity, including missing or out-of-range pages.
+        set to negative infinity, including missing or out-of-range pages
+        (positions past the row end only when ``fill_tail``).
     """
     if q_fp8.ndim != 4 or q_fp8.dtype != torch.float8_e4m3fn:
         raise ValueError("q_fp8 must be a rank-4 float8_e4m3fn tensor")
@@ -145,6 +168,7 @@ def gfx938_fp8_paged_mqa_logits(
     )
     if max_model_len == 0:
         return output
+
     cache = kv_cache_fp8.view(q_fp8.dtype)
     _paged_logits[(batch * next_n, triton.cdiv(max_model_len, 64))](
         q_fp8,
@@ -170,6 +194,7 @@ def gfx938_fp8_paged_mqa_logits(
         max(16, triton.next_power_of_2(heads)),
         triton.next_power_of_2(dim),
         64,
+        fill_tail,
         num_warps=4,
     )
     return output

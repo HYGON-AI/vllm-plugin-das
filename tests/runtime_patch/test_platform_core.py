@@ -201,6 +201,7 @@ def test_envs_allows_only_hcu_namespace_and_defaults_aiter_off(
         environment_variables={
             "VLLM_KNOWN": lambda: "known",
             "VLLM_ROCM_USE_AITER_MOE": lambda: True,
+            "VLLM_USE_V2_MODEL_RUNNER": lambda: None,
         },
         validate_environ=original_validate,
         logger=logger,
@@ -215,6 +216,9 @@ def test_envs_allows_only_hcu_namespace_and_defaults_aiter_off(
 
     monkeypatch.setenv("VLLM_HCU_FEATURE", "1")
     monkeypatch.setenv("VLLM_KNOWN", "1")
+    for name in ("VLLM_KIMI_KDA_PREFILL_BACKEND", "VLLM_KIMI_KDA_CACHE_STRATEGY",
+                 "VLLM_KIMI_KDA_STATE_BACKEND", "VLLM_KIMI_KDA_DEBUG"):
+        monkeypatch.setenv(name, "1")
     module.validate_environ(hard_fail=True)
 
     monkeypatch.setenv("VLLM_NOT_HCU", "1")
@@ -233,7 +237,10 @@ def test_envs_allows_only_hcu_namespace_and_defaults_aiter_off(
 def test_envs_rejects_signature_drift_and_latches_failure():
     module = _module(
         patch_envs.TARGET_MODULE,
-        environment_variables={"VLLM_ROCM_USE_AITER_MOE": lambda: True},
+        environment_variables={
+            "VLLM_ROCM_USE_AITER_MOE": lambda: True,
+            "VLLM_USE_V2_MODEL_RUNNER": lambda: None,
+        },
         validate_environ=lambda: None,
         logger=logging.getLogger("test.hcu.bad_envs"),
     )

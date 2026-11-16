@@ -4,7 +4,7 @@ on:
   pull_request:
     types: [opened, synchronize, reopened, ready_for_review]
     branches:
-      - v0.25.1
+      - v0.28.1-dev
 
 permissions:
   contents: read
@@ -16,6 +16,6 @@ concurrency:
 jobs:
   gate:
     name: Checks
-    uses: HYGON-AI/quality-gate/.github/workflows/pr-quality-gate.yml@v2.0.3
+    uses: HYGON-AI/quality-gate/.github/workflows/pr-quality-gate.yml@stable
     permissions:
       contents: read

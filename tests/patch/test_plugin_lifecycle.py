@@ -94,6 +94,20 @@ def _fresh_python(
         child_code = _TARGET_INSTALL_ASSERTION + code
     else:
         child_code = code + _TARGET_INSTALL_ASSERTION
+    if env.get("VLLM_HCU_CPU_AUDIT") == "1" and not no_site and assert_target_install:
+        # Propagate the CPU audit boundary into lifecycle child interpreters.
+        child_code = """
+import torch
+
+def _cpu_audit_forbidden(*args, **kwargs):
+    raise RuntimeError("GPU/distributed initialization forbidden in CPU audit")
+
+torch.cuda._lazy_init = _cpu_audit_forbidden
+torch.cuda.init = _cpu_audit_forbidden
+# Import-time kernel selection uses a synthetic capability in this CPU fixture.
+torch.cuda.get_device_capability = lambda *args, **kwargs: (9, 0)
+torch.distributed.init_process_group = _cpu_audit_forbidden
+""" + child_code
     command = [sys.executable]
     if no_site:
         command.append("-S")
@@ -483,6 +497,133 @@ print(json.dumps({
 
 
 @pytest.mark.hcu
+def test_offline_eplb_worker_callbacks_apply_once_with_serialized_mrv2_config():
+    result = _fresh_python(
+        r'''
+import importlib
+import json
+import pickle
+
+from vllm import envs
+from vllm.config import CompilationConfig, ParallelConfig, VllmConfig
+from vllm_hcu.patch import patch_report
+from vllm_hcu.patch.config import HcuFeatureConfig, get_hcu_config
+from vllm_hcu.patch.worker import apply_worker_patches
+from vllm_hcu.patch.worker.framework_opt import (
+    patch_eplb_communicator,
+    patch_model_loader_static_eplb,
+    patch_offline_eplb,
+    patch_static_expert_mapping,
+)
+
+envs.VLLM_USE_V2_MODEL_RUNNER = True
+config = object.__new__(VllmConfig)
+config.additional_config = {
+    "hcu": HcuFeatureConfig(
+        expert_map_path="/maps/hy4-static.json",
+        eplb_static_dispatch_policy="locality_fair",
+    ).to_dict()
+}
+config.compilation_config = CompilationConfig()
+config.parallel_config = ParallelConfig(all2all_backend="deepep_low_latency")
+config = pickle.loads(pickle.dumps(config))
+assert get_hcu_config(config).expert_map_path == "/maps/hy4-static.json"
+assert config.use_v2_model_runner is True
+assert type(config) is VllmConfig
+
+apply_worker_patches(config)
+apply_worker_patches(config)
+adapters = (
+    patch_model_loader_static_eplb,
+    patch_static_expert_mapping,
+    patch_offline_eplb,
+    patch_eplb_communicator,
+)
+second_apply = []
+for adapter in adapters:
+    module = importlib.import_module(adapter.TARGET_MODULE)
+    second_apply.append(adapter.apply_to_module(module))
+
+report = patch_report()["patches"]
+patch_ids = [adapter.PATCH_ID for adapter in adapters]
+print(json.dumps({
+    "statuses": {patch_id: report[patch_id]["status"] for patch_id in patch_ids},
+    "features": {
+        patch_id: report[patch_id]["feature_enabled"] for patch_id in patch_ids
+    },
+    "second_apply": second_apply,
+    "config_class": f"{type(config).__module__}.{type(config).__name__}",
+    "use_v2_model_runner": config.use_v2_model_runner,
+    "failed": {
+        patch_id: record["failure_reason"]
+        for patch_id, record in report.items()
+        if record["status"] == "failed"
+    },
+}))
+''',
+        plugins="hcu",
+    )
+    assert result.returncode == 0, result.stdout + result.stderr
+    payload = json.loads(result.stdout.strip().splitlines()[-1])
+    assert set(payload["statuses"].values()) == {"applied"}
+    assert set(payload["features"].values()) == {True}
+    assert payload["second_apply"] == [False, False, False, False]
+    assert payload["config_class"] == "vllm.config.vllm.VllmConfig"
+    assert payload["use_v2_model_runner"] is True
+    assert payload["failed"] == {}
+
+
+@pytest.mark.hcu
+def test_installed_cli_defers_hcu_offline_eplb_fields_until_engine_args():
+    result = _fresh_python(
+        r'''
+import json
+import tempfile
+from transformers import Qwen3Config
+
+# Argument parsing requires a real local config, not an unmounted model path.
+model_directory = tempfile.TemporaryDirectory()
+Qwen3Config().save_pretrained(model_directory.name)
+
+from vllm.engine.arg_utils import EngineArgs
+from vllm.utils.argparse_utils import FlexibleArgumentParser
+from vllm_hcu.patch.config import get_hcu_config
+
+parser = FlexibleArgumentParser()
+EngineArgs.add_cli_args(parser)
+namespace = parser.parse_args([
+    "--model", model_directory.name,
+    "--eplb-config", json.dumps({
+        "window_size": 16,
+        "step_interval": 16,
+        "num_redundant_experts": 8,
+        "use_async": False,
+        "expert_map_record_path": "/maps/hy4-calibration.json",
+    }),
+])
+engine_args = EngineArgs.from_cli_args(namespace)
+print(json.dumps({
+    "parsed_type": type(namespace.eplb_config).__name__,
+    "engine_type": type(engine_args.eplb_config).__name__,
+    "window_size": engine_args.eplb_config.window_size,
+    "use_async": engine_args.eplb_config.use_async,
+    "record_path": get_hcu_config(engine_args).expert_map_record_path,
+}))
+''',
+        plugins="hcu",
+    )
+    assert result.returncode == 0, result.stdout + result.stderr
+    payload = json.loads(result.stdout.strip().splitlines()[-1])
+    assert payload == {
+        "parsed_type": "dict",
+        "engine_type": "EPLBConfig",
+        "window_size": 16,
+        "use_async": False,
+        "record_path": "/maps/hy4-calibration.json",
+    }
+
+
+@pytest.mark.hcu
 def test_arg_utils_first_import_applies_sidecar_before_first_construction():
     result = _fresh_python(
         "import dataclasses,json,tempfile; "
@@ -658,7 +799,9 @@ def test_worker_selects_plugin_owned_model_runner(
 def test_hcu_worker_rejects_model_runner_v1(cpu_safe_hcu_worker_module):
     with pytest.raises(RuntimeError, match="only Model Runner V2"):
         cpu_safe_hcu_worker_module._create_model_runner(
-            object(), object(), use_v2_model_runner=False
+            SimpleNamespace(model_config=SimpleNamespace(hf_config=SimpleNamespace(
+                model_type="qwen3"
+            ))), object(), use_v2_model_runner=False
         )
 
 
@@ -719,16 +862,21 @@ def test_hcu_model_runner_v2_scopes_request_phase_around_upstream_execute(
     upstream_name = "vllm.v1.worker.gpu.model_runner"
     adapter_name = "vllm_hcu.v1.hcu_model_runner_v2"
     upstream_module = ModuleType(upstream_name)
+    prepared_inputs = []
 
     class UpstreamGPUModelRunner:
         def __init__(self, vllm_config, device):
+            self.vllm_config = vllm_config
             self.upstream_init = (vllm_config, device)
 
-        def prepare_inputs(self, scheduler_output, batch_desc, batch_req_state):
+        def prepare_inputs(self, scheduler_output, batch_req_state, batch_desc):
+            prepared_inputs.append(
+                (scheduler_output, batch_req_state, batch_desc)
+            )
             return SimpleNamespace(is_prefilling_np=[False, False])
 
         def execute_model(self):
-            self.prepare_inputs(None, None, None)
+            self.prepare_inputs("scheduler", "batch_state", "batch_desc")
             from vllm_hcu.forward_context_runtime import (
                 get_deepep_auto_request_phase,
             )
@@ -737,6 +885,11 @@ def test_hcu_model_runner_v2_scopes_request_phase_around_upstream_execute(
 
     upstream_module.GPUModelRunner = UpstreamGPUModelRunner
     monkeypatch.setitem(sys.modules, upstream_name, upstream_module)
+    # Register undo even when the adapter was absent before this stub import.
+    import vllm_hcu.v1 as hcu_v1
+
+    monkeypatch.setattr(hcu_v1, "hcu_model_runner_v2", None, raising=False)
+    monkeypatch.setitem(sys.modules, adapter_name, None)
     monkeypatch.delitem(sys.modules, adapter_name, raising=False)
 
     adapter_module = importlib.import_module(adapter_name)
@@ -749,10 +902,83 @@ def test_hcu_model_runner_v2_scopes_request_phase_around_upstream_execute(
     assert runner.upstream_init == (config, device)
     assert runner.pcp_manager is None
     assert runner.execute_model() == [False, False]
+    assert prepared_inputs == [("scheduler", "batch_state", "batch_desc")]
     from vllm_hcu.forward_context_runtime import get_deepep_auto_request_phase
 
     assert get_deepep_auto_request_phase() is None
     assert "execute_model" in adapter.__dict__
+
+
+def test_hcu_model_runner_v2_binds_router_while_worker_weight_pool_is_active(
+    monkeypatch,
+):
+    """The packed router copy must be allocated before the weights pool exits."""
+
+    upstream_name = "vllm.v1.worker.gpu.model_runner"
+    adapter_name = "vllm_hcu.v1.hcu_model_runner_v2"
+    upstream_module = ModuleType(upstream_name)
+    events: list[object] = []
+    pool_active = False
+    model = SimpleNamespace(modules=lambda: ())
+
+    class UpstreamGPUModelRunner:
+        def __init__(self, vllm_config, device):
+            self.vllm_config = vllm_config
+            del device
+            self.model = None
+
+        def load_model(self, load_dummy_weights=False):
+            assert pool_active
+            events.append(("upstream-load", load_dummy_weights))
+            self.model = model
+
+        def get_draft_model(self):
+            return None
+
+        def execute_model(self):
+            return None
+
+    upstream_module.GPUModelRunner = UpstreamGPUModelRunner
+    monkeypatch.setitem(sys.modules, upstream_name, upstream_module)
+    # Restore the package attribute as well as sys.modules after the test.
+    import vllm_hcu.v1 as hcu_v1
+
+    monkeypatch.setattr(hcu_v1, "hcu_model_runner_v2", None, raising=False)
+    monkeypatch.setitem(sys.modules, adapter_name, None)
+    monkeypatch.delitem(sys.modules, adapter_name, raising=False)
+
+    from vllm_hcu.model_executor.layers.fused_moe import (
+        glm53_router_gemv as router_runtime,
+    )
+
+    def bind_router(loaded_model):
+        assert pool_active
+        assert loaded_model is model
+        events.append("bind-router")
+        return 42
+
+    monkeypatch.setattr(router_runtime, "bind_glm53_router_gates", bind_router)
+    from vllm_hcu.patch.worker.core_fix import patch_deepseek_v4_attention
+
+    def bind_compressor(loaded_model):
+        assert pool_active
+        assert loaded_model is model
+        events.append("bind-compressor")
+        return 7
+
+    monkeypatch.setattr(patch_deepseek_v4_attention, "bind_compressor_nt_weights", bind_compressor)
+    adapter_module = importlib.import_module(adapter_name)
+    runner = adapter_module.HcuGPUModelRunnerV2(object(), object())
+
+    pool_active = True
+    try:
+        runner.load_model(load_dummy_weights=True)
+    finally:
+        pool_active = False
+
+    assert events == [("upstream-load", True), "bind-router", "bind-compressor"]
+    assert runner._vllm_hcu_num_router_gates == 42
+    assert runner._vllm_hcu_num_compressor_weights == 7
 
 
 def test_worker_allocates_separate_dspark_workspace_lane(
@@ -935,6 +1161,13 @@ def test_platform_defaults_prearm_worker_before_aiter_import(monkeypatch):
     assert events == ["prepare", "fused_moe", "linear", "shared"]
 
 
+class _CompilationConfigStub:
+    """Support the weak-reference binding used by the platform graph policy."""
+
+    def __init__(self):
+        self.cudagraph_mode = SimpleNamespace(has_full_cudagraphs=lambda: False)
+
+
 def test_platform_check_uses_lazy_executor_selector(monkeypatch):
     import torch
 
@@ -959,12 +1192,11 @@ def test_platform_check_uses_lazy_executor_selector(monkeypatch):
         lambda config: events.append("executor") or False,
     )
     config = SimpleNamespace(
+        additional_config={},
         model_config=SimpleNamespace(use_mla=False),
         cache_config=None,
         attention_config=SimpleNamespace(backend=None),
-        compilation_config=SimpleNamespace(
-            cudagraph_mode=SimpleNamespace(has_full_cudagraphs=lambda: False)
-        ),
+        compilation_config=_CompilationConfigStub(),
         parallel_config=SimpleNamespace(worker_cls="auto"),
     )
     HCUPlatform.check_and_update_config(config)
@@ -1001,15 +1233,14 @@ def test_hcu_config_preserves_mla_prefix_caching(monkeypatch):
         or False,
     )
     config = SimpleNamespace(
+        additional_config={},
         model_config=SimpleNamespace(use_mla=True),
         cache_config=SimpleNamespace(
             enable_prefix_caching=True,
             user_specified_block_size=True,
         ),
         attention_config=SimpleNamespace(backend=None),
-        compilation_config=SimpleNamespace(
-            cudagraph_mode=SimpleNamespace(has_full_cudagraphs=lambda: False)
-        ),
+        compilation_config=_CompilationConfigStub(),
         parallel_config=SimpleNamespace(worker_cls="auto"),
     )
 
@@ -1126,3 +1357,36 @@ def test_plugin_source_has_no_builtins_import_override():
     source = inspect.getsource(plugin)
     assert "patch_utils" not in source
     assert "builtins.__import__" not in source
+
+
+@pytest.mark.parametrize("model_type,dp,pcp,allowed", [
+    ("kimi_k3", 1, 1, True),
+    ("kimi_k3", 2, 1, False),
+    ("kimi_k3", 1, 2, False),
+    ("other", 1, 1, False),
+])
+def test_kimi_reference_runner_exception_is_limited_to_supported_topology(
+    monkeypatch, cpu_safe_hcu_worker_module, model_type, dp, pcp, allowed,
+):
+    module = ModuleType("vllm.v1.worker.gpu_model_runner")
+    constructed = []
+
+    class Runner:
+        def __init__(self, config, device):
+            constructed.append((config, device))
+
+    module.GPUModelRunner = Runner
+    monkeypatch.setitem(sys.modules, module.__name__, module)
+    config = SimpleNamespace(
+        model_config=SimpleNamespace(hf_config=SimpleNamespace(model_type=model_type)),
+        parallel_config=SimpleNamespace(data_parallel_size=dp, prefill_context_parallel_size=pcp),
+    )
+    if allowed:
+        assert isinstance(cpu_safe_hcu_worker_module._create_model_runner(
+            config, "cpu", use_v2_model_runner=False), Runner)
+        assert constructed == [(config, "cpu")]
+    else:
+        with pytest.raises(RuntimeError, match="only Model Runner V2"):
+            cpu_safe_hcu_worker_module._create_model_runner(
+                config, "cpu", use_v2_model_runner=False)
+        assert not constructed

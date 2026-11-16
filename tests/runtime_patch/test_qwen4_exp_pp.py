@@ -8,6 +8,8 @@ import subprocess
 import sys
 import textwrap
 
+import pytest
+
 from vllm_hcu.patch.platform.core_fix import patch_qwen4_exp_pp
 from vllm_hcu.patch.worker.core_fix import (
     patch_qwen4_exp_model_state,
@@ -295,6 +297,7 @@ def test_qwen4_exp_model_state_rejects_ple_owned_by_later_stage() -> None:
     assert result.returncode == 0, result.stderr
 
 
+@pytest.mark.hcu
 def test_qwen4_exp_mtp_last_pp_rank_accepts_speculator_hidden_states() -> None:
     script = textwrap.dedent(
         """

@@ -20,6 +20,18 @@ _PACKED_MARKER = "_hcu_lightop_w16a16_packed"
 _GENERATION_MARKER = "_hcu_lightop_w16a16_generation"
 _LAYOUT_MARKER = "_hcu_lightop_w16a16_layout"
 logger = init_logger(__name__)
+_BACKEND_SELECTED = False
+
+
+def mark_lightop_w16a16_backend_selected() -> None:
+    """Record that this worker owns at least one LightOp W16A16 layer."""
+
+    global _BACKEND_SELECTED
+    _BACKEND_SELECTED = True
+
+
+def lightop_w16a16_backend_selected() -> bool:
+    return _BACKEND_SELECTED
 
 
 @dataclass(frozen=True, slots=True)
@@ -224,9 +236,20 @@ def select_lightop_w16a16_config(
     index = torch.cuda.current_device() if device.index is None else device.index
     properties = torch.cuda.get_device_properties(index)
     dtype = getattr(moe_config, "in_dtype", None)
+    arch = str(getattr(properties, "gcnArchName", "")).split(":", 1)[0]
+    config_m = int(expected_m)
+    if (
+        config_m == 1
+        and (experts, hidden, intermediate, topk) == (256, 2048, 256, 8)
+        and arch == "gfx936"
+        and int(properties.multi_processor_count) == 80
+    ):
+        # LightOp 0.6's gfx936 one-token records fail this exact TP2 problem,
+        # while the M=2 records are correct for the same one-token workload.
+        config_m = 2
     result = exports.get_config(
         experts,
-        int(expected_m),
+        config_m,
         2 * intermediate,
         hidden,
         hidden,
@@ -341,15 +364,21 @@ def run_lightop_w16a16(
 
     cache1_elements = tokens * topk * two_n
     cache3_elements = tokens * topk * hidden
-    if workspace13.numel() < max(cache1_elements, cache3_elements):
-        raise RuntimeError("vLLM W16A16 workspace13 is smaller than required")
-    if workspace2.numel() < tokens * topk * intermediate:
+    cache2_elements = tokens * topk * intermediate
+    if workspace2.numel() < max(cache1_elements, cache3_elements):
         raise RuntimeError("vLLM W16A16 workspace2 is smaller than required")
-    cache1 = workspace13.reshape(-1)[:cache1_elements].view(-1, two_n)
-    cache2 = workspace2.reshape(-1)[: tokens * topk * intermediate].view(
+    if workspace13.numel() < cache2_elements:
+        raise RuntimeError("vLLM W16A16 workspace13 is smaller than required")
+    # vLLM aliases the final output with workspace13.  Keep cache3 in the
+    # other allocation so reduction never reads and writes overlapping views.
+    # cache1 and cache3 may share workspace2 because activation finishes
+    # consuming cache1 before GEMM2 produces cache3.  Likewise cache2 is dead
+    # before reduction writes the aliased output into workspace13.
+    cache1 = workspace2.reshape(-1)[:cache1_elements].view(-1, two_n)
+    cache2 = workspace13.reshape(-1)[:cache2_elements].view(
         -1, intermediate
     )
-    cache3 = workspace13.reshape(-1)[:cache3_elements].view(-1, hidden)
+    cache3 = workspace2.reshape(-1)[:cache3_elements].view(-1, hidden)
     exports.gemm(
         hidden_states,
         w13,
@@ -396,7 +425,9 @@ class SimpleMoeProblem:
 __all__ = [
     "LightopW16A16Layout",
     "is_lightop_w16a16_available",
+    "lightop_w16a16_backend_selected",
     "lightop_w16a16_layout",
+    "mark_lightop_w16a16_backend_selected",
     "mark_lightop_w16a16_weights",
     "pack_lightop_w16a16_weights",
     "run_lightop_w16a16",

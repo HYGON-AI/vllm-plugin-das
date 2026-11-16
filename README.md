@@ -52,10 +52,10 @@ must match the chosen model/backend and runtime ABI; a generic PyPI stack is
 not a substitute for those HCU builds.
 
 The [CI environment lock](.github/workflows/configs/hcu-runner-environment.json)
-checks DTK using `match: release_line` against its configured major/minor
-release. Numeric patch releases and `-`/`+` build suffixes within that line are
-accepted; other release lines and malformed versions are rejected. Preflight
-reports the full installed version.
+accepts Python 3.10.12 or 3.12.12 and checks DTK using `match: release_line` against
+the configured 26.04 and 26.10 major/minor releases. Numeric patch releases and
+`-`/`+` build suffixes within those lines are accepted; other release lines and
+malformed versions are rejected. Preflight reports the full installed version.
 Custom locks without `rocm.match` retain exact matching. Other dependency
 checks remain independent, and this CI policy does not prove binary ABI
 compatibility for every build in the series.
@@ -119,18 +119,17 @@ platform patch activation; neither mode proves model accuracy or GPU execution.
 ## Runtime Settings
 
 This branch's [HCU worker](vllm_hcu/v1/worker.py) constructs
-`HcuGPUModelRunnerV2` and rejects the legacy runner. Use Model Runner V2 when
-launching a server, as the model validation profiles do:
-
-```bash
-export VLLM_USE_V2_MODEL_RUNNER=1
-```
+`HcuGPUModelRunnerV2` and rejects the legacy runner. The HCU platform defaults
+`VLLM_USE_V2_MODEL_RUNNER` to `True` (equivalent to `1`) when it is unset,
+through its environment adapter. Explicit `1` remains supported;
+explicit `0` raises a configuration error without being overwritten. vLLM's
+Model Runner V2 feature-compatibility checks still apply.
 
 The following settings are not interchangeable:
 
 | Setting | Current behavior |
 | --- | --- |
-| `VLLM_USE_V2_MODEL_RUNNER` | Must resolve to V2; the HCU worker has no legacy-runner fallback. |
+| `VLLM_USE_V2_MODEL_RUNNER` | Defaults to `1` on HCU; explicit `0` is rejected. The HCU worker has no legacy-runner fallback. |
 | `VLLM_HCU_USE_CUSTOM_OPS` | Enabled by default; `0` disables optional HCU optimized paths governed by the master switch, not the entire plugin or all native dependencies. |
 
 See [environment settings](vllm_hcu/platforms/envs.py) for HCU-specific

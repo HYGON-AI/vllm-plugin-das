@@ -136,25 +136,28 @@ Post-review gates:
 
 ## PCP8/EP8/MTP3 FP8 validation
 
-The exact TP1/PCP8/PP1 topology requires Hy4's existing PCP K-sharded
-`linear_gate`. Without it, the model replicated every BF16 elementwise gate:
+The exact TP1/PCP8/PP1 topology requires Hy4's PCP K-sharded `linear_gate`.
+With `VLLM_HCU_USE_CUSTOM_OPS=1` (the default), this topology now enables the
+shard automatically when `VLLM_HCU_ENABLE_LINEAR_GATE_PCP_SHARD` is unset.
+Without the shard, the model replicated every BF16 elementwise gate:
 each rank loaded 129.27 GiB, and profiling left -6.39 GiB KV at the default
 0.9 memory utilization (-0.78 GiB even at 0.959). A 0.98 launch failed the
 initial free-memory contract, so tuning `gpu_memory_utilization` cannot create
 a valid window on these 143.98 GiB devices.
 
-Set `VLLM_HCU_ENABLE_LINEAR_GATE_PCP_SHARD=1`. The same isolated `35d188f`
-wheel then loaded 116.30 GiB per rank, profiled 4.13 GiB peak activation, and
-created a 65,600-token FP8 E4M3 KV cache (3.2-3.47 GiB per rank) at the default
-0.9 utilization. The PCP8 config gate now rejects a missing opt-in before
-weight loading instead of allowing this late negative-KV failure.
+The historical `35d188f` validation wheel required an explicit
+`VLLM_HCU_ENABLE_LINEAR_GATE_PCP_SHARD=1`; with it, the wheel loaded 116.30 GiB
+per rank, profiled 4.13 GiB peak activation, and created a 65,600-token FP8 E4M3
+KV cache (3.2-3.47 GiB per rank) at the default 0.9 utilization. The current
+resolver makes that supported topology the default shown below. An explicit
+child `0` is rejected, as is master `0` even if the child is `1`, before model
+weight allocation; both errors name the switch that blocks the required shard.
 
 ```bash
 env -u VLLM_PLUGINS -u HTTP_PROXY -u HTTPS_PROXY -u ALL_PROXY \
   -u http_proxy -u https_proxy -u all_proxy \
   VLLM_USE_V2_MODEL_RUNNER=1 VLLM_USE_NN=1 \
   VLLM_DEEPEP_BUFFER_SIZE_MB=256 \
-  VLLM_HCU_ENABLE_LINEAR_GATE_PCP_SHARD=1 \
   HIP_VISIBLE_DEVICES=0,1,2,3,4,5,6,7 \
   NO_PROXY=127.0.0.1,localhost no_proxy=127.0.0.1,localhost \
   PYTHONNOUSERSITE=1 \

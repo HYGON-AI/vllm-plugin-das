@@ -4,13 +4,23 @@
 
 from __future__ import annotations
 
+from collections.abc import Mapping
+
+
+def config_field(owner: object | None, name: str, default: object = None) -> object:
+    """Read a field from either an object config or its serialized mapping."""
+
+    if isinstance(owner, Mapping):
+        return owner.get(name, default)
+    return getattr(owner, name, default)
+
 
 def model_architectures(vllm_config: object | None) -> tuple[str, ...]:
-    model_config = getattr(vllm_config, "model_config", None)
-    architectures = getattr(model_config, "architectures", None)
+    model_config = config_field(vllm_config, "model_config")
+    architectures = config_field(model_config, "architectures")
     if architectures is None:
-        hf_config = getattr(model_config, "hf_config", None)
-        architectures = getattr(hf_config, "architectures", ())
+        hf_config = config_field(model_config, "hf_config")
+        architectures = config_field(hf_config, "architectures", ())
     return tuple(architectures or ())
 
 
@@ -19,11 +29,38 @@ def is_deepseek_v4(vllm_config: object | None) -> bool:
 
 
 def is_dspark_enabled(vllm_config: object | None) -> bool:
-    speculative_config = getattr(vllm_config, "speculative_config", None)
-    use_dspark = getattr(speculative_config, "use_dspark", None)
+    speculative_config = config_field(vllm_config, "speculative_config")
+    use_dspark = config_field(speculative_config, "use_dspark")
     if callable(use_dspark):
         return bool(use_dspark())
-    return getattr(speculative_config, "method", None) == "dspark"
+    return config_field(speculative_config, "method") == "dspark"
 
 
-__all__ = ["is_deepseek_v4", "is_dspark_enabled", "model_architectures"]
+def dspark_mooncake_pd_use_low_latency(
+    vllm_config: object | None,
+) -> bool | None:
+    """Return the fixed DeepEP layout for a supported Mooncake P/D role."""
+
+    if not is_dspark_enabled(vllm_config):
+        return None
+    kv_transfer_config = config_field(vllm_config, "kv_transfer_config")
+    if config_field(kv_transfer_config, "kv_connector") != "MooncakeConnector":
+        return None
+    if not is_deepseek_v4(vllm_config):
+        return None
+
+    role = config_field(kv_transfer_config, "kv_role")
+    if role == "kv_producer":
+        return False
+    if role == "kv_consumer":
+        return True
+    return None
+
+
+__all__ = [
+    "config_field",
+    "dspark_mooncake_pd_use_low_latency",
+    "is_deepseek_v4",
+    "is_dspark_enabled",
+    "model_architectures",
+]

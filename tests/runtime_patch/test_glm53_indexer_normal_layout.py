@@ -64,11 +64,14 @@ def _record_layout_logs(monkeypatch):
     return recorder.records
 
 
-def _restore_upstream_sparse(monkeypatch, upstream_sparse):
-    attrs = ["rocm_fp8_mqa_logits", "rocm_fp8_paged_mqa_logits"]
-    attrs += [attr for attr, _, _ in glm_patch._NORMAL_LAYOUT_SPARSE_KERNELS]
-    for attr in attrs:
-        monkeypatch.setattr(upstream_sparse, attr, getattr(upstream_sparse, attr))
+def _isolate_upstream_sparse(monkeypatch, upstream_sparse):
+    def unused_kernel(*_args, **_kwargs):
+        return None
+
+    monkeypatch.setattr(upstream_sparse, "rocm_fp8_mqa_logits", unused_kernel)
+    monkeypatch.setattr(upstream_sparse, "rocm_fp8_paged_mqa_logits", unused_kernel)
+    for attr, _, _ in glm_patch._NORMAL_LAYOUT_SPARSE_KERNELS:
+        monkeypatch.setattr(upstream_sparse, attr, _FakeKernel())
 
 
 def test_pinned_constexpr_replaces_positional_and_keyword_arguments() -> None:
@@ -156,7 +159,7 @@ def test_glm5next_layout_env_selects_writers_and_decode_reader(
     monkeypatch.setenv(henvs.INDEXER_KCACHE_LAYOUT_ENV, layout)
     monkeypatch.setenv("VLLM_HCU_USE_CUSTOM_OPS", custom_ops)
     monkeypatch.setattr(hcu_sparse, "on_gfx938", lambda: True)
-    _restore_upstream_sparse(monkeypatch, upstream_sparse)
+    _isolate_upstream_sparse(monkeypatch, upstream_sparse)
     calls = []
 
     def dispatcher(*args, **kwargs):
@@ -203,7 +206,7 @@ def test_glm5next_normal_layout_is_ignored_off_gfx938(monkeypatch) -> None:
     monkeypatch.setenv("VLLM_HCU_USE_CUSTOM_OPS", "1")
     monkeypatch.setenv(henvs.INDEXER_KCACHE_LAYOUT_ENV, "normal")
     monkeypatch.setattr(hcu_sparse, "on_gfx938", lambda: False)
-    _restore_upstream_sparse(monkeypatch, upstream_sparse)
+    _isolate_upstream_sparse(monkeypatch, upstream_sparse)
     kpool = _fake_kpool_module()
     glm_patch._patch_sparse_indexer_kpool(kpool)
 

@@ -4,6 +4,8 @@
 # Modified by Hygon Information Technology Co., Ltd., 2026.
 import typing
 from collections.abc import Callable, Iterable
+from copy import copy
+from types import MethodType
 
 import torch
 import torch.nn as nn
@@ -52,6 +54,132 @@ from .deepseek_v2 import (
 logger = init_logger(__name__)
 
 
+def _mtp_quantization_config(vllm_config: VllmConfig, prefix: str) -> VllmConfig:
+    """Match this MTP layer against canonical checkpoint quantization rules."""
+    if not henvs.VLLM_HCU_GLM_MTP_QUANT_PREFIX_FIX:
+        return vllm_config
+    # Eagle replaces model_config with the converted draft config, whose type
+    # is deepseek_mtp for GLM DSA as well as DeepSeek. Identify the original
+    # target through SpeculativeConfig rather than widening the architecture
+    # gate to every model sharing that draft type.
+    speculative_config = getattr(vllm_config, "speculative_config", None)
+    model_config = getattr(speculative_config, "target_model_config", None)
+    if model_config is None:
+        model_config = getattr(vllm_config, "model_config", None)
+    hf_config = getattr(model_config, "hf_config", None)
+    if getattr(hf_config, "model_type", None) != "glm_moe_dsa":
+        return vllm_config
+    quant_config = vllm_config.quant_config
+    if quant_config is None:
+        return vllm_config
+    from vllm.model_executor.layers.quantization.compressed_tensors.compressed_tensors import (
+        CompressedTensorsConfig,
+    )
+
+    if not isinstance(quant_config, CompressedTensorsConfig):
+        return vllm_config
+
+    from vllm.model_executor.layers.quantization.compressed_tensors.utils import (
+        find_matched_target,
+    )
+    from vllm.model_executor.layers.quantization.utils.config_utils import (
+        find_matching_patterns,
+    )
+
+    original_match = type(quant_config).get_scheme_dict
+
+    def get_scheme_dict(self, layer, layer_name=None):
+        if layer_name is None or not layer_name.startswith(prefix + "."):
+            return original_match(self, layer, layer_name)
+        canonical = "model.decoder" + layer_name[len(prefix):]
+        mapping = self.packed_modules_mapping
+        # Resolve both spellings before validating fused shards. A complete
+        # fused-name ignore takes precedence over redundant partial ignores.
+        ignores = [find_matching_patterns(name, self.ignore, mapping)
+                   for name in (layer_name, canonical)]
+        if any(all(shards) for shards in ignores):
+            return None
+        ignored_shards = [any(matches) for matches in zip(*ignores)]
+        if any(ignored_shards):
+            if not all(ignored_shards):
+                raise ValueError(
+                    "Found different quantization schemes for the shards of "
+                    f"{layer_name}. vLLM requires all to use the same scheme."
+                )
+            return None
+
+        canonical_targets = {}
+        actual_targets = {}
+        for target, scheme in self.target_scheme_map.items():
+            actual_matches = find_matching_patterns(layer_name, [target], mapping)
+            canonical_matches = find_matching_patterns(canonical, [target], mapping)
+            if any(canonical_matches) and not any(actual_matches):
+                canonical_targets[target] = scheme
+            if any(actual_matches) and not any(canonical_matches):
+                actual_targets[target] = scheme
+
+        def depends_on(name, targets, candidates):
+            # Use the full native rule table for fusion completeness and its
+            # first matching rule for each shard. A decoder rule can cooperate
+            # with a generic rule, or be shadowed by an earlier generic rule.
+            shards = find_matching_patterns(name, targets, mapping)
+            first_matches = [
+                next((target for target in targets if target in matches), None)
+                for matches in shards
+            ]
+            return all(first_matches) and any(
+                target in candidates for target in first_matches
+            )
+
+        # Configs without decoder-specific targets keep native runtime matching.
+        if not canonical_targets:
+            return original_match(self, layer, layer_name)
+
+        # Matching only the actual spelling does not make a rule MTP-specific:
+        # model.layers.\d+ also targets the backbone. Only rules excluding all
+        # target-model backbone layers can override a canonical decoder rule.
+        parent, index = prefix.rsplit(".", 1)
+        num_layers = getattr(hf_config, "num_hidden_layers", None)
+        if num_layers is None:
+            num_layers = int(index) if index.isdecimal() else 0
+        suffix = layer_name[len(prefix):]
+        overrides = {
+            target: scheme for target, scheme in actual_targets.items()
+            if not any(
+                any(find_matching_patterns(f"{parent}.{i}{suffix}", [target], mapping))
+                for i in range(num_layers)
+            )
+        }
+        # Fully explicit fused overrides retain priority over generic rules
+        # matching the fused name directly, as in the existing MTP contract.
+        targets = dict(overrides)
+        explicit_match = find_matched_target(layer_name, layer, targets, mapping)
+        if explicit_match is None:
+            # A partial explicit override can cooperate with generic shard
+            # rules; use the complete native table to resolve that combination.
+            targets.update(self.target_scheme_map)
+        if explicit_match is not None or depends_on(layer_name, targets, overrides):
+            explicit = copy(self)
+            explicit.target_scheme_map = targets
+            return original_match(explicit, layer, layer_name)
+        if not depends_on(canonical, self.target_scheme_map, canonical_targets):
+            return original_match(self, layer, layer_name)
+        return original_match(self, layer, canonical)
+
+    # Keep the target model and other MTP layers' quantization rules unchanged.
+    # copy(), unlike dataclasses.replace(), does not rerun engine validation.
+    mtp_quant_config = copy(quant_config)
+    mtp_quant_config.target_scheme_map = dict(quant_config.target_scheme_map)
+    mtp_quant_config.ignore = list(quant_config.ignore)
+    mtp_quant_config.get_scheme_dict = MethodType(get_scheme_dict, mtp_quant_config)
+    mtp_vllm_config = copy(vllm_config)
+    mtp_vllm_config.quant_config = mtp_quant_config
+    logger.info_once(
+        "Matching compressed-tensors MTP prefix %s as model.decoder", prefix
+    )
+    return mtp_vllm_config
+
+
 class SharedHead(nn.Module):
     def __init__(
         self,
@@ -78,6 +206,7 @@ class DeepSeekMultiTokenPredictorLayer(nn.Module):
 
         config = vllm_config.speculative_config.draft_model_config.hf_config
         self.config = config
+        vllm_config = _mtp_quantization_config(vllm_config, prefix)
         quant_config = vllm_config.quant_config
 
         self.enorm = RMSNorm(config.hidden_size, eps=config.rms_norm_eps)

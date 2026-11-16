@@ -21,23 +21,30 @@ import socket
 import subprocess
 import sys
 import time
+from contextlib import contextmanager
+from contextvars import ContextVar
 from pathlib import Path
-from typing import Any
+from typing import TYPE_CHECKING, Any
 
 import pytest
 
 REPOSITORY = Path(__file__).resolve().parents[2]
-if os.environ.get("VLLM_HCU_RELEASE_WHEEL") == "1":
-    repository_text = str(REPOSITORY)
-    if repository_text not in sys.path:
-        sys.path.append(repository_text)
+if TYPE_CHECKING:
+    from tests.fixtures.resources import TestResources as HcuTestResources
 
-from tests.fixtures.resources import TestResources as HcuTestResources
+if __package__:
+    from .gpu_memory import configured_gpu_wait_timeout, wait_for_gpu_memory
+else:
+    # Release-wheel cases execute this file directly from outside the checkout.
+    from gpu_memory import configured_gpu_wait_timeout, wait_for_gpu_memory
 
 
 DEFAULT_MODEL_ROOT = Path("/models/llm-models")
 DEFAULT_LOG_DIR = Path("/tmp/vllm-hcu-integration/logs")
 RESULT_PREFIX = "VLLM_HCU_RESULT="
+_CASE_GPU_MEMORY_READY: ContextVar[bool | None] = ContextVar(
+    "hcu_case_gpu_memory_ready", default=None
+)
 UNIFIED_ATTENTION_HEAD_DIMS = {128, 192, 256, 512}
 DEEPSEEK_V4_DSPARK_SPECULATIVE_CONFIG = {
     "method": "dspark",
@@ -384,6 +391,8 @@ def run_vllm_case(
         )
     if extra_env:
         env.update(extra_env)
+    gpu_wait_budget = configured_gpu_wait_timeout(env=env)
+    process_timeout_s = timeout_s + gpu_wait_budget
     log_path = _case_log_path(log_label or case, model_path)
     release_wheel = os.environ.get("VLLM_HCU_RELEASE_WHEEL") == "1"
     if release_wheel:
@@ -426,13 +435,14 @@ def run_vllm_case(
                 start_new_session=True,
             )
             try:
-                returncode = proc.wait(timeout=timeout_s)
+                returncode = proc.wait(timeout=process_timeout_s)
             except subprocess.TimeoutExpired:
                 _terminate_case_process_group(proc)
                 output = log_path.read_text(encoding="utf-8", errors="replace")
                 raise AssertionError(
                     f"vLLM integration case {case!r} timed out after "
-                    f"{timeout_s}s\n"
+                    f"{process_timeout_s}s "
+                    f"(model budget={timeout_s}s, GPU wait budget={gpu_wait_budget}s)\n"
                     f"command={' '.join(command)}\n"
                     f"log={log_path}\n"
                     f"{output}"
@@ -612,6 +622,58 @@ def _llm_kwargs(
     return kwargs
 
 
+@contextmanager
+def _case_gpu_memory_wait_scope():
+    token = _CASE_GPU_MEMORY_READY.set(False)
+    try:
+        yield
+    finally:
+        _CASE_GPU_MEMORY_READY.reset(token)
+
+
+def _wait_for_case_gpu_memory(
+    *, required_cards: int, gpu_memory_utilization: float
+) -> None:
+    if _CASE_GPU_MEMORY_READY.get() is True or configured_gpu_wait_timeout() == 0:
+        return
+    wait_for_gpu_memory(
+        required_cards=required_cards,
+        gpu_memory_utilization=gpu_memory_utilization,
+        env=os.environ,
+        report=lambda message: print(message, flush=True),
+    )
+    if _CASE_GPU_MEMORY_READY.get() is not None:
+        _CASE_GPU_MEMORY_READY.set(True)
+
+
+def _create_llm(**kwargs: Any) -> Any:
+    required_cards = 1
+    for name in (
+        "tensor_parallel_size", "pipeline_parallel_size",
+        "prefill_context_parallel_size",
+    ):
+        size = kwargs.get(name, 1)
+        if not isinstance(size, int) or isinstance(size, bool) or size < 1:
+            raise ValueError(f"{name} must be a positive integer")
+        required_cards *= size
+    local_dp = kwargs.get("data_parallel_size_local")
+    if local_dp is None:
+        local_dp = kwargs.get("data_parallel_size", 1)
+    if not isinstance(local_dp, int) or isinstance(local_dp, bool) or local_dp < 1:
+        raise ValueError("local data parallel size must be a positive integer")
+    required_cards *= local_dp
+    _wait_for_case_gpu_memory(
+        required_cards=required_cards,
+        # Every harness model is built from _llm_kwargs, including its explicit
+        # memory budget. Never substitute a smaller utilization to make it fit.
+        gpu_memory_utilization=float(kwargs["gpu_memory_utilization"]),
+    )
+
+    from vllm import LLM
+
+    return LLM(**kwargs)
+
+
 def _shutdown_llm(llm: Any) -> None:
     engine = getattr(llm, "llm_engine", None)
     engine_core = getattr(engine, "engine_core", None)
@@ -710,9 +772,8 @@ def _generate(
     enforce_eager: bool,
     **llm_overrides: Any,
 ) -> list[dict[str, Any]]:
-    from vllm import LLM
 
-    llm = LLM(
+    llm = _create_llm(
         **_llm_kwargs(
             model_path,
             enforce_eager=enforce_eager,
@@ -726,9 +787,8 @@ def _generate(
 
 
 def _case_smoke(model_path: Path) -> dict[str, Any]:
-    from vllm import LLM
 
-    llm = LLM(**_llm_kwargs(model_path, enforce_eager=True))
+    llm = _create_llm(**_llm_kwargs(model_path, enforce_eager=True))
     try:
         first = _generate_with_llm(llm)
         second = _generate_with_llm(llm)
@@ -755,13 +815,12 @@ def _case_lora_switching(
     lora_a: Path,
     lora_b: Path,
 ) -> dict[str, Any]:
-    from vllm import LLM
     from vllm.lora.request import LoRARequest
 
     prompt = ["用一句话写一个武侠小说开头："]
     adapter_a = LoRARequest("adapter-a", 1, str(lora_a))
     adapter_b = LoRARequest("adapter-b", 2, str(lora_b))
-    llm = LLM(
+    llm = _create_llm(
         **_llm_kwargs(
             model_path,
             enforce_eager=True,
@@ -819,7 +878,6 @@ def _case_mtp_parity(model_path: Path) -> dict[str, Any]:
 
 
 def _case_kv_transfer_smoke(model_path: Path) -> dict[str, Any]:
-    from vllm import LLM
     from vllm.config.kv_transfer import KVTransferConfig
 
     storage_path = Path(
@@ -829,7 +887,7 @@ def _case_kv_transfer_smoke(model_path: Path) -> dict[str, Any]:
         )
     )
     storage_path.mkdir(parents=True, exist_ok=True)
-    llm = LLM(
+    llm = _create_llm(
         **_llm_kwargs(
             model_path,
             enforce_eager=True,
@@ -859,7 +917,6 @@ def _case_kv_transfer_smoke(model_path: Path) -> dict[str, Any]:
 
 
 def _case_prefix_caching_smoke(model_path: Path) -> dict[str, Any]:
-    from vllm import LLM
 
     shared_prefix = (
         "You are checking prefix caching on HCU. "
@@ -869,7 +926,7 @@ def _case_prefix_caching_smoke(model_path: Path) -> dict[str, Any]:
         shared_prefix + "Question A: answer with one short word.",
         shared_prefix + "Question B: answer with one short word.",
     ]
-    llm = LLM(
+    llm = _create_llm(
         **_llm_kwargs(
             model_path,
             enforce_eager=True,
@@ -892,13 +949,12 @@ def _case_prefix_caching_smoke(model_path: Path) -> dict[str, Any]:
 
 
 def _case_chunked_prefill_smoke(model_path: Path) -> dict[str, Any]:
-    from vllm import LLM
 
     long_prompt = (
         "Chunked prefill should process this repeated HCU prompt safely. "
         "The model should continue after a long shared context. "
     ) * 20
-    llm = LLM(
+    llm = _create_llm(
         **_llm_kwargs(
             model_path,
             enforce_eager=True,
@@ -919,9 +975,8 @@ def _case_chunked_prefill_smoke(model_path: Path) -> dict[str, Any]:
 
 
 def _case_logprobs_smoke(model_path: Path) -> dict[str, Any]:
-    from vllm import LLM
 
-    llm = LLM(
+    llm = _create_llm(
         **_llm_kwargs(
             model_path,
             enforce_eager=True,
@@ -946,7 +1001,6 @@ def _case_logprobs_smoke(model_path: Path) -> dict[str, Any]:
 
 
 def _case_batch_mixed_lengths(model_path: Path) -> dict[str, Any]:
-    from vllm import LLM
 
     prompts = [
         "Short prompt:",
@@ -954,7 +1008,7 @@ def _case_batch_mixed_lengths(model_path: Path) -> dict[str, Any]:
         "Long prompt: " + "mixed length batch scheduling on HCU " * 48,
         "Tiny:",
     ]
-    llm = LLM(
+    llm = _create_llm(
         **_llm_kwargs(
             model_path,
             enforce_eager=True,
@@ -974,14 +1028,13 @@ def _case_batch_mixed_lengths(model_path: Path) -> dict[str, Any]:
 
 
 def _case_embedding_smoke(model_path: Path) -> dict[str, Any]:
-    from vllm import LLM
 
     prompts = [
         "HCU inference runtime",
         "HCU inference runtime",
         "A completely unrelated cooking recipe",
     ]
-    llm = LLM(
+    llm = _create_llm(
         **_llm_kwargs(
             model_path,
             enforce_eager=True,
@@ -1020,7 +1073,6 @@ def _case_embedding_smoke(model_path: Path) -> dict[str, Any]:
 
 def _case_reranker_smoke(model_path: Path) -> dict[str, Any]:
     from transformers import AutoTokenizer
-    from vllm import LLM
     from vllm.sampling_params import SamplingParams
 
     tokenizer = AutoTokenizer.from_pretrained(
@@ -1055,7 +1107,7 @@ def _case_reranker_smoke(model_path: Path) -> dict[str, Any]:
         logprob_token_ids=[true_token, false_token],
         allowed_token_ids=[true_token, false_token],
     )
-    llm = LLM(
+    llm = _create_llm(
         **_llm_kwargs(
             model_path,
             enforce_eager=True,
@@ -1098,7 +1150,6 @@ def _case_reranker_smoke(model_path: Path) -> dict[str, Any]:
 def _case_vl_image_smoke(model_path: Path) -> dict[str, Any]:
     from PIL import Image
     from transformers import AutoProcessor
-    from vllm import LLM
     from vllm.sampling_params import SamplingParams
 
     image = Image.new("RGB", (64, 32), color=(220, 30, 30))
@@ -1123,7 +1174,7 @@ def _case_vl_image_smoke(model_path: Path) -> dict[str, Any]:
         tokenize=False,
         add_generation_prompt=True,
     )
-    llm = LLM(
+    llm = _create_llm(
         **_llm_kwargs(
             model_path,
             enforce_eager=True,
@@ -1235,7 +1286,6 @@ def _case_deepseek_v4_dspark_rank(
     data_parallel_size: int,
     gpu_memory_utilization: float,
 ) -> dict[str, Any]:
-    from vllm import LLM
 
     parallel_kwargs: dict[str, Any] = {
         "tensor_parallel_size": tensor_parallel_size,
@@ -1243,7 +1293,7 @@ def _case_deepseek_v4_dspark_rank(
     }
     if data_parallel_size > 1:
         parallel_kwargs["all2all_backend"] = "deepep_auto"
-    llm = LLM(
+    llm = _create_llm(
         **_llm_kwargs(
             model_path,
             enforce_eager=False,
@@ -1328,7 +1378,6 @@ def _case_tp_ep_smoke_rank(
     all2all_backend: str | None,
     moe_backend: str,
 ) -> dict[str, Any]:
-    from vllm import LLM
 
     max_num_batched_tokens = (
         300 if all2all_backend == "deepep_low_latency" else 512
@@ -1338,7 +1387,7 @@ def _case_tp_ep_smoke_rank(
         if all2all_backend is not None
         else {}
     )
-    llm = LLM(
+    llm = _create_llm(
         **_llm_kwargs(
             model_path,
             enforce_eager=True,
@@ -1404,6 +1453,9 @@ def _tp_ep_data_parallel_rank(
     process_group_ready.set()
     start_gate.wait()
     dp_environment = {
+        # The coordinator checked the complete local DP allocation before any
+        # rank was started. Waiting here could block on a successful peer.
+        "HCU_CI_GPU_MEMORY_WAIT_TIMEOUT_S": "0",
         "VLLM_DP_RANK": str(local_dp_rank),
         "VLLM_DP_RANK_LOCAL": str(local_dp_rank),
         "VLLM_DP_SIZE": str(data_parallel_size),
@@ -1451,6 +1503,10 @@ def _case_tp_ep_smoke_data_parallel(
     moe_backend: str,
     rank_case: str = "tp_ep",
 ) -> dict[str, Any]:
+    _wait_for_case_gpu_memory(
+        required_cards=tensor_parallel_size * data_parallel_size,
+        gpu_memory_utilization=gpu_memory_utilization,
+    )
     with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as listener:
         listener.bind(("127.0.0.1", 0))
         dp_master_port = int(listener.getsockname()[1])
@@ -1594,6 +1650,7 @@ def _terminate_data_parallel_process_groups(
         )
 
 
+@_case_gpu_memory_wait_scope()
 def _main(argv: list[str] | None = None) -> int:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument(

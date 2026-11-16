@@ -10,6 +10,7 @@ and updated to fit vllm needs and terminology.
 import torch
 
 import vllm.model_executor.layers.fused_moe.modular_kernel as mk
+from vllm.logger import init_logger
 from vllm.model_executor.layers.fused_moe.utils import count_expert_num_tokens
 from vllm.platforms import current_platform
 from vllm.triton_utils import tl, triton
@@ -22,6 +23,7 @@ import vllm_hcu.platforms.envs as henvs
 # HCU DeepEP/LightOP kernels use 256-row expert slices. Keep this separate
 # from the target's quantization block shape: it is an HCU workspace contract.
 _HCU_TOKEN_ALIGNMENT = 256
+_COMPACT_ROWS_LOGGED = False
 
 
 def expert_num_tokens_round_up_and_sum(
@@ -57,6 +59,17 @@ def compute_aligned_M_and_alignment(
         # lag a post-dispatch expert remap, so it may raise the bound but must
         # never shrink the worst-case workspace derived from the routed batch.
         alignment = max(alignment, _HCU_TOKEN_ALIGNMENT)
+        # A provenance-tagged DeepEP HT layout is already post-EPLB physical
+        # routing, unlike generic metadata that may precede an expert remap.
+        # Preserve the conservative fallback for mismatched chunks/alignment.
+        layout = getattr(expert_tokens_meta, "_hcu_deepep_ht_layout", None)
+        if (
+            henvs.optional_custom_op_enabled(henvs.VLLM_HCU_DEEPEP_HT_EXACT_LAYOUT)
+            and alignment == _HCU_TOKEN_ALIGNMENT
+            and layout is not None
+            and layout[:3] == (M, num_topk, local_num_experts)
+        ):
+            return layout[3], alignment
         M_sum_upper = round_up(
             (M * num_topk) + local_num_experts * (alignment - 1), alignment
         )
@@ -66,6 +79,26 @@ def compute_aligned_M_and_alignment(
             M_sum_meta = expert_num_tokens_round_up_and_sum(
                 expert_tokens_meta.expert_num_tokens_cpu, alignment=alignment
             )
+            if getattr(expert_tokens_meta, "_hcu_step5_compact_rows", False):
+                counts = expert_tokens_meta.expert_num_tokens_cpu
+                if (
+                    counts.device.type != "cpu"
+                    or counts.numel() != local_num_experts
+                    or bool((counts < 0).any())
+                ):
+                    raise ValueError("Invalid post-dispatch Step5 expert counts")
+                # Only shrink the runtime view. The planner, which has no
+                # dispatch metadata, continues reserving its conservative bound.
+                # Keep one aligned tile for the all-empty kernel contract.
+                compact = max(alignment, M_sum_meta)
+                global _COMPACT_ROWS_LOGGED
+                if not _COMPACT_ROWS_LOGGED:
+                    init_logger("vllm.hcu.step5_deepep").info(
+                        "Step5 DeepEP compact rows: received=%d conservative=%d compact=%d",
+                        M, M_sum_upper, compact,
+                    )
+                    _COMPACT_ROWS_LOGGED = True
+                return compact, alignment
             return max(M_sum_upper, M_sum_meta), alignment
         return M_sum_upper, alignment
 

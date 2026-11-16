@@ -214,6 +214,10 @@ fptr_t open_mem_handle(torch::Tensor& mem_handle) {
   return reinterpret_cast<fptr_t>(ipc_ptr);
 }
 
+void close_mem_handle(fptr_t buffer) {
+  AT_CUDA_CHECK(cudaIpcCloseMemHandle(reinterpret_cast<void*>(buffer)));
+}
+
 void free_shared_buffer(fptr_t buffer) {
   AT_CUDA_CHECK(cudaFree(reinterpret_cast<void*>(buffer)));
 }

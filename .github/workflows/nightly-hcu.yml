@@ -11,7 +11,7 @@ on:
       ref:
         description: Branch, tag, or SHA to test
         required: true
-        default: v0.25.1
+        default: v0.28.1-dev
         type: string
       image:
         description: Optional immutable HCU CI image override
@@ -30,9 +30,10 @@ jobs:
   prepare:
     runs-on:
       - self-hosted
-      - hcu-ci-pr
+      - ci
+      - bw1100
     container:
-      image: ${{ vars.HCU_CI_IMAGE }}
+      image: ${{ vars.HCU_CI_IMAGE_V0281 }}
     defaults:
       run:
         shell: bash
@@ -44,7 +45,7 @@ jobs:
       - name: Checkout nightly revision
         uses: actions/checkout@v4
         with:
-          ref: ${{ inputs.ref || 'v0.25.1' }}
+          ref: ${{ inputs.ref || 'v0.28.1-dev' }}
           clean: true
           fetch-depth: 1
 
@@ -55,17 +56,17 @@ jobs:
       - name: Build nightly matrix
         id: matrix
         run: |
-          /usr/local/bin/python3.10 --version
-          /usr/local/bin/python3.10 .github/scripts/hcu_ci/hcu_ci_preflight.py --check-lock-only
-          /usr/local/bin/python3.10 .github/scripts/hcu_ci/verify_hcu_registration.py
-          /usr/local/bin/python3.10 .github/scripts/hcu_ci/build_hcu_matrix.py \
+          python3 --version
+          python3 .github/scripts/hcu_ci/hcu_ci_preflight.py --check-lock-only
+          python3 .github/scripts/hcu_ci/verify_hcu_registration.py
+          python3 .github/scripts/hcu_ci/build_hcu_matrix.py \
             --profile nightly \
             --github-output "$GITHUB_OUTPUT"
 
       - name: Build due-quarantine matrix
         id: quarantine
         run: >-
-          /usr/local/bin/python3.10 .github/scripts/hcu_ci/build_hcu_matrix.py
+          python3 .github/scripts/hcu_ci/build_hcu_matrix.py
           --profile quarantine
           --github-output "$GITHUB_OUTPUT"
 
@@ -79,7 +80,7 @@ jobs:
     with:
       matrix: ${{ needs.prepare.outputs.matrix }}
       tested_ref: ${{ needs.prepare.outputs.tested_sha }}
-      image: ${{ inputs.image || '' }}
+      image: ${{ inputs.image || vars.HCU_CI_IMAGE_V0281 }}
     permissions:
       contents: read
 
@@ -89,7 +90,7 @@ jobs:
     with:
       matrix: ${{ needs.prepare.outputs.quarantine_matrix }}
       tested_ref: ${{ needs.prepare.outputs.tested_sha }}
-      image: ${{ inputs.image || '' }}
+      image: ${{ inputs.image || vars.HCU_CI_IMAGE_V0281 }}
     permissions:
       contents: read
 
@@ -101,7 +102,8 @@ jobs:
       - quarantine-retest
     runs-on:
       - self-hosted
-      - hcu-ci-pr
+      - ci
+      - bw1100
     permissions:
       contents: read
       issues: write
@@ -130,7 +132,7 @@ jobs:
               `Hardware: ${process.env.HARDWARE_RESULT}`,
               `Quarantine retest: ${process.env.QUARANTINE_RESULT}`,
               '',
-              'Logs remain on each self-hosted runner under /tmp/vllm-hcu-ci/<run-id>/<attempt>/<job-id>. See each job summary for the exact runner and path.',
+              'Logs and reports are uploaded as workflow artifacts on the linked run.',
             ].join('\n');
             const issues = await github.paginate(github.rest.issues.listForRepo, {
               owner: context.repo.owner,

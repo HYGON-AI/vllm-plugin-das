@@ -35,7 +35,6 @@ from vllm.distributed import (
     get_dp_group,
     get_etp_group,
     get_tp_group,
-    tensor_model_parallel_all_reduce,
 )
 from vllm.forward_context import get_forward_context
 from vllm.logger import init_logger
@@ -53,11 +52,18 @@ logger = init_logger(__name__)
 
 from ._common import (
     PatchCompatibilityError,
-    load_exact_module,
     require_callable,
     require_class,
     require_exact_signature,
 )
+
+
+def tensor_model_parallel_all_reduce(tensor):
+    """Load the communicator only when PLE actually executes a reduction."""
+    from vllm.distributed import tensor_model_parallel_all_reduce as reduce
+
+    return reduce(tensor)
+
 
 TARGET_MODULE = "vllm.models.qwen4_exp.amd.ple_layer"
 REPLACEMENT_MODULE = "vllm_hcu.models.qwen4_exp.amd.ple_layer"
@@ -128,11 +134,12 @@ def _should_prefetch_ple() -> bool:
 
         return bool(henvs.VLLM_HCU_PLE_PREFETCH_STREAM)
     except (ImportError, AttributeError):
-        return (
-            os.environ.get("VLLM_HCU_USE_CUSTOM_OPS", "1").lower()
-            in ("true", "1")
-            and os.environ.get("VLLM_HCU_PLE_PREFETCH_STREAM", "0").lower()
-            in ("true", "1")
+        return os.environ.get("VLLM_HCU_USE_CUSTOM_OPS", "1").lower() in (
+            "true",
+            "1",
+        ) and os.environ.get("VLLM_HCU_PLE_PREFETCH_STREAM", "0").lower() in (
+            "true",
+            "1",
         )
 
 
@@ -140,6 +147,7 @@ def _is_pin_memory_available() -> bool:
     """Check if pinned memory allocation is available on this platform."""
     try:
         from vllm.utils.platform_utils import is_pin_memory_available
+
         return is_pin_memory_available()
     except (ImportError, AttributeError):
         # Fallback: try to allocate a small pinned tensor
@@ -313,9 +321,7 @@ class HcuQwen4ExpPLEInt8UVAEmbeddingMethod(HcuQwen4ExpPLEInt8EmbeddingMethod):
         weight_view, scale_view = self._uva_view(layer)
         embeddings = F.embedding(local_ids, weight_view)
         scales = F.embedding(local_ids, scale_view)
-        output.copy_(
-            embeddings.to(torch.bfloat16) * scales.to(torch.bfloat16)
-        )
+        output.copy_(embeddings.to(torch.bfloat16) * scales.to(torch.bfloat16))
 
     def finalize_prefetched(
         self,
@@ -426,7 +432,9 @@ class HcuQwen4ExpPLEUnquantizedUVAEmbeddingMethod(QuantizeMethodBase):
         output.copy_(self.embedding(layer, local_ids))
 
     def finalize_prefetched(
-        self, layer: nn.Module, rows: torch.Tensor,
+        self,
+        layer: nn.Module,
+        rows: torch.Tensor,
     ) -> torch.Tensor:
         if layer.tp_size == 1:
             return rows

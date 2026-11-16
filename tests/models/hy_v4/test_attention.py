@@ -8,6 +8,54 @@ import torch
 from vllm.v1.kv_cache_interface import KVQuantMode
 
 
+@pytest.mark.parametrize(
+    ("tp_size", "pcp_size", "pp_size", "expected"),
+    [
+        (1, 8, 1, True),
+        (1, 8, 2, False),
+        (1, 1, 1, False),
+        (1, 4, 1, False),
+        (8, 1, 1, False),
+        (2, 8, 1, False),
+    ],
+)
+def test_linear_gate_pcp_shard_defaults_only_for_tp1_pcp8(
+    monkeypatch, tp_size, pcp_size, pp_size, expected
+):
+    """An unset opt-in must only auto-select the validated PCP8 topology."""
+    from vllm_hcu.models.hy_v4.attention import linear_gate_pcp_shard_enabled
+
+    monkeypatch.delenv("VLLM_HCU_USE_CUSTOM_OPS", raising=False)
+    monkeypatch.delenv("VLLM_HCU_ENABLE_LINEAR_GATE_PCP_SHARD", raising=False)
+
+    assert linear_gate_pcp_shard_enabled(
+        tp_size=tp_size, pcp_size=pcp_size, pp_size=pp_size
+    ) is expected
+
+
+@pytest.mark.parametrize(("value", "expected"), [("0", False), ("1", True)])
+def test_linear_gate_pcp_shard_explicit_env_overrides_default(
+    monkeypatch, value, expected
+):
+    """An explicit setting must retain operator control over auto-selection."""
+    from vllm_hcu.models.hy_v4.attention import linear_gate_pcp_shard_enabled
+
+    monkeypatch.delenv("VLLM_HCU_USE_CUSTOM_OPS", raising=False)
+    monkeypatch.setenv("VLLM_HCU_ENABLE_LINEAR_GATE_PCP_SHARD", value)
+
+    assert linear_gate_pcp_shard_enabled(tp_size=1, pcp_size=8) is expected
+
+
+def test_linear_gate_pcp_shard_master_overrides_explicit_child(monkeypatch):
+    """The child must not bypass the process-wide custom-op opt-out."""
+    from vllm_hcu.models.hy_v4.attention import linear_gate_pcp_shard_enabled
+
+    monkeypatch.setenv("VLLM_HCU_USE_CUSTOM_OPS", "0")
+    monkeypatch.setenv("VLLM_HCU_ENABLE_LINEAR_GATE_PCP_SHARD", "1")
+
+    assert linear_gate_pcp_shard_enabled(tp_size=1, pcp_size=8) is False
+
+
 def test_transformers_indexed_attention_alias_is_sparse() -> None:
     from vllm.transformers_utils.configs.hy_v4 import HYV4Config
     from vllm_hcu.models.hy_v4.attention import _SPARSE_LAYER_TYPES
