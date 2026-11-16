@@ -261,3 +261,12 @@ Do not remove the guard to satisfy an outdated direct-Core identity assertion.
 Exercise published and proposed compatible Adapter pairs, then the unchanged
 portable selection. These tests do not qualify guard behavior, device numerics,
 model quality or clean lifecycle. Track exit-time errors even when pytest exits0.
+
+
+When modular MoE reserves per-expert capacity, retain batched tensors and pass
+live-token counts to the target's official masked activation API; GEMM masking
+alone leaves activation processing padding. Check both Core and Plugin wrapper
+signatures at the actual target. Admission must follow all switches selecting
+the scatter/gather provider, whose tile limits may differ from GEMM alignment.
+Keep dispatch capacity guards and update positive decode fixtures to fit their
+allocated bound, with separate oversized refusals and retained RED evidence.
