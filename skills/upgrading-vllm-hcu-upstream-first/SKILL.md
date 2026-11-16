@@ -221,6 +221,14 @@ ownership refusal. Trust only the exact checkout path in the ephemeral job,
 never `safe.directory=*`, and verify another foreign checkout remains rejected.
 A successful container start still requires the actual selected tests to pass.
 
+A workflow can intentionally skip its GPU job for pull_request_target events.
+Treat the automatic green summary as structural evidence only. If the project
+provides an authorized manual PR test route, inspect its current trusted
+workflow and concurrency group before dispatching, then verify the fetched PR
+head, merged source and installed wheel identity in the resulting device job.
+Do not infer that a draft flag caused the skip or that a manual run qualifies
+a newer PR head.
+
 The portable script tests use temporary Git repositories:
 
 ```bash
