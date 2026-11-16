@@ -330,3 +330,13 @@ coherent Core build, architecture and submitted source.
 格式宽度/精度、嵌套或空格式参数均须保留为 unresolved 并触发人工复核；
 不能丢弃这些 AST 字段后检查另一个模块，再给出静态 unchanged 结论。
 
+For RMSNorm provider migration, read the exact target IR and preserve both
+intermediate rounding and FP32 epsilon. Compare small constant inputs near
+sqrt(epsilon) against an independent FP64 scalar oracle: random unit-scale
+inputs can hide an epsilon cast in an otherwise FP32 kernel. Check ordinary
+and fused exports separately, including changed-input Graph replay and input
+preservation. A public inference export may default to an in-place output,
+so pass a separate output for a non-mutating official op and validate its
+actual ABI before activation. Bind vendor behavior to the tested build. A
+component defect or repair alone does not prove a HumanEval failure's cause;
+retain per-task pass-set comparisons and exact-release model gates.
