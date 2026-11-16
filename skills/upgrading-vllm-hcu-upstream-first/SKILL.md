@@ -106,6 +106,18 @@ dependencies, gapped GPU READ/WRITE and real model P/D with Graph and prefix.
    process release and normal teardown as separate results.
 
 Graph capture or HTTP health alone does not establish successful generation.
+For GDN, follow the actual constructor's dispatch selection: an official
+CustomOp may replace `_forward_method` after platform dispatch, so overriding
+`forward_hip` alone need not execute the provider. An OOT prefill entry does
+not imply a public registry for its FLA leaves. Keep the official pipeline
+and current prefill/decode configuration semantics; legacy root callbacks or
+deprecated switches do not establish coverage in the production wheel.
+For compiler layout drift, inspect the resolved Triton build and actual layout
+constructor rather than deriving its API from the Torch version. Preserve the
+hardware register mode through layout construction and IR round trips; a
+constructor-only probe cannot establish native lowering or changed-input Graph
+correctness. Separate compiler failures from reference-allocation OOM and
+numerical assertions, and retain each original failure.
 For optional AutoAWQ dense providers, retain the official configuration,
 checkpoint loader and complete fallback through the public quantization
 registry. Eager and GPU-Graph success of a pybind callable does not establish
