@@ -24,7 +24,7 @@ and retains a Plugin E5M2 writer and descale adapter. The kernel page is 64
 tokens. It neither copies nor replaces the official Flash forward method and
 does not require private HCU hooks in the Core.
 
-## E2M1 packer lowering (opt-in, default stock)
+## E2M1 packer lowering (default triton, `stock` opts out)
 
 `das_hcu_fp4_packer` rebinds Core's `_fp32x2_to_fp4x2` E2M1 packer at startup.
 The audited upstream body emits PTX `cvt.rn.satfinite.e2m1x2.f32` with the
@@ -36,8 +36,10 @@ stays `0x8`). The first argument keeps the low nibble.
 Activation requires real HCU `gfx938`, vLLM `0.33.*`, an exact AST match with
 the audited definition plus identical aliases in six namespaces, an unhashed
 and uncompiled caller set, no foreign compile factor, and no existing runtime
-record. Stock (`HCU_VLLM_FP4_PACKER_IMPL=stock`, the default) or
-`HCU_DISABLE_OPS=vllm_fp4_packer` leaves every original object in place; a
+record. The paired Adapter registry defaults `HCU_VLLM_FP4_PACKER_IMPL` to
+`triton`, so the candidate is selected unless a deployment opts out. Explicit
+`stock` (`HCU_VLLM_FP4_PACKER_IMPL=stock`) or `HCU_DISABLE_OPS=vllm_fp4_packer`
+leaves every original object in place; a
 policy change needs a fresh process because JIT and Graph caches may already
 refer to the published kernel. A failure after publication is commit-fatal and
 is never presented as a rollback.

@@ -300,11 +300,28 @@ def test_audit_accepts_comment_and_whitespace_changes() -> None:
 
 
 # ---------------------------------------------------------------------------
-# 5. policy: default stock, kill switch wins, unsafe states refuse
+# 5. policy: default triton, kill switch wins, unsafe states refuse
 # ---------------------------------------------------------------------------
 
-def test_default_is_stock_with_no_capability(monkeypatch) -> None:
+def test_default_is_triton_and_advertises_capability(monkeypatch) -> None:
+    """The unpinned default is `triton`, so the candidate is advertised.
+
+    `HCU_VLLM_FP4_PACKER_IMPL` resolves through `hcu_adapter.hcu_env`, whose
+    registry default moved to `triton` (adapter 6de214a, "enable LightOp FP4
+    indexer and Triton packer by default"). Pin the value rather than reading
+    the registry back: `_mode()` resolves from that same registry, so comparing
+    the two would be tautological and could never fail. A deliberate policy
+    change must update this test.
+    """
     monkeypatch.delenv(packer.VARIABLE, raising=False)
+    monkeypatch.delenv("HCU_DISABLE_OPS", raising=False)
+    assert packer._mode() == "triton"
+    assert packer.extension_spec().capabilities == frozenset({packer.CAPABILITY})
+
+
+def test_explicit_stock_advertises_no_capability(monkeypatch) -> None:
+    """`stock` is now an explicit opt-out, and it must still stay inert."""
+    monkeypatch.setenv(packer.VARIABLE, "stock")
     monkeypatch.delenv("HCU_DISABLE_OPS", raising=False)
     assert packer._mode() == "stock"
     assert packer.extension_spec().capabilities == frozenset()
@@ -337,7 +354,9 @@ def test_invalid_value_is_refused(monkeypatch) -> None:
 def test_stock_activation_is_a_no_op(monkeypatch) -> None:
     monkeypatch.setattr(packer, "_state", None, raising=False)
     monkeypatch.setattr(packer, "_failure", None, raising=False)
-    monkeypatch.delenv(packer.VARIABLE, raising=False)
+    # `stock` is an explicit opt-out now; leaving the variable unset would
+    # activate the default `triton` candidate instead of the no-op branch.
+    monkeypatch.setenv(packer.VARIABLE, "stock")
     monkeypatch.delenv("HCU_DISABLE_OPS", raising=False)
     packer.activate_extension(ExtensionContext("0.1.0", "0.33.0"))
     assert packer._state == {"mode": "stock", "pid": __import__("os").getpid()}
@@ -354,11 +373,19 @@ def test_pending_opt_in_is_refused_before_activation(monkeypatch) -> None:
 
 
 def test_release_gate_rejects_other_release_line(monkeypatch) -> None:
+    """The 0.32 line must be refused by the release gate, not by a stray error.
+
+    `_require_release` lives in the paired Adapter and raises
+    `Dsv41ActivationError` (a RuntimeError). Pinning the type keeps the gate
+    from silently degrading into a bare AttributeError/TypeError.
+    """
+    from hcu_adapter.dsv41_activation import Dsv41ActivationError
+
     monkeypatch.setattr(packer, "_state", None, raising=False)
     monkeypatch.setattr(packer, "_failure", None, raising=False)
     monkeypatch.delenv("HCU_DISABLE_OPS", raising=False)
     monkeypatch.setenv(packer.VARIABLE, "triton")
-    with pytest.raises(Exception):
+    with pytest.raises(Dsv41ActivationError, match="0.33"):
         packer.activate_extension(ExtensionContext("0.1.0", "0.32.1"))
 
 
