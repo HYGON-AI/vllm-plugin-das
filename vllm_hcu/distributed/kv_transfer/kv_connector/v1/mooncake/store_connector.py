@@ -4,15 +4,21 @@
 
 from copy import copy
 from dataclasses import replace
+from typing import TYPE_CHECKING, Any
 
 from vllm.distributed.parallel_state import get_pcp_group
 from vllm.distributed.kv_transfer.kv_connector.v1.mooncake.store.connector import (
     MooncakeStoreConnector,
 )
 from vllm.distributed.kv_transfer.kv_connector.v1.mooncake.store.data import (
+    MooncakeStoreConnectorMetadata,
     PoolKey,
 )
 from vllm.distributed.kv_transfer.kv_connector.v1.base import KVConnectorRole
+
+if TYPE_CHECKING:
+    from vllm.v1.core.sched.output import SchedulerOutput
+    from vllm.v1.request import Request
 
 
 _SINGLE_PCP_REPLICA = "pcp_single_replica"
@@ -86,11 +92,9 @@ class HcuMooncakeStoreConnector(MooncakeStoreConnector):
         config = args[0] if args else kwargs["vllm_config"]
         role = args[1] if len(args) > 1 else kwargs["role"]
         parallel_config = config.parallel_config
-        self._singlecopy_send_count = (
-            parallel_config.world_size
-            // parallel_config.prefill_context_parallel_size
-        )
+        self._singlecopy_send_count = parallel_config.world_size
         self._singlecopy_recv_count = parallel_config.world_size
+        self._singlecopy_async_send_ids: set[str] = set()
         config, single_pcp_replica = _configure_single_pcp_replica(config, role)
         if args:
             args = (config, *args[1:])
@@ -112,6 +116,60 @@ class HcuMooncakeStoreConnector(MooncakeStoreConnector):
         if self._single_pcp_replica:
             return self._singlecopy_recv_count
         return super().get_finished_recv_count()
+
+    def request_finished(
+        self, request: "Request", block_ids: list[int]
+    ) -> tuple[bool, dict[str, Any] | None]:
+        return self.request_finished_all_groups(request, (block_ids,))
+
+    def request_finished_all_groups(
+        self, request: "Request", block_ids: tuple[list[int], ...]
+    ) -> tuple[bool, dict[str, Any] | None]:
+        async_save, transfer_params = super().request_finished_all_groups(
+            request, block_ids
+        )
+        if (
+            self._single_pcp_replica
+            and self.connector_scheduler is not None
+            and async_save
+        ):
+            self._singlecopy_async_send_ids.add(request.request_id)
+        return async_save, transfer_params
+
+    def build_connector_meta(
+        self, scheduler_output: "SchedulerOutput"
+    ) -> MooncakeStoreConnectorMetadata:
+        metadata = super().build_connector_meta(scheduler_output)
+        if self._single_pcp_replica and self._singlecopy_async_send_ids:
+            setattr(
+                metadata,
+                "_hcu_singlecopy_noop_send_ids",
+                self._singlecopy_async_send_ids,
+            )
+            self._singlecopy_async_send_ids = set()
+        return metadata
+
+    def get_finished(
+        self, finished_req_ids: set[str]
+    ) -> tuple[set[str] | None, set[str] | None]:
+        finished_sending, finished_recving = super().get_finished(finished_req_ids)
+        worker = self.connector_worker
+        if (
+            not self._single_pcp_replica
+            or worker is None
+            or worker.kv_role != "kv_consumer"
+        ):
+            return finished_sending, finished_recving
+
+        # MultiConnector counts async saves on the scheduler side. Consumer
+        # ranks must report this no-op Store completion so their P2P completion
+        # can drain the same per-request async-save count as the writer rank.
+        metadata = self._get_connector_metadata()
+        assert isinstance(metadata, MooncakeStoreConnectorMetadata)
+        no_op_sends = getattr(metadata, "_hcu_singlecopy_noop_send_ids", set())
+        if no_op_sends:
+            finished_sending = (finished_sending or set()) | no_op_sends
+        return finished_sending or None, finished_recving
 
 
 __all__ = ["HcuMooncakeStoreConnector"]

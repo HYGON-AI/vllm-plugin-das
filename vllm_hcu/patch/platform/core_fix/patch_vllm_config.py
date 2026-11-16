@@ -166,6 +166,28 @@ def _is_hyv4_vl_mooncake_store(vllm_config: object) -> bool:
     )
 
 
+def _is_hyv4_vl_mooncake_pd_store_producer(vllm_config: object) -> bool:
+    """Allow the supported PCP producer to publish to P2P and Store."""
+    transfer = getattr(vllm_config, "kv_transfer_config", None)
+    transfer_repr = repr(transfer)
+    return (
+        getattr(transfer, "kv_connector", None) == "MultiConnector"
+        and str(getattr(transfer, "kv_role", None)) == "kv_producer"
+        and "MooncakeConnector" in transfer_repr
+        and "MooncakeStoreConnector" in transfer_repr
+    )
+
+
+def _is_hyv4_vl_mooncake_p2p_producer(vllm_config: object) -> bool:
+    """Allow the supported PCP producer to publish KV through Mooncake P2P."""
+    transfer = getattr(vllm_config, "kv_transfer_config", None)
+    return (
+        getattr(transfer, "kv_connector", None) == "MooncakeConnector"
+        and str(getattr(transfer, "kv_role", None)) == "kv_producer"
+        and getattr(transfer, "kv_connector_module_path", None) is None
+    )
+
+
 def _require_hyv4_vl_pcp_contract(vllm_config: object) -> None:
     """Admit standalone W4A8 PCP16 and the static image producer."""
     parallel = vllm_config.parallel_config
@@ -174,13 +196,18 @@ def _require_hyv4_vl_pcp_contract(vllm_config: object) -> None:
     raw_quantization = getattr(
         getattr(model, "hf_config", None), "quantization_config", None
     )
-    mooncake_store = _is_hyv4_vl_mooncake_store(vllm_config)
+    mooncake_store = (
+        _is_hyv4_vl_mooncake_store(vllm_config)
+        or _is_hyv4_vl_mooncake_pd_store_producer(vllm_config)
+    )
     if mooncake_store and getattr(
         getattr(vllm_config, "cache_config", None), "cache_dtype", None
     ) not in ("fp8_e4m3", "fp8_ds_mla"):
         raise ValueError("HYV4-VL MooncakeStore PCP requires FP8 E4M3 KV cache.")
     if (
-        vllm_config.kv_transfer_config is None or mooncake_store
+        vllm_config.kv_transfer_config is None
+        or mooncake_store
+        or _is_hyv4_vl_mooncake_p2p_producer(vllm_config)
     ) and not parallel.enable_eplb:
         expected = {
             "pipeline_parallel_size": 1,
@@ -232,7 +259,11 @@ def _require_hyv4_vl_pcp_contract(vllm_config: object) -> None:
         != "deep_gemm"
         or (
             vllm_config.speculative_config is not None
-            and not _is_hyv4_vl_mooncake_store(vllm_config)
+            and not (
+                _is_hyv4_vl_mooncake_store(vllm_config)
+                or _is_hyv4_vl_mooncake_pd_store_producer(vllm_config)
+                or _is_hyv4_vl_mooncake_p2p_producer(vllm_config)
+            )
         )
         or vllm_config.kv_transfer_config is None
         or not feature.expert_map_path
@@ -452,6 +483,7 @@ def _require_mrv2_pcp_contract(vllm_config: object) -> None:
         # HYV4-VL Mooncake Store path; do not infer support from connector name.
         if not (
             _is_hyv4_vl_mooncake_store(vllm_config)
+            or _is_hyv4_vl_mooncake_pd_store_producer(vllm_config)
             or (
                 (is_hyv4 or is_hyv4_vl)
                 and getattr(kv_transfer_config, "kv_connector", None)
