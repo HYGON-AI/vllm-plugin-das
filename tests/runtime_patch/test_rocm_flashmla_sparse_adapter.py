@@ -184,7 +184,7 @@ def test_decode_contract(monkeypatch, ratio, batch, tp_size):
     )
     local_heads = 64 // tp_size
     calls = []
-    mapper = ModuleType("vllm.models.deepseek_v4.common.ops")
+    mapper = ModuleType("vllm_hcu.v1.attention.ops.deepseek_v4_topk")
 
     def map_topk(indices, *args):
         calls.append("map")
@@ -320,7 +320,7 @@ def test_decode_falls_back_for_unsupported_local_head_counts(
     monkeypatch, heads, uses_flashmla
 ):
     calls = []
-    mapper = ModuleType("vllm.models.deepseek_v4.common.ops")
+    mapper = ModuleType("vllm_hcu.v1.attention.ops.deepseek_v4_topk")
     mapper.compute_global_topk_indices_and_lens = lambda *args: (None, None)
     monkeypatch.setitem(sys.modules, mapper.__name__, mapper)
     flash = ModuleType("vllm_hcu.v1.attention.ops.flashmla")

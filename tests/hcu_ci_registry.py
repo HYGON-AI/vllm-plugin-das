@@ -604,3 +604,14 @@ register_hcu_ci(
     target="tests/distributed/single_node/test_topology_contracts.py",
     est_time=60,
 )
+
+register_hcu_ci(
+    job="accuracy-gfx936",
+    target="tests/kernels/test_bf16_indexer_gather.py",
+    est_time=30,
+)
+register_hcu_ci(
+    job="accuracy-gfx938",
+    target="tests/kernels/test_bf16_indexer_gather.py",
+    est_time=30,
+)
