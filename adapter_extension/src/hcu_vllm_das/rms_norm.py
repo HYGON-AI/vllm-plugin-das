@@ -3,7 +3,7 @@
 from __future__ import annotations
 
 import torch
-from lightop.norm import fused_add_rms_norm, rmsnorm_forward_autograd
+from lightop.norm import fused_add_rms_norm, rms_norm
 
 from vllm import envs
 from vllm.model_executor.layers.layernorm import RMSNorm
@@ -21,9 +21,12 @@ def _rms_norm_impl(
     variance_epsilon: float,
     training: bool,
 ) -> torch.Tensor:
+    del training  # The vLLM operator is inference-only.
     # vLLM's native IR rounds the normalized value before multiplying weight.
-    normalized = rmsnorm_forward_autograd(
-        x, torch.ones_like(weight), variance_epsilon, training
+    # The autograd export narrows epsilon to x.dtype. The public inference
+    # export retains FP32 epsilon; its default aliases x, so provide an output.
+    normalized = rms_norm(
+        x, torch.ones_like(weight), variance_epsilon, torch.empty_like(x)
     )
     return normalized * weight
 

@@ -89,11 +89,13 @@ sys.modules["torch"] = torch
 lightop = ModuleType("lightop")
 lightop.__path__ = []
 norm = ModuleType("lightop.norm")
-def rmsnorm_forward_autograd(value, weight, epsilon, training):
+def rms_norm(value, weight, epsilon, output):
+    assert output is not value
     events.append(
-        ["ordinary-lightop", value.tag, weight.tag, epsilon, training]
+        ["ordinary-lightop", value.tag, weight.tag, epsilon, output.tag]
     )
-    return Tensor(value.shape, dtype=value.dtype, tag="ordinary-output")
+    output.tag = "ordinary-output"
+    return output
 def fused_add_rms_norm(value, residual_value, weight, epsilon):
     events.append(
         ["fused-lightop", value.tag, residual_value.tag, weight.tag, epsilon]
@@ -101,7 +103,7 @@ def fused_add_rms_norm(value, residual_value, weight, epsilon):
     value.tag = "fused-output"
     residual_value.tag = "fused-residual"
     return "ignored-lightop-return"
-norm.rmsnorm_forward_autograd = rmsnorm_forward_autograd
+norm.rms_norm = rms_norm
 norm.fused_add_rms_norm = fused_add_rms_norm
 lightop.norm = norm
 sys.modules["lightop"] = lightop
@@ -297,6 +299,8 @@ def test_ordinary_rmsnorm_registers_and_calls_lightop() -> None:
     assert report["result"] == "ordinary-output"
     assert report["ordinary_fake_shape"] == [3, 256]
     assert any(event[0] == "ordinary-lightop" for event in report["events"])
+    assert next(event for event in report["events"]
+                if event[0] == "ordinary-lightop")[-1] == "ordinary-fake"
 
 
 def test_fused_add_rmsnorm_returns_mutated_inputs() -> None:
