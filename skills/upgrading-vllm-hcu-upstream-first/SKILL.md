@@ -75,6 +75,13 @@ present, describes the legacy root version file; inspect the production
 `adapter_extension` metadata independently. Static matches do not validate
 ABI compatibility, HCU execution, correctness, model quality or speed.
 
+For NIXL, derive the package and descriptor ABI from the selected Core target.
+Module discovery, distribution-version checks and Ray aliases must select one
+native provider. A working older `nixl` UCX transfer does not satisfy a target
+requiring `nixl_rocm` and compressed Nx5 descriptors. Prefer the target's pinned
+official ROCm build before adding a package shim; verify installed native
+dependencies, gapped GPU READ/WRITE and real model P/D with Graph and prefix.
+
 ## Validate the changed execution path
 
 1. Freeze Core/Adapter/Plugin sources and dependency heads. Check capability
