@@ -16,6 +16,7 @@ from vllm.model_executor.layers.fused_moe.topk_weight_and_reduce import (
 )
 from vllm.model_executor.layers.fused_moe.utils import _resize_cache
 from vllm.platforms import current_platform
+from vllm_hcu.platforms import envs as henvs
 from vllm_hcu.model_executor.layers.fused_moe.deep_gemm_utils import (
     compute_aligned_M,
     deepgemm_moe_permute,
@@ -242,7 +243,7 @@ class DeepEPBF16MaskedExperts(DeepEPBF16ContiguousExperts):
         config = {"MODE": 2000}
         gemm(hidden_states, self._packed_w13, gateup, counts, expected_m, config=config)
         activated = flat[e * m * n : e * m * (n + n // 2)].view(e, m, n // 2)
-        self.activation(activation, activated.view(-1, n // 2), gateup.view(-1, n))
+        self.activation(activation, activated, gateup, valid_token_counts=counts)
         gemm(
             activated,
             self._packed_w2,
@@ -274,6 +275,21 @@ class DeepEPAutoBF16Experts(DeepEPAutoDeepGemmExperts):
             return (
                 False,
                 "BF16 DeepGEMM requires hidden/intermediate sizes divisible by 256",
+            )
+        # Generic ep_gather has no masked final tile. Match its provider
+        # selection so non-1024-aligned hidden sizes fail before loading when
+        # either LightOp switch is disabled. Intermediate size is unrelated.
+        lightop_gather = (
+            current_platform.is_rocm()
+            and henvs.VLLM_HCU_USE_CUSTOM_OPS
+            and henvs.VLLM_HCU_USE_LIGHTOP_EP_SCATTER
+        )
+        if not lightop_gather and moe_config.hidden_dim % min(
+            moe_config.hidden_dim, 1024
+        ):
+            return (
+                False,
+                "BF16 DeepGEMM generic ep_gather requires 1024-aligned hidden size",
             )
         if getattr(moe_config, "apply_router_weight_on_input", False):
             return False, "BF16 DeepGEMM requires output router weighting"

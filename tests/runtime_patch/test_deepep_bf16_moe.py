@@ -193,3 +193,73 @@ def test_online_eplb_is_refused_before_delegating_to_expert_selection(monkeypatc
     supported, reason = DeepEPAutoBF16Experts.is_supported_config(
         DeepEPAutoBF16Experts, config, None, None, None)
     assert not supported and "EPLB" in reason
+
+
+@pytest.mark.parametrize("hidden", [512, 768, 1024, 2048, 2560, 3072])
+@pytest.mark.parametrize("custom,lightop", [(False, False), (False, True), (True, False), (True, True)])
+def test_bf16_admission_matches_selected_ht_gather(monkeypatch, hidden, custom, lightop):
+    from vllm_hcu.model_executor.layers.fused_moe.experts import deepep_bf16_moe as impl
+
+    monkeypatch.setattr(impl.current_platform, "is_rocm", lambda: True)
+    monkeypatch.setenv("VLLM_HCU_USE_CUSTOM_OPS", str(int(custom)))
+    monkeypatch.setenv("VLLM_HCU_USE_LIGHTOP_EP_SCATTER", str(int(lightop)))
+    # Isolate this admission boundary from unrelated host/target selection ABI.
+    monkeypatch.setattr(DeepEPBF16ContiguousExperts, "is_supported_config",
+                        staticmethod(lambda *args: (True, None)))
+    config = _auto_config()
+    config.hidden_dim = hidden
+    supported, reason = DeepEPAutoBF16Experts.is_supported_config(
+        DeepEPAutoBF16Experts, config, None, None, None)
+    expected = (custom and lightop) or hidden % min(hidden, 1024) == 0
+    assert supported is expected
+    if not expected:
+        assert "ep_gather" in reason
+
+
+def test_bf16_masked_activation_preserves_expert_counts_and_padding(monkeypatch):
+    from types import SimpleNamespace
+    from vllm_hcu.model_executor.layers.fused_moe.experts import deepep_bf16_moe as impl
+    from vllm.model_executor.layers.fused_moe.activation import MoEActivation
+
+    expert = object.__new__(impl.DeepEPBF16MaskedExperts)
+    expert.num_dispatchers = 1
+    e, m, n, k = 3, 8, 8, 4
+    counts = torch.tensor([0, 1, 3], dtype=torch.int32)
+    x = torch.arange(e * m * k, dtype=torch.float32).view(e, m, k) / 100
+    w1 = torch.arange(e * n * k, dtype=torch.float32).view(e, n, k) / 100
+    w2 = torch.arange(e * k * (n // 2), dtype=torch.float32).view(e, k, n // 2) / 100
+    expert._packed_w13, expert._packed_w2 = w1, w2
+    workspace = torch.full((e, m, n + n // 2), -123.)
+    output = torch.full((e, m, k), -456.)
+    calls = []
+
+    def gemm(a, weight, out, actual_counts, expected_m, *, config):
+        assert actual_counts is counts
+        assert config == {"MODE": 2000}
+        calls.append("gemm")
+        for i, count in enumerate(counts.tolist()):
+            out[i, :count].copy_(a[i, :count] @ weight[i].T)
+
+    def activate(activation, out, inp, *, valid_token_counts):
+        assert activation is MoEActivation.SILU
+        assert valid_token_counts is counts
+        assert inp.shape == (e, m, n) and out.shape == (e, m, n // 2)
+        assert inp.is_contiguous() and out.is_contiguous()
+        calls.append("activation")
+        for i, count in enumerate(counts.tolist()):
+            gate, up = inp[i, :count].chunk(2, dim=-1)
+            out[i, :count].copy_(torch.nn.functional.silu(gate) * up)
+
+    monkeypatch.setattr(impl, "_deepgemm_op", lambda _: gemm)
+    expert.activation = activate
+    expert.apply(output, x, w1, w2, torch.ones(4, 1), torch.zeros(4, 1, dtype=torch.int64),
+                 MoEActivation.SILU, e, None, None, None, torch.empty(0), workspace,
+                 SimpleNamespace(expert_num_tokens=counts), False)
+    assert calls == ["gemm", "activation", "gemm"]
+    activated = workspace.view(-1)[e * m * n:].view(e, m, n // 2)
+    for i, count in enumerate(counts.tolist()):
+        gate, up = (x[i, :count] @ w1[i].T).chunk(2, dim=-1)
+        expected = (torch.nn.functional.silu(gate) * up) @ w2[i].T
+        torch.testing.assert_close(output[i, :count], expected)
+        assert torch.all(output[i, count:] == -456.)
+        assert torch.all(activated[i, count:] == -123.)

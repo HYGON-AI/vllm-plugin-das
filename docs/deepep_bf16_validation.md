@@ -154,3 +154,28 @@ Worker method bodies, so they prove refresh selection/order, content and pointer
 preservation, not native GEMM or Graph replay. Historical native/model numbers
 above retain their original source and environment scope. Required current-head
 portable/native/model gates still apply after this conflict/review repair.
+
+## HT admission and LL activation follow-up (2026-11-16)
+
+For HT, the generic `ep_gather` has no masked final hidden tile. When either
+`VLLM_HCU_USE_CUSTOM_OPS` or `VLLM_HCU_USE_LIGHTOP_EP_SCATTER` is disabled,
+hidden dimensions above 1024 must therefore be divisible by 1024. Reject an
+incompatible request before loading; for example hidden2560 requires the ROCm
+LightOp path with both switches enabled. The independent BF16 GEMM requirement
+of hidden/intermediate dimensions divisible by256 remains. Sub-1024 dimensions
+and compatible generic-gather dimensions retain their original admission.
+
+LL now passes contiguous `[experts, capacity, width]` tensors and int32
+`valid_token_counts` through the official modular activation API. Both GEMMs and
+activation use the same expert counts, avoiding activation work on reserved
+padding. This API was checked in SourceFind v0.28.1-dev
+`b95ba2d1df6d8046aa58cf83e813805312ef2884` and the submitted Plugin modular
+wrapper; an older v0.28.0 Core without that API is not qualified by these tests.
+
+The original Worker decode fixture now fits its64-token LL buffer, and separately
+refuses65/256-token decode inputs. The production capacity guard is retained.
+CPU tests cover all four provider-switch combinations, compatible and incompatible
+hidden widths, empty and populated experts, counts forwarding, numeric output,
+and untouched padding with explicit CPU GEMM/activation doubles. These tests do
+not establish native masked activation speed, device kernels, Graph or model
+accuracy. Current-head target CI and applicable E2E gates still apply.
