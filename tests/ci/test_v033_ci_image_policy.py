@@ -170,7 +170,7 @@ class ImagePolicyTests(unittest.TestCase):
         self.assertNotEqual(code, 0)
         self.assertEqual(output, '')
 
-    def test_fork_container_credentials_omit_unavailable_secrets_in_both_jobs(self):
+    def test_cross_repository_credentials_omit_unavailable_secrets_in_both_jobs(self):
         for name in ['v033-device-gfx936', 'v033-device-gfx938']:
             with self.subTest(job=name):
                 block = job_block(self.source, name)
@@ -178,7 +178,9 @@ class ImagePolicyTests(unittest.TestCase):
                 line = next(line.strip() for line in container.splitlines()
                             if line.strip().startswith('credentials:'))
                 self.assertTrue(line.startswith('credentials: ${{ fromJSON('))
-                self.assertIn("github.event.pull_request.head.repo.fork && '{}' || format(", line)
+                self.assertIn("github.event_name == 'pull_request' && ", line)
+                self.assertIn("github.event.pull_request.head.repo.full_name "
+                              "!= github.repository && '{}' || format(", line)
                 self.assertIn('"username":{0},"password":{1}', line)
                 self.assertIn('toJSON(secrets.HARBOR_USERNAME)', line)
                 self.assertIn('toJSON(secrets.HARBOR_PASSWORD)', line)
