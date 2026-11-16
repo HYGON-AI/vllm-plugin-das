@@ -54,8 +54,24 @@ def host_enabled():
     return _state['host'] if _state is not None else _flag(_HOST_FLAG, default=False)
 
 
+def _profile_policy():
+    from .environment import dsv41_profile_worker_enabled
+
+    return dsv41_profile_worker_enabled()
+
+
+def _install_profile_worker():
+    from vllm.platforms import current_platform
+    from .dsv41.profile_worker import install
+    from hcu_adapter.bridges.vllm_dsv41 import register_compatibility
+
+    install(current_platform)
+    register_compatibility()
+
+
 def policy_factor():
-    return (pcp_enabled(), host_enabled(), True) if fp4_selected() else (pcp_enabled(), host_enabled())
+    policy = (pcp_enabled(), host_enabled(), True) if fp4_selected() else (pcp_enabled(), host_enabled())
+    return (*policy, _profile_policy()) if pcp_enabled() else policy
 
 
 def _fatal(message):
@@ -100,6 +116,7 @@ def check_health():
                     or _function(ModelRegistry.register_model) is not _state['register']
                     or _flag(_FLAG, default=False) != _state['enabled']
                     or _flag(_HOST_FLAG, default=False) != _state['host']
+                    or (_state['enabled'] and _profile_policy() != _state['profile_worker'])
                     or fp4_selected() != _state.get('fp4', False)
                     or envs.environment_variables.get(_FACTOR) is not policy_factor
                     or not _adapter_bindings_valid()):
@@ -153,13 +170,18 @@ def activate_extension(context):
             if selected:
                 from .v41_pcp import bind_adapter_classes
                 bind_adapter_classes()
+            profile_worker = _profile_policy() if pcp_selected else None
+            if pcp_selected:
+                _install_profile_worker()
             if selected and _key(entry) == _NATIVE:
                 ModelRegistry.register_model(_ARCH, ':'.join(_PLUGIN))
             entry = ModelRegistry.models.get(_ARCH)
             if _key(entry) != (_PLUGIN if selected else _NATIVE):
                 raise RuntimeError('V41 PCP model publication lost its owner')
             envs.environment_variables[_FACTOR] = policy_factor
-            _state = dict(enabled=pcp_selected, host=host_selected, fp4=fp4, registry=ModelRegistry, entry=entry, register=register)
+            _state = dict(enabled=pcp_selected, host=host_selected, fp4=fp4,
+                          profile_worker=profile_worker,
+                          registry=ModelRegistry, entry=entry, register=register)
             check_health()
         except BaseException as error:
             try:
@@ -171,6 +193,11 @@ def activate_extension(context):
 
 
 def extension_spec():
+    capabilities = {'hcu-v41-pcp-eager-attention', 'hcu-v41-private-engram-host'}
+    # Keep #399's required-capability contract on the actual PCP owner. The
+    # independent Channel-FP8 quantization owner does not imply PCP activation.
+    if _flag(_FLAG, default=False):
+        capabilities.add('dsv41-pcp-megamoe')
     return ExtensionSpec(name='das-hcu-v41-pcp', api_version=1, priority=116,
-        capabilities=frozenset({'hcu-v41-pcp-eager-attention', 'hcu-v41-private-engram-host'}),
+        capabilities=frozenset(capabilities),
         activate=activate_extension, check_health=check_health)

@@ -127,9 +127,14 @@ def mega_config():
     config = NS(
         parallel_config=NS(tensor_parallel_size=1, data_parallel_size=1,
             pipeline_parallel_size=1, enable_expert_parallel=True,
-            enable_dbo=False, enable_eplb=False, expert_placement_strategy="linear"),
-        model_config=NS(enforce_eager=True, enable_sleep_mode=False),
-        speculative_config=None, offload_config=None)
+            prefill_context_parallel_size=8, decode_context_parallel_size=1,
+            worker_cls="auto", enable_dbo=False, enable_eplb=False,
+            expert_placement_strategy="linear"),
+        model_config=NS(enforce_eager=True, enable_sleep_mode=False,
+            quantization="hcu_dsv41_channel_fp8", hf_config=NS(model_type="deepseek_v41")),
+        kernel_config=NS(moe_backend="deep_gemm_mega_moe"),
+        speculative_config=None, offload_config=None,
+        cache_config=NS(swa_bounded_replay=False))
     moe = NS(pcp_size=8, ep_size=8, num_experts=384, num_logical_experts=384,
         moe_parallel_config=NS(use_deepep_ht_kernels=True),
         in_dtype=torch.bfloat16, is_sequence_parallel=False, has_bias=False,
@@ -145,6 +150,7 @@ def test_target_contract_and_excluded_features():
     validate_config(config, moe)
     for owner, name, value, message in [
         (config, "speculative_config", object(), "speculative"),
+        (config.cache_config, "swa_bounded_replay", True, "replay"),
         (config.parallel_config, "enable_eplb", True, "EPLB"),
         (moe, "num_experts", 392, "redundant"),
         (moe, "experts_per_token", 3, "target shape"),
@@ -159,10 +165,10 @@ def test_target_contract_and_excluded_features():
 
 
 def test_identity_routes_and_no_redundant_factory():
-    from hcu_vllm_das.models import dsv41_pcp as model
+    from hcu_vllm_das.models import v41_pcp as model
     from vllm.models.deepseek_v41.amd import model as native
-    assert model._DECODER_INIT.__globals__["DeepseekV4MoE"] is model.HcuDSV41PcpMoE
-    assert model.HcuDSV41PcpMoE.__mro__[1] is native.DeepseekV4MoE
+    assert model._DECODER_INIT.__globals__["DeepseekV4MoE"] is model.HcuV41PcpMoE
+    assert model.HcuV41PcpMoE.__mro__[1] is native.DeepseekV4MoE
     ids = torch.tensor([[1, 5], [7, 2]])
     x = torch.ones(2, 8)
     weights = torch.full((2, 2), .25)
@@ -183,14 +189,14 @@ def test_mega_native_modular_instance():
 
 
 def test_pcp_reports_ep_local_expert_count(monkeypatch):
-    from hcu_vllm_das.models import dsv41_pcp as model
+    from hcu_vllm_das.models import v41_pcp as model
     from vllm.models.deepseek_v41.amd import model as native
     def initialize(self, *args, **kwargs):
         torch.nn.Module.__init__(self)
         self.n_local_physical_experts = 384
         self.experts = NS(moe_config=NS(num_local_experts=48))
     monkeypatch.setattr(native.DeepseekV4MoE, "__init__", initialize)
-    assert model.HcuDSV41PcpMoE().n_local_physical_experts == 48
+    assert model.HcuV41PcpMoE().n_local_physical_experts == 48
 
 
 @pytest.mark.parametrize("rows", [0, 2])

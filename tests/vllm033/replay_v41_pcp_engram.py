@@ -29,7 +29,9 @@ except ModuleNotFoundError as e:
     if not e.name.startswith('hcu_vllm_das.'):raise
     prod=host=None
 RESULTS=[]
-def require():assert prod is not None,'production Engram module absent'
+def require():
+    assert prod is not None,'production Engram module absent'
+    v41_pcp.bind_adapter_classes()
 def case(name,fn):
     try:fn();RESULTS.append(dict(case=name,status='passed'))
     except Exception as e:
@@ -40,7 +42,7 @@ def reject(fn):
     except (ValueError,RuntimeError,AssertionError):return
     raise AssertionError('unsupported contract accepted')
 def config(width=8):
-    c=cfg(width);c.engram_config=NS(cpu_offload=True,dp_shared_memory=False,embedding_across_dp=False,use_thp=False)
+    c=cfg(width);c.parallel_config.worker_cls='auto';c.engram_config=NS(cpu_offload=True,dp_shared_memory=False,embedding_across_dp=False,use_thp=False)
     c.scheduler_config=NS(max_num_batched_tokens=8)
     return c
 class Hip:

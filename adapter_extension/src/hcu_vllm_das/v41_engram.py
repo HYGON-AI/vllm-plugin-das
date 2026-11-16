@@ -93,8 +93,12 @@ class HcuV41PcpEngram(native.Engram):
         super().__init__(*args, **kwargs)
 
     def _init_staging(self, max_tokens, head_dim):
+        from .dsv41.profile_worker import profile_token_capacity
+
         table = self.embed_tokens
-        self.staged_rows = torch.empty(max_tokens * table._hcu_pcp_size,
+        slot = profile_token_capacity(
+            get_current_vllm_config(), table._hcu_pcp_size, max_tokens)
+        self.staged_rows = torch.empty(slot * table._hcu_pcp_size,
                                        table.part_n_hash_cols, head_dim, dtype=torch.bfloat16)
         # Synchronous staging keeps eager PCP collectives ordered and avoids
         # a lookup stream retaining temporary hashes past their ownership scope.

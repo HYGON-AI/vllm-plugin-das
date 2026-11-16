@@ -96,3 +96,32 @@ class HcuDSV41ChannelFP8MoEMethod(CompressedTensorsW8A8Fp8MoEMethod):
         packed.validate(layer.w13_weight, layer.w2_weight, layer.w13_weight_scale, layer.w2_weight_scale)
         self.moe_kernel = mk.FusedMoEKernel(prepare, experts)
         self._packed = packed
+
+
+def create_channel_fp8_moe_method(weight_quant, input_quant, moe, layer_name=None):
+    """Select PCP providers without changing the existing decode/draft routes.
+
+    The provider is invoked only for the adapter-validated Channel-FP8 scheme.
+    Each PCP method retains its full shape/topology/vendor admission checks.
+    """
+    parallel = getattr(moe, "moe_parallel_config", None)
+    pcp_target = (
+        getattr(moe, "pcp_size", None) == 8
+        and getattr(moe, "ep_size", None) == 8
+        and getattr(parallel, "tp_size", None) == 1
+        and getattr(parallel, "dp_size", None) == 1
+        and getattr(parallel, "use_deepep_ht_kernels", False)
+        and not getattr(parallel, "use_deepep_ll_kernels", False)
+    )
+    backend = getattr(moe, "moe_backend", None)
+    if backend == "deep_gemm_mega_moe":
+        if not pcp_target:
+            raise ValueError("Channel-FP8 MegaMoE requires TP1/DP1/PCP8/EP8 and DeepEP HT")
+        from ..moe.dsv41_megamoe import HcuDSV41MegaMoEMethod
+
+        return HcuDSV41MegaMoEMethod(weight_quant, input_quant, moe, layer_name)
+    if backend == "deep_gemm" and pcp_target:
+        from ..moe.dsv41_deepgemm import HcuDSV41DeepGemmMethod
+
+        return HcuDSV41DeepGemmMethod(weight_quant, input_quant, moe, layer_name)
+    return HcuDSV41ChannelFP8MoEMethod(weight_quant, input_quant, moe, layer_name)

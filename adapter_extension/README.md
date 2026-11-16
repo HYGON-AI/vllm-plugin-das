@@ -101,6 +101,41 @@ quantization and GEMM are doubled in that replay. DSpark draft scale aliases,
 actual checkpoint loading, distributed execution and GPU correctness remain
 unverified. See [target loading and empty-row validation](../docs/validation/dsv41-channel-fp8-loading.md).
 
+## PCP Channel-FP8 providers
+
+`das_hcu_v41_pcp` remains the sole owner of the V4.1 target model registration;
+`das_hcu_dsv41` independently owns Channel-FP8 quantization admission. Select
+PCP with `VLLM_HCU_DSV41_PCP_ATTENTION=1` and `HCU_VLLM_PCP_IMPL=native`.
+The enabled PCP owner also advertises the `dsv41-pcp-megamoe` capability from
+#399; requiring that capability does not enable PCP by itself.
+
+PCP attention and FP8 reference scoring stay adapter-owned. Native mHC class
+names retain the adapter's public OOT dispatch, including its provider/shape
+fallbacks; the PCP model does not install another local mHC implementation.
+The additional `dsv41.pcp_attention` and `models.dsv41_pcp` import paths are
+compatibility aliases to these same classes, not independent implementations.
+
+For Channel-FP8 TP1/DP1/PCP8/EP8 with DeepEP HT, explicit `deep_gemm` selects
+the scoped PCP DeepGEMM method; explicit `deep_gemm_mega_moe` selects MegaMoE.
+Vendor target-shape, eager, no-replay and other provider admission checks remain
+mandatory. Existing decode HT/LL and DSpark AG-RS methods remain selected for
+their original configurations. CT W4A8 uses its independent quantization route.
+
+`VLLM_HCU_DSV41_PCP_PROFILE_WORKER=1` (default) selects rank-local memory
+profiling only for that resolved Channel-FP8 PCP8 topology and only when Core's
+worker choice was automatic. Engram staging and vendor buffers share the same
+local token bound. Disabling automatic selection or using a different explicit
+worker retains global capacity. Explicitly naming this PCP worker still applies
+its topology/quantization predicate to both profiling and capacity reservation;
+configurations outside that predicate retain global capacity. Changing the
+policy after PCP publication requires a fresh process. The scheduler's global
+budget is not reduced.
+
+CPU contracts cover registration, dispatch, local capacity, empty ranks and
+loader preservation. They do not certify multi-rank execution, vendor kernel
+availability, model accuracy or performance. PCP8 hardware acceptance remains
+required after merging these providers.
+
 ## Compatibility
 
 - vLLM release line: `>=0.33.0,<0.34.0`; prerelease, postrelease,

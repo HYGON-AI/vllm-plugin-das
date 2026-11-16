@@ -118,9 +118,9 @@ def _bindings():
 
 
 def _moe_provider():
-    from .quantization.channel_fp8_moe import HcuDSV41ChannelFP8MoEMethod
+    from .quantization.channel_fp8_moe import create_channel_fp8_moe_method
 
-    return HcuDSV41ChannelFP8MoEMethod
+    return create_channel_fp8_moe_method
 
 
 def _ct_w4a8_config_provider():

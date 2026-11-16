@@ -131,6 +131,8 @@ def decoder_replay_gate():
 def publication():
     require()
     with ExitStack() as s:
+        s.enter_context(patch('vllm.platforms.current_platform', NS(
+            is_rocm=lambda:True, device_name='hcu', register_worker_selector=lambda fn:None)))
         s.enter_context(patch.dict(os.environ,{'VLLM_HCU_DSV41_PCP_ATTENTION':'1'}))
         s.enter_context(patch.object(activation,'_state',None));s.enter_context(patch.object(activation,'_failure',None))
         s.enter_context(patch.object(activation,'_is_hcu',return_value=True))

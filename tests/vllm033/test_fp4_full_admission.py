@@ -68,12 +68,12 @@ def test_off_preserves_default_fp8(monkeypatch):
     `applicable()` first.
     """
     monkeypatch.delenv('HCU_VLLM_FP4_INDEXER_IMPL', raising=False)
-    monkeypatch.delenv('HCU_VLLM_FP4_PACKER_IMPL', raising=False)
     monkeypatch.delenv('HCU_DISABLE_OPS', raising=False)
     assert selected()
     assert not applicable(config())
     assert not applicable(config_with(indexer_kv_dtype='fp8'))
     assert applicable(config_with(indexer_kv_dtype='mxfp4'))
+    monkeypatch.setenv('HCU_VLLM_FP4_PACKER_IMPL', 'stock')
     with pytest.raises(ValueError, match='explicit triton FP4 lowering required'):
         validate_config(config_with(indexer_kv_dtype='mxfp4'))
     monkeypatch.setenv('HCU_VLLM_FP4_PACKER_IMPL', 'triton')

@@ -70,8 +70,16 @@ def select_attention(cfg):
     return attention_class()
 
 
+class HcuV41PcpMoE(native.DeepseekV4MoE):
+    def __init__(self, *args, **kwargs):
+        super().__init__(*args, **kwargs)
+        # Model protocol fields must describe the actual EP-owned partition.
+        self.n_local_physical_experts = self.experts.moe_config.num_local_experts
+
+
 _DECODER_INIT = _constructor(_DECODER_NATIVE, _REVIEWED[0],
                              {'_select_dsv4_attn_cls': select_attention,
+                              'DeepseekV4MoE': HcuV41PcpMoE,
                               'Engram': HcuV41PcpEngram})
 
 

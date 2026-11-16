@@ -104,10 +104,6 @@ def layer(kind):
     obj = cls.__new__(cls)
     torch.nn.Module.__init__(obj)
     obj.moe_config = SimpleNamespace()
-    if kind == "experts":
-        obj.ckpt_gate_proj_name = "gate_proj"
-        obj.ckpt_up_proj_name = "up_proj"
-        obj.ckpt_down_proj_name = "down_proj"
     return obj
 
 
@@ -312,26 +308,49 @@ def test_matching_linear_delegates_to_official_ct_channel_scheme(contracts, monk
     assert delegated.target_scheme_map["Linear"]["input_activations"].dynamic is True
 
 
-def test_channel_experts_use_plugin_provider_with_official_ct_scheme(contracts, monkeypatch):
+@pytest.mark.parametrize("backend,pcp,expected", [
+    ("deep_gemm_mega_moe", 8, "mega"),
+    ("deep_gemm", 8, "pcp-deepgemm"),
+    ("deep_gemm", 1, "existing"),
+])
+def test_expert_schema_reaches_scoped_plugin_provider(contracts, monkeypatch, backend, pcp, expected):
+    from hcu_vllm_das.quantization import channel_fp8_moe as existing
+    from hcu_vllm_das.moe import dsv41_megamoe, dsv41_deepgemm
     c = activate(contracts)
     calls = []
-    sentinel = object()
-
-    def provider(weights, inputs, moe_config, prefix):
-        calls.append((weights, inputs, moe_config, prefix))
-        return sentinel
-
-    monkeypatch.setattr(c.candidate, "_moe_provider", lambda: provider)
-    config = c.cls.from_config(SCHEMA)
+    def constructor(name):
+        def create(weights, inputs, moe, prefix):
+            calls.append((weights, inputs, moe, prefix))
+            return name
+        return create
+    monkeypatch.setattr(existing, "HcuDSV41ChannelFP8MoEMethod", constructor("existing"))
+    monkeypatch.setattr(dsv41_megamoe, "HcuDSV41MegaMoEMethod", constructor("mega"))
+    monkeypatch.setattr(dsv41_deepgemm, "HcuDSV41DeepGemmMethod", constructor("pcp-deepgemm"))
     obj = layer("experts")
-    prefix = "model.layers.0.ffn.experts"
-    assert config.get_quant_method(obj, prefix) is sentinel
-    weights, inputs, moe_config, name = calls[0]
-    assert weights.strategy == "channel" and weights.type == "float"
-    assert weights.num_bits == 8 and weights.dynamic is False
-    assert inputs.strategy == "token" and inputs.type == "float"
-    assert inputs.num_bits == 8 and inputs.dynamic is True
-    assert moe_config is obj.moe_config and name == prefix
+    obj.ckpt_gate_proj_name, obj.ckpt_up_proj_name, obj.ckpt_down_proj_name = "w1", "w3", "w2"
+    obj.moe_config = SimpleNamespace(moe_backend=backend, pcp_size=pcp, ep_size=8,
+        moe_parallel_config=SimpleNamespace(tp_size=1, dp_size=1 if pcp > 1 else 8,
+            use_deepep_ht_kernels=True, use_deepep_ll_kernels=False))
+    assert c.cls.from_config(SCHEMA).get_quant_method(obj, "model.layers.0.ffn.experts") == expected
+    weights, inputs, moe, prefix = calls[0]
+    assert weights.strategy == "channel" and inputs.strategy == "token"
+    assert moe is obj.moe_config and prefix == "model.layers.0.ffn.experts"
+
+
+def test_empty_linear_only_and_native_nonempty(monkeypatch):
+    import torch
+    from hcu_adapter.channel_fp8_empty_linear import HcuDSV41ChannelFP8LinearMethod
+    method = object.__new__(HcuDSV41ChannelFP8LinearMethod)
+    kernel = SimpleNamespace(config=SimpleNamespace(out_dtype=None), input_quant_key=lambda: None)
+    obj = SimpleNamespace(processed_weight_dims=(0, 1), weight=torch.empty(3, 5),
+                          weight_scale=torch.ones(5), scheme=SimpleNamespace(fp8_linear=kernel))
+    out = method.apply(obj, torch.empty(0, 3, dtype=torch.bfloat16))
+    assert out.shape == (0, 5) and out.dtype == torch.bfloat16
+    monkeypatch.setattr(HcuDSV41ChannelFP8LinearMethod.__mro__[1], "apply", lambda *args: "native")
+    assert method.apply(obj, torch.empty(2, 3)) == "native"
+    obj.processed_weight_dims = (1, 0)
+    with pytest.raises(RuntimeError, match="processed"):
+        method.apply(obj, torch.empty(0, 3))
 
 
 def test_wo_a_stays_bf16_without_ct_selection(contracts, monkeypatch):
