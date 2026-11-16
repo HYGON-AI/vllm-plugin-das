@@ -139,6 +139,13 @@ hardware register mode through layout construction and IR round trips; a
 constructor-only probe cannot establish native lowering or changed-input Graph
 correctness. Separate compiler failures from reference-allocation OOM and
 numerical assertions, and retain each original failure.
+Probe the MFMA constructor and explicit enum together: a transpose-only API,
+an explicit-only API and a dual API can require different calls for the same
+register mode. Bind capability choices as kernel constexpr arguments or actual
+constexpr globals so JIT compilation and caching include them. Exercise real
+native IR for each admitted architecture; Python constructor success misses
+native mode rejection. Keep full kernel compilation/target device-library
+availability separate from IR checks and device numerical/Graph qualification.
 For optional AutoAWQ dense providers, retain the official configuration,
 checkpoint loader and complete fallback through the public quantization
 registry. Eager and GPU-Graph success of a pybind callable does not establish
