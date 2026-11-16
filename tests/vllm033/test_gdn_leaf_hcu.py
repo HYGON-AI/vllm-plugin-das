@@ -415,15 +415,17 @@ def test_complete_gated_fla_state_output_and_changed_input_graph(
     for _ in range(3):
         result = candidate(*inputs, core_attn_out=out)
     compare(result)
-    assert any(name == "recompute_w_u_fwd" for name, _ in seen)
+    assert ("recompute_w_u_fwd", "hcu-boltops") in seen
     assert any(
         name == "chunk_fwd_o" and provider == "hcu-boltops" for name, provider in seen
     )
     assert not any(
         name == "chunk_fwd_o" and provider == "hcu-aiter" for name, provider in seen
     )
-    if heads == 8:
-        assert any(name == "chunk_gated_delta_rule_fwd_h" for name, _ in seen)
+    if activation._published.policy[0] == "hcu-aiter":
+        assert ("chunk_gated_delta_rule_fwd_h", "hcu-aiter") in seen
+    elif heads == 8:
+        assert ("chunk_gated_delta_rule_fwd_h", "hcu-boltops") in seen
     graph = torch.cuda.CUDAGraph()
     with torch.cuda.graph(graph):
         captured = candidate(*inputs, core_attn_out=out)

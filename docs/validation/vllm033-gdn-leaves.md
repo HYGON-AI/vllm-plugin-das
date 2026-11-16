@@ -103,7 +103,19 @@ startup has replaced consumer aliases. Packed decode and sigmoid MTP tests
 additionally compare the official kernels and an independent CPU FP32 recurrence, with NULL state,
 accepted-token metadata and fixed-address changed-input Graph replay.
 
-Installed wheel qualification, native prefill/decode, provider performance,
+On gfx938, the installed Core98/Adapter719/Plugin candidate completed all eight
+component cases through real Adapter public startup for BoltOPs (cold Triton
+autotuning, 288 MiB test budget) and AITER (verified genuine warm cache, 64 MiB).
+Each selection includes 24 changed-input Graph replays. AITER chunk-H/decode
+execution is required explicitly; recompute and gated chunk-O still execute
+BoltOPs. Each process exits 0 but retains two known provider weakref cleanup
+errors: this is numerical/Graph component evidence, not clean lifecycle closure.
+An earlier device-6 run failed with `hipErrorNoBinaryForGpu` during comparison;
+the device-7 synchronous/private-cache repeat passes, but its root cause is
+still unattributed. The old 64 MiB cold-autotune and pre-fix numerical failures
+remain recorded separately.
+
+Provider performance, actual serving-worker execution and lifecycle closure,
 applicable hybrid model accuracy/HumanEval32, MTP and serving Graph reachability
 remain gates. Existing legacy-provider and BF16 Qwen3 results do not certify
 this candidate. Do not mark this migration complete or merge it on CPU
