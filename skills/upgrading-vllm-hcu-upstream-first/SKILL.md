@@ -121,6 +121,18 @@ backend selector authoritative: a selected whole-op/fused route can bypass the
 leaf aliases, so require execution evidence rather than counting activation as
 coverage. Python guards do not execute inside an already captured device Graph;
 serving health must also cover the host boundary before Graph replay.
+Inspect actual optional-provider signatures even when the public version is
+unchanged. BoltOPs chunk-O has an audited trailing `full_chunks=None` variant;
+retain masked varlen semantics rather than forcing full chunks. Distinguish
+indexed decode NULL slot 0 (`null_state_index=0`) from prefill's already-gathered
+dense per-sequence state: row 0 is valid with no index tensor and needs
+`null_state_index=-1` in the observed BoltOPs ABI. Test nonzero row-0 initial
+state, output and final state rather than transferring the cache sentinel.
+Include actual Triton autotune scratch in bounded device probes: the observed HCU benchmark
+cache alone needs 256 MiB. A lower allocator cap can pass decode and fail official
+prefill before candidate execution. Preserve that resource failure separately,
+keep shapes/tuning/precision checks, and reject zero-like outputs with meaningful
+absolute tolerances and an independent decode reference.
 For compiler layout drift, inspect the resolved Triton build and actual layout
 constructor rather than deriving its API from the Torch version. Preserve the
 hardware register mode through layout construction and IR round trips; a
