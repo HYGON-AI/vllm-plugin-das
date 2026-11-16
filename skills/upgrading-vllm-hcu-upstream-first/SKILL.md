@@ -106,6 +106,14 @@ dependencies, gapped GPU READ/WRITE and real model P/D with Graph and prefix.
    process release and normal teardown as separate results.
 
 Graph capture or HTTP health alone does not establish successful generation.
+For optional AutoAWQ dense providers, retain the official configuration,
+checkpoint loader and complete fallback through the public quantization
+registry. Eager and GPU-Graph success of a pybind callable does not establish
+Dynamo support: validate a dispatcher custom op with its FakeTensor rule,
+fullgraph compilation and changed-input replay separately. Hash the effective
+master/child policy, retain batch-invariant fallback, and keep operator tests
+separate from model and HumanEval qualification.
+
 For `torch.library` exit errors, inspect the actual provider's registration:
 a Library already owns its namespace, so qualified definition names can leave
 duplicate namespaces in cleanup metadata even when dispatch succeeds. Reuse an
