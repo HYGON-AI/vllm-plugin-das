@@ -278,3 +278,12 @@ and double only its final provider. Verify native batched semantics separately;
 a binary may accept the same operator signature yet implement flat counts only.
 Retain a failing old-binary result and bind native/Graph successes to the actual
 coherent Core build, architecture and submitted source.
+
+
+## 已有 MR 的目标版本边界
+
+处理已提 MR 时，仍以本次选定的目标版本为交付范围。旧分支请求先作为功能迁移和证据输入；
+核对目标版官方实现与当前 owner 后，仅迁移仍缺少的能力。没有明确的旧版维护要求时，
+不要为修复历史 CI 新建旧发布线请求，也不要直接改 base 夹带跨版本差异。
+较新开发版、较旧 wheel 或组件移植的结果只能定位问题；正式验收须在目标发布线的完整组合上重跑。
+
