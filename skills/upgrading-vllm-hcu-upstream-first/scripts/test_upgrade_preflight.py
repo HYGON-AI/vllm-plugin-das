@@ -165,6 +165,58 @@ PATCH_ID = "old"
         self.assertNotEqual(run.returncode, 0)
         self.assertFalse(out.exists())
 
+    def test_function_local_helpers_are_not_public_dotted_attributes(self):
+        write(self.fork, "vllm/router.py",
+              "class Ops:\n    def route(x): return x\n")
+        commit(self.fork)
+        write(self.plugin, "vllm_hcu/patch/patch_router.py", '''
+TARGET_MODULE = "vllm.router"
+PATCH_ID = "router"
+def apply():
+    require_exact_signature(fn, "vllm.router.Ops.route", positional=("x",))
+''')
+        commit(self.plugin)
+        for prefix in ("def", "async def"):
+            with self.subTest(prefix=prefix):
+                write(self.up, "vllm/router.py",
+                      f"{prefix} Ops():\n    def route(x): return x\n"
+                      "    return route\n")
+                commit(self.up)
+                out = self.root / ("factory-" + prefix.replace(" ", "-"))
+                run = self.invoke(out)
+                self.assertEqual(run.returncode, 0, run.stderr)
+                report = json.loads((out / "preflight.json").read_text())
+                row = next(x for x in report["adapters"] if x["patch_id"] == "router")
+                check = row["signature_checks"][0]
+                self.assertEqual(check["status"], "symbol_unresolved")
+                self.assertEqual(check["contract_comparison"]["status"], "symbol_unresolved")
+
+    def test_rejects_output_inside_separate_and_shared_git_storage(self):
+        original = self.plugin
+        separate = self.root / "separate-worktree"
+        storage = self.root / "separate-storage"
+        subprocess.run(["git", "clone", "-q", "--separate-git-dir", str(storage),
+                        str(original), str(separate)], check=True)
+        linked = self.root / "linked-worktree"
+        git(original, "worktree", "add", "--detach", str(linked), "HEAD")
+        for root in (separate, linked):
+            self.plugin = root
+            for option in ("--git-dir", "--git-common-dir"):
+                with self.subTest(worktree=root.name, storage=option):
+                    git_storage = (root / git(root, "rev-parse", option)).resolve()
+                    before = {str(p.relative_to(git_storage)): p.read_bytes()
+                              for p in git_storage.rglob("*") if p.is_file()}
+                    out = git_storage / ("refs/heads/report" + option)
+                    run = self.invoke(out)
+                    self.assertNotEqual(run.returncode, 0,
+                                        "Preflight wrote a report into Git storage")
+                    self.assertIn("Output must be outside", run.stderr)
+                    self.assertFalse(out.exists())
+                    after = {str(p.relative_to(git_storage)): p.read_bytes()
+                             for p in git_storage.rglob("*") if p.is_file()}
+                    self.assertEqual(before, after)
+        self.plugin = original
+
     def test_package_initializer_takes_precedence_over_sibling_module(self):
         for root in (self.fork, self.up):
             write(root, "vllm/router.py", "def route(x): return x\n")

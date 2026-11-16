@@ -46,6 +46,8 @@ moves and statically parsed legacy `TARGET_MODULE` guards. Resolved functions
 are compared for parameter kinds/defaults, annotations, decorators, async
 status and body AST. Findings remain pending review. Uncommitted changes are
 reported but excluded from analysis; commit or separately bind their bytes.
+Report destinations must also be outside each checkout's private Git directory
+and shared storage, including linked worktrees and separate Git directories.
 For repositories with configured clean/process filters, working-tree inspection
 is reported as unavailable because `git status` can execute those filters.
 Committed-tree analysis still runs without invoking them.
@@ -56,6 +58,9 @@ When a regular package and sibling `.py` file share a name, module lookup
 prefers the package initializer, matching Python's import precedence.
 A regular parent module blocks namespace children; dotted parent components
 are checked before resolving a child file.
+Dotted callable lookup traverses class scopes; a function-local definition is
+not treated as a public attribute. Imported and dynamically assigned attributes
+remain unresolved.
 Direct classmethod guards distinguish bound access from `.__func__`; aliases
 or additional decorators with unresolved binding remain review candidates.
 Git paths retain arbitrary filename bytes in escaped JSON/Markdown output.
@@ -104,6 +109,11 @@ already handles this case, then validate any remaining stage-local fix with
 a serialized hybrid checkpoint and changing prompts/batches. A zero output
 head can test startup and communication, but cannot establish model quality.
 
+Re-read device identity and total capacity after an environment change; an old
+absolute free-memory threshold can become unreachable and a prior utilization
+fraction can become too small for the same weights. Record a new budget and
+its changed validation scope before launching.
+
 A shared-node memory preflight is an observation, not a reservation. Preserve
 the actual worker admission failure if free memory changes before startup;
 do not report a weight-loading failure or a model score for that attempt.
@@ -126,7 +136,10 @@ corrected diagnostic separately instead of treating missing results as passes.
 Platform API semantics do not establish a kernel's physical lane width. For
 warp reductions, check the active compiler target and generated reduction
 scope before choosing lane IDs or shared-memory partitions. Preserve the
-Adapter's platform identity. An exact projection and squared-sum regression
+Adapter's platform identity. Check every executed fusion independently and
+keep thread-group branches uniform at that physical width; fixing an unfused
+projection does not qualify a fused post/pre or its normalization epilogue.
+An exact projection and squared-sum regression
 with changed-input Graph replay can expose duplicate lane contributions;
 validate the real model separately before claiming its accuracy is restored.
 

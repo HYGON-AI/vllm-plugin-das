@@ -62,6 +62,10 @@ class Repo:
         self.sha = git(self.root, "rev-parse", "--verify", "--end-of-options",
                        ref + "^{commit}").decode().strip()
         self.ref = ref
+        self.storage_roots = [
+            (self.root / os.fsdecode(git(self.root, "rev-parse", option)).rstrip("\n")).resolve()
+            for option in ("--git-dir", "--git-common-dir")
+        ]
         self.files = {}
         for record in git(self.root, "ls-tree", "-rz", self.sha).split(b"\0"):
             if not record:
@@ -176,6 +180,8 @@ def constants(tree):
 def find_function(tree, symbol):
     owner = tree
     for name in symbol.split("."):
+        if not isinstance(owner, (ast.Module, ast.ClassDef)):
+            return None
         matches = [n for n in getattr(owner, "body", [])
                    if isinstance(n, (ast.ClassDef, ast.FunctionDef, ast.AsyncFunctionDef))
                    and n.name == name]
@@ -435,8 +441,10 @@ def main():
         target = Repo(args.upstream_root, args.target_ref)
         base = Repo(args.fork_root, args.upstream_base)
         output = args.output.resolve()
-        if any(output == r.root or r.root in output.parents for r in (plugin, fork, target)):
-            raise ValueError("Output must be outside all source repositories")
+        excluded = {path for repo in (plugin, fork, target)
+                    for path in (repo.root, *repo.storage_roots)}
+        if any(output == path or path in output.parents for path in excluded):
+            raise ValueError("Output must be outside all source repositories and Git storage")
         if output.exists():
             raise ValueError("Output directory already exists; choose a new directory")
         git(fork.root, "merge-base", "--is-ancestor", base.sha, fork.sha)
