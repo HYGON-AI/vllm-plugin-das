@@ -90,9 +90,9 @@ class ImagePolicyTests(unittest.TestCase):
         device = job_block(self.source, 'v033-device-gfx936')
         container = device.split('    container:\n', 1)[1].split('    steps:\n', 1)[0]
         self.assertIn('image: ${{ needs.resolve-device-image.outputs.image }}', container)
-        self.assertIn('credentials:\n', container)
-        self.assertIn('username: ${{ secrets.HARBOR_USERNAME }}', container)
-        self.assertIn('password: ${{ secrets.HARBOR_PASSWORD }}', container)
+        self.assertIn('credentials: ${{ fromJSON(', container)
+        self.assertIn('toJSON(secrets.HARBOR_USERNAME)', container)
+        self.assertIn('toJSON(secrets.HARBOR_PASSWORD)', container)
         self.assertIn('/opt/hyhal:/opt/hyhal:ro', container)
         self.assertIn('--shm-size=32g', container)
         self.assertNotIn('--privileged', container)
@@ -141,6 +141,20 @@ class ImagePolicyTests(unittest.TestCase):
         code, output = self.guard(image, harbor)
         self.assertNotEqual(code, 0)
         self.assertEqual(output, '')
+
+    def test_fork_container_credentials_omit_unavailable_secrets_in_both_jobs(self):
+        for name in ['v033-device-gfx936', 'v033-device-gfx938']:
+            with self.subTest(job=name):
+                block = job_block(self.source, name)
+                container = block.split('    container:\n', 1)[1].split('    steps:\n', 1)[0]
+                line = next(line.strip() for line in container.splitlines()
+                            if line.strip().startswith('credentials:'))
+                self.assertTrue(line.startswith('credentials: ${{ fromJSON('))
+                self.assertIn("github.event.pull_request.head.repo.fork && '{}' || format(", line)
+                self.assertIn('"username":{0},"password":{1}', line)
+                self.assertIn('toJSON(secrets.HARBOR_USERNAME)', line)
+                self.assertIn('toJSON(secrets.HARBOR_PASSWORD)', line)
+                self.assertTrue(line.endswith('))) }}'))
 
     def test_pr_code_jobs_do_not_persist_checkout_credentials(self):
         for name in ['select', 'v033-source-contract', 'v033-device-gfx936', 'v033-device-gfx938']:

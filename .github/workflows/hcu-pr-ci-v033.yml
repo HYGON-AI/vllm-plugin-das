@@ -169,9 +169,9 @@ jobs:
     timeout-minutes: 45
     container:
       image: ${{ needs.resolve-device-image.outputs.image }}
-      credentials:
-        username: ${{ secrets.HARBOR_USERNAME }}
-        password: ${{ secrets.HARBOR_PASSWORD }}
+      # Fork PRs receive no secrets. Empty credentials are optional; explicit
+      # empty username/password fields fail Actions template validation.
+      credentials: ${{ fromJSON(github.event.pull_request.head.repo.fork && '{}' || format('{{"username":{0},"password":{1}}}', toJSON(secrets.HARBOR_USERNAME), toJSON(secrets.HARBOR_PASSWORD))) }}
       volumes:
         - /opt/hyhal:/opt/hyhal:ro
       options: --device=/dev/kfd --device=/dev/dri --group-add video --shm-size=32g
@@ -205,9 +205,7 @@ jobs:
     timeout-minutes: 45
     container:
       image: ${{ needs.resolve-device-image.outputs.image }}
-      credentials:
-        username: ${{ secrets.HARBOR_USERNAME }}
-        password: ${{ secrets.HARBOR_PASSWORD }}
+      credentials: ${{ fromJSON(github.event.pull_request.head.repo.fork && '{}' || format('{{"username":{0},"password":{1}}}', toJSON(secrets.HARBOR_USERNAME), toJSON(secrets.HARBOR_PASSWORD))) }}
       volumes:
         - /opt/hyhal:/opt/hyhal:ro
       options: --device=/dev/kfd --device=/dev/dri --group-add video --shm-size=32g
