@@ -141,6 +141,13 @@ def run_case(adapter, shape, warmup, repeats, profile=False, with_sink=False):
     )
     base_out, _, base_lse = bf16()
     output, lse = checked()
+    torch.cuda.synchronize()
+    cold_start = perf_counter()
+    adaptive()
+    torch.cuda.synchronize()
+    adaptive_first_call_ms = (perf_counter() - cold_start) * 1000
+    adaptive_timing = timing(adaptive, max(4, warmup), repeats)
+    # The first call calibrates; label the warmed timing with its actual route.
     adaptive_out, adaptive_max, adaptive_lse = adaptive()
     assert bool(torch.isfinite(adaptive_out).all() & torch.isfinite(adaptive_lse).all())
     adaptive_error = errors(adaptive_out[:4], adaptive_lse[:4], expected, expected_lse)
@@ -170,7 +177,8 @@ def run_case(adapter, shape, warmup, repeats, profile=False, with_sink=False):
         "bf16": timing(bf16, warmup, repeats),
         "qk_fp8_direct": timing(direct, warmup, repeats),
         "qk_fp8_adapter": timing(checked, warmup, repeats),
-        "adaptive": timing(adaptive, warmup, repeats),
+        "adaptive": adaptive_timing,
+        "adaptive_first_call_ms": adaptive_first_call_ms,
         "adaptive_dispatch": "qk_fp8" if adaptive_max is None else "bf16",
         "adaptive_vs_fp32": adaptive_error,
     }

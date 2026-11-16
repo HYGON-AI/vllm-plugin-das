@@ -98,6 +98,30 @@ def test_small_workload_avoids_validation_and_forces_masked_public_api(
     assert calls[0][1][-1].tolist() == [2048, 2048]
 
 
+def test_small_workload_skips_frontend_eligibility_check(adapter, monkeypatch):
+    module, calls = adapter
+    monkeypatch.setenv("FLASH_MLA_DSA_FP8_QK", "1")
+    monkeypatch.setattr(
+        module, "_frontend_qk_shape_ok", lambda *args: pytest.fail("small workload")
+    )
+    q, kv, indices = _inputs()
+    counts = torch.full((q.shape[0],), 2048, dtype=torch.int32)
+    module.flash_mla_sparse_fwd(q, kv, indices, 0.1, topk_length=counts)
+    assert calls[0][0] == "public"
+    assert calls[0][1][-1] is counts
+
+
+def test_bf16_cost_fallback_accepts_supported_strided_sink(adapter, monkeypatch):
+    module, calls = adapter
+    monkeypatch.setenv("FLASH_MLA_DSA_FP8_QK", "1")
+    q, kv, indices = _inputs()
+    sink = torch.arange(128, dtype=torch.float32)[::2]
+    module.flash_mla_sparse_fwd(q, kv, indices, 0.1, attn_sink=sink)
+    received = calls[0][1][-2]
+    assert received.stride(0) == 1
+    torch.testing.assert_close(received, sink)
+
+
 def test_valid_sink_is_applied_after_native_without_changing_lse(adapter, monkeypatch):
     module, calls = adapter
     _enable(module, monkeypatch)

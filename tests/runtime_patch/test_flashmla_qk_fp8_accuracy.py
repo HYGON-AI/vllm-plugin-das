@@ -28,7 +28,21 @@ def kernels(monkeypatch):
     monkeypatch.setenv("FLASH_MLA_DSA_FP8_QK", "1")
     monkeypatch.delenv("FLASH_MLA_DISABLE_DSA_MLS_PREFILL", raising=False)
     monkeypatch.setenv("FLASH_MLA_ENABLE_MLS_RESIDENT_PREFILL", "1")
+    from vllm_hcu.v1.attention.ops import flashmla_qk_fp8_dispatch as dispatch
+
+    monkeypatch.setattr(dispatch, "policy", dispatch.DispatchPolicy())
     return helper, helper.load_adapter()
+
+
+def _select_fp8(q, kv, indices, sink=None):
+    """Pin only the performance choice; execute real validation and kernels."""
+    from vllm_hcu.v1.attention.ops import flashmla_qk_fp8_dispatch as dispatch
+
+    key = dispatch.dispatch_key(
+        q, kv, indices, sink, torch.cuda.current_stream(q.device).cuda_stream
+    )
+    entry, _, _ = dispatch.policy._reserve(key)
+    entry.choice = True
 
 
 @pytest.mark.parametrize("heads,kv_len", [(64, 32768), (64, 24576), (128, 24576)])
@@ -140,7 +154,13 @@ def test_adaptive_dispatch_output_and_skipped_scan(kernels, shape, monkeypatch):
     out, maximum, lse = adapter.flash_mla_sparse_fwd(
         q, kv, indices, 576**-0.5, topk_length=counts
     )
-    assert (maximum is None) == prefer
+    assert maximum is not None, "cold calibration must return its BF16 result"
+    if prefer:
+        _select_fp8(q, kv, indices)
+        out, maximum, lse = adapter.flash_mla_sparse_fwd(
+            q, kv, indices, 576**-0.5, topk_length=counts
+        )
+        assert maximum is None, "chosen FP8 path did not reach native execution"
     error = helper.errors(out[:4], lse[:4], expected, expected_lse)
     assert error["finite"] and error["relative_l2"] < 0.05, error
     assert error["max_abs"] < 0.05 and error["lse_max_abs"] < 0.05, error
@@ -165,6 +185,7 @@ def test_fp8_preserves_attention_sink_and_lse(kernels, heads, sink_stride, monke
     expected, expected_lse = helper.reference(
         q[:4], kv, indices[:4], counts[:4], attn_sink=sink
     )
+    _select_fp8(q, kv, indices, sink)
     output, maximum, lse = adapter.flash_mla_sparse_fwd(
         q, kv, indices, 576**-0.5, attn_sink=sink, topk_length=counts
     )
@@ -194,6 +215,7 @@ def test_hyv4_sink_backend_reaches_native_fp8(kernels, monkeypatch):
         return result
 
     monkeypatch.setattr(hcu_sparse, "flash_mla_sparse_fwd", entry)
+    _select_fp8(q, kv, indices, impl.sinks)
     out, lse = impl._bf16_flash_mla_kernel_with_lse(q, kv, indices[:, 0], counts)
     assert calls == [None], "actual HYV4 backend missed QK FP8"
     expected, pre_lse = helper.reference(
@@ -221,5 +243,32 @@ def test_sink_masked_fallback_applies_sink_once(kernels, case):
         q, kv, indices, 576**-0.5, attn_sink=sink, topk_length=counts
     )
     assert maximum is not None
+    torch.testing.assert_close(out[:4].float(), expected, atol=0.006, rtol=0.01)
+    torch.testing.assert_close(lse[:4], lse_ref, atol=2e-5, rtol=2e-5)
+
+
+@pytest.mark.parametrize("case", ["negative", "short_counts"])
+def test_cached_fp8_choice_rechecks_changed_gpu_inputs(kernels, case):
+    helper, adapter = kernels
+    q, kv, indices, counts = helper.inputs(768, 24576, 64)
+    sink = torch.linspace(4, 11, 64, device=q.device, dtype=torch.float32)
+    _select_fp8(q, kv, indices, sink)
+    assert (
+        adapter.flash_mla_sparse_fwd(
+            q, kv, indices, 576**-0.5, attn_sink=sink, topk_length=counts
+        )[1]
+        is None
+    )
+    if case == "negative":
+        indices[0, 0, 7] = -1
+    else:
+        counts[0] = 17
+    out, maximum, lse = adapter.flash_mla_sparse_fwd(
+        q, kv, indices, 576**-0.5, attn_sink=sink, topk_length=counts
+    )
+    assert maximum is not None
+    expected, lse_ref = helper.reference(
+        q[:4], kv, indices[:4], counts[:4], attn_sink=sink
+    )
     torch.testing.assert_close(out[:4].float(), expected, atol=0.006, rtol=0.01)
     torch.testing.assert_close(lse[:4], lse_ref, atol=2e-5, rtol=2e-5)

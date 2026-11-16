@@ -70,8 +70,8 @@ def _prefer_qk_fp8(q, kv, with_sink=False):
         return True  # Let the ordinary shape checks/fallback handle this input.
     work = q.shape[0] * q.shape[1]
     if with_sink:
-        # Sink correction adds an output pass. Keep the marginal workloads on
-        # BF16; this conservative bound includes the long-workspace sweep.
+        # This is only a cheap candidate filter. Actual-input calibration below
+        # includes native preprocessing, validation and any legacy sink pass.
         return work > 32768 and 8 * work > kv.shape[0] + 131072
     # Bound the fallback to small query/head workloads: a KV/work ratio alone
     # incorrectly rejects larger workloads that already amortize preprocessing.
@@ -174,36 +174,64 @@ def flash_mla_sparse_fwd(
 
     if os.environ.get("FLASH_MLA_DSA_FP8_QK") != "1":
         return public(q, kv, indices, sm_scale, d_v, attn_sink, topk_length)
-    native_shape = _frontend_qk_shape_ok(q, kv, indices, d_v)
-    external_sink = attn_sink is not None and native_shape is None
-    if native_shape is not False and _prefer_qk_fp8(q, kv, attn_sink is not None):
-        if attn_sink is not None and not _supports_sink(q, attn_sink):
-            return public(q, kv, indices, sm_scale, d_v, attn_sink, topk_length)
-        try:
-            output, lse = sparse_prefill_qk_fp8(
-                q,
-                kv,
-                indices,
-                sm_scale,
-                d_v,
-                topk_length=topk_length,
-                attn_sink=attn_sink if native_shape is True else None,
+
+    def bf16():
+        counts = topk_length
+        if counts is None:
+            # A non-None count prevents the public frontend selecting FP8.
+            counts = torch.full(
+                (q.shape[0],),
+                indices.shape[-1],
+                dtype=torch.int32,
+                device=indices.device,
             )
-            if external_sink:
-                output = _apply_sink(output, lse, attn_sink)
-            _report_dispatch(q, kv, attn_sink is not None)
-            # Preserve the adapter's output/LSE-only contract. Older native
-            # builds did not initialize max_logits; MLA callers do not use it.
-            return output, None, lse
-        except _UnsupportedQkFp8:
-            pass
-    if topk_length is None:
-        # A non-None count prevents the public frontend selecting QK-FP8
-        # when shape cost, padding or graph capture forced fallback.
-        topk_length = torch.full(
-            (q.shape[0],),
-            indices.shape[-1],
-            dtype=torch.int32,
-            device=indices.device,
+        sink = attn_sink
+        if _supports_sink(q, sink) and sink.stride(0) != 1:
+            sink = sink.contiguous()
+        return public(q, kv, indices, sm_scale, d_v, sink, counts)
+
+    # Reject small work before frontend device/layout queries or data checks.
+    if not _prefer_qk_fp8(q, kv, attn_sink is not None):
+        return bf16()
+    native_shape = _frontend_qk_shape_ok(q, kv, indices, d_v)
+    if native_shape is False:
+        return bf16()
+    if attn_sink is not None and not _supports_sink(q, attn_sink):
+        return public(q, kv, indices, sm_scale, d_v, attn_sink, topk_length)
+    external_sink = attn_sink is not None and native_shape is None
+
+    def fp8():
+        output, lse = sparse_prefill_qk_fp8(
+            q,
+            kv,
+            indices,
+            sm_scale,
+            d_v,
+            topk_length=topk_length,
+            attn_sink=attn_sink if native_shape is True else None,
         )
-    return public(q, kv, indices, sm_scale, d_v, attn_sink, topk_length)
+        if external_sink:
+            output = _apply_sink(output, lse, attn_sink)
+        _report_dispatch(q, kv, attn_sink is not None)
+        return output, None, lse
+
+    if q.is_cuda:
+        with torch.cuda.device(q.device):
+            if torch.cuda.is_current_stream_capturing():
+                return bf16()
+            if not _supports_qk_fp8(q, kv, indices, d_v, None):
+                return bf16()
+            from vllm_hcu.v1.attention.ops.flashmla_qk_fp8_dispatch import (
+                dispatch_key,
+                policy,
+            )
+
+            key = dispatch_key(
+                q, kv, indices, attn_sink, torch.cuda.current_stream().cuda_stream
+            )
+            return policy.run(key, fp8, bf16, _UnsupportedQkFp8)
+    # CPU dispatch contract tests use the same checked callback.
+    try:
+        return fp8()
+    except _UnsupportedQkFp8:
+        return bf16()
