@@ -1427,13 +1427,9 @@ def make_deepep_auto_deepgemm_int8_moe_kernel(
     )
 
 
-def make_deepep_auto_deepgemm_w4a8_moe_kernel(
+def _validate_deepep_auto_w4a8_quant_config(
     moe_quant_config: FusedMoEQuantConfig,
-    moe_config: FusedMoEConfig,
-    routing_tables: tuple[torch.Tensor, torch.Tensor, torch.Tensor] | None = None,
-) -> mk.FusedMoEKernel:
-    """Build the unified DeepEP HT/LL kernel for SlimQuant W4A8."""
-
+) -> None:
     if moe_quant_config.weight_quant_dtype != "int4":
         raise ValueError("SlimQuant auto factory requires INT4 W4A8 quantization")
     if (
@@ -1473,9 +1469,76 @@ def make_deepep_auto_deepgemm_w4a8_moe_kernel(
             "SlimQuant auto factory requires symmetric W4A8 without "
             "auxiliary scales, zero points, or biases"
         )
+
+
+def make_deepep_auto_deepgemm_w4a8_moe_kernel(
+    moe_quant_config: FusedMoEQuantConfig,
+    moe_config: FusedMoEConfig,
+    routing_tables: tuple[torch.Tensor, torch.Tensor, torch.Tensor] | None = None,
+) -> mk.FusedMoEKernel:
+    """Build the unified DeepEP HT/LL kernel for SlimQuant W4A8."""
+
+    _validate_deepep_auto_w4a8_quant_config(moe_quant_config)
     return _make_deepep_auto_deepgemm_moe_kernel(
         moe_quant_config=moe_quant_config,
         moe_config=moe_config,
         routing_tables=routing_tables,
         experts_cls=DeepEPAutoW4A8Experts,
     )
+
+
+def make_fixed_deepep_deepgemm_w4a8_moe_kernel(
+    moe_quant_config: FusedMoEQuantConfig,
+    moe_config: FusedMoEConfig,
+    routing_tables: tuple[torch.Tensor, torch.Tensor, torch.Tensor] | None = None,
+    *,
+    use_low_latency: bool,
+) -> mk.FusedMoEKernel:
+    """Build a fixed ``deepep_high_throughput`` / ``deepep_low_latency`` kernel.
+
+    The SiLU SlimQuant W4A8 experts of ``deepep_auto`` are constructed with a
+    fixed role, so only the requested HT contiguous or LL masked layout is
+    packed. They pad the gate/up dimension to the HIPC contract and own the
+    weights in place. The upstream single-backend prepare/finalize replaces the
+    HT/LL wrapper because the all2all backend is not ``deepep_auto``.
+    """
+
+    from vllm.model_executor.layers.fused_moe.all2all_utils import (
+        maybe_make_prepare_finalize,
+    )
+
+    _validate_deepep_auto_w4a8_quant_config(moe_quant_config)
+    parallel_config = moe_config.moe_parallel_config
+    if use_low_latency and not parallel_config.use_deepep_ll_kernels:
+        raise RuntimeError("Fixed LL W4A8 requires the deepep_low_latency backend")
+    if not use_low_latency and not parallel_config.use_deepep_ht_kernels:
+        raise RuntimeError(
+            "Fixed HT W4A8 requires the deepep_high_throughput backend"
+        )
+    prepare_finalize = maybe_make_prepare_finalize(
+        moe=moe_config,
+        quant_config=moe_quant_config,
+        routing_tables=routing_tables,
+        allow_new_interface=True,
+        use_monolithic=False,
+    )
+    if prepare_finalize is None:
+        raise RuntimeError("Fixed DeepEP prepare/finalize was not constructed")
+    if use_low_latency:
+        max_num_tokens = prepare_finalize.max_num_tokens_per_rank()
+        if max_num_tokens is None:
+            raise RuntimeError("Fixed DeepEP LL token capacity is unavailable")
+    else:
+        max_num_tokens = int(moe_config.max_num_tokens)
+    experts = DeepEPAutoW4A8Experts(
+        moe_config=moe_config,
+        quant_config=moe_quant_config,
+        max_num_tokens=max_num_tokens,
+        num_dispatchers=prepare_finalize.num_dispatchers(),
+        fixed_use_low_latency=use_low_latency,
+    )
+    logger.info_once(
+        "Using fixed DeepEP %s SlimQuant W4A8 experts.",
+        "LL" if use_low_latency else "HT",
+    )
+    return mk.FusedMoEKernel(prepare_finalize, experts)

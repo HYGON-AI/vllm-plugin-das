@@ -827,6 +827,10 @@ _BOLTOPS_W4A8_FUSED_EXPERTS_CONTRACT = (
     ("gemm1_limit", None),
     ("activation_situ_beta", None),
     ("activation_situ_linear_beta", None),
+    ("use_mxfp4_w4a8", False),
+    ("use_ue8m0", False),
+    ("use_mxfp8", False),
+    ("gemm1_beta", None),
 )
 
 

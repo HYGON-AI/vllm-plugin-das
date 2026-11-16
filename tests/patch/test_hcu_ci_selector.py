@@ -1248,6 +1248,40 @@ def test_unified_aiter_moe_accuracy_test_selects_gfx938() -> None:
     assert groups == ["kernel-accuracy-tests"]
 
 
+@pytest.mark.parametrize("full", [False, True])
+@pytest.mark.parametrize("include_related_paths", [False, True])
+def test_gfx938_indexer_regression_is_selected_and_partitioned(
+    full: bool, include_related_paths: bool,
+) -> None:
+    target = "tests/kernels/test_gfx938_indexer_normal_layout.py"
+    changed_paths = [target]
+    if include_related_paths:
+        changed_paths.extend([
+            "vllm_hcu/v1/attention/ops/rocm_aiter_mla_sparse.py",
+            "tests/runtime_patch/test_indexer_cache_backing_view.py",
+            "tests/runtime_patch/test_lightop_categorized_api.py",
+        ])
+    jobs, _, _ = select_jobs(_config(), changed_paths, full=full)
+    selected_jobs = [
+        job for job in jobs if job["registry_job"] == "accuracy-gfx938"
+    ]
+    assert selected_jobs
+    registrations = [
+        registration for registration in parse_registry()
+        if registration.job == "accuracy-gfx938"
+        and registration.disabled is None
+    ]
+    assigned_targets = [
+        registration.target
+        for job in selected_jobs
+        for registration in partition_registrations(
+            registrations, job["partition_id"], job["partition_size"],
+        )
+    ]
+    assert assigned_targets.count(target) == 1
+    assert _contains_pytest_hcu_marker(REPOSITORY / target)
+
+
 def test_deepseek_runtime_change_selects_deepseek_jobs() -> None:
     jobs, groups, fallback = select_jobs(
         _config(),

@@ -24,6 +24,12 @@ TARGETS = (
     "vllm.envs.environment_variables.VLLM_USE_V2_MODEL_RUNNER",
 )
 _MARKER = "_vllm_hcu_envs_patch_applied"
+_KIMI_KDA_ENV_VARS = frozenset({
+    "VLLM_KIMI_KDA_PREFILL_BACKEND",
+    "VLLM_KIMI_KDA_CACHE_STRATEGY",
+    "VLLM_KIMI_KDA_STATE_BACKEND",
+    "VLLM_KIMI_KDA_DEBUG",
+})
 
 
 def apply_to_module(module: ModuleType) -> bool:
@@ -71,7 +77,8 @@ def apply_to_module(module: ModuleType) -> bool:
         for name in os.environ:
             if not name.startswith("VLLM_"):
                 continue
-            if name in environment_variables or name.startswith("VLLM_HCU_"):
+            if (name in environment_variables or name in _KIMI_KDA_ENV_VARS
+                    or name.startswith("VLLM_HCU_")):
                 continue
             if hard_fail:
                 raise ValueError(

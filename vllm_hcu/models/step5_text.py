@@ -138,6 +138,17 @@ _DSA_INDEXER_SUBSTRINGS = (
 # Escape hatch back to the pre-DSA dense path, for A/B against this backend.
 DISABLE_DSA = is_dsa_disabled()
 
+# Apply placement while checkpoint tensors stream through the plugin loader.
+EXPERT_PLACEMENT = (
+    os.environ.get("VLLM_STEP5_EXPERT_PLACEMENT", "")
+    if henvs.custom_ops_enabled()
+    else ""
+)
+_PLACED_TENSOR = re.compile(
+    r"layers\.(\d+)\.moe\.(?:(?:gate|up|down)_proj\.weight(?:_scale(?:_inv)?)?"
+    r"|gate\.weight|router_bias)$"
+)
+
 # Run qkv_proj and g_proj as one GEMM. Both weights become column views of one
 # [hidden, qkv + heads] buffer, so the loaders fill it in place and no
 # post-load step is needed (AutoWeightsLoader may call load_weights twice).
@@ -167,6 +178,11 @@ FUSED_ROUTER_SHARED = henvs.optional_custom_op_enabled(
 # lm_head stay bf16.
 FP8_DENSE = henvs.optional_custom_op_enabled(
     os.environ.get("VLLM_HCU_STEP5_FP8_DENSE", "0") == "1"
+)
+
+# Append DSA q/k/z/w rows to the fused channel-FP8 QKV/gate projection.
+QKV_INDEXER = henvs.optional_custom_op_enabled(
+    os.environ.get("VLLM_HCU_STEP5_QKV_INDEXER", "0") == "1"
 )
 
 # Quantize the bf16 routed experts (layers 88-90) to fp8 per output channel at
@@ -213,6 +229,42 @@ def _unignore_bf16_experts(quant_config: QuantizationConfig | None) -> None:
     if len(kept) != len(ignore):
         logger.info_once("step5: quantizing the bf16 routed experts to fp8")
     quant_config.ignore = kept
+
+
+def _place_experts(
+    weights: Iterable[tuple[str, torch.Tensor]], moe_layer_ids: list[int]
+) -> Iterable[tuple[str, torch.Tensor]]:
+    """EXPERT_PLACEMENT: index dim 0 of each packed expert tensor and of the
+    router weight/bias with the layer's physical-to-logical map. Done on the
+    stream rather than on the loaded parameters because load_weights may run
+    more than once over parts of the checkpoint."""
+    physical_to_logical = torch.load(
+        EXPERT_PLACEMENT, map_location="cpu", weights_only=True
+    )["physical_to_logical_map"]
+    if (
+        physical_to_logical.ndim != 2
+        or physical_to_logical.shape[0] != len(moe_layer_ids)
+        or physical_to_logical.shape[1] == 0
+        or physical_to_logical.dtype not in (torch.int32, torch.int64)
+    ):
+        raise ValueError("Step5 expert placement must be an integer [MoE layers, experts] map")
+    physical_to_logical = physical_to_logical.to(torch.int64)
+    identity = torch.arange(physical_to_logical.shape[1])
+    for row in physical_to_logical:
+        if not torch.equal(row.sort().values, identity):
+            raise ValueError("Step5 expert placement row is not a permutation")
+    rows = dict(zip(moe_layer_ids, physical_to_logical))
+    logger.info_once("step5: expert placement loaded from %s", EXPERT_PLACEMENT)
+    for name, w in weights:
+        if ".moe.experts." in name:
+            raise ValueError("Step5 expert placement needs packed experts")
+        m = _PLACED_TENSOR.search(name)
+        if m is not None and int(m.group(1)) in rows:
+            row = rows[int(m.group(1))]
+            if w.ndim == 0 or w.shape[0] != row.numel():
+                raise ValueError(f"Step5 expert placement shape mismatch: {name} {w.shape}")
+            w = w[row.to(w.device)]
+        yield name, w
 
 
 def _quantize_bf16_experts(
@@ -290,6 +342,9 @@ class FP32ReplicatedLinear(ReplicatedLinear):
 class BF16FP32RouterLinear(ReplicatedLinear):
     """Router with a bf16 weight and fp32 logits (see ``BF16_ROUTER``)."""
 
+    # The second result is an activation, unlike ReplicatedLinear's extra bias.
+    returns_fused_shared_activation = True
+
     def __init__(self, input_size: int, output_size: int, prefix: str = ""):
         super().__init__(
             input_size,
@@ -322,6 +377,7 @@ class BF16FP32RouterLinear(ReplicatedLinear):
         """Compute ``mlp``'s gate_up + SwigluStep together with the logits for
         decode-sized inputs; ``mlp.forward`` on the same input picks it up."""
         from vllm_hcu.ops.step5.router_gemm import (
+            RSG_MAX_M,
             make_router_shared_workspace,
             router_shared_swiglustep,
         )
@@ -329,6 +385,7 @@ class BF16FP32RouterLinear(ReplicatedLinear):
         assert mlp.limit is not None
         # A list, not an attribute: keep the MLP out of this module's children.
         self._fused_shared = [mlp]
+        mlp.enable_fused_router_shared(RSG_MAX_M)
         self._rsg = router_shared_swiglustep
         if self.weight.is_cuda:
             self._rsg_workspace = make_router_shared_workspace(
@@ -513,6 +570,7 @@ class Step5MLP(nn.Module):
         # buffers holding the same values. The stream check rejects a stale
         # entry when the shared expert runs on the aux stream before the router.
         self.fused_act: tuple[int, torch.Size, torch.Tensor] | None = None
+        self._fused_router_shared_max_m: int | None = None
         self.limit = None
         layer_idx = extract_layer_index(prefix)
         swiglu_limits_shared = getattr(config, "swiglu_limits_shared", None)
@@ -525,19 +583,56 @@ class Step5MLP(nn.Module):
             self.limit = swiglu_limits_shared[layer_idx]
             self.act_fn = SwigluStepAndMul(limit=self.limit)
 
-    def forward(self, hidden_states: torch.Tensor) -> torch.Tensor:
+    def enable_fused_router_shared(self, max_m: int) -> None:
+        """Keep short fused-router batches on the stream that made the act."""
+        self._fused_router_shared_max_m = max_m
+
+    def requires_main_stream_for_fused_activation(
+        self, hidden_states: torch.Tensor
+    ) -> bool:
+        max_m = getattr(self, "_fused_router_shared_max_m", None)
+        return (
+            max_m is not None
+            and hidden_states.ndim == 2
+            and hidden_states.shape[0] <= max_m
+        )
+
+    def cache_fused_router_activation(
+        self, hidden_states: torch.Tensor, activation: torch.Tensor
+    ) -> None:
+        """Consume the explicit router result in the internal MoE path."""
+        self.fused_act = (
+            torch.cuda.current_stream().cuda_stream,
+            hidden_states.shape,
+            activation,
+        )
+
+    def pop_fused_router_activation(
+        self, hidden_states: torch.Tensor
+    ) -> torch.Tensor | None:
+        """Take a fresh activation on its producer stream, before any handoff."""
         fused, self.fused_act = self.fused_act, None
         if (
             fused is not None
             and fused[0] == torch.cuda.current_stream().cuda_stream
             and fused[1] == hidden_states.shape
         ):
-            intermediate_act = fused[2]
-        else:
+            return fused[2]
+        return None
+
+    def forward_fused_router_activation(
+        self, activation: torch.Tensor
+    ) -> torch.Tensor:
+        """The shared down projection reads only this independent activation."""
+        output, _ = self.down_proj(activation)
+        return output
+
+    def forward(self, hidden_states: torch.Tensor) -> torch.Tensor:
+        intermediate_act = self.pop_fused_router_activation(hidden_states)
+        if intermediate_act is None:
             gate_up, _ = self.gate_up_proj(hidden_states)
             intermediate_act = self.act_fn(gate_up)
-        output, _ = self.down_proj(intermediate_act)
-        return output
+        return self.forward_fused_router_activation(intermediate_act)
 
 
 class Step5Attention(nn.Module):
@@ -775,7 +870,26 @@ class Step5Attention(nn.Module):
     def _quantize_qkvg(self) -> None:
         from vllm_hcu.ops.step5.fp8_dense import quantize_weight_fp8
 
-        self.qkvg_wq, self.qkvg_ws = quantize_weight_fp8(self.qkvg_weight)
+        w = self.qkvg_weight
+        if QKV_INDEXER and self.indexer is not None:
+            # [q; k; z; w] as in Step4Indexer._merged_projection (w rounded to
+            # bf16 first), stored [out, in]; qkvg_weight is [in, out].
+            parts = (
+                self.sparse_indexer_q.weight,
+                self.sparse_indexer_k.weight,
+                self.sparse_indexer_z.weight,
+                self.sparse_indexer_w.weight.to(w.dtype),
+            )
+            idx = torch.cat([t.detach().to(w.dtype) for t in parts], 0)
+            self.idx_off = w.shape[1]
+            self.idx_n = idx.shape[0]
+            w = torch.cat([w, idx.t()], 1)
+            self.indexer.pre_projected = True
+            for lin in (
+                self.sparse_indexer_q, self.sparse_indexer_k, self.sparse_indexer_z
+            ):
+                _free_weight(lin.weight)
+        self.qkvg_wq, self.qkvg_ws = quantize_weight_fp8(w)
         self.qkvg_weight = None
         _free_weight(self.qkv_proj.weight)
         _free_weight(self.g_proj.weight)
@@ -823,8 +937,13 @@ class Step5Attention(nn.Module):
             q, k = self.rotary_emb(positions, q, k)
         if self.indexer is not None:
             # Publishes layer.attn.step4_sparse_plan, which the DSA backend
-            # reads. It needs hidden_states, which Attention.forward never sees.
-            self.indexer.forward(hidden_states, positions)
+            # reads. It needs hidden_states, which Attention.forward never sees
+            # (or, with QKV_INDEXER, its projection's columns of qkvg).
+            if self.indexer.pre_projected:
+                idx = qkvg[..., self.idx_off : self.idx_off + self.idx_n]
+                self.indexer.forward(idx, positions)
+            else:
+                self.indexer.forward(hidden_states, positions)
         attn_output = self.attn(q, k, v)
         return self._gate_o_proj(attn_output, extra_dims, hidden_states)
 
@@ -1011,6 +1130,16 @@ class FusedMoEBlock(nn.Module):
             router_logits_dtype=torch.float32,
             custom_routing_function=custom_routing_function,
         )
+
+    @property
+    def routed_experts(self):
+        """Expose the normal RoutedExperts owner to static EPLB loading."""
+        return self.experts.routed_experts
+
+    @property
+    def eplb_state(self):
+        """Use the same layer state as the normal MoERunner router."""
+        return self.experts.eplb_state
 
     def forward(
         self,
@@ -1409,6 +1538,13 @@ class Step5Model(nn.Module):
         )
 
         disable_moe_stacked_params = [data[1] for data in expert_params_mapping]
+        if EXPERT_PLACEMENT:
+            if get_pp_group().world_size != 1:
+                raise ValueError("Step5 expert placement requires PP=1")
+            weights = _place_experts(
+                weights,
+                [i for i, layer in enumerate(self.layers) if layer.use_moe],
+            )
         if FP8_BF16_MOE:
             weights = _quantize_bf16_experts(weights)
 

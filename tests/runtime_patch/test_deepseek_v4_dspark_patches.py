@@ -1292,6 +1292,66 @@ def test_rocm_wo_a_cache_accepts_hcu_nn_layout() -> None:
     torch.testing.assert_close(calls[0], logical_weight)
 
 
+@pytest.mark.parametrize("use_nn", [True, False])
+def test_rocm_wo_a_cache_square_tp_shard(
+    monkeypatch: pytest.MonkeyPatch, use_nn: bool
+) -> None:
+    monkeypatch.setattr("vllm_hcu.platforms.envs.VLLM_USE_NN", use_nn)
+    calls = []
+
+    def get_cached_wo_a_bf16(wo_a, n_local_groups, o_lora_rank, hidden_dim):
+        calls.append(wo_a.weight)
+        return wo_a.weight.reshape(n_local_groups, o_lora_rank, hidden_dim)
+
+    module = _module(
+        patch_deepseek_v4_rocm_wo_a_layout.TARGET_MODULE,
+        _get_cached_wo_a_bf16=get_cached_wo_a_bf16,
+    )
+    patch_deepseek_v4_rocm_wo_a_layout.apply_to_module(module)
+
+    # Pro TP4 has groups * rank == hidden == 4096. A contiguous NN shard
+    # and its NT checkpoint tensor have identical shapes, but different values.
+    checkpoint = torch.arange(64, dtype=torch.float32).reshape(8, 8)
+    physical = checkpoint.T.contiguous() if use_nn else checkpoint.clone()
+    wo_a = SimpleNamespace(weight=physical, is_quantization=False)
+    cached = module._get_cached_wo_a_bf16(wo_a, 4, 2, 8)
+    activations = torch.arange(32, dtype=torch.float32).reshape(1, 4, 8)
+    expected = torch.stack(
+        [
+            activations[0, g] @ checkpoint[g * 2 : (g + 1) * 2].T
+            for g in range(4)
+        ]
+    ).unsqueeze(0)
+    torch.testing.assert_close(
+        torch.einsum("tgd,grd->tgr", activations, cached), expected
+    )
+    if use_nn:
+        assert module._get_cached_wo_a_bf16(wo_a, 4, 2, 8) is cached
+        assert len(calls) == 1
+
+
+@pytest.mark.parametrize("scale_name", ["weight_scale", "weight_scale_inv"])
+def test_rocm_wo_a_cache_square_quantized_shard_keeps_layout(
+    monkeypatch: pytest.MonkeyPatch, scale_name: str
+) -> None:
+    monkeypatch.setattr("vllm_hcu.platforms.envs.VLLM_USE_NN", True)
+
+    def get_cached_wo_a_bf16(wo_a, n_local_groups, o_lora_rank, hidden_dim):
+        return wo_a
+
+    module = _module(
+        patch_deepseek_v4_rocm_wo_a_layout.TARGET_MODULE,
+        _get_cached_wo_a_bf16=get_cached_wo_a_bf16,
+    )
+    patch_deepseek_v4_rocm_wo_a_layout.apply_to_module(module)
+    wo_a = SimpleNamespace(
+        weight=torch.arange(64).reshape(8, 8),
+        is_quantization=True,
+        **{scale_name: torch.ones(8, 1)},
+    )
+    assert module._get_cached_wo_a_bf16(wo_a, 4, 2, 8) is wo_a
+
+
 def test_rocm_wo_a_cache_keeps_upstream_layout() -> None:
     def get_cached_wo_a_bf16(
         wo_a,

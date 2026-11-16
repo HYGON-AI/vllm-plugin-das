@@ -4,6 +4,8 @@
 
 from __future__ import annotations
 
+import torch
+
 from .lightop_routing import (
     lightop_moe_gate_kwargs,
     lightop_moe_gate_should_fallback,
@@ -66,6 +68,42 @@ def eplb_map_to_physical_and_record(
         ).to(expert_load_view.dtype)
     expert_load_view.scatter_add_(0, safe_physical, increments)
     return physical.reshape(topk_shape)
+
+
+def window_sp_padding_mask(
+    is_padding: torch.Tensor,
+    topk_ids: torch.Tensor,
+    window: tuple[int, int] | None,
+) -> torch.Tensor | None:
+    """Restrict the global padding suffix bitmap to an SP rank's row window.
+
+    SP-MoE (worker.op_opt.kimi_k3.sp_moe) republishes ``topk_ids`` in window
+    coordinates: this rank dispatched its rows [rank*S, (rank+1)*S) of the
+    padded layer batch, so the router must match the global suffix bitmap to
+    the same coordinates. Runs inside the opaque MoE custom op -- never in
+    the layer body, where a Python attribute store is invisible to dynamo
+    under torch.compile.
+
+    ``window`` is attached only where SP enablement holds (PCP/DCP
+    rejected), which makes the bitmap's coordinate domain global: its
+    length is the local padded batch and carries every real row. Window
+    coordinates past the bitmap's end are therefore covered rows that the
+    local length simply does not describe (legal whenever N < rank*S in
+    small batches) and are True-padded: their rows dispatch nothing. A
+    mask without the window attribute is returned untouched.
+    """
+    if window is None:
+        return is_padding
+    rank, tp_size = window
+    shard = topk_ids.shape[0]
+    padded_len = shard * tp_size
+    if is_padding.shape[0] < padded_len:
+        is_padding = torch.nn.functional.pad(
+            is_padding,
+            (0, padded_len - is_padding.shape[0]),
+            value=True,
+        )
+    return is_padding[:padded_len][rank * shard : (rank + 1) * shard]
 
 
 def make_hcu_grouped_topk_router(base_class):
@@ -193,6 +231,12 @@ def make_hcu_grouped_topk_router(base_class):
 
             if envs.VLLM_MOE_SKIP_PADDING and is_forward_context_available():
                 is_padding = get_forward_context().is_padding
+                if is_padding is not None:
+                    is_padding = window_sp_padding_mask(
+                        is_padding,
+                        topk_ids,
+                        getattr(self, "_hcu_sp_padding_window", None),
+                    )
                 # Fallback PCP gathers routing rows across ranks without
                 # gathering ForwardContext.is_padding.  A shorter mask is
                 # therefore local to this rank and must not be applied to the

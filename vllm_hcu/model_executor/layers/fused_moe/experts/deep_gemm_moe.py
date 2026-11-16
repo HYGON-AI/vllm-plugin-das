@@ -56,6 +56,7 @@ from vllm.utils.deep_gemm import (
 )
 from vllm.utils.import_utils import has_deep_gemm
 from vllm_hcu.platforms import envs as henvs
+from vllm_hcu.runtime_compat.step5 import is_step5_owner
 
 logger = init_logger(__name__)
 
@@ -153,11 +154,49 @@ def _valid_deep_gemm(
     return True
 
 
+def _step5_fused_scatter_rows(meta, topk_ids, local_num_experts, hidden_size):
+    """Validate the dispatch-owned layout before reusing its GEMM inputs."""
+    layout = getattr(meta, "_hcu_step5_fused_scatter_layout", None)
+    scatter = getattr(meta, "_hcu_step5_fused_scatter", None)
+    if (
+        not isinstance(layout, tuple) or len(layout) != 2
+        or not isinstance(scatter, tuple) or len(scatter) != 4
+    ):
+        raise ValueError("Step5 fused scatter is missing dispatch layout metadata")
+    shape, counts = layout
+    if (
+        shape != tuple(topk_ids.shape)
+        or not isinstance(counts, tuple)
+        or len(counts) != local_num_experts
+        or any(type(c) is not int or c < 0 or c % 256 for c in counts)
+    ):
+        raise ValueError("Step5 fused scatter has mismatched dispatch counts or batch shape")
+    rows = sum(counts)
+    aq, scales, expert_ids, inv_perm = scatter
+    if (
+        aq.shape != (rows, hidden_size) or scales.shape != (rows, 1)
+        or expert_ids.shape != (rows,) or inv_perm.shape != topk_ids.shape
+        or (rows == 0) != (topk_ids.size(0) == 0)
+        or aq.dtype != torch.float8_e4m3fn or scales.dtype != torch.float32
+        or expert_ids.dtype != torch.int32 or inv_perm.dtype != torch.int32
+        or any(t.device != topk_ids.device or not t.is_contiguous() for t in scatter)
+        or not isinstance(getattr(meta, "_hcu_step5_fused_scatter_guard", None), dict)
+    ):
+        raise ValueError("Step5 fused scatter tensors do not match the dispatch layout")
+    return rows
+
+
 class DeepGemmExperts(mk.FusedMoEExpertsModular):
     """DeepGemm-based fused MoE expert implementation."""
 
     def __init__(self, moe_config: FusedMoEConfig, quant_config: FusedMoEQuantConfig):
         super().__init__(moe_config=moe_config, quant_config=quant_config)
+        self._hcu_step5_owner = is_step5_owner(moe_config)
+        self._hcu_step5_compact_ht = (
+            henvs.custom_ops_enabled()
+            and self._hcu_step5_owner
+            and os.environ.get("HCU_STEP5_DEEPEP_COMPACT_ROWS", "0") == "1"
+        )
         # MXFP8: FP8 e4m3 values + UE8M0 1x32 block scales (Blackwell). Reuses
         # the same grouped GEMM (aliased to fp8_fp4) with recipe (1, 32).
         self.mxfp8 = quant_config.block_shape == [1, 32]
@@ -201,6 +240,39 @@ class DeepGemmExperts(mk.FusedMoEExpertsModular):
     @staticmethod
     def activation_format() -> mk.FusedMoEActivationFormat:
         return mk.FusedMoEActivationFormat.Standard
+
+    def moe_problem_size(
+        self,
+        a1: torch.Tensor,
+        w1: torch.Tensor,
+        w2: torch.Tensor,
+        topk_ids: torch.Tensor,
+    ) -> tuple[int, int, int, int, int]:
+        """Use logical model dimensions for HCU's opaque packed weights.
+
+        gfx938 pair32 packing produces rank-7 tensors, while the generic
+        modular contract only understands rank-3 and the older rank-6 layout.
+        The logical dimensions were captured from ``FusedMoEConfig`` before
+        packing, so they are the authoritative shape for workspace sizing.
+        """
+        if not current_platform.is_rocm():
+            return super().moe_problem_size(a1, w1, w2, topk_ids)
+        assert w1.size(0) == w2.size(0)
+        experts = w1.size(0)
+        if a1.dim() == 2:
+            assert topk_ids.size(0) == a1.size(0)
+            tokens = a1.size(0)
+        else:
+            assert a1.dim() == 3 and a1.size(0) == experts
+            tokens = a1.size(1)
+        assert topk_ids.dim() == 2
+        return (
+            experts,
+            tokens,
+            self._hcu_logical_n,
+            self._hcu_logical_k,
+            topk_ids.size(1),
+        )
 
     @staticmethod
     def _supports_current_device() -> bool:
@@ -255,6 +327,54 @@ class DeepGemmExperts(mk.FusedMoEExpertsModular):
 
     def finalize_weight_and_reduce_impl(self) -> mk.TopKWeightAndReduce:
         return TopKWeightAndReduceNoOP()
+
+    def _hcu_step5_ep_chunk_size(
+        self, w1, w2, activation, global_num_experts, expert_map,
+        top_k, apply_router_weight_on_input,
+    ) -> int | None:
+        """Bound Step5 EP8/EP16 scratch, including static EP16 replicas."""
+        if not (
+            _EP_FUSED_MOE
+            and getattr(self, "_hcu_step5_owner", False)
+            and current_platform.is_rocm()
+            and henvs.optional_custom_op_enabled(
+                os.environ.get("HCU_STEP5_BOUNDED_EP_WORKSPACE", "0") == "1"
+            )
+            and self.block_shape is None
+            and self.quant_config.use_fp8_w8a8
+            and self.quant_config.per_out_ch_quant
+            and self.quant_config.per_act_token_quant
+            and getattr(self, "_lora_context", None) is None
+            and w1.ndim == 3
+            and (
+                (w1.shape[0] in (22, 44) and global_num_experts == 352)
+                or (
+                    w1.shape[0] == 23 and global_num_experts == 368
+                    and expert_map is not None
+                    and expert_map.ndim == 1 and expert_map.numel() == 368
+                )
+            )
+            and w1.shape[1:] == (3072, 4096)
+            and w2.shape == (w1.shape[0], 4096, 1536)
+            and top_k == 8
+        ):
+            return None
+        from vllm_hcu.model_executor.layers.fused_moe.ep_fused_moe_support import (
+            supports_channel_ep_fused,
+        )
+
+        if not supports_channel_ep_fused(
+            w1, w2, self.w1_scale, self.w2_scale,
+            block_shape=self.block_shape, activation=activation,
+            expert_map=expert_map,
+            apply_router_weight_on_input=apply_router_weight_on_input,
+        ):
+            return None
+        from vllm_hcu.model_executor.layers.fused_moe.ep_fused_moe import CHUNK
+
+        if CHUNK <= 0:
+            raise ValueError("EP_FUSED_MOE_CHUNK must be positive")
+        return CHUNK
 
     def workspace_shapes(
         self,
@@ -447,18 +567,41 @@ class DeepGemmExperts(mk.FusedMoEExpertsModular):
         if global_num_experts == -1:
             global_num_experts = local_num_experts
 
-        if (
-            _EP_FUSED_MOE
+        native_channel_fp8 = (
+            henvs.optional_custom_op_enabled(_EP_FUSED_MOE)
+            and getattr(self, "_hcu_step5_owner", False)
             and self.block_shape is None
             and self.quant_config.use_fp8_w8a8
             and w1.dim() == 3
-        ):
+        )
+        step5_channel_fp8 = (
+            henvs.optional_custom_op_enabled(
+                getattr(self, "_hcu_step5_owner", False)
+            )
+            and current_platform.is_rocm()
+            and activation == MoEActivation.SWIGLUSTEP
+            and self.block_shape is None
+            and self.quant_config.use_fp8_w8a8
+            and self.quant_config.per_out_ch_quant
+            and self.quant_config.per_act_token_quant
+            and w1.ndim == w2.ndim == 7
+            and self._hcu_logical_n == 3072
+            and self._hcu_logical_k == 4096
+        )
+        if native_channel_fp8:
             self._apply_ep_fused(
                 output, a1q, w1, w2, topk_weights, topk_ids, activation,
                 global_num_experts, expert_map, a1q_scale, workspace13, workspace2,
                 apply_router_weight_on_input,
             )
             return
+
+        if (
+            step5_channel_fp8
+            and self._hcu_step5_compact_ht
+            and getattr(expert_tokens_meta, "_hcu_deepep_ht_local_counts", False)
+        ):
+            expert_tokens_meta._hcu_step5_compact_rows = True
 
         if current_platform.is_rocm():
             N = self._hcu_logical_n
@@ -467,36 +610,49 @@ class DeepGemmExperts(mk.FusedMoEExpertsModular):
             _, N, K = w1.size()
             assert w2.size(1) == K
 
-        M_sum, _ = compute_aligned_M_and_alignment(
-            M=topk_ids.size(0),
-            num_topk=topk_ids.size(1),
-            local_num_experts=local_num_experts,
-            alignment=(
-                _HCU_HT_EP_TOKEN_ALIGNMENT
-                if current_platform.is_rocm()
-                else get_mk_alignment_for_contiguous_layout()[0]
-            ),
-            expert_tokens_meta=expert_tokens_meta,
-        )
-
         permuted_dtype = (
             a1q.dtype
             if self.quant_config.use_int8_w8a8
             else torch.float8_e4m3fn
         )
-        a1q_perm = _resize_cache(workspace13.view(dtype=permuted_dtype), (M_sum, K))
-        a1q, a1q_scale, expert_ids, inv_perm, align_used = deepgemm_moe_permute(
-            aq=a1q,
-            aq_scale=a1q_scale,
-            topk_ids=topk_ids,
-            local_num_experts=local_num_experts,
-            expert_map=expert_map,
-            expert_tokens_meta=expert_tokens_meta,
-            aq_out=a1q_perm,
-            # MXFP8 uses a 32-element activation-scale group (block_shape[1]);
-            # FP8-block keeps the default (128) alignment.
-            block_size=self.block_shape[1] if self.mxfp8 else None,
-        )
+        fused_scatter = getattr(expert_tokens_meta, "_hcu_step5_fused_scatter", None)
+        if getattr(self, "_hcu_step5_fused_scatter_enabled", False):
+            if not step5_channel_fp8 or fused_scatter is None or local_num_experts not in (22, 23):
+                raise ValueError("Step5 DeepGEMM requires matching fused-scatter metadata")
+            # DeepEP already wrote aligned expert slices. Their exact row
+            # count is part of this input contract, regardless of whether
+            # compact sizing is enabled for the separate permutation path.
+            M_sum = _step5_fused_scatter_rows(
+                expert_tokens_meta, topk_ids, local_num_experts, K,
+            )
+            if topk_ids.size(0) == 0:
+                output.zero_()
+                return
+            a1q, a1q_scale, expert_ids, inv_perm = fused_scatter
+            align_used = _HCU_HT_EP_TOKEN_ALIGNMENT
+        else:
+            M_sum, _ = compute_aligned_M_and_alignment(
+                M=topk_ids.size(0),
+                num_topk=topk_ids.size(1),
+                local_num_experts=local_num_experts,
+                alignment=(
+                    _HCU_HT_EP_TOKEN_ALIGNMENT
+                    if current_platform.is_rocm()
+                    else get_mk_alignment_for_contiguous_layout()[0]
+                ),
+                expert_tokens_meta=expert_tokens_meta,
+            )
+            a1q_perm = _resize_cache(workspace13.view(dtype=permuted_dtype), (M_sum, K))
+            a1q, a1q_scale, expert_ids, inv_perm, align_used = deepgemm_moe_permute(
+                aq=a1q,
+                aq_scale=a1q_scale,
+                topk_ids=topk_ids,
+                local_num_experts=local_num_experts,
+                expert_map=expert_map,
+                expert_tokens_meta=expert_tokens_meta,
+                aq_out=a1q_perm,
+                block_size=self.block_shape[1] if self.mxfp8 else None,
+            )
         assert a1q.size(0) == M_sum
 
         # MXFP8 (1x32) drives the fp8_fp4-aliased grouped GEMM with recipe
@@ -563,14 +719,25 @@ class DeepGemmExperts(mk.FusedMoEExpertsModular):
                     workspace13.view(dtype=torch.float8_e4m3fn),
                     (M_sum, activation_out_dim),
                 )
-                if current_platform.is_rocm() and activation in (
+                if step5_channel_fp8:
+                    from vllm_hcu.model_executor.layers.fused_moe.ep_fused_moe import (
+                        ep_swiglustep_quant_deepgemm,
+                    )
+
+                    a2q, a2q_scale = ep_swiglustep_quant_deepgemm(
+                        mm1_out,
+                        expert_ids,
+                        quant_out,
+                        limit=float(self.gemm1_clamp_limit or 7.0),
+                    )
+                elif current_platform.is_rocm() and activation in (
                     MoEActivation.SILU,
                     MoEActivation.SWIGLUSTEP,
                 ):
                     from lightop.activation import fuse_silu_mul_fp8_quant
 
-                    # lightop's `limit` computes min(silu(g), L) * clamp(u, -L, L),
-                    # i.e. swiglustep; -1 disables the clamp (plain SiLU).
+                    # Preserve the existing LightOp path for other model
+                    # dimensions/layouts and for ordinary SiLU.
                     limit = -1.0
                     if activation == MoEActivation.SWIGLUSTEP:
                         limit = float(self.gemm1_clamp_limit or 7.0)
@@ -608,6 +775,13 @@ class DeepGemmExperts(mk.FusedMoEExpertsModular):
             expert_map=expert_map,
             output=output,
         )
+        if fused_scatter is not None and getattr(self, "_hcu_step5_fused_scatter_enabled", False):
+            stream = torch.cuda.current_stream()
+            for tensor in fused_scatter:
+                tensor.record_stream(stream)
+            event = torch.cuda.Event()
+            event.record(stream)
+            expert_tokens_meta._hcu_step5_fused_scatter_guard["last_use"] = event
 
 
 class DeepGemmFP4Experts(mk.FusedMoEExpertsModular):

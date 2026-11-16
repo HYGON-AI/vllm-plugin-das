@@ -2,7 +2,9 @@
 # SPDX-FileCopyrightText: Copyright (c) 2026 Hygon Information Technology Co., Ltd.
 """Route the vLLM FLA recompute_w_u helper through the selected HCU provider.
 
-aiter has no recompute_w_u kernel, so ``hcu-aiter`` falls back to BoltOPs.
+aiter's recompute kernel is internal to its fused CK prefill pipeline; it has
+no standalone vLLM-compatible entry point, so ``hcu-aiter`` falls back to
+BoltOPs for this helper.
 """
 
 from __future__ import annotations
@@ -43,7 +45,15 @@ def apply_to_module(module: ModuleType) -> bool:
         defaults={"chunk_indices": None},
     )
     select_provider = make_provider_selector(
-        "prefill", _OP, {BOLTOPS: make_boltops_gdn_resolver(_OP)}
+        "prefill",
+        _OP,
+        {BOLTOPS: make_boltops_gdn_resolver(_OP)},
+        unavailable_reasons={
+            "hcu-aiter": (
+                "it has no standalone vLLM-compatible entry point; its "
+                "recompute kernel is internal to ck_gdn_prefill"
+            )
+        },
     )
 
     @functools.wraps(original)

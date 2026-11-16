@@ -273,6 +273,20 @@ def persistent_masked_m_silu_mul_quant(
     return y_q, y_s
 
 
+def _w4a8_masked_kernel_weight(weight: torch.Tensor) -> torch.Tensor:
+    """Expose packed N32 storage through the HIPC kernel's rank-3 ABI.
+
+    Packing already reordered the bytes. Only change metadata here; do not
+    transpose or repack the N32 storage.
+    """
+    if weight.ndim == 3:
+        return weight
+    if weight.ndim != 6 or tuple(weight.shape[-3:]) != (4, 32, 8):
+        raise ValueError("Expected rank-3 packed W4A8 weight or rank-6 N32 view")
+    experts, k_blocks, n_blocks = weight.shape[:3]
+    return weight.view(experts, n_blocks * 32, k_blocks * 32)
+
+
 class BatchedDeepGemmExperts(mk.FusedMoEExpertsModular):
     def __init__(
         self,
@@ -390,21 +404,52 @@ class BatchedDeepGemmExperts(mk.FusedMoEExpertsModular):
         return (workspace13, workspace2, output)
 
     def estimate_expected_m(
-        self, global_num_experts: int, max_tokens_per_expert: int, topk: int
+        self,
+        global_num_experts: int,
+        max_tokens_per_expert: int,
+        topk: int,
+    ) -> int:
+        """Upstream v0.25.1 signature, byte-for-byte (module-exchange contract).
+
+        The DeepEP-LL hint plumbing lives in ``_hcu_estimate_expected_m``,
+        which ``apply`` routes through; the public method stays the exact
+        upstream surface.
+        """
+        # The context-local token count rides the instance hint slot (see
+        # _hcu_estimate_expected_m): upstream surfaces must not widen.
+        local_num_tokens = getattr(self, "_hcu_expected_m_local_tokens", None)
+        return self._hcu_estimate_expected_m(
+            global_num_experts,
+            max_tokens_per_expert,
+            topk,
+            local_num_tokens,
+        )
+
+    def _hcu_estimate_expected_m(
+        self,
+        global_num_experts: int,
+        max_tokens_per_expert: int,
+        topk: int,
+        local_num_tokens: int | None,
     ) -> int:
         dp_meta = (
             get_forward_context().dp_metadata
             if is_forward_context_available()
             else None
         )
-        if dp_meta is None:
+        if dp_meta is not None:
+            total_num_tokens = dp_meta.num_tokens_across_dp_cpu.sum().item()
+        elif local_num_tokens is not None and self.num_dispatchers is not None:
+            # DeepEP-LL skips dp_metadata by design. Every dispatcher pads to
+            # the same graph batch size, so local * num_dispatchers is a pure
+            # Python int and safe to bake into a cudagraph.
+            total_num_tokens = int(local_num_tokens) * int(self.num_dispatchers)
+        else:
             logger.warning_once(
                 "DPMetadata unavailable. Defaulting expected_m to "
                 f"{max_tokens_per_expert}.",
             )
             return max_tokens_per_expert
-
-        total_num_tokens = dp_meta.num_tokens_across_dp_cpu.sum().item()
         total_num_tokens_replicated = total_num_tokens * topk
 
         # Assume even load balancing
@@ -462,11 +507,16 @@ class BatchedDeepGemmExperts(mk.FusedMoEExpertsModular):
 
         workspace1 = _resize_cache(workspace13, (E, max_num_tokens, N))
 
+        # Private hint channel instead of widening the upstream signature:
+        # the module-exchange contract pins every public method's args AST
+        # to the v0.25.1 surface (test_module_exchange signature gate).
+        self._hcu_expected_m_local_tokens = topk_ids.size(0)
         expected_m = self.estimate_expected_m(
             global_num_experts=global_num_experts,
             max_tokens_per_expert=max_num_tokens,
             topk=topk_ids.size(-1),
         )
+        self._hcu_expected_m_local_tokens = None
 
         if use_w4a8:
             is_situ = (
@@ -493,7 +543,7 @@ class BatchedDeepGemmExperts(mk.FusedMoEExpertsModular):
 
             m_grouped_w4a8_gemm_nt_masked_hipc(
                 (a1q, a1q_scale),
-                (self._deepgemm_w13, self.w1_scale),
+                (_w4a8_masked_kernel_weight(self._deepgemm_w13), self.w1_scale),
                 workspace1,
                 expert_num_tokens,
                 expected_m,
@@ -526,7 +576,7 @@ class BatchedDeepGemmExperts(mk.FusedMoEExpertsModular):
                 )
             m_grouped_w4a8_gemm_nt_masked_hipc(
                 (a2q, a2q_scale),
-                (self._deepgemm_w2, self.w2_scale),
+                (_w4a8_masked_kernel_weight(self._deepgemm_w2), self.w2_scale),
                 output,
                 expert_num_tokens,
                 expected_m,

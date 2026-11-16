@@ -36,6 +36,7 @@ import os as _vllm_hcu_os
 from pathlib import Path as _VllmHcuPath
 from packaging.version import Version as _VllmHcuVersion
 import vllm as _vllm_hcu_target
+import vllm_hcu as _vllm_hcu_plugin
 from vllm_hcu.version import __vllm_target_version__ as _vllm_hcu_target_version
 _vllm_hcu_root = _VllmHcuPath(
     _vllm_hcu_os.environ["VLLM_SOURCE_ROOT"]
@@ -54,6 +55,9 @@ assert _VllmHcuVersion(_vllm_hcu_target_version).release[:3] == (
     _vllm_hcu_expected_release
 ), (_vllm_hcu_target_version, _vllm_hcu_expected_release)
 assert "VLLM_V0251_SOURCE_ROOT" not in _vllm_hcu_os.environ
+assert _VllmHcuPath(_vllm_hcu_plugin.__file__).resolve().is_relative_to(
+    _VllmHcuPath(_vllm_hcu_os.environ["HCU_TEST_PLUGIN_ROOT"]).resolve()
+), "worker test imported an installed plugin instead of the checkout"
 '''
 
 
@@ -63,7 +67,8 @@ def _run_fresh(code: str, *, timeout: int = 120) -> subprocess.CompletedProcess[
     env.pop("VLLM_V0251_SOURCE_ROOT", None)
     env["VLLM_SOURCE_ROOT"] = str(TARGET_VLLM_ROOT)
     env["VLLM_TARGET_RELEASE"] = ".".join(map(str, TARGET_RELEASE))
-    env["PYTHONPATH"] = os.pathsep.join((str(TARGET_VLLM_ROOT), str(REPO)))
+    env["HCU_TEST_PLUGIN_ROOT"] = str(REPO)
+    env["PYTHONPATH"] = os.pathsep.join((str(REPO), str(TARGET_VLLM_ROOT)))
     return subprocess.run(
         [sys.executable, "-c", _TARGET_SOURCE_ASSERTION + code],
         check=False,
@@ -115,6 +120,10 @@ def test_worker_inventory_is_complete_explicit_and_dependency_ordered():
         ),
     )
     assert callbacks
+    assert (
+        "worker.core_fix.kimi_k25.vision_conv",
+        "vllm.model_executor.models.kimi_k25_vit",
+    ) in callbacks
     assert len({patch_id for patch_id, _ in callbacks}) == len(callbacks)
 
     positions = {patch_id: index for index, (patch_id, _) in enumerate(callbacks)}
@@ -134,9 +143,6 @@ def test_worker_inventory_is_complete_explicit_and_dependency_ordered():
         "worker.op_opt.quantization.lightop_autoawq"
     ] == "always"
     framework_order = (
-        "worker.framework_opt.model_loader.static_eplb_preload",
-        "worker.framework_opt.model_loader.static_expert_mapping",
-        "worker.framework_opt.eplb.gloo_profile_reservation",
         "worker.framework_opt.dp.deepep_low_latency",
         "worker.framework_opt.forward_context.hcu_runtime_fields",
         "worker.framework_opt.communicator.base_custom_sp",
@@ -147,6 +153,14 @@ def test_worker_inventory_is_complete_explicit_and_dependency_ordered():
         "worker.framework_opt.dbo.deep_gemm_sms_capability",
         "worker.framework_opt.dbo.ubatch_metadata",
         "worker.framework_opt.communicator.deep_ep_runtime",
+        "worker.framework_opt.step5_eplb_communicator",
+        "worker.framework_opt.step5_eplb_transfer",
+        "worker.framework_opt.step5_eplb_async_worker",
+        "worker.framework_opt.step5_eplb_state",
+        "worker.framework_opt.model_loader.static_eplb_preload",
+        "worker.framework_opt.model_loader.static_expert_mapping",
+        "worker.framework_opt.eplb.offline_expert_map",
+        "worker.framework_opt.eplb.gloo_profile_reservation",
     )
     assert tuple(positions[name] for name in framework_order) == tuple(
         sorted(positions[name] for name in framework_order)
@@ -169,12 +183,12 @@ def test_worker_inventory_is_complete_explicit_and_dependency_ordered():
     }
     inventoried_adapters = callback_specs | replacement_specs
     adapter_files = {
-        ".".join(path.with_suffix("").parts)
+        ".".join(path.relative_to(REPO).with_suffix("").parts)
         for root in (
-            Path("vllm_hcu/patch/worker/core_fix"),
-            Path("vllm_hcu/patch/worker/op_opt"),
-            Path("vllm_hcu/patch/worker/op_opt/moe"),
-            Path("vllm_hcu/patch/worker/framework_opt"),
+            REPO / "vllm_hcu/patch/worker/core_fix",
+            REPO / "vllm_hcu/patch/worker/op_opt",
+            REPO / "vllm_hcu/patch/worker/op_opt/moe",
+            REPO / "vllm_hcu/patch/worker/framework_opt",
         )
         for path in root.glob("patch_*.py")
     }
@@ -343,28 +357,17 @@ def test_prepare_is_lazy_narrow_idempotent_and_keeps_main_role():
     )
     assert result.returncode == 0, result.stdout + result.stderr
     payload = json.loads(result.stdout.strip().splitlines()[-1])
+    # Target builds may preload different upstream modules. Preparation must
+    # add no target/business imports to that observed baseline.
+    initial_targets = payload["initial_targets_loaded"]
     assert payload == {
         "first": expected_total,
         "second": expected_total,
         "replacements": expected_replacements,
         "callbacks": expected_callbacks,
         "statuses": ["applied", "armed"],
-        "initial_targets_loaded": [
-            "vllm.distributed.device_communicators.base_device_communicator",
-            "vllm.forward_context",
-            "vllm.utils.deep_gemm",
-            "vllm.v1.attention.backend",
-            "vllm.v1.worker.dp_utils",
-            "vllm.v1.worker.ubatch_utils",
-        ],
-        "targets_loaded": [
-            "vllm.distributed.device_communicators.base_device_communicator",
-            "vllm.forward_context",
-            "vllm.utils.deep_gemm",
-            "vllm.v1.attention.backend",
-            "vllm.v1.worker.dp_utils",
-            "vllm.v1.worker.ubatch_utils",
-        ],
+        "initial_targets_loaded": initial_targets,
+        "targets_loaded": initial_targets,
         "business_loaded": [],
         "runner_loaded": False,
         "shared_loaded": False,

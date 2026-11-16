@@ -25,9 +25,59 @@ register_hcu_ci(
     est_time=900,
 )
 register_hcu_ci(
+    job="accuracy-gfx936",
+    target="tests/accuracy/test_grouped_w4a16_moe_accuracy.py",
+    est_time=300,
+)
+register_hcu_ci(
+    job="accuracy-gfx936",
+    target="tests/accuracy/test_aiter_moe_config_selection.py",
+    est_time=120,
+)
+register_hcu_ci(
+    job="accuracy-gfx936",
+    target="tests/accuracy/test_aiter_moe_tp2_group128_moec.py",
+    est_time=180,
+)
+register_hcu_ci(
+    job="accuracy-gfx936",
+    target="tests/accuracy/test_aiter_moe_tp2_group32.py",
+    est_time=300,
+)
+register_hcu_ci(
+    job="accuracy-gfx936",
+    target="tests/kernels/test_kimi_k3_kda_checkpoints_numeric.py",
+    est_time=180,
+)
+register_hcu_ci(
+    job="accuracy-gfx936",
+    target="tests/kernels/test_kimi_k3_kda_aiter_sglang.py",
+    est_time=300,
+    disabled=(
+        "requires an SGLang source tree on PYTHONPATH with "
+        "SGLANG_KDA_USE_HCU_OP=1; the HCU CI runner image does not include "
+        "SGLang"
+    ),
+)
+register_hcu_ci(
     job="accuracy-gfx938",
     target="tests/accuracy/test_hcu_kernel_accuracy.py",
     est_time=900,
+)
+register_hcu_ci(
+    job="accuracy-gfx938",
+    target="tests/kernels/test_gfx938_indexer_normal_layout.py",
+    est_time=60,
+)
+register_hcu_ci(
+    job="accuracy-gfx938",
+    target="tests/model_executor/test_step5_upstream_delta.py::test_causal_fp8_prefill_scores_preserve_group_major_strided_output",
+    est_time=60,
+)
+register_hcu_ci(
+    job="accuracy-gfx938",
+    target="tests/model_executor/test_step5_upstream_delta.py::test_resident_prefill_selection_matches_radix_with_ties_and_padding",
+    est_time=60,
 )
 register_hcu_ci(
     job="accuracy-gfx938",
@@ -65,6 +115,16 @@ register_hcu_ci(
     est_time=60,
 )
 register_hcu_ci(
+    job="accuracy-gfx936",
+    target="tests/accuracy/test_autoawq_triton_bf16.py",
+    est_time=60,
+)
+register_hcu_ci(
+    job="accuracy-gfx938",
+    target="tests/accuracy/test_autoawq_triton_bf16.py",
+    est_time=60,
+)
+register_hcu_ci(
     job="accuracy-gfx938",
     target="tests/accuracy/test_moe_align_fallback_graph.py",
     est_time=120,
@@ -84,6 +144,16 @@ register_hcu_ci(
     target="tests/runtime_patch/test_gate_linear_context.py",
     est_time=180,
 )
+register_hcu_ci(
+    job="accuracy-gfx938",
+    target="tests/runtime_patch/test_bf16_fp32_mmac.py",
+    est_time=300,
+)
+register_hcu_ci(
+    job="accuracy-gfx938",
+    target="tests/runtime_patch/test_dsv4_skinny_lm_head.py",
+    est_time=180,
+)
 
 register_hcu_ci(
     job="contract-hcu-gfx936",
@@ -94,6 +164,11 @@ register_hcu_ci(
     job="contract-hcu-gfx936",
     target="tests/runtime_patch/test_glm53_channel_fp8.py",
     est_time=60,
+)
+register_hcu_ci(
+    job="contract-hcu-gfx936",
+    target="tests/runtime_patch/test_grouped_w4a16_scale_reload.py",
+    est_time=180,
 )
 register_hcu_ci(
     job="contract-hcu-gfx936",
@@ -122,6 +197,11 @@ register_hcu_ci(
 )
 register_hcu_ci(
     job="contract-hcu-gfx936",
+    target="tests/runtime_patch/test_compressed_tensors_w4a8.py",
+    est_time=60,
+)
+register_hcu_ci(
+    job="contract-hcu-gfx936",
     target="tests/runtime_patch/test_worker_framework_opt.py",
     est_time=180,
 )
@@ -133,6 +213,11 @@ register_hcu_ci(
 register_hcu_ci(
     job="contract-hcu-gfx936",
     target="tests/runtime_patch/test_deepseek_v4_dspark_patches.py",
+    est_time=60,
+)
+register_hcu_ci(
+    job="contract-hcu-gfx936",
+    target="tests/runtime_patch/test_deepseek_v4_wo_a_reload.py",
     est_time=60,
 )
 register_hcu_ci(
@@ -172,8 +257,28 @@ register_hcu_ci(
 )
 register_hcu_ci(
     job="contract-hcu-gfx936",
+    target="tests/runtime_patch/test_slimquant_w4a8_fixed_deepep.py",
+    est_time=60,
+)
+register_hcu_ci(
+    job="contract-hcu-gfx936",
     target="tests/runtime_patch/test_kimi_k3_eplb_model.py",
     est_time=60,
+)
+register_hcu_ci(
+    job="contract-hcu-gfx936",
+    target="tests/kernels/test_kimi_k3_kda_cache_reuse.py",
+    est_time=300,
+)
+register_hcu_ci(
+    job="contract-hcu-gfx936",
+    target="tests/kernels/test_kimi_k3_kda_aiter_timing.py",
+    est_time=120,
+    disabled=(
+        "manual non-gating GPU timing check; it prints timing data instead of "
+        "asserting a contract, so keeping it out of required HCU gating avoids "
+        "noise from runner contention"
+    ),
 )
 register_hcu_ci(
     job="contract-hcu-gfx936",
@@ -498,4 +603,15 @@ register_hcu_ci(
     job="single-node-topology",
     target="tests/distributed/single_node/test_topology_contracts.py",
     est_time=60,
+)
+
+register_hcu_ci(
+    job="accuracy-gfx936",
+    target="tests/kernels/test_bf16_indexer_gather.py",
+    est_time=30,
+)
+register_hcu_ci(
+    job="accuracy-gfx938",
+    target="tests/kernels/test_bf16_indexer_gather.py",
+    est_time=30,
 )

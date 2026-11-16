@@ -134,15 +134,19 @@ def get_version() -> str:
 # --- 2. 定义 C++ 扩展模块 ---
 # =========================================================
 # 建议将生成的 .so 放到包名路径下，例如 vllm_hcu.cache_ops
+_BUILD_STEP5_DENSE = os.getenv("VLLM_HCU_BUILD_STEP5_DENSE", "0") == "1"
+
 ext_modules = [
     CUDAExtension(
-        name='vllm_hcu.hcu_ops', 
+        name='vllm_hcu.hcu_ops',
         sources=['vllm_hcu/csrc/hcu_cache_kernel.cu',
                  'vllm_hcu/csrc/torch_bindings.cpp',
                  'vllm_hcu/csrc/custom_all_reduce.cu',
-                 'vllm_hcu/csrc/fused_deepseek_v4_inv_rope_kernel.cu'
-                 ], 
-        define_macros=[('TORCH_EXTENSION_NAME', 'hcu_ops')], 
+                 'vllm_hcu/csrc/fused_deepseek_v4_inv_rope_kernel.cu',
+                 ] + (['vllm_hcu/csrc/step5_fp8_dense.cpp'] if _BUILD_STEP5_DENSE else []),
+        libraries=['hipblaslt', 'dl'] if _BUILD_STEP5_DENSE else [],
+        define_macros=[('TORCH_EXTENSION_NAME', 'hcu_ops')] + (
+            [('VLLM_HCU_BUILD_STEP5_DENSE', '1')] if _BUILD_STEP5_DENSE else []),
         extra_compile_args={
             'cxx': ['-O3'],
             'nvcc': ['-O3', '-fno-gpu-rdc']
@@ -159,14 +163,14 @@ class CustomBuildExt(BuildExtension.with_options(use_ninja=True)):
         # 1. 调用父类的 run()，这会根据 MAX_JOBS 环境并行编译
         with _sanitized_ninja_build():
             super().run()
-        
+
         # 2. 编译完成后，执行你的拷贝逻辑
         for ext in self.extensions:
             # 获取编译出来的 .so 完整路径
             ext_path = self.get_ext_fullpath(ext.name)
             if not os.path.exists(ext_path):
                 continue
-                
+
             file_name = os.path.basename(ext_path)
             # 确定目标包路径 vllm_hcu/
             target_dir = os.path.join(ROOT, "vllm_hcu")
@@ -177,7 +181,7 @@ class CustomBuildExt(BuildExtension.with_options(use_ninja=True)):
             # 如果目标已存在则先删除
             if os.path.exists(target_path):
                 os.remove(target_path)
-            
+
             # 拷贝文件
             shutil.copyfile(ext_path, target_path)
             print(f"\n[CustomBuildExt] Success: {file_name} -> {target_path}")
@@ -197,7 +201,10 @@ setup(
             "*.so",
             "so/*.so",
             "include/*.h",
-            "model_executor/layers/fused_moe/ep_table.json",
+            "csrc/*.h",
+            "csrc/*.cuh",
+            "csrc/*.cu",
+            "csrc/*.cpp",
         ]
     },
     ext_modules=ext_modules,

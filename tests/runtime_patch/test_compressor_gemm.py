@@ -368,12 +368,16 @@ def test_compressor_nt_pool_sleep_wake(monkeypatch, level, with_draft):
                 return self.draft
 
         runner_cls = load_method(
-            "vllm_hcu/v1/hcu_model_runner_v2.py", "HcuGPUModelRunnerV2", RunnerBase, {},
+            "vllm_hcu/v1/hcu_model_runner_v2.py",
+            "HcuGPUModelRunnerV2",
+            RunnerBase,
+            {"is_deepseek_v4": lambda _: False},
         )
         runner = runner_cls()
         config = SimpleNamespace(model_config=SimpleNamespace(
             enable_nccl_comm_suspend=False,
         ))
+        runner.vllm_config = config
         worker = SimpleNamespace(
             model_runner=runner, vllm_config=config,
             get_draft_model=runner.get_draft_model,

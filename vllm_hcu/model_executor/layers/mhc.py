@@ -8,7 +8,7 @@ from typing import TYPE_CHECKING, Tuple
 
 import torch
 
-from deepgemm import tf32_hc_pernorm_gemm as tf32_hc_prenorm_gemm
+from deepgemm import tf32_hc_prenorm_gemm
 from vllm.platforms import current_platform
 from vllm.utils.import_utils import has_tilelang
 from vllm.utils.math_utils import cdiv

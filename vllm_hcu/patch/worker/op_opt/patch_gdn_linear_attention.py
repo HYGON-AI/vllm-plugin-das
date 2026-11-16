@@ -22,9 +22,11 @@ from ._boltops_fla import make_boltops_gdn_resolver
 from ._gdn_backend import (
     AITER,
     BOLTOPS,
+    TRITON,
     aiter_input_fallback,
     make_provider_selector,
     record_prefill_backend,
+    requested_backend,
 )
 from ._gdn_common import (
     normalize_nn_conv_weight,
@@ -50,6 +52,8 @@ _RECURRENT_WRAPPER = "_vllm_hcu_qwen_gdn_recurrent_wrapper"
 _LOADER_WRAPPER = "_vllm_hcu_qwen_gdn_loader_wrapper"
 _PREFILL_WRAPPER = "_vllm_hcu_qwen_gdn_prefill_backend_wrapper"
 _PREFILL_TARGET = f"{TARGET_MODULE}._resolve_gdn_prefill_backend"
+_PREFILL_LOG_WRAPPER = "_vllm_hcu_qwen_gdn_prefill_log_wrapper"
+_PREFILL_LOG_TARGET = f"{TARGET_MODULE}._log_gdn_backend_decision"
 
 # This is the audited vLLM v0.28.1 AITER launcher contract.  Binding by name is
 # intentional: the old HCU adapter rewrote args[10], which could silently
@@ -158,10 +162,16 @@ def apply_to_module(module: ModuleType) -> bool:
             (qwen, TARGETS[0].rsplit(".", 1)[-1], TARGETS[0], _WRAPPER),
         )
     official_resolver = getattr(qwen, "_resolve_gdn_prefill_backend", None)
+    official_prefill_log = getattr(qwen, "_log_gdn_backend_decision", None)
     if callable(official_resolver):
         wrapped.append(
             (qwen, "_resolve_gdn_prefill_backend", _PREFILL_TARGET,
              _PREFILL_WRAPPER)
+        )
+    if callable(official_prefill_log):
+        wrapped.append(
+            (qwen, "_log_gdn_backend_decision", _PREFILL_LOG_TARGET,
+             _PREFILL_LOG_WRAPPER)
         )
     if already_applied(qwen, _MARKER, wrapped):
         return False
@@ -393,6 +403,35 @@ def apply_to_module(module: ModuleType) -> bool:
             qwen,
             "_resolve_gdn_prefill_backend",
             hcu_resolve_gdn_prefill_backend,
+        )
+    if callable(official_prefill_log):
+
+        @functools.wraps(official_prefill_log)
+        def hcu_log_gdn_backend_decision(
+            vllm_config, requested_backend_name, active_backend
+        ):
+            provider = requested_backend("prefill")
+            if active_backend == TRITON and provider != TRITON:
+                qwen.logger.info_once(
+                    "Using Triton/FLA GDN prefill frontend; HCU provider "
+                    "requested=%s and is resolved per operator at execution.",
+                    provider,
+                )
+                return
+            return official_prefill_log(
+                vllm_config, requested_backend_name, active_backend
+            )
+
+        setattr(hcu_log_gdn_backend_decision, _PREFILL_LOG_WRAPPER, True)
+        setattr(
+            qwen,
+            "_vllm_hcu_original_log_gdn_backend_decision",
+            official_prefill_log,
+        )
+        setattr(
+            qwen,
+            "_log_gdn_backend_decision",
+            hcu_log_gdn_backend_decision,
         )
     setattr(qwen, _MARKER, True)
     return True

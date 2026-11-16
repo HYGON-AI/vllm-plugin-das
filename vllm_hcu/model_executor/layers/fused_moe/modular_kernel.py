@@ -2,6 +2,7 @@
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 # SPDX-FileCopyrightText: Copyright (c) 2026 Hygon Information Technology Co., Ltd.
 # Modified by Hygon Information Technology Co., Ltd., 2026.
+import os
 from abc import ABC, abstractmethod
 from collections.abc import Callable
 from dataclasses import dataclass
@@ -14,6 +15,9 @@ import torch
 import vllm.envs as envs
 import vllm_hcu.platforms.envs as henvs
 from vllm_hcu.model_executor.layers.fused_moe.workspace_growth import get_moe_workspaces
+from vllm_hcu.model_executor.layers.fused_moe.combine_runtime import (
+    suspend_ep_shared_add,
+)
 from vllm.logger import init_logger
 from vllm.model_executor.layers.fused_moe.activation import (
     ApplyMoEActivationConfig,
@@ -42,10 +46,101 @@ from vllm.v1.worker.ubatching import (
     dbo_maybe_run_recv_hook,
     dbo_register_recv_hook,
     dbo_yield,
+    dbo_yield_and_switch_from_comm_to_compute,
+    dbo_yield_and_switch_from_compute_to_comm,
 )
 from vllm.v1.worker.workspace import current_workspace_manager
 
 logger = init_logger(__name__)
+
+# Prefill (>= this many tokens summed over DP ranks; 0 disables): naive DP/EP
+# dispatch -> experts -> combine pipelined over two halves of the source DP
+# ranks.  The all-gather of half 1 runs under the experts of half 0 and the
+# reduce of half 0 under the experts of half 1, all comm on a side stream with
+# grouped NCCL broadcast/reduce. Newer vLLM uses native uniform collectives
+# for equal sizes, so BF16 reduction association and performance may differ;
+# validate numerical tolerance and the complete MoE (including shared overlap).
+# The caller
+# joins the side stream with join_dp_moe_pipe() (after launching a late shared
+# expert, which then overlaps the last reduce).  Not VLLM_HCU_*: eager-only
+# inside the MoE custom op, must not change the compile hash.
+_DP_MOE_PIPE_MIN_TOKENS = (
+    int(os.environ.get("HCU_DP_MOE_PIPE_MIN_TOKENS", "0"))
+    if henvs.custom_ops_enabled() else 0
+)
+_EP_DIRECT_SUM = (
+    int(os.environ.get("HCU_EP_DIRECT_SUM", "0"))
+    if henvs.custom_ops_enabled() else 0
+)
+_DP_PIPE_UNIFORM = henvs.optional_custom_op_enabled(
+    os.environ.get("HCU_DP_MOE_PIPE_UNIFORM", "0") == "1"
+)
+_dp_pipe_stream: torch.cuda.Stream | None = None
+# (side stream, tensors it still reads/writes) until the main stream joins it.
+_dp_pipe_pending: tuple | None = None
+_dp_pipe_announced = False
+_step5_ep_workspace_announced = False
+
+
+def _step5_ep_chunk_provider(experts, hidden_states, w1, w2):
+    """Use the implementation selected by the official runtime dispatcher."""
+    if not henvs.optional_custom_op_enabled(
+        os.environ.get("HCU_STEP5_BOUNDED_EP_WORKSPACE", "0") == "1"
+    ):
+        return None
+    provider = getattr(experts, "_hcu_step5_ep_chunk_size", None)
+    if provider is not None:
+        return provider if getattr(experts, "_hcu_step5_owner", False) else None
+    from vllm.model_executor.layers.fused_moe.experts.triton_deep_gemm_moe import (
+        TritonOrDeepGemmExperts,
+    )
+
+    if type(experts) is TritonOrDeepGemmExperts:
+        selected = experts._select_experts_impl(hidden_states, w1, w2)
+        return (getattr(selected, "_hcu_step5_ep_chunk_size", None)
+                if getattr(selected, "_hcu_step5_owner", False) else None)
+    return None
+
+
+def _step5_ep_private_output(
+    workspace13: torch.Tensor, fused_out: torch.Tensor
+) -> torch.Tensor:
+    """Keep the native EP result alive while GEMM2 reuses scratch storage.
+
+    WorkspaceManager can return disjoint views of one allocation, so compare
+    actual contiguous byte intervals rather than their storage identities.
+    """
+    if (
+        workspace13.device != fused_out.device
+        or workspace13.numel() == 0
+        or fused_out.numel() == 0
+        or not workspace13.is_contiguous()
+        or not fused_out.is_contiguous()
+    ):
+        return fused_out
+    start = workspace13.data_ptr()
+    other = fused_out.data_ptr()
+    if (
+        start < other + fused_out.numel() * fused_out.element_size()
+        and other < start + workspace13.numel() * workspace13.element_size()
+    ):
+        return torch.empty_like(fused_out)
+    return fused_out
+
+
+def join_dp_moe_pipe() -> None:
+    global _dp_pipe_pending
+    if _dp_pipe_pending is not None:
+        torch.cuda.current_stream().wait_stream(_dp_pipe_pending[0])
+        _dp_pipe_pending = None
+
+
+def _nccl_dtype(t: torch.Tensor):
+    from vllm.distributed.device_communicators.pynccl_wrapper import ncclDataTypeEnum
+
+    if t.element_size() == 1:
+        t = t.view(torch.uint8)
+    return ncclDataTypeEnum.from_torch(t.dtype)
 
 #
 # This file defines a set of base classes used to make MoE kernels more modular.
@@ -1074,6 +1169,9 @@ class FusedMoEKernelModularImpl:
         N: int = -1,
         K: int = -1,
     ):
+        from vllm_hcu.runtime_compat.step5 import is_step5_owner
+
+        self._hcu_step5_owner = is_step5_owner(fused_experts.moe_config)
         self.prepare_finalize = prepare_finalize
         self.fused_experts = fused_experts
         self.shared_experts: SharedExperts | None = None
@@ -1136,6 +1234,25 @@ class FusedMoEKernelModularImpl:
             expert_tokens_meta,
             activation,
         )
+
+        if M_chunk < M_full:
+            # The inner EP loop reuses both scratch buffers across chunks.
+            # Its full output must survive every later GEMM1 and GEMM2.
+            workspace13, workspace2, fused_out = (
+                current_workspace_manager().get_simultaneous(
+                    (workspace13_shape, workspace_dtype),
+                    (workspace2_shape, workspace_dtype),
+                    (fused_out_shape, out_dtype),
+                )
+            )
+            global _step5_ep_workspace_announced
+            if not _step5_ep_workspace_announced:
+                _step5_ep_workspace_announced = True
+                print(
+                    f"[step5_ep_workspace] active: full_M={M_full} "
+                    f"chunk_M={M_chunk} separate_output=True", flush=True,
+                )
+            return workspace13, workspace2, fused_out
 
         # We can reuse the memory between cache1 and cache3 because by the
         # time we need cache3, we're done with cache1.
@@ -1332,10 +1449,30 @@ class FusedMoEKernelModularImpl:
         if M_full == 0:
             return torch.empty_like(a1q, dtype=in_dtype)
 
+        M_chunk = M_full
+        private_native_ep_output = False
+        chunk_provider = _step5_ep_chunk_provider(self.fused_experts, a1q, w1, w2)
+        if chunk_provider is not None and not dbo_enabled():
+            from vllm.model_executor.layers.fused_moe.prepare_finalize import naive_dp_ep
+
+            pf = self.prepare_finalize
+            if (
+                type(pf) is naive_dp_ep.MoEPrepareAndFinalizeNaiveDPEPModular
+                and not pf.is_sequence_parallel
+                and pf._lora_context is None
+            ):
+                ep_chunk = chunk_provider(
+                    w1, w2, activation, global_num_experts, expert_map,
+                    top_k, apply_router_weight_on_input,
+                )
+                if ep_chunk is not None:
+                    M_chunk = min(M_full, ep_chunk)
+                    private_native_ep_output = True
+
         workspace13, workspace2, fused_out = self._allocate_buffers(
             in_dtype,
             a1q.device,
-            M_full,
+            M_chunk,
             M_full,
             N,
             K,
@@ -1362,6 +1499,15 @@ class FusedMoEKernelModularImpl:
                 and output_alias.is_contiguous()
             ):
                 fused_out = output_alias
+
+        if getattr(self.prepare_finalize, "_hcu_dbo_private_output", False):
+            # HT yields before combine. Even disjoint views in this step's
+            # shared workspace can be overwritten by the next microbatch.
+            fused_out = torch.empty_like(fused_out)
+        elif private_native_ep_output:
+            # A mixed-size native step needs scratch reuse to avoid a second
+            # M*topk*K allocation instead of this much smaller M*K result.
+            fused_out = _step5_ep_private_output(workspace13, fused_out)
 
         self.fused_experts.apply(
             output=fused_out,
@@ -1460,6 +1606,252 @@ class FusedMoEKernelModularImpl:
 
         return output
 
+    def _dp_pipe_apply(
+        self,
+        hidden_states: torch.Tensor,
+        w1: torch.Tensor,
+        w2: torch.Tensor,
+        topk_ids: torch.Tensor,
+        topk_weights: torch.Tensor,
+        activation: MoEActivation,
+        global_num_experts: int,
+        local_num_experts: int,
+        expert_map: torch.Tensor | None,
+    ) -> torch.Tensor | None:
+        """See _DP_MOE_PIPE_MIN_TOKENS.  None: not applicable, nothing done."""
+        if not henvs.custom_ops_enabled():
+            return None
+        global _dp_pipe_stream, _dp_pipe_pending
+        from vllm.distributed import get_dp_group
+        from vllm.distributed.device_communicators.pynccl_wrapper import (
+            buffer_type,
+            cudaStream_t,
+            ncclRedOpTypeEnum,
+        )
+        from vllm.forward_context import get_forward_context
+        from vllm.model_executor.layers.fused_moe.prepare_finalize import naive_dp_ep
+        from vllm.model_executor.layers.fused_moe.topk_weight_and_reduce import (
+            TopKWeightAndReduceNoOP,
+        )
+
+        pf = self.prepare_finalize
+        fe = self.fused_experts
+        # Microbatched (HCU_DBO_MIN_TOKENS, vllm_hcu.v1.hcu_dbo): one group, its
+        # dispatch and combine on the ubatch comm stream overlapping the other
+        # microbatch's compute instead of this one's.
+        dbo = dbo_enabled()
+        if not (
+            type(pf) is naive_dp_ep.MoEPrepareAndFinalizeNaiveDPEPModular
+            and not pf.is_sequence_parallel
+            and pf._lora_context is None
+            and getattr(fe, "_lora_context", None) is None
+            and fe.activation_format() == FusedMoEActivationFormat.Standard
+            and not fe.expects_unquantized_inputs
+            and isinstance(fe.finalize_weight_and_reduce_impl(), TopKWeightAndReduceNoOP)
+        ):
+            return None
+        dp_meta = get_forward_context().dp_metadata
+        if dp_meta is None:
+            return None
+        sizes = dp_meta.get_chunk_sizes_across_dp_rank()
+        if sizes is None or (not dbo and sum(sizes) < _DP_MOE_PIPE_MIN_TOKENS):
+            return None
+        dp = get_dp_group()
+        comm = getattr(dp.device_communicator, "pynccl_comm", None)
+        if comm is None or comm.disabled or len(sizes) < 2:
+            return None
+        assert sizes[dp.rank_in_group] == hidden_states.shape[0]
+        join_dp_moe_pipe()
+        global _dp_pipe_announced
+        if not _dp_pipe_announced:
+            _dp_pipe_announced = True
+            print(f"[dp_moe_pipe] active: sizes={sizes} dbo={dbo}", flush=True)
+
+        a1q, scales, a1q_scale = naive_dp_ep._quantize_and_setup_dispatch(
+            hidden_states, fe.quant_config
+        )
+        local = [a1q, topk_weights, topk_ids] + (scales or [])
+        W = len(sizes)
+        offs = [0]
+        for n in sizes:
+            offs.append(offs[-1] + n)
+        M = offs[-1]
+        gath = [
+            torch.empty((M,) + t.shape[1:], dtype=t.dtype, device=t.device)
+            for t in local
+        ]
+        if scales:
+            a1q_scale = gath[3]
+        K = hidden_states.shape[1]
+        groups = [range(W)] if dbo else [range(0, W // 2), range(W // 2, W)]
+        # HCU_EP_DIRECT_SUM: spare rows right after moe_out serve as the direct
+        # combine's scratch (see ep_fused_moe.DIRECT_MIN); one half's MoE at a time.
+        S = (
+            max(offs[g[-1] + 1] - offs[g[0]] for g in groups if len(g))
+            if _EP_DIRECT_SUM
+            else 0
+        )
+        if S:
+            from vllm_hcu.model_executor.layers.fused_moe import ep_fused_moe as _ep_mod
+        moe_full = torch.empty((M + S, K), dtype=hidden_states.dtype, device=a1q.device)
+        moe_out = moe_full[:M]
+        result = torch.empty_like(hidden_states)
+
+        nccl, ncomm = comm.nccl, comm.comm
+        sum_op = ncclRedOpTypeEnum.from_torch(torch.distributed.ReduceOp.SUM)
+
+        # The synchronized DP metadata makes this decision identical on peers.
+        # Half-DP pipelines and nonuniform/empty shards retain the grouped path.
+        uniform = (
+            _DP_PIPE_UNIFORM and dbo and len(sizes) == W
+            and sizes[0] > 0 and all(n == sizes[0] for n in sizes)
+        )
+        if uniform and not getattr(self, "_step5_uniform_announced", False):
+            self._step5_uniform_announced = True
+            print(f"[dp_moe_pipe] uniform collectives: sizes={sizes}", flush=True)
+
+        def broadcast(grp, stream) -> None:
+            st = cudaStream_t(stream.cuda_stream)
+            if uniform:
+                assert len(grp) == W and grp[0] == 0 and grp[-1] == W - 1
+                nccl.ncclGroupStart()
+                for src, dst in zip(local, gath):
+                    nccl.ncclAllGather(
+                        buffer_type(src.data_ptr()), buffer_type(dst.data_ptr()),
+                        src.numel(), _nccl_dtype(src), ncomm, st,
+                    )
+                nccl.ncclGroupEnd()
+                return
+            nccl.ncclGroupStart()
+            for src, dst in zip(local, gath):
+                for root in grp:
+                    sl = dst[offs[root] : offs[root + 1]]
+                    nccl.ncclBroadcast(
+                        buffer_type(src.data_ptr()),
+                        buffer_type(sl.data_ptr()),
+                        sl.numel(),
+                        _nccl_dtype(src),
+                        root,
+                        ncomm,
+                        st,
+                    )
+            nccl.ncclGroupEnd()
+
+        def experts(grp) -> None:
+            a, b = offs[grp[0]], offs[grp[-1] + 1]
+            if b <= a:
+                return
+            _, _, N, Kw, top_k = fe.moe_problem_size(
+                gath[0][a:b], w1, w2, gath[2][a:b]
+            )
+            if self.N > 0:
+                N, Kw = self.N, self.K
+            workspace13, workspace2, _ = self._allocate_buffers(
+                hidden_states.dtype,
+                a1q.device,
+                b - a,
+                b - a,
+                N,
+                Kw,
+                top_k,
+                global_num_experts,
+                local_num_experts,
+                None,
+                activation,
+            )
+            if S:
+                _ep_mod.direct_scratch = moe_full[M:]
+            # This path owns its NCCL combine and never calls finalize_hook.
+            # Keep the shared result separate for the runner's final add. The
+            # scope is local to this microbatch's compute, not the global hook.
+            with suspend_ep_shared_add():
+                fe.apply(
+                    output=moe_out[a:b],
+                    hidden_states=gath[0][a:b],
+                    w1=w1,
+                    w2=w2,
+                    topk_weights=gath[1][a:b],
+                    topk_ids=gath[2][a:b],
+                    activation=activation,
+                    global_num_experts=global_num_experts,
+                    expert_map=expert_map,
+                    a1q_scale=(
+                        a1q_scale[a:b]
+                        if a1q_scale is not None and a1q_scale.numel() > 1
+                        else a1q_scale
+                    ),
+                    a2_scale=fe.a2_scale,
+                    workspace13=workspace13,
+                    workspace2=workspace2,
+                    expert_tokens_meta=None,
+                    apply_router_weight_on_input=False,
+                )
+            if S:
+                _ep_mod.direct_scratch = None
+
+        def reduce(grp, stream) -> None:
+            st = cudaStream_t(stream.cuda_stream)
+            if uniform:
+                assert len(grp) == W and grp[0] == 0 and grp[-1] == W - 1
+                nccl.ncclReduceScatter(
+                    buffer_type(moe_out.data_ptr()), buffer_type(result.data_ptr()),
+                    result.numel(), _nccl_dtype(result), sum_op, ncomm, st,
+                )
+                return
+            nccl.ncclGroupStart()
+            for root in grp:
+                ch = moe_out[offs[root] : offs[root + 1]]
+                nccl.ncclReduce(
+                    buffer_type(ch.data_ptr()),
+                    buffer_type(result.data_ptr()),
+                    ch.numel(),
+                    _nccl_dtype(ch),
+                    sum_op,
+                    root,
+                    ncomm,
+                    st,
+                )
+            nccl.ncclGroupEnd()
+
+        if dbo:
+            # Every buffer here was allocated on the compute stream, which waits
+            # for the combine before this returns, so none is freed early.
+            dbo_yield_and_switch_from_compute_to_comm()
+            broadcast(groups[0], torch.cuda.current_stream())
+            dbo_yield_and_switch_from_comm_to_compute()
+            experts(groups[0])
+            dbo_yield_and_switch_from_compute_to_comm()
+            reduce(groups[0], torch.cuda.current_stream())
+            dbo_yield_and_switch_from_comm_to_compute()
+            return result
+
+        if _dp_pipe_stream is None:
+            _dp_pipe_stream = torch.cuda.Stream(device=a1q.device)
+        side = _dp_pipe_stream
+        cur = torch.cuda.current_stream()
+        side.wait_stream(cur)
+
+        ag_ev = []
+        for grp in groups:
+            broadcast(grp, side)
+            ev = torch.cuda.Event()
+            ev.record(side)
+            ag_ev.append(ev)
+
+        moe_ev = []
+        for grp, ev in zip(groups, ag_ev):
+            cur.wait_event(ev)
+            experts(grp)
+            ev = torch.cuda.Event()
+            ev.record(cur)
+            moe_ev.append(ev)
+
+        for grp, ev in zip(groups, moe_ev):
+            side.wait_event(ev)
+            reduce(grp, side)
+        _dp_pipe_pending = (side, local, gath, moe_out, result)
+        return result
+
     def apply(
         self,
         hidden_states: torch.Tensor,
@@ -1504,11 +1896,32 @@ class FusedMoEKernelModularImpl:
         Returns:
         - torch.Tensor: The output tensor after applying the MoE layer.
         """
-        output = torch.empty_like(hidden_states)
-
         local_num_experts = w1.shape[0]
         if global_num_experts == -1:
             global_num_experts = local_num_experts
+
+        if (
+            henvs.custom_ops_enabled()
+            and _DP_MOE_PIPE_MIN_TOKENS > 0
+            and self._hcu_step5_owner
+            and quanted_hidden_states is None
+            and not apply_router_weight_on_input
+        ):
+            piped = self._dp_pipe_apply(
+                hidden_states,
+                w1,
+                w2,
+                topk_ids,
+                topk_weights,
+                activation,
+                global_num_experts,
+                local_num_experts,
+                expert_map,
+            )
+            if piped is not None:
+                return piped
+
+        output = torch.empty_like(hidden_states)
 
         a1q, a1q_scale, expert_tokens_meta, topk_ids, topk_weights = self._prepare(
             quanted_hidden_states
