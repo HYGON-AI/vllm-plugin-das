@@ -1905,7 +1905,13 @@ def _install_fake_vllm_torch_utils(
 
 @pytest.mark.parametrize(
     ("arch", "expected"),
-    [("gfx92a", True), ("gfx936", True), ("gfx938", True), ("gfx900", False)],
+    [
+        ("gfx92a", True),
+        ("gfx936", True),
+        ("gfx938", True),
+        ("gfx946", True),
+        ("gfx900", False),
+    ],
 )
 @pytest.mark.parametrize("found", [False, True])
 @pytest.mark.parametrize("rocm", [False, True])
