@@ -41,11 +41,12 @@ class ImagePolicyTests(unittest.TestCase):
 
     def test_only_configured_repository_digest_is_emitted(self):
         for harbor in [self.harbor, 'other-harbor.invalid']:
-            with self.subTest(harbor=harbor):
-                image = harbor + '/jenkins/model_test_env/vllm@' + self.digest
-                code, output = self.guard(image, harbor)
-                self.assertEqual(code, 0)
-                self.assertEqual(output, 'image=' + image + '\n')
+            for repository in ['jenkins/model_test_env/vllm', 'hcu/base_env/vllm']:
+                with self.subTest(harbor=harbor, repository=repository):
+                    image = harbor + '/' + repository + '@' + self.digest
+                    code, output = self.guard(image, harbor)
+                    self.assertEqual(code, 0)
+                    self.assertEqual(output, 'image=' + image + '\n')
 
     def test_absent_whitespace_mutable_foreign_and_malformed_images_refuse(self):
         good = self.repository + '@' + self.digest
@@ -53,6 +54,12 @@ class ImagePolicyTests(unittest.TestCase):
                   self.repository + ':v0.33@' + self.digest,
                   'foreign.invalid/jenkins/model_test_env/vllm@' + self.digest,
                   self.harbor + '/different/vllm@' + self.digest,
+                  self.harbor + '/hcu/base_env/sglang@' + self.digest,
+                  self.harbor + '/hcu/base/dtk@' + self.digest,
+                  self.harbor + '/hcu/base_env/vllm:latest',
+                  self.harbor + '/hcu/base_env/vllm:v0.33@' + self.digest,
+                  self.harbor + '/hcu/base_env/vllm-other@' + self.digest,
+                  'foreign.invalid/hcu/base_env/vllm@' + self.digest,
                   self.repository + '-other@' + self.digest,
                   self.repository + '@sha256:' + 'a' * 63,
                   self.repository + '@sha256:' + 'a' * 65,
