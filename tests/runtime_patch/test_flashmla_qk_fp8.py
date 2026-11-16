@@ -117,7 +117,8 @@ def test_valid_sink_is_applied_after_native_without_changing_lse(adapter, monkey
     assert applied[0][2] is sink
 
 
-def test_frontend_native_sink_is_forwarded_once(adapter, monkeypatch):
+@pytest.mark.parametrize("sink_stride", [1, 2])
+def test_frontend_native_sink_is_forwarded_once(adapter, sink_stride, monkeypatch):
     module, calls = adapter
     _enable(module, monkeypatch)
     interface = sys.modules["flash_mla.flash_mla_interface"]
@@ -128,14 +129,18 @@ def test_frontend_native_sink_is_forwarded_once(adapter, monkeypatch):
         module, "_apply_sink", lambda *args: pytest.fail("native sink applied twice")
     )
     q, kv, indices = _inputs()
-    sink = torch.zeros(64, dtype=torch.float32)
+    sink = torch.arange(64 * sink_stride, dtype=torch.float32)[::sink_stride]
     counts = torch.full((2,), 2048, dtype=torch.int32)
     result = module.flash_mla_sparse_fwd(
         q, kv, indices, 0.1, attn_sink=sink, topk_length=counts
     )
     assert result == ("fp8_out", None, "fp8_lse")
     assert [name for name, _ in calls] == ["native"]
-    assert calls[0][1][-2] is sink
+    native_sink = calls[0][1][-2]
+    assert native_sink.stride(0) == 1
+    torch.testing.assert_close(native_sink, sink)
+    if sink_stride == 1:
+        assert native_sink is sink
     assert calls[0][1][-1] is None
 
 

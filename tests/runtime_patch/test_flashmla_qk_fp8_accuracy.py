@@ -87,11 +87,12 @@ def test_fused_validation_handles_strides_and_mutation(kernels):
 
 @pytest.mark.parametrize("q_len", [5, 768])
 @pytest.mark.parametrize("has_sink", [False, True])
+@pytest.mark.parametrize("kv_len", [2048, 32768])
 def test_graph_capture_uses_bf16_without_host_read(
-    kernels, q_len, has_sink, monkeypatch
+    kernels, q_len, has_sink, kv_len, monkeypatch
 ):
     helper, adapter = kernels
-    q, kv, indices, counts = helper.inputs(q_len, 2048, 64)
+    q, kv, indices, counts = helper.inputs(q_len, kv_len, 64)
     sink = (
         torch.linspace(4, 11, 64, device=q.device, dtype=torch.float32)
         if has_sink
@@ -146,10 +147,14 @@ def test_adaptive_dispatch_output_and_skipped_scan(kernels, shape, monkeypatch):
 
 
 @pytest.mark.parametrize("heads", [64, 128])
-def test_fp8_preserves_attention_sink_and_lse(kernels, heads, monkeypatch):
+@pytest.mark.parametrize("sink_stride", [1, 2])
+def test_fp8_preserves_attention_sink_and_lse(kernels, heads, sink_stride, monkeypatch):
     helper, adapter = kernels
     q, kv, indices, counts = helper.inputs(768, 24576, heads)
-    sink = torch.linspace(4, 11, heads, device="cuda", dtype=torch.float32)
+    sink = torch.full(
+        (heads * sink_stride,), -123.0, device="cuda", dtype=torch.float32
+    )[::sink_stride]
+    sink.copy_(torch.linspace(4, 11, heads, device="cuda", dtype=torch.float32))
     sink[0], sink[1] = float("inf"), -float("inf")
     if adapter._frontend_qk_shape_ok(q, kv, indices, 512) is True:
         monkeypatch.setattr(

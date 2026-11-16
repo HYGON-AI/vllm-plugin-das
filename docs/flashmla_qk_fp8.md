@@ -55,7 +55,7 @@ output_sink = output * sigmoid(LSE - sink)
 
 sink 是 value 为零的虚拟 token，仅增加 softmax 分母，因此该缩放保留 sink 语义。权重用 FP32 计算，输出仍为 BF16；`+inf` sink 强制输出零，`-inf` 保持原输出。返回的 LSE 按原公共接口约定不包含 sink，HY4 后端需要跨 rank 合并时再折入 sink。短计数、非法索引及图捕获继续调用原生 BF16 sink 路径，不重复应用 sink。
 
-sink 要求同设备、FP32、形状 `[h_q]` 且 stride 为正；其他布局交给原公共接口处理。模型调用方不需要新增启动参数。
+sink 要求同设备、FP32、形状 `[h_q]` 且 stride 为正。原生 binding 要求连续 sink，适配仅为非连续的正 stride sink 做一次小拷贝；连续模型参数不拷贝。其他布局交给原公共接口处理。
 
 旧包的原生 QK 路径未初始化 `max_logits`。适配继续保持原有返回约定：直接入口仅返回 `out, lse`，兼容入口返回 `out, None, lse`；现有 MLA 调用方只使用 output/LSE。
 
@@ -74,9 +74,9 @@ sink 要求同设备、FP32、形状 `[h_q]` 且 stride 为正；其他布局交
 
 大 Q 场景耗时降低约40.1%，h128场景降低约10.9%；小 Q 强制 FP8 仍更慢，继续使用 BF16。Profiler 观察到 FP8 QK kernel，未观察到旧框架 sink 缩放 kernel。
 
-该版本通过95项检查：68项 CPU 合约和27项 HCU 测试，包括原生 sink 只应用一次、独立 FP32 参考、无穷边界、真实 HY4 后端、计数/索引回退和 graph capture。随机输入相对 BF16 的输出 L2 差异约3.2%，不能代替整模型精度验证。单 P 的146预热、2920正式对照正在进行，算子收益不作为客户端 TTFT 收益。
+该版本通过102项检查：69项 CPU 合约和33项 HCU 测试，包括原生 sink 只应用一次、独立 FP32 参考、无穷边界、真实 HY4 后端、计数/索引回退、非连续 sink 和满足 FP8 形状条件时的 graph 回退。随机输入相对 BF16 的输出 L2 差异约3.2%，不能代替整模型精度验证。
 
-单 P 参考[部署命令](https://github.com/HYGON-AI/inference-cookbook-das/blob/aa1813de3ccceb3e63c61d2d52cb8119dce075dd/docs/model-deployment/vllm/hy4.md)，在服务启动前加上：
+复现单 P 的 FP8 实验组时，参考[部署命令](https://github.com/HYGON-AI/inference-cookbook-das/blob/aa1813de3ccceb3e63c61d2d52cb8119dce075dd/docs/model-deployment/vllm/hy4.md)，在服务启动前加上：
 
 ```bash
 export FLASH_MLA_DSA_FP8_FLAGS=1
@@ -85,6 +85,20 @@ export VLLM_HCU_SPARSE_MLA_PREFILL_WORKSPACE_DEDUP=1
 ```
 
 BF16 对照只将 `FLASH_MLA_DSA_FP8_QK` 改为 `0`；两组均保留 workspace 去重。每组新起服务，先146、再2920，组内保持同一服务和前缀缓存。使用离线 R16 EPLB、PCP16，输入85K、输出1，单 P 不设置固定 MTP 接受率。
+
+| 2920 条正式测试 | BF16＋去重 | 原生 sink FP8＋去重 |
+|---|---:|---:|
+| 成功 / 失败 | 2920 / 0 | 2920 / 0 |
+| 客户端平均 TTFT（ms） | 1564.66 | 2441.53 |
+| 中位 TTFT（ms） | 1520.48 | 2422.33 |
+| P95 TTFT（ms） | 1903.26 | 3028.84 |
+| P99 TTFT（ms） | 2169.16 | 3392.11 |
+| 完成请求/s | 2.54648 | 2.54455 |
+| 引擎平均 TTFT（ms） | 1467.15 | 2288.53 |
+| 平均 prefill（ms） | 741.01 | 1221.56 |
+| 前缀命中率（%） | 92.91294 | 92.91294 |
+
+本轮原生 FP8 的客户端平均 TTFT 高56.04%。当前高缓存命中的 PCP16 单 P 场景建议关闭 FP8 开关，保留 Draft；大 Q 算子收益不等于服务收益。正式轮 FP8 分流比例未统计，尚未用完整服务 profile 确认退化根因，也未完成整模型精度验证。
 
 ### 旧包测量与通用测试命令
 

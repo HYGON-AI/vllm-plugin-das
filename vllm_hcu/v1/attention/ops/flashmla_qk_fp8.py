@@ -157,6 +157,10 @@ def sparse_prefill_qk_fp8(
             )
         from flash_mla.flash_mla_interface import flash_mla_cuda
 
+        # Native bindings require a contiguous sink. Preserve the adapter's
+        # positive-stride contract without copying ordinary model parameters.
+        if attn_sink is not None and attn_sink.stride(0) != 1:
+            attn_sink = attn_sink.contiguous()
         output, _unused_max, lse = flash_mla_cuda.sparse_prefill_fwd(
             q, kv, indices, sm_scale, d_v, attn_sink, None
         )
