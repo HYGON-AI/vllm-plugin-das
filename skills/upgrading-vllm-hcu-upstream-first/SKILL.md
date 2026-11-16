@@ -191,6 +191,20 @@ update an explicit repository allowlist with executable positive and negative
 guard cases. Keep image configuration, source checks and actual device jobs
 as separate evidence. Registry provenance alone does not qualify the runtime.
 
+If a selected test fails on a missing official Core interface, inspect the
+installed Core payload and the publisher's package index before rebuilding
+an image. Reusing the same archived wheel preserves the defect. Keep the
+original test selected and deliver the required interface through Core.
+
+For images shared by multiple device tiers, inspect embedded code objects in
+each GPU extension and record the actual build targets. A Python-only wheel
+refresh over native libraries for one architecture cannot qualify another.
+After a complete compatible build, rerun installed portable contracts, then
+the actual image's selected native/Graph jobs on each supported architecture.
+Record a locally assembled image separately from a successfully published
+digest and a runtime-qualified image; a pull-only registry token cannot
+publish it. Keep private source artifacts in an authorized private channel.
+
 For three-way repair, resolve the live target Git ref: PR metadata `base.sha`
 can lag the branch. Preserve independent changes and compare interface owners
 when a conflict reveals a newer merged implementation. Check expected head and
