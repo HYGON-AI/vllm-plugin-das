@@ -124,10 +124,6 @@ def _normalise_constructor_kwargs(
         for name in _HCU_BOOLEAN_KWARGS
         if name in kwargs
     }
-    if kwargs.get("moe_backend") == HY4_MEGAMOE_BACKEND:
-        # Keep the upstream FP8 oracle on DeepGEMM and serialize the HY4 kernel choice.
-        updates["hy4_fp8_megamoe"] = True
-        kwargs["moe_backend"] = _DEEP_GEMM_BACKEND
     eplb_payload = kwargs.get("eplb_config")
     if isinstance(eplb_payload, Mapping):
         official_eplb = dict(eplb_payload)
@@ -592,6 +588,8 @@ def apply_to_module(module: ModuleType) -> bool:
     def hcu_create_engine_config(self, *args: Any, **kwargs: Any):
         feature_config = _normalise_existing_engine_args(self)
         config = create_engine_config(self, *args, **kwargs)
+        if get_hcu_config(config).hy4_fp8_megamoe:
+            feature_config = feature_config.with_updates(hy4_fp8_megamoe=True, moe_backend="deep_gemm")
         if feature_config.hy4_fp8_megamoe:
             model = config.model_config
             quant = getattr(model.hf_config, "quantization_config", None)

@@ -30,7 +30,7 @@ _FEATURE_FIELDS = (
     "eplb_static_dispatch_policy",
 )
 _BOOLEAN_FIELDS = _FEATURE_FIELDS[:6]
-HY4_MEGAMOE_BACKEND = "deep_gemm_meag_moe"
+HY4_MEGAMOE_BACKEND = "deep_gemm_mega_moe"
 _SUPPORTED_MOE_BACKENDS = frozenset({"auto", "deep_gemm"})
 _LEGACY_DEEP_GEMM_BACKEND = "dpsk_deep_gemm"
 _DEEP_GEMM_BACKEND = "deep_gemm"

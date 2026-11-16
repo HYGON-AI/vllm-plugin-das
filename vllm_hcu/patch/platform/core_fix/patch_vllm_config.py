@@ -4,6 +4,7 @@
 
 from __future__ import annotations
 
+import copy
 import functools
 import inspect
 import os
@@ -11,7 +12,7 @@ from types import ModuleType
 from typing import Any
 
 from vllm_hcu.deepseek_v4_runtime import is_deepseek_v4, is_dspark_enabled
-from vllm_hcu.patch.config import HcuFeatureConfig, get_hcu_config, set_hcu_config
+from vllm_hcu.patch.config import HY4_MEGAMOE_BACKEND, HcuFeatureConfig, get_hcu_config, set_hcu_config
 
 from ._common import PatchCompatibilityError, apply_once, load_exact_module
 from .patch_compilation_config import bind_hcu_config
@@ -514,6 +515,20 @@ def _validate_dspark_pd_scope(vllm_config: object) -> None:
     )
 
 
+def _resolve_hy4_megamoe_backend(config):
+    kernel = getattr(config, "kernel_config", None)
+    if getattr(kernel, "moe_backend", None) != HY4_MEGAMOE_BACKEND:
+        return
+    if getattr(config.model_config, "architectures", None) != ["HYV4VLForConditionalGeneration"]:
+        return
+    # HY4 uses the DeepGEMM FP8 oracle and replaces the resolved expert kernel.
+    # Other architectures retain vLLM's native MegaMoE selection.
+    config.kernel_config = copy.copy(kernel)
+    config.kernel_config.moe_backend = "deep_gemm"
+    config.additional_config = dict(config.additional_config or {})
+    set_hcu_config(config, moe_backend="deep_gemm", hy4_fp8_megamoe=True)
+
+
 def validate_and_update_hcu_config(vllm_config: object) -> HcuFeatureConfig:
     """Validate cross-config invariants and bind the compilation adapter."""
 
@@ -757,6 +772,7 @@ def apply_to_module(module: ModuleType) -> bool:
 
     @functools.wraps(post_init)
     def hcu_post_init(self):
+        _resolve_hy4_megamoe_backend(self)
         _apply_kimi_k3_source_compilation_defaults(self)
         return post_init(self)
 
