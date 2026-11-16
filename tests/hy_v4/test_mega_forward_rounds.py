@@ -72,3 +72,21 @@ def test_megamoe_rejects_unsupported_features_before_accessing_ep_group(monkeypa
         with pytest.raises(ValueError, match=f"MegaMoE does not support {feature}"):
             install_hy4_mega_kernel(None, None)
         get_group.assert_not_called()
+
+
+@pytest.mark.parametrize("pcp,dp", [(16, 1), (1, 16)])
+def test_megamoe_rejects_round_robin_placement(monkeypatch, pcp, dp):
+    install = _load_megamoe()["install_hy4_mega_kernel"]
+    config = SimpleNamespace(
+        model_config=SimpleNamespace(architectures=["HYV4VLForConditionalGeneration"]),
+        lora_config=None,
+        parallel_config=SimpleNamespace(
+            enable_dbo=False, prefill_context_parallel_size=pcp, data_parallel_size=dp,
+            expert_placement_strategy="round_robin",
+        ),
+    )
+    monkeypatch.setattr("vllm.config.get_current_vllm_config", lambda: config)
+    with patch("vllm.distributed.get_ep_group") as get_group:
+        with pytest.raises(ValueError, match="requires linear expert placement"):
+            install(None, None)
+        get_group.assert_not_called()
