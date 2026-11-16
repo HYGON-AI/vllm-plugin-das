@@ -57,6 +57,11 @@ register_hcu_ci(
     target="tests/hy_v4/test_registration.py",
     est_time=60,
 )
+register_hcu_ci(
+    job="hy4-contract",
+    target="tests/hy_v4/test_mega_forward_rounds.py",
+    est_time=60,
+)
 
 register_hcu_ci(
     job="hy4-contract",
