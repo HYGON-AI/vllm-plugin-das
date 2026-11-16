@@ -263,7 +263,13 @@ generator providers are rejected. This extends the existing activation preflight
 its provider checks still run even when the RMS execution flags are OFF.
 It neither invokes a provider nor proves kernel, Graph or model correctness.
 
-The LightOp RMSNorm path is selected only when all of the following hold:
+Compiled calls delegate to Core's complete RMSNorm IR, including its compiler
+precision policy and fusion across consecutive residual additions. The optional
+LightOp provider is retained for eligible eager execution; this capability does
+not promise a vendor normalization kernel in compiled serving. Direct ordinary
+and mutating-fused custom-op ABIs remain available and independently tested.
+
+The eager LightOp RMSNorm path is selected only when all of the following hold:
 
 - the master and RMSNorm-specific switches are enabled;
 - vLLM batch-invariant mode is disabled;
@@ -278,7 +284,7 @@ All other cases use vLLM's native RMSNorm implementation. `GemmaRMSNorm`,
 `RMSNormGated`, quantized fusion, model patches, and performance claims are out
 of scope for this release.
 
-The optional ordinary and fused RMSNorm paths retain the native IR's rounding
+The optional eager ordinary and fused RMSNorm paths retain eager native IR's rounding
 order: normalize in FP32, cast to the input/weight dtype, then multiply by the
 weight. LightOp computes the unweighted normalization and PyTorch applies the
 weight after that cast. The residual still stores the rounded FP32 sum. This

@@ -1,4 +1,69 @@
-# Native RMSNorm rounding on vLLM 0.33
+# RMSNorm ownership on vLLM 0.33
+
+## Current candidate: Core owns compiled execution
+
+The optional HCU class delegates compiled calls to the complete official
+`RMSNorm.forward_cuda` path. Core's IR lowering and default precision policy own
+fusion across residual chains. Eligible eager calls retain LightOp and its
+existing ordinary/mutating custom-op ABIs. This adds no model-specific route
+and does not disable Graph, prefix caching or compiler precision behavior.
+
+The compiled provider contract is tested with genuine Core and OOT layers,
+BF16/FP16, widths 128/2048/4096, dynamic batches 17/33, ordinary calls, two
+successive residual additions and three changed-input Graph replays per batch.
+Both sides use Core's `VllmBackend` and default arithmetic. Generated Triton
+source and selected IR providers must match. Equal launch configurations must
+be bitwise equal; independently autotuned configurations use the existing
+official dtype tolerance, with residuals and input preservation still exact.
+
+This distinction is supported by a separate Core-vs-Core control: independent
+compilations of identical source select different launch geometries and can
+differ by one low-precision ULP. At 4096x1024 BF16, Core and OOT both select
+reduction blocks 2048 or4096; same-configuration pairs match bitwise. The original
+failed exact comparisons and controls remain preserved. No precision setting
+was changed. Ordinary `torch.compile` without the serving IR passes is a
+different pipeline and is not the compiled serving oracle.
+
+Selected validation on gfx936: 83 portable/cache cases and30 native/Graph cases
+pass without skips. The same frozen Core0.33/Adapter combination runs original
+HumanEval0–31 on Qwen3-1.7B BF16/TP1 with default FULL_AND_PIECEWISE Graphs,
+prefix caching, Triton attention, seed0 and thinking disabled. All32 choices
+and raw sample bytes match the no-Plugin baseline: raw2/32, normalized28/32,
+4285 completion tokens,32 normal stops, no per-task losses. Profiling records
+125 actual compiled RMS GPU events; it does not establish compiled vendor RMS
+coverage. All10 checkpoint assets match original/pre/post dual reads,33312
+physical installed files pass RECORD checks, and the owned API/engine exit.
+
+Strict instruction-format probes fail on this small model and its baseline;
+one concurrent candidate answer also differs. These are retained open gates,
+not claimed as functional acceptance. The current compiled-owner candidate
+still needs8B BF16/INT8, broader models, lifecycle and required remote CI.
+The partial synthetic performance experiment stopped at a cross-configuration
+bitwise comparison and is not a completed serving-performance result.
+No gfx836/gfx938 or full-upgrade acceptance is claimed.
+
+Runtime provenance: Core source `98a09850d56b4ab99a8c9bc4b28d411b72ed5147`,
+Adapter source `60930a785fd1b0a550e292f23ed78ded5fb65400`,
+Plugin wheel SHA256
+`df4ff349106f516137aecb46714d158ddfce16bae0b4c40aa0a4896c66e77907`.
+This is a combined candidate; other source changes in the cohort are not
+transferred to this PR by the scoped RMS tests. Recheck the exact final merged
+head and its compatible Adapter/CI prerequisites.
+
+Reproduce the new composition test in an installed, ABI-matched0.33 stack:
+
+```bash
+HCU_ADAPTER_HOST=vllm VLLM_PLUGINS=hcu_adapter HCU_VLLM033_RMSNORM_LIVE=1 \
+  python -m pytest tests/vllm033/test_rms_norm_hcu.py \
+  tests/vllm033/test_rms_norm_composed_hcu.py -q
+```
+
+Complete requests, responses, scores, controls and seals are retained in
+`publication/mr-r33/qwen3-17b-rms-upstream-pair.json` and the associated evidence
+under `/data/models/gfx836-v033-20261115`. The following results belong to the
+older staged vendor candidate and do not qualify the current compiled route.
+
+## Historical staged vendor experiment
 
 ## Current 0.33.0 acceptance and epsilon follow-up
 

@@ -17,6 +17,7 @@ PLUGIN_SOURCE_ROOT = (
 def run_fake_runtime(
     *,
     residual: bool = False,
+    compiling: bool = False,
     master: str | None = "1",
     child: str = "1",
     hidden_size: int = 256,
@@ -79,6 +80,7 @@ def empty_like(value):
 
 torch = ModuleType("torch")
 torch.Tensor = Tensor
+torch.compiler = SimpleNamespace(is_compiling=lambda: {compiling!r})
 torch.bfloat16 = "bf16"
 torch.empty_like = empty_like
 torch.ones_like = lambda value: Tensor(value.shape, dtype=value.dtype, tag="unit-weight")
@@ -426,3 +428,11 @@ def test_unsupported_rmsnorm_cases_use_vllm_native_path(
         event[0] in {"ordinary-lightop", "fused-lightop"}
         for event in report["events"]
     )
+
+
+@pytest.mark.parametrize("residual", [False, True])
+def test_compiled_rms_delegates_complete_operation_to_core(residual):
+    report = run_fake_runtime(compiling=True, residual=residual)
+    assert report["result"] == "native-result"
+    assert not any(event[0] in {"ordinary-lightop", "fused-lightop"}
+                   for event in report["events"])

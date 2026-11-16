@@ -1,4 +1,4 @@
-"""vLLM 0.33 OOT LightOp implementation of ``RMSNorm``."""
+"""Optional eager LightOp RMSNorm; compiled execution stays with vLLM IR."""
 
 from __future__ import annotations
 
@@ -120,6 +120,11 @@ class HcuRMSNorm(RMSNorm):
         x: torch.Tensor,
         residual: torch.Tensor | None = None,
     ) -> torch.Tensor | tuple[torch.Tensor, torch.Tensor]:
+        # Core owns compiler precision and fusion across residual chains.
+        # Opaque eager vendor ops would force intermediate low-precision stores.
+        if torch.compiler.is_compiling():
+            return super().forward_cuda(x, residual)
+
         if not self._can_use_lightop(x, residual):
             return super().forward_cuda(x, residual)
 
