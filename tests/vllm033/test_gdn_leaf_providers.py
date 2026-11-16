@@ -286,6 +286,32 @@ def test_present_incompatible_provider_is_not_absence(state, monkeypatch):
     assert activation._failure is None
 
 
+@pytest.mark.parametrize("full_chunks_default", [None, True, False])
+def test_boltops_full_chunks_extension_requires_exact_safe_default(
+    state, monkeypatch, full_chunks_default
+):
+    _, modules = providers(monkeypatch)
+    module = modules[gdn.MODULES["hcu-boltops"]]
+    function = module.chunk_fwd_o
+    signature = inspect.signature(function)
+    extended = signature.replace(
+        parameters=[
+            *signature.parameters.values(),
+            inspect.Parameter(
+                "full_chunks",
+                inspect.Parameter.POSITIONAL_OR_KEYWORD,
+                default=full_chunks_default,
+            ),
+        ]
+    )
+    monkeypatch.setattr(function, "__signature__", extended, raising=False)
+    if full_chunks_default is None:
+        assert gdn.resolve("hcu-boltops", "chunk_fwd_o")[2] is function
+    else:
+        with pytest.raises(RuntimeError, match="signature"):
+            gdn.resolve("hcu-boltops", "chunk_fwd_o")
+
+
 @pytest.mark.parametrize(
     "missing", ["boltops", "boltops.fla.gdn", "internal_broken_dependency"]
 )

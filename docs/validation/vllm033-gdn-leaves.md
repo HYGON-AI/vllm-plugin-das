@@ -42,6 +42,12 @@ Missing packages or symbols follow AITER → BoltOPs → official, or
 BoltOPs → official. Missing internal dependencies and incompatible installed
 ABIs are errors. Native execution errors propagate after selection.
 
+BoltOPs chunk-O has two audited exact signatures: the original entry and an
+extended entry with trailing `full_chunks=None`. The latter's default retains
+masked varlen execution and auto-detects only fixed aligned chunks. The Plugin
+does not assert `full_chunks=True`; different defaults or additional parameters
+still refuse before publication.
+
 Adapters retain the official metadata, `[N,H,V,K]` state layout, initial/final
 state, `save_new_value` and output backing. BoltOPs receives explicit
 `null_state_index=0`; AITER decode converts indices ≤0 to -1 without mutating
@@ -80,8 +86,12 @@ evidence rather than being relabeled as device failures.
 legal WY intermediates, real gates, head ratios 4/8 and 4/12, nonaligned varlen,
 initial/final state, padded output backing and three changed-input Graph
 replays. Run each provider selection in a fresh process with
-`HCU_V033_TEST_GDN=1`. It requires at least 1 GiB actually free on the selected
-device and has not yet been executed for this candidate.
+`HCU_V033_TEST_GDN=1`. It requires at least 256 MiB actually free on the selected
+device and enforces a hard 64 MiB Torch allocator cap; the tensor matrix and
+numerical thresholds remain unchanged. It has not yet completed qualification
+for this candidate. Packed decode and sigmoid MTP tests additionally compare
+the official kernels and an independent CPU FP32 recurrence, with NULL state,
+accepted-token metadata and fixed-address changed-input Graph replay.
 
 Installed wheel qualification, native prefill/decode, provider performance,
 applicable hybrid model accuracy/HumanEval32, MTP and serving Graph reachability

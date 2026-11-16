@@ -66,6 +66,13 @@ def resolve(provider, name):
     function = getattr(module, attribute, None)
     if function is None:
         return None
+    if provider == "hcu-boltops" and name == "chunk_fwd_o":
+        # The public full_chunks extension is optional and defaults to None
+        # (fixed aligned auto-detection, varlen masked). Audit BOTH exact ABIs;
+        # never invent the stronger full_chunks=True promise for varlen.
+        names, defaults = contract
+        if tuple(inspect.signature(function).parameters) == names + ("full_chunks",):
+            contract = names + ("full_chunks",), dict(defaults, full_chunks=None)
     require_signature(
         function,
         contract if provider == "hcu-boltops" else contract[1:],
