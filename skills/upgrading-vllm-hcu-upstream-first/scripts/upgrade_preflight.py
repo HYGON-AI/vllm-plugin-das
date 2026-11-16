@@ -58,12 +58,14 @@ def git(root, *args, data=None):
 
 class Repo:
     def __init__(self, root, ref):
-        self.root = Path(git(root, "rev-parse", "--show-toplevel").decode().strip()).resolve()
+        self.root = Path(os.fsdecode(git(root, "rev-parse", "--show-toplevel"))
+                         .removesuffix("\n")).resolve()
         self.sha = git(self.root, "rev-parse", "--verify", "--end-of-options",
                        ref + "^{commit}").decode().strip()
         self.ref = ref
         self.storage_roots = [
-            (self.root / os.fsdecode(git(self.root, "rev-parse", option)).rstrip("\n")).resolve()
+            (self.root / os.fsdecode(git(self.root, "rev-parse", option))
+             .removesuffix("\n")).resolve()
             for option in ("--git-dir", "--git-common-dir")
         ]
         self.files = {}

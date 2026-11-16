@@ -165,6 +165,43 @@ PATCH_ID = "old"
         self.assertNotEqual(run.returncode, 0)
         self.assertFalse(out.exists())
 
+    def test_checkout_root_preserves_trailing_whitespace(self):
+        original = self.plugin
+        for suffix in (" ", "\t", "\n"):
+            with self.subTest(suffix=repr(suffix)):
+                checkout = self.root / ("plugin" + suffix)
+                subprocess.run(["git", "clone", "-q", str(original), str(checkout)], check=True)
+                write(checkout, "unique.py", "value = 1\n")
+                expected_sha = commit(checkout)
+                self.plugin = checkout
+                outside = self.root / ("outside-" + str(ord(suffix)))
+                run = self.invoke(outside)
+                self.assertEqual(run.returncode, 0, run.stderr)
+                source = json.loads((outside / "preflight.json").read_text())["sources"]["plugin"]
+                self.assertEqual(source["root"], str(checkout))
+                self.assertEqual(source["sha"], expected_sha)
+                inside = checkout / "report"
+                run = self.invoke(inside)
+                self.assertNotEqual(run.returncode, 0)
+                self.assertFalse(inside.exists())
+        self.plugin = original
+
+    def test_git_storage_preserves_trailing_newline(self):
+        checkout = self.root / "separate-checkout"
+        storage = self.root / "git-storage\n"
+        subprocess.run(["git", "clone", "-q", "--separate-git-dir", str(storage),
+                        str(self.plugin), str(checkout)], check=True)
+        self.plugin = checkout
+        before = {str(p.relative_to(storage)): p.read_bytes()
+                  for p in storage.rglob("*") if p.is_file()}
+        inside = storage / "report"
+        run = self.invoke(inside)
+        self.assertNotEqual(run.returncode, 0, run.stderr)
+        self.assertFalse(inside.exists())
+        after = {str(p.relative_to(storage)): p.read_bytes()
+                 for p in storage.rglob("*") if p.is_file()}
+        self.assertEqual(before, after)
+
     def test_function_local_helpers_are_not_public_dotted_attributes(self):
         write(self.fork, "vllm/router.py",
               "class Ops:\n    def route(x): return x\n")
