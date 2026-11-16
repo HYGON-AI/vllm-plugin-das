@@ -144,6 +144,16 @@ LBNHC remain unvalidated and are not claimed by this release.
 
 ## RMSNorm eligibility
 
+Provider admission checks the actual four-positional-argument call ABI before
+compile-factor or operator publication. It accepts normal Python signatures and,
+only for uninspectable native builtins, a compatible concrete declaration from
+generated binding documentation, including overloads and optional additions.
+Declarations are parsed without evaluating annotations or defaults. Missing or
+incompatible documentation, uninspectable Python callables, and asynchronous or
+generator providers are rejected. This extends the existing activation preflight;
+its provider checks still run even when the RMS execution flags are OFF.
+It neither invokes a provider nor proves kernel, Graph or model correctness.
+
 The LightOp RMSNorm path is selected only when all of the following hold:
 
 - the master and RMSNorm-specific switches are enabled;
