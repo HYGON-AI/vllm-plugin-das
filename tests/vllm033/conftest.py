@@ -8,19 +8,54 @@ import sys
 
 _OWNERS = {}
 
+# These installed facades deliberately expose the Adapter module itself so
+# historical attribute writes still reach its state. Keep this list exact:
+# another Plugin name or another Adapter module is not a compatibility alias.
+_ADAPTER_ALIASES = {
+    'hcu_vllm_das.dsv41_activation': 'hcu_adapter.dsv41_activation',
+    'hcu_vllm_das.ct_w4a8_activation': 'hcu_adapter.ct_w4a8_registration',
+    'hcu_vllm_das.dsv41_dspark_registration': 'hcu_adapter.dsv41_dspark_registration',
+    'hcu_vllm_das.quantization.dsv41_channel_fp8': 'hcu_adapter.dsv41_channel_fp8',
+    'hcu_vllm_das.quantization.dsv41_int8_linear': 'hcu_adapter.dsv41_int8_linear',
+}
 
-def _verify_installed_modules():
+
+def _owned_adapter_alias(name, module, modules):
+    target = _ADAPTER_ALIASES.get(name)
+    if target is None or module is not modules.get(target):
+        return False
+    if getattr(module, '__name__', None) != target:
+        return False
+    plugin = modules.get('hcu_vllm_das')
+    adapter = modules.get('hcu_adapter')
+    if not getattr(plugin, '__file__', None) or not getattr(adapter, '__file__', None):
+        return False
+    facade = Path(plugin.__file__).resolve().parent.joinpath(*name.split('.')[1:]).with_suffix('.py')
+    destination = Path(adapter.__file__).resolve().parent.joinpath(*target.split('.')[1:]).with_suffix('.py')
+    return (facade in _OWNERS.get('hcu_vllm_das', ())
+            and destination in _OWNERS.get('hcu_adapter', ())
+            and bool(getattr(module, '__file__', None))
+            and Path(module.__file__).resolve() == destination)
+
+
+def _verify_installed_modules(modules=None):
+    modules = sys.modules if modules is None else modules
     for prefix, owned in _OWNERS.items():
-        if prefix not in sys.modules:
+        if prefix not in modules:
             raise RuntimeError(prefix + ' is not owned by the installed distribution')
-        for name, module in tuple(sys.modules.items()):
+        for name, module in tuple(modules.items()):
             if name != prefix and not name.startswith(prefix + '.'):
                 continue
             origin = getattr(module, '__file__', None)
+            if name in _ADAPTER_ALIASES:
+                if _owned_adapter_alias(name, module, modules):
+                    continue
+                raise RuntimeError(name + ' is not owned by the installed distribution: ' + str(origin))
             if origin is None and name != prefix:
                 continue  # Some Core dispatcher/namespace modules have no file.
-            if not origin or Path(origin).resolve() not in owned:
-                raise RuntimeError(name + ' is not owned by the installed distribution: ' + str(origin))
+            if origin and Path(origin).resolve() in owned:
+                continue
+            raise RuntimeError(name + ' is not owned by the installed distribution: ' + str(origin))
 
 
 def pytest_sessionstart(session):
