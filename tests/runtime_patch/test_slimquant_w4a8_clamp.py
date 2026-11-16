@@ -26,6 +26,11 @@ from vllm_hcu.model_executor.layers.quantization import (
 
 @pytest.fixture
 def cpu_ops(monkeypatch):
+    # The CPU-only Triton placeholder omits the dtype tags passed to our GEMM double.
+    for name in ("bfloat16", "float16", "float32"):
+        if not hasattr(triton_moe.tl, name):
+            monkeypatch.setattr(triton_moe.tl, name, object(), raising=False)
+
     quantized = []
     gemms = []
 
