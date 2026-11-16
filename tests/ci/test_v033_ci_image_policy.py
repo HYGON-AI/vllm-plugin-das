@@ -85,8 +85,8 @@ class ImagePolicyTests(unittest.TestCase):
                 self.assertEqual(output, '')
 
     def test_registry_variable_is_wired_and_pull_credentials_are_device_only(self):
-        self.assertIn('HARBOR_SITE: ${{ vars.HARBOR_SITE }}', self.resolver)
-        self.assertIn('HCU_CI_IMAGE_V033: ${{ vars.HCU_CI_IMAGE_V033 }}', self.resolver)
+        self.assertIn('HARBOR_SITE: ${{ vars.HARBOR_SITE', self.resolver)
+        self.assertIn('HCU_CI_IMAGE_V033: ${{ vars.HCU_CI_IMAGE_V033', self.resolver)
         device = job_block(self.source, 'v033-device-gfx936')
         container = device.split('    container:\n', 1)[1].split('    steps:\n', 1)[0]
         self.assertIn('image: ${{ needs.resolve-device-image.outputs.image }}', container)
@@ -105,6 +105,42 @@ class ImagePolicyTests(unittest.TestCase):
                                   'needs: [select, authorize-device']:
                     self.assertNotIn(forbidden, block)
         self.assertIn('needs: select\n', job_block(self.source, 'v033-source-contract'))
+
+    def configured_value(self, name, value):
+        # Evaluate only the two documented GitHub configuration-variable
+        # defaults, then execute the real shell guard. No registry is contacted.
+        pattern = re.escape(name) + r": \$\{\{ vars\." + re.escape(name)
+        match = re.search(pattern + r" \|\| '([^']+)' \}\}", self.resolver)
+        self.assertIsNotNone(match, 'fork PRs do not receive repository variables')
+        return value or match.group(1)
+
+    def test_fork_without_variables_uses_the_published_v033_digest(self):
+        harbor = self.configured_value('HARBOR_SITE', '')
+        image = self.configured_value('HCU_CI_IMAGE_V033', '')
+        self.assertEqual(harbor, '10.16.1.152:5000')
+        self.assertRegex(image, r'^' + re.escape(harbor)
+                         + r'/hcu/base_env/vllm@sha256:[0-9a-f]{64}$')
+        code, output = self.guard(image, harbor)
+        self.assertEqual(code, 0)
+        self.assertEqual(output, 'image=' + image + '\n')
+
+    def test_explicit_configuration_overrides_defaults_and_invalid_values_refuse(self):
+        harbor = self.configured_value('HARBOR_SITE', self.harbor)
+        image = self.configured_value('HCU_CI_IMAGE_V033', self.repository + '@' + self.digest)
+        code, output = self.guard(image, harbor)
+        self.assertEqual(code, 0)
+        self.assertEqual(output, 'image=' + image + '\n')
+        for bad in [' ', self.repository + ':latest', 'foreign.invalid/vllm@' + self.digest]:
+            with self.subTest(image=bad):
+                image = self.configured_value('HCU_CI_IMAGE_V033', bad)
+                code, output = self.guard(image, harbor)
+                self.assertNotEqual(code, 0)
+                self.assertEqual(output, '')
+        # Overriding only the host must not repin the known image onto it.
+        image = self.configured_value('HCU_CI_IMAGE_V033', '')
+        code, output = self.guard(image, harbor)
+        self.assertNotEqual(code, 0)
+        self.assertEqual(output, '')
 
     def test_pr_code_jobs_do_not_persist_checkout_credentials(self):
         for name in ['select', 'v033-source-contract', 'v033-device-gfx936', 'v033-device-gfx938']:
