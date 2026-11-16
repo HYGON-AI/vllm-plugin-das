@@ -31,3 +31,20 @@ GPU resources were released on 2026-11-13. No consumer, producer or GPU test may
 Historical launcher, ELF symbol and trace evidence strongly identify the reference GEMM as DeepGEMM HIPC with an internal Marlin kernel. The candidate MODE1006 is not established as the historical configuration. Current source places weighted gather after second-GEMM BF16 output; the Bolt path weights before its final BF16 store, so numerical ordering remains a comparison boundary. Historical runtime maps were not captured.
 
 The subsequent executable HIPC backend, real-expert module checks and new weight contract are documented in [minimax31_hipc_backend.md](minimax31_hipc_backend.md).
+
+## Process lifecycle review (2026-11-16)
+
+MiniMax quantization and PCP extension admission checks process identity before
+acquiring any inherited locks. Active or failed publication state is refused in
+fork children; a clean child gets its own lock. Use spawn for active extensions.
+The experimental Kimi preload owner follows the same rule. It requires the
+optional companion Adapter Kimi preload bridge and refuses clearly before any
+publication when that dependency is absent; the MiniMax Adapter branch does not
+provide Kimi preload support. Its registry unit test supplies an explicit bridge
+double, and is not evidence of real preload integration.
+
+The PCP producer supervisor watches all child sentinels after READY, rather than
+joining the first live rank indefinitely. Any unrequested rank exit is an error.
+Shutdown terminates all started workers, waits for a bounded grace period, kills
+unresponsive workers and joins them. CPU tests use real spawn children, including
+a later-rank failure and a child that ignores SIGTERM.

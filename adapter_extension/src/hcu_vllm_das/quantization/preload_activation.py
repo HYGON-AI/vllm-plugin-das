@@ -15,6 +15,19 @@ CAPABILITY = "kimi31-slimquant-preload-experimental"
 _lock=RLock()
 _publication=None
 _failure=None
+_pid = os.getpid()
+
+
+def _check_process():
+    global _pid, _lock
+    pid = os.getpid()
+    if pid != _pid:
+        # Check before entering locks inherited from arbitrary parent threads.
+        _lock = RLock()
+        if _publication is not None or _failure is not None:
+            _fatal("extension process state inherited across fork; use spawn")
+        _pid = pid
+
 
 
 def _fatal(reason, error=None):
@@ -34,6 +47,7 @@ def _owned(pub):
 
 
 def check_health():
+    _check_process()
     with _lock:
         if _failure is not None: _fatal(_failure)
         if _publication is None: raise RuntimeError("K3.1 SlimQuant candidate was not activated")
@@ -42,6 +56,7 @@ def check_health():
 
 def activate(context):
     global _publication
+    _check_process()
     with _lock:
         if _failure is not None: _fatal(_failure)
         if _publication is not None:
@@ -52,7 +67,14 @@ def activate(context):
         v=Version(context.vllm_version or "0")
         if v.epoch != 0 or v.release[:2] != (0,33):
             raise RuntimeError("K3.1 SlimQuant candidate requires vLLM 0.33")
-        from hcu_adapter.bridges.vllm_kimi31_preload import selected_mode, require_healthy
+        try:
+            from hcu_adapter.bridges.vllm_kimi31_preload import selected_mode, require_healthy
+        except ModuleNotFoundError as error:
+            if error.name != "hcu_adapter.bridges.vllm_kimi31_preload":
+                raise
+            raise RuntimeError(
+                "K3.1 preload requires the optional Kimi preload bridge in the companion adapter"
+            ) from error
         if selected_mode() != "nvidia-load-only":
             raise RuntimeError("K3.1 SlimQuant candidate requires nvidia-load-only")
         require_healthy()

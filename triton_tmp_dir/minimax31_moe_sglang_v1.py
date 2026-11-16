@@ -190,6 +190,7 @@ class AlignedMoE:
                         else expert_factory(weights))
         self.physical_experts = self.experts.e * 8
         self.device = self.experts.device
+        self.stream = torch.cuda.current_stream(self.device).cuda_stream
         self._fallback_quant = per_token_quant_int8
         self._wide_quant = _wide_int8
         if self.experts.h == 6144 and self._wide_quant is None:
@@ -221,11 +222,13 @@ class AlignedMoE:
 
     @torch.no_grad()
     def __call__(self, hidden, ids, route_weights, *, expert_weights=None):
-        if self.closed:
-            raise RuntimeError('MoE buffer has been closed')
         if not self._lock.acquire(blocking=False):
             raise RuntimeError('AlignedMoE owns one non-reentrant DeepEP buffer')
         try:
+            if self.closed:
+                raise RuntimeError('MoE buffer has been closed')
+            if torch.cuda.current_stream(self.device).cuda_stream != self.stream:
+                raise RuntimeError('MoE buffer cannot be shared across CUDA streams')
             if expert_weights is not None:
                 self.experts.bind_weights(expert_weights)
             return self._run(hidden, ids, route_weights)
@@ -247,36 +250,49 @@ class AlignedMoE:
             guard = self._guard[:blocks]
             _route_guard[(blocks,)](ids, route_weights, guard, ids.numel(), self.physical_experts, 1024)
             torch._assert_async(guard.all(), 'invalid physical Top4 or nonzero padding weight')
-        shared = None
-        if self.shared_fn:
-            self.shared_stream.wait_stream(torch.cuda.current_stream(self.device))
-            with torch.cuda.stream(self.shared_stream):
-                shared = self.shared_fn(hidden)
+        shared_pending = False
+        try:
+            shared = None
+            if self.shared_fn:
+                self.shared_stream.wait_stream(torch.cuda.current_stream(self.device))
                 hidden.record_stream(self.shared_stream)
-        quantized = self.quant(hidden)
-        nr, nrdma, ne, mask, event = self.buffer.get_dispatch_layout(ids, self.physical_experts,
-                                                                   async_finish=False)
-        recv, rid, rw, counts, handle, event = self.buffer.dispatch(
-            quantized, topk_idx=ids, topk_weights=route_weights,
-            num_tokens_per_rank=nr, num_tokens_per_rdma_rank=nrdma,
-            is_token_in_rank=mask, num_tokens_per_expert=ne,
-            expert_alignment=256, config=self.dispatch_config, async_finish=False)
-        self.last_dispatch = {'aligned_counts': tuple(counts), 'recv_rows': rid.shape[0]}
-        if not isinstance(recv, tuple) or len(recv) != 2:
-            raise RuntimeError('unverified DeepEP INT8 tuple receive ABI')
-        local = self.experts(recv[0], recv[1], rid, rw, counts)
-        result, _, event = self.buffer.combine(local, handle, config=self.combine_config,
-                                                async_finish=False)
-        if self.routed_scale != 1.0:
-            result.mul_(self.routed_scale)
-        if shared is not None:
-            torch.cuda.current_stream(self.device).wait_stream(self.shared_stream)
-            shared.record_stream(torch.cuda.current_stream(self.device))
-            result.add_(shared)
-        return result
+                shared_pending = True
+                with torch.cuda.stream(self.shared_stream):
+                    shared = self.shared_fn(hidden)
+            quantized = self.quant(hidden)
+            nr, nrdma, ne, mask, event = self.buffer.get_dispatch_layout(ids, self.physical_experts,
+                                                                       async_finish=False)
+            recv, rid, rw, counts, handle, event = self.buffer.dispatch(
+                quantized, topk_idx=ids, topk_weights=route_weights,
+                num_tokens_per_rank=nr, num_tokens_per_rdma_rank=nrdma,
+                is_token_in_rank=mask, num_tokens_per_expert=ne,
+                expert_alignment=256, config=self.dispatch_config, async_finish=False)
+            self.last_dispatch = {'aligned_counts': tuple(counts), 'recv_rows': rid.shape[0]}
+            if not isinstance(recv, tuple) or len(recv) != 2:
+                raise RuntimeError('unverified DeepEP INT8 tuple receive ABI')
+            local = self.experts(recv[0], recv[1], rid, rw, counts)
+            result, _, event = self.buffer.combine(local, handle, config=self.combine_config,
+                                                    async_finish=False)
+            if self.routed_scale != 1.0:
+                result.mul_(self.routed_scale)
+            if shared is not None:
+                torch.cuda.current_stream(self.device).wait_stream(self.shared_stream)
+                shared_pending = False
+                shared.record_stream(torch.cuda.current_stream(self.device))
+                result.add_(shared)
+            return result
+        finally:
+            # Join outstanding shared work on both callback and routed failures.
+            if shared_pending:
+                torch.cuda.current_stream(self.device).wait_stream(self.shared_stream)
 
     def close(self):
-        if not self.closed:
-            torch.cuda.synchronize(self.device)
-            self.buffer.destroy()
-            self.closed = True
+        if not self._lock.acquire(blocking=False):
+            raise RuntimeError('cannot close inflight MoE buffer')
+        try:
+            if not self.closed:
+                torch.cuda.synchronize(self.device)
+                self.buffer.destroy()
+                self.closed = True
+        finally:
+            self._lock.release()

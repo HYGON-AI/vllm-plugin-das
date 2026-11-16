@@ -14,8 +14,16 @@ def test_requires_explicit_request():
         owner.activate(context())
 
 
-def test_real_public_registration_and_latched_drift(monkeypatch):
-    import hcu_adapter.bridges.vllm_kimi31_preload as bridge
+def test_public_registration_with_preload_bridge_double_and_latched_drift(monkeypatch):
+    # The MiniMax adapter branch does not ship the optional Kimi preload bridge.
+    # Model/quantization registration is real; only this deployment dependency
+    # is supplied as a double, never claimed as actual preload validation.
+    import sys
+    from types import ModuleType
+    bridge = ModuleType("hcu_adapter.bridges.vllm_kimi31_preload")
+    bridge.selected_mode = lambda: "nvidia-load-only"
+    bridge.require_healthy = lambda: None
+    monkeypatch.setitem(sys.modules, bridge.__name__, bridge)
     import vllm.model_executor.layers.quantization as q
     from vllm.model_executor.models.registry import ModelRegistry as registry
     from vllm.platforms import current_platform
@@ -42,3 +50,16 @@ def test_real_public_registration_and_latched_drift(monkeypatch):
         registry.models.pop("HcuKimi31SlimQuantLoadOnlyInner",None)
         monkeypatch.setattr(owner,"_publication",None)
         monkeypatch.setattr(owner,"_failure",None)
+
+
+def test_missing_optional_preload_bridge_refuses_before_publication(monkeypatch):
+    import sys
+    import vllm.model_executor.layers.quantization as q
+    monkeypatch.setitem(sys.modules, "hcu_adapter.bridges.vllm_kimi31_preload", None)
+    monkeypatch.setattr(owner, "_publication", None)
+    monkeypatch.setattr(owner, "_failure", None)
+    with pytest.raises(RuntimeError, match="optional Kimi preload bridge"):
+        owner.activate(context([owner.ENTRY]))
+    assert owner._publication is None
+    assert owner._failure is None
+    assert "slimquant_w4a8" not in q._CUSTOMIZED_METHOD_TO_QUANT_CONFIG

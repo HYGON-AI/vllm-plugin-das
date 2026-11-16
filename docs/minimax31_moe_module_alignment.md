@@ -121,3 +121,21 @@ python -m torch.distributed.run --standalone --nproc-per-node=8   benchmarks/ker
 - `preliminary_segments/` 为首轮探索记录，未使用最终 native 量化配置；最终数字只取顶层及 `sglang_reference_module/`。
 
 基线插件提交为 `4ce0e7de3f4a5a0a24efb28cb836740abe5b70bb`。本次只新增独立模块、独立 benchmark/audit 工具和说明，不注册或切换服务后端。
+
+## Lifecycle review (2026-11-16)
+
+An `AlignedMoE` instance now admits its bound CUDA stream before quantization,
+shared work or DeepEP communication. `close()` takes the same non-reentrant lock
+as calls, so an active call cannot race buffer destruction. Shared inputs are
+recorded on the auxiliary stream before invoking the callback; both callback and
+routed-path exceptions enqueue the shared-stream join before releasing the lock.
+Normal expert math, weight layouts and numerical thresholds are unchanged.
+
+CPU contract tests are in
+`tests/vllm033/test_minimax31_aligned_lifecycle_cpu.py`. On nmz20 in the original
+bench container, an eight-rank synthetic EP8 probe passed the independent integer
+expert reference including BF16 rank partials, normal-output bit equality against
+the pristine branch, shared output/scale composition, injected routed failure and
+recovery, foreign-stream refusal, and inflight-close refusal on all ranks. The
+existing single-GPU oracle and 33792-padded-row workspace reuse also passed.
+These component checks do not certify full-checkpoint model accuracy.

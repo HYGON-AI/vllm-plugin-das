@@ -33,3 +33,11 @@
 
 - BoltOPs：`80c89aa`，实验性 K3.1 量化和 DSA 辅助代码。
 - plugin：`f15c252`，实验性 K3.1 W4A8 TP16 preload 代码和诊断脚本。
+
+## Adapter dependency
+
+The optional activation candidate requires the companion Adapter module
+`hcu_adapter.bridges.vllm_kimi31_preload` with `selected_mode()` and
+`require_healthy()`. The MiniMax squash Adapter branch does not ship that bridge;
+activation there is explicitly refused before registration. A registry unit test
+with a bridge double does not establish real preload support on that branch.

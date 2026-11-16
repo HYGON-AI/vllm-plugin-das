@@ -1,10 +1,7 @@
 """CPU contract tests for the task-isolated new-wheel PCP FP8 cache guard."""
 import json
-import os
-import sys
 from types import SimpleNamespace
 
-os.environ["HCU_MINIMAX_FP8_PCP"] = "1"
 
 import torch
 from hcu_vllm_das.parallel import minimax31_pcp as pcp

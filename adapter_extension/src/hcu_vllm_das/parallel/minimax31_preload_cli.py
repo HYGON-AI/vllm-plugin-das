@@ -3,11 +3,13 @@
 import argparse
 import json
 import multiprocessing
+from multiprocessing.connection import wait
 import os
 from pathlib import Path
 import queue
 import signal
 import sys
+import time
 
 from vllm.engine.arg_utils import EngineArgs
 from vllm.entrypoints.cli.preload import PreloadSubcommand, _HealthState, _start_health_server
@@ -35,6 +37,34 @@ def _worker(rank, config, address, socket_dir, ready_queue):
         "socket_path": daemon._socket_path,
         "static_publication": publication_identity(daemon),
     }))
+
+
+def _wait_for_workers(procs, stopping):
+    # Waiting on the first live daemon would hide another rank's death forever.
+    while not stopping():
+        exited = wait([proc.sentinel for proc in procs], timeout=1)
+        if stopping():
+            return 0
+        if exited:
+            failures = [(proc.name, proc.exitcode) for proc in procs
+                        if proc.sentinel in exited]
+            raise RuntimeError("PCP/EP producer exited after readiness: %s" % failures)
+    return 0
+
+
+def _stop_workers(procs, *, grace_s=5):
+    started = [proc for proc in procs if proc.pid is not None]
+    for proc in started:
+        if proc.is_alive():
+            proc.terminate()
+    deadline = time.monotonic() + grace_s
+    for proc in started:
+        proc.join(timeout=max(0, deadline - time.monotonic()))
+    for proc in started:
+        if proc.is_alive():
+            proc.kill()
+    for proc in started:
+        proc.join(timeout=grace_s)
 
 
 def main(argv=None):
@@ -107,15 +137,11 @@ def main(argv=None):
             json.dump(record,stream,ensure_ascii=False,indent=2);stream.write("\n")
         state.mark_ready()
         print("PCP8 EP8 preload READY: 8 local producers",flush=True)
-        for proc in procs: proc.join()
-        return max((proc.exitcode or 0) for proc in procs)
+        return _wait_for_workers(procs, lambda: stopping)
     finally:
         if server is not None: server.should_exit=True
-        for proc in procs:
-            if proc.is_alive(): proc.terminate()
-        for proc in procs:
-            if proc.pid is not None: proc.join()
-        if thread is not None: thread.join()
+        _stop_workers(procs)
+        if thread is not None: thread.join(timeout=5)
 
 
 if __name__ == "__main__":
