@@ -1,5 +1,6 @@
 """Dummy-input policy only; Core retains profiling and PCP execution."""
 from types import SimpleNamespace as NS
+from hcu_adapter.bridges.vllm_worker import Worker as AdapterWorker
 import pytest
 import vllm.envs as envs
 from hcu_vllm_das.dsv41.worker import HcuDSV41PcpWorker
@@ -23,7 +24,9 @@ def test_dummy_policy_is_scoped_and_preserves_core(monkeypatch, pcp, dp, backend
     worker.vllm_config = NS(parallel_config=worker.parallel_config,
         kernel_config=NS(moe_backend=backend), model_config=NS(hf_config=NS(model_type=model)))
     assert worker.randomize_dummy_inputs is expected
-    assert HcuDSV41PcpWorker.execute_model is Worker.execute_model
+    # Keep the Adapter execution guard when it wraps the Core entry point.
+    assert "execute_model" not in HcuDSV41PcpWorker.__dict__
+    assert HcuDSV41PcpWorker.execute_model is AdapterWorker.execute_model
 
 
 @pytest.mark.parametrize("fail", [False, True])
