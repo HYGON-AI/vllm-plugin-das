@@ -33,6 +33,8 @@ def validate_config(config, moe):
         raise ValueError("V41 MegaMoE currently requires eager execution without DBO")
     if config.speculative_config is not None:
         raise ValueError("V41 PCP MegaMoE does not support speculative decoding")
+    if getattr(getattr(config, "cache_config", None), "swa_bounded_replay", False):
+        raise ValueError("V41 PCP MegaMoE/DeepGEMM does not support SWA bounded replay")
     if p.enable_eplb or moe.num_experts != moe.num_logical_experts:
         raise ValueError("V41 PCP MegaMoE does not support EPLB or redundant experts")
     if not moe.moe_parallel_config.use_deepep_ht_kernels:
