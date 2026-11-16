@@ -615,3 +615,10 @@ register_hcu_ci(
     target="tests/kernels/test_bf16_indexer_gather.py",
     est_time=30,
 )
+
+# Native pointer specialization and >2 GiB compressor/gather cache offsets.
+register_hcu_ci(
+    job="contract-hcu-gfx936",
+    target="tests/kernels/test_deepseek_v4_compressor_kv_offset.py",
+    est_time=180,
+)
