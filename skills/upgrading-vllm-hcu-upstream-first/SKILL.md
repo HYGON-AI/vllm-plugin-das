@@ -227,3 +227,29 @@ The portable script tests use temporary Git repositories:
 python -I -B -m unittest discover \
   -s skills/upgrading-vllm-hcu-upstream-first/scripts -v
 ```
+
+
+Check the actual Core APIs in a prepared image before replacing it with a newer
+dated tag. Compare complete source changes and verify package/layer hashes;
+rebuilding against the same archived wheel cannot supply a missing interface.
+When native, build and dependency inputs are unchanged, exact target Python over
+verified published binaries is only a partial candidate. Preserve its provenance
+and regenerate RECORD; required native, image and device gates remain separate.
+Inspect actual embedded HIP bundle targets in a scratch library copy, not an
+architecture substring in a diagnostic path. DTK llvm-objdump --offloading can
+extract files beside its input. A gfx938-only library cannot qualify gfx936;
+even a compiled dual-target wheel still needs execution on both architectures.
+Keep private Core source/wheels in the original private project or an authorized
+internal publisher; publishing a candidate does not repin consumers or a release.
+
+For optional container credentials, distinguish cross-repository PRs from PRs
+inside a repository that is itself a fork. Compare head/base repository identity
+and event type rather than head.repo.fork. Cover cross-repository and both kinds
+of same-repository PR, push and manual events while retaining secret escaping.
+
+When the public Adapter Worker wraps Core execution with a health guard, Plugin
+inheritance tests must preserve that Adapter method and reject a Plugin override.
+Do not remove the guard to satisfy an outdated direct-Core identity assertion.
+Exercise published and proposed compatible Adapter pairs, then the unchanged
+portable selection. These tests do not qualify guard behavior, device numerics,
+model quality or clean lifecycle. Track exit-time errors even when pytest exits0.
