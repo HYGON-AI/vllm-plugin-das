@@ -100,6 +100,18 @@ receipts, not just a terminal-looking state string. Write final status only
 after the last check, using an atomic snapshot. Preserve consumer failures
 and restart only unexecuted work in new output directories.
 
+After a pause or executor restart, recheck the controller's recorded process
+identity, descendants, listener and output files. A saved `RESOURCE_WAIT` or
+`RUNNING` receipt does not establish that work is still alive. Preserve the
+original receipt and record interruption separately; distinguish no service
+or samples from an interrupted evaluation before starting a new attempt.
+
+Check the interpreters spawned by structural gates too. A parent launched
+with `-I -S` can spawn a normal interpreter whose sitecustomize preloads an
+older Adapter, even with an empty PYTHONPATH and HOSTnone. Use a matching
+installed owner for that child and retain the first failure; do not regenerate
+documentation or relax freshness assertions to hide package-origin drift.
+
 For pipeline parallelism, count workers and distinct GPU trace ranks as
 TP times PP. Hybrid cache projection can preserve globally indexed groups
 whose local layer list is empty: allocate only worker-owned layers and check
