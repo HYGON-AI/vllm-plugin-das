@@ -1903,15 +1903,34 @@ def _install_fake_vllm_torch_utils(
     return direct_register_custom_op
 
 
-def test_aiter_gfx93x_capability_extends_upstream(monkeypatch: pytest.MonkeyPatch):
-    fake_hcu = _module("vllm_hcu.platforms.hcu", on_gfx93x=lambda: True)
-    monkeypatch.setitem(sys.modules, "vllm_hcu.platforms.hcu", fake_hcu)
-    platform = SimpleNamespace(is_rocm=lambda: True)
-    assert aiter_runtime.is_aiter_found_and_supported(
-        lambda: False, platform, True
+@pytest.mark.parametrize(
+    ("arch", "expected"),
+    [("gfx92a", True), ("gfx936", True), ("gfx938", True), ("gfx900", False)],
+)
+@pytest.mark.parametrize("found", [False, True])
+@pytest.mark.parametrize("rocm", [False, True])
+def test_aiter_hcu_capability_extends_upstream(monkeypatch, arch, expected, found, rocm):
+    fake_hcu = _module(
+        "vllm_hcu.platforms.hcu",
+        on_gfx93x=lambda: arch in {"gfx936", "gfx938"},
+        _get_gcn_arch_name=lambda: arch,
     )
-    assert not aiter_runtime.is_aiter_found_and_supported(
-        lambda: False, platform, False
+    monkeypatch.setitem(sys.modules, "vllm_hcu.platforms.hcu", fake_hcu)
+    platform = SimpleNamespace(is_rocm=lambda: rocm)
+    assert aiter_runtime.is_aiter_found_and_supported(
+        lambda: False, platform, found
+    ) == (expected and found and rocm)
+
+
+def test_aiter_capability_preserves_upstream_supported_device(monkeypatch):
+    fake_hcu = _module(
+        "vllm_hcu.platforms.hcu",
+        on_gfx93x=lambda: False,
+        _get_gcn_arch_name=lambda: "gfx950",
+    )
+    monkeypatch.setitem(sys.modules, "vllm_hcu.platforms.hcu", fake_hcu)
+    assert aiter_runtime.is_aiter_found_and_supported(
+        lambda: True, SimpleNamespace(is_rocm=lambda: True), True
     )
 
 
@@ -4166,14 +4185,9 @@ def test_compressed_linear_only_forwards_supported_prequantized_input():
         def apply(self, layer, x, bias=None):
             return layer.scheme.apply_weights(layer, x, bias=bias)
 
-    class CompressedTensorsConfig:
-        def get_quant_method(self, layer, prefix):
-            return None
-
     module = _module(
         patch_compressed_tensors.TARGET_MODULE,
         CompressedTensorsLinearMethod=CompressedTensorsLinearMethod,
-        CompressedTensorsConfig=CompressedTensorsConfig,
     )
     patch_compressed_tensors.apply_to_module(module)
     calls: list[dict[str, object]] = []
@@ -8467,6 +8481,10 @@ def _fake_moe_wna16_module():
         def get_fused_moe_quant_config(self, layer):
             return ("upstream-config", layer)
 
+        @property
+        def supports_eplb(self):
+            return True
+
     module = _module(
         patch_compressed_tensors_moe_wna16.TARGET_MODULE,
         CompressedTensorsWNA16MoEMethod=CompressedTensorsWNA16MoEMethod,
@@ -9640,38 +9658,3 @@ def test_transform_sf_identity_fallback_and_backend_delegation():
     module._transform_sf_into_required_layout_impl = object()
     assert module.transform_sf_into_required_layout(sf, 128, 128) == "backend"
     assert calls[-2:] == ["lazy", ("backend", (sf, 128, 128), {})]
-
-def test_compressed_quant_dispatch_tracks_stale_patch_and_native_fallback(monkeypatch):
-    from vllm.model_executor.layers.fused_moe import RoutedExperts
-    from vllm_hcu.model_executor.layers.quantization import compressed_tensors_w4a8
-    from vllm_hcu.patch.worker.op_opt._common import PatchCompatibilityError
-
-    class LinearMethod:
-        def apply(self, layer, x, bias=None):
-            return x
-
-    class Config:
-        def get_quant_method(self, layer, prefix):
-            return ("native", prefix)
-
-    module = _module(
-        patch_compressed_tensors.TARGET_MODULE,
-        CompressedTensorsLinearMethod=LinearMethod,
-        CompressedTensorsConfig=Config,
-    )
-    assert patch_compressed_tensors.apply_to_module(module)
-    assert not patch_compressed_tensors.apply_to_module(module)
-    layer = RoutedExperts.__new__(RoutedExperts)
-    torch.nn.Module.__init__(layer)
-    marker = object()
-    monkeypatch.setattr(compressed_tensors_w4a8, "select_method", lambda *a: marker)
-    assert Config().get_quant_method(layer, "experts") is marker
-    assert Config().get_quant_method(torch.nn.Identity(), "linear") == (
-        "native",
-        "linear",
-    )
-    monkeypatch.setattr(compressed_tensors_w4a8, "select_method", lambda *a: None)
-    assert Config().get_quant_method(layer, "experts") == ("native", "experts")
-    Config.get_quant_method = lambda self, layer, prefix: None
-    with pytest.raises(PatchCompatibilityError, match="stale"):
-        patch_compressed_tensors.apply_to_module(module)

@@ -6099,17 +6099,14 @@ def test_deepep_ll_non_hcu_dispatch_signatures_delegate_to_upstream(
     )
 
 
-@pytest.mark.parametrize(
-    ("shared_with_high_throughput", "expected_clean_calls"),
-    [
-        (False, []),
-        (True, [(8, 2048, 1, 128), (8, 2048, 1, 128)]),
-    ],
-)
+@pytest.mark.parametrize("cleanup_accepts_topk", [False, True])
+@pytest.mark.parametrize("topk", [1, 6, 8])
+@pytest.mark.parametrize("shared_with_high_throughput", [False, True])
 def test_deepep_ll_fp8_cleans_only_when_buffer_is_shared_with_high_throughput(
     monkeypatch: pytest.MonkeyPatch,
     shared_with_high_throughput: bool,
-    expected_clean_calls: list[tuple[int, int, int, int]],
+    topk: int,
+    cleanup_accepts_topk: bool,
 ):
     module = _fake_deepep_ll_module()
     module.torch = torch
@@ -6124,11 +6121,15 @@ def test_deepep_ll_fp8_cleans_only_when_buffer_is_shared_with_high_throughput(
     from vllm_hcu.model_executor.layers.fused_moe import deepep_runtime
 
     signature_calls = 0
+    cleanup_signature_calls = 0
     original_signature = deepep_runtime.inspect.signature
 
     def counted_signature(callable_object):
-        nonlocal signature_calls
-        signature_calls += 1
+        nonlocal signature_calls, cleanup_signature_calls
+        if getattr(callable_object, "__func__", None) is Buffer.low_latency_dispatch:
+            signature_calls += 1
+        if getattr(callable_object, "__func__", None) is Buffer.clean_low_latency_buffer:
+            cleanup_signature_calls += 1
         return original_signature(callable_object)
 
     monkeypatch.setattr(deepep_runtime.inspect, "signature", counted_signature)
@@ -6142,9 +6143,10 @@ def test_deepep_ll_fp8_cleans_only_when_buffer_is_shared_with_high_throughput(
             hidden_size,
             num_experts,
             quant_group_size,
+            num_topk=8,
         ):
             calls.setdefault("clean", []).append(
-                (max_tokens, hidden_size, num_experts, quant_group_size)
+                (max_tokens, hidden_size, num_experts, quant_group_size, num_topk)
             )
 
         def low_latency_dispatch(
@@ -6178,6 +6180,15 @@ def test_deepep_ll_fp8_cleans_only_when_buffer_is_shared_with_high_throughput(
             )
             return expert_x, torch.ones(1, dtype=torch.int32), "handle", None, lambda: None
 
+    if not cleanup_accepts_topk:
+
+        def legacy_cleanup(self, max_tokens, hidden_size, num_experts, quant_group_size):
+            calls.setdefault("clean", []).append(
+                (max_tokens, hidden_size, num_experts, quant_group_size)
+            )
+
+        Buffer.clean_low_latency_buffer = legacy_cleanup
+
     instance = cls(Buffer(), 8, 1, use_fp8_dispatch=True)
     instance._vllm_hcu_clean_low_latency_buffer = shared_with_high_throughput
     instance.handles = [None]
@@ -6191,7 +6202,7 @@ def test_deepep_ll_fp8_cleans_only_when_buffer_is_shared_with_high_throughput(
         a2_scale=None,
         a1_gscale=None,
     )
-    topk_weights = torch.ones((1, 1))
+    topk_weights = torch.ones((1, topk))
     from vllm_hcu.platforms import envs as henvs
 
     monkeypatch.setattr(henvs, "VLLM_HCU_USE_CUSTOM_OPS", True)
@@ -6203,7 +6214,7 @@ def test_deepep_ll_fp8_cleans_only_when_buffer_is_shared_with_high_throughput(
     hook, _receiver = instance.prepare_async(
         torch.ones((1, 2048), dtype=torch.bfloat16),
         topk_weights,
-        torch.zeros((1, 1), dtype=torch.int64),
+        torch.zeros((1, topk), dtype=torch.int64),
         1,
         None,
         False,
@@ -6212,7 +6223,7 @@ def test_deepep_ll_fp8_cleans_only_when_buffer_is_shared_with_high_throughput(
     instance.prepare_async(
         torch.ones((1, 2048), dtype=torch.bfloat16),
         topk_weights,
-        torch.zeros((1, 1), dtype=torch.int64),
+        torch.zeros((1, topk), dtype=torch.int64),
         1,
         None,
         False,
@@ -6221,9 +6232,14 @@ def test_deepep_ll_fp8_cleans_only_when_buffer_is_shared_with_high_throughput(
 
     assert callable(hook)
     assert signature_calls == 1
+    assert cleanup_signature_calls == 1
     assert calls["topk_weight"] is topk_weights
     assert calls["quant_type"] == 2
     assert calls["quant_group_size"] == 128
+    expected_clean = (
+        (8, 2048, 1, 128, topk) if cleanup_accepts_topk else (8, 2048, 1, 128)
+    )
+    expected_clean_calls = [expected_clean] * 2 if shared_with_high_throughput else []
     assert calls.get("clean", []) == expected_clean_calls
 
 
@@ -6372,7 +6388,9 @@ def test_moe_runner_and_shared_experts_cold_replacement_contract():
         raise RuntimeError(
             f"VLLM_HCU_TARGET_ROOT does not contain vllm: {target_vllm}"
         )
-    python_path = [str(target_vllm), str(repository)]
+    # A wheel target root can also contain an installed vllm_hcu. Test this
+    # checkout's adapters while still resolving vllm from the requested root.
+    python_path = [str(repository), str(target_vllm)]
     existing = os.environ.get("PYTHONPATH")
     if existing:
         python_path.append(existing)
@@ -6703,6 +6721,39 @@ def test_moe_runner_and_shared_experts_cold_replacement_contract():
         direct_runner.gate = None
         direct_runner._sequence_parallel_context = lambda: runner_module.nullcontext()
         runner_module._int8_allgatherv_enabled = lambda: True
+        # Exercise the CT adapter's real post-load capability propagation
+        # through the production runner, including its modular unwrap path.
+        from vllm_hcu.model_executor.layers.quantization import compressed_tensors_w4a8_runtime as ct_w4a8
+
+        saved_quant_method = direct_runner.routed_experts.quant_method
+        for support in (False, True):
+            delegate = SimpleNamespace(
+                supports_int8_allgatherv_input=support,
+                moe_quant_config=None,
+                moe_kernel=None,
+                process_weights_after_loading=lambda layer: None,
+            )
+            adapter = SimpleNamespace(
+                is_transposed=False,
+                supports_internal_mk=False,
+                _hcu_ct_w4a8_delegate=delegate,
+            )
+            storage = torch.nn.Module()
+            for prefix in ("w13", "w2"):
+                storage.register_parameter(prefix + "_weight_packed", torch.nn.Parameter(
+                    torch.zeros(1, 1, 1, dtype=torch.int32), requires_grad=False,
+                ))
+                storage.register_parameter(prefix + "_weight_scale", torch.nn.Parameter(
+                    torch.ones(1, 1, 1), requires_grad=False,
+                ))
+            ct_w4a8._process_weights_after_loading(adapter, storage)
+            for wrapped in (False, True):
+                direct_runner.routed_experts.quant_method = (
+                    SimpleNamespace(old_quant_method=adapter, supports_internal_mk=False)
+                    if wrapped else adapter
+                )
+                assert direct_runner.do_int8_allgatherv_dispatch is support
+        direct_runner.routed_experts.quant_method = saved_quant_method
         from vllm_hcu.patch.worker.framework_opt import patch_agrs_int8
 
         patch_agrs_int8._quantize_hidden_states = lambda value: (

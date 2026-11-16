@@ -283,7 +283,7 @@ def set_forward_context(
         and not getattr(parallel_config, "_vllm_hcu_deepep_auto", False)
     )
     if (
-        not low_latency
+        (not low_latency or num_tokens_across_dp is not None)
         and (
             parallel_config.data_parallel_size > 1
             or parallel_config.use_sequence_parallel_moe

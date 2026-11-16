@@ -90,6 +90,7 @@ def test_warmup_collective_scope_restores_communicator_on_error(monkeypatch, dis
 
 def test_capture_uses_separate_collectives_only_in_eager_warmup(monkeypatch):
     import vllm.distributed
+    from vllm.config.compilation import CUDAGraphMode
 
     comm = SimpleNamespace(disabled=False)
     monkeypatch.setattr(
@@ -100,10 +101,10 @@ def test_capture_uses_separate_collectives_only_in_eager_warmup(monkeypatch):
     module, _, _ = _make_target_module()
     exec(
         "def capture(self, create_forward_fn, progress_bar_desc='Capturing CUDA graphs'):\n"
-        "    create_forward_fn(4, True)('eager')\n"
+        "    create_forward_fn(4, True)(self.none_mode)\n"
         "    graph = torch.cuda.CUDAGraph()\n"
         "    torch.cuda.graph(graph, self.pool)\n"
-        "    create_forward_fn(4, False)('capture')\n",
+        "    create_forward_fn(4, False)(self.none_mode)\n",
         module.__dict__,
     )
     module.CudaGraphManager.capture = module.capture
@@ -115,8 +116,57 @@ def test_capture_uses_separate_collectives_only_in_eager_warmup(monkeypatch):
         return lambda mode: observed.append((mode, comm.disabled))
 
     assert apply_to_module(module) is True
-    module.CudaGraphManager().capture(factory)
-    assert observed == [("eager", True), ("capture", False)]
+    manager = module.CudaGraphManager()
+    manager.none_mode = CUDAGraphMode.NONE
+    manager.capture(factory)
+    assert observed == [(CUDAGraphMode.NONE, True), (CUDAGraphMode.NONE, False)]
+    assert comm.disabled is False
+
+
+@pytest.mark.parametrize("use_keyword", [False, True])
+def test_piecewise_capture_reuses_warmup_forward_with_communication_enabled(
+    monkeypatch, use_keyword
+):
+    import vllm.distributed
+    from vllm.config.compilation import CUDAGraphMode
+
+    comm = SimpleNamespace(disabled=False)
+    monkeypatch.setattr(
+        vllm.distributed,
+        "get_tp_group",
+        lambda: SimpleNamespace(device_communicator=SimpleNamespace(pynccl_comm=comm)),
+    )
+    module, _, _ = _make_target_module()
+    exec(
+        "def capture(self, create_forward_fn, progress_bar_desc='Capturing CUDA graphs'):\n"
+        "    graph = torch.cuda.CUDAGraph()\n"
+        "    torch.cuda.graph(graph, self.pool)\n"
+        "    forward = create_forward_fn(self.capture_desc, True)\n"
+        "    if self.use_keyword:\n"
+        "        forward(cg_mode=self.none_mode)\n"
+        "        forward(cg_mode=self.piecewise_mode)\n"
+        "    else:\n"
+        "        forward(self.none_mode)\n"
+        "        forward(self.piecewise_mode)\n",
+        module.__dict__,
+    )
+    module.CudaGraphManager.capture = module.capture
+    observed = []
+
+    def factory(desc, warmup):
+        assert warmup is True
+        assert comm.disabled is False
+        return lambda cg_mode: observed.append((cg_mode, comm.disabled))
+
+    assert apply_to_module(module) is True
+    manager = module.CudaGraphManager()
+    manager.capture_desc = SimpleNamespace(cg_mode=CUDAGraphMode.PIECEWISE)
+    manager.none_mode = CUDAGraphMode.NONE
+    manager.piecewise_mode = CUDAGraphMode.PIECEWISE
+    manager.use_keyword = use_keyword
+    manager.capture(factory)
+
+    assert observed == [(CUDAGraphMode.NONE, True), (CUDAGraphMode.PIECEWISE, False)]
     assert comm.disabled is False
 
 

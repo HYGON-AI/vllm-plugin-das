@@ -82,6 +82,21 @@ def apply_to_module(module: ModuleType) -> bool:
     ):
         quant_config = getattr(self, "quant_config", None)
         moe_config = getattr(self, "moe_config", None)
+        if (
+            getattr(quant_config, "use_int4_w4a16", False)
+            and not getattr(quant_config, "_hcu_channel_w4a16", False)
+            and getattr(moe_config, "moe_backend", None) == "aiter"
+        ):
+            from vllm_hcu.model_executor.layers.quantization.grouped_w4a16_moe_runtime import (
+                apply_grouped_w4a16_moe,
+            )
+
+            if apply_grouped_w4a16_moe(
+                self, output, hidden_states, w1, w2, topk_weights, topk_ids,
+                activation, global_num_experts, expert_map, a1q_scale, a2_scale,
+                expert_tokens_meta, apply_router_weight_on_input,
+            ):
+                return None
         is_channel_aiter = bool(
             getattr(quant_config, "use_int4_w4a16", False)
             and getattr(quant_config, "_hcu_channel_w4a16", False)
