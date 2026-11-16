@@ -369,3 +369,15 @@ its actual ABI before activation. Do not change compiler settings or force
 eager to make the comparison pass. Bind vendor behavior to the tested build;
 component repair alone does not prove a HumanEval failure's cause. Retain
 per-task pass-set comparisons and exact-release model gates.
+
+Include two successive residual additions without returning an otherwise
+unused intermediate residual: default compilation can remove its low-precision
+store, whereas an opaque mutating provider or an observation-only output can
+force materialization. Single fused calls can miss the resulting composition
+difference. Cover the legacy mutating ABI independently from a functional layer.
+Measure the actual provider against official compiled IR at relevant shapes;
+a transparent decomposition can add launches and intermediate buffers even
+when component numerics pass. If official IR covers the required behavior,
+consider official ownership of compiled execution and assess eager vendor
+dispatch separately. Revalidate the resulting model path before acceptance.
+
