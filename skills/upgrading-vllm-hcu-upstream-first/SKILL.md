@@ -86,6 +86,15 @@ requiring `nixl_rocm` and compressed Nx5 descriptors. Prefer the target's pinned
 official ROCm build before adding a package shim; verify installed native
 dependencies, gapped GPU READ/WRITE and real model P/D with Graph and prefix.
 
+For DeepGEMM, check the selected public platform's support gate, Core's package
+discovery and the vendor's actual exports separately. A GPU-hidden CPU probe
+cannot establish HCU platform activation; real detection may initialize a device.
+The vendor namespace `deepgemm` does not establish the official `deep_gemm` ABI.
+Inspect runtime exports as well as source, since wildcard/native imports can add
+symbols. Retain scale/layout semantics: do not substitute identity transforms,
+enable an unsupported platform globally or install a different host's bridge
+merely to pass discovery. Qualify each admitted operator and consumer separately.
+
 ## Validate the changed execution path
 
 1. Freeze Core/Adapter/Plugin sources and dependency heads. Check capability
