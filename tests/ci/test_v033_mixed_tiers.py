@@ -71,8 +71,12 @@ class MixedTierContracts(unittest.TestCase):
     def test_device_enables_real_packed_provider_contracts(self):
         self.assertIn('tests/vllm033/test_slimquant_packed_hcu.py',
                       RUNNER.test_files('device'))
-        self.assertEqual(self.run_tier('device').kwargs['env'].get(
-            'HCU_PACKED_LIVE'), '1')
+        # Opt-in belongs to the fresh packed component, not unrelated tests.
+        self.assertIsNone(self.run_tier('device').kwargs['env'].get('HCU_PACKED_LIVE'))
+        component, = [item for item in RUNNER.DEVICE_COMPONENTS
+                      if item[1] == 'tests/vllm033/test_slimquant_packed_hcu.py']
+        self.assertEqual(component[2], 'hcu-slimquant-w4a8')
+        self.assertEqual(component[3]['HCU_PACKED_LIVE'], '1')
 
     def test_installed_tiers_require_record_origin_guard(self):
         for tier in ('portable', 'device'):

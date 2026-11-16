@@ -26,6 +26,12 @@ PUBLIC_SELECTOR_CASES = ('normal', 'optional', 'required', 'commit',
 
 DEVICE_TIERS = ('device', 'device-gfx938')
 
+DEVICE_COMPONENTS = (
+    ('slimquant-packed', 'tests/vllm033/test_slimquant_packed_hcu.py',
+     'hcu-slimquant-w4a8', {'HCU_PACKED_LIVE': '1'}),
+)
+
+
 
 def _has_hcu_contracts(path):
     """Read marker declarations without importing portable test modules."""
@@ -112,6 +118,46 @@ def validate_result(path):
         raise ValueError('empty, skipped/xfail, failed or errored v0.33 tier; not a pass')
 
 
+def run_device_components(files, environment, junit):
+    """Run opted-in native owners in fresh processes before the remaining tier."""
+    remaining = [name for name in files if name not in {item[1] for item in DEVICE_COMPONENTS}]
+    reports = []
+    for label, filename, capability, overrides in DEVICE_COMPONENTS:
+        if filename not in files:
+            continue
+        component_env = dict(environment)
+        required = {item.strip() for item in component_env.get(
+            'HCU_ADAPTER_VLLM_REQUIRED_CAPABILITIES', '').split(',') if item.strip()}
+        required.add(capability)
+        component_env['HCU_ADAPTER_VLLM_REQUIRED_CAPABILITIES'] = ','.join(sorted(required))
+        component_env.update(overrides)
+        report = junit.with_name(junit.stem + '-' + label + junit.suffix)
+        # Prevent an earlier local run from supplying a missing current report.
+        report.unlink(missing_ok=True)
+        result = subprocess.run([sys.executable, '-m', 'pytest', '-q', filename,
+            '-m', 'hcu', '--strict-markers', '--junitxml', str(report),
+            '-o', 'xfail_strict=true', '-o', 'cache_dir=.pytest_cache/v033'],
+            cwd=ROOT, env=component_env)
+        reports.append(report)
+        if result.returncode:
+            return remaining, reports, result.returncode
+        try:
+            validate_result(report)
+        except ValueError:
+            merge_device_reports(junit, reports)
+            raise
+    return remaining, reports, 0
+
+
+def merge_device_reports(destination, reports):
+    """Keep component cases in the workflow's existing uploaded JUnit artifact."""
+    combined = ET.Element('testsuites')
+    for path in reports:
+        root = ET.parse(path).getroot()
+        combined.extend(list(root) if root.tag == 'testsuites' else [root])
+    ET.ElementTree(combined).write(destination, encoding='utf-8', xml_declaration=True)
+
+
 def main():
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument('--tier', choices=('source', 'portable', 'device', 'device-gfx938'), required=True)
@@ -146,7 +192,7 @@ def main():
             environment.update(HCU_ADAPTER_HOST='vllm', VLLM_PLUGINS='hcu_adapter',
                            VLLM033_HCU_TEST='1', HCU_VLLM033_RMSNORM_LIVE='1',
                            HCU_VLLM033_GRAPH_LIVE='1', HCU_VLLM033_AITER_INT8_LIVE='1',
-                           HCU_SLIMQUANT_LIVE='1', HCU_PACKED_LIVE='1')
+                           HCU_SLIMQUANT_LIVE='1')
         installed_version, installed_root = _installed_vllm(environment)
         if _vllm_release(installed_version)[:2] != (0, 33):
             raise ValueError('installed image must provide epoch-zero vLLM 0.33')
@@ -160,11 +206,24 @@ def main():
     # Select actual pytest markers rather than inferring hardware from its name.
     marker_args = [] if args.tier == 'source' else [
         '-m', 'hcu' if args.tier in DEVICE_TIERS else 'not hcu']
-    result = subprocess.run([sys.executable, '-m', 'pytest', '-q', *files, *marker_args,
-        '--strict-markers', '--junitxml', str(args.junit.resolve()),
-        '-o', 'xfail_strict=true', '-o', 'cache_dir=.pytest_cache/v033'], cwd=ROOT, env=environment)
-    if result.returncode:
-        return result.returncode
+    reports = []
+    code = 0
+    if args.tier in DEVICE_TIERS:
+        files, reports, code = run_device_components(files, environment, args.junit.resolve())
+    report = args.junit.resolve()
+    if reports:
+        report = report.with_name(report.stem + '-remaining' + report.suffix)
+    if not code and files:
+        report.unlink(missing_ok=True)
+        result = subprocess.run([sys.executable, '-m', 'pytest', '-q', *files, *marker_args,
+            '--strict-markers', '--junitxml', str(report),
+            '-o', 'xfail_strict=true', '-o', 'cache_dir=.pytest_cache/v033'], cwd=ROOT, env=environment)
+        code = result.returncode
+        reports.append(report)
+    if reports and reports != [args.junit.resolve()]:
+        merge_device_reports(args.junit.resolve(), [p for p in reports if p.exists()] if code else reports)
+    if code:
+        return code
     validate_result(args.junit)
     return 0
 
