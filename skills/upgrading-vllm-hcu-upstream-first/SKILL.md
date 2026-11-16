@@ -52,7 +52,9 @@ Control-flow writes, container mutations and lexical shadowing cannot reuse a
 stale global constant. Unsupported guard arguments remain explicit unresolved
 rows; resolvable symbols still receive contract comparison. Constant starred
 sequences are expanded without executing source. Later target rebinding makes
-the callable unresolved. Inherited `GIT_CONFIG` is cleared so configuration
+the callable unresolved. Wildcard imports invalidate cached targets and callable
+bindings because their exports are unknown without execution.
+Inherited `GIT_CONFIG` is cleared so configuration
 probes and guarded Git operations inspect the same repository settings.
 Uncommitted changes are
 reported but excluded from analysis; commit or separately bind their bytes.

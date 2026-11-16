@@ -253,7 +253,7 @@ def constants(tree):
         # snapshot when an item/attribute of the original has been written.
         objects = {id(values[name]) for name in names if name in values}
         for name in list(values):
-            if name in names or isinstance(values[name], tuple) and id(values[name]) in objects:
+            if "*" in names or name in names or isinstance(values[name], tuple) and id(values[name]) in objects:
                 values.pop(name, None)
 
     values = {}
@@ -289,7 +289,7 @@ def find_function(tree, symbol):
                    and n.name == name]
         if len(matches) != 1:
             return None
-        if any(statement is not matches[0] and name in assigned_names(statement)
+        if any(statement is not matches[0] and assigned_names(statement).intersection({name, "*"})
                for statement in owner.body):
             return None
         owner = matches[0]

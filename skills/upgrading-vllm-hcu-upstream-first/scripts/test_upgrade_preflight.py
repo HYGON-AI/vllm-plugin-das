@@ -97,6 +97,35 @@ PATCH_ID = "old"
         self.assertEqual(result.returncode, 0, result.stderr)
         return json.loads((output / 'preflight.json').read_text())
 
+    def test_wildcard_import_cannot_preserve_an_obsolete_target(self):
+        write(self.plugin, 'vllm_hcu/patch/patch_router.py', '''
+TARGET_MODULE = "vllm.router"
+from dynamic_targets import *
+PATCH_ID = "router"
+''')
+        commit(self.plugin)
+        report = self.report('wildcard-target')
+        self.assertFalse(any(r['target_module'] == 'vllm.router'
+                             for r in report['adapters']))
+        self.assertTrue(any('Unresolved TARGET_MODULE' in w for w in report['warnings']))
+
+    def test_wildcard_import_cannot_preserve_an_obsolete_function(self):
+        write(self.plugin, 'vllm_hcu/patch/patch_router.py', '''
+TARGET_MODULE = "vllm.router"
+PATCH_ID = "router"
+def apply():
+    require_exact_signature(fn, "vllm.router.route", positional=("x",))
+''')
+        commit(self.plugin)
+        write(self.up, 'vllm/router.py',
+              'def route(x): return x\nfrom dynamic_routes import *\n')
+        commit(self.up)
+        report = self.report('wildcard-function')
+        row = next(r for r in report['adapters'] if r['patch_id'] == 'router')
+        self.assertEqual(row['signature_checks'][0]['status'], 'symbol_unresolved')
+        self.assertEqual(row['signature_checks'][0]['contract_comparison']['status'],
+                         'symbol_unresolved')
+
     def test_config_override_cannot_hide_status_filters(self):
         marker = self.root / 'filter-executed'
         write(self.up, '.gitattributes', 'vllm/router.py filter=probe\n')
