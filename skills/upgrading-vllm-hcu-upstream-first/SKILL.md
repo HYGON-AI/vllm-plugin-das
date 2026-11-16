@@ -112,6 +112,15 @@ CustomOp may replace `_forward_method` after platform dispatch, so overriding
 not imply a public registry for its FLA leaves. Keep the official pipeline
 and current prefill/decode configuration semantics; legacy root callbacks or
 deprecated switches do not establish coverage in the production wheel.
+A formal consumer-alias candidate must preflight all selected Core/provider
+ABIs before any publication, retain canonical Core leaves, and reject foreign
+owners, partial publication, reentry and inherited incomplete activation.
+Freeze effective stage policy and prepared fallbacks before model construction;
+include their source identity in official compile factors. Keep Core's official
+backend selector authoritative: a selected whole-op/fused route can bypass the
+leaf aliases, so require execution evidence rather than counting activation as
+coverage. Python guards do not execute inside an already captured device Graph;
+serving health must also cover the host boundary before Graph replay.
 For compiler layout drift, inspect the resolved Triton build and actual layout
 constructor rather than deriving its API from the Torch version. Preserve the
 hardware register mode through layout construction and IR round trips; a
