@@ -3,7 +3,25 @@
 # SPDX-FileCopyrightText: Copyright (c) 2026 Hygon Information Technology Co., Ltd.
 """Optional HCU EP combine ownership for naive DP/EP finalize."""
 
+from contextlib import contextmanager
+from contextvars import ContextVar
+
 _combine_hook = None
+_ep_shared_add_allowed = ContextVar("hcu_ep_shared_add_allowed", default=True)
+
+
+def ep_shared_add_allowed():
+    return _ep_shared_add_allowed.get()
+
+
+@contextmanager
+def suspend_ep_shared_add():
+    """A pipeline that owns combine must leave shared output to its runner."""
+    token = _ep_shared_add_allowed.set(False)
+    try:
+        yield
+    finally:
+        _ep_shared_add_allowed.reset(token)
 
 
 def set_finalize_combine_hook(hook):

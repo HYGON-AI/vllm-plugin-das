@@ -1,7 +1,8 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright (c) 2026 Hygon Information Technology Co., Ltd.
 
-from types import SimpleNamespace
+import sys
+from types import ModuleType, SimpleNamespace
 
 import pytest
 import torch
@@ -209,6 +210,9 @@ def test_kimi_situ_metadata_rejects_invalid_beta(beta):
 
 
 def test_kimi_situ_aiter_call_receives_native_beta_parameters(monkeypatch):
+    aiter_moe = ModuleType("aiter.moe")
+    aiter_moe.MoeQuantType = SimpleNamespace(W4A8=object())
+    monkeypatch.setitem(sys.modules, "aiter.moe", aiter_moe)
     method = _situ_method()
     method.moe_quant_config = SimpleNamespace(
         w1_scale=torch.ones((1, 4, 1)),

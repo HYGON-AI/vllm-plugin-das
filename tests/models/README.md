@@ -13,6 +13,10 @@ Resource resolution:
 CI model/nightly runs should use `--strict-test-resources` so a missing
 checkpoint or dataset fails instead of silently skipping.
 
+All GSM8K configurations evaluate the first 100 samples without shuffling and
+require at least 95% mean accuracy. Prediction, review, and report counts must
+each be exactly 100.
+
 Available local configurations:
 
 - `v0281_gfx938_humaneval16.yaml`: 24 selectable profiles for the 21 local

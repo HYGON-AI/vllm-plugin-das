@@ -7,16 +7,15 @@ set -euo pipefail
 image="${HCU_CI_IMAGE:-}"
 container_name="${HCU_CI_CONTAINER_NAME:-}"
 workspace="${GITHUB_WORKSPACE:-$(pwd)}"
-artifact_root="${HCU_CI_HOST_JOB_ROOT:-}"
 model_root="${HCU_CI_MODEL_ROOT:-${VLLM_HCU_TEST_MODEL_ROOT:-}}"
 dataset_root="${HCU_CI_DATASET_ROOT:-${VLLM_HCU_TEST_DATASET_ROOT:-}}"
+pids_limit="${HCU_CI_PIDS_LIMIT:-8192}"
 
 while [[ $# -gt 0 ]]; do
   case "$1" in
     --image) image="$2"; shift 2 ;;
     --container-name) container_name="$2"; shift 2 ;;
     --workspace) workspace="$2"; shift 2 ;;
-    --artifact-root) artifact_root="$2"; shift 2 ;;
     *) echo "unknown argument: $1" >&2; exit 2 ;;
   esac
 done
@@ -26,8 +25,8 @@ if [[ -z "$image" ]]; then
   image="$("$script_dir/hcu_ci_resolve_image.sh")"
 fi
 
-if [[ -z "$image" || -z "$container_name" || -z "$artifact_root" ]]; then
-  echo "HCU CI image, container name, and host artifact root are required" >&2
+if [[ -z "$image" || -z "$container_name" ]]; then
+  echo "HCU CI image and container name are required" >&2
   exit 2
 fi
 if [[ ! "$container_name" =~ ^[a-zA-Z0-9][a-zA-Z0-9_.-]*$ ]]; then
@@ -41,9 +40,12 @@ if [[ "${HCU_CI_ALLOW_MUTABLE_IMAGE:-0}" != "1" \
   exit 2
 fi
 
+if [[ ! "$pids_limit" =~ ^[1-9][0-9]*$ ]]; then
+  echo "HCU_CI_PIDS_LIMIT must be a positive integer" >&2
+  exit 2
+fi
+
 workspace="$(realpath "$workspace")"
-mkdir -p "$artifact_root"
-artifact_root="$(realpath "$artifact_root")"
 
 if [[ "${HCU_CI_SKIP_PULL:-0}" != "1" && ! "$image" =~ ^sha256:[0-9a-fA-F]{64}$ ]]; then
   docker pull "$image"
@@ -53,14 +55,8 @@ docker rm -f "$container_name" >/dev/null 2>&1 || true
 docker_args=(
   run --detach
   --name "$container_name"
-  --privileged
-  --ipc host
   --shm-size "${HCU_CI_SHM_SIZE:-32g}"
-  --cap-add SYS_PTRACE
-  --security-opt seccomp=unconfined
   --workdir /vllm-plugin-das
-  --volume "$workspace:/vllm-plugin-das"
-  --volume "$artifact_root:/hcu-ci-artifacts"
   --env HOME=/tmp/hcu-ci-home
   --env PYTHONDONTWRITEBYTECODE=1
   --env VLLM_HCU_IS_IN_CI=1
@@ -69,6 +65,23 @@ docker_args=(
   --env TORCHINDUCTOR_CACHE_DIR=/tmp/hcu-ci-torchinductor
   --env XDG_CACHE_HOME=/tmp/hcu-ci-cache
 )
+
+if [[ "${HCU_CI_ISOLATE_GENERATED_CODE:-0}" == "1" ]]; then
+  docker_args+=(
+    # The PID controller counts threads too; eight GPU workers need room for
+    # their driver pools and distributed process-group watchdog threads.
+    --ipc private --cap-drop ALL --security-opt no-new-privileges
+    --pids-limit "$pids_limit"
+    --volume "$workspace:/hcu-ci-source:ro"
+    --env VLLM_HCU_HUMANEVAL_ISOLATED=1
+  )
+else
+  docker_args+=(
+    --privileged --ipc host --cap-add SYS_PTRACE
+    --security-opt seccomp=unconfined
+    --volume "$workspace:/vllm-plugin-das"
+  )
+fi
 
 missing_devices=()
 for device in /dev/kfd /dev/dri; do
@@ -140,15 +153,33 @@ if [[ "${#model_root_hosts[@]}" -gt 0 ]]; then
   )
 fi
 
+dataset_root_hosts=()
+dataset_root_containers=()
+add_dataset_root() {
+  local host_root="$1" container_root="$2" existing
+  [[ -d "$host_root" ]] || return 0
+  host_root="$(realpath "$host_root")"
+  for existing in "${dataset_root_hosts[@]:-}"; do
+    [[ "$existing" == "$host_root" ]] && return 0
+  done
+  dataset_root_hosts+=("$host_root")
+  dataset_root_containers+=("$container_root")
+}
 if [[ -n "$dataset_root" ]]; then
-  dataset_root="$(realpath "$dataset_root")"
-  if [[ ! -d "$dataset_root" ]]; then
-    echo "HCU dataset root does not exist: $dataset_root" >&2
-    exit 2
-  fi
+  [[ -d "$dataset_root" ]] || { echo "HCU dataset root does not exist: $dataset_root" >&2; exit 2; }
+  add_dataset_root "$dataset_root" /datasets
+fi
+add_dataset_root /public/opendas/DL_DATA/ci_datasets /datasets/public
+add_dataset_root /parastor/opendas/DL_DATA/ci_datasets /datasets/parastor
+if [[ "${#dataset_root_hosts[@]}" -gt 0 ]]; then
+  for index in "${!dataset_root_hosts[@]}"; do
+    echo "using HCU dataset root: ${dataset_root_hosts[$index]} -> ${dataset_root_containers[$index]}"
+    docker_args+=(--volume "${dataset_root_hosts[$index]}:${dataset_root_containers[$index]}:ro")
+  done
+  dataset_root_search_path="$(IFS=:; echo "${dataset_root_containers[*]}")"
   docker_args+=(
-    --volume "$dataset_root:/datasets:ro"
-    --env VLLM_HCU_TEST_DATASET_ROOT=/datasets
+    --env "VLLM_HCU_TEST_DATASET_ROOT=${dataset_root_containers[0]}"
+    --env "VLLM_HCU_TEST_DATASET_ROOTS=$dataset_root_search_path"
   )
 fi
 
@@ -167,6 +198,7 @@ for name in \
   HCU_CI_JOB_ID HCU_CI_JOB_ROOT HCU_CI_REGISTRY_JOB HCU_CI_ARCH HCU_CI_CARDS \
   HCU_CI_SUITE HCU_CI_PARTITION_ID HCU_CI_PARTITION_SIZE \
   HCU_CI_PYTEST_ARGS_JSON HCU_CI_REQUIREMENTS_JSON \
+  HCU_CI_GPU_MEMORY_WAIT_TIMEOUT_S HCU_CI_GPU_MEMORY_POLL_INTERVAL_S \
   VLLM_HCU_USE_FLASH_ATTN_UNIFIED VLLM_WORKER_MULTIPROC_METHOD \
   VLLM_HCU_TEST_STRICT_RESOURCES HF_HUB_OFFLINE HF_DATASETS_OFFLINE; do
   if [[ -n "${!name:-}" ]]; then
@@ -177,8 +209,19 @@ done
 docker "${docker_args[@]}" "$image" bash -lc 'while true; do sleep 3600; done'
 docker exec "$container_name" bash -lc '
   set -euo pipefail
+  if [[ "${VLLM_HCU_HUMANEVAL_ISOLATED:-0}" == "1" ]]; then
+    if git -c safe.directory=/hcu-ci-source -C /hcu-ci-source config --local --name-only \
+      --get-regexp "(^http\\..*\\.extraheader$|^credential\\.)" >/dev/null; then
+      echo "isolated evaluation requires checkout with persist-credentials: false" >&2
+      exit 2
+    fi
+    mkdir -p /vllm-plugin-das
+    cp -a --no-preserve=ownership /hcu-ci-source/. /vllm-plugin-das/
+    git -C /vllm-plugin-das config --local --unset-all http.https://github.com/.extraheader || true
+  fi
   ci_home=/tmp/hcu-ci-home
-  mkdir -p "$ci_home" "$TORCHINDUCTOR_CACHE_DIR" "$XDG_CACHE_HOME"
+  # Reports stay container-local; cleanup exports them without another host bind.
+  mkdir -p /hcu-ci-artifacts "$ci_home" "$TORCHINDUCTOR_CACHE_DIR" "$XDG_CACHE_HOME"
   python_bin="$(command -v python3 || true)"
   if [[ -z "$python_bin" ]]; then
     echo "the default python3 is unavailable in HCU CI image" >&2

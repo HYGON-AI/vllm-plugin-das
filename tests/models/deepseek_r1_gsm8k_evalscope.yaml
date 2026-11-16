@@ -35,6 +35,7 @@ evalscope:
   dataset_args:
     gsm8k:
       few_shot_random: false
+      shuffle: false
       metrics_list:
         - Pass@1
   pass_criteria:
@@ -42,4 +43,6 @@ evalscope:
     metric: mean_acc
     display_name: Pass@1
     minimum_score: 0.95
+    num_predictions: 100
+    num_reviews: 100
   no_timestamp: true

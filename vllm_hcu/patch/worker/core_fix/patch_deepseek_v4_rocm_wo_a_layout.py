@@ -7,6 +7,10 @@ from __future__ import annotations
 import functools
 from types import ModuleType, SimpleNamespace
 
+import torch
+
+from vllm_hcu.platforms import envs as henvs
+
 from ._common import (
     PatchCompatibilityError,
     load_exact_module,
@@ -19,6 +23,35 @@ PATCH_ID = "worker.core_fix.deepseek_v4_rocm.wo_a_nn_weight_layout"
 TARGET_SYMBOL = f"{TARGET_MODULE}._get_cached_wo_a_bf16"
 _MARKER = "_vllm_hcu_wo_a_nn_weight_layout_applied"
 _WRAPPER_MARKER = "_vllm_hcu_wo_a_nn_weight_layout_wrapper"
+_CACHE_SHAPE = "_vllm_hcu_wo_a_nn_cache_shape"
+
+
+@torch.inference_mode()
+def refresh_wo_a_bf16_caches(model: torch.nn.Module | None) -> None:
+    """Refresh derived NN weights in place, including graph-referenced storage."""
+    if model is None:
+        return
+    for layer in model.modules():
+        shape = getattr(layer, _CACHE_SHAPE, None)
+        cached = getattr(layer, "_dsv4_wo_a_bf16", None)
+        if shape is None or cached is None:
+            continue
+        weight = layer.weight
+        groups, rank, hidden = shape
+        if (
+            tuple(weight.shape) != (hidden, groups * rank)
+            or tuple(cached.shape) != shape
+            or cached.dtype != torch.bfloat16
+            or cached.device != weight.device
+        ):
+            raise RuntimeError(
+                "reloaded DeepSeek-V4 wo_a weight has incompatible cache layout"
+            )
+        # Do not replace/delete this tensor: a captured graph keeps its address.
+        # Splitting the transposed row dimension is a view; copy_ also handles
+        # parameters replaced by checkpoint post-processing without allocating
+        # a second persistent cache.
+        cached.copy_(weight.T.view(shape))
 
 
 def apply_to_module(module: ModuleType) -> bool:
@@ -59,7 +92,17 @@ def apply_to_module(module: ModuleType) -> bool:
 
         # Quantized wo_a retains upstream storage.  Only the unquantized BF16
         # parameter is transposed by HCU's VLLM_USE_NN linear loader.
-        if hasattr(wo_a, "weight_scale_inv") or tuple(weight.shape) == expected_shape:
+        if hasattr(wo_a, "weight_scale_inv") or hasattr(wo_a, "weight_scale"):
+            return original(wo_a, n_local_groups, o_lora_rank, hidden_dim)
+        # Pro TP4 produces a square [4096, 4096] shard, so physical shape
+        # cannot distinguish NN from NT. Consult the HCU linear loader's
+        # layout contract in that case; quantized and upstream layers retain NT.
+        square_nn = (
+            expected_shape == nn_shape
+            and henvs.VLLM_USE_NN
+            and getattr(wo_a, "is_quantization", None) is False
+        )
+        if tuple(weight.shape) == expected_shape and not square_nn:
             return original(wo_a, n_local_groups, o_lora_rank, hidden_dim)
         if tuple(weight.shape) != nn_shape:
             raise RuntimeError(
@@ -79,6 +122,7 @@ def apply_to_module(module: ModuleType) -> bool:
             hidden_dim,
         )
         wo_a._dsv4_wo_a_bf16 = cached
+        setattr(wo_a, _CACHE_SHAPE, (n_local_groups, o_lora_rank, hidden_dim))
         return cached
 
     setattr(hcu_get_cached_wo_a_bf16, _WRAPPER_MARKER, True)
@@ -92,4 +136,7 @@ def apply(module: ModuleType | None = None) -> bool:
     return apply_to_module(load_exact_module(TARGET_MODULE, module))
 
 
-__all__ = ["PATCH_ID", "TARGET_MODULE", "apply", "apply_to_module"]
+__all__ = [
+    "PATCH_ID", "TARGET_MODULE", "apply", "apply_to_module",
+    "refresh_wo_a_bf16_caches",
+]

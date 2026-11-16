@@ -86,6 +86,9 @@ jobs:
     timeout-minutes: ${{ matrix.timeout_minutes }}
     env:
       HCU_CI_JOB_ID: ${{ matrix.id }}
+      HCU_CI_GPU_MEMORY_WAIT_TIMEOUT_S: ${{ vars.HCU_CI_GPU_MEMORY_WAIT_TIMEOUT_S || '600' }}
+      HCU_CI_GPU_MEMORY_POLL_INTERVAL_S: ${{ vars.HCU_CI_GPU_MEMORY_POLL_INTERVAL_S || '15' }}
+      HCU_CI_ISOLATE_GENERATED_CODE: ${{ matrix.isolate_generated_code && '1' || '0' }}
       HCU_CI_REGISTRY_JOB: ${{ matrix.registry_job }}
       HCU_CI_ARCH: ${{ matrix.arch }}
       HCU_CI_CARDS: ${{ matrix.cards }}
@@ -97,7 +100,6 @@ jobs:
       HCU_CI_IMAGE: ${{ needs.resolve-image.outputs.image }}
       HCU_CI_CONTAINER_NAME: vllm_hcu_${{ github.run_id }}_${{ github.run_attempt }}_${{ matrix.id }}
       HCU_CI_JOB_ROOT: /hcu-ci-artifacts
-      HCU_CI_HOST_JOB_ROOT: /tmp/vllm-hcu-ci/${{ github.run_id }}/${{ github.run_attempt }}/${{ matrix.id }}
       HCU_CI_MODEL_ROOT: ${{ vars.HCU_CI_MODEL_ROOT }}
       HCU_CI_DATASET_ROOT: ${{ vars.HCU_CI_DATASET_ROOT }}
       VLLM_HCU_USE_FLASH_ATTN_UNIFIED: "1"
@@ -183,8 +185,17 @@ jobs:
         uses: actions/checkout@v4
         with:
           ref: ${{ inputs.tested_ref || github.sha }}
+          persist-credentials: false
           clean: true
           fetch-depth: 1
+
+      - name: Prepare HCU artifact upload
+        id: artifacts
+        run: |
+          set -euo pipefail
+          upload_root="$(mktemp -d "$RUNNER_TEMP/hcu-ci-upload.XXXXXX")"
+          echo "HCU_CI_UPLOAD_ROOT=$upload_root" >> "$GITHUB_ENV"
+          echo "path=$upload_root" >> "$GITHUB_OUTPUT"
 
       - name: Diagnose HCU host runtime
         run: |
@@ -200,7 +211,6 @@ jobs:
           --image "$HCU_CI_IMAGE"
           --container-name "$HCU_CI_CONTAINER_NAME"
           --workspace "$GITHUB_WORKSPACE"
-          --artifact-root "$HCU_CI_HOST_JOB_ROOT"
 
       - name: Bootstrap stable Python entry
         run: |
@@ -240,7 +250,7 @@ jobs:
           PY
           '
 
-      - name: Install checked-out plugin without network access
+      - name: Install plugin and selected job dependencies
         run: bash scripts/ci/hcu/hcu_ci_install_dependency.sh
 
       - name: Run preflight and registered test partition
@@ -260,21 +270,35 @@ jobs:
           fi
 
       - name: Upload HCU logs and reports
-        if: always()
+        id: upload
+        if: always() && steps.artifacts.outcome == 'success'
         uses: actions/upload-artifact@v4
         with:
           name: hcu-${{ matrix.id }}-${{ github.run_id }}-${{ github.run_attempt }}
-          path: ${{ env.HCU_CI_HOST_JOB_ROOT }}
+          path: ${{ steps.artifacts.outputs.path }}
           if-no-files-found: warn
           retention-days: 30
 
-      - name: Report local HCU logs and reports
-        if: always()
+      - name: Report uploaded HCU logs and reports
+        if: always() && steps.upload.outputs.artifact-url != ''
+        env:
+          HCU_CI_ARTIFACT_URL: ${{ steps.upload.outputs.artifact-url }}
         run: |
-          echo "HCU logs retained on runner $RUNNER_NAME at $HCU_CI_HOST_JOB_ROOT"
-          {
-            echo "### Local HCU logs"
-            echo
-            echo "- Runner: \`$RUNNER_NAME\`"
-            echo "- Path: \`$HCU_CI_HOST_JOB_ROOT\`"
-          } >> "$GITHUB_STEP_SUMMARY"
+          printf '### HCU logs and reports\n\n[Download artifact](%s)\n' \
+            "$HCU_CI_ARTIFACT_URL" >> "$GITHUB_STEP_SUMMARY"
+
+      - name: Remove uploaded HCU temporary reports
+        if: always() && steps.artifacts.outcome == 'success' && steps.upload.outcome == 'success'
+        run: |
+          set -euo pipefail
+          upload_root="$(realpath "$HCU_CI_UPLOAD_ROOT")"
+          runner_temp="$(realpath "$RUNNER_TEMP")"
+          case "$upload_root" in
+            "$runner_temp"/hcu-ci-upload.*)
+              rm -rf -- "$upload_root"
+              ;;
+            *)
+              echo "Refusing to remove unexpected HCU upload path: $upload_root" >&2
+              exit 2
+              ;;
+          esac

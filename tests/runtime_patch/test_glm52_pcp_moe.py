@@ -334,7 +334,7 @@ def test_shared_and_routed_outputs_keep_local_token_order_before_addition(
     runner._ep_fused_combine = False
     runner.moe_config = SimpleNamespace(hidden_dim_unpadded=2)
     runner.routed_experts = SimpleNamespace(
-        quant_method=SimpleNamespace(has_unpadded_output=False),
+        quant_method=SimpleNamespace(has_unpadded_output=False, moe_kernel=None),
     )
     runner.routed_input_transform = None
     runner.routed_output_transform = None
@@ -365,7 +365,7 @@ def test_shared_and_routed_outputs_keep_local_token_order_before_addition(
     monkeypatch.setattr(
         moe_runner_module.MoERunner,
         "_maybe_reduce_final_output",
-        lambda self, output, _truncate: output,
+        lambda self, output, _truncate, _is_reduced=False: output,
     )
     monkeypatch.setattr(
         moe_runner_module.MoERunner,

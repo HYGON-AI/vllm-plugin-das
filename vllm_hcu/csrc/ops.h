@@ -57,3 +57,11 @@ void concat_and_cache_mla_hcu(torch::Tensor& kv_c, torch::Tensor& k_pe,
 void deepseek_v4_inv_rope(torch::Tensor& rope,
                           torch::Tensor const& position_ids,
                           torch::Tensor const& cos_sin_cache);
+
+// Measured Step5 FP8 choices, built into the normal hcu_ops extension.
+#ifdef VLLM_HCU_BUILD_STEP5_DENSE
+at::Tensor step5_fp8_dense_gemm(const at::Tensor& x, const at::Tensor& xs,
+                              const at::Tensor& w, const at::Tensor& ws,
+                              int64_t algorithm_id, bool allow_initialize);
+std::string step5_fp8_dense_backend_library();
+#endif

@@ -7,6 +7,51 @@ import pytest
 import torch
 
 
+@pytest.mark.parametrize("end", [65535, 65536, 65537, 69632, 1048576])
+def test_spec_schedule_compact_host_pages_match_full_1m_table(monkeypatch, end):
+    """Host compaction must preserve physical slots across page boundaries."""
+    from vllm_hcu.model_executor.layers.step4_dsa import (
+        Step4DSAGeometry,
+        Step4DSAState,
+    )
+
+    monkeypatch.setattr(torch.cuda, "is_available", lambda: False)
+    monkeypatch.setattr(torch.cuda, "is_current_stream_capturing", lambda: False)
+    capacity = 1048576 // 64
+    table = torch.arange(1, 3 * capacity + 1, dtype=torch.int32).reshape(3, capacity)
+    table[2].zero_()
+    qsl = torch.tensor([0, 4, 7, 7], dtype=torch.int32)
+    seq = torch.tensor([end, max(end - 65, 3), 0], dtype=torch.int32)
+    width = (end + 63) // 64
+    results = []
+    for mirror in (table.numpy(), table[:, :width].numpy().copy()):
+        state = Step4DSAState(
+            1, Step4DSAGeometry(), 16, torch.bfloat16,
+            max_num_reqs=3, max_model_len=1048576, spec_query_len=4,
+        )
+        state.regions_per_page = 8
+        md = SimpleNamespace(
+            num_decodes=3, num_decode_tokens=8,
+            query_start_loc_cpu=qsl, query_start_loc=qsl,
+            seq_lens_cpu=seq, block_table=table, block_table_np=mirror,
+        )
+        for row, query_len in enumerate([4, 3]):
+            past = int(seq[row]) - query_len
+            if past % 8:
+                region = past // 8
+                slot = int(table[row, region // 8]) * 8 + region % 8
+                state.pending.acquire(slot)
+        results.append(state._spec_decode_schedule(md))
+    full, compact = results
+    assert vars(full).keys() == vars(compact).keys()
+    for name, expected in vars(full).items():
+        actual = getattr(compact, name)
+        if isinstance(expected, torch.Tensor):
+            assert torch.equal(actual, expected), name
+        else:
+            assert actual == expected, name
+
+
 def test_disabled_spec_indexer_uses_full_batch_baseline(monkeypatch):
     from vllm_hcu.model_executor.layers import step4_dsa as dsa
 

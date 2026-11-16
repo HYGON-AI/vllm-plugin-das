@@ -21,6 +21,7 @@ from vllm import logger as vllm_logger
 
 from vllm_hcu.model_executor.layers.quantization import lightop_fp8_runtime
 from vllm_hcu.ops import test_concat
+from vllm_hcu.platforms import envs as henvs
 
 REPO = Path(__file__).resolve().parents[2]
 
@@ -657,6 +658,7 @@ def test_silu_and_mul_rejects_same_named_legacy_operator_when_category_missing(
 
 def _deep_apply_namespace(logger: _WarningLogger) -> dict[str, object]:
     return {
+        "henvs": henvs,
         "torch": torch,
         "MoEActivation": SimpleNamespace(SILU="silu", SWIGLUSTEP="swiglustep"),
         "current_platform": SimpleNamespace(is_rocm=lambda: True),

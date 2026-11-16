@@ -4,6 +4,9 @@
 import pytest
 import torch
 
+from vllm_hcu.model_executor.layers.fused_moe import (
+    shared_experts as shared_experts_module,
+)
 from vllm_hcu.model_executor.layers.fused_moe.shared_experts import (
     SharedExperts,
     SharedExpertsOrder,
@@ -46,6 +49,23 @@ class _StreamPolicySharedExperts(SharedExperts):
         return True
 
 
+class _FusedActivationLayer:
+    def __init__(self, max_m: int) -> None:
+        self.max_m = max_m
+
+    def requires_main_stream_for_fused_activation(
+        self,
+        hidden_states: torch.Tensor,
+    ) -> bool:
+        return hidden_states.shape[0] <= self.max_m
+
+
+class _FusedActivationSharedExperts(_StreamPolicySharedExperts):
+    def __init__(self, max_m: int) -> None:
+        super().__init__(multistream_safe=True)
+        self._layer = _FusedActivationLayer(max_m)
+
+
 def test_shared_experts_inplace_policy_preserves_overlapped_alias() -> None:
     routed_input = torch.zeros((2, 4))
     aliased_shared_input = routed_input.view_as(routed_input)
@@ -71,6 +91,35 @@ def test_shared_experts_inplace_policy_preserves_overlapped_alias() -> None:
     )
 
 
+def test_shared_experts_serializes_short_fused_router_batches() -> None:
+    short_decode = torch.zeros((64, 4096))
+    larger_batch = torch.zeros((65, 4096))
+    shared_experts = _FusedActivationSharedExperts(max_m=64)
+
+    assert (
+        shared_experts._determine_shared_experts_order(short_decode)
+        is SharedExpertsOrder.NO_OVERLAP
+    )
+    assert (
+        shared_experts._determine_shared_experts_order(larger_batch)
+        is SharedExpertsOrder.MULTI_STREAM_OVERLAPPED
+    )
+
+
+def test_fused_activation_guard_precedes_late_stream(monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.setattr(shared_experts_module, "_LATE_STREAM_MIN_TOKENS", 1)
+    shared_experts = _FusedActivationSharedExperts(max_m=64)
+
+    assert (
+        shared_experts._determine_shared_experts_order(torch.zeros((2, 4)))
+        is SharedExpertsOrder.NO_OVERLAP
+    )
+    assert (
+        shared_experts._determine_shared_experts_order(torch.zeros((65, 4)))
+        is SharedExpertsOrder.MULTI_STREAM_OVERLAPPED
+    )
+
+
 def test_shared_experts_serializes_unsafe_multistream_input() -> None:
     hidden_states = torch.zeros((2, 4))
 
@@ -83,6 +132,27 @@ def test_shared_experts_serializes_unsafe_multistream_input() -> None:
         _StreamPolicySharedExperts(multistream_safe=True)
         ._determine_shared_experts_order(hidden_states)
         is SharedExpertsOrder.MULTI_STREAM_OVERLAPPED
+    )
+
+
+@pytest.mark.parametrize(
+    "force_flag",
+    [
+        "VLLM_HCU_SHARED_EXPERTS_EARLY_LAUNCH",
+        "VLLM_HCU_SHARED_EXPERTS_STREAM_FORCE",
+    ],
+)
+def test_fused_router_activation_cannot_be_moved_to_aux_stream(
+    monkeypatch: pytest.MonkeyPatch,
+    force_flag: str,
+) -> None:
+    monkeypatch.setenv("VLLM_HCU_USE_CUSTOM_OPS", "1")
+    monkeypatch.setenv(force_flag, "1")
+    shared_experts = _FusedActivationSharedExperts(max_m=64)
+
+    assert (
+        shared_experts._determine_shared_experts_order(torch.zeros((2, 4)))
+        is SharedExpertsOrder.NO_OVERLAP
     )
 
 

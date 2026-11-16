@@ -176,6 +176,7 @@ def test_qsa_fp8_cache_writer_fails_early_when_native_op_is_missing(
 def test_qsa_fp8_cache_writer_fails_early_on_wrong_native_arity(
     monkeypatch: pytest.MonkeyPatch,
 ):
+    monkeypatch.setitem(sys.modules, "vllm_hcu.hcu_ops", ModuleType("vllm_hcu.hcu_ops"))
     qsa_fp8_patch = _load_patch()
     _library, writer = _define_native_cache_writer(
         "qsa_fp8_bad_writer_arity",
@@ -197,6 +198,7 @@ def test_qsa_fp8_cache_writer_fails_early_on_wrong_native_arity(
 def test_qsa_fp8_cache_writer_fails_early_on_non_mutating_cache_schema(
     monkeypatch: pytest.MonkeyPatch,
 ):
+    monkeypatch.setitem(sys.modules, "vllm_hcu.hcu_ops", ModuleType("vllm_hcu.hcu_ops"))
     qsa_fp8_patch = _load_patch()
     _library, writer = _define_native_cache_writer(
         "qsa_fp8_bad_writer_mutability",
@@ -218,6 +220,7 @@ def test_qsa_fp8_cache_writer_fails_early_on_non_mutating_cache_schema(
 def test_qsa_fp8_cache_writer_fails_early_on_keyword_only_schema(
     monkeypatch: pytest.MonkeyPatch,
 ):
+    monkeypatch.setitem(sys.modules, "vllm_hcu.hcu_ops", ModuleType("vllm_hcu.hcu_ops"))
     qsa_fp8_patch = _load_patch()
     _library, writer = _define_native_cache_writer(
         "qsa_fp8_bad_writer_kwonly",
@@ -239,6 +242,7 @@ def test_qsa_fp8_cache_writer_fails_early_on_keyword_only_schema(
 def test_qsa_fp8_cache_writer_accepts_exact_native_schema(
     monkeypatch: pytest.MonkeyPatch,
 ):
+    monkeypatch.setitem(sys.modules, "vllm_hcu.hcu_ops", ModuleType("vllm_hcu.hcu_ops"))
     qsa_fp8_patch = _load_patch()
     _library, writer = _define_native_cache_writer(
         "qsa_fp8_good_writer_schema",

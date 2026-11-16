@@ -13,6 +13,7 @@ import shutil
 import signal
 import subprocess
 import sys
+import tempfile
 import time
 import uuid
 from pathlib import Path
@@ -23,6 +24,11 @@ from urllib.request import ProxyHandler, Request, build_opener
 import pytest
 import psutil
 import yaml
+
+from tests.integration.gpu_memory import (
+    gpu_memory_utilization_from_args,
+    wait_for_gpu_memory,
+)
 
 
 ROOT = Path(__file__).resolve().parents[3]
@@ -203,6 +209,53 @@ def server_command(
     return ["vllm", "serve", model, *args], host, port
 
 
+def prepare_evalscope_datasets(
+    config: dict[str, Any], work_dir: Path
+) -> dict[str, Any]:
+    """Use private manifests backed by the mounted read-only parquet data."""
+
+    prepared = copy.deepcopy(config)
+    evaluation = prepared["evalscope"]
+    arguments = evaluation.setdefault("dataset_args", {})
+    for name in evaluation["datasets"]:
+        env_name = f"VLLM_HCU_{str(name).upper()}_DATASET"
+        source_text = os.environ.get(env_name)
+        if not source_text:
+            continue
+        source = Path(source_text).resolve()
+        if not source.is_dir():
+            raise FileNotFoundError(f"{env_name} is unavailable: {source}")
+        # Dataset links must stay outside the report tree: artifact uploaders
+        # may follow symlinks and otherwise upload the shared parquet data.
+        staging_root = EVALSCOPE_OWNED_ROOT / "dataset-manifests"
+        staging_root.mkdir(parents=True, exist_ok=True)
+        target = Path(tempfile.mkdtemp(
+            prefix=f"{work_dir.name}-{name}-", dir=staging_root
+        ))
+        subsets: dict[str, dict[str, list[str]]] = {}
+        for parquet in sorted(source.rglob("*.parquet")):
+            relative = parquet.relative_to(source)
+            link = target / relative
+            link.parent.mkdir(parents=True, exist_ok=True)
+            link.symlink_to(parquet)
+            subset = relative.parts[0] if len(relative.parts) > 1 else "default"
+            split = parquet.name.split("-", 1)[0].removesuffix(".parquet")
+            subsets.setdefault(subset, {}).setdefault(split, []).append(relative.as_posix())
+        if not subsets:
+            raise FileNotFoundError(f"no parquet data under {source}")
+        metadata = {"configs": [
+            {"config_name": subset, "data_files": [
+                {"split": split, "path": paths} for split, paths in splits.items()
+            ]} for subset, splits in subsets.items()
+        ]}
+        (target / "README.md").write_text(
+            "---\n" + yaml.safe_dump(metadata, sort_keys=False) + "---\n",
+            encoding="utf-8",
+        )
+        arguments.setdefault(name, {})["dataset_id"] = str(target)
+    return prepared
+
+
 def evalscope_command(
     config: dict[str, Any],
     *,
@@ -265,6 +318,17 @@ def evalscope_command(
 def _open_log(path: Path):
     path.parent.mkdir(parents=True, exist_ok=True)
     return path.open("ab")
+
+
+def create_evalscope_work_dir(parent: Path) -> Path:
+    """Claim a fresh report directory without adopting existing user outputs."""
+
+    parent.mkdir(parents=True, exist_ok=True)
+    work_dir = Path(tempfile.mkdtemp(prefix="run-", dir=parent))
+    (work_dir / EVALSCOPE_OWNER_MARKER).write_text(
+        EVALSCOPE_OWNER_SIGNATURE, encoding="utf-8"
+    )
+    return work_dir
 
 
 def _reset_evalscope_artifacts(work_dir: Path) -> None:
@@ -453,6 +517,10 @@ def _evaluation_environment(config: dict[str, Any]) -> dict[str, str]:
     env["XDG_CONFIG_HOME"] = str(isolated_home / ".config")
     env["HF_HOME"] = str(isolated_home / ".cache/huggingface")
     env["HF_HUB_DISABLE_IMPLICIT_TOKEN"] = "1"
+    # Capture native crashes (for example SIGSEGV while loading a dataset)
+    # in evalscope.log, including crashes during dependency imports.
+    env["PYTHONFAULTHANDLER"] = "1"
+    env["PYTHONUNBUFFERED"] = "1"
     env[EVALSCOPE_API_KEY_ENV] = str(
         config.get("evalscope", {}).get("api_key", "EMPTY")
     )
@@ -688,6 +756,24 @@ def _assert_pass_criteria(
         dataset=dataset,
         metric=metric,
     )
+    for artifact, key in (
+        ("predictions", "num_predictions"), ("reviews", "num_reviews"),
+    ):
+        if key not in criteria:
+            continue
+        expected = int(criteria[key])
+        count, path = _artifact_record_count(
+            work_dir, artifact=artifact, model=model, dataset=dataset,
+        )
+        assert count == expected, (
+            f"expected {expected} {artifact}, got {count}; path={path}"
+        )
+    if "num_predictions" in criteria:
+        expected = int(criteria["num_predictions"])
+        assert num == expected, (
+            f"{dataset} {metric} expected {expected} samples, "
+            f"got {num}; report={report_path}"
+        )
     verdict = (
         f"pass criterion: {dataset} {display_name}={score:.4f}, "
         f"required>={minimum_score:.4f}, samples={num}, report={report_path}"
@@ -1101,6 +1187,7 @@ def run_evalscope_server_test(
         os.environ.get("VLLM_HCU_EVAL_WORK_DIR", config["evalscope"]["work_dir"])
     )
     _reset_evalscope_artifacts(work_dir)
+    config = prepare_evalscope_datasets(config, work_dir)
     log_dir = work_dir / "logs"
     server_log_path = log_dir / "vllm_server.log"
     eval_log_path = log_dir / "evalscope.log"
@@ -1123,6 +1210,18 @@ def run_evalscope_server_test(
             f"{attention_environment or 'default'}\n".encode()
         )
         server_log.flush()
+        memory_fraction = gpu_memory_utilization_from_args(command)
+
+        def report_memory(message: str) -> None:
+            server_log.write((message + "\n").encode())
+            server_log.flush()
+
+        wait_for_gpu_memory(
+            required_cards=required_hcu_count,
+            gpu_memory_utilization=memory_fraction,
+            env=env,
+            report=report_memory,
+        )
         proc = subprocess.Popen(
             command,
             cwd=ROOT,

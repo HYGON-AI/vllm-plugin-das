@@ -32,6 +32,17 @@ def validate_topk_routing(logits, ids, weights, topk, routed_scaling_factor):
     torch.testing.assert_close(weights, expected_weights, rtol=0, atol=0)
 
 
+def validate_graph_logits(captured, eager, *, baseline: bool):
+    """Keep BF16 gate replay exact; bound FP32 reference reduction roundoff."""
+
+    if baseline:
+        # The vendor FP32-output GEMM may select a different reduction during
+        # capture. It is a numerical reference, not a bitwise replay contract.
+        torch.testing.assert_close(captured, eager, rtol=1e-5, atol=1e-6)
+    else:
+        torch.testing.assert_close(captured, eager, rtol=0, atol=0)
+
+
 def main():
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument('--hidden-size', type=int, default=4096)
@@ -131,6 +142,8 @@ def main():
                             graph_results = []
                             graph_exact = True
                             graph_logits_exact = True
+                            head_graph_logits_exact = True
+                            graph_logits_max_abs = 0.0
                             for name, fn, eager in [('base', base, eager_base), ('head', head, eager_head)]:
                                 stream = torch.cuda.Stream()
                                 stream.wait_stream(torch.cuda.current_stream())
@@ -144,7 +157,15 @@ def main():
                                 graph.replay()
                                 torch.cuda.synchronize()
                                 graph_logits_exact &= torch.equal(captured[0], eager[0])
-                                torch.testing.assert_close(captured[0], eager[0], rtol=0, atol=0)
+                                validate_graph_logits(
+                                    captured[0], eager[0], baseline=name == 'base'
+                                )
+                                graph_logits_max_abs = max(
+                                    graph_logits_max_abs,
+                                    (captured[0] - eager[0]).abs().max().item(),
+                                )
+                                if name == 'head':
+                                    head_graph_logits_exact = torch.equal(captured[0], eager[0])
                                 # BF16 rounding creates ties. CUDA graph topk may
                                 # choose different tied IDs while remaining valid.
                                 validate_topk_routing(
@@ -168,6 +189,8 @@ def main():
                                     'weights_max_abs_aligned': (h_weights-b_weights).abs().max().item(),
                                     'weights_mean_l1_per_token': (h_weights-b_weights).abs().sum(-1).mean().item(),
                                     'eager_graph_logits_exact': graph_logits_exact,
+                                    'head_eager_graph_logits_exact': head_graph_logits_exact,
+                                    'eager_graph_logits_max_abs': graph_logits_max_abs,
                                     'eager_graph_routing_exact': graph_exact})
         finally:
             destroy_model_parallel()

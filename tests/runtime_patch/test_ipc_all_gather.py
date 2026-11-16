@@ -11,6 +11,23 @@ from vllm_hcu.distributed.device_communicators import ipc_all_gather as ipc
 from vllm_hcu.patch.worker.framework_opt import patch_cuda_communicator as adapter
 
 
+def test_import_without_triton_driver(monkeypatch):
+    import importlib.util
+    import vllm.triton_utils as utils
+    from vllm.triton_utils.importing import (
+        TritonLanguagePlaceholder, TritonPlaceholder,
+    )
+
+    monkeypatch.setattr(utils, "HAS_TRITON", False)
+    monkeypatch.setattr(utils, "tl", TritonLanguagePlaceholder())
+    monkeypatch.setattr(utils, "triton", TritonPlaceholder())
+    spec = importlib.util.spec_from_file_location("ipc_without_triton", ipc.__file__)
+    module = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(module)
+    assert module._NT == 4
+    assert callable(module.IpcAllGather)
+
+
 class Launch:
     def __init__(self, callback):
         self.callback = callback

@@ -379,3 +379,39 @@ def test_reload_reuses_matching_packed_ranks(kind, rank, monkeypatch):
     if kind == "auto":
         assert experts[1]._deepgemm_w13 is layer._dsv4_channel_deepgemm_masked_w13
         assert experts[1]._deepgemm_w2 is layer._dsv4_channel_deepgemm_masked_w2
+
+
+@pytest.mark.parametrize("layout", [6, 7])
+@pytest.mark.parametrize("batched", [False, True])
+def test_standard_deepgemm_problem_size_accepts_vendor_packed_layouts(
+    monkeypatch: pytest.MonkeyPatch,
+    layout: int,
+    batched: bool,
+) -> None:
+    from vllm_hcu.model_executor.layers.fused_moe import modular_kernel
+    from vllm_hcu.model_executor.layers.fused_moe.experts import deep_gemm_moe
+
+    # The ordinary deep_gemm backend uses the shared modular shape method,
+    # unlike the DeepEP experts with their own packed-layout override.
+    make_weights = _make_6dim_weights if layout == 6 else _make_7dim_weights
+    w13, w2 = make_weights(2, 128, 256)
+    activations = torch.empty((2, 3, 256) if batched else (3, 256))
+    topk_ids = torch.zeros((3, 2), dtype=torch.int32)
+    shape = modular_kernel.FusedMoEExpertsModular.moe_problem_size(
+        None, activations, w13, w2, topk_ids
+    )
+    assert shape == (2, 3, 256, 256, 2)
+
+    monkeypatch.setattr(deep_gemm_moe, "has_deep_gemm", lambda: True)
+    assert deep_gemm_moe._valid_deep_gemm(activations, w13, w2)
+
+
+def test_standard_deepgemm_rejects_mixed_packed_layouts() -> None:
+    from vllm_hcu.model_executor.layers.fused_moe import modular_kernel
+
+    w13, _ = _make_7dim_weights(2, 128, 256)
+    _, w2 = _make_6dim_weights(2, 128, 256)
+    with pytest.raises(AssertionError):
+        modular_kernel.FusedMoEExpertsModular.moe_problem_size(
+            None, torch.empty(3, 256), w13, w2, torch.zeros(3, 2)
+        )

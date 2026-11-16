@@ -34,6 +34,7 @@ from vllm_hcu.patch.worker.framework_opt import (
     patch_forward_context,
     patch_gpu_ubatch_wrapper,
     patch_llm_base_proposer,
+    patch_mtp_prefill_tail,
     patch_pynccl,
     patch_pynccl_wrapper,
     patch_ubatch_utils,
@@ -323,6 +324,18 @@ def test_agrs_int8_quantizes_zero_token_rank_without_lightop() -> None:
     assert quantized.dtype is torch.int8
     assert scales.shape == (0, 1)
     assert scales.dtype is torch.float32
+
+
+def test_mtp_prefill_tail_adapter_contract() -> None:
+    assert patch_mtp_prefill_tail.PATCH_ID == (
+        "worker.framework_opt.spec_decode.mtp_prefill_tail"
+    )
+    assert patch_mtp_prefill_tail.TARGET_MODULE.endswith(
+        "multi_module_mtp.speculator"
+    )
+    assert patch_mtp_prefill_tail.TARGETS == (
+        f"{patch_mtp_prefill_tail.TARGET_MODULE}.MultiModuleMTPSpeculator.propose",
+    )
 
 
 def test_gloo_eplb_communicator_preserves_profile_buffer_reservation() -> None:
@@ -1527,6 +1540,7 @@ def test_deepep_auto_target_mtp_graph_mode_uses_shared_forward_context(
         with module.set_forward_context(
             None,
             config,
+            num_tokens=8,
             cudagraph_runtime_mode=runtime_mode,
         ):
             pass
@@ -2002,14 +2016,18 @@ def test_proposer_sidecar_init_cplb_fix_rocm_preservation_and_custom_sp_padding(
     assert prepared.num_kv_actual_tokens == 5
 
 
-def test_proposer_registers_hcu_spec_decode_metadata_once() -> None:
+def test_proposer_registers_hcu_spec_decode_metadata_once(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
     from vllm.v1.attention.backends.mla.flashmla_sparse import (
         FlashMLASparseMetadata,
     )
     from vllm_hcu.v1.spec_decode import proposer_runtime
-    from vllm_hcu.v1.attention.backends.flash_attn import (
-        FlashAttentionMetadata,
-    )
+    from tests.fixtures.flash_attention import load_hcu_flash_attention_module
+
+    FlashAttentionMetadata = load_hcu_flash_attention_module(
+        monkeypatch
+    ).FlashAttentionMetadata
 
     proposer = SimpleNamespace(allowed_attn_types=(str,))
     config = _proposer_config()

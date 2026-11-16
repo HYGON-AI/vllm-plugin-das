@@ -15,8 +15,6 @@ import functools
 from types import ModuleType
 from typing import TYPE_CHECKING
 
-import torch
-
 from ._common import (
     PatchCompatibilityError,
     already_applied,
@@ -26,6 +24,7 @@ from ._common import (
 )
 
 if TYPE_CHECKING:
+    import torch
     from vllm.v1.kv_cache_interface import KVCacheSpec
 
 TARGET_MODULE = "vllm.distributed.kv_transfer.kv_connector.utils"

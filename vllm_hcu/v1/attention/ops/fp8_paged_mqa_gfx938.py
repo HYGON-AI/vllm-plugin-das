@@ -35,6 +35,7 @@ def _paged_logits(
     BLOCK_H: tl.constexpr,
     BLOCK_D: tl.constexpr,
     BLOCK_T: tl.constexpr,
+    FILL_TAIL: tl.constexpr,
 ):
     row = tl.program_id(0)
     batch = row // NEXT_N
@@ -46,6 +47,19 @@ def _paged_logits(
         end = tl.load(Lengths + batch * L_BATCH + query * L_NEXT)
     else:
         end = tl.load(Lengths + batch * L_BATCH) - NEXT_N + 1 + query
+    if tl.program_id(1) * BLOCK_T >= end:
+        # Tiles past this query's context only need the -inf fill; skipping
+        # the page loads and dot keeps cost proportional to the context
+        # instead of max_model_len.  Callers whose top-k honors per-row ends
+        # skip the fill too: with a 1M max_model_len it alone writes
+        # rows * 4 MB per layer.
+        if FILL_TAIL:
+            tl.store(
+                Out + row * MAX_LEN + tokens,
+                tl.full((BLOCK_T,), -float("inf"), tl.float32),
+                tokens < MAX_LEN,
+            )
+        return
     logical_page = tokens // PAGE_SIZE
     valid = (tokens < MAX_LEN) & (tokens < end) & (logical_page < TABLE_WIDTH)
     page = tl.load(
@@ -92,6 +106,7 @@ def gfx938_fp8_paged_mqa_logits(
     context_lens: torch.Tensor,
     block_tables: torch.Tensor,
     max_model_len: int,
+    fill_tail: bool = True,
 ) -> torch.Tensor:
     """Compute weighted logits without materializing token-major K storage.
 
@@ -104,10 +119,14 @@ def gfx938_fp8_paged_mqa_logits(
         context_lens: Int32/int64 final lengths [batch] or exact ends [batch,next_n].
         block_tables: Int32/int64 logical-to-physical page IDs [batch, pages].
         max_model_len: Number of output token positions.
+        fill_tail: Write -inf past each row's context end.  When False those
+            positions are left unwritten and consumers must bound reads by the
+            per-row end, as the decode top-k selectors do.
 
     Returns:
         Float32 logits [batch * next_n, max_model_len], with invalid positions
-        set to negative infinity, including missing or out-of-range pages.
+        set to negative infinity, including missing or out-of-range pages
+        (positions past the row end only when ``fill_tail``).
     """
     if q_fp8.ndim != 4 or q_fp8.dtype != torch.float8_e4m3fn:
         raise ValueError("q_fp8 must be a rank-4 float8_e4m3fn tensor")
@@ -175,6 +194,7 @@ def gfx938_fp8_paged_mqa_logits(
         max(16, triton.next_power_of_2(heads)),
         triton.next_power_of_2(dim),
         64,
+        fill_tail,
         num_warps=4,
     )
     return output

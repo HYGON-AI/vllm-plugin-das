@@ -126,76 +126,12 @@ def test_test_requirements_pin_ci_runner_and_official_evalscope() -> None:
     assert str(requirements["evalscope"].specifier) == "==1.9.1"
 
 
-def _dockerfile_instructions() -> list[str]:
-    instructions: list[str] = []
-    current: list[str] = []
-    for raw_line in DOCKERFILE.read_text(encoding="utf-8").splitlines():
-        line = raw_line.strip()
-        if not current and (not line or line.startswith("#")):
-            continue
-        current.append(line.removesuffix("\\").strip())
-        if not line.endswith("\\"):
-            instructions.append(" ".join(current))
-            current = []
-    assert not current, "Dockerfile ends inside a continued instruction"
-    return instructions
-
-
-def test_dockerfile_copies_runtime_installer_before_framework_layer() -> None:
-    instructions = _dockerfile_instructions()
-    requirements_copy = next(
-        index
-        for index, instruction in enumerate(instructions)
-        if instruction.startswith("COPY ")
-        and "requirements-vllm-runtime.txt" in instruction
-    )
-    installer_copy = next(
-        index
-        for index, instruction in enumerate(instructions)
-        if instruction.startswith("COPY ")
-        and "install_vllm_runtime_dependencies.sh" in instruction
-    )
-    framework_run = next(
-        index
-        for index, instruction in enumerate(instructions)
-        if instruction.startswith("RUN ")
-        and "pip install --no-cache-dir ninja wheel setuptools" in instruction
-    )
-
-    assert requirements_copy < framework_run
-    assert installer_copy < framework_run
-    assert "/tmp/install_vllm_runtime_dependencies.sh" in instructions[framework_run]
-    assert "/tmp/requirements-vllm-runtime.txt" in instructions[framework_run]
-
-
-def test_dockerfile_installs_registered_test_dependencies() -> None:
-    instructions = _dockerfile_instructions()
-    requirements_copy = next(
-        index
-        for index, instruction in enumerate(instructions)
-        if instruction.startswith("COPY ") and "requirements-test.txt" in instruction
-    )
-    framework_run = next(
-        index
-        for index, instruction in enumerate(instructions)
-        if instruction.startswith("RUN ")
-        and "pip install --no-cache-dir ninja wheel setuptools" in instruction
-    )
-
-    assert requirements_copy < framework_run
-    assert "pip install --no-cache-dir -r /tmp/requirements-test.txt" in instructions[
-        framework_run
-    ]
-
-
-def test_dockerfile_does_not_override_the_index_for_ray() -> None:
-    ray_instructions = [
-        instruction
-        for instruction in _dockerfile_instructions()
-        if "ray[" in instruction.lower()
-    ]
-
-    assert not ray_instructions
+def test_dockerfile_does_not_install_ci_requirements() -> None:
+    source = DOCKERFILE.read_text(encoding="utf-8")
+    assert "requirements-test.txt" not in source
+    assert "requirements-ci-base.txt" not in source
+    assert "requirements-vllm-runtime.txt" not in source
+    assert "install_vllm_runtime_dependencies.sh" not in source
 
 
 def _docker_context_excludes(relative_path: str) -> bool:

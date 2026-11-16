@@ -181,14 +181,26 @@ def _kda_forward(self, hidden_states, positions):
     batch = _current_pcp_batch()
     original = self._hcu_glm53_original_forward
     if batch is None:
-        return original(hidden_states, positions)
+        output = original(hidden_states, positions)
+        return _reduce_kda_head_output(self, output)
     # DualChunkSwap gives each rank disjoint intervals. Reconstruct their
     # causal order before updating the replicated convolution/recurrent state.
     full_hidden = batch.gather(hidden_states)
     full_positions = batch.global_batch.positions[:full_hidden.shape[0]]
     with replicated_mtp_batch_scope():
         full_output = original(full_hidden, full_positions)
+    # Each head rank's o_proj is a partial sum. Reduce BEFORE localize:
+    # DualChunkSwap does not assign rank-contiguous output rows.
+    full_output = _reduce_kda_head_output(self, full_output)
     return batch.localize(full_output)
+
+
+def _reduce_kda_head_output(layer, output):
+    if not getattr(layer, "_hcu_kda_cp_head_sharded", False):
+        return output
+    # Weight/state sharding is static: also reduce decode/verify and replicated
+    # dummy batches. Group all_reduce can return a different output tensor.
+    return layer._hcu_kda_cp_group.all_reduce(output)
 
 
 def _indexer_forward(self, hidden_states, qr, positions, rotary_emb):
@@ -267,9 +279,14 @@ def install_glm53_pcp(runner) -> None:
             if isinstance(layer, (Glm5NextLinearAttention, Glm5NextTailCache)):
                 _install_replicated_backend(layer)
     logger.info(
-        "GLM5Next PCP eager baseline: %d replicated KDA layers, "
+        "GLM5Next PCP eager: %d KDA layers (%s), "
         "%d replicated K-pool indexers; MLA queries and MoE remain sharded",
-        *counts,
+        counts[0],
+        "CP-head sharded, all-reduce+localize" if any(
+            getattr(layer, "_hcu_kda_cp_head_sharded", False)
+            for layer in runner.model.modules()
+        ) else "replicated baseline",
+        counts[1],
     )
 
 

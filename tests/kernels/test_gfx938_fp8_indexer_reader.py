@@ -117,6 +117,99 @@ def test_direct_reader_matches_token_order_oracle(
 
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="requires HCU GPU")
 @pytest.mark.parametrize("per_query", [False, True])
+def test_skip_tail_preserves_every_valid_row_prefix(per_query):
+    """Dirty tails are safe only when every row prefix remains exact."""
+    args, expected = _case(32, 73, 2, 3, per_query)
+    actual = gfx938_fp8_paged_mqa_logits(*args, fill_tail=False)
+    q, _, _, context, _, max_len = args
+    next_n = q.shape[1]
+    if per_query:
+        row_ends = context.reshape(-1)
+    else:
+        offsets = torch.arange(next_n, device=context.device)
+        row_ends = (context[:, None] - next_n + 1 + offsets).reshape(-1)
+    valid = torch.arange(max_len, device=actual.device)[None, :] < row_ends[:, None]
+    assert torch.equal(
+        torch.isneginf(actual[valid]), torch.isneginf(expected[valid])
+    )
+    finite = valid & torch.isfinite(expected)
+    torch.testing.assert_close(actual[finite], expected[finite], rtol=1e-3, atol=1e-2)
+
+
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="requires HCU GPU")
+def test_skip_tail_graph_replay_masks_empty_and_short_rows_in_topk():
+    """Skipped tiles may stay dirty, but the production top-k must ignore them."""
+    from vllm_hcu.v1.attention.ops.rocm_aiter_mla_sparse import (
+        _topk_indices_torch,
+    )
+
+    args, base_expected = _case(32, 257, 2, 3, True)
+    q, cache, weights, context, table, max_len = args
+    initial_ends = torch.tensor(
+        [[0, 7, 65], [127, 129, 250]], dtype=context.dtype, device=context.device
+    )
+    replay_ends = torch.tensor(
+        [[1, 64, 128], [0, 33, 192]], dtype=context.dtype, device=context.device
+    )
+    context.copy_(initial_ends)
+    topk_tokens = 16
+
+    def run_pipeline():
+        logits = gfx938_fp8_paged_mqa_logits(
+            q,
+            cache,
+            weights,
+            context,
+            table,
+            max_len,
+            fill_tail=False,
+        )
+        indices = _topk_indices_torch(
+            logits,
+            topk_tokens=topk_tokens,
+            row_ends=context.reshape(-1),
+        )
+        return logits, indices
+
+    stream = torch.cuda.Stream()
+    stream.wait_stream(torch.cuda.current_stream())
+    with torch.cuda.stream(stream):
+        run_pipeline()
+    torch.cuda.current_stream().wait_stream(stream)
+
+    graph = torch.cuda.CUDAGraph()
+    with torch.cuda.graph(graph):
+        actual, chosen = run_pipeline()
+
+    def check_replay(ends):
+        expected = base_expected.clone()
+        row_ends = ends.reshape(-1)
+        positions = torch.arange(max_len, device=actual.device)
+        valid = positions[None, :] < row_ends[:, None]
+        expected.masked_fill_(~valid, -torch.inf)
+        assert torch.equal(
+            torch.isneginf(actual[valid]), torch.isneginf(expected[valid])
+        )
+        finite = valid & torch.isfinite(expected)
+        torch.testing.assert_close(
+            actual[finite], expected[finite], rtol=1e-3, atol=1e-2
+        )
+        expected_topk = _topk_indices_torch(
+            expected,
+            topk_tokens=topk_tokens,
+            row_ends=row_ends,
+        )
+        assert torch.equal(chosen, expected_topk)
+
+    graph.replay()
+    check_replay(initial_ends)
+    context.copy_(replay_ends)
+    graph.replay()
+    check_replay(replay_ends)
+
+
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="requires HCU GPU")
+@pytest.mark.parametrize("per_query", [False, True])
 def test_non_power_of_two_heads_and_dim_with_int64_metadata(per_query):
     """Tail lanes and 64-bit page indices must preserve oracle logits."""
     args, expected = _case(

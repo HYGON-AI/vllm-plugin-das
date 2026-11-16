@@ -35,12 +35,15 @@ Python wrapper signature, not the kernel body.
 from __future__ import annotations
 
 import functools
+import os
 from types import ModuleType
 
 import torch
 
-from vllm.third_party.flash_linear_attention.ops.op import exp
-from vllm.triton_utils import tl, triton
+from vllm.triton_utils import tl, tldevice, triton
+
+# Match the upstream alias without importing its ROCm-probing ops package.
+exp = tldevice.fast_expf if os.environ.get("FLA_USE_FAST_OPS", "0") == "1" else tl.exp
 
 from ._common import (
     already_applied,
