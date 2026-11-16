@@ -5,7 +5,7 @@ import sys
 import unittest
 
 sys.dont_write_bytecode = True
-from upgrade_preflight import compare_contracts, signature_checks
+from upgrade_preflight import compare_contracts, constants, signature_checks
 
 
 def compare(old, new, symbol="route"):
@@ -13,6 +13,41 @@ def compare(old, new, symbol="route"):
 
 
 class ContractTests(unittest.TestCase):
+    @unittest.skipIf(sys.version_info < (3, 12), "PEP 695 requires Python 3.12")
+    def test_generic_type_parameters_are_callable_contracts(self):
+        for old, new in [
+            ("T: int", "T: str"),
+            ("T: (int, str)", "T: (int, bytes)"),
+            ("*Ts", "**Ts"),
+        ]:
+            with self.subTest(old=old, new=new):
+                result = compare(f"def route[{old}](): return 1",
+                                 f"def route[{new}](): return 1")
+                self.assertEqual(result["status"], "changed_review_required")
+                self.assertEqual(result["changed_fields"], ["type_params_ast"])
+                same = compare(f"def route[{old}](): return 1",
+                               f"def route[{old}]():\n    # comment\n    return 1\n")
+                self.assertEqual(same["status"], "unchanged_static_only")
+
+    def test_unevaluable_reassignments_invalidate_old_constants(self):
+        for assignment in ["TARGET_MODULE = choose_module()",
+                           "TARGET_MODULE: str = choose_module()",
+                           "TARGET_MODULE = MISSING",
+                           "TARGET_MODULE += suffix",
+                           "TARGET_MODULE, other = choose_pair()"]:
+            with self.subTest(assignment=assignment):
+                values = constants(ast.parse('TARGET_MODULE = "vllm.router"\n' + assignment))
+                self.assertNotIn("TARGET_MODULE", values)
+
+    def test_annotation_only_preserves_binding_and_literal_reassignment_updates(self):
+        values = constants(ast.parse('''TARGET_MODULE = "vllm.router"
+TARGET_MODULE: str
+COPY = TARGET_MODULE
+TARGET_MODULE = "vllm.fast"
+'''))
+        self.assertEqual(values["COPY"], "vllm.router")
+        self.assertEqual(values["TARGET_MODULE"], "vllm.fast")
+
     def test_zero_argument_guard_uses_default_empty_positional(self):
         guard = ast.parse('require_exact_signature(fn, "vllm.ops.ready")')
         target = ast.parse('def ready(): return 1')

@@ -43,8 +43,12 @@ python -I -B skills/upgrading-vllm-hcu-upstream-first/scripts/upgrade_preflight.
 
 The JSON and Markdown report list carried file differences, possible module
 moves and statically parsed legacy `TARGET_MODULE` guards. Resolved functions
-are compared for parameter kinds/defaults, annotations, decorators, async
-status and body AST. Findings remain pending review. Uncommitted changes are
+are compared for parameter kinds/defaults, annotations, decorators, generic
+type parameters, async status and body AST. Findings remain pending review.
+An unevaluable constant reassignment invalidates its previous binding; an
+unresolved `TARGET_MODULE` produces a manual-review warning instead of a
+comparison against the old module. A bare annotation preserves its binding.
+Uncommitted changes are
 reported but excluded from analysis; commit or separately bind their bytes.
 Report destinations must also be outside each checkout's private Git directory
 and shared storage, including linked worktrees and separate Git directories.

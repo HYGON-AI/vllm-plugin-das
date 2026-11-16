@@ -164,16 +164,35 @@ def literal(node, values):
 
 
 def constants(tree):
+    def assigned_names(target):
+        if isinstance(target, ast.Name):
+            return [target.id]
+        if isinstance(target, (ast.Tuple, ast.List)):
+            return [name for child in target.elts for name in assigned_names(child)]
+        if isinstance(target, ast.Starred):
+            return assigned_names(target.value)
+        return []
+
     values = {}
     for node in tree.body:
-        if not isinstance(node, (ast.Assign, ast.AnnAssign)):
+        if not isinstance(node, (ast.Assign, ast.AnnAssign, ast.AugAssign)):
+            continue
+        # A bare annotation does not assign a value at runtime.
+        if isinstance(node, ast.AnnAssign) and node.value is None:
             continue
         targets = node.targets if isinstance(node, ast.Assign) else [node.target]
         try:
+            if isinstance(node, ast.AugAssign):
+                raise ValueError("Augmented assignments require manual review")
             value = literal(node.value, values)
         except (ValueError, KeyError, TypeError, IndexError):
+            for target in targets:
+                for name in assigned_names(target):
+                    values.pop(name, None)
             continue
         for target in targets:
+            for name in assigned_names(target):
+                values.pop(name, None)
             if isinstance(target, ast.Name):
                 values[target.id] = value
     return values
@@ -261,6 +280,7 @@ def function_contract(node):
     normalized_body = json.dumps([dump(n) for n in body], ensure_ascii=True)
     return {"parameters": parameters, "returns_ast": dump(node.returns),
             "decorators_ast": [dump(n) for n in node.decorator_list],
+            "type_params_ast": [dump(n) for n in getattr(node, "type_params", [])],
             "is_async": isinstance(node, ast.AsyncFunctionDef),
             "body_sha256": hashlib.sha256(normalized_body.encode()).hexdigest()}
 
@@ -334,6 +354,9 @@ def scan_adapters(plugin, fork, target, warnings):
         module = values.get("TARGET_MODULE")
         if isinstance(module, str) and module.startswith("vllm."):
             parsed.append((path, tree, values, module))
+        elif any(isinstance(n, ast.Name) and n.id == "TARGET_MODULE"
+                 and isinstance(n.ctx, ast.Store) for n in ast.walk(tree)):
+            warnings.append(f"Unresolved TARGET_MODULE: {path}; manual target review required")
     target.prefetch([p for _, _, _, m in parsed if (p := target.module_path(m))])
     fork.prefetch([p for _, _, _, m in parsed if (p := fork.module_path(m))])
     rows = []

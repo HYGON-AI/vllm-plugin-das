@@ -91,6 +91,46 @@ PATCH_ID = "old"
             capture_output=True, text=True, encoding="utf-8",
         )
 
+    def test_dynamic_target_reassignment_requires_manual_review(self):
+        write(self.plugin, "vllm_hcu/patch/patch_router.py", '''
+TARGET_MODULE = "vllm.router"
+TARGET_MODULE = choose_module()
+PATCH_ID = "router"
+def apply():
+    require_exact_signature(fn, "vllm.fast.fast", positional=("x",))
+''')
+        commit(self.plugin)
+        out = self.root / "dynamic-target-report"
+        run = self.invoke(out)
+        self.assertEqual(run.returncode, 0, run.stderr)
+        report = json.loads((out / "preflight.json").read_text())
+        self.assertFalse(any(row["patch_id"] == "router" for row in report["adapters"]))
+        self.assertTrue(any("TARGET_MODULE" in warning and "patch_router.py" in warning
+                            for warning in report["warnings"]))
+
+    @unittest.skipIf(sys.version_info < (3, 12), "PEP 695 requires Python 3.12")
+    def test_generic_bound_drift_requires_review_end_to_end(self):
+        write(self.fork, "vllm/router.py", "def route[T: int](): return T.__bound__\n")
+        write(self.up, "vllm/router.py", "def route[T: str](): return T.__bound__\n")
+        commit(self.fork)
+        commit(self.up)
+        write(self.plugin, "vllm_hcu/patch/patch_router.py", '''
+TARGET_MODULE = "vllm.router"
+PATCH_ID = "router"
+def apply():
+    require_exact_signature(fn, "vllm.router.route")
+''')
+        commit(self.plugin)
+        out = self.root / "generic-target-report"
+        run = self.invoke(out)
+        self.assertEqual(run.returncode, 0, run.stderr)
+        report = json.loads((out / "preflight.json").read_text())
+        row = next(row for row in report["adapters"] if row["patch_id"] == "router")
+        check = row["signature_checks"][0]
+        self.assertEqual(check["status"], "names_match_only")
+        self.assertEqual(check["contract_comparison"]["status"], "changed_review_required")
+        self.assertEqual(check["contract_comparison"]["changed_fields"], ["type_params_ast"])
+
     def test_committed_python_source_encodings_preserve_body_drift(self):
         cases = [
             (b"# coding: latin-1\ndef route(x): return '\xe9'\n",
