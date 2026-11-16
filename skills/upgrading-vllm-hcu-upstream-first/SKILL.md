@@ -168,6 +168,11 @@ Validate its source/wheel/installed payload and raw RECORD, then rerun affected
 CPU, native/Graph and model gates. A new venv can change a registered console
 script's interpreter prefix; audit that exact generated script separately
 while preserving every payload check and the original RECORD verification.
+Inspect real wheels built from recursive checkouts for submodule `.git`
+pointers. Exclude Git control metadata in the distribution manifest and verify
+the remaining package payload is unchanged. No JIT `.so` in a wheel does not
+mean it has no native assets: inventory source-controlled HSA code objects
+separately from newly compiled JIT modules and qualify their execution.
 
 Chained jobs must wait for completed cleanup, checkpoint post-seal and RECORD
 receipts, not just a terminal-looking state string. Write final status only
