@@ -243,7 +243,11 @@ class DeepEPBF16MaskedExperts(DeepEPBF16ContiguousExperts):
         config = {"MODE": 2000}
         gemm(hidden_states, self._packed_w13, gateup, counts, expected_m, config=config)
         activated = flat[e * m * n : e * m * (n + n // 2)].view(e, m, n // 2)
-        self.activation(activation, activated, gateup, valid_token_counts=counts)
+        # TritonExperts.activation drops keyword arguments on the target.
+        # Use the official modular entry point to retain counts and config.
+        mk.FusedMoEExpertsModular.activation(
+            self, activation, activated, gateup, valid_token_counts=counts
+        )
         gemm(
             activated,
             self._packed_w2,

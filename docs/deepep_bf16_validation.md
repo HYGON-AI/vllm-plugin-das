@@ -179,3 +179,39 @@ hidden widths, empty and populated experts, counts forwarding, numeric output,
 and untouched padding with explicit CPU GEMM/activation doubles. These tests do
 not establish native masked activation speed, device kernels, Graph or model
 accuracy. Current-head target CI and applicable E2E gates still apply.
+
+## Native-discovered activation method boundary
+
+The first native apply probe on local gfx936 found that inheriting
+`TritonExperts.activation` discarded the counts keyword before reaching the
+modular implementation, then rejected the3D input as an ordinary2D activation.
+The initial CPU test had replaced the entire activation method and missed this
+boundary. That failing native log is retained. The audited target Core
+v0.28.1-dev `b95ba2d1` has the same keyword-dropping override.
+
+LL now invokes `FusedMoEExpertsModular.activation` directly, retaining the
+common official activation config and counts-aware implementation without
+changing TritonExperts for unrelated backends. The regression keeps the real
+method chain and doubles only the final activation provider. It fails on the
+prior submitted implementation and passes after the direct modular call;
+50 scoped CPU components pass, with the same2 documented host/target selection
+ABI cases deselected and no skips. Native/Graph/model results require their
+own evidence and are not inferred from CPU doubles.
+
+The final local native component probe uses gfx936, DTK Torch2.13 and
+DeepGEMM2.1.0+dtk2610.torch2130.2611122142.g793351. With the independently
+source-built Core0.33.1.dev17+g0014f6fce.rocm72 environment, real BF16 packing,
+both native masked GEMMs and the official masked activation pass for expert
+counts[0,1,17], preserving activation padding. Three captured-Graph replays
+change input contents and expert counts[9,0,9]/[1,17,0]/[0,1,17] at stable
+addresses, with maximum final-output absolute error6.103515625e-5 against the
+float-accumulation/BF16 reference (atol1e-4,rtol2e-2). No provider is doubled.
+
+The system Core0.33.0+dtk2610.torch2130.2611101131.g7364da binary fails this
+batched activation component despite accepting the Python API: GEMM1 matches,
+but later experts' activation rows remain sentinel values. That failure and
+native library hashes are retained separately; installing Python signatures is
+not native capability evidence. A coherent target build with real batched masked
+activation is required. The passing experiment uses host Core0.33.1 dependencies,
+not the complete target0.28 stack; it does not qualify DeepEP communication,
+full-model/HumanEval32, performance, gfx938, or the requested gfx836.

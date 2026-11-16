@@ -219,10 +219,11 @@ def test_bf16_admission_matches_selected_ht_gather(monkeypatch, hidden, custom, 
 def test_bf16_masked_activation_preserves_expert_counts_and_padding(monkeypatch):
     from types import SimpleNamespace
     from vllm_hcu.model_executor.layers.fused_moe.experts import deepep_bf16_moe as impl
-    from vllm.model_executor.layers.fused_moe.activation import MoEActivation
+    from vllm.model_executor.layers.fused_moe.activation import MoEActivation, ApplyMoEActivationConfig
 
     expert = object.__new__(impl.DeepEPBF16MaskedExperts)
     expert.num_dispatchers = 1
+    expert.activation_config = ApplyMoEActivationConfig()
     e, m, n, k = 3, 8, 8, 4
     counts = torch.tensor([0, 1, 3], dtype=torch.int32)
     x = torch.arange(e * m * k, dtype=torch.float32).view(e, m, k) / 100
@@ -240,7 +241,7 @@ def test_bf16_masked_activation_preserves_expert_counts_and_padding(monkeypatch)
         for i, count in enumerate(counts.tolist()):
             out[i, :count].copy_(a[i, :count] @ weight[i].T)
 
-    def activate(activation, out, inp, *, valid_token_counts):
+    def activate(activation, out, inp, *, valid_token_counts=None, **kwargs):
         assert activation is MoEActivation.SILU
         assert valid_token_counts is counts
         assert inp.shape == (e, m, n) and out.shape == (e, m, n // 2)
@@ -251,7 +252,9 @@ def test_bf16_masked_activation_preserves_expert_counts_and_padding(monkeypatch)
             out[i, :count].copy_(torch.nn.functional.silu(gate) * up)
 
     monkeypatch.setattr(impl, "_deepgemm_op", lambda _: gemm)
-    expert.activation = activate
+    # Keep the real activation method chain. Replacing expert.activation
+    # would hide TritonExperts dropping counts before the modular entry point.
+    monkeypatch.setattr(impl.mk, "apply_moe_activation", activate)
     expert.apply(output, x, w1, w2, torch.ones(4, 1), torch.zeros(4, 1, dtype=torch.int64),
                  MoEActivation.SILU, e, None, None, None, torch.empty(0), workspace,
                  SimpleNamespace(expert_num_tokens=counts), False)
