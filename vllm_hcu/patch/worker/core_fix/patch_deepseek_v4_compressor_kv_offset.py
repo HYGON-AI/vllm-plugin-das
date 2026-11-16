@@ -13,7 +13,17 @@ TARGET_SYMBOL = f"{TARGET_MODULE}.{_KERNEL}"
 
 def apply_to_module(module: ModuleType) -> bool:
     target = load_exact_module(TARGET_MODULE, module)
-    return preserve_cache_pointer_range(target, _KERNEL)
+    changed = preserve_cache_pointer_range(target, _KERNEL, "k_cache_ptr")
+    changed |= preserve_cache_pointer_range(
+        target, "_compress_gather_split_sparse_attn", "state_cache_ptr"
+    )
+    for kernel in (
+        "_fused_kv_compress_norm_rope_insert_sparse_attn",
+        "_fused_kv_compress_norm_rope_insert_indexer_attn",
+        "_fused_kv_compress_norm_rope_insert_indexer_mxfp4_attn",
+    ):
+        changed |= preserve_cache_pointer_range(target, kernel, "k_cache_ptr", "state_cache_ptr")
+    return changed
 
 
 def apply(module: ModuleType | None = None) -> bool:

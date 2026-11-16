@@ -4,16 +4,17 @@ from types import ModuleType
 from ._common import PatchCompatibilityError
 
 
-def preserve_cache_pointer_range(module: ModuleType, symbol: str) -> bool:
+def preserve_cache_pointer_range(module: ModuleType, symbol: str, *pointers: str) -> bool:
     import triton
     from triton.runtime.jit import JITFunction
 
     kernel = getattr(module, symbol, None)
-    if not isinstance(kernel, JITFunction) or "k_cache_ptr" not in kernel.arg_names:
+    if not isinstance(kernel, JITFunction) or not set(pointers).issubset(kernel.arg_names):
         raise PatchCompatibilityError(f"incompatible Triton kernel: {module.__name__}.{symbol}")
 
-    index = kernel.arg_names.index("k_cache_ptr")
-    if kernel.params[index].do_not_specialize:
+    missing = [name for name in pointers
+               if not kernel.params[kernel.arg_names.index(name)].do_not_specialize]
+    if not missing:
         return False
 
     # DTK Triton can attach tt.pointer_range=32 to the cache argument.
@@ -21,7 +22,7 @@ def preserve_cache_pointer_range(module: ModuleType, symbol: str) -> bool:
     # generic so lowering retains the full block offset for cache accesses.
     replacement = triton.jit(
         kernel.fn,
-        do_not_specialize=[*kernel.do_not_specialize, "k_cache_ptr"],
+        do_not_specialize=[*kernel.do_not_specialize, *missing],
         do_not_specialize_on_alignment=kernel.do_not_specialize_on_alignment,
         debug=kernel.debug,
         noinline=kernel.noinline,

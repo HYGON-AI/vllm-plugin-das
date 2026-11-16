@@ -13,7 +13,7 @@ TARGET_SYMBOL = f"{TARGET_MODULE}.{_KERNEL}"
 
 def apply_to_module(module: ModuleType) -> bool:
     target = load_exact_module(TARGET_MODULE, module)
-    return preserve_cache_pointer_range(target, _KERNEL)
+    return preserve_cache_pointer_range(target, _KERNEL, "k_cache_ptr")
 
 
 def apply(module: ModuleType | None = None) -> bool:

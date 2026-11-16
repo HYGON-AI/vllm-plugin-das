@@ -52,3 +52,18 @@ def test_gather_kernel_preserves_cache_pointer_range():
                      if "tt.func public" in line)
     cache_arg = signature.split("%k_cache_ptr:", 1)[1].split("%seq_lens_ptr:", 1)[0]
     assert "tt.pointer_range" not in cache_arg
+
+
+def test_compressor_state_cache_specialization():
+    from importlib import import_module
+    from vllm_hcu.patch.worker.core_fix import patch_deepseek_v4_state_cache_offset
+
+    target = import_module(patch_deepseek_v4_state_cache_offset.TARGET_MODULE)
+    patch_deepseek_v4_state_cache_offset.apply(target)
+    kernel = target._save_partial_states_kernel
+    assert kernel.params[kernel.arg_names.index("state_cache_ptr")].do_not_specialize
+
+    patch_deepseek_v4_compressor_kv_offset.apply(ops)
+    kernel = ops._fused_kv_compress_norm_rope_insert_sparse_attn
+    for pointer in ("state_cache_ptr", "k_cache_ptr"):
+        assert kernel.params[kernel.arg_names.index(pointer)].do_not_specialize
