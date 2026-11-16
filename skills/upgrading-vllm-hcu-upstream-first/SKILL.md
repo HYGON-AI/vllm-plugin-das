@@ -102,6 +102,15 @@ dependencies, gapped GPU READ/WRITE and real model P/D with Graph and prefix.
    process release and normal teardown as separate results.
 
 Graph capture or HTTP health alone does not establish successful generation.
+For `torch.library` exit errors, inspect the actual provider's registration:
+a Library already owns its namespace, so qualified definition names can leave
+duplicate namespaces in cleanup metadata even when dispatch succeeds. Reuse an
+applicable upstream fix in that provider rather than suppressing weakref errors
+or replacing Torch cleanup in Core/Adapter/Plugin. Cover explicit destruction
+and natural child-process exit alongside eager, fake and compile contracts.
+Source fixes and diagnostic repackaged wheels remain distinct from a rebuilt
+provider release and its device/model qualification.
+
 Chained jobs must wait for completed cleanup, checkpoint post-seal and RECORD
 receipts, not just a terminal-looking state string. Write final status only
 after the last check, using an atomic snapshot. Preserve consumer failures
