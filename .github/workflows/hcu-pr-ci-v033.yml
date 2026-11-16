@@ -180,6 +180,9 @@ jobs:
         with:
           ref: ${{ github.event.pull_request.head.sha || github.sha }}
           persist-credentials: false
+      - name: Trust checked-out workspace for package metadata
+        # checkout's temporary HOME does not carry into pip's VCS metadata step.
+        run: git config --global --add safe.directory "$GITHUB_WORKSPACE"
       - name: Full v0.33 portable contracts (devices hidden)
         env:
           PYTEST_DISABLE_PLUGIN_AUTOLOAD: '1'
@@ -214,6 +217,9 @@ jobs:
         with:
           ref: ${{ github.event.pull_request.head.sha || github.sha }}
           persist-credentials: false
+      - name: Trust checked-out workspace for package metadata
+        # checkout's temporary HOME does not carry into pip's VCS metadata step.
+        run: git config --global --add safe.directory "$GITHUB_WORKSPACE"
       - name: Installed Channel-FP8 DeepGEMM numerical contract
         env:
           PYTEST_DISABLE_PLUGIN_AUTOLOAD: '1'
