@@ -408,3 +408,13 @@ observe passes, and validate normal serving with its intended caches intact.
 If independent builds of identical kernel source differ, add a Core-vs-Core
 control and inspect selected launch configurations before assigning the cause
 to the Plugin. Preserve the failures and full-model gates.
+
+For provider CI, inspect the final pytest log and result artifact as well as
+job status. A session-level version pause can exit successfully without running
+any cases; a benchmark driver can then produce no CSV. Record those as no
+execution or unavailable performance evidence, retaining the original guard.
+Bind real pass/fail/skip counts and timings to the exact submitted head and
+dependency matrix. An independently green compliance aggregate, successful
+wheel build or selected native subset does not qualify that correctness or
+performance job. Diagnose the compatibility limit and rerun its affected
+matrix after repair; do not bypass the pause to claim release qualification.
