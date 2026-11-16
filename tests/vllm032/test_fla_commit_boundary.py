@@ -100,6 +100,17 @@ def test_actual_runtime_latches_failed_optional_bundle_and_preserves_report(acti
     monkeypatch.setattr(bridge, "_ensure_hcu_platform_selected", lambda: None)
     monkeypatch.setattr(bridge, "configure_vllm_hip_runtime_path", lambda: None)
     monkeypatch.setattr(bridge, "_installed_adapter_version", lambda: "cpu")
+    # This CPU test exercises the real host failure/report lifecycle. Native
+    # runtime prerequisites have independent gates and must not run here.
+    monkeypatch.setattr(bridge, "_require_vllm_hip_runtime_abi", lambda: None)
+    from hcu_adapter.bridges import (
+        vllm_fp8, vllm_allreduce, vllm_mhc, vllm_sparse_indexer,
+    )
+    for owner, action in ((vllm_fp8, "install"),
+                          (vllm_allreduce, "prepare_runtime"),
+                          (vllm_mhc, "install"),
+                          (vllm_sparse_indexer, "install")):
+        monkeypatch.setattr(owner, action, lambda: None)
     monkeypatch.setattr(host, "_entry_points", lambda: [point("das-hcu", 10, extension.activate_extension)])
     with pytest.raises(bridge.LatchedVllmRuntimeError):
         bridge.hcu_runtime_plugin()

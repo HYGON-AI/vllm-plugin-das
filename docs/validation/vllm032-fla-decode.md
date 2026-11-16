@@ -67,6 +67,26 @@ both ordinary compilation and second-level model AOT keys. Equivalent disabled
 policies are equivalent. Do not change flags or uninstall while serving an
 already compiled/captured model; restarting is required.
 
+## Current v0.32 base maintenance (2026-11-16)
+
+The conflict repair integrates merged PR #323's native/Python RMS call-ABI
+admission with this proposal's preparation and commit-fatal lifecycle. Both
+admission helpers and both independent regression groups remain. RMS factors
+are still first published only after preparation has completed.
+
+The current component reruns cover 69 admission/cache cases, 10 real-host
+lifecycle cases and 110 provider metadata/dispatch cases, all passing with no
+skips. One actual-vLLM0.32 AOT case and eight target/installed-vendor-source/AOT
+cases were explicitly deselected because their pinned runtime/source artifacts
+are absent here. These reruns are not new native, Graph or model acceptance.
+The lifecycle test explicitly doubles unrelated host native prerequisites while
+retaining the real host extension publication, fatal report and retry latch.
+The real Torch dispatcher side-effect and real fork cases execute as before.
+A fork warning from the threaded interpreter remains recorded.
+
+Keep this proposal Draft and both providers default off until the current
+artifact's installed discovery, target ABI, native/Graph and model gates pass.
+
 ## Frozen independent artifact
 
 Validation date: 2026-11-01. Exact versions identify evidence; runtime acceptance
