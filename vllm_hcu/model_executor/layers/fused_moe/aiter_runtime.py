@@ -632,7 +632,7 @@ def is_aiter_found_and_supported(
             raise HcuAiterRuntimeError(
                 "HCU AITER capability check could not load architecture helpers"
             ) from exc
-        if on_gfx93x() or _get_gcn_arch_name() == "gfx92a":
+        if on_gfx93x() or _get_gcn_arch_name() in ("gfx92a", "gfx946"):
             return True
     return bool(original())
 

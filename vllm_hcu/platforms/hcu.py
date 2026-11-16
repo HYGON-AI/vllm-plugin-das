@@ -945,7 +945,7 @@ class HCUPlatform(Platform):
 
     @classmethod
     def supports_fp8(cls) -> bool:
-        return on_gfx938()
+        return on_gfx938() or _get_gcn_arch_name() == "gfx946"
 
     @classmethod
     def get_device_communicator_cls(cls) -> str:
