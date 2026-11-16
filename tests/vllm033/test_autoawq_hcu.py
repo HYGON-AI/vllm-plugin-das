@@ -16,7 +16,27 @@ def require_explicit_device_run():
     assert torch.cuda.is_available(), "Requested AutoAWQ device run has no device"
 
 
-@pytest.mark.parametrize("k,n", [(1024, 8192), (4096, 8192)])
+@pytest.mark.parametrize(
+    "k,n",
+    [
+        (8192, 10240),
+        (8192, 8192),
+        (8192, 59392),
+        (29696, 8192),
+        (8192, 5120),
+        (4096, 8192),
+        (8192, 29696),
+        (14848, 8192),
+        (8192, 2560),
+        (2048, 8192),
+        (8192, 14848),
+        (7424, 8192),
+        (8192, 1280),
+        (1024, 8192),
+        (8192, 7424),
+        (3712, 8192),
+    ],
+)
 @pytest.mark.parametrize("m", [1, 17, 65, 128])
 def test_official_loader_custom_op_compile_and_changed_input_graph(
     k, n, m, monkeypatch
