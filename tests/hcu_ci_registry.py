@@ -322,6 +322,16 @@ register_hcu_ci(
     target="tests/runtime_patch/test_flashmla_decode_align_triton_mla.py",
     est_time=180,
 )
+register_hcu_ci(
+    job="accuracy-gfx938",
+    target="tests/runtime_patch/test_flashmla_qk_fp8_accuracy.py",
+    est_time=90,
+)
+register_hcu_ci(
+    job="hy4-contract",
+    target="tests/runtime_patch/test_flashmla_qk_fp8.py",
+    est_time=15,
+)
 
 register_hcu_ci(
     job="contract-hcu-gfx936",
