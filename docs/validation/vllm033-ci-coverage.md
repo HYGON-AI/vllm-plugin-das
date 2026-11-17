@@ -146,8 +146,11 @@ resources or branch protection itself.
 Both modes retain job IDs/check names, per-job 45-minute timeouts, concurrency
 cancellation, artifact names, source/portable/device suites and the existing
 trusted-author/`ready-hcu` authorization. CPU selection/source checks stay on
-GitHub-hosted runners without Harbor secrets. Fork PR image-pull restrictions
-remain unchanged; do not switch to `pull_request_target` to bypass them.
+GitHub-hosted runners without Harbor secrets. The `pull_request_target` trigger
+lets fork runs resolve repository variables and use repository credentials for
+the device image pull; it stays gated by the trusted-author/`ready-hcu`
+authorization above, and the executed workflow and helper come from the base
+revision rather than the PR head.
 The aggregate `v033-ci-gate` still requires both selected device jobs to pass.
 The v0.28.1 selector map and Docker helpers are not used by this release and
 are intentionally not migrated here. The already-ARC wheel publishing workflow
