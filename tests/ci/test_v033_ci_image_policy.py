@@ -188,7 +188,8 @@ class ImagePolicyTests(unittest.TestCase):
             self.assertNotIn('volumes:', container)
             for forbidden in ['/dev/kfd', '/dev/dri', '--shm-size', '--privileged', '/opt/hyhal:', 'docker ']:
                 self.assertNotIn(forbidden, block)
-            self.assertIn('timeout-minutes: 45', block)
+            expected_timeout = 75 if arch == 'gfx936' else 45
+            self.assertIn('timeout-minutes: ' + str(expected_timeout), block)
 
     def test_pr_code_jobs_do_not_persist_checkout_credentials(self):
         for name in ['select', 'v033-source-contract', 'v033-device-gfx936', 'v033-device-gfx938']:
