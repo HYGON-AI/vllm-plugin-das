@@ -1,12 +1,9 @@
 # SPDX-License-Identifier: Apache-2.0
 """Prepare a private Core wheel and inspect a built release CI candidate."""
-from __future__ import annotations
-
 import argparse
 import base64
 import csv
 import hashlib
-from importlib import metadata
 import io
 import json
 import os
@@ -108,7 +105,10 @@ def download(url, token, destination, maximum):
     # A redirect never forwards the package credential to another destination.
     with build_opener(NoRedirect).open(request, timeout=60) as response, destination.open('xb') as output:
         size = 0
-        while chunk := response.read(1024 * 1024):
+        while True:
+            chunk = response.read(1024 * 1024)
+            if not chunk:
+                break
             size += len(chunk)
             if size > maximum:
                 raise CandidateError('private artifact exceeds size bound')
@@ -146,6 +146,10 @@ def architectures(binary, runner=subprocess.run):
 
 
 def inspect_image():
+    # Installed-runtime inspection runs inside the CPython 3.12 image. The
+    # download/RECORD preparation path must also load on Python 3.6 builders.
+    from importlib import metadata
+
     core = metadata.distribution('vllm')
     if not core.version.startswith('0.33.0+'):
         raise CandidateError('image does not contain a vLLM 0.33 candidate')

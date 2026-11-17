@@ -57,9 +57,9 @@ jobs:
         with:
           ref: ${{ github.sha }}
           persist-credentials: false
-      - uses: actions/setup-python@v5
-        with:
-          python-version: '3.12'
+      - name: Validate runner Python
+        run: |
+          python3 -I -S -B -c 'import sys; assert sys.version_info >= (3, 6), "runner Python 3.6+ required"; print(sys.version)'
       - name: Allocate owned temporary context
         run: |
           set -euo pipefail
@@ -74,7 +74,7 @@ jobs:
           SOURCEFIND_PACKAGE_TOKEN: ${{ secrets.V033_CORE_PACKAGE_TOKEN }}
         run: |
           set -euo pipefail
-          python3 -I -B .github/scripts/hcu_ci/v033_candidate_image.py prepare \
+          python3 -I -S -B .github/scripts/hcu_ci/v033_candidate_image.py prepare \
             --context "$PUBLISH_ROOT/context" > "$PUBLISH_ROOT/preparation.json"
           cp docker/Dockerfile.v033-ci-candidate "$PUBLISH_ROOT/context/Dockerfile"
           rm "$PUBLISH_ROOT/context/candidate-manifest.json"
@@ -109,7 +109,7 @@ jobs:
           docker push "$CANDIDATE_TAG"
           docker image inspect --format '{{json .RepoDigests}}' "$CANDIDATE_TAG" \
             > "$PUBLISH_ROOT/repo-digests.json"
-          python3 -I -B - <<'PY'
+          python3 -I -S -B - <<'PY'
           import json, os, re
           from pathlib import Path
           root = Path(os.environ['PUBLISH_ROOT'])
