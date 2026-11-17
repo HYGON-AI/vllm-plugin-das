@@ -13,6 +13,7 @@ from pathlib import Path
 
 import numpy as np
 import torch
+from .minimax31_prefill import enabled as _prefill_enabled
 
 from vllm.distributed.parallel_state import get_pcp_group
 from vllm.forward_context import get_forward_context
@@ -137,6 +138,10 @@ def validate_fp8_sparse_cache(layer, slots):
                 or scale.device != cache.device):
             raise ValueError("FP8 MiniMax PCP %s must be a local FP32 scalar" % name)
         scales.append(scale)
+    if getattr(layer, "_hcu_native_msa", False) and _prefill_enabled("scale_guard"):
+        from .minimax31_prefill import check_bound_scales
+        if check_bound_scales(layer):
+            return
     values = tuple(float(scale.item()) for scale in scales)
     for name, value in zip(("_k_scale", "_v_scale"), values):
         if not math.isfinite(value) or value <= 0:
@@ -145,6 +150,9 @@ def validate_fp8_sparse_cache(layer, slots):
     if checked is not None and checked[0] == cache.data_ptr() and checked[1] != values:
         raise ValueError("FP8 MiniMax PCP scales changed while KV cache is bound")
     layer._hcu_fp8_checked = (cache.data_ptr(), values)
+    if getattr(layer, "_hcu_native_msa", False) and _prefill_enabled("scale_guard"):
+        from .minimax31_prefill import bind_validated_scales
+        bind_validated_scales(layer)
 
 
 class MiniMax31PCPDenseAttention(_original_dense):
@@ -249,7 +257,11 @@ class MiniMax31PCPSparseAttention(_original_sparse):
         rows = qkv[:, self.q_size:kv_end]
         if not self.skip_index_topk:
             index_k_start = kv_end + self.index_q_size
-            rows = torch.cat((rows, qkv[:, index_k_start:]), dim=-1)
+            if self._hcu_native_msa and _prefill_enabled("pack_buffer"):
+                from .minimax31_prefill import pack_rows
+                rows = pack_rows((rows, qkv[:, index_k_start:]))
+            else:
+                rows = torch.cat((rows, qkv[:, index_k_start:]), dim=-1)
         gathered = gather_cache_rows(rows, slots[self.layer_name])
         k = gathered[:, :self.kv_size].view(-1, self.num_kv_heads, self.head_dim)
         v = gathered[:, self.kv_size:2*self.kv_size].view_as(k)
@@ -271,10 +283,19 @@ class MiniMax31PCPSparseAttention(_original_sparse):
                 keys, values = binding.key_writer, binding.value_writer
             else:
                 keys, values = self.kv_cache.transpose(1, 2).split(self.head_dim, dim=-1)
-            triton_reshape_and_cache_flash(
-                k, v, keys, values, slots[self.layer_name], self.kv_cache_dtype,
-                self._k_scale, self._v_scale)
-            if index_k is not None:
+            fused_store = (self._hcu_native_msa and index_k is not None
+                           and _prefill_enabled("cache_store"))
+            if fused_store:
+                from triton_tmp_dir.minimax31_prefill_triton import store_pcp_cache
+                store_pcp_cache(gathered, slots[self.layer_name],
+                    slots[self.indexer.index_cache.prefix], keys, values,
+                    self.indexer.index_cache.kv_cache, self._k_scale, self._v_scale)
+
+            else:
+                triton_reshape_and_cache_flash(
+                    k, v, keys, values, slots[self.layer_name], self.kv_cache_dtype,
+                    self._k_scale, self._v_scale)
+            if index_k is not None and not fused_store:
                 from vllm.models.minimax_m3.amd.ops.sparse_pa import (
                     minimax_m3_insert_index_cache)
                 if self._hcu_fp8_index:
@@ -320,11 +341,12 @@ class MiniMax31PCPManager(PCPManager):
 
     def partition_batch(self, input_batch, batch_desc):
         local = super().partition_batch(input_batch, batch_desc)
-        if self._hcu_native_msa:
-            from .minimax31_msa import set_forward_layout
-            set_forward_layout(local)
+        # Reserve the static frame before mutating shared MSA metadata.
         if self._hcu_static:
             from .minimax31_static_runtime import set_forward_layout
+            set_forward_layout(local)
+        if self._hcu_native_msa:
+            from .minimax31_msa import set_forward_layout
             set_forward_layout(local)
         return local
 
@@ -360,6 +382,7 @@ class MiniMax31PCPModelState(MiniMaxM3ModelState):
 class MiniMax31PCPForConditionalGeneration(stock.MiniMaxM3SparseForConditionalGeneration):
     def __init__(self, *, vllm_config, prefix=""):
         validate_scope(vllm_config)
+        _prefill_enabled("metadata")  # freeze/report the selected model policy before loading
         from .minimax31_static_contract import model_construction_scope
         with model_construction_scope(vllm_config.model_config):
             super().__init__(vllm_config=vllm_config, prefix=prefix)
