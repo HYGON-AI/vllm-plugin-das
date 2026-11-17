@@ -27,6 +27,21 @@ on:
         description: 'Prepared runtime digest in HARBOR_SITE/hcu/base_env/vllm'
         type: string
         required: true
+      adapter_source:
+        description: 'Optional reviewed Adapter SHA; requires both paired wheel hashes'
+        type: string
+        required: false
+        default: ''
+      adapter_wheel_sha256:
+        description: 'Optional reviewed hcu-adapter wheel SHA256 from candidate manifest'
+        type: string
+        required: false
+        default: ''
+      kernel_wheel_sha256:
+        description: 'Optional reviewed matching sgl-kernel wheel SHA256'
+        type: string
+        required: false
+        default: ''
 
 permissions:
   contents: read
@@ -50,6 +65,9 @@ jobs:
       PACKAGE_VERSION: ${{ inputs.package_version }}
       CORE_SOURCE: ${{ inputs.core_source }}
       WHEEL_SHA256: ${{ inputs.wheel_sha256 }}
+      ADAPTER_SOURCE: ${{ inputs.adapter_source }}
+      ADAPTER_WHEEL_SHA256: ${{ inputs.adapter_wheel_sha256 }}
+      KERNEL_WHEEL_SHA256: ${{ inputs.kernel_wheel_sha256 }}
       BASE_IMAGE: ${{ inputs.base_image }}
       HARBOR_SITE: ${{ vars.HARBOR_SITE }}
     steps:
@@ -95,13 +113,15 @@ jobs:
           docker build --network=none --build-arg "BASE_IMAGE=$BASE_IMAGE" \
             --label "org.opendas.vllm.source=$CORE_SOURCE" \
             --label "org.opendas.vllm.wheel.sha256=$WHEEL_SHA256" \
+            --label "org.opendas.adapter.source=$ADAPTER_SOURCE" \
             --label 'org.opendas.vllm.validation=unqualified-ci-candidate' \
             -t "$tag" "$PUBLISH_ROOT/context"
           docker run --rm --network=none \
             -e HCU_ADAPTER_HOST=none -e HIP_VISIBLE_DEVICES= \
             -e ROCR_VISIBLE_DEVICES= -e CUDA_VISIBLE_DEVICES= \
             -v "$GITHUB_WORKSPACE/.github/scripts/hcu_ci/v033_candidate_image.py:/inspect.py:ro" \
-            --entrypoint python3 "$tag" -I -B /inspect.py inspect \
+            -v "$PUBLISH_ROOT/preparation.json:/expected.json:ro" \
+            --entrypoint python3 "$tag" -I -S -B /inspect.py inspect --expected /expected.json \
             > "$PUBLISH_ROOT/installed-payload.json"
       - name: Publish unique candidate and record immutable reference
         run: |

@@ -1,5 +1,6 @@
 # SPDX-License-Identifier: Apache-2.0
-# Build context contains only the validated private Core wheel and this file.
+# Context contains the validated Core wheel, optional paired Adapter/native
+# wheels, and this file. All wheels install together without dependency lookup.
 ARG BASE_IMAGE
 FROM ${BASE_IMAGE}
 

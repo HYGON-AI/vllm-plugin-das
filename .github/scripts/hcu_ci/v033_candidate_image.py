@@ -1,8 +1,9 @@
 # SPDX-License-Identifier: Apache-2.0
-"""Prepare a private Core wheel and inspect a built release CI candidate."""
+"""Prepare private runtime wheels and inspect a built release CI candidate."""
 import argparse
 import base64
 import csv
+from email.parser import BytesParser
 import hashlib
 import io
 import json
@@ -22,6 +23,7 @@ GPU_LIBRARIES = ('_C.abi3.so', '_C_stable_libtorch.abi3.so',
 ADAPTER_SEAMS = ('kernels/pcp_fork.py', 'fp4_indexer.py', 'v41_fp8_indexer.py',
                  'ct_w4a8_registration.py', 'dsv41_activation.py',
                  'dsv41_channel_fp8.py', 'dsv41_dspark_registration.py')
+PAIR_INPUTS = ('ADAPTER_SOURCE', 'ADAPTER_WHEEL_SHA256', 'KERNEL_WHEEL_SHA256')
 
 
 class CandidateError(ValueError):
@@ -48,6 +50,13 @@ def request_inputs(environment):
     if not values['BASE_IMAGE'].startswith(prefix) or not re.fullmatch(
             r'[0-9a-f]{64}', values['BASE_IMAGE'][len(prefix):]):
         raise CandidateError('base requires an immutable approved runtime repository digest')
+    pair = {key: environment.get(key, '') for key in PAIR_INPUTS}
+    if any(pair.values()):
+        for key in PAIR_INPUTS:
+            if not re.fullmatch(r'[0-9a-f]{40}' if key == 'ADAPTER_SOURCE'
+                                else r'[0-9a-f]{64}', pair[key]):
+                raise CandidateError('complete paired Adapter inputs required: ' + key)
+        values.update(pair)
     return values
 
 
@@ -64,7 +73,7 @@ def validate_manifest(manifest, inputs):
     return filename
 
 
-def verify_wheel(path, expected):
+def wheel_payload(path, expected):
     if hashlib.sha256(path.read_bytes()).hexdigest() != expected:
         raise CandidateError('downloaded wheel checksum differs')
     with zipfile.ZipFile(path) as archive:
@@ -78,24 +87,93 @@ def verify_wheel(path, expected):
         records = [name for name in names if name.endswith('.dist-info/RECORD')]
         if len(records) != 1:
             raise CandidateError('wheel must contain one RECORD')
-        checked = set()
+        checked = {}
         for name, digest, size in csv.reader(io.StringIO(archive.read(records[0]).decode())):
             if name in checked:
                 raise CandidateError('duplicate RECORD member')
-            checked.add(name)
             payload = archive.read(name)
             if not digest:
                 if name != records[0]:
                     raise CandidateError('unhashed wheel payload')
+                checked[name] = None
                 continue
             actual = 'sha256=' + base64.urlsafe_b64encode(hashlib.sha256(payload).digest()).rstrip(b'=').decode()
             if digest != actual or size != str(len(payload)):
                 raise CandidateError('wheel RECORD checksum or size differs')
-        if checked != {name for name in names if not name.endswith('/')}:
+            checked[name] = hashlib.sha256(payload).hexdigest()
+        if set(checked) != {name for name in names if not name.endswith('/')}:
             raise CandidateError('wheel payload missing from RECORD')
-        if not all('vllm/' + library in checked for library in GPU_LIBRARIES):
-            raise CandidateError('wheel lacks required native libraries')
-    return len(checked)
+    return checked
+
+
+def core_payload(path, expected):
+    payload = wheel_payload(path, expected)
+    if not all('vllm/' + library in payload for library in GPU_LIBRARIES):
+        raise CandidateError('wheel lacks required native libraries')
+    return payload
+
+
+def verify_wheel(path, expected):
+    return len(core_payload(path, expected))
+
+
+def wheel_identity(path):
+    with zipfile.ZipFile(path) as archive:
+        names = [n for n in archive.namelist() if n.endswith('.dist-info/METADATA')]
+        if len(names) != 1:
+            raise CandidateError('wheel requires exactly one METADATA')
+        return names[0].split('/')[0], BytesParser().parsebytes(archive.read(names[0]))
+
+
+def adapter_manifest(manifest, inputs):
+    pair = manifest.get('adapter')
+    if 'ADAPTER_SOURCE' not in inputs:
+        if pair is not None:
+            raise CandidateError('Adapter manifest requires explicit paired dispatch inputs')
+        return None
+    if not isinstance(pair, dict) or pair.get('source_head') != inputs['ADAPTER_SOURCE']:
+        raise CandidateError('paired Adapter source differs or is missing')
+    for key, prefix, tag, input_key in [
+            ('adapter', 'hcu_adapter', 'py3-none-any', 'ADAPTER_WHEEL_SHA256'),
+            ('kernel', 'sgl_kernel', 'cp312-cp312-linux_x86_64', 'KERNEL_WHEEL_SHA256')]:
+        filename = pair.get(key + '_wheel_filename', '')
+        if (not isinstance(filename, str)
+                or not re.fullmatch(prefix + r'-[A-Za-z0-9.!+_]+-' + tag + r'\.whl', filename)
+                or pair.get(key + '_wheel_sha256') != inputs[input_key]):
+            raise CandidateError('paired ' + key + ' filename or checksum differs')
+    return pair
+
+
+def component_payload(path, digest, distribution):
+    payload = wheel_payload(path, digest)
+    info, metadata = wheel_identity(path)
+    namespace = distribution.replace('-', '_')
+    version = metadata.get('Version', '')
+    if (metadata.get('Name', '').lower().replace('_', '-') != distribution
+            or info != namespace + '-' + version + '.dist-info'
+            or not version.partition('+')[2].startswith('dtk2610.torch2130.')):
+        raise CandidateError('paired ' + distribution + ' identity or DTK/Torch ABI differs')
+    tag = 'py3-none-any' if distribution == 'hcu-adapter' else 'cp312-cp312-linux_x86_64'
+    if path.name != namespace + '-' + version + '-' + tag + '.whl':
+        raise CandidateError('paired wheel filename disagrees with METADATA')
+    for name in payload:
+        if (not name.startswith((namespace + '/', info + '/'))
+                and not (distribution == 'hcu-adapter' and name == 'sitecustomize.py')):
+            raise CandidateError('paired wheel claims foreign payload: ' + name)
+    if namespace + '/__init__.py' not in payload:
+        raise CandidateError('paired wheel lacks its package')
+    if distribution == 'hcu-adapter':
+        if not all('hcu_adapter/' + name in payload for name in ADAPTER_SEAMS):
+            raise CandidateError('paired Adapter lacks required interfaces')
+    elif len([name for name in payload if name.startswith('sgl_kernel/native_ops.')
+              and name.endswith('.so')]) != 1:
+        raise CandidateError('paired kernel requires exactly one native_ops library')
+    return payload, metadata
+
+
+def wheel_report(path, payload, distribution, version):
+    return dict(distribution=distribution, filename=path.name, version=version,
+                payload_sha256={name: digest for name, digest in payload.items() if digest})
 
 
 def download(url, token, destination, maximum):
@@ -128,12 +206,36 @@ def prepare(destination, environment, fetch=download):
     fetch(base + 'candidate-manifest.json', token, manifest_path, 1024**2)
     manifest = json.loads(manifest_path.read_text())
     filename = validate_manifest(manifest, inputs)
+    pair = adapter_manifest(manifest, inputs)
     wheel = core / filename
     fetch(base + quote(filename, safe=''), token, wheel, 2 * 1024**3)
-    entries = verify_wheel(wheel, inputs['WHEEL_SHA256'])
-    return dict(core_source=inputs['CORE_SOURCE'], wheel_sha256=inputs['WHEEL_SHA256'],
-                wheel_filename=filename, record_entries=entries, base_image=inputs['BASE_IMAGE'],
-                device_qualified=False, model_qualified=False)
+    payload = core_payload(wheel, inputs['WHEEL_SHA256'])
+    _, metadata = wheel_identity(wheel)
+    if metadata.get('Name', '').lower() != 'vllm':
+        raise CandidateError('Core METADATA identity differs')
+    report = dict(core_source=inputs['CORE_SOURCE'], wheel_sha256=inputs['WHEEL_SHA256'],
+                  wheel_filename=filename, record_entries=len(payload), base_image=inputs['BASE_IMAGE'],
+                  wheels=[wheel_report(wheel, payload, 'vllm', metadata['Version'])],
+                  device_qualified=False, model_qualified=False)
+    if pair:
+        prepared = {}
+        for key, distribution, input_key in [
+                ('adapter', 'hcu-adapter', 'ADAPTER_WHEEL_SHA256'),
+                ('kernel', 'sgl-kernel', 'KERNEL_WHEEL_SHA256')]:
+            path = core / pair[key + '_wheel_filename']
+            fetch(base + quote(path.name, safe=''), token, path, 512 * 1024**2)
+            component, metadata = component_payload(path, inputs[input_key], distribution)
+            prepared[key] = metadata
+            report['wheels'].append(wheel_report(path, component, distribution, metadata['Version']))
+        adapter_version, kernel_version = [prepared[key]['Version'] for key in ('adapter', 'kernel')]
+        requirements = [re.sub(r'\s', '', value) for value in prepared['adapter'].get_all('Requires-Dist', [])]
+        if (adapter_version.partition('+')[2] != kernel_version.partition('+')[2]
+                or 'sgl-kernel==' + kernel_version not in requirements):
+            raise CandidateError('Adapter must require the exact matching native build')
+        report['adapter_source'] = inputs['ADAPTER_SOURCE']
+        report['adapter_wheel_sha256'] = inputs['ADAPTER_WHEEL_SHA256']
+        report['kernel_wheel_sha256'] = inputs['KERNEL_WHEEL_SHA256']
+    return report
 
 
 def architectures(binary, runner=subprocess.run):
@@ -145,16 +247,53 @@ def architectures(binary, runner=subprocess.run):
     return targets
 
 
-def inspect_image():
+def inspect_image(expected=None):
     # Installed-runtime inspection runs inside the CPython 3.12 image. The
     # download/RECORD preparation path must also load on Python 3.6 builders.
     from importlib import metadata
 
+    for name in ('vllm', 'hcu-adapter', 'sgl-kernel'):
+        owners = [d for d in metadata.distributions()
+                  if re.sub(r'[-_.]+', '-', d.metadata.get('Name', '').lower()) == name]
+        if len(owners) != 1:
+            raise CandidateError('installed ' + name + ' requires one distribution owner')
     core = metadata.distribution('vllm')
     if not core.version.startswith('0.33.0+'):
         raise CandidateError('image does not contain a vLLM 0.33 candidate')
     adapter = metadata.distribution('hcu-adapter')
     kernel = metadata.distribution('sgl-kernel')
+    records = {}
+    for name, distribution in [('vllm', core), ('hcu-adapter', adapter), ('sgl-kernel', kernel)]:
+        raw = distribution.read_text('RECORD')
+        if not raw:
+            raise CandidateError('installed ' + name + ' lacks RECORD')
+        count = 0
+        seen = set()
+        for filename, digest, size in csv.reader(io.StringIO(raw)):
+            if filename in seen:
+                raise CandidateError('duplicate installed RECORD member')
+            seen.add(filename)
+            if digest:
+                payload = Path(distribution.locate_file(filename)).read_bytes()
+                actual = 'sha256=' + base64.urlsafe_b64encode(hashlib.sha256(payload).digest()).rstrip(b'=').decode()
+                if digest != actual or size != str(len(payload)):
+                    raise CandidateError('installed ' + name + ' RECORD differs: ' + filename)
+                count += 1
+        records[name] = dict(verified=count, record_sha256=hashlib.sha256(raw.encode()).hexdigest())
+    if expected is not None:
+        owners = {'vllm': core, 'hcu-adapter': adapter, 'sgl-kernel': kernel}
+        wheels = expected.get('wheels', [])
+        wanted = {'vllm', 'hcu-adapter', 'sgl-kernel'} if expected.get('adapter_source') else {'vllm'}
+        if len(wheels) != len(wanted) or {w['distribution'] for w in wheels} != wanted:
+            raise CandidateError('prepared installed-owner set differs')
+        for wheel in wheels:
+            distribution = owners[wheel['distribution']]
+            if distribution.version != wheel['version'] or not wheel['payload_sha256']:
+                raise CandidateError('installed wheel identity differs')
+            for filename, digest in wheel['payload_sha256'].items():
+                payload = Path(distribution.locate_file(filename)).read_bytes()
+                if hashlib.sha256(payload).hexdigest() != digest:
+                    raise CandidateError('installed payload differs from prepared wheel: ' + filename)
     for name in ADAPTER_SEAMS:
         if not Path(adapter.locate_file('hcu_adapter/' + name)).is_file():
             raise CandidateError('image Adapter lacks ' + name)
@@ -168,6 +307,7 @@ def inspect_image():
         raise CandidateError('metadata inspection unexpectedly imported Torch')
     return dict(versions={'vllm': core.version, 'hcu-adapter': adapter.version,
                           'sgl-kernel': kernel.version}, embedded_architectures=native,
+                installed_records=records, prepared_payload_verified=expected is not None,
                 device_qualified=False, model_qualified=False)
 
 
@@ -175,10 +315,20 @@ def main():
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument('command', choices=['prepare', 'inspect'])
     parser.add_argument('--context', type=Path)
+    parser.add_argument('--expected', type=Path)
     args = parser.parse_args()
     if args.command == 'prepare' and args.context is None:
         parser.error('prepare requires --context')
-    report = prepare(args.context, os.environ) if args.command == 'prepare' else inspect_image()
+    if args.command == 'inspect' and sys.flags.no_site:
+        # The image uses system Python. Add its package directories without
+        # executing .pth or sitecustomize (Adapter bootstrap probes Torch).
+        import sysconfig
+        for key in ('purelib', 'platlib'):
+            path = sysconfig.get_path(key)
+            if path not in sys.path:
+                sys.path.append(path)
+    expected = json.loads(args.expected.read_text()) if args.expected else None
+    report = prepare(args.context, os.environ) if args.command == 'prepare' else inspect_image(expected)
     print(json.dumps(report, sort_keys=True))
 
 
