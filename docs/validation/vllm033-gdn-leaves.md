@@ -293,3 +293,46 @@ dependency. The earlier frozen-stack leak reports remain valid historical
 results.
 
 Receipt: `evidence/qwen35-gdn-mtp3-gc-exit-tp1-closure-20261117-r2.json`.
+
+## Fresh installed component qualification, 2026-11-17
+
+A separate installation uses the actual Adapter main253989 Nightly artifacts
+from run44024713944, this PR's production payload969294c5, the independently
+unmerged Core!92 candidate8e216c93, and the recorded source-built AITER/BoltOPs
+wheels. All six distributions are physically installed and their raw RECORDs
+match in parent and child processes before and after execution. This is a
+component result for that frozen combination; subsequent Adapter main72484f4
+configuration changes do not inherit it.
+
+| Completed check | Result |
+| --- | --- |
+| Actual Nightly native Adapter contracts | 42 passed, zero skips |
+| Public provider selectors in separate processes | 11 passed |
+| Portable Plugin contracts, corrected fixture | 1132 passed, six HCU cases deselected |
+| AITER GDN leaf and changing-input Graph contracts | 16 passed, zero skips |
+| BoltOPs GDN leaf and changing-input Graph contracts | 16 passed, zero skips |
+
+Both provider suites include four cases with local key/value heads8/16,D128,
+derived from the real checkpoint's16/32 heads and official Core TP2 sharding.
+They cover packed decode, speculative varlen decode, and fixed/varlen prefill;
+the BoltOPs prefill cases also assert the actual chunk-H route. They do not
+exercise TP communication or a TP2 model.
+
+The original portable run's stale test fixture failed once: production freezes
+FP4 profile inputs on the layer, while the fixture patched a removed config
+reader. The corrected fixture supplies those frozen fields and still invokes
+the real execute/reservation path. Production code is unchanged. The original
+AITER cold run timed out after1800seconds; the terminal rerun used only its
+verified real compiler cache and passed in455.35seconds. Neither failed attempt
+is erased, and the cache-assisted result makes no cold-start performance claim.
+
+All terminal component workers exit0, release owned process identities, and
+retain unchanged six-package RECORDs, without observed nanobind, ignored
+exception or forced-cleanup diagnostics. Evidence:
+`evidence/current-v033-candidate-20261117-r1/component-gate.json`.
+
+No new model/HumanEval score, TP2/MTP3, gfx936, provider publication or throughput
+qualification is claimed. Earlier model scores remain bound to their original
+packages. This PR stays Draft pending its remaining model, platform, provider,
+lifecycle-dependency and current-head remote CI/review gates. DeepSeek V4.1
+model tests remain deferred.
