@@ -23,6 +23,7 @@ from __future__ import annotations
 
 from collections.abc import Mapping
 from dataclasses import dataclass
+import inspect
 from types import MethodType
 
 import torch
@@ -266,6 +267,27 @@ def _expert_storage_key(weight: torch.Tensor) -> tuple[object, ...]:
             weight.dtype)
 
 
+def _loader_function(loader, experts, name):
+    if getattr(loader, '__self__', None) is experts:
+        return loader.__func__
+
+    from .quantization.ct_w4a8_method import HcuCTW4A8MoEMethod
+
+    # Packed CT wraps the native bound loader with its one-time loading guard.
+    # Verify the underlying owner, but invoke the wrapper on every replica so
+    # a reload after HIPC conversion still raises before touching packed data.
+    if isinstance(experts.quant_method, HcuCTW4A8MoEMethod):
+        native = inspect.unwrap(loader)
+        if (getattr(native, '__self__', None) is experts
+                and getattr(native, '__func__', None) is type(experts).weight_loader):
+            def guarded_load(self, *args, **kwargs):
+                return loader(*args, **kwargs)
+
+            return guarded_load
+    raise StaticEplbError(
+        f'static EPLB parameter {name!r} has an unsupported loader owner')
+
+
 def bind_placement(model, cfg, *, bind_weight_loaders=True):
     """Bind layout rows, and optionally the checkpoint weight fan-out loaders.
 
@@ -334,10 +356,7 @@ def bind_placement(model, cfg, *, bind_weight_loaders=True):
                         'its loader would not follow the placement')
                 continue
             loader = getattr(parameter, 'weight_loader', None)
-            if getattr(loader, '__self__', None) is not experts:
-                raise StaticEplbError(
-                    f'static EPLB parameter {name!r} has an unsupported loader owner')
-            parameters.append((parameter, loader.__func__))
+            parameters.append((parameter, _loader_function(loader, experts, name)))
         targets.append((experts, parameters))
 
     _verify_plan_across_ep_ranks(plan)

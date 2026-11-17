@@ -73,7 +73,11 @@ def select_attention(cfg):
 
     if pcp_fork.selected_mode() == 'stock' or not validate_config(cfg):
         return native._select_dsv4_attn_cls(cfg)
-    return attention_class()
+    base = attention_class()
+    if cfg.speculative_config is not None:
+        from ..pcp_dspark import HcuV41PcpDSparkAttention
+        return HcuV41PcpDSparkAttention
+    return base
 
 
 class HcuV41PcpMoE(native.DeepseekV4MoE):
@@ -126,6 +130,15 @@ class HcuV41PcpBackbone(native.DeepseekV4Model):
             reason = 'sequence parallel and microbatching cannot follow the replay batch'
         elif any(i >= cut for i in getattr(self.config, 'engram_layer_ids', ())):
             reason = 'an Engram layer sits at or after the last KV source layer'
+        elif vllm_config.speculative_config is not None and (
+            getattr(vllm_config.speculative_config.draft_model_config.hf_config,
+                    'sliding_window', None) is None
+            or vllm_config.speculative_config.draft_model_config.hf_config.sliding_window
+                > self.config.sliding_window
+            or any(kind != 'sliding_attention' for kind in getattr(
+                vllm_config.speculative_config.draft_model_config.hf_config, 'layer_types', ()))
+        ):
+            reason = 'the drafter reads hidden states outside the target replay window'
         else:
             return True
         native.logger.warning_once('Decoder SWA bounded replay is off: %s.', reason)
