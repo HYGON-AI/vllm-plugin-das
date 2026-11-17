@@ -1,4 +1,5 @@
 # SPDX-License-Identifier: Apache-2.0
+# SPDX-FileCopyrightText: Copyright (c) 2026 Hygon Information Technology Co., Ltd.
 from __future__ import annotations
 
 import importlib.util
@@ -649,7 +650,7 @@ def test_pcp_runner_keeps_rank_local_tokens_for_megamoe():
     tree = ast.parse(path.read_text())
     cls = next(n for n in tree.body if isinstance(n, ast.ClassDef) and n.name == "MoERunner")
     names = {"_maybe_dispatch", "_maybe_combine", "do_naive_dispatch_combine",
-             "_pcp_routing_inputs"}
+             "_dispatched_routing_inputs"}
     methods = [n for n in cls.body if isinstance(n, ast.FunctionDef) and n.name in names]
     calls = []
     group = NS(all_gather=lambda x, **kw: calls.append("gather") or x,
@@ -675,19 +676,23 @@ def test_pcp_runner_keeps_rank_local_tokens_for_megamoe():
     assert runner._maybe_combine(None, x) is x
     ids = torch.tensor([17, 23])
     for _ in range(2):
-        with runner._pcp_routing_inputs(ids, 2) as routing_ids:
+        with runner._dispatched_routing_inputs(x, logits, ids) as dispatched:
+            routed_x, routed_logits, routing_ids = dispatched
+            assert routed_x is x and routed_logits is logits
             assert routing_ids is ids
             assert context.is_padding is padding
         assert context.is_padding is padding
     assert calls == []
     runner._quant_method = NS(supports_internal_mk=False)
-    runner._maybe_dispatch(x, logits)
-    runner._maybe_combine(None, x)
-    with runner._pcp_routing_inputs(ids, 1) as routing_ids:
+    with runner._dispatched_routing_inputs(x[:1], logits[:1], ids) as dispatched:
+        routed_x, routed_logits, routing_ids = dispatched
+        torch.testing.assert_close(routed_x, x[:1])
+        torch.testing.assert_close(routed_logits, logits[:1])
         torch.testing.assert_close(routing_ids, ids[:1])
         torch.testing.assert_close(context.is_padding, padding[:1])
+    runner._maybe_combine(None, routed_x)
     assert context.is_padding is padding
-    assert calls == ["gather", "gather", "scatter", "gather", "gather"]
+    assert calls == ["gather", "gather", "gather", "gather", "scatter"]
 
 
 def test_offload_sleep_and_nonstandard_activation_rejected(runtime):

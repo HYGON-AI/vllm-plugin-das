@@ -9664,3 +9664,75 @@ def test_transform_sf_identity_fallback_and_backend_delegation():
     module._transform_sf_into_required_layout_impl = object()
     assert module.transform_sf_into_required_layout(sf, 128, 128) == "backend"
     assert calls[-2:] == ["lazy", ("backend", (sf, 128, 128), {})]
+
+
+@pytest.mark.parametrize("device", ["cpu", "cuda"])
+def test_boltops_w4a8_padding_routes_are_capture_safe(monkeypatch, device):
+    """Keep -1 padding rows out of the sorter's unchecked expert mesh."""
+    monkeypatch.setenv("VLLM_HCU_USE_CUSTOM_OPS", "0")
+    if device == "cuda" and not torch.cuda.is_available():
+        pytest.skip("requires a visible HCU for graph replay")
+    calls = []
+
+    def fused_experts_impl(hidden, _w1, _w2, weights, ids, **kwargs):
+        calls.append((weights, ids))
+        # A distinct expert contributes a different observable value. The
+        # padded row must contribute zero, without changing either live row.
+        return hidden + (weights * (ids + 1)).sum(dim=-1, keepdim=True)
+
+    monkeypatch.setattr(
+        compressed_tensors_moe_runtime,
+        "_boltops_w4a8_fused_experts",
+        lambda: fused_experts_impl,
+    )
+    method = SimpleNamespace(
+        moe=SimpleNamespace(
+            hidden_dim=4, activation=SimpleNamespace(value="silu"), num_experts=4
+        ),
+        moe_quant_config=SimpleNamespace(a1_scale=None, a2_scale=None),
+    )
+    layer = SimpleNamespace(
+        w13_weight=torch.zeros((4, 4, 2), dtype=torch.int8, device=device),
+        w2_weight=torch.zeros((4, 4, 1), dtype=torch.int8, device=device),
+        w13_weight_scale=torch.ones((4, 4, 1), device=device),
+        w2_weight_scale=torch.ones((4, 4, 1), device=device),
+        global_num_experts=4, _expert_map=None, swiglu_limit=0.0,
+    )
+    hidden = torch.zeros((3, 4), device=device)
+    ids = torch.tensor([[1, 3], [-1, -1], [2, 0]], dtype=torch.int32, device=device)
+    weights = torch.tensor([[0.25, 0.75], [0.5, 0.5], [0.6, 0.4]], device=device)
+    original_ids, original_weights = ids.clone(), weights.clone()
+
+    def invoke():
+        return compressed_tensors_moe_runtime.apply_vllm_w4a8_moe(
+            method, layer, hidden, weights, ids
+        )
+
+    output = invoke()
+    safe_weights, safe_ids = calls[-1]
+    torch.testing.assert_close(safe_ids[1], torch.tensor([0, 1], device=device, dtype=torch.int32))
+    torch.testing.assert_close(safe_weights[1], torch.zeros(2, device=device))
+    torch.testing.assert_close(safe_ids[[0, 2]], ids[[0, 2]])
+    torch.testing.assert_close(safe_weights[[0, 2]], weights[[0, 2]])
+    expected = torch.tensor([3.5, 0.0, 2.2], device=device)[:, None].expand_as(hidden)
+    torch.testing.assert_close(output, expected)
+    torch.testing.assert_close(ids, original_ids)
+    torch.testing.assert_close(weights, original_weights)
+    if device == "cuda":
+        stream = torch.cuda.Stream()
+        stream.wait_stream(torch.cuda.current_stream())
+        with torch.cuda.stream(stream):
+            for _ in range(3):
+                invoke()
+        torch.cuda.current_stream().wait_stream(stream)
+        graph = torch.cuda.CUDAGraph()
+        with torch.cuda.graph(graph):
+            captured = invoke()
+        graph.replay()
+        torch.cuda.synchronize()
+        torch.testing.assert_close(captured, expected)
+        ids.copy_(torch.tensor([[-1, -1], [1, 3], [2, 0]], device=device))
+        graph.replay()
+        torch.cuda.synchronize()
+        expected = torch.tensor([0.0, 3.0, 2.2], device=device)[:, None].expand_as(hidden)
+        torch.testing.assert_close(captured, expected)
