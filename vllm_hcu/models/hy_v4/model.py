@@ -522,7 +522,14 @@ class HYV4DecoderLayer(nn.Module):
 
 
 class HYV4Model(nn.Module, MixtureOfExperts):
-    """HY V4 backbone."""
+    """HY V4 backbone.
+
+    ``decoder_layer_cls`` is an extension seam for plugin-owned model
+    variants (for example HYV4 Flash) while keeping the common model
+    construction and loading path shared.
+    """
+
+    decoder_layer_cls = HYV4DecoderLayer
 
     def __init__(self, *, vllm_config: VllmConfig, prefix: str = ""):
         super().__init__()
@@ -568,7 +575,7 @@ class HYV4Model(nn.Module, MixtureOfExperts):
             self.embed_tokens = PPMissingLayer()
         self.start_layer, self.end_layer, self.layers = make_layers(
             config.num_hidden_layers,
-            lambda prefix: HYV4DecoderLayer(
+            lambda prefix: self.decoder_layer_cls(
                 config=config,
                 vllm_config=vllm_config,
                 cache_config=cache_config,
@@ -1044,6 +1051,9 @@ class HYV4Model(nn.Module, MixtureOfExperts):
 
 
 class HYV4ForCausalLM(nn.Module, SupportsPP, SupportsLoRA, MixtureOfExperts):
+    """HY V4 language model with a plugin-overridable backbone class."""
+
+    model_cls = HYV4Model
     packed_modules_mapping = HYV4_PACKED_MODULES_MAPPING
 
     def __init__(self, *, vllm_config: VllmConfig, prefix: str = ""):
@@ -1059,7 +1069,7 @@ class HYV4ForCausalLM(nn.Module, SupportsPP, SupportsLoRA, MixtureOfExperts):
         eplb_config = parallel_config.eplb_config
         self.num_redundant_experts = eplb_config.num_redundant_experts
 
-        self.model = HYV4Model(
+        self.model = self.model_cls(
             vllm_config=vllm_config, prefix=maybe_prefix(prefix, "model")
         )
         self._vllm_hcu_offline_eplb_mode = (
