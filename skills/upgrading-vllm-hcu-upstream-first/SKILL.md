@@ -160,6 +160,11 @@ backend selector authoritative: a selected whole-op/fused route can bypass the
 leaf aliases, so require execution evidence rather than counting activation as
 coverage. Python guards do not execute inside an already captured device Graph;
 serving health must also cover the host boundary before Graph replay.
+An installed native test using public startup must call the target Core's
+general-plugin loader before checking the ACTIVE Adapter owner. Plain pytest
+does not execute serving startup, and host/required-capability environment
+variables alone do not activate extensions. Retain the required-owner check;
+verify the ordinary CI entry without a harness that silently preloads plugins.
 Keep serving-worker policy and completed Python provider submissions separate
 from GPU trace events: a Graph replay may expose `hipGraphLaunch` without
 individual decode-node kernels. Identify prepared fallbacks per leaf; an

@@ -56,6 +56,12 @@ def runtime():
         original.__closure__,
     )
     if os.environ.get("HCU_V033_TEST_GDN_PUBLIC_STARTUP") == "1":
+        from vllm.plugins import load_general_plugins
+
+        # pytest does not run the serving engine's general-plugin startup.
+        # Use that public entry before requiring the ACTIVE Adapter owner;
+        # setting HCU_ADAPTER_HOST alone does not activate the extension.
+        load_general_plugins()
         from hcu_adapter.bridges import vllm as adapter
 
         adapter.require_extension_healthy(activation.CAPABILITY)

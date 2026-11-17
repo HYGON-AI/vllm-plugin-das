@@ -96,8 +96,11 @@ Triton autotuning itself allocates a 256 MiB benchmark cache; the earlier
 64 MiB cap failed there before native prefill execution. Shapes and official
 autotuning remain intact. Output absolute tolerance is tightened to 1e-4, with
 independent decode state checks at 5e-4. This candidate is still being qualified.
-`HCU_V033_TEST_GDN_PUBLIC_STARTUP=1` requires the real Adapter general-plugin
-activation before pytest; the fixture does not activate the extension itself.
+`HCU_V033_TEST_GDN_PUBLIC_STARTUP=1` calls Core's public
+`vllm.plugins.load_general_plugins()` before requiring the real ACTIVE Adapter
+owner. Plain pytest does not execute the serving engine's startup; setting the
+host and required-capability environment variables alone is insufficient. The
+fixture does not call the extension's private activation in this mode.
 Its official reference always binds canonical Core leaves, even after public
 startup has replaced consumer aliases. Packed decode and sigmoid MTP tests
 additionally compare the official kernels and an independent CPU FP32 recurrence, with NULL state,
@@ -336,3 +339,26 @@ qualification is claimed. Earlier model scores remain bound to their original
 packages. This PR stays Draft pending its remaining model, platform, provider,
 lifecycle-dependency and current-head remote CI/review gates. DeepSeek V4.1
 model tests remain deferred.
+
+## Ordinary pytest public-startup repair, 2026-11-17
+
+Exact-source CI44091275270 for57ad719 passed source8, portable1154 and
+gfx9381, but the first gfx936 component raised16 setup errors because no
+ACTIVE GDN extension owner had been activated. Its plain pytest command did
+not call the public general-plugin loader. The previous local harness called
+that loader before pytest, so those earlier passes did not cover this entry.
+
+An ordinary-pytest local control on the physically installed merged Core98,
+published Adapter253/native pair and Plugin57 reproduced all16 setup errors.
+Calling Core's public loader in the public-startup fixture fixes that entry:
+BoltOPs16/16 and AITER16/16 then pass on gfx938, with no skips. Tests retain
+the ACTIVE-owner health guard, independent canonical Core references, all
+four head geometries, accepted-token/state contracts, numerical tolerances
+and changed-input Graph replay. No production package code changed.
+
+Both runs use verified caches from the same six-owner installation and a
+512MiB Torch allocator limit. Raw RECORDs remain unchanged, test and process
+trackers exit0, no owned process remains, and no weakref/nanobind cleanup
+errors are observed. Fourteen upstream Torch deprecation warnings remain
+per provider. These results qualify this local test-entry repair; current-head
+gfx936/full CI, provider serving/HumanEval and performance gates remain open.
