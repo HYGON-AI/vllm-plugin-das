@@ -58,6 +58,9 @@ CPU 契约、设备数值、变输入 Graph、模型精度和性能分别验收�
 `validation/v0.32.0`、`tests/vllm032` 及旧版本设计/验证文档为历史证据，
 其中的分数和产物不能转授本发布线。历史兼容锁测试与其输入保持对应。
 
+033 设备 CI 的旧 Runner / ARC Kubernetes 切换与回退，见
+[CI 接入说明](docs/validation/vllm033-ci-coverage.md#switch-v033-device-ci-between-legacy-runners-and-arck8s)。
+
 ## 许可证
 
 Apache License 2.0，见 [LICENSE](LICENSE)、[NOTICE](NOTICE) 和
