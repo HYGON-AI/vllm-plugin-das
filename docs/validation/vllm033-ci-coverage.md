@@ -77,9 +77,9 @@ requires reviewed pre-existing runner registry authentication or credentials
 available to that event. The credentials declaration does not prove pull success.
 Missing authorization or pull access remains a failure; do not switch to
 `pull_request_target`, expose secrets to PR code, or let a PR head authorize itself.
-The container mounts `/opt/hyhal` read-only and uses the existing
-`scripts/ci/hcu/hcu_ci_start_container.sh` default 32GiB shared-memory policy
-without privileged mode.
+The default legacy container mounts `/opt/hyhal` read-only and uses the
+existing 32GiB shared-memory policy without privileged mode. The opt-in ARC
+backend below delegates mounts, shared memory and devices to the cluster.
 The hosted selector/source jobs receive no Harbor secrets or HCU device mounts.
 PR-code jobs use read-only contents permissions and every checkout disables
 persisted git credentials, including the source job's separate official checkout.
@@ -97,6 +97,61 @@ still works on a stdlib-only interpreter. Script-only public-selector contracts
 run as eleven explicit isolated cases; they are not counted as collected pytest
 tests. Installed tiers default to `TORCHINDUCTOR_COMPILE_THREADS=1`, while keeping
 explicit overrides, torch.compile and changed-input Graph contracts enabled.
+
+## Switch v0.33 device CI between legacy runners and ARC/K8s
+
+The device jobs support the ARC job-container model described in the supplied
+runner migration guide and use **ARC/K8s by default**. To override the default,
+configure the repository **Actions variable** `HCU_CI_RUNNER_MODE_V033`
+(Settings → Secrets and variables → Actions → Variables):
+
+| Value | `v033-device-gfx936` | `v033-device-gfx938` | Container resources |
+| --- | --- | --- | --- |
+| `legacy` | `[self-hosted, ci, bw1000]` | `[self-hosted, ci, bw1100]` | Existing host devices, read-only `/opt/hyhal`, 32GiB shm |
+| unset, empty or `k8s` | `hygon-bw1000-1card` | `hygon-bw1100-1card` | Supplied by the ARC pool; no custom volumes or Docker options |
+
+Explicit non-empty values must be `legacy` or `k8s`. A typo fails image/runner
+resolution before publishing any outputs; it never silently falls back or
+selects an arbitrary runner. The mode and both container specifications are resolved together, so
+changing labels cannot accidentally retain legacy host-device options.
+
+Keep the prepared, digest-pinned `HCU_CI_IMAGE_V033` and approved `HARBOR_SITE`
+configuration above. The same image is passed through `container.image` in both
+modes. ARC pool names are single strings, not combined with `self-hosted` or
+hardware labels. The workflow does not run nested Docker, request privileged
+mode, add `container.volumes`, choose a host/node or override visible-device IDs
+in K8s mode. Leave the injected `OMP_NUM_THREADS`, `MAX_JOBS` and
+`CMAKE_BUILD_PARALLEL_LEVEL` intact. ARC provides standard shared storage and
+resource limits; the repository does not configure the cluster or mount it.
+`HCU_CI_IN_K8S=1` can be inspected in the job environment for diagnosis, but it
+cannot choose `runs-on`: scheduling happens before steps execute.
+
+Before merging or running this workflow revision, the cluster owner must confirm
+both single-card pools (including the newly introduced BW1000 pool), prepared
+image access and the required DTK runtime are ready. Revisions containing this
+default use ARC/K8s without setting a variable; older revisions retain their own
+defaults. An existing explicit `legacy` value still selects the old runners.
+Compare the two backends with the **same image digest and test tiers**. Roll back
+by explicitly setting `HCU_CI_RUNNER_MODE_V033=legacy`; no workflow edit is needed.
+Removing or emptying the variable restores **K8s**, not legacy. This change only
+updates the workflow default; it does not modify repository variables, cluster
+resources or branch protection itself.
+
+Both modes retain job IDs/check names, per-job 45-minute timeouts, concurrency
+cancellation, artifact names, source/portable/device suites and the existing
+trusted-author/`ready-hcu` authorization. CPU selection/source checks stay on
+GitHub-hosted runners without Harbor secrets. Fork PR image-pull restrictions
+remain unchanged; do not switch to `pull_request_target` to bypass them.
+The aggregate `v033-ci-gate` still requires both selected device jobs to pass.
+The v0.28.1 selector map and Docker helpers are not used by this release and
+are intentionally not migrated here. The already-ARC wheel publishing workflow
+is unchanged; this switch covers the v0.33 device CI jobs only.
+
+Regression tests execute the actual image/runner resolver script with fake
+registry names and digests, checking unset/empty/explicit K8s, explicit legacy,
+invalid inputs, expression wiring and credential isolation. These are CPU configuration contracts, not
+proof of ARC scheduling, registry pulls, device isolation, HCU numerical
+correctness or model quality; those require a real authorized run.
 
 CPU verification commands:
 
