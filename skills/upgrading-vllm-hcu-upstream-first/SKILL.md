@@ -24,6 +24,23 @@ rewriting or retiring each patch. Keep a migration row with its owner, reason,
 affected call sites and tests. An identical file or matching parameter names
 does not establish equivalent behavior or performance.
 
+Inspect the old callback's body before calling it an optimization: a
+nonmutating audit callback need not become a replacement for an official
+verifier. Verify the registered target implementation and its observable
+behavior; direct verifier calls do not qualify full configuration construction
+or model execution.
+
+Confirm that tests call the production owner. A class or timeout formula copied
+into a test can pass after the production code regresses. Use real ZMQ sockets
+for receive behavior and real FutureWrapper constructors for queue ordering and
+exception propagation. Bound possible infinite waits and synchronize on explicit
+readiness. Where useful, exercise deliberately broken source in a separate
+process to establish that the test catches the regression; never install or
+commit that broken source. Reuse existing protocol suites and their CI coverage.
+Treat composite patches by subfeature: a passing receive-timeout test does not
+qualify RPC deadlines, pipeline queue capacity, fork initialization or worker
+lifecycle. Preserve unverified subfeatures in the migration ledger.
+
 ## Run a static preflight
 
 The companion script reads committed trees without checking out refs,
