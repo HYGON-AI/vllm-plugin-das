@@ -290,7 +290,7 @@ class MiniMax31PCPSparseAttention(_original_sparse):
             fused_store = (self._hcu_native_msa and index_k is not None
                            and _prefill_enabled())
             if fused_store:
-                from triton_tmp_dir.minimax31_prefill_triton import store_pcp_cache
+                from .minimax31_prefill_triton import store_pcp_cache
                 store_pcp_cache(gathered, slots[self.layer_name],
                     slots[self.indexer.index_cache.prefix], keys, values,
                     self.indexer.index_cache.kv_cache, self._k_scale, self._v_scale)

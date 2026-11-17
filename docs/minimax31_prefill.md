@@ -130,3 +130,17 @@ HCU runtime); restart the engine, never catch and continue with uncertain cache.
 The explicit stock comparison retains its synchronous Python validation. Clean
 forks before policy/device state can initialize independently, but inherited
 active state is never reset to bypass ownership; use spawn workers.
+
+## Installed-wheel boundary
+
+The prefill implementation is packaged as
+`hcu_vllm_das.parallel.minimax31_prefill_triton`. All five production import
+sites use that package-relative module; it is included by the independent
+Plugin project's existing setuptools namespace discovery. It does not require
+the repository-root `triton_tmp_dir` directory on `PYTHONPATH`.
+
+The wheel boundary test checks the exact module in the built wheel and its
+RECORD-owned installed origin from an unrelated directory with isolated Python
+paths and repository-root imports blocked. The portable source lane uses
+import-only Torch/Triton stand-ins; a separate installed-wheel probe imports the
+real runtime dependencies. Relocation preserves the kernel implementation bytes.

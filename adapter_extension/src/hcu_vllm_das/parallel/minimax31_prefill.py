@@ -118,7 +118,7 @@ def check_bound_scales(layer):
     stream = torch.cuda.current_stream(cache.device).cuda_stream
     if stream != state[4]:
         raise RuntimeError("MiniMax scale guard stream changed; construct a fresh engine")
-    from triton_tmp_dir.minimax31_prefill_triton import check_scales
+    from .minimax31_prefill_triton import check_scales
     check_scales(layer._k_scale, layer._v_scale, state[1], state[2], state[3])
     return True
 

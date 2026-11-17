@@ -14,7 +14,7 @@ def require_device():
 
 @pytest.mark.parametrize('pages,queries,local', [(1,1,1),(1152,33,4),(17,187,16),(1024,257,0)])
 def test_local_pages_exact(pages, queries, local):
-    from triton_tmp_dir.minimax31_prefill_triton import force_local_pages
+    from hcu_vllm_das.parallel.minimax31_prefill_triton import force_local_pages
     score=torch.randn((4,queries,pages),device='cuda').transpose(1,2)
     end=torch.arange(queries,device='cuda',dtype=torch.int32)*193
     ref=score.clone()
@@ -27,7 +27,7 @@ def test_local_pages_exact(pages, queries, local):
 
 @pytest.mark.parametrize('scale', [1.,0.3,1.7,0.25])
 def test_quant_q_exact_bytes(scale):
-    from triton_tmp_dir.minimax31_prefill_triton import quant_q
+    from hcu_vllm_das.parallel.minimax31_prefill_triton import quant_q
     q=torch.randn((187,64,128),device='cuda',dtype=torch.bfloat16)*7
     # Include FP8 tie boundaries, zero, signed zero and finite saturation edges.
     q.view(-1)[:8]=torch.tensor([0.,-0.,1.0625,1.1875,432.,448.,464.,-464.],device='cuda')
@@ -41,7 +41,7 @@ def test_quant_q_exact_bytes(scale):
 @pytest.mark.parametrize('index_fp8', [False,True])
 @pytest.mark.parametrize('rows', [0,1,187,257])
 def test_cache_store_exact_physical_bytes(index_fp8,rows,main_dtype):
-    from triton_tmp_dir.minimax31_prefill_triton import store_pcp_cache
+    from hcu_vllm_das.parallel.minimax31_prefill_triton import store_pcp_cache
     from hcu_vllm_das.parallel.minimax31_msa import bind_fresh_main_cache
     # Nontrivial source row stride, distinct and shuffled main/index physical slots.
     raw=torch.randn((rows,1168),device='cuda',dtype=torch.bfloat16).mul_(1.7)[:,:1152]
@@ -93,7 +93,7 @@ def test_pack_workspace_reuse_and_scale_guard_native_mutation():
 
 
 def test_dynamic_selector_matches_independent_uint64_oracle_and_one_variant():
-    from triton_tmp_dir.minimax31_prefill_triton import select_physical_dynamic as kernel
+    from hcu_vllm_das.parallel.minimax31_prefill_triton import select_physical_dynamic as kernel
     mask = (1 << 64) - 1
     def mix(x):
         x = (x + 0x9e3779b97f4a7c15) & mask
@@ -130,7 +130,7 @@ def test_dynamic_selector_matches_independent_uint64_oracle_and_one_variant():
 
 
 def test_cache_store_reuses_variant_across_rows_and_page_capacity():
-    from triton_tmp_dir.minimax31_prefill_triton import store_pcp_cache, _cache_store
+    from hcu_vllm_das.parallel.minimax31_prefill_triton import store_pcp_cache, _cache_store
     from hcu_vllm_das.parallel.minimax31_msa import bind_fresh_main_cache
     before = len(_cache_store.device_caches[torch.cuda.current_device()][0])
     for rows, pages in [(1, 1), (17, 4), (33, 4), (1, 4)]:
@@ -146,7 +146,7 @@ def test_cache_store_reuses_variant_across_rows_and_page_capacity():
 
 
 def test_local_pages_dynamic_geometry_has_at_most_one_variant():
-    from triton_tmp_dir.minimax31_prefill_triton import _local_pages, force_local_pages
+    from hcu_vllm_das.parallel.minimax31_prefill_triton import _local_pages, force_local_pages
     before = len(_local_pages.device_caches[torch.cuda.current_device()][0])
     for heads, queries, pages in [(1,1,1),(2,7,17),(2,9,18),(4,17,129),(4,33,513)]:
         score = torch.randn((heads,queries,pages), device='cuda').transpose(1,2)
@@ -163,7 +163,7 @@ def test_local_pages_dynamic_geometry_has_at_most_one_variant():
 
 
 def test_quant_q_dynamic_elements_have_at_most_one_variant():
-    from triton_tmp_dir.minimax31_prefill_triton import _quant_q, quant_q
+    from hcu_vllm_das.parallel.minimax31_prefill_triton import _quant_q, quant_q
     before = len(_quant_q.device_caches[torch.cuda.current_device()][0])
     scale = torch.tensor(1.3, device='cuda', dtype=torch.float32)
     for elements in [0,1,17,1025,2049,4096]:
@@ -178,7 +178,7 @@ def test_quant_q_dynamic_elements_have_at_most_one_variant():
 @pytest.mark.parametrize('main_dtype',[torch.uint8,torch.float8_e4m3fn])
 @pytest.mark.parametrize('scale',[1.,.3,1.7])
 def test_cache_store_overflow_bytes_match_stock_writer(main_dtype,scale):
-    from triton_tmp_dir.minimax31_prefill_triton import store_pcp_cache
+    from hcu_vllm_das.parallel.minimax31_prefill_triton import store_pcp_cache
     from hcu_vllm_das.parallel.minimax31_msa import bind_fresh_main_cache
     from vllm.v1.attention.ops.triton_reshape_and_cache_flash import triton_reshape_and_cache_flash
     from vllm.models.minimax_m3.amd.ops.sparse_pa import minimax_m3_insert_index_cache

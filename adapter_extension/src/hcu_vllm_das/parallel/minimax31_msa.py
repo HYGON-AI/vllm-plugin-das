@@ -141,7 +141,7 @@ class TeacherMSAPrefill:
         score=self.native.msa128_stage1_page_max(index_q,index_cache.unsqueeze(1),meta.k_end,True,-1,
             meta.q_lens_cpu,meta.kv_lens_cpu,None,meta.packed_kv_pages,meta.max_kv_len,index_q_scale,index_k_scale,True,False,False)
         if local_blocks and _prefill_enabled():
-            from triton_tmp_dir.minimax31_prefill_triton import force_local_pages
+            from .minimax31_prefill_triton import force_local_pages
             force_local_pages(score, meta.k_end, local_blocks)
 
         elif local_blocks:
@@ -163,7 +163,7 @@ class TeacherMSAPrefill:
         indices=self.native.msa128_expand_block_indexes(selected.contiguous(),True,meta.q_offsets,meta.seq_lens,
             meta.page_table,None,None,meta.cu_q,None,None,0)
         if _prefill_enabled():
-            from triton_tmp_dir.minimax31_prefill_triton import quant_q
+            from .minimax31_prefill_triton import quant_q
             q8=quant_q(q, q_scale)
 
         else:

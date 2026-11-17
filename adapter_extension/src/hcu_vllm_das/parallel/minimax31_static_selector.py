@@ -49,7 +49,7 @@ def select_physical(layer,logical_ids):
     if out.numel():
         kernel = _select
         if _prefill_enabled():
-            from triton_tmp_dir.minimax31_prefill_triton import select_physical_dynamic
+            from .minimax31_prefill_triton import select_physical_dynamic
             kernel = select_physical_dynamic
         kernel[(triton.cdiv(out.numel(),256),)](logical_ids,batch['positions'],batch['base'],counts,slots,out,logical_ids.shape[0],batch['rows'],layer._static_layer_id,256)
     return out
