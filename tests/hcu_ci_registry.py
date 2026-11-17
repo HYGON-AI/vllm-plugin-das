@@ -615,3 +615,14 @@ register_hcu_ci(
     target="tests/kernels/test_bf16_indexer_gather.py",
     est_time=30,
 )
+
+register_hcu_ci(
+    job="accuracy-gfx936",
+    target="tests/kernels/test_deepseek_v4_compressor_kv_offset.py",
+    est_time=45,
+)
+register_hcu_ci(
+    job="accuracy-gfx938",
+    target="tests/kernels/test_deepseek_v4_compressor_kv_offset.py",
+    est_time=45,
+)
