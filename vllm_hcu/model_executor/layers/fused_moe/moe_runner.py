@@ -1327,10 +1327,10 @@ class MoERunner(MoERunnerInterface):
                     padding = F.pad(
                         padding, (0, num_local_tokens - padding.shape[0]), value=True
                     )
-                # PyNccl does not accept torch.bool. Reinterpret the one-byte
-                # bitmap for transport without allocating or synchronizing
-                # when no SP padding was needed.
-                extra_tensors.append(padding.view(torch.uint8))
+                # PyNccl cannot carry bool, and IPC all-gather requires each
+                # tensor's row width to be 4-byte aligned. One int32 per row
+                # preserves both providers in the existing batched collective.
+                extra_tensors.append(padding.to(torch.int32))
         if extra_tensors:
             hidden_states, router_logits, extra_tensors = self._maybe_dispatch(
                 hidden_states, router_logits, extra_tensors=extra_tensors
@@ -1343,7 +1343,7 @@ class MoERunner(MoERunnerInterface):
             )
         try:
             if needs_dispatch and local_padding is not None:
-                context.is_padding = extra_tensors[-1].view(torch.bool)
+                context.is_padding = extra_tensors[-1].to(torch.bool)
             yield hidden_states, router_logits, input_ids
         finally:
             if context is not None:
