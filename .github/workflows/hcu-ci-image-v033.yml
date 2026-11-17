@@ -1,6 +1,14 @@
 name: Publish private Core v0.33 CI candidate
 
 on:
+  # Register the workflow from the release branch before its first dispatch.
+  # Current default branch lacks this release-only workflow.
+  push:
+    branches: [v0.33.0]
+    paths:
+      - '.github/workflows/hcu-ci-image-v033.yml'
+      - '.github/scripts/hcu_ci/v033_candidate_image.py'
+      - 'docker/Dockerfile.v033-ci-candidate'
   workflow_dispatch:
     inputs:
       package_version:
@@ -28,8 +36,14 @@ concurrency:
   cancel-in-progress: false
 
 jobs:
+  register-manual-entry:
+    if: github.event_name == 'push'
+    runs-on: ubuntu-latest
+    steps:
+      - run: echo 'Release publisher registered; actual publication requires manual dispatch.'
+
   publish:
-    if: github.ref == 'refs/heads/v0.33.0'
+    if: github.event_name == 'workflow_dispatch' && github.ref == 'refs/heads/v0.33.0'
     runs-on: [self-hosted, hygon-image-build]
     timeout-minutes: 60
     env:
