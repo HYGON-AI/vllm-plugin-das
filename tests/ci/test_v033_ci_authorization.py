@@ -21,10 +21,12 @@ SPEC.loader.exec_module(AUTH)
 
 class AuthorizationTests(unittest.TestCase):
     def authorize(self, author_permission, *, ready=False,
-                  label_permission='write', api_failure=False):
-        event = {'pull_request': {
-            'number': 42, 'user': {'login': 'contributor'},
-            'labels': [{'name': 'ready-hcu'}] if ready else []}}
+                  label_permission='write', api_failure=False,
+                  action='labeled', event_label='ready-hcu'):
+        event = {'action': action, 'label': {'name': event_label},
+                 'pull_request': {
+                     'number': 42, 'user': {'login': 'contributor'},
+                     'labels': [{'name': 'ready-hcu'}] if ready else []}}
 
         def github(url, token):
             if api_failure:
@@ -74,6 +76,20 @@ class AuthorizationTests(unittest.TestCase):
         self.assertEqual(result, 0)
         self.assertEqual(output['authorized'], 'true')
         self.assertEqual(output['actor'], 'reviewer')
+
+    def test_stale_ready_label_does_not_authorize_a_later_head(self):
+        for action in ['opened', 'synchronize', 'reopened', 'ready_for_review',
+                       'unlabeled']:
+            with self.subTest(action=action):
+                result, output = self.authorize('read', ready=True, action=action)
+                self.assertEqual(result, 0)
+                self.assertEqual(output['authorized'], 'false')
+                self.assertEqual(output['ready'], 'false')
+
+    def test_unrelated_labeled_event_does_not_authorize(self):
+        result, output = self.authorize('read', ready=True, event_label='bug')
+        self.assertEqual(result, 0)
+        self.assertEqual(output['authorized'], 'false')
 
     def test_untrusted_label_actor_and_api_failure_fail_closed(self):
         for options in [{'ready': True, 'label_permission': 'read'},

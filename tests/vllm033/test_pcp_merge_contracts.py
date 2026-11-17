@@ -33,7 +33,7 @@ def test_pcp_expert_protocol_matches_real_expert_partition(monkeypatch, decoder_
 
     monkeypatch.setattr(model.native.DeepseekV4MoE, "__init__", native_init)
     constructor = getattr(model, decoder_init)
-    owned = constructor.__globals__['DeepseekV4MoE'](config())
+    owned = model.HcuV41PcpMoE(config())
     assert owned.n_local_physical_experts == 48
     assert owned.n_local_experts == 384
     assert constructor.__globals__["DeepseekV4MoE"] is type(owned)

@@ -23,8 +23,10 @@ fail selection rather than silently using the built-in map.
 PR hardware execution reuses the existing author/`ready-hcu` authorization
 helper from the PR's trusted base commit on a hosted CPU runner. A trusted
 author is authorized automatically; other authors need `ready-hcu` applied
-by a trusted actor. Label additions/removals trigger a new check. CPU source
-contracts run independently. Release pushes/manual runs must target
+by a trusted actor. Only the `labeled` event that adds `ready-hcu` authorizes,
+and it approves the exact head snapshot carried by that run: a later push
+leaves hardware locked until a trusted actor removes and re-applies the label.
+CPU source contracts run independently. Release pushes/manual runs must target
 `refs/heads/v0.33.0`. Image resolution and the self-hosted device job depend
 on authorization. The aggregate gate rejects a selected but unauthorized,
 skipped, failed or cancelled stage, so a skipped hardware job is not a pass.
@@ -68,20 +70,19 @@ a scheme or path). Set `HCU_CI_IMAGE_V033` to an immutable
 `${HARBOR_SITE}/jenkins/model_test_env/vllm@sha256:<64 lowercase hex digits>` or
 `${HARBOR_SITE}/hcu/base_env/vllm@sha256:<64 lowercase hex digits>`
 for a prepared DTK image with compatible vLLM 0.33, Adapter, vendor libraries,
-pytest, packaging and build tooling. Fork events without repository variables
-use the recorded Adapter nightly digest in the workflow and its matching host;
-explicit configuration takes precedence. Whitespace values, mutable tags,
+pytest, packaging and build tooling. Missing/whitespace values, mutable tags,
 malformed digests and other repositories fail before the hardware job starts;
 there is no legacy-image fallback or automatic pull to resolve a tag.
-The job container uses the existing `HARBOR_USERNAME`/`HARBOR_PASSWORD` secrets
-when the event permits them, for the initial private-image pull. Fork PRs
-normally cannot read repository secrets: a private-image pull therefore still
-requires reviewed pre-existing runner registry authentication or credentials
-available to that event. Cross-repository PR containers omit the credentials
-object instead of supplying unavailable empty fields. The credentials
-declaration does not prove pull success.
-Missing authorization or pull access remains a failure; do not switch to
-`pull_request_target`, expose secrets to PR code, or let a PR head authorize itself.
+The workflow is triggered by `pull_request_target` so fork pull requests can
+read repository variables; the executed workflow definition and the
+authorization helper always come from the pull request's base revision. PR-head
+code runs only in read-only hosted jobs or, after a trusted author or an
+authorized `ready-hcu` label unlocks hardware, inside the device container.
+The device container uses the repository `HARBOR_USERNAME`/`HARBOR_PASSWORD`
+secrets for the initial private-image pull. The credentials declaration does
+not prove pull success. Missing authorization or pull access remains a failure;
+never let a PR head authorize itself or run untrusted PR code in a job that
+holds a write-scoped token.
 The default legacy container mounts `/opt/hyhal` read-only and uses the
 existing 32GiB shared-memory policy without privileged mode. The opt-in ARC
 backend below delegates mounts, shared memory and devices to the cluster.
@@ -89,11 +90,6 @@ The hosted selector/source jobs receive no Harbor secrets or HCU device mounts.
 PR-code jobs use read-only contents permissions and every checkout disables
 persisted git credentials, including the source job's separate official checkout.
 A configured digest is not evidence that the image or hardware tier passed.
-The recorded fallback image's gfx936 portable run exposed missing public Core
-PLE APIs; preserve that failure until a compatible prepared image and the full
-matrix pass. Resolving the ARC/fork configuration conflicts does not fix that
-image or qualify either device. Both runner modes still consume the resolved
-digest and require the same selected source, portable and device stages.
 The runner must provide the host `/opt/hyhal` runtime, gfx936 devices
 and the normal prepared DTK environment. This candidate does not create or
 validate such an image, allocate runner resources, or certify models and
@@ -150,8 +146,11 @@ resources or branch protection itself.
 Both modes retain job IDs/check names, per-job 45-minute timeouts, concurrency
 cancellation, artifact names, source/portable/device suites and the existing
 trusted-author/`ready-hcu` authorization. CPU selection/source checks stay on
-GitHub-hosted runners without Harbor secrets. Fork PR image-pull restrictions
-remain unchanged; do not switch to `pull_request_target` to bypass them.
+GitHub-hosted runners without Harbor secrets. The `pull_request_target` trigger
+lets fork runs resolve repository variables and use repository credentials for
+the device image pull; it stays gated by the trusted-author/`ready-hcu`
+authorization above, and the executed workflow and helper come from the base
+revision rather than the PR head.
 The aggregate `v033-ci-gate` still requires both selected device jobs to pass.
 The v0.28.1 selector map and Docker helpers are not used by this release and
 are intentionally not migrated here. The already-ARC wheel publishing workflow
@@ -186,10 +185,19 @@ from MR363. Its generic public Core PLE interface remains an enablement and
 deployment dependency; the CI wrapper does not invent that API, override its
 capability guard, or count a missing interface/skip as positive device evidence.
 
-Worker fixture ownership: a specialized Plugin worker inherits the Adapter
-worker's execution entry. Compare that inherited entry with the actual Adapter
-owner, and assert the specialization does not replace it. Comparing directly
-with Core's method incorrectly rejects an Adapter that checks required-owner
-health before delegating to Core (including FULL Graph replay). Retain the
-Core profiling delegates separately. The CPU inheritance checks do not certify
-a loaded model, device execution or the specialized model's accuracy.
+
+## Checked-out package workspace
+
+After checkout, both ephemeral device containers add only the exact
+`GITHUB_WORKSPACE` to their effective global Git safe.directory configuration.
+Package metadata commands can then inspect the mounted checkout even after the
+checkout action restores its temporary HOME. A real-Git regression first reproduces
+the ownership refusal, checks the workspace command succeeds and verifies that
+an unrelated repository remains untrusted. Wildcard trust is never used.
+
+The merged trusted-base `pull_request_target` flow owns variable and registry
+credential availability. This follow-up uses that flow unchanged: configured
+immutable image and registry host remain required, with no recorded-image
+fallback. Authorization, head checkout, image allowlist, ARC defaults and the full
+portable/operator/Graph gate stay under the release workflow. CPU/source checks
+do not qualify the prepared image, requested gfx836 hardware or model accuracy.

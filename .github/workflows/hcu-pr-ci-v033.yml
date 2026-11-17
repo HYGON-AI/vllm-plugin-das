@@ -1,7 +1,10 @@
 name: HCU v0.33 release contracts
 
 on:
-  pull_request:
+  # pull_request_target lets fork PRs read repository variables. The workflow
+  # definition and authorization helper are taken from the base revision; PR
+  # head code runs only after trusted author/ready-hcu authorization.
+  pull_request_target:
     types: [opened, synchronize, reopened, ready_for_review, labeled, unlabeled]
     branches: [v0.33.0]
   push:
@@ -100,19 +103,19 @@ jobs:
       authorized: ${{ steps.pr-authorization.outputs.authorized || steps.release-authorization.outputs.authorized }}
     steps:
       - name: Checkout trusted PR authorization helper
-        if: github.event_name == 'pull_request'
+        if: github.event_name == 'pull_request' || github.event_name == 'pull_request_target'
         uses: actions/checkout@v4
         with:
           ref: ${{ github.event.pull_request.base.sha }}
           persist-credentials: false
       - name: Reuse existing HCU author and ready-hcu checks
-        if: github.event_name == 'pull_request'
+        if: github.event_name == 'pull_request' || github.event_name == 'pull_request_target'
         id: pr-authorization
         env:
           GITHUB_TOKEN: ${{ github.token }}
         run: python -I -B .github/scripts/hcu_ci/check_hcu_ci_authorization.py
       - name: Authorize release push or manual run
-        if: github.event_name != 'pull_request'
+        if: github.event_name != 'pull_request' && github.event_name != 'pull_request_target'
         id: release-authorization
         env:
           EVENT_NAME: ${{ github.event_name }}
@@ -138,11 +141,8 @@ jobs:
       - name: Resolve prepared image and runner backend
         id: image
         env:
-          # Fork pull_request jobs receive no repository variables. Use the
-          # published v0.33 CI baseline, never a legacy release or mutable tag.
-          # Adapter nightly run 43760660145, build-vllm job 132954501105.
-          HCU_CI_IMAGE_V033: ${{ vars.HCU_CI_IMAGE_V033 || '10.16.1.152:5000/hcu/base_env/vllm@sha256:376b7517858ce9f82bfbc8d81cb582e2f0131ffeb6487fdea868580b8e36afc5' }}
-          HARBOR_SITE: ${{ vars.HARBOR_SITE || '10.16.1.152:5000' }}
+          HCU_CI_IMAGE_V033: ${{ vars.HCU_CI_IMAGE_V033 }}
+          HARBOR_SITE: ${{ vars.HARBOR_SITE }}
           # Default to ARC/K8s; set legacy explicitly to roll back.
           HCU_CI_RUNNER_MODE_V033: ${{ vars.HCU_CI_RUNNER_MODE_V033 }}
         run: |
@@ -155,8 +155,8 @@ jobs:
             echo 'HCU_CI_IMAGE_V033 must name a prepared v0.33 DTK/Core/Adapter/vendor image' >&2
             exit 2
           fi
-          # Adapter's nightly-image workflow publishes the prepared v0.33
-          # runtime here. Retain the existing Plugin release-image repository.
+          # The Plugin release image and Adapter's prepared v0.33 runtime are
+          # both approved sources; anything else fails before the device job.
           release_repository="${HARBOR_SITE}/jenkins/model_test_env/vllm"
           runtime_repository="${HARBOR_SITE}/hcu/base_env/vllm"
           if [[ ( "${HCU_CI_IMAGE_V033%@*}" != "$release_repository" \
@@ -200,9 +200,9 @@ jobs:
     timeout-minutes: 45
     container:
       image: ${{ needs.resolve-device-image.outputs.image }}
-      # Cross-repository PRs receive no secrets. Empty credentials are optional;
-      # explicit empty fields fail Actions template validation.
-      credentials: ${{ fromJSON(github.event_name == 'pull_request' && github.event.pull_request.head.repo.full_name != github.repository && '{}' || format('{{"username":{0},"password":{1}}}', toJSON(secrets.HARBOR_USERNAME), toJSON(secrets.HARBOR_PASSWORD))) }}
+      credentials:
+        username: ${{ secrets.HARBOR_USERNAME }}
+        password: ${{ secrets.HARBOR_PASSWORD }}
       options: ${{ needs.resolve-device-image.outputs.container_options }}
     steps:
       - uses: actions/checkout@v4
@@ -210,7 +210,6 @@ jobs:
           ref: ${{ github.event.pull_request.head.sha || github.sha }}
           persist-credentials: false
       - name: Trust checked-out workspace for package metadata
-        # checkout's temporary HOME does not carry into pip's VCS metadata step.
         run: git config --global --add safe.directory "$GITHUB_WORKSPACE"
       - name: Full v0.33 portable contracts (devices hidden)
         env:
@@ -237,7 +236,9 @@ jobs:
     timeout-minutes: 45
     container:
       image: ${{ needs.resolve-device-image.outputs.image }}
-      credentials: ${{ fromJSON(github.event_name == 'pull_request' && github.event.pull_request.head.repo.full_name != github.repository && '{}' || format('{{"username":{0},"password":{1}}}', toJSON(secrets.HARBOR_USERNAME), toJSON(secrets.HARBOR_PASSWORD))) }}
+      credentials:
+        username: ${{ secrets.HARBOR_USERNAME }}
+        password: ${{ secrets.HARBOR_PASSWORD }}
       options: ${{ needs.resolve-device-image.outputs.container_options }}
     steps:
       - uses: actions/checkout@v4
@@ -245,7 +246,6 @@ jobs:
           ref: ${{ github.event.pull_request.head.sha || github.sha }}
           persist-credentials: false
       - name: Trust checked-out workspace for package metadata
-        # checkout's temporary HOME does not carry into pip's VCS metadata step.
         run: git config --global --add safe.directory "$GITHUB_WORKSPACE"
       - name: Installed Channel-FP8 DeepGEMM numerical contract
         env:

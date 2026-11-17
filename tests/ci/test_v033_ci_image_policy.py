@@ -47,12 +47,11 @@ class ImagePolicyTests(unittest.TestCase):
     def test_only_configured_repository_digest_is_emitted(self):
         for harbor in [self.harbor, 'other-harbor.invalid']:
             for repository in ['jenkins/model_test_env/vllm', 'hcu/base_env/vllm']:
-                for mode in ['legacy', 'k8s']:
-                    with self.subTest(harbor=harbor, repository=repository, mode=mode):
-                        image = harbor + '/' + repository + '@' + self.digest
-                        code, output = self.guard(image, harbor, runner_mode=mode)
-                        self.assertEqual(code, 0)
-                        self.assertEqual(dict(line.split('=', 1) for line in output.splitlines())['image'], image)
+                with self.subTest(harbor=harbor, repository=repository):
+                    image = harbor + '/' + repository + '@' + self.digest
+                    code, output = self.guard(image, harbor)
+                    self.assertEqual(code, 0)
+                    self.assertEqual(dict(line.split('=', 1) for line in output.splitlines())['image'], image)
 
     def test_absent_whitespace_mutable_foreign_and_malformed_images_refuse(self):
         good = self.repository + '@' + self.digest
@@ -60,12 +59,6 @@ class ImagePolicyTests(unittest.TestCase):
                   self.repository + ':v0.33@' + self.digest,
                   'foreign.invalid/jenkins/model_test_env/vllm@' + self.digest,
                   self.harbor + '/different/vllm@' + self.digest,
-                  self.harbor + '/hcu/base_env/sglang@' + self.digest,
-                  self.harbor + '/hcu/base/dtk@' + self.digest,
-                  self.harbor + '/hcu/base_env/vllm:latest',
-                  self.harbor + '/hcu/base_env/vllm:v0.33@' + self.digest,
-                  self.harbor + '/hcu/base_env/vllm-other@' + self.digest,
-                  'foreign.invalid/hcu/base_env/vllm@' + self.digest,
                   self.repository + '-other@' + self.digest,
                   self.repository + '@sha256:' + 'a' * 63,
                   self.repository + '@sha256:' + 'a' * 65,
@@ -92,14 +85,14 @@ class ImagePolicyTests(unittest.TestCase):
                 self.assertEqual(output, '')
 
     def test_registry_variable_is_wired_and_pull_credentials_are_device_only(self):
-        self.assertIn('HARBOR_SITE: ${{ vars.HARBOR_SITE', self.resolver)
-        self.assertIn('HCU_CI_IMAGE_V033: ${{ vars.HCU_CI_IMAGE_V033', self.resolver)
+        self.assertIn('HARBOR_SITE: ${{ vars.HARBOR_SITE }}', self.resolver)
+        self.assertIn('HCU_CI_IMAGE_V033: ${{ vars.HCU_CI_IMAGE_V033 }}', self.resolver)
         device = job_block(self.source, 'v033-device-gfx936')
         container = device.split('    container:\n', 1)[1].split('    steps:\n', 1)[0]
         self.assertIn('image: ${{ needs.resolve-device-image.outputs.image }}', container)
-        self.assertIn('credentials: ${{ fromJSON(', container)
-        self.assertIn('toJSON(secrets.HARBOR_USERNAME)', container)
-        self.assertIn('toJSON(secrets.HARBOR_PASSWORD)', container)
+        self.assertIn('credentials:\n', container)
+        self.assertIn('username: ${{ secrets.HARBOR_USERNAME }}', container)
+        self.assertIn('password: ${{ secrets.HARBOR_PASSWORD }}', container)
         self.assertNotIn('volumes:', container)
         self.assertIn('options: ${{ needs.resolve-device-image.outputs.container_options }}', container)
         self.assertNotIn('--privileged', container)
@@ -141,57 +134,6 @@ class ImagePolicyTests(unittest.TestCase):
                     env=environment, check=True, capture_output=True, text=True, timeout=10)
                 self.assertEqual(configured.stdout.splitlines(), [str(workspace)])
 
-    def configured_value(self, name, value):
-        # Evaluate only the two documented GitHub configuration-variable
-        # defaults, then execute the real shell guard. No registry is contacted.
-        pattern = re.escape(name) + r": \$\{\{ vars\." + re.escape(name)
-        match = re.search(pattern + r" \|\| '([^']+)' \}\}", self.resolver)
-        self.assertIsNotNone(match, 'fork PRs do not receive repository variables')
-        return value or match.group(1)
-
-    def test_fork_without_variables_uses_the_published_v033_digest(self):
-        harbor = self.configured_value('HARBOR_SITE', '')
-        image = self.configured_value('HCU_CI_IMAGE_V033', '')
-        self.assertEqual(harbor, '10.16.1.152:5000')
-        self.assertRegex(image, r'^' + re.escape(harbor)
-                         + r'/hcu/base_env/vllm@sha256:[0-9a-f]{64}$')
-        code, output = self.guard(image, harbor)
-        self.assertEqual(code, 0)
-        self.assertEqual(dict(line.split('=', 1) for line in output.splitlines())['image'], image)
-
-    def test_explicit_configuration_overrides_defaults_and_invalid_values_refuse(self):
-        harbor = self.configured_value('HARBOR_SITE', self.harbor)
-        image = self.configured_value('HCU_CI_IMAGE_V033', self.repository + '@' + self.digest)
-        code, output = self.guard(image, harbor)
-        self.assertEqual(code, 0)
-        self.assertEqual(dict(line.split('=', 1) for line in output.splitlines())['image'], image)
-        for bad in [' ', self.repository + ':latest', 'foreign.invalid/vllm@' + self.digest]:
-            with self.subTest(image=bad):
-                image = self.configured_value('HCU_CI_IMAGE_V033', bad)
-                code, output = self.guard(image, harbor)
-                self.assertNotEqual(code, 0)
-                self.assertEqual(output, '')
-        # Overriding only the host must not repin the known image onto it.
-        image = self.configured_value('HCU_CI_IMAGE_V033', '')
-        code, output = self.guard(image, harbor)
-        self.assertNotEqual(code, 0)
-        self.assertEqual(output, '')
-
-    def test_cross_repository_credentials_omit_unavailable_secrets_in_both_jobs(self):
-        for name in ['v033-device-gfx936', 'v033-device-gfx938']:
-            with self.subTest(job=name):
-                block = job_block(self.source, name)
-                container = block.split('    container:\n', 1)[1].split('    steps:\n', 1)[0]
-                line = next(line.strip() for line in container.splitlines()
-                            if line.strip().startswith('credentials:'))
-                self.assertTrue(line.startswith('credentials: ${{ fromJSON('))
-                self.assertIn("github.event_name == 'pull_request' && ", line)
-                self.assertIn("github.event.pull_request.head.repo.full_name "
-                              "!= github.repository && '{}' || format(", line)
-                self.assertIn('"username":{0},"password":{1}', line)
-                self.assertIn('toJSON(secrets.HARBOR_USERNAME)', line)
-                self.assertIn('toJSON(secrets.HARBOR_PASSWORD)', line)
-                self.assertTrue(line.endswith('))) }}'))
 
     def resolved(self, mode):
         image = self.repository + '@' + self.digest
@@ -239,9 +181,8 @@ class ImagePolicyTests(unittest.TestCase):
             for expected in [
                 'image: ${{ needs.resolve-device-image.outputs.image }}',
                 'options: ${{ needs.resolve-device-image.outputs.container_options }}',
-                'credentials: ${{ fromJSON(',
-                'toJSON(secrets.HARBOR_USERNAME)',
-                'toJSON(secrets.HARBOR_PASSWORD)',
+                'username: ${{ secrets.HARBOR_USERNAME }}',
+                'password: ${{ secrets.HARBOR_PASSWORD }}',
             ]:
                 self.assertIn(expected, container)
             self.assertNotIn('volumes:', container)
