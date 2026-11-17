@@ -4,6 +4,7 @@ from types import SimpleNamespace as NS
 
 import numpy as np
 import pytest
+import torch
 
 from hcu_vllm_das.fp4_indexer_lightop import decode_rows
 from vllm.v1.worker.gpu.pcp_manager import PCPManager
@@ -34,3 +35,30 @@ def test_unsharded_and_nonspeculative_capacities_preserved():
     cfg.parallel_config.prefill_context_parallel_size = 8
     cfg.speculative_config = None
     assert decode_rows(cfg) == 128
+
+
+@pytest.mark.parametrize('sharded,speculative,expected',
+                         [(True, 5, 96), (False, 5, 768), (True, None, 128)])
+def test_real_indexer_constructor_freezes_the_same_workspace_and_staging_bound(
+        monkeypatch, sharded, speculative, expected):
+    from hcu_adapter import dsv41_channel_fp8
+    from hcu_vllm_das import v41_indexer
+
+    cfg = NS(scheduler_config=NS(max_num_seqs=128, max_num_batched_tokens=32768),
+             parallel_config=NS(pcp_shard_decode_requests=sharded,
+                                prefill_context_parallel_size=8),
+             speculative_config=NS(num_speculative_tokens=speculative) if speculative else None,
+             cache_config=NS(block_size=64), model_config=NS(hf_config=NS()))
+
+    def base_init(self):
+        torch.nn.Module.__init__(self)
+        self._hcu_fp4 = True
+        self.max_model_len = 65536
+        self.compress_ratio = 2
+
+    monkeypatch.setattr(dsv41_channel_fp8, '_is_v41', lambda cfg: False)
+    monkeypatch.setattr(v41_indexer, 'current_config', lambda: cfg)
+    monkeypatch.setattr(v41_indexer._api['base'], '__init__', base_init)
+    layer = v41_indexer.HcuV41SparseAttnIndexer()
+    assert layer.fp4_decode_rows == expected
+    assert layer.fp4_staging_plan['requests'] == expected
