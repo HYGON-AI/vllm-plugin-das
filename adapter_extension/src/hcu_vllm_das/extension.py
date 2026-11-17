@@ -101,7 +101,7 @@ def activate_extension(context: ExtensionContext) -> None:
                 f"cannot import required LightOp norm module: {error}"
             ) from error
         for name, arguments in (
-            ("rmsnorm_forward_autograd", (object(), object(), 1e-6, False)),
+            ("rms_norm", (object(), object(), 1e-6, object())),
             ("fused_add_rms_norm", (object(), object(), object(), 1e-6)),
         ):
             _require_callable(lightop_norm, name, f"lightop.norm.{name}")
