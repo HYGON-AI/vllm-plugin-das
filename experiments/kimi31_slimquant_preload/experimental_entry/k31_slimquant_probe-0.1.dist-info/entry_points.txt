@@ -1,0 +1,2 @@
+[hcu_adapter.extensions]
+kimi31_slimquant_exp = hcu_vllm_das.quantization.preload_activation:extension_spec
