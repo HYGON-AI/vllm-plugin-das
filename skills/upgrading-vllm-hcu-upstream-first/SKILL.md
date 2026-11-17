@@ -462,3 +462,12 @@ Check each job's actual driver: direct benchmark scripts may execute even
 when another job's pytest session is paused. Count JUnit launcher cases,
 CSV measurement rows and numerical regression cases separately; selected
 benchmark timings do not qualify unrelated kernels or model accuracy.
+
+Derive grouped key/value head counts from the actual checkpoint and cover
+them explicitly in native tests; small synthetic head counts do not qualify
+the checkpoint geometry. Add only missing cases and bind their receipts to
+unchanged package RECORDs, keeping earlier qualification counts separate.
+Interpret shutdown logs against the selected Core source: `mode=abort` may
+mean the default zero-timeout request policy rather than an OS abort. Record
+actual exit codes, process release and native leak reports independently;
+successful exits do not resolve nanobind leaks.

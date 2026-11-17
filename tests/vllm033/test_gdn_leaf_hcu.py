@@ -136,9 +136,9 @@ def _assert_decode_close(actual, reference, *, state=False):
     )
 
 
-@pytest.mark.parametrize("heads", [8, 12])
+@pytest.mark.parametrize("key_heads,heads", [(4, 8), (4, 12), (16, 32)])
 def test_packed_decode_null_slots_state_and_changed_input_graph(
-    runtime, monkeypatch, heads
+    runtime, monkeypatch, key_heads, heads
 ):
     _, _, gdn, activation = runtime
     from hcu_vllm_das.gdn_contracts import OWNERS
@@ -146,7 +146,7 @@ def test_packed_decode_null_slots_state_and_changed_input_graph(
     name = "fused_recurrent_gated_delta_rule_packed_decode"
     official = getattr(import_module(OWNERS[name]), name)
     candidate = getattr(import_module(activation.QWEN), name)
-    batch, key_heads, dim = 4, 4, 128
+    batch, dim = 4, 128
     mixed = torch.empty(
         (batch, (key_heads * 2 + heads) * dim), device="cuda", dtype=torch.bfloat16
     )
@@ -251,9 +251,9 @@ def test_packed_decode_null_slots_state_and_changed_input_graph(
         )
 
 
-@pytest.mark.parametrize("heads", [8, 12])
+@pytest.mark.parametrize("key_heads,heads", [(4, 8), (4, 12), (16, 32)])
 def test_sigmoid_spec_varlen_accepted_tokens_and_changed_input_graph(
-    runtime, monkeypatch, heads
+    runtime, monkeypatch, key_heads, heads
 ):
     _, _, gdn, activation = runtime
     from hcu_vllm_das.gdn_contracts import OWNERS
@@ -261,7 +261,7 @@ def test_sigmoid_spec_varlen_accepted_tokens_and_changed_input_graph(
     name = "fused_sigmoid_gating_delta_rule_update"
     official = getattr(import_module(OWNERS[name]), name)
     candidate = getattr(import_module(activation.QWEN), name)
-    key_heads, dim, tokens = 4, 128, 6
+    dim, tokens = 128, 6
     q = torch.empty((1, tokens, key_heads, dim), device="cuda", dtype=torch.bfloat16)
     k = torch.empty_like(q)
     v = torch.empty((1, tokens, heads, dim), device="cuda", dtype=q.dtype)
@@ -356,10 +356,10 @@ def test_sigmoid_spec_varlen_accepted_tokens_and_changed_input_graph(
         )
 
 
-@pytest.mark.parametrize("heads", [8, 12])
+@pytest.mark.parametrize("key_heads,heads", [(4, 8), (4, 12), (16, 32)])
 @pytest.mark.parametrize("varlen", [False, True])
 def test_complete_gated_fla_state_output_and_changed_input_graph(
-    runtime, monkeypatch, heads, varlen
+    runtime, monkeypatch, key_heads, heads, varlen
 ):
     candidate, official, gdn, activation = runtime
     from vllm.third_party.flash_linear_attention.ops.index import (
@@ -369,7 +369,7 @@ def test_complete_gated_fla_state_output_and_changed_input_graph(
 
     tokens = 97
     device = "cuda"
-    q = torch.empty((1, tokens, 4, 128), device=device, dtype=torch.bfloat16)
+    q = torch.empty((1, tokens, key_heads, 128), device=device, dtype=torch.bfloat16)
     k = torch.empty_like(q)
     v = torch.empty((1, tokens, heads, 128), device=device, dtype=q.dtype)
     g = torch.empty((1, tokens, heads), device=device, dtype=torch.float32)
@@ -424,7 +424,7 @@ def test_complete_gated_fla_state_output_and_changed_input_graph(
     )
     if activation._published.policy[0] == "hcu-aiter":
         assert ("chunk_gated_delta_rule_fwd_h", "hcu-aiter") in seen
-    elif heads == 8:
+    elif heads in (8, 32):
         assert ("chunk_gated_delta_rule_fwd_h", "hcu-boltops") in seen
     graph = torch.cuda.CUDAGraph()
     with torch.cuda.graph(graph):

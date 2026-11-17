@@ -121,6 +121,17 @@ later isolated source-provider installation (AITER `1cb6ed3`, BoltOPs
 24 changed-input Graph replays each, with zero weakref errors or tracebacks.
 That result does not establish normal model-server teardown.
 
+A separate unchanged-provider qualification adds the real checkpoint geometry
+`(key_heads, value_heads, head_dim)=(16, 32, 128)`. Each provider passes four
+additional cases: packed decode, speculative sigmoid decode and complete gated
+prefill with fixed and variable-length sequences. Each case includes three changed-input Graph
+replays (12 additional replays per provider). Both processes exit 0, all owned
+identities disappear, all six package RECORDs remain unchanged, and neither
+run reports weakref errors, nanobind leaks or tracebacks. The original eight
+cases are not rerun or recounted. These are component results; they do not
+qualify model MTP, performance or server teardown. Evidence:
+`gdn-real-model-geometry-{aiter,boltops}-20261117-r1/receipt.json`.
+
 ### Frozen Qwen3.5 INT8 model comparison, 2026-11-17
 
 Three fresh gfx938 TP1 runs use the original `Qwen3.5-35B-A3B-W8A8` checkpoint,
@@ -176,9 +187,11 @@ kernels; a provider-selection setting alone is not direct native attribution.
 All 23 checkpoint assets (37,602,505,378 bytes) match independent pre/post
 dual reads across all arms. Server, evaluator and tracker exit 0; recorded
 owned identities disappear, ports release, and post-run package/asset checks
-pass. Weakref errors are zero, but **nanobind and abort shutdown diagnostics
-remain in every arm**, including stock. Process release does not establish
-normal lifecycle closure.
+pass. Weakref errors are zero, but **nanobind leak reports remain in every
+arm**, including stock. Core's `mode=abort` log records its default
+`shutdown_timeout=0` request-shutdown policy; it does not indicate SIGABRT or
+a process crash. The observed exits are all 0. Process release and the normal
+request-shutdown policy do not resolve the separate nanobind leak reports.
 
 The local evidence index is `qwen35-gdn-tp1-r7-closure.json`, binding original
 requests/results, worker observations, traces, asset seals and package gates.
