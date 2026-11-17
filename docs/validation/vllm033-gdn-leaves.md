@@ -201,3 +201,59 @@ Adapter main has advanced beyond `20d18cc6`; frozen scores do not qualify
 those complete merged combinations. Keep Draft pending raw accuracy,
 lifecycle, remaining feature/architecture/provider delivery and current-head
 CI/review gates. DeepSeek V4.1 model testing remains user-deferred.
+
+
+## Frozen gfx938 TP1 MTP3 comparison, 2026-11-17
+
+Original `Qwen3.5-35B-A3B-W8A8`, Core `98a09850`, Adapter `20d18cc6`
+and installed Plugin `3836b8b3` with the recorded rebuilt source providers;
+this is the previous frozen installation, not the newly merged PR head.
+All three arms retain official FULL_AND_PIECEWISE Graphs, prefix caching,
+chunked prefill and three speculative positions. The actual MRV2 worker uses
+`MTPSpeculator.model` containing `Qwen3_5MoeMTP`, one trained MTP layer reused
+for three positions, exact original BF16 retained-gate weights and a shared
+target/draft embedding. This is not an INT8 retained-gate checkpoint test.
+
+Original HumanEval0–31, identical requests and thinking-off protocol:
+
+| Arm | Raw | Normalized | Completion tokens | Accepted / drafted tokens |
+| --- | --- | --- | --- | --- |
+| stock | 30/32 | 32/32 | 4813 | 3619/3795 (95.36%) |
+| AITER policy | 30/32 | 32/32 | 4840 | 3648/3804 (95.90%) |
+| BoltOPs policy | 32/32 | 32/32 | 4921 | 3705/3861 (95.96%) |
+
+Acceptance counters cover the complete served probe/evaluation cohort.
+All completions stop without token truncation. Stock raw failures are15/16;
+AITER failures15/30, so AITER loses30 and gains16 relative to stock despite
+equal totals. BoltOPs gains15/16 and loses none. Preserve these original raw
+results independently of normalization; no raw-loss tolerance was authorized.
+The earlier non-MTP comparison remains a separate result.
+
+Each arm passes13/13 arithmetic and3/3 prefix probes with4288 cache hits,
+including concurrency1/4/8. GPU profiles record1844/1844/1850 kernel events
+and50 `hipGraphLaunch` events each. The worker's actual policy and completed
+Python provider submissions are saved separately: AITER's chunk-O and
+recompute use prepared BoltOPs fallbacks. These counts do not identify every
+captured decode-node kernel or establish throughput gains.
+
+All23 checkpoint assets/37602505378bytes match six independent pre/post
+dual-read seals; parent/worker raw RECORD checks for six distributions and
+both real-checkpoint head-geometry prerequisites match. Evaluation, server,
+tracker, post-seal and post-RECORD processes exit0; owned process identities
+are gone and ports released. All three retain nanobind leak diagnostics with
+zero weakref unpack errors. Core's `mode=abort` log is its default zero-timeout
+request shutdown policy, not an OS SIGABRT.
+
+Two earlier attempts stopped before HumanEval because the read-only observer
+first used an obsolete runner field and then expected the dense MTP class.
+Both failures and their completed cleanup are retained. The corrected observer
+was checked against all three saved worker responses before this run; no
+production module, numerical assertion, Graph or prefix setting was changed.
+
+Receipt: `evidence/qwen35-gdn-mtp3-source-tp1-closure-20261117-r3.json`.
+Separate configuration-only diagnostics reproduce nanobind messages after
+`gc.freeze()` and no messages after `gc.unfreeze()` before natural process
+exit. This identifies a lifetime interaction, not a validated production fix.
+Core's API lifespan and ROCm exit-freeze paths remain separate owner findings.
+The PR stays Draft: raw per-task differences, normal teardown, gfx936,
+provider publication, performance and current-head remote CI remain open.

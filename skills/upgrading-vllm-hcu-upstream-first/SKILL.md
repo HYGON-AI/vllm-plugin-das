@@ -123,6 +123,14 @@ merely to pass discovery. Qualify each admitted operator and consumer separately
    process release and normal teardown as separate results.
 
 Graph capture or HTTP health alone does not establish successful generation.
+For MTP observations, derive the draft-model field and concrete class from the
+selected runner and model registry before launching a full checkpoint. MRV2
+uses `speculator.model`; Qwen3.5 MoE resolves to `Qwen3_5MoeMTP`, rather than
+the dense `Qwen3_5MTP` base. Bind the worker's class and source to that selected
+architecture, and separately verify trained layers, shared embeddings, restored
+gate weights and nonzero drafted/accepted tokens. Replay a failed read-only
+observer against its saved response before repeating a costly model run;
+preserve that failed attempt and its completed cleanup.
 For GDN, follow the actual constructor's dispatch selection: an official
 CustomOp may replace `_forward_method` after platform dispatch, so overriding
 `forward_hip` alone need not execute the provider. An OOT prefill entry does
