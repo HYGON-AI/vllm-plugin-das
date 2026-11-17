@@ -17,6 +17,7 @@ PLUGIN_SOURCE_ROOT = (
 def run_fake_runtime(
     *,
     residual: bool = False,
+    compiling: bool = False,
     master: str | None = "1",
     child: str = "1",
     hidden_size: int = 256,
@@ -65,14 +66,24 @@ class Tensor:
     def is_contiguous(self):
         return self._contiguous
 
+    def __mul__(self, other):
+        events.append(["weight-multiply", self.tag, other.tag, self.dtype])
+        return Tensor(self.shape, dtype=self.dtype, tag=self.tag)
+
+    def mul_(self, other):
+        events.append(["weight-multiply-inplace", self.tag, other.tag, self.dtype])
+        return self
+
 def empty_like(value):
     events.append(["empty_like", value.tag])
     return Tensor(value.shape, dtype=value.dtype, tag="ordinary-fake")
 
 torch = ModuleType("torch")
 torch.Tensor = Tensor
+torch.compiler = SimpleNamespace(is_compiling=lambda: {compiling!r})
 torch.bfloat16 = "bf16"
 torch.empty_like = empty_like
+torch.ones_like = lambda value: Tensor(value.shape, dtype=value.dtype, tag="unit-weight")
 torch.float16 = "fp16"
 torch.ops = SimpleNamespace(vllm=SimpleNamespace())
 sys.modules["torch"] = torch
@@ -80,11 +91,13 @@ sys.modules["torch"] = torch
 lightop = ModuleType("lightop")
 lightop.__path__ = []
 norm = ModuleType("lightop.norm")
-def rmsnorm_forward_autograd(value, weight, epsilon, training):
+def rms_norm(value, weight, epsilon, output):
+    assert output is not value
     events.append(
-        ["ordinary-lightop", value.tag, weight.tag, epsilon, training]
+        ["ordinary-lightop", value.tag, weight.tag, epsilon, output.tag]
     )
-    return Tensor(value.shape, dtype=value.dtype, tag="ordinary-output")
+    output.tag = "ordinary-output"
+    return output
 def fused_add_rms_norm(value, residual_value, weight, epsilon):
     events.append(
         ["fused-lightop", value.tag, residual_value.tag, weight.tag, epsilon]
@@ -92,7 +105,7 @@ def fused_add_rms_norm(value, residual_value, weight, epsilon):
     value.tag = "fused-output"
     residual_value.tag = "fused-residual"
     return "ignored-lightop-return"
-norm.rmsnorm_forward_autograd = rmsnorm_forward_autograd
+norm.rms_norm = rms_norm
 norm.fused_add_rms_norm = fused_add_rms_norm
 lightop.norm = norm
 sys.modules["lightop"] = lightop
@@ -288,6 +301,8 @@ def test_ordinary_rmsnorm_registers_and_calls_lightop() -> None:
     assert report["result"] == "ordinary-output"
     assert report["ordinary_fake_shape"] == [3, 256]
     assert any(event[0] == "ordinary-lightop" for event in report["events"])
+    assert next(event for event in report["events"]
+                if event[0] == "ordinary-lightop")[-1] == "ordinary-fake"
 
 
 def test_fused_add_rmsnorm_returns_mutated_inputs() -> None:
@@ -413,3 +428,11 @@ def test_unsupported_rmsnorm_cases_use_vllm_native_path(
         event[0] in {"ordinary-lightop", "fused-lightop"}
         for event in report["events"]
     )
+
+
+@pytest.mark.parametrize("residual", [False, True])
+def test_compiled_rms_delegates_complete_operation_to_core(residual):
+    report = run_fake_runtime(compiling=True, residual=residual)
+    assert report["result"] == "native-result"
+    assert not any(event[0] in {"ordinary-lightop", "fused-lightop"}
+                   for event in report["events"])

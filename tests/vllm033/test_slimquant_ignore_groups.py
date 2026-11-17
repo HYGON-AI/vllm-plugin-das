@@ -80,11 +80,12 @@ def test_fully_ignored_ple_does_not_require_quantized_declarations(monkeypatch):
     ([EXPERT + '.gate_up_proj', EXPERT + '.down_proj'], 'bf16'),
     ([], 'quantized'),
 ])
-def test_uniform_expert_ignore_selects_complete_method(monkeypatch, ignores, expected):
+@pytest.mark.parametrize('legacy', [False, True])
+def test_uniform_expert_ignore_selects_complete_method(monkeypatch, ignores, expected, legacy):
     import torch
     import hcu_vllm_das.slimquant as implementation
 
-    raw = checkpoint_config()
+    raw = checkpoint_config(legacy=legacy)
     raw['ignore'] = ignores
     layer = object.__new__(implementation.RoutedExperts)
     torch.nn.Module.__init__(layer)
@@ -96,11 +97,12 @@ def test_uniform_expert_ignore_selects_complete_method(monkeypatch, ignores, exp
 
 
 @pytest.mark.parametrize('projection', ['gate_up_proj', 'down_proj'])
-def test_partial_expert_ignore_refuses_grouped_method(monkeypatch, projection):
+@pytest.mark.parametrize('legacy', [False, True])
+def test_partial_expert_ignore_refuses_grouped_method(monkeypatch, projection, legacy):
     import torch
     import hcu_vllm_das.slimquant as implementation
 
-    raw = checkpoint_config()
+    raw = checkpoint_config(legacy=legacy)
     raw['ignore'] = [EXPERT + '.' + projection]
     layer = object.__new__(implementation.RoutedExperts)
     torch.nn.Module.__init__(layer)

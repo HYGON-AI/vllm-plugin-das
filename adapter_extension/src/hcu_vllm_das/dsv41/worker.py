@@ -13,8 +13,12 @@ logger = init_logger(f"vllm.{__name__}")
 def uses_pcp_channel_fp8(config):
     """Whether this resolved config profiles rank-local PCP Channel-FP8 batches."""
     cfg = config
+    p = cfg.parallel_config
     return (
-        cfg.parallel_config.prefill_context_parallel_size > 1
+        (p.tensor_parallel_size, p.data_parallel_size, p.pipeline_parallel_size,
+         p.prefill_context_parallel_size, p.decode_context_parallel_size) == (1, 1, 1, 8, 1)
+        and p.enable_expert_parallel
+        and cfg.model_config.quantization == "hcu_dsv41_channel_fp8"
         and cfg.kernel_config.moe_backend in ("deep_gemm_mega_moe", "deep_gemm")
         and _is_v41(cfg.model_config.hf_config)
     )
@@ -30,7 +34,10 @@ class HcuDSV41PcpWorker(Worker):
 
     def determine_available_memory(self):
         runner = self.model_runner
-        if not self._uses_pcp_channel_fp8() or runner.pcp_manager is None:
+        # Replay pads each rank's retained rows to the global retained batch.
+        # Core's global profile covers that padded batch and its MoE workspace.
+        if (not self._uses_pcp_channel_fp8() or runner.pcp_manager is None
+                or self.vllm_config.cache_config.swa_bounded_replay):
             return super().determine_available_memory()
         global_tokens = runner.max_num_tokens
         local_tokens = local_token_bound(

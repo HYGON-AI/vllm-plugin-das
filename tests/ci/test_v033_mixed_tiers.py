@@ -61,6 +61,18 @@ class MixedTierContracts(unittest.TestCase):
         self.assertIn('-m', command[4:])
         self.assertEqual(command[command.index('-m', 4) + 1], 'not hcu')
 
+    def test_cpu_tiers_hide_devices_without_disabling_upstream_triton_imports(self):
+        # Core treats an empty mask as a deferred driver environment. '-1'
+        # instead disables Triton and erases JIT metadata needed by audits.
+        with patch.dict(os.environ, {'VLLM_TARGET_ROOT': '/source'}):
+            for tier in ('source', 'portable'):
+                environment = self.run_tier(tier).kwargs['env']
+                with self.subTest(tier=tier):
+                    self.assertEqual(environment['HCU_ADAPTER_HOST'], 'none')
+                    for name in ('HIP_VISIBLE_DEVICES', 'ROCR_VISIBLE_DEVICES',
+                                 'CUDA_VISIBLE_DEVICES'):
+                        self.assertEqual(environment[name], '')
+
     def test_device_filters_hcu_and_enables_slimquant_opt_in(self):
         call = self.run_tier('device')
         command = call.args[0]

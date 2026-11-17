@@ -91,7 +91,7 @@ def successful_importer(calls: list[str]):
     modules = {
         "lightop.norm": SimpleNamespace(
             fused_add_rms_norm=lambda x, residual, weight, eps: (x, residual),
-            rmsnorm_forward_autograd=lambda x, weight, eps, training: x,
+            rms_norm=lambda x, weight, eps, out: out,
         ),
         "vllm.model_executor.layers.layernorm": SimpleNamespace(RMSNorm=RMSNorm),
         "vllm.utils.torch_utils": SimpleNamespace(
@@ -272,14 +272,14 @@ def test_activation_rejects_unsupported_metadata_before_importing_runtime(
     (
         (
             SimpleNamespace(
-                rmsnorm_forward_autograd=None,
+                rms_norm=None,
                 fused_add_rms_norm=lambda x, residual, weight, eps: (x, residual),
             ),
-            "rmsnorm_forward_autograd",
+            "rms_norm",
         ),
         (
             SimpleNamespace(
-                rmsnorm_forward_autograd=lambda x, weight, eps, training: x,
+                rms_norm=lambda x, weight, eps, out: out,
                 fused_add_rms_norm=None,
             ),
             "fused_add_rms_norm",
@@ -460,10 +460,10 @@ def test_repeated_and_concurrent_activation_registers_capability_once(
 
 
 @pytest.mark.parametrize("documentation", (
-    "rmsnorm_forward_autograd(arg0: torch.Tensor, arg1: torch.Tensor, arg2: typing.SupportsFloat, arg3: bool) -> torch.Tensor",
-    "rmsnorm_forward_autograd(*args, **kwargs)\nOverloaded function.\n\n"
-    "1. rmsnorm_forward_autograd(a, b, epsilon, training, required_extra)\n"
-    "2. rmsnorm_forward_autograd(a, b, epsilon, training, optional_extra=False)",
+    "rms_norm(arg0: torch.Tensor, arg1: torch.Tensor, arg2: typing.SupportsFloat, arg3: torch.Tensor) -> torch.Tensor",
+    "rms_norm(*args, **kwargs)\nOverloaded function.\n\n"
+    "1. rms_norm(a, b, epsilon, out, required_extra)\n"
+    "2. rms_norm(a, b, epsilon, out, optional_extra=False)",
 ))
 def test_uninspectable_native_rms_uses_documented_call_abi_before_publication(
     monkeypatch: pytest.MonkeyPatch, documentation: str,
@@ -482,7 +482,7 @@ def test_uninspectable_native_rms_uses_documented_call_abi_before_publication(
     def changed_importer(name):
         module = base(name)
         if name == "lightop.norm":
-            module.rmsnorm_forward_autograd = math.log
+            module.rms_norm = math.log
         return module
 
     monkeypatch.setattr(extension, "_import_module", changed_importer)
@@ -493,11 +493,11 @@ def test_uninspectable_native_rms_uses_documented_call_abi_before_publication(
 
 @pytest.mark.parametrize("documentation", (
     None,
-    "rmsnorm_forward_autograd(*args, **kwargs)",
-    "rmsnorm_forward_autograd(a, b, epsilon)",
-    "rmsnorm_forward_autograd(a, b, epsilon, training, required_extra)",
-    "rmsnorm_forward_autograd(a, b, epsilon, *, training)",
-    "another_function(a, b, epsilon, training)",
+    "rms_norm(*args, **kwargs)",
+    "rms_norm(a, b, epsilon)",
+    "rms_norm(a, b, epsilon, out, required_extra)",
+    "rms_norm(a, b, epsilon, *, out)",
+    "another_function(a, b, epsilon, out)",
 ))
 def test_uninspectable_native_rms_rejects_unproven_or_incompatible_doc_abi(
     monkeypatch: pytest.MonkeyPatch, documentation: str | None,
@@ -512,7 +512,7 @@ def test_uninspectable_native_rms_rejects_unproven_or_incompatible_doc_abi(
     def changed_importer(name):
         module = base(name)
         if name == "lightop.norm":
-            module.rmsnorm_forward_autograd = math.log
+            module.rms_norm = math.log
         return module
 
     monkeypatch.setattr(extension, "_import_module", changed_importer)
@@ -527,11 +527,11 @@ def test_uninspectable_python_rms_is_not_treated_as_a_native_binding(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     class OpaquePythonCallable:
-        """rmsnorm_forward_autograd(x, weight, epsilon, training) -> Tensor"""
+        """rms_norm(x, weight, epsilon, out) -> Tensor"""
 
         __signature__ = 42
 
-        def __call__(self, x, weight, epsilon, training):
+        def __call__(self, x, weight, epsilon, out):
             raise AssertionError("preflight must not call providers")
 
     monkeypatch.setenv("VLLM_HCU_USE_CUSTOM_OPS", "1")
@@ -542,7 +542,7 @@ def test_uninspectable_python_rms_is_not_treated_as_a_native_binding(
     def changed_importer(name):
         module = base(name)
         if name == "lightop.norm":
-            module.rmsnorm_forward_autograd = OpaquePythonCallable()
+            module.rms_norm = OpaquePythonCallable()
         return module
 
     monkeypatch.setattr(extension, "_import_module", changed_importer)
@@ -556,7 +556,7 @@ def test_uninspectable_python_rms_is_not_treated_as_a_native_binding(
     assert "__signature__" in str(caught.value.__cause__)
 
 
-@pytest.mark.parametrize("name", ("rmsnorm_forward_autograd", "fused_add_rms_norm"))
+@pytest.mark.parametrize("name", ("rms_norm", "fused_add_rms_norm"))
 @pytest.mark.parametrize("kind", (
     "required_fifth", "only_three", "keyword_only", "coroutine", "generator", "async_generator",
 ))
@@ -617,13 +617,13 @@ def test_inspectable_native_rms_cannot_use_documentation_to_hide_wrong_arity(
     def documentation(function):
         if function is math.sin:
             documentation_reads.append(function)
-            return "rmsnorm_forward_autograd(x, weight, epsilon, training)"
+            return "rms_norm(x, weight, epsilon, out)"
         return getdoc(function)
 
     def changed_importer(name: str):
         module = base(name)
         if name == "lightop.norm":
-            module.rmsnorm_forward_autograd = math.sin
+            module.rms_norm = math.sin
         return module
 
     monkeypatch.setattr(inspect, "getdoc", documentation)
@@ -642,7 +642,7 @@ def test_native_rms_documentation_defaults_and_annotations_are_not_evaluated(
     marker = "HCU_RMS_DOC_SHOULD_NOT_EXECUTE"
     monkeypatch.delenv(marker, raising=False)
     documentation = (
-        "rmsnorm_forward_autograd(a, b, epsilon, training, "
+        "rms_norm(a, b, epsilon, out, "
         "optional_extra=__import__('os').environ.__setitem__('"
         + marker + "', '1')) -> __import__('os').environ.__setitem__('"
         + marker + "', '1')"
@@ -655,7 +655,7 @@ def test_native_rms_documentation_defaults_and_annotations_are_not_evaluated(
     def changed_importer(name: str):
         module = base(name)
         if name == "lightop.norm":
-            module.rmsnorm_forward_autograd = math.log
+            module.rms_norm = math.log
         return module
 
     monkeypatch.setattr(extension, "_import_module", changed_importer)

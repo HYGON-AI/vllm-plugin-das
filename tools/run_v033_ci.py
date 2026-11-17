@@ -177,8 +177,11 @@ def main():
     if args.tier == 'source':
         environment['HCU_V033_VERIFY_INSTALLED'] = '0'
     if args.tier in {'source', 'portable'}:
-        environment.update(HCU_ADAPTER_HOST='none', HIP_VISIBLE_DEVICES='-1',
-                           ROCR_VISIBLE_DEVICES='-1', CUDA_VISIBLE_DEVICES='-1')
+        # Empty masks hide devices while retaining Core's deferred-driver
+        # Triton imports. '-1' makes recent Core choose placeholder decorators,
+        # removing the real JIT metadata that portable source audits inspect.
+        environment.update(HCU_ADAPTER_HOST='none', HIP_VISIBLE_DEVICES='',
+                           ROCR_VISIBLE_DEVICES='', CUDA_VISIBLE_DEVICES='')
         if args.tier == 'source' and not environment.get('VLLM_TARGET_ROOT'):
             raise ValueError('source tier requires VLLM_TARGET_ROOT')
     if args.tier != 'source':

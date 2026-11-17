@@ -24,12 +24,119 @@ and retains a Plugin E5M2 writer and descale adapter. The kernel page is 64
 tokens. It neither copies nor replaces the official Flash forward method and
 does not require private HCU hooks in the Core.
 
+## E2M1 packer lowering (default triton, `stock` opts out)
+
+`das_hcu_fp4_packer` rebinds Core's `_fp32x2_to_fp4x2` E2M1 packer at startup.
+The audited upstream body emits PTX `cvt.rn.satfinite.e2m1x2.f32` with the
+`=r,f,f` constraint, which DTK clang cannot lower (029 `BLOCKED_TOOLCHAIN`).
+The replacement is Plugin-owned arithmetic: `min(|x|, 6)` saturation, seven
+thresholds, tie-to-even on the magnitude code, and the IEEE sign bit (so `-0`
+stays `0x8`). The first argument keeps the low nibble.
+
+Activation requires real HCU `gfx938`, vLLM `0.33.*`, an exact AST match with
+the audited definition plus identical aliases in six namespaces, an unhashed
+and uncompiled caller set, no foreign compile factor, and no existing runtime
+record. The paired Adapter registry defaults `HCU_VLLM_FP4_PACKER_IMPL` to
+`triton`, so the candidate is selected unless a deployment opts out. Explicit
+`stock` (`HCU_VLLM_FP4_PACKER_IMPL=stock`) or `HCU_DISABLE_OPS=vllm_fp4_packer`
+leaves every original object in place; a
+policy change needs a fresh process because JIT and Graph caches may already
+refer to the published kernel. A failure after publication is commit-fatal and
+is never presented as a rollback.
+
+Upstreaming position: the arithmetic body is a workaround for a toolchain gap,
+so the intended end state is deleting it once DTK lowers the PTX instruction or
+Core ships a lowering it can compile. This module therefore declares no
+upstream-format contribution; it carries no cache format, scale recipe or
+roofline claim of its own.
+
+Evidence level: **spec-consistent, hardware-unverified**. CPU/mock contracts
+only (83 tests): explicit E2M1 code literals, FP32 tie neighbours, saturation
+including `2**28`/`FLT_MAX`, NaN/Inf policy, nibble order, the audit gate, and
+policy/rollback refusals. The Triton kernel was neither compiled nor executed;
+native compilation, kernel hit, Graph replay, accuracy and performance remain
+separate gates.
+
 vLLM's native `SiluAndMul` remains the selected implementation. Warmed
 compiled A/B measurements on `gfx936` did not justify replacing the upstream
 operator, so the plugin neither registers nor ships a `SiluAndMul` override.
 
 No model, topology, FP8-KV, or broad performance support is implied by these
 operator-level capabilities.
+
+## DSV4.1 Channel-FP8 configuration routing
+
+The independent `das_hcu_dsv41` Adapter extension advertises only
+`dsv41-channel-fp8-routing` and registers the distinct public quantization name
+`hcu_dsv41_channel_fp8`. It does not replace the official `fp8`,
+`deepseek_v4_fp8`, or `compressed-tensors` entries or their methods, and does
+not depend on the RMS/Flash extensions or vendor optimizations for discovery.
+
+Automatic selection requires the HCU platform, a V4.1 model configuration,
+`quant_method=fp8` (or `deepseek_v4_fp8`), `is_per_channel=true`, no weight block
+size, dynamic activations, and a compatible user quantization choice. Other
+models and schemes preserve their official selection. The configuration reuses
+the official V4.1 FP8 policy, checks native exclusions before delegating to the
+official CT channel-weight/token-activation scheme, and leaves BF16 `wo_a`
+unquantized. At normal serialized startup, an existing foreign owner of the
+new name is rejected; partial registration failure refuses further activation
+in that process. The Core registry has no atomic reservation API: this extension
+does not guarantee inter-owner atomicity against concurrent external writes or
+roll back arbitrary Core registrations. Its health check detects a later lost
+owner without repairing it.
+
+This increment is configuration/routing infrastructure. It does **not** certify
+checkpoint or target/draft scale loading, HCU kernel support, model inference,
+W4A8, PCP, DSpark, Graph, accuracy or performance. Those are separate migration
+gates. Requiring `dsv41-channel-fp8-routing` at startup proves activation only,
+not those execution properties. See the [routing contract and evidence](../docs/validation/dsv41-channel-fp8-routing.md).
+
+For the selected Channel-FP8 W8A8 Linear scheme, a Plugin-owned CT LinearMethod
+returns correctly shaped empty outputs before local quantization/GEMM. It
+retains CT weight creation/finalization and native nonempty execution, registers
+through the public weight-loader-v2 API, and leaves the surrounding Linear
+forward and collectives intact. Native `QuantizedActivation` is reused.
+The pinned v0.33 V41 target already resolves direct/inverse scale spellings;
+small CPU source replay verifies ordinary and fused projection loading without
+adding parameter aliases or changing that loader. Hardware admission,
+quantization and GEMM are doubled in that replay. DSpark draft scale aliases,
+actual checkpoint loading, distributed execution and GPU correctness remain
+unverified. See [target loading and empty-row validation](../docs/validation/dsv41-channel-fp8-loading.md).
+
+## PCP Channel-FP8 providers
+
+`das_hcu_v41_pcp` remains the sole owner of the V4.1 target model registration;
+`das_hcu_dsv41` independently owns Channel-FP8 quantization admission. Select
+PCP with `VLLM_HCU_DSV41_PCP_ATTENTION=1` and `HCU_VLLM_PCP_IMPL=native`.
+The enabled PCP owner also advertises the `dsv41-pcp-megamoe` capability from
+#399; requiring that capability does not enable PCP by itself.
+
+PCP attention and FP8 reference scoring stay adapter-owned. Native mHC class
+names retain the adapter's public OOT dispatch, including its provider/shape
+fallbacks; the PCP model does not install another local mHC implementation.
+The additional `dsv41.pcp_attention` and `models.dsv41_pcp` import paths are
+compatibility aliases to these same classes, not independent implementations.
+
+For Channel-FP8 TP1/DP1/PCP8/EP8 with DeepEP HT, explicit `deep_gemm` selects
+the scoped PCP DeepGEMM method; explicit `deep_gemm_mega_moe` selects MegaMoE.
+Vendor target-shape, eager, no-replay and other provider admission checks remain
+mandatory. Existing decode HT/LL and DSpark AG-RS methods remain selected for
+their original configurations. CT W4A8 uses its independent quantization route.
+
+`VLLM_HCU_DSV41_PCP_PROFILE_WORKER=1` (default) selects rank-local memory
+profiling only for that resolved Channel-FP8 PCP8 topology and only when Core's
+worker choice was automatic. Engram staging and vendor buffers share the same
+local token bound. Disabling automatic selection or using a different explicit
+worker retains global capacity. Explicitly naming this PCP worker still applies
+its topology/quantization predicate to both profiling and capacity reservation;
+configurations outside that predicate retain global capacity. Changing the
+policy after PCP publication requires a fresh process. The scheduler's global
+budget is not reduced.
+
+CPU contracts cover registration, dispatch, local capacity, empty ranks and
+loader preservation. They do not certify multi-rank execution, vendor kernel
+availability, model accuracy or performance. PCP8 hardware acceptance remains
+required after merging these providers.
 
 ## Compatibility
 
@@ -182,9 +289,17 @@ backend selection and kernels. Dense INT8 layers also use official CT methods.
 Declared n-gram tables use the public per-row INT8 PLE method with FP32 scales.
 This consumes more weight memory than a packed native W4A8 kernel. It neither
 registers AITER as an official INT8 backend nor replaces `compressed-tensors`.
-The current parser requires the three explicit mixed-precision groups used by
-the Qwen3.8 checkpoint. Verify loader numerics, changed-input Graph and model
-accuracy for the selected Core/provider/checkpoint combination before deployment.
+When `mixed_precision` is absent, the parser preserves the historical format:
+applicable Linear layers use per-channel INT8, routed experts use packed INT4,
+and `ignore` patterns remain authoritative. Ordinary embedding/lm-head and
+model-owned router construction keep their official unquantized behavior.
+An explicit `mixed_precision` map requires the packed-expert declaration.
+Dense INT8 and n-gram INT8 groups are optional; omitting either retains its
+unquantized weights. Every present group needs a complete module list and
+matching format. A malformed declaration never falls back to historical
+defaults. The legacy format does not infer quantized PLE tables. Verify loader
+numerics, changed-input Graph and model accuracy
+for the selected Core/provider/checkpoint combination before deployment.
 
 An experimental native packed provider can be selected explicitly with
 `--additional-config '{"hcu_slimquant":{"moe_provider":"boltops"}}'`.
@@ -300,7 +415,13 @@ generator providers are rejected. This extends the existing activation preflight
 its provider checks still run even when the RMS execution flags are OFF.
 It neither invokes a provider nor proves kernel, Graph or model correctness.
 
-The LightOp RMSNorm path is selected only when all of the following hold:
+Compiled calls delegate to Core's complete RMSNorm IR, including its compiler
+precision policy and fusion across consecutive residual additions. The optional
+LightOp provider is retained for eligible eager execution; this capability does
+not promise a vendor normalization kernel in compiled serving. Direct ordinary
+and mutating-fused custom-op ABIs remain available and independently tested.
+
+The eager LightOp RMSNorm path is selected only when all of the following hold:
 
 - the master and RMSNorm-specific switches are enabled;
 - vLLM batch-invariant mode is disabled;
@@ -314,6 +435,16 @@ The LightOp RMSNorm path is selected only when all of the following hold:
 All other cases use vLLM's native RMSNorm implementation. `GemmaRMSNorm`,
 `RMSNormGated`, quantized fusion, model patches, and performance claims are out
 of scope for this release.
+
+The optional eager ordinary and fused RMSNorm paths retain eager native IR's rounding
+order: normalize in FP32, cast to the input/weight dtype, then multiply by the
+weight. LightOp computes the unweighted normalization and PyTorch applies the
+weight after that cast. The residual still stores the rounded FP32 sum. This
+uses an extra dtype-preserving multiply; measure its serving cost independently
+of accuracy. A final-cast-only FP32 formula is insufficient as a regression
+oracle, especially before INT8 activation quantization.
+See the scoped [rounding validation](../docs/validation/vllm033-rms-rounding.md)
+for the regression, model results, and component cost.
 
 ## Opt in and rollback
 
