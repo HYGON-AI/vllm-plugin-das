@@ -10,6 +10,28 @@ def is_hcu_platform() -> bool:
     return type(current_platform).__module__ == "vllm_hcu.platforms.hcu"
 
 
+def get_paged_mqa_provider():
+    """Select explicit HCU compatibility without rebinding vLLM/DeepGEMM."""
+    if is_hcu_platform():
+        try:
+            from hcu_adapter.bridges.vllm_paged_mqa import get_paged_mqa_provider
+        except ImportError as error:
+            raise RuntimeError(
+                "HYV4 Flash on HCU requires adapter-das with the non-MX "
+                "FP8 paged-MQA bridge (hcu_adapter.bridges.vllm_paged_mqa)"
+            ) from error
+        return get_paged_mqa_provider()
+    from vllm.utils.deep_gemm import (
+        fp8_fp4_paged_mqa_logits,
+        get_paged_mqa_logits_metadata,
+        has_deep_gemm,
+    )
+
+    if not has_deep_gemm():
+        raise RuntimeError("Flash IndexPool requires DeepGEMM paged MQA")
+    return get_paged_mqa_logits_metadata, fp8_fp4_paged_mqa_logits
+
+
 def validate_flash_platform() -> None:
     """Validate that the active platform has a Flash MLA implementation."""
     if is_hcu_platform():

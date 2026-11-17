@@ -7,6 +7,7 @@ from copy import deepcopy
 import torch
 from torch import nn
 
+from vllm.compilation.breakable_cudagraph import eager_break_during_capture
 from vllm.distributed import get_tensor_model_parallel_world_size
 from vllm.model_executor.layers.attention import MLAAttention
 from vllm.model_executor.layers.layernorm import RMSNorm
@@ -183,6 +184,17 @@ class HYV4FlashAttention(HYV4MLAAttention):
             and (self.is_window_layer or not config.dsa_skip_attn_post_norm)
             else None
         )
+
+    @eager_break_during_capture
+    def _indexer_and_attn(self, hidden_states, q_c, positions, q, kv_c_normed,
+                          k_pe, out):
+        # v0.33 HYV4's inherited method signals a ROCm-AITER-only top-k
+        # event. FlashMLA consumes this stream's buffer directly and has no
+        # record_logical_topk_ready hook; keep the eager capture boundary,
+        # not the unrelated backend's event protocol.
+        if self.indexer is not None and self.is_sparse and not self.skip_topk:
+            self.indexer(hidden_states, q_c, positions, self.indexer_rope_emb)
+        out.copy_(self.mla_attn(q, kv_c_normed, k_pe, output_shape=out.shape))
 
     def forward(self, positions, hidden_states, llama_4_scaling=None):
         q_c = self.q_a_layernorm(self.q_a_proj(hidden_states)[0])

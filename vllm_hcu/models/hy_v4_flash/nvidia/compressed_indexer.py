@@ -10,16 +10,16 @@ from vllm import envs
 from vllm.config import CUDAGraphMode
 from vllm.forward_context import get_forward_context
 from vllm.model_executor.layers.linear import ReplicatedLinear
-from vllm.platforms import current_platform
 from vllm.utils.deep_gemm import (
-    fp8_fp4_paged_mqa_logits,
-    get_paged_mqa_logits_metadata,
-    has_deep_gemm,
     mqa_logits_mx_inputs,
     mqa_logits_use_mx_scales,
 )
 from vllm.utils.math_utils import cdiv
 from vllm.utils.platform_utils import num_compute_units
+from vllm_hcu.models.hy_v4_flash.runtime import (
+    get_paged_mqa_provider,
+    is_hcu_platform,
+)
 
 from .indexpool_cache import POOL_PAGE_SIZE, IndexPoolCache, IndexPoolMetadata
 from .indexpool_ops import (
@@ -36,8 +36,8 @@ from .indexpool_prepare import prepare_groups, write_tails
 class FlashCompressedIndexer(nn.Module):
     def __init__(self, vllm_config, config, topk_indices_buffer, prefix):
         super().__init__()
-        if not has_deep_gemm():
-            raise RuntimeError("Flash IndexPool requires DeepGEMM paged MQA")
+        self._paged_metadata, self._paged_logits = get_paged_mqa_provider()
+        self.use_mx_scales = not is_hcu_platform() and mqa_logits_use_mx_scales()
         self.ratio = config.compressed_indexer_compress_ratio
         self.group_budget = config.compressed_indexer_group_topk - 1
         self.num_heads = config.compressed_indexer_num_attention_heads
@@ -82,7 +82,7 @@ class FlashCompressedIndexer(nn.Module):
             tail=True,
         )
         self.num_sms = num_compute_units()
-        self.varlen = current_platform.is_device_capability_family(100)
+        self.varlen = self.use_mx_scales
 
     def forward(self, hidden_states, q_c, positions, rope=None):
         output = self.topk_indices_buffer[: hidden_states.shape[0]]
@@ -136,7 +136,7 @@ class FlashCompressedIndexer(nn.Module):
                     pooled, group_positions, self.rope_dim, self.rope_parameters
                 )
             )
-            if mqa_logits_use_mx_scales():
+            if self.use_mx_scales:
                 scales = (scales.view(torch.int32) >> 23) * 0x01010101
             write_pool(
                 cache, km.block_table, group_owner, groups, group_live, quant, scales
@@ -163,7 +163,9 @@ class FlashCompressedIndexer(nn.Module):
             (0, heads - self.num_heads),
         )
         quant_q = quant_q[:, None]
-        mx_scales, weights = mqa_logits_mx_inputs(quant_q, None, weights, torch.float32)
+        mx_scales = None
+        if self.use_mx_scales:
+            mx_scales, weights = mqa_logits_mx_inputs(quant_q, None, weights)
         max_seq_len = (
             self.max_model_len
             if get_forward_context().cudagraph_runtime_mode == CUDAGraphMode.FULL
@@ -181,11 +183,11 @@ class FlashCompressedIndexer(nn.Module):
             bounds = upper[begin:end]
             lengths = bounds.clamp_min(1).int()[:, None].contiguous()
             indices = owner[begin:end].int().contiguous() if self.varlen else None
-            schedule = get_paged_mqa_logits_metadata(
+            schedule = self._paged_metadata(
                 lengths, POOL_PAGE_SIZE, self.num_sms, indices=indices
             )
             table = km.block_table[owner[begin:end]]
-            logits = fp8_fp4_paged_mqa_logits(
+            logits = self._paged_logits(
                 (
                     quant_q[begin:end],
                     mx_scales[begin:end] if mx_scales is not None else None,
