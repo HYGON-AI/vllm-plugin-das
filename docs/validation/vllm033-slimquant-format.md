@@ -28,6 +28,14 @@ Expert scales convert from the checkpoint's high-nibble units by multiplying
 by 16 before the official INT8 loader. Dense and PLE scales retain their units.
 The expanded expert weights consume more memory than packed W4A8 kernels.
 
+With an explicit `mixed_precision` map, `experts` is required. The
+`w8a8_include` and `ngram_embedding` groups are optional: omitting a group keeps
+those layers unquantized. This covers packed-expert checkpoints with BF16 dense
+weights and BF16 PLE tables, and INT8-dense checkpoints with BF16 PLE tables.
+A present group still requires its complete supported format, scope and
+non-empty module list; null or incomplete declarations are rejected. These
+configuration variants require their own device and model validation.
+
 The decoder supports dynamic per-token INT8 activations and per-channel
 dense weights. Explicit incompatible top-level/expert activation declarations
 or dense weight scope fail during configuration parsing. Omitted top-level

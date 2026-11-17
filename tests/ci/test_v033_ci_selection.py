@@ -109,7 +109,8 @@ class SelectionTests(unittest.TestCase):
         self.assertNotIn(deepgemm, test_files('portable'))
         self.assertEqual(set(test_files('device')), {
             p.relative_to(ROOT).as_posix() for p in (ROOT / 'tests/vllm033').glob('*_hcu.py')
-        } | {'tests/vllm033/test_slimquant.py'})
+        } | {'tests/vllm033/test_slimquant.py',
+             'tests/vllm033/test_minimax31_prefill_gpu.py'})
         with tempfile.TemporaryDirectory() as directory:
             report = Path(directory) / 'junit.xml'
             for text in ['<testsuites/>', '<testsuite><testcase><skipped/></testcase></testsuite>',
@@ -127,7 +128,8 @@ class SelectionTests(unittest.TestCase):
         self.assertIn('v0.33.0', source)
         self.assertIn('HCU_CI_IMAGE_V033', source)
         self.assertNotIn('HCU_CI_IMAGE_V0281', source)
-        self.assertNotIn('pull_request_target', source)
+        self.assertIn('\n  pull_request_target:\n', source)
+        self.assertNotIn('\n  pull_request:\n', source)
         for job in EXPECTED:
             self.assertIn(job + ':', source)
 

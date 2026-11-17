@@ -55,6 +55,10 @@ implementation boundaries and remaining device/model gates are recorded in
 numerics, changed-input Graph replay, model accuracy and performance are
 separate results; source tests do not certify an installed wheel.
 
+For rebases and upgrades, use the [upstream-first upgrade skill](skills/upgrading-vllm-hcu-upstream-first/SKILL.md)
+and its portable static preflight. The report provides review candidates;
+device and model validation remain separate.
+
 The current task's user-authorized acceptance of precision differences for
 models below 7B, preserved original scores and PR330 review scope are recorded
 in [the acceptance review](docs/validation/vllm033-small-model-acceptance.md).
@@ -63,6 +67,9 @@ Files under `validation/v0.32.0`, `tests/vllm032` and older versioned design or
 validation documents are historical evidence. Their scores and artifacts do
 not certify this release. The historical compatibility-lock test is retained
 with its original inputs.
+
+For legacy/ARC Kubernetes device-runner selection and rollback, see the
+[v0.33 CI guide](docs/validation/vllm033-ci-coverage.md#switch-v033-device-ci-between-legacy-runners-and-arck8s).
 
 ## License
 
