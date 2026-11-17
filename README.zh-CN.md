@@ -49,6 +49,9 @@ python3 -m pip install --no-deps ./dist/hcu_vllm_das_plugin-*.whl
 CPU 契约、设备数值、变输入 Graph、模型精度和性能分别验收；源码测试
 不代替安装态 wheel 的验证。
 
+升级或 rebase 时使用 [上游优先升级 skill](skills/upgrading-vllm-hcu-upstream-first/SKILL.md)
+及其可移植静态预检工具。报告用于发现待审查项；设备和模型仍须分别验证。
+
 本轮用户允许 7B 以下模型出现精度误差；原始分数、适用范围及 PR330 的
 审查口径见 [验收更新](docs/validation/vllm033-small-model-acceptance.md)。
 

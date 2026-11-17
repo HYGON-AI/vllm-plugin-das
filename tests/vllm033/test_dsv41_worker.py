@@ -43,6 +43,7 @@ def test_memory_profile_uses_local_bound_and_restores_global_budget(monkeypatch,
         kernel_config=NS(moe_backend=backend),
         model_config=NS(hf_config=NS(model_type="deepseek_v41"),
                         quantization="hcu_dsv41_channel_fp8"),
+        cache_config=NS(swa_bounded_replay=False),
         scheduler_config=NS(max_num_batched_tokens=32768))
     worker.model_runner = NS(max_num_tokens=32768, max_num_reqs=128, pcp_manager=object())
     def core_profile(self):
@@ -51,6 +52,36 @@ def test_memory_profile_uses_local_bound_and_restores_global_budget(monkeypatch,
         if fail:
             raise RuntimeError("profile failed")
         return 123456
+    monkeypatch.setattr(Worker, "determine_available_memory", core_profile)
+    if fail:
+        with pytest.raises(RuntimeError, match="profile failed"):
+            worker.determine_available_memory()
+    else:
+        assert worker.determine_available_memory() == 123456
+    assert worker.model_runner.max_num_tokens == 32768
+
+
+@pytest.mark.parametrize("fail", [False, True])
+def test_swa_replay_profiles_global_padded_rows(monkeypatch, fail):
+    worker = object.__new__(HcuDSV41PcpWorker)
+    worker.rank = 0
+    worker.parallel_config = parallel_config()
+    worker.vllm_config = NS(parallel_config=worker.parallel_config,
+        kernel_config=NS(moe_backend="deep_gemm"),
+        model_config=NS(hf_config=NS(model_type="deepseek_v41"),
+                        quantization="hcu_dsv41_channel_fp8"),
+        cache_config=NS(swa_bounded_replay=True),
+        scheduler_config=NS(max_num_batched_tokens=32768))
+    worker.model_runner = NS(max_num_tokens=32768, max_num_reqs=128, pcp_manager=object())
+
+    def core_profile(self):
+        # Core pads each PCP replay batch to the global retained row count.
+        assert self.model_runner.max_num_tokens == 32768
+        assert self.vllm_config.scheduler_config.max_num_batched_tokens == 32768
+        if fail:
+            raise RuntimeError("profile failed")
+        return 123456
+
     monkeypatch.setattr(Worker, "determine_available_memory", core_profile)
     if fail:
         with pytest.raises(RuntimeError, match="profile failed"):
