@@ -133,6 +133,17 @@ inspect embedded architectures before changing a shared CI image.
    Clean up only recorded owned process identities. Keep numerical success,
    process release and normal teardown as separate results.
 
+For a raw accuracy loss involving output formatting, compare saved reference
+continuations through the target's public prompt-logprob API. Verify identical
+rendered prompt/token IDs and an unchanged BPE boundary; repeat each identical
+request within each arm and record the first greedy-ranking difference, token
+probabilities and top-two margins. Probe both original continuation prefixes
+where available. Teacher-forced prefill has different execution geometry from
+free-running decode: a reproducible ranking change narrows the investigation
+but does not identify one native leaf, qualify decode, or waive the raw loss.
+Keep serving configuration, package/checkpoint identity and lifecycle results
+bound separately; preserve the original evaluation and normalization protocol.
+
 Graph capture or HTTP health alone does not establish successful generation.
 When workspace planning moves to construction, build the real layer in CPU
 regressions with explicit native leaf doubles and exercise its frozen plan.
@@ -140,6 +151,13 @@ Mutate the source configuration afterward and verify reservation and reuse at
 the actual workspace boundary; a removed runtime-config import is not a seam
 to restore merely to keep an old fixture working. Retain missing-reservation
 negative controls. CPU constructor tests do not qualify a model or device.
+CPU CLI transport fixtures should use a real temporary local model directory
+and explicitly exercise offline resolution, rather than depend on a cached
+placeholder repository. For layout-only quantization tests, isolate the
+constructor's device-admission leaf while retaining real post-load/reload,
+tensor-value, stride and pointer assertions. Match source-origin guards to the
+actual Core import path. Keep production admission checks and device tests
+unchanged; these fixture doubles do not establish native execution.
 For GDN, follow the actual constructor's dispatch selection: an official
 CustomOp may replace `_forward_method` after platform dispatch, so overriding
 `forward_hip` alone need not execute the provider. An OOT prefill entry does
