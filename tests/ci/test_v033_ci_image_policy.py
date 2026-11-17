@@ -104,7 +104,7 @@ class ImagePolicyTests(unittest.TestCase):
                                   'HARBOR_USERNAME', 'HARBOR_PASSWORD',
                                   'needs: [select, authorize-device']:
                     self.assertNotIn(forbidden, block)
-        self.assertIn('needs: select\n', job_block(self.source, 'v033-source-contract'))
+        self.assertIn('needs: [resolve-target, select]\n', job_block(self.source, 'v033-source-contract'))
 
     def test_container_packaging_trusts_only_the_checked_out_workspace(self):
         for name in ['v033-device-gfx936', 'v033-device-gfx938']:
