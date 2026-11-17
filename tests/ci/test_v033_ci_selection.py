@@ -127,7 +127,8 @@ class SelectionTests(unittest.TestCase):
         self.assertIn('v0.33.0', source)
         self.assertIn('HCU_CI_IMAGE_V033', source)
         self.assertNotIn('HCU_CI_IMAGE_V0281', source)
-        self.assertNotIn('pull_request_target', source)
+        self.assertIn('\n  pull_request_target:\n', source)
+        self.assertNotIn('\n  pull_request:\n', source)
         for job in EXPECTED:
             self.assertIn(job + ':', source)
 

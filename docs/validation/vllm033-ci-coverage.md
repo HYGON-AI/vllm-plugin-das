@@ -23,8 +23,10 @@ fail selection rather than silently using the built-in map.
 PR hardware execution reuses the existing author/`ready-hcu` authorization
 helper from the PR's trusted base commit on a hosted CPU runner. A trusted
 author is authorized automatically; other authors need `ready-hcu` applied
-by a trusted actor. Label additions/removals trigger a new check. CPU source
-contracts run independently. Release pushes/manual runs must target
+by a trusted actor. Only the `labeled` event that adds `ready-hcu` authorizes,
+and it approves the exact head snapshot carried by that run: a later push
+leaves hardware locked until a trusted actor removes and re-applies the label.
+CPU source contracts run independently. Release pushes/manual runs must target
 `refs/heads/v0.33.0`. Image resolution and the self-hosted device job depend
 on authorization. The aggregate gate rejects a selected but unauthorized,
 skipped, failed or cancelled stage, so a skipped hardware job is not a pass.
@@ -65,18 +67,22 @@ different `sys.path` or inherited `PYTHONPATH` cannot choose the tested Core.
 
 Set `HARBOR_SITE` to the approved registry host (optionally with a port, without
 a scheme or path). Set `HCU_CI_IMAGE_V033` to an immutable
-`${HARBOR_SITE}/jenkins/model_test_env/vllm@sha256:<64 lowercase hex digits>`
+`${HARBOR_SITE}/jenkins/model_test_env/vllm@sha256:<64 lowercase hex digits>` or
+`${HARBOR_SITE}/hcu/base_env/vllm@sha256:<64 lowercase hex digits>`
 for a prepared DTK image with compatible vLLM 0.33, Adapter, vendor libraries,
 pytest, packaging and build tooling. Missing/whitespace values, mutable tags,
 malformed digests and other repositories fail before the hardware job starts;
 there is no legacy-image fallback or automatic pull to resolve a tag.
-The job container uses the existing `HARBOR_USERNAME`/`HARBOR_PASSWORD` secrets
-when the event permits them, for the initial private-image pull. Fork PRs
-normally cannot read repository secrets: a private-image pull therefore still
-requires reviewed pre-existing runner registry authentication or credentials
-available to that event. The credentials declaration does not prove pull success.
-Missing authorization or pull access remains a failure; do not switch to
-`pull_request_target`, expose secrets to PR code, or let a PR head authorize itself.
+The workflow is triggered by `pull_request_target` so fork pull requests can
+read repository variables; the executed workflow definition and the
+authorization helper always come from the pull request's base revision. PR-head
+code runs only in read-only hosted jobs or, after a trusted author or an
+authorized `ready-hcu` label unlocks hardware, inside the device container.
+The device container uses the repository `HARBOR_USERNAME`/`HARBOR_PASSWORD`
+secrets for the initial private-image pull. The credentials declaration does
+not prove pull success. Missing authorization or pull access remains a failure;
+never let a PR head authorize itself or run untrusted PR code in a job that
+holds a write-scoped token.
 The default legacy container mounts `/opt/hyhal` read-only and uses the
 existing 32GiB shared-memory policy without privileged mode. The opt-in ARC
 backend below delegates mounts, shared memory and devices to the cluster.
@@ -140,8 +146,11 @@ resources or branch protection itself.
 Both modes retain job IDs/check names, per-job 45-minute timeouts, concurrency
 cancellation, artifact names, source/portable/device suites and the existing
 trusted-author/`ready-hcu` authorization. CPU selection/source checks stay on
-GitHub-hosted runners without Harbor secrets. Fork PR image-pull restrictions
-remain unchanged; do not switch to `pull_request_target` to bypass them.
+GitHub-hosted runners without Harbor secrets. The `pull_request_target` trigger
+lets fork runs resolve repository variables and use repository credentials for
+the device image pull; it stays gated by the trusted-author/`ready-hcu`
+authorization above, and the executed workflow and helper come from the base
+revision rather than the PR head.
 The aggregate `v033-ci-gate` still requires both selected device jobs to pass.
 The v0.28.1 selector map and Docker helpers are not used by this release and
 are intentionally not migrated here. The already-ARC wheel publishing workflow

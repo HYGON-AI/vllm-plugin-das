@@ -1,7 +1,10 @@
 name: HCU v0.33 release contracts
 
 on:
-  pull_request:
+  # pull_request_target lets fork PRs read repository variables. The workflow
+  # definition and authorization helper are taken from the base revision; PR
+  # head code runs only after trusted author/ready-hcu authorization.
+  pull_request_target:
     types: [opened, synchronize, reopened, ready_for_review, labeled, unlabeled]
     branches: [v0.33.0]
   push:
@@ -100,19 +103,19 @@ jobs:
       authorized: ${{ steps.pr-authorization.outputs.authorized || steps.release-authorization.outputs.authorized }}
     steps:
       - name: Checkout trusted PR authorization helper
-        if: github.event_name == 'pull_request'
+        if: github.event_name == 'pull_request' || github.event_name == 'pull_request_target'
         uses: actions/checkout@v4
         with:
           ref: ${{ github.event.pull_request.base.sha }}
           persist-credentials: false
       - name: Reuse existing HCU author and ready-hcu checks
-        if: github.event_name == 'pull_request'
+        if: github.event_name == 'pull_request' || github.event_name == 'pull_request_target'
         id: pr-authorization
         env:
           GITHUB_TOKEN: ${{ github.token }}
         run: python -I -B .github/scripts/hcu_ci/check_hcu_ci_authorization.py
       - name: Authorize release push or manual run
-        if: github.event_name != 'pull_request'
+        if: github.event_name != 'pull_request' && github.event_name != 'pull_request_target'
         id: release-authorization
         env:
           EVENT_NAME: ${{ github.event_name }}
@@ -152,10 +155,14 @@ jobs:
             echo 'HCU_CI_IMAGE_V033 must name a prepared v0.33 DTK/Core/Adapter/vendor image' >&2
             exit 2
           fi
-          allowed_repository="${HARBOR_SITE}/jenkins/model_test_env/vllm"
-          if [[ "${HCU_CI_IMAGE_V033%@*}" != "$allowed_repository" \
+          # The Plugin release image and Adapter's prepared v0.33 runtime are
+          # both approved sources; anything else fails before the device job.
+          release_repository="${HARBOR_SITE}/jenkins/model_test_env/vllm"
+          runtime_repository="${HARBOR_SITE}/hcu/base_env/vllm"
+          if [[ ( "${HCU_CI_IMAGE_V033%@*}" != "$release_repository" \
+                  && "${HCU_CI_IMAGE_V033%@*}" != "$runtime_repository" ) \
               || ! "${HCU_CI_IMAGE_V033##*@}" =~ ^sha256:[0-9a-f]{64}$ ]]; then
-            echo 'HCU_CI_IMAGE_V033 must be an immutable sha256 digest in the approved vllm repository' >&2
+            echo 'HCU_CI_IMAGE_V033 must be an immutable sha256 digest in an approved vllm repository' >&2
             exit 2
           fi
           case "${HCU_CI_RUNNER_MODE_V033:-k8s}" in

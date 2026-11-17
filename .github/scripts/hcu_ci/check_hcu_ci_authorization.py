@@ -156,6 +156,27 @@ def main() -> int:
             )
             return 0
 
+        # A persistent label must not authorize a later head. Only the event
+        # that adds ready-hcu approves the head snapshot carried by this run;
+        # a later push needs a fresh remove/re-apply by a trusted actor.
+        labeled = event.get("label")
+        if event.get("action") != "labeled" or not (
+            isinstance(labeled, dict) and labeled.get("name") == "ready-hcu"
+        ):
+            print(
+                "ready-hcu does not approve this head; "
+                "re-apply it after each push"
+            )
+            _write_outputs(
+                {
+                    "ready": "false",
+                    "authorized": "false",
+                    "actor": author,
+                    "permission": author_permission,
+                }
+            )
+            return 0
+
         issue_number = pull_request.get("number")
         if not isinstance(issue_number, int):
             raise AuthorizationError("pull request number is unavailable")
