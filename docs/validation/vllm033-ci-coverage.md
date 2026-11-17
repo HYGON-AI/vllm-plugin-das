@@ -65,18 +65,22 @@ different `sys.path` or inherited `PYTHONPATH` cannot choose the tested Core.
 
 Set `HARBOR_SITE` to the approved registry host (optionally with a port, without
 a scheme or path). Set `HCU_CI_IMAGE_V033` to an immutable
-`${HARBOR_SITE}/jenkins/model_test_env/vllm@sha256:<64 lowercase hex digits>`
+`${HARBOR_SITE}/jenkins/model_test_env/vllm@sha256:<64 lowercase hex digits>` or
+`${HARBOR_SITE}/hcu/base_env/vllm@sha256:<64 lowercase hex digits>`
 for a prepared DTK image with compatible vLLM 0.33, Adapter, vendor libraries,
 pytest, packaging and build tooling. Missing/whitespace values, mutable tags,
 malformed digests and other repositories fail before the hardware job starts;
 there is no legacy-image fallback or automatic pull to resolve a tag.
-The job container uses the existing `HARBOR_USERNAME`/`HARBOR_PASSWORD` secrets
-when the event permits them, for the initial private-image pull. Fork PRs
-normally cannot read repository secrets: a private-image pull therefore still
-requires reviewed pre-existing runner registry authentication or credentials
-available to that event. The credentials declaration does not prove pull success.
-Missing authorization or pull access remains a failure; do not switch to
-`pull_request_target`, expose secrets to PR code, or let a PR head authorize itself.
+The workflow is triggered by `pull_request_target` so fork pull requests can
+read repository variables; the executed workflow definition and the
+authorization helper always come from the pull request's base revision. PR-head
+code runs only in read-only hosted jobs or, after a trusted author or an
+authorized `ready-hcu` label unlocks hardware, inside the device container.
+The device container uses the repository `HARBOR_USERNAME`/`HARBOR_PASSWORD`
+secrets for the initial private-image pull. The credentials declaration does
+not prove pull success. Missing authorization or pull access remains a failure;
+never let a PR head authorize itself or run untrusted PR code in a job that
+holds a write-scoped token.
 The default legacy container mounts `/opt/hyhal` read-only and uses the
 existing 32GiB shared-memory policy without privileged mode. The opt-in ARC
 backend below delegates mounts, shared memory and devices to the cluster.
