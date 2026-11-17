@@ -1,22 +1,65 @@
 name: HCU v0.33 release contracts
 
 on:
-  pull_request:
+  # GitHub.com resolves this event from the default branch. Until the default
+  # has this entry, use the explicit PR dispatch on v0.33.0 below.
+  pull_request_target:
     types: [opened, synchronize, reopened, ready_for_review, labeled, unlabeled]
     branches: [v0.33.0]
   push:
     branches: [v0.33.0]
   workflow_dispatch:
+    inputs:
+      pr_number:
+        description: 'Optional open PR against v0.33.0 (requires expected_head)'
+        type: string
+        default: ''
+      expected_head:
+        description: 'Complete current PR head SHA; empty only for a target run'
+        type: string
+        default: ''
 
 permissions:
   contents: read
 
 concurrency:
-  group: hcu-v033-${{ github.event.pull_request.number || github.ref }}
+  group: hcu-v033-${{ github.event.pull_request.number || inputs.pr_number || github.ref }}
   cancel-in-progress: true
 
 jobs:
+  resolve-target:
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      pull-requests: read
+      issues: read
+    outputs:
+      trusted_sha: ${{ steps.trusted.outputs.commit }}
+      head_sha: ${{ steps.target.outputs.head_sha }}
+      base_sha: ${{ steps.target.outputs.base_sha }}
+      pr_number: ${{ steps.target.outputs.pr_number }}
+      manual_authorized: ${{ steps.target.outputs.manual_authorized }}
+      release: ${{ steps.target.outputs.release }}
+    steps:
+      - name: Checkout trusted release resolver
+        id: trusted
+        uses: actions/checkout@v4
+        with:
+          # PR metadata base.sha can lag the live release and lack this helper.
+          # Freeze the checked-out release commit for the authorization job.
+          ref: ${{ github.event_name == 'pull_request_target' && 'v0.33.0' || github.sha }}
+          persist-credentials: false
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+      - name: Resolve current PR head and explicit manual authorization
+        id: target
+        env:
+          GITHUB_TOKEN: ${{ github.token }}
+        run: python -I -B .github/scripts/hcu_ci/resolve_v033_run.py
+
   select:
+    needs: resolve-target
     runs-on: ubuntu-latest
     permissions:
       contents: read
@@ -25,7 +68,7 @@ jobs:
     steps:
       - uses: actions/checkout@v4
         with:
-          ref: ${{ github.event.pull_request.head.sha || github.sha }}
+          ref: ${{ needs.resolve-target.outputs.head_sha }}
           fetch-depth: 0
           persist-credentials: false
       - uses: actions/setup-python@v5
@@ -33,15 +76,16 @@ jobs:
           python-version: '3.12'
       - name: Release and selector contracts
         env:
-          RELEASE_REF: ${{ github.base_ref || github.ref_name }}
+          RELEASE_REF: ${{ needs.resolve-target.outputs.release }}
         run: |
           test "$RELEASE_REF" = v0.33.0
           python -B -m unittest discover -s tests/ci -v
+          python -I -B -m unittest discover -s skills/upgrading-vllm-hcu-upstream-first/scripts -v
       - name: Select this release without the legacy registry
         id: select
         env:
-          BASE_SHA: ${{ github.event.pull_request.base.sha || github.event.before }}
-          HEAD_SHA: ${{ github.event.pull_request.head.sha || github.sha }}
+          BASE_SHA: ${{ needs.resolve-target.outputs.base_sha || github.event.before }}
+          HEAD_SHA: ${{ needs.resolve-target.outputs.head_sha }}
           EVENT_NAME: ${{ github.event_name }}
         run: |
           if [[ "$EVENT_NAME" == workflow_dispatch || -z "$BASE_SHA" || "$BASE_SHA" =~ ^0+$ ]]; then
@@ -57,7 +101,7 @@ jobs:
           path: selection-v033.json
 
   v033-source-contract:
-    needs: select
+    needs: [resolve-target, select]
     if: needs.select.outputs.has_jobs == 'true'
     runs-on: ubuntu-latest
     permissions:
@@ -65,7 +109,7 @@ jobs:
     steps:
       - uses: actions/checkout@v4
         with:
-          ref: ${{ github.event.pull_request.head.sha || github.sha }}
+          ref: ${{ needs.resolve-target.outputs.head_sha }}
           persist-credentials: false
       - uses: actions/setup-python@v5
         with:
@@ -89,29 +133,29 @@ jobs:
           path: v033-source.xml
 
   authorize-device:
-    needs: select
+    needs: [resolve-target, select]
     if: needs.select.outputs.has_jobs == 'true'
     runs-on: ubuntu-latest
     permissions:
       contents: read
       issues: read
     outputs:
-      authorized: ${{ steps.pr-authorization.outputs.authorized || steps.release-authorization.outputs.authorized }}
+      authorized: ${{ steps.pr-authorization.outputs.authorized || steps.manual-authorization.outputs.authorized || steps.release-authorization.outputs.authorized }}
     steps:
       - name: Checkout trusted PR authorization helper
-        if: github.event_name == 'pull_request'
+        if: github.event_name == 'pull_request' || github.event_name == 'pull_request_target'
         uses: actions/checkout@v4
         with:
-          ref: ${{ github.event.pull_request.base.sha }}
+          ref: ${{ needs.resolve-target.outputs.trusted_sha }}
           persist-credentials: false
       - name: Reuse existing HCU author and ready-hcu checks
-        if: github.event_name == 'pull_request'
+        if: github.event_name == 'pull_request' || github.event_name == 'pull_request_target'
         id: pr-authorization
         env:
           GITHUB_TOKEN: ${{ github.token }}
         run: python -I -B .github/scripts/hcu_ci/check_hcu_ci_authorization.py
       - name: Authorize release push or manual run
-        if: github.event_name != 'pull_request'
+        if: github.event_name != 'pull_request' && github.event_name != 'pull_request_target' && needs.resolve-target.outputs.pr_number == ''
         id: release-authorization
         env:
           EVENT_NAME: ${{ github.event_name }}
@@ -122,6 +166,14 @@ jobs:
             exit 2
           fi
           echo 'authorized=true' >> "$GITHUB_OUTPUT"
+      - name: Record trusted exact-head manual authorization
+        if: github.event_name == 'workflow_dispatch' && needs.resolve-target.outputs.pr_number != ''
+        id: manual-authorization
+        env:
+          MANUAL_AUTHORIZED: ${{ needs.resolve-target.outputs.manual_authorized }}
+        run: |
+          [[ "$MANUAL_AUTHORIZED" == true ]] || exit 2
+          echo 'authorized=true' >> "$GITHUB_OUTPUT"
 
   resolve-device-image:
     needs: [select, authorize-device]
@@ -129,12 +181,18 @@ jobs:
     runs-on: ubuntu-latest
     outputs:
       image: ${{ steps.image.outputs.image }}
+      runner_mode: ${{ steps.image.outputs.runner_mode }}
+      gfx936_runner: ${{ steps.image.outputs.gfx936_runner }}
+      gfx938_runner: ${{ steps.image.outputs.gfx938_runner }}
+      container_options: ${{ steps.image.outputs.container_options }}
     steps:
-      - name: Require a prepared v0.33 image
+      - name: Resolve prepared image and runner backend
         id: image
         env:
           HCU_CI_IMAGE_V033: ${{ vars.HCU_CI_IMAGE_V033 }}
           HARBOR_SITE: ${{ vars.HARBOR_SITE }}
+          # Default to ARC/K8s; set legacy explicitly to roll back.
+          HCU_CI_RUNNER_MODE_V033: ${{ vars.HCU_CI_RUNNER_MODE_V033 }}
         run: |
           set -euo pipefail
           if [[ -z "${HARBOR_SITE:-}" || "$HARBOR_SITE" =~ [[:space:]/@] ]]; then
@@ -145,18 +203,46 @@ jobs:
             echo 'HCU_CI_IMAGE_V033 must name a prepared v0.33 DTK/Core/Adapter/vendor image' >&2
             exit 2
           fi
-          allowed_repository="${HARBOR_SITE}/jenkins/model_test_env/vllm"
-          if [[ "${HCU_CI_IMAGE_V033%@*}" != "$allowed_repository" \
+          # The Plugin release image and Adapter's prepared v0.33 runtime are
+          # both approved sources; anything else fails before the device job.
+          release_repository="${HARBOR_SITE}/jenkins/model_test_env/vllm"
+          runtime_repository="${HARBOR_SITE}/hcu/base_env/vllm"
+          if [[ ( "${HCU_CI_IMAGE_V033%@*}" != "$release_repository" \
+                  && "${HCU_CI_IMAGE_V033%@*}" != "$runtime_repository" ) \
               || ! "${HCU_CI_IMAGE_V033##*@}" =~ ^sha256:[0-9a-f]{64}$ ]]; then
-            echo 'HCU_CI_IMAGE_V033 must be an immutable sha256 digest in the approved vllm repository' >&2
+            echo 'HCU_CI_IMAGE_V033 must be an immutable sha256 digest in an approved vllm repository' >&2
             exit 2
           fi
-          printf 'image=%s\n' "$HCU_CI_IMAGE_V033" >> "$GITHUB_OUTPUT"
+          case "${HCU_CI_RUNNER_MODE_V033:-k8s}" in
+            legacy)
+              gfx936_runner='["self-hosted","ci","bw1000"]'
+              gfx938_runner='["self-hosted","ci","bw1100"]'
+              container_options='--device=/dev/kfd --device=/dev/dri --group-add video --shm-size=32g --volume=/opt/hyhal:/opt/hyhal:ro'
+              ;;
+            k8s)
+              # ARC selects the node/devices and supplies the standard mounts.
+              # Do not add self-hosted labels, host volumes or Docker options.
+              gfx936_runner='"hygon-bw1000-1card"'
+              gfx938_runner='"hygon-bw1100-1card"'
+              container_options=''
+              ;;
+            *)
+              echo 'HCU_CI_RUNNER_MODE_V033 must be legacy or k8s' >&2
+              exit 2
+              ;;
+          esac
+          {
+            printf 'image=%s\n' "$HCU_CI_IMAGE_V033"
+            printf 'runner_mode=%s\n' "${HCU_CI_RUNNER_MODE_V033:-k8s}"
+            printf 'gfx936_runner=%s\n' "$gfx936_runner"
+            printf 'gfx938_runner=%s\n' "$gfx938_runner"
+            printf 'container_options=%s\n' "$container_options"
+          } >> "$GITHUB_OUTPUT"
 
   v033-device-gfx936:
-    needs: [select, authorize-device, resolve-device-image]
+    needs: [resolve-target, select, authorize-device, resolve-device-image]
     if: needs.select.outputs.has_jobs == 'true' && needs.authorize-device.outputs.authorized == 'true'
-    runs-on: [self-hosted, ci, bw1000]
+    runs-on: ${{ fromJSON(needs.resolve-device-image.outputs.gfx936_runner) }}
     permissions:
       contents: read
     timeout-minutes: 45
@@ -165,14 +251,14 @@ jobs:
       credentials:
         username: ${{ secrets.HARBOR_USERNAME }}
         password: ${{ secrets.HARBOR_PASSWORD }}
-      volumes:
-        - /opt/hyhal:/opt/hyhal:ro
-      options: --device=/dev/kfd --device=/dev/dri --group-add video --shm-size=32g
+      options: ${{ needs.resolve-device-image.outputs.container_options }}
     steps:
       - uses: actions/checkout@v4
         with:
-          ref: ${{ github.event.pull_request.head.sha || github.sha }}
+          ref: ${{ needs.resolve-target.outputs.head_sha }}
           persist-credentials: false
+      - name: Trust checked-out workspace for package metadata
+        run: git config --global --add safe.directory "$GITHUB_WORKSPACE"
       - name: Full v0.33 portable contracts (devices hidden)
         env:
           PYTEST_DISABLE_PLUGIN_AUTOLOAD: '1'
@@ -190,9 +276,9 @@ jobs:
             v033-device.xml
 
   v033-device-gfx938:
-    needs: [select, authorize-device, resolve-device-image]
+    needs: [resolve-target, select, authorize-device, resolve-device-image]
     if: needs.select.outputs.has_jobs == 'true' && needs.authorize-device.outputs.authorized == 'true'
-    runs-on: [self-hosted, ci, bw1100]
+    runs-on: ${{ fromJSON(needs.resolve-device-image.outputs.gfx938_runner) }}
     permissions:
       contents: read
     timeout-minutes: 45
@@ -201,14 +287,14 @@ jobs:
       credentials:
         username: ${{ secrets.HARBOR_USERNAME }}
         password: ${{ secrets.HARBOR_PASSWORD }}
-      volumes:
-        - /opt/hyhal:/opt/hyhal:ro
-      options: --device=/dev/kfd --device=/dev/dri --group-add video --shm-size=32g
+      options: ${{ needs.resolve-device-image.outputs.container_options }}
     steps:
       - uses: actions/checkout@v4
         with:
-          ref: ${{ github.event.pull_request.head.sha || github.sha }}
+          ref: ${{ needs.resolve-target.outputs.head_sha }}
           persist-credentials: false
+      - name: Trust checked-out workspace for package metadata
+        run: git config --global --add safe.directory "$GITHUB_WORKSPACE"
       - name: Installed Channel-FP8 DeepGEMM numerical contract
         env:
           PYTEST_DISABLE_PLUGIN_AUTOLOAD: '1'
@@ -221,9 +307,10 @@ jobs:
 
   v033-ci-gate:
     if: always()
-    needs: [select, v033-source-contract, authorize-device, resolve-device-image, v033-device-gfx936, v033-device-gfx938]
+    needs: [resolve-target, select, v033-source-contract, authorize-device, resolve-device-image, v033-device-gfx936, v033-device-gfx938]
     runs-on: ubuntu-latest
     env:
+      RESOLVE_RESULT: ${{ needs.resolve-target.result }}
       SELECT_RESULT: ${{ needs.select.result }}
       HAS_JOBS: ${{ needs.select.outputs.has_jobs }}
       SOURCE_RESULT: ${{ needs.v033-source-contract.result }}
@@ -235,6 +322,7 @@ jobs:
     steps:
       - name: Require each selected stage to pass
         run: |
+          [[ "$RESOLVE_RESULT" == success ]] || exit 1
           [[ "$SELECT_RESULT" == success ]] || exit 1
           if [[ "$HAS_JOBS" == false ]]; then
             exit 0
