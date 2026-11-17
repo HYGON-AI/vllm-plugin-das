@@ -4,8 +4,9 @@ A change to `adapter_extension/src/hcu_vllm_das/environment.py` or
 `attention/e5m2_scales.py` previously selected no HCU jobs and did not trigger
 fallback. The legacy workflows only target `v0.28.1-dev`.
 
-`hcu-pr-ci-v033.yml` handles PRs and pushes to `v0.33.0` and dispatches on that
-release. It invokes the existing selector CLI with `--release v0.33.0` and the
+`hcu-pr-ci-v033.yml` handles pushes and dispatches on `v0.33.0`. Its automatic
+PR entry also requires the workflow on the repository's default branch (see
+the manual PR route below). It invokes the selector CLI with `--release v0.33.0` and the
 independent `hcu-test-map-v033.json`. The default CLI, legacy map, registry and
 workflows retain the v0.28.1 behavior. It never sends v0.33 changes to legacy
 vllm_hcu jobs or substitutes the v0.28.1 image.
@@ -21,7 +22,7 @@ map is chosen by release only when no override is provided. Invalid overrides
 fail selection rather than silently using the built-in map.
 
 PR hardware execution reuses the existing author/`ready-hcu` authorization
-helper from the PR's trusted base commit on a hosted CPU runner. A trusted
+helper from the frozen trusted release checkout on a hosted CPU runner. A trusted
 author is authorized automatically; other authors need `ready-hcu` applied
 by a trusted actor. Only the `labeled` event that adds `ready-hcu` authorizes,
 and it approves the exact head snapshot carried by that run: a later push
@@ -73,9 +74,10 @@ for a prepared DTK image with compatible vLLM 0.33, Adapter, vendor libraries,
 pytest, packaging and build tooling. Missing/whitespace values, mutable tags,
 malformed digests and other repositories fail before the hardware job starts;
 there is no legacy-image fallback or automatic pull to resolve a tag.
-The workflow is triggered by `pull_request_target` so fork pull requests can
-read repository variables; the executed workflow definition and the
-authorization helper always come from the pull request's base revision. PR-head
+On current GitHub.com, `pull_request_target` resolves the workflow from the
+receiving repository's default branch. The resolver separately checks out
+v0.33.0 and freezes that commit for the authorization helper; PR metadata's
+base SHA can lag the branch and lack newly delivered helpers. PR-head
 code runs only in read-only hosted jobs or, after a trusted author or an
 authorized `ready-hcu` label unlocks hardware, inside the device container.
 The device container uses the repository `HARBOR_USERNAME`/`HARBOR_PASSWORD`
@@ -83,8 +85,8 @@ secrets for the initial private-image pull. The credentials declaration does
 not prove pull success. Missing authorization or pull access remains a failure;
 never let a PR head authorize itself or run untrusted PR code in a job that
 holds a write-scoped token.
-The default legacy container mounts `/opt/hyhal` read-only and uses the
-existing 32GiB shared-memory policy without privileged mode. The opt-in ARC
+The explicit legacy container mounts `/opt/hyhal` read-only and uses the
+existing 32GiB shared-memory policy without privileged mode. The default ARC
 backend below delegates mounts, shared memory and devices to the cluster.
 The hosted selector/source jobs receive no Harbor secrets or HCU device mounts.
 PR-code jobs use read-only contents permissions and every checkout disables
@@ -146,11 +148,10 @@ resources or branch protection itself.
 Both modes retain job IDs/check names, per-job 45-minute timeouts, concurrency
 cancellation, artifact names, source/portable/device suites and the existing
 trusted-author/`ready-hcu` authorization. CPU selection/source checks stay on
-GitHub-hosted runners without Harbor secrets. The `pull_request_target` trigger
-lets fork runs resolve repository variables and use repository credentials for
-the device image pull; it stays gated by the trusted-author/`ready-hcu`
-authorization above, and the executed workflow and helper come from the base
-revision rather than the PR head.
+GitHub-hosted runners without Harbor secrets. Trusted event execution supplies
+repository variables and initial device-image pull credentials; automatic PR
+events retain the trusted-author/`ready-hcu` policy above. The PR never supplies
+the workflow or its authorization helper.
 The aggregate `v033-ci-gate` still requires both selected device jobs to pass.
 The v0.28.1 selector map and Docker helpers are not used by this release and
 are intentionally not migrated here. The already-ARC wheel publishing workflow
@@ -195,9 +196,46 @@ checkout action restores its temporary HOME. A real-Git regression first reprodu
 the ownership refusal, checks the workspace command succeeds and verifies that
 an unrelated repository remains untrusted. Wildcard trust is never used.
 
-The merged trusted-base `pull_request_target` flow owns variable and registry
-credential availability. This follow-up uses that flow unchanged: configured
-immutable image and registry host remain required, with no recorded-image
+Trusted workflow execution owns variable and registry credential availability.
+The configured immutable image and registry host remain required, with no recorded-image
 fallback. Authorization, head checkout, image allowlist, ARC defaults and the full
 portable/operator/Graph gate stay under the release workflow. CPU/source checks
 do not qualify the prepared image, requested gfx836 hardware or model accuracy.
+
+## Explicit PR dispatch on v0.33.0
+
+Current GitHub.com resolves `pull_request_target` from the default branch.
+Here that branch is `v0.28.1-dev`, where this workflow is absent; merely landing
+the workflow on v0.33.0 does not establish automatic PR runs. No default-branch
+setting or older release workflow is changed by this route.
+
+Dispatch on **v0.33.0** with both `pr_number` and the full current
+`expected_head` SHA, or leave both empty to test the target branch:
+
+```bash
+PR_HEAD=$(gh pr view 421 --repo HYGON-AI/vllm-plugin-das --json headRefOid --jq .headRefOid)
+gh workflow run hcu-pr-ci-v033.yml --repo HYGON-AI/vllm-plugin-das \
+  --ref v0.33.0 -f pr_number=421 -f expected_head="$PR_HEAD"
+```
+
+The trusted release resolver runs before submitted code. It requires an open
+PR against this repository's v0.33.0, compares its live head with the supplied
+SHA, and checks the dispatch actor's current permission using the existing
+trusted-permission set. The explicit dispatch authorizes that exact head;
+a persistent `ready-hcu` label grants no manual authority. A malformed pair,
+stale head, wrong repository/release, closed PR or untrusted actor fails before
+checkout of submitted code. Automatic PR events retain their separate label
+policy. API/permission errors fail closed.
+
+All four submitted-code jobs check out the resolved SHA, with read-only
+permissions and no persisted checkout credentials. Manual PR selection runs
+the full declared matrix. Concurrency includes the PR number so independent
+manual PRs do not cancel one another through a shared release-ref group.
+The existing image, device, no-skip/xfail and aggregate requirements remain.
+
+A 204 dispatch response means accepted; observe that run before retrying.
+Record the trusted workflow revision, resolver output, actual checkout and
+installed payload in its logs. GitHub associates a manual run with its workflow
+ref, so a base-SHA check context alone does not qualify the submitted PR. This
+route supplies explicit PR evidence; it does not create automatic PR statuses,
+repair prepared dependencies or establish model/release acceptance.
