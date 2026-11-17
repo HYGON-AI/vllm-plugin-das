@@ -18,6 +18,7 @@ from vllm.v1.attention.backends.mla import indexer as metadata
 
 from . import fp4_packer
 from .fp4_indexer_lightop import Fp4Query, cache_view, load_providers, providers, rotate_bf16
+from .v41_pcp import HcuV41PcpAttention
 
 
 # anchor-baseline(③): Core 5afd482929, 0.33.1.dev3, constructor globals are
@@ -175,5 +176,16 @@ class _Fp4CommonAttention(common.DeepseekV4Attention):
 class Fp4Attention(rocm.DeepseekV41ROCMAiterMLAAttention, _Fp4CommonAttention):
     # MRO routes native AMD super().__init__ to our private common constructor;
     # its post-init, attention/forward and loading stay native.
+    def _indexer_cls(self, k_cache):
+        return Fp4Indexer
+
+
+class Fp4PcpAttention(HcuV41PcpAttention, _Fp4CommonAttention):
+    """Native PCP preparation plus the FP4 private common constructor.
+
+    MRO keeps the AMD post-init and PCP local-row/empty-rank handling. Only
+    the index cache and indexer change; collectives and source-layer sharing
+    remain in the unmodified common forward.
+    """
     def _indexer_cls(self, k_cache):
         return Fp4Indexer

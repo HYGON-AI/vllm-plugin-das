@@ -126,7 +126,7 @@ def test_kill_wins_before_model_selection(optin, monkeypatch):
 
 @pytest.mark.parametrize('field,value', [
     ('tensor_parallel_size', 2), ('pipeline_parallel_size', 2),
-    ('prefill_context_parallel_size', 8), ('decode_context_parallel_size', 2),
+    ('prefill_context_parallel_size', 4), ('decode_context_parallel_size', 2),
     ('data_parallel_size', 2), ('enable_dbo', True), ('enable_eplb', True)])
 def test_topology_refused_before_allocation(optin, field, value):
     setattr(optin.parallel_config, field, value)
