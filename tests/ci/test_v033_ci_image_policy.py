@@ -1,4 +1,5 @@
 """Execute the actual image guard without Docker, registry access or devices."""
+import json
 import os
 from pathlib import Path
 import re
@@ -28,12 +29,13 @@ class ImagePolicyTests(unittest.TestCase):
         cls.repository = cls.harbor + '/jenkins/model_test_env/vllm'
         cls.digest = 'sha256:' + 'a' * 64
 
-    def guard(self, image, harbor=None):
+    def guard(self, image, harbor=None, runner_mode=''):
         with tempfile.TemporaryDirectory() as directory:
             output = Path(directory) / 'outputs'
             environment = dict(os.environ, HCU_CI_IMAGE_V033=image,
                                HARBOR_SITE=self.harbor if harbor is None else harbor,
-                               GITHUB_OUTPUT=str(output))
+                               GITHUB_OUTPUT=str(output),
+                               HCU_CI_RUNNER_MODE_V033=runner_mode)
             result = subprocess.run(
                 ['bash', '--noprofile', '--norc', '-e', '-c', self.script],
                 env=environment, capture_output=True, text=True, timeout=10)
@@ -45,7 +47,7 @@ class ImagePolicyTests(unittest.TestCase):
                 image = harbor + '/jenkins/model_test_env/vllm@' + self.digest
                 code, output = self.guard(image, harbor)
                 self.assertEqual(code, 0)
-                self.assertEqual(output, 'image=' + image + '\n')
+                self.assertEqual(dict(line.split('=', 1) for line in output.splitlines())['image'], image)
 
     def test_absent_whitespace_mutable_foreign_and_malformed_images_refuse(self):
         good = self.repository + '@' + self.digest
@@ -62,10 +64,11 @@ class ImagePolicyTests(unittest.TestCase):
                   good + '@' + self.digest,
                   ' ' + good, good + ' ', good + '\nimage=foreign']
         for image in images:
-            with self.subTest(image=image):
-                code, output = self.guard(image)
-                self.assertNotEqual(code, 0)
-                self.assertEqual(output, '')
+            for mode in ['legacy', 'k8s']:
+                with self.subTest(image=image, mode=mode):
+                    code, output = self.guard(image, runner_mode=mode)
+                    self.assertNotEqual(code, 0)
+                    self.assertEqual(output, '')
 
     def test_missing_or_malformed_registry_refuses_even_matching_input(self):
         for harbor in ['', ' \t', 'https://harbor-ci.invalid',
@@ -86,8 +89,8 @@ class ImagePolicyTests(unittest.TestCase):
         self.assertIn('credentials:\n', container)
         self.assertIn('username: ${{ secrets.HARBOR_USERNAME }}', container)
         self.assertIn('password: ${{ secrets.HARBOR_PASSWORD }}', container)
-        self.assertIn('/opt/hyhal:/opt/hyhal:ro', container)
-        self.assertIn('--shm-size=32g', container)
+        self.assertNotIn('volumes:', container)
+        self.assertIn('options: ${{ needs.resolve-device-image.outputs.container_options }}', container)
         self.assertNotIn('--privileged', container)
         for name in ['select', 'v033-source-contract']:
             with self.subTest(job=name):
@@ -98,6 +101,61 @@ class ImagePolicyTests(unittest.TestCase):
                                   'needs: [select, authorize-device']:
                     self.assertNotIn(forbidden, block)
         self.assertIn('needs: select\n', job_block(self.source, 'v033-source-contract'))
+
+    def resolved(self, mode):
+        image = self.repository + '@' + self.digest
+        code, output = self.guard(image, runner_mode=mode)
+        self.assertEqual(code, 0)
+        outputs = dict(line.split('=', 1) for line in output.splitlines())
+        self.assertEqual(set(outputs), {'image', 'runner_mode', 'gfx936_runner',
+                                        'gfx938_runner', 'container_options'})
+        self.assertEqual(outputs['image'], image)
+        return outputs
+
+    def test_unset_and_explicit_legacy_keep_existing_host_contract(self):
+        for mode in ['', 'legacy']:
+            with self.subTest(mode=mode):
+                outputs = self.resolved(mode)
+                self.assertEqual(outputs['runner_mode'], 'legacy')
+                for arch, label in [('gfx936', 'bw1000'), ('gfx938', 'bw1100')]:
+                    self.assertEqual(json.loads(outputs[arch + '_runner']),
+                                     ['self-hosted', 'ci', label])
+                self.assertEqual(outputs['container_options'],
+                                 '--device=/dev/kfd --device=/dev/dri --group-add video --shm-size=32g --volume=/opt/hyhal:/opt/hyhal:ro')
+
+    def test_k8s_emits_single_pool_names_without_host_configuration(self):
+        outputs = self.resolved('k8s')
+        self.assertEqual(outputs['runner_mode'], 'k8s')
+        self.assertEqual(json.loads(outputs['gfx936_runner']), 'hygon-bw1000-1card')
+        self.assertEqual(json.loads(outputs['gfx938_runner']), 'hygon-bw1100-1card')
+        self.assertEqual(outputs['container_options'], '')
+        self.assertNotIn('self-hosted', outputs['gfx936_runner'] + outputs['gfx938_runner'])
+
+    def test_invalid_runner_modes_fail_without_publishing_partial_outputs(self):
+        image = self.repository + '@' + self.digest
+        for mode in ['K8S', 'k8s ', ' k8s', 'k8s\nimage=foreign', 'custom-pool']:
+            with self.subTest(mode=mode):
+                code, output = self.guard(image, runner_mode=mode)
+                self.assertNotEqual(code, 0)
+                self.assertEqual(output, '')
+
+    def test_both_device_jobs_consume_the_same_resolved_container_contract(self):
+        self.assertIn('HCU_CI_RUNNER_MODE_V033: ${{ vars.HCU_CI_RUNNER_MODE_V033 }}', self.resolver)
+        for arch in ['gfx936', 'gfx938']:
+            block = job_block(self.source, 'v033-device-' + arch)
+            self.assertIn('runs-on: ${{ fromJSON(needs.resolve-device-image.outputs.' + arch + '_runner) }}', block)
+            container = block.split('    container:\n', 1)[1].split('    steps:\n', 1)[0]
+            for expected in [
+                'image: ${{ needs.resolve-device-image.outputs.image }}',
+                'options: ${{ needs.resolve-device-image.outputs.container_options }}',
+                'username: ${{ secrets.HARBOR_USERNAME }}',
+                'password: ${{ secrets.HARBOR_PASSWORD }}',
+            ]:
+                self.assertIn(expected, container)
+            self.assertNotIn('volumes:', container)
+            for forbidden in ['/dev/kfd', '/dev/dri', '--shm-size', '--privileged', '/opt/hyhal:', 'docker ']:
+                self.assertNotIn(forbidden, block)
+            self.assertIn('timeout-minutes: 45', block)
 
     def test_pr_code_jobs_do_not_persist_checkout_credentials(self):
         for name in ['select', 'v033-source-contract', 'v033-device-gfx936', 'v033-device-gfx938']:
