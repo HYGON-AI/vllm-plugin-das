@@ -34,7 +34,10 @@ class HcuDSV41PcpWorker(Worker):
 
     def determine_available_memory(self):
         runner = self.model_runner
-        if not self._uses_pcp_channel_fp8() or runner.pcp_manager is None:
+        # Replay pads each rank's retained rows to the global retained batch.
+        # Core's global profile covers that padded batch and its MoE workspace.
+        if (not self._uses_pcp_channel_fp8() or runner.pcp_manager is None
+                or self.vllm_config.cache_config.swa_bounded_replay):
             return super().determine_available_memory()
         global_tokens = runner.max_num_tokens
         local_tokens = local_token_bound(

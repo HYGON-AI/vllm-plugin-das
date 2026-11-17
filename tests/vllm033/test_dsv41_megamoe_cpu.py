@@ -164,6 +164,23 @@ def test_target_contract_and_excluded_features():
         setattr(owner, name, previous)
 
 
+def test_swa_replay_is_admitted_only_by_core_deepep_deepgemm(monkeypatch):
+    from hcu_vllm_das.moe import dsv41_megamoe as module
+    from hcu_vllm_das.moe.dsv41_deepgemm import (
+        ChannelDeepGemmExperts, HcuDSV41DeepGemmMethod,
+    )
+
+    config, moe = mega_config()
+    config.cache_config.swa_bounded_replay = True
+    config.kernel_config.moe_backend = "deep_gemm"
+    moe.max_num_tokens = 32768
+    monkeypatch.setattr(module, "get_current_vllm_config", lambda: config)
+    method = HcuDSV41DeepGemmMethod(None, None, moe, "experts")
+    assert method.experts_cls is ChannelDeepGemmExperts
+    with pytest.raises(ValueError, match="SWA bounded replay"):
+        module.HcuDSV41MegaMoEMethod(None, None, moe, "experts")
+
+
 def test_identity_routes_and_no_redundant_factory():
     from hcu_vllm_das.models import v41_pcp as model
     from vllm.models.deepseek_v41.amd import model as native

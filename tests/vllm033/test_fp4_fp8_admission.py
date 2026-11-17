@@ -119,6 +119,7 @@ def test_indexer_constructor_resolves_config_before_native_allocation(owners, mo
     def construct(self):
         assert owners.indexer._state['fp4'] is False
         calls.append('native-allocation')
+        self._hcu_fp4 = False
 
     monkeypatch.setattr(base, '__init__', construct)
     owners.scorer.HcuV41SparseAttnIndexer()

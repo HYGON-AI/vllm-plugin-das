@@ -49,6 +49,7 @@ def _digest_paths():
     return (
         Path(__file__).with_name('fp4_indexer.py'),
         Path(__file__).with_name('fp4_indexer_lightop.py'),
+        Path(__file__).with_name('fp4_workspace.py'),
         Path(__file__).with_name('v41_indexer.py'),
         Path(v41_fp8_indexer.__file__),
         Path(triton.__file__),
