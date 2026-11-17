@@ -254,6 +254,12 @@ when it is absent from the default branch. A dispatch 404 means not accepted;
 verify registration before provisioning a package credential. The publish job
 requires both a manual event and the release ref; a registration success does
 not mean an image was built or tested.
+The self-hosted image builder uses its existing Python 3.6+ standard library
+for private download, wheel RECORD verification and provenance output, with
+`-I -S -B` to avoid site initialization. Do not install Python 3.12 through
+`setup-python` on a builder OS it does not support. Installed package metadata
+and native architecture inspection still run in the CPython 3.12 candidate
+container; changing the builder interpreter does not change the runtime ABI.
 Supply a reviewed private `OpenDAS/vllm` generic candidate package version,
 complete Core source SHA, wheel SHA256, and immutable runtime base from
 `HARBOR_SITE/hcu/base_env/vllm`. The helper reads only that project's fixed

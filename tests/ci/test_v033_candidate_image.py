@@ -1,5 +1,7 @@
 """Private delivery and real native-architecture refusal contracts."""
 import base64
+import ast
+import builtins
 import hashlib
 import importlib.util
 import io
@@ -101,6 +103,30 @@ class CandidateTests(unittest.TestCase):
             self.assertEqual(len(calls), 2)
             self.assertTrue(all(url.startswith(C.PACKAGE_ROOT) for url, _, _ in calls))
             self.assertNotIn(self.env['SOURCEFIND_PACKAGE_TOKEN'], json.dumps(report))
+
+    def test_builder_preparation_uses_only_host_stdlib_without_runtime_metadata(self):
+        # The image builder may use an OS unsupported by setup-python. Its
+        # preparation path needs neither Python 3.12 syntax nor runtime imports.
+        source = (ROOT / '.github/scripts/hcu_ci/v033_candidate_image.py').read_text()
+        ast.parse(source, feature_version=(3, 6))
+        original_import = builtins.__import__
+        def host_import(name, globals=None, locals=None, fromlist=(), level=0):
+            if name == 'importlib.metadata' or (name == 'importlib' and 'metadata' in fromlist):
+                raise ImportError('metadata belongs to the installed-runtime inspector')
+            return original_import(name, globals, locals, fromlist, level)
+        host = importlib.util.module_from_spec(SPEC)
+        data = wheel_bytes()
+        digest = hashlib.sha256(data).hexdigest()
+        def fetch(url, token, destination, maximum):
+            destination.write_bytes(json.dumps(dict(self.manifest, wheel_sha256=digest)).encode()
+                if url.endswith('candidate-manifest.json') else data)
+        with patch.object(builtins, '__import__', side_effect=host_import):
+            SPEC.loader.exec_module(host)
+            with tempfile.TemporaryDirectory() as directory:
+                report = host.prepare(Path(directory) / 'context', dict(self.env, WHEEL_SHA256=digest), fetch)
+                self.assertEqual(report['record_entries'], 6)
+            with self.assertRaises(ImportError):
+                host.inspect_image()
 
     def test_private_download_never_follows_redirects(self):
         request = Request(C.PACKAGE_ROOT + 'version/file')
