@@ -68,6 +68,9 @@ validation documents are historical evidence. Their scores and artifacts do
 not certify this release. The historical compatibility-lock test is retained
 with its original inputs.
 
+For legacy/ARC Kubernetes device-runner selection and rollback, see the
+[v0.33 CI guide](docs/validation/vllm033-ci-coverage.md#switch-v033-device-ci-between-legacy-runners-and-arck8s).
+
 ## License
 
 Apache License 2.0. See [LICENSE](LICENSE), [NOTICE](NOTICE), and
