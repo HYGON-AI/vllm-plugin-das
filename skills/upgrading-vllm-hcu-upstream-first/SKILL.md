@@ -41,6 +41,15 @@ Treat composite patches by subfeature: a passing receive-timeout test does not
 qualify RPC deadlines, pipeline queue capacity, fork initialization or worker
 lifecycle. Preserve unverified subfeatures in the migration ledger.
 
+Before retaining a pre-fork block-size hook, trace worker KV specs back into
+EngineCore. A target that derives the parent's cache block size from those specs
+before scheduler/hash/KV initialization can already propagate a worker-local
+choice. Verify real constructors and returned configurations before copying the
+old hook. A public metadata-only custom worker can isolate this negotiation,
+but does not qualify attention, device KV allocation, Graph, PP computation or
+model lifecycle. Separately check actual worker/manager/page/hash geometry on a
+frozen real-model cohort, preserving its original accuracy and exit findings.
+
 ## Run a static preflight
 
 The companion script reads committed trees without checking out refs,
