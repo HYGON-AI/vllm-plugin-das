@@ -66,6 +66,10 @@ class ChannelDeepGemmExperts(MegaExperts):
 
 
 class HcuDSV41DeepGemmMethod(HcuDSV41MegaMoEMethod):
+    # Core DeepEP HT rebuilds dispatch/combine handles for each call's rows.
+    # This path has no MegaMoE rank-local token pool to overflow during replay.
+    supports_swa_bounded_replay = True
+
     def __init__(self, *args, **kwargs):
         super().__init__(*args, **kwargs)
         self.experts_cls = ChannelDeepGemmExperts

@@ -23,7 +23,7 @@ from vllm.platforms import current_platform
 from ..dsv41.profile_worker import profile_token_capacity
 
 
-def validate_config(config, moe):
+def validate_config(config, moe, *, supports_swa_bounded_replay=False):
     p = config.parallel_config
     if (p.tensor_parallel_size != 1 or p.data_parallel_size != 1
             or p.pipeline_parallel_size != 1 or moe.pcp_size != 8
@@ -33,6 +33,9 @@ def validate_config(config, moe):
         raise ValueError("V41 MegaMoE currently requires eager execution without DBO")
     if config.speculative_config is not None:
         raise ValueError("V41 PCP MegaMoE does not support speculative decoding")
+    if (getattr(getattr(config, "cache_config", None), "swa_bounded_replay", False)
+            and not supports_swa_bounded_replay):
+        raise ValueError("V41 PCP MegaMoE token pool does not support SWA bounded replay")
     if p.enable_eplb or moe.num_experts != moe.num_logical_experts:
         raise ValueError("V41 PCP MegaMoE does not support EPLB or redundant experts")
     if not moe.moe_parallel_config.use_deepep_ht_kernels:
@@ -272,10 +275,13 @@ class MegaKernel(mk.FusedMoEKernel):
 
 
 class HcuDSV41MegaMoEMethod(CompressedTensorsW8A8Fp8MoEMethod):
+    supports_swa_bounded_replay = False
+
     def __init__(self, weight_quant, input_quant, moe, prefix):
         FusedMoEMethodBase.__init__(self, moe)
         config = get_current_vllm_config()
-        validate_config(config, moe)
+        validate_config(config, moe,
+                        supports_swa_bounded_replay=self.supports_swa_bounded_replay)
         self.buffer_capacity = profile_token_capacity(config, moe.pcp_size, moe.max_num_tokens)
         self.weight_quant, self.input_quant = weight_quant, input_quant
         self.weight_block_size = None
