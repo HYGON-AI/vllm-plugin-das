@@ -557,3 +557,15 @@ Check each job's actual driver: direct benchmark scripts may execute even
 when another job's pytest session is paused. Count JUnit launcher cases,
 CSV measurement rows and numerical regression cases separately; selected
 benchmark timings do not qualify unrelated kernels or model accuracy.
+
+For same-host Mooncake HIP IPC, inspect ROCR visibility separately from each
+process's HIP/CUDA compute mask. The tested DTK2610/gfx938 runtime crashes on
+the first 64-byte copy with disjoint single-device ROCR masks, also in a direct
+HIP program without Torch or Mooncake. A shared ROCR list of the two allocated
+peers with separate HIP/CUDA masks passes two changed-input waves in direct HIP
+and the original Mooncake buffer API. Verify relative HIP indexes, PCI buses,
+full destination bytes and untouched regions. Preserve the failed masks and
+record this as a deployment condition for the tested runtime; do not generalize
+it to other builds or claim a native source fix. Keep P/D model output, Graph,
+accuracy, performance and server lifecycle gates separate; changing SDMA or
+transport would be a distinct diagnostic.
