@@ -245,7 +245,9 @@ jobs:
     runs-on: ${{ fromJSON(needs.resolve-device-image.outputs.gfx936_runner) }}
     permissions:
       contents: read
-    timeout-minutes: 45
+    # Portable startup plus cold provider components and the remaining native
+    # matrix exceeded 45 minutes in run 44107339682; keep every test gate.
+    timeout-minutes: 75
     container:
       image: ${{ needs.resolve-device-image.outputs.image }}
       credentials:
@@ -273,7 +275,7 @@ jobs:
           name: v033-device-gfx936
           path: |
             v033-portable.xml
-            v033-device.xml
+            v033-device*.xml
 
   v033-device-gfx938:
     needs: [resolve-target, select, authorize-device, resolve-device-image]
