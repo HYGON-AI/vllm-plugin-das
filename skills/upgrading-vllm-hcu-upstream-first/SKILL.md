@@ -50,6 +50,13 @@ but does not qualify attention, device KV allocation, Graph, PP computation or
 model lifecycle. Separately check actual worker/manager/page/hash geometry on a
 frozen real-model cohort, preserving its original accuracy and exit findings.
 
+Trace worker placements through the target's scheduler-config conversion before
+testing an offload connector. A worker's UniformTypeKVCacheSpecs may be unwrapped
+there; bypassing that boundary can invent a missing-manager failure. For packed
+KV, check shared-allocation accounting and retained layer/offset/stride metadata
+through the real builder, conversion, connector and block pool. Keep independent
+backings, device copies and model acceptance separate from this CPU coverage.
+
 ## Run a static preflight
 
 The companion script reads committed trees without checking out refs,
