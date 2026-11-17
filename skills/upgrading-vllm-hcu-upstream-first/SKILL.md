@@ -138,6 +138,13 @@ backend selector authoritative: a selected whole-op/fused route can bypass the
 leaf aliases, so require execution evidence rather than counting activation as
 coverage. Python guards do not execute inside an already captured device Graph;
 serving health must also cover the host boundary before Graph replay.
+Keep serving-worker policy and completed Python provider submissions separate
+from GPU trace events: a Graph replay may expose `hipGraphLaunch` without
+individual decode-node kernels. Identify prepared fallbacks per leaf; an
+AITER stage policy can still execute BoltOPs chunk-O/recompute. Compare with
+a stock arm that verifies every consumer alias still binds canonical Core.
+Retain per-task raw losses even when fence-normalized tests all pass; do not
+transfer a frozen model result to a head that inherits new target code.
 Inspect actual optional-provider signatures even when the public version is
 unchanged. BoltOPs chunk-O has an audited trailing `full_chunks=None` variant;
 retain masked varlen semantics rather than forcing full chunks. Distinguish

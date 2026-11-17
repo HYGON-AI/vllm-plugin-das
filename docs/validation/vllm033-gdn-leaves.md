@@ -115,8 +115,76 @@ the device-7 synchronous/private-cache repeat passes, but its root cause is
 still unattributed. The old 64 MiB cold-autotune and pre-fix numerical failures
 remain recorded separately.
 
-Provider performance, actual serving-worker execution and lifecycle closure,
-applicable hybrid model accuracy/HumanEval32, MTP and serving Graph reachability
-remain gates. Existing legacy-provider and BF16 Qwen3 results do not certify
-this candidate. Do not mark this migration complete or merge it on CPU
-contracts alone. DeepSeek V4.1 remains user-deferred.
+The earlier component cleanup warnings above remain historical evidence. A
+later isolated source-provider installation (AITER `1cb6ed3`, BoltOPs
+`2d71c75`) revalidated both public-startup selections: eight native cases and
+24 changed-input Graph replays each, with zero weakref errors or tracebacks.
+That result does not establish normal model-server teardown.
+
+### Frozen Qwen3.5 INT8 model comparison, 2026-11-17
+
+Three fresh gfx938 TP1 runs use the original `Qwen3.5-35B-A3B-W8A8` checkpoint,
+Core `98a09850`, Adapter `20d18cc6` and installed Plugin `3836b8b3`. Before
+target integration, all 64 production Python files at PR head `94c35088`
+match that installation byte-for-byte. Source-provider package RECORDs and
+the successful native prerequisites are checked before launch and after
+evaluation. These source-built providers are candidates, not a qualified
+published provider release.
+
+All arms retain BF16 activations/CT INT8 weights, text-only mode, context 4096,
+batch tokens 1024, max sequences 16, fixed 2 GiB KV, admission fraction 0.50,
+official FULL_AND_PIECEWISE Graphs, prefix caching and chunked prefill. The
+official GDN prefill selector is explicitly `triton` in all three arms. The
+stock arm verifies policy `(triton, triton)`, no leaf publication and all five
+actual consumer aliases bound to canonical Core functions.
+
+HumanEval/0–31 uses identical saved request bytes across the three arms:
+temperature 0, seed 0, max tokens 2048, concurrency 4 and thinking disabled.
+Request/protocol SHA256 is
+`c3f27a1e28bdb623aaa4a9bd7f38fff7ca287d73dd68d4714c7beea449ce19f3`.
+This is the current fixed protocol; the historical handoff's original request
+bytes were unavailable and are not claimed to have been recovered. Raw and
+fence-normalized completions are scored separately in the isolated scorer.
+
+| Leaf selection | Raw | Normalized | Raw failed task IDs | Completion tokens |
+| --- | --- | --- | --- | --- |
+| Official stock | 31/32 | 32/32 | 13 | 4966 |
+| AITER | 30/32 | 32/32 | 24, 31 | 4773 |
+| BoltOPs | 29/32 | 32/32 | 15, 24, 31 | 4793 |
+
+Every completion ends with `stop`, with no truncation. Both candidates recover
+task 13, but AITER loses previously passing tasks 24/31 and BoltOPs loses
+15/24/31. These raw failures are fenced Python reported as `invalid syntax`;
+stripped completions pass the tests. **The raw score decreases remain open:
+normalized 32/32 does not authorize acceptance or merge.** No prompt, scorer,
+backend or score threshold was changed to hide them.
+
+Each arm passes 13/13 changing arithmetic/concurrency probes and 3/3 prefix
+probes with 4224 additional cache-hit tokens. The effective manager page is
+1056 tokens with four cache groups; the prefix prompt has 2271 tokens. Actual
+worker snapshots report no observer errors or pending submissions. AITER
+submits chunk-H/decode through AITER and chunk-O/recompute through BoltOPs;
+BoltOPs submits all five leaves through BoltOPs. These are Python submission
+and capture observations, not counts of GPU-only Graph replays.
+
+Real GPU traces contain 1939/1939/1945 kernel events for stock/AITER/BoltOPs
+and 44 `hipGraphLaunch` calls in each arm. The AITER trace includes 30 native
+`FLA_NAMESPACE::chunk_gated_delta_rule_fwd_kernel` events. Decode Graph-node
+attribution remains incomplete where replay traces do not expose individual
+kernels; a provider-selection setting alone is not direct native attribution.
+
+All 23 checkpoint assets (37,602,505,378 bytes) match independent pre/post
+dual reads across all arms. Server, evaluator and tracker exit 0; recorded
+owned identities disappear, ports release, and post-run package/asset checks
+pass. Weakref errors are zero, but **nanobind and abort shutdown diagnostics
+remain in every arm**, including stock. Process release does not establish
+normal lifecycle closure.
+
+The local evidence index is `qwen35-gdn-tp1-r7-closure.json`, binding original
+requests/results, worker observations, traces, asset seals and package gates.
+No performance, MTP, gfx936 or other topology qualification is claimed. The
+later target integration includes Plugin `030c6849` changes outside GDN, and
+Adapter main has advanced beyond `20d18cc6`; frozen scores do not qualify
+those complete merged combinations. Keep Draft pending raw accuracy,
+lifecycle, remaining feature/architecture/provider delivery and current-head
+CI/review gates. DeepSeek V4.1 model testing remains user-deferred.
