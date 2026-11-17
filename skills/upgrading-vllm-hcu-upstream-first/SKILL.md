@@ -130,6 +130,12 @@ inspect embedded architectures before changing a shared CI image.
    process release and normal teardown as separate results.
 
 Graph capture or HTTP health alone does not establish successful generation.
+When workspace planning moves to construction, build the real layer in CPU
+regressions with explicit native leaf doubles and exercise its frozen plan.
+Mutate the source configuration afterward and verify reservation and reuse at
+the actual workspace boundary; a removed runtime-config import is not a seam
+to restore merely to keep an old fixture working. Retain missing-reservation
+negative controls. CPU constructor tests do not qualify a model or device.
 For GDN, follow the actual constructor's dispatch selection: an official
 CustomOp may replace `_forward_method` after platform dispatch, so overriding
 `forward_hip` alone need not execute the provider. An OOT prefill entry does
