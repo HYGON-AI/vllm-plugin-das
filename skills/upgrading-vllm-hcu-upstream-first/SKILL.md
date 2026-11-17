@@ -108,6 +108,9 @@ merely to pass discovery. Qualify each admitted operator and consumer separately
 For v0.33 CI event availability and the trusted exact-head manual PR route, read
 [the release CI guide](../../docs/validation/vllm033-ci-coverage.md#explicit-pr-dispatch-on-v0330).
 Keep dispatch acknowledgement, the actual PR checkout and aggregate acceptance separate.
+For a private Core image candidate, use the guide's
+[publisher and credential boundaries](../../docs/validation/vllm033-ci-coverage.md#publish-a-private-core-candidate-image);
+inspect embedded architectures before changing a shared CI image.
 
 1. Freeze Core/Adapter/Plugin sources and dependency heads. Check capability
    and ABI compatibility instead of introducing an exact-wheel runtime lock.

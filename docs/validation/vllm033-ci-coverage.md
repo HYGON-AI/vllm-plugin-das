@@ -239,3 +239,36 @@ installed payload in its logs. GitHub associates a manual run with its workflow
 ref, so a base-SHA check context alone does not qualify the submitted PR. This
 route supplies explicit PR evidence; it does not create automatic PR statuses,
 repair prepared dependencies or establish model/release acceptance.
+
+## Publish a private Core candidate image
+
+The Adapter publisher supplies the runtime base. Inspect its actual installed
+Core and Adapter payloads before admitting it to both architecture tiers: a
+recent Adapter wheel does not replace a gfx938-only Core build. An image date,
+version suffix or successful publisher job is insufficient evidence.
+
+`hcu-ci-image-v033.yml` is a separate manual publisher on trusted `v0.33.0`.
+Supply a reviewed private `OpenDAS/vllm` generic candidate package version,
+complete Core source SHA, wheel SHA256, and immutable runtime base from
+`HARBOR_SITE/hcu/base_env/vllm`. The helper reads only that project's fixed
+`vllm-ci-candidate` package path, rejects redirects, validates the manifest and
+entire wheel RECORD, and builds without network access. The private wheel is
+never uploaded as a public Actions artifact or passed a credential in Docker.
+
+Provision `V033_CORE_PACKAGE_TOKEN` as a short-lived project deploy token with
+**read_package_registry only** for the preparation step. Keep the user's source
+or GitHub access token outside Actions. Revoke the deploy token and remove the
+temporary secret after the preparation step completes, or after a failed run.
+The build uses the existing registry credentials only for login/pull/push.
+The helper inspects actual embedded gfx936 and gfx938 code objects in all four
+Core GPU libraries and Adapter's native library, plus the required Adapter
+interfaces, in a CPU container with no accelerator mounts.
+
+Publication uses a unique `ci-0.33.0-<run>-<attempt>` tag in the approved Plugin
+image repository. It preserves existing tags and `HCU_CI_IMAGE_V033`. Its public
+receipt contains only provenance, versions, architectures and the immutable
+reference. Private context and temporary registry login are removed afterward.
+The published image remains a candidate: inspect its receipt, then run the
+unchanged portable, native/Graph and applicable model gates on both tiers.
+Changing the CI image after a completed failure justifies a fresh execution;
+an existing matching live run should be observed rather than duplicated.
