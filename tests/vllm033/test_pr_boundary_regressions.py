@@ -71,6 +71,13 @@ assert not torch.cuda.is_initialized()
 
 
 def _edp_gloo_worker(rank, rendezvous):
+    from vllm import platforms
+    from vllm.platforms.cpu import CpuPlatform
+
+    # This spawned process exclusively tests CPU Gloo. Otherwise the real
+    # constructor maps rank 1..3 through the hidden HCU device list even with
+    # its device communicator disabled. Keep the parent platform untouched.
+    platforms.current_platform = CpuPlatform()
     from vllm.distributed import parallel_state as native
     from vllm.distributed import utils
 
@@ -84,6 +91,7 @@ def _edp_gloo_worker(rank, rendezvous):
     partitions = [[0, 2], [1, 3]]
     dp = native.GroupCoordinator(partitions, rank, 'gloo', False,
                                  group_name='review-dp')
+    assert dp.device.type == 'cpu'
 
     def initialize(group_ranks, local_rank, backend, *, group_name):
         # The real native constructor and torch.new_group execute. Only the
@@ -99,6 +107,7 @@ def _edp_gloo_worker(rank, rendezvous):
     try:
         edp._restore_independent_edp()
         dedicated = state._ENGRAM_DP
+        assert dedicated.device.type == 'cpu'
         assert dedicated.group_ranks == partitions
         assert dedicated.ranks == partitions[rank % 2]
         assert dedicated.device_group is not dp.device_group
@@ -115,6 +124,9 @@ def _edp_gloo_worker(rank, rendezvous):
 
 def test_edp_real_four_process_gloo_groups(tmp_path):
     import torch.multiprocessing as mp
+    from vllm import platforms
+
+    parent_platform = platforms.current_platform
 
     context = mp.spawn(_edp_gloo_worker,
                        args=(str(tmp_path / 'rendezvous'),), nprocs=4, join=False)
@@ -122,6 +134,8 @@ def test_edp_real_four_process_gloo_groups(tmp_path):
     try:
         while time.monotonic() < deadline:
             if context.join(timeout=1):
+                assert platforms.current_platform is parent_platform
+                assert not torch.cuda.is_initialized()
                 return
         pytest.fail('four-process Engram EDP rendezvous timed out')
     finally:
