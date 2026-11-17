@@ -50,6 +50,13 @@ but does not qualify attention, device KV allocation, Graph, PP computation or
 model lifecycle. Separately check actual worker/manager/page/hash geometry on a
 frozen real-model cohort, preserving its original accuracy and exit findings.
 
+Parent block-size feedback alone does not qualify hybrid prefill splitting:
+EngineCore can select the smallest group's page while Mamba uses a larger one.
+After the real scheduler-config conversion, test unequal attention/Mamba pages
+with budgets above and below the Mamba page. Preserve finer-hash tail checkpoints
+and shared configuration, and use the actual Mamba spec rather than the scheduler
+LCM. Equal-page tests cannot detect this mismatch; device/model gates remain.
+
 Trace worker placements through the target's scheduler-config conversion before
 testing an offload connector. A worker's UniformTypeKVCacheSpecs may be unwrapped
 there; bypassing that boundary can invent a missing-manager failure. For packed
