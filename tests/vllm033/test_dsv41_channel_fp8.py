@@ -1,154 +1,431 @@
-"""Focused CPU boundaries for the opt-in PCP + MegaMoE registration."""
-from types import SimpleNamespace as NS
+"""CPU contracts for DSV4.1 routing against the selected vLLM 0.33 source.
+
+Run with the target Core and Adapter on PYTHONPATH, HCU_ADAPTER_HOST=none,
+VLLM_PLUGINS=__disabled__, and all GPU visibility variables empty. Platform
+identity and layer construction are doubles; the configuration classes,
+quantization registry, exclusion helper and ModelConfig selector are real.
+These checks do not establish checkpoint loading or GPU/model correctness.
+"""
+from __future__ import annotations
+
+import copy
+import importlib
+import inspect
+import os
+from pathlib import Path
+import subprocess
+import sys
+from types import SimpleNamespace
 
 import pytest
-import torch
-from hcu_vllm_das import dsv41_activation as activation
-from hcu_vllm_das.quantization import dsv41_channel_fp8 as quant
-from vllm.model_executor.layers import quantization
-from vllm.model_executor.models import ModelRegistry
 
-SCHEMA = dict(quant_method="fp8", is_per_channel=True, activation_scheme="dynamic")
+ROOT = Path(__file__).resolve().parents[2]
+CORE_ROOT = Path(os.environ.get("VLLM_TARGET_ROOT", ROOT.parent / "vllm")).resolve()
+PLUGIN_SOURCE = ROOT / "adapter_extension" / "src"
+sys.path.insert(0, os.fspath(PLUGIN_SOURCE))
+NAME = "hcu_dsv41_channel_fp8"
+CAPABILITY = "dsv41-channel-fp8-routing"
+SCHEMA = {"quant_method": "fp8", "is_per_channel": True,
+          "activation_scheme": "dynamic"}
+
+
+class HcuPlatform:
+    device_name = "hcu"
+    supported_quantization = None
+
+    @staticmethod
+    def is_rocm():
+        return True
+
+    @staticmethod
+    def verify_quantization(name):
+        return None
 
 
 @pytest.fixture
-def registered(monkeypatch):
-    from vllm import platforms
-    # Resolve lazy Core quantization imports on the real CPU platform first.
-    quantization.get_quantization_config("fp8")
-    platform = NS(is_rocm=lambda: True, device_name="hcu",
-                  register_worker_selector=lambda selector: None)
-    monkeypatch.setattr(platforms, "current_platform", platform)
-    monkeypatch.setattr(quant, "current_platform", platform)
-    monkeypatch.setenv("VLLM_HCU_DSV41_PCP_ATTENTION", "1")
-    monkeypatch.setattr(ModelRegistry, "models", dict(ModelRegistry.models))
-    monkeypatch.setattr(quantization, "QUANTIZATION_METHODS", list(quantization.QUANTIZATION_METHODS))
-    monkeypatch.setattr(quantization, "_CUSTOMIZED_METHOD_TO_QUANT_CONFIG",
-                        dict(quantization._CUSTOMIZED_METHOD_TO_QUANT_CONFIG))
-    return NS(vllm_version="0.33.0")
+def contracts(monkeypatch):
+    activation = importlib.import_module("hcu_vllm_das.dsv41_activation")
+    candidate = importlib.import_module(
+        "hcu_vllm_das.quantization.dsv41_channel_fp8"
+    )
+    quant = importlib.import_module("vllm.model_executor.layers.quantization")
+    model = importlib.import_module("vllm.config.model")
+    from hcu_adapter.extensions import ExtensionContext
 
-
-def test_registration_is_opt_in_and_reuses_public_registries(registered, monkeypatch):
-    activation.activate_extension(registered)
-    entry = ModelRegistry.models[activation.ARCH]
-    assert (entry.module_name, entry.class_name) == activation.MODEL
-    assert quantization.get_quantization_config(activation.QUANTIZATION_METHOD) is quant.HcuDSV41ChannelFP8Config
-    activation.activate_extension(registered)
-    assert ModelRegistry.models[activation.ARCH] is entry
-
-
-@pytest.mark.parametrize("requested", [None, "fp8", "deepseek_v4_fp8", activation.QUANTIZATION_METHOD])
-def test_model_config_prefers_channel_fp8_override(registered, monkeypatch, requested):
-    from vllm.config import model
-
-    # Keep the competing native override in the registry before plugin activation.
-    monkeypatch.setattr(quantization, "QUANTIZATION_METHODS", ["deepseek_v4_fp8"])
-    activation.activate_extension(registered)
-    monkeypatch.setattr(model, "current_platform", NS(verify_quantization=lambda name: None))
-    config = NS(model_arch_config=NS(quantization_config=SCHEMA),
-                hf_config=NS(model_type="deepseek_v41"), quantization=requested)
-    model.ModelConfig._verify_quantization(config)
-    assert config.quantization == activation.QUANTIZATION_METHOD
-
-
-@pytest.mark.parametrize("flag", [None, "0", "1"])
-@pytest.mark.parametrize("requirement", [None, "extension", "capability"])
-def test_adapter_activation_reports_only_registered_providers(registered, monkeypatch, flag, requirement):
-    from importlib.metadata import EntryPoint
-    from hcu_adapter.extensions import (
-        ExtensionContext, ExtensionStatus, RequiredExtensionError, activate_extensions,
+    assert Path(inspect.getsourcefile(model.ModelConfig)).resolve().is_relative_to(CORE_ROOT)
+    # The official API has no unregister operation. Isolate its state only in
+    # this test fixture; production must exclusively use its public functions.
+    monkeypatch.setattr(quant, "QUANTIZATION_METHODS", list(quant.QUANTIZATION_METHODS))
+    monkeypatch.setattr(quant, "_CUSTOMIZED_METHOD_TO_QUANT_CONFIG",
+                        dict(quant._CUSTOMIZED_METHOD_TO_QUANT_CONFIG))
+    # The real ModelConfig uses a LazyLoader that caches module attributes.
+    # Point this isolated replay at the same real module whose registry state
+    # is copied above; otherwise the fixture itself creates stale aliases.
+    monkeypatch.setattr(model, "me_quant", quant)
+    monkeypatch.setattr(activation, "_publication", None)
+    monkeypatch.setattr(activation, "_failure", None)
+    monkeypatch.setattr(candidate, "current_platform", HcuPlatform())
+    monkeypatch.setattr(model, "current_platform", HcuPlatform())
+    return SimpleNamespace(
+        activation=activation, candidate=candidate, quant=quant, model=model,
+        context=ExtensionContext(adapter_version="0.1.0", vllm_version="0.33.0"),
+        cls=candidate.HcuDSV41ChannelFP8Config,
     )
 
-    switch = "VLLM_HCU_DSV41_PCP_ATTENTION"
-    if flag is None:
-        monkeypatch.delenv(switch)
-    else:
-        monkeypatch.setenv(switch, flag)
-    point = EntryPoint(name="das_hcu_dsv41", group="hcu_adapter.extensions",
-                       value="hcu_vllm_das.dsv41_activation:extension_spec")
-    context = ExtensionContext(
-        adapter_version="0.5.22+hcu.1", vllm_version=registered.vllm_version,
-        requested_extensions={point.name} if requirement == "extension" else set(),
-        requested_capabilities={"dsv41-pcp-megamoe"} if requirement == "capability" else set(),
+
+def activate(c):
+    c.activation.activate_extension(c.context)
+    return c
+
+
+def hf(model_type="deepseek_v41"):
+    return SimpleNamespace(model_type=model_type, architectures=[])
+
+
+def select(c, schema, model_config=None, user_quant=None):
+    # Invoke the actual official selector, rather than duplicating its priority
+    # loop or requiring model weights/devices for this configuration boundary.
+    config = SimpleNamespace(
+        quantization=user_quant,
+        model_arch_config=SimpleNamespace(quantization_config=copy.deepcopy(schema)),
+        hf_config=model_config or hf(),
+        allow_deprecated_quantization=False,
     )
-    before = ModelRegistry.models[activation.ARCH]
-    if flag != "1" and requirement:
-        with pytest.raises(RequiredExtensionError) as exc:
-            activate_extensions(context, [point])
-        report, = exc.value.reports
-    else:
-        report, = activate_extensions(context, [point])
-
-    if flag == "1":
-        assert report.status is ExtensionStatus.ACTIVE
-        assert ModelRegistry.models[activation.ARCH].module_name == activation.MODEL[0]
-        assert quantization.get_quantization_config(activation.QUANTIZATION_METHOD) is quant.HcuDSV41ChannelFP8Config
-    else:
-        assert report.status is ExtensionStatus.FAILED
-        assert switch in report.reason
-        assert ModelRegistry.models[activation.ARCH] is before
-        assert activation.QUANTIZATION_METHOD not in quantization.QUANTIZATION_METHODS
+    c.model.ModelConfig._verify_quantization(config)
+    return config.quantization
 
 
-def test_foreign_model_registration_is_preserved(registered):
-    entry = NS(module_name="foreign", class_name="Foreign")
-    ModelRegistry.models[activation.ARCH] = entry
-    with pytest.raises(RuntimeError, match="foreign"):
-        activation.activate_extension(registered)
-    assert ModelRegistry.models[activation.ARCH] is entry
-
-
-def test_channel_schema_is_scoped_to_hcu_dsv41_pcp(registered, monkeypatch):
-    cls = quant.HcuDSV41ChannelFP8Config
-    hf = NS(model_type="deepseek_v41")
-    assert cls.override_quantization_method(SCHEMA, None, hf) == activation.QUANTIZATION_METHOD
-    assert cls.override_quantization_method(SCHEMA, None, NS(model_type="llama")) is None
-    assert cls.override_quantization_method(dict(SCHEMA, is_per_channel=False), None, hf) is None
-    assert cls.override_quantization_method(SCHEMA, "quark", hf) is None
-    monkeypatch.delenv("VLLM_HCU_DSV41_PCP_ATTENTION")
-    assert cls.override_quantization_method(SCHEMA, None, hf) is None
-    monkeypatch.setattr(quant, "current_platform", NS(is_rocm=lambda: False, device_name="cuda"))
-    assert cls.override_quantization_method(SCHEMA, activation.QUANTIZATION_METHOD, hf) is None
-
-
-def test_native_policy_and_mega_dispatch(registered, monkeypatch):
-    from hcu_vllm_das.moe import dsv41_megamoe as v41_megamoe, dsv41_deepgemm as v41_deepgemm
+def layer(kind):
+    import torch
+    from vllm.model_executor.layers.linear import ReplicatedLinear
     from vllm.model_executor.layers.fused_moe import RoutedExperts
-    before = dict(SCHEMA)
-    config = quant.HcuDSV41ChannelFP8Config.from_config(SCHEMA)
-    assert isinstance(config, quant.DeepseekV4FP8Config)
-    assert SCHEMA == before
-    obj = RoutedExperts.__new__(RoutedExperts)
+
+    cls = ReplicatedLinear if kind == "linear" else RoutedExperts
+    obj = cls.__new__(cls)
     torch.nn.Module.__init__(obj)
-    obj.moe_config = NS(moe_backend="deep_gemm_mega_moe")
+    obj.moe_config = SimpleNamespace()
+    return obj
+
+
+def test_factory_is_framework_and_vendor_free():
+    code = f"""
+import sys
+sys.path[:0] = {list(sys.path)!r}
+import importlib.abc
+class Block(importlib.abc.MetaPathFinder):
+    def find_spec(self, fullname, path=None, target=None):
+        if fullname.split('.')[0] in {{'torch', 'vllm', 'lightop', 'aiter', 'vllm_hcu'}}:
+            raise AssertionError('discovery imported ' + fullname)
+sys.meta_path.insert(0, Block())
+from hcu_vllm_das.dsv41_activation import extension_spec
+spec = extension_spec()
+assert spec.api_version == 1
+assert spec.capabilities == frozenset({{{CAPABILITY!r}}})
+assert spec.check_health is not None
+assert not set(sys.modules).intersection({{'torch', 'vllm', 'lightop', 'aiter', 'vllm_hcu'}})
+"""
+    result = subprocess.run([sys.executable, "-S", "-B", "-c", code],
+                            capture_output=True, text=True, check=False)
+    assert result.returncode == 0, result.stdout + result.stderr
+
+
+@pytest.mark.parametrize("version", ["0.33.0", "0.33.1", "0.33.0rc1",
+                                     "0.33.0.dev1", "0.33.0+das.test"])
+def test_supported_release_registers_distinct_method(contracts, version):
+    from hcu_adapter.extensions import ExtensionContext
+    c = contracts
+    c.activation.activate_extension(ExtensionContext("0.1.0", version))
+    assert c.quant.get_quantization_config(NAME) is c.cls
+    assert c.activation.extension_spec().capabilities == frozenset({CAPABILITY})
+    c.activation.check_health()
+
+
+@pytest.mark.parametrize("version", [None, "bad", "0.32.0", "0.34.0", "1!0.33.0"])
+def test_wrong_release_rejects_before_runtime_import_or_registration(contracts, monkeypatch, version):
+    from hcu_adapter.extensions import ExtensionContext
+    c = contracts
     calls = []
-    def method(weights, inputs, moe, prefix):
-        calls.append((weights, inputs, moe, prefix))
-        return "mega"
-    monkeypatch.setattr(v41_megamoe, "HcuDSV41MegaMoEMethod", method)
-    assert config.get_quant_method(obj, "model.layers.0.ffn.experts") == "mega"
-    assert calls[0][0].strategy == "channel"
-    assert calls[0][1].strategy == "token"
-    assert calls[0][2] is obj.moe_config
-    obj.moe_config.moe_backend = "deep_gemm"
-    monkeypatch.setattr(v41_deepgemm, "HcuDSV41DeepGemmMethod", lambda *args: "deepgemm")
-    assert config.get_quant_method(obj, "model.layers.0.ffn.experts") == "deepgemm"
-    obj.moe_config.moe_backend = "triton"
-    with pytest.raises(ValueError, match="requires deep_gemm_mega_moe"):
-        config.get_quant_method(obj, "model.layers.0.ffn.experts")
+    monkeypatch.setattr(c.activation, "_import_module", lambda name: calls.append(name))
+    with pytest.raises(c.activation.Dsv41ActivationError, match="0.33"):
+        c.activation.activate_extension(ExtensionContext("0.1.0", version))
+    assert not calls
+    assert NAME not in c.quant.QUANTIZATION_METHODS
+
+
+def test_activation_is_idempotent_and_does_not_overwrite_a_foreign_owner(contracts, monkeypatch):
+    c = contracts
+    original = c.quant.register_quantization_config
+    calls = []
+
+    def register(quantization):
+        calls.append(quantization)
+        return original(quantization)
+
+    monkeypatch.setattr(c.quant, "register_quantization_config", register)
+    activate(c)
+    c.activation.activate_extension(c.context)
+    assert calls == [NAME]
+    assert c.quant.QUANTIZATION_METHODS.count(NAME) == 1
+
+
+def test_foreign_registration_is_rejected_without_mutation(contracts):
+    from vllm.model_executor.layers.quantization.fp8 import Fp8Config
+    c = contracts
+    c.quant.register_quantization_config(NAME)(Fp8Config)
+    before = list(c.quant.QUANTIZATION_METHODS)
+    with pytest.raises(c.activation.Dsv41ActivationError, match="owner|registered"):
+        c.activation.activate_extension(c.context)
+    assert c.quant.get_quantization_config(NAME) is Fp8Config
+    assert c.quant.QUANTIZATION_METHODS == before
+
+
+def test_partial_publication_is_commit_fatal_and_retry_refuses(contracts, monkeypatch):
+    from hcu_adapter.extensions import ExtensionCommitError
+    c = contracts
+
+    def broken(quantization):
+        def publish(cls):
+            c.quant.QUANTIZATION_METHODS.append(quantization)
+            raise RuntimeError("published then failed")
+        return publish
+
+    monkeypatch.setattr(c.quant, "register_quantization_config", broken)
+    with pytest.raises(ExtensionCommitError):
+        c.activation.activate_extension(c.context)
+    with pytest.raises(ExtensionCommitError):
+        c.activation.activate_extension(c.context)
+
+
+def test_changed_registration_abi_rejects_before_publication(contracts, monkeypatch):
+    c = contracts
+    monkeypatch.setattr(c.quant, "register_quantization_config",
+                        lambda quantization, extra: None)
+    with pytest.raises(c.activation.Dsv41ActivationError, match="ABI|signature|contract"):
+        c.activation.activate_extension(c.context)
+    assert NAME not in c.quant.QUANTIZATION_METHODS
+
+
+@pytest.mark.parametrize("model_type", ["deepseek_v41", "deepseek_v41_text"])
+@pytest.mark.parametrize("method", ["fp8", "deepseek_v4_fp8"])
+def test_official_model_config_selects_the_custom_override(contracts, model_type, method):
+    c = activate(contracts)
+    schema = dict(SCHEMA, quant_method=method)
+    assert select(c, schema, hf(model_type)) == NAME
+
+
+def test_nested_v41_text_config_is_recognized(contracts):
+    c = activate(contracts)
+    config = SimpleNamespace(model_type="wrapper", text_config=hf(), architectures=[])
+    assert c.cls.override_quantization_method(SCHEMA, None, config) == NAME
+
+
+@pytest.mark.parametrize("model_type", ["llama", "deepseek_v4", "glm5next", "qwen3"])
+def test_other_models_keep_the_official_selector_result(contracts, model_type):
+    c = contracts
+    before = select(c, SCHEMA, hf(model_type))
+    activate(c)
+    assert select(c, SCHEMA, hf(model_type)) == before
+    assert c.cls.override_quantization_method(SCHEMA, None, hf(model_type)) is None
+
+
+@pytest.mark.parametrize("changes", [
+    {"is_per_channel": False}, {"is_per_channel": "true"},
+    {"weight_block_size": [128, 128]}, {"quant_method": "quark"},
+    {"quant_method": "mxfp8"}, {"activation_scheme": "static"},
+])
+def test_non_channel_schemes_are_not_captured(contracts, changes):
+    c = activate(contracts)
+    schema = dict(SCHEMA, **changes)
+    assert c.cls.override_quantization_method(schema, None, hf()) is None
+    with pytest.raises(ValueError, match="Channel-FP8|channel"):
+        c.cls.from_config(schema)
+
+
+@pytest.mark.parametrize("choice", ["quark", "modelopt", "compressed-tensors"])
+def test_incompatible_explicit_choices_are_not_overridden(contracts, choice):
+    c = activate(contracts)
+    assert c.cls.override_quantization_method(SCHEMA, choice, hf()) is None
+
+
+@pytest.mark.parametrize("rocm,name", [(False, "cpu"), (False, "cuda"), (True, "rocm")])
+def test_non_hcu_platforms_are_not_auto_selected(contracts, monkeypatch, rocm, name):
+    c = activate(contracts)
+    monkeypatch.setattr(c.candidate, "current_platform", SimpleNamespace(
+        device_name=name, is_rocm=lambda: rocm))
+    assert c.cls.override_quantization_method(SCHEMA, None, hf()) is None
+    with pytest.raises(ValueError, match="HCU|hcu"):
+        c.cls.from_config(SCHEMA)
+
+
+def test_native_configuration_policy_and_input_are_preserved(contracts):
+    c = activate(contracts)
+    schema = dict(SCHEMA, ignored_layers=["model.layers.0.skip"], store_dtype=None)
+    before = copy.deepcopy(schema)
+    config = c.cls.from_config(schema)
+    assert isinstance(config, c.candidate.DeepseekV4FP8Config)
+    assert config.ignored_layers == schema["ignored_layers"]
+    assert config.activation_scheme == "dynamic"
+    assert config.weight_block_size is None
+    assert config.get_name() == NAME
+    assert schema == before
+    implicit = c.cls.from_config({"quant_method": "fp8", "is_per_channel": True})
+    assert implicit.activation_scheme == "dynamic"
+
+
+def test_native_symbols_and_oracle_are_not_rebound(contracts):
+    from vllm.model_executor.layers.quantization.fp8 import Fp8Config
+    from vllm.model_executor.layers.quantization.compressed_tensors.compressed_tensors import CompressedTensorsConfig
+    from vllm.model_executor.layers.fused_moe.oracle import int8 as oracle
+    c = contracts
+    before = (Fp8Config.get_quant_method, c.candidate.DeepseekV4FP8Config.get_quant_method,
+              CompressedTensorsConfig.get_quant_method, oracle.Int8MoeBackend,
+              oracle.select_int8_moe_backend, oracle.convert_to_int8_moe_kernel_format)
+    activate(c)
+    after = (Fp8Config.get_quant_method, c.candidate.DeepseekV4FP8Config.get_quant_method,
+             CompressedTensorsConfig.get_quant_method, oracle.Int8MoeBackend,
+             oracle.select_int8_moe_backend, oracle.convert_to_int8_moe_kernel_format)
+    assert all(a is b for a, b in zip(before, after))
+
+
+def test_matching_linear_delegates_to_official_ct_channel_scheme(contracts, monkeypatch):
+    from vllm.model_executor.layers.quantization.compressed_tensors.compressed_tensors import CompressedTensorsConfig
+    c = activate(contracts)
+    calls = []
+    sentinel = object()
+
+    def native_ct(config, obj, prefix):
+        calls.append((config, obj, prefix))
+        return sentinel
+
+    monkeypatch.setattr(CompressedTensorsConfig, "get_quant_method", native_ct)
+    config = c.cls.from_config(SCHEMA)
+    obj = layer("linear")
+    assert config.get_quant_method(obj, "model.layers.0.proj") is sentinel
+    delegated = calls[0][0]
+    assert delegated.quant_format == "float-quantized"
+    assert delegated.target_scheme_map["Linear"]["weights"].strategy == "channel"
+    assert delegated.target_scheme_map["Linear"]["input_activations"].strategy == "token"
+    assert delegated.target_scheme_map["Linear"]["input_activations"].dynamic is True
+
+
+@pytest.mark.parametrize("backend,pcp,expected", [
+    ("deep_gemm_mega_moe", 8, "mega"),
+    ("deep_gemm", 8, "pcp-deepgemm"),
+    ("deep_gemm", 1, "existing"),
+])
+def test_expert_schema_reaches_scoped_plugin_provider(contracts, monkeypatch, backend, pcp, expected):
+    from hcu_vllm_das.quantization import channel_fp8_moe as existing
+    from hcu_vllm_das.moe import dsv41_megamoe, dsv41_deepgemm
+    c = activate(contracts)
+    calls = []
+    def constructor(name):
+        def create(weights, inputs, moe, prefix):
+            calls.append((weights, inputs, moe, prefix))
+            return name
+        return create
+    monkeypatch.setattr(existing, "HcuDSV41ChannelFP8MoEMethod", constructor("existing"))
+    monkeypatch.setattr(dsv41_megamoe, "HcuDSV41MegaMoEMethod", constructor("mega"))
+    monkeypatch.setattr(dsv41_deepgemm, "HcuDSV41DeepGemmMethod", constructor("pcp-deepgemm"))
+    obj = layer("experts")
+    obj.ckpt_gate_proj_name, obj.ckpt_up_proj_name, obj.ckpt_down_proj_name = "w1", "w3", "w2"
+    obj.moe_config = SimpleNamespace(moe_backend=backend, pcp_size=pcp, ep_size=8,
+        moe_parallel_config=SimpleNamespace(tp_size=1, dp_size=1 if pcp > 1 else 8,
+            use_deepep_ht_kernels=True, use_deepep_ll_kernels=False))
+    assert c.cls.from_config(SCHEMA).get_quant_method(obj, "model.layers.0.ffn.experts") == expected
+    weights, inputs, moe, prefix = calls[0]
+    assert weights.strategy == "channel" and inputs.strategy == "token"
+    assert moe is obj.moe_config and prefix == "model.layers.0.ffn.experts"
 
 
 def test_empty_linear_only_and_native_nonempty(monkeypatch):
-    from hcu_adapter.bridges.vllm_dsv41.linear import HcuDSV41ChannelFP8LinearMethod
+    import torch
+    from hcu_adapter.channel_fp8_empty_linear import HcuDSV41ChannelFP8LinearMethod
     method = object.__new__(HcuDSV41ChannelFP8LinearMethod)
-    layer = NS(processed_weight_dims=(0, 1), weight=torch.empty(3, 5),
-               scheme=NS(fp8_linear=NS(config=NS(out_dtype=None))))
-    out = method.apply(layer, torch.empty(0, 3, dtype=torch.bfloat16))
+    kernel = SimpleNamespace(config=SimpleNamespace(out_dtype=None), input_quant_key=lambda: None)
+    obj = SimpleNamespace(processed_weight_dims=(0, 1), weight=torch.empty(3, 5),
+                          weight_scale=torch.ones(5), scheme=SimpleNamespace(fp8_linear=kernel))
+    out = method.apply(obj, torch.empty(0, 3, dtype=torch.bfloat16))
     assert out.shape == (0, 5) and out.dtype == torch.bfloat16
-    monkeypatch.setattr(quant.CompressedTensorsConfig, "get_quant_method", lambda *a: None)
-    base = HcuDSV41ChannelFP8LinearMethod.__mro__[1]
-    monkeypatch.setattr(base, "apply", lambda *a: "native")
-    assert method.apply(layer, torch.empty(2, 3)) == "native"
-    layer.processed_weight_dims = (1, 0)
-    with pytest.raises(ValueError, match="finalized"):
-        method.apply(layer, torch.empty(0, 3))
+    monkeypatch.setattr(HcuDSV41ChannelFP8LinearMethod.__mro__[1], "apply", lambda *args: "native")
+    assert method.apply(obj, torch.empty(2, 3)) == "native"
+    obj.processed_weight_dims = (1, 0)
+    with pytest.raises(RuntimeError, match="processed"):
+        method.apply(obj, torch.empty(0, 3))
+
+
+def test_wo_a_stays_bf16_without_ct_selection(contracts, monkeypatch):
+    from vllm.model_executor.layers.linear import UnquantizedLinearMethod
+    from vllm.model_executor.layers.quantization.compressed_tensors.compressed_tensors import CompressedTensorsConfig
+    c = activate(contracts)
+    monkeypatch.setattr(CompressedTensorsConfig, "get_quant_method",
+                        lambda *args: pytest.fail("wo_a entered CT"))
+    config = c.cls.from_config(SCHEMA)
+    assert isinstance(config.get_quant_method(layer("linear"), "model.layers.0.attn.wo_a"),
+                      UnquantizedLinearMethod)
+
+
+@pytest.mark.parametrize("mode,ignored,prefix", [
+    ("exact", ["model.layers.0.skip"], "model.layers.0.skip"),
+    ("substring", ["layers.0"], "model.layers.0.proj"),
+    ("suffix", ["skip"], "model.layers.0.skip"),
+])
+def test_native_linear_exclusions_run_before_ct(contracts, monkeypatch, mode, ignored, prefix):
+    c = activate(contracts)
+    sentinel = object()
+    monkeypatch.setattr(c.candidate.DeepseekV4FP8Config, "get_quant_method",
+                        lambda self, obj, name: sentinel)
+    config = c.cls.from_config(dict(SCHEMA, ignored_layers=ignored))
+    config.ignored_layers_match_mode = mode
+    assert config.get_quant_method(layer("linear"), prefix) is sentinel
+
+
+def test_expert_exact_exclusion_is_preserved(contracts, monkeypatch):
+    c = activate(contracts)
+    sentinel = object()
+    monkeypatch.setattr(c.candidate.DeepseekV4FP8Config, "get_quant_method",
+                        lambda self, obj, name: sentinel)
+    config = c.cls.from_config(dict(SCHEMA, ignored_layers=["model.layers.0.ffn.experts.0.w1"]))
+    assert config.get_quant_method(layer("experts"), "model.layers.0.ffn.experts") is sentinel
+
+
+def test_mixed_precision_fused_shards_still_reject(contracts):
+    c = activate(contracts)
+    config = c.cls.from_config(dict(SCHEMA, ignored_layers=["model.layers.0.q_proj"]))
+    config.packed_modules_mapping = {"qkv_proj": ["q_proj", "k_proj", "v_proj"]}
+    with pytest.raises(ValueError, match="some but not all shards"):
+        config.get_quant_method(layer("linear"), "model.layers.0.qkv_proj")
+
+
+def test_ct_mapping_follows_native_mapper_updates_and_is_instance_local(contracts, monkeypatch):
+    from vllm.model_executor.layers.quantization.compressed_tensors.compressed_tensors import CompressedTensorsConfig
+    c = activate(contracts)
+    calls = []
+    monkeypatch.setattr(CompressedTensorsConfig, "get_quant_method",
+                        lambda config, obj, prefix: calls.append(config))
+    first = c.cls.from_config(SCHEMA)
+    second = c.cls.from_config(SCHEMA)
+    first.get_quant_method(layer("linear"), "model.layers.0.proj")
+    first.packed_modules_mapping = {"qkv_proj": ["q_proj", "k_proj", "v_proj"]}
+    first.get_quant_method(layer("linear"), "model.layers.0.proj")
+    second.get_quant_method(layer("linear"), "model.layers.0.proj")
+    assert calls[1].packed_modules_mapping == first.packed_modules_mapping
+    assert calls[2] is not calls[1]
+    assert calls[2].packed_modules_mapping == {}
+
+
+def test_unrelated_layer_keeps_native_method(contracts, monkeypatch):
+    import torch
+    c = activate(contracts)
+    sentinel = object()
+    monkeypatch.setattr(c.candidate.DeepseekV4FP8Config, "get_quant_method",
+                        lambda self, obj, name: sentinel)
+    assert c.cls.from_config(SCHEMA).get_quant_method(torch.nn.Module(), "embedding") is sentinel
+
+
+def test_changed_registry_owner_is_observable(contracts):
+    from hcu_adapter.extensions import ExtensionCommitError
+    from vllm.model_executor.layers.quantization.fp8 import Fp8Config
+    c = activate(contracts)
+    c.quant.register_quantization_config(NAME)(Fp8Config)
+    with pytest.raises(ExtensionCommitError):
+        c.activation.check_health()

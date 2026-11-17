@@ -1,0 +1,9 @@
+# SPDX-License-Identifier: Apache-2.0
+# Build context contains only the validated private Core wheel and this file.
+ARG BASE_IMAGE
+FROM ${BASE_IMAGE}
+
+COPY core/*.whl /tmp/v033-core/
+RUN HCU_ADAPTER_HOST=none python3 -m pip install --no-index --no-deps \
+    --no-build-isolation --force-reinstall /tmp/v033-core/*.whl \
+    && rm -rf /tmp/v033-core
