@@ -333,8 +333,9 @@ when a conflict reveals a newer merged implementation. Check expected head and
 live base again before a normal non-forced publication.
 
 Inspect the actual fork job environment before relying on variables/secrets.
-An authorized published release digest can supply an explicit project baseline
-when variables are unavailable; preserve overrides and reject mutable/foreign
+Only when the project's trusted policy explicitly permits a recorded baseline,
+an authorized published release digest can supply it when variables are unavailable;
+otherwise retain required configuration. Preserve overrides and reject mutable/foreign
 images. On Actions runner v2.338.2, an empty container credentials object is
 valid while present empty username/password fields fail template validation.
 Omit unavailable fields for forks; never send secrets to them or relax gates.
@@ -342,6 +343,17 @@ After checkout restores its temporary HOME, package metadata may still hit Git
 ownership refusal. Trust only the exact checkout path in the ephemeral job,
 never `safe.directory=*`, and verify another foreign checkout remains rejected.
 A successful container start still requires the actual selected tests to pass.
+
+When PR checks never appear, resolve the workflow's actual event context before
+changing labels or pushing again. Current GitHub.com `pull_request_target` uses
+the receiving repository's default branch; older GHES versions can use the PR
+base. Check the applicable [event documentation](https://docs.github.com/en/actions/reference/workflows-and-actions/events-that-trigger-workflows#pull_request_target),
+default ref and workflow file there. Landing it only on another release branch
+may leave the PR entry absent. A manual dispatch returning 204 is accepted:
+observe its run before retrying. A target-only run does not test a PR head.
+Retain trusted authorization, exact-head checkout, credential isolation and
+device/aggregate gates when choosing a repair within the authorized branch scope.
+Zero check contexts or conflict-free mergeability do not establish CI success.
 
 A workflow can intentionally skip its GPU job for pull_request_target events.
 Treat the automatic green summary as structural evidence only. If the project
