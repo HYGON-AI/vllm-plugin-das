@@ -184,3 +184,20 @@ The integration follow-up incorporates the merged optional SlimQuant format
 from MR363. Its generic public Core PLE interface remains an enablement and
 deployment dependency; the CI wrapper does not invent that API, override its
 capability guard, or count a missing interface/skip as positive device evidence.
+
+
+## Checked-out package workspace
+
+After checkout, both ephemeral device containers add only the exact
+`GITHUB_WORKSPACE` to their effective global Git safe.directory configuration.
+Package metadata commands can then inspect the mounted checkout even after the
+checkout action restores its temporary HOME. A real-Git regression first reproduces
+the ownership refusal, checks the workspace command succeeds and verifies that
+an unrelated repository remains untrusted. Wildcard trust is never used.
+
+The merged trusted-base `pull_request_target` flow owns variable and registry
+credential availability. This follow-up uses that flow unchanged: configured
+immutable image and registry host remain required, with no recorded-image
+fallback. Authorization, head checkout, image allowlist, ARC defaults and the full
+portable/operator/Graph gate stay under the release workflow. CPU/source checks
+do not qualify the prepared image, requested gfx836 hardware or model accuracy.
