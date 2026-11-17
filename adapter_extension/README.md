@@ -289,9 +289,17 @@ backend selection and kernels. Dense INT8 layers also use official CT methods.
 Declared n-gram tables use the public per-row INT8 PLE method with FP32 scales.
 This consumes more weight memory than a packed native W4A8 kernel. It neither
 registers AITER as an official INT8 backend nor replaces `compressed-tensors`.
-The current parser requires the three explicit mixed-precision groups used by
-the Qwen3.8 checkpoint. Verify loader numerics, changed-input Graph and model
-accuracy for the selected Core/provider/checkpoint combination before deployment.
+When `mixed_precision` is absent, the parser preserves the historical format:
+applicable Linear layers use per-channel INT8, routed experts use packed INT4,
+and `ignore` patterns remain authoritative. Ordinary embedding/lm-head and
+model-owned router construction keep their official unquantized behavior.
+An explicit `mixed_precision` map requires the packed-expert declaration.
+Dense INT8 and n-gram INT8 groups are optional; omitting either retains its
+unquantized weights. Every present group needs a complete module list and
+matching format. A malformed declaration never falls back to historical
+defaults. The legacy format does not infer quantized PLE tables. Verify loader
+numerics, changed-input Graph and model accuracy
+for the selected Core/provider/checkpoint combination before deployment.
 
 ## HCU FlashAttention varlen backend
 
