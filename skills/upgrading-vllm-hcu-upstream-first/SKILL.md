@@ -105,6 +105,13 @@ merely to pass discovery. Qualify each admitted operator and consumer separately
 
 ## Validate the changed execution path
 
+For v0.33 CI event availability and the trusted exact-head manual PR route, read
+[the release CI guide](../../docs/validation/vllm033-ci-coverage.md#explicit-pr-dispatch-on-v0330).
+Keep dispatch acknowledgement, the actual PR checkout and aggregate acceptance separate.
+For a private Core image candidate, use the guide's
+[publisher and credential boundaries](../../docs/validation/vllm033-ci-coverage.md#publish-a-private-core-candidate-image);
+inspect embedded architectures before changing a shared CI image.
+
 1. Freeze Core/Adapter/Plugin sources and dependency heads. Check capability
    and ABI compatibility instead of introducing an exact-wheel runtime lock.
 2. Run affected CPU contracts, then installed native numerics and Graph
@@ -131,6 +138,13 @@ architecture, and separately verify trained layers, shared embeddings, restored
 gate weights and nonzero drafted/accepted tokens. Replay a failed read-only
 observer against its saved response before repeating a costly model run;
 preserve that failed attempt and its completed cleanup.
+
+When workspace planning moves to construction, build the real layer in CPU
+regressions with explicit native leaf doubles and exercise its frozen plan.
+Mutate the source configuration afterward and verify reservation and reuse at
+the actual workspace boundary; a removed runtime-config import is not a seam
+to restore merely to keep an old fixture working. Retain missing-reservation
+negative controls. CPU constructor tests do not qualify a model or device.
 For GDN, follow the actual constructor's dispatch selection: an official
 CustomOp may replace `_forward_method` after platform dispatch, so overriding
 `forward_hip` alone need not execute the provider. An OOT prefill entry does

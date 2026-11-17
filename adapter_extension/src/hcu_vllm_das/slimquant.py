@@ -104,6 +104,16 @@ class SlimQuantConfig(CompressedTensorsConfig):
             ignore=list(config.get("ignore") or []),
             quant_format="int-quantized",
         )
+        # Historical checkpoints declare only quant_method/activation_scheme.
+        # They quantize applicable Linear layers and all routed experts, with
+        # explicit ignores retained. A present but incomplete mixed_precision
+        # map must still fail the declared-format checks below.
+        self.legacy_format = "mixed_precision" not in config
+        if self.legacy_format:
+            self.expert_modules = []
+            self.dense_modules = []
+            self.ngram_modules = []
+            return
         mixed = config.get("mixed_precision") or {}
         experts = mixed.get("experts") or {}
         if (
@@ -122,7 +132,7 @@ class SlimQuantConfig(CompressedTensorsConfig):
         ):
             raise ValueError("SlimQuant requires dynamic-token INT8 expert activations")
         dense = mixed.get("w8a8_include") or {}
-        if (
+        if "w8a8_include" in mixed and (
             dense.get("format"),
             dense.get("weight_bits"),
             dense.get("activation_bits"),
@@ -134,14 +144,24 @@ class SlimQuantConfig(CompressedTensorsConfig):
             )
         self.dense_modules = list(dense.get("modules") or [])
         ngram = mixed.get("ngram_embedding") or {}
-        if (ngram.get("format"), ngram.get("weight_bits"), ngram.get("scope")) != (
+        if "ngram_embedding" in mixed and (
+            ngram.get("format"),
+            ngram.get("weight_bits"),
+            ngram.get("scope"),
+        ) != (
             "int8",
             8,
             "per_channel",
         ):
             raise ValueError("SlimQuant requires declared per-row INT8 n-gram tables")
         self.ngram_modules = list(ngram.get("modules") or [])
-        if not all((self.expert_modules, self.dense_modules, self.ngram_modules)):
+        if not self.expert_modules or any(
+            name in mixed and not modules
+            for name, modules in (
+                ("w8a8_include", self.dense_modules),
+                ("ngram_embedding", self.ngram_modules),
+            )
+        ):
             raise ValueError("SlimQuant mixed-precision module lists must be non-empty")
 
     @classmethod
@@ -182,6 +202,12 @@ class SlimQuantConfig(CompressedTensorsConfig):
 
         if self._matches(prefix, self.ignore):
             return Qwen4ExpPLEUnquantizedEmbeddingMethod()
+        if self.legacy_format:
+            raise ValueError(
+                "SlimQuant PLE requires explicit mixed_precision declarations"
+            )
+        if not self.ngram_modules:
+            return Qwen4ExpPLEUnquantizedEmbeddingMethod()
         context = get_current_vllm_config_or_none()
         model_config = getattr(context, "model_config", None)
         text_config = getattr(model_config, "hf_text_config", None)
@@ -199,12 +225,16 @@ class SlimQuantConfig(CompressedTensorsConfig):
         if all(ignored):
             return Qwen4ExpPLEUnquantizedEmbeddingMethod()
         if any(ignored):
-            raise ValueError(f"SlimQuant does not support partially ignored PLE {prefix!r}")
+            raise ValueError(
+                f"SlimQuant does not support partially ignored PLE {prefix!r}"
+            )
         declared = [self._matches(name, self.ngram_modules) for name in shards]
         if not any(declared):
             return Qwen4ExpPLEUnquantizedEmbeddingMethod()
         if not all(declared):
-            raise ValueError(f"SlimQuant does not support partially declared PLE {prefix!r}")
+            raise ValueError(
+                f"SlimQuant does not support partially declared PLE {prefix!r}"
+            )
         return Qwen4ExpPLEPerRowEmbeddingMethod(torch.int8)
 
     def get_quant_method(self, layer: nn.Module, prefix: str):
@@ -213,7 +243,9 @@ class SlimQuantConfig(CompressedTensorsConfig):
             if ignored:
                 return UnquantizedFusedMoEMethod(layer.moe_config)
             projections = [f"{prefix}.{name}" for name in ("gate_up_proj", "down_proj")]
-            ignored_projections = [self._matches(name, self.ignore) for name in projections]
+            ignored_projections = [
+                self._matches(name, self.ignore) for name in projections
+            ]
             if all(ignored_projections):
                 return UnquantizedFusedMoEMethod(layer.moe_config)
             if any(ignored_projections):
@@ -221,7 +253,7 @@ class SlimQuantConfig(CompressedTensorsConfig):
                     f"SlimQuant does not support partially ignored expert group {prefix!r}"
                 )
             # RoutedExperts groups the serialized gate_up_proj/down_proj modules.
-            if not all(
+            if not self.legacy_format and not all(
                 self._matches(name, self.expert_modules) for name in projections
             ):
                 raise ValueError(f"Undeclared SlimQuant expert group {prefix!r}")
@@ -229,6 +261,8 @@ class SlimQuantConfig(CompressedTensorsConfig):
                 self.weight_quant, self.input_quant, layer.moe_config
             )
         if isinstance(layer, LinearBase):
-            if ignored or not self._matches(prefix, self.dense_modules):
+            if ignored or (
+                not self.legacy_format and not self._matches(prefix, self.dense_modules)
+            ):
                 return UnquantizedLinearMethod()
         return super().get_quant_method(layer, prefix)

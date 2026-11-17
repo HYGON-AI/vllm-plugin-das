@@ -104,7 +104,36 @@ class ImagePolicyTests(unittest.TestCase):
                                   'HARBOR_USERNAME', 'HARBOR_PASSWORD',
                                   'needs: [select, authorize-device']:
                     self.assertNotIn(forbidden, block)
-        self.assertIn('needs: select\n', job_block(self.source, 'v033-source-contract'))
+        self.assertIn('needs: [resolve-target, select]\n', job_block(self.source, 'v033-source-contract'))
+
+    def test_container_packaging_trusts_only_the_checked_out_workspace(self):
+        for name in ['v033-device-gfx936', 'v033-device-gfx938']:
+            with self.subTest(job=name), tempfile.TemporaryDirectory() as directory:
+                block = job_block(self.source, name)
+                step = block.split('      - name: Trust checked-out workspace for package metadata\n', 1)[1]
+                command = next(line.strip()[5:] for line in step.splitlines()
+                               if line.strip().startswith('run: '))
+                root = Path(directory)
+                workspace, foreign = root / 'checkout with spaces', root / 'foreign'
+                for path in [workspace, foreign]:
+                    subprocess.run(['git', 'init', '-q', str(path)], check=True)
+                environment = dict(os.environ, GITHUB_WORKSPACE=str(workspace),
+                    GIT_CONFIG_GLOBAL=str(root / 'gitconfig'),
+                    GIT_CONFIG_SYSTEM=os.devnull, GIT_TEST_ASSUME_DIFFERENT_OWNER='1')
+                def status(path):
+                    return subprocess.run(['git', '-C', str(path), 'status', '--porcelain'],
+                        env=environment, capture_output=True, text=True, timeout=10)
+                before = status(workspace)
+                self.assertNotEqual(before.returncode, 0)
+                self.assertIn('dubious ownership', before.stderr)
+                subprocess.run(['bash', '--noprofile', '--norc', '-e', '-c', command],
+                    env=environment, check=True, capture_output=True, timeout=10)
+                self.assertEqual(status(workspace).returncode, 0)
+                self.assertNotEqual(status(foreign).returncode, 0)
+                configured = subprocess.run(['git', 'config', '--global', '--get-all', 'safe.directory'],
+                    env=environment, check=True, capture_output=True, text=True, timeout=10)
+                self.assertEqual(configured.stdout.splitlines(), [str(workspace)])
+
 
     def resolved(self, mode):
         image = self.repository + '@' + self.digest

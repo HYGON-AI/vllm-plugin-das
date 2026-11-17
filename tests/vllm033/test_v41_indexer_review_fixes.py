@@ -28,6 +28,7 @@ from hcu_vllm_das import v41_indexer as scorer
 from hcu_vllm_das import v41_indexer_activation as activation
 
 from test_fp4_full_admission import config
+from test_fp4_full_chain import chain, make_attention  # noqa: F401 -- pytest fixture
 
 
 @pytest.fixture(autouse=True)
@@ -137,42 +138,38 @@ def test_staging_plan_sizes_the_pool_and_transient_scratch():
     assert plan['transient'] > 0
 
 
-def test_profile_pass_reserves_the_staging_pool(monkeypatch):
+def test_profile_pass_reserves_the_staging_pool(chain, monkeypatch):
     """The profile branch must reserve staging, not only the FP32 logits."""
-    cfg = staged_config()
+    chain.cfg.model_config.hf_config.compress_ratios = [2, 0]
+    layer = make_attention(chain).indexer.indexer_op
+    plan = dict(layer.fp4_staging_plan)
+    assert plan['page_records'] == 32
+    # The real constructor freezes the capacity; execution must not reread it.
+    chain.cfg.scheduler_config.max_num_seqs = 99999
+    chain.context.attn_metadata = None
     calls = []
 
     class Workspace:
-        def get_simultaneous(self, *shapes):
-            calls.append(('simultaneous', shapes))
-            return [torch.zeros(shapes[0][0], dtype=torch.float32)]
-
         def get_persistent(self, key, shape, dtype, **kwargs):
-            calls.append(('persistent', key, shape))
+            calls.append(('persistent', key, shape, dtype))
             return torch.empty(shape, dtype=dtype)
-
-    monkeypatch.setattr(reader, 'get_forward_context',
-                        lambda: NS(attn_metadata=None))
 
     import vllm.v1.worker.workspace as workspace
     monkeypatch.setattr(workspace, 'is_workspace_manager_initialized',
                         lambda: True)
     monkeypatch.setattr(workspace, 'current_workspace_manager', lambda: Workspace())
 
-    # Construction freezes these values; execute must not query live config.
-    plan = reader.staging_plan(cfg, 8192, 2)
-    layer = NS(max_model_len=8192, compress_ratio=2, topk_indices_buffer='out',
-               fp4_decode_rows=reader.decode_rows(cfg), max_total_seq_len=8192,
-               topk_tokens=16, fp4_max_logits_bytes=4 * 8192 * 4,
-               fp4_page_records=plan['page_records'], fp4_staging_plan=plan)
-    result = reader.execute(layer, torch.zeros((4, 128)), None, None)
-    assert result == 'out'
-    plan_records = plan['page_records']
+    output = reader.execute(layer, torch.zeros((4, 128)), None, None)
 
     kinds = [entry[0] for entry in calls]
     assert 'persistent' in kinds, 'profile pass did not reserve the staging pool'
-    pool = reader._reserved_pools[plan_records]
-    assert pool.shape[2] == reader.STAGING_PAGE_BYTES
+    assert calls == [('persistent', reader.staging_key(plan), plan['shape'], torch.uint8)]
+    pool = reader._reserved_pools[plan['page_records']]
+    assert tuple(pool.shape) == plan['shape']
+    assert output is layer.topk_indices_buffer
+    cache = NS(shape=(1, plan['page_records'], 68), device=torch.device('cpu'))
+    assert reader._staging_target(cache, 1, 4).data_ptr() == pool.data_ptr()
+    assert not torch.cuda.is_initialized()
 
 
 def test_staging_reuses_the_reserved_pool_for_a_smaller_step():
