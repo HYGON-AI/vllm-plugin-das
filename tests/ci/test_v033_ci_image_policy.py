@@ -46,11 +46,12 @@ class ImagePolicyTests(unittest.TestCase):
 
     def test_only_configured_repository_digest_is_emitted(self):
         for harbor in [self.harbor, 'other-harbor.invalid']:
-            with self.subTest(harbor=harbor):
-                image = harbor + '/jenkins/model_test_env/vllm@' + self.digest
-                code, output = self.guard(image, harbor)
-                self.assertEqual(code, 0)
-                self.assertEqual(dict(line.split('=', 1) for line in output.splitlines())['image'], image)
+            for repository in ['jenkins/model_test_env/vllm', 'hcu/base_env/vllm']:
+                with self.subTest(harbor=harbor, repository=repository):
+                    image = harbor + '/' + repository + '@' + self.digest
+                    code, output = self.guard(image, harbor)
+                    self.assertEqual(code, 0)
+                    self.assertEqual(dict(line.split('=', 1) for line in output.splitlines())['image'], image)
 
     def test_absent_whitespace_mutable_foreign_and_malformed_images_refuse(self):
         good = self.repository + '@' + self.digest
