@@ -151,6 +151,13 @@ Mutate the source configuration afterward and verify reservation and reuse at
 the actual workspace boundary; a removed runtime-config import is not a seam
 to restore merely to keep an old fixture working. Retain missing-reservation
 negative controls. CPU constructor tests do not qualify a model or device.
+CPU CLI transport fixtures should use a real temporary local model directory
+and explicitly exercise offline resolution, rather than depend on a cached
+placeholder repository. For layout-only quantization tests, isolate the
+constructor's device-admission leaf while retaining real post-load/reload,
+tensor-value, stride and pointer assertions. Match source-origin guards to the
+actual Core import path. Keep production admission checks and device tests
+unchanged; these fixture doubles do not establish native execution.
 For GDN, follow the actual constructor's dispatch selection: an official
 CustomOp may replace `_forward_method` after platform dispatch, so overriding
 `forward_hip` alone need not execute the provider. An OOT prefill entry does
