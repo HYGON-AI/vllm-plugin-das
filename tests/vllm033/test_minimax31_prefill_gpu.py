@@ -81,6 +81,7 @@ def test_pack_workspace_reuse_and_scale_guard_native_mutation():
     assert opt.check_bound_scales(obj)
     torch.cuda.synchronize()
     a=torch.randn((187,1024),device='cuda',dtype=torch.bfloat16);b=torch.randn((187,128),device='cuda',dtype=torch.bfloat16)
+    opt.reserve_pack_rows(187,a.device)
     out=opt.pack_rows((a,b));ptr=out.data_ptr()
     assert torch.equal(out,torch.cat((a,b),1))
     out=opt.pack_rows((a[:1],b[:1]));assert out.data_ptr()==ptr
@@ -142,3 +143,95 @@ def test_cache_store_reuses_variant_across_rows_and_page_capacity():
         store_pcp_cache(raw, slots, slots, cache.key_writer, cache.value_writer, index, scale, scale)
     torch.cuda.synchronize()
     assert len(_cache_store.device_caches[torch.cuda.current_device()][0]) - before == 1
+
+
+def test_local_pages_dynamic_geometry_has_at_most_one_variant():
+    from triton_tmp_dir.minimax31_prefill_triton import _local_pages, force_local_pages
+    before = len(_local_pages.device_caches[torch.cuda.current_device()][0])
+    for heads, queries, pages in [(1,1,1),(2,7,17),(2,9,18),(4,17,129),(4,33,513)]:
+        score = torch.randn((heads,queries,pages), device='cuda').transpose(1,2)
+        end = torch.arange(queries, device='cuda', dtype=torch.int32) * 193
+        ref = score.clone()
+        last = (end-1)//128
+        ids = torch.arange(pages, device='cuda').view(1,-1,1)
+        ref.masked_fill_((ids <= last.view(1,1,-1)) &
+                        (ids >= (last-3).clamp_min(0).view(1,1,-1)), 1.e30)
+        force_local_pages(score,end,4)
+        torch.testing.assert_close(score,ref,rtol=0,atol=0)
+    torch.cuda.synchronize()
+    assert len(_local_pages.device_caches[torch.cuda.current_device()][0])-before <= 1
+
+
+def test_quant_q_dynamic_elements_have_at_most_one_variant():
+    from triton_tmp_dir.minimax31_prefill_triton import _quant_q, quant_q
+    before = len(_quant_q.device_caches[torch.cuda.current_device()][0])
+    scale = torch.tensor(1.3, device='cuda', dtype=torch.float32)
+    for elements in [0,1,17,1025,2049,4096]:
+        q = torch.linspace(-500,500,elements,device='cuda',dtype=torch.bfloat16)
+        out = quant_q(q,scale)
+        ref = (q.float()/scale).to(torch.float8_e4m3fn)
+        assert torch.equal(out.view(torch.uint8),ref.view(torch.uint8))
+    torch.cuda.synchronize()
+    assert len(_quant_q.device_caches[torch.cuda.current_device()][0])-before <= 1
+
+
+@pytest.mark.parametrize('main_dtype',[torch.uint8,torch.float8_e4m3fn])
+@pytest.mark.parametrize('scale',[1.,.3,1.7])
+def test_cache_store_overflow_bytes_match_stock_writer(main_dtype,scale):
+    from triton_tmp_dir.minimax31_prefill_triton import store_pcp_cache
+    from hcu_vllm_das.parallel.minimax31_msa import bind_fresh_main_cache
+    from vllm.v1.attention.ops.triton_reshape_and_cache_flash import triton_reshape_and_cache_flash
+    from vllm.models.minimax_m3.amd.ops.sparse_pa import minimax_m3_insert_index_cache
+    values=torch.tensor([0.,-0.,1.0625,-1.1875,432.,-448.,464.,-500.,512.,-1024.,65504.,-65504.],device='cuda',dtype=torch.bfloat16).repeat(43)[:512]
+    raw=torch.empty((3,1168),device='cuda',dtype=torch.bfloat16)[:,:1152]
+    raw[:,:512]=values;raw[:,512:1024]=values.flip(0)
+    raw[:,1024:]=torch.linspace(-1024,1024,128,device='cuda',dtype=torch.bfloat16)
+    a=torch.full((2,4,128,256),17,device='cuda',dtype=main_dtype);b=a.clone()
+    bound=bind_fresh_main_cache(a,fresh=True);reference=bind_fresh_main_cache(b,fresh=True)
+    index=torch.ones((2,128,128),device='cuda',dtype=torch.float8_e4m3fn);ri=index.clone()
+    ms=torch.tensor([0,129,-1],device='cuda',dtype=torch.int64)
+    ix=torch.tensor([129,-1,0],device='cuda',dtype=torch.int64)
+    ks=torch.tensor(scale,device='cuda');vs=torch.tensor(scale,device='cuda')
+    triton_reshape_and_cache_flash(raw[:,:512].view(3,4,128),raw[:,512:1024].view(3,4,128),reference.key_writer,reference.value_writer,ms,'fp8',ks,vs)
+    minimax_m3_insert_index_cache(raw[:,1024:].clamp(-448,448),ri,ix)
+    store_pcp_cache(raw,ms,ix,bound.key_writer,bound.value_writer,index,ks,vs)
+    assert torch.equal(a.view(torch.uint8),b.view(torch.uint8))
+    assert torch.equal(index.view(torch.uint8),ri.view(torch.uint8))
+
+
+def test_pack_profile_budget_and_same_stream_consumption(monkeypatch):
+    from hcu_vllm_das.parallel import minimax31_prefill as opt
+    monkeypatch.setattr(opt,'_PACK',{})
+    a=torch.randn((17,1024),device='cuda',dtype=torch.bfloat16)
+    b=torch.randn((17,128),device='cuda',dtype=torch.bfloat16)
+    with pytest.raises(RuntimeError,match='profiled'):opt.pack_rows((a,b))
+    from types import SimpleNamespace
+    from hcu_vllm_das.parallel import minimax31_pcp as pcp
+    monkeypatch.setattr(pcp,'_validate_prefill_policy',lambda:True)
+    monkeypatch.setattr(pcp,'_prefill_enabled',lambda:True)
+    monkeypatch.setattr(pcp.PCPManager,'prepare_inputs_for_capture_or_profile',lambda self,batch:batch)
+    manager=pcp.MiniMax31PCPManager.__new__(pcp.MiniMax31PCPManager)
+    manager._hcu_native_msa=True;manager._hcu_static=False
+    manager.pcp_world_size=8;manager.dcp_world_size=1;manager.shard_decode_requests=True
+    def dummy(self,rows,*a,**kw):
+        return manager.prepare_inputs_for_capture_or_profile(SimpleNamespace(num_tokens_after_padding=rows,positions=torch.arange(rows,device=self.device)))
+    monkeypatch.setattr(pcp.GPUModelRunner,'_dummy_run',dummy)
+    runner=pcp.MiniMax31PCPModelRunner.__new__(pcp.MiniMax31PCPModelRunner)
+    runner.pcp_manager=manager;runner.max_num_reqs=1;runner.speculator=None;runner.device=a.device
+    profiled=runner._dummy_run(257,is_profile=True,skip_attn=True)
+    capacity=profiled.num_tokens_after_padding
+    assert capacity>=17
+    first=opt.pack_rows((a,b));ptr=first.data_ptr()
+    assert not first.is_inference()
+    # Enqueue consumption before overwriting the borrowed buffer, without a
+    # host/device synchronize between these same-stream operations.
+    consumed=first.clone()
+    second=opt.pack_rows((-a,-b))
+    assert second.data_ptr()==ptr
+    torch.testing.assert_close(consumed,torch.cat((a,b),1),rtol=0,atol=0)
+    torch.testing.assert_close(second,torch.cat((-a,-b),1),rtol=0,atol=0)
+    biga=torch.empty((capacity+1,1024),device='cuda',dtype=torch.bfloat16)
+    bigb=torch.empty((capacity+1,128),device='cuda',dtype=torch.bfloat16)
+    with pytest.raises(RuntimeError,match='profiled'):opt.pack_rows((biga,bigb))
+    with torch.cuda.stream(torch.cuda.Stream()):
+        with pytest.raises(RuntimeError,match='profiled'):opt.pack_rows((a,b))

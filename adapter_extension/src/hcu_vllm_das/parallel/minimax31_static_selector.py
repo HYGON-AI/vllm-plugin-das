@@ -4,6 +4,7 @@ import torch
 import triton
 import triton.language as tl
 from .minimax31_static_runtime import layout
+from .minimax31_prefill import enabled as _prefill_enabled
 
 @triton.jit
 def _mix(x):
@@ -46,9 +47,8 @@ def select_physical(layer,logical_ids):
     if (batch['positions'].device!=logical_ids.device or batch['base'].device!=logical_ids.device or batch['positions'].dtype!=torch.int64 or not batch['positions'].is_contiguous() or batch['positions'].numel()<logical_ids.shape[0]):raise ValueError('static selector position/device binding mismatch')
     out=torch.empty_like(logical_ids,dtype=torch.int64)
     if out.numel():
-        from .minimax31_prefill import enabled
         kernel = _select
-        if enabled("selector"):
+        if _prefill_enabled():
             from triton_tmp_dir.minimax31_prefill_triton import select_physical_dynamic
             kernel = select_physical_dynamic
         kernel[(triton.cdiv(out.numel(),256),)](logical_ids,batch['positions'],batch['base'],counts,slots,out,logical_ids.shape[0],batch['rows'],layer._static_layer_id,256)

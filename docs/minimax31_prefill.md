@@ -18,8 +18,11 @@ model path. Use `stock` in a fresh process for the unfused comparison:
 Select that file through the existing `HCU_CONFIG` interface. The existing
 `HCU_DISABLE_OPS=vllm_minimax_prefill` startup veto wins over configuration.
 There is no new private environment variable or per-feature debug switch.
-Policy is frozen/reported before model loading; later changes and inherited
-active fork state are refused. Both catalog choices remain candidates.
+Policy is frozen/reported before model loading. Planner/profile entry checks
+reject later changes before mutating inputs; per-layer `enabled()` reads only the
+cached composition after a PID check. There are no per-feature selections.
+Inherited active fork state is refused; use the existing upstream
+`VLLM_WORKER_MULTIPROC_METHOD=spawn` startup setting. Both catalog choices remain candidates.
 
 Use explicit stock/triton configuration for A/B work: the old private experimental
 switch is no longer read, and an unset configuration now selects the optimized
@@ -31,11 +34,11 @@ rewrite old hashes to reuse a producer.
 
 | Optimization | Preserved boundary |
 |---|---|
-| Local-page update | Same FP32 sentinel, Top16 ordering and zero-end masking; write only selected local pages. |
-| Q conversion | BF16 input, correctly rounded FP32 division, identical E4M3FN bytes. |
+| Local-page update | Same FP32 sentinel, Top16 ordering and zero-end masking; strides/page count are non-specialized runtime scalars. Only the local-page setting remains constexpr. |
+| Q conversion | BF16 input, correctly rounded FP32 division, identical E4M3FN bytes; element count is a non-specialized runtime scalar, only tile size remains constexpr. |
 | Fused cache store | Gather order K512/V512/index-K128, independent main/index physical slots, -1 padding, native token-major strides, unchanged descales and FP8-index clamp. |
-| Pack workspace | Same-stream BF16 inference storage, geometric growth/reuse, original inputs untouched. |
-| Metadata reuse | Reset every forward; hold the original tensor references (even if wrapper fields change) and bind device/address/shape/stride/dtype/version. Inference tensors without versions retain object identity instead of merging fresh wrappers. |
+| Pack workspace | BF16 K512/V512/index-K128 scratch is reserved by the existing local memory-profile entry. Inference never grows it; unprofiled streams or row budgets refuse. The borrowed view must be consumed by the synchronous, same-stream PCP gather before reuse; inputs remain untouched. |
+| Metadata reuse | Reset every forward; retain only the three source tensors, not their metadata wrapper or unrelated tensors. Both stock and optimized keys bind physical identity/version; only the optimized key shares fresh wrappers. Inference tensors without versions retain tensor object identity. |
 | Scale guard | First binding retains finite-positive host validation; subsequent same-cache checks compare device values with private snapshots on the bound stream. Geometry/stream changes refuse. Failed device assertions require process restart. |
 | Static selector | Original immutable tables and logical-ID checks; identical uint64 hash. N/REAL/LAYER remain runtime scalars to avoid per-layer/row JIT variants. No first-forward kernel rebinding. |
 
@@ -51,8 +54,17 @@ HCU checks compare exact FP8/cache bytes (both uint8 and FP8 backing), real stri
 inputs and independent Python uint64 selector outputs for all 57 MoE layers,
 0/1 boundaries and nine-replica tables. Selector compilation has one variant in
 that check; the cache-store check also varies rows and page capacity without
-creating a new variant. Static frame admission precedes MSA metadata mutation,
-so a rejected concurrent frame cannot overwrite the active owner.
+creating a new variant. Local-page and Q checks also vary geometry/element count
+with at most one variant per fixed setting. Main-cache finite overflow values
+(up to BF16 65504 with several scales) are compared byte-for-byte with the official
+`triton_reshape_and_cache_flash`, in addition to the independent small-value oracle.
+The real `is_profile=True` runner boundary (rather than the later shared dummy
+preparation) reserves scratch as normal mutable storage, even under inference
+mode. Tests cover later non-inference writes and same-stream scratch consumption. Static frame admission precedes MSA metadata mutation,
+so a rejected concurrent frame cannot overwrite the active owner. If MSA setup
+throws after admission, the existing `execute_model` / `_dummy_run` failure guard
+releases the host frame and poisons further model execution until restart; it does
+not roll back to a seemingly healthy engine.
 Destructive scale mutations run only in isolated probe processes;
 an arbitrary crash is not a passing result: the expected assertion kernel and
 message must be identified.
@@ -96,3 +108,25 @@ Archive identity: `benchmark_fixed_evidence_20261117.tar.gz`, SHA256
 Full request/timing/source manifests remain in the independent experiment archive;
 no personal account, internal host address or private launcher is required by the
 public commands above.
+
+## Review disposition and result identity
+
+The paired Adapter prerequisite and merge order are recorded in
+[minimax31_configuration.md](minimax31_configuration.md). The admitted-path default
+remains `triton` under the requested deployment policy; both backends stay
+`candidate`, and `stock` remains the explicit startup comparison. Component checks
+and a default selection do not promote a backend to production.
+
+The 2026-11-17 HumanEval thinking run used Adapter `1f643926` and Plugin `5e48369c`:
+163/164 unique tasks completed, 156 passed, seven failed, and task 145 was stopped
+at the user's request. There were 162 normal stops and one 16384-token truncation
+(task 32); complete pass@1 is null. Failed IDs were 32/39/75/106/119/134/163.
+This partial result predates the review fixes above and must not be relabelled as
+current-head or complete-model acceptance. The stopped task is not resumed.
+
+Scale mutation is a correctness failure while FP8 KV is bound. The optimized
+same-stream device assertion can terminate the worker (SIGABRT on the measured
+HCU runtime); restart the engine, never catch and continue with uncertain cache.
+The explicit stock comparison retains its synchronous Python validation. Clean
+forks before policy/device state can initialize independently, but inherited
+active state is never reset to bypass ownership; use spawn workers.

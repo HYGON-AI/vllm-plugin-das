@@ -62,3 +62,25 @@ path evidence is recorded in the MR; it is component numerical/lifecycle
 validation, not a complete checkpoint accuracy result.
 
 Long shared prefill overlap is attempted only for the audited HIPC/hipBLASLt MLP with an enabled safe stream. Retained Bolt/Triton configurations, disabled streams and other unsupported overlap conditions use the stock shared lifecycle; an occupied output slot remains an error. Failed static forwards release the host frame but require a new engine, rather than reusing uncertain GPU state.
+
+## Paired Adapter prerequisite and worker startup
+
+Merge/install [Adapter #128](https://github.com/HYGON-AI/adapter-das/pull/128)
+before [Plugin #427](https://github.com/HYGON-AI/vllm-plugin-das/pull/427).
+The minimum Adapter feature baseline is the `vllm_minimax_prefill` catalog and
+startup-veto registration introduced by Adapter commit `1f643926a890749cd80008e94cc56b5ec6a0b265`;
+a merged/released build must contain that functionality. An older Adapter fails
+at model construction with the paired-catalog diagnostic, rather than silently
+ignoring a requested backend. A container tag alone does not establish this floor.
+
+Use the existing vLLM worker-startup interface:
+
+```bash
+export VLLM_WORKER_MULTIPROC_METHOD=spawn
+```
+
+This is an upstream worker setting, not a new Plugin variable. The policy and
+scratch ownership guards reject active state inherited by fork. Configuration
+changes are rejected at the next planner/profile boundary and require restart.
+The memory probe reserves maximum local K/V/index pack scratch before KV capacity
+is computed; inference is restricted to that profiled stream and row budget.

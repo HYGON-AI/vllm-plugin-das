@@ -13,7 +13,9 @@ from pathlib import Path
 
 import numpy as np
 import torch
-from .minimax31_prefill import enabled as _prefill_enabled
+from .minimax31_prefill import (enabled as _prefill_enabled,
+                                validate_policy as _validate_prefill_policy,
+                                reserve_pack_rows)
 
 from vllm.distributed.parallel_state import get_pcp_group
 from vllm.forward_context import get_forward_context
@@ -87,6 +89,8 @@ class MiniMax31PCPAttentionLayer(_original_attention):
 
 
 def gather_cache_rows(rows, slots):
+    # GroupCoordinator.all_gather consumes rows on the calling stream before
+    # a later pack may overwrite scratch; no async handle/source escapes here.
     group = get_pcp_group()
     if group.world_size != 8 or rows.ndim != 2 or slots.ndim != 1:
         raise ValueError("invalid PCP cache-input group or row/slot layout")
@@ -138,7 +142,7 @@ def validate_fp8_sparse_cache(layer, slots):
                 or scale.device != cache.device):
             raise ValueError("FP8 MiniMax PCP %s must be a local FP32 scalar" % name)
         scales.append(scale)
-    if getattr(layer, "_hcu_native_msa", False) and _prefill_enabled("scale_guard"):
+    if getattr(layer, "_hcu_native_msa", False) and _prefill_enabled():
         from .minimax31_prefill import check_bound_scales
         if check_bound_scales(layer):
             return
@@ -150,7 +154,7 @@ def validate_fp8_sparse_cache(layer, slots):
     if checked is not None and checked[0] == cache.data_ptr() and checked[1] != values:
         raise ValueError("FP8 MiniMax PCP scales changed while KV cache is bound")
     layer._hcu_fp8_checked = (cache.data_ptr(), values)
-    if getattr(layer, "_hcu_native_msa", False) and _prefill_enabled("scale_guard"):
+    if getattr(layer, "_hcu_native_msa", False) and _prefill_enabled():
         from .minimax31_prefill import bind_validated_scales
         bind_validated_scales(layer)
 
@@ -257,7 +261,7 @@ class MiniMax31PCPSparseAttention(_original_sparse):
         rows = qkv[:, self.q_size:kv_end]
         if not self.skip_index_topk:
             index_k_start = kv_end + self.index_q_size
-            if self._hcu_native_msa and _prefill_enabled("pack_buffer"):
+            if self._hcu_native_msa and _prefill_enabled():
                 from .minimax31_prefill import pack_rows
                 rows = pack_rows((rows, qkv[:, index_k_start:]))
             else:
@@ -284,7 +288,7 @@ class MiniMax31PCPSparseAttention(_original_sparse):
             else:
                 keys, values = self.kv_cache.transpose(1, 2).split(self.head_dim, dim=-1)
             fused_store = (self._hcu_native_msa and index_k is not None
-                           and _prefill_enabled("cache_store"))
+                           and _prefill_enabled())
             if fused_store:
                 from triton_tmp_dir.minimax31_prefill_triton import store_pcp_cache
                 store_pcp_cache(gathered, slots[self.layer_name],
@@ -333,6 +337,7 @@ class MiniMax31PCPManager(PCPManager):
         validate_scope(vllm_config)
 
     def prepare_inputs_for_capture_or_profile(self, input_batch):
+        _validate_prefill_policy()
         local = super().prepare_inputs_for_capture_or_profile(input_batch)
         if self._hcu_static:
             from .minimax31_static_runtime import set_forward_layout
@@ -340,6 +345,7 @@ class MiniMax31PCPManager(PCPManager):
         return local
 
     def partition_batch(self, input_batch, batch_desc):
+        _validate_prefill_policy()
         local = super().partition_batch(input_batch, batch_desc)
         # Reserve the static frame before mutating shared MSA metadata.
         if self._hcu_static:
@@ -382,7 +388,7 @@ class MiniMax31PCPModelState(MiniMaxM3ModelState):
 class MiniMax31PCPForConditionalGeneration(stock.MiniMaxM3SparseForConditionalGeneration):
     def __init__(self, *, vllm_config, prefix=""):
         validate_scope(vllm_config)
-        _prefill_enabled("metadata")  # freeze/report the selected model policy before loading
+        _validate_prefill_policy()  # freeze/report the selected model policy before loading
         from .minimax31_static_contract import model_construction_scope
         with model_construction_scope(vllm_config.model_config):
             super().__init__(vllm_config=vllm_config, prefix=prefix)
@@ -425,6 +431,7 @@ class MiniMax31PCPModelRunner(GPUModelRunner):
     @guard_model_forward
     def _dummy_run(self, num_tokens, *args, **kwargs):
         if kwargs.get("is_profile", False):
+            _validate_prefill_policy()
             manager = self.pcp_manager
             if (args or kwargs.get("skip_attn") is not True
                     or kwargs.get("uniform_decode", False)
@@ -433,6 +440,10 @@ class MiniMax31PCPModelRunner(GPUModelRunner):
                     or self.speculator is not None):
                 raise RuntimeError("unsupported MiniMax PCP synthetic memory probe")
             local_tokens = profile_local_token_budget(num_tokens, self.max_num_reqs)
+            if manager._hcu_native_msa and _prefill_enabled():
+                # Only the memory probe may grow persistent pack scratch.
+                # The shared dummy/capture preparation also runs after sizing KV.
+                reserve_pack_rows(local_tokens, self.device)
             print("MINIMAX_PCP_PROFILE_BUDGET " + json.dumps({
                 "global_scheduler_budget": num_tokens, "local_probe_rows": local_tokens,
                 "max_num_reqs": self.max_num_reqs, "scheduler_unchanged": True}), flush=True)

@@ -140,7 +140,7 @@ class TeacherMSAPrefill:
             raise ValueError('forced prefix/local pages must be nonnegative and fit Top16')
         score=self.native.msa128_stage1_page_max(index_q,index_cache.unsqueeze(1),meta.k_end,True,-1,
             meta.q_lens_cpu,meta.kv_lens_cpu,None,meta.packed_kv_pages,meta.max_kv_len,index_q_scale,index_k_scale,True,False,False)
-        if local_blocks and _prefill_enabled("local_pages"):
+        if local_blocks and _prefill_enabled():
             from triton_tmp_dir.minimax31_prefill_triton import force_local_pages
             force_local_pages(score, meta.k_end, local_blocks)
 
@@ -162,7 +162,7 @@ class TeacherMSAPrefill:
         if q.shape[0]!=meta.k_end.numel():raise ValueError('query metadata rows disagree')
         indices=self.native.msa128_expand_block_indexes(selected.contiguous(),True,meta.q_offsets,meta.seq_lens,
             meta.page_table,None,None,meta.cu_q,None,None,0)
-        if _prefill_enabled("q_fp8"):
+        if _prefill_enabled():
             from triton_tmp_dir.minimax31_prefill_triton import quant_q
             q8=quant_q(q, q_scale)
 
@@ -236,21 +236,19 @@ def _get_adapter(extension_dir):
 
 def _forward_meta(sub,req_start,req_count):
     if _HOST is None:raise RuntimeError('native MSA has no PCP planner metadata')
-    key=(id(sub),req_start,req_count)
-    if _prefill_enabled("metadata"):
-        # Same physical metadata, not merely equal shape. Per-forward reset
-        # prevents reuse after scheduler page-table/length updates.
-        def identity(t):
-            try:
-                version = t._version
-            except RuntimeError:
-                # Inference buffers have no version counter; don't merge fresh
-                # tensor wrappers whose immutable ownership cannot be checked.
-                version = ("inference", id(t))
-            return (t.device, t.data_ptr(), tuple(t.shape), tuple(t.stride()), t.dtype, version)
-        key=(identity(sub.block_table), identity(sub.seq_lens),
-             identity(sub.cu_seqlens_q) if hasattr(sub, "cu_seqlens_q") else None,
-             req_start, req_count)
+    def identity(t):
+        try:
+            version = t._version
+        except RuntimeError:
+            # Unversioned inference tensors retain wrapper identity as well.
+            version = ("inference", id(t))
+        return (t.device, t.data_ptr(), tuple(t.shape), tuple(t.stride()), t.dtype, version)
+    physical=(identity(sub.block_table), identity(sub.seq_lens),
+              identity(sub.cu_seqlens_q) if hasattr(sub, "cu_seqlens_q") else None,
+              req_start, req_count)
+    # Stock keeps per-wrapper reuse; physical identity also protects it against
+    # wrapper id recycling without retaining unrelated wrapper-owned tensors.
+    key=physical if _prefill_enabled() else (id(sub), physical)
 
     if key in _META:return _META[key]
     lens,starts,_=_HOST
@@ -265,7 +263,7 @@ def _forward_meta(sub,req_start,req_count):
     if hasattr(sub,'cu_seqlens_q'):
         torch._assert_async((meta.cu_q==sub.cu_seqlens_q).all(),'native MSA planner cu_seqlens mismatch')
     _META[key]=meta
-    _META_SOURCES[key]=(sub, sub.block_table, sub.seq_lens,
+    _META_SOURCES[key]=(sub.block_table, sub.seq_lens,
                         getattr(sub, "cu_seqlens_q", None))
     return meta
 

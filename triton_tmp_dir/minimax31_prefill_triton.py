@@ -6,9 +6,8 @@ import triton
 import triton.language as tl
 
 
-@triton.jit
-def _local_pages(S, End, SH: tl.constexpr, SP: tl.constexpr, SQ: tl.constexpr,
-                 P: tl.constexpr, LOCAL: tl.constexpr):
+@triton.jit(do_not_specialize=["SH", "SP", "SQ", "P"])
+def _local_pages(S, End, SH, SP, SQ, P, LOCAL: tl.constexpr):
     q, h = tl.program_id(0), tl.program_id(1)
     end = tl.load(End + q).to(tl.int64)
     # Triton signed division truncates toward zero; k_end=0 has no local page.
@@ -30,8 +29,8 @@ def force_local_pages(score, k_end, local_blocks):
                      score.shape[1], local_blocks, num_warps=1)
 
 
-@triton.jit
-def _quant_q(X, Scale, Out, N: tl.constexpr, B: tl.constexpr):
+@triton.jit(do_not_specialize=["N"])
+def _quant_q(X, Scale, Out, N, B: tl.constexpr):
     i = tl.program_id(0) * B + tl.arange(0, B)
     x = tl.load(X + i, i < N, other=0).to(tl.float32)
     y = tl.div_rn(x, tl.load(Scale))
