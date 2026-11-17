@@ -1,5 +1,7 @@
 """Private delivery and real native-architecture refusal contracts."""
 import base64
+import ast
+import builtins
 import hashlib
 import importlib.util
 import io
@@ -102,6 +104,30 @@ class CandidateTests(unittest.TestCase):
             self.assertTrue(all(url.startswith(C.PACKAGE_ROOT) for url, _, _ in calls))
             self.assertNotIn(self.env['SOURCEFIND_PACKAGE_TOKEN'], json.dumps(report))
 
+    def test_builder_preparation_uses_only_host_stdlib_without_runtime_metadata(self):
+        # The image builder may use an OS unsupported by setup-python. Its
+        # preparation path needs neither Python 3.12 syntax nor runtime imports.
+        source = (ROOT / '.github/scripts/hcu_ci/v033_candidate_image.py').read_text()
+        ast.parse(source, feature_version=(3, 6))
+        original_import = builtins.__import__
+        def host_import(name, globals=None, locals=None, fromlist=(), level=0):
+            if name == 'importlib.metadata' or (name == 'importlib' and 'metadata' in fromlist):
+                raise ImportError('metadata belongs to the installed-runtime inspector')
+            return original_import(name, globals, locals, fromlist, level)
+        host = importlib.util.module_from_spec(SPEC)
+        data = wheel_bytes()
+        digest = hashlib.sha256(data).hexdigest()
+        def fetch(url, token, destination, maximum):
+            destination.write_bytes(json.dumps(dict(self.manifest, wheel_sha256=digest)).encode()
+                if url.endswith('candidate-manifest.json') else data)
+        with patch.object(builtins, '__import__', side_effect=host_import):
+            SPEC.loader.exec_module(host)
+            with tempfile.TemporaryDirectory() as directory:
+                report = host.prepare(Path(directory) / 'context', dict(self.env, WHEEL_SHA256=digest), fetch)
+                self.assertEqual(report['record_entries'], 6)
+            with self.assertRaises(ImportError):
+                host.inspect_image()
+
     def test_private_download_never_follows_redirects(self):
         request = Request(C.PACKAGE_ROOT + 'version/file')
         self.assertIsNone(C.NoRedirect().redirect_request(request, None, 302, 'Found', {}, 'https://foreign.invalid'))
@@ -128,7 +154,7 @@ class CandidateTests(unittest.TestCase):
 
     def test_publisher_has_no_pr_entry_public_wheel_or_runtime_variable_write(self):
         source = (ROOT / '.github/workflows/hcu-ci-image-v033.yml').read_text()
-        self.assertIn("if: github.ref == 'refs/heads/v0.33.0'", source)
+        self.assertIn("if: github.event_name == 'workflow_dispatch' && github.ref == 'refs/heads/v0.33.0'", source)
         self.assertIn('ref: ${{ github.sha }}', source)
         self.assertIn('persist-credentials: false', source)
         self.assertIn('docker build --network=none', source)
@@ -140,6 +166,18 @@ class CandidateTests(unittest.TestCase):
         dockerfile = (ROOT / 'docker/Dockerfile.v033-ci-candidate').read_text()
         self.assertIn('--no-index --no-deps', dockerfile)
         self.assertNotIn('SOURCEFIND_PACKAGE_TOKEN', dockerfile)
+
+    def test_first_dispatch_has_a_secret_free_release_registration_entry(self):
+        from test_v033_ci_image_policy import job_block
+        source = (ROOT / '.github/workflows/hcu-ci-image-v033.yml').read_text()
+        events = source.split('permissions:\n', 1)[0]
+        self.assertIn('branches: [v0.33.0]', events)
+        self.assertIn("- '.github/workflows/hcu-ci-image-v033.yml'", events)
+        registration = job_block(source, 'register-manual-entry')
+        self.assertIn("if: github.event_name == 'push'", registration)
+        self.assertIn('runs-on: ubuntu-latest', registration)
+        for forbidden in ['secrets.', 'checkout@', 'docker', '/dev/', 'SOURCEFIND']:
+            self.assertNotIn(forbidden, registration)
 
 
 if __name__ == '__main__':
