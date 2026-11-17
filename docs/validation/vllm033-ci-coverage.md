@@ -23,8 +23,10 @@ fail selection rather than silently using the built-in map.
 PR hardware execution reuses the existing author/`ready-hcu` authorization
 helper from the PR's trusted base commit on a hosted CPU runner. A trusted
 author is authorized automatically; other authors need `ready-hcu` applied
-by a trusted actor. Label additions/removals trigger a new check. CPU source
-contracts run independently. Release pushes/manual runs must target
+by a trusted actor. Only the `labeled` event that adds `ready-hcu` authorizes,
+and it approves the exact head snapshot carried by that run: a later push
+leaves hardware locked until a trusted actor removes and re-applies the label.
+CPU source contracts run independently. Release pushes/manual runs must target
 `refs/heads/v0.33.0`. Image resolution and the self-hosted device job depend
 on authorization. The aggregate gate rejects a selected but unauthorized,
 skipped, failed or cancelled stage, so a skipped hardware job is not a pass.
