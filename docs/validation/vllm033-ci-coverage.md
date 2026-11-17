@@ -101,17 +101,18 @@ explicit overrides, torch.compile and changed-input Graph contracts enabled.
 ## Switch v0.33 device CI between legacy runners and ARC/K8s
 
 The device jobs support the ARC job-container model described in the supplied
-runner migration guide. Configure the repository **Actions variable**
-`HCU_CI_RUNNER_MODE_V033` (Settings → Secrets and variables → Actions → Variables):
+runner migration guide and use **ARC/K8s by default**. To override the default,
+configure the repository **Actions variable** `HCU_CI_RUNNER_MODE_V033`
+(Settings → Secrets and variables → Actions → Variables):
 
 | Value | `v033-device-gfx936` | `v033-device-gfx938` | Container resources |
 | --- | --- | --- | --- |
-| unset or `legacy` | `[self-hosted, ci, bw1000]` | `[self-hosted, ci, bw1100]` | Existing host devices, read-only `/opt/hyhal`, 32GiB shm |
-| `k8s` | `hygon-bw1000-1card` | `hygon-bw1100-1card` | Supplied by the ARC pool; no custom volumes or Docker options |
+| `legacy` | `[self-hosted, ci, bw1000]` | `[self-hosted, ci, bw1100]` | Existing host devices, read-only `/opt/hyhal`, 32GiB shm |
+| unset, empty or `k8s` | `hygon-bw1000-1card` | `hygon-bw1100-1card` | Supplied by the ARC pool; no custom volumes or Docker options |
 
-Only those two values are accepted. A typo fails image/runner resolution before
-publishing any outputs; it never silently falls back or selects an arbitrary
-runner. The mode and both container specifications are resolved together, so
+Explicit non-empty values must be `legacy` or `k8s`. A typo fails image/runner
+resolution before publishing any outputs; it never silently falls back or
+selects an arbitrary runner. The mode and both container specifications are resolved together, so
 changing labels cannot accidentally retain legacy host-device options.
 
 Keep the prepared, digest-pinned `HCU_CI_IMAGE_V033` and approved `HARBOR_SITE`
@@ -125,14 +126,16 @@ resource limits; the repository does not configure the cluster or mount it.
 `HCU_CI_IN_K8S=1` can be inspected in the job environment for diagnosis, but it
 cannot choose `runs-on`: scheduling happens before steps execute.
 
-Roll out only after the cluster owner confirms both single-card pools (including
-the newly introduced BW1000 pool), prepared image access and the required DTK
-runtime are ready. During review, enabling the variable affects only workflow
-revisions that implement this switch; older workflow revisions continue their
-legacy path. Compare the two backends with the **same image digest and test
-tiers**, then retain `k8s` when device results agree. Roll back by setting
-`legacy` or removing the variable; no workflow edit is needed. This PR only adds
-support and does not change repository variables or branch protection itself.
+Before merging or running this workflow revision, the cluster owner must confirm
+both single-card pools (including the newly introduced BW1000 pool), prepared
+image access and the required DTK runtime are ready. Revisions containing this
+default use ARC/K8s without setting a variable; older revisions retain their own
+defaults. An existing explicit `legacy` value still selects the old runners.
+Compare the two backends with the **same image digest and test tiers**. Roll back
+by explicitly setting `HCU_CI_RUNNER_MODE_V033=legacy`; no workflow edit is needed.
+Removing or emptying the variable restores **K8s**, not legacy. This change only
+updates the workflow default; it does not modify repository variables, cluster
+resources or branch protection itself.
 
 Both modes retain job IDs/check names, per-job 45-minute timeouts, concurrency
 cancellation, artifact names, source/portable/device suites and the existing
@@ -145,8 +148,8 @@ are intentionally not migrated here. The already-ARC wheel publishing workflow
 is unchanged; this switch covers the v0.33 device CI jobs only.
 
 Regression tests execute the actual image/runner resolver script with fake
-registry names and digests, checking both modes, invalid inputs, expression
-wiring and credential isolation. These are CPU configuration contracts, not
+registry names and digests, checking unset/empty/explicit K8s, explicit legacy,
+invalid inputs, expression wiring and credential isolation. These are CPU configuration contracts, not
 proof of ARC scheduling, registry pulls, device isolation, HCU numerical
 correctness or model quality; those require a real authorized run.
 

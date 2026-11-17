@@ -34,8 +34,11 @@ class ImagePolicyTests(unittest.TestCase):
             output = Path(directory) / 'outputs'
             environment = dict(os.environ, HCU_CI_IMAGE_V033=image,
                                HARBOR_SITE=self.harbor if harbor is None else harbor,
-                               GITHUB_OUTPUT=str(output),
-                               HCU_CI_RUNNER_MODE_V033=runner_mode)
+                               GITHUB_OUTPUT=str(output))
+            if runner_mode is None:
+                environment.pop('HCU_CI_RUNNER_MODE_V033', None)
+            else:
+                environment['HCU_CI_RUNNER_MODE_V033'] = runner_mode
             result = subprocess.run(
                 ['bash', '--noprofile', '--norc', '-e', '-c', self.script],
                 env=environment, capture_output=True, text=True, timeout=10)
@@ -64,7 +67,7 @@ class ImagePolicyTests(unittest.TestCase):
                   good + '@' + self.digest,
                   ' ' + good, good + ' ', good + '\nimage=foreign']
         for image in images:
-            for mode in ['legacy', 'k8s']:
+            for mode in [None, '', 'legacy', 'k8s']:
                 with self.subTest(image=image, mode=mode):
                     code, output = self.guard(image, runner_mode=mode)
                     self.assertNotEqual(code, 0)
@@ -112,24 +115,24 @@ class ImagePolicyTests(unittest.TestCase):
         self.assertEqual(outputs['image'], image)
         return outputs
 
-    def test_unset_and_explicit_legacy_keep_existing_host_contract(self):
-        for mode in ['', 'legacy']:
+    def test_explicit_legacy_keeps_existing_host_contract(self):
+        outputs = self.resolved('legacy')
+        self.assertEqual(outputs['runner_mode'], 'legacy')
+        for arch, label in [('gfx936', 'bw1000'), ('gfx938', 'bw1100')]:
+            self.assertEqual(json.loads(outputs[arch + '_runner']),
+                             ['self-hosted', 'ci', label])
+        self.assertEqual(outputs['container_options'],
+                         '--device=/dev/kfd --device=/dev/dri --group-add video --shm-size=32g --volume=/opt/hyhal:/opt/hyhal:ro')
+
+    def test_unset_empty_and_explicit_k8s_emit_pools_without_host_configuration(self):
+        for mode in [None, '', 'k8s']:
             with self.subTest(mode=mode):
                 outputs = self.resolved(mode)
-                self.assertEqual(outputs['runner_mode'], 'legacy')
-                for arch, label in [('gfx936', 'bw1000'), ('gfx938', 'bw1100')]:
-                    self.assertEqual(json.loads(outputs[arch + '_runner']),
-                                     ['self-hosted', 'ci', label])
-                self.assertEqual(outputs['container_options'],
-                                 '--device=/dev/kfd --device=/dev/dri --group-add video --shm-size=32g --volume=/opt/hyhal:/opt/hyhal:ro')
-
-    def test_k8s_emits_single_pool_names_without_host_configuration(self):
-        outputs = self.resolved('k8s')
-        self.assertEqual(outputs['runner_mode'], 'k8s')
-        self.assertEqual(json.loads(outputs['gfx936_runner']), 'hygon-bw1000-1card')
-        self.assertEqual(json.loads(outputs['gfx938_runner']), 'hygon-bw1100-1card')
-        self.assertEqual(outputs['container_options'], '')
-        self.assertNotIn('self-hosted', outputs['gfx936_runner'] + outputs['gfx938_runner'])
+                self.assertEqual(outputs['runner_mode'], 'k8s')
+                self.assertEqual(json.loads(outputs['gfx936_runner']), 'hygon-bw1000-1card')
+                self.assertEqual(json.loads(outputs['gfx938_runner']), 'hygon-bw1100-1card')
+                self.assertEqual(outputs['container_options'], '')
+                self.assertNotIn('self-hosted', outputs['gfx936_runner'] + outputs['gfx938_runner'])
 
     def test_invalid_runner_modes_fail_without_publishing_partial_outputs(self):
         image = self.repository + '@' + self.digest
