@@ -479,3 +479,9 @@ Interpret shutdown logs against the selected Core source: `mode=abort` may
 mean the default zero-timeout request policy rather than an OS abort. Record
 actual exit codes, process release and native leak reports independently;
 successful exits do not resolve nanobind leaks.
+For a suspected frozen-heap leak, compare the public `freeze_gc_heap()` helper
+and natural interpreter exit in hidden-device base/candidate processes before
+running a model. Keep serving-time freezing intact. Verify shutdown duration,
+child-process release and `force killing remaining processes` logs: a parent
+exit of 0 cannot establish natural worker cleanup. An import-only fix does not
+qualify serving or waive the exit-latency tradeoff of final cyclic collection.

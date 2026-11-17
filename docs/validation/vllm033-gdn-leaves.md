@@ -257,3 +257,39 @@ exit. This identifies a lifetime interaction, not a validated production fix.
 Core's API lifespan and ROCm exit-freeze paths remain separate owner findings.
 The PR stays Draft: raw per-task differences, normal teardown, gfx936,
 provider publication, performance and current-head remote CI remain open.
+
+### Independent Core exit-lifecycle candidate
+
+Core [!92](https://developer.sourcefind.cn/codes/OpenDAS/vllm/-/merge_requests/92)
+adds an exit-time unfreeze callback to the public GC helper. It is a separate
+Draft candidate, based on Core98a09850 with unchanged native libraries and the
+same frozen Adapter20d18cc6 / Plugin3836b8b3 / source-built providers.
+
+With fresh independent compile caches, the same original checkpoint, TP1,
+MTP3, default Graph/prefix/chunked configuration and HumanEval0–31 requests:
+
+| Provider | Original raw/norm | GC candidate raw/norm | Identical choices |
+| --- | --- | --- | --- |
+| stock | 30/32,32/32 | 30/32,32/32 | 32/32 |
+| AITER | 30/32,32/32 | 32/32,32/32 | 20/32 |
+| BoltOPs | 32/32,32/32 | 32/32,32/32 | 22/32 |
+
+No arm loses a prior raw or normalized pass; provider output differences remain
+recorded and do not establish a model-quality improvement from GC. All candidate
+arms finish without truncation, retain actual MTP acceptance and Graph launches,
+and pass arithmetic13/13 and prefix3/3 with hits. Model seals, package RECORDs,
+exit0, released owned identities and ports are verified. None reports nanobind,
+weakref errors or forced worker cleanup. Public-helper import controls and the
+existing real-server shutdown regression show original failures and candidate
+passes.
+
+Final cyclic collection has a cost: EngineCore-manager log intervals are about
+9/12/10 seconds versus6/8/6 in the original profiled runs, within its unchanged
+15-second grace. Whole-frontend shutdown is14.94/17.70/15.59 seconds. These are
+single-run observations; exit-latency acceptance and broader platform review
+remain open in Core!92. The candidate does not qualify this PR's latest merged
+source, gfx936, performance or remote CI, and is not yet an available merged
+dependency. The earlier frozen-stack leak reports remain valid historical
+results.
+
+Receipt: `evidence/qwen35-gdn-mtp3-gc-exit-tp1-closure-20261117-r2.json`.
