@@ -19,6 +19,7 @@ from vllm.distributed import (
     get_dp_group,
     get_ep_group,
     get_pcp_group,
+    get_tensor_model_parallel_rank,
     get_tensor_model_parallel_world_size,
     tensor_model_parallel_all_reduce,
 )
@@ -1283,6 +1284,9 @@ class MoERunner(MoERunnerInterface):
         The padding bitmap belongs to the local forward context, not to the
         gathered MoE batch. Carry it through the same DP/EP and fallback PCP
         collectives, then restore it before the next layer or on failure.
+        Core's SP bitmap is TP-global. Already-local producers may declare
+        ``context.additional_kwargs["hcu_moe_padding_is_local"] = True``;
+        this is required when a single-row mask has an ambiguous shape.
         """
         needs_dispatch = self.do_naive_dispatch_combine or (
             self.moe_config.pcp_size > 1
@@ -1297,9 +1301,36 @@ class MoERunner(MoERunnerInterface):
             if input_ids is not None:
                 extra_tensors.append(input_ids[:num_local_tokens])
             if local_padding is not None:
+                padding = local_padding
+                if self.moe_config.is_sequence_parallel:
+                    # SP shards activations using the original TP group. MoE
+                    # TP may instead be flattened over DP or collapsed by EP.
+                    tp_size = get_tensor_model_parallel_world_size()
+                    if tp_size > 1:
+                        # Core provides a TP-global bitmap. Exact-sized,
+                        # multirow local masks are unambiguous; a one-row mask
+                        # is not, so default to Core's global contract. Local
+                        # producers can declare their domain for any shape.
+                        is_local = getattr(context, "additional_kwargs", {}).get(
+                            "hcu_moe_padding_is_local",
+                            padding.shape[0] == num_local_tokens
+                            and num_local_tokens > 1,
+                        )
+                        if not is_local:
+                            start = get_tensor_model_parallel_rank() * num_local_tokens
+                            padding = padding[start : start + num_local_tokens]
+                padding = padding[:num_local_tokens]
+                if padding.shape[0] < num_local_tokens:
+                    # sequence_parallel_chunk can append activation rows when
+                    # the global token count is not divisible by TP. Those
+                    # synthetic rows must be skipped, not treated as valid.
+                    padding = F.pad(
+                        padding, (0, num_local_tokens - padding.shape[0]), value=True
+                    )
                 # PyNccl does not accept torch.bool. Reinterpret the one-byte
-                # bitmap for transport without allocating or synchronizing.
-                extra_tensors.append(local_padding[:num_local_tokens].view(torch.uint8))
+                # bitmap for transport without allocating or synchronizing
+                # when no SP padding was needed.
+                extra_tensors.append(padding.view(torch.uint8))
         if extra_tensors:
             hidden_states, router_logits, extra_tensors = self._maybe_dispatch(
                 hidden_states, router_logits, extra_tensors=extra_tensors
