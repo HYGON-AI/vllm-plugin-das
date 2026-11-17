@@ -1,4 +1,5 @@
 """Experimental one-process TP16 meta construction; no GPU allocations or loading."""
+import os
 import json, traceback
 from pathlib import Path
 from types import SimpleNamespace
@@ -12,7 +13,7 @@ from vllm.engine.arg_utils import EngineArgs
 from vllm.config import KernelConfig, set_current_vllm_config
 from vllm.utils.torch_utils import set_default_torch_dtype
 import vllm.distributed.parallel_state as ps
-root=Path('/public4/share/wufan/model/Kimi-K3.1-Pro-CHANNEL-INT4-w4a8')
+root=Path(os.environ["KIMI_K31_CHECKPOINT"])
 out={'scope':'single-process fake TP16 rank 0, 93-layer outer meta construction using explicit public registries; no weights or real distributed group','ok':False}
 try:
     register_quantization_config('slimquant_w4a8')(Kimi31SlimQuantLoadOnlyConfig)

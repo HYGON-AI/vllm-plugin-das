@@ -60,3 +60,5 @@ backend defaults, READY generations and cached MSA artifact drift. A source gate
 rejects private MiniMax environment reads and capture hooks. Real EP8 default
 path evidence is recorded in the MR; it is component numerical/lifecycle
 validation, not a complete checkpoint accuracy result.
+
+Long shared prefill overlap is attempted only for the audited HIPC/hipBLASLt MLP with an enabled safe stream. Retained Bolt/Triton configurations, disabled streams and other unsupported overlap conditions use the stock shared lifecycle; an occupied output slot remains an error. Failed static forwards release the host frame but require a new engine, rather than reusing uncertain GPU state.

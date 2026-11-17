@@ -23,7 +23,7 @@
 
 ## 相同工作量的性能结果
 
-节点 `xiesl@10.16.1.20`，BW1100，单节点 EP8。每个 rank 4 次 warmup，15 次无 profiler 测量；每次先取八个 rank wall time 的最大值，再对 15 次取中位数。单位 ms。权重一次性 pack、fixture 加载/哈希、数值检查和 profiler 均不计入这些时延。
+环境：BW1100，单节点 EP8。每个 rank 4 次 warmup，15 次无 profiler 测量；每次先取八个 rank wall time 的最大值，再对 15 次取中位数。单位 ms。权重一次性 pack、fixture 加载/哈希、数值检查和 profiler 均不计入这些时延。
 
 | 每 rank 输入行数 | 路由分布 | 旧路径24 | 新路径24 | 新路径64 | SGLang64 | 相对旧路径时延降低 | 相对SGLang时延变化 |
 |---:|---|---:|---:|---:|---:|---:|---:|
@@ -110,7 +110,7 @@ python -m torch.distributed.run --standalone --nproc-per-node=8   benchmarks/ker
 
 ## 交付与原始产物
 
-远程根目录：`/public/home/xiesl/inference/verify_torch213_image/task_dir/support_minmax_31_pcp8_ep8_perf/moe_module_alignment_20261115/`。
+归档制品目录：`moe_module_alignment_20261115/`（独立实验归档）。
 
 - `module_alignment_summary.json`：全部时延数组、48组数值结果、输入/计数身份及32份 profile 摘要。
 - `test_module.py`、`audit_results.py`：fixture、oracle、guard、八卡基准和审计脚本；对应代码也放入 plugin 的 `benchmarks/kernels/`。

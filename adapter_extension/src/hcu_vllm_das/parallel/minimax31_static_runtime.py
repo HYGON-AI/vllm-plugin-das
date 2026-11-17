@@ -1,11 +1,13 @@
 # SPDX-License-Identifier: Apache-2.0
 """Content-derived request identity and PCP global positions for static routing."""
 import hashlib,json,threading
+from functools import wraps
 from pathlib import Path
 import numpy as np
 import torch
 from .minimax31_static_contract import canonical,from_current,request_base
 _MANIFEST_PATH=None
+_FRAME_POISONED=False
 _REQUESTS={};_DUMMY={};_MANIFEST_KEYS=None;_LAYOUT=None;_HOOKS=None;_PLACEMENT=None;_FRAME_LOCK=threading.Lock();_LAST_LAYER=None
 
 def content_key(token_ids):
@@ -76,22 +78,60 @@ def _set_forward_layout(batch):
         key,base=entry;bases[offset:offset+n]=base;segments.append((offset,offset+n,key,int(start)));keys.append(key);offset+=n
     _LAYOUT={'rows':rows,'padded':padded,'base':torch.from_numpy(bases).to(device=batch.positions.device),'positions':batch.positions,'segments':segments,'is_dummy':all(req in _DUMMY for req in reqs),'thread':threading.get_ident(),'next_layer':3,'completed':False}
 
+def require_frame_healthy():
+    if _FRAME_POISONED:
+        raise RuntimeError("static model forward failed; restart the engine")
+
+
+def abort_model_forward():
+    """Release only the caller's host frame, without admitting damaged GPU state."""
+    global _LAYOUT, _FRAME_POISONED
+    frame = _LAYOUT
+    if frame is None or frame["thread"] != threading.get_ident():
+        return False
+    _FRAME_POISONED = True
+    _LAYOUT = None
+    if not frame["completed"]:
+        _FRAME_LOCK.release()
+    return True
+
+
+def guard_model_forward(forward):
+    @wraps(forward)
+    def guarded(*args, **kwargs):
+        require_frame_healthy()
+        try:
+            return forward(*args, **kwargs)
+        except BaseException:
+            abort_model_forward()
+            raise
+    return guarded
+
+
 def set_forward_layout(batch):
+    global _LAYOUT, _FRAME_POISONED
+    require_frame_healthy()
     if not _FRAME_LOCK.acquire(blocking=False):raise RuntimeError("static routing supports only one in-flight model forward")
     try:_set_forward_layout(batch)
     except BaseException:
+        _FRAME_POISONED = True
+        _LAYOUT = None
         _FRAME_LOCK.release()
         raise
 
 def complete_layer(layer):
+    require_frame_healthy()
     if (_LAYOUT is None or _LAYOUT["completed"] or _LAYOUT["thread"]!=threading.get_ident()
-            or layer!=_LAYOUT["next_layer"]):raise RuntimeError("static routed layer/frame order changed")
+            or layer!=_LAYOUT["next_layer"]):
+        abort_model_forward()
+        raise RuntimeError("static routed layer/frame order changed")
     _LAYOUT["next_layer"]+=1
     if layer==_LAST_LAYER:
         _LAYOUT["completed"]=True
         _FRAME_LOCK.release()
 
 def layout(rows):
+    require_frame_healthy()
     if _LAYOUT is None or rows!=_LAYOUT['padded']:raise RuntimeError('static selector missing matching PCP token layout')
     if _LAYOUT['completed'] or _LAYOUT['thread']!=threading.get_ident():raise RuntimeError('static frame is completed or belongs to another in-flight caller')
     return _LAYOUT

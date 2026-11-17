@@ -2,7 +2,7 @@
 
 ## 目标与环境
 
-- 模型：`/public4/share/wufan/model/Kimi-K3.1-Pro-CHANNEL-INT4-w4a8`；容器：`xiesl_verify_torch213`；nmz22 为 `10.16.1.22`，nmz20 为 `10.16.1.20`。
+- 模型：Kimi-K3.1-Pro Channel INT4 W4A8；环境：双节点 TP16。实际模型目录、节点地址、Python 环境和网卡由执行者提供。
 - 参考 `task_dir/support_kimi31_pro/full93/gpu_rdma_candidate` 的双节点 TP16、fastsafetensors GPU RDMA preload 方案。vLLM 版本 `9d6ac73f3d`，adapter 分支 `adapter-kimi31-preload-opt`。
 - 专家中间维度 3072，TP16 每 rank 192，**不做 padding**。实验配置将 `min_moe_intermediate_per_partition` 设为 192，避开原构造器默认的 256。
 
@@ -41,3 +41,21 @@ The optional activation candidate requires the companion Adapter module
 `require_healthy()`. The MiniMax squash Adapter branch does not ship that bridge;
 activation there is explicitly refused before registration. A registry unit test
 with a bridge double does not establish real preload support on that branch.
+
+## 可移植的诊断入口
+
+源 checkpoint 和输出目录必须由执行者指定，不提供机器专属默认路径：
+
+```bash
+python experiments/kimi31_slimquant_preload/plan_small_fixture.py \
+  --source-model "$MODEL" --output "$RUN_DIR/fixture-plan.json"
+python experiments/kimi31_slimquant_preload/materialize_small_fixture.py \
+  --source-model "$MODEL" --output-dir "$RUN_DIR/fixture"
+```
+
+其余历史探针读取已有的 `KIMI_K31_CHECKPOINT` 输入，未设置时明确失败。
+`run_extension_probe_node.sh OUTPUT_JSON [PYTHON]` 直接运行仓内探针。
+`run_preload_fixture.sh NODE_RANK MASTER_ADDR MODEL_DIR ADAPTER_ROOT PYTHON SOCKET_DIR`
+接受 0/1 节点 rank、地址、模型、配套 Adapter、解释器和 socket 目录；NIC/HCA、
+RDMA 库和其他集群设置由调用环境提供，不覆盖为某台机器的值。以上诊断不代表
+完整模型精度、完整双节点 preload 或性能验收通过。

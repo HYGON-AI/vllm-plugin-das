@@ -33,7 +33,7 @@ The original SGLang baseline is historical nmz18 data; this rerun is nmz20, so i
 
 ## Artifacts
 
-Task directory: `/public/home/xiesl/inference/verify_torch213_image/task_dir/support_minmax_31_pcp8_ep8_perf/sglang_full_moe_alignment_20261115/`.
+Artifact bundle: `sglang_full_moe_alignment_20261115/` (archived separately).
 
 `optimized_results/` retains raw requests/native metrics; `runtime_evidence.json` independently reconciles all 53 cases; `readiness_proof.json` and `aligned_runtime_state.json` prove the loaded path and ownership; `traces/` is a separate four-request diagnostic. The updated two-sheet workbook preserves source reference data, all formulas, styles, table/conditional-format definitions and freeze panes.
 

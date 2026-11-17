@@ -1,4 +1,5 @@
 """Check real checkpoint expert TP16 slicing; no vLLM or GPU allocation."""
+import os
 import hashlib
 import json
 from pathlib import Path
@@ -6,7 +7,7 @@ import torch
 from safetensors import safe_open
 from hcu_vllm_das.quantization.slimquant_shard import shard_expert
 
-root=Path('/public4/share/wufan/model/Kimi-K3.1-Pro-CHANNEL-INT4-w4a8')
+root=Path(os.environ["KIMI_K31_CHECKPOINT"])
 prefix='language_model.model.layers.1.block_sparse_moe.experts.0.'
 keys=[prefix+part+suffix for part in ('w1','w2','w3') for suffix in ('.weight','.weight_scale')]
 index=json.loads((root/'model.safetensors.index.json').read_text())['weight_map']

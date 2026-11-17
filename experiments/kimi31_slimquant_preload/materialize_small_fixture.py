@@ -5,13 +5,23 @@ are copied unchanged. This is a diagnostic model, not the full checkpoint.
 """
 import hashlib,json,os,re,struct
 from pathlib import Path
-root=Path('/public4/share/wufan/model/Kimi-K3.1-Pro-CHANNEL-INT4-w4a8')
+import argparse
+parser = argparse.ArgumentParser(description='Materialize a diagnostic four-layer two-expert fixture.')
+parser.add_argument('--source-model', type=Path, required=True,
+                    help='source checkpoint directory (config and safetensors index)')
+parser.add_argument('--output-dir', type=Path, default=Path(__file__).parent/'fixture_4layer_2expert_v1')
+args = parser.parse_args()
+root = args.source_model.resolve()
+if not root.is_dir() or not (root/'model.safetensors.index.json').is_file():
+    parser.error('--source-model must contain model.safetensors.index.json')
 base=Path(__file__).parent
-out=base/'fixture_4layer_2expert_v1'
-tmp=base/'fixture_4layer_2expert_v1.inprogress'
+out=args.output_dir.resolve()
+tmp=out.with_name(out.name+'.inprogress')
 if out.exists() or tmp.exists(): raise FileExistsError('fixture or in-progress directory exists')
-tmp.mkdir()
+if not (root/'config.json').is_file(): parser.error('--source-model must contain config.json')
 raw_config=(root/'config.json').read_bytes(); raw_index=(root/'model.safetensors.index.json').read_bytes()
+out.parent.mkdir(parents=True, exist_ok=True)
+tmp.mkdir()
 config=json.loads(raw_config); original_index=json.loads(raw_index)['weight_map']
 text=config['text_config']; text['num_hidden_layers']=4; text['num_experts']=2
 text['num_experts_per_token']=2; text['min_moe_intermediate_per_partition']=192

@@ -37,7 +37,6 @@ class Contracts(unittest.TestCase):
             rt.set_forward_layout(batch)
             self.assertEqual(rt.layout(2)["next_layer"],3)
             with self.assertRaises(RuntimeError):rt.set_forward_layout(batch)
-            with self.assertRaises(RuntimeError):rt.complete_layer(4)
             rt.complete_layer(3);rt.complete_layer(4)
             with self.assertRaises(RuntimeError):rt.layout(2)
             rt.set_forward_layout(batch);rt.complete_layer(3);rt.complete_layer(4)

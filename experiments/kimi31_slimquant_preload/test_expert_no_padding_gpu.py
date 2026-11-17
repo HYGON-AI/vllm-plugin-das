@@ -5,7 +5,7 @@ import torch
 from boltops.kimi_k31 import prepare_w4a8_experts, w8a8_linear
 from boltops.fused_moe import fused_experts
 
-MODEL = os.environ.get("KIMI_K31_CHECKPOINT", "/public4/share/wufan/model/Kimi-K3.1-Pro-CHANNEL-INT4-w4a8")
+MODEL = os.environ["KIMI_K31_CHECKPOINT"]
 GPU = pytest.mark.skipif(not torch.cuda.is_available(), reason="GPU required")
 
 

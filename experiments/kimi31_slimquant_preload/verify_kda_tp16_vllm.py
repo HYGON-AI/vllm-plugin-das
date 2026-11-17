@@ -1,4 +1,5 @@
 """Real checkpoint KDA TP16 parameter bytes via official vLLM loaders on CPU."""
+import os
 import json
 from pathlib import Path
 import torch
@@ -7,7 +8,7 @@ from safetensors import safe_open
 from vllm.model_executor.layers.linear import ColumnParallelLinear
 from vllm.models.kimi_k3.nvidia.kda import _KimiGDNMergedColumnParallelLinear
 from hcu_vllm_das.quantization.mixed_kda import MixedKDAProjection
-root=Path('/public4/share/wufan/model/Kimi-K3.1-Pro-CHANNEL-INT4-w4a8')
+root=Path(os.environ["KIMI_K31_CHECKPOINT"])
 prefix='language_model.model.layers.0.self_attn.'
 branches=('q_proj','k_proj','v_proj','g_proj','f_a_proj','b_proj')
 keys=[prefix+b+'.weight' for b in branches]+[prefix+b+'.weight_scale' for b in branches[:3]]

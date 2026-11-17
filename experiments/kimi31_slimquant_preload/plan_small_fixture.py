@@ -1,7 +1,15 @@
 """Plan a small four-layer/two-expert fixture; metadata only."""
 import collections,json,re,struct
 from pathlib import Path
-root=Path('/public4/share/wufan/model/Kimi-K3.1-Pro-CHANNEL-INT4-w4a8')
+import argparse
+parser = argparse.ArgumentParser(description='Plan a diagnostic fixture from checkpoint metadata.')
+parser.add_argument('--source-model', type=Path, required=True,
+                    help='source checkpoint directory (config and safetensors index)')
+parser.add_argument('--output', type=Path, default=Path(__file__).with_suffix('.json'))
+args = parser.parse_args()
+root = args.source_model.resolve()
+if not root.is_dir() or not (root/'model.safetensors.index.json').is_file():
+    parser.error('--source-model must contain model.safetensors.index.json')
 index=json.loads((root/'model.safetensors.index.json').read_text())['weight_map']
 selected={}
 for name,shard in index.items():
@@ -29,5 +37,5 @@ out={'scope':'fixture metadata plan only; no checkpoint payload read', 'layers':
      'source_shards':len(sizes),'largest_output_shard_bytes':max(sizes.values()),
      'per_shard':[{'shard':k,'bytes':sizes[k],'tensors':counts[k]} for k in sorted(sizes)],
      'transformed':transformed}
-Path(__file__).with_suffix('.json').write_text(json.dumps(out,indent=2)+'\n')
+args.output.write_text(json.dumps(out,indent=2)+'\n')
 print(json.dumps(out,indent=2))

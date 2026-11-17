@@ -172,7 +172,7 @@ class MiniMax31DeepEpRunner(MiniMax31PcpEpMoERunner):
         if (shared is None or shared.enable_dbo or shared._stream is None
                 or shared._disable_shared_experts_overlap
                 or self.routed_experts.quant_method.quant_config.routed_backend != "deepgemm_hipc_v1"):
-            raise RuntimeError("shared overlap requires single-inflight PCP/EP HIPC and an available safe stream")
+            return False
         # Only the audited MiniMax TP1 shared MLP is allowed on the side
         # stream: RowParallelLinear is configured without a reduction, so it
         # cannot issue a collective that races DeepEP's main-stream sequence.
@@ -186,7 +186,7 @@ class MiniMax31DeepEpRunner(MiniMax31PcpEpMoERunner):
                        != "MiniMax31HipBlasLtInt8Kernel"
                        for proj in (layer.gate_up_proj, layer.down_proj))
                 or shared_input.ndim != 2 or shared_input.dtype != torch.bfloat16):
-            raise RuntimeError("shared overlap requires audited BF16 MiniMax TP1 hipBLASLt MLP")
+            return False
         if shared._output[0] is not None:
             raise RuntimeError("shared output slot is already in use")
         main = torch.cuda.current_stream(shared_input.device)
@@ -219,7 +219,7 @@ class MiniMax31DeepEpRunner(MiniMax31PcpEpMoERunner):
                 and shared_experts_input is not None
                 and shared_experts_input.shape[0] >= 2048):
             shared_overlapping = self._launch_long_shared(shared_experts_input)
-        else:
+        if not shared_overlapping:
             if self._shared_experts is not None:
                 shared_overlapping = self._shared_experts.maybe_forward_async(shared_experts_input)
             self._maybe_apply_shared_experts(shared_experts_input, SharedExpertsOrder.NO_OVERLAP)

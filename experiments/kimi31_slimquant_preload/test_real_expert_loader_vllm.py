@@ -1,5 +1,6 @@
 # SPDX-License-Identifier: Apache-2.0
 """Verify target packed expert layout with actual upstream loader methods."""
+import os
 from types import SimpleNamespace
 import torch
 from torch import nn
@@ -11,7 +12,7 @@ def test_real_expert_weight_loader_tp16_no_padding():
     import json
     from pathlib import Path
     from safetensors import safe_open
-    root=Path("/public4/share/wufan/model/Kimi-K3.1-Pro-CHANNEL-INT4-w4a8")
+    root=Path(os.environ["KIMI_K31_CHECKPOINT"])
     prefix="language_model.model.layers.1.block_sparse_moe.experts.0."
     index=json.loads((root/"model.safetensors.index.json").read_text())["weight_map"]
     keys=[prefix+part+suffix for part in ("w1","w2","w3") for suffix in (".weight",".weight_scale")]

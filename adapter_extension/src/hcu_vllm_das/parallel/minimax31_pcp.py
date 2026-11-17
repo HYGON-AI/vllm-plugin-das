@@ -21,6 +21,7 @@ from vllm.models.minimax_m3.amd.model_state import MiniMaxM3ModelState
 from vllm.v1.attention.backends.triton_attn import TritonAttentionBackend
 from vllm.v1.worker.gpu.model_runner import GPUModelRunner
 from vllm.v1.worker.gpu.pcp_manager import PCPManager
+from .minimax31_static_runtime import guard_model_forward
 
 OWNER = "minimax31-pcp-ep"
 ARCH = "MiniMaxM3SparseForConditionalGeneration"
@@ -393,7 +394,12 @@ class MiniMax31PCPModelRunner(GPUModelRunner):
             self.pcp_manager._hcu_native_msa = artifacts(self.vllm_config).msa_extension_dir is not None
             self.pcp_manager._hcu_static = from_model_config(self.vllm_config.model_config) is not None
 
+    @guard_model_forward
+    def execute_model(self, *args, **kwargs):
+        return super().execute_model(*args, **kwargs)
+
     @torch.inference_mode()
+    @guard_model_forward
     def _dummy_run(self, num_tokens, *args, **kwargs):
         if kwargs.get("is_profile", False):
             manager = self.pcp_manager
