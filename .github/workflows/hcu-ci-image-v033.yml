@@ -1,0 +1,122 @@
+name: Publish private Core v0.33 CI candidate
+
+on:
+  workflow_dispatch:
+    inputs:
+      package_version:
+        description: 'Private OpenDAS/vllm generic candidate package version'
+        type: string
+        required: true
+      core_source:
+        description: 'Reviewed complete Core source SHA from candidate manifest'
+        type: string
+        required: true
+      wheel_sha256:
+        description: 'Reviewed complete wheel SHA256 from candidate manifest'
+        type: string
+        required: true
+      base_image:
+        description: 'Prepared runtime digest in HARBOR_SITE/hcu/base_env/vllm'
+        type: string
+        required: true
+
+permissions:
+  contents: read
+
+concurrency:
+  group: hcu-ci-image-v033-${{ github.ref }}
+  cancel-in-progress: false
+
+jobs:
+  publish:
+    if: github.ref == 'refs/heads/v0.33.0'
+    runs-on: [self-hosted, hygon-image-build]
+    timeout-minutes: 60
+    env:
+      PACKAGE_VERSION: ${{ inputs.package_version }}
+      CORE_SOURCE: ${{ inputs.core_source }}
+      WHEEL_SHA256: ${{ inputs.wheel_sha256 }}
+      BASE_IMAGE: ${{ inputs.base_image }}
+      HARBOR_SITE: ${{ vars.HARBOR_SITE }}
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: ${{ github.sha }}
+          persist-credentials: false
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+      - name: Allocate owned temporary context
+        run: |
+          set -euo pipefail
+          root="$RUNNER_TEMP/v033-image-${GITHUB_RUN_ID}-${GITHUB_RUN_ATTEMPT}"
+          test ! -e "$root"
+          mkdir -m 700 "$root"
+          echo "PUBLISH_ROOT=$root" >> "$GITHUB_ENV"
+          echo "DOCKER_CONFIG=$root/docker" >> "$GITHUB_ENV"
+      - name: Validate trusted dispatch and prepare private wheel
+        env:
+          # A short-lived deploy token with read_package_registry only.
+          SOURCEFIND_PACKAGE_TOKEN: ${{ secrets.V033_CORE_PACKAGE_TOKEN }}
+        run: |
+          set -euo pipefail
+          python3 -I -B .github/scripts/hcu_ci/v033_candidate_image.py prepare \
+            --context "$PUBLISH_ROOT/context" > "$PUBLISH_ROOT/preparation.json"
+          cp docker/Dockerfile.v033-ci-candidate "$PUBLISH_ROOT/context/Dockerfile"
+          rm "$PUBLISH_ROOT/context/candidate-manifest.json"
+      - name: Login to approved registry
+        env:
+          HARBOR_USERNAME: ${{ secrets.HARBOR_USERNAME }}
+          HARBOR_PASSWORD: ${{ secrets.HARBOR_PASSWORD }}
+        run: |
+          set -euo pipefail
+          printf '%s' "$HARBOR_PASSWORD" | docker login "$HARBOR_SITE" \
+            --username "$HARBOR_USERNAME" --password-stdin
+      - name: Build and inspect complete candidate
+        run: |
+          set -euo pipefail
+          tag="$HARBOR_SITE/jenkins/model_test_env/vllm:ci-0.33.0-${GITHUB_RUN_ID}-${GITHUB_RUN_ATTEMPT}"
+          echo "CANDIDATE_TAG=$tag" >> "$GITHUB_ENV"
+          docker pull "$BASE_IMAGE"
+          docker build --network=none --build-arg "BASE_IMAGE=$BASE_IMAGE" \
+            --label "org.opendas.vllm.source=$CORE_SOURCE" \
+            --label "org.opendas.vllm.wheel.sha256=$WHEEL_SHA256" \
+            --label 'org.opendas.vllm.validation=unqualified-ci-candidate' \
+            -t "$tag" "$PUBLISH_ROOT/context"
+          docker run --rm --network=none \
+            -e HCU_ADAPTER_HOST=none -e HIP_VISIBLE_DEVICES= \
+            -e ROCR_VISIBLE_DEVICES= -e CUDA_VISIBLE_DEVICES= \
+            -v "$GITHUB_WORKSPACE/.github/scripts/hcu_ci/v033_candidate_image.py:/inspect.py:ro" \
+            --entrypoint python3 "$tag" -I -B /inspect.py inspect \
+            > "$PUBLISH_ROOT/installed-payload.json"
+      - name: Publish unique candidate and record immutable reference
+        run: |
+          set -euo pipefail
+          docker push "$CANDIDATE_TAG"
+          docker image inspect --format '{{json .RepoDigests}}' "$CANDIDATE_TAG" \
+            > "$PUBLISH_ROOT/repo-digests.json"
+          python3 -I -B - <<'PY'
+          import json, os, re
+          from pathlib import Path
+          root = Path(os.environ['PUBLISH_ROOT'])
+          prefix = os.environ['HARBOR_SITE'] + '/jenkins/model_test_env/vllm@sha256:'
+          refs = [r for r in json.loads((root/'repo-digests.json').read_text())
+                  if r.startswith(prefix) and re.fullmatch('[0-9a-f]{64}', r[len(prefix):])]
+          assert len(refs) == 1, 'candidate repository digest missing or ambiguous'
+          receipt = dict(reference=refs[0], preparation=json.loads((root/'preparation.json').read_text()),
+              installed=json.loads((root/'installed-payload.json').read_text()),
+              workflow_sha=os.environ['GITHUB_SHA'], device_qualified=False, model_qualified=False)
+          (root/'publication.json').write_text(json.dumps(receipt, indent=2)+'\n')
+          with open(os.environ['GITHUB_STEP_SUMMARY'], 'a') as f:
+              f.write('Published CI candidate: `'+refs[0]+'`\n\nActual release/device/Graph/model gates remain required.\n')
+          PY
+      - uses: actions/upload-artifact@v4
+        with:
+          name: v033-image-publication
+          path: ${{ env.PUBLISH_ROOT }}/publication.json
+          if-no-files-found: error
+      - name: Remove owned private context and registry login
+        if: always()
+        run: |
+          if [[ -n "${CANDIDATE_TAG:-}" ]]; then docker image rm "$CANDIDATE_TAG" || true; fi
+          if [[ -n "${PUBLISH_ROOT:-}" ]]; then rm -rf -- "$PUBLISH_ROOT"; fi
