@@ -105,6 +105,10 @@ merely to pass discovery. Qualify each admitted operator and consumer separately
 
 ## Validate the changed execution path
 
+For interrupted checkpoint downloads and live-worker inspection, read
+[checkpoint recovery and runtime probes](references/checkpoint-runtime-probes.md).
+Keep the original checkpoint identity and avoid copying live tensor owners.
+
 For v0.33 CI event availability and the trusted exact-head manual PR route, read
 [the release CI guide](../../docs/validation/vllm033-ci-coverage.md#explicit-pr-dispatch-on-v0330).
 Keep dispatch acknowledgement, the actual PR checkout and aggregate acceptance separate.
