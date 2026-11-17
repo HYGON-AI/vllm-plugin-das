@@ -465,6 +465,15 @@ If independent builds of identical kernel source differ, add a Core-vs-Core
 control and inspect selected launch configurations before assigning the cause
 to the Plugin. Preserve the failures and full-model gates.
 
+Budget serial device jobs from measured cold execution, including portable
+startup, every provider subprocess and the remaining native matrix. Inspect
+actual timeout annotations before changing the bounded job budget; preserve
+all selection, authorization and aggregate gates. Upload each component's
+JUnit alongside the final aggregate so a later cancellation retains completed
+evidence. Component logs or XML do not qualify an unfinished aggregate, and
+an increased budget is not a passing rerun. Reuse live runs and retain the
+original timeout result when validating the corrected workflow.
+
 For provider CI, inspect the final pytest log and result artifact as well as
 job status. A session-level version pause can exit successfully without running
 any cases; a benchmark driver can then produce no CSV. Record those as no
