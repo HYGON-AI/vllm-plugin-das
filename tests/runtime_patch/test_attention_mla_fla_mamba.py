@@ -1097,6 +1097,39 @@ def test_boltops_resolver_accepts_current_null_state_index_abi(
     assert make_boltops_gdn_resolver(name)() is kernel
 
 
+@pytest.mark.parametrize("extra", [None, "full_chunks", "bad_default", "unknown"])
+def test_boltops_chunk_o_current_abi(monkeypatch, extra):
+    from vllm_hcu.patch.worker.op_opt._boltops_fla import (
+        make_boltops_gdn_resolver,
+    )
+
+    def kernel(*args, **kwargs):
+        return args, kwargs
+
+    signature = inspect.signature(_boltops_chunk_o_contract)
+    parameters = list(signature.parameters.values())
+    if extra is not None:
+        parameters.append(inspect.Parameter(
+            "unknown" if extra == "unknown" else "full_chunks",
+            inspect.Parameter.POSITIONAL_OR_KEYWORD,
+            default=False if extra == "bad_default" else None,
+        ))
+    kernel.__signature__ = signature.replace(parameters=parameters)
+    _install_fake_module(monkeypatch, "boltops.fla.gdn", chunk_fwd_o=kernel)
+    resolve = make_boltops_gdn_resolver("chunk_fwd_o")
+    if extra is None:
+        assert resolve() is kernel
+        assert resolve()() == ((), {})
+    elif extra == "full_chunks":
+        resolved = resolve()
+        assert resolved() == ((), {"full_chunks": False})
+        assert resolve() is resolved
+    else:
+        compatibility_error = _adapter("_common").PatchCompatibilityError
+        with pytest.raises(compatibility_error, match="audited BoltOPs"):
+            resolve()
+
+
 def test_fla_chunk_o_feature_off_is_numerically_identical(monkeypatch):
     adapter = _adapter("patch_fla_chunk_o")
 
@@ -1175,7 +1208,7 @@ def test_fla_chunk_delta_h_uses_boltops(monkeypatch):
     assert kwargs["save_new_value"] is False
     assert kwargs["use_exp2"] is True
     assert kwargs["transpose_state_layout"] is True
-    assert kwargs["null_state_index"] == 0
+    assert kwargs["null_state_index"] == -1
 
 
 def test_fla_chunk_o_uses_boltops_and_preserves_output_buffer(monkeypatch):
@@ -1348,7 +1381,7 @@ def test_fla_chunk_delta_h_unsupported_aiter_inputs_fall_back_to_boltops(
     )
 
     assert result == ("boltops-h", "boltops-v", "boltops-final")
-    assert calls[0]["null_state_index"] == 0
+    assert calls[0]["null_state_index"] == -1
 
 
 def test_fla_chunk_o_uses_aiter_hip_and_fills_output_buffer(monkeypatch):

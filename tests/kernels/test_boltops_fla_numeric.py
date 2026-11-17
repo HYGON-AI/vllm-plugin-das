@@ -4,6 +4,8 @@
 
 from __future__ import annotations
 
+import importlib
+import inspect
 from types import ModuleType
 
 import pytest
@@ -306,3 +308,86 @@ def test_aiter_hip_decode_matches_official_with_null_block_padding():
     )
     torch.testing.assert_close(hip_state, ref_state, rtol=5e-2, atol=5e-3)
     torch.testing.assert_close(hip_state[0], state0[0], rtol=0, atol=0)
+
+
+@pytest.mark.parametrize(
+    ("lengths", "varlen"),
+    [((64,), True), ((33, 129), True), ((64, 64), False), ((65, 65), False)],
+)
+def test_boltops_dense_initial_state_keeps_first_row(monkeypatch, lengths, varlen):
+    """With zero updates and no gate, every initial state must be preserved."""
+    if not torch.cuda.is_available():
+        pytest.skip("HCU is required")
+    pytest.importorskip("boltops.fla.gdn")
+    from vllm.third_party.flash_linear_attention.ops import chunk
+    from vllm_hcu.patch.worker.op_opt import _gdn_backend, patch_fla_chunk_delta_h
+
+    patch_fla_chunk_delta_h.apply_to_module(chunk)
+    monkeypatch.setenv("VLLM_HCU_USE_CUSTOM_OPS", "1")
+    monkeypatch.setattr(_gdn_backend, "_prefill_requested", "hcu-boltops")
+    batch, length = (1, sum(lengths)) if varlen else (len(lengths), lengths[0])
+    k = torch.zeros(batch, length, 16, 128, device="cuda", dtype=torch.bfloat16)
+    w = torch.zeros(batch, length, 48, 128, device="cuda", dtype=torch.bfloat16)
+    u = torch.zeros_like(w)
+    offsets = [0]
+    for length in lengths:
+        offsets.append(offsets[-1] + length)
+    cu = torch.tensor(offsets, device="cuda", dtype=torch.long) if varlen else None
+    initial = torch.full((len(lengths), 48, 128, 128), 0.125, device="cuda")
+    initial[-1] *= 2
+    states = [
+        initial[i:i + 1].to(k.dtype).repeat((length + 63) // 64, 1, 1, 1)
+        for i, length in enumerate(lengths)
+    ]
+    expected = torch.cat(states).unsqueeze(0) if varlen else torch.stack(states)
+    state_arg = initial.clone()
+    h, new_u, final = chunk.chunk_gated_delta_rule_fwd_h(
+        k, w, u, initial_state=state_arg, output_final_state=True,
+        cu_seqlens=cu,
+    )
+    torch.cuda.synchronize()
+    torch.testing.assert_close(h, expected, rtol=0, atol=0)
+    torch.testing.assert_close(new_u, u, rtol=0, atol=0)
+    torch.testing.assert_close(final, initial, rtol=0, atol=0)
+    torch.testing.assert_close(state_arg, initial, rtol=0, atol=0)
+
+
+@pytest.mark.parametrize("value_dim", [32, 96])
+def test_boltops_chunk_o_fixed_length_value_tail(monkeypatch, value_dim):
+    """Do not enter the unmasked full-chunk path for a partial value tile."""
+    if not torch.cuda.is_available():
+        pytest.skip("HCU is required")
+    pytest.importorskip("boltops.fla.gdn")
+    from vllm.third_party.flash_linear_attention.ops import chunk
+    from vllm_hcu.patch.worker.op_opt import _gdn_backend, patch_fla_chunk_o
+
+    boltops_o = importlib.import_module("boltops.fla.gdn.triton.chunk_o")
+    if "full_chunks" not in inspect.signature(boltops_o.chunk_fwd_o).parameters:
+        pytest.skip("This regression targets the newer full_chunks ABI")
+    launch = boltops_o.launch_chunk_fwd_kernel_o
+    calls = []
+
+    def checked_launch(**kwargs):
+        # Fail before a potentially unsafe launch on the unfixed adapter.
+        assert kwargs["full_chunks"] is False
+        calls.append(kwargs["full_chunks"])
+        kwargs["kernel_cfg"] = {
+            "BK": 128, "BV": 64, "num_warps": 4, "num_stages": 2,
+        }
+        return launch(**kwargs)
+
+    monkeypatch.setattr(boltops_o, "launch_chunk_fwd_kernel_o", checked_launch)
+    patch_fla_chunk_o.apply_to_module(chunk)
+    monkeypatch.setenv("VLLM_HCU_USE_CUSTOM_OPS", "1")
+    torch.manual_seed(13)
+    q = torch.randn(1, 64, 1, 128, device="cuda", dtype=torch.bfloat16) * 0.1
+    k = torch.randn_like(q) * 0.1
+    v = torch.randn(1, 64, 1, value_dim, device="cuda", dtype=q.dtype) * 0.1
+    h = torch.randn(1, 1, 1, value_dim, 128, device="cuda", dtype=q.dtype) * 0.1
+    qf, kf, vf = q[0, :, 0].float(), k[0, :, 0].float(), v[0, :, 0].float()
+    expected = (qf @ h[0, 0, 0].float().T + (qf @ kf.T).tril() @ vf) * 128**-0.5
+    monkeypatch.setattr(_gdn_backend, "_prefill_requested", "hcu-boltops")
+    out = chunk.chunk_fwd_o(q, k, v, h, chunk_size=64, cu_seqlens=None)
+    torch.cuda.synchronize()
+    assert calls == [False]
+    torch.testing.assert_close(out[0, :, 0].float(), expected, rtol=5e-2, atol=5e-3)
