@@ -471,10 +471,13 @@ when another job's pytest session is paused. Count JUnit launcher cases,
 CSV measurement rows and numerical regression cases separately; selected
 benchmark timings do not qualify unrelated kernels or model accuracy.
 
-Derive grouped key/value head counts from the actual checkpoint and cover
-them explicitly in native tests; small synthetic head counts do not qualify
-the checkpoint geometry. Add only missing cases and bind their receipts to
-unchanged package RECORDs, keeping earlier qualification counts separate.
+Derive grouped key/value head counts from the actual checkpoint and the
+selected Core's sharding/replication rules. Cover each new per-rank geometry
+when changing TP, even if its head ratio matches an already-tested TP1 shape.
+Keep prefill, packed decode and speculative varlen/accepted-state Graph
+coverage. Add only missing cases and bind their receipts to the actual
+installation's package RECORDs; component parity does not qualify TP
+communication, model quality or performance, and older counts stay separate.
 Interpret shutdown logs against the selected Core source: `mode=abort` may
 mean the default zero-timeout request policy rather than an OS abort. Record
 actual exit codes, process release and native leak reports independently;

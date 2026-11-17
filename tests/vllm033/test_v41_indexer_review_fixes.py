@@ -151,7 +151,6 @@ def test_profile_pass_reserves_the_staging_pool(monkeypatch):
             calls.append(('persistent', key, shape))
             return torch.empty(shape, dtype=dtype)
 
-    monkeypatch.setattr(reader, 'get_current_vllm_config', lambda: cfg)
     monkeypatch.setattr(reader, 'get_forward_context',
                         lambda: NS(attn_metadata=None))
 
@@ -160,9 +159,15 @@ def test_profile_pass_reserves_the_staging_pool(monkeypatch):
                         lambda: True)
     monkeypatch.setattr(workspace, 'current_workspace_manager', lambda: Workspace())
 
-    layer = NS(max_model_len=8192, compress_ratio=2, topk_indices_buffer='out')
-    reader.execute(layer, torch.zeros((4, 128)), None, None)
-    plan_records = reader.staging_plan(cfg, 8192, 2)['page_records']
+    # Construction freezes these values; execute must not query live config.
+    plan = reader.staging_plan(cfg, 8192, 2)
+    layer = NS(max_model_len=8192, compress_ratio=2, topk_indices_buffer='out',
+               fp4_decode_rows=reader.decode_rows(cfg), max_total_seq_len=8192,
+               topk_tokens=16, fp4_max_logits_bytes=4 * 8192 * 4,
+               fp4_page_records=plan['page_records'], fp4_staging_plan=plan)
+    result = reader.execute(layer, torch.zeros((4, 128)), None, None)
+    assert result == 'out'
+    plan_records = plan['page_records']
 
     kinds = [entry[0] for entry in calls]
     assert 'persistent' in kinds, 'profile pass did not reserve the staging pool'

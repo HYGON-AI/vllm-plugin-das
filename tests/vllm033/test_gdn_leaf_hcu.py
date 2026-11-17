@@ -136,7 +136,7 @@ def _assert_decode_close(actual, reference, *, state=False):
     )
 
 
-@pytest.mark.parametrize("key_heads,heads", [(4, 8), (4, 12), (16, 32)])
+@pytest.mark.parametrize("key_heads,heads", [(4, 8), (4, 12), (8, 16), (16, 32)])
 def test_packed_decode_null_slots_state_and_changed_input_graph(
     runtime, monkeypatch, key_heads, heads
 ):
@@ -251,7 +251,7 @@ def test_packed_decode_null_slots_state_and_changed_input_graph(
         )
 
 
-@pytest.mark.parametrize("key_heads,heads", [(4, 8), (4, 12), (16, 32)])
+@pytest.mark.parametrize("key_heads,heads", [(4, 8), (4, 12), (8, 16), (16, 32)])
 def test_sigmoid_spec_varlen_accepted_tokens_and_changed_input_graph(
     runtime, monkeypatch, key_heads, heads
 ):
@@ -356,7 +356,7 @@ def test_sigmoid_spec_varlen_accepted_tokens_and_changed_input_graph(
         )
 
 
-@pytest.mark.parametrize("key_heads,heads", [(4, 8), (4, 12), (16, 32)])
+@pytest.mark.parametrize("key_heads,heads", [(4, 8), (4, 12), (8, 16), (16, 32)])
 @pytest.mark.parametrize("varlen", [False, True])
 def test_complete_gated_fla_state_output_and_changed_input_graph(
     runtime, monkeypatch, key_heads, heads, varlen
@@ -424,7 +424,7 @@ def test_complete_gated_fla_state_output_and_changed_input_graph(
     )
     if activation._published.policy[0] == "hcu-aiter":
         assert ("chunk_gated_delta_rule_fwd_h", "hcu-aiter") in seen
-    elif heads in (8, 32):
+    elif heads in (8, 16, 32):
         assert ("chunk_gated_delta_rule_fwd_h", "hcu-boltops") in seen
     graph = torch.cuda.CUDAGraph()
     with torch.cuda.graph(graph):
