@@ -403,6 +403,17 @@ even a compiled dual-target wheel still needs execution on both architectures.
 Keep private Core source/wheels in the original private project or an authorized
 internal publisher; publishing a candidate does not repin consumers or a release.
 
+When a published runtime lacks a newly merged Adapter capability, deliver the
+host wheel and its exact required native-wheel build together. Verify wheel
+RECORDs, namespace ownership, build ABI and the host's kernel requirement before
+offline installation. Compare the installed payload with the prepared wheels,
+verify installed RECORDs and embedded architectures, then rerun the affected
+full CI matrix. Publish a unique candidate digest; keep shared consumer changes
+and device/model acceptance separate from artifact delivery.
+Run metadata-only image inspection with isolated no-site startup, adding the
+system interpreter's package directories without executing `.pth` or
+`sitecustomize`; a disabled host can still import Torch during bootstrap.
+
 For optional container credentials, distinguish cross-repository PRs from PRs
 inside a repository that is itself a fork. Compare head/base repository identity
 and event type rather than head.repo.fork. Cover cross-repository and both kinds

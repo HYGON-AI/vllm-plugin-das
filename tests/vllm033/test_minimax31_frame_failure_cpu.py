@@ -104,3 +104,20 @@ def test_failed_frame_setup_releases_lock_and_latches_restart(monkeypatch, batch
     assert not runtime._FRAME_LOCK.locked()
     with pytest.raises(RuntimeError, match='restart the engine'):
         runtime.set_forward_layout(batch)
+
+
+def test_msa_layout_failure_is_cleaned_by_actual_runner_boundary(monkeypatch,batch):
+    from hcu_vllm_das.parallel import minimax31_msa as msa
+    manager=pcp.MiniMax31PCPManager.__new__(pcp.MiniMax31PCPManager)
+    manager._hcu_native_msa=True;manager._hcu_static=True
+    monkeypatch.setattr(pcp.PCPManager,'partition_batch',lambda *a:batch)
+    error=RuntimeError('MSA planner start/lens contract mismatch')
+    def fail(batch): raise error
+    monkeypatch.setattr(msa,'set_forward_layout',fail)
+    monkeypatch.setattr(pcp.GPUModelRunner,'execute_model',lambda self:manager.partition_batch(None,None))
+    runner=pcp.MiniMax31PCPModelRunner.__new__(pcp.MiniMax31PCPModelRunner)
+    with pytest.raises(RuntimeError) as caught:runner.execute_model()
+    assert caught.value is error
+    assert runtime._LAYOUT is None and not runtime._FRAME_LOCK.locked()
+    assert runtime._FRAME_POISONED
+    with pytest.raises(RuntimeError,match='restart the engine'):runner.execute_model()

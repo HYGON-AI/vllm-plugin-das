@@ -23,7 +23,7 @@ def test_profile_only_changes_synthetic_local_rows(monkeypatch):
     calls=[]
     monkeypatch.setattr(p.GPUModelRunner,'_dummy_run',lambda self,n,*args,**kw:calls.append((n,kw)) or 'result')
     obj=p.MiniMax31PCPModelRunner.__new__(p.MiniMax31PCPModelRunner)
-    obj.pcp_manager=SimpleNamespace(pcp_world_size=8,dcp_world_size=1,shard_decode_requests=True)
+    obj.pcp_manager=SimpleNamespace(pcp_world_size=8,dcp_world_size=1,shard_decode_requests=True, _hcu_native_msa=False)
     obj.speculator=None;obj.max_num_reqs=80;obj.max_num_tokens=65536
     assert obj._dummy_run(65536,is_profile=True,skip_attn=True)=='result'
     assert calls[-1][0]==8448 and obj.max_num_tokens==65536

@@ -121,6 +121,10 @@ def test_built_wheel_contains_only_the_new_plugin_namespace(tmp_path: Path) -> N
     assert len(wheels) == 1
     with ZipFile(wheels[0]) as archive:
         names = set(archive.namelist())
+        prefill_kernel = "hcu_vllm_das/parallel/minimax31_prefill_triton.py"
+        assert prefill_kernel in names
+        installed = tmp_path / "installed"
+        archive.extractall(installed)
         metadata_name = next(
             name for name in names if name.endswith(".dist-info/METADATA")
         )
@@ -170,6 +174,36 @@ def test_built_wheel_contains_only_the_new_plugin_namespace(tmp_path: Path) -> N
     assert license_names == {"LICENSE", "NOTICE"}
     assert not any(name.startswith("vllm_hcu/") for name in names)
     assert not any(name.startswith("tests/") for name in names)
+
+    # The source CI lane has no Torch/Triton. Use import-only stand-ins here;
+    # real Torch/Triton imports are checked separately in the HCU container.
+    code = f"""
+import importlib, importlib.abc, importlib.metadata, sys, types
+from pathlib import Path
+installed = Path({str(installed)!r})
+sys.path.insert(0, str(installed))
+class NoRepositoryModules(importlib.abc.MetaPathFinder):
+    def find_spec(self, fullname, path=None, target=None):
+        if fullname.split('.')[0] in {{'triton_tmp_dir', 'vllm_hcu'}}:
+            raise AssertionError('repository-root dependency: ' + fullname)
+sys.meta_path.insert(0, NoRepositoryModules())
+sys.modules['torch'] = types.ModuleType('torch')
+triton = types.ModuleType('triton'); triton.__path__ = []
+triton.jit = lambda fn=None, **kw: fn if fn is not None else (lambda f: f)
+language = types.ModuleType('triton.language'); language.constexpr = object
+triton.language = language
+sys.modules['triton'] = triton; sys.modules['triton.language'] = language
+module = importlib.import_module('hcu_vllm_das.parallel.minimax31_prefill_triton')
+origin = Path(module.__file__).resolve()
+assert origin == (installed / 'hcu_vllm_das/parallel/minimax31_prefill_triton.py').resolve()
+record = importlib.metadata.distribution('hcu-vllm-das-plugin')
+assert any(Path(record.locate_file(f)).resolve() == origin for f in record.files)
+for name in ['force_local_pages','quant_q','store_pcp_cache','check_scales','select_physical_dynamic']:
+    assert callable(getattr(module,name)), name
+"""
+    result = subprocess.run([sys.executable, '-I', '-S', '-c', code],
+                            cwd=tmp_path, capture_output=True, text=True, timeout=30)
+    assert result.returncode == 0, result.stdout + result.stderr
 
 
 @pytest.mark.parametrize("frontend", ["setup", "pip"])
