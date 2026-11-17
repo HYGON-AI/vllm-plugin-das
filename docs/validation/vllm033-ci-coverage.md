@@ -248,6 +248,12 @@ recent Adapter wheel does not replace a gfx938-only Core build. An image date,
 version suffix or successful publisher job is insufficient evidence.
 
 `hcu-ci-image-v033.yml` is a separate manual publisher on trusted `v0.33.0`.
+A path-filtered release push runs only a hosted registration message, without
+checkout or secrets. This registers a new workflow before its first dispatch
+when it is absent from the default branch. A dispatch 404 means not accepted;
+verify registration before provisioning a package credential. The publish job
+requires both a manual event and the release ref; a registration success does
+not mean an image was built or tested.
 Supply a reviewed private `OpenDAS/vllm` generic candidate package version,
 complete Core source SHA, wheel SHA256, and immutable runtime base from
 `HARBOR_SITE/hcu/base_env/vllm`. The helper reads only that project's fixed

@@ -128,7 +128,7 @@ class CandidateTests(unittest.TestCase):
 
     def test_publisher_has_no_pr_entry_public_wheel_or_runtime_variable_write(self):
         source = (ROOT / '.github/workflows/hcu-ci-image-v033.yml').read_text()
-        self.assertIn("if: github.ref == 'refs/heads/v0.33.0'", source)
+        self.assertIn("if: github.event_name == 'workflow_dispatch' && github.ref == 'refs/heads/v0.33.0'", source)
         self.assertIn('ref: ${{ github.sha }}', source)
         self.assertIn('persist-credentials: false', source)
         self.assertIn('docker build --network=none', source)
@@ -140,6 +140,18 @@ class CandidateTests(unittest.TestCase):
         dockerfile = (ROOT / 'docker/Dockerfile.v033-ci-candidate').read_text()
         self.assertIn('--no-index --no-deps', dockerfile)
         self.assertNotIn('SOURCEFIND_PACKAGE_TOKEN', dockerfile)
+
+    def test_first_dispatch_has_a_secret_free_release_registration_entry(self):
+        from test_v033_ci_image_policy import job_block
+        source = (ROOT / '.github/workflows/hcu-ci-image-v033.yml').read_text()
+        events = source.split('permissions:\n', 1)[0]
+        self.assertIn('branches: [v0.33.0]', events)
+        self.assertIn("- '.github/workflows/hcu-ci-image-v033.yml'", events)
+        registration = job_block(source, 'register-manual-entry')
+        self.assertIn("if: github.event_name == 'push'", registration)
+        self.assertIn('runs-on: ubuntu-latest', registration)
+        for forbidden in ['secrets.', 'checkout@', 'docker', '/dev/', 'SOURCEFIND']:
+            self.assertNotIn(forbidden, registration)
 
 
 if __name__ == '__main__':
