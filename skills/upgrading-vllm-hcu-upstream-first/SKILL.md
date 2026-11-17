@@ -240,6 +240,13 @@ older Adapter, even with an empty PYTHONPATH and HOSTnone. Use a matching
 installed owner for that child and retain the first failure; do not regenerate
 documentation or relax freshness assertions to hide package-origin drift.
 
+For installed lifecycle tests that launch a bare CLI, prepend the tested
+venv bin directory to that arm's PATH, check the selected script and shebang,
+and record actual server/worker origins. Preloading the correct parent package
+does not select the child CLI. Preserve a wrong-PATH attempt as invalid harness
+evidence, clean up its owned identities, and rerun the unchanged original tests
+and deadlines in a new output directory.
+
 For pipeline parallelism, count workers and distinct GPU trace ranks as
 TP times PP. Hybrid cache projection can preserve globally indexed groups
 whose local layer list is empty: allocate only worker-owned layers and check
