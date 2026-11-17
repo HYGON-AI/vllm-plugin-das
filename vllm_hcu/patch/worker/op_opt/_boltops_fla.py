@@ -6,6 +6,7 @@ from __future__ import annotations
 
 import importlib
 from collections.abc import Callable
+from functools import partial
 
 from ._common import PatchCompatibilityError, require_exact_signature
 
@@ -127,12 +128,24 @@ def make_boltops_gdn_resolver(name: str) -> Callable[[], Callable | None]:
             raise PatchCompatibilityError(
                 f"optional {_MODULE}.{name} exists but is not callable"
             )
-        require_exact_signature(
-            candidate,
-            f"{_MODULE}.{name} (audited BoltOPs {_AUDITED_VERSION})",
-            positional=positional,
-            defaults=defaults,
-        )
+        target = f"{_MODULE}.{name} (audited BoltOPs {_AUDITED_VERSION})"
+        try:
+            require_exact_signature(
+                candidate, target, positional=positional, defaults=defaults,
+            )
+        except PatchCompatibilityError:
+            if name != "chunk_fwd_o":
+                raise
+            # The newer public ABI adds only this optional trailing argument.
+            require_exact_signature(
+                candidate,
+                target,
+                positional=(*positional, "full_chunks"),
+                defaults={**defaults, "full_chunks": None},
+            )
+            # Preserve the old masked behavior: the newer automatic full-chunk
+            # path can omit value-tail bounds checks when V is not BV-aligned.
+            candidate = partial(candidate, full_chunks=False)
         kernel = candidate
         resolved = True
         return kernel
