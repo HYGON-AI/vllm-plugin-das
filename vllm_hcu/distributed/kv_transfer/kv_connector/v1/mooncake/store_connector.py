@@ -23,6 +23,7 @@ if TYPE_CHECKING:
 
 _SINGLE_PCP_REPLICA = "pcp_single_replica"
 _MAX_MULTI_BUFFER_BATCH = 32
+_MAX_MULTI_BUFFER_GET_BATCH = 256
 
 
 def _configure_single_pcp_replica(vllm_config, role):
@@ -78,8 +79,8 @@ class _BoundedStore:
 
     def batch_get_into_multi_buffers(self, keys, addrs, sizes):
         results = []
-        for start in range(0, len(keys), _MAX_MULTI_BUFFER_BATCH):
-            end = start + _MAX_MULTI_BUFFER_BATCH
+        for start in range(0, len(keys), _MAX_MULTI_BUFFER_GET_BATCH):
+            end = start + _MAX_MULTI_BUFFER_GET_BATCH
             results.extend(self.store.batch_get_into_multi_buffers(
                 keys[start:end], addrs[start:end], sizes[start:end]))
         return results
