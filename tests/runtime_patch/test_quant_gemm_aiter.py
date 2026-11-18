@@ -9242,7 +9242,7 @@ def test_int8_scheme_layout_and_feature_off_delegation(monkeypatch: pytest.Monke
     scheme = module.CompressedTensorsW8A8Int8()
     assert scheme.supports_quanted_inputs() is False
     layer = SimpleNamespace(weight=torch.nn.Parameter(torch.ones(2, 3)))
-    assert scheme.apply_weights(layer, "x", None)[0] == "upstream"
+    assert scheme.apply_weights(layer, torch.ones(2, 3), None)[0] == "upstream"
     scheme.process_weights_after_loading(layer)
     assert layer.weight.shape == (3, 2)
 
@@ -9274,6 +9274,100 @@ def test_int8_scheme_layout_and_feature_off_delegation(monkeypatch: pytest.Monke
     assert feature_layer.weight.is_contiguous()
     assert feature_scheme.apply_weights(feature_layer, "x", None) == "hcu"
     assert calls[0]["weight"] is feature_layer.weight
+
+
+def _int8_tensor_fallback_scheme(monkeypatch: pytest.MonkeyPatch):
+    class CompressedTensorsW8A8Int8:
+        def process_weights_after_loading(self, layer):
+            pass
+
+        def apply_weights(self, layer, x, bias):
+            # Model the Core Triton kernel's two-dimensional row contract.
+            # This is a CPU wrapper test, not a native quantization test.
+            rows, width = x.shape
+            assert width == layer.weight.shape[1]
+            result = x @ layer.weight.t()
+            assert result.shape == (rows, layer.weight.shape[0])
+            return result if bias is None else result + bias
+
+    module = _module(
+        patch_compressed_tensors_w8a8_int8.TARGET_MODULE,
+        CompressedTensorsW8A8Int8=CompressedTensorsW8A8Int8,
+    )
+    monkeypatch.setattr(
+        patch_compressed_tensors_w8a8_int8,
+        "_custom_quantization_enabled",
+        lambda: False,
+    )
+    patch_compressed_tensors_w8a8_int8.apply_to_module(module)
+    return module.CompressedTensorsW8A8Int8()
+
+
+@pytest.mark.parametrize("shape", [(8,), (6, 8), (2, 3, 8), (2, 1, 3, 8)])
+@pytest.mark.parametrize("noncontiguous", [False, True])
+@pytest.mark.parametrize("with_bias", [False, True])
+def test_int8_fallback_preserves_leading_dimensions(
+    monkeypatch: pytest.MonkeyPatch,
+    shape: tuple[int, ...],
+    noncontiguous: bool,
+    with_bias: bool,
+):
+    scheme = _int8_tensor_fallback_scheme(monkeypatch)
+    torch.manual_seed(19)
+    if noncontiguous:
+        x = torch.randn(*shape[:-1], 2 * shape[-1])[..., ::2]
+        assert not x.is_contiguous()
+    else:
+        x = torch.randn(shape)
+    layer = SimpleNamespace(weight=torch.randn(5, 8))
+    bias = torch.randn(5) if with_bias else None
+    result = scheme.apply_weights(layer, x, bias)
+    expected = torch.nn.functional.linear(x, layer.weight, bias)
+    assert result.shape == shape[:-1] + (5,)
+    torch.testing.assert_close(result, expected)
+
+
+def test_int8_fallback_2d_delegates_without_replacing_input(
+    monkeypatch: pytest.MonkeyPatch,
+):
+    module = _fake_int8_scheme_module()
+    monkeypatch.setattr(
+        patch_compressed_tensors_w8a8_int8,
+        "_custom_quantization_enabled",
+        lambda: False,
+    )
+    patch_compressed_tensors_w8a8_int8.apply_to_module(module)
+    x = torch.randn(2, 6)[:, ::2]
+    layer, bias = object(), torch.ones(5)
+    result = module.CompressedTensorsW8A8Int8().apply_weights(layer, x, bias)
+    assert result[0] == "upstream"
+    assert result[1] is layer
+    assert result[2] is x
+    assert result[3] is bias
+
+
+@pytest.mark.parametrize("rank", [1, 2, 3, 4])
+@pytest.mark.parametrize("with_bias", [False, True])
+def test_int8_fallback_fullgraph(
+    monkeypatch: pytest.MonkeyPatch, rank: int, with_bias: bool
+):
+    scheme = _int8_tensor_fallback_scheme(monkeypatch)
+    layer = SimpleNamespace(weight=torch.randn(5, 8))
+    bias = torch.randn(5) if with_bias else None
+
+    def apply(x):
+        return scheme.apply_weights(layer, x, bias)
+
+    compiled = torch.compile(apply, backend="aot_eager", fullgraph=True, dynamic=True)
+    try:
+        for rows in (2, 5):
+            shape = (rows,) * (rank - 1) + (8,)
+            x = torch.randn(shape)
+            torch.testing.assert_close(
+                compiled(x), torch.nn.functional.linear(x, layer.weight, bias)
+            )
+    finally:
+        torch._dynamo.reset()
 
 
 def test_int8_weight_layout_rolls_back_if_upstream_processing_fails(
