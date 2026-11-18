@@ -17,8 +17,10 @@ def _packed_to_kn(
     tile_k: tl.constexpr,
     block_n: tl.constexpr,
 ):
-    tile = tl.program_id(0)
-    columns = tl.program_id(1) * block_n + tl.arange(0, block_n)
+    # Adjacent programs traverse contiguous N tiles in the packed backing.
+    # Keeping K fastest instead scatters adjacent programs across that backing.
+    tile = tl.program_id(1)
+    columns = tl.program_id(0) * block_n + tl.arange(0, block_n)
     words = tl.arange(0, tile_k // 8)
     offsets = (
         tile * n * (tile_k // 8)
@@ -68,7 +70,7 @@ def dequantize_for_matmul(
     n = scales_zeros.shape[0]
     output = torch.empty((k, n), device=weight.device, dtype=torch.float16)
     tile_k = 256 if k % 256 == 0 else 128
-    _packed_to_kn[(k // tile_k, triton.cdiv(n, 64))](
+    _packed_to_kn[(triton.cdiv(n, 64), k // tile_k)](
         weight, scales_zeros, output, n, k, tile_k, 64, num_warps=4
     )
     return output

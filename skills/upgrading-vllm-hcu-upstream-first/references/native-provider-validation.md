@@ -58,3 +58,9 @@ of a prototype, including both packing branches and changed-input Graph replay.
 Measure throughput and TTFT separately; a throughput gain can accompany a
 substantial first-token regression. See
 `docs/validation/vllm033-autoawq-prefill.md` for the scoped AutoAWQ example.
+
+Compare temporary layouts using conversion plus the downstream GEMM: returning
+a transposed view can accelerate conversion but select a slower BLAS algorithm.
+Bind trace comparisons to matching prefill geometry; mixed prefill/decode
+totals do not isolate conversion cost. Check launch traversal against physical
+packing before changing the format, and revalidate both physical packing tiles.
