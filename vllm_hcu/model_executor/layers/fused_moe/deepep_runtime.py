@@ -165,11 +165,6 @@ def slimquant_w4a8_uses_deepep_ll(moe_config: object) -> bool:
                 "SlimQuant W4A8 HYV4-VL DeepEP LL requires "
                 "PP1/TP1/PCP1/DP16/DCP1/EP16"
             )
-    if (
-        architectures == ("HYV4VLForConditionalGeneration",)
-        and getattr(config, "speculative_config", None) is not None
-    ):
-        raise ValueError("SlimQuant W4A8 HYV4-VL does not support MTP")
     if getattr(moe_config, "moe_backend", "auto") not in ("auto", "deep_gemm"):
         raise ValueError(
             "SlimQuant W4A8 DeepEP LL requires moe_backend='auto' or 'deep_gemm'"
