@@ -32,6 +32,15 @@ default-serving variation, preserving the first candidate failure. An exit
 within the existing grace can still emit native leak diagnostics; record
 those separately from forced cleanup and normal lifecycle qualification.
 
+For a token-choice regression, compare both saved continuation histories with
+teacher-forced prompt logprobs before assigning the cause to decode. Verify
+tokenization boundaries; retokenized text is not the original emitted token ID
+stream. Warmed-prefix probes need actual cache-hit counts to establish a
+single-query call. Isolate a reader substitution over the same writer, typed
+cache and scales, and trace its execution. A restored choice establishes reader
+sensitivity, not a kernel defect, full-model recovery or accuracy acceptance;
+use the same captured inputs and an independent numerical reference next.
+
 Validate positive softcap separately from ordinary FP8 attention. A vendor
 paged path can accept the argument while ignoring it. When routing softcap to
 Core's official attention, cover every advertised cache dtype: preserve E4M3

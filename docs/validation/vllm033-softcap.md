@@ -194,6 +194,45 @@ erases the older BF16 task 18 regression nor qualifies other checkpoints,
 architectures, positive softcap or performance. The original selected CI and
 component results remain bound to their tested runtime commit.
 
+## Frozen-history reader diagnostic on gfx938
+
+The subsequent r128 diagnostic keeps Core `c440c089`, Adapter main `89fc929c`
+and the tested Plugin runtime. Both saved task19 continuations are retokenized
+with an unchanged prompt boundary. Complete teacher-forced prefill repeats
+are identical within each KV arm. The first BF16/E5M2 greedy difference is at
+absolute token149 / continuation17: BF16 chooses220 (space), E5M2 chooses364
+(space+quote), with top-two logprob gaps9.75/2.00. Full prefill reproduces it,
+so a single-token decode-only explanation is insufficient. Each arm's18
+aligned-prefix probes verify192/256/320 cached tokens for193/257/321-token
+prompts. No new HumanEval cohort or score is claimed.
+
+Local diagnostic Plugin `57182d8609202d748e5a14f8758a0fb0af441f12` (r129)
+substitutes Core's unchanged `unified_attention` only for output-only E5M2
+reads. It preserves the writer/cache/scales and the original statistics-return
+provider. All46 unchanged E5M2 numerical/Graph cases pass with their original
+tolerances. An independent physical installation then runs the same frozen
+requests; trace shows `kernel_unified_attention`, the E5M2 writer and row
+scales, plus actual Graph launches. At token149 it chooses220 with gap1.00,
+matching BF16's choice; complete prefill repeats are again identical. Against
+the vendor reader, each saved reference has3 greedy differences, and3/18
+aligned-prefix choices differ. Against BF16, the two references have3/1
+greedy differences; aligned-prefix choices agree18/18. This establishes reader
+sensitivity. It does not establish a vendor defect or qualify the local
+substitution as a production repair, performance improvement or HE32 recovery.
+Next numerical comparison must use identical captured attention inputs and an
+independent reference.
+
+The other four package RECORDs are identical to r128; five full installed
+RECORDs, source/wheel/installed binding and full checkpoint pre/post seals pass.
+All other90 Plugin payload files are unchanged. The frontend exits0 in9.53s
+under the original15s grace, no forced cleanup, owned descendants and port19994
+released; native nanobind leak diagnostics persist. Original accuracy and
+lifecycle gates remain open. Adapter main advanced separately to `ef63bbbd`
+during this diagnostic; these results remain bound to installed `89fc929c`.
+The reader experiment remains local and is absent from this MR's production
+tree. Evidence: `evidence/plugin410-e5m2-frozen-history-r128` and
+`evidence/plugin410-official-reader-r129` in the upgrade workspace.
+
 ## Component timing and limits
 
 One gfx936, BF16, HND, 32 query/8 KV heads, head size128, cap0.5: three warmed
