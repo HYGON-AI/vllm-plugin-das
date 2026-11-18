@@ -156,6 +156,13 @@ For a private Core image candidate, use the guide's
 [publisher and credential boundaries](../../docs/validation/vllm033-ci-coverage.md#publish-a-private-core-candidate-image);
 inspect embedded architectures before changing a shared CI image.
 
+For a newly published image, prefer a trusted single-run candidate input when
+the target workflow provides one; see [candidate CI qualification](../../docs/validation/vllm033-ci-coverage.md#qualify-a-candidate-image-for-one-pr).
+Verify the live PR/head, dispatch actor, immutable approved image and concurrency
+group before dispatch. Reuse an existing matching run. Keep the shared consumer
+and complete source/device/Graph/aggregate gates unchanged; publication or
+successful image selection does not establish runtime qualification.
+
 1. Freeze Core/Adapter/Plugin sources and dependency heads. Check capability
    and ABI compatibility instead of introducing an exact-wheel runtime lock.
 2. Run affected CPU contracts, then installed native numerics and Graph
