@@ -1,0 +1,15 @@
+self-hosted-runner:
+  labels:
+    - ci
+    - bw1000
+    - bw1100
+    - hygon-cpu
+    - hygon-build
+    - hygon-bw1000-1card
+    - hygon-bw1000-2card
+    - hygon-bw1000-4card
+    - hygon-bw1000-8card
+    - hygon-bw1100-1card
+    - hygon-bw1100-2card
+    - hygon-bw1100-4card
+    - hygon-bw1100-8card

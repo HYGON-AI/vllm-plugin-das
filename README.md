@@ -10,6 +10,11 @@ vLLM HCU Plugin
 [vLLM](https://github.com/vllm-project/vllm). Use the repository branch that
 matches your HCU/OpenDAS vLLM deployment.
 
+## PR CI on Kubernetes
+
+For the `v0.28.1-dev` ARC/Kubernetes PR lane, explicit legacy rollback and
+security exceptions, see [the CI migration guide](docs/hcu-ci-k8s-v0281.md).
+
 ## Version Compatibility
 
 Package versions and integration revisions are maintained in
