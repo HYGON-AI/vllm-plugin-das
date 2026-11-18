@@ -39,3 +39,11 @@ replay when KV backing ends mid-tile; keep the final 256-token tile initialized
 and include it in the byte bound. Poison uninitialized allocations in native
 regressions so allocator reuse cannot hide the failure. A real large mixed batch
 should assert both its output and a practical peak extra-device-memory bound.
+
+Exercise both requested and unrequested LSE for single-token decode. The
+observed paged decode fast path returns only output even when LSE is requested;
+a generic promise to preserve LSE is not enough. For E4M3, a finite-window
+fallback also re-enters the vendor path that casts Q to cache dtype. Route
+explicit decode-LSE through the verified bounded byte-gather/ordinary-varlen
+composition and independently check output/LSE in eager and changed-input
+Graph tests; retain paged decode when no normalizer is requested.

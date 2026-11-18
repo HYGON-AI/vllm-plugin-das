@@ -19,7 +19,10 @@ reader boundary. For prefill, Core's `cp_gather_cache` copies exact bytes from
 the declared HND/NHD views into bounded, device-length-indexed contiguous
 storage; Torch converts those bytes to the query dtype before vendor varlen
 attention. The existing descale adapter applies key scales to Q and value
-scales to output. Single-token decode retains vendor paged attention.
+scales to output. Single-token decode without requested LSE retains vendor
+paged attention. Explicit decode-LSE requests use the same bounded byte-gather
+and unquantized varlen composition: the vendor paged fast path otherwise drops
+the requested normalizers, and its finite-window fallback quantizes Q to E4M3.
 
 Prefill groups sequences against a 64-MiB target for the combined FP8 gather
 and BF16/FP16 conversion buffers. A single maximum-length context is the
@@ -61,8 +64,14 @@ the original small native/Graph matrix and exact-head CI passed. Keep those
 results bound to their original source; the correction adds the reported
 48-GiB metadata-shape regression, forced grouping, empty query rows, query
 and KV length changes during Graph replay, padding and independent LSE checks.
+The subsequent decode-LSE review found the original native matrix requested
+LSE only for multi-token queries. A new native negative control confirms the
+old single-token path returns only a Tensor; decode with and without LSE now
+has separate eager/Graph coverage in both layouts and all advertised dtypes
+and head sizes. Keep that failure and requalify this functional follow-up.
+
 Local correction validation uses installed Core `c440c08` on gfx938 and Adapter
-`1c9448`: 131 affected portable cases and 64 native writer/reader/Graph cases
+`1c9448`: 131 affected portable cases and 80 native writer/reader/Graph cases
 pass. Native cases poison uninitialized allocations and change query/KV lengths
 without changing addresses. A separate real 256-sequence/32768-max-K case
 passes with 192.07 MiB peak extra allocated device memory (including vendor

@@ -34,10 +34,13 @@ def poison_allocations():
 @pytest.mark.parametrize("layout", ("LBHNC", "LBNHC"))
 @pytest.mark.parametrize("dtype", (torch.bfloat16, torch.float16))
 @pytest.mark.parametrize("dim", (64, 128, 192, 256))
-@pytest.mark.parametrize("nq,chunked", (
-    ((3, 11), False), ((1, 1), False), ((3, 11), True), ((0, 14), True)))
+@pytest.mark.parametrize("nq,chunked,wants_lse", (
+    ((3, 11), False, True), ((1, 1), False, False),
+    ((1, 1), False, True), ((3, 11), True, True), ((0, 14), True, True)))
 @torch.inference_mode()
-def test_native_e4m3_writer_reader_graph(monkeypatch, poison_allocations, layout, dtype, dim, nq, chunked):
+def test_native_e4m3_writer_reader_graph(
+    monkeypatch, poison_allocations, layout, dtype, dim, nq, chunked, wants_lse,
+):
     import vllm._C_stable_libtorch  # noqa: F401
     if chunked:
         from hcu_vllm_das.attention import e4m3_attention
@@ -76,9 +79,9 @@ def test_native_e4m3_writer_reader_graph(monkeypatch, poison_allocations, layout
             cu_seqlens_q=cu, seqused_k=lengths, max_seqlen_q=max_q,
             max_seqlen_k=max(nk), softmax_scale=dim ** -.5, causal=True,
             block_table=table, k_descale=ks, v_descale=vs,
-            return_softmax_lse=max_q > 1)
+            return_softmax_lse=wants_lse)
         assert (result[0] if isinstance(result, tuple) else result) is output
-        if max_q > 1:
+        if wants_lse:
             assert isinstance(result, tuple) and result[1].shape == (h, sum(nq))
             lse[:] = [result[1]]
     def check():

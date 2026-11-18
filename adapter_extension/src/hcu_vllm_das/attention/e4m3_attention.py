@@ -125,7 +125,13 @@ def run_e4m3_attention(vendor: Callable[..., Any], kwargs: dict[str, Any]) -> An
     from hcu_vllm_das.attention.e5m2_scales import run_e5m2_attention
 
     def execute(**arguments: Any) -> Any:
-        if arguments.get("block_table") is not None and arguments["max_seqlen_q"] > 1:
+        # Paged single-token decode's fast path drops requested LSE. The
+        # byte-gather/ordinary-varlen path retains BF16/FP16 Q and exposes LSE
+        # via return_attn_probs, including for one query per sequence.
+        if arguments.get("block_table") is not None and (
+            arguments["max_seqlen_q"] > 1
+            or arguments.get("return_softmax_lse", False)
+        ):
             return _prefill(vendor, arguments)
         return vendor(**arguments)
 
