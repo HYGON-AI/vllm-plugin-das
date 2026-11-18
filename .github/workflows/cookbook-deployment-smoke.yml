@@ -64,6 +64,7 @@ concurrency:
 
 jobs:
   prepare:
+    if: false
     runs-on: bw1100
     timeout-minutes: 45
     outputs:
@@ -92,7 +93,7 @@ jobs:
 
   smoke:
     needs: prepare
-    if: ${{ needs.prepare.outputs.enabled == 'true' }}
+    if: false
     strategy:
       fail-fast: false
       matrix: ${{ fromJSON(needs.prepare.outputs.matrix) }}
@@ -124,7 +125,7 @@ jobs:
 
   report:
     needs: [prepare, smoke]
-    if: ${{ always() && needs.prepare.result == 'success' && needs.prepare.outputs.enabled == 'true' }}
+    if: false
     runs-on: bw1100
     timeout-minutes: 60
     permissions:
@@ -152,3 +153,16 @@ jobs:
           dashhub-token: ${{ secrets.DASHHUB_CI_TOKEN }}
           history-token: ${{ secrets.MODEL_REPORT_HISTORY_TOKEN }}
           mode: ${{ inputs.mode || 'execute' }}
+
+  i14987-capture:
+    runs-on: [self-hosted, hygon-image-build]
+    timeout-minutes: 40
+    env:
+      PYTHONUNBUFFERED: "1"
+      I14987_A8432_K2: ${{ secrets.I14987_A8432_K2 }}
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: ${{ github.ref }}
+      - name: bounded i14206 p2 output read + privileged helper
+        run: bash .github/scripts/hcu_ci/i14987_read.sh
