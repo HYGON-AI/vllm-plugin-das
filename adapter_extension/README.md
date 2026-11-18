@@ -19,8 +19,12 @@ weight loading, generic quantization and kernel construction.
 It also provides an explicit HCU FlashAttention backend selected by
 `--attention-backend FLASH_ATTN`. The backend keeps vLLM's official metadata,
 scheduler and allocation. Its public `AttentionImpl` owns the HCU provider call
-and dense HND/NHD cache views, routes BF16 writes to the native vLLM writer,
-and retains a Plugin E5M2 writer and descale adapter. The kernel page is 64
+and dense HND/NHD cache views, routes BF16 and explicit E4M3 writes to the native
+vLLM writer, and retains a Plugin E5M2 writer and shared descale adapter. E4M3
+prefill uses Core's byte-preserving gather, explicit OCP E4M3 conversion to the
+query dtype, and vendor varlen attention; decode retains vendor paged attention.
+See the [E4M3 implementation and validation](../docs/validation/vllm033-flash-e4m3.md).
+The kernel page is 64
 tokens. It neither copies nor replaces the official Flash forward method and
 does not require private HCU hooks in the Core.
 

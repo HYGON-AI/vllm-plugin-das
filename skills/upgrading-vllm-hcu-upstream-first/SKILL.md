@@ -191,6 +191,9 @@ but does not identify one native leaf, qualify decode, or waive the raw loss.
 Keep serving configuration, package/checkpoint identity and lifecycle results
 bound separately; preserve the original evaluation and normalization protocol.
 
+For explicit FP8 KV names, writer bytes, mixed query/cache dtypes and native
+Flash prefill/decode boundaries, read [Flash KV formats](references/flash-kv-formats.md).
+
 Graph capture or HTTP health alone does not establish successful generation.
 When workspace planning moves to construction, build the real layer in CPU
 regressions with explicit native leaf doubles and exercise its frozen plan.
