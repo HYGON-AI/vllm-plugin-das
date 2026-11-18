@@ -45,6 +45,17 @@ offline-resolution failure, and compare output token IDs with tracing off/on in
 fresh services. Component tests and successful activation do not replace that
 real-weight output regression or the separate P/D and lifecycle matrix.
 
+When comparing generated token IDs, request them through the target's public
+API and require present, nonempty integer lists before asserting equality.
+Two missing fields do not establish output parity. Keep default-serving
+accuracy evidence separate from a batch-invariant diagnostic.
+
+If identical greedy requests differ, repeat the unchanged baseline's complete
+cohort in a fresh service with the same sampling, concurrency, cache and Graph
+policy. Preserve both runs and their per-task pass sets. A candidate sequence
+reproduced on the baseline narrows that case; baseline variation does not
+identify a numerical kernel, explain every difference or waive an accuracy loss.
+
 Mock the HTTP client actually imported by the tested owner. A target may use
 `huggingface_hub.utils.httpx` while an old fixture patches top-level `httpx`.
 Retain accidental network attempts and timeout evidence before repairing the
