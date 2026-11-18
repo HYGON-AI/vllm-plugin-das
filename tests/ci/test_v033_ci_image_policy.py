@@ -29,12 +29,16 @@ class ImagePolicyTests(unittest.TestCase):
         cls.repository = cls.harbor + '/jenkins/model_test_env/vllm'
         cls.digest = 'sha256:' + 'a' * 64
 
-    def guard(self, image, harbor=None, runner_mode=''):
+    def guard(self, image, harbor=None, runner_mode='', *, candidate='',
+              event='workflow_dispatch', manual_authorized='true', pr_number='42'):
         with tempfile.TemporaryDirectory() as directory:
             output = Path(directory) / 'outputs'
             environment = dict(os.environ, HCU_CI_IMAGE_V033=image,
                                HARBOR_SITE=self.harbor if harbor is None else harbor,
-                               GITHUB_OUTPUT=str(output))
+                               GITHUB_OUTPUT=str(output), CANDIDATE_IMAGE=candidate,
+                               GITHUB_EVENT_NAME=event,
+                               MANUAL_AUTHORIZED=manual_authorized,
+                               RESOLVED_PR_NUMBER=pr_number)
             if runner_mode is None:
                 environment.pop('HCU_CI_RUNNER_MODE_V033', None)
             else:
@@ -43,6 +47,61 @@ class ImagePolicyTests(unittest.TestCase):
                 ['bash', '--noprofile', '--norc', '-e', '-c', self.script],
                 env=environment, capture_output=True, text=True, timeout=10)
             return result.returncode, output.read_text() if output.exists() else ''
+
+    def test_candidate_overrides_only_this_authorized_manual_pr_run(self):
+        for repository in ['jenkins/model_test_env/vllm', 'hcu/base_env/vllm']:
+            candidate = self.harbor + '/' + repository + '@sha256:' + 'b' * 64
+            for shared in ['', self.repository + '@' + self.digest]:
+                for mode in ['k8s', 'legacy']:
+                    with self.subTest(repository=repository, shared=shared, mode=mode):
+                        code, output = self.guard(shared, candidate=candidate, runner_mode=mode)
+                        self.assertEqual(code, 0)
+                        values = dict(line.split('=', 1) for line in output.splitlines())
+                        self.assertEqual(values['image'], candidate)
+                        self.assertEqual(values['runner_mode'], mode)
+
+    def test_candidate_cannot_use_automatic_target_or_unauthorized_contexts(self):
+        image = self.repository + '@' + self.digest
+        contexts = [dict(event='push'), dict(event='pull_request_target'),
+                    dict(event='pull_request'), dict(event=''),
+                    dict(manual_authorized='false'), dict(manual_authorized=''),
+                    dict(pr_number=''), dict(pr_number='0'), dict(pr_number='042'),
+                    dict(pr_number='42\nimage=foreign')]
+        for context in contexts:
+            with self.subTest(context=context):
+                code, output = self.guard(image, candidate=image, **context)
+                self.assertNotEqual(code, 0)
+                self.assertEqual(output, '')
+
+    def test_invalid_candidate_refuses_instead_of_falling_back_to_shared_image(self):
+        good = self.repository + '@' + self.digest
+        for candidate in [' \t\n', self.repository + ':latest',
+                          'foreign.invalid/jenkins/model_test_env/vllm@' + self.digest,
+                          self.harbor + '/sibling/vllm@' + self.digest,
+                          self.repository + '@sha256:' + 'a' * 63,
+                          good + '\nimage=foreign', good + '@' + self.digest]:
+            with self.subTest(candidate=candidate):
+                code, output = self.guard(good, candidate=candidate)
+                self.assertNotEqual(code, 0)
+                self.assertEqual(output, '')
+
+    def test_empty_candidate_retains_shared_image_without_manual_pr_authorization(self):
+        image = self.repository + '@' + self.digest
+        for event in ['push', 'pull_request_target', 'workflow_dispatch']:
+            with self.subTest(event=event):
+                code, output = self.guard(image, event=event,
+                                          manual_authorized='', pr_number='')
+                self.assertEqual(code, 0)
+                self.assertEqual(dict(line.split('=', 1) for line in output.splitlines())['image'], image)
+
+    def test_candidate_input_uses_resolved_authorization_and_isolates_concurrency(self):
+        self.assertIn('      candidate_image:\n', self.source)
+        self.assertIn('CANDIDATE_IMAGE: ${{ inputs.candidate_image }}', self.resolver)
+        self.assertIn('MANUAL_AUTHORIZED: ${{ needs.resolve-target.outputs.manual_authorized }}', self.resolver)
+        self.assertIn('RESOLVED_PR_NUMBER: ${{ needs.resolve-target.outputs.pr_number }}', self.resolver)
+        self.assertIn('needs: [resolve-target, select, authorize-device]', self.resolver)
+        concurrency = self.source.split('\nconcurrency:\n', 1)[1].split('\njobs:\n', 1)[0]
+        self.assertIn("inputs.candidate_image && format('-candidate-{0}', inputs.candidate_image) || ''", concurrency)
 
     def test_only_configured_repository_digest_is_emitted(self):
         for harbor in [self.harbor, 'other-harbor.invalid']:
