@@ -364,3 +364,69 @@ do not qualify gfx836; independent earlier Qwen3 BF16 and gfx938 E5M2 losses
 remain recorded. Keep Draft and `last_good=false`.
 
 Runtime CI44305568352 is **success**:8 source,1204 portable,383 gfx936 native/Graph and1 gfx938 synthetic case, all zero failures/errors/skips. The64 local sliding cases overlap with the383 CI native cases. Full immutable-head checkout logs and artifact SHA256 digests were verified. gfx938 is synthetic operator coverage. This evidence belongs to the tested runtime SHA above; the following documentation commit has no new runtime payload.
+
+
+## 2026-11-18 Gemma2 long-context four-arm comparison
+
+This separate boundary probe uses the same unchanged pretrained Gemma2
+checkpoint and runtime payload as the four-arm HE32 cohort above, on **gfx936**.
+Core remains 0.33 (`98a09850d56b`); there is no new Core or Adapter change.
+TP1, BF16 compute, context8192, block64, batched tokens1024, default
+FULL_AND_PIECEWISE Graph, prefix caching, softcap50 and the original
+13 full/13 sliding4096 layers are preserved. Worker RPC checks all26 actual
+attention implementations, window bounds, head size256, softcap and cache dtype.
+All six installed package RECORDs and the checkpoint seal match before/after
+each arm; the published Flash runtime is byte-identical to the tested source.
+
+Six fixed integer-token prompts have lengths4095,4096,4097,6144,6144,4352;
+their requested keys are RED, BLUE, GREEN, GOLD, SILVER and BLACK. A subsequent
+four-request concurrent wave repeats RED/GOLD/SILVER/BLACK. Identical request
+payloads use temperature0, seed0, max_tokens16 and sampled/top5 logprobs.
+The first-wave files retain their original `*-cold.json` names, but later
+first-wave requests reuse common prefix blocks too. These are long sequence
+positions and cache reuse probes, **not evidence of a completely uncached
+6144-token prefill** or a performance benchmark.
+
+| Arm | Exact key after whitespace | Normal stops | Completion tokens | Prefix hits | Actual Graph launches |
+| --- | ---: | ---: | ---: | ---: | ---: |
+| reference-bf16 | 10/10 | 10/10 | 40 | 42624 | 8 |
+| flash-bf16 | 10/10 | 10/10 | 40 | 42624 | 8 |
+| reference-e4m3 | 10/10 | 10/10 | 40 | 42624 | 8 |
+| flash-e4m3 | 10/10 | 10/10 | 40 | 42624 | 8 |
+
+Exact greedy token/text comparisons over the same ten requests:
+
+- reference-bf16 / flash-bf16: equal token sequences 10/10; equal texts 10/10; maximum sampled-logprob difference along identical histories 0.015656114.
+- reference-e4m3 / flash-e4m3: equal token sequences 10/10; equal texts 10/10; maximum sampled-logprob difference along identical histories 0.030717403.
+- reference-bf16 / reference-e4m3: equal token sequences 10/10; equal texts 10/10; maximum sampled-logprob difference along identical histories 0.03996912.
+- flash-bf16 / flash-e4m3: equal token sequences 10/10; equal texts 10/10; maximum sampled-logprob difference along identical histories 0.035611284.
+
+The logprob differences are observations, not a new numerical tolerance.
+Raw logprobs, integer prompt IDs, generated token representations, request/
+response hashes and unchanged-source checks remain in the evidence. Native
+profiles show actual `kernel_unified_attention` execution in all four arms.
+The E4M3 reference traces Core's `reshape_and_cache_kernel_flash`; its retained
+compiled IR has `f8E4M3FN` key/value cache pointers. The E4M3 Plugin traces
+the native HCU byte-cache writer. The original review expected the Plugin
+writer name in both arms and failed; the corrected review checks each actual
+provider plus the reference's compiled format. Both review scripts and the
+failure are retained, with no regenerated responses. Traces cover the final
+first-wave request and the concurrent repeat wave; earlier requests are
+supported by API responses and runtime policy inspection, not by those traces.
+All repeated keys match their own first-wave output.
+
+**Remaining gates:** native leak diagnostics persist in all four arms;
+the original15s cleanup also force-kills remaining workers in reference-bf16, flash-bf16, flash-e4m3.
+Recorded services/descendants release, but the original lifecycle gate stays
+failed. This key-retrieval probe does not replace HE32, resolve strict format
+probes, qualify cache reclamation, or clear earlier Qwen3 BF16/E4M3 and gfx938
+E5M2 task losses. There is no gfx836 qualification or full-feature/last-good
+claim; keep Draft. The separate original HE32 raw/normalized results above
+are unchanged. DeepSeek V4 remains last.
+
+Retained evidence: upgrade workspace
+`publication/plugin410-long-context-20261118-r145/`, with exact requests,
+40 responses, pre/postflight seals, runtime inspections, metrics, profiles,
+original cleanup logs, controllers and response/trace review output. The earlier
+tokenizer/orchestration failures are retained separately and are not model
+results. This follow-up changes documentation and the skill reference only.

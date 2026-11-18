@@ -111,3 +111,14 @@ The [Qwen3-8B final-payload comparison](../../../docs/validation/vllm033-flash-e
 records an E4M3 raw loss despite equal normalized totals and passing Graph/prefix
 probes. Its unchanged full-cohort BF16 repeat preserves the failing-task boundary;
 neither that repeat nor normal process exits waive accuracy or native-owner leaks.
+
+
+For a sliding-window model, include sequence positions on both sides of the
+window boundary and changed concurrent prefix repeats. Preserve exact integer
+prompts and generated tokens, inspect each layer's actual window/softcap/cache
+policy, and record prefix-hit counters plus actual Graph/kernel traces. A long
+prompt can still reuse cached blocks; distinguish its total sequence length
+from the uncached prefill length instead of calling every first-wave request
+cold. State which request waves the profile captures. Short key-retrieval probes
+supplement the original model evaluation and do not establish long uncached
+prefill, cache reclamation or accuracy/lifecycle acceptance.
