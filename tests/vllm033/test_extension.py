@@ -28,6 +28,15 @@ def context(version: str | None = "0.33.0") -> ExtensionContext:
 @pytest.fixture(autouse=True)
 def reset_activation(monkeypatch: pytest.MonkeyPatch):
     monkeypatch.setattr(extension, "_activated", False)
+    monkeypatch.setattr(extension, "_provider_health", None)
+    # Existing ABI tests exercise explicit opt-in; OFF is covered separately.
+    monkeypatch.setenv("VLLM_HCU_USE_CUSTOM_OPS", "1")
+    monkeypatch.setenv("VLLM_HCU_USE_CUSTOM_RMS_NORM", "1")
+    from hcu_vllm_das import rms_provider
+    from hcu_adapter.runtime_lifecycle import ProcessLocalLifecycle
+    monkeypatch.setattr(rms_provider, "_lifecycle", ProcessLocalLifecycle(
+        runtime_action=rms_provider._ACTION, error_type=extension.DasExtensionError))
+    monkeypatch.setattr(rms_provider, "_provider", None)
 
 
 def successful_importer(calls: list[str]):
@@ -161,7 +170,7 @@ extensions.EXTENSION_API_VERSION = 2
 extensions.ExtensionContext = object
 
 class ExtensionSpec:
-    def __init__(self, *, name, api_version, priority, capabilities, activate):
+    def __init__(self, *, name, api_version, priority, capabilities, activate, check_health=None):
         self.name = name
         self.api_version = api_version
         self.priority = priority
@@ -552,8 +561,11 @@ def test_uninspectable_python_rms_is_not_treated_as_a_native_binding(
     assert extension._activated is False
     assert "hcu_vllm_das.rms_norm" not in calls
 
-    assert isinstance(caught.value.__cause__, TypeError)
-    assert "__signature__" in str(caught.value.__cause__)
+    # The common process lifecycle latches and wraps the original ABI error.
+    admission_error = caught.value.__cause__
+    assert isinstance(admission_error, extension.DasExtensionError)
+    assert isinstance(admission_error.__cause__, TypeError)
+    assert "__signature__" in str(admission_error.__cause__)
 
 
 @pytest.mark.parametrize("name", ("rms_norm", "fused_add_rms_norm"))
@@ -663,3 +675,170 @@ def test_native_rms_documentation_defaults_and_annotations_are_not_evaluated(
 
     assert extension._activated is True
     assert marker not in os.environ
+
+
+@pytest.mark.parametrize("master,child", (("0", "0"), ("0", "1"), ("1", "0"), (None, None)))
+def test_disabled_rms_publishes_official_fallback_without_importing_vendor(
+    monkeypatch, master, child,
+):
+    for key, value in (("VLLM_HCU_USE_CUSTOM_OPS", master),
+                       ("VLLM_HCU_USE_CUSTOM_RMS_NORM", child)):
+        if value is None:
+            monkeypatch.delenv(key, raising=False)
+        else:
+            monkeypatch.setenv(key, value)
+    calls = []
+    base = successful_importer(calls)
+
+    def importer(name):
+        assert not name.startswith("lightop"), "disabled RMS must not load native DSOs"
+        return base(name)
+
+    monkeypatch.setattr(extension, "_import_module", importer)
+    extension.activate_extension(context())
+    extension.extension_spec().check_health()
+    assert calls == ["vllm.model_executor.layers.layernorm", "vllm.utils.torch_utils",
+                     "vllm.envs", "hcu_vllm_das.rms_norm"]
+    assert extension._activated
+
+
+@pytest.mark.parametrize("requirement", ("extension", "capability"))
+@pytest.mark.parametrize("after_disabled_activation", (False, True))
+def test_required_rms_is_preflighted_even_when_switches_are_off(
+    monkeypatch, requirement, after_disabled_activation,
+):
+    monkeypatch.setenv("VLLM_HCU_USE_CUSTOM_OPS", "0")
+    monkeypatch.setenv("VLLM_HCU_USE_CUSTOM_RMS_NORM", "0")
+    calls = []
+    base = successful_importer(calls)
+
+    def importer(name):
+        if name == "lightop.norm":
+            calls.append(name)
+            raise ImportError("native provider unavailable")
+        return base(name)
+
+    monkeypatch.setattr(extension, "_import_module", importer)
+    if after_disabled_activation:
+        extension.activate_extension(context())
+        assert "lightop.norm" not in calls
+    required = ExtensionContext(adapter_version="0.5.22", vllm_version="0.33.0",
+        requested_extensions={"das-hcu"} if requirement == "extension" else (),
+        requested_capabilities={"lightop-rms-norm"} if requirement == "capability" else ())
+    with pytest.raises(extension.DasExtensionError, match="native provider unavailable"):
+        extension.activate_extension(required)
+    assert calls.count("lightop.norm") == 1
+    assert extension._activated is after_disabled_activation
+
+
+def test_health_does_not_load_vendor_after_policy_change(monkeypatch):
+    monkeypatch.setenv("VLLM_HCU_USE_CUSTOM_OPS", "0")
+    calls = []
+    monkeypatch.setattr(extension, "_import_module", successful_importer(calls))
+    extension.activate_extension(context())
+    assert "lightop.norm" not in calls
+    monkeypatch.setenv("VLLM_HCU_USE_CUSTOM_OPS", "1")
+    extension.check_health()
+    assert "lightop.norm" not in calls  # Health is read-only, never initializes a provider.
+    extension.get_lightop_norm()
+    extension.check_health()
+    assert calls.count("lightop.norm") == 1
+
+
+def test_concurrent_first_use_resolves_vendor_once(monkeypatch):
+    calls = []
+    monkeypatch.setattr(extension, "_import_module", successful_importer(calls))
+    with ThreadPoolExecutor(max_workers=8) as pool:
+        providers = tuple(pool.map(lambda _: extension.get_lightop_norm(), range(32)))
+    assert all(provider is providers[0] for provider in providers)
+    assert calls == ["lightop.norm"]
+
+
+def test_late_invalid_provider_is_latched_without_fallback(monkeypatch):
+    calls = []
+    def invalid(name):
+        calls.append(name)
+        return SimpleNamespace(rms_norm=None)
+    monkeypatch.setattr(extension, "_import_module", invalid)
+    for _ in range(2):
+        with pytest.raises(extension.DasExtensionError, match="rms_norm"):
+            extension.get_lightop_norm()
+    assert calls == ["lightop.norm"]
+
+
+def test_fork_during_vendor_resolution_refuses_without_waiting_on_parent(monkeypatch):
+    import os
+    import select
+    import threading
+    started, release = threading.Event(), threading.Event()
+    base = successful_importer([])
+    def importer(name):
+        started.set()
+        assert release.wait(10)
+        return base(name)
+    monkeypatch.setattr(extension, "_import_module", importer)
+    reader, writer = os.pipe()
+    child = None
+    with ThreadPoolExecutor(max_workers=1) as pool:
+        future = pool.submit(extension.get_lightop_norm)
+        assert started.wait(10)
+        try:
+            child = os.fork()
+            if child == 0:
+                os.close(reader)
+                try:
+                    extension.get_lightop_norm()
+                except extension.DasExtensionError as error:
+                    os.write(writer, str(error).encode())
+                    os._exit(0)
+                os._exit(2)
+            os.close(writer)
+            assert select.select([reader], [], [], 5)[0], "inherited provider lock deadlocked"
+            assert b"inherited incomplete" in os.read(reader, 4096)
+            assert os.waitpid(child, 0)[1] == 0
+            child = None
+        finally:
+            release.set()
+            os.close(reader)
+            if child:
+                os.kill(child, 9)
+                os.waitpid(child, 0)
+        assert future.result(timeout=10) is not None
+
+
+@pytest.mark.parametrize("requirement", ("extension", "capability"))
+def test_required_disabled_rms_validates_before_oot_registration(monkeypatch, requirement):
+    monkeypatch.setenv("VLLM_HCU_USE_CUSTOM_OPS", "0")
+    monkeypatch.setenv("VLLM_HCU_USE_CUSTOM_RMS_NORM", "0")
+    calls = []
+    monkeypatch.setattr(extension, "_import_module", successful_importer(calls))
+    required = ExtensionContext(adapter_version="0.5.22", vllm_version="0.33.0",
+        requested_extensions={"das-hcu"} if requirement == "extension" else (),
+        requested_capabilities={"lightop-rms-norm"} if requirement == "capability" else ())
+    extension.activate_extension(required)
+    assert calls[0] == "lightop.norm"
+    assert calls.index("lightop.norm") < calls.index("hcu_vllm_das.rms_norm")
+    extension.check_health()
+    assert calls.count("lightop.norm") == 1
+
+
+def test_read_only_health_preserves_late_failure_after_switches_are_disabled(monkeypatch):
+    monkeypatch.setenv("VLLM_HCU_USE_CUSTOM_OPS", "0")
+    calls = []
+    base = successful_importer(calls)
+    def invalid(name):
+        if name == "lightop.norm":
+            calls.append(name)
+            return SimpleNamespace(rms_norm=None)
+        return base(name)
+    monkeypatch.setattr(extension, "_import_module", invalid)
+    extension.activate_extension(context())
+    monkeypatch.setenv("VLLM_HCU_USE_CUSTOM_OPS", "1")
+    with pytest.raises(extension.DasExtensionError, match="rms_norm"):
+        extension.get_lightop_norm()
+    monkeypatch.setenv("VLLM_HCU_USE_CUSTOM_OPS", "0")
+    # Health must neither retry the provider nor mask its failure.
+    for _ in range(2):
+        with pytest.raises(extension.DasExtensionError, match="rms_norm"):
+            extension.check_health()
+    assert calls.count("lightop.norm") == 1

@@ -3,13 +3,13 @@
 from __future__ import annotations
 
 import torch
-from lightop.norm import fused_add_rms_norm, rms_norm
 
 from vllm import envs
 from vllm.model_executor.layers.layernorm import RMSNorm
 from vllm.utils.torch_utils import direct_register_custom_op
 
 from .environment import rms_norm_enabled
+from .extension import get_lightop_norm
 
 
 _LIGHTOP_RMS_NORM_MIN_WIDTH = 64
@@ -25,7 +25,7 @@ def _rms_norm_impl(
     # vLLM's native IR rounds the normalized value before multiplying weight.
     # The autograd export narrows epsilon to x.dtype. The public inference
     # export retains FP32 epsilon; its default aliases x, so provide an output.
-    normalized = rms_norm(
+    normalized = get_lightop_norm().rms_norm(
         x, torch.ones_like(weight), variance_epsilon, torch.empty_like(x)
     )
     return normalized * weight
@@ -47,7 +47,9 @@ def _fused_add_rms_norm_impl(
     weight: torch.Tensor,
     variance_epsilon: float,
 ) -> None:
-    fused_add_rms_norm(x, residual, torch.ones_like(weight), variance_epsilon)
+    get_lightop_norm().fused_add_rms_norm(
+        x, residual, torch.ones_like(weight), variance_epsilon
+    )
     x.mul_(weight)
 
 
