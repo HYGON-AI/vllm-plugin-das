@@ -30,9 +30,29 @@ cd "${GITHUB_WORKSPACE:?GITHUB_WORKSPACE is required}"
 export CI=1 VLLM_HCU_IS_IN_CI=1 PYTHONDONTWRITEBYTECODE=1
 export PYTHONPATH="$GITHUB_WORKSPACE${PYTHONPATH:+:$PYTHONPATH}"
 export HCU_CI_ENVIRONMENT_LOCK="$GITHUB_WORKSPACE/.github/workflows/configs/hcu-runner-environment.json"
-export TORCHINDUCTOR_CACHE_DIR="${RUNNER_TEMP:?RUNNER_TEMP is required}/hcu-ci-torchinductor"
-export XDG_CACHE_HOME="$RUNNER_TEMP/hcu-ci-cache"
-mkdir -p "$TORCHINDUCTOR_CACHE_DIR" "$XDG_CACHE_HOME" "${HCU_CI_JOB_ROOT:?HCU_CI_JOB_ROOT is required}"
+# The platform owns this NFS mount. Never silently recreate it on local disk.
+if [[ ! -d /ci_public || ! -w /ci_public ]]; then
+  echo "ARC requires the platform-provided writable /ci_public mount" >&2
+  exit 2
+fi
+# Do not consume a mutable cache published by another PR or a previous attempt.
+# Namespace both architectures and all partitions by their original job ID.
+if [[ ! "${GITHUB_REPOSITORY:-}" =~ ^[A-Za-z0-9][A-Za-z0-9_.-]*/[A-Za-z0-9][A-Za-z0-9_.-]*$ ||
+      ! "${GITHUB_RUN_ID:-}" =~ ^[0-9]+$ ||
+      ! "${GITHUB_RUN_ATTEMPT:-}" =~ ^[0-9]+$ ||
+      ! "${HCU_CI_JOB_ID:-}" =~ ^[A-Za-z0-9_-]+$ ]]; then
+  echo "invalid ARC scratch namespace" >&2
+  exit 2
+fi
+scratch="/ci_public/hcu-ci/$GITHUB_REPOSITORY/$GITHUB_RUN_ID/$GITHUB_RUN_ATTEMPT/$HCU_CI_JOB_ID"
+# Only installers opt into this temporary directory. Runtime TMPDIR stays local:
+# vLLM/Python use it for Unix sockets, whose path length is limited on Linux.
+export HCU_CI_NFS_TMPDIR="$scratch/tmp"
+export PIP_CACHE_DIR="$scratch/pip-cache"
+export TORCHINDUCTOR_CACHE_DIR="$scratch/torchinductor"
+export XDG_CACHE_HOME="$scratch/cache"
+mkdir -p "$HCU_CI_NFS_TMPDIR" "$PIP_CACHE_DIR" "$TORCHINDUCTOR_CACHE_DIR" "$XDG_CACHE_HOME" "${HCU_CI_JOB_ROOT:?HCU_CI_JOB_ROOT is required}"
+echo "ARC scratch: $scratch; reports: $HCU_CI_JOB_ROOT" >&2
 # Only trust this checkout for package metadata; never trust all directories.
 git config --global --add safe.directory "$GITHUB_WORKSPACE"
 

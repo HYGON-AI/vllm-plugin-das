@@ -359,6 +359,11 @@ def test_workflow_keeps_pr_event_trusted_base_auth_and_head_only_execution():
             "Preserve caller ARC matrix mapper",
         ),
         (
+            "static-and-select",
+            "scripts/ci/hcu/hcu_ci_run_k8s.sh",
+            "Preserve caller ARC matrix mapper",
+        ),
+        (
             "hardware",
             "scripts/ci/hcu/hcu_ci_run_k8s.sh",
             "Preserve caller ARC native launcher",
@@ -397,6 +402,15 @@ def test_bootstrap_survives_shallow_checkout_of_pre_migration_head(
     helper_path.parent.mkdir(parents=True)
     expected_helper = (REPOSITORY / helper).read_bytes()
     helper_path.write_bytes(expected_helper)
+    if job_id == "static-and-select":
+        # This bootstrap step preserves both helpers before head checkout.
+        for relative in (
+            ".github/scripts/hcu_ci/prepare_hcu_k8s.py",
+            "scripts/ci/hcu/hcu_ci_run_k8s.sh",
+        ):
+            target = remote / relative
+            target.parent.mkdir(parents=True, exist_ok=True)
+            target.write_bytes((REPOSITORY / relative).read_bytes())
     (remote / "base-only.txt").write_text("new base revision\n")
     git(remote, "add", ".")
     git(remote, "commit", "-m", "migration on base")
@@ -471,6 +485,8 @@ def test_arc_container_contract_and_failure_artifacts():
         assert set(jobs[job_id]["container"]) == {"image"}
         assert jobs[job_id]["defaults"]["run"]["shell"] == "bash"
     hardware = jobs["hardware"]
+    assert hardware["strategy"]["max-parallel"] == "4"
+    assert hardware["strategy"]["fail-fast"] == "false"
     assert hardware["timeout-minutes"] == "${{ matrix.timeout_minutes }}"
     assert (
         hardware["env"]["HCU_CI_ISOLATE_GENERATED_CODE"]
@@ -526,7 +542,8 @@ def test_native_helper_rejects_wrong_environment_and_isolated_jobs():
         assert forbidden not in source
 
 
-def test_native_helper_preserves_resources_devices_and_thread_budgets(tmp_path):
+@pytest.fixture
+def native_environment(tmp_path):
     workspace = tmp_path / "workspace with spaces"
     workspace.mkdir()
     (workspace / ".github/workflows/configs").mkdir(parents=True)
@@ -538,20 +555,27 @@ def test_native_helper_preserves_resources_devices_and_thread_budgets(tmp_path):
     home = tmp_path / "home"
     home.mkdir()
     dtk = tmp_path / "dtk-env.sh"
-    dtk.write_text("export DTK_TEST_SOURCED=yes MAX_JOBS=99 HIP_VISIBLE_DEVICES=99\n")
-    source = (REPOSITORY / "scripts/ci/hcu/hcu_ci_run_k8s.sh").read_text()
-    # Only replace the unavailable DTK installation in this CPU fixture.
-    assert "source /opt/dtk/env.sh" in source
-    source = source.replace("source /opt/dtk/env.sh", 'source "' + posix(dtk) + '"')
-    source = source.replace(
-        'exec "$@"',
-        'printf "%s\\n" "$DTK_TEST_SOURCED" "$VLLM_HCU_TEST_MODEL_ROOT" "$VLLM_HCU_TEST_DATASET_ROOT" "$OMP_NUM_THREADS" "$MAX_JOBS" "$CMAKE_BUILD_PARALLEL_LEVEL" "$HIP_VISIBLE_DEVICES" "$CUDA_VISIBLE_DEVICES" "$HCU_CI_ENVIRONMENT_LOCK"',
+    dtk.write_text(
+        "export DTK_TEST_SOURCED=yes OMP_NUM_THREADS=99 MAX_JOBS=99 "
+        "CMAKE_BUILD_PARALLEL_LEVEL=99 HIP_VISIBLE_DEVICES=99 "
+        "CUDA_VISIBLE_DEVICES=99 ROCR_VISIBLE_DEVICES=99\n"
     )
+    storage = tmp_path / "ci_public"
+    storage.mkdir()
+    source = (REPOSITORY / "scripts/ci/hcu/hcu_ci_run_k8s.sh").read_text()
+    # Substitute only the two platform mounts absent from CPU/Windows fixtures.
+    assert "source /opt/dtk/env.sh" in source and "/ci_public" in source
+    source = source.replace("source /opt/dtk/env.sh", 'source "' + posix(dtk) + '"')
+    source = source.replace("/ci_public", posix(storage))
     environment = dict(
         HCU_CI_IN_K8S="1",
         HCU_CI_ISOLATE_GENERATED_CODE="0",
         HOME=posix(home),
         GITHUB_WORKSPACE=posix(workspace),
+        GITHUB_REPOSITORY="HYGON-AI/vllm-plugin-das",
+        GITHUB_RUN_ID="12345",
+        GITHUB_RUN_ATTEMPT="1",
+        HCU_CI_JOB_ID="contract-hcu-gfx936-p1of2",
         RUNNER_TEMP=posix(tmp_path),
         HCU_CI_JOB_ROOT=posix(tmp_path / "reports"),
         HCU_CI_MODEL_ROOT=posix(model),
@@ -561,20 +585,163 @@ def test_native_helper_preserves_resources_devices_and_thread_budgets(tmp_path):
         CMAKE_BUILD_PARALLEL_LEVEL="5",
         HIP_VISIBLE_DEVICES="2",
         CUDA_VISIBLE_DEVICES="2",
+        ROCR_VISIBLE_DEVICES="",  # Empty scheduler values must be preserved too.
+    )
+    return source, environment, storage
+
+
+def test_native_helper_preserves_resources_devices_and_thread_budgets(
+    native_environment,
+):
+    source, environment, storage = native_environment
+    source = source.replace(
+        'exec "$@"',
+        'printf "%s\\n" "$DTK_TEST_SOURCED" "$VLLM_HCU_TEST_MODEL_ROOT" "$VLLM_HCU_TEST_DATASET_ROOT" "$OMP_NUM_THREADS" "$MAX_JOBS" "$CMAKE_BUILD_PARALLEL_LEVEL" "$HIP_VISIBLE_DEVICES" "$CUDA_VISIBLE_DEVICES" "$ROCR_VISIBLE_DEVICES" "$HCU_CI_ENVIRONMENT_LOCK"',
     )
     result = run_bash("set -- true\n" + source, environment)
     assert result.returncode == 0, result.stdout + result.stderr
-    assert result.stdout.splitlines()[:8] == [
+    assert result.stdout.splitlines()[:9] == [
         "yes",
-        posix(model),
-        posix(dataset),
+        environment["HCU_CI_MODEL_ROOT"],
+        environment["HCU_CI_DATASET_ROOT"],
         "7",
         "6",
         "5",
         "2",
         "2",
+        "",
     ]
-    assert result.stdout.splitlines()[8].endswith(
+    assert result.stdout.splitlines()[9].endswith(
         "/.github/workflows/configs/hcu-runner-environment.json"
     )
-    assert (tmp_path / "reports").is_dir()
+    assert (storage.parent / "reports").is_dir()
+
+
+def test_native_helper_uses_nfs_for_installer_temp_and_compiler_caches(
+    native_environment,
+):
+    source, environment, storage = native_environment
+    source = source.replace(
+        'exec "$@"',
+        'printf "%s\\n" "$HCU_CI_NFS_TMPDIR" "$PIP_CACHE_DIR" "$TORCHINDUCTOR_CACHE_DIR" "$XDG_CACHE_HOME"',
+    )
+    expected = (
+        storage / "hcu-ci/HYGON-AI/vllm-plugin-das/12345/1/contract-hcu-gfx936-p1of2"
+    )
+    for updates, scratch in (
+        ({}, expected),
+        (
+            {"HCU_CI_JOB_ID": "contract-hcu-gfx936-p2of2"},
+            expected.with_name("contract-hcu-gfx936-p2of2"),
+        ),
+        ({"GITHUB_RUN_ATTEMPT": "2"}, expected.parent.parent / "2" / expected.name),
+        (
+            {"GITHUB_RUN_ID": "67890"},
+            storage / "hcu-ci/HYGON-AI/vllm-plugin-das/67890/1" / expected.name,
+        ),
+        (
+            {"GITHUB_REPOSITORY": "fork/vllm-plugin-das"},
+            storage / "hcu-ci/fork/vllm-plugin-das/12345/1" / expected.name,
+        ),
+    ):
+        result = run_bash("set -- true\n" + source, dict(environment, **updates))
+        assert result.returncode == 0, result.stdout + result.stderr
+        directories = [
+            scratch / name for name in ("tmp", "pip-cache", "torchinductor", "cache")
+        ]
+        assert result.stdout.splitlines() == [posix(path) for path in directories]
+        assert all(path.is_dir() for path in directories)
+
+
+def test_native_helper_does_not_recreate_a_missing_platform_mount(native_environment):
+    source, environment, storage = native_environment
+    storage.rmdir()  # Empty fixture directory only, not a recursive deletion.
+    result = run_bash("set -- true\n" + source, environment)
+    assert result.returncode == 2
+    assert "platform-provided writable" in result.stderr
+    assert not storage.exists()
+
+
+@pytest.mark.parametrize(
+    "updates",
+    [
+        {"GITHUB_REPOSITORY": "../escape"},
+        {"GITHUB_REPOSITORY": "owner/../../escape"},
+        {"GITHUB_RUN_ID": "../escape"},
+        {"GITHUB_RUN_ATTEMPT": "../escape"},
+        {"HCU_CI_JOB_ID": "../escape"},
+        {"HCU_CI_JOB_ID": "bad\njob"},
+    ],
+)
+def test_native_helper_rejects_invalid_scratch_namespaces(native_environment, updates):
+    source, environment, storage = native_environment
+    result = run_bash("set -- true\n" + source, dict(environment, **updates))
+    assert result.returncode == 2
+    assert "invalid ARC scratch namespace" in result.stderr
+    assert list(storage.iterdir()) == []
+
+
+def test_native_helper_propagates_the_original_command_failure(native_environment):
+    source, environment, _ = native_environment
+    result = run_bash("set -- bash -c 'exit 37'\n" + source, environment)
+    assert result.returncode == 37
+
+
+def test_static_and_selection_share_the_platform_preserving_native_launcher():
+    static = workflow("_hcu-pr-ci-k8s.yml")["jobs"]["static-and-select"]
+    assert static["env"]["HCU_CI_JOB_ID"] == "static-and-select"
+    for name in (
+        "Verify patch contracts",
+        "Select the unchanged registered test partitions",
+        "Map supported topologies without changing test selection",
+    ):
+        step = next(step for step in static["steps"] if step.get("name") == name)
+        assert (
+            'bash "$RUNNER_TEMP/hcu-ci-arc-bootstrap/hcu_ci_run_k8s.sh"' in step["run"]
+        )
+        assert "source /opt/dtk/env.sh" not in step["run"]
+        syntax = subprocess.run(
+            ["bash", "-n"], input=step["run"], text=True, capture_output=True
+        )
+        assert syntax.returncode == 0, syntax.stderr
+
+
+def test_only_installers_opt_into_the_nfs_temporary_directory(native_environment):
+    source, environment, storage = native_environment
+    environment["TMPDIR"] = posix(storage.parent / "local-runtime-tmp")
+    Path(storage.parent / "local-runtime-tmp").mkdir()
+    runtime = run_bash(
+        'set -- bash -c \'printf "%s\\n" "$TMPDIR"\'\n' + source, environment
+    )
+    assert runtime.returncode == 0, runtime.stdout + runtime.stderr
+    assert runtime.stdout.strip() == environment["TMPDIR"]
+    installer = run_bash(
+        'set -- bash -c \'export TMPDIR="$HCU_CI_NFS_TMPDIR"; printf "%s\\n" "$TMPDIR"\'\n'
+        + source,
+        environment,
+    )
+    assert installer.returncode == 0, installer.stdout + installer.stderr
+    assert installer.stdout.strip().startswith(posix(storage) + "/hcu-ci/")
+    jobs = workflow("_hcu-pr-ci-k8s.yml")["jobs"]
+    static = next(
+        step
+        for step in jobs["static-and-select"]["steps"]
+        if step.get("name") == "Verify patch contracts"
+    )
+    assert (
+        'TMPDIR="$HCU_CI_NFS_TMPDIR" python3 .github/scripts/hcu_ci/ensure_ci_dependencies.py --user'
+        in static["run"]
+    )
+    install = next(
+        step
+        for step in jobs["hardware"]["steps"]
+        if step.get("name")
+        == "Install plugin and selected job dependencies in the job container"
+    )
+    assert 'export TMPDIR="$HCU_CI_NFS_TMPDIR"' in install["run"]
+    run = next(
+        step
+        for step in jobs["hardware"]["steps"]
+        if step.get("name") == "Run unchanged preflight and registered test partition"
+    )
+    assert "export TMPDIR=" not in run["run"]
