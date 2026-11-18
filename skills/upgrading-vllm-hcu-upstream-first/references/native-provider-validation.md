@@ -40,7 +40,14 @@ provider. Required extensions use published entry-point names, which can differ
 from declared spec names; exercise the real host activation with that metadata.
 Reuse Adapter's process-local lifecycle for serialized first-use ABI checks
 and fork refusal; a health checker reports failures without initializing
-or repairing the provider. Verify enabled ordinary/fused execution and changing
+or repairing the provider. Guard the outer publication transaction as well:
+a separate module lock acquired before provider resolution can be inherited
+locked and prevent the child from reaching the provider's fork guard. Exercise
+the published entrypoint through real host activation while the parent is in
+both provider loading and registration, plus direct provider access during
+incomplete publication. Require prompt refusal before another import, parent
+completion and owned-child cleanup; resetting a lock alone must not permit
+publication over inherited partial state. Verify enabled ordinary/fused execution and changing
 input Graph replay after an installed-wheel binding check. Count shutdown leaks
 and the original cleanup deadline separately: fewer imports do not establish a
 clean exit or a speedup. The Plugin RMS example is documented in

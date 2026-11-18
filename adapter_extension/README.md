@@ -379,7 +379,7 @@ only for uninspectable native builtins, a compatible concrete declaration from
 generated binding documentation, including overloads and optional additions.
 Declarations are parsed without evaluating annotations or defaults. Missing or
 incompatible documentation, uninspectable Python callables, and asynchronous or
-generator providers are rejected. Explicit RMS opt-in, a required `das-hcu` extension, or a required
+generator providers are rejected. Explicit RMS opt-in, a required `das_hcu` extension, or a required
 `lightop-rms-norm` capability performs these checks before registration.
 With RMS disabled and no explicit requirement, registration retains the official
 fallback and compile factor without importing LightOp. If later enabled, the

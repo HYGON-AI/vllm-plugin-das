@@ -20,6 +20,17 @@ Adapter activation through the project metadata, covering missing imports and
 invalid ABI both before and after optional activation. These regressions do not
 extend the recorded wheel/device/model qualification below to a new build.
 
+Publication itself also uses Adapter's process-local lifecycle. A child forked
+while the parent is resolving the provider or registering RMS refuses inherited
+incomplete activation before taking a lock or importing another provider. This
+guard covers both the actual published entrypoint through `activate_extensions`
+and the direct provider accessor. A later explicit requirement still preflights
+the provider after an earlier optional activation; health remains read-only and
+initialization failures stay latched. Regression cases use real metadata and
+Adapter activation with controlled CPU provider/registration doubles, preserving
+the parent completion and owned-child cleanup checks. Python activation across
+fork and native/model teardown remain separate qualification gates.
+
 ## Source and component verification
 
 Candidate is based on Plugin `v0.33.0` commit
