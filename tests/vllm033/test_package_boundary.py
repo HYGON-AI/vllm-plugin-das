@@ -17,6 +17,7 @@ SOURCE_ROOT = PROJECT_ROOT / "src"
 # wheel are checked against this, so the two cannot drift apart.
 EXPECTED_ENTRY_POINTS = {
     "hcu_adapter.extensions": {
+        "das_hcu_mooncake_trace": "hcu_vllm_das.mooncake_trace:extension_spec",
         "minimax31_slimquant": "hcu_vllm_das.quantization.minimax31_activation:extension_spec",
         "minimax31_pcp_ep": "hcu_vllm_das.parallel.minimax31_pcp_activation:extension_spec",
         "das_hcu": "hcu_vllm_das.extension:extension_spec",
