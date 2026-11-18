@@ -164,7 +164,7 @@ class Fp4Indexer(common.DeepseekV4Indexer):
 def _compressor_factory(*args, **kwargs):
     cfg = args[0] if args else kwargs['vllm_config']
     if cfg.parallel_config.prefill_context_parallel_size > 1 and cfg.speculative_config is not None:
-        from hcu_adapter.kernels.pcp_dspark import HcuPcpDSparkCompressor
+        from .pcp_dspark import HcuPcpDSparkCompressor
         return HcuPcpDSparkCompressor(*args, **kwargs)
     return common.DeepseekCompressor(*args, **kwargs)
 

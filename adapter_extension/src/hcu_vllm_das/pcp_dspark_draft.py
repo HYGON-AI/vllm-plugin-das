@@ -4,7 +4,7 @@ from __future__ import annotations
 
 import copy
 
-from hcu_adapter.dspark_capacity import token_capacity
+from .dspark_capacity import token_capacity
 
 _KEY = '_hcu_dsv41_pcp_dspark_draft'
 
