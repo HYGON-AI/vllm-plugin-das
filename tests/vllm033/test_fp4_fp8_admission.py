@@ -156,3 +156,90 @@ def test_pending_mxfp4_admission_keeps_provider_and_digest_checks(owners, monkey
     monkeypatch.setattr(owners.indexer, '_compute_digest', lambda: 'changed')
     with pytest.raises(ExtensionCommitError, match='implementation changed'):
         owners.indexer.check_health()
+
+
+def test_auto_deployment_waits_for_platform_default(owners, monkeypatch):
+    from vllm.config import AttentionConfig
+
+    owners.cfg.model_config = NS(hf_text_config=NS(model_type='deepseek_v41'))
+    owners.cfg.attention_config = AttentionConfig()
+    assert owners.indexer._uses_fp4_cache() is None
+    # Explicit admission resolves the remaining auto case to FP8 when the
+    # paired owners were unavailable at platform configuration time.
+    assert owners.indexer._uses_fp4_cache(owners.cfg) is False
+    load(owners)
+    assert owners.indexer._state['fp4'] is None
+    owners.indexer.admit_config(owners.cfg)
+    assert owners.indexer._state['fp4'] is False
+    owners.indexer.check_health()
+
+
+def test_resolved_auto_uses_the_fp4_deployment_branch(owners):
+    from vllm.config import AttentionConfig
+
+    owners.cfg.model_config = NS(hf_text_config=NS(model_type='deepseek_v41'))
+    owners.cfg.attention_config = AttentionConfig()
+    assert owners.indexer._uses_fp4_cache() is None
+    owners.cfg.attention_config.indexer_kv_dtype = 'mxfp4'
+    assert owners.indexer._uses_fp4_cache() is True
+    assert owners.indexer._uses_fp4_cache(owners.cfg) is True
+
+
+def test_previous_adapter_keeps_its_original_auto_policy(owners, monkeypatch):
+    from vllm.config import AttentionConfig
+
+    owners.cfg.model_config = NS(hf_text_config=NS(model_type='deepseek_v41'))
+    owners.cfg.attention_config = AttentionConfig()
+    monkeypatch.delattr(fp4_indexer, 'default_requested')
+    assert owners.indexer._uses_fp4_cache() is False
+
+
+@pytest.mark.parametrize('config_available_at_activation', [True, False])
+def test_default_after_public_owner_activation(owners, monkeypatch,
+                                             config_available_at_activation):
+    from hcu_adapter import registry
+    from hcu_adapter.bridges import vllm as bridge
+    from hcu_adapter.extensions import ExtensionSpec
+    from vllm import config
+    from hcu_vllm_das import fp4_indexer as native, fp4_indexer_lightop as reader
+
+    owners.cfg.model_config = NS(hf_text_config=NS(model_type='deepseek_v41'))
+    owners.cfg.attention_config = config.AttentionConfig()
+    current = owners.cfg if config_available_at_activation else None
+    monkeypatch.setattr(config, 'get_current_vllm_config_or_none', lambda: current)
+    monkeypatch.setattr(bridge, '_RUNTIME_ACTIONS', bridge.ProcessLocalActions())
+    monkeypatch.setattr(registry, '_RECORDS', {})
+    monkeypatch.setattr(registry, '_BOUND', {})
+    # Only native packer/provider operations are doubled. The public loader,
+    # exact process-local health bindings and indexer deployment admission run.
+    monkeypatch.setattr(owners.packer, '_state', {'mode': 'triton'})
+    monkeypatch.setattr(owners.packer, 'check_health', lambda: None)
+    monkeypatch.setattr(reader, 'load_providers', lambda: None)
+    monkeypatch.setattr(native, 'check_native_contract', lambda: None)
+    monkeypatch.setattr(owners.indexer, '_compute_digest', lambda: 'digest')
+    monkeypatch.setattr(owners.indexer, '_digest_signature', lambda: ('signature',))
+    packer = ExtensionSpec('cpu-packer', 1, 120,
+                           frozenset({'hcu-e2m1-packer-lowering'}),
+                           lambda _: None, lambda: None)
+    points = [NS(name='indexer', load=lambda: owners.indexer.extension_spec),
+              NS(name='packer', load=lambda: lambda: packer)]
+    reports = activate_extensions(ExtensionContext('0.1.0', '0.33.0'),
+                                  entry_points=points,
+                                  health_check_sink=bridge._RUNTIME_ACTIONS.record_extension_health)
+    assert all(report.status is ExtensionStatus.ACTIVE for report in reports)
+    bridge._RUNTIME_ACTIONS.record_extension_reports(reports)
+    assert owners.indexer._state['fp4'] is None
+    bridge._configure_indexer_kv_dtype(owners.cfg)
+    assert owners.cfg.attention_config.indexer_kv_dtype == 'mxfp4'
+    current = owners.cfg
+    owners.indexer.admit_config(owners.cfg)
+    assert owners.indexer._state['fp4'] is True
+    bridge.require_extension_healthy('hcu-v41-fp8-indexer-eager-reference')
+    assert owners.indexer.policy_factor() == ('fp4-lightop', 'digest')
+    # Once admitted, auto is a real policy change, not another activation wait.
+    owners.cfg.attention_config.indexer_kv_dtype = 'auto'
+    with pytest.raises(bridge.LatchedVllmRuntimeError, match='ownership/policy changed'):
+        bridge.require_extension_healthy('hcu-v41-fp8-indexer-eager-reference')
+    owners.cfg.attention_config.indexer_kv_dtype = 'mxfp4'
+    with pytest.raises(bridge.LatchedVllmRuntimeError):
+        bridge.require_extension_healthy('hcu-v41-fp8-indexer-eager-reference')

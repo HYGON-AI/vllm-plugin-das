@@ -9,6 +9,7 @@ from hcu_adapter.extensions import ExtensionCommitError, ExtensionSpec
 
 from .dsv41_activation import _require_release
 from .environment import _flag
+from hcu_adapter import fp4_indexer as fp4_policy
 from hcu_adapter.fp4_indexer import applicable as fp4_applicable, selected as fp4_selected
 
 _state = None
@@ -99,6 +100,13 @@ def _uses_fp4_cache(cfg=None):
     if cfg is None:
         from vllm.config import get_current_vllm_config_or_none
         cfg = get_current_vllm_config_or_none()
+        # A model config may already exist while general plugins activate.
+        # Keep auto pending until the platform has checked both provider owners
+        # and resolved the effective dtype. Explicit admission always uses cfg.
+        default_requested = getattr(fp4_policy, 'default_requested', None)
+        pending = _state is None or _state.get('fp4') is None
+        if pending and default_requested is not None and default_requested(cfg):
+            return None
     return None if cfg is None else fp4_applicable(cfg)
 
 
