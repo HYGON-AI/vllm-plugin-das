@@ -195,16 +195,20 @@ def test_previous_adapter_keeps_its_original_auto_policy(owners, monkeypatch):
 
 
 @pytest.mark.parametrize('config_available_at_activation', [True, False])
+@pytest.mark.parametrize('tp_size,expected_dtype', [(1, 'mxfp4'), (2, 'auto')])
 def test_default_after_public_owner_activation(owners, monkeypatch,
-                                             config_available_at_activation):
+                                              config_available_at_activation,
+                                              tp_size, expected_dtype):
     from hcu_adapter import registry
     from hcu_adapter.bridges import vllm as bridge
     from hcu_adapter.extensions import ExtensionSpec
     from vllm import config
     from hcu_vllm_das import fp4_indexer as native, fp4_indexer_lightop as reader
+    from test_fp4_full_admission import config as fp4_config
 
-    owners.cfg.model_config = NS(hf_text_config=NS(model_type='deepseek_v41'))
+    owners.cfg = fp4_config()
     owners.cfg.attention_config = config.AttentionConfig()
+    owners.cfg.parallel_config.tensor_parallel_size = tp_size
     current = owners.cfg if config_available_at_activation else None
     monkeypatch.setattr(config, 'get_current_vllm_config_or_none', lambda: current)
     monkeypatch.setattr(bridge, '_RUNTIME_ACTIONS', bridge.ProcessLocalActions())
@@ -230,11 +234,14 @@ def test_default_after_public_owner_activation(owners, monkeypatch,
     bridge._RUNTIME_ACTIONS.record_extension_reports(reports)
     assert owners.indexer._state['fp4'] is None
     bridge._configure_indexer_kv_dtype(owners.cfg)
-    assert owners.cfg.attention_config.indexer_kv_dtype == 'mxfp4'
+    assert owners.cfg.attention_config.indexer_kv_dtype == expected_dtype
     current = owners.cfg
     owners.indexer.admit_config(owners.cfg)
-    assert owners.indexer._state['fp4'] is True
+    assert owners.indexer._state['fp4'] is (expected_dtype == 'mxfp4')
     bridge.require_extension_healthy('hcu-v41-fp8-indexer-eager-reference')
+    if expected_dtype == 'auto':
+        assert owners.cfg.attention_config.resolve_indexer_kv_dtype('fp8') == 'fp8'
+        return
     assert owners.indexer.policy_factor() == ('fp4-lightop', 'digest')
     # Once admitted, auto is a real policy change, not another activation wait.
     owners.cfg.attention_config.indexer_kv_dtype = 'auto'

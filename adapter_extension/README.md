@@ -27,9 +27,11 @@ does not require private HCU hooks in the Core.
 ## V4.1 indexer cache default
 
 With the paired Adapter's V4.1 default policy, `indexer_kv_dtype=auto` resolves
-to `mxfp4` during HCU platform configuration when the V4.1 Indexer and E2M1
-packer extensions are active and healthy. The effective dtype is set before
-Core model construction, cache allocation and configuration hashing. Explicit
+to `mxfp4` during HCU platform configuration when the deployment meets FP4
+admission and the V4.1 Indexer and E2M1 packer extensions are active and
+healthy. Deployments outside FP4 admission retain Core's FP8 default. The
+effective dtype is set before Core model construction, cache allocation and
+configuration hashing. Explicit
 `--attention-config '{"indexer_kv_dtype":"fp8"}'` selects FP8, and explicit
 `mxfp4` retains the existing FP4 admission. Other model families retain their
 Core defaults.
