@@ -86,17 +86,22 @@ Once LightOp layout is established, reload uses the official recorded loader
 metadata and rejects provider failure rather than falling back over the wrong
 layout. Canonical checkpoint weights are not retained twice.
 
-The provider calls only `lightop.gemm_ops` public functions. Its GEMM crosses
-an official dispatcher custom op with a non-aliasing output and FakeTensor
-rule so pybind code is not traced through Dynamo. The effective master/child
-policy enters the official compilation cache factors. Operator registration,
-Inductor/Graph and model qualification remain separate gates.
+Repacking and small batches use `lightop.gemm_ops` public functions. For
+M>64, the vendor already dequantizes before an ordinary matrix multiplication.
+When the actual repacked bytes match the Plugin's supported layout, a narrow
+Triton reader writes the temporary FP16 KN input for `torch.matmul`. Other
+layouts retain the public vendor GEMM. Reload cannot change the reader mode
+captured by an existing graph; no second weight representation is retained.
+See [the prefill implementation and validation boundary](../docs/validation/vllm033-autoawq-prefill.md).
 
-The component test covers `(K,N)=(1024,8192)/(4096,8192)` with M=1/17/65/128,
-the official AWQ Triton and dequantized references, fullgraph Inductor, bias
-and fixed-address changed-input replay. It does not qualify every tuned
-shape, another architecture, a complete AutoAWQ model or HumanEval. Keep this
-candidate opt-in until those applicable gates are completed.
+The GEMM crosses an official dispatcher custom op with a non-aliasing output
+and FakeTensor rule so pybind code is not traced through Dynamo. The effective
+master/child policy enters the official compilation cache factors. The native
+suite covers all 16 admitted post-TP shapes with M=1/17/65/128/256/512, the
+official AWQ Triton and dequantized references, fullgraph Inductor, bias and
+fixed-address changed-input replay. Test coverage does not itself establish
+passing execution, another architecture, a complete model or HumanEval.
+Keep this candidate opt-in until the applicable gates are completed.
 
 ## DSV4.1 Channel-FP8 configuration routing
 

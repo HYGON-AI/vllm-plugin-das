@@ -45,3 +45,16 @@ input Graph replay after an installed-wheel binding check. Count shutdown leaks
 and the original cleanup deadline separately: fewer imports do not establish a
 clean exit or a speedup. The Plugin RMS example is documented in
 `docs/validation/vllm033-rms-lazy-provider.md`.
+
+For quantized prefill performance, inspect the public GEMM's implementation
+before adding a new size fallback: it may already dequantize and call ordinary
+matmul. Compare the actual compiled serving IR, since eager official dispatch
+can select a different algorithm. If an optional provider stores different
+packed weights, official dequantization cannot read them directly. A narrow
+Plugin layout conversion can retain official matmul, but admit it from actual
+repacked values, preserve unknown-layout fallback and freeze the selected
+mode across reload. Validate the final installed implementation independently
+of a prototype, including both packing branches and changed-input Graph replay.
+Measure throughput and TTFT separately; a throughput gain can accompany a
+substantial first-token regression. See
+`docs/validation/vllm033-autoawq-prefill.md` for the scoped AutoAWQ example.

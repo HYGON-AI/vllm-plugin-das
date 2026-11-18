@@ -65,6 +65,24 @@ def test_awq_shape_support_is_limited_to_lightop_tuned_pairs(
     assert autoawq.is_lightop_awq_shape_supported(k, n) is expected
 
 
+@pytest.mark.parametrize("k", [128, 256, 384])
+def test_prefill_reader_requires_actual_repacked_values(k):
+    autoawq = _load_autoawq_module()
+    n = 8
+    logical = torch.arange(n * k // 8, dtype=torch.int32).reshape(n, k // 8)
+    tile = 256 if k % 256 == 0 else 128
+    packed = torch.empty((k // tile, n * tile // 8), dtype=torch.int32)
+    # An independent scalar mapping covers both packing tiles and more than
+    # one tile; equal shapes alone must not admit a different byte layout.
+    for row in range(n):
+        for word in range(k // 8):
+            block, offset = divmod(word, tile // 8)
+            packed[block, row * (tile // 8) + offset] = logical[row, word]
+    assert autoawq._matches_prefill_layout(logical, packed, k, n)
+    packed[-1, -1] += 1
+    assert not autoawq._matches_prefill_layout(logical, packed, k, n)
+
+
 class _Delegate:
     def __init__(self) -> None:
         self.created = 0
@@ -164,6 +182,7 @@ def test_hybrid_awq_replaces_standard_weights_once_and_preserves_apply_shape(
     assert not hasattr(layer, "qzeros")
     assert not hasattr(layer, "scales")
     assert hasattr(layer, "scales_zeros")
+    assert method._lightop_fast_prefill is False
     inputs = torch.ones((2, 2, 128), dtype=torch.float16)
     bias = torch.arange(8, dtype=torch.float16)
     output = method.apply(layer, inputs, bias)
@@ -354,6 +373,23 @@ def test_hybrid_awq_reprocesses_after_vllm_restores_loader_parameters(
     assert not hasattr(layer, "scales")
     assert layer.qweight is kernel_qweight
     assert layer.scales_zeros is kernel_scales_zeros
+    assert method._lightop_fast_prefill is True
+
+    # A reload may not change the flag captured by an existing compiled op.
+    # Use the real Core restore/process path and a changed repacker, rather
+    # than directly changing the reader's eligibility predicate.
+    monkeypatch.setattr(
+        autoawq,
+        "_resolve_lightop_awq_ops",
+        lambda: (
+            lambda weight, _n, _k: weight.reshape(1, -1) + 1,
+            lambda a, b, scales_zeros: a,
+        ),
+    )
+    restore_layer_on_meta(layer, info)
+    with pytest.raises(RuntimeError, match="prefill layout changed during reload"):
+        _layerwise_process(layer, info)
+    assert method._lightop_active is False
 
 
 def test_hybrid_awq_reload_keeps_initial_delegate_layout_after_repack_recovers(
@@ -490,7 +526,7 @@ def test_hybrid_awq_reload_does_not_fallback_after_lightop_layout_is_fixed(
 def cpu_native_double(monkeypatch):
     # Only these CPU layout/loader tests replace the dispatcher. The separate
     # native suite exercises the real registered CUDA op and FakeTensor rule.
-    def gemm(a, b, scales_zeros):
+    def gemm(a, b, scales_zeros, prefill_layout=False):
         return _load_autoawq_module()._resolve_lightop_awq_ops()[1](a, b, scales_zeros)
 
     monkeypatch.setattr(torch.ops.vllm, "hcu_lightop_autoawq", gemm, raising=False)

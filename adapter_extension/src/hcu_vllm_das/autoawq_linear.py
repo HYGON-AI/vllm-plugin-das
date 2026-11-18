@@ -122,6 +122,20 @@ def _resolve_lightop_awq_ops() -> tuple[Callable[..., Any], Callable[..., Any]]:
     return awq_gemm_marlin_weight_repack, gemm_awq_w4a16_marlin
 
 
+def _matches_prefill_layout(
+    logical_weight: torch.Tensor, packed_weight: torch.Tensor, k: int, n: int
+) -> bool:
+    """Check actual packed bytes before allowing a separate layout reader.
+
+    The public vendor GEMM remains usable when a compatible repacker uses a
+    different layout. This comparison adds no persistent weight copy.
+    """
+    tile = 256 if k % 256 == 0 else 128
+    expected = logical_weight.reshape(n, k // tile, tile // 8).transpose(0, 1)
+    actual = packed_weight.reshape(k // tile, n, tile // 8)
+    return torch.equal(actual, expected)
+
+
 class LightOpAutoAWQLinearMethod(LinearMethodBase):
     """Wrap a vLLM AutoAWQ method and activate LightOp only when eligible."""
 
@@ -132,6 +146,7 @@ class LightOpAutoAWQLinearMethod(LinearMethodBase):
         self._k = 0
         self._n = 0
         self._lightop_active = False
+        self._lightop_fast_prefill = False
         self._lightop_gemm: Callable[..., torch.Tensor] | None = None
 
     def create_weights(
@@ -170,7 +185,9 @@ class LightOpAutoAWQLinearMethod(LinearMethodBase):
 
     def process_weights_after_loading(self, layer: torch.nn.Module) -> None:
         selected_layout = getattr(layer, _LAYOUT_ATTR, None)
+        previous_prefill = self._lightop_fast_prefill
         self._lightop_active = False
+        self._lightop_fast_prefill = False
         self._lightop_gemm = None
         if selected_layout == _DELEGATE_LAYOUT:
             self.delegate.process_weights_after_loading(layer)
@@ -221,6 +238,13 @@ class LightOpAutoAWQLinearMethod(LinearMethodBase):
                     "LightOp AutoAWQ repack returned an incompatible tensor"
                 )
             native_gemm = torch.ops.vllm.hcu_lightop_autoawq
+            fast_prefill = _matches_prefill_layout(
+                weight_trans, repacked_weight, self._k, self._n
+            )
+            if not first_processing and fast_prefill != previous_prefill:
+                raise RuntimeError(
+                    "LightOp AutoAWQ prefill layout changed during reload"
+                )
             new_weight = Parameter(repacked_weight, requires_grad=False)
             new_scales_zeros = Parameter(scales_zeros, requires_grad=False)
         except (
@@ -245,6 +269,7 @@ class LightOpAutoAWQLinearMethod(LinearMethodBase):
         # construction. Never trace the vendor pybind function through Dynamo.
         self._lightop_gemm = native_gemm
         self._lightop_active = True
+        self._lightop_fast_prefill = fast_prefill
         setattr(layer, _LAYOUT_ATTR, _LIGHTOP_LAYOUT)
 
     def apply(
@@ -265,6 +290,7 @@ class LightOpAutoAWQLinearMethod(LinearMethodBase):
             x.reshape(-1, x.shape[-1]),
             layer.qweight,
             layer.scales_zeros,
+            self._lightop_fast_prefill,
         )
         if bias is not None:
             output.add_(bias)

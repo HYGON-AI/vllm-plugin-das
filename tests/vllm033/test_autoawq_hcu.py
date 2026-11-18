@@ -37,7 +37,7 @@ def require_explicit_device_run():
         (3712, 8192),
     ],
 )
-@pytest.mark.parametrize("m", [1, 17, 65, 128])
+@pytest.mark.parametrize("m", [1, 17, 65, 128, 256, 512])
 def test_official_loader_custom_op_compile_and_changed_input_graph(
     k, n, m, monkeypatch
 ):
@@ -82,7 +82,16 @@ def test_official_loader_custom_op_compile_and_changed_input_graph(
     layer.scales.data.copy_(scales)
     method.process_weights_after_loading(layer)
     assert method._lightop_active, "Fallback cannot qualify the LightOp path"
+    assert method._lightop_fast_prefill, "Packed-byte admission must enable the reader"
     dequant = awq_dequantize_triton(qw, scales, qz)
+    from hcu_vllm_das.autoawq_prefill import dequantize_for_matmul
+
+    torch.testing.assert_close(
+        dequantize_for_matmul(layer.qweight, layer.scales_zeros, k),
+        dequant,
+        atol=0,
+        rtol=0,
+    )
     bias = torch.randn(n, device="cuda", dtype=torch.float16) * 0.001
 
     def call(x):

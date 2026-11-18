@@ -1,7 +1,8 @@
 # SPDX-License-Identifier: Apache-2.0
 """Real official registry/config and compilation contracts, without a device."""
 
-from types import SimpleNamespace
+import sys
+from types import ModuleType, SimpleNamespace
 
 import pytest
 import torch
@@ -134,7 +135,9 @@ def test_health_checks_registry_and_compile_policy_ownership(activation, monkeyp
         module.check_health()
 
 
-def test_custom_op_schema_and_fake_rule_are_nonmutating():
+@pytest.mark.parametrize("m", [17, 128])
+@pytest.mark.parametrize("prefill_layout", [False, True])
+def test_custom_op_schema_and_fake_rule_are_nonmutating(m, prefill_layout):
     from hcu_vllm_das import autoawq_ops  # noqa: F401
     from torch._subclasses.fake_tensor import FakeTensorMode
 
@@ -142,12 +145,48 @@ def test_custom_op_schema_and_fake_rule_are_nonmutating():
     assert all(arg.alias_info is None for arg in schema.arguments)
     assert len(schema.returns) == 1 and schema.returns[0].alias_info is None
     with FakeTensorMode():
-        x = torch.empty((17, 1024), dtype=torch.float16, device="cuda")
+        x = torch.empty((m, 1024), dtype=torch.float16, device="cuda")
         w = torch.empty((4, 8192 * 32), dtype=torch.int32, device="cuda")
         sz = torch.empty((8192, 8), dtype=torch.int32, device="cuda")
-        result = torch.ops.vllm.hcu_lightop_autoawq(x, w, sz)
-        assert result.shape == (17, 8192) and result.dtype == torch.float16
+        result = torch.ops.vllm.hcu_lightop_autoawq(x, w, sz, prefill_layout)
+        assert result.shape == (m, 8192) and result.dtype == torch.float16
         assert result.device == x.device
+
+
+@pytest.mark.parametrize(
+    "m,prefill_layout,converted",
+    [(64, True, False), (65, True, True), (65, False, False)],
+)
+def test_real_dispatch_uses_vendor_boundary_and_validated_layout(
+    monkeypatch, m, prefill_layout, converted
+):
+    from hcu_vllm_das import autoawq_ops
+    calls = []
+    a = torch.arange(m * 8, dtype=torch.float16).reshape(m, 8) / 100
+    expected_weight = torch.arange(24, dtype=torch.float16).reshape(8, 3) / 100
+    packed = torch.empty((1, 3), dtype=torch.int32)
+    parameters = torch.empty((3, 1), dtype=torch.int32)
+    provider = ModuleType("lightop.gemm_ops")
+
+    def vendor(x, weight, sz):
+        assert x is a and weight is packed and sz is parameters
+        calls.append("vendor")
+        return torch.full((m, 3), 7, dtype=x.dtype)
+
+    def reader(weight, sz, k):
+        assert weight is packed and sz is parameters and k == 8
+        calls.append("reader")
+        return expected_weight
+
+    provider.gemm_awq_w4a16_marlin = vendor
+    reader_module = ModuleType("hcu_vllm_das.autoawq_prefill")
+    reader_module.dequantize_for_matmul = reader
+    monkeypatch.setitem(sys.modules, "lightop.gemm_ops", provider)
+    monkeypatch.setitem(sys.modules, "hcu_vllm_das.autoawq_prefill", reader_module)
+    output = autoawq_ops._gemm(a, packed, parameters, prefill_layout)
+    expected = a @ expected_weight if converted else torch.full((m, 3), 7, dtype=a.dtype)
+    torch.testing.assert_close(output, expected, atol=0, rtol=0)
+    assert calls == ["reader" if converted else "vendor"]
 
 
 @pytest.mark.parametrize("enabled", [False, True])
