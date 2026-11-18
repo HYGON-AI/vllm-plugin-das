@@ -41,6 +41,20 @@ cache and scales, and trace its execution. A restored choice establishes reader
 sensitivity, not a kernel defect, full-model recovery or accuracy acceptance;
 use the same captured inputs and an independent numerical reference next.
 
+When public responses preserve prompt and generated IDs, replay those integer
+arrays directly and bind source response hashes; verify current chat rendering
+still matches saved prompt IDs. Re-tokenizing answer text loses that exact
+history guarantee. Keep teacher-forced and warmed-prefix geometry distinct
+from the original concurrent free-running cohort.
+
+A whole Plugin installation can also register non-attention operators. When
+isolating an attention regression, an additional Plugin/official-backend
+control can distinguish registration effects from the requested backend path.
+Observe actual layer implementations, operator forwards, resolved layouts and
+kernel traces. Narrowing a probability difference to one service path does not
+establish a defective native kernel or waive the original model loss. See the
+[BF16 code-pair and owner-isolation record](../../../docs/validation/vllm033-flash-bf16-owner-isolation.md).
+
 Validate positive softcap separately from ordinary FP8 attention. A vendor
 paged path can accept the argument while ignoring it. When routing softcap to
 Core's official attention, cover every advertised cache dtype: preserve E4M3

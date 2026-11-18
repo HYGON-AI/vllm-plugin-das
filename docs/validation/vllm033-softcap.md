@@ -1,5 +1,9 @@
 # v0.33 HCU Flash attention softcap
 
+The [BF16 code-pair and owner-isolation record](vllm033-flash-bf16-owner-isolation.md)
+preserves the complete official/Plugin Qwen3-8B comparison and its unresolved
+task18 loss. Component softcap/window passes do not replace that model gate.
+
 The public HCU FLASH_ATTN implementation used to forward a positive
 `logits_soft_cap` to the vendor function for every batch. The installed vendor
 wrapper's direct paged path explicitly ignores softcap. A writer-to-reader
