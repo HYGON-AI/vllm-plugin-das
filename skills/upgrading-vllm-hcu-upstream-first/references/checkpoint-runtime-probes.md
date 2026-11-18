@@ -40,3 +40,19 @@ identities, health and selected implementation before continuing the same
 service. Label that continuation as warmed execution after the failed probe;
 it does not establish clean startup or lifecycle acceptance. Prepare a corrected
 probe separately rather than replacing modules beneath the live worker.
+
+## Resume scoring without regenerating answers
+
+Before a long generation run, check the evaluator wrapper's input-root policy
+against the resolved output path. A symlink beneath an allowed evidence root
+can resolve outside that root and fail admission after generation completes.
+Use a real output directory within the allowed root when the wrapper requires
+one; temporary caches can remain on separate storage.
+
+If scoring alone fails after answers are complete, preserve that failure and
+the original requests, responses, samples and problem data. Copy the existing
+inputs into an admitted directory if needed, compare every copied file's bytes
+or digest, then run the unchanged isolated evaluator on those inputs. Record
+the original and recovered paths and score receipt. Do not loosen the path
+guard, repeat model generation, or treat recorded functional-probe failures
+as passes because a score was recovered.

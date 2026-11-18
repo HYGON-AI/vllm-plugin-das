@@ -299,3 +299,64 @@ Decode can cost more; no softcap speedup or serving performance pass is claimed.
 Existing native finalizer warnings and forced worker shutdowns remain recorded.
 These results do not certify all Flash accuracy, other hardware or the complete
 upgrade. DeepSeek V4 remains deferred until the preceding adaptation is complete.
+
+
+## 2026-11-18 pretrained Gemma2 BF16/E4M3 four-arm follow-up
+
+This cohort tests runtime `877a96ad81df020f7e708467c94a2c4bddb63bb0` on actual
+**gfx936**, official Core 0.33 `98a09850d56b` and unchanged baseline Adapter.
+The installed Plugin's 91 production files match their published Git blobs.
+Adapter/kernel payloads match the baseline (279 files); the build's
+`exitcleanup1` version suffix does not imply Draft Adapter #140's exit hook.
+
+The unchanged pretrained `google/gemma-2-2b-it` checkpoint is pinned to
+ModelScope revision `c400b2564e9db9e5a0bc6dfbe07a05da3cd09f52`; its 12 assets
+and full pre/post package RECORDs were verified. Attention head size 256, softcap 50,
+13 full layers and 13 sliding 4096 layers remain intact. All four arms use TP1,
+BF16 compute, context8192, block64, default FULL_AND_PIECEWISE Graph and
+prefix caching, original15s shutdown grace, and the same original HE0–31
+requests at temperature0/seed0/max_tokens2048. We retain failed format probes.
+
+| Arm | Raw HE32 | Normalized HE32 | Completion tokens | Normal stops |
+| --- | ---: | ---: | ---: | ---: |
+| reference-bf16 | 0/32 | 23/32 | 4998 | 32 |
+| flash-bf16 | 0/32 | 23/32 | 4986 | 32 |
+| reference-e4m3 | 0/32 | 24/32 | 4969 | 32 |
+| flash-e4m3 | 0/32 | 24/32 | 4979 | 32 |
+
+Pairwise original passing-task sets and answer comparisons:
+
+- reference-bf16 / flash-bf16: identical request payloads=True; raw/normalized answer texts identical 30/32 and 30/32; lost passes {"raw": [], "normalized": []}; gained passes {"raw": [], "normalized": []}.
+- reference-e4m3 / flash-e4m3: identical request payloads=True; raw/normalized answer texts identical 28/32 and 28/32; lost passes {"raw": [], "normalized": []}; gained passes {"raw": [], "normalized": []}.
+- reference-bf16 / reference-e4m3: identical request payloads=True; raw/normalized answer texts identical 25/32 and 25/32; lost passes {"raw": [], "normalized": []}; gained passes {"raw": [], "normalized": ["HumanEval/18"]}.
+- flash-bf16 / flash-e4m3: identical request payloads=True; raw/normalized answer texts identical 27/32 and 27/32; lost passes {"raw": [], "normalized": []}; gained passes {"raw": [], "normalized": ["HumanEval/18"]}.
+
+Raw scores retain the original response-format failures; normalization uses
+the unchanged isolated evaluator. Every score verifies its input hashes,
+namespace isolation, nobody UID/GID and absent host credentials/GPU nodes.
+The first official BF16 arm generated all32 answers before scoring rejected
+a temporary output symlink resolving outside its allowed root. That failed
+run and its raw bytes were preserved. All27 existing evidence files were
+copied and verified under a real permitted directory; only scoring resumed.
+The other three arms use real output directories. No answers were regenerated
+for this recovery and no scorer/path/normalization checks were relaxed.
+
+Worker probes confirm26 selected attention implementations and the original
+13 sliding/13 full cache groups before/after every arm. The three remaining
+arms additionally inspect every implementation's softcap 50/head size 256/window bounds
+by RPC; that additional RPC was not collected in the first official BF16 arm
+because its original scoring wrapper failed. Native traces show official
+`kernel_unified_attention` and native cache writes. Each arm retains 3840
+prefix-cache hits and two concurrent waves.
+
+**Qualification limits:** strict functional probes that request only an integer
+remain failures when the model emits an equation. Inspect the original
+`functional-probe-status.json` for each arm. All recorded services, workers,
+ports and device handles release, but native leaks and forced worker cleanup
+remain failures of the original lifecycle gate. These short HE32 inputs do
+not cover contexts beyond the 4096-token sliding window or cache reclamation
+at that boundary. Source/native tests are separate evidence. gfx936 results
+do not qualify gfx836; independent earlier Qwen3 BF16 and gfx938 E5M2 losses
+remain recorded. Keep Draft and `last_good=false`.
+
+Runtime CI44305568352 is **success**:8 source,1204 portable,383 gfx936 native/Graph and1 gfx938 synthetic case, all zero failures/errors/skips. The64 local sliding cases overlap with the383 CI native cases. Full immutable-head checkout logs and artifact SHA256 digests were verified. gfx938 is synthetic operator coverage. This evidence belongs to the tested runtime SHA above; the following documentation commit has no new runtime payload.
