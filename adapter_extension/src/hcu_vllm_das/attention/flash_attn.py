@@ -17,6 +17,7 @@ from vllm.v1.kv_cache_layout import KVCacheLayout
 
 _FA4_ONLY_ARGUMENTS = ("dynamic_causal", "mask_mod", "aux_tensors")
 _E5M2_KV_CACHE_DTYPE = "fp8_e5m2"
+_E4M3_KV_CACHE_DTYPE = "fp8_e4m3"
 _KERNEL_BLOCK_SIZE = 64
 
 
@@ -210,7 +211,7 @@ class HcuFlashAttentionImpl(AttentionImpl[FlashAttentionMetadata]):
             return output
         key_cache, value_cache = self._get_kv_cache_views(kv_cache)
         descale_shape = (attn_metadata.query_start_loc.shape[0] - 1, self.num_kv_heads)
-        uses_e5m2 = self.kv_cache_dtype == _E5M2_KV_CACHE_DTYPE
+        uses_fp8 = self.kv_cache_dtype in (_E5M2_KV_CACHE_DTYPE, _E4M3_KV_CACHE_DTYPE)
         self._run_flash_attention(
             q=query[:tokens],
             k=key_cache,
@@ -227,8 +228,8 @@ class HcuFlashAttentionImpl(AttentionImpl[FlashAttentionMetadata]):
             window_size=(-1, -1),
             softcap=self.logits_soft_cap,
             q_descale=None,
-            k_descale=layer._k_scale.expand(descale_shape) if uses_e5m2 else None,
-            v_descale=layer._v_scale.expand(descale_shape) if uses_e5m2 else None,
+            k_descale=layer._k_scale.expand(descale_shape) if uses_fp8 else None,
+            v_descale=layer._v_scale.expand(descale_shape) if uses_fp8 else None,
         )
         return output
 
@@ -333,6 +334,14 @@ class HcuFlashAttentionImpl(AttentionImpl[FlashAttentionMetadata]):
             kwargs["k"] = _e5m2_byte_view(kwargs["k"])
             kwargs["v"] = _e5m2_byte_view(kwargs["v"])
         kwargs["fa_version"] = 2
+        if self.kv_cache_dtype == _E4M3_KV_CACHE_DTYPE:
+            from hcu_vllm_das.attention.e4m3_attention import run_e4m3_attention
+
+            for name in ("k", "v"):
+                if kwargs[name].element_size() != 1:
+                    raise ValueError("HCU E4M3 requires one-byte K/V storage")
+                kwargs[name] = kwargs[name].view(torch.float8_e4m3fn)
+            return run_e4m3_attention(_vendor_varlen_func(), kwargs)
         if (
             self.kv_cache_dtype == _E5M2_KV_CACHE_DTYPE
             and kwargs.get("block_table") is not None
@@ -360,6 +369,7 @@ class HcuFlashAttentionBackend(FlashAttentionBackend):
         "float16",
         "bfloat16",
         _E5M2_KV_CACHE_DTYPE,
+        _E4M3_KV_CACHE_DTYPE,
     ]
 
     @classmethod
