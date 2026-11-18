@@ -430,3 +430,94 @@ Retained evidence: upgrade workspace
 original cleanup logs, controllers and response/trace review output. The earlier
 tokenizer/orchestration failures are retained separately and are not model
 results. This follow-up changes documentation and the skill reference only.
+
+
+## Current merged-Plugin control on actual gfx938 (r146)
+
+The release branch now includes required-entry-point follow-up #464, merged as
+`45befb54005d26ea684cccf5568ed63659a3e276`. Its complete tree equals tested
+control source `8dad9325966c787e463f7c954b3bbdc44f2a5938`. The new local candidate
+`46bd710afdca96b320e7a08926a171d5e3e85d72` combines this MR with that control.
+Merging the actual release commit into this MR produces the same complete tree;
+this follow-up then changes validation/skill text only. Production is still the
+Plugin adaptation of official `unified_attention`; no new Core/Adapter patch.
+
+Actual local devices are **gfx938**, verified in the worker device properties
+with UUID/PCI identity. An initial component harness expected gfx936 and refused
+before pytest. Its failed preflight is retained. A separate explicitly gfx938
+run completes the three affected installed test files: **251/251 pass**, zero
+failures/errors/skips, including all64 sliding-window native-writer/forward,
+ragged/empty-row, softcap, BF16/FP16/E4M3/E5M2 and changed-input Graph cases.
+Package RECORDs match before/after, no package was reinstalled, and owned
+processes are absent. This does not qualify gfx936 or gfx836 on this allocation,
+or convert the earlier preflight refusal into a test pass.
+
+The BF16 model comparison restores original GPU7/admission0.40/fixedKV1GiB,
+Qwen3-8B, default Graph/prefix, batch/token limits and the byte-identical original
+HE0–31 requests at concurrency4. Both arms use fresh caches/default tuning;
+there is no replay of old tuning choices. Core is `c440c089fe96`, Adapter is
+`89fc929c1455`; this is not qualification of a latest Adapter/main wheel or a
+new native release build. All36 actual attention layers report the expected
+Plugin implementation and BF16 storage. Isolated scoring retains raw and
+normalized results separately.
+
+| BF16 arm | Raw | Normalized | Normalized failures | Completion tokens |
+| --- | ---: | ---: | --- | ---: |
+| merged-Plugin-equivalent FLASH control | 20/32 | 30/32 | /18, /26 | 4198 |
+| local current-release + #410 FLASH candidate | 20/32 | 30/32 | /18, /26 | 4199 |
+
+There are no gained/lost raw or normalized passes between these two arms;
+31/32 complete emitted token sequences match. Task1 differs at emitted token197,
+with lengths202/203, and passes in both. Each arm passes13 arithmetic and3 prefix
+probes, records1280 prefix-hit tokens and genuine Graph/kernel traces. There is
+no generation truncation. Frontends exit0 within the original15s grace
+(9.478s/10.530s); descendants and ports are released, all RECORD/checkpoint seals
+match, but nanobind/EngineDeadError diagnostics keep lifecycle unqualified.
+
+The separately completed earlier official-TRITON cohort (r144) remains
+raw20/32, normalized31/32, failing only /26. It was not repeated or relabeled as
+a concurrent control. The new current Plugin control also loses /18 relative
+to that official cohort. This changes attribution of the previous #410-only
+claim: this increment has no new pass-set loss in the current BF16 comparison,
+but recovery of official accuracy is **not established**. Original failures,
+format findings, broader cache-reclamation/architecture gates and the independent
+E5M2 history remain recorded; no accuracy threshold or lifecycle gate is waived.
+Keep Draft and `last_good=false`.
+
+Evidence: upgrade workspace `evidence/plugin410-released-two-arm-r146/`
+(`analysis.json`, `affected-native-gfx938/receipt.json`) and original retained
+model receipts under `plugin410-unexecuted-after464-r145/` and
+`plugin410-default-after464-r144/`. No DeepSeek V4.1 checkpoint was tested.
+
+
+### Current-control E5M2 follow-up
+
+The separately completed E5M2 pair preserves the same frozen sources, actual
+gfx938 GPU7, original requests/concurrency4, admission0.40/fixedKV1GiB, default
+Graph/prefix, fresh default-tuning caches and original15s grace. Worker RPC
+verifies36 actual Plugin Flash implementations with public `fp8_e5m2` and byte
+cache storage, before/after generation; no installed package or native ABI was
+changed during the run.
+
+| E5M2 arm | Raw | Normalized | Normalized failures | Completion tokens |
+| --- | ---: | ---: | --- | ---: |
+| merged-Plugin-equivalent FLASH control | 21/32 | 30/32 | /19, /26 | 4076 |
+| local current-release + #410 FLASH candidate | 21/32 | 30/32 | /19, /26 | 4076 |
+
+All32 emitted token sequences and prompt token IDs match across the pair, with
+identical raw/normalized passing-task sets and no truncation. Both pass all13
+arithmetic/3 prefix probes, with1280 prefix-hit tokens and actual Graph/native
+writer/attention traces. Frontends exit0 in9.429s/10.330s, no owned descendants
+remain, ports close, and complete package/checkpoint post-seals match. The logs
+still contain native leak/EngineDeadError diagnostics, so lifecycle remains red.
+
+This establishes no new E5M2 pass-set/token loss for this increment against
+current Plugin mainline. It does **not** remove the previous KV-dtype /19 loss:
+that failure also occurs in the current E5M2 control, whereas the BF16 controls
+pass /19. BF16 /18 versus the earlier official cohort, format/lifecycle and
+remaining qualification gates are likewise retained. No kernel cause, complete
+accuracy recovery, performance or full-upgrade acceptance is claimed. Keep
+Draft. `e5m2-analysis.json` and `current-e5m2-pair-inputs-fixed/` retain the
+completed evidence. The first E5M2 orchestration attempt failed on missing
+helper paths before starting a model; its original failure remains separately
+under `current-e5m2-pair/` and was not relabeled as a model result.

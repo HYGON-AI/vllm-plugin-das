@@ -27,11 +27,17 @@ does not establish equivalent behavior or performance.
 When Adapter directories move, verify published cross-repository contracts too.
 An entry-point group is a distribution metadata protocol name, independent of
 its implementation module's location. Check the current Plugin's real installed
-metadata with Adapter discovery and load representative actual entry points;
+metadata with Adapter discovery and load the applicable actual entry points;
 Adapter-only fixtures can migrate together and miss a broken consumer. Retain
 public API imports and shared type identity for a compatible API revision, or
 coordinate an explicit breaking migration and paired release. Version acceptance
 alone cannot qualify that pair.
+
+Include dynamically constructed module paths and public package attributes in
+that audit. Restoring the discovery group and two factories can leave other
+installed factories broken after a directory move. Record each factory's load
+result against current consumer bytes; loading is separate from activation,
+native execution and checkpoint qualification.
 
 Inspect the old callback's body before calling it an optimization: a
 nonmutating audit callback need not become a replacement for an official

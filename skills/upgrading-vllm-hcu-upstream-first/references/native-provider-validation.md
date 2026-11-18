@@ -8,6 +8,11 @@ declare different versions at the same commit. Preserve the resulting metadata;
 do not rename the new artifact to impersonate the installed vendor release.
 
 Check native dependencies after installation outside the source and build trees.
+Read the actual worker's architecture, UUID and PCI identity after visibility
+filtering before choosing a hardware gate. A host's old architecture label is
+not evidence for its current allocation. Preserve an architecture-preflight
+refusal; a later run explicitly targeting the observed supported architecture
+qualifies only that device, without broadening the original gate or result.
 A wheel repair can bundle ordinary libraries while leaving DTK/HSA or network
 libraries external. Record those runtime requirements separately from the wheel's
 platform tag. Verify the full installed RECORD, wheel payload and actual parent
