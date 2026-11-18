@@ -22,6 +22,16 @@ changed-input Graph and applicable head sizes. A component pass still needs
 the same-checkpoint BF16-KV model comparison and original HumanEval protocol;
 retain raw scores and shutdown failures independently.
 
+A KV-dtype pair on the same Plugin measures a different change from an
+official-versus-Plugin pair at one fixed dtype. Retain both scopes; neither
+substitutes for the other. Compare per-task pass sets as well as scores:
+equal totals can hide a lost task offset by a gained task. Inspect the saved
+program and isolated checker result before attributing a loss to formatting
+or a kernel. Repeat the original full baseline cohort when characterizing
+default-serving variation, preserving the first candidate failure. An exit
+within the existing grace can still emit native leak diagnostics; record
+those separately from forced cleanup and normal lifecycle qualification.
+
 Validate positive softcap separately from ordinary FP8 attention. A vendor
 paged path can accept the argument while ignoring it. When routing softcap to
 Core's official attention, cover every advertised cache dtype: preserve E4M3

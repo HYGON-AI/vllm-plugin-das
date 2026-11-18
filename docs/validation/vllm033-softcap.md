@@ -136,6 +136,64 @@ it is not pretrained positive-softcap model acceptance. No supported pretrained
 positive-softcap checkpoint was validated here. Gemma4's other unsupported
 attention requirements are not enabled by this fallback.
 
+## gfx938 BF16 / E5M2 pretrained KV comparison
+
+On 2026-11-18, an independent installed-wheel run used Core `c440c089fe96`,
+Adapter main `89fc929c1455` and Plugin runtime `7fa427b81f8f` on gfx938.
+Both arms use the same Qwen3-8B checkpoint, FLASH_ATTN, TP1/BF16 weights,
+block 64, default Graph/prefix, max length 4096, seqs 16, batched tokens 1024
+and a fixed 1 GiB KV allocation. The baseline requests `auto` KV; the other
+arm requests public `fp8_e5m2`. This measures the KV dtype change inside the
+same Plugin; it is not official-versus-Plugin or positive-softcap acceptance.
+
+The HumanEval 0–31 requests are byte-identical across the arms:
+temperature 0, seed 0, max output 2048, thinking disabled and concurrency 4.
+Generation, raw outputs and scoring are retained independently. Scoring uses
+the existing unprivileged read-only chroot with mount/network/PID namespaces.
+
+| KV dtype | Raw | Normalized | Normalized failed tasks | Completion tokens |
+| --- | ---: | ---: | --- | ---: |
+| BF16 (`auto`) | 20/32 | 30/32 | 18, 26 | 4218 |
+| E5M2 | 21/32 | 30/32 | 19, 26 | 4064 |
+| Fresh full BF16 repeat | 20/32 | 31/32 | 26 | 4218 |
+
+All 32 responses stop normally in each arm. E5M2 loses task 19 and gains task 18
+after normalization; equal totals do **not** establish no regression. Task 19
+emits an unordered `Enum` as the sorting key, and the isolated checker reports
+that `<` is unsupported between two `Number` values. This is a semantic
+failure, not a Markdown-only normalization issue. No kernel cause is established.
+
+Both arms pass 13 arithmetic requests at concurrency 1/4/8, three repeated-prefix
+requests and the profiled request; prefix hits increase by 1280 tokens per arm.
+Real worker inspection verifies all 36 Flash layers, BF16 versus byte E5M2
+cache storage, installed package origins and native library paths. Traces
+observe 40 Graph launches per arm. E5M2 traces include the byte writer,
+row scales, BF16 Flash prefill and byte-cache paged decode; this does not
+establish native FP8-compute throughput.
+Plugin source/wheel/installed payloads, five full hashed package RECORDs and
+the checkpoint's complete pre/post seal verify unchanged. Owned descendants
+are absent after cleanup. The frontends exit 0 in 10.63s/9.23s under the original
+15s grace without forced cleanup, but both logs retain nanobind native-leak
+diagnostics: normal lifecycle remains unqualified.
+
+The full BF16 baseline was then repeated in a fresh service with identical
+request bytes, probe sequence and default settings. Four completions differ
+(tasks 1, 18, 25, 31); task 18 passes after normalization, while task 19 passes
+in both BF16 runs. This establishes baseline variation for task 18, without
+reproducing or waiving the E5M2 task 19 loss or identifying a kernel cause.
+The repeat also passes all probes, unchanged RECORD/checkpoint checks and
+Graph inspection. It exits 0 in 9.38s without forced cleanup, retaining the
+native-leak diagnostics.
+
+Evidence: `evidence/plugin410-gfx938-public-llm-r127` in the upgrade workspace,
+including original responses, isolated results, launch receipts, worker
+provenance, traces, `independent-model-review.json` and
+`independent-baseline-repeat-review.json`. This is scoped
+pretrained E5M2 execution evidence with an unresolved pass-set loss. It neither
+erases the older BF16 task 18 regression nor qualifies other checkpoints,
+architectures, positive softcap or performance. The original selected CI and
+component results remain bound to their tested runtime commit.
+
 ## Component timing and limits
 
 One gfx936, BF16, HND, 32 query/8 KV heads, head size128, cap0.5: three warmed
