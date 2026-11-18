@@ -73,6 +73,15 @@ uploaded with the existing partition-specific artifact naming and 30-day
 retention, including failed test steps. Pods/workspaces are reclaimed by ARC;
 there is no recursive host workspace repair or deletion on the K8s lane.
 
+The image resolver, matrix mapper and native launcher belong to the workflow
+revision (`github.workflow_sha`), not the tested revision. The mapper and launcher
+are preserved under `runner.temp` before checking out the PR head. This allows
+pre-migration PR branches to use the ARC lane without copying the migration into
+every branch. Existing selector, preflight, environment lock, plugin source and
+tests still come from the exact PR head; the bootstrap does not replace them.
+The static job fetches only the workflow, base and head commits (depth 1 each),
+retaining both endpoints needed by the existing two-endpoint diff selector.
+
 The trusted-author/`ready-hcu` helper is checked out from the immutable PR base
 SHA on a separate CPU runner. Tested source is always the PR head SHA; checkout
 credentials are not persisted. The outer `ci-gate` name and fail-closed admission

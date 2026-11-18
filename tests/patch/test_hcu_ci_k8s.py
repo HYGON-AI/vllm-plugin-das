@@ -327,17 +327,138 @@ def test_workflow_keeps_pr_event_trusted_base_auth_and_head_only_execution():
         for step in jobs[job_id]["steps"]:
             if step.get("uses", "").startswith("actions/checkout@"):
                 assert step["with"]["persist-credentials"] == "false"
-                if job_id != "authorize-hcu":
-                    assert (
-                        step["with"]["ref"]
-                        == "${{ github.event.pull_request.head.sha }}"
-                    )
+    assert (
+        jobs["resolve-image"]["steps"][0]["with"]["ref"] == "${{ github.workflow_sha }}"
+    )
+    for job_id in ("static-and-select", "hardware"):
+        checkouts = [
+            step["with"]
+            for step in jobs[job_id]["steps"]
+            if step.get("uses", "").startswith("actions/checkout@")
+        ]
+        expected_refs = ["${{ github.workflow_sha }}"]
+        if job_id == "static-and-select":
+            expected_refs.append("${{ github.event.pull_request.base.sha }}")
+        expected_refs.append("${{ github.event.pull_request.head.sha }}")
+        assert [step["ref"] for step in checkouts] == expected_refs
+        assert all(step["fetch-depth"] == "1" for step in checkouts)
     for job_id in ("hardware", "isolated-hardware"):
         assert "needs.authorize-hcu.outputs.authorized == 'true'" in jobs[job_id]["if"]
     assert (
         jobs["isolated-hardware"]["uses"]
         == "./.github/workflows/_selected-hcu-tests.yml"
     )
+
+
+@pytest.mark.parametrize(
+    "job_id,helper,preserve_name",
+    [
+        (
+            "static-and-select",
+            ".github/scripts/hcu_ci/prepare_hcu_k8s.py",
+            "Preserve caller ARC matrix mapper",
+        ),
+        (
+            "hardware",
+            "scripts/ci/hcu/hcu_ci_run_k8s.sh",
+            "Preserve caller ARC native launcher",
+        ),
+    ],
+)
+def test_bootstrap_survives_shallow_checkout_of_pre_migration_head(
+    tmp_path, job_id, helper, preserve_name
+):
+    # Model an existing PR that diverged before the migration reached its base.
+    # Run the actual preservation step between real depth-1 Git checkouts.
+    remote = tmp_path / "remote"
+    remote.mkdir()
+
+    def git(root, *args):
+        return subprocess.check_output(
+            ["git", "-C", str(root), *args], text=True, stderr=subprocess.STDOUT
+        ).strip()
+
+    git(remote, "init", "--initial-branch=main")
+    git(remote, "config", "core.autocrlf", "false")
+    git(remote, "config", "user.name", "ARC fixture")
+    git(remote, "config", "user.email", "arc-fixture@example.invalid")
+    (remote / "revision.txt").write_text("before migration\n")
+    git(remote, "add", ".")
+    git(remote, "commit", "-m", "before migration")
+    ancestor = git(remote, "rev-parse", "HEAD")
+    git(remote, "checkout", "-b", "old-pr")
+    (remote / "feature.txt").write_text("tested PR source\n")
+    git(remote, "add", ".")
+    git(remote, "commit", "-m", "old PR head")
+    head = git(remote, "rev-parse", "HEAD")
+    git(remote, "checkout", "main")
+    assert git(remote, "rev-parse", "HEAD") == ancestor
+    helper_path = remote / helper
+    helper_path.parent.mkdir(parents=True)
+    expected_helper = (REPOSITORY / helper).read_bytes()
+    helper_path.write_bytes(expected_helper)
+    (remote / "base-only.txt").write_text("new base revision\n")
+    git(remote, "add", ".")
+    git(remote, "commit", "-m", "migration on base")
+    base = git(remote, "rev-parse", "HEAD")
+    git(remote, "merge", "--no-ff", "old-pr", "-m", "PR workflow merge revision")
+    workflow_sha = git(remote, "rev-parse", "HEAD")
+    refs = {
+        "${{ github.workflow_sha }}": workflow_sha,
+        "${{ github.event.pull_request.base.sha }}": base,
+        "${{ github.event.pull_request.head.sha }}": head,
+    }
+    tested = tmp_path / "tested workspace"
+    tested.mkdir()
+    git(tested, "init")
+    git(tested, "config", "core.autocrlf", "false")
+    git(tested, "remote", "add", "origin", remote.as_uri())
+    runner_temp = tmp_path / "runner temp"
+    runner_temp.mkdir()
+    steps = workflow("_hcu-pr-ci-k8s.yml")["jobs"][job_id]["steps"]
+    preserved = False
+    for step in steps:
+        if step.get("uses", "").startswith("actions/checkout@"):
+            settings = step["with"]
+            assert settings["fetch-depth"] == "1"
+            ref = refs[settings["ref"]]
+            git(tested, "fetch", "--no-tags", "--depth=1", "origin", ref)
+            git(tested, "checkout", "--force", "--detach", ref)
+        elif step.get("name") == preserve_name:
+            result = run_bash(
+                'cd "$GITHUB_WORKSPACE"\n' + step["run"],
+                {
+                    "GITHUB_WORKSPACE": posix(tested),
+                    "RUNNER_TEMP": posix(runner_temp),
+                },
+            )
+            assert result.returncode == 0, result.stdout + result.stderr
+            preserved = True
+        elif step.get("name") in (
+            "Verify patch contracts",
+            "Prepare container-local reports",
+        ):
+            break
+    assert preserved
+    assert git(tested, "rev-parse", "HEAD") == head
+    assert not (tested / helper).exists()
+    assert not (tested / "base-only.txt").exists()
+    assert (tested / "feature.txt").read_text() == "tested PR source\n"
+    preserved_helper = runner_temp / "hcu-ci-arc-bootstrap" / Path(helper).name
+    assert preserved_helper.read_bytes() == expected_helper
+    subsequent_runs = "\n".join(step.get("run", "") for step in steps)
+    assert f'"$RUNNER_TEMP/hcu-ci-arc-bootstrap/{Path(helper).name}"' in subsequent_runs
+    assert helper not in "\n".join(
+        step.get("run", "")
+        for step in steps[
+            steps.index(next(s for s in steps if s.get("name") == preserve_name)) + 1 :
+        ]
+    )
+    if job_id == "static-and-select":
+        # The shallow base fetch must still be available after head checkout.
+        assert git(tested, "cat-file", "-t", base) == "commit"
+        changed = git(tested, "diff", "--name-only", base, head)
+        assert "feature.txt" in changed and "base-only.txt" in changed
 
 
 def test_arc_container_contract_and_failure_artifacts():

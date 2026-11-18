@@ -17,9 +17,13 @@ jobs:
     outputs:
       image: ${{ steps.image.outputs.image }}
     steps:
-      - uses: actions/checkout@v4
+      # Image resolution is orchestration, not code under test. Older PR heads
+      # need not contain the migration helpers present in the workflow revision.
+      - name: Checkout caller ARC image resolver
+        uses: actions/checkout@v4
         with:
-          ref: ${{ github.event.pull_request.head.sha }}
+          ref: ${{ github.workflow_sha }}
+          fetch-depth: 1
           persist-credentials: false
       - name: Resolve release image without a Docker daemon
         id: image
@@ -42,10 +46,30 @@ jobs:
       arc_matrix: ${{ steps.pools.outputs.arc_matrix }}
       legacy_matrix: ${{ steps.pools.outputs.legacy_matrix }}
     steps:
-      - uses: actions/checkout@v4
+      - name: Checkout caller ARC bootstrap
+        uses: actions/checkout@v4
+        with:
+          ref: ${{ github.workflow_sha }}
+          fetch-depth: 1
+          persist-credentials: false
+      - name: Preserve caller ARC matrix mapper
+        run: |
+          set -euo pipefail
+          mkdir -p "$RUNNER_TEMP/hcu-ci-arc-bootstrap"
+          cp .github/scripts/hcu_ci/prepare_hcu_k8s.py "$RUNNER_TEMP/hcu-ci-arc-bootstrap/"
+      # Selection uses a two-endpoint diff, not merge-base/history traversal.
+      # Keep both exact commits locally without fetching every branch and tag.
+      - name: Checkout selection base revision
+        uses: actions/checkout@v4
+        with:
+          ref: ${{ github.event.pull_request.base.sha }}
+          fetch-depth: 1
+          persist-credentials: false
+      - name: Checkout tested revision
+        uses: actions/checkout@v4
         with:
           ref: ${{ github.event.pull_request.head.sha }}
-          fetch-depth: 0
+          fetch-depth: 1
           persist-credentials: false
       - name: Verify patch contracts
         env:
@@ -88,7 +112,7 @@ jobs:
           MATRIX_JSON: ${{ steps.select.outputs.matrix }}
         run: |
           source /opt/dtk/env.sh
-          python3 .github/scripts/hcu_ci/prepare_hcu_k8s.py matrix --github-output "$GITHUB_OUTPUT"
+          python3 "$RUNNER_TEMP/hcu-ci-arc-bootstrap/prepare_hcu_k8s.py" matrix --github-output "$GITHUB_OUTPUT"
       - uses: actions/upload-artifact@v4
         if: always()
         with:
@@ -158,15 +182,28 @@ jobs:
       HF_HUB_OFFLINE: '1'
       HF_DATASETS_OFFLINE: '1'
     steps:
-      - uses: actions/checkout@v4
+      - name: Checkout caller ARC bootstrap
+        uses: actions/checkout@v4
+        with:
+          ref: ${{ github.workflow_sha }}
+          fetch-depth: 1
+          persist-credentials: false
+      - name: Preserve caller ARC native launcher
+        run: |
+          set -euo pipefail
+          mkdir -p "$RUNNER_TEMP/hcu-ci-arc-bootstrap"
+          cp scripts/ci/hcu/hcu_ci_run_k8s.sh "$RUNNER_TEMP/hcu-ci-arc-bootstrap/"
+      - name: Checkout tested revision
+        uses: actions/checkout@v4
         with:
           ref: ${{ github.event.pull_request.head.sha }}
+          fetch-depth: 1
           persist-credentials: false
       - name: Prepare container-local reports
         run: echo "HCU_CI_JOB_ROOT=$RUNNER_TEMP/hcu-ci-$HCU_CI_JOB_ID" >> "$GITHUB_ENV"
       - name: Install plugin and selected job dependencies in the job container
         run: |
-          bash scripts/ci/hcu/hcu_ci_run_k8s.sh bash -c '
+          bash "$RUNNER_TEMP/hcu-ci-arc-bootstrap/hcu_ci_run_k8s.sh" bash -c '
             set -euo pipefail
             python3 -m pip install --no-deps --no-build-isolation -e .
             python3 .github/scripts/hcu_ci/ensure_ci_dependencies.py
@@ -174,7 +211,7 @@ jobs:
             python3 .github/scripts/hcu_ci/ensure_evalscope.py
           '
       - name: Run unchanged preflight and registered test partition
-        run: bash scripts/ci/hcu/hcu_ci_run_k8s.sh python3 .github/scripts/hcu_ci/run_hcu_ci_job.py
+        run: bash "$RUNNER_TEMP/hcu-ci-arc-bootstrap/hcu_ci_run_k8s.sh" python3 .github/scripts/hcu_ci/run_hcu_ci_job.py
       - name: Upload HCU logs and reports
         if: always()
         uses: actions/upload-artifact@v4
