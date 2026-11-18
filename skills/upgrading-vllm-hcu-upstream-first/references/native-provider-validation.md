@@ -36,8 +36,10 @@ For a default-OFF native optimization, trace real activation and the ordinary
 model path as well as the enable switch: registering an OOT class or fake/custom
 op need not import its vendor DSO. Preserve official fallback, compile-cache
 factors and explicit required-capability admission while deferring an unused
-provider. Reuse Adapter's process-local lifecycle for serialized first-use ABI
-checks and fork refusal; a health checker reports failures without initializing
+provider. Required extensions use published entry-point names, which can differ
+from declared spec names; exercise the real host activation with that metadata.
+Reuse Adapter's process-local lifecycle for serialized first-use ABI checks
+and fork refusal; a health checker reports failures without initializing
 or repairing the provider. Verify enabled ordinary/fused execution and changing
 input Graph replay after an installed-wheel binding check. Count shutdown leaks
 and the original cleanup deadline separately: fewer imports do not establish a
