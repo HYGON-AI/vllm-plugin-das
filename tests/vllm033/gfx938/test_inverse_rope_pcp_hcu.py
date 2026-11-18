@@ -6,11 +6,6 @@ from statistics import median
 import pytest
 import torch
 
-pytestmark = pytest.mark.skipif(
-    not torch.cuda.is_available() or torch.version.hip is None,
-    reason="requires an explicitly assigned idle HCU")
-
-
 def _time_events(function, prepare):
     for _ in range(10):
         prepare()
@@ -27,11 +22,17 @@ def _time_events(function, prepare):
     return median(samples)
 
 
+@pytest.mark.hcu
 @pytest.mark.parametrize("rows,heads", [(1, 1), (8, 2), (128, 64), (4096, 64)])
 @torch.inference_mode()
 def test_inverse_rope_matches_core_eager_and_changed_input_graph(rows, heads, record_property):
     from hcu_vllm_das.inverse_rope_hcu import load_operator
     from vllm.v1.attention.ops.rocm_aiter_mla_sparse import rocm_inverse_rope_rows_
+
+    assert torch.version.hip is not None and torch.cuda.is_available(), "Expected a HIP device"
+    torch.cuda.set_device(0)
+    arch = torch.cuda.get_device_properties(0).gcnArchName.split(":")[0]
+    assert arch == "gfx938", f"Inverse RoPE numerical contract requires gfx938, got {arch}"
 
     operator = load_operator()
     output = torch.randn(rows, heads, 512, device="cuda", dtype=torch.bfloat16)

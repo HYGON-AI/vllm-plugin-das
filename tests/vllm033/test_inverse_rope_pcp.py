@@ -143,9 +143,8 @@ def test_method_provider_cannot_be_added_after_class_construction(monkeypatch):
 
 
 def _core_method(name, namespace):
-    root = os.environ.get("VLLM_SOURCE_ROOT")
-    if root is None:
-        pytest.skip("set VLLM_SOURCE_ROOT for real-Core-source replay")
+    root = os.environ.get("VLLM_TARGET_ROOT") or os.environ.get("VLLM_SOURCE_ROOT")
+    assert root, "VLLM_TARGET_ROOT must identify the vLLM source tree for replay"
     path = Path(root) / "vllm/models/deepseek_v41/amd/rocm.py"
     tree = ast.parse(path.read_text())
     cls = next(node for node in tree.body if isinstance(node, ast.ClassDef)
