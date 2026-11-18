@@ -232,11 +232,14 @@ def test_forward_profiles_without_provider_and_leaves_empty_batch_untouched(
 
 @pytest.mark.parametrize("layout", ("LBHNC", "LBNHC"))
 @pytest.mark.parametrize("prefill_gather", (False, True))
+@pytest.mark.parametrize("sliding_window,softcap", (
+    (None, 0.5), (1, 0.0), (1, 0.5), (3, 0.0), (3, 0.5),
+))
 def test_softcap_forward_uses_core_attention_and_preserves_output(
-    monkeypatch, layout, prefill_gather
+    monkeypatch, layout, prefill_gather, sliding_window, softcap
 ):
     flash = load_flash_attention(monkeypatch, kv_cache_layout=layout)
-    impl = make_impl(flash, logits_soft_cap=0.5)
+    impl = make_impl(flash, logits_soft_cap=softcap, sliding_window=sliding_window)
     impl._prefill_gather_enabled = prefill_gather
     query = torch.randn(5, 4, 64)
     output = torch.full_like(query, -99.0)
@@ -246,7 +249,10 @@ def test_softcap_forward_uses_core_attention_and_preserves_output(
     )
 
     def core(**arguments):
-        assert arguments["softcap"] == 0.5
+        assert arguments["softcap"] == softcap
+        assert arguments["window_size"] == (
+            (-1, -1) if sliding_window is None else (sliding_window - 1, 0)
+        )
         assert arguments["layout"] == ("bhsd" if layout == "LBHNC" else "bshd")
         arguments["out"].fill_(7)
         return arguments["out"]
@@ -259,6 +265,13 @@ def test_softcap_forward_uses_core_attention_and_preserves_output(
     assert result is output
     assert torch.all(output[:2] == 7)
     assert torch.all(output[2:] == -99)
+
+
+@pytest.mark.parametrize("window", (0, -1, True, 1.5))
+def test_rejects_invalid_sliding_window(monkeypatch, window):
+    flash = load_flash_attention(monkeypatch)
+    with pytest.raises(ValueError, match="positive integer sliding window"):
+        make_impl(flash, sliding_window=window)
 
 
 @pytest.mark.parametrize("option", ("return_softmax_lse", "return_attn_probs"))
@@ -274,11 +287,13 @@ def test_core_softcap_path_refuses_unavailable_statistics(monkeypatch, option):
     ("fp8_e4m3", torch.float8_e4m3fn),
 ))
 @pytest.mark.parametrize("prefill_gather", (False, True))
+@pytest.mark.parametrize("sliding_window,softcap", ((None, 0.5), (3, 0.0), (3, 0.5)))
 def test_fp8_softcap_forward_preserves_format_and_layer_descales(
-    monkeypatch, layout, kv_dtype, storage_dtype, prefill_gather,
+    monkeypatch, layout, kv_dtype, storage_dtype, prefill_gather, sliding_window, softcap,
 ):
     flash = load_flash_attention(monkeypatch, kv_cache_layout=layout)
-    impl = make_impl(flash, kv_cache_dtype=kv_dtype, logits_soft_cap=0.5)
+    impl = make_impl(flash, kv_cache_dtype=kv_dtype, logits_soft_cap=softcap,
+                     sliding_window=sliding_window)
     impl._prefill_gather_enabled = prefill_gather
     query = torch.randn(5, 4, 64, dtype=torch.bfloat16)
     output = torch.full_like(query, -99)
@@ -306,7 +321,10 @@ def test_fp8_softcap_forward_preserves_format_and_layer_descales(
         calls.append("core")
         assert arguments["k"].dtype == arguments["v"].dtype == storage_dtype
         assert arguments["q_descale"] is arguments["k_descale"] is arguments["v_descale"] is None
-        assert arguments["softcap"] == 0.5
+        assert arguments["softcap"] == softcap
+        assert arguments["window_size"] == (
+            (-1, -1) if sliding_window is None else (sliding_window - 1, 0)
+        )
         arguments["out"].fill_(7)
 
     scales = ModuleType("hcu_vllm_das.attention.e5m2_scales")
@@ -357,7 +375,6 @@ def test_forward_rejects_fused_output_quantization(monkeypatch, argument):
     "kwargs",
     (
         {"attn_type": "encoder"},
-        {"sliding_window": 128},
         {"sinks": torch.empty(4)},
         {"kv_cache_dtype": "fp8_e4m3fnuz"},
         {"head_size": 96},
@@ -575,7 +592,7 @@ def test_backend_selects_fa2_dual_layout_and_64_token_pages(monkeypatch):
     assert flash.HcuFlashAttentionBackend.supports_rswa() is False
     assert flash.HcuFlashAttentionBackend.supports_attn_type("decoder") is True
     assert flash.HcuFlashAttentionBackend.supports_attn_type("encoder") is False
-    assert flash.HcuFlashAttentionBackend.supports_sliding_window() is False
+    assert flash.HcuFlashAttentionBackend.supports_sliding_window() is True
     assert flash.HcuFlashAttentionBackend.supports_non_causal() is False
     assert flash.HcuFlashAttentionBackend.supports_batch_invariance() is False
 

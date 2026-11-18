@@ -40,7 +40,7 @@ def _layout_name(layout: KVCacheLayout) -> str:
 
 
 def _triton_softcap_attention(**kwargs: Any) -> torch.Tensor:
-    """Use Core's softcap implementation over the existing paged cache views."""
+    """Use Core's softcap/window implementation over existing paged views."""
     if kwargs.get("return_softmax_lse") or kwargs.get("return_attn_probs"):
         raise NotImplementedError("Core softcap path does not return attention statistics")
     if any(kwargs.get(name) is not None for name in ("q_descale", "k_descale", "v_descale")):
@@ -62,7 +62,7 @@ def _triton_softcap_attention(**kwargs: Any) -> torch.Tensor:
         softmax_scale=kwargs["q"].shape[-1] ** -0.5 if scale is None else scale,
         causal=kwargs.get("causal", False),
         window_size=kwargs.get("window_size") or (-1, -1),
-        block_table=kwargs["block_table"], softcap=kwargs["softcap"],
+        block_table=kwargs["block_table"], softcap=kwargs.get("softcap", 0.0),
         q_descale=None, k_descale=None, v_descale=None,
         alibi_slopes=kwargs.get("alibi_slopes"),
     )
@@ -182,8 +182,12 @@ class HcuFlashAttentionImpl(AttentionImpl[FlashAttentionMetadata]):
         kv_sharing_target_layer_name: str | None = None,
         sinks: torch.Tensor | None = None,
     ) -> None:
-        if attn_type != "decoder" or sliding_window is not None or sinks is not None:
-            raise NotImplementedError("HCU Flash supports full decoder attention only")
+        if attn_type != "decoder" or sinks is not None:
+            raise NotImplementedError("HCU Flash supports decoder attention without sinks")
+        if sliding_window is not None and (
+            type(sliding_window) is not int or sliding_window <= 0
+        ):
+            raise ValueError("HCU Flash requires a positive integer sliding window")
         if self.dcp_world_size != 1 or self.pcp_world_size != 1:
             raise NotImplementedError("HCU Flash does not support context parallelism")
         if not HcuFlashAttentionBackend.supports_head_size(head_size):
@@ -205,6 +209,11 @@ class HcuFlashAttentionImpl(AttentionImpl[FlashAttentionMetadata]):
             else None
         )
         self.logits_soft_cap = 0.0 if logits_soft_cap is None else logits_soft_cap
+        # Match Core's causal convention: the current token counts in the
+        # requested window, so a window of one sees no preceding tokens.
+        self.sliding_window = (
+            (-1, -1) if sliding_window is None else (sliding_window - 1, 0)
+        )
         # Both vendor paths consume unquantized BF16/FP16 Q. Keep the public
         # base's fusion support disabled: native fused writers use another ABI.
         self.supports_quant_query_input = False
@@ -261,7 +270,7 @@ class HcuFlashAttentionImpl(AttentionImpl[FlashAttentionMetadata]):
             softmax_scale=self.scale,
             causal=True,
             alibi_slopes=self.alibi_slopes,
-            window_size=(-1, -1),
+            window_size=self.sliding_window,
             softcap=self.logits_soft_cap,
             q_descale=None,
             k_descale=layer._k_scale.expand(descale_shape) if uses_fp8 else None,
@@ -340,9 +349,10 @@ class HcuFlashAttentionImpl(AttentionImpl[FlashAttentionMetadata]):
                 raise NotImplementedError(
                     f"HCU FlashAttention FA2 does not support {name}"
                 )
-        if kwargs.get("softcap", 0.0) > 0:
-            # Vendor direct-paged attention ignores softcap. Reuse Core's
-            # attention algorithm instead of maintaining another softcap kernel.
+        if (kwargs.get("softcap", 0.0) > 0
+                or kwargs.get("window_size", (-1, -1)) != (-1, -1)):
+            # Preserve both softcap and the exact causal window using Core;
+            # do not depend on the vendor direct-paged path's mask support.
             kwargs["layout"] = (
                 "bhsd" if self.kv_cache_layout == KVCacheLayout.LBHNC else "bshd"
             )
@@ -448,7 +458,7 @@ class HcuFlashAttentionBackend(FlashAttentionBackend):
         device_capability: Any,
     ) -> str | None:
         if use_mla or has_sink or use_sparse or use_mm_prefix:
-            return "HCU Flash supports ordinary full decoder attention only"
+            return "HCU Flash supports ordinary decoder attention only"
         return None
 
     @classmethod
@@ -477,7 +487,7 @@ class HcuFlashAttentionBackend(FlashAttentionBackend):
 
     @classmethod
     def supports_sliding_window(cls) -> bool:
-        return False
+        return True
 
     @classmethod
     def supports_non_causal(cls) -> bool:

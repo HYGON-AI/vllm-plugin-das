@@ -51,6 +51,17 @@ prefill-gather on/off, non-unit scales and changed-input Graph replay in both
 layouts. Core owns the softcap algorithm; a provider fallback does not prove
 the vendor implements it or qualify model accuracy.
 
+For pretrained softcap checkpoints, inspect per-layer attention policy too.
+Gemma2 alternates full and sliding layers; a full-attention synthetic fixture
+does not establish that combination. Preserve the requested window and Core's
+cache manager rather than removing the model's sliding configuration. Translate
+a causal window W to `(W - 1, 0)` and test W=1, a boundary-crossing small window
+and the checkpoint window. Cover finite windows with both zero and positive
+softcap, native cache writes, FP8 scales, ragged/empty rows and changed-input
+Graph against an independently masked reference. Mask support in a contiguous
+vendor path does not establish paged-window correctness. Reusing official Core
+attention through the Plugin boundary keeps the model and scheduler upstream.
+
 Bound temporary bytes as well as token counts. A batch-times-maximum-context
 gather can reserve every short decode row at one long prefill's length; count
 both FP8 gathers and both converted tensors while they coexist. Group sequences

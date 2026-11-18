@@ -15,7 +15,7 @@ scheduler, metadata builder, cache allocation or custom kernel is copied.
 Both explicit E5M2 and E4M3 paths use the existing query/output descale adapter,
 including its rounding behavior; each keeps its own FP8 typed cache view.
 The underlying attention call uses Core instead of vendor Flash. A zero/absent
-softcap keeps the existing vendor route and optional
+softcap with a full window keeps the existing vendor route and optional
 prefill gather policy. Enabling prefill gather cannot bypass softcap dispatch.
 
 This is an explicit provider fallback for a correctness boundary, and is not
@@ -24,6 +24,48 @@ public AttentionImpl output only; diagnostic requests for LSE or attention
 probabilities are refused. Remove this fallback only after the vendor passes
 the same writer/reader, non-unit-scale and changed-input Graph tests for both
 prefill and decode, plus applicable model validation.
+
+## Causal sliding-window composition
+
+Pretrained Gemma2 combines positive attention softcap with alternating full
+and sliding layers. The previous provider advertised no sliding support and
+rejected its constructor, so the full-attention synthetic fixture cannot
+qualify this checkpoint. The Plugin now accepts positive integer causal
+windows and routes every finite window to Core's unchanged `unified_attention`,
+including zero softcap. It passes `(window - 1, 0)`, counting the current token
+in the public window size. E4M3/E5M2 retain typed views and the same one-time
+KV descales. Core retains the per-layer policy, metadata and cache allocation;
+no checkpoint configuration or Core source is edited. Sink, RSWA, noncausal
+and context-parallel combinations remain rejected.
+
+The new native regression uses an independent FP32 mask/softcap reference,
+native KV writes and public `forward`, head size256, both layouts, BF16/FP16/
+E4M3/E5M2, non-unit FP8 scales, windows1/17/64/4096 and caps0/50. Ragged rows,
+empty rows, changed page tables and lengths, invalid writer slots, output
+padding and stable-address Graph replay are exercised. Results and pretrained
+HE32 comparison remain separate gates; historical results below bind their
+original runtime rather than this new composition.
+
+On gfx936, the sliding composition passes128 CPU Flash contracts,8 source/
+package contracts, and64 installed native cases with no skips and unchanged
+0.016 absolute/relative numerical tolerances. All six installed package
+RECORDs verify before/after. The wheel SHA256 is
+`12e1858293aef1312609eb34eea7e8b4b83a97ccad474b9fa1a6c4bd5da966d1`;
+Core0.33 source `98a09850d56b` and baseline Adapter `89fc929c1455` are unchanged.
+The initial native attempt failed because the new object-based test fixture
+omitted `alibi_slopes`; that failure is retained, the fixture now declares its
+absent bias, and the complete64-case matrix was rerun. No production change
+or tolerance relaxation was needed for that test-fixture failure.
+
+A pretrained `google/gemma-2-2b-it` checkpoint has been sealed from the public
+ModelScope mirror at revision `c400b2564e9db9e5a0bc6dfbe07a05da3cd09f52`:
+all12 assets (5,250,588,019bytes) match remote SHA256 and an independent full
+reread. Its original26layers,13full/13sliding4096 policy, head size256 and
+attention cap50 are retained. Original HE0–31 paired validation is running
+with official TRITON_ATTN and Plugin FLASH_ATTN at BF16 and E4M3 KV, default
+Graph/prefix and the original15s shutdown grace. This is pending model/accuracy
+evidence, not a passed gate. The local checkpoint weights reside in tmpfs;
+only the bounded metadata/seal is durably archived. gfx836 remains unqualified.
 
 ## E4M3 composition follow-up (2026-11-18)
 

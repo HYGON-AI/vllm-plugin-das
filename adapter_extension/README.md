@@ -36,6 +36,14 @@ For explicit E4M3 and E5M2 caches, the Plugin preserves the format's typed
 view and applies KV descales through the shared query/output scale adapter
 before/after the Core call.
 
+Causal sliding windows also use the same official Core attention path, with
+`(window - 1, 0)` bounds, including when softcap is zero. Full attention with
+zero softcap retains its vendor route. The scheduler, sliding-cache manager,
+metadata builder and model layer policy remain owned by Core. Sink, noncausal,
+RSWA and context-parallel attention remain outside this provider's capability.
+Component coverage and pretrained Gemma2 qualification are tracked separately
+in the softcap validation record; enabling a capability is not an accuracy pass.
+
 ## E2M1 packer lowering (default triton, `stock` opts out)
 
 `das_hcu_fp4_packer` rebinds Core's `_fp32x2_to_fp4x2` E2M1 packer at startup.
