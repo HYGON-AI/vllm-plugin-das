@@ -1256,12 +1256,26 @@ def apply_vllm_w4a8_moe(
         getattr(layer, "expert_map", None),
     )
     fused_experts_impl = _boltops_w4a8_fused_experts()
+    # vLLM marks a skipped padding row with -1 in every top-k slot. BoltOps'
+    # HIPC sorter indexes its expert mesh directly with these ids and cannot
+    # consume that sentinel. Give only those rows distinct in-range experts
+    # with zero weights; valid rows keep their original routing. Distinct ids
+    # are required because the sorter stores only one route per token/expert.
+    # Keep this device-only so graph replay also observes changed padding rows.
+    padding_rows = (topk_ids == -1).all(dim=-1, keepdim=True)
+    safe_padding_ids = torch.arange(
+        topk_ids.shape[-1], dtype=torch.int32, device=topk_ids.device
+    )
+    topk_ids = torch.where(
+        padding_rows, safe_padding_ids, topk_ids.to(torch.int32)
+    )
+    topk_weights = topk_weights.to(torch.float32).masked_fill(padding_rows, 0.0)
     return fused_experts_impl(
         hidden_states,
         w1,
         w2,
-        topk_weights.to(torch.float32),
-        topk_ids.to(torch.int32),
+        topk_weights,
+        topk_ids,
         output_dtype=hidden_states.dtype,
         inplace=False,
         activation=activation,

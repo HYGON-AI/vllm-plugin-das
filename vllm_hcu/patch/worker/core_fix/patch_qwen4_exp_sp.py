@@ -36,6 +36,7 @@ import functools
 import hashlib
 import inspect
 import textwrap
+from contextlib import contextmanager
 from itertools import islice
 from types import ModuleType
 
@@ -167,6 +168,34 @@ def sp_padding_mask(
     return _local_rows(_pad_rows(is_padding, value=True))
 
 
+@contextmanager
+def hc_sp_padding_context(enabled: bool):
+    """Scope the TP-local bitmap to one target/draft forward, including errors.
+
+    The output is gathered back to full tokens. Restore the caller's bitmap
+    and domain metadata before another target or MTP forward can shard it.
+    """
+    if not (
+        enabled and envs.VLLM_MOE_SKIP_PADDING and is_forward_context_available()
+    ):
+        yield
+        return
+    context = get_forward_context()
+    original_padding = context.is_padding
+    kwargs = context.additional_kwargs
+    key = "hcu_moe_padding_is_local"
+    had_domain = key in kwargs
+    original_domain = kwargs.get(key)
+    try:
+        yield
+    finally:
+        context.is_padding = original_padding
+        if had_domain:
+            kwargs[key] = original_domain
+        else:
+            kwargs.pop(key, None)
+
+
 def shard_tokens_for_hc_sp(hidden_states: torch.Tensor) -> torch.Tensor:
     """Keep this rank's token rows and align the MoE padding mask with them."""
     if envs.VLLM_MOE_SKIP_PADDING and is_forward_context_available():
@@ -174,6 +203,9 @@ def shard_tokens_for_hc_sp(hidden_states: torch.Tensor) -> torch.Tensor:
         forward_context.is_padding = sp_padding_mask(
             forward_context.is_padding, hidden_states
         )
+        # Unlike Core's SP producer, this helper already localizes the mask.
+        # A one-row mask cannot communicate that domain through shape alone.
+        forward_context.additional_kwargs["hcu_moe_padding_is_local"] = True
     return sp_shard(hidden_states)
 
 
@@ -382,96 +414,97 @@ def model_forward(
     deepstack_input_embeds=None,
 ):
     hc_sp = getattr(self, HC_SP_ATTR, False)
-    num_tokens = positions.shape[-1]
-    if _target.get_pp_group().is_first_rank:
-        if inputs_embeds is not None:
-            hidden_states = inputs_embeds
-        else:
-            if input_ids is None:
-                raise ValueError("input_ids or inputs_embeds is required")
-            hidden_states = self.embed_input_ids(input_ids)
-        if hc_sp:
-            hidden_states = shard_tokens_for_hc_sp(hidden_states)
-        # Expand only the local token rows when HC SP is enabled.
-        hidden_states = hidden_states.repeat(1, self.config.hc_count)
-    else:
-        if intermediate_tensors is None:
-            raise ValueError("pipeline stage requires intermediate tensors")
-        hidden_states = intermediate_tensors["hidden_states"]
-
-    block_output = None
-    injection = None
-    last_layer = None
-    for layer_idx, layer in islice(
-        enumerate(self.layers), self.start_layer, self.end_layer
-    ):
-        last_layer = layer
-        hidden_states, block_output, injection = layer(
-            hidden_states=hidden_states,
-            prev_block_output=block_output,
-            prev_injection=injection,
-            positions=positions,
-            input_ids=input_ids,
-            query_start_loc=query_start_loc,
-            ngram_context=ngram_context,
-        )
-        if deepstack_input_embeds is not None and layer_idx < len(
-            deepstack_input_embeds
-        ):
-            deepstack_embed = deepstack_input_embeds[
-                f"deepstack_input_embeds_{layer_idx}"
-            ]
+    with hc_sp_padding_context(hc_sp):
+        num_tokens = positions.shape[-1]
+        if _target.get_pp_group().is_first_rank:
+            if inputs_embeds is not None:
+                hidden_states = inputs_embeds
+            else:
+                if input_ids is None:
+                    raise ValueError("input_ids or inputs_embeds is required")
+                hidden_states = self.embed_input_ids(input_ids)
             if hc_sp:
-                deepstack_embed = sp_shard(deepstack_embed)
-            deepstack_embed = (
-                deepstack_embed.unsqueeze(-2)
-                .expand(
-                    *deepstack_embed.shape[:-1],
-                    self.config.hc_count,
-                    self.config.hidden_size,
-                )
-                .flatten(-2)
-            )
-            # Deepstack is an external addition to the materialized
-            # multi-stream state and therefore terminates delayed combine.
-            hidden_states = layer.mlp_hyper_connection.combine(
-                hidden_states, block_output, injection
-            )
-            block_output = None
-            injection = None
-            hidden_states = hidden_states + deepstack_embed
-
-    if not _target.get_pp_group().is_last_rank:
-        # PP transports one tensor, not the delayed HC tuple. Materialize
-        # with the HC module that produced the pending injection.
-        if last_layer is not None and block_output is not None:
-            hidden_states = last_layer.mlp_hyper_connection.combine(
-                hidden_states, block_output, injection
-            )
-        return _target.IntermediateTensors({"hidden_states": hidden_states})
-
-    # The final mixer consumes the last pending combine and returns both
-    # the sampled single stream and the materialized multi-stream state.
-    final_mixer = self.hyper_connection_mixer
-    assert final_mixer is not None
-    multi_hidden, sample_hidden_states, _ = final_mixer.combine_and_mix(
-        hidden_states, block_output, injection
-    )
-    if hc_sp:
-        if self._mtp_hidden_buffer is not None:
-            # Gather LM-head and MTP states together when both are needed.
-            sample_hidden_states, multi_hidden = gather_packed(
-                sample_hidden_states, multi_hidden, num_tokens
-            )
+                hidden_states = shard_tokens_for_hc_sp(hidden_states)
+            # Expand only the local token rows when HC SP is enabled.
+            hidden_states = hidden_states.repeat(1, self.config.hc_count)
         else:
-            sample_hidden_states = sp_all_gather(sample_hidden_states)[:num_tokens]
-    if self._mtp_hidden_buffer is not None:
-        # Capture the pre-final-mixer multi-stream hidden state
-        # [T, hc_count*H] for the MTP drafter (zero extra compute:
-        # this tensor is needed by the final mixer regardless).
-        num_tokens = multi_hidden.shape[0]
-        self._mtp_hidden_buffer[:num_tokens].copy_(multi_hidden)
-    return sample_hidden_states
+            if intermediate_tensors is None:
+                raise ValueError("pipeline stage requires intermediate tensors")
+            hidden_states = intermediate_tensors["hidden_states"]
+
+        block_output = None
+        injection = None
+        last_layer = None
+        for layer_idx, layer in islice(
+            enumerate(self.layers), self.start_layer, self.end_layer
+        ):
+            last_layer = layer
+            hidden_states, block_output, injection = layer(
+                hidden_states=hidden_states,
+                prev_block_output=block_output,
+                prev_injection=injection,
+                positions=positions,
+                input_ids=input_ids,
+                query_start_loc=query_start_loc,
+                ngram_context=ngram_context,
+            )
+            if deepstack_input_embeds is not None and layer_idx < len(
+                deepstack_input_embeds
+            ):
+                deepstack_embed = deepstack_input_embeds[
+                    f"deepstack_input_embeds_{layer_idx}"
+                ]
+                if hc_sp:
+                    deepstack_embed = sp_shard(deepstack_embed)
+                deepstack_embed = (
+                    deepstack_embed.unsqueeze(-2)
+                    .expand(
+                        *deepstack_embed.shape[:-1],
+                        self.config.hc_count,
+                        self.config.hidden_size,
+                    )
+                    .flatten(-2)
+                )
+                # Deepstack is an external addition to the materialized
+                # multi-stream state and therefore terminates delayed combine.
+                hidden_states = layer.mlp_hyper_connection.combine(
+                    hidden_states, block_output, injection
+                )
+                block_output = None
+                injection = None
+                hidden_states = hidden_states + deepstack_embed
+
+        if not _target.get_pp_group().is_last_rank:
+            # PP transports one tensor, not the delayed HC tuple. Materialize
+            # with the HC module that produced the pending injection.
+            if last_layer is not None and block_output is not None:
+                hidden_states = last_layer.mlp_hyper_connection.combine(
+                    hidden_states, block_output, injection
+                )
+            return _target.IntermediateTensors({"hidden_states": hidden_states})
+
+        # The final mixer consumes the last pending combine and returns both
+        # the sampled single stream and the materialized multi-stream state.
+        final_mixer = self.hyper_connection_mixer
+        assert final_mixer is not None
+        multi_hidden, sample_hidden_states, _ = final_mixer.combine_and_mix(
+            hidden_states, block_output, injection
+        )
+        if hc_sp:
+            if self._mtp_hidden_buffer is not None:
+                # Gather LM-head and MTP states together when both are needed.
+                sample_hidden_states, multi_hidden = gather_packed(
+                    sample_hidden_states, multi_hidden, num_tokens
+                )
+            else:
+                sample_hidden_states = sp_all_gather(sample_hidden_states)[:num_tokens]
+        if self._mtp_hidden_buffer is not None:
+            # Capture the pre-final-mixer multi-stream hidden state
+            # [T, hc_count*H] for the MTP drafter (zero extra compute:
+            # this tensor is needed by the final mixer regardless).
+            num_tokens = multi_hidden.shape[0]
+            self._mtp_hidden_buffer[:num_tokens].copy_(multi_hidden)
+        return sample_hidden_states
 
 
 def same_parameters(a, b) -> bool:
