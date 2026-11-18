@@ -141,6 +141,12 @@ def apply_to_module(module: ModuleType) -> bool:
         x_and_scale_quanted=None,
     ):
         if not _custom_quantization_enabled():
+            # Preserve leading dimensions for MTP inputs.
+            if x.ndim > 2:
+                leading_shape = x.shape[:-1]
+                x_2d = x.reshape(-1, x.shape[-1])
+                out = original_apply(self, layer, x_2d, bias)
+                return out.reshape(*leading_shape, out.shape[-1])
             return original_apply(self, layer, x, bias)
         return apply_int8_linear(
             input=x,
