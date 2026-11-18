@@ -57,10 +57,8 @@ def load_operator():
     return operator
 
 
-
-@lru_cache(maxsize=4)
 def forward_table(cos_sin_cache):
-    """Reuse a reversed-angle copy across layers sharing a static Core table."""
+    """Copy the static Core table and reverse its sine half."""
     with torch.no_grad():
         table = cos_sin_cache.clone(memory_format=torch.contiguous_format)
         table[:, 32:].neg_()
@@ -73,19 +71,33 @@ def _supported_device(device):
     return getattr(properties, "gcnArchName", "").split(":", 1)[0] == "gfx938"
 
 
-def prepare(q, positions, cos_sin_cache):
-    """Prepare the rotation, or defer unsupported inputs to the native path."""
-    if (torch.version.hip is None or torch.is_grad_enabled()
-            or not q.is_cuda or q.dtype != torch.bfloat16 or q.ndim != 3
-            or q.shape[-1] != 512 or not q.is_contiguous()
-            or not 0 < q.shape[0] * q.shape[1] <= 2**31 - 9
-            or positions.device != q.device or positions.dtype != torch.int64
-            or positions.shape != (q.shape[0],) or not positions.is_contiguous()
-            or cos_sin_cache.device != q.device or cos_sin_cache.dtype != torch.float32
-            or cos_sin_cache.ndim != 2 or cos_sin_cache.shape[1] != 64
-            or not _supported_device(q.device)):
+def _supports_table(cache):
+    return (
+        torch.version.hip is not None
+        and cache.is_cuda and cache.dtype == torch.float32
+        and cache.ndim == 2 and cache.shape[1] == 64
+        and _supported_device(cache.device)
+    )
+
+
+@lru_cache(maxsize=4)
+def initialize(cos_sin_cache):
+    """Reserve the shared FP32 table and load the extension during profiling."""
+    if not _supports_table(cos_sin_cache):
         return None
 
-    # The native kernel applies inverse GPT-J rotation. Flip the sine to obtain
-    # forward rotation; the original table is still used by Core for KV.
-    return partial(load_operator(), q[..., -64:], positions, forward_table(cos_sin_cache))
+    operator = load_operator()
+    # Layer closures retain the table even if this sharing cache evicts it.
+    table = forward_table(cos_sin_cache)
+
+    def prepare(q, positions, current_table):
+        if (current_table is not cos_sin_cache or torch.is_grad_enabled()
+                or q.device != table.device or q.dtype != torch.bfloat16 or q.ndim != 3
+                or q.shape[-1] != 512 or not q.is_contiguous()
+                or not 0 < q.shape[0] * q.shape[1] <= 2**31 - 9
+                or positions.device != q.device or positions.dtype != torch.int64
+                or positions.shape != (q.shape[0],) or not positions.is_contiguous()):
+            return None
+        return partial(operator, q[..., -64:], positions, table)
+
+    return prepare

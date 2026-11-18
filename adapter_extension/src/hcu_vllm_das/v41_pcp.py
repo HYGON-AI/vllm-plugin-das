@@ -87,9 +87,9 @@ def bind_adapter_classes() -> None:
     # Older adapters keep the stock path on the same Plugin release.
     q_rope_selected = getattr(pcp_fork, "q_rope_selected", None)
     if q_rope_selected is not None and q_rope_selected():
-        from .pcp_q_rope import prepare
+        from .pcp_q_rope import initialize
 
-        pcp_fork.set_q_rope_provider(prepare)
+        pcp_fork.set_q_rope_provider(initialize)
     _bound = True
 
 

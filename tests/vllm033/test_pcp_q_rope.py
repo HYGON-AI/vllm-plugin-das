@@ -23,17 +23,46 @@ def test_q_rope_policy(monkeypatch):
         assert not pcp_fork.q_rope_selected()
 
 
-def test_forward_table_keeps_original_and_reverses_only_sine():
+def test_initializer_warms_once_and_reuses_only_the_original_table(monkeypatch):
     original = torch.arange(3 * 64, dtype=torch.float32).view(3, 64)
     baseline = original.clone()
+    calls = []
+    load_count = []
+
+    def operator(*args):
+        calls.append(args)
+
+    def load_operator():
+        load_count.append(True)
+        return operator
+
+    monkeypatch.setattr(pcp_q_rope, "_supports_table", lambda _: True)
+    monkeypatch.setattr(pcp_q_rope, "load_operator", load_operator)
     try:
-        reversed_table = pcp_q_rope.forward_table(original)
-        assert pcp_q_rope.forward_table(original) is reversed_table
+        prepare = pcp_q_rope.initialize(original)
+        assert pcp_q_rope.initialize(original) is prepare
+        assert load_count == [True]
+
+        def unexpected_init(*args):
+            pytest.fail("real prefill retried startup preparation")
+
+        monkeypatch.setattr(pcp_q_rope, "load_operator", unexpected_init)
+        monkeypatch.setattr(pcp_q_rope, "forward_table", unexpected_init)
+        q = torch.zeros(2, 64, 512, dtype=torch.bfloat16)
+        positions = torch.tensor([0, 1])
+        with torch.inference_mode():
+            assert prepare(q, positions, original.clone()) is None
+            rotate = prepare(q, positions, original)
+            assert rotate is not None
+            rotate()
+        q_view, used_positions, table = calls[0]
+        assert q_view.data_ptr() == q[..., -64:].data_ptr()
+        assert used_positions is positions
         torch.testing.assert_close(original, baseline, rtol=0, atol=0)
-        torch.testing.assert_close(reversed_table[:, :32], baseline[:, :32], rtol=0, atol=0)
-        torch.testing.assert_close(reversed_table[:, 32:], -baseline[:, 32:], rtol=0, atol=0)
+        torch.testing.assert_close(table[:, :32], baseline[:, :32], rtol=0, atol=0)
+        torch.testing.assert_close(table[:, 32:], -baseline[:, 32:], rtol=0, atol=0)
     finally:
-        pcp_q_rope.forward_table.cache_clear()
+        pcp_q_rope.initialize.cache_clear()
 
 
 @pytest.mark.parametrize("eager", [True, False])
@@ -56,10 +85,13 @@ def test_plugin_binds_provider_for_owned_eager_attention(monkeypatch, eager):
     cls = v41_pcp.attention_class()
     config = SimpleNamespace(model_config=SimpleNamespace(enforce_eager=eager))
     attn = cls(vllm_config=config)
-    assert attn._prepare_q_rope is (pcp_q_rope.prepare if eager else None)
+    assert attn._initialize_q_rope is (pcp_q_rope.initialize if eager else None)
+    assert attn._prepare_q_rope is None
 
 
-@pytest.mark.parametrize("route", ["prefill", "stock", "padding", "mixed", "profile", "unsupported"])
+@pytest.mark.parametrize("route", [
+    "prefill", "stock", "padding", "mixed", "profile", "unsupported", "cold",
+])
 def test_owned_prefill_routes_q_and_keeps_native_kv(monkeypatch, route):
     from vllm import distributed
     from vllm.models.deepseek_v41.amd.rocm import DeepseekV41ROCMAiterMLAAttention
@@ -116,7 +148,13 @@ def test_owned_prefill_routes_q_and_keeps_native_kv(monkeypatch, route):
 
     monkeypatch.setattr(distributed, "get_pcp_group", lambda: SimpleNamespace(all_gather=gather))
     monkeypatch.setattr(torch.ops._C, "fused_deepseek_v4_kv_rope_insert", insert, raising=False)
-    attn._prepare_q_rope = None if route == "stock" else prepare
+    def initialize(table):
+        assert table is cos_sin
+        calls.append("initialize")
+        return prepare
+
+    attn._initialize_q_rope = None if route == "stock" else initialize
+    attn._prepare_q_rope = None
     attn.use_pcp = True
     monkeypatch.setattr(cls, "accepts_unnormed_unroped_query", property(lambda self: False))
     attn.n_local_heads = 64
@@ -125,6 +163,13 @@ def test_owned_prefill_routes_q_and_keeps_native_kv(monkeypatch, route):
     attn.rotary_emb = SimpleNamespace(is_neox_style=False, cos_sin_cache=cos_sin)
     attn.swa_cache_layer = SimpleNamespace(prefix="swa", kv_cache=cache)
     attn.kv_mxfp8 = False
+    attn.kv_cache_torch_dtype = torch.uint8
+
+    if route in ("prefill", "mixed", "profile", "unsupported"):
+        assert attn._fused_qnorm_rope_kv_insert(q, kv, positions, None) is native_q
+        assert calls == ["initialize", "native"]
+        assert torch.count_nonzero(q) == 0
+        calls.clear()
 
     result = attn._fused_qnorm_rope_kv_insert(q, kv, positions, metadata)
     if route == "prefill":
@@ -162,7 +207,9 @@ def test_device_matches_native_q_only(tokens):
             q, kv, cache, slots, positions, cos_sin, 64, 1e-6, 64,
             False, False, True, False,
         )
-        rotate = pcp_q_rope.prepare(q, positions, cos_sin)
+        prepare = pcp_q_rope.initialize(cos_sin)
+        assert prepare is not None
+        rotate = prepare(q, positions, cos_sin)
         assert rotate is not None
         rotate()
         torch.testing.assert_close(q, native, rtol=0, atol=0)
