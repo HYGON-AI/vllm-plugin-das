@@ -131,7 +131,7 @@ def activate_extension(context: ExtensionContext) -> None:
     with _activation_lock:
         provider_required = (
             rms_norm_enabled()
-            or "das-hcu" in context.requested_extensions
+            or "das_hcu" in context.requested_extensions
             or "lightop-rms-norm" in context.requested_capabilities
         )
         if provider_required:

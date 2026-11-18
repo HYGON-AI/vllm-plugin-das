@@ -7,6 +7,7 @@ import os
 from pathlib import Path
 import subprocess
 import sys
+import tomllib
 from types import SimpleNamespace
 
 import pytest
@@ -723,7 +724,7 @@ def test_required_rms_is_preflighted_even_when_switches_are_off(
         extension.activate_extension(context())
         assert "lightop.norm" not in calls
     required = ExtensionContext(adapter_version="0.5.22", vllm_version="0.33.0",
-        requested_extensions={"das-hcu"} if requirement == "extension" else (),
+        requested_extensions={"das_hcu"} if requirement == "extension" else (),
         requested_capabilities={"lightop-rms-norm"} if requirement == "capability" else ())
     with pytest.raises(extension.DasExtensionError, match="native provider unavailable"):
         extension.activate_extension(required)
@@ -813,7 +814,7 @@ def test_required_disabled_rms_validates_before_oot_registration(monkeypatch, re
     calls = []
     monkeypatch.setattr(extension, "_import_module", successful_importer(calls))
     required = ExtensionContext(adapter_version="0.5.22", vllm_version="0.33.0",
-        requested_extensions={"das-hcu"} if requirement == "extension" else (),
+        requested_extensions={"das_hcu"} if requirement == "extension" else (),
         requested_capabilities={"lightop-rms-norm"} if requirement == "capability" else ())
     extension.activate_extension(required)
     assert calls[0] == "lightop.norm"
@@ -841,4 +842,43 @@ def test_read_only_health_preserves_late_failure_after_switches_are_disabled(mon
     for _ in range(2):
         with pytest.raises(extension.DasExtensionError, match="rms_norm"):
             extension.check_health()
+    assert calls.count("lightop.norm") == 1
+
+
+@pytest.mark.parametrize("after_disabled_activation", (False, True))
+@pytest.mark.parametrize("unavailable", ("import", "abi"))
+def test_published_required_entry_point_preflights_provider_when_switches_are_off(
+    monkeypatch, after_disabled_activation, unavailable,
+):
+    from importlib.metadata import EntryPoint
+    from hcu_adapter.extensions import RequiredExtensionError, activate_extensions
+
+    project = PLUGIN_SOURCE_ROOT.parent / "pyproject.toml"
+    metadata = tomllib.loads(project.read_text())["project"]["entry-points"]
+    group = "hcu_adapter.extensions"
+    points = [EntryPoint(name=name, value=value, group=group)
+              for name, value in metadata[group].items()
+              if value == "hcu_vllm_das.extension:extension_spec"]
+    assert len(points) == 1
+    monkeypatch.setenv("VLLM_HCU_USE_CUSTOM_OPS", "0")
+    monkeypatch.setenv("VLLM_HCU_USE_CUSTOM_RMS_NORM", "0")
+    calls = []
+    base = successful_importer(calls)
+
+    def importer(name):
+        if name == "lightop.norm":
+            calls.append(name)
+            if unavailable == "import":
+                raise ImportError("required RMS provider unavailable")
+            return SimpleNamespace(rms_norm=None)
+        return base(name)
+
+    monkeypatch.setattr(extension, "_import_module", importer)
+    if after_disabled_activation:
+        extension.activate_extension(context())
+        assert "lightop.norm" not in calls
+    required = ExtensionContext(adapter_version="0.5.22", vllm_version="0.33.0",
+        requested_extensions={points[0].name})
+    with pytest.raises(RequiredExtensionError, match=points[0].name):
+        activate_extensions(required, entry_points=points)
     assert calls.count("lightop.norm") == 1

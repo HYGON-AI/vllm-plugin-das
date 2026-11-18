@@ -14,6 +14,11 @@ The health callback only reports prior failure; it never initializes or repairs
 a provider. The existing synchronous/four-positional-argument ABI check, including
 native generated-signature validation, runs before vendor use. Explicit startup
 requirements still check ABI before registration while execution switches are OFF.
+Those requirements use the published entry-point name `das_hcu`, rather than
+the declared spec name `das-hcu`. Four source CPU regressions exercise actual
+Adapter activation through the project metadata, covering missing imports and
+invalid ABI both before and after optional activation. These regressions do not
+extend the recorded wheel/device/model qualification below to a new build.
 
 ## Source and component verification
 
