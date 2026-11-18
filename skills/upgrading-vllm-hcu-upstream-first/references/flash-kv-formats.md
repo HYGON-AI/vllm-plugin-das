@@ -21,3 +21,21 @@ Require non-unit scales, exact cache bytes, declared strides, prefill/decode,
 changed-input Graph and applicable head sizes. A component pass still needs
 the same-checkpoint BF16-KV model comparison and original HumanEval protocol;
 retain raw scores and shutdown failures independently.
+
+Bound temporary bytes as well as token counts. A batch-times-maximum-context
+gather can reserve every short decode row at one long prefill's length; count
+both FP8 gathers and both converted tensors while they coexist. Group sequences
+to a byte target with at most one context as the minimum group, retain a stated
+single-context bound, and account separately for query compaction/scatter.
+Keep offsets on device and rebase each group's cumulative lengths. Test the
+large metadata shape without allocating its old huge buffers, then exercise
+forced groups, empty query rows, padding, LSE and changed query/KV lengths in
+native Graph replay. A small numerical matrix alone misses this allocation bug.
+
+Budget initialized vendor tile backing as well as logical tokens. A masked V
+lane containing NaN can taint PV even when its probability is zero. Independent
+canary probes on the observed provider reproduce this in changed-length Graph
+replay when KV backing ends mid-tile; keep the final 256-token tile initialized
+and include it in the byte bound. Poison uninitialized allocations in native
+regressions so allocator reuse cannot hide the failure. A real large mixed batch
+should assert both its output and a practical peak extra-device-memory bound.

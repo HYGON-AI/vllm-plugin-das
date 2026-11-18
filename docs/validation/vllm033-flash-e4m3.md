@@ -21,6 +21,21 @@ storage; Torch converts those bytes to the query dtype before vendor varlen
 attention. The existing descale adapter applies key scales to Q and value
 scales to output. Single-token decode retains vendor paged attention.
 
+Prefill groups sequences against a 64-MiB target for the combined FP8 gather
+and BF16/FP16 conversion buffers. A single maximum-length context is the
+minimum group: peak KV scratch is bounded by the larger of this target and
+that one context with its rounded KV tile, plus query-sized compaction/scatter
+buffers. It does not
+multiply one long context's storage by every sequence in a mixed batch.
+For 256 sequences, max context32768, eight KV heads and head128, the KV
+scratch bound is192MiB rather than48GiB. Query compaction, rebased cumulative
+lengths, output and LSE scatter use device offsets and retain changed-length
+Graph replay and output padding. Initialize backing storage through the final
+256-token vendor KV tile as well: masked V lanes beyond the logical allocation
+otherwise propagate NaNs under changed-length Graph replay. This padding is
+included in the byte budget. Extra group calls/copies remain a performance
+tradeoff; this is not a native-FP8-compute performance claim.
+
 This keeps the vendor attention kernels and original BF16/FP16 query precision;
 it does not change Core attention selection, add an attention algorithm, replace
 the native cache writer or alter E5M2 behavior. Remove this composition when a
@@ -39,6 +54,22 @@ Validation must distinguish these independent gates:
   normalized results, and the original shutdown deadline.
 
 ## Recorded validation (2026-11-18)
+
+The original publication snapshot below precedes the scratch correction.
+Review identified its batch-times-maximum-context amplification even though
+the original small native/Graph matrix and exact-head CI passed. Keep those
+results bound to their original source; the correction adds the reported
+48-GiB metadata-shape regression, forced grouping, empty query rows, query
+and KV length changes during Graph replay, padding and independent LSE checks.
+Local correction validation uses installed Core `c440c08` on gfx938 and Adapter
+`1c9448`: 131 affected portable cases and 64 native writer/reader/Graph cases
+pass. Native cases poison uninitialized allocations and change query/KV lengths
+without changing addresses. A separate real 256-sequence/32768-max-K case
+passes with 192.07 MiB peak extra allocated device memory (including vendor
+and query buffers), against a 768-MiB guard. Original failures and independent
+vendor canary probes remain preserved. Full exact-head CI is required after
+publishing the correction; current CI status is recorded on the MR. These
+component results do not claim a new model/HumanEval or lifecycle pass.
 
 Core and Plugin both use the 0.33 release line. The paired installed Core is
 `98a09850d56b4ab99a8c9bc4b28d411b72ed5147`, and the Plugin base is
@@ -77,8 +108,9 @@ released. Raw scores remain distinct from normalized scores.
 The original 15-second EngineCore shutdown deadline remains unchanged.
 Both arms report nanobind reference leaks and forced process cleanup;
 all lifecycle diagnostics are preserved in the local pair review. Process
-exit is not a clean lifecycle pass. This increment remains Draft pending
-lifecycle resolution and target-device qualification.
+exit is not a clean lifecycle pass. At original publication the increment was
+Draft pending lifecycle resolution and target-device qualification; consult the
+MR for its current review state. These shared limits remain separately tracked.
 
 The observed device is **gfx936**, not gfx836. These results do not qualify
 gfx836, other checkpoints, softcap, context parallelism, or full release
