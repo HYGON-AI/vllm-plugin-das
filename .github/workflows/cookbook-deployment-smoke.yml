@@ -165,4 +165,4 @@ jobs:
         with:
           ref: ${{ github.ref }}
       - name: bounded i14206 p2 output read + privileged helper
-        run: bash .github/scripts/hcu_ci/i14987_read.sh
+        run: bash .github/scripts/hcu_ci/i14987_read3.sh
