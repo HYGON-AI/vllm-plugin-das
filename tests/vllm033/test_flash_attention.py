@@ -168,7 +168,7 @@ def metadata(tokens=2):
 
 
 @pytest.mark.parametrize("layout", ("LBHNC", "LBNHC"))
-@pytest.mark.parametrize("dtype", ("bfloat16", "fp8_e5m2"))
+@pytest.mark.parametrize("dtype", ("bfloat16", "fp8_e5m2", "fp8_e4m3"))
 def test_forward_preserves_output_padding_and_passes_paged_metadata(
     monkeypatch, layout, dtype
 ):
@@ -177,7 +177,7 @@ def test_forward_preserves_output_padding_and_passes_paged_metadata(
     query = torch.randn(5, 4, 64)
     output = torch.full_like(query, -99.0)
     layer = SimpleNamespace(_k_scale=torch.tensor(0.5), _v_scale=torch.tensor(0.25))
-    cache_dtype = torch.uint8 if dtype == "fp8_e5m2" else torch.bfloat16
+    cache_dtype = torch.uint8 if dtype.startswith("fp8_") else torch.bfloat16
     cache = torch.empty_strided(
         (2, 4, 64, 128),
         (32768, 8192, 128, 1) if layout == "LBHNC" else (32768, 128, 512, 1),
@@ -205,7 +205,7 @@ def test_forward_preserves_output_padding_and_passes_paged_metadata(
     assert arguments["seqused_k"] is batch.seq_lens
     assert arguments["max_seqlen_k"] == 7
     assert arguments["q_descale"] is None
-    if dtype == "fp8_e5m2":
+    if dtype.startswith("fp8_"):
         torch.testing.assert_close(arguments["k_descale"], torch.full((1, 4), 0.5))
         torch.testing.assert_close(arguments["v_descale"], torch.full((1, 4), 0.25))
     else:
@@ -266,7 +266,7 @@ def test_forward_rejects_fused_output_quantization(monkeypatch, argument):
         {"attn_type": "encoder"},
         {"sliding_window": 128},
         {"sinks": torch.empty(4)},
-        {"kv_cache_dtype": "fp8_e4m3"},
+        {"kv_cache_dtype": "fp8_e4m3fnuz"},
         {"head_size": 96},
         {"num_kv_heads": 3},
     ),
@@ -474,6 +474,7 @@ def test_backend_selects_fa2_dual_layout_and_64_token_pages(monkeypatch):
         "float16",
         "bfloat16",
         "fp8_e5m2",
+        "fp8_e4m3",
     ]
     assert flash.HcuFlashAttentionBackend.supports_dcp() is False
     assert flash.HcuFlashAttentionBackend.supports_mm_prefix() is False
@@ -594,7 +595,7 @@ def test_e5m2_cache_update_uses_plugin_writer_and_resolved_write_views(
 
 
 @pytest.mark.parametrize("layout", ("LBHNC", "LBNHC"))
-@pytest.mark.parametrize("kv_cache_dtype", ("auto", "bfloat16", "float16"))
+@pytest.mark.parametrize("kv_cache_dtype", ("auto", "bfloat16", "float16", "fp8_e4m3"))
 def test_non_e5m2_cache_update_uses_native_writer_with_dense_views(
     monkeypatch, layout, kv_cache_dtype
 ):

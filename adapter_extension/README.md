@@ -19,8 +19,13 @@ weight loading, generic quantization and kernel construction.
 It also provides an explicit HCU FlashAttention backend selected by
 `--attention-backend FLASH_ATTN`. The backend keeps vLLM's official metadata,
 scheduler and allocation. Its public `AttentionImpl` owns the HCU provider call
-and dense HND/NHD cache views, routes BF16 writes to the native vLLM writer,
-and retains a Plugin E5M2 writer and descale adapter. The kernel page is 64
+and dense HND/NHD cache views, routes BF16 and explicit E4M3 writes to the native
+vLLM writer, and retains a Plugin E5M2 writer and shared descale adapter. E4M3
+prefill uses Core's byte-preserving gather, explicit OCP E4M3 conversion to the
+query dtype, and vendor varlen attention; decode without LSE retains vendor
+paged attention, while explicit decode-LSE requests use the bounded composition.
+See the [E4M3 implementation and validation](../docs/validation/vllm033-flash-e4m3.md).
+The kernel page is 64
 tokens. It neither copies nor replaces the official Flash forward method and
 does not require private HCU hooks in the Core.
 
@@ -403,9 +408,16 @@ only for uninspectable native builtins, a compatible concrete declaration from
 generated binding documentation, including overloads and optional additions.
 Declarations are parsed without evaluating annotations or defaults. Missing or
 incompatible documentation, uninspectable Python callables, and asynchronous or
-generator providers are rejected. This extends the existing activation preflight;
-its provider checks still run even when the RMS execution flags are OFF.
-It neither invokes a provider nor proves kernel, Graph or model correctness.
+generator providers are rejected. Explicit RMS opt-in, a required `das-hcu` extension, or a required
+`lightop-rms-norm` capability performs these checks before registration.
+With RMS disabled and no explicit requirement, registration retains the official
+fallback and compile factor without importing LightOp. If later enabled, the
+first eligible eager custom-op call resolves and validates the provider once
+per process; ABI/import failures are latched rather than silently falling back.
+The read-only extension health checker reports prior provider failures without
+loading or repairing a provider. Direct custom-op calls also require admission.
+See [optional-provider loading](../docs/validation/vllm033-rms-lazy-provider.md).
+Admission neither invokes a provider nor proves kernel, Graph or model correctness.
 
 Compiled calls delegate to Core's complete RMSNorm IR, including its compiler
 precision policy and fusion across consecutive residual additions. The optional

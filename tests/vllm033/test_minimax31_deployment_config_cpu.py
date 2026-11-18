@@ -13,15 +13,21 @@ from hcu_vllm_das.parallel import minimax31_static_ipc as ipc
 from hcu_vllm_das.parallel import minimax31_msa as msa
 
 
-def test_public_engine_cli_transports_artifacts_without_environment():
+def test_public_engine_cli_transports_artifacts_without_environment(tmp_path, monkeypatch):
+    import huggingface_hub
     from vllm.engine.arg_utils import EngineArgs
     from vllm.utils.argparse_utils import FlexibleArgumentParser
+    # Exercise the real offline CLI path without resolving a placeholder repo.
+    monkeypatch.setattr(huggingface_hub.constants, 'HF_HUB_OFFLINE', True)
+    checkpoint = tmp_path / 'checkpoint'
+    checkpoint.mkdir()
     parser = FlexibleArgumentParser()
     EngineArgs.add_cli_args(parser)
     args = EngineArgs.from_cli_args(parser.parse_args([
-        '--model', 'unused-checkpoint', '--additional-config',
+        '--model', str(checkpoint), '--additional-config',
         json.dumps({'minimax31': {'msa_extension_dir': '/artifacts/msa',
                                  'loading_receipts': '/outputs/loading'}})]))
+    assert args.model == str(checkpoint)
     settings = artifacts(args)
     assert settings.msa_extension_dir == '/artifacts/msa'
     assert settings.loading_receipts == '/outputs/loading'
