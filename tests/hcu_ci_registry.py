@@ -242,6 +242,11 @@ register_hcu_ci(
 )
 register_hcu_ci(
     job="contract-hcu-gfx936",
+    target="tests/runtime_patch/test_indexer_rope_return.py",
+    est_time=10,
+)
+register_hcu_ci(
+    job="contract-hcu-gfx936",
     target="tests/runtime_patch/test_sparse_indexer_loading.py",
     est_time=60,
 )
