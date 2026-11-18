@@ -270,6 +270,8 @@ repository before rebuilding: similarly named mirrors can lack the wheel's
 newer ABI. Compare all relevant package files, not only the repaired module;
 publish against the maintained source without downgrading algorithms. Label
 a local PEP 517 source build separately from a released or CI-produced wheel.
+For packaging profiles, native dependencies and source/installed test isolation,
+read [native provider validation](references/native-provider-validation.md).
 Validate its source/wheel/installed payload and raw RECORD, then rerun affected
 CPU, native/Graph and model gates. A new venv can change a registered console
 script's interpreter prefix; audit that exact generated script separately
