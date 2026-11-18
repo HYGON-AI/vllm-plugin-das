@@ -240,6 +240,34 @@ ref, so a base-SHA check context alone does not qualify the submitted PR. This
 route supplies explicit PR evidence; it does not create automatic PR statuses,
 repair prepared dependencies or establish model/release acceptance.
 
+## Qualify a candidate image for one PR
+
+Use optional `candidate_image` on the exact-head manual PR route to test a new
+runtime without changing the shared `HCU_CI_IMAGE_V033` variable. First verify
+the trusted publisher's provenance, manifest/config digest and installed
+payload. Set `CI_CANDIDATE_IMAGE` to that immutable reference, then dispatch:
+
+```bash
+gh workflow run hcu-pr-ci-v033.yml --repo HYGON-AI/vllm-plugin-das \
+  --ref v0.33.0 -f pr_number="$PR_NUMBER" -f expected_head="$PR_HEAD" \
+  -f candidate_image="$CI_CANDIDATE_IMAGE"
+```
+
+This input requires a live open PR, its complete current head and a trusted
+manual actor. It cannot override automatic PR/push or target-only runs. Both
+approved image repositories on `HARBOR_SITE` retain the existing immutable
+SHA256 guard; malformed candidates fail instead of falling back to the shared
+image. An empty input preserves normal shared-image resolution.
+
+Candidate concurrency includes the PR and image reference, separate from the
+normal PR group and other candidate images. Inspect existing runs before
+dispatching: a duplicate for the same PR/image can still cancel its predecessor.
+Record the resolved image printed in the job log, trusted workflow revision,
+resolved PR head, actual installed payload and complete matrix results. The
+source, authorization, runner, device/Graph and aggregate gates are unchanged.
+Image publication, successful input resolution or a partial job result does not
+qualify the runtime or update any shared consumer.
+
 ## Publish a private Core candidate image
 
 The Adapter publisher supplies the runtime base. Inspect its actual installed
