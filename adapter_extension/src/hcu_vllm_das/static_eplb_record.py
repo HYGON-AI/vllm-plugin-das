@@ -127,6 +127,8 @@ class RecordSession:
         self.num_logical = num_logical
         self.num_groups = num_groups
         self.model_key = model_key
+        record_start_file = getattr(options, 'record_start_file', None)
+        self.start_file = Path(record_start_file) if record_start_file is not None else None
         self.steps = 0
         self.writes = 0
         self.last_sha256 = None
@@ -148,7 +150,11 @@ class RecordSession:
         target = self.unpadded[0]
         # Core profiles MoE with non-padding dummy tokens before KV caches and
         # attention metadata exist. Those rows must never enter the counters.
-        if context.attn_metadata is None or num_rows == 0:
+        # Startup can also run dummy forwards with attention metadata. Offline
+        # callers can start recording after the service is ready, before sending
+        # their first request, so every EP rank sees the gate before it forwards.
+        if (context.attn_metadata is None or num_rows == 0
+                or (self.start_file is not None and not self.start_file.is_file())):
             target.zero_()
             return False
         if getattr(context, 'ubatch_slices', None):

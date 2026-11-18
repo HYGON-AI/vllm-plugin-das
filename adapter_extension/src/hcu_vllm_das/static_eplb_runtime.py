@@ -38,7 +38,7 @@ _SESSION_ATTR = '_hcu_static_eplb_record_session'
 _INSTALLED_ATTR = '_hcu_static_eplb_routing_installed'
 _LOADERS_BOUND_ATTR = '_hcu_static_eplb_loaders_bound'
 _FIELDS = ('expert_map_path', 'expert_map_record_path', 'num_redundant_experts',
-           'static_dispatch_policy', 'record_step_interval')
+           'static_dispatch_policy', 'record_step_interval', 'record_start_file')
 
 
 class StaticEplbError(ValueError):
@@ -52,6 +52,7 @@ class StaticEplbOptions:
     num_redundant_experts: int
     static_dispatch_policy: str
     record_step_interval: int
+    record_start_file: str | None = None
 
     @property
     def recording(self) -> bool:
@@ -82,10 +83,13 @@ def read_options(cfg):
         raise StaticEplbError(f'unknown {_CONFIG_KEY} fields: {", ".join(unknown)}')
     path = _optional_path(payload, 'expert_map_path')
     record_path = _optional_path(payload, 'expert_map_record_path')
+    start_file = _optional_path(payload, 'record_start_file')
     if (path is None) == (record_path is None):
         raise StaticEplbError(
             f'{_CONFIG_KEY} requires exactly one of expert_map_path '
             '(deploy a placement) or expert_map_record_path (calibrate one)')
+    if start_file is not None and record_path is None:
+        raise StaticEplbError(f'{_CONFIG_KEY}.record_start_file requires calibration mode')
     redundant = payload.get('num_redundant_experts', 0)
     if type(redundant) is not int or redundant < 0:
         raise StaticEplbError(
@@ -99,7 +103,7 @@ def read_options(cfg):
     if type(interval) is not int or interval < 1:
         raise StaticEplbError(
             f'{_CONFIG_KEY}.record_step_interval must be an integer >= 1')
-    return StaticEplbOptions(path, record_path, redundant, policy, interval)
+    return StaticEplbOptions(path, record_path, redundant, policy, interval, start_file)
 
 
 def enabled(cfg) -> bool:
