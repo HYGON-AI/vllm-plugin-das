@@ -51,7 +51,11 @@ A whole Plugin installation can also register non-attention operators. When
 isolating an attention regression, an additional Plugin/official-backend
 control can distinguish registration effects from the requested backend path.
 Observe actual layer implementations, operator forwards, resolved layouts and
-kernel traces. Narrowing a probability difference to one service path does not
+kernel traces. Fresh services may autotune identical generated reduction
+source to different tiles and round differently. Retain selected tuning
+configurations and compare a fresh unchanged-path repeat before assigning
+a probability change to an OOT class. Narrowing a probability difference
+to one service path does not
 establish a defective native kernel or waive the original model loss. See the
 [BF16 code-pair and owner-isolation record](../../../docs/validation/vllm033-flash-bf16-owner-isolation.md).
 

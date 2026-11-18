@@ -140,3 +140,97 @@ worker/operator observations, traces and `analysis.json`.
 
 Native leak messages are preserved separately from process exit status;
 no arm is promoted to full lifecycle or model qualification.
+
+## RMS registration and autotune controls
+
+A follow-up on the same gfx938/Core/Adapter/Plugin runtime uses four fresh
+official-TRITON services: no Plugin, unchanged Plugin, Plugin with only its
+RMSNorm OOT entry removed by a diagnostic worker hook before model construction,
+and a fresh unchanged-Plugin repeat. The hook keeps other registry entries
+and compile-factor getters intact. It is not a production Plugin fix. Actual
+constructed RMS classes and native forwards, attention layers, cache layout,
+source origins and Graph traces are observed. All four keep the original
+BF16/Graph/prefix serving configuration and exact saved-ID requests.
+
+| Arm | History | Prefill top ID | Top-two gap | Cached branch emitted IDs |
+| --- | --- | ---: | ---: | --- |
+| official | baseline | 671 | 0.0000 | 671,671,671 |
+| official | candidate | 671 | 0.0000 | 671,671,671 |
+| plugin_triton | baseline | 671 | 0.2500 | 671,671,671 |
+| plugin_triton | candidate | 671 | 0.2500 | 671,671,671 |
+| plugin_no_rms | baseline | 671 | 0.0000 | 671,671,671 |
+| plugin_no_rms | candidate | 671 | 0.0000 | 671,671,671 |
+| plugin_repeat | baseline | 671 | 0.0000 | 671,671,671 |
+| plugin_repeat | candidate | 671 | 0.0000 | 671,671,671 |
+
+| Pair | History | Prefill top-ID differences | Max reference logprob delta | Cached emitted-ID differences |
+| --- | --- | ---: | ---: | ---: |
+| official_vs_plugin_triton | baseline | 0 | 0.162644 | 0 |
+| official_vs_plugin_triton | candidate | 0 | 0.138315 | 0 |
+| official_vs_plugin_no_rms | baseline | 0 | 0.000000 | 0 |
+| official_vs_plugin_no_rms | candidate | 0 | 0.000000 | 0 |
+| official_vs_plugin_repeat | baseline | 0 | 0.000000 | 0 |
+| official_vs_plugin_repeat | candidate | 0 | 0.000000 | 0 |
+| plugin_triton_vs_plugin_no_rms | baseline | 0 | 0.162644 | 0 |
+| plugin_triton_vs_plugin_no_rms | candidate | 0 | 0.138315 | 0 |
+| plugin_triton_vs_plugin_repeat | baseline | 0 | 0.162644 | 0 |
+| plugin_triton_vs_plugin_repeat | candidate | 0 | 0.138315 | 0 |
+| plugin_no_rms_vs_plugin_repeat | baseline | 0 | 0.000000 | 0 |
+| plugin_no_rms_vs_plugin_repeat | candidate | 0 | 0.000000 | 0 |
+
+Prefill rankings retain the original tie rule; emitted IDs are sampled
+responses. Branch requests still reuse192 tokens and compute29 query
+tokens. Full prefill repeats exactly within each arm/history. The three Plugin
+arms have equal compile factors.
+
+| Pair | Model graph AST equal | Generated kernel AST sets equal after removing comment-only lines | Different selected autotune configurations |
+| --- | --- | --- | ---: |
+| official_vs_plugin_triton | True | True | 2 |
+| official_vs_plugin_no_rms | True | True | 0 |
+| official_vs_plugin_repeat | True | True | 1 |
+| plugin_triton_vs_plugin_no_rms | True | True | 2 |
+| plugin_triton_vs_plugin_repeat | True | True | 3 |
+| plugin_no_rms_vs_plugin_repeat | True | True | 1 |
+
+The unchanged-Plugin repeat retains all145 `HcuRMSNorm` instances, yet
+both complete returned prefill distributions and all cached-prefix top
+logprobs match the official service exactly, for both saved histories.
+The RMS-entry-removed arm matches them too. The first Plugin service
+differs from its own fresh repeat despite the same class registration.
+Several tuning choices differ in that repeat: it is not a single-tile
+causal intervention. These observations do not establish an RMS class
+defect or identify the cause of the original concurrent model failure.
+
+The preceding official/Plugin-TRITON diagnostic already had matching
+model graph ASTs and matching generated-source AST sets after removing
+comment-only source paths. Its selected RMS reduction differed:
+`XBLOCK=2,R0_BLOCK=2048` versus `XBLOCK=1,R0_BLOCK=4096`, both with
+`num_warps=8,num_stages=1`. Different compile-cache keys and OOT class
+names therefore do not by themselves establish different algorithms.
+
+An independent gfx938 operator probe retains that exact official generated
+Triton body and removes only its timing-autotuner decorator to request
+the two recorded configurations on identical CPU-seeded BF16 tensors.
+Across 15 cases, 32 BF16 elements differ; maximum tile-output absolute delta is 0.015625.
+Both outputs are finite; independent FP64 mean/rsqrt reference errors
+and input hashes are retained. These are synthetic inputs, not captured
+model activations. This demonstrates reduction-choice rounding sensitivity,
+not the cause of the original model loss, a numerical acceptance waiver,
+or a requirement to pin tuning globally. No tolerance is changed.
+
+| Arm | Exit | Natural exit seconds | Frontend timeout | Forced cleanup | Remaining at grace |
+| --- | ---: | ---: | --- | --- | --- |
+| official | 0 | 9.377 | False | False | False |
+| plugin_triton | 0 | 9.729 | False | False | False |
+| plugin_no_rms | 0 | 9.579 | False | False | False |
+| plugin_repeat | 0 | 9.178 | False | False | False |
+
+All package RECORDs and checkpoint seals remain unchanged. The original
+15s grace and native leak diagnostics are preserved. No new HumanEval
+score, original concurrent-cohort recovery, full lifecycle acceptance,
+Core change or production registry modification is claimed. Original
+BF16 task18 and E5M2 task19 losses remain; keep Draft.
+
+Evidence: `evidence/plugin410-rms-registration-r134/`, including actual
+registry snapshots, source-bound distributions, compiler artifacts,
+selected configurations, synthetic tile probe, traces and `analysis.json`.
