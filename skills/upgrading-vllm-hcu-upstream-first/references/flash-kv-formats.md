@@ -122,3 +122,11 @@ from the uncached prefill length instead of calling every first-wave request
 cold. State which request waves the profile captures. Short key-retrieval probes
 supplement the original model evaluation and do not establish long uncached
 prefill, cache reclamation or accuracy/lifecycle acceptance.
+
+When replaying observed tuning choices as a diagnostic, retain the official
+cache key/config-hash validation and verify cache hits plus actual selected
+worker launchers before and after requests. Frozen objects may be absent
+from GC enumeration; inspect the compiler-owned module references without
+unfreezing GC or reloading kernels. For a single-choice control, verify all
+other effective configurations and generated-source identities remain fixed.
+Such sequential controls do not replace the original concurrent model cohort.

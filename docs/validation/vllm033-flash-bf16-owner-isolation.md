@@ -234,3 +234,92 @@ BF16 task18 and E5M2 task19 losses remain; keep Draft.
 Evidence: `evidence/plugin410-rms-registration-r134/`, including actual
 registry snapshots, source-bound distributions, compiler artifacts,
 selected configurations, synthetic tile probe, traces and `analysis.json`.
+
+## Matched live tuning and one-configuration control
+
+Four fresh gfx938 services retain the preceding Core/Adapter/Plugin runtime
+and actual saved histories: official/TRITON, Plugin/TRITON, Plugin/TRITON
+with one RMS reduction choice changed, and Plugin/FLASH. Each private cache
+replays ten previously observed official tuning choices. The third arm only
+changes `3e47a29ee0274aefe888dd7cbc7d7a4dbb737d72431586ead332762cac963a22.best_config`
+from XBLOCK2/R0_BLOCK2048 to XBLOCK1/R0_BLOCK4096; warps8/stages1 remain.
+All original cache validation is retained. The installed Torch cache API
+accepts the recorded configurations and rejects mismatched config hashes
+for the target choice in a separate CPU control. No production tuning policy or RMS registration
+is changed.
+
+Before and after historical requests, actual worker CachingAutotuner
+instances must report cache hits and the selected active launcher for all
+ten choices. Disk files alone are insufficient. The first attempt stopped
+before requests because gc.get_objects omitted frozen instances. Its failure
+is retained. The second attempt exposed released candidate configs=None
+in the observer; its terminal failure is retained too. A CPU contract
+checks the finalized/frozen state. The completed attempt reads modules held by
+PyCodeCache/sys.modules, without unfreezing GC, reloading kernels or
+substituting functions.
+
+| Arm | History | Prefill top ID | Top-two gap | Cached branch emitted IDs |
+| --- | --- | ---: | ---: | --- |
+| official | baseline | 671 | 0.000000 | 671,671,671 |
+| official | candidate | 671 | 0.000000 | 671,671,671 |
+| plugin_triton | baseline | 671 | 0.000000 | 671,671,671 |
+| plugin_triton | candidate | 671 | 0.000000 | 671,671,671 |
+| plugin_flip | baseline | 671 | 0.250000 | 671,671,671 |
+| plugin_flip | candidate | 671 | 0.250000 | 671,671,671 |
+| plugin_flash | baseline | 671 | 0.000000 | 671,671,671 |
+| plugin_flash | candidate | 671 | 0.000000 | 671,671,671 |
+
+| Pair | History | Max reference logprob delta | Prefill top-ID differences | Cached emitted-ID differences |
+| --- | --- | ---: | ---: | ---: |
+| official_vs_plugin_triton | baseline | 0.000000 | 0 | 0 |
+| official_vs_plugin_triton | candidate | 0.000000 | 0 | 0 |
+| official_vs_plugin_flip | baseline | 0.162644 | 0 | 0 |
+| official_vs_plugin_flip | candidate | 0.138315 | 0 | 0 |
+| official_vs_plugin_flash | baseline | 0.049198 | 0 | 0 |
+| official_vs_plugin_flash | candidate | 0.030302 | 0 | 0 |
+| plugin_triton_vs_plugin_flip | baseline | 0.162644 | 0 | 0 |
+| plugin_triton_vs_plugin_flip | candidate | 0.138315 | 0 | 0 |
+| plugin_triton_vs_plugin_flash | baseline | 0.049198 | 0 | 0 |
+| plugin_triton_vs_plugin_flash | candidate | 0.030302 | 0 | 0 |
+| plugin_flip_vs_plugin_flash | baseline | 0.162670 | 0 | 0 |
+| plugin_flip_vs_plugin_flash | candidate | 0.147028 | 0 | 0 |
+
+Exact equality of the complete returned prefill distributions and cached
+top-logprobs, respectively, is recorded below for both saved histories:
+
+- `official_vs_plugin_triton`: `{"baseline": {"cached": true, "prefill": true}, "candidate": {"cached": true, "prefill": true}}`.
+- `plugin_triton_vs_plugin_flip`: `{"baseline": {"cached": false, "prefill": false}, "candidate": {"cached": false, "prefill": false}}`.
+- `official_vs_plugin_flash`: `{"baseline": {"cached": false, "prefill": false}, "candidate": {"cached": false, "prefill": false}}`.
+
+With the same verified tuning choices, Plugin RMS registration and
+official/TRITON produce exactly equal returned distributions in these probes.
+
+Changing just the observed RMS tuning choice alters returned model
+probabilities here. This identifies a cause within the sequential control;
+it does not establish the cause of the original concurrent task failure.
+
+Generated-source ASTs, graph ASTs, final configuration sets and active
+launcher provenance are retained in the analysis. The Plugin/TRITON flip
+has exactly one effective configuration difference; official/TRITON and
+Plugin/TRITON or Plugin/FLASH have no effective configuration differences.
+This isolates a tuning choice in these sequential history probes, not the
+original concurrent free-running HumanEval failure. The branch still uses
+cached192/query29. Full model recovery and a vendor-kernel defect are not
+established, and no new HumanEval score or accuracy waiver is introduced.
+
+| Arm | Exit | Natural exit seconds | Forced cleanup |
+| --- | ---: | ---: | --- |
+| official | 0 | 9.879 | False |
+| plugin_triton | 0 | 10.078 | False |
+| plugin_flip | 0 | 9.380 | False |
+| plugin_flash | 0 | 8.878 | False |
+
+The original15s grace, native leak diagnostics, original BF16 task18 loss
+and E5M2 task19 loss remain. Package RECORDs/checkpoint seals are unchanged;
+owned processes and ports are absent after terminal controller completion.
+Keep Draft while the original accuracy/lifecycle and applicable release
+gates remain open. No Core production MR is introduced.
+
+Evidence: `evidence/plugin410-matched-tuning-r135/` (retained first attempt
+and CPU cache controls), and `evidence/plugin410-matched-tuning-r135a3/`
+(completed actual live-launcher controls, responses, traces and analysis).
