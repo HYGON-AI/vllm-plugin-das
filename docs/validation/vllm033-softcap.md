@@ -12,9 +12,10 @@ The adapter passes the existing paged K/V views in NHD order, cumulative query
 lengths, sequence lengths, block table, causal flag, scale and ALiBi slopes.
 Core owns the attention algorithm and softcap calculation. No Core source,
 scheduler, metadata builder, cache allocation or custom kernel is copied.
-The E5M2 path retains the existing query/output descale adapter, including its
-rounding behavior; the underlying attention call uses Core instead of vendor
-Flash. A zero/absent softcap keeps the existing vendor route and optional
+Both explicit E5M2 and E4M3 paths use the existing query/output descale adapter,
+including its rounding behavior; each keeps its own FP8 typed cache view.
+The underlying attention call uses Core instead of vendor Flash. A zero/absent
+softcap keeps the existing vendor route and optional
 prefill gather policy. Enabling prefill gather cannot bypass softcap dispatch.
 
 This is an explicit provider fallback for a correctness boundary, and is not
@@ -24,7 +25,35 @@ probabilities are refused. Remove this fallback only after the vendor passes
 the same writer/reader, non-unit-scale and changed-input Graph tests for both
 prefill and decode, plus applicable model validation.
 
-## Component validation
+## E4M3 composition follow-up (2026-11-18)
+
+Replaying the original #410 payload over the merged E4M3 provider exposed a
+dispatch defect: only E5M2 consumed KV descales before entering the Core
+softcap helper, so an E4M3 public forward raised its unapplied-descale guard.
+Four E4M3 CPU regressions fail on that composition while four E5M2 controls
+pass. The corrected Plugin routes both formats through the existing shared
+scale adapter, retaining their distinct typed cache views and the official
+Core attention algorithm. No Core or Adapter production code changes.
+
+The isolated installed candidate passes **93 CPU Flash contracts**, **8
+source/package contracts** and **219 actual HCU numerical/Graph cases**, all
+with zero skips. The latter includes all original 80 E4M3 cases, 32 new
+positive-softcap E4M3 cases and the existing bounded-scratch test, plus the
+BF16/FP16 and E5M2 suites. Original tolerances remain unchanged. Source,
+wheel and installed Plugin payloads match; all six native-owner/package
+RECORDs verify before/after. The immediate native terminal still observed a
+KFD owner; three later independent checks found none. Eventual device release
+does not qualify clean model lifecycle.
+
+This run uses actual **gfx936**, Core **0.33.0** source `98a09850d56b`,
+Torch 2.13 and the baseline Adapter from `89fc929c1455`, independently of
+Draft Adapter #140. The Plugin wheel SHA256 is
+`ab6bca09f3cf76fc60b0e705210df8e5909ece17718a18112038dc68d6ea84fa`.
+Positive-softcap public LLM and fresh original HE32 regression gates for this
+integrated payload are pending. Historical results below do not certify the
+updated payload, gfx836 or full upgrade acceptance.
+
+## Historical component validation
 
 Environment: real gfx936 (not gfx836/gfx938), DTK/Torch 2.13 stack;
 Core 0014f6fce6de03125c02aa1541344ecba54ef114 and Adapter 21cf8f7.

@@ -9,7 +9,9 @@ import os
 import pytest
 
 
-def checkpoint_config():
+def checkpoint_config(legacy=False):
+    if legacy:
+        return {"quant_method": "slimquant_w4a8", "activation_scheme": "dynamic"}
     return {
         "quant_method": "slimquant_w4a8",
         "ignore": ["re:.*lm_head$"],
@@ -40,6 +42,84 @@ def checkpoint_config():
     }
 
 
+def test_legacy_dense_selection_preserves_official_int8_and_ignores():
+    import torch
+    from hcu_vllm_das.slimquant import SlimQuantConfig
+    from vllm.model_executor.layers.linear import (
+        ReplicatedLinear,
+        UnquantizedLinearMethod,
+    )
+    from vllm.model_executor.layers.quantization.compressed_tensors.compressed_tensors import (
+        CompressedTensorsLinearMethod,
+    )
+    from vllm.model_executor.layers.quantization.compressed_tensors.schemes import (
+        CompressedTensorsW8A8Int8,
+    )
+
+    raw = checkpoint_config(legacy=True)
+    raw["ignore"] = ["model.layers.*.self_attn.o_proj"]
+    original = copy.deepcopy(raw)
+    config = SlimQuantConfig.from_config(raw)
+    # Construct the actual layer type without allocating distributed weights.
+    layer = object.__new__(ReplicatedLinear)
+    torch.nn.Module.__init__(layer)
+    method = config.get_quant_method(layer, "model.layers.0.self_attn.q_a_proj")
+    assert isinstance(method, CompressedTensorsLinearMethod)
+    assert isinstance(layer.scheme, CompressedTensorsW8A8Int8)
+    assert layer.scheme.strategy == "channel"
+    assert layer.scheme.is_static_input_scheme is False
+    assert isinstance(
+        config.get_quant_method(layer, "model.layers.0.self_attn.o_proj"),
+        UnquantizedLinearMethod,
+    )
+    assert raw == original
+
+
+def test_legacy_mapper_keeps_default_selection_and_unquantized_embeddings():
+    import torch
+    from hcu_vllm_das.slimquant import SlimQuantConfig
+    from vllm.model_executor.layers.vocab_parallel_embedding import (
+        ParallelLMHead,
+        VocabParallelEmbedding,
+    )
+    from vllm.model_executor.models.utils import WeightsMapper
+
+    raw = checkpoint_config(legacy=True)
+    raw["ignore"] = ["model.layers.*.self_attn.o_proj"]
+    original = copy.deepcopy(raw)
+    config = SlimQuantConfig.from_config(raw)
+    config.apply_vllm_mapper(
+        WeightsMapper(orig_to_new_prefix={"model.": "language_model.model."})
+    )
+    assert config.ignore == ["language_model.model.layers.*.self_attn.o_proj"]
+    assert raw == original
+    for cls, prefix in [
+        (ParallelLMHead, "lm_head"),
+        (VocabParallelEmbedding, "model.embed_tokens"),
+    ]:
+        layer = object.__new__(cls)
+        torch.nn.Module.__init__(layer)
+        assert config.get_quant_method(layer, prefix) is None
+
+
+def test_legacy_ple_does_not_guess_quantized_table_format():
+    from hcu_vllm_das.slimquant import SlimQuantConfig
+
+    config = SlimQuantConfig.from_config(checkpoint_config(legacy=True))
+    with pytest.raises(ValueError, match="PLE requires explicit mixed_precision"):
+        config.get_embedding_method("model.layers.0.ple.ngram_embedding", object)
+
+
+@pytest.mark.parametrize("declaration", [None, {}, [], False])
+def test_explicit_invalid_mixed_precision_never_falls_back_to_legacy(declaration):
+    from hcu_vllm_das.slimquant import SlimQuantConfig
+
+    raw = checkpoint_config(legacy=True)
+    raw["mixed_precision"] = declaration
+    with pytest.raises(ValueError, match="SlimQuant requires declared"):
+        SlimQuantConfig.from_config(raw)
+
+
 def test_all_packed_bytes_decode_canonical_signed_int4_without_rescaling():
     import torch
     from hcu_vllm_das.slimquant import unpack_signed_int4
@@ -57,14 +137,74 @@ def test_all_packed_bytes_decode_canonical_signed_int4_without_rescaling():
     assert packed.flatten().tolist() == [b if b < 128 else b - 256 for b in range(256)]
 
 
-@pytest.mark.parametrize("group", ["experts", "w8a8_include", "ngram_embedding"])
-def test_parser_rejects_missing_mixed_precision_group(group):
+def test_parser_rejects_missing_packed_expert_declaration():
     from hcu_vllm_das.slimquant import SlimQuantConfig
 
     config = checkpoint_config()
-    config["mixed_precision"].pop(group)
+    config["mixed_precision"].pop("experts")
     with pytest.raises(ValueError, match="SlimQuant requires declared"):
         SlimQuantConfig.from_config(config)
+
+
+@pytest.mark.parametrize("dense", [False, True])
+@pytest.mark.parametrize("ngram", [False, True])
+def test_optional_groups_keep_undeclared_dense_and_ple_unquantized(
+    monkeypatch, dense, ngram
+):
+    from types import SimpleNamespace
+
+    import torch
+    import hcu_vllm_das.slimquant as implementation
+    from vllm.model_executor.layers.linear import (
+        ReplicatedLinear,
+        UnquantizedLinearMethod,
+    )
+    from vllm.model_executor.layers.quantization.compressed_tensors.compressed_tensors import (
+        CompressedTensorsLinearMethod,
+    )
+
+    raw = checkpoint_config()
+    if not dense:
+        raw["mixed_precision"].pop("w8a8_include")
+    if not ngram:
+        raw["mixed_precision"].pop("ngram_embedding")
+    original = copy.deepcopy(raw)
+    config = implementation.SlimQuantConfig.from_config(raw)
+    context = SimpleNamespace(
+        model_config=SimpleNamespace(
+            hf_text_config=SimpleNamespace(split_ngram_parts=2)
+        )
+    )
+    monkeypatch.setattr(
+        implementation, "get_current_vllm_config_or_none", lambda: context
+    )
+    layer = object.__new__(ReplicatedLinear)
+    torch.nn.Module.__init__(layer)
+    method = config.get_quant_method(layer, "model.layers.0.self_attn.q_proj")
+    assert type(method) is (
+        CompressedTensorsLinearMethod if dense else UnquantizedLinearMethod
+    )
+    embedding = config.get_embedding_method(
+        "model.layers.0.ple.ple_embedding.ngram_embedding", object
+    )
+    expected = (
+        "Qwen4ExpPLEPerRowEmbeddingMethod"
+        if ngram
+        else "Qwen4ExpPLEUnquantizedEmbeddingMethod"
+    )
+    assert type(embedding).__name__ == expected
+    assert raw == original
+
+
+@pytest.mark.parametrize("group", ["w8a8_include", "ngram_embedding"])
+@pytest.mark.parametrize("declaration", [None, {}, {"format": "int8"}])
+def test_present_malformed_optional_group_is_rejected(group, declaration):
+    from hcu_vllm_das.slimquant import SlimQuantConfig
+
+    raw = checkpoint_config()
+    raw["mixed_precision"][group] = declaration
+    with pytest.raises(ValueError, match="SlimQuant requires declared"):
+        SlimQuantConfig.from_config(raw)
 
 
 def test_parser_maps_all_declared_module_lists_without_mutating_checkpoint():
@@ -143,9 +283,14 @@ def native_parallel(tmp_path, monkeypatch):
 
     # The standalone native table fixture has one serialized shard. Supply only
     # that public model-metadata boundary; device/backend/kernel paths stay real.
-    metadata = SimpleNamespace(model_config=SimpleNamespace(
-        hf_text_config=SimpleNamespace(split_ngram_parts=1)))
-    monkeypatch.setattr(implementation, "get_current_vllm_config_or_none", lambda: metadata)
+    metadata = SimpleNamespace(
+        model_config=SimpleNamespace(
+            hf_text_config=SimpleNamespace(split_ngram_parts=1)
+        )
+    )
+    monkeypatch.setattr(
+        implementation, "get_current_vllm_config_or_none", lambda: metadata
+    )
     torch.cuda.set_device(0)
     with set_current_vllm_config(VllmConfig()):
         init_distributed_environment(
@@ -168,6 +313,62 @@ native = pytest.mark.skipif(
     os.environ.get("HCU_SLIMQUANT_LIVE") != "1",
     reason="explicit live format validation",
 )
+
+
+@pytest.mark.hcu
+@native
+@pytest.mark.parametrize("activation", ["bfloat16", "float16"])
+def test_legacy_dense_official_loader_and_changed_input_graph(
+    native_parallel, activation
+):
+    import torch
+    from hcu_vllm_das.slimquant import SlimQuantConfig
+    from vllm.model_executor.layers.linear import ReplicatedLinear
+    from vllm.model_executor.layers.fused_moe.router.gate_linear import GateLinear
+    from vllm.model_executor.layers.quantization.compressed_tensors.compressed_tensors import (
+        CompressedTensorsLinearMethod,
+    )
+
+    dtype = getattr(torch, activation)
+    with torch.device("cuda:0"):
+        layer = ReplicatedLinear(
+            256,
+            128,
+            bias=False,
+            params_dtype=dtype,
+            quant_config=SlimQuantConfig.from_config(checkpoint_config(legacy=True)),
+            prefix="model.layers.0.self_attn.q_a_proj",
+        )
+        # DeepSeek constructs its router without quant_config. It must retain
+        # its BF16/FP16 storage rather than inherit the dense INT8 default.
+        gate = GateLinear(256, 4, params_dtype=dtype, prefix="model.layers.3.mlp.gate")
+    assert gate.weight.dtype == dtype
+    assert isinstance(layer.quant_method, CompressedTensorsLinearMethod)
+    weight = (torch.arange(128 * 256).reshape(128, 256) % 15 - 7).to(torch.int8)
+    scales = (torch.arange(128).reshape(128, 1) % 4 + 1).float() / 256
+    layer.weight.weight_loader(layer.weight, weight)
+    layer.weight_scale.weight_loader(layer.weight_scale, scales)
+    assert layer.weight_scale.dtype == torch.float32
+    layer.quant_method.process_weights_after_loading(layer)
+    x = torch.empty((3, 256), device="cuda:0", dtype=dtype)
+    x.copy_(torch.linspace(-0.5, 0.5, 256, device="cuda:0"))
+    layer(x)
+    graph = torch.cuda.CUDAGraph()
+    with torch.cuda.graph(graph):
+        output, _ = layer(x)
+    address = output.data_ptr()
+    for shift in (0.0, 0.25, -0.125):
+        x.copy_(torch.linspace(-0.5, 0.5, 256, device="cuda:0") + shift)
+        graph.replay()
+        # Independent CPU dynamic-token INT8 quantization and FP64 GEMM.
+        values = x.cpu().double()
+        input_scale = values.abs().amax(dim=-1, keepdim=True) / 127
+        quantized = (values / input_scale).round().clamp(-127, 127)
+        reference = (quantized * input_scale) @ (weight.double() * scales.double()).T
+        torch.testing.assert_close(
+            output.cpu().double(), reference, rtol=0.01, atol=0.002
+        )
+        assert output.data_ptr() == address
 
 
 @pytest.mark.hcu
@@ -234,8 +435,10 @@ def test_public_int8_ple_method_preserves_scales_and_changed_input_graph(
 
 @pytest.mark.hcu
 @native
+@pytest.mark.parametrize("legacy", [False, True])
 def test_packed_experts_enter_official_loader_with_standard_scale_units(
     native_parallel,
+    legacy,
 ):
     import torch
     from hcu_vllm_das.slimquant import SlimQuantConfig, SlimQuantInt8Experts
@@ -249,7 +452,7 @@ def test_packed_experts_enter_official_loader_with_standard_scale_units(
             intermediate_size=128,
             params_dtype=torch.bfloat16,
             prefix="model.layers.0.mlp.experts",
-            quant_config=SlimQuantConfig.from_config(checkpoint_config()),
+            quant_config=SlimQuantConfig.from_config(checkpoint_config(legacy=legacy)),
         )
     experts = runner.routed_experts
     assert isinstance(experts.quant_method, SlimQuantInt8Experts)
@@ -297,8 +500,10 @@ def test_packed_experts_enter_official_loader_with_standard_scale_units(
 
 @pytest.mark.hcu
 @native
+@pytest.mark.parametrize("legacy", [False, True])
 def test_expert_scale_domain_matches_independent_moe_reference_and_graph(
     native_parallel,
+    legacy,
 ):
     """The serialized scale is 1/16 of the canonical signed-INT4 scale."""
     import torch
@@ -314,7 +519,7 @@ def test_expert_scale_domain_matches_independent_moe_reference_and_graph(
             intermediate_size=128,
             params_dtype=torch.bfloat16,
             prefix="model.layers.0.mlp.experts",
-            quant_config=SlimQuantConfig.from_config(checkpoint_config()),
+            quant_config=SlimQuantConfig.from_config(checkpoint_config(legacy=legacy)),
         )
     layer = runner.routed_experts
     # Fixed bytes have known alternating values: 0x12 -> [1,2], 0x34 -> [3,4].

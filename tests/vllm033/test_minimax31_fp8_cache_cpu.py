@@ -82,3 +82,40 @@ def test_fp8_cache_guard_and_scale_lifecycle(monkeypatch):
     pcp.validate_fp8_sparse_cache(bf16, slots)
     cases["bf16_path_unchanged"] = "pass"
     print(json.dumps({"plugin_file": pcp.__file__, "cases": cases}, sort_keys=True))
+
+
+def test_native_scale_guard_wiring_preserves_first_host_validation(monkeypatch):
+    from hcu_vllm_das.parallel import minimax31_prefill as opt
+    obj=layer();obj._hcu_native_msa=True;calls=[]
+    monkeypatch.setattr(pcp,'_prefill_enabled',lambda:True)
+    def check(o):calls.append('check');return hasattr(o,'bound')
+    def bind(o):
+        assert o._hcu_fp8_checked==(o.kv_cache.data_ptr(),(.5,2.))
+        calls.append('bind');o.bound=True
+    monkeypatch.setattr(opt,'check_bound_scales',check)
+    monkeypatch.setattr(opt,'bind_validated_scales',bind)
+    slots=torch.arange(4,dtype=torch.int64)
+    pcp.validate_fp8_sparse_cache(obj,slots)
+    def no_item(self,*a):raise AssertionError('bound native scale forced host sync')
+    monkeypatch.setattr(torch.Tensor,'item',no_item)
+    pcp.validate_fp8_sparse_cache(obj,slots)
+    assert calls==['check','bind','check']
+    obj._k_scale=torch.ones(2)
+    import pytest
+    with pytest.raises(ValueError,match='local FP32 scalar'):
+        pcp.validate_fp8_sparse_cache(obj,slots)
+    assert calls==['check','bind','check']
+
+
+def test_native_guard_failure_is_not_rebound_or_suppressed(monkeypatch):
+    import pytest
+    from hcu_vllm_das.parallel import minimax31_prefill as opt
+    obj=layer();obj._hcu_native_msa=True
+    monkeypatch.setattr(pcp,'_prefill_enabled',lambda:True)
+    failure=RuntimeError('scale guard stream changed')
+    def reject(o):raise failure
+    monkeypatch.setattr(opt,'check_bound_scales',reject)
+    with pytest.raises(RuntimeError) as error:
+        pcp.validate_fp8_sparse_cache(obj,torch.arange(4))
+    assert error.value is failure
+    assert not hasattr(obj,'_hcu_fp8_checked')

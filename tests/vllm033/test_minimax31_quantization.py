@@ -96,12 +96,18 @@ def test_registration_is_owned_and_drift_is_fatal(monkeypatch):
         activation.check_health()
 
 
-def test_w8_runtime_cache_restore_skips_second_transpose():
+def test_w8_runtime_cache_restore_skips_second_transpose(monkeypatch):
     from compressed_tensors.quantization import QuantizationStrategy
     from vllm.model_executor.layers.quantization.compressed_tensors.schemes import CompressedTensorsW8A8Int8
     from vllm.model_executor.kernels.linear.scaled_mm.triton import TritonInt8ScaledMMLinearKernel
     from vllm.model_executor.utils import weights_already_processed
     from hcu_vllm_das.quantization.minimax31 import MiniMax31W8A8LinearMethod
+    from hcu_vllm_das.quantization.minimax31_w8a8 import MiniMax31HipBlasLtInt8Kernel
+    # Only layout/reload is under test. Admit these inert constructor objects
+    # explicitly; this does not exercise or qualify native device support.
+    for cls in (TritonInt8ScaledMMLinearKernel, MiniMax31HipBlasLtInt8Kernel):
+        monkeypatch.setattr(cls, 'is_supported', classmethod(
+            lambda cls, compute_capability=None: (True, None)))
     layer = torch.nn.Module()
     layer.input_size_per_partition = 4
     layer.logical_widths = [3, 3]

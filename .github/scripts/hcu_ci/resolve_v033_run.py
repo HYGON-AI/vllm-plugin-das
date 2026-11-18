@@ -29,10 +29,13 @@ def resolve(event, environment, github):
     inputs = event.get("inputs") or {}
     number = inputs.get("pr_number", "")
     expected = inputs.get("expected_head", "")
+    candidate = inputs.get("candidate_image", "")
     if kind not in ("push", "workflow_dispatch", "pull_request_target"):
         raise AUTH.AuthorizationError("unsupported release event")
     if kind != "pull_request_target" and environment["GITHUB_REF"] != "refs/heads/v0.33.0":
         raise AUTH.AuthorizationError("release/manual runs require ref v0.33.0")
+    if candidate and (kind != "workflow_dispatch" or not number or not expected):
+        raise AUTH.AuthorizationError("candidate image requires an exact-head manual PR run")
     manual_pr = kind == "workflow_dispatch" and bool(number or expected)
     if manual_pr:
         if not isinstance(number, str) or not re.fullmatch(r"[1-9][0-9]*", number):

@@ -31,6 +31,7 @@ def worker_identity(worker):
         cap = getattr(impl, "logits_soft_cap", None)
         if cap:
             layers.append({"name": name, "softcap": cap,
+                           "kv_cache_dtype": getattr(impl, "kv_cache_dtype", None),
                            "impl": type(impl).__module__ + "." + type(impl).__name__})
     if len(layers) != 2 or any(layer["softcap"] != 0.5 for layer in layers):
         raise RuntimeError(f"unexpected effective softcap layers: {layers}")
@@ -38,6 +39,7 @@ def worker_identity(worker):
     return {"vllm": vllm.__file__, "adapter": hcu_adapter.__file__,
             "layers": layers, "graph": str(config.compilation_config.cudagraph_mode),
             "prefix": config.cache_config.enable_prefix_caching,
+            "kv_cache_dtype": config.cache_config.cache_dtype,
             "block_size": config.cache_config.block_size}
 
 
@@ -65,7 +67,7 @@ def build_checkpoint(checkpoint):
     model.save_pretrained(checkpoint)
 
 
-def run(checkpoint, backend, output_dir):
+def run(checkpoint, backend, output_dir, kv_cache_dtype="auto"):
     import hcu_adapter
     import torch
     import vllm
@@ -83,6 +85,7 @@ def run(checkpoint, backend, output_dir):
         dtype="bfloat16", block_size=64, max_model_len=128, max_num_seqs=4,
         max_num_batched_tokens=128, gpu_memory_utilization=0.15, seed=0,
         enable_prefix_caching=True, max_logprobs=128,
+        kv_cache_dtype=kv_cache_dtype,
     )
     workers = llm.collective_rpc(worker_identity, timeout=60)
     params = SamplingParams(temperature=0, seed=0, max_tokens=8, ignore_eos=True,
@@ -106,6 +109,7 @@ def run(checkpoint, backend, output_dir):
         raise RuntimeError("prefix replay did not reuse the complete shared page")
     record = {
         "backend": backend, "outputs": waves, "workers": workers,
+        "kv_cache_dtype": kv_cache_dtype,
         "architecture": torch.cuda.get_device_properties(0).gcnArchName,
         "vllm_origin": vllm.__file__, "adapter_origin": hcu_adapter.__file__,
         "torch_version": torch.__version__,
@@ -122,6 +126,8 @@ def main():
     parser.add_argument("--build", action="store_true")
     parser.add_argument("--backend", choices=["TRITON_ATTN", "FLASH_ATTN"])
     parser.add_argument("--output-dir", type=Path)
+    parser.add_argument("--kv-cache-dtype", choices=["auto", "fp8_e4m3", "fp8_e5m2"],
+                        default="auto")
     args = parser.parse_args()
     if args.build:
         if args.backend or args.output_dir:
@@ -130,7 +136,7 @@ def main():
     else:
         if not args.backend or args.output_dir is None:
             parser.error("run requires --backend and --output-dir")
-        run(args.checkpoint, args.backend, args.output_dir)
+        run(args.checkpoint, args.backend, args.output_dir, args.kv_cache_dtype)
 
 
 if __name__ == "__main__":

@@ -7,6 +7,7 @@ all cache writers/readers must select this layout for the engine lifetime.
 """
 from dataclasses import dataclass
 import torch
+from .minimax31_prefill import enabled as _prefill_enabled
 
 LAYOUT='pcp_msa128_tokenmajor_v1'
 
@@ -139,7 +140,11 @@ class TeacherMSAPrefill:
             raise ValueError('forced prefix/local pages must be nonnegative and fit Top16')
         score=self.native.msa128_stage1_page_max(index_q,index_cache.unsqueeze(1),meta.k_end,True,-1,
             meta.q_lens_cpu,meta.kv_lens_cpu,None,meta.packed_kv_pages,meta.max_kv_len,index_q_scale,index_k_scale,True,False,False)
-        if local_blocks:
+        if local_blocks and _prefill_enabled():
+            from .minimax31_prefill_triton import force_local_pages
+            force_local_pages(score, meta.k_end, local_blocks)
+
+        elif local_blocks:
             last=(meta.k_end-1)//128
             pages=torch.arange(score.shape[1],device=score.device).view(1,-1,1)
             mask=(pages<=last.view(1,1,-1))&(pages>=(last-local_blocks+1).clamp_min(0).view(1,1,-1))
@@ -157,7 +162,12 @@ class TeacherMSAPrefill:
         if q.shape[0]!=meta.k_end.numel():raise ValueError('query metadata rows disagree')
         indices=self.native.msa128_expand_block_indexes(selected.contiguous(),True,meta.q_offsets,meta.seq_lens,
             meta.page_table,None,None,meta.cu_q,None,None,0)
-        q8=(q.float()/q_scale).to(torch.float8_e4m3fn)
+        if _prefill_enabled():
+            from .minimax31_prefill_triton import quant_q
+            q8=quant_q(q, q_scale)
+
+        else:
+            q8=(q.float()/q_scale).to(torch.float8_e4m3fn)
         out,_,_=self.native.sparse_prefill_fwd(q8,cache.key,indices,128**-.5,128,None,None,cache.value,
                                              q_scale,k_scale,v_scale,p_scale)
         # Native applies all descales: no second scale fold or V multiply.
@@ -166,6 +176,7 @@ class TeacherMSAPrefill:
 # Scoped production bridge: explicit startup opt-in in minimax31_pcp only.
 _HOST = None
 _META = {}
+_META_SOURCES = {}
 _ADAPTER = None
 _ADAPTER_ROOT = None
 _UNIT = {}
@@ -174,13 +185,14 @@ _UNIT_VERSION = {}
 
 def set_forward_layout(batch):
     """Publish planner-owned CPU metadata once; local routing uses local mask."""
-    global _HOST, _META
+    global _HOST, _META, _META_SOURCES
     lens=tuple(int(x) for x in batch.num_scheduled_tokens.tolist())
     starts=tuple(int(x) for x in batch.num_computed_tokens_np[:len(lens)].tolist())
     if len(starts)!=len(lens) or sum(lens)!=int(batch.num_tokens):
         raise RuntimeError('native MSA planner start/lens contract mismatch')
     _HOST=(lens,starts,int(batch.num_tokens))
     _META={}
+    _META_SOURCES={}
 
 
 def ensure_native_cache(layer):
@@ -224,7 +236,20 @@ def _get_adapter(extension_dir):
 
 def _forward_meta(sub,req_start,req_count):
     if _HOST is None:raise RuntimeError('native MSA has no PCP planner metadata')
-    key=(id(sub),req_start,req_count)
+    def identity(t):
+        try:
+            version = t._version
+        except RuntimeError:
+            # Unversioned inference tensors retain wrapper identity as well.
+            version = ("inference", id(t))
+        return (t.device, t.data_ptr(), tuple(t.shape), tuple(t.stride()), t.dtype, version)
+    physical=(identity(sub.block_table), identity(sub.seq_lens),
+              identity(sub.cu_seqlens_q) if hasattr(sub, "cu_seqlens_q") else None,
+              req_start, req_count)
+    # Stock keeps per-wrapper reuse; physical identity also protects it against
+    # wrapper id recycling without retaining unrelated wrapper-owned tensors.
+    key=physical if _prefill_enabled() else (id(sub), physical)
+
     if key in _META:return _META[key]
     lens,starts,_=_HOST
     lengths=lens[req_start:req_start+req_count];offsets=starts[req_start:req_start+req_count]
@@ -238,6 +263,8 @@ def _forward_meta(sub,req_start,req_count):
     if hasattr(sub,'cu_seqlens_q'):
         torch._assert_async((meta.cu_q==sub.cu_seqlens_q).all(),'native MSA planner cu_seqlens mismatch')
     _META[key]=meta
+    _META_SOURCES[key]=(sub.block_table, sub.seq_lens,
+                        getattr(sub, "cu_seqlens_q", None))
     return meta
 
 

@@ -240,6 +240,34 @@ ref, so a base-SHA check context alone does not qualify the submitted PR. This
 route supplies explicit PR evidence; it does not create automatic PR statuses,
 repair prepared dependencies or establish model/release acceptance.
 
+## Qualify a candidate image for one PR
+
+Use optional `candidate_image` on the exact-head manual PR route to test a new
+runtime without changing the shared `HCU_CI_IMAGE_V033` variable. First verify
+the trusted publisher's provenance, manifest/config digest and installed
+payload. Set `CI_CANDIDATE_IMAGE` to that immutable reference, then dispatch:
+
+```bash
+gh workflow run hcu-pr-ci-v033.yml --repo HYGON-AI/vllm-plugin-das \
+  --ref v0.33.0 -f pr_number="$PR_NUMBER" -f expected_head="$PR_HEAD" \
+  -f candidate_image="$CI_CANDIDATE_IMAGE"
+```
+
+This input requires a live open PR, its complete current head and a trusted
+manual actor. It cannot override automatic PR/push or target-only runs. Both
+approved image repositories on `HARBOR_SITE` retain the existing immutable
+SHA256 guard; malformed candidates fail instead of falling back to the shared
+image. An empty input preserves normal shared-image resolution.
+
+Candidate concurrency includes the PR and image reference, separate from the
+normal PR group and other candidate images. Inspect existing runs before
+dispatching: a duplicate for the same PR/image can still cancel its predecessor.
+Record the resolved image printed in the job log, trusted workflow revision,
+resolved PR head, actual installed payload and complete matrix results. The
+source, authorization, runner, device/Graph and aggregate gates are unchanged.
+Image publication, successful input resolution or a partial job result does not
+qualify the runtime or update any shared consumer.
+
 ## Publish a private Core candidate image
 
 The Adapter publisher supplies the runtime base. Inspect its actual installed
@@ -284,3 +312,43 @@ The published image remains a candidate: inspect its receipt, then run the
 unchanged portable, native/Graph and applicable model gates on both tiers.
 Changing the CI image after a completed failure justifies a fresh execution;
 an existing matching live run should be observed rather than duplicated.
+
+## Paired Adapter delivery for a private runtime candidate
+
+The release publisher can optionally replace the Adapter host/native pair along
+with the complete Core wheel. This repairs dependency delivery when a prepared
+image predates an already-merged Adapter interface or policy catalog. It does
+not move that interface into the Plugin or skip the failing tests.
+
+Supply all three optional dispatch values `adapter_source`,
+`adapter_wheel_sha256`, and `kernel_wheel_sha256`, and add an `adapter` object
+to the private package's `candidate-manifest.json`:
+
+```json
+{
+  "source_head": "reviewed Adapter commit (40 lowercase hex digits)",
+  "adapter_wheel_filename": "hcu_adapter-VERSION-py3-none-any.whl",
+  "adapter_wheel_sha256": "reviewed host wheel SHA256",
+  "kernel_wheel_filename": "sgl_kernel-VERSION-cp312-cp312-linux_x86_64.whl",
+  "kernel_wheel_sha256": "reviewed native wheel SHA256"
+}
+```
+
+The manifest object requires explicit paired dispatch inputs; partial inputs,
+source/hash mismatches, foreign package payloads, missing native libraries,
+different build suffixes, wrong DTK/Torch ABI and a missing exact native-wheel
+requirement are rejected. The selected producer ABI is CPython3.12,
+DTK26.10/Torch2.13. Complete versions and hashes freeze this candidate's build
+inputs, rather than imposing a Plugin runtime exact-wheel policy.
+
+The wheels stay in the existing fixed private project/package origin. A short
+lived read-only package credential is confined to preparation. Offline Docker
+installation applies all selected wheels together, and inspection verifies
+their actual installed bytes, raw RECORDs and required embedded architectures.
+The published receipt binds the prepared wheels to the installed result.
+Inspection uses system Python with isolated `-I -S -B` startup and adds only
+its sysconfig package directories. It does not execute `.pth` or Adapter
+`sitecustomize`, which can import Torch even when the host is disabled.
+Core-only dispatch remains available without any Adapter manifest or inputs.
+Unique tags, immutable base references, credential cleanup, unchanged shared
+consumer variables and all portable/native/Graph/model gates remain in force.

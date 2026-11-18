@@ -24,6 +24,46 @@ rewriting or retiring each patch. Keep a migration row with its owner, reason,
 affected call sites and tests. An identical file or matching parameter names
 does not establish equivalent behavior or performance.
 
+Inspect the old callback's body before calling it an optimization: a
+nonmutating audit callback need not become a replacement for an official
+verifier. Verify the registered target implementation and its observable
+behavior; direct verifier calls do not qualify full configuration construction
+or model execution.
+
+Confirm that tests call the production owner. A class or timeout formula copied
+into a test can pass after the production code regresses. Use real ZMQ sockets
+for receive behavior and real FutureWrapper constructors for queue ordering and
+exception propagation. Bound possible infinite waits and synchronize on explicit
+readiness. Where useful, exercise deliberately broken source in a separate
+process to establish that the test catches the regression; never install or
+commit that broken source. Reuse existing protocol suites and their CI coverage.
+Treat composite patches by subfeature: a passing receive-timeout test does not
+qualify RPC deadlines, pipeline queue capacity, fork initialization or worker
+lifecycle. Preserve unverified subfeatures in the migration ledger.
+
+Before retaining a pre-fork block-size hook, trace worker KV specs back into
+EngineCore. A target that derives the parent's cache block size from those specs
+before scheduler/hash/KV initialization can already propagate a worker-local
+choice. Verify real constructors and returned configurations before copying the
+old hook. A public metadata-only custom worker can isolate this negotiation,
+but does not qualify attention, device KV allocation, Graph, PP computation or
+model lifecycle. Separately check actual worker/manager/page/hash geometry on a
+frozen real-model cohort, preserving its original accuracy and exit findings.
+
+Parent block-size feedback alone does not qualify hybrid prefill splitting:
+EngineCore can select the smallest group's page while Mamba uses a larger one.
+After the real scheduler-config conversion, test unequal attention/Mamba pages
+with budgets above and below the Mamba page. Preserve finer-hash tail checkpoints
+and shared configuration, and use the actual Mamba spec rather than the scheduler
+LCM. Equal-page tests cannot detect this mismatch; device/model gates remain.
+
+Trace worker placements through the target's scheduler-config conversion before
+testing an offload connector. A worker's UniformTypeKVCacheSpecs may be unwrapped
+there; bypassing that boundary can invent a missing-manager failure. For packed
+KV, check shared-allocation accounting and retained layer/offset/stride metadata
+through the real builder, conversion, connector and block pool. Keep independent
+backings, device copies and model acceptance separate from this CPU coverage.
+
 ## Run a static preflight
 
 The companion script reads committed trees without checking out refs,
@@ -105,12 +145,23 @@ merely to pass discovery. Qualify each admitted operator and consumer separately
 
 ## Validate the changed execution path
 
+For interrupted checkpoint downloads and live-worker inspection, read
+[checkpoint recovery and runtime probes](references/checkpoint-runtime-probes.md).
+Keep the original checkpoint identity and avoid copying live tensor owners.
+
 For v0.33 CI event availability and the trusted exact-head manual PR route, read
 [the release CI guide](../../docs/validation/vllm033-ci-coverage.md#explicit-pr-dispatch-on-v0330).
 Keep dispatch acknowledgement, the actual PR checkout and aggregate acceptance separate.
 For a private Core image candidate, use the guide's
 [publisher and credential boundaries](../../docs/validation/vllm033-ci-coverage.md#publish-a-private-core-candidate-image);
 inspect embedded architectures before changing a shared CI image.
+
+For a newly published image, prefer a trusted single-run candidate input when
+the target workflow provides one; see [candidate CI qualification](../../docs/validation/vllm033-ci-coverage.md#qualify-a-candidate-image-for-one-pr).
+Verify the live PR/head, dispatch actor, immutable approved image and concurrency
+group before dispatch. Reuse an existing matching run. Keep the shared consumer
+and complete source/device/Graph/aggregate gates unchanged; publication or
+successful image selection does not establish runtime qualification.
 
 1. Freeze Core/Adapter/Plugin sources and dependency heads. Check capability
    and ABI compatibility instead of introducing an exact-wheel runtime lock.
@@ -129,6 +180,20 @@ inspect embedded architectures before changing a shared CI image.
    Clean up only recorded owned process identities. Keep numerical success,
    process release and normal teardown as separate results.
 
+For a raw accuracy loss involving output formatting, compare saved reference
+continuations through the target's public prompt-logprob API. Verify identical
+rendered prompt/token IDs and an unchanged BPE boundary; repeat each identical
+request within each arm and record the first greedy-ranking difference, token
+probabilities and top-two margins. Probe both original continuation prefixes
+where available. Teacher-forced prefill has different execution geometry from
+free-running decode: a reproducible ranking change narrows the investigation
+but does not identify one native leaf, qualify decode, or waive the raw loss.
+Keep serving configuration, package/checkpoint identity and lifecycle results
+bound separately; preserve the original evaluation and normalization protocol.
+
+For explicit FP8 KV names, writer bytes, mixed query/cache dtypes and native
+Flash prefill/decode boundaries, read [Flash KV formats](references/flash-kv-formats.md).
+
 Graph capture or HTTP health alone does not establish successful generation.
 When workspace planning moves to construction, build the real layer in CPU
 regressions with explicit native leaf doubles and exercise its frozen plan.
@@ -136,6 +201,13 @@ Mutate the source configuration afterward and verify reservation and reuse at
 the actual workspace boundary; a removed runtime-config import is not a seam
 to restore merely to keep an old fixture working. Retain missing-reservation
 negative controls. CPU constructor tests do not qualify a model or device.
+CPU CLI transport fixtures should use a real temporary local model directory
+and explicitly exercise offline resolution, rather than depend on a cached
+placeholder repository. For layout-only quantization tests, isolate the
+constructor's device-admission leaf while retaining real post-load/reload,
+tensor-value, stride and pointer assertions. Match source-origin guards to the
+actual Core import path. Keep production admission checks and device tests
+unchanged; these fixture doubles do not establish native execution.
 For GDN, follow the actual constructor's dispatch selection: an official
 CustomOp may replace `_forward_method` after platform dispatch, so overriding
 `forward_hip` alone need not execute the provider. An OOT prefill entry does
@@ -201,6 +273,8 @@ repository before rebuilding: similarly named mirrors can lack the wheel's
 newer ABI. Compare all relevant package files, not only the repaired module;
 publish against the maintained source without downgrading algorithms. Label
 a local PEP 517 source build separately from a released or CI-produced wheel.
+For packaging profiles, native dependencies and source/installed test isolation,
+read [native provider validation](references/native-provider-validation.md).
 Validate its source/wheel/installed payload and raw RECORD, then rerun affected
 CPU, native/Graph and model gates. A new venv can change a registered console
 script's interpreter prefix; audit that exact generated script separately
@@ -235,6 +309,13 @@ with `-I -S` can spawn a normal interpreter whose sitecustomize preloads an
 older Adapter, even with an empty PYTHONPATH and HOSTnone. Use a matching
 installed owner for that child and retain the first failure; do not regenerate
 documentation or relax freshness assertions to hide package-origin drift.
+
+For installed lifecycle tests that launch a bare CLI, prepend the tested
+venv bin directory to that arm's PATH, check the selected script and shebang,
+and record actual server/worker origins. Preloading the correct parent package
+does not select the child CLI. Preserve a wrong-PATH attempt as invalid harness
+evidence, clean up its owned identities, and rerun the unchanged original tests
+and deadlines in a new output directory.
 
 For pipeline parallelism, count workers and distinct GPU trace ranks as
 TP times PP. Hybrid cache projection can preserve globally indexed groups
@@ -370,6 +451,17 @@ even a compiled dual-target wheel still needs execution on both architectures.
 Keep private Core source/wheels in the original private project or an authorized
 internal publisher; publishing a candidate does not repin consumers or a release.
 
+When a published runtime lacks a newly merged Adapter capability, deliver the
+host wheel and its exact required native-wheel build together. Verify wheel
+RECORDs, namespace ownership, build ABI and the host's kernel requirement before
+offline installation. Compare the installed payload with the prepared wheels,
+verify installed RECORDs and embedded architectures, then rerun the affected
+full CI matrix. Publish a unique candidate digest; keep shared consumer changes
+and device/model acceptance separate from artifact delivery.
+Run metadata-only image inspection with isolated no-site startup, adding the
+system interpreter's package directories without executing `.pth` or
+`sitecustomize`; a disabled host can still import Torch during bootstrap.
+
 For optional container credentials, distinguish cross-repository PRs from PRs
 inside a repository that is itself a fork. Compare head/base repository identity
 and event type rather than head.repo.fork. Cover cross-repository and both kinds
@@ -454,6 +546,15 @@ If independent builds of identical kernel source differ, add a Core-vs-Core
 control and inspect selected launch configurations before assigning the cause
 to the Plugin. Preserve the failures and full-model gates.
 
+Budget serial device jobs from measured cold execution, including portable
+startup, every provider subprocess and the remaining native matrix. Inspect
+actual timeout annotations before changing the bounded job budget; preserve
+all selection, authorization and aggregate gates. Upload each component's
+JUnit alongside the final aggregate so a later cancellation retains completed
+evidence. Component logs or XML do not qualify an unfinished aggregate, and
+an increased budget is not a passing rerun. Reuse live runs and retain the
+original timeout result when validating the corrected workflow.
+
 For provider CI, inspect the final pytest log and result artifact as well as
 job status. A session-level version pause can exit successfully without running
 any cases; a benchmark driver can then produce no CSV. Record those as no
@@ -468,3 +569,15 @@ Check each job's actual driver: direct benchmark scripts may execute even
 when another job's pytest session is paused. Count JUnit launcher cases,
 CSV measurement rows and numerical regression cases separately; selected
 benchmark timings do not qualify unrelated kernels or model accuracy.
+
+For same-host Mooncake HIP IPC, inspect ROCR visibility separately from each
+process's HIP/CUDA compute mask. The tested DTK2610/gfx938 runtime crashes on
+the first 64-byte copy with disjoint single-device ROCR masks, also in a direct
+HIP program without Torch or Mooncake. A shared ROCR list of the two allocated
+peers with separate HIP/CUDA masks passes two changed-input waves in direct HIP
+and the original Mooncake buffer API. Verify relative HIP indexes, PCI buses,
+full destination bytes and untouched regions. Preserve the failed masks and
+record this as a deployment condition for the tested runtime; do not generalize
+it to other builds or claim a native source fix. Keep P/D model output, Graph,
+accuracy, performance and server lifecycle gates separate; changing SDMA or
+transport would be a distinct diagnostic.

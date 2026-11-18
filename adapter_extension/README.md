@@ -19,14 +19,22 @@ weight loading, generic quantization and kernel construction.
 It also provides an explicit HCU FlashAttention backend selected by
 `--attention-backend FLASH_ATTN`. The backend keeps vLLM's official metadata,
 scheduler and allocation. Its public `AttentionImpl` owns the HCU provider call
-and dense HND/NHD cache views, routes BF16 writes to the native vLLM writer,
-and retains a Plugin E5M2 writer and descale adapter. The kernel page is 64
+and dense HND/NHD cache views, routes BF16 and explicit E4M3 writes to the native
+vLLM writer, and retains a Plugin E5M2 writer and shared descale adapter. E4M3
+prefill uses Core's byte-preserving gather, explicit OCP E4M3 conversion to the
+query dtype, and vendor varlen attention; decode without LSE retains vendor
+paged attention, while explicit decode-LSE requests use the bounded composition.
+See the [E4M3 implementation and validation](../docs/validation/vllm033-flash-e4m3.md).
+The kernel page is 64
 tokens. It neither copies nor replaces the official Flash forward method and
 does not require private HCU hooks in the Core.
 
 Positive `logits_soft_cap` uses Core's unchanged Triton attention over the same
 paged cache views, because the vendor paged path ignores softcap. See
 [softcap routing and validation](../docs/validation/vllm033-softcap.md).
+For explicit E4M3 and E5M2 caches, the Plugin preserves the format's typed
+view and applies KV descales through the shared query/output scale adapter
+before/after the Core call.
 
 ## E2M1 packer lowering (default triton, `stock` opts out)
 
@@ -293,9 +301,17 @@ backend selection and kernels. Dense INT8 layers also use official CT methods.
 Declared n-gram tables use the public per-row INT8 PLE method with FP32 scales.
 This consumes more weight memory than a packed native W4A8 kernel. It neither
 registers AITER as an official INT8 backend nor replaces `compressed-tensors`.
-The current parser requires the three explicit mixed-precision groups used by
-the Qwen3.8 checkpoint. Verify loader numerics, changed-input Graph and model
-accuracy for the selected Core/provider/checkpoint combination before deployment.
+When `mixed_precision` is absent, the parser preserves the historical format:
+applicable Linear layers use per-channel INT8, routed experts use packed INT4,
+and `ignore` patterns remain authoritative. Ordinary embedding/lm-head and
+model-owned router construction keep their official unquantized behavior.
+An explicit `mixed_precision` map requires the packed-expert declaration.
+Dense INT8 and n-gram INT8 groups are optional; omitting either retains its
+unquantized weights. Every present group needs a complete module list and
+matching format. A malformed declaration never falls back to historical
+defaults. The legacy format does not infer quantized PLE tables. Verify loader
+numerics, changed-input Graph and model accuracy
+for the selected Core/provider/checkpoint combination before deployment.
 
 ## HCU FlashAttention varlen backend
 
@@ -374,7 +390,13 @@ generator providers are rejected. This extends the existing activation preflight
 its provider checks still run even when the RMS execution flags are OFF.
 It neither invokes a provider nor proves kernel, Graph or model correctness.
 
-The LightOp RMSNorm path is selected only when all of the following hold:
+Compiled calls delegate to Core's complete RMSNorm IR, including its compiler
+precision policy and fusion across consecutive residual additions. The optional
+LightOp provider is retained for eligible eager execution; this capability does
+not promise a vendor normalization kernel in compiled serving. Direct ordinary
+and mutating-fused custom-op ABIs remain available and independently tested.
+
+The eager LightOp RMSNorm path is selected only when all of the following hold:
 
 - the master and RMSNorm-specific switches are enabled;
 - vLLM batch-invariant mode is disabled;
@@ -388,6 +410,16 @@ The LightOp RMSNorm path is selected only when all of the following hold:
 All other cases use vLLM's native RMSNorm implementation. `GemmaRMSNorm`,
 `RMSNormGated`, quantized fusion, model patches, and performance claims are out
 of scope for this release.
+
+The optional eager ordinary and fused RMSNorm paths retain eager native IR's rounding
+order: normalize in FP32, cast to the input/weight dtype, then multiply by the
+weight. LightOp computes the unweighted normalization and PyTorch applies the
+weight after that cast. The residual still stores the rounded FP32 sum. This
+uses an extra dtype-preserving multiply; measure its serving cost independently
+of accuracy. A final-cast-only FP32 formula is insufficient as a regression
+oracle, especially before INT8 activation quantization.
+See the scoped [rounding validation](../docs/validation/vllm033-rms-rounding.md)
+for the regression, model results, and component cost.
 
 ## Opt in and rollback
 

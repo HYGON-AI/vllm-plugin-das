@@ -224,6 +224,31 @@ class ManualPrTests(unittest.TestCase):
                 pr_number='', manual_authorized='', release='v0.33.0'))
         self.assertEqual(self.calls, [])
 
+    def test_candidate_requires_manual_pr_and_complete_head_before_api(self):
+        for kind, number, head in [('push', '', ''),
+                                   ('push', '42', self.head),
+                                   ('workflow_dispatch', '', ''),
+                                   ('workflow_dispatch', '42', ''),
+                                   ('workflow_dispatch', '', self.head)]:
+            with self.subTest(kind=kind, number=number, head=head):
+                self.environment['GITHUB_EVENT_NAME'] = kind
+                self.event['inputs'] = dict(pr_number=number, expected_head=head,
+                    candidate_image='harbor.invalid/hcu/base_env/vllm@sha256:' + 'c' * 64)
+                with self.assertRaises(RESOLVER.AUTH.AuthorizationError):
+                    self.resolve()
+        self.assertEqual(self.calls, [])
+
+    def test_candidate_keeps_live_head_and_actor_checks(self):
+        self.event['inputs']['candidate_image'] = 'harbor.invalid/hcu/base_env/vllm@sha256:' + 'c' * 64
+        self.assertEqual(self.resolve()['head_sha'], self.head)
+        self.permission = 'read'
+        with self.assertRaisesRegex(RESOLVER.AUTH.AuthorizationError, 'trusted dispatch actor'):
+            self.resolve()
+        self.permission = 'write'
+        self.pull['head']['sha'] = 'd' * 40
+        with self.assertRaisesRegex(RESOLVER.AUTH.AuthorizationError, 'head moved'):
+            self.resolve()
+
     def test_pr_event_keeps_label_policy_instead_of_manual_authorization(self):
         self.environment['GITHUB_EVENT_NAME'] = 'pull_request_target'
         self.environment['GITHUB_REF'] = 'refs/heads/v0.28.1-dev'

@@ -24,6 +24,7 @@ SPEC.loader.exec_module(C)
 def wheel_bytes(changed=None, omitted=None):
     payload = {'vllm/' + name: b'native-placeholder' for name in C.GPU_LIBRARIES}
     payload['vllm/__init__.py'] = b''
+    payload['vllm-0.33.0.dist-info/METADATA'] = b'Name: vllm\nVersion: 0.33.0+candidate\n'
     record = 'vllm-0.33.0.dist-info/RECORD'
     rows = []
     for name, data in payload.items():
@@ -81,7 +82,7 @@ class CandidateTests(unittest.TestCase):
                 path.write_bytes(data)
                 digest = hashlib.sha256(data).hexdigest()
                 if valid:
-                    self.assertEqual(C.verify_wheel(path, digest), 6)
+                    self.assertEqual(C.verify_wheel(path, digest), 7)
                     with self.assertRaises(C.CandidateError):
                         C.verify_wheel(path, 'f' * 64)
                 else:
@@ -98,7 +99,7 @@ class CandidateTests(unittest.TestCase):
                 if url.endswith('candidate-manifest.json') else data)
         with tempfile.TemporaryDirectory() as directory:
             report = C.prepare(Path(directory) / 'context', dict(self.env, WHEEL_SHA256=digest), fetch)
-            self.assertEqual(report['record_entries'], 6)
+            self.assertEqual(report['record_entries'], 7)
             self.assertFalse(report['device_qualified'])
             self.assertEqual(len(calls), 2)
             self.assertTrue(all(url.startswith(C.PACKAGE_ROOT) for url, _, _ in calls))
@@ -124,7 +125,7 @@ class CandidateTests(unittest.TestCase):
             SPEC.loader.exec_module(host)
             with tempfile.TemporaryDirectory() as directory:
                 report = host.prepare(Path(directory) / 'context', dict(self.env, WHEEL_SHA256=digest), fetch)
-                self.assertEqual(report['record_entries'], 6)
+                self.assertEqual(report['record_entries'], 7)
             with self.assertRaises(ImportError):
                 host.inspect_image()
 
