@@ -8,6 +8,11 @@ are retained in the corresponding local files.
 
 ## vLLM Upstream Baseline
 
+The PCP prefill Q RoPE candidate reuses the HCU inverse RoPE implementation
+from `vllm_hcu/csrc/fused_deepseek_v4_inv_rope_kernel.cu` at
+`d024e8db02cd95b401603b6d9b52e02433284f6a`. Its notices are preserved in
+`adapter_extension/src/hcu_vllm_das/csrc/inverse_rope.cu`.
+
 - Upstream repository: `https://github.com/vllm-project/vllm.git`
 - Upstream branch: `releases/v0.25.1`
 - Upstream tag: `v0.25.1`
