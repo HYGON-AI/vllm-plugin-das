@@ -49,6 +49,7 @@ def _owned():
     _, mapping, cls = _publication
     return (
         mapping["step5_mtp"] is cls
+        and cls.model_type == "step5_mtp"
         and import_module("transformers").CONFIG_MAPPING is mapping
         and import_module("hcu_vllm_das.step5_config").Step5MTPConfig is cls
         and import_module("vllm.transformers_utils.configs").Step5Config.model_type

@@ -17,9 +17,10 @@ count is one; checkpoint values override these defaults.
   `auto`, with remote code disabled; save/load and pickle preserve layer arrays,
   quantization metadata and the prediction-layer count.
 - Ordinary official Step5 text/VL round trips and inherited invalid-input
-  rejections.
+  rejections; the unmodified official in-checkpoint MTP converter over text/VL,
+  zero/one/three prediction layers and quantized/unquantized metadata (12 combinations).
 - Foreign-owner refusal, read-only health, latched publication failure and
-  registry drift, repeated activation, fresh spawn and a fork while a parent
+  registry/class model-type drift, repeated activation, fresh spawn and a fork while a parent
   thread holds the extension lock.
 
 The portable CI selector collects this file. Packaging tests check the new

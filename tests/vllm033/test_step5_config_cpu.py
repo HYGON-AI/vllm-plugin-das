@@ -54,6 +54,8 @@ def _run(case):
         "roundtrip-explicit",
         "foreign",
         "drift",
+        "class-drift",
+        "in-checkpoint",
         "partial-commit",
         "versions",
         "discovery",
@@ -162,6 +164,36 @@ def _scenario(case):
     _activate()
     cls = CONFIG_MAPPING["step5_mtp"]
     assert issubclass(cls, Step5Config) and cls is not Step5Config
+    if case == "class-drift":
+        cls.model_type = "foreign_mutated_type"
+        with pytest.raises(ExtensionCommitError):
+            owner.check_health()
+        assert cls.model_type == "foreign_mutated_type"  # No repair in health.
+        cls.model_type = "step5_mtp"
+        with pytest.raises(ExtensionCommitError):
+            owner.activate(context)
+        return
+    if case == "in-checkpoint":
+        from itertools import product
+        from vllm.config.speculative import SpeculativeConfig
+
+        for vl, layers, quantized in product((False, True), (0, 1, 3), (False, True)):
+            text = Step5Config(
+                num_nextn_predict_layers=layers, architectures=["Step5ForCausalLM"]
+            )
+            target = Step5VLConfig(text_config=text) if vl else text
+            if quantized:
+                target.quantization_config = {"quant_method": "compressed-tensors"}
+            draft = SpeculativeConfig.hf_config_override(target)
+            assert draft.model_type == "step5_mtp"
+            assert draft.architectures == ["Step5MTP"]
+            assert draft.n_predict == layers
+            if quantized:
+                assert draft.quantization_config == target.quantization_config
+            assert Step5Config.model_type == "step5"
+            assert Step5VLConfig.model_type == "step5_vl"
+            owner.check_health()
+        return
     if case == "drift":
 
         class Foreign(PreTrainedConfig):
