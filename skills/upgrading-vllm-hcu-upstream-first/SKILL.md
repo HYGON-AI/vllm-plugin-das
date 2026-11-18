@@ -377,6 +377,13 @@ the original cohort. Retain both full-cohort and serial results, including
 baseline failures. Reproduction on the baseline does not establish numerical
 equivalence or erase an earlier candidate failure.
 
+When an unmerged change differs from the no-Plugin control, also compare the
+current merged Plugin with the candidate on matched dependencies and requests.
+Inspect the production diff and actual executed branch before assigning the
+loss to the new change. An unchanged branch is a reason to run that control,
+not evidence of parity. Record live autotune choices when comparing compiled
+paths; seeded choices are a diagnostic and do not qualify default tuning.
+
 ## Prepare a reviewable change
 
 Refresh the target branch, relevant open/merged requests, commits and review
