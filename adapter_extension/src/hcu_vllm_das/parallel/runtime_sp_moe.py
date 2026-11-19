@@ -39,7 +39,7 @@ def _publish():
     targets = tuple(import_module("vllm.model_executor.models." + name)
                     for name in ("glm4_moe", "hy_v3"))
     signature = inspect.signature(original)
-    for name in ("prefix", "is_sequence_parallel"):
+    for name in ("prefix", "is_sequence_parallel", "runner_cls"):
         parameter = signature.parameters.get(name)
         if parameter is None or parameter.kind not in (
                 inspect.Parameter.POSITIONAL_OR_KEYWORD, inspect.Parameter.KEYWORD_ONLY):
@@ -54,7 +54,11 @@ def _publish():
             return original(*args, **kwargs)
         bound = signature.bind(*args, **kwargs)
         if bound.arguments.get("prefix", "").endswith(".mlp.experts"):
+            from .runtime_sp_moe_runner import RuntimeSPMoERunner
+            if bound.arguments.get("runner_cls") not in (None, RuntimeSPMoERunner):
+                raise RuntimeError("foreign runtime SP MoE runner policy")
             bound.arguments["is_sequence_parallel"] = True
+            bound.arguments["runner_cls"] = RuntimeSPMoERunner
             return original(*bound.args, **bound.kwargs)
         return original(*args, **kwargs)
 

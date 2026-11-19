@@ -104,12 +104,23 @@ They adapt local tokens/full heads to global tokens/local heads and invert the
 exchange before the output projection. Replicated GQA uses contiguous replica
 groups. These helpers have no automatic model registration or serving enablement.
 
-These are **communication and attention components**, not full custom-SP model
-support. Embedding/residual/PP boundaries, dense/shared MLP, early MoE factory
-policy, target/draft batching, model accuracy and lifecycle remain open. The
-paired Adapter seam is an unpublished dependency; no released combination is
-qualified. See [validation and standalone probes](
-../docs/validation/vllm033-runtime-sp-components.md).
+Explicit model-boundary candidates compose full vocabulary-TP embedding before
+token sharding, local hidden/residual streams, global attention positions,
+device padding masks and gather/trim at stage exits. Dense/shared MLP weights
+are selected before official allocation; a scoped model-local factory bridge
+passes early SP policy and a narrow MoE padding runner. Official inner loops,
+loading, routing and logits remain inherited. No ModelRegistry entry enables
+these candidates automatically.
+
+These are **components and model-boundary candidates**. Complete synthetic
+models retain an ordinary-TP numerical gate failure; trained checkpoint,
+target/draft batching, real PP/DP/PCP, default compilation, model accuracy,
+performance and lifecycle remain unqualified. The paired Adapter seam is an
+unpublished dependency; no released combination is qualified. See
+[component validation and standalone probes](
+../docs/validation/vllm033-runtime-sp-components.md) and
+[model boundaries and preserved failures](
+../docs/validation/vllm033-runtime-sp-boundaries.md).
 
 ## Standalone Step5 MTP configuration
 

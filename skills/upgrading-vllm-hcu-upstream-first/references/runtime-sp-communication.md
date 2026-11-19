@@ -88,6 +88,41 @@ checkpoint loading, native quantization, target/draft batching, complete topolog
 HumanEval32, performance and original model shutdown qualification separate.
 
 
+## Full model token and padding boundaries
+
+Keep the official inner model loop and outer loading/logits interfaces. An
+outer CausalLM subclass can compute full vocabulary-TP embeddings before
+sharding token rows; sharding IDs first makes embedding all-reduces mix
+unrelated tokens. Preserve inputs_embeds, both hidden/residual PP fields, and
+stock runner/send-buffer token shapes by gathering and trimming at stage exits.
+Attention exchanges restore global token rows, so positions stay global even
+while MLP/residual rows are local. Test nondivisible token counts and runner
+padding separately from the extra SP alignment rows.
+
+Use the runner's device Boolean padding tensor, including in-place changes on
+Graph replay. Do not capture a Python num_actual_tokens as a constant mask.
+FlashAttention can leave padded output rows unwritten: masked_fill them before
+the inverse exchange and projection/activation quantization. Multiplication by
+zero does not clear NaNs. Also mask local projection inputs so padding cannot
+pollute a tensor-wide scale.
+
+Core's MoE routing may happen before internal dispatch or after naive
+all-gather. Use the local mask in the former layout and the exact gathered EP
+mask in the latter; with DP, use the same group and per-rank sizes as dispatch.
+The public runner_cls factory argument can supply this narrow context adapter,
+while is_sequence_parallel still has to precede config/router/weight creation.
+Do not overwrite a foreign runner policy. Restore context on exceptions and
+preserve the official custom-op layer-name cursor across context copies.
+
+A Graph capture allocates outputs but does not establish their values. Replay
+the unchanged initial inputs and compare them with the reference before using
+the captured output for change detection. An all-padding rank can correctly
+remain zero; compare against the expected change rather than uninitialized
+capture storage. Preserve the original failed probe and unchanged numerical
+gates. CPU Dynamo with layer doubles, raw native Graphs, complete synthetic
+models, and trained-checkpoint/default-runner/HumanEval acceptance are distinct
+validation scopes; do not transfer one scope to another.
+
 ## Independent native MoE reference boundaries
 
 Derive reference casts from the actually selected activation and expert kernels.
@@ -105,3 +140,22 @@ CPU arithmetic with documented cast boundaries, keeping the original numerical
 gates, and verify fresh eager and changed-input Graph execution. A corrected
 reference does not retroactively pass the original run or qualify a checkpoint,
 quantized provider, different kernel selection or normal model shutdown.
+
+
+## Full GEMM versus ordinary TP rounding
+
+A replicated SP projection and an ordinary TP projection can load identical
+weights and receive identical head inputs yet round differently: the full BF16
+GEMM casts once, while sharded GEMMs cast partial outputs before the collective
+reduction. Trace the first differing module, reconstruct the full weight/input,
+and compare both outputs with independent FP32 arithmetic before attributing a
+later model mismatch to attention or routing. Record intervening residual/norm
+amplification and top-k changes separately. A closer FP32 result does not waive
+an existing model tolerance or establish checkpoint accuracy. Keep that gate
+failed; do not change weights, precision or thresholds just to obtain a pass.
+
+When an early numerical assertion prevents later model/Graph cases from
+running, a diagnostic collector may preserve each original assertion and finish
+the remaining cases, then exit nonzero if any gate failed. Report candidate
+Graph-versus-eager consistency separately from candidate-versus-official TP
+agreement; neither replaces the other or trained-checkpoint acceptance.

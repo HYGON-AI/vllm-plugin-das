@@ -163,6 +163,15 @@ def test_real_factory_gets_sp_before_parallel_config_router_or_weights(core, fac
     assert not sp.model_construction_active()
 
 
+def test_scoped_factory_does_not_overwrite_a_foreign_runner(core, factory):
+    moe.install_moe_factory_policy()
+    class ForeignRunner:
+        pass
+    with pytest.raises(RuntimeError, match="foreign runtime SP MoE runner"), sp.runtime_sp_model_construction():
+        glm4_moe.FusedMoEFactory(8, 2, 16, 32, prefix="model.layers.0.mlp.experts",
+                                runner_cls=ForeignRunner)
+
+
 @pytest.mark.parametrize("family", ["glm4", "hy3"])
 @pytest.mark.parametrize("shared", [False, True])
 def test_official_moe_model_constructor_reaches_early_sp_policy(core, factory,

@@ -19,6 +19,7 @@ from vllm.distributed import get_tp_group
 from vllm.model_executor.layers.linear import (
     MergedColumnParallelLinear, QKVParallelLinear, RowParallelLinear,
 )
+from .runtime_sp_batch import current_sp_batch, mask_local_padding
 
 _construction = ContextVar("hcu_runtime_sp_attention_construction", default=False)
 _mlp_construction = ContextVar("hcu_runtime_sp_mlp_construction", default=False)
@@ -179,7 +180,7 @@ class RuntimeSPQKVParallelLinear(QKVParallelLinear):
         group = _check_group(self)
         if input_.ndim != 2:
             raise ValueError("runtime SP QKV expects a two-dimensional local token tensor")
-        result = super().forward(input_)
+        result = super().forward(mask_local_padding(input_))
         output, bias = result if self.return_bias else (result, None)
         send = self._runtime_sp_layout.pack_qkv(output)
         recv = _exchange(group, send)
@@ -207,7 +208,7 @@ class RuntimeSPRowParallelLinear(RowParallelLinear):
     def forward(self, input_):
         if self._runtime_sp_mlp:
             _check_group(self)
-            return super().forward(input_)
+            return super().forward(mask_local_padding(input_))
         if not self._runtime_sp:
             return super().forward(input_)
         group = _check_group(self)
@@ -215,6 +216,13 @@ class RuntimeSPRowParallelLinear(RowParallelLinear):
             raise ValueError("runtime SP output projection expects head-sharded input")
         if input_.shape[0] % group.world_size:
             raise ValueError("runtime SP attention tokens must be padded to TP size")
+        batch = current_sp_batch()
+        if batch is not None:
+            if input_.shape[0] != batch.padded_tokens:
+                raise ValueError("runtime SP attention output has an invalid token layout")
+            # FlashAttention may leave padded rows unwritten. Clear them before
+            # inverse exchange and GEMM/activation quantization; 0 * NaN is NaN.
+            input_ = input_.masked_fill(batch.global_padding[:, None], 0)
         rows = input_.shape[0] // group.world_size
         send = input_.reshape(group.world_size, rows, input_.shape[-1]).contiguous()
         recv = _exchange(group, send)
@@ -236,6 +244,7 @@ class RuntimeSPMergedColumnParallelLinear(MergedColumnParallelLinear):
     def forward(self, input_):
         if self._runtime_sp_mlp:
             _check_group(self)
+            input_ = mask_local_padding(input_)
         return super().forward(input_)
 
 
