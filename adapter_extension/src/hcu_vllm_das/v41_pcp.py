@@ -91,6 +91,14 @@ def bind_adapter_classes() -> None:
     # lookup only worked after a replay had already materialized this export.
     pcp_fork.set_forward_context_resolver(
         lambda: getattr(sys.modules[__name__], "get_forward_context")())
+    # Older adapters keep the stock path on the same Plugin release.
+    q_rope_selected = getattr(pcp_fork, "q_rope_selected", None)
+    if q_rope_selected is not None and q_rope_selected():
+        from .pcp_q_rope import initialize
+
+        pcp_fork.set_q_rope_provider(initialize)
+    elif hasattr(pcp_fork, "require_q_rope_healthy"):
+        pcp_fork.set_q_rope_provider(None)
     _bound = True
 
 
