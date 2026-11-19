@@ -27,6 +27,14 @@ class HcuCTW4A8MoEMethod(FusedMoEMethodBase):
         self._ops=get_ops()
         validate_ops(self._ops,self._backend,moe.swiglu_limit)
 
+    @property
+    def supports_eplb(self):
+        # Only the owned static deployment sizes physical slots before load.
+        # Dynamic Core EPLB would move already-converted HIPC storage.
+        from ..static_eplb_runtime import validate_config
+
+        return validate_config(self._config)
+
     def maybe_roundup_sizes(self, hidden_size, intermediate_size_per_partition, act_dtype, moe_parallel_config):
         if hidden_size%512 or intermediate_size_per_partition%256:
             raise ValueError('HIPC requires H%512==0 and I%256==0; implicit padding is unsupported')

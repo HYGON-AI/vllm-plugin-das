@@ -69,6 +69,9 @@ class HcuDSV41DeepGemmMethod(HcuDSV41MegaMoEMethod):
     # Core DeepEP HT rebuilds dispatch/combine handles for each call's rows.
     # This path has no MegaMoE rank-local token pool to overflow during replay.
     supports_swa_bounded_replay = True
+    # Core's routing state remaps logical IDs before DeepEP HT dispatch. The
+    # grouped GEMMs and expert maps already use the physical/local expert counts.
+    supports_static_eplb = True
 
     def __init__(self, *args, **kwargs):
         super().__init__(*args, **kwargs)

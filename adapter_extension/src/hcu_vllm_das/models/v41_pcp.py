@@ -11,10 +11,13 @@ from __future__ import annotations
 
 import hashlib
 import inspect
+from contextvars import ContextVar
 from types import FunctionType
 
+from vllm.models.deepseek_v4.amd import model as native_v4
 from vllm.models.deepseek_v41.amd import model as native
 from vllm.models.deepseek_v41.amd import vl_model as native_vl
+from .. import static_eplb_runtime as static_eplb
 from ..v41_pcp import attention_class, validate_config
 from ..v41_engram import HcuV41PcpEngram
 from ..v41_target_engram import HcuV41HostEngram, use_host_target, validate_host_config
@@ -22,6 +25,8 @@ from ..v41_target_engram import HcuV41HostEngram, use_host_target, validate_host
 _DECODER_NATIVE = native.DeepseekV4DecoderLayer.__init__
 _BACKBONE_NATIVE = native.DeepseekV4Model.__init__
 _OUTER_NATIVE = native_vl.DeepseekV41ForCausalLM.__init__
+_BASE_MOE_NATIVE = native_v4.DeepseekV4MoE.__init__
+_REVIEWED_BASE_MOE = '3396ecd9e48af5d6c094d392ffb62ad4271ec94cea4c42e6a037c5f398d26610'
 _REVIEWED = (
     '919c98099d1ba3e443ea5a5c5569e6bd407caf52c40945fb792e9b4e85a13a86',
     'b804d0bd4d325397b0df3a094f47456a715b2d431cb06d2c7a06c6bc8332681b',
@@ -48,7 +53,8 @@ def _constructor(function, expected_hash, substitutions):
 def check_native_contract():
     if (native.DeepseekV4DecoderLayer.__init__ is not _DECODER_NATIVE
             or native.DeepseekV4Model.__init__ is not _BACKBONE_NATIVE
-            or native_vl.DeepseekV41ForCausalLM.__init__ is not _OUTER_NATIVE):
+            or native_vl.DeepseekV41ForCausalLM.__init__ is not _OUTER_NATIVE
+            or native_v4.DeepseekV4MoE.__init__ is not _BASE_MOE_NATIVE):
         raise RuntimeError('HCU V41 PCP native constructors changed after preparation')
 
 
@@ -64,10 +70,18 @@ def select_attention(cfg):
     `HCU_DISABLE_OPS=vllm_pcp` actually mean something at construction time.
     """
     from hcu_adapter.kernels import pcp_fork
+    from ..inverse_rope_policy import selected_mode
 
-    if pcp_fork.selected_mode() == 'stock' or not validate_config(cfg):
+    admitted = pcp_fork.selected_mode() != 'stock' and validate_config(cfg)
+    if not admitted:
+        if selected_mode() == 'hcu':
+            raise ValueError('Selected inverse RoPE requires native PCP attention')
         return native._select_dsv4_attn_cls(cfg)
-    return attention_class()
+    base = attention_class()
+    if cfg.speculative_config is not None:
+        from ..pcp_dspark import HcuV41PcpDSparkAttention
+        return HcuV41PcpDSparkAttention
+    return base
 
 
 class HcuV41PcpMoE(native.DeepseekV4MoE):
@@ -120,6 +134,15 @@ class HcuV41PcpBackbone(native.DeepseekV4Model):
             reason = 'sequence parallel and microbatching cannot follow the replay batch'
         elif any(i >= cut for i in getattr(self.config, 'engram_layer_ids', ())):
             reason = 'an Engram layer sits at or after the last KV source layer'
+        elif vllm_config.speculative_config is not None and (
+            getattr(vllm_config.speculative_config.draft_model_config.hf_config,
+                    'sliding_window', None) is None
+            or vllm_config.speculative_config.draft_model_config.hf_config.sliding_window
+                > self.config.sliding_window
+            or any(kind != 'sliding_attention' for kind in getattr(
+                vllm_config.speculative_config.draft_model_config.hf_config, 'layer_types', ()))
+        ):
+            reason = 'the drafter reads hidden states outside the target replay window'
         else:
             return True
         native.logger.warning_once('Decoder SWA bounded replay is off: %s.', reason)
@@ -160,8 +183,70 @@ _HOST_OUTER_INIT = _constructor(_OUTER_NATIVE, _REVIEWED[2],
                                  {'DeepseekV41LLMForCausalLM': HcuV41HostLLM})
 
 
+# Static placement adds physical capacity at the existing factory seam. Keep
+# native V41 initialization and forward methods, including the SWA replay gate.
+_MOE_CONFIG = ContextVar('hcu_static_eplb_moe_config', default=None)
+
+
+def _eplb_factory(*args, **kwargs):
+    cfg = _MOE_CONFIG.get()
+    if cfg is None:
+        raise RuntimeError('HCU static EPLB factory used outside owned construction')
+    extra = static_eplb.moe_eplb_kwargs(cfg, kwargs.get('prefix', ''))
+    return native_v4.FusedMoEFactory(*args, **{**kwargs, **extra})
+
+
+_EPLB_BASE_MOE_INIT = _constructor(_BASE_MOE_NATIVE, _REVIEWED_BASE_MOE,
+                                    {'FusedMoEFactory': _eplb_factory})
+
+
+class _HcuEplbBaseMoE(native_v4.DeepseekV4MoE):
+    __init__ = _EPLB_BASE_MOE_INIT
+
+
+class HcuV41EplbMoE(native.DeepseekV4MoE, _HcuEplbBaseMoE):
+    def __init__(self, vllm_config, prefix='', use_sequence_parallel=False):
+        token = _MOE_CONFIG.set(vllm_config)
+        try:
+            super().__init__(vllm_config, prefix=prefix,
+                             use_sequence_parallel=use_sequence_parallel)
+        finally:
+            _MOE_CONFIG.reset(token)
+        static_eplb.publish_physical_metadata(self, vllm_config, prefix)
+
+
+_EPLB_DECODER_INIT = _constructor(_DECODER_NATIVE, _REVIEWED[0],
+                                   {'_select_dsv4_attn_cls': select_attention,
+                                    'Engram': HcuV41PcpEngram,
+                                    'DeepseekV4MoE': HcuV41EplbMoE})
+
+
+class HcuV41EplbDecoderLayer(native.DeepseekV4DecoderLayer):
+    __init__ = _EPLB_DECODER_INIT
+
+
+_EPLB_BACKBONE_INIT = _constructor(_BACKBONE_NATIVE, _REVIEWED[1],
+                                    {'DeepseekV4DecoderLayer': HcuV41EplbDecoderLayer})
+
+
+class HcuV41EplbBackbone(HcuV41PcpBackbone):
+    __init__ = _EPLB_BACKBONE_INIT
+
+
+class HcuV41EplbLLM(native.DeepseekV41LLMForCausalLM):
+    model_cls = HcuV41EplbBackbone
+
+
+_EPLB_OUTER_INIT = _constructor(_OUTER_NATIVE, _REVIEWED[2],
+                                 {'DeepseekV41LLMForCausalLM': HcuV41EplbLLM})
+
+
 class HcuV41PcpForCausalLM(native_vl.DeepseekV41ForCausalLM):
     def __init__(self, *, vllm_config, prefix=''):
+        self._hcu_static_eplb_config = None
+        if static_eplb.enabled(vllm_config):
+            static_eplb.validate_config(vllm_config)
+            self._hcu_static_eplb_config = vllm_config
         from hcu_adapter.fp4_indexer import applicable as fp4_applicable
         if fp4_applicable(vllm_config):
             from ..fp4_indexer import preflight
@@ -174,7 +259,9 @@ class HcuV41PcpForCausalLM(native_vl.DeepseekV41ForCausalLM):
             from ..v41_pcp_activation import check_health
             check_health()
             check_native_contract()
-            _FP4_OUTER_INIT(self, vllm_config=vllm_config, prefix=prefix)
+            init = (_FP4_EPLB_OUTER_INIT if self._hcu_static_eplb_config is not None
+                    else _FP4_OUTER_INIT)
+            init(self, vllm_config=vllm_config, prefix=prefix)
             return
         from ..v41_pcp_activation import check_health
         check_health()
@@ -183,13 +270,46 @@ class HcuV41PcpForCausalLM(native_vl.DeepseekV41ForCausalLM):
             from ..v41_pcp_activation import pcp_enabled
             if not pcp_enabled():
                 raise ValueError('PCP attention requires VLLM_HCU_DSV41_PCP_ATTENTION=1')
-        if validate_config(vllm_config):
+        if self._hcu_static_eplb_config is not None:
+            _EPLB_OUTER_INIT(self, vllm_config=vllm_config, prefix=prefix)
+        elif validate_config(vllm_config):
             _OUTER_INIT(self, vllm_config=vllm_config, prefix=prefix)
         elif use_host_target(vllm_config):
             _HOST_OUTER_INIT(self, vllm_config=vllm_config, prefix=prefix)
         else:
             # PCP1 without the explicit host route remains fully native.
             super().__init__(vllm_config=vllm_config, prefix=prefix)
+
+    def load_weights(self, weights):
+        cfg = getattr(self, '_hcu_static_eplb_config', None)
+        if cfg is not None:
+            # Bind before native checkpoint loaders read logical expert IDs.
+            static_eplb.bind_placement(self, cfg)
+        return super().load_weights(weights)
+
+    def process_weights_after_loading(self):
+        super().process_weights_after_loading()
+        cfg = getattr(self, '_hcu_static_eplb_config', None)
+        if cfg is None:
+            return
+        # DummyModelLoader also reaches this hook without calling load_weights.
+        static_eplb.bind_placement(self, cfg, bind_weight_loaders=False)
+        static_eplb.install_routing(self, cfg)
+        self._hcu_static_eplb_session = static_eplb.record_session(self)
+
+    def forward(self, input_ids, positions, intermediate_tensors=None,
+                inputs_embeds=None, lookback_token_ids=None, **kwargs):
+        session = getattr(self, '_hcu_static_eplb_session', None)
+        record_step = False
+        if session is not None:
+            rows = positions.shape[0] if inputs_embeds is None else inputs_embeds.shape[0]
+            record_step = session.prepare(rows)
+        output = super().forward(input_ids, positions, intermediate_tensors,
+                                 inputs_embeds,
+                                 lookback_token_ids=lookback_token_ids, **kwargs)
+        if record_step:
+            session.step()
+        return output
 
 
 def _fp4_attention(cfg):
@@ -235,3 +355,31 @@ class HcuV41Fp4LLM(native.DeepseekV41LLMForCausalLM):
 
 _FP4_OUTER_INIT = _constructor(_OUTER_NATIVE, _REVIEWED[2],
                               {'DeepseekV41LLMForCausalLM': HcuV41Fp4LLM})
+
+
+# Compose the FP4 attention/PCP Engram selection with static physical MoE
+# placement. Inherit the same backbone so decoder SWA replay remains available.
+_FP4_EPLB_DECODER_INIT = _constructor(_DECODER_NATIVE, _REVIEWED[0],
+                                       {'_select_dsv4_attn_cls': _fp4_attention,
+                                        'DeepseekV4MoE': HcuV41EplbMoE,
+                                        'Engram': HcuV41PcpEngram})
+
+
+class HcuV41Fp4EplbDecoderLayer(native.DeepseekV4DecoderLayer):
+    __init__ = _FP4_EPLB_DECODER_INIT
+
+
+_FP4_EPLB_BACKBONE_INIT = _constructor(_BACKBONE_NATIVE, _REVIEWED[1],
+                                        {'DeepseekV4DecoderLayer': HcuV41Fp4EplbDecoderLayer})
+
+
+class HcuV41Fp4EplbBackbone(HcuV41PcpBackbone):
+    __init__ = _FP4_EPLB_BACKBONE_INIT
+
+
+class HcuV41Fp4EplbLLM(native.DeepseekV41LLMForCausalLM):
+    model_cls = HcuV41Fp4EplbBackbone
+
+
+_FP4_EPLB_OUTER_INIT = _constructor(_OUTER_NATIVE, _REVIEWED[2],
+                                     {'DeepseekV41LLMForCausalLM': HcuV41Fp4EplbLLM})
