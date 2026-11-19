@@ -11,7 +11,15 @@ from hcu_adapter.kernels import pcp_fork
 from hcu_vllm_das import pcp_q_rope, v41_pcp
 
 
-def test_q_rope_policy(monkeypatch):
+@pytest.fixture
+def isolated_q_rope(monkeypatch):
+    for name in ("_q_rope_provider", "_q_rope_binding", "_q_rope_failure"):
+        monkeypatch.setattr(pcp_fork, name, None)
+    monkeypatch.setenv("HCU_VLLM_PCP_IMPL", "native")
+    monkeypatch.setenv("HCU_DISABLE_OPS", "")
+
+
+def test_q_rope_policy(monkeypatch, isolated_q_rope):
     ops = {}
     monkeypatch.setattr(hcu_config, "load", lambda: {"ops": ops, "overrides": {}})
     monkeypatch.setenv("HCU_DISABLE_OPS", "")
@@ -66,11 +74,11 @@ def test_initializer_warms_once_and_reuses_only_the_original_table(monkeypatch):
 
 
 @pytest.mark.parametrize("eager", [True, False])
-def test_plugin_binds_provider_for_owned_eager_attention(monkeypatch, eager):
+def test_plugin_binds_provider_for_owned_eager_attention(monkeypatch, isolated_q_rope, eager):
     from vllm.models.deepseek_v41.amd.rocm import DeepseekV41ROCMAiterMLAAttention
 
     monkeypatch.setattr(v41_pcp, "_bound", False)
-    for field in ("_reference", "_engram_validator", "_forward_context_resolver", "_q_rope_provider"):
+    for field in ("_reference", "_engram_validator", "_forward_context_resolver"):
         monkeypatch.setattr(pcp_fork, field, None)
     monkeypatch.setattr(hcu_config, "load", lambda: {
         "ops": {pcp_fork.Q_ROPE_OP: "hcu"}, "overrides": {},
@@ -91,8 +99,9 @@ def test_plugin_binds_provider_for_owned_eager_attention(monkeypatch, eager):
 
 @pytest.mark.parametrize("route", [
     "prefill", "stock", "padding", "mixed", "profile", "unsupported", "cold",
+    "drift-before-profile", "drift-after-profile",
 ])
-def test_owned_prefill_routes_q_and_keeps_native_kv(monkeypatch, route):
+def test_owned_prefill_routes_q_and_keeps_native_kv(monkeypatch, isolated_q_rope, route):
     from vllm import distributed
     from vllm.models.deepseek_v41.amd.rocm import DeepseekV41ROCMAiterMLAAttention
 
@@ -165,11 +174,39 @@ def test_owned_prefill_routes_q_and_keeps_native_kv(monkeypatch, route):
     attn.kv_mxfp8 = False
     attn.kv_cache_torch_dtype = torch.uint8
 
-    if route in ("prefill", "mixed", "profile", "unsupported"):
+    drift = route.startswith("drift-")
+    if drift:
+        from hcu_adapter.bridges import vllm_pcp
+
+        monkeypatch.setattr(hcu_config, "load", lambda: {
+            "ops": {pcp_fork.Q_ROPE_OP: "hcu"}, "overrides": {},
+        })
+        monkeypatch.setattr(vllm_pcp, "_failure", None)
+        monkeypatch.setattr(vllm_pcp, "_publication", None)
+        monkeypatch.setattr(vllm_pcp, "_lifecycle", vllm_pcp.ProcessLocalLifecycle(
+            runtime_action="vllm-pcp", error_type=vllm_pcp.PcpCompatibilityError))
+        monkeypatch.setattr(vllm_pcp.registry, "register", lambda **kwargs: None)
+        assert vllm_pcp.install()
+        pcp_fork.set_q_rope_provider(initialize)
+        vllm_pcp.require_healthy()
+
+    if route in ("prefill", "mixed", "profile", "unsupported", "drift-after-profile"):
         assert attn._fused_qnorm_rope_kv_insert(q, kv, positions, None) is native_q
         assert calls == ["initialize", "native"]
         assert torch.count_nonzero(q) == 0
         calls.clear()
+
+    if drift:
+        monkeypatch.setenv("HCU_DISABLE_OPS", pcp_fork.Q_ROPE_OP)
+        with pytest.raises(vllm_pcp.PcpCompatibilityError, match="restart process"):
+            vllm_pcp.require_healthy()
+        monkeypatch.setenv("HCU_DISABLE_OPS", "")
+        with pytest.raises(vllm_pcp.PcpCompatibilityError, match="restart process"):
+            vllm_pcp.require_healthy()
+        with pytest.raises(pcp_fork.PcpAttentionError, match="restart process"):
+            attn._fused_qnorm_rope_kv_insert(q, kv, positions, metadata)
+        assert calls == []
+        return
 
     result = attn._fused_qnorm_rope_kv_insert(q, kv, positions, metadata)
     if route == "prefill":
@@ -183,33 +220,45 @@ def test_owned_prefill_routes_q_and_keeps_native_kv(monkeypatch, route):
         assert torch.count_nonzero(q) == 0
 
 
-@pytest.mark.parametrize("tokens", [1, 128, 4096])
-def test_device_matches_native_q_only(tokens):
-    if torch.version.hip is None or not torch.cuda.is_available():
-        pytest.skip("requires gfx938 and the vLLM native Q-only operator")
-    device = torch.device("cuda", torch.cuda.current_device())
-    if not pcp_q_rope._supported_device(device):
-        pytest.skip("requires gfx938")
+@pytest.mark.parametrize("change", ["policy", "provider"])
+def test_plugin_owner_latches_q_rope_binding_drift(monkeypatch, isolated_q_rope, change):
+    from hcu_adapter.extensions import ExtensionCommitError, ExtensionContext
+    from hcu_vllm_das import v41_pcp_activation as activation
+    from vllm import envs
+    from vllm.model_executor.models import ModelRegistry
 
-    from vllm.platforms import current_platform
+    monkeypatch.setattr(v41_pcp, "_bound", False)
+    for field in ("_reference", "_engram_validator", "_forward_context_resolver"):
+        monkeypatch.setattr(pcp_fork, field, None)
+    for field, value in (("_state", None), ("_failure", None), ("_publishing", False)):
+        monkeypatch.setattr(activation, field, value)
+    monkeypatch.setattr(activation, "_is_hcu", lambda: True)
+    monkeypatch.setattr(activation, "_install_profile_worker", lambda: None)
+    monkeypatch.setattr(hcu_config, "load", lambda: {
+        "ops": {pcp_fork.Q_ROPE_OP: "hcu"}, "overrides": {},
+    })
+    monkeypatch.setenv("VLLM_HCU_DSV41_PCP_ATTENTION", "1")
+    monkeypatch.setenv("VLLM_HCU_DSV41_ENGRAM_HOST", "0")
+    monkeypatch.setenv("HCU_VLLM_FP4_INDEXER_IMPL", "stock")
+    monkeypatch.setattr(ModelRegistry, "models", dict(ModelRegistry.models))
+    monkeypatch.setattr(envs, "environment_variables", dict(envs.environment_variables))
+    envs.environment_variables.pop(activation._FACTOR, None)
 
-    current_platform.import_kernels()
-    with torch.inference_mode():
-        generator = torch.Generator(device=device).manual_seed(33)
-        q = torch.randn(tokens, 64, 512, dtype=torch.bfloat16, device=device, generator=generator)
-        positions = torch.arange(tokens, dtype=torch.int64, device=device)
-        angles = torch.randn(tokens, 32, device=device, generator=generator)
-        cos_sin = torch.cat((angles.cos(), angles.sin()), dim=-1)
-        kv = torch.empty(tokens, 512, dtype=q.dtype, device=device)
-        cache = torch.empty(1, 64 * 584, dtype=torch.uint8, device=device)
-        slots = positions[:0]
-        native = torch.ops._C.fused_deepseek_v4_qnorm_rope_kv_rope_quant_insert(
-            q, kv, cache, slots, positions, cos_sin, 64, 1e-6, 64,
-            False, False, True, False,
-        )
-        prepare = pcp_q_rope.initialize(cos_sin)
-        assert prepare is not None
-        rotate = prepare(q, positions, cos_sin)
-        assert rotate is not None
-        rotate()
-        torch.testing.assert_close(q, native, rtol=0, atol=0)
+    context = ExtensionContext("0.5.22", "0.33.0")
+    activation.activate_extension(context)
+    assert activation.policy_factor()[-1] is True
+    assert pcp_fork._q_rope_provider is pcp_q_rope.initialize
+    if change == "policy":
+        monkeypatch.setenv("HCU_DISABLE_OPS", pcp_fork.Q_ROPE_OP)
+        assert activation.policy_factor()[-1] is False
+    else:
+        monkeypatch.setattr(pcp_fork, "_q_rope_provider", lambda cache: None)
+    with pytest.raises(ExtensionCommitError, match="restart process"):
+        activation.check_health()
+
+    monkeypatch.setenv("HCU_DISABLE_OPS", "")
+    monkeypatch.setattr(pcp_fork, "_q_rope_provider", pcp_q_rope.initialize)
+    with pytest.raises(ExtensionCommitError, match="restart process"):
+        activation.activate_extension(context)
+    with pytest.raises(pcp_fork.PcpAttentionError, match="restart process"):
+        pcp_fork.require_q_rope_healthy()

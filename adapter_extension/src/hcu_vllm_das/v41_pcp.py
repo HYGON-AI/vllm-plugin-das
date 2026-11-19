@@ -90,6 +90,8 @@ def bind_adapter_classes() -> None:
         from .pcp_q_rope import initialize
 
         pcp_fork.set_q_rope_provider(initialize)
+    elif hasattr(pcp_fork, "require_q_rope_healthy"):
+        pcp_fork.set_q_rope_provider(None)
     _bound = True
 
 

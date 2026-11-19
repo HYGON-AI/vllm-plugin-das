@@ -69,9 +69,16 @@ def _install_profile_worker():
     register_compatibility()
 
 
+def _q_rope_policy():
+    from hcu_adapter.kernels import pcp_fork
+
+    selected = getattr(pcp_fork, 'q_rope_selected', None)
+    return selected is not None and selected()
+
+
 def policy_factor():
     policy = (pcp_enabled(), host_enabled(), True) if fp4_selected() else (pcp_enabled(), host_enabled())
-    return (*policy, _profile_policy()) if pcp_enabled() else policy
+    return (*policy, _profile_policy(), _q_rope_policy()) if pcp_enabled() else policy
 
 
 def _fatal(message):
@@ -93,6 +100,12 @@ def _adapter_bindings_valid():
         return True
     if not (_state['enabled'] or _state['host'] or _state.get('fp4', False)):
         return True
+    check_q_rope = getattr(pcp_fork, 'require_q_rope_healthy', None)
+    if check_q_rope is not None:
+        try:
+            check_q_rope()
+        except pcp_fork.PcpAttentionError:
+            return False
     if pcp_fork.bound_reference() is None:
         return False
     if (_state['enabled'] or _state['host']) and pcp_fork.bound_engram_validator() is None:
@@ -119,7 +132,8 @@ def check_health():
                     or (_state['enabled'] and _profile_policy() != _state['profile_worker'])
                     or fp4_selected() != _state.get('fp4', False)
                     or envs.environment_variables.get(_FACTOR) is not policy_factor
-                    or not _adapter_bindings_valid()):
+                    or not _adapter_bindings_valid()
+                    or (_state['enabled'] and _q_rope_policy() != _state['q_rope'])):
                 _fatal('V41 PCP ownership/policy changed; restart process')
             loaded = sys.modules.get('hcu_vllm_das.models.v41_pcp')
             if loaded is not None:
@@ -181,6 +195,7 @@ def activate_extension(context):
             envs.environment_variables[_FACTOR] = policy_factor
             _state = dict(enabled=pcp_selected, host=host_selected, fp4=fp4,
                           profile_worker=profile_worker,
+                          q_rope=_q_rope_policy() if pcp_selected else False,
                           registry=ModelRegistry, entry=entry, register=register)
             check_health()
         except BaseException as error:
