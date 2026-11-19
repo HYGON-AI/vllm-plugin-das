@@ -419,9 +419,23 @@ def apply_to_module(module: ModuleType) -> bool:
             num_actual_reqs = is_prefilling.numel()
             query_offsets = query_start_loc_cpu[: num_actual_reqs + 1].numpy()
             query_lens = query_offsets[1:] - query_offsets[:-1]
+            decode_mask = ~is_prefilling.numpy()
             multi_token_decodes = (
                 query_lens > self.reorder_batch_threshold
-            ) & ~is_prefilling.numpy()
+            ) & decode_mask
+            if (
+                self.query_len_support == mla.QueryLenSupport.UNIFORM
+                and query_lens.size > 0
+                and decode_mask.any()
+                and (query_lens != query_lens[0]).any()
+            ):
+                num_decodes = mla.split_decodes_and_prefills(
+                    common_attn_metadata,
+                    decode_threshold=self.reorder_batch_threshold,
+                    require_uniform=True,
+                    treat_short_extends_as_decodes=not self.use_pcp,
+                )[0]
+                multi_token_decodes[num_decodes:] |= decode_mask[num_decodes:]
             if multi_token_decodes.any():
                 common_attn_metadata = copy.copy(common_attn_metadata)
                 common_attn_metadata.seq_lens_cpu_upper_bound = (
