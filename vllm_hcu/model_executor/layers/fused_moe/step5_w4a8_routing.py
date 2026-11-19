@@ -43,6 +43,7 @@ def _block_prefixes(
     NB: tl.constexpr,
     RB: tl.constexpr,
     EH: tl.constexpr,
+    ALIGN: tl.constexpr,
 ):
     r = tl.arange(0, RB)
     e = tl.arange(0, EH)
@@ -52,7 +53,7 @@ def _block_prefixes(
         other=0,
     )
     counts = tl.sum(values, axis=0)
-    padded = tl.cdiv(counts, 64) * 64
+    padded = tl.cdiv(counts, ALIGN) * ALIGN
     starts = tl.cumsum(padded, axis=0) - padded
     block_starts = starts[None, :] + tl.cumsum(values, axis=0) - values
     tl.store(
@@ -113,16 +114,31 @@ def _gather_tokens(
                 tl.store(out_scale + pos, s)
 
 
-def permute64(a, scale, ids, mapping, experts, out):
+def permute_aligned(a, scale, ids, mapping, experts, out, alignment=64):
+    """Expert-contiguous permutation padded to `alignment` rows per expert.
+
+    Native Step5 uses 64; the DeepGEMM MODE1006 candidate needs 128 so the
+    kernel's on-device 16/32/64/128 tile selection sees aligned segments.
+    Padding rows carry ids=-1 and never affect real-token results.
+    """
+    assert alignment in (32, 64, 128, 256)
     assert a.is_contiguous() and ids.is_contiguous() and mapping.is_contiguous()
     assert scale.is_contiguous() and scale.shape[1] == 1 and a.dtype == torch.int8
     routes = ids.numel()
     groups = triton.cdiv(routes, 1024)
-    bound = padded_route_rows(ids.shape[0], ids.shape[1], experts)
+    bound = padded_route_rows(
+        ids.shape[0], ids.shape[1], experts, alignment=alignment
+    )
     assert out.shape == (bound, a.shape[1])
     partial = torch.empty((groups, experts), device=a.device, dtype=torch.int32)
     prefix = torch.empty_like(partial)
-    indices = torch.empty((bound,), device=a.device, dtype=torch.int32)
+    # Every row must carry a valid expert id or -1.  The histogram kernel
+    # initializes only its own coverage; the MODE1006 consumer indexes the
+    # packed weights by m_indices[block] and has no upper-bound check, so an
+    # uninitialized tail can produce an out-of-range expert pointer.
+    indices = torch.full(
+        (bound,), -1, device=a.device, dtype=torch.int32
+    )
     inverse = torch.empty_like(ids)
     scales = torch.empty((bound, 1), device=a.device, dtype=torch.float32)
     _histogram[(groups,)](
@@ -147,6 +163,7 @@ def permute64(a, scale, ids, mapping, experts, out):
         groups,
         triton.next_power_of_2(groups),
         triton.next_power_of_2(experts),
+        alignment,
         num_warps=4,
     )
     _assign_positions[(groups, experts)](
@@ -172,4 +189,8 @@ def permute64(a, scale, ids, mapping, experts, out):
         triton.next_power_of_2(a.shape[1]),
         num_warps=4,
     )
-    return out, scales, indices, inverse, 64
+    return out, scales, indices, inverse, alignment
+
+
+def permute64(a, scale, ids, mapping, experts, out):
+    return permute_aligned(a, scale, ids, mapping, experts, out, alignment=64)

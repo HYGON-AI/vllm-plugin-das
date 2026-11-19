@@ -192,9 +192,11 @@ def test_numeric_kernels_are_unchanged_by_deduplication():
             "routing.py",
             "11cc39a92afde8b0923ae713306b44d3363e9c96f722cf01f52390c05dccacd4",
         ),
+        # Parameterized by ALIGN for the opt-in MODE1006 128-row path; the
+        # digest freezes the reviewed alignment-aware version.
         "_block_prefixes": (
             "routing.py",
-            "8d3836416ee3e925e2d4e417ef0b410e9f119f5c6fac92f4b123be9a08032d6c",
+            "e6949a5795befb579feff94f1f5544a94cf373941955398a1de86c3f009145b5",
         ),
         "_assign_positions": (
             "routing.py",
@@ -214,3 +216,31 @@ def test_numeric_kernels_are_unchanged_by_deduplication():
                 ).hexdigest()
     for name, (filename, digest) in expected.items():
         assert found[name] == digest, (filename, name)
+
+
+def test_block_prefixes_alignment_is_parameterized_and_native_default_64():
+    """The ALIGN parameter is intentional; the native default stays 64."""
+    source = (PLUGIN / "step5_w4a8_routing.py").read_text(encoding="utf8")
+    tree = ast.parse(source)
+    node = next(
+        n
+        for n in tree.body
+        if isinstance(n, ast.FunctionDef) and n.name == "_block_prefixes"
+    )
+    args = {arg.arg: arg.annotation for arg in node.args.args}
+    assert "ALIGN" in args
+    annotation = args["ALIGN"]
+    assert isinstance(annotation, ast.Attribute)
+    assert isinstance(annotation.value, ast.Name)
+    assert annotation.value.id == "tl"
+    assert annotation.attr == "constexpr"
+    body = ast.unparse(node)
+    assert "tl.cdiv(counts, ALIGN) * ALIGN" in body
+    assert "tl.cdiv(counts, 64) * 64" not in body
+    # Native path: permute64 must still request 64-row segments.
+    permute64 = next(
+        n
+        for n in tree.body
+        if isinstance(n, ast.FunctionDef) and n.name == "permute64"
+    )
+    assert "alignment=64" in ast.unparse(permute64)

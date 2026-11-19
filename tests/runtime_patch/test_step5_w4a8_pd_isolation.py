@@ -183,8 +183,9 @@ def test_slimquant_native_branch_exits_before_generic_layout():
 
 
 @pytest.mark.parametrize("prefill", [False, True])
+@pytest.mark.parametrize("modeswap", [False, True])
 @pytest.mark.parametrize("rows", [1, 32, 256, 4096, 16384])
-def test_phase_specific_workspace_layout_is_preserved(prefill, rows):
+def test_phase_specific_workspace_layout_is_preserved(prefill, rows, modeswap):
     tree = ast.parse((PLUGIN / "step5_w4a8.py").read_text(encoding="utf8"))
     original = next(
         n
@@ -208,6 +209,7 @@ def test_phase_specific_workspace_layout_is_preserved(prefill, rows):
     namespace = {
         "Base": Base,
         "is_prefill": prefill,
+        "use_modeswap": modeswap,
         "padded_route_rows": common.padded_route_rows,
         "triton": NS(cdiv=lambda a, b: (a + b - 1) // b),
     }
@@ -225,7 +227,9 @@ def test_phase_specific_workspace_layout_is_preserved(prefill, rows):
     if not prefill:
         assert actual == ((1, 2), (3, 4), (5, 6))
     else:
-        aligned = common.padded_route_rows(rows, 8, 44)
+        aligned = common.padded_route_rows(
+            rows, 8, 44, alignment=128 if modeswap else 64
+        )
         elements = max(aligned * 4096 // 2, rows * 4096)
         assert actual == (
             ((elements + 4095) // 4096, 4096),
