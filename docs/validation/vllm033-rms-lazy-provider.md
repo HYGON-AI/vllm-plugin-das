@@ -102,3 +102,64 @@ with `VLLM_TARGET_ROOT` naming the actual Core checkout. In the admitted install
 HCU stack, retain the original device suites:
 `HCU_VLLM033_RMSNORM_LIVE=1 pytest tests/vllm033/test_rms_norm_hcu.py
  tests/vllm033/test_rms_norm_composed_hcu.py`.
+
+
+## Current v0.33 integration on gfx938 (R227)
+
+The prospective Plugin merge `d659c2e516e7ef0df1fcefe17c7ae188f5d38a68`
+combines PR head `93dcf621` with current v0.33 target `c0e608de` without
+conflicts. The RMS runtime and three fork regressions retain their previous bytes.
+Adapter is proposed #97 head `6eeea954`; it is not merged main. Core remains
+0.33.0+das.c440c08.dtk2610.torch2130.gfx936gfx938.base93. Source-bound wheels
+were installed in a separate physical prefix, with 18 complete original
+RECORDs and source/wheel/installed payload identities verified before and after.
+FlashAttention was neither modified nor rebuilt.
+
+Full unchanged Plugin portable selection: **1360 passed**, zero failures,
+errors or skips; 46 HCU cases were deselected by the original portable marker.
+Eleven separate public-selector subprocesses pass. Eight affected Adapter
+contract files pass **244 cases**, including real metadata discovery/spawn.
+All processes reached successful terminal states; this is not log-only evidence.
+Native components pass **30 RMS/compiled/Graph** and **43 Adapter native-pair**
+cases. A real required RMS owner with the official Worker/FULL Graph manager
+passes six changing-input GPU replays across FP16/BF16 and four sticky refusals
+before pending sends or replay. Its runner/PP doubles do not qualify real PP.
+
+The separate Qwen3-8B candidate-only cohort uses TP1, BF16 weights,
+FLASH_ATTN, `fp8_e4m3`, block64, context8192, maxseq8/batched-tokens1024,
+memory0.6, explicit RMS switches, default compilation/Graph and prefix caching.
+The original checkpoint is double-read sealed; post-run checkpoint and all
+18 RECORD checks pass. Scorer/request/controller sources are sealed as well.
+
+| Original check | Result |
+| --- | --- |
+| Arithmetic at concurrency1/4/8 | 13/13 |
+| Repeated-prefix strict output | 3/3; +1280 prefix-hit tokens |
+| Profiled strict output | 1/1 |
+| HumanEval0-31 raw | 20/32 |
+| Existing format normalization | 31/32 |
+| Length-limited responses | 0 |
+| Completion tokens | 4159 |
+| Owned processes after shutdown | 0 |
+| Original15s grace / frontend exit | within grace / exit0, no forced cleanup |
+| Clean native lifecycle | FAIL: nanobind leaks and shutdown EngineDeadError |
+
+HumanEval/26 remains an actual semantic failure after normalization: the
+completion keeps one copy of repeated values instead of removing every value
+occurring more than once. Do not describe it as formatting. No same-installation
+current-target baseline was run, so these scores establish neither regression
+nor numerical equivalence; prior gfx936 scores remain under their old sources.
+
+Before/after worker reports agree: genuine gfx938/BW1100, Adapter Worker,
+official MRV2 runner, 36 HCU Flash implementations and 145 RMS OOT instances.
+The native trace records the E4M3 uint8 cache writer, Flash prefill, paged decode
+and three hipGraphLaunch calls. Default compiled RMS deliberately delegates to
+Core IR: the trace contains fused Triton RMS kernels, not a LightOp execution
+claim. Eager LightOp is qualified only by its separate component evidence.
+
+Local immutable evidence root:
+`evidence/rms-owner-current-combination-r227/`; `cpu-state.json`, native JUnits,
+`model-audit.json`, original model logs, requests/responses/scoring, profile,
+shutdown and post-seal receipts retain their scopes. These are local evidence,
+not a new remote CI qualification or independent approval. Keep Draft pending
+matched-baseline precision attribution and the original lifecycle gates.
