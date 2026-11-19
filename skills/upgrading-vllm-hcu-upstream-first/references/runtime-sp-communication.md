@@ -259,3 +259,35 @@ rows by name or assign a later call to the layer encoded in that shared name.
 Its success does not qualify a device trace, SP collective, trained checkpoint,
 HumanEval, normal shutdown or gfx836 support. Record the exact runtime/source
 and archive identities when the original failed cohort can actually be traced.
+
+## Projection compiler and cached replay boundaries
+
+Compile the real QKV, Row and MergedColumn OOT classes with the target Core;
+projection doubles can hide unsupported process/group checks. Keep the original
+GEMM, loaders and arithmetic visible to Core. Narrow data-producing mask/layout
+and collective custom ops can contain Python ownership checks while their fake
+rules describe exact shapes and non-aliasing outputs. Keep the guarded result
+on the GEMM dependency path. Pass device masks as explicit tensor arguments:
+reading them only inside an opaque op hides their addresses from the compiler
+and can retain capture-time storage after the outer batch context changes.
+Verify the captured FX graph with no Python SP batch and with replacement mask
+storage, in addition to in-place mask-value changes. An unused output-free guard
+can be eliminated. Preserve rejection before GEMM even when the supplied token
+shape is invalid.
+Without a batch mask, a functional preparation op may need a copy; record that
+cost rather than returning an alias that violates its declared schema.
+
+Python custom-op checks run during capture, not cached CUDA Graph replay. Bind
+model/group and concrete projection ownership into required capability health
+and verify Adapter's actual Worker boundary before PP wait, offload and FULL
+replay. A public platform hook alone is bypassed by that path. Refuse missing
+Adapter capabilities rather than freezing PID, skipping health, disabling
+compilation or repairing owners during forward. Keep model health registrations
+process-local, weakly owned and serialized; an expired owner must refuse replay.
+
+Separate eager-backend Dynamo, AOT functionalization, default CPU Inductor,
+installed-wheel behavior and actual device/default-serving compilation. Exercise
+changed mask values at stable addresses, NaN padding, owner drift and real fork.
+A CPU Graph-manager test with a replay double qualifies the host boundary only;
+native Graph, trained-model HumanEval, numerics, performance and lifecycle gates
+remain separate. See the [fullgraph validation record](../../../docs/validation/vllm033-runtime-sp-fullgraph.md).

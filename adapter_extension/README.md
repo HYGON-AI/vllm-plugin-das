@@ -93,6 +93,8 @@ operator-level capabilities.
 `das_hcu_runtime_sp_communication` supplies the explicitly requested
 `runtime-sp-communication` capability. It requires Adapter's public
 communicator-selector seam and an exact process-local capability health binding.
+It also requires Adapter's required-owner boundary before cached FULL Graph
+replay. A selector-only Adapter does not supply that boundary and is refused.
 With the existing `additional_config['hcu']['enable_custom_sp']` boolean, the
 Plugin subclass passes EP admission before the official communicator constructs
 its manager. Backend selection, dispatch/combine and destruction stay official.
@@ -112,6 +114,15 @@ shared experts select replicated weights before allocation. A model-local bridge
 passes early SP policy and a narrow MoE padding runner. Official inner loops,
 loading, routing and logits remain inherited. No ModelRegistry entry enables
 these candidates automatically.
+
+Projection layout/mask and collective operations use Core's public custom-op
+registration, with ownership checks before official GEMM. Enabled model
+boundaries bind model/projection health into the required capability so Adapter
+checks it before replay, which does not execute Python custom-op bodies.
+Device masks are explicit tensor arguments so compiled graphs track them across
+batch changes rather than retaining a hidden capture-time context tensor.
+CPU compiler coverage and remaining gates are recorded in the
+[fullgraph follow-up](../docs/validation/vllm033-runtime-sp-fullgraph.md).
 
 These are **components and model-boundary candidates**. Complete synthetic
 models retain an ordinary-TP numerical gate failure; trained checkpoint,

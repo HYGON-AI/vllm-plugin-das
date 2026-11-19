@@ -15,7 +15,9 @@ from vllm.sequence import IntermediateTensors
 
 from .runtime_sp_attention import (
     check_attention_layers, install_attention_layers, runtime_sp_model_construction,
+    _check_group, _owner_fields,
 )
+from .runtime_sp_activation import register_model_health
 from .runtime_sp_batch import RuntimeSPBatch, _BATCH_KEY
 from .runtime_sp_moe import check_moe_factory_policy, install_moe_factory_policy
 from .runtime_sp_policy import custom_sp_requested
@@ -36,6 +38,13 @@ class RuntimeSPModelBoundary:
             self._runtime_sp_size = group.world_size
             self._runtime_sp_rank = group.rank_in_group
             self._runtime_sp_pid = os.getpid()
+            self._runtime_sp_projection_owners = tuple(
+                (name, layer, type(layer), _owner_fields(layer))
+                for name, layer in self.named_modules()
+                if getattr(layer, '_runtime_sp', False)
+                or getattr(layer, '_runtime_sp_mlp', False)
+            )
+            register_model_health(self)
         else:
             super().__init__(vllm_config=vllm_config, prefix=prefix)
         self._runtime_sp_enabled = enabled
@@ -48,6 +57,18 @@ class RuntimeSPModelBoundary:
             raise RuntimeError("runtime SP model process or TP ownership changed")
         check_attention_layers()
         check_moe_factory_policy()
+        for name, layer, layer_type, fields in self._runtime_sp_projection_owners:
+            if (self.get_submodule(name) is not layer or type(layer) is not layer_type
+                    or _owner_fields(layer) != fields):
+                raise RuntimeError("runtime SP projection ownership changed")
+            _check_group(layer)
+        # Registry checks can execute Python callbacks; recheck process/group
+        # after them too, before delegating to an already captured model graph.
+        if (os.getpid() != self._runtime_sp_pid or get_tp_group() is not group
+                or group.world_size != self._runtime_sp_size
+                or group.rank_in_group != self._runtime_sp_rank
+                or os.getpid() != self._runtime_sp_pid):
+            raise RuntimeError("runtime SP model process or TP ownership changed")
         return group
 
     def forward(self, input_ids, positions, intermediate_tensors=None, inputs_embeds=None):

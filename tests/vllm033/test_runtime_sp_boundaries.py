@@ -81,6 +81,7 @@ def test_official_outer_and_inner_loops_keep_full_embedding_and_pp_boundaries(
     model._runtime_sp_enabled = True
     model._runtime_sp_group, model._runtime_sp_size = group, size
     model._runtime_sp_rank, model._runtime_sp_pid = rank, os.getpid()
+    model._runtime_sp_projection_owners = ()
     out_hidden = masked_x + 2
     out_residual = 3 * masked_x + (0 if first else masked_residual)
     expected = [out_hidden + out_residual] if last else [out_hidden, out_residual]

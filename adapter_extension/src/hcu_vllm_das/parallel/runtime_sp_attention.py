@@ -19,7 +19,8 @@ from vllm.distributed import get_tp_group
 from vllm.model_executor.layers.linear import (
     MergedColumnParallelLinear, QKVParallelLinear, RowParallelLinear,
 )
-from .runtime_sp_batch import current_sp_batch, mask_local_padding
+from vllm.utils.torch_utils import direct_register_custom_op
+from .runtime_sp_batch import current_sp_batch
 
 _construction = ContextVar("hcu_runtime_sp_attention_construction", default=False)
 _mlp_construction = ContextVar("hcu_runtime_sp_mlp_construction", default=False)
@@ -137,14 +138,102 @@ def _exchange(group, send):
 
 
 def _check_group(layer):
-    if os.getpid() != layer._runtime_sp_pid:
-        raise RuntimeError("runtime SP attention inherited across fork; use spawn")
-    group = get_tp_group()
+    group = _check_group_fields(*_owner_fields(layer))
     if group is not layer._runtime_sp_group:
         raise RuntimeError("runtime SP attention TP group ownership changed")
-    if group.world_size != layer._runtime_sp_size or group.rank_in_group != layer._runtime_sp_rank:
+    return group
+
+
+def _owner_fields(layer):
+    return (layer._runtime_sp_pid, layer._runtime_sp_owner_id,
+            layer._runtime_sp_size, layer._runtime_sp_rank)
+
+
+def _check_group_fields(pid, owner_id, size, rank):
+    if os.getpid() != pid:
+        raise RuntimeError("runtime SP attention inherited across fork; use spawn")
+    group = get_tp_group()
+    if os.getpid() != pid:
+        raise RuntimeError("runtime SP attention inherited across fork; use spawn")
+    if id(group) != owner_id:
+        raise RuntimeError("runtime SP attention TP group ownership changed")
+    if group.world_size != size or group.rank_in_group != rank:
         raise RuntimeError("runtime SP attention TP geometry changed")
     return group
+
+
+def _masked_input(input_, padding):
+    if padding is None:
+        return input_.clone(memory_format=torch.contiguous_format)
+    if input_.ndim != 2 or input_.shape[0] != padding.shape[0]:
+        raise ValueError("runtime SP projection received an invalid token layout")
+    return input_.masked_fill(padding[:, None], 0)
+
+
+def _prepare_input(input_: torch.Tensor, padding: torch.Tensor | None,
+                   pid: int, owner_id: int, size: int, rank: int) -> torch.Tensor:
+    # This data-producing op precedes the official GEMM. Its guard cannot be
+    # removed as an unused, output-free Python side effect during compilation.
+    _check_group_fields(pid, owner_id, size, rank)
+    return _masked_input(input_, padding)
+
+
+def _prepare_input_fake(input_: torch.Tensor, padding: torch.Tensor | None,
+                        pid: int, owner_id: int, size: int, rank: int) -> torch.Tensor:
+    return input_.new_empty(input_.shape)
+
+
+def _collective(input_: torch.Tensor, padding: torch.Tensor | None, pid: int, owner_id: int,
+                size: int, rank: int, kind: str) -> torch.Tensor:
+    group = _check_group_fields(pid, owner_id, size, rank)
+    if kind == 'exchange':
+        return _exchange(group, input_) if size > 1 else input_.clone()
+    if kind == 'gather':
+        return group.all_gather(input_, dim=0) if size > 1 else input_.clone()
+    if kind == 'scatter':
+        result = group.reduce_scatter(input_, dim=0) if size > 1 else input_
+        return _masked_input(result, padding)
+    raise ValueError("unknown runtime SP collective")
+
+
+def _collective_fake(input_: torch.Tensor, padding: torch.Tensor | None, pid: int, owner_id: int,
+                     size: int, rank: int, kind: str) -> torch.Tensor:
+    shape = list(input_.shape)
+    if kind == 'gather':
+        shape[0] *= size
+    elif kind == 'scatter':
+        shape[0] //= size
+    elif kind != 'exchange':
+        raise ValueError("unknown runtime SP collective")
+    return input_.new_empty(shape)
+
+
+# Keep only layout/ownership/collective Python behind the public Core custom-op
+# seam. Core still compiles the original quantization method and GEMM normally.
+_sp_lib = torch.library.Library('hcu_vllm_das_sp', 'FRAGMENT')
+for _name, _impl, _fake in (
+    ('prepare_input', _prepare_input, _prepare_input_fake),
+    ('collective', _collective, _collective_fake),
+):
+    direct_register_custom_op(_name, _impl, fake_impl=_fake,
+                              target_lib=_sp_lib, dispatch_key='CUDA')
+    _sp_lib.impl(_name, _impl, dispatch_key='CPU')
+
+
+def _prepared(layer, input_, global_layout=False):
+    # Masks must be graph tensor inputs, not hidden context reads inside an
+    # opaque op: Core's graph wrapper must track/copy them on later replays.
+    batch = current_sp_batch()
+    padding = None if batch is None else (
+        batch.global_padding if global_layout else batch.local_padding)
+    return torch.ops.hcu_vllm_das_sp.prepare_input(
+        input_, padding, *_owner_fields(layer))
+
+
+def _communicate(layer, input_, kind):
+    batch = current_sp_batch() if kind == 'scatter' else None
+    padding = None if batch is None else batch.local_padding
+    return torch.ops.hcu_vllm_das_sp.collective(input_, padding, *_owner_fields(layer), kind)
 
 
 def _bind(signature, self, args, kwargs):
@@ -157,6 +246,7 @@ def _capture_group(layer):
     group = get_tp_group()
     layer._runtime_sp_pid = os.getpid()
     layer._runtime_sp_group = group
+    layer._runtime_sp_owner_id = id(group)
     layer._runtime_sp_size = group.world_size
     layer._runtime_sp_rank = group.rank_in_group
     return group
@@ -181,13 +271,13 @@ class RuntimeSPQKVParallelLinear(QKVParallelLinear):
     def forward(self, input_):
         if not self._runtime_sp:
             return super().forward(input_)
-        group = _check_group(self)
+        input_ = _prepared(self, input_)
         if input_.ndim != 2:
             raise ValueError("runtime SP QKV expects a two-dimensional local token tensor")
-        result = super().forward(mask_local_padding(input_))
+        result = super().forward(input_)
         output, bias = result if self.return_bias else (result, None)
         send = self._runtime_sp_layout.pack_qkv(output)
-        recv = _exchange(group, send)
+        recv = _communicate(self, send, 'exchange')
         output = recv.reshape(recv.shape[0] * recv.shape[1], recv.shape[2])
         if bias is not None:
             bias = self._runtime_sp_layout.local_bias(bias)
@@ -220,39 +310,26 @@ class RuntimeSPRowParallelLinear(RowParallelLinear):
 
     def forward(self, input_):
         if self._runtime_sp_mlp:
-            group = _check_group(self)
             if not self._runtime_sp_mlp_gather:
-                return super().forward(mask_local_padding(input_))
-            if input_.ndim != 2 or input_.shape[0] % group.world_size:
+                return super().forward(_prepared(self, input_))
+            input_ = _prepared(self, input_, global_layout=True)
+            if input_.ndim != 2 or input_.shape[0] % self._runtime_sp_size:
                 raise ValueError("runtime SP dense MLP requires gathered padded tokens")
-            batch = current_sp_batch()
-            if batch is not None:
-                if input_.shape[0] != batch.padded_tokens:
-                    raise ValueError("runtime SP dense MLP received an invalid gathered layout")
-                input_ = input_.masked_fill(batch.global_padding[:, None], 0)
             result = super().forward(input_)
             output, bias = result if self.return_bias else (result, None)
-            if group.world_size > 1:
-                output = group.reduce_scatter(output, dim=0)
-            output = mask_local_padding(output)
+            output = _communicate(self, output, 'scatter')
             return (output, bias) if self.return_bias else output
         if not self._runtime_sp:
             return super().forward(input_)
-        group = _check_group(self)
-        if input_.ndim != 2 or input_.shape[-1] * group.world_size != self.input_size:
+        input_ = _prepared(self, input_, global_layout=True)
+        if input_.ndim != 2 or input_.shape[-1] * self._runtime_sp_size != self.input_size:
             raise ValueError("runtime SP output projection expects head-sharded input")
-        if input_.shape[0] % group.world_size:
+        if input_.shape[0] % self._runtime_sp_size:
             raise ValueError("runtime SP attention tokens must be padded to TP size")
-        batch = current_sp_batch()
-        if batch is not None:
-            if input_.shape[0] != batch.padded_tokens:
-                raise ValueError("runtime SP attention output has an invalid token layout")
-            # FlashAttention may leave padded rows unwritten. Clear them before
-            # inverse exchange and GEMM/activation quantization; 0 * NaN is NaN.
-            input_ = input_.masked_fill(batch.global_padding[:, None], 0)
-        rows = input_.shape[0] // group.world_size
-        send = input_.reshape(group.world_size, rows, input_.shape[-1]).contiguous()
-        recv = _exchange(group, send)
+        # Clear unwritten NaN padding before inverse exchange/quantization.
+        rows = input_.shape[0] // self._runtime_sp_size
+        send = input_.reshape(self._runtime_sp_size, rows, input_.shape[-1]).contiguous()
+        recv = _communicate(self, send, 'exchange')
         tokens = recv.permute(1, 0, 2).contiguous().reshape(rows, self.input_size)
         return super().forward(tokens)
 
@@ -274,10 +351,9 @@ class RuntimeSPMergedColumnParallelLinear(MergedColumnParallelLinear):
 
     def forward(self, input_):
         if self._runtime_sp_mlp:
-            group = _check_group(self)
-            input_ = mask_local_padding(input_)
-            if self._runtime_sp_mlp_gather and group.world_size > 1:
-                input_ = group.all_gather(input_.contiguous(), dim=0)
+            input_ = _prepared(self, input_)
+            if self._runtime_sp_mlp_gather and self._runtime_sp_size > 1:
+                input_ = _communicate(self, input_.contiguous(), 'gather')
         return super().forward(input_)
 
 

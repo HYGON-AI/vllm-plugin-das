@@ -1,4 +1,6 @@
 """Explicit communication subfeature; discovery does not import Torch/Core."""
+import os
+import weakref
 from packaging.version import Version
 from hcu_adapter.extensions import ExtensionCommitError, ExtensionSpec
 from hcu_adapter.runtime_lifecycle import ProcessLocalLifecycle
@@ -10,14 +12,47 @@ CAPABILITY = "runtime-sp-communication"
 _ACTION = "runtime-sp-communication-publication"
 _PATH = "hcu_vllm_das.parallel.runtime_sp_communicator.RuntimeSPCommunicator"
 _platform = None
+_model_health = ()
 _lifecycle = ProcessLocalLifecycle(runtime_action=_ACTION, error_type=ExtensionCommitError)
 
 
 def check_health():
+    pid = os.getpid()
     _lifecycle.require_runtime_healthy()
     if (_platform is None
             or not _platform.owns_device_communicator_selector(select_communicator)):
         raise ExtensionCommitError("runtime SP communicator selector ownership changed")
+    owners = _model_health
+    for reference, checker in owners:
+        model = reference()
+        if model is None:
+            raise ExtensionCommitError("runtime SP model health owner expired")
+        checker(model)
+    if (owners is not _model_health or os.getpid() != pid
+            or not _platform.owns_device_communicator_selector(select_communicator)):
+        raise ExtensionCommitError("runtime SP model owners changed during health check")
+
+
+def register_model_health(model):
+    """Bind model/projection health to Adapter's pre-replay required check.
+
+    Publish immutable snapshots under the existing lifecycle lock. Weak refs
+    retain no model/weights; an expired owner refuses replay until process exit.
+    No cleanup callback or lock is inherited independently of the lifecycle.
+    """
+    checker = type(model)._check_runtime_sp
+    pid = model._runtime_sp_pid
+
+    def publish():
+        global _model_health
+        check_health()
+        checker(model)
+        if os.getpid() != pid:
+            raise ExtensionCommitError("runtime SP model publication crossed fork")
+        _model_health = (*_model_health, (weakref.ref(model), checker))
+
+    _lifecycle.run_once(f"runtime-sp-model-{id(model)}", publish)
+    check_health()
 
 
 def select_communicator(default):
@@ -55,6 +90,9 @@ def activate(context):
         ownership = getattr(HcuPlatform, "owns_device_communicator_selector", None)
         if not callable(register) or not callable(ownership):
             raise RuntimeError("Adapter lacks the communicator-selector capability")
+        from hcu_adapter.bridges import vllm as bridge
+        if not callable(getattr(bridge, "require_forward_healthy", None)):
+            raise RuntimeError("Adapter lacks required-owner checks before cached FULL replay")
         try:
             register(select_communicator)
             _platform = HcuPlatform

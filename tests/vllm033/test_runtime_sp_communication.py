@@ -146,11 +146,13 @@ def activation(core, monkeypatch):
             return cls._device_communicator_selector is selector
 
     monkeypatch.setitem(bridge.__dict__, "HcuPlatform", Platform)
+    monkeypatch.setattr(bridge, "require_forward_healthy", lambda: None, raising=False)
     monkeypatch.setattr(bridge, "require_extension_healthy", lambda capability: (
         module.check_health() if capability == module.CAPABILITY
         else pytest.fail("wrong required owner")
     ))
     monkeypatch.setattr(module, "_platform", None)
+    monkeypatch.setattr(module, "_model_health", ())
     monkeypatch.setattr(module, "_lifecycle", ProcessLocalLifecycle(
         runtime_action=module._ACTION, error_type=ExtensionCommitError))
     return SimpleNamespace(module=module, platform=Platform, core=core)
