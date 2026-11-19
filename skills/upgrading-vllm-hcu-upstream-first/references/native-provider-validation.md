@@ -92,3 +92,26 @@ of that private cache have exited, bind the lock path/inode/time to the original
 run, and preserve the old lock in a new run's evidence. Do not clear shared or
 another client's locks. An interrupted run retains its failed lifecycle result;
 cache recovery does not retroactively qualify its tests.
+
+## Varlen FlashAttention and allocation-sensitive failures
+
+When identical `cu_seqlens_q` and `cu_seqlens_k` values produce different native
+results depending on pointer identity, compare shared and separate buffers in
+fresh processes while always allocating both buffers. This controls allocation
+count as well as metadata values; retaining or synchronizing a temporary tensor
+alone does not establish a lifetime bug. Preserve the original separate-buffer
+case rather than forcing aliasing to pass.
+
+To probe a suspected sequence-boundary read, preserve logical Q/K/V and metadata
+while varying only allocated storage after the logical K/V end (zero versus NaN,
+K and V independently). Compare with an independent FP32 attention reference in
+eager and changing-input Graph replay. A result that depends on this tail
+localizes a native memory-boundary problem; it does not prove which source line
+is defective, or establish FP8 KV support.
+
+Resolve the installed provider's real source revision before attributing the
+failure to a current vendor branch. A masking-loop bound found in different
+source remains a candidate until that source is built and the original failing
+cases pass on the device. Avoid an Adapter/Plugin padding or metadata-alias
+workaround that conceals a native out-of-bounds read; keep provider ownership and
+unverified capability explicit.
