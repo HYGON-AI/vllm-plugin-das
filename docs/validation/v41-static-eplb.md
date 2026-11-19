@@ -52,7 +52,9 @@ The map must match the native `DeepseekV41LLMForCausalLM` key, exact model
 path, MoE layer count and expert counts. At 40 layers and 384 logical
 experts, 32 redundant experts produce 416 physical slots and 52 slots per
 EP8 rank. Both deployed FP8 and FP4 indexer paths share the same static map
-loading lifecycle.
+loading lifecycle. Calibration and deployment require
+`--expert-placement-strategy linear` (the vLLM default). The placement and
+replica ordering use contiguous physical expert IDs per rank.
 
 Calibration uses identity placement with zero deployed redundancy. The
 configured redundant count determines the proposed map. Replace

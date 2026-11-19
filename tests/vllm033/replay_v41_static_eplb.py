@@ -94,7 +94,7 @@ def cfg(width=8, **options):
                            pipeline_parallel_size=1, data_parallel_size=1, tensor_parallel_size=1,
                            enable_dbo=False, enable_eplb=False, enable_expert_parallel=True,
                            enable_elastic_ep=False, all2all_backend='deepep_high_throughput',
-                           num_ubatches=0),
+                           expert_placement_strategy='linear', num_ubatches=0),
         use_v2_model_runner=True, speculative_config=None, lora_config=None, kv_transfer_config=None,
         kernel_config=NS(monokernel=False, moe_backend='deep_gemm'),
         cache_config=NS(swa_bounded_replay=False),

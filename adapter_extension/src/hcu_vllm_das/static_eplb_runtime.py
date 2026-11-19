@@ -124,6 +124,9 @@ def validate_config(cfg) -> bool:
         errors.append('static EPLB replaces --enable-eplb; both cannot be active')
     if p.enable_elastic_ep:
         errors.append('elastic EP would resize the fixed physical expert layout')
+    if p.expert_placement_strategy != 'linear':
+        errors.append('static EPLB requires --expert-placement-strategy linear '
+                      'for contiguous physical expert ownership')
     if p.all2all_backend != 'deepep_high_throughput':
         errors.append('static EPLB is validated only with deepep_high_throughput')
     if cfg.kernel_config.moe_backend != 'deep_gemm':

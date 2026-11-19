@@ -44,6 +44,17 @@ def static_config(cfg, *, recording=False):
     return cfg
 
 
+@pytest.mark.parametrize('recording', [False, True])
+@pytest.mark.parametrize('policy', ['nearest', 'locality_fair'])
+def test_static_eplb_rejects_round_robin_placement_before_moe_construction(
+        chain, recording, policy):
+    cfg = static_config(chain.cfg, recording=recording)
+    cfg.parallel_config.expert_placement_strategy = 'round_robin'
+    cfg.additional_config['hcu_static_eplb']['static_dispatch_policy'] = policy
+    with pytest.raises(runtime.StaticEplbError, match='--expert-placement-strategy linear'):
+        runtime.moe_eplb_kwargs(cfg, 'model.layers.0.ffn.experts')
+
+
 @pytest.mark.parametrize('fp4', [False, True])
 @pytest.mark.parametrize('static', [False, True])
 def test_outer_selects_composed_constructor(chain, monkeypatch, fp4, static):
