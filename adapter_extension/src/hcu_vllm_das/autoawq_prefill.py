@@ -70,7 +70,11 @@ def dequantize_for_matmul(
     n = scales_zeros.shape[0]
     output = torch.empty((k, n), device=weight.device, dtype=torch.float16)
     tile_k = 256 if k % 256 == 0 else 128
-    _packed_to_kn[(triton.cdiv(n, 64), k // tile_k)](
-        weight, scales_zeros, output, n, k, tile_k, 64, num_warps=4
+    # Wider programs improve conversion plus GEMM for large admitted shapes.
+    # Small shards and the alternate packing tile retain their original launch.
+    wide = tile_k == 256 and k >= 4096 and n >= 7424
+    block_n, num_warps = (128, 8) if wide else (64, 4)
+    _packed_to_kn[(triton.cdiv(n, block_n), k // tile_k)](
+        weight, scales_zeros, output, n, k, tile_k, block_n, num_warps=num_warps
     )
     return output

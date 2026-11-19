@@ -23,10 +23,15 @@ The output remains non-aliasing. Both reader modes use the same dispatcher
 custom op and FakeTensor rule; three-argument callers retain the vendor path.
 
 The conversion grid traverses N blocks before K blocks, following adjacent
-regions of the packed backing. The physical packing tile, launch block size,
-FP16 KN output strides and ordinary Torch matmul stay the same. Component
-timings motivated this launch-order change; its installed Graph, model and
-serving performance results must still be checked on the final source.
+regions of the packed backing. The physical packing tile, FP16 KN output
+strides and ordinary Torch matmul stay unchanged. For admitted shapes with
+K>=4096, N>=7424 and a 256-row packing tile, the reader uses 128 columns and
+eight warps per program. Other shapes
+retain 64 columns and four warps. A full admitted-shape conversion-plus-GEMM
+prototype motivated this policy: applying the wider launch to every shape
+regressed smaller shards. Installed Graph, model and serving performance
+results must still be checked on this implementation; prototype timings do
+not close the previously observed TTFT regression.
 
 Time conversion and downstream matmul together when comparing temporary
 layouts. A transposed KN view can make conversion faster while selecting a

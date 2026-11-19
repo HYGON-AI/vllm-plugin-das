@@ -64,3 +64,7 @@ a transposed view can accelerate conversion but select a slower BLAS algorithm.
 Bind trace comparisons to matching prefill geometry; mixed prefill/decode
 totals do not isolate conversion cost. Check launch traversal against physical
 packing before changing the format, and revalidate both physical packing tiles.
+Keep physical packing separate from launch tuning. A wider program that wins
+on the largest weight can regress smaller shards; compare conversion plus GEMM
+across the admitted shapes before choosing a size policy, then validate the
+final installed kernel and changed-input Graph independently of the prototype.
