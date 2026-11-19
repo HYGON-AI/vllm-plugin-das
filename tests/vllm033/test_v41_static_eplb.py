@@ -55,6 +55,22 @@ def test_static_eplb_rejects_round_robin_placement_before_moe_construction(
         runtime.moe_eplb_kwargs(cfg, 'model.layers.0.ffn.experts')
 
 
+@pytest.mark.parametrize('recording', [False, True], ids=['deploy', 'calibrate'])
+@pytest.mark.parametrize('filter_weights', [False, True], ids=['unfiltered', 'filtered'])
+def test_static_eplb_ep_weight_filter(chain, monkeypatch, recording, filter_weights):
+    cfg = static_config(chain.cfg, recording=recording)
+    cfg.parallel_config.enable_ep_weight_filter = filter_weights
+    monkeypatch.setenv('HCU_VLLM_PCP_IMPL', 'native')
+    if filter_weights and not recording:
+        with pytest.raises(runtime.StaticEplbError, match='--enable-ep-weight-filter'):
+            runtime.moe_eplb_kwargs(cfg, 'model.layers.0.ffn.experts')
+    else:
+        assert runtime.moe_eplb_kwargs(cfg, 'model.layers.0.ffn.experts') == {
+            'enable_eplb': True,
+            'num_redundant_experts': 0 if recording else 32,
+        }
+
+
 @pytest.mark.parametrize('recording,replay,skip_padding,allowed', [
     (True, True, None, True),
     (True, True, '1', True),

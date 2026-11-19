@@ -129,6 +129,10 @@ def validate_config(cfg) -> bool:
     if p.expert_placement_strategy != 'linear':
         errors.append('static EPLB requires --expert-placement-strategy linear '
                       'for contiguous physical expert ownership')
+    # Core filters by the original logical placement before the static loader
+    # can distribute checkpoint weights to the mapped physical slots.
+    if not options.recording and getattr(p, 'enable_ep_weight_filter', False):
+        errors.append('static EPLB deployment cannot use --enable-ep-weight-filter')
     if p.all2all_backend != 'deepep_high_throughput':
         errors.append('static EPLB is validated only with deepep_high_throughput')
     if cfg.kernel_config.moe_backend != 'deep_gemm':

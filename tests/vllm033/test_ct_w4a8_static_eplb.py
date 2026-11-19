@@ -27,6 +27,15 @@ def test_ct_admits_only_owned_static_eplb(chain, monkeypatch):
         _ = method.supports_eplb
 
 
+def test_ct_static_eplb_rejects_ep_weight_filter(chain, monkeypatch):
+    monkeypatch.setenv('HCU_VLLM_PCP_IMPL', 'native')
+    method = HcuCTW4A8MoEMethod.__new__(HcuCTW4A8MoEMethod)
+    method._config = static_config(chain.cfg)
+    chain.cfg.parallel_config.enable_ep_weight_filter = True
+    with pytest.raises(runtime.StaticEplbError, match='--enable-ep-weight-filter'):
+        _ = method.supports_eplb
+
+
 def make_experts(rank):
     experts = RoutedExperts.__new__(RoutedExperts)
     torch.nn.Module.__init__(experts)

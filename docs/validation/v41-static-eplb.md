@@ -56,6 +56,12 @@ loading lifecycle. Calibration and deployment require
 `--expert-placement-strategy linear` (the vLLM default). The placement and
 replica ordering use contiguous physical expert IDs per rank.
 
+When deploying a map, leave `--enable-ep-weight-filter` disabled (the default).
+Core filters by the original logical expert placement before the static loader
+can distribute the weights, so the filter can discard weights needed by the
+new layout, including W4A8 packed weights. Deployment rejects this combination
+at startup.
+
 Calibration uses identity placement with zero deployed redundancy. The
 configured redundant count determines the proposed map. Replace
 `expert_map_path` with `expert_map_record_path` and configure a start marker,
