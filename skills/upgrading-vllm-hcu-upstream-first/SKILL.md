@@ -316,6 +316,14 @@ before installation. Use an explicit candidate `--prefix`/`--target`, or a
 normal venv interpreter whose prefix has been verified, then verify actual
 installed files and RECORD. Check build-backend child interpreters separately.
 
+When a Plugin facade delegates its module identity to Adapter, update the
+exact alias-to-owner entry in `tests/vllm033/conftest.py`. Require both facade
+and destination RECORD entries, the canonical Adapter module object and its
+expected installed path. Retain negatives for either missing record, a
+same-path substitute, missing canonical binding and a foreign checkout; do
+not exempt the Adapter namespace as a whole. See the ownership tests in
+`tests/ci/test_v033_installed_module_ownership.py`.
+
 Chained jobs must wait for completed cleanup, checkpoint post-seal and RECORD
 receipts, not just a terminal-looking state string. Write final status only
 after the last check, using an atomic snapshot. Preserve consumer failures
