@@ -132,6 +132,19 @@ rejection and verify actual per-process ordering before qualifying that route.
 Preserve other loader errors observed during peer shutdown separately; this
 timing failure alone does not attribute or resolve them.
 
+Early admission and checkpoint loading do not qualify the default compiler.
+Run the actual target fullgraph compiler over real projection classes: native
+Graph components or a synthetic outer model can miss Python guards traced by
+Core's compiled inner loop. In the inspected target, an inlined `os.getpid()`
+projection check is rejected by Dynamo before serving becomes healthy.
+Keep process/owner enforcement at a verified execution boundary, including
+cached FULL replay; do not freeze a PID with constant-result annotations or
+skip health checks merely because compilation is active. Use the target's
+supported tensor/collective custom-op boundaries where needed, preserving
+ownership, masks and numerical assertions. A CPU compiler reproducer isolates
+this blocker; a fix still needs the unchanged trained-model/default-Graph,
+changed-input replay, HumanEval and normal serving-shutdown gates.
+
 Core's MoE routing may happen before internal dispatch or after naive
 all-gather. Use the local mask in the former layout and the exact gathered EP
 mask in the latter; with DP, use the same group and per-rank sizes as dispatch.
