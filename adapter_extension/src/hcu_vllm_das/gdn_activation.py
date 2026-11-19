@@ -16,8 +16,15 @@ from hcu_adapter.extensions import ExtensionCommitError, ExtensionSpec
 
 from .environment import gdn_policy
 from .extension import _require_vllm_033_release_line
-from .gdn import DECODE, PREFILL, make_wrapper, prepare_routes, require_signature
-from .gdn_contracts import OFFICIAL, OWNERS
+from .gdn import (
+    DECODE,
+    PREFILL,
+    boltops_contract,
+    make_wrapper,
+    prepare_routes,
+    require_signature,
+)
+from .gdn_contracts import BOLTOPS_IMPLEMENTATIONS, OFFICIAL, OWNERS
 
 CAPABILITY = "hcu-gdn-fla"
 FACTOR = "VLLM_HCU_DAS_GDN_PROVIDER_IDENTITY"
@@ -129,21 +136,46 @@ def compile_identity():
     return _published.identity
 
 
-def _source_identity(routes, policy):
+def _provider_owners(routes):
+    owners = {}
+    for name, candidates in routes.items():
+        for provider, module, attribute, function in candidates:
+            owners[module, attribute] = function
+            if (
+                provider == "hcu-boltops"
+                and module.__name__ == "boltops.fla.gdn"
+                and function.__module__ == module.__name__
+            ):
+                # Lazy public shims import these implementations on each call.
+                # Track their owners and bytes before creating compile keys.
+                for suffix, impl_name in BOLTOPS_IMPLEMENTATIONS[name]:
+                    implementation = import_module(module.__name__ + "." + suffix)
+                    leaf = getattr(implementation, impl_name)
+                    require_signature(
+                        leaf,
+                        boltops_contract(name, leaf),
+                        implementation.__name__ + "." + impl_name,
+                    )
+                    owners[implementation, impl_name] = leaf
+    return tuple(
+        (module, name, function) for (module, name), function in owners.items()
+    )
+
+
+def _source_identity(routes, policy, providers):
     paths = {
         Path(__file__),
         Path(__file__).with_name("gdn.py"),
         Path(__file__).with_name("gdn_contracts.py"),
         Path(__file__).with_name("environment.py"),
     }
-    for candidates in routes.values():
-        for _, module, _, function in candidates:
-            for filename in (
-                getattr(module, "__file__", None),
-                inspect.getsourcefile(function),
-            ):
-                if filename:
-                    paths.add(Path(filename))
+    for module, _, function in providers:
+        for filename in (
+            getattr(module, "__file__", None),
+            inspect.getsourcefile(function),
+        ):
+            if filename:
+                paths.add(Path(filename))
     files = tuple(
         (str(p.resolve()), hashlib.sha256(p.read_bytes()).hexdigest())
         for p in sorted(paths)
@@ -204,14 +236,8 @@ def activate(context):
         if FACTOR in envs.environment_variables:
             raise RuntimeError("GDN compilation factor already has another owner")
         routes = prepare_routes(policy)
-        files, identity = _source_identity(routes, policy)
-        providers = tuple(
-            {
-                (module, name, function)
-                for entries in routes.values()
-                for _, module, name, function in entries
-            }
-        )
+        providers = _provider_owners(routes)
+        files, identity = _source_identity(routes, policy, providers)
         publication = Publication(
             os.getpid(),
             policy,

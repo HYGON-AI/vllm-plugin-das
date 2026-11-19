@@ -536,3 +536,216 @@ def test_aiter_chunk_h_uses_int64_offsets_without_mutating_metadata(monkeypatch)
     assert a["chunk_offsets"].dtype == torch.int64 and offsets.dtype == torch.int32
     assert a["chunk_offsets"].tolist() == offsets.tolist()
     assert a["transpose_state_layout"] is True
+
+
+# Current public BoltOPs ABI uses negative invalid indices and has no explicit
+# null_state_index option. These doubles audit the boundary only; the unchanged
+# native16-case matrix remains required on the real provider.
+def negative_sentinel_providers(monkeypatch, result="native"):
+    calls, modules = providers(monkeypatch, result=result)
+    module = modules[gdn.MODULES["hcu-boltops"]]
+    for name in (
+        "chunk_gated_delta_rule_fwd_h",
+        "fused_sigmoid_gating_delta_rule_update",
+        "fused_recurrent_gated_delta_rule_packed_decode",
+    ):
+        names, defaults = BOLTOPS[name]
+        parameters = ", ".join(
+            n + ("=" + repr(defaults[n]) if n in defaults else "")
+            for n in names
+            if n != "null_state_index"
+        )
+        namespace = {
+            "record": lambda a, n=name: (
+                calls.append(("hcu-boltops", n, dict(a))),
+                result(a) if callable(result) else result,
+            )[1]
+        }
+        exec(
+            compile(
+                "def kernel(" + parameters + "):\n    return record(locals())\n",
+                __file__,
+                "exec",
+            ),
+            namespace,
+        )
+        setattr(module, name, namespace["kernel"])
+    return calls, modules
+
+
+@pytest.mark.parametrize(
+    "name",
+    [
+        "chunk_gated_delta_rule_fwd_h",
+        "fused_sigmoid_gating_delta_rule_update",
+        "fused_recurrent_gated_delta_rule_packed_decode",
+    ],
+)
+def test_exact_negative_sentinel_public_abi_admitted(monkeypatch, name):
+    _, modules = negative_sentinel_providers(monkeypatch)
+    module = modules[gdn.MODULES["hcu-boltops"]]
+    assert gdn.resolve("hcu-boltops", name) == (module, name, getattr(module, name))
+
+
+@pytest.mark.parametrize("dtype", [torch.int32, torch.int64])
+@pytest.mark.parametrize("speculative", [False, True])
+def test_negative_sentinel_decode_preserves_metadata_and_null_cache(
+    monkeypatch, dtype, speculative
+):
+    calls, modules = negative_sentinel_providers(monkeypatch)
+    name = (
+        "fused_sigmoid_gating_delta_rule_update"
+        if speculative
+        else "fused_recurrent_gated_delta_rule_packed_decode"
+    )
+    module = modules[gdn.MODULES["hcu-boltops"]]
+    wrapped = leaf(name, (("hcu-boltops", module, name, getattr(module, name)),))
+    original = torch.tensor([[0, 99, 2, 99, -3, 99]], dtype=dtype)
+    indices = original[:, ::2] if speculative else original[0, ::2]
+    before = original.clone()
+    x = torch.empty((1, 3, 4, 128), dtype=torch.bfloat16)
+    gates = torch.empty((1, 3, 4), dtype=x.dtype)
+    state = torch.empty((4, 4, 128, 128), dtype=torch.float32)
+    accepted = torch.tensor([2], dtype=torch.int32)
+    cu = torch.tensor([0, 3], dtype=torch.int32)
+    out = torch.empty_like(x)
+    if speculative:
+        result = wrapped(
+            torch.empty(4),
+            gates,
+            gates,
+            torch.empty(4, dtype=x.dtype),
+            x,
+            x,
+            x,
+            initial_state=state,
+            cu_seqlens=cu,
+            ssm_state_indices=indices,
+            num_accepted_tokens=accepted,
+            use_qk_l2norm_in_kernel=True,
+        )
+    else:
+        result = wrapped(
+            x, gates, gates, torch.empty(4), torch.empty(4), 0.125, state, out, indices
+        )
+    assert result == "native" and len(calls) == 1
+    a = calls[-1][2]
+    assert "null_state_index" not in a and a["initial_state"] is state
+    assert a["ssm_state_indices"].tolist() == (
+        [[-1, 2, -1]] if speculative else [-1, 2, -1]
+    )
+    assert (
+        a["ssm_state_indices"].dtype == dtype
+        and a["ssm_state_indices"].device == indices.device
+    )
+    torch.testing.assert_close(original, before, atol=0, rtol=0)
+    if speculative:
+        assert a["num_accepted_tokens"] is accepted and a["cu_seqlens"] is cu
+    else:
+        assert a["out"] is out
+
+
+def test_negative_sentinel_prefill_keeps_dense_row_zero(monkeypatch):
+    calls, modules = negative_sentinel_providers(monkeypatch)
+    name = "chunk_gated_delta_rule_fwd_h"
+    module = modules[gdn.MODULES["hcu-boltops"]]
+    wrapped = leaf(name, (("hcu-boltops", module, name, getattr(module, name)),))
+    k = torch.empty((1, 17, 4, 128), dtype=torch.bfloat16)
+    u = torch.empty((1, 17, 8, 128), dtype=k.dtype)
+    state = torch.ones((1, 8, 128, 128), dtype=torch.float32)
+    assert wrapped(k, k, u, initial_state=state, output_final_state=True) == "native"
+    a = calls[-1][2]
+    assert "null_state_index" not in a and a["initial_state_indices"] is None
+    assert a["initial_state"] is state and a["inplace_final_state"] is False
+    assert a["transpose_state_layout"] is True and a["output_final_state"] is True
+
+
+def test_negative_sentinel_native_error_propagates(monkeypatch):
+    def fail(_):
+        raise RuntimeError("native negative-sentinel launch failed")
+
+    _, modules = negative_sentinel_providers(monkeypatch, result=fail)
+    name = "fused_recurrent_gated_delta_rule_packed_decode"
+    module = modules[gdn.MODULES["hcu-boltops"]]
+    wrapped = leaf(name, (("hcu-boltops", module, name, getattr(module, name)),))
+    x = torch.empty(1)
+    with pytest.raises(RuntimeError, match="native negative-sentinel launch failed"):
+        wrapped(x, x, x, x, x, 0.125, x, x, torch.tensor([1]))
+
+
+@pytest.mark.parametrize("drift", ["source", "owner"])
+def test_lazy_boltops_implementation_source_and_owner_tracked(
+    state, monkeypatch, tmp_path, drift
+):
+    _, modules = providers(monkeypatch)
+    public = modules[gdn.MODULES["hcu-boltops"]]
+    name = "recompute_w_u_fwd"
+    function = getattr(public, name)
+    monkeypatch.setattr(function, "__module__", public.__name__)
+    facade = ModuleType(public.__name__ + ".triton")
+    facade.__file__ = __file__
+    setattr(facade, name, function)
+    modules[facade.__name__] = facade
+    impl = ModuleType(public.__name__ + ".triton.recompute_w_u")
+    impl_name = "recompute_w_u_fwd_gdn"
+    path = tmp_path / "recompute_w_u.py"
+    path.write_text(
+        "def recompute_w_u_fwd_gdn(k, v, beta, g_cumsum, A, cu_seqlens=None, chunk_indices=None):\n    return k\n"
+    )
+    impl.__file__ = str(path)
+    exec(compile(path.read_text(), str(path), "exec"), impl.__dict__)
+    modules[impl.__name__] = impl
+    activation.activate(state.context)
+    assert str(path.resolve()) in dict(activation._published.files)
+    from hcu_adapter.extensions import ExtensionCommitError
+
+    if drift == "source":
+        path.write_text(path.read_text() + "# changed native implementation\n")
+        with pytest.raises(ExtensionCommitError, match="source changed"):
+            activation.compile_identity()
+    else:
+        monkeypatch.setattr(impl, impl_name, lambda *args: None)
+        with pytest.raises(ExtensionCommitError, match="owner changed"):
+            activation.check_health()
+
+
+@pytest.mark.parametrize(
+    "name",
+    [
+        "chunk_gated_delta_rule_fwd_h",
+        "fused_sigmoid_gating_delta_rule_update",
+        "fused_recurrent_gated_delta_rule_packed_decode",
+    ],
+)
+@pytest.mark.parametrize("drift", ["default", "extra"])
+def test_negative_sentinel_abi_still_refuses_other_drift(monkeypatch, name, drift):
+    _, modules = negative_sentinel_providers(monkeypatch)
+    function = getattr(modules[gdn.MODULES["hcu-boltops"]], name)
+    signature = inspect.signature(function)
+    parameters = list(signature.parameters.values())
+    if drift == "default":
+        parameters[-1] = parameters[-1].replace(default=True)
+    else:
+        parameters.append(
+            inspect.Parameter(
+                "foreign_option", inspect.Parameter.POSITIONAL_OR_KEYWORD, default=None
+            )
+        )
+    monkeypatch.setattr(
+        function,
+        "__signature__",
+        signature.replace(parameters=parameters),
+        raising=False,
+    )
+    with pytest.raises(RuntimeError, match="signature"):
+        gdn.resolve("hcu-boltops", name)
+
+
+def test_negative_sentinel_sigmoid_without_index_metadata(monkeypatch):
+    calls, modules = negative_sentinel_providers(monkeypatch)
+    name = "fused_sigmoid_gating_delta_rule_update"
+    module = modules[gdn.MODULES["hcu-boltops"]]
+    wrapped = leaf(name, (("hcu-boltops", module, name, getattr(module, name)),))
+    x = torch.empty(1)
+    assert wrapped(x, x, x, x, x, x, x, initial_state=x) == "native"
+    assert calls[-1][2]["ssm_state_indices"] is None

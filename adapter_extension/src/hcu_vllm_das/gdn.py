@@ -47,6 +47,24 @@ def require_signature(function, contract, label):
         raise RuntimeError(label + " has an incompatible GDN signature")
 
 
+def boltops_contract(name, function):
+    """Admit only the audited public default sets, including negative slots."""
+    names, defaults = BOLTOPS[name]
+    actual = tuple(inspect.signature(function).parameters)
+    if "null_state_index" in names and actual == tuple(
+        key for key in names if key != "null_state_index"
+    ):
+        # Current public BoltOPs uses negative invalid slots. All other
+        # parameters/defaults still undergo the exact signature check.
+        return actual, {
+            key: value for key, value in defaults.items() if key != "null_state_index"
+        }
+    if name == "chunk_fwd_o" and actual == names + ("full_chunks",):
+        # None retains fixed aligned auto-detection and masked varlen.
+        return actual, dict(defaults, full_chunks=None)
+    return names, defaults
+
+
 def resolve(provider, name):
     module_name = MODULES[provider]
     contract = (BOLTOPS if provider == "hcu-boltops" else AITER).get(name)
@@ -66,13 +84,8 @@ def resolve(provider, name):
     function = getattr(module, attribute, None)
     if function is None:
         return None
-    if provider == "hcu-boltops" and name == "chunk_fwd_o":
-        # The public full_chunks extension is optional and defaults to None
-        # (fixed aligned auto-detection, varlen masked). Audit BOTH exact ABIs;
-        # never invent the stronger full_chunks=True promise for varlen.
-        names, defaults = contract
-        if tuple(inspect.signature(function).parameters) == names + ("full_chunks",):
-            contract = names + ("full_chunks",), dict(defaults, full_chunks=None)
+    if provider == "hcu-boltops":
+        contract = boltops_contract(name, function)
     require_signature(
         function,
         contract if provider == "hcu-boltops" else contract[1:],
@@ -237,8 +250,45 @@ def _call(name, provider, kernel, a):
     return kernel(**args)
 
 
+def _boltops_call_adapter(name, kernel):
+    if (
+        "null_state_index" not in BOLTOPS[name][0]
+        or "null_state_index" in inspect.signature(kernel).parameters
+    ):
+        return kernel
+
+    @wraps(kernel)
+    def translated(**arguments):
+        expected = -1 if name == "chunk_gated_delta_rule_fwd_h" else 0
+        if arguments.pop("null_state_index") != expected:
+            raise RuntimeError("GDN internal null-state contract changed")
+        if name != "chunk_gated_delta_rule_fwd_h":
+            import torch
+
+            indices = arguments["ssm_state_indices"]
+            if indices is not None:
+                arguments["ssm_state_indices"] = torch.where(
+                    indices > 0, indices, torch.full_like(indices, -1)
+                )
+        # Prefill has already gathered dense states, including valid row0.
+        # Preserve Core's undefined sigmoid padding output and packed decode's
+        # explicit zeros; neither needs a plugin output fill or native retry.
+        return kernel(**arguments)
+
+    return translated
+
+
 def make_wrapper(name, original, candidates, require_healthy):
     signature = inspect.signature(original)
+    calls = tuple(
+        (
+            provider,
+            _boltops_call_adapter(name, kernel)
+            if provider == "hcu-boltops"
+            else kernel,
+        )
+        for provider, _, _, kernel in candidates
+    )
 
     @wraps(original)
     def wrapper(*args, **kwargs):
@@ -246,7 +296,7 @@ def make_wrapper(name, original, candidates, require_healthy):
         bound = signature.bind(*args, **kwargs)
         bound.apply_defaults()
         a = bound.arguments
-        for provider, _, _, kernel in candidates:
+        for provider, kernel in calls:
             if provider == "hcu-aiter" and not _aiter_supports(name, a):
                 continue
             if (

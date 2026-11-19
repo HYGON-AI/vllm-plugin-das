@@ -1,6 +1,23 @@
 # SPDX-License-Identifier: Apache-2.0
 """Audited public call contracts; versions are provenance, not wheel pins."""
 
+BOLTOPS_IMPLEMENTATIONS = {
+    "recompute_w_u_fwd": (
+        ("triton", "recompute_w_u_fwd"),
+        ("triton.recompute_w_u", "recompute_w_u_fwd_gdn"),
+    ),
+    "chunk_gated_delta_rule_fwd_h": (
+        ("triton.chunk_delta_h", "chunk_gated_delta_rule_fwd_h"),
+    ),
+    "chunk_fwd_o": (("triton.chunk_o", "chunk_fwd_o"),),
+    "fused_sigmoid_gating_delta_rule_update": (
+        ("triton.fused_sigmoid_gating", "fused_sigmoid_gating_delta_rule_update"),
+    ),
+    "fused_recurrent_gated_delta_rule_packed_decode": (
+        ("triton.fused_recurrent", "fused_recurrent_gated_delta_rule_packed_decode"),
+    ),
+}
+
 BOLTOPS = {
     "chunk_gated_delta_rule_fwd_h": (
         (

@@ -49,14 +49,35 @@ does not assert `full_chunks=True`; different defaults or additional parameters
 still refuse before publication.
 
 Adapters retain the official metadata, `[N,H,V,K]` state layout, initial/final
-state, `save_new_value` and output backing. BoltOPs indexed decode receives explicit
-`null_state_index=0`. Prefill chunk-H receives dense gathered per-sequence state,
+state, `save_new_value` and output backing. For the BoltOPs ABI exposing an
+explicit sentinel option, indexed decode receives `null_state_index=0`.
+Prefill chunk-H receives dense gathered per-sequence state,
 where row 0 is real data and there are no state indices; it explicitly uses
 `null_state_index=-1`. Treating that dense row as the cache NULL slot discarded
 its initial state in the installed provider and failed native varlen final-state
 parity (max absolute error about 0.012). AITER decode converts indices ≤0 to -1
 without mutating the original index tensor. AITER chunk-H receives int64 offsets. AITER has no
 standalone recompute entry, so that leaf uses BoltOPs or official.
+
+The current public BoltOPs ABI omits `null_state_index` from chunk-H and the
+two decode leaves. It is admitted only when all remaining parameter names,
+defaults and synchronous execution contracts match. The adapter keeps dense
+prefill row0 valid and translates indexed decode slots <=0 to -1 without
+mutating the source indices, accepted-token metadata, sequence offsets, state
+or output backing. This preserves Core's undefined sigmoid padding output and
+packed decode's explicit zero output. It does not initialize unspecified
+outputs or retry another provider after a native failure.
+
+Lazy BoltOPs public shims additionally require the audited internal leaf owners,
+including the intermediate Triton WY facade and `recompute_w_u_fwd_gdn`.
+Their source bytes enter the official compilation factor; replacing an internal
+owner or modifying its source refuses the process. Providers continue to own
+native/JIT caches. This capability check does not pin a complete wheel version.
+
+This ABI follow-up has source-level CPU RED/GREEN coverage and a hidden-device
+preflight against the actual current provider. Its installed-wheel, unchanged
+native numerical/Graph matrices and original HE32 are still pending. Results
+from the separately frozen WY-only diagnostic do not qualify this new source.
 
 Gated AITER chunk-O remains excluded because earlier device evidence showed
 numerical divergence. AITER-incompatible inputs use the next prepared route.
