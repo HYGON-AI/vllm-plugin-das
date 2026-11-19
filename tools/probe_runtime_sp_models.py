@@ -9,6 +9,9 @@ def worker(rank):
     import torch.nn.functional as F
     import torch.distributed as dist
     torch.cuda.set_device(rank)
+    # Bound this tiny synthetic diagnostic's allocator; it is not a serving
+    # memory/performance qualification or a production runtime policy.
+    torch.cuda.set_per_process_memory_fraction(.05)
     from vllm.plugins import load_general_plugins
     load_general_plugins()
     from vllm.config import (ParallelConfig,VllmConfig,CacheConfig,ModelConfig,
@@ -175,7 +178,8 @@ def worker(rank):
             print('FULL_MODEL',rank,family,errors,flush=True)
             dist.barrier(group=tp.device_group)
         result['success']=not result['failures']
-        if result['failures']:raise AssertionError('Original numerical gates failed; see per-rank failures')
+        # Keep numerical failures in the receipt, but let all ranks finish
+        # cleanup. Raising here makes mp.spawn terminate still-exiting peers.
     except BaseException:
         result['error']=traceback.format_exc();raise
     finally:
@@ -185,3 +189,6 @@ def worker(rank):
 if __name__=='__main__':
     import torch.multiprocessing as mp
     mp.spawn(worker,nprocs=4,join=True)
+    reports=[json.loads((OUT/f'rank{rank}.json').read_text()) for rank in range(4)]
+    if any(report['failures'] for report in reports):
+        raise SystemExit(1)

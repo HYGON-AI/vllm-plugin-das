@@ -5,6 +5,13 @@ projection and early MoE factory policies around the unchanged official inner
 model loops. They are **not published through ModelRegistry or automatically
 enabled**. Full custom-SP model acceptance remains incomplete; keep #479 Draft.
 
+**Subsequent correction:** [dense TP follow-up](vllm033-runtime-sp-dense-tp.md)
+restores ordinary dense MLP gather/TP/reduce-scatter while shared experts remain
+replicated. The original complete-model log also contains three `mp.spawn`
+SIGTERM attempts after rank numerical exceptions. Its controller recorded no
+signals, but that is not signal-free diagnostic shutdown; original evidence
+and failed numerical gates remain preserved.
+
 ## Implementation
 
 Vocabulary-TP embeddings receive the same complete input IDs on every rank
@@ -95,7 +102,8 @@ the active7 comparisons pass the unchanged absolute-plus-relative assertion.
 All 16 family/rank/replay comparisons against SP eager are exactly equal.
 Padding stays finite/zero and addresses remain fixed with active tokens5→7.
 Controller exit1 is expected from the retained numerical failures; tracker0,
-no signals, no owned survivors and all18 RECORDs unchanged. This is not model
+no controller cleanup signals, no owned survivors and all18 RECORDs unchanged.
+`mp.spawn` did log three SIGTERM attempts; see the correction above. This is not model
 qualification or a normal-serving shutdown result.
 
 The preceding diagnostic completed GLM4 before HY3 construction failed because

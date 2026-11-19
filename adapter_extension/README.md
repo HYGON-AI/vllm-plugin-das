@@ -106,8 +106,9 @@ groups. These helpers have no automatic model registration or serving enablement
 
 Explicit model-boundary candidates compose full vocabulary-TP embedding before
 token sharding, local hidden/residual streams, global attention positions,
-device padding masks and gather/trim at stage exits. Dense/shared MLP weights
-are selected before official allocation; a scoped model-local factory bridge
+device padding masks and gather/trim at stage exits. Ordinary dense MLPs gather
+tokens, retain official TP weights and reduce-scatter down-projection partials;
+shared experts select replicated weights before allocation. A model-local bridge
 passes early SP policy and a narrow MoE padding runner. Official inner loops,
 loading, routing and logits remain inherited. No ModelRegistry entry enables
 these candidates automatically.
@@ -120,7 +121,8 @@ unpublished dependency; no released combination is qualified. See
 [component validation and standalone probes](
 ../docs/validation/vllm033-runtime-sp-components.md) and
 [model boundaries and preserved failures](
-../docs/validation/vllm033-runtime-sp-boundaries.md).
+../docs/validation/vllm033-runtime-sp-boundaries.md), plus the subsequent
+[dense TP policy correction](../docs/validation/vllm033-runtime-sp-dense-tp.md).
 
 ## Standalone Step5 MTP configuration
 

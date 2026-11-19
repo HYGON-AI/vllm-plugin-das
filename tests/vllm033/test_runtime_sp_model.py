@@ -51,8 +51,8 @@ def values(rows, columns, epoch=0):
 @pytest.mark.parametrize("family,shared", [("glm4", False), ("glm4", True), ("hy3", False), ("hy3", True)])
 def test_official_dense_shared_mlp_load_reload_and_local_tokens(core, rank, family, shared):
     core.rank_in_group = rank
-    # These dimensions cannot be TP4-sharded; replication must precede allocation.
-    hidden, middle, rows = 13, 19, 3
+    # Shared weights may be nondivisible; dense intermediate weights retain TP.
+    hidden, middle, rows = 13, 19 if shared else 20, 3
     cls = glm4_moe.Glm4MoeMLP if family == "glm4" else hy_v3.HYV3FeedForward
     prefix = "model.layers.0.mlp"
     if shared:
@@ -62,12 +62,17 @@ def test_official_dense_shared_mlp_load_reload_and_local_tokens(core, rank, fami
     up, down = module.gate_up_proj, module.down_proj
     assert type(up) is sp.RuntimeSPMergedColumnParallelLinear
     assert type(down) is sp.RuntimeSPRowParallelLinear
-    assert up.tp_size == down.tp_size == 1 and up.tp_rank == down.tp_rank == 0
-    assert up.weight.shape == (2 * middle, hidden) and down.weight.shape == (hidden, middle)
+    partitions = 1 if shared else 4
+    assert up.tp_size == down.tp_size == partitions
+    assert up.tp_rank == down.tp_rank == (0 if shared else rank)
+    assert up.weight.shape == (2 * middle // partitions, hidden)
+    assert down.weight.shape == (hidden, middle // partitions)
     assert up.weight_loader_v2.__func__ is linear.MergedColumnParallelLinear.weight_loader_v2
     assert down.weight_loader_v2.__func__ is linear.RowParallelLinear.weight_loader_v2
     assert not down._runtime_sp and down._runtime_sp_mlp
-    assert down.reduce_results is (not shared)
+    assert not down.reduce_results
+    assert up._runtime_sp_mlp_gather is (not shared)
+    assert down._runtime_sp_mlp_gather is (not shared)
     for layer in (up, down):
         layer.quant_method._gemm_impl = lambda layer, x, w, b: F.linear(x, w, b)
     module.act_fn._forward_method = module.act_fn.forward_native
@@ -78,12 +83,105 @@ def test_official_dense_shared_mlp_load_reload_and_local_tokens(core, rank, fami
         down.weight.weight_loader(down.weight, wdown)
         for layer in (up, down):
             layer.update_param_tp_status()
-        torch.testing.assert_close(up.weight, wup, rtol=0, atol=0)
-        torch.testing.assert_close(down.weight, wdown, rtol=0, atol=0)
-        x = values(4 * rows, hidden, epoch + 3)[rank * rows:(rank + 1) * rows]
-        gate, value = F.linear(x, wup).chunk(2, dim=-1)
-        expected = F.linear(F.silu(gate) * value, wdown)
-        torch.testing.assert_close(module(x), expected, rtol=0, atol=0)
+        x = values(4 * rows, hidden, epoch + 3)
+        local = x[rank * rows:(rank + 1) * rows]
+        if shared:
+            torch.testing.assert_close(up.weight, wup, rtol=0, atol=0)
+            torch.testing.assert_close(down.weight, wdown, rtol=0, atol=0)
+            gate, value = F.linear(local, wup).chunk(2, dim=-1)
+            expected = F.linear(F.silu(gate) * value, wdown)
+        else:
+            width = middle // 4
+            shards = [torch.cat([part[i * width:(i + 1) * width]
+                                 for part in wup.chunk(2)], dim=0) for i in range(4)]
+            torch.testing.assert_close(up.weight, shards[rank], rtol=0, atol=0)
+            torch.testing.assert_close(down.weight, wdown[:, rank * width:(rank + 1) * width], rtol=0, atol=0)
+            partials = []
+            for i in range(4):
+                gate, value = F.linear(x, shards[i]).chunk(2, dim=-1)
+                partials.append(F.linear(F.silu(gate) * value, wdown[:, i * width:(i + 1) * width]))
+            total = torch.stack(partials).sum(0)
+            calls = []
+            def gather(actual, dim):
+                assert dim == 0
+                torch.testing.assert_close(actual, local, rtol=0, atol=0)
+                calls.append("gather")
+                return x
+            def scatter(actual, dim):
+                assert dim == 0
+                torch.testing.assert_close(actual, partials[rank], rtol=0, atol=0)
+                calls.append("scatter")
+                return total[rank * rows:(rank + 1) * rows]
+            core.all_gather, core.reduce_scatter = gather, scatter
+            expected = total[rank * rows:(rank + 1) * rows]
+        torch.testing.assert_close(module(local), expected, rtol=0, atol=0)
+        if not shared:
+            assert calls == ["gather", "scatter"]
+
+
+@pytest.mark.parametrize("projection", ["gate_up_proj", "down_proj"])
+def test_dense_mlp_refuses_replicated_allocation_before_constructor(core, projection):
+    cls, args = ((linear.MergedColumnParallelLinear, (16, [20, 20]))
+                 if projection == "gate_up_proj" else (linear.RowParallelLinear, (20, 16)))
+    with sp.runtime_sp_model_construction(), pytest.raises(ValueError, match="TP weight allocation"):
+        cls(*args, disable_tp=True, bias=False, prefix="model.layers.0.mlp." + projection)
+
+
+@pytest.mark.parametrize("rank", range(4))
+@pytest.mark.parametrize("family", ["glm4", "hy3"])
+def test_dense_mlp_padding_mask_changes_keep_local_sum_and_finite_values(core, monkeypatch, rank, family):
+    from hcu_vllm_das.parallel import runtime_sp_batch as layout
+    from vllm.forward_context import ForwardContext, override_forward_context
+
+    core.rank_in_group = rank
+    hidden, middle, rows = 13, 20, 2
+    cls = glm4_moe.Glm4MoeMLP if family == "glm4" else hy_v3.HYV3FeedForward
+    with sp.runtime_sp_model_construction():
+        module = cls(hidden, middle, "silu", prefix="model.layers.0.mlp")
+    up, down = module.gate_up_proj, module.down_proj
+    wup, wdown = values(2 * middle, hidden), values(hidden, middle, 2)
+    width = middle // 4
+    shards = [torch.cat([part[i * width:(i + 1) * width] for part in wup.chunk(2)]) for i in range(4)]
+    for i, part in enumerate(wup.chunk(2)):
+        up.weight.weight_loader(up.weight, part, i)
+    down.weight.weight_loader(down.weight, wdown)
+    for layer in (up, down):
+        layer.quant_method._gemm_impl = lambda layer, x, w, b: F.linear(x, w, b)
+    module.act_fn._forward_method = module.act_fn.forward_native
+    padding = torch.zeros(7, dtype=torch.bool)
+    batch = layout.RuntimeSPBatch.create(4, rank, 7, padding, padding.device)
+    original = ForwardContext(no_compile_layers={}, attn_metadata={}, slot_mapping={},
+                              is_padding=batch.local_padding,
+                              additional_kwargs={layout._BATCH_KEY: batch})
+    pointers = batch.global_padding.data_ptr(), batch.local_padding.data_ptr()
+    for epoch, active in enumerate((5, 7, 3)):
+        batch.global_padding.copy_(torch.arange(8) >= active)
+        x = values(8, hidden, epoch + 3).masked_fill(batch.global_padding[:, None], 0)
+        local = x[rank * rows:(rank + 1) * rows].clone()
+        local.masked_fill_(batch.local_padding[:, None], float("nan"))
+        partials = []
+        for i in range(4):
+            gate, value = F.linear(x, shards[i]).chunk(2, dim=-1)
+            partials.append(F.linear(F.silu(gate) * value, wdown[:, i * width:(i + 1) * width]))
+        total = torch.stack(partials).sum(0)
+        calls = []
+        def gather(actual, dim):
+            assert dim == 0 and torch.isfinite(actual).all()
+            torch.testing.assert_close(actual, x[rank * rows:(rank + 1) * rows], rtol=0, atol=0)
+            calls.append("gather")
+            return x
+        def scatter(actual, dim):
+            assert dim == 0 and torch.isfinite(actual).all()
+            torch.testing.assert_close(actual, partials[rank], rtol=0, atol=0)
+            calls.append("scatter")
+            return total[rank * rows:(rank + 1) * rows]
+        core.all_gather, core.reduce_scatter = gather, scatter
+        with override_forward_context(original):
+            actual = module(local)
+        expected = total[rank * rows:(rank + 1) * rows].masked_fill(batch.local_padding[:, None], 0)
+        torch.testing.assert_close(actual, expected, rtol=0, atol=0)
+        assert torch.isfinite(actual).all() and calls == ["gather", "scatter"]
+        assert pointers == (batch.global_padding.data_ptr(), batch.local_padding.data_ptr())
 
 
 def test_mlp_scope_does_not_change_attention_only_or_unrelated_layers(core):

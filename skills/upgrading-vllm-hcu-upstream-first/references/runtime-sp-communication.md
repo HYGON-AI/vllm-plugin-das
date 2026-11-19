@@ -63,14 +63,24 @@ Graph/prefix policy and numerical assertions while diagnosing capture failures.
 
 ## Dense/shared MLP and early MoE construction
 
-Independent token shards cannot use ordinary TP-sharded dense/shared MLP weights:
-an all-reduce would sum different tokens. Under the same explicit model
-construction scope, select replicated merged gate/up and down projections before
-Core allocates weights and loaders. Keep official model MLP forward, activation,
-checkpoint names, scale loaders, post-load processing and TP-status updates.
-Use distinct attention-only/model scopes and precise dense/shared prefixes;
-unrelated projections retain their ordinary TP behavior. Check differing token
-shards, dimensions not divisible by TP, weight reloads and ownership drift.
+Independent token shards must agree on token rows before a TP reduction. Trace
+dense and shared MLP policy separately rather than replicating every projection.
+In the inspected legacy GLM4/HY3 path, ordinary dense MLPs gather tokens before
+the official TP-sharded gate/up GEMM and reduce-scatter the down-projection
+partials back to local token rows. Set down-projection reduce_results=False
+before construction; an intervening all-reduce would duplicate the reduction.
+Shared experts retain local tokens and select replicated weights before official
+allocation. Keep official model MLP forward, activation, checkpoint names,
+scale loaders, post-load processing and TP-status updates. Preserve TP
+divisibility for dense weights; nondivisible shared dimensions are a separate
+case. Scoped prefixes must distinguish ordinary MLPs from shared experts.
+
+Clear local NaN padding before all-gather and global padding before the down
+GEMM; mask the local result after reduce-scatter. Exercise device-mask changes,
+different rank token shards, weight reloads and changed-input Graph replay.
+Compare ordinary TP and SP collective cast/reduction behavior without loosening
+existing numerical gates. Native component correctness with bounded allocations
+alongside another service does not establish uncontended serving performance.
 
 At the inspected 0.33 target, GLM4/HY3 call the plain FusedMoEFactory without its
 existing is_sequence_parallel argument. runner_cls is too late: parallel config,

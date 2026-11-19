@@ -44,7 +44,7 @@ def runtime_sp_attention_construction():
 
 @contextmanager
 def runtime_sp_model_construction():
-    """Prepare attention and replicated dense/shared MLP projections together.
+    """Prepare attention, TP dense MLP and replicated shared projections.
 
     This construction scope does not enable a model. Entry/exit token layouts
     and early routed-expert policy still belong to the composing model owner.
@@ -60,6 +60,10 @@ def runtime_sp_model_construction():
 def _mlp_projection(prefix, name):
     return _mlp_construction.get() and any(prefix.endswith(f".mlp.{path}{name}")
         for path in ("", "shared_experts.", "shared_mlp."))
+
+
+def _dense_mlp_projection(prefix, name):
+    return _mlp_construction.get() and prefix.endswith(f".mlp.{name}")
 
 
 def model_construction_active():
@@ -195,6 +199,7 @@ class RuntimeSPRowParallelLinear(RowParallelLinear):
         params = _bind(_row_signature, self, args, kwargs)
         self._runtime_sp = _construction.get() and params["prefix"].endswith(".self_attn.o_proj")
         self._runtime_sp_mlp = _mlp_projection(params["prefix"], "down_proj")
+        self._runtime_sp_mlp_gather = _dense_mlp_projection(params["prefix"], "down_proj")
         if self._runtime_sp:
             group = _capture_group(self)
             if params["input_size"] % group.world_size:
@@ -202,13 +207,35 @@ class RuntimeSPRowParallelLinear(RowParallelLinear):
             params["disable_tp"] = True
         elif self._runtime_sp_mlp:
             _capture_group(self)
-            params["disable_tp"] = True
+            if self._runtime_sp_mlp_gather:
+                if params["disable_tp"]:
+                    raise ValueError("runtime SP dense MLP requires TP weight allocation")
+                # Dense gate/up sees gathered tokens and retains official TP
+                # weights. Scatter the summed partial outputs instead of
+                # all-reducing them onto every token shard.
+                params["reduce_results"] = False
+            else:
+                params["disable_tp"] = True
         super().__init__(**params)
 
     def forward(self, input_):
         if self._runtime_sp_mlp:
-            _check_group(self)
-            return super().forward(mask_local_padding(input_))
+            group = _check_group(self)
+            if not self._runtime_sp_mlp_gather:
+                return super().forward(mask_local_padding(input_))
+            if input_.ndim != 2 or input_.shape[0] % group.world_size:
+                raise ValueError("runtime SP dense MLP requires gathered padded tokens")
+            batch = current_sp_batch()
+            if batch is not None:
+                if input_.shape[0] != batch.padded_tokens:
+                    raise ValueError("runtime SP dense MLP received an invalid gathered layout")
+                input_ = input_.masked_fill(batch.global_padding[:, None], 0)
+            result = super().forward(input_)
+            output, bias = result if self.return_bias else (result, None)
+            if group.world_size > 1:
+                output = group.reduce_scatter(output, dim=0)
+            output = mask_local_padding(output)
+            return (output, bias) if self.return_bias else output
         if not self._runtime_sp:
             return super().forward(input_)
         group = _check_group(self)
@@ -234,17 +261,23 @@ class RuntimeSPMergedColumnParallelLinear(MergedColumnParallelLinear):
     def __init__(self, *args, **kwargs):
         params = _bind(_merged_signature, self, args, kwargs)
         self._runtime_sp_mlp = _mlp_projection(params["prefix"], "gate_up_proj")
+        self._runtime_sp_mlp_gather = _dense_mlp_projection(params["prefix"], "gate_up_proj")
         if self._runtime_sp_mlp:
             _capture_group(self)
-            # Independent token shards cannot all-reduce intermediate shards.
-            # Select full weights before Core allocates parameters and loaders.
-            params["disable_tp"] = True
+            # Shared experts remain local/replicated; ordinary dense MLPs keep
+            # TP allocation/loading and gather token rows before their GEMM.
+            if self._runtime_sp_mlp_gather and params["disable_tp"]:
+                raise ValueError("runtime SP dense MLP requires TP weight allocation")
+            if not self._runtime_sp_mlp_gather:
+                params["disable_tp"] = True
         super().__init__(**params)
 
     def forward(self, input_):
         if self._runtime_sp_mlp:
-            _check_group(self)
+            group = _check_group(self)
             input_ = mask_local_padding(input_)
+            if self._runtime_sp_mlp_gather and group.world_size > 1:
+                input_ = group.all_gather(input_.contiguous(), dim=0)
         return super().forward(input_)
 
 
