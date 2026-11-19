@@ -264,6 +264,8 @@ class HcuV41PcpForCausalLM(native_vl.DeepseekV41ForCausalLM):
             init = (_FP4_EPLB_OUTER_INIT if self._hcu_static_eplb_config is not None
                     else _FP4_OUTER_INIT)
             init(self, vllm_config=vllm_config, prefix=prefix)
+            from ..dspark_ll import install_model_entry_reset
+            install_model_entry_reset(self, vllm_config, 384)
             return
         from ..v41_pcp_activation import check_health
         check_health()
@@ -281,6 +283,9 @@ class HcuV41PcpForCausalLM(native_vl.DeepseekV41ForCausalLM):
         else:
             # PCP1 without the explicit host route remains fully native.
             super().__init__(vllm_config=vllm_config, prefix=prefix)
+
+        from ..dspark_ll import install_model_entry_reset
+        install_model_entry_reset(self, vllm_config, 384)
 
     def load_weights(self, weights):
         cfg = getattr(self, '_hcu_static_eplb_config', None)
