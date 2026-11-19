@@ -29,7 +29,7 @@ import torch
 class _OpSpec:
     name: str
     # Leading positional ``torch.ops.aiter`` schema argument types.
-    torch_types: tuple[str, ...]
+    torch_types: tuple[str | tuple[str, ...], ...]
     # Leading DAS wrapper parameter names; ``None`` means no DAS wrapper and
     # the op is implemented in PyTorch (see :func:`top_k_renorm_probs`).
     das_prefix: tuple[str, ...] | None
@@ -43,12 +43,12 @@ _OPT = "Optional[Tensor]"
 _OP_SPECS = (
     _OpSpec(
         "top_k_top_p_sampling_from_probs",
-        ("Tensor", _OPT, _OPT, "int", _OPT, "float"),
+        ("Tensor", ("Tensor", _OPT), _OPT, "int", _OPT, "float"),
         ("probs", "top_k", "top_p"),
     ),
     _OpSpec(
         "top_p_sampling_from_probs",
-        ("Tensor", _OPT, _OPT, "float"),
+        ("Tensor", ("Tensor", _OPT), _OPT, "float"),
         ("probs", "top_p"),
     ),
     _OpSpec(
@@ -77,7 +77,10 @@ def _torch_op_compatible(namespace: object, spec: _OpSpec) -> bool:
     count = len(spec.torch_types)
     if len(arguments) < count:
         return False
-    if tuple(str(argument.type) for argument in arguments[:count]) != spec.torch_types:
+    if not all(
+        str(argument.type) in ((expected,) if isinstance(expected, str) else expected)
+        for argument, expected in zip(arguments[:count], spec.torch_types)
+    ):
         return False
     # Sampling ops receive ``deterministic`` by keyword; every other trailing
     # argument must have a default because it is never passed.

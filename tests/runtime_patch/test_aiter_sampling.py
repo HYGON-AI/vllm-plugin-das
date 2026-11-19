@@ -203,11 +203,11 @@ def test_resolve_rejects_incompatible_das_wrappers(das_aiter, name, replacement)
 
 _UPSTREAM_SCHEMAS = {
     "top_k_top_p_sampling_from_probs": (
-        "(Tensor probs, Tensor? indices, Tensor? maybe_top_k_arr, int top_k_val, "
+        "(Tensor probs, Tensor indices, Tensor? maybe_top_k_arr, int top_k_val, "
         "Tensor? maybe_top_p_arr, float top_p_val, bool deterministic=False) -> Tensor"
     ),
     "top_p_sampling_from_probs": (
-        "(Tensor probs, Tensor? indices, Tensor? maybe_top_p_arr, float top_p_val, "
+        "(Tensor probs, Tensor indices, Tensor? maybe_top_p_arr, float top_p_val, "
         "bool deterministic=False) -> Tensor"
     ),
     "top_k_renorm_probs": (
@@ -223,12 +223,103 @@ def _define_namespace(name: str, schemas: dict[str, str]):
     return library, getattr(torch.ops, name)
 
 
-def test_torch_op_schema_check_accepts_upstream_schemas():
-    library, namespace = _define_namespace("hcu_test_aiter_ok", _UPSTREAM_SCHEMAS)
+@pytest.mark.parametrize("indices_type", ["Tensor", "Tensor?"])
+def test_torch_op_schema_check_accepts_upstream_schemas(indices_type):
+    schemas = {
+        name: schema.replace("Tensor indices", f"{indices_type} indices")
+        for name, schema in _UPSTREAM_SCHEMAS.items()
+    }
+    suffix = "optional" if indices_type == "Tensor?" else "tensor"
+    library, namespace = _define_namespace(f"hcu_test_aiter_ok_{suffix}", schemas)
     assert all(
         aiter_sampling._torch_op_compatible(namespace, spec)
         for spec in aiter_sampling._OP_SPECS
     )
+    del library
+
+
+@pytest.mark.parametrize("tensor_top_k", [False, True])
+@pytest.mark.parametrize("tensor_top_p", [False, True])
+def test_resolve_and_dispatch_inferred_upstream_schemas(
+    monkeypatch, tensor_top_k, tensor_top_p
+):
+    """Register upstream AITER signatures with CPU-only kernel stubs."""
+    calls = []
+
+    def top_k_top_p_sampling_from_probs(
+        probs: torch.Tensor,
+        indices: torch.Tensor,
+        maybe_top_k_arr: torch.Tensor | None,
+        top_k_val: int,
+        maybe_top_p_arr: torch.Tensor | None,
+        top_p_val: float,
+        deterministic: bool = False,
+    ) -> torch.Tensor:
+        calls.append(
+            (
+                "kp", indices, maybe_top_k_arr, top_k_val,
+                maybe_top_p_arr, top_p_val, deterministic,
+            )
+        )
+        return torch.zeros(probs.shape[0], dtype=torch.int32)
+
+    def top_p_sampling_from_probs(
+        probs: torch.Tensor,
+        indices: torch.Tensor,
+        maybe_top_p_arr: torch.Tensor | None,
+        top_p_val: float,
+        deterministic: bool = False,
+    ) -> torch.Tensor:
+        calls.append(("p", indices, maybe_top_p_arr, top_p_val, deterministic))
+        return torch.ones(probs.shape[0], dtype=torch.int32)
+
+    def top_k_renorm_probs(
+        probs: torch.Tensor,
+        maybe_top_k_arr: torch.Tensor | None,
+        top_k_val: int,
+    ) -> torch.Tensor:
+        calls.append(("k", maybe_top_k_arr, top_k_val))
+        return probs.clone()
+
+    functions = (
+        top_k_top_p_sampling_from_probs,
+        top_p_sampling_from_probs,
+        top_k_renorm_probs,
+    )
+    schemas = {
+        function.__name__: torch.library.infer_schema(function, mutates_args=())
+        for function in functions
+    }
+    library, namespace = _define_namespace(
+        f"hcu_test_aiter_inferred_{tensor_top_k}_{tensor_top_p}", schemas
+    )
+    for function in functions:
+        library.impl(function.__name__, function, "CPU")
+    monkeypatch.setattr(torch.ops, "aiter", namespace)
+    monkeypatch.setitem(sys.modules, "aiter.ops.sampling", None)
+
+    for spec in aiter_sampling._OP_SPECS:
+        if spec.sampling:
+            schema = getattr(namespace, spec.name).default._schema
+            assert str(schema.arguments[1].type) == "Tensor"
+
+    ops = aiter_sampling.resolve_aiter_sampling_ops()
+    assert isinstance(ops, aiter_sampling.TorchAiterSamplingOps)
+    probs = torch.full((2, 4), 0.25)
+    top_k = torch.tensor([2, 3]) if tensor_top_k else 2
+    top_p = torch.tensor([0.5, 0.9]) if tensor_top_p else 0.7
+
+    assert ops.top_k_top_p_sampling_from_probs(probs, top_k, top_p).tolist() == [0, 0]
+    assert ops.top_p_sampling_from_probs(probs, top_p).tolist() == [1, 1]
+    torch.testing.assert_close(ops.top_k_renorm_probs(probs, top_k), probs)
+
+    expected_top_k = (top_k, 0) if tensor_top_k else (None, top_k)
+    expected_top_p = (top_p, 0.0) if tensor_top_p else (None, top_p)
+    assert calls == [
+        ("kp", None, *expected_top_k, *expected_top_p, True),
+        ("p", None, *expected_top_p, True),
+        ("k", *expected_top_k),
+    ]
     del library
 
 
@@ -237,16 +328,31 @@ def test_torch_op_schema_check_accepts_upstream_schemas():
     [
         # Same name, merged (DAS-style) arguments.
         ("top_p_sampling_from_probs", "(Tensor probs, Tensor top_p) -> Tensor"),
+        (
+            "top_p_sampling_from_probs",
+            "(Tensor probs, int indices, Tensor? maybe_top_p_arr, "
+            "float top_p_val, bool deterministic=False) -> Tensor",
+        ),
+        (
+            "top_p_sampling_from_probs",
+            "(Tensor probs, Tensor indices, Tensor maybe_top_p_arr, "
+            "float top_p_val, bool deterministic=False) -> Tensor",
+        ),
         # Missing the keyword-passed ``deterministic``.
         (
             "top_p_sampling_from_probs",
-            "(Tensor probs, Tensor? indices, Tensor? maybe_top_p_arr, "
+            "(Tensor probs, Tensor indices, Tensor? maybe_top_p_arr, "
             "float top_p_val) -> Tensor",
         ),
         # Extra required trailing argument.
         (
             "top_k_renorm_probs",
             "(Tensor probs, Tensor? maybe_top_k_arr, int top_k_val, int extra) -> Tensor",
+        ),
+        (
+            "top_p_sampling_from_probs",
+            "(Tensor probs, Tensor indices, Tensor? maybe_top_p_arr, "
+            "float top_p_val, int extra, bool deterministic=False) -> Tensor",
         ),
     ],
 )
