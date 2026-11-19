@@ -55,6 +55,29 @@ def test_static_eplb_rejects_round_robin_placement_before_moe_construction(
         runtime.moe_eplb_kwargs(cfg, 'model.layers.0.ffn.experts')
 
 
+@pytest.mark.parametrize('recording,replay,skip_padding,allowed', [
+    (True, True, None, True),
+    (True, True, '1', True),
+    (True, True, '0', False),
+    (True, False, '0', True),
+    (False, True, '0', True),
+])
+def test_static_eplb_swa_replay_calibration_padding(
+        chain, monkeypatch, recording, replay, skip_padding, allowed):
+    cfg = static_config(chain.cfg, recording=recording)
+    cfg.cache_config.swa_bounded_replay = replay
+    monkeypatch.setenv('HCU_VLLM_PCP_IMPL', 'native')
+    if skip_padding is None:
+        monkeypatch.delenv('VLLM_MOE_SKIP_PADDING', raising=False)
+    else:
+        monkeypatch.setenv('VLLM_MOE_SKIP_PADDING', skip_padding)
+    if not allowed:
+        with pytest.raises(runtime.StaticEplbError, match='VLLM_MOE_SKIP_PADDING=1'):
+            runtime.validate_config(cfg)
+    else:
+        assert runtime.validate_config(cfg)
+
+
 @pytest.mark.parametrize('fp4', [False, True])
 @pytest.mark.parametrize('static', [False, True])
 def test_outer_selects_composed_constructor(chain, monkeypatch, fp4, static):

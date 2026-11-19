@@ -82,8 +82,13 @@ for example when recording a single request:
    service with the resulting file as `expert_map_path`. Omit the recording
    fields from the deployment configuration.
 
-Padding remains excluded. Without `record_start_file`, dummy forwards that
-have attention metadata can enter the calibration counts.
+Calibration with SWA bounded replay requires `VLLM_MOE_SKIP_PADDING=1`
+(the vLLM default). The router marks replay padding with invalid expert IDs
+so the load recorder can exclude it. Calibration with replay and
+`VLLM_MOE_SKIP_PADDING=0` fails at startup.
+
+Without `record_start_file`, dummy forwards that have attention metadata
+can enter the calibration counts.
 
 For the validated W4A8 + FP4 + SWA + DSpark configuration, use eager V2 with
 TP1/DP1/PP1/DCP1, PCP8/EP8 and `deepep_high_throughput`. Use this speculative

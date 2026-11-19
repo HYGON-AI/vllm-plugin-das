@@ -115,6 +115,8 @@ def validate_config(cfg) -> bool:
     options = read_options(cfg)
     if options is None:
         return False
+    from vllm import envs
+
     from .v41_pcp import validate_config as validate_pcp
     errors = []
     p = cfg.parallel_config
@@ -133,6 +135,11 @@ def validate_config(cfg) -> bool:
         errors.append('static EPLB requires the owned DeepGEMM expert path')
     if options.recording and p.enable_dbo:
         errors.append('calibration cannot attribute load across DBO ubatches')
+    # Replay uses a different batch. The router must mark its padding as
+    # invalid because the recorder has only the original batch's row count.
+    if (options.recording and cfg.cache_config.swa_bounded_replay
+            and not envs.VLLM_MOE_SKIP_PADDING):
+        errors.append('calibration with SWA bounded replay requires VLLM_MOE_SKIP_PADDING=1')
     # EP width is the flattened TP/PCP width; reject an unusable redundancy here
     # rather than at the first proposal, which would kill one rank mid-run.
     ep_size = p.prefill_context_parallel_size * p.tensor_parallel_size
