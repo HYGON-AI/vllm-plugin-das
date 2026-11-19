@@ -341,6 +341,14 @@ requirement are rejected. The selected producer ABI is CPython3.12,
 DTK26.10/Torch2.13. Complete versions and hashes freeze this candidate's build
 inputs, rather than imposing a Plugin runtime exact-wheel policy.
 
+Both paired-wheel preparation and installed-image inspection require the PCP
+DSpark companion module and the declared selectable `vllm_pcp_q_rope/hcu`
+catalog backend. The catalog is read as a static Python literal without
+importing Adapter or executing configuration code. A valid RECORD and matching
+package version can still describe an older payload missing these interfaces.
+This structural check rejects that delivery before native inspection; it does
+not qualify module imports, registry publication, native numerics or a model.
+
 The wheels stay in the existing fixed private project/package origin. A short
 lived read-only package credential is confined to preparation. Offline Docker
 installation applies all selected wheels together, and inspection verifies
