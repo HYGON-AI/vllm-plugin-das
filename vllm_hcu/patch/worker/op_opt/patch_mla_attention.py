@@ -439,6 +439,19 @@ def apply_to_module(module: ModuleType) -> bool:
             if multi_token_decodes.any():
                 seq_lens_cpu = getattr(common_attn_metadata, "_seq_lens_cpu", None)
                 if seq_lens_cpu is None:
+                    vllm_config = getattr(self, "vllm_config", None)
+                    scheduler_config = getattr(vllm_config, "scheduler_config", None)
+                    speculative_config = getattr(vllm_config, "speculative_config", None)
+                    if (
+                        getattr(scheduler_config, "async_scheduling", None) is False
+                        and getattr(
+                            speculative_config, "enable_adaptive_verification", False
+                        ) is False
+                    ):
+                        seq_lens_cpu = getattr(
+                            common_attn_metadata, "seq_lens_cpu_upper_bound", None
+                        )
+                if seq_lens_cpu is None:
                     seq_lens_cpu = common_attn_metadata.seq_lens.cpu()
                 common_attn_metadata = copy.copy(common_attn_metadata)
                 common_attn_metadata.seq_lens_cpu_upper_bound = seq_lens_cpu

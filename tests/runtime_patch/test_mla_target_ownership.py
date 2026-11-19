@@ -4,6 +4,7 @@
 
 from __future__ import annotations
 
+import ast
 import importlib
 import importlib.util
 import sys
@@ -1252,6 +1253,161 @@ def test_mla_prefill_fallback_uses_actual_split_and_sequence_lengths(
             attn_mask=key_positions <= expected_context_len + query_positions,
         )
         torch.testing.assert_close(actual_output, expected_output)
+
+
+@pytest.fixture
+def mrv2_prepare_attn():
+    import vllm
+    from vllm.config.compilation import CUDAGraphMode
+    from vllm.v1.attention.backend import CommonAttentionMetadata
+
+    assert CommonAttentionMetadata.__dataclass_fields__["_seq_lens_cpu"].default is None
+    namespace = {
+        "torch": torch,
+        "CUDAGraphMode": CUDAGraphMode,
+        "CommonAttentionMetadata": CommonAttentionMetadata,
+    }
+    for relative_path, owner, function_name in (
+        ("v1/worker/gpu/attn_utils.py", None, "build_attn_metadata"),
+        ("v1/worker/gpu/model_states/default.py", "DefaultModelState", "prepare_attn"),
+    ):
+        source_path = Path(vllm.__file__).parent / relative_path
+        body = ast.parse(source_path.read_text()).body
+        if owner is not None:
+            body = next(
+                node for node in body
+                if isinstance(node, ast.ClassDef) and node.name == owner
+            ).body
+        function = next(
+            node for node in body
+            if isinstance(node, ast.FunctionDef) and node.name == function_name
+        )
+        source = ast.Module(body=[function], type_ignores=[])
+        exec(compile(source, str(source_path), "exec"), namespace)
+    return namespace["prepare_attn"], CUDAGraphMode
+
+
+@pytest.mark.parametrize(
+    "query_lens,actual_lengths,upper_bound,query_len_support,decode_threshold",
+    [
+        pytest.param([4], [108], [110], "SINGLE_ONLY", 1, id="single-only"),
+        pytest.param([4, 2], [108, 106], [108, 108], "UNIFORM", 128, id="uniform"),
+    ],
+)
+@pytest.mark.parametrize("graph_mode", ["PIECEWISE", "FULL", "FULL_PADDED"])
+@pytest.mark.parametrize(
+    "async_scheduling,adaptive_verification,has_config,needs_sync",
+    [
+        pytest.param(False, False, True, False, id="sync-no-mirror"),
+        pytest.param(True, False, True, True, id="async-rejection"),
+        pytest.param(False, True, True, True, id="adaptive-verification"),
+        pytest.param(None, False, True, True, id="unresolved-scheduling"),
+        pytest.param(False, None, True, True, id="unknown-adaptive-state"),
+        pytest.param(None, None, False, True, id="missing-config"),
+    ],
+)
+def test_mrv2_prefill_fallback_reuses_exact_cpu_upper_bound(
+    monkeypatch, mrv2_prepare_attn, query_lens, actual_lengths, upper_bound,
+    query_len_support, decode_threshold, graph_mode, async_scheduling,
+    adaptive_verification, has_config, needs_sync,
+):
+    from vllm import envs
+    from vllm.v1.attention.backends.utils import split_decodes_and_prefills
+
+    monkeypatch.setattr(envs, "VLLM_USE_V2_MODEL_RUNNER", True)
+    prepare_attn, cudagraph_mode = mrv2_prepare_attn
+    adapter = _adapter()
+    module = _fake_mla_module(adapter, [])
+    module.split_decodes_and_prefills = split_decodes_and_prefills
+    produced_metadata = []
+
+    def build(self, common_prefix_len, common_attn_metadata, fast_build=False):
+        num_decodes = module.split_decodes_and_prefills(
+            common_attn_metadata,
+            decode_threshold=self.reorder_batch_threshold,
+            require_uniform=True,
+            treat_short_extends_as_decodes=True,
+        )[0]
+        return SimpleNamespace(
+            common=common_attn_metadata,
+            context_lens=(
+                common_attn_metadata.seq_lens_cpu_upper_bound[num_decodes:]
+                - common_attn_metadata.query_start_loc_cpu.diff()[num_decodes:]
+            ),
+        )
+
+    module.MLACommonMetadataBuilder.build = build
+    assert adapter.apply_to_module(module) is True
+    metadata_builder = module.MLACommonMetadataBuilder()
+    metadata_builder.query_len_support = getattr(module.QueryLenSupport, query_len_support)
+    metadata_builder.reorder_batch_threshold = decode_threshold
+    if has_config:
+        metadata_builder.vllm_config = SimpleNamespace(
+            parallel_config=SimpleNamespace(prefill_context_parallel_size=1),
+            scheduler_config=SimpleNamespace(async_scheduling=async_scheduling),
+            speculative_config=SimpleNamespace(
+                enable_adaptive_verification=adaptive_verification,
+            ),
+        )
+
+    def record_and_build(common_prefix_len, common_attn_metadata):
+        produced_metadata.append(common_attn_metadata)
+        return metadata_builder.build(common_prefix_len, common_attn_metadata)
+
+    num_reqs = len(query_lens)
+    num_padded_reqs = 4 if graph_mode == "FULL_PADDED" else num_reqs
+    padding = [0] * (num_padded_reqs - num_reqs)
+    device_lengths = torch.tensor(actual_lengths + padding, dtype=torch.int32)
+    cpu_lengths = upper_bound if needs_sync else actual_lengths
+    original_upper_bound = torch.tensor(cpu_lengths + padding, dtype=torch.int32)
+    query_offsets = torch.tensor([0] + query_lens + padding, dtype=torch.int32).cumsum(0)
+    input_batch = SimpleNamespace(
+        num_reqs=num_reqs,
+        num_reqs_after_padding=num_padded_reqs,
+        num_tokens=sum(query_lens),
+        num_tokens_after_padding=sum(query_lens) + len(padding),
+        query_start_loc_np=query_offsets.numpy(),
+        query_start_loc=query_offsets,
+        max_query_len=max(query_lens),
+        seq_lens=device_lengths,
+        seq_lens_cpu_upper_bound=original_upper_bound,
+        dcp_local_seq_lens=None,
+        positions=None,
+        is_prefilling_np=torch.zeros(num_reqs, dtype=torch.bool).numpy(),
+        prompt_lens=None,
+    )
+    state = SimpleNamespace(supports_mm_inputs=False)
+    attn_group = SimpleNamespace(
+        get_metadata_builder=lambda ubatch_idx: SimpleNamespace(build=record_and_build),
+        layer_names=["mla.layer"],
+    )
+    cpu_calls = []
+    original_cpu = torch.Tensor.cpu
+
+    def record_cpu(tensor, *args, **kwargs):
+        if tensor.untyped_storage().data_ptr() == device_lengths.untyped_storage().data_ptr():
+            cpu_calls.append("cpu")
+        return original_cpu(tensor, *args, **kwargs)
+
+    monkeypatch.setattr(torch.Tensor, "cpu", record_cpu)
+    result = prepare_attn(
+        state, input_batch,
+        getattr(cudagraph_mode, "FULL" if graph_mode.startswith("FULL") else graph_mode),
+        (torch.zeros(num_padded_reqs, 1, dtype=torch.int32),),
+        torch.zeros(input_batch.num_tokens_after_padding, dtype=torch.int64),
+        [[attn_group]], SimpleNamespace(kv_cache_groups=[object()]),
+    )["mla.layer"]
+
+    assert len(produced_metadata) == 1
+    common = produced_metadata[0]
+    assert common._seq_lens_cpu is None
+    assert result.common._seq_lens_cpu is None
+    assert cpu_calls == (["cpu"] if needs_sync else [])
+    assert result.context_lens.tolist() == [104] + padding
+    assert common.seq_lens_cpu_upper_bound.tolist() == cpu_lengths + padding
+    assert original_upper_bound.tolist() == cpu_lengths + padding
+    if not needs_sync:
+        assert result.common.seq_lens_cpu_upper_bound is common.seq_lens_cpu_upper_bound
 
 
 def test_dense_and_sparse_mla_metadata_carry_parallel_sizes(monkeypatch):
