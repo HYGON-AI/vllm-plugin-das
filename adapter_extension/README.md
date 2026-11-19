@@ -88,6 +88,29 @@ operator, so the plugin neither registers nor ships a `SiluAndMul` override.
 No model, topology, FP8-KV, or broad performance support is implied by these
 operator-level capabilities.
 
+## Runtime SP components under development
+
+`das_hcu_runtime_sp_communication` supplies the explicitly requested
+`runtime-sp-communication` capability. It requires Adapter's public
+communicator-selector seam and an exact process-local capability health binding.
+With the existing `additional_config['hcu']['enable_custom_sp']` boolean, the
+Plugin subclass passes EP admission before the official communicator constructs
+its manager. Backend selection, dispatch/combine and destruction stay official.
+Public Torch all-to-all uses the borrowed device group.
+
+The attention projection helpers retain official GLM4/HY3 modules and Linear
+loaders/GEMM, with explicit scoped construction and concrete public OOT owners.
+They adapt local tokens/full heads to global tokens/local heads and invert the
+exchange before the output projection. Replicated GQA uses contiguous replica
+groups. These helpers have no automatic model registration or serving enablement.
+
+These are **communication and attention components**, not full custom-SP model
+support. Embedding/residual/PP boundaries, dense/shared MLP, early MoE factory
+policy, target/draft batching, model accuracy and lifecycle remain open. The
+paired Adapter seam is an unpublished dependency; no released combination is
+qualified. See [validation and standalone probes](
+../docs/validation/vllm033-runtime-sp-components.md).
+
 ## Standalone Step5 MTP configuration
 
 `das_hcu_step5_config` declares the `step5-standalone-mtp-config` capability.
