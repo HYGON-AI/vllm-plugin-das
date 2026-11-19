@@ -3,6 +3,9 @@
 Selected by the normal SlimQuant method only for the explicit Step5 profile.
 """
 
+import json
+import os
+
 import torch
 import triton
 from vllm.logger import init_logger
@@ -16,7 +19,7 @@ from .step5_w4a8_kernels import (
     activation_persistent,
     small_permute,
 )
-from .step5_w4a8_routing import permute64
+from .step5_w4a8_routing import permute64, permute_aligned
 
 
 def _generation(layer):
@@ -35,6 +38,24 @@ def _no_reload(*args, **kwargs):
     raise RuntimeError("W4A8 packed layout: restart from checkpoint for reload or EPLB")
 
 
+def _rsi_trace(payload):
+    """Append a runtime provenance record when explicitly requested.
+
+    This is the only way to prove which GEMM entry actually ran in the
+    forked vLLM workers; environment variables alone are not evidence.
+    """
+    path = os.environ.get("VLLM_HCU_STEP5_W4A8_TRACE")
+    if not path:
+        return
+    try:
+        record = dict(payload)
+        record["pid"] = os.getpid()
+        with open(path, "a") as fh:
+            fh.write(json.dumps(record) + "\n")
+    except OSError:
+        pass
+
+
 @lru_cache(maxsize=2)
 def _make_experts_class(phase):
     is_prefill = phase == "prefill"
@@ -49,8 +70,45 @@ def _make_experts_class(phase):
     from vllm_hcu.ops.step5.w4a8 import require_native_op
 
     op = require_native_op()
+    experiment = os.environ.get("VLLM_HCU_STEP5_W4A8_EXPERIMENT", "native")
+    use_modeswap = experiment == "agrs_deepgemm1006"
 
-    def native_gemm(a, b, output, indices, config):
+    # MODE1006 packs M*K bytes into a 32-bit buffer-descriptor size, so each
+    # call must stay below 4 GiB.  Cuts are 128-row aligned, hence they never
+    # split an expert segment (segments are also 128-row aligned).
+    _MODE1006_MAX_ROWS = (1 << 32) // 4096 - 128
+
+    _rsi_traced = [False]
+
+    def native_gemm(a, b, output, indices, config, use_deepgemm_gemm=False):
+        if use_deepgemm_gemm:
+            # Same packed HIPC weights, scales, and activation contract; only
+            # the grouped GEMM engine changes. MODE1006 selects 16/32/64/128
+            # rows per tile on device and therefore requires 128-row aligned
+            # expert segments. Small/decode-shaped calls keep MODE1002.
+            total = output.shape[0]
+            for start in range(0, total, _MODE1006_MAX_ROWS):
+                end = min(start + _MODE1006_MAX_ROWS, total)
+                dg.m_grouped_w4a8_gemm_nt_contiguous_hipc(
+                    (a[0][start:end], a[1][start:end].contiguous()),
+                    (b[0], b[1].contiguous()),
+                    output[start:end],
+                    indices[start:end].contiguous(),
+                    config={"MODE": 1006},
+                )
+            if not _rsi_traced[0]:
+                _rsi_traced[0] = True
+                _rsi_trace({
+                    "event": "gemm",
+                    "engine": "deepgemm_contiguous_hipc",
+                    "mode": 1006,
+                    "M": int(total),
+                    "N": int(output.shape[1]),
+                    "K": int(a[0].shape[1]),
+                    "chunks": (int(total) + _MODE1006_MAX_ROWS - 1)
+                    // _MODE1006_MAX_ROWS,
+                })
+            return output
         op(
             a[0],
             b[0],
@@ -144,7 +202,10 @@ def _make_experts_class(phase):
             if not is_prefill or (N, K) != (3072, 4096):
                 return base
             if expert_tokens_meta is None:
-                aligned = padded_route_rows(M, topk, local_num_experts)
+                aligned = padded_route_rows(
+                    M, topk, local_num_experts,
+                    alignment=128 if use_modeswap else 64,
+                )
             else:
                 from vllm_hcu.model_executor.layers.quantization import (
                     slimquant_w4a8_deepgemm_runtime as dg,
@@ -201,8 +262,17 @@ def _make_experts_class(phase):
                 and a1q_scale.is_contiguous()
                 and expert_tokens_meta is None
             )
+            use_large128 = (
+                is_prefill
+                and use_modeswap
+                and not use_small
+                and expert_tokens_meta is None
+                and expert_map is not None
+                and a1q_scale.is_contiguous()
+            )
             use_large64 = (
                 is_prefill
+                and not use_modeswap
                 and not use_small
                 and expert_tokens_meta is None
                 and expert_map is not None
@@ -217,8 +287,20 @@ def _make_experts_class(phase):
             )
             if use_small:
                 aligned = padded_route_rows(hidden_states.shape[0], topk, E)
+            elif use_large128:
+                aligned = padded_route_rows(
+                    hidden_states.shape[0], topk, E, alignment=128
+                )
             elif use_large64:
                 aligned = padded_route_rows(hidden_states.shape[0], topk, E)
+            if use_modeswap and not getattr(self, "_rsi_aligned_logged", False):
+                self._rsi_aligned_logged = True
+                logger.info(
+                    "[step5-w4a8-rsi] tokens=%d topk=%d aligned=%d "
+                    "workspace13=%d bytes, mode=1006 alignment=128",
+                    hidden_states.shape[0], topk, aligned,
+                    workspace13.numel() * workspace13.element_size(),
+                )
             gathered = _resize_cache(workspace13.view(dtype=torch.int8), (aligned, K))
             if use_small:
                 aq, scales, indices, inverse, _ = small_permute(
@@ -229,6 +311,16 @@ def _make_experts_class(phase):
                     E,
                     gathered,
                     global_num_experts,
+                )
+            elif use_large128:
+                aq, scales, indices, inverse, _ = permute_aligned(
+                    hidden_states,
+                    self._ensure_2d_scale(a1q_scale),
+                    topk_ids,
+                    expert_map,
+                    E,
+                    gathered,
+                    alignment=128,
                 )
             elif use_large64:
                 aq, scales, indices, inverse, _ = permute64(
@@ -257,6 +349,7 @@ def _make_experts_class(phase):
                 gateup,
                 indices,
                 config={"MODE": 1002},
+                use_deepgemm_gemm=use_large128,
             )
             intermediate = _resize_cache(
                 workspace13.view(dtype=torch.int8), (aligned, N // 2)
@@ -294,6 +387,7 @@ def _make_experts_class(phase):
                 down,
                 indices,
                 config={"MODE": 1002},
+                use_deepgemm_gemm=use_large128,
             )
             # Same provider/state protocol as FP8 fused experts. It declines
             # while DP-pipe owns combine or shared output is not ready. The
@@ -340,6 +434,12 @@ def prepare_step5_w4a8(method, layer, phase):
     activation = getattr(method.moe.activation, "value", method.moe.activation)
     if activation != "swiglustep":
         raise ValueError("Native Step5 experts require SwigluStep activation")
+    experiment = os.environ.get("VLLM_HCU_STEP5_W4A8_EXPERIMENT", "native")
+    if experiment not in ("native", "agrs_deepgemm1006"):
+        raise ValueError(
+            "This W4 profile supports experiment=native|agrs_deepgemm1006"
+        )
+    use_modeswap = experiment == "agrs_deepgemm1006"
     parallel = method.moe.moe_parallel_config
     if parallel.enable_eplb or parallel.all2all_backend != "allgather_reducescatter":
         raise ValueError(
@@ -377,7 +477,11 @@ def prepare_step5_w4a8(method, layer, phase):
     method.moe_quant_config = quant
     method.moe_kernel = mk.FusedMoEKernel(prepare, experts)
     logger.info_once(
-        "[step5-w4a8-native] built-in hcu_ops, profile=%s, static EP8", phase
+        "[step5-w4a8-native] built-in hcu_ops, profile=%s, static EP8, "
+        "experiment=%s gemm=%s alignment=%d",
+        phase, experiment,
+        "deepgemm_hipc_mode1006" if use_modeswap else "native",
+        128 if use_modeswap else 64,
     )
     # The modular prepare owns quantize/dispatch and the modular kernel
     # owns pipe/DBO/combine. Outer naive dispatch must therefore be off.
@@ -386,9 +490,12 @@ def prepare_step5_w4a8(method, layer, phase):
     layer._hcu_step5_w4a8_backend = {
         "experts": type(experts).__name__,
         "prepare": type(prepare).__name__,
+        "experiment": experiment,
+        "gemm": "deepgemm_hipc_mode1006" if use_modeswap else "native",
+        "route_alignment": 128 if use_modeswap else 64,
         "activation_dtype": "int8",
         "weight_bits": 4,
-        "gemm_mode": 1002,
+        "gemm_mode": 1006 if use_modeswap else 1002,
         "reduction_block": 2048,
         "small_route_alignment": 64,
         "prefill_activation": "persistent8x512",
@@ -396,6 +503,9 @@ def prepare_step5_w4a8(method, layer, phase):
         "shared_add_protocol": "EP_COMBINE provider/finalize",
         "weight_scale": "canonical checkpoint s8, no x16 copy",
     }
+    if use_modeswap:
+        _rsi_trace({"event": "backend", "phase": phase,
+                    **layer._hcu_step5_w4a8_backend})
 
 
 def validate_loaded_model(model):
