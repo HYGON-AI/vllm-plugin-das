@@ -13,6 +13,7 @@
  */
 
 #include <cstdint>
+#include <cmath>
 #include <cassert>
 #include <limits>
 
@@ -51,7 +52,7 @@ __device__ __forceinline__ uint16_t float_to_bf16_rne(float x) {
   return static_cast<uint16_t>((v.u + rounding_bias) >> 16);
 }
 
-template <typename PosT>
+template <typename PosT, bool FuseCosine>
 __global__ __launch_bounds__(kBlockSize, 16) void deepseek_v4_inv_rope_kernel(
     void* __restrict__ rope, const PosT* __restrict__ positions,
     const float* __restrict__ cos_sin_cache, int64_t rope_stride_token,
@@ -84,13 +85,20 @@ __global__ __launch_bounds__(kBlockSize, 16) void deepseek_v4_inv_rope_kernel(
   float const s = cache[kHalfRope + lane_id];
 
   // Inverse GPT-J RoPE: (a + bi) * (c - di).
-  float const out_even = even * c + odd * s;
-  float const out_odd = odd * c - even * s;
+  // Match Core's Triton lowering: round the sine product first, then fuse
+  // the cosine product with that addend. Separate FP32 sums differ at BF16
+  // rounding boundaries, especially for nearly cancelling lane pairs.
+  // PCP forward Q rotation shares the layout but preserves its separate
+  // FP32 products and sum. Keep that contract independent of inverse RoPE.
+  float const out_even = FuseCosine ? fmaf(even, c, odd * s)
+                                   : even * c + odd * s;
+  float const out_odd = FuseCosine ? fmaf(odd, c, -(even * s))
+                                  : odd * c - even * s;
   base[lane_id * 2] = float_to_bf16_rne(out_even);
   base[lane_id * 2 + 1] = float_to_bf16_rne(out_odd);
 }
 
-template <typename PosT>
+template <typename PosT, bool FuseCosine>
 void launch_deepseek_v4_inv_rope(torch::Tensor& rope,
                                  torch::Tensor const& positions,
                                  torch::Tensor const& cos_sin_cache) {
@@ -104,7 +112,7 @@ void launch_deepseek_v4_inv_rope(torch::Tensor& rope,
       (total_warps + kWarpsPerBlock - 1) / kWarpsPerBlock;
   auto stream = at::cuda::getCurrentCUDAStream();
 
-  deepseek_v4_inv_rope_kernel<PosT><<<num_blocks, kBlockSize, 0, stream>>>(
+  deepseek_v4_inv_rope_kernel<PosT, FuseCosine><<<num_blocks, kBlockSize, 0, stream>>>(
       rope.data_ptr(), positions.data_ptr<PosT>(),
       cos_sin_cache.data_ptr<float>(), rope.stride(0), rope.stride(1),
       cos_sin_cache.stride(0), num_tokens, num_heads, cos_sin_cache.size(0));
@@ -113,8 +121,9 @@ void launch_deepseek_v4_inv_rope(torch::Tensor& rope,
 
 }  // namespace
 
-void deepseek_v4_inv_rope(torch::Tensor& rope, torch::Tensor const& positions,
-                          torch::Tensor const& cos_sin_cache) {
+template <bool FuseCosine>
+void checked_deepseek_v4_inv_rope(torch::Tensor& rope, torch::Tensor const& positions,
+                                 torch::Tensor const& cos_sin_cache) {
   TORCH_CHECK(rope.is_cuda(), "rope must be CUDA/ROCm");
   TORCH_CHECK(positions.is_cuda(), "positions must be CUDA/ROCm");
   TORCH_CHECK(cos_sin_cache.is_cuda(), "cos_sin_cache must be CUDA/ROCm");
@@ -142,10 +151,19 @@ void deepseek_v4_inv_rope(torch::Tensor& rope, torch::Tensor const& positions,
 
   at::cuda::OptionalCUDAGuard device_guard(device_of(rope));
   if (positions.dtype() == torch::kInt64) {
-    launch_deepseek_v4_inv_rope<int64_t>(rope, positions, cos_sin_cache);
+    launch_deepseek_v4_inv_rope<int64_t, FuseCosine>(rope, positions, cos_sin_cache);
   } else if (positions.dtype() == torch::kInt32) {
-    launch_deepseek_v4_inv_rope<int32_t>(rope, positions, cos_sin_cache);
+    launch_deepseek_v4_inv_rope<int32_t, FuseCosine>(rope, positions, cos_sin_cache);
   } else {
     TORCH_CHECK(false, "positions must be int32 or int64");
+  }
+}
+
+void deepseek_v4_inv_rope(torch::Tensor& rope, torch::Tensor const& positions,
+                          torch::Tensor const& cos_sin_cache, bool fuse_cosine) {
+  if (fuse_cosine) {
+    checked_deepseek_v4_inv_rope<true>(rope, positions, cos_sin_cache);
+  } else {
+    checked_deepseek_v4_inv_rope<false>(rope, positions, cos_sin_cache);
   }
 }

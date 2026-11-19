@@ -136,3 +136,15 @@ Reuse unaffected completed cases only with unchanged source, dependencies and
 configuration evidence. If combining JUnit reports, label the derived report,
 retain each original report and verify the exact case multiset. CPU import/ABI
 success does not qualify native numerics, Graph, model accuracy or lifecycle.
+
+## Inverse-RoPE rounding boundaries
+
+Compare the target Core's emitted instructions, not only its Python arithmetic.
+On the tested DTK 26.10/gfx938 Triton build, inverse-RoPE rounds the sine
+product before fusing the cosine product with that addend. A native kernel
+with two separately rounded products and a separate sum can disagree at the
+BF16 store. Freeze cancellation witnesses with an independent FP64 oracle,
+retain exact eager and changed-input Graph assertions, and cover both position
+index dtypes. This component result does not qualify a model or other builds.
+PCP forward Q shares the native layout but requires separate FP32 products;
+validate both users together rather than changing the shared rounding globally.

@@ -20,7 +20,8 @@ def load_operator():
     root = Path(__file__).with_name("csrc")
     assets = [(name, (root / name).read_bytes())
               for name in ("inverse_rope.cpp", "inverse_rope.cu")]
-    # Match Core's separate FP32 products and sum before the BF16 cast.
+    # Keep the sine product rounded; the kernel explicitly fuses the cosine
+    # product with that addend, matching Core's Triton lowering.
     cuda_flags = ["-O3", "-ffp-contract=off"]
     key = hashlib.sha256(
         (str(torch.__version__) + str(torch.version.hip)).encode()
@@ -47,7 +48,7 @@ def load_operator():
          extra_cuda_cflags=cuda_flags, is_python_module=False, verbose=False)
     operator = torch.ops.hcu_vllm_das.deepseek_v4_inv_rope
     torch.library.register_fake("hcu_vllm_das::deepseek_v4_inv_rope")(
-        lambda rope, position_ids, cos_sin_cache: None)
+        lambda rope, position_ids, cos_sin_cache, fuse_cosine=True: None)
     return operator
 
 
