@@ -2,7 +2,7 @@
 # SPDX-License-Identifier: Apache-2.0
 
 """HCU inverse-RoPE provider, prepared before model execution or Graph capture."""
-from functools import lru_cache
+from functools import lru_cache, partial
 import hashlib
 import os
 from pathlib import Path
@@ -20,7 +20,8 @@ def load_operator():
     root = Path(__file__).with_name("csrc")
     assets = [(name, (root / name).read_bytes())
               for name in ("inverse_rope.cpp", "inverse_rope.cu")]
-    # Match Core's separate FP32 products and sum before the BF16 cast.
+    # Expose both arithmetic modes without compiler-chosen contraction. Inverse
+    # preparation selects the actual Core contract; PCP Q always uses False.
     cuda_flags = ["-O3", "-ffp-contract=off"]
     key = hashlib.sha256(
         (str(torch.__version__) + str(torch.version.hip)).encode()
@@ -47,8 +48,49 @@ def load_operator():
          extra_cuda_cflags=cuda_flags, is_python_module=False, verbose=False)
     operator = torch.ops.hcu_vllm_das.deepseek_v4_inv_rope
     torch.library.register_fake("hcu_vllm_das::deepseek_v4_inv_rope")(
-        lambda rope, position_ids, cos_sin_cache: None)
+        lambda rope, position_ids, cos_sin_cache, fuse_cosine=True: None)
     return operator
+
+
+def _probe_mode(original, operator, device):
+    """Distinguish the two native modes using private cancellation witnesses.
+
+    Run only during preparation, never on a caller's data or a captured path.
+    Position dtypes must agree; an unknown/ambiguous lowering is not admitted.
+    """
+    values = torch.tensor([
+        [-1.1484375, 0.83203125, -0.809720516204834, 0.5868157148361206],
+        [0.546875, -2.359375, -0.22580166161060333, 0.9741733074188232],
+        [-0.80078125, -1.0390625, -0.7926467657089233, 0.6096811890602112],
+    ], dtype=torch.float32, device=device)
+    source = torch.zeros(3, 1, 512, dtype=torch.bfloat16, device=device)
+    source[..., 448::2] = values[:, 0, None, None]
+    source[..., 449::2] = values[:, 1, None, None]
+    cache = torch.cat((values[:, 2, None].expand(-1, 32),
+                       values[:, 3, None].expand(-1, 32)), dim=-1)
+    matches = {False, True}
+    with torch.inference_mode():
+        for dtype in (torch.int32, torch.int64):
+            positions = torch.arange(3, device=device, dtype=dtype)
+            expected = source.clone()
+            original(expected, positions, cache, 64)
+            for mode in tuple(matches):
+                actual = source.clone()
+                operator(actual[..., -64:], positions, cache, fuse_cosine=mode)
+                if not torch.equal(actual, expected):
+                    matches.remove(mode)
+    if len(matches) != 1:
+        raise RuntimeError("Core inverse-RoPE arithmetic is unsupported or ambiguous")
+    return matches.pop()
+
+
+def prepare_operator(original):
+    """Bind Core-matching native arithmetic before model execution/Graph capture."""
+    if torch.cuda.is_current_stream_capturing():
+        raise RuntimeError("Prepare inverse RoPE before Graph capture")
+    operator = load_operator()
+    mode = _probe_mode(original, operator, torch.device("cuda", torch.cuda.current_device()))
+    return partial(operator, fuse_cosine=mode)
 
 
 def eligible(output, positions, cos_sin_cache, rope_head_dim):

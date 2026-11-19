@@ -97,7 +97,9 @@ def test_query_and_inverse_rope_share_the_operator(monkeypatch, tmp_path):
     from torch.utils import cpp_extension
 
     loads = []
-    operator = object()
+    def operator(*args, **kwargs):
+        pass
+
     monkeypatch.setattr(torch.version, "hip", "cpu-contract")
     monkeypatch.setattr(cpp_extension, "_get_build_directory", lambda *args: str(tmp_path))
     monkeypatch.setattr(cpp_extension, "load", lambda **kwargs: loads.append(kwargs))
@@ -109,7 +111,7 @@ def test_query_and_inverse_rope_share_the_operator(monkeypatch, tmp_path):
     pcp_q_rope.load_operator.cache_clear()
     try:
         assert inverse_rope_hcu.load_operator() is operator
-        assert pcp_q_rope.load_operator() is operator
+        assert pcp_q_rope.load_operator().func is operator
         assert pcp_q_rope.registry.get(pcp_fork.Q_ROPE_OP)["implementation"] == "hcu"
         assert len(loads) == 1
     finally:
@@ -307,3 +309,20 @@ def test_plugin_owner_latches_q_rope_binding_drift(monkeypatch, isolated_q_rope,
         activation.activate_extension(context)
     with pytest.raises(pcp_fork.PcpAttentionError, match="restart process"):
         pcp_fork.require_q_rope_healthy()
+
+
+def test_loader_preserves_forward_q_rounding(monkeypatch):
+    calls = []
+
+    def operator(*args, **kwargs):
+        calls.append((args, kwargs))
+
+    monkeypatch.setattr(inverse_rope_hcu, "load_operator", lambda: operator)
+    monkeypatch.setattr(pcp_q_rope.registry, "register", lambda *args, **kwargs: None)
+    pcp_q_rope.load_operator.cache_clear()
+    try:
+        rotate = pcp_q_rope.load_operator()
+        rotate("rope", "positions", "table")
+        assert calls == [(("rope", "positions", "table"), {"fuse_cosine": False})]
+    finally:
+        pcp_q_rope.load_operator.cache_clear()

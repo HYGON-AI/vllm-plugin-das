@@ -13,7 +13,9 @@ from . import inverse_rope_hcu
 
 @lru_cache(maxsize=1)
 def load_operator():
-    operator = inverse_rope_hcu.load_operator()
+    # Forward Q retains separately rounded products; inverse RoPE must match
+    # Core's cosine-product FMA. The native implementation specializes both.
+    operator = partial(inverse_rope_hcu.load_operator(), fuse_cosine=False)
     registry.register(
         "vllm_pcp_q_rope", "hcu", "torch.ops.hcu_vllm_das.deepseek_v4_inv_rope",
         registry.MECH_SEAM, detail="Eager PCP prefill Q RoPE using a negated sine table",
