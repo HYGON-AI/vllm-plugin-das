@@ -19,6 +19,8 @@ from vllm.model_executor import parameter
 
 @pytest.fixture
 def core(monkeypatch):
+    monkeypatch.setattr(sp, '_publication_lifecycle', sp.ProcessLocalLifecycle(
+        runtime_action=sp._PUBLICATION_ACTION, error_type=sp.ExtensionCommitError))
     group = SimpleNamespace(world_size=4, rank_in_group=0)
     monkeypatch.setattr(sp, 'get_tp_group', lambda: group)
     monkeypatch.setattr(linear, 'get_tensor_model_parallel_world_size', lambda: 4)
@@ -175,7 +177,7 @@ def test_public_oot_registration_covers_concrete_classes(core, monkeypatch):
         assert type(qkv) is sp.RuntimeSPQKVParallelLinear and qkv._runtime_sp
         assert type(row) is sp.RuntimeSPRowParallelLinear and row._runtime_sp
         monkeypatch.setitem(op_registry_oot, 'RowParallelLinear', object())
-        with pytest.raises(RuntimeError, match='foreign'):sp.install_attention_layers()
+        with pytest.raises(RuntimeError, match='ownership'):sp.install_attention_layers()
         with pytest.raises(RuntimeError, match='ownership'):sp.check_attention_layers()
     finally:
         for cls, _ in sp._BINDINGS:op_registry_oot.pop(cls.__name__, None)
@@ -186,6 +188,52 @@ def test_registration_preflight_does_not_publish_before_rejecting_foreign(core, 
     monkeypatch.setitem(op_registry_oot, 'RowParallelLinear', object())
     with pytest.raises(RuntimeError, match='foreign'):sp.install_attention_layers()
     assert 'QKVParallelLinear' not in op_registry_oot
+
+
+def test_partial_publication_stays_failed_after_registry_repair(core, monkeypatch):
+    for cls, _ in sp._BINDINGS:
+        monkeypatch.delitem(op_registry_oot, cls.__name__, raising=False)
+    original = linear.RowParallelLinear.register_oot
+    calls = []
+    def fail(candidate):
+        calls.append(candidate)
+        raise RuntimeError('injected second publication failure')
+    monkeypatch.setattr(linear.RowParallelLinear, 'register_oot', fail)
+    with pytest.raises(sp.ExtensionCommitError, match='publication incomplete'):
+        sp.install_attention_layers()
+    assert op_registry_oot['QKVParallelLinear'] is sp.RuntimeSPQKVParallelLinear
+    monkeypatch.setattr(linear.RowParallelLinear, 'register_oot', original)
+    monkeypatch.delitem(op_registry_oot, 'QKVParallelLinear')
+    for action in [sp.install_attention_layers, sp.check_attention_layers]:
+        with pytest.raises(sp.ExtensionCommitError, match='publication incomplete'):
+            action()
+    assert calls == [sp.RuntimeSPRowParallelLinear]
+    assert all(cls.__name__ not in op_registry_oot for cls, _ in sp._BINDINGS)
+
+
+def test_concurrent_publication_publishes_each_real_owner_once(core, monkeypatch):
+    from concurrent.futures import ThreadPoolExecutor
+    from threading import Barrier, Lock
+    start, lock, calls = Barrier(4), Lock(), []
+    for cls, _ in sp._BINDINGS:
+        monkeypatch.delitem(op_registry_oot, cls.__name__, raising=False)
+        original = cls.register_oot
+        def register(candidate, original=original, cls=cls):
+            with lock:
+                calls.append(cls.__name__)
+            return original(candidate)
+        monkeypatch.setattr(cls, 'register_oot', register)
+    def install(_):
+        start.wait(timeout=10)
+        sp.install_attention_layers()
+    try:
+        with ThreadPoolExecutor(max_workers=4) as workers:
+            list(workers.map(install, range(4)))
+        assert sorted(calls) == ['QKVParallelLinear', 'RowParallelLinear']
+        sp.check_attention_layers()
+    finally:
+        for cls, _ in sp._BINDINGS:
+            op_registry_oot.pop(cls.__name__, None)
 
 
 @pytest.mark.parametrize('rank', range(4))

@@ -14,12 +14,17 @@ import os
 
 import torch
 from hcu_adapter.extensions import ExtensionCommitError
+from hcu_adapter.runtime_lifecycle import ProcessLocalLifecycle
 from vllm.distributed import get_tp_group
 from vllm.model_executor.layers.linear import QKVParallelLinear, RowParallelLinear
 
 _construction = ContextVar("hcu_runtime_sp_attention_construction", default=False)
 _qkv_signature = inspect.signature(QKVParallelLinear.__init__)
 _row_signature = inspect.signature(RowParallelLinear.__init__)
+_PUBLICATION_ACTION = "runtime-sp-attention-publication"
+_publication_lifecycle = ProcessLocalLifecycle(
+    runtime_action=_PUBLICATION_ACTION, error_type=ExtensionCommitError,
+)
 
 
 @contextmanager
@@ -186,8 +191,7 @@ _BINDINGS = ((QKVParallelLinear, RuntimeSPQKVParallelLinear),
              (RowParallelLinear, RuntimeSPRowParallelLinear))
 
 
-def install_attention_layers():
-    """Publish concrete public OOT owners; ordinary construction delegates."""
+def _publish_attention_layers():
     from vllm.model_executor.custom_op import op_registry_oot
     for base, candidate in _BINDINGS:
         owner = op_registry_oot.get(base.__name__)
@@ -203,7 +207,14 @@ def install_attention_layers():
     check_attention_layers()
 
 
+def install_attention_layers():
+    """Serialize concrete OOT publication and refuse inherited partial state."""
+    _publication_lifecycle.run_once(_PUBLICATION_ACTION, _publish_attention_layers)
+    check_attention_layers()
+
+
 def check_attention_layers():
+    _publication_lifecycle.require_runtime_healthy()
     from vllm.model_executor.custom_op import op_registry_oot
     if any(op_registry_oot.get(base.__name__) is not candidate for base, candidate in _BINDINGS):
         raise ExtensionCommitError("runtime SP attention OOT ownership changed")
