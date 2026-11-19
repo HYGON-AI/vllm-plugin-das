@@ -64,6 +64,14 @@ Treat composite patches by subfeature: a passing receive-timeout test does not
 qualify RPC deadlines, pipeline queue capacity, fork initialization or worker
 lifecycle. Preserve unverified subfeatures in the migration ledger.
 
+Audit Graph configuration per runner before carrying an old wrapper. On v0.33,
+the official MRV1 speculative-size method no longer accepts a TP argument or
+uses `pass_config.enable_sp`; MRV2 plans its own capture descriptors. Keep the
+official size validation and DeepEP HT policy. Register Adapter-owned unsafe
+ops only after official split-list finalization, without replacing the config
+methods or mutating the shared stock list. Exercise real CPU config objects;
+these checks do not qualify custom-SP, DeepEP-auto, capture or model execution.
+
 Before retaining a pre-fork block-size hook, trace worker KV specs back into
 EngineCore. A target that derives the parent's cache block size from those specs
 before scheduler/hash/KV initialization can already propagate a worker-local

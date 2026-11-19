@@ -130,3 +130,13 @@ from GC enumeration; inspect the compiler-owned module references without
 unfreezing GC or reloading kernels. For a single-choice control, verify all
 other effective configurations and generated-source identities remain fixed.
 Such sequential controls do not replace the original concurrent model cohort.
+For a pretrained startup launch failure after successful weight loading and partial
+Graph capture, retain that original failed cohort. A small probe with matching
+head/GQA geometry may still pass: compare the actual failing tensor shapes,
+strides, storage offsets, layout and static sequence bounds before changing the
+Plugin route. A failure-only external metadata observer can preserve the original
+call and exception without replacing the installed package or native library;
+its run remains diagnostic, including if observation changes whether it fails.
+Do not infer healthy serving, HumanEval or normal shutdown from completed model
+loading or capture progress. Record controller cleanup signals separately from
+framework-internal signals and the final surviving-process check.
