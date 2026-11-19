@@ -4,10 +4,12 @@
 
 from __future__ import annotations
 
+import ast
 import importlib
 import importlib.util
 import sys
 from contextlib import nullcontext
+from dataclasses import make_dataclass, replace
 from pathlib import Path
 from types import ModuleType, SimpleNamespace
 
@@ -354,6 +356,13 @@ def _fake_mla_module(adapter, target_calls, event_log=None):
     module.MLAAttention = MLAAttention
     module.MLACommonMetadata = MLACommonMetadata
     module.MLACommonMetadataBuilder = MLACommonMetadataBuilder
+    module.QueryLenSupport = SimpleNamespace(
+        SINGLE_ONLY="single_only", UNIFORM="uniform", VARLEN="varlen"
+    )
+    module.MLACommonMetadataBuilder.query_len_support = (
+        module.QueryLenSupport.SINGLE_ONLY
+    )
+    module.MLACommonMetadataBuilder.use_pcp = False
     module._get_kv_b_proj_input_dtype = _get_kv_b_proj_input_dtype
     module.split_decodes_and_prefills = split_decodes_and_prefills
     def maybe_gather_mla_latent_cache_inputs(
@@ -891,6 +900,514 @@ def test_mla_cache_gather_distinguishes_replicated_mtp_from_pcp_prefill():
     assert module.cache_gather_calls == [
         (kv, rope, partitioned_slots, 4, True)
     ]
+
+
+@pytest.mark.parametrize(
+    (
+        "query_lens", "prefilling", "device_lens", "upper_bound", "causal",
+        "decode_threshold", "expected_context",
+    ),
+    [
+        ([4], [False], [108], [110], True, 1, [104]),
+        ([4, 12], [False, True], [108, 60], [110, 60], True, 1, [104, 48]),
+        ([12], [True], [60], [60], True, 1, [48]),
+        ([1], [False], [108], [110], True, 1, [109]),
+        ([4], [False], [108], [110], False, 1, [106]),
+        ([4], [False], [108], [110], True, 4, [106]),
+        ([4, 4], [False, False], [108, 100], [110, 103], True, 1, [104, 96]),
+    ],
+)
+def test_mla_multitoken_decode_context_excludes_rejected_drafts(
+    query_lens, prefilling, device_lens, upper_bound, causal, decode_threshold,
+    expected_context,
+):
+    adapter = _adapter()
+    module = _fake_mla_module(adapter, [])
+
+    def build(self, common_prefix_len, common_attn_metadata, fast_build=False):
+        return SimpleNamespace(
+            num_actual_tokens=common_attn_metadata.num_actual_tokens,
+            context_lens=common_attn_metadata.seq_lens_cpu_upper_bound
+            - common_attn_metadata.query_start_loc_cpu.diff(),
+            common=common_attn_metadata,
+        )
+
+    module.MLACommonMetadataBuilder.build = build
+    assert adapter.apply_to_module(module) is True
+    metadata_builder = module.MLACommonMetadataBuilder()
+    metadata_builder.reorder_batch_threshold = decode_threshold
+    metadata_values = {
+        "num_actual_tokens": sum(query_lens),
+        "query_start_loc_cpu": torch.tensor([0] + query_lens).cumsum(0),
+        "is_prefilling": torch.tensor(prefilling),
+        "seq_lens": torch.tensor(device_lens),
+        "seq_lens_cpu_upper_bound": torch.tensor(upper_bound),
+        "causal": causal,
+    }
+    metadata_class = make_dataclass(
+        "CommonAttentionMetadata", [(name, object) for name in metadata_values]
+    )
+    common = metadata_class(**metadata_values)
+    common.replace = lambda **updates: replace(common, **updates)
+    common.num_kv_actual_tokens = common.num_actual_tokens + 5
+
+    result = metadata_builder.build(0, common)
+
+    assert result.context_lens.tolist() == expected_context
+    assert result.num_kv_actual_tokens == common.num_kv_actual_tokens
+    assert common.seq_lens_cpu_upper_bound.tolist() == upper_bound
+    if causal and any(
+        length > decode_threshold and not phase
+        for length, phase in zip(query_lens, prefilling)
+    ):
+        assert result.common is not common
+    else:
+        assert result.common is common
+
+
+@pytest.mark.parametrize(
+    ("query_len_support", "decode_threshold"),
+    [("SINGLE_ONLY", 1), ("UNIFORM", 128), ("VARLEN", 128)],
+)
+@pytest.mark.parametrize(
+    ("num_actual_reqs", "num_padded_reqs", "padding_query_len"),
+    [
+        pytest.param(3, 4, 0, id="full-3-to-4"),
+        pytest.param(5, 8, 0, id="full-5-to-8"),
+        pytest.param(6, 8, 0, id="full-6-to-8"),
+        pytest.param(7, 8, 0, id="full-7-to-8"),
+        pytest.param(8, 8, 0, id="full-unpadded"),
+        pytest.param(3, 3, 0, id="piecewise-unpadded"),
+        pytest.param(7, 8, 1, id="full-single-token-padding"),
+        pytest.param(7, 8, 4, id="ignore-multitoken-padding"),
+    ],
+)
+def test_mla_build_ignores_decode_graph_padding_without_device_sync(
+    num_actual_reqs, num_padded_reqs, padding_query_len,
+    query_len_support, decode_threshold,
+):
+    adapter = _adapter()
+    module = _fake_mla_module(adapter, [])
+    query_lens = [1] * num_actual_reqs + [padding_query_len] * (
+        num_padded_reqs - num_actual_reqs
+    )
+    common = SimpleNamespace(
+        num_reqs=num_padded_reqs,
+        num_actual_tokens=sum(query_lens),
+        max_query_len=max(query_lens),
+        query_start_loc_cpu=torch.tensor([0] + query_lens).cumsum(0),
+        is_prefilling=torch.zeros(num_actual_reqs, dtype=torch.bool),
+        seq_lens=SimpleNamespace(
+            cpu=lambda: pytest.fail("ordinary decode synchronized device lengths")
+        ),
+        causal=True,
+    )
+    build_calls = []
+
+    def build(self, common_prefix_len, common_attn_metadata, fast_build=False):
+        build_calls.append((common_prefix_len, common_attn_metadata, fast_build))
+        return SimpleNamespace(num_actual_tokens=common_attn_metadata.num_actual_tokens)
+
+    module.MLACommonMetadataBuilder.build = build
+    assert adapter.apply_to_module(module) is True
+    metadata_builder = module.MLACommonMetadataBuilder()
+    metadata_builder.query_len_support = getattr(
+        module.QueryLenSupport, query_len_support
+    )
+    metadata_builder.reorder_batch_threshold = decode_threshold
+
+    result = metadata_builder.build(0, common, fast_build=True)
+
+    assert build_calls == [(0, common, True)]
+    assert result.num_actual_tokens == common.num_actual_tokens
+    assert result.num_kv_actual_tokens == common.num_actual_tokens
+
+
+@pytest.mark.parametrize("num_padded_reqs", [2, 4, 8])
+def test_mla_multitoken_decode_uses_actual_lengths_with_graph_padding(
+    num_padded_reqs,
+):
+    adapter = _adapter()
+    module = _fake_mla_module(adapter, [])
+    num_padding_reqs = num_padded_reqs - 2
+    query_lens = [4, 4] + [0] * num_padding_reqs
+    upper_bound = [110, 103] + [0] * num_padding_reqs
+    device_lens = torch.tensor([108, 100] + [0] * num_padding_reqs)
+    sync_calls = []
+    common = SimpleNamespace(
+        num_reqs=num_padded_reqs,
+        num_actual_tokens=8,
+        query_start_loc_cpu=torch.tensor([0] + query_lens).cumsum(0),
+        is_prefilling=torch.tensor([False, False]),
+        seq_lens=SimpleNamespace(
+            cpu=lambda: sync_calls.append("cpu") or device_lens,
+        ),
+        seq_lens_cpu_upper_bound=torch.tensor(upper_bound),
+        causal=True,
+        num_kv_actual_tokens=13,
+    )
+
+    def build(self, common_prefix_len, common_attn_metadata, fast_build=False):
+        return SimpleNamespace(
+            common=common_attn_metadata,
+            context_lens=common_attn_metadata.seq_lens_cpu_upper_bound
+            - common_attn_metadata.query_start_loc_cpu.diff(),
+        )
+
+    module.MLACommonMetadataBuilder.build = build
+    assert adapter.apply_to_module(module) is True
+    metadata_builder = module.MLACommonMetadataBuilder()
+    metadata_builder.reorder_batch_threshold = 1
+
+    result = metadata_builder.build(0, common)
+
+    assert sync_calls == ["cpu"]
+    assert result.context_lens.tolist() == [104, 96] + [0] * num_padding_reqs
+    assert result.common is not common
+    assert common.seq_lens_cpu_upper_bound.tolist() == upper_bound
+    assert result.num_kv_actual_tokens == 13
+
+
+@pytest.mark.parametrize(
+    (
+        "query_lens", "prefilling", "device_lens", "upper_bound",
+        "query_len_support", "decode_threshold", "expected_num_decodes",
+        "expected_context", "needs_length_refresh",
+    ),
+    [
+        pytest.param(
+            [4, 2], [False, False], [108, 106], [108, 108],
+            "UNIFORM", 128, 1, [104], True, id="budget-truncated-4-2",
+        ),
+        pytest.param(
+            [4, 1], [False, False], [108, 105], [108, 108],
+            "UNIFORM", 128, 1, [104], True, id="budget-truncated-4-1",
+        ),
+        pytest.param(
+            [4, 4, 2], [False] * 3, [108, 108, 106], [108] * 3,
+            "UNIFORM", 128, 2, [104], True, id="budget-truncated-last-request",
+        ),
+        pytest.param(
+            [4, 2, 2], [False] * 3, [108, 106, 106], [108] * 3,
+            "UNIFORM", 128, 1, [104, 104], True, id="multiple-fallback-requests",
+        ),
+        pytest.param(
+            [4, 2, 4], [False] * 3, [108, 106, 106], [108] * 3,
+            "UNIFORM", 128, 1, [104, 102], True, id="whole-prefill-suffix",
+        ),
+        pytest.param(
+            [2, 4], [False, False], [106, 108], [108, 110],
+            "UNIFORM", 128, 1, [104], True, id="short-first-query",
+        ),
+        pytest.param(
+            [1, 4], [False, False], [105, 108], [108, 110],
+            "UNIFORM", 128, 1, [104], True, id="single-token-first-query",
+        ),
+        pytest.param(
+            [4, 2], [False, False], [108, 106], [108, 108],
+            "UNIFORM", 4, 1, [104], True, id="speculative-query-threshold",
+        ),
+        pytest.param(
+            [4, 2], [False, False], [108, 106], [108, 108],
+            "UNIFORM", 1, 0, [104, 104], True, id="dcp-single-query-threshold",
+        ),
+        pytest.param(
+            [4, 2, 16], [False, False, True], [108, 106, 60], [108, 108, 60],
+            "UNIFORM", 128, 1, [104, 44], True, id="fallback-and-real-prefill",
+        ),
+        pytest.param(
+            [4, 16], [False, True], [106, 60], [108, 60],
+            "UNIFORM", 128, 1, [44], False, id="real-prefill-only-no-sync",
+        ),
+        pytest.param(
+            [4, 4, 16], [False, False, True], [106, 106, 60], [108, 108, 60],
+            "UNIFORM", 128, 2, [44], False, id="uniform-decodes-and-prefill",
+        ),
+        pytest.param(
+            [4, 4], [False, False], [106, 106], [108, 108],
+            "UNIFORM", 128, 2, [], False, id="uniform-mtp-no-sync",
+        ),
+        pytest.param(
+            [1, 1], [False, False], [106, 106], [108, 108],
+            "UNIFORM", 128, 2, [], False, id="ordinary-decode-no-sync",
+        ),
+        pytest.param(
+            [4, 2], [False, False], [108, 106], [108, 108],
+            "VARLEN", 128, 2, [], False, id="varlen-mtp-no-sync",
+        ),
+        pytest.param(
+            [4, 2], [False, False], [108, 106], [108, 108],
+            "SINGLE_ONLY", 1, 0, [104, 104], True, id="single-only-fallback",
+        ),
+        pytest.param(
+            [4, 2], [True, True], [108, 108], [108, 108],
+            "UNIFORM", 128, 0, [104, 106], False, id="real-prefills-no-sync",
+        ),
+        pytest.param(
+            [4, 4, 0, 0], [False, False], [106, 106, 0, 0], [108, 108, 0, 0],
+            "UNIFORM", 128, 4, [], False, id="uniform-mtp-graph-padding",
+        ),
+        pytest.param(
+            [4, 2, 0, 0], [False, False], [108, 106, 0, 0], [108, 108, 0, 0],
+            "UNIFORM", 128, 1, [104, 0, 0], True, id="fallback-with-padding",
+        ),
+    ],
+)
+@pytest.mark.parametrize("has_cpu_mirror", [False, True], ids=["async", "sync"])
+def test_mla_prefill_fallback_uses_actual_split_and_sequence_lengths(
+    monkeypatch, query_lens, prefilling, device_lens, upper_bound,
+    query_len_support, decode_threshold, expected_num_decodes,
+    expected_context, needs_length_refresh, has_cpu_mirror,
+):
+    from vllm import envs
+    from vllm.v1.attention.backends.utils import split_decodes_and_prefills
+
+    monkeypatch.setattr(envs, "VLLM_USE_V2_MODEL_RUNNER", True)
+    adapter = _adapter()
+    module = _fake_mla_module(adapter, [])
+    module.split_decodes_and_prefills = split_decodes_and_prefills
+    sync_calls = []
+    device_lengths = torch.tensor(device_lens)
+    seq_lens_cpu = torch.tensor(device_lens) if has_cpu_mirror else None
+    expected_upper_bound = device_lens if has_cpu_mirror else upper_bound
+    original_upper_bound = (
+        seq_lens_cpu if has_cpu_mirror else torch.tensor(upper_bound)
+    )
+    common = SimpleNamespace(
+        num_reqs=len(query_lens),
+        num_actual_tokens=sum(query_lens),
+        max_query_len=max(query_lens),
+        query_start_loc_cpu=torch.tensor([0] + query_lens).cumsum(0),
+        is_prefilling=torch.tensor(prefilling),
+        seq_lens=SimpleNamespace(
+            cpu=lambda: sync_calls.append("cpu") or device_lengths,
+        ),
+        _seq_lens_cpu=seq_lens_cpu,
+        seq_lens_cpu_upper_bound=original_upper_bound,
+        causal=True,
+        num_kv_actual_tokens=sum(query_lens) + 5,
+    )
+
+    def build(self, common_prefix_len, common_attn_metadata, fast_build=False):
+        num_decodes = module.split_decodes_and_prefills(
+            common_attn_metadata,
+            decode_threshold=self.reorder_batch_threshold,
+            require_uniform=(
+                self.query_len_support != module.QueryLenSupport.VARLEN
+            ),
+            treat_short_extends_as_decodes=not self.use_pcp,
+        )[0]
+        return SimpleNamespace(
+            common=common_attn_metadata,
+            num_decodes=num_decodes,
+            context_lens=(
+                common_attn_metadata.seq_lens_cpu_upper_bound[num_decodes:]
+                - common_attn_metadata.query_start_loc_cpu.diff()[num_decodes:]
+            ),
+        )
+
+    module.MLACommonMetadataBuilder.build = build
+    assert adapter.apply_to_module(module) is True
+    metadata_builder = module.MLACommonMetadataBuilder()
+    metadata_builder.query_len_support = getattr(
+        module.QueryLenSupport, query_len_support
+    )
+    metadata_builder.reorder_batch_threshold = decode_threshold
+
+    result = metadata_builder.build(0, common, fast_build=True)
+
+    assert result.num_decodes == expected_num_decodes
+    assert result.context_lens.tolist() == expected_context
+    assert sync_calls == (
+        ["cpu"] if needs_length_refresh and not has_cpu_mirror else []
+    )
+    assert (result.common is not common) is needs_length_refresh
+    assert result.common._seq_lens_cpu is seq_lens_cpu
+    if has_cpu_mirror:
+        assert result.common.seq_lens_cpu_upper_bound is seq_lens_cpu
+    assert result.common.query_start_loc_cpu is common.query_start_loc_cpu
+    assert result.common.num_reqs == common.num_reqs
+    assert common.seq_lens_cpu_upper_bound is original_upper_bound
+    assert common.seq_lens_cpu_upper_bound.tolist() == expected_upper_bound
+    assert result.num_kv_actual_tokens == common.num_kv_actual_tokens
+
+    for request_index in range(expected_num_decodes, len(prefilling)):
+        query_len = query_lens[request_index]
+        context_len = result.context_lens[
+            request_index - expected_num_decodes
+        ].item()
+        expected_context_len = device_lens[request_index] - query_len
+        query = torch.ones(1, query_len, 1)
+        key = torch.zeros(1, upper_bound[request_index], 1)
+        value = torch.arange(
+            upper_bound[request_index], dtype=torch.float32
+        ).view(1, -1, 1)
+        query_positions = torch.arange(query_len).unsqueeze(1)
+        key_positions = torch.arange(upper_bound[request_index]).unsqueeze(0)
+        actual_output = torch.nn.functional.scaled_dot_product_attention(
+            query, key, value,
+            attn_mask=key_positions <= context_len + query_positions,
+        )
+        expected_output = torch.nn.functional.scaled_dot_product_attention(
+            query, key, value,
+            attn_mask=key_positions <= expected_context_len + query_positions,
+        )
+        torch.testing.assert_close(actual_output, expected_output)
+
+
+@pytest.fixture
+def mrv2_prepare_attn():
+    import vllm
+    from vllm.config.compilation import CUDAGraphMode
+    from vllm.v1.attention.backend import CommonAttentionMetadata
+
+    assert CommonAttentionMetadata.__dataclass_fields__["_seq_lens_cpu"].default is None
+    namespace = {
+        "torch": torch,
+        "CUDAGraphMode": CUDAGraphMode,
+        "CommonAttentionMetadata": CommonAttentionMetadata,
+    }
+    for relative_path, owner, function_name in (
+        ("v1/worker/gpu/attn_utils.py", None, "build_attn_metadata"),
+        ("v1/worker/gpu/model_states/default.py", "DefaultModelState", "prepare_attn"),
+    ):
+        source_path = Path(vllm.__file__).parent / relative_path
+        body = ast.parse(source_path.read_text()).body
+        if owner is not None:
+            body = next(
+                node for node in body
+                if isinstance(node, ast.ClassDef) and node.name == owner
+            ).body
+        function = next(
+            node for node in body
+            if isinstance(node, ast.FunctionDef) and node.name == function_name
+        )
+        source = ast.Module(body=[function], type_ignores=[])
+        exec(compile(source, str(source_path), "exec"), namespace)
+    return namespace["prepare_attn"], CUDAGraphMode
+
+
+@pytest.mark.parametrize(
+    "query_lens,actual_lengths,upper_bound,query_len_support,decode_threshold",
+    [
+        pytest.param([4], [108], [110], "SINGLE_ONLY", 1, id="single-only"),
+        pytest.param([4, 2], [108, 106], [108, 108], "UNIFORM", 128, id="uniform"),
+    ],
+)
+@pytest.mark.parametrize("graph_mode", ["PIECEWISE", "FULL", "FULL_PADDED"])
+@pytest.mark.parametrize(
+    "async_scheduling,adaptive_verification,has_config,needs_sync",
+    [
+        pytest.param(False, False, True, False, id="sync-no-mirror"),
+        pytest.param(True, False, True, True, id="async-rejection"),
+        pytest.param(False, True, True, True, id="adaptive-verification"),
+        pytest.param(None, False, True, True, id="unresolved-scheduling"),
+        pytest.param(False, None, True, True, id="unknown-adaptive-state"),
+        pytest.param(None, None, False, True, id="missing-config"),
+    ],
+)
+def test_mrv2_prefill_fallback_reuses_exact_cpu_upper_bound(
+    monkeypatch, mrv2_prepare_attn, query_lens, actual_lengths, upper_bound,
+    query_len_support, decode_threshold, graph_mode, async_scheduling,
+    adaptive_verification, has_config, needs_sync,
+):
+    from vllm import envs
+    from vllm.v1.attention.backends.utils import split_decodes_and_prefills
+
+    monkeypatch.setattr(envs, "VLLM_USE_V2_MODEL_RUNNER", True)
+    prepare_attn, cudagraph_mode = mrv2_prepare_attn
+    adapter = _adapter()
+    module = _fake_mla_module(adapter, [])
+    module.split_decodes_and_prefills = split_decodes_and_prefills
+    produced_metadata = []
+
+    def build(self, common_prefix_len, common_attn_metadata, fast_build=False):
+        num_decodes = module.split_decodes_and_prefills(
+            common_attn_metadata,
+            decode_threshold=self.reorder_batch_threshold,
+            require_uniform=True,
+            treat_short_extends_as_decodes=True,
+        )[0]
+        return SimpleNamespace(
+            common=common_attn_metadata,
+            context_lens=(
+                common_attn_metadata.seq_lens_cpu_upper_bound[num_decodes:]
+                - common_attn_metadata.query_start_loc_cpu.diff()[num_decodes:]
+            ),
+        )
+
+    module.MLACommonMetadataBuilder.build = build
+    assert adapter.apply_to_module(module) is True
+    metadata_builder = module.MLACommonMetadataBuilder()
+    metadata_builder.query_len_support = getattr(module.QueryLenSupport, query_len_support)
+    metadata_builder.reorder_batch_threshold = decode_threshold
+    if has_config:
+        metadata_builder.vllm_config = SimpleNamespace(
+            parallel_config=SimpleNamespace(prefill_context_parallel_size=1),
+            scheduler_config=SimpleNamespace(async_scheduling=async_scheduling),
+            speculative_config=SimpleNamespace(
+                enable_adaptive_verification=adaptive_verification,
+            ),
+        )
+
+    def record_and_build(common_prefix_len, common_attn_metadata):
+        produced_metadata.append(common_attn_metadata)
+        return metadata_builder.build(common_prefix_len, common_attn_metadata)
+
+    num_reqs = len(query_lens)
+    num_padded_reqs = 4 if graph_mode == "FULL_PADDED" else num_reqs
+    padding = [0] * (num_padded_reqs - num_reqs)
+    device_lengths = torch.tensor(actual_lengths + padding, dtype=torch.int32)
+    cpu_lengths = upper_bound if needs_sync else actual_lengths
+    original_upper_bound = torch.tensor(cpu_lengths + padding, dtype=torch.int32)
+    query_offsets = torch.tensor([0] + query_lens + padding, dtype=torch.int32).cumsum(0)
+    input_batch = SimpleNamespace(
+        num_reqs=num_reqs,
+        num_reqs_after_padding=num_padded_reqs,
+        num_tokens=sum(query_lens),
+        num_tokens_after_padding=sum(query_lens) + len(padding),
+        query_start_loc_np=query_offsets.numpy(),
+        query_start_loc=query_offsets,
+        max_query_len=max(query_lens),
+        seq_lens=device_lengths,
+        seq_lens_cpu_upper_bound=original_upper_bound,
+        dcp_local_seq_lens=None,
+        positions=None,
+        is_prefilling_np=torch.zeros(num_reqs, dtype=torch.bool).numpy(),
+        prompt_lens=None,
+    )
+    state = SimpleNamespace(supports_mm_inputs=False)
+    attn_group = SimpleNamespace(
+        get_metadata_builder=lambda ubatch_idx: SimpleNamespace(build=record_and_build),
+        layer_names=["mla.layer"],
+    )
+    cpu_calls = []
+    original_cpu = torch.Tensor.cpu
+
+    def record_cpu(tensor, *args, **kwargs):
+        if tensor.untyped_storage().data_ptr() == device_lengths.untyped_storage().data_ptr():
+            cpu_calls.append("cpu")
+        return original_cpu(tensor, *args, **kwargs)
+
+    monkeypatch.setattr(torch.Tensor, "cpu", record_cpu)
+    result = prepare_attn(
+        state, input_batch,
+        getattr(cudagraph_mode, "FULL" if graph_mode.startswith("FULL") else graph_mode),
+        (torch.zeros(num_padded_reqs, 1, dtype=torch.int32),),
+        torch.zeros(input_batch.num_tokens_after_padding, dtype=torch.int64),
+        [[attn_group]], SimpleNamespace(kv_cache_groups=[object()]),
+    )["mla.layer"]
+
+    assert len(produced_metadata) == 1
+    common = produced_metadata[0]
+    assert common._seq_lens_cpu is None
+    assert result.common._seq_lens_cpu is None
+    assert cpu_calls == (["cpu"] if needs_sync else [])
+    assert result.context_lens.tolist() == [104] + padding
+    assert common.seq_lens_cpu_upper_bound.tolist() == cpu_lengths + padding
+    assert original_upper_bound.tolist() == cpu_lengths + padding
+    if not needs_sync:
+        assert result.common.seq_lens_cpu_upper_bound is common.seq_lens_cpu_upper_bound
 
 
 def test_dense_and_sparse_mla_metadata_carry_parallel_sizes(monkeypatch):
