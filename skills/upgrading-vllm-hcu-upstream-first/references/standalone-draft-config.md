@@ -32,3 +32,27 @@ tokenization, weight loading, sparse kernels, Graph or accepted draft tokens.
 When the official release adds its own standalone type, reassess ownership and
 retire the optional registration after equivalent behavior is verified. Do not
 overwrite the new owner or keep a copied config implementation.
+
+## Qualify the selected execution separately
+
+After configuration resolves, inspect the official model and normalization
+classes actually selected by the target. Step5's CUDA-named Triton libdevice
+imports and CuTe normalization are separate compatibility boundaries. A config
+registration or successful Graph capture does not establish either one.
+
+For a shared HIP libdevice adapter, check both package attributes and
+`sys.modules`: they can hold different module objects. Preserve cached module
+aliases and metadata while binding real HIP exports. Previously cached
+individual functions and compiled kernels require earlier activation; repairing
+module attributes cannot repair them retrospectively. Validate the real host
+startup order, read-only ownership checks and changed-input Graph numerics.
+Keep this shared hardware adaptation in Adapter rather than copying it into
+each Plugin provider.
+
+If a CUDA-only normalization import prevents the official fallback from being
+reached, establish that boundary explicitly. Reuse the target's existing math
+where its semantics fit, including residual precision, zero-centered weights,
+output dtype and output-buffer behavior. A process-local diagnostic shim can
+test that fallback but does not deliver a production provider or establish
+native CuTe support. Preserve the original failure and qualify the eventual
+installed solution through the public model path before claiming support.
