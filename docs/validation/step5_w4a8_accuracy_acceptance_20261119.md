@@ -12,7 +12,7 @@
 | Full GSM8K 1319, FP8 reference vs W4A8 | A=1270/1319; B=1265/1319; 5 fewer correct in W4A8 | **INCONCLUSIVE** under the pre-registered strict non-drop requirement |
 | Full GSM8K, W4A8+MTP3 vs W4A8 no-speculation | B=1265/1319; D=1266/1319 | **PASS_NON_INFERIOR** under the task runbook rule; not identical |
 | Full GSM8K, W4A8 IPC AG off vs on | B=C=1265/1319; 9 per-question flips in each direction | **PASS** under the runbook's equal-total gate; **not** per-question bitwise identity |
-| AA-LCR High81 Rescue C3 | 243/243 terminal generations; official judge job completed, 243 judged; 105 `judge_correct` trials; 16/16 independent checks PASS; diagnostic adjusted score **88.25%** = (318 + 105/3) / 400 | **COMPLETED RUN / DIAGNOSTIC ADJUSTED SCORE RECONCILED; NOT OFFICIAL** |
+| AA-LCR High81 Rescue C3 | 243/243 terminal generations; AA-LCR V1.1 judge contract, 243 judged; 105 `judge_correct` trials; 16/16 independent integrity checks PASS; diagnostic adjusted score **88.25%** = (318 + 105/3) / 400; StepFun official High reference **88.3%** (verified) | **COMPLETED RUN / DIAGNOSTIC ADJUSTED SCORE RECONCILED; OFFICIAL REFERENCE VERIFIED; LOCAL PROTOCOL NOT OFFICIAL-EQUIVALENT** |
 | Terminal-Bench 2.1 | Not a completed 89×3 official-comparable score in the evidence reviewed | **PENDING**, independent future report |
 
 **AA-LCR score reconciliation (2026-11-19, CPU-only):** The original 400-slot run is
@@ -23,9 +23,13 @@ The rescue covers the 81 non-OOM incorrect slots (40 EMPTY + 41 WRONG) with
 **(318 + 105/3) / 400 = 353/400 = 88.25%**: each rescued slot receives the
 fraction of its three trials that were correct. This is a
 **SELECTIVE_RETEST_MIXED_PROTOCOL** diagnostic, not an official
-same-protocol AA-LCR score. The reference is 88.3%; the rescue changed
+same-protocol AA-LCR score. The model-provider reference is **88.3%**
+(StepFun, Step 5 Preview (High), AA-LCR v1.1,
+<https://www.stepfun.com/step-5-preview>); the local diagnostic adjusted score
+is 88.25%, an absolute gap of **0.05 pp**. The rescue changed
 `reasoning_effort` to `high` and `max_tokens` to 16384, and selectively
-retested only the 81 failed slots. The 16/16 independent verifier checks
+retested only the 81 failed slots; it does not reproduce the provider's
+High-reference protocol. The 16/16 independent verifier checks
 cover judge-contract identity, dataset/prompt hashes, result
 coverage/uniqueness, raw-summary recomputation, and key-leak scanning; they
 do not certify an official leaderboard score. Therefore **88.25% may be
@@ -130,6 +134,29 @@ repository. The script re-verifies all 400 original result hashes, the
 359 JUDGED + 40 EMPTY_CANDIDATE + 1 ERROR/OOM split, the 81x3 rescue design,
 and the 105/243 judge result.
 
+### 4.2 Model-provider reference and protocol alignment
+
+| item | value |
+| --- | --- |
+| Model provider | StepFun |
+| Model | Step 5 Preview (High) |
+| Benchmark | AA-LCR v1.1 |
+| Official reference score | **88.3%** |
+| Official source | <https://www.stepfun.com/step-5-preview> |
+| Local diagnostic adjusted score | **88.25%** |
+| Absolute gap | **0.05 pp** |
+| Official reference verified | **YES** (provider page; raw HTML is JS-rendered, independent benchmark coverage corroborates 88.3% on AA-LCR v1.1) |
+| Official protocol equivalence | **NO / UNVERIFIED** |
+
+The original local 400-slot run used the frozen AA-LCR V1.1 documents and
+judge, but `reasoning_effort=unset` and `max_tokens=4096`; the rescue raised
+`reasoning_effort` to `high` and `max_tokens` to 16384 for only the 81 failed
+slots. The provider's 88.3% is a High-reference score. Therefore the local
+88.25% is a **diagnostic adjusted score from a selective-retest, mixed
+protocol**, not an official same-protocol reproduction. No separate company
+AA-LCR acceptance runbook authorizing the selective-retest protocol was found;
+`COMPANY_ACCEPTANCE_VERDICT=DIAGNOSTIC_ONLY`.
+
 The model's service configuration in the handoff used W4A8, TP4/DP2/EP8, MTP3, Triton MoE, AllGather/ReduceScatter, graph FULL_AND_PIECEWISE and BF16/FP8 mixed runtime components. The exact service logs, checkpoint identity and manifest are authoritative; do not replace them with assumptions about an unrelated performance run.
 
 ## 5. Evidence provenance and reproduction pointers
@@ -137,7 +164,7 @@ The model's service configuration in the handoff used W4A8, TP4/DP2/EP8, MTP3, T
 The original results were produced in external evaluation environments and are **not copied into this PR**. Internal evidence owners should cross-check the original artifacts before signoff:
 
 - GSM8K full A/B/C/D summary: `W4A8_ACCURACY_REPORT.md` (generated 2026-11-13), archived `accuracy_gate/RUNBOOK_GPU_ACCURACY.md`, `PROTOCOL_AUDIT.md`, `PER_QUESTION_COMPARISON.json`, `ACCURACY_VERIFICATION_RESULTS.json`, and each arm's `decode_accuracy/summary.json`.
-- AA-LCR High81: run directory `AA_LCR_W4A8_HIGH81_RESCUE_C3`, frozen `HIGH81_TO_TB21_READY.json` and `HIGH81_RESULT_MANIFEST.sha256`. The 2026-11-19 CPU reconciliation verifies 400/400 original manifest hashes, 318 original correct, 41+40+1 failure slots, 105/243 rescue correct trials, and `(318 + 105/3) / 400 = 88.25%`; per-slot and per-trial ledgers are in the adjacent `evidence/` directory.
+- AA-LCR High81: run directory `AA_LCR_W4A8_HIGH81_RESCUE_C3`, frozen `HIGH81_TO_TB21_READY.json` and `HIGH81_RESULT_MANIFEST.sha256`. The 2026-11-19 CPU reconciliation verifies 400/400 original manifest hashes, 318 original correct, 41+40+1 failure slots, 105/243 rescue correct trials, and `(318 + 105/3) / 400 = 88.25%`; per-slot and per-trial ledgers are kept in the internal archive. The model-provider reference is StepFun Step 5 Preview (High) AA-LCR v1.1 **88.3%** at <https://www.stepfun.com/step-5-preview>; the local 88.25% is a diagnostic selective-retest score, not an official same-protocol reproduction.
 - Existing source/performance change in separate PR: [#472](https://github.com/HYGON-AI/vllm-plugin-das/pull/472).
 
 The evidence set was **read from archived status and accuracy reports**, not from a fresh execution of GSM8K/AA-LCR, and no new hardware run is claimed.
@@ -146,10 +173,12 @@ The evidence set was **read from archived status and accuracy reports**, not fro
 
 1. **Resolved 2026-11-19 (CPU-only):** AA-LCR raw 105/243 is the trial-level
    rescue result; the diagnostic adjusted score is `(318 + 105/3) / 400 =
-   88.25%`. The reference protocol and denominator do **not** match the
-   official 88.3% protocol because this is a selective retest with
-   `reasoning_effort=high` and `max_tokens=16384`. The remaining decision is
-   reviewer acceptance of the diagnostic label, not arithmetic reconciliation.
+   88.25%`. The StepFun official reference **88.3%** is verified from the
+   provider page. The reference protocol and denominator do **not** match the
+   official High protocol because this is a selective retest with
+   `reasoning_effort=high` and `max_tokens=16384` applied only to failed
+   slots. The remaining decision is reviewer acceptance of the diagnostic
+   label, not arithmetic reconciliation.
 2. If publication requires strict W4A8-vs-FP8 non-drop, resolve Gate 1 **INCONCLUSIVE** with a pre-registered follow-up.
 3. Validate the code changes in PR #472 under the remaining device/Graph/Prefill gates independently of the GSM8K total-score comparison.
 4. Run Terminal-Bench 2.1 only as a later, separately versioned evaluation; its current absence must not be misreported as a passed result.
