@@ -123,6 +123,14 @@ registration after a stock class was cached can still load that stock class.
 Refuse stale admission rather than clearing Core caches; verify the resolved
 class before loading and the actual class on every live worker afterward.
 Registry-only CPU checks do not qualify the real initialization hook or model.
+Trace the wrapper and underlying worker together: an `init_worker_extension`
+hook called after `init_device` can follow runner construction and a rank-local
+architecture lookup. One rank may already cache the stock class while others
+begin loading the candidate. Check whether the target provides an earlier
+general-plugin startup seam before first resolution; retain the warm-cache
+rejection and verify actual per-process ordering before qualifying that route.
+Preserve other loader errors observed during peer shutdown separately; this
+timing failure alone does not attribute or resolve them.
 
 Core's MoE routing may happen before internal dispatch or after naive
 all-gather. Use the local mask in the former layout and the exact gathered EP
