@@ -77,6 +77,14 @@ def _ipc_all_gather_kernel(
     my_flags = tl.load(flags_ptr + RANK).to(tl.pointer_type(tl.int64))
 
     # ---- push local rows to every peer (and to the local output) ----
+    # The programs split the source region (the tensors back to back), not each
+    # tensor: a small tensor then costs one program's slice instead of a
+    # dependent load/store round on every program (4 tensors: 16.7 -> 11.7 us).
+    WS: tl.constexpr = W0 + W1 + W2 + W3
+    total = n_my * WS
+    chunk = tl.cdiv(tl.cdiv(total, NPROG), 64) * 64
+    plo = pid * chunk
+    phi = tl.minimum(total, plo + chunk)
     t_off = 0
     for t in tl.static_range(_NT):
         W = W0 if t == 0 else W1 if t == 1 else W2 if t == 2 else W3
@@ -84,9 +92,8 @@ def _ipc_all_gather_kernel(
             src = in0 if t == 0 else in1 if t == 1 else in2 if t == 2 else in3
             dst = out0 if t == 0 else out1 if t == 1 else out2 if t == 2 else out3
             E = n_my * W
-            chunk = tl.cdiv(tl.cdiv(E, NPROG), BLOCK) * BLOCK
-            lo = pid * chunk
-            hi = tl.minimum(E, lo + chunk)
+            lo = tl.maximum(plo, t_off) - t_off
+            hi = tl.minimum(phi, t_off + E) - t_off
             for off in range(lo, hi, BLOCK):
                 idx = off + ar
                 m = idx < hi
@@ -118,15 +125,18 @@ def _ipc_all_gather_kernel(
             while seen <= call and spins < max_spins:
                 seen = tl.atomic_add(flag, 0, sem="acquire", scope="sys")
                 spins += 1
+            total = n_r * WS
+            chunk = tl.cdiv(tl.cdiv(total, NPROG), 64) * 64
+            plo = pid * chunk
+            phi = tl.minimum(total, plo + chunk)
             t_off = 0
             for t in tl.static_range(_NT):
                 W = W0 if t == 0 else W1 if t == 1 else W2 if t == 2 else W3
                 if W > 0:
                     dst = out0 if t == 0 else out1 if t == 1 else out2 if t == 2 else out3
                     E = n_r * W
-                    chunk = tl.cdiv(tl.cdiv(E, NPROG), BLOCK) * BLOCK
-                    lo = pid * chunk
-                    hi = tl.minimum(E, lo + chunk)
+                    lo = tl.maximum(plo, t_off) - t_off
+                    hi = tl.minimum(phi, t_off + E) - t_off
                     for off in range(lo, hi, BLOCK):
                         idx = off + ar
                         m = idx < hi
@@ -148,7 +158,7 @@ def _zero_i64_kernel(ptrs, rank, n, BLOCK: tl.constexpr):
 class IpcAllGather:
     """dim-0 all-gather(v) of up to four small tensors over IPC memory."""
 
-    NPROG = 64
+    NPROG = 128
     BLOCK = 512
 
     def __init__(
