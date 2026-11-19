@@ -384,7 +384,9 @@ def test_fp8_softcap_forward_preserves_format_and_layer_descales(
     core = ModuleType("vllm.v1.attention.ops.triton_unified_attention")
     core.unified_attention = unified_attention
     kv_interface = ModuleType("vllm.v1.kv_cache_interface")
-    kv_interface.KVQuantMode = SimpleNamespace(FP8_PER_TOKEN_HEAD=token_head_mode)
+    kv_interface.KVQuantMode = SimpleNamespace(
+        FP8_PER_TOKEN_HEAD=token_head_mode, FP8_PER_TENSOR=object(),
+    )
     monkeypatch.setitem(sys.modules, scales.__name__, scales)
     monkeypatch.setitem(sys.modules, core.__name__, core)
     monkeypatch.setitem(sys.modules, kv_interface.__name__, kv_interface)
