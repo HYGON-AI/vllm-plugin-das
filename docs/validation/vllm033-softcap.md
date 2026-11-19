@@ -708,3 +708,25 @@ last_good=false; no performance or full-upgrade acceptance follows.
 Immutable current Gemma review SHA256: `69da52ed059050a4ea136932b3c25084d56ecdb610da44a391ef40ce9f6c31f0`.
 The structured record retains per-arm provenance, controller transitions,
 original requests, expected-key checks and every raw/normalized task result.
+## Official per-tensor FP8 descales candidate
+
+The selected v0.33 Core already exposes `KVQuantMode.FP8_PER_TENSOR` in
+`unified_attention`. For BF16/FP16 queries it multiplies loaded FP8 KV tiles
+by their FP32 layer scales before casting to the query dtype. The Plugin now
+passes scalar or zero-stride broadcast layer scales to that official mode,
+preserving typed E4M3/E5M2 views and the caller's Q/output buffers. It avoids
+the vendor mixed-dtype workaround's extra Q/output scaling on this route.
+No FlashAttention source or binary is changed or rebuilt.
+
+Nonuniform `[batch, KV heads]` scales retain the existing scale adapter;
+Core's per-tensor path loads only the first element and cannot represent them.
+Selection uses tensor metadata, without CPU value reads or synchronization.
+The focused portable attention suite passes 132 cases, including public
+forward routing and retained nonuniform-scale forwarding. These are source
+contracts, not installed native or model qualification.
+
+The native ragged-window matrix retains its original reference and tolerances,
+native writer, both layouts, zero/positive softcap and changed-input Graph
+checks. It adds non-power-of-two scales 0.7/0.3 alongside 0.5/0.25 for both FP8
+formats. Device results, current-combination model accuracy, original normal
+shutdown and performance remain pending; historical failures below are not waived.

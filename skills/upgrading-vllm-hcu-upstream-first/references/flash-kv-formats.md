@@ -62,9 +62,15 @@ establish a defective native kernel or waive the original model loss. See the
 Validate positive softcap separately from ordinary FP8 attention. A vendor
 paged path can accept the argument while ignoring it. When routing softcap to
 Core's official attention, cover every advertised cache dtype: preserve E4M3
-and E5M2 typed views and apply their descales exactly once. The shared scale
-adapter rounds query/output products to the query dtype; keep an independent
-FP32 reference with unchanged tolerances. Exercise public forward dispatch,
+and E5M2 typed views and apply their descales exactly once. Inspect the exact
+Core's `KVQuantMode.FP8_PER_TENSOR` before reusing a vendor scale workaround:
+the v0.33 BF16/FP16-query kernel scales FP32 KV tiles before casting them.
+Pass actual scalar or zero-stride broadcast layer scales directly to that mode;
+its single-scalar load cannot represent nonuniform batch/head scales. Retain
+the separate contract for those layouts, without reading GPU values to select
+the route. The vendor workaround rounds query/output products to query dtype;
+keep an independent FP32 reference with unchanged tolerances, including scales
+that are not powers of two. Exercise public forward dispatch,
 prefill-gather on/off, non-unit scales and changed-input Graph replay in both
 layouts. Core owns the softcap algorithm; a provider fallback does not prove
 the vendor implements it or qualify model accuracy.

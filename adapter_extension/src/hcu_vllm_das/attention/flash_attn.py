@@ -39,15 +39,46 @@ def _layout_name(layout: KVCacheLayout) -> str:
     return getattr(layout, "name", str(layout))
 
 
+def _has_core_tensor_descales(kwargs: dict[str, Any]) -> bool:
+    """Recognize scalar storage without reading scale values or synchronizing."""
+    query, key = kwargs["q"], kwargs["k"]
+    batch = kwargs["cu_seqlens_q"].shape[0] - 1
+    kv_heads = key.shape[1] if kwargs["layout"] == "bhsd" else key.shape[2]
+    if batch < 1 or query.shape[1] % kv_heads or query.stride(-1) != 1:
+        return False
+    for name in ("k_descale", "v_descale"):
+        scale = kwargs.get(name)
+        if (not isinstance(scale, torch.Tensor) or scale.device != query.device
+                or scale.dtype != torch.float32):
+            return False
+        if scale.numel() != 1 and not (
+            scale.shape == (batch, kv_heads)
+            and all(size <= 1 or stride == 0 for size, stride in zip(scale.shape, scale.stride()))
+        ):
+            return False
+    return True
+
+
 def _triton_softcap_attention(**kwargs: Any) -> torch.Tensor:
     """Use Core's softcap/window implementation over existing paged views."""
     if kwargs.get("return_softmax_lse") or kwargs.get("return_attn_probs"):
         raise NotImplementedError("Core softcap path does not return attention statistics")
-    if any(kwargs.get(name) is not None for name in ("q_descale", "k_descale", "v_descale")):
-        raise ValueError("Core softcap path requires descales to be applied first")
+    if kwargs.get("q_descale") is not None:
+        raise ValueError("Core softcap path requires unquantized queries")
     from vllm.v1.attention.ops.triton_unified_attention import unified_attention
 
     key, value = kwargs["k"], kwargs["v"]
+    quantization = {}
+    if any(kwargs.get(name) is not None for name in ("k_descale", "v_descale")):
+        if not _has_core_tensor_descales(kwargs):
+            raise ValueError("Core softcap path requires scalar or broadcast layer descales")
+        if (kwargs["q"].dtype not in (torch.bfloat16, torch.float16)
+                or key.dtype not in (torch.float8_e4m3fn, torch.float8_e5m2)
+                or value.dtype != key.dtype):
+            raise ValueError("Core scaled softcap requires BF16/FP16 queries and typed FP8 KV")
+        from vllm.v1.kv_cache_interface import KVQuantMode
+
+        quantization["kv_quant_mode"] = KVQuantMode.FP8_PER_TENSOR
     if kwargs["layout"] == "bhsd":
         key, value = key.transpose(1, 2), value.transpose(1, 2)
     output = kwargs.get("out")
@@ -63,8 +94,9 @@ def _triton_softcap_attention(**kwargs: Any) -> torch.Tensor:
         causal=kwargs.get("causal", False),
         window_size=kwargs.get("window_size") or (-1, -1),
         block_table=kwargs["block_table"], softcap=kwargs.get("softcap", 0.0),
-        q_descale=None, k_descale=None, v_descale=None,
+        q_descale=None, k_descale=kwargs.get("k_descale"), v_descale=kwargs.get("v_descale"),
         alibi_slopes=kwargs.get("alibi_slopes"),
+        **quantization,
     )
     return output
 
@@ -357,8 +389,6 @@ class HcuFlashAttentionImpl(AttentionImpl[FlashAttentionMetadata]):
                 "bhsd" if self.kv_cache_layout == KVCacheLayout.LBHNC else "bshd"
             )
             if self.kv_cache_dtype in (_E5M2_KV_CACHE_DTYPE, _E4M3_KV_CACHE_DTYPE):
-                from hcu_vllm_das.attention.e5m2_scales import run_e5m2_attention
-
                 cache_view = (
                     _e4m3_cache_view
                     if self.kv_cache_dtype == _E4M3_KV_CACHE_DTYPE
@@ -366,6 +396,15 @@ class HcuFlashAttentionImpl(AttentionImpl[FlashAttentionMetadata]):
                 )
                 kwargs["k"] = cache_view(kwargs["k"])
                 kwargs["v"] = cache_view(kwargs["v"])
+                if _has_core_tensor_descales(kwargs):
+                    # Core applies layer scales to FP32 KV tiles before casting
+                    # to Q's dtype. Do not round Q/output through the vendor's
+                    # mixed-dtype workaround when this official mode applies.
+                    return _triton_softcap_attention(**kwargs)
+                # Preserve nonuniform batch/head scale semantics. Core's
+                # per-tensor mode loads only the first scalar.
+                from hcu_vllm_das.attention.e5m2_scales import run_e5m2_attention
+
                 return run_e5m2_attention(_triton_softcap_attention, kwargs)
             return _triton_softcap_attention(**kwargs)
         if (getattr(self, "_prefill_gather_enabled", False)

@@ -267,6 +267,47 @@ def test_softcap_forward_uses_core_attention_and_preserves_output(
     assert torch.all(output[2:] == -99)
 
 
+@pytest.mark.parametrize("layout", ("LBHNC", "LBNHC"))
+@pytest.mark.parametrize("kv_dtype", ("fp8_e4m3", "fp8_e5m2"))
+def test_softcap_nonuniform_descales_retain_batch_and_head_semantics(
+    monkeypatch, layout, kv_dtype,
+):
+    flash = load_flash_attention(monkeypatch, kv_cache_layout=layout)
+    impl = make_impl(flash, kv_cache_dtype=kv_dtype, logits_soft_cap=0.5)
+    query = torch.randn(3, 4, 64, dtype=torch.bfloat16)
+    cache_shape = (2, 4, 64, 64) if layout == "LBHNC" else (2, 64, 4, 64)
+    key = torch.empty(cache_shape, dtype=torch.uint8)
+    output = torch.empty_like(query)
+    kscale = torch.arange(1, 9, dtype=torch.float32).reshape(2, 4)
+    vscale = kscale.flip(1).contiguous()
+    calls = []
+
+    def apply_descales(core, arguments):
+        calls.append("nonuniform")
+        assert core is flash._triton_softcap_attention
+        assert arguments["k_descale"] is kscale
+        assert arguments["v_descale"] is vscale
+        assert arguments["q"] is query
+        assert arguments["k"].dtype == (
+            torch.float8_e4m3fn if kv_dtype == "fp8_e4m3" else torch.float8_e5m2
+        )
+        output.fill_(7)
+        return output
+
+    scales = ModuleType("hcu_vllm_das.attention.e5m2_scales")
+    scales.run_e5m2_attention = apply_descales
+    monkeypatch.setitem(sys.modules, scales.__name__, scales)
+    monkeypatch.setattr(flash, "_vendor_varlen_func", lambda: pytest.fail("reached vendor"))
+    result = impl._run_flash_attention(
+        q=query, k=key, v=key.clone(), out=output,
+        cu_seqlens_q=torch.tensor([0, 1, 3], dtype=torch.int32),
+        k_descale=kscale, v_descale=vscale, q_descale=None,
+        softcap=0.5, window_size=(-1, -1),
+    )
+    assert result is output and torch.all(output == 7)
+    assert calls == ["nonuniform"]
+
+
 @pytest.mark.parametrize("window", (0, -1, True, 1.5))
 def test_rejects_invalid_sliding_window(monkeypatch, window):
     flash = load_flash_attention(monkeypatch)
@@ -307,20 +348,22 @@ def test_fp8_softcap_forward_preserves_format_and_layer_descales(
     calls = []
 
     def apply_descales(core, arguments):
-        calls.append("descales")
-        for name, view in zip(("k", "v"), views):
-            assert arguments[name].dtype == storage_dtype
-            assert arguments[name].data_ptr() == view.data_ptr()
-        torch.testing.assert_close(arguments["k_descale"], torch.full((1, 4), 0.5))
-        torch.testing.assert_close(arguments["v_descale"], torch.full((1, 4), 0.25))
-        # This CPU contract doubles only the GPU row-scale operation. The
-        # real softcap adapter must still call Core after scales are consumed.
-        return core(**dict(arguments, k_descale=None, v_descale=None))
+        pytest.fail("scalar layer scales reached the vendor Q/output workaround")
+
+    tensor_mode = object()
 
     def unified_attention(**arguments):
         calls.append("core")
-        assert arguments["k"].dtype == arguments["v"].dtype == storage_dtype
-        assert arguments["q_descale"] is arguments["k_descale"] is arguments["v_descale"] is None
+        for name, view in zip(("k", "v"), views):
+            assert arguments[name].dtype == storage_dtype
+            assert arguments[name].data_ptr() == view.data_ptr()
+        assert arguments["q"].data_ptr() == query.data_ptr()
+        assert arguments["kv_quant_mode"] is tensor_mode
+        assert arguments["q_descale"] is None
+        torch.testing.assert_close(arguments["k_descale"], torch.full((1, 4), 0.5))
+        torch.testing.assert_close(arguments["v_descale"], torch.full((1, 4), 0.25))
+        assert arguments["k_descale"].data_ptr() == layer._k_scale.data_ptr()
+        assert arguments["v_descale"].data_ptr() == layer._v_scale.data_ptr()
         assert arguments["softcap"] == softcap
         assert arguments["window_size"] == (
             (-1, -1) if sliding_window is None else (sliding_window - 1, 0)
@@ -331,12 +374,15 @@ def test_fp8_softcap_forward_preserves_format_and_layer_descales(
     scales.run_e5m2_attention = apply_descales
     core = ModuleType("vllm.v1.attention.ops.triton_unified_attention")
     core.unified_attention = unified_attention
+    kv_interface = ModuleType("vllm.v1.kv_cache_interface")
+    kv_interface.KVQuantMode = SimpleNamespace(FP8_PER_TENSOR=tensor_mode)
     monkeypatch.setitem(sys.modules, scales.__name__, scales)
     monkeypatch.setitem(sys.modules, core.__name__, core)
+    monkeypatch.setitem(sys.modules, kv_interface.__name__, kv_interface)
     monkeypatch.setattr(flash, "_vendor_varlen_func", lambda: pytest.fail("softcap reached vendor"))
     result = impl.forward(layer, query, query, query, cache, metadata(), output)
     assert result is output
-    assert calls == ["descales", "core"]
+    assert calls == ["core"]
     assert torch.all(output[:2] == 7)
     assert torch.all(output[2:] == -99)
 

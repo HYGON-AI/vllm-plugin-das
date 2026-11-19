@@ -14,11 +14,17 @@ pytestmark = [pytest.mark.hcu, pytest.mark.skipif(
 
 
 @pytest.mark.parametrize("layout", ("LBHNC", "LBNHC"))
-@pytest.mark.parametrize("kv_dtype", ("bfloat16", "float16", "fp8_e4m3", "fp8_e5m2"))
+@pytest.mark.parametrize("kv_dtype,k_scale,v_scale", (
+    ("bfloat16", 1.0, 1.0), ("float16", 1.0, 1.0),
+    ("fp8_e4m3", 0.5, 0.25), ("fp8_e4m3", 0.7, 0.3),
+    ("fp8_e5m2", 0.5, 0.25), ("fp8_e5m2", 0.7, 0.3),
+))
 @pytest.mark.parametrize("softcap", (0.0, 50.0))
 @pytest.mark.parametrize("window", (1, 17, 64, 4096))
 @torch.inference_mode()
-def test_sliding_native_writer_forward_ragged_changed_graph(layout, kv_dtype, softcap, window):
+def test_sliding_native_writer_forward_ragged_changed_graph(
+    layout, kv_dtype, k_scale, v_scale, softcap, window,
+):
     import vllm._C_stable_libtorch  # noqa: F401
 
     torch.manual_seed(417)
@@ -44,8 +50,8 @@ def test_sliding_native_writer_forward_ragged_changed_graph(layout, kv_dtype, so
     lengths = torch.zeros(batch, device="cuda", dtype=torch.int32)
     slots = torch.empty(batch * capacity, device="cuda", dtype=torch.long)
     output = torch.full((8, heads, dim), 99, device="cuda", dtype=dtype)
-    kscale = torch.tensor(0.5 if fp8 else 1.0, device="cuda", dtype=torch.float32)
-    vscale = torch.tensor(0.25 if fp8 else 1.0, device="cuda", dtype=torch.float32)
+    kscale = torch.tensor(k_scale, device="cuda", dtype=torch.float32)
+    vscale = torch.tensor(v_scale, device="cuda", dtype=torch.float32)
     layer = SimpleNamespace(_k_scale=kscale, _v_scale=vscale)
     meta = SimpleNamespace(num_actual_tokens=6, causal=True, query_start_loc=cuq,
         max_query_len=3, seq_lens=lengths, max_seq_len=capacity, block_table=table,
