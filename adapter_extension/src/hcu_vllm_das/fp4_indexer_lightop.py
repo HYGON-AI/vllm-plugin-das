@@ -120,7 +120,14 @@ def decode_rows(cfg):
     """Decode rows one step can carry, including speculative tokens."""
     spec = cfg.speculative_config
     extra = spec.num_speculative_tokens if spec else 0
-    return cfg.scheduler_config.max_num_seqs * (1 + extra)
+    requests = cfg.scheduler_config.max_num_seqs
+    parallel = getattr(cfg, 'parallel_config', None)
+    if spec is not None and getattr(parallel, 'pcp_shard_decode_requests', False):
+        # Native PCPManager assigns each step's compact decode ordinal modulo
+        # PCP width. Each owner keeps all verification tokens of its requests.
+        width = parallel.prefill_context_parallel_size
+        requests = (requests + width - 1) // width
+    return requests * (1 + extra)
 
 
 def staging_plan(cfg, max_model_len, compress_ratio):

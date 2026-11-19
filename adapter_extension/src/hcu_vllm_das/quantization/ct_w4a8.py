@@ -53,8 +53,13 @@ def validate_topology(config, moe):
         errors.append('fixed DeepEP HT/LL or owned DSpark AG-RS is required')
     if not actual.use_ep:
         errors.append('actual expert parallel ownership is required')
-    if actual.tp_size != 1 or actual.dp_size != p.data_parallel_size or actual.pcp_size != p.prefill_context_parallel_size or actual.ep_size != actual.dp_size*actual.pcp_size:
-        errors.append('MoE TP/DP/PCP/EP membership mismatch')
+    from hcu_vllm_das.pcp_dspark_draft import moe_pcp_size
+    expected_pcp = moe_pcp_size(config)
+    if actual.tp_size != 1 or actual.dp_size != p.data_parallel_size or actual.pcp_size != expected_pcp or actual.ep_size != actual.dp_size*actual.pcp_size:
+        errors.append(
+            'MoE TP/DP/PCP/EP membership mismatch: '
+            f'configured={(p.tensor_parallel_size, p.data_parallel_size, p.prefill_context_parallel_size)}, '
+            f'actual={(actual.tp_size, actual.dp_size, actual.pcp_size, actual.ep_size)}')
     if moe.max_num_tokens != config.scheduler_config.max_num_batched_tokens:
         errors.append('MoE capacity must match scheduler budget')
     sizes=config.compilation_config.cudagraph_capture_sizes

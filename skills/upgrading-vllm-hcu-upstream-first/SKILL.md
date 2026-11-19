@@ -49,6 +49,14 @@ Treat composite patches by subfeature: a passing receive-timeout test does not
 qualify RPC deadlines, pipeline queue capacity, fork initialization or worker
 lifecycle. Preserve unverified subfeatures in the migration ledger.
 
+Audit Graph configuration per runner before carrying an old wrapper. On v0.33,
+the official MRV1 speculative-size method no longer accepts a TP argument or
+uses `pass_config.enable_sp`; MRV2 plans its own capture descriptors. Keep the
+official size validation and DeepEP HT policy. Register Adapter-owned unsafe
+ops only after official split-list finalization, without replacing the config
+methods or mutating the shared stock list. Exercise real CPU config objects;
+these checks do not qualify custom-SP, DeepEP-auto, capture or model execution.
+
 Before retaining a pre-fork block-size hook, trace worker KV specs back into
 EngineCore. A target that derives the parent's cache block size from those specs
 before scheduler/hash/KV initialization can already propagate a worker-local
@@ -153,7 +161,7 @@ merely to pass discovery. Qualify each admitted operator and consumer separately
 
 ## Validate the changed execution path
 
-For interrupted checkpoint downloads and live-worker inspection, read
+For interrupted checkpoint downloads, live-worker inspection or shutdown stalls, read
 [checkpoint recovery and runtime probes](references/checkpoint-runtime-probes.md).
 Keep the original checkpoint identity and avoid copying live tensor owners.
 
@@ -170,6 +178,13 @@ Verify the live PR/head, dispatch actor, immutable approved image and concurrenc
 group before dispatch. Reuse an existing matching run. Keep the shared consumer
 and complete source/device/Graph/aggregate gates unchanged; publication or
 successful image selection does not establish runtime qualification.
+
+For missing Adapter modules or catalog entries, bind the failed job's resolved
+image digest to its actual installed payload before changing either repository.
+Check companion modules and selectable backend declarations in both the paired
+wheel and installed image without running startup hooks. A merged dependency
+or a self-consistent RECORD does not prove that the selected image delivers it;
+structural admission still needs the original registry/native/device tests.
 
 1. Freeze Core/Adapter/Plugin sources and dependency heads. Check capability
    and ABI compatibility instead of introducing an exact-wheel runtime lock.
@@ -300,6 +315,14 @@ location. Check `sys.executable`, `sys.prefix` and `sysconfig.get_path("purelib"
 before installation. Use an explicit candidate `--prefix`/`--target`, or a
 normal venv interpreter whose prefix has been verified, then verify actual
 installed files and RECORD. Check build-backend child interpreters separately.
+
+When a Plugin facade delegates its module identity to Adapter, update the
+exact alias-to-owner entry in `tests/vllm033/conftest.py`. Require both facade
+and destination RECORD entries, the canonical Adapter module object and its
+expected installed path. Retain negatives for either missing record, a
+same-path substitute, missing canonical binding and a foreign checkout; do
+not exempt the Adapter namespace as a whole. See the ownership tests in
+`tests/ci/test_v033_installed_module_ownership.py`.
 
 Chained jobs must wait for completed cleanup, checkpoint post-seal and RECORD
 receipts, not just a terminal-looking state string. Write final status only

@@ -56,3 +56,20 @@ output dtype and output-buffer behavior. A process-local diagnostic shim can
 test that fallback but does not deliver a production provider or establish
 native CuTe support. Preserve the original failure and qualify the eventual
 installed solution through the public model path before claiming support.
+
+## Draft request buffers and dummy batches
+
+Trace the selected runner's input residency before porting an asynchronous-copy
+wrapper. In the inspected v0.33 V2 runner, both normal and dummy draft calls pass
+the sampler's GPU temperature/seed buffers. A legacy H2D rationale alone does
+not establish a performance gap on that path. Preserve the official preallocated
+destinations and the current `dummy_run` argument: a dummy batch invalidates
+every request index, while ordinary padding invalidates only inactive rows.
+Blindly retaining the old five-argument replacement loses this newer contract.
+
+Exercise the real Core helper with changing request counts, full/empty batches,
+large integer seeds, caller-input reuse and stable destination addresses.
+`test_draft_input_owner.py` covers those CPU buffer contracts without replacing
+the helper. It does not establish async transfers, device Graph replay, accepted
+draft tokens or MTP throughput; keep those gates separate before retiring any
+remaining performance requirement.
