@@ -209,6 +209,16 @@ requires HIP PyTorch, matching hipcc and a C++ build toolchain. A missing select
 provider fails during preparation. Ineligible tensor shapes use Core inverse RoPE.
 Prefill retains Core's compressed KV and SWA gather and dequantization.
 
+## DeepSeek V4.1 static EPLB candidate
+
+The owned PCP model accepts `additional_config.hcu_static_eplb` for a fixed
+version-2 expert map or offline calibration. The FP4 constructor composes
+static placement with the existing PCP attention, Engram and decoder SWA
+replay gate. The scoped DeepGEMM/DeepEP HT method admits the configured
+physical expert count. Global runtime EPLB remains disabled.
+Configuration, migration ownership and validation scope are recorded in
+[static EPLB](../docs/validation/v41-static-eplb.md).
+
 ## Compatibility
 
 - vLLM release line: `>=0.33.0,<0.34.0`; prerelease, postrelease,

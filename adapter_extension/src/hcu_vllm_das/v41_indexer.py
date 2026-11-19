@@ -126,16 +126,14 @@ class HcuV41SparseAttnIndexer(_api['base']):
         if self._hcu_fp4:
             from vllm import envs
             from .fp4_workspace import query_chunk_rows
-            from .fp4_indexer_lightop import staging_plan
+            from .fp4_indexer_lightop import decode_rows, staging_plan
             cfg = current_config()
             self.fp4_max_logits_bytes = envs.VLLM_SPARSE_INDEXER_MAX_LOGITS_MB * 1024**2
             self.fp4_query_chunk_rows = query_chunk_rows(
                 self.max_model_len, self.fp4_max_logits_bytes)
             self.fp4_decode_rows = min(
                 cfg.scheduler_config.max_num_batched_tokens,
-                cfg.scheduler_config.max_num_seqs * (
-                    1 + (cfg.speculative_config.num_speculative_tokens
-                         if cfg.speculative_config else 0)))
+                decode_rows(cfg))
             self.fp4_page_records = cfg.cache_config.block_size // self.compress_ratio
             self.fp4_staging_plan = staging_plan(cfg, self.max_model_len, self.compress_ratio)
 
