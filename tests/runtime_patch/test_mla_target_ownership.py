@@ -957,6 +957,101 @@ def test_mla_multitoken_decode_context_excludes_rejected_drafts(
         assert result.common is common
 
 
+@pytest.mark.parametrize(
+    ("num_actual_reqs", "num_padded_reqs", "padding_query_len"),
+    [
+        pytest.param(3, 4, 0, id="full-3-to-4"),
+        pytest.param(5, 8, 0, id="full-5-to-8"),
+        pytest.param(6, 8, 0, id="full-6-to-8"),
+        pytest.param(7, 8, 0, id="full-7-to-8"),
+        pytest.param(8, 8, 0, id="full-unpadded"),
+        pytest.param(3, 3, 0, id="piecewise-unpadded"),
+        pytest.param(7, 8, 1, id="full-single-token-padding"),
+        pytest.param(7, 8, 4, id="ignore-multitoken-padding"),
+    ],
+)
+def test_mla_build_ignores_decode_graph_padding_without_device_sync(
+    num_actual_reqs, num_padded_reqs, padding_query_len,
+):
+    adapter = _adapter()
+    module = _fake_mla_module(adapter, [])
+    query_lens = [1] * num_actual_reqs + [padding_query_len] * (
+        num_padded_reqs - num_actual_reqs
+    )
+    common = SimpleNamespace(
+        num_reqs=num_padded_reqs,
+        num_actual_tokens=sum(query_lens),
+        max_query_len=max(query_lens),
+        query_start_loc_cpu=torch.tensor([0] + query_lens).cumsum(0),
+        is_prefilling=torch.zeros(num_actual_reqs, dtype=torch.bool),
+        seq_lens=SimpleNamespace(
+            cpu=lambda: pytest.fail("ordinary decode synchronized device lengths")
+        ),
+        causal=True,
+    )
+    build_calls = []
+
+    def build(self, common_prefix_len, common_attn_metadata, fast_build=False):
+        build_calls.append((common_prefix_len, common_attn_metadata, fast_build))
+        return SimpleNamespace(num_actual_tokens=common_attn_metadata.num_actual_tokens)
+
+    module.MLACommonMetadataBuilder.build = build
+    assert adapter.apply_to_module(module) is True
+    metadata_builder = module.MLACommonMetadataBuilder()
+    metadata_builder.reorder_batch_threshold = 1
+
+    result = metadata_builder.build(0, common, fast_build=True)
+
+    assert build_calls == [(0, common, True)]
+    assert result.num_actual_tokens == common.num_actual_tokens
+    assert result.num_kv_actual_tokens == common.num_actual_tokens
+
+
+@pytest.mark.parametrize("num_padded_reqs", [2, 4, 8])
+def test_mla_multitoken_decode_uses_actual_lengths_with_graph_padding(
+    num_padded_reqs,
+):
+    adapter = _adapter()
+    module = _fake_mla_module(adapter, [])
+    num_padding_reqs = num_padded_reqs - 2
+    query_lens = [4, 4] + [0] * num_padding_reqs
+    upper_bound = [110, 103] + [0] * num_padding_reqs
+    device_lens = torch.tensor([108, 100] + [0] * num_padding_reqs)
+    sync_calls = []
+    common = SimpleNamespace(
+        num_reqs=num_padded_reqs,
+        num_actual_tokens=8,
+        query_start_loc_cpu=torch.tensor([0] + query_lens).cumsum(0),
+        is_prefilling=torch.tensor([False, False]),
+        seq_lens=SimpleNamespace(
+            cpu=lambda: sync_calls.append("cpu") or device_lens,
+        ),
+        seq_lens_cpu_upper_bound=torch.tensor(upper_bound),
+        causal=True,
+        num_kv_actual_tokens=13,
+    )
+
+    def build(self, common_prefix_len, common_attn_metadata, fast_build=False):
+        return SimpleNamespace(
+            common=common_attn_metadata,
+            context_lens=common_attn_metadata.seq_lens_cpu_upper_bound
+            - common_attn_metadata.query_start_loc_cpu.diff(),
+        )
+
+    module.MLACommonMetadataBuilder.build = build
+    assert adapter.apply_to_module(module) is True
+    metadata_builder = module.MLACommonMetadataBuilder()
+    metadata_builder.reorder_batch_threshold = 1
+
+    result = metadata_builder.build(0, common)
+
+    assert sync_calls == ["cpu"]
+    assert result.context_lens.tolist() == [104, 96] + [0] * num_padding_reqs
+    assert result.common is not common
+    assert common.seq_lens_cpu_upper_bound.tolist() == upper_bound
+    assert result.num_kv_actual_tokens == 13
+
+
 def test_dense_and_sparse_mla_metadata_carry_parallel_sizes(monkeypatch):
     adapter = _adapter()
     module = _fake_mla_module(adapter, [])

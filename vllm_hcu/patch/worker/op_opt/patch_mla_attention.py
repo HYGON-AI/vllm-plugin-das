@@ -416,7 +416,8 @@ def apply_to_module(module: ModuleType) -> bool:
             and query_start_loc_cpu is not None
             and getattr(common_attn_metadata, "causal", True) is not False
         ):
-            query_offsets = query_start_loc_cpu.numpy()
+            num_actual_reqs = is_prefilling.numel()
+            query_offsets = query_start_loc_cpu[: num_actual_reqs + 1].numpy()
             query_lens = query_offsets[1:] - query_offsets[:-1]
             multi_token_decodes = (
                 query_lens > self.reorder_batch_threshold
