@@ -184,3 +184,23 @@ labeled whitespace-only comparison; a correct extracted key does not pass a
 failed strict-format probe. Keep expected-value checks in the derived audit
 when the original generation client is frozen, without changing its requests
 or regenerating answers.
+
+
+## Inverse-RoPE rounding boundaries
+
+Compare the target Core's emitted instructions, not only its Python arithmetic.
+One DTK 26.10/gfx938 Triton build rounds the sine product before fusing the
+cosine product; another supported installed build emits separate products
+and sum even with `enable_fp_fusion=True`. Do not transfer either contract
+across installations or infer it from that compiler flag or a wheel string.
+At provider preparation, compare both native modes with the actual Core helper
+using distinguishing cancellation inputs and both position dtypes. Admit only
+one consistent match; reject unknown or ambiguous behavior before execution.
+Bind the selected mode once, before Graph capture; forward and health checks
+must not rerun calibration, initialize vendors or change the selection.
+Keep the original failed gates and the old installation's results separately.
+Freeze cancellation witnesses with independent FP64 oracles for both modes,
+retain exact eager and changed-input Graph assertions, and cover both position
+index dtypes. This component result does not qualify a model or other builds.
+PCP forward Q shares the native layout but requires separate FP32 products;
+validate both users together rather than changing the shared rounding globally.

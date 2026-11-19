@@ -3,10 +3,10 @@
 #include <torch/extension.h>
 
 void deepseek_v4_inv_rope(torch::Tensor& rope, const torch::Tensor& positions,
-                          const torch::Tensor& cos_sin_cache);
+                          const torch::Tensor& cos_sin_cache, bool fuse_cosine);
 
 TORCH_LIBRARY_FRAGMENT(hcu_vllm_das, m) {
-  m.def("deepseek_v4_inv_rope(Tensor(a!) rope, Tensor position_ids, Tensor cos_sin_cache) -> ()");
+  m.def("deepseek_v4_inv_rope(Tensor(a!) rope, Tensor position_ids, Tensor cos_sin_cache, bool fuse_cosine=True) -> ()");
 }
 
 TORCH_LIBRARY_IMPL(hcu_vllm_das, CUDA, m) {
