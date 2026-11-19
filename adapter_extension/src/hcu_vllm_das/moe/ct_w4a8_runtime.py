@@ -6,6 +6,9 @@ import copy
 import inspect
 from types import SimpleNamespace
 import torch
+from ..adapter_api import adapter_module
+
+hcu_env = adapter_module('hcu_env')
 import vllm.model_executor.layers.fused_moe.modular_kernel as mk
 from vllm.model_executor.layers.fused_moe.activation import MoEActivation
 from vllm.model_executor.layers.fused_moe.all2all_utils import maybe_make_prepare_finalize as native_make_prepare_finalize
@@ -14,6 +17,7 @@ from vllm.model_executor.layers.fused_moe.topk_weight_and_reduce import TopKWeig
 from vllm.model_executor.layers.fused_moe.utils import _resize_cache
 from vllm.model_executor.layers.quantization.utils.quant_utils import kInt4W4A8StaticChannelSym, kInt8DynamicTokenSym
 from vllm.platforms import current_platform
+from .ct_w4a8_hints import expected_m, masked_gemm
 from .ct_w4a8_prepare import HcuCTHTPrepareAndFinalize,HcuCTLLPrepareAndFinalize,DeepEPHTPrepareAndFinalize,DeepEPLLPrepareAndFinalize
 
 
@@ -143,6 +147,9 @@ class HcuCTContiguousExperts(_Experts):
     ALIGNMENT=256
     def __init__(self,moe,quant,weights,ops):
         super().__init__(moe,quant);self.weights=weights;self.ops=ops
+        from .clamped_int8_admission import admitted
+        self._live_row_activation = admitted(ops, weights, self.w1_scale,
+            self.w2_scale, quant.gemm1_clamp_limit, masked=False)
     @staticmethod
     def activation_format(): return mk.FusedMoEActivationFormat.Standard
     def finalize_weight_and_reduce_impl(self): return TopKWeightAndReduceNoOP()
@@ -164,7 +171,10 @@ class HcuCTContiguousExperts(_Experts):
         self.ops.gemm_contiguous((data,scale),(self.weights[0],self.w1_scale),gateup,indices)
         qout=_resize_cache(workspace13.view(dtype=torch.int8),(aligned,n//2))
         limit=self.quant_config.gemm1_clamp_limit
-        if limit is not None and limit>0:
+        if self._live_row_activation:
+            from .clamped_int8_triton import clamped_int8_2304
+            mid,ms=clamped_int8_2304(gateup,indices,masked=False,output=qout)
+        elif limit is not None and limit>0:
             mid,ms=self.ops.clamp_quant(gateup,limit=limit,output=qout)
         else:
             mid,ms=self.ops.silu_quant(gateup,output=qout,expert_ids=indices)
@@ -179,6 +189,23 @@ class HcuCTMaskedExperts(_Experts):
     def __init__(self,moe,quant,weights,ops,capacity,dispatchers):
         super().__init__(moe,quant,max_num_tokens=capacity,num_dispatchers=dispatchers)
         self.weights=weights;self.ops=ops
+        from .clamped_int8_admission import admitted
+        self._live_row_activation = (capacity == 256 and dispatchers == 8
+            and admitted(ops, weights, self.w1_scale, self.w2_scale,
+                         quant.gemm1_clamp_limit, masked=True))
+        self._small_batch_hint = False
+        hint_mode, _ = hcu_env.resolve('HCU_DSV41_W4A8_MOE_EXPECTED_M', host='vllm')
+        local_experts = int(self.w1_scale.shape[0])
+        if (hint_mode == '1'
+                and capacity == 256 and dispatchers == 8
+                and local_experts in (16, 48)
+                and tuple(self.w1_scale.shape[:2]) == (local_experts, 4608)
+                and tuple(self.w2_scale.shape[:2]) == (local_experts, 5120)
+                and quant.gemm1_clamp_limit == 10
+                and weights[0].device.type == 'cuda'):
+            props = torch.cuda.get_device_properties(weights[0].device)
+            arch = getattr(props, 'gcnArchName', '').split(':', 1)[0]
+            self._small_batch_hint = arch == 'gfx938' and props.multi_processor_count == 64
     @staticmethod
     def activation_format(): return mk.FusedMoEActivationFormat.BatchedExperts
     def finalize_weight_and_reduce_impl(self): return TopKWeightAndReduceDelegate()
@@ -193,14 +220,31 @@ class HcuCTMaskedExperts(_Experts):
         e,t,n,k,_=self.moe_problem_size(hidden_states,w1,w2,topk_ids)
         if t!=self.max_num_tokens*self.num_dispatchers: raise ValueError('LL input exceeds expert workspace contract')
         counts=expert_tokens_meta.expert_num_tokens
+        # The hint selects kernels. Device counts still bound every expert's rows.
+        hint = t
+        use_hint = self._small_batch_hint and (e, global_num_experts, topk_ids.shape[1]) in (
+            (48, 384, 6), (16, 128, 3))
+        if use_hint:
+            hint = expected_m(topk_ids.shape[0], self.num_dispatchers, topk_ids.shape[1],
+                              global_num_experts, t)
         gateup=_resize_cache(workspace13,(e,t,n))
-        self.ops.gemm_masked((hidden_states,a1q_scale),(self.weights[0],self.w1_scale),gateup,counts,t)
+        self._masked_gemm((hidden_states, a1q_scale), (self.weights[0], self.w1_scale),
+                          gateup, counts, hint, use_hint)
         limit=self.quant_config.gemm1_clamp_limit
-        if limit is not None and limit>0:
-            mid,ms=self.ops.clamp_quant_ep(gateup,limit=limit,mask_m=counts,expect_m=t)
+        if self._live_row_activation:
+            from .clamped_int8_triton import clamped_int8_2304
+            mid,ms=clamped_int8_2304(gateup,counts,masked=True,expected_m=hint)
+        elif limit is not None and limit>0:
+            mid,ms=self.ops.clamp_quant_ep(gateup,limit=limit,mask_m=counts,expect_m=hint)
         else:
             mid,ms=self.ops.silu_quant_ep(gateup,tokens_per_expert=counts)
-        self.ops.gemm_masked((mid,ms),(self.weights[1],self.w2_scale),output,counts,t)
+        self._masked_gemm((mid, ms), (self.weights[1], self.w2_scale), output, counts,
+                          hint, use_hint)
+
+    def _masked_gemm(self, inputs, weights, output, counts, hint, use_hint):
+        if use_hint:
+            return masked_gemm(self.ops.gemm_masked, inputs, weights, output, counts, hint)
+        return self.ops.gemm_masked(inputs, weights, output, counts, hint)
 
 
 def make_experts(moe,quant,weights,ops,prepare):

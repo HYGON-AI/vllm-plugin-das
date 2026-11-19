@@ -51,6 +51,16 @@ The existing FP4 deployment admission and provider checks still apply.
 The LightOp FP4 decode path masks logits beyond each device sequence length
 before candidate selection and top-k, including during CUDA Graph replay.
 
+## V4.1 W4A8 masked MoE scheduling hint
+
+Set `HCU_DSV41_W4A8_MOE_EXPECTED_M=1` before starting the service to enable
+this opt-in on the DeepEP low-latency `gfx938` 64-CU path with 256 tokens of
+capacity per dispatcher, 8 dispatchers, 384 global experts, 48 local experts,
+top-k 6, hidden width 5120, gate/up width 4608, and clamp limit 10. The hint
+uses the local token extent for both masked GEMMs and clamp/quantization.
+Workspace capacity and device-side per-expert row counts retain their existing
+roles. Other configurations use the capacity as the hint.
+
 ## E2M1 packer lowering (default triton, `stock` opts out)
 
 `das_hcu_fp4_packer` rebinds Core's `_fp32x2_to_fp4x2` E2M1 packer at startup.
