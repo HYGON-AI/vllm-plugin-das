@@ -54,3 +54,41 @@ enablement rather than forcing every configuration through the kernel. Reuse
 upstream eager tests and add changing-input Graph coverage on the real class;
 see `docs/validation/vllm033-official-clamp-swiglu.md`. Component ownership does
 not qualify a checkpoint, HumanEval, performance or whole-model shutdown.
+
+## Cross-framework GDN verify contracts
+
+For Adapter's GDN target-verify bridge, describe the upstream and vendor
+signatures independently. An upstream-only `lower_bound=None` may be omitted
+from the vendor call after reviewing its meaning. Every non-None request,
+including zero and `False`, must retain the original upstream semantics;
+do not silently discard it. Unknown added parameters still reject publication.
+Preserve the original callable object, signature and previously cached aliases.
+
+Inspect the actual native gate strides. In the observed AITER verify kernel,
+`a` has no token/head stride and `b` has no head stride. Materialize interleaved
+gate views without changing their values; retain the existing Q/K/V stride
+contract. Check independent FP32 recurrence, snapshot slots, unchanged initial
+state and changing-input Graph replay. Successful binding alone does not
+establish numerical compatibility.
+
+Keep explicit-provider numerical results separate from automatic admission.
+A passing explicit suite on a new stack does not qualify that stack's default
+selection or skipped automatic-admission tests. Extending admission still needs
+its actual eager/Graph/model evidence; do not loosen the table to make skips pass.
+
+## Native JIT and interrupted cold builds
+
+When a vendor builds after a native-module miss, compatibility stubs must not
+report a missing native module as successfully imported. Verify real discovery,
+the missing-module exception, the vendor build and native execution separately.
+Use privately owned package and cache directories for default JIT writes;
+checking wheel RECORDs does not identify newly generated native artifacts.
+
+After a cold-build timeout, a live retry can be waiting on an abandoned
+FileBaton lock. Inspect its actual stack, compiler descendants and artifact
+progress rather than inferring compilation from a live parent or more jobs.
+Preserve the timeout and waiting evidence. Before recovery, confirm all users
+of that private cache have exited, bind the lock path/inode/time to the original
+run, and preserve the old lock in a new run's evidence. Do not clear shared or
+another client's locks. An interrupted run retains its failed lifecycle result;
+cache recovery does not retroactively qualify its tests.
