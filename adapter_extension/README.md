@@ -33,8 +33,15 @@ Positive `logits_soft_cap` uses Core's unchanged Triton attention over the same
 paged cache views, because the vendor paged path ignores softcap. See
 [softcap routing and validation](../docs/validation/vllm033-softcap.md).
 For explicit E4M3 and E5M2 caches, the Plugin preserves the format's typed
-view and applies KV descales through the shared query/output scale adapter
-before/after the Core call.
+view. Scalar FP32 layer descales use zero-stride views through Core's official
+`FP8_PER_TOKEN_HEAD` scale API, preserving FP32 score scaling before softcap
+without rescaling Q/output or allocating a full scale cache. Nonuniform
+request/head scales retain the shared query/output scale adapter.
+
+FP16 inputs written to an E4M3 cache use the existing native writer's FP32
+input specialization to avoid an extra half-precision rounding step. This
+allocates two temporary FP32 input tensors; their cost follows the supplied
+input shapes, including padded rows. Quantization and scatter remain native.
 
 Causal sliding windows also use the same official Core attention path, with
 `(window - 1, 0)` bounds, including when softcap is zero. Full attention with
