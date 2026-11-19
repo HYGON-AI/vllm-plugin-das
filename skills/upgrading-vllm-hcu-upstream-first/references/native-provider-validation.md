@@ -115,3 +115,24 @@ source remains a candidate until that source is built and the original failing
 cases pass on the device. Avoid an Adapter/Plugin padding or metadata-alias
 workaround that conceals a native out-of-bounds read; keep provider ownership and
 unverified capability explicit.
+
+## CPU import probes and device namespaces
+
+Separate framework management queries from provider computation when isolating
+CPU contracts. In the inspected v0.33 Core, importing `RocmPlatform` queries
+architecture through AMD SMI and falls back to Torch device properties if that
+query fails. Hiding every device node can therefore fail collection before a
+selector or provider is tested. Check the actual management query and Torch
+initialization state before choosing the namespace; preserve a real architecture
+query rather than inventing architecture or availability results.
+
+Vendor imports have separate requirements. The observed DeepGEMM import runs
+`rocminfo` for a CU count and fails on `None` when its device namespace prevents
+that query. A parsed count alone does not identify a GPU or prove usable kernels.
+Keep that failure and its original JUnit. If matching production CI's namespace
+repairs the environment, rerun the unchanged affected contract with real provider
+imports, empty compute masks and a Torch-initialization guard where applicable.
+Reuse unaffected completed cases only with unchanged source, dependencies and
+configuration evidence. If combining JUnit reports, label the derived report,
+retain each original report and verify the exact case multiset. CPU import/ABI
+success does not qualify native numerics, Graph, model accuracy or lifecycle.
