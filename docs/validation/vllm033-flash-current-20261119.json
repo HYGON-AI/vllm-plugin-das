@@ -1,0 +1,329 @@
+{
+  "at": "2026-11-19T10:59:29.462586+00:00",
+  "tested_plugin_head": "74967a41f9b058d15371941366b1709227e5d26d",
+  "release_target": "v0.33.0",
+  "CI": {
+    "run": 44503238282,
+    "url": "https://github.com/HYGON-AI/vllm-plugin-das/actions/runs/44503238282",
+    "jobs_success": 8,
+    "workflow_head": "6fa728d2b913d8e4e46e5f5638c90a48405c3b3f",
+    "image_sha256": "046196c7d2900438755dc7935db0ca280054b05717d2e6b3e8ea7dcf2c2ed249",
+    "counts": {
+      "v033-device-gfx936/v033-device.xml": {
+        "tests": 401,
+        "failures": 0,
+        "errors": 0,
+        "skipped": 0
+      },
+      "v033-device-gfx936/v033-portable.xml": {
+        "tests": 1382,
+        "failures": 0,
+        "errors": 0,
+        "skipped": 0
+      },
+      "v033-device-gfx938/v033-device.xml": {
+        "tests": 8,
+        "failures": 0,
+        "errors": 0,
+        "skipped": 0
+      },
+      "v033-source-contract/v033-source.xml": {
+        "tests": 8,
+        "failures": 0,
+        "errors": 0,
+        "skipped": 0
+      }
+    },
+    "deselected": {
+      "portable": 46,
+      "gfx936_native": 26
+    },
+    "selector_records": 11,
+    "scope": "Components only. gfx938 synthetic Channel-FP8 expert and RoPE; no model/gfx836 qualification. Remote image and fresh local model cohort remain separate."
+  },
+  "fresh_local": {
+    "CPU": {
+      "at": "2026-11-19T10:35:56.048163+00:00",
+      "returncode": 0,
+      "cases": 271,
+      "failures": 0,
+      "errors": 0,
+      "skips": 0,
+      "records_unchanged": true,
+      "source_unchanged": true,
+      "GPU_initialized": false
+    },
+    "native_283": {
+      "at": "2026-11-19T10:43:42.433736+00:00",
+      "returncode": 0,
+      "cases": 283,
+      "failures": 0,
+      "errors": 0,
+      "skips": 0,
+      "records_unchanged": true,
+      "source_unchanged": true,
+      "KFD_pids": []
+    },
+    "native_actual_device": {
+      "pid": 2368798,
+      "architecture": "gfx936:sramecc+:xnack-",
+      "name": "BW",
+      "visible_device_count": 1,
+      "visibility": {
+        "ROCR_VISIBLE_DEVICES": "7",
+        "HIP_VISIBLE_DEVICES": "0",
+        "CUDA_VISIBLE_DEVICES": "0"
+      }
+    },
+    "initial_native_failure": {
+      "passed": 33,
+      "failed": 250,
+      "cause": "Isolated launcher omitted existing ROCM_PATH/HIP_PATH; original failure retained, same unchanged283-case matrix passed after restoring environment."
+    },
+    "Core": "98a09850d56b4ab99a8c9bc4b28d411b72ed5147",
+    "Adapter_build": "8ba62c9d349a101b82a3e2a47a82b68635362937",
+    "Adapter_runtime_equal_main": "9e2340aaa8358de6c064fc8dd7d54d4488971c5d",
+    "candidate_wheel_sha256": "7a09643670e1df1682772a9cabae7fe38365559adadad638e6bceddc504d38ad"
+  },
+  "official_model": {
+    "backend": "TRITON_ATTN",
+    "kv_dtype": "auto",
+    "architecture": "gfx936:sramecc+:xnack-",
+    "counts": {
+      "raw": 20,
+      "normalized": 31
+    },
+    "raw_pass_ids": [
+      "HumanEval/0",
+      "HumanEval/1",
+      "HumanEval/3",
+      "HumanEval/4",
+      "HumanEval/5",
+      "HumanEval/6",
+      "HumanEval/7",
+      "HumanEval/8",
+      "HumanEval/9",
+      "HumanEval/11",
+      "HumanEval/12",
+      "HumanEval/14",
+      "HumanEval/17",
+      "HumanEval/19",
+      "HumanEval/20",
+      "HumanEval/21",
+      "HumanEval/22",
+      "HumanEval/25",
+      "HumanEval/28",
+      "HumanEval/29"
+    ],
+    "normalized_pass_ids": [
+      "HumanEval/0",
+      "HumanEval/1",
+      "HumanEval/2",
+      "HumanEval/3",
+      "HumanEval/4",
+      "HumanEval/5",
+      "HumanEval/6",
+      "HumanEval/7",
+      "HumanEval/8",
+      "HumanEval/9",
+      "HumanEval/10",
+      "HumanEval/11",
+      "HumanEval/12",
+      "HumanEval/13",
+      "HumanEval/14",
+      "HumanEval/15",
+      "HumanEval/16",
+      "HumanEval/17",
+      "HumanEval/18",
+      "HumanEval/19",
+      "HumanEval/20",
+      "HumanEval/21",
+      "HumanEval/22",
+      "HumanEval/23",
+      "HumanEval/24",
+      "HumanEval/25",
+      "HumanEval/27",
+      "HumanEval/28",
+      "HumanEval/29",
+      "HumanEval/30",
+      "HumanEval/31"
+    ],
+    "finish_reasons": {
+      "stop": 32
+    },
+    "completion_tokens": [
+      160,
+      202,
+      109,
+      49,
+      151,
+      124,
+      194,
+      101,
+      142,
+      153,
+      206,
+      148,
+      145,
+      83,
+      75,
+      81,
+      76,
+      210,
+      154,
+      217,
+      242,
+      155,
+      101,
+      47,
+      101,
+      234,
+      114,
+      53,
+      58,
+      95,
+      36,
+      201
+    ],
+    "functional_probes": {
+      "passed": true,
+      "failures": [],
+      "continued_for_scoring": true
+    },
+    "prefix_hit_delta": 3840.0,
+    "actual_impls": {
+      "vllm.v1.attention.backends.triton_attn.TritonAttentionImpl": 36
+    },
+    "physical_cache_dtypes": [
+      "torch.bfloat16"
+    ],
+    "cache_resolution": {
+      "num_blocks": 113,
+      "hash_block_size": 64,
+      "prefix_cache_retention_interval": 0,
+      "kv_cache_layout": "LBNHC"
+    },
+    "graph_config": [
+      2,
+      1
+    ],
+    "graph_events": {
+      "execute_context_1(18)_generation_0(0)": 2,
+      "execute_context_0(0)_generation_1(1)": 50,
+      "execute_context_0(0)_generation_0(0)": 1,
+      "hipGraphLaunch": 62
+    },
+    "native_leak_diagnostics": [
+      "nanobind: leaked 4 instances!",
+      "nanobind: leaked 70 types!",
+      "nanobind: leaked 558 functions!",
+      "nanobind: leaked 4 instances!",
+      "nanobind: leaked 69 types!",
+      "nanobind: leaked 556 functions!"
+    ],
+    "exit": {
+      "at": "2026-11-19T10:56:14.673736+00:00",
+      "returncode": 0,
+      "elapsed_s": 29.012530125211924,
+      "api_sigint": true,
+      "original_EngineCore_grace_s": 15
+    },
+    "forced_or_timeout_log_lines": [
+      "(APIServer pid=2374429) WARNING 11-19 10:56:00 [utils.py:648] [shutdown] Process manager: force killing remaining processes count=1",
+      "(APIServer pid=2374429) WARNING 11-19 10:56:00 [utils.py:653] [shutdown] Process manager: force killing remaining process EngineCore pid 2375719"
+    ]
+  },
+  "generation": {
+    "dataset_commit": "6d43fb980f9fee3c892a914eda09951f772ad10d",
+    "dataset_sha256": "b796127e635a67f93fb35c04f4cb03cf06f38c8072ee7cee8833d7bee06979ef",
+    "request_sha256": "7f16e8d239ea905fd79192c7efad014ff9467def7822be3a9c8566a1498fe5e0",
+    "schedule": "HumanEval sequential; separate arithmetic waves concurrency4",
+    "temperature": 0,
+    "seed": 0,
+    "max_tokens": 2048,
+    "thinking": "disable",
+    "ids": [
+      0,
+      1,
+      2,
+      3,
+      4,
+      5,
+      6,
+      7,
+      8,
+      9,
+      10,
+      11,
+      12,
+      13,
+      14,
+      15,
+      16,
+      17,
+      18,
+      19,
+      20,
+      21,
+      22,
+      23,
+      24,
+      25,
+      26,
+      27,
+      28,
+      29,
+      30,
+      31
+    ],
+    "isolated_scorer": {
+      "uid": 65534,
+      "gid": 65534,
+      "cap_eff": "0",
+      "namespaces": {
+        "mnt": "mnt:[4026542156]",
+        "net": "net:[4026542159]",
+        "pid": "pid:[4026542157]"
+      },
+      "environment_keys": [
+        "HOME",
+        "LANG",
+        "PATH",
+        "TMPDIR"
+      ],
+      "gpu_nodes": false,
+      "host_credentials": false
+    },
+    "raw_input_hashes": {
+      "problems.jsonl": "6906d173a121e247cc03340ec685d66019a6aa8949276a368b796b819540bc2c",
+      "samples.jsonl": "8c28de956f677af440e57c28d48531e43c935ed6ab8fe4fef91f9be919aec00a"
+    }
+  },
+  "resource_stop": {
+    "original_controller_exit": 1,
+    "owned_processes_remaining": 0,
+    "port_released": true,
+    "foreign_KFD_active_processes": 8,
+    "foreign_gpu_ids_with_VRAM": 8,
+    "foreign_vpid_all_zero": true,
+    "no_foreign_process_signaled": true,
+    "no_retry_or_duplicate_generation": true,
+    "Flash_BF16_E4M3_E5M2": "not started"
+  },
+  "qualification": {
+    "gfx836": false,
+    "model_comparison": false,
+    "full_lifecycle": false,
+    "old_BF16_task18_E5M2_task19_waived": false
+  },
+  "evidence_files": {
+    "models/official/he32/responses.jsonl": "2aa37b0b84bef5c430ab4934fd18598e6fd190e8947cccfd2565beb42b9dc35f",
+    "models/official/he32/samples.jsonl": "8c28de956f677af440e57c28d48531e43c935ed6ab8fe4fef91f9be919aec00a",
+    "models/official/service.log": "eba90d9e81ada73cb1d535e4543f2fa6ad0f891acadd39c13093394fde473d52",
+    "models/official/score.json": "7d734844e6f1da45f62c281fc396df8e8ca5a17d31abec74bb085f8499c39f8d",
+    "models/official/terminal.json": "46a614424cdb03ace7e1e3d3a2a3813acd0d6b129c8b7dc6afd232a4055ee460",
+    "models/official/score-recovery-receipt.json": "2d2ea01153e09ebc8b5fd2f1c579540e9321a3499834d7f651d8cc1bc4790811",
+    "models/kfd-post-baseline.json": "1eeb8e6df470076b964ec1c04af311183fbef79b479377c865f3a10727921014",
+    "models/independent-review.json": "61f1b1269e37ab14732d8d94bd0e5fd950de81c40b529310e3d9cad6f1d667c7"
+  }
+}

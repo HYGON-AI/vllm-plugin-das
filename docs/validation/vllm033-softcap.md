@@ -521,3 +521,58 @@ Draft. `e5m2-analysis.json` and `current-e5m2-pair-inputs-fixed/` retain the
 completed evidence. The first E5M2 orchestration attempt failed on missing
 helper paths before starting a model; its original failure remains separately
 under `current-e5m2-pair/` and was not relabeled as a model result.
+
+
+## Current-head component CI and fresh baseline (2026-11-19)
+
+PR #410 runtime head `74967a41f9b058d15371941366b1709227e5d26d` completed
+[run44503238282](https://github.com/HYGON-AI/vllm-plugin-das/actions/runs/44503238282)
+with all eight jobs successful. Artifact ZIP digests, JUnit cases and actual
+checkout were checked: source8, portable1382, gfx936 native/Graph401 and gfx938
+components8 passed, with no JUnit failures/errors/skips. Logs retain portable46
+and native26 deselections. Eleven public-selector CPU ABI records pass without
+compute calls or GPU initialization. gfx938 covers a synthetic Channel-FP8 expert
+and RoPE components, not a checkpoint or gfx836. The workflow source is6fa728d2;
+the resolver targets74967a41 and the immutable runtime image is recorded in the
+[structured evidence summary](vllm033-flash-current-20261119.json).
+
+A separate fresh installed environment binds all107 Plugin wheel payload files
+to that tested production head, using Core0.33/98a09850 and Adapter0.5.22/8ba62c
+whose runtime bytes match main9e2340aa. CPU271 and actual gfx936 native283 pass;
+the latter is an exact case-ID subset of CI's401. The initial native run had
+33 passes and250 missing-ROCm-device-library compilation failures because its
+isolated launcher omitted the existing ROCM_PATH/HIP_PATH. The failure is
+retained; restoring those roots makes the unchanged283-case matrix pass without
+changing tests, tolerances, provider, source or wheel payloads. Complete package
+RECORDs and frozen sources remain unchanged.
+
+The fresh Qwen3-8B no-Plugin official TRITON_ATTN baseline uses TP1/BF16,
+block64, context4096, max sequences16, batched tokens1024, fixed1GiB KV, default
+FULL_AND_PIECEWISE Graph and enabled prefix caching. Original HumanEval0–31
+uses temperature0/seed0/max_tokens2048/thinking-off. This preserved client sends
+HE tasks sequentially; its separate arithmetic probes use concurrency4. This
+schedule differs from the historical concurrency4 cohorts above and does not
+replace them. All32 answers stop normally: raw20/32, existing normalization31/32,
+with only task26 failing normalized scoring. The scorer runs in the unchanged
+read-only chroot/mount/net/PID/uid65534 isolation. Arithmetic13/13, including
+prefix3 and two four-request waves, passes; repeated prefix requests add3840
+cache-hit tokens. Worker RPC confirms36 official Triton attention layers and
+BF16 storage; the profile records actual Graph and official kernel execution.
+
+The API exits0 after SIGINT in29.013s; the Core's original15-second grace remains
+unchanged. No owned process remains and the port is released. Native nanobind
+leak diagnostics remain, so full lifecycle is not qualified. Before scoring and
+the next arm, the controller's global-resource gate refuses progression: KFD
+shows foreign PID-namespace processes, with eight active workers allocating
+VRAM across all eight GPUs. Their vpid values are zero in this namespace; they
+are not attributed to the completed baseline. The original controller failure
+is retained, and existing answers are scored separately without regeneration.
+
+Plugin FLASH BF16/E4M3/E5M2 model arms have **not started** in this fresh cohort.
+No fresh model parity, performance, softcap/window checkpoint, gfx836 or full
+release claim follows from these component and baseline results. Historical
+BF16/task18, E5M2/task19, strict-format and lifecycle failures remain unwaived.
+Keep Draft and last_good=false. The fresh local evidence root is
+`/data/models/plugin410-e2e-20261119-r722`; remote CI uses its separately recorded
+image/dependencies. This documentation follow-up changes no runtime code and
+does not relabel old-head CI as a successful full run of a later commit.

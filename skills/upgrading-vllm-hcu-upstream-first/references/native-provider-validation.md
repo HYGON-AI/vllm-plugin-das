@@ -83,6 +83,15 @@ its actual eager/Graph/model evidence; do not loosen the table to make skips pas
 
 ## Native JIT and interrupted cold builds
 
+An isolated child can import Torch and native DSOs while its compiler cannot
+find device bitcode because the launcher dropped the toolchain roots. Preserve
+and record the actual validated `ROCM_PATH` and `HIP_PATH` in compiler children;
+derive paths from the current DTK installation rather than an old example.
+For clang's missing-ROCm-device-library error, inspect those paths and the
+resolved bitcode directory before changing attention math or providers. Retain
+the failed run, then rerun its unchanged native matrix after repairing the
+launch environment; CPU import success does not replace that execution.
+
 When a vendor builds after a native-module miss, compatibility stubs must not
 report a missing native module as successfully imported. Verify real discovery,
 the missing-module exception, the vendor build and native execution separately.
@@ -97,6 +106,13 @@ of that private cache have exited, bind the lock path/inode/time to the original
 run, and preserve the old lock in a new run's evidence. Do not clear shared or
 another client's locks. An interrupted run retains its failed lifecycle result;
 cache recovery does not retroactively qualify its tests.
+
+KFD sysfs can expose processes from another PID namespace. A nonempty global
+KFD list alone does not identify this run's surviving owners. Compare the saved
+PID/startticks ledger with KFD `vpid`, per-GPU queue IDs and VRAM counters before
+attributing a resource refusal to model teardown. A zero `vpid` identifies a PID
+invisible in the reader's namespace. Keep the original refusal and completed
+answers; score those answers separately when device progression has stopped.
 
 ## Varlen FlashAttention and allocation-sensitive failures
 
