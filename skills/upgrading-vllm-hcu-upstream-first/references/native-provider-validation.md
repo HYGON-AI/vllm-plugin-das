@@ -174,3 +174,13 @@ the actual serving run; qualify eager LightOp separately with native and
 changed-input Graph components. Keep default compilation for model acceptance.
 Record process exit within its original grace separately from native leak or
 shutdown exceptions, even when the frontend returns zero.
+
+For separate-prefix model A/B, verify every original RECORD against its actual
+files before comparing distribution payloads. Console-script hashes may differ
+only because the interpreter shebang names a different prefix; normalize that
+exact first line for comparison only, retaining both original RECORDs and script
+bytes. Do not normalize package/native bytes or silently admit other changed
+dependencies. Compare task-level raw responses, finish reasons and pass sets:
+equal or improved totals need not mean identical outputs or a causal accuracy
+gain. A shutdown failure shared by both arms remains a failed lifecycle gate;
+record it separately from newly introduced failures and keep the original grace.
