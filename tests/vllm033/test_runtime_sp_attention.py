@@ -229,7 +229,7 @@ def test_concurrent_publication_publishes_each_real_owner_once(core, monkeypatch
     try:
         with ThreadPoolExecutor(max_workers=4) as workers:
             list(workers.map(install, range(4)))
-        assert sorted(calls) == ['QKVParallelLinear', 'RowParallelLinear']
+        assert sorted(calls) == ['MergedColumnParallelLinear', 'QKVParallelLinear', 'RowParallelLinear']
         sp.check_attention_layers()
     finally:
         for cls, _ in sp._BINDINGS:

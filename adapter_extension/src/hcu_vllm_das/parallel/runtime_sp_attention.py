@@ -16,11 +16,15 @@ import torch
 from hcu_adapter.extensions import ExtensionCommitError
 from hcu_adapter.runtime_lifecycle import ProcessLocalLifecycle
 from vllm.distributed import get_tp_group
-from vllm.model_executor.layers.linear import QKVParallelLinear, RowParallelLinear
+from vllm.model_executor.layers.linear import (
+    MergedColumnParallelLinear, QKVParallelLinear, RowParallelLinear,
+)
 
 _construction = ContextVar("hcu_runtime_sp_attention_construction", default=False)
+_mlp_construction = ContextVar("hcu_runtime_sp_mlp_construction", default=False)
 _qkv_signature = inspect.signature(QKVParallelLinear.__init__)
 _row_signature = inspect.signature(RowParallelLinear.__init__)
+_merged_signature = inspect.signature(MergedColumnParallelLinear.__init__)
 _PUBLICATION_ACTION = "runtime-sp-attention-publication"
 _publication_lifecycle = ProcessLocalLifecycle(
     runtime_action=_PUBLICATION_ACTION, error_type=ExtensionCommitError,
@@ -35,6 +39,30 @@ def runtime_sp_attention_construction():
         yield
     finally:
         _construction.reset(token)
+
+
+@contextmanager
+def runtime_sp_model_construction():
+    """Prepare attention and replicated dense/shared MLP projections together.
+
+    This construction scope does not enable a model. Entry/exit token layouts
+    and early routed-expert policy still belong to the composing model owner.
+    """
+    token = _mlp_construction.set(True)
+    try:
+        with runtime_sp_attention_construction():
+            yield
+    finally:
+        _mlp_construction.reset(token)
+
+
+def _mlp_projection(prefix, name):
+    return _mlp_construction.get() and any(prefix.endswith(f".mlp.{path}{name}")
+        for path in ("", "shared_experts.", "shared_mlp."))
+
+
+def model_construction_active():
+    return _mlp_construction.get()
 
 
 @dataclass(frozen=True)
@@ -165,14 +193,21 @@ class RuntimeSPRowParallelLinear(RowParallelLinear):
     def __init__(self, *args, **kwargs):
         params = _bind(_row_signature, self, args, kwargs)
         self._runtime_sp = _construction.get() and params["prefix"].endswith(".self_attn.o_proj")
+        self._runtime_sp_mlp = _mlp_projection(params["prefix"], "down_proj")
         if self._runtime_sp:
             group = _capture_group(self)
             if params["input_size"] % group.world_size:
                 raise ValueError("runtime SP output projection width must divide TP")
             params["disable_tp"] = True
+        elif self._runtime_sp_mlp:
+            _capture_group(self)
+            params["disable_tp"] = True
         super().__init__(**params)
 
     def forward(self, input_):
+        if self._runtime_sp_mlp:
+            _check_group(self)
+            return super().forward(input_)
         if not self._runtime_sp:
             return super().forward(input_)
         group = _check_group(self)
@@ -187,8 +222,26 @@ class RuntimeSPRowParallelLinear(RowParallelLinear):
         return super().forward(tokens)
 
 
+class RuntimeSPMergedColumnParallelLinear(MergedColumnParallelLinear):
+    def __init__(self, *args, **kwargs):
+        params = _bind(_merged_signature, self, args, kwargs)
+        self._runtime_sp_mlp = _mlp_projection(params["prefix"], "gate_up_proj")
+        if self._runtime_sp_mlp:
+            _capture_group(self)
+            # Independent token shards cannot all-reduce intermediate shards.
+            # Select full weights before Core allocates parameters and loaders.
+            params["disable_tp"] = True
+        super().__init__(**params)
+
+    def forward(self, input_):
+        if self._runtime_sp_mlp:
+            _check_group(self)
+        return super().forward(input_)
+
+
 _BINDINGS = ((QKVParallelLinear, RuntimeSPQKVParallelLinear),
-             (RowParallelLinear, RuntimeSPRowParallelLinear))
+             (RowParallelLinear, RuntimeSPRowParallelLinear),
+             (MergedColumnParallelLinear, RuntimeSPMergedColumnParallelLinear))
 
 
 def _publish_attention_layers():

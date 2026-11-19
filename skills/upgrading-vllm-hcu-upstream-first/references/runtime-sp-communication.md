@@ -59,3 +59,49 @@ CPU allocation/loader tests with a kernel-init double do not qualify FP8 GEMM.
 Native attention component tests do not qualify full model SP, shared experts,
 early MoE factory policy, batching or HumanEval32. Preserve precision, backend,
 Graph/prefix policy and numerical assertions while diagnosing capture failures.
+
+
+## Dense/shared MLP and early MoE construction
+
+Independent token shards cannot use ordinary TP-sharded dense/shared MLP weights:
+an all-reduce would sum different tokens. Under the same explicit model
+construction scope, select replicated merged gate/up and down projections before
+Core allocates weights and loaders. Keep official model MLP forward, activation,
+checkpoint names, scale loaders, post-load processing and TP-status updates.
+Use distinct attention-only/model scopes and precise dense/shared prefixes;
+unrelated projections retain their ordinary TP behavior. Check differing token
+shards, dimensions not divisible by TP, weight reloads and ownership drift.
+
+At the inspected 0.33 target, GLM4/HY3 call the plain FusedMoEFactory without its
+existing is_sequence_parallel argument. runner_cls is too late: parallel config,
+router and routed weights already exist. A temporary scoped bridge can bind only
+these model-local factory aliases and pass that argument before the unchanged
+Core factory executes. Leave the shared Core factory intact, preflight all alias
+owners and ABI, reject later owner changes and latch a partial publication failure.
+Retire this bridge when the official models expose an equivalent early policy.
+Validate actual official model constructors reaching make_parallel_config before
+router/weight creation; a fake returned runner does not establish that ordering.
+
+These projection/factory components still require full model composition across
+embeddings/inputs_embeds, residuals, positions, padding and PP boundaries. Keep
+checkpoint loading, native quantization, target/draft batching, complete topology,
+HumanEval32, performance and original model shutdown qualification separate.
+
+
+## Independent native MoE reference boundaries
+
+Derive reference casts from the actually selected activation and expert kernels.
+For the inspected Core activation template, SiLU returns the input dtype before
+multiplication by the up half. The selected Triton expert GEMM2 multiplies its
+FP32 accumulator by router weights before the final output cast. A reference
+that skips the first cast and rounds GEMM2 before weighting can fail despite
+identical loaded parameters and routing. Do not respond by loosening tolerances
+or changing the backend.
+
+Retain the first failed run, then save frozen inputs, loaded expert maps/weights,
+router logits/IDs/weights and actual/reference tensors before the assertion.
+Check shared and routed branches separately. Compare independently implemented
+CPU arithmetic with documented cast boundaries, keeping the original numerical
+gates, and verify fresh eager and changed-input Graph execution. A corrected
+reference does not retroactively pass the original run or qualify a checkpoint,
+quantized provider, different kernel selection or normal model shutdown.

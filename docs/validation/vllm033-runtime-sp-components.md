@@ -1,10 +1,11 @@
-# Runtime SP communication and official attention components
+# Runtime SP communication and official model components
 
 This candidate targets Plugin v0.33.0 at `6fa728d2b913d8e4e46e5f5638c90a48405c3b3f`.
 Core owns model algorithms, attention, Linear allocation/loading/GEMM, MoE
 factory/backend/manager policy and teardown. Adapter owns platform identity,
 the communicator selector and process-local lifecycle. Plugin adapts optional
-communication admission and attention token/head layouts through public seams.
+communication admission, attention token/head layouts, dense/shared projection
+construction and early model-local MoE factory arguments through narrow seams.
 No Core, native kernel or FlashAttention library change is included.
 
 ## Construction and ownership
@@ -77,6 +78,71 @@ between the arms the runtime also gained the separately tested publication
 lifecycle guard. This is evidence for the corrected probe, not a causal proof
 about the vendor's internal failure mechanism. FlashAttention was not rebuilt.
 
+## Dense/shared projections and early routed-expert policy
+
+The r188 follow-up adds a distinct model-construction scope. Dense/shared MLP
+merged gate/up and down projections use `disable_tp=True` before official
+allocation/loading; unrelated projections and attention-only construction keep
+ordinary TP behavior. Official model MLP forward, activation, loaders/reload,
+post-load processing and parameter TP status remain responsible for execution.
+Instances reject PID, group and rank drift before GEMM.
+
+GLM4/HY3 do not pass their existing factory's early SP argument. A temporary
+bridge binds only the two model-local `FusedMoEFactory` aliases within the
+explicit construction scope. It sets `is_sequence_parallel=True` before Core
+creates parallel configuration, router or weights. The shared Core factory is
+unchanged. ABI/foreign-owner preflight, shared-factory ownership health and
+sticky partial-publication failure are covered. Retire the bridge when official
+models expose an equivalent early policy. These components do not enable or
+register a full model.
+
+The independently installed Plugin wheel SHA256 is
+`47221f889bca0fd60f9ec04c6bdf6553a2c56561c79d1754f971125e9ab78e3b`.
+Core c440c08, paired unpublished Adapter004c and vendor dependencies retain
+separate provenance. All110 Plugin Python payloads match source/wheel/install;
+all18 owner RECORDs are checked before and after every native arm.
+
+| Follow-up scope | Result and limit |
+| --- | --- |
+| Source and independent installed CPU | Each101 passed; repeats are not added together. Real official dense/shared constructors, loaders/reloads, non-TP-divisible dimensions, ownership drift and real early factory entry are covered. CPU GEMM doubles do not qualify native execution. |
+| Source/package contracts | 8 passed. The first invocation omitted required `VLLM_TARGET_ROOT` and failed3 source checks; the unchanged tests pass when that argument names the frozen Core checkout. Original log retained. |
+| Clean CPU CI unit contracts | 98 passed; inherited Python search-path variables sanitized. |
+| Native dense/shared MLP | GLM4/HY3 × BF16/FP16 × dense/shared ×4 ranks =32 rank/case combinations. Official allocation, loaders, linear method, activation and GEMM; no native execution double. |
+| Native routed MoE | GLM4/HY3 × BF16/FP16 × shared/no-shared ×4 ranks =32 rank/case combinations. SP4/EP4/TP-within-expert1, AgRs, official gate/router/dispatch/expert kernel/combine. |
+| Eager and Graph | Original atol=rtol0.016 retained. Independent CPU reference with native dtype boundaries; epochs1/3 change inputs on captured graphs with stable addresses. All64 above rank/cases pass, max absolute error0. |
+| Native terminal state | Both final controllers exit0, no controller signals, tracker0, no owned survivors, unchanged18 RECORDs. This is component cleanup, not the model15s shutdown gate. |
+
+The original r1 attempt omitted standard worker workspace initialization and
+failed on its first real MoE call. Adding official `init_workspace_manager` did
+not clear the numerical gate: r2 still failed against its reference. Neither
+attempt is relabeled as passing.
+
+A separate frozen-input diagnostic saved all four ranks' actual/reference
+outputs, expert maps and loaded parameters, gate logits, selected IDs and
+weights. Loaded weights and routing match; gate error is below5e-7 and shared
+branch error0. Core's selected native activation returns SiLU in input dtype
+before multiplying by the up half. Triton expert GEMM2 applies router weights
+to FP32 accumulators before its final cast. The original reference omitted the
+former cast and performed the latter cast too early. Independently modeling
+both boundaries reproduces every saved actual BF16 output exactly; changing
+only either boundary does not. Fresh r4/r5 eager and Graph runs then pass with
+unchanged production bytes, inputs, backends and numerical thresholds. This
+diagnosis applies to the recorded kernel selection, not all MoE providers.
+
+Evidence root: `runtime-sp-model-r188-20261119T113408Z`; final arms are
+`candidate-mlp-moe-r4` and `candidate-moe-no-shared-r5`. Original failures,
+frozen diagnostic tensors, scripts and CPU source/installed reports remain
+separate. The public `tools/probe_runtime_sp_mlp_moe.py` retains the executed r4
+MLP/MoE-with-shared test body; run under the same external bounded-controller
+and reserved-four-GPU requirements as the attention probe. It is not a service
+or checkpoint runner. The supplemental no-shared probe is retained in the
+external delivery evidence.
+
+The existing #479 CI44514700496 is still an independent run of the older
+cad1428 head; its initial predecessor44513321167 failed with a stale Adapter
+image. Running or successful old-head CI does not qualify this follow-up.
+No duplicate dispatch was issued while that run remained active.
+
 ## Reproduce the bounded native probes
 
 Use an isolated installed environment with the compatible Core/vendor stack,
@@ -100,8 +166,8 @@ They do not manage another client's devices or qualify a service lifecycle.
 
 ## Remaining migration scope
 
-Keep Draft. Full model embedding/residual/PP entry/exit, dense/shared experts,
-early `FusedMoEFactory(is_sequence_parallel=True)` policy, quantized native
+Keep Draft. Full model composition across embedding/residual/PP entry/exit and
+dense/shared/routed experts, quantized native
 execution, target/draft batching and capture, MTP/PP/DP/PCP/DeepEP modes,
 checkpoint/HumanEval32 accuracy, performance and the original15s model
 shutdown gate remain open. Component constructor/transport/attention success
