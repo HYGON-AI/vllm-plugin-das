@@ -35,6 +35,13 @@ _CLASS_MARKER = "_vllm_hcu_aiter_sampling_ops_applied"
 _WRAPPER_MARKER = "_vllm_hcu_aiter_sampling_ops_wrapper"
 
 
+def _use_aiter_sampler() -> bool:
+    """AITER sampler is an optional custom op under the HCU master switch."""
+    import vllm_hcu.platforms.envs as henvs
+
+    return henvs.optional_custom_op_enabled(henvs.VLLM_HCU_USE_AITER_SAMPLER)
+
+
 def _fall_back_to_native(sampler: object, message: str) -> bool:
     sampler.aiter_ops = None
     sampler._aiter_ops_import_failed = True
@@ -73,13 +80,11 @@ def apply_to_module(module: ModuleType) -> bool:
 
     @functools.wraps(original_init)
     def hcu_init_aiter_ops(self) -> bool:
-        import vllm_hcu.platforms.envs as henvs
-
-        if not henvs.VLLM_HCU_USE_AITER_SAMPLER:
+        if not _use_aiter_sampler():
             return _fall_back_to_native(
                 self,
-                "VLLM_HCU_USE_AITER_SAMPLER=0; using PyTorch-native sampling "
-                "instead of the AITER sampler.",
+                "AITER sampler disabled (VLLM_HCU_USE_CUSTOM_OPS=0 or "
+                "VLLM_HCU_USE_AITER_SAMPLER=0); using PyTorch-native sampling.",
             )
         if not original_init(self):
             return False

@@ -59,6 +59,7 @@ def das_aiter(monkeypatch):
     monkeypatch.setitem(sys.modules, "aiter.ops.sampling", das)
     monkeypatch.setattr(aiter_sampling, "_has_torch_ops", lambda: False)
     monkeypatch.delenv("VLLM_HCU_USE_AITER_SAMPLER", raising=False)
+    monkeypatch.delenv("VLLM_HCU_USE_CUSTOM_OPS", raising=False)
     return das, calls
 
 
@@ -341,10 +342,20 @@ def test_forward_hip_generators_bypass_aiter(das_aiter, device):
     assert calls == []
 
 
-@pytest.mark.parametrize("value", ["0", "false", "False"])
-def test_switch_off_keeps_native_sampling(das_aiter, monkeypatch, device, value):
+@pytest.mark.parametrize(
+    "master, feature",
+    [
+        ("1", "0"), ("1", "false"), ("1", "False"),
+        # VLLM_HCU_USE_CUSTOM_OPS is the master switch for this custom op.
+        ("0", "1"), ("false", "1"), ("0", "0"),
+    ],
+)
+def test_switch_off_keeps_native_sampling(
+    das_aiter, monkeypatch, device, master, feature
+):
     _, calls = das_aiter
-    monkeypatch.setenv("VLLM_HCU_USE_AITER_SAMPLER", value)
+    monkeypatch.setenv("VLLM_HCU_USE_CUSTOM_OPS", master)
+    monkeypatch.setenv("VLLM_HCU_USE_AITER_SAMPLER", feature)
     monkeypatch.setattr(
         aiter_sampling,
         "resolve_aiter_sampling_ops",
@@ -369,6 +380,16 @@ def test_switch_defaults_on(das_aiter):
     import vllm_hcu.platforms.envs as henvs
 
     assert henvs.VLLM_HCU_USE_AITER_SAMPLER is True
+    assert patch_topk_topp_sampler._use_aiter_sampler() is True
+
+
+@pytest.mark.parametrize("master", ["1", "0"])
+@pytest.mark.parametrize("feature", ["1", "0"])
+def test_aiter_sampler_requires_custom_ops_master(monkeypatch, master, feature):
+    monkeypatch.setenv("VLLM_HCU_USE_CUSTOM_OPS", master)
+    monkeypatch.setenv("VLLM_HCU_USE_AITER_SAMPLER", feature)
+    expected = master == "1" and feature == "1"
+    assert patch_topk_topp_sampler._use_aiter_sampler() is expected
 
 
 def test_unsupported_aiter_falls_back_to_native(das_aiter, monkeypatch, device):

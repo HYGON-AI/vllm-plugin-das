@@ -492,7 +492,8 @@ hcu_vllm_environment_variables: dict[str, Callable[[], Any]] = {
                     ("true", "1")),
 
     # Use AITER top-k/top-p sampling kernels when vLLM selects its ROCm AITER
-    # sampler (VLLM_ROCM_USE_AITER=1). False keeps PyTorch-native sampling.
+    # sampler (VLLM_ROCM_USE_AITER=1). Also requires VLLM_HCU_USE_CUSTOM_OPS;
+    # either switch off keeps PyTorch-native sampling.
     "VLLM_HCU_USE_AITER_SAMPLER":
         lambda: (os.environ.get("VLLM_HCU_USE_AITER_SAMPLER", "True").lower() in
                     ("true", "1")),
