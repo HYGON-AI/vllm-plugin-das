@@ -3,53 +3,17 @@
 
 """Use the HCU rotary kernel for eager PCP prefill queries."""
 from functools import lru_cache, partial
-import hashlib
-import os
-from pathlib import Path
-import tempfile
 
 import torch
 
 from hcu_adapter import registry
 
+from . import inverse_rope_hcu
+
 
 @lru_cache(maxsize=1)
 def load_operator():
-    if torch.version.hip is None:
-        raise RuntimeError("HCU inverse RoPE requires HIP PyTorch and hipcc")
-    from torch.utils.cpp_extension import load, _get_build_directory
-
-    root = Path(__file__).with_name("csrc")
-    assets = [(name, (root / name).read_bytes())
-              for name in ("inverse_rope.cpp", "inverse_rope.cu")]
-    # Match Core's separate FP32 products and sum before the BF16 cast.
-    cuda_flags = ["-O3", "-ffp-contract=off"]
-    key = hashlib.sha256(
-        (str(torch.__version__) + str(torch.version.hip)).encode()
-        + repr(cuda_flags).encode()
-        + b"".join(payload for _, payload in assets)).hexdigest()[:20]
-    build = Path(_get_build_directory("hcu_vllm_das_inverse_rope", False)) / key
-    build.mkdir(parents=True, exist_ok=True)
-    sources = []
-    for name, payload in assets:
-        destination = build / name
-        if destination.exists():
-            if destination.read_bytes() != payload:
-                raise RuntimeError("HCU inverse-RoPE source cache is corrupt")
-        else:
-            # HIPify writes a sibling .hip file. Stage into the build cache so
-            # compiling an installed wheel never writes into its package tree.
-            with tempfile.TemporaryDirectory(dir=build) as temporary:
-                staged = Path(temporary) / name
-                staged.write_bytes(payload)
-                os.replace(staged, destination)
-        sources.append(str(destination))
-    load(name="hcu_vllm_das_inverse_rope",
-         sources=sources, build_directory=str(build),
-         extra_cuda_cflags=cuda_flags, is_python_module=False, verbose=False)
-    operator = torch.ops.hcu_vllm_das.deepseek_v4_inv_rope
-    torch.library.register_fake("hcu_vllm_das::deepseek_v4_inv_rope")(
-        lambda rope, position_ids, cos_sin_cache: None)
+    operator = inverse_rope_hcu.load_operator()
     registry.register(
         "vllm_pcp_q_rope", "hcu", "torch.ops.hcu_vllm_das.deepseek_v4_inv_rope",
         registry.MECH_SEAM, detail="Eager PCP prefill Q RoPE using a negated sine table",

@@ -27,6 +27,23 @@ configuration. Partial-shard headers are diagnostic only. Record upstream
 identity separately from mirror transport; a complete download does not qualify
 the provider, Graph execution, accuracy or another hardware architecture.
 
+## Check installation isolation before adding dependencies
+
+A prepared venv may contain top-level package symlinks into shared
+site-packages while lacking matching distribution metadata. Installing a
+distribution that exports that package can follow the symlink and overwrite
+shared files, even with `--no-deps`. Inspect both package destinations and
+dist-info ownership before installation; use an independently owned package
+directory when adding or replacing a dependency.
+
+If an overwrite occurs, preserve the affected bytes and identify the original
+distribution from its existing metadata. Restore only payloads whose digests
+and sizes match its pre-existing RECORD, then verify all hashed entries and
+the unchanged RECORD. Keep candidate and shared payloads separate. A repair
+cannot establish what an already-running process loaded or retroactively
+qualify earlier runtime results; recheck the affected environment before using
+it for new validation.
+
 ## Inspect a live worker without copying its owners
 
 A live CompilationConfig can reference model modules and KV-cache tensors

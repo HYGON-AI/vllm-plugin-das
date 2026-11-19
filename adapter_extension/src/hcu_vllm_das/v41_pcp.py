@@ -78,6 +78,13 @@ def bind_adapter_classes() -> None:
 
     pcp_fork.set_indexer_reference(reference.indexer)
     pcp_fork.set_engram_validator(validate_engram_config)
+    from .inverse_rope_policy import selected_mode
+    if selected_mode() == "hcu":
+        from .inverse_rope_pcp import prepare_forward_mqa
+        setter = getattr(pcp_fork, "set_forward_mqa_provider", None)
+        if not callable(setter):
+            raise RuntimeError("Upgrade adapter-das for the PCP forward_mqa provider")
+        setter(prepare_forward_mqa)
     # Resolve through this module so a patch on `v41_pcp.get_forward_context`
     # (the historical seam) still reaches the adapter-owned attention class.
     # Attribute lookup must trigger __getattr__ on a cold module; direct globals

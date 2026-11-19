@@ -8,7 +8,7 @@ import torch
 
 from hcu_adapter import hcu_config
 from hcu_adapter.kernels import pcp_fork
-from hcu_vllm_das import pcp_q_rope, v41_pcp
+from hcu_vllm_das import inverse_rope_hcu, pcp_q_rope, v41_pcp, v41_pcp_activation
 
 
 @pytest.fixture
@@ -29,6 +29,26 @@ def test_q_rope_policy(monkeypatch, isolated_q_rope):
     for op in (pcp_fork.Q_ROPE_OP, pcp_fork.OP_NAME):
         monkeypatch.setenv("HCU_DISABLE_OPS", op)
         assert not pcp_fork.q_rope_selected()
+
+
+def test_compile_factor_distinguishes_the_two_rope_policies(
+        monkeypatch, isolated_q_rope):
+    activation = v41_pcp_activation
+    ops = {}
+    monkeypatch.setattr(hcu_config, "load", lambda: {"ops": ops, "overrides": {}})
+    monkeypatch.setattr(activation, "pcp_enabled", lambda: True)
+    monkeypatch.setattr(activation, "host_enabled", lambda: False)
+    monkeypatch.setattr(activation, "fp4_selected", lambda: False)
+    monkeypatch.setattr(activation, "_profile_policy", lambda: True)
+
+    stock = (True, False, True)
+    assert activation.policy_factor() == stock
+    ops[pcp_fork.Q_ROPE_OP] = "hcu"
+    assert activation.policy_factor() == (*stock, "q_rope_hcu")
+    ops["vllm_inverse_rope"] = "hcu"
+    assert activation.policy_factor() == (*stock, "hcu", "q_rope_hcu")
+    monkeypatch.setenv("HCU_DISABLE_OPS", pcp_fork.Q_ROPE_OP)
+    assert activation.policy_factor() == (*stock, "hcu")
 
 
 def test_initializer_warms_once_and_reuses_only_the_original_table(monkeypatch):
@@ -71,6 +91,30 @@ def test_initializer_warms_once_and_reuses_only_the_original_table(monkeypatch):
         torch.testing.assert_close(table[:, 32:], -baseline[:, 32:], rtol=0, atol=0)
     finally:
         pcp_q_rope.initialize.cache_clear()
+
+
+def test_query_and_inverse_rope_share_the_operator(monkeypatch, tmp_path):
+    from torch.utils import cpp_extension
+
+    loads = []
+    operator = object()
+    monkeypatch.setattr(torch.version, "hip", "cpu-contract")
+    monkeypatch.setattr(cpp_extension, "_get_build_directory", lambda *args: str(tmp_path))
+    monkeypatch.setattr(cpp_extension, "load", lambda **kwargs: loads.append(kwargs))
+    monkeypatch.setattr(torch.library, "register_fake", lambda name: lambda fn: fn)
+    monkeypatch.setattr(torch.ops.hcu_vllm_das, "deepseek_v4_inv_rope", operator, raising=False)
+    monkeypatch.setattr(pcp_q_rope.registry, "_RECORDS", {})
+    monkeypatch.setattr(pcp_q_rope.registry, "_BOUND", {})
+    inverse_rope_hcu.load_operator.cache_clear()
+    pcp_q_rope.load_operator.cache_clear()
+    try:
+        assert inverse_rope_hcu.load_operator() is operator
+        assert pcp_q_rope.load_operator() is operator
+        assert pcp_q_rope.registry.get(pcp_fork.Q_ROPE_OP)["implementation"] == "hcu"
+        assert len(loads) == 1
+    finally:
+        pcp_q_rope.load_operator.cache_clear()
+        inverse_rope_hcu.load_operator.cache_clear()
 
 
 @pytest.mark.parametrize("eager", [True, False])
@@ -246,11 +290,12 @@ def test_plugin_owner_latches_q_rope_binding_drift(monkeypatch, isolated_q_rope,
 
     context = ExtensionContext("0.5.22", "0.33.0")
     activation.activate_extension(context)
-    assert activation.policy_factor()[-1] is True
+    q_rope_factor = activation.policy_factor()
+    assert q_rope_factor[-1] == "q_rope_hcu"
     assert pcp_fork._q_rope_provider is pcp_q_rope.initialize
     if change == "policy":
         monkeypatch.setenv("HCU_DISABLE_OPS", pcp_fork.Q_ROPE_OP)
-        assert activation.policy_factor()[-1] is False
+        assert activation.policy_factor() == q_rope_factor[:-1]
     else:
         monkeypatch.setattr(pcp_fork, "_q_rope_provider", lambda cache: None)
     with pytest.raises(ExtensionCommitError, match="restart process"):
