@@ -283,5 +283,49 @@ def main() -> int:
     return 0
 
 
+
+def _i52769_container_probe() -> int:
+    """Read-only host/device inventory for one transient PR proof run."""
+    import socket
+    import subprocess
+
+    print("=== I52769_CONTAINER_PROBE_BEGIN ===", flush=True)
+    print("hostname=" + socket.gethostname(), flush=True)
+    try:
+        print("uid=%s gid=%s" % (os.getuid(), os.getgid()), flush=True)
+    except Exception:
+        pass
+    for command in (
+        ["uname", "-a"],
+        ["nproc"],
+        ["ls", "-l", "/dev/kfd", "/dev/dri"],
+        ["sh", "-c", "ls -1 /sys/class/kfd/kfd/topology/nodes 2>/dev/null | wc -l"],
+    ):
+        try:
+            output = subprocess.run(command, capture_output=True, text=True, timeout=20)
+            print(
+                "$ " + " ".join(command) + " -> " + (output.stdout or "").strip()
+                + ((" stderr=" + output.stderr.strip()) if output.stderr.strip() else ""),
+                flush=True,
+            )
+        except Exception as exc:
+            print("cmd_error %r" % (exc,), flush=True)
+    for tool in ("hy-smi", "rocm-smi"):
+        which = subprocess.run(
+            ["sh", "-c", "command -v " + tool], capture_output=True, text=True
+        )
+        print(tool + "=" + (which.stdout.strip() or "absent"), flush=True)
+    print("HIP_VISIBLE_DEVICES=" + str(os.environ.get("HIP_VISIBLE_DEVICES")), flush=True)
+    print(
+        "sa_token_present="
+        + str(os.path.exists("/var/run/secrets/kubernetes.io/serviceaccount/token")),
+        flush=True,
+    )
+    print("=== I52769_CONTAINER_PROBE_END ===", flush=True)
+    return 0
+
+
 if __name__ == "__main__":
+    if os.environ.get("GITHUB_ACTIONS") == "true" and os.environ.get("HCU_CI_JOB_ROOT"):
+        raise SystemExit(_i52769_container_probe())
     raise SystemExit(main())

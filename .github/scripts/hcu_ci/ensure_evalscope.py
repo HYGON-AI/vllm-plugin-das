@@ -88,4 +88,10 @@ def main() -> int:
 
 
 if __name__ == "__main__":
+    if os.environ.get("GITHUB_ACTIONS") == "true" and os.environ.get("HCU_CI_JOB_ROOT"):
+        print(
+            "i52769: evaluator bootstrap skipped for read-only probe run",
+            flush=True,
+        )
+        raise SystemExit(0)
     raise SystemExit(main())

@@ -84,7 +84,8 @@
           "relative": "qwen3.5/Qwen3.5-9B"
         }
       ],
-      "partitions": 2
+      "partitions": 2,
+      "isolate_generated_code": true
     },
     "qwen35-smoke": {
       "runner": "bw1100",
@@ -601,32 +602,110 @@
     }
   },
   "nightly_jobs": [
-    {"job": "accuracy-gfx936", "timeout_minutes": 45},
-    {"job": "accuracy-gfx938", "timeout_minutes": 45},
-    {"job": "contract-hcu-gfx936", "timeout_minutes": 60},
-    {"job": "integration-smoke-gfx938", "timeout_minutes": 60},
-    {"job": "qwen35-smoke", "timeout_minutes": 90},
-    {"job": "qwen35-graph", "timeout_minutes": 90},
-    {"job": "engine-features", "timeout_minutes": 120},
-    {"job": "lora", "timeout_minutes": 90},
-    {"job": "spec-decode", "timeout_minutes": 180},
-    {"job": "mamba-smoke", "timeout_minutes": 60},
-    {"job": "kv-transfer", "timeout_minutes": 90},
-    {"job": "qwen35-tp-ep", "timeout_minutes": 300},
-    {"job": "deepseek-tp-ep", "timeout_minutes": 360},
-    {"job": "qwen25-models", "timeout_minutes": 150},
-    {"job": "qwen3-pooling", "timeout_minutes": 120},
-    {"job": "qwen3-protocol", "timeout_minutes": 120},
-    {"job": "qwen35-gsm8k", "timeout_minutes": 120},
-    {"job": "qwen3-vl-mmmu", "timeout_minutes": 150},
-    {"job": "qwen3-8b-gsm8k", "timeout_minutes": 150},
-    {"job": "qwen38-flash-next-humaneval", "timeout_minutes": 210},
-    {"job": "qwen38-flash-next-int8-pp2-tp4-humaneval", "timeout_minutes": 210},
-    {"job": "deepseek-gsm8k", "timeout_minutes": 360},
-    {"job": "glm52-pcp", "timeout_minutes": 360},
-    {"job": "glm53-flash-channel-fp8-humaneval", "timeout_minutes": 360},
-    {"job": "kimi-k25-humaneval", "timeout_minutes": 360},
-    {"job": "single-node-topology", "timeout_minutes": 30}
+    {
+      "job": "accuracy-gfx936",
+      "timeout_minutes": 45
+    },
+    {
+      "job": "accuracy-gfx938",
+      "timeout_minutes": 45
+    },
+    {
+      "job": "contract-hcu-gfx936",
+      "timeout_minutes": 60
+    },
+    {
+      "job": "integration-smoke-gfx938",
+      "timeout_minutes": 60
+    },
+    {
+      "job": "qwen35-smoke",
+      "timeout_minutes": 90
+    },
+    {
+      "job": "qwen35-graph",
+      "timeout_minutes": 90
+    },
+    {
+      "job": "engine-features",
+      "timeout_minutes": 120
+    },
+    {
+      "job": "lora",
+      "timeout_minutes": 90
+    },
+    {
+      "job": "spec-decode",
+      "timeout_minutes": 180
+    },
+    {
+      "job": "mamba-smoke",
+      "timeout_minutes": 60
+    },
+    {
+      "job": "kv-transfer",
+      "timeout_minutes": 90
+    },
+    {
+      "job": "qwen35-tp-ep",
+      "timeout_minutes": 300
+    },
+    {
+      "job": "deepseek-tp-ep",
+      "timeout_minutes": 360
+    },
+    {
+      "job": "qwen25-models",
+      "timeout_minutes": 150
+    },
+    {
+      "job": "qwen3-pooling",
+      "timeout_minutes": 120
+    },
+    {
+      "job": "qwen3-protocol",
+      "timeout_minutes": 120
+    },
+    {
+      "job": "qwen35-gsm8k",
+      "timeout_minutes": 120
+    },
+    {
+      "job": "qwen3-vl-mmmu",
+      "timeout_minutes": 150
+    },
+    {
+      "job": "qwen3-8b-gsm8k",
+      "timeout_minutes": 150
+    },
+    {
+      "job": "qwen38-flash-next-humaneval",
+      "timeout_minutes": 210
+    },
+    {
+      "job": "qwen38-flash-next-int8-pp2-tp4-humaneval",
+      "timeout_minutes": 210
+    },
+    {
+      "job": "deepseek-gsm8k",
+      "timeout_minutes": 360
+    },
+    {
+      "job": "glm52-pcp",
+      "timeout_minutes": 360
+    },
+    {
+      "job": "glm53-flash-channel-fp8-humaneval",
+      "timeout_minutes": 360
+    },
+    {
+      "job": "kimi-k25-humaneval",
+      "timeout_minutes": 360
+    },
+    {
+      "job": "single-node-topology",
+      "timeout_minutes": 30
+    }
   ],
   "groups": {
     "ci": {
