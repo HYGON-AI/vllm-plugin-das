@@ -173,3 +173,14 @@ A no-Plugin official baseline versus vendor attention can identify a lost answer
 but does not isolate a softcap/window-only change on a full-window, zero-softcap
 checkpoint. Preserve that broader failure and use matched implementations or a
 checkpoint exercising the changed branch before assigning causality.
+
+
+## Expected outputs in paired probes
+
+When a frozen probe artifact defines an expected value, check each arm against
+that value as well as comparing the arms. Two implementations can return the
+same wrong answer. Preserve literal text equality separately from any explicitly
+labeled whitespace-only comparison; a correct extracted key does not pass a
+failed strict-format probe. Keep expected-value checks in the derived audit
+when the original generation client is frozen, without changing its requests
+or regenerating answers.

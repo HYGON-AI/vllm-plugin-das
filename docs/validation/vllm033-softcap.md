@@ -646,3 +646,65 @@ before a latest-view update. No missing historical snapshot was fabricated.
 Immutable final review SHA256: `200d67463edbb487066649918135ee7fb5180f1eb7214fff20ae65aec7cf4367`.
 See [the full structured result](vllm033-flash-current-20261119.json) for per-arm
 comparisons, raw-input hashes, original failures and evidence paths.
+
+
+## Current-stack Gemma2 checkpoint and window-boundary comparison (2026-11-19)
+
+This cohort actually exercises positive attention softcap50 and alternating
+sliding4096/full layers on the unchanged pretrained Gemma2-2B-IT checkpoint
+revision c400b2564e9db9e5a0bc6dfbe07a05da3cd09f52. It is separate from the
+preceding full-window, zero-softcap Qwen3 cohort and the older Gemma stack.
+Production Plugin remains74967a41; Core0.33/98a09850 and Adapter0.5.22/8ba62c
+(runtime-equal-main9e) and the recorded provider cohort are preserved.
+
+Both completed BF16 arms use TP1/BF16 weights, context8192, maxseq16, batch-token1024, block64,
+memory-utilization0.7, default V2 Model Runner/FULL_AND_PIECEWISE Graph and prefix
+caching. No fixed KV-memory override is applied, matching the original Gemma
+command; this differs from Qwen's fixed1GiB cohort. The original HE0–31 client
+and isolated scorer are unchanged; only the served model name changes in the
+HE request hash. Each completed BF16 service then receives the original six exact-token
+completion prompts of4095/4096/4097/6144/6144/4352 tokens and four concurrent
+repeats. Existing answers are never regenerated when an original gate stops
+progression. Detailed controller and resource failures remain in the record.
+
+| Arm | Raw HE0–31 | Existing normalization | Strict functional probes | Long requests | Key matches ignoring surrounding whitespace | Prefix-hit tokens, HE / long |
+| --- | --- | --- | --- | --- | --- | --- |
+| official-bf16 | 0/32 | 23/32 | fail (3 recorded) | 10 | 10/10 | 3840 / 42624 |
+| flash-bf16 | 0/32 | 23/32 | fail (3 recorded) | 10 | 10/10 | 3840 / 42624 |
+
+Passing-task sets, full HE message differences, raw failures and each long
+request's literal text, token strings, sampled logprobs and expected key are
+preserved. Key matching after surrounding-whitespace removal is reported
+separately from literal text equality; it does not pass strict formatting probes.
+Pairwise equality is not used as a substitute for checking the original expected
+key. Sampled-logprob deltas are compared only along identical sampled token
+strings/histories and do not represent full-vocabulary equivalence.
+
+| Matched pair | Raw lost / gained | Normalized lost / gained | Long equal texts | Long equal token strings | Maximum sampled-logprob delta on equal strings |
+| --- | --- | --- | --- | --- | --- |
+| official-bf16...flash-bf16 | none / none | none / none | 10/10 | 10/10 | 0.01569509506225586 |
+
+Only the BF16 matched pair completed generation and scoring: official and Flash each raw0/32 and existing-normalization23/32, identical passing-task sets.30/32 full HE messages match. Both differing tasks still fail in both arms: HumanEval/10 constructs an incorrect shortest palindrome; HumanEval/21 uses incorrect rescaling (official omits subtracting the minimum, Flash omits division by the range). These differences are not passed off as formatting-only errors. All32 responses in both arms stop normally.
+
+All10 window-boundary/concurrent long outputs have identical text and sampled token strings between BF16 arms. They match the original expected keys only after surrounding-whitespace removal (10/10), while literal expected-key equality is0/10. Maximum sampled-logprob difference on the matching histories is0.0156950951; this does not measure full-vocabulary equality. HE prefix-hit tokens increase3840 per arm; long-request hits increase42624. Both retain3 original strict-format failures, and Flash retains forced EngineCore cleanup; both report native nanobind leaks. Later port release does not clear those original failures.
+
+The planned official E4M3 service failed before readiness or generation: at worker initialization only30.62/63.98GiB was free versus the unchanged0.7 requirement of44.79GiB. Other-namespace KFD processes acquired the device after an initially idle observation. Zero E4M3 samples were generated, no FP8 accuracy conclusion follows, and the Flash E4M3 arm was not started. Original failed attempt and all source/checkpoint/RECORD checks remain retained. Further device runs must wait for resource availability; the inactive-context admission exception used by this failed attempt is not reused. Neither full lifecycle, model accuracy acceptance, performance, gfx836 nor the full upgrade is qualified.
+
+Each completed BF16 service's worker reports26 actual attention implementations,13 full and13
+sliding windows, head256 and softcap50 with the requested BF16 cache dtype. The failed E4M3 startup has no worker RPC or generation evidence.
+Actual Graph and kernel_unified_attention traces, physical cache layouts,
+complete package RECORD/checkpoint seals and mapped native binaries are retained.
+PID/startticks, namespace-aware KFD vpid and queue gpuid bind actual workers to
+the recorded physical gfx936 device. This does not qualify gfx836.
+
+Original strict-format probe failures, native nanobind diagnostics and immediate
+port-bind failures stay failed. Original TCP rows are preserved; a TIME_WAIT
+explanation is applied only to arms whose captured rows establish state06.
+Later bare-bind success permits continuation of original unstarted arms and
+does not retroactively pass any failed gate. Original15s EngineCore grace is
+unchanged; API exit0 does not establish clean native lifecycle. Keep Draft and
+last_good=false; no performance or full-upgrade acceptance follows.
+
+Immutable current Gemma review SHA256: `69da52ed059050a4ea136932b3c25084d56ecdb610da44a391ef40ce9f6c31f0`.
+The structured record retains per-arm provenance, controller transitions,
+original requests, expected-key checks and every raw/normalized task result.
