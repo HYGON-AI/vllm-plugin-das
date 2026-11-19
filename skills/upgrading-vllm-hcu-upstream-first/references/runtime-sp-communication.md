@@ -21,6 +21,10 @@ back to the world group. Check independent layouts/inverse transforms, changed
 inputs on Graph replay, stable addresses and natural cleanup. Byte transport
 does not qualify FP8 scaling or quantization.
 
+Core's preallocated reduce-scatter may return a new view of the supplied output.
+Check storage address, shape, dtype and contents rather than Python object
+identity; retain the full numerical and changed-input Graph assertions.
+
 The `runtime-sp-communication` capability is a communication subfeature under
 development, not complete GLM4/HY3 custom-SP. It uses the existing
 `additional_config['hcu']['enable_custom_sp']` boolean and an explicit Adapter
