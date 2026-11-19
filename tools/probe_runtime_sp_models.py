@@ -1,8 +1,14 @@
 """Synthetic complete official GLM4/HY3 models; not trained-checkpoint/HE32 acceptance."""
 from datetime import timedelta
 from pathlib import Path
-import json, sys, traceback
-OUT=Path(sys.argv[1])
+import argparse, json, sys, traceback
+
+parser = argparse.ArgumentParser(description=__doc__)
+parser.add_argument('output', type=Path)
+parser.add_argument('--trace-intermediates', action='store_true',
+                    help='record eager CPU intermediates; no serving/performance qualification')
+ARGS = parser.parse_args()
+OUT = ARGS.output
 
 def worker(rank):
     import torch
@@ -27,6 +33,7 @@ def worker(rank):
     from hcu_vllm_das.parallel.runtime_sp_models import RuntimeSPGlm4MoeForCausalLM,RuntimeSPHYV3ForCausalLM
     from transformers import Glm4MoeConfig,HYV3Config
     result=dict(rank=rank,architecture=torch.cuda.get_device_properties(rank).gcnArchName,cases=[], failures=[])
+    trace_records = []
     def compare(label,actual,expected):
         difference=float((actual.float()-expected.float()).abs().max())
         result.setdefault('comparisons',[]).append(dict(gate=label,max_abs_error=difference))
@@ -110,6 +117,7 @@ def worker(rank):
             hf.architectures=[base.__name__]
             cfgpath=OUT/f'{family}-config-rank{rank}';hf.save_pretrained(cfgpath)
             arms=[]
+            traces=[]
             for name,cls in [('reference',base),('candidate',candidate)]:
                 cache=CacheConfig(block_size=64,cache_dtype='auto');cache.kv_cache_layout='LBHNC'
                 config=VllmConfig(model_config=ModelConfig(model=str(cfgpath),skip_tokenizer_init=True,
@@ -129,6 +137,12 @@ def worker(rank):
                     seq_lens=torch.tensor([7],device='cuda',dtype=torch.int32),
                     block_table=torch.zeros((1,1),device='cuda',dtype=torch.int32),slot_mapping=slots)
                 arms.append((model,config,attention,slots,metadata))
+                trace = None
+                if ARGS.trace_intermediates:
+                    from runtime_sp_trace import RuntimeSPTrace
+                    trace = RuntimeSPTrace(model,arm=name,rank=rank,size=4,num_tokens=7)
+                    trace_records.append((family,name,trace))
+                traces.append(trace)
             ids=torch.arange(7,device='cuda',dtype=torch.long)
             positions=torch.arange(7,device='cuda',dtype=torch.long)
             padding=torch.zeros(7,device='cuda',dtype=torch.bool)
@@ -146,9 +160,18 @@ def worker(rank):
                 with set_current_vllm_config(config),set_forward_context({a.layer_name:metadata for a in attention},config,
                         num_tokens=7,slot_mapping={a.layer_name:slots for a in attention},is_padding=padding):
                     return model(ids,positions)
+            def observed_run(arm,label,active):
+                with traces[arm].capture(label,active_tokens=active):
+                    return run(arm)
             with torch.inference_mode():
                 active=update(0)
                 for _ in range(3):expected=run(0);actual=run(1)
+                if ARGS.trace_intermediates:
+                    traced_reference=observed_run(0,'eager',active)
+                    traced_candidate=observed_run(1,'eager',active)
+                    # Snapshotting must not alter either arm's result.
+                    torch.testing.assert_close(traced_reference,expected,atol=0,rtol=0)
+                    torch.testing.assert_close(traced_candidate,actual,atol=0,rtol=0)
                 torch.cuda.synchronize()
                 torch.save(dict(actual=actual.cpu(),reference=expected.cpu()),OUT/f'{family}-rank{rank}-eager.pt')
                 eager_error=compare(family+':eager-vs-tp-reference',actual[:active],expected[:active])
@@ -163,7 +186,13 @@ def worker(rank):
                 address=(ids.data_ptr(),positions.data_ptr(),padding.data_ptr(),actual.data_ptr())
                 errors=[]
                 for epoch in [1,3]:
-                    active=update(epoch);expected=run(0);eager=run(1).clone();graph.replay();torch.cuda.synchronize()
+                    active=update(epoch)
+                    if ARGS.trace_intermediates:
+                        expected=observed_run(0,f'eager-for-replay-{epoch}',active)
+                        eager=observed_run(1,f'eager-for-replay-{epoch}',active).clone()
+                    else:
+                        expected=run(0);eager=run(1).clone()
+                    graph.replay();torch.cuda.synchronize()
                     torch.save(dict(actual=actual.cpu(),reference=expected.cpu()),OUT/f'{family}-rank{rank}-graph{epoch}.pt')
                     compare(family+':graph-vs-tp-reference:'+str(epoch),actual[:active],expected[:active])
                     compare(family+':graph-vs-sp-eager:'+str(epoch),actual[:active],eager[:active])
@@ -183,6 +212,11 @@ def worker(rank):
     except BaseException:
         result['error']=traceback.format_exc();raise
     finally:
+        for family,name,trace in trace_records:
+            trace.close()
+            try:trace.save(OUT/f'trace-{family}-{name}-rank{rank}.pt')
+            except Exception:
+                result.setdefault('trace_errors',[]).append(traceback.format_exc())
         (OUT/f'rank{rank}.json').write_text(json.dumps(result,indent=2)+'\n')
         cleanup_dist_env_and_memory()
 
@@ -190,5 +224,5 @@ if __name__=='__main__':
     import torch.multiprocessing as mp
     mp.spawn(worker,nprocs=4,join=True)
     reports=[json.loads((OUT/f'rank{rank}.json').read_text()) for rank in range(4)]
-    if any(report['failures'] for report in reports):
+    if any(report['failures'] or report.get('trace_errors') for report in reports):
         raise SystemExit(1)

@@ -169,3 +169,44 @@ running, a diagnostic collector may preserve each original assertion and finish
 the remaining cases, then exit nonzero if any gate failed. Report candidate
 Graph-versus-eager consistency separately from candidate-versus-official TP
 agreement; neither replaces the other or trained-checkpoint acceptance.
+
+## Intermediate numerical diagnosis
+
+When a complete synthetic model differs from ordinary TP, preserve the original
+weights, backend, precision, Graph settings and tolerances. Do not infer the
+root cause from its final maximum error. The diagnostic model tool accepts
+`--trace-intermediates` to snapshot eager module outputs at embedding, decoder
+norms, QKV, Q/K norm, RoPE, attention, output projection, MLP and final norm.
+Capture is default-off and is forbidden inside a GPU Graph. Inactive hooks do
+not query capture state or copy tensors. Trace snapshots synchronize the device
+and must never be included in serving/performance measurements.
+
+With a fresh output directory and the same admitted dependency/device setup as
+the original model probe:
+
+```bash
+python tools/probe_runtime_sp_models.py /path/to/new-output --trace-intermediates
+python tools/runtime_sp_trace.py /path/to/new-output glm4 --output /path/to/glm4-comparison.json
+python tools/runtime_sp_trace.py /path/to/new-output hy3 --output /path/to/hy3-comparison.json
+```
+
+The additional initial traced forwards must exactly match each arm's original
+warm result. Later samples are eager intermediates before changed-input Graph
+replay, not traces of Graph execution. Original full-model assertions remain
+unchanged and failures still produce exit1. Snapshot failures also fail the
+diagnostic, after the ranks retain their result/cleanup path.
+
+The offline comparator joins candidate token shards in rank order, retains
+head shards per rank, excludes only declared padding and uses the original
+`atol=rtol=.016`. Missing/duplicate ranks, incomplete samples, mismatched event
+orders/layouts/dtypes and empty outputs are refused. Report the first unequal
+intermediate separately from the first outside the original tolerance. Neither
+is root-cause proof: later controlled experiments must distinguish layout,
+weight loading, provider arithmetic and rounding/reduction order. Ordinary TP's
+partial GEMMs plus reduction and an SP replicated full GEMM can differ in BF16;
+that observation alone neither waives a model gate nor justifies a policy change.
+
+`tests/vllm033/test_runtime_sp_trace.py` covers CPU capture and offline controls.
+Its success does not qualify a device trace, SP collective, trained checkpoint,
+HumanEval, normal shutdown or gfx836 support. Record the exact runtime/source
+and archive identities when the original failed cohort can actually be traced.
