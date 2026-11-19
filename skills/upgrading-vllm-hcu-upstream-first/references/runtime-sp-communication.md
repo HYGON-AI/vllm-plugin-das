@@ -116,6 +116,14 @@ the inverse exchange and projection/activation quantization. Multiplication by
 zero does not clear NaNs. Also mask local projection inputs so padding cannot
 pollute a tensor-wide scale.
 
+For explicit candidate model admission, inspect the target's loader cache and
+worker-extension initialization order before loading a checkpoint. In the
+inspected Core, the architecture cache key omits registry ownership, so public
+registration after a stock class was cached can still load that stock class.
+Refuse stale admission rather than clearing Core caches; verify the resolved
+class before loading and the actual class on every live worker afterward.
+Registry-only CPU checks do not qualify the real initialization hook or model.
+
 Core's MoE routing may happen before internal dispatch or after naive
 all-gather. Use the local mask in the former layout and the exact gathered EP
 mask in the latter; with DP, use the same group and per-rank sizes as dispatch.
@@ -163,6 +171,21 @@ later model mismatch to attention or routing. Record intervening residual/norm
 amplification and top-k changes separately. A closer FP32 result does not waive
 an existing model tolerance or establish checkpoint accuracy. Keep that gate
 failed; do not change weights, precision or thresholds just to obtain a pass.
+
+Freeze the actual attention input and preserve each GEMM's M/K/N, padding,
+strides and selected quantization method. Removing inactive rows can select a
+different kernel and invalidate the arithmetic control. Distinguish captured
+loaded weights from weights reconstructed from a retained synthetic formula.
+Compare full and partial GEMMs with an independent higher-precision result.
+A matching sequential BF16 sum proves a compatible rounding explanation, not
+the collective kernel's actual summation order; do not hardcode that order into
+production to imitate a less accurate result.
+
+A full-model control that replaces reference TP partial GEMMs/reduction with
+a gathered full GEMM changes the reference. Keep its failures and subsequent
+first-divergence analysis separate from the original TP gate. Fewer failures
+under that control do not pass the original gate or prove remaining MLP
+reduction arithmetic, trained-model accuracy or lifecycle correctness.
 
 When an early numerical assertion prevents later model/Graph cases from
 running, a diagnostic collector may preserve each original assertion and finish
