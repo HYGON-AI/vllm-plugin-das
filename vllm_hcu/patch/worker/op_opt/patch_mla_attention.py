@@ -437,10 +437,11 @@ def apply_to_module(module: ModuleType) -> bool:
                 )[0]
                 multi_token_decodes[num_decodes:] |= decode_mask[num_decodes:]
             if multi_token_decodes.any():
+                seq_lens_cpu = getattr(common_attn_metadata, "_seq_lens_cpu", None)
+                if seq_lens_cpu is None:
+                    seq_lens_cpu = common_attn_metadata.seq_lens.cpu()
                 common_attn_metadata = copy.copy(common_attn_metadata)
-                common_attn_metadata.seq_lens_cpu_upper_bound = (
-                    common_attn_metadata.seq_lens.cpu()
-                )
+                common_attn_metadata.seq_lens_cpu_upper_bound = seq_lens_cpu
         result = builder(self, common_prefix_len, common_attn_metadata, fast_build)
         result.num_kv_actual_tokens = getattr(
             common_attn_metadata,

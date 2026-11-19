@@ -1071,7 +1071,7 @@ def test_mla_multitoken_decode_uses_actual_lengths_with_graph_padding(
     (
         "query_lens", "prefilling", "device_lens", "upper_bound",
         "query_len_support", "decode_threshold", "expected_num_decodes",
-        "expected_context", "needs_sync",
+        "expected_context", "needs_length_refresh",
     ),
     [
         pytest.param(
@@ -1152,10 +1152,11 @@ def test_mla_multitoken_decode_uses_actual_lengths_with_graph_padding(
         ),
     ],
 )
+@pytest.mark.parametrize("has_cpu_mirror", [False, True], ids=["async", "sync"])
 def test_mla_prefill_fallback_uses_actual_split_and_sequence_lengths(
     monkeypatch, query_lens, prefilling, device_lens, upper_bound,
     query_len_support, decode_threshold, expected_num_decodes,
-    expected_context, needs_sync,
+    expected_context, needs_length_refresh, has_cpu_mirror,
 ):
     from vllm import envs
     from vllm.v1.attention.backends.utils import split_decodes_and_prefills
@@ -1166,6 +1167,11 @@ def test_mla_prefill_fallback_uses_actual_split_and_sequence_lengths(
     module.split_decodes_and_prefills = split_decodes_and_prefills
     sync_calls = []
     device_lengths = torch.tensor(device_lens)
+    seq_lens_cpu = torch.tensor(device_lens) if has_cpu_mirror else None
+    expected_upper_bound = device_lens if has_cpu_mirror else upper_bound
+    original_upper_bound = (
+        seq_lens_cpu if has_cpu_mirror else torch.tensor(upper_bound)
+    )
     common = SimpleNamespace(
         num_reqs=len(query_lens),
         num_actual_tokens=sum(query_lens),
@@ -1175,7 +1181,8 @@ def test_mla_prefill_fallback_uses_actual_split_and_sequence_lengths(
         seq_lens=SimpleNamespace(
             cpu=lambda: sync_calls.append("cpu") or device_lengths,
         ),
-        seq_lens_cpu_upper_bound=torch.tensor(upper_bound),
+        _seq_lens_cpu=seq_lens_cpu,
+        seq_lens_cpu_upper_bound=original_upper_bound,
         causal=True,
         num_kv_actual_tokens=sum(query_lens) + 5,
     )
@@ -1210,11 +1217,17 @@ def test_mla_prefill_fallback_uses_actual_split_and_sequence_lengths(
 
     assert result.num_decodes == expected_num_decodes
     assert result.context_lens.tolist() == expected_context
-    assert sync_calls == (["cpu"] if needs_sync else [])
-    assert (result.common is not common) is needs_sync
+    assert sync_calls == (
+        ["cpu"] if needs_length_refresh and not has_cpu_mirror else []
+    )
+    assert (result.common is not common) is needs_length_refresh
+    assert result.common._seq_lens_cpu is seq_lens_cpu
+    if has_cpu_mirror:
+        assert result.common.seq_lens_cpu_upper_bound is seq_lens_cpu
     assert result.common.query_start_loc_cpu is common.query_start_loc_cpu
     assert result.common.num_reqs == common.num_reqs
-    assert common.seq_lens_cpu_upper_bound.tolist() == upper_bound
+    assert common.seq_lens_cpu_upper_bound is original_upper_bound
+    assert common.seq_lens_cpu_upper_bound.tolist() == expected_upper_bound
     assert result.num_kv_actual_tokens == common.num_kv_actual_tokens
 
     for request_index in range(expected_num_decodes, len(prefilling)):
