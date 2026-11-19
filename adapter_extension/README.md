@@ -168,6 +168,28 @@ loader preservation. They do not certify multi-rank execution, vendor kernel
 availability, model accuracy or performance. PCP8 hardware acceptance remains
 required after merging these providers.
 
+## Optional PCP inverse RoPE
+
+Select the HCU provider in an `HCU_CONFIG` file with the PCP model owner enabled.
+
+```yaml
+version: 1
+ops:
+  vllm_pcp: native
+  vllm_inverse_rope: hcu
+```
+
+Inverse RoPE defaults to `stock`. `HCU_DISABLE_OPS=vllm_inverse_rope` selects
+Core inverse RoPE in a fresh process. The choice enters the PCP compile factor.
+Source or policy drift after publication requires a process restart.
+
+The provider applies `hcu_vllm_das::deepseek_v4_inv_rope` to the unrotated
+64-dimension BF16 output tail on gfx938. PyTorch builds the packaged HIP sources
+in its user build cache before model construction. Explicit HCU selection
+requires HIP PyTorch, matching hipcc and a C++ build toolchain. A missing selected
+provider fails during preparation. Ineligible tensor shapes use Core inverse RoPE.
+Prefill retains Core's compressed KV and SWA gather and dequantization.
+
 ## Compatibility
 
 - vLLM release line: `>=0.33.0,<0.34.0`; prerelease, postrelease,

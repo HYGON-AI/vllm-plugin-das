@@ -32,3 +32,6 @@ minimax31_pcp_ep = "hcu_vllm_das.parallel.minimax31_pcp_activation:extension_spe
 [tool.setuptools.packages.find]
 where = ["src"]
 include = ["hcu_vllm_das", "hcu_vllm_das.*"]
+
+[tool.setuptools.package-data]
+hcu_vllm_das = ["csrc/*.cpp", "csrc/*.cu"]
