@@ -157,3 +157,19 @@ Reuse unaffected completed cases only with unchanged source, dependencies and
 configuration evidence. If combining JUnit reports, label the derived report,
 retain each original report and verify the exact case multiset. CPU import/ABI
 success does not qualify native numerics, Graph, model accuracy or lifecycle.
+
+
+## Derived audit snapshots and model attribution
+
+A derived review may change when another arm finishes, even when raw inputs
+do not. Retain the exact derived bytes in an immutable content-addressed snapshot
+before updating a latest-view pointer; publish that snapshot path and digest.
+If an earlier published view was overwritten without retention, disclose that
+missing derived artifact and re-audit the preserved raw inputs. Do not fabricate
+historical bytes or claim the earlier digest identifies the new review.
+
+Compare a numerical regression within the actual changed execution branch.
+A no-Plugin official baseline versus vendor attention can identify a lost answer,
+but does not isolate a softcap/window-only change on a full-window, zero-softcap
+checkpoint. Preserve that broader failure and use matched implementations or a
+checkpoint exercising the changed branch before assigning causality.

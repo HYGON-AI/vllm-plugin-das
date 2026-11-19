@@ -576,3 +576,73 @@ Keep Draft and last_good=false. The fresh local evidence root is
 `/data/models/plugin410-e2e-20261119-r722`; remote CI uses its separately recorded
 image/dependencies. This documentation follow-up changes no runtime code and
 does not relabel old-head CI as a successful full run of a later commit.
+
+
+## Fresh four-arm results after resource release (2026-11-19)
+
+The previous section is a historical snapshot before device resources became
+available. The original controller's resource refusal is preserved. After KFD
+was independently empty, a continuation ran only the three unstarted Flash
+arms, preserving the original checkpoint seal, requests, client/scorer bytes,
+backend/dtypes, default FULL_AND_PIECEWISE Graph, prefix caching and15s Core grace.
+No completed baseline or answer was regenerated. All four arms below use the
+same recorded Core0.33/98a09850, Adapter0.5.22/8ba62c runtime-equal-main9e, and
+vendor cohort; Plugin production is74967a41. Later documentation heads do not
+become new runtime or full-CI qualifications.
+
+After E4M3 the unchanged port-bind check refused progression, despite no owned
+process or KFD survivor. A separate read13s later found the port bindable. A
+final continuation ran only original E5M2 arm3 after checking both ports/KFD;
+its post-run port check also refused, with no owned/KFD survivors. Subsequent
+TCP-table/bind observations found that port released. Neither transient cause
+was established. Both original controller failures/terminals stay unchanged;
+existing answers were scored in the unchanged isolated evaluator without
+regeneration. A later released port does not retroactively pass either gate.
+
+| Arm | Raw HE0–31 | Existing normalization | Lost normalized tasks vs official | Prefix-hit tokens | Explicit Core force cleanup |
+| --- | --- | --- | --- | --- | --- |
+| official | 20/32 | 31/32 | none | 3840 | yes |
+| candidate-bf16 | 20/32 | 30/32 | HumanEval/18 | 3840 | yes |
+| candidate-e4m3 | 20/32 | 31/32 | none | 3840 | yes |
+| candidate-e5m2 | 21/32 | 29/32 | HumanEval/15, HumanEval/19 | 3840 | no matching log |
+
+Each arm has32 normal stop responses and13 passing functional arithmetic probes.
+Actual worker reports show36 official Triton layers for the no-Plugin baseline
+and36 HcuFlashAttentionImpl layers for each candidate. BF16 uses BF16 physical
+cache; E4M3/E5M2 use byte physical storage with the explicit requested cache dtype.
+Graph/native traces and complete source/RECORD/checkpoint checks are retained.
+The structured record preserves actual kernel names, cache resolution, full
+extension reports (including unavailable/unrequested capabilities), pass sets,
+raw-score failures, stop reasons and per-answer token counts.
+
+Candidate worker RPC identities are bound through saved PID/startticks, KFD
+namespace vpid and active queue gpuid to PCI0000:f5:00.0, unique ID0x14bc4a274e18a1,
+actual gfx936. Each candidate's nine mapped Core/provider native binaries match
+the BF16 bytes; library mapping alone is not execution proof and is paired with
+the actual runtime/profiler records. This is not gfx836 qualification.
+
+The BF16 raw passing-task set is identical to official. Existing normalized
+scoring losesHumanEval/18 and gains none; full messages differ at/12 and/18.
+The candidate's generated regex omits the positive lookahead needed to count
+overlapping occurrences. This identifies the wrong generated answer, not a
+causal attribution to a numerical kernel or this MR's softcap/window delta.
+The two arms select different attention implementations. The checkpoint has
+zero softcap and full-window attention, so this model does not exercise the
+positive-softcap/window branch added by this MR.
+
+API exit0 and released devices/ports do not qualify normal lifecycle. The
+structured record retains each force-cleanup line and native nanobind diagnostic;
+the unchanged15s EngineCore deadline is not extended. Accuracy differences,
+historical strict-format/softcap/window model failures and gfx836 remain open.
+Keep Draft, last_good=false; no performance or full-upgrade claim follows.
+
+The earlier structured summary referenced the mutable convenience file
+`models/independent-review.json`. Its exact older derived bytes were not retained
+when a new arm was audited; raw generations/scores/logs and their hashes remained
+unchanged. That historical hash is now explicitly labeled in the structured
+record. Current/future derived audits retain immutable content-addressed snapshots
+before a latest-view update. No missing historical snapshot was fabricated.
+
+Immutable final review SHA256: `200d67463edbb487066649918135ee7fb5180f1eb7214fff20ae65aec7cf4367`.
+See [the full structured result](vllm033-flash-current-20261119.json) for per-arm
+comparisons, raw-input hashes, original failures and evidence paths.

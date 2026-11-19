@@ -299,20 +299,9 @@
       "samples.jsonl": "8c28de956f677af440e57c28d48531e43c935ed6ab8fe4fef91f9be919aec00a"
     }
   },
-  "resource_stop": {
-    "original_controller_exit": 1,
-    "owned_processes_remaining": 0,
-    "port_released": true,
-    "foreign_KFD_active_processes": 8,
-    "foreign_gpu_ids_with_VRAM": 8,
-    "foreign_vpid_all_zero": true,
-    "no_foreign_process_signaled": true,
-    "no_retry_or_duplicate_generation": true,
-    "Flash_BF16_E4M3_E5M2": "not started"
-  },
   "qualification": {
     "gfx836": false,
-    "model_comparison": false,
+    "model_comparison": true,
     "full_lifecycle": false,
     "old_BF16_task18_E5M2_task19_waived": false
   },
@@ -323,7 +312,2028 @@
     "models/official/score.json": "7d734844e6f1da45f62c281fc396df8e8ca5a17d31abec74bb085f8499c39f8d",
     "models/official/terminal.json": "46a614424cdb03ace7e1e3d3a2a3813acd0d6b129c8b7dc6afd232a4055ee460",
     "models/official/score-recovery-receipt.json": "2d2ea01153e09ebc8b5fd2f1c579540e9321a3499834d7f651d8cc1bc4790811",
-    "models/kfd-post-baseline.json": "1eeb8e6df470076b964ec1c04af311183fbef79b479377c865f3a10727921014",
-    "models/independent-review.json": "61f1b1269e37ab14732d8d94bd0e5fd950de81c40b529310e3d9cad6f1d667c7"
+    "models/kfd-post-baseline.json": "1eeb8e6df470076b964ec1c04af311183fbef79b479377c865f3a10727921014"
+  },
+  "historical_derived_audit_reference": {
+    "path": "models/independent-review.json",
+    "originally_published_sha256": "61f1b1269e37ab14732d8d94bd0e5fd950de81c40b529310e3d9cad6f1d667c7",
+    "exact_old_bytes_retained": false,
+    "explanation": "This convenience view was overwritten when a newly completed arm was audited. The older exact derived JSON bytes were not retained. Raw generations, scores, source, logs and their published hashes remain unchanged. No historical snapshot is reconstructed or claimed.",
+    "repair_record_sha256": "ec4c9e69e0713b829a09db5f9686fa6a54418ef31add595848e17d4b48373a53"
+  },
+  "followup_at": "2026-11-19T11:43:25.079921+00:00",
+  "current_documentation_parent": "b27718afcb59bd40834216a51b76fabae1159522",
+  "historical_resource_stop": {
+    "original_controller_exit": 1,
+    "owned_processes_remaining": 0,
+    "port_released": true,
+    "foreign_KFD_active_processes": 8,
+    "foreign_gpu_ids_with_VRAM": 8,
+    "foreign_vpid_all_zero": true,
+    "no_foreign_process_signaled": true,
+    "no_retry_or_duplicate_generation": true,
+    "Flash_BF16_E4M3_E5M2": "not started"
+  },
+  "fresh_four_arm_cohort": {
+    "immutable_review_snapshot": {
+      "path": "models/review-snapshots/sha256-200d67463edbb487066649918135ee7fb5180f1eb7214fff20ae65aec7cf4367.json",
+      "sha256": "200d67463edbb487066649918135ee7fb5180f1eb7214fff20ae65aec7cf4367"
+    },
+    "arms": {
+      "official": {
+        "backend": "TRITON_ATTN",
+        "kv_dtype": "auto",
+        "architecture": "gfx936:sramecc+:xnack-",
+        "worker_pid": 2375719,
+        "counts": {
+          "raw": 20,
+          "normalized": 31
+        },
+        "raw_pass_ids": [
+          "HumanEval/0",
+          "HumanEval/1",
+          "HumanEval/3",
+          "HumanEval/4",
+          "HumanEval/5",
+          "HumanEval/6",
+          "HumanEval/7",
+          "HumanEval/8",
+          "HumanEval/9",
+          "HumanEval/11",
+          "HumanEval/12",
+          "HumanEval/14",
+          "HumanEval/17",
+          "HumanEval/19",
+          "HumanEval/20",
+          "HumanEval/21",
+          "HumanEval/22",
+          "HumanEval/25",
+          "HumanEval/28",
+          "HumanEval/29"
+        ],
+        "normalized_pass_ids": [
+          "HumanEval/0",
+          "HumanEval/1",
+          "HumanEval/2",
+          "HumanEval/3",
+          "HumanEval/4",
+          "HumanEval/5",
+          "HumanEval/6",
+          "HumanEval/7",
+          "HumanEval/8",
+          "HumanEval/9",
+          "HumanEval/10",
+          "HumanEval/11",
+          "HumanEval/12",
+          "HumanEval/13",
+          "HumanEval/14",
+          "HumanEval/15",
+          "HumanEval/16",
+          "HumanEval/17",
+          "HumanEval/18",
+          "HumanEval/19",
+          "HumanEval/20",
+          "HumanEval/21",
+          "HumanEval/22",
+          "HumanEval/23",
+          "HumanEval/24",
+          "HumanEval/25",
+          "HumanEval/27",
+          "HumanEval/28",
+          "HumanEval/29",
+          "HumanEval/30",
+          "HumanEval/31"
+        ],
+        "finish_reasons": {
+          "stop": 32
+        },
+        "completion_tokens": [
+          160,
+          202,
+          109,
+          49,
+          151,
+          124,
+          194,
+          101,
+          142,
+          153,
+          206,
+          148,
+          145,
+          83,
+          75,
+          81,
+          76,
+          210,
+          154,
+          217,
+          242,
+          155,
+          101,
+          47,
+          101,
+          234,
+          114,
+          53,
+          58,
+          95,
+          36,
+          201
+        ],
+        "functional_probes": {
+          "passed": true,
+          "failures": [],
+          "continued_for_scoring": true
+        },
+        "prefix_hit_delta": 3840.0,
+        "actual_impls": {
+          "vllm.v1.attention.backends.triton_attn.TritonAttentionImpl": 36
+        },
+        "physical_cache_dtypes": [
+          "torch.bfloat16"
+        ],
+        "cache_resolution": {
+          "num_blocks": 113,
+          "hash_block_size": 64,
+          "prefix_cache_retention_interval": 0,
+          "kv_cache_layout": "LBNHC"
+        },
+        "graph_config": [
+          2,
+          1
+        ],
+        "graph_events": {
+          "execute_context_1(18)_generation_0(0)": 2,
+          "execute_context_0(0)_generation_1(1)": 50,
+          "execute_context_0(0)_generation_0(0)": 1,
+          "hipGraphLaunch": 62
+        },
+        "native_kernel_events": {
+          "_apply_write_kernel": 4,
+          "void at::native::vectorized_elementwise_kernel<16, at::native::FillFunctor<bool>, std::array<char*, 1ul> >(int, at::native::FillFunctor<bool>, std::array<char*, 1ul>)": 26,
+          "void at::native::vectorized_elementwise_kernel<2, at::native::FillFunctor<bool>, std::array<char*, 1ul> >(int, at::native::FillFunctor<bool>, std::array<char*, 1ul>)": 1,
+          "void (anonymous namespace)::elementwise_kernel_with_index_grid_stride<int, at::native::arange_cuda_out(c10::Scalar const&, c10::Scalar const&, c10::Scalar const&, at::Tensor&)::{lambda()#1}::operator()() const::{lambda()#3}::operator()() const::{lambda(long)#1}>(int, at::native::arange_cuda_out(c10::Scalar const&, c10::Scalar const&, c10::Scalar const&, at::Tensor&)::{lambda()#1}::operator()() const::{lambda()#3}::operator()() const::{lambda(long)#1}, function_traits<at::native::arange_cuda_out(c10::Scalar const&, c10::Scalar const&, c10::Scalar const&, at::Tensor&)::{lambda()#1}::operator()() const::{lambda()#3}::operator()() const::{lambda(long)#1}>::result_type*)": 26,
+          "void at::native::vectorized_elementwise_kernel<4, at::native::FillFunctor<int>, std::array<char*, 1ul> >(int, at::native::FillFunctor<int>, std::array<char*, 1ul>)": 52,
+          "_prepare_prefill_inputs_kernel": 1,
+          "_prepare_pos_seq_lens_kernel": 26,
+          "_combine_sampled_and_draft_tokens_kernel": 26,
+          "_gather_block_tables_kernel": 26,
+          "_compute_slot_mappings_kernel": 26,
+          "triton_red_fused__to_copy_embedding_rms_norm_0": 26,
+          "Cijk_Alik_Bljk_BBH_MT32x32x128_SE_AMAS3_BW_DTL0_BL1_DRB16_ALT_KME0_ETSP_EPS1_FL0_GRVW4_GSU1_ISA936_IU1_KME_GRCMn1_K1_KLA_LDL1_LRVW4_MAC_MMAC_BW1_MMAC_KM0_MMAC_KME1_NBWB1_NLCA1_NLCB1_OLDSR0_PGR1_PLR1_RK1_SU0_SUM0_SUS256_SVW4_TT4_4_TLM0_ULDSWM0_USFGRO0_USSB0_VAW2_VSn1_VW4_WG8_8_1_WGM1": 1,
+          "triton_red_fused_1": 26,
+          "reshape_and_cache_kernel_flash": 61,
+          "kernel_unified_attention": 61,
+          "Cijk_Alik_Bljk_BBH_MT64x32x128_SE_AMAS3_BW_DTL0_BL1_DRB16_ALT_KME0_ETSP_EPS1_FL0_GRVW4_GSU1_ISA936_IU1_KME_GRCMn1_K1_KLA_LDL1_LRVW4_MAC_MMAC_BW1_MMAC_KM0_MMAC_KME1_NBWB1_NLCA1_NLCB1_OLDSR0_PGR1_PLR1_RK1_SU0_SUM0_SUS256_SVW4_TT8_4_TLM0_ULDSWM0_USFGRO0_USSB0_VAW2_VSn1_VW4_WG8_8_1_WGM1": 36,
+          "triton_red_fused_fused_add_rms_norm_0": 61,
+          "Cijk_Alik_Bljk_BBH_MT32x16x256_SE_AMAS3_BW_DTL0_BL1_DRB16_ALT_KME0_ETSP_EPS1_FL0_GRVW2_GSU1_ISA936_IU1_KME_GRCMn1_K1_KLA_LDL1_LRVW2_MAC_MMAC_BW1_MMAC_KM0_MMAC_KME1_NBWB1_NLCA1_NLCB1_OLDSR0_PGR1_PLR1_RK1_SU0_SUM0_SUS1024_SVW4_TT4_2_TLM0_ULDSWM0_USFGRO0_USSB0_VAW2_VSn1_VW2_WG8_8_1_WGM1": 36,
+          "triton_poi_fused_mul_silu_slice_1": 49,
+          "void at::native::index_elementwise_kernel<128, 4, at::native::gpu_index_kernel<at::native::index_kernel_impl<at::native::OpaqueType<2> >(at::TensorIteratorBase&, c10::ArrayRef<long>, c10::ArrayRef<long>)::{lambda(char*, char const*, long)#1}>(at::TensorIteratorBase&, c10::ArrayRef<long>, c10::ArrayRef<long>, at::native::index_kernel_impl<at::native::OpaqueType<2> >(at::TensorIteratorBase&, c10::ArrayRef<long>, c10::ArrayRef<long>)::{lambda(char*, char const*, long)#1} const&, bool)::{lambda(int)#1}>(long, at::native::gpu_index_kernel<at::native::index_kernel_impl<at::native::OpaqueType<2> >(at::TensorIteratorBase&, c10::ArrayRef<long>, c10::ArrayRef<long>)::{lambda(char*, char const*, long)#1}>(at::TensorIteratorBase&, c10::ArrayRef<long>, c10::ArrayRef<long>, at::native::index_kernel_impl<at::native::OpaqueType<2> >(at::TensorIteratorBase&, c10::ArrayRef<long>, c10::ArrayRef<long>)::{lambda(char*, char const*, long)#1} const&, bool)::{lambda(int)#1})": 26,
+          "Cijk_Alik_Bljk_BBH_MT32x16x4_SE_AMAS3_BW_DTL0_BL1_DRB16_ALT_KME0_ETSP_EPS1_FL0_GRVW2_GSU1_ISA936_IU1_KME_GRCMn1_K1_KLA_LDL1_LRVW2_MAC_MMAC_BW1_MMAC_KM0_MMAC_KME1_NBWB1_NLCA1_NLCB1_OLDSR0_PGR1_PLR1_RK1_SU0_SUM0_SUS256_SVW4_TT4_2_TLM0_ULDSWM0_USFGRO0_USSB0_VAW2_VSn1_VW2_WG8_8_1_WGM1": 76,
+          "void at::native::index_elementwise_kernel<128, 4, at::native::gpu_index_kernel<at::native::index_kernel_impl<at::native::OpaqueType<8> >(at::TensorIteratorBase&, c10::ArrayRef<long>, c10::ArrayRef<long>)::{lambda(char*, char const*, long)#1}>(at::TensorIteratorBase&, c10::ArrayRef<long>, c10::ArrayRef<long>, at::native::index_kernel_impl<at::native::OpaqueType<8> >(at::TensorIteratorBase&, c10::ArrayRef<long>, c10::ArrayRef<long>)::{lambda(char*, char const*, long)#1} const&, bool)::{lambda(int)#1}>(long, at::native::gpu_index_kernel<at::native::index_kernel_impl<at::native::OpaqueType<8> >(at::TensorIteratorBase&, c10::ArrayRef<long>, c10::ArrayRef<long>)::{lambda(char*, char const*, long)#1}>(at::TensorIteratorBase&, c10::ArrayRef<long>, c10::ArrayRef<long>, at::native::index_kernel_impl<at::native::OpaqueType<8> >(at::TensorIteratorBase&, c10::ArrayRef<long>, c10::ArrayRef<long>)::{lambda(char*, char const*, long)#1} const&, bool)::{lambda(int)#1})": 26,
+          "void at::native::index_elementwise_kernel<128, 4, at::native::gpu_index_kernel<at::native::index_kernel_impl<at::native::OpaqueType<4> >(at::TensorIteratorBase&, c10::ArrayRef<long>, c10::ArrayRef<long>)::{lambda(char*, char const*, long)#1}>(at::TensorIteratorBase&, c10::ArrayRef<long>, c10::ArrayRef<long>, at::native::index_kernel_impl<at::native::OpaqueType<4> >(at::TensorIteratorBase&, c10::ArrayRef<long>, c10::ArrayRef<long>)::{lambda(char*, char const*, long)#1} const&, bool)::{lambda(int)#1}>(long, at::native::gpu_index_kernel<at::native::index_kernel_impl<at::native::OpaqueType<4> >(at::TensorIteratorBase&, c10::ArrayRef<long>, c10::ArrayRef<long>)::{lambda(char*, char const*, long)#1}>(at::TensorIteratorBase&, c10::ArrayRef<long>, c10::ArrayRef<long>, at::native::index_kernel_impl<at::native::OpaqueType<4> >(at::TensorIteratorBase&, c10::ArrayRef<long>, c10::ArrayRef<long>)::{lambda(char*, char const*, long)#1} const&, bool)::{lambda(int)#1})": 26,
+          "_gumbel_sample_kernel": 26,
+          "void at::native::reduce_kernel<512, 1, at::native::ReduceOp<float, at::native::ArgMaxOps<float>, unsigned int, long, 4, 4> >(at::native::ReduceOp<float, at::native::ArgMaxOps<float>, unsigned int, long, 4, 4>)": 26,
+          "void at::native::_scatter_gather_elementwise_kernel<256, 4, at::native::_cuda_scatter_gather_internal_kernel<false, at::native::OpaqueType<8>, long>::operator()<at::native::TensorAssign>(at::TensorIterator&, long, long, long, at::native::TensorAssign const&)::{lambda(int)#1}>(int, at::native::_cuda_scatter_gather_internal_kernel<false, at::native::OpaqueType<8>, long>::operator()<at::native::TensorAssign>(at::TensorIterator&, long, long, long, at::native::TensorAssign const&)::{lambda(int)#1})": 26,
+          "_get_num_sampled_and_rejected_kernel": 26,
+          "_post_update_kernel": 26,
+          "reduce_segments": 25,
+          "Cijk_Alik_Bljk_BBH_MT64x32x32_SE_AMAS3_BW_DTL0_BL1_DRB16_ALT_KME0_ETSP_EPS1_FL0_GRVW4_GSU1_ISA936_IU1_KME_GRCMn2_K1_KLA_LDL1_LRVW4_MAC_MMAC_BW1_MMAC_KM0_MMAC_KME1_NBWB1_NLCA1_NLCB1_OLDSR1_PGR1_PLR1_RK0_SU32_SUM0_SUS256_SVW4_TT8_4_TLM0_ULDSWM0_USFGRO0_USSB0_VAW2_VSn1_VW4_WG8_8_1_WGM8": 25
+        },
+        "trace_hashes": {
+          "cache/profiles/m09r2n16_2374429.async_llm.1795085743794797208.pt.trace.json.gz": "5fbac16120fcdd887ac5725d2bd638aecbd203028ea5cebafd8fb26ea6e5986f",
+          "cache/profiles/rank0.1795085743844841057.pt.trace.json.gz": "d7f994636e2efcfe9a77d4130b4bbdc4e16b6374833801bf38ba84630400c08c"
+        },
+        "extension_reports": [],
+        "exit": {
+          "at": "2026-11-19T10:56:14.673736+00:00",
+          "returncode": 0,
+          "elapsed_s": 29.012530125211924,
+          "api_sigint": true,
+          "original_EngineCore_grace_s": 15
+        },
+        "native_leak_diagnostics": [
+          "nanobind: leaked 4 instances!",
+          "nanobind: leaked 70 types!",
+          "nanobind: leaked 558 functions!",
+          "nanobind: leaked 4 instances!",
+          "nanobind: leaked 69 types!",
+          "nanobind: leaked 556 functions!"
+        ],
+        "forced_or_timeout_log_lines": [
+          "(APIServer pid=2374429) WARNING 11-19 10:56:00 [utils.py:648] [shutdown] Process manager: force killing remaining processes count=1",
+          "(APIServer pid=2374429) WARNING 11-19 10:56:00 [utils.py:653] [shutdown] Process manager: force killing remaining process EngineCore pid 2375719"
+        ],
+        "terminal": {
+          "at": "2026-11-19T10:56:46.280392+00:00",
+          "arm": "official",
+          "error": null,
+          "client_returncode": 0,
+          "service_returncode": 0,
+          "records_unchanged": true,
+          "checkpoint_unchanged": true,
+          "remaining_owned": [],
+          "KFD_pids": [
+            "3430030",
+            "3430020",
+            "3430029",
+            "3430019",
+            "3469361",
+            "3430027",
+            "3430025",
+            "3430023",
+            "3430021",
+            "3469362",
+            "3478496",
+            "3470301",
+            "3470913",
+            "3469360",
+            "3430026",
+            "3420350",
+            "3469359",
+            "3430024"
+          ],
+          "port_bindable": true,
+          "scoring_pending": true
+        },
+        "provenance": {
+          "launch.json": "fb68911ec84a939e744937a87266b2095532a1c6cc1adeedefc59ec78acc1095",
+          "terminal.json": "46a614424cdb03ace7e1e3d3a2a3813acd0d6b129c8b7dc6afd232a4055ee460",
+          "score.json": "7d734844e6f1da45f62c281fc396df8e8ca5a17d31abec74bb085f8499c39f8d",
+          "he32/protocol.json": "2ff7438e99c914b5b86bcdfb94fbd0f012a0502ba71d125059e6b3c8ba192735",
+          "he32/server-info.json": "89c01ea7c005f4d3b07d61601bce55ff1a1b77571db030f626cac1d7af741a0a",
+          "he32/worker-before.json": "777328dbc90ee543f77ab75892a90e06901e20f8c817865fa2786e9e62c9f5af",
+          "he32/worker-after.json": "777328dbc90ee543f77ab75892a90e06901e20f8c817865fa2786e9e62c9f5af",
+          "he32/responses.jsonl": "2aa37b0b84bef5c430ab4934fd18598e6fd190e8947cccfd2565beb42b9dc35f",
+          "he32/samples.jsonl": "8c28de956f677af440e57c28d48531e43c935ed6ab8fe4fef91f9be919aec00a",
+          "he32/functional-probe-status.json": "087e6bf797cf34483dc77a501435e708dc0003224ccdc3fdfc18d4956ef71020"
+        },
+        "original_resource_gate_passed": false,
+        "raw_failed_ids": [
+          "HumanEval/10",
+          "HumanEval/13",
+          "HumanEval/15",
+          "HumanEval/16",
+          "HumanEval/18",
+          "HumanEval/2",
+          "HumanEval/23",
+          "HumanEval/24",
+          "HumanEval/26",
+          "HumanEval/27",
+          "HumanEval/30",
+          "HumanEval/31"
+        ],
+        "normalized_failed_ids": [
+          "HumanEval/26"
+        ],
+        "completion_tokens_total": 4217
+      },
+      "candidate-bf16": {
+        "backend": "FLASH_ATTN",
+        "kv_dtype": "auto",
+        "architecture": "gfx936:sramecc+:xnack-",
+        "worker_pid": 2394437,
+        "counts": {
+          "raw": 20,
+          "normalized": 30
+        },
+        "raw_pass_ids": [
+          "HumanEval/0",
+          "HumanEval/1",
+          "HumanEval/3",
+          "HumanEval/4",
+          "HumanEval/5",
+          "HumanEval/6",
+          "HumanEval/7",
+          "HumanEval/8",
+          "HumanEval/9",
+          "HumanEval/11",
+          "HumanEval/12",
+          "HumanEval/14",
+          "HumanEval/17",
+          "HumanEval/19",
+          "HumanEval/20",
+          "HumanEval/21",
+          "HumanEval/22",
+          "HumanEval/25",
+          "HumanEval/28",
+          "HumanEval/29"
+        ],
+        "normalized_pass_ids": [
+          "HumanEval/0",
+          "HumanEval/1",
+          "HumanEval/2",
+          "HumanEval/3",
+          "HumanEval/4",
+          "HumanEval/5",
+          "HumanEval/6",
+          "HumanEval/7",
+          "HumanEval/8",
+          "HumanEval/9",
+          "HumanEval/10",
+          "HumanEval/11",
+          "HumanEval/12",
+          "HumanEval/13",
+          "HumanEval/14",
+          "HumanEval/15",
+          "HumanEval/16",
+          "HumanEval/17",
+          "HumanEval/19",
+          "HumanEval/20",
+          "HumanEval/21",
+          "HumanEval/22",
+          "HumanEval/23",
+          "HumanEval/24",
+          "HumanEval/25",
+          "HumanEval/27",
+          "HumanEval/28",
+          "HumanEval/29",
+          "HumanEval/30",
+          "HumanEval/31"
+        ],
+        "finish_reasons": {
+          "stop": 32
+        },
+        "completion_tokens": [
+          160,
+          202,
+          109,
+          49,
+          151,
+          124,
+          194,
+          101,
+          142,
+          153,
+          206,
+          148,
+          145,
+          83,
+          75,
+          81,
+          76,
+          210,
+          135,
+          217,
+          242,
+          155,
+          101,
+          47,
+          101,
+          234,
+          114,
+          53,
+          58,
+          95,
+          36,
+          201
+        ],
+        "functional_probes": {
+          "passed": true,
+          "failures": [],
+          "continued_for_scoring": true
+        },
+        "prefix_hit_delta": 3840.0,
+        "actual_impls": {
+          "hcu_vllm_das.attention.flash_attn.HcuFlashAttentionImpl": 36
+        },
+        "physical_cache_dtypes": [
+          "torch.bfloat16"
+        ],
+        "cache_resolution": {
+          "num_blocks": 113,
+          "hash_block_size": 64,
+          "prefix_cache_retention_interval": 0,
+          "kv_cache_layout": "LBHNC"
+        },
+        "graph_config": [
+          2,
+          1
+        ],
+        "graph_events": {
+          "execute_context_1(18)_generation_0(0)": 2,
+          "execute_context_0(0)_generation_1(1)": 50,
+          "execute_context_0(0)_generation_0(0)": 1,
+          "hipGraphLaunch": 62
+        },
+        "native_kernel_events": {
+          "_apply_write_kernel": 4,
+          "void at::native::vectorized_elementwise_kernel<16, at::native::FillFunctor<bool>, std::array<char*, 1ul> >(int, at::native::FillFunctor<bool>, std::array<char*, 1ul>)": 26,
+          "void at::native::vectorized_elementwise_kernel<2, at::native::FillFunctor<bool>, std::array<char*, 1ul> >(int, at::native::FillFunctor<bool>, std::array<char*, 1ul>)": 1,
+          "void (anonymous namespace)::elementwise_kernel_with_index_grid_stride<int, at::native::arange_cuda_out(c10::Scalar const&, c10::Scalar const&, c10::Scalar const&, at::Tensor&)::{lambda()#1}::operator()() const::{lambda()#3}::operator()() const::{lambda(long)#1}>(int, at::native::arange_cuda_out(c10::Scalar const&, c10::Scalar const&, c10::Scalar const&, at::Tensor&)::{lambda()#1}::operator()() const::{lambda()#3}::operator()() const::{lambda(long)#1}, function_traits<at::native::arange_cuda_out(c10::Scalar const&, c10::Scalar const&, c10::Scalar const&, at::Tensor&)::{lambda()#1}::operator()() const::{lambda()#3}::operator()() const::{lambda(long)#1}>::result_type*)": 26,
+          "void at::native::vectorized_elementwise_kernel<4, at::native::FillFunctor<int>, std::array<char*, 1ul> >(int, at::native::FillFunctor<int>, std::array<char*, 1ul>)": 52,
+          "_prepare_prefill_inputs_kernel": 1,
+          "_prepare_pos_seq_lens_kernel": 26,
+          "_combine_sampled_and_draft_tokens_kernel": 26,
+          "_gather_block_tables_kernel": 26,
+          "_compute_slot_mappings_kernel": 26,
+          "triton_red_fused__to_copy_embedding_rms_norm_0": 26,
+          "Cijk_Alik_Bljk_BBH_MT32x32x128_SE_AMAS3_BW_DTL0_BL1_DRB16_ALT_KME0_ETSP_EPS1_FL0_GRVW4_GSU1_ISA936_IU1_KME_GRCMn1_K1_KLA_LDL1_LRVW4_MAC_MMAC_BW1_MMAC_KM0_MMAC_KME1_NBWB1_NLCA1_NLCB1_OLDSR0_PGR1_PLR1_RK1_SU0_SUM0_SUS256_SVW4_TT4_4_TLM0_ULDSWM0_USFGRO0_USSB0_VAW2_VSn1_VW4_WG8_8_1_WGM1": 1,
+          "triton_red_fused_1": 26,
+          "void vllm::reshape_and_cache_flash_kernel<__hip_bfloat16, __hip_bfloat16, (vllm::Fp8KVCacheDataType)0>(__hip_bfloat16 const*, __hip_bfloat16 const*, __hip_bfloat16*, __hip_bfloat16*, long const*, long, long, long, long, long, int, int, int, float const*, float const*, int)": 61,
+          "void at::native::elementwise_kernel_manual_unroll<128, 4, at::native::gpu_kernel_impl<at::native::direct_copy_kernel_cuda(at::TensorIteratorBase&)::{lambda()#3}::operator()() const::{lambda()#4}::operator()() const::{lambda(long)#1}>(at::TensorIteratorBase&, at::native::direct_copy_kernel_cuda(at::TensorIteratorBase&)::{lambda()#3}::operator()() const::{lambda()#4}::operator()() const::{lambda(long)#1} const&)::{lambda(int, bool)#1}>(int, at::native::gpu_kernel_impl<at::native::direct_copy_kernel_cuda(at::TensorIteratorBase&)::{lambda()#3}::operator()() const::{lambda()#4}::operator()() const::{lambda(long)#1}>(at::TensorIteratorBase&, at::native::direct_copy_kernel_cuda(at::TensorIteratorBase&)::{lambda()#3}::operator()() const::{lambda()#4}::operator()() const::{lambda(long)#1} const&)::{lambda(int, bool)#1})": 36,
+          "void at::native::reduce_kernel<512, 1, at::native::ReduceOp<long, at::native::func_wrapper_t<long, at::native::sum_functor<long, long, long>::operator()(at::TensorIterator&)::{lambda(long, long)#1}>, unsigned int, long, 4, 4> >(at::native::ReduceOp<long, at::native::func_wrapper_t<long, at::native::sum_functor<long, long, long>::operator()(at::TensorIterator&)::{lambda(long, long)#1}>, unsigned int, long, 4, 4>)": 36,
+          "void at::native::vectorized_elementwise_kernel<4, at::native::compare_scalar_kernel<long>(at::TensorIteratorBase&, at::native::(anonymous namespace)::OpType, long)::{lambda(long)#1}, std::array<char*, 2ul> >(int, at::native::compare_scalar_kernel<long>(at::TensorIteratorBase&, at::native::(anonymous namespace)::OpType, long)::{lambda(long)#1}, std::array<char*, 2ul>)": 36,
+          "void at::native::vectorized_elementwise_kernel<8, at::native::FillFunctor<c10::BFloat16>, std::array<char*, 1ul> >(int, at::native::FillFunctor<c10::BFloat16>, std::array<char*, 1ul>)": 72,
+          "void pagedkv_to_contiguouskv_kernel<unsigned short, unsigned short, false, 256>(unsigned short*, unsigned short*, unsigned short*, unsigned short*, int*, int*, int*, int, int, int, int, int, int, int, int, int, int, int, int)": 36,
+          "void flash_fwd_kernel_16x64_prefetch<Flash_fwd_kernel_16x64_prefetch_traits<128, 64, 64, 4, hytlass::bfloat16_t, 3, false, false, 128, Flash_kernel_traits<128, 64, 64, 4, hytlass::bfloat16_t> >, false, true, false, false, false, true, false, false>(Flash_fwd_params)": 36,
+          "Cijk_Alik_Bljk_BBH_MT64x32x128_SE_AMAS3_BW_DTL0_BL1_DRB16_ALT_KME0_ETSP_EPS1_FL0_GRVW4_GSU1_ISA936_IU1_KME_GRCMn1_K1_KLA_LDL1_LRVW4_MAC_MMAC_BW1_MMAC_KM0_MMAC_KME1_NBWB1_NLCA1_NLCB1_OLDSR0_PGR1_PLR1_RK1_SU0_SUM0_SUS256_SVW4_TT8_4_TLM0_ULDSWM0_USFGRO0_USSB0_VAW2_VSn1_VW4_WG8_8_1_WGM1": 36,
+          "triton_red_fused_fused_add_rms_norm_0": 61,
+          "Cijk_Alik_Bljk_BBH_MT32x16x256_SE_AMAS3_BW_DTL0_BL1_DRB16_ALT_KME0_ETSP_EPS1_FL0_GRVW2_GSU1_ISA936_IU1_KME_GRCMn1_K1_KLA_LDL1_LRVW2_MAC_MMAC_BW1_MMAC_KM0_MMAC_KME1_NBWB1_NLCA1_NLCB1_OLDSR0_PGR1_PLR1_RK1_SU0_SUM0_SUS1024_SVW4_TT4_2_TLM0_ULDSWM0_USFGRO0_USSB0_VAW2_VSn1_VW2_WG8_8_1_WGM1": 36,
+          "triton_poi_fused_mul_silu_slice_1": 56,
+          "void at::native::index_elementwise_kernel<128, 4, at::native::gpu_index_kernel<at::native::index_kernel_impl<at::native::OpaqueType<2> >(at::TensorIteratorBase&, c10::ArrayRef<long>, c10::ArrayRef<long>)::{lambda(char*, char const*, long)#1}>(at::TensorIteratorBase&, c10::ArrayRef<long>, c10::ArrayRef<long>, at::native::index_kernel_impl<at::native::OpaqueType<2> >(at::TensorIteratorBase&, c10::ArrayRef<long>, c10::ArrayRef<long>)::{lambda(char*, char const*, long)#1} const&, bool)::{lambda(int)#1}>(long, at::native::gpu_index_kernel<at::native::index_kernel_impl<at::native::OpaqueType<2> >(at::TensorIteratorBase&, c10::ArrayRef<long>, c10::ArrayRef<long>)::{lambda(char*, char const*, long)#1}>(at::TensorIteratorBase&, c10::ArrayRef<long>, c10::ArrayRef<long>, at::native::index_kernel_impl<at::native::OpaqueType<2> >(at::TensorIteratorBase&, c10::ArrayRef<long>, c10::ArrayRef<long>)::{lambda(char*, char const*, long)#1} const&, bool)::{lambda(int)#1})": 26,
+          "Cijk_Alik_Bljk_BBH_MT32x16x4_SE_AMAS3_BW_DTL0_BL1_DRB16_ALT_KME0_ETSP_EPS1_FL0_GRVW2_GSU1_ISA936_IU1_KME_GRCMn1_K1_KLA_LDL1_LRVW2_MAC_MMAC_BW1_MMAC_KM0_MMAC_KME1_NBWB1_NLCA1_NLCB1_OLDSR0_PGR1_PLR1_RK1_SU0_SUM0_SUS256_SVW4_TT4_2_TLM0_ULDSWM0_USFGRO0_USSB0_VAW2_VSn1_VW2_WG8_8_1_WGM1": 76,
+          "void at::native::index_elementwise_kernel<128, 4, at::native::gpu_index_kernel<at::native::index_kernel_impl<at::native::OpaqueType<8> >(at::TensorIteratorBase&, c10::ArrayRef<long>, c10::ArrayRef<long>)::{lambda(char*, char const*, long)#1}>(at::TensorIteratorBase&, c10::ArrayRef<long>, c10::ArrayRef<long>, at::native::index_kernel_impl<at::native::OpaqueType<8> >(at::TensorIteratorBase&, c10::ArrayRef<long>, c10::ArrayRef<long>)::{lambda(char*, char const*, long)#1} const&, bool)::{lambda(int)#1}>(long, at::native::gpu_index_kernel<at::native::index_kernel_impl<at::native::OpaqueType<8> >(at::TensorIteratorBase&, c10::ArrayRef<long>, c10::ArrayRef<long>)::{lambda(char*, char const*, long)#1}>(at::TensorIteratorBase&, c10::ArrayRef<long>, c10::ArrayRef<long>, at::native::index_kernel_impl<at::native::OpaqueType<8> >(at::TensorIteratorBase&, c10::ArrayRef<long>, c10::ArrayRef<long>)::{lambda(char*, char const*, long)#1} const&, bool)::{lambda(int)#1})": 26,
+          "void at::native::index_elementwise_kernel<128, 4, at::native::gpu_index_kernel<at::native::index_kernel_impl<at::native::OpaqueType<4> >(at::TensorIteratorBase&, c10::ArrayRef<long>, c10::ArrayRef<long>)::{lambda(char*, char const*, long)#1}>(at::TensorIteratorBase&, c10::ArrayRef<long>, c10::ArrayRef<long>, at::native::index_kernel_impl<at::native::OpaqueType<4> >(at::TensorIteratorBase&, c10::ArrayRef<long>, c10::ArrayRef<long>)::{lambda(char*, char const*, long)#1} const&, bool)::{lambda(int)#1}>(long, at::native::gpu_index_kernel<at::native::index_kernel_impl<at::native::OpaqueType<4> >(at::TensorIteratorBase&, c10::ArrayRef<long>, c10::ArrayRef<long>)::{lambda(char*, char const*, long)#1}>(at::TensorIteratorBase&, c10::ArrayRef<long>, c10::ArrayRef<long>, at::native::index_kernel_impl<at::native::OpaqueType<4> >(at::TensorIteratorBase&, c10::ArrayRef<long>, c10::ArrayRef<long>)::{lambda(char*, char const*, long)#1} const&, bool)::{lambda(int)#1})": 26,
+          "_gumbel_sample_kernel": 26,
+          "void at::native::reduce_kernel<512, 1, at::native::ReduceOp<float, at::native::ArgMaxOps<float>, unsigned int, long, 4, 4> >(at::native::ReduceOp<float, at::native::ArgMaxOps<float>, unsigned int, long, 4, 4>)": 26,
+          "void at::native::_scatter_gather_elementwise_kernel<256, 4, at::native::_cuda_scatter_gather_internal_kernel<false, at::native::OpaqueType<8>, long>::operator()<at::native::TensorAssign>(at::TensorIterator&, long, long, long, at::native::TensorAssign const&)::{lambda(int)#1}>(int, at::native::_cuda_scatter_gather_internal_kernel<false, at::native::OpaqueType<8>, long>::operator()<at::native::TensorAssign>(at::TensorIterator&, long, long, long, at::native::TensorAssign const&)::{lambda(int)#1})": 26,
+          "_get_num_sampled_and_rejected_kernel": 26,
+          "_post_update_kernel": 26,
+          "void paged_attention_kernel_bshd_opt<unsigned short, unsigned short, false, 128, 128, 64, 256, 16, 2, 8, 4, false, false, false, true, false>(unsigned short*, unsigned short*, unsigned short const*, unsigned short const*, unsigned short const*, int, int, int const*, int const*, int, float const*, int, int, int, int, unsigned short const*, int, Pa28WindowConfig, int)": 25,
+          "void paged_attention_combine<unsigned short, 128, 64>(unsigned short*, unsigned short*, int const*, int, int, int, int, int, int)": 25,
+          "Cijk_Alik_Bljk_BBH_MT64x32x32_SE_AMAS3_BW_DTL0_BL1_DRB16_ALT_KME0_ETSP_EPS1_FL0_GRVW4_GSU1_ISA936_IU1_KME_GRCMn2_K1_KLA_LDL1_LRVW4_MAC_MMAC_BW1_MMAC_KM0_MMAC_KME1_NBWB1_NLCA1_NLCB1_OLDSR1_PGR1_PLR1_RK0_SU32_SUM0_SUS256_SVW4_TT8_4_TLM0_ULDSWM0_USFGRO0_USSB0_VAW2_VSn1_VW4_WG8_8_1_WGM8": 25
+        },
+        "trace_hashes": {
+          "cache/profiles/m09r2n16_2393266.async_llm.1795086931357508710.pt.trace.json.gz": "d6df326ce7068e32cdc5f5ebc8b5465443af00d78eb893a11d3e9f3be9aa9671",
+          "cache/profiles/rank0.1795086931415709502.pt.trace.json.gz": "53514c1735b0ffd572cc66e05ec0acc43bae7dbfbaa6621f5303b392fb31af88"
+        },
+        "extension_reports": [
+          {
+            "entry_point_name": "das_hcu",
+            "extension_name": "das-hcu",
+            "status": "active",
+            "capabilities": [
+              "lightop-rms-norm"
+            ],
+            "reason": ""
+          },
+          {
+            "entry_point_name": "das_hcu_aiter_int8",
+            "extension_name": "das-hcu-aiter-int8",
+            "status": "failed",
+            "capabilities": [
+              "hcu-aiter-int8-moe"
+            ],
+            "reason": "activation failed: RuntimeError: INT8 ASM requires explicit hcu-aiter-int8-moe capability"
+          },
+          {
+            "entry_point_name": "das_hcu_ct_w4a8",
+            "extension_name": "das-hcu-ct-w4a8",
+            "status": "active",
+            "capabilities": [
+              "dsv41-ct-w4a8"
+            ],
+            "reason": ""
+          },
+          {
+            "entry_point_name": "das_hcu_dsv41",
+            "extension_name": "das-hcu-dsv41",
+            "status": "active",
+            "capabilities": [
+              "dsv41-channel-fp8-routing"
+            ],
+            "reason": ""
+          },
+          {
+            "entry_point_name": "das_hcu_flash",
+            "extension_name": "das-hcu-flash",
+            "status": "active",
+            "capabilities": [
+              "hcu-flash-attention"
+            ],
+            "reason": ""
+          },
+          {
+            "entry_point_name": "das_hcu_fp4_packer",
+            "extension_name": "das-hcu-fp4-packer",
+            "status": "failed",
+            "capabilities": [
+              "hcu-e2m1-packer-lowering"
+            ],
+            "reason": "activation failed: Fp4PackerCompatibilityError: FP4 lowering candidate requires real HCU gfx938"
+          },
+          {
+            "entry_point_name": "das_hcu_slimquant",
+            "extension_name": "das-hcu-slimquant",
+            "status": "failed",
+            "capabilities": [
+              "hcu-slimquant-w4a8"
+            ],
+            "reason": "activation failed: RuntimeError: SlimQuant requires explicit hcu-slimquant-w4a8 capability"
+          },
+          {
+            "entry_point_name": "das_hcu_step5_config",
+            "extension_name": "das-hcu-step5-config",
+            "status": "active",
+            "capabilities": [
+              "step5-standalone-mtp-config"
+            ],
+            "reason": ""
+          },
+          {
+            "entry_point_name": "das_hcu_v41_indexer",
+            "extension_name": "das-hcu-v41-indexer",
+            "status": "active",
+            "capabilities": [
+              "hcu-v41-fp8-indexer-eager-reference",
+              "hcu-v41-fp8-indexer-graph-break"
+            ],
+            "reason": ""
+          },
+          {
+            "entry_point_name": "das_hcu_v41_pcp",
+            "extension_name": "das-hcu-v41-pcp",
+            "status": "active",
+            "capabilities": [
+              "hcu-v41-pcp-eager-attention",
+              "hcu-v41-private-engram-host"
+            ],
+            "reason": ""
+          },
+          {
+            "entry_point_name": "minimax31_pcp_ep",
+            "extension_name": "minimax31_pcp_ep",
+            "status": "failed",
+            "capabilities": [
+              "minimax31-pcp-ep"
+            ],
+            "reason": "activation failed: RuntimeError: MiniMax PCP/EP requires an explicit extension request"
+          },
+          {
+            "entry_point_name": "minimax31_slimquant",
+            "extension_name": "minimax31_slimquant",
+            "status": "failed",
+            "capabilities": [
+              "minimax31-slimquant"
+            ],
+            "reason": "activation failed: RuntimeError: MiniMax SlimQuant requires an explicit extension request"
+          }
+        ],
+        "exit": {
+          "at": "2026-11-19T11:16:02.634911+00:00",
+          "returncode": 0,
+          "elapsed_s": 29.89134284807369,
+          "api_sigint": true,
+          "original_EngineCore_grace_s": 15
+        },
+        "native_leak_diagnostics": [
+          "nanobind: leaked 4 instances!",
+          "nanobind: leaked 70 types!",
+          "nanobind: leaked 558 functions!",
+          "nanobind: leaked 4 instances!",
+          "nanobind: leaked 69 types!",
+          "nanobind: leaked 556 functions!"
+        ],
+        "forced_or_timeout_log_lines": [
+          "(APIServer pid=2393266) WARNING 11-19 11:15:47 [utils.py:648] [shutdown] Process manager: force killing remaining processes count=1",
+          "(APIServer pid=2393266) WARNING 11-19 11:15:47 [utils.py:653] [shutdown] Process manager: force killing remaining process EngineCore pid 2394437"
+        ],
+        "terminal": {
+          "at": "2026-11-19T11:16:34.027569+00:00",
+          "arm": "candidate-bf16",
+          "error": null,
+          "client_returncode": 0,
+          "service_returncode": 0,
+          "records_unchanged": true,
+          "checkpoint_unchanged": true,
+          "remaining_owned": [],
+          "KFD_pids": [],
+          "port_bindable": true,
+          "scoring_pending": true
+        },
+        "provenance": {
+          "launch.json": "817becdab95117332b729ee61c605a6e7af49876eec18cf055f881fe48c70af3",
+          "terminal.json": "5bef559a9207054356f61bc3b5043c7502124ed86aea5d42c3442b868e06c126",
+          "score.json": "801d6e2dbb51ff4dca59246a9724a847d0b2d665d00cb435fd2be89694215be9",
+          "he32/protocol.json": "2ff7438e99c914b5b86bcdfb94fbd0f012a0502ba71d125059e6b3c8ba192735",
+          "he32/server-info.json": "ad105e6d1419474e4402f7609bfb8da1b1c515ad49f03fe5ef1f1e780863598a",
+          "he32/worker-before.json": "cbe31043d0eda4dcf48060be6f9f87187cdb83242a914e48830fe554bd53ab8f",
+          "he32/worker-after.json": "cbe31043d0eda4dcf48060be6f9f87187cdb83242a914e48830fe554bd53ab8f",
+          "he32/responses.jsonl": "d88d05724b07a7cfe93ed2c9a6fef3318b58bfc8da958dcdb029750044087621",
+          "he32/samples.jsonl": "84617b0689db090f6c7be64eb9ebb1382f7aebeca6c58981f8c4ac28d7751c03",
+          "he32/functional-probe-status.json": "087e6bf797cf34483dc77a501435e708dc0003224ccdc3fdfc18d4956ef71020"
+        },
+        "original_resource_gate_passed": true,
+        "raw_failed_ids": [
+          "HumanEval/10",
+          "HumanEval/13",
+          "HumanEval/15",
+          "HumanEval/16",
+          "HumanEval/18",
+          "HumanEval/2",
+          "HumanEval/23",
+          "HumanEval/24",
+          "HumanEval/26",
+          "HumanEval/27",
+          "HumanEval/30",
+          "HumanEval/31"
+        ],
+        "normalized_failed_ids": [
+          "HumanEval/18",
+          "HumanEval/26"
+        ],
+        "completion_tokens_total": 4198,
+        "actual_device_binding": {
+          "at": "2026-11-19T11:14:06.120875+00:00",
+          "arm": "candidate-bf16",
+          "worker_pid": 2394437,
+          "worker_startticks": "249936263",
+          "architecture_from_worker_RPC": "gfx936:sramecc+:xnack-",
+          "worker_versions": {
+            "vllm": "0.33.0+das.98a0985.dtk2610.torch2130.gfx936gfx938.r1.rocm72",
+            "hcu-adapter": "0.5.22+dtk2610.torch2130.2611191429.g8ba62c",
+            "sgl-kernel": "0.0.0+dtk2610.torch2130.2611191429.g8ba62c",
+            "hcu-vllm-das-plugin": "0.33.0",
+            "torch": "2.13.0+dtk2610.2611091606.ge8aa84"
+          },
+          "KFD": [
+            {
+              "host_KFD_pid": "3530904",
+              "vpid": "2394437",
+              "queues": [
+                {
+                  "queue": "5",
+                  "gpuid": "45786",
+                  "type": "0",
+                  "size": "1048576"
+                },
+                {
+                  "queue": "3",
+                  "gpuid": "45786",
+                  "type": "0",
+                  "size": "1048576"
+                },
+                {
+                  "queue": "1",
+                  "gpuid": "45786",
+                  "type": "0",
+                  "size": "1048576"
+                },
+                {
+                  "queue": "6",
+                  "gpuid": "45786",
+                  "type": "0",
+                  "size": "1048576"
+                },
+                {
+                  "queue": "4",
+                  "gpuid": "45786",
+                  "type": "1",
+                  "size": "1048576"
+                },
+                {
+                  "queue": "2",
+                  "gpuid": "45786",
+                  "type": "1",
+                  "size": "1048576"
+                },
+                {
+                  "queue": "0",
+                  "gpuid": "45786",
+                  "type": "0",
+                  "size": "4096"
+                }
+              ],
+              "VRAM_bytes": {
+                "vram_45786": 19790069760
+              }
+            }
+          ],
+          "topology": [
+            {
+              "node": "15",
+              "gpu_id": "45786",
+              "gfx_target_version": "90306",
+              "DRM_render_minor": "135",
+              "PCI_BDF": "0000:f5:00.0",
+              "device_sysfs": "/sys/devices/pci0000:f0/0000:f0:01.1/0000:f1:00.0/0000:f2:00.0/0000:f3:00.0/0000:f4:00.0/0000:f5:00.0",
+              "unique_id_decimal": "5836526207244449",
+              "unique_id_hex": "0x14bc4a274e18a1"
+            }
+          ],
+          "scope": "Worker RPC PID plus saved process identity and namespace-aware KFD vpid/active queue gpuid mapped to physical topology. No visibility ordinal inference. No model/precision/gfx836 qualification."
+        },
+        "actual_mapped_native_libraries": {
+          "at": "2026-11-19T11:14:24.451184+00:00",
+          "worker_pid": 2394437,
+          "startticks": "249936263",
+          "maps_sha256": "1809a414feec3af7b7b599a9292a400ccf4de00842d6da9ee2dc3e9b6305baf9",
+          "native_libraries": [
+            {
+              "path": "/data/models/plugin410-e2e-20261119-r722/env-candidate/lib/python3.12/site-packages/aiter/jit/module_aiter_enum.so",
+              "realpath": "/data/models/plugin410-e2e-20261119-r722/env-candidate/lib/python3.12/site-packages/aiter/jit/module_aiter_enum.so",
+              "bytes": 513800,
+              "sha256": "9249e7ec2416388d78a112faf5cd1bd61216ee5775a7bcd5b0a6be32d9ec8245",
+              "device": 66305,
+              "inode": 16258251
+            },
+            {
+              "path": "/data/models/plugin410-e2e-20261119-r722/env-candidate/lib/python3.12/site-packages/vllm/_C.abi3.so",
+              "realpath": "/data/models/plugin410-e2e-20261119-r722/env-candidate/lib/python3.12/site-packages/vllm/_C.abi3.so",
+              "bytes": 15790544,
+              "sha256": "1c2006683b98f80f2d19c394c8ec1fcc17ea19a9dd589f9f44f22c82c4b79a99",
+              "device": 66305,
+              "inode": 16259062
+            },
+            {
+              "path": "/data/models/plugin410-e2e-20261119-r722/env-candidate/lib/python3.12/site-packages/vllm/_C_stable_libtorch.abi3.so",
+              "realpath": "/data/models/plugin410-e2e-20261119-r722/env-candidate/lib/python3.12/site-packages/vllm/_C_stable_libtorch.abi3.so",
+              "bytes": 102551920,
+              "sha256": "8ff4c0ca5ac2ea03d945d6adea092426c1c4b82e1f5e621840311d19589e1818",
+              "device": 66305,
+              "inode": 16259063
+            },
+            {
+              "path": "/data/models/plugin410-e2e-20261119-r722/env-candidate/lib/python3.12/site-packages/vllm/_moe_C_stable_libtorch.abi3.so",
+              "realpath": "/data/models/plugin410-e2e-20261119-r722/env-candidate/lib/python3.12/site-packages/vllm/_moe_C_stable_libtorch.abi3.so",
+              "bytes": 59858136,
+              "sha256": "09b661bdf1bb5b135e1668d7ff9fec21449854d1cdf2142494bd090f48c07cd7",
+              "device": 66305,
+              "inode": 16259067
+            },
+            {
+              "path": "/data/models/plugin410-e2e-20261119-r722/env-candidate/lib/python3.12/site-packages/vllm/_rocm_C.abi3.so",
+              "realpath": "/data/models/plugin410-e2e-20261119-r722/env-candidate/lib/python3.12/site-packages/vllm/_rocm_C.abi3.so",
+              "bytes": 37513848,
+              "sha256": "ac9b3bddb3ea176316012cefd119773e6d68dba05435de45696e6dbc7d833585",
+              "device": 66305,
+              "inode": 16259068
+            },
+            {
+              "path": "/usr/local/lib/python3.12/site-packages/flash_attn/lib/libflash_attention.so",
+              "realpath": "/usr/local/lib/python3.12/site-packages/flash_attn/lib/libflash_attention.so",
+              "bytes": 1673065,
+              "sha256": "f7b375a65b1471589d14faa6777a9d2637696aab8787f007efa47b635533f828",
+              "device": 75,
+              "inode": 13501828
+            },
+            {
+              "path": "/usr/local/lib/python3.12/site-packages/flash_attn/lib/libflash_attention_c.so",
+              "realpath": "/usr/local/lib/python3.12/site-packages/flash_attn/lib/libflash_attention_c.so",
+              "bytes": 1345698872,
+              "sha256": "501d8f85dfcf4f7b92fa1ee13d8afdcdd3e3b7c6eabbca1241c55e2e0650aa54",
+              "device": 75,
+              "inode": 13501829
+            },
+            {
+              "path": "/usr/local/lib/python3.12/site-packages/flash_attn_2_cuda.cpython-312-x86_64-linux-gnu.so",
+              "realpath": "/usr/local/lib/python3.12/site-packages/flash_attn_2_cuda.cpython-312-x86_64-linux-gnu.so",
+              "bytes": 813606024,
+              "sha256": "95f426878a2eb642b03a11701015ccb6d3b3a7823f2e302152a4a806f008ef24",
+              "device": 75,
+              "inode": 13380727
+            },
+            {
+              "path": "/usr/local/lib/python3.12/site-packages/lightop/op.cpython-312-x86_64-linux-gnu.so",
+              "realpath": "/usr/local/lib/python3.12/site-packages/lightop/op.cpython-312-x86_64-linux-gnu.so",
+              "bytes": 1069051105,
+              "sha256": "c8e62d33a7809c9e342f1be0068d733e4a361f697acbe0a1a0b03d88a3190991",
+              "device": 75,
+              "inode": 13503204
+            }
+          ],
+          "scope": "Actual mapped provider/Core native binaries, hashed with stable file identity. Loaded libraries alone do not prove provider execution; pair with runtime/profiler evidence."
+        }
+      },
+      "candidate-e4m3": {
+        "backend": "FLASH_ATTN",
+        "kv_dtype": "fp8_e4m3",
+        "architecture": "gfx936:sramecc+:xnack-",
+        "worker_pid": 2407002,
+        "counts": {
+          "raw": 20,
+          "normalized": 31
+        },
+        "raw_pass_ids": [
+          "HumanEval/0",
+          "HumanEval/1",
+          "HumanEval/3",
+          "HumanEval/4",
+          "HumanEval/5",
+          "HumanEval/6",
+          "HumanEval/7",
+          "HumanEval/8",
+          "HumanEval/9",
+          "HumanEval/11",
+          "HumanEval/12",
+          "HumanEval/14",
+          "HumanEval/17",
+          "HumanEval/19",
+          "HumanEval/20",
+          "HumanEval/21",
+          "HumanEval/22",
+          "HumanEval/25",
+          "HumanEval/28",
+          "HumanEval/29"
+        ],
+        "normalized_pass_ids": [
+          "HumanEval/0",
+          "HumanEval/1",
+          "HumanEval/2",
+          "HumanEval/3",
+          "HumanEval/4",
+          "HumanEval/5",
+          "HumanEval/6",
+          "HumanEval/7",
+          "HumanEval/8",
+          "HumanEval/9",
+          "HumanEval/10",
+          "HumanEval/11",
+          "HumanEval/12",
+          "HumanEval/13",
+          "HumanEval/14",
+          "HumanEval/15",
+          "HumanEval/16",
+          "HumanEval/17",
+          "HumanEval/18",
+          "HumanEval/19",
+          "HumanEval/20",
+          "HumanEval/21",
+          "HumanEval/22",
+          "HumanEval/23",
+          "HumanEval/24",
+          "HumanEval/25",
+          "HumanEval/27",
+          "HumanEval/28",
+          "HumanEval/29",
+          "HumanEval/30",
+          "HumanEval/31"
+        ],
+        "finish_reasons": {
+          "stop": 32
+        },
+        "completion_tokens": [
+          160,
+          202,
+          109,
+          49,
+          151,
+          123,
+          194,
+          101,
+          142,
+          153,
+          206,
+          148,
+          145,
+          83,
+          75,
+          84,
+          76,
+          227,
+          169,
+          217,
+          242,
+          155,
+          101,
+          47,
+          101,
+          232,
+          114,
+          53,
+          58,
+          95,
+          36,
+          201
+        ],
+        "functional_probes": {
+          "passed": true,
+          "failures": [],
+          "continued_for_scoring": true
+        },
+        "prefix_hit_delta": 3840.0,
+        "actual_impls": {
+          "hcu_vllm_das.attention.flash_attn.HcuFlashAttentionImpl": 36
+        },
+        "physical_cache_dtypes": [
+          "torch.uint8"
+        ],
+        "cache_resolution": {
+          "num_blocks": 227,
+          "hash_block_size": 64,
+          "prefix_cache_retention_interval": 0,
+          "kv_cache_layout": "LBHNC"
+        },
+        "graph_config": [
+          2,
+          1
+        ],
+        "graph_events": {
+          "execute_context_1(18)_generation_0(0)": 2,
+          "execute_context_0(0)_generation_1(1)": 50,
+          "execute_context_0(0)_generation_0(0)": 1,
+          "hipGraphLaunch": 62
+        },
+        "native_kernel_events": {
+          "_apply_write_kernel": 4,
+          "void at::native::vectorized_elementwise_kernel<16, at::native::FillFunctor<bool>, std::array<char*, 1ul> >(int, at::native::FillFunctor<bool>, std::array<char*, 1ul>)": 26,
+          "void at::native::vectorized_elementwise_kernel<2, at::native::FillFunctor<bool>, std::array<char*, 1ul> >(int, at::native::FillFunctor<bool>, std::array<char*, 1ul>)": 1,
+          "void (anonymous namespace)::elementwise_kernel_with_index_grid_stride<int, at::native::arange_cuda_out(c10::Scalar const&, c10::Scalar const&, c10::Scalar const&, at::Tensor&)::{lambda()#1}::operator()() const::{lambda()#3}::operator()() const::{lambda(long)#1}>(int, at::native::arange_cuda_out(c10::Scalar const&, c10::Scalar const&, c10::Scalar const&, at::Tensor&)::{lambda()#1}::operator()() const::{lambda()#3}::operator()() const::{lambda(long)#1}, function_traits<at::native::arange_cuda_out(c10::Scalar const&, c10::Scalar const&, c10::Scalar const&, at::Tensor&)::{lambda()#1}::operator()() const::{lambda()#3}::operator()() const::{lambda(long)#1}>::result_type*)": 26,
+          "void at::native::vectorized_elementwise_kernel<4, at::native::FillFunctor<int>, std::array<char*, 1ul> >(int, at::native::FillFunctor<int>, std::array<char*, 1ul>)": 88,
+          "_prepare_prefill_inputs_kernel": 1,
+          "_prepare_pos_seq_lens_kernel": 26,
+          "_combine_sampled_and_draft_tokens_kernel": 26,
+          "_gather_block_tables_kernel": 26,
+          "_compute_slot_mappings_kernel": 26,
+          "triton_red_fused__to_copy_embedding_rms_norm_0": 26,
+          "Cijk_Alik_Bljk_BBH_MT32x32x128_SE_AMAS3_BW_DTL0_BL1_DRB16_ALT_KME0_ETSP_EPS1_FL0_GRVW4_GSU1_ISA936_IU1_KME_GRCMn1_K1_KLA_LDL1_LRVW4_MAC_MMAC_BW1_MMAC_KM0_MMAC_KME1_NBWB1_NLCA1_NLCB1_OLDSR0_PGR1_PLR1_RK1_SU0_SUM0_SUS256_SVW4_TT4_4_TLM0_ULDSWM0_USFGRO0_USSB0_VAW2_VSn1_VW4_WG8_8_1_WGM1": 1,
+          "triton_red_fused_1": 26,
+          "void vllm::reshape_and_cache_flash_kernel<__hip_bfloat16, unsigned char, (vllm::Fp8KVCacheDataType)1>(__hip_bfloat16 const*, __hip_bfloat16 const*, unsigned char*, unsigned char*, long const*, long, long, long, long, long, int, int, int, float const*, float const*, int)": 61,
+          "_scale_rows": 122,
+          "void at::native::vectorized_elementwise_kernel<16, at::native::FillFunctor<c10::Float8_e4m3fn>, std::array<char*, 1ul> >(int, at::native::FillFunctor<c10::Float8_e4m3fn>, std::array<char*, 1ul>)": 72,
+          "void rocprim::ROCPRIM_400200_NS::detail::trampoline_kernel<rocprim::ROCPRIM_400200_NS::detail::wrapped_scan_config<rocprim::ROCPRIM_400200_NS::default_config, int>, rocprim::ROCPRIM_400200_NS::detail::scan_impl<(rocprim::ROCPRIM_400200_NS::detail::lookback_scan_determinism)0, false, false, rocprim::ROCPRIM_400200_NS::default_config, int const*, int*, int, std::plus<int>, int>(void*, unsigned long&, int const*, int*, int, unsigned long, std::plus<int>, ihipStream_t*, bool)::{lambda(auto:1, auto:2)#1}::operator()<std::integral_constant<bool, false>, std::integral_constant<bool, false> >(std::integral_constant<bool, false>, std::integral_constant<bool, false>) const::{lambda(auto:1)#2}, rocprim::ROCPRIM_400200_NS::detail::default_config_selector>(rocprim::ROCPRIM_400200_NS::detail::scan_impl<(rocprim::ROCPRIM_400200_NS::detail::lookback_scan_determinism)0, false, false, rocprim::ROCPRIM_400200_NS::default_config, int const*, int*, int, std::plus<int>, int>(void*, unsigned long&, int const*, int*, int, unsigned long, std::plus<int>, ihipStream_t*, bool)::{lambda(auto:1, auto:2)#1}::operator()<std::integral_constant<bool, false>, std::integral_constant<bool, false> >(std::integral_constant<bool, false>, std::integral_constant<bool, false>) const::{lambda(auto:1)#2})": 36,
+          "void vllm::cp_gather_cache_page<false, true>(unsigned char const*, unsigned char*, int const*, int const*, int, int, int, int, long, long, long, long, int const*)": 576,
+          "void at::native::elementwise_kernel_manual_unroll<128, 4, at::native::gpu_kernel_impl<at::native::direct_copy_kernel_cuda(at::TensorIteratorBase&)::{lambda()#3}::operator()() const::{lambda()#12}::operator()() const::{lambda(c10::BFloat16)#1}>(at::TensorIteratorBase&, at::native::direct_copy_kernel_cuda(at::TensorIteratorBase&)::{lambda()#3}::operator()() const::{lambda()#12}::operator()() const::{lambda(c10::BFloat16)#1} const&)::{lambda(int, bool)#1}>(int, at::native::gpu_kernel_impl<at::native::direct_copy_kernel_cuda(at::TensorIteratorBase&)::{lambda()#3}::operator()() const::{lambda()#12}::operator()() const::{lambda(c10::BFloat16)#1}>(at::TensorIteratorBase&, at::native::direct_copy_kernel_cuda(at::TensorIteratorBase&)::{lambda()#3}::operator()() const::{lambda()#12}::operator()() const::{lambda(c10::BFloat16)#1} const&)::{lambda(int, bool)#1})": 72,
+          "void flash_fwd_kernel_16x64_prefetch<Flash_fwd_kernel_16x64_prefetch_traits<128, 64, 64, 4, hytlass::bfloat16_t, 3, false, false, 128, Flash_kernel_traits<128, 64, 64, 4, hytlass::bfloat16_t> >, false, true, false, false, false, true, false, false>(Flash_fwd_params)": 36,
+          "Cijk_Alik_Bljk_BBH_MT64x32x128_SE_AMAS3_BW_DTL0_BL1_DRB16_ALT_KME0_ETSP_EPS1_FL0_GRVW4_GSU1_ISA936_IU1_KME_GRCMn1_K1_KLA_LDL1_LRVW4_MAC_MMAC_BW1_MMAC_KM0_MMAC_KME1_NBWB1_NLCA1_NLCB1_OLDSR0_PGR1_PLR1_RK1_SU0_SUM0_SUS256_SVW4_TT8_4_TLM0_ULDSWM0_USFGRO0_USSB0_VAW2_VSn1_VW4_WG8_8_1_WGM1": 36,
+          "triton_red_fused_fused_add_rms_norm_0": 61,
+          "Cijk_Alik_Bljk_BBH_MT32x16x256_SE_AMAS3_BW_DTL0_BL1_DRB16_ALT_KME0_ETSP_EPS1_FL0_GRVW2_GSU1_ISA936_IU1_KME_GRCMn1_K1_KLA_LDL1_LRVW2_MAC_MMAC_BW1_MMAC_KM0_MMAC_KME1_NBWB1_NLCA1_NLCB1_OLDSR0_PGR1_PLR1_RK1_SU0_SUM0_SUS1024_SVW4_TT4_2_TLM0_ULDSWM0_USFGRO0_USSB0_VAW2_VSn1_VW2_WG8_8_1_WGM1": 36,
+          "triton_poi_fused_mul_silu_slice_1": 60,
+          "void at::native::index_elementwise_kernel<128, 4, at::native::gpu_index_kernel<at::native::index_kernel_impl<at::native::OpaqueType<2> >(at::TensorIteratorBase&, c10::ArrayRef<long>, c10::ArrayRef<long>)::{lambda(char*, char const*, long)#1}>(at::TensorIteratorBase&, c10::ArrayRef<long>, c10::ArrayRef<long>, at::native::index_kernel_impl<at::native::OpaqueType<2> >(at::TensorIteratorBase&, c10::ArrayRef<long>, c10::ArrayRef<long>)::{lambda(char*, char const*, long)#1} const&, bool)::{lambda(int)#1}>(long, at::native::gpu_index_kernel<at::native::index_kernel_impl<at::native::OpaqueType<2> >(at::TensorIteratorBase&, c10::ArrayRef<long>, c10::ArrayRef<long>)::{lambda(char*, char const*, long)#1}>(at::TensorIteratorBase&, c10::ArrayRef<long>, c10::ArrayRef<long>, at::native::index_kernel_impl<at::native::OpaqueType<2> >(at::TensorIteratorBase&, c10::ArrayRef<long>, c10::ArrayRef<long>)::{lambda(char*, char const*, long)#1} const&, bool)::{lambda(int)#1})": 26,
+          "Cijk_Alik_Bljk_BBH_MT32x16x4_SE_AMAS3_BW_DTL0_BL1_DRB16_ALT_KME0_ETSP_EPS1_FL0_GRVW2_GSU1_ISA936_IU1_KME_GRCMn1_K1_KLA_LDL1_LRVW2_MAC_MMAC_BW1_MMAC_KM0_MMAC_KME1_NBWB1_NLCA1_NLCB1_OLDSR0_PGR1_PLR1_RK1_SU0_SUM0_SUS256_SVW4_TT4_2_TLM0_ULDSWM0_USFGRO0_USSB0_VAW2_VSn1_VW2_WG8_8_1_WGM1": 76,
+          "void at::native::index_elementwise_kernel<128, 4, at::native::gpu_index_kernel<at::native::index_kernel_impl<at::native::OpaqueType<8> >(at::TensorIteratorBase&, c10::ArrayRef<long>, c10::ArrayRef<long>)::{lambda(char*, char const*, long)#1}>(at::TensorIteratorBase&, c10::ArrayRef<long>, c10::ArrayRef<long>, at::native::index_kernel_impl<at::native::OpaqueType<8> >(at::TensorIteratorBase&, c10::ArrayRef<long>, c10::ArrayRef<long>)::{lambda(char*, char const*, long)#1} const&, bool)::{lambda(int)#1}>(long, at::native::gpu_index_kernel<at::native::index_kernel_impl<at::native::OpaqueType<8> >(at::TensorIteratorBase&, c10::ArrayRef<long>, c10::ArrayRef<long>)::{lambda(char*, char const*, long)#1}>(at::TensorIteratorBase&, c10::ArrayRef<long>, c10::ArrayRef<long>, at::native::index_kernel_impl<at::native::OpaqueType<8> >(at::TensorIteratorBase&, c10::ArrayRef<long>, c10::ArrayRef<long>)::{lambda(char*, char const*, long)#1} const&, bool)::{lambda(int)#1})": 26,
+          "void at::native::index_elementwise_kernel<128, 4, at::native::gpu_index_kernel<at::native::index_kernel_impl<at::native::OpaqueType<4> >(at::TensorIteratorBase&, c10::ArrayRef<long>, c10::ArrayRef<long>)::{lambda(char*, char const*, long)#1}>(at::TensorIteratorBase&, c10::ArrayRef<long>, c10::ArrayRef<long>, at::native::index_kernel_impl<at::native::OpaqueType<4> >(at::TensorIteratorBase&, c10::ArrayRef<long>, c10::ArrayRef<long>)::{lambda(char*, char const*, long)#1} const&, bool)::{lambda(int)#1}>(long, at::native::gpu_index_kernel<at::native::index_kernel_impl<at::native::OpaqueType<4> >(at::TensorIteratorBase&, c10::ArrayRef<long>, c10::ArrayRef<long>)::{lambda(char*, char const*, long)#1}>(at::TensorIteratorBase&, c10::ArrayRef<long>, c10::ArrayRef<long>, at::native::index_kernel_impl<at::native::OpaqueType<4> >(at::TensorIteratorBase&, c10::ArrayRef<long>, c10::ArrayRef<long>)::{lambda(char*, char const*, long)#1} const&, bool)::{lambda(int)#1})": 26,
+          "_gumbel_sample_kernel": 26,
+          "void at::native::reduce_kernel<512, 1, at::native::ReduceOp<float, at::native::ArgMaxOps<float>, unsigned int, long, 4, 4> >(at::native::ReduceOp<float, at::native::ArgMaxOps<float>, unsigned int, long, 4, 4>)": 26,
+          "void at::native::_scatter_gather_elementwise_kernel<256, 4, at::native::_cuda_scatter_gather_internal_kernel<false, at::native::OpaqueType<8>, long>::operator()<at::native::TensorAssign>(at::TensorIterator&, long, long, long, at::native::TensorAssign const&)::{lambda(int)#1}>(int, at::native::_cuda_scatter_gather_internal_kernel<false, at::native::OpaqueType<8>, long>::operator()<at::native::TensorAssign>(at::TensorIterator&, long, long, long, at::native::TensorAssign const&)::{lambda(int)#1})": 26,
+          "_get_num_sampled_and_rejected_kernel": 26,
+          "_post_update_kernel": 26,
+          "void paged_attention_kernel_bshd_opt<unsigned short, unsigned char, true, 128, 128, 64, 256, 16, 2, 8, 4, false, false, false, true, false>(unsigned short*, unsigned short*, unsigned short const*, unsigned char const*, unsigned char const*, int, int, int const*, int const*, int, float const*, int, int, int, int, unsigned short const*, int, Pa28WindowConfig, int)": 25,
+          "void paged_attention_combine<unsigned short, 128, 64>(unsigned short*, unsigned short*, int const*, int, int, int, int, int, int)": 25,
+          "Cijk_Alik_Bljk_BBH_MT64x32x32_SE_AMAS3_BW_DTL0_BL1_DRB16_ALT_KME0_ETSP_EPS1_FL0_GRVW4_GSU1_ISA936_IU1_KME_GRCMn2_K1_KLA_LDL1_LRVW4_MAC_MMAC_BW1_MMAC_KM0_MMAC_KME1_NBWB1_NLCA1_NLCB1_OLDSR1_PGR1_PLR1_RK0_SU32_SUM0_SUS256_SVW4_TT8_4_TLM0_ULDSWM0_USFGRO0_USSB0_VAW2_VSn1_VW4_WG8_8_1_WGM8": 25
+        },
+        "trace_hashes": {
+          "cache/profiles/m09r2n16_2405927.async_llm.1795087667246318435.pt.trace.json.gz": "3b7edea4478cea761d9f4ba8329cf0586238371ff347abb8e681393eee2af365",
+          "cache/profiles/rank0.1795087667323706564.pt.trace.json.gz": "2c9795969b4548be4752892bd1c6a0c05f848e1cdb94db5185bdbfd5cba70a6f"
+        },
+        "extension_reports": [
+          {
+            "entry_point_name": "das_hcu",
+            "extension_name": "das-hcu",
+            "status": "active",
+            "capabilities": [
+              "lightop-rms-norm"
+            ],
+            "reason": ""
+          },
+          {
+            "entry_point_name": "das_hcu_aiter_int8",
+            "extension_name": "das-hcu-aiter-int8",
+            "status": "failed",
+            "capabilities": [
+              "hcu-aiter-int8-moe"
+            ],
+            "reason": "activation failed: RuntimeError: INT8 ASM requires explicit hcu-aiter-int8-moe capability"
+          },
+          {
+            "entry_point_name": "das_hcu_ct_w4a8",
+            "extension_name": "das-hcu-ct-w4a8",
+            "status": "active",
+            "capabilities": [
+              "dsv41-ct-w4a8"
+            ],
+            "reason": ""
+          },
+          {
+            "entry_point_name": "das_hcu_dsv41",
+            "extension_name": "das-hcu-dsv41",
+            "status": "active",
+            "capabilities": [
+              "dsv41-channel-fp8-routing"
+            ],
+            "reason": ""
+          },
+          {
+            "entry_point_name": "das_hcu_flash",
+            "extension_name": "das-hcu-flash",
+            "status": "active",
+            "capabilities": [
+              "hcu-flash-attention"
+            ],
+            "reason": ""
+          },
+          {
+            "entry_point_name": "das_hcu_fp4_packer",
+            "extension_name": "das-hcu-fp4-packer",
+            "status": "failed",
+            "capabilities": [
+              "hcu-e2m1-packer-lowering"
+            ],
+            "reason": "activation failed: Fp4PackerCompatibilityError: FP4 lowering candidate requires real HCU gfx938"
+          },
+          {
+            "entry_point_name": "das_hcu_slimquant",
+            "extension_name": "das-hcu-slimquant",
+            "status": "failed",
+            "capabilities": [
+              "hcu-slimquant-w4a8"
+            ],
+            "reason": "activation failed: RuntimeError: SlimQuant requires explicit hcu-slimquant-w4a8 capability"
+          },
+          {
+            "entry_point_name": "das_hcu_step5_config",
+            "extension_name": "das-hcu-step5-config",
+            "status": "active",
+            "capabilities": [
+              "step5-standalone-mtp-config"
+            ],
+            "reason": ""
+          },
+          {
+            "entry_point_name": "das_hcu_v41_indexer",
+            "extension_name": "das-hcu-v41-indexer",
+            "status": "active",
+            "capabilities": [
+              "hcu-v41-fp8-indexer-eager-reference",
+              "hcu-v41-fp8-indexer-graph-break"
+            ],
+            "reason": ""
+          },
+          {
+            "entry_point_name": "das_hcu_v41_pcp",
+            "extension_name": "das-hcu-v41-pcp",
+            "status": "active",
+            "capabilities": [
+              "hcu-v41-private-engram-host",
+              "hcu-v41-pcp-eager-attention"
+            ],
+            "reason": ""
+          },
+          {
+            "entry_point_name": "minimax31_pcp_ep",
+            "extension_name": "minimax31_pcp_ep",
+            "status": "failed",
+            "capabilities": [
+              "minimax31-pcp-ep"
+            ],
+            "reason": "activation failed: RuntimeError: MiniMax PCP/EP requires an explicit extension request"
+          },
+          {
+            "entry_point_name": "minimax31_slimquant",
+            "extension_name": "minimax31_slimquant",
+            "status": "failed",
+            "capabilities": [
+              "minimax31-slimquant"
+            ],
+            "reason": "activation failed: RuntimeError: MiniMax SlimQuant requires an explicit extension request"
+          }
+        ],
+        "exit": {
+          "at": "2026-11-19T11:28:17.329058+00:00",
+          "returncode": 0,
+          "elapsed_s": 27.890729965176433,
+          "api_sigint": true,
+          "original_EngineCore_grace_s": 15
+        },
+        "native_leak_diagnostics": [
+          "nanobind: leaked 4 instances!",
+          "nanobind: leaked 70 types!",
+          "nanobind: leaked 558 functions!",
+          "nanobind: leaked 4 instances!",
+          "nanobind: leaked 69 types!",
+          "nanobind: leaked 556 functions!"
+        ],
+        "forced_or_timeout_log_lines": [
+          "(APIServer pid=2405927) WARNING 11-19 11:28:04 [utils.py:648] [shutdown] Process manager: force killing remaining processes count=1",
+          "(APIServer pid=2405927) WARNING 11-19 11:28:04 [utils.py:653] [shutdown] Process manager: force killing remaining process EngineCore pid 2407002"
+        ],
+        "terminal": {
+          "at": "2026-11-19T11:28:49.015088+00:00",
+          "arm": "candidate-e4m3",
+          "error": null,
+          "client_returncode": 0,
+          "service_returncode": 0,
+          "records_unchanged": true,
+          "checkpoint_unchanged": true,
+          "remaining_owned": [],
+          "KFD_pids": [],
+          "port_bindable": false,
+          "scoring_pending": true
+        },
+        "provenance": {
+          "launch.json": "5c967e804c60566719c4d2917b62af69dbba3095fbcdb067bf4a152c2b537940",
+          "terminal.json": "4740031215d6a7efc967f7e4952a144212a6598f104102d97aa7887bb1b12941",
+          "score.json": "3867bf7309e55f4efb8dbca1720fca9a23666779017ca8613be24bb418f4ed19",
+          "he32/protocol.json": "2ff7438e99c914b5b86bcdfb94fbd0f012a0502ba71d125059e6b3c8ba192735",
+          "he32/server-info.json": "d8b4ddb0a60c8c5de03f06c4286e0489b56a58c46d070922d3c5d69b8cac5992",
+          "he32/worker-before.json": "a7cf6cb86aab8ca2e73ee07f6c781dbac352ea937863e1fa46b7f247a241506e",
+          "he32/worker-after.json": "a7cf6cb86aab8ca2e73ee07f6c781dbac352ea937863e1fa46b7f247a241506e",
+          "he32/responses.jsonl": "46fa7b8b2da4d3526f3a658d81def7c81a877bc91ccd0b3a9f800341300c9c5c",
+          "he32/samples.jsonl": "ec1620dd77228bbac2f111a11e3e8b6b4323fbc642ebed58fb3c37f7816ae6a8",
+          "he32/functional-probe-status.json": "087e6bf797cf34483dc77a501435e708dc0003224ccdc3fdfc18d4956ef71020"
+        },
+        "original_resource_gate_passed": false,
+        "raw_failed_ids": [
+          "HumanEval/10",
+          "HumanEval/13",
+          "HumanEval/15",
+          "HumanEval/16",
+          "HumanEval/18",
+          "HumanEval/2",
+          "HumanEval/23",
+          "HumanEval/24",
+          "HumanEval/26",
+          "HumanEval/27",
+          "HumanEval/30",
+          "HumanEval/31"
+        ],
+        "normalized_failed_ids": [
+          "HumanEval/26"
+        ],
+        "completion_tokens_total": 4249,
+        "actual_device_binding": {
+          "at": "2026-11-19T11:26:14.247741+00:00",
+          "arm": "candidate-e4m3",
+          "worker_pid": 2407002,
+          "worker_startticks": "250007038",
+          "architecture_from_worker_RPC": "gfx936:sramecc+:xnack-",
+          "worker_versions": {
+            "vllm": "0.33.0+das.98a0985.dtk2610.torch2130.gfx936gfx938.r1.rocm72",
+            "hcu-adapter": "0.5.22+dtk2610.torch2130.2611191429.g8ba62c",
+            "sgl-kernel": "0.0.0+dtk2610.torch2130.2611191429.g8ba62c",
+            "hcu-vllm-das-plugin": "0.33.0",
+            "torch": "2.13.0+dtk2610.2611091606.ge8aa84"
+          },
+          "KFD": [
+            {
+              "host_KFD_pid": "3592502",
+              "vpid": "2407002",
+              "queues": [
+                {
+                  "queue": "5",
+                  "gpuid": "45786",
+                  "type": "0",
+                  "size": "1048576"
+                },
+                {
+                  "queue": "3",
+                  "gpuid": "45786",
+                  "type": "0",
+                  "size": "1048576"
+                },
+                {
+                  "queue": "1",
+                  "gpuid": "45786",
+                  "type": "0",
+                  "size": "1048576"
+                },
+                {
+                  "queue": "6",
+                  "gpuid": "45786",
+                  "type": "0",
+                  "size": "1048576"
+                },
+                {
+                  "queue": "4",
+                  "gpuid": "45786",
+                  "type": "1",
+                  "size": "1048576"
+                },
+                {
+                  "queue": "2",
+                  "gpuid": "45786",
+                  "type": "1",
+                  "size": "1048576"
+                },
+                {
+                  "queue": "0",
+                  "gpuid": "45786",
+                  "type": "0",
+                  "size": "4096"
+                }
+              ],
+              "VRAM_bytes": {
+                "vram_45786": 18768859136
+              }
+            }
+          ],
+          "topology": [
+            {
+              "node": "15",
+              "gpu_id": "45786",
+              "gfx_target_version": "90306",
+              "DRM_render_minor": "135",
+              "PCI_BDF": "0000:f5:00.0",
+              "device_sysfs": "/sys/devices/pci0000:f0/0000:f0:01.1/0000:f1:00.0/0000:f2:00.0/0000:f3:00.0/0000:f4:00.0/0000:f5:00.0",
+              "unique_id_decimal": "5836526207244449",
+              "unique_id_hex": "0x14bc4a274e18a1"
+            }
+          ],
+          "scope": "Worker RPC PID plus saved process identity and namespace-aware KFD vpid/active queue gpuid mapped to physical topology. No visibility ordinal inference. No model/precision/gfx836 qualification."
+        },
+        "actual_mapped_native_libraries": {
+          "at": "2026-11-19T11:26:42.443541+00:00",
+          "worker_pid": 2407002,
+          "startticks": "250007038",
+          "architecture_from_RPC": "gfx936:sramecc+:xnack-",
+          "maps_sha256": "443ef8d090043e90884956522a34d34693e45e1504b569626cc77789170cc6df",
+          "native_libraries": [
+            {
+              "path": "/data/models/plugin410-e2e-20261119-r722/env-candidate/lib/python3.12/site-packages/aiter/jit/module_aiter_enum.so",
+              "realpath": "/data/models/plugin410-e2e-20261119-r722/env-candidate/lib/python3.12/site-packages/aiter/jit/module_aiter_enum.so",
+              "bytes": 513800,
+              "sha256": "9249e7ec2416388d78a112faf5cd1bd61216ee5775a7bcd5b0a6be32d9ec8245",
+              "device": 66305,
+              "inode": 16258251
+            },
+            {
+              "path": "/data/models/plugin410-e2e-20261119-r722/env-candidate/lib/python3.12/site-packages/vllm/_C.abi3.so",
+              "realpath": "/data/models/plugin410-e2e-20261119-r722/env-candidate/lib/python3.12/site-packages/vllm/_C.abi3.so",
+              "bytes": 15790544,
+              "sha256": "1c2006683b98f80f2d19c394c8ec1fcc17ea19a9dd589f9f44f22c82c4b79a99",
+              "device": 66305,
+              "inode": 16259062
+            },
+            {
+              "path": "/data/models/plugin410-e2e-20261119-r722/env-candidate/lib/python3.12/site-packages/vllm/_C_stable_libtorch.abi3.so",
+              "realpath": "/data/models/plugin410-e2e-20261119-r722/env-candidate/lib/python3.12/site-packages/vllm/_C_stable_libtorch.abi3.so",
+              "bytes": 102551920,
+              "sha256": "8ff4c0ca5ac2ea03d945d6adea092426c1c4b82e1f5e621840311d19589e1818",
+              "device": 66305,
+              "inode": 16259063
+            },
+            {
+              "path": "/data/models/plugin410-e2e-20261119-r722/env-candidate/lib/python3.12/site-packages/vllm/_moe_C_stable_libtorch.abi3.so",
+              "realpath": "/data/models/plugin410-e2e-20261119-r722/env-candidate/lib/python3.12/site-packages/vllm/_moe_C_stable_libtorch.abi3.so",
+              "bytes": 59858136,
+              "sha256": "09b661bdf1bb5b135e1668d7ff9fec21449854d1cdf2142494bd090f48c07cd7",
+              "device": 66305,
+              "inode": 16259067
+            },
+            {
+              "path": "/data/models/plugin410-e2e-20261119-r722/env-candidate/lib/python3.12/site-packages/vllm/_rocm_C.abi3.so",
+              "realpath": "/data/models/plugin410-e2e-20261119-r722/env-candidate/lib/python3.12/site-packages/vllm/_rocm_C.abi3.so",
+              "bytes": 37513848,
+              "sha256": "ac9b3bddb3ea176316012cefd119773e6d68dba05435de45696e6dbc7d833585",
+              "device": 66305,
+              "inode": 16259068
+            },
+            {
+              "path": "/usr/local/lib/python3.12/site-packages/flash_attn/lib/libflash_attention.so",
+              "realpath": "/usr/local/lib/python3.12/site-packages/flash_attn/lib/libflash_attention.so",
+              "bytes": 1673065,
+              "sha256": "f7b375a65b1471589d14faa6777a9d2637696aab8787f007efa47b635533f828",
+              "device": 75,
+              "inode": 13501828
+            },
+            {
+              "path": "/usr/local/lib/python3.12/site-packages/flash_attn/lib/libflash_attention_c.so",
+              "realpath": "/usr/local/lib/python3.12/site-packages/flash_attn/lib/libflash_attention_c.so",
+              "bytes": 1345698872,
+              "sha256": "501d8f85dfcf4f7b92fa1ee13d8afdcdd3e3b7c6eabbca1241c55e2e0650aa54",
+              "device": 75,
+              "inode": 13501829
+            },
+            {
+              "path": "/usr/local/lib/python3.12/site-packages/flash_attn_2_cuda.cpython-312-x86_64-linux-gnu.so",
+              "realpath": "/usr/local/lib/python3.12/site-packages/flash_attn_2_cuda.cpython-312-x86_64-linux-gnu.so",
+              "bytes": 813606024,
+              "sha256": "95f426878a2eb642b03a11701015ccb6d3b3a7823f2e302152a4a806f008ef24",
+              "device": 75,
+              "inode": 13380727
+            },
+            {
+              "path": "/usr/local/lib/python3.12/site-packages/lightop/op.cpython-312-x86_64-linux-gnu.so",
+              "realpath": "/usr/local/lib/python3.12/site-packages/lightop/op.cpython-312-x86_64-linux-gnu.so",
+              "bytes": 1069051105,
+              "sha256": "c8e62d33a7809c9e342f1be0068d733e4a361f697acbe0a1a0b03d88a3190991",
+              "device": 75,
+              "inode": 13503204
+            }
+          ],
+          "same_native_bytes_as_BF16": true,
+          "scope": "Actual mapped Core/provider binaries with stable file identity; read-only observation. Loaded DSO alone does not prove execution; pair with worker/trace evidence."
+        }
+      },
+      "candidate-e5m2": {
+        "backend": "FLASH_ATTN",
+        "kv_dtype": "fp8_e5m2",
+        "architecture": "gfx936:sramecc+:xnack-",
+        "worker_pid": 2420258,
+        "counts": {
+          "raw": 21,
+          "normalized": 29
+        },
+        "raw_pass_ids": [
+          "HumanEval/0",
+          "HumanEval/1",
+          "HumanEval/2",
+          "HumanEval/3",
+          "HumanEval/4",
+          "HumanEval/5",
+          "HumanEval/6",
+          "HumanEval/7",
+          "HumanEval/8",
+          "HumanEval/9",
+          "HumanEval/11",
+          "HumanEval/12",
+          "HumanEval/14",
+          "HumanEval/17",
+          "HumanEval/18",
+          "HumanEval/20",
+          "HumanEval/21",
+          "HumanEval/22",
+          "HumanEval/25",
+          "HumanEval/28",
+          "HumanEval/29"
+        ],
+        "normalized_pass_ids": [
+          "HumanEval/0",
+          "HumanEval/1",
+          "HumanEval/2",
+          "HumanEval/3",
+          "HumanEval/4",
+          "HumanEval/5",
+          "HumanEval/6",
+          "HumanEval/7",
+          "HumanEval/8",
+          "HumanEval/9",
+          "HumanEval/10",
+          "HumanEval/11",
+          "HumanEval/12",
+          "HumanEval/13",
+          "HumanEval/14",
+          "HumanEval/16",
+          "HumanEval/17",
+          "HumanEval/18",
+          "HumanEval/20",
+          "HumanEval/21",
+          "HumanEval/22",
+          "HumanEval/23",
+          "HumanEval/24",
+          "HumanEval/25",
+          "HumanEval/27",
+          "HumanEval/28",
+          "HumanEval/29",
+          "HumanEval/30",
+          "HumanEval/31"
+        ],
+        "finish_reasons": {
+          "stop": 32
+        },
+        "completion_tokens": [
+          160,
+          202,
+          23,
+          49,
+          151,
+          126,
+          194,
+          101,
+          142,
+          153,
+          186,
+          148,
+          145,
+          83,
+          75,
+          28,
+          76,
+          227,
+          174,
+          199,
+          247,
+          155,
+          101,
+          47,
+          101,
+          180,
+          114,
+          53,
+          58,
+          95,
+          36,
+          208
+        ],
+        "functional_probes": {
+          "passed": true,
+          "failures": [],
+          "continued_for_scoring": true
+        },
+        "prefix_hit_delta": 3840.0,
+        "actual_impls": {
+          "hcu_vllm_das.attention.flash_attn.HcuFlashAttentionImpl": 36
+        },
+        "physical_cache_dtypes": [
+          "torch.uint8"
+        ],
+        "cache_resolution": {
+          "num_blocks": 227,
+          "hash_block_size": 64,
+          "prefix_cache_retention_interval": 0,
+          "kv_cache_layout": "LBHNC"
+        },
+        "graph_config": [
+          2,
+          1
+        ],
+        "graph_events": {
+          "execute_context_1(18)_generation_0(0)": 2,
+          "execute_context_0(0)_generation_1(1)": 50,
+          "execute_context_0(0)_generation_0(0)": 1,
+          "hipGraphLaunch": 62
+        },
+        "native_kernel_events": {
+          "_apply_write_kernel": 4,
+          "void at::native::vectorized_elementwise_kernel<16, at::native::FillFunctor<bool>, std::array<char*, 1ul> >(int, at::native::FillFunctor<bool>, std::array<char*, 1ul>)": 26,
+          "void at::native::vectorized_elementwise_kernel<2, at::native::FillFunctor<bool>, std::array<char*, 1ul> >(int, at::native::FillFunctor<bool>, std::array<char*, 1ul>)": 1,
+          "void (anonymous namespace)::elementwise_kernel_with_index_grid_stride<int, at::native::arange_cuda_out(c10::Scalar const&, c10::Scalar const&, c10::Scalar const&, at::Tensor&)::{lambda()#1}::operator()() const::{lambda()#3}::operator()() const::{lambda(long)#1}>(int, at::native::arange_cuda_out(c10::Scalar const&, c10::Scalar const&, c10::Scalar const&, at::Tensor&)::{lambda()#1}::operator()() const::{lambda()#3}::operator()() const::{lambda(long)#1}, function_traits<at::native::arange_cuda_out(c10::Scalar const&, c10::Scalar const&, c10::Scalar const&, at::Tensor&)::{lambda()#1}::operator()() const::{lambda()#3}::operator()() const::{lambda(long)#1}>::result_type*)": 26,
+          "void at::native::vectorized_elementwise_kernel<4, at::native::FillFunctor<int>, std::array<char*, 1ul> >(int, at::native::FillFunctor<int>, std::array<char*, 1ul>)": 52,
+          "_prepare_prefill_inputs_kernel": 1,
+          "_prepare_pos_seq_lens_kernel": 26,
+          "_combine_sampled_and_draft_tokens_kernel": 26,
+          "_gather_block_tables_kernel": 26,
+          "_compute_slot_mappings_kernel": 26,
+          "triton_red_fused__to_copy_embedding_rms_norm_0": 26,
+          "Cijk_Alik_Bljk_BBH_MT32x32x128_SE_AMAS3_BW_DTL0_BL1_DRB16_ALT_KME0_ETSP_EPS1_FL0_GRVW4_GSU1_ISA936_IU1_KME_GRCMn1_K1_KLA_LDL1_LRVW4_MAC_MMAC_BW1_MMAC_KM0_MMAC_KME1_NBWB1_NLCA1_NLCB1_OLDSR0_PGR1_PLR1_RK1_SU0_SUM0_SUS256_SVW4_TT4_4_TLM0_ULDSWM0_USFGRO0_USSB0_VAW2_VSn1_VW4_WG8_8_1_WGM1": 1,
+          "triton_red_fused_1": 26,
+          "_reshape_and_cache_e5m2_kernel": 61,
+          "_scale_rows": 122,
+          "void at::native::elementwise_kernel_manual_unroll<128, 4, at::native::gpu_kernel_impl<at::native::direct_copy_kernel_cuda(at::TensorIteratorBase&)::{lambda()#3}::operator()() const::{lambda()#4}::operator()() const::{lambda(long)#1}>(at::TensorIteratorBase&, at::native::direct_copy_kernel_cuda(at::TensorIteratorBase&)::{lambda()#3}::operator()() const::{lambda()#4}::operator()() const::{lambda(long)#1} const&)::{lambda(int, bool)#1}>(int, at::native::gpu_kernel_impl<at::native::direct_copy_kernel_cuda(at::TensorIteratorBase&)::{lambda()#3}::operator()() const::{lambda()#4}::operator()() const::{lambda(long)#1}>(at::TensorIteratorBase&, at::native::direct_copy_kernel_cuda(at::TensorIteratorBase&)::{lambda()#3}::operator()() const::{lambda()#4}::operator()() const::{lambda(long)#1} const&)::{lambda(int, bool)#1})": 36,
+          "void at::native::reduce_kernel<512, 1, at::native::ReduceOp<long, at::native::func_wrapper_t<long, at::native::sum_functor<long, long, long>::operator()(at::TensorIterator&)::{lambda(long, long)#1}>, unsigned int, long, 4, 4> >(at::native::ReduceOp<long, at::native::func_wrapper_t<long, at::native::sum_functor<long, long, long>::operator()(at::TensorIterator&)::{lambda(long, long)#1}>, unsigned int, long, 4, 4>)": 36,
+          "void at::native::vectorized_elementwise_kernel<4, at::native::compare_scalar_kernel<long>(at::TensorIteratorBase&, at::native::(anonymous namespace)::OpType, long)::{lambda(long)#1}, std::array<char*, 2ul> >(int, at::native::compare_scalar_kernel<long>(at::TensorIteratorBase&, at::native::(anonymous namespace)::OpType, long)::{lambda(long)#1}, std::array<char*, 2ul>)": 36,
+          "void at::native::vectorized_elementwise_kernel<8, at::native::FillFunctor<c10::BFloat16>, std::array<char*, 1ul> >(int, at::native::FillFunctor<c10::BFloat16>, std::array<char*, 1ul>)": 72,
+          "void pagedkv_to_contiguouskv_kernel<unsigned short, unsigned char, false, 256>(unsigned short*, unsigned short*, unsigned char*, unsigned char*, int*, int*, int*, int, int, int, int, int, int, int, int, int, int, int, int)": 36,
+          "void flash_fwd_kernel_16x64_prefetch<Flash_fwd_kernel_16x64_prefetch_traits<128, 64, 64, 4, hytlass::bfloat16_t, 3, false, false, 128, Flash_kernel_traits<128, 64, 64, 4, hytlass::bfloat16_t> >, false, true, false, false, false, true, false, false>(Flash_fwd_params)": 36,
+          "Cijk_Alik_Bljk_BBH_MT64x32x128_SE_AMAS3_BW_DTL0_BL1_DRB16_ALT_KME0_ETSP_EPS1_FL0_GRVW4_GSU1_ISA936_IU1_KME_GRCMn1_K1_KLA_LDL1_LRVW4_MAC_MMAC_BW1_MMAC_KM0_MMAC_KME1_NBWB1_NLCA1_NLCB1_OLDSR0_PGR1_PLR1_RK1_SU0_SUM0_SUS256_SVW4_TT8_4_TLM0_ULDSWM0_USFGRO0_USSB0_VAW2_VSn1_VW4_WG8_8_1_WGM1": 36,
+          "triton_red_fused_fused_add_rms_norm_0": 61,
+          "Cijk_Alik_Bljk_BBH_MT32x16x256_SE_AMAS3_BW_DTL0_BL1_DRB16_ALT_KME0_ETSP_EPS1_FL0_GRVW2_GSU1_ISA936_IU1_KME_GRCMn1_K1_KLA_LDL1_LRVW2_MAC_MMAC_BW1_MMAC_KM0_MMAC_KME1_NBWB1_NLCA1_NLCB1_OLDSR0_PGR1_PLR1_RK1_SU0_SUM0_SUS1024_SVW4_TT4_2_TLM0_ULDSWM0_USFGRO0_USSB0_VAW2_VSn1_VW2_WG8_8_1_WGM1": 36,
+          "triton_poi_fused_mul_silu_slice_1": 52,
+          "void at::native::index_elementwise_kernel<128, 4, at::native::gpu_index_kernel<at::native::index_kernel_impl<at::native::OpaqueType<2> >(at::TensorIteratorBase&, c10::ArrayRef<long>, c10::ArrayRef<long>)::{lambda(char*, char const*, long)#1}>(at::TensorIteratorBase&, c10::ArrayRef<long>, c10::ArrayRef<long>, at::native::index_kernel_impl<at::native::OpaqueType<2> >(at::TensorIteratorBase&, c10::ArrayRef<long>, c10::ArrayRef<long>)::{lambda(char*, char const*, long)#1} const&, bool)::{lambda(int)#1}>(long, at::native::gpu_index_kernel<at::native::index_kernel_impl<at::native::OpaqueType<2> >(at::TensorIteratorBase&, c10::ArrayRef<long>, c10::ArrayRef<long>)::{lambda(char*, char const*, long)#1}>(at::TensorIteratorBase&, c10::ArrayRef<long>, c10::ArrayRef<long>, at::native::index_kernel_impl<at::native::OpaqueType<2> >(at::TensorIteratorBase&, c10::ArrayRef<long>, c10::ArrayRef<long>)::{lambda(char*, char const*, long)#1} const&, bool)::{lambda(int)#1})": 26,
+          "Cijk_Alik_Bljk_BBH_MT32x16x4_SE_AMAS3_BW_DTL0_BL1_DRB16_ALT_KME0_ETSP_EPS1_FL0_GRVW2_GSU1_ISA936_IU1_KME_GRCMn1_K1_KLA_LDL1_LRVW2_MAC_MMAC_BW1_MMAC_KM0_MMAC_KME1_NBWB1_NLCA1_NLCB1_OLDSR0_PGR1_PLR1_RK1_SU0_SUM0_SUS256_SVW4_TT4_2_TLM0_ULDSWM0_USFGRO0_USSB0_VAW2_VSn1_VW2_WG8_8_1_WGM1": 76,
+          "void at::native::index_elementwise_kernel<128, 4, at::native::gpu_index_kernel<at::native::index_kernel_impl<at::native::OpaqueType<8> >(at::TensorIteratorBase&, c10::ArrayRef<long>, c10::ArrayRef<long>)::{lambda(char*, char const*, long)#1}>(at::TensorIteratorBase&, c10::ArrayRef<long>, c10::ArrayRef<long>, at::native::index_kernel_impl<at::native::OpaqueType<8> >(at::TensorIteratorBase&, c10::ArrayRef<long>, c10::ArrayRef<long>)::{lambda(char*, char const*, long)#1} const&, bool)::{lambda(int)#1}>(long, at::native::gpu_index_kernel<at::native::index_kernel_impl<at::native::OpaqueType<8> >(at::TensorIteratorBase&, c10::ArrayRef<long>, c10::ArrayRef<long>)::{lambda(char*, char const*, long)#1}>(at::TensorIteratorBase&, c10::ArrayRef<long>, c10::ArrayRef<long>, at::native::index_kernel_impl<at::native::OpaqueType<8> >(at::TensorIteratorBase&, c10::ArrayRef<long>, c10::ArrayRef<long>)::{lambda(char*, char const*, long)#1} const&, bool)::{lambda(int)#1})": 26,
+          "void at::native::index_elementwise_kernel<128, 4, at::native::gpu_index_kernel<at::native::index_kernel_impl<at::native::OpaqueType<4> >(at::TensorIteratorBase&, c10::ArrayRef<long>, c10::ArrayRef<long>)::{lambda(char*, char const*, long)#1}>(at::TensorIteratorBase&, c10::ArrayRef<long>, c10::ArrayRef<long>, at::native::index_kernel_impl<at::native::OpaqueType<4> >(at::TensorIteratorBase&, c10::ArrayRef<long>, c10::ArrayRef<long>)::{lambda(char*, char const*, long)#1} const&, bool)::{lambda(int)#1}>(long, at::native::gpu_index_kernel<at::native::index_kernel_impl<at::native::OpaqueType<4> >(at::TensorIteratorBase&, c10::ArrayRef<long>, c10::ArrayRef<long>)::{lambda(char*, char const*, long)#1}>(at::TensorIteratorBase&, c10::ArrayRef<long>, c10::ArrayRef<long>, at::native::index_kernel_impl<at::native::OpaqueType<4> >(at::TensorIteratorBase&, c10::ArrayRef<long>, c10::ArrayRef<long>)::{lambda(char*, char const*, long)#1} const&, bool)::{lambda(int)#1})": 26,
+          "_gumbel_sample_kernel": 26,
+          "void at::native::reduce_kernel<512, 1, at::native::ReduceOp<float, at::native::ArgMaxOps<float>, unsigned int, long, 4, 4> >(at::native::ReduceOp<float, at::native::ArgMaxOps<float>, unsigned int, long, 4, 4>)": 26,
+          "void at::native::_scatter_gather_elementwise_kernel<256, 4, at::native::_cuda_scatter_gather_internal_kernel<false, at::native::OpaqueType<8>, long>::operator()<at::native::TensorAssign>(at::TensorIterator&, long, long, long, at::native::TensorAssign const&)::{lambda(int)#1}>(int, at::native::_cuda_scatter_gather_internal_kernel<false, at::native::OpaqueType<8>, long>::operator()<at::native::TensorAssign>(at::TensorIterator&, long, long, long, at::native::TensorAssign const&)::{lambda(int)#1})": 26,
+          "_get_num_sampled_and_rejected_kernel": 26,
+          "_post_update_kernel": 26,
+          "void paged_attention_kernel_bshd_opt<unsigned short, unsigned char, false, 128, 128, 64, 256, 16, 2, 8, 4, false, false, false, true, false>(unsigned short*, unsigned short*, unsigned short const*, unsigned char const*, unsigned char const*, int, int, int const*, int const*, int, float const*, int, int, int, int, unsigned short const*, int, Pa28WindowConfig, int)": 25,
+          "void paged_attention_combine<unsigned short, 128, 64>(unsigned short*, unsigned short*, int const*, int, int, int, int, int, int)": 25,
+          "Cijk_Alik_Bljk_BBH_MT64x32x32_SE_AMAS3_BW_DTL0_BL1_DRB16_ALT_KME0_ETSP_EPS1_FL0_GRVW4_GSU1_ISA936_IU1_KME_GRCMn2_K1_KLA_LDL1_LRVW4_MAC_MMAC_BW1_MMAC_KM0_MMAC_KME1_NBWB1_NLCA1_NLCB1_OLDSR1_PGR1_PLR1_RK0_SU32_SUM0_SUS256_SVW4_TT8_4_TLM0_ULDSWM0_USFGRO0_USSB0_VAW2_VSn1_VW4_WG8_8_1_WGM8": 25
+        },
+        "trace_hashes": {
+          "cache/profiles/m09r2n16_2419189.async_llm.1795088446595350908.pt.trace.json.gz": "3a6dc39bafc77bdb310ed1b496af4b25df1ec2494ef46ac713772e0f6f8b7d0a",
+          "cache/profiles/rank0.1795088446650470716.pt.trace.json.gz": "5764424e750443188a363e975ca2860e9a84a1de44d48536678339924c702717"
+        },
+        "extension_reports": [
+          {
+            "entry_point_name": "das_hcu",
+            "extension_name": "das-hcu",
+            "status": "active",
+            "capabilities": [
+              "lightop-rms-norm"
+            ],
+            "reason": ""
+          },
+          {
+            "entry_point_name": "das_hcu_aiter_int8",
+            "extension_name": "das-hcu-aiter-int8",
+            "status": "failed",
+            "capabilities": [
+              "hcu-aiter-int8-moe"
+            ],
+            "reason": "activation failed: RuntimeError: INT8 ASM requires explicit hcu-aiter-int8-moe capability"
+          },
+          {
+            "entry_point_name": "das_hcu_ct_w4a8",
+            "extension_name": "das-hcu-ct-w4a8",
+            "status": "active",
+            "capabilities": [
+              "dsv41-ct-w4a8"
+            ],
+            "reason": ""
+          },
+          {
+            "entry_point_name": "das_hcu_dsv41",
+            "extension_name": "das-hcu-dsv41",
+            "status": "active",
+            "capabilities": [
+              "dsv41-channel-fp8-routing"
+            ],
+            "reason": ""
+          },
+          {
+            "entry_point_name": "das_hcu_flash",
+            "extension_name": "das-hcu-flash",
+            "status": "active",
+            "capabilities": [
+              "hcu-flash-attention"
+            ],
+            "reason": ""
+          },
+          {
+            "entry_point_name": "das_hcu_fp4_packer",
+            "extension_name": "das-hcu-fp4-packer",
+            "status": "failed",
+            "capabilities": [
+              "hcu-e2m1-packer-lowering"
+            ],
+            "reason": "activation failed: Fp4PackerCompatibilityError: FP4 lowering candidate requires real HCU gfx938"
+          },
+          {
+            "entry_point_name": "das_hcu_slimquant",
+            "extension_name": "das-hcu-slimquant",
+            "status": "failed",
+            "capabilities": [
+              "hcu-slimquant-w4a8"
+            ],
+            "reason": "activation failed: RuntimeError: SlimQuant requires explicit hcu-slimquant-w4a8 capability"
+          },
+          {
+            "entry_point_name": "das_hcu_step5_config",
+            "extension_name": "das-hcu-step5-config",
+            "status": "active",
+            "capabilities": [
+              "step5-standalone-mtp-config"
+            ],
+            "reason": ""
+          },
+          {
+            "entry_point_name": "das_hcu_v41_indexer",
+            "extension_name": "das-hcu-v41-indexer",
+            "status": "active",
+            "capabilities": [
+              "hcu-v41-fp8-indexer-graph-break",
+              "hcu-v41-fp8-indexer-eager-reference"
+            ],
+            "reason": ""
+          },
+          {
+            "entry_point_name": "das_hcu_v41_pcp",
+            "extension_name": "das-hcu-v41-pcp",
+            "status": "active",
+            "capabilities": [
+              "hcu-v41-private-engram-host",
+              "hcu-v41-pcp-eager-attention"
+            ],
+            "reason": ""
+          },
+          {
+            "entry_point_name": "minimax31_pcp_ep",
+            "extension_name": "minimax31_pcp_ep",
+            "status": "failed",
+            "capabilities": [
+              "minimax31-pcp-ep"
+            ],
+            "reason": "activation failed: RuntimeError: MiniMax PCP/EP requires an explicit extension request"
+          },
+          {
+            "entry_point_name": "minimax31_slimquant",
+            "extension_name": "minimax31_slimquant",
+            "status": "failed",
+            "capabilities": [
+              "minimax31-slimquant"
+            ],
+            "reason": "activation failed: RuntimeError: MiniMax SlimQuant requires an explicit extension request"
+          }
+        ],
+        "exit": {
+          "at": "2026-11-19T11:41:12.998082+00:00",
+          "returncode": 0,
+          "elapsed_s": 24.907116817310452,
+          "api_sigint": true,
+          "original_EngineCore_grace_s": 15
+        },
+        "native_leak_diagnostics": [
+          "nanobind: leaked 4 instances!",
+          "nanobind: leaked 70 types!",
+          "nanobind: leaked 558 functions!",
+          "nanobind: leaked 4 instances!",
+          "nanobind: leaked 69 types!",
+          "nanobind: leaked 556 functions!"
+        ],
+        "forced_or_timeout_log_lines": [],
+        "terminal": {
+          "at": "2026-11-19T11:41:44.559879+00:00",
+          "arm": "candidate-e5m2",
+          "error": null,
+          "client_returncode": 0,
+          "service_returncode": 0,
+          "records_unchanged": true,
+          "checkpoint_unchanged": true,
+          "remaining_owned": [],
+          "KFD_pids": [],
+          "port_bindable": false,
+          "scoring_pending": true
+        },
+        "provenance": {
+          "launch.json": "7da556545732fd2b08851cf5e8e1a961d0623d8afbee8347afda17469431bb3b",
+          "terminal.json": "cf65f405d6587505a7b3a9786d45a42c18a35848877415040f0ea4dfb9deb3d4",
+          "score.json": "a2c5e9f96d5cfec444617625fa656b9d52f0d4b22b124db033d0d6bb0bbb3040",
+          "he32/protocol.json": "2ff7438e99c914b5b86bcdfb94fbd0f012a0502ba71d125059e6b3c8ba192735",
+          "he32/server-info.json": "2f0daa7f3ad57c09234f26382eb32b45a9a483cd0cd297a17cc1b1342a5093cb",
+          "he32/worker-before.json": "476e0f694611cd5847f2537f7ee33b68effe071739440726588d4fa18d7e634b",
+          "he32/worker-after.json": "476e0f694611cd5847f2537f7ee33b68effe071739440726588d4fa18d7e634b",
+          "he32/responses.jsonl": "9f77a254989cd9b2306de67fb7ccc782fa28a92da893eb12a85f4afacd1f6be7",
+          "he32/samples.jsonl": "3d08228d694de32f1b82fb4b066d2de3a7da6cfb198106dfe2c29528ee3427e2",
+          "he32/functional-probe-status.json": "087e6bf797cf34483dc77a501435e708dc0003224ccdc3fdfc18d4956ef71020"
+        },
+        "original_resource_gate_passed": false,
+        "raw_failed_ids": [
+          "HumanEval/10",
+          "HumanEval/13",
+          "HumanEval/15",
+          "HumanEval/16",
+          "HumanEval/19",
+          "HumanEval/23",
+          "HumanEval/24",
+          "HumanEval/26",
+          "HumanEval/27",
+          "HumanEval/30",
+          "HumanEval/31"
+        ],
+        "normalized_failed_ids": [
+          "HumanEval/15",
+          "HumanEval/19",
+          "HumanEval/26"
+        ],
+        "completion_tokens_total": 4037,
+        "actual_device_binding": {
+          "at": "2026-11-19T11:39:22.955243+00:00",
+          "arm": "candidate-e5m2",
+          "worker_pid": 2420258,
+          "worker_startticks": "250086106",
+          "architecture_from_worker_RPC": "gfx936:sramecc+:xnack-",
+          "worker_versions": {
+            "vllm": "0.33.0+das.98a0985.dtk2610.torch2130.gfx936gfx938.r1.rocm72",
+            "hcu-adapter": "0.5.22+dtk2610.torch2130.2611191429.g8ba62c",
+            "sgl-kernel": "0.0.0+dtk2610.torch2130.2611191429.g8ba62c",
+            "hcu-vllm-das-plugin": "0.33.0",
+            "torch": "2.13.0+dtk2610.2611091606.ge8aa84"
+          },
+          "KFD": [
+            {
+              "host_KFD_pid": "3660435",
+              "vpid": "2420258",
+              "queues": [
+                {
+                  "queue": "5",
+                  "gpuid": "45786",
+                  "type": "0",
+                  "size": "1048576"
+                },
+                {
+                  "queue": "3",
+                  "gpuid": "45786",
+                  "type": "0",
+                  "size": "1048576"
+                },
+                {
+                  "queue": "1",
+                  "gpuid": "45786",
+                  "type": "0",
+                  "size": "1048576"
+                },
+                {
+                  "queue": "6",
+                  "gpuid": "45786",
+                  "type": "0",
+                  "size": "1048576"
+                },
+                {
+                  "queue": "4",
+                  "gpuid": "45786",
+                  "type": "1",
+                  "size": "1048576"
+                },
+                {
+                  "queue": "2",
+                  "gpuid": "45786",
+                  "type": "1",
+                  "size": "1048576"
+                },
+                {
+                  "queue": "0",
+                  "gpuid": "45786",
+                  "type": "0",
+                  "size": "4096"
+                }
+              ],
+              "VRAM_bytes": {
+                "vram_45786": 19779411968
+              }
+            }
+          ],
+          "topology": [
+            {
+              "node": "15",
+              "gpu_id": "45786",
+              "gfx_target_version": "90306",
+              "DRM_render_minor": "135",
+              "PCI_BDF": "0000:f5:00.0",
+              "device_sysfs": "/sys/devices/pci0000:f0/0000:f0:01.1/0000:f1:00.0/0000:f2:00.0/0000:f3:00.0/0000:f4:00.0/0000:f5:00.0",
+              "unique_id_decimal": "5836526207244449",
+              "unique_id_hex": "0x14bc4a274e18a1"
+            }
+          ],
+          "scope": "Worker RPC PID plus saved process identity and namespace-aware KFD vpid/active queue gpuid mapped to physical topology. No visibility ordinal inference. No model/precision/gfx836 qualification."
+        },
+        "actual_mapped_native_libraries": {
+          "at": "2026-11-19T11:39:35.958598+00:00",
+          "worker_pid": 2420258,
+          "startticks": "250086106",
+          "architecture_from_RPC": "gfx936:sramecc+:xnack-",
+          "maps_sha256": "b2902b86e40e3016766748cfc53bd9f1fb676c4198fce67a86a6fba3152ad52f",
+          "native_libraries": [
+            {
+              "path": "/data/models/plugin410-e2e-20261119-r722/env-candidate/lib/python3.12/site-packages/aiter/jit/module_aiter_enum.so",
+              "realpath": "/data/models/plugin410-e2e-20261119-r722/env-candidate/lib/python3.12/site-packages/aiter/jit/module_aiter_enum.so",
+              "bytes": 513800,
+              "sha256": "9249e7ec2416388d78a112faf5cd1bd61216ee5775a7bcd5b0a6be32d9ec8245",
+              "device": 66305,
+              "inode": 16258251
+            },
+            {
+              "path": "/data/models/plugin410-e2e-20261119-r722/env-candidate/lib/python3.12/site-packages/vllm/_C.abi3.so",
+              "realpath": "/data/models/plugin410-e2e-20261119-r722/env-candidate/lib/python3.12/site-packages/vllm/_C.abi3.so",
+              "bytes": 15790544,
+              "sha256": "1c2006683b98f80f2d19c394c8ec1fcc17ea19a9dd589f9f44f22c82c4b79a99",
+              "device": 66305,
+              "inode": 16259062
+            },
+            {
+              "path": "/data/models/plugin410-e2e-20261119-r722/env-candidate/lib/python3.12/site-packages/vllm/_C_stable_libtorch.abi3.so",
+              "realpath": "/data/models/plugin410-e2e-20261119-r722/env-candidate/lib/python3.12/site-packages/vllm/_C_stable_libtorch.abi3.so",
+              "bytes": 102551920,
+              "sha256": "8ff4c0ca5ac2ea03d945d6adea092426c1c4b82e1f5e621840311d19589e1818",
+              "device": 66305,
+              "inode": 16259063
+            },
+            {
+              "path": "/data/models/plugin410-e2e-20261119-r722/env-candidate/lib/python3.12/site-packages/vllm/_moe_C_stable_libtorch.abi3.so",
+              "realpath": "/data/models/plugin410-e2e-20261119-r722/env-candidate/lib/python3.12/site-packages/vllm/_moe_C_stable_libtorch.abi3.so",
+              "bytes": 59858136,
+              "sha256": "09b661bdf1bb5b135e1668d7ff9fec21449854d1cdf2142494bd090f48c07cd7",
+              "device": 66305,
+              "inode": 16259067
+            },
+            {
+              "path": "/data/models/plugin410-e2e-20261119-r722/env-candidate/lib/python3.12/site-packages/vllm/_rocm_C.abi3.so",
+              "realpath": "/data/models/plugin410-e2e-20261119-r722/env-candidate/lib/python3.12/site-packages/vllm/_rocm_C.abi3.so",
+              "bytes": 37513848,
+              "sha256": "ac9b3bddb3ea176316012cefd119773e6d68dba05435de45696e6dbc7d833585",
+              "device": 66305,
+              "inode": 16259068
+            },
+            {
+              "path": "/usr/local/lib/python3.12/site-packages/flash_attn/lib/libflash_attention.so",
+              "realpath": "/usr/local/lib/python3.12/site-packages/flash_attn/lib/libflash_attention.so",
+              "bytes": 1673065,
+              "sha256": "f7b375a65b1471589d14faa6777a9d2637696aab8787f007efa47b635533f828",
+              "device": 75,
+              "inode": 13501828
+            },
+            {
+              "path": "/usr/local/lib/python3.12/site-packages/flash_attn/lib/libflash_attention_c.so",
+              "realpath": "/usr/local/lib/python3.12/site-packages/flash_attn/lib/libflash_attention_c.so",
+              "bytes": 1345698872,
+              "sha256": "501d8f85dfcf4f7b92fa1ee13d8afdcdd3e3b7c6eabbca1241c55e2e0650aa54",
+              "device": 75,
+              "inode": 13501829
+            },
+            {
+              "path": "/usr/local/lib/python3.12/site-packages/flash_attn_2_cuda.cpython-312-x86_64-linux-gnu.so",
+              "realpath": "/usr/local/lib/python3.12/site-packages/flash_attn_2_cuda.cpython-312-x86_64-linux-gnu.so",
+              "bytes": 813606024,
+              "sha256": "95f426878a2eb642b03a11701015ccb6d3b3a7823f2e302152a4a806f008ef24",
+              "device": 75,
+              "inode": 13380727
+            },
+            {
+              "path": "/usr/local/lib/python3.12/site-packages/lightop/op.cpython-312-x86_64-linux-gnu.so",
+              "realpath": "/usr/local/lib/python3.12/site-packages/lightop/op.cpython-312-x86_64-linux-gnu.so",
+              "bytes": 1069051105,
+              "sha256": "c8e62d33a7809c9e342f1be0068d733e4a361f697acbe0a1a0b03d88a3190991",
+              "device": 75,
+              "inode": 13503204
+            }
+          ],
+          "same_native_bytes_as_BF16": true,
+          "scope": "Actual mapped Core/provider binaries with stable file identity; read-only observation. Loaded DSO alone does not prove execution; pair with worker/trace evidence."
+        }
+      }
+    },
+    "comparisons_to_official": {
+      "candidate-bf16": {
+        "raw": {
+          "lost": [],
+          "gained": []
+        },
+        "normalized": {
+          "lost": [
+            "HumanEval/18"
+          ],
+          "gained": []
+        },
+        "message_differences": [
+          "HumanEval/12",
+          "HumanEval/18"
+        ]
+      },
+      "candidate-e4m3": {
+        "raw": {
+          "lost": [],
+          "gained": []
+        },
+        "normalized": {
+          "lost": [],
+          "gained": []
+        },
+        "message_differences": [
+          "HumanEval/1",
+          "HumanEval/5",
+          "HumanEval/12",
+          "HumanEval/15",
+          "HumanEval/17",
+          "HumanEval/18",
+          "HumanEval/25",
+          "HumanEval/31"
+        ]
+      },
+      "candidate-e5m2": {
+        "raw": {
+          "lost": [
+            "HumanEval/19"
+          ],
+          "gained": [
+            "HumanEval/18",
+            "HumanEval/2"
+          ]
+        },
+        "normalized": {
+          "lost": [
+            "HumanEval/15",
+            "HumanEval/19"
+          ],
+          "gained": []
+        },
+        "message_differences": [
+          "HumanEval/1",
+          "HumanEval/2",
+          "HumanEval/4",
+          "HumanEval/5",
+          "HumanEval/7",
+          "HumanEval/10",
+          "HumanEval/12",
+          "HumanEval/15",
+          "HumanEval/17",
+          "HumanEval/18",
+          "HumanEval/19",
+          "HumanEval/20",
+          "HumanEval/21",
+          "HumanEval/25",
+          "HumanEval/31"
+        ]
+      }
+    },
+    "all_existing_answers_scored_without_regeneration": true,
+    "original_controller_resource_refusal_preserved": true,
+    "continuation_started_only_after_verified_KFD_empty": true,
+    "continuation_terminal": {
+      "original_continuation_exit": 1,
+      "BF16": {
+        "at": "2026-11-19T11:16:34.027569+00:00",
+        "arm": "candidate-bf16",
+        "error": null,
+        "client_returncode": 0,
+        "service_returncode": 0,
+        "records_unchanged": true,
+        "checkpoint_unchanged": true,
+        "remaining_owned": [],
+        "KFD_pids": [],
+        "port_bindable": true,
+        "scoring_pending": true
+      },
+      "E4M3": {
+        "at": "2026-11-19T11:28:49.015088+00:00",
+        "arm": "candidate-e4m3",
+        "error": null,
+        "client_returncode": 0,
+        "service_returncode": 0,
+        "records_unchanged": true,
+        "checkpoint_unchanged": true,
+        "remaining_owned": [],
+        "KFD_pids": [],
+        "port_bindable": false,
+        "scoring_pending": true
+      },
+      "E4M3_original_port_gate_passed": false,
+      "E4M3_later_resource_observation": {
+        "at": "2026-11-19T11:29:02.556544+00:00",
+        "original_terminal_unchanged": true,
+        "controller_present": false,
+        "KFD_pids": [],
+        "port_bindable_now": true
+      },
+      "E4M3_score_recovery": {
+        "at": "2026-11-19T11:29:49.071726+00:00",
+        "scorer_returncode": 0,
+        "count": 32,
+        "raw": 20,
+        "normalized": 31,
+        "all_inputs_verified": true,
+        "unchanged_original_sandbox": true,
+        "regeneration": false,
+        "original_port_gate_failure_preserved": true
+      },
+      "E5M2_resumption": {
+        "at": "2026-11-19T11:29:25.795357+00:00",
+        "original_continuation_exit": 1,
+        "cause": "Original port-bind gate refused after E4M3. No owned or KFD processes remained. 13 seconds later port was bindable; transient cause not proven.",
+        "original_terminal_sha256": "4740031215d6a7efc967f7e4952a144212a6598f104102d97aa7887bb1b12941",
+        "only_original_arm_index": 3,
+        "port": 19075,
+        "original_gates_unchanged": true,
+        "no_existing_generation_repeated": true,
+        "original_script_sha256": "d719a3271e760a4388811b40bf93cf0b94d61168b6aae9fd7f32050e5779e69a",
+        "new_script_sha256": "78592b5c1bf79900ce7f6d117196730bd2aac420112a8ce2cd51708cd612c2bc",
+        "ports19074_19075_bindable_before_launch": true,
+        "KFD_empty": true
+      },
+      "E5M2_controller": {
+        "at": "2026-11-19T11:42:25.784486+00:00",
+        "session_id": 68542,
+        "pid": 2417916,
+        "startticks": "250071494",
+        "returncode": 1,
+        "terminal_reason": "Original post-E5M2 port-bind resource gate refused; all32 answers completed; no owned/KFD survivors.",
+        "scoring_recovery_pending": true
+      },
+      "E5M2_terminal": {
+        "at": "2026-11-19T11:41:44.559879+00:00",
+        "arm": "candidate-e5m2",
+        "error": null,
+        "client_returncode": 0,
+        "service_returncode": 0,
+        "records_unchanged": true,
+        "checkpoint_unchanged": true,
+        "remaining_owned": [],
+        "KFD_pids": [],
+        "port_bindable": false,
+        "scoring_pending": true
+      },
+      "E5M2_later_resource_observation": {
+        "at": "2026-11-19T11:42:25.784486+00:00",
+        "original_terminal_unchanged": true,
+        "controller_present": false,
+        "KFD_pids": [],
+        "port_bindable_now": true,
+        "cause": "Original bind refusal preserved; later TCP table has no port rows and bind succeeds. Transient cause unproven."
+      },
+      "E5M2_score_recovery": {
+        "at": "2026-11-19T11:42:51.420577+00:00",
+        "scorer_returncode": 0,
+        "count": 32,
+        "raw": 21,
+        "normalized": 29,
+        "all_inputs_verified": true,
+        "unchanged_original_sandbox": true,
+        "regeneration": false,
+        "original_port_gate_failure_preserved": true
+      }
+    },
+    "original_EngineCore_grace_s": 15,
+    "qualification": {
+      "gfx836": false,
+      "full_lifecycle": false,
+      "performance": false,
+      "old_failures_waived": false,
+      "model_accuracy_accepted": false
+    }
+  },
+  "new_evidence_files": {
+    "models/review-snapshots/sha256-200d67463edbb487066649918135ee7fb5180f1eb7214fff20ae65aec7cf4367.json": "200d67463edbb487066649918135ee7fb5180f1eb7214fff20ae65aec7cf4367",
+    "models/official/service.log": "eba90d9e81ada73cb1d535e4543f2fa6ad0f891acadd39c13093394fde473d52",
+    "models/official/score.json": "7d734844e6f1da45f62c281fc396df8e8ca5a17d31abec74bb085f8499c39f8d",
+    "models/official/terminal.json": "46a614424cdb03ace7e1e3d3a2a3813acd0d6b129c8b7dc6afd232a4055ee460",
+    "models/official/he32/responses.jsonl": "2aa37b0b84bef5c430ab4934fd18598e6fd190e8947cccfd2565beb42b9dc35f",
+    "models/official/he32/samples.jsonl": "8c28de956f677af440e57c28d48531e43c935ed6ab8fe4fef91f9be919aec00a",
+    "models/candidate-bf16/runtime-device-binding.json": "ce9a06a54d6eebe8994a8f608b93d20286e600295cdc9196e0c6d8865eb863d4",
+    "models/candidate-bf16/worker-native-libraries.json": "9693b21a8e9f0de549adc3f551319f37f7bb0095fb306c04f53f719f1bdb9daf",
+    "models/candidate-bf16/worker-loaded-maps.txt": "1809a414feec3af7b7b599a9292a400ccf4de00842d6da9ee2dc3e9b6305baf9",
+    "models/candidate-bf16/service.log": "3342305549e1cbfc32edd972d5607b75b4165e25d16b7ec9f7c6b7e22fc2349a",
+    "models/candidate-bf16/score.json": "801d6e2dbb51ff4dca59246a9724a847d0b2d665d00cb435fd2be89694215be9",
+    "models/candidate-bf16/terminal.json": "5bef559a9207054356f61bc3b5043c7502124ed86aea5d42c3442b868e06c126",
+    "models/candidate-bf16/he32/responses.jsonl": "d88d05724b07a7cfe93ed2c9a6fef3318b58bfc8da958dcdb029750044087621",
+    "models/candidate-bf16/he32/samples.jsonl": "84617b0689db090f6c7be64eb9ebb1382f7aebeca6c58981f8c4ac28d7751c03",
+    "models/candidate-e4m3/runtime-device-binding.json": "332275e3b27e85c93d48000fb8e436704b9e0b2558197c6ba977872f0902e8e8",
+    "models/candidate-e4m3/worker-native-libraries.json": "cfd4f7f47a585b618d48c8d9174e511d055e8f074c07df2fb8b24860910c3782",
+    "models/candidate-e4m3/worker-loaded-maps.txt": "443ef8d090043e90884956522a34d34693e45e1504b569626cc77789170cc6df",
+    "models/candidate-e4m3/service.log": "02bfa76f4f10b0c7108aba6b8c9b06ac89ecc27cd2d6e2228e7b47ab7c339706",
+    "models/candidate-e4m3/score.json": "3867bf7309e55f4efb8dbca1720fca9a23666779017ca8613be24bb418f4ed19",
+    "models/candidate-e4m3/terminal.json": "4740031215d6a7efc967f7e4952a144212a6598f104102d97aa7887bb1b12941",
+    "models/candidate-e4m3/he32/responses.jsonl": "46fa7b8b2da4d3526f3a658d81def7c81a877bc91ccd0b3a9f800341300c9c5c",
+    "models/candidate-e4m3/he32/samples.jsonl": "ec1620dd77228bbac2f111a11e3e8b6b4323fbc642ebed58fb3c37f7816ae6a8",
+    "models/candidate-e5m2/runtime-device-binding.json": "464052f028153421fa09a3dd44bbebe3e28f018956597a879484dbcedb62a0ac",
+    "models/candidate-e5m2/worker-native-libraries.json": "6cf580f279960ce33fa27c2da58185946274664f5dafe920cbc572f39debdc59",
+    "models/candidate-e5m2/worker-loaded-maps.txt": "b2902b86e40e3016766748cfc53bd9f1fb676c4198fce67a86a6fba3152ad52f",
+    "models/candidate-e5m2/service.log": "7583efa93e6cb58f4e96311c3bbf19c25607b6875edc5d5ae4cf5f17775c1e55",
+    "models/candidate-e5m2/score.json": "a2c5e9f96d5cfec444617625fa656b9d52f0d4b22b124db033d0d6bb0bbb3040",
+    "models/candidate-e5m2/terminal.json": "cf65f405d6587505a7b3a9786d45a42c18a35848877415040f0ea4dfb9deb3d4",
+    "models/candidate-e5m2/he32/responses.jsonl": "9f77a254989cd9b2306de67fb7ccc782fa28a92da893eb12a85f4afacd1f6be7",
+    "models/candidate-e5m2/he32/samples.jsonl": "3d08228d694de32f1b82fb4b066d2de3a7da6cfb198106dfe2c29528ee3427e2"
   }
 }
