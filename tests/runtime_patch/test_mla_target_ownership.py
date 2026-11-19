@@ -8,6 +8,7 @@ import importlib
 import importlib.util
 import sys
 from contextlib import nullcontext
+from dataclasses import make_dataclass, replace
 from pathlib import Path
 from types import ModuleType, SimpleNamespace
 
@@ -891,6 +892,69 @@ def test_mla_cache_gather_distinguishes_replicated_mtp_from_pcp_prefill():
     assert module.cache_gather_calls == [
         (kv, rope, partitioned_slots, 4, True)
     ]
+
+
+@pytest.mark.parametrize(
+    (
+        "query_lens", "prefilling", "device_lens", "upper_bound", "causal",
+        "decode_threshold", "expected_context",
+    ),
+    [
+        ([4], [False], [108], [110], True, 1, [104]),
+        ([4, 12], [False, True], [108, 60], [110, 60], True, 1, [104, 48]),
+        ([12], [True], [60], [60], True, 1, [48]),
+        ([1], [False], [108], [110], True, 1, [109]),
+        ([4], [False], [108], [110], False, 1, [106]),
+        ([4], [False], [108], [110], True, 4, [106]),
+        ([4, 4], [False, False], [108, 100], [110, 103], True, 1, [104, 96]),
+    ],
+)
+def test_mla_multitoken_decode_context_excludes_rejected_drafts(
+    query_lens, prefilling, device_lens, upper_bound, causal, decode_threshold,
+    expected_context,
+):
+    adapter = _adapter()
+    module = _fake_mla_module(adapter, [])
+
+    def build(self, common_prefix_len, common_attn_metadata, fast_build=False):
+        return SimpleNamespace(
+            num_actual_tokens=common_attn_metadata.num_actual_tokens,
+            context_lens=common_attn_metadata.seq_lens_cpu_upper_bound
+            - common_attn_metadata.query_start_loc_cpu.diff(),
+            common=common_attn_metadata,
+        )
+
+    module.MLACommonMetadataBuilder.build = build
+    assert adapter.apply_to_module(module) is True
+    metadata_builder = module.MLACommonMetadataBuilder()
+    metadata_builder.reorder_batch_threshold = decode_threshold
+    metadata_values = {
+        "num_actual_tokens": sum(query_lens),
+        "query_start_loc_cpu": torch.tensor([0] + query_lens).cumsum(0),
+        "is_prefilling": torch.tensor(prefilling),
+        "seq_lens": torch.tensor(device_lens),
+        "seq_lens_cpu_upper_bound": torch.tensor(upper_bound),
+        "causal": causal,
+    }
+    metadata_class = make_dataclass(
+        "CommonAttentionMetadata", [(name, object) for name in metadata_values]
+    )
+    common = metadata_class(**metadata_values)
+    common.replace = lambda **updates: replace(common, **updates)
+    common.num_kv_actual_tokens = common.num_actual_tokens + 5
+
+    result = metadata_builder.build(0, common)
+
+    assert result.context_lens.tolist() == expected_context
+    assert result.num_kv_actual_tokens == common.num_kv_actual_tokens
+    assert common.seq_lens_cpu_upper_bound.tolist() == upper_bound
+    if causal and any(
+        length > decode_threshold and not phase
+        for length, phase in zip(query_lens, prefilling)
+    ):
+        assert result.common is not common
+    else:
+        assert result.common is common
 
 
 def test_dense_and_sparse_mla_metadata_carry_parallel_sizes(monkeypatch):

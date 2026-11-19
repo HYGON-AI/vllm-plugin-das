@@ -4,6 +4,7 @@
 
 from __future__ import annotations
 
+import copy
 import functools
 import inspect
 from types import ModuleType
@@ -406,6 +407,25 @@ def apply_to_module(module: ModuleType) -> bool:
 
     @functools.wraps(builder)
     def hcu_build(self, common_prefix_len, common_attn_metadata, fast_build=False):
+        is_prefilling = getattr(common_attn_metadata, "is_prefilling", None)
+        query_start_loc_cpu = getattr(
+            common_attn_metadata, "query_start_loc_cpu", None
+        )
+        if (
+            is_prefilling is not None
+            and query_start_loc_cpu is not None
+            and getattr(common_attn_metadata, "causal", True) is not False
+        ):
+            query_offsets = query_start_loc_cpu.numpy()
+            query_lens = query_offsets[1:] - query_offsets[:-1]
+            multi_token_decodes = (
+                query_lens > self.reorder_batch_threshold
+            ) & ~is_prefilling.numpy()
+            if multi_token_decodes.any():
+                common_attn_metadata = copy.copy(common_attn_metadata)
+                common_attn_metadata.seq_lens_cpu_upper_bound = (
+                    common_attn_metadata.seq_lens.cpu()
+                )
         result = builder(self, common_prefix_len, common_attn_metadata, fast_build)
         result.num_kv_actual_tokens = getattr(
             common_attn_metadata,
