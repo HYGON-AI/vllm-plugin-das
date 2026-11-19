@@ -798,6 +798,38 @@ not establish deterministic causality. Ordinary zero-softcap/full-window E5M2
 does not require the added softcap/window or FP16/E4M3 branch. An unchanged
 baseline fresh-service repeat remains a separate diagnostic, not acceptance.
 
+That unchanged merged-Plugin baseline repeat is now terminal. With the same
+physical device, checkpoint, commands, environment, fixed requests and default
+Graph/prefix policy, it scores raw21/normalized30 and fails19/26 after
+normalization. Baseline distributions and payloads are unchanged from its
+original22/31 run. All32 raw and normalized pass flags now match the candidate,
+but only27/32 messages match; task19's message is different too. This establishes
+that task19 can fail on the unchanged baseline, not that its exact candidate
+continuation was reproduced or that outputs are equivalent. The original
+observed loss remains recorded; neither numerical causality nor acceptance
+follows from this repeat. Both serving arms retain nanobind/EngineDeadError
+lifecycle failures despite exit0 within15s and no forced cleanup or survivors.
+An independent read-only audit recomputes these counts from the saved score
+flags and raw responses, without rerunning generated code. Evidence:
+`evidence/plugin410-e5m2-baseline-repeat-r240/` and
+`evidence/plugin410-repeat-audit-r245/audit.json`.
+
+A real-device configuration-only probe also admits the available Gemma3
+text encoder from an LTX pipeline: original
+`Gemma3ForConditionalGeneration`, head256,48 layers (40 sliding/8 full),
+window1024, BF16 compute/E5M2 KV, default FULL_AND_PIECEWISE Graph and prefix.
+The official `limit_mm_per_prompt={"image": 0}` disables mm-prefix mode and
+the real public selector returns `HcuFlashAttentionBackend`. The matching
+pipeline tokenizer loads and tokenizes. The earlier device-hidden attempts
+are retained as failed: HCU detection correctly declined activation without
+an available HIP device, leaving the ordinary ROCm selector. This follow-up
+uses a real gfx938 device and initializes HIP; it is not CPU-only evidence.
+Installed payloads/18 RECORDs verify before and after. No model weights were
+loaded, so this does not qualify pretrained window behavior, accuracy,
+softcap or serving performance. Evidence:
+`evidence/gemma3-window-config-r245/` and
+`evidence/gemma3-window-config-r245-controller/`.
+
 FP16/E4M3 writer component timing on gfx938,8 KV heads/head128 and five warmed
 100-call samples per route: corrected Graph replay intervals are about
 12.5–13.7us at1–128 unpadded tokens, versus6.8–8.0us for the numerically

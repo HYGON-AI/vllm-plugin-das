@@ -177,11 +177,21 @@ checkpoint exercising the changed branch before assigning causality.
 For differing greedy outputs, preserve the failing cohort and repeat the
 unchanged merged baseline in a fresh service with the same physical device,
 requests, concurrency, default Graph/prefix and private cold caches. Compare
-per-task pass sets and messages, not only total scores. A candidate answer
-reproduced by the baseline narrows that case; it does not explain every change
-or waive the original loss, lifecycle or performance gates. Do not treat two
+per-task pass sets and messages, not only total scores. Distinguish a repeated
+failure from reproduction of the exact candidate continuation: equal per-task
+pass flags can accompany different texts and failure mechanisms. A repeated
+baseline failure narrows attribution; it does not explain every change or
+waive the original loss, lifecycle or performance gates. Do not treat two
 absent generated-token fields as token parity; obtain actual integer token
 lists in a separately labeled diagnostic when the target API supports them.
+
+Before a public backend-selection probe, check the actual platform and extension
+publication. HCU admission requires real available HIP device evidence; hiding
+every device can legitimately leave the official ROCm platform selected even
+when the Plugin is installed and required names are set. Preserve that failed
+probe. A separately labeled real-device configuration probe may initialize HIP
+and check the genuine public selector; do not fake detection, replace the
+platform or count that probe as CPU-only or pretrained-model qualification.
 
 Retain each run's live Inductor/Triton tuning artifacts when compiled reductions
 can differ. Compare selected launch/reduction parameters separately from tuning
